@@ -65,11 +65,22 @@ func tracePath(rel *RelOptInfo, p *Path, producer string, partial bool, verdict 
 	} else {
 		pathkeys = "0"
 	}
+	// C-03a: the jointype label. It is what makes a DPPATH line adjudicable
+	// for C-03b/C-03d — "was an outer/semi/anti pairing OFFERED at its level,
+	// and did it survive dominance" cannot be read off a line that only names
+	// the operator kind, because kind is the ALGORITHM (hash/merge/nestloop)
+	// and jointype is the SEMANTICS, and the two are orthogonal.
+	//
+	// Every path emits it, including the scan and wrapper paths that never set
+	// the field: `inner` there is the zero value, and a label that appears on
+	// some lines but not others would need the reader to know which kinds are
+	// joins. Appended at the END of the record, after `verdict`, so a reader
+	// splitting on the existing key=value pairs keeps working unchanged.
 	fmt.Fprintf(os.Stderr,
-		"%s %s producer=%s relids=%s kind=%d reqouter=%s rows=%.0f startup=%.2f total=%.2f disabled=%d pathkeys=%s verdict=%s\n",
+		"%s %s producer=%s relids=%s kind=%d reqouter=%s rows=%.0f startup=%.2f total=%.2f disabled=%d pathkeys=%s verdict=%s jointype=%s\n",
 		pathTraceTag, list, producer, relSetBits(rel.Relids), int(p.Kind),
 		relSetBits(p.RequiredOuter), p.Rows, p.Cost.Startup, p.Cost.Total,
-		p.DisabledNodes, pathkeys, verdict)
+		p.DisabledNodes, pathkeys, verdict, strings.ToLower(joinTypeName(p.Jointype)))
 }
 
 // relSetBits renders a RelSet as a stable, parseable member list. The trace has

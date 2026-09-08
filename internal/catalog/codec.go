@@ -1264,7 +1264,12 @@ func DecodePGIndexPhysicalRow(data, bitmap []byte) (PGIndexRow, error) {
 	// failure below is treated as "field unavailable" rather than a hard
 	// error, since the fields already decoded above remain valid on their
 	// own.
-	off := pgIndexAlign4(pgIndexOffIndKey + needed)
+	// Vectors always carry 4-byte headers (pgInt2VectorBytes /
+	// pgOIDVectorBytes emit total<<2), so the peek below agrees with
+	// nominal align on encoder-produced bytes — uniform with the text
+	// tails, and a future short-header writer desynchronises loudly
+	// (misread) rather than silently (skipped).
+	off := AttAlignPointer(data, pgIndexOffIndKey+needed, 4, true)
 	if collOIDs, newOff, ok := decodePGIndexOIDVector(data, off); ok {
 		r.IndCollation = collOIDs
 		off = newOff
@@ -1306,12 +1311,20 @@ func DecodePGIndexPhysicalRow(data, bitmap []byte) (PGIndexRow, error) {
 	// has no NULLs — either way, decode whatever trailing varlenas fit.
 	exprsPresent := pgIndexBitNotNull(bitmap, pgIndexColIndExprs)
 	predPresent := pgIndexBitNotNull(bitmap, pgIndexColIndPred)
-	fieldOff := pgIndexAlign4(off + vectorHdrSize + 2*m)
+	// indpred (col 20) is last ON DISK: the row carries 21 values but
+	// buildUserPGIndexRow omits indcoloptions (col 21, always
+	// NULL/virtual), so no offset walks past indpred — peek coverage
+	// below is complete.
+	// D-09: the trailing text varlenas pack short+unaligned — peek
+	// (shared rule: AttAlignPointer), not unconditional align. The
+	// oidvector/int2vector columns above use the same peek, which
+	// agrees with nominal align on their always-4-byte headers.
+	fieldOff := AttAlignPointer(data, off+vectorHdrSize+2*m, 4, true)
 	if exprsPresent && fieldOff < len(data) {
 		if text, ok := decodePGIndexVarlenaText(data[fieldOff:]); ok {
 			r.IndHasExprs = true
 			r.IndExprs = text
-			fieldOff = pgIndexAlign4(fieldOff + pgIndexVarlenaLen(data[fieldOff:]))
+			fieldOff = AttAlignPointer(data, fieldOff+pgIndexVarlenaLen(data[fieldOff:]), 4, true)
 		}
 	}
 	if predPresent && fieldOff < len(data) {
@@ -1440,7 +1453,7 @@ func decodePGIndexOIDVector(data []byte, off int) ([]uint32, int, bool) {
 	for i := range oids {
 		oids[i] = binary.LittleEndian.Uint32(blob[vectorHdrSize+4*i : vectorHdrSize+4*i+4])
 	}
-	return oids, pgIndexAlign4(off + needed), true
+	return oids, AttAlignPointer(data, off+needed, 4, true), true
 }
 
 // PGStatisticRow holds the fields from pg_statistic needed for in-memory

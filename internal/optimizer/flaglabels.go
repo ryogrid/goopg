@@ -56,10 +56,11 @@ type FlagProvenance struct {
 }
 
 // onOff spells a boolean flag's resolved state. It describes the VARIABLE, never
-// the feature — so an inverted switch such as GOOPG_PGSHAPED_COLLAPSE resolves
+// the feature — so an inverted switch such as GOOPG_MHJ_PACKING_OFF resolves
 // to `off` ("the off-switch is not engaged"). Reading it the other way would
-// make one row of the stamp mean the opposite of its neighbours. (The pattern's
-// original exemplar, GOOPG_MHJ_PACKING_OFF, was retired by M0127-P6.2.)
+// make one row of the stamp mean the opposite of its neighbours. (Both that
+// exemplar and GOOPG_PGSHAPED_COLLAPSE have since been retired, by M0127-P6.2
+// and take3 C-06.)
 func onOff(on bool) string {
 	if on {
 		return "on"
@@ -79,7 +80,6 @@ var flagResolvedState = map[string]func(string) string{
 	"GOOPG_MEMOIZE":           func(v string) string { return onOff(memoizeFromEnv(v)) },
 	"GOOPG_PARALLEL":          func(v string) string { return onOff(parallelFromEnv(v)) },
 	"GOOPG_PGSHAPED_DP":       func(v string) string { return onOff(pgShapedDPFromEnv(v)) },
-	"GOOPG_PGSHAPED_COLLAPSE": func(v string) string { return onOff(pgShapedCollapseFromEnv(v)) },
 	"GOOPG_EXISTS_TO_ANY":     func(v string) string { return onOff(existsToAnyFromEnv(v)) },
 	"GOOPG_UNNEST_PREDP":      func(v string) string { return onOff(unnestPreDPFromEnv(v)) },
 	"GOOPG_INDEXKEY_HARVEST":  func(v string) string { return onOff(indexKeyHarvestFromEnv(v)) },
@@ -88,6 +88,40 @@ var flagResolvedState = map[string]func(string) string{
 	// statement's needed columns. Default ON since step 5 (P4-A §18); `=0`
 	// opts back out to the un-narrowed arm.
 	"GOOPG_NARROW_BUILD": func(v string) string { return onOff(narrowBuildFromEnv(v)) },
+	// B-01c applying half, slice (b): narrows the input row of an upper
+	// Aggregate site whose stamped target the key-preservation gate passes,
+	// sinking the cut past order-preserving wrappers so the Sort beneath a
+	// sorted aggregation carries the narrowed row (upper_narrow_apply.go).
+	// Default ON, `=0` opts back out to the un-narrowed arm.
+	"GOOPG_NARROW_UPPER": func(v string) string { return onOff(narrowUpperFromEnv(v)) },
+	// B-01c applying half, slice (c): narrows the input row of an upper `*Sort`
+	// site — the general ORDER BY sort — re-basing the whole ancestor chain up
+	// to the node that absorbs the change (upper_narrow_chain.go). A separate
+	// flag from GOOPG_NARROW_UPPER because the two sites move different plan
+	// shapes and an A/B that cannot separate them cannot attribute a
+	// regression. Default ON; `=0` opts back out, as does GOOPG_NARROW_UPPER=0.
+	"GOOPG_NARROW_UPPER_SORT": func(v string) string { return onOff(narrowUpperSortFromEnv(v)) },
+	// C-19d: a MODE, not a boolean — off / top / all. It decides whether the
+	// search may choose a Gather at all, and at which rels, so an artefact
+	// that does not name it cannot say whether the plans it holds were free
+	// to parallelise. Rendered through the same label function the resolver
+	// uses, so the token inside `unset(…)` re-exported reproduces the arm.
+	"GOOPG_GATHER_PATHS": func(v string) string { return gatherPathModeLabel(gatherPathModeFromEnv(v)) },
+	"GOOPG_PARTIAL_AGG_PATHS": func(v string) string {
+		return partialAggModeLabel(partialAggModeFromEnv(v))
+	},
+	// E-21 Cut 1 (onerelsearch.go): decides whether a statement with ONE FROM
+	// item enters the path search at all. It moves access-method selection for
+	// every single-table query, not only the Gather it exists for, so an
+	// artefact that does not name it cannot say which arm was measured.
+	"GOOPG_ONEREL_SEARCH": func(v string) string { return oneRelSearchLabel(oneRelSearchFromEnv(v)) },
+	// C-19e: selects which authority decides `Gather Merge -> Sort -> partial`
+	// — the retired type switch or the priced two-candidate tournament. It
+	// moves the plan of every parallel ORDER BY / merge-input sort, so an
+	// artefact that does not name it cannot say which arm it measured.
+	"GOOPG_PARTIAL_SORT_PATHS": func(v string) string {
+		return partialSortModeLabel(partialSortModeFromEnv(v))
+	},
 	// A mode, not a boolean: the artefact carries the word an operator would
 	// export to reproduce the arm.
 	"GOOPG_NLI_COSTGATE": func(v string) string {
@@ -137,6 +171,29 @@ var flagProvenanceOrder = []string{
 	// Joined at take2 P4-01 rev 10 step 3: narrows hash-join build sides,
 	// default ON since step 5 (P4-A §18 steps 3-5).
 	"GOOPG_NARROW_BUILD",
+	// Joined at take3 B-01c applying half, slice (b): narrows an upper
+	// Aggregate site's input row and sinks the cut past the Sort beneath a
+	// sorted aggregation, so an artefact that does not name it cannot say
+	// which sort payload it measured. Default ON.
+	"GOOPG_NARROW_UPPER",
+	// Joined at take3 B-01c applying half, slice (c): narrows the general
+	// ORDER BY sort's input row and re-bases the ancestor chain above it, so an
+	// artefact that does not name it cannot say which sort payload it measured.
+	// Default ON.
+	"GOOPG_NARROW_UPPER_SORT",
+	// Joined at take3 C-19d (P5-04): admits `PathGather` / `PathGatherMerge`
+	// into the search. Default `off` pending the TPC-H A/B that decides it
+	// (docs/design/planner-c19d-gather-paths/DESIGN.md §5).
+	"GOOPG_GATHER_PATHS",
+	"GOOPG_PARTIAL_AGG_PATHS",
+	// Joined at take3 E-21 Cut 1: admits a one-FROM-item statement to the path
+	// search, as PG's set_base_rel_pathlists does unconditionally
+	// (allpaths.c:221). Default `off` pending the corpora A/B
+	// (docs/design/planner-e20-e21-parallel-path-search/DESIGN.md §4, §6).
+	"GOOPG_ONEREL_SEARCH",
+	// Joined at take3 C-19e (P5-05). Default `off` pending the measurement in
+	// docs/design/planner-c19e-partial-sort/DESIGN.md §5.
+	"GOOPG_PARTIAL_SORT_PATHS",
 }
 
 // flagProvenanceRetired names variables no code reads any more, and the
@@ -159,6 +216,14 @@ var flagProvenanceRetired = map[string]string{
 	// off independently of join-order. M0127-P6.2 deleted the packer, so the
 	// off-switch has nothing left to turn off.
 	"GOOPG_MHJ_PACKING_OFF": "M0127-P6.2",
+	// take3 C-06. The switch selected explicit-INNER-JOIN flattening, default
+	// ON since take2 P0-13; flattening is now unconditional and the `=0`
+	// branch is deleted. Retiring it was a DECISION, not a gate pass: the flip
+	// is not byte-identical (TPC-H Q13 moves), but after C-06s taught the
+	// search JOIN_RIGHT the flattened arm became both the PG-parity plan and
+	// the faster one, so the `=0` arm held a plan that was neither
+	// (analysis/planner-refactor-take3/c06-flip-remeasure-20260907/README.md).
+	"GOOPG_PGSHAPED_COLLAPSE": "take3-C-06",
 	// M0125-0040's grouping-sets source-sharing knob. M0125-0048 replaced the
 	// UNION-ALL expansion the knob existed to make cheaper with a single-pass
 	// grouping-sets aggregate, so there is no source to share and nothing

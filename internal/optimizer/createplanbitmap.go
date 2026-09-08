@@ -43,6 +43,7 @@ func createBitmapHeapScanPlan(p *Path) (Node, error) {
 		pos:   id.pos,
 		Table: id.table,
 		Alias: id.alias,
+		RTID:  id.rtid,
 		// BitmapQual: the original index qual + partial-index predicates,
 		// re-evaluated on lossy pages or when the index AM requires recheck.
 		BitmapQual: bitmapQual,

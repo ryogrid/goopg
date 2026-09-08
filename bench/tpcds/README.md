@@ -358,3 +358,43 @@ same plan line carries the planner's *estimated* `rows=` first.
 | `SF05_SWEEP_BASELINE` | newest non-probe `sweep-*.txt` | report to diff the status/runtime vector against; `none` skips it |
 | `PLAN_TIMEOUT` | `180` | per-query timeout for the EXPLAIN-only plan capture |
 | `SF05_PLANS_BASELINE` | newest `plans-*.txt` | capture to diff against; `none` skips the diff |
+
+## Buffer residency — read before publishing any TPC-DS timing
+
+Measured 2026-09-06. goopg converts `shared_buffers` into pool slots as
+`shared_buffers / 8` (`cmd/goopg/main.go`, `poolSlotsFromGUC`), and both
+TPC-DS `postgresql.conf` files had **left `shared_buffers` commented out**, so
+the clusters ran on the `128MB` GUC BootVal — **16,384 slots** — against
+working sets of **1.113 GiB (SF0.5, 75 relations)** and **2.2 GiB (SF1)**.
+
+The consequence was measured with `pg_stat_io`, not assumed:
+
+| | slots | pool | working set | 2 scans of `store_sales` |
+|---|---:|---:|---:|---|
+| before | 16,384 | 128 MiB | 1.113 GiB | reads 59,522 / **evictions 43,138** |
+
+`store_sales` alone is **232 MiB**, 1.8x the entire pool, so nothing was ever
+resident and every scan re-read from the OS. For contrast the TPC-H goopg
+cluster has been at `2048MB` = 262,144 slots since `bench/tpch/setup_goopg.sh`
+was written, and three consecutive scans of its 6M-row `lineitem` show
+**reads 136,393 / evictions 0**, unchanged from the second scan onward — fully
+resident, which is what a hot benchmark is supposed to look like.
+
+Both TPC-DS configs are now set to `shared_buffers = 2048MB`, matching TPC-H
+and the PG TPC-DS reference (`bench/tpcds/runtime/pgdata` runs `2GB`). At
+128MB the goopg-vs-PG comparison was silently **16x unfair on memory**.
+
+Two things follow, and they are different:
+
+- **Values gates were never affected.** `scripts/tpcds-sf05-regression.sh`
+  compares row values against a git-tracked PG oracle; residency does not
+  change an answer. Every `PASS=95 CKMISMATCH=0` recorded before this change
+  stands.
+- **Any TPC-DS timing taken before 2026-09-06 is I/O-bound and must not be
+  compared against PG.** That includes the per-query wall times in
+  `analysis/planner-refactor-take3/c13a-limit-sort-census-20260906/`, whose own
+  conclusion (sorting is a negligible share of runtime) is *strengthened* by
+  this, not weakened — the denominator was inflated by I/O the fix removes.
+
+`bench/tpcds/server.sh` now warns at start if `shared_buffers` is unset, so the
+cluster cannot silently return to 128MB.

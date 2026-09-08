@@ -96,6 +96,16 @@ func createPlanNodeUnpriced(p *Path) (Node, outputLayout) {
 		// keys onto the outer alone, the residual onto the merged row.
 		// createplannl.go.
 		return createNestLoopPlan(p)
+	case PathGather:
+		// C-19d (P5-04): the Gather the SEARCH chose, priced by cost_gather
+		// and compared against the serial path by add_path — as opposed to
+		// the one `MaybeAddGather` stamps onto a finished tree. Both shapes
+		// exist while C-19h is open; the post-pass declines on a tree that
+		// already carries one (parallel.go). createplangather.go.
+		return createGatherPlan(p)
+	case PathGatherMerge:
+		// The order-preserving twin, priced by cost_gather_merge.
+		return createGatherMergePlan(p)
 	case PathMemoize:
 		// A Memoize path has NO arm here, deliberately (M0127-P5.4b-ii-b-2).
 		// goopg's executor expresses the cache as `NestedLoopIndexJoin.InnerMemo`
@@ -128,6 +138,24 @@ func createPlanNodeUnpriced(p *Path) (Node, outputLayout) {
 		// M0128-P2.4: bitmap union combinator.
 		n := buildBitmapAndOrPlan(p, false)
 		return n, baseRelLayout(p.Rel, n)
+	case PathAgg:
+		// C-15: the GROUP_AGG upper rel's candidate. createplansimple.go.
+		return createAggPlan(p)
+	case PathFinalizeAgg:
+		// C-19g's remainder: the GROUP_AGG rel's PARALLEL candidate — the
+		// whole Finalize -> Gather -> Partial shape, built by the same
+		// `splitAggregate` the post-pass uses. createplansimple.go.
+		return createFinalizeAggPlan(p)
+	case PathDistinct:
+		// C-16: the DISTINCT upper rel's candidate. createplansimple.go.
+		return createDistinctPlan(p)
+	case PathWindow:
+		// C-18: the WINDOW upper rel's candidate. createplansimple.go.
+		return createWindowPlan(p)
+	case PathSetOp:
+		// C-18: the SETOP upper rel's candidate — the only two-input arm
+		// above the seam. createplansimple.go.
+		return createSetOpPlan(p)
 	default:
 		// PathMultiHash / … do not have arms yet. Reaching here means a phase
 		// constructed a path kind without teaching createPlan to translate it.

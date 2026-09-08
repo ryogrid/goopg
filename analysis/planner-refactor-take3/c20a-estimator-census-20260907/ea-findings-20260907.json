@@ -1,0 +1,2565 @@
+{
+ "queries": [
+  1,
+  2,
+  3,
+  4,
+  5,
+  6,
+  7,
+  8,
+  9,
+  10,
+  11,
+  12,
+  13,
+  14,
+  15,
+  16,
+  17,
+  18,
+  19,
+  20,
+  21,
+  22,
+  23,
+  24,
+  25,
+  26,
+  27,
+  28,
+  29,
+  30,
+  31,
+  32,
+  33,
+  34,
+  35,
+  36,
+  37,
+  38,
+  39,
+  40,
+  41,
+  42,
+  43,
+  44,
+  45,
+  46,
+  47,
+  48,
+  49,
+  50,
+  51,
+  52,
+  53,
+  54,
+  55,
+  56,
+  57,
+  58,
+  59,
+  60,
+  61,
+  62,
+  63,
+  64,
+  65,
+  66,
+  67,
+  68,
+  69,
+  70,
+  71,
+  72,
+  73,
+  74,
+  75,
+  76,
+  77,
+  78,
+  79,
+  80,
+  81,
+  82,
+  83,
+  84,
+  85,
+  86,
+  87,
+  88,
+  89,
+  90,
+  91,
+  92,
+  93,
+  94,
+  95,
+  96,
+  97,
+  98,
+  99
+ ],
+ "scored": 844,
+ "tol": 2.0,
+ "floor": 10.0,
+ "findings": [
+  {
+   "q": 82,
+   "key": [
+    "date_dim",
+    "inventory"
+   ],
+   "node": "Nested Loop",
+   "est": 1818353,
+   "actual": 0.0,
+   "qerr": 1818353.0,
+   "pg_est": null,
+   "pg_qerr": null
+  },
+  {
+   "q": 78,
+   "key": [
+    "ss.date_dim",
+    "ss.store_returns",
+    "ss.store_sales"
+   ],
+   "node": "Hash Join",
+   "est": 1,
+   "actual": 274384.0,
+   "qerr": 274384.0,
+   "pg_est": null,
+   "pg_qerr": null
+  },
+  {
+   "q": 78,
+   "key": [
+    "cte:cs",
+    "cte:ss",
+    "cte:ws"
+   ],
+   "node": "Hash Left Join",
+   "est": 1,
+   "actual": 245587.0,
+   "qerr": 245587.0,
+   "pg_est": null,
+   "pg_qerr": null
+  },
+  {
+   "q": 78,
+   "key": [
+    "cte:ss",
+    "cte:ws"
+   ],
+   "node": "Hash Left Join",
+   "est": 1,
+   "actual": 245587.0,
+   "qerr": 245587.0,
+   "pg_est": null,
+   "pg_qerr": null
+  },
+  {
+   "q": 78,
+   "key": [
+    "cte:ss"
+   ],
+   "node": "CTE Scan on ss",
+   "est": 1,
+   "actual": 245587.0,
+   "qerr": 245587.0,
+   "pg_est": null,
+   "pg_qerr": null
+  },
+  {
+   "q": 78,
+   "key": [
+    "cs.catalog_returns",
+    "cs.catalog_sales",
+    "cs.date_dim"
+   ],
+   "node": "Hash Join",
+   "est": 1,
+   "actual": 142656.0,
+   "qerr": 142656.0,
+   "pg_est": null,
+   "pg_qerr": null
+  },
+  {
+   "q": 78,
+   "key": [
+    "cte:cs"
+   ],
+   "node": "CTE Scan on cs",
+   "est": 1,
+   "actual": 128409.0,
+   "qerr": 128409.0,
+   "pg_est": null,
+   "pg_qerr": null
+  },
+  {
+   "q": 78,
+   "key": [
+    "ws.date_dim",
+    "ws.web_returns",
+    "ws.web_sales"
+   ],
+   "node": "Hash Join",
+   "est": 1,
+   "actual": 72124.0,
+   "qerr": 72124.0,
+   "pg_est": null,
+   "pg_qerr": null
+  },
+  {
+   "q": 78,
+   "key": [
+    "cte:ws"
+   ],
+   "node": "CTE Scan on ws",
+   "est": 1,
+   "actual": 64983.0,
+   "qerr": 64983.0,
+   "pg_est": null,
+   "pg_qerr": null
+  },
+  {
+   "q": 53,
+   "key": [
+    "date_dim",
+    "item",
+    "store_sales"
+   ],
+   "node": "Hash Join",
+   "est": 1,
+   "actual": 18830.0,
+   "qerr": 18830.0,
+   "pg_est": null,
+   "pg_qerr": null
+  },
+  {
+   "q": 53,
+   "key": [
+    "date_dim",
+    "item",
+    "store",
+    "store_sales"
+   ],
+   "node": "Hash Join",
+   "est": 1,
+   "actual": 18372.0,
+   "qerr": 18372.0,
+   "pg_est": 3,
+   "pg_qerr": 6124.0
+  },
+  {
+   "q": 47,
+   "key": [
+    "cte:v2"
+   ],
+   "node": "CTE Scan on v2",
+   "est": 4,
+   "actual": 43626.0,
+   "qerr": 10906.5,
+   "pg_est": null,
+   "pg_qerr": null
+  },
+  {
+   "q": 57,
+   "key": [
+    "cte:v2"
+   ],
+   "node": "CTE Scan on v2",
+   "est": 2,
+   "actual": 17189.0,
+   "qerr": 8594.5,
+   "pg_est": null,
+   "pg_qerr": null
+  },
+  {
+   "q": 63,
+   "key": [
+    "date_dim",
+    "item",
+    "store_sales"
+   ],
+   "node": "Hash Join",
+   "est": 1,
+   "actual": 6277.0,
+   "qerr": 6277.0,
+   "pg_est": null,
+   "pg_qerr": null
+  },
+  {
+   "q": 63,
+   "key": [
+    "date_dim",
+    "item",
+    "store",
+    "store_sales"
+   ],
+   "node": "Hash Join",
+   "est": 1,
+   "actual": 6140.0,
+   "qerr": 6140.0,
+   "pg_est": 3,
+   "pg_qerr": 2046.7
+  },
+  {
+   "q": 34,
+   "key": [
+    "date_dim",
+    "household_demographics",
+    "store",
+    "store_sales"
+   ],
+   "node": "Hash Join",
+   "est": 6,
+   "actual": 20019.0,
+   "qerr": 3336.5,
+   "pg_est": 31,
+   "pg_qerr": 645.8
+  },
+  {
+   "q": 10,
+   "key": [
+    "date_dim",
+    "store_sales"
+   ],
+   "node": "Hash Join",
+   "est": 19,
+   "actual": 51846.0,
+   "qerr": 2728.7,
+   "pg_est": 734,
+   "pg_qerr": 70.6
+  },
+  {
+   "q": 69,
+   "key": [
+    "date_dim",
+    "web_sales"
+   ],
+   "node": "Hash Join",
+   "est": 4,
+   "actual": 10450.0,
+   "qerr": 2612.5,
+   "pg_est": 145,
+   "pg_qerr": 72.1
+  },
+  {
+   "q": 69,
+   "key": [
+    "catalog_sales",
+    "date_dim"
+   ],
+   "node": "Hash Join",
+   "est": 9,
+   "actual": 20290.0,
+   "qerr": 2254.4,
+   "pg_est": 288,
+   "pg_qerr": 70.5
+  },
+  {
+   "q": 69,
+   "key": [
+    "date_dim",
+    "store_sales"
+   ],
+   "node": "Hash Join",
+   "est": 19,
+   "actual": 42236.0,
+   "qerr": 2222.9,
+   "pg_est": 552,
+   "pg_qerr": 76.5
+  },
+  {
+   "q": 53,
+   "key": [
+    "item",
+    "store_sales"
+   ],
+   "node": "Nested Loop",
+   "est": 28,
+   "actual": 60237.0,
+   "qerr": 2151.3,
+   "pg_est": 1364,
+   "pg_qerr": 44.2
+  },
+  {
+   "q": 63,
+   "key": [
+    "item",
+    "store_sales"
+   ],
+   "node": "Nested Loop",
+   "est": 28,
+   "actual": 60237.0,
+   "qerr": 2151.3,
+   "pg_est": 1364,
+   "pg_qerr": 44.2
+  },
+  {
+   "q": 27,
+   "key": [
+    "customer_demographics",
+    "date_dim",
+    "item",
+    "store",
+    "store_sales"
+   ],
+   "node": "HashAggregate (2 keys, 3 grouping sets)",
+   "est": 3,
+   "actual": 6175.0,
+   "qerr": 2058.3,
+   "pg_est": 29,
+   "pg_qerr": 212.9
+  },
+  {
+   "q": 73,
+   "key": [
+    "date_dim",
+    "household_demographics",
+    "store",
+    "store_sales"
+   ],
+   "node": "Hash Join",
+   "est": 3,
+   "actual": 5211.0,
+   "qerr": 1737.0,
+   "pg_est": 9,
+   "pg_qerr": 579.0
+  },
+  {
+   "q": 34,
+   "key": [
+    "date_dim",
+    "store_sales"
+   ],
+   "node": "Hash Join",
+   "est": 197,
+   "actual": 187815.0,
+   "qerr": 953.4,
+   "pg_est": null,
+   "pg_qerr": null
+  },
+  {
+   "q": 34,
+   "key": [
+    "date_dim",
+    "store",
+    "store_sales"
+   ],
+   "node": "Hash Join",
+   "est": 197,
+   "actual": 183343.0,
+   "qerr": 930.7,
+   "pg_est": null,
+   "pg_qerr": null
+  },
+  {
+   "q": 52,
+   "key": [
+    "date_dim",
+    "item",
+    "store_sales"
+   ],
+   "node": "Hash Join",
+   "est": 1,
+   "actual": 787.0,
+   "qerr": 787.0,
+   "pg_est": 3,
+   "pg_qerr": 262.3
+  },
+  {
+   "q": 60,
+   "key": [
+    "cte:cs"
+   ],
+   "node": "CTE Scan on cs",
+   "est": 1,
+   "actual": 766.0,
+   "qerr": 766.0,
+   "pg_est": null,
+   "pg_qerr": null
+  },
+  {
+   "q": 42,
+   "key": [
+    "date_dim",
+    "item",
+    "store_sales"
+   ],
+   "node": "Hash Join",
+   "est": 1,
+   "actual": 759.0,
+   "qerr": 759.0,
+   "pg_est": 3,
+   "pg_qerr": 253.0
+  },
+  {
+   "q": 19,
+   "key": [
+    "date_dim",
+    "item",
+    "store_sales"
+   ],
+   "node": "Hash Join",
+   "est": 1,
+   "actual": 649.0,
+   "qerr": 649.0,
+   "pg_est": null,
+   "pg_qerr": null
+  },
+  {
+   "q": 19,
+   "key": [
+    "customer",
+    "customer_address",
+    "date_dim",
+    "item",
+    "store_sales"
+   ],
+   "node": "Nested Loop",
+   "est": 1,
+   "actual": 631.0,
+   "qerr": 631.0,
+   "pg_est": null,
+   "pg_qerr": null
+  },
+  {
+   "q": 19,
+   "key": [
+    "customer",
+    "date_dim",
+    "item",
+    "store_sales"
+   ],
+   "node": "Nested Loop",
+   "est": 1,
+   "actual": 631.0,
+   "qerr": 631.0,
+   "pg_est": null,
+   "pg_qerr": null
+  },
+  {
+   "q": 33,
+   "key": [
+    "cte:cs"
+   ],
+   "node": "CTE Scan on cs",
+   "est": 1,
+   "actual": 613.0,
+   "qerr": 613.0,
+   "pg_est": null,
+   "pg_qerr": null
+  },
+  {
+   "q": 19,
+   "key": [
+    "customer",
+    "customer_address",
+    "date_dim",
+    "item",
+    "store",
+    "store_sales"
+   ],
+   "node": "Merge Join",
+   "est": 1,
+   "actual": 601.0,
+   "qerr": 601.0,
+   "pg_est": 9,
+   "pg_qerr": 66.8
+  },
+  {
+   "q": 73,
+   "key": [
+    "date_dim",
+    "store_sales"
+   ],
+   "node": "Hash Join",
+   "est": 98,
+   "actual": 54176.0,
+   "qerr": 552.8,
+   "pg_est": null,
+   "pg_qerr": null
+  },
+  {
+   "q": 73,
+   "key": [
+    "date_dim",
+    "store",
+    "store_sales"
+   ],
+   "node": "Hash Join",
+   "est": 98,
+   "actual": 52852.0,
+   "qerr": 539.3,
+   "pg_est": null,
+   "pg_qerr": null
+  },
+  {
+   "q": 33,
+   "key": [
+    "cte:ws"
+   ],
+   "node": "CTE Scan on ws",
+   "est": 1,
+   "actual": 535.0,
+   "qerr": 535.0,
+   "pg_est": null,
+   "pg_qerr": null
+  },
+  {
+   "q": 68,
+   "key": [
+    "customer_address",
+    "date_dim",
+    "household_demographics",
+    "store",
+    "store_sales"
+   ],
+   "node": "Hash Join",
+   "est": 24,
+   "actual": 12007.0,
+   "qerr": 500.3,
+   "pg_est": 94,
+   "pg_qerr": 127.7
+  },
+  {
+   "q": 60,
+   "key": [
+    "cte:ws"
+   ],
+   "node": "CTE Scan on ws",
+   "est": 1,
+   "actual": 450.0,
+   "qerr": 450.0,
+   "pg_est": null,
+   "pg_qerr": null
+  },
+  {
+   "q": 55,
+   "key": [
+    "date_dim",
+    "item",
+    "store_sales"
+   ],
+   "node": "Hash Join",
+   "est": 1,
+   "actual": 447.0,
+   "qerr": 447.0,
+   "pg_est": 3,
+   "pg_qerr": 149.0
+  },
+  {
+   "q": 66,
+   "key": [
+    "date_dim",
+    "ship_mode",
+    "web_sales"
+   ],
+   "node": "Nested Loop",
+   "est": 17,
+   "actual": 7509.0,
+   "qerr": 441.7,
+   "pg_est": 58,
+   "pg_qerr": 129.5
+  },
+  {
+   "q": 69,
+   "key": [
+    "customer",
+    "customer_address",
+    "customer_demographics",
+    "date_dim",
+    "store_sales",
+    "web_sales"
+   ],
+   "node": "Hash Anti Join",
+   "est": 1,
+   "actual": 418.0,
+   "qerr": 418.0,
+   "pg_est": 183,
+   "pg_qerr": 2.3
+  },
+  {
+   "q": 69,
+   "key": [
+    "catalog_sales",
+    "customer",
+    "customer_address",
+    "customer_demographics",
+    "date_dim",
+    "store_sales",
+    "web_sales"
+   ],
+   "node": "Hash Anti Join",
+   "est": 1,
+   "actual": 407.0,
+   "qerr": 407.0,
+   "pg_est": 100,
+   "pg_qerr": 4.1
+  },
+  {
+   "q": 66,
+   "key": [
+    "catalog_sales",
+    "date_dim",
+    "ship_mode"
+   ],
+   "node": "Nested Loop",
+   "est": 35,
+   "actual": 14169.0,
+   "qerr": 404.8,
+   "pg_est": 115,
+   "pg_qerr": 123.2
+  },
+  {
+   "q": 54,
+   "key": [
+    "my_customers.catalog_sales",
+    "my_customers.customer",
+    "my_customers.date_dim",
+    "my_customers.item",
+    "my_customers.web_sales"
+   ],
+   "node": "Nested Loop",
+   "est": 1,
+   "actual": 269.0,
+   "qerr": 269.0,
+   "pg_est": null,
+   "pg_qerr": null
+  },
+  {
+   "q": 54,
+   "key": [
+    "my_customers.catalog_sales",
+    "my_customers.date_dim",
+    "my_customers.item",
+    "my_customers.web_sales"
+   ],
+   "node": "Hash Join",
+   "est": 1,
+   "actual": 269.0,
+   "qerr": 269.0,
+   "pg_est": null,
+   "pg_qerr": null
+  },
+  {
+   "q": 56,
+   "key": [
+    "cte:cs"
+   ],
+   "node": "CTE Scan on cs",
+   "est": 1,
+   "actual": 236.0,
+   "qerr": 236.0,
+   "pg_est": null,
+   "pg_qerr": null
+  },
+  {
+   "q": 54,
+   "key": [
+    "cte:my_customers"
+   ],
+   "node": "CTE Scan on my_customers",
+   "est": 1,
+   "actual": 235.0,
+   "qerr": 235.0,
+   "pg_est": null,
+   "pg_qerr": null
+  },
+  {
+   "q": 69,
+   "key": [
+    "customer",
+    "customer_address",
+    "customer_demographics",
+    "date_dim",
+    "store_sales"
+   ],
+   "node": "Hash Semi Join",
+   "est": 2,
+   "actual": 422.0,
+   "qerr": 211.0,
+   "pg_est": 184,
+   "pg_qerr": 2.3
+  },
+  {
+   "q": 34,
+   "key": [
+    "customer",
+    "date_dim",
+    "household_demographics",
+    "store",
+    "store_sales"
+   ],
+   "node": "Sort",
+   "est": 1,
+   "actual": 187.0,
+   "qerr": 187.0,
+   "pg_est": 31,
+   "pg_qerr": 6.0
+  },
+  {
+   "q": 85,
+   "key": [
+    "customer_address",
+    "customer_demographics",
+    "date_dim",
+    "web_page",
+    "web_returns",
+    "web_sales"
+   ],
+   "node": "Hash Join",
+   "est": 177,
+   "actual": 0.0,
+   "qerr": 177.0,
+   "pg_est": null,
+   "pg_qerr": null
+  },
+  {
+   "q": 85,
+   "key": [
+    "customer_address",
+    "customer_demographics",
+    "date_dim",
+    "web_returns",
+    "web_sales"
+   ],
+   "node": "Nested Loop",
+   "est": 177,
+   "actual": 0.0,
+   "qerr": 177.0,
+   "pg_est": null,
+   "pg_qerr": null
+  },
+  {
+   "q": 94,
+   "key": [
+    "customer_address",
+    "date_dim",
+    "web_returns",
+    "web_sales",
+    "web_site"
+   ],
+   "node": "Sort",
+   "est": 339,
+   "actual": 2.0,
+   "qerr": 169.5,
+   "pg_est": 1,
+   "pg_qerr": 2.0
+  },
+  {
+   "q": 3,
+   "key": [
+    "date_dim",
+    "item",
+    "store_sales"
+   ],
+   "node": "Hash Join",
+   "est": 1,
+   "actual": 159.0,
+   "qerr": 159.0,
+   "pg_est": 59,
+   "pg_qerr": 2.7
+  },
+  {
+   "q": 51,
+   "key": [
+    "cte:store_v1",
+    "cte:web_v1"
+   ],
+   "node": "WindowAgg (2 funcs)",
+   "est": 2174,
+   "actual": 324249.0,
+   "qerr": 149.1,
+   "pg_est": null,
+   "pg_qerr": null
+  },
+  {
+   "q": 54,
+   "key": [
+    "cte:my_customers",
+    "my_revenue.customer_address",
+    "my_revenue.store_sales"
+   ],
+   "node": "Nested Loop",
+   "est": 25,
+   "actual": 3448.0,
+   "qerr": 137.9,
+   "pg_est": null,
+   "pg_qerr": null
+  },
+  {
+   "q": 54,
+   "key": [
+    "cte:my_customers",
+    "my_revenue.store_sales"
+   ],
+   "node": "Hash Join",
+   "est": 25,
+   "actual": 3448.0,
+   "qerr": 137.9,
+   "pg_est": null,
+   "pg_qerr": null
+  },
+  {
+   "q": 54,
+   "key": [
+    "cte:my_customers",
+    "my_revenue.customer_address",
+    "my_revenue.date_dim",
+    "my_revenue.store_sales"
+   ],
+   "node": "Nested Loop",
+   "est": 25,
+   "actual": 3364.0,
+   "qerr": 134.6,
+   "pg_est": null,
+   "pg_qerr": null
+  },
+  {
+   "q": 94,
+   "key": [
+    "customer_address",
+    "date_dim",
+    "web_sales",
+    "web_site"
+   ],
+   "node": "Hash Semi Join",
+   "est": 1128,
+   "actual": 9.0,
+   "qerr": 125.3,
+   "pg_est": 1,
+   "pg_qerr": 9.0
+  },
+  {
+   "q": 56,
+   "key": [
+    "cte:ws"
+   ],
+   "node": "CTE Scan on ws",
+   "est": 1,
+   "actual": 112.0,
+   "qerr": 112.0,
+   "pg_est": null,
+   "pg_qerr": null
+  },
+  {
+   "q": 37,
+   "key": [
+    "date_dim",
+    "inventory",
+    "item"
+   ],
+   "node": "Hash Join",
+   "est": 101,
+   "actual": 0.0,
+   "qerr": 101.0,
+   "pg_est": 1,
+   "pg_qerr": 1.0
+  },
+  {
+   "q": 82,
+   "key": [
+    "date_dim",
+    "inventory",
+    "item"
+   ],
+   "node": "Hash Join",
+   "est": 101,
+   "actual": 0.0,
+   "qerr": 101.0,
+   "pg_est": 1,
+   "pg_qerr": 1.0
+  },
+  {
+   "q": 93,
+   "key": [
+    "reason",
+    "store_returns",
+    "store_sales"
+   ],
+   "node": "Limit",
+   "est": 100,
+   "actual": 0.0,
+   "qerr": 100.0,
+   "pg_est": 3,
+   "pg_qerr": 3.0
+  },
+  {
+   "q": 14,
+   "key": [
+    "date_dim",
+    "item",
+    "web_sales"
+   ],
+   "node": "Nested Loop",
+   "est": 142,
+   "actual": 11986.0,
+   "qerr": 84.4,
+   "pg_est": null,
+   "pg_qerr": null
+  },
+  {
+   "q": 14,
+   "key": [
+    "date_dim",
+    "web_sales"
+   ],
+   "node": "Hash Join",
+   "est": 142,
+   "actual": 11986.0,
+   "qerr": 84.4,
+   "pg_est": null,
+   "pg_qerr": null
+  },
+  {
+   "q": 55,
+   "key": [
+    "item",
+    "store_sales"
+   ],
+   "node": "Nested Loop",
+   "est": 169,
+   "actual": 14271.0,
+   "qerr": 84.4,
+   "pg_est": 7951,
+   "pg_qerr": 1.8
+  },
+  {
+   "q": 14,
+   "key": [
+    "catalog_sales",
+    "date_dim",
+    "item"
+   ],
+   "node": "Merge Join",
+   "est": 286,
+   "actual": 23513.0,
+   "qerr": 82.2,
+   "pg_est": null,
+   "pg_qerr": null
+  },
+  {
+   "q": 14,
+   "key": [
+    "catalog_sales",
+    "date_dim"
+   ],
+   "node": "Hash Join",
+   "est": 286,
+   "actual": 23513.0,
+   "qerr": 82.2,
+   "pg_est": null,
+   "pg_qerr": null
+  },
+  {
+   "q": 42,
+   "key": [
+    "item",
+    "store_sales"
+   ],
+   "node": "Nested Loop",
+   "est": 321,
+   "actual": 25104.0,
+   "qerr": 78.2,
+   "pg_est": null,
+   "pg_qerr": null
+  },
+  {
+   "q": 52,
+   "key": [
+    "item",
+    "store_sales"
+   ],
+   "node": "Nested Loop",
+   "est": 321,
+   "actual": 25104.0,
+   "qerr": 78.2,
+   "pg_est": null,
+   "pg_qerr": null
+  },
+  {
+   "q": 19,
+   "key": [
+    "item",
+    "store_sales"
+   ],
+   "node": "Nested Loop",
+   "est": 293,
+   "actual": 22665.0,
+   "qerr": 77.4,
+   "pg_est": null,
+   "pg_qerr": null
+  },
+  {
+   "q": 61,
+   "key": [
+    "date_dim",
+    "store_sales"
+   ],
+   "node": "Hash Join",
+   "est": 610,
+   "actual": 46822.0,
+   "qerr": 76.8,
+   "pg_est": null,
+   "pg_qerr": null
+  },
+  {
+   "q": 14,
+   "key": [
+    "date_dim",
+    "store_sales"
+   ],
+   "node": "Hash Join",
+   "est": 571,
+   "actual": 43569.0,
+   "qerr": 76.3,
+   "pg_est": null,
+   "pg_qerr": null
+  },
+  {
+   "q": 3,
+   "key": [
+    "item",
+    "store_sales"
+   ],
+   "node": "Nested Loop",
+   "est": 15,
+   "actual": 976.0,
+   "qerr": 65.1,
+   "pg_est": 753,
+   "pg_qerr": 1.3
+  },
+  {
+   "q": 97,
+   "key": [
+    "cte:csci",
+    "cte:ssci"
+   ],
+   "node": "Merge Full Join",
+   "est": 6523,
+   "actual": 420546.0,
+   "qerr": 64.5,
+   "pg_est": null,
+   "pg_qerr": null
+  },
+  {
+   "q": 95,
+   "key": [
+    "cte:ws_wh",
+    "customer_address",
+    "date_dim",
+    "web_returns",
+    "web_site",
+    "ws1"
+   ],
+   "node": "Sort",
+   "est": 1781,
+   "actual": 28.0,
+   "qerr": 63.6,
+   "pg_est": null,
+   "pg_qerr": null
+  },
+  {
+   "q": 48,
+   "key": [
+    "customer_address",
+    "date_dim",
+    "store_sales"
+   ],
+   "node": "Hash Join",
+   "est": 187,
+   "actual": 11842.0,
+   "qerr": 63.3,
+   "pg_est": null,
+   "pg_qerr": null
+  },
+  {
+   "q": 95,
+   "key": [
+    "cte:ws_wh",
+    "customer_address",
+    "date_dim",
+    "web_site",
+    "ws1"
+   ],
+   "node": "Hash Semi Join",
+   "est": 2549,
+   "actual": 42.0,
+   "qerr": 60.7,
+   "pg_est": null,
+   "pg_qerr": null
+  },
+  {
+   "q": 95,
+   "key": [
+    "customer_address",
+    "date_dim",
+    "web_site",
+    "ws1"
+   ],
+   "node": "Nested Loop",
+   "est": 2549,
+   "actual": 42.0,
+   "qerr": 60.7,
+   "pg_est": null,
+   "pg_qerr": null
+  },
+  {
+   "q": 17,
+   "key": [
+    "catalog_sales",
+    "date_dim",
+    "store_returns",
+    "store_sales"
+   ],
+   "node": "Nested Loop",
+   "est": 534,
+   "actual": 9.0,
+   "qerr": 59.3,
+   "pg_est": null,
+   "pg_qerr": null
+  },
+  {
+   "q": 60,
+   "key": [
+    "cs.catalog_sales",
+    "cs.date_dim"
+   ],
+   "node": "Hash Join",
+   "est": 295,
+   "actual": 16029.0,
+   "qerr": 54.3,
+   "pg_est": null,
+   "pg_qerr": null
+  },
+  {
+   "q": 60,
+   "key": [
+    "cte:cs",
+    "cte:ss",
+    "cte:ws"
+   ],
+   "node": "Append",
+   "est": 44,
+   "actual": 2382.0,
+   "qerr": 54.1,
+   "pg_est": null,
+   "pg_qerr": null
+  },
+  {
+   "q": 60,
+   "key": [
+    "ws.date_dim",
+    "ws.web_sales"
+   ],
+   "node": "Hash Join",
+   "est": 147,
+   "actual": 7796.0,
+   "qerr": 53.0,
+   "pg_est": null,
+   "pg_qerr": null
+  },
+  {
+   "q": 60,
+   "key": [
+    "ss.customer_address",
+    "ss.date_dim",
+    "ss.item",
+    "ss.store_sales"
+   ],
+   "node": "Merge Join",
+   "est": 215,
+   "actual": 11295.0,
+   "qerr": 52.5,
+   "pg_est": null,
+   "pg_qerr": null
+  },
+  {
+   "q": 60,
+   "key": [
+    "ss.customer_address",
+    "ss.date_dim",
+    "ss.store_sales"
+   ],
+   "node": "Hash Join",
+   "est": 215,
+   "actual": 11295.0,
+   "qerr": 52.5,
+   "pg_est": null,
+   "pg_qerr": null
+  },
+  {
+   "q": 60,
+   "key": [
+    "ss.date_dim",
+    "ss.store_sales"
+   ],
+   "node": "Hash Join",
+   "est": 591,
+   "actual": 30883.0,
+   "qerr": 52.3,
+   "pg_est": null,
+   "pg_qerr": null
+  },
+  {
+   "q": 60,
+   "key": [
+    "cs.catalog_sales",
+    "cs.customer_address",
+    "cs.date_dim",
+    "cs.item"
+   ],
+   "node": "Nested Loop",
+   "est": 107,
+   "actual": 5482.0,
+   "qerr": 51.2,
+   "pg_est": null,
+   "pg_qerr": null
+  },
+  {
+   "q": 60,
+   "key": [
+    "cs.catalog_sales",
+    "cs.customer_address",
+    "cs.date_dim"
+   ],
+   "node": "Hash Join",
+   "est": 107,
+   "actual": 5482.0,
+   "qerr": 51.2,
+   "pg_est": null,
+   "pg_qerr": null
+  },
+  {
+   "q": 68,
+   "key": [
+    "customer",
+    "customer_address",
+    "date_dim",
+    "household_demographics",
+    "store",
+    "store_sales"
+   ],
+   "node": "Nested Loop",
+   "est": 24,
+   "actual": 1114.0,
+   "qerr": 46.4,
+   "pg_est": 100,
+   "pg_qerr": 11.1
+  },
+  {
+   "q": 51,
+   "key": [
+    "web_v1.date_dim",
+    "web_v1.web_sales"
+   ],
+   "node": "Hash Join",
+   "est": 1628,
+   "actual": 74491.0,
+   "qerr": 45.8,
+   "pg_est": null,
+   "pg_qerr": null
+  },
+  {
+   "q": 51,
+   "key": [
+    "cte:web_v1"
+   ],
+   "node": "CTE Scan on web_v1 web",
+   "est": 1628,
+   "actual": 73440.0,
+   "qerr": 45.1,
+   "pg_est": null,
+   "pg_qerr": null
+  },
+  {
+   "q": 16,
+   "key": [
+    "call_center",
+    "catalog_sales",
+    "customer_address",
+    "date_dim"
+   ],
+   "node": "Hash Semi Join",
+   "est": 11554,
+   "actual": 260.0,
+   "qerr": 44.4,
+   "pg_est": null,
+   "pg_qerr": null
+  },
+  {
+   "q": 97,
+   "key": [
+    "cte:csci"
+   ],
+   "node": "CTE Scan on csci",
+   "est": 3265,
+   "actual": 143777.0,
+   "qerr": 44.0,
+   "pg_est": null,
+   "pg_qerr": null
+  },
+  {
+   "q": 97,
+   "key": [
+    "csci.catalog_sales",
+    "csci.date_dim"
+   ],
+   "node": "Hash Join",
+   "est": 3265,
+   "actual": 143794.0,
+   "qerr": 44.0,
+   "pg_est": null,
+   "pg_qerr": null
+  },
+  {
+   "q": 97,
+   "key": [
+    "ssci.date_dim",
+    "ssci.store_sales"
+   ],
+   "node": "Hash Join",
+   "est": 6523,
+   "actual": 278617.0,
+   "qerr": 42.7,
+   "pg_est": null,
+   "pg_qerr": null
+  },
+  {
+   "q": 97,
+   "key": [
+    "cte:ssci"
+   ],
+   "node": "CTE Scan on ssci",
+   "est": 6523,
+   "actual": 276804.0,
+   "qerr": 42.4,
+   "pg_est": null,
+   "pg_qerr": null
+  },
+  {
+   "q": 57,
+   "key": [
+    "v1.catalog_sales",
+    "v1.date_dim",
+    "v1.item"
+   ],
+   "node": "Hash Join",
+   "est": 4173,
+   "actual": 174855.0,
+   "qerr": 41.9,
+   "pg_est": null,
+   "pg_qerr": null
+  },
+  {
+   "q": 51,
+   "key": [
+    "store_v1.date_dim",
+    "store_v1.store_sales"
+   ],
+   "node": "Hash Join",
+   "est": 6523,
+   "actual": 272543.0,
+   "qerr": 41.8,
+   "pg_est": null,
+   "pg_qerr": null
+  },
+  {
+   "q": 66,
+   "key": [
+    "date_dim",
+    "web_sales"
+   ],
+   "node": "Hash Join",
+   "est": 1781,
+   "actual": 74491.0,
+   "qerr": 41.8,
+   "pg_est": null,
+   "pg_qerr": null
+  },
+  {
+   "q": 29,
+   "key": [
+    "catalog_sales",
+    "date_dim",
+    "store_returns"
+   ],
+   "node": "Hash Join",
+   "est": 1,
+   "actual": 41.0,
+   "qerr": 41.0,
+   "pg_est": null,
+   "pg_qerr": null
+  },
+  {
+   "q": 47,
+   "key": [
+    "v1.date_dim",
+    "v1.item",
+    "v1.store_sales"
+   ],
+   "node": "Hash Join",
+   "est": 8336,
+   "actual": 340267.0,
+   "qerr": 40.8,
+   "pg_est": null,
+   "pg_qerr": null
+  },
+  {
+   "q": 85,
+   "key": [
+    "date_dim",
+    "web_sales"
+   ],
+   "node": "Hash Join",
+   "est": 1781,
+   "actual": 72124.0,
+   "qerr": 40.5,
+   "pg_est": null,
+   "pg_qerr": null
+  },
+  {
+   "q": 85,
+   "key": [
+    "date_dim",
+    "web_returns",
+    "web_sales"
+   ],
+   "node": "Hash Join",
+   "est": 177,
+   "actual": 7141.0,
+   "qerr": 40.3,
+   "pg_est": null,
+   "pg_qerr": null
+  },
+  {
+   "q": 66,
+   "key": [
+    "catalog_sales",
+    "date_dim"
+   ],
+   "node": "Hash Join",
+   "est": 3571,
+   "actual": 143408.0,
+   "qerr": 40.2,
+   "pg_est": null,
+   "pg_qerr": null
+  },
+  {
+   "q": 72,
+   "key": [
+    "catalog_sales",
+    "date_dim"
+   ],
+   "node": "Hash Join",
+   "est": 3571,
+   "actual": 142656.0,
+   "qerr": 39.9,
+   "pg_est": null,
+   "pg_qerr": null
+  },
+  {
+   "q": 29,
+   "key": [
+    "catalog_sales",
+    "date_dim"
+   ],
+   "node": "Hash Join",
+   "est": 10782,
+   "actual": 429337.0,
+   "qerr": 39.8,
+   "pg_est": null,
+   "pg_qerr": null
+  },
+  {
+   "q": 13,
+   "key": [
+    "customer_address",
+    "date_dim",
+    "store_sales"
+   ],
+   "node": "Hash Join",
+   "est": 72,
+   "actual": 2852.0,
+   "qerr": 39.6,
+   "pg_est": null,
+   "pg_qerr": null
+  },
+  {
+   "q": 37,
+   "key": [
+    "date_dim",
+    "inventory"
+   ],
+   "node": "Nested Loop",
+   "est": 1818353,
+   "actual": 45874.0,
+   "qerr": 39.6,
+   "pg_est": null,
+   "pg_qerr": null
+  },
+  {
+   "q": 51,
+   "key": [
+    "cte:store_v1"
+   ],
+   "node": "CTE Scan on store_v1 store",
+   "est": 6523,
+   "actual": 258258.0,
+   "qerr": 39.6,
+   "pg_est": null,
+   "pg_qerr": null
+  },
+  {
+   "q": 13,
+   "key": [
+    "customer_address",
+    "customer_demographics",
+    "date_dim",
+    "store_sales"
+   ],
+   "node": "Nested Loop",
+   "est": 72,
+   "actual": 2834.0,
+   "qerr": 39.4,
+   "pg_est": null,
+   "pg_qerr": null
+  },
+  {
+   "q": 13,
+   "key": [
+    "date_dim",
+    "store_sales"
+   ],
+   "node": "Hash Join",
+   "est": 7134,
+   "actual": 272543.0,
+   "qerr": 38.2,
+   "pg_est": null,
+   "pg_qerr": null
+  },
+  {
+   "q": 83,
+   "key": [
+    "cte:wr_items"
+   ],
+   "node": "CTE Scan on wr_items",
+   "est": 9,
+   "actual": 344.0,
+   "qerr": 38.2,
+   "pg_est": null,
+   "pg_qerr": null
+  },
+  {
+   "q": 89,
+   "key": [
+    "date_dim",
+    "store_sales"
+   ],
+   "node": "Hash Join",
+   "est": 7134,
+   "actual": 272543.0,
+   "qerr": 38.2,
+   "pg_est": null,
+   "pg_qerr": null
+  },
+  {
+   "q": 27,
+   "key": [
+    "customer_demographics",
+    "date_dim",
+    "store_sales"
+   ],
+   "node": "Hash Join",
+   "est": 101,
+   "actual": 3813.0,
+   "qerr": 37.8,
+   "pg_est": null,
+   "pg_qerr": null
+  },
+  {
+   "q": 46,
+   "key": [
+    "customer_address",
+    "date_dim",
+    "household_demographics",
+    "store_sales"
+   ],
+   "node": "Hash Join",
+   "est": 1542,
+   "actual": 58323.0,
+   "qerr": 37.8,
+   "pg_est": null,
+   "pg_qerr": null
+  },
+  {
+   "q": 7,
+   "key": [
+    "customer_demographics",
+    "date_dim",
+    "item",
+    "store_sales"
+   ],
+   "node": "Nested Loop",
+   "est": 103,
+   "actual": 3620.0,
+   "qerr": 35.1,
+   "pg_est": null,
+   "pg_qerr": null
+  },
+  {
+   "q": 7,
+   "key": [
+    "customer_demographics",
+    "date_dim",
+    "store_sales"
+   ],
+   "node": "Hash Join",
+   "est": 103,
+   "actual": 3620.0,
+   "qerr": 35.1,
+   "pg_est": null,
+   "pg_qerr": null
+  },
+  {
+   "q": 85,
+   "key": [
+    "customer_address",
+    "customer_demographics",
+    "date_dim",
+    "reason",
+    "web_page",
+    "web_returns",
+    "web_sales"
+   ],
+   "node": "Limit",
+   "est": 34,
+   "actual": 0.0,
+   "qerr": 34.0,
+   "pg_est": 2,
+   "pg_qerr": 2.0
+  },
+  {
+   "q": 39,
+   "key": [
+    "inv.date_dim",
+    "inv.inventory",
+    "inv.item"
+   ],
+   "node": "Hash Join",
+   "est": 23340,
+   "actual": 780000.0,
+   "qerr": 33.4,
+   "pg_est": null,
+   "pg_qerr": null
+  },
+  {
+   "q": 83,
+   "key": [
+    "cte:cr_items"
+   ],
+   "node": "CTE Scan on cr_items",
+   "est": 19,
+   "actual": 632.0,
+   "qerr": 33.3,
+   "pg_est": null,
+   "pg_qerr": null
+  },
+  {
+   "q": 8,
+   "key": [
+    "customer",
+    "customer_address",
+    "store"
+   ],
+   "node": "Hash Join",
+   "est": 31,
+   "actual": 0.0,
+   "qerr": 31.0,
+   "pg_est": 12,
+   "pg_qerr": 12.0
+  },
+  {
+   "q": 29,
+   "key": [
+    "catalog_sales",
+    "date_dim",
+    "store_returns",
+    "store_sales"
+   ],
+   "node": "Nested Loop",
+   "est": 1,
+   "actual": 30.0,
+   "qerr": 30.0,
+   "pg_est": null,
+   "pg_qerr": null
+  },
+  {
+   "q": 34,
+   "key": [
+    "household_demographics"
+   ],
+   "node": "Seq Scan on household_demographics",
+   "est": 244,
+   "actual": 7200.0,
+   "qerr": 29.5,
+   "pg_est": 489,
+   "pg_qerr": 14.7
+  },
+  {
+   "q": 73,
+   "key": [
+    "household_demographics"
+   ],
+   "node": "Seq Scan on household_demographics",
+   "est": 244,
+   "actual": 7200.0,
+   "qerr": 29.5,
+   "pg_est": 489,
+   "pg_qerr": 14.7
+  },
+  {
+   "q": 24,
+   "key": [
+    "ssales.customer",
+    "ssales.customer_address",
+    "ssales.item",
+    "ssales.store",
+    "ssales.store_returns",
+    "ssales.store_sales"
+   ],
+   "node": "HashAggregate",
+   "est": 29,
+   "actual": 0.0,
+   "qerr": 29.0,
+   "pg_est": 1,
+   "pg_qerr": 1.0
+  },
+  {
+   "q": 24,
+   "key": [
+    "ssales.customer",
+    "ssales.customer_address",
+    "ssales.store",
+    "ssales.store_returns",
+    "ssales.store_sales"
+   ],
+   "node": "Nested Loop",
+   "est": 29,
+   "actual": 0.0,
+   "qerr": 29.0,
+   "pg_est": 1,
+   "pg_qerr": 1.0
+  },
+  {
+   "q": 24,
+   "key": [
+    "ssales.customer",
+    "ssales.customer_address",
+    "ssales.store",
+    "ssales.store_sales"
+   ],
+   "node": "Hash Join",
+   "est": 29,
+   "actual": 0.0,
+   "qerr": 29.0,
+   "pg_est": null,
+   "pg_qerr": null
+  },
+  {
+   "q": 83,
+   "key": [
+    "cte:sr_items"
+   ],
+   "node": "CTE Scan on sr_items",
+   "est": 39,
+   "actual": 1103.0,
+   "qerr": 28.3,
+   "pg_est": null,
+   "pg_qerr": null
+  },
+  {
+   "q": 60,
+   "key": [
+    "cte:ss"
+   ],
+   "node": "CTE Scan on ss",
+   "est": 42,
+   "actual": 1166.0,
+   "qerr": 27.8,
+   "pg_est": null,
+   "pg_qerr": null
+  },
+  {
+   "q": 54,
+   "key": [
+    "my_customers.catalog_sales",
+    "my_customers.date_dim",
+    "my_customers.web_sales"
+   ],
+   "node": "Hash Join",
+   "est": 443,
+   "actual": 11258.0,
+   "qerr": 25.4,
+   "pg_est": null,
+   "pg_qerr": null
+  },
+  {
+   "q": 24,
+   "key": [
+    "ssales.customer",
+    "ssales.customer_address",
+    "ssales.store"
+   ],
+   "node": "Hash Join",
+   "est": 25,
+   "actual": 0.0,
+   "qerr": 25.0,
+   "pg_est": null,
+   "pg_qerr": null
+  },
+  {
+   "q": 49,
+   "key": [
+    "catalog_returns",
+    "catalog_sales",
+    "date_dim",
+    "store_returns",
+    "store_sales",
+    "web_returns",
+    "web_sales"
+   ],
+   "node": "Limit",
+   "est": 1,
+   "actual": 25.0,
+   "qerr": 25.0,
+   "pg_est": 3,
+   "pg_qerr": 8.3
+  },
+  {
+   "q": 56,
+   "key": [
+    "cte:cs",
+    "cte:ss",
+    "cte:ws"
+   ],
+   "node": "Append",
+   "est": 29,
+   "actual": 718.0,
+   "qerr": 24.8,
+   "pg_est": null,
+   "pg_qerr": null
+  },
+  {
+   "q": 58,
+   "key": [
+    "cte:cs_items"
+   ],
+   "node": "CTE Scan on cs_items",
+   "est": 59,
+   "actual": 1456.0,
+   "qerr": 24.7,
+   "pg_est": null,
+   "pg_qerr": null
+  },
+  {
+   "q": 5,
+   "key": [
+    "cte:csr"
+   ],
+   "node": "CTE Scan on csr",
+   "est": 11718,
+   "actual": 483.0,
+   "qerr": 24.3,
+   "pg_est": null,
+   "pg_qerr": null
+  },
+  {
+   "q": 56,
+   "key": [
+    "cs.catalog_sales",
+    "cs.customer_address",
+    "cs.date_dim",
+    "cs.item"
+   ],
+   "node": "Nested Loop",
+   "est": 134,
+   "actual": 3197.0,
+   "qerr": 23.9,
+   "pg_est": null,
+   "pg_qerr": null
+  },
+  {
+   "q": 56,
+   "key": [
+    "cs.catalog_sales",
+    "cs.customer_address",
+    "cs.date_dim"
+   ],
+   "node": "Hash Join",
+   "est": 134,
+   "actual": 3197.0,
+   "qerr": 23.9,
+   "pg_est": null,
+   "pg_qerr": null
+  },
+  {
+   "q": 33,
+   "key": [
+    "ss.customer_address",
+    "ss.date_dim",
+    "ss.item",
+    "ss.store_sales"
+   ],
+   "node": "Merge Join",
+   "est": 222,
+   "actual": 5294.0,
+   "qerr": 23.8,
+   "pg_est": null,
+   "pg_qerr": null
+  },
+  {
+   "q": 33,
+   "key": [
+    "ss.customer_address",
+    "ss.date_dim",
+    "ss.store_sales"
+   ],
+   "node": "Hash Join",
+   "est": 222,
+   "actual": 5294.0,
+   "qerr": 23.8,
+   "pg_est": null,
+   "pg_qerr": null
+  },
+  {
+   "q": 56,
+   "key": [
+    "cs.catalog_sales",
+    "cs.date_dim"
+   ],
+   "node": "Hash Join",
+   "est": 305,
+   "actual": 7233.0,
+   "qerr": 23.7,
+   "pg_est": null,
+   "pg_qerr": null
+  },
+  {
+   "q": 5,
+   "key": [
+    "cte:csr",
+    "cte:ssr",
+    "cte:wsr"
+   ],
+   "node": "HashAggregate (2 keys, 3 grouping sets)",
+   "est": 11940,
+   "actual": 508.0,
+   "qerr": 23.5,
+   "pg_est": null,
+   "pg_qerr": null
+  },
+  {
+   "q": 33,
+   "key": [
+    "cs.catalog_sales",
+    "cs.customer_address",
+    "cs.date_dim",
+    "cs.item"
+   ],
+   "node": "Nested Loop",
+   "est": 111,
+   "actual": 2573.0,
+   "qerr": 23.2,
+   "pg_est": null,
+   "pg_qerr": null
+  },
+  {
+   "q": 33,
+   "key": [
+    "cs.catalog_sales",
+    "cs.customer_address",
+    "cs.date_dim"
+   ],
+   "node": "Hash Join",
+   "est": 111,
+   "actual": 2573.0,
+   "qerr": 23.2,
+   "pg_est": null,
+   "pg_qerr": null
+  },
+  {
+   "q": 32,
+   "key": [
+    "catalog_sales",
+    "item"
+   ],
+   "node": "Nested Loop",
+   "est": 15,
+   "actual": 338.0,
+   "qerr": 22.5,
+   "pg_est": null,
+   "pg_qerr": null
+  },
+  {
+   "q": 33,
+   "key": [
+    "cs.catalog_sales",
+    "cs.date_dim"
+   ],
+   "node": "Hash Join",
+   "est": 305,
+   "actual": 6728.0,
+   "qerr": 22.1,
+   "pg_est": null,
+   "pg_qerr": null
+  },
+  {
+   "q": 56,
+   "key": [
+    "ws.date_dim",
+    "ws.web_sales"
+   ],
+   "node": "Hash Join",
+   "est": 152,
+   "actual": 3356.0,
+   "qerr": 22.1,
+   "pg_est": null,
+   "pg_qerr": null
+  },
+  {
+   "q": 58,
+   "key": [
+    "cte:ws_items"
+   ],
+   "node": "CTE Scan on ws_items",
+   "est": 29,
+   "actual": 642.0,
+   "qerr": 22.1,
+   "pg_est": null,
+   "pg_qerr": null
+  },
+  {
+   "q": 33,
+   "key": [
+    "ws.date_dim",
+    "ws.web_sales"
+   ],
+   "node": "Hash Join",
+   "est": 152,
+   "actual": 3350.0,
+   "qerr": 22.0,
+   "pg_est": null,
+   "pg_qerr": null
+  },
+  {
+   "q": 56,
+   "key": [
+    "ss.date_dim",
+    "ss.store_sales"
+   ],
+   "node": "Hash Join",
+   "est": 610,
+   "actual": 13329.0,
+   "qerr": 21.9,
+   "pg_est": null,
+   "pg_qerr": null
+  },
+  {
+   "q": 33,
+   "key": [
+    "ss.date_dim",
+    "ss.store_sales"
+   ],
+   "node": "Hash Join",
+   "est": 610,
+   "actual": 13020.0,
+   "qerr": 21.3,
+   "pg_est": null,
+   "pg_qerr": null
+  },
+  {
+   "q": 56,
+   "key": [
+    "cs.item"
+   ],
+   "node": "Seq Scan on item_3",
+   "est": 879,
+   "actual": 18000.0,
+   "qerr": 20.5,
+   "pg_est": null,
+   "pg_qerr": null
+  },
+  {
+   "q": 56,
+   "key": [
+    "ws.item"
+   ],
+   "node": "Seq Scan on item_5",
+   "est": 879,
+   "actual": 18000.0,
+   "qerr": 20.5,
+   "pg_est": null,
+   "pg_qerr": null
+  },
+  {
+   "q": 56,
+   "key": [
+    "ss.customer_address",
+    "ss.date_dim",
+    "ss.item",
+    "ss.store_sales"
+   ],
+   "node": "Merge Join",
+   "est": 268,
+   "actual": 5453.0,
+   "qerr": 20.3,
+   "pg_est": null,
+   "pg_qerr": null
+  },
+  {
+   "q": 56,
+   "key": [
+    "ss.customer_address",
+    "ss.date_dim",
+    "ss.store_sales"
+   ],
+   "node": "Hash Join",
+   "est": 268,
+   "actual": 5453.0,
+   "qerr": 20.3,
+   "pg_est": null,
+   "pg_qerr": null
+  },
+  {
+   "q": 58,
+   "key": [
+    "cte:ss_items"
+   ],
+   "node": "CTE Scan on ss_items",
+   "est": 118,
+   "actual": 2368.0,
+   "qerr": 20.1,
+   "pg_est": null,
+   "pg_qerr": null
+  },
+  {
+   "q": 60,
+   "key": [
+    "ws.customer_address",
+    "ws.date_dim",
+    "ws.item",
+    "ws.web_sales"
+   ],
+   "node": "Nested Loop",
+   "est": 147,
+   "actual": 2937.0,
+   "qerr": 20.0,
+   "pg_est": null,
+   "pg_qerr": null
+  },
+  {
+   "q": 60,
+   "key": [
+    "ws.customer_address",
+    "ws.date_dim",
+    "ws.web_sales"
+   ],
+   "node": "Nested Loop",
+   "est": 147,
+   "actual": 2937.0,
+   "qerr": 20.0,
+   "pg_est": null,
+   "pg_qerr": null
+  },
+  {
+   "q": 17,
+   "key": [
+    "catalog_sales",
+    "date_dim",
+    "store",
+    "store_returns",
+    "store_sales"
+   ],
+   "node": "Nested Loop",
+   "est": 16,
+   "actual": 0.0,
+   "qerr": 16.0,
+   "pg_est": null,
+   "pg_qerr": null
+  },
+  {
+   "q": 49,
+   "key": [
+    "catalog_returns",
+    "catalog_sales",
+    "date_dim",
+    "web_returns",
+    "web_sales"
+   ],
+   "node": "HashSetOp Union",
+   "est": 1,
+   "actual": 15.0,
+   "qerr": 15.0,
+   "pg_est": null,
+   "pg_qerr": null
+  },
+  {
+   "q": 88,
+   "key": [
+    "household_demographics"
+   ],
+   "node": "Seq Scan on household_demographics",
+   "est": 483,
+   "actual": 7200.0,
+   "qerr": 14.9,
+   "pg_est": 1152,
+   "pg_qerr": 6.2
+  },
+  {
+   "q": 80,
+   "key": [
+    "cte:csr"
+   ],
+   "node": "CTE Scan on csr",
+   "est": 4585,
+   "actual": 331.0,
+   "qerr": 13.9,
+   "pg_est": null,
+   "pg_qerr": null
+  },
+  {
+   "q": 56,
+   "key": [
+    "cte:ss"
+   ],
+   "node": "CTE Scan on ss",
+   "est": 27,
+   "actual": 370.0,
+   "qerr": 13.7,
+   "pg_est": null,
+   "pg_qerr": null
+  },
+  {
+   "q": 80,
+   "key": [
+    "cte:csr",
+    "cte:ssr",
+    "cte:wsr"
+   ],
+   "node": "HashAggregate (2 keys, 3 grouping sets)",
+   "est": 4807,
+   "actual": 356.0,
+   "qerr": 13.5,
+   "pg_est": null,
+   "pg_qerr": null
+  },
+  {
+   "q": 10,
+   "key": [
+    "customer",
+    "customer_address",
+    "customer_demographics",
+    "date_dim",
+    "store_sales"
+   ],
+   "node": "Hash Semi Join",
+   "est": 1,
+   "actual": 13.0,
+   "qerr": 13.0,
+   "pg_est": 5,
+   "pg_qerr": 2.6
+  },
+  {
+   "q": 24,
+   "key": [
+    "ssales.customer_address",
+    "ssales.store"
+   ],
+   "node": "Hash Join",
+   "est": 13,
+   "actual": 0.0,
+   "qerr": 13.0,
+   "pg_est": null,
+   "pg_qerr": null
+  },
+  {
+   "q": 5,
+   "key": [
+    "ssr.date_dim",
+    "ssr.store",
+    "ssr.store_returns",
+    "ssr.store_sales"
+   ],
+   "node": "Hash Join",
+   "est": 175887,
+   "actual": 15089.0,
+   "qerr": 11.7,
+   "pg_est": null,
+   "pg_qerr": null
+  },
+  {
+   "q": 5,
+   "key": [
+    "ssr.date_dim",
+    "ssr.store_returns",
+    "ssr.store_sales"
+   ],
+   "node": "Hash Join",
+   "est": 175887,
+   "actual": 15428.0,
+   "qerr": 11.4,
+   "pg_est": null,
+   "pg_qerr": null
+  },
+  {
+   "q": 5,
+   "key": [
+    "csr.catalog_page",
+    "csr.catalog_returns",
+    "csr.catalog_sales",
+    "csr.date_dim"
+   ],
+   "node": "Hash Join",
+   "est": 88058,
+   "actual": 7894.0,
+   "qerr": 11.2,
+   "pg_est": null,
+   "pg_qerr": null
+  },
+  {
+   "q": 5,
+   "key": [
+    "csr.catalog_returns",
+    "csr.catalog_sales",
+    "csr.date_dim"
+   ],
+   "node": "Hash Join",
+   "est": 88058,
+   "actual": 7912.0,
+   "qerr": 11.1,
+   "pg_est": null,
+   "pg_qerr": null
+  },
+  {
+   "q": 5,
+   "key": [
+    "wsr.date_dim",
+    "wsr.web_returns",
+    "wsr.web_sales",
+    "wsr.web_site"
+   ],
+   "node": "Hash Join",
+   "est": 43922,
+   "actual": 4102.0,
+   "qerr": 10.7,
+   "pg_est": null,
+   "pg_qerr": null
+  },
+  {
+   "q": 5,
+   "key": [
+    "wsr.date_dim",
+    "wsr.web_returns",
+    "wsr.web_sales"
+   ],
+   "node": "Hash Join",
+   "est": 43922,
+   "actual": 4103.0,
+   "qerr": 10.7,
+   "pg_est": null,
+   "pg_qerr": null
+  },
+  {
+   "q": 33,
+   "key": [
+    "cs.item"
+   ],
+   "node": "Seq Scan on item_3",
+   "est": 1733,
+   "actual": 18000.0,
+   "qerr": 10.4,
+   "pg_est": null,
+   "pg_qerr": null
+  },
+  {
+   "q": 33,
+   "key": [
+    "ws.item"
+   ],
+   "node": "Seq Scan on item_5",
+   "est": 1733,
+   "actual": 18000.0,
+   "qerr": 10.4,
+   "pg_est": null,
+   "pg_qerr": null
+  },
+  {
+   "q": 77,
+   "key": [
+    "sr.date_dim",
+    "sr.store",
+    "sr.store_returns"
+   ],
+   "node": "Hash Join",
+   "est": 15941,
+   "actual": 1529.0,
+   "qerr": 10.4,
+   "pg_est": null,
+   "pg_qerr": null
+  },
+  {
+   "q": 60,
+   "key": [
+    "cs.item"
+   ],
+   "node": "Seq Scan on item_3",
+   "est": 1740,
+   "actual": 18000.0,
+   "qerr": 10.3,
+   "pg_est": null,
+   "pg_qerr": null
+  },
+  {
+   "q": 60,
+   "key": [
+    "ws.item"
+   ],
+   "node": "Seq Scan on item_5",
+   "est": 1740,
+   "actual": 18000.0,
+   "qerr": 10.3,
+   "pg_est": null,
+   "pg_qerr": null
+  },
+  {
+   "q": 77,
+   "key": [
+    "sr.date_dim",
+    "sr.store_returns"
+   ],
+   "node": "Hash Join",
+   "est": 15941,
+   "actual": 1556.0,
+   "qerr": 10.2,
+   "pg_est": null,
+   "pg_qerr": null
+  },
+  {
+   "q": 77,
+   "key": [
+    "cr.catalog_returns",
+    "cr.date_dim"
+   ],
+   "node": "Hash Join",
+   "est": 7990,
+   "actual": 780.0,
+   "qerr": 10.2,
+   "pg_est": null,
+   "pg_qerr": null
+  }
+ ]
+}

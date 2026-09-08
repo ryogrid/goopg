@@ -1,0 +1,32 @@
+Limit  (cost=4088.92..4088.92 rows=1 width=253)
+  CTE customer_total_return
+    ->  GroupAggregate  (cost=3028.68..3032.35 rows=163 width=39)
+          Group Key: web_returns.wr_returning_customer_sk, customer_address_1.ca_state
+          ->  Sort  (cost=3028.68..3029.09 rows=163 width=13)
+                Sort Key: web_returns.wr_returning_customer_sk, customer_address_1.ca_state
+                ->  Nested Loop  (cost=0.59..3022.69 rows=163 width=13)
+                      ->  Nested Loop  (cost=0.30..2945.82 rows=171 width=14)
+                            ->  Seq Scan on web_returns  (cost=0.00..1023.00 rows=35900 width=18)
+                            ->  Memoize  (cost=0.30..0.50 rows=1 width=4)
+                                  Cache Key: web_returns.wr_returned_date_sk
+                                  Cache Mode: logical
+                                  ->  Index Scan using date_dim_pkey on date_dim  (cost=0.29..0.49 rows=1 width=4)
+                                        Index Cond: (d_date_sk = web_returns.wr_returned_date_sk)
+                                        Filter: (d_year = 2000)
+                      ->  Index Scan using customer_address_pkey on customer_address customer_address_1  (cost=0.29..0.45 rows=1 width=7)
+                            Index Cond: (ca_address_sk = web_returns.wr_returning_addr_sk)
+  ->  Sort  (cost=1056.57..1056.57 rows=1 width=253)
+        Sort Key: customer.c_customer_id, customer.c_salutation, customer.c_first_name, customer.c_last_name, customer.c_preferred_cust_flag, customer.c_birth_day, customer.c_birth_month, customer.c_birth_year, customer.c_birth_country, customer.c_login, customer.c_email_address, customer.c_last_review_date, ctr1.ctr_total_return
+        ->  Nested Loop  (cost=0.58..1056.56 rows=1 width=253)
+              ->  Nested Loop  (cost=0.29..1037.06 rows=54 width=257)
+                    ->  CTE Scan on customer_total_return ctr1  (cost=0.00..604.32 rows=54 width=36)
+                          Filter: (ctr_total_return > (SubPlan 2))
+                          SubPlan 2
+                            ->  Aggregate  (cost=3.67..3.68 rows=1 width=32)
+                                  ->  CTE Scan on customer_total_return ctr2  (cost=0.00..3.67 rows=1 width=32)
+                                        Filter: (ctr1.ctr_state = ctr_state)
+                    ->  Index Scan using customer_pkey on customer  (cost=0.29..8.01 rows=1 width=229)
+                          Index Cond: (c_customer_sk = ctr1.ctr_customer_sk)
+              ->  Index Scan using customer_address_pkey on customer_address  (cost=0.29..0.36 rows=1 width=4)
+                    Index Cond: (ca_address_sk = customer.c_current_addr_sk)
+                    Filter: (ca_state = 'AR'::bpchar)

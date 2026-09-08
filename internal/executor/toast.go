@@ -9,6 +9,7 @@ import (
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/access/transam"
 	"github.com/goopg/goopg/internal/access/common/pglz"
+	"github.com/goopg/goopg/internal/optimizer"
 	"github.com/goopg/goopg/internal/storage"
 )
 
@@ -36,6 +37,24 @@ const (
 	maxDetoastChunks   = 1 << 20
 	maxDetoastTotalLen = maxDetoastChunks * ToastMaxChunkSize
 )
+
+// detoastValueCalls counts DetoastValue invocations process-wide (EX1-03).
+// The cost model is honest only when measured: each resolved pointer costs
+// one TOAST-relation sequential scan (no chunk index), so the win is purely
+// fewer resolutions (proportional to referenced columns), never faster
+// resolution. The witness matrix asserts these counts, not just time.
+// Tests reset via ResetDetoastValueCalls and read via DetoastValueCalls.
+var detoastValueCalls atomic.Int64
+
+// DetoastValueCalls returns the process-wide DetoastValue invocation count.
+func DetoastValueCalls() int64 {
+	return detoastValueCalls.Load()
+}
+
+// ResetDetoastValueCalls zeroes the DetoastValue invocation count (tests).
+func ResetDetoastValueCalls() {
+	detoastValueCalls.Store(0)
+}
 
 // toastOIDCounter is a process-global counter for assigning unique OIDs
 // to TOAST values. It is not itself persisted — it resets to 0 on every
@@ -401,6 +420,7 @@ func writeHeapTupleToRel(ctx *Context, rel storage.RelFileNode, tuple storage.He
 // DetoastValue reads a TOAST pointer and reassembles the original value
 // by scanning the TOAST relation for chunks with the matching OID.
 func DetoastValue(ctx *Context, toastRel storage.RelFileNode, pointer []byte) ([]byte, error) {
+	detoastValueCalls.Add(1)
 	if len(pointer) != 12 {
 		return nil, fmt.Errorf("invalid TOAST pointer: %d bytes (want 12)", len(pointer))
 	}
@@ -511,33 +531,195 @@ func DetoastValue(ctx *Context, toastRel storage.RelFileNode, pointer []byte) ([
 	return result, nil
 }
 
+// detoastedDatumForType restores the datum kind for reassembled TOAST
+// bytes, mirroring the store path (ToastLargeColumnsIfNeeded accepts only
+// KindString/KindBytes payloads): bytea columns come back as KindBytes,
+// every other toastable type as KindString.
+func detoastedDatumForType(col catalog.Column, data []byte) Datum {
+	if col.Type.Name == "bytea" {
+		return NewBytesDatum(data)
+	}
+	return NewStringDatum(string(data))
+}
+
+// DetoastAttr resolves a single KindToastPointer attribute, replacing it
+// with the original (detoasted) string/bytes (EX1-03b). A non-pointer datum
+// is returned unchanged; sibling attributes are never touched — the caller
+// owns the row copy discipline. mainRel is the heap relation the datum came
+// from; the TOAST relation is derived from it via ToastRelFor.
+func DetoastAttr(ctx *Context, mainRel storage.RelFileNode, col catalog.Column, d Datum) (Datum, error) {
+	if d.Kind != KindToastPointer {
+		return d, nil
+	}
+	if ctx == nil || ctx.Pool == nil {
+		return d, nil
+	}
+	data, err := DetoastValue(ctx, ToastRelFor(mainRel), d.BytesValue())
+	if err != nil {
+		return Datum{}, fmt.Errorf("detoast column %s: %w", col.Name, err)
+	}
+	return detoastedDatumForType(col, data), nil
+}
+
 // DetoastRow resolves any KindToastPointer datums in row, replacing them
 // with the original (detoasted) string/bytes. Returns the row unchanged
 // if no detoasting is needed. mainRel is the heap relation the row came
 // from; the TOAST relation is derived from it via ToastRelFor.
 func DetoastRow(ctx *Context, mainRel storage.RelFileNode, cols []catalog.Column, row Row) (Row, error) {
-	if ctx == nil || ctx.Pool == nil || !needsDetoast(row) {
+	return DetoastRowBound(ctx, mainRel, cols, row, len(row))
+}
+
+// DetoastRowBound resolves KindToastPointer datums at positions i < bound
+// only (EX1-03a). Narrowed detoast is sound IFF the reference walk is
+// complete — the scan's deform/survivor bound already excludes exactly the
+// columns no consumer reads ("walk-completeness is the whole safety story";
+// there is no independent guard). Positions at/past bound keep whatever the
+// caller left there (stale or poisoned); callers must therefore pair this
+// with prefix-scoped needsDetoastPrefix scanning, never whole-row
+// needsDetoast — a stale tail pointer would otherwise false-positive the
+// skip-undetoastable path and skip a LIVE tuple. A bound at/above the row
+// width behaves exactly as DetoastRow. Whole-row DetoastRow survives only
+// where no bound exists (DML/EPQ/COPY paths — untouched).
+func DetoastRowBound(ctx *Context, mainRel storage.RelFileNode, cols []catalog.Column, row Row, bound int) (Row, error) {
+	if bound > len(row) {
+		bound = len(row)
+	}
+	if bound < 0 {
+		bound = 0
+	}
+	if ctx == nil || ctx.Pool == nil || !needsDetoastPrefix(row, bound) {
 		return row, nil
 	}
 	toastRel := ToastRelFor(mainRel)
 	newRow := make(Row, len(row))
 	copy(newRow, row)
-	for i, d := range newRow {
+	for i := 0; i < bound; i++ {
+		d := newRow[i]
 		if d.Kind != KindToastPointer {
 			continue
 		}
 		data, err := DetoastValue(ctx, toastRel, d.BytesValue())
 		if err != nil {
-			return nil, fmt.Errorf("detoast column %s: %w", cols[i].Name, err)
+			colName := ""
+			if i < len(cols) {
+				colName = cols[i].Name
+			}
+			return nil, fmt.Errorf("detoast column %s: %w", colName, err)
 		}
-		// Return as the appropriate datum kind for the column type.
-		if cols[i].Type.Name == "bytea" {
-			newRow[i] = NewBytesDatum(data)
+		if i < len(cols) {
+			newRow[i] = detoastedDatumForType(cols[i], data)
 		} else {
 			newRow[i] = NewStringDatum(string(data))
 		}
 	}
 	return newRow, nil
+}
+
+// updateSetRefCols collects the scanned-row column ordinals read by the
+// UPDATE SET-clause expressions (EX1-03b). It mirrors deformScanRefs'
+// positively-understood set (plain column reads, constants, and the
+// transparent comparison/arithmetic/boolean/cast/is-null wrappers): any
+// other shape — FuncCall, subqueries, LIKE...ESCAPE patterns, whole-row
+// refs — declines (fullRow=true) and the caller falls back to whole-row
+// detoast. A missed arm costs performance, never correctness; an
+// unattributed read would be silent corruption, so the default is decline.
+// Out-of-range ordinals decline too: evalExpr would not read the scanned
+// row for them, but attributing them to a sibling would be wrong.
+// A (non-nil-empty, false) result means no SET expression reads any
+// scanned column, so the eval row needs no detoasting at all.
+func updateSetRefCols(set []optimizer.Expr, ncols int) (refs []int, fullRow bool) {
+	seen := make(map[int]bool)
+	out := []int{}
+	for _, e := range set {
+		if e == nil {
+			continue
+		}
+		if !collectToastRefCols(e, &out, seen, ncols) {
+			return nil, true
+		}
+	}
+	return out, false
+}
+
+func collectToastRefCols(e optimizer.Expr, out *[]int, seen map[int]bool, ncols int) bool {
+	switch x := e.(type) {
+	case nil:
+		// Diverges from deformScanRefs (which declines nil): a nil SET
+		// arm reads nothing, so attributing it as ref-free is exact.
+		return true
+	case *optimizer.ColumnRef:
+		if x.Index < 0 || x.Index >= ncols {
+			return false
+		}
+		if !seen[x.Index] {
+			seen[x.Index] = true
+			*out = append(*out, x.Index)
+		}
+		return true
+	case *optimizer.IntegerConst, *optimizer.StringConst, *optimizer.NumericConst,
+		*optimizer.TypedStringLit, *optimizer.IntervalLit, *optimizer.NullConst,
+		*optimizer.BooleanConst:
+		return true
+	case *optimizer.BinaryOp:
+		return collectToastRefCols(x.Left, out, seen, ncols) &&
+			collectToastRefCols(x.Right, out, seen, ncols)
+	case *optimizer.UnaryOp:
+		return collectToastRefCols(x.Operand, out, seen, ncols)
+	case *optimizer.CastExpr:
+		return collectToastRefCols(x.Operand, out, seen, ncols)
+	case *optimizer.IsNullExpr:
+		return collectToastRefCols(x.Operand, out, seen, ncols)
+	case *optimizer.IsBoolExpr:
+		return collectToastRefCols(x.Operand, out, seen, ncols)
+	case *optimizer.IsDistinctFromExpr:
+		return collectToastRefCols(x.Left, out, seen, ncols) &&
+			collectToastRefCols(x.Right, out, seen, ncols)
+	default:
+		return false
+	}
+}
+
+// detoastUpdateEvalRow builds the UPDATE SET-clause evaluation row
+// (EX1-03b): when the SET expressions' column reads are fully attributed,
+// only those attributes are resolved via DetoastAttr and siblings keep
+// their raw TOAST pointer — mirroring PG's behaviour of leaving an
+// unchanged TOASTed datum alone instead of needlessly re-toasting it on
+// write. When fullRow is set (some SET shape declined) it falls back to
+// whole-row DetoastRow, the exact pre-EX1-03 behaviour. With no attributed
+// reads at all the row is returned untouched: no SET expression observes
+// it, so there is nothing to resolve.
+func detoastUpdateEvalRow(ctx *Context, rel storage.RelFileNode, cols []catalog.Column, row Row, refs []int, fullRow bool) (Row, error) {
+	if len(refs) == 0 && !fullRow {
+		return row, nil
+	}
+	// Full-width invariant: scanMatching hands this a full-width row, so
+	// whole-row needsDetoast is exact here. Never call this with a
+	// narrowed row — pair narrowed rows with needsDetoastPrefix.
+	if !needsDetoast(row) {
+		return row, nil
+	}
+	if fullRow {
+		return DetoastRow(ctx, rel, cols, row)
+	}
+	out := make(Row, len(row))
+	copy(out, row)
+	for _, ci := range refs {
+		if ci < 0 || ci >= len(out) || ci >= len(cols) {
+			// Unreachable: updateSetRefCols declines out-of-range
+			// ordinals to fullRow. Loud (not silent-skip): an
+			// unattributed read would be silent corruption.
+			return nil, fmt.Errorf("detoast UPDATE eval row: ref %d out of range (row %d, cols %d)", ci, len(out), len(cols))
+		}
+		if out[ci].Kind != KindToastPointer {
+			continue
+		}
+		dd, err := DetoastAttr(ctx, rel, cols[ci], out[ci])
+		if err != nil {
+			return nil, err
+		}
+		out[ci] = dd
+	}
+	return out, nil
 }
 
 // sortChunks orders a slice of (seq, data) pairs by seq for deterministic

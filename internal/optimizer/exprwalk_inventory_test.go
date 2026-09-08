@@ -139,7 +139,10 @@ var exprSwitchInventory = map[string]walkerRole{
 	// entirely loses its line.
 	"joinlayout.go:remapByPosMap":           nonRecursiveClassifier, // moved from bushy.go at M0127-P6.3 (rename only)
 	"joinlayout.go:remapOuterRefsInSubplan": walkerPending, // 5 of 32 arms; moved from bushy.go at M0127-P6.3
-	"joinlayout.go:remapPosMapAfterRewrite": walkerPending, // 8 of 32 arms; moved from bushy.go at M0127-P6.3
+	// `joinlayout.go:remapPosMapAfterRewrite` (walkerPending, 8 of 32 arms)
+	// was deleted by C-20b: the walker mutated nothing — its posMap parameter
+	// was never read — so there was no conversion to finish, only dead weight
+	// to remove. Deleting the line here is how that is audited.
 	// CONVERTED by M0125-0002 commit 7, the LAST of the series. The
 	// recursion is walkExprRefs (scopeSignal); the surviving switch is the
 	// three-arm "reads row data but names no column" veto inside the Visit
@@ -156,6 +159,14 @@ var exprSwitchInventory = map[string]walkerRole{
 	// whose two-arm veto set this one's is a superset of. Fail-open is not a
 	// hazard here: an unenumerated type aborts cloneExprRefs itself, and the
 	// arm panics on the `!ok`.
+	// C-19a (2026-09-06): `is_parallel_safe` built on walkExprRefs under
+	// scopeVeto; the three-arm dispatch (*FuncCall proparallel lookup,
+	// *OuterColumnRef / *ExecParamRef as PARAM_EXEC) lives inside the Visit
+	// closure and is attributed to the enclosing function — the demoted
+	// shape of local_filters.go:conjunctIsLocalEligible. Fail-closed by
+	// construction: an unenumerated type aborts the walk (OnUnknown) and the
+	// rel is read as parallel-unsafe.
+	"considerparallel.go:isParallelSafeExpr": nonRecursiveClassifier,
 	"createplanjoin.go:translateToLayout": nonRecursiveClassifier,
 	// Added by the M0125-0035 CTE-body arm. Both are built on the
 	// exprwalk primitives — walkExprRefs carries the recursion and
@@ -169,6 +180,12 @@ var exprSwitchInventory = map[string]walkerRole{
 	// residual copy either way.
 	"cte_inline_pushdown.go:remapConjunctThroughCTEOutput":  nonRecursiveClassifier,
 	"cte_inline_pushdown.go:remapConjunctThroughProjection": nonRecursiveClassifier,
+	// Added by B-06 synthesis. A two-arm classifier (StringConst /
+	// TypedStringLit target at one output position), not a traversal:
+	// no descent, no scope handling, miss (anything else) returns
+	// false and the position stays unknown. Same demoted shape as the
+	// CTE entries above.
+	"cte_stats_synthesis.go:branchLiteralAt": nonRecursiveClassifier,
 	// Added by M0125-0036. See boundedQualSpine's comment: the arm set is
 	// the transformation's NULL-semantics invariant, not an omission.
 	"exists_to_any.go:rewriteExistsToAnyQual": boundedQualSpine,
@@ -191,12 +208,31 @@ var exprSwitchInventory = map[string]walkerRole{
 	// same commit — cloneExprRefs left it with a *ColumnRef type
 	// assertion and no switch at all.
 	"local_filters.go:conjunctIsLocalEligible": nonRecursiveClassifier,
+	// Added by C-02b. Built on walkExprRefs (scopeVeto carries the
+	// recursion and the exhaustiveness — sublinks and unenumerated
+	// kinds abort the walk, fail-closed); what the census sees is the
+	// three-arm dispatch inside the Visit closure (veto
+	// *OuterColumnRef / *FuncCall, collect *ColumnRef identities),
+	// attributed to the enclosing function. Same demoted shape as
+	// innerJoinPushTarget above. Fail-open is a DECLINE here: ok=false
+	// keeps the legacy copy-pass verdict and consults no delay proof.
+	"outerjoin_delay.go:qualSrcRelSet": nonRecursiveClassifier,
 	// `mhj_input_rewrite.go` was renamed `scan_input_rewrite.go` by M0127-P6.2,
 	// which deleted its MultiHashJoin half: `cloneExprForShift` and
 	// `pushSingleSourceFiltersIntoMHJTables` went with the node (rows deleted,
 	// not demoted); `matchSingleTableConstantPredicate` survives under the new
 	// path and keeps its classification.
 	"scan_input_rewrite.go:matchSingleTableConstantPredicate": nonRecursiveClassifier,
+	// E-17 / EX3-08 cut 2. Classifier, not a walker: the RECURSION is
+	// walkExprRefs' — this switch lives inside its Visit closure and only
+	// records a column bound / clears an eligibility flag for the node in
+	// front of it. Same demotion as remapByPosMap and cloneExprShiftIdx,
+	// whose dispatch switches likewise survive inside their Rewrite
+	// closures. Being built on the primitive is what makes it fail-closed:
+	// an unenumerated type aborts walkExprRefs and PlanScanQual reports
+	// Early=false, so a missing arm costs a slower qual position, never a
+	// wrong column bound.
+	"scan_qual.go:PlanScanQual": nonRecursiveClassifier,
 	// CONVERTED by M0125-0002 commit 2, and DEMOTED for the same reason
 	// commit 1's remapByPosMap was: the recursion and the exhaustiveness
 	// moved to exprChildSlots (via cloneExprRefs), but a two-arm bottom-up
@@ -285,6 +321,15 @@ var exprSwitchInventory = map[string]walkerRole{
 	"unnest.go:subqueryANDReachable":       walkerPending, // 2 of 32 arms
 	"unnest.go:walkExprTree":               walkerPending, // 8 of 32 arms
 	"unnest.go:walkSubqueryPlansInExpr":    walkerPending, // 9 of 32 arms
+	// Added by B-01c APPLYING half slice (a), 2026-09-07. Built on
+	// cloneExprRefs (which carries both the recursion and the
+	// exhaustiveness); what the census sees is the four-arm dispatch
+	// inside the Rewrite closure — renumber *ColumnRef, refuse
+	// *OuterColumnRef / *CTIDExpr / *MergeWholeRowRef — attributed to the
+	// enclosing function. Same demoted shape as
+	// nl_index_join.go:cloneExprShiftIdx. Fail-closed by construction:
+	// OnUnknown refuses and any refusal aborts the round-trip proof.
+	"upper_narrow_gate.go:remapExprIndices": nonRecursiveClassifier,
 }
 
 // exprSwitchSites runs the census: every package function whose body holds a

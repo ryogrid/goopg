@@ -1,0 +1,47 @@
+Limit  (cost=145042.08..93944989.88 rows=5 width=100)
+  ->  GroupAggregate  (cost=145042.08..93944989.88 rows=5 width=100)
+        Group Key: customer_demographics.cd_gender, customer_demographics.cd_marital_status, customer_demographics.cd_education_status, customer_demographics.cd_purchase_estimate, customer_demographics.cd_credit_rating, customer_demographics.cd_dep_count, customer_demographics.cd_dep_employed_count, customer_demographics.cd_dep_college_count
+        ->  Nested Loop  (cost=145042.08..93944989.72 rows=5 width=52)
+              Join Filter: (customer_demographics.cd_demo_sk = c.c_current_cdemo_sk)
+              ->  Gather Merge  (cost=109840.56..337083.59 rows=1920800 width=56)
+                    Workers Planned: 3
+                    ->  Sort  (cost=108840.52..110389.55 rows=619613 width=56)
+                          Sort Key: customer_demographics.cd_gender, customer_demographics.cd_marital_status, customer_demographics.cd_education_status, customer_demographics.cd_purchase_estimate, customer_demographics.cd_credit_rating, customer_demographics.cd_dep_count, customer_demographics.cd_dep_employed_count, customer_demographics.cd_dep_college_count
+                          ->  Parallel Seq Scan on customer_demographics  (cost=0.00..28052.13 rows=619613 width=56)
+              ->  Materialize  (cost=35201.52..93463846.14 rows=5 width=4)
+                    ->  Nested Loop  (cost=35201.52..93463846.11 rows=5 width=4)
+                          ->  Nested Loop  (cost=35201.23..93463225.77 rows=1625 width=8)
+                                ->  HashAggregate  (cost=35200.93..35223.67 rows=2274 width=4)
+                                      Group Key: store_sales.ss_customer_sk
+                                      ->  Gather  (cost=3176.86..35195.25 rows=2274 width=4)
+                                            Workers Planned: 3
+                                            ->  Parallel Hash Join  (cost=2176.86..33967.85 rows=734 width=4)
+                                                  Hash Cond: (store_sales.ss_sold_date_sk = date_dim.d_date_sk)
+                                                  ->  Parallel Seq Scan on store_sales  (cost=0.00..30571.90 rows=464390 width=8)
+                                                  ->  Parallel Hash  (cost=2175.97..2175.97 rows=71 width=4)
+                                                        ->  Parallel Seq Scan on date_dim  (cost=0.00..2175.97 rows=71 width=4)
+                                                              Filter: ((d_moy >= 3) AND (d_moy <= 6) AND (d_year = 2001))
+                                ->  Index Scan using customer_pkey on customer c  (cost=0.29..41935.75 rows=1 width=12)
+                                      Index Cond: (c_customer_sk = store_sales.ss_customer_sk)
+                                      Filter: ((ANY (c_customer_sk = (hashed SubPlan 2).col1)) OR (ANY (c_customer_sk = (hashed SubPlan 4).col1)))
+                                      SubPlan 2
+                                        ->  Gather  (cost=3176.86..14116.20 rows=595 width=4)
+                                              Workers Planned: 3
+                                              ->  Parallel Hash Join  (cost=2176.86..13056.70 rows=192 width=4)
+                                                    Hash Cond: (web_sales.ws_sold_date_sk = date_dim_1.d_date_sk)
+                                                    ->  Parallel Seq Scan on web_sales  (cost=0.00..10575.46 rows=115946 width=8)
+                                                    ->  Parallel Hash  (cost=2175.97..2175.97 rows=71 width=4)
+                                                          ->  Parallel Seq Scan on date_dim date_dim_1  (cost=0.00..2175.97 rows=71 width=4)
+                                                                Filter: ((d_moy >= 3) AND (d_moy <= 6) AND (d_year = 2001))
+                                      SubPlan 4
+                                        ->  Gather  (cost=3176.86..24990.63 rows=1188 width=4)
+                                              Workers Planned: 3
+                                              ->  Parallel Hash Join  (cost=2176.86..23871.83 rows=383 width=4)
+                                                    Hash Cond: (catalog_sales.cs_sold_date_sk = date_dim_2.d_date_sk)
+                                                    ->  Parallel Seq Scan on catalog_sales  (cost=0.00..21084.70 rows=232470 width=8)
+                                                    ->  Parallel Hash  (cost=2175.97..2175.97 rows=71 width=4)
+                                                          ->  Parallel Seq Scan on date_dim date_dim_2  (cost=0.00..2175.97 rows=71 width=4)
+                                                                Filter: ((d_moy >= 3) AND (d_moy <= 6) AND (d_year = 2001))
+                          ->  Index Scan using customer_address_pkey on customer_address ca  (cost=0.29..0.38 rows=1 width=4)
+                                Index Cond: (ca_address_sk = c.c_current_addr_sk)
+                                Filter: ((ca_county)::text = ANY ('{"Fairfield County","Campbell County","Washtenaw County","Escambia County","Cleburne County"}'::text[]))

@@ -111,18 +111,28 @@ type baseColumnRef struct {
 // resolveBaseColumn walks a child plan tree to the base relation behind the
 // column at logical index `idx`.
 //
-// It is the THIRD member of the resolver family whose other two are
-// `columnNDistinctForChild` (cardinality.go) and `columnStatsForChild`
-// (selectivity.go): same arm list, same coordinate rule, three different
-// answers about the same column. That trio is exactly the sibling-path shape
-// hard-won rule #2 is about — the `*Project` remap and the `*Join` arm each
-// went in to ONE of them first and the divergence was a live defect both times
-// (M0125-0038, M0127-P5.6-e-ii/-e-iii). `columnNDistinctForChild` now delegates
-// its base-relation arms to this function so two of the three can no longer
-// drift; `columnStatsForChild` still has its own copy and is missing the
-// `*IndexScan` arm, which is ledgered rather than fixed here (changing which
-// nodes resolve MCV lists moves estimates, and this loop's measurement already
-// has two variables).
+// It is the arm list the resolver FAMILY shares. The family's other question
+// forms — `columnNDistinctForChild` (cardinality.go), `columnStatsForChild`
+// (selectivity.go) and `columnRawRowsForChild` (selectivity.go) — all delegate
+// here now, so those three can no longer drift from each other: same arm list,
+// same coordinate rule, one answer about the same column. That is the fix for
+// the sibling-path shape hard-won rule #2 is about — the `*Project` remap and
+// the `*Join` arm each went in to ONE resolver first and the divergence was a
+// live defect both times (M0125-0038, M0127-P5.6-e-ii/-e-iii), and take2 P1-26
+// collapsed the duplicate walkers to end it.
+//
+// Delegation did NOT end the class, because a fifth walker over the same plan
+// shapes survives outside the family: `relFilteredRowsWalk` (cardinality.go)
+// asks a different question ("which relation is this subtree about") over the
+// same arm list, so it cannot delegate — and it is where the divergence went
+// next. It had the `*NestedLoopIndexJoin` arm; this function did not, for the
+// whole life of the NLI node, and every column above an NLI resolved to
+// nothing (see that arm below for what it cost). Third instance.
+//
+// `TestResolverFamilyArmListsAgree` (joinkeyproof_arms_test.go) now pins the
+// two arm lists against each other by parsing both type switches, so a fourth
+// instance fails a test instead of being found by a benchmark census. Adding a
+// node type to either walker without the other is the failure it catches.
 //
 // Coordinate rule, identical to both twins: a `*Join`'s Predicate and key
 // coordinates count from the start of the merged left‖right schema, so an index
@@ -189,6 +199,45 @@ func resolveBaseColumn(idx int, child Node) (baseColumnRef, bool) {
 			return resolveBaseColumn(idx-lw, x.Right)
 		}
 		return resolveBaseColumn(idx, x.Left)
+
+	// The `*Join` arm above and this one are the SAME rule over a second node
+	// type: `*NestedLoopIndexJoin` is not a `*Join`, it carries `Outer`/`Inner`
+	// (plan.go), and until this arm existed EVERY column read above an NLI
+	// resolved to nothing. The consequences were not confined to join sizing:
+	// `examineGroupVar` then priced each grouping variable at
+	// `defaultNumDistinct`, the independence product saturated the closing
+	// `numdistinct > rows` clamp in `estimateNumGroups`, and the aggregate's
+	// output estimate became its INPUT row count (TPC-DS Q99 estimated 720657
+	// against an actual 90 — 8007x — and reverted to 90 exactly with this arm;
+	// Q62 359432 -> 150, exact). Because `columnStatsForChild` and
+	// `columnRawRowsForChild` also delegate here, every `clauseSelectivity`
+	// call above an NLI was reading defaults too. Diagnosis and the probe
+	// measurements: docs/design/planner-rowest-collapse/DESIGN.md §3.
+	//
+	// This was the THIRD time an arm went into one member of the family and
+	// not the others (see the doc comment above), which is why
+	// `TestResolverFamilyArmListsAgree` now pins the two remaining arm lists
+	// against each other mechanically instead of by comment.
+	//
+	// SEMI/ANTI needs no special case for the same reason it does not on
+	// `*Join`: such a join's `Output()` is outer-only, so `idx >= ow` cannot
+	// occur. A LEFT NLI resolves an inner column to its base relation exactly
+	// as upstream's `examine_variable` does through an outer join.
+	case *NestedLoopIndexJoin:
+		if x.Outer == nil {
+			return baseColumnRef{}, false
+		}
+		ow := len(x.Outer.Output())
+		if ow == 0 {
+			return baseColumnRef{}, false
+		}
+		if idx >= ow {
+			if x.Inner == nil {
+				return baseColumnRef{}, false
+			}
+			return resolveBaseColumn(idx-ow, x.Inner)
+		}
+		return resolveBaseColumn(idx, x.Outer)
 	}
 	return baseColumnRef{}, false
 }

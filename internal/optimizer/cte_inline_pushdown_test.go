@@ -8,6 +8,15 @@ import (
 )
 
 // --- fixtures --------------------------------------------------------
+//
+// NOTE (C-02c): the pushInnerJoinInputQuals calls below discard the new
+// (Node, bool) move returns deliberately — every fixture schema here is
+// srcIdx-free (ijCol carries no SourceTableIdx), so attribution is
+// incomplete, the move proof never holds, and every descent is a legacy
+// copy with the residual kept. Do NOT "fix" these fixtures by adding
+// identities: that would silently move them into C-02c move coverage
+// (residuals dropped, Filters spliced) and every assertion below about
+// kept residuals would need re-derivation.
 
 // cipScan builds a CTE reference wired the way planScanRangeVar wires
 // one for the M0125-0035 CTE-body pass: the scan carries a back-pointer

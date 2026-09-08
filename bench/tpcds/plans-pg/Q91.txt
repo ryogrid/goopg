@@ -1,0 +1,34 @@
+Sort  (cost=4803.62..4803.62 rows=1 width=97)
+  Sort Key: (sum(catalog_returns.cr_net_loss)) DESC
+  ->  GroupAggregate  (cost=4803.58..4803.61 rows=1 width=97)
+        Group Key: call_center.cc_call_center_id, call_center.cc_name, call_center.cc_manager, customer_demographics.cd_marital_status, customer_demographics.cd_education_status
+        ->  Sort  (cost=4803.58..4803.58 rows=1 width=71)
+              Sort Key: call_center.cc_call_center_id, call_center.cc_name, call_center.cc_manager, customer_demographics.cd_marital_status, customer_demographics.cd_education_status
+              ->  Gather  (cost=1001.73..4803.57 rows=1 width=71)
+                    Workers Planned: 1
+                    ->  Nested Loop  (cost=1.73..3803.47 rows=1 width=71)
+                          ->  Nested Loop  (cost=1.30..3801.93 rows=1 width=52)
+                                ->  Nested Loop  (cost=1.17..3801.77 rows=1 width=14)
+                                      ->  Nested Loop  (cost=0.88..3800.69 rows=3 width=18)
+                                            ->  Nested Loop  (cost=0.59..3795.19 rows=18 width=22)
+                                                  ->  Nested Loop  (cost=0.30..3786.46 rows=18 width=14)
+                                                        ->  Parallel Seq Scan on catalog_returns  (cost=0.00..1911.07 rows=42307 width=18)
+                                                        ->  Memoize  (cost=0.30..0.42 rows=1 width=4)
+                                                              Cache Key: catalog_returns.cr_returned_date_sk
+                                                              Cache Mode: logical
+                                                              ->  Index Scan using date_dim_pkey on date_dim  (cost=0.29..0.41 rows=1 width=4)
+                                                                    Index Cond: (d_date_sk = catalog_returns.cr_returned_date_sk)
+                                                                    Filter: ((d_year = 2000) AND (d_moy = 12))
+                                                  ->  Index Scan using customer_pkey on customer  (cost=0.29..0.49 rows=1 width=16)
+                                                        Index Cond: (c_customer_sk = catalog_returns.cr_returning_customer_sk)
+                                            ->  Index Scan using household_demographics_pkey on household_demographics  (cost=0.28..0.31 rows=1 width=4)
+                                                  Index Cond: (hd_demo_sk = customer.c_current_hdemo_sk)
+                                                  Filter: (hd_buy_potential ~~ 'Unknown%'::text)
+                                      ->  Index Scan using customer_address_pkey on customer_address  (cost=0.29..0.36 rows=1 width=4)
+                                            Index Cond: (ca_address_sk = customer.c_current_addr_sk)
+                                            Filter: (ca_gmt_offset = '-7'::numeric)
+                                ->  Index Scan using call_center_pkey on call_center  (cost=0.13..0.15 rows=1 width=46)
+                                      Index Cond: (cc_call_center_sk = catalog_returns.cr_call_center_sk)
+                          ->  Index Scan using customer_demographics_pkey on customer_demographics  (cost=0.43..1.54 rows=1 width=27)
+                                Index Cond: (cd_demo_sk = customer.c_current_cdemo_sk)
+                                Filter: (((cd_marital_status = 'M'::bpchar) AND (cd_education_status = 'Unknown'::bpchar)) OR ((cd_marital_status = 'W'::bpchar) AND (cd_education_status = 'Advanced Degree'::bpchar)))

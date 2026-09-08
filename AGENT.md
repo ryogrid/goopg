@@ -118,6 +118,25 @@ Integration tests that need a real `psql`/`pgbench` belong under
 `internal/<subsystem>/...` next to the code they exercise, gated by a build
 tag (`//go:build integration`) so the default `go test ./...` stays fast.
 
+### Long-running tests: poll, don't sit waiting
+
+If you lack a mechanism or tool that automatically notifies you when a
+`monitor` command or a background job completes, do not end your turn "waiting"
+for a long test or benchmark to finish — in a headless loop that turn is
+discarded and the work is re-run. Detect completion yourself by wrapping the
+wait in a shell check loop that polls at a suitable interval in seconds:
+
+```bash
+# e.g. poll until the gate's log carries the done marker (or the PID is gone)
+until grep -q "done-marker" gate.log 2>/dev/null || ! kill -0 "$PID" 2>/dev/null; do
+  sleep 5
+done
+```
+
+Choose the interval to match the job's expected duration (~5s for a minutes-long
+gate, ~30s for a multi-hour sweep): a too-tight loop burns CPU for nothing, and
+a loop that never reaches its termination condition wastes the whole turn.
+
 ### PostgreSQL Oracle Test Port (separate from `go test ./...`)
 
 Ported upstream TAP tests live in `internal/testport/tap_port_test.go`.

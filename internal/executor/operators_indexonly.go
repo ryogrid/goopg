@@ -30,19 +30,12 @@ type indexOnlyScanOp struct {
 	// worker's driving scan; nil for a serial scan, and a nil receiver
 	// claims every block (parallel_scan.go). M0134-0189.
 	pidx *parallelIndexScanState
-	// leafOwned caches this worker's verdict per leaf, lastLeaf* the most
-	// recent one. The shared claim is a sync.Map operation and a range scan
-	// visits ~300 entries per leaf, so consulting it per ENTRY made the
-	// parallel scan 3.5x SLOWER than serial (q16 1.6s -> 5.7s). A btree scan
-	// walks leaves in key order, so the common case is "same block as the
-	// last entry" and costs one comparison. The map is kept so revisiting a
-	// block reuses this worker's OWN verdict rather than re-asking the
-	// shared set, which would answer "already claimed" about our own claim
-	// and silently drop rows.
-	leafOwned     map[storage.BlockNumber]bool
-	lastLeaf      storage.BlockNumber
-	lastLeafOwned bool
-	lastLeafValid bool
+	// leafMemo caches this worker's verdict per leaf and the most recent one
+	// — see leafClaimMemo (parallel_scan.go) for why the shared set is
+	// consulted at most once per block per worker rather than once per entry
+	// (q16 1.6s -> 5.7s otherwise). Shared with the plain index scan since
+	// C-19c so the two partitions cannot drift.
+	leafMemo leafClaimMemo
 	// arrayStyle is the session DateStyle/TimeZone an array element's output
 	// function reads, resolved once in Open. M0119-0006.
 	arrayStyle array.OutputStyle
@@ -461,22 +454,9 @@ func (o *indexOnlyScanOp) Rescan(outerSlot SlotView, outerWidth int) error {
 // but takes no relation lock and never touches the Visibility Map. Best-effort:
 // any error leaves the page untouched rather than failing the read.
 // ownsLeaf reports whether this worker processes entries from leaf block blk,
-// memoising the shared claim. See the leafOwned field for why the shared set is
-// consulted at most once per block per worker rather than once per entry.
+// memoising the shared claim (leafClaimMemo).
 func (o *indexOnlyScanOp) ownsLeaf(blk storage.BlockNumber) bool {
-	if o.lastLeafValid && o.lastLeaf == blk {
-		return o.lastLeafOwned
-	}
-	owned, seen := o.leafOwned[blk]
-	if !seen {
-		owned = o.pidx.claimLeaf(blk)
-		if o.leafOwned == nil {
-			o.leafOwned = make(map[storage.BlockNumber]bool, 64)
-		}
-		o.leafOwned[blk] = owned
-	}
-	o.lastLeaf, o.lastLeafOwned, o.lastLeafValid = blk, owned, true
-	return owned
+	return o.leafMemo.owns(o.pidx, blk)
 }
 
 func (o *indexOnlyScanOp) pruneTouchedTempPages(ctx *Context, heapRel storage.RelFileNode) {
@@ -626,9 +606,19 @@ func (o *indexOnlyScanOp) decodeRowFromKey(key []byte) (Row, error) {
 		return Row{d}, nil
 	}
 	// Multi-column: decode all key columns in declaration order, then project.
-	vals := make([]Datum, 0, len(o.plan.Index.Columns))
+	// EX1-02b: stop decoding after the highest covered key ordinal — decode
+	// THROUGH gaps (offsets are sequential, so a gap column's bytes must
+	// still be walked to reach higher ordinals). No codec change.
+	maxKey := len(o.plan.Index.Columns) - 1
+	if m, ok := iosMaxCoveredKeyPos(o.plan); ok && m < maxKey {
+		maxKey = m
+	}
+	vals := make([]Datum, 0, maxKey+1)
 	off := 0
-	for _, colName := range o.plan.Index.Columns {
+	for ki, colName := range o.plan.Index.Columns {
+		if ki > maxKey {
+			break
+		}
 		col, ok := o.ctx.Catalog.LookupColumn(o.plan.Table, colName)
 		if !ok {
 			return nil, fmt.Errorf("IOS: index column %q not in catalog", colName)
@@ -785,13 +775,77 @@ func decodeIndexKeyColumnStyled(key []byte, col catalog.Column, st array.OutputS
 	}
 }
 
+// iosMaxCoveredKeyPos reports the highest position in the index's key-column
+// order occupied by a Covered column. ok=false when any Covered column is not
+// among the index key columns — then the key loop must decode everything
+// (zero codec change: the caller only ever stops early, never skips).
+func iosMaxCoveredKeyPos(p *optimizer.IndexOnlyScan) (max int, ok bool) {
+	max = -1
+	for _, col := range p.Covered {
+		pos := -1
+		for j, kn := range p.Index.Columns {
+			if kn == col.Name {
+				pos = j
+				break
+			}
+		}
+		if pos < 0 {
+			return 0, false
+		}
+		if pos > max {
+			max = pos
+		}
+	}
+	return max, true
+}
+
+// iosHeapFallbackWidth is the exclusive heap-decode width for the
+// non-ALL_VISIBLE fallback: [0, maxCovered+1), where maxCovered is the highest
+// heap ordinal among the Covered columns. Gaps over-decode (offsets are
+// sequential, so the range must still walk THROUGH them); a subset helper
+// only if the gap cost ever matters.
+func iosHeapFallbackWidth(p *optimizer.IndexOnlyScan) int {
+	max := -1
+	for _, col := range p.Covered {
+		for j, tc := range p.Table.Columns {
+			if tc.Name == col.Name {
+				if j > max {
+					max = j
+				}
+				break
+			}
+		}
+	}
+	return max + 1
+}
+
 // decodeRowFromHeap projects only the covered columns from a full heap tuple.
 func (o *indexOnlyScanOp) decodeRowFromHeap(t storage.HeapTuple) (Row, error) {
+	o.ensureCoveredMaps()
+	// EX1-02b: subset decode — only [0, maxCovered+1) can be read through the
+	// Covered projection below. A width at or past full takes the exact
+	// pre-EX1-02b path.
+	if to := iosHeapFallbackWidth(o.plan); to > 0 && to < len(o.plan.Table.Columns) {
+		// Tuple-decompose + range-decode by name: there is NO HeapTuple
+		// range helper, so natts comes from Infomask2 at this site. The
+		// unstyled (default) array style matches the full path below.
+		natts := int(t.Header.Infomask2 & storage.HeapNattsMask)
+		fullRow := make(Row, len(o.plan.Table.Columns))
+		if _, err := DecodeRowRangeIntoMctxPGTupleStyled(fullRow, o.plan.Table.Columns, t.Data, t.Bitmap, natts, nil, array.DefaultOutputStyle(), 0, to, 0); err != nil {
+			return nil, err
+		}
+		return o.projectHeapRow(fullRow), nil
+	}
 	fullRow, err := DecodeHeapTupleRow(o.plan.Table.Columns, t, nil)
 	if err != nil {
 		return nil, err
 	}
-	o.ensureCoveredMaps()
+	return o.projectHeapRow(fullRow), nil
+}
+
+// projectHeapRow picks the scan's output columns out of a decoded heap row,
+// converting enum spellings to sort orders like the key path must.
+func (o *indexOnlyScanOp) projectHeapRow(fullRow Row) Row {
 	row := make(Row, len(o.plan.Covered))
 	for i, j := range o.coveredHeapIdx {
 		if j >= 0 && j < len(fullRow) {
@@ -808,7 +862,7 @@ func (o *indexOnlyScanOp) decodeRowFromHeap(t storage.HeapTuple) (Row, error) {
 			row[i] = NewEnumDatum(order, row[i].StringValue())
 		}
 	}
-	return row, nil
+	return row
 }
 
 // ensureCoveredMaps resolves, once per scan, where each Covered column lives in

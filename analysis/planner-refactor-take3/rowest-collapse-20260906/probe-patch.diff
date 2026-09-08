@@ -1,0 +1,113 @@
+diff --git a/internal/optimizer/joinkeyproof.go b/internal/optimizer/joinkeyproof.go
+index 990fae31e..02e02b1e5 100644
+--- a/internal/optimizer/joinkeyproof.go
++++ b/internal/optimizer/joinkeyproof.go
+@@ -189,6 +189,23 @@ func resolveBaseColumn(idx int, child Node) (baseColumnRef, bool) {
+ 			return resolveBaseColumn(idx-lw, x.Right)
+ 		}
+ 		return resolveBaseColumn(idx, x.Left)
++
++	// PROBE PATCH (rowest defect b): the missing NLI arm.
++	case *NestedLoopIndexJoin:
++		if x.Outer == nil {
++			return baseColumnRef{}, false
++		}
++		ow := len(x.Outer.Output())
++		if ow == 0 {
++			return baseColumnRef{}, false
++		}
++		if idx >= ow {
++			if x.Inner == nil {
++				return baseColumnRef{}, false
++			}
++			return resolveBaseColumn(idx-ow, x.Inner)
++		}
++		return resolveBaseColumn(idx, x.Outer)
+ 	}
+ 	return baseColumnRef{}, false
+ }
+diff --git a/internal/optimizer/rangequery.go b/internal/optimizer/rangequery.go
+index 2249c336f..a77aa2429 100644
+--- a/internal/optimizer/rangequery.go
++++ b/internal/optimizer/rangequery.go
+@@ -35,6 +35,7 @@ const defaultRangeIneqSel = 0.005
+ // clausesel.c's RangeQueryClause struct.
+ type rangeQueryClause struct {
+ 	key         string
++	cr          *ColumnRef // PROBE PATCH (rowest defect a)
+ 	haveLoBound bool
+ 	haveHiBound bool
+ 	loBound     float64
+@@ -61,18 +62,23 @@ func splitConjuncts(e Expr, out []Expr) []Expr {
+ // which reports whether the column was on the right so the operator can be
+ // flipped.
+ func rangeBoundOf(e Expr) (key string, isLo bool, ok bool) {
++	k, l, _, o := rangeBoundOfCR(e)
++	return k, l, o
++}
++
++func rangeBoundOfCR(e Expr) (key string, isLo bool, col *ColumnRef, ok bool) {
+ 	b, isBin := e.(*BinaryOp)
+ 	if !isBin {
+-		return "", false, false
++		return "", false, nil, false
+ 	}
+ 	switch b.Op {
+ 	case parser.OpLt, parser.OpLe, parser.OpGt, parser.OpGe:
+ 	default:
+-		return "", false, false
++		return "", false, nil, false
+ 	}
+ 	cr, _, colOnRight, matched := normalizeColumnConstRange(b.Left, b.Right)
+ 	if !matched || cr == nil {
+-		return "", false, false
++		return "", false, nil, false
+ 	}
+ 	op := b.Op
+ 	if colOnRight {
+@@ -82,9 +88,9 @@ func rangeBoundOf(e Expr) (key string, isLo bool, ok bool) {
+ 	// below and `<`/`<=` from above.
+ 	switch op {
+ 	case parser.OpGt, parser.OpGe:
+-		return rangeVarKey(cr), true, true
++		return rangeVarKey(cr), true, cr, true
+ 	default:
+-		return rangeVarKey(cr), false, true
++		return rangeVarKey(cr), false, cr, true
+ 	}
+ }
+ 
+@@ -143,7 +149,7 @@ func conjunctionSelectivity(conjuncts []Expr, child Node) float64 {
+ 			// bms_is_member(estimatedclauses) skip).
+ 			continue
+ 		}
+-		key, isLo, ok := rangeBoundOf(c)
++		key, isLo, boundCR, ok := rangeBoundOfCR(c)
+ 		if !ok {
+ 			// Not a pairable bound: multiply it in as before.
+ 			s1 *= clauseSelectivity(c, child)
+@@ -151,6 +157,9 @@ func conjunctionSelectivity(conjuncts []Expr, child Node) float64 {
+ 		}
+ 		s2 := clauseSelectivity(c, child)
+ 		g := find(key)
++		if g.cr == nil {
++			g.cr = boundCR
++		}
+ 		if isLo {
+ 			// Two similar clauses (`x > y AND x >= z`): keep the more
+ 			// restrictive one, as clausesel.c:456-471 does.
+@@ -177,6 +186,14 @@ func conjunctionSelectivity(conjuncts []Expr, child Node) float64 {
+ 			continue
+ 		}
+ 		s2 := g.hiBound + g.loBound - 1.0
++		// PROBE PATCH (rowest defect a): PG's `s2 += nulltestsel(IS_NULL)`
++		// (clausesel.c:283). Both bounds exclude NULLs, so the subtraction
++		// double-excludes them.
++		if g.cr != nil {
++			if cs := columnStatsForChild(g.cr.Index, child); cs != nil {
++				s2 += cs.NullFrac
++			}
++		}
+ 		// PG additionally adds nulltestsel(IS_NULL) here to undo the
+ 		// double-exclusion of NULLs. goopg has no nulltestsel yet (P1-14), so
+ 		// that term is omitted — it only matters for a column with a

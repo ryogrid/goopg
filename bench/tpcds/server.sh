@@ -51,6 +51,21 @@ goopg_start() {
     goopg_target "$1"
     [[ -d "${DATA}" ]] || die "cluster missing: ${DATA} (see bench/tpcds/README.md for setup)"
     ( cd "${REPO_ROOT}" && go build -o "${GOOPG_BIN}" ./cmd/goopg )
+    # Residency guard (2026-09-06). goopg turns shared_buffers into pool slots
+    # as shared_buffers/8 (cmd/goopg/main.go poolSlotsFromGUC), and a
+    # postgresql.conf that leaves it commented falls back to the 128MB GUC
+    # BootVal = 16384 slots. Both TPC-DS clusters were in exactly that state
+    # while their working sets are 1.1 GiB (SF0.5) and 2.2 GiB (SF1): measured,
+    # store_sales alone is 232MB — 1.8x the whole pool — and two scans of it
+    # produced 59522 reads and 43138 evictions, so nothing was ever resident.
+    # The PG TPC-DS reference runs at 2GB, so this also silently made any
+    # goopg-vs-PG TPC-DS timing a 16x unfair comparison. Warn rather than fail:
+    # a values-only gate is still valid on a thrashing pool, a timing arm is not.
+    if ! grep -qE '^[[:space:]]*shared_buffers[[:space:]]*=' "${DATA}/postgresql.conf" 2>/dev/null; then
+        echo "tpcds-server: WARNING — shared_buffers is not set in ${DATA}/postgresql.conf;" >&2
+        echo "tpcds-server:   the cluster will use the 128MB default (16384 slots) against a" >&2
+        echo "tpcds-server:   >1 GiB working set. Values gates stay valid; do NOT publish timing." >&2
+    fi
     goopg_stop "$1" >/dev/null
     local hba_arg=()
     [[ -f "${DATA}/pg_hba.conf" ]] && hba_arg=(--hba "${DATA}/pg_hba.conf")

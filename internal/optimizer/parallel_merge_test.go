@@ -164,12 +164,47 @@ func TestGatherMergeIsNonMutating(t *testing.T) {
 	if gm == nil {
 		t.Fatal("no GatherMerge")
 	}
-	// The Sort itself is SHARED, not copied — it is below the boundary and
-	// each worker builds its own operator from it, so sharing the plan node is
-	// correct and copying would be waste.
-	if gm.Child != Node(srt) {
-		t.Errorf("GatherMerge child is %T, want the original *Sort shared", gm.Child)
+	// The Sort below the boundary is a SHALLOW COPY of the cached one, not the
+	// cached node itself.
+	//
+	// It used to be shared, and the comment here used to say copying "would be
+	// waste". That was true only while the merge arm stamped nothing: the
+	// `Parallel ` label belongs on the scan UNDER this Sort (see
+	// TestGatherMergeStampsDrivingScan), and writing it through the cached
+	// node would be exactly the cross-session data race this test exists to
+	// prevent. So one node is copied to carry a new child pointer — which is
+	// what `stampParallelScan` already does for every node on the spine of the
+	// plain-Gather arm, and what `replaceSingleChild` does above the target.
+	//
+	// The property that actually matters is unchanged and is asserted above:
+	// nothing reachable from the ORIGINAL root is written.
+	copied, ok := gm.Child.(*Sort)
+	if !ok {
+		t.Fatalf("GatherMerge child is %T, want *Sort", gm.Child)
 	}
+	if copied == srt {
+		t.Error("GatherMerge reuses the cached Sort node; stamping its child " +
+			"would write through a node other sessions are executing")
+	}
+	if !sortsAgreeExceptChild(copied, srt) {
+		t.Error("the copied Sort differs from the cached one in more than its child")
+	}
+}
+
+// sortsAgreeExceptChild reports whether two Sort nodes carry the same ordering
+// contract. Used to pin that the merge arm's shallow copy changes ONLY the
+// child pointer — a copy that also dropped a key would return rows in the
+// wrong order with no crash to point at.
+func sortsAgreeExceptChild(a, b *Sort) bool {
+	if a == nil || b == nil || len(a.Keys) != len(b.Keys) {
+		return false
+	}
+	for i := range a.Keys {
+		if a.Keys[i] != b.Keys[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // TestSortWithoutEligibleScanStillTerminates: the Sort special-case must not
@@ -204,6 +239,42 @@ func TestGatherMergeRespectsSizeGate(t *testing.T) {
 	}
 }
 
+// TestEnableGatherMergeOffFallsBackToGatherBelowSort pins B-17c.
+//
+// `enable_gathermerge` was a registered GUC with no consumer. PG's
+// cost_gather_merge carries the flag (costsize.c:485); with no GatherMerge
+// path in the search (P5-04 open) there is no count to carry, so the
+// post-pass gates the P7 arm instead. Off must reproduce the pre-P7 shape —
+// the Sort stays whole above a plain Gather — and must never produce the
+// wrong-results shape (plain Gather over per-worker Sorts).
+func TestEnableGatherMergeOffFallsBackToGatherBelowSort(t *testing.T) {
+	tbl := bigTable(t, "gm_guc")
+	root := sortOver(seqScanOver(tbl), testKeys())
+
+	off := parallelTestSettings()
+	off.DisableGatherMerge = true
+	got := MaybeAddGather(root, off)
+
+	if gm := findGatherMerge(got); gm != nil {
+		t.Fatalf("a GatherMerge survived enable_gathermerge=off: %+v", gm)
+	}
+	if g := findPlainGatherOverSort(got); g != nil {
+		t.Fatalf("plain Gather sits above a Sort — the fallback must keep " +
+			"exactly one leader-side sort, not per-worker sorts")
+	}
+	srt, ok := got.(*Sort)
+	if !ok {
+		t.Fatalf("root is %T, want *Sort above the Gather (the pre-P7 shape)", got)
+	}
+	if _, ok := srt.Child.(*Gather); !ok {
+		t.Fatalf("Sort child is %T, want *Gather below it", srt.Child)
+	}
+	// The control arm is unchanged: on still lifts the Sort into the workers.
+	if _, ok := MaybeAddGather(root, parallelTestSettings()).(*GatherMerge); !ok {
+		t.Fatal("enable_gathermerge=on stopped producing GatherMerge")
+	}
+}
+
 // TestKillSwitchSuppressesGatherMerge — the kill switch must cover both
 // variants, or disabling parallelism would leave ordered queries parallel.
 func TestKillSwitchSuppressesGatherMerge(t *testing.T) {
@@ -216,5 +287,50 @@ func TestKillSwitchSuppressesGatherMerge(t *testing.T) {
 
 	if gm := findGatherMerge(MaybeAddGather(root, parallelTestSettings())); gm != nil {
 		t.Fatal("kill switch did not suppress GatherMerge")
+	}
+}
+
+// TestGatherMergeStampsDrivingScan pins the label half of the placement.
+//
+// `rebuildWithGather`'s merge arm used to call `stampParallelScan(root)` with
+// root = the *Sort. `stampParallelScan` has no `*Sort` arm — correctly, since
+// `terminatesPartial` lists `*Sort` and a Sort therefore never appears inside a
+// partial subtree — so the call fell through every arm and returned the tree
+// UNCHANGED. The scan under the Gather Merge then rendered with no `Parallel `
+// prefix while the workers were really splitting it, i.e. EXPLAIN
+// under-reporting exactly the fact it is consulted for.
+//
+// Latent since P7 because the shape was unreachable in practice, and found by
+// C-19e's TPC-H arm when the cost verdict made it reachable on q16.
+func TestGatherMergeStampsDrivingScan(t *testing.T) {
+	tbl := bigTable(t, "gm_stamp")
+	scan := seqScanOver(tbl)
+	root := sortOver(scan, testKeys())
+
+	got := MaybeAddGather(root, parallelTestSettings())
+
+	gm, ok := got.(*GatherMerge)
+	if !ok {
+		t.Fatalf("root is %T, want *GatherMerge", got)
+	}
+	srt, ok := gm.Child.(*Sort)
+	if !ok {
+		t.Fatalf("GatherMerge child is %T, want *Sort", gm.Child)
+	}
+	ss, ok := srt.Child.(*SeqScan)
+	if !ok {
+		t.Fatalf("Sort child is %T, want *SeqScan", srt.Child)
+	}
+	if !ss.Parallel {
+		t.Error("the scan under Gather Merge -> Sort is not stamped Parallel — " +
+			"EXPLAIN renders it as a serial scan while the workers split it")
+	}
+	// Non-mutation still holds: the ORIGINAL scan must be untouched, because
+	// the plan cache hands this node to other sessions concurrently.
+	if scan.Parallel {
+		t.Error("the original SeqScan was mutated in place")
+	}
+	if srt == root {
+		t.Error("the original Sort was reused rather than shallow-copied")
 	}
 }

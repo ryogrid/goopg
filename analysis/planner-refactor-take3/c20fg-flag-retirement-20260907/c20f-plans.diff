@@ -1,0 +1,26 @@
+--- /tmp/c20-out/c20f-costgate-default.plans.txt	2026-09-07 08:12:51.677741924 +0900
++++ /tmp/c20-out/c20f-costgate-legacy.plans.txt	2026-09-07 08:13:24.938171691 +0900
+@@ -63,17 +63,17 @@
+                           Filter: (c_mktsegment = 'BUILDING')
+ 
+ === Q4
+-Sort  (cost=8672.13..8672.14 rows=5 width=72)
++Sort  (cost=105656.84..105656.86 rows=5 width=72)
+   Sort Key: o_orderpriority
+-  ->  HashAggregate  (cost=8672.02..8672.07 rows=5 width=72)
++  ->  HashAggregate  (cost=105656.74..105656.79 rows=5 width=72)
+         Group Key: o_orderpriority
+-        ->  Nested Loop Semi Join  (cost=0.00..7708.46 rows=385423 width=448)
+-              Filter: (l_commitdate < l_receiptdate)
++        ->  Hash Semi Join  (cost=0.00..104902.76 rows=301590 width=448)
++              Hash Cond: (o_orderkey = l_orderkey)
+               Filter: (true)
+               ->  Seq Scan on orders  (cost=0.00..18854.23 rows=385423 width=448)
+                     Filter: ((o_orderdate >= '1993-07-01'::date) AND (o_orderdate < ('1993-07-01'::date + '3 month'::interval)))
+-              ->  Index Scan using idx_lineitem_orderkey_fkidx on lineitem  (cost=0.00..0.05 rows=5 width=550)
+-                    Index Cond: (l_orderkey = o_orderkey)
++              ->  Seq Scan on lineitem  (cost=0.00..80016.73 rows=2000418 width=550)
++                    Filter: (l_commitdate < l_receiptdate)
+ 
+ === Q5
+ Sort  (cost=1377396.03..1377396.10 rows=25 width=136)

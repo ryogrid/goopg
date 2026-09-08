@@ -723,6 +723,15 @@ type SeqScan struct {
 	// inheritance-child scan. M0118-0008 (alter-table-4 perm 4: concurrent
 	// `ALTER TABLE c1 ALTER COLUMN a TYPE float`).
 	InheritParentOID uint32
+	// RTID is the statement-unique range-table identity (A-01(ii)):
+	// this scan's FROM-clause entry allocation from the statement's
+	// rtableScope, stamped in planScanRangeVar (each partition /
+	// inheritance fan-out leaf consumes its own — F7). 0 means "no
+	// identity" (a scan built outside a threaded planning path) and
+	// keeps today's rendering. Only explain_names.go
+	// will read this field (a later cut); value, cost, and executor
+	// paths never do.
+	RTID int32
 	// PrivilegeCheckRole / PrivilegeCheckRoleSet override which role's SELECT
 	// grant the executor checks against Table: set by tagViewOwnerScans when
 	// this scan sits inside an inlined, non-security_invoker view (PostgreSQL
@@ -772,6 +781,21 @@ type IndexScan struct {
 	// priority over Key. len(Keys) == len(Index.Columns) means a full equality
 	// probe (no suffix padding); a shorter prefix is rejected by the planner
 	// to keep the executor probe path purely equality-shaped.
+	// SAOPKeys holds one probe expression per element of a ScalarArrayOp
+	// (`col = ANY (consts)`, i.e. `col IN (consts)`) over the index's LEADING
+	// column — PG's `match_saopclause_to_indexcol` shape
+	// (postgres/src/backend/optimizer/path/indxpath.c:3136): useOr-only
+	// (ANY, never ALL/NOT IN), bare index column on the left, all-constant
+	// array on the right, equality in the index opfamily. The executor
+	// performs one point descent per element and unions the tids
+	// (B-14/P2-09a). Exactly one probe shape is ever set on a node
+	// (Key, Keys, LowKey/HighKey, or SAOPKeys); the executor checks SAOPKeys
+	// first. A node carrying SAOPKeys is never promoted to IndexOnlyScan
+	// (tryPromoteIndexOnlyScan declines: the IOS operator has no
+	// multi-descent) and DML falls back to its SeqScan+predicate path
+	// (updateViaIndex requires Key; indexScanPredicate rebuilds the IN
+	// qual for the fallback).
+	SAOPKeys []Expr
 	LowKey  Expr // inclusive lower bound for range scan; nil = no lower bound
 	HighKey Expr // inclusive upper bound for range scan; nil = no upper bound
 	// LowOp / HighOp preserve the ORIGINAL comparison operator in its canonical
@@ -802,8 +826,16 @@ type IndexScan struct {
 	// leaf's `*Filter` wrappers are rebuilt above the scan by `scanLeafFor`'s
 	// rewrapper as before, and Cond stays nil — one predicate evaluated in one
 	// place either way, never both.
-	Cond   Expr
-	schema Schema
+	Cond Expr
+	// Parallel mirrors PostgreSQL's Plan.parallel_aware — see SeqScan's field
+	// of the same name. Stamped once by parallel.go's stampParallelScan,
+	// never inferred at render time. When set, each worker's scan collects
+	// only the TIDs from the index LEAF BLOCKS it claims from the shared
+	// parallelIndexScanState (C-19c, the plain-scan sibling of
+	// IndexOnlyScan.Parallel / M0134-0189), so the union over workers is the
+	// whole scan exactly once.
+	Parallel bool
+	schema   Schema
 	// PrivilegeCheckRole / PrivilegeCheckRoleSet — see SeqScan's field of the
 	// same name. M0122-0008 (view-owner privilege gap).
 	PrivilegeCheckRole    string
@@ -818,6 +850,12 @@ type IndexScan struct {
 	// a SeqScan: the relation's uniqueness evidence is a property of the
 	// relation, not of how this plan chose to read it.
 	UniqueKeys [][]string
+	// RTID is the statement-unique range-table identity (A-01(ii) cut 1).
+	// Field exists for the §4 minimal set; stamping of IndexScan nodes is
+	// a later cut, so this stays 0 (today's rendering) throughout cut 1.
+	// Only explain_names.go will read it; value, cost, and executor
+	// paths never do.
+	RTID int32
 }
 
 func (n *IndexScan) Pos() int       { return n.pos }
@@ -942,6 +980,13 @@ type IndexOnlyScan struct {
 	PlanCost
 	pos   int
 	Table *catalog.Table
+	// Alias is the FROM-clause alias; empty when not specified. Mirrors
+	// IndexScan.Alias (M0062-0002): every IndexScan→IOS promotion site
+	// carries it so EXPLAIN prints `Index Only Scan on customer c2`
+	// instead of the bare catalog name. The two min/max-agg synthesis
+	// sites leave it empty — they build a fresh inner scan with no alias
+	// in scope, where the bare relation name is the truthful rendering.
+	Alias string
 	Index *catalog.Index
 	Key   Expr
 	// Keys mirrors IndexScan.Keys: a full multi-column equality probe
@@ -983,6 +1028,12 @@ type IndexOnlyScan struct {
 	// same name. M0122-0008 (view-owner privilege gap).
 	PrivilegeCheckRole    string
 	PrivilegeCheckRoleSet bool
+	// RTID is the statement-unique range-table identity (A-01(ii) cut 1).
+	// Field exists for the §4 minimal set; stamping of IndexOnlyScan
+	// nodes is a later cut, so this stays 0 (today's rendering)
+	// throughout cut 1. Only explain_names.go will read it; value,
+	// cost, and executor paths never do.
+	RTID int32
 }
 
 func (n *IndexOnlyScan) Pos() int       { return n.pos }
@@ -1248,8 +1299,8 @@ type Aggregate struct {
 	Strategy AggStrategy
 
 	// GroupKeyOrder is an EXPLAIN-only permutation: indices into GroupExprs,
-	// in the order applyIndexOrderedGroupingRule's chosen index lays its key
-	// columns out (S8 Slice 2c-i, 0134-0001 P2). GroupExprs itself is NEVER
+	// in the order the GROUP_AGG producer's chosen index lays its key
+	// columns out (C-15 index-driven sorted input). GroupExprs itself is NEVER
 	// reordered — every output-column binding downstream of buildAggregateStage
 	// (target list, HAVING, ORDER BY) is fixed to GroupExprs' written
 	// position, and finalizeGroup's group-boundary test
@@ -1263,6 +1314,29 @@ type Aggregate struct {
 	// the alternative design (see docs/design/0134-0001-p2-explain-format.md
 	// §"S8 Slice 2c").
 	GroupKeyOrder []int
+
+	// InputTarget / InputTargetKnown is the aggregate's input-column keep list —
+	// B-01c second cut (COMPUTE-ONLY group_input_target): the ascending
+	// child-output positions of the group-input columns (group keys ∪
+	// aggregate args ∪ internal ORDER BY / WITHIN GROUP ORDER BY args) plus
+	// the columns needed above the Aggregate, derived from existing walkers
+	// only (group inputs per walkPlanExprs' Aggregate arm, above-chain scopes
+	// per enclosingNodeScopeOf).
+	//
+	// NEVER applied: no Project insertion, no schema change, no cost
+	// change — behaviour-neutral by construction (one small slice header
+	// per Aggregate). InputTargetKnown false means "unknown": a Filter or
+	// Passthrough is present, or a group/above expression could not be
+	// enumerated, and no narrowing may be attempted. It is NOT the same as
+	// an empty list. Read by nothing except
+	// assertAggregateInputTargetCoversKeys (group_input_target.go) and its
+	// unit tests.
+	//
+	// Must-avoid list: cost readers (plancost.go reads GroupExprs/Child
+	// only), EXPLAIN output, plan equality/goldens, copy/clone paths (a
+	// clone that drops the stamp reads as unknown, the safe direction).
+	InputTarget      []int
+	InputTargetKnown bool
 }
 
 // GroupingMaskColOffset is the index of the first GROUPING(...) output
@@ -1347,6 +1421,28 @@ type WindowAgg struct {
 	// ROWS/GROUPS/RANGE frame (M0122-0004 frame-clause slice).
 	Frame  *WindowFrame
 	schema Schema
+
+	// InputTarget / InputTargetKnown is the window's input-column keep list —
+	// B-01c third cut (COMPUTE-ONLY window_input_target): the ascending
+	// child-output positions of the window-input columns (PartitionBy ∪
+	// OrderBy key columns ∪ func args ∪ func Filters ∪ frame offsets) plus
+	// the columns needed above the WindowAgg, derived from existing walkers
+	// only (window inputs per walkPlanExprs' WindowAgg arm, above-chain
+	// scopes per enclosingNodeScopeOf).
+	//
+	// NEVER applied: no Project insertion, no schema change, no cost
+	// change — behaviour-neutral by construction (one small slice header
+	// per WindowAgg). InputTargetKnown false means "unknown": a window or
+	// above-chain expression could not be enumerated, and no narrowing may
+	// be attempted. It is NOT the same as an empty list. Read by nothing
+	// except assertWindowInputTargetCoversKeys (window_input_target.go) and
+	// its unit tests.
+	//
+	// Must-avoid list: cost readers (plancost.go descends to Child only),
+	// EXPLAIN output, plan equality/goldens, copy/clone paths (a clone
+	// that drops the stamp reads as unknown, the safe direction).
+	InputTarget      []int
+	InputTargetKnown bool
 }
 
 // WindowFrame is the planner-resolved form of parser.WindowFrame:
@@ -1401,10 +1497,11 @@ type Filter struct {
 	// double-counting them because they were not considered in estimating
 	// the sizes of the component rels").
 	//
-	// goopg cannot move the clause — the copy left above the join is what
-	// keeps the join's own residual evaluation correct — so it records the
-	// duplication instead and `filterSelectivity` skips these conjuncts.
-	// M0127-P5.6-f-vi.
+	// goopg moves the clause only on the C-02c/d proof (full-path delay
+	// proof, side containment, no sibling derivation) — otherwise the
+	// copy left above the join is what keeps the join's own residual
+	// evaluation correct — so copies (not moves) are recorded here and
+	// `filterSelectivity` skips those conjuncts. M0127-P5.6-f-vi.
 	PushedBelow []Expr
 }
 
@@ -1487,6 +1584,12 @@ type CTEScan struct {
 	// into the body only when no second reference exists. nil for scans built
 	// outside preplanWithClause (tests). M0125-0035 CTE-body arm.
 	cte *plannedCTE
+	// RTID is the statement-unique range-table identity (A-01(ii) cut 1):
+	// this consumer's FROM-clause entry allocation, stamped in
+	// planScanRangeVar. 0 means "no identity" (nested scope not yet
+	// threaded) and keeps today's rendering. Only explain_names.go will
+	// read this field (a later cut); value and executor paths never do.
+	RTID int32
 }
 
 // CTEDMLPrefix executes data-modifying CTEs (INSERT/UPDATE/DELETE/MERGE)
@@ -1512,6 +1615,12 @@ type MaterializedCTEScan struct {
 	Name   string // CTE name (key into ctx.MaterializedCTEs)
 	Alias  string
 	schema Schema
+	// RTID is the statement-unique range-table identity (A-01(ii) cut 1):
+	// this consumer's FROM-clause entry allocation, stamped in
+	// planScanRangeVar. 0 means "no identity" (nested scope not yet
+	// threaded) and keeps today's rendering. Only explain_names.go will
+	// read this field (a later cut); value and executor paths never do.
+	RTID int32
 }
 
 func (n *MaterializedCTEScan) Pos() int       { return n.pos }
@@ -1585,6 +1694,27 @@ type Sort struct {
 	pos   int
 	Child Node
 	Keys  []SortKey
+
+	// InputTarget / InputTargetKnown is the sort's input-column keep list —
+	// B-01c Slice 1 (COMPUTE-ONLY sort_input_target): the ascending
+	// child-output positions of the sort-key columns plus the columns
+	// needed above the Sort, derived at Sort-construction time from
+	// existing walkers only (sort keys per walkPlanExprs' Sort arm,
+	// above-chain scopes per enclosingNodeScopeOf).
+	//
+	// NEVER applied: no Project insertion, no schema change, no cost
+	// change — behaviour-neutral by construction (one small slice header
+	// per Sort). InputTargetKnown false means "unknown": a key or an
+	// above-chain expression could not be enumerated, and no narrowing
+	// may be attempted. It is NOT the same as an empty list. Read by
+	// nothing except assertSortInputTargetCoversKeys (sort_input_target.go)
+	// and its unit tests.
+	//
+	// Must-avoid list: cost readers (plancost.go reads Keys only),
+	// EXPLAIN output, plan equality/goldens, copy/clone paths (a clone
+	// that drops the stamp reads as unknown, the safe direction).
+	InputTarget      []int
+	InputTargetKnown bool
 }
 
 func (n *Sort) Pos() int       { return n.pos }
@@ -2522,6 +2652,14 @@ func (n *SetOp) Output() Schema { return n.Left.Output() }
 // space. The risk correspondingly moves from "is the transport correct" to "is
 // the shutdown correct".
 type Gather struct {
+	PlanCost
+	// searchedTree: C-19f. A Gather became a root `createPlanNode` can return
+	// the moment a partial JOIN path made one winnable at a search root
+	// (`generateUsefulGatherPaths` over `try_partial_hashjoin_path`), and
+	// `markSearchedTree` panics rather than silently declining on a kind that
+	// cannot carry the tag — an untagged searched subtree would be walked
+	// again by the legacy posmap family and permuted twice.
+	searchedTree
 	pos   int
 	Child Node
 	// WorkersPlanned is the worker count chosen at plan time. EXPLAIN renders
@@ -2552,6 +2690,9 @@ func NewGather(pos int, child Node, nWorkers int) *Gather {
 //
 // P7 of docs/design/parallel-query/ (chapter 05 §4).
 type GatherMerge struct {
+	PlanCost
+	// searchedTree: see *Gather. C-19e/C-19f make this reachable too.
+	searchedTree
 	pos            int
 	Child          Node
 	WorkersPlanned int
@@ -2684,6 +2825,12 @@ type BitmapHeapScan struct {
 	// that function's comment for why). Only affects the "Parallel " EXPLAIN
 	// text prefix (operators_explain.go describePlan).
 	Parallel bool
+	// RTID is the statement-unique range-table identity (A-01(ii) cut 1).
+	// Field exists for the §4 minimal set; stamping of BitmapHeapScan
+	// nodes is a later cut, so this stays 0 (today's rendering)
+	// throughout cut 1. Only explain_names.go will read it; value,
+	// cost, and executor paths never do.
+	RTID int32
 }
 
 func (n *BitmapHeapScan) Pos() int       { return n.pos }

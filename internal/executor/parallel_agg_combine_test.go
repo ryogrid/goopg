@@ -29,12 +29,13 @@ func aggTestOp(ctx *Context) *aggregateOp {
 }
 
 // applyAggValue feeds one value through the real transition function.
+// idx<0: the bare helper op is never Opened/compiled — interpreted path.
 func applyAggValue(ctx *Context, call optimizer.AggregateCall, st *aggRuntime, v Datum) error {
 	op := aggTestOp(ctx)
 	slot := SlotFromRow(optimizer.Schema{{Name: "v"}}, Row{v})
 	c := call
 	c.Arg = &optimizer.ColumnRef{Index: 0}
-	return op.applyAgg(st, c, slot)
+	return op.applyAgg(st, c, slot, -1)
 }
 
 // finishAggValue runs the real finalize function.

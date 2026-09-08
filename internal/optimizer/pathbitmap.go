@@ -190,15 +190,24 @@ func (s *searchCtx) buildOneBitmapPath(
 		IndexClauses:      indexClauses,
 		PartialPredicate:  partialPredicate,
 		RequiredOuter:     0,
+		// create_bitmap_index_path: `rel->consider_parallel`. C-19a.
+		ParallelSafe: rel.ParallelSafeForPath(),
 	}
 
 	// Build the bitmap heap scan path (the outer container).
+	// B-17d: `cost_bitmap_heap_scan`'s own flag (costsize.c:1023), on top of
+	// the index child's count (normally zero — the child carries no flag of
+	// its own). The producer always runs.
 	return &Path{
 		Kind:     PathBitmapHeapScan,
 		Rel:      rel,
 		Rows:     rel.Rows, // the rel's post-restriction row count
 		Cost:     totalCost,
+		DisabledNodes: disabledNodesFor(!s.cp.enableBitmapScan, bitmapIdxPath),
 		Children: []*Path{bitmapIdxPath},
+		// create_bitmap_heap_path (pathnode.c:1149): the rel's flag AND the
+		// bitmapqual's. C-19a.
+		ParallelSafe: parallelSafeWith(rel, bitmapIdxPath),
 	}
 }
 
@@ -243,6 +252,16 @@ func flattenExprAnd(expr Expr) []Expr {
 // Only top-level equality conjuncts (col = const) are eligible — range
 // predicates and disjunctions remain as recheck / residual quals and do
 // not contribute selectivity reduction on the index side.
+//
+// ScalarArrayOp (`col IN (consts)`) is deliberately NOT matched here,
+// though PG wires `match_saopclause_to_indexcol` into its bitmap build too
+// (indxpath.c:3136). The bitmap carrier end-to-end is single-key per column
+// (indexPathClause.key → BitmapIndexScan.Key/Keys → single-descent probe),
+// while SAOP needs a multi-key carrier at every layer; the SAOP probe
+// therefore lives on IndexScan.SAOPKeys (trySAOPIndexScan, planner.go) with
+// multi-descent in indexScanOp. The cost side is already shared —
+// costBitmapIndexScan reads btreeIndexAMCost, which charges num_sa_scans —
+// so a future bitmap SAOP arm prices identically to the plain one (P2-09b).
 //
 // id is the scanIdentity extracted from the leaf (via scanLeafFor); its
 // table provides the column-name→position mapping.
@@ -434,6 +453,8 @@ func (s *searchCtx) chooseBitmapAnd(
 		Cost:              andCost,
 		BitmapSelectivity: andSelec,
 		Children:          inners,
+		// create_bitmap_and_path (pathnode.c:1189): `rel->consider_parallel`.
+		ParallelSafe: rel.ParallelSafeForPath(),
 	}
 
 	// Recompute heap-access cost atop the AND tree.
@@ -448,6 +469,7 @@ func (s *searchCtx) chooseBitmapAnd(
 		Rows:     rel.Rows,
 		Cost:     totalCost,
 		Children: []*Path{bitmapAndPath},
+		ParallelSafe: parallelSafeWith(rel, bitmapAndPath),
 	}
 }
 
@@ -563,10 +585,19 @@ func (s *searchCtx) buildOneParameterizedBitmapPath(
 	// multiplies by the outer row count without double-counting.
 	pagesFetched, tuplesFetched := computeBitmapPagesLooped(tuplesFetched, relTuples, T, indexPages, totalPages,
 		s.cp.effectiveCacheSize, maxEntries, s.loopCountFor(req))
+	child := &Path{
+		Kind: PathBitmapIndexScan, Rel: rel, Rows: tuplesFetched, Cost: idxCost,
+		BitmapSelectivity: sel, IndexInfo: idx, IndexScanDir: NoMovementScanDirection,
+		IndexClauses: clauses, RequiredOuter: req,
+		ParallelSafe: rel.ParallelSafeForPath(),
+	}
 	return &Path{
 		Kind: PathBitmapHeapScan, Rel: rel,
 		Rows:          parameterizedBaserelRows(rel, nil, sel, false),
 		Cost:          costBitmapHeapScan(s.cp, idxCost, pagesFetched, tuplesFetched, T),
+		// B-17d: `cost_bitmap_heap_scan`'s own flag (costsize.c:1023), on
+		// top of the index child's count.
+		DisabledNodes: disabledNodesFor(!s.cp.enableBitmapScan, child),
 		RequiredOuter: req,
 		// On the HEAP path, not only the child: `probeEnforcedClauses` and
 		// `memoizeCacheKeys` both read the INNER CANDIDATE's own list, and the
@@ -578,10 +609,7 @@ func (s *searchCtx) buildOneParameterizedBitmapPath(
 		// (~5.0 on Q2's supplier probe) that the sibling index path did not
 		// pay.
 		IndexClauses: clauses,
-		Children: []*Path{{
-			Kind: PathBitmapIndexScan, Rel: rel, Rows: tuplesFetched, Cost: idxCost,
-			BitmapSelectivity: sel, IndexInfo: idx, IndexScanDir: NoMovementScanDirection,
-			IndexClauses: clauses, RequiredOuter: req,
-		}},
+		Children:     []*Path{child},
+		ParallelSafe: parallelSafeWith(rel, child),
 	}
 }

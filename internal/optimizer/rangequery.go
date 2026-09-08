@@ -32,9 +32,12 @@ import (
 const defaultRangeIneqSel = 0.005
 
 // rangeQueryClause groups the inequality bounds found on one variable, mirroring
-// clausesel.c's RangeQueryClause struct.
+// clausesel.c's RangeQueryClause struct. cr is the first bound's column
+// reference (both bounds share the variable by key) for the null-fraction
+// correction below; nil when the pairing was built without one.
 type rangeQueryClause struct {
 	key         string
+	cr          *ColumnRef
 	haveLoBound bool
 	haveHiBound bool
 	loBound     float64
@@ -53,26 +56,27 @@ func splitConjuncts(e Expr, out []Expr) []Expr {
 
 // rangeBoundOf reports whether e is `var <op> const` (or the mirrored
 // `const <op> var`) with an inequality operator, and if so returns a stable key
-// for the variable and whether the clause is a LOW bound.
+// for the variable, whether the clause is a LOW bound, and the bound's column
+// reference (for the null-fraction correction in the pairing completion).
 //
 // PG decides lo/hi from the operator's strategy number after normalising which
 // side the Var is on (clausesel.c:236-251): `x > c` and `c < x` are both low
 // bounds. The same normalisation is done here through normalizeColumnConstRange,
 // which reports whether the column was on the right so the operator can be
 // flipped.
-func rangeBoundOf(e Expr) (key string, isLo bool, ok bool) {
+func rangeBoundOf(e Expr) (key string, isLo bool, col *ColumnRef, ok bool) {
 	b, isBin := e.(*BinaryOp)
 	if !isBin {
-		return "", false, false
+		return "", false, nil, false
 	}
 	switch b.Op {
 	case parser.OpLt, parser.OpLe, parser.OpGt, parser.OpGe:
 	default:
-		return "", false, false
+		return "", false, nil, false
 	}
 	cr, _, colOnRight, matched := normalizeColumnConstRange(b.Left, b.Right)
 	if !matched || cr == nil {
-		return "", false, false
+		return "", false, nil, false
 	}
 	op := b.Op
 	if colOnRight {
@@ -82,9 +86,9 @@ func rangeBoundOf(e Expr) (key string, isLo bool, ok bool) {
 	// below and `<`/`<=` from above.
 	switch op {
 	case parser.OpGt, parser.OpGe:
-		return rangeVarKey(cr), true, true
+		return rangeVarKey(cr), true, cr, true
 	default:
-		return rangeVarKey(cr), false, true
+		return rangeVarKey(cr), false, cr, true
 	}
 }
 
@@ -116,7 +120,14 @@ func rangeVarKey(cr *ColumnRef) string {
 // conjunctionSelectivity is goopg's clauselist_selectivity: it estimates an
 // AND-list, pairing inequality bounds on the same variable instead of
 // multiplying them as independent events.
+//
+// B-05b: extended statistics run first, exactly as clauselist_selectivity_ext
+// calls statext_clauselist_selectivity before the range-pairing loop: clauses
+// consumed there (estimatedclauses) are skipped below. With nothing
+// registered the ext call returns 1.0 with no clause marked and the loop is
+// bit-identical to the pre-B-05b one.
 func conjunctionSelectivity(conjuncts []Expr, child Node) float64 {
+	extSel, estimated := statextClauselistSelectivity(conjuncts, child)
 	var groups []*rangeQueryClause
 	find := func(key string) *rangeQueryClause {
 		for _, g := range groups {
@@ -129,9 +140,14 @@ func conjunctionSelectivity(conjuncts []Expr, child Node) float64 {
 		return g
 	}
 
-	s1 := 1.0
-	for _, c := range conjuncts {
-		key, isLo, ok := rangeBoundOf(c)
+	s1 := extSel
+	for idx, c := range conjuncts {
+		if estimated[idx] {
+			// Consumed by extended statistics (clausesel.c's
+			// bms_is_member(estimatedclauses) skip).
+			continue
+		}
+		key, isLo, boundCR, ok := rangeBoundOf(c)
 		if !ok {
 			// Not a pairable bound: multiply it in as before.
 			s1 *= clauseSelectivity(c, child)
@@ -139,6 +155,9 @@ func conjunctionSelectivity(conjuncts []Expr, child Node) float64 {
 		}
 		s2 := clauseSelectivity(c, child)
 		g := find(key)
+		if g.cr == nil {
+			g.cr = boundCR
+		}
 		if isLo {
 			// Two similar clauses (`x > y AND x >= z`): keep the more
 			// restrictive one, as clausesel.c:456-471 does.
@@ -164,12 +183,37 @@ func conjunctionSelectivity(conjuncts []Expr, child Node) float64 {
 			}
 			continue
 		}
-		s2 := g.hiBound + g.loBound - 1.0
-		// PG additionally adds nulltestsel(IS_NULL) here to undo the
-		// double-exclusion of NULLs. goopg has no nulltestsel yet (P1-14), so
-		// that term is omitted — it only matters for a column with a
-		// significant null fraction, and omitting it UNDER-estimates slightly
-		// rather than reverting to the independent product.
+		// PG refuses to combine when either bound is itself a punt
+		// (`hibound == DEFAULT_INEQ_SEL || lobound == DEFAULT_INEQ_SEL`
+		// → DEFAULT_RANGE_INEQ_SEL): a defaulted bound plus a null
+		// fraction can fabricate a confident selectivity out of two
+		// unknowns (0.33+0.33-1+0.5 = +0.16 trusted vs PG 0.005).
+		var s2 float64
+		if g.hiBound == defaultIneqSelectivity || g.loBound == defaultIneqSelectivity {
+			s2 = defaultRangeIneqSel
+		} else {
+			s2 = g.hiBound + g.loBound - 1.0
+			// PG adds nulltestsel(IS_NULL) here (clausesel.c:283) to
+			// undo the double-exclusion of NULLs: both bounds exclude
+			// NULLs, so the subtraction removes them twice. Add the
+			// column's null fraction back when statistics resolve it;
+			// without stats the term stays omitted (slight
+			// under-estimate, never the independent product).
+			// Rowest A1: Q28's scans estimated 1 row against 15,410
+			// actual without this correction. The correction needs a
+			// resolved column identity (SourceTableIdx != 0):
+			// zero-valued refs are synthesized without one
+			// (patternsel) and could donate the wrong column's
+			// fraction.
+			// NOTE: s2 is intentionally NOT clamped to 1.0 here — the
+			// function-final clamp below already bounds the output, and
+			// an early clamp would undercut PG's late composition.
+			if g.cr != nil && g.cr.SourceTableIdx != 0 {
+				if cs := columnStatsForChild(g.cr.Index, child); cs != nil {
+					s2 += cs.NullFrac
+				}
+			}
+		}
 		switch {
 		case s2 < -0.01:
 			// Very negative means at least one side was a default estimate we

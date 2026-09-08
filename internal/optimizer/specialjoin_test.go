@@ -55,8 +55,11 @@ func fmtJoinRelSet(b *strings.Builder, label string, rs RelSet) {
 func sjCollect(t *testing.T, from string) string {
 	t.Helper()
 	fromExprs := parseFrom(t, from)
-	jl := deconstructJointree(fromExprs, defaultCollapseLimits(), pgShapedCollapseEnabled())
-	infos := jl.collectSpecialJoinInfos(nil)
+	// C-04a: read the SpecialJoinInfos from the DECONSTRUCTION, not from a
+	// walk of the joinlist's items — a LEFT join no longer pins, so it has no
+	// item to carry one and the walk would answer "(none)" for every LEFT
+	// fixture in this file. See `deconstructJointreeScopedSJI`.
+	_, infos := deconstructJointreeScopedSJI(fromExprs, defaultCollapseLimits(), nil)
 	if len(infos) == 0 {
 		return "(none)"
 	}
@@ -80,12 +83,22 @@ func TestSpecialJoinInfoLeftJoin(t *testing.T) {
 }
 
 func TestSpecialJoinInfoRightJoin(t *testing.T) {
-	// RIGHT JOIN is pinned and should produce a SpecialJoinInfo.
-	// PG never sees RIGHT (reduce_outer_joins flips it), but goopg has no
-	// such pass yet, so RIGHT reaches deconstruction as itself.
+	// C-04b: a RIGHT JOIN produces the SpecialJoinInfo PG would have built
+	// AFTER reduce_outer_joins — a LEFT one with the hands swapped
+	// (prepjointree.c:3360-3376; `reduceRightLink`). PG never builds a RIGHT
+	// SJI at all (initsplan.c:1728), and neither does goopg now.
 	got := sjCollect(t, "a RIGHT JOIN b ON a.x = b.x")
-	if got == "(none)" {
-		t.Error("RIGHT JOIN must produce a SpecialJoinInfo")
+	want := "LEFT synL={1} synR={0} minL={1} minR={0}"
+	if got != want {
+		t.Errorf("got  %s\nwant %s", got, want)
+	}
+	// A deeper RIGHT link null-extends its whole left prefix, and the prefix
+	// holds an inner join: min = syn on the reduced RHS, as PG's min_righthand
+	// includes inner_join_rels (initsplan.c:1804-1805). No LhsStrict.
+	got = sjCollect(t, "a JOIN b ON a.x = b.x RIGHT JOIN c ON b.x = c.x")
+	want = "LEFT synL={2} synR={0,1} minL={2} minR={0,1}"
+	if got != want {
+		t.Errorf("got  %s\nwant %s", got, want)
 	}
 }
 
@@ -262,7 +275,7 @@ func TestSpecialJoinInfoResolveContextPopulated(t *testing.T) {
 		t.Fatal(err)
 	}
 	sel := stmts[0].(*parser.SelectStmt)
-	_, rctx, err := planFromClause(sel, cat, DefaultPlannerSettings())
+	_, rctx, err := planFromClause(sel, cat, DefaultPlannerSettings(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -272,16 +285,31 @@ func TestSpecialJoinInfoResolveContextPopulated(t *testing.T) {
 	if len(rctx.joinInfoList) == 0 {
 		t.Error("joinInfoList not populated on resolveContext for LEFT JOIN query")
 	}
-	if len(rctx.joinlist.collectSpecialJoinInfos(nil)) != len(rctx.joinInfoList) {
-		t.Error("joinInfoList and collectSpecialJoinInfos disagree")
+	// C-04a: the joinlist walk no longer sees a LEFT join's SpecialJoinInfo —
+	// the link does not pin, so there is no item to carry it — which is
+	// exactly why `joinInfoList` is now published by the deconstruction. The
+	// walk is a SUBSET, and the invariant that remains is that everything it
+	// does see is in the list. TestJoinInfoListProvenanceMatchesJoinlistWalk
+	// pins the divergence itself.
+	for _, sj := range rctx.joinlist.collectSpecialJoinInfos(nil) {
+		found := false
+		for _, got := range rctx.joinInfoList {
+			if got == sj {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Error("a SpecialJoinInfo on the joinlist is missing from joinInfoList")
+		}
 	}
 }
 
 func TestSpecialJoinInfoFieldsAreSet(t *testing.T) {
 	// Verify that the SpecialJoinInfo fields match PG's expectations.
 	fromExprs := parseFrom(t, "a LEFT JOIN b ON a.x = b.x")
-	jl := deconstructJointree(fromExprs, defaultCollapseLimits(), pgShapedCollapseEnabled())
-	infos := jl.collectSpecialJoinInfos(nil)
+	// C-04a: from the deconstruction, not the joinlist walk (see sjCollect).
+	_, infos := deconstructJointreeScopedSJI(fromExprs, defaultCollapseLimits(), nil)
 	if len(infos) != 1 {
 		t.Fatalf("expected 1 SpecialJoinInfo, got %d", len(infos))
 	}

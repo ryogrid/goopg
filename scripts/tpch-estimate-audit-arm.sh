@@ -24,7 +24,9 @@
 #   PGSHAPED   GOOPG_PGSHAPED_DP for this arm (default 0). Set EXPLICITLY on
 #              both arms — see tpch-acceptance-arm.sh's note on why an unset
 #              flag stops being a well-defined arm the day the default flips.
-#   COLLAPSE   GOOPG_PGSHAPED_COLLAPSE (default 0)
+#              (COLLAPSE was GOOPG_PGSHAPED_COLLAPSE; take3 C-06 retired the
+#              flag and explicit-JOIN flattening is unconditional, so the
+#              knob is gone rather than silently inert.)
 #   DP_TRACE   1 = run the server with GOOPG_PGSHAPED_DP_TRACE=1 and hand its
 #              log to the audit tool as --enum-trace, which adds the clause-6
 #              enumeration-provenance section (M0127-P5.9-l-ii). Only
@@ -78,7 +80,6 @@ export GOMEMLIMIT="${GOMEMLIMIT:-12GiB}" GOGC="${GOGC:-off}"
 export GOOPG_MEM_HIGH="${GOOPG_MEM_HIGH:-20G}" GOOPG_MEM_MAX="${GOOPG_MEM_MAX:-24G}"
 export GOOPG_MEM_SWAP_MAX="${GOOPG_MEM_SWAP_MAX:-0}"
 export GOOPG_PGSHAPED_DP="${PGSHAPED:-0}"
-export GOOPG_PGSHAPED_COLLAPSE="${COLLAPSE:-0}"
 export GOOPG_PGSHAPED_DP_TRACE="${DP_TRACE:-0}"
 
 if pg_isready -h "${PG_HOST}" -p "${PG_PORT}" -q 2>/dev/null; then
@@ -136,7 +137,7 @@ audit_args=(-host "${PG_HOST}" -port "${PG_PORT}" --label "${LABEL}" --timeout "
 [[ "${GOOPG_PGSHAPED_DP_TRACE}" == "1" ]] && audit_args+=(--enum-trace "${SRV_LOG}")
 [[ "${PLAN_ONLY:-0}" == "1" ]] && audit_args+=(--plan-only)
 
-echo "# audit ${LABEL} GOOPG_PGSHAPED_DP=${GOOPG_PGSHAPED_DP} COLLAPSE=${GOOPG_PGSHAPED_COLLAPSE} DP_TRACE=${GOOPG_PGSHAPED_DP_TRACE} PLAN_ONLY=${PLAN_ONLY:-0} started $(date -Is)"
+echo "# audit ${LABEL} GOOPG_PGSHAPED_DP=${GOOPG_PGSHAPED_DP} DP_TRACE=${GOOPG_PGSHAPED_DP_TRACE} PLAN_ONLY=${PLAN_ONLY:-0} started $(date -Is)"
 ( cd "${REPO_ROOT}" && "${AUDIT_BIN}" "${audit_args[@]}" "$@" )
 rc=$?
 echo "# audit ${LABEL} finished $(date -Is) rc=${rc}"

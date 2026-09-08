@@ -12,8 +12,9 @@ package optimizer
 //     index-only assertion passes for a plan that reads the wrong column; and
 //  2. a sub-joinlist is a SEPARATE search problem whose relations are joined to
 //     each other before anything outside it — the pin `deconstructJointree`
-//     produces for an outer join, and for an explicit JOIN with
-//     `GOOPG_PGSHAPED_COLLAPSE` off.
+//     produces for a FULL outer join. (Until take3 C-06 retired
+//     `GOOPG_PGSHAPED_COLLAPSE`, its `=0` regime produced the same shape for
+//     every explicit JOIN, which is where this fixture's shape comes from.)
 
 import (
 	"strings"
@@ -100,8 +101,59 @@ func rfjAssertBindingOrder(t *testing.T, n Node, names []string) {
 	}
 }
 
+// rfjLeafCount counts the base inputs under a node: every node that is not a
+// join or a unary wrapper counts as one, and a nested-loop index join's probed
+// inner relation counts as one too. C-04b uses it to say WHICH side of a
+// searched outer join holds the preserved leaf.
+func rfjLeafCount(n Node) int {
+	switch t := n.(type) {
+	case nil:
+		return 0
+	case *Join:
+		return rfjLeafCount(t.Left) + rfjLeafCount(t.Right)
+	case *NestedLoopIndexJoin:
+		return rfjLeafCount(t.Outer) + 1
+	case *Project:
+		return rfjLeafCount(t.Child)
+	case *Filter:
+		return rfjLeafCount(t.Child)
+	case *Sort:
+		return rfjLeafCount(t.Child)
+	default:
+		return 1
+	}
+}
+
 // rfjJoins collects every `*Join` in a tree, deepest-last, so a test can talk
 // about "the join below the root" without knowing which side it landed on.
+// rfjOuterPreserving counts the joins in n that PRESERVE unmatched outer rows,
+// i.e. LEFT and RIGHT together.
+//
+// C-06s (2026-09-07) is why this exists. Before it, `jointypeForDirection`
+// declined the commuted containment, so an admitted LEFT link could only ever
+// come back spelled LEFT and the shape pins below counted `JoinTypeLeft`
+// directly. C-06s offers PG's `JOIN_RIGHT`, so the search may now win the same
+// join with the hands swapped — `Join{Type: Right}` with swapped children is
+// multiset-equal to the written LEFT, which is what JOIN_RIGHT MEANS
+// (postgres/src/backend/optimizer/path/joinrels.c:932-939).
+//
+// The guard those pins exist to enforce is UNCHANGED and is not about the
+// spelling: an INNER join where an outer one belongs DROPS the unmatched rows
+// (the Q72 wrong answer), and a FULL one is still refused outright. So the
+// invariant is "exactly one outer-preserving join", not "exactly one LEFT".
+// Counting LEFT+RIGHT keeps the wrong-answer guard while admitting the
+// equivalent spelling; counting LEFT alone would fail a correct plan, and
+// counting all joins would pass the wrong one.
+func rfjOuterPreserving(n Node) int {
+	c := 0
+	for _, j := range rfjJoins(n) {
+		if j.Type == JoinTypeLeft || j.Type == JoinTypeRight {
+			c++
+		}
+	}
+	return c
+}
+
 func rfjJoins(n Node) []*Join {
 	var out []*Join
 	var walk func(Node)
@@ -320,8 +372,10 @@ func TestPlanJoinlistSearchRejectsMalformedInput(t *testing.T) {
 // rests on, on the producer's own output: every sub-joinlist
 // `deconstructJointree` can emit covers one unbroken run of FROM items.
 func TestJoinlistLeafRange(t *testing.T) {
-	// `a, b JOIN c, d` with the JOIN pinned — the production shape while
-	// `GOOPG_PGSHAPED_COLLAPSE` is off.
+	// `a, b JOIN c, d` with the JOIN pinned. Hand-built rather than parsed:
+	// since take3 C-06 retired `GOOPG_PGSHAPED_COLLAPSE` only a FULL JOIN
+	// still pins, but the invariant under test is about the SHAPE, which the
+	// producer can still emit (a FULL link, or `join_collapse_limit`).
 	jl := joinlist{leafItem(0), subItem(joinlist{leafItem(1), leafItem(2)}), leafItem(3)}
 	if lo, hi, ok := jl.leafRange(); !ok || lo != 0 || hi != 4 {
 		t.Fatalf("leafRange = (%d,%d,%v), want (0,4,true)", lo, hi, ok)
@@ -340,22 +394,25 @@ func TestJoinlistLeafRange(t *testing.T) {
 
 // TestDeconstructedJointreeFeedsTheRecursion is the end-to-end seam between
 // P5.8 and this task: the joinlist the PRODUCER emits for a real FROM clause
-// plans without any adjustment, in both collapse regimes, and publishes binding
-// order either way. That the two regimes may pick DIFFERENT trees is the point
-// of the flag; that both publish the same row is the contract.
+// plans without any adjustment and publishes binding order.
+//
+// It used to run both collapse regimes; take3 C-06 retired
+// `GOOPG_PGSHAPED_COLLAPSE`, so the `=0` arm is gone and only the flattened
+// one remains. The pinned shape it used to cover is not lost:
+// `TestPlanJoinlistSearchPinnedSubproblemIsItsOwnSearch` above asserts it on a
+// hand-built pinned joinlist, which is the same shape the producer still emits
+// for a `join_collapse_limit` overflow.
 func TestDeconstructedJointreeFeedsTheRecursion(t *testing.T) {
 	names := []string{"a", "b", "c"}
 	// `FROM a, b JOIN c ON b.b0 = c.c0` with a second clause reaching out of
-	// the explicit JOIN, so both regimes have work to place.
+	// the explicit JOIN, so there is work to place.
 	from := parseFrom(t, "a, b JOIN c ON b.b0 = c.c0")
-	for _, collapse := range []bool{false, true} {
-		jl := deconstructJointree(from, defaultCollapseLimits(), collapse)
-		prob := rfjProblem(names, []int64{1_000_000, 10, 1000},
-			[]Expr{rfjEq(names, 0, 1), rfjEq(names, 1, 2)})
-		n, err := planJoinlistSearch(jl, prob)
-		if err != nil {
-			t.Fatalf("collapse=%v: planJoinlistSearch: %v", collapse, err)
-		}
-		rfjAssertBindingOrder(t, n, names)
+	jl := deconstructJointree(from, defaultCollapseLimits())
+	prob := rfjProblem(names, []int64{1_000_000, 10, 1000},
+		[]Expr{rfjEq(names, 0, 1), rfjEq(names, 1, 2)})
+	n, err := planJoinlistSearch(jl, prob)
+	if err != nil {
+		t.Fatalf("planJoinlistSearch: %v", err)
 	}
+	rfjAssertBindingOrder(t, n, names)
 }

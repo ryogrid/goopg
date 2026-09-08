@@ -107,7 +107,14 @@ func (o *cteDMLPrefixOp) setInstrumentScope(s *instrumenter) { o.scope = s }
 // temporarily set to o.scope, so maybeInstrument wraps n's operator (and
 // records its stats in the same nodeStatsTable the EXPLAIN renderer
 // reads) exactly as if it had been Build() during the original dispatch.
+//
+// EX0-03b: takes instrumentScopeMu like every other global handoff. This
+// path runs at Open time, which under a Gather is concurrent across
+// workers — the old unguarded save/restore was safe only while the CTE
+// path was serial.
 func (o *cteDMLPrefixOp) buildUnderScope(n optimizer.Node) (Operator, error) {
+	instrumentScopeMu.Lock()
+	defer instrumentScopeMu.Unlock()
 	prev := instrumentScope
 	instrumentScope = o.scope
 	defer func() { instrumentScope = prev }()

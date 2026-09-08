@@ -226,7 +226,8 @@ func patternSelectivity(col *ColumnRef, pattern string, icase, negate bool, chil
 			// like_selectivity on the pattern past the fixed prefix.
 			prefixsel := 1.0
 			rest := pattern
-			if prefix, exact, ok := ExtractLikePrefix(pattern); ok && !exact && prefix != "" {
+			prefix, exact, hasPrefix := ExtractLikePrefix(pattern)
+			if hasPrefix && !exact && prefix != "" {
 				rest = pattern[len(prefix):]
 				if succ, ok := IncrementString(prefix); ok {
 					ref := &ColumnRef{Index: col.Index, Name: col.Name, Type: col.Type}
@@ -234,6 +235,18 @@ func patternSelectivity(col *ColumnRef, pattern string, icase, negate bool, chil
 						&BinaryOp{Op: parser.OpGe, Left: ref, Right: &StringConst{Value: prefix}},
 						&BinaryOp{Op: parser.OpLt, Left: &ColumnRef{Index: col.Index, Name: col.Name, Type: col.Type}, Right: &StringConst{Value: succ}},
 					}, child)
+				}
+			}
+			// B-03 tail: prefix_selectivity's clamp (like_support.c:1289-1292).
+			// A long prefix squeezes the [prefix, successor) band below what
+			// the histogram can distinguish, yielding ~zero; the equality
+			// estimate on the prefix is the floor (Max(prefixsel, eq_sel)).
+			// Applied even when no successor string exists — a prefix near
+			// the maximum is probably off the histogram's end, so the >=
+			// half is already tiny and still needs the clamp.
+			if hasPrefix && prefix != "" {
+				if eqSel := eqSelectivityForColumn(stats, &StringConst{Value: prefix}, tuples); eqSel > prefixsel {
+					prefixsel = eqSel
 				}
 			}
 			heursel := prefixsel * likeSelectivityHeuristic(rest)

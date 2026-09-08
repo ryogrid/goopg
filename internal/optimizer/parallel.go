@@ -75,6 +75,18 @@ type ParallelSettings struct {
 	// (chapter 11 §1.3). Zero value false is safe: it understates the divisor,
 	// which understates the split's benefit.
 	LeaderParticipates bool
+	// DisableGatherMerge is `enable_gathermerge = off` (B-17c): PG's
+	// cost_gather_merge flag (costsize.c:485). With no GatherMerge path in the
+	// search (P5-04 open) there is no disabled_nodes count to carry, so the
+	// post-pass gates the P7 arm instead: off falls back to the pre-P7 shape
+	// (Gather below the Sort). Plain Gather is unaffected — upstream's
+	// cost_gather has no flag either. Convert to counting when P5-04 lands
+	// real Gather/GatherMerge paths.
+	//
+	// Opt-out on purpose: the zero value keeps the merge arm, so every
+	// struct-literal constructor (production dispatch, executor tests) behaves
+	// as before without setting anything; only an explicit off disables it.
+	DisableGatherMerge bool
 	// BlocksForTable returns a relation's size in blocks. Optional: when nil
 	// the size gate falls back to the row estimate, which is an approximation
 	// and is recorded as such.
@@ -86,14 +98,41 @@ type ParallelSettings struct {
 //
 // It never mutates root or anything below it.
 func MaybeAddGather(root Node, s ParallelSettings) Node {
-	if root == nil || !parallelOn.Load() {
+	if root == nil {
 		return root
 	}
+	if !parallelOn.Load() {
+		// `GOOPG_PARALLEL=off` is an ENGINE-level refusal, and since C-19g's
+		// remainder the planner can have chosen a Gather before this pass
+		// runs, so the knob has to strip rather than merely not-add.
+		return StripGather(root)
+	}
 
+	// C-19d COEXISTENCE RULE — the path model wins.
+	//
+	// The search can now produce a `PathGather` / `PathGatherMerge` priced by
+	// cost_gather / cost_gather_merge (gatherpaths.go), so a plan reaching
+	// this pass may ALREADY carry a Gather that add_path chose. Re-deciding
+	// that with a size rule is precisely the defect Phase 5 removes, so the
+	// post-pass stands down: the costed placement is kept as it is.
+	//
+	// This is not tidiness, it is a correctness stop. `terminatesPartial`
+	// lists *Gather / *GatherMerge, and `findPartialSubtree` DESCENDS through
+	// a terminating single-child node — so without this rule the post-pass
+	// would nest a second Gather BELOW the path model's one: N workers each
+	// launching N workers, and `gatherOp.prebuildHashJoins`'s "a Gather never
+	// appears inside another Gather's partial subtree" comment silently
+	// falsified.
+	//
 	// EXPLAIN carries the real plan in Child. Descend so `EXPLAIN <query>`
 	// renders the SAME plan the query would execute — otherwise EXPLAIN would
 	// systematically under-report parallelism, which is worse than useless: it
 	// is the tool people use to check whether parallelism happened.
+	//
+	// The unwrap runs FIRST (it used to run after the stand-down): every test
+	// below is about the real plan, and an *Explain root has no
+	// `parallelChildren` arm, so asking any of them about the wrapper answers
+	// about nothing.
 	if ex, ok := root.(*Explain); ok {
 		inner := MaybeAddGather(ex.Child, s)
 		if inner == ex.Child {
@@ -103,16 +142,44 @@ func MaybeAddGather(root Node, s ParallelSettings) Node {
 		c.Child = inner
 		return &c
 	}
+
+	// ── PERMISSION, and the post-cache ENFORCEMENT that goes with it ────────
+	//
+	// C-19g's remainder made the planner able to choose a Gather BEFORE the
+	// plan-cache lookup, so a plan arriving here may already carry one that
+	// THIS session may not run. The session GUCs that decide it are now part
+	// of `plannerCacheFingerprint`, so a cached plan cannot cross that
+	// boundary; the two facts that are NOT session GUCs — the transaction's
+	// isolation level and the statement's own shape — cannot be fingerprinted
+	// at all, and are enforced here by REMOVING the parallelism rather than by
+	// declining to add it. `StripGather` is exact, not approximate: a Gather is
+	// semantically transparent and a split aggregate folds back to the simple
+	// one it was split from.
 	if s.MaxWorkersPerGather <= 0 {
-		return root
+		return StripGather(root)
 	}
 	if s.IsSerializable {
 		// SSI predicate-lock acquisition is a genuine write on the scan read
 		// path, funnelling through one mutex. PG itself only allowed parallel
 		// query under SERIALIZABLE from v12, and it was not cheap.
-		return root
+		return StripGather(root)
 	}
 	if !statementIsParallelSafe(root) {
+		return StripGather(root)
+	}
+
+	// C-19d COEXISTENCE RULE — the path model wins. The costed placement is
+	// kept as it is; re-deciding it with a size rule is precisely the defect
+	// Phase 5 removes.
+	//
+	// This is not tidiness, it is a correctness stop. `terminatesPartial`
+	// lists *Gather / *GatherMerge, and `findPartialSubtree` DESCENDS through
+	// a terminating single-child node — so without this rule the post-pass
+	// would nest a second Gather BELOW the path model's one: N workers each
+	// launching N workers, and `gatherOp.prebuildHashJoins`'s "a Gather never
+	// appears inside another Gather's partial subtree" comment silently
+	// falsified. It is the check C-19h deletes together with the pass.
+	if subtreeHasGather(root) {
 		return root
 	}
 
@@ -137,6 +204,32 @@ func MaybeAddGather(root Node, s ParallelSettings) Node {
 	}
 
 	return rebuildWithGather(root, tgt, workers)
+}
+
+// subtreeHasGather reports whether the tree already carries a Gather or a
+// Gather Merge anywhere — the C-19d coexistence test.
+//
+// The walk is `parallelChildren`'s, the same one `findPartialSubtree` descends,
+// so "already gathered" is judged over exactly the nodes the post-pass would
+// have considered placing a Gather among. A node `parallelChildren` does not
+// model reads as having no children, which for THIS question fails toward
+// "no Gather found" — i.e. toward the post-pass acting. That is the safe
+// direction only because the path model cannot put a Gather under an
+// unmodelled node in the first place: `createGatherPlan` panics unless
+// `drivingScan` reaches the subtree's scan through this same walk.
+func subtreeHasGather(n Node) bool {
+	switch n.(type) {
+	case nil:
+		return false
+	case *Gather, *GatherMerge:
+		return true
+	}
+	for _, c := range parallelChildren(n) {
+		if subtreeHasGather(c) {
+			return true
+		}
+	}
+	return false
 }
 
 // partialTarget is where the Gather goes and what kind it must be.
@@ -264,7 +357,19 @@ func findPartialSubtree(root Node, s ParallelSettings) (partialTarget, bool) {
 			// worker count until after this walk has chosen a target. There is
 			// no circularity — the sizing input (agg.Child) is in scope right
 			// here — so the resolution is simply to size it now.
-			if splitAggregateIsProfitable(agg, computeParallelWorkers(agg.Child, s), s.LeaderParticipates) {
+			//
+			// C-19g (P5-07): the verdict is now a two-candidate PATH
+			// tournament — Finalize->Gather->Partial against
+			// Agg->Gather->input — priced by `costAgg` + `cost_gather` and
+			// adjudicated by `addPath`/`setCheapest`
+			// (partialaggpaths.go). `GOOPG_PARTIAL_AGG_PATHS=off`, the
+			// default until the measurement in
+			// docs/design/planner-c19g-partial-agg/DESIGN.md §6 says
+			// otherwise, delegates to the retired size rule unchanged.
+			// The construction site below is unchanged and is still the
+			// ONLY one, which is what makes double-splitting structurally
+			// impossible.
+			if partialAggSplitPays(agg, computeParallelWorkers(agg.Child, s), s.LeaderParticipates) {
 				return partialTarget{node: agg, splitAgg: true}, true
 			}
 		}
@@ -281,8 +386,22 @@ func findPartialSubtree(root Node, s ParallelSettings) (partialTarget, bool) {
 		//
 		// goopg's Sort carries no top-N limit, so there is no per-worker
 		// truncation to reason about: every worker emits its whole partition.
+		//
+		// C-19e (P5-05): the verdict is now a two-candidate PATH tournament —
+		// `Gather Merge -> Sort -> partial` against `Sort -> Gather -> partial`
+		// — priced by `costSortRun` + `cost_gather` / `cost_gather_merge` and
+		// adjudicated by `addPath` / `setCheapest` (partialsortpaths.go).
+		// `GOOPG_PARTIAL_SORT_PATHS=off`, the default until the measurement in
+		// docs/design/planner-c19e-partial-sort/DESIGN.md §5 says otherwise,
+		// delegates to the retired type switch unchanged. The worker count is
+		// sized from `srt.Child` for the same reason the aggregate arm sizes
+		// from `agg.Child`: the divisor that PRICES the candidates must be the
+		// one the built plan RUNS at, and `MaybeAddGather` does not compute it
+		// until after this walk has chosen a target.
 		if srt, isSort := cur.(*Sort); isSort && len(srt.Keys) > 0 &&
-			drivingScan(srt.Child) != nil && sortPartialRootPays(srt) {
+			!s.DisableGatherMerge &&
+			drivingScan(srt.Child) != nil &&
+			partialSortRootPays(srt, computeParallelWorkers(srt.Child, s), s.LeaderParticipates) {
 			return partialTarget{node: srt, mergeKeys: srt.Keys}, true
 		}
 		if terminatesPartial(cur) {
@@ -331,9 +450,33 @@ func findPartialSubtree(root Node, s ParallelSettings) (partialTarget, bool) {
 // comparison. Until that exists this states the one case measurement has
 // actually settled, and states it where the decision is made rather than by
 // disabling the scan type outright.
+//
+// C-19c: a plain `*IndexScan` driving scan declines for the same reason.
+//
+// C-19e (P5-05) is the item that gives the post-pass the cost model this
+// comment says it lacks: `partialSortRootPays` (partialsortpaths.go) prices
+// both candidates with `costSortRun` + `cost_gather` / `cost_gather_merge` and
+// lets `addPath` adjudicate. This function is what that tournament DELEGATES TO
+// when `GOOPG_PARTIAL_SORT_PATHS` is `off` — the default — so it is still the
+// production verdict and its measurement still stands.
+//
+// It used to decline for a SECOND, harder reason as well — the Gather Merge
+// operator attached only the seq-scan block allocator to its workers, not the
+// index leaf-claim set, so a per-worker Sort over an index scan under Gather
+// Merge would have returned every row once per worker. **That reason is no
+// longer true**: E-10 (`a22d995c8`) gave both gather operators a shared
+// `parallelClaimSet` covering all three claim kinds, with an anti-drift test.
+// The correctness hazard is gone; only the measured cost argument above
+// remains, and it is what still carries this decline (q16 1.5 -> 2.3 s,
+// q13 4.2 -> 6.8 s). Do not read the removal of the hazard as a reason to
+// flip this rule — that needs the cost comparison the rule's own text says
+// goopg's post-pass does not have.
 func sortPartialRootPays(srt *Sort) bool {
-	_, isIOS := drivingScan(srt.Child).(*IndexOnlyScan)
-	return !isIOS
+	switch drivingScan(srt.Child).(type) {
+	case *IndexOnlyScan, *IndexScan:
+		return false
+	}
+	return true
 }
 
 // terminatesPartial reports whether a Gather must sit at or below this node.
@@ -344,7 +487,7 @@ func terminatesPartial(n Node) bool {
 		*Aggregate, *Sort, *Gather, *GatherMerge:
 		// Aggregate reaches here only when the split was REFUSED — either the
 		// node is not decomposable (aggregateSplitIsSafe) or the cost model
-		// declined (splitAggregateIsProfitable). Terminating is then correct
+		// declined (partialAggSplitPays). Terminating is then correct
 		// and is the fallback the model costs against: the Gather goes below
 		// the aggregate, which is the pre-P9 shape.
 		//
@@ -391,6 +534,16 @@ func stampParallelScan(n Node) Node {
 		c := *x
 		c.Parallel = true
 		return &c
+	case *IndexScan:
+		// C-19c. The SAME predicate drivingScan admits on, so the two
+		// functions cannot disagree about a plain index scan: a node
+		// drivingScan refused is returned unchanged here too.
+		if !plainIndexScanIsPartialCapable(x) {
+			return n
+		}
+		c := *x
+		c.Parallel = true
+		return &c
 	case *Filter:
 		child := stampParallelScan(x.Child)
 		if child == x.Child {
@@ -410,7 +563,15 @@ func stampParallelScan(n Node) Node {
 	case *Join:
 		// P8 (drivingScan): a hash join is partial through its PROBE side
 		// only. Mirrored here so the same side gets labelled.
-		if !hashJoinIsPartialCapable(x) {
+		//
+		// E-20 Cut 3: a merge join is partial through its OUTER (left)
+		// side only — each worker merge-joins its outer partition against
+		// the whole inner, which it sorts and reads itself. Same
+		// side-descends-side agreement as the hash arm: the path walk
+		// (`partialPathDrivingKind` Children[0]), this label walk, and the
+		// executor walk (`attachParallelScan` JoinAlgoMerge) all descend
+		// the left.
+		if !hashJoinIsPartialCapable(x) && !mergeJoinIsPartialCapable(x) {
 			return n
 		}
 		if joinProbeSideIsLeft(x) {
@@ -452,6 +613,31 @@ func drivingScan(n Node) Node {
 		// partition of that materialisation — while an index scan is also the
 		// NLI probe shape, under which a Gather never sits.
 		return x
+	case *IndexScan:
+		// C-19c (P5-03). The plain index scan is eager at Open the same way
+		// the IOS is — it materialises its TID list through one leaf-chain
+		// walk (operators_index.go, M0092-0001) — so the IOS's leaf-block
+		// partition applies to it unchanged: attachParallelIndexScan hands
+		// the worker the shared claim set and RangeScanWithPosLeafFilter
+		// keeps only the leaves it owns. PG's counterpart is a Parallel
+		// Index Scan, which is `amcanparallel` (btree only) and never a
+		// bitmap input (build_index_paths, indxpath.c).
+		//
+		// Admitted only as a bare RANGE or FULL scan. A point probe (Key /
+		// Keys) or a SAOP multi-descent is refused: this post-pass sizes
+		// workers on the TABLE's block count (computeParallelWorkers), not
+		// on what the probe fetches — PG's cost_index passes the fetched
+		// heap pages to compute_parallel_worker, which is what stops a
+		// 1-row probe on a large relation from gathering. Until C-19d makes
+		// that price the decider, the shape rule stands in for it. A SAOP
+		// scan is also the one site (rescanSAOP) that does not consult the
+		// leaf filter, so refusing it here is what keeps that site serial.
+		// The NLI inner probe is not reached at all: terminatesPartial
+		// stops at *NestedLoopIndexJoin.
+		if !plainIndexScanIsPartialCapable(x) {
+			return nil
+		}
+		return x
 	case *Filter:
 		return drivingScan(x.Child)
 	case *Project:
@@ -462,7 +648,15 @@ func drivingScan(n Node) Node {
 		// what the workers split. Returning the probe's scan also makes the
 		// size rule measure the right relation — the probe is the big side by
 		// the planner's own build-side choice.
-		if !hashJoinIsPartialCapable(x) {
+		//
+		// E-20 Cut 3: a merge join is partial through its OUTER (left) side
+		// only — each worker merge-joins its outer partition against the
+		// whole inner. joinProbeSideIsLeft answers left for a merge join
+		// (BuildLeft is meaningless for merge and stays false), so the
+		// shared side logic below descends the outer with no special case —
+		// which is exactly what must stay true: if BuildLeft ever becomes
+		// meaningful for merge, this arm needs its own side test.
+		if !hashJoinIsPartialCapable(x) && !mergeJoinIsPartialCapable(x) {
 			return nil
 		}
 		if joinProbeSideIsLeft(x) {
@@ -471,6 +665,14 @@ func drivingScan(n Node) Node {
 		return drivingScan(x.Right)
 	}
 	return nil
+}
+
+// plainIndexScanIsPartialCapable is the one predicate drivingScan (eligibility)
+// and stampParallelScan (label) share for a plain `*IndexScan` — see the
+// drivingScan arm for what each condition protects. C-19c.
+func plainIndexScanIsPartialCapable(x *IndexScan) bool {
+	return x != nil && x.Index != nil && isBTreeIndex(x.Index) && !x.Index.DeclaredHash &&
+		x.Key == nil && len(x.Keys) == 0 && len(x.SAOPKeys) == 0
 }
 
 // The `*MultiHashJoin` arm and its `multiHashJoinIsPartialCapable` approval
@@ -567,8 +769,53 @@ func hashJoinIsPartialCapable(p *Join) bool {
 	return false
 }
 
-// scanTable extracts the *catalog.Table from a scan node (SeqScan or
-// BitmapHeapScan). Returns nil for any other node kind.
+// mergeJoinIsPartialCapable states which merge joins may run with a partial
+// outer side (E-20 Cut 3, `try_partial_mergejoin_path`, joinpath.c:1145).
+//
+// The rule is "a merge join whose per-outer-row verdict is worker-local",
+// the same shape as hashJoinIsPartialCapable with the build/probe vocabulary
+// replaced by outer/whole-inner: each worker merge-joins ITS partition of the
+// outer against the WHOLE inner, which it sorts and reads itself (no shared
+// build exists for merge, so there is nothing for prebuildSharedHashJoins to
+// adopt — a partial hash join BELOW a partial merge is built independently by
+// every worker, correctly and N× the memory; see attachParallelScan).
+//
+//   - INNER, SEMI and ANTI decide each outer row against the inner alone, so
+//     partitioning the outer is transparent.
+//   - LEFT emits every outer row (matched or null-padded) with per-row
+//     padding, so partitioning the outer is transparent. Unlike the hash
+//     twin there is no BuildLeft proviso: a merge join has no build side
+//     (`createMergeJoinPlan`: BuildLeft stays false by construction), the
+//     outer is always Children[0]/Left, and the padding needs no
+//     cross-worker state either way.
+//   - FULL and RIGHT would require knowing which INNER rows went unmatched
+//     across ALL workers — the same cross-worker reduction the hash twin
+//     refuses. Refused rather than approximated.
+//
+// LATERAL is excluded on the same ground as the hash twin.
+func mergeJoinIsPartialCapable(p *Join) bool {
+	if p == nil || p.Algo != JoinAlgoMerge || p.Lateral {
+		return false
+	}
+	switch p.Type {
+	case JoinTypeInner, JoinTypeSemi, JoinTypeAnti, JoinTypeLeft:
+		return true
+	}
+	return false
+}
+
+// scanTable extracts the *catalog.Table from a scan node (SeqScan,
+// BitmapHeapScan, IndexOnlyScan or — C-19c — a plain IndexScan). Returns nil
+// for any other node kind.
+//
+// A plain index scan is sized on its TABLE's blocks below, the heap arm of
+// compute_parallel_worker. PG sizes it on min(heap ladder over the heap pages
+// the scan fetches, index ladder over the index pages it reads); the path
+// model's twin (costPartialIndexScan) does exactly that, while this post-pass
+// has only the live block counts. The heap ladder is the binding one for the
+// shapes drivingScan admits (a range or full scan reads most of the heap, and
+// an index is far smaller than its heap against a 16x smaller threshold), so
+// until C-19h retires the post-pass the two agree in practice.
 func scanTable(n Node) *catalog.Table {
 	switch x := n.(type) {
 	case *SeqScan:
@@ -576,6 +823,8 @@ func scanTable(n Node) *catalog.Table {
 	case *BitmapHeapScan:
 		return x.Table
 	case *IndexOnlyScan:
+		return x.Table
+	case *IndexScan:
 		return x.Table
 	}
 	return nil
@@ -699,8 +948,37 @@ func rebuildWithGather(root Node, tgt partialTarget, workers int) Node {
 	if root == tgt.node {
 		switch {
 		case tgt.mergeKeys != nil:
-			stamped := stampParallelScan(root)
-			return NewGatherMerge(stamped.Pos(), stamped, workers, tgt.mergeKeys)
+			// The target IS the Sort, and `stampParallelScan` has no `*Sort`
+			// arm — deliberately: `terminatesPartial` lists `*Sort`, so a Sort
+			// can never appear INSIDE a partial subtree, and the traversal must
+			// stay identical to `drivingScan`'s (this function's sibling
+			// warning). The one place a Sort sits at the top of a partial
+			// subtree is right here, and `findPartialSubtree` already resolved
+			// it the same asymmetric way: it asked `drivingScan(srt.Child)`,
+			// not `drivingScan(srt)`. So stamp the CHILD, for the same reason
+			// and at the same offset.
+			//
+			// Found by C-19e's TPC-H arm (2026-09-07). Stamping `root` here
+			// fell through every arm and returned the Sort UNCHANGED, so the
+			// scan under a Gather Merge rendered without its `Parallel ` label
+			// — EXPLAIN under-reporting the parallelism that actually ran,
+			// which is the one thing EXPLAIN exists to answer here. Label-only
+			// (the executor reads `Parallel` in operators_explain.go and
+			// nowhere else), and latent since P7 because the shape was
+			// unreachable: `sortPartialRootPays` declines every index driver,
+			// and no TPC-H plan reached it with a seq-scan driver either.
+			// C-19e's cost verdict makes it reachable (q16), which is the
+			// "an unwinnable path is an untested path" pattern again.
+			srt := root.(*Sort)
+			stampedChild := stampParallelScan(srt.Child)
+			if stampedChild == srt.Child {
+				return NewGatherMerge(root.Pos(), root, workers, tgt.mergeKeys)
+			}
+			// Shallow copy: this pass runs on a plan the process-wide cache may
+			// be handing to other sessions right now (file header, property 2).
+			c := *srt
+			c.Child = stampedChild
+			return NewGatherMerge(c.Pos(), &c, workers, tgt.mergeKeys)
 		case tgt.splitAgg:
 			return splitAggregate(root.(*Aggregate), workers)
 		}
@@ -743,6 +1021,14 @@ func splitAggregate(a *Aggregate, workers int) Node {
 	final.Mode = AggModeFinal
 	final.Child = gather
 	final.PartialSource = &partial
+	// B-01c second cut: the Final's child is now the Gather over the
+	// Partial's output row, not the original input row, so the copied
+	// group-input keep (positions into the input schema) no longer
+	// addresses this node's child — decline to unknown, the safe
+	// direction. The Partial keeps the original's stamp: it reads the
+	// same input row (stampParallelScan only labels the scan).
+	// Payload-only, no plan change.
+	final.InputTarget, final.InputTargetKnown = nil, false
 	return &final
 }
 
@@ -773,6 +1059,14 @@ func replaceSingleChild(n Node, child Node) Node {
 		c.Child = child
 		return &c
 	case *Distinct:
+		c := *x
+		c.Child = child
+		return &c
+	case *DistinctOn:
+		// C-16b: the unique winner is a DistinctOn; without this arm
+		// rebuildWithGather silently drops Gather insertion across it
+		// (safe direction — correct plan, missed parallelization — but
+		// a prior review's requirement must not evaporate silently).
 		c := *x
 		c.Child = child
 		return &c
@@ -827,4 +1121,154 @@ func parallelChildren(n Node) []Node {
 		return []Node{x.Outer}
 	}
 	return nil
+}
+
+// StripGather returns root with every Gather / Gather Merge removed and every
+// "Parallel " scan label taken back off, or root itself when the tree carries
+// none.
+//
+// It is the post-cache ENFORCEMENT half of the plan-cache answer C-19g's §2.2
+// left open (partialaggupper.go's file header, blocker 2). Since the planner
+// can choose a Gather BEFORE the cache lookup, a plan can reach a session that
+// may not execute it in parallel — under SERIALIZABLE, under a
+// parallel-unsafe statement shape, with `max_parallel_workers_per_gather = 0`,
+// or with the engine knob off. The session GUCs among those are fingerprinted
+// into the cache key; the rest are not knowable at plan time, so they are
+// applied here.
+//
+// The removal is EXACT rather than approximate, in both shapes it can meet:
+//
+//   - a plain Gather / Gather Merge is semantically transparent — it
+//     interleaves rows from workers and touches no column — so the child alone
+//     produces the same rows in the plain case and, for a Gather Merge, the
+//     same rows in the same order (the child is sorted by construction, which
+//     is what `createGatherMergePlan` requires);
+//   - a SPLIT aggregate is not: its Partial node "emits NOTHING" and publishes
+//     group states through `PartialSource` (operators_join_agg.go:2351-2372),
+//     so dropping the Gather alone would leave a Finalize over a node that
+//     returns no rows. The Finalize folds back into the SIMPLE aggregate it was
+//     split from, over the Partial's own input — which is exactly what
+//     `splitAggregate` copied it from.
+//
+// Non-mutating, like every other function in this pass: the plan cache is
+// process-wide and other sessions may be executing this very tree. Nodes with
+// nothing to change are shared by pointer.
+func StripGather(n Node) Node {
+	if n == nil {
+		return nil
+	}
+	switch x := n.(type) {
+	case *Gather:
+		return unstampParallelScan(StripGather(x.Child))
+	case *GatherMerge:
+		return unstampParallelScan(StripGather(x.Child))
+	case *Aggregate:
+		// The split shape, folded back before the generic single-child arm can
+		// see the Gather underneath it.
+		if x.Mode == AggModeFinal && x.PartialSource != nil {
+			src := x.PartialSource
+			c := *x
+			c.Mode = AggModeSimple
+			c.PartialSource = nil
+			c.Child = unstampParallelScan(StripGather(src.Child))
+			return &c
+		}
+	case *Explain:
+		child := StripGather(x.Child)
+		if child == x.Child {
+			return n
+		}
+		c := *x
+		c.Child = child
+		return &c
+	}
+	kids := parallelChildren(n)
+	if len(kids) == 0 {
+		return n
+	}
+	if len(kids) == 1 {
+		child := StripGather(kids[0])
+		if child == kids[0] {
+			return n
+		}
+		return replaceSingleChild(n, child)
+	}
+	// Two-child shapes: a Join is the only one `parallelChildren` reports, and
+	// it is the only one a Gather can sit under.
+	j, ok := n.(*Join)
+	if !ok {
+		return n
+	}
+	left, right := StripGather(j.Left), StripGather(j.Right)
+	if left == j.Left && right == j.Right {
+		return n
+	}
+	c := *j
+	c.Left, c.Right = left, right
+	return &c
+}
+
+// unstampParallelScan is `stampParallelScan`'s inverse: it takes the
+// "Parallel " EXPLAIN label back off a subtree's driving scan.
+//
+// SIBLING WARNING, the same one `stampParallelScan` carries: this traversal
+// must admit exactly the node kinds that one does. A scan left labelled
+// parallel with no Gather above it makes EXPLAIN claim a parallelism the
+// executor will not run — the label is the only thing a reader has.
+func unstampParallelScan(n Node) Node {
+	switch x := n.(type) {
+	case *SeqScan:
+		if !x.Parallel {
+			return n
+		}
+		c := *x
+		c.Parallel = false
+		return &c
+	case *BitmapHeapScan:
+		if !x.Parallel {
+			return n
+		}
+		c := *x
+		c.Parallel = false
+		return &c
+	case *IndexOnlyScan:
+		if !x.Parallel {
+			return n
+		}
+		c := *x
+		c.Parallel = false
+		return &c
+	case *IndexScan:
+		if !x.Parallel {
+			return n
+		}
+		c := *x
+		c.Parallel = false
+		return &c
+	case *Filter:
+		child := unstampParallelScan(x.Child)
+		if child == x.Child {
+			return n
+		}
+		c := *x
+		c.Child = child
+		return &c
+	case *Project:
+		child := unstampParallelScan(x.Child)
+		if child == x.Child {
+			return n
+		}
+		c := *x
+		c.Child = child
+		return &c
+	case *Join:
+		left, right := unstampParallelScan(x.Left), unstampParallelScan(x.Right)
+		if left == x.Left && right == x.Right {
+			return n
+		}
+		c := *x
+		c.Left, c.Right = left, right
+		return &c
+	}
+	return n
 }

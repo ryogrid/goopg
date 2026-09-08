@@ -1,0 +1,36 @@
+Merge Join  (cost=89420.46..89661.21 rows=13 width=228)
+  Merge Cond: (wswscs.d_week_seq = date_dim.d_week_seq)
+  CTE wswscs
+    ->  Finalize GroupAggregate  (cost=79138.91..84459.80 rows=10423 width=228)
+          Group Key: date_dim_2.d_week_seq
+          ->  Gather Merge  (cost=79138.91..82961.51 rows=32311 width=228)
+                Workers Planned: 3
+                ->  Sort  (cost=78138.87..78164.92 rows=10423 width=228)
+                      Sort Key: date_dim_2.d_week_seq
+                      ->  Partial HashAggregate  (cost=73073.63..77443.26 rows=10423 width=228)
+                            Group Key: date_dim_2.d_week_seq
+                            Planned Partitions: 4
+                            ->  Parallel Hash Join  (cost=2390.82..36707.71 rows=348416 width=20)
+                                  Hash Cond: (catalog_sales.cs_sold_date_sk = date_dim_2.d_date_sk)
+                                  ->  Parallel Append  (cost=0.00..33402.24 rows=348416 width=10)
+                                        ->  Parallel Seq Scan on catalog_sales  (cost=0.00..21084.70 rows=232470 width=10)
+                                        ->  Parallel Seq Scan on web_sales  (cost=0.00..10575.46 rows=115946 width=10)
+                                  ->  Parallel Hash  (cost=1853.70..1853.70 rows=42970 width=18)
+                                        ->  Parallel Seq Scan on date_dim date_dim_2  (cost=0.00..1853.70 rows=42970 width=18)
+  ->  CTE Scan on wswscs  (cost=0.00..208.46 rows=10423 width=228)
+  ->  Materialize  (cost=4960.66..4966.28 rows=13 width=232)
+        ->  Merge Join  (cost=4960.66..4966.25 rows=13 width=232)
+              Merge Cond: (((wswscs_1.d_week_seq - 53)) = date_dim.d_week_seq)
+              ->  Sort  (cost=2608.06..2608.97 rows=364 width=228)
+                    Sort Key: ((wswscs_1.d_week_seq - 53))
+                    ->  Merge Join  (cost=2352.60..2592.57 rows=364 width=228)
+                          Merge Cond: (wswscs_1.d_week_seq = date_dim_1.d_week_seq)
+                          ->  CTE Scan on wswscs wswscs_1  (cost=0.00..208.46 rows=10423 width=228)
+                          ->  Sort  (cost=2352.60..2353.51 rows=364 width=4)
+                                Sort Key: date_dim_1.d_week_seq
+                                ->  Seq Scan on date_dim date_dim_1  (cost=0.00..2337.11 rows=364 width=4)
+                                      Filter: (d_year = 1999)
+              ->  Sort  (cost=2352.60..2353.51 rows=364 width=4)
+                    Sort Key: date_dim.d_week_seq
+                    ->  Seq Scan on date_dim  (cost=0.00..2337.11 rows=364 width=4)
+                          Filter: (d_year = 1998)

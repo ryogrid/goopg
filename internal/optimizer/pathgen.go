@@ -21,30 +21,43 @@ package optimizer
 
 // generateScanPaths adds the base-relation scan paths to rel: a serial SeqScan
 // and, when the relation clears the parallel size ladder (parallelWorkers > 0), a
-// partial SeqScan whose cost is divided by the parallel divisor (design ch. 06
-// §1.1). relPages is the live block count; numQualOps is the per-tuple operator
-// count of the scan's restriction qual.
+// partial SeqScan priced by cost_seqscan's parallel arm (design ch. 06 §1.1;
+// C-19b, `addPartialSeqScanPath`). relPages is the live block count; numQualOps
+// is the per-tuple operator count of the scan's restriction qual.
+//
+// `leaderParticipates` is honoured by copying it onto cp: the production
+// producer (`addBaseRelPartialPaths`) reads the session's value from costParams,
+// and this test-facing entry keeps its explicit parameter.
+import "github.com/goopg/goopg/internal/parser"
+
 func generateScanPaths(rel *RelOptInfo, cp costParams, relPages int64, numQualOps, parallelWorkers int, leaderParticipates bool) {
 	seqCost := costSeqscan(cp, relPages, rel.Rows, numQualOps)
+	// B-17d: `cost_seqscan`'s own flag (costsize.c:295). The producer always
+	// runs; a disabled seqscan is counted, not skipped.
+	seqDisabled := disabledNodesFor(!cp.enableSeqScan)
+	// take2 P4-01 Slice 1: the scan Target, computed from NeededCols at
+	// path-creation time. Assert-only — never applied, never costed.
+	tgt, tgtKnown := scanPathTarget(rel)
 	addPath(rel, &Path{
 		Kind:         PathSeqScan,
 		Rel:          rel,
 		Rows:         rel.Rows,
 		Cost:         seqCost,
-		ParallelSafe: parallelWorkers > 0,
+		DisabledNodes: seqDisabled,
+		ParallelSafe: rel.ParallelSafeForPath(),
+		Target:       tgt,
+		TargetKnown:  tgtKnown,
 	}, "scan.seq")
 	if parallelWorkers > 0 {
-		// Each worker processes ~1/d of the pages and tuples; the seq scan's
-		// startup is zero, so dividing the total by the divisor is exact.
-		d := getParallelDivisor(parallelWorkers, leaderParticipates)
-		addPartialPath(rel, &Path{
-			Kind:            PathSeqScan,
-			Rel:             rel,
-			Rows:            rel.Rows / d,
-			Cost:            Cost{Startup: 0, Total: seqCost.Total / d},
-			ParallelSafe:    true,
-			ParallelWorkers: parallelWorkers,
-		}, "scan.seq.partial")
+		cp.parallelLeaderParticipation = leaderParticipates
+		// C-19c: add_partial_path asserts `parent_rel->consider_parallel`
+		// and goopg's refuses instead. A caller asking this entry for a
+		// partial path is vouching for the rel — the production producer
+		// checks the flag itself (addBaseRelPartialPaths) — so the flag is
+		// stamped here, AFTER the serial path, whose parallel_safe stays
+		// whatever the rel said before.
+		rel.ConsiderParallel = true
+		addPartialSeqScanPath(rel, cp, relPages, rel.Rows, numQualOps, parallelWorkers)
 	}
 }
 
@@ -62,7 +75,7 @@ func generateScanPaths(rel *RelOptInfo, cp costParams, relPages int64, numQualOp
 //
 // Child convention: Children[0] is the probe (outer) side, Children[1] is the
 // build (inner) side. createPlan reads it to set the executor Join's BuildLeft.
-func addHashJoinPath(joinRel, probe, build *RelOptInfo, cp costParams, keys, residual []*restrictInfo, innerBucketSize float64) {
+func addHashJoinPath(joinRel, probe, build *RelOptInfo, cp costParams, jt parser.JoinType, keys, residual []*restrictInfo, innerBucketSize float64) {
 	p, b := probe.CheapestTotal, build.CheapestTotal
 	if p == nil || b == nil {
 		return
@@ -93,7 +106,14 @@ func addHashJoinPath(joinRel, probe, build *RelOptInfo, cp costParams, keys, res
 	// `hashjointuples`, costsize.c:4432).
 	cost.Total += qualEvalCost(cp, len(residual), joinRel.Rows)
 	addPath(joinRel, &Path{
-		Kind:          PathHashJoin,
+		Kind: PathHashJoin,
+		// C-03b: the join this path performs, decided by `addPathsToJoinrel`
+		// from the SpecialJoinInfo and this direction's orientation. PG passes
+		// `jointype` into every `try_*_path` the same way (joinpath.c:2398
+		// `try_hashjoin_path`), because the operator and the join semantics are
+		// orthogonal: hash/merge/nestloop is the ALGORITHM, jointype is WHAT IS
+		// COMPUTED.
+		Jointype:      jt,
 		DisabledNodes: disabledNodesFor(!cp.enableHashJoin, p, b),
 		Rel:           joinRel,
 		Rows:          joinRel.Rows,
@@ -102,6 +122,9 @@ func addHashJoinPath(joinRel, probe, build *RelOptInfo, cp costParams, keys, res
 		HashKeys:      keys,
 		Residual:      residual,
 		RequiredOuter: calcNonNestloopRequiredOuter(p, b),
+		// create_hashjoin_path (pathnode.c:2740): the rel's flag AND both
+		// inputs'. C-19a.
+		ParallelSafe: parallelSafeWith(joinRel, p, b),
 	}, "join.hash")
 }
 
@@ -116,7 +139,7 @@ func addHashJoinPath(joinRel, probe, build *RelOptInfo, cp costParams, keys, res
 // P5.7's (leftdeep-joins 04 §4 / the P4.3 ledger row). Until it lands this
 // over-charges a rescan of a cheap inner, which biases against nested loops —
 // the safe direction.
-func addNestLoopPath(joinRel, outer, inner *RelOptInfo, cp costParams, quals []*restrictInfo) {
+func addNestLoopPath(joinRel, outer, inner *RelOptInfo, cp costParams, jt parser.JoinType, quals []*restrictInfo) {
 	o, i := outer.CheapestTotal, inner.CheapestTotal
 	if o == nil || i == nil {
 		return
@@ -133,6 +156,7 @@ func addNestLoopPath(joinRel, outer, inner *RelOptInfo, cp costParams, quals []*
 	cost.Total += qualEvalCost(cp, len(quals), o.Rows*i.Rows)
 	addPath(joinRel, &Path{
 		Kind:          PathNestLoop,
+		Jointype:      jt, // C-03b; see addHashJoinPath.
 		DisabledNodes: disabledNodesFor(!cp.enableNestLoop, o, i),
 		Rel:           joinRel,
 		Rows:     joinRel.Rows,
@@ -142,6 +166,8 @@ func addNestLoopPath(joinRel, outer, inner *RelOptInfo, cp costParams, quals []*
 		// A nested loop DISCHARGES an inner parameterised by the outer, so
 		// this is a subtraction, not a union (pathnode.c:2592).
 		RequiredOuter: calcNestloopRequiredOuter(outer.Relids, o.RequiredOuter, inner.Relids, i.RequiredOuter),
+		// create_nestloop_path (pathnode.c:2590). C-19a.
+		ParallelSafe: parallelSafeWith(joinRel, o, i),
 	}, "join.nestloop")
 }
 
@@ -159,7 +185,7 @@ func addNestLoopPath(joinRel, outer, inner *RelOptInfo, cp costParams, quals []*
 // different relations, and that is the whole point of costing them separately.
 // A nil closure means "no statistics available" and suppresses the term, which
 // is what keeps this function usable from tests that build bare RelOptInfos.
-func generateHashJoinPaths(joinRel, outer, inner *RelOptInfo, cp costParams, keys, residual []*restrictInfo, bucketFor func(RelSet) float64) {
+func generateHashJoinPaths(joinRel, outer, inner *RelOptInfo, cp costParams, jt parser.JoinType, keys, residual []*restrictInfo, bucketFor func(RelSet) float64) {
 	bucket := func(build *RelOptInfo) float64 {
 		if bucketFor == nil || build == nil {
 			return 0
@@ -167,10 +193,10 @@ func generateHashJoinPaths(joinRel, outer, inner *RelOptInfo, cp costParams, key
 		return bucketFor(build.Relids)
 	}
 	// Orientation 1: build the inner side.
-	addHashJoinPath(joinRel, outer, inner, cp, keys, residual, bucket(inner))
+	addHashJoinPath(joinRel, outer, inner, cp, jt, keys, residual, bucket(inner))
 	// Orientation 2: build the outer side (swap the roles). The join output is
 	// the same; only which side is hashed differs.
-	addHashJoinPath(joinRel, inner, outer, cp, keys, residual, bucket(outer))
+	addHashJoinPath(joinRel, inner, outer, cp, jt, keys, residual, bucket(outer))
 }
 
 // The C1-era `generateNLIPath` used to live here. It was retired by

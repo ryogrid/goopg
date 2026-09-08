@@ -1,0 +1,8 @@
+=== Q1
+Sort  (cost=411160.79..411160.80 rows=6 width=236)
+  Sort Key: l_returnflag, l_linestatus
+  ->  HashAggregate  (cost=411160.54..411160.71 rows=6 width=236)
+        Group Key: l_returnflag, l_linestatus
+        ->  Seq Scan on lineitem  (cost=0.00..204337.95 rows=5909217 width=25)
+              Filter: (l_shipdate <= '1998-09-02 00:00:00'::timestamp without time zone)
+

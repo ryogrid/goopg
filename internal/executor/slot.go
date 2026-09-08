@@ -243,6 +243,16 @@ func slotToRow(view SlotView) Row {
 			return nil
 		}
 		return v.Row()
+	case *PackedSlot:
+		// R-0 site 1 (04 §9.1), D-03. Without this arm a *PackedSlot falls to
+		// `default: return nil` and the row silently becomes nil — the exact
+		// failure the *Slot arm below records having shipped once. Row()
+		// deforms fully first, so what escapes here is never a partially
+		// filled scratch (04 §2.2's escape rule).
+		if v == nil {
+			return nil
+		}
+		return v.Row()
 	case *Slot:
 		// Phase C concrete slot (M0107-0003): used by evalFastExpr's ExprAdapter
 		// path when evalExprSlot is called with a *Slot from projectOpNext /

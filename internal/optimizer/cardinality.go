@@ -165,8 +165,20 @@ func filterSelectivity(f *Filter) float64 {
 		return clauseSelectivity(f.Predicate, f.Child)
 	}
 	sel := 1.0
+	kept := make([]Expr, 0, len(splitAnd(f.Predicate)))
 	for _, c := range splitAnd(f.Predicate) {
 		if f.pricedBelow(c) {
+			continue
+		}
+		kept = append(kept, c)
+	}
+	// B-05b: extended statistics over the kept conjuncts first
+	// (clauselist_selectivity_ext order); consumed clauses are skipped by
+	// the base product below. Empty registry => 1.0 with nothing marked.
+	extSel, estimated := statextClauselistSelectivity(kept, f.Child)
+	sel *= extSel
+	for i, c := range kept {
+		if estimated[i] {
 			continue
 		}
 		sel *= clauseSelectivity(c, f.Child)
@@ -778,11 +790,30 @@ func semiPairMatchFraction(j *Join, p JoinKeyPair, innerRows int64) float64 {
 	if !nd2Known {
 		nd2 = defaultNumDistinct
 	}
+	// Only the inner INPUT's rows clamp nd2 here; the search-side twin
+	// (`eqJoinSelectivitySemi`, joinselectivity.go) applies upstream's
+	// `vardata2->rel->rows` clamp as well. Ledger `C-05
+	// plan-node-semi-nd2-rel-rows`.
 	if innerRows > 0 && nd2 >= float64(innerRows) {
 		nd2 = float64(innerRows)
 		nd2Known = true
 	}
+	return eqjoinselSemiCore(st1, st2, nd1, nd2, nd1Known, nd2Known, nullfrac1)
+}
 
+// eqjoinselSemiCore is `eqjoinsel_semi`'s body AFTER the nd2 clamps
+// (selfuncs.c:2668-2760): the MCV arm when both sides carry an MCV list,
+// otherwise the nd heuristic. C-05 factored it out of `semiPairMatchFraction`
+// so that the plan-node estimator (above) and the join search's
+// `eqJoinSelectivitySemi` (joinselectivity.go) compute the SAME number from
+// the same inputs — two copies of this arithmetic are exactly the sibling-path
+// shape that silently diverges (hard-won rule #2). The callers own the nd
+// resolution and the clamps, which is where they legitimately differ.
+//
+// `nd1Known`/`nd2Known` are the complements of upstream's `isdefault1/2`: a
+// clamped nd2 counts as known, because an inner relation smaller than
+// DEFAULT_NUM_DISTINCT bounds its own distinct count exactly.
+func eqjoinselSemiCore(st1, st2 *catalog.ColumnStats, nd1, nd2 float64, nd1Known, nd2Known bool, nullfrac1 float64) float64 {
 	if st1 != nil && st2 != nil && len(st1.MCV) > 0 && len(st2.MCV) > 0 {
 		// "The clamping above could have resulted in nd2 being less than
 		// sslot2->nvalues; in which case, we assume that precisely the nd2 most
@@ -1042,6 +1073,9 @@ type groupVarKey struct {
 
 // groupVarInfo is upstream's GroupVarInfo (selfuncs.c:3310) minus `isdefault`,
 // which only feeds the SELFLAG_USED_DEFAULT bit no goopg caller reads yet.
+// tableOID/attnum carry the variable's catalog identity for the
+// estimate_multivariate_ndistinct consumption (B-05c): both are zero when the
+// variable resolved to no base relation, and the combo lookup then declines.
 type groupVarInfo struct {
 	// rel is the leaf scan the variable resolved to, nil when it resolved to
 	// no base relation. A nil-rel variable skips the per-relation clamp
@@ -1052,6 +1086,12 @@ type groupVarInfo struct {
 	// rawRows is the relation's unfiltered tuple count — upstream's
 	// `rel->tuples`, the clamp denominator.
 	rawRows float64
+	// tableOID is the base table's catalog OID (0 when unknown). Registry
+	// lookups key on it; 0 is fail-closed because no real table has OID 0.
+	tableOID uint32
+	// attnum is the 1-based catalog attnum (column Ordinal+1), 0 when the
+	// column name matched nothing (dropped columns, unresolvable keys).
+	attnum int16
 }
 
 // estimateAggregate returns the group count via `estimateNumGroups`.
@@ -1064,7 +1104,69 @@ type groupVarInfo struct {
 // grouped scan of 6 surviving rows claim its column's whole-table 18 000
 // distinct values.
 func estimateAggregate(a *Aggregate) int64 {
-	return estimateNumGroups(a.GroupExprs, a.Child, EstimateRows(a.Child))
+	inputRows := EstimateRows(a.Child)
+	if len(a.GroupingSets) == 0 {
+		return estimateNumGroups(a.GroupExprs, a.Child, inputRows)
+	}
+	// C-10a: a GROUPING SETS / ROLLUP / CUBE aggregate emits one row per
+	// group PER SET, so its output is the SUM over the sets — which is what
+	// PG accumulates into `dNumGroups` in `create_grouping_paths` /
+	// `consider_groupingsets_paths`
+	// (postgres/src/backend/optimizer/plan/planner.c, calling
+	// estimate_num_groups once per rollup level).
+	//
+	// Before this, `a.GroupExprs` alone was estimated — the deduplicated
+	// UNION of every set — so an N-set query was priced as though it had one
+	// set. That under-states the row count by up to N×, and the error is
+	// silent: nothing downstream can tell a rolled-up estimate from a plain
+	// one. It reaches `cost_agg` (C-15) and, through `rel.rows`, the
+	// LIMIT-to-fraction conversion in `tuple_fraction` (C-17), so it is
+	// fixed here, before either consumes it.
+	//
+	// The empty set `()` — ROLLUP's grand total — contributes exactly one
+	// row, which `estimateNumGroups` already answers for an empty expression
+	// list.
+	var total int64
+	for _, set := range a.GroupingSets {
+		exprs := make([]Expr, 0, len(set))
+		for _, idx := range set {
+			if idx < 0 || idx >= len(a.GroupExprs) {
+				// Fail-safe: an out-of-range index means the set list and
+				// GroupExprs disagree, which the builder should make
+				// impossible. Price the whole aggregate the old way rather
+				// than silently dropping a dimension, since dropping one
+				// under-states further in the same direction.
+				return estimateNumGroups(a.GroupExprs, a.Child, inputRows)
+			}
+			exprs = append(exprs, a.GroupExprs[idx])
+		}
+		total += estimateNumGroups(exprs, a.Child, inputRows)
+	}
+	if total < 1 {
+		return 1
+	}
+	// CORRECTION (2026-09-06, C-10a scope review): an earlier version of
+	// this clamped the accumulated total to `inputRows` and attributed that
+	// to upstream. **Upstream does not do it.**
+	// `get_number_of_groups` (postgres/src/backend/optimizer/plan/planner.c)
+	// accumulates `dNumGroups += rollup->numGroups` with NO clamp on the
+	// total; the clamp lives inside each per-set `estimate_num_groups` call,
+	// which this function inherits by calling `estimateNumGroups` per set.
+	//
+	// And the old bound was simply wrong. Each of k sets can legitimately
+	// emit up to `inputRows` groups, so the sound ceiling is `k*inputRows`,
+	// not `inputRows`: a 4-row input under ROLLUP(a,b) really can produce 6
+	// output rows, which the `inputRows` clamp would have under-stated back
+	// to 4 — the same direction as the bug this function exists to fix.
+	//
+	// The ceiling is kept (rather than dropped entirely) as an overflow
+	// guard, since `total` is a sum of k independently-clamped estimates.
+	if inputRows > 0 {
+		if ceiling := inputRows * int64(len(a.GroupingSets)); total > ceiling {
+			return ceiling
+		}
+	}
+	return total
 }
 
 // estimateNumGroups is `estimate_num_groups` (selfuncs.c:3449): the number of
@@ -1089,12 +1191,14 @@ func estimateAggregate(a *Aggregate) int64 {
 //
 // Three upstream refinements are deliberately absent and ledgered rather than
 // faked: the equivalence-class de-duplication of step 3 (goopg's planner has
-// no EC structure at estimate time), extended-statistics ndistinct
-// (`estimate_multivariate_ndistinct` — goopg collects no multivariate stats),
-// and the boolean short-circuit ("a boolean expression contributes 2 groups"),
-// which needs an `exprType` this package does not have. A boolean COLUMN still
-// answers 2 through its own ANALYZE ndistinct; only boolean-valued
-// EXPRESSIONS fall through to the default.
+// no EC structure at estimate time), the ITERATIVE remainder of
+// estimate_multivariate_ndistinct (B-05c consumes only the exact-set hit; a
+// partial combo match falls back to the full independence product rather than
+// pricing the remainder separately), and the boolean short-circuit ("a
+// boolean expression contributes 2 groups"), which needs an `exprType` this
+// package does not have. A boolean COLUMN still answers 2 through its own
+// ANALYZE ndistinct; only boolean-valued EXPRESSIONS fall through to the
+// default.
 func estimateNumGroups(groupExprs []Expr, child Node, inputRows int64) int64 {
 	rows := float64(inputRows)
 	if rows < 1 {
@@ -1155,10 +1259,20 @@ func estimateNumGroups(groupExprs []Expr, child Node, inputRows int64) int64 {
 		vis := byRel[rel]
 		reldistinct := 1.0
 		relmax := 1.0
-		for _, vi := range vis {
-			reldistinct *= vi.ndistinct
-			if relmax < vi.ndistinct {
-				relmax = vi.ndistinct
+		if mv, ok := groupComboNDistinct(vis); ok {
+			// estimate_multivariate_ndistinct exact-set hit (B-05c): the
+			// measured combo replaces the independence product. The clamp
+			// and the Yao/Dell'Era restriction term below apply unchanged —
+			// upstream applies them to the multivariate value too — and
+			// relmax takes the combo so the floor ("surely at least that
+			// many groups") stays consistent with the value in use.
+			reldistinct, relmax = mv, mv
+		} else {
+			for _, vi := range vis {
+				reldistinct *= vi.ndistinct
+				if relmax < vi.ndistinct {
+					relmax = vi.ndistinct
+				}
 			}
 		}
 		tuples := vis[0].rawRows
@@ -1233,11 +1347,19 @@ func groupVarsOfExpr(e Expr) ([]*ColumnRef, bool) {
 func examineGroupVar(cr *ColumnRef, child Node) (groupVarKey, groupVarInfo) {
 	if cr.Index >= 0 {
 		if ref, ok := resolveBaseColumn(cr.Index, child); ok {
+			var oid uint32
+			var attnum int16
+			if ref.table != nil {
+				oid = ref.table.OID
+				attnum, _ = attnumOfColumn(ref.table, ref.col)
+			}
 			return groupVarKey{rel: ref.scan, col: ref.col},
 				groupVarInfo{
 					rel:       ref.scan,
 					ndistinct: groupVarNDistinct(float64(ref.ndistinct), ref.rawRows),
 					rawRows:   ref.rawRows,
+					tableOID:  oid,
+					attnum:    attnum,
 				}
 		}
 		// `get_variable_numdistinct`'s isunique branch: a column that is the
@@ -1269,6 +1391,37 @@ func groupVarNDistinct(nd, rawRows float64) float64 {
 		return rawRows
 	}
 	return defaultNumDistinct
+}
+
+// groupComboNDistinct is the exact-set cut of estimate_multivariate_ndistinct
+// (selfuncs.c:4220) for one relation's grouping variables: the registered
+// combo ndistinct when the relation's whole GROUP BY attnum set equals one
+// registered combination, false (caller's independence product stands) for
+// everything else.
+//
+// Decline cases, each fail-closed toward today's arithmetic:
+//   - fewer than two variables (combos cover k>=2; one column's own ndistinct
+//     is already the exact answer — upstream requires two matches too);
+//   - mixed table OIDs, unknown OID (0), or unknown attnum (0): the set is
+//     not one table's columns (cross-relation sets multiply in step 5);
+//   - no registered combo with exactly this attnum set (subset, superset, or
+//     nothing registered — the empty-registry production case today).
+func groupComboNDistinct(vis []groupVarInfo) (float64, bool) {
+	if len(vis) < 2 {
+		return 0, false
+	}
+	oid := vis[0].tableOID
+	if oid == 0 {
+		return 0, false
+	}
+	attnums := make([]int16, 0, len(vis))
+	for _, vi := range vis {
+		if vi.tableOID != oid || vi.attnum <= 0 {
+			return 0, false
+		}
+		attnums = append(attnums, vi.attnum)
+	}
+	return plannerMultivariateNDistinct(oid, attnums)
 }
 
 // relFilteredRows answers upstream's `rel->rows` — the estimated row count of

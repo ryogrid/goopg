@@ -1,0 +1,30 @@
+Sort  (cost=34463.01..34463.03 rows=9 width=77)
+  Sort Key: (count(*)) DESC, customer.c_last_name
+  ->  Nested Loop  (cost=34376.59..34462.86 rows=9 width=77)
+        ->  GroupAggregate  (cost=34376.30..34387.98 rows=9 width=16)
+              Group Key: store_sales.ss_ticket_number, store_sales.ss_customer_sk
+              Filter: ((count(*) >= 1) AND (count(*) <= 5))
+              ->  Gather Merge  (cost=34376.30..34386.12 rows=83 width=8)
+                    Workers Planned: 3
+                    ->  Sort  (cost=33376.26..33376.32 rows=27 width=8)
+                          Sort Key: store_sales.ss_ticket_number, store_sales.ss_customer_sk
+                          ->  Hash Join  (cost=240.75..33375.61 rows=27 width=8)
+                                Hash Cond: (store_sales.ss_store_sk = store.s_store_sk)
+                                ->  Nested Loop  (cost=239.42..33374.19 rows=28 width=12)
+                                      ->  Hash Join  (cost=239.11..32030.72 rows=30154 width=16)
+                                            Hash Cond: (store_sales.ss_hdemo_sk = household_demographics.hd_demo_sk)
+                                            ->  Parallel Seq Scan on store_sales  (cost=0.00..30571.90 rows=464390 width=20)
+                                            ->  Hash  (cost=233.00..233.00 rows=489 width=4)
+                                                  ->  Seq Scan on household_demographics  (cost=0.00..233.00 rows=489 width=4)
+                                                        Filter: ((hd_vehicle_count > 0) AND ((hd_buy_potential = '1001-5000'::bpchar) OR (hd_buy_potential = '5001-10000'::bpchar)) AND (CASE WHEN (hd_vehicle_count > 0) THEN (hd_dep_count / hd_vehicle_count) ELSE NULL::integer END > 1))
+                                      ->  Memoize  (cost=0.30..0.33 rows=1 width=4)
+                                            Cache Key: store_sales.ss_sold_date_sk
+                                            Cache Mode: logical
+                                            ->  Index Scan using date_dim_pkey on date_dim  (cost=0.29..0.32 rows=1 width=4)
+                                                  Index Cond: (d_date_sk = store_sales.ss_sold_date_sk)
+                                                  Filter: ((d_dom >= 1) AND (d_dom <= 2) AND (d_year = ANY ('{2000,2001,2002}'::integer[])))
+                                ->  Hash  (cost=1.18..1.18 rows=12 width=4)
+                                      ->  Seq Scan on store  (cost=0.00..1.18 rows=12 width=4)
+                                            Filter: ((s_county)::text = ANY ('{"Williamson County","Williamson County","Williamson County","Williamson County"}'::text[]))
+        ->  Index Scan using customer_pkey on customer  (cost=0.29..8.31 rows=1 width=69)
+              Index Cond: (c_customer_sk = store_sales.ss_customer_sk)

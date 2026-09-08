@@ -164,6 +164,17 @@ func (s *Slot) fillFromTupleSlot(ts TupleSlot) {
 		s.hasCTID = false
 		return
 	}
+	// R-0 site 6 (04 §9.1, "performance only"), D-03. A *PackedSlot
+	// deliberately takes the generic path below, and the decision is written
+	// out rather than left implicit because the obvious "optimisation" is
+	// wrong twice over. VirtualSlot needs the fast path because its Row() is
+	// acquireRow plus a 48-byte Datum copy per column and then drops the
+	// pooled row; PackedSlot.Row() deforms into its OWN reused scratch and
+	// returns it, so the generic path is already allocation-free and one
+	// `copy` beats a per-column Get with a watermark branch. And a
+	// VirtualSlot-shaped arm would early-return past the ctid switch below,
+	// which is where a PackedSlot's carried tid is read — silently setting
+	// hasCTID = false and breaking CTIDExpr / WHERE CURRENT OF.
 	row := ts.Row()
 	if cap(s.Cells) < len(row) {
 		s.Cells = make([]Datum, len(row))
@@ -179,6 +190,13 @@ func (s *Slot) fillFromTupleSlot(ts TupleSlot) {
 		s.ctidBlock = v.ctidBlock
 		s.ctidOff = v.ctidOff
 	case *Slot:
+		s.hasCTID = v.hasCTID
+		s.ctidBlock = v.ctidBlock
+		s.ctidOff = v.ctidOff
+	case *PackedSlot:
+		// R-0 site 4 (04 §9.1), D-03. Without this arm a PackedSlot's carried
+		// tid falls to `default: hasCTID = false` — silently, and only
+		// CTIDExpr and WHERE CURRENT OF would notice (04 §7).
 		s.hasCTID = v.hasCTID
 		s.ctidBlock = v.ctidBlock
 		s.ctidOff = v.ctidOff
@@ -291,6 +309,11 @@ type filterState struct {
 	predIdx int32        // root index into exprs slab (noExpr for nil predicate)
 	exprs   exprTreeSlab // set at Open time from the shared opTreeSlab.exprs
 	ctx     *Context
+	// needsCTID is set at build time when the predicate contains a
+	// *optimizer.CTIDExpr: evaluating it against the child's slots reads
+	// the sort TID side-channel, so opOpen enables it on the spine below
+	// (markSlabSorts) before the child opens. EX3-05 Cut A.
+	needsCTID bool
 }
 
 // projectState is the per-node state for OpProject.
@@ -301,6 +324,10 @@ type projectState struct {
 	outCells  []Datum      // persistent output buffer, reused across Next calls
 	targExprs []int32      // root indices into exprs slab (one per target)
 	exprs     exprTreeSlab // set at Open time from the shared opTreeSlab.exprs
+	// needsCTID is set at build time when any target contains a
+	// *optimizer.CTIDExpr (`SELECT ctid ... ORDER BY ...`). Same contract
+	// as filterState.needsCTID. EX3-05 Cut A.
+	needsCTID bool
 }
 
 // limitState is the per-node state for OpLimit.
@@ -495,6 +522,43 @@ func (it *OpIterator) RowsAffected() int64 {
 	return 0
 }
 
+// markSlabSorts enables the TID side-channel (sortOp.wantCTIDs) on every
+// OpSort kernel on the single-child spine below ops[idx], descending through
+// the slab-native pass-throughs (OpProject/OpFilter/OpLimit) and through an
+// OpSort's opNodeOperator bridge into its child subtree (child indices are
+// built before their parents, so the descent strictly decreases and always
+// terminates). It stops at any other kind: OpAdapter subtrees self-mark via
+// their legacy Opens (lockRowsOp/projectOp/filterOp/aggregateOp), and joins
+// and scans either consume slots row-wise or rebuild them, so a sort below
+// one has no live consumer. Slab twin of markSortWantCTIDs. EX3-05 Cut A.
+func markSlabSorts(tree *opTreeSlab, idx int32) {
+	for idx != noChild {
+		if tree == nil || int(idx) < 0 || int(idx) >= len(tree.ops) {
+			return
+		}
+		n := &tree.ops[idx]
+		switch n.Kind {
+		case OpSort:
+			s, ok := n.state.(*sortOpState)
+			if !ok || s.op == nil {
+				return
+			}
+			s.op.wantCTIDs = true
+			// Descend through the bridge into the sort's child subtree
+			// (covers Sort-above-Sort; the common single-sort shape
+			// simply finds a non-sort child below and stops).
+			if w, ok := s.op.child.(*opNodeOperator); ok && w.tree != nil {
+				markSlabSorts(w.tree, w.idx)
+			}
+			return
+		case OpProject, OpFilter, OpLimit:
+			idx = n.childA
+		default:
+			return
+		}
+	}
+}
+
 // ---------------------------------------------------------------------------
 // opOpen — recursive tree-open. Called once before the first opNext.
 // ---------------------------------------------------------------------------
@@ -517,12 +581,23 @@ func opOpen(tree *opTreeSlab, idx int32, ctx *Context) error {
 		s := n.state.(*filterState)
 		s.ctx = ctx
 		s.exprs = tree.exprs // wire in the shared slab for evalFastExpr
+		// EX3-05 Cut A: a ctid predicate above a sort reads the sort's TID
+		// side-channel — enable it before the child drains (legacy twin:
+		// filterOp.Open → markSortWantCTIDs).
+		if s.needsCTID {
+			markSlabSorts(tree, n.childA)
+		}
 		return opOpen(tree, n.childA, ctx)
 
 	case OpProject:
 		s := n.state.(*projectState)
 		s.ctx = ctx
 		s.exprs = tree.exprs // wire in the shared slab for evalFastExpr
+		// EX3-05 Cut A: same contract as OpFilter (`SELECT ctid ... ORDER
+		// BY ...`; legacy twin: projectOp.Open → markSortWantCTIDs).
+		if s.needsCTID {
+			markSlabSorts(tree, n.childA)
+		}
 		ntargets := len(s.targExprs)
 		if ntargets > 0 {
 			if cap(s.outCells) < ntargets {

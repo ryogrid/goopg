@@ -1,0 +1,37 @@
+# TPC-H SF=1 warm-start query timings — goopg
+# captured: 2026-09-06T16:20:00.077454+09:00
+# repo commit at capture: a22d995c8
+# engine build: a22d995c8
+# port: 65433
+# settings: shared_buffers=2GB work_mem=64MB effective_cache_size=2GB autovacuum=on
+# protocol: one WARM pass discarded, then two measured passes over all
+#   queries on the same server (server age therefore differs between
+#   pass 1 and pass 2 — that is visible as the p1/p2 spread, not hidden).
+# harness: tmp/tpch-acceptance-runner, serial per-query connections.
+# NOTE: seconds are machine-specific. The FIXTURE here is the pair of
+#   passes and their spread; a single number should not be quoted alone.
+#
+# query     pass1_s    pass2_s      min_s
+Q1             7.84       7.72       7.72
+Q2             0.66       0.65       0.65
+Q3             2.41       2.51       2.41
+Q4             1.51       1.50       1.50
+Q5             4.05       4.13       4.05
+Q6             0.73       0.76       0.73
+Q7             5.64       5.92       5.64
+Q8             0.45       0.48       0.45
+Q9             6.86       6.81       6.81
+Q10            3.18       2.97       2.97
+Q11            0.20       0.18       0.18
+Q12           13.04      12.63      12.63
+Q13            5.94       5.87       5.87
+Q14            0.47       0.44       0.44
+Q16            0.73       0.73       0.73
+Q17            0.55       0.52       0.52
+Q18           35.04      34.03      34.03
+Q19            2.04       1.99       1.99
+Q20            1.25       1.32       1.25
+Q21           14.09      13.72      13.72
+Q22            0.70       0.63       0.63
+#
+# TOTAL      107.38     105.51       0.00   (21 labels)

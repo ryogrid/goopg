@@ -1,0 +1,6 @@
+=== Q15a-VIEWBODY
+HashAggregate  (cost=266565.93..266690.97 rows=10003 width=37)
+  Group Key: l_suppkey
+  ->  Seq Scan on lineitem  (cost=0.00..264331.51 rows=223442 width=17)
+        Filter: ((l_shipdate >= to_date('1996-01-01'::text, 'YYYY-MM-DD'::text)) AND (l_shipdate < (to_date('1996-01-01'::text, 'YYYY-MM-DD'::text) + '3 mons'::interval)))
+

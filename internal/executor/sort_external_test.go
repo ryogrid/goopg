@@ -6,7 +6,6 @@ import (
 
 	"github.com/goopg/goopg/internal/optimizer"
 )
-
 // TestM0068SortExternalSpills constructs a sortOp with a tiny chunk
 // limit so a small input forces multiple spill rounds. The test
 // asserts that (a) at least one spill file was created during Open,
@@ -100,4 +99,146 @@ func TestM0068SortNoSpillBelowChunk(t *testing.T) {
 		t.Fatalf("emitted = %d, want 64", emitted)
 	}
 	_ = s.Close()
+}
+
+// ctidRowSource is a minimal Operator stub emitting rows with a caller-chosen
+// TID side-channel, so the EX3-05 Cut A gate tests can verify TID tracking
+// without a heap.
+type ctidRowSource struct {
+	rows  []Row
+	ctids []sortCTID
+	idx   int
+}
+
+func (o *ctidRowSource) Open(*Context) error      { o.idx = 0; return nil }
+func (o *ctidRowSource) Schema() optimizer.Schema { return nil }
+func (o *ctidRowSource) Close() error             { return nil }
+func (o *ctidRowSource) Next() (TupleSlot, error) {
+	if o.idx >= len(o.rows) {
+		return nil, EOF
+	}
+	ms := SlotFromRow(nil, o.rows[o.idx])
+	if o.idx < len(o.ctids) {
+		c := o.ctids[o.idx]
+		ms.hasCTID = c.has
+		ms.ctidBlock = c.block
+		ms.ctidOff = c.off
+	}
+	o.idx++
+	return ms, nil
+}
+
+// ctidGateFixture returns a 3-row out-of-order input whose keys sort to
+// [1,2,3] while the TIDs identify the original positions: key k rode in on
+// (0,k), so after sorting row i must carry (0,i+1).
+func ctidGateFixture() ([]Row, []sortCTID) {
+	rows := []Row{{NewIntDatum(3)}, {NewIntDatum(1)}, {NewIntDatum(2)}}
+	ctids := []sortCTID{
+		{block: 0, off: 3, has: true},
+		{block: 0, off: 1, has: true},
+		{block: 0, off: 2, has: true},
+	}
+	return rows, ctids
+}
+
+func ctidGateSortOp(rows []Row, ctids []sortCTID) *sortOp {
+	return &sortOp{
+		child: &ctidRowSource{rows: rows, ctids: ctids},
+		keys: []optimizer.SortKey{
+			{Expr: &optimizer.ColumnRef{Index: 0}, Desc: false},
+		},
+	}
+}
+
+// TestSortCTIDSkippedWithoutConsumer pins EX3-05 Cut A's default: a sort with
+// no consumer above (wantCTIDs false) must not maintain the TID side-channel
+// even when every input row carries one — no per-row append at Open, no
+// re-attach at Next — while ordering stays bit-identical (stable ascending).
+func TestSortCTIDSkippedWithoutConsumer(t *testing.T) {
+	rows, ctids := ctidGateFixture()
+	s := ctidGateSortOp(rows, ctids)
+	if err := s.Open(&Context{}); err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if len(s.ctids) != 0 {
+		t.Fatalf("len(ctids) = %d, want 0 (no consumer marked the sort)", len(s.ctids))
+	}
+	for i := int64(1); i <= 3; i++ {
+		slot, err := s.Next()
+		if err != nil {
+			t.Fatalf("Next: %v", err)
+		}
+		if got := slot.Row()[0].Int; got != i {
+			t.Fatalf("row %d: key = %d, want %d (order regressed)", i, got, i)
+		}
+		if _, _, ok := slot.TID(); ok {
+			t.Fatalf("row %d: TID attached with no consumer (wantCTIDs=false)", i)
+		}
+	}
+	if _, err := s.Next(); err != EOF {
+		t.Fatalf("trailing Next = %v, want EOF", err)
+	}
+	_ = s.Close()
+}
+
+// TestSortCTIDMaintainedWhenMarked pins the enabled path: once
+// markSortWantCTIDs runs (as lockRowsOp.Open does for ORDER BY ... FOR
+// UPDATE), the sort records TIDs at Open, carries them through the sort
+// permutation, and re-attaches each row's own TID at Next.
+func TestSortCTIDMaintainedWhenMarked(t *testing.T) {
+	rows, ctids := ctidGateFixture()
+	s := ctidGateSortOp(rows, ctids)
+	markSortWantCTIDs(s)
+	if err := s.Open(&Context{}); err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if len(s.ctids) != 3 {
+		t.Fatalf("len(ctids) = %d, want 3 (marked sort must record TIDs)", len(s.ctids))
+	}
+	for i := int64(1); i <= 3; i++ {
+		slot, err := s.Next()
+		if err != nil {
+			t.Fatalf("Next: %v", err)
+		}
+		if got := slot.Row()[0].Int; got != i {
+			t.Fatalf("row %d: key = %d, want %d", i, got, i)
+		}
+		blk, off, ok := slot.TID()
+		if !ok {
+			t.Fatalf("row %d: TID missing on marked sort", i)
+		}
+		if blk != 0 || off != uint16(i) {
+			t.Fatalf("row %d: TID = (%d,%d), want (0,%d) (TID did not follow its row)", i, blk, off, i)
+		}
+	}
+	if _, err := s.Next(); err != EOF {
+		t.Fatalf("trailing Next = %v, want EOF", err)
+	}
+	_ = s.Close()
+}
+
+// TestMarkSortWantCTIDsSpine pins the consumer-detection walk: marking from
+// above a project→filter→limit→sort spine enables the sort; a LockRows node
+// is a consumer rather than a conduit, so a sort below one stays disabled.
+func TestMarkSortWantCTIDsSpine(t *testing.T) {
+	rows, ctids := ctidGateFixture()
+	s := ctidGateSortOp(rows, ctids)
+	top := &projectOp{child: &filterOp{child: &limitOp{child: s}}}
+	markSortWantCTIDs(top)
+	if !s.wantCTIDs {
+		t.Fatal("sort on a project→filter→limit spine not enabled")
+	}
+
+	below := ctidGateSortOp(rows, ctids)
+	markSortWantCTIDs(&lockRowsOp{child: below})
+	if below.wantCTIDs {
+		t.Fatal("sort below a LockRows enabled (LockRows consumes, it does not forward the mark)")
+	}
+
+	// The EXPLAIN ANALYZE wrapper must stay transparent to the walk.
+	wrapped := ctidGateSortOp(rows, ctids)
+	markSortWantCTIDs(&instrumentedOp{inner: wrapped})
+	if !wrapped.wantCTIDs {
+		t.Fatal("sort under instrumentedOp not enabled")
+	}
 }

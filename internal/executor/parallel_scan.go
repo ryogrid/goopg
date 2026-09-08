@@ -17,6 +17,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/goopg/goopg/internal/optimizer"
 	"github.com/goopg/goopg/internal/storage"
 )
 
@@ -128,6 +129,44 @@ func attachParallelScan(op Operator, st *parallelScanState) bool {
 		// side instead would give each worker a PARTITION of the build input,
 		// so every worker's hash table would be missing most of its rows and
 		// the join would silently drop matches.
+		//
+		// FAIL CLOSED on anything but a HASH join (2026-09-07). `joinOp` runs
+		// all three algorithms, and `probeSideIsLeft` answers from `BuildLeft`
+		// — a field a merge join leaves false by construction
+		// (`createMergeJoinPlan`: "a merge join has no build side, so BuildLeft
+		// is meaningless here and stays false"). So for a merge or nested-loop
+		// join this arm used to answer "left" not because left is the partial
+		// side but because the field it reads is unset, and the walk would
+		// descend a subtree whose per-worker semantics nothing here models.
+		//
+		// It is unreachable today: the planner's own twin refuses first —
+		// `drivingScan`'s `*Join` arm is gated on `hashJoinIsPartialCapable`
+		// (Algo == JoinAlgoHash) and the path model's `partialPathDrivingKind`
+		// has an arm for `PathHashJoin` only. That is exactly why the guard is
+		// worth writing: this walk is the LAST line of defence, `runWorker`
+		// IGNORES the return value, and the failure mode of a wrong answer here
+		// is N copies of every row rather than an error. Declining leaves the
+		// subtree serial, which is the direction an ambiguous case must fail.
+		//
+		// A partial merge join (`try_partial_mergejoin_path`, joinpath.c:1218)
+		// is a real PG shape and goopg has no producer for it; when one is
+		// written, this arm gains a `JoinAlgoMerge` case that descends the
+		// OUTER (left) side explicitly, together with its own serial-vs-parallel
+		// identity test.
+		//
+		// E-20 Cut 3 wrote that producer (`addPartialMergeJoinPath`). Each
+		// worker merge-joins ITS partition of the outer against the WHOLE
+		// inner, so the walk descends the OUTER (left) side explicitly —
+		// never `probeSideIsLeft`, which answers from `BuildLeft`, a field
+		// a merge join leaves false by construction. The inner is left
+		// alone: every worker sorts and reads it whole, which is why the
+		// planner prices it undivided.
+		if x.plan == nil || x.plan.Algo != optimizer.JoinAlgoHash {
+			if x.plan != nil && x.plan.Algo == optimizer.JoinAlgoMerge {
+				return attachParallelScan(x.left, st)
+			}
+			return false
+		}
 		if probeSideIsLeft(x.plan) {
 			return attachParallelScan(x.left, st)
 		}
@@ -238,17 +277,66 @@ func (s *parallelIndexScanState) claimedBlocks() uint64 {
 	return s.blocks.Load()
 }
 
-// attachParallelIndexScan wires op's driving index-only scan to the shared
-// leaf-block claim set. The walk mirrors attachParallelScan's — row-wise
-// wrappers only, stopping at the first index-only scan — and an unmodelled node
-// is left alone, leaving the tree serial. Declining to parallelise is a missed
-// optimisation; attaching in the wrong place is duplicated or dropped rows.
+// leafClaimMemo is one worker's cached view of the shared leaf-claim set: the
+// verdict per leaf, and the most recent one. The shared claim is a sync.Map
+// operation and a range scan visits ~300 entries per leaf, so consulting it
+// per ENTRY made the parallel index-only scan 3.5x SLOWER than serial (q16
+// 1.6s -> 5.7s). A btree scan walks leaves in key order, so the common case
+// is "same block as the last entry" and costs one comparison. The map is kept
+// so revisiting a block reuses this worker's OWN verdict rather than
+// re-asking the shared set, which would answer "already claimed" about our
+// own claim and silently drop rows.
+//
+// C-19c: extracted from indexOnlyScanOp's fields so the plain index scan
+// (indexScanOp) partitions by the same memo rather than a re-typed sibling.
+type leafClaimMemo struct {
+	owned     map[storage.BlockNumber]bool
+	last      storage.BlockNumber
+	lastOwned bool
+	lastValid bool
+}
+
+// owns reports whether this worker processes entries from leaf block blk,
+// memoising the shared claim. A nil st answers YES for every block (serial).
+func (m *leafClaimMemo) owns(st *parallelIndexScanState, blk storage.BlockNumber) bool {
+	if m.lastValid && m.last == blk {
+		return m.lastOwned
+	}
+	owned, seen := m.owned[blk]
+	if !seen {
+		owned = st.claimLeaf(blk)
+		if m.owned == nil {
+			m.owned = make(map[storage.BlockNumber]bool, 64)
+		}
+		m.owned[blk] = owned
+	}
+	m.last, m.lastOwned, m.lastValid = blk, owned, true
+	return owned
+}
+
+// attachParallelIndexScan wires op's driving index scan — index-only or, since
+// C-19c, a plain index scan — to the shared leaf-block claim set. The walk
+// mirrors attachParallelScan's — row-wise wrappers only, stopping at the first
+// index scan — and an unmodelled node is left alone, leaving the tree serial.
+// Declining to parallelise is a missed optimisation; attaching in the wrong
+// place is duplicated or dropped rows.
+//
+// The plain index scan partitions the SAME way the index-only scan does: both
+// are eager at Open/Rescan (the IOS materialises rows, the plain scan its TID
+// list — operators_index.go's M0092-0001 note), both walk the leaf chain
+// through nbtree.RangeScanWithPosLeafFilter, and the leaf filter decides per
+// leaf block which worker's list an entry lands in. Exactly one worker owns
+// each leaf, so the union over workers is the whole scan exactly once, and the
+// per-Next heap fetch then runs only over that worker's TIDs.
 func attachParallelIndexScan(op Operator, st *parallelIndexScanState) bool {
 	if st == nil {
 		return false
 	}
 	switch x := op.(type) {
 	case *indexOnlyScanOp:
+		x.pidx = st
+		return true
+	case *indexScanOp:
 		x.pidx = st
 		return true
 	case *filterOp:
@@ -269,4 +357,115 @@ func attachParallelIndexScan(op Operator, st *parallelIndexScanState) bool {
 		return attachParallelIndexScan(x.child, st)
 	}
 	return false
+}
+
+// parallelClaimSet is the COMPLETE set of shared work-claim state a Gather (or
+// Gather Merge) hands to each participant's child tree — one field per claim
+// kind the executor knows about.
+//
+// It exists because `gatherOp` and `gatherMergeOp` are a sibling pair that must
+// agree, and did not: gatherOp attached all three kinds, gatherMergeOp attached
+// only the sequential-scan allocator. A Gather Merge over a partial INDEX path
+// therefore had every worker walk the WHOLE index, and the merge returned
+// (workers+1) copies of every row — in the correct ORDER, which is what made it
+// silent. Measured on the C-19f fixture before this type existed: 5802 / 8703 /
+// 14505 rows at 1 / 2 / 4 workers against a serial 2901.
+//
+// The planner worked around the gap by admitting seq-scan-driven subpaths only
+// (C-19f, docs/design/planner-c19f-parallel-hashjoin/DESIGN.md), so the defect
+// was unreachable from SQL — and unreachable also means untested. Centralising
+// the state here means a future claim kind is added in ONE place and both
+// consumers get it; TestParallelClaimSetAttachesEveryKind fails if a field is
+// added without an arm in attachAll.
+type parallelClaimSet struct {
+	// pscan is the shared block allocator for a parallel sequential scan.
+	pscan *parallelScanState
+	// pbm is the shared page allocator for a parallel bitmap heap scan (S5.6).
+	// Unlike the others it is nil until prebuildBitmap runs, because the leader
+	// must build the TIDBitmap once before fan-out.
+	pbm *parallelBitmapState
+	// pidx is the shared leaf-block claim set for a parallel index or
+	// index-only scan (M0134-0189, C-19c).
+	pidx *parallelIndexScanState
+}
+
+// newParallelClaimSet builds the claim state that needs no pre-pass. pbm is
+// filled in later by prebuildBitmap, when the plan contains a bitmap scan.
+func newParallelClaimSet() *parallelClaimSet {
+	return &parallelClaimSet{
+		pscan: newParallelScanState(0),
+		pidx:  newParallelIndexScanState(),
+	}
+}
+
+// attachAll wires every claim kind into op's driving scan. It reports whether
+// ANY kind attached.
+//
+// The return value is NOT a safe-fallback signal, and no caller treats it as
+// one. A tree with an unattached driving scan does not "stay serial": each
+// participant runs a complete scan and the node returns N copies of every row.
+// What actually keeps that from happening is the planner's producer, which
+// refuses to build a partial subtree whose driving scan it cannot model
+// (createGatherPlan). The executor cannot re-derive that here, because an
+// injected child tree may legitimately be a non-scan source. So: precondition
+// owned by the planner, reported (not enforced) here.
+func (cs *parallelClaimSet) attachAll(op Operator) bool {
+	if cs == nil {
+		return false
+	}
+	attached := attachParallelScan(op, cs.pscan)
+	attached = attachParallelBitmapScan(op, cs.pbm) || attached
+	attached = attachParallelIndexScan(op, cs.pidx) || attached
+	return attached
+}
+
+// prebuildBitmap builds the TIDBitmap once before fan-out so workers
+// share the result rather than each running their own index scan. (S5.6)
+//
+// C-19f/E-10: hoisted off gatherOp so gatherMergeOp runs the same pre-pass.
+// This mirrors the pattern of prebuildSharedHashJoins: the leader builds the bitmap
+// eagerly, publishes the sorted block list in a shared atomic allocator, and
+// workers claim disjoint pages from it.
+func (cs *parallelClaimSet) prebuildBitmap(ctx *Context, planChild optimizer.Node, buildChild func() (Operator, error)) error {
+	// Decide from the PLAN, before building anything.
+	if !optimizer.HasBitmapScan(planChild) {
+		return nil
+	}
+	// EX0-03b: prebuild throwaway tree — scope explicitly NIL
+	// (uninstrumented, exactly today's behavior). Its drains would
+	// double-count the same plan keys into a worker/leader table, and
+	// the bitmap tree is never even closed, so its loops would leak.
+	tree, err := buildUnderNilScope(buildChild)
+	if err != nil {
+		return err
+	}
+	var bmOps []*bitmapHeapScanOp
+	collectBitmapScans(tree, &bmOps)
+	if len(bmOps) == 0 {
+		return nil
+	}
+	// A partial subtree should have exactly one driving scan. If multiple
+	// bitmap scans appear (unexpected), fall back rather than guessing which
+	// one to share.
+	if len(bmOps) > 1 {
+		return nil
+	}
+	bm := bmOps[0]
+	if err := bm.Open(ctx); err != nil {
+		return err
+	}
+	// Build the bitmap.
+	tbm, err := bm.outerBitmap.buildBitmap(ctx)
+	if err != nil {
+		bm.Close()
+		return err
+	}
+	bm.tbm = tbm
+	bm.iter = tbmBeginIterate(tbm)
+	bm.ownBitmap = true
+
+	// Publish the sorted block list for workers.
+	cs.pbm = newParallelBitmapState()
+	cs.pbm.init(tbm)
+	return nil
 }

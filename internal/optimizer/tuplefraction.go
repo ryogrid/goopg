@@ -1,5 +1,9 @@
 package optimizer
 
+import (
+	"github.com/goopg/goopg/internal/parser"
+)
+
 // M0127-P5.7-b — the LIMIT fraction: what makes a startup cost SELECTABLE.
 //
 // PG oracle: `preprocess_limit` (planner.c:2577) turns the query's LIMIT/OFFSET
@@ -212,6 +216,80 @@ func limitClauseEstimate(e Expr, isCount bool) int64 {
 		return 0
 	}
 	return v
+}
+
+// limitTuplesFromEstimates is the absolute half of `preprocess_limit`'s
+// arithmetic (planner.c:2636-2650) as `cost_tuplesort` consumes it: the
+// `limit_tuples` bound, i.e. count+offset when the LIMIT is a usable bound,
+// or -1 when it is not. C-13b reads it for the ORDERED upper rel; C-17's
+// fraction threading is the other half and stays untouched.
+//
+// -1 (no bound) when: no LIMIT clause (an OFFSET alone is not a bound —
+// upstream only sets `limit_tuples` from the count); WITH TIES; either
+// clause present-but-not-constant (the 10% punt is a FRACTION for
+// `tuple_fraction`, not an absolute bound for the heap).
+//
+// WITH TIES note: the `-1` is conservative goopg divergence, not PG
+// fidelity. Upstream's PLANNER sets `limit_tuples = count+offset` with no
+// ties exception (planner.c:1461-1462); it is the EXECUTOR's
+// `compute_tuples_needed` that returns -1 for ties (nodeLimit.c:430-437),
+// and PG 18.3 therefore costs the heap discount on a sort its executor
+// runs unbounded. Matching that would price a discount that never
+// executes; -1 overstates those rare sorts instead. Zero shape risk either
+// way (single-candidate ORDERED rel).
+func limitTuplesFromEstimates(count, offset int64, withTies bool) float64 {
+	if withTies {
+		return -1
+	}
+	if count == 0 {
+		return -1
+	}
+	if count < 0 || offset < 0 {
+		return -1
+	}
+	return float64(count) + float64(offset)
+}
+
+// limitTuplesForOrderedSort resolves the statement's LIMIT/OFFSET against
+// the FROM-clause context and returns the `limit_tuples` bound C-13b hands
+// the ORDERED upper rel, or -1. Resolution here mirrors the `*Limit` build
+// below (same `resolveExpr`, same `limitClauseEstimate` states: 0 absent,
+// positive estimate, -1 present-but-not-constant); on a resolution error it
+// returns -1 and the later build raises the error itself.
+func limitTuplesForOrderedSort(s *parser.SelectStmt, ctx *resolveContext) float64 {
+	if s == nil || s.WithTies {
+		return -1
+	}
+	var count, offset int64
+	if s.Limit != nil {
+		count = limitBoundClause(s.Limit, ctx, true)
+	}
+	if s.Offset != nil {
+		offset = limitBoundClause(s.Offset, ctx, false)
+	}
+	return limitTuplesFromEstimates(count, offset, false)
+}
+
+// limitBoundClause estimates one LIMIT/OFFSET clause for the bound. Only
+// bare literals (`*parser.IntegerConst`, `*parser.NullConst`) are resolved:
+// they resolve without touching subqueries or CTE references, while
+// anything else — a `LIMIT (SELECT …)`, a parameter, a column — would plan
+// or probe real work only to be discarded here (the `*Limit` build resolves
+// it again below). Skipping resolution is outcome-identical: goopg does not
+// const-fold LIMIT expressions (ledger 2026-08-05) and `constInt` accepts
+// only `*IntegerConst`, so every non-literal estimates as present-but-not-
+// constant (-1) through the resolver too.
+func limitBoundClause(e parser.Expr, ctx *resolveContext, isCount bool) int64 {
+	switch e.(type) {
+	case *parser.IntegerConst, *parser.NullConst:
+		r, err := resolveExpr(e, ctx)
+		if err != nil {
+			return -1
+		}
+		return limitClauseEstimate(r, isCount)
+	default:
+		return -1
+	}
 }
 
 // compareFractionalPathCosts is `compare_fractional_path_costs`

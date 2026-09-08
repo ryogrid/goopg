@@ -1,0 +1,25 @@
+=== Q20
+Sort  (cost=94991.08..94991.35 rows=108 width=52)
+  Sort Key: supplier.s_name
+  ->  Hash Right Semi Join  (cost=257.77..94987.43 rows=108 width=52)
+        Hash Cond: (partsupp.ps_suppkey = supplier.s_suppkey)
+        ->  Nested Loop  (cost=0.42..94718.91 rows=2693 width=5)
+              ->  Seq Scan on part  (cost=0.00..6699.00 rows=2020 width=6)
+                    Filter: ((p_name)::text ~~ 'forest%'::text)
+              ->  Index Scan using partsupp_part_fkidx on partsupp  (cost=0.42..43.56 rows=1 width=11)
+                    Index Cond: (ps_partkey = part.p_partkey)
+                    Filter: (ps_availqty > (SubPlan 1))
+                    SubPlan 1
+                      ->  Aggregate  (cost=8.46..8.47 rows=1 width=32)
+                            ->  Index Scan using lineitem_part_supp_fkidx on lineitem  (cost=0.43..8.46 rows=1 width=5)
+                                  Index Cond: ((l_partkey = partsupp.ps_partkey) AND (l_suppkey = partsupp.ps_suppkey))
+                                  Filter: ((l_shipdate >= '1994-01-01'::date) AND (l_shipdate < '1995-01-01 00:00:00'::timestamp without time zone))
+        ->  Hash  (cost=252.34..252.34 rows=400 width=57)
+              ->  Nested Loop  (cost=11.38..252.34 rows=400 width=57)
+                    ->  Seq Scan on nation  (cost=0.00..1.31 rows=1 width=4)
+                          Filter: (n_name = 'CANADA'::bpchar)
+                    ->  Bitmap Heap Scan on supplier  (cost=11.38..247.03 rows=400 width=61)
+                          Recheck Cond: (s_nationkey = nation.n_nationkey)
+                          ->  Bitmap Index Scan on supplier_nation_fkidx  (cost=0.00..11.29 rows=400 width=0)
+                                Index Cond: (s_nationkey = nation.n_nationkey)
+

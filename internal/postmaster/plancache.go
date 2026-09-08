@@ -5,8 +5,10 @@ package postmaster
 // Architecture:
 //   - 16 shards, each holding an RWMutex + map[string]planner.Node.
 //   - Max 32 entries per shard = 512 total entries.
-//   - Key: planCacheKey(sql, dbOid) — normalizeCompatSQL(sql) (lowercase,
-//     whitespace-collapsed, trailing-semicolon stripped) prefixed with the
+//   - Key: planCacheKey(sql, dbOid, fingerprint) — the session's planner
+//     context (plannerCacheFingerprint: full PlannerSettings plus the four
+//     scan-method toggles) joined to normalizeCompatSQL(sql) (lowercase,
+//     whitespace-collapsed, trailing-semicolon stripped) and prefixed with the
 //     querying connection's effective table/index namespace oid
 //     (catalog.NamespaceDBOid). This matches across sessions sending the
 //     same SQL even with minor whitespace differences, AND across

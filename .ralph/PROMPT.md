@@ -297,7 +297,7 @@ roll-up (`docs/test-port/postgres-oracle-target-inventory.md`) and the
   files changed**, and is now machine-enforced by `.githooks/pre-commit`
   (run `make install-hooks` once). Never `git commit --no-verify`.
 - If tests fail: fix them as part of your current work
-- Keep .ralph/AGENT.md updated with build/run instructions
+- Keep AGENT.md updated with build/run instructions
 - Document the WHY behind tests and implementations
 - No placeholder implementations - build it properly
 - Reserve a concrete design-doc filename before coding (use `docs/design/<milestone-or-spec-id>-NNNN-short-slug.md`, e.g. `root-0001-...` or `0002-0001-...`; never use bare `NNNN-*` placeholders)
@@ -396,10 +396,10 @@ EXIT_SIGNAL: true is reserved for genuine completion (every fix_plan item [x] AN
 passing AND specs satisfied). Everything else is EXIT_SIGNAL: false.
 
 ## File Structure
+- `AGENT.md`: Project build and run instructions
 - `.ralph/`: Ralph-specific configuration and documentation
   - `specs/`: Project specifications and requirements
   - `fix_plan.md`: Prioritized TODO list for all of milestones
-  - `AGENT.md`: Project build and run instructions
   - `PROMPT.md`: This file — Ralph development instructions
   - `logs/`: Loop execution logs
   - `deferral_ledger.md`: Deferral tracking ledger

@@ -56,6 +56,8 @@ package optimizer
 // fallback because a canonical pathkey is per-EC by construction; goopg's
 // pathkeys are syntactic (pathkeys.go, design ch. 04 §2.1) and so can collide
 // without the classifier having said so.
+import "github.com/goopg/goopg/internal/parser"
+
 type mergeKeyGroup struct {
 	outerKey PathKey
 	innerKey PathKey
@@ -235,7 +237,7 @@ func mergeInnerSortKeys(groups []mergeKeyGroup, outerKeys []PathKey, outer RelSe
 // subtree). The base order is therefore the clause order, which is stable and
 // deterministic; the heuristic is a ranking of paths that all get generated
 // anyway, so its absence costs a tie-break, not a path. Ledgered.
-func sortInnerAndOuter(joinrel, outer, inner *RelOptInfo, cp costParams, keys, residual []*restrictInfo, mergeTuplesFor func([]*restrictInfo) float64, scanSelFor func([]*restrictInfo) (float64, float64)) {
+func sortInnerAndOuter(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp costParams, jt parser.JoinType, keys, residual []*restrictInfo, mergeTuplesFor func([]*restrictInfo) float64, scanSelFor func([]*restrictInfo) (float64, float64), paramSrc RelSet) {
 	groups := mergeKeyGroups(keys, outer.Relids)
 	if len(groups) == 0 {
 		// PG's `if (extra->mergeclause_list == NIL) return` (:1372). A pair
@@ -263,7 +265,13 @@ func sortInnerAndOuter(joinrel, outer, inner *RelOptInfo, cp costParams, keys, r
 		// pathkeys makes that a property of the construction instead of a
 		// check — the groups partition `keys`, so the concatenation is a
 		// permutation of it.
-		addMergeJoinPath(joinrel, outer, inner, cp, outerKeys, innerKeys, mergeClauses, residual, mergeTuplesFor, scanSelFor)
+		addMergeJoinPath(joinrel, outer, inner, cp, jt, outerKeys, innerKeys, mergeClauses, residual, mergeTuplesFor, scanSelFor, paramSrc)
+		// E-20 Cut 3: PG's `sort_inner_and_outer` loop offers a partial
+		// mergejoin per ordering (`cheapest_partial_outer` +
+		// `cheapest_safe_inner`, joinpath.c:1535-1545), beside the serial
+		// offer above. The delivered ordering here IS the loop's ordering
+		// (resultKeys == outerKeys), exactly as the serial call passes.
+		addPartialMergeJoinPath(s, joinrel, outer, inner, cp, jt, outerKeys, outerKeys, innerKeys, mergeClauses, residual, mergeTuplesFor, scanSelFor, paramSrc)
 	}
 }
 
@@ -292,12 +300,12 @@ func rotateToFront(groups []mergeKeyGroup, front int) []mergeKeyGroup {
 //     but it is what makes P5.4c-ii's ordered index paths worth anything, and
 //     writing it now means that slice adds a producer rather than also having to
 //     add the consumer.
-//   - A still-parameterised result is refused (:1073-1081). `param_source_rels`
-//     is empty in v1 (`paramSourceRels`, joinpathsnli.go), so any non-empty
-//     `required_outer` fails PG's own overlap test — no goopg-only gate is
-//     needed here, unlike the NLI arm, because merge has no `allow_star_schema_join`
-//     escape. The two `PATH_PARAM_BY_REL` refusals `sort_inner_and_outer` makes
-//     first (:1397-1399) are the caller's: `addPathsToJoinrel` already made
+//   - A still-parameterised result is refused (:1073-1081) unless this
+//     joinrel's `param_source_rels` wants it (C-08 derivation, threaded
+//     as `paramSrc`). No goopg-only gate is needed here, unlike the NLI
+//     arm, because merge has no `allow_star_schema_join` escape. The two
+//     `PATH_PARAM_BY_REL` refusals `sort_inner_and_outer` makes first
+//     (:1397-1399) are the caller's: `addPathsToJoinrel` already made
 //     them, for both directions, before reaching this arm.
 //   - The join's output ordering is the OUTER's ordering (`build_join_pathkeys`,
 //     pathkeys.c:1295 — "normally the same as the outer path's keys"). For a
@@ -307,7 +315,7 @@ func rotateToFront(groups []mergeKeyGroup, front int) []mergeKeyGroup {
 //     goopg keeps it whole, which can only leave `addPath` distinguishing two
 //     paths PG would have merged — more paths considered, never fewer, and
 //     never a different winner on cost. Ledgered.
-func addMergeJoinPath(joinrel, outer, inner *RelOptInfo, cp costParams, outerKeys, innerKeys []PathKey, mergeClauses, residual []*restrictInfo, mergeTuplesFor func([]*restrictInfo) float64, scanSelFor func([]*restrictInfo) (float64, float64)) {
+func addMergeJoinPath(joinrel, outer, inner *RelOptInfo, cp costParams, jt parser.JoinType, outerKeys, innerKeys []PathKey, mergeClauses, residual []*restrictInfo, mergeTuplesFor func([]*restrictInfo) float64, scanSelFor func([]*restrictInfo) (float64, float64), paramSrc RelSet) {
 	o, i := outer.CheapestTotal, inner.CheapestTotal
 	if o == nil || i == nil {
 		return
@@ -316,7 +324,31 @@ func addMergeJoinPath(joinrel, outer, inner *RelOptInfo, cp costParams, outerKey
 	// sort keys ARE the result's pathkeys. The arm that consumes an ordering it
 	// did not choose (P5.4c-ii-c) passes a different pair, which is why
 	// `tryMergeJoinPath` takes the two separately.
-	tryMergeJoinPath(joinrel, o, i, cp, outerKeys, outerKeys, innerKeys, mergeClauses, residual, mergeTuplesFor, scanSelFor)
+	tryMergeJoinPath(joinrel, o, i, cp, jt, outerKeys, outerKeys, innerKeys, mergeClauses, residual, mergeTuplesFor, scanSelFor, paramSrc)
+}
+
+// buildJoinPathkeys is the ONE rule of `build_join_pathkeys` (pathkeys.c:1295)
+// that is not "return the outer's keys unchanged": a FULL or RIGHT join
+// delivers NO ordering.
+//
+// The reason is the null-extended rows. A merge join streams the outer in
+// order, so an INNER or LEFT join's output is in the outer's order — but a
+// FULL or RIGHT join must also emit the inner rows that matched nothing, and
+// those are injected wherever the merge happens to reach them, not at the
+// position the outer ordering would put them. PG returns NIL and so does this.
+//
+// Added 2026-09-07 with C-07's seam half, and the timing is the point. Until
+// then a merge path's `Pathkeys` were read only INSIDE the search, by another
+// merge's sort-skip branch, where an over-claim costs a wrong cost at worst.
+// Now the ordering escapes to the ORDERED upper rel and can DELETE the ORDER BY
+// Sort, so the same over-claim would be a WRONG ANSWER — rows returned out of
+// order with a correct row count, the class that no row-count gate can see.
+func buildJoinPathkeys(jt parser.JoinType, outerKeys []PathKey) []PathKey {
+	switch jt {
+	case parser.JoinFull, parser.JoinRight:
+		return nil
+	}
+	return outerKeys
 }
 
 // tryMergeJoinPath is `try_mergejoin_path` proper (joinpath.c:1029) over two
@@ -333,16 +365,17 @@ func addMergeJoinPath(joinrel, outer, inner *RelOptInfo, cp costParams, outerKey
 // `outerSortKeys` / `innerSortKeys` are PG's `outersortkeys` / `innersortkeys`
 // with PG's NIL convention: an empty list means "this side needs no sort". The
 // explicit re-check below (:1091-1097) makes passing them harmless either way.
-func tryMergeJoinPath(joinrel *RelOptInfo, o, i *Path, cp costParams, resultKeys, outerSortKeys, innerSortKeys []PathKey, mergeClauses, residual []*restrictInfo, mergeTuplesFor func([]*restrictInfo) float64, scanSelFor func([]*restrictInfo) (float64, float64)) {
+func tryMergeJoinPath(joinrel *RelOptInfo, o, i *Path, cp costParams, jt parser.JoinType, resultKeys, outerSortKeys, innerSortKeys []PathKey, mergeClauses, residual []*restrictInfo, mergeTuplesFor func([]*restrictInfo) float64, scanSelFor func([]*restrictInfo) (float64, float64), paramSrc RelSet) {
 	if o == nil || i == nil {
 		return
 	}
 	// `calc_non_nestloop_required_outer` (:1071): a merge join discharges
 	// nothing, so the result is parameterised by the union of its inputs'
-	// requirements. With an empty `param_source_rels` that is only acceptable
-	// when it is empty.
+	// requirements. Acceptable iff empty or wanted by this joinrel's
+	// `param_source_rels` (C-08 derivation, computed once per
+	// addPathsToJoinrel call).
 	req := calcNonNestloopRequiredOuter(o, i)
-	if req != 0 && !relsOverlap(req, paramSourceRels()) {
+	if req != 0 && !relsOverlap(req, paramSrc) {
 		return
 	}
 
@@ -357,8 +390,12 @@ func tryMergeJoinPath(joinrel *RelOptInfo, o, i *Path, cp costParams, resultKeys
 	// Row counts from the CHILD PATHS (03 §9 rule 3), as everywhere else in
 	// path generation. A Sort propagates its subpath's count unchanged, so for
 	// a parameterised input this is still the per-parameterisation count —
-	// which the refusal above has already ruled out, but the rule is written
-	// once rather than per-arm.
+	// which the refusal above has ruled out UNLESS this joinrel's
+	// param_source_rels wants it (C-08). An admitted parameterised merge
+	// therefore carries the full `joinrel.Rows` with no `ppi_rows` sizer
+	// (costing-only overestimate, safe direction; ledgered as the merge
+	// half of the NLI P5.6 deferral — `createPlan` panics loud on a
+	// parameterised merge that ever got chosen, so no wrong-plan path).
 	// `mergejointuples` (costsize.c:3960-4045), NOT joinrel.Rows.
 	//
 	// joinrel.Rows is what survives EVERY join clause. The merge operator emits
@@ -386,11 +423,12 @@ func tryMergeJoinPath(joinrel *RelOptInfo, o, i *Path, cp costParams, resultKeys
 
 	addPath(joinrel, &Path{
 		Kind:          PathMergeJoin,
+		Jointype:      jt, // C-03b; see addHashJoinPath.
 		DisabledNodes: disabledNodesFor(!cp.enableMergeJoin, op, ip),
 		Rel:      joinrel,
 		Rows:     joinrel.Rows,
 		Cost:     cost,
-		Pathkeys: resultKeys,
+		Pathkeys: buildJoinPathkeys(jt, resultKeys),
 		// Children[0] is the outer (streaming left) side, Children[1] the
 		// inner — the same convention the hash and nested-loop arms use, so
 		// P5.5's createPlan reads one layout for every join kind. When a side
@@ -400,6 +438,8 @@ func tryMergeJoinPath(joinrel *RelOptInfo, o, i *Path, cp costParams, resultKeys
 		HashKeys:      mergeClauses,
 		Residual:      residual,
 		RequiredOuter: req,
+			// create_mergejoin_path (pathnode.c:2660). C-19a.
+		ParallelSafe: parallelSafeWith(joinrel, op, ip),
 	}, "mergejoin")
 }
 
@@ -416,11 +456,24 @@ func tryMergeJoinPath(joinrel *RelOptInfo, o, i *Path, cp costParams, resultKeys
 // `PathSort` (path.go) finally has a producer. Ledgered as a representational
 // divergence.
 //
-// The Sort is deliberately NOT offered to `addPath`: it belongs to this merge
-// candidate, not to the input relation's pathlist, and adding it there would let
-// a sort generated for one pair change another pair's `CheapestTotal`. PG's
-// equivalent paths are likewise private to the MergePath.
+// The Sort is deliberately NOT offered to `addPath` by the merge caller: it
+// belongs to this merge candidate, not to the input relation's pathlist, and
+// adding it there would let a sort generated for one pair change another pair's
+// `CheapestTotal`. PG's equivalent paths are likewise private to the MergePath.
+// The ORDERED upper rel (`addOrderedPaths`, upperordered.go, C-12) is the one
+// caller that DOES offer the result to `addPath` — there the Sort is the rel's
+// own candidate, which is `create_ordered_paths`' use of `create_sort_path`.
 func sortPathFor(sub *Path, keys []PathKey, cp costParams) *Path {
+	return sortPathForBounded(sub, keys, cp, -1)
+}
+
+// sortPathForBounded is `sortPathFor` with `cost_tuplesort`'s `limit_tuples`
+// (C-13b): the absolute count+offset bound, or <= 0 for none. The merge-join
+// side has no LIMIT context above an input sort and always passes -1, so its
+// number is unchanged; the ORDERED upper rel (`addOrderedPaths`) passes the
+// statement's bound. Split rather than re-signed so the merge callers — and
+// the concurrent work above them — do not move.
+func sortPathForBounded(sub *Path, keys []PathKey, cp costParams, limitTuples float64) *Path {
 	// `cost_sort` charges the comparison work as STARTUP — nothing emerges
 	// until the sort is complete — on top of the subpath's total, and the
 	// per-row emit at run.
@@ -430,16 +483,23 @@ func sortPathFor(sub *Path, keys []PathKey, cp costParams) *Path {
 	// `hashJoinCost` prices its batch files with, so the merge candidate and the
 	// hash candidate for one joinrel are charged for the same bytes at the same
 	// rate. Passing `relNCols(sub.Rel)` rather than the SORT path's own width is
-	// exact: a Sort projects nothing, so its output rows are its input's.
-	s := costSortRun(cp, sub.Rows, relNCols(sub.Rel))
+	// exact: a Sort projects nothing, so its output rows are its input's. The
+	// rel's `AvgVarBytes` rides along for the same reason (spill-calibration
+	// Cut 1): it is the statistic `hashJoinCost` sizes the rival's build with.
+	s := costSortRun(cp, sub.Rows, relNCols(sub.Rel), relAvgVarBytes(sub.Rel), limitTuples)
 	return &Path{
-		Kind:          PathSort,
+		Kind: PathSort,
+		// B-17a: `cost_sort`'s own flag on top of the input's count
+		// (costsize.c:2144). The producer is not skipped when off.
+		DisabledNodes: disabledNodesFor(!cp.enableSort, sub),
 		Rel:           sub.Rel,
 		Rows:          sub.Rows,
 		Cost:          Cost{Startup: sub.Cost.Total + s.Startup, Total: sub.Cost.Total + s.Total},
 		Pathkeys:      keys,
 		Children:      []*Path{sub},
 		RequiredOuter: sub.RequiredOuter,
-		ParallelSafe:  sub.ParallelSafe,
+		// create_sort_path (pathnode.c:3065): `rel->consider_parallel &&
+		// subpath->parallel_safe`. C-19a.
+		ParallelSafe: parallelSafeWith(sub.Rel, sub),
 	}
 }

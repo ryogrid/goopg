@@ -771,10 +771,32 @@ func collectUnnestParams(node Node) []unnestParam {
 // present in the scan schema (should not happen for a base-table index)
 // is skipped, which makes the OuterColumnRef unaccounted and the whole
 // subquery bail — the safe direction.
-// Gated OFF by default pending index-driven semi/anti execution.
+// **Default ON** (`indexKeyHarvestFromEnv` answers true for an unset
+// variable); `GOOPG_INDEXKEY_HARVEST=off` is the escape hatch. This
+// comment previously said "Gated OFF by default", which contradicted the
+// code — corrected 2026-09-05 while measuring C-20c.
+//
 // Measured at SF1 on 2026-07-21 with the harvest enabled: Q2 10.87 s →
 // 3.36 s and Q22 7.83 s → 1.66 s, but Q4 3.87 s → 276.08 s, Q17 58.27 s →
-// 86.65 s, Q20 12.29 s → 26.57 s. The regressions are not a defect in this
+// 86.65 s, Q20 12.29 s → 26.57 s.
+//
+// **Re-measured 2026-09-05** (pinned-statistics regime, SF=1, serial,
+// on/off arms back to back). The catastrophic Q4 case is gone — the
+// prerequisite execution work landed in the meantime — but the flag is
+// still live in BOTH directions, so the off path is not dead code:
+//
+//	        harvest ON (default)   harvest OFF
+//	Q2       0.97 s                 1.05 s
+//	Q4       2.27 s                 1.46 s
+//	Q17      0.65 s                 0.75 s
+//	Q20      1.70 s                 1.99 s
+//	Q22      1.17 s                 0.79 s
+//
+// Q4 and Q22 are materially faster with the harvest OFF; Q2, Q17 and Q20
+// are faster with it ON. That is why C-20c (retire this flag) cannot close
+// on its stated gate of byte-identical plans for the flip: the flip is not
+// plan-neutral, and deleting the off path would lock in the slower side of
+// two queries. The regressions are not a defect in this
 // harvest — the decorrelated plans are correct — but a consequence of
 // goopg executing every semi/anti join as a HASH join. A selective
 // correlated EXISTS (Q4 probes ~57 K date-filtered orders through
@@ -1051,10 +1073,29 @@ func walkPlanExprs(node Node, visit func(Expr)) {
 		}
 	case *OrdinalityWrap:
 		walkPlanExprs(n.Child, visit)
+	case *Gather:
+		// C-19g's upper-rel-resident half: a Gather can now appear in the
+		// tree BEFORE `Plan()`'s tail passes run, where previously the only
+		// producer (`MaybeAddGather`) ran after all of them. Without these two
+		// arms the walker stops dead at the Gather and `lowerSubPlanParams`
+		// never discovers a sublink host inside the partial subtree — the
+		// sublink stays on the legacy OuterRows path (slower, not wrong), and
+		// every other reader of this walker silently under-reports.
+		//
+		// It cannot make the MUTATING readers (remapOuterRefsInSubplan,
+		// collectUnnestParams) see anything new in practice: those run while
+		// planning a sublink's inner plan, and a nested planning scope is
+		// refused a parallel candidate outright (`ParallelStatementOK`).
+		walkPlanExprs(n.Child, visit)
+	case *GatherMerge:
+		walkPlanExprs(n.Child, visit)
 	case *Aggregate:
 		walkPlanExprs(n.Child, visit)
 		for _, g := range n.GroupExprs {
 			walkExprTree(g, visit)
+		}
+		for _, p := range n.Passthrough {
+			walkExprTree(p, visit)
 		}
 		for _, a := range n.Aggs {
 			if a.Arg != nil {
@@ -1065,6 +1106,9 @@ func walkPlanExprs(node Node, visit func(Expr)) {
 			}
 			for _, ea := range a.ExtraArgs {
 				walkExprTree(ea, visit)
+			}
+			if a.Filter != nil {
+				walkExprTree(a.Filter, visit)
 			}
 			for _, sk := range a.OrderBy {
 				walkExprTree(sk.Expr, visit)
@@ -1138,6 +1182,22 @@ func walkPlanExprs(node Node, visit func(Expr)) {
 		}
 		for _, k := range n.OrderBy {
 			walkExprTree(k.Expr, visit)
+		}
+		for _, f := range n.Funcs {
+			for _, a := range f.Args {
+				walkExprTree(a, visit)
+			}
+			if f.Filter != nil {
+				walkExprTree(f.Filter, visit)
+			}
+		}
+		if n.Frame != nil {
+			if n.Frame.StartOffset != nil {
+				walkExprTree(n.Frame.StartOffset, visit)
+			}
+			if n.Frame.EndOffset != nil {
+				walkExprTree(n.Frame.EndOffset, visit)
+			}
 		}
 	case *Values:
 		for _, row := range n.Rows {

@@ -17,7 +17,7 @@ from .collector import collect_go_files
 from .config import Config, load_config
 from .reports import print_console_summary, write_all
 from .runner import ToolNotFoundError, analyze
-from .sourcemetrics import duplication_pct, scan_sources
+from .sourcemetrics import DuplicationResult, duplication_analysis, scan_sources
 from .stats import build_summary
 
 # Default parent directory for timestamped report dirs (beside the tool).
@@ -144,9 +144,9 @@ def main(argv: list[str] | None = None) -> None:
     sources = scan_sources(files, base=args.base)
     if args.no_duplication:
         total_code = sum(fs.loc for fs in sources.values())
-        duplication = (0.0, 0, total_code)
+        duplication = DuplicationResult(0.0, 0, total_code)
     else:
-        duplication = duplication_pct(sources, config.duplication_min_lines)
+        duplication = duplication_analysis(sources, config.duplication_min_lines)
 
     generated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")

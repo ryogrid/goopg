@@ -93,6 +93,37 @@ func IndexRealPages(idx *Index) (int64, bool) {
 	return RelNBlocksFunc(storage.RelFileNode{TblOid: idx.Tablespace, DBOid: dbOid, RelOid: idx.OID, Fork: storage.MainFork})
 }
 
+// TableRealPages reports tbl's real main-fork size in blocks, when the storage
+// hook is wired and the fork exists. It is `IndexRealPages`' sibling and PG's
+// own input: `estimate_rel_size` fills `rel->pages` from a live
+// `RelationGetNumberOfBlocks()` call (plancat.c:1097-1100), and
+// `compute_parallel_worker` (allpaths.c:4274) sizes a partial path on that
+// figure — NOT on `pg_class.relpages`, which ANALYZE maintains and which goopg
+// does not restore at startup at all (deferral ledger pq-P6).
+//
+// That distinction is the whole reason this exists: a planner-side worker count
+// keyed on ANALYZE statistics refuses every query on a freshly started server,
+// while looking like a deliberate policy. C-19g's upper-rel-resident partial
+// aggregation reads it through `optimizer.tableRealPages`.
+//
+// The dbOid/tablespace resolution mirrors (*InMemory).RelFileNode less the
+// receiver's default-db state, exactly as IndexRealPages mirrors
+// IndexRelFileNode.
+func TableRealPages(tbl *Table) (int64, bool) {
+	if tbl == nil || RelNBlocksFunc == nil {
+		return 0, false
+	}
+	dbOid := DefaultDBOid
+	if tbl.DBOid != 0 {
+		dbOid = tbl.DBOid
+	}
+	relOID := tbl.OID
+	if tbl.RelFileNodeOID != 0 {
+		relOID = tbl.RelFileNodeOID
+	}
+	return RelNBlocksFunc(storage.RelFileNode{TblOid: tbl.Tablespace, DBOid: dbOid, RelOid: relOID, Fork: storage.MainFork})
+}
+
 // relAllVisibleFor renders the relallvisible column for one table via the
 // bootstrap-provided hook; "0" when unavailable.
 func (c *InMemory) relAllVisibleCell(t *Table) string {
@@ -4353,6 +4384,31 @@ func (c *InMemory) AllStatistics() []*StatisticsObject {
 	for _, obj := range c.statisticsObjs {
 		out = append(out, obj)
 	}
+	return out
+}
+
+// StatisticsObjectsForTable returns a snapshot of the statistics objects
+// defined on the table with the given OID (pg_statistic_ext.stxrelid), in
+// name order for determinism. B-05a: the ANALYZE extended-statistics hook
+// (fetch_statentries_for_relation in
+// postgres/src/backend/statistics/extended_stats.c:128) needs exactly this
+// per-relation lookup; the pre-existing AllStatistics snapshot would force
+// every ANALYZE to filter the whole registry itself.
+func (c *InMemory) StatisticsObjectsForTable(tableOID uint32) []*StatisticsObject {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	var out []*StatisticsObject
+	for _, obj := range c.statisticsObjs {
+		if obj.TableOID == tableOID {
+			out = append(out, obj)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Schema != out[j].Schema {
+			return out[i].Schema < out[j].Schema
+		}
+		return out[i].Name < out[j].Name
+	})
 	return out
 }
 

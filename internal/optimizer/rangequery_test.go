@@ -115,6 +115,45 @@ func TestNullTestSelectivityReadsNullFrac(t *testing.T) {
 	}
 }
 
+// TestRangePairingAddsBackNullFrac pins rowest A1 (PG clausesel.c:283):
+// a paired band (lo+hi-1) double-excludes NULLs, so the column's null
+// fraction is added back. Band 20<=d<30 on a NullFrac=0.2 column must
+// estimate ~0.2 above the same band on a null-free column; without
+// stats the term stays omitted (slight under-estimate, never the
+// independent product).
+func TestRangePairingAddsBackNullFrac(t *testing.T) {
+	loC, hiC := rqBound(parser.OpGe, 20), rqBound(parser.OpLt, 30)
+	withNulls := rqScan(t)
+	withNulls.Table.Stats.Columns[0].NullFrac = 0.2
+	// Per-bound selectivities under the same stats (each bound already
+	// accounts for NULLs its own way); the pairing must add exactly the
+	// column's null fraction back on top (PG clausesel.c:283).
+	lo := clauseSelectivity(loC, withNulls)
+	hi := clauseSelectivity(hiC, withNulls)
+	got := conjunctionSelectivity([]Expr{loC, hiC}, withNulls)
+	if math.Abs(got-(lo+hi-1.0+0.2)) > 0.03 {
+		t.Errorf("paired band = %.4f, want lo+hi-1+NullFrac = %.4f+%.4f-1+0.2",
+			got, lo, hi)
+	}
+	// Punt bounds (histogram too short to read) plus a null fraction
+	// must NOT fabricate confidence: PG falls back to
+	// DEFAULT_RANGE_INEQ_SEL when either bound punted, before any
+	// null correction (0.33+0.33-1+0.5 = +0.16 trusted would be 33x
+	// over PG's 0.005).
+	short := rqScan(t)
+	short.Table.Stats.Columns[0] = catalog.ColumnStats{NDistinct: 2, Histogram: []string{"0"}, NullFrac: 0.5}
+	if got := conjunctionSelectivity([]Expr{loC, hiC}, short); math.Abs(got-defaultRangeIneqSel) > 1e-9 {
+		t.Errorf("paired punt bounds with NullFrac=0.5 = %.4f, want default %.4f", got, defaultRangeIneqSel)
+	}
+	// No stats at all: correction unavailable — falls back to the
+	// default inequality selectivity, never a fabricated correction.
+	nostats := rqScan(t)
+	nostats.Table.Stats = nil
+	if got := conjunctionSelectivity([]Expr{loC, hiC}, nostats); math.Abs(got-defaultRangeIneqSel) > 1e-9 {
+		t.Errorf("paired band without stats = %.4f, want default %.4f", got, defaultRangeIneqSel)
+	}
+}
+
 // TestNullTestSelectivityFallsBackWithoutStats mirrors nulltestsel's
 // no-statistics arm: DEFAULT_UNK_SEL / DEFAULT_NOT_UNK_SEL.
 func TestNullTestSelectivityFallsBackWithoutStats(t *testing.T) {
@@ -413,15 +452,70 @@ func TestConvertTimevalueToScalar(t *testing.T) {
 		}
 	}
 
-	// A type still outside convert_to_scalar's reach keeps the documented
-	// half-bucket default rather than silently producing a wrong number.
-	if got := bucketFraction("a", "z", "m", "text"); got != 0.5 {
-		t.Errorf("text bucketFraction = %.4f, want the 0.5 default "+
-			"(convert_string_to_scalar is not ported)", got)
+	// B-08 (take2 P1-11b remainder): text now interpolates through
+	// convert_string_to_scalar instead of the flat half-bucket default.
+	// Bucket ["c","g"] widens to the full a-z run (base 26, no common
+	// prefix), so "d" sits one quarter across: (3-2)/(6-2) = 0.25.
+	if got := bucketFraction("c", "g", "d", "text"); math.Abs(got-0.25) > 1e-9 {
+		t.Errorf("text bucketFraction = %.6f, want the interpolated 0.25 "+
+			"(convert_string_to_scalar is ported)", got)
 	}
 	// An unparseable date must also fall back rather than return 0.
 	if got := bucketFraction("2024-01-01", "2024-01-05", "not-a-date", "date"); got != 0.5 {
 		t.Errorf("unparseable date = %.4f, want the 0.5 fallback", got)
+	}
+}
+
+// TestConvertStringToScalar pins B-08, the string half of convert_to_scalar
+// (postgres/src/backend/utils/adt/selfuncs.c:4787-4906): the adaptive digit
+// range with A-Z/a-z/0-9 widening, the <9-chars full-ASCII rule, the common
+// prefix strip, and the 12-byte base-N fraction (empty scales to 0).
+func TestConvertStringToScalar(t *testing.T) {
+	// Common-prefix strip ("zoom in"): the shared "555" carries no
+	// information, so "5553000" scales as "3" over the digit range
+	// (base 10): 0.3.
+	if got := convertStringToScalar("5553000", "5551000", "5559000"); math.Abs(got-0.3) > 1e-9 {
+		t.Errorf("prefix-stripped scalar = %.6f, want 0.3", got)
+	}
+	// ... and the bucket interpolates on the stripped scale:
+	// (0.3-0.1)/(0.9-0.1) = 0.25.
+	if got := bucketFraction("5551000", "5559000", "5553000", "text"); math.Abs(got-0.25) > 1e-9 {
+		t.Errorf("stripped bucketFraction = %.6f, want 0.25", got)
+	}
+	// ASCII widening: bounds "A".."C" touch the upper-case run, so the
+	// range widens to all of A-Z (base 26) and "M" is 12/26 — not the
+	// 1.0 an unwidened 3-wide range would clamp it to.
+	if got := convertStringToScalar("M", "A", "C"); math.Abs(got-12.0/26.0) > 1e-9 {
+		t.Errorf("widened scalar = %.6f, want 12/26", got)
+	}
+	// Narrow range without a widening trigger falls back to full ASCII:
+	// bounds "!".."#" span 2, so "!" is (33-32)/96 = 1/96, not 0.
+	if got := convertStringToScalar("!", "!", "#"); math.Abs(got-1.0/96.0) > 1e-9 {
+		t.Errorf("narrow-range scalar = %.6f, want 1/96", got)
+	}
+	// Empty string scales to 0.
+	if got := convertStringToScalar("", "a", "z"); got != 0 {
+		t.Errorf("empty scalar = %.6f, want 0", got)
+	}
+	// 12-byte cap: bytes past the twelfth do not move the value.
+	long := "abcdefghijklmnop"
+	if got, want := convertStringToScalar(long, "a", "z"), convertStringToScalar(long[:12], "a", "z"); got != want {
+		t.Errorf("uncapped scalar = %.9f, truncated = %.9f, want them equal", got, want)
+	}
+}
+
+// TestStringHistogramInterpolatesAcrossTenBounds is the take2 06 §12.3
+// shape for text: 11 bounds (10 buckets) a..k, literal "du" inside bucket
+// ["d","e"]. The three share no common byte (bounds differ at once), so
+// nothing strips; over the widened a-z run lo is 78/676, hi 104/676 and
+// the literal 98/676, giving a bucket fraction of 20/26 and a selectivity
+// of 3/10 + (20/26)/10 ≈ 0.3769 — not the 0.35 the flat 0.5 gave.
+func TestStringHistogramInterpolatesAcrossTenBounds(t *testing.T) {
+	bounds := []string{"a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k"}
+	got := histogramOpSelectivity(parser.OpLt, bounds, "du", "text")
+	want := 0.3 + (20.0/26.0)/10.0
+	if math.Abs(got-want) > 1e-9 {
+		t.Errorf("10-bound text histogram selectivity = %.6f, want %.6f", got, want)
 	}
 }
 

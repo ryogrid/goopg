@@ -394,6 +394,133 @@ func TestEqJoinSelectivityIsDefaultFollowsTheDenominator(t *testing.T) {
 	}
 }
 
+// jsBucketClause builds a one-clause search whose INNER side (rel 1) carries
+// the statistics under test on its single column `k`. `filteredRows` is the
+// post-qual row count PG's rows/tuples scaling reads; pass it equal to
+// baseRows for an unfiltered relation.
+func jsBucketClause(t *testing.T, stats catalog.ColumnStats, baseRows, filteredRows int64) (*searchCtx, []*restrictInfo) {
+	t.Helper()
+	c := catalog.NewInMemory()
+	outer := jsTable(t, c, "bkt_outer", []catalog.Column{
+		{Name: "k", Type: catalog.Type{Name: "int4"}},
+	}, 1000, catalog.ColumnStats{NDistinct: 1000})
+	inner := jsTable(t, c, "bkt_inner", []catalog.Column{
+		{Name: "k", Type: catalog.Type{Name: "int4"}},
+	}, baseRows, stats)
+	s, err := newSearchCtx(2, defaultCostParams(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.relInfos = []baseRelInfo{
+		{table: outer, baseRows: 1000, filteredRows: 1000},
+		{table: inner, baseRows: baseRows, filteredRows: filteredRows},
+	}
+	l, r := jsCol(0, "k"), jsCol(1, "k")
+	ri := &restrictInfo{
+		clause:      &BinaryOp{Op: parser.OpEq, Left: l, Right: r},
+		relids:      relsetOf(0) | relsetOf(1),
+		leftKey:     l,
+		rightKey:    r,
+		leftRelids:  relsetOf(0),
+		rightRelids: relsetOf(1),
+		isEquijoin:  true,
+		ecID:        noEquivClass,
+	}
+	return s, []*restrictInfo{ri}
+}
+
+// TestEstimateHashBucketSizeSkewInflates (B-16): a hot MCV inflates the bucket
+// over 1/ndistinct. nd=10 gives avgfreq 0.1; the 0.5 MCV scales the fraction
+// 5× to 0.5 (selfuncs.c: `estfract *= mcv_freq/avgfreq`).
+func TestEstimateHashBucketSizeSkewInflates(t *testing.T) {
+	stats := catalog.ColumnStats{NDistinct: 10, MCV: []catalog.MCVEntry{{Value: "1", Frequency: 0.5}}}
+	s, clauses := jsBucketClause(t, stats, 1000, 1000)
+	if got := s.estimateHashBucketSize(clauses, relsetOf(1)); math.Abs(got-0.5) > 1e-12 {
+		t.Fatalf("bucket=%v; want 0.5 (a 0.5-hot value on 10 distinct values)", got)
+	}
+}
+
+// TestEstimateHashBucketSizeUniformIsNoOp (B-16): an MCV at or below the
+// average frequency leaves 1/ndistinct alone — the scale fires only when
+// `mcv_freq > avgfreq`.
+func TestEstimateHashBucketSizeUniformIsNoOp(t *testing.T) {
+	stats := catalog.ColumnStats{NDistinct: 10, MCV: []catalog.MCVEntry{{Value: "1", Frequency: 0.05}}}
+	s, clauses := jsBucketClause(t, stats, 1000, 1000)
+	if got := s.estimateHashBucketSize(clauses, relsetOf(1)); math.Abs(got-0.1) > 1e-12 {
+		t.Fatalf("bucket=%v; want 0.1 (1/nd, unscaled)", got)
+	}
+}
+
+// TestEstimateHashBucketSizeEmptyMCVIsNoOp (B-16): no MCV list means
+// mcv_freq=0, which can never exceed avgfreq, so the answer is 1/ndistinct.
+func TestEstimateHashBucketSizeEmptyMCVIsNoOp(t *testing.T) {
+	s, clauses := jsBucketClause(t, catalog.ColumnStats{NDistinct: 10}, 1000, 1000)
+	if got := s.estimateHashBucketSize(clauses, relsetOf(1)); math.Abs(got-0.1) > 1e-12 {
+		t.Fatalf("bucket=%v; want 0.1 (1/nd, unscaled)", got)
+	}
+}
+
+// TestEstimateHashBucketSizeClampBounds (B-16): the MCV scale can overshoot
+// on both ends — a hot value over nulls pushes past 1, a huge ndistinct
+// pushes below 1e-6 — and PG clamps both.
+func TestEstimateHashBucketSizeClampBounds(t *testing.T) {
+	// avgfreq=(1-0.5)/10=0.05; 0.1 × (0.8/0.05) = 1.6 → clamped to 1.
+	hot := catalog.ColumnStats{NDistinct: 10, NullFrac: 0.5, MCV: []catalog.MCVEntry{{Value: "1", Frequency: 0.8}}}
+	s, clauses := jsBucketClause(t, hot, 1000, 1000)
+	if got := s.estimateHashBucketSize(clauses, relsetOf(1)); got != 1 {
+		t.Fatalf("bucket=%v; want 1 (clamped)", got)
+	}
+	// 1/2e7 = 5e-8 → floored to 1e-6.
+	flat := catalog.ColumnStats{NDistinct: 20000000}
+	s, clauses = jsBucketClause(t, flat, 20000000, 20000000)
+	if got := s.estimateHashBucketSize(clauses, relsetOf(1)); got != 1e-6 {
+		t.Fatalf("bucket=%v; want 1e-6 (floored)", got)
+	}
+}
+
+// TestEstimateHashBucketSizeDefaultArm (B-16): a resolved key with no usable
+// ndistinct reports Max(0.1, mcv_freq) — PG's isdefault arm — instead of
+// being skipped. A hotter MCV steers harder; without one the answer is
+// exactly the 0.1 that discourages hashing a large unknown inner.
+func TestEstimateHashBucketSizeDefaultArm(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		stats catalog.ColumnStats
+		want  float64
+	}{
+		{"hot MCV wins", catalog.ColumnStats{MCV: []catalog.MCVEntry{{Value: "1", Frequency: 0.3}}}, 0.3},
+		{"cold MCV loses to 0.1", catalog.ColumnStats{MCV: []catalog.MCVEntry{{Value: "1", Frequency: 0.05}}}, 0.1},
+		{"no MCV at all", catalog.ColumnStats{}, 0.1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, clauses := jsBucketClause(t, tc.stats, 6000000, 6000000)
+			if got := s.estimateHashBucketSize(clauses, relsetOf(1)); math.Abs(got-tc.want) > 1e-12 {
+				t.Fatalf("bucket=%v; want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestEstimateHashBucketSizeScalesWithFilteredRows (B-16): restriction
+// clauses thin rows uniformly, so ndistinct scales by filtered/raw before
+// the 1/nd fraction is taken. 100 distinct values over 10,000 raw rows with
+// 1,000 surviving price as 10 surviving values: a 0.1 bucket, not 0.01.
+func TestEstimateHashBucketSizeScalesWithFilteredRows(t *testing.T) {
+	s, clauses := jsBucketClause(t, catalog.ColumnStats{NDistinct: 100}, 10000, 1000)
+	if got := s.estimateHashBucketSize(clauses, relsetOf(1)); math.Abs(got-0.1) > 1e-12 {
+		t.Fatalf("bucket=%v; want 0.1 (nd 100 → 10 under a 10× filter)", got)
+	}
+}
+
+// TestEstimateHashBucketSizeUnresolvedIsZero: the default arm must not swallow
+// the "no information" contract — a key that resolves to no statistic at all
+// still answers 0, and `hashJoinCost` still skips the walk term on it.
+func TestEstimateHashBucketSizeUnresolvedIsZero(t *testing.T) {
+	s := jsCtx(t)
+	if got := s.estimateHashBucketSize(nil, relsetOf(1)); got != 0 {
+		t.Fatalf("bucket=%v; want 0 (no clauses, no information)", got)
+	}
+}
 // TestJoinClauseSelectivityExtConstantArmsAreDefaults: every arm that answers
 // with a selfuncs.h constant reports itself as a guess, which is what makes
 // 04 §3.3's fallback cap fire on an inequality join between two fully analysed

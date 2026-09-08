@@ -1,0 +1,21 @@
+=== Q18
+Sort  (cost=486946.95..488130.80 rows=473537 width=79)
+  Sort Key: orders.o_totalprice DESC, orders.o_orderdate
+  ->  HashAggregate  (cost=436389.50..442308.71 rows=473537 width=79)
+        Group Key: customer.c_custkey, orders.o_orderkey
+        ->  Nested Loop  (cost=233181.62..432837.97 rows=473537 width=52)
+              ->  Hash Join  (cost=233181.18..280243.50 rows=118397 width=53)
+                    Hash Cond: (orders.o_custkey = customer.c_custkey)
+                    ->  Hash Join  (cost=226144.18..272895.69 rows=118397 width=34)
+                          Hash Cond: (orders.o_orderkey = lineitem_1.l_orderkey)
+                          ->  Seq Scan on orders  (cost=0.00..42814.00 rows=1500000 width=28)
+                          ->  Hash  (cost=224664.22..224664.22 rows=118397 width=6)
+                                ->  HashAggregate  (cost=219336.34..224664.22 rows=118397 width=6)
+                                      Group Key: lineitem_1.l_orderkey
+                                      Filter: (sum(lineitem_1.l_quantity) > '313'::numeric)
+                                      ->  Seq Scan on lineitem lineitem_1  (cost=0.00..189339.56 rows=5999356 width=11)
+                    ->  Hash  (cost=5162.00..5162.00 rows=150000 width=25)
+                          ->  Seq Scan on customer  (cost=0.00..5162.00 rows=150000 width=25)
+              ->  Index Scan using idx_lineitem_orderkey_fkidx on lineitem  (cost=0.43..1.12 rows=17 width=11)
+                    Index Cond: (l_orderkey = orders.o_orderkey)
+

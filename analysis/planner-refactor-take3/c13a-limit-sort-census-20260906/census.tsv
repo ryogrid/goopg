@@ -1,0 +1,101 @@
+query	bindable	limit	sort_est_rows	sort_actual_input_rows	sort_output_rows	width	sort_ms	query_ms	sort_method	space_kb	sort_child_node
+Q51	direct	100	2246	324249	100	136	1.9	12710	quicksort	7362	WindowAgg (2 funcs)
+Q78	direct	100	1	245587	45	240	0.0	17912	quicksort	38	Hash Left Join
+Q67	direct	100	11738	115150	100	212	1.0	11532	quicksort	559	WindowAgg (1 funcs)
+Q47	direct	100	1	43626	100	196	35.7	12094	quicksort	12553	CTE Scan on v2
+Q1	direct	100	8	25329	100	1076	9.5	2879	quicksort	26210	Hash Join
+Q28	none	100	1	18372	18372	428	20.3	31699	quicksort	19808	Seq Scan on store_sales_1
+Q28	none	100	1	18083	18083	428	15.8	31699	quicksort	19496	Seq Scan on store_sales_5
+Q41	direct	100	66	18000	1	480	0.0	8824	quicksort	2	Seq Scan on item i1
+Q57	direct	100	1	17189	100	228	12.5	6775	quicksort	6146	CTE Scan on v2
+Q14	direct	100	113	17170	100	84	7.9	52386	quicksort	4916	HashAggregate (4 keys, 5 grouping sets)
+Q28	none	100	1	16563	16563	428	17.7	31699	quicksort	17857	Seq Scan on store_sales_3
+Q28	none	100	1	16276	16276	428	15.1	31699	quicksort	17548	Seq Scan on store_sales_2
+Q28	none	100	1	15410	15410	428	13.5	31699	quicksort	16614	Seq Scan on store_sales
+Q28	none	100	1	15406	15406	428	12.8	31699	quicksort	16610	Seq Scan on store_sales_4
+Q59	direct	100	351606	15288	100	584	4.1	10550	quicksort	14930	Hash Join
+Q22	direct	100	9460201	11987	100	160	12.0	10788	quicksort	3223	HashAggregate (4 keys, 5 grouping sets)
+Q79	direct	100	384	7575	100	428	8.4	80383	quicksort	8757	Nested Loop
+Q27	direct	100	3	6175	100	196	0.9	9642	quicksort	2137	HashAggregate (2 keys, 3 grouping sets)
+Q46	direct	100	233	4958	100	816	4.7	35334	quicksort	9202	Nested Loop
+Q18	direct	100	281	4130	100	352	2.5	31715	quicksort	2314	HashAggregate (4 keys, 5 grouping sets)
+Q7	direct	100	1	2847	100	160	0.2	10518	quicksort	716	HashAggregate
+Q98	none		597	2128	2128	224	0.9	3842	quicksort	965	WindowAgg (1 funcs)
+Q26	direct	100	1	1822	100	160	0.1	6625	quicksort	458	HashAggregate
+Q21	direct	100	565	1765	100	72	0.1	2172	quicksort	209	HashAggregate
+Q89	direct	100	1	1730	100	228	1.6	1638	quicksort	662	WindowAgg (1 funcs)
+Q53	direct	100	1	1686	100	68	1.0	1005	quicksort	214	WindowAgg (1 funcs)
+Q20	direct	100	5374	1506	100	224	0.7	2374	quicksort	686	WindowAgg (1 funcs)
+Q60	direct	100	85	1450	100	64	0.1	14780	quicksort	159	HashAggregate
+Q65	direct	100	2496	1422	100	1232	1.5	14869	quicksort	4037	Hash Join
+Q35	direct	100	27777	1286	100	320	0.5	11708	quicksort	975	HashAggregate
+Q68	direct	100	142	1045	100	848	0.7	14322	quicksort	1989	Nested Loop
+Q12	direct	100	107310	932	100	224	0.4	2835	quicksort	427	WindowAgg (1 funcs)
+Q63	direct	100	1	818	100	68	0.2	914	quicksort	104	WindowAgg (1 funcs)
+Q72	direct	100	1	740	100	92	0.1	5898	quicksort	287	HashAggregate
+Q33	direct	100	85	689	100	36	0.3	14849	quicksort	65	HashAggregate
+Q71	none		1	580	580	76	0.3	15435	quicksort	146	HashAggregate
+Q14	direct	100	1	579	100	168	0.5	63143	quicksort	332	Nested Loop
+Q56	direct	100	85	554	100	64	0.2	13813	quicksort	61	HashAggregate
+Q5	direct	100	11940	508	100	160	0.0	21886	quicksort	141	HashAggregate (2 keys, 3 grouping sets)
+Q76	direct	100	67352	470	100	144	0.1	2160	quicksort	167	HashAggregate
+Q40	direct	100	4666	425	100	128	0.1	1479	quicksort	88	HashAggregate
+Q69	direct	100	187	391	100	140	0.1	14724	quicksort	117	HashAggregate
+Q81	direct	100	1	362	100	844	0.1	7139	quicksort	194	Hash Join
+Q80	direct	100	57	356	100	160	0.0	17141	quicksort	99	HashAggregate (2 keys, 3 grouping sets)
+Q34	none		1	187	187	340	0.1	8069	quicksort	198	Nested Loop
+Q75	direct	100	43	184	100	112	0.1	10654	quicksort	121	Hash Join
+Q62	direct	100	359432	150	100	136	0.0	3159	quicksort	61	HashAggregate
+Q30	direct	100	1	145	31	844	0.6	5521	quicksort	58	Hash Join
+Q19	direct	100	1	138	100	104	0.1	325	quicksort	37	HashAggregate
+Q15	direct	100	147	134	100	64	0.0	5872	quicksort	14	HashAggregate
+Q52	direct	100	1	109	100	72	0.1	274	quicksort	23	HashAggregate
+Q99	direct	100	720657	90	90	136	0.0	6999	quicksort	37	HashAggregate
+Q39	none		1	75	75	280	0.0	5118	quicksort	55	Hash Join
+Q55	direct	100	1	73	73	68	0.0	162	quicksort	12	HashAggregate
+Q16	none	100	4	71	71	2076	0.1	13580	quicksort	379	Hash Anti Join
+Q6	direct	100	66	49	37	40	0.0	13144	quicksort	4	HashAggregate
+Q77	direct	100	2289	44	44	132	0.0	14353	quicksort	11	HashAggregate (2 keys, 3 grouping sets)
+Q3	direct	100	1	31	31	72	0.0	111	quicksort	7	HashAggregate
+Q95	none	100	2	28	28	2000	16.9	14953	quicksort	143	Hash Semi Join
+Q49	direct	100	1	25	25	84	0.0	15736	quicksort	7	HashSetOp Union
+Q31	none		1	19	19	432	0.4	13879	quicksort	23	Hash Join
+Q42	direct	100	1	10	10	72	0.0	313	quicksort	2	HashAggregate
+Q44	direct	100	505	10	10	984	5.9	5919	quicksort	27	Nested Loop
+Q11	direct	100	1	8	8	1168	0.6	16367	quicksort	18	Hash Join
+Q45	direct	100	73	7	7	96	0.0	2860	quicksort	2	HashAggregate
+Q74	direct	100	1	7	7	656	2.7	11424	quicksort	9	Hash Join
+Q43	direct	100	1	6	6	288	0.0	8115	quicksort	3	HashAggregate
+Q50	direct	100	1	6	6	332	0.0	691	quicksort	5	HashAggregate
+Q66	direct	100	21	5	5	1352	0.0	7641	quicksort	11	HashAggregate
+Q83	direct	100	25	3	3	108	0.0	2592	quicksort	1	Hash Join
+Q39	none		1	2	2	280	0.3	4643	quicksort	2	Hash Join
+Q64	none		1	2	2	944	0.0	18958	quicksort	4	Hash Join
+Q94	none	100	1	2	2	2000	774.1	2924	quicksort	11	Hash Anti Join
+Q16	direct	100	1	1	1	72	0.0	13580	quicksort	1	Aggregate
+Q41	none	100	66	1	1	32	0.0	8824	quicksort	1	Unique
+Q61	direct	100	1	1	1	64	0.0	2593	quicksort	1	Nested Loop
+Q73	none		1	1	1	340	534.0	10198	quicksort	2	Nested Loop
+Q90	direct	100	1	1	1	16	0.0	4781	quicksort	1	Nested Loop
+Q91	none		1	1	1	192	0.0	3024	quicksort	1	HashAggregate
+Q92	direct	100	1	1	1	32	0.0	4846	quicksort	1	Aggregate
+Q94	direct	100	1	1	1	72	0.0	2924	quicksort	1	Aggregate
+Q95	direct	100	1	1	1	72	0.0	14953	quicksort	1	Aggregate
+Q96	direct	100	1	1	1	8	0.0	7151	quicksort	1	Aggregate
+Q2	none		111			456		10666	quicksort	877	Hash Join
+Q4	direct	100	1	0	0	1752	0.0	0	quicksort	0	Hash Join
+Q8	direct	100	12	0	0	64	0.0	0	quicksort	0	HashAggregate
+Q10	direct	100	70	0	0	152	0.0	0	quicksort	0	HashAggregate
+Q17	direct	100	1	0	0	312	0.0	0	quicksort	0	HashAggregate
+Q23	direct	100	18	0	0	96	0.0	0	quicksort	0	Append
+Q24	none		1	0	0	128	0.0	0	quicksort	0	HashAggregate
+Q24	none		1	0	0	128	0.0	0	quicksort	0	HashAggregate
+Q25	direct	100	1	0	0	224	0.0	0	quicksort	0	HashAggregate
+Q29	direct	100	1	0	0	140	0.0	0	quicksort	0	HashAggregate
+Q37	direct	100	85	0	0	96	0.0	0	quicksort	0	HashAggregate
+Q54	direct	100	1	0	0	12	0.0	0	quicksort	0	HashAggregate
+Q58	direct	100	1	0	0	192	0.0	0	quicksort	0	Hash Join
+Q82	direct	100	85	0	0	96	0.0	0	quicksort	0	HashAggregate
+Q84	descent	100	314			1252		667	quicksort	13	Hash Join
+Q85	direct	100	1	0	0	128	0.0	0	quicksort	0	HashAggregate
+Q93	direct	100	41131	0	0	36	0.0	0	quicksort	0	HashAggregate

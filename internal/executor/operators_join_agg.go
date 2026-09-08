@@ -17,6 +17,7 @@ import (
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/optimizer"
 	"github.com/goopg/goopg/internal/storage"
+	"github.com/goopg/goopg/internal/utils/mmgr"
 )
 
 // joinRowCTID carries the heap tuple identifier captured for one left-side row
@@ -71,6 +72,24 @@ type joinOp struct {
 	lazyIntHash   map[int64][]Row
 	lazyHashIsInt bool
 
+	// EX3-02 Cut 1 (stratum B): per-joinOp build arena for variable-width
+	// payloads (dense_build.go). Parented to the statement context, released
+	// at Close in the serial case; a shared-adopted arena (applySharedBuild)
+	// is owned by sharedHashBuild until statement end (buildBytesShared).
+	// Row headers stay per-row — this covers payloads only.
+	buildBytes       *mmgr.Context
+	buildBytesShared bool
+
+	// EX3-02 Cut 2 (stratum D): per-joinOp build arena for Datum cells.
+	// The struct copy lands in buildCells.AllocAligned(w*48, 8) and the
+	// retained Row is a view over the chunk. Same statement-parenting and
+	// serial teardown as stratum B; no shared flag — workers never retain
+	// (single leader build loop by construction), so shared-adopted cells
+	// cannot exist (see ensureBuildCells). Buf-carrying rows never enter
+	// this arena (F1 whole-row heap rule); dense rows bypass rowPool and
+	// must never reach releaseRow.
+	buildCells *mmgr.Context
+
 	// M0127-P2.2 (05 §5, stage E4): the executor's key plan, resolved once
 	// per Open from planner.Join.ExecHashKeyPlan. execKeys holds EVERY
 	// equi-pair the hash table is keyed on — goopg carried one since M0003 —
@@ -123,6 +142,19 @@ type joinOp struct {
 	// wrong-key join. See join_merge_key.go.
 	mergeKeys     []optimizer.JoinKeyPair
 	mergeResidual optimizer.Expr
+
+	// E-05 (EX4-02): the merge twin of the execExprs slab above —
+	// compiled merge-side key accessors + residual, evaluated with
+	// evalFastExpr. Separate slab by discipline (single algo per Open;
+	// both slabs rebuild unconditionally, so neither can go stale).
+	// mergeResidSlot is the DEDICATED reusable residual slot (never
+	// o.slot — nextMerge reuses that for output); rebound per pair.
+	mergeExprs        exprTreeSlab
+	mergeKeyNodesL    []int32
+	mergeKeyNodesR    []int32
+	mergeResidualNode int32
+	mergeResidSlot    *MaterializedSlot
+	mergeCompiled     bool
 
 	// M0127-P4.1 (07 §2): the streaming merge join. Non-nil for the whole
 	// life of a JoinAlgoMerge Open, and the reason Next has a third arm:
@@ -212,13 +244,16 @@ type joinOp struct {
 	// M0127-P3.2 (06 §2.2-2.4): hybrid-hash batching state. nil means the
 	// build was projected to fit work_mem, or batching was declined for this
 	// join shape (joinBatchEligible) — either way every path below behaves as
-	// it did before batching existed. noBatch is the caller-side decline used
-	// by the shared (parallel) build, whose published table workers read
-	// without ever seeing this state. batchKeySlot re-presents a row reloaded
-	// from an inner batch file to the build key expression.
-	batches      *hashBatchState
-	noBatch      bool
-	batchKeySlot *MaterializedSlot
+	// it did before batching existed. noBatch is a caller-side decline that
+	// nothing sets today (E-09a publishes a spilling shared build; each
+	// participant then holds a PRIVATE state over the shared inner files —
+	// join_batch.go newParticipantBatchState).
+	//
+	// E-14 removed batchKeySlot along with buildKeyOfRow: a reloaded inner
+	// row now carries its canonical hash-table key in the spill frame, so
+	// nothing re-presents it to the build key expression.
+	batches *hashBatchState
+	noBatch bool
 
 	// M0122-0011: NullAware (NOT IN) anti-join build-side state,
 	// computed once in openLazyHashJoin's build loop. Real NOT IN
@@ -285,6 +320,28 @@ type joinOp struct {
 	// maybeInstrument; nil when EXPLAIN ANALYZE is not active. Incremented
 	// each time joinPredicateMatchSlot returns false (residual reject).
 	joinFilterRemoved *int64
+
+	// deformLeftBound / deformRightBound are the EX1-02 per-side deform
+	// bounds the tree builder used for THIS join's two children
+	// (deformJoinBounds, scan_deform.go). They are stamped by the Join arms
+	// of buildNode and buildRec purely so the cooperative parallel hash
+	// build can REBUILD the build-side subtree with the identical bound.
+	//
+	// It has to be recorded rather than re-derived because the bound depends
+	// on the `incoming` bound from everything ABOVE the join, which the
+	// build phase cannot see. parallelBuildLazyHashTable used to rebuild the
+	// build subtree through BuildWorker, i.e. at the ROOT bound
+	// (deformBoundNone) — so a build side of the shape `Filter(dk > 3) ->
+	// SeqScan` was rebuilt as if `dk` were the only column anyone reads, the
+	// scan deformed [0,1) and every later column came back NULL. The join
+	// then returned the right number of rows with a NULL payload, silently.
+	// See TestCoopParallelHashBuildValuesAcrossWorkMem.
+	//
+	// Fail-closed: newJoinOp initialises both to deformBoundFull, so a
+	// joinOp built by any path that does NOT stamp them deforms full rows
+	// (slower, never wrong).
+	deformLeftBound  int
+	deformRightBound int
 }
 
 func newJoinOp(plan *optimizer.Join, left, right Operator) *joinOp {
@@ -300,7 +357,13 @@ func newJoinOp(plan *optimizer.Join, left, right Operator) *joinOp {
 	if plan != nil {
 		residual = plan.Predicate
 	}
-	return &joinOp{plan: plan, left: left, right: right, schema: schema, execResidual: residual}
+	return &joinOp{
+		plan: plan, left: left, right: right, schema: schema, execResidual: residual,
+		// Fail-closed default: full deform. Only the tree builders know the
+		// real per-side bounds, and they stamp them right after this call.
+		deformLeftBound:  deformBoundFull,
+		deformRightBound: deformBoundFull,
+	}
 }
 
 func (o *joinOp) setJoinFilterRemoveCounter(p *int64) { o.joinFilterRemoved = p }
@@ -484,7 +547,7 @@ func (o *joinOp) openLazyHashJoin(ctx *Context) error {
 	// than shipping it in sharedHashBuild) makes that agreement structural.
 	o.initExecKeys()
 	if sb := lookupSharedHashBuild(ctx, o.plan); sb != nil {
-		o.applySharedBuild(sb)
+		o.applySharedBuild(ctx, sb)
 		return o.openProbeSide(ctx, sb.probeIsLeft)
 	}
 	probeIsLeft, err := o.buildLazyHashTable(ctx)
@@ -555,6 +618,11 @@ func (o *joinOp) buildLazyHashTable(ctx *Context) (bool, error) {
 	o.fillNullIdx = 0
 	o.probeEOF = false
 	o.fillSweepReset()
+	// EX3-02 Cut 1: a re-Open that skipped Close must not inherit the
+	// previous run's stratum-B arena (nor keep a stale shared adoption).
+	// Cut 2: same for the stratum-D cell arena (never shared-adopted).
+	o.releaseBuildBytes()
+	o.releaseBuildCells()
 	// M0054-0005b: hoist the per-iteration `nullRow(...)` allocation
 	// out of the build loop. The hash-key evaluation only needs the
 	// other-side columns to be present so column-index resolution
@@ -581,6 +649,14 @@ func (o *joinOp) buildLazyHashTable(ctx *Context) (bool, error) {
 	// map[int64] table can never be built for a join that probes with a
 	// composite key.
 	o.lazyHashIsInt = !o.multiKey() && o.plan.HashKeysAreInt64()
+
+	// EX3-02 Cut 1: stratum-B arena for this build, parented to the
+	// statement context. Covers the serial loops below and the cooperative
+	// parallel consumer (single leader loop by construction, §3.7).
+	// Cut 2: stratum-D cell arena alongside it — the dense path requires
+	// both, and retainBuildRow degrades to legacy unless both are set.
+	o.ensureBuildBytes(ctx)
+	o.ensureBuildCells(ctx)
 
 	// M0129-S4.1: cooperative parallel hash build — N goroutines scan+filter
 	// the build table while one goroutine owns the hash map
@@ -655,6 +731,10 @@ func (o *joinOp) recordBuildTime(ctx *Context, start time.Time) {
 // where the operator is never Closed at all) is P3.3.
 func (o *joinOp) releaseBatches() {
 	if o.batches != nil {
+		// E-09b: clear this operator's pointer to the shared batch table
+		// before the reference is dropped, so the freeing refcount cannot
+		// leave the operator aliasing a table it no longer holds.
+		o.batches.releaseHeldBatch(o)
 		o.batches.close()
 		o.batches = nil
 	}
@@ -816,9 +896,9 @@ func (o *joinOp) buildLoopLeft(ctx *Context, rightWidth int) error {
 				return err
 			}
 			if ok {
-				o.fileCompositeBuildRow(ownedBuildRow(l))
+				o.fileCompositeBuildRow(o.retainBuildRow(l))
 			} else {
-				o.recordBuildNullKey(ownedBuildRow(l))
+				o.recordBuildNullKey(o.retainBuildRow(l))
 			}
 			continue
 		}
@@ -829,10 +909,10 @@ func (o *joinOp) buildLoopLeft(ctx *Context, rightWidth int) error {
 		if !ok {
 			// M0127-P4.2: a NULL key matches nothing, which under RIGHT/FULL
 			// is precisely why the row has to be kept.
-			o.recordBuildNullKey(ownedBuildRow(l))
+			o.recordBuildNullKey(o.retainBuildRow(l))
 			continue
 		}
-		if err := o.insertBuildRow(kd, ownedBuildRow(l)); err != nil {
+		if err := o.insertBuildRow(kd, o.retainBuildRow(l)); err != nil {
 			return err
 		}
 	}
@@ -886,9 +966,9 @@ func (o *joinOp) buildLoopRight(ctx *Context, leftWidth int) error {
 				return err
 			}
 			if ok {
-				o.fileCompositeBuildRow(ownedBuildRow(r))
+				o.fileCompositeBuildRow(o.retainBuildRow(r))
 			} else {
-				o.recordBuildNullKey(ownedBuildRow(r))
+				o.recordBuildNullKey(o.retainBuildRow(r))
 			}
 			continue
 		}
@@ -905,7 +985,7 @@ func (o *joinOp) buildLoopRight(ctx *Context, leftWidth int) error {
 			}
 			// M0127-P4.2: see buildLoopLeft — under RIGHT/FULL the NULL-key
 			// row is unmatched by construction, not absent.
-			o.recordBuildNullKey(ownedBuildRow(r))
+			o.recordBuildNullKey(o.retainBuildRow(r))
 			continue
 		}
 		// M0127-P0.3 (05 §4, stage E3): Semi/Anti go through the same
@@ -915,7 +995,7 @@ func (o *joinOp) buildLoopRight(ctx *Context, leftWidth int) error {
 		// made up front there is nothing left for them to opt out of.
 		// Their NullAware / emit-once invariants live in the counters above
 		// and in nextLazy, neither of which reads the key representation.
-		if err := o.insertBuildRow(kd, ownedBuildRow(r)); err != nil {
+		if err := o.insertBuildRow(kd, o.retainBuildRow(r)); err != nil {
 			return err
 		}
 	}
@@ -928,6 +1008,12 @@ func (o *joinOp) buildLoopRight(ctx *Context, leftWidth int) error {
 // because the producer's next Next may Reset the arena, while the non-arena
 // case keeps the cheap O(width) struct copy. Dropping either half re-opens the
 // M0097-0058 aliasing class — build rows must never alias a scan buffer.
+// EX3-02 Cut 1: the build loops now retain through retainBuildRow (stratum-B
+// payloads); Cut 2 adds the stratum-D cell packing there. This stays as the
+// no-arena-context fallback and the cross-path primitive — semantics
+// bit-identical by pin. It is also the whole-row heap path for rows stratum
+// D cannot take (F1 Buf-carriers, non-arena rows): retainBuildRowHeap shares
+// this header discipline, differing only in payload destination.
 func ownedBuildRow(row Row) Row {
 	if rowHasArena(row) {
 		return cloneRowOwned(row)
@@ -1165,6 +1251,61 @@ func (o *joinOp) lazyHashInsertDatum(keyDatum Datum, row Row) {
 	}
 	sk := datumKey(keyDatum)
 	o.lazyHash[sk] = append(o.lazyHash[sk], row)
+}
+
+// spillKeyOfDatum canonicalises a build key Datum into the form the hash
+// table is keyed by, so a spilled inner row can be re-filed on reload without
+// re-evaluating the build key expression (E-14; spill.go's keyed-frame
+// header). It mirrors lazyHashInsertDatum's lane choice EXACTLY, including
+// the int-lane fallback: a datum the int64 lane cannot represent is filed
+// under datumKey, which is the same string demoteIntHash would have produced
+// for it. The two must agree — a disagreement files a reloaded row in a
+// bucket no probe visits, which is a silent lost-rows bug, not a slow one.
+func (o *joinOp) spillKeyOfDatum(keyDatum Datum) spillRowKey {
+	if o.lazyHashIsInt {
+		if ik, ok := datumToInt64Key(keyDatum); ok {
+			return spillIntKey(ik)
+		}
+	}
+	return spillStrKey(datumKey(keyDatum))
+}
+
+// lazyHashInsertKeyed files a reloaded row under a canonical key recovered
+// from its spill frame, rather than from a key Datum.
+//
+// The lane the key was WRITTEN in and the lane the table is in NOW can differ:
+// a build that demoted mid-flight (demoteIntHash) spilled int-lane keys before
+// the demotion and is a string table afterwards. That case is handled by the
+// same conversion demoteIntHash performs — canonicalNumericKey(ik, 0) — which
+// its own comment establishes is exact.
+//
+// The reverse (a string key arriving at an int table) cannot happen: the table
+// only ever leaves the int lane, never returns to it. It is still handled,
+// by demoting, because "cannot happen" is how rows get lost silently.
+func (o *joinOp) lazyHashInsertKeyed(k spillRowKey, row Row) {
+	switch k.tag {
+	case spillKeyInt:
+		if o.lazyHashIsInt {
+			if o.lazyIntHash == nil {
+				o.lazyIntHash = make(map[int64][]Row)
+			}
+			o.lazyIntHash[k.i] = append(o.lazyIntHash[k.i], row)
+			return
+		}
+		if o.lazyHash == nil {
+			o.lazyHash = make(map[string][]Row)
+		}
+		sk := canonicalNumericKey(k.i, 0)
+		o.lazyHash[sk] = append(o.lazyHash[sk], row)
+	case spillKeyStr:
+		if o.lazyHashIsInt {
+			o.demoteIntHash()
+		}
+		if o.lazyHash == nil {
+			o.lazyHash = make(map[string][]Row)
+		}
+		o.lazyHash[k.s] = append(o.lazyHash[k.s], row)
+	}
 }
 
 // demoteIntHash abandons the int64 representation mid-build and re-keys
@@ -1571,7 +1712,10 @@ func (o *joinOp) nextLazy() (TupleSlot, error) {
 				}
 				// Release the files as soon as the last batch drains, but
 				// keep the state itself: Close() is what retires it, and the
-				// counters are what EXPLAIN reads (P3.5).
+				// counters are what EXPLAIN reads (P3.5). E-09b: nextBatch
+				// already dropped the hold on the last batch's shared table
+				// when it found nothing left, so nothing is still resident
+				// here — the NULL-key sweep below reads fillNullBuild only.
 				o.batches.close()
 			}
 			// The NULL-keyed build rows belong to no batch, so they are swept
@@ -1795,6 +1939,13 @@ func (o *joinOp) Close() error {
 	o.closeLateralStream()
 	o.lazyHash = nil
 	o.lazyIntHash = nil
+	// EX3-02 Cut 1: drop the stratum-B arena with the table. A
+	// shared-adopted arena is only dereferenced here (statement end
+	// reclaims it); the serial arena is Released eagerly.
+	// Cut 2: drop the stratum-D cell arena alongside it (always owned —
+	// shared-adopted cells cannot exist, so this is unconditionally eager).
+	o.releaseBuildBytes()
+	o.releaseBuildCells()
 	o.lazyProbe = nil
 	o.lazyProbeSrc = nil
 	o.lazyMatches = nil
@@ -1838,6 +1989,22 @@ type aggregateOp struct {
 	sharedUserStateSet     []bool
 	sharedUserStateVersion []int64 // which currentRowVersion last updated this slot
 	currentRowVersion      int64   // incremented per input row
+
+	// E-06 (EX4-03): compiled per-call transition expressions. Node
+	// lists run parallel to plan.Aggs; extraNodes/orderNodes are
+	// per-call lists. aggDeclined marks whole-call UserAgg declines
+	// (shared transition machinery stays interpreted). Compiled once
+	// per Open; the window helper (bare struct, never Opened) runs
+	// interpreted via the idx<0 path.
+	aggExprs       exprTreeSlab
+	aggArgNodes    []int32
+	aggFilterNodes []int32
+	aggArg2Nodes   []int32
+	aggExtraNodes  [][]int32
+	aggOrderNodes  [][]int32
+	aggWGOrderNodes [][]int32
+	aggDeclined    []bool
+	aggCompiled    bool
 }
 
 // groupRuntime is one accumulated output group: the GROUP BY key values, the
@@ -1963,6 +2130,39 @@ func newAggregateOp(plan *optimizer.Aggregate, child Operator) *aggregateOp {
 	return &aggregateOp{plan: plan, child: child, schema: plan.Output()}
 }
 
+// aggPlanUsesCTID reports whether an Aggregate plan evaluates any expression
+// against its child slots that can observe the TID side-channel — i.e.
+// whether any group key, aggregate argument, FILTER, ORDER BY / WITHIN GROUP
+// key, or passthrough expression contains a *optimizer.CTIDExpr. Only the
+// node's OWN expressions are scanned (never the child's): a ctid buried in
+// the subtree below the sort is some other operator's concern. EX3-05 Cut A.
+func aggPlanUsesCTID(p *optimizer.Aggregate) bool {
+	if p == nil {
+		return false
+	}
+	if exprTreeUsesCTID(p.GroupExprs...) || exprTreeUsesCTID(p.Passthrough...) {
+		return true
+	}
+	for i := range p.Aggs {
+		call := &p.Aggs[i]
+		if exprTreeUsesCTID(call.Arg, call.Arg2, call.Filter) ||
+			exprTreeUsesCTID(call.ExtraArgs...) {
+			return true
+		}
+		for _, sk := range call.OrderBy {
+			if exprTreeUsesCTID(sk.Expr) {
+				return true
+			}
+		}
+		for _, sk := range call.WithinGroupOrderBy {
+			if exprTreeUsesCTID(sk.Expr) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func (o *aggregateOp) Open(ctx *Context) error {
 	o.ctx = ctx
 	o.idx = 0 // reset read cursor — o.rows is rebuilt below, so always start at 0
@@ -1980,6 +2180,14 @@ func (o *aggregateOp) Open(ctx *Context) error {
 		defer delete(ctx.PartialAggStates, o.plan.PartialSource)
 	}
 
+	// EX3-05 Cut A: aggregate args/group keys/passthrough are evaluated
+	// against the child slots (evalExprSlot), so a ctid reference there
+	// (`SELECT max(ctid::text) ...` over a sorted grouping) reads the sort's
+	// TID side-channel. Enable it on the spine below before the child
+	// drains; otherwise leave sorts disabled.
+	if aggPlanUsesCTID(o.plan) {
+		markSortWantCTIDs(o.child)
+	}
 	if err := o.child.Open(ctx); err != nil {
 		return err
 	}
@@ -1996,6 +2204,15 @@ func (o *aggregateOp) Open(ctx *Context) error {
 	o.sharedUserStateSet = make([]bool, nSlots)
 	o.sharedUserStateVersion = make([]int64, nSlots)
 	o.currentRowVersion = 0
+
+	// E-06: compile the transition expressions once per Open (same-split
+	// discipline: nodes derive from the plan.Aggs calls the loops
+	// evaluate). Rebuilt unconditionally. Direct-driven ops (window
+	// helper, tests) never run this: every eval site falls back to
+	// interpreted unless aggCompiled with matching node lists (same
+	// trust root as the same-length plan: plan.Aggs mutates only at
+	// build, pre-Open).
+	o.compileAggExprs()
 
 	// Sorted aggregation (M0134-0001 S8): when the node is marked
 	// AggStrategySorted the child is expected to deliver rows already ordered
@@ -2123,7 +2340,7 @@ func (o *aggregateOp) Open(ctx *Context) error {
 						continue
 					}
 				}
-				if err := o.applyAgg(&gr.aggs[i], call, slot); err != nil {
+				if err := o.applyAgg(&gr.aggs[i], call, slot, i); err != nil {
 					return err
 				}
 			}
@@ -2538,7 +2755,7 @@ func (o *aggregateOp) openSorted(ctx *Context) error {
 					continue
 				}
 			}
-			if err := o.applyAgg(&cur.aggs[i], call, slot); err != nil {
+			if err := o.applyAgg(&cur.aggs[i], call, slot, i); err != nil {
 				return err
 			}
 		}
@@ -2563,11 +2780,92 @@ func sameGroupKey(a, b []string) bool {
 	return true
 }
 
-func (o *aggregateOp) applyAgg(st *aggRuntime, call optimizer.AggregateCall, slot TupleSlot) error {
+// compileAggExprs compiles each aggregate call's transition expressions
+// into this op's slab (E-06, the agg twin of compileExecExprs). Called
+// once per Open from the plan.Aggs calls the loops evaluate
+// (same-split discipline). Whole-call decline for UserAgg (their args
+// stay interpreted — see aggEvalVal). Rebuilds unconditionally;
+// direct-driven ops (window helper, tests) run interpreted via the
+// idx<0 / uncompiled path in aggEvalVal. Mandates buildExpr (never
+// buildExprCtx — volatile timing must not change).
+func (o *aggregateOp) compileAggExprs() {
+	o.aggExprs = o.aggExprs[:0]
+	o.aggCompiled = false
+	if o.plan == nil {
+		return
+	}
+	n := len(o.plan.Aggs)
+	o.aggArgNodes = make([]int32, n)
+	o.aggFilterNodes = make([]int32, n)
+	o.aggArg2Nodes = make([]int32, n)
+	o.aggExtraNodes = make([][]int32, n)
+	o.aggOrderNodes = make([][]int32, n)
+	o.aggWGOrderNodes = make([][]int32, n)
+	o.aggDeclined = make([]bool, n)
+	for i := range o.plan.Aggs {
+		call := &o.plan.Aggs[i]
+		if call.UserAgg != nil {
+			// Whole-call decline: Filter/Arg/Arg2/ExtraArgs/OrderBy
+			// all stay interpreted (shared transition machinery).
+			o.aggDeclined[i] = true
+			o.aggArgNodes[i] = noExpr
+			o.aggFilterNodes[i] = noExpr
+			o.aggArg2Nodes[i] = noExpr
+			continue
+		}
+		o.aggArgNodes[i] = o.aggExprs.buildExpr(call.Arg)
+		o.aggFilterNodes[i] = o.aggExprs.buildExpr(call.Filter)
+		o.aggArg2Nodes[i] = o.aggExprs.buildExpr(call.Arg2)
+		o.aggExtraNodes[i] = make([]int32, len(call.ExtraArgs))
+		for ei, ea := range call.ExtraArgs {
+			o.aggExtraNodes[i][ei] = o.aggExprs.buildExpr(ea)
+		}
+		o.aggOrderNodes[i] = make([]int32, len(call.OrderBy))
+		for ki, sk := range call.OrderBy {
+			o.aggOrderNodes[i][ki] = o.aggExprs.buildExpr(sk.Expr)
+		}
+		o.aggWGOrderNodes[i] = make([]int32, len(call.WithinGroupOrderBy))
+		for ki, sk := range call.WithinGroupOrderBy {
+			o.aggWGOrderNodes[i][ki] = o.aggExprs.buildExpr(sk.Expr)
+		}
+	}
+	o.aggCompiled = true
+}
+
+// aggEvalList evaluates one transition expression from a per-call node
+// list: the compiled fast path when this call index is compiled and not
+// declined, interpreted otherwise (window helper via idx<0, declined
+// UserAgg calls, direct-driven test ops, length mismatch). Nil
+// expressions yield NullDatum without evaluation on either path.
+func (o *aggregateOp) aggEvalList(nodes []int32, idx int, e optimizer.Expr, slot TupleSlot) (Datum, error) {
+	if e == nil {
+		return NullDatum, nil
+	}
+	if idx >= 0 && idx < len(o.aggDeclined) && !o.aggDeclined[idx] && o.aggCompiled &&
+		idx < len(nodes) {
+		return evalFastExpr(o.aggExprs, nodes[idx], slot, o.ctx)
+	}
+	return evalExprSlot(e, slot, o.ctx)
+}
+
+// aggEvalList2 is aggEvalList for per-call element lists (ExtraArgs,
+// OrderBy keys): sub selects the element. Same fallback contract.
+func (o *aggregateOp) aggEvalList2(nodes [][]int32, idx, sub int, e optimizer.Expr, slot TupleSlot) (Datum, error) {
+	if e == nil {
+		return NullDatum, nil
+	}
+	if idx >= 0 && idx < len(o.aggDeclined) && !o.aggDeclined[idx] && o.aggCompiled &&
+		idx < len(nodes) && sub >= 0 && sub < len(nodes[idx]) {
+		return evalFastExpr(o.aggExprs, nodes[idx][sub], slot, o.ctx)
+	}
+	return evalExprSlot(e, slot, o.ctx)
+}
+
+func (o *aggregateOp) applyAgg(st *aggRuntime, call optimizer.AggregateCall, slot TupleSlot, idx int) error {
 	// FILTER (WHERE condition): skip this row if the condition is false/null.
 	// M0097-0007.
 	if call.Filter != nil {
-		fv, ferr := evalExprSlot(call.Filter, slot, o.ctx)
+		fv, ferr := o.aggEvalList(o.aggFilterNodes, idx, call.Filter, slot)
 		if ferr != nil || fv.IsNull() || fv.Kind != KindBool || !fv.BoolValue() {
 			return nil // skip row — filter not satisfied
 		}
@@ -2611,7 +2909,7 @@ func (o *aggregateOp) applyAgg(st *aggRuntime, call optimizer.AggregateCall, slo
 		// If evaluation fails (e.g. rank('fred') with int ORDER BY), propagate
 		// the error so the caller sees "invalid input syntax" instead of NULL.
 		if !st.withinGroupDirectArgSet && call.Arg != nil {
-			v, verr := evalExprSlot(call.Arg, slot, o.ctx)
+			v, verr := o.aggEvalList(o.aggArgNodes, idx, call.Arg, slot)
 			if verr != nil {
 				return verr
 			}
@@ -2622,7 +2920,7 @@ func (o *aggregateOp) applyAgg(st *aggRuntime, call optimizer.AggregateCall, slo
 				st.withinGroupDirectArgs = make([]Datum, 1+len(call.ExtraArgs))
 				st.withinGroupDirectArgs[0] = v
 				for ei, ea := range call.ExtraArgs {
-					ev, eerr := evalExprSlot(ea, slot, o.ctx)
+					ev, eerr := o.aggEvalList2(o.aggExtraNodes, idx, ei, ea, slot)
 					if eerr != nil {
 						return eerr
 					}
@@ -2633,7 +2931,7 @@ func (o *aggregateOp) applyAgg(st *aggRuntime, call optimizer.AggregateCall, slo
 		row := make([]Datum, len(call.WithinGroupOrderBy))
 		allNull := true
 		for i, sk := range call.WithinGroupOrderBy {
-			v, verr := evalExprSlot(sk.Expr, slot, o.ctx)
+			v, verr := o.aggEvalList2(o.aggWGOrderNodes, idx, i, sk.Expr, slot)
 			if verr != nil {
 				return verr
 			}
@@ -2654,7 +2952,7 @@ func (o *aggregateOp) applyAgg(st *aggRuntime, call optimizer.AggregateCall, slo
 		st.count++
 		return nil
 	}
-	arg, err := evalExprSlot(call.Arg, slot, o.ctx)
+	arg, err := o.aggEvalList(o.aggArgNodes, idx, call.Arg, slot)
 	if err != nil {
 		return err
 	}
@@ -2669,13 +2967,13 @@ func (o *aggregateOp) applyAgg(st *aggRuntime, call optimizer.AggregateCall, slo
 			return nil
 		}
 		if call.Arg2 != nil {
-			a2, _ := evalExprSlot(call.Arg2, slot, o.ctx)
+			a2, _ := o.aggEvalList(o.aggArg2Nodes, idx, call.Arg2, slot)
 			if a2.IsNull() {
 				return nil
 			}
 		}
-		for _, ea := range call.ExtraArgs {
-			eav, _ := evalExprSlot(ea, slot, o.ctx)
+		for ei, ea := range call.ExtraArgs {
+			eav, _ := o.aggEvalList2(o.aggExtraNodes, idx, ei, ea, slot)
 			if eav.IsNull() {
 				return nil
 			}
@@ -2907,7 +3205,7 @@ func (o *aggregateOp) applyAgg(st *aggRuntime, call optimizer.AggregateCall, slo
 			raw := string(arg.BytesValue())
 			delimRaw := ""
 			if call.Arg2 != nil {
-				dv, _ := evalExprSlot(call.Arg2, slot, o.ctx)
+				dv, _ := o.aggEvalList(o.aggArg2Nodes, idx, call.Arg2, slot)
 				if !dv.IsNull() {
 					if b, ok := byteaOperand(dv); ok {
 						delimRaw = string(b)
@@ -2918,7 +3216,7 @@ func (o *aggregateOp) applyAgg(st *aggRuntime, call optimizer.AggregateCall, slo
 			if len(call.OrderBy) > 0 {
 				st.strElems = append(st.strElems, raw)
 				st.strDelims = append(st.strDelims, delimRaw)
-				st.strElemKeys = append(st.strElemKeys, evalAggOrderByKeys(call.OrderBy, slot, o.ctx))
+				st.strElemKeys = append(st.strElemKeys, o.evalAggOrderByKeys(call.OrderBy, idx, slot))
 				st.hasValue = true
 				break
 			}
@@ -2932,7 +3230,7 @@ func (o *aggregateOp) applyAgg(st *aggRuntime, call optimizer.AggregateCall, slo
 		// Text string_agg: evaluate the delimiter from Arg2.
 		delim := ""
 		if call.Arg2 != nil {
-			dv, derr := evalExprSlot(call.Arg2, slot, o.ctx)
+			dv, derr := o.aggEvalList(o.aggArg2Nodes, idx, call.Arg2, slot)
 			if derr != nil {
 				break
 			}
@@ -2946,7 +3244,7 @@ func (o *aggregateOp) applyAgg(st *aggRuntime, call optimizer.AggregateCall, slo
 		if len(call.OrderBy) > 0 {
 			st.strElems = append(st.strElems, sv)
 			st.strDelims = append(st.strDelims, delim)
-			st.strElemKeys = append(st.strElemKeys, evalAggOrderByKeys(call.OrderBy, slot, o.ctx))
+			st.strElemKeys = append(st.strElemKeys, o.evalAggOrderByKeys(call.OrderBy, idx, slot))
 			st.hasValue = true
 			break
 		}
@@ -2971,16 +3269,10 @@ func (o *aggregateOp) applyAgg(st *aggRuntime, call optimizer.AggregateCall, slo
 		st.arrayElems = append(st.arrayElems, elemStr)
 		st.arrayElemNull = append(st.arrayElemNull, isNull)
 		// Evaluate ORDER BY expressions for later sorting in finishAgg.
+		// E-06: compiled per-key eval (error→NULL preserved verbatim;
+		// materialization inside the helper, as before).
 		if len(call.OrderBy) > 0 {
-			keys := make([]Datum, 0, len(call.OrderBy))
-			for _, sk := range call.OrderBy {
-				kv, kerr := evalExprSlot(sk.Expr, slot, o.ctx)
-				if kerr != nil {
-					kv = NullDatum
-				}
-				keys = append(keys, kv.MaterializeArena())
-			}
-			st.arrayElemKeys = append(st.arrayElemKeys, keys)
+			st.arrayElemKeys = append(st.arrayElemKeys, o.evalAggOrderByKeys(call.OrderBy, idx, slot))
 		}
 		st.hasValue = true
 	case "any_value":
@@ -3163,7 +3455,7 @@ func (o *aggregateOp) applyAgg(st *aggRuntime, call optimizer.AggregateCall, slo
 			if call.Arg2 == nil {
 				break
 			}
-			arg2, a2err := evalExprSlot(call.Arg2, slot, o.ctx)
+			arg2, a2err := o.aggEvalList(o.aggArg2Nodes, idx, call.Arg2, slot)
 			if a2err != nil || arg2.IsNull() {
 				break // skip row if either arg is NULL
 			}
@@ -3194,14 +3486,15 @@ func (o *aggregateOp) applyAgg(st *aggRuntime, call optimizer.AggregateCall, slo
 // against the current input row and materialises them, so finishAgg can sort
 // the accumulated pieces later. A key that fails to evaluate becomes NULL
 // rather than aborting the aggregate — the pre-existing array_agg behaviour
-// this was factored out of.
-func evalAggOrderByKeys(orderBy []optimizer.SortKey, slot TupleSlot, ctx *Context) []Datum {
+// this was factored out of. E-06: per-key compiled eval via aggEvalList2
+// (error swallowed to NULL exactly as before).
+func (o *aggregateOp) evalAggOrderByKeys(orderBy []optimizer.SortKey, idx int, slot TupleSlot) []Datum {
 	if len(orderBy) == 0 {
 		return nil
 	}
 	keys := make([]Datum, 0, len(orderBy))
-	for _, sk := range orderBy {
-		kv, err := evalExprSlot(sk.Expr, slot, ctx)
+	for ki, sk := range orderBy {
+		kv, err := o.aggEvalList2(o.aggOrderNodes, idx, ki, sk.Expr, slot)
 		if err != nil {
 			kv = NullDatum
 		}
@@ -4137,18 +4430,15 @@ func drainRowsCtx(op Operator, ctx *Context) ([]Row, error) {
 			return nil, err
 		}
 		row := slotRow(slot)
-		// Always make an independent copy: clone the slice AND
-		// materialize any arena-backed Datums so each entry stays
-		// valid regardless of the producer's slot reuse or arena
-		// reset.  (M0097-0058 CTE-left cross join fix.)
-		// Always make an independent copy: clone the slice AND materialize
-		// any arena-backed Datums so each entry stays valid regardless of
-		// the producer's slot reuse or arena reset.
-		dup := make(Row, len(row))
-		copy(dup, row)
-		if rowHasArena(row) {
-			dup = cloneRowOwned(dup)
-		}
+		// Always make an independent copy: cloneRowOwned clones the
+		// slice AND materializes any arena-backed Datums so each entry
+		// stays valid regardless of the producer's slot reuse or arena
+		// reset. A single cloneRowOwned covers both: the slice copy
+		// owns non-arena Datums, and MaterializeArena detaches
+		// arena-backed ones (no-op per Datum otherwise), so no
+		// separate make+copy is needed. (M0097-0058 CTE-left cross
+		// join fix; EX2-02a fold of the arena-path double copy.)
+		dup := cloneRowOwned(row)
 		rows = append(rows, dup)
 		n++
 	}
@@ -4175,12 +4465,12 @@ func drainRowsCtxCTID(op Operator, ctx *Context, scanLeaf currentTIDProvider) ([
 			return nil, nil, err
 		}
 		row := slotRow(slot)
-		// Always make an independent copy (see drainRowsCtx above).
-		dup := make(Row, len(row))
-		copy(dup, row)
-		if rowHasArena(row) {
-			dup = cloneRowOwned(dup)
-		}
+		// Always make an independent copy (see drainRowsCtx above:
+		// single cloneRowOwned; EX2-02a fold). The TID sidecar below
+		// comes from scanLeaf.currentTID() (scan-operator cursor
+		// state), not from the row buffer, so it is unaffected by
+		// the row-copy fold.
+		dup := cloneRowOwned(row)
 		rows = append(rows, dup)
 		if scanLeaf != nil {
 			rel, ptr, ok := scanLeaf.currentTID()

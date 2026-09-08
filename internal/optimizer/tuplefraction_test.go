@@ -220,11 +220,11 @@ func tfSearch(t *testing.T, lim *Limit) *searchCtx {
 // hash-vs-nested-loop choice.
 type twoShapeBuilder struct{}
 
-func (b *twoShapeBuilder) sizeJoinRel(outer, inner *RelOptInfo, _ []*restrictInfo) (float64, int) {
+func (b *twoShapeBuilder) sizeJoinRel(outer, inner *RelOptInfo, _ []*restrictInfo, _ *SpecialJoinInfo) (float64, int) {
 	return 10000, outer.Width + inner.Width
 }
 
-func (b *twoShapeBuilder) addPaths(joinrel, outer, inner *RelOptInfo, _ []*restrictInfo) error {
+func (b *twoShapeBuilder) addPaths(joinrel, outer, inner *RelOptInfo, _ []*restrictInfo, _ *SpecialJoinInfo) error {
 	addPath(joinrel, &Path{Kind: PathHashJoin, Rel: joinrel, Rows: joinrel.Rows,
 		Cost: Cost{Startup: 500, Total: 900}}, "test")
 	addPath(joinrel, &Path{Kind: PathNestLoop, Rel: joinrel, Rows: joinrel.Rows,

@@ -1,0 +1,6 @@
+# ea-parity capture
+# engine-binary: /home/ryo/work/goopg/goopg/tmp/c20a/goopg-ea sha256/16=01b6b310646a7b76
+# commit: 542a6b765
+# date: 2026-09-07T05:56:40+09:00
+# port: 5534  data: /home/ryo/work/goopg/goopg/tmp/c20a/data-sf05
+# non-zero psql rc: none

@@ -14,7 +14,11 @@ package optimizer
 //  4. the sort is skipped, and paid for, exactly when the input's own ordering
 //     says so — the branch that makes P5.4c-ii's ordered inputs worth having.
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/goopg/goopg/internal/parser"
+)
 
 // orderedRel is a rel whose single (cheapest) path already delivers `keys` — the
 // shape P5.4c-ii's ordered index paths will produce and that nothing in the
@@ -138,7 +142,7 @@ func TestSortInnerAndOuter_OnePathPerSortKey(t *testing.T) {
 	joinrel := newRelOptInfo(a|b, 2000, 64)
 	keys := []*restrictInfo{equiClauseOn(a, b, 1, 2), equiClauseOn(a, b, 3, 4)}
 
-	sortInnerAndOuter(joinrel, outer, inner, defaultCostParams(), keys, nil, func([]*restrictInfo) float64 { return joinrel.Rows }, func([]*restrictInfo) (float64, float64) { return 1, 1 })
+	sortInnerAndOuter(nil, joinrel, outer, inner, defaultCostParams(), parser.JoinInner, keys, nil, func([]*restrictInfo) float64 { return joinrel.Rows }, func([]*restrictInfo) (float64, float64) { return 1, 1 }, 0)
 
 	paths := mergePathsOf(joinrel)
 	if len(paths) != 2 {
@@ -164,10 +168,10 @@ func TestSortInnerAndOuter_OutputOrderingIsTheOuters(t *testing.T) {
 	a, b := relsetOf(0), relsetOf(1)
 	outer, inner := scanRel(a, 1000, 10), scanRel(b, 800, 8)
 	joinrel := newRelOptInfo(a|b, 500, 64)
-	sortInnerAndOuter(joinrel, outer, inner, defaultCostParams(),
+	sortInnerAndOuter(nil, joinrel, outer, inner, defaultCostParams(), parser.JoinInner,
 		[]*restrictInfo{equiClauseOn(a, b, 5, 6)}, nil,
 		func([]*restrictInfo) float64 { return joinrel.Rows },
-		func([]*restrictInfo) (float64, float64) { return 1, 1 })
+		func([]*restrictInfo) (float64, float64) { return 1, 1 }, 0)
 
 	paths := mergePathsOf(joinrel)
 	if len(paths) != 1 {
@@ -206,7 +210,7 @@ func TestSortInnerAndOuter_SkipsSortWhenInputAlreadyOrdered(t *testing.T) {
 
 	costOf := func(outer *RelOptInfo) *Path {
 		joinrel := newRelOptInfo(a|b, 2000, 64)
-		sortInnerAndOuter(joinrel, outer, inner, cp, keys, nil, func([]*restrictInfo) float64 { return joinrel.Rows }, func([]*restrictInfo) (float64, float64) { return 1, 1 })
+		sortInnerAndOuter(nil, joinrel, outer, inner, cp, parser.JoinInner, keys, nil, func([]*restrictInfo) float64 { return joinrel.Rows }, func([]*restrictInfo) (float64, float64) { return 1, 1 }, 0)
 		paths := mergePathsOf(joinrel)
 		if len(paths) != 1 {
 			t.Fatalf("got %d merge paths, want 1", len(paths))
@@ -225,7 +229,7 @@ func TestSortInnerAndOuter_SkipsSortWhenInputAlreadyOrdered(t *testing.T) {
 		t.Fatalf("skipping the sort must be cheaper: %v vs %v", pre.Cost.Total, plain.Cost.Total)
 	}
 	// The saving must be the sort's own cost, not a rounding difference.
-	if want := costSortRun(cp, 10000, relNCols(unordered)).Total; plain.Cost.Total-pre.Cost.Total < want*0.9 {
+	if want := costSortRun(cp, 10000, relNCols(unordered), relAvgVarBytes(unordered), -1).Total; plain.Cost.Total-pre.Cost.Total < want*0.9 {
 		t.Fatalf("saving %v is far below the sort cost %v — the sort was charged twice or not at all",
 			plain.Cost.Total-pre.Cost.Total, want)
 	}
@@ -233,23 +237,44 @@ func TestSortInnerAndOuter_SkipsSortWhenInputAlreadyOrdered(t *testing.T) {
 
 // TestSortInnerAndOuter_RefusesAParameterisedResult — `try_mergejoin_path`
 // :1073-1081. A merge join discharges nothing, so an input parameterised by a
-// THIRD relation leaves the join parameterised. `param_source_rels` is empty in
-// v1, so PG's own overlap test rejects it; there is no `allow_star_schema_join`
-// escape for merge. This keeps P5.4b-ii-b-1's invariant intact: every JOIN path
-// in the search is unparameterised.
+// THIRD relation leaves the join parameterised. With an empty
+// `param_source_rels` PG's own overlap test rejects it; there is no
+// `allow_star_schema_join` escape for merge.
 func TestSortInnerAndOuter_RefusesAParameterisedResult(t *testing.T) {
 	a, b, c := relsetOf(0), relsetOf(1), relsetOf(2)
 	outer := paramRel(a, 100, c) // parameterised by c, not by the inner
 	inner := scanRel(b, 500, 5)
 	joinrel := newRelOptInfo(a|b, 200, 64)
 
-	sortInnerAndOuter(joinrel, outer, inner, defaultCostParams(),
+	sortInnerAndOuter(nil, joinrel, outer, inner, defaultCostParams(), parser.JoinInner,
 		[]*restrictInfo{equiClauseOn(a, b, 1, 2)}, nil,
 		func([]*restrictInfo) float64 { return joinrel.Rows },
-		func([]*restrictInfo) (float64, float64) { return 1, 1 })
+		func([]*restrictInfo) (float64, float64) { return 1, 1 }, 0)
 
 	if got := len(mergePathsOf(joinrel)); got != 0 {
-		t.Fatalf("a still-parameterised merge result must be refused, got %d paths", got)
+		t.Fatalf("an unwanted parameterisation must be refused, got %d paths", got)
+	}
+}
+
+// TestSortInnerAndOuter_AdmitsWantedParameterisation — the C-08 half of
+// the refusal test above: the same parameterised input with `paramSrc`
+// wanting it (this joinrel's param_source_rels derivation) IS offered.
+// The admitted path stays parameterised (req={c}); merge has no second
+// gate, unlike NLI.
+func TestSortInnerAndOuter_AdmitsWantedParameterisation(t *testing.T) {
+	a, b, c := relsetOf(0), relsetOf(1), relsetOf(2)
+	outer := paramRel(a, 100, c) // parameterised by c, not by the inner
+	inner := scanRel(b, 500, 5)
+	joinrel := newRelOptInfo(a|b, 200, 64)
+
+	sortInnerAndOuter(nil, joinrel, outer, inner, defaultCostParams(), parser.JoinInner,
+		[]*restrictInfo{equiClauseOn(a, b, 1, 2)}, nil,
+		func([]*restrictInfo) float64 { return joinrel.Rows },
+		func([]*restrictInfo) (float64, float64) { return 1, 1 }, c)
+
+	paths := mergePathsOf(joinrel)
+	if len(paths) != 1 {
+		t.Fatalf("a wanted parameterisation must be offered, got %d paths", len(paths))
 	}
 }
 
@@ -262,7 +287,7 @@ func TestAddPathsToJoinrel_MergeArmRunsForAnEqualityPair(t *testing.T) {
 
 	joinrel := newRelOptInfo(a|b, 2000, 64)
 	if err := addPathsToJoinrel(nil, joinrel, scanRel(a, 10000, 100), scanRel(b, 5000, 50),
-		[]*restrictInfo{equiClause(a, b)}, cp); err != nil {
+		[]*restrictInfo{equiClause(a, b)}, cp, nil); err != nil {
 		t.Fatalf("addPathsToJoinrel: %v", err)
 	}
 	if len(mergePathsOf(joinrel)) == 0 {
@@ -271,7 +296,7 @@ func TestAddPathsToJoinrel_MergeArmRunsForAnEqualityPair(t *testing.T) {
 
 	bare := newRelOptInfo(a|b, 2000, 64)
 	if err := addPathsToJoinrel(nil, bare, scanRel(a, 100, 2), scanRel(b, 50, 1),
-		[]*restrictInfo{plainClause(a | b)}, cp); err != nil {
+		[]*restrictInfo{plainClause(a | b)}, cp, nil); err != nil {
 		t.Fatalf("addPathsToJoinrel: %v", err)
 	}
 	if got := len(mergePathsOf(bare)); got != 0 {
@@ -290,13 +315,13 @@ func TestSortInnerAndOuter_ResidualRidesTheJoinOutput(t *testing.T) {
 	residual := []*restrictInfo{plainClause(a | b)}
 
 	withRes := newRelOptInfo(a|b, 2000, 64)
-	sortInnerAndOuter(withRes, scanRel(a, 10000, 100), scanRel(b, 5000, 50), cp, keys, residual,
+	sortInnerAndOuter(nil, withRes, scanRel(a, 10000, 100), scanRel(b, 5000, 50), cp, parser.JoinInner, keys, residual,
 		func([]*restrictInfo) float64 { return withRes.Rows },
-		func([]*restrictInfo) (float64, float64) { return 1, 1 })
+		func([]*restrictInfo) (float64, float64) { return 1, 1 }, 0)
 	without := newRelOptInfo(a|b, 2000, 64)
-	sortInnerAndOuter(without, scanRel(a, 10000, 100), scanRel(b, 5000, 50), cp, keys, nil,
+	sortInnerAndOuter(nil, without, scanRel(a, 10000, 100), scanRel(b, 5000, 50), cp, parser.JoinInner, keys, nil,
 		func([]*restrictInfo) float64 { return without.Rows },
-		func([]*restrictInfo) (float64, float64) { return 1, 1 })
+		func([]*restrictInfo) (float64, float64) { return 1, 1 }, 0)
 
 	got, base := mergePathsOf(withRes), mergePathsOf(without)
 	if len(got) != 1 || len(base) != 1 {
@@ -321,7 +346,7 @@ func TestSortPathFor_ChargesTheSortOnTopOfItsInput(t *testing.T) {
 	keys := []PathKey{{Expr: col(1), SortAsc: true}}
 
 	s := sortPathFor(sub, keys, cp)
-	run := costSortRun(cp, 1000, relNCols(rel))
+	run := costSortRun(cp, 1000, relNCols(rel), relAvgVarBytes(rel), -1)
 	if s.Cost.Startup != sub.Cost.Total+run.Startup {
 		t.Fatalf("sort startup = %v, want input total + comparison cost %v", s.Cost.Startup, sub.Cost.Total+run.Startup)
 	}

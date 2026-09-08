@@ -1,0 +1,14 @@
+# arm=s4-r3 GOOPG_PGSHAPED_DP=1 GOOPG_PGSHAPED_COLLAPSE=1
+# started 2026-09-06T11:19:45+09:00
+# engine-id: d712db0ea66ab604d6da4724c7229c947c0ba004 adac573515d2f130d75ee99e1dd8fd1f328e9924  diff=5be8a9032c38
+# engine-binary: on-disk=04b4178d65eeda2f (/tmp/claude-1000/-home-ryo-work-goopg-goopg/b8e0d095-04da-41e7-b272-805106e9cf98/scratchpad/e11b/goopg-e11b)
+# per-query cap 900s, serial, digest=1, queries=1,3,6,12,14,19,22
+# host: load7.50 5.20 4.68
+Q1: OK elapsed=19.67s colsig=767ce848ef814ee2 ordered=bec2bfd31be0c585 unordered=4b7a568f26bb0b26 rows=4
+Q3: OK elapsed=9.41s colsig=83ee73dd50fba86d ordered=5d8f90f94f391dee unordered=410178f16d5b42bc rows=11415
+Q6: OK elapsed=6.30s colsig=2e0a9e7c16d79cc6 ordered=84fac084e52a96e1 unordered=84fac084e52a96e1 rows=1
+Q12: OK elapsed=16.07s colsig=8c6c14235b8e3d44 ordered=a26b3ee1c5904461 unordered=b36b0103eb864256 rows=2
+Q14: OK elapsed=2.36s colsig=ab278eb7d8e03030 ordered=b16b43d3cdcc29f6 unordered=b16b43d3cdcc29f6 rows=1
+Q19: OK elapsed=10.28s colsig=2e0a9e7c16d79cc6 ordered=53c9e350c86504c6 unordered=53c9e350c86504c6 rows=1
+Q22: OK elapsed=0.65s colsig=6d31a4f5ee00a4d0 ordered=a94736ae38ca1128 unordered=ff1e67e6689fd94a rows=7
+# finished 2026-09-06T11:20:55+09:00

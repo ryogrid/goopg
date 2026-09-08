@@ -43,7 +43,7 @@ PSQL_USER     ?= postgres
 # Wrap shell invocations with the in-tree PostgreSQL paths.
 ENV_PREFIX = PATH="$(PG_BIN_DIR):$$PATH" LD_LIBRARY_PATH="$(PG_LIB_DIR):$$LD_LIBRARY_PATH"
 
-.PHONY: help build init start goopg-test-server stop restart psql status clean clean-data print-env install-hooks ralph-state-check ralph-state-repair ralph-state-guard ralph-metrics check-testport-inventory regen-testport bench-build bench-build-optimized pgo-profile pgbench-compare pgbench-compare-matrix pgbench-compare-report plan-snapshot-build plan-snapshot-capture plan-diff plan-gate runtimeshim-matrix race-gate parity-dashboard nightly-batch
+.PHONY: help build init start goopg-test-server stop restart psql status clean clean-data print-env install-hooks ralph-state-check ralph-state-repair ralph-state-guard ralph-metrics check-testport-inventory regen-testport bench-build bench-build-optimized pgo-profile pgbench-compare pgbench-compare-matrix pgbench-compare-report plan-snapshot-build plan-snapshot-capture plan-diff plan-gate runtimeshim-matrix race-gate parity-dashboard nightly-batch ea-ratchet ea-ratchet-repin
 
 help:
 	@echo "goopg lifecycle targets:"
@@ -67,7 +67,8 @@ help:
 	@echo "  make pgbench-compare-matrix Run the full goopg pgbench matrix survey."
 	@echo "  make pgbench-compare-report Generate markdown report from latest pgbench results."
 	@echo "  make race-gate          Run concurrency-critical packages under -race (Go data race detector)."
-	@echo "  make plan-gate          Diff EXPLAIN plans against latest baseline; SKIP when unavailable."
+	@echo "  make plan-gate          Diff EXPLAIN plans against latest baseline; FAILS when unavailable (strict)."
+	@echo "  make ea-ratchet         Estimate-accuracy parity ratchet vs PG 18.3 over TPC-DS SF0.5 (~1h)."
 	@echo "  make parity-dashboard   Generate docs/parity-dashboard.md (GUC/SQLSTATE/catalog parity vs PG 18.3)."
 	@echo
 	@echo "  scripts/pg-oracle-diff.sh   Run SQL against goopg AND vanilla PG 18.3, diff output."
@@ -369,11 +370,18 @@ pgbench-compare-report:
 #                   ignores cost variance.
 #   strict-text   — byte-for-byte comparison.
 #   semantic-cost — structural + cost ±10% tolerance.
+#   costs         — cost-visible pin for geometry items (A-05):
+#                   shape AND cost/rows/width must match exactly
+#                   (per-line whitespace-trimmed, unlike strict-text),
+#                   so a hashsize reprice without a reshape is a DIFFER.
+#                   Default stays structural for shape pins; geometry
+#                   items run MODE=costs.
 #
 # Usage:
 #   make plan-snapshot-capture LABEL=m0076-baseline-ffc3429
 #   make plan-diff             LABEL=m0076-baseline-ffc3429
 #   make plan-diff             LABEL=m0076-baseline-ffc3429 MODE=strict-text
+#   make plan-diff             LABEL=m0076-baseline-ffc3429 MODE=costs
 #
 # Requires goopg-bench-bin running on 127.0.0.1:65433
 # (the standard tpch-runner port).
@@ -387,6 +395,9 @@ PLAN_USER    ?= tpch
 PLAN_PASS    ?= tpch
 LABEL        ?=
 MODE         ?= structural
+# PLAN_GATE_ALLOW_SKIP=1 restores the pre-A-05 lenient behaviour (SKIP/exit 0
+# when no baseline exists or the server is unreachable). Default is strict:
+# a mandatory pin that silently passes is not a pin.
 
 plan-snapshot-build:
 	@mkdir -p "$(REPO_ROOT)/tmp"
@@ -411,18 +422,29 @@ plan-diff: plan-snapshot-build
 # ---------------------------------------------------------------
 # plan-gate: run plan-diff against the latest baseline if one
 # exists and the TPC-H server is available.  Used as a pre-commit
-# gate for planner/executor changes.  Exits SKIP (0) when there is
-# no data or no baseline so it never hard-blocks loops without data.
+# gate for planner/executor changes.  STRICT BY DEFAULT (A-05): a
+# missing baseline or an unreachable server FAILS (exit 1) — a
+# mandatory pin that silently passes is not a pin.  Loops without
+# data opt out explicitly with PLAN_GATE_ALLOW_SKIP=1 (restores
+# SKIP/exit 0 for that run only).
 # ---------------------------------------------------------------
 plan-gate: plan-snapshot-build
 	@LATEST=$$(ls -t "$(REPO_ROOT)/plan_snapshots"/*.txt 2>/dev/null | head -1); \
 	if [ -z "$$LATEST" ]; then \
-		echo "plan-gate: SKIPPED (no plan_snapshots/*.txt baseline found)"; \
-		exit 0; \
+		if [ "$(PLAN_GATE_ALLOW_SKIP)" = "1" ]; then \
+			echo "plan-gate: SKIPPED (no plan_snapshots/*.txt baseline found; PLAN_GATE_ALLOW_SKIP=1)"; \
+			exit 0; \
+		fi; \
+		echo "plan-gate: FAIL (no plan_snapshots/*.txt baseline found; capture one with 'make plan-snapshot-capture LABEL=<name>', or opt out with PLAN_GATE_ALLOW_SKIP=1)" >&2; \
+		exit 1; \
 	fi; \
 	if ! pg_isready -h "$(PLAN_HOST)" -p $(PLAN_PORT) -U "$(PLAN_USER)" -q 2>/dev/null; then \
-		echo "plan-gate: SKIPPED (goopg not reachable on $(PLAN_HOST):$(PLAN_PORT) — start the bench server first)"; \
-		exit 0; \
+		if [ "$(PLAN_GATE_ALLOW_SKIP)" = "1" ]; then \
+			echo "plan-gate: SKIPPED (goopg not reachable on $(PLAN_HOST):$(PLAN_PORT) — start the bench server first; PLAN_GATE_ALLOW_SKIP=1)"; \
+			exit 0; \
+		fi; \
+		echo "plan-gate: FAIL (goopg not reachable on $(PLAN_HOST):$(PLAN_PORT) — start the bench server first, or opt out with PLAN_GATE_ALLOW_SKIP=1)" >&2; \
+		exit 1; \
 	fi; \
 	LNAME=$$(basename "$$LATEST" .txt); \
 	echo "plan-gate: diffing against baseline $$LNAME (mode=$(MODE))"; \
@@ -567,3 +589,32 @@ parity-dashboard:
 # ---------------------------------------------------------------
 nightly-batch:
 	@bash "$(REPO_ROOT)/ci/batch/run-nightly.sh"
+
+# ---------------------------------------------------------------
+# ea-ratchet: the estimate-accuracy parity ratchet (C-20a).
+#
+# Four TODO_ALL items (C-05, C-10a, C-20a, C-21) cite an "EA ratchet"
+# as their acceptance gate; ledger `take3-ea-ratchet-never-ran`
+# established that it had never run, because the instrument it named
+# (scripts/tpch-estimate-audit-arm.sh) was wired into no Makefile
+# target, no hook, no precommit script and no ci/batch stage, and its
+# pinned PG baseline was absent from the tree.  THIS target is the
+# wiring: the gate now has a name a person or a stage can invoke, so
+# it cannot silently not-run again.
+#
+# It measures goopg's EXPLAIN ANALYZE estimate against its own actual
+# row count over the TPC-DS SF0.5 corpus, at base-relation AND joinrel
+# granularity, and fails a node only when goopg is materially worse
+# than PostgreSQL 18.3 on the same relation set (bench/tpcds/plans-pg).
+# That PG-relative bar is the only one that passes Q47 — where PG also
+# emits rows=1 — and fails Q99's 8007x.
+#
+# Runs on its own clone and its own port; it never touches the SF0.5
+# gate's cluster on 65437.  ~1 h for a full capture.  To re-score a
+# capture without a server:  EA_CAPTURE=<file> make ea-ratchet
+# ---------------------------------------------------------------
+ea-ratchet:
+	@bash "$(REPO_ROOT)/scripts/estimate-parity-gate.sh"
+
+ea-ratchet-repin:
+	@EA_REPIN=1 bash "$(REPO_ROOT)/scripts/estimate-parity-gate.sh"

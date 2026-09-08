@@ -86,9 +86,16 @@ var planCTEs map[string]*plannedCTE
 // caller MUST defer the returned restorer to release the scope
 // once the WITH-prefixed statement has finished planning.
 //
+// scope is the statement's rtableScope (A-01(ii) cut 2): every CTE
+// body (plain, recursive, and DML) allocates its RTIDs from the same
+// scope as the outer statement. Threaded, never created here (F1).
+//
 // Returns nil restorer when with is nil so the caller can defer
 // unconditionally with `defer restore()` and a no-op stub.
-func preplanWithClause(with *parser.WithClause, cat catalog.Catalog) (restore func(), dmlPlans []dmlCTEPlan, err error) {
+// EX3-03 cut 1: ps is the enclosing statement's settings. CTE bodies
+// routinely contain the join tree (the Q9 pattern), so these are the
+// highest-value conversions — every body below prices under ps.
+func preplanWithClause(with *parser.WithClause, cat catalog.Catalog, ps PlannerSettings, scope *rtableScope) (restore func(), dmlPlans []dmlCTEPlan, err error) {
 	if with == nil {
 		return func() {}, nil, nil
 	}
@@ -105,7 +112,7 @@ func preplanWithClause(with *parser.WithClause, cat catalog.Catalog) (restore fu
 		restore = func() { planCTEs = prev }
 
 		for _, cte := range with.CTEs {
-			body, err := planRecursiveCTE(cte, cat)
+			body, err := planRecursiveCTE(cte, cat, ps, scope)
 			if err != nil {
 				restore()
 				return nil, nil, err
@@ -161,7 +168,7 @@ func preplanWithClause(with *parser.WithClause, cat catalog.Catalog) (restore fu
 	for _, cte := range with.CTEs {
 		// Data-modifying CTE (INSERT/UPDATE/DELETE/MERGE body).
 		if cte.DMLBody != nil {
-			body, dmlErr := planDMLCTEBody(cte.DMLBody, cat)
+			body, dmlErr := planDMLCTEBody(cte.DMLBody, cat, ps, scope)
 			if dmlErr != nil {
 				restore()
 				return nil, nil, dmlErr
@@ -199,10 +206,13 @@ func preplanWithClause(with *parser.WithClause, cat catalog.Catalog) (restore fu
 		// recursive-Plan time would re-validate WITHOUT the
 		// parent's CTE scope and erroneously reject sibling
 		// references like `WITH a AS (SELECT 1), b AS (SELECT *
-		// FROM a) ...`. Calling planSelect directly skips Analyze
-		// while still seeing the in-progress planCTEs map so an
-		// earlier sibling is visible to a later one.
-		body, err := planSelect(cte.Query, cat)
+		// FROM a) ...`. Planning the body directly (rather than via
+		// the Plan entry) skips Analyze while still seeing the
+		// in-progress planCTEs map so an earlier sibling is visible
+		// to a later one.
+		// A-01(ii) cut 2: the body shares the statement scope.
+		// EX3-03 cut 1: under ps — the CTE body holds the join tree.
+		body, err := planSelectWithSettings(cte.Query, cat, ps, scope)
 		if err != nil {
 			restore()
 			return nil, nil, err
@@ -254,14 +264,19 @@ func preplanWithClause(with *parser.WithClause, cat catalog.Catalog) (restore fu
 // planRecursiveCTE plans a WITH RECURSIVE CTE body as a RecursiveUnion.
 // The CTE must have a UNION ALL body; the left side is the anchor
 // and the right side is the recursive member.
-func planRecursiveCTE(cte *parser.CommonTableExpr, cat catalog.Catalog) (Node, error) {
+//
+// scope is the statement's rtableScope (A-01(ii) cut 2): anchor and
+// recursive member allocate from it like any other nested SELECT.
+// EX3-03 cut 1: ps is the enclosing statement's settings — anchor and
+// recursive member both price under it.
+func planRecursiveCTE(cte *parser.CommonTableExpr, cat catalog.Catalog, ps PlannerSettings, scope *rtableScope) (Node, error) {
 	key := strings.ToLower(cte.Name)
 
 	// PostgreSQL allows WITH RECURSIVE CTEs whose bodies don't actually
 	// recurse (no UNION self-reference). In that case, treat the CTE as a
-	// regular non-recursive CTE — plan it with planSelect and register it.
+	// regular non-recursive CTE — plan it directly and register it.
 	if cte.Query.SetOp == nil {
-		body, err := planSelect(cte.Query, cat)
+		body, err := planSelectWithSettings(cte.Query, cat, ps, scope)
 		if err != nil {
 			return nil, err
 		}
@@ -331,7 +346,9 @@ func planRecursiveCTE(cte *parser.CommonTableExpr, cat catalog.Catalog) (Node, e
 	}
 	savedSetOp := cte.Query.SetOp
 	cte.Query.SetOp = nil
-	anchor, err := planSelect(cte.Query, cat)
+	// A-01(ii) cut 2: the anchor shares the statement scope.
+	// EX3-03 cut 1: anchor prices under ps.
+	anchor, err := planSelectWithSettings(cte.Query, cat, ps, scope)
 	cte.Query.SetOp = savedSetOp
 	if err != nil {
 		if hadEntry {
@@ -392,7 +409,8 @@ func planRecursiveCTE(cte *parser.CommonTableExpr, cat catalog.Catalog) (Node, e
 		return nil, err
 	}
 
-	rec, err := planSelect(cte.Query.SetOp.Right, cat)
+	// EX3-03 cut 1: recursive member prices under ps.
+	rec, err := planSelectWithSettings(cte.Query.SetOp.Right, cat, ps, scope)
 	if err != nil {
 		if hadEntry {
 			planCTEs[key] = savedEntry
@@ -573,16 +591,23 @@ type dmlCTEPlan struct {
 // planDMLCTEBody plans an INSERT/UPDATE/DELETE/MERGE statement that
 // appears as a CTE body. The plan's Output() schema reflects the
 // RETURNING columns (empty if no RETURNING clause).
-func planDMLCTEBody(stmt parser.Stmt, cat catalog.Catalog) (Node, error) {
+//
+// scope is the statement's rtableScope (A-01(ii) cut 2): DML bodies
+// allocate from the enclosing statement like any other nested query.
+// EX3-03 cut 1: the DML body receives the enclosing statement's settings.
+func planDMLCTEBody(stmt parser.Stmt, cat catalog.Catalog, ps PlannerSettings, scope *rtableScope) (Node, error) {
 	switch s := stmt.(type) {
 	case *parser.InsertStmt:
-		return planInsert(s, cat)
+		return planInsert(s, cat, ps, scope)
 	case *parser.UpdateStmt:
-		return planUpdate(s, cat)
+		// EX3-03 cut 1: preplanWithClause now carries the enclosing
+		// statement's settings, so the CTE-body UPDATE prices under
+		// them instead of the hard-wired defaults (B-12f's note).
+		return planUpdate(s, cat, ps, scope)
 	case *parser.DeleteStmt:
-		return planDelete(s, cat)
+		return planDelete(s, cat, ps, scope)
 	case *parser.MergeStmt:
-		return planMerge(s, cat)
+		return planMerge(s, cat, ps, scope)
 	default:
 		return nil, &PlanError{Code: "0A000", Message: "unsupported DML statement in CTE body"}
 	}

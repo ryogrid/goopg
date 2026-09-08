@@ -74,7 +74,14 @@ HBA
         echo "port = ${PG_PORT}"
         echo "unix_socket_directories = '${PGSOCKET_DIR}'"
         echo "max_connections = 64"
-        echo "shared_buffers = 512MB"
+        # 2048MB to match the goopg cluster (bench/tpch/setup_goopg.sh),
+        # raised from 512MB on 2026-09-06. At 512MB against a 2.1 GiB
+        # dataset PG held roughly a quarter of the working set while goopg
+        # held all of it, so any goopg-vs-PG wall-clock comparison gave
+        # goopg 4x the buffer memory. Both engines still benefit from the
+        # OS page cache, so the practical gap was smaller than 4x — but it
+        # was an asymmetry in the measurement, not in the engines.
+        echo "shared_buffers = 2048MB"
         echo "work_mem = 64MB"
         echo "maintenance_work_mem = 256MB"
         echo "effective_cache_size = 2GB"

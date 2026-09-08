@@ -64,6 +64,39 @@ type PlannerSettings struct {
 	EnableMergeJoin bool
 	EnableNestLoop  bool
 
+	// EnableSort is PG's `enable_sort` (B-17a): cost_sort's own flag on top of
+	// the input's disabled_nodes count (costsize.c:2144). The producer
+	// (sortPathFor) still builds the Sort path when off, so a query whose
+	// only legal plan sorts still plans.
+	//
+	// There is deliberately no EnableMaterial: goopg builds no Material path
+	// (joinpathsmemoize.go; take2 P2-06), so the flag would have no consumer.
+	EnableSort bool
+
+	// EnableSeqScan / EnableIndexScan / EnableBitmapScan are PG's
+	// `enable_seqscan` / `enable_indexscan` / `enable_bitmapscan` (B-17d):
+	// the scan producers' own flags, counted rather than gating the
+	// producer (costsize.c:295, 560, 1023). The generation gates that stay
+	// gates — enable_indexonlyscan, enable_memoize, and the vacuous TID and
+	// incremental-sort halves (no producer exists) — are NOT here.
+	EnableSeqScan    bool
+	EnableIndexScan  bool
+	EnableBitmapScan bool
+
+	// EnableGatherMerge is PG's `enable_gathermerge` (C-19d): cost_gather_
+	// merge's own flag (costsize.c:536), counted onto the path's
+	// DisabledNodes rather than gating the producer, exactly as the join and
+	// scan toggles above are. `enable_gather` does not exist upstream —
+	// cost_gather carries no flag — so there is no field beside it.
+	//
+	// Like the four parallel fields below it is NOT read from the session
+	// yet (`plannerSettingsFrom` reads no parallel GUC), so it sits at its
+	// default; the post-pass's boolean twin
+	// (`ParallelSettings.DisableGatherMerge`) is not wired either. Both
+	// channels are P2-02's remainder, and the post-pass half retires with
+	// C-19h.
+	EnableGatherMerge bool
+
 	// EnableHashAgg / EnablePresortedAggregate / Geqo / GeqoThreshold are the
 	// remaining P2-02c bridges. Same defect as EnableMemoize below: each
 	// reached the planner through a registry.OnChange bridge writing a
@@ -107,6 +140,51 @@ type PlannerSettings struct {
 	// nodeHash.c:3622), NOT work_mem alone — take2 P2-03. Zero means "use the
 	// default", so a zero-valued PlannerSettings still prices hashes sanely.
 	HashMemMultiplier float64
+
+	// MaxParallelWorkersPerGather / MinParallelTableScanSize /
+	// ParallelLeaderParticipation are the three parallel GUCs the PATH MODEL
+	// reads (C-19a/b, take3 08 §8): `compute_parallel_worker` (allpaths.c:4274)
+	// sizes a partial seq scan from the first two, and `get_parallel_divisor`
+	// (costsize.c:6474) prices it with the third. They are the same facts
+	// `ParallelSettings` carries to the post-planning Gather pass
+	// (parallel.go), duplicated here because the post-pass runs OUTSIDE the
+	// search — the whole defect Phase 5 removes — while a partial path has to
+	// be priced INSIDE it. MinParallelTableScanSize and
+	// MinParallelIndexScanSize are in BLOCKS (GUC_UNIT_BLOCKS upstream,
+	// guc_tables.c:3727); the index threshold is C-19c's, read by
+	// `compute_parallel_worker`'s `index_pages` arm for a partial index path.
+	//
+	// Zero MaxParallelWorkersPerGather means "no parallel paths", which is
+	// PG's own reading (`parallelModeOK` requires it > 0, planner.c:339) and
+	// the safe zero value for every hand-built PlannerSettings.
+	MaxParallelWorkersPerGather int
+	MinParallelTableScanSize    int64
+	MinParallelIndexScanSize    int64
+	ParallelLeaderParticipation bool
+
+	// ParallelStatementOK is the STATEMENT-shape half of
+	// `statementIsParallelSafe` (parallel.go), carried into the pre-cache
+	// planner so an upper-rel producer can refuse for the same reasons the
+	// post-pass refuses at its entry.
+	//
+	// It is NOT a session input and deliberately NOT part of the plan-cache
+	// fingerprint: it is a property of the SQL text, which the cache key
+	// already fixes.
+	//
+	// It travels one way only: the postmaster's `plannerSettingsFrom` sets it
+	// on the top-level statement sites, `PlanWithSettings` clears it for any
+	// statement that is not a plain SELECT, and `planSelectWithParent` clears
+	// it for every nested scope. Every hand-built PlannerSettings —
+	// `DefaultPlannerSettings`, and therefore `optimizer.Plan` — leaves it
+	// false. Fail-closed by DEFAULT rather than by enumeration, which is the
+	// lesson of TPC-H Q15b: a view body is planned by a re-entrant `Plan` call
+	// whose result becomes a search LEAF, and a flag derived from the
+	// statement's own shape called that body a top-level SELECT.
+	//
+	// The residual facts that are neither statement shape nor session GUC —
+	// the transaction's isolation level above all — cannot be known here at
+	// all, and are enforced POST-cache by `StripGather` (parallel.go).
+	ParallelStatementOK bool
 }
 
 // DefaultPlannerSettings returns the settings a statement plans under when no
@@ -121,6 +199,11 @@ func DefaultPlannerSettings() PlannerSettings {
 		EnableHashJoin:  true,
 		EnableMergeJoin: true,
 		EnableNestLoop:  true,
+		EnableSort:      true,
+		EnableSeqScan:    true,
+		EnableIndexScan:  true,
+		EnableBitmapScan: true,
+		EnableGatherMerge: true,
 		EnableMemoize:   true,
 
 		EnableHashAgg:            HashAggEnabled(),
@@ -148,6 +231,10 @@ func DefaultPlannerSettings() PlannerSettings {
 		// round-trip invariant is for.
 		WorkMem:           hashsize.DefaultMemLimitBytes,
 		HashMemMultiplier: hashsize.DefaultHashMemMultiplier,
+		MaxParallelWorkersPerGather: cp.maxParallelWorkersPerGather,
+		MinParallelTableScanSize:    cp.minParallelTableScanBlocks,
+		MinParallelIndexScanSize:    cp.minParallelIndexScanBlocks,
+		ParallelLeaderParticipation: cp.parallelLeaderParticipation,
 	}
 }
 
@@ -177,6 +264,11 @@ func (ps PlannerSettings) costParams() costParams {
 		enableHashJoin:  ps.EnableHashJoin,
 		enableMergeJoin: ps.EnableMergeJoin,
 		enableNestLoop:  ps.EnableNestLoop,
+		enableSort:      ps.EnableSort,
+		enableSeqScan:    ps.EnableSeqScan,
+		enableIndexScan:  ps.EnableIndexScan,
+		enableBitmapScan: ps.EnableBitmapScan,
+		enableGatherMerge: ps.EnableGatherMerge,
 		enableMemoize:   ps.EnableMemoize,
 		geqo:            ps.Geqo,
 		geqoThreshold:   ps.GeqoThreshold,
@@ -185,5 +277,9 @@ func (ps PlannerSettings) costParams() costParams {
 		geqoGenerations: ps.GeqoGenerations,
 		geqoBias:        ps.GeqoSelectionBias,
 		geqoSeed:        ps.GeqoSeed,
+		maxParallelWorkersPerGather: ps.MaxParallelWorkersPerGather,
+		minParallelTableScanBlocks:  ps.MinParallelTableScanSize,
+		minParallelIndexScanBlocks:  ps.MinParallelIndexScanSize,
+		parallelLeaderParticipation: ps.ParallelLeaderParticipation,
 	}
 }

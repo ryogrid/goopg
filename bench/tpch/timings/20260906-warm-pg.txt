@@ -1,0 +1,37 @@
+# TPC-H SF=1 warm-start query timings — pg-18.3
+# captured: 2026-09-06T16:21:04.855791+09:00
+# repo commit at capture: a22d995c8
+# engine build: PostgreSQL 18.3
+# port: 65432
+# settings: shared_buffers=2GB work_mem=64MB effective_cache_size=2GB autovacuum=on
+# protocol: one WARM pass discarded, then two measured passes over all
+#   queries on the same server (server age therefore differs between
+#   pass 1 and pass 2 — that is visible as the p1/p2 spread, not hidden).
+# harness: tmp/tpch-acceptance-runner, serial per-query connections.
+# NOTE: seconds are machine-specific. The FIXTURE here is the pair of
+#   passes and their spread; a single number should not be quoted alone.
+#
+# query     pass1_s    pass2_s      min_s
+Q1             1.07       1.06       1.06
+Q2             0.22       0.23       0.22
+Q3             0.23       0.22       0.22
+Q4             0.12       0.12       0.12
+Q5             0.31       0.32       0.31
+Q6             0.24       0.25       0.24
+Q7             0.40       0.41       0.40
+Q8             0.18       0.18       0.18
+Q9             0.43       0.44       0.43
+Q10            0.62       0.61       0.61
+Q11            0.09       0.09       0.09
+Q12            0.42       0.42       0.42
+Q13            1.26       1.27       1.26
+Q14            0.20       0.20       0.20
+Q16            0.26       0.26       0.26
+Q17            1.42       1.41       1.41
+Q18            6.10       6.24       6.10
+Q19            0.06       0.06       0.06
+Q20            0.22       0.22       0.22
+Q21            0.55       0.66       0.55
+Q22            0.06       0.06       0.06
+#
+# TOTAL       14.46      14.73       0.00   (21 labels)

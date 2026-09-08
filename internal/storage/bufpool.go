@@ -210,9 +210,6 @@ type Pool struct {
 	// logger surfaces non-fatal FPI failures.
 	logger *slog.Logger
 
-	// prefetchEnabled gates Pool.Prefetch.
-	prefetchEnabled atomic.Bool
-
 	// asyncFlushBatchSize controls FlushAllPaced batching.
 	asyncFlushBatchSize atomic.Int32
 
@@ -520,6 +517,19 @@ type Pool struct {
 	// internal/amcheck, which sets this to reproduce the bug in ~1s.
 	// Remove this field once the eviction-race root cause is fixed.
 	DebugValidateCleanEvictions bool
+
+	// DebugReadFault, when non-nil, is consulted on every buffer-pool disk
+	// read just before the read is issued; a non-nil return makes the read
+	// fail exactly as a real I/O error would, with no file to corrupt and no
+	// fake Manager to write.
+	//
+	// E-19 S2. §4.2's leak test has three arms — scan to EOF, mid-scan Close,
+	// and an INJECTED READ ERROR — and the third was unwritable: OnPinWait /
+	// OnPinDone are timing hooks with no error return, and the alternatives
+	// (a fake Manager, a deliberately truncated file) both change the thing
+	// under test. Off by default and nil-checked, so it costs one predicted
+	// branch per miss and nothing per hit.
+	DebugReadFault func(tag BufferTag) error
 
 	// DebugTraceSlotEvents is an M-NIGHTLY investigation aid
 	// (AI-20260708-064334-001), off by default (zero cost when false: the
@@ -1186,6 +1196,28 @@ func (p *Pool) WriteTimeNanos() int64 {
 	return p.sharedWriteTimeNanos.Load()
 }
 
+// TotalPinCount returns the sum of every slot's pin count, plus the number of
+// slots holding at least one pin. Both are sampled slot-by-slot without any
+// pool-wide lock, so the pair is only exact on a quiesced pool — which is
+// precisely the condition the leak test asserts under (before a scan, after
+// the scan has finished or been closed).
+//
+// E-19 S2. §4.2 hazard 1 — "a prefetch that pins and never unpins" — is a
+// surface no values suite can see: a leaked pin is not a wrong answer, it is a
+// buffer that can never be evicted again. Asserting the balance needs the sum,
+// and before this the only exported readers were SlotPinCount(tag) (which
+// needs a tag the test would have to guess) and Capacity(). getPinCount is
+// unexported, so a test in internal/executor could not compute it at all.
+func (p *Pool) TotalPinCount() (total int64, slotsPinned int) {
+	for i := range p.slots {
+		if n := statePin(p.slots[i].state.Load()); n != 0 {
+			total += int64(n)
+			slotsPinned++
+		}
+	}
+	return total, slotsPinned
+}
+
 // EvictionCount returns the pool-wide cumulative count of real victim
 // evictions (backs pg_stat_io's evictions column).
 func (p *Pool) EvictionCount() int64 {
@@ -1316,9 +1348,6 @@ func (p *Pool) SyncAllDataFiles() error {
 	return p.mgr.SyncAll()
 }
 
-// SetPrefetchEnabled toggles Pool.Prefetch's behaviour.
-func (p *Pool) SetPrefetchEnabled(on bool) { p.prefetchEnabled.Store(on) }
-
 // SetAsyncFlushBatchSize controls how many dirty slots FlushAllPaced batches.
 func (p *Pool) SetAsyncFlushBatchSize(n int) {
 	if n > MaxFlushBatchSize {
@@ -1342,18 +1371,23 @@ func (p *Pool) flushBatchSize() int {
 	return n
 }
 
-// Prefetch is a hint that the caller is about to Pin tag.
-func (p *Pool) Prefetch(tag BufferTag) {
-	if !p.prefetchEnabled.Load() {
-		return
-	}
-	// Fast check: already cached?
-	if slotIdx, _ := p.bm.Lookup(tag); slotIdx >= 0 {
-		return
-	}
-	buf := make([]byte, BlockSize)
-	_, _ = p.mgr.PrefetchBlock(tag.Rel, tag.Block, buf)
-}
+// NOTE: the Pool has no Prefetch hint. It had one until 2026-09-06 —
+// `Pool.Prefetch(tag)` allocated a fresh 8 KiB buffer, handed it to
+// Manager.PrefetchBlock and then DROPPED it, so the read could never serve
+// the following Pin and its only effect was warming the OS page cache. It
+// measured at 63.8% of allocation objects and 90.1% of allocation bytes on a
+// serial TPC-H Q6, and removing it was 11.2% faster on a COLD page cache as
+// well as 11.1% warm. Upstream reaches the same conclusion normatively:
+// postgres/src/include/storage/read_stream.h:30-36 ("Explicit advice is known
+// to perform worse than letting the kernel (at least Linux) detect sequential
+// access") and heapam.c:1220 passes READ_STREAM_SEQUENTIAL from exactly the
+// sequential heap scan that was this hint's only caller — and goopg's data
+// files are plain buffered (smgr.go:616, no O_DIRECT), so Linux readahead is
+// active. The smgr-level seam Manager.SetAIO/Manager.PrefetchBlock is KEPT:
+// it is the entry point for a real StartReadBuffers/WaitReadBuffers-shaped
+// prefetch, which is what a RANDOM-access caller (bitmap heap scan, or an
+// index scan on a low-correlation index) would need. See
+// docs/design/storage-prefetch-buffer/DESIGN.md.
 
 // InvalidateRel evicts every slot currently bound to rel.
 // TruncateRelationTail drops all blocks >= keep for rel: WAL-first (when the
@@ -1998,7 +2032,10 @@ func (p *Pool) pinLoad(tag BufferTag) (*Slot, error) {
 	if p.OnPinWait != nil {
 		p.OnPinWait()
 	}
-	ioErr := p.mgr.ReadBlock(tag.Rel, tag.Block, s.page)
+	ioErr := p.readFault(tag)
+	if ioErr == nil {
+		ioErr = p.mgr.ReadBlock(tag.Rel, tag.Block, s.page)
+	}
 	if ioErr == nil && p.OnBlockReload != nil {
 		p.OnBlockReload(tag, s.page)
 	}
@@ -2018,16 +2055,28 @@ func (p *Pool) pinLoad(tag BufferTag) (*Slot, error) {
 
 	// Transition to valid+pinned. Read waiter count under pinMu before
 	// clearing ioInflight so no new waiters can arrive between read and wake.
+	//
+	// E-19 S3: this used to be an absolute Store with the pin hard-coded to 1.
+	// It is now publishValid(extraPin=1) — a CAS that MERGES — so that this
+	// path and ReadOp.Finish (which already holds its caller's pin, taken at
+	// claim time) share one publish and cannot drift. Under pinLoad nothing
+	// can hold a pin here, so the merge is arithmetically identical to the
+	// Store it replaces.
 	n := p.slotWaiters[victimIdx].Load()
-	prevSt := s.state.Load()
-	newSt := slotValidBit | uint64(1) | (uint64(1) << slotUsageShift) | (uint64(gen) << slotGenShift)
-	s.state.Store(newSt)
-	p.traceSlotEvent(int32(victimIdx), evPinLoadPublish, tag, prevSt, newSt)
+	p.publishValid(s, gen, 1)
 	for i := int32(0); i < n; i++ {
 		runtimeshim.SemaRelease(&p.slotSema[victimIdx])
 	}
 	p.sharedReadCount.Add(1)
 	return s, nil
+}
+
+// readFault consults the DebugReadFault seam. Always nil in production.
+func (p *Pool) readFault(tag BufferTag) error {
+	if p.DebugReadFault == nil {
+		return nil
+	}
+	return p.DebugReadFault(tag)
 }
 
 // Capacity returns the total number of buffer slots in the pool.

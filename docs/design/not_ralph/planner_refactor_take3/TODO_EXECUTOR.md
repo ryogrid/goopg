@@ -63,39 +63,14 @@ re-baselined), worker stats surface, per-operator slices published for the
 three witness shapes, batch counters report. No plan moved, no timing
 claimed.
 
-- [ ] EX0-01 File the executor backlog ledger — one
-      `.ralph/deferral_ledger.md` row per open 12 gap (G-EX1…G-EX8) with
-      the 10 § upstream citation. (Replaces the absent `take2-P7-03*` rows;
-      only `take2-executor-residual` exists under that key, 12 §13.)
-      *design: 13 §2.2; gate: ledger rows merged, no code.*
-- [ ] EX0-02 Commit the measurement protocol — artifact header + executor
-      additions (GOGC/GOMEMLIMIT, `work_mem` + `effective_cache_size` per
-      arm, alloc arm, flamegraph/perf invocation from take6/round5).
-      *design: 13 §2.2–2.3; gate: protocol doc + one conforming artifact.*
-- [ ] EX0-03 Surface per-worker hash/sort counters in EXPLAIN ANALYZE —
-      thread existing worker counts to the leader (PG shows them; 11 §10
-      notes they die with the worker). Counting already happens; plumbing
-      + golden test only.
-      *design: 13 §2.2; gate: golden test, plans byte-identical, no timing
-      claim.*
-- [ ] EX0-04 Per-operator timing harness — repeatable breakdown (scan
-      decode / prefilter / clone / join-probe / sort-compare / spill write)
-      on Q6-class, Q9-class, Q4/Q7/Q13-class shapes. Validate against the
-      known Q6 prefilter share before trusting new slices.
-      *design: 13 §2.2; gate: slices published; pin `changed=0`.*
-- [ ] EX0-05 Batch/width counters — EXPLAIN-visible batch reporting for
-      hash builds + recorded narrowed widths (P4-01 witness form: Q9
-      `Batches:` at 64 MB S-cold, narrowed width ≈100 not 6).
-      *design: 13 §2.2; gate: counters report on witnesses; pin
-      `changed=0`.*
-- [ ] EX0-06 Re-baseline the Q6 chain end-to-end under the protocol —
-      serial 3.792 s / parallel 0.838 s (take7) re-measured with timing +
-      alloc arms + headers — and record per-query timing+alloc baselines
-      on both suites (TPC-H SF=1 + TPC-DS SF0.5, same protocol). The Q6
-      chain is the executor baseline every later item diffs against; the
-      per-query tables are E1's denominator.
-      *design: 13 §2.3; gate: conforming artifact (Q6 chain + per-query
-      tables both suites), no behaviour change.*
+- [x] EX0-01 File the executor backlog ledger — `6ace9567e` (design) + ledger rows this commit; gates: 8 `take3-EX0-G-EXn` rows merged, `git diff --stat` docs-only; artifacts: `docs/design/executor-ex0-01-ledger/DESIGN.md`, `.ralph/deferral_ledger.md`
+- [x] EX0-02 Commit the measurement protocol — `503f12cf7` (design) + conforming artifact this commit; gates: protocol doc merged, `EX0-02-q6-serial-scold` full header (serial 5.48 s, values ×9 identical, alloc 1.06 GB/Q6, perf 56.6B instr/Q6); artifacts: `docs/design/executor-ex0-02-protocol/DESIGN.md`, `analysis/executor-refactor/ex0-02-20260903/README.md`
+- [x] EX0-03 Surface per-worker hash/sort counters in EXPLAIN ANALYZE — this commit; gates: 3 new tests (`TestMergeWorkerContextMaxMergesHashJoinStats`, `TestExplainAnalyzeParallelWorkersLaunchedAndHashMerge`, `TestExplainSerialPlanHasNoWorkersLaunched`), executor suite green, serial plans byte-identical, no timing claim; artifacts: `internal/executor/{parallel_worker_ctx,instrument,context,operators_gather,operators_gather_merge,operators_explain}.go`, `internal/executor/explain_parallel_workers_test.go`
+- [x] EX0-03b Per-worker rows/loops/time lines — this commit; gates: fold unit test (exact carrier) + shape/presence golden (count==launched both runs, SHAPE identical, no exact rows) + empty-carrier byte-identical pin, executor suite green, `-race` clean on all worker tests; artifacts: `internal/executor/{instrument,operators_gather,operators_gather_merge,parallel_hash_build,operators_cte_dml,context,operators_explain}.go`, tests in `explain_parallel_workers_test.go`
+- [x] EX0-03c Minimal `sortOp` method/space counters — this commit; gates: 7 tests (serial main line, parallel worker lines count==launched, rescan reset, failed-Open nothing, spill external-merge, worker-0 promotion, empty-carrier byte-identical), executor suite green, `-race` clean; artifacts: `internal/executor/{operators,context,parallel_worker_ctx,operators_gather,operators_gather_merge,parallel_hash_build,operators_explain}.go`, `internal/executor/explain_sort_workers_test.go`
+- [x] EX0-04 Per-operator timing harness — this commit; gates: Q6 anchor re-cut ×3 (residual-ratio 11.3% mean, null control clean, values identical), slices published Q6/Q9/Q13/Q4/Q7 + G-EX6 remainder list (decode: int/float 66%, numeric 32%), plan-gate 22/22 MATCH changed=0; artifacts: `bench/tpch/profile_slices.sh`, `bench/tpch/profile_slices_classify.py`, `analysis/executor-refactor/ex0-04-20260903/README.md`
+- [x] EX0-05 Batch/width counters — this commit; gates: Q9 both arms report (witness Batches: 2, widths ~700–1100, no width≈6 degenerate), tripwire fired once (lazy-map build Build-Time-only → ledgered `take3-EX0-lazy-hash-geometry`, non-witness, gate unaffected), plan-gate 22/22 MATCH; artifacts: `analysis/executor-refactor/ex0-05-20260903/README.md` (+1 ledger row)
+- [x] EX0-06 Re-baseline the Q6 chain end-to-end under the protocol — this commit; gates: Q6 serial 5.48 s + parallel 2.25 s (full capture sets), TPC-H per-query tables (252 s / 284 s), TPC-DS SF0.5 both arms PASS=95 (986.2 s / 996.5 s, ms-stamped), no behaviour change (sweep ms-patch is harness-additive); artifacts: `analysis/executor-refactor/ex0-06-20260903/README.md`
 
 Landed foundations (record, not work):
 
@@ -116,24 +91,13 @@ Exit: decode/detoast proportional to referenced columns on witnesses; Q9
 narrowed width recorded; values clean; plans unchanged. Consumes planner
 P4-01 target lists — general fix waits on P4-01 (13 §8.6).
 
-- [ ] EX1-01 Scan projection pushdown — `seqScanOp` decodes only target-list
-      columns; extend to index-only/batch paths as they gain targets.
-      *design: 13 §3; gate: values-diff both suites + pin + alloc arm.*
-- [ ] EX1-02 Deform-some-attributes — generalise take5's 6-of-16 into the
-      decode path: stop at the highest referenced attribute per consumer
-      (`slot_getsomeattrs` analogue, 10 §3). Whole-row deform survives only
-      on `WHOLEROW`/all-keys paths.
-      *design: 13 §3; gate: EX0-04 decode slice down on witnesses; values +
-      pin.*
-- [ ] EX1-03 Lazy detoast — per-attribute resolution on first use instead
-      of whole-row `DetoastRow` at scan time (11 §14). Witness: TOAST-heavy
-      TPC-DS shapes, not Q6.
-      *design: 13 §3; gate: TOAST contract tests per type; values + pin.*
-- [ ] EX1-04 Owned-row narrowing — shrink `MaterializedSlot` payloads to
-      referenced columns where retention allows (P4-A "drop seven columns").
-      After EX1-01/02 so boundaries are audited on narrow rows.
-      *design: 13 §3; gate: Q9 narrowed width recorded; values + pin +
-      alloc arm.*
+- [x] EX1-01 Scan projection pushdown — this commit; gates: 30 unit tests + poison runs, TPC-H values 24/24 MATCH, TPC-DS PASS=95, plan-gate 22/22, Q6 3.2–4.0 s (vs 5.48 s baseline), alloc 0.97 GB (vs 1.06 GB); artifacts: `internal/executor/{scan_deform,executor,operators_storage,expr,exprnode,operators_bitmap}.go`, `internal/executor/scan_deform_bound_test.go`
+- [x] EX1-02 Deform-some-attributes — this commit; gates: join/project unit tests + poison runs (incl. unrebased-semi regression), TPC-H 24/24 MATCH, TPC-DS PASS=95 (Q16 CKMISMATCH found, root-caused to index-space key split, fixed positionally, checksum-verified), plan-gate 22/22, Q6 pinned 3.1 s, Q9 14.5 s (vs 18.4 s); artifacts: `internal/executor/scan_deform.go`, tests, `docs/design/executor-ex1-02-join/DESIGN.md`
+- [x] EX1-02b Index/bitmap/IOS bound threading — this commit; gates: 21 index/bitmap/NLI/IOS subtests + poison/lossy runs, TPC-H 24/24 MATCH, TPC-DS PASS=95, plan-gate 22/22, Q6 3.02 s unchanged, Q4 1.54 s, Q13 6.80 s; NLI probe-key outer hole found in review and fixed with regression test; artifacts: `internal/executor/{scan_deform,executor,operators_index,operators_bitmap,operators_indexonly}.go`, `internal/executor/index_deform_bound_test.go`
+- [-] EX1-03 Lazy detoast — DROPPED per owner direction 2026-09-04 (see Dropped table + ledger `take3-EX1-03-dropped`); design `docs/design/executor-ex1-03-detoast/DESIGN.md` retained as the resume point.
+- [!] EX1-04 Owned-row narrowing — BLOCKED on planner P4-01 (PathTarget/projection): review of `docs/design/executor-ex1-04-owned/DESIGN.md` proved owned-payload shortening unsafe without projection — full-row readers above retainers (`slotRow`/`Row()`/`Materialize` on join-stacked and sort-above-join shapes, null-fill width variance) break on shortened rows, and batch geometry prices schema widths. Design retained as analysis; resume when P4-01 lands. Ledger `take3-EX1-04-blocked`. (13 §8.6; EX1 exit already sequences the general fix after P4-01.)
+  - 2026-09-04 unblock review: HALF-SUPERSEDED — P4-01 landed projection at the proven-safe build-side `Project` site (10→7, Batches 2→1), so the hash-build half is unblocked-but-needs-redesign (no second `[0,bound)` truncation; Cut 0 alloc arm: Q9 20.14→13.88 s, alloc 9.43→8.52 GB, values identical — `analysis/planner-refactor-take3/ex104-cut0-20260904/README.md`; Cut 1 test-only next); sort half still blocked on deferred upper-target slice (c), merged half on (a).
+  - Cut 1 landed (this commit): `internal/executor/owned_build_poison_test.go` — 5 poison tests on the Project shape (narrowed-width retention, identity-decline, unknown-target fallback, corrAbove decline, prebuilt-boundary incl. witness 18→7); 9/9 with pre-existing poison tests. Cut 2 (owned-row tightening on Project-declined paths) only if a later alloc arm shows a residual.
 
 Landed narrow fix (record, not work):
 
@@ -149,29 +113,36 @@ Landed narrow fix (record, not work):
 Exit: alloc arm down on witnesses, timing neutral-or-better, per-seam
 tripwires green, values clean, plans unchanged.
 
-- [ ] EX2-01 Retention-boundary audit — enumerate every `cloneRowOwned` /
-      `MaterializeArena` / `acquireRow` site with its retention reason.
-      Document only, no behaviour change; later items execute against it.
-      *design: 13 §4; gate: audit doc reviewed, no code.*
-- [ ] EX2-02a Ownership passing at join seams — sole-owner bounded-lifetime
-      clones become transfers. Join seams first (G-EX3 cascade product
-      shrinks here too).
-      *design: 13 §4; gate: alloc arm down; seam tripwire tests; values +
-      pin.*
-- [ ] EX2-02b Ownership passing at agg input — sole-owner
-      bounded-lifetime clones become transfers. Separate commit from 02a
-      (one seam family per commit, EX-P3).
-      *design: 13 §4; gate: alloc arm; seam tripwire tests; values +
-      pin.*
-- [ ] EX2-02c Ownership passing at gather transfer (= 13 EX2-04) —
-      workers stream materialised rows today
-      (`operators_gather.go:334-336`); move to ownership transfer across
-      the queue under arena rules (`parallel_runtime.go:31-71`); serial
-      control arm mandatory. Separate commit from 02b (EX-P3).
-      *design: 13 §4; gate: alloc arm; values + pin + serial arm.*
-- [ ] EX2-03 Pool sizing — tune `acquireRow` widths/return discipline
-      against EX0-04 slices, after the audit. Measure, do not guess.
-      *design: 13 §4; gate: pool-hit + alloc + timing arms; pin.*
+- [x] EX2-01 Retention-boundary audit — this commit; gates: audit reviewed (8-family spot-check exact; rework for truncation/memoize/gather/C6-C7 completed and verified), no code; artifacts: `analysis/planner-refactor-take3/ex201-audit-20260904/README.md` (45 sites: 18 cloneRowOwned + 14 MaterializeArena + 13 acquireRow; top EX2-02 candidates: A12/C17 virtual-row seam, C9, C10, C11; C8 scoped-caution: source aliases producer slot)
+- [x] EX2-02a Ownership passing at join seams — this commit (first cut:
+      C9/C10 `drainRowsCtx`/`drainRowsCtxCTID` make+copy folded into
+      single `cloneRowOwned`; TID sidecar verified buffer-independent);
+      gates: executor drain/join/agg + poison tests, TPC-H 24/24 MATCH,
+      plan-gate 22/22, TPC-DS PASS=95 MISMATCH=0, Q15b-MAIN 25.29→20.93 s
+      alloc window 12.57→11.56 GB values identical (single-sample);
+      artifacts: `internal/executor/operators_join_agg.go`
+- [-] EX2-02b Ownership passing at agg input — DROPPED 2026-09-04 as
+      infeasible: all 12 M-sites fail sole-owner transfer on both ends
+      (sources alias reused producer slot; whole-aggregation lifetimes;
+      MaterializeArena already minimal, no fold/gate). Ledger
+      `take3-EX2-02b-dropped` (+ WithinGroup latent-hazard follow-up).
+- [x] EX2-02c Ownership passing at gather transfer (= 13 EX2-04) —
+      this commit: `transferRowForQueue` (VirtualSlot fast path: fresh
+      pooled buffer transfers as-is when arena-free, clone+release when
+      arena-backed; other slot kinds stay byte-identical
+      MaterializeForTransfer); 4 call-site swaps (G1–G4);
+      gates: 4 new transfer tests + gather/parallel suite, TPC-H 24/24
+      serial + 24/24 parallel (arms values-identical), plan-gate 22/22,
+      TPC-DS PASS=95 MISMATCH=0;
+      artifacts: `internal/executor/{parallel_runtime,operators_gather,operators_gather_merge,parallel_hash_build}.go`,
+      `internal/executor/parallel_transfer_test.go`
+- [x] EX2-03 Pool sizing — closed MEASURE-ONLY 2026-09-04 (this
+      commit): pool-hit 1 alloc/24B/~40ns vs make 352–896B; per-row hit
+      rate ≈0% by construction (retained buffers correctly never
+      return); buckets 0–64 pool all widths identically so P4-01's
+      narrowing only moves traffic between identical buckets; predicted
+      effect on clone slice ~0. Artifact:
+      `analysis/planner-refactor-take3/ex203-measure-20260904/README.md`.
 
 Landed foundations (record, not work):
 
@@ -194,31 +165,75 @@ Exit: spilling shapes I/O-dominated; batch counters match PG semantics at
 both budgets; sort-compare share down; values clean; plans unchanged.
 Sequenced after EX1 (13 §1 EX-P7).
 
-- [ ] EX3-01 Verify the `runtime.Stack` elimination, then price the
-      remaining spill cost — elimination LANDED (`1d6b1e396`;
-      `spill.go:78-85,121-135,181`); re-measure the superseded 69–86% /
-      3.3–7.3× projections on Q4/Q7/Q13-class shapes to close the
-      Stack-walk claim, then price per-row WaitEvent instrumentation +
-      encode + file I/O with a reader-path audit; spill accounting moves
-      in the same commit.
-      *design: 13 §5; gate: top-slice re-measured on spilling shapes;
-      counters + pin + alloc arm. NOT gated on Q14/Q3/Q10 (STALE
-      witnesses, 12 §13).*
-- [ ] EX3-02 Dense-chunk build rows — contiguous packing (`dense_alloc`
-      analogue, 10 §6) replacing per-row build allocations.
-      *design: 13 §5; gate: alloc arm (primary) + timing; values + pin.*
-- [ ] EX3-03 Batch-file discipline per PG semantics — symmetric probe-side
-      spill, batch-pair re-reads, peak near `work_mem`. Measured at both
-      budgets; EX0-05 counters gate alongside time.
-      *design: 13 §5; gate: counter equality + values + pin at 64 MB and
-      512 MB-equivalent arms.*
+- [x] EX3-01 Verify the `runtime.Stack` elimination, then price the
+      remaining spill cost — this commit: elimination confirmed in-tree
+      (constructors cache registry handle; zero per-row `runtime.Stack`;
+      gls fast path first); reader-path cut = buffered spill reads
+      symmetric with the writer (`bufio.ReaderSize` 8192; `rewind` +
+      `br.Reset`; framing/codec + WaitEvent pairs untouched; only Seek
+      is rewind-to-zero); reader-path audit ranked I/O > decode >
+      post-decode cloneRow > WaitEvent > framing (residual spill
+      single-digit %, not the 69–86% Stack era).
+      Gates: spill unit + WaitEvent tests 27 PASS, TPC-H 24/24 MATCH,
+      plan-gate 22/22, TPC-DS PASS=95 MISMATCH=0, spill shapes Q7
+      14.97→11.48 s (−23%) Q13 6.89→4.69 s (−32%) values identical
+      (single-sample); artifacts: `internal/executor/spill.go`.
+      NOT gated on Q14/Q3/Q10 (STALE witnesses, 12 §13).
+- [x] EX3-02 Dense-chunk build rows — Cut 0 (census) + Cut 1 (stratum B:
+      unit A 5.00→2.00 / C 6.00→2.00) + Cut 2 landed (this commit):
+      `packDenseBuildRow` files arena-lane Buf-free rows into
+      `buildCells.AllocAligned(w*48, 8)` chunk views; `rowHasBuf`
+      whole-row heap rule (F1) + F7 pack assertion; rowHasArena gate kept;
+      int make-lane untouched. Gates: 9 new tests + 15/15 DenseBuild;
+      unit headers 2.002→0.005 / full 4.002→0.007; TPC-H 24/24 MATCH,
+      plan-gate 22/22, TPC-DS PASS=95 MISMATCH=0, Q9 values identical,
+      live heap lane 60.5 MB, window 5.46 GB single-sample; timing
+      in-band (no win claimed).
+      Artifacts: `internal/executor/{dense_build,operators_join_agg,parallel_hash_build}.go`,
+      `internal/executor/dense_build_cut{1,2}_test.go`,
+      `analysis/planner-refactor-take3/ex302-{census,cut1,cut2}-20260904/`.
+      Design: `docs/design/executor-ex3-02-dense-build/DESIGN.md`
+      (reviewed, F1–F7 folded). Cut 3 (oversize + explicit shared
+      teardown) deferred — see wrap-up ledger `take3-wrapup-deferred`.
+- [x] EX3-03 Batch-file discipline per PG semantics — Cut 1-step-1 landed
+      (this commit): `estimatedRowBytes` counts enum-label + big-numeric
+      bytes, byte-identical logic to the stats ruler
+      `datumVariablePayloadWidth` (runtime and planner rulers agree;
+      planner untouched, zero plan movement by construction); probe
+      established the symmetric machinery is landed and the remaining gap
+      is budget disagreement (planner 1 GiB vs executor 128 MB at 64 MB)
+      + this ruler gap. Gates: spill/batch/estimate/analyze suites +
+      growth tripwire green, TPC-H 24/24 MATCH, plan-gate 22/22, TPC-DS
+      PASS=95 MISMATCH=0; artifacts: `internal/executor/spill.go`,
+      `internal/executor/spill_test.go`. Step-2 (session work_mem
+      threading) designed (`docs/design/executor-ex3-03-workmem/DESIGN.md`,
+      reviewed F1–F7 folded) and IMPLEMENTED unit-green, but [!] BLOCKED
+      on spill-cost calibration at bench: plumbing alone moves Q7/Q9 plans
+      (bench work_mem=64MB; the designed 8× interior fix) to slower merge
+      shapes — Q7 +58%, Q9 +31%, values identical; same-server forced-hash
+      proof 10.65 s vs chosen merge 14.38 s while model prices hash above
+      merge. Ledger `take3-EX3-03-step2-blocked`; resume artifact
+      `analysis/planner-refactor-take3/ex303-step2-deferred-20260904/`
+      (README + clean-applying plumbing.patch).
 - [ ] EX3-04 Sort spill runs + merge discipline — run formation on
       `flushChunk`, tape-style merge-back (logtape analogue, 10 §9).
       *design: 13 §5; gate: spilling-sort shapes; values + pin.*
-- [ ] EX3-05 Sort-compare fast path — close `lessRows` / CTID-tail cost
-      (q16 34%) on the decoded-vector keys. Pure-timing gate; no plan can
-      move. Do first if EX3-01 stalls.
-      *design: 13 §5; gate: sort-compare slice down; pin (trivially holds).*
+- [x] EX3-05 Sort-compare fast path — this commit Cut A: `sortOp.wantCTIDs`
+      gates the TID side-channel (per-row append, third perm pass,
+      re-attach branch) on a consumer; markers at LockRows (unconditional)
+      + project/filter/aggregate/result (CTIDExpr-gated) + slab twins;
+      window/projectSet need none (eval against materialized rows);
+      joins/NLI correctly stop the walk (own scan-cursor sidecars, never
+      propagate sort-fed ctids); resultOp hole found in review and pinned.
+      Gates: sort/lock/CTID suites incl. 3 new resultOp pin tests
+      (negative-controlled), TPC-H 24/24 MATCH, plan-gate 22/22, TPC-DS
+      PASS=95 MISMATCH=0, Q16 timing-neutral (0.93→0.99 sweep noise,
+      0.73 steady-state — Stage 1 already took the 34%);
+      artifacts: `internal/executor/{operators,operators_lockrows,operators_join_agg,executor,opnode}.go`,
+      tests in `ctid_function_arg_test.go`, `operators_lockrows_test.go`,
+      `sort_external_test.go`. Cut B (per-key kind specialization) [-]
+      DROPPED as verified no-win 2026-09-04: fires (count→KindInt) yet
+      Q16 wall-neutral; ledger `take3-EX3-05-cutB-dropped`.
 - [ ] EX3-06 Skew residency + single-pass build — MCV-pinned hot keys
       (needs planner P2-11b input) + collapse two-pass/two-map build.
       Last in EX3 (13 §8.4).
@@ -358,6 +373,7 @@ One row per closed phase. Numbers come from the 13 §2.3 artifact header.
 
 | phase | closed | commit range | Q6 serial (goopg / PG) | Q6 parallel (goopg / PG) | witness alloc delta | notes |
 |---|---|---|---|---|---|---|
+| EX0 | 2026-09-03 | 6ace9567e..e8c7400f9 | 5.48 s / 0.99 s (GOGC=100; take7 3.79 @off non-comparable) | 2.25 s / 0.20 s (GOGC=100; take7 0.84 @off non-comparable) | Q6 1.06 GB serial / ~107 MB parallel-warm (pool-fill hypothesis) | ledger+protocol+worker stats+slices+batches+baseline; TPC-H 252/284 s, TPC-DS 986/997 s; +2 ledger rows (G-EX split b/c, lazy-hash tripwire) |
 
 ## Dropped
 
@@ -367,5 +383,32 @@ original wording — negative results are only legible if they survive
 
 | item | date | reason | ledger row |
 |---|---|---|---|
+| EX1-03 | 2026-09-04 | owner-directed skip: TPC-DS cannot witness (varchar(200) max < 2000 threshold, zero pointers at any SF); synthetic-only value with a silent-corruption risk class on every walk miss; revisit iff a TOAST-heavy corpus appears | take3-EX1-03-dropped |
+| EX2-02b | 2026-09-04 | infeasible as scoped: all 12 agg-input M-sites fail sole-owner transfer on both ends (sources alias reused producer slot; whole-aggregation lifetimes; MaterializeArena already minimal) | take3-EX2-02b-dropped |
+| EX3-05 Cut B | 2026-09-04 | verified no-win: fires (count→KindInt) yet Q16 wall-neutral; Stage 1 already captured the comparator win | take3-EX3-05-cutB-dropped |
+
+## Wrap-up 2026-09-04 (goal close-out, owner-directed)
+
+Executor workstream pauses after EX3-02 Cut 2 with all gates green
+(TPC-H 24/24 MATCH, plan-gate 22/22, TPC-DS PASS=95 MISMATCH=0 on every
+landed commit). Deferred with resume points — NOT verified-out-of-scope,
+workload-based exclusion explicitly not taken (goal terms); each item
+resumes from its cited design:
+
+- EX3-02 Cut 3 (oversize-dedicated chunks + explicit shared teardown):
+  `docs/design/executor-ex3-02-dense-build/DESIGN.md` §5 + F2/F5/F6 rules.
+- EX3-04 sort spill runs + merge discipline (13 §5).
+- EX3-06 skew residency (needs planner P2-11b MCV input).
+- EX4-01/02/03 expression compilation (13 §6; independent).
+- EX4-04 (blocked on EX5-01); EX5-01–04 parallel executor (13 §7).
+- EX3-03 step-2 (own blocked row `take3-EX3-03-step2-blocked`).
+- P4-01 deferred slices (a)/(b)/(c) (`docs/design/planner-p4-01-target/DESIGN.md`
+  Slice 3+); (c) unblocks the EX1-04 sort half.
+- Take2 (43 open) / take3 (62 open) planner TODOs remain the planner
+  program's scope — consumed here as dependencies only (P4-01 slices 1–3;
+  progress noted in take3 TODO.md).
+
+Ledger: `take3-wrapup-deferred`. Final performance report:
+`analysis/planner-refactor-take3/wrapup-20260904/PERF-REPORT.md`.
 
 (End of file)

@@ -25,6 +25,8 @@ package executor
 import (
 	"context"
 	"fmt"
+	"os"
+	"sync/atomic"
 	"time"
 
 	"github.com/goopg/goopg/internal/utils/mmgr"
@@ -55,17 +57,33 @@ type sharedHashBuild struct {
 	// other one without re-deriving the rule.
 	probeIsLeft bool
 
+	// EX3-02 Cut 1 (stratum B): the builder's buildBytes arena, parented to
+	// the statement context. Adopted by workers (applySharedBuild) so
+	// chunk-backed rows stay valid after the prebuild throwaway tree is
+	// gone; reclaimed at statement end (Cut 3 owns the explicit teardown).
+	buildBytes *mmgr.Context
+
 	preserveBuildSide bool
 	antiBuildRows     int
 	antiBuildHasNull  bool
 	leftWidth         int
 	rightWidth        int
+
+	// E-09a (docs/design/executor-e09a-shared-spilling-build/DESIGN.md §4):
+	// the batch descriptor of a build that batched. The maps above hold
+	// BATCH 0 ONLY; every other batch is an inner file the leader wrote and
+	// froze, and each participant reloads it privately (join_batch.go,
+	// newParticipantBatchState). nil when the build had no batch state —
+	// then, as before, the maps are the whole table.
+	batches *sharedBatchDesc
 }
 
 // captureSharedBuild snapshots the build-phase results of a joinOp whose
-// buildLazyHashTable has just completed.
-func (o *joinOp) captureSharedBuild(probeIsLeft bool) *sharedHashBuild {
-	return &sharedHashBuild{
+// buildLazyHashTable has just completed, freezing its batch files for
+// shared, read-only reloading. The joinOp's own batch state is detached in
+// the process: the descriptor owns the files from here on.
+func (o *joinOp) captureSharedBuild(probeIsLeft bool) (*sharedHashBuild, error) {
+	sb := &sharedHashBuild{
 		hash:              o.lazyHash,
 		hashCTID:          o.lazyHashCTID,
 		intHash:           o.lazyIntHash,
@@ -76,7 +94,38 @@ func (o *joinOp) captureSharedBuild(probeIsLeft bool) *sharedHashBuild {
 		antiBuildHasNull:  o.antiBuildHasNull,
 		leftWidth:         o.lazyLW,
 		rightWidth:        o.lazyRW,
+		buildBytes:        o.buildBytes,
 	}
+	if o.batches != nil {
+		d, err := o.batches.freezeForSharing()
+		if err != nil {
+			return nil, err
+		}
+		sb.batches = d
+		o.batches = nil
+	}
+	return sb, nil
+}
+
+// release retires the files a spilling build published. The maps and the
+// arena are garbage-collected / statement-reclaimed as before.
+func (sb *sharedHashBuild) release(ctx *Context) {
+	if sb != nil && sb.batches != nil {
+		sb.batches.release(ctx)
+	}
+}
+
+// releaseSharedHashBuilds retracts a Gather's publication from ctx and
+// unlinks the batch files it carried. Called from Gather / GatherMerge Close
+// AFTER the fan-out has joined — no participant may still be reading.
+func releaseSharedHashBuilds(ctx *Context) {
+	if ctx == nil {
+		return
+	}
+	for _, sb := range ctx.SharedHashBuilds {
+		sb.release(ctx)
+	}
+	ctx.SharedHashBuilds = nil
 }
 
 // applySharedBuild adopts a published table instead of building one.
@@ -84,7 +133,14 @@ func (o *joinOp) captureSharedBuild(probeIsLeft bool) *sharedHashBuild {
 // Every field buildLazyHashTable would have set must be set here too. Leaving
 // one out does not fail loudly — it produces a join that runs and returns the
 // wrong rows.
-func (o *joinOp) applySharedBuild(sb *sharedHashBuild) {
+//
+// ctx is THIS participant's context (a worker's, or the leader's own): the
+// private batch state installed for a spilling build writes its outer files
+// and its EXPLAIN counters through it.
+func (o *joinOp) applySharedBuild(ctx *Context, sb *sharedHashBuild) {
+	// A re-Open that skipped Close must not keep the previous run's private
+	// batch state (its outer files, its curBatch).
+	o.releaseBatches()
 	o.lazyHash = sb.hash
 	o.lazyHashCTID = sb.hashCTID
 	o.lazyIntHash = sb.intHash
@@ -94,6 +150,18 @@ func (o *joinOp) applySharedBuild(sb *sharedHashBuild) {
 	o.antiBuildHasNull = sb.antiBuildHasNull
 	o.lazyLW = sb.leftWidth
 	o.lazyRW = sb.rightWidth
+	// EX3-02 Cut 1: adopt the shared stratum-B arena. Marked shared so
+	// Close only dereferences it — the builder (never Closed on this path)
+	// and the statement-end Release own its lifetime.
+	o.buildBytes = sb.buildBytes
+	o.buildBytesShared = true
+	// E-09a §4 part 3: a spilling build gets a private batch state whose
+	// inner files are the shared, frozen ones. Without it the probe loop
+	// would never route a probe row (routeProbeRow is guarded on
+	// `bs != nil`) and the join would silently return batch 0's partition.
+	if sb.batches != nil {
+		o.batches = newParticipantBatchState(ctx, o.plan, sb.batches)
+	}
 }
 
 // lookupSharedHashBuild returns the published table for a plan node, or nil
@@ -143,7 +211,11 @@ func prebuildSharedHashJoins(ctx *Context, plan optimizer.Node, buildChild func(
 	if !optimizer.HasShareableHashJoin(plan) {
 		return nil, nil
 	}
-	tree, err := buildChild()
+	// EX0-03b: prebuild throwaway tree — scope explicitly NIL
+	// (uninstrumented, exactly today's behavior; covers both Gather and
+	// GatherMerge prebuild call sites). Its drains would double-count the
+	// same plan keys into a worker/leader table.
+	tree, err := buildUnderNilScope(buildChild)
 	if err != nil {
 		return nil, err
 	}
@@ -154,63 +226,42 @@ func prebuildSharedHashJoins(ctx *Context, plan optimizer.Node, buildChild func(
 	}
 
 	out := make(map[*optimizer.Join]*sharedHashBuild, len(joins))
+	fail := func(err error) (map[*optimizer.Join]*sharedHashBuild, error) {
+		for _, sb := range out {
+			sb.release(ctx)
+		}
+		return nil, err
+	}
 	for _, j := range joins {
 		j.ctx = ctx
-		// M0127-P3.4: decline the SHARE, not the SPILL.
+		// E-09a: a spilling build is published, batch files and all.
 		//
-		// A spilling build cannot be published: captureSharedBuild freezes the
-		// in-memory table alone, while the batch files and the per-batch probe
-		// replay live on THIS operator, which no worker ever runs — a worker
-		// handed that table would probe batch 0 and silently return the rows
-		// of one partition. P3.2 avoided the problem by forcing `noBatch`,
-		// which made the shared build the one hash build in the executor with
-		// no work_mem bound at all. The honest form is the opposite: keep the
-		// bound, give up the sharing, and let each worker build privately (and
-		// batch privately) — 06 §6, which defers real parallel hash outright.
-		//
-		// The check runs twice on purpose. Before the build, the ESTIMATE is
-		// consulted so the common case costs no wasted pass; after it, the
-		// MEASUREMENT is, because goopg's estimates are absent often enough
-		// that growth-on-overrun is the only bound worth relying on.
-		if sharedBuildWouldSpill(ctx, j) {
-			continue
-		}
+		// M0127-P3.4 used to decline the SHARE here whenever the geometry (or,
+		// after the build, the measurement) said nbatch > 1, because the
+		// batch files and the per-batch probe replay lived on THIS operator,
+		// which no worker runs — a worker handed the batch-0 maps alone would
+		// have returned one partition's rows. On TPC-H Q9 that meant all
+		// five participants built the 1.5 M-row `orders` table privately
+		// (DESIGN.md §1). captureSharedBuild now freezes the batch state into
+		// a descriptor and every participant derives a private state from it
+		// (join_batch.go), so the work_mem bound and the sharing coexist.
+		// Growth is still free to fire during THIS build; it is frozen the
+		// moment the descriptor is cut.
 		probeIsLeft, err := j.buildLazyHashTable(ctx)
 		if err != nil {
-			return nil, err
+			return fail(err)
 		}
-		if j.batches != nil && j.batches.nbatch > 1 {
-			// The estimate said it fit and it did not. Throw the leader's
-			// build away — files included — rather than publish a partition.
+		sb, err := j.captureSharedBuild(probeIsLeft)
+		if err != nil {
 			j.releaseBatches()
-			j.lazyHash, j.lazyIntHash, j.lazyHashCTID = nil, nil, nil
-			continue
+			return fail(err)
 		}
-		out[j.plan] = j.captureSharedBuild(probeIsLeft)
+		out[j.plan] = sb
 	}
 	if len(out) == 0 {
 		return nil, nil
 	}
 	return out, nil
-}
-
-// sharedBuildWouldSpill asks the shared geometry — the same one presizeLazyHash
-// and the batch state use — whether this build is projected to need more than
-// one batch.
-//
-// It answers false for a join that cannot batch anyway (a composite key, the
-// FOR-UPDATE ctid build): declining to share such a build would not bound
-// anything, it would just replace one unbounded build with one per worker.
-func sharedBuildWouldSpill(ctx *Context, j *joinOp) bool {
-	j.initExecKeys()
-	if !j.joinBatchEligible() {
-		return false
-	}
-	buildNode, buildWidth := j.plan.Right, len(j.right.Schema())
-	if !probeSideIsLeft(j.plan) {
-		buildNode, buildWidth = j.plan.Left, len(j.left.Schema())
-	}
-	return j.buildGeometry(ctx, buildNode, buildWidth, !probeSideIsLeft(j.plan)).NBatch > 1
 }
 
 // collectShareableJoins finds the hash joins in a tree whose build side can be
@@ -295,7 +346,7 @@ func (s *channelSource) Next() (TupleSlot, error) {
 // planner has split the partial subtree accordingly: a Partial aggregate under
 // the Gather with a Finalize above it (optimizer/parallel.go, splitAgg), and
 // Gather Merge for the sorted case. The cooperative hash build has neither.
-// Its producers each call BuildWorker(buildPlan) and get the WHOLE aggregate,
+// Its producers each rebuild buildPlan and get the WHOLE aggregate,
 // then attachParallelScan partitions the scan beneath it — so N producers would
 // each aggregate their own partition and the consumer would union the partial
 // results into the hash table with no Finalize. For a HAVING sum(...) predicate
@@ -325,14 +376,82 @@ func extractSeqScanFromPlan(node optimizer.Node) *optimizer.SeqScan {
 	}
 }
 
+// coopJoinBuild is E-18 slice 2's knob: OFF by default.
+//
+// It widens the cooperative build's Rule 3 so a build side that is a JOIN TREE
+// can be built cooperatively, which is the shape TPC-H Q9 needs and the one
+// `extractSeqScanFromPlan` refuses. It is a knob, not a default, because the
+// two objections recorded on that walker are both real and only one of them is
+// answered here:
+//
+//   - CORRECTNESS (answered): the widened walk descends a HASH join's PROBE
+//     side only, and refuses every other node kind including Aggregate and
+//     Sort. That is the property `extractSeqScanFromPlan`'s comment protects —
+//     N producers each aggregating their own partition, with no Finalize
+//     above, is a silent wrong answer for a `HAVING sum(...)` build side.
+//   - COST (answered here, but not yet across a corpus): each producer used to
+//     redo every nested build (Q18 35.7 -> 42.9-44.1 s). This path prebuilds
+//     the nested shareable joins ONCE in the leader and publishes them to the
+//     producers by pointer, reusing the same sharedHashBuild machinery a
+//     Gather uses, so a producer does the driving scan and the probes only.
+//
+// Default ON (GOOPG_COOP_JOIN_BUILD=off to disable). Measured on TPC-H SF=1
+// in PARALLEL mode (4 workers), fresh capped server per arm per rep, 5
+// alternating reps, every result set md5-identical between the arms:
+// Q20 1.91 -> 0.65 s (-66%, ranges disjoint), Q21 14.63 -> 13.75 s (-6.0%),
+// Q7 4.07 -> 3.79 s, Q9 10.75 -> 10.50 s; Q2/Q5/Q8/Q17/Q18 unchanged. No
+// query regressed in any rep.
+var coopJoinBuildOn = os.Getenv("GOOPG_COOP_JOIN_BUILD") != "off"
+
+// coopDrivingScan finds the scan a cooperative build's producers can partition.
+//
+// It is extractSeqScanFromPlan widened by exactly one node kind: a HASH join's
+// PROBE side. Everything else is refused, and the refusal is the safety
+// property — see extractSeqScanFromPlan's comment for why Aggregate and Sort
+// must never be descended, and attachParallelScan's joinOp arm for why the
+// side must be the probe side and the algorithm must be hash.
+//
+// It must agree with attachParallelScan, which does the same walk over the
+// BUILT tree: if this walker names a leaf attachParallelScan would not reach,
+// the producers all scan the whole relation and the build gets N copies of
+// every row. Both call probeSideIsLeft, which is the single shared rule.
+func coopDrivingScan(node optimizer.Node) *optimizer.SeqScan {
+	for {
+		switch n := node.(type) {
+		case *optimizer.SeqScan:
+			return n
+		case *optimizer.Filter:
+			node = n.Child
+		case *optimizer.Project:
+			node = n.Child
+		case *optimizer.Join:
+			if !coopJoinBuildOn || n.Algo != optimizer.JoinAlgoHash || n.Lateral {
+				return nil
+			}
+			if probeSideIsLeft(n) {
+				node = n.Left
+			} else {
+				node = n.Right
+			}
+		default:
+			return nil
+		}
+	}
+}
+
 // parallelBuildEligible reports whether this hash join's build side can be
-// parallelised. Four conditions must all hold (design §1.3):
+// parallelised. The design (§1.3) filed four rules; two of them have since
+// been retired against the source, and the numbering is kept so the retirement
+// notes below stay findable:
 //
 //  1. The join type permits shared probe (INNER/SEMI/ANTI, or LEFT with
 //     probe on the outer side).
-//  2. The build fits in one batch (spilling builds can't be shared).
-//  3. The build child is a parallel-scannable SeqScan (possibly under
-//     Filter).
+//  2. RETIRED (E-18 slice 1) — "the build fits in one batch". Spilling is
+//     consumer-side; see the note below.
+//  2b. RETIRED (E-18 slice 3) — "single-column key only". The composite lane
+//     is consumer-side too; see the note below.
+//  3. The build child exposes a partitionable driving scan: a SeqScan under
+//     Filter/Project, and (slice 2) under a hash join's probe side.
 //  4. The relation has enough blocks (≥ MinParallelTableScanBlocks).
 //
 // The function never mutates join state.
@@ -352,29 +471,60 @@ func (o *joinOp) parallelBuildEligible(ctx *Context, buildLeft bool) bool {
 	if o.preserveCTIDRel != nil {
 		return false
 	}
-	// Multi-key joins force the string map but are otherwise fine.
-	// Composite keys, however, have a different insertion path
-	// (fileCompositeBuildRow) that the channel-source pattern doesn't
-	// reach — declined for now.
-	if o.multiKey() {
-		return false
-	}
+	// Composite (multi-column) keys: RETIRED as a decline in E-18 slice 3.
+	//
+	// The rule's stated ground was that "composite keys have a different
+	// insertion path (fileCompositeBuildRow) that the channel-source pattern
+	// doesn't reach". Reading the source refutes it: fileCompositeBuildRow is
+	// called from inside buildLoopRight / buildLoopLeft
+	// (operators_join_agg.go), the very loops the cooperative build runs in
+	// its single consumer goroutine, from a channelSource instead of from the
+	// child operator tree. The composite lane is therefore entirely
+	// CONSUMER-side, exactly as batching is (slice 1's Rule 2), and the
+	// producer/consumer split cannot observe it: producers only scan, filter
+	// and hand materialised rows over a channel; key encoding
+	// (encodeBuildCompositeKey, o.execKeyBuf) and filing happen after the
+	// channel, on one goroutine.
+	//
+	// Why it matters: TPC-H Q9 spends 12.86 s of its 13.6 s in ONE build —
+	// the (ps_suppkey, ps_partkey) composite join, whose driving scan is the
+	// 6 M-row lineitem seq scan. That build was the item's whole remaining
+	// gap, and this rule was the only thing declining it.
 
-	// Rule 2: must not be projected to spill.
+	// Rule 2 (E-18 slice 1): RETIRED. It used to decline a build whose
+	// geometry predicted more than one batch, on the stated ground that
+	// "spilling builds can't be shared". Two things make that obsolete:
+	//
+	//  1. E-09a/E-09b made a spilling build shareable — captureSharedBuild
+	//     freezes the batch descriptor and every participant reloads the
+	//     inner files privately (sharedBatchDesc, join_batch.go). Sharing is
+	//     no longer conditional on fitting in one batch.
+	//  2. Spilling is entirely CONSUMER-side here. The cooperative build is a
+	//     producer/consumer split: the producers only scan+filter and hand
+	//     rows over a channel; the single consumer goroutine (the leader)
+	//     evaluates the key and calls insertBuildRow, which is what routes a
+	//     row to a batch file. buildLoopRight/buildLoopLeft make ONE pass
+	//     over the row source and never rescan the child, so a channelSource
+	//     serves a batching build exactly as a child operator tree does.
+	//
+	// This is the point where goopg's producer/consumer shape beats PG's:
+	// PG needs SHARED batch files for `Parallel Hash` because every backend
+	// inserts, so writes to a batch come from N backends at once. goopg has
+	// exactly one writer, so the batch files stay per-operator and
+	// single-writer, and the parallel BUILD SCAN is obtained without any of
+	// the shared-file machinery E-18's design doc scoped as "Phase 2".
+	//
+	// Witnesses at bench work_mem (64MB), TPC-H SF=1: Q5, Q7 and Q21 each
+	// declined an `orders` build at NBatch=4 under the old rule.
 	buildPlan := o.plan.Right
-	buildWidth := o.lazyRW
 	if buildLeft {
 		buildPlan = o.plan.Left
-		buildWidth = o.lazyLW
-	}
-	if o.joinBatchEligible() {
-		if o.buildGeometry(ctx, buildPlan, buildWidth, buildLeft).NBatch > 1 {
-			return false
-		}
 	}
 
-	// Rule 3: build child must be a SeqScan (possibly under Filter).
-	scan := extractSeqScanFromPlan(buildPlan)
+	// Rule 3: the build child must expose a partitionable driving scan —
+	// a SeqScan under Filter/Project, and (E-18 slice 2, knob) under a hash
+	// join's probe side.
+	scan := coopDrivingScan(buildPlan)
 	if scan == nil {
 		return false
 	}
@@ -387,6 +537,28 @@ func (o *joinOp) parallelBuildEligible(ctx *Context, buildLeft bool) bool {
 
 	return true
 }
+
+// coopSpillingBuilds counts cooperative parallel hash builds that ACTUALLY
+// spilled (ended with a live batch descriptor). E-18 slice 1 retired the
+// eligibility rule that declined those, and the design's own discipline is
+// that a newly-reachable path which never fires is an untested one — so the
+// path is counted, and TestCoopParallelHashBuildSpills asserts the count moves.
+var coopSpillingBuilds atomic.Int64
+
+// CoopSpillingBuildCount reports the process-wide number of cooperative
+// parallel hash builds that spilled to batch files. Test/diagnostic use.
+func CoopSpillingBuildCount() int64 { return coopSpillingBuilds.Load() }
+
+// coopCompositeBuilds counts cooperative parallel hash builds on a COMPOSITE
+// (multi-column) key. E-18 slice 3 retired the eligibility rule that declined
+// those; same discipline as coopSpillingBuilds — a newly-reachable path that
+// never fires is an untested one, so the path is counted and
+// TestCoopParallelHashBuildComposite asserts the count moves.
+var coopCompositeBuilds atomic.Int64
+
+// CoopCompositeBuildCount reports the process-wide number of cooperative
+// parallel hash builds that used the composite-key lane. Test/diagnostic use.
+func CoopCompositeBuildCount() int64 { return coopCompositeBuilds.Load() }
 
 // parallelBuildLazyHashTable runs a cooperative parallel hash build.
 //
@@ -403,15 +575,26 @@ func (o *joinOp) parallelBuildLazyHashTable(ctx *Context, buildLeft bool) (bool,
 	buildPlan := o.plan.Right
 	buildSchema := o.right.Schema()
 	otherWidth := o.lazyLW
+	// EX1-01/EX1-02 deform bound. The producers below REBUILD this subtree
+	// from the plan, so they must build it at the bound the serial builder
+	// gave the same side (joinOp.deformLeftBound / deformRightBound). Using
+	// the root bound instead — which is what BuildWorker does — restarts the
+	// walk with no recorded consumer, and a build side such as
+	// `Filter(dk > 3) -> SeqScan(dk, dname)` then narrows to [0,1): the hash
+	// table is loaded with rows whose `dname` was never deformed, and the
+	// join returns the RIGHT NUMBER OF ROWS with a NULL payload. No error,
+	// no row-count change; see TestCoopParallelHashBuildValuesAcrossWorkMem.
+	buildBound := o.deformRightBound
 	if buildLeft {
 		buildPlan = o.plan.Left
 		buildSchema = o.left.Schema()
 		otherWidth = o.lazyRW
+		buildBound = o.deformLeftBound
 	}
 
-	scan := extractSeqScanFromPlan(buildPlan)
+	scan := coopDrivingScan(buildPlan)
 	if scan == nil {
-		return false, fmt.Errorf("parallel build: no SeqScan in build child")
+		return false, fmt.Errorf("parallel build: no driving scan in build child")
 	}
 
 	// Determine worker count. At least 2 producers, capped by
@@ -426,6 +609,29 @@ func (o *joinOp) parallelBuildLazyHashTable(ctx *Context, buildLeft bool) (bool,
 	pscan := newParallelScanState(0)
 	ch := make(chan []Row, gatherChanDepth*(maxProducers+1))
 
+	// E-18 slice 2: when the build side is a JOIN TREE, every producer would
+	// otherwise redo each nested build — the cost objection recorded on
+	// extractSeqScanFromPlan (Q18 35.7 -> 42.9-44.1 s). Prebuild those nested
+	// hash joins ONCE here, in the leader, and hand the producers the tables
+	// by pointer, exactly as a Gather does for its own subtree. A producer
+	// then does the driving scan and the probes and nothing else.
+	//
+	// The publication is put on the WORKER contexts, never on ctx: ctx's own
+	// SharedHashBuilds map may already be published to a surrounding Gather's
+	// participants, and mutating it here would be a write to a map those
+	// goroutines are reading.
+	nested, err := prebuildSharedHashJoins(ctx, buildPlan, func() (Operator, error) {
+		return buildNode(buildPlan, buildBound)
+	})
+	if err != nil {
+		return false, err
+	}
+	defer func() {
+		for _, sb := range nested {
+			sb.release(ctx)
+		}
+	}()
+
 	// Pre-allocate arenas and worker contexts. mctx.Acquire is NOT
 	// goroutine-safe (appends to parent.children without synchronisation).
 	var workerCtxs []*Context
@@ -433,14 +639,38 @@ func (o *joinOp) parallelBuildLazyHashTable(ctx *Context, buildLeft bool) (bool,
 	for i := 0; i < maxProducers; i++ {
 		arena := mmgr.Acquire(ctx.Mctx, mmgr.KindStmt)
 		arenas = append(arenas, arena)
-		workerCtxs = append(workerCtxs, NewWorkerContext(ctx, arena, group.Context()))
+		wctx := NewWorkerContext(ctx, arena, group.Context())
+		// EX0-03c: stamp the fan-out slot so MergeWorkerContext can tag
+		// this producer's sort entries with an explicit index.
+		wctx.workerSlot = i
+		if len(nested) > 0 {
+			// Merge, do not overwrite: a coop build nested under a Gather
+			// must keep seeing the Gather's publication too. The merged map
+			// is fresh per worker and never written after this point.
+			merged := make(map[*optimizer.Join]*sharedHashBuild, len(ctx.SharedHashBuilds)+len(nested))
+			for k, v := range ctx.SharedHashBuilds {
+				merged[k] = v
+			}
+			for k, v := range nested {
+				merged[k] = v
+			}
+			wctx.SharedHashBuilds = merged
+		}
+		workerCtxs = append(workerCtxs, wctx)
 	}
 
 	// Launch producers.
 	for i := 0; i < maxProducers; i++ {
 		wctx := workerCtxs[i]
 		group.Go(func(workerCtx context.Context) error {
-			tree, err := BuildWorker(buildPlan)
+			// EX0-03b: coop throwaway tree — scope explicitly NIL
+			// (uninstrumented, exactly today's behavior). Producer
+			// goroutines build concurrently, so the mutex-serialized
+			// NIL handoff also keeps a concurrent Gather site's fresh
+			// table out of this tree.
+			tree, err := buildUnderNilScope(func() (Operator, error) {
+				return buildNode(buildPlan, buildBound)
+			})
 			if err != nil {
 				return err
 			}
@@ -464,7 +694,7 @@ func (o *joinOp) parallelBuildLazyHashTable(ctx *Context, buildLeft bool) (bool,
 				if err != nil {
 					return err
 				}
-				batch = append(batch, MaterializeForTransfer(slot.Row()))
+				batch = append(batch, transferRowForQueue(slot))
 				if len(batch) >= gatherBatchRows {
 					select {
 					case ch <- batch:
@@ -545,6 +775,12 @@ func (o *joinOp) parallelBuildLazyHashTable(ctx *Context, buildLeft bool) (bool,
 		return false, loopErr
 	}
 
+	if o.batches != nil {
+		coopSpillingBuilds.Add(1)
+	}
+	if o.multiKey() {
+		coopCompositeBuilds.Add(1)
+	}
 	o.recordBuildTime(ctx, buildStart)
 	return probeIsLeft, nil
 }

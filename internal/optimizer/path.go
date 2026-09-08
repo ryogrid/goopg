@@ -16,7 +16,10 @@ package optimizer
 // startup cost, each within a multiplicative STD_FUZZ_FACTOR (:50) tolerance.
 // add_path (:464) folds in pathkeys, parallel_safe, and required-outer relids.
 
-import "github.com/goopg/goopg/internal/catalog"
+import (
+	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/parser"
+)
 
 // stdFuzzFactor is PG's STD_FUZZ_FACTOR (pathnode.c:50): two costs within 1% are
 // treated as equal, and the tie is broken on the non-cost dimensions. This is the
@@ -57,6 +60,24 @@ const (
 	PathNestLoop
 	PathAgg
 	PathSort
+	// PathDistinct is C-16's (P4-07) DISTINCT upper-rel candidate — the
+	// hashed or unique (DistinctOn-emitted) way to deduplicate one
+	// input. Produced only by `addDistinctPaths` (distinctpaths.go) and
+	// consumed only by `createDistinctPlan`, because goopg's executor
+	// expresses the choice as `*Distinct` vs all-columns `*DistinctOn`.
+	PathDistinct
+	// PathWindow is C-18's (P4-09) WINDOW upper-rel candidate: window-function
+	// evaluation over one input. Produced only by `addWindowPaths`
+	// (windowsetoppaths.go) and consumed only by `createWindowPlan`. There is
+	// exactly one form — goopg's `windowOp` sorts internally, so no presorted
+	// variant exists to distinguish (C-14 is the resume point).
+	PathWindow
+	// PathSetOp is C-18's (P4-09) SETOP upper-rel candidate: one
+	// UNION/INTERSECT/EXCEPT node over TWO inputs. It is the only two-input
+	// upper candidate in the tree — `Children` holds left then right, the
+	// order `createSetOpPlan` reads them back in. Produced only by
+	// `addSetOpPaths` and consumed only by `createSetOpPlan`.
+	PathSetOp
 	PathGather
 	PathGatherMerge
 	// PathMemoize is PG's `MemoizePath` (pathnodes.h:2079): a caching wrapper
@@ -77,6 +98,21 @@ const (
 	PathBitmapHeapScan
 	PathBitmapAnd
 	PathBitmapOr
+
+	// PathFinalizeAgg is C-19g's upper-rel-resident partial-aggregation
+	// candidate (partialaggupper.go): the whole
+	// `Finalize -> Gather -> Partial` shape as ONE path on the GROUP_AGG rel.
+	//
+	// It is one kind rather than three stacked ones because goopg's executor
+	// expresses the split as a linked PAIR — `Aggregate.PartialSource` points
+	// at the very `*Aggregate` the Gather runs, and the Partial node publishes
+	// group states through that pointer instead of emitting rows — so the
+	// three nodes cannot be built independently by three createPlan arms. The
+	// path still CARRIES its partial and gather children (they are what the
+	// cost is composed from, and what a trace shows); the arm reads the input
+	// subtree off the bottom of that chain and hands the shape to
+	// `splitAggregate`, the same constructor the post-pass uses.
+	PathFinalizeAgg
 )
 
 // Path is one way to produce a relation, with a cost and an ordering. It is kept
@@ -84,7 +120,94 @@ const (
 // specific data in a narrow payload rather than a fat struct (design ch. 03 §1).
 type Path struct {
 	Kind PathKind
-	Rel  *RelOptInfo
+
+	// Jointype is the join this path PERFORMS — PG's `JoinPath.jointype`
+	// (pathnodes.h:2119: "JoinPath is used to represent all types of join
+	// nodes", with `JoinType jointype` on the node itself). PG has no
+	// PathSemi/PathAnti kind either: NestPath/MergePath/HashPath each carry
+	// the jointype, and `add_paths_to_joinrel` (joinpath.c:124) is passed one
+	// per call.
+	//
+	// C-03a (docs/design/planner-c03-jointype-search/DESIGN.md §4): the field
+	// lands INERT. `parser.JoinInner` is the zero value
+	// (internal/parser/ast.go:727, pinned by TestPathJointypeDefaultsToInner),
+	// so every path that does not set it — every scan path, every Sort /
+	// Agg / Gather wrapper, every path built by a test fixture — reads as an
+	// inner join and behaves exactly as before. Only C-03b makes a producer
+	// stamp anything else, and only C-03c lets it reach `Join.Type`.
+	//
+	// The carrier is the PATH, never the `RelOptInfo`: a relset-keyed
+	// singleton (findRel/addRel, first-writer-wins) cannot hold one jointype,
+	// because different pairs spanning one relset can match different SJIs and
+	// the rel's jointype would become arrival-order dependent. Mixed-jointype
+	// pathlists coexist on one rel, exactly as in PG.
+	//
+	// Must-avoid list (the sibling precedent is Target/NCols below): jointype
+	// is a CORRECTNESS attribute decided by legality, not a cost dimension, so
+	// it stays out of `comparePathCostsFuzzily`, `comparePaths` and
+	// `comparePathCosts` — costs alone decide dominance, and `setCheapest`
+	// inherits that rule. Any cross-jointype pruning question belongs to C-04,
+	// with the enumeration that produces it.
+	Jointype parser.JoinType
+
+	// AggStrategy is the aggregation this path PERFORMS — PG's
+	// `AggPath.aggstrategy`, set per path by `add_paths_to_grouping_rel`
+	// (planner.c:7114). Same carrier rule as Jointype above: the PATH, never
+	// the `RelOptInfo`, because sorted and hashed candidates coexist on one
+	// GROUP_AGG rel and the rel cannot hold one strategy.
+	//
+	// C-15 (docs/design/planner-p4-grouping-paths/DESIGN.md §3.1): the field
+	// lands with its first producer. `AggStrategyHashed` is the zero value
+	// (`plan.go:1356`), so every path that does not set it — every non-agg
+	// path, every test fixture — reads as hashed and behaves exactly as
+	// before. Unordered (non-grouped) aggregates also carry Hashed: today
+	// they keep the zero value with the plain "Aggregate" label, and the
+	// producer preserves that mapping (no Plain enum value exists).
+	//
+	// Same must-avoid list as Jointype: strategy is decided by the producer,
+	// costs alone decide dominance.
+	AggStrategy AggStrategy
+
+	// Agg is the aggregate SPEC a PathAgg performs — the `*Aggregate`
+	// `buildAggregateStage` built (GroupExprs, Aggs, GroupingSets, Mode,
+	// Passthrough, GroupingMasks, GroupKeyOrder, pos, schema), whose Child
+	// the arm replaces with the built input and whose Strategy it sets from
+	// AggStrategy. One spec per candidate: the Sort-driven variants share
+	// the built spec, the index-driven variant carries the narrowed clone
+	// (`buildIndexOrderedScan` remaps to narrowed positions). nil for every
+	// other kind; `createAggPlan` panics on a PathAgg without one, the same
+	// way `createSortPlan` panics on a Sort without pathkeys.
+	Agg *Aggregate
+
+	// Distinct is the DISTINCT spec a PathDistinct performs — the
+	// `*Distinct` built at the wrapper site (pos, schema), whose Child the
+	// arm replaces with the built input. Shared by both candidates
+	// (hashed, unique); unlike AggStrategy's copy problem there is
+	// nothing per-variant to carry, because the input-child difference
+	// already rides in Children[0]. nil for every other kind.
+	Distinct *Distinct
+
+	// Unique switches a PathDistinct's emitted node kind: false emits
+	// `*Distinct` (hash dedup), true emits `DistinctOn` with all-output-
+	// columns keys (streaming adjacent dedup over the producer-stacked
+	// Sort). Set only by the unique arm, read only by `createDistinctPlan`
+	// (C-16b). Never pruned on: costs alone decide, exactly as for every
+	// other path attribute above.
+	Unique bool
+
+	// Window is the window SPEC a PathWindow evaluates — the `*WindowAgg`
+	// `buildWindowStage` built for one spec group (PartitionBy, OrderBy,
+	// Funcs, Frame, pos, schema), whose Child the arm replaces with the
+	// built input. nil for every other kind; `createWindowPlan` panics on a
+	// PathWindow without one, as `createAggPlan` does for PathAgg. C-18.
+	Window *WindowAgg
+
+	// SetOp is the set-operation SPEC a PathSetOp performs — the `*SetOp`
+	// the `applySetOp` fold built (Op, All, pos), whose Left/Right the arm
+	// replaces with the two built inputs. nil for every other kind. C-18.
+	SetOp *SetOp
+
+	Rel *RelOptInfo
 
 	Cost Cost
 
@@ -109,8 +232,37 @@ type Path struct {
 	Pathkeys []PathKey
 
 	// ParallelSafe / ParallelWorkers describe parallel eligibility. Workers > 0
-	// only for partial paths (design ch. 08 §2). Unused until C5.
-	ParallelSafe    bool
+	// only for partial paths (design ch. 08 §2).
+	ParallelSafe bool
+
+	// ParallelAware is PG's `path->parallel_aware` ("engage parallel-aware
+	// logic?", pathnodes.h) — C-19f. It says this node's OPERATOR behaves
+	// differently when several participants run it, as opposed to merely being
+	// safe to run inside one of them (`ParallelSafe`) or being a per-worker
+	// slice of a relation (`ParallelWorkers`).
+	//
+	// Set today by `addPartialHashJoinPath` and by nothing else. goopg's
+	// meaning of "parallel-aware hash join" is not upstream's: PG sets the flag
+	// only for `Parallel Hash` (a partial inner built cooperatively in DSM),
+	// while every hash join inside a goopg Gather's partial subtree is treated
+	// specially by the executor — `HasShareableHashJoin` selects it,
+	// `prebuildSharedHashJoins` runs its build ONCE in the leader, and each
+	// participant adopts the published table. See
+	// docs/design/planner-c19f-parallel-hashjoin/DESIGN.md §5.
+	//
+	// It reaches `createPlan` as a fail-closed ASSERTION rather than as a node
+	// field: the executor derives its parallel behaviour by walking the BUILT
+	// tree, so there is nothing for a flag to carry — what the flag buys is
+	// `createHashJoinPlan` refusing to build a node it has just declared
+	// parallel-aware when the executor's own `hashJoinIsPartialCapable` would
+	// decline to run it that way.
+	//
+	// Declared between the two `ParallelSafe`/`ParallelWorkers` fields rather
+	// than after them so the two bools share one padding word: this struct is
+	// allocated thousands of times per join search, and appending the bool
+	// after the int would have grown it from 336 to 344 bytes for one bit.
+	ParallelAware bool
+
 	ParallelWorkers int
 
 	// NCols / AvgVarBytes describe what THIS PATH emits, when that is narrower
@@ -121,10 +273,33 @@ type Path struct {
 	NCols       int
 	AvgVarBytes float64
 
+	// Target / TargetKnown is the scan's emitted-column list — take2 P4-01
+	// Slice 1 (planner-p4-01-target DESIGN, "Slice 1"): the ordered
+	// emitted-column list computed from NeededCols at path-creation time,
+	// extending the landed NCols/AvgVarBytes pair toward a column list. SCAN
+	// paths only (PathSeqScan/PathIndexScan); unset on every other kind.
+	//
+	// Stored in EMITTED-SCHEMA order — ascending leaf-output positions, the
+	// shape `neededKeepSet` returns — so Slice 2's ascending checks pass
+	// without guard loosening. NEVER applied: no createPlan change, no cost
+	// change — behaviour-neutral by construction (modulo allocator noise: one
+	// small slice header per path). TargetKnown false means "unknown": the
+	// collector declined (NeededColsKnown false) or the rel carries no leaf
+	// schema, and no narrowing may be attempted. It is NOT the same as an
+	// empty list.
+	//
+	// Must-avoid list: comparePaths dims (Target stays out), cost readers
+	// (pathNCols/pathAvgVarBytes read NCols/AvgVarBytes only), DPPATH format,
+	// EXPLAIN output, any Path equality/golden.
+	Target      []int
+	TargetKnown bool
+
 	// DisabledNodes reproduces PG 18's path->disabled_nodes (the count of
-	// enable_*-disabled nodes below this path). goopg has no enable_* GUCs, so it
-	// is always 0 today; carried so the dominance order matches PG and adding
-	// enable_* later is a data change, not a code change (design ch. 02 §2.2).
+	// enable_*-disabled nodes below this path). It is assigned by the join
+	// producers (P2-05), the Sort producer (B-17a) and the scan producers
+	// (B-17d) via disabledNodesFor, and read before any cost by the dominance
+	// order, so adding a further enable_* later is a data change at the
+	// producer, not a code change to the comparison.
 	DisabledNodes int
 
 	// RequiredOuter is the set of outer relations a parameterized path depends on
@@ -255,6 +430,36 @@ type RelOptInfo struct {
 	NeededCols      map[string]bool
 	NeededColsKnown bool
 
+	// OutputCols / OutputColsKnown carry the statement's ABOVE-TREE
+	// needed-column set (outputColumnNames, pathindexonlyneed.go): the
+	// names read by consumers above the scan/join tree rather than by
+	// tree-internal quals. Take2 P4-01 Slice 3 (planner-p4-01-target
+	// DESIGN, "Slice 3+"): the union needed above the tree from which
+	// per-joinrel keep-sets derive (F1).
+	//
+	// Like NeededCols it is a statement property travelling by reference,
+	// stamped by the search alongside NeededCols — but ONLY on problems
+	// eligible for parent-aware narrowing (the statement-top problem with
+	// no pinned spine above it; subproblems and spine prefixes keep the
+	// zero value, and the derivation declines there by construction).
+	// OutputColsKnown false, or a nil map, means "no information": narrow
+	// nothing beyond the statement-wide set.
+	OutputCols      map[string]bool
+	OutputColsKnown bool
+
+	// JoinKeep / JoinKeepKnown is this rel's DERIVED joinrel tlist (F1):
+	// the column names the built node for this rel must still emit when
+	// consumed as a hash-join build side — the union of the above-tree
+	// set, the ancestor join quals and the parent join's own quals,
+	// intersected with what this rel supplies. Stamped by the
+	// deriveJoinKeeps pre-pass over the CHOSEN tree (narrowoutput.go),
+	// never by a parent onto a shared path: rels are per-relset singletons
+	// with one position in the chosen tree, while paths are shared across
+	// candidate parents via CheapestTotal. JoinKeepKnown false, or a nil
+	// map, means "no derivation": fall back to the Slice-2 arms.
+	JoinKeep      map[string]bool
+	JoinKeepKnown bool
+
 	// AvgVarBytes is the average total variable-width payload per row, in
 	// bytes — the sum of the per-column average widths (ColumnStats.AvgWidth)
 	// across every column of this relation. It feeds `hashsize.EntryBytes` as
@@ -265,8 +470,39 @@ type RelOptInfo struct {
 	// M0128-P3.1.
 	AvgVarBytes float64
 
+	// ColVarBytes is the same statistic BEFORE it is summed: column name →
+	// that column's ColumnStats.AvgWidth. It exists because AvgVarBytes is
+	// the whole relation's payload while a hash join's build side retains
+	// only the columns `narrowBuildInput` keeps (narrowoutput.go), so the
+	// two disagree by every dropped column's width — on TPC-H Q9's `orders`
+	// build, 74 B/row of a 194 B/row modelled entry against 120 B/row
+	// measured. `buildAvgVarBytes` (createplanjoin.go) re-sums this over the
+	// schema the build actually emits. nil means "no per-column statistics":
+	// callers fall back to AvgVarBytes, which OVER-states rather than
+	// under-states the entry.
+	//
+	// Set alongside AvgVarBytes by the same two constructors; a join rel's
+	// map is the union of its inputs'.
+	ColVarBytes map[string]float64
+
 	Pathlist        []*Path
 	PartialPathlist []*Path
+
+	// ConsiderParallel is PG's `RelOptInfo.consider_parallel`
+	// (pathnodes.h:911): whether it is worth generating partial paths for
+	// this rel at all — the relation can be read by a worker (not temp, not
+	// a virtual catalog), and its restriction quals and outputs are
+	// parallel-safe. C-19a (take3 08 §8, `set_rel_consider_parallel`,
+	// allpaths.c:589): set per base rel by `setBaseRelConsiderParallel`
+	// (considerparallel.go) and propagated to a join rel in `makeJoinRel` as
+	// "both inputs and the join's own clauses" (build_join_rel,
+	// relnode.c:842).
+	//
+	// false is the zero value and the safe one: a rel that never went
+	// through the step gets no partial paths and marks every path it owns
+	// parallel-unsafe, exactly as `build_simple_rel` initialises it
+	// (relnode.c:213 "might get changed later").
+	ConsiderParallel bool
 
 	CheapestTotal   *Path
 	CheapestStartup *Path
@@ -302,6 +538,29 @@ type RelOptInfo struct {
 	// P5.4b-ii reads exactly this list. Empty until parameterised paths exist.
 	CheapestParameterized []*Path
 
+	// rangeTblEntry is the search's range-table entry for this rel — PG's
+	// `RangeTblEntry` reduced to what the search reads (C-20h/P6-07, take3
+	// 08 §9; C-20b's recommended shape). It is EMBEDDED by value, so
+	// `rel.baseLeaf` and `rel.baseOffset` keep working through Go's field
+	// promotion and no consumer moves; what it buys is that the two fields
+	// stop being loose members of a 30-field struct and become the named
+	// thing they have always been — the entry `Var.varno` would address.
+	//
+	// The rest of P6-07 — giving `ColumnRef` a `(varno, attno)` address so
+	// that a `setrefs` pass, not each producer, computes positions — is NOT
+	// landed here and is ledgered (`take3-C-20h-var-migration`). Until it is,
+	// `baseOffset` remains the position half of the coordinate map and the
+	// boundary assertions in `createplanroot.go` remain the detector for the
+	// wrong-answer class that arrangement admits.
+	rangeTblEntry
+}
+
+// rangeTblEntry is one FROM item as the join search sees it: what a base relid
+// MEANS (`baseLeaf`) and where its columns USED TO BE (`baseOffset`). Both
+// halves are set together by `buildInitialRels` (joinsearch.go) from the
+// statement's `rangeBinding` list, and both are meaningful only on level-1
+// rels — a join rel carries the zero value.
+type rangeTblEntry struct {
 	// baseLeaf is the executor Node the pre-search pipeline handed
 	// `buildInitialRels` for this FROM item — the search boundary's half of
 	// 03 §10's coordinate map, recording what a base relid MEANS: the relation,
@@ -350,6 +609,15 @@ func newRelOptInfo(relids RelSet, rows float64, width int) *RelOptInfo {
 // is a base rel. Zero is returned only when neither is available, and
 // hashJoinCost reads that as "assume no spill", which is what it did before
 // this function existed.
+// relAvgVarBytes is `relNCols`' variable-payload twin at REL granularity: the
+// statistic `RelOptInfo.AvgVarBytes` carries, nil-safe for the same callers.
+func relAvgVarBytes(r *RelOptInfo) float64 {
+	if r == nil {
+		return 0
+	}
+	return r.AvgVarBytes
+}
+
 // pathNCols is `relNCols` at PATH granularity — take2 P1-20's sibling in
 // P4-01.
 //
@@ -406,7 +674,7 @@ func relNCols(r *RelOptInfo) int {
 // consulted); Rows is taken from the rel. This is the C0 bridge (design ch. 03
 // §3.1).
 func newPrebuiltPath(rel *RelOptInfo, n Node) *Path {
-	return &Path{Kind: PathPrebuilt, Rel: rel, Rows: rel.Rows, node: n}
+	return &Path{Kind: PathPrebuilt, Rel: rel, Rows: rel.Rows, node: n, ParallelSafe: rel.ParallelSafeForPath()}
 }
 
 // pathCostComparison is the result of compare_path_costs_fuzzily.
@@ -634,17 +902,128 @@ func pathlistVerdict(list []*Path, newPath *Path, _ int) pathVerdict {
 	return verdictDominated
 }
 
-// addPartialPath is add_partial_path (pathnode.c:798): the same dominance pruning
-// over the partial pathlist, used for parallel candidates (design ch. 08 §2).
-// Present now; exercised from C5.
+// addPartialPath is add_partial_path (pathnode.c:798): dominance pruning over
+// the partial pathlist, used for parallel candidates (design ch. 08 §2).
+//
+// C-19c (ledger `take3-C-19ab-review-deferred` item (c)): it does NOT reuse
+// addPath's comparator. Upstream's is deliberately narrower — "Because we
+// don't consider parameterized paths here, we also don't need to consider the
+// row counts as a measure of quality" and "Neither do we need to consider
+// startup costs: parallelism is only used for plans that will be run to
+// completion" (pathnode.c:770-790). So a partial path is judged on TOTAL cost
+// and pathkeys only, plus disabled_nodes. The serial comparator's other three
+// axes would each let a path survive here that PG drops: a lower-startup /
+// higher-total path is "incomparable" on the cost axis to add_path (when its
+// rel considers startup) but simply dearer to add_partial_path; every partial
+// path is parallel-safe, so that axis can only ever be a tie; and none is
+// parameterised (`required_outer == NULL` at every producer), so the
+// required-outer axis is a tie too. The two lists first hold rivals here —
+// a rel with a partial seq scan AND a partial index scan — which is why this
+// slice lands the comparator.
+//
+// The list is kept in ascending total-cost order like upstream's (`insert_at`),
+// so `PartialPathlist[0]` is the cheapest partial path — what
+// generate_useful_gather_paths reads as `linitial(rel->partial_pathlist)`
+// (C-19d).
+//
+// PG asserts `new_path->parallel_safe` and `parent_rel->consider_parallel`.
+// Here both are refused rather than asserted: a partial path that is not
+// parallel-safe, or offered on a rel that does not consider parallel, is not
+// a candidate at all, and refusing fails closed (a path not offered cannot
+// be chosen), where a panic inside the planner would fail the statement.
 func addPartialPath(rel *RelOptInfo, newPath *Path, producer string) {
-	before := len(rel.PartialPathlist)
-	rel.PartialPathlist = addToPathlist(rel.PartialPathlist, newPath)
+	if newPath == nil || !newPath.ParallelSafe || !rel.ConsiderParallel {
+		return
+	}
+	rel.PartialPathlist = addToPartialPathlist(rel.PartialPathlist, newPath)
+	verdict := verdictDominated
+	for _, p := range rel.PartialPathlist {
+		if p == newPath {
+			verdict = verdictAccepted
+			break
+		}
+	}
 	// The partial list is traced too: `parallelism` is one of the nine
 	// divergence classes the parity work tracks, so a provenance channel that
 	// covered only addPath could not answer whether a partial path was ever
 	// offered.
-	tracePath(rel, newPath, producer, true, pathlistVerdict(rel.PartialPathlist, newPath, before))
+	tracePath(rel, newPath, producer, true, verdict)
+}
+
+// addToPartialPathlist is add_partial_path's loop (pathnode.c:820-893). Each
+// incumbent whose pathkeys are comparable with the newcomer's (one a prefix of
+// the other — PATHKEYS_EQUAL / BETTER1 / BETTER2, i.e. not
+// PATHKEYS_DIFFERENT) yields exactly one survivor of the pair:
+//
+//   - disabled_nodes differ: the lower count wins;
+//   - totals differ by more than STD_FUZZ_FACTOR: the cheaper wins unless the
+//     dearer has strictly better pathkeys, in which case both stay;
+//   - totals fuzzily equal: better pathkeys win; with equal pathkeys the
+//     incumbent stays unless the newcomer is cheaper by more than 1e-10
+//     (upstream's 1.0000000001, which is what keeps a re-offered identical
+//     path from replacing the first).
+//
+// Incomparable pathkeys leave both. The newcomer is inserted after the last
+// incumbent whose total cost it does not undercut, which keeps the list
+// sorted by total cost as long as every insertion goes through here.
+func addToPartialPathlist(list []*Path, newPath *Path) []*Path {
+	acceptNew := true
+	insertAt := 0
+	survivors := make([]*Path, 0, len(list)+1)
+	for i, old := range list {
+		removeOld := false
+		keys := comparePathkeysDim(newPath.Pathkeys, old.Pathkeys)
+		if keys != dimIncomparable {
+			switch {
+			case newPath.DisabledNodes != old.DisabledNodes:
+				if newPath.DisabledNodes > old.DisabledNodes {
+					acceptNew = false
+				} else {
+					removeOld = true
+				}
+			case newPath.Cost.Total > old.Cost.Total*stdFuzzFactor:
+				// New path costs more; keep it only if pathkeys are better.
+				if keys != dimBetter1 {
+					acceptNew = false
+				}
+			case old.Cost.Total > newPath.Cost.Total*stdFuzzFactor:
+				// Old path costs more; keep it only if pathkeys are better.
+				if keys != dimBetter2 {
+					removeOld = true
+				}
+			case keys == dimBetter1:
+				// Costs are about the same, new path has better pathkeys.
+				removeOld = true
+			case keys == dimBetter2:
+				// Costs are about the same, old path has better pathkeys.
+				acceptNew = false
+			case old.Cost.Total > newPath.Cost.Total*1.0000000001:
+				// Pathkeys are the same, and the old path costs more.
+				removeOld = true
+			default:
+				// Pathkeys are the same, and new path isn't materially
+				// cheaper.
+				acceptNew = false
+			}
+		}
+		if !removeOld {
+			survivors = append(survivors, old)
+			// New belongs after this old path if it has cost >= old's.
+			if newPath.Cost.Total >= old.Cost.Total {
+				insertAt = len(survivors)
+			}
+		}
+		if !acceptNew {
+			// An incumbent dominates the newcomer: stop scanning, keep the
+			// rest untouched (upstream assumes the newcomer cannot dominate
+			// any later path either).
+			return append(survivors, list[i+1:]...)
+		}
+	}
+	survivors = append(survivors, nil)
+	copy(survivors[insertAt+1:], survivors[insertAt:])
+	survivors[insertAt] = newPath
+	return survivors
 }
 
 func addToPathlist(list []*Path, newPath *Path) []*Path {

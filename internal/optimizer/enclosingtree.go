@@ -113,6 +113,10 @@ type enclosingNodeScope struct {
 // index in one is the same defect; the shallow walker's omission is recorded as
 // a ledger row rather than fixed here, because that walker's callers are
 // rewriters and widening a rewriter's reach is not a P5.5-f change.
+// (B-01c window cut: walkPlanExprs has since been widened to cover exactly
+// these arms (unnest.go), audited safe for all 15 callers — the ledger row
+// above is retained as history, and this enumeration stays the wider,
+// independent check by design.)
 func enclosingNodeScopeOf(n Node) (enclosingNodeScope, bool) {
 	switch x := n.(type) {
 	case *Project:

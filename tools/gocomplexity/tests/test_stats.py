@@ -6,6 +6,7 @@ import unittest
 
 from tools.gocomplexity.config import Config
 from tools.gocomplexity.models import FunctionMetric
+from tools.gocomplexity.sourcemetrics import DuplicationResult
 from tools.gocomplexity.stats import build_summary
 
 
@@ -36,7 +37,7 @@ class StatsTest(unittest.TestCase):
     def test_counts(self) -> None:
         s = build_summary(
             self.metrics, self.config, "now", num_files=3, sources={},
-            duplication=(0.0, 0, 0),
+            duplication=DuplicationResult(0.0, 0, 0),
         )
         self.assertEqual(s.num_functions, 4)
         self.assertEqual(s.num_packages, 2)
@@ -45,7 +46,7 @@ class StatsTest(unittest.TestCase):
     def test_cyclomatic_stats(self) -> None:
         s = build_summary(
             self.metrics, self.config, "now", num_files=3, sources={},
-            duplication=(0.0, 0, 0),
+            duplication=DuplicationResult(0.0, 0, 0),
         )
         self.assertEqual(s.cyclomatic.maximum, 20)
         self.assertEqual(s.cyclomatic.mean, 9.0)  # (1+5+10+20)/4
@@ -58,7 +59,7 @@ class StatsTest(unittest.TestCase):
         metrics = self.metrics + [_fm(3, None, "b", "F5", "internal/b/z.go", 40)]
         s = build_summary(
             metrics, self.config, "now", num_files=3, sources={},
-            duplication=(0.0, 0, 0),
+            duplication=DuplicationResult(0.0, 0, 0),
         )
         # cognitive count excludes the None entry
         self.assertEqual(s.cognitive.count, 4)
@@ -67,7 +68,7 @@ class StatsTest(unittest.TestCase):
     def test_package_aggregate_ranked_by_total_cc(self) -> None:
         s = build_summary(
             self.metrics, self.config, "now", num_files=3, sources={},
-            duplication=(0.0, 0, 0),
+            duplication=DuplicationResult(0.0, 0, 0),
         )
         # package 'a' total cc = 16, package 'b' = 20 -> b ranks first
         self.assertEqual(s.packages[0].key, "b")
@@ -77,7 +78,7 @@ class StatsTest(unittest.TestCase):
 
     def test_empty_metrics(self) -> None:
         s = build_summary(
-            [], self.config, "now", num_files=0, sources={}, duplication=(0.0, 0, 0)
+            [], self.config, "now", num_files=0, sources={}, duplication=DuplicationResult(0.0, 0, 0)
         )
         self.assertEqual(s.num_functions, 0)
         self.assertEqual(s.cyclomatic.maximum, 0)

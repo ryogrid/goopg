@@ -72,6 +72,7 @@ import (
 	"fmt"
 
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/parser"
 )
 
 // joinlistProblem is everything one statement's joinlist recursion reads. It is
@@ -116,6 +117,40 @@ type joinlistProblem struct {
 	// the STATEMENT, not of a FROM subset.
 	neededCols      map[string]bool
 	neededColsKnown bool
+
+	// outputCols / outputColsKnown carry the statement's above-tree
+	// needed-column set (outputColumnNames) to `searchCtx`. Take2 P4-01
+	// Slice 3: the union needed above the scan/join tree from which
+	// per-joinrel keep-sets derive.
+	outputCols      map[string]bool
+	outputColsKnown bool
+
+	// queryPathkeys carries `PlannerInfo.query_pathkeys` (C-07/P3-06,
+	// querypathkeys.go) to `searchCtx`. It is a property of the STATEMENT,
+	// so every sub-problem of one statement shares it — the same rule
+	// neededCols follows.
+	queryPathkeys []PathKey
+
+	// spineAbove reports that a pinned outer spine sits above this
+	// problem's tree: the spine's ON quals read the searched subtree's
+	// output from above, so parent-aware narrowing is declined here (the
+	// Slice-2 arms still run). Set by the seam, which owns the spine.
+	spineAbove bool
+
+	// pinAbove reports that a pinned semi/anti spine sits above this
+	// problem's tree (runJoinSearchBelowPinned): same decline, same
+	// reason. Carried on the resolve context the seam reads.
+	pinAbove bool
+
+	// corrAbove reports that this problem's statement reads an outer query
+	// level (a current-scope OuterColumnRef in its WHERE or searched ON
+	// quals): post-hoc machinery above the tree reads body-local columns no
+	// statement-level collector can see — the unnest rewrite's decorrelated
+	// group keys and probe keys. Parent-aware narrowing is declined here
+	// (the Slice-2 arms still run). Set by the seam, which owns the
+	// resolved predicate; subquery interiors are stepped over, so only the
+	// body's own correlation declines it. Take2 P4-01 Slice 3.
+	corrAbove bool
 }
 
 // joinlistRel is what a joinlist item resolves to: goopg's stand-in for the
@@ -267,10 +302,12 @@ func makeRelFromJoinlist(jl joinlist, prob *joinlistProblem, tupleFraction float
 		switch {
 		case it.isLeaf():
 			r, err = prob.leafRel(it.rel)
-		case it.pinnedOuter():
-			// M0127-P5.9-s: the search builds INNER joins, so planning a pinned
-			// outer subproblem would emit an inner join where the statement wrote
-			// an outer one and drop its unmatched rows. Upstream cannot reach
+		case it.pinnedUnsearchable():
+			// M0127-P5.9-s: the search builds INNER joins for the types it has
+			// no jointype-aware producer for, so planning such a pinned outer
+			// subproblem would emit an inner join where the statement wrote an
+			// outer one and drop its unmatched rows. C-04a took LEFT out of
+			// that set — see `pinnedUnsearchable`. Upstream cannot reach
 			// this: its joinlist member IS the `JoinExpr`, and
 			// `make_rel_from_joinlist` hands a pinned one to
 			// `make_join_rel`/`join_is_legal`, which honour `jointype`.
@@ -278,14 +315,33 @@ func makeRelFromJoinlist(jl joinlist, prob *joinlistProblem, tupleFraction float
 			// Refusing here is a decline of the whole statement, not of this
 			// item — `planJoinlistSearch`'s error makes the seam fall back to
 			// the syntactic tree (03 §4.2), which still carries the outer join
-			// on its own node. The seam peels an outer SPINE off before it gets
-			// here (`splitOuterSpine`, joinsearchseam.go), so what reaches this
-			// arm is an outer join the peel could not lift out: one below an
-			// inner link, or on a non-first comma FROM item.
+			// on its own node. C-04c admitted the last positional shapes the
+			// peel could not lift out (below an inner link, non-first comma
+			// item), so what reaches this arm is a join type the search has no
+			// producer for — FULL — rather than a LEFT/RIGHT link in an
+			// awkward place.
 			return joinlistRel{}, fmt.Errorf(
 				"join search: joinlist item %d is a pinned %s join, which the search cannot rebuild",
 				i, joinTypeName(it.jointype))
 		default:
+			// C-04b, and it closes a hole C-04a opened: a pinned LEFT/RIGHT
+			// item — a link over a FULL pin; before take3 C-06 retired
+			// `GOOPG_PGSHAPED_COLLAPSE`, also its `=0` regime — is now
+			// handed to the search as a two-item
+			// problem, and the search knows it is an OUTER join only through
+			// `root->join_info_list`. The seam checks that list for the
+			// links it flattens (`outerLinksHaveSJInfos`); this is the same
+			// check for the links it did not, and it is FAIL-CLOSED for the
+			// same reason: with the SpecialJoinInfo missing, every pairing
+			// looks inner and the plan drops the unmatched rows. The
+			// production producer attaches the pointer it also accumulates
+			// (`deconstructFromItemScoped`), so this can fire only on a
+			// joinlist built by hand.
+			if it.pinnedOuter() && !joinInfoListHas(prob.joinInfoList, it.sjinfo) {
+				return joinlistRel{}, fmt.Errorf(
+					"join search: joinlist item %d is a pinned %s join with no SpecialJoinInfo in root->join_info_list; searched, it would be planned as an inner join",
+					i, joinTypeName(it.jointype))
+			}
 			r, err = makeRelFromJoinlist(it.sub, prob, 0)
 		}
 		if err != nil {
@@ -325,6 +381,104 @@ func (prob *joinlistProblem) leafRel(rel int) (joinlistRel, error) {
 	}, nil
 }
 
+// joinInfoListHas reports whether `sj` is a member of `list` by identity — the
+// accumulation and the pinned item carry the SAME pointer
+// (`deconstructFromItemScoped`), which is what
+// TestJoinInfoListProvenanceMatchesJoinlistWalk pins.
+func joinInfoListHas(list []*SpecialJoinInfo, sj *SpecialJoinInfo) bool {
+	if sj == nil {
+		return false
+	}
+	for _, x := range list {
+		if x == sj {
+			return true
+		}
+	}
+	return false
+}
+
+// sjInfosInItemSpace rewrites every SpecialJoinInfo hand from statement-leaf
+// coordinates into the coordinates of ONE search problem — PG has no such step
+// because its joinrels are always base-relid sets, so a sub-joinlist's rel
+// simply carries the union of its leaves; goopg's search numbers a problem's
+// ITEMS `1<<i` and a sub-problem is one opaque item, so a leaf-space hand has
+// to be re-expressed before `joinIsLegal`, `joinOrderRestricted`,
+// `hasJoinRestriction`, `sizeJoinRel` and `paramSourceRelsForProblem` read it.
+//
+// The rule, per hand: item i is a member iff the hand overlaps the leaf range
+// `[items[i].lo, items[i].hi)`. For a single-leaf run starting at leaf 0 this
+// is the identity, which is why every C-03/C-04a fixture passed without it.
+// A hand that touches an item only partially (an outer join's `MinLefthand`
+// narrowed by C-01 to one leaf of an 8-leaf sub-problem) maps to the whole
+// item, which is a STRICTER constraint than the statement's — the item is
+// planned as a unit, so "must contain leaf 0" and "must contain the item
+// holding leaf 0" admit the same item-space joinrels.
+//
+// Leaves OUTSIDE this problem's window — the spine above a peeled prefix,
+// or the enclosing problem's other items when this is a sub-problem — are
+// kept, as one bit just above the window (`1<<len(items)`), rather than
+// dropped. A joinrel of this problem never contains that bit, so every
+// overlap/subset test answers exactly as it did when the outside leaves were
+// bits at or above `nprefix` in the un-remapped list: an SJI whose nullable
+// side lies wholly outside is skipped by `joinIsLegal`'s first test, and the
+// FULL arm of `paramSourceRelsForProblem` still sees a non-empty RHS it does
+// not overlap. Zeroing them instead would turn `relsSubset(0, x)` true in
+// three consumers and change verdicts this fix has no business changing.
+//
+// Fail-closed: a hand cannot need the outside bit when the problem already
+// uses all 32 bits (32 single-leaf items cover every statement leaf), so
+// that combination is reported rather than silently truncated.
+func sjInfosInItemSpace(list []*SpecialJoinInfo, items []joinlistRel) ([]*SpecialJoinInfo, error) {
+	if len(list) == 0 {
+		return nil, nil
+	}
+	var window RelSet
+	ranges := make([]RelSet, len(items))
+	for i, it := range items {
+		ranges[i] = leafRangeRelSet(it.lo, it.hi)
+		window |= ranges[i]
+	}
+	outside := RelSet(1) << uint(len(items))
+	remap := func(hand RelSet) (RelSet, error) {
+		var out RelSet
+		for i := range items {
+			if relsOverlap(hand, ranges[i]) {
+				out |= RelSet(1) << uint(i)
+			}
+		}
+		if hand&^window != 0 {
+			if len(items) >= maxSearchRels {
+				return 0, fmt.Errorf("join search: SpecialJoinInfo hand %#08x reaches outside a %d-item problem that has no spare bit",
+					uint32(hand), len(items))
+			}
+			out |= outside
+		}
+		return out, nil
+	}
+	out := make([]*SpecialJoinInfo, 0, len(list))
+	for _, sj := range list {
+		if sj == nil {
+			continue
+		}
+		c := *sj
+		var err error
+		if c.MinLefthand, err = remap(sj.MinLefthand); err != nil {
+			return nil, err
+		}
+		if c.MinRighthand, err = remap(sj.MinRighthand); err != nil {
+			return nil, err
+		}
+		if c.SynLefthand, err = remap(sj.SynLefthand); err != nil {
+			return nil, err
+		}
+		if c.SynRighthand, err = remap(sj.SynRighthand); err != nil {
+			return nil, err
+		}
+		out = append(out, &c)
+	}
+	return out, nil
+}
+
 // searchOneProblem runs the three-step search protocol over a list of items and
 // returns the chosen tree as one rel.
 //
@@ -332,6 +486,104 @@ func (prob *joinlistProblem) leafRel(rel int) (joinlistRel, error) {
 // must exist before `addBaseRelIndexPaths`, because that is the list an index
 // path is parameterised BY (`create_index_paths` after `deconstruct_jointree`,
 // allpaths.c:191), and every initial rel must already carry its cheapest slots
+// leafIsDerivedInput reports whether a statement leaf is a derived
+// (statistics-less) input: a CTE scan, a recursive CTE's worktable, a
+// FROM-subquery, or a function scan. It tests the leaf's NODE TYPE, and it
+// exists because the obvious test — `relInfos[leaf].table == nil` — is WRONG
+// for the case that matters most. `with.go` hands every CTE binding a
+// synthesised `&catalog.Table{Name: cte.Name, Columns: cols}` so that column
+// resolution works, and that table has no statistics behind it. To the
+// `table == nil` test a CTE scan therefore looks like a base relation, and
+// TPC-DS Q78's three CTE leaves classified as `derived=[false false false]`
+// (traced 2026-09-06): the firewall below was reached with both LEFT sjinfos
+// in hand and declined nothing, and the search ran three rows=1 leaves into
+// an epsilon Nested Loop victory (3.07 vs Hash 3.09) — 15 s became a 327 s
+// timeout. The `table == nil` arm is kept as a fallback for a leaf that has
+// no binding table at all.
+func leafIsDerivedInput(scan Node, info baseRelInfo) bool {
+	// A statement leaf reaches the search WRAPPED: a CTE output with a
+	// pushed-down predicate is `*Filter{Child: *CTEScan}`, not a bare
+	// `*CTEScan`, and a type switch on the top node sees only the Filter.
+	// That is exactly how TPC-DS Q78's three leaves escaped the first
+	// version of this classifier (traced 2026-09-06: `scan=*optimizer.Filter
+	// table=true` for all three, `derived=[false false false]`). Descend
+	// through single-child wrappers to the scan underneath, then classify.
+	for {
+		switch x := scan.(type) {
+		case *Filter:
+			scan = x.Child
+			continue
+		case *Project:
+			scan = x.Child
+			continue
+		}
+		break
+	}
+	switch scan.(type) {
+	case *CTEScan, *WorkTableScan:
+		return true
+	}
+	return info.table == nil
+}
+
+// problemPairsOuterWithDerived reports whether any OUTER hand in sjis
+// (already remapped to this problem's item space by sjInfosInItemSpace)
+// touches an item whose STATEMENT leaves include a derived (table-less)
+// FROM item — a CTE scan, FROM-subquery, or function scan. Derived inputs
+// carry no statistics, so an outer join over them is the catastrophic-choice
+// shape C-04a §4 names and the problem must decline (see the firewall in
+// searchOneProblem).
+//
+// The check reads through to statement leaves (prob.relInfos[leaf].table)
+// rather than trusting items[i].info.table: a searched sub-problem's rel is
+// table-less by construction, and declining on that would refuse every
+// nested outer join, including base-only ones. Syn (not Min) sides are
+// tested — Min can narrow to one leaf of a multi-leaf item, and the question
+// is whether the join READS a derived input, not whether the ordering
+// constraint names it.
+func problemPairsOuterWithDerived(sjis []*SpecialJoinInfo, items []joinlistRel, prob *joinlistProblem) bool {
+	if len(sjis) == 0 || prob == nil {
+		return false
+	}
+	derived := make([]bool, len(items))
+	anyDerived := false
+	for i, it := range items {
+		for leaf := it.lo; leaf < it.hi; leaf++ {
+			if leaf < 0 || leaf >= len(prob.relInfos) {
+				continue
+			}
+			if leafIsDerivedInput(prob.scans[leaf], prob.relInfos[leaf]) {
+				derived[i] = true
+				anyDerived = true
+				break
+			}
+		}
+	}
+	if !anyDerived {
+		return false
+	}
+	for _, sj := range sjis {
+		if sj == nil {
+			continue
+		}
+		switch sj.Jointype {
+		case parser.JoinLeft, parser.JoinRight, parser.JoinFull:
+		default:
+			continue
+		}
+		touched := sj.SynLefthand | sj.SynRighthand
+		for i := range items {
+			if !derived[i] {
+				continue
+			}
+			if touched&(1<<uint(i)) != 0 {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // before `joinSearch` compares anything.
 func (prob *joinlistProblem) searchOneProblem(items []joinlistRel, tupleFraction float64) (joinlistRel, error) {
 	lo, hi := items[0].lo, items[len(items)-1].hi
@@ -353,21 +605,103 @@ func (prob *joinlistProblem) searchOneProblem(items []joinlistRel, tupleFraction
 	}
 	cum[len(items)] = prob.cumOffsets[hi]
 
-	s, err := buildInitialRels(bindings, scans, infos, prob.cp, tupleFraction, prob.joinInfoList)
+	// C-04a fix (Q72): `root->join_info_list` is written in STATEMENT-LEAF
+	// coordinates, and this problem searches in ITEM coordinates. They are the
+	// same space only for the one shape the C-03/C-04a fixtures exercised — a
+	// run of single-leaf items starting at leaf 0. The moment
+	// `join_collapse_limit` splits a JOIN chain (Q72: nine inner links, so the
+	// first eight leaves become ONE sub-problem item and the two LEFT links
+	// are items 2 and 3 of a 4-item problem), the SJI's `MinRighthand` names a
+	// leaf bit no item-space joinrel ever contains, `joinIsLegal` never finds
+	// it relevant, and the LEFT link is searched as an INNER join — the
+	// sjinfo==nil arm, 100 → 84 rows. The list is remapped here, once per
+	// problem, before anything reads it.
+	sjis, err := sjInfosInItemSpace(prob.joinInfoList, items)
 	if err != nil {
 		return joinlistRel{}, err
 	}
+	// C-04a firewall (Q78): a problem that pairs an OUTER hand with a
+	// derived (table-less) input declines. Derived inputs — CTE scans,
+	// FROM-subqueries, function scans — carry no statistics (B-06's
+	// CTE-output synthesis is inert; a searched sub-problem's rel is
+	// table-less by construction too, but the check below reads through
+	// to STATEMENT leaves so those never trigger it), so their rows are
+	// defaults and guards. The search's algorithm comparison on those
+	// defaults is the catastrophic-choice shape C-04a §4 names: Q78's
+	// outer problem costed Nested Loop 3.07 against Hash 3.09 with every
+	// path at rows=1 (the surviving IS NULL priced from the base
+	// 	column's stanullfrac=0 — rowest A3), and the epsilon victory ran
+	// Nested Loop with a Join Filter over full multi-year CTE outputs
+	// (15 s Hash shape → 327 s timeout). C-04a's §4 floor
+	// (applyOuterJoinRowFloor) cannot see it: the floor is the
+	// preserved side's rows, and the lie is IN the preserved side's
+	// rows. Declining falls back to the syntactic tree (03 §4.2), whose
+	// legacy rewrites hash outer joins without a cost comparison — the
+	// pre-C-04a shape. Base-leaf outer problems (Q72) are unaffected;
+	// inner-only problems over derived inputs are unaffected (their
+	// rows=1 is A4-expected and values-passing). Resume: lift when B-06
+	// wires CTE-output stats (TODO_ALL B-06 step 4).
+	if problemPairsOuterWithDerived(sjis, items, prob) {
+		traceSeamDecline("outer-over-derived", len(prob.bindings), len(items))
+		return joinlistRel{}, fmt.Errorf("join search: problem pairs an outer join with a derived input, which carries no statistics")
+	}
+	s, err := buildInitialRels(bindings, scans, infos, prob.cp, tupleFraction, sjis)
+	if err != nil {
+		return joinlistRel{}, err
+	}
+	// C-08: publish the item run beside the clause list — the
+	// param_source_rels derivation remaps statement-global SJI hands
+	// through it (see paramSourceRelsForProblem's frame rule).
+	s.problemItems = items
 	// `addParameterizedIndexPaths` reads `s.clauses`, and `joinSearch` sets it
 	// — so the list is published here, before the producers that consume it,
 	// and handed to `joinSearch` as well rather than left implicit.
 	s.clauses = buildRestrictInfos(prob.conjuncts, 0, cum)
+	// C-07: `root->query_pathkeys`, published beside the clause list because
+	// `hasUsefulPathkeys` reads both.
+	s.queryPathkeys = prob.queryPathkeys
 	s.neededCols, s.neededColsKnown = prob.neededCols, prob.neededColsKnown
+	s.outputCols, s.outputColsKnown = prob.outputCols, prob.outputColsKnown
+	// Take2 P4-01 Slice 3: parent-aware narrowing is eligible only for the
+	// problem covering its statement's whole prefix (a strict sub-joinlist
+	// publishes to an enclosing problem whose quals this derivation cannot
+	// see) with no pinned spine above it (outer or semi/anti — both read
+	// the searched output from above) and no outer-scope reads (a
+	// correlated statement's unnest group/probe keys read body-local
+	// columns above the tree that no collector sees). Anything else keeps
+	// the zero value on its rels, and the derivation declines there by
+	// construction.
+	s.outputEligible = lo == 0 && hi == len(prob.bindings) && !prob.spineAbove && !prob.pinAbove && !prob.corrAbove
 	// take2 P4-01 rev 10 step 1: publish the set onto the base rels, AFTER the
 	// assignment above. buildInitialRels ran eight lines earlier and could not
 	// have seen it — that ordering is what made P4-01b's first version silently
 	// dormant, so the stamp is deliberately here and not there.
 	s.stampNeededColsOnRels()
+	s.stampOutputColsOnRels()
+	// C-19a / C-19b: `set_rel_consider_parallel` for every base rel, then
+	// `create_plain_partial_paths` — in PG's order, the flag inside
+	// set_rel_size and the partial seq scan in set_plain_rel_pathlist right
+	// after the serial one and before create_index_paths (allpaths.c:768-790).
+	// Both steps are AFTER stampNeededColsOnRels because the partial path's
+	// Target is computed from NeededCols, like the serial scans' (P4-01).
+	s.setBaseRelConsiderParallel(prob.cat)
+	s.addBaseRelPartialPaths()
 	s.addBaseRelIndexPaths(prob.cat)
+	// C-19d: `generate_useful_gather_paths` for every BASE rel, which
+	// upstream runs at the end of `set_rel_pathlist` (allpaths.c) — after
+	// every base path producer, before the rel's set_cheapest — and ONLY when
+	// the statement has more than one base rel (`bms_membership(root->
+	// all_baserels) != BMS_SINGLETON`), so that a single-relation statement's
+	// parallelism is decided by the upper planner (partial aggregation)
+	// instead. goopg gets that exclusion for free: a one-item joinlist returns
+	// its rel directly (makeRelFromJoinlist) and never reaches this function,
+	// which is what keeps TPC-H Q1's `Finalize Agg -> Gather -> Partial Agg`
+	// (built by the post-pass) out of this slice's blast radius.
+	//
+	// It runs before the level-2 search reads `CheapestTotal`, and is a no-op
+	// unless GOOPG_GATHER_PATHS is `all` — see DESIGN.md §5 for why `top` is
+	// the arm to measure first.
+	s.addBaseRelGatherPaths()
 	// GEQO: when the query has >= geqo_threshold base relations and geqo is
 	// enabled, use the genetic query optimizer instead of the DP search.
 	builder := newJoinRelBuilder(s, prob.cat)
@@ -395,10 +729,15 @@ func (prob *joinlistProblem) searchOneProblem(items []joinlistRel, tupleFraction
 	}
 	return joinlistRel{
 		// The hole-filler licenses a PADDED boundary slot for exactly the
-		// coordinates a narrowed index-only leaf legitimately dropped: the
-		// column must be provably outside the statement's needed set. Any
-		// other hole still panics — the totality assertion stays loud for
-		// real producer bugs (M0134-0187, DESIGN §21).
+		// coordinates a narrowed leaf legitimately dropped. Take2 P4-01
+		// Slice 3: besides the statement-unneeded columns (the Slice-2
+		// holes), a below-only join key — read by the statement but by
+		// nothing above this root — may be padded, so the license is the
+		// above-tree set when it is known and the needed set otherwise.
+		// Anything the filler does not license still panics, and the seam
+		// falls the search back when the above-root residual references a
+		// padded coordinate — the totality assertion stays loud for real
+		// producer bugs (M0134-0187, DESIGN §21).
 		node: createPlanAtSearchRootRange(p, base, width, func(coord int) (SchemaColumn, bool) {
 			if !prob.neededColsKnown {
 				return SchemaColumn{}, false
@@ -411,7 +750,16 @@ func (prob *joinlistProblem) searchOneProblem(items []joinlistRel, tupleFraction
 						return SchemaColumn{}, false
 					}
 					col := leafSchema[pos]
-					if col.Name == "" || prob.neededCols[col.Name] {
+					if col.Name == "" {
+						return SchemaColumn{}, false
+					}
+					if prob.outputColsKnown && prob.outputCols != nil {
+						if prob.outputCols[col.Name] {
+							return SchemaColumn{}, false
+						}
+						return col, true
+					}
+					if prob.neededCols[col.Name] {
 						return SchemaColumn{}, false
 					}
 					return col, true

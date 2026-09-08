@@ -1,0 +1,128 @@
+=== PLAN-ONLY RUN — §4 clause 6 channel only (09 §5 and the §4 parity ratchet are NOT measured)
+  Queries were EXPLAINed, not EXPLAIN ANALYZEd. Both the §5 estimate audit
+  and the §4 parity ratchet score an estimate against an ACTUAL row count,
+  which this run does not have, so both sections are omitted rather than
+  printed empty, and --fail-on-violation is off. Do not cite this artifact
+  as a §5 or §4 result.
+  What IS measured: the join-spine pairing diff and, with --enum-trace, the
+  clause-6 enumeration provenance. Both are properties of PLANNING, decided
+  before a single tuple moves, so a plan-only run answers clause 6 exactly
+  as a full audit would — in seconds instead of a power run, and without
+  timing content that a co-resident workload could contaminate.
+
+=== JOIN SPINE PAIRINGS vs PG 18.3 (09 §4 clause 6)
+--- Q10
+  F goopg d4  BUSHY     {lineitem+orders} ⋈ {customer+nation}   GOOPG-ONLY PAIRING
+    goopg d7  left-deep {customer} ⋈ {nation}   GOOPG-ONLY PAIRING
+    both  d7  left-deep {lineitem} ⋈ {orders}
+  F PG    d4  left-deep {customer+lineitem+orders} ⋈ {nation}   PG-ONLY PAIRING
+    PG    d7  left-deep {lineitem+orders} ⋈ {customer}   PG-ONLY PAIRING
+--- Q11
+  F both  d4  left-deep {nation+supplier} ⋈ {partsupp}
+    both  d8  left-deep {nation_1+supplier_1} ⋈ {partsupp_1}
+    both  d11 left-deep {nation_1} ⋈ {supplier_1}
+    both  d7  left-deep {nation} ⋈ {supplier}
+--- Q12
+  F both  d4  left-deep {orders} ⋈ {lineitem}
+--- Q13
+  F both  d7  left-deep {customer} ⋈ {orders}
+--- Q14
+  F both  d1  left-deep {lineitem} ⋈ {part}
+--- Q16
+  F goopg d7  left-deep {part+partsupp} ⋈ {supplier}   GOOPG-ONLY PAIRING
+    goopg d10 left-deep {partsupp} ⋈ {part}   GOOPG-ONLY PAIRING
+  F PG    d7  left-deep {partsupp+supplier} ⋈ {part}   PG-ONLY PAIRING
+--- Q17
+  F goopg d1  left-deep {lineitem_1} ⋈ {part} ⋈ {lineitem}   GOOPG-ONLY PAIRING
+  F PG    d1  left-deep {lineitem} ⋈ {lineitem_1+part}   PG-ONLY PAIRING
+--- Q18
+  F goopg d4  left-deep {customer+lineitem+orders} ⋈ {lineitem_1}   GOOPG-ONLY PAIRING
+    goopg d7  left-deep {lineitem+orders} ⋈ {customer}   GOOPG-ONLY PAIRING
+    goopg d10 left-deep {orders} ⋈ {lineitem}   GOOPG-ONLY PAIRING
+  F PG    d4  left-deep {customer+lineitem_1+orders} ⋈ {lineitem}   PG-ONLY PAIRING
+    PG    d7  left-deep {lineitem_1+orders} ⋈ {customer}   PG-ONLY PAIRING
+    PG    d10 left-deep {orders} ⋈ {lineitem_1}   PG-ONLY PAIRING
+--- Q19
+  F both  d1  left-deep {lineitem} ⋈ {part}
+--- Q2
+  F goopg d1  BUSHY     {nation+part+partsupp+region+supplier} ⋈ {nation_1+partsupp_1+region_1+supplier_1}   GOOPG-ONLY PAIRING
+    goopg d4  BUSHY     {part+partsupp} ⋈ {nation+region+supplier}   GOOPG-ONLY PAIRING
+    both  d7  left-deep {nation+region} ⋈ {supplier}
+    goopg d7  left-deep {nation_1+region_1+supplier_1} ⋈ {partsupp_1}   GOOPG-ONLY PAIRING
+    goopg d10 left-deep {nation_1+region_1} ⋈ {supplier_1}   GOOPG-ONLY PAIRING
+    goopg d13 left-deep {nation_1} ⋈ {region_1}   GOOPG-ONLY PAIRING
+    both  d10 left-deep {nation} ⋈ {region}
+    goopg d7  left-deep {part} ⋈ {partsupp}   GOOPG-ONLY PAIRING
+  F PG    d1  left-deep {part} ⋈ {nation+nation_1+partsupp+partsupp_1+region+region_1+supplier+supplier_1}   PG-ONLY PAIRING
+    PG    d7  left-deep {nation+region+supplier} ⋈ {partsupp}   PG-ONLY PAIRING
+    PG    d8  left-deep {region_1} ⋈ {nation_1+partsupp_1+supplier_1}   PG-ONLY PAIRING
+    PG    d11 left-deep {partsupp_1+supplier_1} ⋈ {nation_1}   PG-ONLY PAIRING
+    PG    d14 left-deep {partsupp_1} ⋈ {supplier_1}   PG-ONLY PAIRING
+--- Q20
+  F both  d1  BUSHY     {nation+supplier} ⋈ {lineitem+part+partsupp}
+    goopg d4  left-deep {lineitem} ⋈ {partsupp} ⋈ {part}   GOOPG-ONLY PAIRING
+    both  d4  left-deep {nation} ⋈ {supplier}
+    PG    d4  left-deep {part} ⋈ {lineitem+partsupp}   PG-ONLY PAIRING
+--- Q21
+  F goopg d4  left-deep {l1+l2+nation+orders+supplier} ⋈ {l3}   GOOPG-ONLY PAIRING
+    goopg d7  left-deep {l1+nation+orders+supplier} ⋈ {l2}   GOOPG-ONLY PAIRING
+    goopg d10 left-deep {l1+nation+supplier} ⋈ {orders}   GOOPG-ONLY PAIRING
+    both  d13 left-deep {l1} ⋈ {nation+supplier}
+    both  d16 left-deep {nation} ⋈ {supplier}
+  F PG    d7  left-deep {l1+l2+l3+nation+supplier} ⋈ {orders}   PG-ONLY PAIRING
+    PG    d10 left-deep {l1+l3+nation+supplier} ⋈ {l2}   PG-ONLY PAIRING
+    PG    d13 left-deep {l3} ⋈ {l1+nation+supplier}   PG-ONLY PAIRING
+--- Q22
+  F goopg d4  left-deep {customer_1} ⋈ {customer} ⋈ {orders}   GOOPG-ONLY PAIRING
+  F PG    d4  left-deep {customer} ⋈ {orders}   PG-ONLY PAIRING
+--- Q3
+  F both  d4  left-deep {lineitem} ⋈ {customer+orders}
+    both  d7  left-deep {orders} ⋈ {customer}
+--- Q4
+  F both  d4  left-deep {orders} ⋈ {lineitem}
+--- Q5
+  F goopg d4  left-deep {lineitem+nation+orders+region+supplier} ⋈ {customer}   GOOPG-ONLY PAIRING
+    goopg d7  BUSHY     {lineitem+orders} ⋈ {nation+region+supplier}   GOOPG-ONLY PAIRING
+    goopg d10 left-deep {orders} ⋈ {lineitem}   GOOPG-ONLY PAIRING
+    goopg d10 left-deep {nation+region} ⋈ {supplier}   GOOPG-ONLY PAIRING
+    both  d13 left-deep {nation} ⋈ {region}
+  F PG    d7  left-deep {customer+lineitem+nation+orders+region} ⋈ {supplier}   PG-ONLY PAIRING
+    PG    d10 left-deep {customer+nation+orders+region} ⋈ {lineitem}   PG-ONLY PAIRING
+    PG    d13 left-deep {customer+nation+region} ⋈ {orders}   PG-ONLY PAIRING
+    PG    d16 left-deep {nation+region} ⋈ {customer}   PG-ONLY PAIRING
+--- Q7
+  F both  d4  BUSHY     {customer+lineitem+n2+orders} ⋈ {n1+supplier}
+    goopg d7  BUSHY     {lineitem+orders} ⋈ {customer+n2}   GOOPG-ONLY PAIRING
+    both  d10 left-deep {customer} ⋈ {n2}
+    goopg d10 left-deep {lineitem} ⋈ {orders}   GOOPG-ONLY PAIRING
+    both  d7  left-deep {supplier} ⋈ {n1}
+    PG    d7  left-deep {customer+n2+orders} ⋈ {lineitem}   PG-ONLY PAIRING
+    PG    d10 left-deep {customer+n2} ⋈ {orders}   PG-ONLY PAIRING
+--- Q8
+  F goopg d4  left-deep {customer+lineitem+n1+orders+part+region+supplier} ⋈ {n2}   GOOPG-ONLY PAIRING
+    goopg d7  left-deep {customer+lineitem+n1+orders+part+region} ⋈ {supplier}   GOOPG-ONLY PAIRING
+    goopg d10 BUSHY     {lineitem+orders+part} ⋈ {customer+n1+region}   GOOPG-ONLY PAIRING
+    both  d13 left-deep {n1+region} ⋈ {customer}
+    both  d13 left-deep {orders} ⋈ {lineitem+part}
+    both  d16 left-deep {part} ⋈ {lineitem}
+    both  d16 left-deep {n1} ⋈ {region}
+  F PG    d4  BUSHY     {lineitem+n2+orders+part+supplier} ⋈ {customer+n1+region}   PG-ONLY PAIRING  <== CLAUSE-6 CANDIDATE
+    PG    d7  left-deep {lineitem+orders+part+supplier} ⋈ {n2}   PG-ONLY PAIRING
+    PG    d10 left-deep {lineitem+orders+part} ⋈ {supplier}   PG-ONLY PAIRING
+--- Q9
+  F goopg d4  left-deep {lineitem+nation+orders+part+supplier} ⋈ {partsupp}   GOOPG-ONLY PAIRING
+    goopg d7  BUSHY     {lineitem+orders+part} ⋈ {nation+supplier}   GOOPG-ONLY PAIRING
+    goopg d10 left-deep {orders} ⋈ {lineitem+part}   GOOPG-ONLY PAIRING
+    goopg d13 left-deep {lineitem} ⋈ {part}   GOOPG-ONLY PAIRING
+    goopg d10 left-deep {supplier} ⋈ {nation}   GOOPG-ONLY PAIRING
+  F PG    d4  left-deep {orders} ⋈ {lineitem+nation+part+partsupp+supplier}   PG-ONLY PAIRING
+    PG    d10 left-deep {nation+part+partsupp+supplier} ⋈ {lineitem}   PG-ONLY PAIRING
+    PG    d13 left-deep {part+partsupp+supplier} ⋈ {nation}   PG-ONLY PAIRING
+    PG    d16 left-deep {part+partsupp} ⋈ {supplier}   PG-ONLY PAIRING
+    PG    d19 left-deep {partsupp} ⋈ {part}   PG-ONLY PAIRING
+
+=== SPINE SUMMARY (09 §4 clause 6)
+  queries compared: 22; pairings: 26 matched, 33 goopg-only, 31 PG-only
+  bushy spine chosen by: goopg 7 (Q2, Q5, Q7, Q8, Q9, Q10, Q20) | PG 3 (Q7, Q8, Q20)
+  CLAUSE-6-CANDIDATE Q8: {lineitem+n2+orders+part+supplier} ⋈ {customer+n1+region} (Hash Join, BUSHY) — enumerated-and-lost vs never-enumerated is NOT decidable from the plan (P5.9-l-ii)
+  RATCHET spine_pg_only=31 spine_goopg_only=33 bushy_pg=3 bushy_goopg=7 clause6_candidates=1

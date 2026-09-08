@@ -1,0 +1,87 @@
+Limit  (cost=18251.83..18251.99 rows=3 width=84)
+  ->  Incremental Sort  (cost=18251.83..18251.99 rows=3 width=84)
+        Sort Key: ('web'::text), web.return_rank, web.currency_rank, web.item
+        Presorted Key: ('web'::text)
+        ->  Unique  (cost=18251.81..18251.85 rows=3 width=84)
+              ->  Sort  (cost=18251.81..18251.81 rows=3 width=84)
+                    Sort Key: ('web'::text), web.item, web.return_ratio, web.return_rank, web.currency_rank
+                    ->  Append  (cost=3683.02..18251.78 rows=3 width=84)
+                          ->  Subquery Scan on web  (cost=3683.02..3683.05 rows=1 width=84)
+                                Filter: ((web.return_rank <= 10) OR (web.currency_rank <= 10))
+                                ->  WindowAgg  (cost=3683.02..3683.04 rows=1 width=84)
+                                      Window: w2 AS (ORDER BY in_web.return_ratio ROWS UNBOUNDED PRECEDING)
+                                      ->  Sort  (cost=3683.02..3683.02 rows=1 width=76)
+                                            Sort Key: in_web.return_ratio
+                                            ->  WindowAgg  (cost=3682.99..3683.01 rows=1 width=76)
+                                                  Window: w1 AS (ORDER BY in_web.currency_ratio ROWS UNBOUNDED PRECEDING)
+                                                  ->  Sort  (cost=3682.99..3682.99 rows=1 width=68)
+                                                        Sort Key: in_web.currency_ratio
+                                                        ->  Subquery Scan on in_web  (cost=3682.93..3682.98 rows=1 width=68)
+                                                              ->  GroupAggregate  (cost=3682.93..3682.98 rows=1 width=68)
+                                                                    Group Key: ws.ws_item_sk
+                                                                    ->  Sort  (cost=3682.93..3682.93 rows=1 width=24)
+                                                                          Sort Key: ws.ws_item_sk
+                                                                          ->  Nested Loop  (cost=0.71..3682.92 rows=1 width=24)
+                                                                                ->  Nested Loop  (cost=0.42..3682.55 rows=1 width=28)
+                                                                                      ->  Seq Scan on web_returns wr  (cost=0.00..1112.75 rows=324 width=18)
+                                                                                            Filter: (wr_return_amt > '10000'::numeric)
+                                                                                      ->  Index Scan using web_sales_pkey on web_sales ws  (cost=0.42..7.93 rows=1 width=22)
+                                                                                            Index Cond: ((ws_item_sk = wr.wr_item_sk) AND (ws_order_number = wr.wr_order_number))
+                                                                                            Filter: ((ws_net_profit > '1'::numeric) AND (ws_net_paid > '0'::numeric) AND (ws_quantity > 0))
+                                                                                ->  Index Scan using date_dim_pkey on date_dim  (cost=0.29..0.36 rows=1 width=4)
+                                                                                      Index Cond: (d_date_sk = ws.ws_sold_date_sk)
+                                                                                      Filter: ((d_year = 1998) AND (d_moy = 11))
+                          ->  Subquery Scan on catalog  (cost=6137.71..6137.74 rows=1 width=84)
+                                Filter: ((catalog.return_rank <= 10) OR (catalog.currency_rank <= 10))
+                                ->  WindowAgg  (cost=6137.71..6137.73 rows=1 width=84)
+                                      Window: w2 AS (ORDER BY in_cat.return_ratio ROWS UNBOUNDED PRECEDING)
+                                      ->  Sort  (cost=6137.71..6137.71 rows=1 width=76)
+                                            Sort Key: in_cat.return_ratio
+                                            ->  WindowAgg  (cost=6137.68..6137.70 rows=1 width=76)
+                                                  Window: w1 AS (ORDER BY in_cat.currency_ratio ROWS UNBOUNDED PRECEDING)
+                                                  ->  Sort  (cost=6137.68..6137.68 rows=1 width=68)
+                                                        Sort Key: in_cat.currency_ratio
+                                                        ->  Subquery Scan on in_cat  (cost=6137.61..6137.67 rows=1 width=68)
+                                                              ->  GroupAggregate  (cost=6137.61..6137.67 rows=1 width=68)
+                                                                    Group Key: cs.cs_item_sk
+                                                                    ->  Sort  (cost=6137.61..6137.62 rows=1 width=24)
+                                                                          Sort Key: cs.cs_item_sk
+                                                                          ->  Nested Loop  (cost=1000.72..6137.60 rows=1 width=24)
+                                                                                ->  Gather  (cost=1000.42..6137.26 rows=1 width=28)
+                                                                                      Workers Planned: 1
+                                                                                      ->  Nested Loop  (cost=0.42..5137.16 rows=1 width=28)
+                                                                                            ->  Parallel Seq Scan on catalog_returns cr  (cost=0.00..2016.84 rows=392 width=18)
+                                                                                                  Filter: (cr_return_amount > '10000'::numeric)
+                                                                                            ->  Index Scan using catalog_sales_pkey on catalog_sales cs  (cost=0.42..7.96 rows=1 width=22)
+                                                                                                  Index Cond: ((cs_item_sk = cr.cr_item_sk) AND (cs_order_number = cr.cr_order_number))
+                                                                                                  Filter: ((cs_net_profit > '1'::numeric) AND (cs_net_paid > '0'::numeric) AND (cs_quantity > 0))
+                                                                                ->  Index Scan using date_dim_pkey on date_dim date_dim_1  (cost=0.29..0.34 rows=1 width=4)
+                                                                                      Index Cond: (d_date_sk = cs.cs_sold_date_sk)
+                                                                                      Filter: ((d_year = 1998) AND (d_moy = 11))
+                          ->  Subquery Scan on store  (cost=8430.94..8430.97 rows=1 width=84)
+                                Filter: ((store.return_rank <= 10) OR (store.currency_rank <= 10))
+                                ->  WindowAgg  (cost=8430.94..8430.96 rows=1 width=84)
+                                      Window: w2 AS (ORDER BY in_store.return_ratio ROWS UNBOUNDED PRECEDING)
+                                      ->  Sort  (cost=8430.94..8430.94 rows=1 width=76)
+                                            Sort Key: in_store.return_ratio
+                                            ->  WindowAgg  (cost=8430.91..8430.93 rows=1 width=76)
+                                                  Window: w1 AS (ORDER BY in_store.currency_ratio ROWS UNBOUNDED PRECEDING)
+                                                  ->  Sort  (cost=8430.91..8430.91 rows=1 width=68)
+                                                        Sort Key: in_store.currency_ratio
+                                                        ->  Subquery Scan on in_store  (cost=8430.85..8430.90 rows=1 width=68)
+                                                              ->  GroupAggregate  (cost=8430.85..8430.90 rows=1 width=68)
+                                                                    Group Key: sts.ss_item_sk
+                                                                    ->  Sort  (cost=8430.85..8430.85 rows=1 width=24)
+                                                                          Sort Key: sts.ss_item_sk
+                                                                          ->  Nested Loop  (cost=1000.72..8430.84 rows=1 width=24)
+                                                                                ->  Gather  (cost=1000.43..8430.50 rows=1 width=28)
+                                                                                      Workers Planned: 1
+                                                                                      ->  Nested Loop  (cost=0.43..7430.40 rows=1 width=28)
+                                                                                            ->  Parallel Seq Scan on store_returns sr  (cost=0.00..3503.04 rows=484 width=18)
+                                                                                                  Filter: (sr_return_amt > '10000'::numeric)
+                                                                                            ->  Index Scan using store_sales_pkey on store_sales sts  (cost=0.43..8.11 rows=1 width=22)
+                                                                                                  Index Cond: ((ss_item_sk = sr.sr_item_sk) AND (ss_ticket_number = sr.sr_ticket_number))
+                                                                                                  Filter: ((ss_net_profit > '1'::numeric) AND (ss_net_paid > '0'::numeric) AND (ss_quantity > 0))
+                                                                                ->  Index Scan using date_dim_pkey on date_dim date_dim_2  (cost=0.29..0.34 rows=1 width=4)
+                                                                                      Index Cond: (d_date_sk = sts.ss_sold_date_sk)
+                                                                                      Filter: ((d_year = 1998) AND (d_moy = 11))

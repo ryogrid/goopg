@@ -703,9 +703,12 @@ func (s *Server) describeViaPlanner(query string, sess *misc.SessionRegistry, db
 	// following Execute actually runs — the previous divergence meant a session
 	// with search_path/enable_seqscan/temp overrides could see the two disagree.
 	connDBOid := resolveConnDBOid(s.cfg.Catalog, dbName)
+	// B-18 commit 1: keyed by planner context (see dispatch_extended.go) —
+	// Get and Put must use the identical fingerprint.
+	cacheFP := sessionPlannerFingerprint(sess)
 	var node optimizer.Node
-	if s.pc != nil && !plannerSessionInputsActive(sess) && !sessionTempInheritanceActive(s.cfg.Catalog) && !partitionDetachPending(s.cfg.Catalog) && !inheritanceChangePending(s.cfg.Catalog) {
-		if cached, ok := s.pc.Get(planCacheKey(query, connDBOid)); ok {
+	if s.pc != nil && !sessionTempInheritanceActive(s.cfg.Catalog) && !partitionDetachPending(s.cfg.Catalog) && !inheritanceChangePending(s.cfg.Catalog) {
+		if cached, ok := s.pc.Get(planCacheKey(query, connDBOid, cacheFP)); ok {
 			node = cached
 		} else {
 			stmts, err := parser.Parse(query)
@@ -718,7 +721,7 @@ func (s *Server) describeViaPlanner(query string, sess *misc.SessionRegistry, db
 				return nil, false
 			}
 			if planCacheIsCacheable(node) {
-				s.pc.Put(planCacheKey(query, connDBOid), node)
+				s.pc.Put(planCacheKey(query, connDBOid, cacheFP), node)
 			}
 		}
 	} else {

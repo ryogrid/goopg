@@ -3,6 +3,7 @@ package executor
 import (
 	"errors"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -118,7 +119,7 @@ func (o *explainOp) Open(ctx *Context) error {
 			return nil
 		}
 		var b strings.Builder
-		walkPlanAnalyze(&b, o.plan.Child, 0, &o.rows, opts, stats, ctx.SubPlanStats, ctx.MemoizeStats, ctx.HashJoinStats)
+		walkPlanAnalyze(&b, o.plan.Child, 0, &o.rows, opts, stats, ctx.SubPlanStats, ctx.MemoizeStats, ctx.HashJoinStats, ctx.GatherLaunched, ctx.GatherWorkerStats, ctx.SortStats, ctx.SortWorkerStats)
 		appendExplainSettingsRow(ctx, opts, &o.rows)
 		if summary {
 			o.rows = append(o.rows,
@@ -229,6 +230,13 @@ func formatHashJoinInfoLine(hs *HashJoinStats) string {
 		parts = append(parts, fmt.Sprintf("Build Time: %.3f ms", float64(hs.BuildTimeNs)/1e6))
 	}
 	return strings.Join(parts, "  ")
+}
+
+// formatSortStatLine renders one SortStat in PG's text form, verbatim
+// from show_sort_info (postgres/src/backend/commands/explain.c:3105):
+// `Sort Method: %s  %s: %dkB`. EX0-03c.
+func formatSortStatLine(st SortStat) string {
+	return fmt.Sprintf("Sort Method: %s  %s: %dkB", st.Method, st.SpaceType, st.SpaceKB)
 }
 
 func formatBuffersLine(s *nodeStats) string {
@@ -490,7 +498,9 @@ func walkPlanFiltered(n optimizer.Node, indent int, rows *[]Row, opts parser.Exp
 			est = 1
 		}
 		// PG's cost annotation, from the path the planner chose (take2 P0-02).
-		startup, total, width := explainCostFields(rowSrc, est)
+		// `rows=` comes from the SAME carrier since C-20a's successor, so the
+		// line no longer states one estimator's costs beside another's rows.
+		est, startup, total, width := explainCostFields(rowSrc, est)
 		label += fmt.Sprintf("  (cost=%.2f..%.2f rows=%d width=%d)", startup, total, est, width)
 	}
 	*rows = append(*rows, Row{NewStringDatum(label)})
@@ -992,6 +1002,15 @@ func formatIndexCond(p *optimizer.IndexScan, reg *subPlanReg) string {
 	if p == nil || p.Index == nil {
 		return ""
 	}
+	// B-14 (P2-09a): ScalarArrayOp probe — PG renders
+	// `Index Cond: (col = ANY (...))`, and so does this.
+	if len(p.SAOPKeys) > 0 && len(p.Index.Columns) > 0 {
+		parts := make([]string, 0, len(p.SAOPKeys))
+		for _, k := range p.SAOPKeys {
+			parts = append(parts, formatIndexCondKey(k, reg))
+		}
+		return wrapParen(p.Index.Columns[0] + " = ANY (" + strings.Join(parts, ", ") + ")")
+	}
 	return formatIndexCondParts(p.Index, p.Keys, p.Key, p.LowKey, p.HighKey, p.LowOp, p.HighOp, reg)
 }
 
@@ -1167,6 +1186,16 @@ type subPlanReg struct {
 	// `SubPlan N` subtree must render as a leaf too. nil when the plan has
 	// no CTE, and nil-receiver tolerant either way.
 	cte *cteHoist
+	// sortStats / sortWorkers carry EX0-03c's per-Sort execution stats for
+	// this render (the leader's main-line entries and the folded per-worker
+	// carrier). They live here rather than in their own walker parameters
+	// because subPlanReg is already the one piece of per-EXPLAIN state
+	// threaded through every walker call — same reason as rel above — so
+	// the Sort arm stays reachable without re-signaturing the walker. Nil
+	// (or empty) renders no `Sort Method:` lines, so serial plans,
+	// unexecuted nodes, and reg-less callers stay byte-identical.
+	sortStats   map[*optimizer.Sort]SortStat
+	sortWorkers map[*optimizer.Sort][]SortStat
 }
 
 // ancestorNode returns the plan node currently being rendered, or nil.
@@ -1510,13 +1539,15 @@ func schemaColumnNames(n optimizer.Node) []string {
 // `(actual time=startup..total rows=R loops=L)` suffix pulled
 // from the instrumentation table. Loops > 0 means the operator
 // ran at least once. Total time is in milliseconds.
-func walkPlanAnalyze(b *strings.Builder, n optimizer.Node, depth int, rows *[]Row, opts parser.ExplainOptions, stats nodeStatsTable, spStats map[optimizer.Expr]*SubPlanSiteStats, memoStats map[*optimizer.Memoize]*MemoizeStats, hashStats map[*optimizer.Join]*HashJoinStats) {
-	walkPlanAnalyzeFiltered(n, depth, rows, opts, stats, spStats, memoStats, hashStats, nil, nil, 0, &subPlanReg{rel: newExplainNames(n), cte: collectCTEHoist(n)})
+func walkPlanAnalyze(b *strings.Builder, n optimizer.Node, depth int, rows *[]Row, opts parser.ExplainOptions, stats nodeStatsTable, spStats map[optimizer.Expr]*SubPlanSiteStats, memoStats map[*optimizer.Memoize]*MemoizeStats, hashStats map[*optimizer.Join]*HashJoinStats, gatherLaunched gatherLaunchedTable, workerStats workerNodeStatsTable, sortStats map[*optimizer.Sort]SortStat, sortWorkers map[*optimizer.Sort][]SortStat) {
+	reg := &subPlanReg{rel: newExplainNames(n), cte: collectCTEHoist(n)}
+	reg.sortStats, reg.sortWorkers = sortStats, sortWorkers
+	walkPlanAnalyzeFiltered(n, depth, rows, opts, stats, spStats, memoStats, hashStats, gatherLaunched, workerStats, nil, nil, 0, reg)
 }
 
-func walkPlanAnalyzeFiltered(n optimizer.Node, indent int, rows *[]Row, opts parser.ExplainOptions, stats nodeStatsTable, spStats map[optimizer.Expr]*SubPlanSiteStats, memoStats map[*optimizer.Memoize]*MemoizeStats, hashStats map[*optimizer.Join]*HashJoinStats, attachedFilter optimizer.Expr, attachedFilterNode optimizer.Node, filterRowsRemoved int64, reg *subPlanReg) {
+func walkPlanAnalyzeFiltered(n optimizer.Node, indent int, rows *[]Row, opts parser.ExplainOptions, stats nodeStatsTable, spStats map[optimizer.Expr]*SubPlanSiteStats, memoStats map[*optimizer.Memoize]*MemoizeStats, hashStats map[*optimizer.Join]*HashJoinStats, gatherLaunched gatherLaunchedTable, workerStats workerNodeStatsTable, attachedFilter optimizer.Expr, attachedFilterNode optimizer.Node, filterRowsRemoved int64, reg *subPlanReg) {
 	if p, ok := n.(*optimizer.Project); ok {
-		walkPlanAnalyzeFiltered(p.Child, indent, rows, opts, stats, spStats, memoStats, hashStats, attachedFilter, attachedFilterNode, filterRowsRemoved, reg)
+		walkPlanAnalyzeFiltered(p.Child, indent, rows, opts, stats, spStats, memoStats, hashStats, gatherLaunched, workerStats, attachedFilter, attachedFilterNode, filterRowsRemoved, reg)
 		return
 	}
 	if f, ok := n.(*optimizer.Filter); ok {
@@ -1535,7 +1566,7 @@ func walkPlanAnalyzeFiltered(n optimizer.Node, indent int, rows *[]Row, opts par
 		if fs, ok := stats[f]; ok && fs != nil {
 			fr += fs.filterRejected
 		}
-		walkPlanAnalyzeFiltered(f.Child, indent, rows, opts, stats, spStats, memoStats, hashStats, next, nextNode, fr, reg)
+		walkPlanAnalyzeFiltered(f.Child, indent, rows, opts, stats, spStats, memoStats, hashStats, gatherLaunched, workerStats, next, nextNode, fr, reg)
 		return
 	}
 
@@ -1572,7 +1603,7 @@ func walkPlanAnalyzeFiltered(n optimizer.Node, indent int, rows *[]Row, opts par
 		if est <= 0 {
 			est = 1
 		}
-		startup, total, width := explainCostFields(rowSrc, est)
+		est, startup, total, width := explainCostFields(rowSrc, est)
 		label += fmt.Sprintf("  (cost=%.2f..%.2f rows=%d width=%d)", startup, total, est, width)
 	}
 	if s, ok := stats[n]; ok && s != nil {
@@ -1603,6 +1634,27 @@ func walkPlanAnalyzeFiltered(n optimizer.Node, indent int, rows *[]Row, opts par
 		// stats.filterRejected. Mirrors PG's show_instrumentation_count
 		// (nfiltered1 for scan qual rejects, per-loop average). Zero
 		// suppressed in text mode (PG convention).
+		// E-17 / EX3-08 cut 2: the count may live on EITHER node. A Filter
+		// whose filterOp survives (any child that is not a SeqScan) counts on
+		// the collapsed Filter node, carried down in filterRowsRemoved; a
+		// Filter whose qual the SeqScan absorbed has no filterOp at all and
+		// counts on the SCAN node — which is where PG keeps nfiltered1
+		// (execScan.h:245) and where the JSON renderer below has always read
+		// it. Summing both is what keeps the two renderers agreeing; reading
+		// only one of them is how they diverged in the first place.
+		// Parallel plans keep one stats table per EXECUTION SITE (workers
+		// 0..n-1 plus the leader at slot n, gatherOp.workerTables), folded
+		// into workerStats. When those entries exist they are the complete
+		// population — summing them AND stats[n] would count the leader
+		// twice. PG folds every site's nfiltered1 into one total the same
+		// way (instrument.c:187) before dividing by nloops.
+		if ws, ok := workerStats[n]; ok && len(ws) > 0 {
+			for _, w := range ws {
+				filterRowsRemoved += w.FilterRejected
+			}
+		} else if s, ok := stats[n]; ok && s != nil {
+			filterRowsRemoved += s.filterRejected
+		}
 		if filterRowsRemoved > 0 {
 			if s, ok := stats[n]; ok && s != nil && s.loops > 0 {
 				avg := float64(filterRowsRemoved) / float64(s.loops)
@@ -1632,12 +1684,73 @@ func walkPlanAnalyzeFiltered(n optimizer.Node, indent int, rows *[]Row, opts par
 		}
 	}
 
+	// A Gather/GatherMerge emits PG's `Workers Launched:` line under ANALYZE,
+	// from the Context-keyed carrier the operator recorded at Open (the
+	// renderer sees plan nodes, never operators). No entry — plain EXPLAIN,
+	// which never executes — renders nothing. EX0-03 (b).
+	switch n.(type) {
+	case *optimizer.Gather, *optimizer.GatherMerge:
+		if launched, ok := gatherLaunched[n]; ok {
+			*rows = append(*rows, Row{NewStringDatum(detailIndent + fmt.Sprintf("Workers Launched: %d", launched))})
+		}
+	}
+
+	// EX0-03b (new): per-worker `Worker N:` lines from the Context-keyed
+	// carrier folded post-join in gatherOp/gatherMergeOp.Close. Text
+	// format only (no JSON twin, per design). Unreachable when the carrier
+	// is empty — a nil/empty map, or a node with no entries, renders
+	// nothing, so serial plans and unexecuted nodes stay byte-identical.
+	if len(workerStats) > 0 {
+		if ws, ok := workerStats[n]; ok && len(ws) > 0 {
+			ordered := make([]workerNodeStat, len(ws))
+			copy(ordered, ws)
+			sort.Slice(ordered, func(i, j int) bool { return ordered[i].Worker < ordered[j].Worker })
+			for _, w := range ordered {
+				*rows = append(*rows, Row{NewStringDatum(detailIndent + fmt.Sprintf(
+					"Worker %d:  actual time=%.3f..%.3f rows=%.2f loops=%d",
+					w.Worker, nsToMs(w.StartupNs), nsToMs(w.TotalNs), float64(w.RowsOut), w.Loops))})
+			}
+		}
+	}
+
 	// A hash join emits PG's hash-table line under ANALYZE. Upstream hangs it
 	// off the HASH node; goopg has no Hash node (the build lives inside
 	// joinOp), so it hangs off the Hash Join. M0127-P3.5 / design 06 §4.
 	if j, isJoin := n.(*optimizer.Join); isJoin && j.Algo == optimizer.JoinAlgoHash {
 		if line := formatHashJoinInfoLine(hashStats[j]); line != "" {
 			*rows = append(*rows, Row{NewStringDatum(detailIndent + line)})
+		}
+	}
+
+	// EX0-03c: a Sort emits PG's `Sort Method:` line under ANALYZE, text
+	// format only (no JSON twin, same escape clause as EX0-03/03b). The
+	// main line comes from the leader's SortStats entry when present;
+	// with leader non-participation the leader never Opens its Sort, so
+	// worker 0's stats are promoted to the main line instead (PG's
+	// explain.c:3116-3124 rule). Then one flat `Worker N:` line per
+	// carrier entry, sorted by slot (EX0-03b's discipline). No entry
+	// anywhere renders no lines; nil-map reads are safe, so a nil/empty
+	// carrier is unreachable output-wise.
+	if srt, isSort := n.(*optimizer.Sort); isSort && reg != nil {
+		if st, ok := reg.sortStats[srt]; ok {
+			*rows = append(*rows, Row{NewStringDatum(detailIndent + formatSortStatLine(st))})
+		} else if ws := reg.sortWorkers[srt]; len(ws) > 0 {
+			promoted := ws[0]
+			for _, w := range ws[1:] {
+				if w.Worker < promoted.Worker {
+					promoted = w
+				}
+			}
+			*rows = append(*rows, Row{NewStringDatum(detailIndent + formatSortStatLine(promoted))})
+		}
+		if ws := reg.sortWorkers[srt]; len(ws) > 0 {
+			ordered := make([]SortStat, len(ws))
+			copy(ordered, ws)
+			sort.Slice(ordered, func(i, j int) bool { return ordered[i].Worker < ordered[j].Worker })
+			for _, w := range ordered {
+				*rows = append(*rows, Row{NewStringDatum(detailIndent + fmt.Sprintf(
+					"Worker %d:  %s", w.Worker, formatSortStatLine(w)))})
+			}
 		}
 	}
 
@@ -1687,7 +1800,7 @@ func walkPlanAnalyzeFiltered(n optimizer.Node, indent int, rows *[]Row, opts par
 	// reference shares one body Node, so the section IS the subtree that
 	// ran (the later references replay from ctx.CTERowCache). M0125-0049.
 	emitCTESections(rows, indent, childIndent, reg, func(body optimizer.Node, bodyIndent int) {
-		walkPlanAnalyzeFiltered(body, bodyIndent, rows, opts, stats, spStats, memoStats, hashStats, nil, nil, 0, reg)
+		walkPlanAnalyzeFiltered(body, bodyIndent, rows, opts, stats, spStats, memoStats, hashStats, gatherLaunched, workerStats, nil, nil, 0, reg)
 	})
 
 	// Sublink subtrees keep their instrumentation: stats is passed
@@ -1695,12 +1808,12 @@ func walkPlanAnalyzeFiltered(n optimizer.Node, indent int, rows *[]Row, opts par
 	prevAncestor := reg.ancestor
 	reg.ancestor = n
 	emitSubPlanSubtrees(rows, detailIndent, opts, reg, spStats, func(sub optimizer.Node, subIndent int) {
-		walkPlanAnalyzeFiltered(sub, subIndent, rows, opts, stats, spStats, memoStats, hashStats, nil, nil, 0, reg)
+		walkPlanAnalyzeFiltered(sub, subIndent, rows, opts, stats, spStats, memoStats, hashStats, gatherLaunched, workerStats, nil, nil, 0, reg)
 	})
 	reg.ancestor = prevAncestor
 
 	for _, c := range renderChildren(n, reg.cte) {
-		walkPlanAnalyzeFiltered(c, childIndent, rows, opts, stats, spStats, memoStats, hashStats, nil, nil, 0, reg)
+		walkPlanAnalyzeFiltered(c, childIndent, rows, opts, stats, spStats, memoStats, hashStats, gatherLaunched, workerStats, nil, nil, 0, reg)
 	}
 }
 
@@ -1897,6 +2010,13 @@ func planToJSONNamed(n optimizer.Node, opts parser.ExplainOptions, reg *subPlanR
 		costNode = filterNode
 		est = optimizer.EstimateRows(costNode)
 	}
+	// `Plan Rows` is set from the carrier below, together with the three cost
+	// fields, so FORMAT JSON and the text walkers cannot state different rows
+	// for the same node (C-20a's successor).
+	estFromCarrier, startup, total, width := explainCostFields(costNode, est)
+	if estFromCarrier > 0 {
+		est = estFromCarrier
+	}
 	if est > 0 {
 		obj["Plan Rows"] = est
 	}
@@ -1905,7 +2025,6 @@ func planToJSONNamed(n optimizer.Node, opts parser.ExplainOptions, reg *subPlanR
 	// Rows, so FORMAT JSON stated no cost at all — and once the text walkers
 	// print real costs, a silent JSON would DISAGREE with text rather than
 	// merely lag it.
-	startup, total, width := explainCostFields(costNode, est)
 	obj["Startup Cost"] = startup
 	obj["Total Cost"] = total
 	obj["Plan Width"] = width
@@ -1993,14 +2112,48 @@ func explainIndexName(i *catalog.Index) string {
 // printing zeros. A plan mixing real costs with 0.00 is WORSE than one where
 // every cost is 0.00: with all-zero, a reader knows nothing is priced; with a
 // mixture, a free node and an unpriced node look identical.
-func explainCostFields(n optimizer.Node, rows int64) (startup, total float64, width int) {
+func explainCostFields(n optimizer.Node, rows int64) (est int64, startup, total float64, width int) {
 	if c, ok := n.(optimizer.PlanCostCarrier); ok {
 		if pc, set := c.PlanCostInfo(); set {
-			return pc.StartupCost, pc.TotalCost, pc.PlanWidth
+			return planCostRows(pc.PlanRows, rows), pc.StartupCost, pc.TotalCost, pc.PlanWidth
 		}
 	}
 	d := optimizer.DeriveLegacyDisplayCost(n, rows)
-	return d.StartupCost, d.TotalCost, d.PlanWidth
+	return planCostRows(d.PlanRows, rows), d.StartupCost, d.TotalCost, d.PlanWidth
+}
+
+// planCostRows converts a carrier's `PlanRows` to the integer EXPLAIN prints,
+// falling back to the caller's own estimate when the carrier has none.
+//
+// C-20a's successor (take3 08 §9, census
+// `analysis/planner-refactor-take3/c20a-estimator-census-20260907`). The three
+// deletions the original item asked for are all unavailable — `EstimateRows`
+// has 28 live call sites in 15 files, three of them in `internal/executor`
+// where no `RelOptInfo` exists or ever will — but the DEFECT under them is
+// smaller and is closed here: the planner CHOSE with `calcJoinrelSize` while
+// EXPLAIN REPORTED `estimateJoin`, because `explainCostFields` took
+// StartupCost/TotalCost/PlanWidth from the carrier and then recomputed `rows=`
+// with `EstimateRows`. One node, two estimators, and every estimate artefact
+// in the tree — plan-gate `MODE=semantic-cost`, `estimate-audit`, the c13a
+// census figures, the EA ratchet — read the reported one.
+//
+// `stampPlanCost` is a single funnel, so on a search-produced node this is the
+// WINNING PATH's row count: the number the planner actually compared. Nodes the
+// search did not produce keep the legacy derivation, which is the same
+// asymmetry the three cost fields already carry.
+//
+// The clamp is PG's own (`clamp_row_est`, costsize.c:216): a plan row count is
+// never below 1, and EXPLAIN has never printed `rows=0` for an estimate. A
+// carrier with a zero/negative `PlanRows` predates the stamp for that node kind
+// and falls back rather than printing a floor it did not earn.
+func planCostRows(planRows float64, fallback int64) int64 {
+	if planRows <= 0 {
+		return fallback
+	}
+	if planRows < 1 {
+		return 1
+	}
+	return int64(planRows + 0.5)
 }
 
 // schemaQualify prepends "public." to an unqualified table name for VERBOSE mode.
@@ -2101,16 +2254,23 @@ func describePlanVerbose(n optimizer.Node, verbose bool, nm *explainNames) strin
 		}
 		return parallelPrefix + seqScanLabel(p) + " on " + tname
 	case *optimizer.IndexScan:
+		// C-19c: "Parallel " prefix, same rule and same source as the SeqScan
+		// and IndexOnlyScan arms — the flag stampParallelScan set, never
+		// inferred from sitting under a Gather.
+		parallelPrefix := ""
+		if p.Parallel {
+			parallelPrefix = "Parallel "
+		}
 		if dname := nm.disambiguatedName(n); dname != "" {
-			return fmt.Sprintf("Index Scan using %s on %s", explainIndexName(p.Index), dname)
+			return fmt.Sprintf("%sIndex Scan using %s on %s", parallelPrefix, explainIndexName(p.Index), dname)
 		}
 		// P0-04: print the FROM-clause alias like the SeqScan arm does, so
 		// a self-join's second scan renders `on customer c2` as PG's
 		// select_rtable_names does, not a bare second `on customer`.
 		if p.Alias != "" && p.Alias != strings.ToLower(p.Table.Name) {
-			return fmt.Sprintf("Index Scan using %s on %s %s", explainIndexName(p.Index), schemaQualify(p.Table.QualifiedName()), p.Alias)
+			return fmt.Sprintf("%sIndex Scan using %s on %s %s", parallelPrefix, explainIndexName(p.Index), schemaQualify(p.Table.QualifiedName()), p.Alias)
 		}
-		return fmt.Sprintf("Index Scan using %s on %s", explainIndexName(p.Index), schemaQualify(p.Table.QualifiedName()))
+		return fmt.Sprintf("%sIndex Scan using %s on %s", parallelPrefix, explainIndexName(p.Index), schemaQualify(p.Table.QualifiedName()))
 	case *optimizer.IndexOnlyScan:
 		// S6 max rewrite: PG's ExplainIndexScanDetails (explain.c:4330-4336)
 		// puts " Backward" between the scan name and " using".
@@ -2129,6 +2289,13 @@ func describePlanVerbose(n optimizer.Node, verbose bool, nm *explainNames) strin
 		}
 		if dname := nm.disambiguatedName(n); dname != "" {
 			return fmt.Sprintf("%sIndex Only Scan%s using %s on %s", parallelPrefix, dir, explainIndexName(p.Index), dname)
+		}
+		// A-01(i): print the FROM-clause alias like the IndexScan arm
+		// does, so a self-join's IOS probe renders `on customer c2`
+		// as PG's select_rtable_names does, not a bare second
+		// `on customer`.
+		if p.Alias != "" && p.Table != nil && p.Alias != strings.ToLower(p.Table.Name) {
+			return fmt.Sprintf("%sIndex Only Scan%s using %s on %s %s", parallelPrefix, dir, explainIndexName(p.Index), schemaQualify(p.Table.QualifiedName()), p.Alias)
 		}
 		return fmt.Sprintf("%sIndex Only Scan%s using %s on %s", parallelPrefix, dir, explainIndexName(p.Index), schemaQualify(p.Table.QualifiedName()))
 	case *optimizer.Insert:
@@ -2288,14 +2455,19 @@ func describePlanMode(n optimizer.Node, nm *explainNames, verbose bool) string {
 		}
 		return fmt.Sprintf("%s%s on %s", parallelPrefix, seqScanLabel(p), explainRelName(p.Table, verbose))
 	case *optimizer.IndexScan:
+		// C-19c: verbose-independent prefix, same source as the plain arm.
+		parallelPrefix := ""
+		if p.Parallel {
+			parallelPrefix = "Parallel "
+		}
 		if dname := nm.disambiguatedName(n); dname != "" {
-			return fmt.Sprintf("Index Scan using %s on %s", explainIndexName(p.Index), dname)
+			return fmt.Sprintf("%sIndex Scan using %s on %s", parallelPrefix, explainIndexName(p.Index), dname)
 		}
 		// P0-04: same alias branch as the verbose arm above.
 		if p.Alias != "" && p.Alias != strings.ToLower(p.Table.Name) {
-			return fmt.Sprintf("Index Scan using %s on %s %s", explainIndexName(p.Index), explainRelName(p.Table, verbose), p.Alias)
+			return fmt.Sprintf("%sIndex Scan using %s on %s %s", parallelPrefix, explainIndexName(p.Index), explainRelName(p.Table, verbose), p.Alias)
 		}
-		return fmt.Sprintf("Index Scan using %s on %s", explainIndexName(p.Index), explainRelName(p.Table, verbose))
+		return fmt.Sprintf("%sIndex Scan using %s on %s", parallelPrefix, explainIndexName(p.Index), explainRelName(p.Table, verbose))
 	case *optimizer.IndexOnlyScan:
 		// M0118-0009 (design 0118-0102): horizons.spec inspects the IOS
 		// label via `EXPLAIN (COSTS OFF)` (pruner_query_plan) — mirror
@@ -2318,6 +2490,10 @@ func describePlanMode(n optimizer.Node, nm *explainNames, verbose bool) string {
 		}
 		if dname := nm.disambiguatedName(n); dname != "" {
 			return fmt.Sprintf("%sIndex Only Scan%s using %s on %s", parallelPrefix, dir, explainIndexName(p.Index), dname)
+		}
+		// A-01(i): same alias branch as the verbose arm above.
+		if p.Alias != "" && p.Table != nil && p.Alias != strings.ToLower(p.Table.Name) {
+			return fmt.Sprintf("%sIndex Only Scan%s using %s on %s %s", parallelPrefix, dir, explainIndexName(p.Index), explainRelName(p.Table, verbose), p.Alias)
 		}
 		return fmt.Sprintf("%sIndex Only Scan%s using %s on %s", parallelPrefix, dir, explainIndexName(p.Index), explainRelName(p.Table, verbose))
 	case *optimizer.Insert:

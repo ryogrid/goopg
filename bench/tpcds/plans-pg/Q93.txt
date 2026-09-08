@@ -1,0 +1,18 @@
+Limit  (cost=7616.27..7616.28 rows=3 width=36)
+  ->  Sort  (cost=7616.27..7616.28 rows=3 width=36)
+        Sort Key: (sum(CASE WHEN (store_returns.sr_return_quantity IS NOT NULL) THEN (((store_sales.ss_quantity - store_returns.sr_return_quantity))::numeric * store_sales.ss_sales_price) ELSE ((store_sales.ss_quantity)::numeric * store_sales.ss_sales_price) END)), store_sales.ss_customer_sk
+        ->  GroupAggregate  (cost=7616.15..7616.25 rows=3 width=36)
+              Group Key: store_sales.ss_customer_sk
+              ->  Sort  (cost=7616.15..7616.16 rows=3 width=18)
+                    Sort Key: store_sales.ss_customer_sk
+                    ->  Gather  (cost=1001.88..7616.13 rows=3 width=18)
+                          Workers Planned: 1
+                          ->  Nested Loop  (cost=1.88..6615.83 rows=2 width=18)
+                                ->  Hash Join  (cost=1.45..3540.98 rows=2331 width=12)
+                                      Hash Cond: (store_returns.sr_reason_sk = reason.r_reason_sk)
+                                      ->  Parallel Seq Scan on store_returns  (cost=0.00..3292.04 rows=84404 width=16)
+                                      ->  Hash  (cost=1.44..1.44 rows=1 width=4)
+                                            ->  Seq Scan on reason  (cost=0.00..1.44 rows=1 width=4)
+                                                  Filter: (r_reason_desc = 'reason 58'::bpchar)
+                                ->  Index Scan using store_sales_pkey on store_sales  (cost=0.43..1.32 rows=1 width=22)
+                                      Index Cond: ((ss_item_sk = store_returns.sr_item_sk) AND (ss_ticket_number = store_returns.sr_ticket_number))

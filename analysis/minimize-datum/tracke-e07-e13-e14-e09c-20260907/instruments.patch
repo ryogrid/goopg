@@ -1,0 +1,386 @@
+diff --git a/internal/executor/dense_build.go b/internal/executor/dense_build.go
+index ff73f332f..5409a6c08 100644
+--- a/internal/executor/dense_build.go
++++ b/internal/executor/dense_build.go
+@@ -147,6 +147,10 @@ func rowHasBuf(r Row) bool {
+ // make did), and dense rows are immutable after filing (the bumper only
+ // ever advances; filed ranges are never written again).
+ func (o *joinOp) retainBuildRow(row Row) Row {
++	if censusOn {
++		o.censusRows++
++		o.censusWidth = len(row)
++	}
+ 	if o.buildBytes == nil || o.buildCells == nil {
+ 		return ownedBuildRow(row)
+ 	}
+diff --git a/internal/executor/executor.go b/internal/executor/executor.go
+index 15196c2b6..107a92ea7 100644
+--- a/internal/executor/executor.go
++++ b/internal/executor/executor.go
+@@ -161,6 +161,7 @@ func buildNode(plan optimizer.Node, bound int) (Operator, error) {
+ 		// parent via SetBorrow.
+ 		return maybeInstrument(p, newLimitOp(p, child)), nil
+ 	case *optimizer.Sort:
++		censusSortSite(p, deformBoundBelow(p, bound))
+ 		child, err := buildNode(p.Child, deformBoundBelow(p, bound))
+ 		if err != nil {
+ 			return nil, err
+@@ -186,6 +187,7 @@ func buildNode(plan optimizer.Node, bound int) (Operator, error) {
+ 		// impossible (it depends on `bound`, i.e. on everything above this
+ 		// join). See joinOp.deformLeftBound.
+ 		jop.deformLeftBound, jop.deformRightBound = leftBound, rightBound
++		censusJoinSite(p, leftBound, rightBound)
+ 		return maybeInstrument(p, jop), nil
+ 	case *optimizer.NestedLoopIndexJoin:
+ 		// EX1-02: the outer follows the left-side rule; inner rescans
+@@ -658,6 +660,7 @@ func (tree *opTreeSlab) buildRec(plan optimizer.Node, bound int) (int32, error)
+ 		// expects. sortOp.Open() drains the child in a tight loop; the
+ 		// opNodeOperator hop adds one function call per row but the child
+ 		// subtree runs on concrete switch dispatch.
++		censusSortSite(p, deformBoundBelow(p, bound))
+ 		childOp := &opNodeOperator{tree: tree, idx: childIdx, schema: p.Child.Output()}
+ 		sortLegacy := newSortOp(p, childOp)
+ 		return tree.add(OpNode{Kind: OpSort, childA: noChild, childB: noChild, state: &sortOpState{op: sortLegacy, schema: p.Output()}}), nil
+@@ -705,6 +708,7 @@ func (tree *opTreeSlab) buildRec(plan optimizer.Node, bound int) (int32, error)
+ 		op := newJoinOp(p, leftOp, rightOp)
+ 		// Same stamping as the buildNode Join arm — see joinOp.deformLeftBound.
+ 		op.deformLeftBound, op.deformRightBound = leftBound, rightBound
++		censusJoinSite(p, leftBound, rightBound)
+ 		return tree.add(OpNode{Kind: OpJoin, childA: noChild, childB: noChild, state: &joinOpState{op: op, schema: p.Output()}}), nil
+ 
+ 	default:
+diff --git a/internal/executor/operators.go b/internal/executor/operators.go
+index b94943b58..e6f3b43a5 100644
+--- a/internal/executor/operators.go
++++ b/internal/executor/operators.go
+@@ -788,6 +788,8 @@ func (o *limitOp) tiesRowMatches(row Row) bool {
+ // row count, eliminating the heap blow-up that the M0066 review
+ // flagged for large sorts.
+ type sortOp struct {
++	censusRows  int64
++	censusWidth int
+ 	child Operator
+ 	// plan is the Sort plan node this operator executes. Retained (unlike
+ 	// the pre-EX0-03c shape that kept only Keys) so Open can publish the
+@@ -943,6 +945,10 @@ func (o *sortOp) Open(ctx *Context) error {
+ 		}
+ 		o.rows = append(o.rows, row)
+ 		o.keyvals = append(o.keyvals, kv)
++		if censusOn {
++			o.censusRows++
++			o.censusWidth = len(row)
++		}
+ 		// EX3-05 Cut A: maintain the TID side-channel only when a consumer
+ 		// above needs it (wantCTIDs, set by markSortWantCTIDs). Otherwise
+ 		// skip the per-row append entirely.
+@@ -1341,6 +1347,8 @@ func (o *sortOp) flushChunk() error {
+ 
+ func (o *sortOp) Schema() optimizer.Schema { return o.child.Schema() }
+ func (o *sortOp) Close() error {
++	censusSortRetained(o.plan, o.censusRows, o.censusWidth)
++	o.censusRows = 0
+ 	// Captured before o.ctx is cleared: the spill-file unlink below has to
+ 	// tell the statement's registry it no longer owns these paths.
+ 	ctx := o.ctx
+diff --git a/internal/executor/operators_join_agg.go b/internal/executor/operators_join_agg.go
+index 40e8122be..10ef89a89 100644
+--- a/internal/executor/operators_join_agg.go
++++ b/internal/executor/operators_join_agg.go
+@@ -174,6 +174,8 @@ type joinOp struct {
+ 	lazyProbeMatched bool
+ 	lazyLW       int  // left schema width
+ 	lazyRW       int  // right schema width
++	censusRows   int64
++	censusWidth  int
+ 
+ 	// M0054-0005b: per-Open() reusable buffers for nullRow / hash
+ 	// key evaluation. The pre-fix path called `nullRow(width)` and
+@@ -1933,6 +1935,8 @@ func (o *joinOp) nextLazy() (TupleSlot, error) {
+ }
+ 
+ func (o *joinOp) Close() error {
++	censusRetained(o.plan, o.censusRows, o.censusWidth)
++	o.censusRows = 0
+ 	o.releaseBatches()
+ 	o.closeMergeStream()
+ 	o.closeNLStream()
+diff --git a/internal/executor/parallel_hash_build.go b/internal/executor/parallel_hash_build.go
+index 687310c60..4f0843f6b 100644
+--- a/internal/executor/parallel_hash_build.go
++++ b/internal/executor/parallel_hash_build.go
+@@ -319,7 +319,17 @@ func (s *channelSource) Schema() optimizer.Schema { return s.schema }
+ 
+ func (s *channelSource) Next() (TupleSlot, error) {
+ 	for s.idx >= len(s.batch) {
+-		b, ok := <-s.ch
++		var b []Row
++		var ok bool
++		select {
++		case b, ok = <-s.ch:
++		default:
++			recvStart := time.Now()
++			b, ok = <-s.ch
++			if stallOn {
++				stallAddConsumer(time.Since(recvStart))
++			}
++		}
+ 		if !ok {
+ 			return nil, EOF
+ 		}
+@@ -537,11 +547,15 @@ func (o *joinOp) parallelBuildLazyHashTable(ctx *Context, buildLeft bool) (bool,
+ 				}
+ 				batch = append(batch, transferRowForQueue(slot))
+ 				if len(batch) >= gatherBatchRows {
++					sendStart := time.Now()
+ 					select {
+ 					case ch <- batch:
+ 					case <-workerCtx.Done():
+ 						return workerCtx.Err()
+ 					}
++					if stallOn {
++						stallAddProducer(time.Since(sendStart))
++					}
+ 					batch = nil
+ 				}
+ 			}
+@@ -617,5 +631,6 @@ func (o *joinOp) parallelBuildLazyHashTable(ctx *Context, buildLeft bool) (bool,
+ 	}
+ 
+ 	o.recordBuildTime(ctx, buildStart)
++	stallReport(fmt.Sprintf("node=%p type=%v", o.plan, o.plan.Type), time.Since(buildStart), maxProducers)
+ 	return probeIsLeft, nil
+ }
+--- internal/executor/zz_e13_census.go
+package executor
+
+// zz_e13_census.go — TEMPORARY measurement instrument for E-13 (EX1-04 Cut 2)
+// and E-14 (Cut A/B). NOT for commit.
+//
+// E-13's gate is "only if a later alloc arm shows a residual". The residual it
+// would collect is, at each RETAINING site (hash build, sort input), the
+// columns beyond the threaded EX1-01 deform bound: `(width - bound) * 48 B`
+// per retained row. This instrument records (width, bound) at Build and the
+// retained row count at run, so the residual is a product of measured numbers
+// rather than an argument.
+
+import (
+	"fmt"
+	"os"
+	"sync"
+
+	"github.com/goopg/goopg/internal/optimizer"
+)
+
+var censusOn = os.Getenv("GOOPG_E13_CENSUS") != ""
+
+var censusMu sync.Mutex
+
+func censusLogf(format string, args ...any) {
+	if !censusOn {
+		return
+	}
+	censusMu.Lock()
+	defer censusMu.Unlock()
+	fmt.Fprintf(os.Stderr, "E13CENSUS "+format+"\n", args...)
+}
+
+// censusBuildSite records a retaining Build site's schema width against the
+// bound its child subtree was built with.
+func censusJoinSite(p *optimizer.Join, leftBound, rightBound int) {
+	if !censusOn {
+		return
+	}
+	buildLeft := p.BuildLeft
+	if p.Type == optimizer.JoinTypeSemi || p.Type == optimizer.JoinTypeAnti {
+		buildLeft = false
+	}
+	w, b := len(p.Right.Output()), rightBound
+	if buildLeft {
+		w, b = len(p.Left.Output()), leftBound
+	}
+	censusLogf("join algo=%v type=%v buildLeft=%v buildWidth=%d buildBound=%d node=%p",
+		p.Algo, p.Type, buildLeft, w, b, p)
+}
+
+func censusSortSite(p *optimizer.Sort, childBound int) {
+	if !censusOn {
+		return
+	}
+	censusLogf("sort childWidth=%d childBound=%d node=%p", len(p.Child.Output()), childBound, p)
+}
+
+func censusSortRetained(p *optimizer.Sort, n int64, w int) {
+	if !censusOn || n == 0 {
+		return
+	}
+	censusLogf("sort-retained node=%p rows=%d width=%d", p, n, w)
+}
+
+func censusRetained(p *optimizer.Join, n int64, w int) {
+	if !censusOn || n == 0 {
+		return
+	}
+	censusLogf("join-retained node=%p rows=%d width=%d", p, n, w)
+}
+--- internal/executor/zz_e09c_stall.go
+package executor
+
+// zz_e09c_stall.go — TEMPORARY measurement instrument for E-09c
+// ("cooperative-stall measurement under skew + worker-count scaling").
+// NOT for commit.
+//
+// The cooperative parallel hash build (parallel_hash_build.go) is a
+// producer/consumer split: N producers scan+filter and send 256-row batches
+// through a depth-limited channel; ONE consumer (the leader) evaluates keys
+// and inserts. Either half can stall on the other. This instrument charges
+// the blocked time to whichever side actually waited:
+//
+//   producerBlockedNs — summed across producers, time parked on `ch <- batch`
+//                       (the consumer is the bottleneck)
+//   consumerBlockedNs — time the leader parked on `<-ch` with the channel
+//                       empty (the producers are the bottleneck)
+//
+// A cooperative build with NO stall shows both near zero relative to build
+// wall time.
+
+import (
+	"fmt"
+	"os"
+	"sync/atomic"
+	"time"
+)
+
+var stallOn = os.Getenv("GOOPG_E09C_STALL") != ""
+
+var (
+	stallProducerNs atomic.Int64
+	stallConsumerNs atomic.Int64
+	stallBatches    atomic.Int64
+	stallRecvWaits  atomic.Int64
+)
+
+func stallAddProducer(d time.Duration) {
+	stallProducerNs.Add(int64(d))
+	stallBatches.Add(1)
+}
+
+func stallAddConsumer(d time.Duration) {
+	stallConsumerNs.Add(int64(d))
+	stallRecvWaits.Add(1)
+}
+
+func stallReport(tag string, buildWall time.Duration, producers int) {
+	if !stallOn {
+		return
+	}
+	p := stallProducerNs.Swap(0)
+	c := stallConsumerNs.Swap(0)
+	b := stallBatches.Swap(0)
+	w := stallRecvWaits.Swap(0)
+	fmt.Fprintf(os.Stderr,
+		"E09CSTALL %s producers=%d buildWallMs=%.1f producerBlockedMs=%.1f consumerBlockedMs=%.1f batches=%d recvWaits=%d\n",
+		tag, producers, float64(buildWall)/1e6, float64(p)/1e6, float64(c)/1e6, b, w)
+}
+--- internal/executor/zz_e09c_scaling_test.go
+package executor
+
+// zz_e09c_scaling_test.go — TEMPORARY measurement harness for E-09c
+// ("Cooperative-stall measurement under skew + worker-count scaling on
+// Q9-class shapes"). NOT for commit.
+//
+// Run with:
+//   GOOPG_E09C_STALL=1 go test -run TestE09CStallScaling -v ./internal/executor/
+//
+// It drives the COOPERATIVE PARALLEL HASH BUILD (parallel_hash_build.go) —
+// N producers scan+filter, one consumer inserts — across worker counts and
+// two build-key distributions (uniform vs 10:1 skew), and reads the
+// producer/consumer blocked-time counters from zz_e09c_stall.go.
+
+import (
+	"fmt"
+	"os"
+	"strings"
+	"testing"
+	"time"
+)
+
+func e09cSeed(t *testing.T, ctx *Context, table string, n int, skew bool) {
+	t.Helper()
+	const batch = 500
+	for base := 0; base < n; base += batch {
+		var sb strings.Builder
+		sb.WriteString("INSERT INTO " + table + " VALUES ")
+		for i := base; i < base+batch && i < n; i++ {
+			if i > base {
+				sb.WriteString(",")
+			}
+			k := i
+			if skew {
+				// 90% of build rows collapse onto 1/10 of the key space:
+				// the consumer's bucket chains lengthen while the producers'
+				// scan cost is unchanged.
+				if i%10 != 0 {
+					k = i % (n / 10)
+				}
+			}
+			fmt.Fprintf(&sb, "(%d,'name-%06d')", k, i)
+		}
+		if err := runDDL(t, ctx, sb.String()); err != nil {
+			t.Fatalf("seed %s: %v", table, err)
+		}
+	}
+}
+
+func TestE09CStallScaling(t *testing.T) {
+	if os.Getenv("GOOPG_E09C_STALL") == "" {
+		t.Skip("measurement harness; set GOOPG_E09C_STALL=1")
+	}
+	// The BUILD side is the SMALLER input, so the probe table must be
+	// larger than the table whose build we want to measure.
+	const dimRows = 300000
+	const factRows = 330000
+
+	for _, skew := range []bool{false, true} {
+		for _, workers := range []int{2, 4, 8} {
+			name := fmt.Sprintf("skew=%v/workers=%d", skew, workers)
+			t.Run(name, func(t *testing.T) {
+				ctx, _, cleanup := newDDLFixture(t)
+				defer cleanup()
+				if err := runDDL(t, ctx, "CREATE TABLE cs_dim (dk int, dname text)"); err != nil {
+					t.Fatal(err)
+				}
+				if err := runDDL(t, ctx, "CREATE TABLE cs_fact (fid int, fk int)"); err != nil {
+					t.Fatal(err)
+				}
+				e09cSeed(t, ctx, "cs_dim", dimRows, skew)
+				// Probe side is the LARGER input so the planner builds on cs_dim.
+				for base := 0; base < factRows; base += 500 {
+					var sb strings.Builder
+					sb.WriteString("INSERT INTO cs_fact VALUES ")
+					for i := base; i < base+500 && i < factRows; i++ {
+						if i > base {
+							sb.WriteString(",")
+						}
+						fmt.Fprintf(&sb, "(%d,%d)", i, i%dimRows)
+					}
+					if err := runDDL(t, ctx, sb.String()); err != nil {
+						t.Fatal(err)
+					}
+				}
+
+				ctx.MaxParallelWorkers = workers
+				ctx.MinParallelTableScanBlocks = 1
+				ctx.ParallelLeaderParticipation = true
+				ctx.WorkMem = 1 << 30 // single batch: the coop path declines when NBatch > 1
+
+				start := time.Now()
+				rows, err := runQueryWithErr(ctx,
+					"SELECT count(*) FROM cs_fact f JOIN cs_dim d ON f.fk = d.dk")
+				if err != nil {
+					t.Fatalf("query: %v", err)
+				}
+				t.Logf("E09C %s wall=%.1fms rows=%v", name, float64(time.Since(start))/1e6, renderRows(rows))
+			})
+		}
+	}
+}

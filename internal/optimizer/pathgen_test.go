@@ -1,6 +1,10 @@
 package optimizer
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/goopg/goopg/internal/parser"
+)
 
 // Phase C3.2 — path generation primitives. Pure functions over RelOptInfo;
 // nothing live calls them yet (C4 wires them into the DP and switches selection).
@@ -33,8 +37,18 @@ func TestGenerateScanPaths_PartialIsDivided(t *testing.T) {
 	if partial >= serial {
 		t.Fatalf("partial cost %v must be less than serial %v", partial, serial)
 	}
-	if diff := partial - serial/d; diff > 1e-6 || diff < -1e-6 {
-		t.Fatalf("partial cost %v should be serial/%v = %v", partial, d, serial/d)
+	// cost_seqscan's parallel arm (costsize.c:335-353): only the CPU run cost
+	// is divided by the parallel divisor; the disk cost is charged whole to
+	// every worker ("we assume that the disk run cost can't be amortized at
+	// all"). C-19b replaced the earlier whole-total division.
+	disk := cp.seqPageCost * 1000
+	cpu := (cp.cpuTupleCost + cp.cpuOperatorCost*1) * rel.Rows
+	want := disk + cpu/d
+	if diff := partial - want; diff > 1e-6 || diff < -1e-6 {
+		t.Fatalf("partial cost %v should be disk %v + cpu %v / %v = %v", partial, disk, cpu, d, want)
+	}
+	if got, want := rel.PartialPathlist[0].Rows, clampRowEst(rel.Rows/d); got != want {
+		t.Fatalf("partial rows = %v, want clamp_row_est(rows / divisor) = %v", got, want)
 	}
 	if rel.PartialPathlist[0].ParallelWorkers != 2 {
 		t.Fatalf("partial path must carry the worker count")
@@ -55,7 +69,7 @@ func TestGenerateHashJoinPaths_KeepsCheaperBuildSide(t *testing.T) {
 	joinRel := newRelOptInfo(RelSet(0b11), 1000000, 100)
 	// One hash key, no residual. The clause's contents do not matter here —
 	// only its count reaches hashJoinCost.
-	generateHashJoinPaths(joinRel, fact, dim, cp, []*restrictInfo{{}}, nil, nil)
+	generateHashJoinPaths(joinRel, fact, dim, cp, parser.JoinInner, []*restrictInfo{{}}, nil, nil)
 	setCheapest(joinRel)
 
 	if joinRel.CheapestTotal == nil {
@@ -101,7 +115,7 @@ func TestNLIPathRuinousForLargeOuter(t *testing.T) {
 		outer := relWithScanCost(outerRelids, outerRows, outerCost)
 		inner := nliInnerRel(innerRelids, 1000000, outerRelids, indexProbeCost(cp))
 		joinRel := newRelOptInfo(outerRelids|innerRelids, joinRows, 40)
-		addNLIPaths(nil, joinRel, outer, inner, cp, nil)
+		addNLIPaths(nil, joinRel, outer, inner, cp, parser.JoinInner, nil, 0)
 		setCheapest(joinRel)
 		if joinRel.CheapestTotal == nil {
 			t.Fatal("the NLI arm produced no path for a fully-supplied inner")
@@ -141,7 +155,7 @@ func TestGenerateHashJoinPaths_NoChildCheapestIsNoop(t *testing.T) {
 	joinRel := newRelOptInfo(RelSet(0b11), 10, 10)
 	outer := newRelOptInfo(RelSet(0b01), 10, 10) // no paths -> CheapestTotal nil
 	inner := newRelOptInfo(RelSet(0b10), 10, 10)
-	generateHashJoinPaths(joinRel, outer, inner, cp, []*restrictInfo{{}}, nil, nil)
+	generateHashJoinPaths(joinRel, outer, inner, cp, parser.JoinInner, []*restrictInfo{{}}, nil, nil)
 	if len(joinRel.Pathlist) != 0 {
 		t.Fatalf("no join paths should be generated without child cheapest paths")
 	}

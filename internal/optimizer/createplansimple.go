@@ -145,6 +145,179 @@ func createSeqScanPlan(p *Path) Node {
 // the keys are emitted as written; the only producer that can reach this is the
 // bridge, whose subtree was never expressed in binding coordinates in the first
 // place.
+// createAggPlan is the PathAgg arm (C-15): emit the path's aggregate spec
+// over the built input with the path's strategy. The spec is COPIED, never
+// rebound in place — sibling candidates share it, and the index-driven
+// variant's narrowed clone must not leak into them. The B-01c input-target
+// stamp is NOT applied here: the planner recomputes it on the emitted node
+// after the producer returns (same site as today), ordered after any
+// index-narrowing remap.
+//
+// The returned layout is nil: an Aggregate reorders columns (group keys +
+// agg outputs + passthrough), so no binding map of the child survives it —
+// the same nil `baseRelLayout` yields for any upper rel without a baseLeaf.
+// Callers above the seam work in Nodes (Output schemas), never layouts.
+func createAggPlan(p *Path) (Node, outputLayout) {
+	if p.Agg == nil {
+		panic("createPlan: PathAgg with no aggregate spec")
+	}
+	if len(p.Children) != 1 {
+		panic(fmt.Sprintf("createPlan: PathAgg with %d children, want exactly 1", len(p.Children)))
+	}
+	child, _ := createPlanNode(p.Children[0])
+	if child == nil {
+		panic("createPlan: PathAgg over a child path that built no node")
+	}
+	out := *p.Agg
+	out.Child = child
+	out.Strategy = p.AggStrategy
+	return &out, nil
+}
+
+// createFinalizeAggPlan is the PathFinalizeAgg arm (C-19g's remainder): emit
+// the parallel `Finalize -> Gather -> Partial` shape for the GROUP_AGG rel's
+// winning split candidate.
+//
+// It does NOT recurse through its own gather/partial children. Those exist to
+// carry the price (partialaggupper.go composes the cost from all three arms and
+// a trace shows them), but the three NODES cannot be built independently:
+// goopg's Final aggregate holds a `PartialSource` pointer at the very
+// `*Aggregate` its Gather runs, and the Partial publishes group states through
+// that pointer rather than emitting rows. So the arm walks to the bottom of the
+// chain, builds the ONE input subtree, and hands the shape to `splitAggregate`
+// (parallel.go) — the identical constructor `MaybeAddGather` calls, which is
+// what makes a path-model split and a post-pass split byte-identical rather
+// than merely similar (rule #2: sibling paths must agree).
+//
+// Every refusal is a panic, per createplan.go's contract: a path reaching here
+// in one of these shapes is a producer bug.
+func createFinalizeAggPlan(p *Path) (Node, outputLayout) {
+	if p.Agg == nil {
+		panic("createPlan: PathFinalizeAgg with no aggregate spec")
+	}
+	if p.ParallelWorkers <= 0 {
+		panic(fmt.Sprintf("createPlan: PathFinalizeAgg planning %d workers", p.ParallelWorkers))
+	}
+	// Finalize -> Gather -> Partial -> input.
+	if len(p.Children) != 1 || p.Children[0] == nil || p.Children[0].Kind != PathGather {
+		panic("createPlan: PathFinalizeAgg without a PathGather child")
+	}
+	gather := p.Children[0]
+	if len(gather.Children) != 1 || gather.Children[0] == nil || gather.Children[0].Kind != PathAgg {
+		panic("createPlan: PathFinalizeAgg's Gather without a partial PathAgg child")
+	}
+	partial := gather.Children[0]
+	if len(partial.Children) != 1 || partial.Children[0] == nil {
+		panic("createPlan: PathFinalizeAgg's partial aggregate without an input")
+	}
+	child, layout := createPlanNode(partial.Children[0])
+	if child == nil {
+		panic("createPlan: PathFinalizeAgg over a child path that built no node")
+	}
+	simple := *p.Agg
+	simple.Child = child
+	simple.Strategy = p.AggStrategy
+	// `splitAggregate` stamps the driving scan itself (stampParallelScan) and
+	// returns the Final node; the producer has already established that a
+	// driving scan exists, which is the same precondition `gatherChildPlan`
+	// enforces for a plain Gather.
+	built, ok := splitAggregate(&simple, p.ParallelWorkers).(*Aggregate)
+	if !ok || built == nil {
+		panic("createPlan: PathFinalizeAgg: splitAggregate built no aggregate")
+	}
+	if built.PartialSource == nil || drivingScan(built.PartialSource.Child) == nil {
+		panic("createPlan: PathFinalizeAgg over a subtree with no driving scan; every worker would read the whole relation")
+	}
+	return built, layout
+}
+
+// createDistinctPlan is the PathDistinct arm (C-16): emit the path's
+// DISTINCT spec over the built input — `*Distinct` (hash dedup), or
+// `DistinctOn` with all-output-columns keys when the path is Unique
+// (streaming adjacent dedup over the producer-stacked Sort, C-16b).
+// The KeyCols cover every output position, which is exactly full-row
+// dedup; the child order contract ("equal keys contiguous") holds because
+// the unique arm is only ever offered over the producer's own Sort.
+//
+// The returned layout is nil, as for the aggregate arm: DISTINCT preserves
+// columns positionally (dedup, not projection), but the layout describes
+// BINDING coordinates and the producers above the seam work in Nodes —
+// the same nil `baseRelLayout` yields for any upper rel without a baseLeaf.
+// Callers above the seam never read it (C-12 precedent).
+func createDistinctPlan(p *Path) (Node, outputLayout) {
+	if p.Distinct == nil {
+		panic("createPlan: PathDistinct with no distinct spec")
+	}
+	if len(p.Children) != 1 {
+		panic(fmt.Sprintf("createPlan: PathDistinct with %d children, want exactly 1", len(p.Children)))
+	}
+	child, _ := createPlanNode(p.Children[0])
+	if child == nil {
+		panic("createPlan: PathDistinct over a child path that built no node")
+	}
+	if p.Unique {
+		return &DistinctOn{pos: p.Distinct.pos, Child: child, KeyCols: distinctAllKeyCols(child), schema: p.Distinct.schema}, nil
+	}
+	return &Distinct{pos: p.Distinct.pos, Child: child, schema: p.Distinct.schema}, nil
+}
+
+// createWindowPlan is the PathWindow arm (C-18): emit the path's window
+// spec over the built input. The spec is COPIED, never rebound in place —
+// the same rule `createAggPlan` follows, so a sibling candidate (C-14's
+// presorted window, when an Incremental Sort executor exists) cannot see
+// another candidate's child.
+//
+// The B-01c input-target stamp is NOT applied here: `buildWindowStage`
+// stamps it on the emitted node after the producer returns, the same
+// ordering the aggregate site uses.
+//
+// The returned layout is nil, as for the aggregate and distinct arms: a
+// WindowAgg APPENDS columns to its child's schema, so the child's binding
+// map no longer describes the output, and callers above the seam work in
+// Nodes rather than layouts.
+func createWindowPlan(p *Path) (Node, outputLayout) {
+	if p.Window == nil {
+		panic("createPlan: PathWindow with no window spec")
+	}
+	if len(p.Children) != 1 {
+		panic(fmt.Sprintf("createPlan: PathWindow with %d children, want exactly 1", len(p.Children)))
+	}
+	child, _ := createPlanNode(p.Children[0])
+	if child == nil {
+		panic("createPlan: PathWindow over a child path that built no node")
+	}
+	out := *p.Window
+	out.Child = child
+	return &out, nil
+}
+
+// createSetOpPlan is the PathSetOp arm (C-18): emit the path's set-operation
+// spec over the two built inputs. `Children[0]` is the LEFT branch and
+// `Children[1]` the RIGHT — the order `addSetOpPaths` appended them in, and
+// the order the semantics depend on (EXCEPT is not commutative, and
+// `SetOp.Output()` reads the left branch's schema).
+//
+// The returned layout is nil for the same reason the other upper arms return
+// nil: a set operation has two children and therefore no single child layout
+// to pass through, and no caller above the seam reads one.
+func createSetOpPlan(p *Path) (Node, outputLayout) {
+	if p.SetOp == nil {
+		panic("createPlan: PathSetOp with no set-op spec")
+	}
+	if len(p.Children) != 2 {
+		panic(fmt.Sprintf("createPlan: PathSetOp with %d children, want exactly 2", len(p.Children)))
+	}
+	left, _ := createPlanNode(p.Children[0])
+	right, _ := createPlanNode(p.Children[1])
+	if left == nil || right == nil {
+		panic("createPlan: PathSetOp over a child path that built no node")
+	}
+	out := *p.SetOp
+	out.Left = left
+	out.Right = right
+	return &out, nil
+}
+
 func createSortPlan(p *Path) (Node, outputLayout) {
 	if len(p.Children) != 1 {
 		panic(fmt.Sprintf("createPlan: PathSort with %d children, want exactly 1", len(p.Children)))

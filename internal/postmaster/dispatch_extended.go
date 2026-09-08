@@ -46,10 +46,15 @@ func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *misc
 	// statement. This removes the per-Execute parser.Parse that was the -N hot
 	// path (S11's O-XP-1 profile: 6.2% cum).
 	connDBOid := resolveConnDBOid(s.cfg.Catalog, dbName)
+	// B-18 commit 1: the fingerprint keys the cache by planner context, so
+	// sessions with their own SETs share the cache under their own entry
+	// instead of bypassing it. Hoisted: Get and Put below must use the
+	// identical key.
+	cacheFP := sessionPlannerFingerprint(sess)
 	var node optimizer.Node
 	cacheHit := false
-	if s.pc != nil && !plannerSessionInputsActive(sess) && !sessionTempInheritanceActive(s.cfg.Catalog) && !partitionDetachPending(s.cfg.Catalog) && !inheritanceChangePending(s.cfg.Catalog) {
-		if cached, ok := s.pc.Get(planCacheKey(query, connDBOid)); ok {
+	if s.pc != nil && !sessionTempInheritanceActive(s.cfg.Catalog) && !partitionDetachPending(s.cfg.Catalog) && !inheritanceChangePending(s.cfg.Catalog) {
+		if cached, ok := s.pc.Get(planCacheKey(query, connDBOid, cacheFP)); ok {
 			node = cached
 			cacheHit = true
 		}
@@ -124,8 +129,8 @@ func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *misc
 		if perr != nil {
 			return nil, newPlannerExtendedQueryError(perr)
 		}
-		if s.pc != nil && !plannerSessionInputsActive(sess) && planCacheIsCacheable(node) {
-			s.pc.Put(planCacheKey(query, connDBOid), node)
+		if s.pc != nil && planCacheIsCacheable(node) {
+			s.pc.Put(planCacheKey(query, connDBOid, cacheFP), node)
 		}
 	} else {
 		// Cache hit: the query was already parsed and planned once (it could not

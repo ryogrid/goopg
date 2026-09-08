@@ -1,0 +1,27 @@
+Limit  (cost=13988.97..14062.95 rows=100 width=110)
+  ->  Finalize GroupAggregate  (cost=13988.97..14077.74 rows=120 width=110)
+        Group Key: (substr((warehouse.w_warehouse_name)::text, 1, 20)), ship_mode.sm_type, web_site.web_name
+        ->  Gather Merge  (cost=13988.97..14068.80 rows=372 width=110)
+              Workers Planned: 3
+              ->  Partial GroupAggregate  (cost=12988.93..13025.05 rows=120 width=110)
+                    Group Key: (substr((warehouse.w_warehouse_name)::text, 1, 20)), ship_mode.sm_type, web_site.web_name
+                    ->  Sort  (cost=12988.93..12990.31 rows=554 width=78)
+                          Sort Key: (substr((warehouse.w_warehouse_name)::text, 1, 20)), ship_mode.sm_type, web_site.web_name
+                          ->  Hash Join  (cost=2076.35..12963.68 rows=554 width=78)
+                                Hash Cond: (web_sales.ws_web_site_sk = web_site.web_site_sk)
+                                ->  Hash Join  (cost=2073.68..12957.97 rows=554 width=61)
+                                      Hash Cond: (web_sales.ws_ship_mode_sk = ship_mode.sm_ship_mode_sk)
+                                      ->  Hash Join  (cost=2072.23..12954.75 rows=554 width=34)
+                                            Hash Cond: (web_sales.ws_warehouse_sk = warehouse.w_warehouse_sk)
+                                            ->  Parallel Hash Join  (cost=2071.11..12950.95 rows=554 width=20)
+                                                  Hash Cond: (web_sales.ws_ship_date_sk = date_dim.d_date_sk)
+                                                  ->  Parallel Seq Scan on web_sales  (cost=0.00..10575.46 rows=115946 width=20)
+                                                  ->  Parallel Hash  (cost=2068.55..2068.55 rows=205 width=4)
+                                                        ->  Parallel Seq Scan on date_dim  (cost=0.00..2068.55 rows=205 width=4)
+                                                              Filter: ((d_month_seq >= 1223) AND (d_month_seq <= 1234))
+                                            ->  Hash  (cost=1.05..1.05 rows=5 width=22)
+                                                  ->  Seq Scan on warehouse  (cost=0.00..1.05 rows=5 width=22)
+                                      ->  Hash  (cost=1.20..1.20 rows=20 width=35)
+                                            ->  Seq Scan on ship_mode  (cost=0.00..1.20 rows=20 width=35)
+                                ->  Hash  (cost=2.30..2.30 rows=30 width=11)
+                                      ->  Seq Scan on web_site  (cost=0.00..2.30 rows=30 width=11)

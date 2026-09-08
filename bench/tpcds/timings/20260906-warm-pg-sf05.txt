@@ -1,0 +1,141 @@
+# TPC-DS SF=0.5 warm-start query timings — pg-18.3
+# captured: 2026-09-06T16:52:49.052980+09:00
+# repo commit at capture: 5bad1e52f
+# engine build: PostgreSQL 18.3
+# port: 65438  db: tpcds05
+# settings: shared_buffers=2GB work_mem=4MB effective_cache_size=4GB autovacuum=on
+# protocol: one WARM pass over queries 1..99 discarded, then ONE measured
+#   pass. Only one measured pass here (a pass costs ~40 min on goopg), so
+#   there is NO error bar in this file — unlike the TPC-H timings, a single
+#   query's number here must not be read as reproducible on its own.
+# harness: psql -f over bench/tpcds/runtime_goopg/tpcds-data/queries/
+# FAIL = non-zero exit or 300s timeout; this file records TIMING only, the
+#   correctness gate is scripts/tpcds-sf05-regression.sh against the
+#   git-tracked value oracle.
+# NOTE: seconds are machine-specific.
+#
+#
+# ===== TWO CAVEATS THAT CHANGE HOW THIS FILE READS =====
+#
+# (1) CONCURRENCY. The goopg (:65437) and PG (:65438) captures OVERLAPPED on
+#     this host — goopg finished 16:58, PG 16:52, both running most of that
+#     span together, each with up to 4 parallel workers. Both totals are
+#     therefore INFLATED by CPU contention. The goopg-vs-PG RATIO is the less
+#     damaged figure (both sides paid it), the absolutes are the more damaged.
+#     A quiet-host re-run is owed; ledger `tpcds-timing-concurrent-capture`.
+#
+# (2) THE TOTALS ARE NOT COMPARABLE AS PRINTED. PG's Q4 hit the 300 s budget
+#     and is recorded FAIL, so PG's TOTAL covers 98 queries while goopg's
+#     covers 99. Re-run cleanly afterwards, PG's Q4 still did not finish in
+#     400 s (exit 124); goopg runs the same query in 25.15 s. Adding a
+#     conservative 400 s for it:
+#
+#         goopg   1114.06 s over 99 queries
+#         PG     >= 985    s over 99 queries  (584.90 + >400)
+#
+#     i.e. roughly 1.1x rather than the 1.9x the printed totals suggest. A
+#     comparison that silently drops a timeout credits the engine that timed
+#     out, which is the opposite of conservative.
+#
+# query       secs
+Q1           57.68
+Q2            0.30
+Q3            0.02
+Q4            FAIL
+Q5            0.48
+Q6           90.70
+Q7            0.27
+Q8            0.14
+Q9            3.27
+Q10          10.80
+Q11          66.03
+Q12           0.03
+Q13           0.22
+Q14          18.17
+Q15           0.06
+Q16           0.19
+Q17           0.57
+Q18           0.18
+Q19           0.07
+Q20           0.05
+Q21           0.19
+Q22           1.36
+Q23           1.47
+Q24           0.02
+Q25           0.49
+Q26           0.18
+Q27           0.25
+Q28           0.79
+Q29           2.61
+Q30           3.62
+Q31           4.50
+Q32           0.04
+Q33           0.14
+Q34           0.09
+Q35           0.38
+Q36           0.01
+Q37           0.01
+Q38           0.75
+Q39           1.94
+Q40           0.04
+Q41           1.92
+Q42           0.06
+Q43           0.16
+Q44           0.41
+Q45           0.05
+Q46           0.19
+Q47           2.13
+Q48           0.23
+Q49           0.07
+Q50           0.04
+Q51           0.63
+Q52           0.08
+Q53           0.15
+Q54           8.90
+Q55           0.04
+Q56           0.21
+Q57           0.75
+Q58           0.11
+Q59           0.58
+Q60           0.33
+Q61           0.02
+Q62           0.09
+Q63           0.12
+Q64           0.27
+Q65           0.40
+Q66           0.13
+Q67           6.29
+Q68           0.10
+Q69           0.34
+Q70           0.01
+Q71           0.15
+Q72           0.21
+Q73           0.09
+Q74         261.23
+Q75           0.97
+Q76           0.14
+Q77           0.19
+Q78           0.96
+Q79           0.14
+Q80           0.13
+Q81          17.40
+Q82           0.02
+Q83           0.10
+Q84           0.04
+Q85           0.10
+Q86           0.01
+Q87           0.69
+Q88           0.77
+Q89           0.16
+Q90           0.07
+Q91           0.07
+Q92           0.04
+Q93           0.01
+Q94           0.07
+Q95           7.60
+Q96           0.08
+Q97           0.26
+Q98           0.08
+Q99           0.20
+#
+# TOTAL     584.90   (98 ok, 1 fail)

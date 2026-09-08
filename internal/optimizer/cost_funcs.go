@@ -79,13 +79,31 @@ type costParams struct {
 	// the parallel post-pass). Deferral ledger 2026-08-05 M0127-P5.7-a.
 	workMem int64
 
-	// enable* are PG's planner-method GUCs (take2 P2-05). True means the
-	// method is enabled; a disabled method still PRODUCES its path and
-	// increments Path.DisabledNodes, as PG 18 does.
+	// enable* are PG's planner-method GUCs (take2 P2-05, B-17a/B-17d). True
+	// means the method is enabled; a disabled method still PRODUCES its path
+	// and increments Path.DisabledNodes, as PG 18 does.
 	enableHashJoin  bool
 	enableMergeJoin bool
 	enableNestLoop  bool
-	enableMemoize   bool
+	// enableSort is `enable_sort` (B-17a): cost_sort's own flag on top of the
+	// input's count (costsize.c:2144). The Sort producer is sortPathFor.
+	enableSort   bool
+	enableMemoize bool
+	// enableSeqScan / enableIndexScan / enableBitmapScan are `enable_seqscan`
+	// / `enable_indexscan` / `enable_bitmapscan` (B-17d): cost_seqscan's,
+	// cost_index's and cost_bitmap_heap_scan's own flags (costsize.c:295, 560,
+	// 1023). The scan producers always generate the path and count, exactly
+	// as the join producers do since P2-05.
+	enableSeqScan    bool
+	enableIndexScan  bool
+	enableBitmapScan bool
+	// enableGatherMerge is `enable_gathermerge` (C-19d): cost_gather_merge's
+	// own flag (costsize.c:536, `path->path.disabled_nodes = input_disabled_
+	// nodes + (enable_gathermerge ? 0 : 1)`). It is the COUNTING form of
+	// `ParallelSettings.DisableGatherMerge`, whose comment asked for exactly
+	// this conversion once P5-04 landed real GatherMerge paths. `cost_gather`
+	// has no flag upstream, so there is no enableGather beside it.
+	enableGatherMerge bool
 	geqo            bool
 	geqoThreshold   int
 	geqoEffort      int
@@ -93,6 +111,17 @@ type costParams struct {
 	geqoGenerations int
 	geqoBias        float64
 	geqoSeed        float64
+
+	// maxParallelWorkersPerGather / minParallelTableScanBlocks /
+	// minParallelIndexScanBlocks / parallelLeaderParticipation are the
+	// parallel GUCs the path model reads (C-19a/b/c; see PlannerSettings for
+	// the unit and zero-value rules). `compute_parallel_worker` reads the
+	// first three (the index threshold from C-19c's partial index paths),
+	// `get_parallel_divisor` the last.
+	maxParallelWorkersPerGather int
+	minParallelTableScanBlocks  int64
+	minParallelIndexScanBlocks  int64
+	parallelLeaderParticipation bool
 }
 
 func defaultCostParams() costParams {
@@ -116,11 +145,26 @@ func defaultCostParams() costParams {
 		enableHashJoin:  true,
 		enableMergeJoin: true,
 		enableNestLoop:  true,
+		enableSort:      true,
+		enableSeqScan:   true,
+		enableIndexScan: true,
+		enableBitmapScan: true,
+		enableGatherMerge: true,
 		enableMemoize:   true,
 		geqo:            GeqoEnabled(),
 		geqoThreshold:   GeqoThreshold(),
 		geqoEffort:      5,
 		geqoBias:        2.0,
+		// The registered boot values (internal/utils/misc/defaults.go):
+		// max_parallel_workers_per_gather = 4 is a deliberate goopg default
+		// (PG 18.3 ships 2 — workers here are goroutines, not scarce slots);
+		// min_parallel_table_scan_size = 8MB = 1024 blocks,
+		// min_parallel_index_scan_size = 512kB = 64 blocks and
+		// parallel_leader_participation = on are PG's own.
+		maxParallelWorkersPerGather: 4,
+		minParallelTableScanBlocks:  8 * 1024 * 1024 / blockSizeBytes,
+		minParallelIndexScanBlocks:  512 * 1024 / blockSizeBytes,
+		parallelLeaderParticipation: true,
 	}
 }
 
@@ -144,12 +188,30 @@ func getParallelDivisor(workers int, leaderParticipates bool) float64 {
 
 // costSeqscan reproduces cost_seqscan (costsize.c:295): sequential page reads
 // plus per-tuple CPU. numQualOps is the number of operator evaluations per tuple
-// from the scan's restriction qual. The parallel case divides the run cost by the
-// divisor (the caller passes a per-worker tuple/page count, or divides after).
+// from the scan's restriction qual. The parallel arm is costParallelSeqscan.
 func costSeqscan(cp costParams, relPages int64, relTuples float64, numQualOps int) Cost {
 	run := cp.seqPageCost*float64(relPages) +
 		(cp.cpuTupleCost+cp.cpuOperatorCost*float64(numQualOps))*relTuples
 	return Cost{Startup: 0, Total: run}
+}
+
+// costParallelSeqscan is cost_seqscan's `parallel_workers > 0` arm
+// (costsize.c:335-353), the price of ONE worker's share of a partial seq scan.
+// It returns the cost and the per-worker row count.
+//
+// Only the CPU run cost is divided by `get_parallel_divisor`; the disk run
+// cost is charged in full to every worker — upstream's comment: "It may be
+// possible to amortize some of the I/O cost, but probably not very much,
+// because most operating systems already do aggressive prefetching. For now,
+// we assume that the disk run cost can't be amortized at all." The row count
+// is clamp_row_est(rows / divisor), "the number of tuples processed per
+// worker". C-19b (take3 08 §8): this is what makes a partial scan a REAL path
+// with a real cost rather than the post-pass's size rule.
+func costParallelSeqscan(cp costParams, relPages int64, relTuples, rows float64, numQualOps, workers int) (Cost, float64) {
+	d := getParallelDivisor(workers, cp.parallelLeaderParticipation)
+	disk := cp.seqPageCost * float64(relPages)
+	cpu := (cp.cpuTupleCost + cp.cpuOperatorCost*float64(numQualOps)) * relTuples / d
+	return Cost{Startup: 0, Total: disk + cpu}, clampRowEst(rows / d)
 }
 
 // qualEvalCost is `cost_qual_eval`'s contribution to a join (costsize.c:4700):
@@ -197,20 +259,34 @@ func qualEvalCost(cp costParams, numQuals int, tuples float64) float64 {
 // for five TPC-H queries where the flag-OFF planner hash-joins, at 2-4x the
 // runtime (09 §3.7).
 //
-// Only two of upstream's three branches can be reached from here. PG's middle
-// branch is the bounded heap-sort for a useful LIMIT (`limit_tuples`); goopg
-// has no LIMIT-aware sort path, so `output_tuples == tuples` and
-// `output_bytes == input_bytes` identically, which makes that branch's guard
-// (`tuples > 2 * output_tuples || input_bytes > sort_mem_bytes`) false whenever
-// the disk branch did not already fire. Ledgered with the LIMIT push-down.
+// C-13b (P4-04 cost arm) added the third branch: `limitTuples` is
+// `cost_tuplesort`'s `limit_tuples` (costsize.c:1898) — the absolute
+// count+offset bound the ORDERED upper rel carries, or <= 0 for "no useful
+// LIMIT". With a useful bound the middle branch prices the bounded heap-sort
+// (`N log2 K` comparisons); without one `output == tuples` and the branch's
+// guard is false whenever the disk branch did not fire, which is exactly the
+// two-branch shape this function had before. The merge-join side always
+// passes -1 (no LIMIT context above an input sort).
 //
 // `ncols` sizes one row through `hashsize.EntryBytes` — the SAME byte model
 // `spillPages` uses for the hash rival's batch files, so the two spill charges
 // this function was added to reconcile are denominated in one currency. Zero
 // means "column count unknown" and suppresses the disk arm, matching
 // `hashJoinCost`'s reading of a zero `innerCols` as "assume no spill": an
-// unknown width must not invent an I/O charge.
-func costSortRun(cp costParams, inputRows float64, ncols int) Cost {
+// unknown width must not invent an I/O charge. The bounded arm is likewise
+// unreachable at ncols == 0 (output_bytes is unknowable there): a bound sort
+// of unknown width keeps the quicksort price, never a heap price derived
+// from a guessed width.
+//
+// `avgVarBytes` is the row's variable-width payload, the second argument of
+// that same `EntryBytes` — the one `hashJoinCost` has passed as the real
+// `innerAvgVarBytes` since M0128-P3.1 while this function passed a literal 0
+// (`docs/design/planner-spill-cost-calibration/DESIGN.md` §3.3, Cut 1). A
+// sort of text-heavy rows was sized as if every column were fixed-width,
+// which under-charges the spill in the direction §3.2 already errs. Callers
+// hand in the rel's `AvgVarBytes`; zero stays a legitimate value ("no
+// ANALYZE, or every column fixed-width") and changes nothing.
+func costSortRun(cp costParams, inputRows float64, ncols int, avgVarBytes float64, limitTuples float64) Cost {
 	// "We want to be sure the cost of a sort is never estimated as zero, even
 	// if passed-in tuple count is zero. Besides, mustn't do log(0)..."
 	// (costsize.c) — PG clamps rather than returning zero, and a zero here
@@ -221,12 +297,24 @@ func costSortRun(cp costParams, inputRows float64, ncols int) Cost {
 		tuples = 2.0
 	}
 	comparisonCost := 2.0 * cp.cpuOperatorCost
+	// `output_tuples` (costsize.c:1918): the bound, when useful.
+	output := tuples
+	if limitTuples > 0 && limitTuples < tuples {
+		output = limitTuples
+	}
 	startup := comparisonCost * tuples * math.Log2(tuples)
 
 	if ncols > 0 && cp.workMem > 0 {
-		inputBytes := tuples * hashsize.EntryBytes(ncols, 0)
+		inputBytes := tuples * hashsize.EntryBytes(ncols, avgVarBytes)
+		outputBytes := output * hashsize.EntryBytes(ncols, avgVarBytes)
 		sortMemBytes := float64(cp.workMem)
-		if inputBytes > sortMemBytes {
+		if outputBytes > sortMemBytes {
+			// Disk-based sort of all the tuples (costsize.c:1936): the
+			// page/run math still sizes the INPUT — every tuple is
+			// written and re-read — while the branch itself is chosen on
+			// the OUTPUT size, so a bounded sort that fits in memory
+			// never spills. Without a bound output == tuples and this
+			// is the old condition exactly.
 			npages := math.Ceil(inputBytes / blockSizeBytes)
 			nruns := inputBytes / sortMemBytes
 			mergeorder := tuplesortMergeOrder(cp.workMem)
@@ -237,6 +325,15 @@ func costSortRun(cp costParams, inputRows float64, ncols int) Cost {
 			npageaccesses := 2.0 * npages * logRuns
 			// "Assume 3/4ths of accesses are sequential, 1/4th are not."
 			startup += npageaccesses * (cp.seqPageCost*0.75 + cp.randomPageCost*0.25)
+		} else if tuples > 2*output || inputBytes > sortMemBytes {
+			// Bounded heap-sort keeping just K tuples in memory
+			// (costsize.c:1960): N log2 K comparisons with the slightly
+			// higher constant PG tweaks for curve continuity at the
+			// crossover (tuples == 2*output prices identically to the
+			// quicksort arm below). Without a bound output == tuples
+			// and neither disjunct can fire past the disk branch, so
+			// the merge side's number is unchanged.
+			startup = comparisonCost * tuples * math.Log2(2.0*output)
 		}
 	}
 
@@ -244,6 +341,80 @@ func costSortRun(cp costParams, inputRows float64, ncols int) Cost {
 	// tuple" — NOT cpu_tuple_cost, because a Sort does no qual-checking or
 	// projection.
 	return Cost{Startup: startup, Total: startup + cp.cpuOperatorCost*tuples}
+}
+
+// costAgg is `cost_agg` (costsize.c:2682) for SORTED and HASHED — C-15's
+// replacement for the three aggregate rules' outcome-guessing. (The PLAIN
+// candidate is priced by the HASHED arm at 0 group columns and 1 group,
+// which is term-for-term PG's PLAIN arm: no grouping comparisons, trans
+// per input tuple, final once, emit once. No third enum value exists, by
+// the same zero-value discipline that keeps ungrouped nodes hashed today.)
+// Inputs mirror upstream's: per-aggregate trans/final costs, group-column
+// count, group count, and the input's cost/rows. inNcols/inAvgVarBytes are
+// the OMITTED spill arm's future inputs (kept so the resume does not
+// re-plumb callers) — see the NO-spill note at the function tail.
+//
+// AggClauseCosts (F3): goopg's catalog HAS procost but the planner never
+// reads it, so trans charges cpu_operator_cost per aggregate per input row
+// and final charges cpu_operator_cost per output group, with zero startup
+// terms — the legacy display number's shape with upstream's trans/final,
+// per-input/per-group structure, which is what lets real procost plug in
+// later. SORTED and HASHED therefore share exactly the same total CPU cost
+// and differ only in startup (streams vs blocking), so sorted-wins-iff-
+// input-ordered falls out without a special case (costsize.c:2720-2732).
+//
+// No spill arm exists (see the NO-spill note at the function tail):
+// `aggregateOp` performs grouped aggregation in memory with no spill path,
+// so there is nothing to charge. inNcols/inAvgVarBytes are its future
+// inputs, kept so the resume does not re-plumb callers.
+func costAgg(cp costParams, strategy AggStrategy, inputRows, inputStartup, inputTotal float64, numGroupCols int, numGroups float64, nAggs int, inNcols int, inAvgVarBytes float64) Cost {
+	tuples := inputRows
+	if tuples < 0 {
+		tuples = 0
+	}
+	groups := numGroups
+	if groups < 1 {
+		groups = 1
+	}
+	transPerTuple := cp.cpuOperatorCost * float64(nAggs)
+	finalPerGroup := cp.cpuOperatorCost * float64(nAggs)
+	groupCmpPerTuple := cp.cpuOperatorCost * float64(numGroupCols)
+
+	if strategy == AggStrategySorted {
+		// Streams: startup is the input's; total adds trans + grouping
+		// comparisons per input tuple, final + emit per group.
+		startup := inputStartup
+		total := inputTotal + transPerTuple*tuples + groupCmpPerTuple*tuples +
+			finalPerGroup*groups + cp.cpuTupleCost*groups
+		return Cost{Startup: startup, Total: total}
+	}
+
+	// SORTED and HASHED block on the input the same way: startup is the
+	// input's total, plus trans per input tuple. (PLAIN reaches here only
+	// via the HASHED arm at 0 group columns / 1 group — see above.)
+	startup := inputTotal + transPerTuple*tuples
+	if strategy == AggStrategyHashed {
+		// Hash computation per input tuple.
+		startup += groupCmpPerTuple * tuples
+	}
+	total := startup + finalPerGroup*groups + cp.cpuTupleCost*groups
+
+	// NO spill arm — deliberately, not an omission. PG's arm charges
+	// batches the executor actually writes; goopg's `aggregateOp`
+	// "performs grouped aggregation in memory"
+	// (operators_join_agg.go:1973) with no spill path at all, so every
+	// spill page charged here would be I/O that never happens — and a
+	// fictional charge flips real plans (measured: it drove Q3/Q10/Q13/Q18
+	// to sorted, Q13 5.67 s → 8.71 s, all four away from PG's hash). A
+	// memory-blind model that picks hash for a 100M-group query risks the
+	// OOM instead, but that failure already exists today and a fake I/O
+	// number does not fix it. Resume WITH executor spill support, pricing
+	// the batches the executor really writes (the JOIN spill currency in
+	// `spillPages` is the template, not PG's depth loop — goopg has no
+	// recursive hash partitioning).
+	// (inNcols/inAvgVarBytes are the spill arm's future inputs — kept so
+	// the resume does not re-plumb every caller.)
+	return Cost{Startup: startup, Total: total}
 }
 
 // tuplesortMergeOrder is `tuplesort_merge_order` (tuplesort.c): how many input
@@ -501,6 +672,77 @@ func gatherCost(cp costParams, sub Cost, outputRows float64) Cost {
 	return Cost{Startup: startup, Total: total}
 }
 
+// gatherMergeCost reproduces cost_gather_merge (costsize.c:485): a Gather that
+// MERGES its workers' already-ordered streams instead of interleaving them, so
+// it pays for a k-way heap on top of everything cost_gather pays for.
+//
+// `sub` is the partial subpath's cost (upstream's input_startup_cost /
+// input_total_cost, which create_gather_merge_path reads off the subpath),
+// `workers` is `path->num_workers` — the SUBPATH's parallel_workers — and
+// `outputRows` is compute_gather_rows(subpath), the same figure gatherCost
+// takes.
+//
+// The five terms, in upstream's order (:510-533):
+//
+//	N               = num_workers + 1   // "add one … to account for the leader"
+//	comparison_cost = 2.0 * cpu_operator_cost
+//	startup        += comparison_cost * N * log2(N)   // heap creation
+//	run            += rows * comparison_cost * log2(N) // per-tuple maintenance
+//	run            += cpu_operator_cost * rows        // "like cost_merge_append"
+//	startup        += parallel_setup_cost
+//	run            += parallel_tuple_cost * rows * 1.05
+//
+// The 1.05 is upstream's, and so is its reason: "Since Gather Merge, unlike
+// Gather, requires us to block until a tuple is available from every worker,
+// we bump the IPC cost up a little bit as compared with Gather. For lack of a
+// better idea, charge an extra 5%."
+//
+// `workers` must be > 0 (upstream asserts it): a zero-worker Gather Merge is
+// the single_copy shape, which C-19d's producer refuses rather than builds
+// (docs/design/planner-c19d-gather-paths/DESIGN.md §4.3). The clamp here is
+// belt-and-braces so an N of 1 cannot make log2(N) zero and price the merge
+// free.
+func gatherMergeCost(cp costParams, sub Cost, workers int, outputRows float64) Cost {
+	if workers < 1 {
+		workers = 1
+	}
+	n := float64(workers) + 1
+	logN := math.Log2(n)
+	comparisonCost := 2.0 * cp.cpuOperatorCost
+
+	startup := comparisonCost*n*logN + cp.parallelSetupCost
+	run := outputRows*comparisonCost*logN +
+		cp.cpuOperatorCost*outputRows +
+		cp.parallelTupleCost*outputRows*gatherMergeIPCFactor
+
+	return Cost{
+		Startup: startup + sub.Startup,
+		Total:   startup + run + sub.Total,
+	}
+}
+
+// gatherMergeIPCFactor is cost_gather_merge's extra 5% on the IPC term
+// (costsize.c:533). Named rather than written inline so a test can express the
+// relationship "a Gather Merge's tuple transfer costs more than a Gather's"
+// through the constant instead of pinning 1.05.
+const gatherMergeIPCFactor = 1.05
+
+// computeGatherRows reproduces compute_gather_rows (costsize.c:6625): a partial
+// path's `rows` is the PER-WORKER count (cost_seqscan's parallel arm divides by
+// get_parallel_divisor), so the Gather above it multiplies the same divisor
+// back to recover the relation's own row count.
+//
+// It reads the divisor from the SUBPATH's worker count, never from the rel or
+// the GUC, because that is the count the subpath was priced with — pricing a
+// Gather with a divisor the child did not use is how a row estimate silently
+// stops matching the cost beside it.
+func computeGatherRows(sub *Path, cp costParams) float64 {
+	if sub == nil {
+		return 0
+	}
+	return clampRowEst(sub.Rows * getParallelDivisor(sub.ParallelWorkers, cp.parallelLeaderParticipation))
+}
+
 // indexProbeCost is the cost of one equality probe of a selective/unique index
 // returning ~1 row: an index page and a heap page, both random, plus per-tuple
 // CPU. This is the per-outer-row rescan cost a nested-loop-index join pays
@@ -517,8 +759,27 @@ func indexProbeCost(cp costParams) float64 {
 // pick ruinous PG-shaped NL plans (measured: Q5/Q9 20-200x). This multiplier
 // recalibrates the probe cost toward goopg's in-memory reality so the DP prefers
 // a hash join over NL-probing a large outer. Overridable via
-// GOOPG_INDEX_PROBE_MULT for measurement; the calibrated default is set once a
-// value is validated on SF1.
+// GOOPG_INDEX_PROBE_MULT for measurement.
+//
+// **Calibrated to 2.0 on 2026-09-05** (C-20d). The knob had shipped at 1.0 —
+// exactly the value this comment says under-costs goopg's probes — because
+// the calibration it was created for was never run. Measured at SF=1, serial,
+// pinned-statistics regime, fresh server per arm, values 24/24 MATCH against
+// the multiplier-1 baseline on every arm:
+//
+//	        mult=1     mult=2     mult=4
+//	Q5      21.60 s     4.07 s     6.84 s
+//	Q7      15.72 s     5.86 s     6.24 s
+//	Q9      13.17 s     7.06 s     7.18 s
+//	Q3       6.25 s     2.67 s        —
+//	suite  138.58 s   100.79 s        —
+//
+// 2 and 4 pick the same plans on the probed queries, so 2 is chosen as the
+// smaller departure from PG's constants that still buys the whole win —
+// raising it further is unjustified without evidence. Every other query moved
+// within the noise band. The multiplier stays a knob rather than becoming a
+// hard-coded 2 so the next recalibration (after the NL-probe execution work
+// this comment describes) can be measured the same way.
 var indexProbeCostMultiplier = indexProbeMultFromEnv(os.Getenv("GOOPG_INDEX_PROBE_MULT"))
 
 // indexProbeMultFromEnv resolves GOOPG_INDEX_PROBE_MULT's raw value to the
@@ -535,8 +796,15 @@ func indexProbeMultFromEnv(v string) float64 {
 			return f
 		}
 	}
-	return 1.0
+	return indexProbeMultCalibrated
 }
+
+// indexProbeMultCalibrated is the validated default (see the block comment on
+// indexProbeCostMultiplier for the measurement that set it). Named rather than
+// inlined so the flag-provenance table resolves the same default the process
+// does — `unset(2)` is then a statement about the binary, not a restated
+// constant.
+const indexProbeMultCalibrated = 2.0
 
 // `multiHashJoinCost` costed goopg's N-way MultiHashJoin under the
 // comparability invariant (design ch. 06 §4.1) — build every dimension hash

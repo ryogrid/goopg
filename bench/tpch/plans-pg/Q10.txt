@@ -1,0 +1,21 @@
+=== Q10
+Sort  (cost=272218.71..272355.52 rows=54723 width=205)
+  Sort Key: (sum((lineitem.l_extendedprice * ('1'::numeric - lineitem.l_discount)))) DESC
+  ->  HashAggregate  (cost=267228.01..267912.05 rows=54723 width=205)
+        Group Key: customer.c_custkey, nation.n_name
+        ->  Hash Join  (cost=58053.88..266543.97 rows=54723 width=185)
+              Hash Cond: (customer.c_nationkey = nation.n_nationkey)
+              ->  Hash Join  (cost=58052.31..266374.41 rows=54723 width=163)
+                    Hash Cond: (orders.o_custkey = customer.c_custkey)
+                    ->  Hash Join  (cost=51015.31..259193.76 rows=54723 width=18)
+                          Hash Cond: (lineitem.l_orderkey = orders.o_orderkey)
+                          ->  Seq Scan on lineitem  (cost=0.00..204337.95 rows=1463043 width=18)
+                                Filter: (l_returnflag = 'R'::bpchar)
+                          ->  Hash  (cost=50314.00..50314.00 rows=56105 width=12)
+                                ->  Seq Scan on orders  (cost=0.00..50314.00 rows=56105 width=12)
+                                      Filter: ((o_orderdate >= '1993-10-01'::date) AND (o_orderdate < '1994-01-01 00:00:00'::timestamp without time zone))
+                    ->  Hash  (cost=5162.00..5162.00 rows=150000 width=151)
+                          ->  Seq Scan on customer  (cost=0.00..5162.00 rows=150000 width=151)
+              ->  Hash  (cost=1.25..1.25 rows=25 width=30)
+                    ->  Seq Scan on nation  (cost=0.00..1.25 rows=25 width=30)
+

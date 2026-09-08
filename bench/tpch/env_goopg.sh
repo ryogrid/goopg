@@ -98,3 +98,18 @@ export GOMEMLIMIT=${GOMEMLIMIT:-12GiB}
 # trades memory headroom for raw throughput. Override with
 # `GOGC=100` for memory-tight hosts.
 export GOGC=${GOGC:-off}
+
+# Gate determinism (2026-09-05): pin ANALYZE's reservoir sample for every
+# server this env file starts. goopg's statistics are per-connection and
+# ANALYZE is sampled, so an unpinned server plans against a fresh random
+# sample on each start — measured A/A noise between two captures of the SAME
+# binary was 455 estimate lines and 27 plan-shape lines, LARGER than the
+# signal a planner A/B is trying to read.
+#
+# It must live HERE, not in a client-side harness: ANALYZE executes
+# server-side and the value is read at server process start, so exporting it
+# next to a psql invocation is inert. `scripts/goopg-test-run.sh` runs the
+# server under `systemd-run --user --scope`, which inherits this environment.
+# Set to 0 to restore wall-clock seeding.
+# See docs/design/planner-gate-reproducibility/DESIGN.md.
+export GOOPG_ANALYZE_SEED=${GOOPG_ANALYZE_SEED:-20260905}

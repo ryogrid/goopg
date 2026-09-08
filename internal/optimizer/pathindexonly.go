@@ -95,7 +95,7 @@ func (s *searchCtx) addOneIndexOnlyPath(rel *RelOptInfo, tbl *catalog.Table, idx
 		return false
 	}
 	indexPages, indexTuples, treeHeight := estimateIndexGeometry(idx, tbl, relTuples)
-	cost := costIndexScan(s.cp, indexScanInputs{
+	in := indexScanInputs{
 		relPages:    relPages,
 		relTuples:   relTuples,
 		indexPages:  indexPages,
@@ -111,12 +111,23 @@ func (s *searchCtx) addOneIndexOnlyPath(rel *RelOptInfo, tbl *catalog.Table, idx
 		loopCount:       1,
 		indexOnly:       true,
 		allVisFrac:      relAllVisibleFraction(tbl, relPages),
-	})
-	addPath(rel, &Path{
+	}
+	cost := costIndexScan(s.cp, in)
+	// take2 P4-01 Slice 1: the scan Target, computed from NeededCols at
+	// path-creation time (see the Target comment on the literal below).
+	tgt, tgtKnown := scanPathTarget(rel)
+	serial := &Path{
 		Kind:             PathIndexScan,
 		Rel:              rel,
 		Rows:             rel.Rows,
 		Cost:             cost,
+		// create_index_path (pathnode.c:1078): `rel->consider_parallel`. C-19a.
+		ParallelSafe:     rel.ParallelSafeForPath(),
+		// B-17d: an index-only path is costed by cost_index too, so
+		// enable_indexscan = off counts here as well (planner.go's
+		// indexOnlyScanRejected documents the OR). enable_indexonlyscan =
+		// off stays a generation gate at the caller (check_index_only).
+		DisabledNodes:    disabledNodesFor(!s.cp.enableIndexScan),
 		IndexInfo:        idx,
 		IndexScanDir:     ForwardScanDirection,
 		IndexOnly:        true,
@@ -128,9 +139,21 @@ func (s *searchCtx) addOneIndexOnlyPath(rel *RelOptInfo, tbl *catalog.Table, idx
 		// hashsize.Choose exists to prevent.
 		NCols:       len(covered),
 		AvgVarBytes: coveredAvgVarBytes(tbl, covered),
+		// take2 P4-01 Slice 1: the scan Target, computed from NeededCols at
+		// path-creation time. Assert-only — never applied, never costed; the
+		// NCols/AvgVarBytes pair above is unchanged.
+		Target:      tgt,
+		TargetKnown: tgtKnown,
 		// No index clauses: this is the full-index-scan shape, and
 		// `createPlan` reads the empty list as exactly that.
-	}, "indexonly")
+	}
+	addPath(rel, serial, "indexonly")
+	// C-19c: the partial twin, `create_index_path(..., index_only_scan,
+	// ..., partial_path = true)` — the same build_index_paths arm as the
+	// plain scan's; cost_index sizes it on index pages alone
+	// (`rand_heap_pages = -1` when indexonly). Executor counterpart exists
+	// since M0134-0189 (Parallel Index Only Scan).
+	s.addPartialIndexPath(rel, tbl, serial, in, "indexonly.partial")
 	return true
 }
 

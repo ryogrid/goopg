@@ -83,27 +83,54 @@ type gatherOp struct {
 	// Close can tell a self-inflicted 57014 apart from a genuine failure.
 	selfCancelled bool
 
-	// pscan is the shared block allocator every child tree's driving scan is
-	// wired to. Without it each tree would scan the WHOLE relation and the
-	// Gather would return N copies of every row — which is exactly what
-	// happened the first time these pieces were connected, and what the
-	// serial-vs-parallel identity check caught.
-	pscan *parallelScanState
+	// parallelClaimSet is the shared work-claim state every child tree's
+	// driving scan is wired to (embedded, so o.pscan / o.pbm / o.pidx still
+	// name the individual kinds). Without it each tree would scan the WHOLE
+	// relation and the Gather would return N copies of every row — which is
+	// exactly what happened the first time these pieces were connected, and
+	// what the serial-vs-parallel identity check caught. It is shared with
+	// gatherMergeOp so the two cannot drift apart again (see the type's
+	// comment in parallel_scan.go).
+	*parallelClaimSet
 
 	// ownsSharedBuilds records that this Gather published hash tables on the
 	// session context (P8) and must retract them at Close.
 	ownsSharedBuilds bool
 
-	// pbm is the shared page allocator for a parallel bitmap heap scan (S5.6).
-	// The leader builds the bitmap once before fan-out and publishes it here;
-	// workers claim pages via attachParallelBitmapScan.
-	pbm *parallelBitmapState
+	// EX0-03b (new): scope is the instrumenter active on this op's own
+	// Build() call, handed over by maybeInstrument (instrumentScopeCarrier).
+	// workerTables holds one FRESH nodeStatsTable per execution site —
+	// worker i fills slot i, the leader fills slot n — folded post-join in
+	// Close into ctx.GatherWorkerStats. Pre-sized in Open; nil (unarmed)
+	// when no instrumentation scope was stored.
+	scope        *instrumenter
+	workerTables []nodeStatsTable
+}
 
-	// pidx is the shared leaf-block claim set for a parallel index-only scan
-	// (M0134-0189). Unlike pbm there is nothing to pre-build: the index is
-	// already there, so every tree — leader and workers alike — walks it and
-	// keeps only the leaf blocks it claims first.
-	pidx *parallelIndexScanState
+// EX0-03b (new): setInstrumentScope implements instrumentScopeCarrier,
+// storing the scope live at this op's own Build() time. Only the timing
+// bool is ever inherited from it — each execution site mints its own
+// fresh table via buildUnderFreshScope, so the stored table is never
+// reused.
+func (o *gatherOp) setInstrumentScope(s *instrumenter) { o.scope = s }
+
+// EX0-03b (new): buildChildForSlot builds one child tree for the given
+// execution slot. Instrumented sites (workers, leader) mint a FRESH table
+// under the mutex and file it into the pre-sized slot; uninstrumented
+// builds (no stored scope) still serialize through an explicit NIL scope
+// so a concurrent site's fresh table cannot leak into this tree.
+func (o *gatherOp) buildChildForSlot(slot int) (Operator, error) {
+	if o.scope == nil {
+		return buildUnderNilScope(o.buildChild)
+	}
+	op, tab, err := buildUnderFreshScope(o.scope.timing, o.buildChild)
+	if err != nil {
+		return nil, err
+	}
+	if slot >= 0 && slot < len(o.workerTables) {
+		o.workerTables[slot] = tab
+	}
+	return op, nil
 }
 
 func newGatherOp(p *optimizer.Gather, buildChild func() (Operator, error)) *gatherOp {
@@ -116,52 +143,6 @@ func (o *gatherOp) Schema() optimizer.Schema { return o.schema }
 // ANALYZE renders as PG's `Workers Launched:`. It can be lower than
 // WorkersPlanned once the cluster-wide cap is honoured (P6).
 func (o *gatherOp) WorkersLaunched() int { return o.launched }
-
-// prebuildBitmapScan builds the TIDBitmap once before fan-out so workers
-// share the result rather than each running their own index scan. (S5.6)
-//
-// This mirrors the pattern of prebuildHashJoins: the leader builds the bitmap
-// eagerly, publishes the sorted block list in a shared atomic allocator, and
-// workers claim disjoint pages from it.
-func (o *gatherOp) prebuildBitmapScan(ctx *Context) error {
-	// Decide from the PLAN, before building anything.
-	if !optimizer.HasBitmapScan(o.plan.Child) {
-		return nil
-	}
-	tree, err := o.buildChild()
-	if err != nil {
-		return err
-	}
-	var bmOps []*bitmapHeapScanOp
-	collectBitmapScans(tree, &bmOps)
-	if len(bmOps) == 0 {
-		return nil
-	}
-	// A partial subtree should have exactly one driving scan. If multiple
-	// bitmap scans appear (unexpected), fall back rather than guessing which
-	// one to share.
-	if len(bmOps) > 1 {
-		return nil
-	}
-	bm := bmOps[0]
-	if err := bm.Open(ctx); err != nil {
-		return err
-	}
-	// Build the bitmap.
-	tbm, err := bm.outerBitmap.buildBitmap(ctx)
-	if err != nil {
-		bm.Close()
-		return err
-	}
-	bm.tbm = tbm
-	bm.iter = tbmBeginIterate(tbm)
-	bm.ownBitmap = true
-
-	// Publish the sorted block list for workers.
-	o.pbm = newParallelBitmapState()
-	o.pbm.init(tbm)
-	return nil
-}
 
 // collectBitmapScans walks an operator tree and collects all bitmapHeapScanOp
 // nodes into dst.
@@ -229,9 +210,8 @@ func (o *gatherOp) Open(ctx *Context) error {
 
 	o.group = NewParallelGroup(ctx.Ctx)
 	o.ch = make(chan rowBatch, gatherChanDepth*(n+1))
-	// One allocator shared by every child tree, including the leader's.
-	o.pscan = newParallelScanState(0)
-	o.pidx = newParallelIndexScanState()
+	// One claim set shared by every child tree, including the leader's.
+	o.parallelClaimSet = newParallelClaimSet()
 
 	// P8: hash-join build sides run ONCE, here, before anything fans out.
 	// This must precede both NewWorkerContext (which copies the reference)
@@ -246,7 +226,7 @@ func (o *gatherOp) Open(ctx *Context) error {
 
 	// S5.6: pre-build the bitmap scan (if any) so workers share the result
 	// rather than each running their own index scan.
-	if err := o.prebuildBitmapScan(ctx); err != nil {
+	if err := o.prebuildBitmap(ctx, o.plan.Child, o.buildChild); err != nil {
 		o.startChannelCloser()
 		return err
 	}
@@ -257,9 +237,21 @@ func (o *gatherOp) Open(ctx *Context) error {
 	for i := 0; i < n; i++ {
 		arena := mmgr.Acquire(ctx.Mctx, mmgr.KindStmt)
 		o.arenas = append(o.arenas, arena)
-		o.workers = append(o.workers, NewWorkerContext(ctx, arena, o.group.Context()))
+		wctx := NewWorkerContext(ctx, arena, o.group.Context())
+		// EX0-03c: stamp the fan-out slot so MergeWorkerContext can tag
+		// this worker's sort entries with an explicit index.
+		wctx.workerSlot = i
+		o.workers = append(o.workers, wctx)
 	}
 	o.launched = n
+	ctx.recordGatherLaunched(o.plan, n)
+
+	// EX0-03b (new): pre-size the indexed per-site table slots (workers
+	// 0..n-1, leader slot n) when instrumentation is armed. Indexes are
+	// disjoint across goroutines, so no mutex is needed for the stores.
+	if o.scope != nil {
+		o.workerTables = make([]nodeStatsTable, n+1)
+	}
 
 	// Leader participation. PG's parallel_leader_participation has the leader
 	// execute a share as well as drain; goopg honours it — and with ZERO
@@ -292,15 +284,14 @@ func (o *gatherOp) Open(ctx *Context) error {
 	o.startChannelCloser()
 
 	if o.leaderRuns {
-		child, err := o.buildChild()
+		// EX0-03b: leader instrumented site — fresh table into slot n.
+		child, err := o.buildChildForSlot(n)
 		if err != nil {
 			return err
 		}
 		// The leader takes blocks from the same allocator as the workers —
 		// it is a peer, not an extra full scan.
-		attachParallelScan(child, o.pscan)
-		attachParallelBitmapScan(child, o.pbm) // S5.6
-		attachParallelIndexScan(child, o.pidx) // M0134-0189
+		o.attachAll(child)
 		if err := child.Open(ctx); err != nil {
 			_ = child.Close()
 			return err
@@ -334,13 +325,12 @@ func (o *gatherOp) startChannelCloser() {
 // runWorker builds this worker's own operator tree and streams materialised
 // batches to the leader.
 func (o *gatherOp) runWorker(idx int, wctx *Context) error {
-	child, err := o.buildChild()
+	// EX0-03b: worker instrumented site — fresh table into slot idx.
+	child, err := o.buildChildForSlot(idx)
 	if err != nil {
 		return err
 	}
-	attachParallelScan(child, o.pscan)
-	attachParallelBitmapScan(child, o.pbm) // S5.6
-	attachParallelIndexScan(child, o.pidx) // M0134-0189
+	o.attachAll(child)
 	defer func() { _ = child.Close() }()
 	if err := child.Open(wctx); err != nil {
 		return err
@@ -374,10 +364,10 @@ func (o *gatherOp) runWorker(idx int, wctx *Context) error {
 		if slot == nil {
 			continue
 		}
-		// The ownership boundary. Materialize — never cloneRow, never
+		// The ownership boundary. Transfer — never cloneRow, never
 		// Slot.CopyTo — because both are shallow, preserve ArenaID, and are
 		// silently wrong exactly here while passing every serial test.
-		batch = append(batch, MaterializeForTransfer(slot.Row()))
+		batch = append(batch, transferRowForQueue(slot))
 		if len(batch) >= gatherBatchRows && !flush() {
 			return wctx.Ctx.Err()
 		}
@@ -471,6 +461,11 @@ func (o *gatherOp) Close() error {
 	// 3. Join. Worker lifetime is strictly nested inside the statement.
 	err := o.group.Wait()
 
+	// EX0-03b (new): fold the per-site fresh tables post-join (the Wait
+	// above supplies the happens-before edge) into the Context-keyed
+	// carrier, copying only rows/loops/time per node.
+	foldGatherWorkerStats(o.ctx, o.workerTables)
+
 	// 4. Fold per-worker notices back, then release the arenas the leader
 	//    allocated. Both happen after the join, which supplies the
 	//    happens-before edge.
@@ -483,8 +478,10 @@ func (o *gatherOp) Close() error {
 	o.workers, o.arenas = nil, nil
 	if o.ownsSharedBuilds && o.ctx != nil {
 		// Retract the published tables so a later serial statement on this
-		// session does not adopt a stale build for the same plan node.
-		o.ctx.SharedHashBuilds = nil
+		// session does not adopt a stale build for the same plan node, and
+		// unlink the batch files of a spilling build (E-09a) now that no
+		// participant can still be reading them.
+		releaseSharedHashBuilds(o.ctx)
 		o.ownsSharedBuilds = false
 	}
 

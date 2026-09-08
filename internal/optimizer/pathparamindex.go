@@ -391,11 +391,19 @@ func (s *searchCtx) addOneParameterizedIndexPath(rel *RelOptInfo, tbl *catalog.T
 		totalTablePages: totalPages,
 		loopCount:       s.loopCountFor(req),
 	})
+	// take2 P4-01 Slice 1: the scan Target, computed from NeededCols at
+	// path-creation time. Assert-only — never applied, never costed.
+	tgt, tgtKnown := scanPathTarget(rel)
 	addPath(rel, &Path{
 		Kind:     PathIndexScan,
 		Rel:      rel,
 		Rows:     rows,
 		Cost:     cost,
+		// create_index_path (pathnode.c:1078): `rel->consider_parallel`. C-19a.
+		ParallelSafe: rel.ParallelSafeForPath(),
+		// B-17d: `cost_index`'s own flag (costsize.c:560). The producer
+		// always runs, parameterised or not.
+		DisabledNodes: disabledNodesFor(!s.cp.enableIndexScan),
 		Pathkeys: keys,
 		// `IndexPath.indexinfo` / `indexscandir` (pathnodes.h:1845/1849): the
 		// index this path's cost and rows were computed FOR, named so P5.5's
@@ -411,6 +419,8 @@ func (s *searchCtx) addOneParameterizedIndexPath(rel *RelOptInfo, tbl *catalog.T
 		// `idx` only because every one of its columns is bound.
 		IndexClauses:  clauses,
 		RequiredOuter: req,
+		Target:        tgt,
+		TargetKnown:   tgtKnown,
 	}, "index.parameterised")
 	return true
 }

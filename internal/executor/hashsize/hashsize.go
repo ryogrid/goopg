@@ -51,23 +51,46 @@ const (
 	RowSliceBytes = 24
 
 	// MapSlotBytes is goopg's analogue of PG's `sizeof(HashJoinTuple)` —
-	// the per-bucket cost of the table's index structure. A Go
-	// `map[string][]Row` slot holds a 16-byte string header, a 24-byte
-	// slice header and roughly a byte of tophash plus the load-factor
-	// slack, which rounds to 48. PG's bucket is a bare 8-byte pointer;
-	// using PG's 8 here would let the sizing believe six times as many
-	// buckets fit in work_mem as actually do.
+	// the per-bucket cost of the table's index structure. PG's bucket is a
+	// bare 8-byte pointer; using PG's 8 here would let the sizing believe
+	// six times as many buckets fit in work_mem as actually do.
+	//
+	// KNOWN 2x LOW — 48 is a hand-derived guess, not a measurement, and it
+	// is retained deliberately. The derivation below (a 16-byte string
+	// header, a 24-byte slice header, a tophash byte and load-factor slack,
+	// "which rounds to 48") was checked against go1.25's swisstable runtime
+	// during D-05 and came out at 96.1 B for `map[string][]Row` and 80.1 B
+	// for `map[int64][]Row`.
+	//
+	// Correcting it to 96 was implemented and measured (2026-09-06): it
+	// halved the bucket heap, 586.7 -> 286.0 MB live, per-worker peak
+	// -34.5%, batches unchanged, values 24/24 MATCH — and cost +10.4% on
+	// TPC-H because Q14 flipped Hash Join -> Nested Loop (+3364%). Q14 ran
+	// `Batches: 1` in BOTH arms, so nothing spilled: the PLANNER prices a
+	// 9-column build the executor never builds, and an honest bucket price
+	// pushed that phantom 1.5% past the budget.
+	//
+	// So this constant cannot be fixed on its own. It is blocked behind the
+	// cost-side narrowing fix (deferral ledger `take3-D-05-costside-unnarrowed`);
+	// with the narrowed input the same build sits at 53.4 of 134.2 MB, a
+	// 2.5x margin instead of a 1.5% one. Patch preserved at
+	// `tmp/d05p2-bucket-charge.patch`; artifact
+	// `analysis/minimize-datum/d05-bucket-charge-20260906/README.md`.
+	// Do not raise it without that fix, and do not read 48 as validated.
 	MapSlotBytes = 48
 
 	// MinBuckets mirrors nodeHash.c's "don't let nbuckets be really small"
 	// floor of 1024.
 	MinBuckets = 1024
 
-	// FileBufferBytes is the write buffer assumed per batch temp file in
-	// the walk-back below — PG's BLCKSZ. goopg's spillWriter is currently
-	// unbuffered (internal/executor/spill.go), so this term is a
-	// forward-looking bound that P3.2's framed batch files will make real;
-	// see the deferral ledger row for M0127-P3.1.
+	// FileBufferBytes is the write buffer per batch temp file assumed by
+	// the walk-back below — PG's BLCKSZ. No longer forward-looking: P3.2
+	// landed the framed batch files and sized spillWriter's bufio writer at
+	// exactly this constant (`bufio.NewWriterSize(f, hashsize.FileBufferBytes)`,
+	// internal/executor/spill.go), so the assumption is true rather than
+	// aspirational. The M0127-P3.1 ledger row that recorded the gap is
+	// closed by that change; this comment previously still described the
+	// unbuffered pre-P3.2 writer.
 	FileBufferBytes = 8192
 
 	// MaxTableBytes is the ceiling on a single allocation the geometry may
@@ -126,6 +149,111 @@ func EntryBytes(ncols int, avgVarBytes float64) float64 {
 		avgVarBytes = 0
 	}
 	return float64(ncols)*DatumBytes + RowSliceBytes + avgVarBytes
+}
+
+const (
+	// SpillFrameBytes is the per-row overhead a spilled row pays outside its
+	// datums: writeFrame's 4-byte little-endian length prefix plus
+	// WriteRowHashed's 4-byte join hash value (internal/executor/spill.go).
+	// The unhashed WriteRow pays only the first 4, so charging both errs
+	// high by 4 bytes on the merge-spill path, which is the safe direction.
+	SpillFrameBytes = 8
+
+	// SpillColumnBytes is the encoded size of one fixed-width column:
+	// encodeDatum's 1-byte Kind tag plus an 8-byte payload.
+	//
+	// The planner knows ncols and avgVarBytes but not the KIND MIX, so this
+	// is one number standing for a switch. Its error against every arm of
+	// encodeDatum is bounded and small:
+	//
+	//	KindInt        1+8       = 9   exact
+	//	KindString     1+4+len   = 5   +4 (model over-charges the header)
+	//	KindBytes      1+4+len   = 5   +4
+	//	KindToastPtr   1+4+len   = 5   +4
+	//	KindNull       1         = 1   +8
+	//	KindBool       1+1       = 2   +7
+	//	KindTime       1+8+1+2   = 12  -3
+	//	KindEnum       1+8+4+len = 13  -4
+	//	KindInterval   1+4+4+8   = 17  -8
+	//	KindNumeric    1+2+4+1+len(mag) = 8 + mag  ≈ +1
+	//
+	// i.e. within ±8 B/column either way, against the 39 B/column
+	// (DatumBytes - SpillColumnBytes) of over-statement it removes.
+	SpillColumnBytes = 9
+
+	// SpillCountBytes is appendRowPayload's uvarint column count. One byte
+	// for any row of fewer than 128 columns, which is every row goopg
+	// spills in practice; wider rows are under-charged by a byte or two.
+	SpillCountBytes = 1
+
+	// SpillKeyBytes is the extra prefix an INNER (build-side) batch frame
+	// carries over an outer one: appendSpillRowKey's 1-byte lane tag plus
+	// the canonical hash-table key itself (internal/executor/spill.go,
+	// WriteRowKeyed). E-14 added it so a reloaded build row no longer has to
+	// re-evaluate the build key expression to learn its bucket — PG's
+	// ExecHashJoinSaveTuple rationale, except that goopg's buckets are keyed
+	// by canonical form rather than by hash, so the key has to ride along
+	// and the 32-bit hash alone will not do.
+	//
+	// 9 is the INT lane, exact: 1-byte tag + a fixed-width int64. The string
+	// lane is 1 + uvarint(len) + len, so this UNDER-charges a string-keyed
+	// build by the key's own length. That is the unsafe direction for a
+	// spill charge, and it is deliberate only in the sense that the planner
+	// has no key-width statistic to do better with — recorded here rather
+	// than hidden, and it is the first thing to fix if an inner-file page
+	// count is ever measured short.
+	SpillKeyBytes = 9
+)
+
+// SpillBytes returns the ON-DISK size of one spilled row of ncols columns
+// whose variable-width payload averages avgVarBytes, as
+// internal/executor/spill.go actually encodes it.
+//
+// It exists because EntryBytes is the wrong model for batch I/O and was being
+// used for it. EntryBytes measures the IN-MEMORY entry — a 48-byte Datum
+// struct per column plus a 24-byte slice header — while the file holds a kind
+// tag and a payload. The gap is not a constant: it runs from about 5x (a
+// narrow fixed-width row, where the 48 bytes are almost pure overhead) down to
+// about 1.2x (a wide text row, where variable-width payload is carried at par
+// on both sides), so no single multiplier corrects it. Design:
+// docs/design/planner-spill-cost-calibration/DESIGN.md §6.2; the ledgered
+// approximation it retires is M0127-P5.7-a.
+//
+// This is deliberately NOT the model Choose uses. Choose must keep predicting
+// the executor's in-memory geometry through EntryBytes, because that identity
+// with joinOp.buildGeometry is what makes `NBatch > 1` mean "the executor will
+// really write files". Only the I/O CHARGE moves to this model.
+//
+// spill.go's encoder and this function are a sibling pair and must change
+// together; TestSpillBytesAgreesWithEncoder (internal/executor) pins them by
+// encoding real rows and comparing byte lengths.
+func SpillBytes(ncols int, avgVarBytes float64) float64 {
+	if ncols < 0 {
+		ncols = 0
+	}
+	if avgVarBytes < 0 || math.IsNaN(avgVarBytes) {
+		avgVarBytes = 0
+	}
+	return SpillFrameBytes + SpillCountBytes +
+		float64(ncols)*SpillColumnBytes + avgVarBytes
+}
+
+// SpillInnerBytes is SpillBytes for an INNER (build-side) batch file, whose
+// frames carry the canonical hash-table key ahead of the payload.
+//
+// The two sides of a hash join spill through different writers —
+// WriteRowKeyed for the inner, WriteRowHashed for the outer — so a cost model
+// that charges both through one function is wrong on one of them. It exists as
+// a separate function rather than a bool parameter so a call site has to say
+// which side it means.
+//
+// This is a drift the agreement test did NOT catch when the keyed frame
+// landed, because the test pinned the outer writer: the model stayed correct
+// for the frames it was tested against and went 9 B/row short on the frames it
+// was not. TestSpillBytesAgreesWithKeyedEncoder (internal/executor) now covers
+// both writers, which is what the sibling-pair rule actually requires.
+func SpillInnerBytes(ncols int, avgVarBytes float64) float64 {
+	return SpillBytes(ncols, avgVarBytes) + SpillKeyBytes
 }
 
 // EffectiveMemLimit maps an executor Context.WorkMem (where 0 means "no limit

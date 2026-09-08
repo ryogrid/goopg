@@ -147,8 +147,16 @@ func TestPlanJoinPicksHashAlgo(t *testing.T) {
 		{"SELECT a.aid FROM pgbench_accounts a JOIN pgbench_history h ON a.aid = h.aid", true},
 		// Reversed equality flipped at plan time → still hash.
 		{"SELECT a.aid FROM pgbench_accounts a JOIN pgbench_history h ON h.aid = a.aid", true},
-		// LEFT join also takes the hash path.
-		{"SELECT a.aid FROM pgbench_accounts a LEFT JOIN pgbench_history h ON a.aid = h.aid", true},
+		// C-04a: a LEFT link now enters the join SEARCH, which offers merge,
+		// hash and nested loop for it (DPPATH shows all three, all
+		// `jointype=left`). On this catalog neither table has row estimates,
+		// so the hash and nested-loop totals tie EXACTLY and the tie-break
+		// takes the lower startup — the nested loop. That is a cost decision
+		// on an unmeasured fixture, not a lost capability: with real
+		// estimates the LEFT join takes the hash path, which is what
+		// TestPlanJoinHashBuildSidePicksSmaller's LEFT case (smallStats /
+		// bigStats) asserts.
+		{"SELECT a.aid FROM pgbench_accounts a LEFT JOIN pgbench_history h ON a.aid = h.aid", false},
 		// RIGHT/FULL are no longer PINNED to merge (M0127-P4.2 gave the hash
 		// executor outer fill on either side, design leftdeep-joins/07 §3) —
 		// but this catalog carries no row estimates, and with none the
@@ -260,7 +268,16 @@ func TestPlanJoinHashBuildSidePicksSmaller(t *testing.T) {
 			if !ok {
 				t.Fatalf("root=%T want *Project", node)
 			}
-			j, ok := proj.Child.(*Join)
+			child := proj.Child
+			// C-04a: a LEFT link now enters the join search, whose root
+			// republishes the prefix's columns through its own boundary
+			// `*Project` (03 §10). Step over it rather than reaching past
+			// only for the LEFT case, so the INNER cases keep exercising the
+			// same unwrap.
+			if inner, isProj := child.(*Project); isProj {
+				child = inner.Child
+			}
+			j, ok := child.(*Join)
 			if !ok {
 				t.Fatalf("child=%T want *Join", proj.Child)
 			}
@@ -315,9 +332,10 @@ func TestPlanCommaFromPushesEqualityIntoJoin(t *testing.T) {
 		}
 	})
 
-	// Mixed case: an eq-conjunct should land on the Join while a
-	// single-table filter stays on top.
-	t.Run("non-pushable conjunct stays on Filter", func(t *testing.T) {
+	// Mixed case: an eq-conjunct lands on the Join while a single-table
+	// restriction is PLACED on its input (C-02c move — pre-C-02c it stayed
+	// on a residual Filter above the Join and was evaluated twice).
+	t.Run("single-table conjunct placed on scan input", func(t *testing.T) {
 		sql := "SELECT a.aid FROM pgbench_accounts a, pgbench_history h WHERE a.aid = h.aid AND a.bid = 5"
 		node, err := Plan(parseOne(t, sql), cat)
 		if err != nil {
@@ -327,16 +345,28 @@ func TestPlanCommaFromPushesEqualityIntoJoin(t *testing.T) {
 		if !ok {
 			t.Fatalf("root=%T want *Project", node)
 		}
-		f, ok := proj.Child.(*Filter)
+		j, ok := proj.Child.(*Join)
 		if !ok {
-			t.Fatalf("Project.Child=%T want *Filter (a.bid=5 stays here)", proj.Child)
-		}
-		j, ok := f.Child.(*Join)
-		if !ok {
-			t.Fatalf("Filter.Child=%T want *Join", f.Child)
+			t.Fatalf("Project.Child=%T want *Join (no residual Filter — a.bid=5 moved below)", proj.Child)
 		}
 		if j.Type != JoinTypeInner || j.Algo != JoinAlgoHash {
 			t.Errorf("Join Type=%v Algo=%v want INNER+Hash", j.Type, j.Algo)
+		}
+		lf, ok := j.Left.(*Filter)
+		if !ok {
+			t.Fatalf("Join.Left=%T want *Filter carrying the placed a.bid=5", j.Left)
+		}
+		placed := splitAnd(lf.Predicate)
+		if len(placed) != 1 {
+			t.Fatalf("placed Filter has %d conjuncts, want 1 (a.bid=5)", len(placed))
+		}
+		if cr, ok := placed[0].(*BinaryOp).Left.(*ColumnRef); !ok || cr.Name != "bid" {
+			t.Errorf("placed conjunct is %v, want the a.bid=5 restriction (not an equi-leak)", placed[0])
+		}
+		// The join keeps its equi-clause: only the single-table
+		// restriction moved, not the join predicate.
+		if j.Predicate == nil {
+			t.Error("Join.Predicate nil after placement — the equi-clause must stay on the Join")
 		}
 	})
 }

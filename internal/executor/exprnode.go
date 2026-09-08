@@ -324,28 +324,53 @@ func evalFastExpr(exprs exprTreeSlab, idx int32, slot SlotView, ctx *Context) (D
 			if colIdx < 0 || colIdx >= len(s.row) {
 				return evalFastColumnRefErr(n, slot, ctx, colIdx, len(s.row))
 			}
-			return s.Get(colIdx), nil
+			// EX1-01 tail-poison (see evalExprSlot's ColumnRef arm).
+			d := s.Get(colIdx)
+			checkDeformPoison(d)
+			return d, nil
 		case *VirtualSlot:
 			if colIdx < 0 || colIdx >= len(s.cols) {
 				return evalFastColumnRefErr(n, slot, ctx, colIdx, len(s.cols))
 			}
-			return s.Get(colIdx), nil
+			d := s.Get(colIdx)
+			checkDeformPoison(d)
+			return d, nil
 		case *Slot:
 			if colIdx < 0 || colIdx >= len(s.Cells) {
 				return evalFastColumnRefErr(n, slot, ctx, colIdx, len(s.Cells))
 			}
-			return s.Get(colIdx), nil
+			d := s.Get(colIdx)
+			checkDeformPoison(d)
+			return d, nil
+		case *PackedSlot:
+			// R-0 site 2 (04 §9.1), D-03. Without an arm a *PackedSlot falls
+			// past the switch to the unchecked `slot.Get(colIdx)` below, which
+			// loses the bounds guard this whole switch exists to provide — and
+			// an out-of-range index there panics raw in a goroutine outside
+			// ParallelGroup.Go's recover (the TPC-DS Q8 post-mortem above).
+			// Width() is the descriptor's width, not the deform watermark, so
+			// the comparison is the same one every other arm makes.
+			if colIdx < 0 || colIdx >= s.Width() {
+				return evalFastColumnRefErr(n, slot, ctx, colIdx, s.Width())
+			}
+			d := s.Get(colIdx)
+			checkDeformPoison(d)
+			return d, nil
 		case rowSlotView:
 			if colIdx < 0 || colIdx >= len(s) {
 				return evalFastColumnRefErr(n, slot, ctx, colIdx, len(s))
 			}
-			return s.Get(colIdx), nil
+			d := s.Get(colIdx)
+			checkDeformPoison(d)
+			return d, nil
 		case nil:
 			return evalFastColumnRefErr(n, slot, ctx, colIdx, 0)
 		}
 		// A SlotView implementation this switch does not know: no width is
 		// reachable, so behave as the pre-PS6.1 arm did.
-		return slot.Get(colIdx), nil
+		d := slot.Get(colIdx)
+		checkDeformPoison(d)
+		return d, nil
 
 	case ExprIntConst:
 		v := int64(binary.LittleEndian.Uint64(n.payload[:]))

@@ -314,11 +314,11 @@ type refusingBuilder struct {
 	s *searchCtx
 }
 
-func (r *refusingBuilder) sizeJoinRel(outer, inner *RelOptInfo, clauses []*restrictInfo) (float64, int) {
-	return r.s.calcJoinrelSize(nil, outer, inner, clauses)
+func (r *refusingBuilder) sizeJoinRel(outer, inner *RelOptInfo, clauses []*restrictInfo, _ *SpecialJoinInfo) (float64, int) {
+	return r.s.calcJoinrelSize(nil, outer, inner, clauses, nil)
 }
 
-func (r *refusingBuilder) addPaths(joinrel, outer, inner *RelOptInfo, clauses []*restrictInfo) error {
+func (r *refusingBuilder) addPaths(joinrel, outer, inner *RelOptInfo, clauses []*restrictInfo, sjinfo *SpecialJoinInfo) error {
 	return nil // refuse: never add a path
 }
 

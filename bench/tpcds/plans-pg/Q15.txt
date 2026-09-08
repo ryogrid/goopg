@@ -1,0 +1,20 @@
+Limit  (cost=24967.71..24981.29 rows=100 width=43)
+  ->  GroupAggregate  (cost=24967.71..24982.10 rows=106 width=43)
+        Group Key: customer_address.ca_zip
+        ->  Gather Merge  (cost=24967.71..24980.25 rows=106 width=17)
+              Workers Planned: 3
+              ->  Sort  (cost=23967.67..23967.75 rows=34 width=17)
+                    Sort Key: customer_address.ca_zip
+                    ->  Nested Loop  (cost=2069.82..23966.80 rows=34 width=17)
+                          Join Filter: ((substr((customer_address.ca_zip)::text, 1, 5) = ANY ('{85669,86197,88274,83405,86475,85392,85460,80348,81792}'::text[])) OR (customer_address.ca_state = ANY ('{CA,WA,GA}'::bpchar[])) OR (catalog_sales.cs_sales_price > '500'::numeric))
+                          ->  Nested Loop  (cost=2069.51..23857.51 rows=284 width=10)
+                                ->  Parallel Hash Join  (cost=2069.21..23764.18 rows=285 width=10)
+                                      Hash Cond: (catalog_sales.cs_sold_date_sk = date_dim.d_date_sk)
+                                      ->  Parallel Seq Scan on catalog_sales  (cost=0.00..21084.70 rows=232470 width=14)
+                                      ->  Parallel Hash  (cost=2068.55..2068.55 rows=53 width=4)
+                                            ->  Parallel Seq Scan on date_dim  (cost=0.00..2068.55 rows=53 width=4)
+                                                  Filter: ((d_qoy = 2) AND (d_year = 2001))
+                                ->  Index Scan using customer_pkey on customer  (cost=0.29..0.33 rows=1 width=8)
+                                      Index Cond: (c_customer_sk = catalog_sales.cs_bill_customer_sk)
+                          ->  Index Scan using customer_address_pkey on customer_address  (cost=0.29..0.36 rows=1 width=18)
+                                Index Cond: (ca_address_sk = customer.c_current_addr_sk)

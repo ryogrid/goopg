@@ -102,7 +102,7 @@ func TestCalcJoinrelSizeEqjoinselShape(t *testing.T) {
 	outer, inner := jrsRels(6000000, 800000)
 
 	clauses := []*restrictInfo{jrsEq("l_partkey", "ps_partkey", noEquivClass)}
-	rows, width := s.calcJoinrelSize(c, outer, inner, clauses)
+	rows, width := s.calcJoinrelSize(c, outer, inner, clauses, nil)
 
 	// nd is 200000 on both sides, so the divisor is 200000.
 	wantRows(t, rows, clampRowEst(6000000.0*800000.0/200000.0), "single non-key equality")
@@ -133,7 +133,7 @@ func TestCalcJoinrelSizeCompositeUniqueNoFanout(t *testing.T) {
 		jrsEq("l_partkey", "ps_partkey", noEquivClass),
 		jrsEq("l_suppkey", "ps_suppkey", noEquivClass),
 	}
-	rows, _ := s.calcJoinrelSize(c, outer, inner, clauses)
+	rows, _ := s.calcJoinrelSize(c, outer, inner, clauses, nil)
 	wantRows(t, rows, 6000000, "composite unique key covered")
 
 	marginal := clampRowEst(6000000.0 * 800000.0 / 200000.0 / 10000.0)
@@ -156,7 +156,7 @@ func TestCalcJoinrelSizePartialKeyDoesNotFire(t *testing.T) {
 	outer, inner := jrsRels(6000000, 800000)
 
 	clauses := []*restrictInfo{jrsEq("l_partkey", "ps_partkey", noEquivClass)}
-	rows, _ := s.calcJoinrelSize(c, outer, inner, clauses)
+	rows, _ := s.calcJoinrelSize(c, outer, inner, clauses, nil)
 	wantRows(t, rows, clampRowEst(6000000.0*800000.0/200000.0), "half a composite key")
 }
 
@@ -177,7 +177,7 @@ func TestCalcJoinrelSizeSuperkeySubsetLeavesResidual(t *testing.T) {
 		jrsEq("l_partkey", "ps_partkey", noEquivClass),
 		jrsEq("l_suppkey", "ps_suppkey", noEquivClass),
 	}
-	rows, _ := s.calcJoinrelSize(c, outer, inner, clauses)
+	rows, _ := s.calcJoinrelSize(c, outer, inner, clauses, nil)
 	// 1/800000 for the covered key, then 1/10000 for the leftover equality.
 	wantRows(t, rows, clampRowEst(6000000.0*800000.0/800000.0/10000.0), "one-column key under a two-clause join")
 }
@@ -200,7 +200,7 @@ func TestCalcJoinrelSizeDividesByRawNotFilteredCount(t *testing.T) {
 		jrsEq("l_partkey", "ps_partkey", noEquivClass),
 		jrsEq("l_suppkey", "ps_suppkey", noEquivClass),
 	}
-	rows, _ := s.calcJoinrelSize(c, outer, inner, clauses)
+	rows, _ := s.calcJoinrelSize(c, outer, inner, clauses, nil)
 	wantRows(t, rows, 750000, "filtered key side")
 }
 
@@ -235,7 +235,7 @@ func TestCalcJoinrelSizeFKDividesByParentCount(t *testing.T) {
 	}
 	outer, inner := jrsRels(6000000, 1500000)
 
-	rows, _ := s.calcJoinrelSize(c, outer, inner, []*restrictInfo{jrsEq("l_orderkey", "o_orderkey", noEquivClass)})
+	rows, _ := s.calcJoinrelSize(c, outer, inner, []*restrictInfo{jrsEq("l_orderkey", "o_orderkey", noEquivClass)}, nil)
 	wantRows(t, rows, 6000000, "FK child joined to its parent")
 	if rows == clampRowEst(6000000.0*1500000.0/6000000.0) {
 		t.Fatal("the divisor was the CHILD's raw count — an FK bounds the join by the PARENT's")
@@ -268,7 +268,7 @@ func TestCalcJoinrelSizeInvalidFKIgnored(t *testing.T) {
 	}
 	outer, inner := jrsRels(6000000, 1500000)
 
-	rows, _ := s.calcJoinrelSize(c, outer, inner, []*restrictInfo{jrsEq("l_orderkey", "o_orderkey", noEquivClass)})
+	rows, _ := s.calcJoinrelSize(c, outer, inner, []*restrictInfo{jrsEq("l_orderkey", "o_orderkey", noEquivClass)}, nil)
 	wantRows(t, rows, clampRowEst(6000000.0*1500000.0/100000.0), "NOT VALID FK")
 }
 
@@ -305,7 +305,7 @@ func TestCalcJoinrelSizeClauseConsumedOnce(t *testing.T) {
 	}
 	outer, inner := jrsRels(6000000, 1500000)
 
-	rows, _ := s.calcJoinrelSize(c, outer, inner, []*restrictInfo{jrsEq("s_orderkey", "o_orderkey", noEquivClass)})
+	rows, _ := s.calcJoinrelSize(c, outer, inner, []*restrictInfo{jrsEq("s_orderkey", "o_orderkey", noEquivClass)}, nil)
 	// The larger raw count (6e6) is the tighter bound; applying the smaller
 	// one as well would give 250000.
 	wantRows(t, rows, 1500000, "unique on both sides")
@@ -323,7 +323,7 @@ func TestCalcJoinrelSizeEquivClassReduction(t *testing.T) {
 	inferred := jrsEq("l_partkey", "ps_partkey", 0)
 	inferred.inferred = true
 
-	rows, _ := s.calcJoinrelSize(c, outer, inner, []*restrictInfo{explicit, inferred})
+	rows, _ := s.calcJoinrelSize(c, outer, inner, []*restrictInfo{explicit, inferred}, nil)
 	wantRows(t, rows, clampRowEst(6000000.0*800000.0/200000.0), "two members of one class")
 }
 
@@ -360,7 +360,7 @@ func TestCalcJoinrelSizeNoCatalogFallsBack(t *testing.T) {
 	s := jrsCtx(t, lineitem, partsupp)
 	outer, inner := jrsRels(6000000, 800000)
 
-	rows, _ := s.calcJoinrelSize(nil, outer, inner, []*restrictInfo{jrsEq("l_partkey", "ps_partkey", noEquivClass)})
+	rows, _ := s.calcJoinrelSize(nil, outer, inner, []*restrictInfo{jrsEq("l_partkey", "ps_partkey", noEquivClass)}, nil)
 	wantRows(t, rows, clampRowEst(6000000.0*800000.0/200000.0), "nil catalog")
 }
 
@@ -443,7 +443,7 @@ func TestCalcJoinrelSizeKeyBoundClampsStaleStats(t *testing.T) {
 		jrsEq("l_partkey", "ps_partkey", noEquivClass),
 		jrsEq("l_suppkey", "ps_suppkey", noEquivClass),
 	}
-	rows, _ := s.calcJoinrelSize(c, outer, inner, clauses)
+	rows, _ := s.calcJoinrelSize(c, outer, inner, clauses, nil)
 	wantRows(t, rows, 6000000, "stale key-side statistics")
 
 	if unclamped := clampRowEst(6000000.0 * 8000000.0 / 800000.0); rows >= unclamped {
@@ -486,7 +486,7 @@ func TestCalcJoinrelSizeKeyBoundNeedsASingleRelKeySide(t *testing.T) {
 		jrsEq("l_partkey", "ps_partkey", noEquivClass),
 		jrsEq("l_suppkey", "ps_suppkey", noEquivClass),
 	}
-	rows, _ := s.calcJoinrelSize(c, outer, inner, clauses)
+	rows, _ := s.calcJoinrelSize(c, outer, inner, clauses, nil)
 	wantRows(t, rows, clampRowEst(6000000.0*8000000.0/800000.0), "key relation inside a joinrel")
 }
 
@@ -524,7 +524,7 @@ func TestCalcJoinrelSizeFallbackCapWithoutStats(t *testing.T) {
 	c, s := jrsUnanalysed(t)
 	outer, inner := jrsRels(6000000, 800000)
 
-	rows, _ := s.calcJoinrelSize(c, outer, inner, []*restrictInfo{jrsEq("l_orderkey", "o_orderkey", noEquivClass)})
+	rows, _ := s.calcJoinrelSize(c, outer, inner, []*restrictInfo{jrsEq("l_orderkey", "o_orderkey", noEquivClass)}, nil)
 	wantRows(t, rows, 6000000, "two unanalysed columns")
 
 	if uncapped := clampRowEst(6000000.0 * 800000.0 / defaultNumDistinct); rows >= uncapped {
@@ -546,7 +546,7 @@ func TestCalcJoinrelSizeInequalityIsCapped(t *testing.T) {
 	ri.clause.(*BinaryOp).Op = parser.OpLt
 	ri.isEquijoin = false
 
-	rows, _ := s.calcJoinrelSize(c, outer, inner, []*restrictInfo{ri})
+	rows, _ := s.calcJoinrelSize(c, outer, inner, []*restrictInfo{ri}, nil)
 	wantRows(t, rows, 6000000, "inequality join clause")
 }
 
@@ -573,7 +573,7 @@ func TestCalcJoinrelSizeMeasuredBlowUpIsNotCapped(t *testing.T) {
 	}
 	outer, inner := jrsRels(6000000, 800000)
 
-	rows, _ := s.calcJoinrelSize(c, outer, inner, []*restrictInfo{jrsEq("l_orderkey", "o_orderkey", noEquivClass)})
+	rows, _ := s.calcJoinrelSize(c, outer, inner, []*restrictInfo{jrsEq("l_orderkey", "o_orderkey", noEquivClass)}, nil)
 	wantRows(t, rows, clampRowEst(6000000.0*800000.0/100.0), "a measured many-to-many join")
 }
 
@@ -586,6 +586,6 @@ func TestCalcJoinrelSizeCrossProductIsNotCapped(t *testing.T) {
 	c, s := jrsUnanalysed(t)
 	outer, inner := jrsRels(6000000, 800000)
 
-	rows, _ := s.calcJoinrelSize(c, outer, inner, nil)
+	rows, _ := s.calcJoinrelSize(c, outer, inner, nil, nil)
 	wantRows(t, rows, clampRowEst(6000000.0*800000.0), "cross product")
 }

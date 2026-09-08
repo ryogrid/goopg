@@ -209,7 +209,12 @@ func (m *Manager) PrefetchBlock(rel RelFileNode, blk BlockNumber, buf []byte) (A
 	if err != nil {
 		return nil, err
 	}
-	if blk >= f.nblocks {
+	// f.nBlocks() takes r.mu. Reading f.nblocks bare here was a dormant data
+	// race against relFile.extend's r.nblocks++ (E-19 design §4.1a, the second
+	// unnumbered finding) — dormant only because PrefetchBlock had no
+	// production caller. E-19 S3 gives it one on every look-ahead block, so
+	// the race would have gone hot.
+	if blk >= f.nBlocks() {
 		return preCompletedHandle{err: ErrShortRead}, nil
 	}
 	off := int64(blk) * BlockSize
@@ -352,6 +357,61 @@ func (m *Manager) ReadBlock(rel RelFileNode, blk BlockNumber, buf []byte) error 
 		return err
 	}
 	return f.readBlock(blk, buf)
+}
+
+// MaxIOCombineLimit is the hard ceiling on how many blocks one vectored read
+// may cover, mirroring upstream's MAX_IO_COMBINE_LIMIT (= PG_IOV_MAX)
+// in postgres/src/include/storage/bufmgr.h:165.
+const MaxIOCombineLimit = 128
+
+// DefaultIOCombineLimit is the default run length for a combined read, the
+// same 128 kB / BLCKSZ = 16 blocks upstream defaults to
+// (DEFAULT_IO_COMBINE_LIMIT, postgres/src/include/storage/bufmgr.h:166).
+const DefaultIOCombineLimit = 128 * 1024 / BlockSize
+
+// ReadBlocks reads a RUN of consecutive blocks [first, first+len(bufs)) of rel
+// with a single vectored read, filling bufs in order. Each buf must be exactly
+// BlockSize. Returns the number of whole blocks filled.
+//
+// This is E-19 slice S1 and it is the half of upstream's prefetch mechanism
+// that goopg was missing entirely: PG's read stream merges adjacent blocks
+// into one I/O of up to io_combine_limit
+// (postgres/src/backend/storage/aio/read_stream.c:474-477, flushed at the
+// limit at :445-450) and issues it as ONE vectored read
+// (src/backend/storage/buffer/bufmgr.c:1777). Before this function goopg had
+// no vectored read at all — method_iouring_linux.go:43 says so outright — so
+// an N-block run cost N syscalls, and the concurrency win a look-ahead window
+// buys was the only win available.
+//
+// Checksums are verified per landed block, exactly as ReadBlock does; the
+// verification is inside relFile.ReadvAt so it cannot be bypassed by a caller.
+// A run that reaches the end of the relation reports the whole blocks that
+// landed and no error — ErrShortRead is reserved for a run that starts beyond
+// the relation, matching ReadBlock's contract for a single block.
+func (m *Manager) ReadBlocks(rel RelFileNode, first BlockNumber, bufs [][]byte) (int, error) {
+	if len(bufs) == 0 {
+		return 0, nil
+	}
+	if len(bufs) > MaxIOCombineLimit {
+		return 0, fmt.Errorf("ReadBlocks: run of %d blocks exceeds MaxIOCombineLimit %d",
+			len(bufs), MaxIOCombineLimit)
+	}
+	for i, b := range bufs {
+		if len(b) != BlockSize {
+			return 0, fmt.Errorf("ReadBlocks: buf[%d] is %d bytes, want %d", i, len(b), BlockSize)
+		}
+	}
+	if m.OnReadWait != nil {
+		m.OnReadWait()
+	}
+	if m.OnReadDone != nil {
+		defer m.OnReadDone()
+	}
+	f, err := m.relFile(rel)
+	if err != nil {
+		return 0, err
+	}
+	return f.readBlocks(first, bufs)
 }
 
 // WriteBlock writes buf as block #blk of rel. buf must be BlockSize
@@ -807,6 +867,93 @@ func (r *relFile) ReadAt(p []byte, off int64) (int, error) {
 		}
 	}
 	return n, err
+}
+
+// readBlocks is readBlock's vectored twin: one preadv(2) filling len(bufs)
+// consecutive blocks starting at first, with the SAME per-block latching,
+// bounds check and checksum verification the single-block path does. Returns
+// the number of WHOLE blocks filled.
+//
+// E-19 S1. It is the goopg counterpart of upstream's combined read — PG merges
+// up to io_combine_limit adjacent blocks into one vectored I/O
+// (postgres/src/backend/storage/aio/read_stream.c:474-477 →
+// src/backend/storage/buffer/bufmgr.c:1777 io_pages[]) and goopg had no
+// vectored read anywhere, so a run of N adjacent blocks cost N syscalls.
+//
+// Three properties it deliberately shares with readBlock, because a vectored
+// read that quietly relaxed any of them would be a correctness regression no
+// values suite could see:
+//
+//   - **Per-block latches.** Every block in the run is locked, in ASCENDING
+//     order. Ascending is what makes it deadlock-free against a concurrent run
+//     (also ascending) and against any single-block reader/writer (trivially
+//     ordered). Without this a vectored read could interleave with a
+//     writeBlock of a block in its own range and land a torn mixture.
+//   - **The bounds check happens under r.mu**, with the read, not before it.
+//     Manager.PrefetchBlock reads f.nblocks outside the lock (smgr.go:212)
+//     while relFile.extend writes it under the lock; this path does not repeat
+//     that.
+//   - **Checksums are verified per landed block** and cannot be bypassed by a
+//     caller, because verification lives here rather than in Manager.
+//
+// A run that reaches end-of-relation returns the whole blocks that landed with
+// a nil error. Verification runs only over COMPLETE blocks — verifying a
+// partially-filled tail would report a checksum error for a page nobody
+// claimed was there.
+func (r *relFile) readBlocks(first BlockNumber, bufs [][]byte) (int, error) {
+	if len(bufs) == 0 {
+		return 0, nil
+	}
+	for i, b := range bufs {
+		if len(b) != BlockSize {
+			return 0, fmt.Errorf("readBlocks: buf[%d] is %d bytes, want %d", i, len(b), BlockSize)
+		}
+	}
+
+	// Ascending latch acquisition — see the deadlock note above.
+	unlocks := make([]func(), 0, len(bufs))
+	for i := range bufs {
+		unlocks = append(unlocks, r.lockBlock(first+BlockNumber(i)))
+	}
+	defer func() {
+		for i := len(unlocks) - 1; i >= 0; i-- {
+			unlocks[i]()
+		}
+	}()
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if first >= r.nblocks {
+		return 0, ErrShortRead
+	}
+	n, err := preadvAt(r.f, bufs, int64(first)*BlockSize)
+	full := n / BlockSize
+	if err != nil {
+		return full, err
+	}
+	for i := 0; i < full; i++ {
+		// Trace/observe parity with readBlock (smgr.go readBlock's
+		// recordIOTrace + PageIdentityObserve pair). A vectored read that
+		// skipped these would make PageIdentity's corruption detector blind
+		// to exactly the pages the prefetch window brought in — the class
+		// this observer exists for.
+		tag := BufferTag{Rel: r.rel, Block: first + BlockNumber(i)}
+		recordIOTrace(tag, "postRead", bufs[i])
+		PageIdentityObserve(tag, bufs[i], "postRead")
+	}
+	if r.checksums {
+		for i := 0; i < full; i++ {
+			if verr := r.verifyOnRead(first+BlockNumber(i), bufs[i]); verr != nil {
+				// Report only the blocks that VERIFIED, so the count never
+				// covers a page the caller must not trust. Returning `full`
+				// here would tell a caller that reads the count before the
+				// error — the natural shape for a partial-progress API — that
+				// the corrupt block was successfully filled.
+				return i, verr
+			}
+		}
+	}
+	return full, nil
 }
 
 // WriteAt is the engine-facing offset-shaped write. Mirrors

@@ -107,17 +107,18 @@ Remaining:
       starting numbers for bars A1/A2 (09 §4.1). Until measured, enforce the
       per-category monotone decrements in 09 §5 instead of invented targets.
       *design: 08 §3; gate: 09 §5 P0 row.*
-- [ ] P0-08 Re-pin the stale plan baseline — three coordinated edits in one
-      commit: commit `plan_snapshots/take2-p0-<date>.txt`; update
-      `stage-tpch.sh:234`'s `LABEL=`; update `summarize.py:689` (nightly calls
-      `plan-diff`, not `plan-gate`; `plan-gate`'s `ls -t` selects
-      `warm-stats-base.txt`, not `m0077-final`).
+- [x] P0-08 Re-pin the stale plan baseline — `f4a5e7e75` (take2; three
+      coordinated edits: `plan_snapshots/take2-p0-20260903.txt` committed,
+      `stage-tpch.sh` `LABEL=` + `summarize.py` drift-note updated, gate
+      self-diff verified); gates: `bash -n`, `py_compile`, gate self-diff;
+      recorded here 2026-09-04 by the TODO_ALL reconciliation (take2 close
+      entry postdates this list).
       *design: 08 §3; gate: 09 §5 P0.*
-- [ ] P0-13 Flip `GOOPG_PGSHAPED_COLLAPSE` on as the parity instrument's
-      **positive control**. Pre-registered blast radius, pinned by
-      `TestCollapseIsAControlOnTheTPCHCorpus` (TPC-H `changed=0`) and
-      `TestCollapseEligibilityOfTheTPCDSCorpus` (exactly Q72/Q75 moved);
-      re-opens the voided NO-GO. Zero dependency on P1/P2.
+- [x] P0-13 Flip `GOOPG_PGSHAPED_COLLAPSE` on as the parity instrument's
+      **positive control** — `82dd30bbc` (take2; TPC-H `changed=0`, TPC-DS
+      exactly {Q72, Q75} moved, Q72 128s→5s, sweep TOTAL -10.1%); recorded
+      here 2026-09-04 by the TODO_ALL reconciliation (take2 close entry
+      postdates this list).
       *design: 08 §3; gate: 09 §5 P0 — parity both suites + Q72/Q75 timing.*
 
 ---
@@ -218,10 +219,13 @@ Remaining:
       Acceptable interim: bounded-width with a ledger row.
       *design: 08 §4; gate: 09 §5 P1 + full regress (catalog format); re-init
       the data dir.*
-- [ ] P1-14b Remaining per-clause estimators: general `scalararraysel`,
-      `patternsel` (LIKE/regex beyond the access-path prefix), `rowcomparesel`,
-      `booltestsel`, `var_eq_non_const`; align every `DEFAULT_*` with 03 §5.1.
-      Judge by the ratchet, not timing.
+- [~] P1-14b Remaining per-clause estimators — five slices LANDED in take2
+      (LIKE `patternsel`, `booltestsel`, `rowcomparesel`,
+      `scalararraysel`, `var_eq_non_const`; see take2 TODO P1-14b close
+      entries); recorded here 2026-09-04 by the TODO_ALL reconciliation.
+      REMAINING: regex ops, small-hist prefix-range precision (text-scalar
+      P1-31 gap), multibyte case-folding; align every `DEFAULT_*` with
+      03 §5.1. Judge by the ratchet, not timing.
       *design: 08 §4; gate: EA ratchet (09 §4.1 A5); no per-item A/B.*
 - [ ] P1-16 Re-diagnose TPC-H Q9's cardinality error with `estimate-audit`.
       The recorded single-`nd` explanation is RETIRED (M0127-P5.6-f folds every
@@ -510,7 +514,17 @@ sufficient per P4-01b above):
 - [ ] P4-01 `PathTarget` + projection: per-path targets
       (`make_group_input_target`, `make_window_input_target`,
       `make_sort_input_target`, `apply_scanjoin_target_to_paths`; 01 §3) with
-      setrefs-style fixup at `create_plan` time. Gate on **values**
+      setrefs-style fixup at `create_plan` time. Progress 2026-09-04:
+      Slices 1–3 landed per `docs/design/planner-p4-01-target/DESIGN.md`
+      (Slice 1 scan-Path `Target` payload assert-only; Slice 2
+      Target-driven build keep-set behaviour-neutral + model proof; Slice 3
+      per-joinrel keep-sets with LIVE FLIP — Q9 witness Batches 2→1,
+      widths down, delta 10→7, gates 24/24 + 22/22 + TPC-DS PASS=95).
+      DEFERRED to follow-up: (a) merge/NL input policy, (b) scan-node
+      application at `createPlanNode`, (c) upper targets
+      (`make_group/window/sort_input_target`) — see DESIGN.md Slice 3+
+      (reviewed) and wrap-up ledger `take3-wrapup-deferred`.
+      Gate on **values**
       (`tpch-runner -digest` + `-diff`, all items), `NBatch` 2→1 on the
       witness (TPC-H Q9 hash build, EXPLAIN `Batches:` at `work_mem` 64 MB
       S-cold), `DPPATH` hash total below merge total. Threshold correction:

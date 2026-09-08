@@ -115,6 +115,11 @@ func createPlanAtSearchRootRange(p *Path, base, width int, fill func(int) (Schem
 	if base < 0 {
 		panic(fmt.Sprintf("createPlan: search root asked to publish binding coordinates from %d", base))
 	}
+	// Take2 P4-01 Slice 3: derive per-joinrel keep-sets over the chosen tree
+	// before the recursion builds nodes. A no-op wherever the sets are
+	// unknown (ineligible problems, hand-built test trees): the Slice-2 arms
+	// and the NeededCols fallback are untouched.
+	deriveJoinKeeps(p)
 	n, lay := createPlanNode(p)
 	if n == nil {
 		panic("createPlan: search root path built no node")
@@ -135,6 +140,14 @@ func createPlanAtSearchRootRange(p *Path, base, width int, fill func(int) (Schem
 	// — on the Project itself the claim is false by design (searchedtree.go
 	// explains why that is the sharpest argument for the tag).
 	assertSearchedTreeNeedsNoReconcile(n)
+	// C-20b: `boundaryMap` below proves the layout is a PERMUTATION of the
+	// binding concatenation. It cannot say WHICH column sits at a position,
+	// and a valid permutation that assigns the wrong coordinate to a column
+	// is exactly the silent wrong-answer class P6-02 names — the right row
+	// count carrying a neighbouring relation's values. The range table is
+	// what lets that be stated; rangetable.go carries the reasoning and the
+	// abstention list.
+	assertBoundaryColumnIdentity(n, lay, rangeTableFromPath(p))
 	m, fills := boundaryMap(lay, base, width, fill)
 	if len(fills) == 0 && boundaryMapIsIdentity(m) {
 		// The search's order already IS binding order — the common left-deep
@@ -146,9 +159,25 @@ func createPlanAtSearchRootRange(p *Path, base, width int, fill func(int) (Schem
 		// optional — but only for the shapes where it does, and
 		// `reconcileNLILayout`'s name resolution can move a self-join's keys
 		// regardless of layout.
-		return markSearchedTree(n)
+		return stampSearchPathkeys(markSearchedTree(n), p)
 	}
-	return markSearchedTree(projectToBindingOrder(n, m, fills))
+	return stampSearchPathkeys(markSearchedTree(projectToBindingOrder(n, m, fills)), p)
+}
+
+// stampSearchPathkeys records, on the published root, the ordering the WINNING
+// path claimed — C-07's seam half. The claim is re-earned against the schema
+// the root actually publishes (`validatedSearchPathkeys`, upperorderedinput.go)
+// rather than translated out of the search's inner coordinate space; a key the
+// published schema cannot confirm truncates the list, and an empty list is the
+// pre-C-07 behaviour exactly. Nothing here can fail the plan.
+func stampSearchPathkeys(root Node, p *Path) Node {
+	if root == nil || p == nil || len(p.Pathkeys) == 0 {
+		return root
+	}
+	if s, ok := root.(searchRootNode); ok {
+		s.setSearchPathkeys(validatedSearchPathkeys(p.Pathkeys, root.Output()))
+	}
+	return root
 }
 
 // boundaryMap composes 03 §10's map from the search root's layout: entry `b` is

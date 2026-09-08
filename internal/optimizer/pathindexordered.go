@@ -47,29 +47,29 @@ import (
 // they compete in the same rel's pathlist, so generating one without the other
 // hands `addPath` an incomplete field.
 func (s *searchCtx) addBaseRelIndexPaths(cat catalog.Catalog) {
-	// review/260831-2 X-8: the session's enable_indexscan / enable_bitmapscan /
-	// enable_indexonlyscan decide which of these four producers may contribute
-	// a candidate at all. Skipping the producer is this seam's stand-in for
-	// upstream's disabled-node pricing (see currentIndexScanDisabled): the
-	// remaining producers — and, if none contributes, the seq-scan path
-	// generateScanPaths always adds — take over, which is the plan PG lands on.
-	indexOff := currentIndexScanDisabled(cat)
-	if !indexOff {
-		s.addParameterizedIndexPaths(cat)
-		s.addOrderedIndexPaths(cat)
-	}
+	// B-17d: every producer below always runs. The session's scan toggles
+	// are counted on the paths through s.cp (cost_seqscan / cost_index /
+	// cost_bitmap_heap_scan's own flags, costsize.c:295,560,1023), exactly as
+	// the join producers do since P2-05 — a disabled method is a strong
+	// preference in add_path, not a missing candidate. The one generation
+	// gate that stays a gate is enable_indexonlyscan (check_index_only,
+	// indxpath.c), like enable_memoize in get_memoize_path; TID and
+	// incremental-sort have no producer to gate. The rule-based legacy scan
+	// choice (planIndexScanFromWhere, rewriteScanInputsWithSingleTable-
+	// Predicates) keeps its own declines: it has no cost competition to
+	// express a preference in, and retires with the legacy planner (P6).
+	s.addParameterizedIndexPaths(cat)
+	s.addOrderedIndexPaths(cat)
 	// M0128-P2.4: bitmap scan paths compete alongside index scan paths in
 	// add_path for every usable index. They are always generated — PG's
 	// create_index_paths generates both indexscan and bitmap paths for every
 	// index, and add_path keeps the cheaper one in each cost regime.
-	if !currentBitmapScanDisabled(cat) {
-		s.addBaseRelBitmapPaths(cat)
-		s.addParameterizedBitmapPaths(cat)
-	}
+	s.addBaseRelBitmapPaths(cat)
+	s.addParameterizedBitmapPaths(cat)
 	// M0134-0187: `create_index_path(..., indexonly=true)` for every index
 	// covering what the statement reads from the relation — generated here
 	// because it competes in the same rel's pathlist as the rest.
-	if !indexOnlyScanRejected(cat) {
+	if !indexOnlyHardDisabled(cat) {
 		s.addIndexOnlyPaths(cat)
 	}
 }
@@ -77,21 +77,44 @@ func (s *searchCtx) addBaseRelIndexPaths(cat catalog.Catalog) {
 // addOrderedIndexPaths generates, for every base relation, the unparameterised
 // index paths whose ordering some join clause of that relation could merge on.
 //
-// The gate is `has_useful_pathkeys` (pathkeys.c:2323) reduced to the one arm
-// this seam has: `rel->joininfo != NIL || rel->has_eclass_joins`. PG's other
-// two arms — `root->group_pathkeys` and `root->query_pathkeys` — need the
-// query's own ORDER BY / GROUP BY ordering, which the search boundary does not
-// carry (03 §10 defers the whole query-pathkey question to P5.5). A rel with
-// no join clause therefore produces nothing here, which is also what PG's
-// `truncate_useless_pathkeys` would reduce it to.
+// The gate is `has_useful_pathkeys` (pathkeys.c:2319), and since C-07/P3-06 it
+// is COMPLETE: `hasUsefulPathkeys` (querypathkeys.go) answers both of
+// upstream's live arms — the rel's own join clauses (merging) and
+// `root->query_pathkeys` (ordering), the latter derived by the
+// `standard_qp_callback` analogue from the statement's GROUP BY / window /
+// DISTINCT / ORDER BY.
+//
+// What the gate opens onto is BOTH halves since C-07's seam half (2026-09-07).
+// The useful-column set below is the union of `mergeableColumnExprsFor`
+// (`pathkeys_useful_for_merging`) and `addQueryPathkeyColumnExprs`
+// (`pathkeys_useful_for_ordering`), so a rel that passes the gate on the
+// ORDERING arm with no join clause at all now produces an ordered path.
+//
+// That union was filed as "a map union at one line" on 2026-09-05 and held
+// back, correctly, because nothing SELECTED a path for its ordering: the search
+// boundary published a Node and dropped the chosen path's `Pathkeys`, so an
+// ordering-only index scan could only lose on total cost — or win
+// `CheapestStartup` under a LIMIT while a redundant Sort above it still ran.
+// `upperorderedinput.go` removed both: the seam carries the ordering to the
+// ORDERED upper rel, whose input arm then stacks no Sort at all.
+//
+// C-11/C-12 were filed as that consumer. Both landed 2026-09-06 and the
+// 2026-09-07 re-adjudication measured that neither unblocked it on its own:
+// the widening generated the path and no plan moved, because
+// `createOrderedPaths` consumes a NODE and `newPrebuiltPath` carried no
+// `Pathkeys` across the seam. `upperorderedinput.go` is the boundary that
+// re-adjudication named; see querypathkeys.go's header for the measurement.
 func (s *searchCtx) addOrderedIndexPaths(cat catalog.Catalog) {
-	if s == nil || cat == nil || s.clauses == nil || len(s.clauses.all) == 0 {
+	if s == nil || cat == nil {
 		return
 	}
 	totalPages := s.totalTablePages()
 	for i, rel := range s.levelRels(1) {
 		if i >= len(s.relInfos) {
 			break
+		}
+		if !s.hasUsefulPathkeys(rel) {
+			continue
 		}
 		tbl := s.relInfos[i].table
 		if tbl == nil {
@@ -102,7 +125,14 @@ func (s *searchCtx) addOrderedIndexPaths(cat catalog.Catalog) {
 		if _, _, ok := scanLeafFor(rel.baseLeaf); !ok {
 			continue
 		}
-		colExprs := mergeableColumnExprsFor(rel.Relids, s.clauses.all)
+		colExprs := mergeableColumnExprsFor(rel.Relids, s.clausesAll())
+		// C-07 (P3-06) second half, landed 2026-09-07: the union with
+		// `pathkeys_useful_for_ordering`. Unblocked by the seam half
+		// (upperorderedinput.go): the ORDERED upper rel can now RECEIVE an
+		// ordering, so an ordering-only index path finally has a consumer
+		// that selects it FOR its ordering instead of only being able to lose
+		// on cost.
+		addQueryPathkeyColumnExprs(colExprs, s.queryPathkeys, s.relInfos[i].sourceIdx)
 		if len(colExprs) == 0 {
 			continue
 		}
@@ -166,7 +196,7 @@ func (s *searchCtx) addOneOrderedIndexPath(rel *RelOptInfo, tbl *catalog.Table, 
 	// `useful_pathkeys != NIL`, which the non-empty `keys` above just
 	// established.
 	indexPages, indexTuples, treeHeight := estimateIndexGeometry(idx, tbl, relTuples)
-	cost := costIndexScan(s.cp, indexScanInputs{
+	in := indexScanInputs{
 		relPages:    relPages,
 		relTuples:   relTuples,
 		indexPages:  indexPages,
@@ -177,10 +207,19 @@ func (s *searchCtx) addOneOrderedIndexPath(rel *RelOptInfo, tbl *catalog.Table, 
 		correlation: indexCorrelationFor(idx, leadingKeyStats(idx, tbl)),
 
 		totalTablePages: totalPages,
-	})
-	addPath(rel, &Path{
+	}
+	cost := costIndexScan(s.cp, in)
+	// take2 P4-01 Slice 1: the scan Target, computed from NeededCols at
+	// path-creation time. Assert-only — never applied, never costed.
+	tgt, tgtKnown := scanPathTarget(rel)
+	serial := &Path{
 		Kind: PathIndexScan,
 		Rel:  rel,
+		// create_index_path (pathnode.c:1078): `rel->consider_parallel`. C-19a.
+		ParallelSafe: rel.ParallelSafeForPath(),
+		// B-17d: `cost_index`'s own flag (costsize.c:560), on top of nothing
+		// (no input). The producer always runs.
+		DisabledNodes: disabledNodesFor(!s.cp.enableIndexScan),
 		// `path->rows = baserel->rows` (cost_index's unparameterised arm):
 		// the rel's own post-restriction estimate, NOT the pre-restriction
 		// `relTuples` the cost was charged over. The scan reads every tuple
@@ -203,8 +242,56 @@ func (s *searchCtx) addOneOrderedIndexPath(rel *RelOptInfo, tbl *catalog.Table, 
 		//
 		// Empty, and that is the entire point of the slice.
 		RequiredOuter: 0,
-	}, "index.ordered")
+		Target:        tgt,
+		TargetKnown:   tgtKnown,
+	}
+	addPath(rel, serial, "index.ordered")
+
+	// C-19c: the PARTIAL twin — build_index_paths' "if (index->amcanparallel
+	// && rel->consider_parallel && outer_relids == NULL && scantype !=
+	// ST_BITMAPSCAN)" arm (indxpath.c:1039-1062): the same path with
+	// `partial_path = true`, whose cost_index sizes the workers and, when
+	// there are none worth having, is freed. Into PartialPathlist, which
+	// nothing consumes before C-19d: the serial arm is unchanged by
+	// construction.
+	s.addPartialIndexPath(rel, tbl, serial, in, "index.ordered.partial")
 	return true
+}
+
+// addPartialIndexPath offers the partial twin of a plain or index-only index
+// path just added to `rel.Pathlist` — C-19c, `create_index_path(...,
+// partial_path = true)` + `add_partial_path`. `serial` is that path and `in`
+// its costing input, so the twin is the serial path's shape (index, direction,
+// pathkeys, index-only column list, target) priced on exactly the serial
+// path's model with the divisor applied (costPartialIndexScan). It shares no
+// pointer with the serial path: `Pathkeys` and the covered list are read-only
+// after creation, and nothing about the twin is mutated later.
+//
+// The gate is upstream's: `amcanparallel` (btree only — a `USING hash` index
+// rides goopg's btree substrate but is not parallel-capable in PG either),
+// `rel->consider_parallel`, no required outer (every caller here is
+// unparameterised), and the session's parallelModeOK. A twin sized at zero
+// workers is not offered ("just free it").
+func (s *searchCtx) addPartialIndexPath(rel *RelOptInfo, tbl *catalog.Table, serial *Path, in indexScanInputs, producer string) {
+	if s == nil || !s.parallelModeOK || rel == nil || !rel.ConsiderParallel || serial == nil {
+		return
+	}
+	idx := serial.IndexInfo
+	if idx == nil || !isBTreeIndex(idx) || idx.DeclaredHash || serial.RequiredOuter != 0 {
+		return
+	}
+	cost, rows, workers := costPartialIndexScan(s.cp, in, serial.Rows, tableParallelWorkersReloption(tbl))
+	if workers <= 0 {
+		return
+	}
+	twin := *serial
+	twin.Cost = cost
+	twin.Rows = rows
+	// A partial path is parallel-safe by construction (`parallel_safe =
+	// rel->consider_parallel`, checked above).
+	twin.ParallelSafe = true
+	twin.ParallelWorkers = workers
+	addPartialPath(rel, &twin, producer)
 }
 
 // mergeableColumnExprsFor is `pathkeys_useful_for_merging` (pathkeys.c:2166)
@@ -272,6 +359,54 @@ func mergeableColumnExprsFor(relids RelSet, clauses []*restrictInfo) map[string]
 		out[col.Name] = col
 	}
 	return out
+}
+
+// addQueryPathkeyColumnExprs is `pathkeys_useful_for_ordering` (pathkeys.c:2196)
+// in the same inside-out form `mergeableColumnExprsFor` gives
+// `pathkeys_useful_for_merging`: fold the columns `root->query_pathkeys` names
+// ON THIS REL into the useful-column map `buildIndexPathkeys` consults.
+//
+// This is C-07's "so ORDER BY / GROUP BY motivate index paths" half. It was
+// held back (querypathkeys.go's file header) for one reason: nothing selected a
+// path FOR its ordering, so the extra candidate could only lose on cost or —
+// worse — win `CheapestStartup` under a LIMIT while a redundant Sort still ran
+// above it. Both are gone. C-11/C-12 gave the statement an ORDERED upper rel,
+// and C-07's seam half (upperorderedinput.go) gave that rel an input path that
+// CARRIES the ordering, so the Sort above a genuinely ordered input is no
+// longer stacked at all.
+//
+// REL MEMBERSHIP is by `SourceTableIdx`, not by reading the rel's leaf schema.
+// That is deliberate and was measured: the shared `ppiCtx` unit fixture builds
+// `baseLeaf = &SeqScan{Table: inner}` with a NIL schema, so a membership filter
+// that consulted `baseLeaf.Output()` is invisible to the whole optimizer suite
+// — the suite passed with the widening applied and with it absent. `sourceIdx`
+// is `rangeBinding.sourceIdx` mirrored onto `baseRelInfo` (cardinality.go), the
+// same per-FROM-clause identity `ColumnRef.SourceTableIdx` carries, so the two
+// are comparable by construction and a self-join's siblings do not collide.
+//
+// A rel with `sourceIdx <= 0` has no recorded identity (CTE / subquery-only /
+// ON CONFLICT `excluded`, planner.go:527). Membership is then UNKNOWABLE, and
+// the honest answer is to add nothing: a name-only match would hand one
+// self-join sibling's ordering to another.
+func addQueryPathkeyColumnExprs(out map[string]Expr, keys []PathKey, sourceIdx int16) {
+	if out == nil || len(keys) == 0 || sourceIdx <= 0 {
+		return
+	}
+	for _, pk := range keys {
+		col, isCol := pk.Expr.(*ColumnRef)
+		if !isCol || col.Name == "" || col.SourceTableIdx != sourceIdx {
+			continue
+		}
+		// Same first-wins rule as the merging half, and for the same reason:
+		// two expressions naming the same column of the same rel describe the
+		// same ordering, so the deterministic choice keeps generation
+		// reproducible. The merging half is consulted FIRST because its
+		// expression is the one the join clauses were written with.
+		if _, dup := out[col.Name]; dup {
+			continue
+		}
+		out[col.Name] = col
+	}
 }
 
 // totalTablePages is `root->total_table_pages` (set by `set_base_rel_sizes`,

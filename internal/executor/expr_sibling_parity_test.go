@@ -148,6 +148,9 @@ func parityAllSlots(row Row) []namedSlot {
 		{"*MaterializedSlot", ms},
 		{"*Slot", &Slot{Cells: row, HasRow: true}},
 		{"*VirtualSlot", NewVirtualSlot(nil, []TupleSlot{ms}, cols)},
+		// E-05: the merged-key VirtualSlot the merge path evaluates
+		// through (identity mapping over the full row here).
+		{"*mergedKeySlot", mergedKeySlot(ms, len(row), 0, true)},
 		{"nil", nil},
 	}
 }

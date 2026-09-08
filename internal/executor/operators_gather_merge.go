@@ -53,7 +53,14 @@ type gatherMergeOp struct {
 	chans   []chan rowBatch
 	workers []*Context
 	arenas  []*mmgr.Context
-	pscan   *parallelScanState
+
+	// E-10: the SAME claim set gatherOp uses, embedded so o.pscan / o.pbm /
+	// o.pidx name the individual kinds. Before this, Gather Merge attached
+	// only the sequential-scan allocator, so a Gather Merge over a partial
+	// INDEX path had every participant walk the whole index and returned
+	// (workers+1) copies of every row, correctly ordered. See
+	// parallelClaimSet in parallel_scan.go.
+	*parallelClaimSet
 
 	sources  []*gmSource
 	h        *gmHeap
@@ -67,6 +74,41 @@ type gatherMergeOp struct {
 
 	// ownsSharedBuilds — see gatherOp; P8 hash tables published on ctx.
 	ownsSharedBuilds bool
+
+	// EX0-03b (new): scope is the instrumenter active on this op's own
+	// Build() call, handed over by maybeInstrument (instrumentScopeCarrier).
+	// workerTables holds one FRESH nodeStatsTable per execution site —
+	// worker i fills slot i, the leader fills slot n — folded post-join in
+	// Close into ctx.GatherWorkerStats. Pre-sized in Open; nil (unarmed)
+	// when no instrumentation scope was stored.
+	scope        *instrumenter
+	workerTables []nodeStatsTable
+}
+
+// EX0-03b (new): setInstrumentScope implements instrumentScopeCarrier,
+// storing the scope live at this op's own Build() time. Only the timing
+// bool is ever inherited from it — each execution site mints its own
+// fresh table via buildUnderFreshScope, so the stored table is never
+// reused.
+func (o *gatherMergeOp) setInstrumentScope(s *instrumenter) { o.scope = s }
+
+// EX0-03b (new): buildChildForSlot builds one child tree for the given
+// execution slot. Instrumented sites (workers, leader) mint a FRESH table
+// under the mutex and file it into the pre-sized slot; uninstrumented
+// builds (no stored scope) still serialize through an explicit NIL scope
+// so a concurrent site's fresh table cannot leak into this tree.
+func (o *gatherMergeOp) buildChildForSlot(slot int) (Operator, error) {
+	if o.scope == nil {
+		return buildUnderNilScope(o.buildChild)
+	}
+	op, tab, err := buildUnderFreshScope(o.scope.timing, o.buildChild)
+	if err != nil {
+		return nil, err
+	}
+	if slot >= 0 && slot < len(o.workerTables) {
+		o.workerTables[slot] = tab
+	}
+	return op, nil
 }
 
 func newGatherMergeOp(p *optimizer.GatherMerge, buildChild func() (Operator, error)) *gatherMergeOp {
@@ -94,7 +136,7 @@ func (o *gatherMergeOp) Open(ctx *Context) error {
 	}
 
 	o.group = NewParallelGroup(ctx.Ctx)
-	o.pscan = newParallelScanState(0)
+	o.parallelClaimSet = newParallelClaimSet()
 
 	// P8: build shared hash tables once, before fan-out. Same ordering
 	// requirement as gatherOp — before worker contexts, before goroutines.
@@ -107,6 +149,14 @@ func (o *gatherMergeOp) Open(ctx *Context) error {
 		o.ownsSharedBuilds = true
 	}
 
+	// S5.6, via the shared claim set: pre-build the bitmap once so every
+	// participant claims disjoint pages from it. gatherOp has done this since
+	// S5.6; Gather Merge did not, which is the same sibling-drift class as the
+	// index claim set below.
+	if err := o.prebuildBitmap(ctx, o.plan.Child, o.buildChild); err != nil {
+		return err
+	}
+
 	// Unlike plain Gather, each worker gets its OWN channel: the merge needs
 	// to know which stream a row came from, because it must take the next row
 	// from that same stream to keep the heap correct. One shared channel would
@@ -115,10 +165,22 @@ func (o *gatherMergeOp) Open(ctx *Context) error {
 	for i := 0; i < n; i++ {
 		arena := mmgr.Acquire(ctx.Mctx, mmgr.KindStmt)
 		o.arenas = append(o.arenas, arena)
-		o.workers = append(o.workers, NewWorkerContext(ctx, arena, o.group.Context()))
+		wctx := NewWorkerContext(ctx, arena, o.group.Context())
+		// EX0-03c: stamp the fan-out slot so MergeWorkerContext can tag
+		// this worker's sort entries with an explicit index.
+		wctx.workerSlot = i
+		o.workers = append(o.workers, wctx)
 		o.chans = append(o.chans, make(chan rowBatch, gatherChanDepth))
 	}
 	o.launched = n
+	ctx.recordGatherLaunched(o.plan, n)
+
+	// EX0-03b (new): pre-size the indexed per-site table slots (workers
+	// 0..n-1, leader slot n) when instrumentation is armed. Indexes are
+	// disjoint across goroutines, so no mutex is needed for the stores.
+	if o.scope != nil {
+		o.workerTables = make([]nodeStatsTable, n+1)
+	}
 
 	for i := 0; i < n; i++ {
 		wctx, idx := o.workers[i], i
@@ -130,11 +192,13 @@ func (o *gatherMergeOp) Open(ctx *Context) error {
 	// Leader participation: with zero workers it is not optional, or the node
 	// returns nothing.
 	if n == 0 || ctx.ParallelLeaderParticipation {
-		child, err := o.buildChild()
+		// EX0-03b: leader Open-time instrumented site — fresh table into
+		// slot n.
+		child, err := o.buildChildForSlot(n)
 		if err != nil {
 			return err
 		}
-		attachParallelScan(child, o.pscan)
+		o.attachAll(child)
 		if err := child.Open(ctx); err != nil {
 			_ = child.Close()
 			return err
@@ -191,16 +255,24 @@ func (h *gmHeap) Pop() any {
 }
 
 func (o *gatherMergeOp) runWorker(idx int, wctx *Context) error {
-	child, err := o.buildChild()
+	// EX0-03b: worker instrumented site — fresh table into slot idx.
+	// The channel MUST be closed on EVERY exit path, and therefore before the
+	// first `return`: Close drains with `for range ch`, which ends only when
+	// someone closes it. With the close deferred after the build and Open
+	// below, a failure in either left a live channel with no closer and the
+	// statement parked forever inside Close at 0% CPU with the real error
+	// never reaching the client. That is exactly M0127-P5.9's Q17 "hang",
+	// which gatherOp fixed (startChannelCloser) and this sibling did not.
+	defer close(o.chans[idx])
+	child, err := o.buildChildForSlot(idx)
 	if err != nil {
 		return err
 	}
-	attachParallelScan(child, o.pscan)
+	o.attachAll(child)
 	defer func() { _ = child.Close() }()
 	if err := child.Open(wctx); err != nil {
 		return err
 	}
-	defer close(o.chans[idx])
 
 	batch := make([]Row, 0, gatherBatchRows)
 	flush := func() bool {
@@ -230,7 +302,7 @@ func (o *gatherMergeOp) runWorker(idx int, wctx *Context) error {
 		if slot == nil {
 			continue
 		}
-		batch = append(batch, MaterializeForTransfer(slot.Row()))
+		batch = append(batch, transferRowForQueue(slot))
 		if len(batch) >= gatherBatchRows && !flush() {
 			return wctx.Ctx.Err()
 		}
@@ -276,8 +348,8 @@ func (o *gatherMergeOp) advanceRow(src *gmSource) (bool, error) {
 		}
 		// The leader's own rows do not cross a goroutine boundary, but they DO
 		// have to survive until the heap pops them — several Next() calls
-		// later — so they must be materialised like any retained row.
-		src.cur = MaterializeForTransfer(slot.Row())
+		// later — so they must be transferred like any retained row.
+		src.cur = transferRowForQueue(slot)
 		return true, nil
 	}
 	for len(src.pending) == 0 {
@@ -401,6 +473,11 @@ func (o *gatherMergeOp) Close() error {
 	}
 	err := o.group.Wait()
 
+	// EX0-03b (new): fold the per-site fresh tables post-join (the Wait
+	// above supplies the happens-before edge) into the Context-keyed
+	// carrier, copying only rows/loops/time per node.
+	foldGatherWorkerStats(o.ctx, o.workerTables)
+
 	for _, w := range o.workers {
 		MergeWorkerContext(o.ctx, w)
 	}
@@ -409,7 +486,8 @@ func (o *gatherMergeOp) Close() error {
 	}
 	o.workers, o.arenas = nil, nil
 	if o.ownsSharedBuilds && o.ctx != nil {
-		o.ctx.SharedHashBuilds = nil
+		// E-09a: retract and unlink the batch files after the join.
+		releaseSharedHashBuilds(o.ctx)
 		o.ownsSharedBuilds = false
 	}
 

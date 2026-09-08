@@ -1,0 +1,64 @@
+Limit  (cost=36913.04..36915.22 rows=8 width=1254)
+  ->  GroupAggregate  (cost=36913.04..36915.22 rows=8 width=1254)
+        Group Key: warehouse.w_warehouse_name, warehouse.w_warehouse_sq_ft, warehouse.w_city, warehouse.w_county, warehouse.w_state, warehouse.w_country, ('ORIENTAL,BOXBUNDLES'::text), date_dim.d_year
+        ->  Sort  (cost=36913.04..36913.06 rows=8 width=870)
+              Sort Key: warehouse.w_warehouse_name, warehouse.w_warehouse_sq_ft, warehouse.w_city, warehouse.w_county, warehouse.w_state, warehouse.w_country, ('ORIENTAL,BOXBUNDLES'::text), date_dim.d_year
+              ->  Append  (cost=12859.63..36912.92 rows=8 width=870)
+                    ->  Finalize GroupAggregate  (cost=12859.63..12868.12 rows=4 width=870)
+                          Group Key: warehouse.w_warehouse_name, warehouse.w_warehouse_sq_ft, warehouse.w_city, warehouse.w_county, warehouse.w_state, warehouse.w_country
+                          ->  Gather Merge  (cost=12859.63..12866.22 rows=12 width=838)
+                                Workers Planned: 3
+                                ->  Partial GroupAggregate  (cost=11859.59..11864.77 rows=4 width=838)
+                                      Group Key: warehouse.w_warehouse_name, warehouse.w_warehouse_sq_ft, warehouse.w_city, warehouse.w_county, warehouse.w_state, warehouse.w_country
+                                      ->  Sort  (cost=11859.59..11859.64 rows=19 width=91)
+                                            Sort Key: warehouse.w_warehouse_name, warehouse.w_warehouse_sq_ft, warehouse.w_city, warehouse.w_county, warehouse.w_state, warehouse.w_country
+                                            ->  Hash Join  (cost=2.98..11859.19 rows=19 width=91)
+                                                  Hash Cond: (web_sales.ws_warehouse_sk = warehouse.w_warehouse_sk)
+                                                  ->  Nested Loop  (cost=1.87..11857.98 rows=19 width=29)
+                                                        ->  Nested Loop  (cost=1.58..11838.65 rows=58 width=33)
+                                                              ->  Hash Join  (cost=1.27..10945.57 rows=11592 width=29)
+                                                                    Hash Cond: (web_sales.ws_ship_mode_sk = ship_mode.sm_ship_mode_sk)
+                                                                    ->  Parallel Seq Scan on web_sales  (cost=0.00..10575.46 rows=115946 width=33)
+                                                                    ->  Hash  (cost=1.25..1.25 rows=2 width=4)
+                                                                          ->  Seq Scan on ship_mode  (cost=0.00..1.25 rows=2 width=4)
+                                                                                Filter: (sm_carrier = ANY ('{ORIENTAL,BOXBUNDLES}'::bpchar[]))
+                                                              ->  Memoize  (cost=0.30..0.34 rows=1 width=12)
+                                                                    Cache Key: web_sales.ws_sold_date_sk
+                                                                    Cache Mode: logical
+                                                                    ->  Index Scan using date_dim_pkey on date_dim  (cost=0.29..0.33 rows=1 width=12)
+                                                                          Index Cond: (d_date_sk = web_sales.ws_sold_date_sk)
+                                                                          Filter: (d_year = 2001)
+                                                        ->  Index Scan using time_dim_pkey on time_dim  (cost=0.29..0.33 rows=1 width=4)
+                                                              Index Cond: (t_time_sk = web_sales.ws_sold_time_sk)
+                                                              Filter: ((t_time >= 42970) AND (t_time <= 71770))
+                                                  ->  Hash  (cost=1.05..1.05 rows=5 width=70)
+                                                        ->  Seq Scan on warehouse  (cost=0.00..1.05 rows=5 width=70)
+                    ->  Finalize GroupAggregate  (cost=24031.39..24044.77 rows=4 width=870)
+                          Group Key: warehouse_1.w_warehouse_name, warehouse_1.w_warehouse_sq_ft, warehouse_1.w_city, warehouse_1.w_county, warehouse_1.w_state, warehouse_1.w_country
+                          ->  Gather Merge  (cost=24031.39..24042.87 rows=12 width=838)
+                                Workers Planned: 3
+                                ->  Partial GroupAggregate  (cost=23031.35..23041.42 rows=4 width=838)
+                                      Group Key: warehouse_1.w_warehouse_name, warehouse_1.w_warehouse_sq_ft, warehouse_1.w_city, warehouse_1.w_county, warehouse_1.w_state, warehouse_1.w_country
+                                      ->  Sort  (cost=23031.35..23031.45 rows=38 width=91)
+                                            Sort Key: warehouse_1.w_warehouse_name, warehouse_1.w_warehouse_sq_ft, warehouse_1.w_city, warehouse_1.w_county, warehouse_1.w_state, warehouse_1.w_country
+                                            ->  Hash Join  (cost=2.98..23030.35 rows=38 width=91)
+                                                  Hash Cond: (catalog_sales.cs_warehouse_sk = warehouse_1.w_warehouse_sk)
+                                                  ->  Nested Loop  (cost=1.87..23029.05 rows=38 width=29)
+                                                        ->  Nested Loop  (cost=1.58..22991.78 rows=115 width=33)
+                                                              ->  Hash Join  (cost=1.27..21824.87 rows=23129 width=29)
+                                                                    Hash Cond: (catalog_sales.cs_ship_mode_sk = ship_mode_1.sm_ship_mode_sk)
+                                                                    ->  Parallel Seq Scan on catalog_sales  (cost=0.00..21084.70 rows=232470 width=33)
+                                                                    ->  Hash  (cost=1.25..1.25 rows=2 width=4)
+                                                                          ->  Seq Scan on ship_mode ship_mode_1  (cost=0.00..1.25 rows=2 width=4)
+                                                                                Filter: (sm_carrier = ANY ('{ORIENTAL,BOXBUNDLES}'::bpchar[]))
+                                                              ->  Memoize  (cost=0.30..0.33 rows=1 width=12)
+                                                                    Cache Key: catalog_sales.cs_sold_date_sk
+                                                                    Cache Mode: logical
+                                                                    ->  Index Scan using date_dim_pkey on date_dim date_dim_1  (cost=0.29..0.32 rows=1 width=12)
+                                                                          Index Cond: (d_date_sk = catalog_sales.cs_sold_date_sk)
+                                                                          Filter: (d_year = 2001)
+                                                        ->  Index Scan using time_dim_pkey on time_dim time_dim_1  (cost=0.29..0.32 rows=1 width=4)
+                                                              Index Cond: (t_time_sk = catalog_sales.cs_sold_time_sk)
+                                                              Filter: ((t_time >= 42970) AND (t_time <= 71770))
+                                                  ->  Hash  (cost=1.05..1.05 rows=5 width=70)
+                                                        ->  Seq Scan on warehouse warehouse_1  (cost=0.00..1.05 rows=5 width=70)

@@ -1,0 +1,30 @@
+=== Q9
+Sort  (cost=656968.65..657018.65 rows=5000 width=144) (actual time=6631.533..6631.561 rows=175.00 loops=1)
+  Sort Key: nation, o_year DESC
+  Sort Method: quicksort  Memory: 26kB
+  ->  HashAggregate  (cost=656611.46..656661.46 rows=5000 width=144) (actual time=6631.430..6631.494 rows=175.00 loops=1)
+        Group Key: nation, o_year
+        ->  Hash Join  (cost=549258.45..656475.11 rows=6060 width=1032) (actual time=2528.506..6620.123 rows=321056.00 loops=1)
+              Hash Cond: (lineitem.l_suppkey = supplier.s_suppkey)
+              Buckets: 16384  Batches: 1  Memory Usage: 1241kB  Build Time: 18.646 ms
+              ->  Hash Join  (cost=548504.14..653220.52 rows=6060 width=896) (actual time=2509.848..6601.466 rows=321056.00 loops=1)
+                    Hash Cond: (orders.o_orderkey = lineitem.l_orderkey)
+                    Buckets: 262144  Batches: 2  Memory Usage: 91586kB  Build Time: 2509.718 ms
+                    ->  Seq Scan on orders  (cost=0.00..97273.00 rows=1500000 width=448) (actual time=0.029..2671.185 rows=1500000.00 loops=1)
+                    ->  Hash Join  (cost=477130.79..546231.17 rows=6060 width=896) (actual time=1178.764..2509.076 rows=321056.00 loops=1)
+                          Hash Cond: ((partsupp.ps_suppkey = lineitem.l_suppkey) AND (partsupp.ps_partkey = lineitem.l_partkey))
+                          Build Time: 1176.483 ms
+                          ->  Seq Scan on partsupp  (cost=0.00..61282.00 rows=800000 width=544) (actual time=2.188..1332.656 rows=800000.00 loops=1)
+                          ->  Nested Loop  (cost=0.38..474403.22 rows=6060 width=1098) (actual time=19.697..1176.456 rows=321056.00 loops=1)
+                                ->  Seq Scan on part  (cost=0.00..2060.60 rows=6060 width=548) (actual time=19.508..1176.361 rows=10686.00 loops=1)
+                                      Filter: (p_name LIKE '%green%')
+                                ->  Index Scan using lineitem_part_supp_fkidx on lineitem  (cost=0.38..78.27 rows=31 width=550)
+                                      Index Cond: (l_partkey = part.p_partkey)
+              ->  Hash Join  (cost=2.81..629.31 rows=10000 width=720) (actual time=3.336..18.635 rows=10000.00 loops=1)
+                    Hash Cond: (supplier.s_nationkey = nation.n_nationkey)
+                    Buckets: 1024  Batches: 1  Memory Usage: 4kB  Build Time: 0.129 ms
+                    ->  Index Scan using supplier_pk on supplier  (cost=0.25..489.25 rows=10000 width=584) (actual time=3.198..18.500 rows=10000.00 loops=1)
+                    ->  Seq Scan on nation  (cost=0.00..2.25 rows=25 width=490) (actual time=0.050..0.103 rows=25.00 loops=1)
+Planning Time: 0.084 ms
+Execution Time: 6631.581 ms
+

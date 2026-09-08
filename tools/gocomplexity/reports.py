@@ -37,6 +37,7 @@ def project_summary_rows(s: ProjectSummary) -> list[tuple[str, str]]:
         ("Average Cognitive", f"{s.cognitive.mean:.1f}"),
         ("Maintainability Index", f"{round(s.maintainability_index)}"),
         ("Duplicate Code", f"{s.duplicate_code_pct:.1f}%"),
+        ("Duplicate Windows", f"{s.duplicate_window_count:,}"),
     ]
 
 
@@ -48,6 +49,7 @@ OUTPUT_FILES = (
     "directories.csv",
     "files.csv",
     "histogram.svg",
+    "duplication.svg",
 )
 
 
@@ -68,6 +70,7 @@ def write_all(
     _write_aggregate_csv(out_dir, "directories.csv", summary.directories)
     _write_aggregate_csv(out_dir, "files.csv", summary.files)
     _write_histogram(out_dir, metrics)
+    _write_duplication_histogram(out_dir, summary.duplicate_multiplicity_histogram)
     _write_html(out_dir, summary, metrics, top_functions, top_packages, top_files)
 
 
@@ -130,6 +133,35 @@ def _write_histogram(out_dir: str, metrics: list[FunctionMetric]) -> None:
     ax.grid(axis="y", alpha=0.3)
     fig.tight_layout()
     fig.savefig(os.path.join(out_dir, "histogram.svg"), format="svg")
+    plt.close(fig)
+
+
+# Duplicate windows: "multiplicity" is the number of times a window's signature
+# occurs. Clip the (rare) high-multiplicity tail into one overflow bin so the
+# chart stays readable, mirroring the cyclomatic-complexity histogram.
+_DUP_HISTOGRAM_CAP = 20
+
+
+def _write_duplication_histogram(out_dir: str, histogram: dict[int, int]) -> None:
+    fig, ax = plt.subplots(figsize=(8, 4.5))
+    if histogram:
+        cap = _DUP_HISTOGRAM_CAP
+        mults = [m for m in sorted(histogram) if m <= cap]
+        counts = [histogram[m] for m in mults]
+        over = sum(n for m, n in histogram.items() if m > cap)
+        if over:
+            mults.append(cap + 1)
+            counts.append(over)
+        xs = list(range(len(mults)))
+        ax.bar(xs, counts, color="#72B7B2", edgecolor="white", linewidth=0.4)
+        ax.set_xticks(xs)
+        ax.set_xticklabels([f"{m}+" if m > cap else str(m) for m in mults])
+    ax.set_title("Duplicate window multiplicity")
+    ax.set_xlabel("Occurrences per duplicate window")
+    ax.set_ylabel("Number of duplicate windows")
+    ax.grid(axis="y", alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(os.path.join(out_dir, "duplication.svg"), format="svg")
     plt.close(fig)
 
 
@@ -243,6 +275,9 @@ def _write_html(
     # Strip the XML prolog so the SVG can be inlined inside the HTML body.
     svg_inline = svg[svg.find("<svg") :] if "<svg" in svg else svg
 
+    dup_svg = Path(os.path.join(out_dir, "duplication.svg")).read_text(encoding="utf-8")
+    dup_svg_inline = dup_svg[dup_svg.find("<svg") :] if "<svg" in dup_svg else dup_svg
+
     doc = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -267,6 +302,9 @@ roots: {_esc(", ".join(summary.roots))} &middot;
 
 <figure><figcaption><strong>Distribution</strong></figcaption>
 <div class="svgwrap">{svg_inline}</div></figure>
+
+<figure><figcaption><strong>Duplicate window multiplicity</strong></figcaption>
+<div class="svgwrap">{dup_svg_inline}</div></figure>
 
 <h2>Top {min(top_functions, len(metrics))} functions by cyclomatic complexity</h2>
 {_functions_table(metrics, top_functions)}

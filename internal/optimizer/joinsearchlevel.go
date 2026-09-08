@@ -51,13 +51,29 @@ type joinRelBuilder interface {
 	// paths within one rel, and two pairs that disagreed about `rows` would
 	// make those comparisons meaningless. `clauses` is the joinrel's own
 	// restriction list (PG's `build_joinrel_restrictlist` output).
-	sizeJoinRel(outer, inner *RelOptInfo, clauses []*restrictInfo) (rows float64, width int)
+	//
+	// `sjinfo` is what `joinIsLegal` matched for the FIRST pair to reach this
+	// relset, post-`reversed` swap — so `outer` covers its LHS. C-04a passes
+	// it for the outer-join row FLOOR only (see `applyOuterJoinRowFloor`); the
+	// full `calc_joinrel_size_estimate` jointype switch is C-05. It is named
+	// in the interface rather than smuggled through the builder because a
+	// relset's size is fixed once and every path in the rel is compared
+	// against it.
+	sizeJoinRel(outer, inner *RelOptInfo, clauses []*restrictInfo, sjinfo *SpecialJoinInfo) (rows float64, width int)
 
 	// addPaths is `add_paths_to_joinrel` for ONE direction: it must treat
 	// `outer` as the outer (probe/driving) side and `inner` as the inner
 	// (build/inner-scan) side, and add every path it finds to `joinrel` via
 	// `addPath`. makeJoinRel calls it twice per pair, once per direction.
-	addPaths(joinrel, outer, inner *RelOptInfo, clauses []*restrictInfo) error
+	//
+	// `sjinfo` is the SpecialJoinInfo `joinIsLegal` matched for this pair, nil
+	// for a plain inner join, and it is passed POST-`reversed`-swap, so the
+	// caller's `outer` on the first of the two calls is the side that covers
+	// the SJI's LHS. C-03b passes it because legality of a given direction is
+	// an ORIENTATION question, not a jointype question — PG's
+	// `populate_joinrel_with_paths` gives its two calls different jointypes for
+	// exactly this reason (joinrels.c:932-939). See jointypeForDirection.
+	addPaths(joinrel, outer, inner *RelOptInfo, clauses []*restrictInfo, sjinfo *SpecialJoinInfo) error
 }
 
 // joinOrderRestricted is PG's `have_join_order_restriction` (joinrels.c:1066),
@@ -299,6 +315,14 @@ func (s *searchCtx) joinSearch(clauses *restrictInfoList, b joinRelBuilder) (*Re
 				s.traceFailed(err)
 				return nil, err
 			}
+			// C-19d: `generate_useful_gather_paths(root, rel, false)` sits
+			// immediately before `set_cheapest` here in upstream
+			// (allpaths.c:3503-3517), and the order matters — a Gather path
+			// offered after set_cheapest could never become CheapestTotal and
+			// would be invisible to the level above. It is a no-op until a
+			// joinrel has partial paths (C-19f) and while GOOPG_GATHER_PATHS
+			// is off.
+			s.generateUsefulGatherPaths(rel)
 			setCheapest(rel)
 		}
 	}
@@ -567,7 +591,7 @@ func (s *searchCtx) makeJoinRel(rel1, rel2 *RelOptInfo) (*RelOptInfo, error) {
 	// later comparison (joinsearchlevel.go:43) (P5.9-l-ii).
 	s.trace.offer(s.tracePhase, rel1.Relids, rel2.Relids, joinrel == nil)
 	if joinrel == nil {
-		rows, width := s.builder.sizeJoinRel(rel1, rel2, clauses)
+		rows, width := s.builder.sizeJoinRel(rel1, rel2, clauses, sjinfo)
 		// The same floor buildInitialRels applies (joinsearch.go:220-240):
 		// a zero-row rel would make every join above it free and the level
 		// above would order itself on noise.
@@ -578,27 +602,63 @@ func (s *searchCtx) makeJoinRel(rel1, rel2 *RelOptInfo) (*RelOptInfo, error) {
 		// take2 P4-01 rev 10 step 1: a join rel is built during the search,
 		// after s.neededCols is published, so it takes the set directly.
 		joinrel.NeededCols, joinrel.NeededColsKnown = s.neededCols, s.neededColsKnown
+		// Take2 P4-01 Slice 3: the above-tree set travels the same way, but
+		// only on eligible problems (see searchOneProblem) — anything else
+		// keeps the zero value and the keep derivation declines there.
+		if s.outputEligible {
+			joinrel.OutputCols, joinrel.OutputColsKnown = s.outputCols, s.outputColsKnown
+		}
 		// A join row is the concatenation of its two inputs' rows — the
 		// executor's Join emits left++right — so the column count adds
-		// (M0127-P5.7-a).
-		joinrel.NCols = relNCols(rel1) + relNCols(rel2)
-		// AvgVarBytes adds the same way: a concatenation of two
-		// schemas sums their variable-width payloads (M0128-P3.1).
-		joinrel.AvgVarBytes = rel1.AvgVarBytes + rel2.AvgVarBytes
+		// (M0127-P5.7-a)... except for a SEMI or ANTI join, which emits its
+		// LHS alone. C-05 replaced C-03c's deliberate over-wide union with
+		// the real rule, and `joinPublishesInner` (joinrelsize.go) is the ONE
+		// place that states it — the sizer's `Width` reads the same function,
+		// so the rel's three sizing figures and its width cannot disagree
+		// about what the join emits. C-03c's objection that a relset-keyed
+		// singleton cannot carry a jointype is answered there: whether a base
+		// relation's columns are published is a RELSET property under
+		// `joinIsLegal`, so every pair spanning this relset publishes the
+		// same columns and first-writer-wins is safe.
+		//
+		// These figures feed hash sizing (`hashsize.Choose` via `relNCols`,
+		// `entrywidth.go` via `AvgVarBytes`/`ColVarBytes`) and the parent's
+		// own union, which is how a SEMI child's left-only publication reaches
+		// the joinrel above it (C-05 DESIGN §4.6).
+		joinrel.NCols = relNCols(rel1)
+		joinrel.AvgVarBytes = rel1.AvgVarBytes
+		joinrel.ColVarBytes = rel1.ColVarBytes
+		if joinPublishesInner(sjinfo) {
+			joinrel.NCols += relNCols(rel2)
+			// AvgVarBytes adds the same way: a concatenation of two
+			// schemas sums their variable-width payloads (M0128-P3.1).
+			joinrel.AvgVarBytes += rel2.AvgVarBytes
+			// Its unsummed twin concatenates the same way; a name carried by
+			// both inputs (a self-join's aliases) keeps the WIDER width, so a
+			// collision over-states rather than under-states.
+			joinrel.ColVarBytes = unionColVarBytes(rel1.ColVarBytes, rel2.ColVarBytes)
+		}
 		// `joinrel->consider_startup = (root->tuple_fraction > 0)`
 		// (relnode.c:707) — the same query-wide fact every base rel copied in
 		// `buildInitialRels`, not something inherited from the inputs
 		// (M0127-P5.7-b).
 		joinrel.ConsiderStartup = s.tupleFraction > 0
+		// `joinrel->consider_parallel` (relnode.c:842): both inputs AND the
+		// join's own clauses parallel-safe. C-19a (considerparallel.go).
+		joinrel.ConsiderParallel = joinrelConsiderParallel(s, rel1, rel2, clauses)
 		if err := s.addRel(joinrel); err != nil {
 			return nil, err
 		}
 	}
 
-	if err := s.builder.addPaths(joinrel, rel1, rel2, clauses); err != nil {
+	// The two directions of `populate_joinrel_with_paths` (joinrels.c:809-816
+	// and its outer/semi/anti twins). Both calls get the SAME sjinfo — post
+	// swap, so rel1 covers its LHS — and the callee decides per direction what
+	// join, if any, that orientation may perform (C-03b, jointypeForDirection).
+	if err := s.builder.addPaths(joinrel, rel1, rel2, clauses, sjinfo); err != nil {
 		return nil, err
 	}
-	if err := s.builder.addPaths(joinrel, rel2, rel1, clauses); err != nil {
+	if err := s.builder.addPaths(joinrel, rel2, rel1, clauses, sjinfo); err != nil {
 		return nil, err
 	}
 	return joinrel, nil

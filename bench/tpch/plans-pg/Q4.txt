@@ -1,0 +1,12 @@
+=== Q4
+GroupAggregate  (cost=193450.66..193552.92 rows=5 width=24)
+  Group Key: orders.o_orderpriority
+  ->  Sort  (cost=193450.66..193484.73 rows=13628 width=16)
+        Sort Key: orders.o_orderpriority
+        ->  Nested Loop Semi Join  (cost=0.43..192514.81 rows=13628 width=16)
+              ->  Seq Scan on orders  (cost=0.00..50314.00 rows=57554 width=22)
+                    Filter: ((o_orderdate >= '1993-07-01'::date) AND (o_orderdate < '1993-10-01 00:00:00'::timestamp without time zone))
+              ->  Index Scan using idx_lineitem_orderkey_fkidx on lineitem  (cost=0.43..10.67 rows=6 width=6)
+                    Index Cond: (l_orderkey = orders.o_orderkey)
+                    Filter: (l_commitdate < l_receiptdate)
+

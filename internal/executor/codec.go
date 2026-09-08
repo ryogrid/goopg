@@ -114,11 +114,15 @@ func encodeRowPGCtx(cols []catalog.Column, row Row, ctx *Context, pos int) ([]by
 			off += 13
 			continue
 		}
-		align := physicalPGTypeAlign(c.Type)
-		off = alignPhysicalPGOffset(off, align)
+		// D-09 att_align_datum: encode first, then place — a
+		// packable short-header varlena skips alignment (PG's
+		// fill_val short arm); everything else aligns as before.
 		buf, err := encodeValuePGCtx(c.Type, d, ctx, pos)
 		if err != nil {
 			return nil, err
+		}
+		if !packableShortColumn(c, buf) {
+			off = alignPhysicalPGOffset(off, physicalPGTypeAlign(c.Type))
 		}
 		for len(out) < off+len(buf) {
 			out = append(out, 0)
@@ -127,6 +131,50 @@ func encodeRowPGCtx(cols []catalog.Column, row Row, ctx *Context, pos int) ([]by
 		off += len(buf)
 	}
 	return out, nil
+}
+
+// effectiveAttStorage is the column's heap placement storage class for
+// the D-09 packability gate: the per-column override (`ALTER … SET
+// STORAGE`, `Column.Storage`, flushed to pg_attribute heap) wins over
+// the type default from `colTypeDescriptor` (D-01 bridge, no fifth
+// transcription). Resolved inline per call — no global cache, so domain
+// DDL can never go stale. Unknown types fall through to the
+// varlena-shaped default ('x', packable): round-trips hold via the
+// storage-blind peek, but a genuinely STORAGE=PLAIN custom type would
+// pack where PG aligns (placement-only divergence, same class as the
+// 'p'-varlena note in the D-09 design).
+func effectiveAttStorage(col catalog.Column) byte {
+	switch strings.ToLower(col.Storage) {
+	case "plain":
+		return 'p'
+	case "main":
+		return 'm'
+	case "external":
+		return 'e'
+	case "extended":
+		return 'x'
+	}
+	return colTypeDescriptor(col.Type).TypStorage
+}
+
+// isShortVarlenaHeader tests the header FORM, never the length: odd
+// first byte except the 0x01 TOAST-external marker (which can never be
+// a data short header — shortest data header is 0x03 for empty).
+func isShortVarlenaHeader(buf []byte) bool {
+	return len(buf) > 0 && buf[0]&1 == 1 && buf[0] != 0x01
+}
+
+// packableShortColumn is D-09's `att_align_datum`: true iff this value
+// must skip alignment on encode — varlena-kind, packable storage, and
+// actually carrying a short header.
+func packableShortColumn(col catalog.Column, buf []byte) bool {
+	if !pgPhysicalTypeIsVarlena(col.Type) {
+		return false
+	}
+	if effectiveAttStorage(col) == 'p' {
+		return false
+	}
+	return isShortVarlenaHeader(buf)
 }
 
 func coerceTextLikeDatum(t catalog.Type, d Datum) (string, error) {
@@ -1019,6 +1067,22 @@ func encodeValuePGCtx(t catalog.Type, d Datum, ctx *Context, pos int) ([]byte, e
 		// (e.g. relpartbound when relispartition=true). Empty varlena.
 		s := d.StringValue()
 		return varlenaTextBytes(s), nil
+	case "pg_ndistinct", "pg_dependencies", "pg_mcv_list", "_pg_statistic":
+		// B-05a: extended-statistics varlena blobs (pg_statistic_ext_data
+		// stxdndistinct/stxddependencies/stxdmcv/stxdexpr,
+		// postgres/src/include/catalog/pg_statistic_ext_data.h). All four
+		// are typlen=-1 varlenas carrying private binary formats (magic +
+		// LE scalars, NOT text), so the default text arm below would
+		// corrupt them. The writer passes the complete varlena (4-byte
+		// length header included, as statext_*_serialize's SET_VARSIZE
+		// emits) via KindBytes and it is spliced verbatim — the same
+		// pre-built-blob pattern as pg_node_tree/int2vector/oidvector.
+		// A non-bytes datum is a caller bug: fail loudly (like int2vector)
+		// rather than storing text PG would misread as a magic number.
+		if d.Kind != KindBytes {
+			return nil, fmt.Errorf("expected bytes for %s, got kind %d", t.Name, d.Kind)
+		}
+		return d.BytesValue(), nil
 	case "xml":
 		// M0134-0188: the physical-encode path is a SIBLING of evalCast's
 		// `::xml` arm (xmltypes.go) and must apply the same well-formedness
@@ -1380,7 +1444,10 @@ func decodeRowRangeInfo(dst Row, cols []catalog.Column, info []colTypeInfo, data
 			tname = strings.ToLower(c.Type.Name)
 			align = physicalPGTypeAlignLowered(c.Type, tname)
 		}
-		off = alignPhysicalPGOffset(off, align)
+		// D-09 att_align_pointer: the peek decides only whether to
+		// align (shared rule: catalog.AttAlignPointer). Bounds-safe:
+		// OOB cursor returns unchanged and trips the exhausted arm.
+		off = catalog.AttAlignPointer(data, off, align, pgPhysicalTypeIsVarlena(c.Type))
 		if off >= len(data) {
 			// Data exhausted — treat remaining columns as NULL.
 			dst[i] = NullDatum
@@ -1427,7 +1494,8 @@ func decodeRowIntoMctx(dst Row, cols []catalog.Column, data []byte, sctx *mmgr.C
 func decodePhysicalPGRowIntoMctx(dst Row, cols []catalog.Column, data []byte, sctx *mmgr.Context) error {
 	off := 0
 	for i, c := range cols {
-		off = alignPhysicalPGOffset(off, physicalPGTypeAlign(c.Type))
+		// D-09 att_align_pointer (shared rule: catalog.AttAlignPointer).
+		off = catalog.AttAlignPointer(data, off, physicalPGTypeAlign(c.Type), pgPhysicalTypeIsVarlena(c.Type))
 		if off > len(data) {
 			return fmt.Errorf("DecodePhysicalPGRow: %s: truncated at offset %d", c.Name, off)
 		}
@@ -1473,32 +1541,12 @@ func physicalPGTypeAlignLowered(t catalog.Type, tname string) int {
 // will trip if HEAP_HASVARWIDTH is unset and any column on the
 // fixed-prefix path turns out to be varlena per the TupleDesc. M0106-0010
 // batched-49.
+// pgPhysicalTypeIsVarlena is catalog.PhysicalTypeIsVarlena (moved there by
+// D-09 so the heap codec, pgoutput's walker, and the catalog statistic
+// paths share one transcription instead of drifting). Kept as a thin
+// wrapper so the four call sites read unchanged.
 func pgPhysicalTypeIsVarlena(t catalog.Type) bool {
-	switch strings.ToLower(t.Name) {
-	case "char":
-		// Single-byte internal "char": fixed-length (not varlena).
-		// char(N) with length modifier = bpchar (varlena).
-		return len(t.Args) > 0
-	case "bool", "boolean",
-		"int2", "smallint", "smallserial", "serial2",
-		"int4", "integer", "int", "serial", "serial4",
-		"int8", "bigint", "bigserial", "serial8",
-		"pg_lsn",
-		"oid", "regproc", "regprocedure", "regclass", "regtype", "regrole", "regcollation", "cid",
-		"timestamp", "timestamptz", "date", "time", "timetz",
-		"interval", // typlen 16, not varlena
-		"uuid",     // typlen 16, typalign 'c', typstorage 'p' — not varlena
-		"name",
-		"float4", "real",
-		"float8", "double precision", "double",
-		"xid", "xid8":
-		return false
-	default:
-		// text, varchar, bpchar, numeric, unknown, and all varlena
-		// arrays / oidvector / int2vector / pg_node_tree fall through
-		// to varlena. Mirrors the default branch of encodeValuePG.
-		return true
-	}
+	return catalog.PhysicalTypeIsVarlena(t)
 }
 
 // pgRowHasVarWidth reports whether row, encoded with cols via
@@ -1941,6 +1989,17 @@ func decodePhysicalPGValueLowered(t catalog.Type, tname string, data []byte, sct
 			return newStringArenaDatum(sctx, moff, mlen), n, nil
 		}
 		return NewStringDatum(string(payload)), n, nil
+	case "pg_ndistinct", "pg_dependencies", "pg_mcv_list", "_pg_statistic":
+		// B-05a decode twin of the encode arm above: return the FULL varlena
+		// (length header included) as KindBytes — the aclitem[] pattern —
+		// so the extstats deserializers see exactly what statext_*_load
+		// hands statext_*_deserialize (a bytea* with its header). Decoding
+		// to text (the default arm) would destroy the binary magic/scalars.
+		_, n, err := decodePhysicalPGVarlena(data)
+		if err != nil {
+			return Datum{}, 0, fmt.Errorf("decode %q as varlena: %w", t.Name, err)
+		}
+		return NewBytesDatum(append([]byte(nil), data[:n]...)), n, nil
 	case "aclitem[]", "_aclitem":
 		// A heap-backed catalog stores an ACL column (pg_type.typacl —
 		// M0119-0004-ACLHEAP) as a PG-native _aclitem ArrayType varlena whose
@@ -1978,6 +2037,31 @@ func decodePhysicalPGValueLowered(t catalog.Type, tname string, data []byte, sct
 			return NewStringDatum(""), n, nil
 		}
 		return NewStringDatum(catalog.ArrayTextLiteral(elems)), n, nil
+	case "json", "jsonb", "xml":
+		// PG external varlena (VARATT_IS_1B_E = 0x01): our TOAST pointer.
+		// EX1-03 gate: these types are in isToastableType, so oversized
+		// values ARE toasted on write (ToastLargeColumnsIfNeeded) and the
+		// pointer is encoded by the type-independent encodeRowPGCtx arm;
+		// without this arm the shared default below raised "decode %q as
+		// varlena" on the 13-byte pointer blob and the scan silently
+		// skipped the tuple (measured: SELECT v over a toasted json
+		// column returned 0 rows pre-EX1-03). The marker is unambiguous
+		// (same argument as the text arm); inline values take the
+		// identical default path as before.
+		if len(data) >= 13 && data[0] == 0x01 {
+			ptr := make([]byte, 12)
+			copy(ptr, data[1:13])
+			return NewToastPointerDatum(ptr), 13, nil
+		}
+		payload, n, err := decodePhysicalPGVarlena(data)
+		if err != nil {
+			return Datum{}, 0, fmt.Errorf("decode %q as varlena: %w", t.Name, err)
+		}
+		if sctx != nil {
+			moff, mlen := sctx.AllocBytes(payload)
+			return newStringArenaDatum(sctx, moff, mlen), n, nil
+		}
+		return NewStringDatum(string(payload)), n, nil
 	default:
 		// Unknown type (e.g. "point", "path", custom types).  goopg's
 		// encodeValuePG stores them as PG varlena text (the default branch

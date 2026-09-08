@@ -200,3 +200,40 @@ func makeString(n int) string {
 	}
 	return string(b)
 }
+
+// TestEstimatedRowBytesCountsEnumAndBigNumeric is EX3-03 Cut 1-step-1: the
+// runtime ruler must mirror datumVariablePayloadWidth's enum-label and
+// big-numeric-body arms. Fast-path numeric stays 0, empty string stays 0.
+func TestEstimatedRowBytesCountsEnumAndBigNumeric(t *testing.T) {
+	// Enum label bytes (Buf-backed, the NewEnumDatum shape).
+	enumDatum := NewEnumDatum(1.0, "hello")
+	if got := estimatedRowBytes(Row{enumDatum}); got != 48+5 {
+		t.Errorf("enum Buf-backed: estimatedRowBytes = %d, want %d", got, 48+5)
+	}
+	// Enum arena-backed shape: length rides in Int low 32 bits (mirrors
+	// datumVariablePayloadWidth; no mmgr lookup).
+	arenaEnum := Datum{Kind: KindEnum, ArenaID: 1, Int: int64(7) & 0xFFFFFFFF}
+	if got := estimatedRowBytes(Row{arenaEnum}); got != 48+7 {
+		t.Errorf("enum arena-backed: estimatedRowBytes = %d, want %d", got, 48+7)
+	}
+	// Big-numeric body bytes: length rides in Int low 32 bits.
+	bigNum := Datum{Kind: KindNumeric, Flags: flagBigNumeric, ArenaID: 1, Int: int64(11) & 0xFFFFFFFF}
+	if got := estimatedRowBytes(Row{bigNum}); got != 48+11 {
+		t.Errorf("big numeric: estimatedRowBytes = %d, want %d", got, 48+11)
+	}
+	// Fast-path numeric still 0 (int64 mantissa fits in Datum.Int).
+	fastNum := Datum{Kind: KindNumeric, Int: 12345, Scale: 2}
+	if got := estimatedRowBytes(Row{fastNum}); got != 48 {
+		t.Errorf("fast-path numeric: estimatedRowBytes = %d, want 48", got)
+	}
+	// Empty string still 0.
+	if got := estimatedRowBytes(Row{NewStringDatum("")}); got != 48 {
+		t.Errorf("empty string: estimatedRowBytes = %d, want 48", got)
+	}
+	// Cross-check against the stats ruler on representative shapes.
+	for i, d := range []Datum{enumDatum, fastNum, NewStringDatum("abc"), NewBytesDatum([]byte("abcd"))} {
+		if got, want := estimatedRowBytes(Row{d}), int64(48+datumVariablePayloadWidth(d)); got != want {
+			t.Errorf("case %d (%v): estimatedRowBytes = %d, ruler says %d", i, d.Kind, got, want)
+		}
+	}
+}

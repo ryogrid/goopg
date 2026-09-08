@@ -97,6 +97,11 @@ const (
 type joinVarStats struct {
 	stats  *catalog.ColumnStats
 	tuples float64
+	// rows is the relation's FILTERED (post-qual) row count, PG's
+	// `vardata->rel->rows`. The bucket scaler (B-16) prices the rows actually
+	// hashed, while `tuples` stays raw. Zero when the context was hand-built
+	// without it; the scaler reads that as "no filter info" and skips.
+	rows   float64
 	isBool bool
 
 	// typeName is the column's catalog type. Histogram bounds are stored as
@@ -153,6 +158,7 @@ func (s *searchCtx) examineJoinVar(key Expr, relids RelSet) joinVarStats {
 	}
 	info := s.relInfos[i]
 	v.tuples = float64(info.baseRows)
+	v.rows = float64(info.filteredRows)
 	v.stats = columnStatsByName(info.table, cr.Name)
 	return v
 }
@@ -351,7 +357,27 @@ func (s *searchCtx) joinClauseSelectivity(ri *restrictInfo) float64 {
 // `<>` inherits its operand's flag rather than being called a guess outright:
 // `1 - eqjoinsel` over two measured ndistincts is as measured as the equality
 // it negates.
+//
+// P6-08 (take3 08 §9): the result is memoised on the `restrictInfo` as PG's
+// `norm_selec`. The DP asks for the same clause's selectivity once per joinrel
+// pair that can evaluate it — O(2^n) times for a clause low in the tree — and
+// the answer moves with neither the pair nor anything else that changes during
+// a search (see the cache contract on `restrictInfo`). Planning-speed only:
+// the cached value is bit-identical to the computed one, so plans do not move.
 func (s *searchCtx) joinClauseSelectivityExt(ri *restrictInfo) (float64, bool) {
+	if ri != nil && ri.normSelecValid {
+		return ri.normSelec, ri.normSelecDefault
+	}
+	sel, isdefault := s.joinClauseSelectivityExtUncached(ri)
+	if ri != nil && s != nil {
+		ri.normSelec, ri.normSelecDefault, ri.normSelecValid = sel, isdefault, true
+	}
+	return sel, isdefault
+}
+
+// joinClauseSelectivityExtUncached is the body `joinClauseSelectivityExt`
+// memoises; every caller should go through the memo.
+func (s *searchCtx) joinClauseSelectivityExtUncached(ri *restrictInfo) (float64, bool) {
 	if ri == nil || ri.clause == nil {
 		return defaultUnhandledClauseSel, true
 	}
@@ -387,6 +413,132 @@ func (s *searchCtx) joinClauseOperands(ri *restrictInfo, bo *BinaryOp) (joinVarS
 		return s.examineJoinVar(ri.leftKey, ri.leftRelids), s.examineJoinVar(ri.rightKey, ri.rightRelids)
 	}
 	return s.examineJoinVar(bo.Left, 0), s.examineJoinVar(bo.Right, 0)
+}
+
+// joinClauseSelectivityForJoin is `clause_selectivity_ext`'s join arm WITH the
+// jointype PG threads through it (`clauselist_selectivity(root, clauses, 0,
+// jointype, sjinfo)`, costsize.c:5555-5580): the per-clause factor C-05's
+// `calcJoinrelSize` multiplies into `jselec`.
+//
+// INNER, LEFT, RIGHT and FULL dispatch to the inner-join arms above —
+// `eqjoinsel` (selfuncs.c:2280) takes `eqjoinsel_inner` for every jointype
+// except SEMI and ANTI, and `scalarltjoinsel` and the unhandled-clause default
+// have no jointype at all. SEMI and ANTI are the jointypes whose selectivity is
+// DEFINED differently ("the fraction of LHS rows that have matches",
+// costsize.c:5592-5593), and for them:
+//
+//   - `=` is `eqjoinsel_semi`, over operands ORIENTED so that v1 is the outer
+//     (preserved) side. Upstream does that swap through `get_join_variables`'
+//     `join_is_reversed` (selfuncs.c:2312); goopg's `leftKey`/`rightKey` split
+//     is canonical rather than oriented (joinrestrict.go:54), so the sizer
+//     orients by which side `leftRelids` falls in. An operand that resolves to
+//     neither side (a three-relation equality keyed across the pair) keeps
+//     list order — the same "no rel" degradation `examineJoinVar` already
+//     yields.
+//   - `<>` is `neqjoinsel`'s semi arm (selfuncs.c:2843-2861): `1 - nullfrac`
+//     of the OUTER variable, on the argument that with more than one distinct
+//     value on the inside every non-null outer row finds a non-equal partner.
+//     Reported as measured when the outer operand resolved to statistics —
+//     the number is then the column's own null fraction, not a constant.
+//   - everything else is the same selfuncs.h constant as for INNER.
+//
+// `outer`/`inner` are the sizer's post-swap inputs (`makeJoinRel`, C-03b:
+// `outer` covers the SJI's LHS), and `inner.Rows` is `eqjoinsel_semi`'s
+// `inner_rel->rows` clamp on nd2 — the only pathway by which a restriction on
+// the inner side reaches a SEMI/ANTI estimate, since the inner's row count is
+// otherwise unused by the SEMI/ANTI arms.
+func (s *searchCtx) joinClauseSelectivityForJoin(ri *restrictInfo, jt parser.JoinType, outer, inner *RelOptInfo) (float64, bool) {
+	if jt != parser.JoinSemi && jt != parser.JoinAnti {
+		return s.joinClauseSelectivityExt(ri)
+	}
+	if ri == nil || ri.clause == nil {
+		return defaultUnhandledClauseSel, true
+	}
+	bo, ok := ri.clause.(*BinaryOp)
+	if !ok {
+		return defaultUnhandledClauseSel, true
+	}
+	switch bo.Op {
+	case parser.OpEq:
+		v1, v2 := s.semiJoinOperands(ri, bo, outer)
+		return eqJoinSelectivitySemi(v1, v2, relRows(inner))
+	case parser.OpNe:
+		v1, _ := s.semiJoinOperands(ri, bo, outer)
+		nullfrac1 := 0.0
+		if v1.stats != nil {
+			nullfrac1 = v1.stats.NullFrac
+		}
+		return clampSelectivity(1.0 - nullfrac1), v1.stats == nil
+	case parser.OpLt, parser.OpLe, parser.OpGt, parser.OpGe:
+		return defaultIneqJoinSel, true
+	default:
+		return defaultUnhandledClauseSel, true
+	}
+}
+
+// semiJoinOperands is `joinClauseOperands` oriented for the semi arms: the
+// first result is the operand on the OUTER side of the join whenever the
+// clause's canonical split lets that be decided.
+func (s *searchCtx) semiJoinOperands(ri *restrictInfo, bo *BinaryOp, outer *RelOptInfo) (joinVarStats, joinVarStats) {
+	v1, v2 := s.joinClauseOperands(ri, bo)
+	if ri.isEquijoin && outer != nil && !relsSubset(ri.leftRelids, outer.Relids) && relsSubset(ri.rightRelids, outer.Relids) {
+		return v2, v1
+	}
+	return v1, v2
+}
+
+// relRows is a nil-tolerant `rel.Rows`, zero meaning "no clamp".
+func relRows(r *RelOptInfo) float64 {
+	if r == nil {
+		return 0
+	}
+	return r.Rows
+}
+
+// eqJoinSelectivitySemi is `eqjoinsel_semi` (selfuncs.c:2642) over the
+// search's statistics: the fraction of OUTER rows (v1's side) that have at
+// least one partner on the inner side, with `*isdefault` carried out as
+// `eqJoinSelectivityExt` does for the inner arm.
+//
+// The two nd2 clamps are BOTH ported (selfuncs.c:2668-2681):
+//
+//	if (nd2 >= vardata2->rel->rows) nd2 = vardata2->rel->rows;   // the base rel's post-filter rows
+//	if (nd2 >= inner_rel->rows)     nd2 = inner_rel->rows;       // the whole inner side's rows
+//
+// and each turns `isdefault2` OFF — a clamped nd2 is a measurement of the
+// relation's size, not a guess about its column. Upstream's reason for
+// clamping nd2 and NOT nd1 is load-bearing and asymmetric: this is the only
+// pathway by which a restriction on the inner relation reaches a SEMI/ANTI
+// estimate, while clamping nd1 as well would double-count the outer's own
+// restrictions, which are already in `outer_rows`. `joinVarStats.rows` is the
+// first clamp's operand (the same post-filter count B-16's bucket scaler
+// reads); `innerRows` is the second's.
+//
+// The arithmetic after the clamps is `eqjoinselSemiCore` (cardinality.go),
+// shared with the plan-node estimator's `semiPairMatchFraction` — one body,
+// two callers that differ only in where their nd and clamps come from.
+func eqJoinSelectivitySemi(v1, v2 joinVarStats, innerRows float64) (float64, bool) {
+	nd1, isdefault1 := getVariableNumDistinct(v1)
+	nd2, isdefault2 := getVariableNumDistinct(v2)
+	if v2.rows > 0 && nd2 >= v2.rows {
+		nd2 = v2.rows
+		isdefault2 = false
+	}
+	if innerRows > 0 && nd2 >= innerRows {
+		nd2 = innerRows
+		isdefault2 = false
+	}
+	nullfrac1 := 0.0
+	if v1.stats != nil {
+		nullfrac1 = v1.stats.NullFrac
+	}
+	sel := eqjoinselSemiCore(v1.stats, v2.stats, nd1, nd2, !isdefault1, !isdefault2, nullfrac1)
+	// The nd arms are a guess when EITHER nd was (upstream's
+	// `!isdefault1 && !isdefault2` gate picks the 0.5 branch otherwise); the
+	// MCV arm is a measurement whatever the nds were, because the matched
+	// frequency mass is measured.
+	haveMCVs := v1.stats != nil && v2.stats != nil && len(v1.stats.MCV) > 0 && len(v2.stats.MCV) > 0
+	return clampSelectivity(sel), !haveMCVs && (isdefault1 || isdefault2)
 }
 
 // clampSelectivity holds a selectivity inside [0, 1] and maps NaN to the
@@ -457,14 +609,21 @@ func (s *searchCtx) mergeJoinTuples(joinrelRows float64, residual []*restrictInf
 	return tuples
 }
 
-// estimateHashBucketSize is `estimate_hash_bucket_stats` (selfuncs.c) reduced to
-// the fraction it exists to produce: what share of the inner relation lands in
-// the bucket an average outer probe walks. take2 P2-11.
+// estimateHashBucketSize is `estimate_hash_bucket_stats` (selfuncs.c:4060)
+// reduced to the fraction it exists to produce: what share of the inner
+// relation lands in the bucket an average outer probe walks. take2 P2-11.
 //
-// PG's full function also returns the inner key's MCV frequency and folds it in;
-// goopg returns the ndistinct-derived fraction only, and that limit is recorded
-// rather than hidden — the MCV half needs the inner key's MCV list at the cost
-// site, which is a second plumbing step.
+// B-16 (P2-11b) landed the MCV half: the 1/ndistinct fraction is scaled up by
+// the most-common-value frequency over the average frequency, clamped to
+// [1e-6, 1], and a default-ndistinct key reports Max(0.1, mcv_freq) instead of
+// being skipped.
+//
+// SCOPE: the 1/nbuckets arm is OUT. PG starts from 1/nbuckets when ndistinct
+// exceeds the executor's bucket count and only then falls to 1/ndistinct;
+// nbuckets is a build-geometry input that would have to be widened through
+// `addHashJoinPath`'s signature to reach this site. Without it a
+// highly-distinct key prices CHEAPER than upstream (1/nd < 1/nbuckets when
+// nd > nbuckets).
 //
 // The point of the term is the one thing goopg's hash cost could not see: a
 // hash join keyed on a LOW-ndistinct column has long buckets, so every probe
@@ -498,13 +657,51 @@ func (s *searchCtx) estimateHashBucketSize(clauses []*restrictInfo, innerRelids 
 		if v.stats == nil && !v.isBool {
 			continue
 		}
+		// `mcv_freq`: the first MCV entry is the most common value
+		// (ColumnStats.MCV is stored Frequency-desc, catalog.go:1809).
+		mcvFreq := 0.0
+		if v.stats != nil && len(v.stats.MCV) > 0 {
+			mcvFreq = v.stats.MCV[0].Frequency
+		}
 		nd, isDefault := getVariableNumDistinct(v)
 		if isDefault || nd <= 0 {
-			// A guessed ndistinct is exactly the input that must not steer a
-			// cost term; PG's own caller checks `isdefault` for the same reason.
+			// PG's isdefault arm: Max(0.1, mcv_freq). An explicit decision,
+			// not an oversight: the old code SKIPPED a default-ndistinct
+			// clause so a guess could never steer the cost, but upstream
+			// deliberately steers here — 0.1 discourages hashing a large
+			// unknown inner, while a known-hot MCV steers harder. As one
+			// smallest-wins candidate it can only lose to a measured
+			// selective key; an all-default key set reports PG's 0.1
+			// instead of "no information".
+			frac := math.Max(0.1, mcvFreq)
+			if best == 0 || frac < best {
+				best = frac
+			}
 			continue
 		}
+		nullFrac := 0.0
+		if v.stats != nil {
+			nullFrac = v.stats.NullFrac
+		}
+		// `avgfreq` is over the RAW relation (unscaled ndistinct) — PG
+		// computes it before the restriction-clause adjustment below.
+		avgFreq := (1.0 - nullFrac) / nd
+		// Restriction clauses are assumed to thin rows uniformly: scale the
+		// distinct count by filtered/raw. Skipped when either count is
+		// unknown (a zero `rows` is a hand-built context without filter
+		// info, not a truly empty relation).
+		if v.rows > 0 && v.tuples > 0 {
+			nd = clampRowEst(nd * v.rows / v.tuples)
+		}
 		frac := 1.0 / nd
+		if avgFreq > 0 && mcvFreq > avgFreq {
+			frac *= mcvFreq / avgFreq
+		}
+		if frac < 1e-6 {
+			frac = 1e-6
+		} else if frac > 1 {
+			frac = 1
+		}
 		if best == 0 || frac < best {
 			best = frac
 		}
@@ -530,6 +727,22 @@ func (s *searchCtx) estimateHashBucketSize(clauses []*restrictInfo, innerRelids 
 // Returns (1, 1) — charge everything, i.e. today's behaviour — whenever either
 // side's range cannot be established. That is the safe direction: this term can
 // only ever REDUCE a merge join's cost, so an unknown must not.
+//
+// P6-08 (take3 08 §9): the two end selectivities are memoised on the clause,
+// which is upstream's own arrangement — `mergejoinscansel`'s callers go through
+// `cached_scansel` (costsize.c:3798), whose `MergeScanSelCache` list hangs off
+// the `RestrictInfo`. The reason is the same in both planners: the estimate is
+// re-asked once per merge path considered, the histogram walk behind it is the
+// single most expensive thing in the join search on a statistics-bearing
+// catalog (measured: `histCmp` 43.7% of planning CPU over TPC-H before this
+// cache), and its answer moves with none of what varies between those calls.
+//
+// The memo is stored in the clause's OWN left/right orientation and rotated at
+// return, so both directions of a commuted join share one computation. That is
+// sound because the underlying question is symmetric: the pair
+// (fraction of left at or below right's max, fraction of right at or below
+// left's max) is a property of the clause, and which member is the "outer" end
+// is decided entirely by `outerRelids` here at the return.
 func (s *searchCtx) mergeJoinScanSel(clauses []*restrictInfo, outerRelids RelSet) (outerEnd, innerEnd float64) {
 	if len(clauses) == 0 {
 		return 1, 1
@@ -540,28 +753,43 @@ func (s *searchCtx) mergeJoinScanSel(clauses []*restrictInfo, outerRelids RelSet
 	if ri == nil || ri.leftKey == nil || ri.rightKey == nil {
 		return 1, 1
 	}
-	outerKey, outerRels := ri.leftKey, ri.leftRelids
-	innerKey, innerRels := ri.rightKey, ri.rightRelids
-	if !relsSubset(outerRels, outerRelids) {
-		outerKey, outerRels, innerKey, innerRels = innerKey, innerRels, outerKey, outerRels
-	}
-	if !relsSubset(outerRels, outerRelids) {
+	// Which operand is on the outer side of THIS join. The left operand wins
+	// when it qualifies, exactly as the pre-cache swap did.
+	leftIsOuter := relsSubset(ri.leftRelids, outerRelids)
+	if !leftIsOuter && !relsSubset(ri.rightRelids, outerRelids) {
 		return 1, 1
 	}
-
-	ov := s.examineJoinVar(outerKey, outerRels)
-	iv := s.examineJoinVar(innerKey, innerRels)
-	oMax, oOK := histogramMax(ov.stats)
-	iMax, iOK := histogramMax(iv.stats)
-	if !oOK || !iOK {
-		return 1, 1
+	leftEnd, rightEnd := s.mergeScanSelForClause(ri)
+	if leftIsOuter {
+		return leftEnd, rightEnd
 	}
+	return rightEnd, leftEnd
+}
 
-	// The outer is scanned until it passes the INNER's maximum, and vice
-	// versa: `leftend = scalarineqsel(left <= right_max)`.
-	outerEnd = fractionAtMost(ov.stats, iMax, ov.typeName)
-	innerEnd = fractionAtMost(iv.stats, oMax, iv.typeName)
-	return clampSelectivity(outerEnd), clampSelectivity(innerEnd)
+// mergeScanSelForClause is `mergeJoinScanSel`'s body in the clause's own
+// orientation: (fraction of the LEFT operand at or below the right operand's
+// maximum, fraction of the RIGHT operand at or below the left's). Memoised on
+// the `restrictInfo` — PG's `MergeScanSelCache` — under the cache contract
+// documented on that struct.
+func (s *searchCtx) mergeScanSelForClause(ri *restrictInfo) (leftEnd, rightEnd float64) {
+	if ri.scanSelValid {
+		return ri.scanSelLeftEnd, ri.scanSelRightEnd
+	}
+	leftEnd, rightEnd = 1, 1
+	lv := s.examineJoinVar(ri.leftKey, ri.leftRelids)
+	rv := s.examineJoinVar(ri.rightKey, ri.rightRelids)
+	lMax, lOK := histogramMax(lv.stats)
+	rMax, rOK := histogramMax(rv.stats)
+	if lOK && rOK {
+		// The outer is scanned until it passes the INNER's maximum, and vice
+		// versa: `leftend = scalarineqsel(left <= right_max)`.
+		leftEnd = clampSelectivity(fractionAtMost(lv.stats, rMax, lv.typeName))
+		rightEnd = clampSelectivity(fractionAtMost(rv.stats, lMax, rv.typeName))
+	}
+	if s != nil {
+		ri.scanSelLeftEnd, ri.scanSelRightEnd, ri.scanSelValid = leftEnd, rightEnd, true
+	}
+	return leftEnd, rightEnd
 }
 
 // histogramMax is `get_variable_range`'s upper bound: the last histogram

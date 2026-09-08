@@ -28,6 +28,7 @@ Project Summary
   Average Cognitive             14.2
   Maintainability Index           43
   Duplicate Code               28.6%
+  Duplicate Windows          11,834
 ```
 
 ## Install
@@ -70,13 +71,14 @@ Each run creates a fresh, timestamped output directory:
 
 ```
 tools/gocomplexity/reports/report_YYYYmmdd_HHMMSS/
-    report.html        # self-contained HTML: stats + inline histogram + rankings
+    report.html        # self-contained HTML: stats + inline histograms + rankings
     summary.json       # full machine-readable summary
     functions.csv      # every function with its metrics
     packages.csv       # per-package roll-up
     directories.csv    # per-directory roll-up
     files.csv          # per-file roll-up
     histogram.svg      # cyclomatic complexity distribution
+    duplication.svg    # duplicate-window multiplicity distribution
 ```
 
 ## CLI reference
@@ -144,6 +146,11 @@ Source-level (via the built-in scanner, `sourcemetrics.py`):
   normalizing literals (numbers → `0`, strings → `"s"`); any window whose
   signature appears at two or more distinct locations marks its lines as
   duplicated. Catches type-1 clones plus literal-normalized (type-2-lite) ones.
+- **Duplicate Windows** — the number of distinct duplicated window signatures
+  (a window whose signature appears at two or more locations). The report also
+  plots a histogram of each window's multiplicity — how many copies of it were
+  found — so a cluster of 2-copy clones is distinguishable from a few blocks
+  pasted 10+ times.
 
 > The scanner is intentionally approximate — a hand-written lexer, not a full Go
 > AST. It is accurate for line classification and token counting but does not,

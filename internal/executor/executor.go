@@ -19,7 +19,7 @@ import (
 // rows/loops/timing counters. nil-scope (the default) returns
 // raw operators byte-for-byte unchanged.
 func Build(plan optimizer.Node) (Operator, error) {
-	return buildNode(plan)
+	return buildNode(plan, deformBoundNone)
 }
 
 // BuildWorker is the per-worker entry point for Gather/GatherMerge
@@ -30,10 +30,10 @@ func Build(plan optimizer.Node) (Operator, error) {
 // build. The entry point stays because gatherOp/gatherMergeOp and
 // join_worker_path_test.go name it as the worker seam.
 func BuildWorker(plan optimizer.Node) (Operator, error) {
-	return buildNode(plan)
+	return buildNode(plan, deformBoundNone)
 }
 
-func buildNode(plan optimizer.Node) (Operator, error) {
+func buildNode(plan optimizer.Node, bound int) (Operator, error) {
 	switch p := plan.(type) {
 	case *optimizer.Values:
 		return maybeInstrument(p, newValuesOp(p)), nil
@@ -46,7 +46,7 @@ func buildNode(plan optimizer.Node) (Operator, error) {
 	case *optimizer.FromUnnest:
 		return maybeInstrument(p, newFromUnnestOp(p)), nil
 	case *optimizer.OrdinalityWrap:
-		child, err := Build(p.Child)
+		child, err := buildNode(p.Child, deformBoundFull)
 		if err != nil {
 			return nil, err
 		}
@@ -54,7 +54,7 @@ func buildNode(plan optimizer.Node) (Operator, error) {
 	case *optimizer.RowsFrom:
 		children := make([]Operator, len(p.Funcs))
 		for i, f := range p.Funcs {
-			c, err := Build(f)
+			c, err := buildNode(f, deformBoundFull)
 			if err != nil {
 				return nil, err
 			}
@@ -78,7 +78,7 @@ func buildNode(plan optimizer.Node) (Operator, error) {
 	case *optimizer.VerifyHeapam:
 		return maybeInstrument(p, newVerifyHeapamOp(p)), nil
 	case *optimizer.ProjectSet:
-		child, err := Build(p.Child)
+		child, err := buildNode(p.Child, deformBoundFull)
 		if err != nil {
 			return nil, err
 		}
@@ -109,7 +109,7 @@ func buildNode(plan optimizer.Node) (Operator, error) {
 	case *optimizer.MaterializedCTEScan:
 		return maybeInstrument(p, newMaterializedCTEScanOp(p)), nil
 	case *optimizer.Project:
-		child, err := Build(p.Child)
+		child, err := buildNode(p.Child, deformBoundBelow(p, bound))
 		if err != nil {
 			return nil, err
 		}
@@ -119,7 +119,7 @@ func buildNode(plan optimizer.Node) (Operator, error) {
 		// — no borrow contract needed.
 		return maybeInstrument(p, newProjectOp(p, child)), nil
 	case *optimizer.Filter:
-		child, err := Build(p.Child)
+		child, err := buildNode(p.Child, deformBoundBelow(p, bound))
 		if err != nil {
 			return nil, err
 		}
@@ -132,27 +132,43 @@ func buildNode(plan optimizer.Node) (Operator, error) {
 			if so := unwrapSeqScanOp(child); so != nil {
 				so.ssiGistPred = p.Predicate
 				so.ssiGinPred = p.Predicate
-				// Same predicate, second use: let the scan reject tuples
-				// before deforming and deep-copying them. Pure
-				// pre-rejection — filterOp still evaluates it on the
-				// survivors — and armed only for expressions
-				// planScanPrefilter proves safe to evaluate twice.
-				// See scan_prefilter.go.
+				// E-17 / EX3-08 cut 2: ABSORB the qual into the scan and
+				// return the scan itself — no filterOp above it. PG's shape
+				// (Scan.plan.qual run once by ExecScanExtended,
+				// execScan.h:223); the predicate is now evaluated exactly
+				// once per row instead of twice. The scan evaluates it EARLY
+				// on the deformed prefix when PlanScanQual allows, otherwise
+				// LATE on the finished row — the position filterOp occupied.
+				// See scan_prefilter.go and
+				// docs/design/executor-ex3-08-scan-resident-qual/DESIGN.md.
+				//
+				// The *optimizer.Filter PLAN node is untouched: all three
+				// EXPLAIN renderers collapse it into the scan's `Filter:`
+				// line and key on the plan node, never on the operator, and
+				// the post-qual row estimate lives on it. Deleting the
+				// OPERATOR therefore leaves plain EXPLAIN byte-identical.
+				so.qual, so.qualSet = p.Predicate, true
 				if pf, pok := planScanPrefilter(p.Predicate, len(so.cols)); pok {
 					so.prefilter, so.prefilterSet = pf, true
 				}
+				// The rejection counter needs no wiring here: the SeqScan
+				// arm's own maybeInstrument already probed the raw seqScanOp
+				// for filterRemoveCounter and handed it
+				// &stats[scanNode].filterRejected. That is the node the
+				// count belongs on — PG keeps nfiltered1 on the scan
+				// (execScan.h:245) and the JSON renderer already reads it
+				// there. Calling maybeInstrument(p, child) instead would
+				// wire NOTHING (child is an *instrumentedOp, which has no
+				// setFilterRemoveCounter forwarder) and double-wrap the scan.
+				return child, nil
 			}
 		}
-		// M0054-0005a-followup: filterOp is a pure pass-through
-		// — it returns its child's row unchanged. So filter's
-		// own borrow contract must MATCH its child's. We leave
-		// the child at the default OwnedRow at Build time;
-		// filterOp.SetBorrow propagates to the child only when
-		// the eventual parent (project, output sink) flips the
-		// filter itself to BorrowedRow.
+		// filterOp is a pure pass-through — it returns its child's row
+		// unchanged — so its borrow contract matches its child's, and the
+		// child is left at the default OwnedRow at Build time.
 		return maybeInstrument(p, newFilterOp(p, child)), nil
 	case *optimizer.Limit:
-		child, err := Build(p.Child)
+		child, err := buildNode(p.Child, deformBoundBelow(p, bound))
 		if err != nil {
 			return nil, err
 		}
@@ -161,23 +177,36 @@ func buildNode(plan optimizer.Node) (Operator, error) {
 		// parent via SetBorrow.
 		return maybeInstrument(p, newLimitOp(p, child)), nil
 	case *optimizer.Sort:
-		child, err := Build(p.Child)
+		child, err := buildNode(p.Child, deformBoundBelow(p, bound))
 		if err != nil {
 			return nil, err
 		}
 		return maybeInstrument(p, newSortOp(p, child)), nil
 	case *optimizer.Join:
-		left, err := Build(p.Left)
+		// EX1-02: per-side bounds from the merged-space remap
+		// (deformJoinBounds): above-join refs mapped through the output
+		// layout unioned with the remapped keys/residual.
+		leftBound, rightBound := deformJoinBounds(p, bound)
+		left, err := buildNode(p.Left, leftBound)
 		if err != nil {
 			return nil, err
 		}
-		right, err := Build(p.Right)
+		right, err := buildNode(p.Right, rightBound)
 		if err != nil {
 			return nil, err
 		}
-		return maybeInstrument(p, newJoinOp(p, left, right)), nil
+		jop := newJoinOp(p, left, right)
+		// Record the bounds the children were actually built with. The
+		// cooperative parallel hash build rebuilds the build-side subtree
+		// from the plan and must use the SAME bound; deriving it there is
+		// impossible (it depends on `bound`, i.e. on everything above this
+		// join). See joinOp.deformLeftBound.
+		jop.deformLeftBound, jop.deformRightBound = leftBound, rightBound
+		return maybeInstrument(p, jop), nil
 	case *optimizer.NestedLoopIndexJoin:
-		outer, err := Build(p.Outer)
+		// EX1-02: the outer follows the left-side rule; inner rescans
+		// stay out (EX1-02b).
+		outer, err := buildNode(p.Outer, deformNLIOuterBound(p, bound))
 		if err != nil {
 			return nil, err
 		}
@@ -186,13 +215,46 @@ func buildNode(plan optimizer.Node) (Operator, error) {
 		// optimizer; both operators satisfy `nliInner`, which is what lets
 		// the join driver stay ignorant of which one it got.
 		var innerScan nliInner
+		// EX1-02b: the inner probe's consumer set is plan-static (the join
+		// Predicate's inner-side refs plus the probe-local Cond, plus the
+		// parent refs mapped to inner-output space), so the bound threads
+		// once at build into the probe's deformBound field and Rescan does
+		// no per-call work. The Predicate evaluates per joined pair against
+		// the merged (outer++inner) row, so its refs split by the exprSide
+		// cutoff exactly like the outer half of the frozen left-side rule
+		// (index-space split, never face-value). Key probe exprs are never
+		// folded — they index outer space on an inner. The Memoize wrap
+		// below preserves the stamped child untouched.
+		outerW := deformSideWidth(p.Outer)
 		switch in := p.Inner.(type) {
 		case *optimizer.IndexScan:
-			innerScan = newIndexScanOp(in)
+			iop := newIndexScanOp(in)
+			innerW := deformNLIInnerWidth(in)
+			_, innerPred := deformSplitPredicate(p.Predicate, outerW, innerW)
+			innerAbove := deformUnionBound(deformNLIMappedInner(bound, outerW, innerW), innerPred)
+			innerNcols := 0
+			if in.Table != nil {
+				innerNcols = len(in.Table.Columns)
+			}
+			iop.deformBound = effectiveDeformBound(deformIndexLeafBound(
+				innerAbove, in.Cond, in.Index, in.Table), innerNcols)
+			innerScan = iop
 		case *optimizer.IndexOnlyScan:
+			// No plan walk: the consumer is the Covered list (local fixes
+			// in operators_indexonly.go).
 			innerScan = newIndexOnlyScanOp(in)
 		case *optimizer.BitmapHeapScan:
-			innerScan = newBitmapHeapScanOp(in)
+			bop := newBitmapHeapScanOp(in)
+			innerW := deformNLIInnerWidth(in)
+			_, innerPred := deformSplitPredicate(p.Predicate, outerW, innerW)
+			innerAbove := deformUnionBound(deformNLIMappedInner(bound, outerW, innerW), innerPred)
+			bitmapNcols := 0
+			if in.Table != nil {
+				bitmapNcols = len(in.Table.Columns)
+			}
+			bop.deformBound = effectiveDeformBound(deformBitmapLeafBound(
+				innerAbove, in.BitmapQual, in.Cond), bitmapNcols)
+			innerScan = bop
 		default:
 			return nil, &ExecError{Code: "XX000", Pos: p.Pos(),
 				Message: fmt.Sprintf("NestedLoopIndexJoin inner is a %T, which is not a re-probeable scan", p.Inner)}
@@ -211,7 +273,7 @@ func buildNode(plan optimizer.Node) (Operator, error) {
 		// needed at this boundary.
 		return maybeInstrument(p, newNestedLoopIndexJoinOp(p, outer, innerScan)), nil
 	case *optimizer.Aggregate:
-		child, err := Build(p.Child)
+		child, err := buildNode(p.Child, deformBoundBelow(p, bound))
 		if err != nil {
 			return nil, err
 		}
@@ -222,22 +284,41 @@ func buildNode(plan optimizer.Node) (Operator, error) {
 		// read, no borrow contract needed.
 		return maybeInstrument(p, newAggregateOp(p, child)), nil
 	case *optimizer.WindowAgg:
-		child, err := Build(p.Child)
+		child, err := buildNode(p.Child, deformBoundFull)
 		if err != nil {
 			return nil, err
 		}
 		return maybeInstrument(p, newWindowOp(p, child)), nil
 	case *optimizer.SeqScan:
-		return maybeInstrument(p, newSeqScanOp(p)), nil
+		// EX1-01: stamp the threaded bound. effectiveDeformBound maps
+		// None/Full to full width; a narrow bound narrows the survivor
+		// deform in Next. Unset (0) also means full (safe default for
+		// directly-constructed scans that bypass both Build paths).
+		op := newSeqScanOp(p)
+		op.deformBound = effectiveDeformBound(bound, len(op.cols))
+		return maybeInstrument(p, op), nil
 	case *optimizer.IndexScan:
-		return maybeInstrument(p, newIndexScanOp(p)), nil
+		// EX1-02b: stamp the threaded bound — union of the parent walk and
+		// the leaf-local Cond refs, belt-and-braces widened with the index
+		// key columns. Key probe exprs are never folded at face value (on
+		// an NLI inner they index outer space). Unset (0) stays full for
+		// directly-constructed scans. The buildRec slab twin reaches this
+		// arm through its default branch with the bound forwarded, so both
+		// Build paths thread it.
+		indexOp := newIndexScanOp(p)
+		indexNcols := 0
+		if p.Table != nil {
+			indexNcols = len(p.Table.Columns)
+		}
+		indexOp.deformBound = effectiveDeformBound(deformIndexLeafBound(bound, p.Cond, p.Index, p.Table), indexNcols)
+		return maybeInstrument(p, indexOp), nil
 	case *optimizer.IndexOnlyScan:
 		return maybeInstrument(p, newIndexOnlyScanOp(p)), nil
 	case *optimizer.Result:
 		if p.Child != nil {
 			// Result-with-child (S6 Slice 3d const-arg rewrite): build the inner
 			// scan so the One-Time Filter can stream projected rows through it.
-			child, err := Build(p.Child)
+			child, err := buildNode(p.Child, deformBoundBelow(p, bound))
 			if err != nil {
 				return nil, err
 			}
@@ -247,13 +328,13 @@ func buildNode(plan optimizer.Node) (Operator, error) {
 		// Targets once and emits exactly one row. No child to Build.
 		return maybeInstrument(p, newResultOp(p, nil)), nil
 	case *optimizer.LockRows:
-		child, err := Build(p.Child)
+		child, err := buildNode(p.Child, deformBoundBelow(p, bound))
 		if err != nil {
 			return nil, err
 		}
 		return maybeInstrument(p, newLockRowsOp(p, child)), nil
 	case *optimizer.Insert:
-		child, err := Build(p.Source)
+		child, err := buildNode(p.Source, deformBoundFull)
 		if err != nil {
 			return nil, err
 		}
@@ -270,44 +351,52 @@ func buildNode(plan optimizer.Node) (Operator, error) {
 		// Deliberately NOT migrated to the slab path: buildRec's default arm
 		// wraps this in an OpAdapter, so the live BuildFastIterator path
 		// reaches it with no slab changes and no shared per-node state.
+		//
+		// EX1-01: the bound is captured into the worker buildChild closure
+		// so every worker's private tree narrows the same leaves. A worker
+		// built through the public BuildWorker entry (no bound in scope)
+		// declines to full deform.
+		workerBound := deformBoundBelow(p, bound)
 		return maybeInstrument(p, newGatherOp(p, func() (Operator, error) {
-			return BuildWorker(p.Child)
+			return buildNode(p.Child, workerBound)
 		})), nil
 	case *optimizer.GatherMerge:
 		// Same per-worker construction as Gather; the difference is entirely in
-		// how the leader consumes the streams.
+		// how the leader consumes the streams. The GatherMerge keys (folded
+		// by deformBoundBelow) are leader-side consumers of the worker rows.
+		workerMergeBound := deformBoundBelow(p, bound)
 		return maybeInstrument(p, newGatherMergeOp(p, func() (Operator, error) {
-			return BuildWorker(p.Child)
+			return buildNode(p.Child, workerMergeBound)
 		})), nil
 	case *optimizer.Distinct:
-		child, err := Build(p.Child)
+		child, err := buildNode(p.Child, deformBoundBelow(p, bound))
 		if err != nil {
 			return nil, err
 		}
 		return maybeInstrument(p, newDistinctOp(p, child)), nil
 	case *optimizer.DistinctOn:
-		child, err := Build(p.Child)
+		child, err := buildNode(p.Child, deformBoundFull)
 		if err != nil {
 			return nil, err
 		}
 		return maybeInstrument(p, newDistinctOnOp(p, child)), nil
 	case *optimizer.SetOp:
-		left, err := Build(p.Left)
+		left, err := buildNode(p.Left, deformBoundFull)
 		if err != nil {
 			return nil, err
 		}
-		right, err := Build(p.Right)
+		right, err := buildNode(p.Right, deformBoundFull)
 		if err != nil {
 			left.Close()
 			return nil, err
 		}
 		return maybeInstrument(p, newSetOp(p, left, right)), nil
 	case *optimizer.RecursiveUnion:
-		anchor, err := Build(p.Anchor)
+		anchor, err := buildNode(p.Anchor, deformBoundFull)
 		if err != nil {
 			return nil, err
 		}
-		recursive, err := Build(p.Recursive)
+		recursive, err := buildNode(p.Recursive, deformBoundFull)
 		if err != nil {
 			anchor.Close()
 			return nil, err
@@ -388,7 +477,18 @@ func buildNode(plan optimizer.Node) (Operator, error) {
 	case *optimizer.BitmapIndexScan:
 		return maybeInstrument(p, newBitmapIndexScanOp(p)), nil
 	case *optimizer.BitmapHeapScan:
-		return maybeInstrument(p, newBitmapHeapScanOp(p)), nil
+		// EX1-02b: stamp the threaded bound — BitmapQual recheck refs and
+		// Cond refs folded first, then unioned with the parent walk; either
+		// declining re-widens the whole bound. Inner bitmap builds (the
+		// BitmapIndexScan/And/Or subtrees) stay bound-free: they build TID
+		// sets, not rows. Reached from both Build paths like IndexScan.
+		bitmapOp := newBitmapHeapScanOp(p)
+		bitmapNcols := 0
+		if p.Table != nil {
+			bitmapNcols = len(p.Table.Columns)
+		}
+		bitmapOp.deformBound = effectiveDeformBound(deformBitmapLeafBound(bound, p.BitmapQual, p.Cond), bitmapNcols)
+		return maybeInstrument(p, bitmapOp), nil
 	case *optimizer.BitmapAnd:
 		return maybeInstrument(p, newBitmapAndOp(p)), nil
 	case *optimizer.BitmapOr:
@@ -482,14 +582,18 @@ func unwrapSeqScanOp(op Operator) *seqScanOp {
 	return nil
 }
 
-// buildRec is the recursive tree builder for BuildFast.
-func (tree *opTreeSlab) buildRec(plan optimizer.Node) (int32, error) {
+// buildRec is the recursive tree builder for BuildFast. It threads the
+// EX1-01 deform bound exactly like buildNode; see scan_deform.go.
+func (tree *opTreeSlab) buildRec(plan optimizer.Node, bound int) (int32, error) {
 	switch p := plan.(type) {
 	case *optimizer.SeqScan:
-		return tree.add(OpNode{Kind: OpSeqScan, childA: noChild, childB: noChild, state: newSeqScanOp(p)}), nil
+		// Same stamping as the buildNode SeqScan arm.
+		op := newSeqScanOp(p)
+		op.deformBound = effectiveDeformBound(bound, len(op.cols))
+		return tree.add(OpNode{Kind: OpSeqScan, childA: noChild, childB: noChild, state: op}), nil
 
 	case *optimizer.Filter:
-		childIdx, err := tree.buildRec(p.Child)
+		childIdx, err := tree.buildRec(p.Child, deformBoundBelow(p, bound))
 		if err != nil {
 			return noChild, err
 		}
@@ -502,25 +606,32 @@ func (tree *opTreeSlab) buildRec(plan optimizer.Node) (int32, error) {
 			if so, ok2 := tree.ops[childIdx].state.(*seqScanOp); ok2 {
 				so.ssiGistPred = p.Predicate
 				so.ssiGinPred = p.Predicate
-				// Same predicate, second use: let the scan reject tuples
-				// before deforming and deep-copying them. Pure
-				// pre-rejection — filterOp still evaluates it on the
-				// survivors — and armed only for expressions
-				// planScanPrefilter proves safe to evaluate twice.
-				// See scan_prefilter.go.
+				// E-17 / EX3-08 cut 2, SIBLING of the buildNode arm: absorb
+				// the qual and return the scan's node index, emitting no
+				// OpFilter. This is the LIVE server path (BuildFastIterator)
+				// and the one parallel workers build through, so a fix in
+				// buildNode alone would leave every worker evaluating the
+				// predicate twice — this codebase's documented sibling-path
+				// failure mode.
+				//
+				// No instrumentation counter is wired here: buildRec never
+				// calls maybeInstrument, so its nodes carry no nodeStats at
+				// all (the old OpFilter path counted nothing either).
+				so.qual, so.qualSet = p.Predicate, true
 				if pf, pok := planScanPrefilter(p.Predicate, len(so.cols)); pok {
 					so.prefilter, so.prefilterSet = pf, true
 				}
+				return childIdx, nil
 			}
 		}
 		// Phase C.3: predicate compiled into exprTreeSlab; filterState holds
 		// only the predIdx — no GC-traced planner.Expr reference needed.
 		predIdx := tree.exprs.buildExpr(p.Predicate)
 		return tree.add(OpNode{Kind: OpFilter, childA: childIdx, childB: noChild,
-			state: &filterState{predIdx: predIdx}}), nil
+			state: &filterState{predIdx: predIdx, needsCTID: exprTreeUsesCTID(p.Predicate)}}), nil
 
 	case *optimizer.Project:
-		childIdx, err := tree.buildRec(p.Child)
+		childIdx, err := tree.buildRec(p.Child, deformBoundBelow(p, bound))
 		if err != nil {
 			return noChild, err
 		}
@@ -534,10 +645,10 @@ func (tree *opTreeSlab) buildRec(plan optimizer.Node) (int32, error) {
 		schemaIdx := int32(len(tree.schemas))
 		tree.schemas = append(tree.schemas, p.Output())
 		return tree.add(OpNode{Kind: OpProject, childA: childIdx, childB: noChild,
-			state: &projectState{schemaIdx: schemaIdx, targExprs: targExprs}}), nil
+			state: &projectState{schemaIdx: schemaIdx, targExprs: targExprs, needsCTID: exprTreeUsesCTID(p.Targets...)}}), nil
 
 	case *optimizer.Limit:
-		childIdx, err := tree.buildRec(p.Child)
+		childIdx, err := tree.buildRec(p.Child, deformBoundBelow(p, bound))
 		if err != nil {
 			return noChild, err
 		}
@@ -562,7 +673,7 @@ func (tree *opTreeSlab) buildRec(plan optimizer.Node) (int32, error) {
 			}}), nil
 
 	case *optimizer.Sort:
-		childIdx, err := tree.buildRec(p.Child)
+		childIdx, err := tree.buildRec(p.Child, deformBoundBelow(p, bound))
 		if err != nil {
 			return noChild, err
 		}
@@ -589,7 +700,7 @@ func (tree *opTreeSlab) buildRec(plan optimizer.Node) (int32, error) {
 		return tree.add(OpNode{Kind: OpDelete, childA: noChild, childB: noChild, state: &deleteOpState{op: op}}), nil
 
 	case *optimizer.Insert:
-		childIdx, err := tree.buildRec(p.Source)
+		childIdx, err := tree.buildRec(p.Source, deformBoundFull)
 		if err != nil {
 			return noChild, err
 		}
@@ -602,24 +713,32 @@ func (tree *opTreeSlab) buildRec(plan optimizer.Node) (int32, error) {
 		return tree.add(OpNode{Kind: OpInsert, childA: noChild, childB: noChild, state: &insertOpState{op: newInsertOp(p, childOp)}}), nil
 
 	case *optimizer.Join:
-		leftIdx, err := tree.buildRec(p.Left)
+		// Same per-side remap as the buildNode Join arm.
+		leftBound, rightBound := deformJoinBounds(p, bound)
+		leftIdx, err := tree.buildRec(p.Left, leftBound)
 		if err != nil {
 			return noChild, err
 		}
-		rightIdx, err := tree.buildRec(p.Right)
+		rightIdx, err := tree.buildRec(p.Right, rightBound)
 		if err != nil {
 			return noChild, err
 		}
 		leftOp := &opNodeOperator{tree: tree, idx: leftIdx, schema: p.Left.Output()}
 		rightOp := &opNodeOperator{tree: tree, idx: rightIdx, schema: p.Right.Output()}
 		op := newJoinOp(p, leftOp, rightOp)
+		// Same stamping as the buildNode Join arm — see joinOp.deformLeftBound.
+		op.deformLeftBound, op.deformRightBound = leftBound, rightBound
 		return tree.add(OpNode{Kind: OpJoin, childA: noChild, childB: noChild, state: &joinOpState{op: op, schema: p.Output()}}), nil
 
 	default:
 		// For non-migrated operators, build the legacy Operator tree
 		// and wrap in an adapter. This path preserves the existing
 		// operator semantics exactly — Open/Next/Close are forwarded.
-		legacyOp, err := Build(plan)
+		// The incoming bound threads through (not a fresh root Build)
+		// so ancestors folded above the adapter boundary still cover
+		// the leaves inside; reshape boundaries below drop it again by
+		// the same rules.
+		legacyOp, err := buildNode(plan, bound)
 		if err != nil {
 			return noChild, err
 		}
@@ -637,7 +756,7 @@ func BuildFast(plan optimizer.Node) (*opTreeSlab, int32, error) {
 		plans:   make(planTreeSlab, 0, 8),
 		schemas: make([]optimizer.Schema, 0, 4),
 	}
-	rootIdx, err := tree.buildRec(plan)
+	rootIdx, err := tree.buildRec(plan, deformBoundNone)
 	if err != nil {
 		return nil, noChild, err
 	}

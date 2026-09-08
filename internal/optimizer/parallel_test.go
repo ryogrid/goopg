@@ -29,7 +29,9 @@ func parallelTestSettingsBlocks(blocks int64) ParallelSettings {
 		MaxWorkersPerGather: 2,
 		MinTableScanBlocks:  1024,
 		DebugParallelQuery:  "off",
-		BlocksForTable:      func(*catalog.Table) (int64, bool) { return blocks, true },
+		// DisableGatherMerge defaults false (merge arm kept); B-17c flips it
+		// per test rather than here.
+		BlocksForTable: func(*catalog.Table) (int64, bool) { return blocks, true },
 	}
 }
 
@@ -446,4 +448,37 @@ func planHasGather(n Node) bool {
 		}
 	}
 	return false
+}
+
+// TestPostPassOwnsTheNonAggregateGather is C-19h's blocker, pinned as a test
+// so the next retirement attempt fails HERE instead of in a benchmark that
+// cannot see it.
+//
+// Every one of the 22 TPC-H queries carries an aggregate at its top, and
+// C-19g's path producer (partialaggupper.go) is aggregate-only. So the
+// 22-query plan census the item is judged on is BLIND to this plan class: with
+// the post-pass's ADD half deleted all 22 captures stay byte-identical
+// (analysis/planner-refactor-take3/c19h-census-rerun-20260907 §1) while a
+// plain filtered scan silently loses its Gather (§2). Vanilla PG 18.3 emits
+// `Gather -> Parallel Seq Scan` for the same query, so the loss is a
+// PG-parity regression and not a cleanup.
+//
+// `GOOPG_GATHER_PATHS=all` does NOT discharge it — measured, §2 — because
+// cost_gather charges parallel_tuple_cost 0.1/row against a 4-worker saving of
+// roughly 0.0075/row and add_path correctly dominates every plain Gather
+// (C-19d DESIGN §5.1). The prerequisite is that crossover, not the flip.
+func TestPostPassOwnsTheNonAggregateGather(t *testing.T) {
+	tbl := bigTable(t, "lineitemish")
+	// A scan with a filter above it and NO aggregate anywhere: the shape the
+	// path model has no producer for at any setting.
+	root := &Project{
+		Child:  &Filter{Child: seqScanOver(tbl)},
+		schema: Schema{{Name: "a"}},
+	}
+	if !planHasGather(MaybeAddGather(root, parallelTestSettings())) {
+		t.Fatal("the post-pass is the only producer of a Gather over a " +
+			"non-aggregate scan; retiring it loses PG-parity parallelism " +
+			"that no TPC-H plan census can see " +
+			"(analysis/planner-refactor-take3/c19h-census-rerun-20260907)")
+	}
 }

@@ -14,7 +14,7 @@ import (
 // newStorageFixture spins up a per-test buffer pool + manager + mvcc
 // manager + catalog with one table seeded, ready to run heap-touching
 // operators against.
-func newStorageFixture(t *testing.T) (*Context, catalog.Catalog, func()) {
+func newStorageFixture(t testing.TB) (*Context, catalog.Catalog, func()) {
 	t.Helper()
 	dir := t.TempDir()
 	mgr := storage.NewManager(storage.ManagerConfig{DataDir: dir})
@@ -714,25 +714,25 @@ type execAIOHandle struct {
 
 func (h execAIOHandle) Wait() (int, error) { return h.n, h.err }
 
-// TestSeqScanFiresPrefetchesAcrossBlocks pins the M0009 caller
-// integration: with prefetching enabled, seqScan walks
-// `seqScanLookahead` blocks ahead of curBlock via Pool.Prefetch.
-// Constructs a fixture with a recording AIO engine, inserts
-// enough rows to span 5+ blocks, runs a SeqScan to completion,
-// and asserts the engine saw at least one Submit (and at most
-// nBlocks Submits — we never overshoot the relation).
-func TestSeqScanFiresPrefetchesAcrossBlocks(t *testing.T) {
+// TestSeqScanFiresNoSpeculativeReads is the regression guard for the
+// Pool.Prefetch removal (docs/design/storage-prefetch-buffer/DESIGN.md).
+// seqScan used to keep a `seqScanLookahead`-block hint window warm via
+// Pool.Prefetch, which allocated an 8 KiB buffer per hinted block and threw
+// it away — the read could never serve the following Pin, so its only effect
+// was warming the OS page cache, a job Linux readahead already does for this
+// strictly-sequential access pattern (upstream says so itself:
+// postgres/src/include/storage/read_stream.h:30-36, and heapam.c:1220 passes
+// READ_STREAM_SEQUENTIAL from the same kind of scan). The scan must now read
+// every block synchronously through Pin and NEVER touch the AIO engine, while
+// still returning every row. A non-zero submit count here means a speculative
+// read has been reintroduced.
+func TestSeqScanFiresNoSpeculativeReads(t *testing.T) {
 	ctx, cat, cleanup := newStorageFixture(t)
 	defer cleanup()
 	tbl, _ := cat.LookupTable(parser.ObjectName{Name: "items"})
-
-	// Attach a recording AIO engine to the fixture's Manager
-	// and opt the Pool into prefetching.
 	eng := &recordingExecAIOEngine{}
 	ctx.Pool.Manager().SetAIO(eng)
-	ctx.Pool.SetPrefetchEnabled(true)
 
-	// Stuff enough rows in to span several blocks.
 	const N = 600
 	rows := make([][]optimizer.Expr, N)
 	for i := range rows {
@@ -754,28 +754,11 @@ func TestSeqScanFiresPrefetchesAcrossBlocks(t *testing.T) {
 		t.Fatalf("Insert.Next: %v", err)
 	}
 	_ = op.Close()
-
 	rel := cat.RelFileNode(tbl)
-	nBlocks, err := ctx.Pool.NBlocks(rel)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if nBlocks < 2 {
-		t.Fatalf("test setup wrote only %d blocks; need ≥2 to exercise prefetch", nBlocks)
-	}
-
-	// Insert populated the buffer pool with every page. Flush
-	// to disk THEN drop them so the SeqScan's Pool.Prefetch
-	// hits the not-cached path (Pool.Prefetch silently no-ops
-	// on cached tags). InvalidateRel without a prior FlushAll
-	// would discard dirty pages, costing the inserted data.
 	if err := ctx.Pool.FlushAll(); err != nil {
 		t.Fatal(err)
 	}
 	ctx.Pool.InvalidateRel(rel)
-	// Reset the counter so we observe only the SeqScan's
-	// prefetches, not any Pin-driven background reads from the
-	// insert path.
 	eng.submits = 0
 	scan := newSeqScanOp(&optimizer.SeqScan{Table: tbl})
 	if err := scan.Open(ctx); err != nil {
@@ -789,13 +772,7 @@ func TestSeqScanFiresPrefetchesAcrossBlocks(t *testing.T) {
 	if len(scanned) != N {
 		t.Errorf("scanned %d rows, want %d", len(scanned), N)
 	}
-	// SeqScan should have fired at least one prefetch (the
-	// initial lookahead window) and at most nBlocks — the
-	// refill loop never overshoots NBlocks.
-	if eng.submits == 0 {
-		t.Errorf("seqScan fired 0 prefetches; expected at least 1")
-	}
-	if eng.submits > int(nBlocks) {
-		t.Errorf("seqScan fired %d prefetches, exceeds NBlocks=%d", eng.submits, nBlocks)
+	if eng.submits != 0 {
+		t.Errorf("seqScan fired %d speculative engine reads; want 0", eng.submits)
 	}
 }

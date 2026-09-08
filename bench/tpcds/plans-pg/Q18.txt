@@ -1,0 +1,37 @@
+Limit  (cost=25363.51..25363.74 rows=93 width=272)
+  ->  Sort  (cost=25363.51..25363.74 rows=93 width=272)
+        Sort Key: customer_address.ca_country, customer_address.ca_state, customer_address.ca_county, item.i_item_id
+        ->  GroupAggregate  (cost=25356.87..25360.47 rows=93 width=272)
+              Group Key: item.i_item_id, customer_address.ca_country, customer_address.ca_state, customer_address.ca_county
+              Group Key: item.i_item_id, customer_address.ca_country, customer_address.ca_state
+              Group Key: item.i_item_id, customer_address.ca_country
+              Group Key: item.i_item_id
+              Group Key: ()
+              ->  Sort  (cost=25356.87..25356.93 rows=23 width=81)
+                    Sort Key: item.i_item_id, customer_address.ca_country, customer_address.ca_state, customer_address.ca_county
+                    ->  Gather  (cost=2965.52..25356.35 rows=23 width=81)
+                          Workers Planned: 3
+                          ->  Nested Loop  (cost=1965.52..24354.05 rows=7 width=81)
+                                ->  Nested Loop  (cost=1965.24..24351.87 rows=7 width=68)
+                                      ->  Nested Loop  (cost=1964.81..24344.82 rows=8 width=72)
+                                            ->  Nested Loop  (cost=1964.38..24279.96 rows=108 width=72)
+                                                  ->  Nested Loop  (cost=1964.09..24044.99 rows=558 width=45)
+                                                        ->  Parallel Hash Join  (cost=1963.80..23658.77 rows=1153 width=37)
+                                                              Hash Cond: (catalog_sales.cs_sold_date_sk = date_dim.d_date_sk)
+                                                              ->  Parallel Seq Scan on catalog_sales  (cost=0.00..21084.70 rows=232470 width=41)
+                                                              ->  Parallel Hash  (cost=1961.12..1961.12 rows=214 width=4)
+                                                                    ->  Parallel Seq Scan on date_dim  (cost=0.00..1961.12 rows=214 width=4)
+                                                                          Filter: (d_year = 2001)
+                                                        ->  Index Scan using customer_pkey on customer  (cost=0.29..0.33 rows=1 width=16)
+                                                              Index Cond: (c_customer_sk = catalog_sales.cs_bill_customer_sk)
+                                                              Filter: (c_birth_month = ANY ('{1,3,7,11,10,4}'::integer[]))
+                                                  ->  Index Scan using customer_address_pkey on customer_address  (cost=0.29..0.42 rows=1 width=35)
+                                                        Index Cond: (ca_address_sk = customer.c_current_addr_sk)
+                                                        Filter: (ca_state = ANY ('{AL,MO,TN,GA,MT,IN,CA}'::bpchar[]))
+                                            ->  Index Scan using customer_demographics_pkey on customer_demographics cd1  (cost=0.43..0.60 rows=1 width=8)
+                                                  Index Cond: (cd_demo_sk = catalog_sales.cs_bill_cdemo_sk)
+                                                  Filter: ((cd_gender = 'F'::bpchar) AND (cd_education_status = 'Primary'::bpchar))
+                                      ->  Index Only Scan using customer_demographics_pkey on customer_demographics cd2  (cost=0.43..0.88 rows=1 width=4)
+                                            Index Cond: (cd_demo_sk = customer.c_current_cdemo_sk)
+                                ->  Index Scan using item_pkey on item  (cost=0.29..0.31 rows=1 width=21)
+                                      Index Cond: (i_item_sk = catalog_sales.cs_item_sk)

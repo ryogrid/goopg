@@ -5,14 +5,15 @@ import (
 	"sync/atomic"
 )
 
-// Presorted aggregates — S8 Slice 2a of M0134-0001. Port of PostgreSQL's
-// adjust_group_pathkeys_for_groupagg (postgres/src/backend/optimizer/plan/
-// planner.c:3229): when a grouped or non-grouped aggregate query has at least
-// one aggregate with an internal ORDER BY or DISTINCT clause, choose the set
-// of aggregate pathkeys that covers the most aggregates, wrap the Aggregate's
-// child in a Sort, and (for grouped queries) switch Strategy to
-// AggStrategySorted so EXPLAIN shows GroupAggregate instead of HashAggregate.
-// Gated on the enable_presorted_aggregate GUC (default on).
+// Presorted aggregate keys — S8 Slice 2a of M0134-0001, retired by C-15.
+// Port of PostgreSQL's adjust_group_pathkeys_for_groupagg
+// (postgres/src/backend/optimizer/plan/planner.c:3229): the greedy covering
+// key selection over internal ORDER BY / DISTINCT clauses now serves as the
+// GROUP_AGG producer's sorted candidate keys (groupingpaths.go
+// presortedAggKeysOrAbsent) instead of mutating the node. The mutating rule
+// is gone; the key-selection half, FILTER-safety, volatility list, and the
+// GUC seed below stay. Gated on the enable_presorted_aggregate GUC
+// (default on).
 
 // presortedAggEnabled is the package-level kill-switch for the presorted
 // aggregate rule. Initialised to "on" (1), mirroring PG's
@@ -37,141 +38,12 @@ func SetPresortedAggEnabled(on bool) {
 	presortedAggEnabled.Store(on)
 }
 
-// applyPresortedAggregateRule ports adjust_group_pathkeys_for_groupagg
-// (planner.c:3229). It mutates aggNode in place: on success the child is
-// wrapped in a Sort and a grouped aggregate switches to AggStrategySorted.
-// Returns without touching aggNode when the GUC is off, when the query uses
-// grouping sets, or when no aggregate has a usable internal ORDER BY / DISTINCT.
-func applyPresortedAggregateRule(aggNode *Aggregate, ps PlannerSettings) {
-	// take2 P2-02c: per-statement enable_presorted_aggregate.
-	if !ps.EnablePresortedAggregate || aggNode.GroupingSets != nil {
-		return
-	}
-
-	type aggCandidate struct {
-		pathkeys []PathKey
-	}
-	var candidates []aggCandidate
-	for i := range aggNode.Aggs {
-		a := &aggNode.Aggs[i]
-		// Ordered-set aggregates (percentile_cont & friends) sort via their
-		// WITHIN GROUP clause and must be skipped (planner.c:3257-3258,
-		// AGGKIND_IS_ORDERED_SET).
-		if a.WithinGroup {
-			continue
-		}
-		// Skip unless there's a DISTINCT or ORDER BY clause (planner.c:3260).
-		if len(a.OrderBy) == 0 && !a.Distinct {
-			continue
-		}
-		// FILTER safety (planner.c:3264-3303): with a FILTER, presorting could
-		// evaluate an argument that errors before the FILTER discards the row.
-		// Only Vars and Consts are provably safe; error-prone casts (an explicit
-		// typmod coercion such as f1::varchar(2)) are not relabels and reject.
-		if a.Filter != nil && !aggArgsAllVarConst(a) {
-			continue
-		}
-		pathkeys := makeCandidatePathkeys(aggregateSortlist(a))
-		if len(pathkeys) == 0 {
-			// Every sort key was a dropped constant (e.g. sum(distinct 42)):
-			// nothing to presort by.
-			continue
-		}
-		// Ignore aggregates with volatile functions in their ORDER BY / DISTINCT
-		// clause (planner.c:3347-3355, has_volatile_pathkey).
-		if pathkeysContainVolatile(pathkeys) {
-			continue
-		}
-		candidates = append(candidates, aggCandidate{pathkeys: pathkeys})
-	}
-	if len(candidates) == 0 {
-		return
-	}
-
-	// grouppathkeys is one ascending pathkey per GroupExprs (nil when the
-	// query is non-grouped). goopg's GroupExprs are resolved AFTER the
-	// bindings remap, so they are already in child-output coordinate space.
-	var grouppathkeys []PathKey
-	for _, g := range aggNode.GroupExprs {
-		grouppathkeys = append(grouppathkeys, PathKey{Expr: g, SortAsc: true, NullsFirst: false})
-	}
-
-	// Greedy "most covered aggregates, tiebreak by target-list position"
-	// (planner.c:3309-3417): repeatedly pick the strongest set of pathkeys
-	// that covers the largest number of still-unprocessed aggregates, then
-	// retire the covered ones and repeat until not enough candidates remain to
-	// beat the current best.
-	bestCount := 0
-	var bestpathkeys []PathKey
-	unprocessed := make([]int, len(candidates))
-	for i := range candidates {
-		unprocessed[i] = i
-	}
-	for len(unprocessed) > bestCount {
-		var currpathkeys []PathKey
-		covered := make([]bool, len(candidates))
-		for _, ui := range unprocessed {
-			pk := appendPathKeys(append([]PathKey(nil), grouppathkeys...), candidates[ui].pathkeys)
-			if currpathkeys == nil {
-				currpathkeys = pk
-				covered[ui] = true
-				continue
-			}
-			switch comparePathkeysDim(currpathkeys, pk) {
-			case dimBetter2:
-				// pk is a strict superset of currpathkeys: adopt it.
-				currpathkeys = pk
-				fallthrough
-			case dimBetter1, dimEqual:
-				// pk is no stricter than currpathkeys: covered by it.
-				covered[ui] = true
-			case dimIncomparable:
-				// No common prefix — this candidate needs its own sort.
-			}
-		}
-		next := unprocessed[:0]
-		for _, ui := range unprocessed {
-			if !covered[ui] {
-				next = append(next, ui)
-			}
-		}
-		unprocessed = next
-		n := 0
-		for _, c := range covered {
-			if c {
-				n++
-			}
-		}
-		if n > bestCount {
-			bestCount = n
-			bestpathkeys = currpathkeys
-		}
-	}
-	if bestpathkeys == nil {
-		return
-	}
-
-	// Final sort keys are the winning pathkeys (group prefix + aggregate
-	// keys), converted back to SortKey form. Converting from the pathkeys —
-	// not from the raw sortlist — is what keeps the dropped constant
-	// delimiters (string_agg(distinct f1, ',') → Sort Key: f1) out of the
-	// plan.
-	finalSortKeys := make([]SortKey, 0, len(bestpathkeys))
-	for _, pk := range bestpathkeys {
-		finalSortKeys = append(finalSortKeys, SortKey{Expr: pk.Expr, Desc: !pk.SortAsc, NullsFirst: pk.NullsFirst})
-	}
-
-	aggNode.Child = &Sort{pos: aggNode.Pos(), Child: aggNode.Child, Keys: finalSortKeys}
-	// Grouped queries become AGG_SORTED ("GroupAggregate"); a non-grouped
-	// query keeps the plain "Aggregate" label (AGG_PLAIN) and Strategy must
-	// not be touched (planner.c:3200-3206, create_ordinary_grouping_paths
-	// calls create_grouping_paths with a one-element grouping set only when
-	// there IS a GROUP BY).
-	if len(aggNode.GroupExprs) > 0 {
-		aggNode.Strategy = AggStrategySorted
-	}
-}
-
+// (Retired by C-15.) applyPresortedAggregateRule used to port
+// adjust_group_pathkeys_for_groupagg (planner.c:3229) as a mutator: on
+// success the child was wrapped in a Sort and a grouped aggregate switched
+// to AggStrategySorted. The key selection survives verbatim as the GROUP_AGG
+// producer's sorted-candidate keys (groupingpaths.go
+// presortedAggKeysOrAbsent); the mutation is gone.
 // aggregateArgExprs returns an aggregate call's direct arguments in order —
 // Arg, Arg2, then ExtraArgs — skipping nil slots. PG's Aggref->args.
 func aggregateArgExprs(a *AggregateCall) []Expr {

@@ -1,0 +1,92 @@
+ANALYZE
+                                                               QUERY PLAN                                                               
+----------------------------------------------------------------------------------------------------------------------------------------
+ Sort  (cost=1206730.74..1206780.74 rows=5000 width=144) (actual time=8062.311..8062.339 rows=175.00 loops=1)
+   Sort Key: nation, o_year DESC
+   Sort Method: quicksort  Memory: 26kB
+   ->  HashAggregate  (cost=1206373.54..1206423.54 rows=5000 width=144) (actual time=8062.188..8062.270 rows=175.00 loops=1)
+         Group Key: nation, o_year
+         ->  Gather  (cost=326121.59..1205615.81 rows=303093 width=144) (actual time=4572.191..8061.261 rows=321056.00 loops=1)
+               Workers Planned: 4
+               Workers Launched: 4
+               ->  Hash Join  (cost=326121.59..1196523.02 rows=303093 width=854)
+                     Hash Cond: (lineitem.l_suppkey = supplier.s_suppkey)
+                     Worker 0:  actual time=2977.186..6440.084 rows=65254.00 loops=1
+                     Worker 1:  actual time=2979.459..6430.413 rows=65862.00 loops=1
+                     Worker 2:  actual time=2979.285..6440.721 rows=65345.00 loops=1
+                     Worker 3:  actual time=2977.316..6440.166 rows=65191.00 loops=1
+                     Worker 4:  actual time=2979.328..6468.406 rows=59404.00 loops=1
+                     Buckets: 16384  Batches: 1  Memory Usage: 768kB  Build Time: 15.339 ms
+                     ->  Hash Join  (cost=325255.27..1191489.18 rows=303093 width=718)
+                           Hash Cond: (lineitem.l_orderkey = orders.o_orderkey)
+                           Worker 0:  actual time=2977.182..6440.081 rows=65254.00 loops=1
+                           Worker 1:  actual time=2979.454..6430.410 rows=65862.00 loops=1
+                           Worker 2:  actual time=2979.278..6440.715 rows=65345.00 loops=1
+                           Worker 3:  actual time=2977.311..6440.163 rows=65191.00 loops=1
+                           Worker 4:  actual time=2979.323..6468.402 rows=59404.00 loops=1
+                           Buckets: 1048576  Batches: 4  Memory Usage: 93178kB  Build Time: 2979.329 ms
+                           ->  Hash Join  (cost=112139.27..748535.78 rows=303093 width=678)
+                                 Hash Cond: ((lineitem.l_suppkey = partsupp.ps_suppkey) AND (lineitem.l_partkey = partsupp.ps_partkey))
+                                 Worker 0:  actual time=0.123..2122.325 rows=65254.00 loops=1
+                                 Worker 1:  actual time=0.068..2120.420 rows=65862.00 loops=1
+                                 Worker 2:  actual time=0.031..2120.317 rows=65345.00 loops=1
+                                 Worker 3:  actual time=0.041..2122.239 rows=65191.00 loops=1
+                                 Worker 4:  actual time=0.052..2120.755 rows=59404.00 loops=1
+                                 Build Time: 1561.753 ms
+                                 ->  Hash Join  (cost=905.27..490554.46 rows=303093 width=582)
+                                       Hash Cond: (lineitem.l_partkey = part.p_partkey)
+                                       Worker 0:  actual time=0.105..2122.308 rows=65254.00 loops=1
+                                       Worker 1:  actual time=0.059..2120.411 rows=65862.00 loops=1
+                                       Worker 2:  actual time=0.025..2120.311 rows=65345.00 loops=1
+                                       Worker 3:  actual time=0.031..2122.230 rows=65191.00 loops=1
+                                       Worker 4:  actual time=0.044..2120.748 rows=59404.00 loops=1
+                                       Buckets: 16384  Batches: 1  Memory Usage: 768kB  Build Time: 15.488 ms
+                                       ->  Parallel Seq Scan on lineitem  (cost=0.00..464113.55 rows=6001255 width=550)
+                                             Worker 0:  actual time=0.037..2122.332 rows=1224652.00 loops=1
+                                             Worker 1:  actual time=0.026..2120.417 rows=1226623.00 loops=1
+                                             Worker 2:  actual time=0.014..2120.342 rows=1218406.00 loops=1
+                                             Worker 3:  actual time=0.027..2122.249 rows=1217581.00 loops=1
+                                             Worker 4:  actual time=0.014..2120.758 rows=1113993.00 loops=1
+                                       ->  Seq Scan on part  (cost=0.00..2101.01 rows=10101 width=548)
+                                             Filter: (p_name LIKE '%green%')
+                                             Worker 0:  actual time=0.000..0.000 rows=0.00 loops=0
+                                             Worker 1:  actual time=0.000..0.000 rows=0.00 loops=0
+                                             Worker 2:  actual time=0.000..0.000 rows=0.00 loops=0
+                                             Worker 3:  actual time=0.000..0.000 rows=0.00 loops=0
+                                             Worker 4:  actual time=0.000..0.000 rows=0.00 loops=0
+                                 ->  Seq Scan on partsupp  (cost=0.00..61282.00 rows=800000 width=544)
+                                       Worker 0:  actual time=0.000..0.000 rows=0.00 loops=0
+                                       Worker 1:  actual time=0.000..0.000 rows=0.00 loops=0
+                                       Worker 2:  actual time=0.000..0.000 rows=0.00 loops=0
+                                       Worker 3:  actual time=0.000..0.000 rows=0.00 loops=0
+                                       Worker 4:  actual time=0.000..0.000 rows=0.00 loops=0
+                           ->  Seq Scan on orders  (cost=0.00..97273.00 rows=1500000 width=448)
+                                 Worker 0:  actual time=93.451..2976.606 rows=1500000.00 loops=1
+                                 Worker 1:  actual time=93.528..2979.320 rows=1500000.00 loops=1
+                                 Worker 2:  actual time=94.349..2979.189 rows=1500000.00 loops=1
+                                 Worker 3:  actual time=93.718..2977.131 rows=1500000.00 loops=1
+                                 Worker 4:  actual time=94.991..2979.104 rows=1500000.00 loops=1
+                     ->  Hash Join  (cost=2.81..741.31 rows=10000 width=720)
+                           Hash Cond: (supplier.s_nationkey = nation.n_nationkey)
+                           Worker 0:  actual time=0.000..0.000 rows=0.00 loops=0
+                           Worker 1:  actual time=0.000..0.000 rows=0.00 loops=0
+                           Worker 2:  actual time=0.000..0.000 rows=0.00 loops=0
+                           Worker 3:  actual time=0.000..0.000 rows=0.00 loops=0
+                           Worker 4:  actual time=0.000..0.000 rows=0.00 loops=0
+                           Buckets: 1024  Batches: 1  Memory Usage: 52kB  Build Time: 0.051 ms
+                           ->  Index Scan using supplier_pk on supplier  (cost=0.25..601.25 rows=10000 width=584)
+                                 Worker 0:  actual time=0.000..0.000 rows=0.00 loops=0
+                                 Worker 1:  actual time=0.000..0.000 rows=0.00 loops=0
+                                 Worker 2:  actual time=0.000..0.000 rows=0.00 loops=0
+                                 Worker 3:  actual time=0.000..0.000 rows=0.00 loops=0
+                                 Worker 4:  actual time=0.000..0.000 rows=0.00 loops=0
+                           ->  Seq Scan on nation  (cost=0.00..2.25 rows=25 width=490)
+                                 Worker 0:  actual time=0.000..0.000 rows=0.00 loops=0
+                                 Worker 1:  actual time=0.000..0.000 rows=0.00 loops=0
+                                 Worker 2:  actual time=0.000..0.000 rows=0.00 loops=0
+                                 Worker 3:  actual time=0.000..0.000 rows=0.00 loops=0
+                                 Worker 4:  actual time=0.000..0.000 rows=0.00 loops=0
+ Planning Time: 0.019 ms
+ Execution Time: 8062.371 ms
+(87 rows)
+

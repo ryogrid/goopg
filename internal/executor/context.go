@@ -206,6 +206,46 @@ type Context struct {
 	// maps above. Lazily allocated by hashJoinStat. M0127-P3.5.
 	HashJoinStats map[*optimizer.Join]*HashJoinStats
 
+	// GatherLaunched carries the per-Gather/GatherMerge worker count EXPLAIN
+	// ANALYZE renders as PG's `Workers Launched:` line, keyed by plan node
+	// like HashJoinStats. Recorded in gatherOp/gatherMergeOp.Open via
+	// recordGatherLaunched; only entries for executed nodes exist, so plain
+	// EXPLAIN renders nothing. EX0-03 (b).
+	GatherLaunched gatherLaunchedTable
+
+	// GatherWorkerStats carries the per-worker (plus leader) per-node
+	// rows/loops/time EXPLAIN ANALYZE renders as `Worker N:` lines, keyed
+	// by inner plan node like GatherLaunched. Folded post-join in
+	// gatherOp/gatherMergeOp.Close via foldGatherWorkerStats; only entries
+	// for executed sites exist, so plans without a Gather render nothing.
+	// EX0-03b (new).
+	GatherWorkerStats workerNodeStatsTable
+
+	// SortStats carries the per-Sort ANALYZE counters (method / space),
+	// keyed by plan node like HashJoinStats. Published at the end of a
+	// successful sortOp.Open; failed Opens publish nothing, so their nodes
+	// render no `Sort Method:` line. The leader's own entry renders the
+	// main line; worker entries render the per-worker lines via
+	// SortWorkerStats below. EX0-03c.
+	SortStats map[*optimizer.Sort]SortStat
+
+	// SortWorkerStats carries one entry per worker per executed Sort node,
+	// folded post-join in MergeWorkerContext with each worker's explicit
+	// fan-out slot (never bare call order). Rendered as
+	// `Worker N:  Sort Method: …` lines, sorted by slot at render time —
+	// the same discipline as GatherWorkerStats. The leader's own SortStats
+	// entry is NEVER merged into this list. EX0-03c.
+	SortWorkerStats map[*optimizer.Sort][]SortStat
+
+	// workerSlot is this worker Context's fan-out slot (0..n-1), stamped by
+	// the leader when the worker is created (gatherOp/gatherMergeOp/Open,
+	// parallel_hash_build.go). MergeWorkerContext tags the worker's sort
+	// entries with it — the EX0-03b slot discipline (foldGatherWorkerStats'
+	// explicit index), applied to a per-worker merge call that otherwise
+	// carries no index. A Context that never fanned out reads as slot 0.
+	// EX0-03c.
+	workerSlot int
+
 	// MultiAssignSubqCache caches the result row of a MultiAssignSubqRow
 	// evaluation (tuple SET subquery). Keyed by *planner.MultiAssignSubqRow
 	// pointer (as uintptr). Cleared by the update executor at the start of

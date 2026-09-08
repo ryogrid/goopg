@@ -1,0 +1,21 @@
+Limit  (cost=5683.04..5701.04 rows=100 width=91)
+  ->  Incremental Sort  (cost=5683.04..5701.22 rows=101 width=91)
+        Sort Key: dt.d_year, (sum(store_sales.ss_sales_price)) DESC, item.i_brand_id
+        Presorted Key: dt.d_year
+        ->  GroupAggregate  (cost=5682.89..5696.67 rows=101 width=91)
+              Group Key: dt.d_year, item.i_brand, item.i_brand_id
+              ->  Gather Merge  (cost=5682.89..5694.40 rows=101 width=65)
+                    Workers Planned: 1
+                    ->  Sort  (cost=4682.88..4683.03 rows=59 width=65)
+                          Sort Key: dt.d_year, item.i_brand, item.i_brand_id
+                          ->  Nested Loop  (cost=5.40..4681.14 rows=59 width=65)
+                                ->  Nested Loop  (cost=5.11..4442.43 rows=753 width=65)
+                                      ->  Parallel Seq Scan on item  (cost=0.00..1416.35 rows=9 width=59)
+                                            Filter: (i_manufact_id = 816)
+                                      ->  Bitmap Heap Scan on store_sales  (cost=5.11..335.35 rows=88 width=14)
+                                            Recheck Cond: (ss_item_sk = item.i_item_sk)
+                                            ->  Bitmap Index Scan on store_sales_pkey  (cost=0.00..5.09 rows=88 width=0)
+                                                  Index Cond: (ss_item_sk = item.i_item_sk)
+                                ->  Index Scan using date_dim_pkey on date_dim dt  (cost=0.29..0.32 rows=1 width=8)
+                                      Index Cond: (d_date_sk = store_sales.ss_sold_date_sk)
+                                      Filter: (d_moy = 11)

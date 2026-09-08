@@ -93,6 +93,8 @@ package optimizer
 // at that position. The pathkey is kept, not just the group, because the inner
 // must be sorted in the outer's direction and null placement — the outer's
 // ordering is given here, not chosen.
+import "github.com/goopg/goopg/internal/parser"
+
 type mergeOuterMatch struct {
 	group    mergeKeyGroup
 	outerKey PathKey
@@ -114,7 +116,7 @@ type mergeOuterMatch struct {
 // outer before reaching this arm, so only the per-outer-path test is made below —
 // the pathlist can hold parameterised paths that the cheapest-total test did not
 // cover.
-func matchUnsortedOuterMerge(joinrel, outer, inner *RelOptInfo, cp costParams, keys, residual []*restrictInfo, mergeTuplesFor func([]*restrictInfo) float64, scanSelFor func([]*restrictInfo) (float64, float64)) {
+func matchUnsortedOuterMerge(joinrel, outer, inner *RelOptInfo, cp costParams, jt parser.JoinType, keys, residual []*restrictInfo, mergeTuplesFor func([]*restrictInfo) float64, scanSelFor func([]*restrictInfo) (float64, float64), paramSrc RelSet) {
 	innerCheapestTotal := inner.CheapestTotal
 	if innerCheapestTotal == nil {
 		return
@@ -138,13 +140,13 @@ func matchUnsortedOuterMerge(joinrel, outer, inner *RelOptInfo, cp costParams, k
 		if pathParamByRel(op, inner) {
 			continue
 		}
-		generateMergeJoinPaths(joinrel, inner, op, innerCheapestTotal, cp, groups, outer.Relids, residual, mergeTuplesFor, scanSelFor)
+		generateMergeJoinPaths(joinrel, inner, op, innerCheapestTotal, cp, jt, groups, outer.Relids, residual, mergeTuplesFor, scanSelFor, paramSrc)
 	}
 }
 
 // generateMergeJoinPaths is `generate_mergejoin_paths` (joinpath.c:1564) for one
 // already-ordered outer path.
-func generateMergeJoinPaths(joinrel, inner *RelOptInfo, outerPath, innerCheapestTotal *Path, cp costParams, groups []mergeKeyGroup, outerRelids RelSet, residual []*restrictInfo, mergeTuplesFor func([]*restrictInfo) float64, scanSelFor func([]*restrictInfo) (float64, float64)) {
+func generateMergeJoinPaths(joinrel, inner *RelOptInfo, outerPath, innerCheapestTotal *Path, cp costParams, jt parser.JoinType, groups []mergeKeyGroup, outerRelids RelSet, residual []*restrictInfo, mergeTuplesFor func([]*restrictInfo) float64, scanSelFor func([]*restrictInfo) (float64, float64), paramSrc RelSet) {
 	matched := findMergeClausesForOuterPathkeys(outerPath.Pathkeys, groups)
 	if len(matched) == 0 {
 		return
@@ -196,7 +198,7 @@ func generateMergeJoinPaths(joinrel, inner *RelOptInfo, outerPath, innerCheapest
 	// evaluated nowhere — the truncation demotion only ever re-adds clauses cut
 	// from the ALREADY-trimmed list.
 	fullResidual := demoteUnmatchedGroupClauses(residual, groups, mergeClauses)
-	tryMergeJoinPath(joinrel, outerPath, innerCheapestTotal, cp, resultKeys, nil, innerSortKeys, mergeClauses, fullResidual, mergeTuplesFor, scanSelFor)
+	tryMergeJoinPath(joinrel, outerPath, innerCheapestTotal, cp, jt, resultKeys, nil, innerSortKeys, mergeClauses, fullResidual, mergeTuplesFor, scanSelFor, paramSrc)
 
 	// The truncation search (:1685-1782). `cheapestTotalInner` /
 	// `cheapestStartupInner` carry the best inner found SO FAR, and a candidate
@@ -230,8 +232,8 @@ func generateMergeJoinPaths(joinrel, inner *RelOptInfo, outerPath, innerCheapest
 				// Both sort-key lists are nil: the outer is ordered by
 				// construction and this inner was SELECTED for already being
 				// ordered, so neither side is sorted here.
-				tryMergeJoinPath(joinrel, outerPath, ip, cp, resultKeys, nil, nil,
-					newClauses, demoteDroppedMergeClauses(fullResidual, mergeClauses, newClauses), mergeTuplesFor, scanSelFor)
+				tryMergeJoinPath(joinrel, outerPath, ip, cp, jt, resultKeys, nil, nil,
+					newClauses, demoteDroppedMergeClauses(fullResidual, mergeClauses, newClauses), mergeTuplesFor, scanSelFor, paramSrc)
 			}
 			cheapestTotalInner = ip
 		}
@@ -247,12 +249,81 @@ func generateMergeJoinPaths(joinrel, inner *RelOptInfo, outerPath, innerCheapest
 					newClauses = trimmedMergeClauses(mergeClauses, trial, cnt, numSortKeys, outerRelids)
 				}
 				if len(newClauses) > 0 {
-					tryMergeJoinPath(joinrel, outerPath, ip, cp, resultKeys, nil, nil,
-						newClauses, demoteDroppedMergeClauses(fullResidual, mergeClauses, newClauses), mergeTuplesFor, scanSelFor)
+					tryMergeJoinPath(joinrel, outerPath, ip, cp, jt, resultKeys, nil, nil,
+						newClauses, demoteDroppedMergeClauses(fullResidual, mergeClauses, newClauses), mergeTuplesFor, scanSelFor, paramSrc)
 				}
 			}
 			cheapestStartupInner = ip
 		}
+	}
+}
+
+// matchUnsortedOuterMergePartial is the partial twin of the first candidate
+// `generateMergeJoinPaths` emits: the cheapest partial outer that already
+// carries an ordering, against the cheapest parallel-safe complete inner
+// sorted to the full key list. E-20 Cut 3, PG's `consider_parallel_mergejoin`
+// (joinpath.c:2071-2097) narrowed by the deliberate divergence Cut 3 records
+// (only `PartialPathlist[0]`, following the hash twin rather than upstream's
+// whole-list loop) and by the no-sort gate (the truncation search's shorter
+// prefixes are a follow-up the A/B can motivate, not a guess).
+//
+// resultKeys is the outer's FULL ordering (behaviour 3: generally longer than
+// the merge keys); the outer needs no sort by construction; the inner takes
+// the full sort-key list exactly as the serial first candidate does.
+func matchUnsortedOuterMergePartial(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp costParams,
+	jt parser.JoinType, keys, residual []*restrictInfo, mergeTuplesFor func([]*restrictInfo) float64,
+	scanSelFor func([]*restrictInfo) (float64, float64), paramSrc RelSet) {
+
+	if s == nil || !s.parallelModeOK || gatherPathsMode == gatherPathsOff {
+		return
+	}
+	// PG's `consider_parallel_mergejoin` (joinpath.c:2071-2097) loops over the
+	// WHOLE `outerrel->partial_pathlist` — and it must, because the cheapest
+	// partial path is almost never the ORDERED one: a partial seq scan prices
+	// below a partial index scan carrying pathkeys, so reading only
+	// `PartialPathlist[0]` (the hash twin's rule, correct for a twin that
+	// needs no ordering) would decline exactly the shapes this site exists
+	// for. Each ordered partial outer gets the first candidate (the
+	// truncation search stays deferred). Unordered partial outers are
+	// skipped: `sort_inner_and_outer` serves unordered inputs.
+	groups := mergeKeyGroups(keys, outer.Relids)
+	if len(groups) == 0 {
+		return
+	}
+	for _, op := range outer.PartialPathlist {
+		if op == nil || len(op.Pathkeys) == 0 {
+			continue
+		}
+		if pathParamByRel(op, inner) {
+			continue
+		}
+		matched := findMergeClausesForOuterPathkeys(op.Pathkeys, groups)
+		if len(matched) == 0 {
+			continue
+		}
+		selected := make([]mergeKeyGroup, len(matched))
+		outerKeys := make([]PathKey, len(matched))
+		var mergeClauses []*restrictInfo
+		for i, m := range matched {
+			selected[i] = m.group
+			outerKeys[i] = m.outerKey
+			mergeClauses = append(mergeClauses, m.group.clauses...)
+		}
+		innerSortKeys := mergeInnerSortKeys(selected, outerKeys, outer.Relids)
+		if len(innerSortKeys) == 0 {
+			continue
+		}
+		fullResidual := demoteUnmatchedGroupClauses(residual, groups, mergeClauses)
+		// The inner is the cheapest parallel-safe COMPLETE path (each
+		// worker reads it whole); the outer stays the partial path (each
+		// worker reads its partition). resultKeys is the outer's full
+		// ordering.
+		i := cheapestParallelSafeTotalInner(inner.Pathlist)
+		if i == nil {
+			continue
+		}
+		tryPartialMergeJoinPath(s, joinrel, op, i, cp, jt, op.Pathkeys, nil, innerSortKeys,
+			mergeClauses, fullResidual, mergeTuplesFor, scanSelFor, paramSrc)
 	}
 }
 
@@ -392,7 +463,8 @@ func trimMergeClausesForInnerPathkeys(mergeClauses []*restrictInfo, pathkeys []P
 // "Currently we do not consider parameterized inner paths here"). That is not an
 // oversight being reproduced: a merge join discharges no parameter, so a
 // parameterised inner would only produce a parameterised join that
-// `tryMergeJoinPath` then refuses on `param_source_rels` anyway.
+// `tryMergeJoinPath` then refuses unless this joinrel's `param_source_rels`
+// wants it (C-08).
 func getCheapestPathForPathkeys(paths []*Path, keys []PathKey, criterion costSelector) *Path {
 	var matched *Path
 	for _, p := range paths {

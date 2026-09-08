@@ -169,12 +169,34 @@ func newLockRowsOp(p *optimizer.LockRows, child Operator) *lockRowsOp {
 }
 
 // findFilterPred walks the child chain past Project wrappers and returns the
-// predicate of the first filterOp found. Returns nil when no filter is present.
+// scan-level qual, for lockRowsOp's EPQ recheck (epqRecheckFilter).
+//
+// E-17 / EX3-08 cut 2: the qual is no longer always on a filterOp. When it
+// sits directly above a SeqScan the scan ABSORBS it and no filterOp is built,
+// so this walker must read seqScanOp.qual too. Missing that arm is not a
+// missed optimisation — it makes epqRecheckFilter a silent no-op and returns
+// WRONG ROWS for `SELECT ... FOR UPDATE` against a concurrently updated row,
+// because the re-fetched latest version is never re-tested against the WHERE
+// clause. Pinned by TestLockRowsEPQRechecksAbsorbedScanQual.
+//
+// It also peels *instrumentedOp, which it did not before: under EXPLAIN
+// ANALYZE every operator is wrapped, so the pre-E-17 walker already returned
+// nil there and silently degraded the recheck. findScanLeaf peels it; this
+// is the sibling that did not.
 func findFilterPred(op Operator) optimizer.Expr {
 	for {
 		switch v := op.(type) {
 		case *filterOp:
 			return v.pred
+		case *seqScanOp:
+			// nil when this scan absorbed no qual, which is the same
+			// "no filter present" answer the default arm gives.
+			if v.qualSet {
+				return v.qual
+			}
+			return nil
+		case *instrumentedOp:
+			op = v.inner
 		case *projectOp:
 			op = v.child
 		default:
@@ -704,6 +726,11 @@ func (o *lockRowsOp) Open(ctx *Context) error {
 			return err
 		}
 	}
+	// EX3-05 Cut A: this LockRows is the TID side-channel's consumer
+	// (drainAndStamp's ms.hasCTID fallback). Enable sortOp.wantCTIDs on the
+	// spine below BEFORE the child drains — the sort records TIDs only when
+	// asked. Must precede child.Open: sortOp.Open pulls every row up front.
+	markSortWantCTIDs(o.child)
 	if err := o.child.Open(ctx); err != nil {
 		return err
 	}
@@ -763,14 +790,32 @@ func (o *lockRowsOp) Open(ctx *Context) error {
 	// [0,len(filterCols)). For a non-key UPDATE the join key is preserved on the
 	// successor, so skipping its recheck is correct; key-column changes are still
 	// caught by the CTID-chain logic. M0118-0009 (docs/design/0118-0106).
-	if ix, ok := o.scan.(*indexScanOp); ok && ix.plan != nil && len(o.filterCols) > 0 &&
-		ix.plan.Key != nil && !exprRefsColumnOrOuter(ix.plan.Key) {
-		if idxPred := indexScanPredicate(ix.plan); idxPred != nil &&
-			filterPredMaxColRef(idxPred) < len(o.filterCols) {
-			if o.filterPred == nil {
-				o.filterPred = idxPred
-			} else {
-				o.filterPred = &optimizer.BinaryOp{Op: parser.OpAnd, Left: o.filterPred, Right: idxPred}
+	// The foldable probe keys: the single Key, or one per SAOP descent
+	// (B-14 — every element is a planner Const by gate, hence row-local
+	// unless the gate is ever widened, which the per-element check
+	// guards). Keys (composite) stays out, as before.
+	probeRowLocal := false
+	if ix, ok := o.scan.(*indexScanOp); ok && ix.plan != nil && len(o.filterCols) > 0 {
+		switch {
+		case ix.plan.Key != nil:
+			probeRowLocal = !exprRefsColumnOrOuter(ix.plan.Key)
+		case len(ix.plan.SAOPKeys) > 0:
+			probeRowLocal = true
+			for _, k := range ix.plan.SAOPKeys {
+				if exprRefsColumnOrOuter(k) {
+					probeRowLocal = false
+					break
+				}
+			}
+		}
+		if probeRowLocal {
+			if idxPred := indexScanPredicate(ix.plan); idxPred != nil &&
+				filterPredMaxColRef(idxPred) < len(o.filterCols) {
+				if o.filterPred == nil {
+					o.filterPred = idxPred
+				} else {
+					o.filterPred = &optimizer.BinaryOp{Op: parser.OpAnd, Left: o.filterPred, Right: idxPred}
+				}
 			}
 		}
 	}

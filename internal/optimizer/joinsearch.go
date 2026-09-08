@@ -29,6 +29,8 @@ import (
 	"fmt"
 	"math/bits"
 	"os"
+
+	"github.com/goopg/goopg/internal/catalog"
 )
 
 // maxSearchRels is the relset width. `RelSet` is a uint16 (path.go:29), so the
@@ -169,6 +171,22 @@ type searchCtx struct {
 	// the fast path equivalent of an empty list. M0128-P1.2.
 	joinInfoList []*SpecialJoinInfo
 
+	// problemItems is the FROM-item run this problem searches, in order:
+	// item i owns relid 1<<i. Stamped by searchOneProblem beside the
+	// clause list; read by the C-08 param_source_rels derivation, which
+	// must remap statement-global SJI hands into this problem's frame
+	// (an item is NOT always statement leaf lo+i — see the remap rule).
+	// Nil in hand-built test contexts → the derivation yields 0 (legacy).
+	problemItems []joinlistRel
+
+	// queryPathkeys is `PlannerInfo.query_pathkeys` (C-07/P3-06,
+	// querypathkeys.go): the ordering the STATEMENT wants from this level,
+	// derived once by `standard_qp_callback` before the first rel exists and
+	// carried here for the same reason `tupleFraction` is — it is a property
+	// of the query, not of a relation. Read by `hasUsefulPathkeys`. Empty
+	// means "no special ordering requested", which is upstream's NIL.
+	queryPathkeys []PathKey
+
 	// neededCols / neededColsKnown are PG's `reltarget` + `attr_needed` for
 	// this statement, by COLUMN NAME — see pathindexonlyneed.go for the
 	// direction of the approximation. `neededColsKnown == false` means
@@ -176,6 +194,26 @@ type searchCtx struct {
 	// planner assumed unconditionally. Consumed by `addIndexOnlyPaths`.
 	neededCols      map[string]bool
 	neededColsKnown bool
+
+	// outputCols / outputColsKnown are the statement's ABOVE-TREE
+	// needed-column set (outputColumnNames), the union needed above the
+	// scan/join tree. Take2 P4-01 Slice 3: per-joinrel keep-sets derive
+	// from it. outputEligible folds the positional gates (statement-top
+	// problem, no pinned spine above, no outer-scope reads): only an
+	// eligible problem stamps the set onto its rels, so the derivation
+	// declines everywhere else by construction.
+	outputCols      map[string]bool
+	outputColsKnown bool
+	outputEligible  bool
+
+	// parallelModeOK is `root->glob->parallelModeOK` for this search
+	// (considerparallel.go); cat is the catalog the qual-safety walk resolves
+	// user routines through. Both are set by `setBaseRelConsiderParallel`,
+	// the C-19a protocol step; a search that skips the step (every direct
+	// test caller) keeps the zero values — no rel considers parallel, no
+	// partial path exists — which is the pre-C-19 regime exactly.
+	parallelModeOK bool
+	cat            catalog.Catalog
 }
 
 // newSearchCtx allocates the level lists for an nrels-relation join problem.
@@ -368,6 +406,9 @@ func buildInitialRels(bindings []rangeBinding, scans []Node, relInfos []baseRelI
 				sum += cs.AvgWidth
 			}
 			rel.AvgVarBytes = sum
+			// The same widths unsummed, for the build-side narrowing
+			// (see RelOptInfo.ColVarBytes).
+			rel.ColVarBytes = tableColVarBytes(ri.table)
 		}
 		// `rel->consider_startup = (root->tuple_fraction > 0)`
 		// (relnode.c:211): a fast start is worth keeping paths for exactly when
@@ -391,16 +432,59 @@ func buildInitialRels(bindings []rangeBinding, scans []Node, relInfos []baseRelI
 			return nil, err
 		}
 		p := newPrebuiltPath(rel, leaf)
-		// The scan-cost currency of 04 §1 over the rel's own estimate.
-		// numQualOps is 0 because the local quals are already inside the
-		// leaf node and their selectivity is already inside `rows`; charging
-		// for them again here would double-count (the per-tuple operator
-		// term is what `estimateBaseRelInfo` has already spent).
-		p.Cost = costSeqscan(cp, estScanPages(rows, width), rows, 0)
+		// The scan-cost currency of 04 §1, on `cost_seqscan`'s OWN inputs:
+		// `baserel->pages` and `baserel->tuples`, not the post-restriction
+		// row count. See baseSeqScanCostInputs.
+		scanPages, scanTuples, scanQualOps := baseSeqScanCostInputs(ri, leaf, rows, width)
+		p.Cost = costSeqscan(cp, scanPages, scanTuples, scanQualOps)
 		addPath(rel, p, "joinsearch.prebuilt")
 		setCheapest(rel)
 	}
 	return s, nil
+}
+
+// baseSeqScanCostInputs resolves `cost_seqscan`'s three inputs for a base
+// relation's prebuilt leaf path, and is the single place the serial scan and
+// its partial twin (`addBaseRelPartialPaths`) agree on them.
+//
+// PG charges the two halves of a parallel plan on TWO DIFFERENT row counts,
+// and that difference is the entire reason a selective scan has a Gather
+// crossover (costsize.c:295 `cost_seqscan` vs :447 `cost_gather`):
+//
+//	cost_seqscan   (cpu_tuple_cost + qual cost) x baserel->tuples — every
+//	               tuple SCANNED, and that is the term `get_parallel_divisor`
+//	               divides — over seq_page_cost x baserel->pages.
+//	cost_gather    parallel_tuple_cost x baserel->rows — only the survivors
+//	               CROSSING the worker boundary.
+//
+// goopg used to substitute the post-restriction row count into BOTH (and a
+// page count derived from that same number), which collapses the difference to
+// `gather - serial = parallel_setup_cost + (parallel_tuple_cost -
+// per_tuple_cpu x (1 - 1/d)) x rows`: strictly positive at every row count and
+// every selectivity, so no crossover existed at all and a plain filtered
+// SELECT lost the Gather that vanilla PG 18.3 keeps. Ledger
+// `c19-baserel-scan-priced-on-output-rows`; pinned both ways in
+// gatherpaths_crossover_test.go.
+//
+// The qual cost comes back with the tuples it is charged on: the local filter's
+// conjuncts are evaluated on every scanned tuple, which is exactly what pays
+// for the rows the scan then does NOT emit. Charging it was double-counting
+// only while the tuple count was already post-restriction.
+//
+// PG's inputs need a real relation to read them from, so the legacy pricing is
+// kept for every leaf class that is not a plain heap scan of a catalog table:
+// an index leaf is the rule-based planner's own choice standing in for the
+// relation and must not be repriced as a full sequential scan, and a subquery
+// or CTE leaf has no `baserel->tuples` to speak of.
+func baseSeqScanCostInputs(ri baseRelInfo, leaf Node, fallbackRows float64, fallbackWidth int) (pages int64, tuples float64, numQualOps int) {
+	if _, ok := leafBaseScan(leaf).(*SeqScan); !ok || ri.table == nil || ri.baseRows < 1 {
+		return estScanPages(fallbackRows, fallbackWidth), fallbackRows, 0
+	}
+	tuples = float64(ri.baseRows)
+	if ri.localFilter != nil {
+		numQualOps = len(splitConjuncts(ri.localFilter, nil))
+	}
+	return baseRelPages(ri.table, tuples), tuples, numQualOps
 }
 
 // initialRelRows is the initial rel's cardinality: post-local-filter for a base
@@ -478,6 +562,28 @@ func (s *searchCtx) stampNeededColsOnRels() {
 				continue
 			}
 			r.NeededCols, r.NeededColsKnown = s.neededCols, s.neededColsKnown
+		}
+	}
+}
+
+// stampOutputColsOnRels copies the statement's above-tree needed-column set
+// onto every rel the search has built so far. Take2 P4-01 Slice 3: the union
+// needed above the scan/join tree, from which per-joinrel keep-sets derive.
+//
+// Called only when s.outputEligible (the statement-top problem with no pinned
+// spine above it and no outer-scope reads); every other problem leaves the
+// zero value on its rels and the derivation declines there. Same by-reference
+// sharing as the needed set.
+func (s *searchCtx) stampOutputColsOnRels() {
+	if s == nil || !s.outputEligible {
+		return
+	}
+	for _, level := range s.joinrels {
+		for _, r := range level {
+			if r == nil {
+				continue
+			}
+			r.OutputCols, r.OutputColsKnown = s.outputCols, s.outputColsKnown
 		}
 	}
 }

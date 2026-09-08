@@ -1,0 +1,15 @@
+=== Q22
+GroupAggregate  (cost=16627.86..16645.59 rows=645 width=72)
+  Group Key: (substr((customer.c_phone)::text, 1, 2))
+  InitPlan 1
+    ->  Aggregate  (cost=7611.42..7611.43 rows=1 width=32)
+          ->  Seq Scan on customer customer_1  (cost=0.00..7599.50 rows=4766 width=6)
+                Filter: ((c_acctbal > 0.00) AND (substr((c_phone)::text, 1, 2) = ANY ('{13,31,23,29,30,18,17}'::text[])))
+  ->  Sort  (cost=9016.43..9018.04 rows=645 width=38)
+        Sort Key: (substr((customer.c_phone)::text, 1, 2))
+        ->  Nested Loop Anti Join  (cost=0.43..8986.33 rows=645 width=38)
+              ->  Seq Scan on customer  (cost=0.00..7599.50 rows=1750 width=28)
+                    Filter: ((c_acctbal > (InitPlan 1).col1) AND (substr((c_phone)::text, 1, 2) = ANY ('{13,31,23,29,30,18,17}'::text[])))
+              ->  Index Only Scan using order_customer_fkidx on orders  (cost=0.43..4.01 rows=16 width=6)
+                    Index Cond: (o_custkey = customer.c_custkey)
+

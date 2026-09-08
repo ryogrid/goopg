@@ -5,10 +5,12 @@ import (
 	"fmt"
 	"math"
 	"math/rand"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/goopg/goopg/internal/access/transam"
 	"github.com/goopg/goopg/internal/access/transam/multixact"
@@ -380,6 +382,12 @@ func persistStatsToPGStatistic(ctx *Context, tbl *catalog.Table, stats *catalog.
 	// NO trailing-column rows and no size row, while lineitem/part/… — whose
 	// comment histograms fit — persisted fully. Keep the first error for the
 	// caller's (non-fatal) bookkeeping, write everything that fits.
+	//
+	// B-02 bounded-width interim: an oversized row is truncated (bound widths
+	// capped, then bounds thinned evenly with endpoints kept, then the MCV
+	// tail dropped — scalar fields never touched; see truncateColumnStatsToFit)
+	// and the TRUNCATED row is what persists, instead of dropping the column
+	// entirely. A row that fits is written byte-identical (no cap engaged).
 	var firstErr error
 	for i, cs := range stats.Columns {
 		if i >= len(tbl.Columns) {
@@ -393,6 +401,9 @@ func persistStatsToPGStatistic(ctx *Context, tbl *catalog.Table, stats *catalog.
 		}
 		attNum := int16(col.Ordinal + 1)
 		row := buildUserPGStatisticRow(tbl.OID, attNum, cs)
+		if n, serr := pgStatisticRowTupleLen(cols, row); serr == nil && n > storage.MaxHeapTupleSize {
+			row, cs = truncateColumnStatsToFit(tbl.OID, attNum, cols, cs)
+		}
 		if _, err := writeHeapRowCanonical(ctx, statRel, cols, row); err != nil && firstErr == nil {
 			firstErr = fmt.Errorf("pg_statistic col %q: %w", col.Name, err)
 		}
@@ -401,6 +412,124 @@ func persistStatsToPGStatistic(ctx *Context, tbl *catalog.Table, stats *catalog.
 		firstErr = err
 	}
 	return firstErr
+}
+
+// pgStatisticMaxBoundBytes caps one histogram/MCV bound's width in the B-02
+// bounded-width interim. Upstream pg_statistic has a toast relation, so wide
+// histograms persist whole; goopg's catalog heap writer does not TOAST, so a
+// per-column row wider than MaxHeapTupleSize (8160 B) was dropped entirely
+// (orders/customer/partsupp comment columns). Truncation is prefix-faithful
+// (UTF-8 boundary aware) and thinning keeps the endpoints, so range
+// selectivity degrades gracefully; scalar fields (nullfrac/distinct/width,
+// correlation) are never touched. A row that fits is returned byte-identical.
+// Remove when pg_statistic gains TOAST/out-of-line storage (ledger M0125-0029).
+const pgStatisticMaxBoundBytes = 64
+
+// truncateUTF8Prefix cuts s to at most maxBytes without splitting a UTF-8
+// encoding (backs off to the last rune boundary at or under the limit).
+func truncateUTF8Prefix(s string, maxBytes int) string {
+	if len(s) <= maxBytes {
+		return s
+	}
+	t := s[:maxBytes]
+	for len(t) > 0 && !utf8.ValidString(t) {
+		t = t[:len(t)-1]
+	}
+	return t
+}
+
+// thinStatisticBounds keeps an evenly spaced subset of at most maxBounds
+// entries, always including the first and last bound so the histogram still
+// spans the column's full range. The input must be ascending (as the ANALYZE
+// bucketer emits); a subset of an ascending slice stays ascending.
+func thinStatisticBounds(bounds []string, maxBounds int) []string {
+	if maxBounds < 2 {
+		maxBounds = 2
+	}
+	if len(bounds) <= maxBounds {
+		return bounds
+	}
+	out := make([]string, maxBounds)
+	last := len(bounds) - 1
+	for i := range out {
+		out[i] = bounds[i*last/(maxBounds-1)]
+	}
+	return out
+}
+
+// pgStatisticRowTupleLen is the exact on-page tuple length of a
+// pg_statistic row: EncodeRowPG + NullBitmapPG + heap header/hoff, the same
+// construction buildCatalogPGHeapTuple uses (natts/infomask bits carry no
+// length). Compare against storage.MaxHeapTupleSize: anything at or under it
+// is accepted by PageAddHeapTuple on a fresh page.
+func pgStatisticRowTupleLen(cols []catalog.Column, row Row) (int, error) {
+	body, err := EncodeRowPG(cols, row)
+	if err != nil {
+		return 0, err
+	}
+	bitmap := NullBitmapPG(row)
+	var tup storage.HeapTuple
+	if len(bitmap) > 0 {
+		tup = storage.NewHeapTupleWithNulls(1, storage.InvalidTransactionID, bitmap, body)
+	} else {
+		tup = storage.NewHeapTuple(1, storage.InvalidTransactionID, body)
+	}
+	raw, err := tup.MarshalBinary()
+	if err != nil {
+		return 0, err
+	}
+	return len(raw), nil
+}
+
+// pgStatisticRowIfFits builds the row for cs and reports whether its tuple
+// fits on a heap page. Encode failures report not-fits; the caller then falls
+// through to the scalar-only last resort.
+func pgStatisticRowIfFits(tableOID uint32, attNum int16, cols []catalog.Column, cs catalog.ColumnStats) (Row, bool) {
+	row := buildUserPGStatisticRow(tableOID, attNum, cs)
+	n, err := pgStatisticRowTupleLen(cols, row)
+	if err != nil {
+		return row, false
+	}
+	return row, n <= storage.MaxHeapTupleSize
+}
+
+// truncateColumnStatsToFit shrinks cs until its pg_statistic row fits on a
+// heap page, cheapest fidelity loss first: per-bound width cap, then evenly
+// spaced histogram thinning (endpoints kept), then the MCV tail (least
+// frequent entries first — MCV is frequency-ordered), then the histogram
+// outright. The scalar-only last resort (a few hundred bytes) always fits. A
+// cs that already fits is returned unchanged with its byte-identical row.
+func truncateColumnStatsToFit(tableOID uint32, attNum int16, cols []catalog.Column, cs catalog.ColumnStats) (Row, catalog.ColumnStats) {
+	if row, ok := pgStatisticRowIfFits(tableOID, attNum, cols, cs); ok {
+		return row, cs
+	}
+	trunc := cs
+	trunc.Histogram = make([]string, len(cs.Histogram))
+	for i, b := range cs.Histogram {
+		trunc.Histogram[i] = truncateUTF8Prefix(b, pgStatisticMaxBoundBytes)
+	}
+	trunc.MCV = make([]catalog.MCVEntry, len(cs.MCV))
+	for i, e := range cs.MCV {
+		trunc.MCV[i] = catalog.MCVEntry{Value: truncateUTF8Prefix(e.Value, pgStatisticMaxBoundBytes), Frequency: e.Frequency}
+	}
+	if row, ok := pgStatisticRowIfFits(tableOID, attNum, cols, trunc); ok {
+		return row, trunc
+	}
+	for len(trunc.Histogram) > 2 {
+		trunc.Histogram = thinStatisticBounds(trunc.Histogram, (len(trunc.Histogram)+1)/2)
+		if row, ok := pgStatisticRowIfFits(tableOID, attNum, cols, trunc); ok {
+			return row, trunc
+		}
+	}
+	for len(trunc.MCV) > 0 {
+		trunc.MCV = trunc.MCV[:len(trunc.MCV)/2]
+		if row, ok := pgStatisticRowIfFits(tableOID, attNum, cols, trunc); ok {
+			return row, trunc
+		}
+	}
+	trunc.Histogram = nil
+	trunc.MCV = nil
+	return buildUserPGStatisticRow(tableOID, attNum, trunc), trunc
 }
 
 // persistRelSize writes one relation's ANALYZE/VACUUM-measured size to the
@@ -536,6 +665,66 @@ func analyzeMCVList(mcvCounts []int, numMCV int, staDistinct, staNullFrac float6
 	return numMCV
 }
 
+// analyzeSeedEnv is the process-wide fallback seed for ANALYZE's reservoir
+// sampler, read once from `GOOPG_ANALYZE_SEED`. Zero (the unset case) keeps
+// upstream behaviour: every ANALYZE draws a fresh wall-clock-seeded sample,
+// exactly as PG's acquire_sample_rows does
+// (postgres/src/backend/commands/analyze.c — `random()` seeded per backend).
+//
+// Why it exists: a *measurement* problem, not a semantics one. goopg's
+// statistics are per-connection, so the plan-capture harness
+// (`cmd/estimate-audit -warm-stats`, on by default) re-ANALYZEs every table at
+// the start of each capture session. With a wall-clock seed each capture sees
+// a different sample, so two captures of the SAME binary disagree — measured
+// 2026-09-05 at 455 differing estimate lines and 27 differing plan-shape lines
+// between two back-to-back A/A captures, including whole join-method flips
+// (TPC-H Q3 Nested Loop vs Merge Join, Q9 hash vs merge spine). That noise is
+// larger than the signal every planner A/B in
+// `docs/design/not_ralph/minimize_datum/TODO_ALL.md` is trying to read, and it
+// makes the plan-shape pin (A-05) report changes no commit caused.
+//
+// Setting the variable pins the sample so a capture is reproducible. It is a
+// harness knob: production and every unset run are bit-for-bit unchanged.
+var analyzeSeedEnv = func() int64 {
+	v := strings.TrimSpace(os.Getenv("GOOPG_ANALYZE_SEED"))
+	if v == "" {
+		return 0
+	}
+	n, err := strconv.ParseInt(v, 10, 64)
+	if err != nil {
+		return 0
+	}
+	return n
+}()
+
+// analyzeSeedFor returns the sampler seed for one relation when no
+// Context-level seed was set: the pinned harness seed when
+// `GOOPG_ANALYZE_SEED` is set, otherwise a fresh wall-clock draw (upstream
+// behaviour).
+//
+// The pinned seed is mixed with the relation OID. One seed shared by every
+// relation would make each table's reservoir replay the identical random
+// stream, correlating which sample POSITIONS survive across all tables — the
+// pinned statistics would then be systematically less representative than an
+// unpinned draw, so the gate would pin a plan set production would not
+// necessarily pick. Mixing keeps a run fully reproducible (the OID is stable
+// for a given cluster) while leaving the per-table samples independent.
+//
+// An explicit `GOOPG_ANALYZE_SEED=0` means "unset" and keeps the wall clock:
+// zero is the sentinel, so there is no way to request the all-zero seed. A
+// mistyped or overflowing value is likewise indistinguishable from unset (see
+// analyzeSeedEnv) — fail-open, because the alternative pins every sample to a
+// single draw that nobody asked for.
+func analyzeSeedFor(tbl *catalog.Table) int64 {
+	if analyzeSeedEnv == 0 {
+		return time.Now().UnixNano()
+	}
+	if tbl == nil {
+		return analyzeSeedEnv
+	}
+	return analyzeSeedEnv ^ int64(tbl.OID)
+}
+
 // analyzeRelationCtx is the Context-aware entry point that
 // honours StatsTarget / AnalyzeRandSeed.
 func analyzeRelationCtx(ctx *Context, tbl *catalog.Table) (*catalog.TableStats, error) {
@@ -545,18 +734,18 @@ func analyzeRelationCtx(ctx *Context, tbl *catalog.Table) (*catalog.TableStats, 
 	}
 	seed := ctx.AnalyzeRandSeed
 	if seed == 0 {
-		seed = time.Now().UnixNano()
+		seed = analyzeSeedFor(tbl)
 	}
 	return analyzeRelationWith(ctx.Pool, ctx.TxnMgr, ctx.Catalog, tbl, target, rand.New(rand.NewSource(seed)), ctx.MultiXact, ctx)
 }
 
 // analyzeRelation is kept as a thin wrapper for tests that don't
 // thread a Context — it uses the upstream-default stats target
-// and a wall-clock-seeded sampler.
+// and a wall-clock-seeded sampler (pinned when `GOOPG_ANALYZE_SEED` is set).
 func analyzeRelation(pool *storage.Pool, mgr *transam.Manager, cat catalog.Catalog, tbl *catalog.Table) (*catalog.TableStats, error) {
 	// nil store: analyzeRelation is the test-only convenience wrapper with no
 	// executor.Context (hence no MultiXact) in scope. M0118-0003.
-	return analyzeRelationWith(pool, mgr, cat, tbl, upstreamDefaultStatsTarget, rand.New(rand.NewSource(time.Now().UnixNano())), nil, nil)
+	return analyzeRelationWith(pool, mgr, cat, tbl, upstreamDefaultStatsTarget, rand.New(rand.NewSource(analyzeSeedFor(tbl))), nil, nil)
 }
 
 // analyzeRelationWith walks every block of tbl under a fresh
@@ -713,6 +902,17 @@ func analyzeRelationWith(pool *storage.Pool, mgr *transam.Manager, cat catalog.C
 			// no second field to disagree).
 			stats.Columns[i].NDistinctFrac = 0
 		}
+	}
+	// B-05a: extended statistics (pg_statistic_ext_data _data write path).
+	// reservoir/tbl/target/stats.RowCount are all in scope here — the same
+	// inputs BuildRelationExtStatistics consumes (sample rows, relation,
+	// computed target, totalrows). dsCtx carries the heap-write handles;
+	// the test-only analyzeRelation wrapper passes nil and skips the write
+	// (its contexts have no Pool). Best-effort: a _data write failure must
+	// never fail ANALYZE itself, matching persistStatsToPGStatistic's
+	// non-fatal contract at the analyzeOp.Next call site.
+	if dsCtx != nil {
+		_ = buildAndStoreExtStatistics(dsCtx, tbl, target, reservoir, stats.RowCount)
 	}
 	return stats, nil
 }
@@ -1144,13 +1344,13 @@ func sortDatumsAscending(ds []Datum) error {
 
 // AnalyzeRelationSampled runs the executor-grade sampled analyzer for one
 // relation without an executor Context: upstream-default stats target,
-// wall-clock-seeded reservoir, full column stats (NDistinct/NullFrac/MCV/
-// histogram/correlation). The autovacuum launcher calls this instead of the
+// wall-clock-seeded reservoir (pinned when `GOOPG_ANALYZE_SEED` is set),
+// full column stats (NDistinct/NullFrac/MCV/histogram/correlation). The autovacuum launcher calls this instead of the
 // simplified commands/vacuum.Analyze so autoanalyze produces planner-grade
 // statistics. pg_statistic heap persistence still requires a Context and is
 // therefore skipped here; the catalog TableStats sidecar (which the planner
 // consumes via internal/optimizer/relsize.go) IS updated by the caller.
 func AnalyzeRelationSampled(pool *storage.Pool, mgr *transam.Manager, cat catalog.Catalog, tbl *catalog.Table) (*catalog.TableStats, error) {
 	return analyzeRelationWith(pool, mgr, cat, tbl, upstreamDefaultStatsTarget,
-		rand.New(rand.NewSource(time.Now().UnixNano())), nil, nil)
+		rand.New(rand.NewSource(analyzeSeedFor(tbl))), nil, nil)
 }
