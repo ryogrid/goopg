@@ -645,7 +645,13 @@ failure/hang in background wastes the session — goal instruction).
     - Narrowed to an IMMEDIATE Gather: all 22 plans build, no crash —
       but `aggregation-strategy` stays 14. **Sound but INERT**: the
       search's Gather always sits behind a Project.
-    **CORRECT FIX: SPLICE the Gather out of the chain, keeping every
+    **ATTEMPT 4 (SPLICE) WORKS — K23 CLOSED.** Under the flip: all 22
+    TPC-H plans build (was 20), `unparsed` 2 -> 0,
+    `aggregation-strategy` 14 -> **10**, and Q9's aggregate is PG's
+    shape exactly (`Finalize HashAggregate -> Gather -> Partial
+    HashAggregate`). Values 22/22 byte-identical UNDER THE FLIP, and
+    default-off plans+values unchanged. Implementation:
+    **SPLICE the Gather out of the chain, keeping every
     wrapper** — `Project(Gather(X))` -> `Project(X)`. A Gather is
     schema-preserving, so the input row's columns (incl. `l_year`) are
     unchanged, which is what the name-matched derivation needs. Needs
@@ -750,6 +756,11 @@ failure/hang in background wastes the session — goal instruction).
 
 ## Log
 
+- 2026-09-09 **Slice 2b DONE (attempt 4, splice) — K23 CLOSED.** The
+  flip no longer costs the Partial/Finalize split: aggregation-strategy
+  14 -> 10, 22/22 plans build, Q9's aggregate matches PG exactly.
+  Values 22/22 identical under the flip. That was R10 DESIGN §7's last
+  documented objection to landing the flip.
 - 2026-09-09 Slice 2b attempt 3: diagnosis COMPLETE. The derivation was
   correct; my helper discarded the Project computing the group key.
   Narrow (immediate-Gather) form is sound but inert. Correct fix

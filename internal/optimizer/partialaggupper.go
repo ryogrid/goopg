@@ -139,11 +139,46 @@ func gatherToUnwrapForPartialAgg(n Node) (Node, bool) {
 	// changing what the aggregate's input row contains, not merely removing a
 	// Gather. Only a Gather sitting DIRECTLY under the aggregate can be
 	// unwrapped without changing the input row's columns.
-	g, ok := n.(*Gather)
-	if !ok || g.Child == nil {
-		return nil, false
+	if g, ok := n.(*Gather); ok {
+		if g.Child == nil {
+			return nil, false
+		}
+		return g.Child, true
 	}
-	return g.Child, true
+	// SPLICE, don't descend. A Gather one or more pass-through wrappers down
+	// is removed from the CHAIN, with every wrapper rebuilt over the Gather's
+	// child — `Project(Gather(X))` becomes `Project(X)`.
+	//
+	// This is what attempt 3 established is required: descending to the
+	// Gather's child discards the wrappers, and on TPC-H Q9 one of them is
+	// the Project computing `l_year`, the very column the aggregate groups
+	// on. A Gather is schema-preserving, so removing only that level leaves
+	// every wrapper's schema and expressions valid over the new child.
+	//
+	// Only kinds whose clone-with-a-new-child is OBVIOUSLY sound are peeled:
+	// a `*Project` (targets and schema unchanged — the child's rows are the
+	// same rows) and a `*Filter` (predicate unchanged, same reason).
+	// Anything else declines, which costs an optimisation and never
+	// correctness.
+	switch w := n.(type) {
+	case *Project:
+		inner, ok := gatherToUnwrapForPartialAgg(w.Child)
+		if !ok {
+			return nil, false
+		}
+		c := *w
+		c.Child = inner
+		return &c, true
+	case *Filter:
+		inner, ok := gatherToUnwrapForPartialAgg(w.Child)
+		if !ok {
+			return nil, false
+		}
+		c := *w
+		c.Child = inner
+		return &c, true
+	}
+	return nil, false
 }
 
 func addPartialAggSplitPath(u *upperRels, grouped *RelOptInfo, seed *Path, aggNode *Aggregate, child Node, cp costParams, ps PlannerSettings) *Path {

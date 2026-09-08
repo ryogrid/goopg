@@ -147,9 +147,58 @@ derivation needs.
 That needs one piece of machinery this attempt lacked: cloning the
 wrapper nodes with a new child.
 
-## 7. Next
+## 7. Fourth attempt — splice, and it works
 
-1. Splice, don't descend (§6).
+Implemented as §6 concluded: a Gather one or more pass-through wrappers
+down is removed **from the chain**, with each wrapper rebuilt over the
+Gather's child. `Project(Gather(X))` → `Project(X)`.
+
+Only kinds whose clone-with-a-new-child is obviously sound are peeled —
+`*Project` (targets and schema unchanged: the child's rows are the same
+rows) and `*Filter` (predicate unchanged, same reason). Anything else
+declines, costing an optimisation and never correctness.
+
+### Result, under the flip, TPC-H
+
+| | before 2b | with the splice |
+|---|---|---|
+| `aggregation-strategy` | 14 | **10** |
+| plans built | 20 of 22 (2 panics) | **22 of 22** |
+| `unparsed` | 2 | **0** |
+
+**Q9's aggregate is now PG's shape exactly:**
+
+```
+goopg:  Finalize HashAggregate -> Gather -> Partial HashAggregate
+PG:     Finalize HashAggregate -> Gather -> Partial HashAggregate
+```
+
+K23 is closed: the flip no longer costs goopg the `Partial`/`Finalize`
+split, which was the last documented objection to landing it under R10
+`DESIGN.md` §7.
+
+### Gates
+
+- TPC-H **values 22/22 byte-identical under the flip** — the
+  load-bearing one, since a mis-split parallel aggregate returns wrong
+  rows rather than an error.
+- Default-off: plans byte-identical, values 22/22 identical.
+- optimizer + executor suites green.
+
+## 8. What the four attempts cost, and bought
+
+1. descend to the Gather's child → panic (discarded the Project);
+2. clear the stamp → same panic (it is applied post-hoc);
+3. immediate-Gather only → sound but inert;
+4. **splice the chain → correct.**
+
+Every one was found wrong by running it. Attempt 3 is what made the
+diagnosis specific — that the derivation matched by NAME and the lost
+Project computed `l_year` — and 4 follows directly from it.
+
+## 9. Next
+
+1. Re-measure TPC-DS under the flip with the splice.
 2. Uncomment the call. Expect `aggregation-strategy` 14 → 10 with **22
    plans**, not 20.
 3. Values gates on both corpora — load-bearing here, since a mis-split
