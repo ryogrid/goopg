@@ -241,6 +241,14 @@ failure/hang in background wastes the session — goal instruction).
   (R11) and `rfjLeafCount` (R12). Apply the rule to TRIAGE ORDER too —
   the failure ranked "most likely a genuine defect" was this bug both
   times it was ranked.
+- **K20 (2026-09-08).** `GOOPG_GATHER_PATHS` gates PARTIAL PATHS only,
+  **not parallelism**. The post-pass (`stampParallelScan` /
+  `MaybeAddGather`) produces a Gather regardless — verified via a test
+  whose control arm sets mode `off` explicitly and still got one. So
+  there is currently **no setting that yields a serial plan** for such
+  a fixture, which breaks any test wanting a serial baseline. Also:
+  `scripts/planner-flags.env` records what the default IS, so it must
+  be regenerated IN THE SAME COMMIT as a default change, never before.
 - **K4 (rev-1 error pattern, from §6).** Never conclude from a file
   without checking its callers (`pathgen.go`/`generateScanPaths` is
   test-only; production seed is `newPrebuiltPath`). Every design must
@@ -435,7 +443,20 @@ failure/hang in background wastes the session — goal instruction).
   build", i.e. a different build side), plus
   `TestSplitEqualityForHashMultiKey` and
   `TestOwnedBuildPoisonPrebuiltBoundary`.
-- [ ] **R13 — adjudicate the 4 real ones AGAINST PG** (not against the
+- [x] **R13 — the mechanical three** — DONE 2026-09-08, findings only,
+  nothing committed as code (deliberately).
+  `r13-mechanical-and-postpass/FINDINGS.md`. The provenance artefact
+  regenerates to a one-line change but **must land WITH the flip** —
+  it records what the default IS, and committing `unset(all)` while the
+  default is `off` would make the stamp bench reports cite a lie.
+  `TestC19fPathModelGather...`'s control arm sets mode off EXPLICITLY
+  and still got a Gather: the post-pass (`stampParallelScan`) is not
+  gated by `GOOPG_GATHER_PATHS` at all (K16's two mechanisms), so no
+  setting gives that fixture a serial baseline. Its assertion is
+  load-bearing ("any row difference is a wrong answer"), so the fix may
+  be an off switch for the post-pass, not a weakened test — a design
+  question, not an edit.
+- [ ] **R14 — adjudicate the 4 real ones AGAINST PG** (not against the
   new output: the criterion is whether the flip's shape is PG's shape),
   then the 2 stage pins + regenerate `scripts/planner-flags.env`, then
   land the flip and run R10 DESIGN §5's gates. Known already: TPC-H
@@ -448,31 +469,31 @@ failure/hang in background wastes the session — goal instruction).
   each expected tree against PG rather than against the new output.
   Then land the flip and run R10 DESIGN §5's gates. Everything already
   known is in R10's report so it need not be re-derived.
-- [ ] **R14 — slice (B): let a node below satisfy the ordering** (K12
+- [ ] **R15 — slice (B): let a node below satisfy the ordering** (K12
   remainder, LARGEST identified lever). Convert HashAggregate to
   GroupAggregate where the order is owed anyway. Needs the upper
   planner to compare paths by PATHKEYS; today `createWindowPaths` takes
   a finished Node and `windowsetoppaths.go:19` records that above the
   search seam inputs carry no pathkeys. Architectural.
-- [ ] **R15 — heap page fill on bulk load** (K14 remainder). goopg
+- [ ] **R16 — heap page fill on bulk load** (K14 remainder). goopg
   leaves ~21.9 bytes/row of free space PG does not (~15% on
   `store_sales`). Compare free space per page directly on both engines
   — do NOT infer from totals again. On-disk question, not planner.
-- [ ] **R16 — `character(N)` blank-padding** (R5 §2.1). An on-disk
+- [ ] **R17 — `character(N)` blank-padding** (R5 §2.1). An on-disk
   PG-compat defect in its own right; shifts `relpages` on every
   `bpchar` table.
-- [ ] **R17 — index-leaf repricing hole** (§7.2, `joinsearch.go:480`),
+- [ ] **R18 — index-leaf repricing hole** (§7.2, `joinsearch.go:480`),
   now with K6's evidence: the winning scans in these plans are PREBUILT
   leaves priced by `costSeqscan` with `numQualOps = 0`, so R1's charge
   never reached them. Fixing this is the precondition for testing
   DESIGN §5's suspect #1.
   Give index leaves their qual charge instead of `numQualOps = 0`.
-- [ ] **R18 — unconditional plain-index-scan arm** (§7.3). Drop/relax the
+- [ ] **R19 — unconditional plain-index-scan arm** (§7.3). Drop/relax the
   `hasUsefulPathkeys` gate so a plain index path is always a candidate.
-- [ ] **R19 — persist correlation** (§7.4). Connection-scoped ANALYZE
+- [ ] **R20 — persist correlation** (§7.4). Connection-scoped ANALYZE
   loses correlation across restart → `corr = 0` → every index scan at
   `max_IO_cost` (`costindex.go:407-420`).
-- [ ] **R20 — re-measure the ONEREL flip.** E-21 Cut 1b routes
+- [ ] **R21 — re-measure the ONEREL flip.** E-21 Cut 1b routes
   single-table statements through the search behind `GOOPG_ONEREL_SEARCH`
   (default OFF, deliberately — removing the rule chooser made plans
   worse under the §3 asymmetry). After R1/R2 change the prices, re-run
@@ -481,6 +502,11 @@ failure/hang in background wastes the session — goal instruction).
 
 ## Log
 
+- 2026-09-08 R13 done (findings only, nothing committed as code): the
+  provenance artefact must land WITH the flip or the stamp lies; and
+  mode=off still produces a Gather because the post-pass is ungated
+  (K20), so that test's control arm cannot get a serial baseline at any
+  setting. R10's set stays at 7, now fully characterised.
 - 2026-09-08 R12 done: 8 -> 7. The outer-join null-extension failure —
   R11's "most likely genuine defect" — was K19's fourth walker.
   4 of the remaining 7 show REAL plan movement and need adjudicating
