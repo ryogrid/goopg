@@ -325,6 +325,20 @@ join-order **95/17**, parallelism 89/16, aggregation-strategy 81/10,
 sort-strategy 79/13, join-method 72/12, scan-type 72/14,
 parameterisation 42/6, rendering 35/7, qual-placement 13/6.
 
+**K26 (2026-09-09): join-order's cause is now MEASURED** — see
+`K26-join-order-implied-equalities.md`. goopg's DP declines
+`{part}|{partsupp}` on TPC-H Q9 with `reason=no-join-clause` (20 such
+declines), because Q9's clauses all run through `lineitem` and those
+two rels share no DIRECT clause. PG joins them via an EQUIVALENCE
+CLASS: both are equated to `l_partkey`, so
+`generate_join_implied_equalities` (equivclass.c) synthesises
+`p_partkey = ps_partkey`. goopg HAS equivalence classes
+(`equiv_class.go`) but the seam gives the search only "the equivalence
+class's CONSTANTS", never derived JOIN CLAUSES. That single gap makes
+goopg's reachable join orders a strict subset of PG's on any
+star-shaped query — most of TPC-H, essentially all of TPC-DS. It is
+CANDIDATE GENERATION, so no cost work can reach it.
+
 **join-order is the dominant blocker and is UNTOUCHED** — it is the
 join search reproducing PG's `join_search_one_level`, larger than
 anything attempted so far.
@@ -775,6 +789,10 @@ anything attempted so far.
 
 ## Log
 
+- 2026-09-09 K26 measured: join-order's dominant cause is that goopg
+  never synthesises implied join equalities from its equivalence
+  classes, so star-shaped queries can only be joined through the fact
+  table. Next round: port `generate_join_implied_equalities`.
 - 2026-09-09 Roadmap note added (`ROADMAP-to-all-match.md`): measured
   that reaching ALL-match is a conjunction of 6 category programs plus
   2 storage items. join-order blocks 95/99 TPC-DS and 17/22 TPC-H and
