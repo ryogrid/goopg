@@ -526,6 +526,16 @@ func seamLeafLocalFilters(n Node) []*Filter {
 			walk(t.Child)
 		case *Sort:
 			walk(t.Child)
+		// R11 (plan-parity-fix-take2): descend through the parallel wrappers.
+		// Once partial paths are enabled a Gather sits above the searched
+		// tree, and a walker that stops there reports zero of whatever it
+		// counts — which reads as a catastrophic search regression when the
+		// search is fine. This blindness accounted for most of the 15
+		// failures that made R10 revert.
+		case *Gather:
+			walk(t.Child)
+		case *GatherMerge:
+			walk(t.Child)
 		}
 	}
 	walk(n)

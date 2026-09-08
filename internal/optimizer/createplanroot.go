@@ -435,6 +435,17 @@ func boundaryWalkChildren(n Node) []Node {
 		return []Node{x.Child}
 	case *Memoize:
 		return []Node{x.Child}
+	// R11 (plan-parity-fix-take2): the parallel wrappers. This function's
+	// contract is "every kind that can sit between a statement's root and a
+	// spliced searched subtree", and once partial paths are admitted
+	// (GOOPG_GATHER_PATHS) a Gather sits exactly there — so without these the
+	// walk ENDS at the Gather and the boundary below it is never reached.
+	// Both are single-child pass-throughs, so enumerating them is safe
+	// regardless of the knob's setting.
+	case *Gather:
+		return []Node{x.Child}
+	case *GatherMerge:
+		return []Node{x.Child}
 	case *Join:
 		return []Node{x.Left, x.Right}
 	case *SetOp:

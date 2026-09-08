@@ -171,6 +171,15 @@ func rfjJoins(n Node) []*Join {
 			walk(t.Child)
 		case *Sort:
 			walk(t.Child)
+		// R11 (plan-parity-fix-take2): descend through the parallel wrappers.
+		// Without these the walker STOPS AT THE ROOT once partial paths are
+		// enabled (a Gather sits above the join tree) and reports "0 joins",
+		// which reads as a catastrophic search regression when the search is
+		// in fact fine — it cost R10 a reverted round to tell the two apart.
+		case *Gather:
+			walk(t.Child)
+		case *GatherMerge:
+			walk(t.Child)
 		}
 	}
 	walk(n)

@@ -227,6 +227,16 @@ failure/hang in background wastes the session — goal instruction).
   use a fixed `parity-capture-$$.sql` name. **Anything that diffs two
   captures — especially a plan PIN — must not reintroduce a random
   path into the output.**
+- **K19 (2026-09-08).** Walkers that switch on node kind must handle
+  `*Gather`/`*GatherMerge` or they stop at the ROOT once partial paths
+  are admitted and report zero of whatever they count. This produced
+  messages like "searched tree has 0 joins" and "an ON qual was
+  dropped, which is a cross product" from a planner that was working
+  correctly — TPC-H values under the flip are 22/22 byte-identical.
+  Fixed in `rfjJoins`, `seamLeafLocalFilters` and **production**
+  `boundaryWalkChildren`. **Run the cheap decisive check (values)
+  before diagnosing an alarming message**; it is what separated a
+  walker gap from a search regression here.
 - **K4 (rev-1 error pattern, from §6).** Never conclude from a file
   without checking its callers (`pathgen.go`/`generateScanPaths` is
   test-only; production seed is `newPrebuiltPath`). Every design must
@@ -398,35 +408,50 @@ failure/hang in background wastes the session — goal instruction).
   ORIGINAL SCOPE: Full
   values gates both corpora; adjudicate every moved plan; explain the
   `aggregation-strategy` 10 -> 14 move before accepting.
-- [ ] **R11 — adjudicate R10's 15 tests**, in three groups, reading
+- [x] **R11 — adjudicate R10's 15 tests** — DONE 2026-09-08.
+  `r11-adjudicate-gather-walkers/REPORT.md`. **15 -> 8.** Seven were one
+  bug in three walkers that cannot descend a `Gather` — including
+  `boundaryWalkChildren`, which is PRODUCTION code whose own contract
+  says it enumerates "every kind that can sit between a statement's
+  root and a spliced searched subtree". Fixes landed and green at the
+  shipping default. R10's alarming messages ("0 joins", "an ON qual was
+  dropped, which is a cross product") were walker blindness: TPC-H
+  values under the flip are 22/22 byte-identical, which was checked
+  BEFORE diagnosing. 8 remain (2 stage pins, 1 generated artefact,
+  5 needing real judgement).
+- [ ] **R12 — the remaining 8** (`remaining-under-the-flip.txt`), start
+  with `TestSeamPlansARightLinkInsideOneSearchProblem` (outer-join
+  null-extension — the class where a wrong answer is silent). Then land
+  the flip and run R10 DESIGN §5's gates. NOTE: TPC-H values are
+  already known identical under the flip. ORIGINAL R11 SCOPE: reading
   each expected tree against PG rather than against the new output.
   Then land the flip and run R10 DESIGN §5's gates. Everything already
   known is in R10's report so it need not be re-derived.
-- [ ] **R12 — slice (B): let a node below satisfy the ordering** (K12
+- [ ] **R13 — slice (B): let a node below satisfy the ordering** (K12
   remainder, LARGEST identified lever). Convert HashAggregate to
   GroupAggregate where the order is owed anyway. Needs the upper
   planner to compare paths by PATHKEYS; today `createWindowPaths` takes
   a finished Node and `windowsetoppaths.go:19` records that above the
   search seam inputs carry no pathkeys. Architectural.
-- [ ] **R13 — heap page fill on bulk load** (K14 remainder). goopg
+- [ ] **R14 — heap page fill on bulk load** (K14 remainder). goopg
   leaves ~21.9 bytes/row of free space PG does not (~15% on
   `store_sales`). Compare free space per page directly on both engines
   — do NOT infer from totals again. On-disk question, not planner.
-- [ ] **R14 — `character(N)` blank-padding** (R5 §2.1). An on-disk
+- [ ] **R15 — `character(N)` blank-padding** (R5 §2.1). An on-disk
   PG-compat defect in its own right; shifts `relpages` on every
   `bpchar` table.
-- [ ] **R15 — index-leaf repricing hole** (§7.2, `joinsearch.go:480`),
+- [ ] **R16 — index-leaf repricing hole** (§7.2, `joinsearch.go:480`),
   now with K6's evidence: the winning scans in these plans are PREBUILT
   leaves priced by `costSeqscan` with `numQualOps = 0`, so R1's charge
   never reached them. Fixing this is the precondition for testing
   DESIGN §5's suspect #1.
   Give index leaves their qual charge instead of `numQualOps = 0`.
-- [ ] **R16 — unconditional plain-index-scan arm** (§7.3). Drop/relax the
+- [ ] **R17 — unconditional plain-index-scan arm** (§7.3). Drop/relax the
   `hasUsefulPathkeys` gate so a plain index path is always a candidate.
-- [ ] **R17 — persist correlation** (§7.4). Connection-scoped ANALYZE
+- [ ] **R18 — persist correlation** (§7.4). Connection-scoped ANALYZE
   loses correlation across restart → `corr = 0` → every index scan at
   `max_IO_cost` (`costindex.go:407-420`).
-- [ ] **R18 — re-measure the ONEREL flip.** E-21 Cut 1b routes
+- [ ] **R19 — re-measure the ONEREL flip.** E-21 Cut 1b routes
   single-table statements through the search behind `GOOPG_ONEREL_SEARCH`
   (default OFF, deliberately — removing the rule chooser made plans
   worse under the §3 asymmetry). After R1/R2 change the prices, re-run
@@ -435,6 +460,11 @@ failure/hang in background wastes the session — goal instruction).
 
 ## Log
 
+- 2026-09-08 R11 done: R10's 15 failures triaged 15 -> 8. Seven were
+  one bug in three Gather-blind walkers, one of them production
+  (`boundaryWalkChildren`). Fixes landed, green at the shipping
+  default. Flip still reverted pending the 5 substantive claims among
+  the remaining 8.
 - 2026-09-08 R10 attempted and REVERTED: flipping GOOPG_GATHER_PATHS to
   `all` fails 15 tests pinning the pre-flip world, in >=3 classes,
   including the test written FOR this mechanism. Reverted rather than
