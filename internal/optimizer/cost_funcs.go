@@ -399,22 +399,140 @@ func costAgg(cp costParams, strategy AggStrategy, inputRows, inputStartup, input
 	}
 	total := startup + finalPerGroup*groups + cp.cpuTupleCost*groups
 
-	// NO spill arm — deliberately, not an omission. PG's arm charges
-	// batches the executor actually writes; goopg's `aggregateOp`
-	// "performs grouped aggregation in memory"
-	// (operators_join_agg.go:1973) with no spill path at all, so every
-	// spill page charged here would be I/O that never happens — and a
-	// fictional charge flips real plans (measured: it drove Q3/Q10/Q13/Q18
-	// to sorted, Q13 5.67 s → 8.71 s, all four away from PG's hash). A
-	// memory-blind model that picks hash for a 100M-group query risks the
-	// OOM instead, but that failure already exists today and a fake I/O
-	// number does not fix it. Resume WITH executor spill support, pricing
-	// the batches the executor really writes (the JOIN spill currency in
-	// `spillPages` is the template, not PG's depth loop — goopg has no
-	// recursive hash partitioning).
-	// (inNcols/inAvgVarBytes are the spill arm's future inputs — kept so
-	// the resume does not re-plumb every caller.)
+	// SPILL ARM (R3, plan-parity-fix-take2) — `cost_agg`'s AGG_HASHED tail
+	// (costsize.c:2783-2840). This arm used to be absent, and the comment
+	// that stood here explained why: goopg's `aggregateOp` aggregates in
+	// memory with no spill path, so the pages charged here are I/O that
+	// never happens.
+	//
+	// Reinstated because the charge's PURPOSE is not to predict goopg's
+	// I/O — it is to express "this hash table does not fit". That fact is
+	// true of goopg too, and more so: goopg cannot spill in response to
+	// it. Without the arm a 100-million-group hash table priced exactly
+	// like a ten-group one while the sorted rival always paid a full Sort,
+	// so hash won every large grouping by construction. Measured over
+	// TPC-DS SF0.5: goopg emitted `GroupAggregate` 1x / `HashAggregate`
+	// 133x where PG 18.3 emits 100x / 29x, with the sorted candidate
+	// present on both sides. The arm steers those to `GroupAggregate`,
+	// whose input Sort goopg CAN spill — it removes an OOM exposure
+	// rather than adding one.
+	//
+	// The prior objection also recorded a timing move (Q13 5.67 s ->
+	// 8.71 s). Under this workstream's rule a plan that matches PG is not
+	// a regression however slow, and the parity half of that objection was
+	// measured against references later shown to be invalid (a stale
+	// serial PG fixture; a 128x work_mem gap) — see
+	// docs/design/not_ralph/plan_parity_fix_take2/r3-hashagg-spill/DESIGN.md §2.
+	//
+	// Note the arm is INERT below the memory threshold: `hashAggSetLimits`
+	// returns early when the groups fit, which collapses nbatches to 1 and
+	// depth to 0, so a grouping that fits prices bit-identically to before.
+	if strategy == AggStrategyHashed && inAvgVarBytes > 0 {
+		entry := hashAggEntrySize(nAggs, inAvgVarBytes)
+		memLimit, ngroupsLimit, numPartitions := hashAggSetLimits(cp, entry, groups)
+		nbatches := math.Max(groups*entry/memLimit, groups/ngroupsLimit)
+		nbatches = math.Max(math.Ceil(nbatches), 1)
+		if numPartitions < 2 {
+			numPartitions = 2
+		}
+		depth := math.Ceil(math.Log(nbatches) / math.Log(float64(numPartitions)))
+		if depth > 0 {
+			// `relation_byte_size(input_tuples, input_width) / BLCKSZ`.
+			pages := tuples * inAvgVarBytes / float64(blockSizeBytes)
+			// "HashAgg has somewhat worse IO behavior than Sort on typical
+			// hardware/OS combinations" — PG's explicit generic penalty.
+			written := pages * depth * 2.0
+			read := pages * depth * 2.0
+			// Writes accrue to startup AND total; reads only to total.
+			spillCPU := depth * tuples * 2.0 * cp.cpuTupleCost
+			startup += written*cp.randomPageCost + spillCPU
+			total += written*cp.randomPageCost + read*cp.seqPageCost + spillCPU
+		}
+	}
+
 	return Cost{Startup: startup, Total: total}
+}
+
+// hashAggEntrySize is `hash_agg_entry_size` (nodeAgg.c:1701): the bytes one
+// group occupies in the aggregate's hash table. transitionSpace is 0 — goopg
+// has no per-aggregate transition-space estimate, and PG's own expression
+// degrades to the same when it is 0. Getting it wrong can only UNDER-charge,
+// never invent a spill that PG would not see.
+func hashAggEntrySize(numTrans int, tupleWidth float64) float64 {
+	const (
+		sizeofMinimalTupleHeader = 16 // MAXALIGN(SizeofMinimalTupleHeader)
+		perGroupDataSize         = 16 // sizeof(AggStatePerGroupData)
+		maxAlign                 = 8
+	)
+	tupleSize := float64(sizeofMinimalTupleHeader) + tupleWidth
+	// MAXALIGN(tupleSize)
+	tupleChunk := math.Ceil(tupleSize/maxAlign) * maxAlign
+	return tupleChunk + float64(numTrans*perGroupDataSize)
+}
+
+// hashAggSetLimits is `hash_agg_set_limits` (nodeAgg.c:1809). `cp.workMem` is
+// already `get_hash_memory_limit()` — work_mem times hash_mem_multiplier, in
+// bytes — so it is used directly.
+//
+// The early return is load-bearing for R3: when the groups fit, the caller's
+// nbatches collapses to 1 and its depth to 0, so the spill arm charges exactly
+// nothing and no in-memory grouping can change plan.
+func hashAggSetLimits(cp costParams, entrySize, inputGroups float64) (memLimit, ngroupsLimit float64, numPartitions int) {
+	hashMemLimit := float64(cp.workMem)
+	if hashMemLimit <= 0 || entrySize <= 0 {
+		// No budget to reason about: behave as if everything fits, which is
+		// the pre-R3 price.
+		return math.MaxFloat64, math.MaxFloat64, 0
+	}
+	if inputGroups*entrySize <= hashMemLimit {
+		return hashMemLimit, hashMemLimit / entrySize, 0
+	}
+	npartitions := hashAggChooseNumPartitions(hashMemLimit, inputGroups, entrySize)
+	// HASHAGG_READ_BUFFER_SIZE + HASHAGG_WRITE_BUFFER_SIZE * npartitions,
+	// both BLCKSZ.
+	partitionMem := float64(blockSizeBytes) + float64(blockSizeBytes)*float64(npartitions)
+	// "Don't set the limit below 3/4 of hash_mem."
+	if hashMemLimit > 4*partitionMem {
+		memLimit = hashMemLimit - partitionMem
+	} else {
+		memLimit = hashMemLimit * 0.75
+	}
+	if memLimit > entrySize {
+		ngroupsLimit = memLimit / entrySize
+	} else {
+		ngroupsLimit = 1
+	}
+	return memLimit, ngroupsLimit, npartitions
+}
+
+// hashAggChooseNumPartitions is `hash_choose_num_partitions` (nodeAgg.c:412):
+// enough partitions that each is likely to fit, capped so the open partition
+// files cannot themselves eat more than a quarter of hash_mem, then rounded UP
+// to a power of two (PG derives the count from ceil(log2()) bits).
+func hashAggChooseNumPartitions(hashMemLimit, inputGroups, entrySize float64) int {
+	const (
+		partitionFactor = 1.50 // HASHAGG_PARTITION_FACTOR
+		minPartitions   = 4    // HASHAGG_MIN_PARTITIONS
+		maxPartitions   = 1024 // HASHAGG_MAX_PARTITIONS
+	)
+	partitionLimit := (hashMemLimit*0.25 - float64(blockSizeBytes)) / float64(blockSizeBytes)
+	memWanted := partitionFactor * inputGroups * entrySize
+	dpartitions := 1 + memWanted/hashMemLimit
+	if dpartitions > partitionLimit {
+		dpartitions = partitionLimit
+	}
+	if dpartitions < minPartitions {
+		dpartitions = minPartitions
+	}
+	if dpartitions > maxPartitions {
+		dpartitions = maxPartitions
+	}
+	// my_log2 is ceil(log2(n)); the count is then 1 << bits.
+	bits := int(math.Ceil(math.Log2(dpartitions)))
+	if bits < 0 {
+		bits = 0
+	}
+	return 1 << bits
 }
 
 // tuplesortMergeOrder is `tuplesort_merge_order` (tuplesort.c): how many input

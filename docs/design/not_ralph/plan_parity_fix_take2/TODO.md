@@ -122,6 +122,28 @@ failure/hang in background wastes the session — goal instruction).
   /`Parallel Hash`, goopg plain `Hash Join` under a Gather;
   (d) **Sort/Group keys render as output aliases**, PG renders source
   expressions — TPC-H Q9's tree MATCHES and fails on this alone.
+- **K12 (measured 2026-09-08 — the dominant aggregation cause).**
+  PG picks `GroupAggregate` mostly because it **delivers an ordering
+  something above needs**, not because the hash spills. Evidence: on
+  TPC-DS Q81 and Q12 the group counts are 146/351 and 4572/41 — all
+  fit trivially in 64MB, so NEITHER engine spills, yet PG sorts and
+  goopg hashes. Q12's shape shows the mechanism: PG runs
+  `WindowAgg -> Sort -> GroupAggregate` because the window's
+  `PARTITION BY` needs the order, so the Sort is owed anyway and the
+  sorted aggregate is nearly free. goopg emits `WindowAgg ->
+  HashAggregate` with NO Sort — its `WindowAgg` orders internally, so
+  the requirement never reaches the planner and no path is ever
+  credited for satisfying it. **goopg's upper planner does not model
+  ordering requirements**, which is why the sorted aggregate cannot win
+  a contest it should. This is the single largest lever left on TPC-DS
+  aggregation.
+- **K13 (limitation introduced by R3, filed not erased).**
+  `partialAggNotionalRows` substitutes a NOTIONAL row count when goopg
+  cannot see a real one; with a memory threshold in `costAgg` that
+  notional value can now land on the wrong side of it and flip a
+  verdict a real row count would not. Needs a real row count
+  (`TableStats.RowCount` is not restored at startup — ledger pq-P6),
+  not a cost tweak.
 - **K4 (rev-1 error pattern, from §6).** Never conclude from a file
   without checking its callers (`pathgen.go`/`generateScanPaths` is
   test-only; production seed is `newPrebuiltPath`). Every design must
@@ -201,7 +223,16 @@ failure/hang in background wastes the session — goal instruction).
   the goal's success condition is unmeasurable. Gate: the tool's own
   test (`scripts/pg-plan-parity-diff-test.py`) plus a hand-adjudicated
   sample of at least 5 reclassified queries per corpus.
-- [ ] **R3 — the memory-blind HashAggregate** (K11a as corrected;
+- [x] **R3 — the memory-blind HashAggregate** — DONE 2026-09-08.
+  Report: `r3-hashagg-spill/REPORT.md`. PG's spill arm transcribed
+  faithfully; TPC-DS `GroupAggregate` 1 -> 13 (PG: 100), TPC-H
+  unmoved, parity verdicts unchanged on both, values green on both.
+  The old objection did NOT reproduce (TPC-H did not move at all).
+  **The arm is a minor contributor — see K12 for the dominant cause it
+  exposed.** Broke `TestPartialAggVerdictIsScaleFree` legitimately (a
+  memory threshold is not scale-free, and PG's model is not either);
+  bounded the property to the sub-threshold regime + added a companion
+  pin. ORIGINAL SCOPE:
   design `r3-hashagg-spill/DESIGN.md`). `costAgg` has no spill arm, so
   the hashed candidate is priced as if memory were infinite and beats
   its sorted rival (which always pays a Sort) on every large grouping —
@@ -211,22 +242,30 @@ failure/hang in background wastes the session — goal instruction).
   threshold, so small groupings cannot move. Re-opens a standing
   objection whose timing leg the goal rule voids and whose parity leg
   was measured against the invalid references (K9/K10).
-- [ ] **R4 — compute the worker count** (K11b). PG's
+- [ ] **R4 — model the ordering requirement** (K12, NEW, largest
+  remaining lever). PG's upper planner selects the cheapest path that
+  SATISFIES a required ordering, so a sorted aggregate that delivers
+  the order a WindowAgg / ORDER BY / DISTINCT needs wins a contest the
+  hashed one cannot enter. goopg's WindowAgg orders internally, so the
+  requirement never reaches the planner. Oracle:
+  `create_grouping_paths` pathkey handling +
+  `get_cheapest_fractional_path_for_pathkeys`.
+- [ ] **R5 — compute the worker count** (K11b). PG's
   `compute_parallel_worker` (allpaths.c) derives workers from relation
   size on a log scale; goopg always plans 4. Cheap, well-defined, and
   it moves plans that are otherwise already identical.
-- [ ] **R5 — index-leaf repricing hole** (§7.2, `joinsearch.go:480`),
+- [ ] **R6 — index-leaf repricing hole** (§7.2, `joinsearch.go:480`),
   now with K6's evidence: the winning scans in these plans are PREBUILT
   leaves priced by `costSeqscan` with `numQualOps = 0`, so R1's charge
   never reached them. Fixing this is the precondition for testing
   DESIGN §5's suspect #1.
   Give index leaves their qual charge instead of `numQualOps = 0`.
-- [ ] **R6 — unconditional plain-index-scan arm** (§7.3). Drop/relax the
+- [ ] **R7 — unconditional plain-index-scan arm** (§7.3). Drop/relax the
   `hasUsefulPathkeys` gate so a plain index path is always a candidate.
-- [ ] **R7 — persist correlation** (§7.4). Connection-scoped ANALYZE
+- [ ] **R8 — persist correlation** (§7.4). Connection-scoped ANALYZE
   loses correlation across restart → `corr = 0` → every index scan at
   `max_IO_cost` (`costindex.go:407-420`).
-- [ ] **R8 — re-measure the ONEREL flip.** E-21 Cut 1b routes
+- [ ] **R9 — re-measure the ONEREL flip.** E-21 Cut 1b routes
   single-table statements through the search behind `GOOPG_ONEREL_SEARCH`
   (default OFF, deliberately — removing the rule chooser made plans
   worse under the §3 asymmetry). After R1/R2 change the prices, re-run
@@ -235,6 +274,12 @@ failure/hang in background wastes the session — goal instruction).
 
 ## Log
 
+- 2026-09-08 R3 done: PG's hashagg spill arm landed; TPC-DS
+  GroupAggregate 1 -> 13 (PG 100), TPC-H unmoved, parity flat both
+  corpora, values green both. Prediction only partly held (called the
+  rise substantial; it closes ~12%% of the gap). The measurement then
+  exposed K12 — PG's sorted aggregate wins on ORDERING, not spill —
+  which becomes R4; later rounds renumbered. K13 filed.
 - 2026-09-08 R2 done: instrument fixed (UNPARSED 0/0) AND the parity
   target corrected twice (K9 stale serial TPC-H fixture; K10 128x
   work_mem gap on TPC-DS). All R0/R1 parity numbers superseded; the

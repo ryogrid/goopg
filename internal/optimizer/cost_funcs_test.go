@@ -308,3 +308,85 @@ func TestHashJoinBucketWalkIsCharged(t *testing.T) {
 		t.Errorf("bucket-walk delta = %v, want %v", got, wantGap)
 	}
 }
+
+// TestCostAggHashSpillInertBelowThreshold (R3, plan-parity-fix-take2) pins the
+// load-bearing property of the spill arm: `hash_agg_set_limits` returns early
+// when the groups fit in hash memory, which collapses nbatches to 1 and depth
+// to 0, so a grouping that fits prices EXACTLY as it did before the arm
+// existed. If this ever fails, the arm has started moving plans that have no
+// memory problem — the opposite of its purpose.
+func TestCostAggHashSpillInertBelowThreshold(t *testing.T) {
+	cp := defaultCostParams()
+	// 1000 groups of ~100 bytes is ~100KB against a multi-MB work_mem.
+	fits := costAgg(cp, AggStrategyHashed, 1e6, 0, 1000, 2, 1000, 1, 8, 100)
+	// The same call with the width the arm keys on removed must agree: with
+	// no width there is nothing to size an entry with, and the arm declines.
+	blind := costAgg(cp, AggStrategyHashed, 1e6, 0, 1000, 2, 1000, 1, 8, 0)
+	if !approxCost(fits.Total, blind.Total) || !approxCost(fits.Startup, blind.Startup) {
+		t.Fatalf("in-memory grouping was charged for spill: %+v vs unpriced %+v", fits, blind)
+	}
+}
+
+// TestCostAggHashSpillChargedAboveThreshold pins that the arm does fire, that
+// it moves BOTH axes, and that it obeys PG's asymmetry — writes accrue to
+// startup and total, reads to total only — so the total must rise strictly
+// more than the startup (costsize.c:2836-2839).
+func TestCostAggHashSpillChargedAboveThreshold(t *testing.T) {
+	cp := defaultCostParams()
+	// 200M groups x ~120B/entry vastly exceeds any work_mem: guaranteed spill.
+	spilled := costAgg(cp, AggStrategyHashed, 4e8, 0, 1e6, 2, 2e8, 1, 8, 100)
+	blind := costAgg(cp, AggStrategyHashed, 4e8, 0, 1e6, 2, 2e8, 1, 8, 0)
+	if spilled.Total <= blind.Total {
+		t.Fatalf("spilling grouping not charged: %v <= %v", spilled.Total, blind.Total)
+	}
+	if spilled.Startup <= blind.Startup {
+		t.Fatalf("spill writes must accrue to startup too: %v <= %v",
+			spilled.Startup, blind.Startup)
+	}
+	dTotal := spilled.Total - blind.Total
+	dStartup := spilled.Startup - blind.Startup
+	if dTotal <= dStartup {
+		t.Fatalf("reads accrue to total only, so total must move more: "+
+			"dTotal=%v dStartup=%v", dTotal, dStartup)
+	}
+	// The sorted rival must now be able to win a large grouping. Same input,
+	// but the sorted arm pays a Sort in its inputTotal — give it a generous
+	// one and it should still beat the spilling hash.
+	sorted := costAgg(cp, AggStrategySorted, 4e8, 0, 5e6, 2, 2e8, 1, 8, 100)
+	if sorted.Total >= spilled.Total {
+		t.Fatalf("sorted still cannot win a spilling grouping: sorted=%v hashed=%v",
+			sorted.Total, spilled.Total)
+	}
+}
+
+// TestHashAggEntrySizeAndLimits pins the two transcribed helpers against PG's
+// formulas (nodeAgg.c:1701 hash_agg_entry_size, :1809 hash_agg_set_limits,
+// :412 hash_choose_num_partitions) on worked values.
+func TestHashAggEntrySizeAndLimits(t *testing.T) {
+	// MAXALIGN(16 + 100) = 120, plus 2 trans * 16 = 32 -> 152.
+	if got := hashAggEntrySize(2, 100); got != 152 {
+		t.Fatalf("hashAggEntrySize(2,100) = %v, want 152", got)
+	}
+	// MAXALIGN(16 + 101) = 120 as well (117 rounds to 120).
+	if got := hashAggEntrySize(0, 101); got != 120 {
+		t.Fatalf("hashAggEntrySize(0,101) = %v, want 120", got)
+	}
+	cp := defaultCostParams()
+	// Fits: early return hands back the whole budget and no partitions.
+	mem, ng, np := hashAggSetLimits(cp, 100, 10)
+	if mem != float64(cp.workMem) || np != 0 || ng != float64(cp.workMem)/100 {
+		t.Fatalf("fitting case: mem=%v ngroups=%v parts=%v", mem, ng, np)
+	}
+	// Spills: partitions are a power of two, at least HASHAGG_MIN_PARTITIONS,
+	// and the limit is reduced but never below 3/4 of the budget.
+	mem, ng, np = hashAggSetLimits(cp, 100, 1e9)
+	if np < 4 || np&(np-1) != 0 {
+		t.Fatalf("partitions must be a power of two >= 4, got %v", np)
+	}
+	if mem < float64(cp.workMem)*0.75 || mem > float64(cp.workMem) {
+		t.Fatalf("mem limit %v outside [0.75*budget, budget] (%v)", mem, cp.workMem)
+	}
+	if ng < 1 {
+		t.Fatalf("ngroups limit must be at least 1, got %v", ng)
+	}
+}
