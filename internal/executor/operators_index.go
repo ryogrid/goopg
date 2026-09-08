@@ -193,6 +193,14 @@ type indexScanOp struct {
 	// no enum column, which is every TPC-H and TPC-DS table.
 	// See resolveEnumColumns (enumcols.go).
 	enumTypes []*catalog.EnumType
+	// colInfo is the per-column decode memo (resolveColTypeInfo), resolved
+	// once in openPrep from o.plan.Table.Columns -- the SAME slice Next()
+	// decodes with, which is the positional-indexing precondition
+	// decodeRowIntoInfo documents. Without it this operator decoded through
+	// the public entry points, which hardcode info = nil, so every value
+	// re-derived its type facts from a string: 29.70% of TPC-H CPU reached
+	// decodeRowRangeInfo this way. seqScanOp already threaded its memo.
+	colInfo []colTypeInfo
 	// M0092-0001: TID-list-eager + heap-fetch-lazy.
 	// `tids[i]` holds the (block, index-pointed offset) pair for the
 	// i-th match emitted by btree.RangeScan. The HOT-resolved actual
@@ -342,8 +350,10 @@ func (o *indexScanOp) openPrep(ctx *Context) error {
 	// memo DDL-safe -- the same rule the sequential scan and colTypeInfo use.
 	if o.plan.Table != nil {
 		o.enumTypes, _ = resolveEnumColumns(ctx.Catalog, o.plan.Table.Columns)
+		o.colInfo = resolveColTypeInfo(o.plan.Table.Columns)
 	} else {
 		o.enumTypes = nil
+		o.colInfo = nil
 	}
 	o.tids = nil
 	o.poss = nil
@@ -758,10 +768,11 @@ func (o *indexScanOp) Next() (TupleSlot, error) {
 			// Tuple-decompose + range-decode by name: there is NO HeapTuple
 			// range helper, so natts comes from Infomask2 at this site.
 			natts := int(tuple.Header.Infomask2 & storage.HeapNattsMask)
-			_, decErr = DecodeRowRangeIntoMctxPGTupleStyled(o.scanRow, cols, tuple.Data, tuple.Bitmap, natts, nil, array.DefaultOutputStyle(), 0, survivorBound, 0)
+			_, decErr = decodeRowRangeInfo(o.scanRow, cols, o.colInfo, tuple.Data, tuple.Bitmap, natts, nil, array.DefaultOutputStyle(), 0, survivorBound, 0)
 			poisonDeformTail(o.scanRow, survivorBound)
 		} else {
-			decErr = DecodeHeapTupleRowInto(o.scanRow, cols, tuple, nil)
+			natts2 := int(tuple.Header.Infomask2 & storage.HeapNattsMask)
+			decErr = decodeRowIntoInfo(o.scanRow, cols, o.colInfo, tuple.Data, tuple.Bitmap, natts2, nil, array.DefaultOutputStyle())
 		}
 		slot.RUnlock()
 		o.ctx.Pool.Unpin(slot)

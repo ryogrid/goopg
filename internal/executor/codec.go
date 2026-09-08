@@ -1438,16 +1438,21 @@ func decodeRowRangeInfo(dst Row, cols []catalog.Column, info []colTypeInfo, data
 			align int
 			tname string
 		)
+		// isVarlena is the third per-value string derivation this memo
+		// exists to remove; it was previously re-derived here on BOTH
+		// paths, including the one that already had info[i] in hand.
+		var isVarlena bool
 		if info != nil {
-			align, tname = info[i].align, info[i].lower
+			align, tname, isVarlena = info[i].align, info[i].lower, info[i].isVarlena
 		} else {
 			tname = strings.ToLower(c.Type.Name)
 			align = physicalPGTypeAlignLowered(c.Type, tname)
+			isVarlena = pgPhysicalTypeIsVarlena(c.Type)
 		}
 		// D-09 att_align_pointer: the peek decides only whether to
 		// align (shared rule: catalog.AttAlignPointer). Bounds-safe:
 		// OOB cursor returns unchanged and trips the exhausted arm.
-		off = catalog.AttAlignPointer(data, off, align, pgPhysicalTypeIsVarlena(c.Type))
+		off = catalog.AttAlignPointer(data, off, align, isVarlena)
 		if off >= len(data) {
 			// Data exhausted — treat remaining columns as NULL.
 			dst[i] = NullDatum
