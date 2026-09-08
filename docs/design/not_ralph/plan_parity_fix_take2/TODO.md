@@ -305,6 +305,21 @@ failure/hang in background wastes the session — goal instruction).
   unexported POINTER such walks reach; `searchPathkeys` is a slice and
   never took that branch). Copying, serialisation and deep-equal will
   hit this too.
+- **K27 (verified 2026-09-09, live write+restart+read).** Correlation
+  PERSISTS across restart at HEAD — R23's stated blocker is stale.
+  `ANALYZE store_sales` on a private SF0.5 clone wrote slot 3
+  (`ss_sold_date_sk` 0.14367048); after stop+restart the same session
+  reads back byte-identical values. Write path
+  (`pg18_user_catalog_rows.go` slot-3 writer), decode
+  (`codec.go:DecodePGStatisticPhysicalRow` stanumbers3 arm) and restore
+  (`open.go` `Correlation: float64(sr.Correlation)`) all confirmed live,
+  not by reading. What is TRUE underneath: the bench heaps predate the
+  slot-3 writer, so their restored stats have no correlation slot
+  (TPC-DS `pg_stats.correlation` empty where n_distinct is present) —
+  an OPERATIONAL gap (re-ANALYZE), not a code gap.   NOT done here:
+  re-ANALYZEing shared bench clusters would mutate peer measurement
+  state. TPC-H lineitem.l_orderkey reads -0.0018 post-restore, which is
+  the computed value on unordered HammerDB input, not a defect signal.
 - **K4 (rev-1 error pattern, from §6).** Never conclude from a file
   without checking its callers (`pathgen.go`/`generateScanPaths` is
   test-only; production seed is `newPrebuiltPath`). Every design must
@@ -816,9 +831,16 @@ anything attempted so far.
   `numQualOps = 0`.
 - [ ] **R22 — unconditional plain-index-scan arm** (§7.3). Drop/relax the
   `hasUsefulPathkeys` gate so a plain index path is always a candidate.
-- [ ] **R23 — persist correlation** (§7.4). Connection-scoped ANALYZE
-  loses correlation across restart → `corr = 0` → every index scan at
-  `max_IO_cost` (`costindex.go:407-420`).
+- [x] **R23 — persist correlation** (§7.4) — **STALE 2026-09-09, no
+  code change (K27).** Live-verified on a private SF0.5 clone:
+  `ANALYZE store_sales` writes slot 3, stop+restart restores
+  byte-identical correlation (`ss_sold_date_sk` 0.14367048). The
+  write/decode/restore chain is complete at HEAD; the row's premise
+  predates the slot-3 writer. What remains is operational (bench heaps
+  need re-ANALYZE — NOT done: shared measurement state) and out of
+  planner scope. ORIGINAL: Connection-scoped ANALYZE loses correlation
+  across restart → `corr = 0` → every index scan at `max_IO_cost`
+  (`costindex.go:407-420`).
 - [ ] **R24 — re-measure the ONEREL flip.** E-21 Cut 1b routes
   single-table statements through the search behind `GOOPG_ONEREL_SEARCH`
   (default OFF, deliberately — removing the rule chooser made plans
