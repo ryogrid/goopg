@@ -32,6 +32,7 @@ import (
 	"sync/atomic"
 
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/parser"
 )
 
 // parallelOn is the process-global kill switch, in the established house
@@ -765,6 +766,43 @@ func hashJoinIsPartialCapable(p *Join) bool {
 		return true
 	case JoinTypeLeft:
 		return !p.BuildLeft
+	}
+	return false
+}
+
+// partialHashJoinTypeOK is the jointype half of hashJoinIsPartialCapable,
+// asked at PATH-generation time where only the direction is known and no
+// *Join exists yet (R9, plan-parity-fix-take2, K17).
+//
+// It existed nowhere before: `addPartialHashJoinPath` took the jointype and
+// never compared it to anything, so it filed parallel-aware partial paths for
+// RIGHT hash joins — which `assertParallelAwareJoinIsRunnable` then caught as
+// a panic under GOOPG_GATHER_PATHS=all (TPC-DS Q5), because a right join's
+// per-row verdict is not worker-local and the join would otherwise silently
+// drop or duplicate rows.
+//
+// The set is {INNER, LEFT, SEMI, ANTI}, which is where two authorities
+// coincide:
+//
+//   - PG's `hash_inner_and_outer` parallel block (joinpath.c:2418) files
+//     partial hash joins for exactly these and never for RIGHT/FULL;
+//   - goopg's own `hashJoinIsPartialCapable` (above) allows INNER/SEMI/ANTI
+//     unconditionally and LEFT when `!BuildLeft` — which the hash arm
+//     guarantees ("Outer drives the probe, inner is hashed … BuildLeft stays
+//     false", createHashJoinPlan).
+//
+// Filtering to PG's set alone would have re-created the bug in the other
+// direction, since goopg's LEFT support is the conditional one.
+//
+// KEEP IN SYNC BY TEST, NOT BY COMMENT: the K17 defect was a comment
+// asserting a filter the code did not implement. TestPartialHashJoinTypeOK
+// pins this predicate AGAINST hashJoinIsPartialCapable for every jointype, so
+// narrowing the executor predicate fails that test instead of silently
+// leaving this one over-permissive.
+func partialHashJoinTypeOK(jt parser.JoinType) bool {
+	switch jt {
+	case parser.JoinInner, parser.JoinLeft, parser.JoinSemi, parser.JoinAnti:
+		return true
 	}
 	return false
 }

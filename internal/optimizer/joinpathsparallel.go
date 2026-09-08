@@ -89,6 +89,16 @@ func addPartialHashJoinPath(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp 
 	if gatherPathsMode == gatherPathsOff {
 		return
 	}
+	// R9 (plan-parity-fix-take2, K17): the direction filter this producer
+	// never had. Without it a RIGHT hash join is filed as parallel-aware and
+	// `assertParallelAwareJoinIsRunnable` panics at plan build — the join's
+	// per-row verdict is not worker-local, so running it with a partial probe
+	// would silently drop or duplicate rows. See partialHashJoinTypeOK for
+	// why the set is {INNER, LEFT, SEMI, ANTI} and why it is pinned against
+	// the executor's own predicate by test rather than by comment.
+	if !partialHashJoinTypeOK(jt) {
+		return
+	}
 	// `joinrel->consider_parallel` (joinpath.c:2418), already propagated by
 	// joinrelConsiderParallel (= build_join_rel, relnode.c:829-845).
 	if s == nil || !s.parallelModeOK || joinrel == nil || !joinrel.ConsiderParallel {

@@ -219,6 +219,14 @@ failure/hang in background wastes the session — goal instruction).
   "unreachable" branch became reachable. Fix: derive the filter from
   `hashJoinIsPartialCapable` rather than hand-listing, so predicate and
   producer cannot drift again.
+- **K18 (measurement artefact, fixed at source 2026-09-08).** Two
+  BYTE-IDENTICAL TPC-DS captures diff every time: the three unplannable
+  queries (Q36/70/86) echo psql's ERROR text, which contains the
+  capture script's `mktemp` path. In R9 this briefly read as "plans
+  MOVED" and contradicted a design's central claim. Capture scripts now
+  use a fixed `parity-capture-$$.sql` name. **Anything that diffs two
+  captures — especially a plan PIN — must not reintroduce a random
+  path into the output.**
 - **K4 (rev-1 error pattern, from §6).** Never conclude from a file
   without checking its callers (`pathgen.go`/`generateScanPaths` is
   test-only; production seed is `newPrebuiltPath`). Every design must
@@ -367,8 +375,14 @@ failure/hang in background wastes the session — goal instruction).
   candidate causes, one instrumentation step to distinguish them. This
   is TPC-H's joint-top divergence category and it is a mechanism gap,
   not a label.
-- [ ] **R9 — jointype filter on the partial hash-join producer** (K17,
-  BLOCKING). Derive from `hashJoinIsPartialCapable`; unit pin per
+- [x] **R9 — jointype filter on the partial hash-join producer** (K17)
+  — DONE 2026-09-08. `r9-partial-jointype-filter/REPORT.md`.
+  `partialHashJoinTypeOK` admits {INNER, LEFT, SEMI, ANTI}, pinned
+  BY TEST against `hashJoinIsPartialCapable` for all 7 jointypes (K17
+  was a class bug — a comment drifting from code — so a second
+  hand-written list would reproduce it). R8's crash reproduction now
+  plans. Default-off byte-identical on both corpora; values green both.
+  **R10 unblocked.** ORIGINAL SCOPE: Derive from `hashJoinIsPartialCapable`; unit pin per
   jointype; correct the stale comment. Prerequisite for R10.
 - [ ] **R10 — flip `GOOPG_GATHER_PATHS`** (R8 §5), after R9. Full
   values gates both corpora; adjudicate every moved plan; explain the
@@ -406,6 +420,11 @@ failure/hang in background wastes the session — goal instruction).
 
 ## Log
 
+- 2026-09-08 R9 done: partial-producer jointype filter landed, pinned
+  by cross-predicate test rather than a second hand-written list.
+  R8's crash reproduction plans; default-off byte-identical both
+  corpora; values green both. R10 (the flip) unblocked. Also killed a
+  measurement artefact (K18) that made identical captures diff.
 - 2026-09-08 R8 done (findings only): the partial-path CONSUMER is off
   by default, parked on a timing decision this goal's rule voids.
   Probed `=all`: Parallel Hash Join 0 -> 132 on TPC-DS (PG 139).

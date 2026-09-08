@@ -593,8 +593,17 @@ func createHashJoinPlan(p *Path) (Node, outputLayout) {
 // executor's OWN predicate would decline to run it that way.
 //
 // The two can only disagree if a producer changes. `addPartialHashJoinPath`
-// files only INNER hash joins today — since C-03b it is passed the direction's
-// jointype and declines outright for SEMI/ANTI, and no outer link reaches the
+// files {INNER, LEFT, SEMI, ANTI} via `partialHashJoinTypeOK`
+// (parallel.go), the set where PG's parallel block and this file's own
+// `hashJoinIsPartialCapable` coincide.
+//
+// CORRECTED R9 (plan-parity-fix-take2): this comment previously claimed the
+// producer "files only INNER hash joins today … and declines outright for
+// SEMI/ANTI". That described a filter which DID NOT EXIST — the producer took
+// the jointype and never compared it to anything — and the claim is what made
+// the defect invisible to reading. The panic below was therefore reachable,
+// not unreachable, and fired on TPC-DS Q5 under GOOPG_GATHER_PATHS=all with a
+// RIGHT hash join (K17). The filter now exists, and no outer link reaches the
 // search at all (03 §4.4 / C-03 DESIGN §3) — so the panic is unreachable from
 // the live search — which is precisely why it is a separate,
 // directly testable function rather than an inline `if`: an unwinnable path is

@@ -7,7 +7,10 @@ PORT="$1"; DB="$2"; USER="$3"; OUT="$4"; HDR="$5"
 export PATH="/home/ryo/work/goopg/goopg/postgres/local_install/bin:${PATH}"
 QDIR=/home/ryo/work/goopg/goopg/bench/tpcds/runtime_goopg/tpcds-data/queries
 PIN=(-c "SET work_mem='64MB'" -c "SET max_parallel_workers_per_gather=4")
-tmp=$(mktemp)
+# Fixed name, not mktemp: the temp path appears in psql ERROR text for
+# the unplannable queries, so a random name fakes a plan diff between
+# two otherwise identical captures (seen in R9).
+tmp="${TMPDIR:-/tmp}/parity-capture-$$.sql"
 { echo "# ${HDR}"; echo "# EXPLAIN only (no ANALYZE)."; } > "$OUT"
 for q in $(seq 1 99); do
     f="${QDIR}/query${q}.sql"; [ -f "$f" ] || continue

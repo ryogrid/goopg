@@ -18,7 +18,10 @@ run() {
         echo "(capture failed)" >> "$OUT"
     fi
 }
-tmp=$(mktemp)
+# Fixed name, not mktemp: the temp path appears in psql ERROR text for
+# the unplannable queries, so a random name fakes a plan diff between
+# two otherwise identical captures (seen in R9).
+tmp="${TMPDIR:-/tmp}/parity-capture-$$.sql"
 for n in $(seq 1 22); do
     if [ "$n" = "15" ]; then run "Q15a-VIEWBODY" /tmp/parity-r0/q15a.sql; continue; fi
     f="$Q/Q${n}.sql"
