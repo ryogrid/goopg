@@ -127,3 +127,28 @@ Self-review:
 - **Slices 2 and 3 are deliberately not bundled**, so an unexplained
   move stays attributable — the same discipline that let R19 attribute
   `aggregation-strategy` to a single producer.
+
+---
+
+## 8. Slice 2 plumbing map (added after slice 1 landed)
+
+Slice 1 made the rel available at `tryPGShapedJoinSearch`. Slice 2's
+first task is getting it to the consumer, and the route is longer than
+the signature change suggests — recorded here so it is not rediscovered:
+
+| hop | today | needs |
+|---|---|---|
+| `tryPGShapedJoinSearch` (`joinsearchseam.go:532`) | has the rel, discards it with `_` | return it |
+| `tryJoinSearch` (`joinsearchseam.go:203`) | returns `(Node, Expr, bool)` | carry the rel |
+| `planSelectWithSettings` (`planner.go:1529` and the two other call sites) | consumes the node | hold the rel for the upper stages |
+| `createGroupingPaths` (`groupingpaths.go:46`) | `(u, aggNode, cat, ps, tupleFraction)` — **no rel** | take the rel |
+| `addPartialAggSplitPath` (`partialaggupper.go:73`) | refuses on `subtreeHasGather(child)` | use `rel.PartialPathlist` to build below the Gather |
+
+`createWindowPaths` (`windowsetoppaths.go:91`) needs the same rel for
+slice 3, so the plumbing is shared and should be done once.
+
+**Recommended split**: slice 2a is the plumbing alone, with slice 1's
+gate (byte-identical plans on both corpora, since nothing consumes it);
+slice 2b is the behaviour change. The same reasoning that justified
+splitting slice 1 applies with more force here, because the route
+crosses `planner.go`.

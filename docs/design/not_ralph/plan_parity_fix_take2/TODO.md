@@ -580,10 +580,17 @@ failure/hang in background wastes the session — goal instruction).
   discards it with an explicit `_` marking slices 2/3. Gate —
   **byte-identical plans on BOTH corpora** — passes; suites green.
   Nothing consumes it yet.
-  - [ ] **Slice 2 (K23)**: partial aggregation from `PartialPathlist`,
-    built BELOW the Gather (`create_partial_grouping_paths`,
-    planner.c:7351). Success test: `aggregation-strategy` 10 -> 14
-    under the flip disappears.
+  - [ ] **Slice 2a (plumbing)**: thread the rel
+    `tryPGShapedJoinSearch` -> `tryJoinSearch` -> `planSelectWithSettings`
+    -> `createGroupingPaths` (which today takes NO rel) and on to
+    `addPartialAggSplitPath`. Route crosses `planner.go`; the full hop
+    table is in `r21-upper-planner-seam/DESIGN.md` §8. Gate: slice 1's
+    — byte-identical plans both corpora, since nothing consumes it.
+    `createWindowPaths` needs the same rel for slice 3, so do it once.
+  - [ ] **Slice 2b (K23 behaviour)**: partial aggregation from
+    `rel.PartialPathlist`, built BELOW the Gather
+    (`create_partial_grouping_paths`, planner.c:7351). Success test:
+    `aggregation-strategy` 10 -> 14 under the flip disappears.
   - [ ] **Slice 3 (K12 B)**: pathkeys for the ordering contest.
   ORIGINAL SCOPE:
   Give the grouping and window stages the join rel's PATHS
@@ -665,6 +672,11 @@ failure/hang in background wastes the session — goal instruction).
 
 ## Log
 
+- 2026-09-08 Slice 2 scoped, not started: the rel's route to the
+  consumer crosses `planner.go` (`createGroupingPaths` takes no rel
+  today). Hop table recorded in the design §8 and split into 2a
+  (plumbing, byte-identical gate) and 2b (behaviour), for the same
+  reason slice 1 was split — the invasive half gets an absolute gate.
 - 2026-09-08 R21 slice 1 LANDED: the search's RelOptInfo now leaves
   `planJoinlistSearch` instead of dying there. Purely additive — gate is
   byte-identical plans on both corpora, and it passes. First shipped
