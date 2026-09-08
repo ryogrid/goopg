@@ -80,10 +80,30 @@ dense path's comparison vacuous. That job is unchanged.
 
 ## 5. Still outstanding
 
-- **TPC-DS: sweeps running** (after-arm, then before-arm, back to back on the
-  same machine). TPC-DS is where this item's *larger* share sits — `acquireRow`
-  was 16.6% of TPC-DS CPU against 8.4% of TPC-H — so the TPC-H result above is
-  the **smaller** half of the expected effect. Results append as §6.
+- **TPC-DS: after-arm complete, before-arm running.** `PASS=95 MISMATCH=0
+  CKMISMATCH=0 ERROR=0 TIMEOUT=0 SKIP=4` — values gate clean. Total over 95
+  comparable queries: **867.9 s**.
+
+  **Interim, cross-session: 888.3 s → 867.9 s = −2.3%.** The 888.3 s baseline
+  is part 2's sweep, which is legitimate for a cross-check because
+  `0b1bd7e6d → 7642bac63` changes **zero `.go` files** — the same binary
+  functionally — but it spans hours of machine drift, so the same-session
+  before-arm now running is the primary and this figure may move.
+
+  **This contradicts the prediction, and the prediction was mine.** `DESIGN-3.md`
+  argued TPC-DS would carry the *larger* half of this item because `acquireRow`
+  was 16.6% of TPC-DS CPU against 8.4% of TPC-H. TPC-H delivered −5.6%; TPC-DS
+  is tracking about −2.3%, i.e. **less than half** the TPC-H gain rather than
+  more.
+
+  If the same-session pair confirms it, the conclusion is that **a CPU-share
+  figure again over-predicted wall-clock gain**, and for a specific reason:
+  TPC-DS is more allocation- and I/O-bound than TPC-H, so removing CPU from
+  `acquireRow` exposes a different bottleneck rather than converting to wall
+  time. That would be the **third** time in this series a share was read as a
+  forecast — parts 1 and 2 both over- or under-shot for the same class of
+  reason — and it is the single most repeated methodological error of this
+  workstream.
 - **GC pressure — the risk `DESIGN-3.md` §2.1 named — is not yet closed by a
   direct measurement.** §4's allocs/row halving is strong evidence that
   allocation *fell*, but a `GODEBUG=gctrace=1` arm at `GOGC=100` is queued
