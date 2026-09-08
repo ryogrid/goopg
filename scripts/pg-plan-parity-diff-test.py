@@ -89,10 +89,14 @@ EXPECTED_CATEGORIES = {"join-order": 13, "join-method": 13, "scan-type": 8,
                        "sort-strategy": 7, "parallelism": 0,
                        "qual-placement": 7, "rendering": 8}
 
-LINE_RE = re.compile(r"^(Q\S+)\s+(MATCH|SHAPE-DIFF|MISSING-NODE|ERROR|TIMEOUT)"
+LINE_RE = re.compile(r"^(Q\S+)\s+(MATCH|SHAPE-DIFF|UNPARSED|MISSING-NODE|ERROR|TIMEOUT)"
                      r"\s+\[([^\]]*)\]")
+# R2 (plan-parity-fix-take2): the rollup gained an `unparsed=` field between
+# shapediff and missingnode — the tool declining to answer, split out of the
+# MISSING-NODE verdict it used to be conflated with.
 ROLLUP_RE = re.compile(r"PLAN-PARITY:\s+queries=(\d+)\s+match=(\d+)\s+"
-                       r"shapediff=(\d+)\s+missingnode=(\d+)\s+"
+                       r"shapediff=(\d+)\s+unparsed=(\d+)\s+"
+                       r"missingnode=(\d+)\s+"
                        r"error=(\d+)\s+timeout=(\d+)")
 CATS_RE = re.compile(r"CATEGORIES:\s+(.*)$")
 
@@ -114,8 +118,9 @@ def parse_report(out):
         m = ROLLUP_RE.search(line)
         if m:
             rollup = {"MATCH": int(m.group(2)), "SHAPE-DIFF": int(m.group(3)),
-                      "MISSING-NODE": int(m.group(4)), "ERROR": int(m.group(5)),
-                      "TIMEOUT": int(m.group(6)),
+                      "UNPARSED": int(m.group(4)),
+                      "MISSING-NODE": int(m.group(5)), "ERROR": int(m.group(6)),
+                      "TIMEOUT": int(m.group(7)),
                       "queries": int(m.group(1))}
         m = CATS_RE.search(line)
         if m:

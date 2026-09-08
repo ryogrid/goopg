@@ -22,8 +22,17 @@ sort/agg strategy, qual attachment) with child order significant.
 costs/rows/widths (and any actual times) are parsed into a SEPARATE estimate
 column: they never influence the verdict, they are printed alongside it.
 
-Per-query verdicts: MATCH / SHAPE-DIFF / MISSING-NODE / ERROR / TIMEOUT.
-Precedence: ERROR > TIMEOUT > MISSING-NODE > SHAPE-DIFF > MATCH.
+Per-query verdicts: MATCH / SHAPE-DIFF / UNPARSED / MISSING-NODE / ERROR /
+TIMEOUT.
+Precedence: ERROR > TIMEOUT > MISSING-NODE > UNPARSED > SHAPE-DIFF > MATCH.
+
+UNPARSED (R2, plan-parity-fix-take2) is the tool DECLINING to answer: a
+node name it does not recognise appeared, so no verdict about the plans
+themselves is claimed. It used to be reported as MISSING-NODE, which
+asserted something quite different and much stronger — that goopg had
+omitted a node PG emitted. 65 of the 71 MISSING-NODE verdicts across the
+TPC-H and TPC-DS corpora were this parse failure. A parity PROOF requires
+UNPARSED = 0.
 
 Nine-category taxonomy (spec order): join-order, join-method, scan-type,
 parameterisation, aggregation-strategy, sort-strategy, parallelism,
@@ -91,7 +100,7 @@ CATEGORIES = (
     "rendering",
 )
 
-VERDICTS = ("MATCH", "SHAPE-DIFF", "MISSING-NODE", "ERROR", "TIMEOUT")
+VERDICTS = ("MATCH", "SHAPE-DIFF", "UNPARSED", "MISSING-NODE", "ERROR", "TIMEOUT")
 
 # Node kinds goopg's EXPLAIN renderer cannot emit (grounded in
 # internal/executor/operators_explain.go, which has no such arms; goopg's
@@ -149,14 +158,33 @@ SCAN_KINDS = (
     "Subquery Scan",
 )
 AGG_KINDS = ("Aggregate", "HashAggregate", "GroupAggregate", "MixedAggregate")
+# R2 (plan-parity-fix-take2): PG splits a parallel aggregate into a Partial
+# phase below the Gather and a Finalize phase above it (explain.c:1531-1553).
+# Both engines print these. The prefix is deliberately KEPT IN THE KIND rather
+# than stripped: `Partial HashAggregate` is not a `HashAggregate`, and goopg
+# emitting the latter where PG emits the former is a real divergence this tool
+# must keep visible (census: goopg emits `Finalize GroupAggregate` 0 times over
+# TPC-DS, PG 18 times).
+AGG_PHASES = ("Partial", "Finalize")
+PHASED_AGG_KINDS = tuple("%s %s" % (ph, k) for ph in AGG_PHASES for k in AGG_KINDS)
+# Node kinds that carry a strategy/name word after the kind, split into
+# (kind, detail) the same way `Index Scan using i on t` already is. `CTE` is
+# the header line a WITH clause emits; `SetOp`/`HashSetOp` carry the set
+# operation (Except/Intersect/Union).
+SUFFIXED_KINDS = ("CTE", "HashSetOp", "SetOp")
+SUFFIXED_RE = re.compile(r"^(%s) (\S+)$" % "|".join(SUFFIXED_KINDS))
 # goopg renders grouping-sets aggregates as "HashAggregate (N keys, M grouping
 # sets)"; the suffix is a strategy attribute (kept in detail), not a kind.
-AGG_SUFFIX_RE = re.compile(r"^(%s) (\(\d+ keys, \d+ grouping sets\))$" % "|".join(AGG_KINDS))
+AGG_SUFFIX_RE = re.compile(
+    r"^(%s) (\(\d+ keys, \d+ grouping sets\))$"
+    % "|".join(PHASED_AGG_KINDS + AGG_KINDS))
 # Generous known-kind universe (PG EXPLAIN node types + goopg renderer arms).
 # Anything outside this set triggers an unknown-kind warning.
 KNOWN_KINDS = frozenset(
     list(SCAN_KINDS)
     + list(AGG_KINDS)
+    + list(PHASED_AGG_KINDS)
+    + list(SUFFIXED_KINDS)
     + [
         "Nested Loop",
         "Hash Join",
@@ -167,6 +195,10 @@ KNOWN_KINDS = frozenset(
         "Limit",
         "Append",
         "MergeAppend",
+        # R2: PG prints "Merge Append" with a space (explain.c). Without this
+        # the name was UNPARSED, which hid the fact that goopg emits no such
+        # node at all — a real divergence, now classified as one.
+        "Merge Append",
         "Recursive Union",
         "Result",
         "ProjectSet",
@@ -340,7 +372,13 @@ def make_node(body, indent, warnings, line):
         jm, jt = split_join_norm(text)
         if jm:
             kind, detail = jm, jt
+        elif text in PHASED_AGG_KINDS:
+            # R2: keep the phase in the kind (see AGG_PHASES).
+            kind, detail = text, ""
+        elif SUFFIXED_RE.match(text):
+            kind, detail = SUFFIXED_RE.match(text).groups()
         elif text in ("Sort", "Unique", "Limit", "Append", "MergeAppend",
+                      "Merge Append",
                       "Recursive Union", "Result", "ProjectSet", "WindowAgg",
                       "Group", "Memoize", "Materialize", "Hash", "HashSetOp",
                       "SetOp", "LockRows", "Gather", "Gather Merge",
@@ -1082,6 +1120,11 @@ def compare_query(key, glines, plines):
     notes = ["normalisation: %s" % ",".join(sorted(applied))] if applied else []
     pg_kinds = {n.kind for n in walk(proots)}
     if unknowns or (pg_kinds & set(GOOPG_UNEMITTABLE)):
+        # R2 (plan-parity-fix-take2): these are two different findings and
+        # used to share one verdict. A PG-only kind goopg cannot emit is a
+        # MISSING-NODE — an assertion about the PLANS. An unrecognised name is
+        # UNPARSED — the tool declining to answer, an assertion about ITSELF.
+        # MISSING-NODE outranks UNPARSED when both apply.
         missing_kinds = sorted(pg_kinds & set(GOOPG_UNEMITTABLE))
         ctx = Ctx(tables)
         ctx.groot, ctx.proot = groots, proots
@@ -1094,7 +1137,7 @@ def compare_query(key, glines, plines):
             ctx.divergences.append((key, "MISSING-NODE",
                                     "PG-only kinds: %s" % ",".join(
                                         missing_kinds)))
-        return ("MISSING-NODE", set(sorted(
+        return ("MISSING-NODE" if missing_kinds else "UNPARSED", set(sorted(
             ctx.cats, key=CATEGORIES.index)), ctx.divergences, gest, pest,
             notes, unknowns)
     ctx = Ctx(tables)

@@ -18,9 +18,16 @@ failure/hang in background wastes the session — goal instruction).
   but a slower identical plan never blocks a round.
 - **Values gates still bind every round**: TPC-H digest 24/24 MATCH,
   TPC-DS SF0.5 sweep PASS=95 all-zero. A values break stops the round.
-- **Parity criterion**: `scripts/pg-plan-parity-diff.py` (TPC-H) +
-  `scripts/tpcds-plan-diff.py` (TPC-DS) classifications
-  (match / shapediff / …). Report per-round movement on BOTH corpora.
+- **Parity criterion** (revised by R2): `scripts/pg-plan-parity-diff.py`
+  on BOTH corpora, against a **live** PG capture taken with
+  `r2-instrument/capture-tpch.sh` / `capture-tpcds.sh` (GUCs pinned in
+  session). Verdicts: match / shapediff / unparsed / missingnode /
+  error. `scripts/tpcds-plan-diff.py` is byte-equality and is a
+  goopg-vs-goopg movement detector only — never a parity criterion.
+  **The goal's proof requires unparsed = 0** (else the tool is
+  declining to answer) and match = every planneable query.
+  Do NOT diff against `bench/tpch/plans-pg/` — it is stale and serial
+  (K9).
 - Never `git add -A` (foreign WIP lives in the main tree); stage by
   explicit pathspec. Never `gofmt -w` wholesale (repo baseline go1.25).
 - `./postgres/` is a READ-ONLY oracle. Bench ports: PG TPC-H :65432,
@@ -79,6 +86,35 @@ failure/hang in background wastes the session — goal instruction).
   `pg-plan-parity-diff.py` after normalising `===== Qn =====` to
   `=== Qn`. Both R0 and R1 now have shape verdicts
   (`r1-qpqual-index/tpcds-shape-diff*.txt`).
+- **K9 (verified 2026-09-08 — invalidates every R0/R1 parity number).**
+  The TPC-H parity target `bench/tpch/plans-pg/` is a **stale, SERIAL**
+  capture. Live PG on :65432 (`max_parallel_workers_per_gather=4`,
+  read from `pg_settings`) plans TPC-H in PARALLEL. All nine TPC-H
+  MISSING-NODE verdicts were this artefact; the true count is 0, and
+  Q6 is a clean MATCH. **Never use that fixture as a parity target** —
+  capture PG live with `r2-instrument/capture-tpch.sh`. R0 had a live
+  capture and diffed the fixture anyway.
+- **K10 (verified 2026-09-08, read from both engines).** The TPC-DS
+  pair was configured 128x apart: goopg SF0.5 clone `work_mem=512MB`,
+  PG :65438 `work_mem=4MB`. `work_mem` decides hash-vs-sort and
+  HashAggregate-vs-GroupAggregate, so that comparison measured
+  configuration, not planning. Both capture scripts now pin
+  `work_mem=64MB` + `max_parallel_workers_per_gather=4` IN SESSION.
+  **A comparison's REFERENCE needs the same provenance check as its
+  subject** (the K5 discipline, applied to data).
+- **K11 (adjudicated 2026-09-08, four systematic causes).** From
+  reading 10 plan pairs by hand:
+  (a) **goopg's planner never sets `AggStrategySorted`** — its own
+  renderer comment says so (`operators_explain.go`); PG chooses
+  `GroupAggregate` constantly (TPC-DS Q12/Q81, TPC-H Q1), so every such
+  query is unmatchable today;
+  (b) **worker count is not computed** — goopg always plans 4, PG
+  derives it from relation size (`compute_parallel_worker`, log-scale):
+  3 on DS Q96/Q38, 2 on TPC-H Q19;
+  (c) **no parallel-aware hash join** — PG emits `Parallel Hash Join`
+  /`Parallel Hash`, goopg plain `Hash Join` under a Gather;
+  (d) **Sort/Group keys render as output aliases**, PG renders source
+  expressions — TPC-H Q9's tree MATCHES and fails on this alone.
 - **K4 (rev-1 error pattern, from §6).** Never conclude from a file
   without checking its callers (`pathgen.go`/`generateScanPaths` is
   test-only; production seed is `newPrebuiltPath`). Every design must
@@ -137,8 +173,18 @@ failure/hang in background wastes the session — goal instruction).
   Gates: optimizer/executor suites, values both suites, parity A/B both
   corpora (expect Q12-class moves toward PG), timing table reported
   (not adjudicated unless shapes move unexpectedly).
-- [ ] **R2 — make the instrument able to prove the goal** (K7/K8, NEW,
-  promoted ahead of costing work). Teach `pg-plan-parity-diff.py` the
+- [x] **R2 — make the instrument able to prove the goal** (K7/K8) —
+  DONE 2026-09-08. Report: `r2-instrument/REPORT.md`. UNPARSED is now 0
+  on both corpora, and validating the instrument found the parity
+  TARGET was wrong twice over (K9 stale serial TPC-H fixture, K10
+  128x work_mem gap on TPC-DS). **Every R0/R1 parity number is
+  superseded.** Corrected baseline: **TPC-H match=2 shapediff=20
+  unparsed=0 missingnode=0**; **TPC-DS match=0 shapediff=72
+  unparsed=0 missingnode=24 error=3**. TPC-H Q6 had been planning
+  identically to PG for two rounds while filed as MISSING-NODE. The
+  design's advance prediction (reclassification goes to SHAPE-DIFF, not
+  MATCH) held exactly: zero queries moved to MATCH from the tool change.
+  Yielded K9/K10/K11. ORIGINAL SCOPE: Teach `pg-plan-parity-diff.py` the
   node names both engines already emit (`Finalize/Partial` aggregates,
   `WindowAgg`, `CTE`, `SetOp`/`HashSetOp`, `Merge`) and make the TPC-DS
   corpus a first-class channel (section normalisation, not byte
@@ -148,18 +194,28 @@ failure/hang in background wastes the session — goal instruction).
   the goal's success condition is unmeasurable. Gate: the tool's own
   test (`scripts/pg-plan-parity-diff-test.py`) plus a hand-adjudicated
   sample of at least 5 reclassified queries per corpus.
-- [ ] **R3 — index-leaf repricing hole** (§7.2, `joinsearch.go:480`),
+- [ ] **R3 — reachable sorted aggregation** (K11a, NEW, highest value).
+  goopg's planner never sets `AggStrategySorted`, so `GroupAggregate`
+  is unreachable and every query where PG sorts-then-groups is
+  unmatchable. PG's oracle: `create_grouping_paths` /
+  `add_paths_to_grouping_rel` cost BOTH strategies and let addPath
+  choose. Blocks TPC-H Q1 and a large share of TPC-DS.
+- [ ] **R4 — compute the worker count** (K11b). PG's
+  `compute_parallel_worker` (allpaths.c) derives workers from relation
+  size on a log scale; goopg always plans 4. Cheap, well-defined, and
+  it moves plans that are otherwise already identical.
+- [ ] **R5 — index-leaf repricing hole** (§7.2, `joinsearch.go:480`),
   now with K6's evidence: the winning scans in these plans are PREBUILT
   leaves priced by `costSeqscan` with `numQualOps = 0`, so R1's charge
   never reached them. Fixing this is the precondition for testing
   DESIGN §5's suspect #1.
   Give index leaves their qual charge instead of `numQualOps = 0`.
-- [ ] **R4 — unconditional plain-index-scan arm** (§7.3). Drop/relax the
+- [ ] **R6 — unconditional plain-index-scan arm** (§7.3). Drop/relax the
   `hasUsefulPathkeys` gate so a plain index path is always a candidate.
-- [ ] **R5 — persist correlation** (§7.4). Connection-scoped ANALYZE
+- [ ] **R7 — persist correlation** (§7.4). Connection-scoped ANALYZE
   loses correlation across restart → `corr = 0` → every index scan at
   `max_IO_cost` (`costindex.go:407-420`).
-- [ ] **R6 — re-measure the ONEREL flip.** E-21 Cut 1b routes
+- [ ] **R8 — re-measure the ONEREL flip.** E-21 Cut 1b routes
   single-table statements through the search behind `GOOPG_ONEREL_SEARCH`
   (default OFF, deliberately — removing the rule chooser made plans
   worse under the §3 asymmetry). After R1/R2 change the prices, re-run
@@ -168,6 +224,13 @@ failure/hang in background wastes the session — goal instruction).
 
 ## Log
 
+- 2026-09-08 R2 done: instrument fixed (UNPARSED 0/0) AND the parity
+  target corrected twice (K9 stale serial TPC-H fixture; K10 128x
+  work_mem gap on TPC-DS). All R0/R1 parity numbers superseded; the
+  honest baseline is TPC-H 2/20/0/0 and TPC-DS 0/72/0/24/3. Advance
+  prediction held. Hand-adjudicated 5 queries per corpus, yielding K11's
+  four systematic causes; R3 (sorted aggregation) and R4 (worker count)
+  inserted ahead of the remaining costing rounds, later rounds renumbered.
 - 2026-09-08 R1 done: implemented + gated + measured. Values green on
   both corpora; parity unmoved on both. Caught and discarded a
   contaminated capture pair (measured the R0 binary — K5) and a

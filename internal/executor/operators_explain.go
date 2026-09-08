@@ -2480,7 +2480,18 @@ func describePlanMode(n optimizer.Node, nm *explainNames, verbose bool) string {
 		}
 		return prefix + "HashAggregate"
 	case *optimizer.WindowAgg:
-		return fmt.Sprintf("WindowAgg (%d funcs)", len(p.Funcs))
+		// PG labels this node bare "WindowAgg" (explain.c:1575,
+		// `pname = sname = "WindowAgg"`) — the window-function count is not
+		// part of the label at any verbosity. goopg printed
+		// "WindowAgg (N funcs)", which is text vanilla PG never emits, so
+		// every windowed plan differed from PG's in a way that had nothing
+		// to do with the plan (plan-parity-fix-take2 R2, 22 occurrences over
+		// TPC-DS). Fixed here rather than forgiven in the comparator: the
+		// two engines' plan text should coincide because the plans do.
+		//
+		// No sibling to keep in sync — the other *optimizer.WindowAgg case
+		// in this file is the children accessor, not a second renderer.
+		return "WindowAgg"
 	case *optimizer.SeqScan:
 		// S17 (0134-0001): "Parallel " prefix mirrors PG's plan->parallel_aware
 		// (explain.c:1630-1631), stamped once at Gather-construction time by
