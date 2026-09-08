@@ -119,6 +119,14 @@ func rfjLeafCount(n Node) int {
 		return rfjLeafCount(t.Child)
 	case *Sort:
 		return rfjLeafCount(t.Child)
+	// R12 (plan-parity-fix-take2): K19's fourth walker. Without these a
+	// Gather inside a join's subtree counts as ONE leaf, so a 3-leaf side
+	// reads as 1 and the assertion reports a jointype preserving/extending
+	// the wrong hands — a correctness-shaped message from a correct plan.
+	case *Gather:
+		return rfjLeafCount(t.Child)
+	case *GatherMerge:
+		return rfjLeafCount(t.Child)
 	default:
 		return 1
 	}
