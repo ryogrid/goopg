@@ -78,7 +78,7 @@ The bound was **re-baselined to `>= 0.9`, not deleted**: its job is to catch the
 day the legacy path stops allocating per row altogether, which would make the
 dense path's comparison vacuous. That job is unchanged.
 
-## 5. Still outstanding
+## 5. Both open items, now closed
 
 - **TPC-DS: COMPLETE. 886.0 s → 867.9 s, −2.0%** over 95 comparable queries,
   same-session pair on an otherwise idle machine. Both arms
@@ -125,12 +125,26 @@ dense path's comparison vacuous. That job is unchanged.
   regression; it is recorded, not explained, and would need repeated runs to
   confirm.
 
-- **GC pressure — the risk `DESIGN-3.md` §2.1 named — is not yet closed by a
-  direct measurement.** §4's allocs/row halving is strong evidence that
-  allocation *fell*, but a `GODEBUG=gctrace=1` arm at `GOGC=100` is queued
-  behind the sweeps to count GC cycles on both builds. Until it lands, "GC
-  pressure did not increase" is an inference, not a measurement, and is
-  labelled as such.
+- **GC pressure: CLOSED by direct measurement. No regression.**
+
+  `DESIGN-3.md` §2.1 named this as the risk of removing an allocation-avoidance
+  mechanism, and required it be measured rather than assumed — at `GOGC=100`,
+  not the historical `GOGC=off` which would have hidden it. Two TPC-H passes
+  per arm under `GODEBUG=gctrace=1`:
+
+  | | GC cycles | live heap after final GC | last GC at |
+  |---|---:|---:|---:|
+  | before (pool) | 80 | ~2,941–3,092 MB | 176.4 s |
+  | after (no pool) | **79** | ~3,004–3,034 MB | **165.0 s** |
+
+  **Same GC work for the same query load, completed in less wall time.** Cycle
+  count is flat (80 → 79), live heap is unchanged at ~3 GB, and the after-arm
+  reached the end of the workload 11.4 s earlier — consistent with the −5.6%
+  suite result measured independently.
+
+  So removing the pool did not trade CPU for GC. That is the outcome the
+  allocation census predicted (`§4`: 2.00 → 1.00 allocs/row), and it is now a
+  measurement rather than the inference this report previously labelled it.
 
 ## 6. Method
 
