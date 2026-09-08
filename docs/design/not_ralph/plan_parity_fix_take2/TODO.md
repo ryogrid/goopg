@@ -156,8 +156,13 @@ failure/hang in background wastes the session — goal instruction).
   bidirectional, sorted by column type: `inventory` (all `integer`)
   matches to **0.2%**, numeric-bearing tables run 1.05-1.15x LARGER in
   goopg, and the two `character(N)` tables run 0.57-0.71x SMALLER.
-  Hypotheses (consistent, unconfirmed): goopg's `numeric` is bigger
-  than PG's and its `character(N)` is not blank-padded.
+  **R5 resolved both hypotheses**: `character(N)` blank-padding is
+  CONFIRMED divergent (PG pads, goopg does not — explains `item` 0.573
+  and `customer` 0.712); `numeric` is FALSIFIED — it matches PG exactly
+  at one and five columns, with and without fractional digits, and with
+  NULLs. The fact-table 15% has NO representation explanation and is
+  reassigned to **heap page FILL on bulk load** (goopg's file is truly
+  29,761 pages; PG's truly 25,928 with 0 dead tuples).
   **`relpages` is a planner INPUT** — every page-priced term, the
   Mackert-Lohman estimate, and the parallel-worker thresholds — so a
   15% page error separates otherwise-identical plans and **no planner
@@ -274,23 +279,30 @@ failure/hang in background wastes the session — goal instruction).
   K11b falsified) — DONE 2026-09-08, findings only, no code change.
   `r4-heap-density/FINDINGS.md`. goopg's worker rule is correct; it is
   fed a page count 14.8% larger than PG's for identical rows. See K14.
-- [ ] **R5 — confirm the per-type storage sizes** (K14 follow-up).
-  Measure single-column tables (`integer`, `numeric(7,2)`,
-  `character(10)`, `varchar`) against PG and locate the divergence in
-  goopg's tuple encoder. Converts K14's hypotheses into facts, cheaply.
-  NOTE: this is an on-disk-format question, not a planner one.
-- [ ] **R6 — index-leaf repricing hole** (§7.2, `joinsearch.go:480`),
+- [x] **R5 — per-type storage sizes** (K14 follow-up) — DONE
+  2026-09-08, findings only. `r5-per-type-density/FINDINGS.md`.
+  9 probe tables on both engines: everything matches EXCEPT
+  `character(N)`, which PG blank-pads and goopg does not. `numeric`
+  falsified. Fact-table gap reassigned to page fill.
+- [ ] **R6 — heap page fill on bulk load** (K14 remainder). goopg
+  leaves ~21.9 bytes/row of free space PG does not (~15% on
+  `store_sales`). Compare free space per page directly on both engines
+  — do NOT infer from totals again. On-disk question, not planner.
+- [ ] **R7 — `character(N)` blank-padding** (R5 §2.1). An on-disk
+  PG-compat defect in its own right; shifts `relpages` on every
+  `bpchar` table.
+- [ ] **R8 — index-leaf repricing hole** (§7.2, `joinsearch.go:480`),
   now with K6's evidence: the winning scans in these plans are PREBUILT
   leaves priced by `costSeqscan` with `numQualOps = 0`, so R1's charge
   never reached them. Fixing this is the precondition for testing
   DESIGN §5's suspect #1.
   Give index leaves their qual charge instead of `numQualOps = 0`.
-- [ ] **R7 — unconditional plain-index-scan arm** (§7.3). Drop/relax the
+- [ ] **R9 — unconditional plain-index-scan arm** (§7.3). Drop/relax the
   `hasUsefulPathkeys` gate so a plain index path is always a candidate.
-- [ ] **R8 — persist correlation** (§7.4). Connection-scoped ANALYZE
+- [ ] **R10 — persist correlation** (§7.4). Connection-scoped ANALYZE
   loses correlation across restart → `corr = 0` → every index scan at
   `max_IO_cost` (`costindex.go:407-420`).
-- [ ] **R9 — re-measure the ONEREL flip.** E-21 Cut 1b routes
+- [ ] **R11 — re-measure the ONEREL flip.** E-21 Cut 1b routes
   single-table statements through the search behind `GOOPG_ONEREL_SEARCH`
   (default OFF, deliberately — removing the rule chooser made plans
   worse under the §3 asymmetry). After R1/R2 change the prices, re-run
@@ -299,6 +311,13 @@ failure/hang in background wastes the session — goal instruction).
 
 ## Log
 
+- 2026-09-08 R5 done (findings only): 9 probe tables, both engines.
+  `character(N)` padding CONFIRMED divergent; `numeric` FALSIFIED
+  (matches exactly across column counts, digit counts, NULLs). The
+  fact-table 15% has no representation explanation and is reassigned to
+  heap page FILL. Fourth falsified hypothesis of mine — and the first
+  that was labelled a hypothesis in advance and killed by the check it
+  asked for, i.e. the process working.
 - 2026-09-08 R4 done (findings only): K11b falsified — goopg DOES
   implement compute_parallel_worker. Real cause is HEAP DENSITY (K14):
   identical reltuples, relpages 29,761 vs 25,928 on store_sales, which
