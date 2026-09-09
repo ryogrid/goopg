@@ -399,10 +399,12 @@ A query the PG-shaped search DECLINES falls to the legacy path and
 
 - **TPC-H: 0 declines.** Every query is admitted, so TPC-H's 2/22 is
   ENTIRELY costing/candidates. Seam work cannot help TPC-H.
-- **TPC-DS: 13 declines across 7 queries** — Q49, Q51, Q68, Q77, Q78,
-  Q93, Q97. Reasons: `outer-link-no-sjinfo` 7 (Q49 x3, Q78, Q93),
+- **TPC-DS: 9 declines across 5 queries** (was 13/7; R27 admitted
+  **Q49 and Q93**). Q51, Q68, Q77, Q78, Q97. Reasons now:
   `outer-over-derived` 3 (Q77 x2, Q78), `outer-spine` 2 (Q51, Q97),
-  `lateral` 1 (Q68).
+  `outer-link-no-sjinfo` 1 (Q78), `lateral` 1 (Q68).
+  **The surviving `outer-link-no-sjinfo` is a DIFFERENT cause** from
+  Q49's — re-diagnose, do not extend R27.
 
 These 7 are a HARD FLOOR: unlike the other 92 they are not merely
 outcosted, they never enter the search. Sequencing therefore has two
@@ -953,6 +955,13 @@ anything attempted so far.
 
 ## Log
 
+- 2026-09-09 (CC) **Decline re-audit** (`r26-seam-decline-audit/FINDINGS-3-reaudit.md`):
+  **13 declines / 7 queries -> 9 / 5.** Q49 and Q93 are now ADMITTED —
+  they moved from ineligible to eligible, the axis category counts
+  cannot see. Survivors: `outer-over-derived` 3 (largest, take first),
+  `outer-spine` 2, `outer-link-no-sjinfo` 1 (Q78 — DIFFERENT cause from
+  Q49's), `lateral` 1 (Q68 — check for another bound-ref-read-as-
+  escaping case first). TPC-H still 0.
 - 2026-09-09 (CC) **R27 §4a SHIPPED — the demotion reaches the plan.**
   Q49: seam declines 3->0, `Hash Left Join` x3 -> gone (5 Nested Loop +
   1 Merge Join vs PG's 6 Nested Loop) — it is ELIGIBLE again. TPC-DS
