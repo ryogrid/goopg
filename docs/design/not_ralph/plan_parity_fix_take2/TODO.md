@@ -332,6 +332,20 @@ failure/hang in background wastes the session — goal instruction).
   only for subquery-bearing EXPRESSIONS — never for a lateral join's
   right side — which is why a ref BOUND inside a subtree reads as
   escaping it.
+- **K28 (2026-09-09).** `reduceOuterJoins` runs AFTER `planFromClause`
+  builds the node tree, so its in-place demotion of `s.FromExprs`
+  reaches only the SJI deconstruction — **it has never driven a plan.**
+  Consequences: (a) the plan keeps `JoinTypeLeft` while
+  `join_info_list` says there is no outer join, which trips the
+  fail-closed `outerLinksHaveSJInfos` guard and declines the statement
+  (K27 — 7 of 13 TPC-DS declines); (b) PG's Q49 has NO outer join
+  (6 Nested Loop) where goopg has 3 `Hash Left Join`, a direct parity
+  divergence. **Moving the call is NOT the fix**: measured, it breaks
+  6 tests including 2 on VALUES (a WHERE qual on a RIGHT JOIN's
+  nullable arm lands below the join that produces the NULLs). The
+  demotion logic must be audited as a PLAN REWRITE against PG's
+  `reduce_outer_joins` first — classic "dead code is not a reference
+  implementation".
 - **K4 (rev-1 error pattern, from §6).** Never conclude from a file
   without checking its callers (`pathgen.go`/`generateScanPaths` is
   test-only; production seed is `newPrebuiltPath`). Every design must
@@ -899,6 +913,19 @@ anything attempted so far.
 
 ## Log
 
+- 2026-09-09 (CC) **R26/2** (`r26-seam-decline-audit/FINDINGS-2-outer-join-reduction.md`):
+  traced `outer-link-no-sjinfo` (7 of 13 declines) to an ORDERING bug —
+  `planFromClause` builds the node tree from the un-demoted `FromExpr`s
+  and only THEN calls `reduceOuterJoins`, which mutates them in place,
+  so the plan says `JoinTypeLeft` while `join_info_list` says there is
+  no outer join. Direct parity evidence: **PG's Q49 has 6 Nested Loop
+  and NO outer join; goopg has 3 Hash Left Join.**
+  **Moving the call (PG's position) is NOT the fix** — it broke 6 tests
+  incl. 2 on VALUES ("got 0 rows, want 1"; "a WHERE qual on a RIGHT
+  JOIN's nullable arm was evaluated below the join that produces the
+  NULLs"). **K28**: goopg's outer-join demotion has NEVER driven a
+  plan, so its correctness as a plan rewrite is unestablished — audit
+  `applyDemotion` against PG's `reduce_outer_joins` BEFORE moving it.
 - 2026-09-09 (CC) **Seam-decline audit** (R26): TPC-H **0 declines**
   (so its 2/22 is purely costing); TPC-DS **13 across 7 queries**
   (Q49/Q51/Q68/Q77/Q78/Q93/Q97), top reason `outer-link-no-sjinfo` (7).
