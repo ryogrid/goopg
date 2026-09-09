@@ -869,6 +869,12 @@ anything attempted so far.
 
 ## Log
 
+- 2026-09-09 (CC) **Corrected my own slice-1 conclusion.** Q30/Q81 are
+  a PLAN divergence (cross product vs PG's index-scan inners), not a
+  goal-sanctioned slowdown. Falsified two repair hypotheses by
+  measurement (lateral CTE seeding; CTE re-materialisation — exactly 1).
+  Sweep on committed slice 1: PASS=93 MISMATCH=0 CKMISMATCH=0 ERROR=0
+  TIMEOUT=2 SKIP=4 — execution correctness confirmed corpus-wide.
 - 2026-09-09 (CC) **R25 slice 1 LANDED** (`r25-nli-decompose/REPORT-slice1.md`).
   Answered the handover's open question with a controlled A/B: the
   Q30/Q81 TIMEOUTs **ARE** slice 1's (base 3s/5s -> both >300s), and
