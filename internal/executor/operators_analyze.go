@@ -665,6 +665,37 @@ func analyzeMCVList(mcvCounts []int, numMCV int, staDistinct, staNullFrac float6
 	return numMCV
 }
 
+// analyzeSampleTID is one reservoir entry's physical location, upstream's
+// HeapTuple->t_self as read by `compare_rows` (analyze.c:1361).
+type analyzeSampleTID struct {
+	block  uint32
+	offset uint16
+}
+
+// analyzeSampleByTID sorts the reservoir into physical order, carrying the
+// rows and their locations together. It is `compare_rows`: block first, then
+// offset. ANALYZE's correlation statistic is the Pearson correlation between
+// physical row order and sorted-value order, so `computeColumnStats` can only
+// read a row's index as its physical position once this has run.
+type analyzeSampleByTID struct {
+	rows []Row
+	tids []analyzeSampleTID
+}
+
+func (a *analyzeSampleByTID) Len() int { return len(a.rows) }
+
+func (a *analyzeSampleByTID) Less(i, j int) bool {
+	if a.tids[i].block != a.tids[j].block {
+		return a.tids[i].block < a.tids[j].block
+	}
+	return a.tids[i].offset < a.tids[j].offset
+}
+
+func (a *analyzeSampleByTID) Swap(i, j int) {
+	a.rows[i], a.rows[j] = a.rows[j], a.rows[i]
+	a.tids[i], a.tids[j] = a.tids[j], a.tids[i]
+}
+
 // analyzeSeedEnv is the process-wide fallback seed for ANALYZE's reservoir
 // sampler, read once from `GOOPG_ANALYZE_SEED`. Zero (the unset case) keeps
 // upstream behaviour: every ANALYZE draws a fresh wall-clock-seeded sample,
@@ -779,6 +810,15 @@ func analyzeRelationWith(pool *storage.Pool, mgr *transam.Manager, cat catalog.C
 		sampleCap = 1
 	}
 	reservoir := make([]Row, 0, sampleCap)
+	// R30: the physical (block, offset) location of each reservoir entry.
+	// Algorithm R replaces a UNIFORMLY CHOSEN slot, so once the reservoir is
+	// full its index order no longer tracks physical order -- and the index
+	// is exactly what `computeColumnStats` uses as the `pos` of its
+	// correlation pairs. Upstream has the same problem and fixes it by
+	// re-sorting the sample into ItemPointer order before computing stats
+	// (analyze.c:1312-1322, `compare_rows`); goopg never did, so correlation
+	// collapsed toward 0 for every relation bigger than the sample cap.
+	reservoirTID := make([]analyzeSampleTID, 0, sampleCap)
 
 	stats := &catalog.TableStats{
 		Pages:   int(nBlocks),
@@ -850,6 +890,7 @@ func analyzeRelationWith(pool *storage.Pool, mgr *transam.Manager, cat catalog.C
 			if seen < int64(sampleCap) {
 				keep = len(reservoir)
 				reservoir = append(reservoir, nil)
+				reservoirTID = append(reservoirTID, analyzeSampleTID{})
 			} else if j := rng.Int63n(seen + 1); j < int64(sampleCap) {
 				keep = int(j)
 			}
@@ -866,8 +907,18 @@ func analyzeRelationWith(pool *storage.Pool, mgr *transam.Manager, cat catalog.C
 				return nil, fmt.Errorf("ANALYZE %s slot=%d: %w", tbl.QualifiedName(), s, derr)
 			}
 			reservoir[keep] = row
+			reservoirTID[keep] = analyzeSampleTID{block: uint32(blk), offset: s}
 		}
 		pool.Unpin(slot)
+	}
+
+	// R30 / PG analyze.c:1312-1322: restore physical order. Upstream sorts
+	// only when the reservoir filled ("If we didn't find as many tuples as we
+	// wanted then we're done. No sort is needed, since they're already in
+	// order."); the same condition holds here, and keeping it means a
+	// short relation takes exactly the path it took before.
+	if len(reservoir) == sampleCap {
+		sort.Sort(&analyzeSampleByTID{rows: reservoir, tids: reservoirTID})
 	}
 
 	if stats.RowCount > 0 {

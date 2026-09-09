@@ -1327,3 +1327,26 @@ all-zero; parity scan-type 70 -> 71 (Q68 only, see K33).
   body), and drove `lateral` declines 1 -> 4. Prefer a generic walk
   over a hand-enumerated one whenever a sibling walker already owns
   the inventory.
+
+## R30 — ANALYZE sample sorted into physical order (done)
+
+`r30-analyze-physical-order/`. Statistics axis. PG's `compare_rows`
+re-sort (analyze.c:1312-1322) was missing, so the correlation statistic
+collapsed toward 0 for every relation bigger than the sample cap.
+`customer.c_customer_sk` 0.0737 -> 1.0 (PG: 0.999908).
+
+- **K34 (new, top blocker).** join-method is the largest movable
+  category on both corpora (TPC-DS 79, TPC-H 14) and it GREW by 2 when
+  a scan-cost input was corrected — so the divergence is in
+  nestloop-vs-hash/merge pricing, not scan pricing. Next round.
+- **K35 (method, important).** A statistics change cannot be A/B'd
+  against stored stats: re-ANALYZE BOTH sides under a pinned
+  `GOOPG_ANALYZE_SEED`. Re-ANALYZing alone moved TPC-DS join-method
+  74 -> 77 with the binary fixed. A/A floor: category counts identical,
+  plans differ only in estimate digits on 5 queries.
+- **K36 (baseline changed).** Both parity clones were re-ANALYZEd in
+  R30. Under the fresh, seed-pinned protocol TPC-H reads match=1/22;
+  earlier rounds' 2/22 was against stale stored stats and is not
+  reproducible. Quote the fresh protocol from here on.
+- Statistics axis, still open: ANALYZE never visits indexes, so
+  `estimateIndexGeometry` synthesises relpages/reltuples/tree_height.
