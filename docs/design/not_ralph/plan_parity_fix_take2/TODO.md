@@ -2592,3 +2592,96 @@ spends a round rediscovering them.
   `lineitem` estimate went 2,412 -> 1,506 against PG's 28,092. Q6 still
   MATCHES (shape is unaffected), but R44's stated aim was estimate parity,
   and on this query it went the wrong way.
+
+
+## R45 — split aggregate + ordered gather cannot combine (K96, DESIGN pre-review)
+
+`r45-gather-merge-ordered-finalize/DESIGN.md`. Found by pursuing K94 (Q1's
+"costing" gap) to its structural cause — which turned out **not to be
+costing at all**.
+
+| node | goopg TPC-H | goopg TPC-DS | PG TPC-H | PG TPC-DS |
+|---|---|---|---|---|
+| `Finalize GroupAggregate` | **0** | **0** | 5 | 18 |
+| `Gather Merge` | **0** | 3 | 9 | **85** |
+
+- **K96 — the shape PG picks is UNREACHABLE, so no cost setting could
+  select it.** `rebuildWithGather` (`parallel.go`) switches on
+  *mutually exclusive* arms — `case tgt.mergeKeys != nil` (target is a
+  Sort) -> `NewGatherMerge`, versus `case tgt.splitAgg` (target is an
+  Aggregate) -> `splitAggregate`. And `splitAggregate` (`parallel.go:1059`)
+  **hardcodes `NewGather` at :1067** — never `NewGatherMerge` — and copies
+  the ORIGINAL aggregate's strategy to the Finalize. Two consequences,
+  both confirmed by the 0/0 measurement: a split aggregate always gets an
+  UNORDERED gather (so `Gather Merge` only arises from the other arm,
+  hence goopg's 3), and the Finalize inherits a hash strategy, so
+  **`Finalize GroupAggregate` is unreachable by construction**.
+- **This CORRECTS K94.** K94 said Q1's gap was "a costing divergence,
+  because `GOOPG_PARTIAL_SORT_PATHS=on` leaves the plan byte-identical".
+  The observation was right, the conclusion premature: the alternative
+  shape does not exist to be priced. K94's framing becomes true only
+  AFTER R45 makes the shape reachable.
+- PG's Q1 needs both arms at once:
+  `Finalize GroupAggregate <- Gather Merge <- Sort <- Partial HashAggregate`
+  (sort INSIDE the workers, merge order-preservingly, finalise ordered)
+  versus goopg's
+  `Sort <- Finalize HashAggregate <- Gather <- Partial HashAggregate`.
+- **Not a new executor feature** (unlike K92's Parallel Hash):
+  `operators_gather_merge.go` exists and the 3 TPC-DS occurrences exercise
+  it. The missing piece is the planner COMBINATION.
+- **Widest surface of any round this session** — it moves every parallel
+  aggregate in both corpora. `splitAggregate`'s own comment records that
+  this pass runs on plans "the process-wide cache may be handing to other
+  sessions right now", so the non-mutating shallow-copy discipline is
+  load-bearing.
+- Gate note carried forward from K91: the TPC-H A/B **must** verify the
+  serving binary by inode. That check's absence produced a false result
+  this session; it is not boilerplate.
+
+### R45 REJECTED on review — the fix is architecturally impossible (K97)
+
+Review VERIFIED §1's measurement and §2's structural cause, then refuted
+the FIX at its root. **K96's diagnosis stands; K96's proposed remedy does
+not.**
+
+- **goopg's Partial aggregate emits ZERO rows.** It publishes transition
+  states through a SIDE CHANNEL, not the plan tree —
+  `parallel_agg_split.go` says so in terms: *"They do not travel through
+  Gather at all."* `AggModePartial` merges into `aggPartialAccum` and sets
+  `o.rows = nil`; `AggModeFinal` rebuilds from `accum.order`, i.e.
+  **worker-arrival order**. So a `Sort` between Partial and Gather would
+  sort an EMPTY stream and `Gather Merge` would merge EMPTY streams — a
+  plan that RENDERS like PG's while executing today's semantics. That is
+  exactly the arbitrary plan-forcing the goal forbids.
+- **Worse than cosmetic: a wrong-answer hazard.** The only point of the
+  shape is to drop the top-level `Sort`, which needs pathkeys claimed on
+  the Finalize — whose order is `accum.order`. **Q1 would return unordered
+  rows.**
+- **A trap for whoever tries this next:** `aggregateOp` already sorts its
+  output by group-key columns for determinism, including on the Finalize
+  path, so Q1 might APPEAR correct after dropping the Sort. That sort uses
+  collation 0, fixed ASC, fixed NULL ordering — it cannot serve `DESC`,
+  `NULLS FIRST/LAST`, non-default collations, or ordering by aggregate
+  outputs. **Do not mistake incidental ordering for a pathkey.**
+- **`Finalize GroupAggregate` is unreachable for a SECOND, independent
+  reason**, and R45 §4's "not a new executor feature" was FALSE: sorted
+  aggregation is gated to `Mode == AggModeSimple`
+  (`operators_join_agg.go:2222`), so a Finalize marked `AggStrategySorted`
+  falls through to the HASH path. Marking it would print
+  `Finalize GroupAggregate` over a hash table — a label lie
+  `operators_explain.go`'s own comment exists to prevent.
+- Correction to K96's wording: the Finalize is hashed not because it
+  *copies* the strategy but because **the split arm never OFFERS
+  `AggStrategySorted`** (`partialaggupper.go`).
+- **Prior art R45 failed to find:** `partialaggupper.go:352-359` already
+  reasons that presortedness cannot survive goopg's Gather, and
+  `parallel_agg_split.go` records the rejected alternatives (a
+  pointer-bearing Datum kind; a side channel threaded through
+  `rowBatch`/`TupleSlot`). This ground was surveyed before. **Search prior
+  design notes for the MECHANISM, not just the symptom, before designing.**
+- **The real item** is PG's `AGGSPLIT_INITIAL_SERIAL` /
+  `FINAL_DESERIAL` — row-borne partial aggregate states with
+  per-aggregate serialize/deserialize, plus `openSorted` extended to
+  `AggModeFinal`. A multi-round EXECUTOR programme, comparable to or
+  larger than K92's Parallel Hash. Only after it can Q1's shape be PRICED
+  rather than rendered.
