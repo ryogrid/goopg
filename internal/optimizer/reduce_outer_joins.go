@@ -51,6 +51,86 @@ func reduceOuterJoins(from []parser.FromExpr, where parser.Expr, cat catalog.Cat
 	}
 }
 
+// demotedForPlan returns a COPY of `item` carrying the same demotion verdicts
+// `reduceOuterJoins` computes, WITHOUT the S9.4 RIGHT->LEFT flip (R27 §4a).
+//
+// The problem it solves: `reduceOuterJoins` runs AFTER `planFromClause` has
+// built the node tree, so its demotions reach the jointree deconstruction but
+// never the plan. The plan keeps `JoinTypeLeft` while `root->join_info_list`
+// (built from the demoted items) says there is no outer join;
+// `outerLinksHaveSJInfos` then declines the statement, and a declined
+// statement cannot converge on PG's plan by any costing work (K27). Measured:
+// TPC-DS Q49 emits 3 `Hash Left Join` where PG emits none at all.
+//
+// Why not simply move the call, and why not suppress the flip — both were
+// tried and measured:
+//
+//   - MOVING IT breaks values. The S9.4 flip SWAPS `Base` and
+//     `Joins[0].Right`, and `planFromItem` assigns
+//     `SchemaColumn.SourceTableIdx` and binding offsets in FROM ORDER, so a
+//     swapped item re-points column references. PG is immune because it
+//     references columns by `Var`.
+//   - SUPPRESSING THE FLIP breaks five tests that pin it: the jointree
+//     deconstruction consumes it, so it is contractual, not an internal
+//     detail of the analysis.
+//
+// So the analysis runs on a throwaway copy and only the join-TYPE verdicts are
+// transplanted onto a fresh copy in the ORIGINAL orientation. The caller plans
+// from that; `s.FromExprs` is untouched, so the late `reduceOuterJoins` call
+// and everything downstream behave exactly as before. The two consumers then
+// agree on join TYPE — all `outerLinksHaveSJInfos` compares — while each keeps
+// the representation it needs.
+//
+// Only the INNER verdict is transplanted. It is orientation-free, so a
+// verdict reached in the flipped orientation still applies to the original;
+// and it drops no qual. LEFT->ANTI is declined because that conversion is not
+// plan-complete in goopg (see the loop). An un-demoted join is today's
+// behaviour, a mis-converted one is wrong rows.
+func demotedForPlan(item parser.FromExpr, where parser.Expr, cat catalog.Catalog) parser.FromExpr {
+	if len(item.Joins) == 0 {
+		return item
+	}
+	tableMap := buildTableMap([]parser.FromExpr{item}, cat)
+	upperNN := collectNonNullableTableNames(where, tableMap, cat)
+	upperFN := collectForcedNullTableNames(where, tableMap, cat)
+
+	work := item
+	work.Joins = make([]parser.JoinExpr, len(item.Joins))
+	copy(work.Joins, item.Joins)
+	applyDemotion(&work, upperNN, upperFN, tableMap, cat)
+
+	out := item
+	out.Joins = make([]parser.JoinExpr, len(item.Joins))
+	copy(out.Joins, item.Joins)
+	for i := range out.Joins {
+		got := work.Joins[i].Type
+		if got == out.Joins[i].Type {
+			continue
+		}
+		// ONLY the INNER verdict is transplanted, deliberately.
+		//
+		// The LEFT->ANTI verdict (S9.3) is NOT plan-complete: PG's
+		// conversion also DROPS the `IS NULL` qual that forced it, because an
+		// anti-join's output has no nullable-side columns for it to test.
+		// goopg's demotion changes the type and leaves the qual, so
+		// `LEFT JOIN … WHERE p.y IS NULL` filters every surviving row and
+		// answers 0 rows where 1 is correct — measured on
+		// `TestLeftJoinSearchAdmissionValues`. That conversion was never
+		// completed because, until now, no demotion verdict reached a plan.
+		//
+		// INNER is safe on both counts: it is orientation-free (so the
+		// flipped first join needs no special case) and it drops no qual —
+		// a strict qual that licensed the demotion stays true above the
+		// join. Declining ANTI leaves today's shipped behaviour; taking it
+		// would ship wrong rows.
+		if got != parser.JoinInner {
+			continue
+		}
+		out.Joins[i].Type = parser.JoinInner
+	}
+	return out
+}
+
 // applyDemotion walks one FromExpr's flat join chain and demotes outer joins
 // whose nullable side is constrained by strict quals. The nonnullable set
 // evolves as we walk the chain: local ON-clause findings are merged for INNER

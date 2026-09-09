@@ -367,6 +367,16 @@ failure/hang in background wastes the session — goal instruction).
   byte-identical, sweep PASS=95 all-zero. **The decline no longer masks
   anything**, so R27 §4a's ordering transplant can proceed on its own
   merits. Remaining: the ordering, then the declines.
+- **K30 (2026-09-09).** goopg's **LEFT->ANTI demotion is not
+  plan-complete.** PG's conversion also DROPS the `IS NULL` qual that
+  forced it, because an anti-join's output has no nullable-side column
+  for that qual to test. goopg changes the join type and leaves the
+  qual, so `LEFT JOIN … WHERE p.y IS NULL` filters every surviving row
+  — measured, **0 rows where 1 is correct**. Only the INNER verdict is
+  therefore transplanted to the plan (`demotedForPlan`). Completing the
+  ANTI conversion (drop the forcing qual) is the prerequisite for
+  transplanting it. Same family as K29: a demotion path that never
+  drove a plan was never completed.
 - **K4 (rev-1 error pattern, from §6).** Never conclude from a file
   without checking its callers (`pathgen.go`/`generateScanPaths` is
   test-only; production seed is `newPrebuiltPath`). Every design must
@@ -943,6 +953,15 @@ anything attempted so far.
 
 ## Log
 
+- 2026-09-09 (CC) **R27 §4a SHIPPED — the demotion reaches the plan.**
+  Q49: seam declines 3->0, `Hash Left Join` x3 -> gone (5 Nested Loop +
+  1 Merge Join vs PG's 6 Nested Loop) — it is ELIGIBLE again. TPC-DS
+  declines 13->9; join-method 74->73; scan-type 71->70; TPC-H values
+  byte-identical; sweep PASS=95 MISMATCH=0 CKMISMATCH=0 ERROR=0
+  TIMEOUT=0. Match count unmoved, exactly as DESIGN §6 predicted.
+  **K30**: LEFT->ANTI is not plan-complete — PG's conversion also drops
+  the forcing `IS NULL` qual; goopg leaves it and filters every row
+  (0 where 1 is correct), so only INNER verdicts are transplanted.
 - 2026-09-09 (CC) **R27 SHIPPED — a row-dropping demotion fixed**
   (`r27-outer-join-reduction/REPORT.md`). RIGHT/FULL joins judged their
   NULLABLE arm against `accumulatedNN`, which carries ON-strictness

@@ -1,0 +1,3 @@
+=== SUMMARY: PASS=95 (57 ck-verified, 38 ck=n/a) MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0 SKIP=4 ===
+
+[exited with code 0]

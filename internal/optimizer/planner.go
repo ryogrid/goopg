@@ -2844,7 +2844,12 @@ func planFromClause(s *parser.SelectStmt, cat catalog.Catalog, ps PlannerSetting
 	// Counter starts at 1; zero is reserved as the "unknown /
 	// derived" sentinel for SchemaColumn.SourceTableIdx.
 	nextSourceIdx := int16(1)
-	for _, item := range s.FromExprs {
+	for _, rawItem := range s.FromExprs {
+		// R27 §4a / K28: plan from a copy carrying the outer-join demotions
+		// that `reduceOuterJoins` (below, unchanged) computes, so the PLAN and
+		// `root->join_info_list` agree on join TYPE. See `demotedForPlan` for
+		// why the call below cannot simply be moved up here instead.
+		item := demotedForPlan(rawItem, s.Where, cat)
 		// LATERAL semantics for FROM-clause SRFs (M0103-0008):
 		// the partial FROM-list context is threaded down so each
 		// item's SRF args see siblings to its left.
