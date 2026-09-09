@@ -99,6 +99,14 @@ type ParallelSettings struct {
 //
 // It never mutates root or anything below it.
 func MaybeAddGather(root Node, s ParallelSettings) Node {
+	return maybeAddGatherInner(root, s, false)
+}
+
+// maybeAddGatherInner is MaybeAddGather with the sublink-nesting rule
+// threaded through: ancGathered reports a Gather above the current
+// tree (placed by this pass or pre-existing), in which case nested
+// sublinks stay serial (subquery_parallel.go: the nesting rule).
+func maybeAddGatherInner(root Node, s ParallelSettings, ancGathered bool) Node {
 	if root == nil {
 		return root
 	}
@@ -135,7 +143,7 @@ func MaybeAddGather(root Node, s ParallelSettings) Node {
 	// `parallelChildren` arm, so asking any of them about the wrapper answers
 	// about nothing.
 	if ex, ok := root.(*Explain); ok {
-		inner := MaybeAddGather(ex.Child, s)
+		inner := maybeAddGatherInner(ex.Child, s, ancGathered)
 		if inner == ex.Child {
 			return root
 		}
@@ -187,7 +195,10 @@ func MaybeAddGather(root Node, s ParallelSettings) Node {
 	// Find the deepest point at which the subtree below is partial-capable.
 	tgt, ok := findPartialSubtree(root, s)
 	if !ok {
-		return root
+		// R33 (K44): no top-level target — sublinks still get their
+		// own verdicts (Q9's top is a 1-row scan; its 15 InitPlans
+		// are the whole question).
+		return graftTop(root, s, ancGathered)
 	}
 
 	// Worker count comes from the scan, so a wrapper target (Sort, Aggregate)
@@ -201,7 +212,7 @@ func MaybeAddGather(root Node, s ParallelSettings) Node {
 	}
 	workers := computeParallelWorkers(sized, s)
 	if workers <= 0 {
-		return root
+		return graftTop(root, s, ancGathered)
 	}
 
 	return rebuildWithGather(root, tgt, workers)

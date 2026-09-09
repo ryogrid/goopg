@@ -301,6 +301,13 @@ var exprSwitchInventory = map[string]walkerRole{
 	"subplan_lower.go:excludedRefsWithin":        walkerPending, // 6 of 32 arms
 	"subplan_lower.go:handleFor":                 nonRecursiveClassifier,
 	"subplan_lower.go:rewriteSublinkPlan":        walkerPending, // 6 of 32 arms
+	// R33 (K44): the sublink-graft classifiers — decide-and-return over
+	// the five/six sublink shapes, no descent (descent rides
+	// exprChildSlots via spliceField). Classifier role needs no
+	// conversion.
+	"subquery_parallel.go:copySublinkWithPlan":  nonRecursiveClassifier,
+	"subquery_parallel.go:eligibleSublinkPlan":  nonRecursiveClassifier,
+	"subquery_parallel.go:isSublinkKind":        nonRecursiveClassifier,
 	"subplan_lower_walk.go:lowerTraverseExpr":    walkerPending, // 24 of 32 arms
 	"unnest.go:canUnnestExistsExpr":              walkerPending, // 5 of 32 arms
 	"unnest.go:cloneExprLeaf":                    walkerPending, // 14 of 32 arms

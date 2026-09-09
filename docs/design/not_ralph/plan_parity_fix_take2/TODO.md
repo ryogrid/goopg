@@ -1423,6 +1423,21 @@ Gates: units pass; TPC-H spotcheck Q12/Q13 PASS; SF0.5 sweep PASS=95
 MISMATCH=0 (plan-shape: 98 same, changed=Q9); TPC-DS A/B only Q9
 changed; TPC-H A/B 22/22 identical.
 
+## R33 — K37 campaign slice 2: parallel pass into uncorrelated sublinks (IMPLEMENTED, all gates pass)
+
+`r33-subquery-parallel-pass/DESIGN.md` (reviewed 2026-09-09:
+REJECT -> revised -> REJECT -> revised -> APPROVE-WITH-NOTES, notes
+applied; design commit `b03657c39`). K44: Q9's 15 InitPlans serial
+(PG: Finalize->Gather->Partial->Parallel SeqScan, corpus-max 15).
+Layer forced by elimination: R32-binary all-mode capture
+(`/tmp/pp2/k37-ds-all-r32.plans.txt`) still 0 gathers in Q9 —
+one-rel shapes never enter the path search (C-19h), only the
+post-pass can reach them. Change: recurse `MaybeAddGather` into
+`IsNonCorrelated` sublink Plans via copy-on-write graft (expr +
+plan COW, Plan-pointer seen-set, fail-closed rebuilder), only on
+non-strip outcomes; safety descent pinned to `walkExprRefs`/
+`scopeDescend`; `MultiAssignSubqRow` out; Result/IndexCond/
+IndexOnlyScan walker arms + coverage test; correlated excluded.
 `r32-targetlist-subplan-display/DESIGN.md` (reviewed 2026-09-09,
 APPROVE-WITH-NOTES, notes applied). Fresh-clone census (pinned env):
 PG-live 180 Gather / 162 PHJ lines; goopg default 42 / 0; `all` 104 /
@@ -1447,3 +1462,18 @@ four classes:
   (Q5: goopg 8116–12121 vs PG 8–14 on same `d_date` predicate);
   attribution (estimate vs Gather-costing) before any fix, per K39a.
 - **Excluded:** Q6-class misses are join-order-downstream (K26 owns).
+
+## R33 result (2026-09-09)
+
+`r33-subquery-parallel-pass/REPORT.md`. Graft shipped with a
+priced-verdicts-only gate (found in implementation: first build
+over-admitted plain-scan Gathers on 31-row/1-row subplans, Q6/Q14 —
+outcome accepted only with a fresh split). Corpus effect, all
+PG-conformant: TPC-DS Q9 15 splits (9 s -> 2 s) + Q44 2 splits;
+TPC-H Q22 InitPlan 1 splits. Gates: units + optimizer/executor
+suites (8 new tests) + TPC-H spotcheck + SF0.5 sweep (PASS=95,
+MISMATCH=0) + A/B both corpora (only intended sections move).
+Follow-ups named, not owned: Sort-rooted merge verdicts,
+Agg-over-Gather and plain-scan sublink Gathers need the
+cost-comparison round (K45 family); nested-under-parallel-top stays
+serial (nesting rule).

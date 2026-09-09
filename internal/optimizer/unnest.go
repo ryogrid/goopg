@@ -1141,6 +1141,43 @@ func walkPlanExprs(node Node, visit func(Expr)) {
 		if n.HighKey != nil {
 			walkExprTree(n.HighKey, visit)
 		}
+		// R33 (K44): the residual filter can host sublinks (a sublink
+		// in an indexqual-adjacent predicate); NodeSubplans already
+		// enumerates it (walk_export.go), and an unvisited Cond hides
+		// both outer refs (planHasOuterRef → IsNonCorrelated) and
+		// parallel-pass sublink discovery.
+		if n.Cond != nil {
+			walkExprTree(n.Cond, visit)
+		}
+	case *IndexOnlyScan:
+		// R33 (K44): mirrors NodeSubplans (walk_export.go); without
+		// this arm the walker skips the node's entire subtree.
+		if n.Key != nil {
+			walkExprTree(n.Key, visit)
+		}
+		for _, k := range n.Keys {
+			walkExprTree(k, visit)
+		}
+		if n.LowKey != nil {
+			walkExprTree(n.LowKey, visit)
+		}
+		if n.HighKey != nil {
+			walkExprTree(n.HighKey, visit)
+		}
+		if n.Cond != nil {
+			walkExprTree(n.Cond, visit)
+		}
+	case *Result:
+		// R33 (K44): the S6 min/max InitPlan hangs in Result.Targets
+		// (plan.go:1557); mirrors NodeSubplans. Child recursion keeps
+		// the subtree walk complete.
+		walkPlanExprs(n.Child, visit)
+		for _, t := range n.Targets {
+			walkExprTree(t, visit)
+		}
+		if n.OneTimeFilter != nil {
+			walkExprTree(n.OneTimeFilter, visit)
+		}
 	// The bitmap family (M0134-0185). These arms are CORRECTNESS, not
 	// coverage hygiene: `planHasOuterRef` rides this walker to compute
 	// `IsNonCorrelated`, and a correlated probe key inside a

@@ -99,6 +99,27 @@ tournament sizing, mirroring PG planning each query level
 independently in `subquery_planner`. No search, executor, or
 costing-function change.
 
+PRICED-VERDICTS-ONLY GATE (scope correction during implementation,
+2026-09-09). The first build recursed every eligible sublink and
+over-admitted: Q6 InitPlan 1 (`Gather` over a 31-row Unique/Sort)
+and Q14 InitPlans 2/4 (`Workers Planned: 1` over rows=1 date_dim
+scans) gained workers PG keeps serial — the EXTRA direction, which
+the K37 census had proved was previously zero. Cause: the pass
+places plain-scan Gathers by size construction with no
+serial-vs-parallel cost comparison (`NewGather` carries no PlanCost),
+and extending that construction into subqueries moved the unpriced
+verdict with it. The gate: an outcome is accepted only when it
+contains a split the input lacked (`hasFreshSplit`, traversal via
+reflection-complete `planChildNodes`) — the one sublink shape whose
+parallel verdict is priced (`partialAggSplitPays`). The check is
+outcome-based, not root-typed: a Project-wrapped aggregate (Q9's
+real shape, found during implementation when the root-typed first
+cut silently rejected all 15 splits) splits inside its wrapper.
+Sort-rooted
+(`partialSortRootPays` exists but unmeasured here), plain
+Agg-over-Gather, and plain-scan sublink Gathers stay serial pending
+the cost-comparison round (K45 family).
+
 Walker coverage the graft needs (review 2026-09-09): `WalkPlanExprs`
 (`walk_export.go:10`, impl `unnest.go:1035`) hosts Q9's `Project`
 targets, but has no `*Result` arm (the S6 min/max InitPlan hangs in
