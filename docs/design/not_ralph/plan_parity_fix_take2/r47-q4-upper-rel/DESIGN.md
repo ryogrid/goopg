@@ -1,129 +1,191 @@
-# R47 — Price NLI/semi probe executions; teach the ordered rel sorted aggregates (K101)
+# R47 — Expose grouping candidates to the ordered level; measure (K101 rev 3)
 
 *Round of `docs/design/not_ralph/plan_parity_fix_take2/TODO.md`.
-Aggregation-strategy + sort-strategy axes. Chosen by nearest-miss
-ranking: TPC-H Q4 differs on `[aggregation-strategy, sort-strategy,
-qual-placement]` with NO join-order divergence — the nearest TPC-H
-miss — and all three divergences sit in the upper rel.*
+Aggregation-strategy + sort-strategy axes. TPC-H Q4 nearest miss.
+Rev 1 REJECTED (11 findings); rev 2 REJECTED (narrow, 8-item
+checklist). This revision answers every item AND downgrades the
+unprovable claim: after exhaustive PG-source analysis the firing
+micro-rule could not be derived from first principles (details
+below), so this round lands SAFE PLUMBING + MEASUREMENT and lets
+the corpus arbitrate — no predicted flip, no hedge, no invented
+rules. K101 retained.*
 
 ## 0. Baseline (R46 `de85a10`, canonical data, pinned env)
 
-- TPC-H: `match=1 shapediff=19`,
-  `join-order=20 join-method=11 scan-type=13 parameterisation=6
-  aggregation-strategy=16 sort-strategy=10 parallelism=15
-  qual-placement=4 rendering=7`.
-- TPC-DS: `match=1 (Q9) shapediff=69`,
-  `join-order=95 join-method=66 scan-type=74 parameterisation=35
-  aggregation-strategy=79 sort-strategy=83 parallelism=89
-  qual-placement=12 rendering=33`.
+- TPC-H: `match=1 shapediff=19` (agg 16 / sort 10).
+- TPC-DS: `match=1 (Q9) shapediff=69` (out of scope).
 
-Q4 (goopg vs PG fixture):
+Reference scoping (K9-compliant): NO parity-verdict claim on Q4
+and no fixture targeting. The fixture (`bench/tpch/plans-pg/Q4.txt`,
+stale-serial) is a movement detector only; acceptance is gates +
+pins + the five live flips as CHARACTERIZATION (informative, not
+gating). Live-parallel shapes stay out via K96/K97. Owner waiver
+for fixture re-capture remains requested, not presupposed.
 
-```
-goopg: Sort -> HashAggregate -> NestedLoop Semi (JoinQual + stray true)
-PG:    GroupAggregate -> Sort -> NestedLoop Semi (probe-side Filter)
-```
+## 1. Step 0 results (all measured; traces removed, tree clean)
 
-## 1. Root cause (K101, two halves)
+- **Provenance:** Q4's semi is a legacy `tryBuildNLI`
+  `*NestedLoopIndexJoin`, unstamped (`CostSet=false`; bypasses
+  the `createPlanNode` stamp funnel, `createplan.go:44-52`).
+  Search builds zero nested-loop paths for Q4 (traced).
+- **1141.32 accounting (CLOSED):** `Derive(Filter_wrapper[NLI],
+  57066)` = NLI_derive (570.66 — no children arm in
+  `legacyDisplayChildren`, `internal/optimizer/plancost.go:204-243`)
+  + perRow (570.66, `internal/optimizer/plancost.go:154-160`).
+  The render reads the collapsed wrapper
+  (`internal/executor/operators_explain.go:421-456`,
+  `:483-515`, `:2177-2190`).
+  HashAggregate startup 1283.98 = 1141.32 + 0.0025×57066,
+  exact.
+- **Width flip (448 vs 64):** same 9-col semi Output both GUC
+  arms; per-column type widths differ. Open mechanism,
+  verdict-neutral; recorded.
+- **Rows:** semi selectivity 1.0 acknowledged, not owned.
+- **PG flips, re-measured live `:65432` 2026-09-10, archived
+  `pg-flips/`:** default→sorted (70122.64),
+  sort-off→hashed (69911.66), hashagg-off→sorted,
+  no-ORDER-BY→sorted, LIMIT-5→sorted. Deterministic.
+- **Micro-rule status (honest): UNIDENTIFIED after exhaustive
+  analysis.** `create_ordered_paths` (`planner.c:5308-5360`)
+  offers presorted inputs directly and Sort over the cheapest
+  input — subject to PG's inner gate (`planner.c:~5355-5365`:
+  non-cheapest unsorted inputs are skipped absent
+  incremental-sort presorted keys). Slice 2 offers Sort per
+  surviving candidate, which is BROADER than PG; declared
+  deviation, harmless (extra Sort candidates lose on cost
+  unless the cheapest-input rule itself diverges — visible in
+  the §3.3 census if so). Both candidates reach `add_path`
+  either way. Every dominance model constructed from PG's
+  documented rules (add_path startup/total/fuzz/pathkeys in
+  all combinations; cheapest_total final; grouping-level
+  pruning) predicts hashed at least once, yet PG picks sorted
+  in all five flips (including no-ORDER-BY, where no ordered
+  level exists).
+  Work_mem spot-checks (1MB/4MB/256MB, identical costs and
+  choice, observed in-session — no artefact file; the five
+  `pg-flips/` captures are the archived evidence) argue
+  against spill-driven explanations. The firing rule is
+  therefore NOT derivable from the rules as understood — it
+  may lie in
+  native-vs-sort pathkey comparison semantics, an
+  unidentified grouping-level pruning, or `can_hash`-adjacent
+  gating. Per the program's honesty norm this is STATED, not
+  papered over — and it is WHY this round predicts no flip.
 
-**Half A — NLI/semi inner executions unpriced.** Q4's grouping
-tournament (`createGroupingPaths`, `groupingpaths.go:46`,
-`setCheapest` at :90) prices hashed vs sorted off the child's
-display cost as seed (`legacyDisplayCostOf`, `:73-76`). The child
-is a `NestedLoop Semi Join` over 57066 outer probes, priced at
-**1141 total = 0.02/probe**. PG prices the same subtree at
-**192514 (3.3/probe)**: `cost_nestloop` charges the inner index
-execution per outer row. goopg's `DeriveLegacyDisplayCost`
-(`plancost.go:116`) `default:` arm sums each child ONCE
-(`legacyDisplayChildren` returns both join sides; no
-per-outer-row factor) — and the probe child's own display cost
-(0.05, uncosted legacy index) contributes nothing either.
+## 2. Change (two slices)
 
-Measured consequence (scratch unit probe of `costAgg` with both
-input scales): with goopg's seed (~1k) hashed wins 4.6x; the sort
-(4651 on 57k rows) can never compete. The tournament machinery
-is CORRECT — with PG-scale inputs the gap is 0.5%, inside the
-1.01 fuzz where `setCheapest`'s pathkeys tie-break
-(`path.go:1141-1147`) picks the sorted path. The inputs are
-wrong, not the comparator. (K26 §9.2's "costing remains" is this.)
+Rationale (PG-cited, rule-free): PG's grouping rel RETAINS
+multiple strategies (`add_paths_to_grouping_rel` offers hashed
++ sorted; both survive `add_path` whenever neither dominates)
+and `create_ordered_paths` iterates ALL input paths
+(`planner.c:5345+` `foreach(lc, input_rel->pathlist)`).
+goopg collapses grouping to one node (`createGroupingPaths`,
+`groupingpaths.go:89-112`) before ordering sees alternatives —
+so whatever PG's firing rule is, goopg cannot execute it. This
+round removes that structural inability; NOTHING about
+comparison logic changes.
 
-Quantitative bar (honest, load-bearing): with per-probe pricing
-at PG levels (~3.3), seed ≈ 190k; hashed adds ~285 (trans+hash on
-57k rows), sorted adds ~sort+trans+cmp (~5k at width 448).
-Ratio ≈ 195/190 ≈ 1.025 — OUTSIDE the fuzz without help. The
-semi output width (448 vs PG 16) inflates the sort further.
-Step 0 (below) measures the real numbers; if the bar is missed,
-the round re-scopes to mechanism-only (probe pricing lands,
-Q4-match deferred) rather than forcing shapes.
+**Slice 1 — plumbing, zero behavior change.** Expose the
+grouping rel's surviving PathAgg candidates (Paths, never
+built Nodes) for the ordered stage; the ORDERED stage is
+untouched (still wraps today's single winner identically).
+Exact mechanics:
+- Per-candidate `Agg` spec clone at offer time (today all arms
+  share `aggNode`: plain `:331`, hashed `:346`, sorted `:396`;
+  only index clones `:419-451`). Winner copy-back
+  (`*aggNode = *built`, `:112`) keeps identical pointer
+  identity (HAVING filter aliases `agg.node`,
+  `planner.go:1732`, `:1746-1748`).
+- `stampAggregateInputTarget(agg.node, nil)` (`:1758`) runs
+  only on the winner, as today.
+- Losers stay unbuilt Paths (no stamps on shared children;
+  `maybeAttachMemoize` runs once on the final tree —
+  Memoize-node census on Q4 before/after).
+- Plan-cache safety: `upper` is per-statement local
+  (`fetchUpperRel`, `:64`; same registry reaches the ordered
+  stage, `planner.go:1937-1940`).
+- Gate: byte-identical corpus A/B both suites + full suites.
 
-**Half B — the ordered rel cannot see sorted-aggregate order.**
-Even if sorted wins grouping, the top Sort stays: with
-`enable_hashagg=off` the plan is
-`Sort -> GroupAggregate -> Sort -> Semi` (verified live) —
-PG has NO top sort (GroupAgg output order satisfies ORDER BY).
-`inputNodePathkeys` (`upperorderedinput.go:150`) handles
-Sort/Filter/Limit but has NO `*Aggregate` arm, so the ORDERED
-rel (`createOrderedPaths`, `upperordered.go:64`) never sees the
-group-key order and always stacks a Sort. PG's groupagg paths
-carry pathkeys; goopg's sorted PathAgg HAS Pathkeys
-(`groupingpaths.go:399`) but the reader drops them at the
-aggregate boundary.
+**Slice 2 — expose at the ordered level, measure.** A new
+ordered-level loop over the grouping survivors calls
+`addOrderedPaths` per candidate directly on the ORDERED rel
+(NOT `createOrderedPaths` reuse — it takes one finished Node
+and `inputNodePathkeys` returns nil through `*Aggregate`,
+`upperorderedinput.go:184-186`; no Aggregate node arm is
+added — paths already carry Pathkeys: hashed `:335`,
+sorted `:390`, `:400`). Existing `setCheapest` +
+`getCheapestFractionalPath` elect (cheapest-total final, no
+LIMIT → `tupleFraction` 0 — stated). Deviations declared:
+M0129-S1 tie-break (`path.go:752-776`, never returns
+costsEqual — does not fire for Q4's numbers but governs other
+near-ties); `sortPathForBounded` stamps sort-disabled
+(`joinpathsmerge.go:490-492`, what makes flip #2
+reproducible).
+- Gate: byte-guard A/B (sections MAY move — that is the
+  measurement), per-query census with ZERO EXTRA flips
+  REQUIRED (no previously-matching query newly diverges;
+  any newly diverging section fails the round), shape-delta
+  reported, standard gates. If Q4 (or anything) flips toward
+  PG → stretch achieved, recorded. If nothing flips → the
+  measurement (which candidates survive where, from the census
+  + unit probes below) must ELIMINATE at least one of the
+  three named hypotheses (native-vs-sort pathkey semantics;
+  grouping-level pruning; `can_hash`-adjacent gating) so the
+  pass always produces the follow-up's starting point.
+  Either outcome is a pass; inventing a rule is the only fail.
 
-## 2. Change
-
-**(a) Price inner executions in the legacy join display cost**
-(PG `cost_nestloop` shape: `outer_total + inner_total ×
-outer_rows`, single execution model; Memoize-dedup and
-rescan-discount refinements are named follow-ups, not this
-round). This changes every legacy NLI/semi/anti display cost
-(estimates column only — N1-verdict-neutral) AND every tournament
-seed built on one (planning — the point). Precedent for display
-costs feeding plans: the grouping seed bridge itself.
-
-**(b) `case *Aggregate` in `inputNodePathkeys`**: a sorted-strategy
-aggregate preserves its group-key order → emit group-key
-pathkeys (in the node's own output coordinates, per the file's
-two rules); all other strategies → nil (today's behavior).
-Tiny, bounded, with a unit pin.
-
-Out of scope for this round (named): qual-placement (probe
-Filter vs JoinQual — NLI probe construction) and the stray
-`Filter: (true)` (unnest leftover) → R48; join-method costing
-(Q84/Q96); K100; width narrowing (448 vs 16 — observed; the bar
-math may recruit it later, not now).
+Explicitly NOT in this round: probe-execution pricing (PG
+itself would pick hashed at grouping on pure cost — shown by
+the sort-off flip; the override, whatever it is, lives above),
+width narrowing, qual-placement + stray `Filter: (true)`
+(→ R48, independent, either order), join-method costing,
+K100, rescan-discount/Memoize refinements, semi selectivity.
 
 ## 3. Success tests (all must hold)
 
-1. Unit pins (before corpus A/B): hand-computed NLI/semi display
-   cost with probe executions (outer × inner, PG-shape numbers);
-   Aggregate-arm pathkeys pin (sorted → group keys; hashed →
-   nil).
-2. Q4 `aggregation-strategy` + `sort-strategy` fall (stretch:
-   full MATCH modulo qual-placement — the bar in §1 decides;
-   mechanism-only landing is an honest outcome, recorded not
-   forced).
-3. Corpus: `aggregation-strategy`/`sort-strategy`/`join-order`
-   move favorably with ZERO EXTRA flips (per-query census);
-   shape-delta reported alongside (R35/K50).
-4. Standard gates: units, suites, TPC-H spotcheck, SF0.5 sweep
+1. Slice-1 gate (§2).
+2. Comparator-parity unit pins (KNOWN PG behaviors, not Q4's
+   contested pair): fuzz bands (1.01), startup dimension
+   (`considerPathStartupCost` gating stated),
+   prefix-pathkeys (`dimEqual`/`dimBetter1`/incomparable),
+   DisabledNodes trumping, M0129-S1 tie-break direction.
+   Plus: no-sort offered iff pathkeys satisfy (unit).
+3. Dominance instrumentation (diagnostic, both magnitudes
+   rows 57066/13628, widths 448/64): which grouping
+   candidates survive `add_path`, which ordered candidates
+   survive, who the final pick is — RECORDED, not asserted.
+4. Five live flips as characterization (informative): goopg's
+   strategy picks reported against PG's; mismatch does NOT
+   fail the round (it scopes the follow-up) — but any flip
+   toward PG is recorded as stretch.
+5. Pins pre-declared: Q4 estimate re-baseline IF its shape
+   moves (estimate-audit/EA-ratchet/c13a); exercised seed
+   sites are `groupingpaths.go:77` + `upperordered.go:89`
+   (others untouched — stated); Memoize-node census Q4
+   before/after; inode-verified serving binary (K91).
+6. Standard gates: units, suites, TPC-H spotcheck, SF0.5 sweep
    `MISMATCH=0`-class, byte-guard A/B both corpora.
-5. `match` count is NOT a criterion (conjunction rule).
+7. `match` count is NOT a criterion (conjunction rule).
 
 ## 4. Non-goals / follow-ups (named, not owned)
 
 - R48: semi JoinQual placement + `Filter: (true)` drop.
-- Q84/Q96 join-method costing (`chooseInnerJoinAlgo` unit-row
-  model vs PG's full join costing).
-- K100 (executor reg*[] comparison); TPC-H fixture parallelism
-  (owner decision); K26 implied-equalities re-wire (candidate
-  half, still open); width narrowing.
-- NLI rescan-discount/Memoize-aware probe pricing refinements.
+- The firing micro-rule follow-up (uses §3.3's diagnosis):
+  native-vs-sort pathkey semantics, grouping-level pruning
+  audit, or `can_hash`-adjacent gating — whichever the
+  measurement implicates.
+- Q84/Q96 join-method costing; K100; TPC-H fixture
+  re-capture (owner); K26 halves; NLI rescan-discount/Memoize
+  refinements; semi selectivity cardinality.
+- K96/K97 execution program for live-parallel shapes.
 
 ## 5. Evidence archive
 
-- `/tmp/pp2/oc-tpch-r46c.txt` (Q4 before-shape),
-  `bench/tpch/plans-pg/Q4.txt` (reference)
-- `enable_hashagg=off` probe (sorted candidate builds; top Sort
-  stays): §1 Half B verification
-- Servers `:5553`/`:5554` (r46 clean binary); foreign `:5545`
-  untouched.
+- `pg-flips/` (five live PG captures, pinned GUCs,
+  2026-09-10); `/tmp/pp2/oc-tpch-r46c.txt` (goopg Q4
+  before-shape);
+  Step-0 trace logs `/tmp/pp2/oc-trace*.log` (binaries
+  removed; tree verified clean of `R47TRACE`)
+- Servers `:5552`/`:5553`/`:5554` (clean r46); PG `:65432`
+  restarted for re-measurement, stopped after (was down on
+  arrival).

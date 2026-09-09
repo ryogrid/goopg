@@ -1,0 +1,19 @@
+                                                                         QUERY PLAN                                                                         
+------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=70094.27..70122.64 rows=5 width=24)
+   ->  Finalize GroupAggregate  (cost=70094.27..70122.64 rows=5 width=24)
+         Group Key: orders.o_orderpriority
+         ->  Gather Merge  (cost=70094.27..70122.49 rows=20 width=24)
+               Workers Planned: 4
+               ->  Partial GroupAggregate  (cost=69094.21..69120.05 rows=5 width=24)
+                     Group Key: orders.o_orderpriority
+                     ->  Sort  (cost=69094.21..69102.81 rows=3439 width=16)
+                           Sort Key: orders.o_orderpriority
+                           ->  Nested Loop Semi Join  (cost=0.43..68892.21 rows=3439 width=16)
+                                 ->  Parallel Seq Scan on orders  (cost=0.00..33439.00 rows=14974 width=22)
+                                       Filter: ((o_orderdate >= '1993-07-01'::date) AND (o_orderdate < '1993-10-01 00:00:00'::timestamp without time zone))
+                                 ->  Index Scan using idx_lineitem_orderkey_fkidx on lineitem  (cost=0.43..10.29 rows=6 width=6)
+                                       Index Cond: (l_orderkey = orders.o_orderkey)
+                                       Filter: (l_commitdate < l_receiptdate)
+(15 rows)
+
