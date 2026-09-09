@@ -913,6 +913,17 @@ anything attempted so far.
 
 ## Log
 
+- 2026-09-09 (CC) **R27 design** (`r27-outer-join-reduction/DESIGN.md`)
+  completes K28's audit. `applyDemotion` does TWO jobs in one mutation:
+  (A) join-type demotion — safe and wanted for the plan; (B) the S9.4
+  RIGHT->LEFT flip, which **swaps `Base<->Right`** and is only an
+  ANALYSIS normalisation. goopg's node builder is position-sensitive
+  (`SourceTableIdx`/binding offsets in FROM order), so (B) reaching it
+  re-points column refs — that is the `SELECT rj_c.id, rj_a.id, rj_b.id`
+  wrong-rows failure, not a moved plan. PG is immune because it
+  references by `Var`. Fix: run the analysis on a COPY, write back only
+  join-TYPE changes, then move the call to PG's position. Strictness
+  analysis deliberately untouched — least evidence behind it.
 - 2026-09-09 (CC) **R26/2** (`r26-seam-decline-audit/FINDINGS-2-outer-join-reduction.md`):
   traced `outer-link-no-sjinfo` (7 of 13 declines) to an ORDERING bug —
   `planFromClause` builds the node tree from the un-demoted `FromExpr`s
