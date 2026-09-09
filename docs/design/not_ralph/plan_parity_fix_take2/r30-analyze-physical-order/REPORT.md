@@ -85,3 +85,22 @@ noticed, and inventing an explanation for it would be guesswork.
 - Index-level statistics remain absent: `estimateIndexGeometry` still
   synthesises `relpages`/`reltuples`/`tree_height` because ANALYZE does
   not visit indexes. That is the next statistics-axis gap after this one.
+
+## 6. Re-verified on the PG-faithful clone (added after R31b)
+
+§2's numbers were measured on a cluster whose fact tables carried ~15%
+more heap pages than PG's (R31, K39). R31b rebuilt the parity clone so
+`relpages` matches PG to within 0.4%, and this round's A/B was re-run on
+it — same pinned seed, both sides re-ANALYZEd, same capture script:
+
+| | pre-R30 ANALYZE | R30 ANALYZE |
+|---|---|---|
+| scan-type | 72 | **71** |
+| join-method | 77 | **79** |
+| every other category | — | unchanged |
+
+**Identical deltas to §2.** R30's conclusion stands on a baseline whose
+`cost_seqscan` inputs are PG-faithful: correcting the correlation
+statistic buys one scan-type row and costs two join-method rows, and
+that trade is a property of the cost model, not an artifact of the
+inflated heap it was first measured on.
