@@ -1378,8 +1378,34 @@ an owner decision.
   `cost_seqscan`, so every fact scan is priced ~15% high while
   dimensions (`item` 736 vs 1284) are priced low — a non-cancelling
   distortion under every TPC-DS cost A/B so far, R30 included.
-  **Blocked on owner approval to reload bench data + re-pin anchors.**
+  **RESOLVED, and the priority was WRONG — see R31b below.**
 - **K40 (minor, found in passing).** `round(double precision, int)`
   resolves on goopg but does not exist in PG 18.3.
 - **Open, unestablished.** goopg's `VACUUM FULL` accepted the command
   and repacked nothing; defect vs documented no-op not determined.
+
+## R31b — private clone rebuilt; heap confound removed (done)
+
+`r31-parallelism-and-heap-density/REPORT-fresh-clone.md`. R31 called the
+reload an owner decision and treated it as blocking; that applied only
+to the SHARED cluster. The PRIVATE parity clone was rebuilt with the
+current binary (same TSVs, same schema — 25 tables / 24 indexes verified
+on all three clusters).
+
+- **K39 CLOSED.** Fact-table pages now PG-faithful to 0.4%
+  (`store_sales` 29761 -> 25866 vs PG 25928). 4-worker plans 19 -> 0,
+  matching PG, which plans none.
+- **K39a — the correction that matters.** Fixing it did NOT move parity:
+  every category identical except qual-placement 13 -> 12, `match=0`
+  unchanged. A 15% error in every fact table's `relpages` — a direct
+  `cost_seqscan` input — changed almost nothing about plan choice. The
+  remaining divergence is in the COST COMPUTATION and PLANNING LOGIC,
+  not in the statistics fed to them. R31's "re-baseline before
+  continuing" recommendation is withdrawn.
+- **K41 (new).** Dimension tables diverge the OTHER way and are still
+  unexplained: `customer` 1979 pages vs PG 2872, `item` 716 vs 1284.
+  goopg packs wide-varchar rows more tightly than PG. Was masked while
+  the fact tables erred in the opposite direction.
+- **Baseline.** Use the fresh clone for parity from here. R30's TPC-DS
+  numbers were measured on the inflated cluster and should be
+  re-measured before being built upon.
