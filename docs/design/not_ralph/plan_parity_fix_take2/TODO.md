@@ -1686,8 +1686,7 @@ multiplies unconditionally via `clauseSelectivity` (NOT the
   exactly. EXPLAIN alone renders 60,299.79. K61's "both models in one
   plan" claim described the RENDERING, not the decision, and is
   withdrawn.
-- **The Q12 build-side divergence is STILL UNEXPLAINED.** Three
-  candidates eliminated by measurement: estimate (folded bound gives
+- **Q12 build-side RESOLVED — see K64.** Four candidates eliminated: estimate (folded bound gives
   28,724 vs PG 28,127, side does not flip), parallelism (disabling does
   not flip it), page term (search had it). Next probe is the comparison
   itself — instrument `add_path` for both hash-join orientations and
@@ -1700,3 +1699,28 @@ multiplies unconditionally via `clauseSelectivity` (NOT the
   MODE=semantic-cost`, estimate-audit tables, and any human reading an
   EXPLAIN. The cost twin of the `EstimateRows`/`calcJoinrelSize` row
   split. Reporting-integrity fix; do NOT expect categories to move.
+
+- **K64 — `hashJoinCost` overcharges the build side by ~58x. THE next
+  round.** `GOOPG_HJ_TRACE` on `addHashJoinPath` for Q12, both
+  orientations as the search costed them:
+  `probe=orders(1.5M,43435) build=lineitem(28724,271421) -> 328627.53`
+  vs `probe=lineitem(28724,271421) build=orders(1.5M,43435) ->
+  534007.10`. PG's orientation WAS generated and `add_path` correctly
+  took the cheaper of the two numbers it was given — the numbers are
+  what is wrong. Scan inputs are identical either way (314,856), so the
+  whole difference is hash overhead: 13,771 building 28,724 rows vs
+  **219,151 building 1,500,000** = ~0.146 per build row, against PG's
+  ~`cpu_operator_cost` (0.0025). That term is why goopg always builds
+  the small side while PG hashes 1.5M `orders` to stream the expensive
+  `lineitem` scan once.
+  Fix: diff `hashJoinCost` (cost_funcs.go) term by term against
+  `initial_cost_hashjoin`/`final_cost_hashjoin` (costsize.c:4200-4450).
+  Squarely a cost-computation fix the parity metric CAN see; expect
+  `join-method` movement and possibly the build-side half of
+  join-order. Do NOT expect `match`.
+- **Chain of elimination, for the record** (each by measurement, not
+  argument): estimate -> parallelism -> page cost -> candidate
+  generation -> arithmetic. Both orientations ARE enumerated
+  (`makeJoinRel` calls `addPaths` twice, joinsearchlevel.go:658/661,
+  matching joinrels.c:916/919), so goopg's join search is structurally
+  PG-shaped here; only the pricing diverges.

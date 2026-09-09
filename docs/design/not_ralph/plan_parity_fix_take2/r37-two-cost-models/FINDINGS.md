@@ -162,3 +162,71 @@ Q12 and record both candidates' total costs, or whether the
 PG-shaped orientation was generated at all. That is the
 `planner_verify_both_candidates_generated` discipline, and it is now
 the only untested link.
+
+---
+
+# RESOLVED — the Q12 build-side divergence is `hashJoinCost`'s build charge
+
+The correction above left the divergence unexplained with one untested
+link: the comparison itself. Instrumented (temporary `GOOPG_HJ_TRACE`
+in `addHashJoinPath`, reverted). Both orientations, as the search
+costed them:
+
+```
+HJTRACE probe=orders(rows=1500000 cost=43435.00) build=lineitem(rows=28724 cost=271421.24) -> total=328627.53
+HJTRACE probe=lineitem(rows=28724 cost=271421.24) build=orders(rows=1500000 cost=43435.00) -> total=534007.10
+```
+
+**PG's orientation WAS generated**, and goopg priced it 64% higher than
+its own, then correctly chose the cheaper by its own model. So this is
+neither a missing candidate nor a broken comparator: `add_path` did its
+job on the numbers it was given.
+
+## The number that is wrong
+
+The two orientations share identical scan inputs — 43,435 + 271,421 =
+**314,856** either way. Everything above that is hash overhead:
+
+| orientation | build side rows | overhead above scans |
+|---|---|---|
+| goopg's (build `lineitem`) | 28,724 | **13,771** |
+| PG's (build `orders`) | 1,500,000 | **219,151** |
+
+219,151 / 1,500,000 = **~0.146 per build row**. PG's `cost_hashjoin`
+charges the build at roughly `cpu_operator_cost` per row — 0.0025 —
+so goopg is charging on the order of **58x** upstream for hashing a
+row.
+
+That single term is what makes goopg refuse to build the large side.
+PG will happily hash 1.5M `orders` rows because the build is cheap and
+the probe side (`lineitem`) is the expensive scan it wants to stream
+once; goopg cannot, because its build charge dominates everything.
+
+## Why this is the answer and not another layer
+
+Four candidates have now been eliminated by measurement, in order:
+
+1. **Estimate** — hand-folding the bound gives 28,724 vs PG's 28,127;
+   the side does not flip.
+2. **Parallelism** — disabling it does not flip it.
+3. **Page cost** — the search had it all along (271,421.24 traced).
+4. **Candidate generation** — both orientations are enumerated
+   (`makeJoinRel` calls `addPaths` twice, joinsearchlevel.go:658/661,
+   matching joinrels.c:916/919).
+
+What remains is the arithmetic inside `hashJoinCost`, and the trace
+prices it directly.
+
+## Filed as K64 — the next ROUND, and a real one
+
+Compare `hashJoinCost` (cost_funcs.go) term by term against
+`initial_cost_hashjoin` / `final_cost_hashjoin` (costsize.c:4200-4450),
+specifically the per-build-row charge. This is a cost-computation fix
+of exactly the kind the goal asks for — same inputs, same formula — and
+unlike the estimate rounds it is squarely inside the model the parity
+metric can see.
+
+Expected to move `join-method` (TPC-DS 80, TPC-H 13) and plausibly the
+build-side half of `join-order`, which has never moved. Not predicted
+to reach `match`, since these queries also differ in parallelism and
+aggregation-strategy.
