@@ -277,7 +277,12 @@ func newSjiScope(from []parser.FromExpr, cat catalog.Catalog) *sjiScope {
 	for i := range from {
 		start := len(sc.leaves)
 		sc.addLeaf(from[i].Base, cat)
-		for _, j := range from[i].Joins {
+		// R41/K74: skip exactly the sides `antiCollapsedJoins` (collapse.go)
+		// gives no leaf index to, or every SJI hand to the RIGHT of a
+		// collapsed link would name the wrong relation. This numbering and
+		// the joinlist's must stay identical, which is why both read the same
+		// helper rather than re-deriving the rule.
+		for _, j := range from[i].Joins[antiCollapsedJoins(from[i]):] {
 			sc.addLeaf(j.Right, cat)
 		}
 		sc.items = append(sc.items, [2]int{start, len(sc.leaves)})

@@ -259,6 +259,25 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 	// touching one is declined by the clause producer and survives in the
 	// residual `Filter` above the spine.
 	nprefix := jl.nrels()
+	// R41/K75: fail closed when the joinlist claims MORE relations than the
+	// statement has bindings. `ctx.bindings[:nprefix]` below would be an
+	// index-out-of-range PANIC, and until R41 the `leaf-count` check was the
+	// only thing that happened to prevent it (measured on TPC-DS Q78:
+	// len(bindings)=2, nprefix=3).
+	//
+	// The two numbers come from SEPARATE computations — `demotedForPlan`
+	// decides the plan tree's join types while the in-place
+	// `reduceOuterJoins(s.FromExprs, …)` decides the joinlist's — so a future
+	// divergence about which links became SEMI/ANTI would desynchronise the
+	// numbering again. This turns that into a decline instead of a crash.
+	//
+	// NOT an equality check: a peeled outer spine legitimately leaves the
+	// prefix narrower than the full binding list, which is the normal
+	// admitted case.
+	if nprefix > nrels {
+		traceSeamDecline("prefix-exceeds-bindings", nrels, nprefix)
+		return node, pred, false
+	}
 	if nprefix < minSearchRels() && len(spine) == 0 {
 		// UNDER a spine a one-relation prefix is already planned
 		// (M0134-0188): there is no order to choose, but there IS an access

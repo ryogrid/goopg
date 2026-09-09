@@ -2164,3 +2164,35 @@ all 22. TPC-DS total 838s -> 817s.
   3 -> 0, declines 8 -> 5) should arrive WITHOUT the qual-placement
   regression that forced the revert. Q78 still will not match — that needs
   Option B's 3-leaf search.
+
+
+### R41 LANDED on the second attempt (`r41-anti-leaf-coordinates/REPORT.md`)
+
+Re-applied unchanged on top of R42, which removed the blocker (K76) that
+forced the first attempt's revert. All gates green: sweep **PASS=95
+MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0**, Q78 checksum unchanged,
+TPC-H values byte-identical AND plan structure identical across all 22.
+
+- **`leaf-count` declines 3 -> 0; TPC-DS declines 8 -> 5, no new class.**
+  Census read BY CLASS, not by total — R40's lesson was that a class can
+  be converted rather than removed.
+- **The qual-placement regression is gone**: Q78's three `date_dim` scans
+  keep `Filter: (d_year = 1998)` and the query is back to 14s (it was 26s
+  when R41 landed without R42). Confirms R42 was the right prerequisite
+  and the revert-then-reland order was correct — landing R41 first would
+  have shipped a measured parity regression to buy an eligibility gain.
+- **What this bought is ELIGIBILITY ONLY.** The three admitted queries
+  come out SHAPE-IDENTICAL to the legacy fallback; only costs differ,
+  because the search now prices them instead of the rule-based path.
+  Match count unmoved (0/99, 1/22), exactly as DESIGN §6 predicted.
+- Q78 still cannot match: PG places `date_dim` BELOW the anti join
+  (`Nested Loop Anti Join` over `Parallel Hash Join`) because its DP
+  searches 3 leaves and can reorder into the anti pair; goopg's collapsed
+  2-leaf problem can only build `(sales anti returns) JOIN date_dim`.
+  That is DESIGN §6's **Option B** (teach the plan walk to descend into
+  ANTI), which needs an ANTI path producer — `pinnedUnsearchable` refuses
+  ANTI today — plus an "unpublished leaf" concept in the coordinate model.
+
+**Remaining declines: 5.** `outer-over-derived` 3 (K68, blocked on the
+separate B-06 CTE-stats workstream — lifting it re-opens a measured 20x
+timeout) and `outer-spine` 2 (K70).

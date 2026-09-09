@@ -420,7 +420,47 @@ func deconstructRangeVars(n int) joinlist {
 // (planner.go:2101-2117 — one `planScanRangeVar` for the base and one per
 // `item.Joins` entry), which is what keeps leaf numbering and binding order in
 // step.
-func fromItemRels(item parser.FromExpr) int { return 1 + len(item.Joins) }
+func fromItemRels(item parser.FromExpr) int {
+	return 1 + len(item.Joins) - antiCollapsedJoins(item)
+}
+
+// antiCollapsedJoins is the number of LEADING SEMI/ANTI links in one FROM
+// item whose right side gets NO leaf index — R41/K74.
+//
+// Why any collapse at all: `extractSearchLeaves` (joinsearchseam.go) returns
+// a SEMI/ANTI `*Join` as ONE OPAQUE LEAF, because `Join.Output()` publishes
+// only the left side and the right side's columns exist nowhere above the
+// node. R40 made `planFromItem` agree on the binding side — it stops
+// advancing `leftCtx`, so the nullable side gets no `rangeBinding` — but the
+// leaf numbering here still allocated an index for it. That desynchronised
+// `len(ctx.bindings)` from `jl.nrels()` (measured on TPC-DS Q78: 2 vs 3) and
+// broke the invariant this function's own comment states. K72's `leaf-count`
+// decline is what that desync surfaces as, and it is currently the only
+// thing preventing a `ctx.bindings[:nprefix]` index panic at the seam.
+//
+// Why only LEADING links: the opaque plan leaf stands for the ENTIRE subtree
+// under the SEMI/ANTI node. When such a link is the first in the chain that
+// subtree is exactly the base range variable, so one leaf index — the base's
+// — names it and every later join numbers from there unchanged. A link at
+// position k>0 would instead collapse k+1 relations into one leaf and
+// renumber everything to its left, which is a different and much larger
+// change. Those keep today's pinned path and therefore today's `leaf-count`
+// decline: fail-closed, never a wrong answer.
+//
+// Consumed by three places that MUST agree leaf for leaf —
+// `deconstructFromItemScoped` (the joinlist), this function (numbering across
+// comma items), and `newSjiScope` (SJI leaf numbering) — which is why the
+// rule lives in one function rather than being re-derived at each.
+func antiCollapsedJoins(item parser.FromExpr) int {
+	n := 0
+	for _, j := range item.Joins {
+		if j.Type != parser.JoinSemi && j.Type != parser.JoinAnti {
+			break
+		}
+		n++
+	}
+	return n
+}
 
 // deconstructFromItem computes the joinlist of ONE comma-separated FROM item —
 // upstream's `deconstruct_recurse` over that item's `JoinExpr` chain
@@ -448,7 +488,15 @@ func deconstructFromItemScoped(item parser.FromExpr, firstRel int, lim collapseL
 	left := joinlist{leafItem(firstRel)}
 	next := firstRel + 1
 	var made []*SpecialJoinInfo
-	for _, j := range item.Joins {
+	// R41/K74: the leading SEMI/ANTI links contribute no leaf, no joinlist
+	// item and no SpecialJoinInfo — `left` already names the single leaf the
+	// plan tree publishes for the whole opaque node. Dropping the SJI is
+	// required, not incidental: its nullable hand would name a relation that
+	// now has no bit, and the plan side raises no `outerChainLink` for the
+	// link either (the walk returns it as a leaf before reaching that code),
+	// so the two descriptions still agree hand for hand.
+	joins := item.Joins[antiCollapsedJoins(item):]
+	for _, j := range joins {
 		right := joinlist{leafItem(next)}
 		next++
 		pinned := joinPinned(j.Type) || pinnedOverAPinnedSide(j.Type, left)
