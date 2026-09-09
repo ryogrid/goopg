@@ -385,6 +385,74 @@ func pushConjunctTraced(n Node, c Expr, st *pushTrace) (Node, bool) {
 		x.Predicate = combineAnd([]Expr{x.Predicate, c})
 		return x, true
 
+	case *Project:
+		// R42/K76: the descent must be able to cross a projection, because
+		// the PG-shaped search's boundary republishes binding order through
+		// one. Before R41 every CTE body carrying this shape DECLINED the
+		// search, so the legacy tree it fell back to had no `Project`
+		// between a join and its scan and this arm was unreachable — the
+		// gap is old, not new. Measured when it became reachable: TPC-DS
+		// Q78's three `date_dim` scans lost `Filter: (d_year = 1998)`
+		// (rows 149 -> 73049), a qual-placement divergence from PG, whose
+		// own plan carries that restriction.
+		//
+		// Fail closed on the two shapes `remapConjunctThroughProjection`
+		// cannot judge, BEFORE calling it:
+		//
+		//   - IsolatedScope: these wrap an isolated subquery scope whose
+		//     targets are inner-indexed then outer-relabeled (plan.go), so
+		//     they must not be remapped against outer coordinates.
+		//     `upper_narrow_chain.go` refuses them verbatim for the same
+		//     reason. Today they are contained only by ACCIDENT — a
+		//     view-rename Project declines because the view and body column
+		//     names differ, which stops working the moment they match.
+		//   - a Targets/Output length disagreement, which would let the
+		//     remap's index checks pass against the wrong layout. The
+		//     sibling `*Aggregate` arm (cte_inline_pushdown.go) and
+		//     `upper_narrow_chain.go` both assert this.
+		if x.IsolatedScope || x.Child == nil || len(x.Output()) != len(x.Targets) {
+			return n, false
+		}
+		mapped, ok := remapConjunctThroughProjection(c, x.Output(), x.Targets, x.Child.Output())
+		if !ok {
+			return n, false
+		}
+		// R42 is PLACEMENT-ONLY, and this line is what makes it so.
+		//
+		// `st.proven` has exactly one consumer — `if tr.proven &&
+		// !tr.planted { continue }` in pushSingleSideQualsIntoInnerJoinInputs
+		// — which DELETES the conjunct from the residual Filter. Leaving
+		// `st` untouched here would be logically defensible (a projection
+		// crosses no outer join, so it cannot invalidate a delay proof) and
+		// operationally backwards: today this shape returns false and the
+		// qual is unconditionally KEPT, so an arm that returns true with
+		// `proven` intact would newly enable a residual-dropping MOVE on a
+		// whole class of trees.
+		//
+		// That move's soundness would rest entirely on the remap being
+		// exact, and the remap has two fail-OPEN seams: it skips the
+		// self-side name check for an UNNAMED ref (and unnamed refs do
+		// occur — innerJoinPushTarget records the same), and its index
+		// checks assume the layout the length guard above now enforces.
+		// The length seam is closed; the unnamed-ref seam is why the move
+		// stays off. Enabling it is a separate round with its own proof.
+		st.proven = false
+		repl, ok := pushConjunctTraced(x.Child, mapped, st)
+		if !ok {
+			return n, false
+		}
+		// In-place, exactly as the *Join arm below assigns x.Left/x.Right:
+		// "copies by default" in this pass means the CONJUNCT is duplicated
+		// (kept above AND planted below), never that nodes are copied. The
+		// real prerequisite is expression freshness, and
+		// remapConjunctThroughProjection supplies it by ending in
+		// cloneExprRefs — so what is planted below never aliases the
+		// residual's `c`. Passing `c` through unchanged would have aliased
+		// the caller's own expression on the CTE entry path, whose entry
+		// node is a *Filter rather than a *Join.
+		x.Child = repl
+		return x, true
+
 	case *Join:
 		leftOK, rightOK, pushable := joinRestrictionSides(x)
 		if !pushable {

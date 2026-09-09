@@ -2122,3 +2122,45 @@ implementation.
   (the caller takes `kept = append(kept, c)` without `notePushedBelow`).
   A `*Project` arm makes deep-then-fail descents more common, so it
   WIDENS this pre-existing wart without creating it.
+
+
+### R42 LANDED (`r42-pushdown-project-arm/REPORT.md`)
+
+All gates green: precommit units, sweep **PASS=95 MISMATCH=0 CKMISMATCH=0
+ERROR=0 TIMEOUT=0**, TPC-DS verdicts+row counts byte-identical for all 99
+vs HEAD, TPC-H values byte-identical AND plan structure identical across
+all 22. TPC-DS total 838s -> 817s.
+
+- **Exactly 2 plans changed (Q47, Q57), both gaining a restriction PG also
+  applies at that level** — oracle-verified (`Filter: ((avg_monthly_sales
+  > '0'::numeric) AND (d_year = 2000) AND …)`). So the movement is TOWARD
+  PG on `qual-placement`, which was the round's stated success criterion.
+  Runtimes noise-level (5454->5487ms, 2592->2609ms).
+- Match count and decline census unmoved (0/99, 1/22; 8 declines) —
+  exactly as predicted before implementing. This round exists to unblock
+  R41, not to produce a match.
+- Landed with all three review guards: `st.proven = false` (K77,
+  placement-only), `IsolatedScope` refused, `Output()/Targets` length
+  mismatch refused.
+- **Baseline caution:** the sweep's own status-delta compared against
+  R41's run, which is NOT HEAD (R41 was reverted). Against R41 it reports
+  Q78 as changed; against the correct pre-R41 baseline
+  (`sweep-20260909-211945`) Q78 is UNCHANGED, which is right — R42 alone
+  does not admit Q78's CTE bodies. Always re-diff by hand after a revert.
+
+- **K78 — a Go filename trap that silently disables a whole test file.**
+  `pushdown_project_arm_test.go` never ran: Go reads a trailing `_arm` as
+  a **GOARCH filename constraint**, so the file lands in `IgnoredGoFiles`
+  and is excluded on amd64. `go test -run …` reports "no tests to run" —
+  and so does `-count=1` — which reads exactly like a filter typo. Caught
+  only by `go list -f '{{.IgnoredGoFiles}}'`. Any file ending in a GOARCH
+  or GOOS word (`_arm`, `_386`, `_linux`, `_windows`, …) is constrained.
+  Renamed to `pushdown_project_crossing_test.go`.
+
+- **Next: re-apply R41's implementation** (specified in
+  `r41-anti-leaf-coordinates/DESIGN.md` §4, already built and gate-verified
+  once). With K76 closed the `date_dim` restriction can now reach through
+  the searched boundary's `Project`, so the eligibility gain (`leaf-count`
+  3 -> 0, declines 8 -> 5) should arrive WITHOUT the qual-placement
+  regression that forced the revert. Q78 still will not match — that needs
+  Option B's 3-leaf search.
