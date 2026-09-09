@@ -372,6 +372,15 @@ failure/hang in background wastes the session — goal instruction).
   test-only; production seed is `newPrebuiltPath`). Every design must
   cite call sites, not files.
 
+## READ FIRST (0): HOW we measure
+
+`METHODOLOGY.md` — the measurement pipeline, the gates, the server
+traps, the diagnosis order, and why rounds are judged by CATEGORY
+rather than by match count. Working copies of every script it names are
+in `methodology/`. Read it before running anything; several of its
+rules exist because breaking them silently invalidated an arm (K5, K9,
+K10, K18).
+
 ## READ FIRST (2): which queries are even ELIGIBLE
 
 `r26-seam-decline-audit/FINDINGS.md` (2026-09-09), acting on K27.
