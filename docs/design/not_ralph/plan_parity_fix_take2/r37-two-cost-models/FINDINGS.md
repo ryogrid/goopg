@@ -230,3 +230,72 @@ Expected to move `join-method` (TPC-DS 80, TPC-H 13) and plausibly the
 build-side half of `join-order`, which has never moved. Not predicted
 to reach `match`, since these queries also differ in parallelism and
 aggregation-strategy.
+
+---
+
+# K64 CORRECTED — it is not the build charge, it is ROW WIDTH
+
+The "~58x build charge" attribution above was reverse-engineered from
+the two totals and is **wrong**. Instrumenting the actual terms:
+
+```
+BUCKET innerRows=1500000 bucketSize=1e-06     bucketTuples=2 term=71.81
+BUCKET innerRows=28724   bucketSize=0.000178  bucketTuples=5 term=9375.00
+```
+
+The bucket term is tiny both ways, and the build term is ~18,750 for
+1.5M rows — neither is the 205,380 difference. The exact sums:
+
+- goopg's orientation: 271,780 (startup) + 47,472 (run) + 9,375
+  (bucket) = **328,627**, matching the trace to the cent. **No spill
+  term at all.**
+- PG's orientation: 62,185 + 271,780 + 72 = 334,037, and the observed
+  total is 534,007 — so ~**200,000 is batch/spill I/O**.
+
+## Why goopg spills where PG does not
+
+```
+goopg  Seq Scan on orders    width=448      lineitem width=550
+PG     Seq Scan on orders    width=22       lineitem width=17
+```
+
+At the capture's `work_mem=64MB`, hashing 1.5M `orders` rows costs
+
+- goopg: 1,500,000 x 448 B = **641 MB** -> multi-batch -> ~200,000 of
+  spill I/O -> PG's orientation is priced out
+- PG: 1,500,000 x 22 B = **31 MB** -> single batch -> no spill, so PG
+  is free to hash the large side and stream the expensive `lineitem`
+  scan once
+
+**goopg carries FULL-WIDTH rows where PG projects only the columns the
+query needs.** Q12 reads `o_orderkey` from `orders` and four columns
+from `lineitem`; PG's widths (22, 17) reflect exactly that, goopg's
+(448, 550) reflect the whole table.
+
+`hashJoinCost` is not obviously wrong — it is being handed a build side
+20-32x too wide, and its spill arithmetic then does its job correctly.
+
+## Filed as K65, replacing K64
+
+This is a **projection / `attr_needed`** gap, not a hash-costing one.
+The existing note `goopg_optimizer_no_attr_needed_no_ios_path` already
+records the shape of it: inside a join tree there is no `Project` above
+the scan at all, so there is nowhere to hang a narrowed target list.
+
+Blast radius is far wider than Q12. Row width feeds hash-table
+geometry, every spill/batch decision, `Gather` transfer costs, sort
+footprints and memory budgets — so a 20-32x width error perturbs
+join-method, parallelism and sort-strategy simultaneously, which are
+three of the four largest remaining categories.
+
+The owner has explicitly permitted architectural change for this goal.
+Column pruning is the largest single PG divergence this session has
+found, and unlike the estimate work it sits inside the model the parity
+metric can see.
+
+## Method note, recorded because it cost time twice
+
+K64 was written from arithmetic reverse-engineered out of two totals
+rather than from instrumented terms, and it was wrong. This is the same
+error class as K61 earlier in the same round. **Instrument the term,
+never infer it from the sum.**

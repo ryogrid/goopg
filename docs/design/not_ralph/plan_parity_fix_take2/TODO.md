@@ -1700,8 +1700,7 @@ multiplies unconditionally via `clauseSelectivity` (NOT the
   EXPLAIN. The cost twin of the `EstimateRows`/`calcJoinrelSize` row
   split. Reporting-integrity fix; do NOT expect categories to move.
 
-- **K64 — `hashJoinCost` overcharges the build side by ~58x. THE next
-  round.** `GOOPG_HJ_TRACE` on `addHashJoinPath` for Q12, both
+- **K64 — WITHDRAWN, WRONG (reverse-engineered from totals). See K65.** `GOOPG_HJ_TRACE` on `addHashJoinPath` for Q12, both
   orientations as the search costed them:
   `probe=orders(1.5M,43435) build=lineitem(28724,271421) -> 328627.53`
   vs `probe=lineitem(28724,271421) build=orders(1.5M,43435) ->
@@ -1724,3 +1723,27 @@ multiplies unconditionally via `clauseSelectivity` (NOT the
   (`makeJoinRel` calls `addPaths` twice, joinsearchlevel.go:658/661,
   matching joinrels.c:916/919), so goopg's join search is structurally
   PG-shaped here; only the pricing diverges.
+
+- **K65 — goopg has NO COLUMN PRUNING; rows are 20-32x too wide.
+  Replaces K64 and is the largest single divergence found this
+  session.** TPC-H Q12: goopg `orders` width=448 / `lineitem` width=550
+  against PG's 22 / 17, for a query reading one column from `orders`
+  and four from `lineitem`. At `work_mem=64MB` a 1.5M-row `orders`
+  build is 641 MB in goopg (multi-batch, ~200,000 of spill I/O) versus
+  31 MB in PG (single batch, no spill). THAT is the whole 205,380 gap
+  that made goopg refuse PG's build side — `hashJoinCost` is handed a
+  side 20-32x too wide and its spill arithmetic then behaves correctly.
+  Instrumented terms: bucket 71.81 / 9,375, build ~18,750 — none of
+  them the difference.
+  Existing note `goopg_optimizer_no_attr_needed_no_ios_path` records
+  the shape: inside a join tree there is no `Project` above the scan,
+  so there is nowhere to hang a narrowed target list.
+  **Blast radius:** width feeds hash geometry, every spill/batch
+  decision, Gather transfer costs, sort footprints and memory budgets —
+  so it perturbs join-method, parallelism AND sort-strategy at once,
+  three of the four largest remaining categories. Architectural change
+  is explicitly permitted for this goal.
+- **Method note (cost time twice this round).** K61 and K64 were both
+  inferred from rendered numbers / totals rather than instrumented
+  terms, and both were wrong. **Instrument the term, never infer it
+  from the sum.**
