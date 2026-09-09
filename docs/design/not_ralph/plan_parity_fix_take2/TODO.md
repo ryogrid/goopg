@@ -346,6 +346,19 @@ failure/hang in background wastes the session — goal instruction).
   demotion logic must be audited as a PLAN REWRITE against PG's
   `reduce_outer_joins` first — classic "dead code is not a reference
   implementation".
+- **K29 (2026-09-09 — the decline is LOAD-BEARING).** goopg's
+  `applyDemotion` produces WRONG verdicts, not merely unverified ones
+  (K28 understated it). `accumulatedNN` accumulates ON-clause
+  strictness from INNER joins BELOW an outer join, so the RIGHT arm
+  reads its own nullable side as non-nullable and demotes RIGHT->INNER
+  where PG does not — measured, it returns 0 rows where 1 is correct
+  (`WHERE rj_a.id IS NULL` over a RIGHT JOIN). PG's
+  `reduce_outer_joins_pass2` only lets quals from ABOVE constrain a
+  join. **The `outerLinksHaveSJInfos` decline is the only thing
+  containing this**: the bad verdict reaches `join_info_list` but not
+  the plan, and the resulting disagreement declines the statement.
+  **Retiring the decline without first fixing the propagation ships
+  wrong rows.** Fix the analysis, then the ordering, then the declines.
 - **K4 (rev-1 error pattern, from §6).** Never conclude from a file
   without checking its callers (`pathgen.go`/`generateScanPaths` is
   test-only; production seed is `newPrebuiltPath`). Every design must
@@ -913,6 +926,20 @@ anything attempted so far.
 
 ## Log
 
+- 2026-09-09 (CC) **R27/2 — the demotion VERDICT is wrong, and the seam
+  decline is MASKING it** (`r27-outer-join-reduction/FINDINGS-demotion-is-wrong.md`).
+  §4a's transplant works structurally (optimizer suite green, flip
+  contract intact) but the 5 executor VALUES tests still fail.
+  Instrumented: `join[1] Right -> Inner` for
+  `rj_a JOIN rj_b ON … RIGHT JOIN rj_c ON … WHERE rj_a.id IS NULL` —
+  destroying the only rows the query returns. Cause: `accumulatedNN`
+  accumulates ON-clause strictness from INNER joins BELOW and the RIGHT
+  arm reads its own nullable side as non-nullable; PG only lets quals
+  from ABOVE constrain a join. **K29**: the fail-closed
+  `outerLinksHaveSJInfos` decline is LOAD-BEARING — it masks an
+  incorrect demotion, so removing it without fixing `applyDemotion`
+  SHIPS WRONG ROWS. Work order inverted: fix the strictness
+  propagation FIRST.
 - 2026-09-09 (CC) **R27 design REVISED (§4a) by implementation.** The
   "analysis on a copy, write back verdicts" plan replaces
   `reduceOuterJoins` and fails 8 tests — five of which PIN the S9.4
