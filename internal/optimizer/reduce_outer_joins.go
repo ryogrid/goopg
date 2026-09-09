@@ -2,6 +2,7 @@ package optimizer
 
 import (
 	"slices"
+	"strings"
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/parser"
@@ -46,8 +47,10 @@ func reduceOuterJoins(from []parser.FromExpr, where parser.Expr, cat catalog.Cat
 	// exactly as PG's analyzer would (varno assignment); ambiguous or
 	// unresolvable refs are skipped (conservative = old behavior).
 	upperFN := collectForcedNullTableNames(where, tableMap, cat)
+	// R40/K69: column-granularity forced-null set for the S9.3 ANTI rule.
+	upperFNCols := collectForcedNullColumnKeys(where, tableMap, cat)
 	for i := range from {
-		applyDemotion(&from[i], upperNN, upperFN, tableMap, cat)
+		applyDemotion(&from[i], upperNN, upperFN, upperFNCols, tableMap, cat)
 	}
 }
 
@@ -86,18 +89,29 @@ func reduceOuterJoins(from []parser.FromExpr, where parser.Expr, cat catalog.Cat
 // and it drops no qual. LEFT->ANTI is declined because that conversion is not
 // plan-complete in goopg (see the loop). An un-demoted join is today's
 // behaviour, a mis-converted one is wrong rows.
-func demotedForPlan(item parser.FromExpr, where parser.Expr, cat catalog.Catalog) parser.FromExpr {
+// demotedForPlan's second return value is the set of "table\x00column" keys
+// whose `IS NULL` conjunct forced a LEFT->ANTI conversion it transplanted in
+// this item — R40/K69. Empty (nil) in the common case where no ANTI verdict
+// fired. The caller unions this across every s.FromExprs item and uses it to
+// strip exactly those conjuncts from WHERE before it is resolved
+// (stripForcingNullQuals); see planner.go's antiForcedNullCols.
+//
+// COLUMN keys, not table names: PG's ANTI rule is var-granular
+// (mbms_overlap_sets), so a table may have one column forcing the conversion
+// and others doing unrelated filtering work that must survive.
+func demotedForPlan(item parser.FromExpr, where parser.Expr, cat catalog.Catalog) (parser.FromExpr, map[string]bool) {
 	if len(item.Joins) == 0 {
-		return item
+		return item, nil
 	}
 	tableMap := buildTableMap([]parser.FromExpr{item}, cat)
 	upperNN := collectNonNullableTableNames(where, tableMap, cat)
 	upperFN := collectForcedNullTableNames(where, tableMap, cat)
+	upperFNCols := collectForcedNullColumnKeys(where, tableMap, cat)
 
 	work := item
 	work.Joins = make([]parser.JoinExpr, len(item.Joins))
 	copy(work.Joins, item.Joins)
-	applyDemotion(&work, upperNN, upperFN, tableMap, cat)
+	antiForcedCols := applyDemotion(&work, upperNN, upperFN, upperFNCols, tableMap, cat)
 
 	out := item
 	out.Joins = make([]parser.JoinExpr, len(item.Joins))
@@ -107,28 +121,36 @@ func demotedForPlan(item parser.FromExpr, where parser.Expr, cat catalog.Catalog
 		if got == out.Joins[i].Type {
 			continue
 		}
-		// ONLY the INNER verdict is transplanted, deliberately.
-		//
-		// The LEFT->ANTI verdict (S9.3) is NOT plan-complete: PG's
-		// conversion also DROPS the `IS NULL` qual that forced it, because an
-		// anti-join's output has no nullable-side columns for it to test.
-		// goopg's demotion changes the type and leaves the qual, so
-		// `LEFT JOIN … WHERE p.y IS NULL` filters every surviving row and
-		// answers 0 rows where 1 is correct — measured on
-		// `TestLeftJoinSearchAdmissionValues`. That conversion was never
-		// completed because, until now, no demotion verdict reached a plan.
-		//
-		// INNER is safe on both counts: it is orientation-free (so the
+		// R40/K69: the LEFT->ANTI verdict (S9.3) is now transplanted too.
+		// It was declined here until now because PG's conversion also DROPS
+		// the `IS NULL` qual that forced it — an anti-join's output has no
+		// nullable-side columns for it to test — and goopg's plan-tree
+		// transplant used to leave both the type AND the qual untouched,
+		// which filters every surviving row (0 rows where 1 is correct,
+		// measured on `TestLeftJoinSearchAdmissionValues`). The caller now
+		// completes the conversion: it strips the specific forcing qual
+		// (stripForcingNullQuals) using the table name recorded here, and
+		// `mapJoinType` (planner.go) maps this verdict to `JoinTypeAnti`
+		// with the per-item schema narrowed to match (planFromItem, R40 §4d)
+		// — an un-narrowed schema would let a later join in the same chain
+		// (Q78's `... JOIN date_dim`) resolve columns at offsets that still
+		// budget space for the now-invisible nullable side.
+		if got == parser.JoinAnti {
+			out.Joins[i].Type = parser.JoinAnti
+			continue
+		}
+		// ONLY INNER and ANTI verdicts are transplanted, deliberately.
+		// INNER is safe unconditionally: it is orientation-free (so the
 		// flipped first join needs no special case) and it drops no qual —
 		// a strict qual that licensed the demotion stays true above the
-		// join. Declining ANTI leaves today's shipped behaviour; taking it
-		// would ship wrong rows.
+		// join. Any other verdict declines: an un-demoted join is today's
+		// shipped behaviour, a mis-converted one is wrong rows.
 		if got != parser.JoinInner {
 			continue
 		}
 		out.Joins[i].Type = parser.JoinInner
 	}
-	return out
+	return out, antiForcedCols
 }
 
 // applyDemotion walks one FromExpr's flat join chain and demotes outer joins
@@ -156,7 +178,12 @@ func demotedForPlan(item parser.FromExpr, where parser.Expr, cat catalog.Catalog
 // Parameters:
 //   - upperNN: nonnullable rels from the WHERE clause (the "upper" set).
 //     This is the starting accumulated set; it is never mutated.
-func applyDemotion(item *parser.FromExpr, upperNN, upperFN map[string]bool, tableMap map[string]*catalog.Table, cat catalog.Catalog) {
+//
+// applyDemotion returns the set of "table\x00column" keys whose IS NULL
+// conjunct forced a LEFT->ANTI conversion (R40/K69). Empty unless an ANTI
+// verdict fired; `demotedForPlan` hands these to `stripForcingNullQuals`,
+// since PG's conversion also drops exactly those conjuncts.
+func applyDemotion(item *parser.FromExpr, upperNN, upperFN, upperFNCols map[string]bool, tableMap map[string]*catalog.Table, cat catalog.Catalog) map[string]bool {
 	// accumulatedNN is the working set that evolves as we walk the chain.
 	// It starts as a copy of upperNN (WHERE-clause findings).
 	accumulatedNN := make(map[string]bool, len(upperNN))
@@ -170,6 +197,17 @@ func applyDemotion(item *parser.FromExpr, upperNN, upperFN map[string]bool, tabl
 	for name := range upperFN {
 		accumulatedFN[name] = true
 	}
+	// accumulatedFNCols is the COLUMN-granularity twin of accumulatedFN, and
+	// is what the S9.3 LEFT->ANTI rule actually tests (R40/K69): PG's ANTI
+	// check is find_nonnullable_VARS vs forced_null_vars, not the relation-
+	// level set the INNER check uses. It propagates by the identical rules.
+	accumulatedFNCols := make(map[string]bool, len(upperFNCols))
+	for key := range upperFNCols {
+		accumulatedFNCols[key] = true
+	}
+	// antiForced accumulates the forcing column keys of every ANTI verdict
+	// this walk reaches.
+	var antiForced map[string]bool
 
 	// S9.4: RIGHT→LEFT flip for the first join (PG pass2 lines 3366-3376).
 	// This normalises RIGHT to LEFT so that LEFT-specific reductions
@@ -206,6 +244,9 @@ func applyDemotion(item *parser.FromExpr, upperNN, upperFN map[string]bool, tabl
 		// within the nullable side (which may still be null-extended).
 		localNN := collectNonNullableTableNames(j.On, tableMap, cat)
 		localFN := collectForcedNullTableNames(j.On, tableMap, cat)
+		// Column-granularity twins for the S9.3 ANTI rule (R40/K69).
+		localNNCols := collectNonNullableColumnKeys(j.On, tableMap, cat)
+		localFNCols := collectForcedNullColumnKeys(j.On, tableMap, cat)
 
 		// ---- demotion check ----
 		switch j.Type {
@@ -214,13 +255,30 @@ func applyDemotion(item *parser.FromExpr, upperNN, upperFN map[string]bool, tabl
 			if accumulatedNN[rightName] {
 				j.Type = parser.JoinInner
 			}
-			// S9.3 LEFT→ANTI: right-side table is forced-null from upper
-			// quals (IS NULL) AND appears in a strict position in the ON
-			// clause → the ON can never be TRUE for any row where the
-			// upper quals pass → ANTI join suffices.
-			// PG reduce_outer_joins_pass2 lines 3388-3403.
-			if j.Type == parser.JoinLeft && accumulatedFN[rightName] && localNN[rightName] {
+			// S9.3 LEFT→ANTI: the SAME right-side COLUMN is forced-null
+			// from upper quals (IS NULL) and held non-null by this join's
+			// own ON clause → the ON can never be TRUE for any row where
+			// the upper quals pass → ANTI join suffices.
+			// PG reduce_outer_joins_pass2 lines 3379-3403.
+			//
+			// R40/K69: this test is COLUMN-granular, matching PG's
+			// `mbms_overlap_sets(nonnullable_vars, forced_null_vars)`.
+			// It used to compare TABLE names, which over-fires: in
+			// `a LEFT JOIN b ON a.id = b.id WHERE b.y IS NULL` the ON is
+			// strict for b.id while the WHERE forces b.y — different
+			// columns, and PG keeps the LEFT join (oracle-verified:
+			// `Merge Left Join` + `Filter: (b.y IS NULL)`). The relation-
+			// level set is still correct for the LEFT->INNER check above,
+			// which is PG's find_nonnullable_RELS — the two granularities
+			// are deliberate on both sides.
+			if forcing := antiForcingColumns(accumulatedFNCols, localNNCols, rangeVarNames(j.Right)); j.Type == parser.JoinLeft && len(forcing) > 0 {
 				j.Type = parser.JoinAnti
+				if antiForced == nil {
+					antiForced = make(map[string]bool)
+				}
+				for key := range forcing {
+					antiForced[key] = true
+				}
 			}
 
 		case parser.JoinRight:
@@ -289,6 +347,9 @@ func applyDemotion(item *parser.FromExpr, upperNN, upperFN map[string]bool, tabl
 			for name := range localFN {
 				accumulatedFN[name] = true
 			}
+			for key := range localFNCols {
+				accumulatedFNCols[key] = true
+			}
 
 		case parser.JoinLeft, parser.JoinAnti:
 			// Preserved left side keeps the upper set unchanged.
@@ -319,16 +380,25 @@ func applyDemotion(item *parser.FromExpr, upperNN, upperFN map[string]bool, tabl
 				}
 			}
 			accumulatedFN = nextFN
+			nextFNCols := make(map[string]bool)
+			for key := range localFNCols {
+				if containsName(rangeVarNames(j.Right), colKeyTable(key)) {
+					nextFNCols[key] = true
+				}
+			}
+			accumulatedFNCols = nextFNCols
 
 		case parser.JoinFull:
 			// Both sides nullable — nothing propagates through.
 			accumulatedNN = make(map[string]bool)
 			accumulatedFN = make(map[string]bool)
+			accumulatedFNCols = make(map[string]bool)
 		}
 
 		// Accumulate right side's names for the next iteration.
 		leftNames = append(leftNames, rangeVarNames(j.Right)...)
 	}
+	return antiForced
 }
 
 // containsName reports whether name is present in names.
@@ -682,6 +752,92 @@ func collectForcedNullWalk(e parser.Expr, topLevel bool, tableMap map[string]*ca
 	return result
 }
 
+// stripForcingNullQuals returns a REWRITTEN copy of `where` with the
+// top-level `IS NULL` conjunct(s) that forced a LEFT->ANTI demotion
+// (R40/K69, `applyDemotion`'s S9.3 rule) elided. It mirrors
+// `collectForcedNullWalk`'s top-level-AND-only descent exactly, so it can
+// only drop a conjunct that function already certified as forcing the
+// demotion — never a nested OR/NOT/function-call qual PG's own
+// `find_forced_null_vars` would not have looked at either.
+//
+// This is PG's own rule, not an invented one: `reduce_outer_joins`'s
+// comment (prepjointree.c) states "The IS NULL clause then becomes
+// redundant, and must be removed to prevent bogus selectivity
+// calculations" — an ANTI join's output has no nullable-side column left
+// for that qual to test, so leaving it in place would filter every
+// surviving row instead of doing nothing (K30).
+//
+// `where` itself is never mutated — same discipline `canonicalizeQual`
+// already uses one call site below this in `planSelect`; the parse tree
+// is shared with view/rule deparsers. Returns nil when every top-level
+// conjunct was elided (a WHERE clause that was ONLY the forcing IS NULL
+// test); callers must treat a nil result as "no Filter node needed", the
+// same convention the single-relation arm already uses for
+// restriction_is_always_true.
+func stripForcingNullQuals(where parser.Expr, antiCols map[string]bool, tableMap map[string]*catalog.Table, cat catalog.Catalog) parser.Expr {
+	if len(antiCols) == 0 {
+		return where
+	}
+	return stripForcingNullWalk(where, true, antiCols, tableMap, cat)
+}
+
+func stripForcingNullWalk(e parser.Expr, topLevel bool, antiCols map[string]bool, tableMap map[string]*catalog.Table, cat catalog.Catalog) parser.Expr {
+	if e == nil {
+		return nil
+	}
+	switch x := e.(type) {
+	case *parser.IsNullExpr:
+		// Mirror collectForcedNullColumnKeys' certification exactly: only a
+		// non-negated IS NULL whose operand's referenced COLUMNS are ALL in
+		// antiCols is dropped — the same keys `antiForcingColumns` certified
+		// as forcing the conversion. A multi-column operand mixing a forcing
+		// column with a non-forcing one is conservatively kept, since the
+		// latter may still be doing real filtering work.
+		if !x.Negated {
+			keys := collectColumnRefColumnKeys(x.Operand, tableMap, cat)
+			if len(keys) > 0 {
+				allForced := true
+				for _, key := range keys {
+					if !antiCols[key] {
+						allForced = false
+						break
+					}
+				}
+				if allForced {
+					return nil
+				}
+			}
+		}
+		return e
+
+	case *parser.BinaryOp:
+		// AND: strip each child independently (top level only — same
+		// no-OR-descent rule as collectForcedNullWalk). A dropped child
+		// collapses the AND to its surviving sibling; dropping both
+		// collapses to nil (no residual predicate at this node).
+		if x.Op == parser.OpAnd && topLevel {
+			left := stripForcingNullWalk(x.Left, true, antiCols, tableMap, cat)
+			right := stripForcingNullWalk(x.Right, true, antiCols, tableMap, cat)
+			switch {
+			case left == nil && right == nil:
+				return nil
+			case left == nil:
+				return right
+			case right == nil:
+				return left
+			case left == x.Left && right == x.Right:
+				return e
+			default:
+				out := *x
+				out.Left = left
+				out.Right = right
+				return &out
+			}
+		}
+	}
+	return e
+}
+
 // rangeVarNames returns the names by which a RangeVar can be referenced:
 // its alias (if any) and its relation name.
 func rangeVarNames(rv parser.RangeVar) []string {
@@ -711,4 +867,178 @@ func anyNameIn(names []string, set map[string]bool) bool {
 		}
 	}
 	return false
+}
+
+// ---- column-granularity variants for the S9.3 LEFT->ANTI rule (R40/K69) ----
+//
+// PG uses TWO different granularities in reduce_outer_joins_pass2, and the
+// difference is load-bearing:
+//
+//   - the LEFT->INNER reduction tests `bms_overlap(nonnullable_rels,
+//     right_state->relids)` — find_nonnullable_RELS, RELATION granularity;
+//   - the LEFT->ANTI reduction tests `mbms_overlap_sets(nonnullable_vars,
+//     forced_null_vars)` — find_nonnullable_VARS, COLUMN granularity
+//     (prepjointree.c:3379-3403).
+//
+// goopg used table granularity for BOTH, which is correct for INNER and
+// OVER-EAGER for ANTI: `a LEFT JOIN b ON a.id = b.id WHERE b.y IS NULL` has
+// the ON strict for `b.id` and the WHERE forcing `b.y` — DIFFERENT columns, so
+// PG keeps the LEFT join and applies the IS NULL as a filter (verified on the
+// 18.3 oracle: `Merge Left Join` + `Filter: (b.y IS NULL)`). goopg demoted it
+// to ANTI. That was invisible while no ANTI verdict reached a plan (K30); the
+// R40 transplant made it reachable, and it showed up as
+// `TestNonSpineOuterAdmissionValues` failing to resolve the nullable-side
+// column an ANTI join no longer publishes.
+//
+// Q78's real shape is unaffected and still converts, because there the SAME
+// column carries both roles: `ON wr_order_number = ws_order_number ...
+// WHERE wr_order_number IS NULL` (oracle: `Merge Anti Join`, IS NULL dropped).
+//
+// Keys are "table\x00column" — table is the alias when one is present, matching
+// rangeVarPrimaryName / collectColumnRefTableNames' own attribution rule.
+
+const colKeySep = "\x00"
+
+func makeColKey(table, column string) string { return table + colKeySep + column }
+
+// colKeyTable returns the table part of a key produced by makeColKey.
+func colKeyTable(key string) string {
+	if i := strings.Index(key, colKeySep); i >= 0 {
+		return key[:i]
+	}
+	return key
+}
+
+// collectColumnRefColumnKeys is collectColumnRefTableNames at column
+// granularity: it attributes each ColumnRef by the same rule (qualifier when
+// present, unique column ownership otherwise) but keeps the column name too.
+func collectColumnRefColumnKeys(e parser.Expr, tableMap map[string]*catalog.Table, cat catalog.Catalog) []string {
+	if e == nil {
+		return nil
+	}
+	m := make(map[string]bool)
+	collectColumnRefColumnKeysWalk(e, m, tableMap, cat)
+	keys := make([]string, 0, len(m))
+	for key := range m {
+		keys = append(keys, key)
+	}
+	return keys
+}
+
+func collectColumnRefColumnKeysWalk(e parser.Expr, dst map[string]bool, tableMap map[string]*catalog.Table, cat catalog.Catalog) {
+	if e == nil {
+		return
+	}
+	switch x := e.(type) {
+	case *parser.ColumnRef:
+		if x.Table != "" {
+			dst[makeColKey(x.Table, x.Column)] = true
+		} else if owner, ok := resolveUnqualifiedOwner(x.Column, tableMap, cat); ok {
+			dst[makeColKey(owner, x.Column)] = true
+		}
+	case *parser.BinaryOp:
+		collectColumnRefColumnKeysWalk(x.Left, dst, tableMap, cat)
+		collectColumnRefColumnKeysWalk(x.Right, dst, tableMap, cat)
+	case *parser.UnaryOp:
+		collectColumnRefColumnKeysWalk(x.Operand, dst, tableMap, cat)
+	case *parser.IsNullExpr:
+		collectColumnRefColumnKeysWalk(x.Operand, dst, tableMap, cat)
+	case *parser.FuncCall:
+		for _, arg := range x.Args {
+			collectColumnRefColumnKeysWalk(arg, dst, tableMap, cat)
+		}
+	}
+}
+
+// collectNonNullableColumnKeys is collectNonNullableTableNames at column
+// granularity — goopg's find_nonnullable_vars. Same descent and same
+// strictness test; only the key is finer.
+func collectNonNullableColumnKeys(e parser.Expr, tableMap map[string]*catalog.Table, cat catalog.Catalog) map[string]bool {
+	result := make(map[string]bool)
+	collectNonNullableColumnKeysWalk(e, result, tableMap, cat)
+	return result
+}
+
+func collectNonNullableColumnKeysWalk(e parser.Expr, dst map[string]bool, tableMap map[string]*catalog.Table, cat catalog.Catalog) {
+	if e == nil {
+		return
+	}
+	switch x := e.(type) {
+	case *parser.BinaryOp:
+		if isStrictOp(x.Op, x.Left, x.Right, tableMap, cat) {
+			for _, key := range collectColumnRefColumnKeys(x.Left, tableMap, cat) {
+				dst[key] = true
+			}
+			for _, key := range collectColumnRefColumnKeys(x.Right, tableMap, cat) {
+				dst[key] = true
+			}
+		}
+		if x.Op == parser.OpAnd {
+			collectNonNullableColumnKeysWalk(x.Left, dst, tableMap, cat)
+			collectNonNullableColumnKeysWalk(x.Right, dst, tableMap, cat)
+		}
+
+	case *parser.IsNullExpr:
+		// IS NOT NULL: the tested column must be non-null.
+		if x.Negated {
+			for _, key := range collectColumnRefColumnKeys(x.Operand, tableMap, cat) {
+				dst[key] = true
+			}
+		}
+	}
+}
+
+// collectForcedNullColumnKeys is collectForcedNullTableNames at column
+// granularity — goopg's find_forced_null_vars. Same top-level-AND-only
+// descent (never into OR), matching PG.
+func collectForcedNullColumnKeys(e parser.Expr, tableMap map[string]*catalog.Table, cat catalog.Catalog) map[string]bool {
+	result := make(map[string]bool)
+	collectForcedNullColumnKeysWalk(e, true, result, tableMap, cat)
+	return result
+}
+
+func collectForcedNullColumnKeysWalk(e parser.Expr, topLevel bool, dst map[string]bool, tableMap map[string]*catalog.Table, cat catalog.Catalog) {
+	if e == nil {
+		return
+	}
+	switch x := e.(type) {
+	case *parser.IsNullExpr:
+		if !x.Negated {
+			for _, key := range collectColumnRefColumnKeys(x.Operand, tableMap, cat) {
+				dst[key] = true
+			}
+		}
+	case *parser.BinaryOp:
+		if x.Op == parser.OpAnd && topLevel {
+			collectForcedNullColumnKeysWalk(x.Left, true, dst, tableMap, cat)
+			collectForcedNullColumnKeysWalk(x.Right, true, dst, tableMap, cat)
+		}
+	}
+}
+
+// antiForcingColumns returns the columns of `rightNames` that carry BOTH roles
+// PG's ANTI test requires — forced null from above AND non-nullable by this
+// join's own quals — i.e. `mbms_overlap_sets(nonnullable_vars,
+// forced_null_vars)` restricted to the join's right relids. A non-empty result
+// is exactly PG's `bms_overlap(overlap, right_state->relids)` being true, and
+// the keys ARE the conjuncts to drop when the conversion is transplanted to a
+// plan (stripForcingNullQuals).
+func antiForcingColumns(accumulatedFNCols, localNNCols map[string]bool, rightNames []string) map[string]bool {
+	if len(accumulatedFNCols) == 0 || len(localNNCols) == 0 {
+		return nil
+	}
+	var out map[string]bool
+	for key := range accumulatedFNCols {
+		if !localNNCols[key] {
+			continue
+		}
+		if !containsName(rightNames, colKeyTable(key)) {
+			continue
+		}
+		if out == nil {
+			out = make(map[string]bool)
+		}
+		out[key] = true
+	}
+	return out
 }

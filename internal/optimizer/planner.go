@@ -466,6 +466,19 @@ type resolveContext struct {
 	// deconstructJointree and consumed by join_is_legal (P1.2+). M0128-P1.1.
 	joinInfoList []*SpecialJoinInfo
 
+	// antiForcedNullCols: the "table\x00column" keys whose IS NULL conjunct
+	// forced a LEFT->ANTI conversion demotedForPlan (reduce_outer_joins.go)
+	// transplanted in this statement (R40/K69). Those conjuncts must not
+	// reach resolveExpr — the ANTI join's Output() (plan.go) no longer
+	// carries the nullable side's columns, and PG's own reduce_outer_joins
+	// drops the identical conjuncts for the identical reason (prepjointree.c:
+	// "must be removed to prevent bogus selectivity calculations"). Column
+	// keys, not table names: PG's ANTI rule is var-granular, so one column of
+	// a table may force the conversion while others keep filtering. Nil in
+	// every context that is not a top-level FROM clause, same convention
+	// as joinlist/joinInfoList above.
+	antiForcedNullCols map[string]bool
+
 	// tupleFraction is `PlannerInfo.tuple_fraction`: how much of the result
 	// will actually be fetched, which decides whether a fast-start path may
 	// win at the search root (`finalPath`) and whether one is worth keeping
@@ -1374,7 +1387,21 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 		// the full statement of why. `s` itself is NOT mutated: the parse tree
 		// is shared with the view/rule deparsers, which must keep rendering
 		// the query as written.
-		whereQual := canonicalizeQual(s.Where)
+		//
+		// R40/K69: same discipline, same reason — a demotedForPlan LEFT->
+		// ANTI transplant (planFromClause, reduce_outer_joins.go) needs the
+		// specific WHERE conjunct that forced it stripped before the qual
+		// reaches resolveExpr, since the ANTI join's Output() no longer
+		// carries that table's columns (plan.go's Semi/Anti special case).
+		// PG drops the identical conjunct for the identical reason
+		// (prepjointree.c: "must be removed to prevent bogus selectivity
+		// calculations"). `whereClause` is a local rewrite; `s.Where` is
+		// untouched, same as `whereQual` below.
+		whereClause := s.Where
+		if len(ctx.antiForcedNullCols) > 0 {
+			whereClause = stripForcingNullQuals(s.Where, ctx.antiForcedNullCols, buildTableMap(s.FromExprs, cat), cat)
+		}
+		whereQual := canonicalizeQual(whereClause)
 		// E-21 Cut 1b: under GOOPG_ONEREL_SEARCH a single-table statement
 		// is planned by the search, not by the rule-based chooser below —
 		// replacing that chooser with `add_path` for every single-table
@@ -1445,11 +1472,22 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 				}
 			}
 		} else {
-			pred, err := resolveExpr(whereQual, ctx)
-			if err != nil {
-				return nil, err
+			// R40/K69: whereQual can be nil here when a demotedForPlan
+			// ANTI transplant's forcing conjunct was the ENTIRE WHERE
+			// clause (stripForcingNullQuals above) — mirror the
+			// single-relation arm's `rewritten == nil` convention
+			// (restriction_is_always_true) rather than calling resolveExpr
+			// on a nil Expr, which its own type switch does not special-
+			// case and would reach a default/error arm.
+			var pred Expr
+			if whereQual != nil {
+				var err error
+				pred, err = resolveExpr(whereQual, ctx)
+				if err != nil {
+					return nil, err
+				}
+				node = &Filter{pos: s.Where.Pos(), Child: node, Predicate: pred}
 			}
-			node = &Filter{pos: s.Where.Pos(), Child: node, Predicate: pred}
 			// M0127-P5.9-b's `root->tuple_fraction` assignment lived HERE,
 			// inside the WHERE arm, until C-17 (P4-08) moved it to the
 			// convergent stamping block above — same call, same value, but
@@ -1460,7 +1498,15 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 			ctx.queryPathkeys = deriveQueryPathkeys(s, ctx)
 			ctx.neededCols, ctx.neededColsKnown = neededColumnNames(s)
 			ctx.outputCols, ctx.outputColsKnown = outputColumnNames(s)
-			if unnestPreDPEnabled() && whereEligibleForPreDPUnnest(pred) {
+			// R40/K69: `whereQual != nil` guards the unchecked `node.(*Filter)`
+			// assertion below — a fully-stripped WHERE (stripForcingNullQuals
+			// elided the entire clause) leaves `node` as the bare join tree,
+			// never a Filter, and `whereEligibleForPreDPUnnest(nil)` is
+			// vacuously true (its walk never visits anything), so without
+			// this guard that assertion would panic. Before R40 this could
+			// not happen: `whereQual` was only nil when `s.Where` itself was,
+			// and this whole block is already gated on `s.Where != nil`.
+			if unnestPreDPEnabled() && whereQual != nil && whereEligibleForPreDPUnnest(pred) {
 				// S5a (D3.1): pull up sublinks BEFORE join-order
 				// search — matching upstream's pull_up_sublinks-
 				// before-join-planning order — then run the join
@@ -1494,6 +1540,21 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 					// product through Filter. See
 					// internal/planner/pushdown.go.
 					node = pushPredicatesIntoCrossJoins(node)
+				}
+			} else if whereQual == nil {
+				// R40/K69: the WHERE clause existed (`s.Where != nil`) but
+				// was entirely the forcing IS NULL conjunct(s)
+				// `stripForcingNullQuals` elided — `node` is the bare join
+				// tree, not a `*Filter`, so neither arm above runs. The
+				// join-order search must still run so an ANTI-demoted item
+				// gets a cost-based join order rather than the untouched
+				// left-deep CROSS chain (K27's eligibility axis) — mirrors
+				// the WHERE-less `joinTreeHasOuterLink` arm below exactly
+				// (nil predicate, same `tryJoinSearch` call).
+				if newChild, newPred := tryJoinSearch(node, nil, ctx, cat); newPred == nil {
+					node = newChild
+				} else if newChild != node {
+					node = &Filter{pos: node.Pos(), Child: newChild, Predicate: newPred}
 				}
 			}
 			// Push outer-only quals below a LATERAL join onto its outer
@@ -2842,6 +2903,13 @@ func planFromClause(s *parser.SelectStmt, cat catalog.Catalog, ps PlannerSetting
 	}
 	var root Node
 	var bindings []rangeBinding
+	// antiForcedNullCols (R40/K69): the union, across every FROM item, of
+	// the column keys whose IS NULL conjunct forced a LEFT->ANTI conversion
+	// demotedForPlan transplanted. Stashed on rctx below so the
+	// WHERE-handling arm in planSelect can strip exactly those conjuncts
+	// before they are resolved — see stripForcingNullQuals and
+	// resolveContext.antiForcedNullCols.
+	var antiForcedNullCols map[string]bool
 	// Counter starts at 1; zero is reserved as the "unknown /
 	// derived" sentinel for SchemaColumn.SourceTableIdx.
 	nextSourceIdx := int16(1)
@@ -2850,7 +2918,13 @@ func planFromClause(s *parser.SelectStmt, cat catalog.Catalog, ps PlannerSetting
 		// that `reduceOuterJoins` (below, unchanged) computes, so the PLAN and
 		// `root->join_info_list` agree on join TYPE. See `demotedForPlan` for
 		// why the call below cannot simply be moved up here instead.
-		item := demotedForPlan(rawItem, s.Where, cat)
+		item, itemAntiCols := demotedForPlan(rawItem, s.Where, cat)
+		for key := range itemAntiCols {
+			if antiForcedNullCols == nil {
+				antiForcedNullCols = make(map[string]bool)
+			}
+			antiForcedNullCols[key] = true
+		}
 		// LATERAL semantics for FROM-clause SRFs (M0103-0008):
 		// the partial FROM-list context is threaded down so each
 		// item's SRF args see siblings to its left.
@@ -2892,6 +2966,8 @@ func planFromClause(s *parser.SelectStmt, cat catalog.Catalog, ps PlannerSetting
 	rctx := newResolveContext(bindings, root.Output(), ps)
 	// A-01(ii) cut 2: carry the statement scope (see lateralCtx above).
 	rctx.rtScope = scope
+	// R40/K69: see antiForcedNullCols' declaration above.
+	rctx.antiForcedNullCols = antiForcedNullCols
 	// M0127-P5.8: decide what enters one search problem HERE, where the FROM
 	// walk that numbered these bindings is still the current walk (collapse.go).
 	// Inert until P5.9 — nothing reads `joinlist` yet.
@@ -3217,6 +3293,29 @@ func planFromItem(item parser.FromExpr, cat catalog.Catalog, nextSourceIdx *int1
 			schema:    mergedSchema,
 			Lateral:   nodeReferencesOuter(rightNode),
 		}
+		// R40 §4d / K69: Semi/Anti publish only the left (outer/probe)
+		// side — `Join.Output()` (plan.go) already special-cases this at
+		// read time, but the STORED `.schema` field here was still the
+		// unconditional merged width, and any FURTHER join in this SAME
+		// chain reads column offsets from `leftCtx.schema`/`leftCtx.
+		// bindings`, not from `Output()`. Left un-narrowed, a join
+		// chained after this one (Q78's `... JOIN date_dim` following the
+		// ANTI-demoted `web_returns` link) would place its columns at
+		// offsets that still budget space for the now-invisible right
+		// side — silently wrong data or an out-of-range panic. Mirrors
+		// `unnest.go`'s own Semi/Anti construction, which already stores
+		// a left-only `schema` at construction rather than deferring to
+		// `Output()`; `joinlayout.go`'s `reresolveJoinByName` documents a
+		// previously shipped regression from this identical bug class
+		// (Q21 NOT-EXISTS, silent 0 rows instead of ~411).
+		if joinType == JoinTypeSemi || joinType == JoinTypeAnti {
+			jn.schema = append(Schema(nil), leftCtx.schema...)
+			// R40/K69: every SEMI/ANTI reaching planFromItem comes from the
+			// outer-join reduction — the unnest rewrite builds its own joins
+			// in unnest.go, never here. See Join.FromOuterReduction for why
+			// the NLI cost gate needs to tell the two populations apart.
+			jn.FromOuterReduction = true
+		}
 		// M0097-0060: For FULL JOIN USING / FULL JOIN NATURAL, populate
 		// UsingLeftCols/UsingRightCols so the executor can coalesce USING
 		// column values from the right side into the left-column positions
@@ -3295,6 +3394,22 @@ func planFromItem(item parser.FromExpr, cat catalog.Catalog, nextSourceIdx *int1
 			switch jn.Type {
 			case JoinTypeInner, JoinTypeLeft:
 				jn.Algo = JoinAlgoHash
+			case JoinTypeAnti:
+				// R40/K69: ANTI became reachable here when demotedForPlan
+				// started transplanting the S9.3 LEFT->ANTI verdict. This
+				// switch had no ANTI arm, so the join kept the nested-loop
+				// default and probed the inner index once per outer row —
+				// 1.4M descents on TPC-DS Q78's store_sales arm, measured at
+				// 16s -> 54s. Hash is the same algorithm `unnest.go` already
+				// builds its own SEMI/ANTI joins with (JoinAlgoHash), so this
+				// is an exercised executor path, not a new one. PG picks a
+				// Merge Anti Join for this shape; choosing between hash and
+				// merge on cost is join-METHOD parity and stays out of scope
+				// here — what this arm fixes is the absence of any choice.
+				// SEMI is deliberately absent: mapJoinType never emits it
+				// (applyDemotion produces no SEMI verdict), so an arm for it
+				// would be unreachable.
+				jn.Algo = JoinAlgoHash
 			case JoinTypeRight, JoinTypeFull:
 				// M0127-P4.2 (design leftdeep-joins/07 §3): RIGHT and FULL
 				// are no longer PINNED to merge. The pin was never a
@@ -3344,7 +3459,16 @@ func planFromItem(item parser.FromExpr, cat catalog.Catalog, nextSourceIdx *int1
 		}
 		} // close else from allLeavesAreTableScans guard
 		leftNode = jn
-		leftCtx = mergedCtx
+		// R40 §4d / K69: for Semi/Anti, `jn`'s Output() (plan.go) and its
+		// now-narrowed `.schema` (set above) equal exactly what `leftCtx`
+		// already described BEFORE this join — the right/nullable side
+		// never appears past this point, so there is nothing to adopt.
+		// Adopting `mergedCtx` here (the pre-R40 behaviour) is what let a
+		// later join in the SAME chain resolve columns at offsets that
+		// still budgeted space for the invisible right side.
+		if joinType != JoinTypeSemi && joinType != JoinTypeAnti {
+			leftCtx = mergedCtx
+		}
 	}
 	return leftNode, leftCtx.bindings, nil
 }
@@ -6593,6 +6717,16 @@ func mapJoinType(t parser.JoinType) JoinType {
 		return JoinTypeFull
 	case parser.JoinCross:
 		return JoinTypeCross
+	case parser.JoinAnti:
+		// R40/K69: demotedForPlan now transplants the LEFT->ANTI verdict
+		// (reduce_outer_joins.go's S9.3 rule) onto the plan tree; before
+		// this case existed it silently fell to JoinTypeInner below,
+		// which would have been wrong rows, not a no-op — the guard was
+		// never exercised because no ANTI verdict reached here until now.
+		// JoinTypeSemi is deliberately NOT added: applyDemotion never
+		// produces one (grep-confirmed), so mapping it would be
+		// speculative code with no caller.
+		return JoinTypeAnti
 	default:
 		return JoinTypeInner
 	}

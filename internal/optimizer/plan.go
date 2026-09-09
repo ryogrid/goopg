@@ -1158,6 +1158,34 @@ type Join struct {
 	// nextLazy/openLazyHashJoin special-case this flag instead of
 	// reusing the NOT-EXISTS-shaped default.
 	NullAware bool
+	// FromOuterReduction marks a JoinTypeAnti produced by the LEFT->ANTI
+	// outer-join reduction (reduce_outer_joins.go's S9.3 rule, transplanted
+	// to the plan by demotedForPlan) rather than by the unnest rewrite.
+	// R40/K69.
+	//
+	// It exists because the NLI cost gate's SEMI/ANTI arm
+	// (nl_index_join.go's nliCostGateAccepts) was calibrated on ONE
+	// population — unnest-sourced joins, whose outer is "the small side by
+	// construction of the unnest rewrite", as that file's own comment
+	// records. The reduction is a SECOND population that breaks the premise:
+	// TPC-DS Q78 hands the gate a 1,439,608-row store_sales outer, and the
+	// gate accepts by a hair (1,439,608 < 1,583,094) only because it charges
+	// a B-tree descent as 1 unit — the same as a hash probe. Measured, that
+	// NLI ran Q78 at 54s against 14s for the hash plan PG's own shape implies
+	// (PG picks Merge Anti Join here).
+	//
+	// Capping the gate by outer size instead was tried and REJECTED by
+	// measurement: it also catches unnest-sourced semi joins, where the
+	// premise fails in the other direction — TPC-H Q4's EXISTS has a 385k
+	// outer but a 6M-row lineitem inner, so NLI is genuinely right there and
+	// the cap made it 1.5s -> 13.1s (8.6x). The two populations need
+	// different answers, so the marker distinguishes them rather than a
+	// threshold pretending they are one.
+	//
+	// Retire this flag when the gate learns a real index-descent probe cost;
+	// that is join-METHOD parity work with its own blast radius, not this
+	// round's.
+	FromOuterReduction bool
 	// AvgVarBytes is the average total variable-width payload of a build-side
 	// row, fed from the build relation's RelOptInfo.AvgVarBytes. Zero means
 	// "unknown" (no ANALYZE stats, or a fixed-width relation) and the geometry

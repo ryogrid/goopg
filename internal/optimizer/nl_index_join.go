@@ -325,6 +325,16 @@ func tryBuildNLI(j *Join, cat catalog.Catalog) (*NestedLoopIndexJoin, bool) {
 		j.Type != JoinTypeSemi && j.Type != JoinTypeAnti {
 		return nil, false
 	}
+	// R40/K69: an ANTI join produced by the LEFT->ANTI outer-join reduction
+	// is outside the population this file's SEMI/ANTI cost gate was
+	// calibrated on (see Join.FromOuterReduction for the measurements, both
+	// directions). Route it to the hash path, which is also the family PG
+	// picks for the shape (Merge/Hash Anti Join, never a nestloop). Existing
+	// unnest-sourced SEMI/ANTI joins are unmarked and reach the gate exactly
+	// as before, so no shipped decision moves.
+	if j.FromOuterReduction {
+		return nil, false
+	}
 	// S6 (D6.2): accept `Filter{SeqScan}` as the RIGHT inner side by
 	// tentatively unwrapping it — the Filter's conjuncts join the
 	// residual set (indices shifted into outer++inner coordinates via

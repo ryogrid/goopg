@@ -1178,3 +1178,208 @@ func TestReduceOuterJoinsFullDemotionBothSidesStructural(t *testing.T) {
 		t.Errorf("FULL→INNER: expected Base 'a', got %q", got)
 	}
 }
+
+// R40/K69 — demotedForPlan now transplants the LEFT->ANTI verdict onto the
+// PLAN tree (previously only INNER was transplanted; see the function's own
+// doc comment and TODO.md's K30/K69). No prior unit test exercised
+// demotedForPlan's transplant loop directly (only reduceOuterJoins' analysis
+// side, above); these are new, not extensions.
+
+func TestDemotedForPlanTransplantsAntiAndReportsTable(t *testing.T) {
+	// Same fixture as TestReduceOuterJoinsLeftToAntiFixedConstant:
+	// a LEFT JOIN b ON b.y = 5 WHERE b.y IS NULL → ANTI.
+	item := parser.FromExpr{
+		Base: parser.RangeVar{Name: "a"},
+		Joins: []parser.JoinExpr{
+			{
+				Type: parser.JoinLeft, Right: parser.RangeVar{Name: "b"},
+				On: &parser.BinaryOp{
+					Op:    parser.OpEq,
+					Left:  &parser.ColumnRef{Table: "b", Column: "y"},
+					Right: &parser.IntegerConst{Value: 5},
+				},
+			},
+		},
+	}
+	where := &parser.IsNullExpr{
+		Operand: &parser.ColumnRef{Table: "b", Column: "y"},
+		Negated: false,
+	}
+
+	out, antiCols := demotedForPlan(item, where, nil)
+
+	if got := out.Joins[0].Type; got != parser.JoinAnti {
+		t.Errorf("demotedForPlan: got %v, want JoinAnti", got)
+	}
+	// COLUMN key, not table name: PG's ANTI rule is var-granular (R40/K69).
+	if !antiCols[makeColKey("b", "y")] {
+		t.Errorf("demotedForPlan: antiCols = %v, want the b.y key", antiCols)
+	}
+	// The source item is untouched (demotedForPlan returns a copy — same
+	// contract as before this round, unchanged by it).
+	if got := item.Joins[0].Type; got != parser.JoinLeft {
+		t.Errorf("demotedForPlan mutated its input: item.Joins[0].Type = %v, want unchanged JoinLeft", got)
+	}
+}
+
+func TestDemotedForPlanStillTransplantsInner(t *testing.T) {
+	// R27's original case, unaffected by the R40 ANTI addition:
+	// a LEFT JOIN b WHERE b.x = 5 → INNER, no antiTables.
+	item := parser.FromExpr{
+		Base: parser.RangeVar{Name: "a"},
+		Joins: []parser.JoinExpr{
+			{Type: parser.JoinLeft, Right: parser.RangeVar{Name: "b"}},
+		},
+	}
+	where := &parser.BinaryOp{
+		Op:    parser.OpEq,
+		Left:  &parser.ColumnRef{Table: "b", Column: "x"},
+		Right: &parser.IntegerConst{Value: 5},
+	}
+
+	out, antiCols := demotedForPlan(item, where, nil)
+
+	if got := out.Joins[0].Type; got != parser.JoinInner {
+		t.Errorf("demotedForPlan: got %v, want JoinInner", got)
+	}
+	if len(antiCols) != 0 {
+		t.Errorf("demotedForPlan: antiCols = %v, want empty", antiCols)
+	}
+}
+
+// R40/K69 — stripForcingNullQuals drops only the specific top-level IS NULL
+// conjunct(s) that demotedForPlan already certified as forcing an ANTI
+// conversion, mirroring collectForcedNullWalk's top-level-AND-only descent
+// exactly (PG's own rule: prepjointree.c, "must be removed to prevent bogus
+// selectivity calculations").
+
+func TestStripForcingNullQualsDropsOnlyTheForcingConjunct(t *testing.T) {
+	// b.y IS NULL AND a.z = 7, antiTables={b} → only the sibling survives.
+	where := &parser.BinaryOp{
+		Op: parser.OpAnd,
+		Left: &parser.IsNullExpr{
+			Operand: &parser.ColumnRef{Table: "b", Column: "y"},
+		},
+		Right: &parser.BinaryOp{
+			Op:    parser.OpEq,
+			Left:  &parser.ColumnRef{Table: "a", Column: "z"},
+			Right: &parser.IntegerConst{Value: 7},
+		},
+	}
+
+	got := stripForcingNullQuals(where, map[string]bool{makeColKey("b", "y"): true}, nil, nil)
+
+	bin, ok := got.(*parser.BinaryOp)
+	if !ok {
+		t.Fatalf("stripForcingNullQuals: got %T, want the surviving BinaryOp sibling", got)
+	}
+	col, ok := bin.Left.(*parser.ColumnRef)
+	if !ok || col.Table != "a" || col.Column != "z" {
+		t.Errorf("stripForcingNullQuals: surviving conjunct = %#v, want a.z = 7", got)
+	}
+}
+
+func TestStripForcingNullQualsDropsEverythingToNil(t *testing.T) {
+	// b.y IS NULL alone, antiTables={b} → nil (no residual predicate).
+	where := &parser.IsNullExpr{Operand: &parser.ColumnRef{Table: "b", Column: "y"}}
+
+	got := stripForcingNullQuals(where, map[string]bool{makeColKey("b", "y"): true}, nil, nil)
+
+	if got != nil {
+		t.Errorf("stripForcingNullQuals: got %#v, want nil", got)
+	}
+}
+
+func TestStripForcingNullQualsLeavesOrNestedIsNullUntouched(t *testing.T) {
+	// (b.y IS NULL OR a.z = 7) — collectForcedNullWalk never descends into
+	// OR, so this conjunct was never certified as forcing anything, and
+	// stripForcingNullQuals must not touch it even though b is in
+	// antiTables (a stale/unrelated antiTables entry, or the OR made the
+	// demotion fire for a different reason — either way, not this rule's
+	// business).
+	where := &parser.BinaryOp{
+		Op: parser.OpOr,
+		Left: &parser.IsNullExpr{
+			Operand: &parser.ColumnRef{Table: "b", Column: "y"},
+		},
+		Right: &parser.BinaryOp{
+			Op:    parser.OpEq,
+			Left:  &parser.ColumnRef{Table: "a", Column: "z"},
+			Right: &parser.IntegerConst{Value: 7},
+		},
+	}
+
+	got := stripForcingNullQuals(where, map[string]bool{makeColKey("b", "y"): true}, nil, nil)
+
+	if got != where {
+		t.Errorf("stripForcingNullQuals: OR-nested IS NULL was touched, got %#v", got)
+	}
+}
+
+func TestStripForcingNullQualsNoOpWhenAntiTablesEmpty(t *testing.T) {
+	where := &parser.IsNullExpr{Operand: &parser.ColumnRef{Table: "b", Column: "y"}}
+	if got := stripForcingNullQuals(where, nil, nil, nil); got != where {
+		t.Errorf("stripForcingNullQuals: empty antiTables should no-op, got %#v", got)
+	}
+}
+
+// R40/K69 — the S9.3 LEFT->ANTI rule is COLUMN-granular, matching PG's
+// `mbms_overlap_sets(nonnullable_vars, forced_null_vars)`
+// (prepjointree.c:3379-3403). goopg compared TABLE names until R40, which
+// over-fired on the shape below.
+
+func TestReduceOuterJoinsLeftToAntiRequiresTheSameColumn(t *testing.T) {
+	// a LEFT JOIN b ON a.id = b.id WHERE b.y IS NULL
+	// → ON is strict for b.id; WHERE forces b.y. DIFFERENT columns, so PG
+	// keeps the LEFT join and applies the IS NULL as a filter. Verified on
+	// the live PG 18.3 oracle: `Merge Left Join` + `Filter: (b.y IS NULL)`,
+	// returning the null-extended row (id=3).
+	from := []parser.FromExpr{{
+		Base: parser.RangeVar{Name: "a"},
+		Joins: []parser.JoinExpr{
+			{
+				Type: parser.JoinLeft, Right: parser.RangeVar{Name: "b"},
+				On: &parser.BinaryOp{
+					Op:    parser.OpEq,
+					Left:  &parser.ColumnRef{Table: "a", Column: "id"},
+					Right: &parser.ColumnRef{Table: "b", Column: "id"},
+				},
+			},
+		},
+	}}
+	where := &parser.IsNullExpr{Operand: &parser.ColumnRef{Table: "b", Column: "y"}}
+
+	reduceOuterJoins(from, where, nil)
+
+	if got := from[0].Joins[0].Type; got != parser.JoinLeft {
+		t.Errorf("ON strict for b.id + WHERE forcing b.y: got %v, want JoinLeft "+
+			"(different columns — PG does not convert; oracle emits Merge Left Join + Filter)", got)
+	}
+}
+
+func TestReduceOuterJoinsLeftToAntiSameColumnStillConverts(t *testing.T) {
+	// Q78's real shape in miniature:
+	// a LEFT JOIN b ON a.id = b.id WHERE b.id IS NULL
+	// → ON strict for b.id AND WHERE forces b.id: SAME column → ANTI.
+	// Oracle on the TPC-DS shape: `Merge Anti Join`, IS NULL qual dropped.
+	from := []parser.FromExpr{{
+		Base: parser.RangeVar{Name: "a"},
+		Joins: []parser.JoinExpr{
+			{
+				Type: parser.JoinLeft, Right: parser.RangeVar{Name: "b"},
+				On: &parser.BinaryOp{
+					Op:    parser.OpEq,
+					Left:  &parser.ColumnRef{Table: "a", Column: "id"},
+					Right: &parser.ColumnRef{Table: "b", Column: "id"},
+				},
+			},
+		},
+	}}
+	where := &parser.IsNullExpr{Operand: &parser.ColumnRef{Table: "b", Column: "id"}}
+
+	reduceOuterJoins(from, where, nil)
+
+	if got := from[0].Joins[0].Type; got != parser.JoinAnti {
+		t.Errorf("ON strict for b.id + WHERE forcing b.id: got %v, want JoinAnti", got)
+	}
+}

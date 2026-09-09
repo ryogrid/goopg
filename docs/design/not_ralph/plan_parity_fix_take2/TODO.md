@@ -1887,6 +1887,55 @@ end-to-end for Q78's exact shape, and §6's gate list now requires a
 3-relation VALUES regression (not just 2-relation) since only the
 3-relation shape exercises §4d. Full record in DESIGN.md §8.
 
-Status: design reviewed and corrected. Not yet implemented, no code
-change, tree clean. Next: commit -n + push the design, then
-implement.
+**LANDED** (`r40-left-anti-transplant/REPORT.md`). All gates green:
+sweep PASS=95 MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0, TPC-H values
+byte-identical AND plan structure identical across all 22, precommit
+units green.
+
+- **Match count did NOT move** (TPC-DS 0/99, TPC-H 1/22) and the decline
+  TOTAL did not move (8). `outer-link-no-sjinfo` 3 -> 0, replaced by
+  `leaf-count` 3. Say this plainly: the round bought a PG-faithful join
+  TYPE and a correctness fix, not a match.
+- **K71 — the round's most important outcome: goopg's S9.3 LEFT->ANTI
+  rule was OVER-FIRING and would have shipped wrong rows.** PG uses TWO
+  granularities deliberately (prepjointree.c:3340-3403): LEFT->INNER is
+  `find_nonnullable_RELS` (relation), LEFT->ANTI is
+  `find_nonnullable_VARS` + `mbms_overlap_sets` (COLUMN). goopg used
+  relation granularity for both. `a LEFT JOIN b ON a.id=b.id WHERE b.y
+  IS NULL` was demoted to ANTI though the ON is strict for a DIFFERENT
+  column than the WHERE forces; oracle: PG emits `Merge Left Join` +
+  `Filter`. The bug was already in `ctx.joinInfoList` (which
+  `reduceOuterJoins` populates today) — invisible only because K30
+  declined the transplant. Both shapes now match PG exactly on SF0.5
+  (323,532 same-column / 325,179 different-column — genuinely different
+  queries).
+- **K72 — the new blocker.** The 3 declines are now `leaf-count`, all
+  `nrels=2 nleaves=2`: an ANTI join's right side is not a search leaf
+  (it is a pinned sub-problem) but Q78's ANTI sits at the BOTTOM of its
+  chain with an INNER `date_dim` join above, so it is not a top-of-tree
+  spine either and `runJoinSearchBelowPinned` does not apply. Adjacent
+  to K70's `outer-spine` work; that is the next round.
+- **K73 — a measurement reversed a decision that had passed review.**
+  `nliCostGateAccepts`' SEMI/ANTI arm charges a B-tree descent as 1 unit
+  (same as a hash probe), so it accepted Q78's 1.44M-row outer by a hair
+  and ran it at 54s vs 16s. Capping the gate by outer size was tried and
+  REJECTED by measurement: it also caught unnest-sourced SEMI joins,
+  where the premise fails the other way — TPC-H Q4's EXISTS has a 385k
+  outer but a 6M-row `lineitem` inner, and the cap made it 1.5s -> 13.1s
+  (8.6x). One threshold cannot serve both populations. Landed instead:
+  `Join.FromOuterReduction` marks only the joins this round creates and
+  declines NLI for them; every existing decision is byte-identical and
+  Q78 ends at **14s, 2s FASTER than the 16s pre-R40 baseline**. Retire
+  the flag when the gate learns a real index-descent probe cost.
+- Also landed: `mapJoinType` learns `parser.JoinAnti` (it silently fell
+  to `JoinTypeInner`, which would have been wrong rows); per-item schema
+  narrowing for Semi/Anti in `planFromItem` (review-found, DESIGN §4d —
+  a chained join after the ANTI read offsets against the stale merged
+  width); `stripForcingNullQuals` dropping exactly the certified
+  conjuncts without mutating `s.Where`.
+- **Method:** the diagnosis came from instrumenting
+  `outerLinksHaveSJInfos` directly (temporary trace, reverted), per
+  R37's "instrument the term, never infer it from the sum". TWO
+  decisions this round were reversed by measurement after passing
+  review — the adversarial review caught the schema gap, but only the
+  A/B caught the NLI cap.
