@@ -2055,3 +2055,70 @@ and this one is not).
 - The R41 implementation is fully specified by `DESIGN.md` §4 and was
   verified to build, pass every suite and pass the sweep, so redoing it
   is mechanical.
+
+
+## R42 — the qual-pushdown descent cannot cross a Project (K76, DESIGN pre-review)
+
+`r42-pushdown-project-arm/DESIGN.md`. Prerequisite for R41's
+implementation.
+
+- `pushConjunctTraced` (`inner_join_qual_pushdown.go:341`) has arms for
+  `*Filter` and `*Join` only, then a terminal gated on
+  `innerJoinPushEligibleInput` (`:496`) that admits `*CTEScan`,
+  `*MaterializedCTEScan` or a base-relation leaf. A `*Project` is none
+  of those, so the descent declines. The PG-shaped search's boundary
+  republishes binding order through exactly such a `Project`, so EVERY
+  body the search admits meets it — the gap was always there, R41 only
+  made it reachable.
+- Fix: a `*Project` arm that remaps via the SAME
+  `remapConjunctThroughProjection` helper `pushConjunctIntoCTEBody`
+  already uses, then recurses — mirroring the `*Join` arm's
+  remap/recurse/assign shape. The helper is already fail-closed: it
+  vetoes `OuterColumnRef`/`FuncCall`, requires every referenced target
+  to be a plain `*ColumnRef` (so a computed or volatile projection
+  declines), and name-checks both schemas.
+- **Blast radius is the reason this is its own round.** The descent has
+  TWO production callers: the CTE path
+  (`cte_inline_pushdown.go:240,252`) and the general single-side
+  inner-join pushdown (`inner_join_qual_pushdown.go:161`, `:739`) which
+  runs for every statement. Movement is expected to IMPROVE
+  qual-placement parity (PG pushes restrictions to baserel level), but
+  that is a prediction to measure, not assume.
+- **K77 — review correction that changes the round's scope: `st.proven`
+  is NOT neutral.** Its ONLY consumer (`inner_join_qual_pushdown.go:167`,
+  `if tr.proven && !tr.planted { continue }`) **DELETES the conjunct from
+  the residual `Filter`**. Today a `Project` between a join and its input
+  makes the descent return false, so the qual is unconditionally KEPT; an
+  arm returning true with `proven` still true would newly REMOVE the qual
+  from above on a whole class of trees — a residual-dropping MOVE, not
+  the deeper placement this round is scoped to. Worse, the remap has two
+  fail-OPEN seams: it skips the self-side name check for an UNNAMED ref
+  (`remapConjunctThroughProjection:281`; unnamed refs demonstrably
+  occur), and it never checks `len(Output()) == len(Targets)`. So R42
+  sets `st.proven = false` and is deliberately COPY-ONLY. Enabling the
+  move is a separate round with its own proof.
+- Two more review corrections adopted: refuse `Project.IsolatedScope`
+  (verbatim precedent at `upper_narrow_chain.go:373-379`; today such
+  Projects are contained only by ACCIDENT — a view-rename Project
+  declines because the view and body column names differ, which fails as
+  soon as they match), and refuse an `Output()`/`Targets` length
+  mismatch (mirroring `cte_inline_pushdown.go:207-209`), which closes
+  the second fail-open seam.
+- "Copies by default" means the CONJUNCT is duplicated, not the node —
+  every arm already mutates in place. The real prerequisite is
+  EXPRESSION FRESHNESS, which `remapConjunctThroughProjection`'s closing
+  `cloneExprRefs` supplies. Passing `c` through unchanged instead would
+  have aliased the caller's own expression on the CTE entry path
+  (`cte_inline_pushdown.go:240/252`, where the entry node is a `*Filter`).
+- **Prediction recorded before implementing:** this round does NOT
+  change the decline census and is NOT expected to produce a match. Its
+  success criterion is narrower — the `qual-placement` parity category
+  must not worsen on either corpus and plan-shape movement must be
+  explainable query by query. Match count expected to stay 0/99 and
+  1/22.
+- Filed, not fixed: `deriveConstAcrossJoinEquality` (`:413`, planting at
+  `:739`) mutates the tree BEFORE the recursion and nothing unwinds it on
+  a failed descent, so a derived sibling copy can sit below un-priced
+  (the caller takes `kept = append(kept, c)` without `notePushedBelow`).
+  A `*Project` arm makes deep-then-fail descents more common, so it
+  WIDENS this pre-existing wart without creating it.
