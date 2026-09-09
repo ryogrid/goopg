@@ -1657,3 +1657,34 @@ multiplies unconditionally via `clauseSelectivity` (NOT the
 - **K59** goopg-only thresholds (`nliMaxOuterRowsHeuristic`,
   `memoizeMinOuterRows`) are crossed far more often now; some shape
   changes are heuristic-driven, not cost-driven.
+
+## R37 — two seq-scan cost models (investigation, no code change)
+
+`r37-two-cost-models/FINDINGS.md`.
+
+- **K60 — goopg prices seq scans two different ways, differing by the
+  ENTIRE page term.** `costSeqscan` (cost_funcs.go:192) is PG-faithful
+  and is called only from the path search; a one-relation statement
+  never enters the search (`makeRelFromJoinlist` returns at
+  `len(items)==1`) and is priced by a legacy model that omits
+  `seq_page_cost*relPages`. Measured: `lineitem` 196,405.55 (search,
+  = 136393 + 60012.55, PG's formula exactly) vs 60,012.55 (legacy).
+- **K61 — both models appear in ONE plan.** R36's Q12 carries
+  `orders` at the search's 43,435.00 and `lineitem` at the legacy
+  60,299.79, where the search's formula would give ~271,421. The
+  largest relation is the one priced without pages, so `lineitem` looks
+  4.5x cheaper to scan than it is — the exact direction that makes
+  goopg hash `lineitem` where PG hashes `orders`. Candidate root cause
+  for join-method and the build-side half of join-order.
+- **Eliminated by probe, not argument:** Q12's build side does NOT flip
+  when the estimate is corrected (hand-folded bound gives 28,724 vs
+  PG's 28,127) nor when parallelism is disabled. So it is neither an
+  estimate nor a parallelism artefact.
+- **K62 — NOT yet established, do not assume.** Whether the search
+  CONSUMED the legacy number for `lineitem` or merely rendered it.
+  Instrument the build-side comparison first. This is the third time
+  this session that a rendered number differed from the consumed one
+  (`EstimateRows` vs `calcJoinrelSize`); the lesson is paid for.
+- If the search did consume it, the fix is C-19h's already-filed
+  successor — "build single-relation base-rel path lists as PG does" —
+  which also unblocks `MaybeAddGather`'s retirement. Same work.
