@@ -337,6 +337,24 @@ failure/hang in background wastes the session — goal instruction).
   test-only; production seed is `newPrebuiltPath`). Every design must
   cite call sites, not files.
 
+## READ FIRST (2): which queries are even ELIGIBLE
+
+`r26-seam-decline-audit/FINDINGS.md` (2026-09-09), acting on K27.
+A query the PG-shaped search DECLINES falls to the legacy path and
+**cannot converge on PG's plan by any costing work**.
+
+- **TPC-H: 0 declines.** Every query is admitted, so TPC-H's 2/22 is
+  ENTIRELY costing/candidates. Seam work cannot help TPC-H.
+- **TPC-DS: 13 declines across 7 queries** — Q49, Q51, Q68, Q77, Q78,
+  Q93, Q97. Reasons: `outer-link-no-sjinfo` 7 (Q49 x3, Q78, Q93),
+  `outer-over-derived` 3 (Q77 x2, Q78), `outer-spine` 2 (Q51, Q97),
+  `lateral` 1 (Q68).
+
+These 7 are a HARD FLOOR: unlike the other 92 they are not merely
+outcosted, they never enter the search. Sequencing therefore has two
+axes, not one — how many queries a category blocks, AND whether a query
+is eligible at all.
+
 ## READ FIRST: what "all plans match" requires
 
 `ROADMAP-to-all-match.md` (2026-09-09). **It is a CONJUNCTION, not a
@@ -881,6 +899,13 @@ anything attempted so far.
 
 ## Log
 
+- 2026-09-09 (CC) **Seam-decline audit** (R26): TPC-H **0 declines**
+  (so its 2/22 is purely costing); TPC-DS **13 across 7 queries**
+  (Q49/Q51/Q68/Q77/Q78/Q93/Q97), top reason `outer-link-no-sjinfo` (7).
+  That guard is fail-closed and correct — without SpecialJoinInfo the
+  search could emit INNER where the statement wrote OUTER. Next: find
+  why `joinInfoList` is unpopulated for those shapes
+  (`deconstructJointreeScopedSJI`), starting with Q49.
 - 2026-09-09 (CC) **Q30/Q81 CLOSED** (`r25-nli-decompose/REPORT-slice1-ctescan-fix.md`).
   Cause was NOT costing (my §4a guess) and NOT the CTE cache (two
   falsified hypotheses): slice 1's `OuterColumnRef` probe keys landed
