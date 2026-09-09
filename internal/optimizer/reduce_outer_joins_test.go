@@ -380,13 +380,25 @@ func TestReduceOuterJoinsInnerUnaffected(t *testing.T) {
 // ---- M0129-S9.2: ON-clause propagation tests ----
 
 func TestReduceOuterJoinsInnerOnPropagatesToRightDemotion(t *testing.T) {
-	// a INNER JOIN b ON a.x = b.y RIGHT JOIN c
-	// WHERE is empty — the INNER JOIN's strict ON clause is the ONLY source
-	// of nonnullable rels.
-	// → INNER ON: localNN = {a, b} → merged into accumulatedNN = {a, b}
-	// → RIGHT JOIN: nullable (left) side = {a, b}, accumulatedNN = {a, b}
-	//   → overlap → demote RIGHT to INNER.
-	// Without S9.2, accumulatedNN stays empty and no demotion happens.
+	// a INNER JOIN b ON a.x = b.y RIGHT JOIN c, no WHERE.
+	//
+	// CORRECTED R27/2 (K29). This test used to assert the RIGHT join demotes
+	// to INNER, reasoning that the inner ON's strict quals put {a, b} in the
+	// accumulated nonnullable set and the RIGHT join's nullable side is
+	// {a, b}. That reasoning is wrong, and the assertion described a
+	// row-dropping bug: the RIGHT join null-extends {a, b} AFTER the inner
+	// join produced them, so the inner ON is never evaluated on the
+	// null-extended rows and cannot make those rels non-nullable here.
+	//
+	// VERIFIED AGAINST THE ORACLE, not argued: PG 18.3 on
+	//   select * from ra join rb on ra.x = rb.y right join rc on rb.z = rc.id
+	// emits `Merge LEFT Join` (RIGHT normalised to LEFT, still OUTER) and
+	// returns BOTH rows — the matched one and the null-extended one. It does
+	// not demote. goopg demoting here returned 0 rows where 1 was correct on
+	// the executor's own `WHERE rj_a.id IS NULL` fixture.
+	//
+	// PG's rule (`reduce_outer_joins_pass2`) is that only quals from ABOVE a
+	// join constrain it. So the RIGHT arm is now judged against `upperNN`.
 	from := []parser.FromExpr{{
 		Base: parser.RangeVar{Name: "a"},
 		Joins: []parser.JoinExpr{
@@ -406,8 +418,10 @@ func TestReduceOuterJoinsInnerOnPropagatesToRightDemotion(t *testing.T) {
 
 	reduceOuterJoins(from, nil, nil) // no WHERE
 
-	if got := from[0].Joins[1].Type; got != parser.JoinInner {
-		t.Errorf("RIGHT JOIN after INNER JOIN with strict ON (no WHERE): got %v, want JoinInner", got)
+	if got := from[0].Joins[1].Type; got != parser.JoinRight {
+		t.Errorf("RIGHT JOIN after INNER JOIN with strict ON (no WHERE): got %v, want JoinRight "+
+			"(unchanged — an inner ON below cannot constrain a join that null-extends its result; "+
+			"PG emits Merge Left Join here and keeps the null-extended row)", got)
 	}
 }
 
@@ -506,8 +520,10 @@ func TestReduceOuterJoinsMultiInnerOnChain(t *testing.T) {
 
 	reduceOuterJoins(from, nil, nil)
 
-	if got := from[0].Joins[2].Type; got != parser.JoinInner {
-		t.Errorf("RIGHT JOIN after two INNER joins with strict ONs (no WHERE): got %v, want JoinInner", got)
+	if got := from[0].Joins[2].Type; got != parser.JoinRight {
+		t.Errorf("RIGHT JOIN after two INNER joins with strict ONs (no WHERE): got %v, want JoinRight "+
+			"(unchanged — R27/2/K29: inner ONs below cannot constrain a join that null-extends "+
+			"their result; PG keeps the outer join here)", got)
 	}
 }
 
@@ -621,14 +637,17 @@ func TestReduceOuterJoinsFullJoinResetsAccumulated(t *testing.T) {
 	reduceOuterJoins(from, nil, nil)
 
 	// FULL→LEFT demotion (left side constrained by propagated INNER→ON NN).
-	if got := from[0].Joins[1].Type; got != parser.JoinLeft {
-		t.Errorf("FULL JOIN after INNER ON chain: got %v, want JoinLeft", got)
+	if got := from[0].Joins[1].Type; got != parser.JoinFull {
+		t.Errorf("FULL JOIN after INNER ON chain: got %v, want JoinFull "+
+			"(unchanged — R27/2/K29: a FULL join's LEFT arm is nullable too, so strictness "+
+			"merged from inner ONs below does not survive it)", got)
 	}
 	// RIGHT→INNER demotion (right was flipped to LEFT, but this is pos 2,
 	// not first, so not flipped — RIGHT→INNER fires because left side
 	// {a,b,c} overlaps accumulatedNN {a,b}).
-	if got := from[0].Joins[2].Type; got != parser.JoinInner {
-		t.Errorf("RIGHT JOIN after FULL→LEFT: got %v, want JoinInner", got)
+	if got := from[0].Joins[2].Type; got != parser.JoinRight {
+		t.Errorf("RIGHT JOIN after FULL chain: got %v, want JoinRight "+
+			"(unchanged — R27/2/K29, same rule)", got)
 	}
 }
 

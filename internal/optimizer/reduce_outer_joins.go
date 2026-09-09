@@ -148,14 +148,37 @@ func applyDemotion(item *parser.FromExpr, upperNN, upperFN map[string]bool, tabl
 			// flipped to LEFT above). Only RIGHT→INNER demotion is possible
 			// without the flip; RIGHT→ANTI needs a nested AST.
 			// S9.4 ledger: deeper RIGHT joins can't be flipped.
-			if anyNameIn(leftNames, accumulatedNN) {
+			//
+			// R27/2 (K29): judged against `upperNN` — quals from ABOVE — and
+			// NOT `accumulatedNN`, which also carries ON-clause strictness
+			// merged from INNER joins BELOW this one. Those do not survive
+			// this join: its nullable side IS that accumulated left arm, and
+			// it null-extends the arm after the inner joins produced it.
+			//
+			// Using the accumulated set demoted RIGHT→INNER on
+			//   rj_a JOIN rj_b ON rj_a.id = rj_b.aid
+			//   RIGHT JOIN rj_c ON rj_b.cid = rj_c.id  WHERE rj_a.id IS NULL
+			// because the inner ON is strict on {rj_a, rj_b} — destroying the
+			// null-extended rows that are the only rows the query returns
+			// (0 rows where 1 is correct). PG does not make this mistake:
+			// `reduce_outer_joins_pass2` only lets quals from above a join
+			// constrain it.
+			//
+			// Conservative by construction: `upperNN` is a subset of
+			// `accumulatedNN`, so this can only DECLINE demotions that were
+			// previously made, never add one. An un-demoted join is today's
+			// shipped behaviour; a wrongly-demoted one drops rows.
+			if anyNameIn(leftNames, upperNN) {
 				j.Type = parser.JoinInner
 			}
 
 		case parser.JoinFull:
 			// Both sides are nullable. Check each independently.
 			// PG prepjointree.c:3319-3341.
-			leftConstrained := anyNameIn(leftNames, accumulatedNN)
+			// R27/2 (K29): same rule as the RIGHT arm above — a FULL join's
+			// LEFT side is nullable too, so strictness merged from INNER
+			// joins below does not survive it. Quals from above only.
+			leftConstrained := anyNameIn(leftNames, upperNN)
 			rightConstrained := accumulatedNN[rightName]
 			if leftConstrained && rightConstrained {
 				j.Type = parser.JoinInner

@@ -357,8 +357,16 @@ failure/hang in background wastes the session — goal instruction).
   join. **The `outerLinksHaveSJInfos` decline is the only thing
   containing this**: the bad verdict reaches `join_info_list` but not
   the plan, and the resulting disagreement declines the statement.
-  **Retiring the decline without first fixing the propagation ships
-  wrong rows.** Fix the analysis, then the ordering, then the declines.
+  ~~Retiring the decline without first fixing the propagation ships
+  wrong rows.~~ **STEP ONE DONE (R27 REPORT.md):** both the RIGHT and
+  FULL arms now judge their nullable side against `upperNN` (quals from
+  ABOVE), PG's rule. Oracle-verified: PG emits `Merge LEFT Join` and
+  returns BOTH rows for `ra join rb on … right join rc on …`; goopg had
+  demoted to INNER. Three optimizer tests pinned the bug and are
+  corrected. Gates: 5 executor VALUES tests now PASS, TPC-H values
+  byte-identical, sweep PASS=95 all-zero. **The decline no longer masks
+  anything**, so R27 §4a's ordering transplant can proceed on its own
+  merits. Remaining: the ordering, then the declines.
 - **K4 (rev-1 error pattern, from §6).** Never conclude from a file
   without checking its callers (`pathgen.go`/`generateScanPaths` is
   test-only; production seed is `newPrebuiltPath`). Every design must
@@ -926,6 +934,17 @@ anything attempted so far.
 
 ## Log
 
+- 2026-09-09 (CC) **R27 SHIPPED — a row-dropping demotion fixed**
+  (`r27-outer-join-reduction/REPORT.md`). RIGHT/FULL joins judged their
+  NULLABLE arm against `accumulatedNN`, which carries ON-strictness
+  from INNER joins BELOW; those do not survive a join that
+  null-extends their result. Now judged against `upperNN` (PG's rule).
+  **Oracle-verified**: PG emits `Merge LEFT Join` + 2 rows where goopg
+  demoted to INNER (would return 1). Three optimizer tests pinned the
+  bug and were corrected with the PG result in their failure messages.
+  All 5 executor VALUES tests pass; TPC-H values byte-identical; sweep
+  PASS=95 all-zero; parity unchanged (neither corpus contains the
+  shape — which is why it survived).
 - 2026-09-09 (CC) **R27/2 — the demotion VERDICT is wrong, and the seam
   decline is MASKING it** (`r27-outer-join-reduction/FINDINGS-demotion-is-wrong.md`).
   §4a's transplant works structurally (optimizer suite green, flip
