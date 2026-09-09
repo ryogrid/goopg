@@ -810,7 +810,15 @@ type selectivityEstimate struct {
 // predates A1); porting the band formula here is filed follow-up
 // work, not part of A1.
 //
-// Slice B uses this to gate updates to
+// R36: `baseRelInfo.filteredRows` NO LONGER READS THIS FLAG.
+// Baserel sizing now multiplies unconditionally, as
+// `set_baserel_size_estimates` does, and it consumes the plain
+// `clauseSelectivity` twin rather than this one precisely
+// BECAUSE of the pairing divergence noted just above: on a
+// histogram-less `x>=a AND x<b` band this twin returns
+// 1/3 x 1/3 = 0.111 where PG's punt rule gives
+// DEFAULT_RANGE_INEQ_SEL = 0.005. Formerly:
+// Slice B used this to gate updates to
 // `baseRelInfo.filteredRows`: when reliability is false, the
 // row count keeps its pre-filter value rather than picking up
 // arbitrary fallback constants that the cost model would then

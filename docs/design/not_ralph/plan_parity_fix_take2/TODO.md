@@ -1553,7 +1553,7 @@ to `TypedStringLit` (parse_coerce.c:232-250) instead of a runtime
   proposing any fix. Do not read the rendered number and assume the
   search saw it.
 
-## R36 — baserel selectivity gate (DESIGN APPROVED, IMPLEMENTATION NOT LANDED)
+## R36 — baserel selectivity gate (LANDED, all gates pass)
 
 `r36-baserel-selectivity-reliable-gate/` (`DESIGN.md` reviewed
 APPROVE-WITH-NOTES; `STATUS.md` records where it stopped). Tree is green
@@ -1629,3 +1629,31 @@ at HEAD — the implementation was reverted, not shipped.
   **NOT a prerequisite for R36** — R36 should seed its three fixtures
   with `SetTableStats` (as the optimizer-side tests do), which bypasses
   ANALYZE entirely. K56 deserves its own round.
+
+## R36 LANDED (second attempt, after K56 unblocked it)
+
+`r36-baserel-selectivity-reliable-gate/REPORT.md`. Baserel sizing
+multiplies unconditionally via `clauseSelectivity` (NOT the
+`…WithSource` twin — K53's 22x trap).
+
+- Join estimate consistency fixed: TPC-H `orders ⋈ lineitem` Merge Join
+  6,001,255 -> 2,000,418, matching its input.
+- **24 plan SHAPES changed** on TPC-DS — the largest structural
+  movement of any round (R34: 0, R30: 6). Net category **−2** on
+  TPC-DS (parameterisation 44→41, parallelism 90→88,
+  aggregation-strategy 83→82; join-method +1, scan-type +1,
+  sort-strategy +2) and **−1** on TPC-H (join-method 14→13).
+- Gates: units 44 ok; TPC-H values byte-identical; SF0.5 sweep PASS=95
+  all-zero, verdict-changes=none, runtime −2.3%.
+- **K49's suspicion now has real evidence.** join-order held at exactly
+  95/99 and 20/22 through R30, R31b, R34 AND R36 — 40+ structural
+  changes, zero movement. Target enumeration and `add_path` dominance
+  next, not cost inputs.
+- **K57** `inferAnchoredEqualities` rule (2) is now vacuously true for
+  default-priced filters (both defaults < 1/2) — an ENUMERATION change
+  that caused the M0075/M0076 Q9 hang when it over-fired. Inert (no
+  non-test caller); commented at the site. Re-derive before wiring.
+- **K58** `scaleByFloat` truncates where `clamp_row_est` rounds.
+- **K59** goopg-only thresholds (`nliMaxOuterRowsHeuristic`,
+  `memoizeMinOuterRows`) are crossed far more often now; some shape
+  changes are heuristic-driven, not cost-driven.

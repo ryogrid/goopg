@@ -68,6 +68,48 @@ func pqJoinFixture(t *testing.T) (*Context, func()) {
 			fail(err, "insert fact")
 		}
 	}
+	// R36: stamp the statistics the data actually implies.
+	//
+	// Needed because baserel sizing now multiplies by
+	// `clauselist_selectivity` unconditionally, as
+	// `set_baserel_size_estimates` does (costsize.c:5348-5362), instead of
+	// discarding a default-derived estimate. Without statistics `f.amt >= 0`
+	// — a predicate every one of the 400 rows satisfies — priced at
+	// DEFAULT_INEQ_SEL and the fixture claimed 133 rows, which is enough to
+	// tip C-19f's gathered hash join into a base-rel Gather and make the
+	// consumer tests measure the absence of statistics rather than the path
+	// model.
+	//
+	// `ANALYZE` cannot supply these here: it counts only tuples passing its
+	// own visibility test and reports RowCount=0 for rows written in this
+	// transaction (K56), while leaving the column slots populated — so it
+	// would look like it worked. `SetTableStats` is the supported route and
+	// is what the optimizer-side tests already use.
+	//
+	// Every number below is derived from the loops above, not fitted to make
+	// a test pass: 400 fact rows with `amt = i*2` (so 0..798, equi-depth
+	// quartile bounds 0/200/400/600/798) and `fk = i%40` with every 53rd row
+	// NULL; 20 dimension rows with `dk = i` and one NULL.
+	setStats := func(name string, rows int64, cols ...catalog.ColumnStats) {
+		tbl, ok := ctx.Catalog.LookupTable(parser.ObjectName{Name: name})
+		if !ok || tbl == nil {
+			fail(fmt.Errorf("table %s not found", name), "stats")
+			return
+		}
+		ctx.Catalog.SetTableStats(tbl, &catalog.TableStats{
+			RowCount: rows, Pages: 4096, Analyzed: true, Columns: cols,
+		})
+	}
+	nullEvery := func(n int) float64 { return 1.0 / float64(n) }
+	setStats("pq_fact", 400,
+		catalog.ColumnStats{NDistinct: 400, Histogram: []string{"0", "100", "200", "300", "399"}},
+		catalog.ColumnStats{NDistinct: 40, NullFrac: nullEvery(53), Histogram: []string{"0", "10", "20", "30", "39"}},
+		catalog.ColumnStats{NDistinct: 400, Histogram: []string{"0", "200", "400", "600", "798"}},
+	)
+	setStats("pq_dim", 20,
+		catalog.ColumnStats{NDistinct: 19, NullFrac: nullEvery(20), Histogram: []string{"0", "5", "10", "15", "19"}},
+		catalog.ColumnStats{NDistinct: 20},
+	)
 	return ctx, cleanup
 }
 

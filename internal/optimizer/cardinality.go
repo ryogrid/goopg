@@ -460,20 +460,37 @@ func estimateBaseRelInfo(binding rangeBinding, scan Node, local Expr) baseRelInf
 // a second open-coded copy of the reliability gate is exactly the sibling shape
 // hard-won rule #2 forbids (M0127-P5.6, the M0125-0003 stage-3 re-evaluation).
 //
-// The one deliberate deviation from upstream is the `reliable` gate: PG always
-// multiplies, falling back to DEFAULT_EQ_SEL / DEFAULT_INEQ_SEL when it has no
-// statistic, whereas goopg keeps the pre-filter count (design 02 §2 rule (4)).
-// Ledgered — see the 2026-08-06 row.
+// R36: the multiply is UNCONDITIONAL here, as `set_baserel_size_estimates` is
+// (costsize.c:5348-5362). Upstream has no reliability concept, and
+// `clauselist_selectivity` returns DEFAULT_EQ_SEL / DEFAULT_INEQ_SEL for a
+// clause it cannot estimate — never 1.0, which is what keeping the pre-filter
+// count amounted to.
+//
+// The gate this replaces was ledgered on 2026-08-06 (M0127-P5.6) at "up to 200x
+// divergence, direction makes build sides look too expensive", and it reached
+// the JOIN SEARCH, not just EXPLAIN: `GOOPG_JRS_TRACE` on `calcJoinrelSize` for
+// `orders ⋈ lineitem WHERE l_shipdate < l_commitdate` showed the search
+// consuming `inner.Rows=6001255` — the raw count — where the scan-level
+// estimator had already applied DEFAULT_INEQ_SEL to reach 2000418.
+//
+// The selectivity comes from `clauseSelectivity`, NOT the `…WithSource` twin,
+// and that choice is this function's whole correctness. The twin's AND arm
+// multiplies conjuncts PAIRWISE (selectivity.go:838-847, a divergence its own
+// comment at :806-812 documents), whereas `clauseSelectivity` routes AND
+// through `conjunctionSelectivity`, which ports `clauselist_selectivity`'s
+// range-band handling INCLUDING PG's punt rule: either bound at
+// DEFAULT_INEQ_SEL collapses the pair to DEFAULT_RANGE_INEQ_SEL
+// (rangequery.go:185-192, clausesel.c:283-286). On the histogram-less
+// `x >= a AND x < b` band this round exists to fix, the twin would give
+// 1/3 x 1/3 = 0.111 against PG's 0.005 — 22x too loose, a fresh error in place
+// of the old one. The scan-level estimator (`filterSelectivity`) already uses
+// this same plain twin, so EXPLAIN and the search now agree by construction.
 func applyLocalFilterSelectivity(baseRows int64, binding rangeBinding, scan Node, local Expr) int64 {
 	if local == nil || scan == nil || baseRows <= 0 {
 		return baseRows
 	}
 	localized := localizeExprToLeaf(local, binding)
-	sel := clauseSelectivityWithSource(localized, scan)
-	if !sel.reliable {
-		return baseRows
-	}
-	rows := scaleByFloat(baseRows, sel.value)
+	rows := scaleByFloat(baseRows, clauseSelectivity(localized, scan))
 	if rows < 1 {
 		// Preserve the bushy DP's "no zero-row singletons"
 		// invariant — without this guard the planner would

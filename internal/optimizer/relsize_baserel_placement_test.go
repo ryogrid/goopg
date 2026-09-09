@@ -56,7 +56,7 @@ func newPlacementFixture(stats *catalog.TableStats) (*catalog.InMemory, rangeBin
 // selectivity invents precision". That premise is true here and is now enforced
 // by the reliability gate instead of by refusing to scale — which is what lets
 // the same code be right in the state below, where the premise is false.
-func TestRelSizeFallbackPlacementIdenticalWhenStatsAbsent(t *testing.T) {
+func TestRelSizeFallbackPlacementScalesWhenStatsAbsent(t *testing.T) {
 	defer SetRelSizeFallbackStage(SetRelSizeFallbackStage(0))
 	SetRelSizeFallbackStage(2)
 
@@ -69,6 +69,8 @@ func TestRelSizeFallbackPlacementIdenticalWhenStatsAbsent(t *testing.T) {
 	if sel.reliable {
 		t.Fatalf("a stats-less table must price no clause reliably; got reliable=%v value=%v", sel.reliable, sel.value)
 	}
+	// R36: that DEFAULT_* constant is now APPLIED rather than discarded.
+	defSel := clauseSelectivity(localizeExprToLeaf(pred, binding), scan)
 
 	want := estimateTableRowsFallback(cat, binding.table)
 	if want <= 1 {
@@ -84,10 +86,16 @@ func TestRelSizeFallbackPlacementIdenticalWhenStatsAbsent(t *testing.T) {
 	if info.baseRows != want {
 		t.Errorf("baseRows = %d; want the block-derived estimate %d", info.baseRows, want)
 	}
-	// The load-bearing assertion: UNSCALED, i.e. byte-identical to the
-	// pre-filter stamping. S-cold plans cannot move on this change.
-	if info.filteredRows != want {
-		t.Errorf("filteredRows = %d; want %d unscaled (pre- and post-filter placements must coincide S-cold)", info.filteredRows, want)
+	// R36 REVERSED this. It demanded the fallback be left UNSCALED, on the
+	// argument that pre- and post-filter placements coincide S-cold — an
+	// equality that held only while the reliability gate existed. Upstream has
+	// no such gate: `set_baserel_size_estimates` multiplies `rel->tuples`
+	// (itself block-derived by `estimate_rel_size` cold) by
+	// `clauselist_selectivity`'s DEFAULT_* punt. S-cold plans CAN move on this.
+	wantScaled := scaleByFloat(want, defSel)
+	if info.filteredRows != wantScaled {
+		t.Errorf("filteredRows = %d; want %d (block estimate %d scaled by default selectivity %g)",
+			info.filteredRows, wantScaled, want, defSel)
 	}
 }
 
@@ -217,7 +225,11 @@ func TestApplyLocalFilterSelectivityMatchesEstimateBaseRelInfo(t *testing.T) {
 		{name: "no filter", tbl: mkTable(1000, mcv), pred: nil, want: 1000},
 		{name: "no scan", tbl: mkTable(1000, mcv), pred: eq("x"), noScan: true, want: 1000},
 		{name: "no base rows", tbl: mkTable(0, nil), pred: eq("x"), want: 0},
-		{name: "unreliable selectivity", tbl: mkTable(1000, nil), pred: eq("x"), want: 1000},
+		// R36: no MCV, so the equality punts to DEFAULT_EQ_SEL (0.005) and is
+		// now APPLIED — upstream multiplies unconditionally. Previously wanted
+		// 1000 (the pre-filter count), i.e. selectivity 1.0, which has no
+		// upstream counterpart.
+		{name: "unreliable selectivity", tbl: mkTable(1000, nil), pred: eq("x"), want: 5, wantSel: true},
 		{name: "reliable selectivity", tbl: mkTable(1000, mcv), pred: eq("x"), want: 250, wantSel: true},
 		{name: "one-row floor", tbl: mkTable(2, mcv), pred: eq("x"), want: 1, wantSel: true},
 	}
