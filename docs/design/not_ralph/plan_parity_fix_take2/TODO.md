@@ -1526,13 +1526,17 @@ to `TypedStringLit` (parse_coerce.c:232-250) instead of a runtime
   quals by (columns, operator multiset) NOT literal values. **No
   estimate change can ever move a parity verdict.** R34 is proof: 18
   TPC-DS plans changed and every category was byte-identical.
-  Judge estimate rounds by direct oracle comparison plus a count of
-  SHAPE changes — never by category counts.
+  Report `shape-delta.sh` counts ALONGSIDE category counts every round:
+  shape-changed=0 means the round moved no plan at all (category zero is
+  trivial); shape changes with no category movement means plans moved
+  SIDEWAYS, which is a different and more interesting result.
 - **K49 WITHDRAWN.** "join-order is not estimate-driven" was inferred
-  from R30/R31b/R34 showing no movement. Those experiments could not
-  have shown movement whatever the estimates did (K50). The advice to
-  investigate the search may still be right; the evidence for it is
-  void and must not be cited.
+  from R30/R31b/R34 showing no movement. Reason CORRECTED: two of the
+  three did change plan structure (6 and 10 queries), so they were not
+  incapable of moving the metric — but join-order stayed at exactly
+  95/99 across 16 structural changes. That is evidence join order
+  resists estimate corrections, NOT proof it is estimate-independent.
+  Do not cite it as proof.
 - **K51 — join cardinality drops whole clause classes.** EXPLAIN on
   `orders ⋈ lineitem` shows Merge Join `rows=6001255` above an input
   scan of `rows=2000418` — three different counts in one plan.

@@ -114,3 +114,55 @@ while PG picks Hash Join with `lineitem` outer). Two relations means
 zero enumeration complexity: any divergence is cost or candidate
 generation, nothing else. Establish which cardinality the search
 consumed before proposing any fix.
+
+---
+
+# CORRECTION (same day, after building the instrument)
+
+§1 above overstated its case. The claim "**no estimate change can ever
+move a parity verdict**" is **wrong** and is withdrawn.
+
+`methodology/shape-delta.sh` was written to count plans whose node
+STRUCTURE changed, separately from ones whose text changed. Applied to
+the three rounds §1 cited:
+
+| round | text-changed | **shape-changed** | category movement |
+|---|---|---|---|
+| R30 (correlation) | 99 | **6** | scan-type −1, join-method +2 |
+| R31b (heap density) | 96 | **10** | qual-placement −1 |
+| R34 (cast folding) | 18 | **0** | none |
+
+R30 and R31b **did** change plan structure — on 6 and 10 queries — and
+the metric **did** register movement on both. It was not blind to them.
+
+## What is actually true
+
+- N1/N5/N6 strip estimate DIGITS, casts and literal spellings from the
+  comparison. That part of §1 is correct and verified from the tool's
+  source.
+- The consequence is narrower than §1 claimed: an estimate change
+  registers **exactly insofar as it changes plan STRUCTURE**, and not at
+  all otherwise.
+- R34 measured zero because it genuinely changed **no plan's
+  structure** (shape-changed=0), not because the metric could not see
+  it. Zero was the correct reading, not a measurement artefact.
+
+## What this does to K49
+
+K49 ("join-order is not estimate-driven") stays **withdrawn**, but the
+reason is now weaker and must be stated as such. It is not that the
+experiments were incapable of showing movement — two of the three
+changed shapes. It is that the shape changes they produced were
+roughly parity-neutral: `join-order` sat at exactly 95/99 across 16
+structural changes. That is *evidence* that join order resists
+estimate corrections; it is not *proof* that it is estimate-independent,
+and it must not be cited as proof.
+
+## Standing instruction that survives
+
+Report `shape-delta.sh`'s counts alongside the category counts in every
+round. A round with `shape-changed=0` has not changed any plan and its
+category result is trivially zero; a round with shape changes and no
+category movement has moved plans sideways, which is a different and
+more interesting result. Conflating the two is what produced the error
+above.
