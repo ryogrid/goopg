@@ -2196,3 +2196,96 @@ TPC-H values byte-identical AND plan structure identical across all 22.
 **Remaining declines: 5.** `outer-over-derived` 3 (K68, blocked on the
 separate B-06 CTE-stats workstream — lifting it re-opens a measured 20x
 timeout) and `outer-spine` 2 (K70).
+
+
+## R43 — `Parallel Hash` is the largest systematic gap left (K79, DESIGN pre-review)
+
+`r43-parallel-hash/DESIGN.md`. Found by ranking queries by NEAREST MISS
+instead of continuing the Q78 decline chain — a method change worth
+keeping.
+
+- **CORRECTION to a figure this workstream has been repeating: TPC-H is
+  `match=2`, not 1/22.** Q13 AND Q6 match at HEAD. The 1/22 came from the
+  R36 baseline and was carried into every later report without
+  re-measurement. Authoritative at HEAD (post-R41/R42):
+  `queries=22 match=2 shapediff=20`,
+  `join-order=18 join-method=12 scan-type=13 parameterisation=6
+  aggregation-strategy=10 sort-strategy=13 parallelism=18
+  qual-placement=7 rendering=7`.
+- **Q14 is ONE category from matching — `[parallelism]` and nothing
+  else.** Q1 is two away (`sort-strategy`, `parallelism`). Then a jump to
+  4-5 categories. Ranking by nearest-miss is how to pick rounds from
+  here.
+- **K79 — the gap is `Parallel Hash`, and it is the biggest systematic
+  divergence found this session.** PG uses it in **69/99 TPC-DS** (310
+  node occurrences) and **7/22 TPC-H** (Q3 Q9 Q10 Q14 Q16 Q18 Q21).
+  goopg emits it ZERO times, structurally: `joinpathsparallel.go`'s
+  header states `parallel_hash = true` is REFUSED because "no goopg
+  executor builds a hash table from a partial inner", and the refusal is
+  structural (the file never reads `inner.PartialPathlist`).
+- **But the executor capability appears to EXIST and be live.**
+  `parallel_hash_build.go` implements M0129-S4.1, a cooperative parallel
+  hash build (N producer goroutines scan+filter the build table, one
+  consumer owns the map), default ON (`coopJoinBuildOn`), reached from
+  `joinOp` via `parallelBuildEligible`, with measured wins (Q20
+  1.91->0.65s). Checked that it is not dead code.
+- **RESOLVED by review — TRUTHFUL.** `coopDrivingScan` IS applied to the
+  build plan (`parallel_hash_build.go:522-531`: `buildPlan := o.plan.Right`
+  / `.Left`), and its "probe side" widening only governs descent THROUGH a
+  nested join inside the build subtree. `:609` makes ONE shared
+  `newParallelScanState`, and `:663-680` has N producers rebuild the build
+  subtree with `attachParallelScan` wiring that shared atomic block
+  allocator into the driving `seqScanOp` — so **each producer claims a
+  disjoint block range of the build relation**, not a duplicate copy. The
+  leader pre-build and the coop build COMPOSE
+  (`operators_join_agg.go:666-668`), they do not compete. My earlier
+  speculation that it "may never partition a BUILD scan" is REFUTED. The
+  timing A/B that came back inside noise was inconclusive and should not
+  have been leaned on — the source answered it.
+- Two caveats: goopg parallelises the build SCAN+FILTER but insertion is
+  single-consumer (PG parallelises insertion too), and
+  `parallelBuildEligible` has NO parallel-mode gate, so it fires in
+  SERIAL queries too where PG shows a plain `Hash`. **Therefore the label
+  must follow the PATH MODEL, never observed executor behaviour.**
+
+- **K80 — the re-scope, and rev 1's biggest error.** `Parallel Hash Join`
+  needs NO `parallel_hash=true` work: `addPartialHashJoinPath` already
+  sets `ParallelAware: true` (`joinpathsparallel.go:205`). It is dead
+  solely because the partial-path machinery sits behind a **default-OFF**
+  knob — `gatherPathModeFromEnv`'s default arm returns `gatherPathsOff`
+  (`gatherpaths.go:70,82`) and every producer returns early at
+  `joinpathsparallel.go:89`. **R10 already measured the flip: TPC-H
+  `Parallel Hash Join` 0 -> 19, TPC-DS 0 -> 132, TPC-H `parallelism`
+  18 -> 15**, with no parallel-hash work at all. The flip is NOT landed,
+  and **R12 (adjudicate the 8 failures R11 left) is its hard
+  prerequisite**. As rev 1 was written its step 2 would have landed code
+  behind `if gatherPathsMode == gatherPathsOff { return }` — inert at the
+  shipping default and unmeasurable by the sweep it named as its binding
+  gate.
+- **Correct order: R12 + flip FIRST**, then the residual Q14 gap (one
+  node: `Seq Scan on part` -> `Parallel Seq Scan on part`) via
+  `try_partial_hashjoin_path(parallel_hash=true)`, and wire
+  `enable_parallel_hash` (declared at `catalog/catalog.go:12171`, default
+  on, **nothing reads it** — the known declared-but-unconsumed-GUC trap).
+- **Occurrence counts corrected: 9 (TPC-H) / 157 (TPC-DS) true `Parallel
+  Hash` BUILD nodes**, not 18/310 — a bare `grep -c "Parallel Hash"` also
+  matches `Parallel Hash Join`/`Semi Join`. Query counts (7/22, 69/99)
+  stand.
+- **Rendering a standalone `Parallel Hash` node buys NO parity**: the
+  differ splices PG's `Hash`/`Parallel Hash` nodes out
+  (`pg-plan-parity-diff.py:571-574`, N2) and excludes `Hash` from
+  MISSING-NODE. Q14 needs exactly two existing flags,
+  `Join.ParallelAware` + `SeqScan.Parallel`.
+- **K81 — inverse-misdescription risk.** If the path model emits
+  `parallel_hash=true` but `parallelBuildEligible` DECLINES at runtime
+  (build < 1024 blocks, `preserveCTIDRel` set, `coopDrivingScan` nil for
+  an Aggregate/Sort/index build side, or `GOOPG_COOP_JOIN_BUILD=off`),
+  the plan claims parallelism the executor does not perform — a new
+  misdescription in the opposite direction, i.e. exactly the "arbitrary"
+  outcome the goal forbids. The planner predicate must be a PINNED TWIN
+  of `parallelBuildEligible`.
+- **MATCH on this metric is SHAPE-ONLY.** Q14's row estimates stay ~300x
+  apart (goopg `Hash Join rows=6,001,255` vs PG `rows=18,444`; goopg's
+  `lineitem` scan does not apply the `l_shipdate` selectivity at all).
+  N1 pushes estimates to a side column so the differ never sees it. Any
+  report claiming Q14 as a match must say this.
