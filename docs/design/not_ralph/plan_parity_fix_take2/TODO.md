@@ -1669,7 +1669,7 @@ multiplies unconditionally via `clauseSelectivity` (NOT the
   `len(items)==1`) and is priced by a legacy model that omits
   `seq_page_cost*relPages`. Measured: `lineitem` 196,405.55 (search,
   = 136393 + 60012.55, PG's formula exactly) vs 60,012.55 (legacy).
-- **K61 — both models appear in ONE plan.** R36's Q12 carries
+- **K61 — WITHDRAWN, see the R37 correction. WRONG.** R36's Q12 carries
   `orders` at the search's 43,435.00 and `lineitem` at the legacy
   60,299.79, where the search's formula would give ~271,421. The
   largest relation is the one priced without pages, so `lineitem` looks
@@ -1680,11 +1680,23 @@ multiplies unconditionally via `clauseSelectivity` (NOT the
   when the estimate is corrected (hand-folded bound gives 28,724 vs
   PG's 28,127) nor when parallelism is disabled. So it is neither an
   estimate nor a parallelism artefact.
-- **K62 — NOT yet established, do not assume.** Whether the search
-  CONSUMED the legacy number for `lineitem` or merely rendered it.
-  Instrument the build-side comparison first. This is the third time
-  this session that a rendered number differed from the consumed one
-  (`EstimateRows` vs `calcJoinrelSize`); the lesson is paid for.
-- If the search did consume it, the fix is C-19h's already-filed
-  successor — "build single-relation base-rel path lists as PG does" —
-  which also unblocks `MaybeAddGather`'s retirement. Same work.
+- **K62 ANSWERED — the search used the CORRECT cost.** Instrumented on
+  Q12's exact shape: `SEQCOST pages=136393 tuples=6001255 qualops=5 ->
+  total=271421.24`. Pages and all five quals included, PG's formula
+  exactly. EXPLAIN alone renders 60,299.79. K61's "both models in one
+  plan" claim described the RENDERING, not the decision, and is
+  withdrawn.
+- **The Q12 build-side divergence is STILL UNEXPLAINED.** Three
+  candidates eliminated by measurement: estimate (folded bound gives
+  28,724 vs PG 28,127, side does not flip), parallelism (disabling does
+  not flip it), page term (search had it). Next probe is the comparison
+  itself — instrument `add_path` for both hash-join orientations and
+  record both candidates' costs, or whether the PG-shaped one was
+  generated at all (`planner_verify_both_candidates_generated`).
+- **K63 — EXPLAIN reports a scan cost the planner did not use.**
+  60,299.79 rendered vs 271,421.24 consumed: a 4.5x understatement on
+  the corpus's largest relation. Does NOT affect plan choice, but it
+  corrupts every cost-based artefact read here — `plan-gate
+  MODE=semantic-cost`, estimate-audit tables, and any human reading an
+  EXPLAIN. The cost twin of the `EstimateRows`/`calcJoinrelSize` row
+  split. Reporting-integrity fix; do NOT expect categories to move.

@@ -104,3 +104,61 @@ showed estimate corrections do not move join-order.
    retirement. The two items are the same work.
 3. Gate as usual, and report `shape-delta.sh` counts alongside the
    categories (K50).
+
+---
+
+# CORRECTION — K62 answered, and §3 was WRONG
+
+§4 said the consumed-vs-rendered question "must be instrumented, not
+inferred", and then §3 had already inferred it. §3 is withdrawn.
+
+Instrumenting `costSeqscan` on Q12's exact shape (temporary
+`GOOPG_SEQCOST_TRACE`, reverted):
+
+```
+SEQCOST pages=136393 tuples=6001255 qualops=5 -> total=271421.24
+SEQCOST pages=28435  tuples=1500000 qualops=0 -> total=43435.00
+```
+
+**The search priced `lineitem` at 271,421.24** — pages included, five
+quals included, PG's `cost_seqscan` exactly. It is only EXPLAIN that
+renders 60,299.79.
+
+## What survives, what does not
+
+- **K60 stands.** Two seq-scan cost models exist and differ by the
+  entire page term. A one-relation statement is priced by the legacy
+  one; `costSeqscan` is never called for it. Verified twice.
+- **K61 is WRONG and is withdrawn.** The planner does NOT compare a
+  page-priced `orders` against a page-free `lineitem`. The search saw
+  271,421.24 for `lineitem` and 43,435.00 for `orders`, both
+  page-priced and mutually consistent. The mixing happens only in the
+  RENDERING.
+- **The Q12 build-side divergence is therefore still unexplained.**
+  Three candidates are now eliminated by measurement: the estimate
+  (hand-folding the bound gives 28,724 vs PG's 28,127 and the side does
+  not flip), parallelism (disabling it does not flip it), and the page
+  term (the search had it all along).
+
+## The defect this leaves, which is real but different
+
+EXPLAIN reports a scan cost the planner did not use — 60,299.79 against
+the search's 271,421.24, a 4.5x understatement on the largest relation
+in the corpus. That does not affect plan choice, but it does affect
+every cost-based artefact this workstream reads: `make plan-gate
+MODE=semantic-cost`, the estimate-audit tables, and any human reading
+an EXPLAIN to reason about why a plan was chosen. It is the cost twin
+of the `EstimateRows` / `calcJoinrelSize` row-count split that
+`cardinality_two_estimators_test.go` already pins for rows.
+
+Filed as K63. It is a reporting-integrity fix, not a parity fix, and it
+should be labelled as such so nobody expects categories to move.
+
+## Where the build-side question goes next
+
+Since cost INPUTS are now eliminated, the next probe is the comparison
+itself: instrument `add_path` for the two hash-join orientations on
+Q12 and record both candidates' total costs, or whether the
+PG-shaped orientation was generated at all. That is the
+`planner_verify_both_candidates_generated` discipline, and it is now
+the only untested link.
