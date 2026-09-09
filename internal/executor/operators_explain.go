@@ -422,6 +422,17 @@ func walkPlanFiltered(n optimizer.Node, indent int, rows *[]Row, opts parser.Exp
 	// Skip Project wrappers: PG has no "Projection" plan node;
 	// the projection is part of the parent / scan's render.
 	if p, ok := n.(*optimizer.Project); ok {
+		// R32 (K42): a Project's targets can carry sublinks (Q9's
+		// fifteen targetlist CASE subqueries) with no detail line to
+		// visit them — the Result-arm precedent in
+		// emitNodeDetailLines. Rendered text is discarded; only the
+		// assignment side effect (subPlanName → assign) is wanted, so
+		// emitSubPlanSubtrees prints them under the child node PG
+		// attaches the targetlist to. assign dedupes, so targets
+		// shared with lines rendered below cannot renumber.
+		for _, t := range p.Targets {
+			formatExprQual(t, reg, reg.names().qualify())
+		}
 		walkPlanFiltered(p.Child, indent, rows, opts, attachedFilter, attachedFilterNode, reg)
 		return
 	}
@@ -1547,6 +1558,12 @@ func walkPlanAnalyze(b *strings.Builder, n optimizer.Node, depth int, rows *[]Ro
 
 func walkPlanAnalyzeFiltered(n optimizer.Node, indent int, rows *[]Row, opts parser.ExplainOptions, stats nodeStatsTable, spStats map[optimizer.Expr]*SubPlanSiteStats, memoStats map[*optimizer.Memoize]*MemoizeStats, hashStats map[*optimizer.Join]*HashJoinStats, gatherLaunched gatherLaunchedTable, workerStats workerNodeStatsTable, attachedFilter optimizer.Expr, attachedFilterNode optimizer.Node, filterRowsRemoved int64, reg *subPlanReg) {
 	if p, ok := n.(*optimizer.Project); ok {
+		// R32 (K42) twin of the walkPlanFiltered Project visit: target
+		// sublinks must assign here or the ANALYZE text path silently
+		// diverges from plain EXPLAIN. Both walkers must agree.
+		for _, t := range p.Targets {
+			formatExprQual(t, reg, reg.names().qualify())
+		}
 		walkPlanAnalyzeFiltered(p.Child, indent, rows, opts, stats, spStats, memoStats, hashStats, gatherLaunched, workerStats, attachedFilter, attachedFilterNode, filterRowsRemoved, reg)
 		return
 	}

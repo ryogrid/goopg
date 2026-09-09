@@ -1410,7 +1410,18 @@ on all three clusters).
   numbers were measured on the inflated cluster and should be
   re-measured before being built upon.
 
-## R32 — K37 campaign slice 1: targetlist subplan display (design approved, implementing)
+## R32 — K37 campaign slice 1: targetlist subplan display (IMPLEMENTED, all gates pass)
+
+`r32-targetlist-subplan-display/` (`DESIGN.md` reviewed
+APPROVE-WITH-NOTES, notes applied; `REPORT.md`). Project-Targets
+visit in both EXPLAIN text walkers (TEXT only; JSON out of scope).
+Q9: 6 -> 66 lines, 0 -> 15 InitPlans (InitPlan 1..15, PG placement);
+newly visible serial Aggregates make K44 measurable. Test 2
+REFUTED/reclassified: Q1/Q32/Q81/Q92 sublinks are Filter/Join-Filter
+decorrelation-vs-SubPlan (planner strategy, referred onward).
+Gates: units pass; TPC-H spotcheck Q12/Q13 PASS; SF0.5 sweep PASS=95
+MISMATCH=0 (plan-shape: 98 same, changed=Q9); TPC-DS A/B only Q9
+changed; TPC-H A/B 22/22 identical.
 
 `r32-targetlist-subplan-display/DESIGN.md` (reviewed 2026-09-09,
 APPROVE-WITH-NOTES, notes applied). Fresh-clone census (pinned env):

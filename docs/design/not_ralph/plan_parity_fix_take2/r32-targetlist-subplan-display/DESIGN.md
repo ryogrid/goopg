@@ -112,8 +112,19 @@ Q1/Q32/Q81/Q92 (smaller deltas, same mechanism).
 1. Q9 section: goopg shows 15 InitPlan-or-SubPlan lines (was 0); the
    fifteen scalar subqueries appear with PG's InitPlan labels/numbering
    (numbering expected from left-to-right CASE visit order, verified
-   only by the post-fix capture).
+   only by the post-fix capture). DONE 2026-09-09: InitPlan 1..15 in
+   CASE order under the top IndexScan, matching PG's placement; the
+   newly visible inner plans are serial `Aggregate`s — the K44 real
+   gap, now measurable.
 2. Q1/Q32/Q81/Q92 Init/Sub deltas close (PG 2 -> goopg 2 each).
+   REFUTED 2026-09-09, reclassified: their sublinks live in
+   Filter/Join-Filter quals (Q32/Q92 `Join Filter: (... > (SubPlan
+   1))`, Q1/Q81 `Filter: (ctr_total_return > (SubPlan 2))`), where
+   goopg's planner chose decorrelation (Q32: HashAggregate-as-input,
+   `Filter: (... > (1.3 * avg))`) while PG kept SubPlan. That is
+   planner subquery strategy, NOT the Project-Targets display
+   mechanism — out of scope for this round, referred to a future
+   subquery-planning round.
 3. Previously byte-identical sections stay byte-identical — the
    load-bearing guard, not decoration: first-visit renumbering can
    touch any query where a Project sits above other sublink sites, so
@@ -125,6 +136,12 @@ Q1/Q32/Q81/Q92 (smaller deltas, same mechanism).
    `scripts/pg-plan-parity-diff.py` is shape-verdicts-only here (needs
    reformatting to `=== QN`, and its N6 normalisation erases subplan
    numbering by design).
+   GUARD RESULT 2026-09-09: TPC-DS full-corpus A/B (base-HEAD binary
+   vs r32, same fresh-clone data, pinned env) — exactly one section
+   changed (Q9: 6 -> 66 lines, 0 -> 15 Init/Sub); Q36/70/86 differ
+   only in the capture temp-file PID inside the psql error prefix
+   (shared PG-unparsable syntax errors, out of scope). TPC-H A/B on
+   `/tmp/pp2/tpch` — 22/22 byte-identical modulo the header line.
 4. Values gates unchanged by construction (no plan struct touched);
    confirm via the standard sweep, not by reasoning.
 5. `match` count is NOT a success criterion (ROADMAP conjunction:
