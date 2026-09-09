@@ -1591,3 +1591,21 @@ at HEAD — the implementation was reverted, not shipped.
   (`…PlacementIdenticalWhenStatsAbsent`) encoded an equivalence that
   held only because of the gate, and `relsize.go:169-177`'s comment
   becomes false with it — a cold-server behaviour change, matching PG.
+
+- **K55 — ANALYZE leaves `Stats.RowCount=0` in the executor test
+  harness.** Probed directly after loading the setop fixture and
+  ANALYZEing every table: `sj_ws Stats.RowCount=0 cols=4` (same for
+  `sj_item`, `sj_td`) — per-column statistics ARE populated, the row
+  count is NOT. With `RowCount==0`, `estimateBaseRelInfo` yields
+  `baseRows==0` and everything falls to `applyRelSizeFallback`'s
+  block-derived count, ~1 in this in-memory harness. That is why a
+  4000-row table rendered `Seq Scan on sj_ws rows=1` with no Filter,
+  and why both R36 diagnostics (add rows / add ANALYZE) were inert.
+  Related known shape: `internal/initdb/open.go` builds
+  `TableStats{Columns: ...}` with `RowCount` left zero on restore.
+  **Consequence:** the three blocked executor tests cannot be repaired
+  by data or ANALYZE; they currently measure the reliability gate, not
+  their own mechanisms (at HEAD `sj_item` keeps 5 rows and `sj_td` 11
+  ONLY because the gate discards the default). Fix/characterise
+  RowCount first, then seed those fixtures via `SetTableStats` at sizes
+  where the promoted plan is genuinely cheaper, then re-run R36.

@@ -101,3 +101,60 @@ planner.
 3. Gates the round still owes: TPC-H values digest, SF0.5 sweep,
    parity BOTH corpora, and `methodology/shape-delta.sh` counts
    reported alongside the categories (K50).
+
+---
+
+# K54 ANSWERED — the fixtures cannot express row counts
+
+The resume point above asked why inserted rows never reach `baseRows`
+in the executor test harness. Probed directly (`ctx.Catalog.LookupTable`
+right after loading the fixture and running `ANALYZE` on every table):
+
+```
+PROBE sj_ws   Stats.RowCount=0 cols=4
+PROBE sj_item Stats.RowCount=0 cols=4
+PROBE sj_td   Stats.RowCount=0 cols=4
+```
+
+**`ANALYZE` populates the per-column statistics and leaves
+`Stats.RowCount` at 0.** With `RowCount == 0`, `estimateBaseRelInfo`
+returns `baseRows == 0` and every relation falls to
+`applyRelSizeFallback`'s block-derived count — which in this in-memory
+harness is ~1. That is why a table holding 4000+ rows rendered as
+`Seq Scan on sj_ws rows=1` with no Filter, and why adding rows and
+adding ANALYZE both failed to move anything.
+
+## What this means for the three blocked tests
+
+They are not repairable by adding data or by calling ANALYZE: the
+harness cannot represent a row count through either path. At HEAD they
+only produce hash joins because the reliability gate DISCARDS the
+default selectivity, so `sj_item` keeps 5 rows and `sj_td` keeps 11
+instead of collapsing to the 1-row floor. Under PG-faithful sizing
+those become 1, and a nested loop is then the correct plan — PG would
+choose one too on tables that size.
+
+So the mechanisms are almost certainly intact and the fixtures are
+measuring the gate rather than the mechanism. "Almost certainly" is
+not good enough to re-tune three mechanism tests on, which is why the
+implementation stays reverted.
+
+## Revised resume point
+
+Two independent pieces of work, in this order:
+
+1. **Fix or characterise `ANALYZE`'s `RowCount`.** Either it genuinely
+   fails to stamp `RowCount` on this path (a defect in its own right,
+   affecting any test that reasons about cardinality), or this harness
+   bypasses the stamping. Establish which. Note the related known
+   issue: `internal/initdb/open.go` builds `TableStats{Columns: ...}`
+   with `RowCount` left zero on restore, so a zero `RowCount` beside
+   populated `Columns` is a shape that already exists elsewhere.
+2. **Then re-run R36.** With row counts expressible, seed the three
+   fixtures via `SetTableStats` (what the optimizer-side tests already
+   do) at sizes where the promoted plan is genuinely cheaper, and the
+   tests will pin their mechanisms rather than the gate. Only then is
+   it honest to judge whether R36 breaks anything.
+
+R36's design, its 22x-error finding (K53) and the three re-derived
+optimizer tests all stand and need no rework.
