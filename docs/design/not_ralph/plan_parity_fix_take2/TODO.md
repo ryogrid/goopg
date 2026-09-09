@@ -1296,3 +1296,34 @@ anything attempted so far.
   directly, all foreground. Servers :5543/:5544 left running.
 - 2026-09-08 R0 started: K1/K2 verified against tree + oracle; tooling
   confirmed. Branch `plan-parity-with-pg-take2`.
+
+## R29 — binder-aware escaping-outer-reference guard (done)
+
+`r29-escape-guard-binders/`. Eligibility axis. `lateral` seam declines
+1 -> 0 (TPC-DS total 9 -> 8); TPC-H values byte-identical; SF0.5 sweep
+all-zero; parity scan-type 70 -> 71 (Q68 only, see K33).
+
+- **K32 (oracle-established, corrects K27).** `LATERAL` governs the
+  visibility of SIBLING FROM items only. An enclosing QUERY LEVEL is
+  visible from a CTE body and from a non-lateral derived table by
+  ordinary correlation — verified against PG 18.3 on :65438:
+  `SELECT 1 FROM store s WHERE EXISTS (WITH c AS (SELECT s.s_store_sk) SELECT 1 FROM c)`
+  is ACCEPTED, while `WITH c AS (SELECT s.s_store_sk) SELECT 1 FROM store s, c`
+  is REJECTED ("missing FROM-clause entry for table s").
+  Consequence: K27's `*CTEScan -> return false` was unsound (correct on
+  TPC-DS only because those CTEs are top-level) and is now deleted.
+  **No "this node kind is a scope boundary" shortcut is sound.** Bind
+  by binder, not by node kind.
+- **K33 (new, costing).** TPC-DS Q68 `customer`: goopg prices a
+  `Bitmap Heap Scan` below an `Index Scan using customer_pkey`; PG
+  takes the index. Isolated by R29 — the decline had been hiding it.
+  First clean bitmap-vs-index costing divergence in this workstream.
+- **Method note.** Decline censuses are only comparable at equal
+  timeouts: the "9" of R26-R28 was a 60 s reading. Re-measure BOTH
+  sides of any decline A/B in one protocol.
+- **Method note.** A fail-closed fallback in a partially-enumerated
+  walker can make things WORSE, silently: R29's first cut enumerated
+  six node kinds, missed `*Aggregate` (the shape of every TPC-DS CTE
+  body), and drove `lateral` declines 1 -> 4. Prefer a generic walk
+  over a hand-enumerated one whenever a sibling walker already owns
+  the inventory.

@@ -271,7 +271,11 @@ var exprSwitchInventory = map[string]walkerRole{
 	// descent, deliberate default=false (keep Filter). Same shape as
 	// selectivity.go:isConstExpr.
 	"planner.go:isPlainConstantBound":            nonRecursiveClassifier,
-	"planner.go:planHasEscapingOuterRef":         walkerPending, // 6 of 32 arms
+	// R29 renamed this switch: planHasEscapingOuterRef became a STRUCTURAL
+	// plan walk (it counts lateral binders), and its per-expression arms moved
+	// out to outerRefEscapes, which the structural walk and the flat fallback
+	// now share. Same 6 arms, same defect class, new key.
+	"planner.go:outerRefEscapes":                walkerPending, // 6 of 32 arms
 	// Renamed by review/260831-2 X-8: the hand-written switch moved into
 	// planIndexScanFromWhereShape; planIndexScanFromWhere is now the thin
 	// wrapper that applies the enable_indexscan/indexonlyscan toggles.

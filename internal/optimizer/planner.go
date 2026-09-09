@@ -1,6 +1,7 @@
 package optimizer
 
 import (
+	"reflect"
 	"fmt"
 	"strconv"
 	"strings"
@@ -14503,63 +14504,231 @@ func planHasOuterRef(node Node) bool {
 // parent scope at the current nesting point (1 at the top call,
 // incrementing by one for each subquery level recursed into — the
 // same convention joinlayout.go's remapOuterRefsInSubplan already uses).
+// planHasEscapingOuterRef reports whether `node`'s subtree demands an
+// outer value that nothing INSIDE the subtree supplies — i.e. a genuinely
+// escaping reference — walking the plan STRUCTURALLY so that a binder
+// standing between a reference and this scope is actually seen.
+//
+// R29. The binder-blind predecessor (now `planHasEscapingOuterRefFlat`)
+// flattened the subtree with `walkPlanExprs` and reported ANY
+// `OuterColumnRef` at `depth` or beyond. That over-reports whenever the
+// subtree contains its own `Join{Lateral:true}`: the join pushes the left
+// row onto `ctx.OuterRows` before re-evaluating its right side, so a
+// level-`depth` reference on that right side is bound BY IT and never
+// reaches this scope. R25 slice 1 made that shape common — a decomposed
+// NLI probe carries `OuterColumnRef` keys (`outerParamKey`, level 1)
+// under exactly such a join — so the guard began reporting bound probe
+// keys as escaping. `chainCarriesLateral` then declined the enclosing
+// join search, which fell to the legacy planner: measured as
+// `seam-decline reason=lateral` on TPC-DS Q30 (a CROSS PRODUCT where PG
+// index-scans both inner sides, 3 s -> >300 s) and Q68.
+//
+// Q30 was first patched by returning false for a `*CTEScan` outright, on
+// the reasoning that a `WITH` body cannot reference the enclosing query.
+// The PG 18.3 oracle refutes that reasoning: `LATERAL` governs visibility
+// of SIBLING FROM items only, and an enclosing QUERY LEVEL is visible
+// from a CTE body (and from a non-lateral derived table) by ordinary
+// correlation --
+//
+//	SELECT 1 FROM store s WHERE EXISTS (            -- accepted by PG
+//	  WITH c AS (SELECT s.s_store_sk AS k) SELECT 1 FROM c)
+//	WITH c AS (SELECT s.s_store_sk AS k)            -- rejected by PG:
+//	SELECT 1 FROM store s, c                        -- "missing FROM-clause
+//	                                                --  entry for table s"
+//
+// so that early-return could hide a real escaping reference. Counting
+// binders subsumes it: the CTE body's probe keys are bound by the lateral
+// join inside the body, and a reference that truly reaches out still
+// escapes. The special case is therefore gone, not merely supplemented.
+//
+// `depth` keeps its meaning — the Level value that refers to this scope's
+// immediate parent — and grows by one whenever the walk descends through
+// something that BINDS that level.
+//
+// Node kinds not enumerated here fall through to the flat fallback, so an
+// unrecognised node declines exactly as it did before this change; the
+// change can only ever REMOVE false declines, never add one.
 func planHasEscapingOuterRef(node Node, depth int) bool {
-	// A `*CTEScan`'s body is a SELF-CONTAINED plan: a plain `WITH` body is
-	// planned in its own scope and SQL gives it no way to reference the
-	// enclosing query's columns (goopg has no LATERAL CTE). So an
-	// `OuterColumnRef` inside it is bound INSIDE it — by the body's own
-	// lateral/parameterized join — and cannot escape to this scope.
-	//
-	// Walking into it anyway is a live defect, not a hypothetical: R25 slice 1
-	// gives a decomposed NLI probe `OuterColumnRef` keys, so a CTE body
-	// containing one made `nodeReferencesOuter` true for the CTEScan LEAF,
-	// which made `chainCarriesLateral` true, which made the seam decline the
-	// whole enclosing join. Measured on TPC-DS Q30: base searched
-	// {ctr1, customer_address, customer}; slice 1 declined it
-	// (`seam-decline reason=lateral`) and the legacy path produced a
-	// CROSS PRODUCT where PG index-scans both inner sides — 3 s -> >300 s.
-	//
-	// `walkPlanExprs` flattens the subtree, so depth increments only for
-	// subquery-bearing EXPRESSIONS and never for a lateral join's right side;
-	// this stops the one boundary that provably closes the scope.
-	if cte, ok := node.(*CTEScan); ok {
-		_ = cte
+	if node == nil {
 		return false
 	}
+	// The BINDERS are the only node kinds named explicitly: they are the
+	// only ones whose children are not all evaluated in this same scope.
+	switch n := node.(type) {
+	case *Join:
+		// A lateral join binds level `depth` for its right side only: the
+		// executor pushes the LEFT row (`openLateral`), so the left side is
+		// evaluated in this scope, unbound.
+		right := depth
+		if n.Lateral {
+			right++
+		}
+		return planHasEscapingOuterRef(n.Left, depth) ||
+			planHasEscapingOuterRef(n.Right, right) ||
+			exprsHaveEscapingOuterRef(depth, n.Predicate, n.LeftKey, n.RightKey)
+	case *NestedLoopIndexJoin:
+		// The fused NLI is a binder by construction: it binds its inner
+		// probe's keys from the outer row (R25 decomposes it into the
+		// `Join{Lateral}` arm above; until then both spellings must agree).
+		return planHasEscapingOuterRef(n.Outer, depth) ||
+			planHasEscapingOuterRef(n.Inner, depth+1) ||
+			exprsHaveEscapingOuterRef(depth, n.Predicate)
+	}
+	// Everything else is a pass-through for scoping purposes: its children
+	// are evaluated in this scope, so they are walked at `depth` unchanged.
+	// Children are discovered by REFLECTION rather than by an 18-arm switch
+	// over the single-child containers (Aggregate, Sort, Limit, Distinct,
+	// CTEScan, ...). A hand-written switch here would have to be kept in
+	// step with `walkPlanExprs`, and the first version of this function got
+	// exactly that wrong: it enumerated six kinds and fell through to the
+	// flat fallback for `*Aggregate`, which is precisely the shape of every
+	// TPC-DS CTE body -- so the fallback flattened past the binder inside
+	// the body and re-reported bound probe keys as escaping (measured: the
+	// TPC-DS `lateral` decline count went 1 -> 4).
+	kids, ok := planChildNodes(node)
+	if !ok {
+		return planHasEscapingOuterRefFlat(node, depth)
+	}
+	for _, k := range kids {
+		if planHasEscapingOuterRef(k, depth) {
+			return true
+		}
+	}
+	return nodeOwnExprsHaveEscapingOuterRef(node, depth)
+}
+
+// emptyPlanStub stands in for a child link while a node's OWN expressions
+// are being walked. A nil child would make `walkPlanExprs` (or an
+// `Output()` call underneath it) dereference nothing; an empty `Values`
+// carries no expressions of its own and a nil schema, so it contributes
+// nothing to the walk.
+var emptyPlanStub Node = &Values{}
+
+// planChildNodes returns the plan children reachable from `node` through
+// its exported `Node` and `[]Node` fields. ok is false when `node` is not
+// a pointer to a struct, in which case the caller keeps the conservative
+// flat behaviour rather than guessing.
+func planChildNodes(node Node) ([]Node, bool) {
+	v := reflect.ValueOf(node)
+	if v.Kind() != reflect.Ptr || v.IsNil() || v.Elem().Kind() != reflect.Struct {
+		return nil, false
+	}
+	e := v.Elem()
+	var kids []Node
+	for i := 0; i < e.NumField(); i++ {
+		f := e.Field(i)
+		if !f.CanInterface() { // unexported: planner bookkeeping, not plan structure
+			continue
+		}
+		switch f.Type() {
+		case nodeIfaceType:
+			if !f.IsNil() {
+				kids = append(kids, f.Interface().(Node))
+			}
+		case nodeSliceType:
+			for j := 0; j < f.Len(); j++ {
+				if el := f.Index(j); !el.IsNil() {
+					kids = append(kids, el.Interface().(Node))
+				}
+			}
+		}
+	}
+	return kids, true
+}
+
+var (
+	nodeIfaceType = reflect.TypeOf((*Node)(nil)).Elem()
+	nodeSliceType = reflect.TypeOf([]Node(nil))
+)
+
+// nodeOwnExprsHaveEscapingOuterRef judges the expressions `node` carries
+// itself, excluding its children's. It does that by flat-walking a shallow
+// COPY whose child links are stubbed out, so the expression inventory comes
+// from `walkPlanExprs` -- the same switch every other reader uses -- instead
+// of a second hand-written list that could drift from it.
+func nodeOwnExprsHaveEscapingOuterRef(node Node, depth int) bool {
+	v := reflect.ValueOf(node)
+	cp := reflect.New(v.Elem().Type())
+	cp.Elem().Set(v.Elem())
+	e := cp.Elem()
+	for i := 0; i < e.NumField(); i++ {
+		f := e.Field(i)
+		if !f.CanSet() {
+			continue
+		}
+		switch f.Type() {
+		case nodeIfaceType:
+			if !f.IsNil() {
+				f.Set(reflect.ValueOf(emptyPlanStub))
+			}
+		case nodeSliceType:
+			f.Set(reflect.Zero(f.Type()))
+		}
+	}
+	stub, ok := cp.Interface().(Node)
+	if !ok {
+		return planHasEscapingOuterRefFlat(node, depth)
+	}
+	return planHasEscapingOuterRefFlat(stub, depth)
+}
+
+// exprsHaveEscapingOuterRef is the expression half of the structural walk:
+// the references a node carries in its OWN expressions, which are evaluated
+// in that node's scope and so are judged at `depth` directly.
+func exprsHaveEscapingOuterRef(depth int, exprs ...Expr) bool {
+	found := false
+	for _, e := range exprs {
+		if e == nil || found {
+			continue
+		}
+		walkExprTree(e, func(inner Expr) {
+			if found {
+				return
+			}
+			if outerRefEscapes(inner, depth) {
+				found = true
+			}
+		})
+	}
+	return found
+}
+
+// outerRefEscapes judges ONE expression node, and is the single place the
+// level rule and the sublink recursion live so the structural walk and the
+// flat fallback cannot drift apart (the sibling-paths hazard).
+func outerRefEscapes(inner Expr, depth int) bool {
+	switch x := inner.(type) {
+	case *OuterColumnRef:
+		return x.Level >= depth
+	case *SubqueryExpr:
+		return x.Plan != nil && planHasEscapingOuterRef(x.Plan, depth+1)
+	case *ArraySubqueryExpr:
+		return x.Plan != nil && planHasEscapingOuterRef(x.Plan, depth+1)
+	case *MultiAssignSubqRow:
+		return x.Plan != nil && planHasEscapingOuterRef(x.Plan, depth+1)
+	case *InExpr:
+		return x.Plan != nil && planHasEscapingOuterRef(x.Plan, depth+1)
+	case *ExistsExpr:
+		return x.Plan != nil && planHasEscapingOuterRef(x.Plan, depth+1)
+	}
+	return false
+}
+
+// planHasEscapingOuterRefFlat is the conservative, binder-BLIND fallback:
+// it flattens the whole subtree and reports any `OuterColumnRef` at
+// `depth` or beyond, regardless of whether something inside the subtree
+// binds it. It is what every node kind `planHasEscapingOuterRef` does
+// not enumerate still gets, so an unknown node declines exactly as it
+// did before R29 (fail-closed).
+func planHasEscapingOuterRefFlat(node Node, depth int) bool {
 	found := false
 	walkPlanExprs(node, func(e Expr) {
 		if found {
 			return
 		}
 		walkExprTree(e, func(inner Expr) {
-			if found {
-				return
-			}
-			switch x := inner.(type) {
-			case *OuterColumnRef:
-				if x.Level >= depth {
-					found = true
-				}
-			case *SubqueryExpr:
-				if x.Plan != nil && planHasEscapingOuterRef(x.Plan, depth+1) {
-					found = true
-				}
-			case *ArraySubqueryExpr:
-				if x.Plan != nil && planHasEscapingOuterRef(x.Plan, depth+1) {
-					found = true
-				}
-			case *MultiAssignSubqRow:
-				if x.Plan != nil && planHasEscapingOuterRef(x.Plan, depth+1) {
-					found = true
-				}
-			case *InExpr:
-				if x.Plan != nil && planHasEscapingOuterRef(x.Plan, depth+1) {
-					found = true
-				}
-			case *ExistsExpr:
-				if x.Plan != nil && planHasEscapingOuterRef(x.Plan, depth+1) {
-					found = true
-				}
+			if !found && outerRefEscapes(inner, depth) {
+				found = true
 			}
 		})
 	})
