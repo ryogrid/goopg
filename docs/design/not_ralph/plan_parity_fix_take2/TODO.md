@@ -1552,3 +1552,42 @@ to `TypedStringLit` (parse_coerce.c:232-250) instead of a runtime
   a TWO-relation join, so zero enumeration complexity — before
   proposing any fix. Do not read the rendered number and assume the
   search saw it.
+
+## R36 — baserel selectivity gate (DESIGN APPROVED, IMPLEMENTATION NOT LANDED)
+
+`r36-baserel-selectivity-reliable-gate/` (`DESIGN.md` reviewed
+APPROVE-WITH-NOTES; `STATUS.md` records where it stopped). Tree is green
+at HEAD — the implementation was reverted, not shipped.
+
+- **K52 ANSWERED: the join SEARCH shares the cardinality defect.**
+  `GOOPG_JRS_TRACE` on `calcJoinrelSize` for TPC-H `orders ⋈ lineitem
+  WHERE l_shipdate < l_commitdate`: `inner.Rows=6001255` (RAW), never
+  the restricted 2000418. So join ORDER is chosen against a 3x-wrong
+  cardinality. Source-reading suggested the opposite; only
+  instrumenting the consumed value found it.
+- **K53 — the naive fix is a 22x error.** Do NOT just delete
+  `if !sel.reliable { return baseRows }`. `sel.value` already carries
+  PG's DEFAULT_* constants; the defect is the AND COMPOSITION. The
+  `…WithSource` twin multiplies conjuncts pairwise
+  (selectivity.go:838-847); the plain `clauseSelectivity` twin routes
+  AND through `conjunctionSelectivity`, which ports PG's punt rule
+  (either bound at DEFAULT_INEQ_SEL -> DEFAULT_RANGE_INEQ_SEL,
+  rangequery.go:185-192 / clausesel.c:283-286). On `x>=a AND x<b`
+  without a histogram: naive = 1/3 x 1/3 = 0.111 vs PG 0.005.
+  **Consume `clauseSelectivity`.** That also makes the search agree
+  with the scan-level estimator, which already uses it.
+- **K54 — the blocker, and a likely harness bug worth its own look.**
+  Three executor tests fail under the fix
+  (`TestC19fPathModelGatherExecutesAsAParallelHashJoin`,
+  `TestC19fGatheredHashBuildRunsOnceAndIsShared`,
+  `TestSetOpJoinPromotesToHashJoin`). They pin MECHANISMS and must not
+  be re-tuned. Diagnostics were inconclusive: after inserting 4000 rows
+  the plan still showed `Seq Scan on sj_ws rows=1` with NO filter — the
+  inserted data never reaches `baseRows` in that harness. Find out why
+  (suspect in-memory catalog `RowCount` not refreshed by INSERT) BEFORE
+  judging those three tests.
+- **Three tests correctly re-derived already** (work is reproducible
+  from STATUS.md): two pinned the bug outright; the third
+  (`…PlacementIdenticalWhenStatsAbsent`) encoded an equivalence that
+  held only because of the gate, and `relsize.go:169-177`'s comment
+  becomes false with it — a cold-server behaviour change, matching PG.
