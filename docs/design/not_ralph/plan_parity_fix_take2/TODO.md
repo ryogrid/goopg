@@ -2005,3 +2005,53 @@ units green.
   cannot place `date_dim` below the anti pair the way PG's 3-leaf search
   can. Eligibility is necessary, not sufficient — same relationship R27
   §4a recorded for Q49.
+
+
+### R41 implementation: BUILT, MEASURED, then REVERTED — and why (K76)
+
+The design's 4-step fix was implemented in full (`antiCollapsedJoins` in
+`collapse.go` consumed by `deconstructFromItemScoped` / `fromItemRels` /
+`newSjiScope`, plus the `prefix-exceeds-bindings` fail-closed guard) and
+it WORKS on its own terms:
+
+- **`leaf-count` declines 3 -> 0; TPC-DS declines 8 -> 5**, no new class.
+- optimizer + executor suites green; **sweep PASS=95 MISMATCH=0
+  CKMISMATCH=0 ERROR=0 TIMEOUT=0**, Q78 checksum unchanged; TPC-H values
+  byte-identical AND plan structure identical across all 22.
+- Design §6's prediction CONFIRMED against the oracle: PG places
+  `date_dim` BELOW the anti join (`Nested Loop Anti Join` over
+  `Parallel Hash Join`); goopg's 2-leaf search can only build
+  `(sales anti returns) JOIN date_dim`. Eligibility gained, match not.
+
+**It was reverted anyway, because admitting the body to the search LOSES
+a qual placement PG has.** Q78's three `date_dim` scans went from
+`rows=149  Filter: (d_year = 1998)` to `rows=73049` with no filter, and
+runtime 14s -> 26s. That is a **qual-placement PARITY regression**, not
+merely a timing one, so the goal's "ignore execution-time degradation"
+clause does not cover it (it applies only when the plan IS PG-identical,
+and this one is not).
+
+- **K76 — root cause, instrumented (traces reverted).**
+  `pushQualsThroughSingleRefCTEs` runs from `Plan()`'s TAIL
+  (`planner.go:159`) on the FINAL tree, so it must descend whatever the
+  body was planned into. Probes: the conjunct maps through every
+  `*Project`/`*Aggregate` layer fine (`project remap ok=true`), then dies
+  in the join descent — `CTEPUSH join type=0 pushable=true
+  L=*optimizer.Join R=*optimizer.Project`. **The searched boundary wraps
+  the scan in a `*Project`, and `pushConjunctIntoSubtreeTraced`
+  (`inner_join_qual_pushdown.go:388`) has no `*Project` arm**, so the
+  descent stops. `joinRestrictionSides` refusing ANTI is NOT the cause —
+  no `pushable=false` was ever traced.
+  This is NOT anti-specific: any CTE body the search admits hits it. It
+  was simply unreachable while these bodies all declined.
+- **Next round is therefore K76, not K72**: give
+  `pushConjunctIntoSubtree` a `*Project` arm (mirroring the one
+  `pushConjunctIntoCTEBody` already has, via
+  `remapConjunctThroughProjection`). It is a shared pass, so it will
+  enable pushdowns in many other searched trees at once — real blast
+  radius, its own round and its own gates. **Land K76 FIRST, then R41's
+  implementation on top**; in that order the eligibility gain arrives
+  without the parity regression.
+- The R41 implementation is fully specified by `DESIGN.md` §4 and was
+  verified to build, pass every suite and pass the sweep, so redoing it
+  is mechanical.
