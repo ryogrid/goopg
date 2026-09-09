@@ -1747,3 +1747,39 @@ multiplies unconditionally via `clauseSelectivity` (NOT the
   inferred from rendered numbers / totals rather than instrumented
   terms, and both were wrong. **Instrument the term, never infer it
   from the sum.**
+
+## R38 — reltarget width (REJECTED on review, then refuted by measurement; NOT implemented)
+
+`r38-reltarget-width/DESIGN.md` + `STATUS.md`. Tree green; no code change.
+
+- **K66 — the design targeted the wrong field.** `pathNCols` /
+  `pathAvgVarBytes` (`path.go:634-658`) read `NCols`/`AvgVarBytes`,
+  never `Width`. The spill term is a function of COLUMN COUNT:
+  `EntryBytes = 48*ncols + 24 + avgVarBytes`
+  (`hashsize/hashsize.go:144-152`). 641 MB = `1.5M x (48x9 + 24)` from
+  `orders`' 9 COLUMNS, not from `width=448`. EXPLAIN's `width=` is
+  `TupleWidth(n.Output())` — a symptom, not the input. Correct target:
+  `RelOptInfo.NCols` + `AvgVarBytes`.
+- **K67 — and even then it would NOT fix Q12.** Narrowed to the single
+  needed column, goopg is 72 B/row -> 103 MB for 1.5M `orders` rows,
+  which STILL spills at `work_mem=64MB`; PG is 22 B/row -> 31 MB and
+  fits. Column pruning is a real 6.3x win (456 -> 72) and remains 3.3x
+  above PG. The residue is `DatumBytes=48` per column vs PG's ~22-byte
+  whole MinimalTuple — the existing
+  `docs/design/not_ralph/minimize_datum/` workstream. **K65 is
+  NECESSARY BUT NOT SUFFICIENT; it is blocked on that.**
+- Review findings kept: executor sizes from the RUNTIME schema
+  (`operators_join_agg.go:607-609`), so narrowing planner width cannot
+  under-size the real table (hazard refuted); nothing derives a schema
+  from `RelOptInfo.Width`, but `considerparallel.go:567` feeds it to
+  `estScanPages` as a PAGE count, which PG never does; the node-free
+  keep-set is `neededKeepSet` (`narrowoutput.go:789-806`), since
+  `joinKeepSet`/`buildKeepSet` need a built node; correct placement is
+  between `relfromjoinlist.go:699` and `:707` with the base path
+  re-costed; do NOT mutate `RelOptInfo.AvgVarBytes`/`ColVarBytes` —
+  `entrywidth.go:53-56` uses them as the executor's over-charge
+  fail-safe. PG order confirmed: `set_rel_size` (allpaths.c:322)
+  completes before `set_rel_pathlist` (:351).
+- **Why not implemented:** the design's own prediction ("the spill term
+  disappears") is now known false. Landing it alone would churn shapes
+  on both corpora while leaving the target query unmoved.

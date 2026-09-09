@@ -232,3 +232,33 @@ trace channels answered each in one run.
 **live** PG references at pinned GUCs, with both values gates all-zero —
 and with each round's category movement recorded so the path is
 auditable rather than asserted.
+
+## What the parity verdict is BLIND to (verified from the tool's source)
+
+`scripts/pg-plan-parity-diff.py:113` parses
+`(cost=..  rows=..  width=..)` with a single regex and N1 moves **all
+three** into a side column before comparison. N5 strips `::type`
+renderings; N6 compares Filter / Index Cond / Hash Cond by (referenced
+columns, operator multiset) and NOT by literal values.
+
+So a change to an estimate, a cost, a WIDTH, a cast rendering or a
+literal registers **only insofar as it changes plan STRUCTURE**.
+
+Measured consequences, all from this workstream:
+
+| round | changed | shape-changed | category movement |
+|---|---|---|---|
+| R30 correlation | 99 plans | 6 | scan-type −1, join-method +2 |
+| R31b heap density | 96 plans | 10 | qual-placement −1 |
+| R34 cast folding | 18 plans | **0** | none |
+| R36 baserel selectivity | 44 plans | 24 | net −2 |
+
+R34 is the instructive one: it corrected a 580x cardinality error and
+measured exactly zero, because it changed no plan's structure.
+
+**Therefore:** run `methodology/shape-delta.sh OLD.norm NEW.norm` every
+round and report its counts ALONGSIDE the categories. A round with
+`shape-changed=0` moved no plan at all and its category zero is
+trivial; a round with shape changes and no category movement moved
+plans SIDEWAYS. Conflating the two produced a wrong conclusion once
+already (R35's withdrawn "the metric can never see an estimate change").
