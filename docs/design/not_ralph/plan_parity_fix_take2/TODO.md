@@ -2289,3 +2289,43 @@ keeping.
   `lineitem` scan does not apply the `l_shipdate` selectivity at all).
   N1 pushes estimates to a side column so the differ never sees it. Any
   report claiming Q14 as a match must say this.
+
+
+### R43 rev 3 — the flip MEASURED at HEAD; rev 2's sequencing claim REFUTED (K82)
+
+R43 rev 2 relied on R10's numbers, which are stale (R40/R41/R42 landed
+since). Re-measured at HEAD, TPC-H, `GOOPG_GATHER_PATHS=all` vs default:
+
+| category | off | on |
+|---|---|---|
+| join-method | 12 | **11** |
+| scan-type | 13 | **12** |
+| parallelism | 18 | **16** |
+| qual-placement | 7 | **6** |
+| aggregation-strategy | 10 | **11** |
+| **match** | **2** | **2** |
+
+Net **-4 / +1**. Worth landing on the category metric, but **no new
+match**, and R10's "parallelism 18 -> 15" is 18 -> 16 at HEAD.
+
+- **K82 — Q14 is BYTE-IDENTICAL under the flip.** Still `Hash Join` over
+  `Seq Scan on part`, still `SHAPE-DIFF [parallelism]`. Its `Gather`
+  already comes from the partial-aggregate path, not from this knob, so
+  the flip is ORTHOGONAL to Q14. **This refutes rev 2's central
+  sequencing claim** that the flip was the prerequisite: the two tracks
+  are INDEPENDENT, and `parallel_hash=true` (step 2) is the only thing
+  that can close Q14. Either may be done first.
+- **R13's scope re-measured at HEAD: 5 failing tests under the flip, not
+  R12's 7** (two fixed by intervening rounds).
+  `TestPartialPathIsNeverTheFinalPath` is a stage pin ("join rel 0x3 has
+  partial paths before C-19d"). The four REAL ones needing adjudication
+  AGAINST PG: `TestSplitEqualityForHashMultiKey/searched_enumerator`
+  ("fell back to Nested Loop"), `TestSlice3LiveQ9ShapeDerivation`
+  (different build sides narrowed on Q9),
+  `TestSlice3FilterColumnSurvivesNarrowing`, and
+  `TestOwnedBuildPoisonPrebuiltBoundary`.
+- **Method note:** R10's numbers were carried forward for several rounds
+  without re-measurement, exactly as the `match=1/22` figure was. Two
+  stale-number corrections in one session — **re-measure before relying
+  on any prior round's figures**, especially after intervening rounds
+  have landed.

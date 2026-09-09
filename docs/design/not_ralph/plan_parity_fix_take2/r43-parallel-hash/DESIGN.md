@@ -1,8 +1,9 @@
 # R43 — parallel-hash parity, re-scoped (K79/K80)
 
 *Round of `docs/design/not_ralph/plan_parity_fix_take2/TODO.md`.
-Status: DESIGN **rev 2** — adversarial review settled the gating question
-and RE-SEQUENCED the round. Rev 1's plan was mis-scoped; see §9.*
+Status: DESIGN **rev 3** — rev 2's review settled the gating question and
+re-sequenced; rev 3 adds the HEAD measurement (§7a) that REFUTES rev 2's
+sequencing claim. Rev 1's plan was mis-scoped; see §9.*
 
 ## 1. How this was found — a method change worth keeping
 
@@ -88,7 +89,11 @@ what it runs**, and correcting it is not relabelling.
    executor does it in parallel" must NOT be used as the labelling rule.
    The label must follow the PATH MODEL, not observed executor behaviour.
 
-## 5. RE-SEQUENCED: the real first step is the `GOOPG_GATHER_PATHS` flip
+## 5. The `GOOPG_GATHER_PATHS` flip — a separate, independently valuable win
+
+*(Rev 2 called this "the real first step". §7a's HEAD measurement shows it
+is independent of Q14, not a prerequisite for it. Kept because it is worth
+landing on its own merits.)*
 
 Rev 1's biggest error. **`Parallel Hash Join` needs no `parallel_hash=true`
 work at all.** `addPartialHashJoinPath` already sets `ParallelAware: true`
@@ -97,26 +102,25 @@ machinery sits behind a default-OFF knob: `gatherPathModeFromEnv`'s default
 arm returns `gatherPathsOff` (`gatherpaths.go:70,82`), and every partial
 path producer returns early at `joinpathsparallel.go:89`.
 
-R10 already measured the flip: under `GOOPG_GATHER_PATHS=all`,
-`Parallel Hash Join` goes **0 → 19 on TPC-H** and **0 → 132 on TPC-DS**
-(PG: 9 and 139), and TPC-H `parallelism` drops **18 → 15** — with *no*
-parallel-hash work whatsoever.
+R10 measured the flip as `Parallel Hash Join` **0 → 19 on TPC-H** and
+**0 → 132 on TPC-DS** (PG: 9 and 139) with TPC-H `parallelism` **18 → 15**
+— with *no* parallel-hash work whatsoever. Those numbers are stale;
+§7a re-measures at HEAD (`parallelism` 18 → 16, net −4/+1 categories).
 
-**The flip is not landed at HEAD, and R12 (adjudicate the 8 remaining
-failures R11 left, including an outer-join null-extension claim) is its
-hard prerequisite.** Rev 1 never mentioned this existed. As rev 1 was
+**The flip is not landed at HEAD, and R13 (adjudicate the failures R12
+left — 5 at HEAD, see §7b) is its hard prerequisite.** Rev 1 never mentioned this existed. As rev 1 was
 written, its step 2 would have landed code behind
 `if gatherPathsMode == gatherPathsOff { return }` — **inert at the
 shipping default and unmeasurable by the sweep it named as its binding
 gate.** Rev 1's §9 risk paragraph was therefore false at the default.
 
-## 6. Work, correctly ordered
+## 6. Work — two INDEPENDENT tracks (see §7a)
 
-1. **R12 + the flip** — adjudicate the 8 remaining failures, land
+1. **R13 + the flip** — adjudicate the remaining failures, land
    `GOOPG_GATHER_PATHS` on by default, regenerate
    `scripts/planner-flags.env`. Largest parity-per-risk ratio available;
    this is its own round.
-2. **Then** the residual Q14 gap, which is one node:
+2. **Independently**, the Q14 gap, which is one node:
    `Seq Scan on part` → `Parallel Seq Scan on part`. That is what
    `try_partial_hashjoin_path(parallel_hash = true)` buys —
    read `inner.PartialPathlist`, price it PG-faithfully, let
@@ -150,12 +154,66 @@ So the planner predicate must be a **pinned twin** of
 shape test, following the existing `drivingScan`/`probeSideIsLeft`
 twinning pattern, and pinned by a test the way `probeSideIsLeft` is.
 
+## 7a. MEASURED at HEAD (rev 3) — what the flip actually buys, and what it does not
+
+R43 rev 2 relied on R10's numbers. Those are stale (R40/R41/R42 have
+landed since). Re-measured at HEAD, TPC-H, `GOOPG_GATHER_PATHS=all` vs the
+shipping default:
+
+| category | flip off | flip on |
+|---|---|---|
+| join-method | 12 | **11** |
+| scan-type | 13 | **12** |
+| parallelism | 18 | **16** |
+| qual-placement | 7 | **6** |
+| aggregation-strategy | 10 | **11** |
+| join-order / parameterisation / sort-strategy / rendering | 18 / 6 / 13 / 7 | unchanged |
+| **match** | **2** | **2** |
+
+Net **−4 categories, +1**. Worth landing on the category metric — but it
+produces **no new match**, and R10's "parallelism 18 → 15" is 18 → 16 at
+HEAD.
+
+**The finding that changes §6's ordering: Q14 is BYTE-IDENTICAL under the
+flip.** Still `Hash Join` over `Seq Scan on part`, still
+`SHAPE-DIFF [parallelism]`. Its `Gather` already comes from the
+partial-aggregate path, not from this knob, so the flip is *orthogonal* to
+Q14. The flip changes other queries.
+
+Consequence: **step 2 (`parallel_hash=true`) is what Q14 needs, and it does
+not depend on step 1.** Rev 2 implied the flip would move Q14 toward the
+match; measurement says it does not. The two steps are independent:
+
+- step 1 (flip, needs R13) — a −4 category win across the corpus, no match;
+- step 2 (`parallel_hash=true`) — the only thing that can close Q14.
+
+Either may be done first. Step 2 is no longer blocked on step 1, which was
+rev 2's central sequencing claim.
+
+## 7b. R13's actual scope, re-measured at HEAD
+
+R12 left 7 failing tests under the flip; at HEAD **5 fail**, two having
+been fixed by intervening rounds:
+
+| test | kind |
+|---|---|
+| `TestPartialPathIsNeverTheFinalPath` | stage pin — *"join rel 0x3 has partial paths before C-19d"* |
+| `TestSplitEqualityForHashMultiKey/searched_enumerator` | **real** — *"fell back to Nested Loop"* |
+| `TestSlice3LiveQ9ShapeDerivation` | **real** — different build sides narrowed (Q9) |
+| `TestSlice3FilterColumnSurvivesNarrowing` | **real** — narrow-build/filter-column pin |
+| `TestOwnedBuildPoisonPrebuiltBoundary` | **real** — narrow-build boundary |
+
+The four "real" ones must be adjudicated **against PG**, not against the
+new output: the question is whether the shape the flip produces is the one
+PG produces. That is the goal's criterion and it is what R13 is for.
+
 ## 8. Prediction, recorded before implementing (METHODOLOGY §2)
 
-- The flip (step 1) should take TPC-H `parallelism` 18 → 15 and produce
-  `Parallel Hash Join` 0 → 19 / 0 → 132.
-- Step 2 should then make **Q14 goopg's first new MATCH this session
-  (3/22)**, since `parallelism` is its only differing category.
+- The flip (step 1) takes TPC-H `parallelism` 18 → 16 and is −4/+1 on
+  categories overall — MEASURED at HEAD (§7a), not predicted.
+- Step 2 should make **Q14 goopg's first new MATCH (3/22)**, since
+  `parallelism` is its only differing category. Step 2 does NOT depend on
+  step 1: Q14 is byte-identical under the flip.
 - **TPC-DS will NOT jump to 69 matches.** Those queries differ in several
   other categories; `Parallel Hash` is one. Expect a large drop in the
   `parallelism` count with few or no new matches — the same "necessary but
