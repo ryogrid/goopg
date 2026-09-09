@@ -1,7 +1,8 @@
 # R43 — parallel-hash parity, re-scoped (K79/K80)
 
 *Round of `docs/design/not_ralph/plan_parity_fix_take2/TODO.md`.
-Status: DESIGN **rev 3** — rev 2's review settled the gating question and
+Status: DESIGN **rev 4** — §4a NARROWS rev 2's TRUTHFUL verdict; step 2 may
+not be a labelling change. Previously: rev 3 — rev 2's review settled the gating question and
 re-sequenced; rev 3 adds the HEAD measurement (§7a) that REFUTES rev 2's
 sequencing claim. Rev 1's plan was mis-scoped; see §9.*
 
@@ -88,6 +89,51 @@ what it runs**, and correcting it is not relabelling.
    in *serial* queries too, where PG shows a plain `Hash`. So "the
    executor does it in parallel" must NOT be used as the labelling rule.
    The label must follow the PATH MODEL, not observed executor behaviour.
+
+## 4a. K79's TRUTHFUL verdict is NARROWER than rev 2 recorded (rev 4)
+
+Investigated while looking for the cheapest route to a third match, since
+after R44 **Q14 differs from PG on `parallelism` alone**. The conclusion
+changes what step 2 may do.
+
+Rev 2 concluded "TRUTHFUL" because goopg's cooperative build partitions the
+BUILD RELATION's scan across producer goroutines. That fact stands. But it
+does **not** license emitting PG's shape, because `Parallel Hash` asserts
+something more specific than "the build scan is parallel": it asserts a
+**partial inner path consumed by the Gather's own worker set**. goopg does
+not do that, and says so explicitly.
+
+`parallel_scan.go`'s `joinOp` arm:
+
+> *"P8. Only PROBE side partial: build side drained once by leader before
+> fan-out. Attaching allocator build side instead would give each worker
+> PARTITION build input, every worker's hash table missing most rows, join
+> would silently drop matches."*
+
+And `parallel.go`'s `stampParallelScan` mirrors it — a hash join is
+labelled through its PROBE side only, with a SIBLING WARNING that the label
+walk, the eligibility walk (`drivingScan`) and the executor walk
+(`attachParallelScan`) must never disagree.
+
+So the two mechanisms are genuinely different:
+
+| | who scans the build relation | when |
+|---|---|---|
+| PG `Parallel Hash` | the Gather's workers, cooperatively into shared DSM | during the join, behind a barrier |
+| goopg | the LEADER's producer goroutines | in `gatherOp.Open`, **before** fan-out |
+
+Both parallelise the build scan; only PG's is a partial path under the
+Gather. Stamping `Parallel Seq Scan on part` inside Q14's Gather subtree
+would therefore claim the Gather's workers each read a partition of `part`
+— which is exactly the arrangement the executor comment says "would
+silently drop matches" — so it is a **misdescription**, i.e. the
+"arbitrary" plan-forcing the goal forbids.
+
+**Consequence for step 2:** closing Q14's last category needs goopg to
+actually implement PG's execution model (workers building a shared hash
+from a partial inner), not to relabel the leader-prebuild model. That is a
+real executor feature, and it is the honest price of Q14's third match.
+Rev 2's §6 step 2 must not be implemented as a labelling change.
 
 ## 5. The `GOOPG_GATHER_PATHS` flip — a separate, independently valuable win
 

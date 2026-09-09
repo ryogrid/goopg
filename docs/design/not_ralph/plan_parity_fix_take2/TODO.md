@@ -2504,3 +2504,41 @@ unmoved (0/99, 2/22).
   the TPC-H corpus was restored from `tmp/take4/`.
   **Standing rule: a harness must fail loudly, and an A/B must prove which
   binary answered. Where it cannot, the result is not evidence.**
+
+
+### K92 — R43's TRUTHFUL verdict NARROWED; Q14's last category needs a real feature
+
+After R44, **Q14 differs from PG on `parallelism` alone** (Q1 is next at
+`[sort-strategy, parallelism]`), so it is the cheapest candidate third
+match. Investigating that route produced a correction to R43.
+
+R43 rev 2 concluded "TRUTHFUL" because goopg's cooperative build
+partitions the BUILD relation's scan. That fact stands, but it does NOT
+license emitting PG's shape. `Parallel Hash` asserts a **partial inner
+path consumed by the Gather's own worker set** — and goopg explicitly
+does not do that. `parallel_scan.go`'s `joinOp` arm:
+
+> "P8. Only PROBE side partial: build side drained once by leader before
+> fan-out. Attaching allocator build side instead would give each worker
+> PARTITION build input, every worker's hash table missing most rows,
+> join would silently drop matches."
+
+`parallel.go`'s `stampParallelScan` mirrors it (probe side only, with a
+SIBLING WARNING that label walk / `drivingScan` / `attachParallelScan`
+must never disagree).
+
+| | who scans the build relation | when |
+|---|---|---|
+| PG `Parallel Hash` | the Gather's workers, into shared DSM | during the join, behind a barrier |
+| goopg | the LEADER's producer goroutines | in `gatherOp.Open`, BEFORE fan-out |
+
+Both parallelise the build scan; only PG's is a partial path under the
+Gather. **Stamping `Parallel Seq Scan on part` inside Q14's Gather subtree
+would claim the Gather's workers each read a partition of `part` — the
+exact arrangement the executor says "would silently drop matches". That is
+a misdescription, i.e. the arbitrary plan-forcing the goal forbids.**
+
+**So Q14's third match is NOT cheap.** It requires implementing PG's
+execution model (workers building a shared hash from a partial inner), not
+relabelling the leader-prebuild model. R43 §6 step 2 must not be
+implemented as a labelling change; DESIGN rev 4 §4a records this.
