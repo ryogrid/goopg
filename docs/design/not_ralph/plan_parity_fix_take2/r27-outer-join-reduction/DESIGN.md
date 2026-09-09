@@ -70,6 +70,42 @@ allowed to touch. That is deliberate: the strictness analysis is the
 part with the least evidence behind it, so this round does not also
 rewrite it.
 
+## 4a. REVISION — the flip is contractual, so it cannot be suppressed
+
+The §4 plan ("run the analysis on a copy, write back only join-type
+verdicts") was implemented and **fails 8 tests**, including five that
+pin the flip as observable behaviour:
+
+```
+TestReduceOuterJoinsRightToLeftFlipFirstPosition
+TestReduceOuterJoinsRightFlipThenAnti
+TestReduceOuterJoinsRightDemotion / RightNoDemotion / FullDemotionOneSide
+```
+
+So the `Base<->Right` swap reaching `s.FromExprs` is **intended and
+pinned** — the jointree deconstruction consumes it, and suppressing it
+changes what the deconstruction sees. §4 was wrong to treat it as an
+internal detail of the analysis.
+
+**Revised change.** Do not replace `reduceOuterJoins`; SUPPLEMENT it:
+
+1. **Early**, before the node-building loop: run the demotion analysis
+   on a COPY of `s.FromExprs` and collect the per-join verdicts. Nothing
+   is mutated.
+2. Build the node tree with those verdicts applied to the join TYPES
+   only — so the plan gets LEFT->INNER without ever seeing the flip.
+3. **Late**, unchanged: `reduceOuterJoins(s.FromExprs, …)` exactly as
+   today, so the deconstruction and all five pinned tests are untouched.
+
+The two consumers then agree on join TYPE (which is all the
+`outerLinksHaveSJInfos` guard compares) while each keeps the
+representation it needs — the deconstruction its flipped-and-demoted
+jointree, the plan its original column order.
+
+Cost of the revision: step 2 threads the verdicts into `planFromItem`,
+which §4 avoided. That is the price of not disturbing a contract five
+tests hold.
+
 ## 5. Gates
 
 - The six tests §2 names are the primary gate, `TestRightJoinSpineKeepsNullExtendedRows`

@@ -913,6 +913,16 @@ anything attempted so far.
 
 ## Log
 
+- 2026-09-09 (CC) **R27 design REVISED (§4a) by implementation.** The
+  "analysis on a copy, write back verdicts" plan replaces
+  `reduceOuterJoins` and fails 8 tests — five of which PIN the S9.4
+  flip as observable (`...RightToLeftFlipFirstPosition`,
+  `...RightFlipThenAnti`, ...). So the `Base<->Right` swap reaching
+  `s.FromExprs` is CONTRACTUAL for the deconstruction, not an internal
+  detail. Revised: SUPPLEMENT rather than replace — collect verdicts
+  early from a COPY, apply join-TYPE only to the node tree, leave the
+  late `reduceOuterJoins` call exactly as-is. Price: threading verdicts
+  into `planFromItem`.
 - 2026-09-09 (CC) **R27 design** (`r27-outer-join-reduction/DESIGN.md`)
   completes K28's audit. `applyDemotion` does TWO jobs in one mutation:
   (A) join-type demotion — safe and wanted for the plan; (B) the S9.4
