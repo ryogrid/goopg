@@ -2329,3 +2329,77 @@ match**, and R10's "parallelism 18 -> 15" is 18 -> 16 at HEAD.
   stale-number corrections in one session — **re-measure before relying
   on any prior round's figures**, especially after intervening rounds
   have landed.
+
+
+## R44 — `date + interval` never folds, so its selectivity is 1.0 (K83-K87, DESIGN rev 2)
+
+`r44-const-fold-before-selectivity/DESIGN.md`. **First round aimed at
+ESTIMATE parity rather than shape parity**, after five rounds closed shape
+categories without moving the match count and every blocker kept
+terminating in estimate-side work.
+
+- **K83 — measured, 11.9x estimate error from one missing fold.** On the
+  live TPC-H cluster:
+  `l_shipdate >= DATE '1995-09-01' AND l_shipdate < DATE '1995-10-01'`
+  gives `rows=78,680`; the same restriction written
+  `... < DATE '1995-09-01' + INTERVAL '1 month'` gives **rows=938,645** —
+  exactly the parallel-divided full table, i.e. **selectivity 1.0, the
+  conjunct contributes nothing**. PG folds it in `preprocess_expression`
+  -> `eval_const_expressions` and renders
+  `'1995-10-01 00:00:00'::timestamp`. `date_pl_interval` is
+  `provolatile='i'` — verified on the live oracle.
+- **Scale: 7 occurrences across Q4 Q5 Q6 Q10 Q12 Q14 Q20; PG has ZERO.**
+  Measured estimates: Q4 385,423 vs 14,974; Q12 1,500,000 vs 7,006;
+  Q14 938,645 vs 18,444; **Q6 2,412 vs 28,092 (UNDER-estimates)**.
+- **K84 — `tryFoldBinaryOp` DOES fold arithmetic.** My first design said
+  it handled only OpAnd/OpOr; **refuted on review**. Arithmetic, concat
+  and comparison all fold via `toLiteralValue` -> `evalLiteralBinary` ->
+  `evalArith`; the AND/OR arms are the short-circuit cases. The real gap
+  is a **type-domain** gap: `toLiteralValue` accepts Integer/String/
+  Numeric/Boolean consts but NOT `*TypedStringLit` / `*IntervalLit`,
+  which is what `DATE '...'` / `INTERVAL '...'` resolve to.
+- **K85 — the round is TWO independently measurable steps, not one.**
+  Because arithmetic folding already works, **moving the fold earlier
+  changes estimates on its own**, with or without the temporal arm. Q6's
+  `l_discount BETWEEN 0.05 - 0.01 AND 0.05 + 0.01` fails `isConstExpr`
+  today and falls to `defaultIneqSelectivity`. So: step A = move the fold
+  before the estimator; step B = add the temporal domain. Landing them
+  together makes movement unattributable.
+- **K86 — the fold must run on the RESOLVED `Expr` at `resolveExpr`, not
+  beside `canonicalizeQual`.** The latter is **WHERE-only**: ON-clause
+  join quals reach the estimator via `planJoinPredicate` -> `chainOnQual`
+  -> `joinsearchseam.go` and bypass it. `resolveExpr` is the single choke
+  point every qual passes (WHERE/ON/HAVING/USING), estimator entry points
+  are all typed on resolved `Expr`, and it builds a FRESH tree so the
+  deparsers' parse tree is untouched by construction. R34's
+  `TypedStringLit` coercion in `resolveExpr`'s `CastExpr` arm is the
+  shipped precedent.
+- **K87 — three pieces the design assumed existed and do NOT:**
+  1. **No volatility route.** `IsStrictProc`'s generated map has no
+     volatility index; no `IsImmutableProc`. `BuiltinProc.Volatile` covers
+     3 pg_dump fixture entries only. `initdb/pg_proc_seed_data.go` HAS
+     `Volatile:` but optimizer **cannot import initdb** (initdb ->
+     executor -> optimizer cycle). Must generate `pgProcVolatileByOID`
+     from `pg_proc.dat` (absent ⇒ `'i'` per `BKI_DEFAULT(i)`).
+  2. **No optimizer-side temporal evaluator, and the executor's is
+     un-importable** (executor imports optimizer in ~91 files). Must host
+     month/day/micro arithmetic in a LEAF package both can import, or
+     duplicate and pin — silent duplication is the known sibling-paths
+     failure mode.
+  3. **The folded literal's SPELLING is an unresolved trade-off that gates
+     the predicted number.** `date + interval` types as `timestamp`, but
+     `numericValue`'s `"date"` arm accepts ONLY `"2006-01-02"`; a
+     timestamp spelling fails to parse so `bucketFraction` returns a flat
+     **0.5** — the estimate lands within half a bucket, not on target
+     (bucket SELECTION still works, ISO-8601 sorts lexically). Either fold
+     to timestamp AND widen the date arm (PG text parity), or fold to a
+     date-spelled literal (histogram parity, diverges from PG's text).
+- **K88 — folding CAN change ANSWERS; my "estimates only" claim was
+  wrong.** `evalArith`'s numeric path is float64-based, so `0.05 + 0.01`
+  folds to `0.060000000000000005`, not `0.06`. Q6 survives only because
+  that perturbation LOOSENS an upper bound; a fold that tightened one
+  would drop rows. PG uses exact `numeric` — file as its own defect.
+- **Q6 is a NAMED GATE ITEM, not left to the sweep.** It is one of only
+  two matches goopg has and it is in the blast radius of BOTH steps
+  independently (a `date + interval` site AND `0.05 +/- 0.01` constant
+  arithmetic).
