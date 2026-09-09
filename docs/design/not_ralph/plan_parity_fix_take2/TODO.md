@@ -2685,3 +2685,38 @@ not.**
   `AggModeFinal`. A multi-round EXECUTOR programme, comparable to or
   larger than K92's Parallel Hash. Only after it can Q1's shape be PRICED
   rather than rendered.
+
+## R46 — cost the legacy funnel's index-vs-seq choice (design approved, implementing)
+
+`r46-legacy-index-seq-competition/DESIGN.md` (reviewed 2026-09-10,
+APPROVE-WITH-NOTES, notes applied; design commit `ffab1708d`).
+Baseline at HEAD on canonical data (pinned env): TPC-H `match=1
+shapediff=19`, TPC-DS `match=0 shapediff=70`; R43's `match=2`/Q6-match
+unreproduced (recorded as discrepancy). Oracle note: TPC-H fixtures
+are all-serial (owner decision needed for re-capture).
+**K98:** `planIndexScanFromWhereShape` equality arm returns
+`IndexScan` unconditionally; TPC-DS Q9 differs on `scan-type` ALONE
+(`reason`, 1 page/35 rows) — nearest miss in either corpus. Change:
+equality-arm-only cost competition (`costIndexScanCore` vs
+`costSeqscan`, per-arm inputs table in DESIGN) with seq-wins
+decline; correlated/range/SAOP untouched. Tests: Q9→MATCH, zero
+EXTRA flips, unit pins both directions first.
+
+## R46 result (2026-09-10)
+
+`r46-legacy-index-seq-competition/REPORT.md`. IMPLEMENTED, all
+gates pass. Two producers gated (funnel equality arm + absorber
+`eqKey` rewrite — the second found live: funnel verdict=true yet
+EXPLAIN still indexed). **TPC-DS Q9 → MATCH** (first TPC-DS match
+of the programme); scan-type 74→73; TPC-H categories identical.
+Gates: units + suites (5 new pins) + spotcheck + SF0.5 sweep
+(PASS=95, MISMATCH=0; plan-shape only Q9) + A/B both corpora (only
+Q9 moves).
+- **K100 (new, executor).** Sequential reg*[] comparison broken
+  twice over (scalar-cast leak drops IsArray; OID-vs-name compare
+  without catalog) — R46 carve-out keeps the index there, dies
+  with K100. Corpus impact zero.
+- Anomaly on record: one build produced corpus-wide width shifts
+  (undetermined; clean rebuild reproducible — verify serving
+  behavior, not just inode); one test passed 4× then failed 20/20
+  on the same tree (suspected stale binary in stash-pop window).

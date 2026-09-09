@@ -1628,7 +1628,7 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 	// Closes the M0054-0003d Q8 case
 	// (`p_type = 'ECONOMY ANODIZED STEEL'` →
 	// `Index Scan using idx_part_type on part`).
-	node = rewriteScanInputsWithSingleTablePredicates(node, cat)
+	node = rewriteScanInputsWithSingleTablePredicates(node, cat, plannerSet)
 	// M0054-0006: rewrite eligible binary `*Join{Algo:Hash}` /
 	// `*Join{Algo:NestedLoop}` nodes to `*NestedLoopIndexJoin` when
 	// the equi-join predicate matches a single-column B-tree index
@@ -10025,6 +10025,115 @@ func bitmapOverCorrelatedProbe(tbl *catalog.Table, idx *catalog.Index, col *Colu
 	}
 }
 
+// indexLeadsRegIdentifierArray reports whether the index's leading
+// column is a reg*-identifier ARRAY (regclass[] etc.). See the R46
+// carve-out in seqWinsEqualityProbe (K100).
+func indexLeadsRegIdentifierArray(tbl *catalog.Table, idx *catalog.Index) bool {
+	if tbl == nil || idx == nil || len(idx.Columns) == 0 {
+		return false
+	}
+	for i := range tbl.Columns {
+		if tbl.Columns[i].Name != idx.Columns[0] {
+			continue
+		}
+		t := tbl.Columns[i].Type
+		if !t.IsArray {
+			return false
+		}
+		switch t.Name {
+		case "regproc", "regprocedure", "regclass", "regtype", "regrole", "regcollation",
+			"regnamespace", "regdictionary":
+			return true
+		}
+		return false
+	}
+	return false
+}
+
+// seqWinsEqualityProbe is R46 (K98): the `add_paths_to_base_rel`
+// competition for the one site the legacy planner still owns. The
+// equality arm below hands back an IndexScan unconditionally on
+// shape match; on a 1-page table like TPC-DS `reason` that loses to
+// a sequential scan the way PG's own costing decides it
+// (cost_seqscan ≈ 1 page vs index descent + random heap fetch).
+//
+// Both candidates are priced by the SAME cost functions the join
+// search uses (`costIndexScan` / `costSeqscan`), mirroring the
+// M0134-0185 bitmap-vs-index precedent directly above. true means
+// "decline the index": the caller falls back to its Seq Scan, which
+// is the shape PG lands on. Anything unmeasurable (no stats,
+// non-positive selectivity) returns false — today's behavior —
+// never a fabricated seq win.
+func seqWinsEqualityProbe(tbl *catalog.Table, idx *catalog.Index, queryClause Expr, ps PlannerSettings) bool {
+	if tbl == nil || tbl.Stats == nil || tbl.Stats.RowCount <= 0 {
+		return false
+	}
+	// R46 carve-out (K100): sequential comparison of reg*-identifier
+	// arrays is broken in the executor — an unknown literal is
+	// coerced to the SCALAR reg type (resolveExpr drops IsArray, so
+	// `{pg_class}` resolves whole and misses with 42P01), and even
+	// explicitly-cast arrays compare by display text (OID vs name
+	// rendering) instead of element OIDs; compareDatum carries no
+	// catalog to canonicalise either side. Declining here would ship
+	// ERRORs/empty answers where the index path is values-correct.
+	// PG seq-scans these shapes, so the carve-out is a workaround,
+	// not the goal state: it dies with K100's executor fix, at which
+	// point the 3 reg* array unit sub-cases return to SeqScan
+	// expectations. Scalar reg* probes are unaffected (their
+	// per-row resolution works — covered by passing tests).
+	if indexLeadsRegIdentifierArray(tbl, idx) {
+		return false
+	}
+	cp := ps.costParams()
+	relTuples := float64(tbl.Stats.RowCount)
+	relPages := baseRelPages(tbl, relTuples)
+	// The equality qual against a synthetic scan: the same
+	// selectivity the search would price this probe at
+	// (costindex.go:512 precedent). 1.0 here would be the
+	// ordering-only collapse the inputs struct warns about and
+	// would flip every legacy probe corpus-wide.
+	sel := clauseSelectivity(queryClause, &SeqScan{Table: tbl})
+	if !(sel > 0) {
+		return false
+	}
+	if sel > 1 {
+		sel = 1
+	}
+	indexPages, indexTuples, treeHeight := estimateIndexGeometry(idx, tbl, relTuples)
+	T := float64(relPages)
+	if T < 1 {
+		T = 1
+	}
+	in := indexScanInputs{
+		relPages:    relPages,
+		relTuples:   relTuples,
+		indexPages:  indexPages,
+		indexTuples: indexTuples,
+		treeHeight:  treeHeight,
+		selectivity: sel,
+		// Single-column equality probe on a UNIQUE single-column
+		// index matches at most one tuple (btcostestimate clamp,
+		// costindex.go:336-338). This arm builds only `Key`
+		// (single-column) probes, so a multi-column index never
+		// has all keys bound here.
+		uniqueEqualityOnAllKeys: idx != nil && idx.Unique && len(idx.Columns) == 1,
+		correlation:             indexCorrelationFor(idx, leadingKeyStats(idx, tbl)),
+		totalTablePages:         T,
+		loopCount:               1,
+		// numQualOps 0: the single equality IS the index qual, so
+		// no restriction conjunct is left for the heap fetch
+		// (costsize.c:822-830). numSAScans 1: plain equality, no
+		// ScalarArrayOp product.
+	}
+	idxCost := costIndexScan(cp, in)
+	// The seq rival evaluates the one equality per tuple scanned.
+	seqCost := costSeqscan(cp, relPages, relTuples, 1)
+	// Strict <: ties keep the index — today's behavior, minimal
+	// Strict <: ties keep the index — today's behavior, minimal
+	// blast radius. A tie is never the 1-page-vs-descent shape
+	// this round exists for.
+	return seqCost.Total < idxCost.Total
+}
 // planIndexScanFromWhere is the rule-based WHERE -> index producer; it wraps
 // planIndexScanFromWhereShape so that EVERY shape the inner function can hand
 // back passes the session's scan toggles (review/260831-2 X-8). Filtering the
@@ -10221,6 +10330,13 @@ func planIndexScanFromWhereShape(where parser.Expr, ctx *resolveContext, cat cat
 	queryClause := Expr(&BinaryOp{pos: where.Pos(), Op: b.Op, Left: col, Right: resolvedKey})
 	idx := findBTreeIndexForColumn(cat, tbl, col.Name, queryClause)
 	if idx == nil {
+		return nil, false, nil
+	}
+	// R46 (K98): cost the legacy funnel's index-vs-seq choice with the
+	// same cost functions the search uses. A 1-page table loses to a
+	// sequential scan; declining returns the caller to its Seq Scan
+	// fallback — the shape PG lands on.
+	if seqWinsEqualityProbe(tbl, idx, queryClause, ctx.settings) {
 		return nil, false, nil
 	}
 	return &IndexScan{

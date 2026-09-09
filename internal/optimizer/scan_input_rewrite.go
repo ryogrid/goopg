@@ -47,7 +47,7 @@ import "github.com/goopg/goopg/internal/catalog"
 // rewriteScanInputsWithSingleTablePredicates is the entry point.
 // Mutates the plan tree in place and returns the (possibly
 // substituted) root.
-func rewriteScanInputsWithSingleTablePredicates(n Node, cat catalog.Catalog) Node {
+func rewriteScanInputsWithSingleTablePredicates(n Node, cat catalog.Catalog, ps PlannerSettings) Node {
 	if n == nil || cat == nil {
 		return n
 	}
@@ -70,30 +70,30 @@ func rewriteScanInputsWithSingleTablePredicates(n Node, cat catalog.Catalog) Nod
 	}
 	switch x := n.(type) {
 	case *Filter:
-		x.Child = rewriteScanInputsWithSingleTablePredicates(x.Child, cat)
-		x.Predicate = absorbConjunctsIntoSubtree(x.Predicate, x, cat)
+		x.Child = rewriteScanInputsWithSingleTablePredicates(x.Child, cat, ps)
+		x.Predicate = absorbConjunctsIntoSubtree(x.Predicate, x, cat, ps)
 		if x.Predicate == nil {
 			return x.Child
 		}
 		return x
 	case *Project:
-		x.Child = rewriteScanInputsWithSingleTablePredicates(x.Child, cat)
+		x.Child = rewriteScanInputsWithSingleTablePredicates(x.Child, cat, ps)
 		return x
 	case *Sort:
-		x.Child = rewriteScanInputsWithSingleTablePredicates(x.Child, cat)
+		x.Child = rewriteScanInputsWithSingleTablePredicates(x.Child, cat, ps)
 		return x
 	case *Limit:
-		x.Child = rewriteScanInputsWithSingleTablePredicates(x.Child, cat)
+		x.Child = rewriteScanInputsWithSingleTablePredicates(x.Child, cat, ps)
 		return x
 	case *Join:
-		x.Left = rewriteScanInputsWithSingleTablePredicates(x.Left, cat)
-		x.Right = rewriteScanInputsWithSingleTablePredicates(x.Right, cat)
+		x.Left = rewriteScanInputsWithSingleTablePredicates(x.Left, cat, ps)
+		x.Right = rewriteScanInputsWithSingleTablePredicates(x.Right, cat, ps)
 		return x
 	case *Aggregate:
-		x.Child = rewriteScanInputsWithSingleTablePredicates(x.Child, cat)
+		x.Child = rewriteScanInputsWithSingleTablePredicates(x.Child, cat, ps)
 		return x
 	case *WindowAgg:
-		x.Child = rewriteScanInputsWithSingleTablePredicates(x.Child, cat)
+		x.Child = rewriteScanInputsWithSingleTablePredicates(x.Child, cat, ps)
 		return x
 	}
 	return n
@@ -139,7 +139,7 @@ type scanBounds struct {
 // matching conjuncts by (scan, column), rewrites each group's
 // SeqScan into an IndexScan when an index exists, and returns the
 // predicate with absorbed conjuncts removed (nil when none remain).
-func absorbConjunctsIntoSubtree(pred Expr, parent *Filter, cat catalog.Catalog) Expr {
+func absorbConjunctsIntoSubtree(pred Expr, parent *Filter, cat catalog.Catalog, ps PlannerSettings) Expr {
 	if pred == nil {
 		return nil
 	}
@@ -265,6 +265,17 @@ func absorbConjunctsIntoSubtree(pred Expr, parent *Filter, cat catalog.Catalog) 
 		var newScan *IndexScan
 		switch {
 		case ch.bounds.eqKey != nil:
+			// R46 (K98): the same index-vs-seq competition the
+			// rule-based funnel runs. This pass otherwise rebuilds
+			// an IndexScan the funnel just declined on cost (the
+			// decline returns Filter+SeqScan, which this pass
+			// absorbs back). eqConjunct is the original equality
+			// conjunct — the selectivity input. SAOP/range
+			// rewrites stay uncosted (today's behavior, named
+			// follow-ups).
+			if ch.bounds.eqConjunct != nil && seqWinsEqualityProbe(ss.Table, idx, ch.bounds.eqConjunct, ps) {
+				continue
+			}
 			newScan = &IndexScan{
 				pos: ss.Pos(), Table: ss.Table, Alias: ss.Alias, RTID: ss.RTID, Index: idx,
 				Key: ch.bounds.eqKey, schema: ss.Output(), SmallDim: ss.SmallDim, UniqueKeys: ss.UniqueKeys,

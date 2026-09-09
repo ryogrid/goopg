@@ -425,7 +425,7 @@ func TestSearchedTreeIsOpaqueToTheLegacyRewrites(t *testing.T) {
 
 	t.Run("rewriteScanInputsWithSingleTablePredicates", func(t *testing.T) {
 		searched := build()
-		if out := rewriteScanInputsWithSingleTablePredicates(searched, stubCatalogForSeam{}); out != searched {
+		if out := rewriteScanInputsWithSingleTablePredicates(searched, stubCatalogForSeam{}, DefaultPlannerSettings()); out != searched {
 			t.Fatalf("the scan-input pass rebuilt a searched tree as %T", out)
 		}
 	})

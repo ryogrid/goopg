@@ -83,11 +83,27 @@ priced candidate wins, whichever it is.
 
 Equality arm only (review 2026-09-10: range/SAOP need residual-qual
 accounting and descent products with zero corpus payoff on the
-EXTRA axis — named follow-ups, not this round). At the equality
-arm's exit in `planIndexScanFromWhereShape`: cost the built index
-candidate with `costIndexScanCore` and the seq alternative with
-`costSeqscan`; return `(nil,false)` when seq wins. Correlated arm
-untouched (has its own priced choice). Callers are exactly three —
+EXTRA axis — named follow-ups, not this round).
+
+**Two producers, not one** (found during implementation — the
+review missed the second too). `planIndexScanFromWhereShape` builds
+the IndexScan, but `rewriteScanInputsWithSingleTablePredicates`
+(`scan_input_rewrite.go`, called at `planner.go:1632`) absorbs
+Filter conjuncts into SeqScans and REBUILDS an IndexScan with no
+cost check — undoing the funnel's decline (measured live: funnel
+verdict=true yet EXPLAIN still showed Index Scan). Both sites run
+the same competition now:
+
+- Funnel equality-arm exit: decline → `(nil,false)` → caller's Seq
+  Scan fallback.
+- Absorber `eqKey` case: `continue` (leave SeqScan + conjunct).
+  SAOP/range rewrites stay uncosted (today's behavior).
+  The pass returns early on searched trees, so search-planned
+  subtrees keep their costed choices; only legacy subtrees are
+  affected. `PlannerSettings` threaded through (was
+  `(n, cat)`; one production caller + one test caller updated).
+
+Correlated arm untouched (has its own priced choice). Callers are exactly three —
 `planSelect` (:1421), `planUpdate` (:12675), `planDelete` (:12859)
 — and the executor's `updateViaIndex` already falls through to the
 SeqScan path when the scan is absent, so declining is perf-only.
@@ -107,6 +123,24 @@ Per-arm `indexScanInputs` derivation (equality arm):
 | `loopCount` | 1 |
 | `numSAScans` | 1 (equality; no SAOP product) |
 | seq-side `numQualOps` | 1 (the restriction qual evaluates per tuple); index side 0 (the qual *is* the index qual) |
+
+**Reg-identifier carve-out** (found during implementation via 3
+unit failures): when the index leads a reg*-identifier ARRAY column
+(`regclass[]` etc.), the gate stays off (keep index). Sequential
+comparison of reg* arrays is broken in the executor, twice over:
+(1) `resolveExpr`'s comparison coercion drops `IsArray`
+(`strings.ToLower(lt.Name)`), so the unknown literal is cast to
+SCALAR regclass and `{pg_class}` misses whole with 42P01;
+(2) even explicitly-cast arrays compare by display text
+(OID-format vs name-format) instead of element OIDs, and
+`compareDatum` carries no catalog to canonicalise either side.
+Declining there would ship ERRORs/empty answers where the index
+path is values-correct. PG seq-scans these shapes, so the
+carve-out is a workaround with a ticket, not the goal state —
+filed as **K100** (executor: sequential reg*[] comparison), which
+also owns the array-aware cast-target fix. The carve-out dies with
+K100. Scalar reg* probes are unaffected (per-row resolution
+works — pinned by passing tests).
 
 Scope guard: the reverse population (goopg seq where PG index:
 `customer_address_pkey` ×3, `time_dim_pkey` ×3, `item_pkey` ×2…)
@@ -129,6 +163,14 @@ top-level one-rel) — arm identity not asserted; the byte-guard A/B
    (`reason`: relpages 1, reltuples 35, unique pkey) AND index-wins
    (large-table equality probe — regression guard against a
    selectivity-1.0 implementation flipping everything to seq).
+   Plus rewrite-pass pins both directions, and fixture
+   re-baselines: 5 IOS/executor tests pinned unconditional index
+   shapes on 2-row tables PG would seq-scan (R14 precedent:
+   justified re-baselines) — scaled to 2000 distinct rows +
+   ANALYZE (vacuum-then-analyze order; ANALYZE in the seeding txn
+   is a no-op) so the index wins honestly. TOAST compresses
+   fixture-bloating pads (measured: 64KB → 1 page), so scale must
+   come from row counts, not widths.
 3. Byte-guard: full-corpus A/B both corpora; only intended sections
    move (expect: Q9 DS; possibly small-table one-rel queries).
 4. Values: SF0.5 sweep `MISMATCH=0`-class unchanged (same rows by
@@ -143,6 +185,12 @@ top-level one-rel) — arm identity not asserted; the byte-guard A/B
   vs PG `511731` — InitPlan/subplan costs are not folded into the
   parent (PG adds them in createplan). N1-normalised, moves no
   verdict; needs its own round.
+- **K100 (executor, NEW): sequential reg*[] comparison.** Unknown
+  literals coerce to the scalar reg type (IsArray dropped in
+  `resolveExpr` comparison coercion) and array-vs-array compares
+  display text, not element OIDs; `compareDatum` has no catalog.
+  Blocks lifting the R46 carve-out. Corpus impact zero (no reg
+  columns in either corpus).
 - Search-side seq-vs-index (multi-rel) and Index-OnlyScan gaps.
 - TPC-H fixture re-capture with parallelism on (owner decision).
 - R43's `match=2` discrepancy (recorded in §0).
