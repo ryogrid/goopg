@@ -1504,7 +1504,7 @@ to `TypedStringLit` (parse_coerce.c:232-250) instead of a runtime
   numeric arithmetic via float64 (`1.10+2.20` -> `3.3`, PG `3.30`), no
   int4-width overflow (`2e9+2e9` folds instead of raising 22003),
   byte-wise string ordering ignoring collation.
-- **K49 — THE STRUCTURAL FINDING. join-order is NOT estimate-driven.**
+- **K49 — WITHDRAWN as proven; see R35 §1. The evidence was void.**
   Three controlled experiments: R30 correlation (~14x), R31b relpages
   (15%), R34 cardinality (580x on 15 queries). join-order stayed at
   exactly 95/99 and 20/22 through all three; R34 moved NO category on
@@ -1515,3 +1515,36 @@ to `TypedStringLit` (parse_coerce.c:232-250) instead of a runtime
   was FALSE (grep excluded `foldconst.go`, which holds the wrapper). It
   runs at planner.go:2136 — but AFTER plan selection, so selectivity
   never sees folded quals. Only the timing differs from PG.
+
+## R35 — metric blindness + join-cardinality divergence (investigation)
+
+`r35-join-cardinality-and-metric-blindness/FINDINGS.md`. No code change.
+
+- **K50 — MEASUREMENT ERROR, affects how every round is judged.**
+  `pg-plan-parity-diff.py:44-62` normalises estimates OUT of the
+  comparison: N1 strips `rows=`/`cost=`, N5 strips `::type`, N6 compares
+  quals by (columns, operator multiset) NOT literal values. **No
+  estimate change can ever move a parity verdict.** R34 is proof: 18
+  TPC-DS plans changed and every category was byte-identical.
+  Judge estimate rounds by direct oracle comparison plus a count of
+  SHAPE changes — never by category counts.
+- **K49 WITHDRAWN.** "join-order is not estimate-driven" was inferred
+  from R30/R31b/R34 showing no movement. Those experiments could not
+  have shown movement whatever the estimates did (K50). The advice to
+  investigate the search may still be right; the evidence for it is
+  void and must not be cited.
+- **K51 — join cardinality drops whole clause classes.** EXPLAIN on
+  `orders ⋈ lineitem` shows Merge Join `rows=6001255` above an input
+  scan of `rows=2000418` — three different counts in one plan.
+  Constant comparisons propagate to the join estimate;
+  column-vs-column (`l_shipdate < l_commitdate`) and unfolded-interval
+  bounds are dropped at selectivity 1.0, though the SCAN applies
+  DEFAULT_INEQ_SEL correctly (goopg and PG both estimate 479,869 for
+  the equivalent TPC-DS predicate). Q12: goopg 6,001,255 vs PG 28,127.
+- **K52 — the open question, deliberately unanswered.** Those are
+  `EstimateRows` numbers (the plan-tree walker EXPLAIN reads), not
+  `calcJoinrelSize` (the `searchCtx` method the join search consumes).
+  Only the latter can affect join ORDER. Instrument it on TPC-H Q12 —
+  a TWO-relation join, so zero enumeration complexity — before
+  proposing any fix. Do not read the rendered number and assume the
+  search saw it.
