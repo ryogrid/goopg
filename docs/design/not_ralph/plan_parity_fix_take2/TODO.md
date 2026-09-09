@@ -1350,3 +1350,36 @@ collapsed toward 0 for every relation bigger than the sample cap.
   reproducible. Quote the fresh protocol from here on.
 - Statistics axis, still open: ANALYZE never visits indexes, so
   `estimateIndexGeometry` synthesises relpages/reltuples/tree_height.
+
+## R31 — parallelism census + heap-density root cause (investigation)
+
+`r31-parallelism-and-heap-density/FINDINGS.md`. No code change; ends on
+an owner decision.
+
+- **K37 (largest structural axis).** 66 of 99 TPC-DS queries: PG plans
+  parallel, goopg serial; ZERO the other way. `Parallel Hash` goopg 0 vs
+  PG 314. This one divergence feeds join-method, scan-type,
+  aggregation-strategy and sort-strategy simultaneously — the four
+  biggest categories after join-order are largely ONE cause.
+- **K38.** The machinery exists behind `GOOPG_GATHER_PATHS` (default
+  off). At `all`: Gather 42->104, Parallel Hash 0->167. But parity does
+  not improve (parallelism stays 90, join-method 79->82). Flipping the
+  flag is NOT the win by itself.
+- **K39 (measurement integrity — affects every TPC-DS cost result to
+  date).** goopg plans 4 workers 49 times; PG never plans 4. Both
+  `compute_parallel_worker` transcriptions are faithful; the INPUT
+  diverges. goopg's on-disk `store_sales` is 29761 pages (48 tuples/page)
+  vs PG's 25928 (55-56). Refuted by measurement: tuple encoding (numeric
+  and int tables pack identically in both), fillfactor (100 both), COPY
+  (56 rows/page both), NULL density. Confirmed: re-inserting the rows
+  with the CURRENT binary gives 25830 pages — PG-faithful to 0.4%. The
+  bench data was loaded by an older binary and `VACUUM FULL` does not
+  rewrite the heap, so it is frozen in. `relpages` also drives
+  `cost_seqscan`, so every fact scan is priced ~15% high while
+  dimensions (`item` 736 vs 1284) are priced low — a non-cancelling
+  distortion under every TPC-DS cost A/B so far, R30 included.
+  **Blocked on owner approval to reload bench data + re-pin anchors.**
+- **K40 (minor, found in passing).** `round(double precision, int)`
+  resolves on goopg but does not exist in PG 18.3.
+- **Open, unestablished.** goopg's `VACUUM FULL` accepted the command
+  and repacked nothing; defect vs documented no-op not determined.
