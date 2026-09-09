@@ -2542,3 +2542,53 @@ a misdescription, i.e. the arbitrary plan-forcing the goal forbids.**
 execution model (workers building a shared hash from a partial inner), not
 relabelling the leader-prebuild model. R43 §6 step 2 must not be
 implemented as a labelling change; DESIGN rev 4 §4a records this.
+
+
+### Post-R44 triage: three measured findings (K93-K95)
+
+Measured while looking for the next round after K92 closed the cheap Q14
+route. All three are negative or cautionary results — recorded so nobody
+spends a round rediscovering them.
+
+- **K93 — K88 (float64 fold) is a FIDELITY item, NOT a parity lever.**
+  Measured: the `0.060000000000000005` artifact occurs **once** in TPC-H
+  (Q6) and **once** in TPC-DS. PG's own plans contain **4** such long
+  decimals. It does not drive the `rendering` category (32 on TPC-DS), and
+  Q6 MATCHES despite carrying it, because the differ compares qual
+  literals by column+operator multiset (N6), not by value. Fix it for
+  correctness and answer-safety — it remains a real
+  planner-vs-PG-`numeric` divergence — but do NOT schedule it expecting
+  category movement.
+
+- **K94 — Q1's gap is a COSTING divergence, not a disabled capability.**
+  Q1 is the nearest miss after Q14 (`[sort-strategy, parallelism]`). PG
+  sorts INSIDE the workers and finalises ordered:
+  `Finalize GroupAggregate <- Gather Merge <- Sort <- Partial HashAggregate`.
+  goopg gathers unsorted and sorts at the top:
+  `Sort <- Finalize HashAggregate <- Gather <- Partial HashAggregate`.
+  `GatherMerge` EXISTS in the planner, and there is a knob for the
+  decision — but **`GOOPG_PARTIAL_SORT_PATHS=on` leaves Q1's plan
+  byte-identical**, so the priced tournament still picks goopg's arm. This
+  is a cost-model divergence to be won on cost, not a flag to flip.
+
+- **K95 — parallel row estimates diverge in BOTH directions; no single
+  convention explains it.** A tempting hypothesis (goopg renders TOTAL
+  rows on a Parallel Seq Scan where PG renders PER-WORKER) fits two data
+  points and is REFUTED by the third:
+
+  | query | goopg | PG | ratio |
+  |---|---|---|---|
+  | Q1 | 5,916,028 | 1,479,529 | **3.99** |
+  | Q14 | 78,680 | 18,444 | **4.26** |
+  | Q6 | 1,506 | 28,092 | **0.05** |
+
+  Q6 is ~19x LOW where the others are ~4x HIGH. So estimate parity has at
+  least two independent root causes on the SAME column of the SAME table,
+  and any "fix the parallel divisor" round would be chasing one of them
+  while the other stays. Instrument per query before generalising.
+
+- **Caveat on R44 that honesty requires recording: it improved shape
+  categories while moving at least one estimate FURTHER from PG.** Q6's
+  `lineitem` estimate went 2,412 -> 1,506 against PG's 28,092. Q6 still
+  MATCHES (shape is unaffected), but R44's stated aim was estimate parity,
+  and on this query it went the wrong way.
