@@ -320,6 +320,18 @@ failure/hang in background wastes the session — goal instruction).
   re-ANALYZEing shared bench clusters would mutate peer measurement
   state. TPC-H lineitem.l_orderkey reads -0.0018 post-restore, which is
   the computed value on unordered HammerDB input, not a defect signal.
+- **K27 (2026-09-09).** A `seam-decline` is a PARITY signal, not just a
+  perf one: a query the PG-shaped search declines falls to the legacy
+  path and **cannot converge on PG's plan by any amount of costing
+  work**. Watch `GOOPG_PGSHAPED_DP_TRACE=1 | grep seam-decline` when a
+  query looks unreachable. Concretely: an `OuterColumnRef` anywhere in
+  a CTE body made `planHasEscapingOuterRef` report an escaping ref for
+  the CTEScan LEAF, so `chainCarriesLateral` declined the whole
+  enclosing join (TPC-DS Q30: cross product instead of PG's index-scan
+  inners, 3s -> >300s). `walkPlanExprs` flattens, so depth increments
+  only for subquery-bearing EXPRESSIONS — never for a lateral join's
+  right side — which is why a ref BOUND inside a subtree reads as
+  escaping it.
 - **K4 (rev-1 error pattern, from §6).** Never conclude from a file
   without checking its callers (`pathgen.go`/`generateScanPaths` is
   test-only; production seed is `newPrebuiltPath`). Every design must
@@ -869,6 +881,18 @@ anything attempted so far.
 
 ## Log
 
+- 2026-09-09 (CC) **Q30/Q81 CLOSED** (`r25-nli-decompose/REPORT-slice1-ctescan-fix.md`).
+  Cause was NOT costing (my §4a guess) and NOT the CTE cache (two
+  falsified hypotheses): slice 1's `OuterColumnRef` probe keys landed
+  in a CTE BODY, so `planHasEscapingOuterRef` walking the CTEScan leaf
+  reported an escaping ref, `chainCarriesLateral` fired, and **the seam
+  declined Q30's whole outer 3-way join** -> legacy path -> cross
+  product. Found with the existing `traceSeamDecline` channel in ONE
+  run. Fix: the walk stops at a `*CTEScan` (a plain WITH body cannot
+  reference the enclosing query). Q30 >300s -> 3.8s (PG 4.1s), Q81
+  ->5.1s (PG 14.7s); **sweep back to PASS=95 all-zero TIMEOUT=0**.
+  **K27**: a seam DECLINE is a parity signal in its own right — a
+  declined query cannot converge on PG's plan by any costing work.
 - 2026-09-09 (CC) **Corrected my own slice-1 conclusion.** Q30/Q81 are
   a PLAN divergence (cross product vs PG's index-scan inners), not a
   goal-sanctioned slowdown. Falsified two repair hypotheses by

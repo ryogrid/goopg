@@ -14499,6 +14499,28 @@ func planHasOuterRef(node Node) bool {
 // incrementing by one for each subquery level recursed into — the
 // same convention joinlayout.go's remapOuterRefsInSubplan already uses).
 func planHasEscapingOuterRef(node Node, depth int) bool {
+	// A `*CTEScan`'s body is a SELF-CONTAINED plan: a plain `WITH` body is
+	// planned in its own scope and SQL gives it no way to reference the
+	// enclosing query's columns (goopg has no LATERAL CTE). So an
+	// `OuterColumnRef` inside it is bound INSIDE it — by the body's own
+	// lateral/parameterized join — and cannot escape to this scope.
+	//
+	// Walking into it anyway is a live defect, not a hypothetical: R25 slice 1
+	// gives a decomposed NLI probe `OuterColumnRef` keys, so a CTE body
+	// containing one made `nodeReferencesOuter` true for the CTEScan LEAF,
+	// which made `chainCarriesLateral` true, which made the seam decline the
+	// whole enclosing join. Measured on TPC-DS Q30: base searched
+	// {ctr1, customer_address, customer}; slice 1 declined it
+	// (`seam-decline reason=lateral`) and the legacy path produced a
+	// CROSS PRODUCT where PG index-scans both inner sides — 3 s -> >300 s.
+	//
+	// `walkPlanExprs` flattens the subtree, so depth increments only for
+	// subquery-bearing EXPRESSIONS and never for a lateral join's right side;
+	// this stops the one boundary that provably closes the scope.
+	if cte, ok := node.(*CTEScan); ok {
+		_ = cte
+		return false
+	}
 	found := false
 	walkPlanExprs(node, func(e Expr) {
 		if found {
