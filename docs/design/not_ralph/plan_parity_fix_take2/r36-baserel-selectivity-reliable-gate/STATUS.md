@@ -158,3 +158,47 @@ Two independent pieces of work, in this order:
 
 R36's design, its 22x-error finding (K53) and the three re-derived
 optimizer tests all stand and need no rework.
+
+---
+
+# K55 refined into K56 — ANALYZE and the scan path disagree on visibility
+
+K55 recorded that `ANALYZE` leaves `Stats.RowCount=0`. Probing one step
+further shows it is not that ANALYZE declines to stamp the field — it
+stamps a count it genuinely measured as zero, because it could not see
+the rows:
+
+```
+PROBE count(*) sj_item      = 3     <-- a normal SELECT sees them
+PROBE after ANALYZE: RowCount=0 Pages=1 cols=4
+```
+
+Same `*Context`, same session, immediately adjacent statements. The
+sampling loop increments `stats.RowCount` once per tuple passing
+`transam.TupleVisible(t.Header, snap, tx.XID, curcid, combo, mxs)`
+(`operators_analyze.go:873`), and `SetTableStats` merely assigns
+(`catalog.go:13112-13119`), so a zero can only mean the visibility test
+rejected every tuple. `Pages=1` confirms the pages were found and read;
+it is the per-tuple test that fails. The four column entries are
+computed from the empty reservoir, which is why populated `Columns`
+sit beside a zero `RowCount` — the shape K55 described.
+
+**This is a divergence from PG, not merely a harness quirk.** In PG,
+`ANALYZE` run in the same transaction as the `INSERT` uses the current
+snapshot and counts the rows. goopg's does not.
+
+It is not visible on the live benchmark clusters because those ANALYZE
+committed data in autocommit, which is why `reltuples` reads correctly
+there (`store_sales` 1,439,608) and why this went unnoticed.
+
+## Filed as K56, and it is NOT R36's to fix
+
+R36 needs only a way to give three fixtures real row counts. The
+supported way is `SetTableStats` directly, which the optimizer-side
+tests already use and which bypasses this entirely. R36 should take
+that route rather than wait on K56.
+
+K56 itself is worth a round of its own: any test or tool that ANALYZEs
+inside a transaction and then reasons about cardinality is silently
+reading zeros, and the failure is invisible because `Columns` looks
+populated.

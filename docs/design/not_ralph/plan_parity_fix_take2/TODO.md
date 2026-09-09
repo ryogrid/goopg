@@ -1609,3 +1609,23 @@ at HEAD — the implementation was reverted, not shipped.
   ONLY because the gate discards the default). Fix/characterise
   RowCount first, then seed those fixtures via `SetTableStats` at sizes
   where the promoted plan is genuinely cheaper, then re-run R36.
+
+- **K56 — ANALYZE cannot see same-transaction rows (a PG divergence).**
+  Refines K55. `SELECT count(*) FROM sj_item` returns 3 while an
+  immediately following `ANALYZE sj_item` in the SAME `*Context` stamps
+  `RowCount=0 Pages=1 cols=4`. The sampling loop counts only tuples
+  passing `transam.TupleVisible` (`operators_analyze.go:873`) and
+  `SetTableStats` merely assigns (`catalog.go:13112`), so zero means the
+  per-tuple visibility test rejected everything; `Pages=1` proves the
+  pages were read. The four column entries come from the empty
+  reservoir — which is exactly why populated `Columns` appear beside a
+  zero `RowCount`. PG's ANALYZE uses the current snapshot and DOES see
+  same-transaction rows. Invisible on the live clusters because those
+  ANALYZE committed data in autocommit (`store_sales` reltuples reads
+  1,439,608 correctly).
+  **Consequence:** any test or tool that ANALYZEs inside a transaction
+  and then reasons about cardinality silently reads zeros, and it looks
+  healthy because the column stats are present.
+  **NOT a prerequisite for R36** — R36 should seed its three fixtures
+  with `SetTableStats` (as the optimizer-side tests do), which bypasses
+  ANALYZE entirely. K56 deserves its own round.
