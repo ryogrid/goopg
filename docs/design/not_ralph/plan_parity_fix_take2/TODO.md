@@ -1409,3 +1409,30 @@ on all three clusters).
 - **Baseline.** Use the fresh clone for parity from here. R30's TPC-DS
   numbers were measured on the inflated cluster and should be
   re-measured before being built upon.
+
+## R32 — K37 campaign slice 1: targetlist subplan display (design approved, implementing)
+
+`r32-targetlist-subplan-display/DESIGN.md` (reviewed 2026-09-09,
+APPROVE-WITH-NOTES, notes applied). Fresh-clone census (pinned env):
+PG-live 180 Gather / 162 PHJ lines; goopg default 42 / 0; `all` 104 /
+162; ZERO goopg gathers where PG has none. MISS set partitions into
+four classes:
+
+- **K42 (this round, display).** Q9: PG 111 lines / 15 Init-Sub / 15
+  Gathers (all under InitPlans) vs goopg 6 / 0 / 0, yet Q9 executes
+  OK. Root cause is a named skip: `walkPlanFiltered:424-427`
+  (+ ANALYZE twin :1549-1552) recurses through `*optimizer.Project`
+  without visiting `p.Targets`; fix extends the `Result`-Targets
+  precedent (:622-635) to Project in BOTH text walkers, TEXT only
+  (JSON out of scope). Same-shape smaller deltas: Q1/Q32/Q81/Q92.
+  Unblocks measuring the real Q9 gap (K44).
+- **K43 (later slice).** Partial paths above Append: Q5 trace shows
+  base partials accepted, base Gathers dominated, zero partial paths
+  on join rels (no partial-Append producer). Narrow: PG uses Parallel
+  Append in 6 queries, only Q5+Q76 miss.
+- **K44 (later slice, unmeasurable until K42).** Partial aggregation
+  inside InitPlans — Q9's real gap once displayed.
+- **K45 (later slice, estimate side).** Date-range row inflation
+  (Q5: goopg 8116–12121 vs PG 8–14 on same `d_date` predicate);
+  attribution (estimate vs Gather-costing) before any fix, per K39a.
+- **Excluded:** Q6-class misses are join-order-downstream (K26 owns).
