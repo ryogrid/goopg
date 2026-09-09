@@ -377,6 +377,20 @@ failure/hang in background wastes the session — goal instruction).
   ANTI conversion (drop the forcing qual) is the prerequisite for
   transplanting it. Same family as K29: a demotion path that never
   drove a plan was never completed.
+- **K31 (2026-09-09).** goopg **materialises** CTEs where PG **inlines**
+  them. PG 12+ inlines a non-recursive CTE referenced once
+  (`inline_cte`, subselect.c; `NOT MATERIALIZED` is the default), so the
+  `CTE Scan` node does not exist and the underlying tables enter the
+  planner with real statistics. TPC-DS: **goopg 111 `CTE Scan` nodes,
+  PG 68.** goopg's `pushQualsThroughSingleRefCTEs` is explicitly the
+  QUAL-PUSHDOWN half of that composition — it carries the restriction
+  into the body and leaves the node. Consequences: the
+  `outer-over-derived` firewall fires on those derived inputs (3
+  declines); their rows are synthesised where PG has real stats (the
+  goal's "same statistics" premise); and the search sees one opaque rel
+  instead of the tables inside it. **Before writing an inliner, census
+  how many of the 111 are single-reference** — only those are eligible,
+  so 43 is an upper bound, not a target.
 - **K4 (rev-1 error pattern, from §6).** Never conclude from a file
   without checking its callers (`pathgen.go`/`generateScanPaths` is
   test-only; production seed is `newPrebuiltPath`). Every design must
@@ -955,6 +969,16 @@ anything attempted so far.
 
 ## Log
 
+- 2026-09-09 (CC) **R28 finding — goopg MATERIALISES CTEs where PG
+  INLINES them** (`r28-cte-inlining/FINDINGS.md`). Diagnosing
+  `outer-over-derived` (a deliberate firewall, NOT a bug — resume
+  condition already written as "B-06 CTE-output stats") found the
+  structural cause underneath: **PG's Q77 has NO `CTE Scan` nodes** —
+  PG 12+ inlines single-reference non-recursive CTEs. Corpus-wide
+  TPC-DS: **goopg 111 `CTE Scan` vs PG 68**. goopg's
+  `pushQualsThroughSingleRefCTEs` reproduces `inline_cte`'s QUAL-PUSHDOWN
+  half and leaves the node standing; PG's replaces the reference. So
+  goopg matches the row counts, not the shape. **K31.**
 - 2026-09-09 (CC) **Decline re-audit** (`r26-seam-decline-audit/FINDINGS-3-reaudit.md`):
   **13 declines / 7 queries -> 9 / 5.** Q49 and Q93 are now ADMITTED —
   they moved from ineligible to eligible, the axis category counts
