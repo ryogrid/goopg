@@ -93,6 +93,35 @@ warns that mutating a shared body filters every other reference twice.
 Single-reference makes both channels vacuous, which is exactly why the
 existing pass gates there.
 
+## 5a. CENSUS DONE — 40 of 63 are eligible
+
+§5 said to measure before writing an inliner. Measured, over the 30
+TPC-DS queries that declare CTEs:
+
+| | count |
+|---|---|
+| CTE declarations | **63** |
+| **single-reference — PG INLINES these** | **40 (63%)** |
+| multi-reference — PG materialises these too | 23 |
+
+So the eligible set is **40 declarations**, not the 43-node gap §2
+quoted. Those numbers are close but measure different things (nodes vs
+declarations) and should not be conflated — the 43 was always an upper
+bound, and this is the real target.
+
+**Correction to §2:** it implied Q77's six CTEs were all single-
+reference because PG's plan showed no `CTE Scan`. Measured, **four of
+the six are** — I inferred a cause from PG's output without checking
+the queries. The conclusion (PG inlines, goopg does not) survives; the
+supporting claim was overstated.
+
+A first census attempt reported only 22 single-reference, because the
+regex counted each CTE's own declaration as a reference — declarations
+after the first begin with a comma, so `, sr as (` matched the
+`,\s+name` reference pattern. Masking the declaration spans gives 40.
+Recorded because the wrong number was plausible and would have halved
+the apparent prize.
+
 ## 6. Not claimed
 
 - That inlining closes 43 nodes: only the single-reference subset is

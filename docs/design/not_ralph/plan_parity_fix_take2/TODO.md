@@ -388,9 +388,12 @@ failure/hang in background wastes the session — goal instruction).
   `outer-over-derived` firewall fires on those derived inputs (3
   declines); their rows are synthesised where PG has real stats (the
   goal's "same statistics" premise); and the search sees one opaque rel
-  instead of the tables inside it. **Before writing an inliner, census
-  how many of the 111 are single-reference** — only those are eligible,
-  so 43 is an upper bound, not a target.
+  instead of the tables inside it. **CENSUS DONE**: of 63 CTE
+  declarations across 30 TPC-DS queries, **40 (63%) are
+  single-reference** and PG inlines them; 23 are multi-reference and PG
+  materialises those too. goopg materialises all 63. So the eligible
+  target is **40 declarations** (the 43-node figure counts SCAN NODES —
+  different unit, do not conflate).
 - **K4 (rev-1 error pattern, from §6).** Never conclude from a file
   without checking its callers (`pathgen.go`/`generateScanPaths` is
   test-only; production seed is `newPrebuiltPath`). Every design must
@@ -969,6 +972,12 @@ anything attempted so far.
 
 ## Log
 
+- 2026-09-09 (CC) **K31 census done**: 63 CTE declarations across 30
+  TPC-DS queries; **40 (63%) single-reference** = the inlinable set;
+  23 multi-reference (PG materialises those too). Also corrected R28 §2:
+  Q77 is 4-of-6 single-reference, not 6-of-6 — I had inferred that from
+  PG's plan without checking the query. A first census said 22 because
+  the regex counted each CTE's own declaration as a reference.
 - 2026-09-09 (CC) **R28 finding — goopg MATERIALISES CTEs where PG
   INLINES them** (`r28-cte-inlining/FINDINGS.md`). Diagnosing
   `outer-over-derived` (a deliberate firewall, NOT a bug — resume
