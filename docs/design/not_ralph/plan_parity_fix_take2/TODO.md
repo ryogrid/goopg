@@ -2720,3 +2720,43 @@ Q9 moves).
   (undetermined; clean rebuild reproducible — verify serving
   behavior, not just inode); one test passed 4× then failed 20/20
   on the same tree (suspected stale binary in stash-pop window).
+
+## R47 — Q4 upper rel (REJECTED on review 2026-09-10; redesign required)
+
+`r47-q4-upper-rel/DESIGN.md` (review verdict: REJECT, 11 findings).
+Do NOT implement as specified. Load-bearing corrections:
+
+- **F3 (fatal to the mechanism):** `setCheapest` uses the EXACT
+  `comparePathCosts`; the 1.01 fuzz lives in `add_path`
+  dominance (`path.go:984-1007`), and the cited
+  `path.go:1141-1147` is the parameterised-fallback block. "Inside
+  the fuzz → pathkeys tie-break picks sorted" never fires at the
+  deciding site.
+- **F1:** grouping collapses to one winner before order is
+  considered — no cheapest-for-pathkeys query exists at the
+  ORDERED level. The decision site is missing from the design.
+- **F4:** `*NestedLoopIndexJoin` is NOT a `*Join`
+  (`legacyDisplayChildren` has no arm) — derivation gives
+  0.01×57066=570.66, not the observed 1141.32. The root cause
+  does not explain its own number.
+- **F5:** seed provenance unestablished (stamp vs derive; TPC-H
+  has 0 declines so the semi may be stamped — then the fix site
+  is `joinpathsnli.go`, not display). Plus an unexplained
+  GUC-sensitive width flip (448→64 under `enable_hashagg=off`).
+- **F6:** seed rows also wrong (semi selectivity 1.0: 57066 vs
+  PG 13628) — unmentioned; may dominate the bar.
+- **F2/F7:** 0.5% vs 1.025 self-contradiction; no Step 0;
+  "mechanism-only" fallback contradicts the acceptance rule.
+- **F8:** K9 violation (stale serial fixture cited as
+  reference — re-capture live from `:65432`); R48 is
+  independent, not unblocked (could go first).
+- **F9/F10/F11:** blast radius (estimate-audit/EA-ratchet/c13a,
+  all `legacyDisplayCostOf` seed sites), Aggregate-arm guards
+  must mirror the executor's sorted guard + GroupKeyOrder, and
+  the Memoize deferral needs a census not a bare note.
+
+Resubmit requires: Step 0 (stamp-vs-derive, exact 1141.32
+accounting, width-flip explanation) gating all code changes;
+the missing decision site designed or the round explicitly
+downgraded; quant reconciled with consistent rows; live PG
+reference; exact guard conditions.
