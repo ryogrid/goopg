@@ -60,8 +60,8 @@ func TestPGShapedSearchPicksNLIOnCost(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Plan: %v", err)
 	}
-	if !findNLI(node) {
-		t.Fatalf("the searched arm did not reach a NestedLoopIndexJoin on a 50 x 200k indexed join; tree: %s",
+	if !findLateralNLI(node) {
+		t.Fatalf("the searched arm did not reach a lateral nested-loop index join on a 50 x 200k indexed join; tree: %s",
 			describePlanTree(node))
 	}
 }
@@ -109,4 +109,44 @@ func TestPGShapedSearchPicksHashJoinOnCost(t *testing.T) {
 	if j.LeftKey == nil || j.RightKey == nil {
 		t.Errorf("hash join has no keys — the equi-pair stayed a residual; tree: %s", describePlanTree(node))
 	}
+}
+
+// findLateralNLI reports whether the tree holds the R25 decomposed shape: a
+// lateral nested-loop Join over a parameterized IndexScan probe (probe Keys
+// as OuterColumnRef nestloop params). This is what findNLI matched via the
+// fused type before slice 1; the rule-based rewrite path still emits the
+// fused node, so findNLI itself is untouched.
+func findLateralNLI(n Node) bool {
+	found := false
+	var walk func(Node)
+	walk = func(cur Node) {
+		if cur == nil || found {
+			return
+		}
+		if j, ok := cur.(*Join); ok && j.Algo == JoinAlgoNestedLoop && j.Lateral {
+			if _, ok := j.Right.(*IndexScan); ok {
+				found = true
+				return
+			}
+		}
+		switch x := cur.(type) {
+		case *Project:
+			walk(x.Child)
+		case *Filter:
+			walk(x.Child)
+		case *Sort:
+			walk(x.Child)
+		case *Limit:
+			walk(x.Child)
+		case *Aggregate:
+			walk(x.Child)
+		case *WindowAgg:
+			walk(x.Child)
+		case *Join:
+			walk(x.Left)
+			walk(x.Right)
+		}
+	}
+	walk(n)
+	return found
 }

@@ -1,0 +1,30 @@
+                                                                                                         QUERY PLAN                                                                                                         
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=503.48..504.51 rows=83 width=332)
+   CTE customer_total_return
+     ->  HashAggregate  (cost=4238.95..4238.96 rows=1 width=68)
+           Group Key: web_returns.wr_returning_customer_sk, customer_address.ca_state
+           ->  Nested Loop  (cost=2437.23..4238.94 rows=73 width=744)
+                 ->  Hash Join  (cost=2436.98..3637.33 rows=73 width=356)
+                       Hash Cond: (web_returns.wr_returned_date_sk = date_dim.d_date_sk)
+                       ->  Seq Scan on web_returns  (cost=0.00..1065.00 rows=35900 width=348)
+                       ->  Seq Scan on date_dim  (cost=0.00..731.98 rows=149 width=420)
+                             Filter: (d_year = 2000)
+                 ->  Index Scan using customer_address_pkey on customer_address  (cost=0.25..8.48 rows=1 width=388)
+                       Index Cond: (ca_address_sk = web_returns.wr_returning_addr_sk)
+   ->  Sort  (cost=503.48..503.68 rows=83 width=780)
+         Sort Key: c_customer_id, c_salutation, c_first_name, c_last_name, c_preferred_cust_flag, c_birth_day, c_birth_month, c_birth_year, c_birth_country, c_login, c_email_address, c_last_review_date, ctr_total_return
+         ->  Nested Loop  (cost=0.00..500.83 rows=83 width=780)
+               Filter: (ca_address_sk = c_current_addr_sk)
+               Filter: ((ctr_total_return > (SubPlan 1)) AND (ca_state = 'AR'))
+               SubPlan 1
+                 ->  Aggregate  (cost=0.02..0.03 rows=1 width=32)
+                       ->  CTE Scan on customer_total_return ctr2  (cost=0.00..0.02 rows=1 width=68)
+                             Filter: (ctr1.ctr_state = ctr_state)
+               ->  Nested Loop  (cost=0.00..1000.01 rows=50000 width=456)
+                     ->  CTE Scan on customer_total_return ctr1  (cost=0.00..0.01 rows=1 width=68)
+                     ->  Seq Scan on customer_address_1  (cost=0.00..500.00 rows=50000 width=388)
+               ->  Index Scan using customer_pkey on customer  (cost=0.00..0.01 rows=1 width=324)
+                     Index Cond: (c_customer_sk = ctr_customer_sk)
+(26 rows)
+

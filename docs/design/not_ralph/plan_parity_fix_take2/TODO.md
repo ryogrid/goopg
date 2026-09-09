@@ -869,6 +869,18 @@ anything attempted so far.
 
 ## Log
 
+- 2026-09-09 (CC) **R25 slice 1 LANDED** (`r25-nli-decompose/REPORT-slice1.md`).
+  Answered the handover's open question with a controlled A/B: the
+  Q30/Q81 TIMEOUTs **ARE** slice 1's (base 3s/5s -> both >300s), and
+  slice 1 is **not** plan-neutral as the handover recorded. Cause: base
+  DECORRELATED Q30's correlated subquery into a hash join; slice 1
+  leaves it a `SubPlan` per outer row. **PG emits the SubPlan too** —
+  so slice 1 moved Q30 TOWARD PG and the timeout is exactly the case
+  the goal rule sanctions. **Slice 2 must NOT "fix" it**; restoring the
+  decorrelation would move Q30 away from PG.
+  Gates: suites green; TPC-H values 22/22 byte-identical (Q12=2/Q13=34
+  as base); TPC-H parity unchanged (2/20); TPC-DS join-method 75->73,
+  scan-type 72->71, qual-placement 11->13, match 0->0.
 - 2026-09-09 K26 §9: obstacle CLEARED — it was a test helper pinning a
   node kind its own file calls an optimisation (`nliIn` vs
   `nliProbeKeys`); the named test now PASSES with implied equalities.

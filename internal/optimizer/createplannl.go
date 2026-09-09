@@ -155,11 +155,53 @@ func createNestLoopPlan(p *Path) (Node, outputLayout) {
 	return j, in.publishedLayout(jt)
 }
 
+// outerParamKey translates a probe-key expression onto the outer layout
+// (validating coordinates exactly as translateToLayout does — same
+// panics, same order) and then re-roots every same-scope ColumnRef as an
+// OuterColumnRef at level 1: PG's nestloop param. R25
+// (plan-parity-fix-take2) decomposes `NestedLoopIndexJoin` into a
+// `Join{Lateral}` over a parameterized `IndexScan`, and the lateral
+// driver resolves outer references from its per-tuple pushed row
+// (`ctx.OuterRows`), not from a bound slot — so positional outer keys
+// must become levelled outer refs at plan time.
+//
+// The conversion runs under the same scopeIgnore policy as the
+// translation: refs inside inner plans belong to that scope and are
+// stepped over, never re-rooted. cloneExprRefs is fail-closed (an
+// unenumerated node aborts rather than passing a bare ColumnRef
+// through): a surviving bare ColumnRef would read the probe's own
+// (nil) bound slot at runtime instead of failing loudly here.
+func outerParamKey(what string, e Expr, lay outputLayout, index map[int]int) Expr {
+	t := translateToLayout(what, e, lay, index)
+	out, ok := cloneExprRefs(t, scopeIgnore, exprRewriter{
+		Rewrite: func(n Expr) Expr {
+			if cr, isCol := n.(*ColumnRef); isCol {
+				return &OuterColumnRef{pos: cr.Pos(), Level: 1, Index: cr.Index,
+					Name: cr.Name, Type: cr.Type, SourceTableIdx: cr.SourceTableIdx}
+			}
+			return n
+		},
+	})
+	if !ok {
+		panic(fmt.Sprintf("createPlan: %s contains an expression the walker does not enumerate; teach exprChildSlots about it", what))
+	}
+	return out
+}
+
 // createNestLoopIndexJoinPlan is the NLI shape: the inner is a parameterised
 // index path and this loop is what binds its parameter.
 //
 // `innerPath` is passed rather than re-read from `p.Children[1]` so the caller's
 // dispatch decision and this function's assumption are the same value.
+//
+// R25 (plan-parity-fix-take2): the search-arm IndexScan site is DECOMPOSED —
+// it emits `Join{Algo: NestedLoop, Lateral}` over the probe with
+// OuterColumnRef keys (PG's nestloop params) instead of the fused
+// `NestedLoopIndexJoin`. The Memoize-wrapped shape stays fused for now
+// (slice 1b): a Memoize node as a generic right child needs its own
+// buildNode arm plus lazy-fill Open semantics, and per-row re-Open would
+// rebuild the cache per outer row (correct, pointless) — so the cache
+// shape keeps the driver that preserves it, with zero behavior change.
 func createNestLoopIndexJoinPlan(p *Path, innerPath *Path) (Node, outputLayout) {
 	// M0127-P5.4b-ii-b-2: the inner may be a `PathMemoize` wrapping the probe.
 	// It is unwrapped HERE rather than given its own `createPlanNode` arm
@@ -209,6 +251,15 @@ func createNestLoopIndexJoinPlan(p *Path, innerPath *Path) (Node, outputLayout) 
 
 	in := joinInputsFor(p, "PathNestLoop(NLI)", outerPath, innerPath)
 	jtNLI := planJoinTypeFor(p, "PathNestLoop(NLI)")
+	if memoPath != nil {
+		// Slice 1b: the memoized shape keeps the fused node and driver
+		// (function header). The decomposed Join below cannot carry a
+		// Memoize child until it gains a buildNode arm plus lazy-fill
+		// Open semantics — and per-row re-Open would rebuild the cache
+		// per outer row anyway — so the cache shape keeps the driver
+		// that preserves it, with zero behavior change.
+		return createNestLoopIndexJoinPlanFused(p, innerPath, memoPath, in, jtNLI)
+	}
 	// The leaf's local quals arrive as `*Filter` wrappers that `scanLeafFor`'s
 	// rewrapper rebuilt over the probe. `NestedLoopIndexJoin.Inner` is typed
 	// `*IndexScan` and cannot hold them, so they are absorbed into the scan's
@@ -258,7 +309,13 @@ func createNestLoopIndexJoinPlan(p *Path, innerPath *Path) (Node, outputLayout) 
 		if c.key == nil {
 			panic(fmt.Sprintf("createPlan: NLI index clause %d of %s has no probe expression", i, innerPath.IndexInfo.Name))
 		}
-		keys = append(keys, translateToLayout("index probe key", c.key, outerLay, outerIndex))
+	// R25 (plan-parity-fix-take2): the probe keys become PG nestloop
+	// params — OuterColumnRef at level 1 over the outer row — instead of
+	// positional outer-layout refs. The lateral driver resolves them from
+	// its per-tuple pushed row (`ctx.OuterRows`); no slot is bound, so the
+	// whole `translateToLayout` coordinate space (and the outerLay map
+	// above) is deleted with the fused node rather than moved.
+	keys = append(keys, outerParamKey("index probe key", c.key, outerLay, outerIndex))
 	}
 	if len(keys) == 0 {
 		// `createIndexScanPlan` already refuses a parameterised path with no
@@ -279,34 +336,80 @@ func createNestLoopIndexJoinPlan(p *Path, innerPath *Path) (Node, outputLayout) 
 		is.Keys = keys
 	}
 
-	nli := &NestedLoopIndexJoin{
-		pos: in.outer.Pos(),
-		// C-03c; see createHashJoinPlan. `NestedLoopIndexJoin.Output` returns
-		// the schema field RAW (plan.go:942), so the left-only publication for
-		// SEMI/ANTI is not optional here the way `Join.Output`'s derivation
-		// makes it belt-and-braces there — the executor raises XX000 on the
-		// width mismatch (operators_nljoin.go:175-181).
-		Type:  jtNLI,
-		Outer: in.outer,
-		Inner: is,
-		// The residual is evaluated against `outer ++ inner` through the
-		// operator's `virtualOut` (operators_nljoin.go:133-141), so it is
-		// translated onto the MERGED layout — the other of this arm's two
-		// coordinate spaces. No key conjuncts are folded in: unlike the hash
-		// arm, where the key is enforced only by a hash bucket and must be
-		// re-checked, an index probe enforces its keys exactly.
+	// R25 (plan-parity-fix-take2): the fused `NestedLoopIndexJoin` is
+	// gone — PG has no such node. The decomposed shape is a lateral
+	// `Join` over the parameterized probe: `NestLoop` with an inner
+	// `IndexScan` whose keys are PG nestloop params (OuterColumnRef,
+	// level 1), driven per outer row by the lateral stream, which
+	// pushes the outer tuple before re-opening the probe. Residual,
+	// schema and layout are unchanged (same jt, same builders).
+	j := &Join{
+		pos:  in.outer.Pos(),
+		Type: jtNLI,
+		Algo: JoinAlgoNestedLoop,
+		// Lateral marks the right child as referencing the left row:
+		// the driver re-opens it per outer tuple with that tuple in
+		// scope (BindLateralOuter contract, plan.go). Without it the
+		// generic nestloop would Materialize the probe once and replay
+		// it — returning every row for the first outer tuple's key.
+		Lateral:   true,
+		Left:      in.outer,
+		Right:     is,
 		Predicate: in.joinPredicate("PathNestLoop(NLI)", nil, p.Residual),
 		schema:    in.publishedSchema(jtNLI),
-		// InnerMemo is filled below, and only when the SEARCH chose a
-		// `PathMemoize` inner. It is never decided here: attaching a cache to a
-		// join whose cost was computed without one makes the executed plan
-		// cheaper than the plan that won the comparison, which is the uncosted
-		// opinion 06 §2.1 retires. `getMemoizePath` (joinpathsmemoize.go) is
-		// where the decision lives, beside every alternative it competes with.
 	}
-	if memoPath != nil {
-		nli.InnerMemo = memoizeNodeFor(memoPath, is, keys)
+	return j, in.publishedLayout(jtNLI)
+}
+
+// createNestLoopIndexJoinPlanFused builds the pre-R25 fused node for the
+// memoized shape only (slice 1b keeps it: no Memoize-as-child support
+// yet). It is the pre-decomposition body verbatim — positional outer keys
+// via translateToLayout, `NestedLoopIndexJoin` node, `InnerMemo` field —
+// and dies in slice 4 with the type. Callers must not extend it: every new
+// shape goes through the decomposed arm above.
+func createNestLoopIndexJoinPlanFused(p *Path, innerPath *Path, memoPath *Path, in joinInputs, jtNLI JoinType) (Node, outputLayout) {
+	innerBase, leafCond, absorbable := absorbableLeafCond(in.inner)
+	if !absorbable {
+		panic(fmt.Sprintf("createPlan: NLI inner %T carries wrappers that are not leaf-local; IndexScan.Cond cannot evaluate them in the scan's coordinates", in.inner))
 	}
+	is, bare := innerBase.(*IndexScan)
+	if !bare {
+		panic(fmt.Sprintf("createPlan: NLI inner emitted a %T, but NestedLoopIndexJoin.Inner is an *IndexScan", innerBase))
+	}
+	if leafCond != nil {
+		is.Cond = leafCond
+	}
+	outerLay := in.lay[:len(in.outer.Output())]
+	outerIndex := outerLay.bindingIndex()
+	keys := make([]Expr, 0, len(innerPath.IndexClauses))
+	for i, c := range innerPath.IndexClauses {
+		if c.indexCol != i {
+			panic(fmt.Sprintf("createPlan: NLI index clause %d of %s claims index column %d; the index-column order was lost",
+				i, innerPath.IndexInfo.Name, c.indexCol))
+		}
+		if c.key == nil {
+			panic(fmt.Sprintf("createPlan: NLI index clause %d of %s has no probe expression", i, innerPath.IndexInfo.Name))
+		}
+		keys = append(keys, translateToLayout("index probe key", c.key, outerLay, outerIndex))
+	}
+	if len(keys) == 0 {
+		panic(fmt.Sprintf("createPlan: NLI inner %s binds no probe key; the parameter would never be applied", innerPath.IndexInfo.Name))
+	}
+	is.Key, is.Keys = nil, nil
+	if len(keys) == 1 {
+		is.Key = keys[0]
+	} else {
+		is.Keys = keys
+	}
+	nli := &NestedLoopIndexJoin{
+		pos:       in.outer.Pos(),
+		Type:      jtNLI,
+		Outer:     in.outer,
+		Inner:     is,
+		Predicate: in.joinPredicate("PathNestLoop(NLI)", nil, p.Residual),
+		schema:    in.publishedSchema(jtNLI),
+	}
+	nli.InnerMemo = memoizeNodeFor(memoPath, is, keys)
 	return nli, in.publishedLayout(jtNLI)
 }
 
