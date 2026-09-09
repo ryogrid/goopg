@@ -14927,6 +14927,33 @@ func resolveCaseExprAfterAggregate(x *parser.CaseExpr, agg *aggregateSurface) (E
 	return out, nil
 }
 
+// castTargetTakesStringLiteral says whether `cast('<string>' as T)` may be
+// resolved straight to a `TypedStringLit` of type T (R34 / K45), i.e. whether
+// T is one of the types for which the literal's own text IS the value's
+// canonical form.
+//
+// Deliberately narrow: the DATE/TIME family only. That is where the estimate
+// defect lives (every TPC-DS and TPC-H date bound) and where the conversion is
+// plainly information-preserving — `formatExprConstant` renders
+// `TypedStringLit.Value` verbatim and ANALYZE stamped the histogram from the
+// same text.
+//
+// The numeric and integer targets are excluded ON PURPOSE even though
+// `evalTypedStringLit` accepts them. Upstream flags the trap in the very
+// comment this change transliterates (parse_coerce.c:238-243): a type's INPUT
+// function does not behave like its CONVERSION function — "int4's typinput
+// function will reject '1.2', whereas float-to-int type conversion will round
+// to integer". Routing `cast('1.2' as int4)` through the literal path would
+// change which of those two behaviours a query gets, so it keeps the runtime
+// cast. Widening this set is a separate change with its own oracle cases.
+func castTargetTakesStringLiteral(typeName string) bool {
+	switch typeName {
+	case "date", "time", "timetz", "timestamp", "timestamptz":
+		return true
+	}
+	return false
+}
+
 func resolveExpr(e parser.Expr, ctx *resolveContext) (Expr, error) {
 	switch x := e.(type) {
 	case *parser.IntegerConst:
@@ -15221,6 +15248,43 @@ func resolveExpr(e parser.Expr, ctx *resolveContext) (Expr, error) {
 		typeName := strings.ToLower(x.Type.Name)
 		srcType := exprType(operand).Name
 		typmod := encodeTypmod(typeName, x.Typmods)
+		// R34 / K45: a cast whose operand is an UNTYPED string literal is
+		// resolved to a typed literal here, not left as a runtime cast.
+		//
+		// This is `coerce_type`'s unknown-Const arm (parse_coerce.c:232-250):
+		// "Input is a string constant with previously undetermined type.
+		// Apply the target type's typinput function to it to produce a
+		// constant of the target type." PG therefore never presents a cast
+		// node to its planner for this shape, and its EXPLAIN prints
+		// `'2000-08-19'::date` — a Const.
+		//
+		// goopg did leave a `*CastExpr`, and `selectivity.go`'s
+		// `isConstExpr` admits five literal kinds but NOT `*CastExpr`, so a
+		// cast bound silently skipped the histogram and took the DEFAULT
+		// range selectivity. Measured on the TPC-DS SF0.5 clone,
+		// `d_date between cast(..) and cast(..)`: 8116 rows estimated
+		// against PG's 14 (15 actual); TPC-H's `l_shipdate <= cast(..)`
+		// gave 2,000,418 = 6,001,215/3 exactly — the 0.3333 default.
+		//
+		// `TypedStringLit` is the node the `DATE 'x'` spelling already
+		// produces, and it is what makes this safe rather than a new
+		// evaluation: nothing is computed at plan time (PG's own comment
+		// notes typinput may be non-immutable — `date_in` is STABLE — and
+		// that it would rather defer, but cannot represent the call), the
+		// value string is carried through unchanged, and
+		// `formatExprConstant` renders it byte-equal to what ANALYZE
+		// stamped into the histogram.
+		//
+		// Restricted to a BARE string literal operand: a cast over anything
+		// else (including an already-typed literal, where the target type's
+		// input function is NOT the right conversion — upstream's note that
+		// int4's typinput rejects "1.2" while float->int rounds) keeps the
+		// runtime cast.
+		if lit, isStr := operand.(*StringConst); isStr && typmod == 0 {
+			if castTargetTakesStringLiteral(typeName) {
+				return &TypedStringLit{pos: x.Pos(), Type: typeName, Value: lit.Value}, nil
+			}
+		}
 		return &CastExpr{pos: x.Pos(), Operand: operand, TargetType: typeName, SourceType: srcType, Typmod: typmod}, nil
 	case *parser.IsNullExpr:
 		operand, err := resolveExpr(x.Operand, ctx)

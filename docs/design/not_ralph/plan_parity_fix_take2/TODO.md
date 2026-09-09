@@ -1477,3 +1477,41 @@ Follow-ups named, not owned: Sort-rooted merge verdicts,
 Agg-over-Gather and plain-scan sublink Gathers need the
 cost-comparison round (K45 family); nested-under-parallel-top stays
 serial (nesting rule).
+
+## R34 — parse-time coercion of unknown literals (IMPLEMENTED, all gates pass)
+
+`r34-const-fold-preprocess/` (DESIGN v2 after an agent REJECT of v1;
+REPORT.md). `resolveExpr` now resolves `cast('<lit>' as DATE/TIME-family)`
+to `TypedStringLit` (parse_coerce.c:232-250) instead of a runtime
+`CastExpr`, which `selectivity.go:717 isConstExpr` does not admit.
+
+- **K45 CLOSED (attribution + mechanism).** Cast bounds reached the
+  DEFAULT 0.3333 selectivity, never the histogram: `d_date between
+  cast(..) and cast(..)` estimated 8116 vs PG 14; TPC-H `l_shipdate <=
+  cast(..)` gave exactly 6,001,215/3. Now 13. It is a PARSE-ANALYSIS
+  gap, not a missing `eval_const_expressions` — PG's parser applies
+  typinput to an UNKNOWN Const, so PG never has the node.
+- **K46/K47 (successors, required for the corpus).** Every corpus date
+  predicate uses `+ INTERVAL`, where only the lower bound folds, so the
+  15 affected queries moved 8116 -> ~12121: still wrong and NUMERICALLY
+  FURTHER from PG's 14. Needs `estimate_expression_value` (folds STABLE
+  for estimation only; `date_in` is `provolatile='s'`, so an
+  immutable-only guard folds nothing) plus a type-aware histogram
+  comparison (`formatExprConstant` matches byte-equal, so a folded
+  timestamp cannot match a date histogram — measured 204 vs 14).
+- **K48.** Pre-existing `FoldConstants` defects, live today via
+  `foldPlanConstants` (planner.go:2136) and NOT introduced by R34:
+  numeric arithmetic via float64 (`1.10+2.20` -> `3.3`, PG `3.30`), no
+  int4-width overflow (`2e9+2e9` folds instead of raising 22003),
+  byte-wise string ordering ignoring collation.
+- **K49 — THE STRUCTURAL FINDING. join-order is NOT estimate-driven.**
+  Three controlled experiments: R30 correlation (~14x), R31b relpages
+  (15%), R34 cardinality (580x on 15 queries). join-order stayed at
+  exactly 95/99 and 20/22 through all three; R34 moved NO category on
+  either corpus. Stop spending rounds on estimate inputs expecting join
+  order to follow. Target the SEARCH: enumeration order, `add_path`
+  dominance, and whether both candidates are generated at all.
+- **Correction to record.** My claim that `FoldConstants` was dead code
+  was FALSE (grep excluded `foldconst.go`, which holds the wrapper). It
+  runs at planner.go:2136 — but AFTER plan selection, so selectivity
+  never sees folded quals. Only the timing differs from PG.
