@@ -1939,3 +1939,69 @@ units green.
   decisions this round were reversed by measurement after passing
   review — the adversarial review caught the schema gap, but only the
   A/B caught the NLI cap.
+
+
+## R41 — the ANTI leaf-count decline is a coordinate-space mismatch (DESIGN, pre-review)
+
+`r41-anti-leaf-coordinates/DESIGN.md`. Successor to R40's K72.
+
+- **K74 — R40 BROKE A DOCUMENTED INVARIANT; K72 is a defect this
+  workstream introduced, not a pre-existing mismatch.** Instrumented
+  (trace reverted before commit), same reading for all three Q78 CTEs:
+  `DPTRACE LEAFCOUNT nprefix=3 nscans=2 jl=2` alongside the standing
+  `nrels=2`. Three of the four numbers are 2; only `jl.nrels()` is 3.
+  R40's §4d narrowing correctly stopped emitting a `rangeBinding` for a
+  SEMI/ANTI nullable side (`planner.go:3466-3471` does not advance
+  `leftCtx`), but the joinlist deconstruction still allocates a LEAF
+  INDEX for it — so `len(ctx.bindings)=2` while `jl.nrels()=3`.
+  `fromItemRels` (`collapse.go:423`) states the violated invariant in
+  its own comment: *"Exactly the number of `rangeBinding`s
+  `planFromItem` appends for the same item … which is what keeps leaf
+  numbering and binding order in step."* **First design draft called
+  this an inherent "two coordinate spaces" condition and was refuted on
+  review** — `bindings`/`scans`/`cumOffsets`/`boundaryMap`/`leafRel` are
+  ALL already in collapsed space; only the joinlist and the SJI scope
+  are not. Our own trace had printed `nrels=2` all along and the draft
+  mis-attributed it.
+- **K75 — the `leaf-count` decline is currently preventing a PANIC, not
+  a wrong answer.** With `len(ctx.bindings)=2` and `nprefix=3`,
+  `ctx.bindings[:nprefix]` (`joinsearchseam.go:507`, `:538`) is
+  index-out-of-range. The seam panics before
+  `validateJoinlistProblem`'s second net can fire. So the one-line
+  "compare `len(jl)` instead of `nrels()`" fix converts a clean decline
+  into a crash.
+- **The fix is a RENUMBERING, not a remap** (design §4): `prob.scans[i]`
+  is already the opaque ANTI `*Join` node, so a joinlist LEAF naming it
+  resolves through the existing `leafRel` path with `lo,hi=i,i+1` and no
+  coordinate work. Four sites: `deconstructFromItemScoped`,
+  `fromItemRels`, `newSjiScope`, and dropping the ANTI's SJI from
+  `join_info_list`. Plus a new `len(ctx.bindings) == jl.nrels()`
+  assertion, because after the fix nothing else would catch a
+  desynchronisation between the plan tree's `demotedForPlan` verdict and
+  the joinlist's separate in-place `reduceOuterJoins` verdict.
+- **Do NOT generalise to FULL.** A pinned FULL item keeps BOTH bindings
+  (`planner.go:3470` skips only Semi/Anti), so collapsing it would make a
+  leaf span two binding coordinates — that is where the real
+  `boundaryMap` totality risk lives (`createplanroot.go:263` panics on an
+  unfillable hole). For SEMI/ANTI there is no hole, because the nullable
+  side has no binding coordinate at all.
+- **The one-line fix (compare `len(jl)` instead of `nrels()`) is WRONG.**
+  `nprefix` also feeds the preceding `leafRange()` equality and the
+  `cumOffsets` sizing, both of which consume FROM-item indices. Changing
+  its unit for the count alone would let the guard pass with the offsets
+  still wrong — converting a clean decline into silently mis-resolved
+  columns, this workstream's recurring failure mode (Q21's stale merged
+  Semi schema; R40 §4d).
+- `extractSearchLeaves` treating ANTI as opaque is FORCED, not an
+  oversight: `Join.Output()` returns `Left.Output()` for Semi/Anti, so
+  the right side's columns do not exist above the node.
+  `joinPinned(parser.JoinAnti)` is already `true`, and
+  `pinnedOverAPinnedSide`'s comment had already NAMED this exact hazard
+  ("the JOINLIST side flattens while the PLAN side stops at the link and
+  `extractSearchLeaves` returns one opaque leaf — the leaf count then
+  disagrees with the relation count"). R40 created a new instance of a
+  hazard the file predicted.
+- **Even if fixed, Q78 is not predicted to MATCH**: a 2-leaf search
+  cannot place `date_dim` below the anti pair the way PG's 3-leaf search
+  can. Eligibility is necessary, not sufficient — same relationship R27
+  §4a recorded for Q49.
