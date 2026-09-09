@@ -1821,3 +1821,72 @@ workstreams, and neither is a defect in this one's plan:
 - **K65** (column pruning) needs `minimize_datum` for `DatumBytes`;
   pruning alone leaves 72 B/row vs PG's 22 and still spills (K67).
 - **K68** (3 declines) needs B-06's consumer wiring.
+
+## R40 — complete the LEFT->ANTI transplant (K69, DESIGN pre-review)
+
+`r40-left-anti-transplant/DESIGN.md`. Root-causes K69's three
+`outer-link-no-sjinfo` declines (all in Q78) by instrumenting
+`outerLinksHaveSJInfos` directly (temporary trace, reverted before
+commit) rather than inferring from code: all three fire on an identical
+mismatch, `want jt=1(LEFT) ... have jt=6(ANTI)` on the same relids. Each
+of Q78's three CTE bodies (`ws`/`cs`/`ss`) has
+`<channel>_sales LEFT JOIN <channel>_returns ON … WHERE
+<returns>.order_number IS NULL`; `reduceOuterJoins`'s real call
+(feeding `ctx.joinInfoList`) demotes this to ANTI via S9.3, but
+`demotedForPlan` — by K30's deliberate, correct-at-the-time decision —
+transplants only the INNER half of the verdicts to the plan tree,
+leaving the plan at LEFT. The two consumers disagree on Jointype and
+`outerLinksHaveSJInfos` fails closed.
+
+**Verified against the PG 18.3 oracle (`:65438`)**: this exact shape
+plans as `Merge Anti Join` with the `IS NULL` qual dropped from the
+rendered plan entirely (not a residual filter); row counts match
+(323532) between the LEFT+`IS NULL` form and an explicit `NOT EXISTS`
+rewrite. This is a real, currently-unrealized parity opportunity, not
+an eligibility technicality.
+
+**Confirmed why a bare Jointype transplant is unsafe** (locks down
+K30's one-line reason structurally): `Join.Output()` (`plan.go:1205`)
+and `joinPublishesInner` (`joinrelsize.go:136`) both drop the
+inner/nullable side's columns for Semi/Anti — transplanting ANTI without
+also removing `wr_order_number IS NULL` from WHERE would try to resolve
+a column that no longer exists in the join's output row. Separately,
+`mapJoinType` (`planner.go:6586`) has no `parser.JoinAnti` case and
+silently falls to `JoinTypeInner` — both gaps must close together.
+
+**Design proposes**: (a) `demotedForPlan` transplants ANTI too and
+reports which table(s) it demoted; (b) `mapJoinType` learns
+`parser.JoinAnti -> JoinTypeAnti` (not `JoinSemi` — `applyDemotion`
+never produces one, so mapping it would be speculative); (c) a new
+`stripForcingNullQuals`, mirroring `collectForcedNullTableNames`'s
+top-level-AND-only walk exactly (so it can only drop what the decision
+side already certified as forcing), removes the specific `IS NULL`
+conjunct from a LOCAL copy of the WHERE clause before it is resolved
+into the top Filter — `s.Where` itself is never mutated, same
+discipline `canonicalizeQual` already uses one line below it.
+
+**Adversarial review (subagent, full HEAD re-derivation) found a real
+gap and it is now closed in the design.** 15 factual claims verified
+against the real source, including both crux wiring questions (is
+`ctx` the same object across `planFromClause` and the WHERE arm? is
+`demotedForPlan`/`reduceOuterJoins` called with the same raw
+`s.Where` `stripForcingNullQuals` would walk?) — both yes. But review
+found (a)-(c) alone would be reachable-and-wrong for Q78 itself:
+`planFromItem`'s per-item schema-carry (`planner.go:3211,3346-3347`)
+does not narrow for Semi/Anti when a further join in the SAME
+`FromExpr` chains onto it — exactly Q78's `<channel>_sales
+LEFT JOIN(->ANTI) <channel>_returns ... JOIN date_dim` shape. Traced
+to a PREVIOUSLY SHIPPED bug of the identical class
+(`joinlayout.go`'s `reresolveJoinByName` doc: a stale merged
+Semi-join schema corrupted Q21's NOT-EXISTS to 0 rows instead of
+~411) and to an existing safe counter-pattern already in the codebase
+(`unnest.go:3315` stores a left-only schema at Semi/Anti construction
+rather than deferring to `Output()`). **Design now includes §4d**
+(mirror that pattern + gate the loop-carry on join type), traced
+end-to-end for Q78's exact shape, and §6's gate list now requires a
+3-relation VALUES regression (not just 2-relation) since only the
+3-relation shape exercises §4d. Full record in DESIGN.md §8.
+
+Status: design reviewed and corrected. Not yet implemented, no code
+change, tree clean. Next: commit -n + push the design, then
+implement.
