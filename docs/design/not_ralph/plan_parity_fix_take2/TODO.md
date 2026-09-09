@@ -1783,3 +1783,41 @@ multiplies unconditionally via `clauseSelectivity` (NOT the
 - **Why not implemented:** the design's own prediction ("the spill term
   disappears") is now known false. Landing it alone would churn shapes
   on both corpora while leaving the target query unmoved.
+
+## R39 — the 8 seam declines, triaged (investigation, no code change)
+
+`r39-seam-decline-triage/FINDINGS.md`. Census unchanged by R36. A
+declined query falls to the legacy planner and CANNOT match PG by any
+costing work, so these 5 queries are hard-blocked from `match`.
+
+- **K68 — `outer-over-derived` (3) is a DELIBERATE guard, blocked on
+  B-06.** `relfromjoinlist.go:665`. An outer join over a derived (CTE)
+  input has no statistics, so every path prices at rows=1; Q78 once
+  costed Nested Loop 3.07 vs Hash 3.09 on that lie and ran 15 s -> 327 s
+  TIMEOUT. Its resume note says "lift when B-06 wires CTE-output
+  stats". **Verified B-06 has NOT landed**: `cte_stats_synthesis.go` is
+  step 2 part 1 and its header says "nothing here is called from
+  production yet ... inert by construction"; no non-test caller exists.
+  DO NOT lift this decline first — it re-opens a measured 20x timeout.
+- **K69 — `outer-link-no-sjinfo` (3)**, `joinsearchseam.go:477`: outer
+  links with no matching SpecialJoinInfo (the fail-closed
+  `outerLinksHaveSJInfos` guard). R27 fixed the Q49 instance of this
+  class by making the PLAN and `join_info_list` agree on join TYPE;
+  these three are a different instance needing their own diagnosis.
+  Worked precedent exists.
+- **K70 — `outer-spine` (2)**, `joinsearchseam.go:253`, when
+  `splitOuterSpine` cannot peel the pinned spine. Already knowingly
+  deferred at `planner.go:1515` too. Deepest of the three.
+- Five of the eight sit on ONE problem
+  (`web_returns,date_dim,web_page`); the other three are one shape
+  across the three sales channels.
+- **Recommended order: B-06 wiring -> outer-link-no-sjinfo -> outer-spine.**
+
+### Cross-workstream dependencies (state plainly, do not re-investigate)
+
+Two of this session's blockers terminate in OTHER in-flight
+workstreams, and neither is a defect in this one's plan:
+
+- **K65** (column pruning) needs `minimize_datum` for `DatumBytes`;
+  pruning alone leaves 72 B/row vs PG's 22 and still spills (K67).
+- **K68** (3 declines) needs B-06's consumer wiring.
