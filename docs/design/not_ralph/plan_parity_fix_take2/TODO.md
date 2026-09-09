@@ -2403,3 +2403,53 @@ terminating in estimate-side work.
   two matches goopg has and it is in the blast radius of BOTH steps
   independently (a `date + interval` site AND `0.05 +/- 0.01` constant
   arithmetic).
+
+
+### R44 step A LANDED (`r44-const-fold-before-selectivity/REPORT-stepA.md`)
+
+`foldQualConstants` applies the existing `FoldConstants` to a resolved qual
+at the point PG's `preprocess_expression` runs `eval_const_expressions` —
+before the estimator. Wired at three sites: both WHERE arms AND
+`planJoinPredicate`'s ON clause (the last is REQUIRED per K86, or the round
+is WHERE-only).
+
+**Result: net -6 TPC-DS parity categories** (join-method 71->69,
+parameterisation 39->37, aggregation-strategy 84->82), **31 plans
+changed**, TPC-DS runtime 811s->771s (-4.9%) with Q38 12s->2s, Q87
+11s->2s, Q99 5s->1s. Sweep **PASS=95 MISMATCH=0 CKMISMATCH=0 ERROR=0
+TIMEOUT=0** with all 99 verdicts and row counts identical. TPC-H
+byte-identical in both values and plan text. Match unmoved (0/99, 2/22).
+
+- **K89 — I reported "step A changed nothing" from TPC-H evidence alone,
+  and that was WRONG.** TPC-H really is byte-identical; TPC-DS moves 31
+  plans and -6 categories. This also settles K85 in the REVIEW's favour:
+  rev 1 called step A inert, review said the converse was false because
+  plain numeric arithmetic already folds, TPC-H made review look wrong,
+  TPC-DS showed it was right. **Two corpora can give opposite answers —
+  measure BOTH before characterising a change.**
+- **K88 confirmed in the wild.** Q6's filter now renders
+  `l_discount <= 0.060000000000000005` — `evalArith`'s numeric path is
+  float64 (`ParseFloat`/`FormatFloat`), where PG uses exact `numeric` and
+  renders `0.06`. Pre-existing (the late fold already rendered it), but
+  step A now feeds that string to the ESTIMATOR too. Answer-safe here only
+  because it LOOSENS an upper bound. **Filed as its own defect** and it is
+  also a live `rendering` divergence.
+- **Step B (the temporal domain, K83's 11.9x Q14 error) is NOT landed**,
+  and implementing step A confirmed the §5a blockers: the leaf
+  `internal/utils/adt/datetime` has formatting/normalisation/validation but
+  **no date+interval arithmetic** — that is `executor/expr.go`'s
+  `addDateTimeInt`, and executor imports optimizer in ~91 files so the
+  dependency cannot be reversed. Step B needs that arithmetic EXTRACTED
+  into the leaf package. Plus: still no reachable `provolatile` index, and
+  the folded-literal spelling (timestamp vs date) is still undecided.
+
+- **K90 — two operational traps hit this session.**
+  1. `/tmp/pp2` (private bench clone + ALL captures) did not survive the
+     session boundary; only git-tracked captures under `r0-baseline/` and
+     `r2-instrument/` did. **Anything needed across sessions must live in
+     the repo.**
+  2. The sweep writes plan sections as `===== Qn =====` while
+     `pg-plan-parity-diff.py` expects `=== Qn`. Feeding it the sweep file
+     directly returns `queries=0 match=0` — which reads exactly like a
+     clean run rather than a parse failure. Convert with
+     `sed -E 's/^===== (Q[0-9]+) =====$/=== \1/'` first.

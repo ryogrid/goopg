@@ -1427,6 +1427,13 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 				if err != nil {
 					return nil, err
 				}
+				// R44/K83 step A: fold before the estimator, where PG's
+				// preprocess_expression runs eval_const_expressions. An
+				// unfolded constant sub-expression fails `isConstExpr` and
+				// the clause is estimated at selectivity 1.0.
+				if pred, err = foldQualConstants(pred); err != nil {
+					return nil, err
+				}
 				// M0134-0010 §4: NOT NULL-driven reduction of IS [NOT] NULL
 				// restriction quals (initsplan.c add_base_clause_to_rel /
 				// restriction_is_always_true / restriction_is_always_false),
@@ -1484,6 +1491,11 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 				var err error
 				pred, err = resolveExpr(whereQual, ctx)
 				if err != nil {
+					return nil, err
+				}
+				// R44/K83 step A: see the sibling call in the single-relation
+				// arm above.
+				if pred, err = foldQualConstants(pred); err != nil {
 					return nil, err
 				}
 				node = &Filter{pos: s.Where.Pos(), Child: node, Predicate: pred}
@@ -6478,7 +6490,15 @@ func planJoinPredicate(join parser.JoinExpr, leftCtx, rightCtx, mergedCtx *resol
 		return nil, nil
 	}
 	if join.On != nil {
-		return resolveExpr(join.On, mergedCtx)
+		// R44/K83 step A: ON-clause quals reach the estimator by a different
+		// route than WHERE (planJoinPredicate -> chainOnQual ->
+		// joinsearchseam), so they must be folded here too or the round is
+		// WHERE-only (K86).
+		onPred, onErr := resolveExpr(join.On, mergedCtx)
+		if onErr != nil {
+			return nil, onErr
+		}
+		return foldQualConstants(onPred)
 	}
 	if len(join.Using) > 0 {
 		return buildUsingPredicate(join.Pos(), join.Using, leftCtx, rightCtx)

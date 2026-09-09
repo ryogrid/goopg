@@ -110,6 +110,42 @@ func foldPlanConstants(node Node) (retErr error) {
 	return nil
 }
 
+// foldQualConstants applies FoldConstants to ONE resolved qual, at the point
+// PG's `preprocess_expression` runs `eval_const_expressions` — i.e. BEFORE the
+// clause reaches the estimator — and converts a folding evaluation error into
+// a `*PlanError` exactly as `foldPlanConstants` does. R44/K83.
+//
+// Why a separate entry point rather than moving `foldPlanConstants`' call
+// site: that pass walks a finished plan TREE and also folds target lists and
+// projections, which is not this round's scope and would change EXPLAIN output
+// far beyond the quals. This folds one expression, at the qual sites, and
+// leaves the late tree pass exactly as it was.
+//
+// Why the estimator needs this at all (measured, TPC-H): a restriction written
+// `l_shipdate < DATE '1995-09-01' + INTERVAL '1 month'` estimates at
+// selectivity 1.0 — `isConstExpr` (selectivity.go) sees a `*BinaryOp`, not a
+// literal, so the clause contributes NOTHING — while the equivalent
+// `< DATE '1995-10-01'` estimates correctly. PG never has this problem because
+// it folds first. Note the same applies to plain numeric arithmetic such as
+// TPC-H Q6's `l_discount BETWEEN 0.05 - 0.01 AND 0.05 + 0.01`, which is why
+// this step moves estimates even before temporal literals are foldable
+// (R44/K85: this is step A, and it is separately measurable from step B).
+func foldQualConstants(e Expr) (out Expr, retErr error) {
+	if e == nil {
+		return nil, nil
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			if fe, ok := r.(foldEvalPanic); ok {
+				out, retErr = nil, fe.err
+			} else {
+				panic(r) // re-panic for unexpected panics
+			}
+		}
+	}()
+	return FoldConstants(e), nil
+}
+
 func foldPlanConstantsInner(node Node) {
 	if node == nil {
 		return
