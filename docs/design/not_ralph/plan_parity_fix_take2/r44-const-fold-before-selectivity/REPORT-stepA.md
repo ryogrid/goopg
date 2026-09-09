@@ -1,5 +1,19 @@
 # R44 step A — fold quals where PG folds them (K83/K85/K89)
 
+> **CORRECTION (2026-09-10, see `REPORT-stepB.md` §4 / K91).** This
+> report's claim that TPC-H is *byte-identical* under step A is
+> **WRONG**. Two harness faults produced it: `launch.sh` had lost its
+> serving-binary verification (so a stale server answered both arms,
+> and one arm named a binary that never existed), and
+> `capture-tpch.sh` read a query corpus that `/tmp` clearing had
+> removed, emitting a 4-line stub — diffing two stubs reports
+> "identical". Re-measured with a verified harness, step A changes
+> TPC-H plans (25 diff lines) and moves TPC-H parity by −1 net
+> (parallelism −1, qual-placement −1, aggregation-strategy +1).
+> The TPC-DS numbers below are UNAFFECTED — they came from
+> `tpcds-sf05-regression.sh`, which fingerprints its own binary — and
+> the values claim re-verifies as correct.
+
 *2026-09-10. Step A only; step B (the temporal domain) is NOT in this
 change and is scoped in §5. All gates green.*
 
@@ -14,7 +28,7 @@ change and is scoped in §5. All gates green.*
 | TPC-DS plans changed | — | **31** |
 | TPC-DS total runtime | 811 s | **771 s** (−4.9 %) |
 | TPC-DS match | 0/99 | 0/99 |
-| TPC-H everything | — | **byte-identical** |
+| TPC-H everything | — | ~~byte-identical~~ **see the correction below** |
 
 **Net −6 parity categories on TPC-DS**, three queries substantially faster
 (Q38 12 s → 2 s, Q87 11 s → 2 s, Q99 5 s → 1 s), and no answer changed
@@ -43,8 +57,13 @@ projections, which is out of scope here.
 ## 3. A correction I have to make (K89)
 
 **I reported "step A changed nothing" after measuring TPC-H alone. That was
-wrong.** TPC-H plans really are byte-identical — but TPC-DS moves **31
-plans** and −6 categories. I generalised from one corpus to both.
+wrong.** TPC-DS moves **31 plans** and −6 categories. I generalised from one
+corpus to both.
+
+(And the TPC-H half of that sentence was wrong too, for a *different*
+reason — the harness was broken, not the change. See the correction at the
+top: TPC-H moves 25 diff lines and −1 net category. Both readings of "TPC-H
+unchanged" in this report are superseded.)
 
 This also settles the review's K85 in the review's favour. The design's rev
 1 called step A "inert without the temporal arm"; review said the converse
@@ -104,12 +123,11 @@ this change, and the design's §5a blockers all stand:
 | **TPC-DS SF0.5 sweep** | **PASS=95 MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0** |
 | TPC-DS verdicts + row counts vs baseline | identical for all 99 |
 | TPC-DS plan shape | 31 changed, −6 parity categories, −4.9 % runtime |
-| TPC-H values, 27 query files | byte-identical (A/B against a pre-change binary) |
-| TPC-H plan text | byte-identical |
+| TPC-H values, 22 queries | identical — RE-VERIFIED with a verified server per arm |
+| TPC-H plan text | ~~byte-identical~~ **WRONG — 25 diff lines; see the correction at the top** |
 
-The TPC-H A/B was run against a purpose-built pre-change binary rather than
-a stored baseline, because the previous session's `/tmp` captures were
-cleared — see §7.
+The TPC-H rows above are the RE-VERIFIED values; the original run of them
+was invalid (correction at the top).
 
 ## 7. Operational note
 

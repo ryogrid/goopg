@@ -509,9 +509,27 @@ func numericValue(s, typeName string) (float64, bool) {
 	// large win the item's original wording implied (07 §4 records the
 	// correction).
 	case "date":
-		if t, err := time.Parse("2006-01-02", strings.TrimSpace(s)); err == nil {
-			// Julian-style day number; only differences matter here.
-			return float64(t.Unix()) / 86400.0, true
+		// R44/K83 step B: the timestamp spellings are accepted here too,
+		// because folding `date + interval` yields a TIMESTAMP literal (PG
+		// spells it that way as well) which is then compared against a DATE
+		// column's histogram. Without these layouts the folded literal fails
+		// to parse, `bucketFraction` falls back to a flat 0.5, and the fold
+		// lands the estimate within half a bucket instead of on it — the
+		// residual this arm's own comment above exists to remove.
+		//
+		// The day-based scale is kept for every layout: both the literal and
+		// the histogram bounds come through this same function with the same
+		// typeName, so the scale only has to be self-consistent, and mixing
+		// in the timestamp arm's seconds scale would break that.
+		for _, layout := range []string{
+			"2006-01-02",
+			"2006-01-02 15:04:05.999999",
+			"2006-01-02 15:04:05",
+		} {
+			if t, err := time.Parse(layout, strings.TrimSpace(s)); err == nil {
+				// Julian-style day number; only differences matter here.
+				return float64(t.Unix()) / 86400.0, true
+			}
 		}
 		return 0, false
 	case "timestamp", "timestamp without time zone", "timestamptz", "timestamp with time zone":

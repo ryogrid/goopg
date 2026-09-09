@@ -2453,3 +2453,54 @@ byte-identical in both values and plan text. Match unmoved (0/99, 2/22).
      directly returns `queries=0 match=0` — which reads exactly like a
      clean run rather than a parse failure. Convert with
      `sed -E 's/^===== (Q[0-9]+) =====$/=== \1/'` first.
+
+
+### R44 step B LANDED + a correction to step A (`REPORT-stepB.md`)
+
+Q14's 11.9x error is FIXED: `lineitem` 938,645 -> **78,680**, and the
+filter now renders `'1995-10-01 00:00:00'::timestamp` — PG's own spelling.
+**R44 total: -10 TPC-DS categories and -3 TPC-H categories** (TPC-DS
+join-method 71->66, parameterisation 39->35, aggregation-strategy 84->82;
+TPC-H parallelism 18->17, qual-placement 6->5, sort-strategy 13->12).
+Sweep PASS=95 all-zero, row counts identical, values identical. Match
+unmoved (0/99, 2/22).
+
+- **DESIGN §5a.2 RETRACTED — step B needed no executor extraction.** The
+  pieces were already importable: `parser.ParseIntervalBodyWithDefault`
+  for the interval body, `time.AddDate` for the month/day carry (the same
+  primitive `addTimeInterval` uses, so planner and executor cannot
+  disagree), and leaf `datetime.FormatTimestamp` for rendering. The
+  companion change widens `numericValue`'s `date` arm to accept timestamp
+  spellings (keeping the DAY scale), without which `bucketFraction` falls
+  back to a flat 0.5 and the fold lands half a bucket off.
+- Volatility still unresolved, so the fold is scoped to ONE
+  oracle-verified-immutable family (`date_pl_interval`, `provolatile='i'`)
+  with both operands literal. Broadening REQUIRES the volatility map.
+- **K88 hit for real.** The first version folded `interval 'infinity'`
+  arithmetically and returned `119521-07-18 06:23:01.689343` for
+  `timestamp '2020-01-01' + interval 'infinity'` — a WRONG ANSWER. The
+  executor implements ±infinity as sentinels. Caught by
+  TestTimestampIntervalInfinity / TestIsFiniteInfinity /
+  TestTimestampSubInfinity — by the SUITE, not by review. Fold now
+  declines on `parser.IntervalNoEnd*`/`IntervalNoBegin*`.
+
+- **K91 — MEASUREMENT-INTEGRITY FAILURE; `REPORT-stepA.md`'s "TPC-H
+  byte-identical" claim was WRONG and is now corrected in place.** Two
+  harness faults, both mine, both introduced after `/tmp` was cleared:
+  1. **`launch.sh` lost its serving-binary verification.** I rewrote it
+     from memory and dropped the inode check. `<bin> stop -D <dir>` fails
+     when `postmaster.pid` is gone or the binary differs, so a **stale
+     server kept serving** and every "A/B" ran one binary. One arm even
+     named `tmp/goopg-base`, which never existed.
+  2. **`capture-tpch.sh` reads `/tmp/parity-r0/queries/tpch`**, wiped with
+     `/tmp`. Every capture became a 4-line stub ending `(capture failed)`,
+     and **diffing two stubs reports "identical"**.
+  Both faults share one signature — **the null result and the broken
+  result are indistinguishable** — which is also K90's `queries=0 match=0`
+  parse failure. TPC-DS numbers were never affected
+  (`tpcds-sf05-regression.sh` fingerprints its own binary).
+  **Fixed:** `launch.sh` now kills the port holder by PID and REFUSES to
+  proceed unless `/proc/<pid>/exe` matches the requested binary's inode;
+  the TPC-H corpus was restored from `tmp/take4/`.
+  **Standing rule: a harness must fail loudly, and an A/B must prove which
+  binary answered. Where it cannot, the result is not evidence.**

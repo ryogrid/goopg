@@ -4,8 +4,11 @@ import (
 	"fmt"
 	"math"
 	"strconv"
+	"strings"
+	"time"
 
 	"github.com/goopg/goopg/internal/parser"
+	"github.com/goopg/goopg/internal/utils/adt/datetime"
 )
 
 // FoldConstants performs a bottom-up constant-folding pass on a resolved
@@ -268,7 +271,147 @@ func foldPlanConstantsInner(node Node) {
 // tryFoldBinaryOp attempts to evaluate a binary operation whose operands have
 // already been folded. Returns nil when the fold cannot be performed (e.g.,
 // one operand is a non-literal ColumnRef).
+// pgEpochUnix is 2000-01-01T00:00:00Z in Unix seconds — the origin
+// `datetime.FormatTimestamp` counts micros from (postgresEpochJDate).
+const pgEpochUnix int64 = 946684800
+
+// tryFoldTemporalBinaryOp folds `<date|timestamp literal> ± <interval literal>`
+// into a single timestamp literal — R44/K83 step B.
+//
+// Why this is needed at all, measured on TPC-H at SF=1: writing a restriction
+// as `l_shipdate < DATE '1995-09-01' + INTERVAL '1 month'` instead of the
+// equivalent `< DATE '1995-10-01'` took the `lineitem` estimate from 78,680
+// rows to 938,645 — exactly the parallel-divided full table, i.e. the clause
+// contributed NOTHING, because `isConstExpr` (selectivity.go) sees a
+// `*BinaryOp` rather than a literal. An 11.9x error from one missing fold.
+// PG never has it: `eval_const_expressions` folds this in
+// `preprocess_expression`, which is why PG's Q14 plan already renders
+// `'1995-10-01 00:00:00'::timestamp`.
+//
+// SCOPE, and why there is no volatility lookup here. PG gates folding on
+// `provolatile`, and goopg has NO `provolatile` index reachable from the
+// optimizer (`IsStrictProc`'s generated map carries no volatility column, and
+// `initdb`'s seed data cannot be imported — initdb -> executor -> optimizer
+// would cycle). Rather than fold on an unverified guess, this handles ONE
+// operator family whose immutability was checked directly against the live
+// PG 18.3 oracle: `date + interval` is `date_pl_interval`, `provolatile='i'`.
+// Both operands are literals, so no volatility can enter. **Broadening this
+// beyond the temporal literals below REQUIRES generating a real
+// `pgProcVolatileByOID` map first** — that is R44 §5a.1 and it is not done.
+//
+// Semantics follow the executor's `addTimeInterval` (`executor/expr.go`) so
+// the planner and the executor cannot disagree about what the expression
+// means: months and days go through `time.AddDate`, which carries year/month
+// overflow the way `timestamp_pl_interval` does, then micros are added. That
+// agreement is load-bearing — a divergence here would change ANSWERS, not
+// just estimates (R44/K88).
+//
+// The result is spelled as a `timestamp`, matching PG's own rendering. The
+// companion change is in `numericValue` (selectivity.go), whose `date` arm
+// accepted ONLY "2006-01-02"; without widening it the folded literal would
+// fail to parse against a `date` column's histogram and `bucketFraction`
+// would fall back to a flat 0.5 — the fold would land the estimate within
+// half a bucket instead of on it.
+func tryFoldTemporalBinaryOp(pos int, op parser.OpCode, l, r Expr) Expr {
+	if op != parser.OpAdd && op != parser.OpSub {
+		return nil
+	}
+	base, ok := l.(*TypedStringLit)
+	if !ok {
+		return nil
+	}
+	switch strings.ToLower(strings.TrimSpace(base.Type)) {
+	case "date", "timestamp", "timestamp without time zone":
+	default:
+		return nil
+	}
+	iv, ok := r.(*IntervalLit)
+	if !ok {
+		return nil
+	}
+	t, ok := parseTemporalLiteral(base.Value)
+	if !ok {
+		return nil
+	}
+	months, days, micros, ok := intervalComponents(iv)
+	if !ok {
+		return nil
+	}
+	if op == parser.OpSub {
+		months, days, micros = -months, -days, -micros
+	}
+	res := t.AddDate(0, int(months), int(days)).Add(time.Duration(micros) * time.Microsecond)
+	usec := (res.Unix()-pgEpochUnix)*1000000 + int64(res.Nanosecond())/1000
+	return &TypedStringLit{pos: pos, Type: "timestamp", Value: datetime.FormatTimestamp(usec)}
+}
+
+// parseTemporalLiteral reads the spellings a `date`/`timestamp` literal can
+// carry, in the same order `numericValue` accepts them.
+func parseTemporalLiteral(s string) (time.Time, bool) {
+	s = strings.TrimSpace(s)
+	for _, layout := range []string{
+		"2006-01-02 15:04:05.999999",
+		"2006-01-02 15:04:05",
+		"2006-01-02",
+	} {
+		if t, err := time.Parse(layout, s); err == nil {
+			return t.UTC(), true
+		}
+	}
+	return time.Time{}, false
+}
+
+// intervalComponents resolves an IntervalLit to (months, days, micros).
+// Multi-field bodies are already decoded by the parser (`PreComputed`);
+// the single-unit form goes back through the same parser entry point the
+// analyzer used, so no interval grammar is duplicated here.
+func intervalComponents(iv *IntervalLit) (months, days int32, micros int64, ok bool) {
+	if iv.PreComputed {
+		if intervalIsInfinite(iv.PreMonths, iv.PreDays, iv.PreMicros) {
+			return 0, 0, 0, false
+		}
+		return iv.PreMonths, iv.PreDays, iv.PreMicros, true
+	}
+	if iv.Qualified || iv.HasPrec {
+		// Trailing-qualifier / SECOND(p) forms truncate or round in ways
+		// `evalIntervalLit` owns; declining keeps the planner from
+		// disagreeing with the executor about the value.
+		return 0, 0, 0, false
+	}
+	unit := iv.Unit
+	if unit == "" {
+		unit = "second"
+	}
+	mo, d, mu, parsed := parser.ParseIntervalBodyWithDefault(iv.Value, unit)
+	if !parsed || intervalIsInfinite(mo, d, mu) {
+		return 0, 0, 0, false
+	}
+	return mo, d, mu, true
+}
+
+// intervalIsInfinite reports the ±infinity sentinels, which the parser encodes
+// as extreme component values (`parser.IntervalNoEnd*` / `IntervalNoBegin*`).
+//
+// These MUST decline. The executor implements them as sentinels
+// (`addTimeInterval`'s IsIntervalNoBegin/NoEnd arms): the result is the
+// same-signed infinite timestamp, and "infinity − infinity" is an ERROR.
+// Folding them arithmetically instead yields a finite value — the first
+// attempt at this fold produced `119521-07-18 06:23:01.689343` for
+// `timestamp '2020-01-01' + interval 'infinity'`, i.e. a wrong ANSWER, not
+// merely a wrong estimate. That is precisely the planner-vs-executor
+// divergence R44/K88 predicted, and it was caught by
+// TestTimestampIntervalInfinity / TestIsFiniteInfinity /
+// TestTimestampSubInfinity rather than by review.
+func intervalIsInfinite(months, days int32, micros int64) bool {
+	return months == parser.IntervalNoEndMonths || months == parser.IntervalNoBeginMonths ||
+		days == parser.IntervalNoEndDays || days == parser.IntervalNoBeginDays ||
+		micros == parser.IntervalNoEndMicros || micros == parser.IntervalNoBeginMicros
+}
+
 func tryFoldBinaryOp(pos int, op parser.OpCode, l, r Expr) Expr {
+	if folded := tryFoldTemporalBinaryOp(pos, op, l, r); folded != nil {
+		return folded
+	}
 	// Boolean short-circuit for AND/OR regardless of the other operand's type.
 	switch op {
 	case parser.OpAnd:
