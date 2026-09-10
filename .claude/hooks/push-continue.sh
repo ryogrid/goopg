@@ -7,8 +7,11 @@ set -u
 input=$(cat)
 cmd=$(printf '%s' "$input" | jq -r '.tool_input.command // ""')
 
-# The `if` matcher is best-effort (it still fires on commands containing $(),
-# backticks or $VAR), so re-verify the actual command string.
+# NOTE: settings.json carries TWO `if` entries for this hook — `Bash(git *)`
+# and `Bash(rtk git *)`. The RTK PreToolUse rewrite turns `git push` into
+# `rtk git push`, which no longer matches `Bash(git *)` (that silently skipped
+# the R59 push 1856259e4). Both spellings still contain the "git push"
+# substring matched below; the script re-verifies and exits silent otherwise.
 case "$cmd" in
   *"git push"*) ;;
   *) exit 0 ;;
@@ -20,5 +23,8 @@ root="${CLAUDE_PROJECT_DIR:-$PWD}"
 # One-shot arm for the Stop hook (cleared by continue-on-stop.sh on next stop).
 mkdir -p "$root/.claude"
 : > "$root/.claude/.continue-pending"
+
+# Best-effort arm log (proves PostToolUse fired; never breaks the hook).
+printf '%s armed root=%s cmd=%.120s\n' "$(date +%FT%T%z)" "$root" "$cmd" >> /tmp/push-continue.log 2>/dev/null || true
 
 jq -nc '{hookSpecificOutput:{hookEventName:"PostToolUse",additionalContext:"continue"}}'
