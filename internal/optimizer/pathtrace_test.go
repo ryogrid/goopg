@@ -92,13 +92,40 @@ func TestPathTraceRendersOuterInnerPartition(t *testing.T) {
 	if !strings.Contains(line, "outer={0,1} inner={2}") {
 		t.Errorf("join line missing partition labels:\n%s", line)
 	}
-	if !strings.HasSuffix(strings.TrimRight(line, "\n"), "inner={2}") {
-		t.Errorf("partition labels are not the trailing fields:\n%s", line)
+	if !strings.Contains(line, "outer={0,1} inner={2} width=") {
+		t.Errorf("partition labels are displaced from the trailing block:\n%s", line)
+	}
+	if !strings.HasSuffix(strings.TrimRight(line, "\n"), "inputtotal=-1.00") {
+		t.Errorf("width/inputtotal are not the trailing fields:\n%s", line)
 	}
 
 	scan := &Path{Kind: PathSeqScan, Rel: rel, Rows: 10, Cost: Cost{Total: 10}}
 	line = formatPathLine("path", rel, scan, "scan.seq", "0", verdictAccepted)
 	if !strings.Contains(line, "outer=- inner=-") {
 		t.Errorf("scan line missing empty partition labels:\n%s", line)
+	}
+}
+
+// TestPathTraceRendersWidthAndInputTotal pins R54 Step-2's instrument: every
+// DPPATH line carries the rel's byte width and the input path's total, so the
+// priced upper decision (serial agg vs Finalize+Gather+Partial on the same
+// join input) reads join-leg delta and upper-leg delta off one line each. A
+// path with no input renders inputtotal=-1.00, never a zero that would parse
+// as a free input.
+func TestPathTraceRendersWidthAndInputTotal(t *testing.T) {
+	rel := &RelOptInfo{Relids: 0, Rows: 1, Width: 3154}
+	seed := &Path{Kind: PathHashJoin, Rel: rel, Rows: 1834, Cost: Cost{Total: 58986.61}}
+	agg := &Path{Kind: PathAgg, Rel: rel, Rows: 1, Cost: Cost{Total: 98673.81},
+		Children: []*Path{seed}}
+	line := formatPathLine("path", rel, agg, "upper.groupagg.hashed", "0", verdictAccepted)
+	if !strings.Contains(line, "width=3154 inputtotal=58986.61") {
+		t.Errorf("agg line missing width/inputtotal:\n%s", line)
+	}
+
+	scan := &Path{Kind: PathSeqScan, Rel: &RelOptInfo{Relids: 1, Width: 550},
+		Rows: 10, Cost: Cost{Total: 10}}
+	line = formatPathLine("path", scan.Rel, scan, "scan.seq", "0", verdictAccepted)
+	if !strings.Contains(line, "width=550 inputtotal=-1.00") {
+		t.Errorf("inputless line must render width with sentinel inputtotal:\n%s", line)
 	}
 }

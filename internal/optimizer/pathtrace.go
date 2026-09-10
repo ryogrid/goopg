@@ -89,13 +89,27 @@ func tracePath(rel *RelOptInfo, p *Path, producer string, partial bool, verdict 
 // formatPathLine renders one provenance record. Separated from `tracePath`
 // so the vocabulary (including the R53 slice-1 partition labels) is testable
 // without capturing stderr.
+//
+// R54 Step-2: `width`/`inputtotal` close the reviewed STEP2.md §2 contract —
+// rows AND width per leg, plus the input join-path total beneath each upper
+// candidate, so the fix round can subtract join-leg delta from upper-leg
+// delta. `width` is the rel's byte width (RelOptInfo.Width, what the page
+// math prices); `inputtotal` is Children[0]'s total (`-1` when the path
+// carries no input — scan leaves and test fixtures), which for every upper
+// arm is the priced input the candidate was costed against. Appended at the
+// END under the same rule as jointype/partition labels, so a reader
+// splitting on key=value pairs keeps working unchanged.
 func formatPathLine(list string, rel *RelOptInfo, p *Path, producer, pathkeys string, verdict pathVerdict) string {
+	inputTotal := -1.0
+	if len(p.Children) > 0 && p.Children[0] != nil {
+		inputTotal = p.Children[0].Cost.Total
+	}
 	return fmt.Sprintf(
-		"%s %s producer=%s relids=%s kind=%d reqouter=%s rows=%.0f startup=%.2f total=%.2f disabled=%d pathkeys=%s verdict=%s jointype=%s outer=%s inner=%s\n",
+		"%s %s producer=%s relids=%s kind=%d reqouter=%s rows=%.0f startup=%.2f total=%.2f disabled=%d pathkeys=%s verdict=%s jointype=%s outer=%s inner=%s width=%d inputtotal=%.2f\n",
 		pathTraceTag, list, producer, relSetBits(rel.Relids), int(p.Kind),
 		relSetBits(p.RequiredOuter), p.Rows, p.Cost.Startup, p.Cost.Total,
 		p.DisabledNodes, pathkeys, verdict, strings.ToLower(joinTypeName(p.Jointype)),
-		relSetBits(p.OuterRelids), relSetBits(p.InnerRelids))
+		relSetBits(p.OuterRelids), relSetBits(p.InnerRelids), rel.Width, inputTotal)
 }
 
 // relSetBits renders a RelSet as a stable, parseable member list. The trace has

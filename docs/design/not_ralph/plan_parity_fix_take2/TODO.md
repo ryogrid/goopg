@@ -3284,3 +3284,15 @@ Scope reviewed APPROVE-WITH-NOTES 2026-09-10, 6 notes + 1 optional,
 all applied (§0 winner-shape softening + Q84 parked, within-query
 cardinality fix, join-below totals + width-per-leg + loser totals in
 §2, workers/algorithm creep seams closed in §5).
+Step-2 DONE 2026-09-10 (instrument + report
+`r54-parallel-admission-step0/REPORT-step2.md`, review
+APPROVE-WITH-NOTES, 5 notes, all applied): DPPATH gains `width` +
+`inputtotal` (trace-only, inert 4/4 at same mode; top plans
+byte-identical to Step-1); priced answer — Q5's split loses by 0.32
+(+0.28 Gather tuple 0.1×4 vs 0.1×~1.2, +0.03 Finalize vs serial agg,
++0.01 Partial) on a ~1.2-row upper seed from `EstimateRows(child)`
+while the join search prices the same relation 1834/7335 rows;
+Q9's wins by 2055.17 on the same three terms flipped (seed 40404
+rows). Fix round: size `seed.Rows` from the search joinrel rows
+(wider estimator reconciliation separately scoped). Evidence tmp-only
+`/tmp/pp2/r54s2/`.
