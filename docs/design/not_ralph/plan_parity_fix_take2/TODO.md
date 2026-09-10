@@ -3446,3 +3446,23 @@ the residual-owner label changes. NO CUT authorised; residual
 ~193 re-owned to worker-count selection (goopg 4 vs PG 2)
 + AGG_MIXED strategy preference, both ledgered.
 Next: worker-count sizing audit — needs its own scope round first.
+R58 scope LANDED 2026-09-11 (`r58-worker-count-sizing/SCOPE.md`,
+review APPROVE-WITH-NOTES, 2 blocking + 6 notes, all applied):
+probe E closes worker-count sizing as FAITHFUL — per-rel ladder,
+outer-takes-all partial joins, subpath-workers Gather, divisor
+all match the oracle; the 4-vs-2 is a SHAPE consequence (PG's
+2-worker index-NL chain vs goopg's 4-worker hash chain), not a
+sizing bug. goopg HAS the NL shapes: the customer→orders probe
+survives (@120221.91) but the lineitem extension dies dominated
+(@13.3M) on per-probe price — 9.20 vs PG 1.20 (11.5× run-cost),
+10.13 vs 1.54 (8.8× run-cost); rows agree within 2.5×, gap is
+cost. Partial-NL absence is NOT the blocker (hypothetical
+divisor-credited NL still 6-9× above the hash rivals).
+NO CUT authorised; residual re-owned to index-probe pricing
+(R59 candidate) WITH the C-20d tension quoted — the 2.0 knob
+buys measured wall-clock (Q7 15.72s→5.86s) by departing from
+PG constants, scales only the heap-I/O bounds, and stays 2.0
+until the executor-side NL-probe work lands; most of the gap
+is OPEN, no remainder treated as measured. Evidence tmp-only
+`/tmp/pp2/r56/` (same captures as R56/R57).
+Next: R59 index-probe pricing audit — needs its own scope round first.
