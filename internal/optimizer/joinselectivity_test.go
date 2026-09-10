@@ -541,3 +541,91 @@ func TestJoinClauseSelectivityExtConstantArmsAreDefaults(t *testing.T) {
 		t.Fatal("an equality between two analysed columns was reported as a default")
 	}
 }
+
+// jsNationCtx is a two-relation search over two aliases of one 25-row,
+// 25-distinct `nation`-shaped table — the Q7 nation-cross fixture. Unlike
+// `jsCtx` it stamps `sourceIdx`, the identity `orConjunctSelectivity`
+// attributes single-side conjuncts by.
+func jsNationCtx(t *testing.T) (*searchCtx, *catalog.Table, *catalog.Table) {
+	t.Helper()
+	c := catalog.NewInMemory()
+	mk := func(name string) *catalog.Table {
+		return jsTable(t, c, name, []catalog.Column{
+			{Name: "n_name", Type: catalog.Type{Name: "bpchar"}},
+		}, 25, catalog.ColumnStats{NDistinct: 25})
+	}
+	n1, n2 := mk("n1"), mk("n2")
+	s, err := newSearchCtx(2, defaultCostParams(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.relInfos = []baseRelInfo{
+		{table: n1, baseRows: 25, sourceIdx: 1},
+		{table: n2, baseRows: 25, sourceIdx: 2},
+	}
+	return s, n1, n2
+}
+
+// jsNameEq is one `n_name = <val>` conjunct on the given source, as the search
+// carries it: a named ColumnRef with the FROM item's identity stamped.
+func jsNameEq(src int16, val int64) *BinaryOp {
+	return &BinaryOp{Op: parser.OpEq,
+		Left:  &ColumnRef{Index: 0, Name: "n_name", Type: catalog.Type{Name: "bpchar"}, SourceTableIdx: src},
+		Right: &IntegerConst{Value: val}}
+}
+
+// TestOrJoinSelectivityMeasuredArms: R54 (ii) — a whole-OR join clause over
+// single-side equalities is estimated arm-by-arm (PG's
+// `clauselist_selectivity_or`), not charged the unhandled-clause 0.5. The
+// clause is Q7's nation-cross OR in miniature: `(n1 = A AND n2 = B) OR
+// (n1 = C AND n2 = D)` over 25-distinct columns, so each conjunct is 1/25,
+// each arm 1/625, and the OR folds to just over 1/312. The expectation is
+// composed from `eqSelectivityForColumn` rather than hard-coded, so this pins
+// the attribution and the fold — not today's ndistinct arithmetic.
+func TestOrJoinSelectivityMeasuredArms(t *testing.T) {
+	s, n1, _ := jsNationCtx(t)
+	or := &BinaryOp{Op: parser.OpOr,
+		Left:  &BinaryOp{Op: parser.OpAnd, Left: jsNameEq(1, 1), Right: jsNameEq(2, 2)},
+		Right: &BinaryOp{Op: parser.OpAnd, Left: jsNameEq(1, 3), Right: jsNameEq(2, 4)}}
+	ri := &restrictInfo{clause: or, relids: relsetOf(0) | relsetOf(1), ecID: noEquivClass}
+
+	e := eqSelectivityForColumn(columnStatsByName(n1, "n_name"), &IntegerConst{Value: 1}, 25)
+	arm := e * e
+	want := arm + arm - arm*arm
+	sel, isDefault := s.joinClauseSelectivityExt(ri)
+	if isDefault {
+		t.Fatal("OR over analysed single-side equalities was reported as a default")
+	}
+	if math.Abs(sel-want) > 1e-15 {
+		t.Fatalf("sel=%v; want %v (inclusion-exclusion over two %v arms)", sel, want, arm)
+	}
+	if sel >= defaultUnhandledClauseSel {
+		t.Fatalf("sel=%v; not below the old whole-OR default %v", sel, defaultUnhandledClauseSel)
+	}
+}
+
+// TestOrJoinSelectivityGuessedConjunctMarksTheOr: one unattributable conjunct
+// (no source identity — a CTE/subquery side, or a column the search never
+// bound) keeps its 0.5 contribution AND marks the whole OR a guess, so
+// `calcJoinrelSize`'s all-default clamp stays on for the join. The measured
+// arm composes with the defaulted one; neither swallows the other.
+func TestOrJoinSelectivityGuessedConjunctMarksTheOr(t *testing.T) {
+	s, n1, _ := jsNationCtx(t)
+	lost := jsNameEq(0, 9) // SourceTableIdx 0: no recorded identity.
+	or := &BinaryOp{Op: parser.OpOr,
+		Left:  &BinaryOp{Op: parser.OpAnd, Left: jsNameEq(1, 1), Right: jsNameEq(2, 2)},
+		Right: &BinaryOp{Op: parser.OpAnd, Left: jsNameEq(1, 3), Right: lost}}
+	ri := &restrictInfo{clause: or, relids: relsetOf(0) | relsetOf(1), ecID: noEquivClass}
+
+	e := eqSelectivityForColumn(columnStatsByName(n1, "n_name"), &IntegerConst{Value: 1}, 25)
+	measuredArm := e * e
+	guessedArm := e * defaultUnhandledClauseSel
+	want := measuredArm + guessedArm - measuredArm*guessedArm
+	sel, isDefault := s.joinClauseSelectivityExt(ri)
+	if !isDefault {
+		t.Fatal("OR with an unattributable conjunct was reported as measured; the fallback clamp would switch off on a guess")
+	}
+	if math.Abs(sel-want) > 1e-15 {
+		t.Fatalf("sel=%v; want %v (measured arm composed with a 0.5 default)", sel, want)
+	}
+}

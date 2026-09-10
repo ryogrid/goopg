@@ -10,6 +10,7 @@ package optimizer
 // up. Migrated rule-shape tests live on in their own files, unchanged.
 
 import (
+	"fmt"
 	"math"
 	"strings"
 	"testing"
@@ -255,6 +256,60 @@ func TestGroupingPathsC10cReassert(t *testing.T) {
 	}
 	if _, planted := nj.Right.(*Filter); planted {
 		t.Errorf("a Filter reached the NULLABLE input for a preserved-side qual")
+	}
+}
+
+// hashedProducerTotal runs createGroupingPaths over agg and returns the
+// hashed arm's traced total — the priced input the candidate was costed
+// against, read off the provenance channel rather than the plan (the plan
+// carries no cost stamp).
+func hashedProducerTotal(t *testing.T, agg *Aggregate) float64 {
+	t.Helper()
+	var total float64
+	found := false
+	lines := captureTrace(t, func() {
+		if _, err := createGroupingPaths(nil, agg, nil, DefaultPlannerSettings(), 0); err != nil {
+			t.Fatal(err)
+		}
+	})
+	for _, l := range lines {
+		if !strings.Contains(l, "producer="+groupAggHashedProducer) {
+			continue
+		}
+		for _, kv := range strings.Fields(l) {
+			if v, ok := strings.CutPrefix(kv, "total="); ok {
+				fmt.Sscanf(v, "%f", &total)
+				found = true
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("no %s line: the hashed arm was never offered", groupAggHashedProducer)
+	}
+	return total
+}
+
+// TestCreateGroupingPathsSizesSeedFromSearchRel pins the R54 re-land's
+// direction (REDESIGN.md rev 2 §1(i)): over a row-preserved searched child
+// the seed prices search-rel rows, and over the identical unmarked child it
+// prices the legacy estimate — so the searched hashed total is strictly
+// greater. Ordering, not exactness: the assertion is the existence-before-
+// verdict direction (the fail-closed assignment fires), never a figure that
+// would calcify today's cost constants into the test.
+func TestCreateGroupingPathsSizesSeedFromSearchRel(t *testing.T) {
+	rel := fetchUpperRel(newUpperRels(), UpperGroupAgg, 0, 0)
+	rel.Rows = 1834
+
+	scan := &SeqScan{schema: cpjSchema("a", 2)}
+	markSearchedTree(scan)
+	scan.setSearchRel(rel)
+	searched := hashedProducerTotal(t, groupingTestAgg(&Sort{Child: &Project{Child: scan}}))
+
+	legacy := hashedProducerTotal(t, groupingTestAgg(
+		&Sort{Child: &Project{Child: &SeqScan{schema: cpjSchema("a", 2)}}}))
+
+	if !(searched > legacy) {
+		t.Fatalf("searched hashed total %v not above legacy %v: the seed is not sized from the search rel", searched, legacy)
 	}
 }
 

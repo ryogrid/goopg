@@ -589,3 +589,51 @@ func TestCalcJoinrelSizeCrossProductIsNotCapped(t *testing.T) {
 	rows, _ := s.calcJoinrelSize(c, outer, inner, nil, nil)
 	wantRows(t, rows, clampRowEst(6000000.0*800000.0), "cross product")
 }
+
+// TestCalcJoinrelSizeOrJoinClauseMeasured: R54 (ii) — the Q7 nation-cross
+// shape end to end. A 25x25 cross whose only clause is the two-sided OR prices
+// at 625 x the arm-by-arm selectivity (~2 rows), and crucially BELOW the
+// 25-row `max(l,r)` fallback cap: the estimate is measured, so the clamp is
+// off. Under the old whole-OR default the same join priced at 312.5 x capped
+// to exactly 25 — the test would read rows=25, the clamp's signature, rather
+// than PG's 2.
+func TestCalcJoinrelSizeOrJoinClauseMeasured(t *testing.T) {
+	c := catalog.NewInMemory()
+	mk := func(name string) *catalog.Table {
+		return jsTable(t, c, name, []catalog.Column{
+			{Name: "n_name", Type: catalog.Type{Name: "bpchar"}},
+		}, 25, catalog.ColumnStats{NDistinct: 25})
+	}
+	n1, n2 := mk("n1"), mk("n2")
+	s, err := newSearchCtx(2, defaultCostParams(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.relInfos = []baseRelInfo{
+		{table: n1, baseRows: 25, sourceIdx: 1},
+		{table: n2, baseRows: 25, sourceIdx: 2},
+	}
+	eq := func(src int16, val int64) *BinaryOp {
+		return &BinaryOp{Op: parser.OpEq,
+			Left:  &ColumnRef{Index: 0, Name: "n_name", Type: catalog.Type{Name: "bpchar"}, SourceTableIdx: src},
+			Right: &IntegerConst{Value: val}}
+	}
+	or := &BinaryOp{Op: parser.OpOr,
+		Left:  &BinaryOp{Op: parser.OpAnd, Left: eq(1, 1), Right: eq(2, 2)},
+		Right: &BinaryOp{Op: parser.OpAnd, Left: eq(1, 3), Right: eq(2, 4)}}
+	ri := &restrictInfo{clause: or, relids: relsetOf(0) | relsetOf(1), ecID: noEquivClass}
+
+	outer, inner := jrsRels(25, 25)
+	rows, _ := s.calcJoinrelSize(c, outer, inner, []*restrictInfo{ri}, nil)
+
+	orsel, isDefault := s.joinClauseSelectivityExt(ri)
+	if isDefault {
+		t.Fatal("nation-cross OR reported as a default; the fallback cap would stay on")
+	}
+	wantRows(t, rows, clampRowEst(25.0*25.0*orsel), "nation-cross OR (sizer x selectivity wiring)")
+	// The literal 2 is the fixture's arithmetic, not a magic number: each
+	// arm pairs two 1-in-25 equalities (1/625), and the fold gives
+	// 625×(2/625−1/625²) = 2 — one match per arm. A fixture tweak that
+	// moves NDistinct re-derives this line.
+	wantRows(t, rows, 2, "nation-cross OR (PG prices this cross at 2)")
+}

@@ -3343,3 +3343,24 @@ with a number), (v) PG Q8 harvest + serial judgment, (vi) a
 step2-binary TPC-DS SF0.5 sweep if DS tournaments are touched.
 Must-holds per FIX-SEED §5 incl. Q19 MATCH + Q5-split-wins
 (non-vacuous). Scope REDESIGN.md rev 2; needs second review.
+Redesign LANDED 2026-09-11 (report
+`r54-parallel-admission-step0/REPORT-redesign.md`, review
+APPROVE-WITH-NOTES, 5 notes, all applied): (i) re-land reproduces the
+failed round to the decimal (Q5 split +750.20, Q9 split +29801.70, Q19
+shape, Q1/Q84 identical, Q3/Q10 zero-move); (ii) OR-join estimator
+lands — Q7 top join 229626→1468 vs PG 2520 (0.58×), nation-cross 25→2
+(PG-exact), winner split→gathered HashAgg (PG sorts; Q7-sorted not
+required); (iv) audit with numbers — Q8's split is a 161-cost
+(0.10%) tie-break over an estimator-justified seed, owned by neither
+arm nor estimator (tie-break calibration ledgered); (v) PG Q8 harvest
+2004 totals vs goopg 2370 = 1.18× ⇒ justified; (vi) DS sweep NO-GO
+with rationale (decision-tree plan-diff + targeted sweep done:
+values 8/8, Q84 identical; estimate-only change). Q19 9125→133
+side-effect assessed toward-PG (PG anchor 47, approximate —
+different join shape), residual range/IN-default follow-up ledgered.
+Must-holds all green incl. structural Q19 MATCH (shape-identical) +
+Q5-split-wins; Q7 winner margin 32.82 (0.02%, both modes) recorded as
+fragility. Evidence tmp-only `/tmp/pp2/r54redesign/`.
+Next: R55 scoping — Q7's remaining sort gap (tie-break calibration
+may subsume it), Q19 range/IN-in-OR defaults, Q8 sorted-vs-split
+tie-break.

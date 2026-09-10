@@ -190,6 +190,78 @@ func searchedRelOf(n Node) *RelOptInfo {
 	return nil
 }
 
+// searchedJoinInputRelOf returns the search's own upper rel for the node that
+// is an aggregate's INPUT, or nil when the input is not a row-preserved
+// searched tree (R54 fix round, FIX-SEED §0; re-landed per REDESIGN rev 2 as
+// the convention-correct totals sourcing).
+//
+// It answers the narrower question `searchedRelOf` cannot. That accessor
+// walks `boundaryWalkChildren` — whose contract is "every kind that can sit
+// between a statement's root and a spliced searched subtree" — so it descends
+// through Aggregate/WindowAgg/Distinct/Filter/Limit, and an agg-over-agg (or
+// a Filter/Limit/Distinct between the aggregate and the search root) would
+// seed the outer aggregate with the WRONG scope's rows, which no `sr.Rows >
+// 0` check can catch. This walk descends ONLY through single-child
+// row-preserving pass-throughs — *Project, *Sort, *Gather, *GatherMerge,
+// *Memoize, *OrdinalityWrap, and uncapped *LockRows — and stops (nil) at
+// everything else: Aggregate/WindowAgg/Distinct/DistinctOn/Filter/Limit/
+// SetOp/multi-child joins/unknown/nil. It fires exactly when search rows ==
+// agg input rows; anything else keeps the legacy seed (fail-closed).
+//
+// Two deliberate scoping notes, both load-bearing for future editors:
+//
+//   - *Memoize* is listed defensively only: it keys its input on outer join
+//     parameters, so "row-preserving" holds per parameter scope, not
+//     unconditionally. Its Child is a typed *IndexScan (plan.go:962), hence
+//     the nil guard before the descent.
+//   - *CTEScan* and *Result* are deliberately UNLISTED, and *ProjectSet*
+//     (row-multiplying) plus *Result-with-OneTimeFilter* (row-gating) must
+//     NEVER be added: a node that can change the row count between the
+//     search rel and the aggregate breaks the "search rows == agg input
+//     rows" identity this accessor exists to guarantee. A plain,
+//     row-preserving *Result is still excluded — conservative, and the
+//     fail-closed direction (legacy seed) for a shape outside the measured
+//     Sort(Project(Join)) family.
+//
+// *LockRows* passes only UNCAPPED (`LimitCount`/`OffsetCount` nil): a Limit
+// lifted above it (plan.go:2320-2345) caps the locked rows at LIMIT+OFFSET,
+// so the aggregate's input is not the search rel's rows. The capped ×2 stop
+// cases in the unit test pin this gate.
+func searchedJoinInputRelOf(n Node) *RelOptInfo {
+	// Bounded like searchedRelOf: the wrapper chain is a handful of unary
+	// nodes, and the depth cap makes a cycle impossible to hang on.
+	for depth := 0; n != nil && depth < 32; depth++ {
+		if s, ok := n.(searchRootNode); ok && s.isFromJoinSearch() {
+			return s.searchedRel()
+		}
+		switch x := n.(type) {
+		case *Project:
+			n = x.Child
+		case *Sort:
+			n = x.Child
+		case *Gather:
+			n = x.Child
+		case *GatherMerge:
+			n = x.Child
+		case *Memoize:
+			if x.Child == nil {
+				return nil
+			}
+			n = x.Child
+		case *OrdinalityWrap:
+			n = x.Child
+		case *LockRows:
+			if x.LimitCount != nil || x.OffsetCount != nil {
+				return nil
+			}
+			n = x.Child
+		default:
+			return nil
+		}
+	}
+	return nil
+}
+
 // markSearchedTree tags n as the root of a subtree the PG-shaped join search
 // produced, and returns it for chaining.
 //

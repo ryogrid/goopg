@@ -77,6 +77,17 @@ func createGroupingPaths(u *upperRels, aggNode *Aggregate, cat catalog.Catalog, 
 	if pc := legacyDisplayCostOf(child); pc.PlanRows > 0 || pc.TotalCost > 0 {
 		seed.Cost = Cost{Startup: pc.StartupCost, Total: pc.TotalCost}
 	}
+	// R54 redesign (REDESIGN.md rev 2): size the seed from the search
+	// joinrel's rows — serial TOTALS, which is what every seed-driven term
+	// prices (serial costAgg arms, both gather crossings; the split divides
+	// exactly once downstream in partialaggupper.go). Rows-only: the input
+	// price cancels across the live contest (split and gathered no-split
+	// build on the same pseed), so Cost replacement is separately scoped.
+	// Fail-closed: fires only through row-preserving pass-throughs, and only
+	// when the rel carries rows.
+	if sr := searchedJoinInputRelOf(child); sr != nil && sr.Rows > 0 {
+		seed.Rows = sr.Rows
+	}
 
 	addGroupingPaths(grouped, seed, aggNode, child, cat, cp, ps)
 	// C-19g's remainder (that design's §8): the PARALLEL candidate —

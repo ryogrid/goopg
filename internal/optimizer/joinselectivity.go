@@ -385,6 +385,18 @@ func (s *searchCtx) joinClauseSelectivityExtUncached(ri *restrictInfo) (float64,
 	if !ok {
 		return defaultUnhandledClauseSel, true
 	}
+	// R54 (ii): a whole-OR join clause is estimated arm-by-arm, as PG's
+	// `clause_selectivity_ext` does (clausesel.c:810-824,
+	// `clauselist_selectivity_or`) — even when the OR spans relations and is
+	// therefore a JOIN clause. The old `default` arm below charged every such
+	// OR the unhandled-clause 0.5, which on TPC-H Q7's nation-cross OR (625
+	// rows, no equijoin for the superkey pass to consume) priced the cross at
+	// 312.5 and left the M0126-0010 `max(l,r)` clamp to cut it to 25 — an
+	// effective 0.04 that read as a measured selectivity but was the clamp
+	// (25/625), masking a 12.5x overestimate of PG's 2.
+	if bo.Op == parser.OpOr {
+		return s.orJoinSelectivity(bo)
+	}
 	switch bo.Op {
 	case parser.OpEq:
 		return eqJoinSelectivityExt(s.joinClauseOperands(ri, bo))
@@ -396,6 +408,123 @@ func (s *searchCtx) joinClauseSelectivityExtUncached(ri *restrictInfo) (float64,
 	default:
 		return defaultUnhandledClauseSel, true
 	}
+}
+
+// orJoinSelectivity estimates a whole-OR join clause PG's way
+// (`clauselist_selectivity_or`, clausesel.c): inclusion-exclusion over the
+// arms, folded pairwise the way `clauseSelectivity`'s own OR arm folds its two
+// sides (`a + b - a*b`). Each arm is an AND of conjuncts priced by
+// `orArmSelectivity`.
+//
+// The result is reported as measured (`isdefault=false`) only when EVERY arm
+// was; one guessed conjunct anywhere marks the OR a guess, which is what keeps
+// `calcJoinrelSize`'s all-default `max(l,r)` clamp protecting a partially
+// measured OR. SEMI/ANTI jointypes do NOT reach this function —
+// `joinClauseSelectivityForJoin` gives them their own arms, whose OR default
+// (0.5) is a residual divergence, ledgered below at `orConjunctSelectivity`.
+func (s *searchCtx) orJoinSelectivity(bo *BinaryOp) (float64, bool) {
+	sel := 0.0
+	isdefault := false
+	// `flattenPlannerOr` (joinrestrict.go) is the package's OR-chain
+	// flattener; reused rather than re-flattened here.
+	for _, arm := range flattenPlannerOr(bo) {
+		asel, adef := s.orArmSelectivity(arm)
+		sel = sel + asel - sel*asel
+		isdefault = isdefault || adef
+	}
+	return clampSelectivity(sel), isdefault
+}
+
+// orArmSelectivity prices one OR arm — an AND of conjuncts — as the
+// independent product, the same rule `conjunctionSelectivity` falls back to
+// for unrelated conjuncts. (The range-band pairing it adds on top is a
+// same-variable refinement; OR arms join FILTERs across relations, where PG
+// likewise multiplies.)
+func (s *searchCtx) orArmSelectivity(arm Expr) (float64, bool) {
+	sel := 1.0
+	isdefault := false
+	for _, c := range splitAnd(arm) {
+		csel, cdef := s.orConjunctSelectivity(c)
+		sel *= csel
+		isdefault = isdefault || cdef
+	}
+	return clampSelectivity(sel), isdefault
+}
+
+// orConjunctSelectivity prices one conjunct of an OR arm as a RESTRICTION, as
+// PG does when `treat_as_join_clause` declines it (clausesel.c): a single-side
+// `col = const` reads that column's own statistics through
+// `eqSelectivityForColumn`, the same primitive the restriction path uses.
+//
+// Attribution is positional, never by name: the column's `SourceTableIdx`
+// translates back to the search rel through `relInfos[].sourceIdx` (the
+// `inferAnchoredEqualities` translation, cardinality.go:411), and the table
+// whose statistics are read is that rel's own. Name matching would confuse
+// two aliases of one table — Q7's `n1.n_name`/`n2.n_name` case exactly —
+// while the index the clause builder resolved at build time does not.
+//
+// Shapes with no restriction estimator here (non-equality comparisons,
+// multi-relation conjuncts, unattributable columns, CTE/subquery sides with
+// no recorded identity) keep today's whole-OR default contribution
+// (`defaultUnhandledClauseSel`, a guess) rather than inventing a number. That
+// is deliberately more conservative than PG, which prices e.g. a single-side
+// inequality through `scalarineqsel`; each such shape is an independent,
+// falsifiable follow-up, and the guess flag keeps the fallback clamp on while
+// any of them is present.
+func (s *searchCtx) orConjunctSelectivity(c Expr) (float64, bool) {
+	if bc, ok := c.(*BooleanConst); ok {
+		if bc.Value {
+			return 1.0, false
+		}
+		return 0.0, false
+	}
+	bo, ok := c.(*BinaryOp)
+	if !ok || (bo.Op != parser.OpEq && bo.Op != parser.OpNe) {
+		return defaultUnhandledClauseSel, true
+	}
+	col, val, ok := normalizeColumnConst(bo.Left, bo.Right)
+	if !ok || col.Name == "" {
+		return defaultUnhandledClauseSel, true
+	}
+	// `normalizeColumnConst` fires only for column-vs-literal, so `col` is
+	// the conjunct's sole ColumnRef; no same-rel check is needed beyond the
+	// attribution below (`isConstExpr` admits no subquery).
+	i, ok := s.relPosForSource(col.SourceTableIdx)
+	if !ok || s.relInfos[i].table == nil {
+		return defaultUnhandledClauseSel, true
+	}
+	stats := columnStatsByName(s.relInfos[i].table, col.Name)
+	sel := eqSelectivityForColumn(stats, val, float64(s.relInfos[i].baseRows))
+	if bo.Op == parser.OpNe {
+		// `1 - eq` inherits the equality's flag, as the `OpNe` arm of
+		// `joinClauseSelectivityExtUncached` does for the join form.
+		sel = clampSelectivity(1.0 - sel)
+	}
+	return sel, stats == nil
+}
+
+// relPosForSource is the `ColumnRef.SourceTableIdx` → search-rel translation
+// `orConjunctSelectivity` attributes single-side conjuncts by: position i in
+// `relInfos` (FROM order, hence relid `1<<i`). A source claimed by zero rels
+// (a column the search never bound) or by more than one (a remapped
+// subproblem sharing one identity) declines rather than guesses.
+func (s *searchCtx) relPosForSource(src int16) (int, bool) {
+	if s == nil || src <= 0 {
+		return -1, false
+	}
+	found := -1
+	for i := range s.relInfos {
+		if s.relInfos[i].sourceIdx == src {
+			if found >= 0 {
+				return -1, false
+			}
+			found = i
+		}
+	}
+	if found < 0 {
+		return -1, false
+	}
+	return found, true
 }
 
 // joinClauseOperands examines both sides of an equality clause, preferring the
