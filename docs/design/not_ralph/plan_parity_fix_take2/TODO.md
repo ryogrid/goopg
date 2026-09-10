@@ -3247,5 +3247,13 @@ numbers, pricing itself NOT Step-0). NOT in Step-0: sizing, arms,
 partial-path/gather pricing numbers, footprint model (SLICE1 §6
 candidate), R51 items 2–3, any planner behaviour change. Review
 APPROVE-WITH-NOTES 2026-09-10, notes applied (flag-level control scope;
-S0/S4 added; gather-considered + upper-gate lines; GUC pin). Next:
-commit + push → implement instrument → measurement report.
+S0/S4 added; gather-considered + upper-gate lines; GUC pin).
+Step-0 DONE 2026-09-10 (instrument + report `r54-parallel-admission-step0/REPORT.md`,
+LANDED 442f90b5c; review APPROVE-WITH-NOTES, 5 notes, all applied):
+Q5 refused `gate=subtree` (NestedLoop capability refusal in `drivingScan`),
+Q84 double lock-out (`no-partials` ×50 + `terminatesPartial` at `Limit` top),
+Q9 splits via upper route only, Q1 control green; all plans byte-identical
+to baseline. Evidence tmp-only `/tmp/pp2/r54/`.
+Next: R54 Step-1 — S4 path-level vetoes in `joinpathsparallel.go` (zero
+partial paths under CP=true joinrels) + refine `gate=subtree` to name its
+disjunct (predict: no-driving-scan).
