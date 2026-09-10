@@ -207,5 +207,102 @@ func TestTraceOffIsNil(t *testing.T) {
 	// The nil-safe call sites: these are what run in production.
 	s.trace.offer(tracePhaseBushy, 0b001, 0b010, true)
 	s.trace.decline(tracePhaseBushy, 0b001, 0b010, "no-join-clause")
+	s.trace.cost(nil)
 	s.trace.emit()
+}
+
+// TestTraceRecordsCostPerRelset: R53 Step-0's instrument. After a full search
+// every built joinrel carries one L-number — the level, the rows setCheapest
+// priced, the pathlist length, the winner's kind and total — so a costing
+// question ("did {ps,p,s,l} lose on rows or on price?") is answered from the
+// trace without re-instrumenting.
+func TestTraceRecordsCostPerRelset(t *testing.T) {
+	enableDPTrace(t)
+	s := traceCtx(t, "a", "b", "c")
+	b := &recordingBuilder{}
+	if _, err := s.joinSearch(jslClauses(0b011, 0b110), b); err != nil {
+		t.Fatalf("joinSearch: %v", err)
+	}
+	// Three joinrels: {a+b} and {b+c} at level 2, {a+b+c} at level 3.
+	if len(s.trace.costs) != 3 {
+		t.Fatalf("cost records = %d, want 3 (one per built joinrel)", len(s.trace.costs))
+	}
+	for _, c := range s.trace.costs {
+		if c.level != relLevel(c.rel) {
+			t.Errorf("cost record level %d for relset %#b (relLevel %d)", c.level, uint32(c.rel), relLevel(c.rel))
+		}
+		if c.rows <= 0 || c.paths == 0 {
+			t.Errorf("cost record holds no pricing: %+v", c)
+		}
+	}
+	out := s.trace.render()
+	for _, want := range []string{
+		"DPTRACE cost lev=2 rel={a+b}",
+		"DPTRACE cost lev=2 rel={b+c}",
+		"DPTRACE cost lev=3 rel={a+b+c}",
+		"cheapest=",
+		"reqouter=",
+		"total=",
+		"second=",
+		"secondtotal=",
+		"costs=3",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("rendered block missing %q:\n%s", want, out)
+		}
+	}
+}
+
+// TestTraceCostSecondAndReqouter: the two fields that scope a pricing slice.
+// The winner is CheapestTotal (the path the search USES), never the min-total
+// pathlist entry: here an unparameterised hash wins while a cheaper
+// parameterised NL stands second, and reqouter says the winner needs no
+// bindings while the inner-parameterisation still reads `nli` on the second.
+func TestTraceCostSecondAndReqouter(t *testing.T) {
+	enableDPTrace(t)
+	s := traceCtx(t, "a", "b")
+	rel := &RelOptInfo{Relids: 0b011, Rows: 200}
+	rel.Pathlist = []*Path{
+		{Kind: PathHashJoin, Cost: Cost{Total: 100}},
+		{Kind: PathNestLoop, Cost: Cost{Total: 50}, Children: []*Path{{}, {RequiredOuter: 0b001}}},
+	}
+	rel.CheapestTotal = rel.Pathlist[0]
+	s.trace.cost(rel)
+	if len(s.trace.costs) != 1 {
+		t.Fatalf("cost records = %d, want 1", len(s.trace.costs))
+	}
+	c := s.trace.costs[0]
+	if c.kind != "hash" || c.total != 100 || c.reqouter != 0 {
+		t.Errorf("winner = %s reqouter=%#b total=%g, want hash reqouter=0 total=100", c.kind, uint32(c.reqouter), c.total)
+	}
+	if c.second != "nli" || c.secondTotal != 50 {
+		t.Errorf("second = %s total=%g, want nli 50", c.second, c.secondTotal)
+	}
+	out := s.trace.render()
+	if !strings.Contains(out, "cheapest=hash reqouter={} total=100 second=nli secondtotal=50") {
+		t.Errorf("rendered cost line wrong:\n%s", out)
+	}
+}
+
+// TestTracePathKindLabels: the winner vocabulary Step-0 reads off the cost
+// lines — join methods by name, parameterised (NLI) nestloops split from plain
+// ones (same PathKind, different admission rules), and a nil winner named.
+func TestTracePathKindLabels(t *testing.T) {
+	nli := &Path{Kind: PathNestLoop, Children: []*Path{{}, {RequiredOuter: 0b001}}}
+	for _, tc := range []struct {
+		path *Path
+		want string
+	}{
+		{&Path{Kind: PathHashJoin}, "hash"},
+		{&Path{Kind: PathMergeJoin}, "merge"},
+		{&Path{Kind: PathNestLoop}, "nl"},
+		{nli, "nli"},
+		{&Path{Kind: PathSeqScan}, "seq"},
+		{&Path{Kind: PathGatherMerge}, "gathermerge"},
+		{nil, "none"},
+	} {
+		if got := tracePathKind(tc.path); got != tc.want {
+			t.Errorf("tracePathKind(%+v) = %q, want %q", tc.path, got, tc.want)
+		}
+	}
 }

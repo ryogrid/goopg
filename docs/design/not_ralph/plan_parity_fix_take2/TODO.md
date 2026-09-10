@@ -3166,3 +3166,25 @@ visible (DP-minimisation = hypothesis, edge-admission unaudited);
 synth-opened orders lose parallel paths. Next: join-order costing half
 (`join_search_one_level` + parallel admission); nullable-side
 assertion still open.
+
+## R53 — join-order costing half, Step 0: measure Q9's divergence (IN PROGRESS 2026-09-10, report `r53-q9-costing-step0/REPORT.md`)
+
+Question: with candidates open (R51), at which DP level does goopg's
+pick first diverge from PG's Q9 order, and does the deciding term live
+in sizing (`sizeJoinRel`) or pricing (`addPaths`)? PG: ((((ps⋈p)⋈s)⋈n)
+⋈NL l)⋈o; goopg R51: ((((ps⋈p)⋈s)⋈NL l)⋈o)⋈n — shared through L3,
+diverge at L4 ({ps,p,s}+n vs {ps,p,s}+l). Instrument: `DPTRACE cost`
+line per relset (level, rows, pathlist length, cheapest kind + total)
+so every future costing slice gets L-numbers without re-instrumenting.
+Deliverables: Step-0 numbers + scoped pricing slice; review; commit;
+push. Nullable-side assertion (R51 item 3) rides a later round.
+
+Step-0 DONE 2026-09-10 (report written): PRICING at L6, hash arm, 2.5%
+margin (winner 616861.02 vs nearest hash rival 632364.99); sizing OUT (L5
+rows 303093=303093) and admission OUT (PG L6 partition offered phase 1,
+zero lev-6 declines); reqouter={} on all L4–L6 winners (no
+parameterisation dimension). Instrument carries reqouter + runner-up
+(second/secondtotal) beyond the line above. Gates green: full
+`internal/optimizer` + `testutil/estimateaudit` suites; Q12=2/Q13=34
+canonical on clone-tpch (trace-off production config). Agent review
+APPROVE-WITH-NOTES 2026-09-10, notes applied. Remaining: commit → push.

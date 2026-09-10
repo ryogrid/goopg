@@ -324,6 +324,10 @@ func (s *searchCtx) joinSearch(clauses *restrictInfoList, b joinRelBuilder) (*Re
 			// is off.
 			s.generateUsefulGatherPaths(rel)
 			setCheapest(rel)
+			// R53 Step-0: one L-number per relset, after the whole level's
+			// pairs have been offered and the cheapest is final. Nil-safe —
+			// a no-op when the trace gate is off.
+			s.trace.cost(rel)
 		}
 	}
 	top, err := s.finalRel()

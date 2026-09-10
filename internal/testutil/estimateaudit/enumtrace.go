@@ -175,6 +175,17 @@ func ParseEnumTrace(r io.Reader) EnumTrace {
 			if _, seen := cur.Declined[d.Key]; !seen {
 				cur.Declined[d.Key] = d
 			}
+		case "cost":
+			// R53 Step-0's L-number line (joinsearchtrace.go `cost`). Parsed
+			// and discarded: Step-0 reads these lines with grep straight off
+			// the server log, and structured cost parsing belongs to the
+			// costing slice that first needs it. Recognised (not Malformed)
+			// so the new line kind does not pollute the provenance channel's
+			// hygiene counter.
+			if cur == nil {
+				t.Malformed++
+				continue
+			}
 		case "end":
 			if cur == nil {
 				t.Malformed++

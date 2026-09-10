@@ -35,6 +35,7 @@ package optimizer
 
 import (
 	"fmt"
+	"math"
 	"os"
 	"sort"
 	"strings"
@@ -70,6 +71,34 @@ type tracePair struct {
 	reason  string // "" for an offered pair; the decline reason otherwise
 }
 
+// traceCost is one relset's L-number: what setCheapest found after the whole
+// level's pairs had been offered. R53 Step-0's instrument — the sizing-vs-pricing
+// separation question ("did {ps,p,s,l} lose on rows or on price?") is answered
+// from these lines, and every future costing slice reuses them without
+// re-instrumenting.
+type traceCost struct {
+	level int // relLevel(rel) — the level whose completion produced it
+	rel   RelSet
+	rows  float64
+	paths int // len(Pathlist) at setCheapest time
+	kind  string
+	// reqouter is the WINNER's RequiredOuter: empty when the path is usable
+	// anywhere. It disambiguates the `nli` label — an index-assisted NL whose
+	// inner takes bindings from the outer is unparameterised as a PATH when
+	// the outer supplies them, and only reqouter says whether the winner can
+	// stand in for the rel above.
+	reqouter RelSet
+	total    float64
+	// second/secondTotal is the cheapest pathlist entry that ISN'T the
+	// winner, by total. The L6 margin (winner vs second) is what scopes a
+	// pricing slice: a 0.7% margin inside one arm is a different job than a
+	// 30% gap across arms. Recorded by total, not by use — when the winner
+	// (CheapestTotal, unparameterised-only) is NOT the min-total path, the
+	// second line names the parameterisation price directly.
+	second      string
+	secondTotal float64
+}
+
 // searchTrace is one join problem's provenance record.
 //
 // It is per-problem rather than per-process because that is the unit the
@@ -88,6 +117,7 @@ type searchTrace struct {
 
 	pairs    []tracePair
 	declined []tracePair
+	costs    []traceCost
 	top      RelSet
 	failed   string
 }
@@ -188,6 +218,111 @@ func (t *searchTrace) decline(phase int, a, b RelSet, reason string) {
 	})
 }
 
+// tracePathKind renders a path's kind the way Step-0 reads it: the join method
+// that won the relset, with index-assisted nestloops (inner takes bindings
+// from the outer) reading `nli` apart from plain `nl` — they are the same
+// PathKind and the costing slices adjudicate them separately. `nli` reports
+// the INNER's parameterisation only: whether the PATH itself needs bindings
+// from above is reqouter's job, and the two come apart exactly when the outer
+// supplies the bindings (the Q9 L4 winner is that shape). Unknown kinds
+// render as `kind<N>` so a new producer can never silently collapse into a
+// known label.
+func tracePathKind(p *Path) string {
+	if p == nil {
+		return "none"
+	}
+	switch p.Kind {
+	case PathHashJoin:
+		return "hash"
+	case PathMergeJoin:
+		return "merge"
+	case PathNestLoop:
+		if len(p.Children) > 1 && p.Children[1].RequiredOuter != 0 {
+			return "nli"
+		}
+		return "nl"
+	case PathSeqScan:
+		return "seq"
+	case PathIndexScan:
+		return "idx"
+	case PathBitmapHeapScan:
+		return "bitmap"
+	case PathGather:
+		return "gather"
+	case PathGatherMerge:
+		return "gathermerge"
+	case PathSort:
+		return "sort"
+	case PathAgg:
+		return "agg"
+	default:
+		return fmt.Sprintf("kind%d", int(p.Kind))
+	}
+}
+
+// cost records one relset's L-number after setCheapest ran. Nil-receiver safe
+// like offer/decline, so the call site stays unconditional and production is
+// untouched when the gate is off.
+func (t *searchTrace) cost(rel *RelOptInfo) {
+	if t == nil || rel == nil {
+		return
+	}
+	t.costs = append(t.costs, traceCost{
+		level:       relLevel(rel.Relids),
+		rel:         rel.Relids,
+		rows:        rel.Rows,
+		paths:       len(rel.Pathlist),
+		kind:        tracePathKind(rel.CheapestTotal),
+		reqouter:    winnerRequiredOuter(rel),
+		total:       cheapestTotal(rel),
+		second:      tracePathKind(secondCheapest(rel)),
+		secondTotal: secondTotal(rel),
+	})
+}
+
+// winnerRequiredOuter is the winner's own parameterisation — the admission
+// property setCheapest selected on — as distinct from the inner's, which is
+// what the `nli` label reports.
+func winnerRequiredOuter(rel *RelOptInfo) RelSet {
+	if rel.CheapestTotal == nil {
+		return 0
+	}
+	return rel.CheapestTotal.RequiredOuter
+}
+
+// secondCheapest is the cheapest pathlist entry that is not the winner, by
+// total. Nil when the winner stands alone.
+func secondCheapest(rel *RelOptInfo) *Path {
+	var best *Path
+	for _, p := range rel.Pathlist {
+		if p == rel.CheapestTotal {
+			continue
+		}
+		if best == nil || p.Cost.Total < best.Cost.Total {
+			best = p
+		}
+	}
+	return best
+}
+
+// secondTotal is secondCheapest's total, or NaN when there is no second path.
+func secondTotal(rel *RelOptInfo) float64 {
+	if s := secondCheapest(rel); s != nil {
+		return s.Cost.Total
+	}
+	return math.NaN()
+}
+
+// cheapestTotal is CheapestTotal's total, or NaN when there is none yet — the
+// call site records after setCheapest, so NaN means "no unparameterised path",
+// itself a diagnosis.
+func cheapestTotal(rel *RelOptInfo) float64 {
+	if rel.CheapestTotal == nil {
+		return math.NaN()
+	}
+	return rel.CheapestTotal.Cost.Total
+}
+
 // Trace line vocabulary. One block per join problem, framed by `problem` and
 // `end`, so a reader can tell a truncated block from a complete one and so two
 // backends' blocks cannot be confused for one (the whole block is written with
@@ -197,6 +332,7 @@ const (
 	traceProblem = traceTag + " problem"
 	tracePairTag = traceTag + " pair"
 	traceDecline = traceTag + " decline"
+	traceCostTag = traceTag + " cost"
 	traceEnd     = traceTag + " end"
 )
 
@@ -214,12 +350,17 @@ func (t *searchTrace) render() string {
 		fmt.Fprintf(&b, "%s phase=%d lev=%d reason=%s pair=%s\n",
 			traceDecline, p.phase, p.level, p.reason, t.pairKey(p.outer, p.inner))
 	}
+	for _, c := range t.costs {
+		fmt.Fprintf(&b, "%s lev=%d rel=%s rows=%g npaths=%d cheapest=%s reqouter=%s total=%g second=%s secondtotal=%g\n",
+			traceCostTag, c.level, t.relsetName(c.rel), c.rows, c.paths, c.kind,
+			t.relsetName(c.reqouter), c.total, c.second, c.secondTotal)
+	}
 	status := "ok"
 	if t.failed != "" {
 		status = t.failed
 	}
-	fmt.Fprintf(&b, "%s top=%s pairs=%d declined=%d status=%s\n",
-		traceEnd, t.relsetName(t.top), len(t.pairs), len(t.declined), status)
+	fmt.Fprintf(&b, "%s top=%s pairs=%d declined=%d costs=%d status=%s\n",
+		traceEnd, t.relsetName(t.top), len(t.pairs), len(t.declined), len(t.costs), status)
 	return b.String()
 }
 
