@@ -616,3 +616,40 @@ func TestElectOrderedGroupingElectsNoSortAtQ4Numbers(t *testing.T) {
 		t.Fatalf("copy-back strategy = %v; want sorted", agg.node.Strategy)
 	}
 }
+
+// TestGroupingEmissionTranslatesGatherMergeChild: R56's
+// worker-sort-under-GatherMerge no-split arm delivers group-key order
+// through a `PathGatherMerge` child — a merge emits its inputs' order,
+// the same contract the Sort-child variant relies on — so it
+// translates identically (direction/nulls ride from the merge keys).
+// A merge on other keys declines exactly like a mis-sorted Sort:
+// translating it would elect a no-Sort plan emitting unordered groups.
+func TestGroupingEmissionTranslatesGatherMergeChild(t *testing.T) {
+	aggNode, groupCol, _ := r47slice2GroupFixture()
+	mergeKeys := []PathKey{{Expr: groupCol, SortAsc: true}}
+	gmChild := &Path{Kind: PathGatherMerge, Pathkeys: mergeKeys, Rows: 57066,
+		Children: []*Path{{Kind: PathSort, Pathkeys: mergeKeys, Rows: 14266}}}
+	spec := &Aggregate{Child: aggNode.Child, GroupExprs: []Expr{groupCol}, schema: aggNode.schema}
+	cand := &Path{Kind: PathAgg, AggStrategy: AggStrategySorted, Agg: spec,
+		Rows: 5, Cost: Cost{Startup: 69094, Total: 70122},
+		Pathkeys: mergeKeys, Children: []*Path{gmChild}}
+	got := groupingEmissionPathkeys(aggNode, cand)
+	if len(got) != 1 {
+		t.Fatalf("gathermerge child translated %d pathkeys, want 1", len(got))
+	}
+	orderCol := &ColumnRef{Index: 0, Name: "o_orderpriority", Type: catalog.Type{Name: "bpchar"}}
+	if !pathKeyEqual(got[0], PathKey{Expr: orderCol, SortAsc: true}) {
+		t.Fatalf("translated key %+v does not equal the ORDER BY key", got[0])
+	}
+	// Wrong merge keys decline: the merge does not deliver group order.
+	other := &ColumnRef{Index: 1, Name: "c1", Type: catalog.Type{Name: "int4"}}
+	badKeys := []PathKey{{Expr: other, SortAsc: true}}
+	badGM := &Path{Kind: PathGatherMerge, Pathkeys: badKeys, Rows: 57066,
+		Children: []*Path{{Kind: PathSort, Pathkeys: badKeys, Rows: 14266}}}
+	bad := &Path{Kind: PathAgg, AggStrategy: AggStrategySorted, Agg: spec,
+		Rows: 5, Cost: Cost{Startup: 69094, Total: 70122},
+		Pathkeys: badKeys, Children: []*Path{badGM}}
+	if got := groupingEmissionPathkeys(aggNode, bad); got != nil {
+		t.Fatalf("gathermerge on other keys translated %d keys, want nil", len(got))
+	}
+}

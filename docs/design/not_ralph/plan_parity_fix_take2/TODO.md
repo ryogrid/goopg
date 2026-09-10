@@ -3410,3 +3410,27 @@ triggers re-audit, not celebration; either in-bar outcome
 promotes the join-rows N-lead with a number). §3 calibration
 still ledgered, still ordered after this audit.
 Next: R56 implementation — §2 worker-sort-under-GatherMerge arm.
+R56 implementation LANDED 2026-09-11 (`r56-sort-placement-gathermerge/
+REPORT.md`, review APPROVE-WITH-NOTES, 6 notes, all applied):
+third no-split upper arm (`GroupAgg → GatherMerge → Sort → pseed`,
+producer `upper.groupagg.gathermerge`; SCOPE Amendment A records
+the two companions the authorised site-b cut proved insufficient
+without — `upperorderedgrouping.go` GatherMerge translation,
+`parallel.go` Sort-through arms — plus the in-loop Q78 defect
+fix, `cte_inline_pushdown.go` GatherMerge passthrough).
+Prediction LANDS 149461.93 (inside [149350,149550], margin
+382→~193 DOWN, no flip — the scope-allowed outcome); Q7 winner
+immobile; Q7 root byte-identical; TPC-H values 8/8; Q3 flip
+(Sort→Gather 233350.75 → GatherMerge→Sort 216851.72, join
+subtree byte-identical, values MATCH) ACCEPTED with C-19e-q16
+precedent; DS SF0.5 sweep PASS=95 all-zero with 9 plan moves
+all toward-PG; Q78 fix restores `d_year = 1998` on all three
+`date_dim` scans (GroupAgg rows 269574→549 / 684176→1395 /
+1425140→2906, Limit 100→7, GM shape retained) with blast
+radius exactly Q78. Residuals ledgered, ordered after: join-rows
+N-lead (now with residual ~193 number), §3 tie-break
+calibration, F3 procost, AGG_MIXED, Q8 +25k gap, general-path
+Gather/GatherMerge crossing in `pushConjunctTraced`. Evidence
+tmp-only `/tmp/pp2/r56/` + `/tmp/q78-clone-{base,r56}.txt`.
+Next: join-rows N-lead follow-up (estimator territory, WITH a
+number) — needs its own scope round first.

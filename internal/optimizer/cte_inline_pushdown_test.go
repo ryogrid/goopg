@@ -106,6 +106,92 @@ func TestCTEBodyPushSingleRef(t *testing.T) {
 	}
 }
 
+// --- the GatherMerge crossing (R56) ----------------------------------
+
+// TestCTEBodyPushCrossesGatherMerge pins the R56 passthrough on the
+// constructed shape the worker-sort-under-GatherMerge no-split arm
+// builds: Aggregate -> GatherMerge -> Sort -> SeqScan. A restriction on
+// the single-reference CTE's group-key output must cross the reference,
+// cross the aggregate, cross the merge boundary, and land on the body's
+// leaf — while the residual Filter keeps its copy (duplicate, not move).
+// Without the arm this declined at the merge boundary: TPC-DS Q78's
+// three `date_dim` scans lost `Filter: (d_year = 1998)` (rows 149 ->
+// 73049) on a plan whose shape is otherwise PG's own.
+func TestCTEBodyPushCrossesGatherMerge(t *testing.T) {
+	leaf := &SeqScan{Table: &catalog.Table{Name: "sales"}, schema: Schema{ijCol("y"), ijCol("cnt")}}
+	srt := &Sort{Child: leaf}
+	gm := &GatherMerge{Child: srt, WorkersPlanned: 3, schema: Schema{ijCol("y"), ijCol("cnt")}}
+	agg := &Aggregate{
+		Child:      gm,
+		GroupExprs: []Expr{&ColumnRef{Index: 0, Name: "y", Type: catalog.Type{Name: "int4"}}},
+		Aggs:       []AggregateCall{{Name: "sum", Arg: &ColumnRef{Index: 1, Name: "cnt", Type: catalog.Type{Name: "int4"}}}},
+		schema:     Schema{ijCol("y"), ijCol("total")},
+	}
+	ce := &plannedCTE{
+		name:           "s",
+		body:           agg,
+		schema:         Schema{ijCol("y"), ijCol("total")},
+		refs:           1,
+		inlineEligible: true,
+	}
+	scan := &CTEScan{Name: "s", Alias: "s", Child: agg, schema: ce.schema, cte: ce}
+	f := &Filter{Child: scan, Predicate: ijEq(0, "y", 1998)}
+	pushQualsThroughSingleRefCTEs(f)
+
+	// Walk the known chain explicitly: positional (child-of-child)
+	// assertions, so a boundary that stops republishing its child
+	// fails HERE rather than as a silent zero-count elsewhere. The
+	// shared planChildren helper carries Gather/GatherMerge arms (see
+	// its R56 note), so cipBodyLeafFilters can also see through the
+	// merge boundary — the explicit walk stays primary because it
+	// pins WHERE the pushed Filter lands, not just that one exists.
+	if agg.Child != Node(gm) {
+		t.Fatalf("aggregate child is %T, want the *GatherMerge it was built over", agg.Child)
+	}
+	if gm.Child != Node(srt) {
+		t.Fatalf("merge child is %T, want the *Sort it was built over", gm.Child)
+	}
+	lf, ok := srt.Child.(*Filter)
+	if !ok {
+		t.Fatalf("sort child is %T, want *Filter carrying the pushed qual", srt.Child)
+	}
+	if lf.Child != Node(leaf) {
+		t.Errorf("pushed Filter sits above %T, want the body SeqScan", lf.Child)
+	}
+	if !lf.LeafLocal {
+		t.Errorf("pushed Filter over a base-relation leaf must set LeafLocal (M0077-0001 convention)")
+	}
+	if got := columnRefIndexes(lf.Predicate); len(got) != 1 || got[0] != 0 {
+		t.Errorf("pushed predicate refs = %v, want [0] (sales.y)", got)
+	}
+	if got := len(splitAnd(f.Predicate)); got != 1 {
+		t.Errorf("residual Filter has %d conjuncts, want 1 — the pass must DUPLICATE, not move", got)
+	}
+
+	// Freshness pin on the shared finder: planChildren must see
+	// through the merge boundary this test crosses. If a later edit
+	// drops the GatherMerge arm, cipBodyLeafFilters goes blind and
+	// the decline-tests below would pass vacuously — this fails
+	// loudly instead.
+	if kids := planChildren(gm); len(kids) != 1 || kids[0] != Node(srt) {
+		t.Fatalf("planChildren(GatherMerge) sees %d children, want the 1 sorted child (R56 finder arm)", len(kids))
+	}
+	if got := cipBodyLeafFilters(agg); len(got) != 1 || got[0] != lf {
+		t.Fatalf("cipBodyLeafFilters(body) found %d leaf Filters, want the 1 pushed Filter", len(got))
+	}
+
+	// Idempotence: a second walk must find the conjunct already present
+	// (exprEqual guard) rather than stack a duplicate.
+	pushQualsThroughSingleRefCTEs(f)
+	lf2, ok := srt.Child.(*Filter)
+	if !ok {
+		t.Fatalf("after a second walk the sort child is %T, want *Filter", srt.Child)
+	}
+	if got := len(splitAnd(lf2.Predicate)); got != 1 {
+		t.Errorf("after a second walk the body Filter has %d conjuncts, want 1 (idempotence)", got)
+	}
+}
+
 // --- the declines ----------------------------------------------------
 
 // TestCTEBodyPushDeclines pins the gate's three legs. A multiply

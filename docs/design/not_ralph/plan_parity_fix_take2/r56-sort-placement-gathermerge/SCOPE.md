@@ -158,3 +158,29 @@ not celebration. Either in-bar outcome promotes the N-lead
 R56 = this audit (probe C, §§1–2) + §2 implementation in the
 next task. Nothing here authorises a constant, a threshold
 tweak, or §3 calibration.
+
+### Amendment A (implementation round, 2026-09-11): companions
+
+The §2 cut as authorised (site b ONLY — the `partialaggupper.go`
+arm) proved insufficient in two places and exposed one latent
+defect; the implementation round added three companions, all
+mechanism-only under the same no-new-constant argument,
+recorded in REPORT.md §2/§5 and approved at review
+(APPROVE-WITH-NOTES):
+
+- `upperorderedgrouping.go`: `groupingEmissionPathkeys` accepts a
+  `PathGatherMerge` child as well as `PathSort` — found
+  pre-compaction by the Q7 root-cost delta (without it the new
+  candidate evicts the leader-sort candidate under identical
+  pathkeys and `electOrderedGrouping` declines to a
+  legacy-priced ORDER BY seed).
+- `parallel.go`: Sort-through arms in the four spine walks
+  (`drivingScan`, `stamp`/`unstamp`, `findPartialSubtree`) — the
+  stamp arm is REQUIRED (`gatherChildPlan` refuses a worker
+  subtree with no driving scan, so without it the upper arm
+  could never build).
+- `cte_inline_pushdown.go`: transparent `*GatherMerge`
+  passthrough in `pushConjunctIntoCTEBody` — in-loop defect
+  (Q78's three `date_dim` scans lost `d_year = 1998` under the
+  new GM shape; single root cause, proved by unit + clone A/B +
+  DS channel A/B).

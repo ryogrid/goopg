@@ -68,6 +68,13 @@ import (
 // (pathtrace.go). It reads `producer=upper.groupagg.split relids=-`.
 const partialAggSplitPathProducer = "upper.groupagg.split"
 
+// partialAggGatherMergeProducer is the R56 worker-sort-under-GatherMerge
+// no-split arm's DPPATH trace string: `producer=upper.groupagg.gathermerge
+// relids=-`. A distinct producer so the trace tells which of the two sorted
+// no-split shapes (leader sort over Gather vs worker sorts under Gather
+// Merge) `add_path` kept.
+const partialAggGatherMergeProducer = "upper.groupagg.gathermerge"
+
 // addPartialAggSplitPath files the parallel `Finalize -> Gather -> Partial`
 // candidate onto the GROUP_AGG rel, or files nothing.
 //
@@ -413,6 +420,64 @@ func addPartialAggSplitPath(u *upperRels, grouped *RelOptInfo, seed *Path, aggNo
 				nGroupCols, finalGroups, nAggs, inNcols, inAvgVar),
 			Pathkeys: sortedInput.Pathkeys, Children: []*Path{sortedInput},
 		}, partialAggNoSplitProducer)
+
+		// R56: the WORKER-SORT no-split arm — `GroupAgg -> GatherMerge ->
+		// Sort -> pseed`, PG's winning Q7 shape
+		// (`GroupAggregate -> Gather Merge -> Sort -> partial join`). The
+		// sort is priced on PER-WORKER rows through `costSortRun` (via
+		// `sortPathForBounded` over the per-worker seed — that is the whole
+		// saving: N sorts of R/N rows against one of R log R), the boundary
+		// through `gatherMergeCost`, the upper through the SORTED arm of
+		// `costAgg` — all existing functions, no new constant (C-19e §3's
+		// argument, unchanged: this round is the upper-aggregate analogue
+		// of C-19e at the site it did not touch). It competes in
+		// `add_path`; `setCheapest` adjudicates.
+		//
+		// The GatherMerge is built MANUALLY rather than through
+		// `makeGatherMergePath`: that constructor only wraps an
+		// already-sorted subpath (`partialPathDrivingKind` refuses Sort),
+		// while this arm builds the sort itself — C-19e's
+		// `createPartialSortPaths` pattern (partialsortpaths.go), whose
+		// worker-side construction this mirrors field for field.
+		workerSort := sortPathForBounded(pseed, pathkeysForSortKeys(groupKeysSortKeys(aggNode)), cp, -1)
+		// `sortPathForBounded` prices ParallelSafe but never plans workers;
+		// without this the GatherMerge build below refuses the subpath
+		// (`gatherChildPlan` panics on 0 workers).
+		workerSort.ParallelWorkers = workers
+		// Rows crossing the merge boundary: every input row — a Sort
+		// emits what it reads — i.e. the per-worker count the sort was
+		// priced with (`perWorkerRows`) times the divisor `d`. Spelled
+		// manually rather than via `computeGatherRows`: that helper
+		// re-derives the divisor from the subpath and applies
+		// `clampRowEst`, while here the count must stay exactly the
+		// pricing basis above (float division round-trips:
+		// `perWorkerRows * d` recovers `inputRows` — no integer
+		// truncation, `d` is float64).
+		gmCrossedRows := perWorkerRows * d
+		gmCost := gatherMergeCost(cp, workerSort.Cost, workers, gmCrossedRows)
+		workerGM := &Path{
+			Kind: PathGatherMerge, Rel: grouped, Rows: gmCrossedRows, Cost: gmCost,
+			// Upstream takes the subpath's own key list ("gather merge
+			// input not sufficiently sorted"); `makeGatherMergePath`
+			// copies it for the same reason.
+			Pathkeys: append([]PathKey(nil), workerSort.Pathkeys...),
+			// Field-for-field with `makeGatherMergePath`: the boundary is
+			// neither partial itself nor usable inside another one.
+			ParallelSafe: false, ParallelWorkers: 0,
+			// `input_disabled_nodes + (enable_gathermerge ? 0 : 1)`
+			// (costsize.c:535).
+			DisabledNodes: workerSort.DisabledNodes + disabledNodesFor(!cp.enableGatherMerge),
+			Children:      []*Path{workerSort},
+		}
+		// R47 slice 1: per-candidate spec clone (see groupingpaths.go).
+		gmSpec := *aggNode
+		addPath(grouped, &Path{
+			Kind: PathAgg, AggStrategy: AggStrategySorted, Agg: &gmSpec,
+			Rel: grouped, Rows: finalGroups,
+			Cost: costAgg(cp, AggStrategySorted, gmCrossedRows, gmCost.Startup, gmCost.Total,
+				nGroupCols, finalGroups, nAggs, inNcols, inAvgVar),
+			Pathkeys: workerGM.Pathkeys, Children: []*Path{workerGM},
+		}, partialAggGatherMergeProducer)
 	}
 	// R54 Step-0: same admission record as the PLAIN arm above — both exits
 	// filed candidates, so both are admissions of the upper-rel round.

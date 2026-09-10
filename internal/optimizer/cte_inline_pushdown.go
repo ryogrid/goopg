@@ -227,7 +227,7 @@ func pushConjunctIntoCTEBody(n Node, c Expr) (Node, bool) {
 
 	case *Filter:
 		switch x.Child.(type) {
-		case *Project, *Aggregate, *Sort, *Filter:
+		case *Project, *Aggregate, *Sort, *GatherMerge, *Filter:
 			repl, ok := pushConjunctIntoCTEBody(x.Child, c)
 			if ok {
 				x.Child = repl
@@ -240,6 +240,39 @@ func pushConjunctIntoCTEBody(n Node, c Expr) (Node, bool) {
 		return pushConjunctIntoSubtree(x, c)
 
 	case *Sort:
+		repl, ok := pushConjunctIntoCTEBody(x.Child, c)
+		if ok {
+			x.Child = repl
+		}
+		return x, ok
+
+	case *GatherMerge:
+		// R56. Transparent passthrough, exactly like *Sort: a Gather Merge
+		// republishes its child's schema unchanged (NewGatherMerge sets
+		// schema: child.Output(), plan.go) and merges already-sorted
+		// worker streams without reordering rows, so a conjunct expressed
+		// in the child's space selects the same rows below the boundary
+		// as above it. Without this, the R56
+		// worker-sort-under-GatherMerge no-split arm (partialaggupper.go)
+		// puts a GatherMerge directly under the upper Aggregate of every
+		// single-reference grouping CTE it wins, and the
+		// unrecognized-node fallthrough below declines — TPC-DS Q78's
+		// three `date_dim` scans lost `Filter: (d_year = 1998)` (rows
+		// 149 -> 73049, GroupAgg rows 549 -> 269574 via the skipped Yao
+		// term), a qual-placement divergence from PG on a plan whose
+		// shape is otherwise PG's own. Copy semantics only: the residual
+		// Filter above keeps its conjunct (pushFilterQualsThroughCTEScan
+		// duplicates), so this plants an earlier filter, never a move.
+		// *Gather* is deliberately NOT included, as scope containment
+		// rather than a soundness verdict: a Gather republishes its
+		// child's schema unchanged too (NewGather, plan.go), so crossing
+		// it would be equally sound — but below the top Aggregate only
+		// the no-split shapes arrive in this round (the *Aggregate* arm
+		// above declines Partial/Finalize splits), and a Gather deeper
+		// in the join tree is pushConjunctIntoSubtree's territory — the
+		// same boundary the *Sort* precedent draws. General-path
+		// Gather/GatherMerge crossing there is a separate round with its
+		// own proof (REPORT.md §6).
 		repl, ok := pushConjunctIntoCTEBody(x.Child, c)
 		if ok {
 			x.Child = repl

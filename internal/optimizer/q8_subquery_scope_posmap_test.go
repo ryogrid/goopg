@@ -118,6 +118,12 @@ func TestQ8SubqueryProjectTargetsStayInChildScope(t *testing.T) {
 // local and explicit rather than reaching for a generic walker: the test
 // must keep working even if the shared walkers change their skip rules,
 // since those rules are exactly what this test is guarding.
+//
+// R56: the parallel-boundary wrappers are listed too. A finder that
+// cannot see through them silently counts zero on any R56-shaped body
+// (Aggregate -> GatherMerge -> Sort -> …), which reads as a passing
+// decline — the failure mode TestCTEBodyPushCrossesGatherMerge was
+// first written around before this arm existed.
 func planChildren(n Node) []Node {
 	switch x := n.(type) {
 	case *Project:
@@ -138,6 +144,10 @@ func planChildren(n Node) []Node {
 		return []Node{x.Left, x.Right}
 	case *NestedLoopIndexJoin:
 		return []Node{x.Outer, x.Inner}
+	case *Gather:
+		return []Node{x.Child}
+	case *GatherMerge:
+		return []Node{x.Child}
 	}
 	return nil
 }

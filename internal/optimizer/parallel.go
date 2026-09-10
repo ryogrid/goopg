@@ -424,8 +424,14 @@ func findPartialSubtree(root Node, s ParallelSettings) (partialTarget, bool) {
 			cur = kids[0]
 			continue
 		}
-		// cur is partial-capable if it bottoms out in an eligible seq scan.
-		if drivingScan(cur) != nil {
+		// cur is partial-capable if it bottoms out in an eligible seq scan —
+		// but not THROUGH a Sort. A Sort on the driving spine means
+		// per-worker sorts, and parking a concatenating Gather above them
+		// returns unordered rows (TestNoPlainGatherOverWorkerSort). The
+		// walk descends to the Sort itself instead, so P7 places a
+		// GatherMerge over it. Sorts OFF the spine — a join build side,
+		// replicated whole per worker — are unaffected, as before.
+		if drivingScan(cur) != nil && !drivingScanCrossesSort(cur) {
 			return partialTarget{node: cur}, true
 		}
 		kids := parallelChildren(cur)
@@ -572,6 +578,22 @@ func stampParallelScan(n Node) Node {
 		c := *x
 		c.Child = child
 		return &c
+	case *Sort:
+		// R56: mirror of the drivingScan arm — stamp through to the driving
+		// scan so an Agg→Sort→scan split labels the scan it actually runs
+		// on. Copy-on-write: the post-pass runs on a plan the process-wide
+		// cache may be handing to other sessions right now
+		// (rebuildWithGather's comment). Required, not cosmetic:
+		// `gatherChildPlan` stamps the built child and refuses a subtree
+		// with no driving scan, so without this arm the R56 GatherMerge
+		// upper arm could never build.
+		child := stampParallelScan(x.Child)
+		if child == x.Child {
+			return x
+		}
+		c := *x
+		c.Child = child
+		return &c
 	case *Join:
 		// P8 (drivingScan): a hash join is partial through its PROBE side
 		// only. Mirrored here so the same side gets labelled.
@@ -654,6 +676,15 @@ func drivingScan(n Node) Node {
 		return drivingScan(x.Child)
 	case *Project:
 		return drivingScan(x.Child)
+	case *Sort:
+		// R56. A Sort over a partial-capable subtree is transparent to the
+		// driving-scan walk: each worker sorts its own partition (P7), so the
+		// scan below is still the per-worker entry the executor's
+		// `attachParallelScan` descends to (parallel_scan.go, P7 arm). This
+		// admits Agg→Sort→scan to the P9 split verdict and Sort-topped
+		// children to the upper-rel producer; the four walks (drivingScan,
+		// stampParallelScan, unstampParallelScan, attachParallelScan) agree.
+		return drivingScan(x.Child)
 	case *Join:
 		// P8. A hash join is partial through its PROBE side only: the build
 		// side is drained once by the leader before fan-out, and the probe is
@@ -677,6 +708,37 @@ func drivingScan(n Node) Node {
 		return drivingScan(x.Right)
 	}
 	return nil
+}
+
+// drivingScanCrossesSort reports whether `drivingScan`'s descent from n to
+// its scan passes through a Sort.
+//
+// R56. This is the guard `findPartialSubtree`'s bottom-out rule needs now
+// that `drivingScan` sees through Sorts: a Sort on the spine means the
+// boundary would sit above per-worker sorts, which only a GatherMerge may
+// do. It follows `drivingScan`'s traversal arm for arm — Filter, Project,
+// the probe side of a partial-capable join (P8) — and the two must stay in
+// agreement: a node kind added to one belongs in the other. Sorts anywhere
+// else (a join build side, a NestedLoopIndexJoin inner) are off the spine
+// and read false here, which is what keeps the old verdict for them.
+func drivingScanCrossesSort(n Node) bool {
+	switch x := n.(type) {
+	case *Sort:
+		return true
+	case *Filter:
+		return drivingScanCrossesSort(x.Child)
+	case *Project:
+		return drivingScanCrossesSort(x.Child)
+	case *Join:
+		if !hashJoinIsPartialCapable(x) && !mergeJoinIsPartialCapable(x) {
+			return false
+		}
+		if joinProbeSideIsLeft(x) {
+			return drivingScanCrossesSort(x.Left)
+		}
+		return drivingScanCrossesSort(x.Right)
+	}
+	return false
 }
 
 // plainIndexScanIsPartialCapable is the one predicate drivingScan (eligibility)
@@ -997,15 +1059,14 @@ func rebuildWithGather(root Node, tgt partialTarget, workers int) Node {
 	if root == tgt.node {
 		switch {
 		case tgt.mergeKeys != nil:
-			// The target IS the Sort, and `stampParallelScan` has no `*Sort`
-			// arm — deliberately: `terminatesPartial` lists `*Sort`, so a Sort
-			// can never appear INSIDE a partial subtree, and the traversal must
-			// stay identical to `drivingScan`'s (this function's sibling
-			// warning). The one place a Sort sits at the top of a partial
-			// subtree is right here, and `findPartialSubtree` already resolved
-			// it the same asymmetric way: it asked `drivingScan(srt.Child)`,
-			// not `drivingScan(srt)`. So stamp the CHILD, for the same reason
-			// and at the same offset.
+			// The target IS the Sort. R56 gave `stampParallelScan` a `*Sort`
+			// arm for Sorts INSIDE a partial subtree (Agg→Sort→scan splits),
+			// but the top-of-subtree case still needs its own branch: stamping
+			// the Sort itself would build a plain Gather over per-worker
+			// Sorts and silently return unordered rows, so the CHILD is
+			// stamped and a GatherMerge wraps the Sort — the same asymmetric
+			// resolution `findPartialSubtree` already made when it asked
+			// `drivingScan(srt.Child)`, not `drivingScan(srt)`.
 			//
 			// Found by C-19e's TPC-H arm (2026-09-07). Stamping `root` here
 			// fell through every arm and returned the Sort UNCHANGED, so the
@@ -1303,6 +1364,18 @@ func unstampParallelScan(n Node) Node {
 		c.Child = child
 		return &c
 	case *Project:
+		child := unstampParallelScan(x.Child)
+		if child == x.Child {
+			return n
+		}
+		c := *x
+		c.Child = child
+		return &c
+	case *Sort:
+		// R56: the inverse of the stampParallelScan arm (that function's
+		// sibling warning). A scan left labelled parallel with no Gather
+		// above it makes EXPLAIN claim a parallelism the executor will
+		// not run.
 		child := unstampParallelScan(x.Child)
 		if child == x.Child {
 			return n

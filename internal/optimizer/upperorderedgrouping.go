@@ -34,8 +34,10 @@ package optimizer
 // they are allowed. Every other shape declines:
 //
 //   - hashed (or any non-sorted strategy): unordered output.
-//   - non-Sort child: the index variant rides a `PathPrebuilt` seed,
-//     never a sort; the plain arm has no order at all.
+//   - neither-Sort-nor-GatherMerge child: the index variant rides a
+//     `PathPrebuilt` seed, never a sort; the plain arm has no order at
+//     all. (R56: a `PathGatherMerge` child translates — a merge emits
+//     its inputs' order, the same contract a Sort gives.)
 //   - `GroupKeyOrder != nil`: the narrowed index-remapped spec —
 //     excluded even though its child check would decline anyway.
 //   - grouping sets / empty groups / non-simple mode: mirrors the
@@ -65,8 +67,20 @@ func groupingEmissionPathkeys(aggNode *Aggregate, cand *Path) []PathKey {
 		spec.GroupKeyOrder != nil {
 		return nil
 	}
+	// R56: the worker-sort-under-GatherMerge no-split arm
+	// (partialaggupper.go) delivers group-key order through a
+	// `PathGatherMerge` child, not a `PathSort` — a Gather Merge emits
+	// the merged order of its sorted inputs, the same order-delivery
+	// contract a Sort gives (the contract PG relies on when it feeds
+	// Gather Merge inputs into `create_ordered_paths`). Without
+	// this the R56 candidate evicts the leader-sort candidate under
+	// identical pathkeys and the loop below loses its only translatable
+	// candidate — declining to a legacy-priced ORDER BY seed on every
+	// query the new arm touches. The positional group-key coverage
+	// check below is unchanged, so a merge on other keys still declines
+	// exactly like a mis-sorted Sort.
 	if len(cand.Children) == 0 || cand.Children[0] == nil ||
-		cand.Children[0].Kind != PathSort {
+		(cand.Children[0].Kind != PathSort && cand.Children[0].Kind != PathGatherMerge) {
 		return nil
 	}
 	childPK := cand.Children[0].Pathkeys
