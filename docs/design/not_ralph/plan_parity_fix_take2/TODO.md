@@ -3390,3 +3390,23 @@ general-ANY, Q8 tie-break) ledgered; §3 calibration still ordered
 after the R56 `costAgg` audit. Evidence tmp-only `/tmp/pp2/r55/`.
 Next: R56-candidate audit — `costAgg` sorted grouping-comparison
 term (SCOPE §1 lead) — needs its own scope round first.
+R56 scope LANDED 2026-09-11 (`r56-sort-placement-gathermerge/
+SCOPE.md`, review APPROVE-WITH-NOTES, 4 precision notes, all
+applied): probe C (i) costAgg terms NO-MECHANISM (grouping-cmp
+term identical to PG; F3 trans/final symmetric 58.75–58.77 on
+all four upper adds — owns zero of the margin; spill inert at
+1468 groups); (ii) margin equation closes to the cent (sorted
+− gathered = 382.40 = leader Sort at N=5874, term-faithful per
+probe A, at estimator-produced N); (iii) structural gap
+WELL-DEFINED-CUT (PG's GroupAgg→GatherMerge→Sort shape absent —
+zero keyed partials on the join input; goopg's pk=3 rival is
+GroupAgg→Sort→Gather). Authorised cut = third no-split upper
+arm (worker Sort via `costSortRun` + `gatherMergeCost` +
+`costAgg` SORTED arm, no new constant — upper-aggregate
+analogue of landed C-19e at the site it did not touch).
+Prediction: pk=3 rival → [149350,149550] (~149460, margin
+382→~190 DOWN, flip NOT promised — a flip at unfaithful N
+triggers re-audit, not celebration; either in-bar outcome
+promotes the join-rows N-lead with a number). §3 calibration
+still ledgered, still ordered after this audit.
+Next: R56 implementation — §2 worker-sort-under-GatherMerge arm.
