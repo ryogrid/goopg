@@ -2895,3 +2895,30 @@ moving except host-line re-pricing + the NLI-residual lines
 that move onto inner scans (each adjudicated toward PG's
 placement); ZERO shape flips required, ZERO EXTRA allowed;
 values gates (TPC-H digest 24/24, SF0.5 sweep all-zero) bind.
+
+**Result — LANDED 2026-09-10** (report:
+`r48-semi-joinqual-placement/REPORT.md`). Half-1: `Filter:
+(true)` skip in BOTH Filter arms of `operators_explain.go`
+(plain + ANALYZE twin — the design named only the plain arm;
+the twin carries the same arm per the file's sibling-agreement
+doctrine). Half-2: `lowerSemiResidualToCond` in
+`nl_index_join.go`, SEMI/ANTI-gated, runs BEFORE
+`indexOnlyNLIInner` (F2 order pin — IOS sees `Cond` set and
+declines). Census: strays 6 → 0 TPC-H / 34 → 0 TPC-DS,
+normalized shape diffs empty (ZERO EXTRA flips); Half-2 moves
+= 9 TPC-H lines, all adjudicated (Q4 join-qual → inner probe
+`Filter:` = PG placement; Q21 outer Anti mixed residual splits
+— outer half stays on the join, inner half to the `l3` probe),
+TPC-DS byte-identical (strict no-op). Q4 semi core now
+placement-identical to `pg-q4.txt` (remaining gap = recorded
+F9 parallel-shape expectation). Values: digest 24/24 MATCH
+VERDICT PASS; SF0.5 sweep PASS=95 MISMATCH=0 CKMISMATCH=0
+ERROR=0; spotcheck Q12=2/Q13=34 PASS; optimizer+executor
+suites + pre-commit units green. Fossil-carrier finding
+(restated): the true-wrapper is fully costed, predicate
+swapped post-costing with stored PlanCost kept — Q2 host rows
+5 → 160000, PG-EXACT vs the live oracle. Pre-existing, not
+owned: `TestLeftJoinCrossRelationResidualReachesNLI` SKIP
+(identical at clean HEAD — R25 arm serves that shape first);
+`Join Filter: (true)` (`exists_to_any.go:355-367`) still
+corpus-zero, follow-up stands.

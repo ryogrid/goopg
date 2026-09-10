@@ -113,6 +113,16 @@ func TestNLISemiResidualExecution(t *testing.T) {
 	if !strings.Contains(plan, "Nested Loop Semi Join") {
 		t.Fatalf("expected the NLI semi path to serve this query; plan:\n%s", plan)
 	}
+	// R48 Half 2: the inner-only residual lives on the probe as
+	// IndexScan.Cond, rendering as the inner scan's Filter: — exactly
+	// one Filter: line, no join-level line (that shape would double
+	// the evaluation, once per row plus once per pair).
+	if !strings.Contains(plan, "Filter: (l_c < l_r)") {
+		t.Fatalf("expected the probe Cond to render as the inner Filter:; plan:\n%s", plan)
+	}
+	if got := strings.Count(plan, "Filter:"); got != 1 {
+		t.Fatalf("expected exactly one Filter: line (the probe's), got %d; plan:\n%s", got, plan)
+	}
 	got := nliResidualRows(t, ctx, sql)
 	want := []string{"1", "3"}
 	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
@@ -130,6 +140,13 @@ func TestNLIAntiResidualExecution(t *testing.T) {
 	plan := nliResidualExplain(t, ctx, sql)
 	if !strings.Contains(plan, "Nested Loop Anti Join") {
 		t.Fatalf("expected the NLI anti path to serve this query; plan:\n%s", plan)
+	}
+	// R48 Half 2: same placement pin as the semi test above.
+	if !strings.Contains(plan, "Filter: (l_c < l_r)") {
+		t.Fatalf("expected the probe Cond to render as the inner Filter:; plan:\n%s", plan)
+	}
+	if got := strings.Count(plan, "Filter:"); got != 1 {
+		t.Fatalf("expected exactly one Filter: line (the probe's), got %d; plan:\n%s", got, plan)
 	}
 	got := nliResidualRows(t, ctx, sql)
 	// o_key=2: inner rows exist but none passes (9<3 false, NULL<5

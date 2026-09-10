@@ -439,6 +439,18 @@ func walkPlanFiltered(n optimizer.Node, indent int, rows *[]Row, opts parser.Exp
 	// Skip Filter wrappers and push their predicate down to be
 	// rendered as `Filter:` detail under the next scan node.
 	if f, ok := n.(*optimizer.Filter); ok {
+		// R48 Half 1: a trivially-true predicate is unnest scaffolding
+		// left deliberately so downstream code that recurses through
+		// Filter still finds the join (unnest.go
+		// pushConjunctsBelowSemiAnti) — PG has no such node, so it
+		// must not render. Pass through carrying the INCOMING
+		// attached filter unchanged, so a real outer filter above a
+		// true-wrapper still renders below. ONLY Value:true fires;
+		// nil predicates and Value:false take the normal path.
+		if b, ok := f.Predicate.(*optimizer.BooleanConst); ok && b != nil && b.Value {
+			walkPlanFiltered(f.Child, indent, rows, opts, attachedFilter, attachedFilterNode, reg)
+			return
+		}
 		next := f.Predicate
 		nextNode := optimizer.Node(f)
 		// If multiple Filter wrappers stack, render only the
@@ -1568,6 +1580,21 @@ func walkPlanAnalyzeFiltered(n optimizer.Node, indent int, rows *[]Row, opts par
 		return
 	}
 	if f, ok := n.(*optimizer.Filter); ok {
+		// R48 Half 1 twin of the plain walker's pass-through: a
+		// trivially-true wrapper rejects no rows, so its own
+		// instrumentation entry (when present) contributes nothing —
+		// still accumulate it before passing through, mirroring the
+		// normal path, so "Rows Removed by Filter" can never lose a
+		// count to the skip. Both walkers must agree: a test pinning
+		// one proves nothing about the other.
+		if b, ok := f.Predicate.(*optimizer.BooleanConst); ok && b != nil && b.Value {
+			fr := filterRowsRemoved
+			if fs, ok := stats[f]; ok && fs != nil {
+				fr += fs.filterRejected
+			}
+			walkPlanAnalyzeFiltered(f.Child, indent, rows, opts, stats, spStats, memoStats, hashStats, gatherLaunched, workerStats, attachedFilter, attachedFilterNode, fr, reg)
+			return
+		}
 		next := f.Predicate
 		nextNode := optimizer.Node(f)
 		if attachedFilter != nil {

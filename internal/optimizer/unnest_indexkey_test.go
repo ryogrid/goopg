@@ -458,8 +458,9 @@ func TestIndexKeyScalarJoinInnerDecorrelates(t *testing.T) {
 // TestIndexKeyExistsResidualBecomesNLISemi is the S6 (D6.2) end-to-end
 // Q4-shape assertion: with the harvest on, an EXISTS whose body carries
 // an inner-only residual AND whose WHERE has an outer local conjunct
-// must plan as an index-driven NLI semi join — residual on the NLI, the
-// local conjunct sunk BELOW the join (pushConjunctsBelowSemiAnti) so the
+// must plan as an index-driven NLI semi join — residual on the PROBE as
+// IndexScan.Cond (R48 Half 2: PG's inner-Filter placement), the local
+// conjunct sunk BELOW the join (pushConjunctsBelowSemiAnti) so the
 // probe count and the NLI cost gate both see the filtered outer.
 func TestIndexKeyExistsResidualBecomesNLISemi(t *testing.T) {
 	SetIndexKeyHarvestEnabled(true)
@@ -503,9 +504,20 @@ func TestIndexKeyExistsResidualBecomesNLISemi(t *testing.T) {
 	if nli == nil {
 		t.Fatalf("EXISTS with inner residual did not become an NLI semi join")
 	}
-	if nli.Predicate == nil {
-		t.Fatalf("the inner residual was lost — NLI.Predicate is nil")
+	if nli.Predicate != nil {
+		t.Fatalf("the inner-only residual should live on the probe Cond, not the join — NLI.Predicate is %#v", nli.Predicate)
 	}
+	probe := nliIn(nli.Inner)
+	if probe == nil {
+		t.Fatalf("inner-only residual must leave a plain IndexScan probe (F2: IOS declines on Cond); inner is %T", nli.Inner)
+	}
+	if probe.Cond == nil {
+		t.Fatal("the inner residual was lost — probe Cond is nil")
+	}
+	if !exprTreeMentions(probe.Cond, "i_a") || !exprTreeMentions(probe.Cond, "i_b") {
+		t.Fatalf("the probe Cond does not carry the i_a < i_b residual; got %#v", probe.Cond)
+	}
+	assertCondLeafLocal(t, probe.Cond, probe)
 	f, isFilter := nli.Outer.(*Filter)
 	if !isFilter {
 		t.Fatalf("the outer local conjunct was not sunk below the semi join; NLI.Outer is %T", nli.Outer)

@@ -775,6 +775,21 @@ func tryBuildNLI(j *Join, cat catalog.Catalog) (*NestedLoopIndexJoin, bool) {
 	}
 
 	committed = true
+	// R48 Half 2 (plan-parity-fix-take2): lower inner-only semi/anti
+	// residuals onto the probe as IndexScan.Cond — PG's inner-`Filter:`
+	// placement (`distribute_restrictinfo_to_rels` MOVEs the qual, it
+	// does not copy it). Runs BEFORE indexOnlyNLIInner below so the IOS
+	// check sees Cond set and declines (it cannot carry a Cond); the
+	// reverse order would drop the qual silently. SEMI/ANTI only: LEFT
+	// keeps its residual unconditionally (a moved qual stops filtering
+	// null-extended rows), INNER is a later slice. For SEMI/ANTI
+	// pickInnerSide only admits j.Right as the inner, so the
+	// outer++inner frame the residual was rebound into is exactly the
+	// Left++Right frame — no frame hazard (that hazard exists only for
+	// INNER's swappable sides, gated out here).
+	if j.Type == JoinTypeSemi || j.Type == JoinTypeAnti {
+		residualPred = lowerSemiResidualToCond(residualPred, inner, len(outerNode.Output()))
+	}
 	// A SEMI or ANTI join never projects its inner — the joinedSchema branch
 	// above builds the OUTER's schema alone, "consumed only for matching, never
 	// projected". So when the residual reads no inner column either, the probe's
@@ -809,6 +824,41 @@ func tryBuildNLI(j *Join, cat catalog.Catalog) (*NestedLoopIndexJoin, bool) {
 		schema:    joinedSchema,
 	}
 	return nli, true
+}
+
+// lowerSemiResidualToCond moves the inner-only conjuncts of a SEMI/ANTI
+// NLI residual onto the probe as IndexScan.Cond (leaf-local coords, via
+// cloneExprShiftIdx with the -outerWidth shift mirroring
+// planner.go:3281), returning the reduced residual (nil when nothing
+// remains). Conjuncts referencing the outer side, both sides, no column
+// at all, or out-of-scope refs (OuterColumnRef/subquery —
+// classifyConjunctSide's sideOutOfScope) stay on the join: fail closed.
+// A clone veto likewise keeps the conjunct. The whole move is declined
+// when inner already carries a Cond. The caller gates on SEMI/ANTI; LEFT
+// must never route here (null-extended-row semantics).
+func lowerSemiResidualToCond(residual Expr, inner *IndexScan, outerWidth int) Expr {
+	if residual == nil || inner == nil || inner.Cond != nil {
+		return residual
+	}
+	innerWidth := len(inner.Output())
+	var movers, keepers []Expr
+	for _, c := range splitAnd(residual) {
+		if classifyConjunctSide(c, outerWidth, outerWidth+innerWidth) != sideRight {
+			keepers = append(keepers, c)
+			continue
+		}
+		cl, ok := cloneExprShiftIdx(c, -outerWidth)
+		if !ok {
+			keepers = append(keepers, c)
+			continue
+		}
+		movers = append(movers, cl)
+	}
+	if len(movers) == 0 {
+		return residual
+	}
+	inner.Cond = combineAnd(movers)
+	return combineAnd(keepers)
 }
 
 // cloneExprShiftIdx deep-clones a conjunct hoisted out of a
