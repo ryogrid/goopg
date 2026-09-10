@@ -2923,7 +2923,7 @@ owned: `TestLeftJoinCrossRelationResidualReachesNLI` SKIP
 `Join Filter: (true)` (`exists_to_any.go:355-367`) still
 corpus-zero, follow-up stands.
 
-## R49 — parameterize the bitmap-heap NLI probe (design LANDED 2cbc83f06; Slice A LANDED 521bc82 2026-09-10 — report `r49-bitmap-probe-param/SLICE-A.md`; Slice B pending. Step 0 closed 2026-09-10; agent review APPROVE-WITH-NOTES 2026-09-10, 1 merge blocker + 8 notes, all applied)
+## R49 — parameterize the bitmap-heap NLI probe (design LANDED 2cbc83f06; Slice A LANDED 521bc82 2026-09-10 — report `r49-bitmap-probe-param/SLICE-A.md`; Slice B IN PROGRESS (setup done 2026-09-10, worktree /tmp/wt-r49b). Step 0 closed 2026-09-10; agent review APPROVE-WITH-NOTES 2026-09-10, 1 merge blocker + 8 notes, all applied)
 
 Named by R48 DESIGN §4 ("IOS/bitmap-Cond inners ... (their
 double-eval is a separate R)"). Census on the post-R48 corpora
@@ -2995,3 +2995,19 @@ its probe (`Recheck Cond:` + `Index Cond:`, no join line),
 each adjudicated toward its PG counterpart (Q5-class shape
 divergences recorded, not forced); ZERO EXTRA flips;
 values gates (TPC-H digest 24/24, SF0.5 sweep all-zero) bind.
+
+Slice-B setup 2026-09-10 (worktree /tmp/wt-r49b, probe
+`internal/executor/zz_probe_bitmap_test.go`, throwaway): live
+NLI-bitmap e2e recipe PROVEN — 20k-row inner / 4 keys + 4-row
+outer + WHERE (filterless INNER never reaches the search:
+`joinTreeHasOuterLink` false → legacy path) wins
+`Nested Loop` → `Bitmap Heap Scan` + `Bitmap Index Scan` on
+NATURAL costs (no toggles; bitmap probe 262 < index probe
+947) and executes 20000/20000 rows. Forcing notes: catalog
+wrapper + `EnableIndexScan=false` do NOT force it — the
+decomposed legacy shape ignores both, and the search joinrel
+ctor drops inner `DisabledNodes`; the base tournament drops a
+bitmap probe unless per-probe cost clears the full-seq
+prebuilt seed (2k rows: 33 vs 30 dropped; 20k: 262 vs 298
+kept — the index sibling survives via its pathkeys axis).
+Full mechanism notes → `SLICE-B.md` with the fix.
