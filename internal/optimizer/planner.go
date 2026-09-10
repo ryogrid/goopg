@@ -1937,7 +1937,22 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 		// function-local `upper` rather than `ctx.upper`: the aggregate and
 		// window stages hand back contexts of their own, and the rel must
 		// be this scope's whichever context is current.
-		node = createOrderedPaths(upper, node, keys, s.Pos(), plannerSet.costParams(), orderTupleFraction, orderLimitTuples)
+		// R47 slice 2 (K101): before stacking the Sort, let the ORDERED
+		// rel adjudicate the GROUP_AGG survivors — a sorted candidate
+		// whose emission order already delivers the ORDER BY needs no
+		// Sort (PG's `create_ordered_paths` over ALL input paths).
+		// Normal arm only: SRF pre/post-sort shapes are excluded, and
+		// any decline runs the call below on the pristine rel.
+		var loopBuilt Node
+		loopElected := false
+		if selectSrfPending == nil {
+			loopBuilt, loopElected = electOrderedGrouping(upper, agg, node, keys, s.Pos(), plannerSet.costParams(), orderTupleFraction, orderLimitTuples)
+		}
+		if loopElected {
+			node = loopBuilt
+		} else {
+			node = createOrderedPaths(upper, node, keys, s.Pos(), plannerSet.costParams(), orderTupleFraction, orderLimitTuples)
+		}
 		if srt, ok := node.(*Sort); ok {
 			// B-01c Slice 1: keys-only construction stamp (above not yet
 			// built); the above-aware re-stamp happens before return.

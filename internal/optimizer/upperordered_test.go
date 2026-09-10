@@ -361,3 +361,258 @@ func TestOrderedStacksSortWithoutTranslatedPathkeys(t *testing.T) {
 		t.Fatalf("untranslated pathkeys unexpectedly elected no-sort (kind=%d); want hashed+Sort documenting today's gap", best.Kind)
 	}
 }
+
+// R47 slice 2 (K101) — grouping-emission translation pins. The two slice-1
+// tests above encode the gap (input-coordinate pathkeys never satisfy the
+// ORDERED check); these pin the helper that closes it for the group-keys
+// Sort variant, and every shape that must still decline. Fixtures are
+// Q4-shaped: one bpchar group column at input Index 3, aggregate output
+// [o_orderpriority | count], ORDER BY the output column.
+
+func r47slice2GroupFixture() (aggNode *Aggregate, groupCol *ColumnRef, outSchema Schema) {
+	groupCol = &ColumnRef{Index: 3, Name: "o_orderpriority", Type: catalog.Type{Name: "bpchar"}}
+	outSchema = Schema{
+		{Name: "o_orderpriority", Type: catalog.Type{Name: "bpchar"}},
+		{Name: "count", Type: catalog.Type{Name: "int8"}},
+	}
+	child := &pricedNode{sch: Schema{
+		{Name: "c0", Type: catalog.Type{Name: "int4"}},
+		{Name: "c1", Type: catalog.Type{Name: "int4"}},
+		{Name: "c2", Type: catalog.Type{Name: "int4"}},
+		{Name: "o_orderpriority", Type: catalog.Type{Name: "bpchar"}},
+	}}
+	child.setPlanCost(PlanCost{StartupCost: 100, TotalCost: 68909, PlanRows: 57066, PlanWidth: 448})
+	aggNode = &Aggregate{Child: child, GroupExprs: []Expr{groupCol}, schema: outSchema}
+	return aggNode, groupCol, outSchema
+}
+
+func r47slice2SortedCand(spec *Aggregate, childKeys []PathKey, cost Cost) *Path {
+	// Hand-built seed: `newPrebuiltPath` dereferences the rel for Rows,
+	// and these fixtures run rel-free (the loop tests below file theirs
+	// on a real rel). `node` is set so the elect test's build has a
+	// wrapped node to return identically.
+	seed := &Path{Kind: PathPrebuilt, Rows: 57066, node: spec.Child}
+	return &Path{Kind: PathAgg, AggStrategy: AggStrategySorted, Agg: spec,
+		Rows: 5, Cost: cost,
+		// Production files the candidate with the sort input's
+		// (input-coordinate) pathkeys (`Pathkeys:
+		// sortedInput.Pathkeys`, groupingpaths.go) — load-bearing:
+		// without them the candidate looks unordered and hashed
+		// dominates it at the grouping rel.
+		Pathkeys: childKeys,
+		Children: []*Path{{Kind: PathSort, Pathkeys: childKeys, Rows: 57066, Children: []*Path{seed}}}}
+}
+
+// TestGroupingEmissionTranslatesGroupKeysSort: the group-keys Sort variant
+// translates to output-coordinate pathkeys that satisfy the ORDER BY check —
+// the hand-built input-coordinate key of
+// TestOrderedStacksSortWithoutTranslatedPathkeys becomes the passing shape of
+// TestOrderedDropsHashedSortForPresortedGrouping.
+func TestGroupingEmissionTranslatesGroupKeysSort(t *testing.T) {
+	aggNode, groupCol, _ := r47slice2GroupFixture()
+	spec := &Aggregate{Child: aggNode.Child, GroupExprs: []Expr{groupCol}, schema: aggNode.schema}
+	cand := r47slice2SortedCand(spec, []PathKey{{Expr: groupCol, SortAsc: true}}, Cost{Startup: 69094, Total: 70122})
+	got := groupingEmissionPathkeys(aggNode, cand)
+	if len(got) != 1 {
+		t.Fatalf("translated %d pathkeys, want 1", len(got))
+	}
+	orderCol := &ColumnRef{Index: 0, Name: "o_orderpriority", Type: catalog.Type{Name: "bpchar"}}
+	if !pathKeyEqual(got[0], PathKey{Expr: orderCol, SortAsc: true}) {
+		t.Fatalf("translated key %+v does not equal the ORDER BY key", got[0])
+	}
+	if !pathkeysContainedIn(got, []PathKey{{Expr: orderCol, SortAsc: true}}) {
+		t.Fatal("translated emission order does not satisfy the ORDER BY requirement")
+	}
+}
+
+// TestGroupingEmissionCarriesDirection: a descending group-keys Sort emits
+// descending — direction/nulls ride from the child PathKeys, never assumed.
+func TestGroupingEmissionCarriesDirection(t *testing.T) {
+	aggNode, groupCol, _ := r47slice2GroupFixture()
+	spec := &Aggregate{Child: aggNode.Child, GroupExprs: []Expr{groupCol}, schema: aggNode.schema}
+	cand := r47slice2SortedCand(spec,
+		[]PathKey{{Expr: groupCol, SortAsc: false, NullsFirst: true}}, Cost{Startup: 69094, Total: 70122})
+	got := groupingEmissionPathkeys(aggNode, cand)
+	if len(got) != 1 {
+		t.Fatalf("translated %d pathkeys, want 1", len(got))
+	}
+	if got[0].SortAsc || !got[0].NullsFirst {
+		t.Fatalf("direction lost: got asc=%v nullsFirst=%v", got[0].SortAsc, got[0].NullsFirst)
+	}
+}
+
+// TestGroupingEmissionAcceptsTrailingKeys: a presorted-shaped Sort whose
+// leading run covers all groups in order still translates — extra trailing
+// keys cannot change group-emergence order, so accepting them is sound
+// (SLICE2 §1 step 3 subsumes the presorted variant here).
+func TestGroupingEmissionAcceptsTrailingKeys(t *testing.T) {
+	aggNode, groupCol, _ := r47slice2GroupFixture()
+	extra := &ColumnRef{Index: 1, Name: "c1", Type: catalog.Type{Name: "int4"}}
+	spec := &Aggregate{Child: aggNode.Child, GroupExprs: []Expr{groupCol}, schema: aggNode.schema}
+	cand := r47slice2SortedCand(spec,
+		[]PathKey{{Expr: groupCol, SortAsc: true}, {Expr: extra, SortAsc: true}}, Cost{Startup: 69094, Total: 70122})
+	if got := groupingEmissionPathkeys(aggNode, cand); len(got) != 1 {
+		t.Fatalf("group-prefixed presorted shape translated %d keys, want 1", len(got))
+	}
+}
+
+// TestGroupingEmissionDeclines: every untranslatable shape returns nil —
+// each row is a wrong-order vector if it ever translated.
+func TestGroupingEmissionDeclines(t *testing.T) {
+	aggNode, groupCol, outSchema := r47slice2GroupFixture()
+	other := &ColumnRef{Index: 1, Name: "c1", Type: catalog.Type{Name: "int4"}}
+	baseSpec := func() *Aggregate {
+		return &Aggregate{Child: aggNode.Child, GroupExprs: []Expr{groupCol}, schema: outSchema}
+	}
+	baseCand := func(spec *Aggregate) *Path {
+		return r47slice2SortedCand(spec, []PathKey{{Expr: groupCol, SortAsc: true}}, Cost{Startup: 69094, Total: 70122})
+	}
+	cases := map[string]func() *Path{
+		"hashed strategy": func() *Path {
+			c := baseCand(baseSpec())
+			c.AggStrategy = AggStrategyHashed
+			return c
+		},
+		"prebuilt child": func() *Path {
+			c := baseCand(baseSpec())
+			c.Children[0] = &Path{Kind: PathPrebuilt, Rows: 57066, node: aggNode.Child}
+			return c
+		},
+		"no child": func() *Path {
+			c := baseCand(baseSpec())
+			c.Children = nil
+			return c
+		},
+		"nil spec": func() *Path {
+			c := baseCand(baseSpec())
+			c.Agg = nil
+			return c
+		},
+		"grouping sets": func() *Path {
+			s := baseSpec()
+			s.GroupingSets = [][]int{{0}}
+			return baseCand(s)
+		},
+		"empty groups": func() *Path {
+			s := baseSpec()
+			s.GroupExprs = nil
+			return baseCand(s)
+		},
+		"non-simple mode": func() *Path {
+			s := baseSpec()
+			s.Mode = AggModePartial
+			return baseCand(s)
+		},
+		"index order": func() *Path {
+			s := baseSpec()
+			s.GroupKeyOrder = []int{0}
+			return baseCand(s)
+		},
+		"expression group key": func() *Path {
+			s := baseSpec()
+			s.GroupExprs = []Expr{&BinaryOp{Left: groupCol, Right: groupCol}}
+			return baseCand(s)
+		},
+		"leading key is not the group": func() *Path {
+			return r47slice2SortedCand(baseSpec(),
+				[]PathKey{{Expr: other, SortAsc: true}, {Expr: groupCol, SortAsc: true}}, Cost{})
+		},
+		"short run": func() *Path {
+			s := baseSpec()
+			s.GroupExprs = []Expr{groupCol, other}
+			return baseCand(s)
+		},
+	}
+	for name, build := range cases {
+		if got := groupingEmissionPathkeys(aggNode, build()); got != nil {
+			t.Errorf("%s: translated %d keys, want nil", name, len(got))
+		}
+	}
+	// Output-prefix mismatch: the layout is verified, never assumed.
+	renamed := *aggNode
+	renamedSchema := Schema{
+		{Name: "renamed", Type: catalog.Type{Name: "bpchar"}},
+		{Name: "count", Type: catalog.Type{Name: "int8"}},
+	}
+	renamed.schema = renamedSchema
+	if got := groupingEmissionPathkeys(&renamed, baseCand(baseSpec())); got != nil {
+		t.Errorf("renamed output prefix: translated %d keys, want nil", len(got))
+	}
+	if got := groupingEmissionPathkeys(nil, baseCand(baseSpec())); got != nil {
+		t.Errorf("nil node: translated %d keys, want nil", len(got))
+	}
+	if got := groupingEmissionPathkeys(aggNode, nil); got != nil {
+		t.Errorf("nil candidate: translated %d keys, want nil", len(got))
+	}
+	notAgg := &Path{Kind: PathSort}
+	if got := groupingEmissionPathkeys(aggNode, notAgg); got != nil {
+		t.Errorf("non-agg path: translated %d keys, want nil", len(got))
+	}
+}
+
+// TestElectOrderedGroupingDeclinesPristine: a rel-level decline (here the
+// GroupKeyOrder index candidate, untranslatable at helper level, leaves <2
+// translatable... precisely: zero translate AND the Finalize-free count gate)
+// restores the ORDERED rel byte-identical — Pathlist length and cheapest
+// fields unchanged, so decline === the loop never ran.
+func TestElectOrderedGroupingDeclinesPristine(t *testing.T) {
+	aggNode, groupCol, outSchema := r47slice2GroupFixture()
+	u := newUpperRels()
+	grouped := fetchUpperRel(u, UpperGroupAgg, 0, 0)
+	idxSpec := &Aggregate{Child: aggNode.Child, GroupExprs: []Expr{groupCol}, schema: outSchema, GroupKeyOrder: []int{0}}
+	idxSeed := newPrebuiltPath(grouped, aggNode.Child)
+	hashedSpec := &Aggregate{Child: aggNode.Child, GroupExprs: []Expr{groupCol}, schema: outSchema}
+	addPath(grouped, &Path{Kind: PathAgg, AggStrategy: AggStrategySorted, Agg: idxSpec,
+		Rows: 5, Cost: Cost{Startup: 69000, Total: 70000}, Rel: grouped, Children: []*Path{idxSeed}}, "test")
+	addPath(grouped, &Path{Kind: PathAgg, AggStrategy: AggStrategyHashed, Agg: hashedSpec,
+		Rows: 5, Cost: Cost{Startup: 68909, Total: 69911}, Rel: grouped,
+		Children: []*Path{newPrebuiltPath(grouped, aggNode.Child)}}, "test")
+	setCheapest(grouped)
+	agg := &aggregateSurface{node: aggNode}
+	keys := []SortKey{{Expr: &ColumnRef{Index: 0, Name: "o_orderpriority", Type: catalog.Type{Name: "bpchar"}}}}
+	ordered := fetchUpperRel(u, UpperOrdered, 0, 0)
+	beforeLen := len(ordered.Pathlist)
+	if got, ok := electOrderedGrouping(u, agg, aggNode, keys, 0, DefaultPlannerSettings().costParams(), 0, -1); ok || got != nil {
+		t.Fatalf("index+hashed rel elected (ok=%v); want decline", ok)
+	}
+	after := fetchUpperRel(u, UpperOrdered, 0, 0)
+	if len(after.Pathlist) != beforeLen || after.CheapestTotal != nil || after.CheapestStartup != nil {
+		t.Fatalf("decline mutated the ORDERED rel: paths %d->%d cheapest=%v/%v",
+			beforeLen, len(after.Pathlist), after.CheapestTotal, after.CheapestStartup)
+	}
+}
+
+// TestElectOrderedGroupingElectsNoSortAtQ4Numbers: with Q4's live costs the
+// loop elects the no-sort sorted candidate (the slice-1 pin's election,
+// end to end through build + copy-back): elected, bare *Aggregate winner,
+// winner spec (sorted strategy) copied back onto agg.node.
+func TestElectOrderedGroupingElectsNoSortAtQ4Numbers(t *testing.T) {
+	aggNode, groupCol, outSchema := r47slice2GroupFixture()
+	u := newUpperRels()
+	grouped := fetchUpperRel(u, UpperGroupAgg, 0, 0)
+	mkSpec := func() *Aggregate {
+		return &Aggregate{Child: aggNode.Child, GroupExprs: []Expr{groupCol}, schema: outSchema}
+	}
+	sorted := r47slice2SortedCand(mkSpec(), []PathKey{{Expr: groupCol, SortAsc: true}}, Cost{Startup: 69094, Total: 70122})
+	sorted.Rel = grouped
+	hashed := &Path{Kind: PathAgg, AggStrategy: AggStrategyHashed, Agg: mkSpec(),
+		Rows: 5, Cost: Cost{Startup: 68909, Total: 69911}, Rel: grouped,
+		Children: []*Path{newPrebuiltPath(grouped, aggNode.Child)}}
+	addPath(grouped, sorted, "test")
+	addPath(grouped, hashed, "test")
+	setCheapest(grouped)
+	agg := &aggregateSurface{node: aggNode}
+	keys := []SortKey{{Expr: &ColumnRef{Index: 0, Name: "o_orderpriority", Type: catalog.Type{Name: "bpchar"}}}}
+	got, ok := electOrderedGrouping(u, agg, aggNode, keys, 0, DefaultPlannerSettings().costParams(), 0, -1)
+	if !ok || got == nil {
+		t.Fatal("Q4-shaped rel declined; want the no-sort election")
+	}
+	built, isAgg := got.(*Aggregate)
+	if !isAgg {
+		t.Fatalf("winner is %T; want bare *Aggregate (no-sort)", got)
+	}
+	_ = built
+	if agg.node.Strategy != AggStrategySorted {
+		t.Fatalf("copy-back strategy = %v; want sorted", agg.node.Strategy)
+	}
+}

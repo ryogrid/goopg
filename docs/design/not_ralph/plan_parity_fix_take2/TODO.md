@@ -2802,3 +2802,34 @@ be Sort" = PathSort *Path* (losers stay unbuilt); presorted/index
 GroupKeyOrder decline); DisabledNodes propagate via
 disabledNodesFor inheritance (verified); sizing from aggNode ≡
 normal call (verified).
+
+## R47 slice 2 result (2026-09-10, MEASURED — 16 flips toward PG, ZERO EXTRA)
+
+Slice-2 loop landed (`upperorderedgrouping.go` new + `planner.go`
+normal-arm loop-first + 6 TDD pins incl. post-decline byte-identity,
+all green). Full measurement in `r47-q4-upper-rel/REPORT.md`.
+
+- TPC-H (vs byte-identical slice-1): Q7 + Q8 flip `Sort →
+  HashAggregate` to `GroupAggregate → Sort(input)` (PG: GroupAggregate
+  both); Q4 does NOT flip — loop ran, hashed+Sort 1426.78 beats
+  no-sort sorted 6077.69 (dominance). Pin's near-tie numbers
+  (70122/69911) turned out PG-oracle-scale (PG Q4 Finalize
+  GroupAggregate 70094.27..70122.64, semi-out 3439 rows), NOT
+  goopg-scale production (57066 rows) — pin stays a unit probe.
+- TPC-DS SF0.5 (vs s1 ≡ r46c): 14 flips, all `Sort → HashAggregate`
+  to `GroupAggregate → Sort(input)`, PG uses (Finalize)
+  GroupAggregate/Group at every station (Q37/Q82: PG `Group` node —
+  goopg has no Group; GroupAggregate is the strategy match).
+- Q7/Q8 census: gathered-hashed+Sort vs gathered-sorted-as-is tie to
+  the penny on total; startup tie-break elects no-sort = PG's choice.
+  Split was dominance-pruned at grouping before the loop (moot gate).
+- Surfaced (not created) skew: `costAgg` charges per-row hashing,
+  `createAggPlan` display omits it — loop-elected Sorts price from
+  path cost while children keep node display (6+16 cost-only
+  Sort/Limit lines). Unification = separate R-item (filed, NOT
+  slice-2 scope). All loop elections path-vs-path, PG-faithful.
+- Gates: units + pre-commit green; spotcheck Q12=2/Q13=34 PASS;
+  SF0.5 sweep PASS=95 MISMATCH=0 SKIP=4, plan-diff channel exactly
+  the 30 adjudicated queries. Match count not a criterion; firing
+  micro-rule still UNIDENTIFIED (honesty preserved); Q4 gap localized
+  to row estimates below the agg (57066 vs PG 3439).
