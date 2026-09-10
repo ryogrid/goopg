@@ -3296,3 +3296,14 @@ Q9's wins by 2055.17 on the same three terms flipped (seed 40404
 rows). Fix round: size `seed.Rows` from the search joinrel rows
 (wider estimator reconciliation separately scoped). Evidence tmp-only
 `/tmp/pp2/r54s2/`.
+Next: R54 fix round — size upper `seed.Rows` from the search joinrel
+(scope `r54-parallel-admission-step0/FIX-SEED.md`): one fail-closed
+assignment in `createGroupingPaths` (new restricted
+`searchedJoinInputRelOf(child).Rows` — the existing `searchedRelOf`
+over-descends through agg/filter/limit, so wrong-scope rows need the
+narrower accessor), Rows-only (input price cancels across the live
+contest; Cost replacement separately scoped), grouped-rows sizing +
+idxSeed + STEP2 §5 seams excluded. Predicts Q5 split wins by ~180
+(~−750 if sr.Rows is the serial 7335), Q9 margin grows, Q84
+identical; Q1 identical IFF legacy seed ≈ search rows there (both
+numbers derived at measurement).
