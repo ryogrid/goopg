@@ -3466,3 +3466,29 @@ until the executor-side NL-probe work lands; most of the gap
 is OPEN, no remainder treated as measured. Evidence tmp-only
 `/tmp/pp2/r56/` (same captures as R56/R57).
 Next: R59 index-probe pricing audit — needs its own scope round first.
+R59 scope LANDED 2026-09-11 (`r59-index-probe-loopcount/SCOPE.md`,
+review APPROVE-WITH-NOTES, 2 blocking + 5 notes, all applied):
+probe F decomposes the 9.20-vs-1.20 gap term-by-term — the
+missing index-side loop-count arm. `btreeIndexAMCostPages`
+never references `loopCount`: goopg charges numIndexPages×
+random×mult in full (8.0) where PG's `genericcostestimate`
+num_scans arm (selfuncs.c:7180-7210) ML-caps at the index
+size and pro-rates by num_outer_scans (≈0.05). Decomposition
+exact by subtraction: lineitem 0.38+8.02+0.75+0.05=9.20,
+orders 0.38+8.05+1.6+0.1=10.13. `loopCountFor` MATCHES
+`get_loop_count` (smallest outer base rows — orders 150000,
+lineitem 1.5M); heap-side loopCount inputs exonerated, descent
+exonerated (treeHeight 2 both; 0.05 startup gap = omitted
+P2-09b log2(N) term, named). Heap gap re-derived: lineitem
+0.75-vs-0.6 nearly closed, orders 1.6-vs-0.9 ≈ the 2.0 knob
+alone (deliberate) + width second. ONE CUT authorised: the
+num_scans>1 arm in `btreeIndexAMCostPages` only (mult applied
+to the pro-rated result, serial arm bit-identical, knob/
+widths/correlation untouched). Prediction: lineitem → [1.2,
+2.0] (central ≈1.3), orders → [2.0, 3.0] (central ≈2.4),
+{1,2} extension 13.3M→~1.5M still dominated by the 516k
+partial hash — Q7 winner immobile (lineitem-last order
+pro-rates nothing at loopCount 25 either). Pricing alone does
+NOT flip Q7; partial-NL (R60 surface) + executor NL-probe work
+still ledgered. Evidence tmp-only `/tmp/pp2/r56/`.
+Next: R59 implementation (pin-then-cut per §3 gates) — then R60 partial-NL producer scope.
