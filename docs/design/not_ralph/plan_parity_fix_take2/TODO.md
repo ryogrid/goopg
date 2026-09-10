@@ -3272,3 +3272,15 @@ scoping: starved-LED (not containing) orientations, Q5 filed-not-won
 split pricing vs Q9's winning split, M12 needs ordered-partial producers.
 Evidence tmp-only `/tmp/pp2/r54s1/` (byte-identity off, Q5/Q9 Gather
 formation under top, Q1/Q84 identical).
+Next: R54 Step-2 — Q5 filed-not-won split pricing (scope
+`r54-parallel-admission-step0/STEP2.md`): PG oracle closes §6 slices 1+3
+by measurement (supplier serial hashed inner in PG Q5/Q9 → V4 deaths
+PG-faithful, no seeding; M12 needs ordered-partial producers/R50
+ruling), leaving the pricing question (Q5 split files but serial wins
+while Q9's identical split wins; PG parallelises Q5's upper via sorted
+GroupAggregate + Gather Merge(2)). Trace-only: per-leg upper costing
+lines Q5 vs Q9; exit = priced fix proposal, no constant moves.
+Scope reviewed APPROVE-WITH-NOTES 2026-09-10, 6 notes + 1 optional,
+all applied (§0 winner-shape softening + Q84 parked, within-query
+cardinality fix, join-below totals + width-per-leg + loser totals in
+§2, workers/algorithm creep seams closed in §5).
