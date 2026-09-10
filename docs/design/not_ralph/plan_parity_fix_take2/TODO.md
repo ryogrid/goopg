@@ -3221,3 +3221,31 @@ Step-0 vs slice-1 binary (trace-only proven); spotcheck SKIPs in
 worktree (no data dir). R53 pricing question CLOSED: pricing via spill,
 spill is a footprint-model consequence (R54 candidate). Pushed to
 origin/plan-parity-with-pg-take2.
+
+## R54 — parallel admission for synth-opened shapes, Step 0: death-level scope (SCOPED 2026-09-10, scope `r54-parallel-admission-step0/STEP0.md`)
+
+Question (R52 §4.2): H-Q5's Gather and DS-Q84's Gather Merge died under
+R51-new shapes — both NEW plans entirely serial, no Parallel anywhere.
+At which admission gate does parallelism die per query: session (S0),
+leaf (S1), join-clause walk (S2), upper/gather admission (S3), or
+path-level vetoes below green flags (S4)? Chain:
+`joinrelConsiderParallel` (considerparallel.go:379) → `joinrel.ConsiderParallel`
+(joinsearchlevel.go:652) → gather gate (gatherpaths.go:144) + partial arms
+(joinpathsparallel.go:104,238); walk input = `buildJoinRelRestrictList`
+(joinrestrict.go:357) taken at joinsearchlevel.go:589. Control: Q9's L4 NLI
+joinrel survives with a parallel plan, so NLI membership does not kill the
+ConsiderParallel *flag* (path-level RequiredOuter vetoes sit below — S4).
+Instrument: trace-only per-joinrel line (relset, CP, rel1.CP, rel2.CP,
+first failing clause kind) + base-rel CP line + gather-considered bit with
+partial-pathlist length + one upper-gate line, gate-held test,
+plan-identity Q5/Q84/Q9 pre/post. Then capped-clone measurement (Q5, Q84,
+Q9 control, PLAN-IDENTICAL ×2, identical GUCs with SHOW recorded);
+exit = named death gate per query, which conditions the pricing slice
+(S0 → config; S1 → leaf; S2 → clause-form; S3 → upper-rel; S4 →
+path-level; generated-but-loses → parallel-pricing round with candidacy
+numbers, pricing itself NOT Step-0). NOT in Step-0: sizing, arms,
+partial-path/gather pricing numbers, footprint model (SLICE1 §6
+candidate), R51 items 2–3, any planner behaviour change. Review
+APPROVE-WITH-NOTES 2026-09-10, notes applied (flag-level control scope;
+S0/S4 added; gather-considered + upper-gate lines; GUC pin). Next:
+commit + push → implement instrument → measurement report.
