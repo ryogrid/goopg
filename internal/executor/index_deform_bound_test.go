@@ -452,6 +452,31 @@ func TestNLIDeformInnerBound(t *testing.T) {
 			t.Fatalf("bitmap inner bound=%d, want 7", b)
 		}
 	})
+
+	t.Run("bitmap-inner-merged-probe-qual-full", func(t *testing.T) {
+		// R49 Slice B: a probe BitmapQual lives in MERGED outer++inner
+		// coordinates, and deformBitmapLeafBound folds it face-value (no
+		// merged→inner mapping, unlike the Predicate split). The inner
+		// ref merged c14 (= 8-wide outer + inner c6) range-checks past
+		// the 8-wide inner → full 8/8. Widening, never narrowing, vs the
+		// Predicate-era bound (which mapped inner c6 → 7/8): the recheck
+		// can never read an undeformed tail. Locked here so a future
+		// mapping "optimization" cannot narrow past a probe reader.
+		leaf := deformTable(8)
+		inner := &optimizer.BitmapHeapScan{
+			Table: leaf,
+			Outer: &optimizer.BitmapIndexScan{
+				Table: leaf,
+				Index: &catalog.Index{Name: "i8m", Columns: []string{"c0"}},
+				Key:   deformCol(7),
+			},
+			BitmapQual: []optimizer.Expr{deformLt(deformCol(14), deformCol(2))},
+		}
+		jo := idxDeformNLI(t, inner, nil, false, nil)
+		if b := idxDeformNLIInnerBound(t, jo, 8); b != 8 {
+			t.Fatalf("merged probe-qual inner bound=%d, want full 8", b)
+		}
+	})
 }
 
 // TestIndexDeformQ6ShapeStillThreeOfEight pins the no-op condition: no index

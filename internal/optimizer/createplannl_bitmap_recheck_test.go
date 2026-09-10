@@ -1,6 +1,10 @@
 package optimizer
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/goopg/goopg/internal/parser"
+)
 
 // TestCreateNestLoopBitmapJoinKeepsProbeBitmapQual is the R49 Slice-B update
 // of the review/260831-2 OP1-3 guard. The NLI-bitmap arm used to clear
@@ -68,5 +72,95 @@ func TestCreateNestLoopBitmapJoinKeepsProbeBitmapQual(t *testing.T) {
 	}
 	if l.Index != 3 || r.Index != 1 {
 		t.Errorf("BitmapQual[0] = col(%d) = col(%d), want col(3) = col(1) inner-left on the merged row", l.Index, r.Index)
+	}
+}
+
+// TestCreateNestLoopBitmapJoinSemiProbeQual pins review-note-8(b): a SEMI
+// PathNestLoop over a parameterised bitmap inner gets the same treatment as
+// INNER — probe clause in merged-coord BitmapQual, residual-only Predicate.
+// The natural-shape census exercises only INNER (SEMI picks index-only/hash
+// in the corpus), so the arm's type-indifference is pinned here, not there.
+func TestCreateNestLoopBitmapJoinSemiProbeQual(t *testing.T) {
+	a, b := cpjTwoRel()
+	idx := cpiIndex("a0")
+
+	clause := equiClauseOn(a.Relids, b.Relids, 0, 3)
+	clause.clause = cpnEq(col(0), col(3))
+
+	inner := &Path{
+		Kind: PathBitmapHeapScan, Rel: a, Rows: 1, IndexInfo: idx,
+		IndexClauses:  []indexPathClause{{ri: clause, indexCol: 0, key: col(3)}},
+		RequiredOuter: b.Relids,
+		Children: []*Path{{
+			Kind: PathBitmapIndexScan, Rel: a, Rows: 1, IndexInfo: idx,
+			IndexClauses:  []indexPathClause{{ri: clause, indexCol: 0, key: col(3)}},
+			RequiredOuter: b.Relids,
+		}},
+	}
+	p := cpnNestLoopPath(cpjLeafPath(b), inner, nil)
+	p.Jointype = parser.JoinSemi
+
+	n, _ := createPlanNode(p)
+	nli, ok := n.(*NestedLoopIndexJoin)
+	if !ok {
+		t.Fatalf("createPlan(parameterised bitmap PathNestLoop semi) = %T, want *NestedLoopIndexJoin", n)
+	}
+	if nli.Type != JoinTypeSemi {
+		t.Fatalf("Type = %v, want JoinTypeSemi", nli.Type)
+	}
+	if nli.Predicate != nil {
+		t.Fatalf("Predicate = %v, want nil (residual empty)", nli.Predicate)
+	}
+	bhs, ok := nli.Inner.(*BitmapHeapScan)
+	if !ok {
+		t.Fatalf("Inner = %T, want *BitmapHeapScan", nli.Inner)
+	}
+	if len(bhs.BitmapQual) != 1 {
+		t.Fatalf("len(BitmapQual) = %d, want 1 (the probe clause)", len(bhs.BitmapQual))
+	}
+	eq, ok := bhs.BitmapQual[0].(*BinaryOp)
+	if !ok {
+		t.Fatalf("BitmapQual[0] = %T, want *BinaryOp", bhs.BitmapQual[0])
+	}
+	l, lok := eq.Left.(*ColumnRef)
+	r, rok := eq.Right.(*ColumnRef)
+	if !lok || !rok || l.Index != 3 || r.Index != 1 {
+		t.Fatalf("BitmapQual[0] = %v, want col(3) = col(1) inner-left", bhs.BitmapQual[0])
+	}
+}
+
+// TestCreateNestLoopBitmapJoinKeylessProbe pins review-note-8(c): a
+// parameterised bitmap path with zero index clauses (no probe keys) yields an
+// empty BitmapQual and a residual-only Predicate — a full scan per probe,
+// exactly as before Slice B. The planner never emits this shape today
+// (parameterisation needs ≥1 key), so it is pinned here, not end-to-end.
+func TestCreateNestLoopBitmapJoinKeylessProbe(t *testing.T) {
+	a, b := cpjTwoRel()
+	idx := cpiIndex("a0")
+
+	inner := &Path{
+		Kind: PathBitmapHeapScan, Rel: a, Rows: 1, IndexInfo: idx,
+		RequiredOuter: b.Relids,
+		Children: []*Path{{
+			Kind: PathBitmapIndexScan, Rel: a, Rows: 1, IndexInfo: idx,
+			RequiredOuter: b.Relids,
+		}},
+	}
+	p := cpnNestLoopPath(cpjLeafPath(b), inner, nil)
+
+	n, _ := createPlanNode(p)
+	nli, ok := n.(*NestedLoopIndexJoin)
+	if !ok {
+		t.Fatalf("createPlan(keyless bitmap PathNestLoop) = %T, want *NestedLoopIndexJoin", n)
+	}
+	if nli.Predicate != nil {
+		t.Fatalf("Predicate = %v, want nil (no probe clauses, residual empty)", nli.Predicate)
+	}
+	bhs, ok := nli.Inner.(*BitmapHeapScan)
+	if !ok {
+		t.Fatalf("Inner = %T, want *BitmapHeapScan", nli.Inner)
+	}
+	if len(bhs.BitmapQual) != 0 {
+		t.Fatalf("len(BitmapQual) = %d, want 0 (no probe keys)", len(bhs.BitmapQual))
 	}
 }
