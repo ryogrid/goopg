@@ -2833,3 +2833,65 @@ all green). Full measurement in `r47-q4-upper-rel/REPORT.md`.
   the 30 adjudicated queries. Match count not a criterion; firing
   micro-rule still UNIDENTIFIED (honesty preserved); Q4 gap localized
   to row estimates below the agg (57066 vs PG 3439).
+
+## R48 — semi JoinQual placement + `Filter: (true)` drop (design; Step 0 closed 2026-09-10)
+
+`r48-semi-joinqual-placement/DESIGN.md` (agent-reviewed
+APPROVE-WITH-NOTES 2026-09-10; F1+F2 blockers + F3-F10 notes all
+closed in text). Named by R47 DESIGN §4 ("semi JoinQual placement
++ `Filter: (true)` drop"). Step-0 pair is TPC-H Q4, captured live
+2026-09-10 (PG :65432 vs s2 tree, GUCs pinned `work_mem='64MB'`,
+`max_parallel_workers_per_gather=4`), archived in-tree as
+`r48-semi-joinqual-placement/pg-q4.txt` +
+`goopg-q4-s2.txt` (R47 pg-flips/ precedent; review F1):
+
+- PG: `Nested Loop Semi Join` with NO join-level qual; the EXISTS
+  inner qual sits on the inner probe —
+  `Index Scan ... Index Cond: (l_orderkey = orders.o_orderkey)`
+  `Filter: (l_commitdate < l_receiptdate)`.
+- goopg s2: same join shape, but the qual stays at join level
+  (`Filter: (l_commitdate < l_receiptdate)`) under a
+  `*NestedLoopIndexJoin` whose inner `Index Scan` carries no
+  `Filter:` — plus a stray second line, `Filter: (true)`.
+
+Two independent halves (either order; Filter-half first, de-risks
+the census):
+
+1. **`Filter: (true)` drop (EXPLAIN-only).** Census on the s2
+   corpora: 6 TPC-H + 34 TPC-DS stray lines, every one an
+   attached-`Filter` (collapsed wrapper) with a trivially-true
+   predicate above a join/NLI — scaffolding the unnest passes
+   leave behind (`unnest.go:414` sets `BooleanConst{true}`
+   instead of removing the wrapper; `:1611`, `:3157`, `:3281`,
+   `:4309` keep `Filter`-wrapping-with-true so downstream
+   recursion "still finds the join"). `combineAnd([])` is nil,
+   so no `Filter: (true)` comes from an empty residual — all 40
+   are wrappers. Fix at the renderer (`walkPlanFiltered`: skip a
+   trivially-true `*Filter`, carry nothing down) — zero
+   executor/estimate impact; only the stray lines vanish (their
+   host lines re-price from the wrapper to the child, which is
+   the PG-faithful carrier).
+2. **Semi JoinQual placement (planner).** Q4's NLI residual
+   (`l_commitdate < l_receiptdate`, inner-only) belongs on the
+   inner probe as `IndexScan.Cond` — the channel the struct doc
+   (`plan.go`, `IndexScan.Cond`) built for exactly this ("Only
+   the NLI arm sets it"; evaluated per heap tuple the probe
+   returns; rendered as the scan's `Filter:`, PG-identical).
+   The legacy `*Join → NLI` rewrite (`tryBuildNLI`,
+   `nl_index_join.go:318`) hoists inner Filters into
+   `residualPred` instead of lowering inner-only conjuncts to
+   `is.Cond` (leaf-local shift, SEMI/ANTI only — LEFT keeps its
+   residual: a moved qual would stop filtering null-extended
+   rows). Converges legacy with the path arm (rule #2) and with
+   PG's `distribute_restrictinfo_to_rels` (MOVE, not goopg's
+   usual copy). Executor support already exists (fused arm
+   relies on per-probe Cond eval); values gates arbitrate.
+   Out of scope: INNER/LEFT NLI residuals, plain-`*Join`
+   residuals, `BitmapHeapScan.Cond` inner (same mechanism,
+   later slice if census implicates).
+
+Pass = stray-line census 40 → 0 with no other EXPLAIN line
+moving except host-line re-pricing + the NLI-residual lines
+that move onto inner scans (each adjudicated toward PG's
+placement); ZERO shape flips required, ZERO EXTRA allowed;
+values gates (TPC-H digest 24/24, SF0.5 sweep all-zero) bind.
