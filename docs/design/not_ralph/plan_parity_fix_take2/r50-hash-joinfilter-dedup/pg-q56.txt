@@ -1,0 +1,30 @@
+                                                                           QUERY PLAN                                                                            
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=37004.74..37004.85 rows=43 width=49)
+   ->  Sort  (cost=37004.74..37004.85 rows=43 width=49)
+         Sort Key: (sum((sum(store_sales.ss_ext_sales_price)))), item.i_item_id
+         ->  GroupAggregate  (cost=37001.41..37003.57 rows=43 width=49)
+               Group Key: item.i_item_id
+               ->  Merge Append  (cost=37001.41..37002.82 rows=43 width=49)
+                     Sort Key: item.i_item_id
+                     ->  GroupAggregate  (cost=16324.60..16325.08 rows=24 width=49)
+                           Group Key: item.i_item_id
+                           ->  Sort  (cost=16324.60..16324.66 rows=24 width=23)
+                                 Sort Key: item.i_item_id
+                                 ->  Gather  (cost=4505.54..16324.05 rows=24 width=23)
+                                       Workers Planned: 1
+                                       ->  Nested Loop  (cost=3505.54..15321.65 rows=14 width=23)
+                                             ->  Parallel Hash Join  (cost=3505.25..15310.99 rows=34 width=27)
+                                                   Hash Cond: (store_sales.ss_sold_date_sk = date_dim.d_date_sk)
+                                                   ->  Nested Loop  (cost=1436.48..13024.49 rows=82939 width=31)
+                                                         ->  Parallel Hash Semi Join  (cost=1436.05..2866.56 rows=1037 width=21)
+                                                               Hash Cond: (item.i_item_id = item_1.i_item_id)
+                                                               ->  Parallel Seq Scan on item  (cost=0.00..1389.88 rows=10588 width=21)
+                                                               ->  Parallel Hash  (cost=1429.59..1429.59 rows=517 width=17)
+                                                                     ->  Parallel Seq Scan on item item_1  (cost=0.00..1429.59 rows=517 width=17)
+                                                                           Filter: (i_color = ANY ('{powder,orchid,pink}'::bpchar[]))
+                                                         ->  Index Scan using store_sales_pkey on store_sales  (cost=0.43..8.92 rows=88 width=18)
+                                                               Index Cond: (ss_item_sk = item.i_item_sk)
+                                                   ->  Parallel Hash  (cost=2068.55..2068.55 rows=18 width=4)
+                                                         ->  Parallel Seq Scan on date_dim  (cost=0.00..2068.55 rows=18 width=4)
+                                                               Filter: ((d_year = 2000) AND (d_moy = 3))

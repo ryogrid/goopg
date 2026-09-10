@@ -168,3 +168,138 @@ func TestHashKeysAreInt64Guards(t *testing.T) {
 		t.Error("nil join: HashKeysAreInt64 = true, want false")
 	}
 }
+
+// TestExecHashKeyPlanBpcharFamily pins R50 Slice A's whitelist admission
+// (design `r50-hash-joinfilter-dedup/DESIGN.md` §2): the three spellings of
+// the bpchar family fold into the executor's key encoding and leave the
+// residual, so their `Hash Cond:` conjunct no longer duplicates into
+// `Join Filter:`.
+//
+// The joins are built directly (no planner round trip): the property under
+// test is the type predicate, and a planner-shape change must not be able
+// to flip it. ColumnRefs carry their types inline, so the merged-schema
+// fallback is not involved.
+func TestExecHashKeyPlanBpcharFamily(t *testing.T) {
+	mkJoin := func(ltyp, rtyp catalog.Type, extra ...Expr) *Join {
+		left := &SeqScan{Table: &catalog.Table{Name: "l"},
+			schema: Schema{{Name: "a", Type: ltyp}}}
+		right := &SeqScan{Table: &catalog.Table{Name: "r"},
+			schema: Schema{{Name: "b", Type: rtyp}}}
+		lk := &ColumnRef{Index: 0, Name: "a", Type: ltyp}
+		rk := &ColumnRef{Index: 1, Name: "b", Type: rtyp}
+		preds := append([]Expr{&BinaryOp{Op: parser.OpEq, Left: lk, Right: rk}}, extra...)
+		return &Join{
+			Type: JoinTypeInner, Algo: JoinAlgoHash,
+			Left: left, Right: right,
+			Predicate: combineAnd(preds),
+			LeftKey:   lk, RightKey: rk,
+			schema:    append(append(Schema{}, left.Output()...), right.Output()...),
+		}
+	}
+	tn := func(name string) catalog.Type { return catalog.Type{Name: name} }
+
+	t.Run("family spellings fold out of the residual", func(t *testing.T) {
+		for _, name := range []string{"char", "bpchar", "character", "text", "varchar", "numeric"} {
+			j := mkJoin(tn(name), tn(name))
+			fillOneJoinHashKeys(j)
+			ek := j.ExecHashKeyPlan()
+			if len(ek.Keys) != 1 {
+				t.Errorf("%s: executor keys on %d pair(s), want the 1 safe pair", name, len(ek.Keys))
+			}
+			if ek.Residual != nil {
+				t.Errorf("%s: residual = %v, want nil (folded into the key encoding)", name, ek.Residual)
+			}
+			if ek.Int64Keys {
+				t.Errorf("%s: Int64Keys = true, want false (strings/numeric never take the fixed-width packing)", name)
+			}
+		}
+	})
+
+	t.Run("declined pairs keep their per-match re-check", func(t *testing.T) {
+		cases := []struct {
+			name       string
+			ltyp, rtyp catalog.Type
+		}{
+			{"float8", tn("float8"), tn("float8")},
+			{"float4", tn("float4"), tn("float4")},
+			// Cross-spelling identity decline: the rule requires the SAME
+			// whitelisted name on both sides (machine-int family excepted),
+			// so char-vs-character stays conservative — a missed
+			// optimisation, never a wrong result.
+			{"char-vs-character", tn("char"), tn("character")},
+			{"int-vs-text", tn("int4"), tn("text")},
+			{"char array", catalog.Type{Name: "char", IsArray: true}, catalog.Type{Name: "char", IsArray: true}},
+		}
+		for _, tc := range cases {
+			j := mkJoin(tc.ltyp, tc.rtyp)
+			fillOneJoinHashKeys(j)
+			ek := j.ExecHashKeyPlan()
+			// Keys[0] leads unconditionally — the pair goopg has hashed on
+			// since M0003 — but an unsafe lead keeps its residual re-check
+			// exactly as the pre-P2.2 executor did.
+			if len(ek.Keys) != 1 {
+				t.Errorf("%s: executor keys on %d pair(s), want the 1 (unsafe) lead pair", tc.name, len(ek.Keys))
+			}
+			if ek.Residual == nil {
+				t.Errorf("%s: residual is nil, want the lead conjunct (unsafe pairs are never discharged by the key)", tc.name)
+			}
+		}
+	})
+
+	// mkJoin2 builds a two-column-per-side join: lead pair (0, 2), second
+	// pair (1, 3). Distinct positions matter — the harvester dedupes by
+	// ColumnRef identity, so a second pair reusing indexes 0/1 would
+	// collapse into the lead and never exercise the multi-key split.
+	mkJoin2 := func(l0, r0, l1, r1 catalog.Type) *Join {
+		left := &SeqScan{Table: &catalog.Table{Name: "l"},
+			schema: Schema{{Name: "a", Type: l0}, {Name: "f", Type: l1}}}
+		right := &SeqScan{Table: &catalog.Table{Name: "r"},
+			schema: Schema{{Name: "b", Type: r0}, {Name: "g", Type: r1}}}
+		lk := &ColumnRef{Index: 0, Name: "a", Type: l0}
+		rk := &ColumnRef{Index: 2, Name: "b", Type: r0}
+		second := &BinaryOp{Op: parser.OpEq,
+			Left:  &ColumnRef{Index: 1, Name: "f", Type: l1},
+			Right: &ColumnRef{Index: 3, Name: "g", Type: r1}}
+		return &Join{
+			Type: JoinTypeInner, Algo: JoinAlgoHash,
+			Left: left, Right: right,
+			Predicate: combineAnd([]Expr{
+				&BinaryOp{Op: parser.OpEq, Left: lk, Right: rk},
+				second,
+			}),
+			LeftKey: lk, RightKey: rk,
+			schema:  append(append(Schema{}, left.Output()...), right.Output()...),
+		}
+	}
+
+	t.Run("non-lead unsafe pair is the residual's only work", func(t *testing.T) {
+		// Q47-brand doll-house: a safe lead (char) plus an unsafe second
+		// pair (float8). The float pair must NOT join the encoding, and the
+		// residual must carry exactly its conjunct.
+		j := mkJoin2(tn("char"), tn("char"), tn("float8"), tn("float8"))
+		fillOneJoinHashKeys(j)
+		if len(j.HashKeys) != 2 {
+			t.Fatalf("plan carries %d hash pair(s), want 2 (HashKeys has no safety gate)", len(j.HashKeys))
+		}
+		ek := j.ExecHashKeyPlan()
+		if len(ek.Keys) != 1 {
+			t.Errorf("executor keys on %d pair(s), want 1 (float pair declined)", len(ek.Keys))
+		}
+		if got := len(splitAnd(ek.Residual)); got != 1 {
+			t.Errorf("residual has %d conjunct(s), want exactly the float equality (residual: %v)", got, ek.Residual)
+		}
+	})
+
+	t.Run("two safe pairs leave no residual", func(t *testing.T) {
+		// Q59-shape doll-house at unit level: char + numeric both fold.
+		j := mkJoin2(tn("char"), tn("char"), tn("numeric"), tn("numeric"))
+		fillOneJoinHashKeys(j)
+		ek := j.ExecHashKeyPlan()
+		if len(ek.Keys) != 2 {
+			t.Errorf("executor keys on %d pair(s), want both (char, numeric)", len(ek.Keys))
+		}
+		if ek.Residual != nil {
+			t.Errorf("residual = %v, want nil", ek.Residual)
+		}
+	})
+}

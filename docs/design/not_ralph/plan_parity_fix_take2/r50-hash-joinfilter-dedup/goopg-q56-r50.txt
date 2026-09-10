@@ -1,0 +1,23 @@
+===== Q56 =====
+                                                            QUERY PLAN                                                            
+----------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=0.19..0.22 rows=3 width=64)
+   CTE ss
+     ->  HashAggregate  (cost=53512.99..53513.00 rows=1 width=64)
+           Group Key: item.i_item_id
+           ->  Hash Semi Join  (cost=2618.30..53512.98 rows=1 width=1716)
+                 Hash Cond: (item.i_item_id = i_item_id)
+                 Join Filter: (item.i_item_id = i_item_id)
+                 ->  Nested Loop  (cost=2618.30..53315.40 rows=43 width=1308)
+                       ->  Nested Loop  (cost=2618.05..52969.90 rows=43 width=828)
+                             ->  Hash Join  (cost=2617.80..52174.40 rows=99 width=440)
+                                   Hash Cond: (store_sales.ss_sold_date_sk = date_dim.d_date_sk)
+                                   ->  Seq Scan on store_sales  (cost=0.00..44157.08 rows=1439608 width=428)
+                                   ->  Seq Scan on date_dim  (cost=0.00..730.54 rows=5 width=420)
+                                         Filter: ((d_year = 2000) AND (d_moy = 3))
+                             ->  Index Scan using customer_address_pkey on customer_address  (cost=0.00..0.01 rows=1 width=388)
+                                   Index Cond: (ca_address_sk = store_sales.ss_addr_sk)
+                                   Filter: (ca_gmt_offset = -6)
+                       ->  Index Scan using item_pkey on item  (cost=0.25..8.27 rows=1 width=480)
+                             Index Cond: (i_item_sk = store_sales.ss_item_sk)
+                 ->  Seq Scan on item_1  (cost=0.00..188.78 rows=878 width=480)

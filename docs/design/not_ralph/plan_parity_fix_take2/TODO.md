@@ -3092,7 +3092,36 @@ goopg HC+JF vs PG HC-only). Safety core: rows reaching JF
 eval already satisfy HC (INNER/SEMI), so HC-implied JF
 conjuncts are dead — drop is values-neutral by
 construction; ANTI explicitly out (no ANTI in scope).
-Follow-ups (not this slice): Q83 (JF-only `item_id`, no
-companion HC — extraction failure, separate slice), Q13H/
-Q48H (state/profit OR on hash — PG placement TBD from full
-Q13 text), plain-NL equi probe-ability (Q37-class).
+Follow-ups (not this slice): Q13H/Q48H (state/profit OR on
+hash — PG placement TBD from full Q13 text), plain-NL equi
+probe-ability (Q37-class). (Q83 was filed here as "JF-only
+`item_id`, extraction failure" but the Slice-A gate corpus proved
+that wrong — same-node HC+identical-JF over char-typed CTE outputs,
+PG Q83 zero-JF — so Q83×2 landed IN Slice A; DESIGN §3.)
+
+Slice-A mechanism SURVEYED + DESIGNED 2026-09-10 (design
+`r50-hash-joinfilter-dedup/DESIGN.md`, slice plan `SLICE-A.md`, review
+agent pending): the dup is pair ∈ HashKeys (HC renders ALL of them,
+`operators_explain.go:973`) but ∉ safe (`ExecHashKeyPlan`, Residual =
+Predicate minus safe-covered). Census of the discriminator: EVERY
+in-scope pair is bpchar-family — character(16) `i_item_id`/`s_store_id`,
+character(50) `i_category`/`i_brand`, character(10) `ca_zip`/`s_zip`
+(PG :65438 information_schema), or char-typed CTE outputs (Q4/Q11/Q74
+`customer_id`, Q47/Q57, Q58 `item_id`). Decisive control: Q47 keeps
+character category+brand while subtracting varchar(50)
+`s_store_name`/`s_company_name` + numeric `(rn-1)=rn` in the SAME join.
+Probe matrix (throwaway `zz_r50_probe_test.go`): char-base DUP,
+varchar-base CLEAN, char-CTE DUP, varchar-CTE CLEAN — CTE schemas
+propagate types (runtime `Type.Name` for `char(16)` DDL is `"char"`), so
+the discriminator is PURELY the whitelist name. Fix (ONE commit, no
+split-brain — single predicate feeds renderer residual + executor
+encoding): admit `"char"`/`"bpchar"`/`"character"` in
+`isHashSafeTypeName` (three spellings, one family — same as text/varchar
+and bool/boolean precedent). Safety: width-carrying bpchar stored
+TRIMMED (codec `coerceTextLikeDatum`, no padded Datum representation),
+so datumKey ≡ `=`; unbounded-verbatim keys differ-but-equal never meet
+(same miss as the residual gives today) and key-equal ⟹ byte-identical
+⟹ `=`-true; NULL keys never meet; INNER/SEMI only; float + arrays stay
+excluded. Non-lead-unsafe (Q47-brand) JOINS the composite key encoding
+on admission — no separate enforcement needed. Gates: 26-line census
+A/B (HC-extra fails), digest 24/24, SF0.5 all-zero, units green.
