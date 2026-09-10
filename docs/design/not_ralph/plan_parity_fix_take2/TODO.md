@@ -3187,4 +3187,37 @@ parameterisation dimension). Instrument carries reqouter + runner-up
 (second/secondtotal) beyond the line above. Gates green: full
 `internal/optimizer` + `testutil/estimateaudit` suites; Q12=2/Q13=34
 canonical on clone-tpch (trace-off production config). Agent review
-APPROVE-WITH-NOTES 2026-09-10, notes applied. Remaining: commit → push.
+APPROVE-WITH-NOTES 2026-09-10, notes applied. LANDED f4f1bc058 2026-09-10,
+pushed to origin/plan-parity-with-pg-take2.
+
+Slice 1 DONE 2026-09-10 (report `r53-q9-costing-step0/SLICE1.md`):
+L6 hash-arm attribution. Instrument gap from Step-0 §3: DPPATH logs
+producer/kind/rows/startup/total/verdict per offered path but NOT the
+partition that produced it. Fix: `OuterRelids, InnerRelids RelSet` on Path
+(trace-only provenance, no planner reader), stamped in the 6 join
+constructors (serial hash/NL/merge, NLI, partial hash/merge), rendered as
+`outer={bits} inner={bits}` appended after `jointype` (existing readers
+split key=value; pathtrace tests don't pin the format; enumtrace ignores
+DPPATH). Then: read PG partition `{l+n+p+ps+s}|{o}`'s hash price at L6,
+decompose winner-vs-rival into arm terms (build/probe sides, widths,
+startup); standing hypothesis: outer-WIDTH term (L6 outer carries nation's
+vs orders' columns at identical rows 303093; M0076 trap: validate the SHAPE,
+not just the number). NOT in slice: sizing, enumeration/phases, parallel
+admission (R52 §4.2 half), merge/NL arms, any planner behaviour change.
+Deliverables: slice numbers + attribution verdict; review; commit; push.
+
+Slice-1 LANDED 8b77a905b 2026-09-10 (instrument + SLICE1.md; this TODO
+line follows separately): rival IS PG's partition `{o}|{l,n,p,ps,s}`
+(632364.99 probe-orders / 643216.79 flipped); margin 15503.97 = four
+exact arm terms (+200876 build-input / +94546 build-op / −569257
+probe-input / +289338 probe-ops); width hypothesis CONFIRMED in M0076
+form (build-op/row 0.312 vs 0.077 — spill pages ∝ ncols; ~378k spill
+charges ARE the margin); PG's price of the partition 44343.58..77747.55
+(no-spill: 6MB build fits 64MB vs goopg's 743MB column-count build).
+Agent review APPROVE-WITH-NOTES 2026-09-10 — one real catch applied
+(flipped build-op forgot outer startup: 0.082→0.077/row, 3.8×→4.0×).
+Gates: optimizer + estimateaudit suites green; Q9 plan byte-identical
+Step-0 vs slice-1 binary (trace-only proven); spotcheck SKIPs in
+worktree (no data dir). R53 pricing question CLOSED: pricing via spill,
+spill is a footprint-model consequence (R54 candidate). Pushed to
+origin/plan-parity-with-pg-take2.
