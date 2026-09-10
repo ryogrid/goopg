@@ -263,8 +263,9 @@ func addPartialAggSplitPath(u *upperRels, grouped *RelOptInfo, seed *Path, aggNo
 	// unwrap above there is no Gather left, and on the post-pass route there
 	// never was one. Two Gathers would have every worker read the whole
 	// relation and return N+1 copies of every row.
-	if subtreeHasUnsafeNode(child) || subtreeHasGather(child) || drivingScan(child) == nil {
-		traceUpperGate("agg-upper", "refused", "gate=subtree")
+	unsafe, gathered, noScan := subtreeHasUnsafeNode(child), subtreeHasGather(child), drivingScan(child) == nil
+	if unsafe || gathered || noScan {
+		traceUpperGate("agg-upper", "refused", "gate=subtree subtree="+subtreeRefusalKind(unsafe, gathered, noScan))
 		return nil
 	}
 	workers := upperSplitWorkers(child, cp, ps)
@@ -434,6 +435,23 @@ func upperSplitVerdict(split *Path) string {
 // both admission exits so the record cannot drift between them.
 func upperSplitDetail(workers int, d float64) string {
 	return "workers=" + strconv.Itoa(workers) + " divisor=" + strconv.FormatFloat(d, 'g', -1, 64)
+}
+
+// subtreeRefusalKind names which `gate=subtree` disjunct fired (R54 Step-1
+// H6): an UNSAFE node in the partial subtree, an already-GATHERED subtree
+// (two Gathers would duplicate rows), or NO-DRIVING-SCAN (no per-worker
+// entry the attach walks model). Pure over the three booleans so the unit
+// test pins the vocabulary without building a plan; the call site passes
+// the same values the guard tested, so the name cannot drift from the
+// refusal. First disjunct wins, matching the guard's || order.
+func subtreeRefusalKind(unsafe, gathered, noScan bool) string {
+	if unsafe {
+		return "unsafe"
+	}
+	if gathered {
+		return "gathered"
+	}
+	return "no-driving-scan"
 }
 
 // addPartialAggSplitArm files `Finalize -> Gather -> Partial` on the GROUP_AGG

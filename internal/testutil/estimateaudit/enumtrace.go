@@ -186,13 +186,14 @@ func ParseEnumTrace(r io.Reader) EnumTrace {
 				t.Malformed++
 				continue
 			}
-		case "cpadmit", "cpgather":
-			// R54 Step-0's search-side admission lines (joinsearchtrace.go).
-			// Parsed and discarded for the same reason as `cost`: Step-0
-			// reads these lines with grep straight off the server log, and
-			// structured admission parsing belongs to the slice that first
-			// needs it. Recognised (not Malformed) so the new line kinds do
-			// not pollute the provenance channel's hygiene counter.
+		case "cpadmit", "cpgather", "pveto":
+			// R54 Step-0's search-side admission lines (joinsearchtrace.go)
+			// plus Step-1's veto lines (pveto). Parsed and discarded for
+			// the same reason as `cost`: the steps read these lines with
+			// grep straight off the server log, and structured parsing
+			// belongs to the slice that first needs it. Recognised (not
+			// Malformed) so the new line kinds do not pollute the
+			// provenance channel's hygiene counter.
 			if cur == nil {
 				t.Malformed++
 				continue

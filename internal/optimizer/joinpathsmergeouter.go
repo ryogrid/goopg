@@ -93,6 +93,8 @@ package optimizer
 // at that position. The pathkey is kept, not just the group, because the inner
 // must be sorted in the outer's direction and null placement — the outer's
 // ordering is given here, not chosen.
+import "strconv"
+
 import "github.com/goopg/goopg/internal/parser"
 
 type mergeOuterMatch struct {
@@ -275,6 +277,13 @@ func matchUnsortedOuterMergePartial(s *searchCtx, joinrel, outer, inner *RelOptI
 	scanSelFor func([]*restrictInfo) (float64, float64), paramSrc RelSet) {
 
 	if s == nil || !s.parallelModeOK || gatherPathsMode == gatherPathsOff {
+		sub := "mode"
+		if s == nil {
+			sub = "s-nil"
+		} else if gatherPathsMode == gatherPathsOff {
+			sub = "gather-off"
+		}
+		tracePVetoCtx(s, "mergeu", traceRelids(joinrel), traceRelids(outer), traceRelids(inner), "M0", "sub="+sub+" jt="+traceJoinTypeName(jt))
 		return
 	}
 	// PG's `consider_parallel_mergejoin` (joinpath.c:2071-2097) loops over the
@@ -288,17 +297,36 @@ func matchUnsortedOuterMergePartial(s *searchCtx, joinrel, outer, inner *RelOptI
 	// skipped: `sort_inner_and_outer` serves unordered inputs.
 	groups := mergeKeyGroups(keys, outer.Relids)
 	if len(groups) == 0 {
+		tracePVetoCtx(s, "mergeu", traceRelids(joinrel), traceRelids(outer), traceRelids(inner), "M2", "sub=no-groups jt="+traceJoinTypeName(jt))
 		return
 	}
-	for _, op := range outer.PartialPathlist {
+	// M3u: no partial outer at all, so the loop below is never entered —
+	// the mergeu twin of the wrapper's M3. First veto wins: a groups==0
+	// return above fires M2 even when the pathlist is also empty.
+	if len(outer.PartialPathlist) == 0 {
+		tracePVetoCtx(s, "mergeu", traceRelids(joinrel), traceRelids(outer), traceRelids(inner), "M3u", "cands=0 jt="+traceJoinTypeName(jt))
+		return
+	}
+	for ci, op := range outer.PartialPathlist {
+		cand := "cand=" + strconv.Itoa(ci) + " jt=" + traceJoinTypeName(jt)
 		if op == nil || len(op.Pathkeys) == 0 {
+			// Unordered (or nil) candidate: the site exists to EXPLOIT an
+			// ordering, so this is the candidate-level outer-sort decline
+			// (the try's M7, mapped here because the try is never reached).
+			nkeys := -1
+			if op != nil {
+				nkeys = len(op.Pathkeys)
+			}
+			tracePVetoCtx(s, "mergeu", traceRelids(joinrel), traceRelids(outer), traceRelids(inner), "M7", cand+" keys="+strconv.Itoa(nkeys))
 			continue
 		}
 		if pathParamByRel(op, inner) {
+			tracePVetoCtx(s, "mergeu", traceRelids(joinrel), traceRelids(outer), traceRelids(inner), "M9", cand+" param")
 			continue
 		}
 		matched := findMergeClausesForOuterPathkeys(op.Pathkeys, groups)
 		if len(matched) == 0 {
+			tracePVetoCtx(s, "mergeu", traceRelids(joinrel), traceRelids(outer), traceRelids(inner), "M2", cand+" matched=0")
 			continue
 		}
 		selected := make([]mergeKeyGroup, len(matched))
@@ -311,6 +339,7 @@ func matchUnsortedOuterMergePartial(s *searchCtx, joinrel, outer, inner *RelOptI
 		}
 		innerSortKeys := mergeInnerSortKeys(selected, outerKeys, outer.Relids)
 		if len(innerSortKeys) == 0 {
+			tracePVetoCtx(s, "mergeu", traceRelids(joinrel), traceRelids(outer), traceRelids(inner), "M8", cand+" isort=0")
 			continue
 		}
 		fullResidual := demoteUnmatchedGroupClauses(residual, groups, mergeClauses)
@@ -320,9 +349,10 @@ func matchUnsortedOuterMergePartial(s *searchCtx, joinrel, outer, inner *RelOptI
 		// ordering.
 		i := cheapestParallelSafeTotalInner(inner.Pathlist)
 		if i == nil {
+			tracePVetoCtx(s, "mergeu", traceRelids(joinrel), traceRelids(outer), traceRelids(inner), "M5", cand)
 			continue
 		}
-		tryPartialMergeJoinPath(s, joinrel, op, i, outer.Relids, inner.Relids, cp, jt, op.Pathkeys, nil, innerSortKeys,
+		tryPartialMergeJoinPath(s, joinrel, op, i, outer.Relids, inner.Relids, cp, jt, "mergeu", op.Pathkeys, nil, innerSortKeys,
 			mergeClauses, fullResidual, mergeTuplesFor, scanSelFor, paramSrc)
 	}
 }

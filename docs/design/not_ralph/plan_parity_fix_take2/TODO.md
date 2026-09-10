@@ -3257,3 +3257,18 @@ to baseline. Evidence tmp-only `/tmp/pp2/r54/`.
 Next: R54 Step-1 — S4 path-level vetoes in `joinpathsparallel.go` (zero
 partial paths under CP=true joinrels) + refine `gate=subtree` to name its
 disjunct (predict: no-driving-scan).
+Step-1 DONE 2026-09-10 (instrument + report
+`r54-parallel-admission-step0/REPORT-step1.md`, review
+APPROVE-WITH-NOTES, notes applied): off-run is 100% mode-gate (V0/M0,
+all `jt=INNER`); top-run veto census per query — hash collapses to
+V9-vs-V4 where every V4 outer is a starved-only set (B4 leaves:
+supplier/nation/region, customer_address/household_demographics/
+income_band; zero B3 — H1 dead, H2 confirmed), V6/V7/V8a/V8b zero lines
+(H3 absent), all 4 serial NL winners map to vetoes never silence (H4: no
+new-producer slice), merge sites fire M7/M3/M8/M3u/M2 but never M12 (H5:
+Gather-Merge not recoverable via current producers), Q5 subtree =
+`no-driving-scan` → split under top via the splice arm (H6). Step-2
+scoping: starved-LED (not containing) orientations, Q5 filed-not-won
+split pricing vs Q9's winning split, M12 needs ordered-partial producers.
+Evidence tmp-only `/tmp/pp2/r54s1/` (byte-identity off, Q5/Q9 Gather
+formation under top, Q1/Q84 identical).

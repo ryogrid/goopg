@@ -41,6 +41,7 @@ import (
 	"strings"
 
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/parser"
 )
 
 // dpTrace gates the enumeration trace. Read once at process start so a plan
@@ -101,6 +102,18 @@ type traceCost struct {
 	secondTotal float64
 }
 
+// tracePVeto is one path-level veto: a partial-path producer that did NOT
+// file (R54 Step-1, STEP1.md §2). Stored as relsets and named at render, the
+// way pairs/costs are, so the names cannot drift from the problem's map.
+type tracePVeto struct {
+	site  string // base | hash | merge | mergeu
+	rel   RelSet // the joinrel (join sites) or base rel (base site); 0 when
+	outer RelSet // the orientation tried (join sites); 0 for site=base
+	inner RelSet
+	veto  string // V0..V9 | B1..B4 | M0..M12 | admitted
+	detail string // space-separated key=value, per-veto contract (STEP1 §2)
+}
+
 // searchTrace is one join problem's provenance record.
 //
 // It is per-problem rather than per-process because that is the unit the
@@ -124,8 +137,11 @@ type searchTrace struct {
 	// after the cost lines in one problem's block.
 	cpAdmits []traceCP
 	gathers  []traceGather
-	top      RelSet
-	failed   string
+	// R54 Step-1's veto records (pveto below), rendered after the gather
+	// lines in one problem's block.
+	pvetos []tracePVeto
+	top    RelSet
+	failed string
 }
 
 // newSearchTrace builds the relid → name map for a problem, or nil when the
@@ -444,6 +460,64 @@ func (t *searchTrace) gather(rel RelSet, partials int, verdict string) {
 	t.gathers = append(t.gathers, traceGather{rel: rel, partials: partials, verdict: verdict})
 }
 
+// pveto records one partial-path producer call that did not file — or one
+// that did (`veto=admitted`), so absence of lines is distinguishable from
+// absence of calls (STEP1.md §2). The caller passes the veto name for the
+// gate that fired; the record cannot drift from the decision because each
+// hook sits on its own early return. Nil-receiver safe like gather: the
+// trace is nil in production, and producers that tolerate a nil searchCtx
+// (hash V2, merge M0/M1) reach this through tracePVetoCtx below.
+func (t *searchTrace) pveto(site string, rel, outer, inner RelSet, veto, detail string) {
+	if t == nil {
+		return
+	}
+	t.pvetos = append(t.pvetos, tracePVeto{site: site, rel: rel, outer: outer, inner: inner, veto: veto, detail: detail})
+}
+
+// tracePVetoCtx is the pveto entry for producers holding a possibly-nil
+// *searchCtx: a veto that fires on a nil ctx has no block to land in, so it
+// records nothing — the nil-ctx arm is defensive-only in production (callers
+// pass a live ctx) and a veto line for it would be unactionable anyway.
+func tracePVetoCtx(s *searchCtx, site string, rel, outer, inner RelSet, veto, detail string) {
+	if s == nil {
+		return
+	}
+	s.trace.pveto(site, rel, outer, inner, veto, detail)
+}
+
+// traceRelids returns r's relset, or 0 when r is nil: a veto that fires
+// before (or on) a nil check still names itself, and the rel renders `{}`.
+func traceRelids(r *RelOptInfo) RelSet {
+	if r == nil {
+		return 0
+	}
+	return r.Relids
+}
+
+// traceJoinTypeName renders a join type in the veto detail's `jt=` field.
+// parser.JoinType is int-based with no String method; the names below are
+// the SQL keywords, so the detail reads without a decoder ring.
+func traceJoinTypeName(jt parser.JoinType) string {
+	switch jt {
+	case parser.JoinInner:
+		return "INNER"
+	case parser.JoinLeft:
+		return "LEFT"
+	case parser.JoinRight:
+		return "RIGHT"
+	case parser.JoinFull:
+		return "FULL"
+	case parser.JoinCross:
+		return "CROSS"
+	case parser.JoinSemi:
+		return "SEMI"
+	case parser.JoinAnti:
+		return "ANTI"
+	default:
+		return "other"
+	}
+}
+
 // traceUpperGate is the S3 line: one post-pass tournament's verdict, where
 // the search trace cannot reach. The partial-agg / partial-sort tournaments
 // run post-cache over finished Nodes (no searchCtx in scope, after the
@@ -475,6 +549,9 @@ const (
 	traceCPAdmitTag = traceTag + " cpadmit"
 	traceGatherTag  = traceTag + " cpgather"
 	traceUpperTag   = traceTag + " upper"
+	// R54 Step-1's veto lines (pveto above). Recognised (not Malformed) by
+	// the enumtrace parser; see its pveto case.
+	tracePVetoTag = traceTag + " pveto"
 	traceEnd        = traceTag + " end"
 )
 
@@ -514,6 +591,21 @@ func (t *searchTrace) render() string {
 	for _, g := range t.gathers {
 		fmt.Fprintf(&b, "%s rel=%s partials=%d verdict=%s\n",
 			traceGatherTag, t.relsetName(g.rel), g.partials, g.verdict)
+	}
+	for _, v := range t.pvetos {
+		// The base site tries no orientation (`dir=-`, STEP1.md §2); a
+		// zero relset (B1's whole-call skip, or a veto on a nil rel)
+		// renders `-` rather than `{}` so it harvests distinctly.
+		dir := "-"
+		if v.site != "base" {
+			dir = t.relsetName(v.outer) + "+" + t.relsetName(v.inner)
+		}
+		rel := t.relsetName(v.rel)
+		if v.rel == 0 {
+			rel = "-"
+		}
+		fmt.Fprintf(&b, "%s site=%s rel=%s dir=%s veto=%s detail=%s\n",
+			tracePVetoTag, v.site, rel, dir, v.veto, v.detail)
 	}
 	status := "ok"
 	if t.failed != "" {

@@ -75,6 +75,8 @@ package optimizer
 // where upstream's parallel block sits relative to its serial one (the
 // `try_hashjoin_path` loop closes at :2398 and the parallel block opens at
 // :2418).
+import "strconv"
+
 import "github.com/goopg/goopg/internal/parser"
 
 func addPartialHashJoinPath(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp costParams,
@@ -87,6 +89,7 @@ func addPartialHashJoinPath(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp 
 	// producer must still run at EVERY level: the final rel's partial path
 	// exists only because the levels below propagated theirs upward.
 	if gatherPathsMode == gatherPathsOff {
+		tracePVetoCtx(s, "hash", traceRelids(joinrel), traceRelids(outer), traceRelids(inner), "V0", "jt="+traceJoinTypeName(jt))
 		return
 	}
 	// R9 (plan-parity-fix-take2, K17): the direction filter this producer
@@ -97,24 +100,49 @@ func addPartialHashJoinPath(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp 
 	// why the set is {INNER, LEFT, SEMI, ANTI} and why it is pinned against
 	// the executor's own predicate by test rather than by comment.
 	if !partialHashJoinTypeOK(jt) {
+		tracePVetoCtx(s, "hash", traceRelids(joinrel), traceRelids(outer), traceRelids(inner), "V1", "jt="+traceJoinTypeName(jt))
 		return
 	}
 	// `joinrel->consider_parallel` (joinpath.c:2418), already propagated by
 	// joinrelConsiderParallel (= build_join_rel, relnode.c:829-845).
 	if s == nil || !s.parallelModeOK || joinrel == nil || !joinrel.ConsiderParallel {
+		sub := "cp"
+		if s == nil {
+			sub = "s-nil"
+		} else if !s.parallelModeOK {
+			sub = "mode"
+		} else if joinrel == nil {
+			sub = "nil-joinrel"
+		}
+		tracePVetoCtx(s, "hash", traceRelids(joinrel), traceRelids(outer), traceRelids(inner), "V2", "sub="+sub+" jt="+traceJoinTypeName(jt))
 		return
 	}
 	if outer == nil || inner == nil || len(keys) == 0 {
+		sub := "no-keys"
+		if outer == nil {
+			sub = "nil-outer"
+		} else if inner == nil {
+			sub = "nil-inner"
+		}
+		tracePVetoCtx(s, "hash", traceRelids(joinrel), traceRelids(outer), traceRelids(inner), "V3", "sub="+sub+" jt="+traceJoinTypeName(jt))
 		return
 	}
 	// `outerrel->partial_pathlist != NIL`, and `linitial` of it — the cheapest,
 	// since addToPartialPathlist keeps ascending total-cost order exactly as
 	// add_partial_path's `insert_at` does.
 	if len(outer.PartialPathlist) == 0 {
+		tracePVetoCtx(s, "hash", traceRelids(joinrel), traceRelids(outer), traceRelids(inner), "V4", "jt="+traceJoinTypeName(jt))
 		return
 	}
 	o := outer.PartialPathlist[0]
 	if o == nil || o.ParallelWorkers <= 0 || !o.ParallelSafe {
+		sub := "unsafe"
+		if o == nil {
+			sub = "head-nil"
+		} else if o.ParallelWorkers <= 0 {
+			sub = "workers"
+		}
+		tracePVetoCtx(s, "hash", traceRelids(joinrel), traceRelids(outer), traceRelids(inner), "V5", "sub="+sub+" jt="+traceJoinTypeName(jt))
 		return
 	}
 	// The path twin of `drivingScan`, asked HERE as well as at the Gather so a
@@ -123,6 +151,7 @@ func addPartialHashJoinPath(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp 
 	// unmodelled subtree does not "stay serial" — every worker reads the whole
 	// relation and the Gather returns N copies of every row.
 	if !partialPathShapeIsGatherable(o) {
+		tracePVetoCtx(s, "hash", traceRelids(joinrel), traceRelids(outer), traceRelids(inner), "V6", "jt="+traceJoinTypeName(jt))
 		return
 	}
 
@@ -132,6 +161,7 @@ func addPartialHashJoinPath(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp 
 	// found by the same scan.
 	i := cheapestParallelSafeTotalInner(inner.Pathlist)
 	if i == nil {
+		tracePVetoCtx(s, "hash", traceRelids(joinrel), traceRelids(outer), traceRelids(inner), "V7", "jt="+traceJoinTypeName(jt))
 		return
 	}
 
@@ -141,9 +171,15 @@ func addPartialHashJoinPath(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp 
 	// a panic inside the planner would fail the statement, while a path not
 	// offered simply cannot be chosen.
 	if o.RequiredOuter != 0 || i.RequiredOuter != 0 {
+		sub := "inner"
+		if o.RequiredOuter != 0 {
+			sub = "outer"
+		}
+		tracePVetoCtx(s, "hash", traceRelids(joinrel), traceRelids(outer), traceRelids(inner), "V8a", "sub="+sub+" jt="+traceJoinTypeName(jt))
 		return
 	}
 	if calcNonNestloopRequiredOuter(o, i) != 0 {
+		tracePVetoCtx(s, "hash", traceRelids(joinrel), traceRelids(outer), traceRelids(inner), "V8b", "jt="+traceJoinTypeName(jt))
 		return
 	}
 
@@ -207,6 +243,7 @@ func addPartialHashJoinPath(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp 
 		ParallelWorkers: o.ParallelWorkers,
 		ParallelAware:   true,
 	}, "join.hash.partial")
+	tracePVetoCtx(s, "hash", traceRelids(joinrel), traceRelids(outer), traceRelids(inner), "V9", "jt="+traceJoinTypeName(jt)+" workers="+strconv.Itoa(o.ParallelWorkers))
 }
 
 // addPartialMergeJoinPath is `try_partial_mergejoin_path`
@@ -230,15 +267,30 @@ func addPartialMergeJoinPath(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp
 	// nothing while costing a mergeJoinCost per pair per direction per
 	// level on a search whose planner time the pgbench smoke measures.
 	if gatherPathsMode == gatherPathsOff {
+		tracePVetoCtx(s, "merge", traceRelids(joinrel), traceRelids(outer), traceRelids(inner), "M0", "jt="+traceJoinTypeName(jt))
 		return
 	}
 	// `joinrel->consider_parallel` (joinpath.c:2418, via the hash block's
 	// guard which the merge block shares), already propagated by
 	// joinrelConsiderParallel.
 	if s == nil || !s.parallelModeOK || joinrel == nil || !joinrel.ConsiderParallel {
+		sub := "cp"
+		if s == nil {
+			sub = "s-nil"
+		} else if !s.parallelModeOK {
+			sub = "mode"
+		}
+		tracePVetoCtx(s, "merge", traceRelids(joinrel), traceRelids(outer), traceRelids(inner), "M1", "sub="+sub+" jt="+traceJoinTypeName(jt))
 		return
 	}
 	if outer == nil || inner == nil || len(mergeClauses) == 0 {
+		sub := "no-clauses"
+		if outer == nil {
+			sub = "nil-outer"
+		} else if inner == nil {
+			sub = "nil-inner"
+		}
+		tracePVetoCtx(s, "merge", traceRelids(joinrel), traceRelids(outer), traceRelids(inner), "M2", "sub="+sub+" jt="+traceJoinTypeName(jt))
 		return
 	}
 	// `outerrel->partial_pathlist != NIL`, cheapest only. This wrapper serves
@@ -254,10 +306,18 @@ func addPartialMergeJoinPath(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp
 	// parallelism — which is why NEITHER site enumerates beyond what PG
 	// does at that site.
 	if len(outer.PartialPathlist) == 0 {
+		tracePVetoCtx(s, "merge", traceRelids(joinrel), traceRelids(outer), traceRelids(inner), "M3", "jt="+traceJoinTypeName(jt))
 		return
 	}
 	o := outer.PartialPathlist[0]
 	if o == nil || o.ParallelWorkers <= 0 || !o.ParallelSafe {
+		sub := "unsafe"
+		if o == nil {
+			sub = "head-nil"
+		} else if o.ParallelWorkers <= 0 {
+			sub = "workers"
+		}
+		tracePVetoCtx(s, "merge", traceRelids(joinrel), traceRelids(outer), traceRelids(inner), "M4", "sub="+sub+" jt="+traceJoinTypeName(jt))
 		return
 	}
 	// `get_cheapest_parallel_safe_total_inner` (pathkeys.c:699), the same
@@ -266,9 +326,10 @@ func addPartialMergeJoinPath(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp
 	// partial-ness is not.
 	i := cheapestParallelSafeTotalInner(inner.Pathlist)
 	if i == nil {
+		tracePVetoCtx(s, "merge", traceRelids(joinrel), traceRelids(outer), traceRelids(inner), "M5", "jt="+traceJoinTypeName(jt))
 		return
 	}
-	tryPartialMergeJoinPath(s, joinrel, o, i, outer.Relids, inner.Relids, cp, jt, resultKeys, outerSortKeys, innerSortKeys,
+	tryPartialMergeJoinPath(s, joinrel, o, i, outer.Relids, inner.Relids, cp, jt, "merge", resultKeys, outerSortKeys, innerSortKeys,
 		mergeClauses, residual, mergeTuplesFor, scanSelFor, paramSrc)
 }
 
@@ -296,19 +357,31 @@ func addPartialMergeJoinPath(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp
 //   - ParallelAware is false: there is no shared prebuild for merge (each
 //     worker sorts and reads the whole inner itself), so the flag whose
 //     whole machinery is the hash twin's sharing protocol is not set.
+// `site` is which merge site offers this candidate — "merge" for the
+// `sort_inner_and_outer` wrapper above, "mergeu" for
+// `matchUnsortedOuterMergePartial` — so the veto line attributes to the
+// route, not just the refusal (R54 Step-1 H5).
 func tryPartialMergeJoinPath(s *searchCtx, joinrel *RelOptInfo, o, i *Path, outerRelids, innerRelids RelSet, cp costParams, jt parser.JoinType,
+	site string,
 	resultKeys, outerSortKeys, innerSortKeys []PathKey, mergeClauses, residual []*restrictInfo,
 	mergeTuplesFor func([]*restrictInfo) float64, scanSelFor func([]*restrictInfo) (float64, float64),
 	paramSrc RelSet) {
 
 	if o == nil || i == nil {
+		sub := "nil-inner"
+		if o == nil {
+			sub = "nil-outer"
+		}
+		tracePVetoCtx(s, site, traceRelids(joinrel), outerRelids, innerRelids, "M6", "sub="+sub+" jt="+traceJoinTypeName(jt))
 		return
 	}
 	// No-sort gate (see above): the ordering must already be delivered.
 	if len(outerSortKeys) > 0 && !pathkeysContainedIn(o.Pathkeys, outerSortKeys) {
+		tracePVetoCtx(s, site, traceRelids(joinrel), outerRelids, innerRelids, "M7", "osort="+strconv.Itoa(len(outerSortKeys))+" jt="+traceJoinTypeName(jt))
 		return
 	}
 	if len(innerSortKeys) > 0 && !pathkeysContainedIn(i.Pathkeys, innerSortKeys) {
+		tracePVetoCtx(s, site, traceRelids(joinrel), outerRelids, innerRelids, "M8", "isort="+strconv.Itoa(len(innerSortKeys))+" jt="+traceJoinTypeName(jt))
 		return
 	}
 	// `calc_non_nestloop_required_outer` (joinpath.c:1071), stricter than
@@ -317,9 +390,15 @@ func tryPartialMergeJoinPath(s *searchCtx, joinrel *RelOptInfo, o, i *Path, oute
 	// it, and no worker can supply it), and this follows the sibling
 	// rather than the serial arm's admit-if-wanted rule.
 	if o.RequiredOuter != 0 || i.RequiredOuter != 0 {
+		sub := "inner"
+		if o.RequiredOuter != 0 {
+			sub = "outer"
+		}
+		tracePVetoCtx(s, site, traceRelids(joinrel), outerRelids, innerRelids, "M9", "sub="+sub+" jt="+traceJoinTypeName(jt))
 		return
 	}
 	if calcNonNestloopRequiredOuter(o, i) != 0 {
+		tracePVetoCtx(s, site, traceRelids(joinrel), outerRelids, innerRelids, "M10", "jt="+traceJoinTypeName(jt))
 		return
 	}
 	// The filed shape must be drivable END TO END, or it is never even
@@ -327,6 +406,7 @@ func tryPartialMergeJoinPath(s *searchCtx, joinrel *RelOptInfo, o, i *Path, oute
 	// the whole relation, so an unmodelled subtree does not "stay serial"
 	// (joinpathsparallel.go, hash-twin comment).
 	if !partialPathShapeIsGatherable(o) {
+		tracePVetoCtx(s, site, traceRelids(joinrel), outerRelids, innerRelids, "M11", "jt="+traceJoinTypeName(jt))
 		return
 	}
 
@@ -377,6 +457,7 @@ func tryPartialMergeJoinPath(s *searchCtx, joinrel *RelOptInfo, o, i *Path, oute
 		ParallelWorkers: o.ParallelWorkers,
 		ParallelAware:   false,
 	}, "join.merge.partial")
+	tracePVetoCtx(s, site, traceRelids(joinrel), outerRelids, innerRelids, "M12", "jt="+traceJoinTypeName(jt)+" workers="+strconv.Itoa(o.ParallelWorkers))
 }
 
 // cheapestParallelSafeTotalInner is `get_cheapest_parallel_safe_total_inner`

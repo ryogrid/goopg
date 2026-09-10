@@ -422,5 +422,62 @@ func TestTraceAdmissionNilSafe(t *testing.T) {
 	nilTrace.admit(0b011, true, true, true, nil, nil)
 	nilTrace.baseCP(0b001, nil, true)
 	nilTrace.gather(0b011, 0, "no-partials")
+	nilTrace.pveto("hash", 0b011, 0b001, 0b010, "V4", "jt=INNER")
+	tracePVetoCtx(nil, "hash", 0b011, 0b001, 0b010, "V2", "sub=s-nil jt=INNER")
+	if got := traceRelids(nil); got != 0 {
+		t.Errorf("traceRelids(nil) = %v, want 0", got)
+	}
 	traceUpperGate("agg", "split", "workers=4 divisor=3")
+}
+
+// TestTracePVetoRenderPins: R54 Step-1's veto lines. One line per producer
+// call that did not file (plus `veto=admitted` per file, so absence of lines
+// is distinguishable from absence of calls), with the site, the rel, the
+// tried orientation (`dir=-` for the base site, which tries none), the veto
+// name and the per-veto detail. Every site's vocabulary renders verbatim —
+// the harvest greps these strings, so a rename must be deliberate.
+func TestTracePVetoRenderPins(t *testing.T) {
+	enableDPTrace(t)
+	s := traceCtx(t, "a", "b", "c")
+	s.trace.pveto("hash", 0b011, 0b001, 0b010, "V4", "jt=INNER")
+	s.trace.pveto("merge", 0b111, 0b011, 0b100, "M12", "jt=INNER workers=2")
+	s.trace.pveto("mergeu", 0b111, 0b011, 0b100, "M7", "cand=1 jt=INNER keys=-1")
+	s.trace.pveto("base", 0b001, 0, 0, "admitted", "leaf=seq workers=2")
+	s.trace.pveto("base", 0, 0, 0, "B1", "sub=mode")
+	if len(s.trace.pvetos) != 5 {
+		t.Fatalf("pveto records = %d, want 5", len(s.trace.pvetos))
+	}
+	out := s.trace.render()
+	for _, want := range []string{
+		"DPTRACE pveto site=hash rel={a+b} dir={a}+{b} veto=V4 detail=jt=INNER",
+		"DPTRACE pveto site=merge rel={a+b+c} dir={a+b}+{c} veto=M12 detail=jt=INNER workers=2",
+		"DPTRACE pveto site=mergeu rel={a+b+c} dir={a+b}+{c} veto=M7 detail=cand=1 jt=INNER keys=-1",
+		"DPTRACE pveto site=base rel={a} dir=- veto=admitted detail=leaf=seq workers=2",
+		"DPTRACE pveto site=base rel=- dir=- veto=B1 detail=sub=mode",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("rendered block missing %q:\n%s", want, out)
+		}
+	}
+}
+
+// TestSubtreeRefusalKind: R54 Step-1 H6's disjunct vocabulary. The `gate=subtree`
+// detail names which precondition refused — unsafe node, gathered subtree, or
+// no driving scan — with first disjunct winning to match the guard's || order.
+func TestSubtreeRefusalKind(t *testing.T) {
+	for _, tc := range []struct {
+		unsafe, gathered, noScan bool
+		want                     string
+	}{
+		{true, false, false, "unsafe"},
+		{false, true, false, "gathered"},
+		{false, false, true, "no-driving-scan"},
+		{true, true, true, "unsafe"},
+		{false, true, true, "gathered"},
+	} {
+		if got := subtreeRefusalKind(tc.unsafe, tc.gathered, tc.noScan); got != tc.want {
+			t.Errorf("subtreeRefusalKind(%v, %v, %v) = %q, want %q",
+				tc.unsafe, tc.gathered, tc.noScan, got, tc.want)
+		}
+	}
 }

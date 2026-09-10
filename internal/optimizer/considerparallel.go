@@ -38,6 +38,7 @@ package optimizer
 // -plan-only) and `make plan-gate`.
 
 import (
+	"strconv"
 	"strings"
 
 	"github.com/goopg/goopg/internal/catalog"
@@ -542,10 +543,31 @@ var parallelRestrictedBuiltins = map[string]bool{
 // two can disagree only in the worker count of a path nothing consumes.
 func (s *searchCtx) addBaseRelPartialPaths() {
 	if s == nil || !s.parallelModeOK || len(s.joinrels) < 2 {
+		sub := "nrels"
+		if s == nil {
+			sub = "s-nil"
+		} else if !s.parallelModeOK {
+			sub = "mode"
+		}
+		tracePVetoCtx(s, "base", 0, 0, 0, "B1", "sub="+sub)
 		return
 	}
 	for i, rel := range s.joinrels[1] {
 		if !rel.ConsiderParallel || i >= len(s.relInfos) {
+			sub := "no-relinfo"
+			if rel != nil && !rel.ConsiderParallel {
+				sub = "cp"
+			}
+			// Leaf kind is available pre-sizing (workers= is not — sizing
+			// is what this veto precedes — so B2 carries sub+leaf while B1,
+			// which fires before the loop with no rel in scope, stays
+			// sub-only). The nil guard is structural: traceRelids above is
+			// nil-safe but a field read on a nil rel would not be.
+			leaf := "other"
+			if rel != nil {
+				leaf = traceLeafKind(rel.baseLeaf)
+			}
+			tracePVetoCtx(s, "base", traceRelids(rel), 0, 0, "B2", "sub="+sub+" leaf="+leaf)
 			continue
 		}
 		tbl := s.relInfos[i].table
@@ -554,6 +576,13 @@ func (s *searchCtx) addBaseRelPartialPaths() {
 			// Only RTE_RELATION leaves get a plain partial path; an index or
 			// bitmap leaf is the legacy rule-based planner's choice standing
 			// in for the relation, and a subtree leaf is not a relation.
+			sub := "not-seq"
+			if ok && tbl == nil {
+				sub = "nil-tbl"
+			} else if ok {
+				sub = "nil-scan-table"
+			}
+			tracePVetoCtx(s, "base", traceRelids(rel), 0, 0, "B3", "sub="+sub+" leaf="+traceLeafKind(rel.baseLeaf))
 			continue
 		}
 		// WORKER COUNT is sized on `baserel->pages` proper — baseRelPages,
@@ -566,6 +595,7 @@ func (s *searchCtx) addBaseRelPartialPaths() {
 		}
 		workers := computeParallelWorkerForRel(s.cp, baseRelPages(tbl, relTuples), tableParallelWorkersReloption(tbl))
 		if workers <= 0 {
+			tracePVetoCtx(s, "base", traceRelids(rel), 0, 0, "B4", "leaf="+traceLeafKind(rel.baseLeaf)+" workers="+strconv.Itoa(workers))
 			continue
 		}
 		// COST is priced on the SAME inputs the serial seq scan of this rel
@@ -580,6 +610,7 @@ func (s *searchCtx) addBaseRelPartialPaths() {
 		// `c19-baserel-scan-priced-on-output-rows`).
 		pages, tuples, numQualOps := baseSeqScanCostInputs(s.relInfos[i], rel.baseLeaf, rel.Rows, rel.Width)
 		addPartialSeqScanPath(rel, s.cp, pages, tuples, numQualOps, workers)
+		tracePVetoCtx(s, "base", traceRelids(rel), 0, 0, "admitted", "leaf="+traceLeafKind(rel.baseLeaf)+" workers="+strconv.Itoa(workers))
 	}
 }
 
