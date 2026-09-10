@@ -93,7 +93,11 @@ package optimizer
 // `planSelect` calls the search, so plans and rows DO move here. Falsifiable
 // in `createplannl_test.go`, but no longer only there.
 
-import "fmt"
+import (
+	"fmt"
+
+	"github.com/goopg/goopg/internal/parser"
+)
 
 // createNestLoopPlan is `create_nestloop_plan` (createplan.c:4322). See the file
 // header for the two shapes it emits and why the shape is read off the inner
@@ -479,23 +483,21 @@ func createNestLoopBitmapJoinPlan(p *Path, innerPath *Path) (Node, outputLayout)
 	} else {
 		bis.Key, bis.Keys = nil, keys
 	}
-	// The recheck qual cannot survive as `BitmapQual`: `bitmapQualExprs` builds
-	// it from the restrictInfo clauses, which are in the search's own
-	// coordinates, and the inner is re-probed per outer row with only the bound
-	// slot in hand — there is no leaf-local form of "= <outer key>" to store.
-	bhs.BitmapQual = nil
-	// …so the recheck moves UP to the join predicate instead of being dropped
-	// (review/260831-2 OP1-3). It cannot simply be dropped the way the index
-	// arm drops it: an index probe enforces its keys exactly, but a bitmap heap
-	// scan does not. Once the per-probe bitmap exceeds work_mem, `tbmLossify`
-	// degrades pages to lossy and the heap scan yields EVERY tuple on such a
-	// page, relying on `BitmapQual` to filter them (operators_bitmap.go:670) —
-	// which is exactly what PG keeps `bitmapqualorig` for. With the qual nil
-	// and the clause already removed from the join residual by
-	// `probeEnforcedClauses`, nothing re-checked the join key at all and a
-	// lossy page leaked non-matching rows. Folding the probe clauses in as key
-	// pairs re-checks them on the merged outer++inner row, where the layout
-	// translation is well defined.
+	// R49 Slice B: the recheck qual survives as `BitmapQual` in merged
+	// outer++inner coordinates instead of being folded into the join Predicate.
+	// Dropping it the way the index arm drops its keys is not an option: an
+	// index probe enforces its keys exactly, but a bitmap heap scan does not.
+	// Once the per-probe bitmap exceeds work_mem, `tbmLossify` degrades pages
+	// to lossy and the heap scan yields EVERY tuple on such a page, relying on
+	// `BitmapQual` to filter them — which is exactly what PG keeps
+	// `bitmapqualorig` for. The executor evaluates it against the combined
+	// outer++inner row the heap op builds from the bound outer slot
+	// (operators_bitmap.go `evalBitmapQual`), where the layout translation
+	// below is well defined; a leaf-local form is never needed.
+	//
+	// Orientation is inner-left (`kp.Right` first): PG's line reads
+	// `Recheck Cond: (ss_item_sk = item.i_item_sk)`, the same inner-first
+	// order `formatIndexCondParts` produces for the sibling `Index Cond:`.
 	probeClauses := make([]*restrictInfo, 0, len(idxPath.IndexClauses))
 	for _, c := range idxPath.IndexClauses {
 		if c.ri != nil {
@@ -503,10 +505,18 @@ func createNestLoopBitmapJoinPlan(p *Path, innerPath *Path) (Node, outputLayout)
 		}
 	}
 	jt := planJoinTypeFor(p, "PathNestLoop(NLI-bitmap)")
+	pairs := in.keyPairs("PathNestLoop(NLI-bitmap)", probeClauses)
+	bhs.BitmapQual = make([]Expr, 0, len(pairs))
+	for _, kp := range pairs {
+		bhs.BitmapQual = append(bhs.BitmapQual,
+			&BinaryOp{pos: kp.Right.Pos(), Op: parser.OpEq, Left: kp.Right, Right: kp.Left})
+	}
 	return &NestedLoopIndexJoin{
 		pos: in.outer.Pos(), Type: jt, Outer: in.outer, Inner: bhs,
-		Predicate: in.joinPredicate("PathNestLoop(NLI-bitmap)",
-			in.keyPairs("PathNestLoop(NLI-bitmap)", probeClauses), p.Residual),
+		// Residual-only: the probe clauses moved onto the probe above (MOVE,
+		// not copy — R48 doctrine). In the corpus equi-probe shape Residual
+		// is nil and combineAnd(nil) is nil, so the join line vanishes.
+		Predicate: in.joinPredicate("PathNestLoop(NLI-bitmap)", nil, p.Residual),
 		schema: in.publishedSchema(jt),
 	}, in.publishedLayout(jt)
 }

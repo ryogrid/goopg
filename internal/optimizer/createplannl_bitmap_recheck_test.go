@@ -2,18 +2,18 @@ package optimizer
 
 import "testing"
 
-// TestCreateNestLoopBitmapJoinRechecksProbeClause is the review/260831-2 OP1-3
-// guard. The NLI-bitmap arm cleared `BitmapHeapScan.BitmapQual` (it cannot be
-// expressed in leaf-local coordinates for a per-outer-row probe) while
-// `probeEnforcedClauses` had already dropped the same clause from the join
-// residual — so NOTHING re-checked the join key. That is safe for the sibling
-// INDEX arm, where the probe enforces its keys exactly, but not for a bitmap
-// heap scan: once the per-probe bitmap exceeds work_mem, `tbmLossify` degrades
-// pages to lossy and the heap scan yields every tuple on such a page, relying
-// on the recheck qual to filter them (PG keeps `bitmapqualorig` for exactly
-// this). The join predicate is where the recheck can be expressed, because it
-// is evaluated on the merged outer++inner row.
-func TestCreateNestLoopBitmapJoinRechecksProbeClause(t *testing.T) {
+// TestCreateNestLoopBitmapJoinKeepsProbeBitmapQual is the R49 Slice-B update
+// of the review/260831-2 OP1-3 guard. The NLI-bitmap arm used to clear
+// `BitmapHeapScan.BitmapQual` and fold the probe clause into the join
+// Predicate; Slice B moves the recheck down onto the probe (MOVE, not copy):
+// `BitmapQual` carries the probe clause in merged outer++inner coordinates
+// (inner-left, PG's `Recheck Cond:` orientation) for per-tuple evaluation
+// against the combined row, and the Predicate keeps the residual only. The
+// recheck moves — it must not vanish: once the per-probe bitmap exceeds
+// work_mem, `tbmLossify` degrades pages to lossy and the heap scan yields
+// every tuple on such a page, relying on the recheck qual to filter them
+// (PG keeps `bitmapqualorig` for exactly this).
+func TestCreateNestLoopBitmapJoinKeepsProbeBitmapQual(t *testing.T) {
 	a, b := cpjTwoRel()
 	idx := cpiIndex("a0")
 
@@ -42,20 +42,31 @@ func TestCreateNestLoopBitmapJoinRechecksProbeClause(t *testing.T) {
 	if !ok {
 		t.Fatalf("createPlan(parameterised bitmap PathNestLoop) = %T, want *NestedLoopIndexJoin", n)
 	}
-	if nli.Predicate == nil {
-		t.Fatal("Predicate is nil: a lossy bitmap page would leak every tuple on it, unfiltered")
+	// The residual is empty, so the Predicate is nil and no join line renders.
+	if nli.Predicate != nil {
+		t.Fatalf("Predicate = %v, want nil (probe clause moved onto the probe, residual empty)", nli.Predicate)
 	}
-	eq, ok := nli.Predicate.(*BinaryOp)
+	// The recheck moved, not vanished: BitmapQual carries the probe equality
+	// in merged coordinates, inner-left (PG's `Recheck Cond:` orientation).
+	// keyPairs orients outer-on-the-left (b.b1 merged position 1, a.a0
+	// position 3); the arm flips to inner-first: col(3) = col(1).
+	bhs, ok := nli.Inner.(*BitmapHeapScan)
 	if !ok {
-		t.Fatalf("Predicate = %T, want the probe equality as a *BinaryOp", nli.Predicate)
+		t.Fatalf("Inner = %T, want *BitmapHeapScan", nli.Inner)
+	}
+	if len(bhs.BitmapQual) != 1 {
+		t.Fatalf("len(BitmapQual) = %d, want 1 (the probe clause)", len(bhs.BitmapQual))
+	}
+	eq, ok := bhs.BitmapQual[0].(*BinaryOp)
+	if !ok {
+		t.Fatalf("BitmapQual[0] = %T, want the probe equality as a *BinaryOp", bhs.BitmapQual[0])
 	}
 	l, lok := eq.Left.(*ColumnRef)
 	r, rok := eq.Right.(*ColumnRef)
 	if !lok || !rok {
-		t.Fatalf("Predicate = %v, want two column references on the merged row", nli.Predicate)
+		t.Fatalf("BitmapQual[0] = %v, want two column references on the merged row", bhs.BitmapQual[0])
 	}
-	// keyPairs orients outer-on-the-left: b.b1 is merged position 1, a.a0 is 3.
-	if l.Index != 1 || r.Index != 3 {
-		t.Errorf("Predicate = col(%d) = col(%d), want col(1) = col(3) on the merged row", l.Index, r.Index)
+	if l.Index != 3 || r.Index != 1 {
+		t.Errorf("BitmapQual[0] = col(%d) = col(%d), want col(3) = col(1) inner-left on the merged row", l.Index, r.Index)
 	}
 }
