@@ -3364,3 +3364,15 @@ fragility. Evidence tmp-only `/tmp/pp2/r54redesign/`.
 Next: R55 scoping — Q7's remaining sort gap (tie-break calibration
 may subsume it), Q19 range/IN-in-OR defaults, Q8 sorted-vs-split
 tie-break.
+R55 scope LANDED 2026-09-11 (`r55-sort-gap-or-defaults-tiebreak/
+SCOPE.md`, review APPROVE-WITH-NOTES, 6 notes, all applied): probe A
+NO-MECHANISM (`costSortRun` term-identical to PG `cost_tuplesort`,
+~80.9 both engines — sort-constant nudge REJECTED as overfitting;
+R56-candidate: `costAgg` sorted grouping-comparison term /
+Gather-Merge-IPC / input-rows lead); probe B WELL-DEFINED-CUT
+(inequality + const-IN-list arms into `orConjunctSelectivity` via
+stats-first cores; general ANY ledgered). R55 implementation = §2
+ONLY; tie-break calibration LEDGERED and ORDERED after the R56
+`cost_agg` audit. P1/P2 withdrawn; P3 live with numeric bar
+(133 → 24–94, Q7 pins bit-exact).
+Next: R55 implementation — §2 OR-conjunct inequality + IN-list arms.
