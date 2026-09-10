@@ -3306,4 +3306,32 @@ contest; Cost replacement separately scoped), grouped-rows sizing +
 idxSeed + STEP2 §5 seams excluded. Predicts Q5 split wins by ~180
 (~−750 if sr.Rows is the serial 7335), Q9 margin grows, Q84
 identical; Q1 identical IFF legacy seed ≈ search rows there (both
-numbers derived at measurement).
+numbers derived at measurement). Fix MEASURED 2026-09-10 (report
+`r54-parallel-admission-step0/REPORT-fix.md`, DS sweep + review +
+commit still pending): Q5→split by 750.20 (7335-case prediction to
+the decimal) ✓, Q9 split kept (margin 2055→29801) ✓, Q19 plain arm
+onto the gate pin (only live-vs-live move, rest 21/22 DIFFER both
+phases = pre-existing drift) ✓, Q1/Q84 identical + Q3/Q10 cost-only
+✓, values 8/8 identical — BUT Q7/Q8 move sorted→split in BOTH modes
+away from PG (which sorts both) ✗. Isolation: search rows are
+4.000× plan rows on every query (parallel-rows defect) and goopg's
+Q7 join is 91× PG's even in plan convention (estimator gap). Verdict:
+FAIL BACK TO DESIGN per FIX-SEED §5; redesign = search ÷degree, Q7
+selectivity scope, margin re-measure (+ Q8/serial predictions).
+Review APPROVE-WITH-NOTES (6 notes, all applied: Memoize/CTEScan/
+LockRows-cap scope comments, ordering-not-exactness test comment,
+gather-term prediction scoping, Q8+serial redesign predictions) +
+new capped-LockRows stop cases. DS SF0.5 sweep on fix binary exit 0:
+95 PASS / 0 mismatch (58 plan-shape diffs vs STALE R48 baseline,
+non-blocking channel, uninterpretable — no step2 DS sweep run).
+Report `r54-parallel-admission-step0/REPORT-fix.md`. Nothing lands:
+the code cut (accessor + assignment + 2 tests) is REVERTED, not
+committed — it regresses Q7/Q8 at HEAD, and the report's §7 fully
+specifies it for the redesign to re-derive. This commit carries the
+design artifacts only (REPORT-fix.md new, TODO.md verdict).
+Next: R54 redesign round — scope doc first: (i) search
+parallel-rows ÷degree (mechanical, uniform 4.000×), (ii) Q7-class
+join selectivity (45–91×, estimator work, separately scoped),
+(iii) margin re-measure with pre-stated Q7/Q8/serial predictions
+(REPORT-fix §9), (iv) split re-derivation term audit (§5), (v) a
+step2-binary TPC-DS SF0.5 sweep if DS tournaments are touched.
