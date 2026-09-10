@@ -750,6 +750,20 @@ func emitNodeDetailLines(n optimizer.Node, indent string, verbose bool, rows *[]
 		if filt != nil {
 			*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + wrapParen(formatExprQual(filt, reg, qualify)))})
 		}
+	case *optimizer.BitmapIndexScan:
+		// R49 Slice A: the NLI-bitmap probe binds Key/Keys per outer row
+		// (createplannl.go overwrites them with outer-layout translated
+		// keys), but no arm rendered them — 0/40 TPC-DS Bitmap Index Scans
+		// carried an Index Cond. Render from keys+columns via the shared
+		// helper, the same mechanism as the NLI index probes (NOT from
+		// Pred, which is in SEARCH coordinates and risks wrong
+		// qualification). Bitmap probes are equality-only: this node has
+		// no Low/High bounds. A key-less bitmap renders nothing.
+		if p != nil && p.Index != nil {
+			if cond := formatIndexCondParts(p.Index, p.Keys, p.Key, nil, nil, 0, 0, reg); cond != "" {
+				*rows = append(*rows, Row{NewStringDatum(indent + "Index Cond: " + cond)})
+			}
+		}
 	case *optimizer.BitmapHeapScan:
 		// PG prints `Recheck Cond:` then `Filter:` on a Bitmap Heap Scan. The
 		// two are different things and both belong here: BitmapQual is the
