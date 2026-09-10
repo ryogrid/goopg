@@ -1350,14 +1350,13 @@ func TestJoinSubtreeNarrowablePrebuiltBoundary(t *testing.T) {
 }
 
 // TestSlice3LiveQ9ShapeDerivation is regression test (a): the live Q9 shape
-// derivation. The DT-owned six-way tree narrows the witness build 10→7 —
-// not the 10→6 of the task brief, corrected with justification: the three
-// dropped columns are exactly the below-point join keys (s_suppkey consumed
-// at the witness root, s_nationkey/n_nationkey inside it); the surviving
-// l_orderkey/l_partkey/l_suppkey are read by joins ABOVE the witness level
-// in this join order. A 10→6 needs the orders link inside the witness
-// subtree (consuming l_orderkey below the narrow point) — same rule, one
-// order step away. Widths and per-level sets below are the gate prediction.
+// derivation. R51 re-baseline (justified — the implied-equality seam switch
+// moves the DP to PG's innermost join, partsupp⋈part on the synthesised
+// p_partkey = ps_partkey; TPC-H Q9's headline drops join-method): the
+// witness build is now 10→8, not 10→7 — the new order reads s_suppkey ABOVE
+// the witness level (same rule as before: surviving keys are read by joins
+// above the narrow point in this join order). The two dropped columns are
+// the below-point join keys consumed inside the witness subtree.
 func TestSlice3LiveQ9ShapeDerivation(t *testing.T) {
 	cat := slice3Q9Catalog(t)
 	plan, err := Plan(parseOne(t, slice3Q9Full), cat)
@@ -1390,7 +1389,7 @@ func TestSlice3LiveQ9ShapeDerivation(t *testing.T) {
 		t.Fatalf("narrow builds = %d, want 5 (every hash build narrows)", len(builds))
 	}
 	wantSets := []map[string]bool{
-		{"l_orderkey": true, "l_partkey": true, "l_suppkey": true, "l_quantity": true, "l_extendedprice": true, "l_discount": true, "n_name": true},
+		{"l_orderkey": true, "l_partkey": true, "l_suppkey": true, "l_quantity": true, "l_extendedprice": true, "l_discount": true, "s_suppkey": true, "n_name": true},
 		{"s_suppkey": true, "n_name": true},
 		{"n_nationkey": true, "n_name": true},
 		{"p_partkey": true},
@@ -1707,10 +1706,13 @@ func TestSlice3DerivedTableAliasMapping(t *testing.T) {
 }
 
 // TestSlice3SelfJoinInDerivedTable is regression test (d2): a self-join
-// inside a derived table over-keeps symmetric copies (F4). The (nation a ⋈
-// nation b) build keeps BOTH n_name copies (and both n_regionkey copies the
-// at-names match on both sides) — never exactly one of a pair — while
-// below-only columns still drop.
+// inside a derived table over-keeps symmetric copies (F4). R51 re-baseline
+// (justified — the implied-equality seam switch synthesises
+// a.n_nationkey = r.r_regionkey, reordering the tree; the F4 pair-rule loop
+// below still passes unchanged, so the invariant holds under the new order):
+// the (nation a ⋈ nation b) build keeps BOTH full 3-column copies
+// (n_nationkey/n_name/n_regionkey twice) — never exactly one of a pair —
+// while below-only columns still drop.
 func TestSlice3SelfJoinInDerivedTable(t *testing.T) {
 	c := catalog.NewInMemory()
 	mk := func(name string, rows int64, cols ...string) {
@@ -1738,7 +1740,7 @@ func TestSlice3SelfJoinInDerivedTable(t *testing.T) {
 	selfKept := false
 	for _, b := range slice3BuildProjects(plan) {
 		got := slice3ProjectNames(b)
-		if slice3EqualNames(got, []string{"n_name", "n_regionkey", "n_name", "n_regionkey"}) {
+		if slice3EqualNames(got, []string{"n_nationkey", "n_name", "n_regionkey", "n_nationkey", "n_name", "n_regionkey"}) {
 			selfKept = true
 		}
 		// F4 pair rule: a name occurring twice in the narrowed child's
@@ -1758,7 +1760,7 @@ func TestSlice3SelfJoinInDerivedTable(t *testing.T) {
 		}
 	}
 	if !selfKept {
-		t.Error("no [n_name n_regionkey n_name n_regionkey] self-join build; want the symmetric over-keep")
+		t.Error("no symmetric 3-column-pair self-join build; want the symmetric over-keep")
 	}
 	if out := plan.Output(); len(out) != 2 || out[0].Name != "x" || out[1].Name != "count" {
 		t.Errorf("outer output = %v, want [x count]", out)

@@ -3125,3 +3125,19 @@ so datumKey ≡ `=`; unbounded-verbatim keys differ-but-equal never meet
 excluded. Non-lead-unsafe (Q47-brand) JOINS the composite key encoding
 on admission — no separate enforcement needed. Gates: 26-line census
 A/B (HC-extra fails), digest 24/24, SF0.5 all-zero, units green.
+
+## R51 — implied-equality seam switch (LANDED 2026-09-10, report `r51-implied-equalities-seam/REPORT.md`, slice plan `SLICE.md`)
+
+K26's candidate-generation half, landed. One-line switch (`joinsearchseam.go:458`
+constants→transitive closure) + 2 PG-adjudicated re-baselines. Blast radius exactly
+K26's prediction (pinned-semi PASSES via the kept `nliProbeKeys` fix; 2 Slice3
+keep-assertions re-baselined — Q9's new innermost join IS PG's `partsupp⋈part` on
+the synthesised clause, F4 pair-rule holds unchanged). Corpus: TPC-H join-method
+11→9 (Q5+Q9), agg +1 sideways; TPC-DS four +1 tag side-effects; **join-order
+95/18 UNMOVED** — K26 §9.2 confirmed, the costing half (`join_search_one_level`
+pricing) is the named next round. Values: digest 24/24, Q12=2/Q13=34, SF0.5
+95/0, suites + vet green. Reviewed APPROVE-WITH-NOTES, notes applied
+(REPORT.md §7 — C-04a ordering verified, re-baselines sound, executor
+risk low; carry-forward: name the 7 DS shape-changed + Q5 agg-sideways
+vs PG before the costing round; Q15a-splice / `.norm`-arm provenance
+stays attached).

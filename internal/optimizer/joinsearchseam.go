@@ -448,14 +448,17 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 	// propagated `var = const` become a relation-local restriction the search
 	// pushes into a leaf.
 	//
-	// CONSTANTS ONLY, deliberately. Propagating `a = 42` across a class only
-	// adds restrictions and re-opens no join order. Adding the transitive
-	// `a = c` would hand the search new JOIN clauses and reshape plans broadly
-	// — measured: it broke the pinned-semi-join layout
-	// TestPreDPPinnedSemiKeysResolveAfterDP asserts, on a query containing no
-	// constants at all. That half stays on its legacy caller pending its own
-	// evaluation.
-	if synth := inferEquivClassConstants(conjuncts); len(synth) > 0 {
+	// R51: the search takes the FULL closure, constants plus transitive
+	// `a = c` (PG's `generate_join_implied_equalities`, equivclass.c) —
+	// the derived clauses re-open join orders the DP otherwise cannot
+	// reach (K26: `{part}|{partsupp}` on TPC-H Q9). The old deferral
+	// ("reshapes plans broadly", via TestPreDPPinnedSemiKeysResolveAfterDP)
+	// was re-measured in K26 §§7–9: the failure was a type-pinning test
+	// helper (fixed via `nliProbeKeys`, kept), and the remaining blast
+	// radius was 2 keep-assertions adjudicated against PG. Join-order may
+	// still not fall — the DP must also CHOOSE PG's order (costing half,
+	// K26 §9.2) — but the candidate half is now open.
+	if synth := inferTransitiveEqualities(conjuncts); len(synth) > 0 {
 		conjuncts = append(conjuncts, synth...)
 	}
 	// C-04a: an admitted outer link's `ON` conjuncts join the list only HERE,
