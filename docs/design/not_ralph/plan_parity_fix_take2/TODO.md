@@ -2923,7 +2923,7 @@ owned: `TestLeftJoinCrossRelationResidualReachesNLI` SKIP
 `Join Filter: (true)` (`exists_to_any.go:355-367`) still
 corpus-zero, follow-up stands.
 
-## R49 — parameterize the bitmap-heap NLI probe (design; Step 0 closed 2026-09-10; agent review APPROVE-WITH-NOTES 2026-09-10, 1 merge blocker + 8 notes, all applied)
+## R49 — parameterize the bitmap-heap NLI probe (design LANDED 2cbc83f06; Slice A LANDED 521bc82 2026-09-10 — report `r49-bitmap-probe-param/SLICE-A.md`; Slice B pending. Step 0 closed 2026-09-10; agent review APPROVE-WITH-NOTES 2026-09-10, 1 merge blocker + 8 notes, all applied)
 
 Named by R48 DESIGN §4 ("IOS/bitmap-Cond inners ... (their
 double-eval is a separate R)"). Census on the post-R48 corpora
