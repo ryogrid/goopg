@@ -1,0 +1,35 @@
+                                                                               QUERY PLAN                                                                               
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Sort  (cost=92120.38..92120.44 rows=25 width=58)
+   Sort Key: (sum((lineitem.l_extendedprice * ('1'::numeric - lineitem.l_discount)))) DESC
+   ->  Finalize GroupAggregate  (cost=92075.18..92119.80 rows=25 width=58)
+         Group Key: nation.n_name
+         ->  Gather Merge  (cost=92075.18..92119.03 rows=60 width=58)
+               Workers Planned: 2
+               ->  Partial GroupAggregate  (cost=91075.16..91112.08 rows=25 width=58)
+                     Group Key: nation.n_name
+                     ->  Sort  (cost=91075.16..91082.48 rows=2929 width=38)
+                           Sort Key: nation.n_name
+                           ->  Hash Join  (cost=478.37..90906.50 rows=2929 width=38)
+                                 Hash Cond: ((lineitem.l_suppkey = supplier.s_suppkey) AND (customer.c_nationkey = supplier.s_nationkey))
+                                 ->  Nested Loop  (cost=3.37..90047.04 rows=73231 width=51)
+                                       ->  Nested Loop  (cost=2.94..25106.38 rows=18310 width=40)
+                                             ->  Hash Join  (cost=2.51..4648.88 rows=12500 width=40)
+                                                   Hash Cond: (customer.c_nationkey = nation.n_nationkey)
+                                                   ->  Parallel Seq Scan on customer  (cost=0.00..4287.00 rows=62500 width=10)
+                                                   ->  Hash  (cost=2.45..2.45 rows=5 width=30)
+                                                         ->  Hash Join  (cost=1.07..2.45 rows=5 width=30)
+                                                               Hash Cond: (nation.n_regionkey = region.r_regionkey)
+                                                               ->  Seq Scan on nation  (cost=0.00..1.25 rows=25 width=34)
+                                                               ->  Hash  (cost=1.06..1.06 rows=1 width=4)
+                                                                     ->  Seq Scan on region  (cost=0.00..1.06 rows=1 width=4)
+                                                                           Filter: (r_name = 'ASIA'::bpchar)
+                                             ->  Index Scan using order_customer_fkidx on orders  (cost=0.43..1.62 rows=2 width=12)
+                                                   Index Cond: (o_custkey = customer.c_custkey)
+                                                   Filter: ((o_orderdate >= '1994-01-01'::date) AND (o_orderdate < '1995-01-01 00:00:00'::timestamp without time zone))
+                                       ->  Index Scan using idx_lineitem_orderkey_fkidx on lineitem  (cost=0.43..3.38 rows=17 width=23)
+                                             Index Cond: (l_orderkey = orders.o_orderkey)
+                                 ->  Hash  (cost=325.00..325.00 rows=10000 width=9)
+                                       ->  Seq Scan on supplier  (cost=0.00..325.00 rows=10000 width=9)
+(31 rows)
+

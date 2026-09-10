@@ -2922,3 +2922,76 @@ owned: `TestLeftJoinCrossRelationResidualReachesNLI` SKIP
 (identical at clean HEAD — R25 arm serves that shape first);
 `Join Filter: (true)` (`exists_to_any.go:355-367`) still
 corpus-zero, follow-up stands.
+
+## R49 — parameterize the bitmap-heap NLI probe (design; Step 0 closed 2026-09-10; agent review APPROVE-WITH-NOTES 2026-09-10, 1 merge blocker + 8 notes, all applied)
+
+Named by R48 DESIGN §4 ("IOS/bitmap-Cond inners ... (their
+double-eval is a separate R)"). Census on the post-R48 corpora
+(`oc-tpch-r48h2.txt`, `oc-ds05-r48h2.txt`): every `Filter:` on a
+`Nested Loop` whose inner is a `Bitmap Heap Scan` is an NLI
+(`NestedLoopIndexJoin.Predicate` renders as `Filter:`, while
+plain-`*Join` renders `Join Filter:`) carrying the probe clause
+at the join, over an UNPARAMETERIZED bitmap (0/40 TPC-DS
+`Bitmap Index Scan`s carry an `Index Cond:`; TPC-H likewise) —
+TPC-H Q2(4)/Q5/Q8(2)/Q11(4)/Q20; TPC-DS Q3/Q19/Q21/Q30
+(ctr_customer_sk)/Q32/Q37/Q39(×2)/Q40/Q42/Q49(×2)/Q52/Q53/
+Q55/Q61(×2)/Q63/Q64/Q75(×2)/Q76(ws_item_sk)/Q80(×2)/Q81
+(ctr_customer_sk)/Q82/Q89/Q98 — 28 lines, inner-child mapping
+verified per line (inner = `Bitmap Index Scan on *_pkey`;
+mapping table archived with the Slice-A census). Non-bitmap
+`Filter:` lines (TPC-DS Q1/Q6/Q18/Q30a/Q34/Q44/Q46/Q54/Q68/
+Q71/Q72/Q73/Q76a/Q79/Q81a — CTE/Hash/Merge/Seq inners,
+SubPlan/InitPlan quals) are out of scope. Step-0 pair is
+TPC-DS Q3, captured live 2026-09-10
+(PG :65438/tpcds05 vs r48 corpus, GUCs pinned `work_mem='64MB'`,
+`max_parallel_workers_per_gather=4`), archived in-tree as
+`r49-bitmap-probe-param/pg-dsq3.txt` +
+`goopg-dsq3-r48.txt`, plus `pg-q5.txt` + `goopg-q5-r48.txt`
+as the shape-divergence witness (PG hash-joins supplier;
+goopg nestloops with a bitmap inner — parameterizing the
+probe is PG-ward but NOT PG-identical there):
+
+- PG: `Nested Loop` with NO join-level line; inner
+  `Bitmap Heap Scan ... Recheck Cond: (ss_item_sk =
+  item.i_item_sk)` + `Bitmap Index Scan ... Index Cond:
+  (ss_item_sk = item.i_item_sk)` (outer ref as parameter).
+- goopg r48: same join shape, but the probe clause stays at
+  join level (`Filter: (item.i_item_sk =
+  store_sales.ss_item_sk)`) over a key-less
+  `Bitmap Index Scan on store_sales_pkey` (no `Index Cond:`,
+  no `Recheck Cond:`).
+
+Mechanism (surveyed, not yet designed): the NLI-bitmap path
+arm (`createNestLoopBitmapJoinPlan`, `createplannl.go:454`)
+binds probe keys per outer row already (`bis.Key`, executor
+`BindOuter`/`Rescan` plumbing exists) but deliberately clears
+`BitmapQual` ("no leaf-local form of = <outer key>") and
+folds the probe clauses into the join Predicate (OP1-3 guard
+test pins this: lossy-page recheck rides the Predicate).
+Two slices; Slice A first (EXPLAIN-only, de-risks the census):
+(A) render bound probe keys as `Index Cond:` via
+`formatIndexCondParts` (NOT `bis.Pred` — SEARCH coordinates),
+(B) keep `BitmapQual` in merged outer++inner coords + retain
+the outer slot in the heap op for combined-row recheck eval,
+and DROP the folded clauses from the Predicate (MOVE, not
+copy — R48 doctrine) — trading always-recheck for PG's
+exact-probe + lossy-recheck model. Slice-B merge blocker:
+NULL probe keys currently full-scan (`lookupKey(s)` NULL →
+`(nil,nil,nil)` → open-ended `RangeScanWithPos`; sibling
+index arm returns `ok=false`) — Slice B must return an empty
+TBM, with NULL tests in both shapes (single-column full-key
++ composite prefix). Values gates arbitrate; lossy-page tests
+must prove the recheck still fires per outer row.
+
+Out of scope: plain-`*Join` `Join Filter:` residuals (Q7/Q13/
+Q14/Q15/Q17/Q25/... — separate R per R48 §4); semi/anti over
+non-scan inners (Q21, Q22 — PG comparison in DESIGN; likely
+already PG-shaped); Q17/Q6/Q30 SubPlan/InitPlan shapes;
+LEFT (Q72 — null-safety, same argument as R48); INNER
+non-bitmap NLI residuals (deferred per R48).
+
+Pass = every in-scope join-level probe `Filter:` moved onto
+its probe (`Recheck Cond:` + `Index Cond:`, no join line),
+each adjudicated toward its PG counterpart (Q5-class shape
+divergences recorded, not forced); ZERO EXTRA flips;
+values gates (TPC-H digest 24/24, SF0.5 sweep all-zero) bind.

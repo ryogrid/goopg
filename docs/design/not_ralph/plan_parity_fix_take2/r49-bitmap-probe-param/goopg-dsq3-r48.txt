@@ -1,0 +1,22 @@
+===== Q3 =====
+                                                     QUERY PLAN                                                      
+---------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=3544.43..3544.45 rows=1 width=72)
+   ->  Sort  (cost=3544.43..3544.44 rows=1 width=72)
+         Sort Key: d_year, sum DESC, i_brand_id
+         ->  HashAggregate  (cost=3544.40..3544.41 rows=1 width=72)
+               Group Key: dt.d_year, item.i_brand, item.i_brand_id
+               ->  Gather  (cost=2104.28..3544.40 rows=1 width=1328)
+                     Workers Planned: 1
+                     ->  Hash Join  (cost=1104.28..3552.30 rows=41 width=504)
+                           Hash Cond: (dt.d_date_sk = store_sales.ss_sold_date_sk)
+                           ->  Parallel Seq Scan on date_dim dt  (cost=0.00..755.49 rows=2500 width=420)
+                                 Filter: (d_moy = 11)
+                           ->  Nested Loop  (cost=8.39..1089.28 rows=1200 width=908)
+                                 Filter: (item.i_item_sk = store_sales.ss_item_sk)
+                                 ->  Seq Scan on item  (cost=0.00..180.15 rows=15 width=480)
+                                       Filter: (i_manufact_id = 816)
+                                 ->  Bitmap Heap Scan on store_sales  (cost=8.39..16.36 rows=2 width=428)
+                                       ->  Bitmap Index Scan on store_sales_pkey  (cost=0.38..8.39 rows=2 width=428)
+(17 rows)
+

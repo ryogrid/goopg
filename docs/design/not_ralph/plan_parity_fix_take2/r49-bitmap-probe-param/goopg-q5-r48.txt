@@ -1,0 +1,32 @@
+=== Q5
+                                                                   QUERY PLAN                                                                   
+------------------------------------------------------------------------------------------------------------------------------------------------
+ Sort  (cost=296418.04..296418.09 rows=18 width=136)
+   Sort Key: sum DESC
+   ->  Finalize HashAggregate  (cost=296417.49..296417.67 rows=18 width=136)
+         Group Key: nation.n_name
+         ->  Gather  (cost=296417.08..296417.44 rows=18 width=136)
+               Workers Planned: 4
+               ->  Partial HashAggregate  (cost=296417.08..296417.26 rows=18 width=136)
+                     Group Key: nation.n_name
+                     ->  Hash Join  (cost=61617.90..296416.86 rows=7335 width=1046)
+                           Hash Cond: ((orders.o_custkey = customer.c_custkey) AND (supplier.s_nationkey = customer.c_nationkey))
+                           ->  Hash Join  (cost=54045.90..287396.26 rows=183366 width=982)
+                                 Hash Cond: (lineitem.l_suppkey = supplier.s_suppkey)
+                                 ->  Hash Join  (cost=53799.50..281878.08 rows=916832 width=614)
+                                       Hash Cond: (lineitem.l_orderkey = orders.o_orderkey)
+                                       ->  Parallel Seq Scan on lineitem  (cost=0.00..196405.55 rows=6001255 width=550)
+                                       ->  Seq Scan on orders  (cost=0.00..17291.60 rows=229160 width=448)
+                                             Filter: ((o_orderdate >= '1994-01-01'::date) AND (o_orderdate < '1995-01-01 00:00:00'::timestamp))
+                                 ->  Nested Loop  (cost=11.42..221.40 rows=2000 width=1210)
+                                       Filter: (nation.n_nationkey = supplier.s_nationkey)
+                                       ->  Hash Join  (cost=1.07..2.47 rows=5 width=626)
+                                             Hash Cond: (nation.n_regionkey = region.r_regionkey)
+                                             ->  Seq Scan on nation  (cost=0.00..1.25 rows=25 width=490)
+                                             ->  Seq Scan on region  (cost=0.00..0.06 rows=1 width=458)
+                                                   Filter: (r_name = 'ASIA')
+                                       ->  Bitmap Heap Scan on supplier  (cost=10.35..48.07 rows=400 width=584)
+                                             ->  Bitmap Index Scan on supplier_nation_fkidx  (cost=0.25..10.35 rows=400 width=584)
+                           ->  Seq Scan on customer  (cost=0.00..5322.00 rows=150000 width=624)
+(27 rows)
+
