@@ -3329,9 +3329,17 @@ the code cut (accessor + assignment + 2 tests) is REVERTED, not
 committed — it regresses Q7/Q8 at HEAD, and the report's §7 fully
 specifies it for the redesign to re-derive. This commit carries the
 design artifacts only (REPORT-fix.md new, TODO.md verdict).
-Next: R54 redesign round — scope doc first: (i) search
-parallel-rows ÷degree (mechanical, uniform 4.000×), (ii) Q7-class
-join selectivity (45–91×, estimator work, separately scoped),
-(iii) margin re-measure with pre-stated Q7/Q8/serial predictions
-(REPORT-fix §9), (iv) split re-derivation term audit (§5), (v) a
+Next: R54 redesign round — scope doc first (REDESIGN.md rev 1
+REJECTED on scope review 2026-09-10: the ÷degree prescription would
+double-divide the split, corrupt serial arms via the shared seed,
+and cannot name its divisor at the sourcing site; tournament
+verified single-divisor-disciplined, totals-sourcing
+convention-correct): (i) RE-LAND totals-sourcing (mechanical,
+reproduce failed-round figures to the decimal as baseline), (ii)
+Q7-class join selectivity (91× per-worker, estimator work, IN the
+round), (iii) margin re-measure with pre-stated predictions, (iv)
+split PER-ARM audit promoted co-equal (which arm over/under-prices,
+with a number), (v) PG Q8 harvest + serial judgment, (vi) a
 step2-binary TPC-DS SF0.5 sweep if DS tournaments are touched.
+Must-holds per FIX-SEED §5 incl. Q19 MATCH + Q5-split-wins
+(non-vacuous). Scope REDESIGN.md rev 2; needs second review.
