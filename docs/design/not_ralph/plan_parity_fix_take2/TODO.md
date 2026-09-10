@@ -3011,3 +3011,14 @@ bitmap probe unless per-probe cost clears the full-seq
 prebuilt seed (2k rows: 33 vs 30 dropped; 20k: 262 vs 298
 kept — the index sibling survives via its pathkeys axis).
 Full mechanism notes → `SLICE-B.md` with the fix.
+
+Slice-B plan 2026-09-10 (`r49-bitmap-probe-param/SLICE-B.md`,
+agent review APPROVE-WITH-NOTES 2026-09-10, 9 notes, all applied):
+planner BitmapQual-from-pairs
+(inner-left, merged coords) + residual-only Predicate;
+heap-op outer-slot retention + combined-row evalBitmapQual
+branch (outerSlot==nil keeps legacy inner-row eval);
+NULL-key empty TBM via lookupBounds flag; all three in ONE
+commit (no safe intermediate); pins = OP1-3 update +
+lossy-per-outer-row + NULL both shapes + deform superset +
+planner e2e + Recheck render.
