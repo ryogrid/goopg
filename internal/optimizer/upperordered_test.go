@@ -286,3 +286,78 @@ func TestCreateOrderedPathsInputArmIsReachableFromANode(t *testing.T) {
 		t.Fatalf("newPrebuiltPath must stay ordering-free, got %d pathkeys", len(seed.Pathkeys))
 	}
 }
+
+// TestOrderedDropsHashedSortForPresortedGrouping is the R47 (K101)
+// slice-2 TDD gate: with output-coordinate pathkeys on the sorted
+// candidate (the translation slice 2 provides), the ordered rel
+// must drop hashed+Sort via the existing startup+fuzz dominance —
+// no-sort offered, hashed dominated, sorted elected. Costs mirror
+// live PG Q4 (totals within fuzz, startup outside it).
+// Companion: TestOrderedStacksSortWithoutTranslatedPathkeys pins
+// today's impotence (input-coordinate keys never match), which is
+// what the translation fixes.
+func TestOrderedDropsHashedSortForPresortedGrouping(t *testing.T) {
+	cp := defaultCostParams()
+	// Output-coordinate order key (shared object → pathKeyEqual TRUE).
+	orderCol := &ColumnRef{Index: 0, Name: "o_orderpriority", Type: catalog.Type{Name: "bpchar"}}
+	orderKeys := []PathKey{{Expr: orderCol, SortAsc: true}}
+	u := newUpperRels()
+	ordered := fetchUpperRel(u, UpperOrdered, 0, 0)
+	ordered.NCols = 2
+	ordered.AvgVarBytes = 8
+	// Sorted grouping candidate, translated (output-coord) pathkeys.
+	sortedAgg := &Path{
+		Kind: PathAgg, Cost: Cost{Startup: 69094, Total: 70122}, Rows: 5,
+		Pathkeys: []PathKey{{Expr: orderCol, SortAsc: true}},
+		Rel: ordered, ParallelSafe: true,
+	}
+	// Hashed grouping candidate, unordered.
+	hashedAgg := &Path{
+		Kind: PathAgg, Cost: Cost{Startup: 68909, Total: 69911}, Rows: 5,
+		Rel: ordered, ParallelSafe: true,
+	}
+	addOrderedPaths(ordered, sortedAgg, orderKeys, cp, -1)
+	addOrderedPaths(ordered, hashedAgg, orderKeys, cp, -1)
+	setCheapest(ordered)
+	best := getCheapestFractionalPath(ordered, 0)
+	if best == nil {
+		t.Fatal("ordered rel has no cheapest path")
+	}
+	if best.Kind == PathSort {
+		t.Fatalf("hashed+Sort won (cost=%.2f); want the no-sort sorted path — startup dominance did not drop it", best.Cost.Total)
+	}
+}
+
+func TestOrderedStacksSortWithoutTranslatedPathkeys(t *testing.T) {
+	cp := defaultCostParams()
+	// Input-coordinate group key: same column, different object and
+	// index → pathKeyEqual FALSE (positional identity, exprwalk.go).
+	// This is today's state: no-sort can never fire across the
+	// grouping boundary, so hashed+Sort wins and the test documents it.
+	groupCol := &ColumnRef{Index: 3, Name: "o_orderpriority", Type: catalog.Type{Name: "bpchar"}}
+	orderCol := &ColumnRef{Index: 0, Name: "o_orderpriority", Type: catalog.Type{Name: "bpchar"}}
+	orderKeys := []PathKey{{Expr: orderCol, SortAsc: true}}
+	u := newUpperRels()
+	ordered := fetchUpperRel(u, UpperOrdered, 0, 0)
+	ordered.NCols = 2
+	ordered.AvgVarBytes = 8
+	sortedAgg := &Path{
+		Kind: PathAgg, Cost: Cost{Startup: 69094, Total: 70122}, Rows: 5,
+		Pathkeys: []PathKey{{Expr: groupCol, SortAsc: true}},
+		Rel: ordered, ParallelSafe: true,
+	}
+	hashedAgg := &Path{
+		Kind: PathAgg, Cost: Cost{Startup: 68909, Total: 69911}, Rows: 5,
+		Rel: ordered, ParallelSafe: true,
+	}
+	addOrderedPaths(ordered, sortedAgg, orderKeys, cp, -1)
+	addOrderedPaths(ordered, hashedAgg, orderKeys, cp, -1)
+	setCheapest(ordered)
+	best := getCheapestFractionalPath(ordered, 0)
+	if best == nil {
+		t.Fatal("ordered rel has no cheapest path")
+	}
+	if best.Kind != PathSort {
+		t.Fatalf("untranslated pathkeys unexpectedly elected no-sort (kind=%d); want hashed+Sort documenting today's gap", best.Kind)
+	}
+}

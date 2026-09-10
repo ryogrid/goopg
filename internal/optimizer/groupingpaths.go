@@ -327,11 +327,16 @@ func addGroupingPaths(grouped *RelOptInfo, seed *Path, aggNode *Aggregate, child
 			input = sortPathForBounded(seed, pathkeysForSortKeys(presortedKeys), cp, -1)
 			producer = groupAggSortedProducer
 		}
+		// R47 slice 1: per-candidate spec clone. All arms below used
+		// to file the shared aggNode pointer, so the winner
+		// copy-back (`*aggNode = *built`) rewrote losers underneath
+		// future readers. Content-identical; behavior change: none.
+		plainSpec := *aggNode
 		addPath(grouped, &Path{
-			Kind: PathAgg, AggStrategy: AggStrategyHashed, Agg: aggNode,
+			Kind: PathAgg, AggStrategy: AggStrategyHashed, Agg: &plainSpec,
 			Rel: grouped, Rows: 1,
 			Cost: costAgg(cp, AggStrategyHashed, inputRows, inputStartup, inputTotal,
-				0, 1, len(aggNode.Aggs), inNcols, inAvgVar),
+				0, 1, len(plainSpec.Aggs), inNcols, inAvgVar),
 			Pathkeys: input.Pathkeys, Children: []*Path{input},
 		}, producer)
 		return
@@ -342,12 +347,14 @@ func addGroupingPaths(grouped *RelOptInfo, seed *Path, aggNode *Aggregate, child
 	// Grouping sets always hash (today's fall-through; executor has one
 	// hash table per set).
 	if groupingHashable(aggNode, presorted) || aggNode.GroupingSets != nil {
+		// R47 slice 1: per-candidate spec clone (see PLAIN arm).
+		hashSpec := *aggNode
 		addPath(grouped, &Path{
-			Kind: PathAgg, AggStrategy: AggStrategyHashed, Agg: aggNode,
+			Kind: PathAgg, AggStrategy: AggStrategyHashed, Agg: &hashSpec,
 			Rel: grouped, Rows: numGroups,
 			DisabledNodes: disabledNodesFor(!ps.EnableHashAgg, seed),
 			Cost: costAgg(cp, AggStrategyHashed, inputRows, inputStartup, inputTotal,
-				len(aggNode.GroupExprs), numGroups, len(aggNode.Aggs), inNcols, inAvgVar),
+				len(hashSpec.GroupExprs), numGroups, len(hashSpec.Aggs), inNcols, inAvgVar),
 			Children: []*Path{seed},
 		}, groupAggHashedProducer)
 	}
@@ -392,11 +399,13 @@ func addGroupingPaths(grouped *RelOptInfo, seed *Path, aggNode *Aggregate, child
 			return
 		}
 		sortedInput := sortPathForBounded(seed, pathkeysForSortKeys(keys), cp, -1)
+		// R47 slice 1: per-candidate spec clone (see PLAIN arm).
+		sortSpec := *aggNode
 		addPath(grouped, &Path{
-			Kind: PathAgg, AggStrategy: AggStrategySorted, Agg: aggNode,
+			Kind: PathAgg, AggStrategy: AggStrategySorted, Agg: &sortSpec,
 			Rel: grouped, Rows: numGroups,
 			Cost: costAgg(cp, AggStrategySorted, inputRows, sortedInput.Cost.Startup, sortedInput.Cost.Total,
-				len(aggNode.GroupExprs), numGroups, len(aggNode.Aggs), inNcols, inAvgVar),
+				len(sortSpec.GroupExprs), numGroups, len(sortSpec.Aggs), inNcols, inAvgVar),
 			Pathkeys: sortedInput.Pathkeys, Children: []*Path{sortedInput},
 		}, groupAggSortedProducer)
 	}

@@ -360,8 +360,10 @@ func addPartialAggSplitPath(u *upperRels, grouped *RelOptInfo, seed *Path, aggNo
 	if len(aggNode.GroupExprs) == 0 && aggNode.GroupingSets == nil {
 		// PLAIN: one candidate, priced by the hashed arm at 0 group columns
 		// and 1 group — term-for-term PG's PLAIN arm, as C-15 does.
+		// R47 slice 1: per-candidate spec clone (see groupingpaths.go).
+		plainSpec := *aggNode
 		addPath(grouped, &Path{
-			Kind: PathAgg, AggStrategy: AggStrategyHashed, Agg: aggNode,
+			Kind: PathAgg, AggStrategy: AggStrategyHashed, Agg: &plainSpec,
 			Rel: grouped, Rows: 1,
 			Cost: costAgg(cp, AggStrategyHashed, inputRows, nsGatherCost.Startup, nsGatherCost.Total,
 				0, 1, nAggs, inNcols, inAvgVar),
@@ -370,8 +372,10 @@ func addPartialAggSplitPath(u *upperRels, grouped *RelOptInfo, seed *Path, aggNo
 		return split
 	}
 	if groupingHashable(aggNode, false) || aggNode.GroupingSets != nil {
+		// R47 slice 1: per-candidate spec clone (see groupingpaths.go).
+		hashSpec := *aggNode
 		addPath(grouped, &Path{
-			Kind: PathAgg, AggStrategy: AggStrategyHashed, Agg: aggNode,
+			Kind: PathAgg, AggStrategy: AggStrategyHashed, Agg: &hashSpec,
 			Rel: grouped, Rows: finalGroups,
 			DisabledNodes: disabledNodesFor(!ps.EnableHashAgg, nsGather),
 			Cost: costAgg(cp, AggStrategyHashed, inputRows, nsGatherCost.Startup, nsGatherCost.Total,
@@ -381,8 +385,10 @@ func addPartialAggSplitPath(u *upperRels, grouped *RelOptInfo, seed *Path, aggNo
 	}
 	if aggNode.GroupingSets == nil && !groupingHasSpecialAgg(aggNode) {
 		sortedInput := sortPathForBounded(nsGather, pathkeysForSortKeys(groupKeysSortKeys(aggNode)), cp, -1)
+		// R47 slice 1: per-candidate spec clone (see groupingpaths.go).
+		sortSpec := *aggNode
 		addPath(grouped, &Path{
-			Kind: PathAgg, AggStrategy: AggStrategySorted, Agg: aggNode,
+			Kind: PathAgg, AggStrategy: AggStrategySorted, Agg: &sortSpec,
 			Rel: grouped, Rows: finalGroups,
 			Cost: costAgg(cp, AggStrategySorted, inputRows, sortedInput.Cost.Startup, sortedInput.Cost.Total,
 				nGroupCols, finalGroups, nAggs, inNcols, inAvgVar),
@@ -404,8 +410,10 @@ func addPartialAggSplitArm(grouped, partialRel *RelOptInfo, pseed *Path, aggNode
 	// planner.c:7606.
 	partialCost := costAgg(cp, strategy, perWorkerRows, pseed.Cost.Startup, pseed.Cost.Total,
 		nGroupCols, partialGroups, nAggs, inNcols, inAvgVar)
+	// R47 slice 1: per-candidate spec clone (see groupingpaths.go).
+	partialSpec := *aggNode
 	partialPath := &Path{
-		Kind: PathAgg, AggStrategy: strategy, Agg: aggNode,
+		Kind: PathAgg, AggStrategy: strategy, Agg: &partialSpec,
 		Rel: partialRel, Rows: partialGroups, Cost: partialCost,
 		ParallelSafe: true, ParallelWorkers: workers,
 		Children: []*Path{pseed},
@@ -430,8 +438,10 @@ func addPartialAggSplitArm(grouped, partialRel *RelOptInfo, pseed *Path, aggNode
 	// FINALIZE arm — `create_agg_path(… AGGSPLIT_FINAL_DESERIAL …)`,
 	// planner.c:7250: the combine charged per INPUT row of the finalize node
 	// and the final function per output group.
+	// R47 slice 1: per-candidate spec clone (see groupingpaths.go).
+	finalSpec := *aggNode
 	split := &Path{
-		Kind: PathFinalizeAgg, AggStrategy: strategy, Agg: aggNode,
+		Kind: PathFinalizeAgg, AggStrategy: strategy, Agg: &finalSpec,
 		Rel: grouped, Rows: finalGroups,
 		Cost: costAgg(cp, strategy, crossedRows, gatherAbove.Startup, gatherAbove.Total,
 			nGroupCols, finalGroups, nAggs, inNcols, inAvgVar),

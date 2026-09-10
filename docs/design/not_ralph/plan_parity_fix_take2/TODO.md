@@ -2744,6 +2744,22 @@ pre-declared estimate/Memoize/inode pins, standard gates.
 Follow-ups: R48 (placement), firing-rule (hypothesis-eliminating
 census), K100, fixture re-capture (owner).
 
+## R47 slice 1 result (2026-09-10, verified on resume)
+
+Per-candidate Agg spec clones (`groupingpaths.go` 3 sites,
+`partialaggupper.go` 5 sites) + 2 dominance TDD pins. Re-verified
+on resume after handover: `go build` clean, both pins PASS, full
+`internal/optimizer` suite green, units gate green, pgbench smoke
+green (0 failed). Serving behavior (K91): fresh `:5554` launch of
+the current-tree binary on the TPC-H clone — full corpus capture
+byte-identical to the R46 baseline (`oc-tpch-r46c.txt`) on all 22
+queries (Q15a helper file absent at capture time; manual Q15a probe
+matches baseline exactly incl. costs/widths/filter rendering), and
+the peer's TPC-DS slice-1 capture differs from its baseline only in
+header + psql-PID noise. Q4 before-shape confirmed live (hashed:
+HashAggregate startup 1283.98, semi 1141.32/57066/width 448).
+Slice 2 (translation helper + ordered loop + copy-back) NOT started.
+
 *Rev history: rev 1 REJECTED (F1-F11: fuzz-site error, missing
 decision site, NLI misattribution, unestablished seed, missing
 rows, self-contradiction, K9 breach, open blast radius/guards);
