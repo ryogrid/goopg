@@ -2923,7 +2923,7 @@ owned: `TestLeftJoinCrossRelationResidualReachesNLI` SKIP
 `Join Filter: (true)` (`exists_to_any.go:355-367`) still
 corpus-zero, follow-up stands.
 
-## R49 — parameterize the bitmap-heap NLI probe (design LANDED 2cbc83f06; Slice A LANDED 521bc82 2026-09-10 — report `r49-bitmap-probe-param/SLICE-A.md`; Slice B IN PROGRESS (setup done 2026-09-10, worktree /tmp/wt-r49b). Step 0 closed 2026-09-10; agent review APPROVE-WITH-NOTES 2026-09-10, 1 merge blocker + 8 notes, all applied; impl LANDED a16db55 2026-09-10; pins LANDED 3639208 2026-09-10 (OP1-3 MOVE-contract + SEMI/keyless, deform widening, e2e doll-house: shape/lossy/NULL/composite/LEFT/cond+lookupBounds; executor+optimizer suites green). NEXT: Slice-B gates (census, values, spotcheck))
+## R49 — parameterize the bitmap-heap NLI probe (design LANDED 2cbc83f06; Slice A LANDED 521bc82 2026-09-10 — report `r49-bitmap-probe-param/SLICE-A.md`; Slice B IN PROGRESS (setup done 2026-09-10, worktree /tmp/wt-r49b). Step 0 closed 2026-09-10; agent review APPROVE-WITH-NOTES 2026-09-10, 1 merge blocker + 8 notes, all applied; impl LANDED a16db55 2026-09-10; pins LANDED 3639208 2026-09-10 (OP1-3 MOVE-contract + SEMI/keyless, deform widening, e2e doll-house: shape/lossy/NULL/composite/LEFT/cond+lookupBounds; executor+optimizer suites green). NEXT: Slice-B gates — DONE 2026-09-10, report f60d69bc1 (census moves-only TPC-H 14/DS 40, digest 24/24 Q12=2/Q13=34, SF0.5 95 PASS/0 mismatch, sibling audit clean). Slice B COMPLETE.)
 
 Named by R48 DESIGN §4 ("IOS/bitmap-Cond inners ... (their
 double-eval is a separate R)"). Census on the post-R48 corpora
