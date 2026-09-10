@@ -2768,3 +2768,37 @@ M0129-S1/sort-disabled disclosure, ungrounded flips, pins,
 K9 framing). All items closed in rev 3 per the two review
 verdicts; full text in the review reports summarized above —
 kept for the record, not repeated.*
+
+## R47 slice 2 plan (2026-09-10, code study complete — review then implement)
+
+New file `internal/optimizer/upperorderedgrouping.go` + pins in
+`upperordered_test.go`, per `r47-q4-upper-rel/SLICE2.md` (written
+2026-09-10 from live-tree code study; agent-reviewed before
+implementation commit). Translation helper (sorted-candidate
+emission order → output-coord pathkeys; executor guard mirrored;
+PathSort-child + full positional group run + name-verified group
+prefix required; hashed/index/presorted/expression-key fall out
+via the checks) + ordered loop at the planSelect normal ORDER BY
+arm only (gates pre-mutation: agg != nil, node == agg.node,
+selectSrfPending == nil, ≥2 PathAgg + 0 PathFinalizeAgg on the
+re-fetched GROUP_AGG rel; per-candidate shallow copy with
+translated pathkeys through existing addOrderedPaths +
+setCheapest/getCheapestFractionalPath; winner built via
+createPlanNode, copy-back descending through *Sort only +
+stampAggregateInputTarget re-run; existing orderSort stamp code
+reused (control flows through the shared block, no early return);
+loop elects ⇒ normal createOrderedPaths call skipped; decline ⇒
+snapshot/restore Pathlist+cheapest (review-adopted).
+Prediction sharpened on review: GROUPING still picks hashed, but
+the ORDERED election is EXPECTED to flip Q4 to no-sort sorted
+(the slice-1 pin elects it at Q4's numbers 70122-vs-69911 via
+fuzz+tie-break) IF production matches the pin — flip = stretch
+recorded, no flip = census must say where production diverged.
+Pass = gates + ZERO EXTRA flips + hypothesis-eliminating §3.3
+census.
+Recipe mapping notes (handover §3 mapped, not coded): "child must
+be Sort" = PathSort *Path* (losers stay unbuilt); presorted/index
+→ nil subsumed by child-kind + run checks (+ explicit
+GroupKeyOrder decline); DisabledNodes propagate via
+disabledNodesFor inheritance (verified); sizing from aggNode ≡
+normal call (verified).
