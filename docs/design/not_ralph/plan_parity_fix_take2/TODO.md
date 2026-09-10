@@ -3022,3 +3022,77 @@ NULL-key empty TBM via lookupBounds flag; all three in ONE
 commit (no safe intermediate); pins = OP1-3 update +
 lossy-per-outer-row + NULL both shapes + deform superset +
 planner e2e + Recheck render.
+
+## R50 — plain-`*Join` `Join Filter:` residuals (setup 2026-09-10; PG adjudication running)
+
+Named by R48 DESIGN §4 ("plain-`*Join` residuals") and R49
+DESIGN §4 ("Plain-`*Join` `Join Filter:` residuals ... —
+separate R per R48 §4"). Post-R49 census on the gate corpora
+(`oc-tpch-r49b.txt`, `oc-ds05-r49b.txt`; machine attribution —
+a qual line counts iff its nearest less-indented node is a
+join; ZERO orphans): TPC-H 2 `Join Filter:` keys (Q7
+`Nested Loop`, disjunctive n_name OR; Q19 `Hash Join`,
+brand/container/quantity OR) + 6 NLI-`Filter:` keys
+(Q2/Q17/Q20/Q21×2/Q22 — NOT this R, R48/R49 own the
+Predicate slot); TPC-DS 38 `Join Filter:` keys / 64 lines
+over 36 queries (Q4/Q11/Q13×2/Q14/Q15/Q16/Q17/Q19/Q24/
+Q25/Q29/Q31/Q37/Q45/Q46/Q47/Q48×2/Q50/Q54/Q56/Q57/Q58/
+Q59/Q60/Q64/Q65/Q68/Q72/Q74/Q75/Q80/Q82/Q83/Q85/Q94/Q95)
++ 12 NLI-`Filter:` keys (SubPlan/InitPlan/LEFT shapes,
+out unless the census implicates the same mechanism).
+Census-trap on record: the first attribution regex
+(`Hash (?:Left|...|Anti )?Join` — trailing space bound
+only to the LAST alternative) silently dropped the whole
+`Hash Semi Join` family from the key census (lines still
+visible in the unfiltered dump, which is what caught it);
+fixed pattern keeps the space outside the group, sanity
+prints all six join spellings, orphans must read 0.
+
+Step-0 TBD by adjudication: PG sweep running
+(`/tmp/pp2/capture-pg-r50.sh` — PG :65432/tpch Q7+Q19, PG
+:65438/tpcds05 all 38 affected DS queries, GUCs pinned
+`work_mem='64MB'`, `max_parallel_workers_per_gather=4`;
+baseline binary `/tmp/pp2/bin/goopg-r50` built from this
+worktree, byte-identical to the r49b gate image, `cmp`
+clean). Each goopg join-level line gets one PG verdict: (a)
+PG-identical Join Filter (no action), (b) PG places it as
+Hash/Merge Cond or a pushed-down Filter/Index Cond (MOVE
+candidate, R48 doctrine), (c) PG picks a different join
+(join-choice — different R, NEVER force the shape).
+Mechanism survey + slicing after adjudication; values gates
+(TPC-H digest 24/24, SF0.5 sweep all-zero) bind as usual.
+
+Adjudication DONE 2026-09-10 (PG sweep
+`/tmp/pp2/pg-r50/`: 2 TPCH + 42 DS plans, GUCs pinned).
+(a) PG-identical JF, no action: TPCH Q7 (OR stays JF even
+on PG's hash join — non-equi JF is PG-faithful), DS Q13N/
+Q48N (giant OR), Q15/Q45 (substr-ANY), Q46/Q68 (city<>),
+Q54 (county), Q64, Q85
+(PG keeps even equi as JF on NL), Q14 (PG also NL JF on
+the outer arms), Q72, Q31/Q75/Q65/Q92 (non-equi, same
+role), Q19 (substr<>), Q95 (warehouse<>, same role),
+Q16/Q94 (self-ref `x<>x`; PG shape differs entirely).
+(c) join-choice, different R: TPCH Q19 (PG NLI probe, no
+join line), DS Q17/Q25/Q29/Q50 (ss/sr-customer; PG hashes
+or index-probes elsewhere), Q37/Q82 (PG `Index Cond:
+(inv_item_sk = item.i_item_sk)` — index-probe R), Q80
+(PG HC on hash; goopg NL — join R, NL has no key slot).
+(b) SLICE A — hash-`Join Filter:` conjuncts already
+covered by the sibling `Hash Cond:` (redundant double-eval;
+PG never duplicates — PG Q56/Q59 show HC-only): Q56×3 +
+Q60×3 (JF textually == HC, `item_id`), Q47×2 + Q57×2 (JF
+category+brand pair ⊂ HC), Q59×1 (store_id ⊂ HC),
+Q58×2 (drop the `item_id` conjunct, keep ranges — PG:
+MC(item_id)+JF(ranges)), Q24×2 (zip dup exact; PG keeps
+JF-on-NL — adjudicated: doctrine over coincident text,
+query stays shapediff), Q4×5 + Q11×3 + Q74×3
+(customer_id dup/partial + CASE ratio stays; same note).
+26 lines / 10 queries. Step-0: DS-Q56 (exact-dup ×3;
+goopg HC+JF vs PG HC-only). Safety core: rows reaching JF
+eval already satisfy HC (INNER/SEMI), so HC-implied JF
+conjuncts are dead — drop is values-neutral by
+construction; ANTI explicitly out (no ANTI in scope).
+Follow-ups (not this slice): Q83 (JF-only `item_id`, no
+companion HC — extraction failure, separate slice), Q13H/
+Q48H (state/profit OR on hash — PG placement TBD from full
+Q13 text), plain-NL equi probe-ability (Q37-class).
