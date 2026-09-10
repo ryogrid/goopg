@@ -329,7 +329,10 @@ func addNLIPaths(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp costParams,
 				Rows:     joinrel.Rows,
 				Cost:     cost,
 				Children: []*Path{o, in},
-				Residual: residual,
+				// R53 slice 1: the partition, in Children order.
+				OuterRelids: outer.Relids,
+				InnerRelids: inner.Relids,
+				Residual:    residual,
 				// Empty by the test above. Carried through the constructor
 				// rather than hard-coded so the star-schema case is a one-line
 				// relaxation once P5.6's sizer exists.

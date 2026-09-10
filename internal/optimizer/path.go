@@ -385,6 +385,18 @@ type Path struct {
 
 	Children []*Path
 
+	// OuterRelids/InnerRelids are the two input relsets this join path was
+	// built from, in Children order (Children[0]'s rel, Children[1]'s rel).
+	// R53 slice 1: DPPATH partition attribution. The `addPathsToJoinrel`
+	// partition a path prices is otherwise unrecoverable downstream — the
+	// joinrel is the UNION, and Children carry no relsets — so the
+	// constructors stamp it here and `tracePath` renders it. Trace-only
+	// provenance: no planner code reads these fields, and they are zero on
+	// every non-join path. For hash joins Children[1] is the BUILD side
+	// (Children[0] the probe), so Inner names the hashed input.
+	OuterRelids RelSet
+	InnerRelids RelSet
+
 	// node is the executor Node a PathPrebuilt wraps. nil for every other kind.
 	node Node
 }

@@ -119,6 +119,9 @@ func addHashJoinPath(joinRel, probe, build *RelOptInfo, cp costParams, jt parser
 		Rows:          joinRel.Rows,
 		Cost:          cost,
 		Children:      []*Path{p, b},
+		// R53 slice 1: the partition, in Children order (probe, build).
+		OuterRelids:   probe.Relids,
+		InnerRelids:   build.Relids,
 		HashKeys:      keys,
 		Residual:      residual,
 		RequiredOuter: calcNonNestloopRequiredOuter(p, b),
@@ -162,7 +165,10 @@ func addNestLoopPath(joinRel, outer, inner *RelOptInfo, cp costParams, jt parser
 		Rows:     joinRel.Rows,
 		Cost:     cost,
 		Children: []*Path{o, i},
-		Residual: quals,
+		// R53 slice 1: the partition, in Children order.
+		OuterRelids: outer.Relids,
+		InnerRelids: inner.Relids,
+		Residual:    quals,
 		// A nested loop DISCHARGES an inner parameterised by the outer, so
 		// this is a subtraction, not a union (pathnode.c:2592).
 		RequiredOuter: calcNestloopRequiredOuter(outer.Relids, o.RequiredOuter, inner.Relids, i.RequiredOuter),

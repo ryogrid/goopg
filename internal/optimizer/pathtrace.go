@@ -76,11 +76,26 @@ func tracePath(rel *RelOptInfo, p *Path, producer string, partial bool, verdict 
 	// some lines but not others would need the reader to know which kinds are
 	// joins. Appended at the END of the record, after `verdict`, so a reader
 	// splitting on the existing key=value pairs keeps working unchanged.
-	fmt.Fprintf(os.Stderr,
-		"%s %s producer=%s relids=%s kind=%d reqouter=%s rows=%.0f startup=%.2f total=%.2f disabled=%d pathkeys=%s verdict=%s jointype=%s\n",
+	//
+	// R53 slice 1: the partition labels `outer`/`inner` follow jointype, under
+	// the same append-at-end rule — they name the two input relsets in
+	// Children order (Path.OuterRelids/InnerRelids), `-` on non-join paths.
+	// A DPPATH line still cannot key a DPTRACE pair by itself (bit positions,
+	// not names), but relSetBits is the same rendering both channels use, so
+	// the two join on it.
+	fmt.Fprint(os.Stderr, formatPathLine(list, rel, p, producer, pathkeys, verdict))
+}
+
+// formatPathLine renders one provenance record. Separated from `tracePath`
+// so the vocabulary (including the R53 slice-1 partition labels) is testable
+// without capturing stderr.
+func formatPathLine(list string, rel *RelOptInfo, p *Path, producer, pathkeys string, verdict pathVerdict) string {
+	return fmt.Sprintf(
+		"%s %s producer=%s relids=%s kind=%d reqouter=%s rows=%.0f startup=%.2f total=%.2f disabled=%d pathkeys=%s verdict=%s jointype=%s outer=%s inner=%s\n",
 		pathTraceTag, list, producer, relSetBits(rel.Relids), int(p.Kind),
 		relSetBits(p.RequiredOuter), p.Rows, p.Cost.Startup, p.Cost.Total,
-		p.DisabledNodes, pathkeys, verdict, strings.ToLower(joinTypeName(p.Jointype)))
+		p.DisabledNodes, pathkeys, verdict, strings.ToLower(joinTypeName(p.Jointype)),
+		relSetBits(p.OuterRelids), relSetBits(p.InnerRelids))
 }
 
 // relSetBits renders a RelSet as a stable, parseable member list. The trace has

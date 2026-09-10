@@ -1,6 +1,9 @@
 package optimizer
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 // TestPathTraceRecordsProducerAndVerdict pins take2 P0-11's contract: every
 // offered path produces exactly one record, naming the producer that offered it
@@ -72,5 +75,30 @@ func TestRelSetBitsIsParseable(t *testing.T) {
 		if got := relSetBits(tc.in); got != tc.want {
 			t.Errorf("relSetBits(%d) = %q, want %q", tc.in, got, tc.want)
 		}
+	}
+}
+
+// TestPathTraceRendersOuterInnerPartition pins R53 slice 1's instrument: a
+// join path's DPPATH line names the partition that produced it (the two input
+// relsets in Children order), so the L6 hash ladder attributes each offer to
+// a DPTRACE pair. A scan path renders both as `-` — the labels appear on
+// every line (C-03a's append-at-end rule), never only on joins.
+func TestPathTraceRendersOuterInnerPartition(t *testing.T) {
+	rel := &RelOptInfo{Relids: 0b111}
+	join := &Path{Kind: PathHashJoin, Rel: rel, Rows: 10,
+		Cost:        Cost{Startup: 1, Total: 10},
+		OuterRelids: 0b011, InnerRelids: 0b100}
+	line := formatPathLine("path", rel, join, "join.hash", "0", verdictAccepted)
+	if !strings.Contains(line, "outer={0,1} inner={2}") {
+		t.Errorf("join line missing partition labels:\n%s", line)
+	}
+	if !strings.HasSuffix(strings.TrimRight(line, "\n"), "inner={2}") {
+		t.Errorf("partition labels are not the trailing fields:\n%s", line)
+	}
+
+	scan := &Path{Kind: PathSeqScan, Rel: rel, Rows: 10, Cost: Cost{Total: 10}}
+	line = formatPathLine("path", rel, scan, "scan.seq", "0", verdictAccepted)
+	if !strings.Contains(line, "outer=- inner=-") {
+		t.Errorf("scan line missing empty partition labels:\n%s", line)
 	}
 }

@@ -324,7 +324,7 @@ func addMergeJoinPath(joinrel, outer, inner *RelOptInfo, cp costParams, jt parse
 	// sort keys ARE the result's pathkeys. The arm that consumes an ordering it
 	// did not choose (P5.4c-ii-c) passes a different pair, which is why
 	// `tryMergeJoinPath` takes the two separately.
-	tryMergeJoinPath(joinrel, o, i, cp, jt, outerKeys, outerKeys, innerKeys, mergeClauses, residual, mergeTuplesFor, scanSelFor, paramSrc)
+	tryMergeJoinPath(joinrel, o, i, outer.Relids, inner.Relids, cp, jt, outerKeys, outerKeys, innerKeys, mergeClauses, residual, mergeTuplesFor, scanSelFor, paramSrc)
 }
 
 // buildJoinPathkeys is the ONE rule of `build_join_pathkeys` (pathkeys.c:1295)
@@ -365,7 +365,7 @@ func buildJoinPathkeys(jt parser.JoinType, outerKeys []PathKey) []PathKey {
 // `outerSortKeys` / `innerSortKeys` are PG's `outersortkeys` / `innersortkeys`
 // with PG's NIL convention: an empty list means "this side needs no sort". The
 // explicit re-check below (:1091-1097) makes passing them harmless either way.
-func tryMergeJoinPath(joinrel *RelOptInfo, o, i *Path, cp costParams, jt parser.JoinType, resultKeys, outerSortKeys, innerSortKeys []PathKey, mergeClauses, residual []*restrictInfo, mergeTuplesFor func([]*restrictInfo) float64, scanSelFor func([]*restrictInfo) (float64, float64), paramSrc RelSet) {
+func tryMergeJoinPath(joinrel *RelOptInfo, o, i *Path, outerRelids, innerRelids RelSet, cp costParams, jt parser.JoinType, resultKeys, outerSortKeys, innerSortKeys []PathKey, mergeClauses, residual []*restrictInfo, mergeTuplesFor func([]*restrictInfo) float64, scanSelFor func([]*restrictInfo) (float64, float64), paramSrc RelSet) {
 	if o == nil || i == nil {
 		return
 	}
@@ -434,7 +434,11 @@ func tryMergeJoinPath(joinrel *RelOptInfo, o, i *Path, cp costParams, jt parser.
 		// P5.5's createPlan reads one layout for every join kind. When a side
 		// needed sorting the child IS the Sort path, so the Sort is a node in
 		// the tree rather than a flag on the join.
-		Children:      []*Path{op, ip},
+		Children: []*Path{op, ip},
+		// R53 slice 1: the partition, in Children order (relsets ride the
+		// caller's parameters — the candidate paths carry none).
+		OuterRelids:   outerRelids,
+		InnerRelids:   innerRelids,
 		HashKeys:      mergeClauses,
 		Residual:      residual,
 		RequiredOuter: req,

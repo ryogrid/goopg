@@ -198,7 +198,7 @@ func generateMergeJoinPaths(joinrel, inner *RelOptInfo, outerPath, innerCheapest
 	// evaluated nowhere — the truncation demotion only ever re-adds clauses cut
 	// from the ALREADY-trimmed list.
 	fullResidual := demoteUnmatchedGroupClauses(residual, groups, mergeClauses)
-	tryMergeJoinPath(joinrel, outerPath, innerCheapestTotal, cp, jt, resultKeys, nil, innerSortKeys, mergeClauses, fullResidual, mergeTuplesFor, scanSelFor, paramSrc)
+	tryMergeJoinPath(joinrel, outerPath, innerCheapestTotal, outerRelids, inner.Relids, cp, jt, resultKeys, nil, innerSortKeys, mergeClauses, fullResidual, mergeTuplesFor, scanSelFor, paramSrc)
 
 	// The truncation search (:1685-1782). `cheapestTotalInner` /
 	// `cheapestStartupInner` carry the best inner found SO FAR, and a candidate
@@ -232,7 +232,7 @@ func generateMergeJoinPaths(joinrel, inner *RelOptInfo, outerPath, innerCheapest
 				// Both sort-key lists are nil: the outer is ordered by
 				// construction and this inner was SELECTED for already being
 				// ordered, so neither side is sorted here.
-				tryMergeJoinPath(joinrel, outerPath, ip, cp, jt, resultKeys, nil, nil,
+				tryMergeJoinPath(joinrel, outerPath, ip, outerRelids, inner.Relids, cp, jt, resultKeys, nil, nil,
 					newClauses, demoteDroppedMergeClauses(fullResidual, mergeClauses, newClauses), mergeTuplesFor, scanSelFor, paramSrc)
 			}
 			cheapestTotalInner = ip
@@ -249,7 +249,7 @@ func generateMergeJoinPaths(joinrel, inner *RelOptInfo, outerPath, innerCheapest
 					newClauses = trimmedMergeClauses(mergeClauses, trial, cnt, numSortKeys, outerRelids)
 				}
 				if len(newClauses) > 0 {
-					tryMergeJoinPath(joinrel, outerPath, ip, cp, jt, resultKeys, nil, nil,
+					tryMergeJoinPath(joinrel, outerPath, ip, outerRelids, inner.Relids, cp, jt, resultKeys, nil, nil,
 						newClauses, demoteDroppedMergeClauses(fullResidual, mergeClauses, newClauses), mergeTuplesFor, scanSelFor, paramSrc)
 				}
 			}
@@ -322,7 +322,7 @@ func matchUnsortedOuterMergePartial(s *searchCtx, joinrel, outer, inner *RelOptI
 		if i == nil {
 			continue
 		}
-		tryPartialMergeJoinPath(s, joinrel, op, i, cp, jt, op.Pathkeys, nil, innerSortKeys,
+		tryPartialMergeJoinPath(s, joinrel, op, i, outer.Relids, inner.Relids, cp, jt, op.Pathkeys, nil, innerSortKeys,
 			mergeClauses, fullResidual, mergeTuplesFor, scanSelFor, paramSrc)
 	}
 }

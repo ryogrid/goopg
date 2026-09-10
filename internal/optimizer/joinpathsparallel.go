@@ -186,8 +186,11 @@ func addPartialHashJoinPath(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp 
 		Cost:          cost,
 		DisabledNodes: disabledNodesFor(!cp.enableHashJoin, o, i),
 		Children:      []*Path{o, i},
-		HashKeys:      keys,
-		Residual:      residual,
+		// R53 slice 1: the partition, in Children order.
+		OuterRelids: outer.Relids,
+		InnerRelids: inner.Relids,
+		HashKeys:    keys,
+		Residual:    residual,
 		// "A hashjoin never has pathkeys" (pathnode.c:2879).
 		Pathkeys:      nil,
 		RequiredOuter: 0,
@@ -265,7 +268,7 @@ func addPartialMergeJoinPath(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp
 	if i == nil {
 		return
 	}
-	tryPartialMergeJoinPath(s, joinrel, o, i, cp, jt, resultKeys, outerSortKeys, innerSortKeys,
+	tryPartialMergeJoinPath(s, joinrel, o, i, outer.Relids, inner.Relids, cp, jt, resultKeys, outerSortKeys, innerSortKeys,
 		mergeClauses, residual, mergeTuplesFor, scanSelFor, paramSrc)
 }
 
@@ -293,7 +296,7 @@ func addPartialMergeJoinPath(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp
 //   - ParallelAware is false: there is no shared prebuild for merge (each
 //     worker sorts and reads the whole inner itself), so the flag whose
 //     whole machinery is the hash twin's sharing protocol is not set.
-func tryPartialMergeJoinPath(s *searchCtx, joinrel *RelOptInfo, o, i *Path, cp costParams, jt parser.JoinType,
+func tryPartialMergeJoinPath(s *searchCtx, joinrel *RelOptInfo, o, i *Path, outerRelids, innerRelids RelSet, cp costParams, jt parser.JoinType,
 	resultKeys, outerSortKeys, innerSortKeys []PathKey, mergeClauses, residual []*restrictInfo,
 	mergeTuplesFor func([]*restrictInfo) float64, scanSelFor func([]*restrictInfo) (float64, float64),
 	paramSrc RelSet) {
@@ -354,8 +357,12 @@ func tryPartialMergeJoinPath(s *searchCtx, joinrel *RelOptInfo, o, i *Path, cp c
 		Cost:          cost,
 		DisabledNodes: disabledNodesFor(!cp.enableMergeJoin, o, i),
 		Children:      []*Path{o, i},
-		HashKeys:      mergeClauses,
-		Residual:      residual,
+		// R53 slice 1: the partition, in Children order (relsets ride the
+		// caller's parameters — the candidate paths carry none).
+		OuterRelids: outerRelids,
+		InnerRelids: innerRelids,
+		HashKeys:    mergeClauses,
+		Residual:    residual,
 		// `build_join_pathkeys` of the delivered ordering (joinpath.c:1932
 		// at the unsorted site; the loop's own ordering at site 1) — NOT
 		// nil like the hash twin ("a hashjoin never has pathkeys",
