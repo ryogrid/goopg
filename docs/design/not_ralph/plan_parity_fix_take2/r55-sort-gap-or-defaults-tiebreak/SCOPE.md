@@ -93,7 +93,13 @@ Extension point is `orConjunctSelectivity`
   1468); must-hold = `TestOrJoinSelectivityMeasuredArms` and
   `TestCalcJoinrelSizeOrJoinClauseMeasured` green unchanged. A
   landing above 94 or at/above 133 FAILS the prediction (no
-  "toward" credit for mere downward movement).
+  "toward" credit for mere downward movement). Bar-retirement
+  note (review R55): 26 sits 2 rows above the 24 floor, and the
+  ledgered general-ANY follow-up pushes the same direction
+  (down) — once general-ANY lands, sub-24 is the EXPECTED
+  outcome and this 24–94 bar is retired, not violated; a future
+  round must not misread an out-of-bar-low result as a
+  regression.
 
 ## 3. Q8 sorted-vs-split tie-break (follows §1)
 

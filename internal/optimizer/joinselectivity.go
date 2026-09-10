@@ -463,14 +463,13 @@ func (s *searchCtx) orArmSelectivity(arm Expr) (float64, bool) {
 // two aliases of one table — Q7's `n1.n_name`/`n2.n_name` case exactly —
 // while the index the clause builder resolved at build time does not.
 //
-// Shapes with no restriction estimator here (non-equality comparisons,
-// multi-relation conjuncts, unattributable columns, CTE/subquery sides with
-// no recorded identity) keep today's whole-OR default contribution
-// (`defaultUnhandledClauseSel`, a guess) rather than inventing a number. That
-// is deliberately more conservative than PG, which prices e.g. a single-side
-// inequality through `scalarineqsel`; each such shape is an independent,
-// falsifiable follow-up, and the guess flag keeps the fallback clamp on while
-// any of them is present.
+// Shapes with no restriction estimator here (multi-relation conjuncts,
+// unattributable columns, CTE/subquery sides with no recorded identity,
+// general-ANY lists) keep today's whole-OR default contribution
+// (`defaultUnhandledClauseSel`, a guess) rather than inventing a number.
+// Each such shape is an independent, falsifiable follow-up, and the guess
+// flag keeps the fallback clamp available while any of them is present
+// (the clamp itself fires only on an all-default estimate).
 func (s *searchCtx) orConjunctSelectivity(c Expr) (float64, bool) {
 	if bc, ok := c.(*BooleanConst); ok {
 		if bc.Value {
@@ -478,10 +477,27 @@ func (s *searchCtx) orConjunctSelectivity(c Expr) (float64, bool) {
 		}
 		return 0.0, false
 	}
+	if ie, ok := c.(*InExpr); ok {
+		return s.orInListSelectivity(ie)
+	}
 	bo, ok := c.(*BinaryOp)
-	if !ok || (bo.Op != parser.OpEq && bo.Op != parser.OpNe) {
+	if !ok {
 		return defaultUnhandledClauseSel, true
 	}
+	switch bo.Op {
+	case parser.OpEq, parser.OpNe:
+		return s.orEqualitySelectivity(bo)
+	case parser.OpLt, parser.OpLe, parser.OpGt, parser.OpGe:
+		return s.orRangeSelectivity(bo)
+	default:
+		return defaultUnhandledClauseSel, true
+	}
+}
+
+// orEqualitySelectivity is the R54 equality arm, extracted unchanged: a
+// single-side `col = const` reads that column's own statistics through
+// `eqSelectivityForColumn`, the same primitive the restriction path uses.
+func (s *searchCtx) orEqualitySelectivity(bo *BinaryOp) (float64, bool) {
 	col, val, ok := normalizeColumnConst(bo.Left, bo.Right)
 	if !ok || col.Name == "" {
 		return defaultUnhandledClauseSel, true
@@ -501,6 +517,105 @@ func (s *searchCtx) orConjunctSelectivity(c Expr) (float64, bool) {
 		sel = clampSelectivity(1.0 - sel)
 	}
 	return sel, stats == nil
+}
+
+// orRangeSelectivity prices one single-side `col <op> const` OR-arm
+// conjunct (`< <= > >=`) as a restriction — PG's `scalarineqsel`
+// (selfuncs.c:588) through `restriction_selectivity`, which is where a
+// single-side member of an OR lands when `treat_as_join_clause`
+// declines it. Attribution is the same positional `SourceTableIdx` →
+// `relInfos[].sourceIdx` translation the equality arm uses; the
+// measurement itself is `rangeOpSelectivityStats`, the stats-first
+// core of the restriction path's inequality estimator, so the two
+// paths price one shape with one arithmetic. Shapes with no
+// measurement keep the whole-OR default contribution as a guess.
+func (s *searchCtx) orRangeSelectivity(bo *BinaryOp) (float64, bool) {
+	col, val, swapped, ok := normalizeColumnConstRange(bo.Left, bo.Right)
+	if !ok || col.Name == "" {
+		return defaultUnhandledClauseSel, true
+	}
+	op := bo.Op
+	if swapped {
+		op = swapInequalityOp(op)
+	}
+	i, ok := s.relPosForSource(col.SourceTableIdx)
+	if !ok || s.relInfos[i].table == nil {
+		return defaultUnhandledClauseSel, true
+	}
+	stats := columnStatsByName(s.relInfos[i].table, col.Name)
+	if sel, measured := rangeOpSelectivityStats(op, col, val, stats); measured {
+		return sel, false
+	}
+	return defaultUnhandledClauseSel, true
+}
+
+// orInListSelectivity prices one single-side `col IN (consts)` OR-arm
+// conjunct as a restriction — PG's `scalararraysel`
+// (selfuncs.c:1824) with `is_join_clause=false`: the element
+// operator's own estimator per element, merged OR-wise with the
+// disjoint-sum refinement for equality. The merge loop mirrors
+// `inListSelectivity` element for element (sibling-paths rule: the
+// two loops price one shape and change together); only the inputs
+// differ, stats-first here versus child-indexed there. Accepted:
+// plain IN / `= ANY` over an all-constant list, plus range-`ANY`
+// over constants through the same inequality core. Declined as a
+// guess: NOT IN (`Negated`), `ALL`, `!= ANY`, `<> ANY`, LIKE
+// elements, subquery `Plan` sources, and any non-constant element —
+// the general-ANY shapes where goopg's `InExpr` diverges most from
+// PG's Const-array deconstruction (R55 scope §2, ledgered
+// follow-up).
+func (s *searchCtx) orInListSelectivity(e *InExpr) (float64, bool) {
+	decline := func() (float64, bool) { return defaultUnhandledClauseSel, true }
+	if e.Negated || e.AllOp || e.NotEqualAny || e.Plan != nil {
+		return decline()
+	}
+	cr, ok := e.Operand.(*ColumnRef)
+	if !ok || cr.Name == "" {
+		return decline()
+	}
+	isEquality := e.AnyOp == 0 || e.AnyOp == parser.OpEq
+	isRange := e.AnyOp == parser.OpLt || e.AnyOp == parser.OpLe ||
+		e.AnyOp == parser.OpGt || e.AnyOp == parser.OpGe
+	if !isEquality && !isRange {
+		return decline()
+	}
+	i, ok := s.relPosForSource(cr.SourceTableIdx)
+	if !ok || s.relInfos[i].table == nil {
+		return decline()
+	}
+	stats := columnStatsByName(s.relInfos[i].table, cr.Name)
+	if stats == nil {
+		return decline()
+	}
+	tuples := float64(s.relInfos[i].baseRows)
+	s1 := 0.0
+	s1disjoint := 0.0
+	for _, elem := range e.List {
+		if !isConstExpr(elem) {
+			return decline()
+		}
+		var s2 float64
+		if isEquality {
+			s2 = eqSelectivityForColumn(stats, elem, tuples)
+		} else {
+			var measured bool
+			if s2, measured = rangeOpSelectivityStats(e.AnyOp, cr, elem, stats); !measured {
+				return decline()
+			}
+		}
+		s1 = s1 + s2 - s1*s2
+		if isEquality {
+			s1disjoint += s2
+		}
+	}
+	// The equality-ANY disjoint sum, accepted exactly when
+	// `inListSelectivity` accepts it (in [0,1]). The final clamp is
+	// `clampProbability`, not `clampSelectivity`, so the mirror is
+	// exact down to the NaN policy (NaN→0, as in `inListSelectivity`).
+	if isEquality && s1disjoint >= 0.0 && s1disjoint <= 1.0 {
+		s1 = s1disjoint
+	}
+	return clampProbability(s1), false
 }
 
 // relPosForSource is the `ColumnRef.SourceTableIdx` → search-rel translation

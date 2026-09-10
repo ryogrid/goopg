@@ -313,12 +313,30 @@ func rangeOpSelectivity(op parser.OpCode, left, right Expr, child Node) float64 
 		op = swapInequalityOp(op)
 	}
 	stats := columnStatsForChild(col.Index, child)
+	if sel, measured := rangeOpSelectivityStats(op, col, val, stats); measured {
+		return sel
+	}
+	return defaultIneqSelectivity
+}
+
+// rangeOpSelectivityStats is the stats-first core of
+// `rangeOpSelectivity`: the MCV satisfied-mass plus
+// `histogramOpSelectivity` over the non-MCV mass — PG's
+// `scalarineqsel` (selfuncs.c:588) arithmetic — but over
+// caller-attributed statistics instead of a child-plan lookup. The
+// restriction path (which has a child Node) and the OR-join arm
+// (which has only search relInfos) price one shape with this one
+// body; sibling-paths rule: the two callers change together.
+// ok=false when the shape carries no measurement (no statistics, a
+// short histogram, or a non-constant) and the caller keeps its own
+// default.
+func rangeOpSelectivityStats(op parser.OpCode, col *ColumnRef, val Expr, stats *catalog.ColumnStats) (float64, bool) {
 	if stats == nil || len(stats.Histogram) < 2 {
-		return defaultIneqSelectivity
+		return 0, false
 	}
 	literal, ok := formatExprConstant(val)
 	if !ok {
-		return defaultIneqSelectivity
+		return 0, false
 	}
 
 	// Histogram covers the non-MCV mass.
@@ -346,12 +364,12 @@ func rangeOpSelectivity(op parser.OpCode, left, right Expr, child Node) float64 
 	histSel := histogramOpSelectivity(op, stats.Histogram, literal, col.Type.Name)
 	sel := mcvHits + histSel*nonMCVMass
 	if sel < 0 {
-		return 0
+		return 0, true
 	}
 	if sel > 1 {
-		return 1
+		return 1, true
 	}
-	return sel
+	return sel, true
 }
 
 // histogramOpSelectivity returns the fraction of the histogram's

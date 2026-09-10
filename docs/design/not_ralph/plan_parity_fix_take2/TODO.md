@@ -3376,3 +3376,17 @@ ONLY; tie-break calibration LEDGERED and ORDERED after the R56
 `cost_agg` audit. P1/P2 withdrawn; P3 live with numeric bar
 (133 → 24–94, Q7 pins bit-exact).
 Next: R55 implementation — §2 OR-conjunct inequality + IN-list arms.
+R55 implementation LANDED 2026-09-11 (`r55-sort-gap-or-defaults-tiebreak/
+REPORT.md`, review APPROVE-WITH-NOTES, 3 notes, all applied):
+`rangeOpSelectivityStats` extracted verbatim (stats-first core) +
+`orRangeSelectivity` / `orInListSelectivity` arms (general ANY
+declines as guesses, clamp stays armed; NaN policy mirrors
+`inListSelectivity` via `clampProbability`). P3 LANDS 133→26
+(inside 24–94, shape-identical, trace-attributed); Q7/Q8/Q5/Q1/Q3/
+Q9/Q10 plans byte-identical; values 8/8; Q12=2/Q13=34; q84-ds05
+byte-identical; DS SF0.5 sweep PASS=95 all-zero; parity-diff
+verdict unchanged, unparsed=0. Residual (26 vs ~47 anchor,
+general-ANY, Q8 tie-break) ledgered; §3 calibration still ordered
+after the R56 `costAgg` audit. Evidence tmp-only `/tmp/pp2/r55/`.
+Next: R56-candidate audit — `costAgg` sorted grouping-comparison
+term (SCOPE §1 lead) — needs its own scope round first.
