@@ -81,6 +81,10 @@ func (s *searchCtx) setBaseRelConsiderParallel(cat catalog.Catalog) {
 		if s.parallelModeOK && i < len(s.relInfos) {
 			rel.ConsiderParallel = relConsiderParallel(rel.baseLeaf, s.relInfos[i].table, cat)
 		}
+		// R54 Step-0: the S1 leaf record. Same searchCtx that owns the
+		// trace (relfromjoinlist.go), so the line lands in the problem's
+		// own block; nil-safe when the gate is off.
+		s.trace.baseCP(rel.Relids, rel.baseLeaf, rel.ConsiderParallel)
 		// The prebuilt path predates the flag (see above). Every path on the
 		// rel at this point is a base-rel scan with no children, so the stamp
 		// is exact for all of them.
@@ -380,12 +384,22 @@ func joinrelConsiderParallel(s *searchCtx, rel1, rel2 *RelOptInfo, clauses []*re
 	if s == nil || !s.parallelModeOK || !rel1.ConsiderParallel || !rel2.ConsiderParallel {
 		return false
 	}
-	for _, ri := range clauses {
-		if ri == nil || !isParallelSafeExpr(ri.clause, s.cat) {
-			return false
+	return firstParallelUnsafeClause(clauses, s.cat) < 0
+}
+
+// firstParallelUnsafeClause is the clause-walk half of
+// joinrelConsiderParallel, extracted so R54 Step-0's admission record names
+// the failing clause through the SAME predicate the verdict uses — a separate
+// walk here would be a second implementation that could disagree with the
+// flag. Returns the first failing index, or -1 when every clause is safe.
+// Behaviour of the caller is unchanged: the loop above is this predicate.
+func firstParallelUnsafeClause(clauses []*restrictInfo, cat catalog.Catalog) int {
+	for i, ri := range clauses {
+		if ri == nil || !isParallelSafeExpr(ri.clause, cat) {
+			return i
 		}
 	}
-	return true
+	return -1
 }
 
 // isParallelSafeExpr is `is_parallel_safe` (clauses.c:706) reduced to the

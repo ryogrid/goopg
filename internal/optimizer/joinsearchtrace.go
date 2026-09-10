@@ -39,6 +39,8 @@ import (
 	"os"
 	"sort"
 	"strings"
+
+	"github.com/goopg/goopg/internal/catalog"
 )
 
 // dpTrace gates the enumeration trace. Read once at process start so a plan
@@ -118,6 +120,10 @@ type searchTrace struct {
 	pairs    []tracePair
 	declined []tracePair
 	costs    []traceCost
+	// R54 Step-0's admission records (admit/baseCP/gather above), rendered
+	// after the cost lines in one problem's block.
+	cpAdmits []traceCP
+	gathers  []traceGather
 	top      RelSet
 	failed   string
 }
@@ -323,6 +329,135 @@ func cheapestTotal(rel *RelOptInfo) float64 {
 	return rel.CheapestTotal.Cost.Total
 }
 
+// traceCP is R54 Step-0's admission record: one joinrel's or base rel's
+// ConsiderParallel verdict with the inputs that decided it. For a joinrel the
+// record carries both input flags (S1 propagation reads off in1/in2) and the
+// first clause that fails the walk (S2 reads off failidx/failkind); for a base
+// rel it carries the leaf kind the `relConsiderParallel` arm below saw (S1 at
+// the leaves). Recorded at build time, inside the block, so the death level
+// is read off one problem's lines without correlating across statements.
+type traceCP struct {
+	src      string // "join" or "base"
+	rel      RelSet
+	cp       bool
+	in1, in2 bool   // join only: the two inputs' flags
+	nclauses int    // join only
+	failidx  int    // join only: first failing clause, -1 when admitted
+	failkind string // join only: %T of the failing clause expr, "" when admitted
+	leaf     string // base only: traceLeafKind of the rel's leaf
+}
+
+// traceGather is one `generateUsefulGatherPaths` decision: the rel, how many
+// partial paths stood for election, and which gate admitted or refused. S4's
+// "generated but lost" vs "never generated" separation reads off partials +
+// verdict together with the `cost` line's cheapest kind.
+type traceGather struct {
+	rel      RelSet
+	partials int
+	verdict  string // "no-partials" | "no-parallel-mode" | "no-cp" | "mode" | "admitted"
+}
+
+// admit records a newly built joinrel's admission verdict. The VERDICT passed
+// in is authoritative — it is the flag `makeJoinRel` just stamped, computed by
+// `joinrelConsiderParallel` itself. Only the S2 explanation (which clause)
+// re-walks, through `firstParallelUnsafeClause`, the same helper the verdict
+// loop is written on, with the same cat — so the name cannot disagree with
+// the flag about what failed. Nil-receiver safe like cost/offer/decline.
+func (t *searchTrace) admit(rel RelSet, cp, in1, in2 bool, clauses []*restrictInfo, cat catalog.Catalog) {
+	if t == nil {
+		return
+	}
+	failidx, failkind := -1, ""
+	if i := firstParallelUnsafeClause(clauses, cat); i >= 0 {
+		failidx = i
+		failkind = fmt.Sprintf("%T", clauseExprForTrace(clauses[i]))
+	}
+	t.cpAdmits = append(t.cpAdmits, traceCP{
+		src: "join", rel: rel, cp: cp, in1: in1, in2: in2,
+		nclauses: len(clauses), failidx: failidx, failkind: failkind,
+	})
+}
+
+// clauseExprForTrace unwraps one restrictInfo for %T naming. A nil entry (the
+// verdict loop vetoes it outright) has no expr; it names itself.
+func clauseExprForTrace(ri *restrictInfo) any {
+	if ri == nil {
+		return "nil-clause"
+	}
+	return ri.clause
+}
+
+// baseCP records one base rel's admission verdict with the leaf kind the
+// `relConsiderParallel` arm saw. Called from `setBaseRelConsiderParallel`,
+// which runs on the same searchCtx that owns this trace (relfromjoinlist.go),
+// so the line lands in the problem's own block.
+func (t *searchTrace) baseCP(rel RelSet, leaf Node, cp bool) {
+	if t == nil {
+		return
+	}
+	t.cpAdmits = append(t.cpAdmits, traceCP{
+		src: "base", rel: rel, cp: cp, leaf: traceLeafKind(leaf),
+	})
+}
+
+// traceLeafKind renders a base leaf's kind in `relConsiderParallel`'s own
+// vocabulary: Filter wrappers peeled exactly as the verdict peels them, then
+// the type-switch arm names. A kind the verdict does not enumerate renders
+// "other" — the verdict fails closed there, and so does the name. Leaf kinds
+// outside this list (UserSrfScan, GenerateSeries, ScalarFuncScan, catalog
+// SRFs) all render "other": that is a deliberate display gap, not a verdict —
+// read the cp flag, not the leaf name, for those.
+func traceLeafKind(leaf Node) string {
+	base := leaf
+	for {
+		f, ok := base.(*Filter)
+		if !ok || f.Child == nil {
+			break
+		}
+		base = f.Child
+	}
+	switch base.(type) {
+	case *SeqScan:
+		return "seq"
+	case *IndexScan:
+		return "idx"
+	case *IndexOnlyScan:
+		return "idxonly"
+	case *BitmapHeapScan:
+		return "bitmap"
+	case *CTEScan, *MaterializedCTEScan:
+		return "cte"
+	case *Values:
+		return "values"
+	default:
+		return "other"
+	}
+}
+
+// gather records one `generateUsefulGatherPaths` decision. Nil-receiver safe;
+// the call site passes the verdict constant for the gate that fired, so the
+// record cannot drift from the decision.
+func (t *searchTrace) gather(rel RelSet, partials int, verdict string) {
+	if t == nil {
+		return
+	}
+	t.gathers = append(t.gathers, traceGather{rel: rel, partials: partials, verdict: verdict})
+}
+
+// traceUpperGate is the S3 line: one post-pass tournament's verdict, where
+// the search trace cannot reach. The partial-agg / partial-sort tournaments
+// run post-cache over finished Nodes (no searchCtx in scope, after the
+// problem block has emitted), so this is a standalone stderr line in
+// `traceSeamDecline`'s style rather than a block member — Step-0 runs one
+// statement at a time, so log proximity correlates it. `detail` is
+// space-separated key=value pairs (workers, divisor, mode).
+func traceUpperGate(gate, verdict, detail string) {
+	if !dpTraceEnabled() {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "%s upper gate=%s verdict=%s %s\n", traceTag, gate, verdict, detail)
+}
+
 // Trace line vocabulary. One block per join problem, framed by `problem` and
 // `end`, so a reader can tell a truncated block from a complete one and so two
 // backends' blocks cannot be confused for one (the whole block is written with
@@ -333,7 +468,14 @@ const (
 	tracePairTag = traceTag + " pair"
 	traceDecline = traceTag + " decline"
 	traceCostTag = traceTag + " cost"
-	traceEnd     = traceTag + " end"
+	// R54 Step-0's admission lines (cpAdmits/gathers above) plus the
+	// standalone post-pass line (traceUpperGate). All three are recognised
+	// (not Malformed) by the enumtrace parser; see its cpadmit/cpgather/upper
+	// cases.
+	traceCPAdmitTag = traceTag + " cpadmit"
+	traceGatherTag  = traceTag + " cpgather"
+	traceUpperTag   = traceTag + " upper"
+	traceEnd        = traceTag + " end"
 )
 
 // render formats the whole block. Separated from `emit` so the format is
@@ -354,6 +496,24 @@ func (t *searchTrace) render() string {
 		fmt.Fprintf(&b, "%s lev=%d rel=%s rows=%g npaths=%d cheapest=%s reqouter=%s total=%g second=%s secondtotal=%g\n",
 			traceCostTag, c.level, t.relsetName(c.rel), c.rows, c.paths, c.kind,
 			t.relsetName(c.reqouter), c.total, c.second, c.secondTotal)
+	}
+	for _, c := range t.cpAdmits {
+		if c.src == "base" {
+			fmt.Fprintf(&b, "%s src=base rel=%s cp=%d leaf=%s\n",
+				traceCPAdmitTag, t.relsetName(c.rel), boolBit(c.cp), c.leaf)
+			continue
+		}
+		failkind := c.failkind
+		if failkind == "" {
+			failkind = "none"
+		}
+		fmt.Fprintf(&b, "%s src=join rel=%s cp=%d in1=%d in2=%d nclauses=%d failidx=%d failkind=%s\n",
+			traceCPAdmitTag, t.relsetName(c.rel), boolBit(c.cp),
+			boolBit(c.in1), boolBit(c.in2), c.nclauses, c.failidx, failkind)
+	}
+	for _, g := range t.gathers {
+		fmt.Fprintf(&b, "%s rel=%s partials=%d verdict=%s\n",
+			traceGatherTag, t.relsetName(g.rel), g.partials, g.verdict)
 	}
 	status := "ok"
 	if t.failed != "" {

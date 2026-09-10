@@ -650,6 +650,12 @@ func (s *searchCtx) makeJoinRel(rel1, rel2 *RelOptInfo) (*RelOptInfo, error) {
 		// `joinrel->consider_parallel` (relnode.c:842): both inputs AND the
 		// join's own clauses parallel-safe. C-19a (considerparallel.go).
 		joinrel.ConsiderParallel = joinrelConsiderParallel(s, rel1, rel2, clauses)
+		// R54 Step-0: the admission record for the S1/S2 separation. Inside
+		// the created branch, so first-writer-wins matches the trace's
+		// `created` semantics above; later pairs spanning this relset reuse
+		// the flag. Nil-safe — a no-op when the trace gate is off.
+		s.trace.admit(joinrel.Relids, joinrel.ConsiderParallel,
+			rel1.ConsiderParallel, rel2.ConsiderParallel, clauses, s.cat)
 		if err := s.addRel(joinrel); err != nil {
 			return nil, err
 		}

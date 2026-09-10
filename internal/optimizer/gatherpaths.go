@@ -139,22 +139,42 @@ func SetGatherPathsMode(label string) (restore func()) {
 // paths returns at the first line, as upstream does.
 func (s *searchCtx) generateUsefulGatherPaths(rel *RelOptInfo) {
 	if s == nil || rel == nil || len(rel.PartialPathlist) == 0 {
+		// R54 Step-0: S4's "never generated" arm. Reachable with s and rel
+		// non-nil (empty partial list); the nil cases have no relset to name.
+		if s != nil && rel != nil {
+			s.trace.gather(rel.Relids, 0, "no-partials")
+		}
 		return
 	}
-	if !s.parallelModeOK || !rel.ConsiderParallel {
+	// R54 Step-0: the S0/S1 split. Upstream's single gate is two verdicts
+	// here with identical behaviour — both arms still refuse — so the trace
+	// can tell "session closed" from "this rel closed".
+	if !s.parallelModeOK {
+		s.trace.gather(rel.Relids, len(rel.PartialPathlist), "no-parallel-mode")
+		return
+	}
+	if !rel.ConsiderParallel {
 		// Belt-and-braces: `addPartialPath` already refuses to file a path on a
 		// rel that does not consider parallel, so an entry here means the flag
 		// was cleared afterwards. Refusing fails closed.
+		s.trace.gather(rel.Relids, len(rel.PartialPathlist), "no-cp")
 		return
 	}
 	switch gatherPathsMode {
 	case gatherPathsOff:
+		s.trace.gather(rel.Relids, len(rel.PartialPathlist), "mode")
 		return
 	case gatherPathsTop:
 		if relLevel(rel.Relids) != s.nrels {
+			s.trace.gather(rel.Relids, len(rel.PartialPathlist), "mode")
 			return
 		}
 	}
+	// Gates passed: "admitted" means candidacy, not victory — whether a Gather
+	// path was filed and won reads off the `cost` line's cheapest kind. This
+	// separation is what makes S4's "generated but lost" distinguishable from
+	// "never generated".
+	s.trace.gather(rel.Relids, len(rel.PartialPathlist), "admitted")
 
 	// "The output of Gather is always unsorted, so there's only one partial
 	// path of interest: the cheapest one. That will be the one at the front of

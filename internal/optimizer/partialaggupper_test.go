@@ -7,6 +7,10 @@ package optimizer
 // before reading any verdict off it.
 
 import (
+	"bufio"
+	"io"
+	"os"
+	"strings"
 	"testing"
 )
 
@@ -271,5 +275,88 @@ func TestStripGatherFoldsASplitAggregateBack(t *testing.T) {
 	// And the enforcement path callers actually take.
 	if got := MaybeAddGather(node, ParallelSettings{MaxWorkersPerGather: 0}); got == node {
 		t.Error("MaybeAddGather returned a parallel plan for a session with max_parallel_workers_per_gather = 0")
+	}
+}
+
+// captureUpperSplit runs the producer the way `createGroupingPaths` does with
+// the DP trace forced on and returns the split path plus the one `upper` line
+// it wrote to stderr. `captureTracePath`'s shape (pathjointype_test.go): the
+// gate is process-global by design, so the test pins and restores it.
+func captureUpperSplit(t *testing.T, agg *Aggregate, ps PlannerSettings) (*Path, string) {
+	t.Helper()
+	enableDPTrace(t)
+	oldErr := os.Stderr
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+	os.Stderr = w
+	_, split := addSplitFor(t, agg, ps)
+	os.Stderr = oldErr
+	if err := w.Close(); err != nil {
+		t.Fatalf("close pipe: %v", err)
+	}
+	line, err := bufio.NewReader(r).ReadString('\n')
+	if err != nil && err != io.EOF {
+		t.Fatalf("read trace: %v", err)
+	}
+	if err := r.Close(); err != nil {
+		t.Fatalf("close read end: %v", err)
+	}
+	return split, strings.TrimSpace(line)
+}
+
+// TestUpperSplitAdmitsWithTraceLine: R54 Step-0's S3 record for the upper-rel
+// route. TPC-H Q1's shape admits with a split candidate AND emits
+// `gate=agg-upper verdict=split` — the positive control the measurement reads
+// Q5/Q84's refusals against. Gate name "agg-upper" keeps this producer
+// distinct from the post-pass "agg" consumer: independent verdicts over the
+// same aggregate that must never be conflated.
+func TestUpperSplitAdmitsWithTraceLine(t *testing.T) {
+	restore := setPartialAggPathsModeForTest(partialAggPathsOn)
+	defer restore()
+
+	agg := sizedAggFixture(t, 5_900_000, 2, 8, 2) // TPC-H Q1's shape
+	split, line := captureUpperSplit(t, agg, upperSplitSettings())
+	if split == nil {
+		t.Fatal("no Finalize->Gather->Partial candidate on the GROUP_AGG rel")
+	}
+	for _, want := range []string{"DPTRACE upper gate=agg-upper verdict=split", "workers=", "divisor="} {
+		if !strings.Contains(line, want) {
+			t.Errorf("upper line missing %q: %q", want, line)
+		}
+	}
+}
+
+// TestUpperSplitModeRefusalWithTraceLine: with the knob off the producer files
+// nothing and the line says which gate refused — a silent nil would leave
+// Step-0 unable to tell "mode off" from "subtree unusable".
+func TestUpperSplitModeRefusalWithTraceLine(t *testing.T) {
+	restore := setPartialAggPathsModeForTest(partialAggPathsOff)
+	defer restore()
+
+	agg := sizedAggFixture(t, 5_900_000, 2, 8, 2)
+	split, line := captureUpperSplit(t, agg, upperSplitSettings())
+	if split != nil {
+		t.Fatal("producer filed a candidate with the knob off")
+	}
+	if want := "DPTRACE upper gate=agg-upper verdict=refused gate=mode"; line != want {
+		t.Errorf("upper line = %q, want %q", line, want)
+	}
+}
+
+// TestUpperSplitVerdictNames: the admitted shape vocabulary — "split" files
+// the Finalize->Gather->Partial candidate, "nosplit" files only the gathered
+// no-split arms (an unsplittable aggregate still admits the round; cost
+// adjudication downstream decides, not this producer).
+func TestUpperSplitVerdictNames(t *testing.T) {
+	if got := upperSplitVerdict(&Path{}); got != "split" {
+		t.Errorf("upperSplitVerdict(non-nil) = %q, want split", got)
+	}
+	if got := upperSplitVerdict(nil); got != "nosplit" {
+		t.Errorf("upperSplitVerdict(nil) = %q, want nosplit", got)
+	}
+	if got := upperSplitDetail(4, 2.5); got != "workers=4 divisor=2.5" {
+		t.Errorf("upperSplitDetail = %q, want workers=4 divisor=2.5", got)
 	}
 }

@@ -306,3 +306,121 @@ func TestTracePathKindLabels(t *testing.T) {
 		}
 	}
 }
+
+// TestTraceCPAdmitJoinAndVeto: R54 Step-0's S1/S2 records. An admitted joinrel
+// carries its inputs' flags, the clause count, and failidx=-1 with the "none"
+// default; a vetoed one names the first failing clause by %T — the S2
+// explanation Step-0 reads, computed through `firstParallelUnsafeClause`, the
+// same helper the verdict loop is written on, so the name cannot disagree with
+// the flag.
+func TestTraceCPAdmitJoinAndVeto(t *testing.T) {
+	enableDPTrace(t)
+	s := traceCtx(t, "a", "b")
+	s.trace.admit(0b011, true, true, true, jslClauses(0b011).all, s.cat)
+	veto := []*restrictInfo{{relids: 0b011, ecID: noEquivClass, clause: &OuterColumnRef{}}}
+	s.trace.admit(0b011, false, true, true, veto, s.cat)
+	if len(s.trace.cpAdmits) != 2 {
+		t.Fatalf("cpadmit records = %d, want 2", len(s.trace.cpAdmits))
+	}
+	a := s.trace.cpAdmits[0]
+	if !a.cp || !a.in1 || !a.in2 || a.nclauses != 1 || a.failidx != -1 || a.failkind != "" {
+		t.Errorf("admitted record wrong: %+v", a)
+	}
+	v := s.trace.cpAdmits[1]
+	if v.cp || v.failidx != 0 || v.failkind != "*optimizer.OuterColumnRef" {
+		t.Errorf("veto record wrong: %+v", v)
+	}
+	out := s.trace.render()
+	for _, want := range []string{
+		"DPTRACE cpadmit src=join rel={a+b} cp=1 in1=1 in2=1 nclauses=1 failidx=-1 failkind=none",
+		"DPTRACE cpadmit src=join rel={a+b} cp=0 in1=1 in2=1 nclauses=1 failidx=0 failkind=*optimizer.OuterColumnRef",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("rendered block missing %q:\n%s", want, out)
+		}
+	}
+}
+
+// TestTraceCPAdmitNilClause: the verdict loop vetoes a nil restrictInfo
+// outright; the record names it "nil-clause" rather than panicking on %T of
+// nothing. %T of that string is "string", which is what the line carries.
+func TestTraceCPAdmitNilClause(t *testing.T) {
+	enableDPTrace(t)
+	s := traceCtx(t, "a", "b")
+	s.trace.admit(0b011, false, true, true, []*restrictInfo{nil}, s.cat)
+	if len(s.trace.cpAdmits) != 1 {
+		t.Fatalf("cpadmit records = %d, want 1", len(s.trace.cpAdmits))
+	}
+	v := s.trace.cpAdmits[0]
+	if v.failidx != 0 || v.failkind != "string" {
+		t.Errorf("nil-clause record wrong: %+v", v)
+	}
+	if out := s.trace.render(); !strings.Contains(out, "failidx=0 failkind=string") {
+		t.Errorf("rendered block missing nil-clause naming:\n%s", out)
+	}
+}
+
+// TestTraceBaseCPLeafVerdict: S1's leaf half. The Filter wrapper peels exactly
+// as `relConsiderParallel` peels it, the arm names in the verdict's own
+// vocabulary, and a kind the verdict does not enumerate renders "other" — the
+// verdict fails closed there, and so does the name.
+func TestTraceBaseCPLeafVerdict(t *testing.T) {
+	enableDPTrace(t)
+	s := traceCtx(t, "a", "b", "c")
+	s.trace.baseCP(0b001, &Filter{Child: &SeqScan{}}, true)
+	s.trace.baseCP(0b010, &BitmapHeapScan{}, false)
+	s.trace.baseCP(0b100, &Sort{}, false)
+	if len(s.trace.cpAdmits) != 3 {
+		t.Fatalf("cpadmit records = %d, want 3", len(s.trace.cpAdmits))
+	}
+	for i, want := range []string{"seq", "bitmap", "other"} {
+		if got := s.trace.cpAdmits[i].leaf; got != want {
+			t.Errorf("leaf %d = %q, want %q", i, got, want)
+		}
+	}
+	out := s.trace.render()
+	for _, want := range []string{
+		"DPTRACE cpadmit src=base rel={a} cp=1 leaf=seq",
+		"DPTRACE cpadmit src=base rel={b} cp=0 leaf=bitmap",
+		"DPTRACE cpadmit src=base rel={c} cp=0 leaf=other",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("rendered block missing %q:\n%s", want, out)
+		}
+	}
+}
+
+// TestTraceGatherVerdicts: S4's "generated but lost" vs "never generated"
+// separation. The record carries the partial-pathlist length at decision time
+// with the gate that fired; whether a Gather won reads off the `cost` line's
+// cheapest kind, not here.
+func TestTraceGatherVerdicts(t *testing.T) {
+	enableDPTrace(t)
+	s := traceCtx(t, "a", "b")
+	s.trace.gather(0b011, 2, "admitted")
+	s.trace.gather(0b011, 1, "no-cp")
+	if len(s.trace.gathers) != 2 {
+		t.Fatalf("cpgather records = %d, want 2", len(s.trace.gathers))
+	}
+	out := s.trace.render()
+	for _, want := range []string{
+		"DPTRACE cpgather rel={a+b} partials=2 verdict=admitted",
+		"DPTRACE cpgather rel={a+b} partials=1 verdict=no-cp",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("rendered block missing %q:\n%s", want, out)
+		}
+	}
+}
+
+// TestTraceAdmissionNilSafe: with the gate off the trace is nil and every R54
+// call site tolerates it — the search and the post-pass must be untouched in
+// production. `traceUpperGate` is a package function rather than a method, so
+// it gets its own nil-tolerance pin here: gate off means no output, no panic.
+func TestTraceAdmissionNilSafe(t *testing.T) {
+	var nilTrace *searchTrace
+	nilTrace.admit(0b011, true, true, true, nil, nil)
+	nilTrace.baseCP(0b001, nil, true)
+	nilTrace.gather(0b011, 0, "no-partials")
+	traceUpperGate("agg", "split", "workers=4 divisor=3")
+}

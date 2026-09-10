@@ -264,6 +264,31 @@ func TestRenderEnumVerdicts(t *testing.T) {
 	}
 }
 
+// TestParseAdmissionLinesDiscarded: R54 Step-0's parallel-admission lines
+// (cpadmit/cpgather from the search trace, upper from the post-pass) are
+// recognised and discarded like `cost` — Step-0 reads them with grep straight
+// off the server log, and structured admission parsing belongs to the slice
+// that first needs them. The property pinned is hygiene: the new line kinds
+// must not increment Malformed, inside a block or (for the standalone upper
+// line) without one — an upper line lands after its problem block has emitted,
+// so log proximity, not block membership, correlates it.
+func TestParseAdmissionLinesDiscarded(t *testing.T) {
+	const log = `DPTRACE problem nrels=2 rels=a,b
+DPTRACE cpadmit src=base rel={a} cp=1 leaf=seq
+DPTRACE cpadmit src=join rel={a+b} cp=1 in1=1 in2=1 nclauses=1 failidx=-1 failkind=none
+DPTRACE cpgather rel={a+b} partials=2 verdict=admitted
+DPTRACE end top={a+b} pairs=0 declined=0 status=ok
+DPTRACE upper gate=agg verdict=split workers=4 divisor=3
+`
+	tr := ParseEnumTrace(strings.NewReader(log))
+	if tr.Malformed != 0 {
+		t.Fatalf("%d malformed lines in an admission log", tr.Malformed)
+	}
+	if len(tr.Problems) != 1 {
+		t.Fatalf("got %d problems, want 1", len(tr.Problems))
+	}
+}
+
 // TestParseEnumTraceTruncatedBlock: a crash mid-search must keep its evidence,
 // flagged as partial rather than dropped or mistaken for a complete search.
 func TestParseEnumTraceTruncatedBlock(t *testing.T) {

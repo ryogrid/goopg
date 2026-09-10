@@ -58,7 +58,11 @@ package optimizer
 //
 // Design: docs/design/planner-c19g-partial-agg/DESIGN.md §8.
 
-import "github.com/goopg/goopg/internal/catalog"
+import (
+	"strconv"
+
+	"github.com/goopg/goopg/internal/catalog"
+)
 
 // partialAggSplitProducer is this producer's DPPATH trace string
 // (pathtrace.go). It reads `producer=upper.groupagg.split relids=-`.
@@ -183,6 +187,11 @@ func gatherToUnwrapForPartialAgg(n Node) (Node, bool) {
 
 func addPartialAggSplitPath(u *upperRels, grouped *RelOptInfo, seed *Path, aggNode *Aggregate, child Node, cp costParams, ps PlannerSettings) *Path {
 	if partialAggPathsMode != partialAggPathsOn {
+		// R54 Step-0: upper-rel refusal record. Gate name "agg-upper" keeps
+		// this producer distinct from the post-pass "agg" consumer — the two
+		// are independent verdicts over the same aggregate, and conflating
+		// them would misattribute a refusal to the wrong round.
+		traceUpperGate("agg-upper", "refused", "gate=mode")
 		return nil
 	}
 	// The statement-level refusals `MaybeAddGather` makes at its own entry.
@@ -190,9 +199,11 @@ func addPartialAggSplitPath(u *upperRels, grouped *RelOptInfo, seed *Path, aggNo
 	// not a DML/DDL/utility statement and not a nested planning scope); the
 	// per-node refusals are `subtreeHasUnsafeNode`'s.
 	if !ps.ParallelStatementOK || !parallelOn.Load() || ps.MaxParallelWorkersPerGather <= 0 {
+		traceUpperGate("agg-upper", "refused", "gate=statement")
 		return nil
 	}
 	if grouped == nil || seed == nil || aggNode == nil || child == nil {
+		traceUpperGate("agg-upper", "refused", "gate=nil-arg")
 		return nil
 	}
 	// The subtree must be one a worker can execute, must not already carry a
@@ -253,14 +264,17 @@ func addPartialAggSplitPath(u *upperRels, grouped *RelOptInfo, seed *Path, aggNo
 	// never was one. Two Gathers would have every worker read the whole
 	// relation and return N+1 copies of every row.
 	if subtreeHasUnsafeNode(child) || subtreeHasGather(child) || drivingScan(child) == nil {
+		traceUpperGate("agg-upper", "refused", "gate=subtree")
 		return nil
 	}
 	workers := upperSplitWorkers(child, cp, ps)
 	if workers <= 0 {
+		traceUpperGate("agg-upper", "refused", "gate=workers")
 		return nil
 	}
 	d := getParallelDivisor(workers, ps.ParallelLeaderParticipation)
 	if d <= 1 {
+		traceUpperGate("agg-upper", "refused", "gate=divisor workers="+strconv.Itoa(workers))
 		return nil
 	}
 
@@ -369,6 +383,10 @@ func addPartialAggSplitPath(u *upperRels, grouped *RelOptInfo, seed *Path, aggNo
 				0, 1, nAggs, inNcols, inAvgVar),
 			Children: []*Path{nsGather},
 		}, partialAggNoSplitProducer)
+		// R54 Step-0: upper-rel admission record. A nil split is still an
+		// admission — the gathered no-split arms were filed and cost
+		// adjudication downstream decides; only the gates above refuse.
+		traceUpperGate("agg-upper", upperSplitVerdict(split), upperSplitDetail(workers, d))
 		return split
 	}
 	if groupingHashable(aggNode, false) || aggNode.GroupingSets != nil {
@@ -395,7 +413,27 @@ func addPartialAggSplitPath(u *upperRels, grouped *RelOptInfo, seed *Path, aggNo
 			Pathkeys: sortedInput.Pathkeys, Children: []*Path{sortedInput},
 		}, partialAggNoSplitProducer)
 	}
+	// R54 Step-0: same admission record as the PLAIN arm above — both exits
+	// filed candidates, so both are admissions of the upper-rel round.
+	traceUpperGate("agg-upper", upperSplitVerdict(split), upperSplitDetail(workers, d))
 	return split
+}
+
+// upperSplitVerdict names the admitted shape: "split" files the
+// Finalize->Gather->Partial candidate, "nosplit" files only the gathered
+// no-split arms (an unsplittable aggregate still admits the round — cost
+// adjudication downstream decides, not this producer).
+func upperSplitVerdict(split *Path) string {
+	if split != nil {
+		return "split"
+	}
+	return "nosplit"
+}
+
+// upperSplitDetail carries the sizing the admission was priced at. Shared by
+// both admission exits so the record cannot drift between them.
+func upperSplitDetail(workers int, d float64) string {
+	return "workers=" + strconv.Itoa(workers) + " divisor=" + strconv.FormatFloat(d, 'g', -1, 64)
 }
 
 // addPartialAggSplitArm files `Finalize -> Gather -> Partial` on the GROUP_AGG

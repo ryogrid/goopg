@@ -186,6 +186,23 @@ func ParseEnumTrace(r io.Reader) EnumTrace {
 				t.Malformed++
 				continue
 			}
+		case "cpadmit", "cpgather":
+			// R54 Step-0's search-side admission lines (joinsearchtrace.go).
+			// Parsed and discarded for the same reason as `cost`: Step-0
+			// reads these lines with grep straight off the server log, and
+			// structured admission parsing belongs to the slice that first
+			// needs it. Recognised (not Malformed) so the new line kinds do
+			// not pollute the provenance channel's hygiene counter.
+			if cur == nil {
+				t.Malformed++
+				continue
+			}
+		case "upper":
+			// R54 Step-0's post-pass line (`traceUpperGate`). Standalone by
+			// construction — the tournaments run post-cache over finished
+			// Nodes, after the problem block has emitted — so a line with no
+			// open block is the normal case, not a malformed one. Discarded
+			// unconditionally; Step-0 correlates it by log proximity.
 		case "end":
 			if cur == nil {
 				t.Malformed++
