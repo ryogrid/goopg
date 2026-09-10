@@ -145,7 +145,100 @@ hand-pass here must never be read as tool parity.
 - `zz_probe_bitmap_test.go` (throwaway probe, untracked): graduate into the
   planner e2e pin or delete — it must not survive as an untracked file.
 
-## 4. Files (expected)
+## 5. Gate report (IMPL a16db55 + PINS 3639208, 2026-09-10)
+
+Binaries: `/tmp/pp2/bin/goopg-r49b` (worktree build; inode-verified on both
+clone servers). Corpora: `/tmp/pp2/oc-tpch-r49b.txt`, `/tmp/pp2/oc-ds05-r49b.txt`
+vs the Slice-A references (`oc-tpch-r49a.txt`, `oc-ds05-r49a.txt`); digests
+`/tmp/pp2/dig-r49b.txt` vs `bench/tpch/baseline-digests.txt` + `dig-r49a.txt`.
+
+### 5.1 Census + adjudication (moves only, ZERO EXTRA)
+
+Normalization: header + `(N rows)` counters excluded (counters shift when a
+line is added above them).
+
+- **TPC-H: 14 removed, 14 added.** Every removed line is a join-level
+  `Filter:` (probe equi-clause, outer-first); every added line is a
+  `Recheck Cond:` (inner-first, PG orientation). Per-query:
+  Q2(4)/Q5/Q8(2)/Q11(4)/Q16/Q19/Q20 — the TODO in-scope set plus Q16/Q19
+  same-shape extras. Zero `Nested Loop` lines added/removed (the join node
+  stays; only its Filter line vanishes). Indent-attribution: all 15 corpus
+  `Recheck Cond:` lines (14 new + 1 pre-existing) sit under a
+  `Bitmap Heap Scan`; orphans 0.
+- **TPC-DS: 40 removed Filters ↔ 40 added Rechecks**, balanced per query
+  (machine-checked, zero mismatches) across 33 sections incl. all in-scope
+  (Q3/Q19/Q21/Q30/Q32/Q37/Q39×2/Q40/Q42/Q49×2/Q52/Q53) plus the Q72 LEFT×2
+  and the Slice-A "extra probe" family (InitPlan `$0`, standalone-keyed).
+  The 8 remaining diff lines are capture-harness noise: 6× temp-filename PIDs
+  inside pre-existing psql ERROR lines (same noise as Slice A) + 2× `(N rows)`
+  counters. Indent-attribution: all 40 under `Bitmap Heap Scan`; orphans 0.
+- Sample pair (DS-Q19): `Filter: (item.i_item_sk = store_sales.ss_item_sk)` →
+  `Recheck Cond: (ss_item_sk = i_item_sk)` — the MOVE, inner-first.
+- Step-0 re-pass: goopg DS-Q3 join core (`Nested Loop` → outer `Seq Scan on
+  item` + `Filter: (i_manufact_id = 816)` → inner `Bitmap Heap Scan` +
+  `Recheck Cond: (ss_item_sk = i_item_sk)` → `Bitmap Index Scan` +
+  `Index Cond: (ss_item_sk = item.i_item_sk)`) is placement-identical to
+  archived `pg-dsq3.txt`. `pg-plan-parity-diff.py` will STILL report shapediff
+  on Q3 (parallel/estimate gaps, R48 F9 family) — hand-pass, not tool parity.
+
+### 5.2 Values bind
+
+- TPC-H canonical digest (`cmd/tpch-runner --digest`, fresh capped `:5533`
+  at `GOGC=100`): **24/24 MATCH vs `baseline-digests.txt` AND 24/24 vs
+  `dig-r49a.txt`** (values, ordered digests included — row order unchanged).
+  Tripwires from the same run: **Q12=2/Q13=34 (canonical)**.
+  (`scripts/tpch-spotcheck.sh` SKIPs in this worktree — no bench data dir
+  here; the fresh-restart + canonical-count gate above is its manual fallback,
+  with stronger evidence: full 24-query value digests, not just 2 counts.)
+- TPC-DS SF0.5 sweep (`SF05_NO_BUILD=1`, scratch results, engine
+  `c50fccd231eaea44` running==on-disk, no VOID): **PASS=95 (57 ck-verified),
+  MISMATCH=0, CKMISMATCH=0, ERROR=0, TIMEOUT=0, SKIP=4** — all-zero, gate
+  binds. The 4 skips are oracle-side (`Q4 TIMEOUT`, `Q36/Q70/Q86
+  SKIP_QUERYGEN`), not engine behavior. Report:
+  `/tmp/pp2/sf05-r49b-results/sweep-20260910-143716.txt`.
+- Lossy agreement: exact-vs-lossy on the doll-house NLI-bitmap
+  (`TestNLIBitmapProbeLossyRecheck`, maxEntries=16 < 5000 TIDs structurally
+  forced) + cond+recheck under lossy — closes the merged-coord correctness
+  loop with OP1-3's orientation pin. No separate NLI↔SubPlan agreement file
+  exists for bitmap probes; the R48-precedent requirement is met by
+  exact-vs-lossy on the same shape.
+- ANALYZE attribution (join→scan move, accepted per R48 F10): no test asserts
+  scan-level removal counts on the moved lines — `internal/executor` suite
+  green covers it.
+- Units: `internal/optimizer` + `internal/executor` suites green (gate runs,
+  no `-count=1`).
+
+### 5.3 Sibling-path audit
+
+- Planner arm is jointype-agnostic (`planJoinTypeFor`; BitmapQual built
+  identically for INNER/SEMI/LEFT/ANTI — no per-type switch to miss). SEMI
+  pinned at contract level, LEFT pinned e2e; ANTI shares SEMI's path and never
+  reaches the arm in the corpus.
+- Executor recheck has ONE choke point (`evalBitmapQual`, `recheck &&` gated
+  at both fetch sites — PG-faithful skip on exact pages): bound →
+  combined-slot `evalExprSlot`, unbound → legacy `evalExpr` on scanRow. The
+  parallel path (`nextParallelTuple` → `fetchOneTuple`) funnels through the
+  same point. NULL→false agrees in both branches. Two-slot discipline
+  (`Cond` stays leaf-local at both fetch sites) is pinned e2e.
+- `lookupBounds` nullKey (empty TBM) vs sibling `operators_index.go` ok=false:
+  consistent NULL-matches-nothing semantics, both pinned; no drift.
+
+### 5.4 Provenance notes
+
+- `:5533`/`:5534` were held by stale Slice-A `goopg-r49a` servers (same
+  session, 12:52/12:58); stopped via `goopg stop -D`, ports verified free
+  before launch. First r49b launch's wrapper task was TaskStop'd, which killed
+  the server (start foreground-blocks) — relaunched and left running; lesson
+  recorded for the next gate run.
+- Mid-gate, an SF0.5 `sweep` from the main tree rebuilt `GOOPG_BIN` in place
+  (main-tree image clobbered `/tmp/pp2/bin/goopg-r49b`); caught by mtime,
+  binary rebuilt from the worktree, sweep relaunched with `SF05_NO_BUILD=1`
+  + scratch `SF05_RESULTS_DIR`. Census/digest evidence is unaffected (clone
+  servers hold the pre-clobber image — `/proc/<pid>/exe` shows `(deleted)`).
+  The sweep image is one docs-only commit (TODO stamp) newer than the
+  census image; Go sources identical.
+
+## 6. Files (landed)
 
 - `internal/optimizer/createplannl.go` (BitmapQual-from-pairs + residual-only
   Predicate in `createNestLoopBitmapJoinPlan`)
