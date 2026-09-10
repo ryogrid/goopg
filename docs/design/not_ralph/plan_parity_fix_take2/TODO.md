@@ -3434,3 +3434,15 @@ Gather/GatherMerge crossing in `pushConjunctTraced`. Evidence
 tmp-only `/tmp/pp2/r56/` + `/tmp/q78-clone-{base,r56}.txt`.
 Next: join-rows N-lead follow-up (estimator territory, WITH a
 number) — needs its own scope round first.
+R57 scope LANDED 2026-09-11 (`r57-join-rows-nlead/SCOPE.md`,
+review APPROVE-WITH-NOTES, 11 notes, all applied): probe D
+closes the N-lead as a UNITS ERROR — 5874 is goopg's TOTAL,
+2520 PG's PER-LOOP (d=2.4 at 2 workers → 6048; GroupAgg above
+the GM shows 6047, self-proving). Normalized chain agrees
+≤3% at every level, both engines textbook (PK-FK defaults,
+1/25, OR 2/625 below / 0.5 above; one divisor applied once,
+in-trace). R56 math stands (pricing-level N untouched); only
+the residual-owner label changes. NO CUT authorised; residual
+~193 re-owned to worker-count selection (goopg 4 vs PG 2)
++ AGG_MIXED strategy preference, both ledgered.
+Next: worker-count sizing audit — needs its own scope round first.
