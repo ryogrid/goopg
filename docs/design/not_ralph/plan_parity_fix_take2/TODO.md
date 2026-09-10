@@ -3141,3 +3141,28 @@ pricing) is the named next round. Values: digest 24/24, Q12=2/Q13=34, SF0.5
 risk low; carry-forward: name the 7 DS shape-changed + Q5 agg-sideways
 vs PG before the costing round; Q15a-splice / `.norm`-arm provenance
 stays attached).
+
+## R52 — R51 shape-movement adjudication (DONE 2026-09-10, report `r52-r51-shape-adjudication/REPORT.md`, docs-only, no code)
+
+R51 review item 1 CLOSED: all 11 headline/shape movers + 12
+text-only named vs PG (review APPROVE-WITH-NOTES, notes applied; first
+draft missed MISSING-NODE movers Q11/Q47/Q57 — re-derived over ALL
+verdicts). H: Q9 TOWARD (reaffirmed); Q5 MIXED (top cond = PG's 2
+clauses + implied 3rd + index-NLI below, toward; serial agg vs PG
+parallel, away-leaning — parallel-admission gap). DS: Q4 TOWARD
+strict (−qual; PG's top filter also carries customer_id — equality
+placement differs); Q11 TOWARD (−qual; bushy secyear-first pairing);
+Q84 MIXED (join-kind toward, top two levels text-identical modulo
+Parallel; parallelism concretely away — R50's Gather Merge matched PG,
+new shape serial); Q31 MIXED-leaning-toward (NL top = PG kind; +qual
+9 redundant equalities; +scan = genuine CTE re-pairing, redundant
+signal); Q47/Q57 NEUTRAL-TO-AWAY-cosmetic (+qual doubled conds; leg
+order away from PG's v1_lead-outer; dominant WindowAgg gap unchanged);
+Q25/Q64/Q72 tag-flat NEUTRAL-to-toward (transitive probe edges,
+PG-verbatim probe on Q64); text-only = duplicate conds (Q58-class,
+Q58 Limit 4.01..4.02→4.06..4.07), leg swap (Q83), ERROR-filename churn
+(Q36/Q70/Q86). Findings for costing half: redundant-clause eval cost
+visible (DP-minimisation = hypothesis, edge-admission unaudited);
+synth-opened orders lose parallel paths. Next: join-order costing half
+(`join_search_one_level` + parallel admission); nullable-side
+assertion still open.
