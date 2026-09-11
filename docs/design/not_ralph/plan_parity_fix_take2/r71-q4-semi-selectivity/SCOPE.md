@@ -71,10 +71,13 @@ Three questions, in order, each with a pre-registered exit:
    vs no-sort sorted) change? Victim predicate (required — without
    it the table is confounded): fire only for an NLI whose outer
    subtree contains `orders` and inner contains `lineitem`, and
-   assert exactly one firing per Q4 run (log a marker; ≠1 → STOP);
-   Q4-only runs with the knob unset must byte-match HEAD (control);
-   sibling paths are unreached by env-gating + predicate, not by
-   assertion alone.
+   assert firings are single-victim+value (log a marker per firing;
+   sort -u must show one line — >1 DISTINCT victims → STOP).
+   SCOPE rev-3 amendment (review-required): N idempotent firings
+   satisfy the predicate; the count (estimation passes) is recorded,
+   not gated. Q4-only runs with the knob unset must byte-match HEAD
+   (control); sibling paths are unreached by env-gating + predicate,
+   not by assertion alone.
    - Grouping flips → rows theory lives beyond B1's arithmetic;
      scope the implementation (fix site + elections) as follow-up.
    - Only the ordered loop flips → follow-up is a rows fix for the
