@@ -63,7 +63,16 @@ proof, and it passes 24/24.
    delta; re-pinning under a renderer round would bless unrelated
    planner drift. SCOPE's "DIFFER on Q11/Q3/Q5/Q10" prediction is
    superseded: in structural mode those queries already DIFFER at HEAD,
-   and the cut flips no verdict.
+   and the cut flips no verdict. Measured pre→post delta: per-query
+   verdict lists byte-identical (20 DIFFER + Q15a-VIEWBODY/Q19 MATCH);
+   the full-file diff is 260 changed lines of which exactly 20 are
+   non-cost text — 7 expansion sites, all predicted: Q1 + Q3 + Q10 Sort
+   Keys (Arm A), Q11 Sort Key + HAVING Filter (Arms A+B, `(InitPlan 1)`
+   → `(InitPlan 1).col1`), Q18 `sum > 313` → `sum(l_quantity) > 313`
+   (Arm A), Q22 `(InitPlan 1)` → `(InitPlan 1).col1` (Arm B). The
+   remainder is estimate-text noise between fresh servers (costs
+   ±~0.01–1%, e.g. Q1 top-node rows 57274↔56095 ≈2% with identical
+   shape); zero node-kind/child/key moves.
 
 ## 3. Deviations from SCOPE (ledgered, none blocking)
 
@@ -79,9 +88,18 @@ proof, and it passes 24/24.
    primary evidence is the `*mine*` / `values-pre|post` / `explain-*` /
    `plangate-*` set captured with this tree's binaries. (Its `pp65-new`
    verdicts agree with mine on every per-query category.)
-4. `:65433` serves foreign `tmp/goopg-bench-bin` (started 19:00 by
-   another lane — left untouched); all R65 measurement used the private
-   clone :5533 (now DOWN, kept for A/B).
+4. `:65433` post-mortem (ERRATA 19:15 — the "another lane"
+   attribution above was wrong): the 19:00 swap-to-base misfired inside
+   this session — `GOOPG_BIN=<base> … scripts/goopg-test-run.sh
+   "$GOOPG_BIN" …` expands `"$GOOPG_BIN"` in the OUTER shell, which still
+   held env_goopg.sh's default (`tmp/goopg-bench-bin`, a NEW-code
+   build). So :65433 served the NEW binary and
+   `/tmp/pp2/r65/plangate-base.txt` (19:02) is a new-binary run,
+   renamed in place to
+   `plangate-65433-newbin-MISLABELED-was-base.txt`. The valid A/B is
+   the :5533 clone pair (§2.7). :65433 still serves that binary (left
+   running); :5533 is UP serving `goopg-r65` (new), restored after the
+   post capture.
 
 ## 4. Sequencing (user order, preserved)
 
@@ -93,7 +111,9 @@ precondition), then #6, R61 #4, (b) Q4, R63-#1/#2, watches, P0-04.
 Evidence tmp-only `/tmp/pp2/r65/` (`values-pre|post.log`,
 `explain-pre|post.txt`, `explain-ab.diff`, `r65mine.plans.txt/.txt`,
 `r65pg.plans.txt/.txt`, `ds-sweep.log`, `plangate-pre|post.txt`,
-`r65-spotcheck.log`); clone `/tmp/pp2/clone-tpch-r65` (server DOWN,
-kept); pre-cut source worktree `/tmp/pp2/r65-pre-src` (HEAD);
+`plangate-65433-newbin-MISLABELED-was-base.txt`, `server-pre3.log`,
+`server-post3.log`, `bench-base|new-start.log`, `r65-spotcheck.log`);
+clone `/tmp/pp2/clone-tpch-r65` (server UP on :5533, `goopg-r65` new
+build, kept); pre-cut source worktree `/tmp/pp2/r65-pre-src` (HEAD);
 binaries `goopg-pre` / `goopg-r65` (md5 `740e797f…` / `7e935a61…`),
 `estimate-audit-mine`, `tpch-runner`.
