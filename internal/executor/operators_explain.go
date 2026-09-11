@@ -667,8 +667,11 @@ func childAggregateThroughFilters(n optimizer.Node) *optimizer.Aggregate {
 // Fail-closed: any coordinate doubt (out-of-range Index, output-schema
 // name mismatch — the same name-level robustness today's purely
 // name-based ColumnRef rendering already relies on) or an
-// un-synthesisable call (DISTINCT, FILTER, ORDER BY, WITHIN GROUP,
-// count(*), nil arg) returns ok=false and the caller keeps today's text.
+// un-synthesisable call (FILTER, ORDER BY, WITHIN GROUP, nil arg on a
+// non-Star call, or the incoherent Star+Distinct combination) returns
+// ok=false and the caller keeps today's text. Star and DISTINCT calls
+// synthesise since R66 (Arms Star/Distinct); the list above is what
+// remains declined.
 func expandAggOutputRef(col *optimizer.ColumnRef, agg *optimizer.Aggregate) (optimizer.Expr, bool) {
 	if col == nil || agg == nil || col.Name == "" {
 		return nil, false
@@ -683,8 +686,21 @@ func expandAggOutputRef(col *optimizer.ColumnRef, agg *optimizer.Aggregate) (opt
 		return nil, false
 	}
 	call := &agg.Aggs[idx-nGroup]
-	if call.Star || call.Distinct || call.Filter != nil ||
-		len(call.OrderBy) > 0 || call.WithinGroup || call.Arg == nil {
+	// R66 Arms Star/Distinct: a Star call with no arg synthesises
+	// `count(*)`; a Distinct call synthesises `count(DISTINCT x)`.
+	// Anything else un-synthesisable (FILTER, ORDER BY, WITHIN GROUP,
+	// nil arg on a non-Star call, or the incoherent Star+Distinct
+	// combination, which no valid SQL produces) keeps today's text.
+	if call.Filter != nil || len(call.OrderBy) > 0 || call.WithinGroup {
+		return nil, false
+	}
+	if call.Star {
+		if call.Distinct || call.Arg != nil || call.Arg2 != nil || len(call.ExtraArgs) > 0 {
+			return nil, false
+		}
+		return &optimizer.FuncCall{Name: call.Name, Star: true}, true
+	}
+	if call.Arg == nil {
 		return nil, false
 	}
 	args := make([]optimizer.Expr, 0, 2+len(call.ExtraArgs))
@@ -693,7 +709,70 @@ func expandAggOutputRef(col *optimizer.ColumnRef, agg *optimizer.Aggregate) (opt
 		args = append(args, call.Arg2)
 	}
 	args = append(args, call.ExtraArgs...)
+	if call.Distinct {
+		return &optimizer.FuncCall{Name: call.Name, Args: args, Distinct: true}, true
+	}
 	return &optimizer.FuncCall{Name: call.Name, Args: args}, true
+}
+
+// sortGroupKeySource — R66 Arm S. A Sort key naming a GROUP-BY output
+// position (not a computed aggregate) is PG's OUTER_VAR into the child's
+// grouping list, so render the grouping expression itself instead of the
+// output alias (goopg `Sort Key: nation` vs PG `Sort Key: nation.n_name`).
+// Only the same-level coordinate check from R65 is reused: the key must
+// name the child aggregate's own output position idx
+// (`Output()[idx].Name`), with an explicit non-negative bound. The
+// grouping expression renders through the caller's pipeline, so the S18
+// wrap behaves exactly as it does on the Group Key line's sibling
+// (ExtractExpr parenthesised in Sort Key, bare in Group Key — PG's own
+// split, verified on the Q9 live pair).
+//
+// Fail-closed: anything that is not a plain group position (masks,
+// passthrough, grouping sets — whose output layout differs), or a
+// grouping expression carrying sublinks / outer references (whose
+// numbering belongs to the main plan walk, never to a key line),
+// keeps today's text. Where GroupExprs is itself alias-named (Q7/Q9's
+// shape) the text is unchanged by construction — that chase is Slice 2.
+func sortGroupKeySource(col *optimizer.ColumnRef, agg *optimizer.Aggregate) (optimizer.Expr, bool) {
+	if col == nil || agg == nil || col.Name == "" {
+		return nil, false
+	}
+	if agg.GroupingSets != nil {
+		return nil, false
+	}
+	idx := col.Index
+	if idx < 0 || idx >= len(agg.GroupExprs) {
+		return nil, false
+	}
+	sch := agg.Output()
+	if idx >= len(sch) || sch[idx].Name != col.Name {
+		return nil, false
+	}
+	src := agg.GroupExprs[idx]
+	if src == nil || exprHasSubplanOrOuterRef(src) {
+		return nil, false
+	}
+	return src, true
+}
+
+// exprHasSubplanOrOuterRef reports whether e carries a sublink or an
+// outer-query reference. Such content rendered on a Sort/Group key line
+// would be numbered outside the main plan walk that owns subplan
+// numbering, so key-line expansion declines wherever it appears.
+func exprHasSubplanOrOuterRef(e optimizer.Expr) bool {
+	found := false
+	optimizer.WalkExprTree(e, func(sub optimizer.Expr) {
+		if found {
+			return
+		}
+		switch sub.(type) {
+		case *optimizer.SubqueryExpr, *optimizer.ExistsExpr, *optimizer.InExpr,
+			*optimizer.ArraySubqueryExpr, *optimizer.OuterColumnRef,
+			*optimizer.ExecParamRef:
+			found = true
+		}
+	})
+	return found
 }
 
 // expandAggOutputRefsInFilter applies expandAggOutputRef to every ColumnRef
@@ -819,7 +898,13 @@ func emitNodeDetailLines(n optimizer.Node, indent string, verbose bool, rows *[]
 				keyExpr := k.Expr
 				if col, ok := k.Expr.(*optimizer.ColumnRef); ok {
 					if agg := childAggregateThroughFilters(p.Child); agg != nil {
-						if expanded, hit := expandAggOutputRef(col, agg); hit {
+						// R66 Arm S first: a group-position key renders
+						// the grouping expression (source, not alias).
+						// Aggs-section keys fall through to R65's call
+						// expansion (now Star/Distinct-capable).
+						if src, hit := sortGroupKeySource(col, agg); hit {
+							keyExpr = src
+						} else if expanded, hit := expandAggOutputRef(col, agg); hit {
 							keyExpr = expanded
 						}
 					}
@@ -1518,9 +1603,21 @@ func formatExprQual(e optimizer.Expr, reg *subPlanReg, qualify bool) string {
 	case *optimizer.CastExpr:
 		return formatExprQual(x.Operand, reg, qualify)
 	case *optimizer.FuncCall:
+		// R66: renderer-synthesised Star/Distinct aggregate calls.
+		// Star fires only on aggregate-derived objects: scalar Star
+		// FuncCalls exist transiently in the planner but none survives
+		// to a rendered plan for valid SQL (`foo(*)` is rejected,
+		// `count()` is not valid SQL), so `count()` from valid SQL can
+		// never take this branch.
+		if x.Star && len(x.Args) == 0 && !x.Distinct {
+			return x.Name + "(*)"
+		}
 		args := make([]string, len(x.Args))
 		for i, a := range x.Args {
 			args[i] = formatExprQual(a, reg, qualify)
+		}
+		if x.Distinct {
+			return x.Name + "(DISTINCT " + strings.Join(args, ", ") + ")"
 		}
 		return x.Name + "(" + strings.Join(args, ", ") + ")"
 	case *optimizer.ParamRef:

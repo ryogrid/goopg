@@ -598,6 +598,13 @@ type FuncCall struct {
 	Name       string
 	Args       []Expr
 	Star       bool
+	// Distinct marks a renderer-synthesised DISTINCT aggregate call
+	// (R66 Arm Distinct: `count(DISTINCT x)` expanded from an
+	// AggregateCall). Never set by the planner; the executor's FuncCall
+	// evaluation ignores it, and synthesised objects never reach the
+	// executor — they are built inside the EXPLAIN renderer and handed
+	// only to formatExprQual.
+	Distinct   bool
 	Variadic   bool   // true when args were expanded from VARIADIC array syntax
 	ReturnType string // return type for user-defined functions; empty for unknown
 	// ArgWidth is the resolved overload width for width-sensitive builtins

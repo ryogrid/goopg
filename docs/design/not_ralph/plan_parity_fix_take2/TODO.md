@@ -3730,3 +3730,19 @@ search knob or records the negative). Review APPROVE-WITH-NOTES
 (3 blocking: same-level name check, explicit 0<=idx, P3 reword +
 HAVING pre-flight — all applied; 8 advisory applied).
 Next: commit this scope, then Slice-1 implementation per §5 gates.
+R66 SLICE-1 LANDED 2026-09-11 (`r66-alias-source-keys/SLICE1-REPORT.md`):
+Arm S + Star + Distinct, renderer-only. P0–P5 all green: Q16 sheds
+`rendering` (sole per-query move; 6/14/0/2), Q13-key1 fixed, values
+24/24 MATCH, DS SF0.25 PASS=96 SKIP=3, plan-gate opt-out (identical
+20/22 verdict sets, 17-line Sort-Key-only diff). DS: 17 queries move,
+all confined (16 sortkey + Q23 `count(*) > 4` adjudicated to SQL text).
+Review APPROVE-WITH-NOTES (2 blocking: R65-header stale list fixed,
+e2e sublink pin added — plannable, no deviation; 4 advisory applied:
+Star wording, guard-walker residual documented, Star+Arg2 strict
+decline, DS pre-flight carried to Slice 2). Worktree trap: an empty
+`postgres/` dir in the worktree makes `ln -sfn` land INSIDE it —
+verify with ls before linking (K91 sibling). Spotcheck deferred (peer
+holds :65433; renderer-only + 24/24 digests cover it). Fresh-PG
+reference shows PG-side Q8 join-order drift (rendering-neutral).
+Next: Slice-2 Step 0 (live agg-chain dump; STEP0.md names the search
+knob or records the negative).
