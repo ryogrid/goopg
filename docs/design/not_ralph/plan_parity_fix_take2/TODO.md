@@ -3913,6 +3913,14 @@ only Right refused; joinrelsize/specialjoin already semi-aware) via
 temp trace on tryBuildNLI + sjinfo path; P1 slices admission routes,
 implementation separate. Q22-ANTI read-only; widths/selectivity/
 elections out. Next: review SCOPE, commit/push, then P0 fork trace.
+R74 P0 DONE 2026-09-12 (`r74-semi-admission/FORK.md`, review APPROVE):
+fork named — `unnestExistsExpr` (unnest.go:4078/:4360) builds
+hash-SEMI Join pre-search (1.5M outer), tryBuildNLI rewrites to
+unpriced NLI (57k), collapse never builds semi sjinfo (not a
+FROM-join) so the search never sees the relset. P1 menu: (i) admit
+unnested SEMI joinrel to search (recommended) vs (ii) post-hoc NLI
+pricing; implementation separate; Q22 rides (i), Q13 separate. Tree
+clean (temp reverted, optimizer builds).
 R68 SCOPE READY 2026-09-11 (`r68-joinorder-costing-step0/SCOPE.md`):
 join-order costing Step-0 (Q9 L-divergence re-measured, sizing vs
 pricing re-adjudicated — R53 numbers stale via R59/R64/R62/R57/R54).
