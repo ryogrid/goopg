@@ -3769,3 +3769,18 @@ Q8/Q22 decline-reasons required in gate 4). Predictions: rendering
 {Q7,Q9,Q10,Q13}→{Q10}, pp unmoved, zero EXTRA. Next: Slice-2
 implementation per §6 gates (pins incl. Group Key text + G-shape
 sourced-text pin).
+R66 SLICE-2 STOPPED at P3 2026-09-11 — TPC-H fully green (rendering
+{Q10}, moves exactly Q7/Q9/Q13 shedding it; values 24/24; DS sweep
+PASS=96) BUT the DS census missed Q44+Q54 (section-splitter blind spot
+— verify censuses against raw grep counts, R50-trap family): Q44
+`rank_col`→`(avg(ss1.ss_net_profit))` vs PG `v1.rank_col`, Q54
+`c_customer_sk`→`my_customers.c_customer_sk` vs PG
+`customer.c_customer_sk` — both AWAY (boundary aliases PG keeps).
+Table-0 rule fixed Q49 (reverted) and contained Q51 (structure-faithful
+CASE, ref gap recorded). Fingerprint incident: an unattributed sweep
+into ds-sweep-s2b resolved by engine-sha to MY OWN binary
+(cbbebc17==s2b) — exonerated; lesson: trust the fingerprint, and census
+by grep not just by section-diff. Evidence `/tmp/pp2/r66/ds-pg/`
+(live-:65438 key lines Q21/39/44/49/51/54/91). Cut UNCOMMITTED.
+Next: dump Q44/Q54 chains (temp DBG on the SF0.25 lane) → boundary
+rule (naming-boundary stop) → implement → full re-gates.
