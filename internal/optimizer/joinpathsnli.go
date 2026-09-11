@@ -268,6 +268,19 @@ func probeEnforcedClauses(p *Path) map[*restrictInfo]bool {
 // both read `CheapestTotal`-only inputs, which a parameterised path can
 // never win (03 §9 rule 1), so the merge exception cannot reach them.
 func addNLIPaths(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp costParams, jt parser.JoinType, clauses []*restrictInfo, paramSrc RelSet) {
+	// R64 (ledger R63-#3): decline when the inner is the preserved side. A
+	// RIGHT join preserves its inner child, which in this arm is a
+	// parameterized probe — unmatched preserved rows surface from no probe
+	// execution, so no driver (fused NLI, decomposed lateral, bitmap) can
+	// emit them (Q13 dropped its 50,000 zero-order customers, 34→33 rows).
+	// The admitted set mirrors partialHashJoinTypeOK (Inner/Left/Semi/Anti);
+	// FULL never reaches here (jointypeForDirection declines it). The Right
+	// direction itself stays legal for hash/merge/plain-NL — only this arm
+	// declines, and addNestLoopPath must keep admitting Right (a complete
+	// inner is sweepable by the generic driver).
+	if jt == parser.JoinRight {
+		return
+	}
 	o := outer.CheapestTotal
 	if o == nil || o.RequiredOuter != 0 {
 		return

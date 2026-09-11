@@ -224,6 +224,53 @@ func TestNLIArmAdmission(t *testing.T) {
 	})
 }
 
+func TestNLIArmDeclinesPreservedInner(t *testing.T) {
+	// R64 (ledger R63-#3): a RIGHT join preserves its inner child, which in
+	// this arm is a parameterized probe — unmatched preserved rows surface
+	// from no probe execution, so no driver can emit them (Q13 dropped its
+	// 50,000 zero-order customers, 34→33 rows). The arm declines the
+	// direction; hash/merge/plain-NL keep serving it, so the jointype
+	// mapping itself is unchanged.
+	cp := defaultCostParams()
+	a, b := relsetOf(0), relsetOf(1)
+	sji := &SpecialJoinInfo{Jointype: parser.JoinLeft, MinLefthand: a, MinRighthand: b}
+
+	countNLI := func(t *testing.T, outer, inner *RelOptInfo) int {
+		t.Helper()
+		joinrel := newRelOptInfo(a|b, 100, 64)
+		if err := addPathsToJoinrel(nil, joinrel, outer, inner, nil, cp, sji); err != nil {
+			t.Fatalf("addPathsToJoinrel: %v", err)
+		}
+		n := 0
+		for _, p := range joinrel.Pathlist {
+			if p.Kind == PathNestLoop && p.Children[1].RequiredOuter != 0 {
+				n++
+			}
+		}
+		return n
+	}
+
+	t.Run("commuted Right declines", func(t *testing.T) {
+		// Outer covers MinRighthand, inner covers MinLefthand: jt=Right,
+		// and the probe IS the preserved side.
+		outer := scanRel(b, 100, estScanPages(100, 32))
+		inner := nliInnerRel(a, 1000, b, 1.0)
+		if got := countNLI(t, outer, inner); got != 0 {
+			t.Fatalf("commuted-Right emitted %d NLI paths, want 0 (probe is the preserved side)", got)
+		}
+	})
+
+	t.Run("forward Left still admits", func(t *testing.T) {
+		// Outer covers MinLefthand, inner covers MinRighthand: jt=Left,
+		// the probe is the nullable side.
+		outer := scanRel(a, 100, estScanPages(100, 32))
+		inner := nliInnerRel(b, 1000, a, 1.0)
+		if got := countNLI(t, outer, inner); got == 0 {
+			t.Fatal("forward-Left emitted 0 NLI paths, want >= 1")
+		}
+	})
+}
+
 // TestNLIArmDropsClausesMovableIntoTheInner is `create_nestloop_path`'s
 // restrict-clause drop (pathnode.c:2478-2500). The clause that parameterised
 // the inner is being enforced down there as an index qual; carrying it at the

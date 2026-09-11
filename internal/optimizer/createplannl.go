@@ -255,6 +255,16 @@ func createNestLoopIndexJoinPlan(p *Path, innerPath *Path) (Node, outputLayout) 
 
 	in := joinInputsFor(p, "PathNestLoop(NLI)", outerPath, innerPath)
 	jtNLI := planJoinTypeFor(p, "PathNestLoop(NLI)")
+	if jtNLI == JoinTypeRight {
+		// R64 (ledger R63-#3): fail-closed. A RIGHT over a parameterized
+		// inner preserves the probe, whose unmatched rows no driver can
+		// emit — addNLIPaths declines the direction, so reaching here
+		// means a producer slipped. Loud failure, not dropped rows. (The
+		// decomposed lateral arm below is covered too: the lateral stream
+		// has no fillInner, so a Join{Lateral,Right} would silently
+		// degrade to Inner.)
+		panic("createPlan: PathNestLoop(NLI) with jointype RIGHT over a parameterized inner; the preserved side is the probe (R64)")
+	}
 	if memoPath != nil {
 		// Slice 1b: the memoized shape keeps the fused node and driver
 		// (function header). The decomposed Join below cannot carry a
@@ -505,6 +515,12 @@ func createNestLoopBitmapJoinPlan(p *Path, innerPath *Path) (Node, outputLayout)
 		}
 	}
 	jt := planJoinTypeFor(p, "PathNestLoop(NLI-bitmap)")
+	if jt == JoinTypeRight {
+		// R64 (ledger R63-#3): fail-closed, same producer slip as the index
+		// arm above — a RIGHT over a parameterized probe preserves rows no
+		// driver can emit. Loud failure, not dropped rows.
+		panic("createPlan: PathNestLoop(NLI-bitmap) with jointype RIGHT over a parameterized inner; the preserved side is the probe (R64)")
+	}
 	pairs := in.keyPairs("PathNestLoop(NLI-bitmap)", probeClauses)
 	bhs.BitmapQual = make([]Expr, 0, len(pairs))
 	for _, kp := range pairs {
