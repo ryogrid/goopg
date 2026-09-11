@@ -352,3 +352,163 @@ func addNLIPaths(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp costParams,
 		}
 	}
 }
+
+// addPartialNestLoopPaths is `consider_parallel_nestloop` +
+// `try_partial_nestloop_path` (joinpath.c:2107-2214, :945-1010): the last
+// missing join arm — a partial path joining a PARTIAL outer to a COMPLETE
+// inner, rescanned once per per-worker outer row. R60 (plan-parity-fix
+// take2).
+//
+// It is the NLI arm's sibling deliberately: the residual comes from the
+// same `nestloopResidualClauses`, the pair expansion is the same bare +
+// `getMemoizePath` shape, and the four costing lines are identical. What
+// differs is the outer (every member of `outer.PartialPathlist`, not the
+// cheapest total), the inner list (the WHOLE `CheapestParameterized`,
+// unparameterised member included — PG iterates the same
+// `cheapest_parameterized_paths` with the cheapest total prepended), and
+// the filing (`addPartialPath`, not `addPath`).
+//
+// Two PG admission tests do NOT cross over, one by vacuity and one by
+// structure: `try_nestloop_path`'s param_source_rels / star-schema test
+// (:882-889) belongs to the serial arm — a partial result must be FULLY
+// unparameterised ("Parameterized partial paths are not supported",
+// :959), so `req != 0` is a refusal here, not a deferral; and the lateral
+// check has nothing to read — no LATERAL shape reaches path generation
+// (C-08 invariant, cited the same way the two landed partial producers
+// cite it: by comment, with no field to test).
+func addPartialNestLoopPaths(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp costParams, jt parser.JoinType, clauses []*restrictInfo) {
+	// V0: the reader-only gate, shared with both landed partial producers
+	// (`joinpathsparallel.go:82-91`): nothing but `generateUsefulGatherPaths`
+	// and the next level's own partial producer reads a partial path.
+	if gatherPathsMode == gatherPathsOff {
+		tracePVetoCtx(s, "nestloop", traceRelids(joinrel), traceRelids(outer), traceRelids(inner), "V0", "jt="+traceJoinTypeName(jt))
+		return
+	}
+	// The dispatch gate (joinpath.c:2022-2031), minus the vacuous:
+	// UNIQUE_OUTER has no goopg jointype, so the set collapses to exactly
+	// `partialHashJoinTypeOK` ({INNER, LEFT, SEMI, ANTI}).
+	if !partialHashJoinTypeOK(jt) {
+		tracePVetoCtx(s, "nestloop", traceRelids(joinrel), traceRelids(outer), traceRelids(inner), "V1", "jt="+traceJoinTypeName(jt))
+		return
+	}
+	// `joinrel->consider_parallel` (already propagated by
+	// joinrelConsiderParallel), as the partial-hash producer reads it.
+	if s == nil || !s.parallelModeOK || joinrel == nil || !joinrel.ConsiderParallel {
+		sub := "cp"
+		if s == nil {
+			sub = "s-nil"
+		} else if !s.parallelModeOK {
+			sub = "mode"
+		} else if joinrel == nil {
+			sub = "nil-joinrel"
+		}
+		tracePVetoCtx(s, "nestloop", traceRelids(joinrel), traceRelids(outer), traceRelids(inner), "V2", "sub="+sub+" jt="+traceJoinTypeName(jt))
+		return
+	}
+	// `outerrel->partial_pathlist != NIL`.
+	if len(outer.PartialPathlist) == 0 {
+		tracePVetoCtx(s, "nestloop", traceRelids(joinrel), traceRelids(outer), traceRelids(inner), "V4", "jt="+traceJoinTypeName(jt))
+		return
+	}
+	// PG's `foreach` over the whole partial_pathlist — NOT the head. The
+	// orderings that motivate it upstream do not exist yet (NL paths carry
+	// no pathkeys, §2.iii), but rows-per-worker differ by outer (a dearer
+	// outer on more workers rescans less), so a non-head outer is not
+	// strictly dominated. Lists are tiny; faithfulness is cheap.
+	for _, o := range outer.PartialPathlist {
+		if o == nil || o.ParallelWorkers <= 0 || o.RequiredOuter != 0 {
+			// PG *asserts* the outer unparameterised
+			// (`bms_is_empty(PATH_REQ_OUTER(outer_path))`, :967) — refused,
+			// not asserted, per `addPartialPath`'s fail-closed convention.
+			sub := "unsafe"
+			if o == nil {
+				sub = "head-nil"
+			} else if o.ParallelWorkers <= 0 {
+				sub = "workers"
+			} else {
+				sub = "outer-param"
+			}
+			tracePVetoCtx(s, "nestloop", traceRelids(joinrel), traceRelids(outer), traceRelids(inner), "V5", "sub="+sub+" jt="+traceJoinTypeName(jt))
+			continue
+		}
+		// `innerrel->cheapest_parameterized_paths`, prepended unparameterised
+		// member included (`setCheapest`, path.go:1193) — so the
+		// unparameterised inner (partial PLAIN nestloop) and the
+		// parameterised probes (partial INDEX nestloop) ride one loop, as
+		// they do in PG. UNIQUE_INNER is vacuous (no such jointype, hence no
+		// `create_unique_path` to call). The materialised-inner tail is
+		// deliberately absent: goopg builds no Material path anywhere
+		// (`plannersettings.go:72`), a pre-existing all-join-types gap.
+		for _, i := range inner.CheapestParameterized {
+			if i == nil || !i.ParallelSafe {
+				// "Can't join to an inner path that is not parallel-safe."
+				tracePVetoCtx(s, "nestloop", traceRelids(joinrel), traceRelids(outer), traceRelids(inner), "V7", "jt="+traceJoinTypeName(jt))
+				continue
+			}
+			// The subset test (joinpath.c:968-990): the inner's
+			// parameterisation must be fully satisfiable by the outer. The
+			// top_parent branch is vacuous (no top parents in goopg);
+			// `calcNestloopRequiredOuter` with an unparameterised outer IS
+			// the subset test, and a nonzero remainder is refused (V8) —
+			// there is no star-schema exception here, because unlike the
+			// serial arm the result may not stay parameterised.
+			req := calcNestloopRequiredOuter(outer.Relids, o.RequiredOuter, inner.Relids, i.RequiredOuter)
+			if req != 0 {
+				tracePVetoCtx(s, "nestloop", traceRelids(joinrel), traceRelids(outer), traceRelids(inner), "V8", "jt="+traceJoinTypeName(jt))
+				continue
+			}
+			residual := nestloopResidualClauses(clauses, i, inner.Relids, i.RequiredOuter)
+			// The reparameterizability check
+			// (`path_is_reparameterizable_by_child`) has no goopg
+			// machinery to mirror — and nothing to check: with `req == 0`
+			// and an unparameterised outer there is no parameterisation
+			// left to translate. Stated, not skipped silently.
+			for _, in := range []*Path{i, getMemoizePath(s, outer, o, i, cp)} {
+				if in == nil {
+					continue
+				}
+				// `initial_cost_nestloop` performs no worker division, and
+				// none is wanted: the outer input arrives already
+				// per-worker-divided (cost AND rows), so the four lines are
+				// the NLI arm's verbatim — the partial-ness lives in the
+				// inputs, exactly as the partial-hash producer documents.
+				// (`add_partial_path_precheck` is CPU-only — bail before
+				// creating the path — and the post-costing domination
+				// decides identically, so it is not mirrored.)
+				matBuild, matRescan := nestLoopInnerRescanCost(in, cp)
+				cost := nestloopCost(cp, o.Cost, in.Cost, o.Rows, in.Rows, 0, matRescan)
+				cost.Total += matBuild
+				cost.Total += qualEvalCost(cp, len(residual), o.Rows*in.Rows)
+				// `final_cost_nestloop` (costsize.c:4307-4314-twin): "For
+				// partial paths, scale row estimate." One divisor, applied
+				// here and undone by `computeGatherRows` — not two.
+				divisor := getParallelDivisor(o.ParallelWorkers, cp.parallelLeaderParticipation)
+				addPartialPath(joinrel, &Path{
+					Kind:     PathNestLoop,
+					Jointype: jt, // C-03b; see addHashJoinPath.
+					Rel:      joinrel,
+					Rows:     clampRowEst(joinrel.Rows / divisor),
+					Cost:     cost,
+					Children: []*Path{o, in},
+					// R53 slice 1: the partition, in Children order.
+					OuterRelids: outer.Relids,
+					InnerRelids: inner.Relids,
+					Residual:    residual,
+					// Empty by the V8 refusal above. Carried through the
+					// constructor rather than hard-coded, as the NLI arm does.
+					RequiredOuter: req,
+					// create_nestloop_path gets `outer_path->parallel_workers`
+					// ("a foolish way to estimate parallel_workers, but for
+					// now…", pathnode.c:2733); parallel_aware stays false —
+					// there is no shared NL build.
+					ParallelSafe:    parallelSafeWith(joinrel, o, in),
+					ParallelWorkers: o.ParallelWorkers,
+					ParallelAware:   false,
+					// The R59 rule (costsize.c:3282): enable_nestloop counts
+					// on EVERY nestloop path, partial ones included.
+					DisabledNodes: disabledNodesFor(!cp.enableNestLoop, o, in),
+				}, "join.nestloop.partial")
+			}
+		}
+	}
+}

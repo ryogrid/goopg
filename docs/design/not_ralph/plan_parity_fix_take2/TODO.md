@@ -3526,3 +3526,19 @@ P3 proves no R60 path wins on Q7. Predictions P0-P4 + WATCH W1/W2
 (too-close-to-call: {2,3,4,5} head ~500, final rung ~9k); any miss →
 DPTRACE A/B re-audit per R59 §1.iii rule. Evidence tmp-only `/tmp/pp2/r60/`.
 Next: review this scope, then R60 implementation per §5 gates.
+
+## R60 implementation (2026-09-11) — LANDED, reviewed APPROVE-WITH-NOTES, notes applied
+Cut as scoped (joinpathsnli.go:379 + joinpaths.go:385). Gates: 1 units/vet
+green; 2 Q7 top byte-identical (.1==.3==R59, run-stable); 3 A/B exactly
+closed (1695 = 1393+257+88-42-1; P0 lands; P1/P2 heads taken by unaudited
+plain arms but probe-rung math exact Δ0.28; P3 holds via Gather
+non-admission — PathNestLoop unadmittable, executor twin confirmed live);
+4 values 8/8 MATCH, Q5+Q10 serial-fallback moves → gate 4 letter-FAIL,
+accepted as amended scope change (parity-neutral, PG serial too); 5 pp
+5/15/0/2 exact (Q3 Δ-8.62 proven autovacuum drift 09:04→10:13); 6 DS SF0.5
+PASS=94 (same 57 ck) + Q72 TIMEOUT alone, verdict-changes=none, shapes 99/99.
+SCOPE wording fix (paramSrc unused, not reused). Follow-ups: executor
+NL-probe/Memoize-under-partial, add_partial_path_precheck CPU work, Q3
+autovacuum drift, plus ledgered width/correlation/probe-rows/AGG_MIXED/etc.
+Next: R61 scope from the ledgered follow-ups (executor NL-probe/Memoize
+completion is trigger-gated on a top ever moving — P3 holds, so optional).

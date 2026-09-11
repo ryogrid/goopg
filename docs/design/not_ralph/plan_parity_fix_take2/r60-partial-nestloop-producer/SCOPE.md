@@ -206,8 +206,10 @@ producer); SEMI/ANTI jt-math (inherited helper limitation).
 
 Beside `addNLIPaths`, AFTER the `!pathParamByRel(i, outer)` block (the
 producer's point is parameterized inners — gating on unparameterized
-would refuse exactly its inputs), reusing the already-computed
-`paramSrc`. PG runs it in the post-serial-arms parallel block; goopg's
+would refuse exactly its inputs), leaving the already-computed
+`paramSrc` unused (partial results must be fully unparameterized, so
+there is no star-schema exception to test — the code comment states
+this; an earlier draft said "reusing", which was wrong). PG runs it in the post-serial-arms parallel block; goopg's
 NLI arm already sits post-block unconditionally for every jointype the
 INNER-only pin admits, and the partial-NL arm takes the same seat with
 its own dispatch gate. No caller needs its own gate — the sibling audit

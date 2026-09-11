@@ -375,5 +375,13 @@ func addPathsToJoinrel(s *searchCtx, joinrel, outer, inner *RelOptInfo, clauses 
 	// (joinpath.c:1949), unconditionally for every jointype `nestjoinOK`
 	// admits — which under 03 §4.4's INNER-only pin is all of them.
 	addNLIPaths(s, joinrel, outer, inner, cp, jt, clauses, paramSrc)
+	// R60 (plan-parity-fix take2): PG's post-serial-arms parallel block runs
+	// `consider_parallel_nestloop` over the same pair irrespective of inner
+	// parameterisation — that is the producer's point — so it sits here
+	// beside the NLI arm, outside the `!pathParamByRel` block, with its own
+	// dispatch gate and the already-computed `paramSrc` unused (partial
+	// results must be fully unparameterised; there is no star-schema
+	// exception to test).
+	addPartialNestLoopPaths(s, joinrel, outer, inner, cp, jt, clauses)
 	return nil
 }
