@@ -3838,3 +3838,12 @@ Review APPROVE-WITH-NOTES (sizing-IN slice (e) added — menu now
 exhaustive; Q9-first framed as lineage call; SHOW capture + Q9-match
 STOP + (d)-attribution + spotcheck-branch provenance required).
 Next: Step-0 measurement per §1, then the scoped pricing/sizing slice.
+R68 STEP-0 DONE 2026-09-11 (`r68-joinorder-costing-step0/STEP0.md`,
+review APPROVE-WITH-NOTES, 4 blocking remediated): Q9 re-measured —
+L6 NLI-winner 117342.97 (true spine L2→L6 re-derived) vs
+PG-partition-hash 528k dominated; sizing/admission/parameterisation
+OUT, pricing IN two-sided; R53's hash-arm question SUPERSEDED (NLI
+took L3–L6). Slice (a): NLI 0.068/probe join-added audit at
+joinpathsnli.go + nestloopCost (no joinsearchnlicost.go exists).
+Evidence filed (trace/plan/PG/SHOW halves). Next: slice-(a)
+implementation per the STEP0 bar.
