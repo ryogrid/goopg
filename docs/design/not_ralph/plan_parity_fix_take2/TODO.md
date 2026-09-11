@@ -3869,6 +3869,12 @@ eqjoinsel_semi non-MCV (nd1=1.5M unscaled vs nd2=347537; inner qual
 not driving). Follow-up: election/firing-rule program (Q4-closing
 path). Tree clean (temp reverted, grep-proof, byte-identity
 re-verified).
+R72 SCOPE READY 2026-09-12 (`r72-election-step0/SCOPE.md`): election
+program Step-0 (Q4 grouping + ordered elections re-measured, PG rule
+cited, one scoped slice). Review APPROVE-WITH-NOTES (diverging
+qualifier, slice-menu exclusions recorded, (c)-exemption, grounds
+spot-check, punctuation — all applied). Next: Step-0 measurement
+per §1, then the scoped slice.
 R68 SCOPE READY 2026-09-11 (`r68-joinorder-costing-step0/SCOPE.md`):
 join-order costing Step-0 (Q9 L-divergence re-measured, sizing vs
 pricing re-adjudicated — R53 numbers stale via R59/R64/R62/R57/R54).
