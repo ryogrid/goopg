@@ -3692,3 +3692,24 @@ pp verdict artifacts saved (`/tmp/pp2/r65/pp65-mine.txt` fixtures
 missing files); "24/24 MATCH" = digest-equality wording (logs print
 OK); Q9-cost side-column swing confirmed verdict-neutral by
 re-derivation. Next: commit -n + push (explicit pathspec).
+R65 LANDED 2026-09-11 (`cdfe9ed32` code+pins+REPORT+TODO, pushed;
+errata `49b690d82` — 65433 attribution, clone state, pre/post delta
+numbers). P0–P4 all green: Q11→MATCH, pp 6/14/0/2 vs fixtures AND
+live PG, values 24/24 MATCH pre/post, DS SF0.25 PASS=96 SKIP=3,
+plan-gate opt-out (pre/post identical 20/22 verdict sets vs stale
+Sep-05 baseline). Rendering 7→5: Q3/Q5 shed, Q11 closed, Q10 partial
+(Group-Key FD-trim remainder), Q7/Q9/Q13/Q16 keep alias-vs-source
+lines (R65 SCOPE P1 named both residuals: Q13-key-2 transitive,
+Q16 pass-through).
+R66 SCOPE-INTENT (K11(d) alias→source Sort/Group keys — the last
+R65-ordered query-closing round before the (a) re-triage): PG
+renders key source expressions where goopg renders output aliases
+(Q7/Q9/Q13/Q16 = 4 of the 5 remaining `rendering` flags; Q10's is
+Group-Key FD-trim = planner work, explicitly out). Probe-first:
+dump key-expr node types + child kinds on small fixtures before
+theorising (K4/K11a-class error guard). Re-triage note for the
+SCOPE: (a) Materialize reconfirmed queued-behind-join-order —
+PG's Materialize in Q5/Q8 wraps 1-row region NL inners inside NL
+shapes goopg does not pick (goopg HJ+Memoize); a producer alone
+moves nothing (R63 triage stands, evidence `/tmp/pp2/r65/`
+r65mine vs r65pg Q5/Q8).
