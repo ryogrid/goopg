@@ -46,9 +46,11 @@ top Sort where the Distinct output already satisfies ORDER BY.
 
 In the M0097-0046 block (`planner.go`, after `outerKeys`
 built, before wrapping): if `out` is `*optimizer.Distinct`
-(type-gate — user DISTINCT ON never reaches here, and a
-plain-DISTINCT unique candidate is still `*Distinct`;
-anything else keeps the Sort) AND every key in `outerKeys`
+(type-gate — user DISTINCT ON never reaches here; note a
+plain-DISTINCT unique-candidate win builds `*DistinctOn`
+(`createplansimple.go:258-259`), NOT `*Distinct`, so the
+type-gate is load-bearing exactly there — declining keeps
+the Sort, safe) AND every key in `outerKeys`
 satisfies ASC + nulls-last (read from the effective
 `outerKeys` entries — `sortByNullsFirst` already applied —
 never the raw `sb`) + positional-prefix on the Distinct

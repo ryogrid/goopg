@@ -4098,3 +4098,18 @@ worktree binary (stale tmp binary caused a false 18-query
 diff first — inode check insufficient, provenance
 required). Follow-ups: ParamRef allowlist, outer-Sort
 elimination, `$0` display.
+R84 LANDED 2026-09-12 (`r84-distinct-outer-sort-skip/REPORT.md`,
+review APPROVE-WITH-NOTES, no blocking): skip redundant
+M0097-0046 outer Sort over *Distinct (type-gate fail-closed;
+ASC+nulls-last positional-prefix rule — sound because
+distinctOp always re-sorts ASC/NL over all columns).
+Q41 3→1 cats (`Limit→Unique→Sort→SeqScan`, PG shape modulo
+`$0` display); corpus join-order 95→94, sort 80→79.
+Gates: units (bak debris excluded) + suites fresh (6 new
+pins: skip/keep shapes, NULL ordering both directions) +
+spotcheck + SF0.25 sweep (PASS=96, MISMATCH=0; plan-shape
+Q41-only) + DS A/B (Q41-only) + TPC-H A/B 22/22 vs TRUE
+HEAD worktree binary (stale tmp binary false alarm:
+inode check insufficient, provenance required). Follow-ups:
+`$0` display (Q41's last gap), ParamRef LIMIT allowlist,
+outer-Sort work beyond the skip (none needed).

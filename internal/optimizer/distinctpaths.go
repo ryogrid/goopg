@@ -112,6 +112,48 @@ func sizeDistinctRelFromNode(rel *RelOptInfo, distinctNode *Distinct) {
 	rel.AvgVarBytes = nodeAvgVarBytes(cols)
 }
 
+// distinctOutputSatisfiesOrder reports whether a DISTINCT node's output
+// already delivers a required ORDER BY, making the M0097-0046 outer Sort
+// redundant (R84). Sound iff ALL of the following hold:
+//
+//   - out is *Distinct (type-gate, fail-closed): its executor,
+//     distinctOp, hash-dedups then ALWAYS re-sorts ascending,
+//     NULLs last, over all columns — input order is destroyed,
+//     so the delivered order is exactly (c0 ASC NL, c1 ASC NL,
+//     …). *DistinctOn streams input order instead (different
+//     operator, different argument — out of scope here).
+//   - every required key is ASC with nulls-last (read from the
+//     effective SortKey entries — sortByNullsFirst already
+//     applied — never the raw parser flags).
+//   - the required keys are a positional prefix of the output:
+//     key i is a ColumnRef with Index == i, for positions
+//     0..n-1 in order. A full-row lexicographic ASC/NL order
+//     satisfies exactly its prefixes — ORDER BY (c1) alone is
+//     NOT satisfied by a (c0,c1) ordering.
+//
+// Anything else keeps the Sort. In particular DESC, explicit
+// NULLS FIRST, non-ColumnRef keys, and non-prefix keys all
+// decline — root-0036/DESC behavior is preserved by
+// construction.
+func distinctOutputSatisfiesOrder(out Node, outerKeys []SortKey) bool {
+	if _, ok := out.(*Distinct); !ok {
+		return false
+	}
+	if len(outerKeys) == 0 {
+		return false
+	}
+	for i, k := range outerKeys {
+		if k.Desc || k.NullsFirst {
+			return false
+		}
+		cr, ok := k.Expr.(*ColumnRef)
+		if !ok || cr.Index != i {
+			return false
+		}
+	}
+	return true
+}
+
 // distinctAllColKeys is one ascending SortKey per output column — the input
 // order a streaming dedup consumes (and the Sort the producer stacks when
 // the input does not deliver it).

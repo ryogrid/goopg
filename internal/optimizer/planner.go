@@ -2413,7 +2413,7 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 				}
 				outerKeys = append(outerKeys, SortKey{Expr: e, Desc: sb.Desc, NullsFirst: sortByNullsFirst(sb)})
 			}
-			if len(outerKeys) > 0 {
+			if len(outerKeys) > 0 && !distinctOutputSatisfiesOrder(out, outerKeys) {
 				out = &Sort{pos: s.Pos(), Child: out, Keys: outerKeys}
 			}
 		}
