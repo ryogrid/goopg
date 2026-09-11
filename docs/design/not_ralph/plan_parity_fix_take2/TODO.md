@@ -3929,6 +3929,12 @@ P1 integration splice design (pinned-spine interplay in predp.go,
 createNestLoopPlan stamping), gates at slice commit (values/sweep/pp
 Q4/Q21/Q22). No selectivity/width/election changes. Next: review
 SCOPE, commit/push, then P0 spike.
+R75 P0 DONE 2026-09-12 (`r75-semi-admission-slice/SPIKE.md`, review
+APPROVE): PASS — keeper `semiadmission_test.go`
+(TestSemiAdmissionFilesPricedNLI): SEMI NLI filed rows=2300
+total=160675 ≥ outer 200 through existing arms, no new machinery,
+subset 17 green. P1 integration splice → R76 (relset/sjinfo
+construction + subtree splice via stampPlanCost; no cost terms).
 R68 SCOPE READY 2026-09-11 (`r68-joinorder-costing-step0/SCOPE.md`):
 join-order costing Step-0 (Q9 L-divergence re-measured, sizing vs
 pricing re-adjudicated — R53 numbers stale via R59/R64/R62/R57/R54).
