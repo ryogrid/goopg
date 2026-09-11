@@ -3508,3 +3508,21 @@ not drift); R56 q19/q5 baselines overwritten by driver reuse, recovered
 via R55 + REPORT line 35 (`/tmp/pp2/r59/run.sh` prevents recurrence).
 Evidence tmp-only `/tmp/pp2/r59/`.
 Next: R60 partial-NL producer scope (needs its own scope round first).
+R60 scope READY 2026-09-11 (`r60-partial-nestloop-producer/SCOPE.md`): probe G
+closes the last missing join arm — goopg has zero partial-NL references while
+PG's live Q7 wins through a partial ladder with an index-NL-chain outer.
+Hand-derivation from the R59 Q7 capture (divisors per-rel: d=2.4 workers-2,
+d=4.0 workers-4): {2,3,5} hyp ~129.5k LOSES to 46602.31 (2.78x);
+{1,2,3,5} hyp ~380146 WINS the partial ladder (531599.26→380146,
+Q-cancellation exact); Q7 top IMMOBILE (gather-vs-serial margin 195616 >
+max single-chain shed 151454). ONE cut authorised: `addPartialNestLoopPaths`
+in joinpathsnli.go (NLI sibling: shared residual+memoize pair expansion,
+PG consider_parallel_nestloop/try_partial_nestloop_path mirror) + call site
+beside addNLIPaths. Non-mirrors cited: matpath (no Material kind),
+precheck (CPU-only), UNIQUE_*/top_parent (vacuous), NL Pathkeys nil (shared
+gap), SEMI/ANTI jt-math (inherited helper). Executor OUT by inventory
+(terminatesPartial NLI+Memoize, stamp kinds, hashJoinIsPartialCapable) —
+P3 proves no R60 path wins on Q7. Predictions P0-P4 + WATCH W1/W2
+(too-close-to-call: {2,3,4,5} head ~500, final rung ~9k); any miss →
+DPTRACE A/B re-audit per R59 §1.iii rule. Evidence tmp-only `/tmp/pp2/r60/`.
+Next: review this scope, then R60 implementation per §5 gates.
