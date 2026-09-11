@@ -172,3 +172,61 @@ celebration.
 Evidence tmp-only `/tmp/pp2/` (`r61probe-tpch` SF1 clone,
 `r61dbg-start.log` G-verdict lines, `r61-q11-explain.sql`,
 `r61-q5-explain.sql`); PG reference :65432 (`PGPASSWORD=tpch -U tpch`).
+
+## 7. AMENDMENT A1 (2026-09-11, pre-implementation): display recomputes — two consumers, one gate
+
+**Finding.** The §2 cut was built and EXPLAINed (bin `goopg-r61`): Q11
+HashAggregate still rows=1, costs bit-identical. Per the re-audit rule
+implementation STOPPED and probed once more (temporary `R61A` print,
+reverted): the gate FIRES — `sr.rows=32000 child=*Project est=1`, both
+Q11 aggs (outer + HAVING subselect). P0's mechanism holds; P1's
+delivery does not, because the sized rel is not what EXPLAIN prints:
+
+- `*Aggregate*` carries no `PlanCost` (`plan.go:1288` has no embed; the
+  copy-back comment at `groupingpaths.go:~115` states it outright: "no
+  planCostSetter — EXPLAIN recomputes legacy").
+- EXPLAIN rows/costs for the agg come from
+  `DeriveLegacyDisplayCost(n, EstimateRows(n))` (`plancost.go:168-173`).
+- `EstimateRows(*Aggregate*)` → `estimateAggregate`
+  (`cardinality.go:1123`) recomputes `EstimateRows(a.Child)` = 1 and
+  calls `estimateNumGroups` with it — the §1.ii chain, untouched by
+  the §2 cut.
+
+So the group-count input has TWO consumers: search-rel sizing
+(`sizeGroupingRelFromAgg`, §2 cut) and estimate/display recompute
+(`estimateAggregate`). Sourcing only the first leaves display at 1
+with identical costs — exactly what the `goopg-r61` capture shows.
+
+**Amended cut.** Extract one helper beside `sizeGroupingRelFromAgg` —
+`groupCountInputRows(child Node) int64`: `EstimateRows(child)`,
+overridden by `int64(sr.Rows)` under the identical R54 gate
+(`sr != nil && sr.Rows > 0`) — and call it from BOTH
+`sizeGroupingRelFromAgg` and `estimateAggregate`. Same gate, same
+statistics, same arithmetic; no estimator change, no Yao change.
+
+**Rejected alternative.** Making `*Aggregate*` a `PlanCost` carrier and
+threading the winner's stamp through the copy-back (the PG-faithful
+"EXPLAIN prints path rows" direction). That is Phase 4 upper-planner
+territory (`DeriveLegacyDisplayCost`'s own doc comment reserves
+aggregation replacement to Phase 4); smuggling it into an estimator
+round would entangle display architecture with a rows fix. The (ii)
+recompute-sourcing keeps the round planner-only and display-code-free
+(row NUMBERS move, no stamper logic changes — §4 holds as written).
+
+**Prediction deltas.** P1 mechanism splits: search `grouped.Rows` 1→~80
+(via §2 cut) AND displayed HashAggregate 1→~80 (via `estimateAggregate`
+arm); Sort-above passthrough → 80; Filter → 80×sel (sel per P2).
+Gate 2 additionally asserts the two sides AGREE (search rel 80 +
+display 80); either side unmoved = FAIL. Blast radius of the new arm:
+only `EstimateRows(*Aggregate*)` outputs move — display rows of
+agg-above subtrees and their Sort/Limit passthroughs. Join/search
+pricing is untouched (no join arm changes); `partialaggpaths.go:298`
+uses per-worker rows (different quantity, unchanged); CTE column
+synthesis calls `estimateNumGroups` directly (unchanged, §6). One
+caveat (re-review): `synthesizeCTEStats` (`cte_stats_synthesis.go:58`,
+`out.rows = EstimateRows(entry.body)`) moves when a CTE body is
+Project→Aggregate and feeds CTEScan sizing — the one consumer that can
+alter plan SHAPE. Movement is parity-direction (1→~80, strictly more
+accurate), so not a blocker; gate 3 A/B explicitly includes a
+grouped-CTE-feeding-a-join case to adjudicate it. Any movement beyond
+Q5/Q11 agg subtrees + that case = FAIL.
