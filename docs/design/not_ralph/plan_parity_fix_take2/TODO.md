@@ -3995,6 +3995,24 @@ vs PG two-stage few-blocks+Vitter, same Duj1; most-likely diverger
 = block representation → f1 on insertion-ordered l_orderkey; MCV
 ruled out for this pair. Next: P1 nd-vs-target curves or BLOCKED
 on the ANALYZE gap.
+R79 P1 IN PROGRESS 2026-09-12 (opencode lane): nd-vs-target
+curves {10,100,1000} on l_orderkey both engines, foreground —
+PG :65432 (per-column SET STATISTICS, restore+re-ANALYZE after),
+private goopg clone :5556 (cp-a of clone-tpch-r65; peer :5533
+untouched). SCOPE already reviewed; P1.md + review to follow,
+then commit/push. Verdict (a) replicate-vs-(b) keep per SCOPE.
+R79 P1 DONE 2026-09-12 (`r79-ndistinct-sampler/P1.md`, review
+APPROVE-WITH-NOTES, notes applied): goopg flat ~1.2M at
+10/100/1000 (target=1 degenerate); PG 0.34M at 10/100,
+~1.22M at 1000 (by-design absolute→fraction switch) —
+converge at 1000 (~0.8%), consistent with P0 sampler story.
+Verdict (b) keep superior stats (closer to truth 1.5M at
+10/100, tied at 1000); nd2 ruled out as the lever within
+tested targets; follow-up program must source the semi
+fraction independently of nd2. Contamination episode handled
+(ALTER persists StatTarget — caught, reset, re-ran clean).
+PG restored+verified, goopg clone canonical. No code changed
+(R80 owns estimators).
 R68 SCOPE READY 2026-09-11 (`r68-joinorder-costing-step0/SCOPE.md`):
 join-order costing Step-0 (Q9 L-divergence re-measured, sizing vs
 pricing re-adjudicated — R53 numbers stale via R59/R64/R62/R57/R54).
