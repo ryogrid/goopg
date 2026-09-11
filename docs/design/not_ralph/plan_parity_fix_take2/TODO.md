@@ -3875,6 +3875,21 @@ cited, one scoped slice). Review APPROVE-WITH-NOTES (diverging
 qualifier, slice-menu exclusions recorded, (c)-exemption, grounds
 spot-check, punctuation — all applied). Next: Step-0 measurement
 per §1, then the scoped slice.
+R72 STEP-0 DONE 2026-09-12 (`r72-election-step0/STEP0.md`, review
+APPROVE after one REJECT remediated — PG cites added, ruling
+unified to pure (c)): Q4 grouping elects hashed outright (1426.71 vs
+sorted 6077.69, 4.26x — no tie); ordered loop elects Sort-over-hashed
+1426.78. PG serial winner GroupAggregate-no-sort 192222.42 while its
+own hashed+Sort is 0.5% cheaper (191263.38, enable_sort=off) — 1%
+fuzz tie broken by pathkeys (pathnode.c:50/:185, planner.c:3763/:5291
+cited). P2: semi selectivity 1.0 vs 0.2317, widths 20–28x, semi price
+570.66 vs 191195.81. R71 audit: 0.23 was selectivity misreported as
+cost; rows=3/1500 unlocated (canonical 13490/57066). Controls: Q6
+MATCH/quiet; Q13-inner diverges opposite (hashed arm absent —
+admission gap, Slice-2 MATCH claim stale, R69 suspect unproven);
+Q22-outer second Q4-family member. Ruling (c): no election-rule slice;
+follow-up program (semi-sel re-anchored, widths, semi-rescan). Tree
+clean (temp reverted, optimizer builds).
 R68 SCOPE READY 2026-09-11 (`r68-joinorder-costing-step0/SCOPE.md`):
 join-order costing Step-0 (Q9 L-divergence re-measured, sizing vs
 pricing re-adjudicated — R53 numbers stale via R59/R64/R62/R57/R54).
