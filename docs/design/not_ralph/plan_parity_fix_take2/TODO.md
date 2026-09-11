@@ -4127,4 +4127,17 @@ fall to a bare name when SourceTableIdx is erased. Scope now
 requires binding lookup → owning-ancestor fallback → retain
 `$N` if unresolved. Review 3 APPROVE (no findings; plain +
 ANALYZE ancestor lifetimes verified). Next: `commit -n` +
-push the reviewed scope before code work.
+push completed in `c840f6c75`; implementation began. Initial
+units exposed and updated one old `$0` expectation; full
+optimizer/executor suites then passed. Implementation review 1
+REJECT: binding-first qualification is unsafe across nested
+query levels because SourceTableIdx restarts and `bySrc` is
+outermost-first. Scope amended to an owner-tree-only resolver
+(no global bySrc fallback). Scope-amendment review 1 REJECT:
+raw planChildren also crosses IsolatedScope/CTE and other
+query/DML boundaries. Scope now specifies an audited explicit
+descent allowlist, boundary stops, and dedicated pins. Next:
+scope-amendment review 2 APPROVE (explicit unknown-node status
+note applied); `commit -n` + push the amendment, then repair
+implementation + add nested
+ID-collision/ambiguous-owner pins before corpus gates.

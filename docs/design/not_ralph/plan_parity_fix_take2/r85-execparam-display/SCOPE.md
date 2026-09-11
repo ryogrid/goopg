@@ -57,18 +57,46 @@ owning Subquery/Exists/non-row-In expression, validates the
 WHOLE mapping as above, installs it only for
 `render(sp.plan, ...)`, and restores the previous map after
 the body (nested bodies shadow and restore correctly). The
-`ExecParamRef` arm consults the active map. For a hit it first
-asks `reg.names().column(source.SourceTableIdx, source.Name,
-true)` for a qualified name. If that stays bare (binding ID
-erased/unregistered), it uses the existing owning-host
-`resolveInAncestor(reg.ancestorNode(), source.Name)` fallback
-and emits `<relation>.<column>`. During a SubPlan body's detail
-render the existing walker deliberately leaves `reg.ancestor`
-at the owning host; nested bodies shadow this through the same
-walker lifetime. If neither route yields a qualified name, the
-arm leaves `$N` unchanged — it MUST NOT emit a bare source.
-Thus qualification is guaranteed or substitution declines,
-matching PG's forced host-Var qualification.
+`ExecParamRef` arm consults the active map. It MUST NOT use
+the statement-global `explainNames.bySrc` lookup first:
+`SourceTableIdx` restarts at each query level and bySrc is
+outermost-first, so a nested body's slot can otherwise print
+the outermost relation instead of its immediate host.
+
+For a hit, a new owner-scoped resolver walks the owning host
+with a dedicated fail-closed child allowlist (not raw
+`planChildren`, and never expression-hanging `NodeSubplans`).
+It stops before every audited explicit scope boundary:
+`Project.IsolatedScope`, `CTEScan.Child` (the CTEScan itself
+may be a candidate), SetOp branches, RecursiveUnion arms,
+CTEDMLPrefix plans/body, Copy.Query, and Insert/Update/Delete/
+Merge children. The remaining `planChildren` arms were
+audited: ordinary upper nodes, joins/NLI, bitmap trees,
+Memoize, OrdinalityWrap, RowsFrom and ProjectSet do not mark
+a query-scope reset and are safe to descend; leaf scan nodes
+terminate naturally. The traversal returns an explicit
+recognized/unknown status so an unknown future leaf cannot be
+mistaken for a recognized terminal node; unknown kinds make
+the whole resolution decline.
+
+Within that owner-scope allowlist, the resolver selects
+scan-like candidates exposing `source.Name`; when
+`SourceTableIdx != 0`, the candidate column must carry that
+same ID, while ID 0 uses a unique-name match (the aggregate-
+erasure fallback). Duplicate visits are de-duplicated by node
+identity/RTID. Exactly one candidate is rendered with its
+RTID-keyed `bySource` name, falling back to that candidate's
+truthful relation/alias base only when it has no registered
+RTID. Zero or multiple candidates leave `$N` unchanged. This
+proves the source belongs to the active owning level before
+printing; no global bySrc fallback is permitted.
+
+During a SubPlan body's detail render the existing walker
+deliberately leaves `reg.ancestor` at the owning host; nested
+bodies shadow this through the same walker lifetime. The arm
+MUST NOT emit a bare source. Thus qualification is guaranteed
+at the correct query level or substitution declines, matching
+PG's forced host-Var qualification.
 Display-only: planner, executor, costs untouched — values-
 safe by construction.
 
@@ -97,7 +125,12 @@ K100; anything beyond EXPLAIN text.
   ExecParamRef decline; unmapped-ID `$N`; direct ColumnRef
   forced-qualified substitution; a zero/erased source ID
   resolved through the owning ancestor; an unresolvable
-  direct ColumnRef retaining `$N`; whole-owner decline on
+  direct ColumnRef retaining `$N`; a nested query-level ID
+  collision resolving to the immediate owner (never the
+  outermost bySrc winner); an ambiguous owner retaining `$N`;
+  same-name/same-ID scans hidden below IsolatedScope and
+  CTEScan.Child boundaries never selected;
+  whole-owner decline on
   length mismatch, duplicate slot, nil Arg, unsupported Arg;
   nil-registry fallback.
 
@@ -139,3 +172,18 @@ alongside. `match` count is NOT a criterion
   reviewer verified the owning-ancestor lifetime in both
   plain EXPLAIN and ANALYZE and the nil/ambiguity-safe
   qualification fallback.
+- Implementation review 1: REJECT. The binding-first lookup
+  was not query-level-safe because SourceTableIdx restarts and
+  `bySrc` is outermost-first; nested SubPlans could print the
+  wrong relation. The algorithm above now resolves and proves
+  membership inside the active owning host tree and forbids a
+  global bySrc fallback. Re-review is required before changing
+  the implementation further.
+- Scope-amendment review 1: REJECT. Raw `planChildren` crosses
+  IsolatedScope and CTE-body boundaries (and other audited
+  explicit query/DML boundaries). The resolver now has an
+  explicit descent allowlist and boundary stops as specified
+  above. Re-review is required before implementation repair.
+- Scope-amendment review 2: APPROVE. No blocking findings;
+  the only note (explicit recognized/unknown traversal status)
+  is incorporated above.
