@@ -3890,6 +3890,14 @@ admission gap, Slice-2 MATCH claim stale, R69 suspect unproven);
 Q22-outer second Q4-family member. Ruling (c): no election-rule slice;
 follow-up program (semi-sel re-anchored, widths, semi-rescan). Tree
 clean (temp reverted, optimizer builds).
+R73 SCOPE READY 2026-09-12 (`r73-semi-price-audit/SCOPE.md`): NL-SEMI
+price audit (R72 program item 3 + display-seam suspect — Q4 SEMI
+570.66 < its own outer 15570.66 is impossible via nestloopCost AND
+via DeriveLegacyDisplayCost-default, so P0 attributes path-cost vs
+display-seam first). Fix iff mis-transcribed (R69 discipline); widths
+(R70) and selectivity (program item 1) explicitly out; Q22-ANTI
+read-only verification, no bundling. Next: review SCOPE, commit/push,
+then P0 attribution.
 R68 SCOPE READY 2026-09-11 (`r68-joinorder-costing-step0/SCOPE.md`):
 join-order costing Step-0 (Q9 L-divergence re-measured, sizing vs
 pricing re-adjudicated — R53 numbers stale via R59/R64/R62/R57/R54).
