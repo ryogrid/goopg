@@ -4113,3 +4113,18 @@ HEAD worktree binary (stale tmp binary false alarm:
 inode check insufficient, provenance required). Follow-ups:
 `$0` display (Q41's last gap), ParamRef LIMIT allowlist,
 outer-Sort work beyond the skip (none needed).
+R85 SCOPE READY 2026-09-12
+(`r85-execparam-display/SCOPE.md`): render a correlated
+`ExecParamRef` from the owning sublink's `ParParam`/`Args`
+source expression, falling back to `$N` when unmapped or
+unsafe. Display-only Q41 last-gap slice; implementation has
+not started. Review 1 REJECT: forced qualification,
+fail-closed owner-map validation, walker soundness, and the
+corpus probe list were incomplete. Scope revised to a direct-
+ColumnRef allowlist and exact H:{Q17,Q20}/DS:{Q6,Q41}
+pre-census. Review 2 REJECT: forced qualification could still
+fall to a bare name when SourceTableIdx is erased. Scope now
+requires binding lookup → owning-ancestor fallback → retain
+`$N` if unresolved. Review 3 APPROVE (no findings; plain +
+ANALYZE ancestor lifetimes verified). Next: `commit -n` +
+push the reviewed scope before code work.
