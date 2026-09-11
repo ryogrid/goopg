@@ -3970,6 +3970,12 @@ passes; gates green (values 24/24, sweep PASS=96, pp Q4 election
 story intact, 19/22 identical, optimizer 2863). DS 90-plan churn
 attributed (join-flips=R66/R69, agg-flips=expected downstream).
 Next: rows/width program (R72 items 1–2).
+R78 SCOPE READY 2026-09-12 (`r78-semi-selectivity/SCOPE.md`): SEMI
+selectivity Step-0 — P0 would-be probe (call eqJoinSelectivitySemi
+with node-derived stats at estimateNLIndexJoin, log only; PASS iff
+≈ PG 0.23), P1 slice (wire match fraction into the NLI estimator
+for Semi/Anti only) iff P0 reproduces. INNER NLI rows + widths
+(R70) explicitly out. Next: review SCOPE, commit/push, then P0.
 R68 SCOPE READY 2026-09-11 (`r68-joinorder-costing-step0/SCOPE.md`):
 join-order costing Step-0 (Q9 L-divergence re-measured, sizing vs
 pricing re-adjudicated — R53 numbers stale via R59/R64/R62/R57/R54).
