@@ -3948,6 +3948,12 @@ helpers at 490456.34 ≥ outer 15570.66 (×2 identical, PG 191195.81
 same order); caveats recorded (rows=5 per-probe, cp threading,
 numQualOps). P1 measurement+gates → next; R77 implementation iff P1
 clean. Tree clean (temp reverted, optimizer builds).
+R76 P1 DONE 2026-09-12 (`r76-nli-price-splice/P1.md`, review
+APPROVE): TEMP stamp prices Q4 SEMI at 490456.34 (shape unchanged,
+pp election story intact on real base); 19/22 byte-identical (Q4/
+Q21/Q22 costs-only + Q4 rows note + Q22 display-rows seam noted);
+subset 16 green; values/sweep DEFERRED to R77 (recorded deviation).
+R77 = production splice (cp threading, keeper, full gates).
 R68 SCOPE READY 2026-09-11 (`r68-joinorder-costing-step0/SCOPE.md`):
 join-order costing Step-0 (Q9 L-divergence re-measured, sizing vs
 pricing re-adjudicated — R53 numbers stale via R59/R64/R62/R57/R54).
