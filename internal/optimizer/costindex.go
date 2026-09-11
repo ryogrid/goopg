@@ -81,7 +81,13 @@ type indexScanInputs struct {
 	// loopCount is `cost_index`'s parameter of the same name: how many times
 	// this scan is expected to be RE-executed, which for a parameterised path
 	// is the row count of the outer relations supplying its parameter
-	// (`get_loop_count`, indxpath.c:3266). 0 or 1 means a single execution.
+	// (`get_loop_count`, indxpath.c:3266). 0 or 1 means a single execution —
+	// with one R59-noted exception: at numSAScans > 1, 0 keeps the legacy
+	// serial page cost (numScans = 0) while 1 takes the Mackert-Lohman arm,
+	// so the two are NOT interchangeable there. No producer sets numSAScans
+	// > 1 yet (P2-09b owns it); unifying the 0-convention belongs to that
+	// round, which can adjudicate it against PG's SAOP pessimism with a real
+	// producer in hand.
 	//
 	// It exists so the returned cost stays "one execution": PG pro-rates the
 	// amortised total back down by `loopCount` for exactly that reason, which
@@ -341,10 +347,44 @@ func btreeIndexAMCostPages(cp costParams, in indexScanInputs) (startup, total, i
 		numIndexPages = math.Ceil(numIndexTuples * in.indexPages / in.indexTuples)
 	}
 
-	// Index pages are random fetches, so they carry goopg's probe calibration
-	// (see the file header). With the default multiplier of 1.0 this is PG's
-	// own arithmetic exactly.
-	total = numIndexPages * cp.randomPageCost * indexProbeCostMultiplier
+	// num_sa_scans, clamped to at most a third of the index's pages
+	// (`btcostestimate`, selfuncs.c:7718-7719: descents cannot exceed leaf
+	// pages, with headroom for the btree's leaf-level continuation) and at
+	// least 1. PG clamps BEFORE genericcostestimate, so the descent charge
+	// below and the repeated-scan arm here both read the clamped value;
+	// numSAScans <= 1 reproduces the pre-existing single charge exactly.
+	numSA := in.numSAScans
+	if numSA < 1 {
+		numSA = 1
+	}
+	if numSA > 1 {
+		numSA = math.Min(numSA, math.Ceil(in.indexPages/3))
+		numSA = math.Max(numSA, 1)
+	}
+
+	// The repeated-scan arm (`genericcostestimate`, selfuncs.c:7180-7204).
+	// A scan repeated loopCount times — a parameterised path inside a
+	// nestloop — with numSA descents per execution touches numIndexPages ×
+	// numScans pages in total, but the second execution largely re-reads the
+	// first's pages. So PG runs Mackert-Lohman over the TOTAL touches (N =
+	// T = index size, "as if there were one tuple per page") and pro-rates
+	// the cost back to ONE execution by num_outer_scans = loopCount — never
+	// by numScans, since ScalarArrayOp repeats are internal to the scan.
+	// Index pages are random fetches, so the pro-rated cost carries goopg's
+	// probe calibration (see the file header) exactly as the heap bounds do.
+	// Gated on numScans, not loopCount, since numSA > 1 repeats scans at
+	// loopCount 1; the numScans <= 1 branch is the pre-existing arithmetic
+	// bit-identically. R59 (plan-parity-fix-take2).
+	numScans := numSA * in.loopCount
+	var indexPageCost float64
+	if numScans > 1 {
+		pagesFetched := indexPagesFetched(numIndexPages*numScans, int64(in.indexPages), in.indexPages, in.totalTablePages, cp.effectiveCacheSize)
+		indexPageCost = (pagesFetched * cp.randomPageCost * indexProbeCostMultiplier) / in.loopCount
+	} else {
+		// A single index scan: spc_random_page_cost per page touched.
+		indexPageCost = numIndexPages * cp.randomPageCost * indexProbeCostMultiplier
+	}
+	total = indexPageCost
 	total += numIndexTuples * cp.cpuIndexTupleCost
 
 	// The B-tree descent (selfuncs.c:7780): tree height plus the leaf page,
@@ -355,20 +395,8 @@ func btreeIndexAMCostPages(cp costParams, in indexScanInputs) (startup, total, i
 	//
 	// With SAOP quals the descent is charged once per estimated descent
 	// (`btcostestimate`, selfuncs.c:7762-7782): once to startup, num_sa_scans
-	// times to total. The count itself is clamped to at most a third of the
-	// index's pages (:7718-7719: descents cannot exceed leaf pages, with
-	// headroom for the btree's leaf-level continuation) and at least 1.
-	// numSAScans <= 1 reproduces the pre-existing single-descent charge
-	// exactly. P2-09b's remainder (the numIndexTuples/rint adjustment and
-	// the log2(N) descent term) stays out.
-	numSA := in.numSAScans
-	if numSA < 1 {
-		numSA = 1
-	}
-	if numSA > 1 {
-		numSA = math.Min(numSA, math.Ceil(in.indexPages/3))
-		numSA = math.Max(numSA, 1)
-	}
+	// times to total. P2-09b's remainder (the numIndexTuples/rint adjustment
+	// and the log2(N) descent term) stays out.
 	descent := float64(in.treeHeight+1) * pageCPUMultiplier * cp.cpuOperatorCost
 	startup = descent
 	total += numSA * descent

@@ -339,6 +339,15 @@ func addNLIPaths(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp costParams,
 				RequiredOuter: req,
 				// create_nestloop_path (pathnode.c:2590). C-19a.
 				ParallelSafe: parallelSafeWith(joinrel, o, in),
+				// initial_cost_nestloop (costsize.c:3282-3284): enable_nestloop
+				// counts on EVERY nestloop path, parameterised inner or not —
+				// PG has no separate index-nestloop switch — plus the inner
+				// and outer inputs' own counts. The plain-NL arm (pathgen.go)
+				// always had this; the NLI arm did not, which R59's probe
+				// repricing exposed: with nestloop disabled the NLI path
+				// priced below the merge join and stole a contest the test
+				// fixture had closed to every nestloop.
+				DisabledNodes: disabledNodesFor(!cp.enableNestLoop, o, in),
 			}, "nestloop.index")
 		}
 	}

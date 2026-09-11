@@ -3492,3 +3492,19 @@ pro-rates nothing at loopCount 25 either). Pricing alone does
 NOT flip Q7; partial-NL (R60 surface) + executor NL-probe work
 still ledgered. Evidence tmp-only `/tmp/pp2/r56/`.
 Next: R59 implementation (pin-then-cut per §3 gates) — then R60 partial-NL producer scope.
+R59 implementation LANDED 2026-09-11 (report `r59-index-probe-loopcount/REPORT.md`):
+reproduction gate 9.2030/10.1302 exact, pins 1.2488 ∈ [1.2,2.0] /
+2.2051 ∈ [2.0,3.0], ONE cut in `btreeIndexAMCostPages` + NLI
+enable-gating fallout fix (`DisabledNodes`, costsize.c:3282). Gates:
+units green, vet clean, values 8/8 MATCH, Q19 MATCH, Q5 top identical
+(split-wins non-vacuous), Q84 tpch identical / ds05 toward-PG
+(run-stable), pp-diff unparsed=0 (match 5 vs 1), DS SF0.5 PASS=94 +
+Q72 TIMEOUT (solo-reproduced 317s; planner toward-oracle, ledgered
+executor NL-probe gap; status channel non-blocking precedent).
+Adjudications carried to review: §3 "Q7 immobile" FAILED → re-audited
+per §1.iii (non-NLI bit-identical, winner math coherent); FIX-SEED §5
+"Q9 split wins" + "Q84 identical" literally breached (priced mechanism,
+not drift); R56 q19/q5 baselines overwritten by driver reuse, recovered
+via R55 + REPORT line 35 (`/tmp/pp2/r59/run.sh` prevents recurrence).
+Evidence tmp-only `/tmp/pp2/r59/`.
+Next: R60 partial-NL producer scope (needs its own scope round first).

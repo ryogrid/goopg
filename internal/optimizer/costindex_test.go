@@ -158,6 +158,81 @@ func TestCostIndexScanFullScanArithmetic(t *testing.T) {
 	}
 }
 
+// TestR59ProbePinLineitem920 is the R59 §3 reproduction gate turned
+// prediction pin (pin-then-cut): the lineitem probe's TRACED inputs through
+// costIndexScanCore reproduced the traced total EXACTLY pre-cut (9.2030 —
+// the gate passed, inputs faithful), and now pin the post-cut value inside
+// the §3 band.
+//
+// Trace: :5533 clone, temporary GOOPG_R59_PIN_DUMP input dump (reverted), plan
+// byte-identical to the R56 capture. DPPATH: index.parameterised relids={1}
+// reqouter={2} rows=2 startup=0.38 total=9.20. The R59PIN literals below are
+// copied verbatim (sel at %.10g — 1e-10 relative, moves the total ~1e-9:
+// immaterial at cent precision).
+//
+// Two SCOPE §1.i narrative corrections the trace forced: numQualOps is 2, not
+// 1, and the probed selectivity is 8.52e-7 (measured ndistinct), not 1/1.5M —
+// the decomposition still closes to the cent.
+func TestR59ProbePinLineitem920(t *testing.T) {
+	cp := defaultCostParams()
+	cp.effectiveCacheSize = 262144 // traced (clone effective_cache_size); the default is 4GB
+	got, _, _ := costIndexScanCore(cp, indexScanInputs{
+		relPages: 136393, relTuples: 6001255,
+		indexPages: 8588, indexTuples: 6001255, treeHeight: 2,
+		selectivity:             8.519796172e-07,
+		uniqueEqualityOnAllKeys: false,
+		correlation:             -0.0017810857389122248,
+		totalTablePages: 168880,
+		loopCount:       1500000,
+		numQualOps: 2,
+	}, 0)
+	if !approxCost(got.Startup, 0.375) {
+		t.Errorf("startup = %v; want 0.375 (the treeHeight-2 descent)", got.Startup)
+	}
+	// Post-cut (R59 §2 arm landed): the SCOPE §3 prediction band is
+	// [1.2, 2.0], central ≈1.3. Hand decomposition at the traced inputs:
+	// index-side ML over 1×1.5M touches caps at the 8588-page index →
+	// 8588×4×2/1.5M = 0.0458 + 5.11×0.005 cpuIndex = 0.0714; heap 0.7274
+	// and CPU 0.075 unchanged; 0.375 + 0.0714 + 0.7274 + 0.075 = 1.2488.
+	if got.Total < 1.2 || got.Total > 2.0 {
+		t.Errorf("total = %v; want the §3 band [1.2, 2.0]", got.Total)
+	}
+	if !approxCost(got.Total, 1.2487967346880979) {
+		t.Errorf("total = %v; want 1.2487967346880979", got.Total)
+	}
+}
+
+// TestR59ProbePinOrders1013 is the same gate's second pin: the orders probe,
+// DPPATH index.parameterised relids={2} reqouter={3} rows=16 startup=0.38
+// total=10.13 — reproduced exactly pre-cut (10.1302), now pinning the
+// post-cut value: the same arm with shallower pro-rating over 150k scans.
+func TestR59ProbePinOrders1013(t *testing.T) {
+	cp := defaultCostParams()
+	cp.effectiveCacheSize = 262144 // traced; see TestR59ProbePinLineitem920
+	got, _, _ := costIndexScanCore(cp, indexScanInputs{
+		relPages: 28435, relTuples: 1500000,
+		indexPages: 1406, indexTuples: 1500000, treeHeight: 2,
+		selectivity:             1.048240005e-05,
+		uniqueEqualityOnAllKeys: false,
+		correlation:             -0.0036176906432956457,
+		totalTablePages: 168880,
+		loopCount:       150000,
+		numQualOps: 0,
+	}, 0)
+	if !approxCost(got.Startup, 0.375) {
+		t.Errorf("startup = %v; want 0.375 (the treeHeight-2 descent)", got.Startup)
+	}
+	// Post-cut: the §3 band is [2.0, 3.0], central ≈2.4 — the same arm with
+	// shallower pro-rating over 150k scans (residual vs PG 1.54 is the 2.0
+	// knob + width-inflated relPages, by design per §1.ii).
+	if got.Total < 2.0 || got.Total > 3.0 {
+		t.Errorf("total = %v; want the §3 band [2.0, 3.0]", got.Total)
+	}
+	if !approxCost(got.Total, 2.2051380003749999) {
+		t.Errorf("total = %v; want 2.2051380003749999", got.Total)
+	}
+}
+
 // TestCostIndexScanStartupIsDescentOnly: an index scan can emit its first row
 // after descending the tree, so its startup cost is the descent and nothing
 // else. This is what lets it beat a sort (whose startup is the whole sort) on
