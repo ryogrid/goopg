@@ -547,3 +547,102 @@ Absolutely forbidden:
 - Adding `if (goopg_compat) {...}` branches or similar workarounds.
 - Any change that would make PG behave differently from upstream release.
 
+## plan-parity-take2 work appendix (TODO.md rounds)
+
+Day-to-day procedures for rounds under
+`docs/design/not_ralph/plan_parity_fix_take2/TODO.md`. Read this whole
+section after any context compaction BEFORE running anything — it exists
+because post-compaction sessions kept losing `psql`/`pgbench`/scripts.
+
+### 0. Post-compaction bootstrap (run first, every time)
+
+```bash
+cd /home/ryo/work/goopg/goopg   # or $REPO_ROOT; all paths below are relative to it
+export PATH="$PWD/postgres/local_install/bin:$PATH"
+export LD_LIBRARY_PATH="$PWD/postgres/local_install/lib:${LD_LIBRARY_PATH:-}"
+which psql pgbench pg_isready   # must all resolve; if not, the exports above did not run
+```
+
+`psql`, `pgbench`, `pg_isready`, `pg_ctl` live ONLY in
+`./postgres/local_install/bin/` (never on a default PATH). That tree is a
+git submodule and the READ-ONLY PG 18.3 oracle — never modify it.
+
+### 1. Cluster map + auth (copy-paste)
+
+| port | engine | db | user | password | data dir |
+|---|---|---|---|---|---|
+| 65432 | PG 18.3 TPC-H ref | `tpch` | `postgres` | `postgres` | `bench/tpch/runtime/pgdata` |
+| 65433 | goopg TPC-H bench (SF=1 HammerDB) | `tpch` | `tpch` | `tpch` | `bench/tpch/runtime_goopg/data` |
+| 65436 | goopg TPC-DS SF=1 | — | `postgres` | (trust, loopback) | `bench/tpcds/runtime_goopg/data` |
+| 65437 | goopg TPC-DS SF=0.25 gate | — | `postgres` | (trust, loopback) | `bench/tpcds/runtime_goopg/data-sf025` |
+| 65438 | PG 18.3 TPC-DS ref (`tpcds`, `tpcds025`) | `tpcds025` | `ryo` | (peer/trust) | `bench/tpcds/runtime/pgdata` |
+
+65434/65435 are reserved nightly ci/batch clone lanes — never use.
+Env files (source, don't hand-roll): `bench/tpch/env.sh` (+
+`env_goopg.sh`: `GOMEMLIMIT=12GiB`, `GOGC=off`) and
+`bench/tpcds/env_tpcds.sh` (single source of truth for TPC-DS
+dirs/ports; `GOOPG_BIN` overridable for a private binary).
+
+### 2. Server lifecycle (binding)
+
+- ALWAYS through the cgroup cap (WSL2 OOM containment):
+  `GOOPG_CG_UNIT=<unique-name> scripts/goopg-test-run.sh <bin> start -D <dir>
+  --listen 127.0.0.1:<port>` (flag is `--listen`, not `-p`).
+- Throwaway/manual servers: private `cp -a` clone under `/tmp/pp2/` +
+  private 55xx port (5533/5534). NEVER bind 6543x for manual work, never
+  point a manual server at a bench data dir (peer agents share them).
+- NEVER `pkill -f goopg` (self-matches the invoking shell, exit 144).
+  Stop via `<bin> stop -D <dir>` or the lifecycle scripts
+  (`bench/tpch/{setup_goopg,stop_goopg,setup_pg,stop_pg}.sh`,
+  `bench/tpcds/server.sh {start|stop|status} [sf1|sf025|pg|all]`).
+- `timeout N psql` kills only the CLIENT; the server keeps executing —
+  reap orphans before measuring.
+
+### 3. Where things live (stop hunting)
+
+- Round dirs: `docs/design/not_ralph/plan_parity_fix_take2/r<NN>-<slug>/`
+  (`SCOPE.md` + `REPORT.md` per round). Ledger: `TODO.md` in the same dir
+  (+ `plan-parity-root-causes.md` rev 2 = authoritative diagnosis).
+- Live PG plan capture (the parity criterion — NOT `bench/tpch/plans-pg/`,
+  which is stale and serial, TODO.md K9):
+  `docs/design/not_ralph/plan_parity_fix_take2/r2-instrument/capture-tpch.sh`
+  and `capture-tpcds.sh` (GUCs pinned in-session).
+- Estimator/plan audit: `go build -o <out> ./cmd/estimate-audit`, then
+  `./estimate-audit -plan-only -label <l> -out <dir> -port <goopg-port>
+  -ref-port 65432 -ref-db tpch -ref-user postgres -ref-password postgres`
+  (serial + stats-warmed both sides, Q15 as view-body).
+- Values digest: `go build -o <out> ./cmd/tpch-runner`; `-digest` full
+  sweep + `-diff` for A/B; `-explain` for plan text A/B.
+- Parity diff: `python3 scripts/pg-plan-parity-diff.py <goopg>.plans.txt
+  <pg-plans-dir-or-file>` (`--verbose` for per-divergence records;
+  `--self-test` for the pinned budget).
+- Practice gates: `scripts/tpch-spotcheck.sh` (Q12/Q13 canonical counts);
+  `GOOPG_BIN=tmp/goopg-sf025-bin scripts/tpcds-sf025-regression.sh sweep`
+  (~5 min, oracle `bench/tpcds/runtime_goopg/tpcds-results-sf025/oracle.txt`);
+  `make plan-gate` (needs postgres bin on PATH; strict — FAILS if no server);
+  `RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh`.
+- Scratch: `/tmp/pp2/` (`r<NN>/` per round, `clone-*` data clones,
+  private `*-bin` binaries). Never commit from there; evidence stays
+  tmp-only unless a REPORT cites it.
+
+### 4. Round process (binding, from TODO.md header)
+
+Design Doc under the take2 dir → agent review → reflect → commit + push →
+implement → English results REPORT.md in the round dir → commit + push.
+Investigation/review/implementation may go to subagents; ALL program
+execution is FOREGROUND. Same plan ⇒ timing delta is NOT a regression;
+values gates bind every round (TPC-H digest 24/24 MATCH, TPC-DS SF0.25
+sweep PASS=96 MISMATCH=0 SKIP=3 — TODO.md still says "SF0.5/PASS=95" in
+places; the 2026-09-11 migration to SF0.25 supersedes it).
+Never `git add -A` (foreign WIP in the main tree — explicit pathspec);
+never `gofmt -w` wholesale (baseline go1.25); never `-count=1` on a gate's
+`go test`; never `--no-verify` except when the round's own process
+(`commit -n` per TODO.md) explicitly calls for it.
+
+### 5. Re-audit rule (R59–R65)
+
+Any falsifiable-prediction miss triggers DPTRACE A/B against the
+pre-round binary (build it at HEAD before the cut; same clone, same
+seed) — not celebration. Keep the pre-round binary + clone until the
+REPORT lands.
+
