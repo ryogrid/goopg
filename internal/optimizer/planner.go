@@ -1636,6 +1636,14 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 	// no-op when the package-level kill-switch is off
 	// (`SetNLIEnabled(false)`).
 	node = rewriteJoinsToNLI(node, cat, plannerSet)
+	// R77: price the rewrite-built SEMI/ANTI NLIs BEFORE the upper
+	// elections (aggregate stage, ORDER BY arm) read their seeds —
+	// otherwise the elections stamp winners priced on the seam base
+	// while EXPLAIN-time derivation reprices the rest (mixed
+	// old/new in one plan). Idempotent with the end-of-pipeline
+	// call below (carrier-set nodes are skipped), which additionally
+	// catches nodes rebuilt by later passes.
+	stampSemiProbePrices(node, cat, plannerSet.costParams())
 	// `remapColumnRefsAfterRewrite(node)` ran here until C-20b (take3 08
 	// §9.2): a tree walk that had mutated nothing since M0127-P6.2 deleted
 	// the MHJ posmap it was built around. joinlayout.go carries the proof.
@@ -2404,6 +2412,9 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 	if orderSort != nil {
 		stampSortInputTarget(orderSort, out)
 	}
+	// R77: stamp arm-priced costs onto legacy-built SEMI/ANTI NLI nodes
+	// (nlipricesplice.go). Final-tree post-pass — idempotent, fail-closed.
+	stampSemiProbePrices(out, cat, plannerSet.costParams())
 	return wrapDMLCTEPrefix(out, dmlPlans), nil
 }
 

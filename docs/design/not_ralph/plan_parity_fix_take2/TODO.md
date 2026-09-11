@@ -3961,6 +3961,15 @@ implement (pricing func + stamp, cp from ps via post-pass to avoid
 tryBuildNLI signature churn across 9 test sites, keeper), full
 gates (values/sweep/pp + 19/22 byte-identity re-verify). Same
 bounds as R76. Next: review SCOPE, commit/push, then P0.
+R77 LANDED 2026-09-12 (`r77-production-splice/REPORT.md`, review
+APPROVE after one REJECT remediated — line pins + evidence paths
+corrected, splice file committed): production NLI price splice —
+dual call sites (:1646 feeds elections, :2417 end-of-pipeline
+catches rebuilds), Q4 coherent at 491312 (rows unmoved), keeper
+passes; gates green (values 24/24, sweep PASS=96, pp Q4 election
+story intact, 19/22 identical, optimizer 2863). DS 90-plan churn
+attributed (join-flips=R66/R69, agg-flips=expected downstream).
+Next: rows/width program (R72 items 1–2).
 R68 SCOPE READY 2026-09-11 (`r68-joinorder-costing-step0/SCOPE.md`):
 join-order costing Step-0 (Q9 L-divergence re-measured, sizing vs
 pricing re-adjudicated — R53 numbers stale via R59/R64/R62/R57/R54).

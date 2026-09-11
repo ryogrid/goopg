@@ -42,3 +42,28 @@ func TestSemiAdmissionFilesPricedNLI(t *testing.T) {
 	t.Logf("SEMI NLI filed: rows=%.0f total=%.2f (outer %.2f)",
 		nli.Rows, nli.Cost.Total, outerTotal)
 }
+
+// TestSemiProbeSpliceStampsPricedCost is R77's keeper: the production
+// post-pass stamps an arm-priced cost onto a rewrite-built SEMI NLI
+// (carrier-unset in, carrier-set out, Total ≥ outer display).
+func TestSemiProbeSpliceStampsPricedCost(t *testing.T) {
+	cat, outer, inner := condLowerFixture(t)
+	nli, ok := tryBuildNLI(condLowerJoin(outer, inner, JoinTypeSemi, nil), cat)
+	if !ok {
+		t.Fatal("semi join on the nation PK must rewrite to an NLI")
+	}
+	if !carrierUnset(nli) {
+		t.Fatal("fixture must start unpriced (carrier-unset)")
+	}
+	stampSemiProbePrices(nli, cat, defaultCostParams())
+	pc, set := nli.PlanCostInfo()
+	if !set {
+		t.Fatal("post-pass must stamp the NLI node")
+	}
+	outerTotal := legacyDisplayCostOf(outer).TotalCost
+	if pc.TotalCost < outerTotal {
+		t.Fatalf("stamped total %.2f < outer display %.2f — violates the PG inequality",
+			pc.TotalCost, outerTotal)
+	}
+	t.Logf("stamped SEMI: rows=%.0f total=%.2f (outer %.2f)", pc.PlanRows, pc.TotalCost, outerTotal)
+}
