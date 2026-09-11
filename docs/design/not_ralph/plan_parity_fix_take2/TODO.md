@@ -4081,3 +4081,20 @@ Q25/26/28/29/Q7 (parallel family, deferred) + Q41
 (Limit/Unique/Sort placement + $0 display, SELECTED next)
 + Q91/Q96 (bigger machinery, not selected). :5557 stopped;
 clone retained; PG untouched; tree clean (no code).
+R83 LANDED 2026-09-12 (`r83-limit-above-distinct/REPORT.md`,
+review APPROVE-WITH-NOTES, no blocking): LIMIT above
+DISTINCT — deferred wrap past DISTINCT adoption, Limit at
+root (PG shape); decline on WithTies/DISTINCT ON/SRF/
+non-constant (IntegerConst allowlist, fail-closed). P2
+synthetic duplicates test (FAIL-before stash-verified,
+PASS-after). Q41 shape exact per P1
+(`Limit→Sort→Unique→Sort`); categories unchanged (top
+M0097-0046 Sort + `$0` remain — named follow-ups).
+Gates: units (pre-existing `bak/` debris excluded) +
+suites fresh + P2 + spotcheck + SF0.25 sweep (PASS=96,
+MISMATCH=0; plan-shape only Q41) + DS A/B (Q41 only;
+Q6/Q38/Q54 identical) + TPC-H A/B 22/22 vs TRUE HEAD
+worktree binary (stale tmp binary caused a false 18-query
+diff first — inode check insufficient, provenance
+required). Follow-ups: ParamRef allowlist, outer-Sort
+elimination, `$0` display.

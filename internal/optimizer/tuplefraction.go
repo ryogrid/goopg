@@ -98,6 +98,19 @@ type limitEstimates struct {
 // caller-supplied case is what the arms are about, and reconstructing them
 // later from a simplified version is how the "use the smaller of the two"
 // asymmetries get lost.
+// limitBoundMovable reports whether a resolved LIMIT/OFFSET bound may be
+// planned above DISTINCT (R83): only position-independent integer
+// constants move. Anything row- or scope-dependent (or of unexamined
+// shape) keeps today's order — the decline is fail-closed, and every
+// corpus LIMIT is a plain integer literal.
+func limitBoundMovable(e Expr) bool {
+	if e == nil {
+		return true
+	}
+	_, ok := e.(*IntegerConst)
+	return ok
+}
+
 func preprocessLimit(lim *Limit, tupleFraction float64) (float64, limitEstimates) {
 	est := limitEstimates{}
 	if lim == nil {

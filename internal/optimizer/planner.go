@@ -2025,6 +2025,7 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 			}
 		}
 	}
+	var deferredLim, deferredOff Expr
 	if s.Limit != nil || s.Offset != nil || s.WithTies {
 		// WITH TIES without ORDER BY is an error (matches PostgreSQL).
 		if s.WithTies && len(s.OrderBy) == 0 {
@@ -2060,8 +2061,20 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 				tiesKeys = append(tiesKeys, k.Expr)
 			}
 		}
-		node = &Limit{pos: s.Pos(), Child: node, Limit: lim, Offset: off,
-			WithTies: s.WithTies, TiesKeys: tiesKeys}
+		if s.Distinct && len(s.DistinctOn) == 0 && !s.WithTies && selectSrfPending == nil && ps == nil && limitBoundMovable(lim) && limitBoundMovable(off) {
+			// R83: LIMIT applies above DISTINCT (PG) — a Limit below
+			// Unique truncates pre-distinct rows (wrong whenever
+			// duplicates exceed the limit). Defer the wrap past the
+			// DISTINCT stage below (applied after the M0097-0046 outer
+			// Sort, so LIMIT sits at the root as in PG). Anything
+			// scope-sensitive (WITH TIES keys, DISTINCT ON, SRF
+			// expansion, non-constant bounds) keeps today's order:
+			// the decline is fail-closed.
+			deferredLim, deferredOff = lim, off
+		} else {
+			node = &Limit{pos: s.Pos(), Child: node, Limit: lim, Offset: off,
+				WithTies: s.WithTies, TiesKeys: tiesKeys}
+		}
 	}
 
 	var (
@@ -2404,6 +2417,10 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 				out = &Sort{pos: s.Pos(), Child: out, Keys: outerKeys}
 			}
 		}
+	}
+	// R83: deferred LIMIT above DISTINCT (see the LIMIT stage above).
+	if deferredLim != nil || deferredOff != nil {
+		out = &Limit{pos: s.Pos(), Child: out, Limit: deferredLim, Offset: deferredOff}
 	}
 	// B-01c Slice 1: finalized above-aware re-stamp of the ORDER BY Sort
 	// (keys-only at construction, keys ∪ above now). Overwrite-only,
