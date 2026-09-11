@@ -3976,6 +3976,12 @@ with node-derived stats at estimateNLIndexJoin, log only; PASS iff
 ≈ PG 0.23), P1 slice (wire match fraction into the NLI estimator
 for Semi/Anti only) iff P0 reproduces. INNER NLI rows + widths
 (R70) explicitly out. Next: review SCOPE, commit/push, then P0.
+R78 P0 DONE 2026-09-12 (`r78-semi-selectivity/PROBE.md`, review
+APPROVE): BLOCKED per SCOPE bar — machinery faithful
+(frac=0.7825 stable) but goopg nd2 1.17M vs PG 347k (3.4×) keeps
+0.23 out of reach; named piece = ANALYZE ndistinct estimator.
+Re-scope input: nd2-estimator program (±widths); no wire-0.78
+without its own SCOPE. Tree clean (temp reverted, builds).
 R68 SCOPE READY 2026-09-11 (`r68-joinorder-costing-step0/SCOPE.md`):
 join-order costing Step-0 (Q9 L-divergence re-measured, sizing vs
 pricing re-adjudicated — R53 numbers stale via R59/R64/R62/R57/R54).
