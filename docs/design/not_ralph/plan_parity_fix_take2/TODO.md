@@ -3713,3 +3713,20 @@ PG's Materialize in Q5/Q8 wraps 1-row region NL inners inside NL
 shapes goopg does not pick (goopg HJ+Memoize); a producer alone
 moves nothing (R63 triage stands, evidence `/tmp/pp2/r65/`
 r65mine vs r65pg Q5/Q8).
+R66 SCOPE READY 2026-09-11 (`r66-alias-source-keys/SCOPE.md`):
+probe-first (9 throwaway fixture shapes A–I, reverted, tree clean)
+— Sort keys bind output positions (table 0), GroupExprs source
+(table N); GROUP-BY-alias resolves through at unit level (F/I), so
+Q7/Q9's alias GroupExprs need the live agg-chain dump (K76 boundary
+candidate, unmeasured); Star/Distinct are the SOLE decline reasons
+for Q13-key1/Q16-key1 (FuncCall has Star, no Distinct, renderer
+neither); Q13-key2 transitive miniature is positional-only (c vs
+count name mismatch). Slice 1 = Arm S (group-section Sort keys
+render GroupExprs[idx], written order, R65 name guard kept) + Star
++ Distinct (additive FuncCall field, render-only precedent);
+predicts Q16 sheds `rendering`, Q13-key1 fixed, ZERO EXTRA flips.
+Slice 2 = G/T chase AFTER a Step-0 live dump (STEP0.md names the
+search knob or records the negative). Review APPROVE-WITH-NOTES
+(3 blocking: same-level name check, explicit 0<=idx, P3 reword +
+HAVING pre-flight — all applied; 8 advisory applied).
+Next: commit this scope, then Slice-1 implementation per §5 gates.
