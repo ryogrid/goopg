@@ -300,7 +300,9 @@ func createPartialGroupingPaths(agg *Aggregate, workers int, leaderParticipates 
 	// OUTPUT. `Rows` is upstream's `dNumGroups`, and it enters BOTH candidates
 	// through identical `costAgg` terms (`finalPerGroup*groups +
 	// cpuTupleCost*groups`), so it cancels in the comparison exactly as the
-	// input price does — which is why a blind `Rows` of 1 is harmless here.
+	// input price does. R61 sources the count from the search rel inside
+	// `sizeGroupingRelFromAgg`, so this rel carries the SAME group count as
+	// the serial rel — consistency, not blindness, is now the justification.
 	sizeGroupingRelFromAgg(grouped, agg)
 	finalGroups := grouped.Rows
 	if finalGroups < 1 {

@@ -1121,7 +1121,11 @@ type groupVarInfo struct {
 // grouped scan of 6 surviving rows claim its column's whole-table 18 000
 // distinct values.
 func estimateAggregate(a *Aggregate) int64 {
-	inputRows := EstimateRows(a.Child)
+	// R61: same searched-input sourcing as the search-rel sizing
+	// (`groupCountInputRows`, groupingpaths.go) — EXPLAIN recomputes this
+	// arm off the built tree, which carries no PlanCost stamp, so sizing
+	// only the search rel leaves display at the recomputed 1 (Q11).
+	inputRows := groupCountInputRows(a.Child)
 	if len(a.GroupingSets) == 0 {
 		return estimateNumGroups(a.GroupExprs, a.Child, inputRows)
 	}

@@ -136,13 +136,33 @@ func sizeGroupingRelFromAgg(rel *RelOptInfo, aggNode *Aggregate) {
 		return
 	}
 	cols := aggNode.Output()
-	rel.Rows = float64(estimateNumGroups(aggNode.GroupExprs, aggNode.Child, EstimateRows(aggNode.Child)))
+	rel.Rows = float64(estimateNumGroups(aggNode.GroupExprs, aggNode.Child, groupCountInputRows(aggNode.Child)))
 	if rel.Rows < 1 {
 		rel.Rows = 1
 	}
 	rel.Width = nodeTupleWidth(aggNode)
 	rel.NCols = len(cols)
 	rel.AvgVarBytes = nodeAvgVarBytes(cols)
+}
+
+// groupCountInputRows is the R61 sourcing shared by both group-count
+// consumers — search-rel sizing (`sizeGroupingRelFromAgg` above) and
+// estimate/display recompute (`estimateAggregate`, cardinality.go).
+// It sizes the group count from the search's own joinrel rows when the
+// aggregate input is a row-preserved searched tree — the R54
+// `searchedJoinInputRelOf` gate the seed below uses. Recomputing
+// `EstimateRows` over a parameterized estimate tree falls to the NL 0.005
+// fallback and floors the input to 1 (Q11: 1 instead of 32000), and no
+// downstream clamp can recover it. Fail-closed to the legacy recompute
+// when the gate does not fire; both production sizing callers
+// (`createGroupingPaths` and the partial tournament) share this sourcing,
+// so the serial and split upper rels agree.
+func groupCountInputRows(child Node) int64 {
+	inputRows := EstimateRows(child)
+	if sr := searchedJoinInputRelOf(child); sr != nil && sr.Rows > 0 {
+		inputRows = int64(sr.Rows)
+	}
+	return inputRows
 }
 
 // groupingHashable is the HASHED arm's gate — PG's `numOrderedAggs == 0`
