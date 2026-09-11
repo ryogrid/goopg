@@ -3756,3 +3756,16 @@ Chase rule derived with per-query traces; table-0/Sort-preservation/
 Filter-hop premises flagged uncited for the arms SCOPE (K4 guard).
 Foreign `zz_probe_r66_test.go` (peer probe) left untouched. Next: arms
 SCOPE citing the three sites, then implementation.
+R66 SLICE-2 SCOPE READY 2026-09-11 (`r66-alias-source-keys/SLICE2-SCOPE.md`,
+rev 2 after review APPROVE-WITH-NOTES): B1 closed with covering sites
+(agg-output zero-value :7829/:7996/:8022 + carry + IsolatedScope
+exclusion; G-Probe IsolatedScope=false unit-measured), B2 entries bound
+(Sort-above-agg, Sort-over-Project with re-anchored guard, Group arm;
+Q8/Q22 named; GroupingSets carried), B3 Gate-0 EXECUTED (flattened→base
+text, MATERIALIZED→s.supp; transcript `/tmp/pp2/r66/gate0/`).
+Re-review APPROVE-WITH-NOTES (Gate-0 transcript saved to close it;
+IsolatedScope-false unevidenced but harmless — runtime guard governs;
+Q8/Q22 decline-reasons required in gate 4). Predictions: rendering
+{Q7,Q9,Q10,Q13}→{Q10}, pp unmoved, zero EXTRA. Next: Slice-2
+implementation per §6 gates (pins incl. Group Key text + G-shape
+sourced-text pin).
