@@ -3797,3 +3797,17 @@ chain incl. Project Targets/IsolatedScope) for Q44's two Sorts + Q54,
 then the boundary rule from 7 chains (stop before Aggs synth, or a
 goopg-side flattening marker). TEMP traces reverted and verified zero
 (`grep R66DBG/Q44DBG` clean); s1 worktree removed.
+Sort-anchored dump DONE 2026-09-11 (server-dbg4.log, reverted clean,
+build green): Q44 path is Sort→Project[rename]→Filter→Agg[avg +
+sublink-HAVING] (PG keeps SubqueryScan v1 — GROUP BY+HAVING+InitPlan,
+unflattenable — prints `v1.rank_col`); Q54 path ends at a
+CTE-qualified stop (`my_customers.*`, PG flattened per K31 — prints
+`customer.*`). Boundary rule scoped: (1) stop-and-render ONLY at
+BASE-table refs — CTE-output refs decline (CTEScan carries
+Name/Alias/RTID, plan.go:1636/1677 — an RTE-kind set, e.g. on
+subPlanReg, is implementable); (2) decline Aggs-synth at aggs with
+sublink-HAVING (R-A: preserves Q13-inner (no HAVING) + Q16/Q21/Q91
+same-level; kills Q44; n=1 correlation honestly labeled). Q49 stays
+declined (table-0 rule), Q51 CASE kept (structure-faithful). TEMP
+SORTDUMP reverted and verified zero; :65437 stopped. Next: implement
+the two rules → full re-gates → SLICE2-REPORT.
