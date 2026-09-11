@@ -3982,6 +3982,13 @@ APPROVE): BLOCKED per SCOPE bar — machinery faithful
 0.23 out of reach; named piece = ANALYZE ndistinct estimator.
 Re-scope input: nd2-estimator program (±widths); no wire-0.78
 without its own SCOPE. Tree clean (temp reverted, builds).
+R79 SCOPE READY 2026-09-12 (`r79-ndistinct-sampler/SCOPE.md`):
+ndistinct sampler Step-0 — P0 sampler mechanisms (goopg reservoir
+vs PG block-sampling, same 300×target size), P1 nd-vs-target
+curves on l_orderkey both engines (ANALYZE rounds, foreground),
+verdict replicate-vs-keep. Widths NOT paired (R70 CLOSED — needs
+DatumBytes/pushdown, neither exists). Next: review SCOPE,
+commit/push, then P0.
 R68 SCOPE READY 2026-09-11 (`r68-joinorder-costing-step0/SCOPE.md`):
 join-order costing Step-0 (Q9 L-divergence re-measured, sizing vs
 pricing re-adjudicated — R53 numbers stale via R59/R64/R62/R57/R54).
