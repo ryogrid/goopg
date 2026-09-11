@@ -3989,6 +3989,12 @@ curves on l_orderkey both engines (ANALYZE rounds, foreground),
 verdict replicate-vs-keep. Widths NOT paired (R70 CLOSED — needs
 DatumBytes/pushdown, neither exists). Next: review SCOPE,
 commit/push, then P0.
+R79 P0 DONE 2026-09-12 (`r79-ndistinct-sampler/P0.md`, review
+APPROVE): mechanism table — goopg uniform reservoir (all blocks)
+vs PG two-stage few-blocks+Vitter, same Duj1; most-likely diverger
+= block representation → f1 on insertion-ordered l_orderkey; MCV
+ruled out for this pair. Next: P1 nd-vs-target curves or BLOCKED
+on the ANALYZE gap.
 R68 SCOPE READY 2026-09-11 (`r68-joinorder-costing-step0/SCOPE.md`):
 join-order costing Step-0 (Q9 L-divergence re-measured, sizing vs
 pricing re-adjudicated — R53 numbers stale via R59/R64/R62/R57/R54).
