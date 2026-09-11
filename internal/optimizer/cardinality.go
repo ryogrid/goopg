@@ -1569,8 +1569,12 @@ func keyNDistinct(key Expr, side Node) int64 {
 // key, and its distinct count is then the node's own row count. The order is
 // upstream's — `isunique` overrides `stadistinct` ("assume it is unique no
 // matter what pg_statistic says", selfuncs.c:6332) — but the two arms cannot
-// both fire here, because `resolveBaseColumn` has no arm that walks through a
-// grouping node in the first place, deliberately (see `groupUniqueNDistinct`).
+// both fire on a WHOLE aggregate, because `resolveBaseColumn`'s only
+// grouping-node arm is partial-mode-only, deliberately: a general arm would
+// shadow `groupUniqueNDistinct`'s exact answers with base-nd overestimates
+// (R63; see `groupUniqueNDistinct`). Through a partial, the base-nd answer
+// is the groups observed — exact when every worker sees every group,
+// bounded by base nd otherwise (R63-#1).
 func columnNDistinctForChild(idx int, child Node) int64 {
 	if ref, ok := resolveBaseColumn(idx, child); ok {
 		return ref.ndistinct

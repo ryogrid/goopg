@@ -145,6 +145,27 @@ func resolveBaseColumn(idx int, child Node) (baseColumnRef, bool) {
 		// Heap-fetching probe: output schema is the table's column order,
 		// same as *SeqScan.
 		return baseColumnOfTable(x, x.Table, x.UniqueKeys, idx)
+	// R63 (M1-display): unlike *IndexScan, the IOS leaf's output schema is
+	// the narrowed `Covered` projection (plan.go), not the table's column
+	// order, so `idx` must be remapped through `Covered[idx].Name` first —
+	// the *Project rule for a fixed projection. IOS carries no UniqueKeys.
+	// Empty/mismatched `Covered` misses exactly as today. A leaf arm (no
+	// recursion into resolveBaseColumn), like *SeqScan/*IndexScan.
+	case *IndexOnlyScan:
+		if x.Table == nil || idx < 0 || idx >= len(x.Covered) {
+			return baseColumnRef{}, false
+		}
+		tableIdx := -1
+		for i := range x.Table.Columns {
+			if x.Table.Columns[i].Name == x.Covered[idx].Name {
+				tableIdx = i
+				break
+			}
+		}
+		if tableIdx < 0 {
+			return baseColumnRef{}, false
+		}
+		return baseColumnOfTable(x, x.Table, nil, tableIdx)
 	case *Filter:
 		return resolveBaseColumn(idx, x.Child)
 	case *Sort:
@@ -238,6 +259,31 @@ func resolveBaseColumn(idx int, child Node) (baseColumnRef, bool) {
 			return resolveBaseColumn(idx-ow, x.Inner)
 		}
 		return resolveBaseColumn(idx, x.Outer)
+
+	// R63 (M1-display): partial-mode ONLY. A partial aggregate's output
+	// layout is [group exprs…, agg calls…, passthrough…], so a bare
+	// *ColumnRef group expr is an identity remap one level down — the
+	// *Project rule. Whole-mode aggs MUST miss here: `groupUniqueNDistinct`
+	// answers them exactly (PG's isunique branch: grouped output IS unique)
+	// and resolveBaseColumn is tried FIRST in `examineGroupVar`, so a
+	// general arm would SHADOW exact agg-rows answers with base-nd
+	// overestimates. `groupUniqueNDistinct` refuses partials (per-worker
+	// rows are not the group count), so this arm converts only today's
+	// misses; whole aggs keep today's behavior bit-identically.
+	// Expressions, agg-call columns, and grouping-sets exoticism beyond
+	// bare refs miss exactly as today. Exempted (not twinned) in
+	// `resolverArmExemptions`: an aggregate's output is groups, not
+	// base-rel rows, so the Yao walk must not descend through it.
+	case *Aggregate:
+		if x.Mode != AggModePartial {
+			return baseColumnRef{}, false
+		}
+		if x.Child == nil || idx < 0 || idx >= len(x.GroupExprs) {
+			return baseColumnRef{}, false
+		}
+		if cr, ok := x.GroupExprs[idx].(*ColumnRef); ok {
+			return resolveBaseColumn(cr.Index, x.Child)
+		}
 	}
 	return baseColumnRef{}, false
 }
