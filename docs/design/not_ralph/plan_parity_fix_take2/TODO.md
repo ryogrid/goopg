@@ -3822,3 +3822,12 @@ Review APPROVE, no blocking (3 comment/hardening notes applied;
 locator-threading + synth-return guard ledgered as follow-ups).
 R66 CLOSED → next due: the (a) Materialize re-triage as a new round
 with its own scope.
+R67 TRIAGE DONE 2026-09-11 (`r67-materialize-retriage/TRIAGE.md`,
+review APPROVE, no blocking): (a) stays queued behind join-order/
+join-method costing on post-R66 numbers — sole live TPC-H use is Q5
+inside 5 category gaps (producer moves zero categories/matches);
+Q8's fixture use evaporated live; DS Q65 same pattern; no MATCHING
+query needs it; 36-site NL-inner census finds no coinciding site.
+Next major round: join-order costing (R53 lineage); #6/R61-#4/(b) stay
+deferred (re-derive, don't re-carry). Next: scope the join-order
+costing round.
