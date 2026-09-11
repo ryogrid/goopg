@@ -3853,6 +3853,14 @@ predicate + 13490/~30000/3439 points) + oracle read + R47
 confrontation; implementation explicitly off-table. Review
 APPROVE-WITH-NOTES (provenance + predicate + 4 precision notes — all
 applied). Next: Gate-0 diagnosis per §1, then close + scope follow-up.
+R71 GATE-0 PROBE DONE 2026-09-11 (uncommitted temp): Q4 semi forced
+to 13490/30000/3439 — rows move exactly, NEITHER election moves at
+any point (Sort→HashAggregate throughout; costs reprice 1426→337/
+750/86). Firings 5/14/14, all same victim (outer orders + inner
+lineitem — predicate held, idempotent; counts are estimation passes,
+recorded against the exactly-one wording). Rows theory DEAD per B1
+(third exit) — follow-up is the election/firing-rule program.
+Remaining: oracle read + R47 confrontation + DIAGNOSIS.md + review.
 R68 SCOPE READY 2026-09-11 (`r68-joinorder-costing-step0/SCOPE.md`):
 join-order costing Step-0 (Q9 L-divergence re-measured, sizing vs
 pricing re-adjudicated — R53 numbers stale via R59/R64/R62/R57/R54).
