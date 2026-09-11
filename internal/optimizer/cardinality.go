@@ -1464,11 +1464,35 @@ func relFilteredRows(root, rel Node) (float64, bool) {
 	return rows, found
 }
 
+// indexProbeHasOuterRef reports whether an index scan's probe keys reference
+// an outer query level (R62): such a scan is a parameterized probe whose
+// per-scan row count is not base-relation restriction evidence. Reuses the
+// sibling same-scope detector (subplan interiors stepped over as their own
+// scope); unenumerated key shapes decline (true), i.e. decline the evidence,
+// the PG-faithful side of the ambiguity.
+func indexProbeHasOuterRef(is *IndexScan) bool {
+	if is == nil {
+		return false
+	}
+	// Sibling `exprHasOuterRef` (narrowoutput.go) — same-scope outer-level
+	// detection, subplans stepped over; unenumerated shapes decline (true),
+	// which here means declining per-probe evidence, the PG-faithful side.
+	return exprHasOuterRef(is.Key) || exprHasOuterRefList(is.Keys)
+}
+
 func relFilteredRowsWalk(n, rel Node) (rows float64, found, sealed bool) {
 	if n == nil {
 		return 0, false, false
 	}
 	if n == rel {
+		// R62: decline per-probe restriction evidence. A parameterized
+		// probe's per-scan rows are not base-relation evidence — upstream
+		// resolves grouping vars to the UNPARAMETERIZED baserel (no Yao
+		// discount when it is unfiltered), which the estimate tree does
+		// not carry. found=false skips the Yao term exactly in that case.
+		if is, ok := n.(*IndexScan); ok && indexProbeHasOuterRef(is) {
+			return 0, false, false
+		}
 		return float64(EstimateRows(n)), true, false
 	}
 	// passthrough: n still describes a single relation if its child does.

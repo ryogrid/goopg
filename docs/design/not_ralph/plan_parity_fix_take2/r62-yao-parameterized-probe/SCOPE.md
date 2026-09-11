@@ -63,9 +63,15 @@ def :1462 + call :1318 only).
 
 ONE arm in `relFilteredRowsWalk`'s `n == rel` (`cardinality.go:1471`): when
 the hit node is `*IndexScan` with an `OuterColumnRef` inside `Key`/`Keys`
-( containment via the existing `exprChildSlots` walker, `exprwalk.go:109`;
-bare-Key fast path first), return `(0, false, false)` — found=false, i.e.
-decline per-probe restriction evidence. Yao math, clamps, both group-count
+(containment via the sibling same-scope detector `exprHasOuterRef` /
+`exprHasOuterRefList`, `narrowoutput.go:506/525` — subplan interiors stepped
+over as their own scope, unenumerated key shapes fail closed toward declining
+the evidence), return `(0, false, false)` — found=false, i.e.
+decline per-probe restriction evidence. (As specified pre-implementation this
+read "`exprChildSlots` walker with bare-Key fast path first"; as built it
+reuses the sibling detector — strictly more precise on subplans, same
+fail-closed direction, fast path dropped as perf-cosmetic. REPORT §1 records
+the as-built form.) Yao math, clamps, both group-count
 consumers, display code, executor: UNCHANGED. The Yao term then fires only
 for genuine base-level restriction evidence, exactly PG's shape.
 

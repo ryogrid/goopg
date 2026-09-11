@@ -3598,3 +3598,22 @@ over-counts; no live case). Re-triage: (a) unchanged, (b) NOT a rows defect
 clamp path :1330-1334, truncation fn, Q5 plan, corner propagation all
 re-derived; 1 citation nit applied).
 Next: review this scope (done — APPROVE), then R62 implementation per §5 gates.
+R62 LANDED 2026-09-11 (`r62-yao-parameterized-probe/REPORT.md`): one arm +
+`indexProbeHasOuterRef` helper in `cardinality.go` (+24/−0, reuses sibling
+`exprHasOuterRef`/`exprHasOuterRefList` — SCOPE §2 amended for the walker
+substitution; Yao/clamps/consumers/display/executor UNCHANGED). Q11 search
+80→EXACTLY 32000 (clamp min(201356,32000)), display 26→10666 by truncation
+(PG 10667, ±1 cosmetic ledgered); Q5 immobile at 25; values 8/8+q11 MATCH;
+DP 3 modified lines only, joins bit-identical; pp 5/15/0/2 (only Q3+Q11 move
+— TPC-H Q3 HashAgg→GroupAgg+Sort, rows 12025→307640 vs PG 308817); DS sweep
+PASS=94 + Q72 alone (300s), verdicts unchanged, totals 1242→1227s; 19-plan
+set = 15 number-only + 4 strategy flips all toward-oracle (Q15/Q45 GroupAgg
+family, Q37/Q82 hash→sort-grouping). Two precision notes (Q39 body 48→3202
+not ~7823 = column-nd stats gap; flips vs "no new flip" phrasing) adjudicated
+non-blocking with full mechanistic account. Review APPROVE-WITH-NOTES (all
+numbers re-derived CONFIRM; 4 notes applied). Closes #2 — Q11 PG-exact at
+search. NEW #6 large-group strategy/stats framing (hash-cost-at-scale Q3;
+Q39 nd 3202 vs 7823). Evidence tmp-only `/tmp/pp2/r62/`
+(+`/tmp/pp2/clone-ds05-r62`); bins `goopg-r62`/`goopg-r62fresh` md5-identical.
+Next: R63 scope from the queue — (a) Materialize producer vs NEW #6 vs R61
+#4 (CTE-body tagging); (b) Q4 stays cost-model framing; R62-#1 watch.
