@@ -3746,3 +3746,13 @@ holds :65433; renderer-only + 24/24 digests cover it). Fresh-PG
 reference shows PG-side Q8 join-order drift (rendering-neutral).
 Next: Slice-2 Step 0 (live agg-chain dump; STEP0.md names the search
 knob or records the negative).
+R66 STEP-0 DONE 2026-09-11 (`r66-alias-source-keys/STEP0.md`, review
+APPROVE-WITH-NOTES, notes applied): (i)-negative recorded (search
+defaults ON — no separating knob; E/I already searched); (ii) live
+dump names all chase targets — Q7/Q9: narrowing Project Targets are
+the source (`n_name` base refs + ExtractExpr); Q13: preserving-Project
+rename → inner `count(o_orderkey)` positionally (probe-D rule live).
+Chase rule derived with per-query traces; table-0/Sort-preservation/
+Filter-hop premises flagged uncited for the arms SCOPE (K4 guard).
+Foreign `zz_probe_r66_test.go` (peer probe) left untouched. Next: arms
+SCOPE citing the three sites, then implementation.
