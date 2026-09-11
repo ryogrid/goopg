@@ -3542,3 +3542,59 @@ NL-probe/Memoize-under-partial, add_partial_path_precheck CPU work, Q3
 autovacuum drift, plus ledgered width/correlation/probe-rows/AGG_MIXED/etc.
 Next: R61 scope from the ledgered follow-ups (executor NL-probe/Memoize
 completion is trigger-gated on a top ever moving — P3 holds, so optional).
+
+## R61 implementation (2026-09-11) — LANDED, reviewed APPROVE-WITH-NOTES, no blockers
+SCOPE `r61-groupcount-search-input/SCOPE.md` (+ §7 AMENDMENT A1, committed
+d90730b0b): Q11 rows=1 is a live estimator-defect chain, not fixture —
+group estimator fine (nd=201356 via pg_stats), input recompute floors to 1
+via NL-0.005 fallback + stale NLI outer-only + closing clamp; PG oracle
+32000×1/3=10667 verified live (no-HAVING→32000). Stamp-cut REFUTED live
+(stamp=1 at estimate time); P0-fires-but-no-display forced A1 (Aggregate
+carries no PlanCost, EXPLAIN recomputes via EstimateRows). Cut:
+`groupCountInputRows` helper (R54 `searchedJoinInputRelOf` gate verbatim,
+fail-closed), consumed by `sizeGroupingRelFromAgg` AND `estimateAggregate`;
+partialaggpaths comment-only (C-15 superseded by consistency). Gates: 1
+units/vet green; 2 values 8/8 MATCH vs r59 + q11 MATCH vs base, seed 32000,
+Q5 groups pinned 25; 3 dp A/B 11-modified/0-added (agg rows/costs only —
+Q11 1→80/26, Q5 1→25; joins bit-identical, verdicts unchanged),
+grouped-CTE-feeding-a-join cases identical both binaries; 4 pp 5/15/0/2
+exact (Q5 rows now 25=25 PG); 5 DS SF0.5 PASS=94 (57 ck-verified)
++ Q72 TIMEOUT alone (325s vs R60 318s), verdict-changes=none, total −1.1%,
+28 plan moves adjudicated (21 number-only incl. DS-Q3 1→15, + 7 cost-driven
+shape moves toward-oracle: Q39 HJ, Q40 GroupAgg, Q47/Q57 HJ, Q64 reorder,
+Q74 CTE-swap, Q79 GatherMerge). HAVING sel 1/3 VERIFIED empirically (was
+#3). Private DS lane (fresh `cp -a` clone :5534, tmp-only script copy;
+CKSUM SCRIPT_DIR fault caught on 2-query probe, fixed before sweep).
+Review APPROVE-WITH-NOTES, no blockers (DP + pp re-derived by reviewer);
+commit 09888fe69 (hook pgbench smoke PASS 138.7 tps), pushed.
+Evidence tmp-only `/tmp/pp2/r61/` (+`/tmp/pp2/clone-ds05-r61`).
+Follow-ups: #2 Yao-through-parameterized-probe (80→32000 groups, then
+10667 with verified 1/3), M1-display (single-table GROUP BY 200 vs
+201356), `estimateNLIndexJoin` staleness comment, (a) Materialize producer,
+(b) Q4 agg/sort strategy, NEW #4 CTE-body join tagging (arm never fires —
+walk-stop vs never-tagged), NEW #5 executor-refinement watch on
+toward-oracle shapes (Memoize/Gather gaps, cf. R59 Q72).
+Next: R62 scope from these follow-ups — #2 is the flagship (completes Q11
+to PG-exact 10667); re-triage (a)/(b) on the R61-moved Q4/Q5/Q11 numbers.
+R62 scope READY 2026-09-11 (`r62-yao-parameterized-probe/SCOPE.md`): probe G
+closes #2 — the `relFilteredRows` hit IS the parameterized probe
+(`IndexScan rows=80 Key=OuterColumnRef` ×8) and Yao crushes 201356→80 with
+tuples=800000 (log `/tmp/pp2/r62probe-start.log`; temp prints reverted, tree
+clean). PG resolves grouping vars to the UNPARAMETERIZED baserel (no
+discount), which goopg's estimate tree doesn't carry — so the faithful cut
+is to DECLINE per-probe evidence, not invent base rows. ONE cut authorised:
+found=false arm at `relFilteredRowsWalk` n==rel (`cardinality.go:1471`) when
+`*IndexScan` Key/Keys contains `OuterColumnRef` (via `exprChildSlots`,
+`exprwalk.go:109`); sole caller is the Yao site (:1318). Yao math, clamps,
+consumers, display, executor all UNCHANGED. Predictions P0-P4: Q11 groups
+80→EXACTLY 32000 (clamp min(201356,32000)); display 32000→10666 by
+truncation (`scaleByFloat`, NOT PG's 10667 — ±1 cosmetic, ledgered);
+values MATCH with **Q5 immobile at 25** (nation is the outer seq scan —
+sharp R61-vs-R62 discriminator); pp 5/15/0/2; DS 94+Q72 with the 28-plan
+set numbers-only toward-oracle (Q39 body 48→~7823, no new flips). WATCH
+DS-Q3/Q4/Q10. Corner R62-#1 ledgered (restricted+parameterized same rel
+over-counts; no live case). Re-triage: (a) unchanged, (b) NOT a rows defect
+(goopg Q4 shape cheaper; cost-model framing). Review APPROVE (probe lines,
+clamp path :1330-1334, truncation fn, Q5 plan, corner propagation all
+re-derived; 1 citation nit applied).
+Next: review this scope (done — APPROVE), then R62 implementation per §5 gates.
