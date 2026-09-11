@@ -4066,3 +4066,18 @@ because its sort-startup is ~202 on 3439 rows vs 5079 on
 (R78/R79), widths BLOCKED (R70, DatumBytes/pushdown);
 deferral-ledger row filed with unblock conditions + re-measure
 gate. :5556 stopped; PG untouched; tree clean (no code).
+R82 IN PROGRESS 2026-09-12 (opencode lane): TPC-DS HEAD
+baseline (SF0.25, private clone :5557, peer :5533 untouched) —
+full 99-EXPLAIN capture + goopg-vs-PG-oracle adjudication +
+nearest-miss ranking. Last DS numbers are R46-era; TPC-H side
+re-baselined at R81. Measurement-only; no code. Next: capture,
+adjudicate, BASELINE.md + review, commit/push.
+R82 DONE 2026-09-12 (`r82-ds-head-baseline/BASELINE.md`,
+review APPROVE-WITH-NOTES, notes applied): DS HEAD
+`match=1 (Q9 holds) shapediff=68 missingnode=27 error=3`;
+cats join-order=95/parallelism=88/sort=80/agg=74/method=62/
+scan=58/param=49/rendering=22/qual=11. Nearest misses:
+Q25/26/28/29/Q7 (parallel family, deferred) + Q41
+(Limit/Unique/Sort placement + $0 display, SELECTED next)
++ Q91/Q96 (bigger machinery, not selected). :5557 stopped;
+clone retained; PG untouched; tree clean (no code).
