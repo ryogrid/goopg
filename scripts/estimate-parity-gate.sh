@@ -11,7 +11,7 @@
 # LIMIT, so the NLI+Memoize shape that produces the aggregate over-estimates
 # never arises in its corpus.
 #
-# THIS script measures est-vs-actual over the TPC-DS SF0.5 corpus with a
+# THIS script measures est-vs-actual over the TPC-DS SF0.25 corpus with a
 # PG-relative bar. See scripts/estimate-parity/parity.py for why the bar has
 # to be PG-relative (an absolute bar fails Q47, where PG 18.3 emits the same
 # rows=1, and a loose absolute bar passes Q99's 8007x).
@@ -20,8 +20,8 @@
 #   make ea-ratchet-repin              # capture + rewrite the baseline
 #   EA_CAPTURE=<file> make ea-ratchet  # re-score an existing capture, no server
 #
-# ISOLATION. This script NEVER touches bench/tpcds/runtime_goopg/data-sf05 or
-# port 65437: those belong to the standing SF0.5 gate and to peer agents, and
+# ISOLATION. This script NEVER touches bench/tpcds/runtime_goopg/data-sf025 or
+# port 65437: those belong to the standing SF0.25 gate and to peer agents, and
 # two writers on one goopg data directory have damaged a bench cluster's WAL
 # before. It runs against its OWN clone (EA_DATA) on its OWN port (EA_PORT),
 # under the mandatory cgroup cap.
@@ -33,8 +33,8 @@ cd "${REPO_ROOT}" || exit 2
 source "${REPO_ROOT}/bench/tpcds/env_tpcds.sh"
 
 EA_PORT="${EA_PORT:-5534}"
-EA_DATA="${EA_DATA:-${REPO_ROOT}/tmp/c20a/data-sf05}"
-EA_SRC_DATA="${EA_SRC_DATA:-${SF05_GOOPG_DATA}}"
+EA_DATA="${EA_DATA:-${REPO_ROOT}/tmp/c20a/data-sf025}"
+EA_SRC_DATA="${EA_SRC_DATA:-${SF025_GOOPG_DATA}}"
 EA_BIN="${EA_BIN:-${REPO_ROOT}/tmp/c20a/goopg-ea}"
 EA_OUT="${EA_OUT:-${REPO_ROOT}/tmp/c20a}"
 EA_CG_UNIT="${EA_CG_UNIT:-goopg-ea-ratchet}"
@@ -49,7 +49,7 @@ EA_NQ="${EA_NQ:-99}"
 # same rows.
 export GOOPG_ANALYZE_SEED="${GOOPG_ANALYZE_SEED:-20260905}"
 # env_tpcds.sh above already exported GOMEMLIMIT/GOGC; these override it on
-# purpose. Its `GOGC=off` is the TIMING regime — it exists so the SF0.5 sweep
+# purpose. Its `GOGC=off` is the TIMING regime — it exists so the SF0.25 sweep
 # does not measure garbage collection. This gate measures ROW COUNTS, for
 # which GOGC=off is pure risk: one heavy query leaves the heap parked at
 # GOMEMLIMIT and every later query runs against a thrashing or SIGKILLed

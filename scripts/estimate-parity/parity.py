@@ -17,7 +17,7 @@ carries no LIMIT, so the NLI+Memoize shape that produces the aggregate
 over-estimates never arises.
 
 This tool closes all four gaps. It reads a real `EXPLAIN (ANALYZE)` capture
-over the TPC-DS SF0.5 corpus, so its truth is measured rather than estimated;
+over the TPC-DS fast-gate corpus, so its truth is measured rather than estimated;
 it scores base relations and joinrels alike; and its bar is PG-RELATIVE.
 
 WHY THE BAR MUST BE PG-RELATIVE, AND NOT ABSOLUTE. An absolute est-vs-actual
@@ -131,7 +131,7 @@ def strip_alias_suffix(rel):
     `<table>_2`. No TPC-DS table name ends in `_<digits>`, so stripping the
     suffix is unambiguous, and it is what lets a self-join's two instances key
     to the same relation on BOTH sides rather than matching nothing. Without
-    it 662 of 1131 nodes in the first SF0.5 capture had no PG counterpart and
+    it 662 of 1131 nodes in the first fast-gate capture had no PG counterpart and
     fell back to the absolute floor — which is the bar this tool exists to
     avoid using.
 
@@ -259,7 +259,7 @@ def measured_actual(n):
     with `(actual rows=0.00 loops=0)` even when the join above it emitted
     tens of thousands of rows — the side was drained by the build, not by the
     node's own executor loop, so no per-loop count was recorded. 220 of the
-    1131 nodes in the first SF0.5 capture were in this state, and scoring
+    1131 nodes in the first fast-gate capture were in this state, and scoring
     them treated a missing measurement as a measured zero: a base relation
     correctly estimated at 464,390 scored a q-error of 464,390 and headed the
     findings table. Treat it exactly like `never executed`.

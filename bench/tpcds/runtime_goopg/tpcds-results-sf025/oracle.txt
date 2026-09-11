@@ -1,0 +1,112 @@
+# TPC-DS SF0.25 row-count + value-checksum oracle — PostgreSQL 18.3 ground truth
+# captured: 2026-09-11T17:20:38+09:00  source: d48072405
+# dataset: SF=1 TSVs, facts quartered by key parity (see tpcds-sf025-regression.sh header)
+# format: q|status|rows|ck|secs   (secs are machine-specific; rows and ck are the fixture)
+# ck: scripts/tpcds-result-checksum.py — sha256/16 over field-stripped rows,
+#     fractional numerics canonicalised to 12 significant digits (goopg's
+#     stddev_samp differs from PG's sqrt_var in the last 1-2 digits: ledger row
+#     'tpcds-round2 stddev-precision'). Column NAMES are excluded. Rows are NOT
+#     sorted, so a wrong ORDER BY is a checksum failure, not a silent pass.
+# ck=n/a: a LIMIT window saturated at its bound — the row SET is ambiguous at
+#     the boundary tie group, so the query stays row-count-only (design D3).
+# This file is GIT-TRACKED as a pinned fixture so other machines/CI can skip
+# the ~3 min PG capture. Re-run 'oracle' only when the dataset or queries change.
+1|OK|100|n/a|15.187
+2|OK|2513|c372ff12ff0235d9|0.176
+3|OK|30|3bb31a49b1b21bf7|0.019
+4|OK|0|1f18d650d205d71d|35.655
+5|OK|100|n/a|0.260
+6|OK|27|87ec5bd032d11623|33.416
+7|OK|100|n/a|0.116
+8|OK|0|1f18d650d205d71d|0.100
+9|OK|1|a70e24a9b0f43963|0.413
+10|OK|0|1f18d650d205d71d|0.140
+11|OK|0|1f18d650d205d71d|8.257
+12|OK|100|n/a|0.027
+13|OK|1|4d550faf1f8a3c40|0.112
+14|OK|200|n/a|8.175
+15|OK|88|accf3f52f5757e39|0.039
+16|OK|1|6e6311159ff5d714|0.068
+17|OK|0|1f18d650d205d71d|0.175
+18|OK|100|n/a|0.098
+19|OK|100|n/a|0.053
+20|OK|100|n/a|0.033
+21|OK|100|n/a|0.109
+22|OK|100|n/a|0.796
+23|OK|1|00f53003bda23764|2.253
+24|OK|0|d4ba2394ffbd157c|0.022
+25|OK|0|1f18d650d205d71d|0.146
+26|OK|100|n/a|0.087
+27|OK|100|n/a|0.122
+28|OK|1|58f05f6812160030|0.407
+29|OK|0|1f18d650d205d71d|0.077
+30|OK|11|d86c59e4b9736e08|0.870
+31|OK|3|6ee894d4093b804a|2.275
+32|OK|1|a55f36d3bf196bce|0.034
+33|OK|100|n/a|0.096
+34|OK|87|9fbbae9bf5176a02|0.050
+35|OK|100|n/a|0.356
+36|SKIP_QUERYGEN|0|n/a|0
+37|OK|0|1f18d650d205d71d|0.017
+38|OK|1|77188220d949e451|0.323
+39|OK|32|9adc1bf3ad0f084c|0.761
+40|OK|100|n/a|0.034
+41|OK|1|7b2c30faa474fb80|1.793
+42|OK|10|1f306df2d30e74ba|0.044
+43|OK|6|981d5ed909d03ba3|0.078
+44|OK|10|9b00efc9629a92e6|0.421
+45|OK|3|96d59766c4f99cd8|0.038
+46|OK|100|n/a|0.110
+47|OK|100|n/a|1.029
+48|OK|1|27f2cdd050408599|0.149
+49|OK|17|847b6be863d3e8ce|0.050
+50|OK|6|6270f4e3d38a4eed|0.028
+51|OK|100|n/a|0.331
+52|OK|100|n/a|0.047
+53|OK|100|n/a|0.068
+54|OK|0|1f18d650d205d71d|2.449
+55|OK|68|fe343d36717a4fb5|0.031
+56|OK|100|n/a|0.134
+57|OK|100|n/a|0.438
+58|OK|0|1f18d650d205d71d|0.090
+59|OK|100|n/a|0.538
+60|OK|100|n/a|0.184
+61|OK|1|4766027020fae308|0.020
+62|OK|100|n/a|0.070
+63|OK|100|n/a|0.065
+64|OK|1|e1fc5695d951684e|0.281
+65|OK|100|n/a|0.233
+66|OK|5|f0996919225fee99|0.090
+67|OK|100|n/a|2.037
+68|OK|100|n/a|0.071
+69|OK|100|n/a|0.078
+70|SKIP_QUERYGEN|0|n/a|0
+71|OK|290|e9f1fcd7c28a1f8f|0.079
+72|OK|100|n/a|0.660
+73|OK|0|1f18d650d205d71d|0.051
+74|OK|0|1f18d650d205d71d|53.487
+75|OK|100|n/a|0.476
+76|OK|100|n/a|0.078
+77|OK|44|eb9e091ac7669153|0.120
+78|OK|15|c06cf981a7819a37|0.474
+79|OK|100|n/a|0.094
+80|OK|100|n/a|0.085
+81|OK|58|1d491680786cf5a1|3.848
+82|OK|0|1f18d650d205d71d|0.023
+83|OK|1|9480cc8e8c967db7|0.109
+84|OK|4|0bd76cf1b8b345c1|0.033
+85|OK|0|1f18d650d205d71d|0.063
+86|SKIP_QUERYGEN|0|n/a|0
+87|OK|1|daa38faef432c025|0.319
+88|OK|1|565313322fa6dbbf|0.340
+89|OK|100|n/a|0.089
+90|OK|1|ae3e8371b4300ef3|0.049
+91|OK|0|1f18d650d205d71d|0.024
+92|OK|1|26c02866b1827f1b|0.039
+93|OK|0|1f18d650d205d71d|0.012
+94|OK|1|4349297292f61686|0.042
+95|OK|1|91da30ff26d84150|1.830
+96|OK|1|cfdf49107affebbc|0.044
+97|OK|1|fac28379b5f7265c|0.116
+98|OK|1406|0601fac905d15590|0.060
+99|OK|90|077e581917849c17|0.078

@@ -22,8 +22,8 @@ cluster).
 | 65434 | — | **reserved: nightly TPC-H clone lane** (ci/batch) | `tmp/goopg-nightly-tpch-data` |
 | 65435 | — | **reserved: nightly TPC-DS clone lane** (ci/batch) | `tmp/goopg-nightly-tpcds-data` |
 | 65436 | goopg | TPC-DS SF=1 | `bench/tpcds/runtime_goopg/data` |
-| 65437 | goopg | TPC-DS SF=0.5 (fast regression gate) | `bench/tpcds/runtime_goopg/data-sf05` |
-| 65438 | PostgreSQL 18.3 | TPC-DS reference (dbs `tpcds`, `tpcds05`) | `bench/tpcds/runtime/pgdata` |
+| 65437 | goopg | TPC-DS SF=0.25 (fast regression gate) | `bench/tpcds/runtime_goopg/data-sf025` |
+| 65438 | PostgreSQL 18.3 | TPC-DS reference (dbs `tpcds`, `tpcds025`) | `bench/tpcds/runtime/pgdata` |
 
 Setup / start / stop procedures:
 
@@ -43,15 +43,15 @@ Setup / start / stop procedures:
   `GOMEMLIMIT=12GiB`.
 - **TPC-DS**: `bench/tpcds/README.md`. Env: `bench/tpcds/env_tpcds.sh`
   (single source of truth for dirs/ports). Lifecycle:
-  `bench/tpcds/server.sh {start|stop|status} [sf1|sf05|pg|all]`.
-  The SF=0.5 fast regression gate (`scripts/tpcds-sf05-regression.sh sweep`,
-  ~1 h) checks goopg row counts against a **git-tracked PG oracle**
-  (`bench/tpcds/runtime_goopg/tpcds-results-sf05/oracle.txt`) and needs no
+  `bench/tpcds/server.sh {start|stop|status} [sf1|sf025|pg|all]`.
+  The SF=0.25 fast regression gate (`scripts/tpcds-sf025-regression.sh sweep`,
+  ~5 min) checks goopg row counts against a **git-tracked PG oracle**
+  (`bench/tpcds/runtime_goopg/tpcds-results-sf025/oracle.txt`) and needs no
   PG instance.
 
 Row-count anchors are **load-dependent**: `bench/tpch/spotcheck_expected.env`
 (Q12/Q13) and `ci/batch/tpch-row-anchors.csv` are pinned to a specific HammerDB
-load and must be re-pinned after any TPC-H reload; the TPC-DS SF0.5 oracle is
+load and must be re-pinned after any TPC-H reload; the TPC-DS SF0.25 oracle is
 re-captured only when the dataset or query files change.
 
 ## Running a server manually
@@ -76,7 +76,7 @@ orphans, and materialize the victim set before `pg_terminate_backend`
   (unit/component suite). The git hook runs the pgbench smoke on EVERY commit —
   never `git commit --no-verify`.
 - Planner/executor changes additionally: `scripts/tpch-spotcheck.sh` (fresh
-  capped server + canonical Q12/Q13 row counts) and the TPC-DS SF0.5 gate.
+  capped server + canonical Q12/Q13 row counts) and the TPC-DS SF0.25 gate.
 - **Never pass `-count=1` to a gate's `go test`** — it defeats the test-result
   cache (~5 min warm vs ~40 min cold). `-count=1` is for one-off probes only.
 

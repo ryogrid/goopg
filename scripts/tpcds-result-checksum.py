@@ -3,7 +3,7 @@
 
 Why this exists
 ---------------
-The TPC-DS SF0.5 fast regression gate compares **row counts** against a
+The TPC-DS SF0.25 fast regression gate compares **row counts** against a
 git-tracked PG 18.3 oracle, so it is structurally blind to "right row count,
 wrong values".  Q75 is the worked example: before RC-1b goopg returned exactly
 100 rows for Q75 -- matching PG -- while its `all_sales` CTE computed 1,057,469

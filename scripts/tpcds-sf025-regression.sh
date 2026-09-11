@@ -1,23 +1,23 @@
 #!/usr/bin/env bash
-# tpcds-sf05-regression.sh — fast TPC-DS regression gate on a half-size dataset.
+# tpcds-sf025-regression.sh — fast TPC-DS regression gate on a quarter-size dataset.
 #
 # Motivation (2026-07-27): a full SF=1 goopg-vs-PG sweep costs 4-5 hours, almost
 # all of it spent waiting out 16 known 600 s timeouts. This gate cuts the loop:
 #
-#   * dataset ~= SF 0.5 (see SAMPLING below), so completing queries run ~2x faster
+#   * dataset ~= SF 0.25 (see SAMPLING below), so completing queries run ~4x faster
 #   * PostgreSQL executes each query ONCE via EXPLAIN (ANALYZE, TIMING OFF),
 #     yielding the plan AND the authoritative row count in a single pass; the
 #     result is cached in an oracle file and reused by every later goopg run
 #   * the recurring cost is therefore ONE goopg pass against the cached oracle
 #
-# SAMPLING — why this is "SF 0.5相当" and not dsdgen output:
+# SAMPLING — why this is "SF 0.25相当" and not dsdgen output:
 #   dsdgen's scale parameter is OPT_INT (integer GB; DSGen r_params.c:63), so a
 #   true fractional scale cannot be generated. Instead the 7 fact tables of the
-#   existing SF=1 TSVs are halved by KEY PARITY, dimensions kept whole:
-#       store_sales / store_returns    ss_/sr_ticket_number % 2 == 0
-#       catalog_sales / catalog_returns cs_/cr_order_number % 2 == 0
-#       web_sales / web_returns        ws_/wr_order_number % 2 == 0
-#       inventory                      inv_item_sk % 2 == 0
+#   existing SF=1 TSVs are quartered by KEY PARITY (key % 4 == 0), dimensions kept whole:
+#       store_sales / store_returns    ss_/sr_ticket_number % 4 == 0
+#       catalog_sales / catalog_returns cs_/cr_order_number % 4 == 0
+#       web_sales / web_returns        ws_/wr_order_number % 4 == 0
+#       inventory                      inv_item_sk % 4 == 0
 #   Parity on the SHARED key keeps every sales<->returns pair intact (a kept
 #   ticket keeps all its line items and all its returns), so join semantics are
 #   realistic. Correctness needs no official scale: PostgreSQL runs on the SAME
@@ -44,22 +44,22 @@
 #     (override with FORCE=1)
 #
 # Usage:
-#   scripts/tpcds-sf05-regression.sh build-data    # sample SF=1 TSVs -> SF0.5 TSVs
-#   scripts/tpcds-sf05-regression.sh load-pg       # create+load PG db 'tpcds05' (:65438)
-#   scripts/tpcds-sf05-regression.sh oracle        # PG plain run -> oracle.txt (rows+ck)
-#   scripts/tpcds-sf05-regression.sh load-goopg    # init+load goopg cluster on :65437
-#   scripts/tpcds-sf05-regression.sh sweep         # goopg run vs oracle (the recurring gate)
-#   scripts/tpcds-sf05-regression.sh plans         # EXPLAIN-only plan capture + diff (~20 s)
-#   scripts/tpcds-sf05-regression.sh delta [OLD [NEW]]  # named per-query status/runtime
+#   scripts/tpcds-sf025-regression.sh build-data    # sample SF=1 TSVs -> SF0.25 TSVs
+#   scripts/tpcds-sf025-regression.sh load-pg       # create+load PG db 'tpcds025' (:65438)
+#   scripts/tpcds-sf025-regression.sh oracle        # PG plain run -> oracle.txt (rows+ck)
+#   scripts/tpcds-sf025-regression.sh load-goopg    # init+load goopg cluster on :65437
+#   scripts/tpcds-sf025-regression.sh sweep         # goopg run vs oracle (the recurring gate)
+#   scripts/tpcds-sf025-regression.sh plans         # EXPLAIN-only plan capture + diff (~20 s)
+#   scripts/tpcds-sf025-regression.sh delta [OLD [NEW]]  # named per-query status/runtime
 #                                                  # delta between two archived reports
 #                                                  # (defaults: the two newest); runs
 #                                                  # nothing, costs nothing
-#   scripts/tpcds-sf05-regression.sh all           # everything above, in order
-#   scripts/tpcds-sf05-regression.sh status
+#   scripts/tpcds-sf025-regression.sh all           # everything above, in order
+#   scripts/tpcds-sf025-regression.sh status
 #
 # Env:
-#   SF05_PORT=65437         goopg port (see bench/tpcds/env_tpcds.sh port map)
-#   SF05_PG_DB=tpcds05      PostgreSQL database name
+#   SF025_PORT=65437         goopg port (see bench/tpcds/env_tpcds.sh port map)
+#   SF025_PG_DB=tpcds025      PostgreSQL database name
 #   ORACLE_TIMEOUT=600      per-query timeout for PG oracle capture (one-time)
 #   TIMEOUT_SEC=300         per-query timeout for the goopg sweep
 #   RESTART_AFTER_TIMEOUT=1 bounce goopg after each goopg TIMEOUT
@@ -67,34 +67,34 @@
 #   QUERIES="35 46"         restrict oracle/sweep to a subset (SOLO probe mode);
 #                           the sweep report is stamped "SUBSET PROBE" and is
 #                           NOT a gate result. With 'oracle' it additionally
-#                           requires SF05_ORACLE (it would truncate the fixture)
-#   SF05_ORACLE=<path>      read/write the oracle fixture elsewhere
-#   SF05_RESULTS_DIR=<dir>  redirect run artefacts (reports/plans); the oracle
-#                           fixture stays where SF05_ORACLE points
-#   SF05_NO_PLANS=1         skip the plan-shape channel appended to a sweep
-#   SF05_NO_DELTA=1         skip the status-delta channel appended to a sweep
-#   SF05_SWEEP_BASELINE=<p> diff the sweep's per-query status/runtime vector
+#                           requires SF025_ORACLE (it would truncate the fixture)
+#   SF025_ORACLE=<path>      read/write the oracle fixture elsewhere
+#   SF025_RESULTS_DIR=<dir>  redirect run artefacts (reports/plans); the oracle
+#                           fixture stays where SF025_ORACLE points
+#   SF025_NO_PLANS=1         skip the plan-shape channel appended to a sweep
+#   SF025_NO_DELTA=1         skip the status-delta channel appended to a sweep
+#   SF025_SWEEP_BASELINE=<p> diff the sweep's per-query status/runtime vector
 #                           against <p> instead of the newest sweep-*.txt in the
 #                           results dir; `none` skips the delta
 #   PLAN_TIMEOUT=180        per-query timeout for the EXPLAIN-only plan capture
-#   SF05_PLANS_BASELINE=<p> diff the capture against <p> instead of the newest
+#   SF025_PLANS_BASELINE=<p> diff the capture against <p> instead of the newest
 #                           plans-*.txt in the results dir; `none` skips the diff
-#   SF05_PLAN_PIN=1         make the plan-shape tail channel BLOCKING (A-05
+#   SF025_PLAN_PIN=1         make the plan-shape tail channel BLOCKING (A-05
 #                           TPC-DS plan pin): plan movement vs the baseline fails
 #                           the sweep via tpcds-plan-diff.py --strict. Requires
-#                           an explicit SF05_PLANS_BASELINE — the default
+#                           an explicit SF025_PLANS_BASELINE — the default
 #                           floating newest-capture baseline would auto-accept
 #                           the movement it just recorded, so an unset baseline
 #                           under the pin is itself a FAIL. Accept a moved plan
 #                           by blessing the new capture
-#                           (SF05_PLANS_BASELINE=<that file>); bootstrap or
-#                           suppress one run with SF05_PLANS_BASELINE=none.
+#                           (SF025_PLANS_BASELINE=<that file>); bootstrap or
+#                           suppress one run with SF025_PLANS_BASELINE=none.
 #                           Default (unset): informational, never changes the
 #                           exit status. No second channel: same capture, same
 #                           diff tool, same baseline mechanism.
-#   SF05_NO_BUILD=1         keep the binary already at GOOPG_BIN instead of
+#   SF025_NO_BUILD=1         keep the binary already at GOOPG_BIN instead of
 #                           rebuilding from the tree (bisect probes); the report
-#                           says its provenance is unknown — see sf05_ensure_bin
+#                           says its provenance is unknown — see sf025_ensure_bin
 #   GOOPG_BIN=<path>        build/run a private binary instead of the SHARED
 #                           tmp/goopg-bench-bin (which the nightly also owns)
 set -euo pipefail
@@ -105,30 +105,30 @@ cd "${REPO_ROOT}"
 # shellcheck source=/dev/null
 source "${REPO_ROOT}/bench/tpcds/env_tpcds.sh"
 # planner_flags_body — the generated provenance stamp (M0127-P5.9-q); see
-# sf05_planner_flags_line below.
+# sf025_planner_flags_line below.
 # shellcheck source=/dev/null
 source "${SCRIPT_DIR}/planner-flags.sh"
 
-# Dirs/ports come from env_tpcds.sh: TPCDS_TOOLS, SF05_DATA_DIR,
-# SF05_GOOPG_DATA, SF05_PORT (65437), SF05_PG_DB, SF05_LOG.
+# Dirs/ports come from env_tpcds.sh: TPCDS_TOOLS, SF025_DATA_DIR,
+# SF025_GOOPG_DATA, SF025_PORT (65437), SF025_PG_DB, SF025_LOG.
 SRC_DATA_DIR="${TPCDS_DATA_DIR}"                   # SF=1 TSVs (input)
 QDIR="${TPCDS_QUERY_DIR}"                          # SF=1 PG-fixed queries (reused)
-OUTDIR="${SF05_RESULTS_DIR}"                       # env-overridable (env_tpcds.sh)
+OUTDIR="${SF025_RESULTS_DIR}"                       # env-overridable (env_tpcds.sh)
 # The oracle is a GIT-TRACKED FIXTURE, not a run artefact: it stays in the
-# canonical results dir even when SF05_RESULTS_DIR is redirected to a scratch
+# canonical results dir even when SF025_RESULTS_DIR is redirected to a scratch
 # dir for a one-off probe. Only 'oracle' (re-capture) writes it.
-ORACLE="${SF05_ORACLE:-${TPCDS_RUNTIME_DIR}/tpcds-results-sf05/oracle.txt}"  # q|status|rows|ck|secs
+ORACLE="${SF025_ORACLE:-${TPCDS_RUNTIME_DIR}/tpcds-results-sf025/oracle.txt}"  # q|status|rows|ck|secs
 ORACLE_TIMEOUT="${ORACLE_TIMEOUT:-600}"
 # Value checksum (M0124-0005). Both engines' results go through the SAME parser
 # and the SAME normalisation, so "same ck" means "same answer" and nothing else.
 CKSUM="${SCRIPT_DIR}/tpcds-result-checksum.py"
 TIMEOUT_SEC="${TIMEOUT_SEC:-300}"
-CG_UNIT="goopg-tpcds-sf05"
+CG_UNIT="goopg-tpcds-sf025"
 
 PG_SKIP="36 70 86"   # dsqgen artefacts; fail on upstream PG too
 
-GOOPG_PSQL="psql -h ${TPCDS_HOST} -p ${SF05_PORT} -U ${TPCDS_SUPERUSER} -d postgres"
-PG_PSQL="psql -h ${TPCDS_HOST} -p ${TPCDS_PG_PORT} -U ${TPCDS_PG_USER} -d ${SF05_PG_DB}"
+GOOPG_PSQL="psql -h ${TPCDS_HOST} -p ${SF025_PORT} -U ${TPCDS_SUPERUSER} -d postgres"
+PG_PSQL="psql -h ${TPCDS_HOST} -p ${TPCDS_PG_PORT} -U ${TPCDS_PG_USER} -d ${SF025_PG_DB}"
 PG_ADMIN="psql -h ${TPCDS_HOST} -p ${TPCDS_PG_PORT} -U ${TPCDS_PG_USER} -d postgres"
 
 # The 25 real tables (mirrors tpcds-load.sh's filter).
@@ -179,7 +179,7 @@ query_list() {
 # a capped goopg server on :65434 for HOURS — measured at 112% CPU and 7.5 GiB
 # RSS, 5 h into the run. It shares nothing with the TPC-DS clusters by port or
 # data dir, so nothing stopped a "solo, fresh server" TPC-DS probe from landing
-# on top of it, and two SF0.5 sweeps (2026-07-29 00:47 and 03:38) plus the
+# on top of it, and two fast-gate sweeps (2026-07-29 00:47 and 03:38) plus the
 # M0124-0004 Q35 probes were all taken against that background before anyone
 # noticed. Timings taken that way are not comparable to a quiet-host baseline,
 # which is the one property every M0124/M0125 measurement depends on.
@@ -214,12 +214,12 @@ cmd_build_data() {
     guard_sf1_sweep
     [[ -d "${SRC_DATA_DIR}" ]] || die "SF=1 TSVs missing — run scripts/tpcds-setup.sh first"
     [[ -f "${TPCDS_TOOLS}/tpcds.sql" ]] || die "tpcds.sql missing — run scripts/tpcds-setup.sh first"
-    mkdir -p "${SF05_DATA_DIR}"
-    log "Sampling SF=1 TSVs -> ${SF05_DATA_DIR} (facts: key%2==0, dims: full copy)"
+    mkdir -p "${SF025_DATA_DIR}"
+    log "Sampling SF=1 TSVs -> ${SF025_DATA_DIR} (facts: key%4==0, dims: full copy)"
     local t src dst key idx in_rows out_rows
     for t in ${TABLES}; do
         src="${SRC_DATA_DIR}/${t}.tsv"
-        dst="${SF05_DATA_DIR}/${t}.tsv"
+        dst="${SF025_DATA_DIR}/${t}.tsv"
         [[ -f "$src" ]] || { log "  ${t}: MISSING source tsv"; continue; }
         key=$(sample_key "$t")
         if [[ -z "$key" ]]; then
@@ -228,7 +228,7 @@ cmd_build_data() {
         else
             idx=$(col_index "$t" "$key")
             [[ -n "$idx" ]] || die "column ${key} not found in ${t} (tpcds.sql parse failed)"
-            awk -F'\t' -v c="$idx" '($c + 0) % 2 == 0' "$src" > "$dst"
+            awk -F'\t' -v c="$idx" '($c + 0) % 4 == 0' "$src" > "$dst"
             in_rows=$(wc -l < "$src"); out_rows=$(wc -l < "$dst")
             [[ "$out_rows" -gt 0 ]] || die "${t}: sampling produced 0 rows (key=${key} idx=${idx})"
             printf "  %-24s %s -> %s rows (%s%%, key=%s col %s)\n" \
@@ -241,15 +241,15 @@ cmd_build_data() {
 # ------------------------------------------------------------------ load-pg
 cmd_load_pg() {
     guard_sf1_sweep
-    [[ -d "${SF05_DATA_DIR}" ]] || die "run build-data first"
-    log "Recreating PG database ${SF05_PG_DB} on :${TPCDS_PG_PORT}"
-    ${PG_ADMIN} -c "DROP DATABASE IF EXISTS ${SF05_PG_DB}" >/dev/null
-    ${PG_ADMIN} -c "CREATE DATABASE ${SF05_PG_DB}" >/dev/null
+    [[ -d "${SF025_DATA_DIR}" ]] || die "run build-data first"
+    log "Recreating PG database ${SF025_PG_DB} on :${TPCDS_PG_PORT}"
+    ${PG_ADMIN} -c "DROP DATABASE IF EXISTS ${SF025_PG_DB}" >/dev/null
+    ${PG_ADMIN} -c "CREATE DATABASE ${SF025_PG_DB}" >/dev/null
     ${PG_PSQL} -q -f "${TPCDS_TOOLS}/tpcds.sql" 2>&1 | tail -2 || true
     local t cnt
     for t in ${TABLES}; do
         printf "  %-24s " "$t"
-        if ${PG_PSQL} -v ON_ERROR_STOP=1 -c "COPY ${t} FROM '${SF05_DATA_DIR}/${t}.tsv'" >/dev/null; then
+        if ${PG_PSQL} -v ON_ERROR_STOP=1 -c "COPY ${t} FROM '${SF025_DATA_DIR}/${t}.tsv'" >/dev/null; then
             cnt=$(${PG_PSQL} -t -A -c "SELECT count(*) FROM ${t}")
             echo "OK (${cnt} rows)"
         else
@@ -274,17 +274,17 @@ cmd_load_pg() {
 # not decoration.
 #
 # So: build unconditionally from the current tree (the Go build cache makes that
-# ~1 s when nothing changed), and stamp what actually ran. SF05_NO_BUILD=1 keeps
+# ~1 s when nothing changed), and stamp what actually ran. SF025_NO_BUILD=1 keeps
 # a deliberately-foreign binary (a bisect probe) usable, at the cost of the
 # report saying so out loud.
-sf05_bin_provenance=""          # set by sf05_ensure_bin; echoed into the report
-sf05_engine_id_at_start=""      # D4a comparability key, captured before the build
-sf05_bin_sha_at_start=""        # on-disk image the sweep intended to measure
-sf05_report=""                  # cmd_sweep's report path (the restart guard appends)
-sf05_sweep_active=0             # 1 once the sweep loop owns the server
-sf05_plan_pin_failed=0          # 1 when SF05_PLAN_PIN=1 and the plan channel moved
+sf025_bin_provenance=""          # set by sf025_ensure_bin; echoed into the report
+sf025_engine_id_at_start=""      # D4a comparability key, captured before the build
+sf025_bin_sha_at_start=""        # on-disk image the sweep intended to measure
+sf025_report=""                  # cmd_sweep's report path (the restart guard appends)
+sf025_sweep_active=0             # 1 once the sweep loop owns the server
+sf025_plan_pin_failed=0          # 1 when SF025_PLAN_PIN=1 and the plan channel moved
 
-sf05_ensure_bin() {
+sf025_ensure_bin() {
     local tree_sha dirty built="rebuilt from tree"
     tree_sha=$(cd "${REPO_ROOT}" && git rev-parse --short HEAD 2>/dev/null || echo unknown)
     # "Dirty" must mean "the binary is not HEAD's code": only tracked Go sources
@@ -293,9 +293,9 @@ sf05_ensure_bin() {
     # make the flag fire on every run, i.e. mean nothing.
     dirty=$(cd "${REPO_ROOT}" && git status --porcelain --untracked-files=no \
                 -- '*.go' go.mod go.sum 2>/dev/null | head -1)
-    if [[ "${SF05_NO_BUILD:-0}" == "1" ]]; then
-        [[ -x "${GOOPG_BIN}" ]] || die "SF05_NO_BUILD=1 but ${GOOPG_BIN} is not executable"
-        built="PRE-EXISTING, NOT BUILT BY THIS RUN (SF05_NO_BUILD=1) — provenance unknown"
+    if [[ "${SF025_NO_BUILD:-0}" == "1" ]]; then
+        [[ -x "${GOOPG_BIN}" ]] || die "SF025_NO_BUILD=1 but ${GOOPG_BIN} is not executable"
+        built="PRE-EXISTING, NOT BUILT BY THIS RUN (SF025_NO_BUILD=1) — provenance unknown"
     else
         # Refuse to clobber the SHARED default while a foreign bench harness owns
         # the host: the nightly runs servers from this exact file for hours and
@@ -305,30 +305,30 @@ sf05_ensure_bin() {
         if [[ "${GOOPG_BIN}" == "${REPO_ROOT}/tmp/goopg-bench-bin" ]] \
            && grep -qE 'ci/batch/(run-nightly\.sh|stages/)|[b]ash scripts/tpcds-bench-compare\.sh' \
                    <<<"$(bench_foreign_procs)"; then
-            die "refusing to rebuild the SHARED ${GOOPG_BIN} while the nightly/SF=1 harness runs from it; re-run with GOOPG_BIN=${REPO_ROOT}/tmp/goopg-sf05-bin"
+            die "refusing to rebuild the SHARED ${GOOPG_BIN} while the nightly/SF=1 harness runs from it; re-run with GOOPG_BIN=${REPO_ROOT}/tmp/goopg-sf025-bin"
         fi
         mkdir -p "$(dirname "${GOOPG_BIN}")"
         log "building goopg -> ${GOOPG_BIN} (tree ${tree_sha}${dirty:+, dirty})"
         ( cd "${REPO_ROOT}" && go build -o "${GOOPG_BIN}" ./cmd/goopg ) \
             || die "goopg build failed"
     fi
-    # Field names and semantics are D4a's, verbatim, so an SF0.5 header and an
+    # Field names and semantics are D4a's, verbatim, so an SF0.25 header and an
     # SF=1 header can be compared line for line (helpers in env_tpcds.sh).
     # `running=` is filled in later — the postmaster does not exist yet here.
-    sf05_engine_id_at_start=$(bench_engine_id)
-    sf05_bin_provenance=$(printf '# goopg: %s\n# engine-id: %s\n# build: %s%s' \
+    sf025_engine_id_at_start=$(bench_engine_id)
+    sf025_bin_provenance=$(printf '# goopg: %s\n# engine-id: %s\n# build: %s%s' \
         "$(cd "${REPO_ROOT}" && git log --oneline -1 2>/dev/null)" \
-        "${sf05_engine_id_at_start}" \
+        "${sf025_engine_id_at_start}" \
         "${built}" \
         "${dirty:+ [tree DIRTY in Go sources — the binary is not this commit alone]}")
 }
 
-# sf05_engine_binary_line — D4a's third field, emitted once the cluster is up.
+# sf025_engine_binary_line — D4a's third field, emitted once the cluster is up.
 # on-disk vs running differ whenever a foreign harness rebuilt the shared path
 # after this server started; the sweep header must show which image answered.
-sf05_engine_binary_line() {
+sf025_engine_binary_line() {
     local running ondisk
-    running=$(bench_running_engine_sha "${SF05_GOOPG_DATA}")
+    running=$(bench_running_engine_sha "${SF025_GOOPG_DATA}")
     ondisk=$(bench_engine_bin_sha "${GOOPG_BIN}")
     printf '# engine-binary: running=%s on-disk=%s (%s)\n' "${running}" "${ondisk}" "${GOOPG_BIN}"
     [[ "${running}" != "${ondisk}" ]] && \
@@ -337,51 +337,51 @@ sf05_engine_binary_line() {
 }
 
 # --------------------------------------------------------------- goopg server
-sf05_goopg_stop() {
-    "${GOOPG_BIN}" stop -D "${SF05_GOOPG_DATA}" >/dev/null 2>&1 || true
+sf025_goopg_stop() {
+    "${GOOPG_BIN}" stop -D "${SF025_GOOPG_DATA}" >/dev/null 2>&1 || true
     systemctl --user stop "${CG_UNIT}.scope" >/dev/null 2>&1 || true
     systemctl --user reset-failed "${CG_UNIT}.scope" >/dev/null 2>&1 || true
 }
 
-sf05_goopg_start() {
-    sf05_goopg_stop
+sf025_goopg_start() {
+    sf025_goopg_stop
     local hba_arg=()
-    [[ -f "${SF05_GOOPG_DATA}/pg_hba.conf" ]] && hba_arg=(--hba "${SF05_GOOPG_DATA}/pg_hba.conf")
+    [[ -f "${SF025_GOOPG_DATA}/pg_hba.conf" ]] && hba_arg=(--hba "${SF025_GOOPG_DATA}/pg_hba.conf")
     GOOPG_CG_UNIT="${CG_UNIT}" "${REPO_ROOT}/scripts/goopg-test-run.sh" \
-        "${GOOPG_BIN}" start -D "${SF05_GOOPG_DATA}" \
-        --listen "127.0.0.1:${SF05_PORT}" "${hba_arg[@]}" \
-        >> "${SF05_LOG}" 2>&1 &
+        "${GOOPG_BIN}" start -D "${SF025_GOOPG_DATA}" \
+        --listen "127.0.0.1:${SF025_PORT}" "${hba_arg[@]}" \
+        >> "${SF025_LOG}" 2>&1 &
     local i
     for i in $(seq 1 180); do
-        if pg_isready -h 127.0.0.1 -p "${SF05_PORT}" -U "${PG_SUPERUSER}" >/dev/null 2>&1; then
-            sf05_guard_engine_stable
+        if pg_isready -h 127.0.0.1 -p "${SF025_PORT}" -U "${PG_SUPERUSER}" >/dev/null 2>&1; then
+            sf025_guard_engine_stable
             return 0
         fi
         sleep 1
     done
-    die "goopg (sf05) did not become ready in 180s — see ${SF05_LOG}"
+    die "goopg (sf025) did not become ready in 180s — see ${SF025_LOG}"
 }
 
-# sf05_guard_engine_stable — every RESTART_AFTER_TIMEOUT bounce and every
+# sf025_guard_engine_stable — every RESTART_AFTER_TIMEOUT bounce and every
 # crash-restart re-execs ${GOOPG_BIN} as it is *then*, so a foreign harness that
 # rebuilt the shared path mid-sweep silently swaps the engine under the report
 # (D4a's second failure direction). Mirror the SF=1 harness's policy: a changed
 # engine-id VOIDS the run and must be shouted in the artefact, not left to
 # process archaeology; a changed image with identical source is a docs/tracker
 # commit rebuild and voids nothing.
-sf05_guard_engine_stable() {
-    [[ "${sf05_sweep_active}" == "1" ]] || return 0
+sf025_guard_engine_stable() {
+    [[ "${sf025_sweep_active}" == "1" ]] || return 0
     local now_id now_sha msg=""
     now_id=$(bench_engine_id)
     now_sha=$(bench_engine_bin_sha "${GOOPG_BIN}")
-    if [[ "${now_id}" != "${sf05_engine_id_at_start}" ]]; then
-        msg="      *** SWEEP VOID: engine source changed mid-sweep (engine-id ${sf05_engine_id_at_start} -> ${now_id}); verdicts before and after this restart are not one measurement ***"
-    elif [[ "${now_sha}" != "${sf05_bin_sha_at_start}" ]]; then
-        msg="      (engine source unchanged; ${GOOPG_BIN} image re-built ${sf05_bin_sha_at_start} -> ${now_sha} — docs/tracker commit, not a code change)"
+    if [[ "${now_id}" != "${sf025_engine_id_at_start}" ]]; then
+        msg="      *** SWEEP VOID: engine source changed mid-sweep (engine-id ${sf025_engine_id_at_start} -> ${now_id}); verdicts before and after this restart are not one measurement ***"
+    elif [[ "${now_sha}" != "${sf025_bin_sha_at_start}" ]]; then
+        msg="      (engine source unchanged; ${GOOPG_BIN} image re-built ${sf025_bin_sha_at_start} -> ${now_sha} — docs/tracker commit, not a code change)"
     fi
     if [[ -n "${msg}" ]]; then
         echo "${msg}"
-        [[ -n "${sf05_report}" ]] && echo "${msg}" >> "${sf05_report}"
+        [[ -n "${sf025_report}" ]] && echo "${msg}" >> "${sf025_report}"
     fi
     return 0
 }
@@ -389,19 +389,19 @@ sf05_guard_engine_stable() {
 # --------------------------------------------------------------- load-goopg
 cmd_load_goopg() {
     guard_sf1_sweep
-    [[ -d "${SF05_DATA_DIR}" ]] || die "run build-data first"
-    sf05_ensure_bin
-    log "Initialising fresh goopg cluster at ${SF05_GOOPG_DATA} (port ${SF05_PORT})"
-    sf05_goopg_stop
-    rm -rf "${SF05_GOOPG_DATA}"
-    "${GOOPG_BIN}" init -D "${SF05_GOOPG_DATA}" >/dev/null
-    sf05_goopg_start
+    [[ -d "${SF025_DATA_DIR}" ]] || die "run build-data first"
+    sf025_ensure_bin
+    log "Initialising fresh goopg cluster at ${SF025_GOOPG_DATA} (port ${SF025_PORT})"
+    sf025_goopg_stop
+    rm -rf "${SF025_GOOPG_DATA}"
+    "${GOOPG_BIN}" init -D "${SF025_GOOPG_DATA}" >/dev/null
+    sf025_goopg_start
     log "Loading schema + data"
     ${GOOPG_PSQL} -q -f "${TPCDS_TOOLS}/tpcds.sql" 2>&1 | tail -2 || true
     local t cnt
     for t in ${TABLES}; do
         printf "  %-24s " "$t"
-        if ${GOOPG_PSQL} -c "COPY ${t} FROM '${SF05_DATA_DIR}/${t}.tsv'" >/dev/null 2>&1; then
+        if ${GOOPG_PSQL} -c "COPY ${t} FROM '${SF025_DATA_DIR}/${t}.tsv'" >/dev/null 2>&1; then
             cnt=$(${GOOPG_PSQL} -t -A -c "SELECT count(*) FROM ${t}" 2>/dev/null)
             echo "OK (${cnt} rows)"
         else
@@ -422,7 +422,7 @@ cmd_load_goopg() {
     done
     log "  reltuples verification: ${ok}/25 tables have reltuples > 0"
     ${GOOPG_PSQL} -c "CHECKPOINT" >/dev/null 2>&1 || true
-    sf05_goopg_stop
+    sf025_goopg_stop
     log "load-goopg done (server stopped; the sweep starts its own fresh instance)"
 }
 
@@ -437,7 +437,7 @@ reap_pg_orphans() {
             select pid from pg_stat_activity
             where backend_type='client backend'
               and pid <> pg_backend_pid()
-              and datname='${SF05_PG_DB}'
+              and datname='${SF025_PG_DB}'
               and state='active'
               and now()-query_start > interval '${ORACLE_TIMEOUT} seconds'
         )
@@ -472,8 +472,8 @@ cmd_oracle() {
     # cmd_oracle TRUNCATES the fixture. A partial re-capture under QUERIES would
     # therefore delete the other 98 rows, silently turning the gate into a
     # 1-query no-op — so a subset capture must name its own output file.
-    if [[ -n "${QUERIES:-}" && -z "${SF05_ORACLE:-}" ]]; then
-        die "QUERIES= with 'oracle' would truncate the git-tracked fixture; set SF05_ORACLE=<scratch path> too"
+    if [[ -n "${QUERIES:-}" && -z "${SF025_ORACLE:-}" ]]; then
+        die "QUERIES= with 'oracle' would truncate the git-tracked fixture; set SF025_ORACLE=<scratch path> too"
     fi
     mkdir -p "${OUTDIR}"
     # PLAIN execution, not EXPLAIN ANALYZE (M0124-0005 / design D1). EXPLAIN
@@ -485,9 +485,9 @@ cmd_oracle() {
     # load-bearing acceptance criterion.
     log "Capturing PG oracle (plain run + value checksum, timeout ${ORACLE_TIMEOUT}s/query) -> ${ORACLE}"
     {
-        echo "# TPC-DS SF0.5 row-count + value-checksum oracle — PostgreSQL 18.3 ground truth"
+        echo "# TPC-DS SF0.25 row-count + value-checksum oracle — PostgreSQL 18.3 ground truth"
         echo "# captured: $(date -Iseconds)  source: $(git -C "${REPO_ROOT}" log --oneline -1 | cut -d' ' -f1)"
-        echo "# dataset: SF=1 TSVs, facts halved by key parity (see tpcds-sf05-regression.sh header)"
+        echo "# dataset: SF=1 TSVs, facts quartered by key parity (see tpcds-sf025-regression.sh header)"
         echo "# format: q|status|rows|ck|secs   (secs are machine-specific; rows and ck are the fixture)"
         echo "# ck: scripts/tpcds-result-checksum.py — sha256/16 over field-stripped rows,"
         echo "#     fractional numerics canonicalised to 12 significant digits (goopg's"
@@ -497,7 +497,7 @@ cmd_oracle() {
         echo "# ck=n/a: a LIMIT window saturated at its bound — the row SET is ambiguous at"
         echo "#     the boundary tie group, so the query stays row-count-only (design D3)."
         echo "# This file is GIT-TRACKED as a pinned fixture so other machines/CI can skip"
-        echo "# the ~20 min PG capture. Re-run 'oracle' only when the dataset or queries change."
+        echo "# the ~3 min PG capture. Re-run 'oracle' only when the dataset or queries change."
     } > "${ORACLE}"
     local q qf res secs start rc rows ck status zero=0 okc=0 ckc=0 nac=0
     for q in $(query_list); do
@@ -554,11 +554,11 @@ cmd_oracle() {
 # TIMEOUT). For a milestone whose whole subject is the join search, 74 plans
 # moving in silence is the event we most want the artefact to record.
 #
-# A-05 promotion: SF05_PLAN_PIN=1 makes this channel BLOCKING — movement vs
-# an explicit SF05_PLANS_BASELINE fails the sweep (--strict) — so this file
+# A-05 promotion: SF025_PLAN_PIN=1 makes this channel BLOCKING — movement vs
+# an explicit SF025_PLANS_BASELINE fails the sweep (--strict) — so this file
 # is now also the TPC-DS plan pin. No second channel was built: same capture,
-# same diff tool, same baseline mechanism; see SF05_PLAN_PIN in the Env block
-# above and sf05_plan_channel below.
+# same diff tool, same baseline mechanism; see SF025_PLAN_PIN in the Env block
+# above and sf025_plan_channel below.
 #
 # The channel is EXPLAIN-without-ANALYZE, so it executes nothing: no timings and
 # no actual rows enter the file, which is what makes the capture byte-stable.
@@ -591,16 +591,16 @@ PLAN_DIFF="${PLAN_DIFF:-${SCRIPT_DIR}/tpcds-plan-diff.py}"
 # never fails this gate, only correctness does.
 SWEEP_DIFF="${SWEEP_DIFF:-${SCRIPT_DIR}/tpcds-sweep-diff.py}"
 
-# sf05_sweep_baseline — the report this run is diffed against, chosen BEFORE the
+# sf025_sweep_baseline — the report this run is diffed against, chosen BEFORE the
 # new one is created so it can never select itself (same rule, and the same
-# hazard, as sf05_plan_baseline). Unlike the plan baseline it skips SUBSET
+# hazard, as sf025_plan_baseline). Unlike the plan baseline it skips SUBSET
 # PROBES: a probe covers a handful of queries and is stamped "NOT a gate
 # result", so diffing a full sweep against one would compare 3 queries and stay
 # silent about the other 96. The newest FULL report is the last comparable gate
-# run. SF05_SWEEP_BASELINE overrides it; `none` suppresses.
-sf05_sweep_baseline() {
-    if [[ -n "${SF05_SWEEP_BASELINE:-}" ]]; then
-        [[ "${SF05_SWEEP_BASELINE}" == "none" ]] || echo "${SF05_SWEEP_BASELINE}"
+# run. SF025_SWEEP_BASELINE overrides it; `none` suppresses.
+sf025_sweep_baseline() {
+    if [[ -n "${SF025_SWEEP_BASELINE:-}" ]]; then
+        [[ "${SF025_SWEEP_BASELINE}" == "none" ]] || echo "${SF025_SWEEP_BASELINE}"
         return 0
     fi
     local f
@@ -612,23 +612,23 @@ sf05_sweep_baseline() {
     ls -t "${OUTDIR}"/sweep-*.txt 2>/dev/null | head -1 || true
 }
 
-# sf05_status_delta_channel <report> <baseline> — append the named delta to the
+# sf025_status_delta_channel <report> <baseline> — append the named delta to the
 # report. Swallows every failure: a broken delta must not turn a passing
 # correctness gate red.
-sf05_status_delta_channel() {
+sf025_status_delta_channel() {
     local report="$1" baseline="$2"
     {
         echo ""
         if [[ -n "${baseline}" && -f "${baseline}" ]]; then
             python3 "${SWEEP_DIFF}" "${baseline}" "${report}" 2>&1 || true
         else
-            echo "# status-delta: no previous sweep report to diff against (first run, or SF05_SWEEP_BASELINE=none)"
+            echo "# status-delta: no previous sweep report to diff against (first run, or SF025_SWEEP_BASELINE=none)"
         fi
         echo "# The status-delta channel is NON-BLOCKING: it never changes this gate's exit status."
     } | tee -a "${report}"
 }
 
-# sf05_planner_flags_line — the arm label, shared by the sweep report and the
+# sf025_planner_flags_line — the arm label, shared by the sweep report and the
 # plan capture. D4a made the report say which ENGINE ran; a planner A/B
 # additionally needs it to say which FLAGS ran, or two arms of the same commit
 # produce artefacts that are indistinguishable on their face and the comparison
@@ -672,24 +672,24 @@ sf05_status_delta_channel() {
 # is how the six flags this function never named (EXISTS_TO_ANY, UNNEST_PREDP,
 # INDEXKEY_HARVEST, NLI_COSTGATE, HASH_OUTER_JOIN, MHJ_PACKING_OFF) joined the
 # line in the same commit.
-sf05_planner_flags_line() {
+sf025_planner_flags_line() {
     printf '# planner-flags: %s\n' "$(planner_flags_body)"
 }
 
-# sf05_plan_baseline — the capture this run is diffed against: the newest
+# sf025_plan_baseline — the capture this run is diffed against: the newest
 # plans-*.txt already in the results dir, chosen BEFORE the new file is created
-# so it can never select itself. SF05_PLANS_BASELINE overrides it (point it at
+# so it can never select itself. SF025_PLANS_BASELINE overrides it (point it at
 # one of the committed corpus captures to attribute a change to a specific
 # commit); `none` suppresses the diff for a first capture on a fresh dir.
-sf05_plan_baseline() {
-    if [[ -n "${SF05_PLANS_BASELINE:-}" ]]; then
-        [[ "${SF05_PLANS_BASELINE}" == "none" ]] || echo "${SF05_PLANS_BASELINE}"
+sf025_plan_baseline() {
+    if [[ -n "${SF025_PLANS_BASELINE:-}" ]]; then
+        [[ "${SF025_PLANS_BASELINE}" == "none" ]] || echo "${SF025_PLANS_BASELINE}"
         return 0
     fi
     ls -t "${OUTDIR}"/plans-*.txt 2>/dev/null | head -1 || true
 }
 
-# sf05_capture_plans <outfile> — one EXPLAIN pass over the corpus on the
+# sf025_capture_plans <outfile> — one EXPLAIN pass over the corpus on the
 # server that is currently up. The caller owns the server's lifecycle: the
 # capture must run on a FRESHLY started instance so a sweep's accumulated heap
 # (and any RESTART_AFTER_TIMEOUT bounce it took) cannot be confused for a
@@ -700,13 +700,13 @@ sf05_plan_baseline() {
 # diffable against every other plan file, and a subset capture would report the
 # other 98 queries as `removed` against any real baseline. At 14 s for the full
 # corpus there is nothing to save by narrowing it.
-sf05_capture_plans() {
+sf025_capture_plans() {
     local out="$1" q f rc
     [[ -n "${QUERIES:-}" ]] && log "  (plan capture ignores QUERIES= — it is always the full corpus)"
     {
-        echo "# TPC-DS SF0.5 plan-shape capture — $(date -Iseconds)"
-        echo "${sf05_bin_provenance}"
-        sf05_planner_flags_line
+        echo "# TPC-DS SF0.25 plan-shape capture — $(date -Iseconds)"
+        echo "${sf025_bin_provenance}"
+        sf025_planner_flags_line
         echo "# EXPLAIN only (no ANALYZE): nothing in this file was executed."
         echo "# diff with: scripts/tpcds-plan-diff.py OLD NEW [--verbose]"
     } > "${out}"
@@ -733,56 +733,56 @@ PY
 # ask before it asks the expensive one.
 cmd_plans() {
     guard_sf1_sweep
-    [[ -d "${SF05_GOOPG_DATA}" ]] || die "run load-goopg first"
+    [[ -d "${SF025_GOOPG_DATA}" ]] || die "run load-goopg first"
     mkdir -p "${OUTDIR}"
-    sf05_ensure_bin
-    sf05_bin_sha_at_start=$(bench_engine_bin_sha "${GOOPG_BIN}")
+    sf025_ensure_bin
+    sf025_bin_sha_at_start=$(bench_engine_bin_sha "${GOOPG_BIN}")
     local baseline plans
-    baseline=$(sf05_plan_baseline)
+    baseline=$(sf025_plan_baseline)
     plans="${OUTDIR}/plans-$(date +%Y%m%d-%H%M%S).txt"
     log "plan-shape capture (EXPLAIN only, timeout ${PLAN_TIMEOUT}s/query) -> ${plans}"
-    sf05_goopg_start
-    sf05_capture_plans "${plans}"
-    sf05_goopg_stop
+    sf025_goopg_start
+    sf025_capture_plans "${plans}"
+    sf025_goopg_stop
     if [[ -n "${baseline}" && -f "${baseline}" ]]; then
-        if [[ "${SF05_PLAN_PIN:-0}" == "1" ]]; then
+        if [[ "${SF025_PLAN_PIN:-0}" == "1" ]]; then
             python3 "${PLAN_DIFF}" "${baseline}" "${plans}" --strict
         else
             python3 "${PLAN_DIFF}" "${baseline}" "${plans}"
         fi
-    elif [[ "${SF05_PLAN_PIN:-0}" == "1" && "${SF05_PLANS_BASELINE:-}" != "none" ]]; then
-        die "plan pin (SF05_PLAN_PIN=1) has no baseline to diff against — set SF05_PLANS_BASELINE=<blessed capture> (or =none to bless this capture explicitly)"
+    elif [[ "${SF025_PLAN_PIN:-0}" == "1" && "${SF025_PLANS_BASELINE:-}" != "none" ]]; then
+        die "plan pin (SF025_PLAN_PIN=1) has no baseline to diff against — set SF025_PLANS_BASELINE=<blessed capture> (or =none to bless this capture explicitly)"
     else
-        log "no baseline capture to diff against (first run, or SF05_PLANS_BASELINE=none)"
+        log "no baseline capture to diff against (first run, or SF025_PLANS_BASELINE=none)"
     fi
     log "plans: ${plans}"
 }
 
-# sf05_plan_channel <report> — the sweep's tail. Restarts the server so the
+# sf025_plan_channel <report> — the sweep's tail. Restarts the server so the
 # capture is S-cold like the sweep itself, captures, diffs, and appends the
 # result to the sweep report. Runs in a subshell and swallows every failure:
 # a broken plan pass must not turn a passing correctness gate red — UNLESS
-# SF05_PLAN_PIN=1 (A-05 TPC-DS plan pin), which promotes the channel to a
+# SF025_PLAN_PIN=1 (A-05 TPC-DS plan pin), which promotes the channel to a
 # blocking gate via --strict (movement fails the sweep) and requires an
-# explicit SF05_PLANS_BASELINE (unset baseline under the pin is itself a
+# explicit SF025_PLANS_BASELINE (unset baseline under the pin is itself a
 # FAIL; =none is the explicit one-run suppression).
-sf05_plan_channel() {
+sf025_plan_channel() {
     local report="$1" baseline plans rc=0 diff_rc=0 pinned=0
-    [[ "${SF05_PLAN_PIN:-0}" == "1" ]] && pinned=1
-    baseline=$(sf05_plan_baseline)
+    [[ "${SF025_PLAN_PIN:-0}" == "1" ]] && pinned=1
+    baseline=$(sf025_plan_baseline)
     plans="${report%/*}/plans-${report##*/sweep-}"
     (
-        sf05_goopg_start
-        sf05_capture_plans "${plans}"
-        sf05_goopg_stop
-    ) >> "${SF05_LOG}" 2>&1 || rc=$?
+        sf025_goopg_start
+        sf025_capture_plans "${plans}"
+        sf025_goopg_stop
+    ) >> "${SF025_LOG}" 2>&1 || rc=$?
     {
         echo ""
         if [[ "${rc}" -ne 0 ]]; then
-            echo "=== PLAN-SHAPE: capture FAILED (rc=${rc}) — see ${SF05_LOG}; the verdict above is unaffected ==="
+            echo "=== PLAN-SHAPE: capture FAILED (rc=${rc}) — see ${SF025_LOG}; the verdict above is unaffected ==="
             [[ "${pinned}" == "1" ]] && diff_rc=1
-        elif [[ "${pinned}" == "1" && -z "${SF05_PLANS_BASELINE:-}" ]]; then
-            echo "=== PLAN-SHAPE PIN: FAIL — SF05_PLAN_PIN=1 requires an explicit SF05_PLANS_BASELINE (the default floating newest-capture baseline would auto-accept the movement it just recorded); bless with SF05_PLANS_BASELINE=none, or accept by pointing at the blessed capture ==="
+        elif [[ "${pinned}" == "1" && -z "${SF025_PLANS_BASELINE:-}" ]]; then
+            echo "=== PLAN-SHAPE PIN: FAIL — SF025_PLAN_PIN=1 requires an explicit SF025_PLANS_BASELINE (the default floating newest-capture baseline would auto-accept the movement it just recorded); bless with SF025_PLANS_BASELINE=none, or accept by pointing at the blessed capture ==="
             diff_rc=1
         elif [[ -n "${baseline}" && -f "${baseline}" ]]; then
             if [[ "${pinned}" == "1" ]]; then
@@ -791,25 +791,25 @@ sf05_plan_channel() {
                 python3 "${PLAN_DIFF}" "${baseline}" "${plans}" 2>&1 || true
             fi
             if [[ "${pinned}" == "1" && "${diff_rc}" -ne 0 ]]; then
-                echo "=== PLAN-SHAPE PIN: FAIL — plans moved vs ${baseline}; accept by blessing ${plans} as the new SF05_PLANS_BASELINE ==="
+                echo "=== PLAN-SHAPE PIN: FAIL — plans moved vs ${baseline}; accept by blessing ${plans} as the new SF025_PLANS_BASELINE ==="
             fi
         elif [[ "${pinned}" == "1" ]]; then
-            if [[ "${SF05_PLANS_BASELINE:-}" == "none" ]]; then
-                echo "# plan-shape pin: explicitly suppressed for this run (SF05_PLANS_BASELINE=none) — accepted, not verified"
+            if [[ "${SF025_PLANS_BASELINE:-}" == "none" ]]; then
+                echo "# plan-shape pin: explicitly suppressed for this run (SF025_PLANS_BASELINE=none) — accepted, not verified"
             else
-                echo "=== PLAN-SHAPE PIN: FAIL — SF05_PLANS_BASELINE=${SF05_PLANS_BASELINE} names a missing file ==="
+                echo "=== PLAN-SHAPE PIN: FAIL — SF025_PLANS_BASELINE=${SF025_PLANS_BASELINE} names a missing file ==="
                 diff_rc=1
             fi
         else
             echo "# plan-shape: captured ${plans} (no baseline to diff against yet)"
         fi
         if [[ "${pinned}" == "1" ]]; then
-            echo "# The plan channel is BLOCKING under SF05_PLAN_PIN=1: movement above fails this gate."
+            echo "# The plan channel is BLOCKING under SF025_PLAN_PIN=1: movement above fails this gate."
         else
             echo "# The plan channel is NON-BLOCKING: it never changes this gate's exit status."
         fi
     } | tee -a "${report}"
-    [[ "${diff_rc}" -ne 0 ]] && sf05_plan_pin_failed=1
+    [[ "${diff_rc}" -ne 0 ]] && sf025_plan_pin_failed=1
     return 0
 }
 
@@ -817,37 +817,37 @@ sf05_plan_channel() {
 cmd_sweep() {
     guard_sf1_sweep
     [[ -s "${ORACLE}" ]] || die "run oracle first"
-    [[ -d "${SF05_GOOPG_DATA}" ]] || die "run load-goopg first"
+    [[ -d "${SF025_GOOPG_DATA}" ]] || die "run load-goopg first"
     mkdir -p "${OUTDIR}"
     # Chosen BEFORE the new report exists, or the status channel would diff the
-    # run against itself (sf05_plan_baseline has the same ordering constraint).
+    # run against itself (sf025_plan_baseline has the same ordering constraint).
     local delta_baseline
-    delta_baseline=$(sf05_sweep_baseline)
+    delta_baseline=$(sf025_sweep_baseline)
     local report="${OUTDIR}/sweep-$(date +%Y%m%d-%H%M%S).txt"
-    log "goopg SF0.5 sweep (timeout ${TIMEOUT_SEC}s/query, S-cold) -> ${report}"
-    sf05_ensure_bin
-    sf05_bin_sha_at_start=$(bench_engine_bin_sha "${GOOPG_BIN}")
-    sf05_report="$report"
-    sf05_goopg_start
+    log "goopg SF0.25 sweep (timeout ${TIMEOUT_SEC}s/query, S-cold) -> ${report}"
+    sf025_ensure_bin
+    sf025_bin_sha_at_start=$(bench_engine_bin_sha "${GOOPG_BIN}")
+    sf025_report="$report"
+    sf025_goopg_start
     # Only now is the sweep the server's owner: the guard must not fire on this
     # first, intended start.
-    sf05_sweep_active=1
+    sf025_sweep_active=1
     local q line ostatus orows ock qf out rc secs start grows gck verdict nf
     local pass=0 mismatch=0 ckmismatch=0 gerr=0 gto=0 skip=0 ckver=0 ckna=0
     local resfile="${OUTDIR}/.goopg_result.txt"
     {
-        echo "# TPC-DS SF0.5 goopg sweep — $(date -Iseconds)"
+        echo "# TPC-DS SF0.25 goopg sweep — $(date -Iseconds)"
         # Identity of the engine that ACTUALLY ran, not just the tree's HEAD —
-        # see sf05_ensure_bin for why the difference bit us. Same three fields as
+        # see sf025_ensure_bin for why the difference bit us. Same three fields as
         # the SF=1 harness (design 0124-0001 D4a).
-        echo "${sf05_bin_provenance}"
-        sf05_engine_binary_line
+        echo "${sf025_bin_provenance}"
+        sf025_engine_binary_line
         echo "# oracle: ${ORACLE} (PG 18.3 plain-run row counts + value checksums)"
         echo "# timeout: ${TIMEOUT_SEC}s"
-        # The arm label — see sf05_planner_flags_line for why a flags line is
+        # The arm label — see sf025_planner_flags_line for why a flags line is
         # load-bearing evidence and why RELSIZE's unset label reads `unset(2)`.
         # Shared with the plan capture so the two artefacts of one run agree.
-        sf05_planner_flags_line
+        sf025_planner_flags_line
         [[ "${FORCE:-0}" == "1" ]] && \
             echo "# FORCE=1 — a foreign bench/nightly harness was running: ROW COUNTS AND CHECKSUMS ARE VALID, PER-QUERY SECONDS ARE NOT"
         [[ -n "${QUERIES:-}" ]] && \
@@ -884,7 +884,7 @@ cmd_sweep() {
             printf "Q%-3s TIMEOUT  %4ss (%sms) (oracle %s rows)\n" "$q" "$secs" "$msecs" "$orows" | tee -a "$report"
             if [[ "${RESTART_AFTER_TIMEOUT:-1}" == "1" ]]; then
                 echo "      (restarting goopg to drop accumulated heap)" | tee -a "$report"
-                sf05_goopg_start
+                sf025_goopg_start
             fi
         elif [[ $rc -ne 0 ]] || grep -qE '^(psql:[^ ]*:[0-9]+: )?(ERROR|FATAL|PANIC):|connection to server was lost|server closed the connection' "$resfile"; then
             # rc!=0 arm added for M0125-0027: connection-refused (dead server,
@@ -895,7 +895,7 @@ cmd_sweep() {
                 "$(grep -E '(ERROR|FATAL|PANIC):|connection to server' "$resfile" | head -1 | cut -c1-90)" | tee -a "$report"
             # A dead server presents as a connection error on the NEXT query;
             # probe and restart so one crash doesn't cascade.
-            pg_isready -h 127.0.0.1 -p "${SF05_PORT}" -U "${PG_SUPERUSER}" >/dev/null 2>&1 || sf05_goopg_start
+            pg_isready -h 127.0.0.1 -p "${SF025_PORT}" -U "${PG_SUPERUSER}" >/dev/null 2>&1 || sf025_goopg_start
         else
             read -r grows gck < <(result_rows_ck "$resfile" "$qf")
             if [[ "$grows" != "$orows" ]]; then
@@ -922,7 +922,7 @@ cmd_sweep() {
             fi
         fi
     done
-    sf05_goopg_stop
+    sf025_goopg_stop
     rm -f "$resfile"
     {
         echo ""
@@ -936,26 +936,26 @@ cmd_sweep() {
     # query owns them, so the named delta goes directly under them, before the
     # (slower) plan pass. It reads the report just written; nothing it does can
     # perturb the verdict or the exit status below.
-    if [[ "${SF05_NO_DELTA:-0}" == "1" ]]; then
-        echo "# status-delta: skipped (SF05_NO_DELTA=1)" | tee -a "$report"
+    if [[ "${SF025_NO_DELTA:-0}" == "1" ]]; then
+        echo "# status-delta: skipped (SF025_NO_DELTA=1)" | tee -a "$report"
     else
-        sf05_status_delta_channel "$report" "${delta_baseline}"
+        sf025_status_delta_channel "$report" "${delta_baseline}"
     fi
     # The plan-shape channel (P5.6-g-i-b) — second, NON-BLOCKING column. It runs
     # after the verdict is written, on its own fresh server, so nothing it does
     # can perturb the per-query seconds above or the exit status below.
-    if [[ "${SF05_NO_PLANS:-0}" == "1" ]]; then
-        echo "# plan-shape: skipped (SF05_NO_PLANS=1)" | tee -a "$report"
+    if [[ "${SF025_NO_PLANS:-0}" == "1" ]]; then
+        echo "# plan-shape: skipped (SF025_NO_PLANS=1)" | tee -a "$report"
     else
-        sf05_plan_channel "$report"
+        sf025_plan_channel "$report"
     fi
     log "sweep report: ${report}"
     # Gate semantics: correctness failures are fatal; timeouts are reported but
     # non-fatal (perf tracking, not a correctness gate). CKMISMATCH is a
     # correctness failure — the right number of wrong rows. Under
-    # SF05_PLAN_PIN=1 a moved plan-shape pin is fatal too (set by
-    # sf05_plan_channel); otherwise the plan channel stays informational.
-    [[ $((mismatch + ckmismatch + gerr + sf05_plan_pin_failed)) -eq 0 ]]
+    # SF025_PLAN_PIN=1 a moved plan-shape pin is fatal too (set by
+    # sf025_plan_channel); otherwise the plan channel stays informational.
+    [[ $((mismatch + ckmismatch + gerr + sf025_plan_pin_failed)) -eq 0 ]]
 }
 
 # cmd_delta [OLD [NEW]] — the status channel on its own, over reports that
@@ -977,9 +977,9 @@ cmd_delta() {
 
 # ------------------------------------------------------------------- status
 cmd_status() {
-    echo "SF0.5 TSVs   : $([[ -d ${SF05_DATA_DIR} ]] && ls "${SF05_DATA_DIR}"/*.tsv 2>/dev/null | wc -l || echo 0) files (${SF05_DATA_DIR})"
-    echo "PG db        : $(${PG_ADMIN} -t -A -c "select count(*) from pg_database where datname='${SF05_PG_DB}'" 2>/dev/null || echo '?') (${SF05_PG_DB} on :${TPCDS_PG_PORT})"
-    echo "goopg cluster: $([[ -d ${SF05_GOOPG_DATA} ]] && echo present || echo absent) (${SF05_GOOPG_DATA}, port ${SF05_PORT})"
+    echo "SF0.25 TSVs   : $([[ -d ${SF025_DATA_DIR} ]] && ls "${SF025_DATA_DIR}"/*.tsv 2>/dev/null | wc -l || echo 0) files (${SF025_DATA_DIR})"
+    echo "PG db        : $(${PG_ADMIN} -t -A -c "select count(*) from pg_database where datname='${SF025_PG_DB}'" 2>/dev/null || echo '?') (${SF025_PG_DB} on :${TPCDS_PG_PORT})"
+    echo "goopg cluster: $([[ -d ${SF025_GOOPG_DATA} ]] && echo present || echo absent) (${SF025_GOOPG_DATA}, port ${SF025_PORT})"
     echo "oracle       : $([[ -s ${ORACLE} ]] && grep -c '|OK|' "${ORACLE}" || echo 0) OK entries (${ORACLE})"
     ls -t "${OUTDIR}"/sweep-*.txt 2>/dev/null | head -3 | sed 's/^/last sweeps  : /' || true
     ls -t "${OUTDIR}"/plans-*.txt 2>/dev/null | head -3 | sed 's/^/last plans   : /' || true

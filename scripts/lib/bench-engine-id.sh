@@ -9,7 +9,7 @@
 #
 # These three helpers live in ONE file, not in each harness, because D4a's
 # fields must mean the SAME thing in every report: the SF=1 TPC-DS board, the
-# SF0.5 gate, and the TPC-H relation-size arms all print them as
+# SF0.25 gate, and the TPC-H relation-size arms all print them as
 #   # engine-id: <trees> diff=<digest>
 #   # engine-binary: running=<sha> on-disk=<sha> (<path>)
 # Callers own the *policy* (when to warn, when to declare a sweep void).

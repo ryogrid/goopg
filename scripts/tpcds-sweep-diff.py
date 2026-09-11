@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""tpcds-sweep-diff.py — diff two SF0.5 sweep reports by NAMED query, not by count.
+"""tpcds-sweep-diff.py — diff two SF0.25 sweep reports by NAMED query, not by count.
 
-Why this exists (M0127-P5.6-f-v, 2026-08-05). The SF0.5 gate's verdict line is a
+Why this exists (M0127-P5.6-f-v, 2026-08-05). The SF0.25 gate's verdict line is a
 set of COUNTS:
 
     === SUMMARY: PASS=94 (57 ck-verified, 37 ck=n/a) MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=1 SKIP=4 ===
@@ -23,7 +23,7 @@ reports and printing what moved, by name:
 
 Input is the sweep report itself (no new artefact, no new format), so every one
 of the ~90 reports already archived under
-bench/tpcds/runtime_goopg/tpcds-results-sf05/ is diffable retroactively — which
+bench/tpcds/runtime_goopg/tpcds-results-sf025/ is diffable retroactively — which
 is how this tool was validated: replayed over the whole corpus, it names the
 Q72->Q47 trade the summary line hid.
 

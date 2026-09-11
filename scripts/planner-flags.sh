@@ -2,7 +2,7 @@
 # planner-flags.sh — the shared provenance stamp for benchmark artefacts.
 #
 # WHY (M0127-P5.9-q, 2026-08-06). Every gate that produces a comparable artefact
-# — the TPC-DS SF0.5 sweep/plan capture, the TPC-H spot-check — prints a
+# — the TPC-DS SF0.25 sweep/plan capture, the TPC-H spot-check — prints a
 # `planner-flags:` line naming the flags in force, so a diff between two
 # captures is attributable to a known arm instead of to the operator's memory of
 # what was exported. The exported case is trivially true; the UNSET case has to

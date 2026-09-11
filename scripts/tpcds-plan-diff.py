@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """tpcds-plan-diff.py — compare two TPC-DS plan captures, query by query.
 
-Why this exists (M0127-P5.6-g-i-b, 2026-08-05). The SF0.5 regression gate
+Why this exists (M0127-P5.6-g-i-b, 2026-08-05). The SF0.25 regression gate
 compares ROW COUNTS and VALUE CHECKSUMS, which is the right primary bar and is
 not weakened here. But it is blind to plan shape: on 2026-08-05 a whole-corpus
 EXPLAIN A/B showed that commit `4b820ab8` re-ordered **74 of 99** TPC-DS plans
@@ -17,7 +17,7 @@ is therefore signal, not flake — which is only true because the capture is
 EXPLAIN-without-ANALYZE (no timings, no actual rows) on a freshly restarted
 server.
 
-Input format (produced by tpcds-sf05-regression.sh `plans`, and by the
+Input format (produced by tpcds-sf025-regression.sh `plans`, and by the
 hand-rolled `analysis/leftdeep-joins/2026-08-05-p56gi-capture.sh` that preceded
 it — the two are deliberately diff-compatible):
 
@@ -49,7 +49,7 @@ PROVENANCE_RE = re.compile(r"^#")
 # `psql:/tmp/xyz.sql:29: ERROR: ...`. That path is the harness's business, not
 # the plan's: TPC-DS Q36/Q70/Q86 are dsqgen artefacts that fail to parse on PG
 # too, so their block is an error message, and every capture written to a
-# different directory (SF05_RESULTS_DIR redirected, or the hand-rolled
+# different directory (SF025_RESULTS_DIR redirected, or the hand-rolled
 # predecessor writing to /tmp) reported all three as "changed". Three permanent
 # false positives in a channel whose entire value rests on a zero noise floor.
 # The line number is KEPT — it moves only when the query file itself does.

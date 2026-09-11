@@ -4,7 +4,7 @@
 #
 # Manages three servers, all defined by bench/tpcds/env_tpcds.sh:
 #   sf1   goopg, SF=1 cluster,   runtime_goopg/data,      port 65436
-#   sf05  goopg, SF=0.5 cluster, runtime_goopg/data-sf05, port 65437
+#   sf025  goopg, SF=0.25 cluster, runtime_goopg/data-sf025, port 65437
 #   pg    PostgreSQL reference,  runtime/pgdata,          port 65438
 #
 # Every goopg start goes through the cgroup memory cap
@@ -15,8 +15,8 @@
 # Modeled on scripts/csq-bench-server.sh (the TPC-H bench twin).
 #
 # Usage:
-#   bench/tpcds/server.sh start  [sf1|sf05|pg]     # default sf1
-#   bench/tpcds/server.sh stop   [sf1|sf05|pg|all]
+#   bench/tpcds/server.sh start  [sf1|sf025|pg]     # default sf1
+#   bench/tpcds/server.sh stop   [sf1|sf025|pg|all]
 #   bench/tpcds/server.sh status
 set -euo pipefail
 
@@ -29,11 +29,11 @@ READY_TIMEOUT="${TPCDS_READY_TIMEOUT:-180}"
 die() { echo "FATAL: $*" >&2; exit 1; }
 
 goopg_target() {
-    # sets DATA / PORT / SCOPE / LOG for sf1|sf05
+    # sets DATA / PORT / SCOPE / LOG for sf1|sf025
     case "$1" in
     sf1)  DATA="${TPCDS_PGDATA}";     PORT="${TPCDS_PORT}"; SCOPE="goopg-tpcds";     LOG="${TPCDS_GOOPG_LOG}" ;;
-    sf05) DATA="${SF05_GOOPG_DATA}";  PORT="${SF05_PORT}";  SCOPE="goopg-tpcds-sf05"; LOG="${SF05_LOG}" ;;
-    *)    die "unknown goopg target '$1' (sf1|sf05)" ;;
+    sf025) DATA="${SF025_GOOPG_DATA}";  PORT="${SF025_PORT}";  SCOPE="goopg-tpcds-sf025"; LOG="${SF025_LOG}" ;;
+    *)    die "unknown goopg target '$1' (sf1|sf025)" ;;
     esac
 }
 
@@ -55,7 +55,7 @@ goopg_start() {
     # as shared_buffers/8 (cmd/goopg/main.go poolSlotsFromGUC), and a
     # postgresql.conf that leaves it commented falls back to the 128MB GUC
     # BootVal = 16384 slots. Both TPC-DS clusters were in exactly that state
-    # while their working sets are 1.1 GiB (SF0.5) and 2.2 GiB (SF1): measured,
+    # while their working sets are 1.1 GiB (half-scale era) and 2.2 GiB (SF1): measured,
     # store_sales alone is 232MB — 1.8x the whole pool — and two scans of it
     # produced 59522 reads and 43138 evictions, so nothing was ever resident.
     # The PG TPC-DS reference runs at 2GB, so this also silently made any
@@ -129,17 +129,17 @@ start)
 stop)
     case "${target}" in
     pg)  pg_stop ;;
-    all) goopg_stop sf1; goopg_stop sf05; pg_stop ;;
+    all) goopg_stop sf1; goopg_stop sf025; pg_stop ;;
     *)   goopg_stop "${target}" ;;
     esac
     ;;
 status)
     echo "tpcds-server status:"
     status_one "goopg sf1 " "${TPCDS_PORT}"
-    status_one "goopg sf05" "${SF05_PORT}"
+    status_one "goopg sf025" "${SF025_PORT}"
     status_one "postgres  " "${TPCDS_PG_PORT}"
     ;;
 *)
-    die "usage: server.sh {start|stop|status} [sf1|sf05|pg|all]"
+    die "usage: server.sh {start|stop|status} [sf1|sf025|pg|all]"
     ;;
 esac

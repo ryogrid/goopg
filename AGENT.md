@@ -517,7 +517,7 @@ recognises the exemption.
 Two separate stacks; full port/dir table and rules in repo-root `CLAUDE.md`.
 TPC-H: `bench/tpch/` (goopg :65433, PG reference :65432, HammerDB SF=1 load —
 see `bench/tpch/README.md`). TPC-DS: `bench/tpcds/` (goopg SF=1 :65436,
-SF=0.5 gate :65437, PG reference :65438 — see `bench/tpcds/README.md`;
+SF=0.25 gate :65437, PG reference :65438 — see `bench/tpcds/README.md`;
 lifecycle via `bench/tpcds/server.sh`). Ports 65434/65435 are reserved nightly
 ci/batch clone lanes. Row anchors (`bench/tpch/spotcheck_expected.env`,
 `ci/batch/tpch-row-anchors.csv`) are load-dependent — re-pin after any TPC-H

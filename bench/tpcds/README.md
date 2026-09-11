@@ -1,10 +1,10 @@
 # TPC-DS Benchmark on goopg — Workflow
 
 > **Location note (2026-07-27):** everything TPC-DS lives under `bench/tpcds/`
-> — clusters in `runtime_goopg/` (goopg SF=1 :65436, SF=0.5 :65437) and
-> `runtime/pgdata` (PostgreSQL reference :65438, dbs `tpcds`/`tpcds05`).
+> — clusters in `runtime_goopg/` (goopg SF=1 :65436, SF=0.25 :65437) and
+> `runtime/pgdata` (PostgreSQL reference :65438, dbs `tpcds`/`tpcds025`).
 > Env: `bench/tpcds/env_tpcds.sh`. Lifecycle:
-> `bench/tpcds/server.sh {start|stop|status} [sf1|sf05|pg|all]`.
+> `bench/tpcds/server.sh {start|stop|status} [sf1|sf025|pg|all]`.
 > Port map + cross-benchmark picture: repo-root `CLAUDE.md`.
 
 ## Prerequisites
@@ -108,7 +108,7 @@ scripts/tpcds-run.sh 1,3,5-10
 | `tpcds-load.sh` | Schema + COPY + ANALYZE (State 2→3) |
 | `tpcds-run.sh` | Execute queries + record results (State 3→results) |
 | `tpcds-bench-compare.sh` | SF=1 goopg + PG side-by-side sweep with EXPLAIN capture, per-timeout goopg restarts |
-| `tpcds-sf05-regression.sh` | **SF 0.5 fast regression gate** — see the dedicated section below |
+| `tpcds-sf025-regression.sh` | **SF 0.25 fast regression gate** — see the dedicated section below |
 | `convert_tpcds.py` | Pipe-delimited `.dat` → tab-delimited `.tsv` |
 | `tpcds_split_queries.py` | Split `query_0.sql` → individual `queryN.sql` |
 
@@ -138,42 +138,44 @@ All other variables inherited from `bench/tpch/env_goopg.sh` (goopg SF=1 on port
 
 ---
 
-# SF 0.5 fast regression gate (`tpcds-sf05-regression.sh`)
+# SF 0.25 fast regression gate (`tpcds-sf025-regression.sh`)
 
 ## Why it exists
 
 A full SF=1 goopg-vs-PG sweep costs **4–5 hours**, almost all of it waiting out
 the ~16 known 600 s planner timeouts, and it needs both engines run per query.
-The SF 0.5 gate restructures the cost:
+The SF 0.25 gate restructures the cost:
 
-- the dataset is half-size, so completing queries run ~2× faster;
-- PostgreSQL executes each query **once**, via `EXPLAIN (ANALYZE, TIMING OFF)`,
-  which yields the plan **and** the authoritative row count in a single pass;
+- the dataset is quarter-size, so completing queries run ~4× faster;
+- PostgreSQL executes each query **once** as a plain run, yielding result
+  rows that are checksummed into a value oracle alongside the row count;
   the result is cached in an *oracle file* and reused forever after;
 - the recurring cost is therefore **one goopg pass against the cached oracle**
-  (~1 h at the default 300 s timeout; ~40 min at `TIMEOUT_SEC=120`).
+  (~6 min at quarter scale, 2026-09-11, at the default 300 s timeout).
 
-First measured run (2026-07-27): oracle capture for 95/96 queries took
-**20 minutes**; goopg load took **2.5 minutes**. The gate also produced two
+Maiden run (2026-07-27, half-scale era): oracle capture for 95/96 queries
+took **20 minutes**; goopg load took **2.5 minutes**. Quarter-scale figures
+(2026-09-11): oracle 96/96 in **~3 min**, goopg load **~2 min**, validation
+sweep **~5 min** + plan capture. The gate also produced two
 discoveries the SF=1 sweep structurally could not: Q39's long-mysterious crash
 finally landed in a logged window (variance-of-constant-group `big.Float`
 panic), and Q51 — which always timed out at SF=1, so its rows were never
 verifiable — completed and revealed a 0-vs-100 wrong answer that had been
 hiding behind its timeout.
 
-## What "SF 0.5" means here (read before trusting comparisons)
+## What "SF 0.25" means here (read before trusting comparisons)
 
 `dsdgen` cannot generate fractional scales — its `scale` parameter is
 `OPT_INT`, integer gigabytes (DSGen `r_params.c:63`). The dataset is instead
 derived **deterministically from the SF=1 TSVs**: the 7 fact tables keep the
-rows whose shared key is even, dimensions are copied whole:
+rows whose shared key is divisible by 4, dimensions are copied whole:
 
 | table | sampling predicate |
 | --- | --- |
-| `store_sales`, `store_returns` | `ss_/sr_ticket_number % 2 == 0` |
-| `catalog_sales`, `catalog_returns` | `cs_/cr_order_number % 2 == 0` |
-| `web_sales`, `web_returns` | `ws_/wr_order_number % 2 == 0` |
-| `inventory` | `inv_item_sk % 2 == 0` |
+| `store_sales`, `store_returns` | `ss_/sr_ticket_number % 4 == 0` |
+| `catalog_sales`, `catalog_returns` | `cs_/cr_order_number % 4 == 0` |
+| `web_sales`, `web_returns` | `ws_/wr_order_number % 4 == 0` |
+| `inventory` | `inv_item_sk % 4 == 0` |
 | all 18 dimension tables | full copy |
 
 Parity on the *shared* key keeps every sales↔returns pair intact: a kept ticket
@@ -189,29 +191,29 @@ Queries are the **same 99 PG-fixed files** as SF=1
 scales. Skip policy is identical: Q36/Q70/Q86 (dsqgen artefacts that fail on PG
 too) plus anything that errors on PG during oracle capture.
 
-## Load procedure (one-time, ~30–45 min end to end)
+## Load procedure (one-time, ~10 min end to end at quarter scale)
 
 Prerequisite: State 2 of the SF=1 flow (`scripts/tpcds-setup.sh` has produced
 the SF=1 TSVs and queries), and the PG 18.3 instance on :65438 is running
 (`bench/tpcds/server.sh start pg`).
 
 ```bash
-# 1. Sample the SF=1 TSVs -> tpcds-data-sf05/   (~20 s, pure text processing)
-scripts/tpcds-sf05-regression.sh build-data
+# 1. Sample the SF=1 TSVs -> tpcds-data-sf025/   (~20 s, pure text processing)
+scripts/tpcds-sf025-regression.sh build-data
 
-# 2. Load PostgreSQL: drops+recreates db 'tpcds05' on :65438, schema, COPY,
+# 2. Load PostgreSQL: drops+recreates db 'tpcds025' on :65438, schema, COPY,
 #    ANALYZE (PG keeps stats persistently, so this is one-time)   (~1 min)
-scripts/tpcds-sf05-regression.sh load-pg
+scripts/tpcds-sf025-regression.sh load-pg
 
-# 3. Capture the oracle: every non-skipped query once on PG under
-#    EXPLAIN (ANALYZE, TIMING OFF); writes per-query plans and
-#    tpcds-results-sf05/oracle.txt   (~20 min; ORACLE_TIMEOUT=600 default)
-scripts/tpcds-sf05-regression.sh oracle
+# 3. Capture the oracle: every non-skipped query once on PG as a plain run +
+#    value checksum; writes tpcds-results-sf025/oracle.txt
+#    (~3 min at quarter scale 2026-09-11; ORACLE_TIMEOUT=600 default)
+scripts/tpcds-sf025-regression.sh oracle
 
-# 4. Init + load a dedicated goopg cluster at bench/tpcds/runtime_goopg/data-sf05 on
-#    port 65437 (cgroup-capped via goopg-test-run.sh, scope goopg-tpcds-sf05),
+# 4. Init + load a dedicated goopg cluster at bench/tpcds/runtime_goopg/data-sf025 on
+#    port 65437 (cgroup-capped via goopg-test-run.sh, scope goopg-tpcds-sf025),
 #    then stop it — the gate always starts its own fresh server   (~3 min)
-scripts/tpcds-sf05-regression.sh load-goopg
+scripts/tpcds-sf025-regression.sh load-goopg
 ```
 
 `all` chains build-data → load-pg → oracle → load-goopg → sweep.
@@ -219,12 +221,12 @@ scripts/tpcds-sf05-regression.sh load-goopg
 ## The recurring gate
 
 ```bash
-scripts/tpcds-sf05-regression.sh sweep            # default 300 s/query
-TIMEOUT_SEC=120 scripts/tpcds-sf05-regression.sh sweep   # quick mode
+scripts/tpcds-sf025-regression.sh sweep            # default 300 s/query
+TIMEOUT_SEC=120 scripts/tpcds-sf025-regression.sh sweep   # quick mode
 ```
 
 Each query is classified **PASS / MISMATCH / ERROR / TIMEOUT / SKIP** against
-the oracle. Reports land in `tpcds-results-sf05/sweep-<timestamp>.txt`. Exit
+the oracle. Reports land in `tpcds-results-sf025/sweep-<timestamp>.txt`. Exit
 status is non-zero iff any MISMATCH or ERROR occurred — TIMEOUTs are reported
 but non-fatal, so the gate is a *correctness* gate and perf is tracked, not
 enforced. Run it after any planner/executor change, alongside (not instead of)
@@ -233,9 +235,9 @@ enforced. Run it after any planner/executor change, alongside (not instead of)
 ## Status-delta channel (named victims, non-blocking)
 
 ```bash
-scripts/tpcds-sf05-regression.sh delta            # last two reports, runs nothing
-scripts/tpcds-sf05-regression.sh delta OLD NEW    # any two archived reports
-SF05_NO_DELTA=1 scripts/…-regression.sh sweep     # skip the tail stage
+scripts/tpcds-sf025-regression.sh delta            # last two reports, runs nothing
+scripts/tpcds-sf025-regression.sh delta OLD NEW    # any two archived reports
+SF025_NO_DELTA=1 scripts/…-regression.sh sweep     # skip the tail stage
 ```
 
 The SUMMARY line is a set of **counts**, and `TIMEOUT=1` is invariant to *which*
@@ -271,12 +273,12 @@ already names them. Non-blocking, exactly like the plan channel below.
 ## Plan-shape channel (second column, non-blocking)
 
 ```bash
-scripts/tpcds-sf05-regression.sh plans        # capture + diff on its own, ~14 s
-SF05_NO_PLANS=1 scripts/…-regression.sh sweep # skip the tail stage
+scripts/tpcds-sf025-regression.sh plans        # capture + diff on its own, ~14 s
+SF025_NO_PLANS=1 scripts/…-regression.sh sweep # skip the tail stage
 ```
 
 Every sweep now ends with one `EXPLAIN`-only pass over all 99 queries on a
-freshly started server, written to `tpcds-results-sf05/plans-<timestamp>.txt`
+freshly started server, written to `tpcds-results-sf025/plans-<timestamp>.txt`
 (same timestamp as its `sweep-` report), plus a per-query diff against the
 previous capture appended to the report:
 
@@ -300,7 +302,7 @@ hand — including the committed baselines under `analysis/leftdeep-joins/` — 
 
 ## Oracle file format
 
-`tpcds-results-sf05/oracle.txt`, one line per query: `q|status|rows|secs`
+`tpcds-results-sf025/oracle.txt`, one line per query: `q|status|rows|ck|secs`
 where status ∈ `OK | TIMEOUT | PG_ERROR | SKIP_QUERYGEN | MISSING`. Only `OK`
 entries are compared; everything else is skipped with the reason echoed.
 Multi-statement templates (Q14/Q23/Q24/Q39) sum the per-statement top-node
@@ -329,17 +331,18 @@ same plan line carries the planner's *estimated* `rows=` first.
 
 - **Weak-signal queries**: an oracle of 0 rows passes trivially against a
   goopg 0 (the historical empty-btree bug hid behind exactly this). The oracle
-  step prints the list — 12 queries at first capture
-  (Q8 Q10 Q17 Q24 Q25 Q29 Q37 Q54 Q58 Q82 Q85 Q93).
-- Halving data does **not** rescue the ~16 planner-timeout queries — they are
-  join-order failures, not volume failures, and most still TIMEOUT at SF 0.5.
-- Generated artefacts (`tpcds-data-sf05/`, `data-sf05/`, the plan captures,
-  the `tpcds05` PG database) are runtime state, **not** git-tracked; they are
+  step prints the list — 17 queries at the quarter-scale capture
+  (Q4 Q8 Q10 Q11 Q17 Q24 Q25 Q29 Q37 Q54 Q58 Q73 Q74 Q82 Q85 Q91 Q93).
+- Quartering data does **not** rescue the planner-timeout queries — they are
+  join-order failures, not volume failures (though Q4 now completes on both
+  engines at quarter scale, so the timeout set itself can move with scale).
+- Generated artefacts (`tpcds-data-sf025/`, `data-sf025/`, the plan captures,
+  the `tpcds025` PG database) are runtime state, **not** git-tracked; they are
   fully reproducible from the tracked script + the SF=1 TSVs. **The one
-  exception is `tpcds-results-sf05/oracle.txt`, which IS git-tracked** as a
+  exception is `tpcds-results-sf025/oracle.txt`, which IS git-tracked** as a
   pinned fixture (~2 KB): the row counts are deterministic given the dataset
   and queries, so tracking it lets other machines and CI run the goopg sweep
-  without the ~20 min PG capture. Re-run `oracle` (and commit the diff) only
+  without the ~3 min PG capture. Re-run `oracle` (and commit the diff) only
   when the dataset or the query files change — a row diff there is itself a
   signal that ground truth moved.
 
@@ -347,17 +350,17 @@ same plan line carries the planner's *estimated* `rows=` first.
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `SF05_PORT` | `65437` | goopg SF0.5 port (see env_tpcds.sh port map) |
-| `SF05_PG_DB` | `tpcds05` | PostgreSQL database name |
+| `SF025_PORT` | `65437` | goopg SF0.25 port (see env_tpcds.sh port map) |
+| `SF025_PG_DB` | `tpcds025` | PostgreSQL database name |
 | `ORACLE_TIMEOUT` | `600` | per-query timeout for the one-time PG capture |
 | `TIMEOUT_SEC` | `300` | per-query timeout for the goopg sweep |
 | `RESTART_AFTER_TIMEOUT` | `1` | bounce goopg after each goopg TIMEOUT |
 | `FORCE` | unset | run even while the SF=1 sweep harness is active |
-| `SF05_NO_PLANS` | unset | skip the plan-shape channel appended to a sweep |
-| `SF05_NO_DELTA` | unset | skip the status-delta channel appended to a sweep |
-| `SF05_SWEEP_BASELINE` | newest non-probe `sweep-*.txt` | report to diff the status/runtime vector against; `none` skips it |
+| `SF025_NO_PLANS` | unset | skip the plan-shape channel appended to a sweep |
+| `SF025_NO_DELTA` | unset | skip the status-delta channel appended to a sweep |
+| `SF025_SWEEP_BASELINE` | newest non-probe `sweep-*.txt` | report to diff the status/runtime vector against; `none` skips it |
 | `PLAN_TIMEOUT` | `180` | per-query timeout for the EXPLAIN-only plan capture |
-| `SF05_PLANS_BASELINE` | newest `plans-*.txt` | capture to diff against; `none` skips the diff |
+| `SF025_PLANS_BASELINE` | newest `plans-*.txt` | capture to diff against; `none` skips the diff |
 
 ## Buffer residency — read before publishing any TPC-DS timing
 
@@ -365,7 +368,7 @@ Measured 2026-09-06. goopg converts `shared_buffers` into pool slots as
 `shared_buffers / 8` (`cmd/goopg/main.go`, `poolSlotsFromGUC`), and both
 TPC-DS `postgresql.conf` files had **left `shared_buffers` commented out**, so
 the clusters ran on the `128MB` GUC BootVal — **16,384 slots** — against
-working sets of **1.113 GiB (SF0.5, 75 relations)** and **2.2 GiB (SF1)**.
+working sets of **~0.6 GiB (SF0.25, 75 relations — halved from the 2026-09-06 half-scale measurement of 1.113 GiB; re-measure before publishing timings)** and **2.2 GiB (SF1)**.
 
 The consequence was measured with `pg_stat_io`, not assumed:
 
@@ -386,7 +389,7 @@ and the PG TPC-DS reference (`bench/tpcds/runtime/pgdata` runs `2GB`). At
 
 Two things follow, and they are different:
 
-- **Values gates were never affected.** `scripts/tpcds-sf05-regression.sh`
+- **Values gates were never affected.** `scripts/tpcds-sf025-regression.sh`
   compares row values against a git-tracked PG oracle; residency does not
   change an answer. Every `PASS=95 CKMISMATCH=0` recorded before this change
   stands.

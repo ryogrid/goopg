@@ -102,7 +102,7 @@ say() { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*" | tee -a "${LOG}"; }
 
 # --- pre-flight: we must OWN the port, and the data must be there ----------
 # A foreign server on 65433 would be measured instead of ours (and killed by our
-# stop ladder). The SF0.5 gate learned this the expensive way; refuse instead.
+# stop ladder). The SF0.25 gate learned this the expensive way; refuse instead.
 if [[ -f "${PGDATA}/postmaster.pid" ]] && kill -0 "$(head -1 "${PGDATA}/postmaster.pid")" 2>/dev/null; then
     echo "a goopg server is already running at ${PGDATA} (pid $(head -1 "${PGDATA}/postmaster.pid")) — stop it first:" >&2
     echo "  bench/tpch/stop_goopg.sh" >&2

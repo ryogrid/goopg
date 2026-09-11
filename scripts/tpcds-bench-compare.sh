@@ -178,7 +178,7 @@ run_one() {
 # when engine-tree AND engine-binary match; restart_goopg re-checks the
 # binary after every rebuild.
 # The three helpers themselves moved to bench/tpcds/env_tpcds.sh on 2026-07-30
-# (M0125-0011's gate-integrity follow-up): the SF0.5 gate needs the SAME fields
+# (M0125-0011's gate-integrity follow-up): the SF0.25 gate needs the SAME fields
 # with the SAME meaning, and two copies of a provenance rule drift. The reasons
 # behind each definition are documented at that single site; these wrappers keep
 # this script's call sites and its "SWEEP VOID" policy unchanged.
@@ -212,7 +212,7 @@ echo ""
 # The M0124-0001 re-sweep itself was lucky, not careful: it ran 17:06–23:49 on
 # 2026-07-28 and finished 34 min before the 00:23:44 fire. The guard makes that
 # a checked precondition instead of a coincidence. FORCE=1 overrides, and the
-# SF0.5 harness carries the mirror-image check.
+# SF0.25 harness carries the mirror-image check.
 guard_host_quiet() {
     [[ "${FORCE:-0}" == "1" ]] && return 0
     if bench_foreign_procs | grep -qE 'ci/batch/(run-nightly\.sh|stages/)'; then
@@ -263,10 +263,10 @@ restart_goopg() {
 
 # reap_pg_orphans — kill PG backends left running by a client-side timeout.
 #
-# Ported from scripts/tpcds-sf05-regression.sh for M0124-0001 (design doc
+# Ported from scripts/tpcds-sf025-regression.sh for M0124-0001 (design doc
 # 0124-0001 D4): `timeout N psql` kills only the CLIENT; the PostgreSQL
 # backend keeps executing the query and contaminates every later timing in
-# the sweep. The SF0.5 harness codified this hazard; the SF=1 harness had no
+# the sweep. The SF0.25 harness codified this hazard; the SF=1 harness had no
 # equivalent, so a PG-side TIMEOUT silently left a hot backend behind.
 #
 # Two properties are load-bearing and must not be "simplified":
@@ -274,7 +274,7 @@ restart_goopg() {
 #    order, and a bare `WHERE … AND pg_terminate_backend(pid)` has already
 #    killed a healthy backend in this programme (the Q6 incident);
 #  * the predicate is `backend_type='client backend' AND state='active'`,
-#    matching SF0.5 exactly. A looser `state <> 'idle'` would also match
+#    matching SF0.25 exactly. A looser `state <> 'idle'` would also match
 #    `idle in transaction` — a silent widening of a statement that kills
 #    backends.
 reap_pg_orphans() {

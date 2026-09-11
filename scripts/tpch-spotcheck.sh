@@ -118,7 +118,7 @@ rm -f "${SPOT_PIDFILE}"
 echo "tpch-spotcheck: starting fresh goopg on ${PG_HOST}:${PG_PORT} (scope ${CG_UNIT}, log ${SPOT_LOG})"
 # Record the planner-flag state IN the artefact. A timing/RSS number whose arm
 # is only known from the shell that produced it is not reproducible evidence —
-# the same omission was repaired in scripts/tpcds-sf05-regression.sh (M0125-0011).
+# the same omission was repaired in scripts/tpcds-sf025-regression.sh (M0125-0011).
 #
 # M0127-P5.9-q (2026-08-06): the flag list and its unset-labels now come from
 # scripts/planner-flags.sh, whose table is GENERATED from the Go defaults. This

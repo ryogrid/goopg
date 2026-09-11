@@ -1,18 +1,18 @@
-Limit  (cost=34919.83..34919.85 rows=10 width=91)
-  ->  Sort  (cost=34919.83..34919.85 rows=10 width=91)
+Limit  (cost=18967.85..18967.86 rows=5 width=91)
+  ->  Sort  (cost=18967.85..18967.86 rows=5 width=91)
         Sort Key: (sum(store_sales.ss_ext_sales_price)) DESC, item.i_brand_id
-        ->  GroupAggregate  (cost=34919.44..34919.66 rows=10 width=91)
+        ->  GroupAggregate  (cost=18967.68..18967.79 rows=5 width=91)
               Group Key: item.i_brand, item.i_brand_id
-              ->  Sort  (cost=34919.44..34919.46 rows=10 width=65)
+              ->  Sort  (cost=18967.68..18967.69 rows=5 width=65)
                     Sort Key: item.i_brand, item.i_brand_id
-                    ->  Gather  (cost=3069.06..34919.27 rows=10 width=65)
+                    ->  Gather  (cost=3069.08..18967.62 rows=5 width=65)
                           Workers Planned: 3
-                          ->  Nested Loop  (cost=2069.06..33918.27 rows=3 width=65)
-                                ->  Parallel Hash Join  (cost=2068.78..33859.76 rows=188 width=14)
+                          ->  Nested Loop  (cost=2069.08..17967.12 rows=2 width=65)
+                                ->  Parallel Hash Join  (cost=2068.79..17936.57 rows=97 width=14)
                                       Hash Cond: (store_sales.ss_sold_date_sk = dt.d_date_sk)
-                                      ->  Parallel Seq Scan on store_sales  (cost=0.00..30571.90 rows=464390 width=14)
-                                      ->  Parallel Hash  (cost=2068.55..2068.55 rows=18 width=8)
-                                            ->  Parallel Seq Scan on date_dim dt  (cost=0.00..2068.55 rows=18 width=8)
+                                      ->  Parallel Seq Scan on store_sales  (cost=0.00..15258.18 rows=232218 width=14)
+                                      ->  Parallel Hash  (cost=2068.55..2068.55 rows=19 width=8)
+                                            ->  Parallel Seq Scan on date_dim dt  (cost=0.00..2068.55 rows=19 width=8)
                                                   Filter: ((d_moy = 12) AND (d_year = 2000))
                                 ->  Index Scan using item_pkey on item  (cost=0.29..0.31 rows=1 width=59)
                                       Index Cond: (i_item_sk = store_sales.ss_item_sk)
