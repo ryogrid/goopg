@@ -3847,3 +3847,11 @@ took L3–L6). Slice (a): NLI 0.068/probe join-added audit at
 joinpathsnli.go + nestloopCost (no joinsearchnlicost.go exists).
 Evidence filed (trace/plan/PG/SHOW halves). Next: slice-(a)
 implementation per the STEP0 bar.
+R69 SCOPE READY 2026-09-11 (`r69-nli-probe-audit/SCOPE.md`): NLI
+0.068/probe join-added audit, PG-term-keyed table (rescan-startup
+included — all three call sites pass literal 0 today), fix iff
+mis-transcribed. Review APPROVE-WITH-NOTES (P0 bidirectionality,
+-n rationale recorded, ZERO-EXTRA supersession stated, ~410k bound,
+body-:723 cite, SEMI/ANTI+qual-startup+tlist non-owners listed,
+estimateaudit gate added — all applied). Next: phase-1 attribution
+(temp instrument, inertness gate), then phase-2 fix.
