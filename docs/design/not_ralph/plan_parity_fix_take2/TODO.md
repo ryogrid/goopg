@@ -3906,6 +3906,13 @@ seeds on the seam number (groupingpaths.go:77). NO cost fix per SCOPE
 P1 (no planning site exists); R72 P2 corrected; next program item is
 SEMI search-admission (producer scope, not a term fix). Tree clean
 (temp reverted, optimizer+executor build).
+R74 SCOPE READY 2026-09-12 (`r74-semi-admission/SCOPE.md`): SEMI
+search-admission Step-0 — locate the fork where Q4's EXISTS-SEMI
+bypasses the search (arm willing: addNLIPaths admits Semi/Anti,
+only Right refused; joinrelsize/specialjoin already semi-aware) via
+temp trace on tryBuildNLI + sjinfo path; P1 slices admission routes,
+implementation separate. Q22-ANTI read-only; widths/selectivity/
+elections out. Next: review SCOPE, commit/push, then P0 fork trace.
 R68 SCOPE READY 2026-09-11 (`r68-joinorder-costing-step0/SCOPE.md`):
 join-order costing Step-0 (Q9 L-divergence re-measured, sizing vs
 pricing re-adjudicated — R53 numbers stale via R59/R64/R62/R57/R54).
