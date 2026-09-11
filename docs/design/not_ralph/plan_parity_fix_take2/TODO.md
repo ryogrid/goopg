@@ -3954,6 +3954,13 @@ pp election story intact on real base); 19/22 byte-identical (Q4/
 Q21/Q22 costs-only + Q4 rows note + Q22 display-rows seam noted);
 subset 16 green; values/sweep DEFERRED to R77 (recorded deviation).
 R77 = production splice (cp threading, keeper, full gates).
+R77 SCOPE READY 2026-09-12 (`r77-production-splice/SCOPE.md`):
+production NLI price splice — P0 stamp-site check (in-tryBuildNLI
+vs end-of-pipeline post-pass; Q22 display-rows seam decides), P1
+implement (pricing func + stamp, cp from ps via post-pass to avoid
+tryBuildNLI signature churn across 9 test sites, keeper), full
+gates (values/sweep/pp + 19/22 byte-identity re-verify). Same
+bounds as R76. Next: review SCOPE, commit/push, then P0.
 R68 SCOPE READY 2026-09-11 (`r68-joinorder-costing-step0/SCOPE.md`):
 join-order costing Step-0 (Q9 L-divergence re-measured, sizing vs
 pricing re-adjudicated — R53 numbers stale via R59/R64/R62/R57/R54).
