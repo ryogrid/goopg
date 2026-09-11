@@ -3846,6 +3846,13 @@ nominal 6-col win (+78k) degrades to a +4k tie at +10% rows (spill
 cliff ~9% away); real headroom needs DatumBytes or
 projection-pushdown (neither exists — verified). No cut. R70 CLOSED
 as a dependency statement; tree clean (temp reverted).
+R71 SCOPE rev 2 READY 2026-09-11 (`r71-q4-semi-selectivity/SCOPE.md`):
+Q4-theory diagnosis ONLY (rev 1 REJECTED: rows can't re-elect per
+costAgg arithmetic; Gate-0 mis-sited). Crossover probe (victim
+predicate + 13490/~30000/3439 points) + oracle read + R47
+confrontation; implementation explicitly off-table. Review
+APPROVE-WITH-NOTES (provenance + predicate + 4 precision notes — all
+applied). Next: Gate-0 diagnosis per §1, then close + scope follow-up.
 R68 SCOPE READY 2026-09-11 (`r68-joinorder-costing-step0/SCOPE.md`):
 join-order costing Step-0 (Q9 L-divergence re-measured, sizing vs
 pricing re-adjudicated — R53 numbers stale via R59/R64/R62/R57/R54).
