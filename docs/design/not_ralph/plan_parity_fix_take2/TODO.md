@@ -3898,6 +3898,14 @@ display-seam first). Fix iff mis-transcribed (R69 discipline); widths
 (R70) and selectivity (program item 1) explicitly out; Q22-ANTI
 read-only verification, no bundling. Next: review SCOPE, commit/push,
 then P0 attribution.
+R73 P0 DONE 2026-09-12 (`r73-semi-price-audit/ATTRIBUTION.md`, review
+APPROVE): display-seam verdict — NO SEMI path ever filed (R73PATH
+silence ×4, stderr proven live), NLI node carrier-UNSET, child walker
+lacks NLI arm so semi prices childless 0+0.01×57066=570.66; grouping
+seeds on the seam number (groupingpaths.go:77). NO cost fix per SCOPE
+P1 (no planning site exists); R72 P2 corrected; next program item is
+SEMI search-admission (producer scope, not a term fix). Tree clean
+(temp reverted, optimizer+executor build).
 R68 SCOPE READY 2026-09-11 (`r68-joinorder-costing-step0/SCOPE.md`):
 join-order costing Step-0 (Q9 L-divergence re-measured, sizing vs
 pricing re-adjudicated — R53 numbers stale via R59/R64/R62/R57/R54).
