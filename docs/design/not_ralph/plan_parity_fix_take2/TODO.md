@@ -3784,3 +3784,16 @@ by grep not just by section-diff. Evidence `/tmp/pp2/r66/ds-pg/`
 (live-:65438 key lines Q21/39/44/49/51/54/91). Cut UNCOMMITTED.
 Next: dump Q44/Q54 chains (temp DBG on the SF0.25 lane) → boundary
 rule (naming-boundary stop) → implement → full re-gates.
+Q44 mechanism NARROWED 2026-09-11: Slice-1 binary on same data prints
+`rank_col` (key measured: `ColumnRef(rank_col,idx1,table1)` under a
+Project child — R65 declines) while s2b prints `(avg(...))`; a unit
+repro shows the same alias-vs-call split, so the entry path differs
+by key object, not by branch logic. PG keeps `Subquery Scan on
+v1/v2` (unflattenable: GROUP BY+HAVING+InitPlan inside) so PG prints
+`v1.rank_col`; goopg flattened it away and the chase cannot see PG's
+boundary. The live s2b key object is UNMEASURED (unit shape differs
+from live shape) — next is a Sort-anchored dump (keys + downward
+chain incl. Project Targets/IsolatedScope) for Q44's two Sorts + Q54,
+then the boundary rule from 7 chains (stop before Aggs synth, or a
+goopg-side flattening marker). TEMP traces reverted and verified zero
+(`grep R66DBG/Q44DBG` clean); s1 worktree removed.
