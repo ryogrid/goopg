@@ -3651,3 +3651,44 @@ lack IOS arms (conservative, ledgered); P1 assumes display/search
 inputRows parity (re-audit rule covers); P2 goopg-side Q11 shape deferred
 to gate-3 DPTRACE; createplannl wording (builder, not executor).
 Next: commit this scope, then R63 implementation per §5 gates.
+R63 LANDED 2026-09-11 (`7ccc0bff8`, `r63-resolver-ios-partialagg/REPORT.md`):
+resolver arms for IOS + partial-agg group-key identity — M1 display
+search-exact; gates 1–4 green, Q13 spotcheck FAIL ledgered as R63-#3
+(Memoize+RightJoin wrong-results row). Review APPROVE.
+R64 SCOPE + LANDED 2026-09-11 (`d48072405`, `r64-nli-right-decline/`):
+decline NLI when the probe side is the preserved (right) side — Q13
+33→34 toward-oracle, consumes R63-#3. Review APPROVE-WITH-NOTES.
+R65 SCOPE COMMITTED 2026-09-11 (`fdb1a6774`,
+`r65-q11-explain-render/SCOPE.md`): Q11 EXPLAIN-rendering round, flagship
+Q11 (structurally identical trees, 2 display-side categories). Two-arm
+renderer-only cut — Arm A Sort-key OUTER_VAR expansion through child agg
+targetlist; Arm B `(InitPlan N).col1` value-position deparse. P0–P4
+(Q11→MATCH, 6/14/0/2, values md5-identical, text-only explain moves, DS
+sweep PASS=96 SKIP=3). Review APPROVE-WITH-NOTES (8 notes applied).
+Next: R65 implementation per §5 gates.
+R65 IMPLEMENTATION IN PROGRESS (uncommitted): `operators_explain.go`
+(+151: `childAggregateThroughFilters` — Aggs-only, fail-closed on
+Star/Distinct/Filter/OrderBy/WithinGroup/nil-arg/coordinate doubt —
+`expandAggOutputRef(s)` clone-rewrite, Sort-arm call site reusing
+`keyExpr` for the S18 wrap, Aggregate Filter call site, SubqueryExpr
+Arm B `(InitPlan N).col1` gated on `IsNonCorrelated && InitPlan`
+prefix); `walk_export.go` (+39 `CloneExprReplacingColumnRefs`);
+`flaglabels_test.go` (1-line sf05→sf025 lane fix); pins
+`explain_agg_output_ref_test.go` (4 tests). Build ok, executor pins
+pass, optimizer cached-pass, vet clean. Gates 2–7 pending:
+spotcheck, TPC-H values A/B vs pre-round binary (clone
+`/tmp/pp2/clone-tpch-r65` :5533), explain A/B text-only, pp 6/14/0/2,
+DS SF0.25 sweep (private GOOPG_BIN), plan-gate DIFFER triage
+(Q11/Q3/Q5/Q10 expected → re-pin or opt-out). Then REPORT.md → review
+→ commit -n + push (explicit pathspec; SCOPE already committed).
+R65 REVIEW 2026-09-11 — APPROVE-WITH-NOTES, no blocking: mechanism
+fidelity confirmed at code level (Arm A Aggs-only with in-bounds proof
+via GroupingMaskColOffset; Arm B double-guarded for correlated SubPlan;
+BareVarKeysUnchanged unreachable; Group Key + Exists/In/Array arms
+untouched); all gate numbers re-derived green; flaglabels_test.go
+1-liner recorded as test-only fallout from e2a50de40. Notes adopted:
+pp verdict artifacts saved (`/tmp/pp2/r65/pp65-mine.txt` fixtures
+6/14/0/2, `pp65-mine-livepg.txt` live-PG 6/14/0/2 — review caught the
+missing files); "24/24 MATCH" = digest-equality wording (logs print
+OK); Q9-cost side-column swing confirmed verdict-neutral by
+re-derivation. Next: commit -n + push (explicit pathspec).

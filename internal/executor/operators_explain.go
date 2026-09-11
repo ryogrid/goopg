@@ -626,6 +626,113 @@ func emitSubPlanSubtrees(rows *[]Row, detailIndent string, opts parser.ExplainOp
 	}
 }
 
+// childAggregateThroughFilters resolves the Aggregate whose output a Sort
+// key (or upper qual) reads: the Sort arm's direct child modulo stacked
+// Filter wrappers. Only Filter wrappers are skipped — they are
+// coordinate-preserving (Filter.Output is its child's schema), while a
+// Project between the Sort and the Aggregate would re-coordinate the key
+// indices, so anything else fails closed to nil (today's rendering).
+func childAggregateThroughFilters(n optimizer.Node) *optimizer.Aggregate {
+	for {
+		f, ok := n.(*optimizer.Filter)
+		if !ok {
+			break
+		}
+		if f.Child == nil {
+			return nil
+		}
+		n = f.Child
+	}
+	agg, _ := n.(*optimizer.Aggregate)
+	return agg
+}
+
+// expandAggOutputRef — R65 Arm A. PG's upper-qual/Sort-key deparse chases an
+// OUTER_VAR through the child aggregate's targetlist and prints the
+// underlying aggregate call (ruleutils.c get_variable), while goopg's
+// ColumnRef renders the output alias (`Sort Key: sum`). Resolve col against
+// agg's output positions — [group exprs..., agg calls..., grouping
+// masks..., passthrough...] — and expand ONLY an Aggs-section hit, as a
+// synthesised FuncCall over the call's own args rendered through the
+// existing FuncCall arm (so qualification matches the child's own
+// printing, e.g. `partsupp.ps_supplycost`). GroupExprs/Passthrough hits
+// keep today's rendering: Q11's Group Key already pairs, and the
+// BareVarKeysUnchanged pin (`Sort Key: a` over a scan) never reaches here
+// with an Aggregate child.
+//
+// The S18 sibling pair is unaffected: group keys render from
+// p.GroupExprs directly, never through this resolver, so the "computed
+// Group Key" shape stays out of scope by construction.
+//
+// Fail-closed: any coordinate doubt (out-of-range Index, output-schema
+// name mismatch — the same name-level robustness today's purely
+// name-based ColumnRef rendering already relies on) or an
+// un-synthesisable call (DISTINCT, FILTER, ORDER BY, WITHIN GROUP,
+// count(*), nil arg) returns ok=false and the caller keeps today's text.
+func expandAggOutputRef(col *optimizer.ColumnRef, agg *optimizer.Aggregate) (optimizer.Expr, bool) {
+	if col == nil || agg == nil || col.Name == "" {
+		return nil, false
+	}
+	nGroup := len(agg.GroupExprs)
+	idx := col.Index
+	if idx < nGroup || idx >= agg.GroupingMaskColOffset() {
+		return nil, false
+	}
+	sch := agg.Output()
+	if idx < 0 || idx >= len(sch) || sch[idx].Name != col.Name {
+		return nil, false
+	}
+	call := &agg.Aggs[idx-nGroup]
+	if call.Star || call.Distinct || call.Filter != nil ||
+		len(call.OrderBy) > 0 || call.WithinGroup || call.Arg == nil {
+		return nil, false
+	}
+	args := make([]optimizer.Expr, 0, 2+len(call.ExtraArgs))
+	args = append(args, call.Arg)
+	if call.Arg2 != nil {
+		args = append(args, call.Arg2)
+	}
+	args = append(args, call.ExtraArgs...)
+	return &optimizer.FuncCall{Name: call.Name, Args: args}, true
+}
+
+// expandAggOutputRefsInFilter applies expandAggOutputRef to every ColumnRef
+// inside a HAVING/upper qual rendered under its own Aggregate node (R65 Arm
+// A, Filter half: Q11's `(sum > (InitPlan 1))`). The rewrite clones — the
+// live plan is never mutated — and is skipped entirely when a read-only
+// pre-pass finds no expandable reference, so filters without aggregate
+// references render pointer-identical to today (in particular their
+// sublink numbering is untouched). Inner sublink plans are aliased, never
+// descended into.
+func expandAggOutputRefsInFilter(filt optimizer.Expr, agg *optimizer.Aggregate) optimizer.Expr {
+	if filt == nil || agg == nil {
+		return filt
+	}
+	expandable := false
+	optimizer.WalkExprTree(filt, func(e optimizer.Expr) {
+		if expandable {
+			return
+		}
+		if col, ok := e.(*optimizer.ColumnRef); ok {
+			if _, hit := expandAggOutputRef(col, agg); hit {
+				expandable = true
+			}
+		}
+	})
+	if !expandable {
+		return filt
+	}
+	if out, ok := optimizer.CloneExprReplacingColumnRefs(filt, func(col *optimizer.ColumnRef) optimizer.Expr {
+		if e, hit := expandAggOutputRef(col, agg); hit {
+			return e
+		}
+		return nil
+	}); ok {
+		return out
+	}
+	return filt
+}
+
 // emitNodeDetailLines writes the PG-style detail lines that
 // belong under n (Sort Key / Index Cond / Filter). attachedFilter
 // is a Filter.Predicate from a Filter wrapper above n that was
@@ -702,7 +809,22 @@ func emitNodeDetailLines(n optimizer.Node, indent string, verbose bool, rows *[]
 		if len(p.Keys) > 0 {
 			parts := make([]string, 0, len(p.Keys))
 			for _, k := range p.Keys {
-				s := formatExprQual(k.Expr, reg, qualify)
+				// R65 Arm A: a key naming a child-aggregate output the
+				// child computed (e.g. Q11's `sum`) is PG's OUTER_VAR
+				// chased through the child's targetlist — render the
+				// underlying call. The S18 wrap below then fires on the
+				// EXPANDED form (a non-Var referent), yielding PG's
+				// `(sum(...)) DESC`; unexpanded keys behave exactly as
+				// before.
+				keyExpr := k.Expr
+				if col, ok := k.Expr.(*optimizer.ColumnRef); ok {
+					if agg := childAggregateThroughFilters(p.Child); agg != nil {
+						if expanded, hit := expandAggOutputRef(col, agg); hit {
+							keyExpr = expanded
+						}
+					}
+				}
+				s := formatExprQual(keyExpr, reg, qualify)
 				// S18: a Sort never evaluates expressions — its key is
 				// always PG's OUTER_VAR reference into the child's target
 				// list, so get_special_variable's "force parentheses for a
@@ -710,7 +832,7 @@ func emitNodeDetailLines(n optimizer.Node, indent string, verbose bool, rows *[]
 				// Placed BEFORE the DESC/NULLS suffix: PG prints
 				// `Sort Key: ((g % 10000)) DESC`, keeping the decoration
 				// outside the added pair.
-				if _, isVar := k.Expr.(*optimizer.ColumnRef); !isVar {
+				if _, isVar := keyExpr.(*optimizer.ColumnRef); !isVar {
 					s = forceParen(s)
 				}
 				if k.Desc {
@@ -945,7 +1067,13 @@ func emitNodeDetailLines(n optimizer.Node, indent string, verbose bool, rows *[]
 		// PG order (explain.c:2196-2197): Group Key first, then the HAVING
 		// qual as `Filter:` (show_upper_qual plan->qual).
 		if attachedFilter != nil {
-			*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + wrapParen(formatExprQual(attachedFilter, reg, qualify)))})
+			// R65 Arm A, Filter half: the HAVING qual reads this
+			// aggregate's own outputs, so expand computed references
+			// (Q11's `sum`) the same way the Sort arm does — without
+			// the S18 wrap (a qual is general-expression position, and
+			// PG prints the FuncCall bare there).
+			filt := expandAggOutputRefsInFilter(attachedFilter, p)
+			*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + wrapParen(formatExprQual(filt, reg, qualify)))})
 		}
 	default:
 		// Non-scan nodes keep an attached Filter alive — render it
@@ -1424,8 +1552,21 @@ func formatExprQual(e optimizer.Expr, reg *subPlanReg, qualify bool) string {
 		return s
 	case *optimizer.SubqueryExpr:
 		// EXPR_SUBLINK: upstream decorates scalar subplan
-		// references with nothing but parentheses.
-		return "(" + subPlanName(reg, x, x.Plan) + ")"
+		// references with nothing but parentheses — in TESTEXPR
+		// position. In VALUE position (a scalar subquery read for its
+		// value, planned as PARAM_EXEC) get_parameter deparses the
+		// reference as `(plan_name).colN`; a scalar subquery returns
+		// one column, so always `.col1` (R65 Arm B — Q11's
+		// `(InitPlan 1).col1`). Keyed off the InitPlan branch ONLY:
+		// correlated SubPlans keep bare parens (the
+		// TestExplainSubPlanCorrelatedScalar pin), as do the
+		// ExistsExpr/InExpr/array-subquery testexpr arms below, which
+		// are untouched.
+		name := subPlanName(reg, x, x.Plan)
+		if x.IsNonCorrelated && strings.HasPrefix(name, "InitPlan") {
+			return "(" + name + ").col1"
+		}
+		return "(" + name + ")"
 	case *optimizer.ArraySubqueryExpr:
 		// ARRAY_SUBLINK: upstream prints `ARRAY(<plan_name>)`.
 		return "ARRAY(" + subPlanName(reg, x, x.Plan) + ")"

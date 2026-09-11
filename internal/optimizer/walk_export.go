@@ -13,6 +13,45 @@ func WalkPlanExprs(n Node, fn func(Expr)) { walkPlanExprs(n, fn) }
 // Same sublink caveat as WalkPlanExprs.
 func WalkExprTree(e Expr, fn func(Expr)) { walkExprTree(e, fn) }
 
+// CloneExprReplacingColumnRefs returns a CLONE of e with every ColumnRef
+// for which replace returns non-nil substituted by that replacement.
+//
+// Display-path helper for the executor's EXPLAIN renderer (R65): expanding
+// an aggregate-output reference must not mutate the live plan, and the
+// rewrite must be exhaustive-or-refuse rather than a partial type switch
+// (the RC-1a defect class exprwalk.go exists to kill), so this reuses
+// cloneExprRefs instead of re-deriving a walker. Inner plans are stepped
+// over with scopeIgnore — the clone ALIASES them, never descending —
+// because a display rewrite has no business renumbering a sublink body;
+// callers that need scope discipline use remapExprIndices instead.
+// ok=false (unenumerated type) is fail-closed: the caller keeps today's
+// rendering. Replacement subtrees are aliased, not cloned; rendering only
+// reads them.
+func CloneExprReplacingColumnRefs(e Expr, replace func(*ColumnRef) Expr) (Expr, bool) {
+	if e == nil {
+		return nil, true
+	}
+	if replace == nil {
+		return nil, false
+	}
+	refused := false
+	out, ok := cloneExprRefs(e, scopeIgnore, exprRewriter{
+		Rewrite: func(n Expr) Expr {
+			if c, isRef := n.(*ColumnRef); isRef {
+				if r := replace(c); r != nil {
+					return r
+				}
+			}
+			return n
+		},
+		OnUnknown: func(Expr) { refused = true },
+	})
+	if !ok || refused {
+		return nil, false
+	}
+	return out, true
+}
+
 // ExprSubplans returns the inner plan roots hung directly off one
 // expression — the five F3 sublink kinds (A-01(ii) cut 2): scalar,
 // ARRAY, IN, EXISTS (each via its Plan field) and the multi-assign

@@ -69,11 +69,11 @@ placeholder is a comment, not a checkbox, so the plan-complete exit
 heuristic stays live.)
 
 ### Nightly run 20260901-010436 (sha `d93fb9edc669`, 7 items) — filed 2026-09-01
-- [ ] **testport/TestPort_PgStatActivity (AI-20260901-010436-005)**.
-- [ ] **testport/TestSyntax_Catalog_PgStatActivity (AI-20260901-010436-007)**.
+- [ ] **testport/TestPort_PgStatActivity (AI-20260901-010436-005, AI-20260905-011015-007)**.
+- [ ] **testport/TestSyntax_Catalog_PgStatActivity (AI-20260901-010436-007, AI-20260905-011015-009)**.
 
 ### Nightly run 20260902-005256 (sha `c11e55d253ff`, 8 items) — filed 2026-09-02
-- [ ] **testport/TestE2E_PGColdStartOnGoopgDataDir (AI-20260902-005256-001)**. New
+- [ ] **testport/TestE2E_PGColdStartOnGoopgDataDir (AI-20260902-005256-001, AI-20260905-011015-002)**. New
   tonight; possibly the M0131-S4 "FAIL-WHEN-FIXED" assertion flipping red
   because a Theme F fix landed rather than a real regression — re-run repro
   and check the M0131 Theme F findings list before treating as a bug.
@@ -85,6 +85,26 @@ heuristic stays live.)
   — remaining 7 items of this run all already have an open task above,
   AI-20260827-052222-037/-071/-080/-107, AI-20260901-010436-005/-007; no new
   line filed for those per the "do not add another" rule.)
+
+### Nightly run 20260905-011015 (sha `2e3deb52ba73`, 9 items) — filed 2026-09-11
+- [ ] **race/internal/executor (AI-20260905-011015-001)** — race suite failed
+  in `internal/executor` (also failed previous run; repro: `go test -race
+  -timeout 45m ./internal/executor/`).
+- [ ] **testport/TestPort_IsolationIntraGrantInplace (AI-20260905-011015-003)** —
+  FAILed, also failed previous run (repro: `go test -v -run
+  '^TestPort_IsolationIntraGrantInplace$' ./internal/testport/`).
+- [ ] **testport/TestPort_IsolationStats (AI-20260905-011015-004)** — FAILed,
+  also failed previous run (same testport repro pattern).
+- [ ] **testport/TestPort_LockRowsSortOverJoinTakesRowLock (AI-20260905-011015-005)** —
+  FAILed subtests: join_no_sort, also failed previous run.
+- [ ] **testport/TestPort_PgDumpConnectionSetup (AI-20260905-011015-006)** —
+  FAILed, also failed previous run.
+- [ ] **testport/TestPort_RegressSuite (AI-20260905-011015-008)** — FAILed
+  subtests: limit, numerology, also failed previous run.
+  (Remaining 3 items — PGColdStart AI-…-002, PgStatActivity AI-…-007,
+  Syntax_Catalog_PgStatActivity AI-…-009 — already have open tasks above;
+  AI-ids appended per the "do not add another" rule. Evidence for all:
+  `ci/logs/20260905-011015/`.)
 
 ## Archived — complete (see `completed_milestones/completed_fix_plan_012.md`)
 
