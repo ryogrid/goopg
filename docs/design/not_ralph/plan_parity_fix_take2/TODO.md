@@ -4055,3 +4055,14 @@ moved; R72's 4.26x used the pre-R77 seed). Step-0: DPPATH harvest
 candidates, exact comparator arm) on private :5556; predictions
 P1-P3 recorded; STOP/branch rules (no mechanism-only landing
 without named next step). Next: commit/push, then Step-0 measure.
+R81 STEP-0 DONE 2026-09-12 (`r81-q4-ordered-remeasure/STEP0.md`,
+review APPROVE-WITH-NOTES, notes applied): P1+P2 confirmed
+(both survive grouping; ordered offers no-sort + Sort-hashed);
+P3 outcome = hashed+Sort via M0129-S1 tie-break on double
+fuzz-equality (1.0095/1.0086); PG decides on startup (1.0118)
+because its sort-startup is ~202 on 3439 rows vs 5079 on
+57066 — comparator correct as designed, NO implementation
+(forcing). Q4-sort blocked on INPUTS: selectivity BLOCKED
+(R78/R79), widths BLOCKED (R70, DatumBytes/pushdown);
+deferral-ledger row filed with unblock conditions + re-measure
+gate. :5556 stopped; PG untouched; tree clean (no code).
