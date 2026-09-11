@@ -3617,3 +3617,37 @@ Q39 nd 3202 vs 7823). Evidence tmp-only `/tmp/pp2/r62/`
 (+`/tmp/pp2/clone-ds05-r62`); bins `goopg-r62`/`goopg-r62fresh` md5-identical.
 Next: R63 scope from the queue — (a) Materialize producer vs NEW #6 vs R61
 #4 (CTE-body tagging); (b) Q4 stays cost-model framing; R62-#1 watch.
+R63 SCOPE DRAFTED 2026-09-11 (`r63-resolver-ios-partialagg/SCOPE.md`):
+re-triage picks M1-display as flagship — (a) insufficient-alone (goopg has
+NO Materialize node by design, `joinpathsmergeouter.go:52`; Q5's HJ-vs-NL
+and HashAgg-vs-GroupAgg gaps are cost-driven and survive any Materialize
+cut); #6/(b) cost-model scope deferred 3×; R61 #4 fail-closed-correct.
+M1 LIVE at R62 HEAD: single-table GROUP BY partsupp displays rows=200
+(`defaultNumDistinct`) through Parallel Index Only Scan; search sizes
+201356, PG 203361. Temp-GOOPG_R63DBG probe (reverted, tree clean) chains
+both links: 9× fallback200 on `*IndexOnlyScan`-direct (Partial's child —
+`resolveBaseColumn` has SeqScan/IndexScan arms, NO IOS arm), 1× fallback200
+on `*Gather` (Finalize's child — NO `*Aggregate` arm; `groupUniqueNDistinct`
+refuses partials at `joinkeyproof.go:301`, principled). Search resolves via
+SeqScan ×2 no-fallback → defect is display-recompute-only; PG target is
+goopg's own nd 201356 (203361 gap = #6(ii) stats). Cut: `*IndexOnlyScan` arm
+(Covered→table-column remap) + partial-mode-ONLY `*Aggregate` arm (bare
+ColumnRef GroupExpr remap; partial-only is load-bearing — a general agg arm
+would SHADOW groupUnique's exact whole-agg answers); twin `*IndexOnlyScan`
+passthrough in `relFilteredRowsWalk` + `*Aggregate` EXEMPTION (groups, not
+base rows). P1: M1 display 200→201356; P2 Q11 32000/10666 + Q5 25 pinned;
+R63-#1 corner (partial-skew over-count, bounded by base nd).
+Next: review this scope, then R63 implementation per §5 gates.
+Review APPROVE-WITH-NOTES (all probe/code citations re-derived CONFIRM; 1
+blocking + 5 notes applied, no re-measurement): BLOCKING — draft's
+`passthrough(x.Child)` for IOS in `relFilteredRowsWalk` unimplementable
+(IOS is a leaf, no Child field) — corrected to NO twin-walker edit (n==rel
+identity covers leaves; leaf arms excluded from `descendingSwitchArms`);
+`Cond`-residual claim also corrected (`EstimateRows(IOS)` prices keys not
+Cond — conservative, M1 Cond-free). Notes: 4 line-citation fixes
+(joinpathsmergeouter :68, joinkeyproof :352, plan :1284/:1010);
+NEW R63-#2 `soleBaseScan` (+`IsSmallDimensionSide`, `outerScanRowCount`)
+lack IOS arms (conservative, ledgered); P1 assumes display/search
+inputRows parity (re-audit rule covers); P2 goopg-side Q11 shape deferred
+to gate-3 DPTRACE; createplannl wording (builder, not executor).
+Next: commit this scope, then R63 implementation per §5 gates.
