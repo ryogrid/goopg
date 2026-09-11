@@ -332,7 +332,13 @@ func addNLIPaths(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp costParams,
 			// Memoize arm of nestLoopInnerRescanCost is the one that fires
 			// when a Memoize sits between.
 			matBuild, matRescan := nestLoopInnerRescanCost(in, cp)
-			cost := nestloopCost(cp, o.Cost, in.Cost, o.Rows, in.Rows, 0, matRescan)
+			// The rescan STARTUP rides alongside the run: nestloopCost
+			// subtracts it back out of the run part
+			// (innerRescanRun = Total − Startup), so pass Total with
+			// the startup included — PG's rescan_total, not just its
+			// run half.
+			rsStart := nestLoopInnerRescanStartup(in)
+			cost := nestloopCost(cp, o.Cost, in.Cost, o.Rows, in.Rows, rsStart, matRescan+rsStart)
 			cost.Total += matBuild
 			cost.Total += qualEvalCost(cp, len(residual), o.Rows*in.Rows)
 			addPath(joinrel, &Path{

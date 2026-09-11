@@ -457,6 +457,27 @@ func relationByteSize(rows, avgVarBytes float64, ncols int) float64 {
 //	         ONCE, plus a spill charge when the cache exceeds work_mem.
 //	rescan — cpu_operator_cost * tuples, the replay (cost_rescan's T_Material
 //	         arm, costsize.c:4703-4712), charged per additional outer row.
+// nestLoopInnerRescanStartup — R69 slice (a): PG's `cost_rescan`
+// STARTUP arm for the nestloop join (`initial_cost_nestloop` charges
+// `(outer−1) × rescan_startup`; all three nestloop call sites passed
+// literal 0). A parameterised inner re-pays its startup (index
+// descent) per rescan (default arm); a Memoize inner pays its modeled
+// rescan startup; a materialised/plain inner pays 0 (`T_Material`
+// arm). Only the first case changes behaviour; the others return
+// exactly what the literal did, by construction.
+func nestLoopInnerRescanStartup(inner *Path) float64 {
+	if inner == nil {
+		return 0
+	}
+	if inner.Kind == PathMemoize && inner.MemoizeInfo != nil {
+		return inner.MemoizeInfo.rescan.Startup
+	}
+	if inner.RequiredOuter != 0 {
+		return inner.Cost.Startup
+	}
+	return 0
+}
+
 func nestLoopInnerRescanCost(inner *Path, cp costParams) (build, rescan float64) {
 	if inner == nil {
 		return 0, 0
