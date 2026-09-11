@@ -4045,3 +4045,13 @@ mis-transcribed. Review APPROVE-WITH-NOTES (P0 bidirectionality,
 body-:723 cite, SEMI/ANTI+qual-startup+tlist non-owners listed,
 estimateaudit gate added — all applied). Next: phase-1 attribution
 (temp instrument, inertness gate), then phase-2 fix.
+R80 reserved per R79-verdict for the ndistinct estimator program.
+R81 SCOPE READY 2026-09-12 (`r81-q4-ordered-remeasure/SCOPE.md`,
+review APPROVE-WITH-NOTES, notes applied): Q4 ordered-election
+re-measurement with the post-R77 seed (scratch: hashed 490741.73
+vs sorted 495392.71, ratio 1.0095 < 1.01 fuzz — election may have
+moved; R72's 4.26x used the pre-R77 seed). Step-0: DPPATH harvest
+(grouping survivors incl. Finalize-decline gate, ordered
+candidates, exact comparator arm) on private :5556; predictions
+P1-P3 recorded; STOP/branch rules (no mechanism-only landing
+without named next step). Next: commit/push, then Step-0 measure.
