@@ -3839,6 +3839,13 @@ Step-A sign-off enforcer; considerparallel citation corrected;
 pruned width from Q9's keep-set not K67's anchor — all applied).
 Next: Step-A decision table (+bar pass/fail recorded), then cut or
 close-out per the route rule.
+R70 STEP-A DONE 2026-09-11 (`r70-hash-footprint/STEP-A.md`, review
+APPROVE-WITH-NOTES as the required enforcer — one grid cell
+corrected, tie-row outer dims stated): BLOCKED with numbers —
+nominal 6-col win (+78k) degrades to a +4k tie at +10% rows (spill
+cliff ~9% away); real headroom needs DatumBytes or
+projection-pushdown (neither exists — verified). No cut. R70 CLOSED
+as a dependency statement; tree clean (temp reverted).
 R68 SCOPE READY 2026-09-11 (`r68-joinorder-costing-step0/SCOPE.md`):
 join-order costing Step-0 (Q9 L-divergence re-measured, sizing vs
 pricing re-adjudicated — R53 numbers stale via R59/R64/R62/R57/R54).
