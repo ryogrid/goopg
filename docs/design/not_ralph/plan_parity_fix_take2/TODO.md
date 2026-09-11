@@ -3942,6 +3942,12 @@ funnel; PASS/BLOCKED both committable), P1 Q4 measurement + gates
 iff PASS, R77 implementation iff P1 clean. Single-SEMI-shape only
 (parameterised index probe); hash-SEMI untouched; no join-order or
 cost-term changes. Next: review SCOPE, commit/push, then P0 probe.
+R76 P0 DONE 2026-09-12 (`r76-nli-price-splice/PROBE.md`, review
+APPROVE): PASS — rewrite-site probe prices SEMI via production
+helpers at 490456.34 ≥ outer 15570.66 (×2 identical, PG 191195.81
+same order); caveats recorded (rows=5 per-probe, cp threading,
+numQualOps). P1 measurement+gates → next; R77 implementation iff P1
+clean. Tree clean (temp reverted, optimizer builds).
 R68 SCOPE READY 2026-09-11 (`r68-joinorder-costing-step0/SCOPE.md`):
 join-order costing Step-0 (Q9 L-divergence re-measured, sizing vs
 pricing re-adjudicated — R53 numbers stale via R59/R64/R62/R57/R54).
