@@ -3831,3 +3831,10 @@ query needs it; 36-site NL-inner census finds no coinciding site.
 Next major round: join-order costing (R53 lineage); #6/R61-#4/(b) stay
 deferred (re-derive, don't re-carry). Next: scope the join-order
 costing round.
+R68 SCOPE READY 2026-09-11 (`r68-joinorder-costing-step0/SCOPE.md`):
+join-order costing Step-0 (Q9 L-divergence re-measured, sizing vs
+pricing re-adjudicated — R53 numbers stale via R59/R64/R62/R57/R54).
+Review APPROVE-WITH-NOTES (sizing-IN slice (e) added — menu now
+exhaustive; Q9-first framed as lineage call; SHOW capture + Q9-match
+STOP + (d)-attribution + spotcheck-branch provenance required).
+Next: Step-0 measurement per §1, then the scoped pricing/sizing slice.
