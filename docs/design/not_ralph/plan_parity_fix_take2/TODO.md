@@ -3935,6 +3935,13 @@ APPROVE): PASS — keeper `semiadmission_test.go`
 total=160675 ≥ outer 200 through existing arms, no new machinery,
 subset 17 green. P1 integration splice → R76 (relset/sjinfo
 construction + subtree splice via stampPlanCost; no cost terms).
+R76 SCOPE READY 2026-09-12 (`r76-nli-price-splice/SCOPE.md`): NLI
+price splice at the rewrite site — P0 probe (construct priced NLI
+path from planned children via existing arms + stamp through the
+funnel; PASS/BLOCKED both committable), P1 Q4 measurement + gates
+iff PASS, R77 implementation iff P1 clean. Single-SEMI-shape only
+(parameterised index probe); hash-SEMI untouched; no join-order or
+cost-term changes. Next: review SCOPE, commit/push, then P0 probe.
 R68 SCOPE READY 2026-09-11 (`r68-joinorder-costing-step0/SCOPE.md`):
 join-order costing Step-0 (Q9 L-divergence re-measured, sizing vs
 pricing re-adjudicated — R53 numbers stale via R59/R64/R62/R57/R54).

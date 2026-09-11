@@ -148,7 +148,7 @@ func walkRewriteNLI(n Node, cat catalog.Catalog) Node {
 				jc.Predicate = andChainForNLI(crossEqs)
 				// A CROSS JOIN with an injected equi-conjunct is
 				// semantically an INNER join — flip the type so
-				// `tryBuildNLI` (which only accepts INNER/LEFT)
+				// `tryBuildNLI` (INNER/LEFT/SEMI/ANTI per :324)
 				// can fire.
 				if jc.Type == JoinTypeCross {
 					jc.Type = JoinTypeInner
