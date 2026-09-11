@@ -3811,3 +3811,14 @@ same-level; kills Q44; n=1 correlation honestly labeled). Q49 stays
 declined (table-0 rule), Q51 CASE kept (structure-faithful). TEMP
 SORTDUMP reverted and verified zero; :65437 stopped. Next: implement
 the two rules → full re-gates → SLICE2-REPORT.
+R66 SLICE-2 LANDED 2026-09-11 (`r66-alias-source-keys/SLICE2-REPORT.md`):
+chase + boundary rule (sublink-Filter + CTE-qualifier declines) +
+table-0-operand fail-closed. P0–P5 all green: rendering {Q7,Q9,Q10,Q13}
+→{Q10} (sole moves Q7/Q9/Q13 shedding it, both refs), values 24/24 at
+every binary step, DS PASS=96, plan-gate opt-out (identical 20/22).
+DS: Q21/Q39/Q91 kept, Q49/Q44/Q54 reverted, Q51 CASE kept — each
+PG-adjudicated (`:65438` transcripts in `/tmp/pp2/r66/ds-pg/`).
+Review APPROVE, no blocking (3 comment/hardening notes applied;
+locator-threading + synth-return guard ledgered as follow-ups).
+R66 CLOSED → next due: the (a) Materialize re-triage as a new round
+with its own scope.

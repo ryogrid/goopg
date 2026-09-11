@@ -703,6 +703,41 @@ func expandAggOutputRef(col *optimizer.ColumnRef, agg *optimizer.Aggregate) (opt
 	if call.Arg == nil {
 		return nil, false
 	}
+	return synthAggCall(call)
+}
+
+// synthAggCall builds the render-only FuncCall for an aggregate call the
+// admission checks already passed. Shared by expandAggOutputRef
+// (same-level: Sort key/HAVING qual naming a child-aggregate output) and
+// resolveKeySource's cross-aggregate hop (transitive: Q13's `c_count` →
+// inner `count(o_orderkey)`), where the caller's name guard cannot apply
+// across scopes (probe-D positional rule) and only these structural
+// checks decide.
+func synthAggCall(call *optimizer.AggregateCall) (optimizer.Expr, bool) {
+	if call.Filter != nil || len(call.OrderBy) > 0 || call.WithinGroup {
+		return nil, false
+	}
+	// A no-table (table-0, alias/output-derived) operand would render a
+	// half-chased call PG never prints (DS Q49's `((sum / sum))` vs PG's
+	// `in_web.return_ratio`): the call is real, its arguments are not
+	// source text. Decline the whole synthesis, not just the operand.
+	for _, a := range append([]optimizer.Expr{call.Arg, call.Arg2}, call.ExtraArgs...) {
+		if a == nil {
+			continue
+		}
+		if exprHasTableZeroRef(a) {
+			return nil, false
+		}
+	}
+	if call.Star {
+		if call.Distinct || call.Arg != nil || call.Arg2 != nil || len(call.ExtraArgs) > 0 {
+			return nil, false
+		}
+		return &optimizer.FuncCall{Name: call.Name, Star: true}, true
+	}
+	if call.Arg == nil {
+		return nil, false
+	}
 	args := make([]optimizer.Expr, 0, 2+len(call.ExtraArgs))
 	args = append(args, call.Arg)
 	if call.Arg2 != nil {
@@ -731,8 +766,9 @@ func expandAggOutputRef(col *optimizer.ColumnRef, agg *optimizer.Aggregate) (opt
 // passthrough, grouping sets — whose output layout differs), or a
 // grouping expression carrying sublinks / outer references (whose
 // numbering belongs to the main plan walk, never to a key line),
-// keeps today's text. Where GroupExprs is itself alias-named (Q7/Q9's
-// shape) the text is unchanged by construction — that chase is Slice 2.
+// keeps today's text. Where GroupExprs is itself alias-named, the
+// caller chases it further via resolveKeySource (Slice 2); a chase
+// miss falls back to this direct render.
 func sortGroupKeySource(col *optimizer.ColumnRef, agg *optimizer.Aggregate) (optimizer.Expr, bool) {
 	if col == nil || agg == nil || col.Name == "" {
 		return nil, false
@@ -753,6 +789,237 @@ func sortGroupKeySource(col *optimizer.ColumnRef, agg *optimizer.Aggregate) (opt
 		return nil, false
 	}
 	return src, true
+}
+
+// resolveKeySource — R66 Slice 2 (families G/T). Chases a grouping key
+// past goopg-internal republishing layers to the source expression PG
+// prints: boundary/narrowing Projects (which rename outputs to SELECT
+// aliases) are transparent to PG's OUTER_VAR deparse, so goopg must
+// look through them instead of printing the alias.
+//
+// The chase stops where PG keeps a naming boundary, approximated by
+// goopg-visible markers (never by guessing PG's plan): a CTE-output
+// reference (Q54 `my_customers.*`, PG flattened per K31) and a Filter
+// carrying a sublink predicate on the path (Q44's HAVING-shaped Filter
+// above the avg agg; PG keeps SubqueryScan v1 with the InitPlan
+// inside) both decline and keep today's alias text — nearer PG's
+// boundary alias than half-chased internals.
+//
+// Chase (expr, node), depth-capped, fail-closed at every step:
+//   - Sort, or Filter whose Predicate carries no sublink, with nout ==
+//     ncout (definitional position preservation, plan.go:1785/:1573):
+//     step into the child.
+//   - Project (!IsolatedScope — view-rename/unnest boundaries stop and
+//     keep today's text): at chase position j, a bare-ColumnRef target
+//     naming a no-table (table-0, aggregate-output-derived) position
+//     with a child-output name match descends; a bare-ColumnRef target
+//     naming a real BASE table with a name match at the pointed
+//     position STOPS and renders (Q7/Q9 `n_name`) — but a qualifier
+//     naming a statement CTE declines (Q54); a computed target STOPS
+//     and renders (ExtractExpr) unless it carries derived inputs;
+//     anything else declines.
+//   - Aggregate (GroupingSets == nil carried over): a group position
+//     recurses into GroupExprs; an Aggs position synthesises via
+//     synthAggCall — positionally, with NO name check (cross-scope
+//     names never agree: probe-D `c` vs `count`, Q13 `c_count` vs
+//     `count`; the pass-through rename maps already matched names).
+//   - Anything else (joins, scans, CTE scans, Memoize): decline.
+// A nil/false return keeps the caller's today's text; the caller
+// applies its own S18 wrap to a hit.
+func resolveKeySource(expr optimizer.Expr, node optimizer.Node, reg *subPlanReg) (optimizer.Expr, bool) {
+	if expr == nil || node == nil || exprHasSubplanOrOuterRef(expr) {
+		return nil, false
+	}
+	cteNames := cteNameSet(reg)
+	cur := expr
+	for depth := 0; depth < 4; depth++ {
+		switch n := node.(type) {
+		case *optimizer.Sort:
+			c := childNodeOf(n)
+			if c == nil || len(n.Output()) != len(c.Output()) {
+				return nil, false
+			}
+			node = c
+			continue
+		case *optimizer.Filter:
+			// A sublink-bearing Filter on the path (Q44's HAVING-shaped
+			// Filter above the avg agg) marks a level PG may wall off
+			// (SubqueryScan v1 keeps the InitPlan inside): do not chase
+			// an Aggs-synth out from under it.
+			if filterBlocksChase(n) {
+				return nil, false
+			}
+			c := childNodeOf(n)
+			if c == nil || len(n.Output()) != len(c.Output()) {
+				return nil, false
+			}
+			node = c
+			continue
+		case *optimizer.Project:
+			if n.IsolatedScope {
+				return nil, false
+			}
+			col, ok := cur.(*optimizer.ColumnRef)
+			if !ok {
+				return nil, false
+			}
+			j := col.Index
+			if j < 0 || j >= len(n.Targets) {
+				return nil, false
+			}
+			t := n.Targets[j]
+			tc, ok := t.(*optimizer.ColumnRef)
+			if !ok {
+				// A computed target over derived (table-0) inputs is
+				// scaffolding, not source text (DS Q51's unqualified
+				// CASE arms vs PG's base-qualified ones): decline the
+				// whole target rather than printing it half-chased.
+				if exprHasSubplanOrOuterRef(t) || exprHasTableZeroRef(t) {
+					return nil, false
+				}
+				return t, true
+			}
+			c := n.Child
+			if c == nil || tc.Index < 0 {
+				return nil, false
+			}
+			cout := c.Output()
+			if tc.Index >= len(cout) || cout[tc.Index].Name != tc.Name {
+				return nil, false
+			}
+			if tc.SourceTableIdx == 0 {
+				cur = tc
+				node = c
+				continue
+			}
+			if qualifierNamesCTE(reg, tc, cteNames) {
+				return nil, false
+			}
+			return tc, true
+		case *optimizer.Aggregate:
+			if n.GroupingSets != nil {
+				return nil, false
+			}
+			col, ok := cur.(*optimizer.ColumnRef)
+			if !ok {
+				return nil, false
+			}
+			j := col.Index
+			if j < 0 {
+				return nil, false
+			}
+			if j < len(n.GroupExprs) {
+				g := n.GroupExprs[j]
+				if g == nil || exprHasSubplanOrOuterRef(g) {
+					return nil, false
+				}
+				cur = g
+				node = n.Child
+				continue
+			}
+			if j >= n.GroupingMaskColOffset() {
+				return nil, false
+			}
+			return synthAggCall(&n.Aggs[j-len(n.GroupExprs)])
+		default:
+			return nil, false
+		}
+	}
+	return nil, false
+}
+
+// cteNameSet returns the CTE names declared in this render (nil-safe:
+// no CTEs, or no registry, means an empty set and the boundary rule is
+// inert). Used to tell a base-table qualifier (chase-correct) from a
+// CTE-output qualifier (PG may have flattened the CTE away per K31,
+// so printing it asserts a boundary PG lacks).
+func cteNameSet(reg *subPlanReg) map[string]bool {
+	out := map[string]bool{}
+	if reg == nil || reg.cte == nil {
+		return out
+	}
+	for _, sec := range reg.cte.order {
+		if sec != nil && sec.name != "" {
+			out[sec.name] = true
+		}
+	}
+	return out
+}
+
+// qualifierNamesCTE reports whether col would render with a qualifier
+// naming one of the statement's CTEs. The qualifier is computed exactly
+// as the renderer will print it (reg.names().column with prefix), so
+// the test answers about the printed text — immune to per-level
+// SourceTableIdx collisions — and consumer aliases fall through
+// correctly (PG prints `m.col` too when the consumer aliases as `m`).
+func qualifierNamesCTE(reg *subPlanReg, col *optimizer.ColumnRef, cteNames map[string]bool) bool {
+	if reg == nil || reg.names() == nil || col == nil || len(cteNames) == 0 {
+		return false
+	}
+	q := reg.names().column(col.SourceTableIdx, col.Name, true)
+	i := strings.LastIndex(q, ".")
+	if i < 0 {
+		return false
+	}
+	return cteNames[q[:i]]
+}
+
+// childNodeOf returns the single child of a Sort/Filter node — the only
+// two kinds resolveKeySource steps through directly.
+func childNodeOf(n optimizer.Node) optimizer.Node {
+	switch t := n.(type) {
+	case *optimizer.Sort:
+		return t.Child
+	case *optimizer.Filter:
+		return t.Child
+	}
+	return nil
+}
+
+// childProjectThroughFilters resolves the Project below (modulo Filter
+// wrappers, which are output-identical by definition) for a Sort whose
+// child carries no aggregate — the grouping-input-sort entry (Q7's
+// Sort, whose keys the pre-search aggregate never sees).
+func childProjectThroughFilters(n optimizer.Node) *optimizer.Project {
+	for {
+		f, ok := n.(*optimizer.Filter)
+		if !ok {
+			break
+		}
+		if f.Child == nil {
+			return nil
+		}
+		n = f.Child
+	}
+	p, _ := n.(*optimizer.Project)
+	return p
+}
+
+// filterBlocksChase reports whether a Filter node walls off the levels
+// below it for key chasing: a sublink in its Predicate (Q44's
+// HAVING-shaped Filter, whose InitPlan PG keeps inside SubqueryScan
+// v1) means an Aggs-synth from below would print internals of a level
+// PG walls off. Plain-predicate Filters step through (position
+// preservation is definitional).
+func filterBlocksChase(f *optimizer.Filter) bool {
+	return f != nil && f.Predicate != nil && exprHasSubplanOrOuterRef(f.Predicate)
+}
+
+// exprHasTableZeroRef reports whether e carries a no-table (table-0,
+// alias/output-derived rather than base-table) column reference. Such
+// content inside a rendered key means the chase stopped halfway: the
+// call/target is real but its inputs are not source text.
+func exprHasTableZeroRef(e optimizer.Expr) bool {
+	found := false
+	optimizer.WalkExprTree(e, func(sub optimizer.Expr) {
+		if found {
+			return
+		}
+		if col, ok := sub.(*optimizer.ColumnRef); ok && col.SourceTableIdx == 0 {
+			found = true
+		}
+	})
+	return found
 }
 
 // exprHasSubplanOrOuterRef reports whether e carries a sublink or an
@@ -884,6 +1151,8 @@ func emitNodeDetailLines(n optimizer.Node, indent string, verbose bool, rows *[]
 	// without the other manufactures an internal inconsistency within a
 	// single EXPLAIN output. See docs/design/0134-0001-p2-explain-format.md
 	// § S18 for the "reference vs compute" rule this pair implements.
+	// R66 Slice 2 feeds both arms from the same resolveKeySource chase,
+	// so the pair still agrees position-by-position by construction.
 	case *optimizer.Sort:
 		if len(p.Keys) > 0 {
 			parts := make([]string, 0, len(p.Keys))
@@ -898,14 +1167,31 @@ func emitNodeDetailLines(n optimizer.Node, indent string, verbose bool, rows *[]
 				keyExpr := k.Expr
 				if col, ok := k.Expr.(*optimizer.ColumnRef); ok {
 					if agg := childAggregateThroughFilters(p.Child); agg != nil {
-						// R66 Arm S first: a group-position key renders
-						// the grouping expression (source, not alias).
+						// Entry (i) — Sort above agg: Arm-S guard, then
+						// the Slice-2 chase down past republishing
+						// layers; a chase-miss falls back to the Arm-S
+						// render (Slice-1 behaviour, byte-identical).
 						// Aggs-section keys fall through to R65's call
 						// expansion (now Star/Distinct-capable).
 						if src, hit := sortGroupKeySource(col, agg); hit {
-							keyExpr = src
+							if chased, ok := resolveKeySource(src, agg.Child, reg); ok {
+								keyExpr = chased
+							} else {
+								keyExpr = src
+							}
 						} else if expanded, hit := expandAggOutputRef(col, agg); hit {
 							keyExpr = expanded
+						}
+					} else if proj := childProjectThroughFilters(p.Child); proj != nil {
+						// Entry (ii) — grouping-input / order-by Sort
+						// over a Project (Q7's Sort: Arm-S never sees
+						// an agg): chase the key through the child's
+						// targets with the re-anchored name guard.
+						cout := proj.Output()
+						if j := col.Index; j >= 0 && j < len(cout) && cout[j].Name == col.Name {
+							if chased, ok := resolveKeySource(col, proj, reg); ok {
+								keyExpr = chased
+							}
 						}
 					}
 				}
@@ -1139,9 +1425,20 @@ func emitNodeDetailLines(n optimizer.Node, indent string, verbose bool, rows *[]
 			_, groupAgg := p.Child.(*optimizer.Sort)
 			parts := make([]string, 0, len(order))
 			for _, gi := range order {
-				s := formatExprQual(p.GroupExprs[gi], reg, qualify)
+				// R66 Slice 2: a ColumnRef group key chases past
+				// republishing layers to the source PG prints (Q7
+				// `supp_nation` → `n1.n_name`); a miss keeps today's
+				// text. Non-ColumnRef group keys already render
+				// source and never enter the chase.
+				keyExpr := p.GroupExprs[gi]
+				if _, ok := keyExpr.(*optimizer.ColumnRef); ok {
+					if chased, hit := resolveKeySource(keyExpr, p.Child, reg); hit {
+						keyExpr = chased
+					}
+				}
+				s := formatExprQual(keyExpr, reg, qualify)
 				if groupAgg {
-					if _, isVar := p.GroupExprs[gi].(*optimizer.ColumnRef); !isVar {
+					if _, isVar := keyExpr.(*optimizer.ColumnRef); !isVar {
 						s = forceParen(s)
 					}
 				}
