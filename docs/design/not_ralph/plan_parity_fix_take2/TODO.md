@@ -3831,6 +3831,14 @@ query needs it; 36-site NL-inner census finds no coinciding site.
 Next major round: join-order costing (R53 lineage); #6/R61-#4/(b) stay
 deferred (re-derive, don't re-carry). Next: scope the join-order
 costing round.
+R70 SCOPE READY 2026-09-11 (`r70-hash-footprint/SCOPE.md`): hash
+footprint compute-then-route (planner pruning cut vs minimize_datum
+dependency). Review APPROVE-WITH-NOTES (per-offer ncols/avgVarBytes
+instrumentation not inference; pre-registered separation bar with
+Step-A sign-off enforcer; considerparallel citation corrected;
+pruned width from Q9's keep-set not K67's anchor — all applied).
+Next: Step-A decision table (+bar pass/fail recorded), then cut or
+close-out per the route rule.
 R68 SCOPE READY 2026-09-11 (`r68-joinorder-costing-step0/SCOPE.md`):
 join-order costing Step-0 (Q9 L-divergence re-measured, sizing vs
 pricing re-adjudicated — R53 numbers stale via R59/R64/R62/R57/R54).
