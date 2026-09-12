@@ -4263,3 +4263,15 @@ keeps Goopg executor map sizing, actual batching, and spill costs separate.
 It must carry a path's emitted byte width, decline unknown/unsupported
 geometry, and retain the existing matched bucket statistic. Next: agent
 review, revise if needed, commit -n/push scope, then and only then implement.
+
+R91 DONE 2026-09-12 (`r91-pg-virtual-bucket-unmatched/REPORT.md`): production
+commit `63c79406b` adds an optimizer-private PG18 packed-tuple virtual-bucket
+port for unmatched, already-proved INNER unique Hash Join probes. It preserves
+executor map geometry/spill costing and propagates exact emitted index-only
+widths through serial and partial candidates. Full gates pass: TPC-H 24/24
+value MATCH, SF0.25 PASS=96 with zero correctness failures, and fresh live-PG
+census `2/67/0/27/3/0`. Q96 remains value-correct and deterministic; its
+serial relation order now matches PG (`store_sales -> household_demographics
+-> store`), but PG's partial aggregate/Gather structural difference remains.
+Next: scope a separately evidenced parallelism/final-cost boundary; do not
+force a Gather or conflate PG virtual buckets with executor map sizing.
