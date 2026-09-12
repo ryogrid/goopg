@@ -4146,4 +4146,20 @@ time_dim-pkey NLI's admission/election. No fix is authorized until
 exactly one branch is
 measured and separately scoped. Q14/K92, Q1/R81 inputs, the parallel
 family, Q91 Materialize, and corpus-zero ParamRef LIMIT debt remain
-deferred. Next: agent review, commit/push SCOPE, then Step-0.
+deferred.
+R86 STEP-0 DONE 2026-09-12
+(`r86-q96-step0/STEP0.md`, measurement-only; implementation review pending):
+both engines have `store_sales=719876` and goopg's actual partial base path
+uses PG's `232218` per-worker rows. The printed 719876 is a serial
+`PathPrebuilt` carrier later stamped under Gather, not the partial tournament.
+Within the common `{ss,hd,store}` partial list, PG's `(ss⋈hd)⋈store` offer
+(`16615.81`) is evicted by `(ss⋈store)⋈hd` (`16562.60`): equal output
+rows/pathkeys/disabled count but a `53.21` lower total. The earliest input
+difference is its L2 selectivity/cardinality (store: 59990 / 19352 partial,
+about 1/12; hd: 71988 / 23222 partial, 1/10). The subsequent parameterised
+NLI and Gather refusal are real but downstream; that NLI's `inputtotal=16562.60`
+proves it uses the non-PG prefix. Primary branch F; A/B ruled out and D/E are
+not reached. No code changed. Required gates pass: optimizer/executor tests
+and vet, trace A/A, Q9/Q41/Q91/Q96 trace on/off controls, and Q96 PG value
+comparison. Next: review corrected report, then commit/push; only after that
+may a separately scoped R87 localise the L2 selectivity/cost input.
