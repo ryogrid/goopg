@@ -4295,3 +4295,16 @@ state, while the rendered serial child has no driving scan. Temporary code was
 removed; final optimizer diff is empty and test/vet/whitespace gates pass.
 Q96 trace stayed byte-identical. Next: separately scope a safe executable
 partial-path node representation; do not adjust costs or force Gather.
+
+R93 SCOPE READY 2026-09-12
+(`r93-isolated-partial-prebuilt/SCOPE.md`): add a fail-closed, fully isolated
+materialization route for a searched partial path whose `PathPrebuilt` leaves
+would otherwise be stamped in place by ordinary plan construction. The route
+is for upper partial-aggregate source selection only and must prove that every
+mutable node and expression it can reach is private before the existing
+constructor stamps costs. It also extends the aligned partial-NLI outer walks
+(three optimizer decisions and all three executor claim walkers) only
+after a focused serial-versus-parallel value proof. It must decline
+unsupported nodes, preserve the serial candidate, and never make a Gather win
+by force. Next: agent review, revise if needed, commit -n/push scope, then
+implement and run the mandatory correctness and parity gates.
