@@ -4350,3 +4350,16 @@ for NL execution) incl. empty sides + large inner (memory deferral
 documented), inner-no-claim, refusal matrix. Full optimizer + executor
 suites green, vet clean. Next: item 4 (agg split source selection),
 full gates, REPORT.
+
+R94 DONE 2026-09-12 (`r94-partial-plain-nestloop/REPORT.md`, review
+APPROVE): items 1–3 landed in `08a6550` (twin + walks, classifier,
+filing, claims, tests); item 4 measured to a scope-invalidating
+finding — Q96's NL nodes are all Lateral=true (R25 decomposed
+parameterized probes), so the scoped ordinary shape never occurs
+and selection correctly stays empty (no Gather forced). Gates:
+suites + vet + whitespace clean; TPC-H digest 24/24 PASS; SF0.25
+PASS=94 with Q35/Q69 environmental (isolated A/B both binaries
+pass, byte-identical outputs); Q9/Q41/Q91/Q96 natural vs opt-in
+identical; census 2/69/0/25/3/0 with baseline-vs-R94 captures
+identical (delta vs R91 is clone drift). Next: separately scope
+lateral-probe worker semantics, or another evidenced mismatch.
