@@ -4209,3 +4209,10 @@ R85 live’s `2/69/0/25/3/0`). Next: scope the measured same-relset Q96 partial
 prefix tournament (`ss⋈store` wins L2 by 184.79 and L3 by 50.81) before any
 conditional serial/parallel follow-up; do not undo the bare-unique/FK
 distinction.
+
+R89 SCOPE READY 2026-09-12 (`r89-q96-partial-prefix-cost/SCOPE.md`):
+measurement-only attribution of the post-R88 Q96 same-relset partial Hash Join
+tournament. The evidence boundary is the 184.79 L2 and 50.81 L3 cost advantage
+of the retained `ss⋈store` prefix, before downstream NLI/Gather behavior. No
+cost, selectivity, parallel, GUC, or query change is authorized until PG source
+terms and Goopg inputs are recomputed and a single C1–C4 outcome is reviewed.
