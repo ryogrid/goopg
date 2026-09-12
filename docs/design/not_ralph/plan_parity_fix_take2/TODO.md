@@ -4229,3 +4229,15 @@ an inner-unique proof, semifactors, PG MCV-frequency/QualCost, and pathtarget
 inputs that Goopg does not represent; outcome C2, not a guessed cost change.
 Next: scope the missing inner-unique final-cost inputs before implementation;
 do not infer unexposed rejected PG path state or promise a Q96 flip.
+
+R90 SCOPE READY 2026-09-12
+(`r90-inner-unique-hash-final-cost/SCOPE.md`): carry fail-closed, sole-base
+non-partial unique-inner evidence into serial and partial Hash Join final
+costing, with matched/unmatched probe factors derived only from fixed path
+cardinalities. It changes neither selectivity, Gather behavior, nor general
+PG MCV/QualCost/pathtarget modeling. It is INNER-only and shares the
+total-relation match fraction across serial/partial siblings; Goopg map
+geometry is not PG virtual-bucket geometry, so its executor-coordinate
+unmatched tuple-walk charge is zero rather than guessed from `NBuckets`.
+Next: agent review, correct if needed, commit -n/push the scope, then and only
+then implement with focused proof tests and the mandatory full parity gates.
