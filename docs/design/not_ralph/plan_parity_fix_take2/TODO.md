@@ -4275,3 +4275,14 @@ serial relation order now matches PG (`store_sales -> household_demographics
 -> store`), but PG's partial aggregate/Gather structural difference remains.
 Next: scope a separately evidenced parallelism/final-cost boundary; do not
 force a Gather or conflate PG virtual buckets with executor map sizing.
+
+R92 SCOPE READY 2026-09-12
+(`r92-q96-partial-aggregate-seed/SCOPE.md`): measurement-only attribution of
+Q96's upper partial-aggregate `no-driving-scan` refusal. R91 has an accepted
+final-relset partial NLI path, but the upper producer sees the rendered serial
+child. Trace only whether a throwaway node built from the partial path is a
+runnable, unparameterized worker subtree; construction must be copy-only and
+recoverable so trace-on cannot change query success. Do not alter costs,
+defaults, Gather policy, aggregate behavior, or Q96 selection. Next: agent
+review, commit -n/push the scope, then add/remove default-off diagnostics and
+report one separately scoped construction or barrier.
