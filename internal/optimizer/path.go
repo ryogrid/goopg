@@ -267,11 +267,13 @@ type Path struct {
 
 	// NCols / AvgVarBytes describe what THIS PATH emits, when that is narrower
 	// than its relation — PG's `pathtarget` at the granularity goopg needs for
-	// hash sizing. Zero NCols means "not narrowed"; read them through
-	// pathNCols / pathAvgVarBytes, never directly, so the fallback to the
-	// rel's figures stays in one place.
+	// executor hash sizing. OutputWidth is the separate emitted byte width for
+	// planner-only PG packed-tuple geometry. Zero values mean "not narrowed";
+	// read them through pathNCols/pathAvgVarBytes/pathWidth, never directly, so
+	// the fallback to the rel's figures stays in one place.
 	NCols       int
 	AvgVarBytes float64
+	OutputWidth int
 
 	// Target / TargetKnown is the scan's emitted-column list — take2 P4-01
 	// Slice 1 (planner-p4-01-target DESIGN, "Slice 1"): the ordered
@@ -666,6 +668,22 @@ func pathAvgVarBytes(p *Path) float64 {
 		return p.Rel.AvgVarBytes
 	}
 	return 0
+}
+
+// pathWidth is the emitted byte-width analogue of pathNCols. It is deliberately
+// separate from the executor's NCols/AvgVarBytes map-footprint model: PG
+// final_cost_hashjoin's virtual-bucket geometry uses pathtarget->width, which
+// is a packed tuple width. A positive OutputWidth is produced only where a path
+// really narrows its emitted schema; otherwise the relation's width is the
+// single source of truth.
+func pathWidth(p *Path) int {
+	if p != nil && p.OutputWidth > 0 {
+		return p.OutputWidth
+	}
+	if p == nil || p.Rel == nil {
+		return 0
+	}
+	return p.Rel.Width
 }
 
 func relNCols(r *RelOptInfo) int {

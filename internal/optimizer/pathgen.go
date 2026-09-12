@@ -92,6 +92,7 @@ func addHashJoinPath(joinRel, probe, build *RelOptInfo, cp costParams, jt parser
 		numHashClauses:  len(keys),
 		innerBucketSize: innerBucketSize,
 		final:           final,
+		innerWidth:      pathWidth(b),
 		// take2 P4-01: column counts come from the PATHS, falling back to the
 		// rels. The previous comment here read "Column counts come from the
 		// RELS, not the paths: a parameterised path returns fewer ROWS than

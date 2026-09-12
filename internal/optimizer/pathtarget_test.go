@@ -262,8 +262,8 @@ func TestIndexOnlyPathTargetMatchesWidth(t *testing.T) {
 	c := catalog.NewInMemory()
 	tbl, err := c.CreateTable(parser.ObjectName{Name: "pt_t"}, []catalog.Column{
 		{Name: "k", Type: catalog.Type{Name: "int4"}},
-		{Name: "v", Type: catalog.Type{Name: "int4"}},
-		{Name: "unused", Type: catalog.Type{Name: "int4"}},
+		{Name: "v", Type: catalog.Type{Name: "int8"}},
+		{Name: "unused", Type: catalog.Type{Name: "text"}},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -277,14 +277,18 @@ func TestIndexOnlyPathTargetMatchesWidth(t *testing.T) {
 		t.Fatalf("got %d indexes, want 1", len(idxs))
 	}
 
-	s := &searchCtx{cp: defaultCostParams()}
+	s := &searchCtx{cp: defaultCostParams(), parallelModeOK: true}
 	s.neededCols, s.neededColsKnown = map[string]bool{"k": true, "v": true}, true
 	rel := ptRel([]string{"k", "v", "unused"}, s.neededCols, true)
+	// Deliberately unlike the two-column index-only output so a fallback to
+	// Rel.Width is observable. The production producer must preserve the
+	// exact emitted width through both its serial and partial twins.
+	rel.Width, rel.Rows, rel.ConsiderParallel = 700, 100000, true
 	needed := s.neededColumnsOf(tbl)
 	if len(needed) != 2 {
 		t.Fatalf("neededColumnsOf = %v, want [k v]", needed)
 	}
-	if !s.addOneIndexOnlyPath(rel, tbl, idxs[0], needed, 100, 1000, 100) {
+	if !s.addOneIndexOnlyPath(rel, tbl, idxs[0], needed, 10000, 100000, 10000) {
 		t.Fatal("addOneIndexOnlyPath declined a covered index; the fixture is wrong")
 	}
 	p := rel.Pathlist[len(rel.Pathlist)-1]
@@ -302,6 +306,31 @@ func TestIndexOnlyPathTargetMatchesWidth(t *testing.T) {
 	}
 	if p.AvgVarBytes != coveredAvgVarBytes(tbl, p.IndexOnlyCovered) {
 		t.Errorf("AvgVarBytes = %v, want the covered-columns figure", p.AvgVarBytes)
+	}
+	wantOutputWidth := TupleWidth([]SchemaColumn{
+		{Name: "k", Type: catalog.Type{Name: "int4"}},
+		{Name: "v", Type: catalog.Type{Name: "int8"}},
+	})
+	if got := pathWidth(p); got != wantOutputWidth || p.OutputWidth != wantOutputWidth {
+		t.Fatalf("serial emitted width = path %d field %d, want %d", got, p.OutputWidth, wantOutputWidth)
+	}
+	if pathWidth(p) == rel.Width {
+		t.Fatalf("serial path fell back to relation width %d", rel.Width)
+	}
+	if len(rel.PartialPathlist) != 1 {
+		t.Fatalf("partial index-only paths = %d, want 1", len(rel.PartialPathlist))
+	}
+	partial := rel.PartialPathlist[0]
+	if got := pathWidth(partial); got != wantOutputWidth || partial.OutputWidth != wantOutputWidth {
+		t.Fatalf("partial emitted width = path %d field %d, want %d", got, partial.OutputWidth, wantOutputWidth)
+	}
+	narrow, ok := pgHashGeometry(100000, pathWidth(p), 64<<10)
+	if !ok {
+		t.Fatal("serial emitted geometry declined")
+	}
+	full, ok := pgHashGeometry(100000, rel.Width, 64<<10)
+	if !ok || narrow == full {
+		t.Fatalf("producer width did not reach geometry: narrow=%+v full=%+v ok=%v", narrow, full, ok)
 	}
 }
 

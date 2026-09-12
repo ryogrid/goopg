@@ -4,6 +4,7 @@ import (
 	"math"
 	"testing"
 
+	"github.com/goopg/goopg/internal/executor/hashsize"
 	"github.com/goopg/goopg/internal/parser"
 )
 
@@ -121,7 +122,7 @@ func TestHashJoinFinalCostInputDeclinesPartialUniqueIndex(t *testing.T) {
 	}
 }
 
-func TestHashJoinInnerUniqueFinalCostUsesRoundToEvenAndZeroUnmatchedWalk(t *testing.T) {
+func TestHashJoinInnerUniqueFinalCostUsesRoundToEvenWhenGeometryDeclines(t *testing.T) {
 	cp := defaultCostParams()
 	base := hashJoinInputs{
 		outerRows: 5, innerRows: 10, numHashClauses: 1,
@@ -130,8 +131,8 @@ func TestHashJoinInnerUniqueFinalCostUsesRoundToEvenAndZeroUnmatchedWalk(t *test
 	unique := base
 	unique.final = hashJoinFinalCostInput{innerUnique: true, outerMatchFrac: 0.5}
 
-	// rint(5 * .5) is 2, not 3. The one-row matched bucket costs
-	// cpu_operator_cost * 2 * 1 * .5; canonical-map misses add no tuple walk.
+	// rint(5 * .5) is 2, not 3. Width zero declines R91's PG virtual
+	// geometry, so this pins R90's matched term in isolation.
 	build := (cp.cpuOperatorCost + cp.cpuTupleCost) * 10
 	wantUnique := build + cp.cpuOperatorCost*5 + cp.cpuOperatorCost*2*1*0.5
 	if got := hashJoinCost(cp, unique).Total; math.Abs(got-wantUnique) > 1e-12 {
@@ -145,20 +146,25 @@ func TestHashJoinInnerUniqueFinalCostUsesRoundToEvenAndZeroUnmatchedWalk(t *test
 	}
 }
 
-func TestHashJoinInnerUniqueWithoutBucketStatsPreservesOldCost(t *testing.T) {
+func TestHashJoinInnerUniqueWithoutBucketStatsAddsUnmatchedVirtualBucketCost(t *testing.T) {
 	cp := defaultCostParams()
-	ordinary := hashJoinInputs{outerRows: 9, innerRows: 7, outputRows: 4, numHashClauses: 1}
+	ordinary := hashJoinInputs{outerRows: 9, innerRows: 7, outputRows: 4, numHashClauses: 1, innerWidth: 48}
 	unique := ordinary
 	unique.final = hashJoinFinalCostInput{innerUnique: true, outerMatchFrac: 0.5}
-	if got, want := hashJoinCost(cp, unique), hashJoinCost(cp, ordinary); got != want {
-		t.Fatalf("unique no-stats cost = %+v, want old cost %+v", got, want)
+	// rint(9*.5)=4, leaving five unmatched probes. Seven inner rows over
+	// the 1024-bucket floor clamp to one tuple; no bucket statistic exists,
+	// so this is the unmatched-only PG final-cost delta.
+	want := hashJoinCost(cp, ordinary)
+	want.Total += cp.cpuOperatorCost * 5 * 1 * 0.05
+	if got := hashJoinCost(cp, unique); math.Abs(got.Total-want.Total) > 1e-12 || got.Startup != want.Startup {
+		t.Fatalf("unique no-stats cost = %+v, want unmatched-only %+v", got, want)
 	}
 }
 
 func TestHashJoinInnerUniqueUsesSharedTotalCoordinateFractionForPartialOuter(t *testing.T) {
 	cp := defaultCostParams()
 	final := hashJoinFinalCostInput{innerUnique: true, outerMatchFrac: 0.5}
-	serial := hashJoinInputs{outerRows: 10, innerRows: 10, numHashClauses: 1, innerBucketSize: 0.1, final: final}
+	serial := hashJoinInputs{outerRows: 10, innerRows: 10, numHashClauses: 1, innerBucketSize: 0.1, innerWidth: 48, final: final}
 	partial := serial
 	partial.outerRows = 3
 
@@ -166,8 +172,8 @@ func TestHashJoinInnerUniqueUsesSharedTotalCoordinateFractionForPartialOuter(t *
 	// rint(3*.5)=2. Both multiply the same rel-level .5, with no second worker
 	// divisor and with the complete ten-row inner build retained.
 	build := (cp.cpuOperatorCost + cp.cpuTupleCost) * 10
-	wantSerial := build + cp.cpuOperatorCost*10 + cp.cpuOperatorCost*5*1*0.5
-	wantPartial := build + cp.cpuOperatorCost*3 + cp.cpuOperatorCost*2*1*0.5
+	wantSerial := build + cp.cpuOperatorCost*10 + cp.cpuOperatorCost*5*1*0.5 + cp.cpuOperatorCost*5*1*0.05
+	wantPartial := build + cp.cpuOperatorCost*3 + cp.cpuOperatorCost*2*1*0.5 + cp.cpuOperatorCost*1*1*0.05
 	if got := hashJoinCost(cp, serial).Total; math.Abs(got-wantSerial) > 1e-12 {
 		t.Fatalf("serial total = %.12g, want %.12g", got, wantSerial)
 	}
@@ -178,10 +184,54 @@ func TestHashJoinInnerUniqueUsesSharedTotalCoordinateFractionForPartialOuter(t *
 
 func TestHashJoinFinalCostInputPreservesNonInnerJoinTypes(t *testing.T) {
 	s, joinrel, outer, inner, keys := r90UniqueFixture(t)
+	base := hashJoinInputs{
+		outerRows: 100, innerRows: 40, numHashClauses: len(keys),
+		innerBucketSize: 0.1, innerWidth: 48,
+	}
+	want := hashJoinCost(s.cp, base)
 	for _, jt := range []parser.JoinType{parser.JoinLeft, parser.JoinSemi, parser.JoinAnti} {
 		if got := s.hashJoinFinalCostInputFor(joinrel, outer, inner, jt, keys); got != (hashJoinFinalCostInput{}) {
 			t.Fatalf("jointype %v input = %+v, want zero-value preservation", jt, got)
 		}
+		candidate := base
+		candidate.final = s.hashJoinFinalCostInputFor(joinrel, outer, inner, jt, keys)
+		if got := hashJoinCost(s.cp, candidate); got != want {
+			t.Fatalf("jointype %v final cost = %+v, want unchanged %+v", jt, got, want)
+		}
+	}
+}
+
+func TestHashJoinUniqueVirtualGeometryLeavesExecutorSpillCostUnchanged(t *testing.T) {
+	cp := defaultCostParams()
+	cp.workMem = 64 << 10
+	base := hashJoinInputs{
+		outerRows: 100, innerRows: 100000, numHashClauses: 1,
+		innerBucketSize: 0.01, innerCols: 4, innerAvgVarBytes: 32,
+		final: hashJoinFinalCostInput{innerUnique: true, outerMatchFrac: 1},
+	}
+	// The valid PG geometries are deliberately different, but every outer row
+	// matches, so R91's unmatched term is zero. Thus an exact cost identity
+	// proves OutputWidth cannot leak into the executor's spill currency.
+	narrow, wide := base, base
+	narrow.innerWidth, wide.innerWidth = 48, 700
+	narrowGeometry, narrowOK := pgHashGeometry(narrow.innerRows, narrow.innerWidth, cp.workMem)
+	wideGeometry, wideOK := pgHashGeometry(wide.innerRows, wide.innerWidth, cp.workMem)
+	if !narrowOK || !wideOK || narrowGeometry.virtualBuckets <= 0 || wideGeometry.virtualBuckets <= 0 {
+		t.Fatalf("PG geometries = %+v/%+v, ok=%v/%v; want valid", narrowGeometry, wideGeometry, narrowOK, wideOK)
+	}
+	if narrowGeometry == wideGeometry {
+		t.Fatalf("fixture did not vary PG virtual geometry: %+v", narrowGeometry)
+	}
+	executorBefore := hashsize.Choose(base.innerRows, base.innerCols, base.innerAvgVarBytes, cp.workMem)
+	if executorBefore.NBatch <= 1 {
+		t.Fatalf("fixture did not exercise executor spill geometry: %+v", executorBefore)
+	}
+	executorAfter := hashsize.Choose(base.innerRows, base.innerCols, base.innerAvgVarBytes, cp.workMem)
+	if executorAfter != executorBefore {
+		t.Fatalf("executor geometry changed: %+v want %+v", executorAfter, executorBefore)
+	}
+	if got, want := hashJoinCost(cp, narrow), hashJoinCost(cp, wide); got != want {
+		t.Fatalf("unique matched-only cost leaked virtual geometry: %+v want %+v", got, want)
 	}
 }
 
@@ -227,7 +277,8 @@ func TestHashJoinInnerUniquePathInputReachesSerialAndPartialCosts(t *testing.T) 
 			outer: serial.Children[0].Cost, inner: serial.Children[1].Cost,
 			outerRows: serial.Children[0].Rows, innerRows: serial.Children[1].Rows,
 			outputRows: joinrel.Rows, numHashClauses: len(keys), innerBucketSize: bucket, final: final,
-			outerCols: pathNCols(serial.Children[0]), innerCols: pathNCols(serial.Children[1]),
+			innerWidth: pathWidth(serial.Children[1]),
+			outerCols:  pathNCols(serial.Children[0]), innerCols: pathNCols(serial.Children[1]),
 			outerAvgVarBytes: pathAvgVarBytes(serial.Children[0]), innerAvgVarBytes: pathAvgVarBytes(serial.Children[1]),
 		})
 		wantSerial.Total += qualEvalCost(s.cp, 1, joinrel.Rows)
@@ -240,7 +291,8 @@ func TestHashJoinInnerUniquePathInputReachesSerialAndPartialCosts(t *testing.T) 
 			outer: partial.Children[0].Cost, inner: partial.Children[1].Cost,
 			outerRows: partial.Children[0].Rows, innerRows: partial.Children[1].Rows,
 			outputRows: wantPartialRows, numHashClauses: len(keys), innerBucketSize: bucket, final: final,
-			outerCols: pathNCols(partial.Children[0]), innerCols: pathNCols(partial.Children[1]),
+			innerWidth: pathWidth(partial.Children[1]),
+			outerCols:  pathNCols(partial.Children[0]), innerCols: pathNCols(partial.Children[1]),
 			outerAvgVarBytes: pathAvgVarBytes(partial.Children[0]), innerAvgVarBytes: pathAvgVarBytes(partial.Children[1]),
 		})
 		wantPartial.Total += qualEvalCost(s.cp, 1, wantPartialRows)

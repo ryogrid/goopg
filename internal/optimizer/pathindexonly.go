@@ -142,6 +142,10 @@ func (s *searchCtx) addOneIndexOnlyPath(rel *RelOptInfo, tbl *catalog.Table, idx
 		// hashsize.Choose exists to prevent.
 		NCols:       len(covered),
 		AvgVarBytes: coveredAvgVarBytes(tbl, covered),
+		// R91: virtual-bucket geometry consumes the emitted packed-tuple
+		// width, never the Goopg map-footprint fields. TupleWidth is the
+		// existing PG-style source over exactly this covered schema.
+		OutputWidth: indexOnlyOutputWidth(covered),
 		// take2 P4-01 Slice 1: the scan Target, computed from NeededCols at
 		// path-creation time. Assert-only — never applied, never costed; the
 		// NCols/AvgVarBytes pair above is unchanged.
@@ -158,6 +162,17 @@ func (s *searchCtx) addOneIndexOnlyPath(rel *RelOptInfo, tbl *catalog.Table, idx
 	// since M0134-0189 (Parallel Index Only Scan).
 	s.addPartialIndexPath(rel, tbl, serial, in, "indexonly.partial")
 	return true
+}
+
+// indexOnlyOutputWidth constructs the same SchemaColumn view a plan node emits
+// before asking the one PG-style byte-width authority, TupleWidth. It is not a
+// map-footprint proxy: catalog columns carry their real planner type widths.
+func indexOnlyOutputWidth(covered []catalog.Column) int {
+	schema := make([]SchemaColumn, len(covered))
+	for i, col := range covered {
+		schema[i] = SchemaColumn{Name: col.Name, Type: col.Type}
+	}
+	return TupleWidth(schema)
 }
 
 // indexCoversColumns is `check_index_only`'s coverage test: every needed column

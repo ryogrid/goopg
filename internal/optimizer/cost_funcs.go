@@ -607,6 +607,11 @@ type hashJoinInputs struct {
 	// existing non-unique bucket-walk result exactly.
 	final hashJoinFinalCostInput
 
+	// innerWidth is the build path's emitted packed-tuple byte width. It feeds
+	// only PG's planner-private virtual-bucket geometry for unmatched
+	// inner-unique probes, never Goopg executor map sizing or spill I/O.
+	innerWidth int
+
 	// `hashsize.Choose`. Populated from RelOptInfo.AvgVarBytes; zero when no
 	// ANALYZE stats exist (correct for fixed-width relations). M0128-P3.1.
 	outerAvgVarBytes, innerAvgVarBytes float64
@@ -656,23 +661,30 @@ func hashJoinCost(cp costParams, in hashJoinInputs) Cost {
 	// innerBucketSize == 0 means "no usable statistic"; the term is then
 	// SKIPPED rather than guessed, so a stats-less plan costs exactly as it did
 	// before this change.
-	if in.innerBucketSize > 0 && in.final.innerUnique {
+	if in.final.innerUnique {
 		// PG's rint() uses round-to-even. The factor was derived once in total
 		// relation coordinates; outerRows is this serial or partial candidate's
 		// path coordinate.
 		outerMatched := math.RoundToEven(in.outerRows * in.final.outerMatchFrac)
-		innerScanFrac := 2.0 / (1.0 + 1.0) // match_count is one for a unique inner.
-		bucketTuples := clampRowEst(in.innerRows * in.innerBucketSize * innerScanFrac)
-		run += cp.cpuOperatorCost * float64(in.numHashClauses) *
-			outerMatched * bucketTuples * 0.5
+		if in.innerBucketSize > 0 {
+			innerScanFrac := 2.0 / (1.0 + 1.0) // match_count is one for a unique inner.
+			bucketTuples := clampRowEst(in.innerRows * in.innerBucketSize * innerScanFrac)
+			run += cp.cpuOperatorCost * float64(in.numHashClauses) *
+				outerMatched * bucketTuples * 0.5
+		}
 
-		// PG charges unmatched probes against inner_path_rows / virtualbuckets.
-		// Goopg's executor instead probes a canonical-key map: an unmatched key
-		// has no candidate slice to walk. NBuckets/NBatch are map sizing and
-		// spill accounting, not that PG chain space, so this bounded adaptation
-		// charges no unmatched tuple walk rather than inventing a denominator.
-		// It intentionally does not model PG packed-tuple geometry,
-		// MCV-frequency suppression, general QualCost, or pathtarget costs.
+		// R91: final_cost_hashjoin prices unmatched inner-unique probes against
+		// PG's packed-tuple virtual buckets, not Goopg's map capacity. The
+		// existing cpuOperatorCost*numHashClauses remains this model's surrogate
+		// for hash_qual_cost.per_tuple; no general QualCost model is implied.
+		if geometry, ok := pgHashGeometry(in.innerRows, in.innerWidth, cp.workMem); ok {
+			unmatched := in.outerRows - outerMatched
+			if unmatched > 0 {
+				bucketTuples := clampRowEst(in.innerRows / float64(geometry.virtualBuckets))
+				run += cp.cpuOperatorCost * float64(in.numHashClauses) *
+					unmatched * bucketTuples * 0.05
+			}
+		}
 	} else if in.innerBucketSize > 0 {
 		bucketTuples := clampRowEst(in.innerRows * in.innerBucketSize)
 		run += cp.cpuOperatorCost * float64(in.numHashClauses) *

@@ -207,6 +207,7 @@ func addPartialHashJoinPath(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp 
 		numHashClauses:  len(keys),
 		innerBucketSize: bucket,
 		final:           final,
+		innerWidth:      pathWidth(i),
 		outerCols:       pathNCols(o), innerCols: pathNCols(i),
 		outerAvgVarBytes: pathAvgVarBytes(o), innerAvgVarBytes: pathAvgVarBytes(i),
 	})
