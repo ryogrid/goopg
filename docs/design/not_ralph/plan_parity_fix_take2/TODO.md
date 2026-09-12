@@ -4163,3 +4163,9 @@ not reached. No code changed. Required gates pass: optimizer/executor tests
 and vet, trace A/A, Q9/Q41/Q91/Q96 trace on/off controls, and Q96 PG value
 comparison. Next: review corrected report, then commit/push; only after that
 may a separately scoped R87 localise the L2 selectivity/cost input.
+R87 SCOPE READY 2026-09-12
+(`r87-q96-f-prefix-cost/SCOPE.md`): measure only the F-branch L2
+`ss⋈hd` versus `ss⋈store` selectivity/cardinality and partial Hash Join
+cost terms that create the 186.54 L2 / 53.21 L3 advantage for the non-PG
+prefix. No Gather/NLI execution support, GUC/default, estimator, or cost code
+is authorized. Next: agent review, commit/push SCOPE, then R87 measurement.
