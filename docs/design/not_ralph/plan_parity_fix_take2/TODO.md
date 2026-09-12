@@ -4379,3 +4379,10 @@ Partial by cost, value 266 in all three modes; census Q96 down to
 clean; TPC-H 24/24 PASS; SF0.25 PASS=96 all-zero; Q9/Q41/Q91
 identical, Q96 differs by design. Next: Q96 join-order distance, or
 another evidenced mismatch (separate scope).
+
+R96 SCOPE READY 2026-09-12 (`r96-q96-join-order/SCOPE.md`): Q96
+join-order Step-0 — P0 candidate-cost attribution for
+(ss⨝store)⨝hdem vs (ss⨝hdem)⨝store (rows agree modulo divisor;
+order preference unexplained, width-driven hash cost suspect),
+P1 slice menu. Implementation separate. Next: agent review, revise
+if needed, commit -n/push scope, then P0.
