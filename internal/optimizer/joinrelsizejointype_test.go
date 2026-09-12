@@ -183,9 +183,9 @@ func TestCalcJoinrelSizeSemiFKArm(t *testing.T) {
 		outer, inner := jrsRels(lineitemRaw, ordersRows)
 		rows, _ := s.calcJoinrelSize(c, outer, inner, []*restrictInfo{ri}, c05SJI(parser.JoinSemi))
 		wantRows(t, rows, clampRowEst(lineitemRaw*semiSelNoFK), "SEMI with a unique inner and no FK")
-		// ...while the same evidence DOES fire for INNER (the P5.6-b rule).
+		// For INNER it remains ordinary equality too; unique is bound-only.
 		innerRows, _ := s.calcJoinrelSize(c, outer, inner, []*restrictInfo{ri}, nil)
-		wantRows(t, innerRows, clampRowEst(lineitemRaw*ordersRows/ordersRaw), "INNER with a unique inner")
+		wantRows(t, innerRows, lineitemRaw, "INNER with a unique inner")
 	})
 	t.Run("declared FK, two-relation inner: punt", func(t *testing.T) {
 		c, s, ri := build(t, true, false)

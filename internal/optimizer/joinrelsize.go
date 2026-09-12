@@ -21,27 +21,17 @@ package optimizer
 //	jselec  = clauselist_selectivity(restrictlist)             // what's left
 //	rows    = clamp_row_est(outer_rows * inner_rows * fkselec * jselec)
 //
-// The two-step structure is the point, not an implementation detail. A join
-// whose key columns are covered by a UNIQUE/FK key does not fan out at all, and
-// the per-clause `eqjoinsel` of P5.6-a cannot express that: it prices each
-// clause independently, so an (a,b) composite key equated column-by-column is
-// charged 1/nd_a · 1/nd_b — a product of two marginal distincts that is far
-// smaller than the 1/ntuples the key actually implies. Removing the covered
-// clauses and substituting ONE 1/ntuples is how upstream avoids exactly that,
-// and it is the mechanism 04 §3.1 names as the primary Q9 fix.
+// The two-step structure is the point, not an implementation detail. A
+// declared FK removes its covered clauses and contributes `1/ref_tuples`;
+// ordinary equality clauses remain in `jselec`. A bare UNIQUE key is different:
+// it proves an output ceiling (each row of the other side finds at most one key
+// row), but it does not prove a match fraction and therefore must not replace
+// equality selectivity with `1/ntuples`.
 //
-// WHERE goopg's evidence differs from PG's, and why that is a deliberate
-// extension rather than a divergence: PG derives the no-fan-out from
-// `root->fkey_list` (declared foreign keys) and — for SINGLE-column keys only
-// (`has_unique_index`, plancat.c:2244 requires `nkeycolumns == 1`) — from
-// `vardata->isunique`. Neither reaches Q9's two-column `partsupp` PK, and the
-// loaded TPC-H/TPC-DS data declares no FKs at all, so PG's own machinery would
-// find no evidence here whatsoever. goopg therefore accepts a COMPOSITE unique
-// index as the same evidence upstream accepts a composite FK for, which is the
-// substitution cost-model/14 §2 argued for and which reproduces
-// `get_variable_numdistinct`'s `isunique ⇒ nd = ntuples` on the key as a whole.
-// The declared-FK arm is implemented beside it for schemas that do declare
-// them.
+// PG derives FK selectivity from `root->fkey_list` (declared foreign keys).
+// goopg also recognises composite unique indexes, including ones PG's
+// single-column `has_unique_index` cannot see, but only as structural bounds.
+// Partial unique indexes are excluded until predicate implication is available.
 //
 // M0127-P5.6-c added the two CLAMPS that sit after that product (04 §3.3), and
 // they are deliberately not one mechanism:
@@ -310,17 +300,19 @@ func (s *searchCtx) calcJoinrelSize(cat catalog.Catalog, outer, inner *RelOptInf
 type superkeyEstimate struct {
 	sel      float64
 	residual []*restrictInfo
-	// fired reports that at least one key was proven and its clauses removed.
+	// fired reports a declared FK whose clauses were removed.
 	fired bool
+	// boundProven records a structural bare-unique or FK output ceiling.
+	boundProven bool
 	// rowsBound is the tightest STRUCTURAL upper bound on the joinrel's output
 	// implied by the proven keys, or +Inf when none is provable.
 	rowsBound float64
 }
 
-// superkeyJoinSelectivity is `get_foreign_key_join_selectivity` (costsize.c:5651)
-// over goopg's evidence: it removes from the clause list every clause covered
-// by a proven key on one side of the join, and returns 1/(that side's RAW tuple
-// count) in their place, multiplied over each key it can prove.
+// superkeyJoinSelectivity applies `get_foreign_key_join_selectivity`
+// (costsize.c:5651) to declared FK evidence, while separately recording every
+// bare-unique structural bound. Only FK-covered clauses are removed and
+// replaced with 1/(referenced RAW tuple count); bare-unique clauses remain.
 //
 // Three properties of upstream's function are reproduced deliberately:
 //
@@ -343,11 +335,10 @@ type superkeyEstimate struct {
 //     chicken-out branch, and the same double-count the EC rule prevents one
 //     level up.
 //
-// Where several keys are provable at once, the one with the LARGEST raw count
-// is applied first. That is the tightest of the available bounds, which is the
-// same choice `eqjoinsel` makes when it divides by max(nd_l, nd_r) (P5.6-a): a
-// key on either side gives an upper bound on the join's size and the estimate
-// is the minimum of the bounds, not their average.
+// Where several FK candidates are provable at once, the one with the LARGEST
+// raw referenced count is applied first. Bare-unique candidates are not
+// ordered this way: their bounds use the opposite side's post-filter rows, so
+// every candidate is inspected and the minimum sound bound retained.
 func (s *searchCtx) superkeyJoinSelectivity(cat catalog.Catalog, outer, inner *RelOptInfo, clauses []*restrictInfo, jt parser.JoinType) superkeyEstimate {
 	est := superkeyEstimate{sel: 1.0, residual: clauses, rowsBound: math.Inf(1)}
 	if cat == nil || len(clauses) == 0 {
@@ -394,10 +385,21 @@ func (s *searchCtx) superkeyJoinSelectivity(cat catalog.Catalog, outer, inner *R
 		return k.fromFK && inner.Relids == RelSet(1)<<uint(k.keyRel)
 	}
 
-	// Greedy, largest-divisor-first, until no further key can be proven over
-	// the clauses that are still available.
+	// A bare UNIQUE key is a structural bound, not a foreign-key selectivity
+	// substitution. Examine every candidate over the intact clause set: two
+	// opposite unique keys may share all clauses yet imply different post-filter
+	// bounds, and raw tuple order does not identify the tighter one.
+	for _, best := range s.provableKeys(cat, pairs, make([]bool, len(clauses)), func(k provenKey) bool { return !k.fromFK }) {
+		if b, ok := keyImpliedRowsBound(outer, inner, best.keyRel); ok && b < est.rowsBound {
+			est.rowsBound, est.boundProven = b, true
+		}
+	}
+
+	// Greedy, largest-divisor-first, over declared FKs only.
 	for {
-		best, ok := s.bestProvableKey(cat, pairs, removed, admit)
+		best, ok := s.bestProvableKey(cat, pairs, removed, func(k provenKey) bool {
+			return k.fromFK && admit(k)
+		})
 		if !ok {
 			break
 		}
@@ -411,7 +413,7 @@ func (s *searchCtx) superkeyJoinSelectivity(cat catalog.Catalog, outer, inner *R
 		}
 		est.sel *= 1.0 / best.rawTuples
 		if b, ok := keyImpliedRowsBound(outer, inner, best.keyRel); ok && b < est.rowsBound {
-			est.rowsBound = b
+			est.rowsBound, est.boundProven = b, true
 		}
 	}
 
@@ -564,6 +566,22 @@ type provenKey struct {
 // `admit` filters the candidates — C-05's SEMI/ANTI rule lives in the caller,
 // where the jointype and the inner relset are known.
 func (s *searchCtx) bestProvableKey(cat catalog.Catalog, pairs []joinKeyPair, removed []bool, admit func(provenKey) bool) (provenKey, bool) {
+	candidates := s.provableKeys(cat, pairs, removed, admit)
+	var best provenKey
+	found := false
+	for _, cand := range candidates {
+		if !found || cand.rawTuples > best.rawTuples {
+			best, found = cand, true
+		}
+	}
+	return best, found
+}
+
+// provableKeys enumerates every applicable key over the given available
+// clauses. It deliberately does not impose the FK pass's largest-divisor
+// ordering: a bare unique key uses the same evidence only for a row bound,
+// whose tightness is determined by post-filter rows rather than raw tuples.
+func (s *searchCtx) provableKeys(cat catalog.Catalog, pairs []joinKeyPair, removed []bool, admit func(provenKey) bool) []provenKey {
 	// equated[r] = the columns of base relation r that a still-available
 	// clause equates to something on the other side of this join.
 	equated := make(map[int]map[string]bool)
@@ -579,8 +597,7 @@ func (s *searchCtx) bestProvableKey(cat catalog.Catalog, pairs []joinKeyPair, re
 		}
 	}
 
-	var best provenKey
-	found := false
+	var out []provenKey
 	for r := 0; r < len(s.relInfos); r++ {
 		cols := equated[r]
 		if len(cols) == 0 {
@@ -590,12 +607,10 @@ func (s *searchCtx) bestProvableKey(cat catalog.Catalog, pairs []joinKeyPair, re
 			if admit != nil && !admit(cand) {
 				continue
 			}
-			if !found || cand.rawTuples > best.rawTuples {
-				best, found = cand, true
-			}
+			out = append(out, cand)
 		}
 	}
-	return best, found
+	return out
 }
 
 // keysCovering enumerates every key of base relation `r` whose columns are
@@ -628,7 +643,7 @@ func (s *searchCtx) keysCovering(cat catalog.Catalog, r int, cols map[string]boo
 	rawTuples := float64(info.baseRows)
 	if rawTuples >= 1 {
 		for _, idx := range cat.IndexesOnTable(info.table) {
-			if idx == nil || !idx.Unique || !columnsSubset(idx.Columns, cols) {
+			if idx == nil || !idx.Unique || idx.HasPredicate || !columnsSubset(idx.Columns, cols) {
 				continue
 			}
 			covered := coveringClauses(pairs, removed, r, idx.Columns)

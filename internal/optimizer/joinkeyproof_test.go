@@ -8,17 +8,16 @@ package optimizer
 // [04](../../docs/design/leftdeep-joins/04-cost-and-cardinality.md) §3.1/§3.3,
 // [09](../../docs/design/leftdeep-joins/09-verification-and-acceptance.md) §5.4.
 //
-// The measured shape these tests are built around is Q9's, because it is the
-// one 09 §5.4 attributed: `lineitem ⋈ partsupp` on
-// `l_suppkey = ps_suppkey AND l_partkey = ps_partkey`, actual 5 997 241 rows.
-// Three numbers matter and the tests name all three:
+// The measured shape these tests are built around is Q9's:
+// `lineitem ⋈ partsupp` on `l_suppkey = ps_suppkey AND
+// l_partkey = ps_partkey`. Three numbers distinguish the evidence kinds:
 //
 //	 481 M — pricing ONE pair while the residual excludes BOTH (the defect)
 //	   2.4 k — pricing both pairs as independent marginals (half 1 alone)
 //	   6.0 M — one 1/ntuples for the composite key as a whole (both halves)
 //
-// The middle number is why the halves cannot land separately: half 1 on its own
-// is a bigger error than the defect it fixes, in the other direction.
+// A bare unique key retains the middle, ordinary-equality value while adding
+// only a structural ceiling. A declared FK may use the final substitution.
 
 import (
 	"testing"
@@ -110,14 +109,62 @@ func TestEstimateJoinSinglePairUnchanged(t *testing.T) {
 	}
 }
 
-// --- half 2: the composite key replaces the product of marginals -----------
+// TestEstimateJoinBareUniqueRetainsNullAwareEquality is the completed-plan
+// half of R88. A bare unique key is a bound, so its equality must still charge
+// both nullable operands through eqjoinsel's no-MCV arm.
+func TestEstimateJoinBareUniqueRetainsNullAwareEquality(t *testing.T) {
+	left := keyProofScan("fact", 1000, []keyProofCol{{"fk", 1000}})
+	right := keyProofScan("dim", 1000, []keyProofCol{{"id", 1000}}, []string{"id"})
+	left.Table.Stats.Columns[0].NullFrac = 0.2
+	right.Table.Stats.Columns[0].NullFrac = 0.1
+	j := keyedPairs(mergedJoin(JoinTypeInner, left, right), [2]int{0, 0})
+	if got, want := EstimateRows(j), int64(720); got != want {
+		t.Fatalf("bare-unique nullable estimate = %d, want %d ((1-.2)(1-.1)×1000)", got, want)
+	}
+}
 
-func TestCompositeUniqueKeyReplacesProductOfMarginals(t *testing.T) {
+// TestEstimateJoinMCVDoesNotApplyNullComplementTwice keeps the MCV branch
+// separate from the no-MCV `pairNullSelectivity` arm. Each side's one MCV
+// accounts for all non-null mass, so its matched frequency is already .9*.9.
+func TestEstimateJoinMCVDoesNotApplyNullComplementTwice(t *testing.T) {
+	left := keyProofScan("left", 1000, []keyProofCol{{"k", 2}})
+	right := keyProofScan("right", 1000, []keyProofCol{{"k", 2}})
+	left.Table.Stats.Columns[0].NullFrac = 0.1
+	left.Table.Stats.Columns[0].MCV = []catalog.MCVEntry{{Value: "a", Frequency: 0.9}}
+	right.Table.Stats.Columns[0].NullFrac = 0.1
+	right.Table.Stats.Columns[0].MCV = []catalog.MCVEntry{{Value: "a", Frequency: 0.9}}
+	j := keyedPairs(mergedJoin(JoinTypeInner, left, right), [2]int{0, 0})
+	if got, want := EstimateRows(j), int64(810000); got != want {
+		t.Fatalf("MCV estimate = %d, want %d (.9*.9 without another null factor)", got, want)
+	}
+}
+
+// --- half 2: a bare composite key remains ordinary selectivity ------------
+
+func TestCompositeUniqueKeyRetainsProductOfMarginals(t *testing.T) {
 	j := q9Shape([]string{"ps_partkey", "ps_suppkey"})
-	// One 1/ntuples for the key as a whole: 6 001 215 · 800 000 / 800 000.
-	// Actual for this joinrel is 5 997 241 — 1.0007× out.
-	if got, want := EstimateRows(j), int64(6001215); got != want {
-		t.Fatalf("superkey estimate = %d, want %d (l·r/raw(partsupp))", got, want)
+	// A UNIQUE index bounds fan-out but is not a declared FK: retain both
+	// ordinary equality clauses rather than replacing them with 1/raw rows.
+	if got, want := EstimateRows(j), int64(2400); got != want {
+		t.Fatalf("bare-unique estimate = %d, want %d (ordinary pair product)", got, want)
+	}
+}
+
+// TestEstimateJoinBareCompositeUniqueDefaultsKeepEqualityAndBound proves the
+// two independent outcomes when per-column NDVs are unavailable: the two
+// equalities remain ordinary default factors, while the fully covered key still
+// supplies a structural ceiling. `boundProven` is what makes estimateJoin take
+// that ceiling even though no FK clause was consumed.
+func TestEstimateJoinBareCompositeUniqueDefaultsKeepEqualityAndBound(t *testing.T) {
+	left := keyProofScan("probe", 1000000, []keyProofCol{{"a", 0}, {"b", 0}})
+	right := keyProofScan("keyed", 1000000, []keyProofCol{{"a", 0}, {"b", 0}}, []string{"a", "b"})
+	j := keyedPairs(mergedJoin(JoinTypeInner, left, right), [2]int{0, 0}, [2]int{1, 1})
+	sk := superkeyJoinEstimate(j, joinEquiPairs(j))
+	if !sk.boundProven || sk.fired || len(sk.covered) != 2 || sk.covered[0] || sk.covered[1] {
+		t.Fatalf("bare composite proof = %+v; want bound-only evidence with both equalities retained", sk)
+	}
+	if got, want := EstimateRows(j), int64(1000000); got != want {
+		t.Fatalf("default-NDV composite estimate = %d, want structural bound %d", got, want)
 	}
 }
 
@@ -125,10 +172,10 @@ func TestCompositeUniqueKeyReplacesProductOfMarginals(t *testing.T) {
 // equates (suppkey, partkey) and the index is declared (partkey, suppkey). A
 // key is a SET for this purpose — matching positionally would silently stop
 // proving anything on real schemas.
-func TestSuperkeyFiresOnKeyColumnOrderIndependently(t *testing.T) {
+func TestBareUniqueBoundRecognisesKeyColumnOrderIndependently(t *testing.T) {
 	reversed := q9Shape([]string{"ps_suppkey", "ps_partkey"})
-	if got, want := EstimateRows(reversed), int64(6001215); got != want {
-		t.Fatalf("estimate = %d, want %d — declared key order must not matter", got, want)
+	if got, want := EstimateRows(reversed), int64(2400); got != want {
+		t.Fatalf("estimate = %d, want %d — unique key order must not matter", got, want)
 	}
 }
 
@@ -182,7 +229,7 @@ func TestSuperkeyDoesNotComposeAcrossASelfJoin(t *testing.T) {
 // each aggregate row still matches at most one `partsupp` row. Demanding both
 // ends (the mechanism's first shape) threw that proof away and priced the join
 // at 283 against 236 624 actual.
-func TestSuperkeyFiresWhenOnlyTheKeySideResolves(t *testing.T) {
+func TestBareUniqueBoundNeedsASoleKeySide(t *testing.T) {
 	partsupp := keyProofScan("partsupp", 800000, []keyProofCol{
 		{"ps_partkey", 200000}, {"ps_suppkey", 10000},
 	}, []string{"ps_partkey", "ps_suppkey"})
@@ -191,8 +238,9 @@ func TestSuperkeyFiresWhenOnlyTheKeySideResolves(t *testing.T) {
 		GroupExprs: []Expr{jrCol(0), jrCol(1)},
 	}
 	j := keyedPairs(mergedJoin(JoinTypeInner, partsupp, grouped), [2]int{0, 0}, [2]int{1, 1})
-	// The proof divides by partsupp's raw count, and the structural bound
-	// then caps the result at what the other side brings.
+	// The composite index establishes only a ceiling. With no far-side base
+	// stats, ordinary equality remains conservative rather than becoming FK
+	// selectivity.
 	other := EstimateRows(grouped)
 	got := EstimateRows(j)
 	if got > other {
@@ -200,8 +248,8 @@ func TestSuperkeyFiresWhenOnlyTheKeySideResolves(t *testing.T) {
 	}
 	// Without the proof this is 800 000·|agg|/(200 000·10 000) — three orders
 	// of magnitude below the other side's row count.
-	if got < other/10 {
-		t.Fatalf("estimate %d collapsed to the product of marginals (other side %d)", got, other)
+	if got >= other/10 {
+		t.Fatalf("estimate %d did not retain ordinary equality (other side %d)", got, other)
 	}
 }
 
@@ -226,6 +274,21 @@ func TestKeyImpliedRowsBoundCapsTheProbeSide(t *testing.T) {
 	}
 }
 
+// TestBareUniqueBoundsInspectBothSides pins the candidate-selection subtlety:
+// raw tuple order is irrelevant to a structural bound, which uses the other
+// side's post-filter rows. The larger-raw left key caps at 1.5m, but the right
+// key yields the tighter valid 1m ceiling.
+func TestBareUniqueBoundsInspectBothSides(t *testing.T) {
+	cols := []keyProofCol{{"a", 1}, {"b", 1}}
+	leftBase := keyProofScan("left", 6000000, cols, []string{"a", "b"})
+	left := &Limit{Child: leftBase, Limit: &IntegerConst{Value: 1000000}}
+	right := keyProofScan("right", 1500000, cols, []string{"a", "b"})
+	j := keyedPairs(mergedJoin(JoinTypeInner, left, right), [2]int{0, 0}, [2]int{1, 1})
+	if got, want := EstimateRows(j), int64(1000000); got != want {
+		t.Fatalf("two unique-key bounds estimate = %d, want tighter post-filter bound %d", got, want)
+	}
+}
+
 // --- declared foreign keys ------------------------------------------------
 
 // TestDeclaredForeignKeyDividesByTheParentRawCount pins the asymmetry that
@@ -238,11 +301,15 @@ func TestDeclaredForeignKeyDividesByTheParentRawCount(t *testing.T) {
 	child.Table.ForeignKeys = []catalog.ForeignKey{{
 		Columns: []string{"o_custkey"}, RefTable: "customer", RefColumns: []string{"c_custkey"},
 	}}
-	parent := keyProofScan("customer", 150000, []keyProofCol{{"c_custkey", 150000}})
+	parent := keyProofScan("customer", 150000, []keyProofCol{{"c_custkey", 150000}}, []string{"c_custkey"})
 	j := keyedPairs(mergedJoin(JoinTypeInner, child, parent), [2]int{1, 0})
+	sk := superkeyJoinEstimate(j, joinEquiPairs(j))
+	if !sk.fired || len(sk.covered) != 1 || !sk.covered[0] || sk.sel != 1.0/150000.0 {
+		t.Fatalf("overlapping FK proof = %+v; want FK clause consumption at 1/ref_tuples", sk)
+	}
 	// 1 500 000 · 150 000 / 150 000 — the child's rows, unchanged.
 	if got, want := EstimateRows(j), int64(1500000); got != want {
-		t.Fatalf("FK estimate = %d, want %d (divide by the PARENT's raw count)", got, want)
+		t.Fatalf("FK estimate = %d, want %d (the overlapping bare unique key must not hide FK selectivity)", got, want)
 	}
 }
 
@@ -281,6 +348,7 @@ func TestUniqueKeyColumnSetsTakesOnlyUniqueIndexes(t *testing.T) {
 	tbl := &catalog.Table{Name: "partsupp"}
 	cat := &stubIndexCatalog{indexes: []*catalog.Index{
 		{Name: "partsupp_pk", Unique: true, Columns: []string{"ps_partkey", "ps_suppkey"}},
+		{Name: "partsupp_partial_uq", Unique: true, HasPredicate: true, Columns: []string{"ps_partkey"}},
 		{Name: "partsupp_part_fkidx", Unique: false, Columns: []string{"ps_partkey"}},
 		{Name: "empty", Unique: true},
 	}}

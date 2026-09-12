@@ -28,11 +28,10 @@ package optimizer
 // `joinResidualSelectivity` excluded BOTH, so the joinrel read
 // `6M · 800k / 10 000 = 481M` against an actual `5 997 241` and the search put
 // it below the `part` filter instead of above it (09 §5.4). Pricing every pair
-// the way `clauselist_selectivity` does swings it the OTHER way — the two
-// marginal distincts multiply to `1/(200 000 · 10 000)`, i.e. ≈ 2 rows — which
-// is exactly the error upstream avoids by removing the covered clauses and
-// substituting ONE `1/ntuples` for the key as a whole. The two halves are one
-// change; landing either alone is a measured regression.
+// the way `clauselist_selectivity` does instead gives the ordinary marginal
+// estimate; R88 keeps that selectivity even when a bare composite unique key
+// proves a no-fan-out ceiling. Only a declared FK may remove the equality
+// pairs and substitute `1/ref_tuples`.
 
 import (
 	"math"
@@ -59,7 +58,9 @@ func uniqueKeyColumnSets(cat catalog.Catalog, tbl *catalog.Table) [][]string {
 	}
 	var out [][]string
 	for _, idx := range cat.IndexesOnTable(tbl) {
-		if idx == nil || !idx.Unique || len(idx.Columns) == 0 {
+		// Without predicate implication, a partial unique index does not
+		// prove that the whole scan output is unique.
+		if idx == nil || !idx.Unique || idx.HasPredicate || len(idx.Columns) == 0 {
 			continue
 		}
 		cols := make([]string, len(idx.Columns))
@@ -511,7 +512,11 @@ func soleBaseScan(n Node) Node {
 type joinSuperkeyEstimate struct {
 	sel     float64
 	covered []bool
-	fired   bool
+	// fired means a declared-FK selectivity substitution consumed clauses.
+	fired bool
+	// boundProven is independent: a bare unique key can establish a sound
+	// ceiling while leaving its equality in ordinary selectivity accounting.
+	boundProven bool
 	// rowsBound is the tightest STRUCTURAL upper bound on the join's output
 	// implied by the proven keys, or +Inf when none is provable.
 	rowsBound float64
@@ -535,19 +540,18 @@ type resolvedPair struct {
 	leftOK, rightOK bool
 }
 
-// superkeyJoinEstimate is `get_foreign_key_join_selectivity` over a finished
-// `*Join`: it removes from `pairs` every pair covered by a proven key on one
-// side and returns 1/(that side's RAW tuple count) in their place, multiplied
-// over each key it can prove.
+// superkeyJoinEstimate applies FK selectivity over a finished `*Join` and
+// separately discovers bare-unique structural bounds. Only a declared FK
+// removes its covered pairs and contributes 1/(referenced RAW tuple count);
+// a bare unique key leaves its equality pairs for ordinary selectivity.
 //
 // The three properties reproduced from upstream are spelled out in
 // joinrelsize.go's `superkeyJoinSelectivity` header and hold identically here:
-// the divisor is the RAW count; the WHOLE key must be covered ("if we failed to
-// remove all the matching clauses we expected to find, chicken out",
-// costsize.c:5760) while the CLAUSE list may be partial; and a pair is consumed
-// once, so two overlapping keys cannot both charge for it. Largest divisor
-// first, because a key on either side gives an upper bound and the estimate is
-// the minimum of the available bounds.
+// the FK divisor is the RAW count; the WHOLE key must be covered ("if we
+// failed to remove all the matching clauses we expected to find, chicken out",
+// costsize.c:5760) while the CLAUSE list may be partial; and an FK pair is
+// consumed once. Bare-unique candidates are all inspected because their bounds
+// depend on opposite-side post-filter rows rather than divisor order.
 func superkeyJoinEstimate(j *Join, pairs []JoinKeyPair) joinSuperkeyEstimate {
 	est := joinSuperkeyEstimate{sel: 1.0, covered: make([]bool, len(pairs)), rowsBound: math.Inf(1)}
 	if j == nil || j.Left == nil || j.Right == nil || len(pairs) == 0 {
@@ -590,8 +594,17 @@ func superkeyJoinEstimate(j *Join, pairs []JoinKeyPair) joinSuperkeyEstimate {
 	leftSole := soleBaseScan(j.Left)
 	rightSole := soleBaseScan(j.Right)
 
+	// Bare UNIQUE evidence is bound-only. Examine every candidate over the
+	// intact pairs: shared pairs can establish distinct post-filter bounds, and
+	// the FK pass below must see the original pair set as well.
+	for _, key := range provableJoinKeys(resolved, make([]bool, len(pairs)), func(k provenJoinKey) bool { return !k.fromFK }) {
+		if b, ok := joinKeyRowsBound(key, leftSole, rightSole, j); ok && b < est.rowsBound {
+			est.rowsBound, est.boundProven = b, true
+		}
+	}
+
 	for {
-		key, ok := bestProvableJoinKey(resolved, est.covered)
+		key, ok := bestProvableJoinKey(resolved, est.covered, func(k provenJoinKey) bool { return k.fromFK })
 		if !ok {
 			break
 		}
@@ -600,22 +613,8 @@ func superkeyJoinEstimate(j *Join, pairs []JoinKeyPair) joinSuperkeyEstimate {
 		}
 		est.sel *= 1.0 / key.rawTuples
 		est.fired = true
-		// The key-implied bound (04 §3.3): every row of the OTHER side
-		// matches at most one row of the key relation, so the join cannot
-		// emit more rows than the other side brings — but only when the key
-		// relation IS that whole side. `Rows` there is the POST-filter
-		// estimate, because the rows it will actually bring are the ones
-		// that survived its quals; unlike the DIVISOR (a match fraction,
-		// hence raw) this is a count of probes.
-		switch {
-		case key.keyScan != nil && key.keyScan == leftSole:
-			if b := float64(EstimateRows(j.Right)); b < est.rowsBound {
-				est.rowsBound = b
-			}
-		case key.keyScan != nil && key.keyScan == rightSole:
-			if b := float64(EstimateRows(j.Left)); b < est.rowsBound {
-				est.rowsBound = b
-			}
+		if b, ok := joinKeyRowsBound(key, leftSole, rightSole, j); ok && b < est.rowsBound {
+			est.rowsBound, est.boundProven = b, true
 		}
 	}
 	est.sel = clampSelectivity(est.sel)
@@ -633,12 +632,45 @@ type provenJoinKey struct {
 	pairs     []int
 	rawTuples float64
 	keyScan   Node
+	fromFK    bool
+}
+
+// joinKeyRowsBound is the plan-node counterpart of keyImpliedRowsBound. A key
+// bounds a join only when its scan is the whole input side; a join below it may
+// otherwise already have duplicated its key rows.
+func joinKeyRowsBound(key provenJoinKey, leftSole, rightSole Node, j *Join) (float64, bool) {
+	if j == nil {
+		return 0, false
+	}
+	switch {
+	case key.keyScan != nil && key.keyScan == leftSole:
+		return float64(EstimateRows(j.Right)), true
+	case key.keyScan != nil && key.keyScan == rightSole:
+		return float64(EstimateRows(j.Left)), true
+	}
+	return 0, false
 }
 
 // bestProvableJoinKey finds the key with the largest divisor over the pairs not
 // yet consumed. Scans are visited in pair order and each scan's candidate keys
 // in stamped (catalog) order, so the answer does not move between runs.
-func bestProvableJoinKey(resolved []resolvedPair, covered []bool) (provenJoinKey, bool) {
+func bestProvableJoinKey(resolved []resolvedPair, covered []bool, admit func(provenJoinKey) bool) (provenJoinKey, bool) {
+	candidates := provableJoinKeys(resolved, covered, admit)
+	var best provenJoinKey
+	found := false
+	for _, cand := range candidates {
+		if !found || cand.rawTuples > best.rawTuples {
+			best, found = cand, true
+		}
+	}
+	return best, found
+}
+
+// provableJoinKeys enumerates the candidate evidence over the currently
+// available pairs. The FK pass chooses its largest raw-tuple divisor; bare
+// unique bounds instead inspect every candidate because their tightness comes
+// from the opposite side's post-filter rows.
+func provableJoinKeys(resolved []resolvedPair, covered []bool, admit func(provenJoinKey) bool) []provenJoinKey {
 	// equated[scan] = the columns of that relation instance which a still
 	// available pair equates to something on the other side of this join.
 	type scanState struct {
@@ -668,15 +700,15 @@ func bestProvableJoinKey(resolved []resolvedPair, covered []bool) (provenJoinKey
 		}
 	}
 
-	var best provenJoinKey
-	found := false
+	var out []provenJoinKey
 	consider := func(cand provenJoinKey) {
 		if cand.rawTuples < 1 || len(cand.pairs) == 0 {
 			return
 		}
-		if !found || cand.rawTuples > best.rawTuples {
-			best, found = cand, true
+		if admit != nil && !admit(cand) {
+			return
 		}
+		out = append(out, cand)
 	}
 	for _, scan := range order {
 		st := state[scan]
@@ -716,10 +748,11 @@ func bestProvableJoinKey(resolved []resolvedPair, covered []bool) (provenJoinKey
 				pairs:     coveringJoinPairs(resolved, covered, scan, fk.Columns),
 				rawTuples: parent.rawRows,
 				keyScan:   parent.scan,
+				fromFK:    true,
 			})
 		}
 	}
-	return best, found
+	return out
 }
 
 // coveringJoinPairs returns the indexes of the still-available pairs that

@@ -636,7 +636,7 @@ func estimateJoin(j *Join) int64 {
 		pairs := joinEquiPairs(j)
 		sk := superkeyJoinEstimate(j, pairs)
 		sel := sk.sel
-		measured := sk.fired
+		measured := sk.fired || sk.boundProven
 		for i, p := range pairs {
 			if i < len(sk.covered) && sk.covered[i] {
 				continue
@@ -653,13 +653,13 @@ func estimateJoin(j *Join) int64 {
 				sel *= mcvSel
 				measured = true
 			} else if nd := pairNDistinct(j, p); nd > 0 {
-				sel /= float64(nd)
+				sel *= pairNullSelectivity(j, p) / float64(nd)
 				measured = true
 			} else {
 				// `clauselist_selectivity` charges an unmeasurable
 				// equijoin the selfuncs.h constant and multiplies it in
 				// with the rest; it does not abandon the measured pairs.
-				sel *= defaultEqSelectivity
+				sel *= defaultEqSelectivity * pairNullSelectivity(j, p)
 			}
 		}
 		if measured {
@@ -985,6 +985,19 @@ func pairNDistinct(j *Join, p JoinKeyPair) int64 {
 		nd = rnd
 	}
 	return nd
+}
+
+// pairNullSelectivity is eqjoinsel's no-MCV strict-operator factor. The MCV
+// arm already accounts for non-null mass and must not call this helper.
+func pairNullSelectivity(j *Join, p JoinKeyPair) float64 {
+	sel := 1.0
+	if st := keyColumnStats(p.Left, j.Left); st != nil {
+		sel *= 1 - st.NullFrac
+	}
+	if st := rightExprStats(j, p.Right); st != nil {
+		sel *= 1 - st.NullFrac
+	}
+	return clampProbability(sel)
 }
 
 // joinEquiPairs is the join's FULL equi-key list in the coordinate space

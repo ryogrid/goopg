@@ -111,16 +111,9 @@ func TestCalcJoinrelSizeEqjoinselShape(t *testing.T) {
 	}
 }
 
-// TestCalcJoinrelSizeCompositeUniqueNoFanout: the primary Q9 fix. Both columns
-// of `partsupp`'s composite PK are equated, so each `lineitem` row matches at
-// most one `partsupp` row and the join does not fan out: the two clauses are
-// REMOVED and replaced by 1/800000, PG's `get_foreign_key_join_selectivity`
-// shape applied to unique-index evidence (cost-model/14 §2).
-//
-// The assertion is against the per-clause answer as well as against the
-// absolute number, because "smaller than the marginal product" is the property
-// that actually matters — the marginals here are wrong by a factor of 2.5e6.
-func TestCalcJoinrelSizeCompositeUniqueNoFanout(t *testing.T) {
+// TestCalcJoinrelSizeCompositeUniqueRetainsEqualities: bare uniqueness proves
+// a ceiling but is not a declared-FK selectivity substitution.
+func TestCalcJoinrelSizeCompositeUniqueRetainsEqualities(t *testing.T) {
 	c, partsupp, lineitem := jrsCatalog(t)
 	if _, err := c.CreateIndex(parser.ObjectName{Name: "partsupp_pkey"}, partsupp,
 		[]string{"ps_partkey", "ps_suppkey"}, true, "btree", true); err != nil {
@@ -134,12 +127,8 @@ func TestCalcJoinrelSizeCompositeUniqueNoFanout(t *testing.T) {
 		jrsEq("l_suppkey", "ps_suppkey", noEquivClass),
 	}
 	rows, _ := s.calcJoinrelSize(c, outer, inner, clauses, nil)
-	wantRows(t, rows, 6000000, "composite unique key covered")
-
 	marginal := clampRowEst(6000000.0 * 800000.0 / 200000.0 / 10000.0)
-	if rows <= marginal {
-		t.Fatalf("rows=%v is not above the marginal-product answer %v — the key never fired", rows, marginal)
-	}
+	wantRows(t, rows, marginal, "composite unique retains both equalities")
 }
 
 // TestCalcJoinrelSizePartialKeyDoesNotFire: PG's chicken-out (costsize.c:5760).
@@ -178,16 +167,12 @@ func TestCalcJoinrelSizeSuperkeySubsetLeavesResidual(t *testing.T) {
 		jrsEq("l_suppkey", "ps_suppkey", noEquivClass),
 	}
 	rows, _ := s.calcJoinrelSize(c, outer, inner, clauses, nil)
-	// 1/800000 for the covered key, then 1/10000 for the leftover equality.
-	wantRows(t, rows, clampRowEst(6000000.0*800000.0/800000.0/10000.0), "one-column key under a two-clause join")
+	wantRows(t, rows, clampRowEst(6000000.0*800000.0/200000.0/10000.0), "bare unique retains both clauses")
 }
 
-// TestCalcJoinrelSizeDividesByRawNotFilteredCount: PG is explicit that the
-// divisor is the raw table count, "not any estimate of its filtered or joined
-// size" (costsize.c:5852). Here the key side has been filtered to an eighth of
-// itself, and the join must produce that same eighth of the probing side — a
-// real match fraction — rather than all 6e6 rows.
-func TestCalcJoinrelSizeDividesByRawNotFilteredCount(t *testing.T) {
+// TestCalcJoinrelSizeBareUniqueDoesNotSubstituteRawCount verifies that an
+// unfiltered/filtered bare key does not acquire FK selectivity.
+func TestCalcJoinrelSizeBareUniqueDoesNotSubstituteRawCount(t *testing.T) {
 	c, partsupp, lineitem := jrsCatalog(t)
 	if _, err := c.CreateIndex(parser.ObjectName{Name: "partsupp_pkey"}, partsupp,
 		[]string{"ps_partkey", "ps_suppkey"}, true, "btree", true); err != nil {
@@ -201,7 +186,111 @@ func TestCalcJoinrelSizeDividesByRawNotFilteredCount(t *testing.T) {
 		jrsEq("l_suppkey", "ps_suppkey", noEquivClass),
 	}
 	rows, _ := s.calcJoinrelSize(c, outer, inner, clauses, nil)
-	wantRows(t, rows, 750000, "filtered key side")
+	wantRows(t, rows, clampRowEst(6000000.0*100000.0/200000.0/10000.0), "filtered bare unique retains equalities")
+}
+
+// TestCalcJoinrelSizeBareUniqueRetainsNullAwareEquality is the DP coordinate
+// space of the legacy nullable-key pin. Bare uniqueness proves only the
+// ceiling; the surviving equality must retain both strict-operator null
+// complements.
+func TestCalcJoinrelSizeBareUniqueRetainsNullAwareEquality(t *testing.T) {
+	c := catalog.NewInMemory()
+	fact := jsTable(t, c, "fact", []catalog.Column{{Name: "fk", Type: catalog.Type{Name: "int4"}}},
+		1000, catalog.ColumnStats{NDistinct: 1000, NullFrac: 0.2})
+	dim := jsTable(t, c, "dim", []catalog.Column{{Name: "id", Type: catalog.Type{Name: "int4"}}},
+		1000, catalog.ColumnStats{NDistinct: 1000, NullFrac: 0.1})
+	if _, err := c.CreateIndex(parser.ObjectName{Name: "dim_id_uq"}, dim, []string{"id"}, true, "btree", false); err != nil {
+		t.Fatal(err)
+	}
+	s, err := newSearchCtx(2, defaultCostParams(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.relInfos = []baseRelInfo{{table: fact, baseRows: 1000}, {table: dim, baseRows: 1000}}
+	outer, inner := jrsRels(1000, 1000)
+	rows, _ := s.calcJoinrelSize(c, outer, inner, []*restrictInfo{jrsEq("fk", "id", noEquivClass)}, nil)
+	wantRows(t, rows, 720, "bare unique nullable equality")
+}
+
+// TestCalcJoinrelSizeBareCompositeDefaultsKeepEqualityAndBound is the DP
+// counterpart of the completed-plan default-NDV pin. Full coverage must still
+// establish the bound, but its clauses stay in `residual` for ordinary
+// selectivity accounting.
+func TestCalcJoinrelSizeBareCompositeDefaultsKeepEqualityAndBound(t *testing.T) {
+	c := catalog.NewInMemory()
+	probe := jsTable(t, c, "probe", []catalog.Column{
+		{Name: "a", Type: catalog.Type{Name: "int4"}},
+		{Name: "b", Type: catalog.Type{Name: "int4"}},
+	}, 1000000, catalog.ColumnStats{}, catalog.ColumnStats{})
+	keyed := jsTable(t, c, "keyed", []catalog.Column{
+		{Name: "a", Type: catalog.Type{Name: "int4"}},
+		{Name: "b", Type: catalog.Type{Name: "int4"}},
+	}, 1000000, catalog.ColumnStats{}, catalog.ColumnStats{})
+	if _, err := c.CreateIndex(parser.ObjectName{Name: "keyed_ab_uq"}, keyed, []string{"a", "b"}, true, "btree", false); err != nil {
+		t.Fatal(err)
+	}
+	s, err := newSearchCtx(2, defaultCostParams(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.relInfos = []baseRelInfo{{table: probe, baseRows: 1000000}, {table: keyed, baseRows: 1000000}}
+	outer, inner := jrsRels(1000000, 1000000)
+	clauses := []*restrictInfo{jrsEq("a", "a", noEquivClass), jrsEq("b", "b", noEquivClass)}
+	est := s.superkeyJoinSelectivity(c, outer, inner, clauses, parser.JoinInner)
+	if !est.boundProven || est.fired || len(est.residual) != 2 {
+		t.Fatalf("bare composite proof = %+v; want bound-only evidence and two residual equalities", est)
+	}
+	rows, _ := s.calcJoinrelSize(c, outer, inner, clauses, nil)
+	wantRows(t, rows, 1000000, "default-NDV composite structural bound")
+}
+
+// TestCalcJoinrelSizeBareUniqueBoundsInspectBothSides is the search-space
+// counterpart of the completed-plan pin. The raw-larger left key's bound is
+// 1.5m, while the right key sees the left's filtered 1m rows and is tighter.
+func TestCalcJoinrelSizeBareUniqueBoundsInspectBothSides(t *testing.T) {
+	c := catalog.NewInMemory()
+	left := jsTable(t, c, "left", []catalog.Column{{Name: "a", Type: catalog.Type{Name: "int4"}}, {Name: "b", Type: catalog.Type{Name: "int4"}}},
+		6000000, catalog.ColumnStats{NDistinct: 1}, catalog.ColumnStats{NDistinct: 1})
+	right := jsTable(t, c, "right", []catalog.Column{{Name: "a", Type: catalog.Type{Name: "int4"}}, {Name: "b", Type: catalog.Type{Name: "int4"}}},
+		1500000, catalog.ColumnStats{NDistinct: 1}, catalog.ColumnStats{NDistinct: 1})
+	for _, spec := range []struct {
+		name string
+		tbl  *catalog.Table
+	}{{"left_k_uq", left}, {"right_k_uq", right}} {
+		if _, err := c.CreateIndex(parser.ObjectName{Name: spec.name}, spec.tbl, []string{"a", "b"}, true, "btree", false); err != nil {
+			t.Fatal(err)
+		}
+	}
+	s, err := newSearchCtx(2, defaultCostParams(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.relInfos = []baseRelInfo{{table: left, baseRows: 6000000}, {table: right, baseRows: 1500000}}
+	outer, inner := jrsRels(1000000, 1500000)
+	clauses := []*restrictInfo{jrsEq("a", "a", noEquivClass), jrsEq("b", "b", noEquivClass)}
+	est := s.superkeyJoinSelectivity(c, outer, inner, clauses, parser.JoinInner)
+	if !est.boundProven || est.rowsBound != 1000000 || est.fired || len(est.residual) != 2 {
+		t.Fatalf("two unique-key bounds = %+v; want tighter 1m bound and retained equalities", est)
+	}
+	rows, _ := s.calcJoinrelSize(c, outer, inner, clauses, nil)
+	wantRows(t, rows, 1000000, "tighter two-sided unique bound")
+}
+
+// TestCalcJoinrelSizePartialUniqueIndexIsNotEvidence declines a partial index
+// outright: without predicate implication, it cannot establish uniqueness of
+// the scan's full output.
+func TestCalcJoinrelSizePartialUniqueIndexIsNotEvidence(t *testing.T) {
+	c, partsupp, lineitem := jrsCatalog(t)
+	idx, err := c.CreateIndex(parser.ObjectName{Name: "partsupp_partial_uq"}, partsupp,
+		[]string{"ps_partkey"}, true, "btree", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	idx.HasPredicate = true
+	s := jrsCtx(t, lineitem, partsupp)
+	outer, inner := jrsRels(6000000, 800000)
+	rows, _ := s.calcJoinrelSize(c, outer, inner, []*restrictInfo{jrsEq("l_partkey", "ps_partkey", noEquivClass)}, nil)
+	wantRows(t, rows, clampRowEst(6000000.0*800000.0/200000.0), "partial unique falls back to equality")
 }
 
 // TestCalcJoinrelSizeFKDividesByParentCount: the declared-FK arm, and the one
@@ -224,6 +313,10 @@ func TestCalcJoinrelSizeFKDividesByParentCount(t *testing.T) {
 		Name: "lineitem_orderkey_fkey", Columns: []string{"l_orderkey"},
 		RefTable: "orders", RefColumns: []string{"o_orderkey"},
 	}}
+	if _, err := c.CreateIndex(parser.ObjectName{Name: "orders_pkey"}, orders,
+		[]string{"o_orderkey"}, true, "btree", true); err != nil {
+		t.Fatal(err)
+	}
 
 	s, err := newSearchCtx(2, defaultCostParams(), nil)
 	if err != nil {
@@ -235,8 +328,13 @@ func TestCalcJoinrelSizeFKDividesByParentCount(t *testing.T) {
 	}
 	outer, inner := jrsRels(6000000, 1500000)
 
-	rows, _ := s.calcJoinrelSize(c, outer, inner, []*restrictInfo{jrsEq("l_orderkey", "o_orderkey", noEquivClass)}, nil)
-	wantRows(t, rows, 6000000, "FK child joined to its parent")
+	clauses := []*restrictInfo{jrsEq("l_orderkey", "o_orderkey", noEquivClass)}
+	est := s.superkeyJoinSelectivity(c, outer, inner, clauses, parser.JoinInner)
+	if !est.fired || len(est.residual) != 0 || est.sel != 1.0/1500000.0 {
+		t.Fatalf("overlapping FK proof = %+v; want FK clause consumption at 1/ref_tuples", est)
+	}
+	rows, _ := s.calcJoinrelSize(c, outer, inner, clauses, nil)
+	wantRows(t, rows, 6000000, "FK child joined to its uniquely indexed parent")
 	if rows == clampRowEst(6000000.0*1500000.0/6000000.0) {
 		t.Fatal("the divisor was the CHILD's raw count — an FK bounds the join by the PARENT's")
 	}
@@ -394,7 +492,7 @@ func TestJoinRelBuilderSizesOnceAndAddsPaths(t *testing.T) {
 	if err != nil {
 		t.Fatalf("makeJoinRel: %v", err)
 	}
-	wantRows(t, joinrel.Rows, 6000000, "joinrel through the concrete builder")
+	wantRows(t, joinrel.Rows, 2400, "joinrel through the concrete builder")
 	if len(joinrel.Pathlist) == 0 {
 		t.Fatal("the builder added no paths — sizing and path generation are not bound together")
 	}
@@ -407,7 +505,7 @@ func TestJoinRelBuilderSizesOnceAndAddsPaths(t *testing.T) {
 	if again != joinrel {
 		t.Fatal("the second pair built a second RelOptInfo for one relset")
 	}
-	wantRows(t, again.Rows, 6000000, "joinrel after the mirror pair")
+	wantRows(t, again.Rows, 2400, "joinrel after the mirror pair")
 }
 
 // ---------------------------------------------------------------------------
@@ -420,16 +518,11 @@ func TestJoinRelBuilderSizesOnceAndAddsPaths(t *testing.T) {
 // statistics.
 // ---------------------------------------------------------------------------
 
-// TestCalcJoinrelSizeKeyBoundClampsStaleStats: the case the structural bound
-// exists for. A proven key normally makes the product land exactly ON the bound
-// (`|L|·|R_raw|/R_raw`), so the clamp is invisible — until the key side's row
-// ESTIMATE and its ANALYZE-time raw count disagree. Here `partsupp` has grown
-// 10× since it was analysed, so the divisor is a tenth of the rows the search
-// thinks it will read and the product claims 60M rows from a join in which each
-// of 6M `lineitem` rows can match at most one `partsupp` row.
-//
-// 6M is not a tighter guess than 60M; it is the largest number the join can
-// possibly produce.
+// TestCalcJoinrelSizeKeyBoundClampsStaleStats keeps the stale-statistics
+// structural proof visible after R88. `partsupp` has grown 10× since ANALYZE,
+// but its bare composite unique key still bounds output by the 6M probe rows.
+// The ordinary equality product is already 24k, below that ceiling, so R88
+// must retain it rather than substitute the former raw-key FK selectivity.
 func TestCalcJoinrelSizeKeyBoundClampsStaleStats(t *testing.T) {
 	c, partsupp, lineitem := jrsCatalog(t)
 	if _, err := c.CreateIndex(parser.ObjectName{Name: "partsupp_pkey"}, partsupp,
@@ -443,12 +536,12 @@ func TestCalcJoinrelSizeKeyBoundClampsStaleStats(t *testing.T) {
 		jrsEq("l_partkey", "ps_partkey", noEquivClass),
 		jrsEq("l_suppkey", "ps_suppkey", noEquivClass),
 	}
-	rows, _ := s.calcJoinrelSize(c, outer, inner, clauses, nil)
-	wantRows(t, rows, 6000000, "stale key-side statistics")
-
-	if unclamped := clampRowEst(6000000.0 * 8000000.0 / 800000.0); rows >= unclamped {
-		t.Fatalf("rows=%v was not clamped below the raw product %v", rows, unclamped)
+	est := s.superkeyJoinSelectivity(c, outer, inner, clauses, parser.JoinInner)
+	if !est.boundProven || est.rowsBound != 6000000 || est.fired || len(est.residual) != 2 {
+		t.Fatalf("stale bare-unique proof = %+v; want a 6m bound and retained equalities", est)
 	}
+	rows, _ := s.calcJoinrelSize(c, outer, inner, clauses, nil)
+	wantRows(t, rows, 24000, "stale bare-unique statistics retain equalities")
 }
 
 // TestCalcJoinrelSizeKeyBoundNeedsASingleRelKeySide: the soundness restriction,
@@ -487,7 +580,7 @@ func TestCalcJoinrelSizeKeyBoundNeedsASingleRelKeySide(t *testing.T) {
 		jrsEq("l_suppkey", "ps_suppkey", noEquivClass),
 	}
 	rows, _ := s.calcJoinrelSize(c, outer, inner, clauses, nil)
-	wantRows(t, rows, clampRowEst(6000000.0*8000000.0/800000.0), "key relation inside a joinrel")
+	wantRows(t, rows, 24000, "bare key relation inside a joinrel")
 }
 
 // jrsUnanalysed is two tables with a `RowCount` but no per-column statistics —
