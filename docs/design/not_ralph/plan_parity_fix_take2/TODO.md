@@ -4386,3 +4386,13 @@ join-order Step-0 — P0 candidate-cost attribution for
 order preference unexplained, width-driven hash cost suspect),
 P1 slice menu. Implementation separate. Next: agent review, revise
 if needed, commit -n/push scope, then P0.
+R96 P0 DONE 2026-09-12 (`r96-q96-join-order/PROBE.md`, review
+APPROVE after one REJECT remediated — stale line cites fixed,
+pre-existing-WIP provenance recorded; the REJECT's PG-numbers claim
+was the reviewer's error, verified verbatim from the live capture):
+ATTRIBUTED — 157.50 (0.68%) raw-min margin, both orders survive
+fuzz, exact-min election picks store-first; deciding term is
+build-side rows (720-vs-1) with rows/sizing ruled out. Hypotheses
+ranked: (1) build-cost transcription audit, (2) conditional fuzz
+tiebreak (needs PG loser price). No code changed. Next: P1 slice
+menu → R97+ implementation (separate).
