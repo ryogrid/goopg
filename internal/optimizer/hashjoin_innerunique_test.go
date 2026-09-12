@@ -104,6 +104,23 @@ func TestHashJoinFinalCostInputDeclinesUnsoundEvidence(t *testing.T) {
 	}
 }
 
+func TestHashJoinFinalCostInputDeclinesPartialUniqueIndex(t *testing.T) {
+	s, joinrel, outer, inner, keys := r90UniqueFixture(t)
+	partial := false
+	for _, idx := range s.cat.IndexesOnTable(s.relInfos[1].table) {
+		if idx != nil && idx.Unique && len(idx.Columns) == 2 {
+			idx.HasPredicate = true
+			partial = true
+		}
+	}
+	if !partial {
+		t.Fatal("fixture has no composite unique index to mark partial")
+	}
+	if got := s.hashJoinFinalCostInputFor(joinrel, outer, inner, parser.JoinInner, keys); got != (hashJoinFinalCostInput{}) {
+		t.Fatalf("partial unique input = %+v, want zero-value old-cost path", got)
+	}
+}
+
 func TestHashJoinInnerUniqueFinalCostUsesRoundToEvenAndZeroUnmatchedWalk(t *testing.T) {
 	cp := defaultCostParams()
 	base := hashJoinInputs{
