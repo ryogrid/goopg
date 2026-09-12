@@ -4286,3 +4286,12 @@ recoverable so trace-on cannot change query success. Do not alter costs,
 defaults, Gather policy, aggregate behavior, or Q96 selection. Next: agent
 review, commit -n/push the scope, then add/remove default-off diagnostics and
 report one separately scoped construction or barrier.
+
+R92 DONE 2026-09-12 (`r92-q96-partial-aggregate-seed/REPORT.md`):
+measurement-only, copy-safe trace proves the final-relset partial NLI is not
+an executable upper worker source through the current API. Its path contains a
+depth-three `PathPrebuilt` shared `*Filter`; rebuilding would stamp shared
+state, while the rendered serial child has no driving scan. Temporary code was
+removed; final optimizer diff is empty and test/vet/whitespace gates pass.
+Q96 trace stayed byte-identical. Next: separately scope a safe executable
+partial-path node representation; do not adjust costs or force Gather.
