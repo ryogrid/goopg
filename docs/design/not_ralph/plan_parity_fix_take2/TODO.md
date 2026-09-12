@@ -4132,3 +4132,18 @@ spotcheck, SF0.25 `PASS=96 MISMATCH=0 CKMISMATCH=0 ERROR=0
 TIMEOUT=0` (plan movement Q6/Q41 only). Remaining deliberate
 debt: forwarded/non-Var PARAM_EXEC source expansion (none in the
 current executable TPC-H/TPC-DS census).
+R86 SCOPE READY 2026-09-12
+(`r86-q96-step0/SCOPE.md`): TPC-DS Q96 measurement-first audit.
+The visible `store_sales` row split is the first discriminator:
+goopg prints 719876 below a 3-worker Gather while fresh PG prints
+232218 and reports base reltuples=719876
+(`clamp_row_est(719876 / 3.1) = 232218`).
+Step-0 proves whether goopg has mismatched base statistics, loses the
+partial path's per-worker rows only at plan stamping, or actually
+prices the tournament with the wrong row unit; then traces the visible
+L2 structural split, decisive L3 prefix election, and the parameterised
+time_dim-pkey NLI's admission/election. No fix is authorized until
+exactly one branch is
+measured and separately scoped. Q14/K92, Q1/R81 inputs, the parallel
+family, Q91 Materialize, and corpus-zero ParamRef LIMIT debt remain
+deferred. Next: agent review, commit/push SCOPE, then Step-0.
