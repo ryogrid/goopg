@@ -80,7 +80,7 @@ import "strconv"
 import "github.com/goopg/goopg/internal/parser"
 
 func addPartialHashJoinPath(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp costParams,
-	jt parser.JoinType, keys, residual []*restrictInfo, bucket float64) {
+	jt parser.JoinType, keys, residual []*restrictInfo, bucket float64, final hashJoinFinalCostInput) {
 
 	// The only reader of a partial path is `generateUsefulGatherPaths`, which
 	// is gated by the same mode — so producing under `off` buys nothing and
@@ -206,6 +206,7 @@ func addPartialHashJoinPath(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp 
 		outputRows:      rows,
 		numHashClauses:  len(keys),
 		innerBucketSize: bucket,
+		final:           final,
 		outerCols:       pathNCols(o), innerCols: pathNCols(i),
 		outerAvgVarBytes: pathAvgVarBytes(o), innerAvgVarBytes: pathAvgVarBytes(i),
 	})

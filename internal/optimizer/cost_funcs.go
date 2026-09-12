@@ -602,6 +602,11 @@ type hashJoinInputs struct {
 	// statistic" and suppresses the bucket-walk term entirely. take2 P2-11.
 	innerBucketSize float64
 
+	// final carries the fail-closed INNER-only evidence that selects the
+	// inner-unique branch of final_cost_hashjoin. Its zero value preserves the
+	// existing non-unique bucket-walk result exactly.
+	final hashJoinFinalCostInput
+
 	// `hashsize.Choose`. Populated from RelOptInfo.AvgVarBytes; zero when no
 	// ANALYZE stats exist (correct for fixed-width relations). M0128-P3.1.
 	outerAvgVarBytes, innerAvgVarBytes float64
@@ -651,7 +656,24 @@ func hashJoinCost(cp costParams, in hashJoinInputs) Cost {
 	// innerBucketSize == 0 means "no usable statistic"; the term is then
 	// SKIPPED rather than guessed, so a stats-less plan costs exactly as it did
 	// before this change.
-	if in.innerBucketSize > 0 {
+	if in.innerBucketSize > 0 && in.final.innerUnique {
+		// PG's rint() uses round-to-even. The factor was derived once in total
+		// relation coordinates; outerRows is this serial or partial candidate's
+		// path coordinate.
+		outerMatched := math.RoundToEven(in.outerRows * in.final.outerMatchFrac)
+		innerScanFrac := 2.0 / (1.0 + 1.0) // match_count is one for a unique inner.
+		bucketTuples := clampRowEst(in.innerRows * in.innerBucketSize * innerScanFrac)
+		run += cp.cpuOperatorCost * float64(in.numHashClauses) *
+			outerMatched * bucketTuples * 0.5
+
+		// PG charges unmatched probes against inner_path_rows / virtualbuckets.
+		// Goopg's executor instead probes a canonical-key map: an unmatched key
+		// has no candidate slice to walk. NBuckets/NBatch are map sizing and
+		// spill accounting, not that PG chain space, so this bounded adaptation
+		// charges no unmatched tuple walk rather than inventing a denominator.
+		// It intentionally does not model PG packed-tuple geometry,
+		// MCV-frequency suppression, general QualCost, or pathtarget costs.
+	} else if in.innerBucketSize > 0 {
 		bucketTuples := clampRowEst(in.innerRows * in.innerBucketSize)
 		run += cp.cpuOperatorCost * float64(in.numHashClauses) *
 			in.outerRows * bucketTuples * 0.5

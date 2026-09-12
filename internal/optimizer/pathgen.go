@@ -75,7 +75,7 @@ func generateScanPaths(rel *RelOptInfo, cp costParams, relPages int64, numQualOp
 //
 // Child convention: Children[0] is the probe (outer) side, Children[1] is the
 // build (inner) side. createPlan reads it to set the executor Join's BuildLeft.
-func addHashJoinPath(joinRel, probe, build *RelOptInfo, cp costParams, jt parser.JoinType, keys, residual []*restrictInfo, innerBucketSize float64) {
+func addHashJoinPath(joinRel, probe, build *RelOptInfo, cp costParams, jt parser.JoinType, keys, residual []*restrictInfo, innerBucketSize float64, final hashJoinFinalCostInput) {
 	p, b := probe.CheapestTotal, build.CheapestTotal
 	if p == nil || b == nil {
 		return
@@ -91,6 +91,7 @@ func addHashJoinPath(joinRel, probe, build *RelOptInfo, cp costParams, jt parser
 		outputRows:      joinRel.Rows,
 		numHashClauses:  len(keys),
 		innerBucketSize: innerBucketSize,
+		final:           final,
 		// take2 P4-01: column counts come from the PATHS, falling back to the
 		// rels. The previous comment here read "Column counts come from the
 		// RELS, not the paths: a parameterised path returns fewer ROWS than
@@ -199,10 +200,10 @@ func generateHashJoinPaths(joinRel, outer, inner *RelOptInfo, cp costParams, jt 
 		return bucketFor(build.Relids)
 	}
 	// Orientation 1: build the inner side.
-	addHashJoinPath(joinRel, outer, inner, cp, jt, keys, residual, bucket(inner))
+	addHashJoinPath(joinRel, outer, inner, cp, jt, keys, residual, bucket(inner), hashJoinFinalCostInput{})
 	// Orientation 2: build the outer side (swap the roles). The join output is
 	// the same; only which side is hashed differs.
-	addHashJoinPath(joinRel, inner, outer, cp, jt, keys, residual, bucket(outer))
+	addHashJoinPath(joinRel, inner, outer, cp, jt, keys, residual, bucket(outer), hashJoinFinalCostInput{})
 }
 
 // The C1-era `generateNLIPath` used to live here. It was retired by

@@ -312,7 +312,7 @@ func TestPartialHashJoinPropagatesUpTheJoinTree(t *testing.T) {
 			t.Fatal("no base rel outside the intermediate joinrel")
 		}
 		probe := &RelOptInfo{Relids: top.Relids, Rows: top.Rows, Width: top.Width, ConsiderParallel: true}
-		addPartialHashJoinPath(s, probe, mid, third, s.cp, parser.JoinInner, midPP.HashKeys, nil, 0)
+		addPartialHashJoinPath(s, probe, mid, third, s.cp, parser.JoinInner, midPP.HashKeys, nil, 0, hashJoinFinalCostInput{})
 		if len(probe.PartialPathlist) != 1 {
 			t.Fatalf("a joinrel's partial path was not usable as the partial outer one level up: %d paths filed", len(probe.PartialPathlist))
 		}
@@ -413,7 +413,7 @@ func TestPartialHashJoinRefusals(t *testing.T) {
 			t.Run(tc.name, func(t *testing.T) {
 				s, joinrel, outer, inner, keys := build(t)
 				tc.sabotage(s, joinrel, outer, inner)
-				addPartialHashJoinPath(s, joinrel, outer, inner, s.cp, parser.JoinInner, keys, nil, 0)
+				addPartialHashJoinPath(s, joinrel, outer, inner, s.cp, parser.JoinInner, keys, nil, 0, hashJoinFinalCostInput{})
 				if len(joinrel.PartialPathlist) != 0 {
 					t.Errorf("filed %d partial path(s) despite the refusal", len(joinrel.PartialPathlist))
 				}
@@ -424,7 +424,7 @@ func TestPartialHashJoinRefusals(t *testing.T) {
 		// refusals above are not all passing because the call is inert.
 		t.Run("control: unbroken, a path IS filed", func(t *testing.T) {
 			s, joinrel, outer, inner, keys := build(t)
-			addPartialHashJoinPath(s, joinrel, outer, inner, s.cp, parser.JoinInner, keys, nil, 0)
+			addPartialHashJoinPath(s, joinrel, outer, inner, s.cp, parser.JoinInner, keys, nil, 0, hashJoinFinalCostInput{})
 			if len(joinrel.PartialPathlist) != 1 {
 				t.Fatalf("the control arm filed %d partial paths, want 1", len(joinrel.PartialPathlist))
 			}
