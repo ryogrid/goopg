@@ -4216,3 +4216,16 @@ tournament. The evidence boundary is the 184.79 L2 and 50.81 L3 cost advantage
 of the retained `ss⋈store` prefix, before downstream NLI/Gather behavior. No
 cost, selectivity, parallel, GUC, or query change is authorized until PG source
 terms and Goopg inputs are recomputed and a single C1–C4 outcome is reviewed.
+
+R89 DONE 2026-09-12 (`r89-q96-partial-prefix-cost/REPORT.md`): the temporary,
+default-off partial-cost trace was removed before the post-measurement build.
+Q96 natural/top and A/A plans are byte-identical, Q9/Q41/Q91/Q96 trace-on/off
+plans are byte-identical, and Q96 values match PG (`266`). Exact Goopg partial
+cost decomposition confirms the retained `ss⋈store` prefix leads by 184.7875
+at L2 and 50.80625 at L3. The live PG selected Hash Joins visibly use `Inner
+Unique: true` with a partial outer and complete inner. PG's common initial
+hash-cost component matches Goopg, but its final inner-unique branch requires
+an inner-unique proof, semifactors, PG MCV-frequency/QualCost, and pathtarget
+inputs that Goopg does not represent; outcome C2, not a guessed cost change.
+Next: scope the missing inner-unique final-cost inputs before implementation;
+do not infer unexposed rejected PG path state or promise a Q96 flip.
