@@ -4370,3 +4370,12 @@ parameterized index probe per worker-local outer row (R25 decomposed
 shape, Q96's actual top NL). Probe-only (index probe bound by the
 outer); general lateral subtrees refused. Next: agent review, revise
 if needed, commit -n/push scope, then implement.
+
+R95 DONE 2026-09-12 (`r95-lateral-probe-workers/REPORT.md`, review
+APPROVE): implementation `2f3febf` (predicate + walks + classifier +
+claims + prebuild descent + tests). Q96 plans Finalize→Gather(3)→
+Partial by cost, value 266 in all three modes; census Q96 down to
+[join-order,scan-type,qual-placement]. Gates: suites + vet + WS
+clean; TPC-H 24/24 PASS; SF0.25 PASS=96 all-zero; Q9/Q41/Q91
+identical, Q96 differs by design. Next: Q96 join-order distance, or
+another evidenced mismatch (separate scope).
