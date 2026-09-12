@@ -4254,3 +4254,12 @@ selected (top cost `25434.49` -> `24541.49`). Full gates pass: TPC-H digest
 census `2/67/0/27/3/0`. Next: separately scope any PG-compatible unmatched
 virtual-bucket/MCV/QualCost/pathtarget input; do not infer it from executor
 map geometry or force Q96's order.
+
+R91 SCOPE READY 2026-09-12
+(`r91-pg-virtual-bucket-unmatched/SCOPE.md`): reproduce PG18's packed-tuple
+virtual bucket count in an optimizer-private representation solely for the
+already-proved inner-unique unmatched Hash Join probe cost. It deliberately
+keeps Goopg executor map sizing, actual batching, and spill costs separate.
+It must carry a path's emitted byte width, decline unknown/unsupported
+geometry, and retain the existing matched bucket statistic. Next: agent
+review, revise if needed, commit -n/push scope, then and only then implement.
