@@ -187,3 +187,14 @@ alongside. `match` count is NOT a criterion
 - Scope-amendment review 2: APPROVE. No blocking findings;
   the only note (explicit recognized/unknown traversal status)
   is incorporated above.
+- Implementation review 2: REJECT. Three blockers: an RTID-
+  bearing candidate incorrectly fell back to its base name when
+  `bySource` registration was missing; distinct nodes with the
+  same RTID were not de-duplicated; and the positive zero-
+  `SourceTableIdx` path lacked a pin. All three were repaired.
+  The suggested recognized-but-nonmatching and unknown-node
+  fail-closed pins were added too.
+- Implementation review 3: APPROVE. No blocking findings. The
+  reviewer re-ran `git diff --check` and the clean optimizer /
+  executor suites, and verified all previous blockers plus both
+  suggested pins against this scope.

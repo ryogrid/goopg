@@ -602,6 +602,18 @@ func emitSubPlanSubtrees(rows *[]Row, detailIndent string, opts parser.ExplainOp
 			}
 			*rows = append(*rows, Row{NewStringDatum(line)})
 			if sp.plan != nil {
+				// A PARAM_EXEC inside this body is supplied by this exact
+				// owning sublink. Keep the source map active only while the
+				// body renders; nested sublinks install their own map and then
+				// restore this one. Malformed or unsupported owners deliberately
+				// install nil, so an inner body can never borrow an outer
+				// owner's slot merely because the statement-wide IDs happen to
+				// share a number.
+				var prevParamSources map[int]*optimizer.ColumnRef
+				if reg != nil {
+					prevParamSources = reg.execParamSources
+					reg.execParamSources = subPlanExecParamSources(sp.expr)
+				}
 				// A sublink body brings its own range-table entries
 				// (Q30's `ctr2` lives only inside SubPlan 1), and they
 				// must be named before any of its detail lines render.
@@ -621,6 +633,9 @@ func emitSubPlanSubtrees(rows *[]Row, detailIndent string, opts parser.ExplainOp
 				// against postgres/src/test/regress/expected/
 				// subselect.out:380-391 (nested SubPlan/InitPlan).
 				render(sp.plan, len(detailIndent)/2+1)
+				if reg != nil {
+					reg.execParamSources = prevParamSources
+				}
 			}
 		}
 	}
@@ -1743,6 +1758,223 @@ type subPlanReg struct {
 	// unexecuted nodes, and reg-less callers stay byte-identical.
 	sortStats   map[*optimizer.Sort]SortStat
 	sortWorkers map[*optimizer.Sort][]SortStat
+	// execParamSources is the owning sublink's validated PARAM_EXEC
+	// input map while that sublink body renders. It is body-scoped (set /
+	// restored by emitSubPlanSubtrees), not statement-global: PG resolves
+	// PARAM_EXEC against the supplying ancestor SubPlan, and nested bodies
+	// must not see their parent's slot sources. Only direct ColumnRef Args
+	// enter the map; forwarded params and every doubtful shape retain `$N`.
+	execParamSources map[int]*optimizer.ColumnRef
+}
+
+// subPlanExecParamSources extracts the PARAM_EXEC sources supplied by one
+// lowerable sublink owner. Validation is atomic for the owner: a malformed
+// length, negative/duplicate slot, nil Arg, forwarded ExecParamRef, or any
+// non-ColumnRef expression rejects the whole map. That keeps EXPLAIN
+// fail-closed and avoids walking expression trees merely to decide whether
+// source expansion is safe.
+func subPlanExecParamSources(e optimizer.Expr) map[int]*optimizer.ColumnRef {
+	var parParam []int
+	var args []optimizer.Expr
+	switch x := e.(type) {
+	case *optimizer.SubqueryExpr:
+		parParam, args = x.ParParam, x.Args
+	case *optimizer.ExistsExpr:
+		parParam, args = x.ParParam, x.Args
+	case *optimizer.InExpr:
+		if _, isRow := x.Operand.(*optimizer.RowExpr); isRow {
+			return nil
+		}
+		parParam, args = x.ParParam, x.Args
+	default:
+		return nil
+	}
+	if len(parParam) == 0 || len(parParam) != len(args) {
+		return nil
+	}
+
+	out := make(map[int]*optimizer.ColumnRef, len(parParam))
+	for i, id := range parParam {
+		if id < 0 {
+			return nil
+		}
+		if _, duplicate := out[id]; duplicate {
+			return nil
+		}
+		source, ok := args[i].(*optimizer.ColumnRef)
+		if !ok || source == nil {
+			return nil
+		}
+		out[id] = source
+	}
+	return out
+}
+
+// execParamOwnerChildren is a query-scope-aware child allowlist for PARAM_EXEC
+// source lookup. It deliberately does not use planChildren: that general
+// EXPLAIN walker crosses isolated subquery, CTE-body, set-operation, and DML
+// boundaries where SourceTableIdx numbering can restart. Unknown node kinds
+// return recognized=false so future plan shapes fail closed to `$N`.
+func execParamOwnerChildren(n optimizer.Node) (children []optimizer.Node, recognized bool) {
+	switch p := n.(type) {
+	case *optimizer.Project:
+		if p.IsolatedScope {
+			return nil, true
+		}
+		return []optimizer.Node{p.Child}, true
+	case *optimizer.Result:
+		if p.Child == nil {
+			return nil, true
+		}
+		return []optimizer.Node{p.Child}, true
+	case *optimizer.Filter:
+		return []optimizer.Node{p.Child}, true
+	case *optimizer.Sort:
+		return []optimizer.Node{p.Child}, true
+	case *optimizer.Limit:
+		return []optimizer.Node{p.Child}, true
+	case *optimizer.Gather:
+		return []optimizer.Node{p.Child}, true
+	case *optimizer.GatherMerge:
+		return []optimizer.Node{p.Child}, true
+	case *optimizer.Distinct:
+		return []optimizer.Node{p.Child}, true
+	case *optimizer.DistinctOn:
+		return []optimizer.Node{p.Child}, true
+	case *optimizer.Aggregate:
+		return []optimizer.Node{p.Child}, true
+	case *optimizer.WindowAgg:
+		return []optimizer.Node{p.Child}, true
+	case *optimizer.Join:
+		return []optimizer.Node{p.Left, p.Right}, true
+	case *optimizer.LockRows:
+		return []optimizer.Node{p.Child}, true
+	case *optimizer.OrdinalityWrap:
+		return []optimizer.Node{p.Child}, true
+	case *optimizer.NestedLoopIndexJoin:
+		if p.InnerMemo != nil {
+			return []optimizer.Node{p.Outer, p.InnerMemo}, true
+		}
+		return []optimizer.Node{p.Outer, p.Inner}, true
+	case *optimizer.BitmapAnd:
+		return p.Inputs, true
+	case *optimizer.BitmapOr:
+		return p.Inputs, true
+	case *optimizer.Memoize:
+		return []optimizer.Node{p.Child}, true
+	case *optimizer.RowsFrom:
+		return p.Funcs, true
+	case *optimizer.ProjectSet:
+		return []optimizer.Node{p.Child}, true
+
+	// Relation candidates are leaves for this lookup. In particular a
+	// CTEScan's Child is a separately planned CTE scope and must not be
+	// inspected even though the general EXPLAIN walker renders it.
+	case *optimizer.SeqScan, *optimizer.IndexScan, *optimizer.IndexOnlyScan,
+		*optimizer.CTEScan, *optimizer.MaterializedCTEScan,
+		*optimizer.BitmapHeapScan:
+		return nil, true
+
+	// Audited explicit query / DML scope boundaries. They are recognized so
+	// the boundary itself is not confused with an unknown future node, but
+	// their children are intentionally invisible to source lookup.
+	case *optimizer.SetOp, *optimizer.RecursiveUnion, *optimizer.CTEDMLPrefix,
+		*optimizer.Copy, *optimizer.Insert, *optimizer.Update,
+		*optimizer.Delete, *optimizer.Merge:
+		return nil, true
+
+	// Known non-relation leaves reachable from the safe container arms.
+	case *optimizer.Values, *optimizer.GenerateSeries, *optimizer.UserSrfScan,
+		*optimizer.GenerateSubscripts, *optimizer.FromUnnest,
+		*optimizer.PgInputErrorInfo, *optimizer.PgGetPublicationTables,
+		*optimizer.PgGetSequenceData, *optimizer.PgSequenceParameters,
+		*optimizer.TSTokenType,
+		*optimizer.PgAvailableWalSummaries, *optimizer.PgGetCatalogForeignKeys,
+		*optimizer.ScalarFuncScan, *optimizer.PgPartitionTree,
+		*optimizer.PgOptionsToTable, *optimizer.FromRegexpMatches,
+		*optimizer.FromRegexpSplitToTable, *optimizer.VerifyHeapam,
+		*optimizer.WorkTableScan, *optimizer.BitmapIndexScan:
+		return nil, true
+	default:
+		return nil, false
+	}
+}
+
+// resolveExecParamSourceInOwner proves that source belongs to exactly one
+// relation in the active sublink owner's query scope, and returns the forced-
+// qualified name PG would deparse. Non-zero SourceTableIdx must match the
+// candidate column. Zero (erased by an aggregate/derived boundary) uses a
+// name-only match but still requires a unique candidate. Expression-hanging
+// subplans are never traversed.
+func resolveExecParamSourceInOwner(nm *explainNames, owner optimizer.Node, source *optimizer.ColumnRef) string {
+	if nm == nil || owner == nil || source == nil || source.Name == "" {
+		return ""
+	}
+	seen := make(map[optimizer.Node]bool)
+	seenRTID := make(map[int32]bool)
+	matches := make([]string, 0, 1)
+	valid := true
+	var walk func(optimizer.Node)
+	walk = func(n optimizer.Node) {
+		if n == nil || !valid || len(matches) > 1 || seen[n] {
+			return
+		}
+		seen[n] = true
+		if base, candidate := explainRelBaseName(n); candidate {
+			for _, col := range n.Output() {
+				if col.Name != source.Name || (source.SourceTableIdx != 0 && col.SourceTableIdx != source.SourceTableIdx) {
+					continue
+				}
+				name := base
+				if rtid, ok := explainNodeRTID(n); ok {
+					if seenRTID[rtid] {
+						break
+					}
+					seenRTID[rtid] = true
+					registered := nm.bySource[rtid]
+					if registered == "" {
+						valid = false
+						return
+					}
+					name = registered
+				}
+				matches = append(matches, name+"."+source.Name)
+				break
+			}
+		}
+		children, recognized := execParamOwnerChildren(n)
+		if !recognized {
+			valid = false
+			return
+		}
+		for _, child := range children {
+			walk(child)
+		}
+	}
+	walk(owner)
+	if !valid || len(matches) != 1 {
+		return ""
+	}
+	return matches[0]
+}
+
+// formatExecParamRef renders a PARAM_EXEC input as its supplying outer Var,
+// following PG get_parameter's forced-varprefix rule. Substitution happens
+// only after the active owner scope proves one source relation. Bare,
+// ambiguous, cross-scope, or unknown source text retains `$N`.
+func formatExecParamRef(x *optimizer.ExecParamRef, reg *subPlanReg) string {
+	fallback := fmt.Sprintf("$%d", x.ID)
+	if reg == nil || reg.rel == nil {
+		return fallback
+	}
+	source := reg.execParamSources[x.ID]
+	if source == nil {
+		return fallback
+	}
+	if qualified := resolveExecParamSourceInOwner(reg.rel, reg.ancestorNode(), source); qualified != "" {
+		return qualified
+	}
+	return fallback
 }
 
 // ancestorNode returns the plan node currently being rendered, or nil.
@@ -1920,10 +2152,10 @@ func formatExprQual(e optimizer.Expr, reg *subPlanReg, qualify bool) string {
 	case *optimizer.ParamRef:
 		return fmt.Sprintf("$%d", x.Number)
 	case *optimizer.ExecParamRef:
-		// PARAM_EXEC slot (D4.1) — upstream prints exec params the
-		// same `$N` way (e.g. `Index Cond: (l_orderkey = $0)`); the
-		// number is the flat per-statement slot ID.
-		return fmt.Sprintf("$%d", x.ID)
+		// PARAM_EXEC slot (D4.1). PG deparses a slot supplied by an
+		// ancestor SubPlan as the source outer Var, forcing its relation
+		// prefix. Unknown/unsafe sources keep the flat statement slot ID.
+		return formatExecParamRef(x, reg)
 	case *optimizer.TypedStringLit:
 		// Upstream renders a typed literal as `'value'::type`
 		// (ruleutils.c get_const_expr with showtype).

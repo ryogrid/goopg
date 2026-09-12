@@ -4113,31 +4113,22 @@ HEAD worktree binary (stale tmp binary false alarm:
 inode check insufficient, provenance required). Follow-ups:
 `$0` display (Q41's last gap), ParamRef LIMIT allowlist,
 outer-Sort work beyond the skip (none needed).
-R85 SCOPE READY 2026-09-12
-(`r85-execparam-display/SCOPE.md`): render a correlated
-`ExecParamRef` from the owning sublink's `ParParam`/`Args`
-source expression, falling back to `$N` when unmapped or
-unsafe. Display-only Q41 last-gap slice; implementation has
-not started. Review 1 REJECT: forced qualification,
-fail-closed owner-map validation, walker soundness, and the
-corpus probe list were incomplete. Scope revised to a direct-
-ColumnRef allowlist and exact H:{Q17,Q20}/DS:{Q6,Q41}
-pre-census. Review 2 REJECT: forced qualification could still
-fall to a bare name when SourceTableIdx is erased. Scope now
-requires binding lookup → owning-ancestor fallback → retain
-`$N` if unresolved. Review 3 APPROVE (no findings; plain +
-ANALYZE ancestor lifetimes verified). Next: `commit -n` +
-push completed in `c840f6c75`; implementation began. Initial
-units exposed and updated one old `$0` expectation; full
-optimizer/executor suites then passed. Implementation review 1
-REJECT: binding-first qualification is unsafe across nested
-query levels because SourceTableIdx restarts and `bySrc` is
-outermost-first. Scope amended to an owner-tree-only resolver
-(no global bySrc fallback). Scope-amendment review 1 REJECT:
-raw planChildren also crosses IsolatedScope/CTE and other
-query/DML boundaries. Scope now specifies an audited explicit
-descent allowlist, boundary stops, and dedicated pins. Next:
-scope-amendment review 2 APPROVE (explicit unknown-node status
-note applied); `commit -n` + push the amendment, then repair
-implementation + add nested
-ID-collision/ambiguous-owner pins before corpus gates.
+R85 LANDED 2026-09-12
+(`r85-execparam-display/REPORT.md`, final implementation review
+APPROVE with no blocking findings): correlated `ExecParamRef` display now
+uses the owning sublink's atomically validated `ParParam`/`Args`
+direct-ColumnRef source; every unproved case remains `$N`.
+Body-local maps shadow/restore for nested SubPlans. Qualification
+uses an owner-query-scope allowlist with explicit IsolatedScope /
+CTE / set / recursive / DML boundaries, no global `bySrc`
+fallback, RTID registration enforcement, node+RTID de-dup, and
+unknown-kind decline. Reviews caught forced qualification,
+malformed-map handling, query-level ID collisions, unsafe generic
+walking, missing RTID registration fallback, RTID de-dup, and the
+zero-ID pin before landing; all are closed and pinned. Q41 is now
+MATCH. Corpus A/B moves exactly H:{Q17,Q20}/DS:{Q6,Q41}; every
+expanded source agrees with fresh live PG. Gates green: suites,
+spotcheck, SF0.25 `PASS=96 MISMATCH=0 CKMISMATCH=0 ERROR=0
+TIMEOUT=0` (plan movement Q6/Q41 only). Remaining deliberate
+debt: forwarded/non-Var PARAM_EXEC source expansion (none in the
+current executable TPC-H/TPC-DS census).
