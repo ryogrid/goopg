@@ -4363,3 +4363,10 @@ pass, byte-identical outputs); Q9/Q41/Q91/Q96 natural vs opt-in
 identical; census 2/69/0/25/3/0 with baseline-vs-R94 captures
 identical (delta vs R91 is clone drift). Next: separately scope
 lateral-probe worker semantics, or another evidenced mismatch.
+
+R95 SCOPE READY 2026-09-12 (`r95-lateral-probe-workers/SCOPE.md`):
+lateral-probe NL worker semantics — partition the outer, re-open the
+parameterized index probe per worker-local outer row (R25 decomposed
+shape, Q96's actual top NL). Probe-only (index probe bound by the
+outer); general lateral subtrees refused. Next: agent review, revise
+if needed, commit -n/push scope, then implement.
