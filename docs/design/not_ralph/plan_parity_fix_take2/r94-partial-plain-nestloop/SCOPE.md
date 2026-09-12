@@ -22,7 +22,10 @@ exactly once. The inner must not receive any shared scan claim.
 This reasoning does not carry to RIGHT or FULL joins: their unmatched-inner
 sweep would occur in every worker and duplicate right-only rows. It also does
 not establish parameterized NLI/Memoize semantics; those are separate node
-shapes and remain refused.
+shapes and remain refused. LEFT/SEMI/ANTI refusal below is deliberate
+scope-minimization (Q96 is INNER; the twins admit them on the same
+worker-local rationale), not a correctness boundary — do not "fix" the
+over-refusal without a separate scope.
 
 ## Authorized change
 
@@ -30,19 +33,29 @@ Under the existing opt-in gather/upper partial-aggregate controls only:
 
 1. Recognize a partial `PathNestLoop` only when it is an unparameterized
    ordinary INNER join: root `RequiredOuter == 0`, exactly two children,
-   outer child is a recognized partial worker shape, and inner child has
-   `RequiredOuter == 0` and is not `PathMemoize`. The path walk descends the
-   outer child only. All other join types and parameterized/memoized inners
-   return the existing refusal marker.
+   outer child is a recognized partial worker shape with `ParallelWorkers > 0`
+   and `ParallelSafe` (the V5-class check every landed producer repeats),
+   and inner child has `RequiredOuter == 0` and is not `PathMemoize`. The
+   path walk descends the outer child only. All other join types and
+   parameterized/memoized inners return the existing refusal marker.
 2. Add a node-side approval predicate for `*Join` with
-   `Algo == JoinAlgoNestedLoop` and `Type == JoinTypeInner`. It must reject
+   `Algo == JoinAlgoNestedLoop`, `Type == JoinTypeInner`, and `!Lateral`
+   (mirroring the hash/merge twin predicates). It must reject
    nil children, a parameterized/NLI node, and every non-INNER join. Extend
-   `drivingScan`, `stampParallelScan`, and the sort-crossing sibling to descend
-   the left/outer child only under that predicate, copy-on-write as today.
+   `drivingScan`, `stampParallelScan`, `unstampParallelScan`, and the
+   sort-crossing sibling to descend the left/outer child only under that
+   predicate, copy-on-write as today. The NL arm names `left` literally in
+   every walker — never route through `probeSideIsLeft` /
+   `joinProbeSideIsLeft` (the seq-arm comment documents the trap).
 3. Extend all three executor claim walkers — sequential, bitmap, and index —
-   to descend `joinOp.left` only when its plan is the approved ordinary INNER
-   nested loop. The right/inner operator receives no claim state and is built
-   independently per worker. Keep the current hash and merge behavior intact.
+   to descend `joinOp.left` literally (never via `probeSideIsLeft`) only when
+   its plan is the approved ordinary INNER nested loop. The right/inner
+   operator receives no claim state and is built independently per worker.
+   Guard: decline (serial fallback) when the inner subtree contains any
+   claimable scan — in particular a bitmap scan, since `prebuildBitmap`
+   shares nothing with >1 bitmap scan (`parallel_scan.go:450-452`) and the
+   outer would otherwise go unpartitioned (N+1 copies, silently wrong). Keep
+   the current hash and merge behavior intact.
 4. Allow `addPartialAggSplitPath` to select an isolated constructed partial
    source only when the source path itself meets the same ordinary-NL predicate,
    has positive finite per-worker rows/cost and workers, and the constructed
@@ -61,13 +74,23 @@ must agree and be unit-pinned together.
 - A duplicate-sensitive ordinary INNER nested loop with a sequential outer,
   filtered complete inner, and multiple workers returns the exact serial
   multiset. The workers claim the outer scan only; assert that the inner has
-  no parallel allocator.
+  no parallel allocator. Include a large-inner case (duplicate-sensitive
+  values + peak-memory assertion) or document an explicit size-gate deferral:
+  per-worker whole-inner materialization is N× memory, unbounded by default
+  (`join_nl_stream.go:110-125`).
 - Repeat the identity proof for bitmap and index/index-only outer scans.
   Reject an inner-only driving scan, RIGHT/FULL/LEFT/SEMI/ANTI, a parameterized
-  inner, a Memoize inner, malformed children, nil claims, and unsafe/Gather
-  sources.
-- Pin path-classifier, node `drivingScan`, stamp, sort-crossing, and all three
-  executor claim walkers to the same approval/refusal matrix.
+  inner, a Memoize inner, an inner subtree holding any claimable scan
+  (bitmap-in-inner pinned to refusal/serial), malformed children, nil claims,
+  and unsafe/Gather sources. Assert for all three claim kinds that the inner
+  receives no claim state, no `Parallel` EXPLAIN stamp lands on any inner
+  scan, and inner bitmaps stay non-shared; cover empty-outer/empty-inner
+  (`drainInner` sweep).
+- Pin path-classifier, node `drivingScan`, stamp, unstamping, sort-crossing,
+  and all three executor claim walkers to the same approval/refusal matrix.
+- Pin that an R60-filed but R94-refused partial-NL head cannot suppress
+  admittable hash/merge siblings (narrow R60's V1 filing or test the
+  refused-head case).
 - Pin isolated prebuilt copying: a source and every nested prebuilt node retain
   their pointer identity/cost/expression state after candidate construction;
   an unsupported leaf or recovered constructor panic falls back to serial.
