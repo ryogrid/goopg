@@ -521,7 +521,8 @@ func terminatesPartial(n Node) bool {
 // stampParallelScan is drivingScan's copy-on-write sibling: it performs the
 // EXACT SAME traversal decision (Filter/Project pass-through, Join probe-side
 // only under hashJoinIsPartialCapable, outer-side only under
-// mergeJoinIsPartialCapable / nestedLoopJoinIsPartialCapable, terminating on
+// mergeJoinIsPartialCapable / nestedLoopJoinIsPartialCapable /
+// lateralProbeJoinIsPartialCapable, terminating on
 // *SeqScan/*BitmapHeapScan)
 // but instead of merely locating the driving scan, it returns a NEW tree with
 // Parallel: true stamped on a COPY of that scan. This mirrors PostgreSQL's
@@ -607,14 +608,16 @@ func stampParallelScan(n Node) Node {
 		// (`partialPathDrivingKind` Children[0]), this label walk, and the
 		// executor walk (`attachParallelScan` JoinAlgoMerge) all descend
 		// the left.
-		if !hashJoinIsPartialCapable(x) && !mergeJoinIsPartialCapable(x) && !nestedLoopJoinIsPartialCapable(x) {
+		if !hashJoinIsPartialCapable(x) && !mergeJoinIsPartialCapable(x) && !nestedLoopJoinIsPartialCapable(x) && !lateralProbeJoinIsPartialCapable(x) {
 			return n
 		}
 		// R94: an ordinary nested loop is partial through its OUTER (left)
 		// side only, named literally — never via joinProbeSideIsLeft, which
 		// answers from BuildLeft, a field a nested loop leaves false by
 		// construction (the seq-arm trap documented on attachParallelScan).
-		if nestedLoopJoinIsPartialCapable(x) {
+		// R95: the lateral probe shape shares the literal-left rule — the
+		// probe re-opens per worker-local outer row and takes no claim.
+		if nestedLoopJoinIsPartialCapable(x) || lateralProbeJoinIsPartialCapable(x) {
 			left := stampParallelScan(x.Left)
 			if left == x.Left {
 				return x
@@ -714,11 +717,12 @@ func drivingScan(n Node) Node {
 		// shared side logic below descends the outer with no special case —
 		// which is exactly what must stay true: if BuildLeft ever becomes
 		// meaningful for merge, this arm needs its own side test.
-		if !hashJoinIsPartialCapable(x) && !mergeJoinIsPartialCapable(x) && !nestedLoopJoinIsPartialCapable(x) {
+		if !hashJoinIsPartialCapable(x) && !mergeJoinIsPartialCapable(x) && !nestedLoopJoinIsPartialCapable(x) && !lateralProbeJoinIsPartialCapable(x) {
 			return nil
 		}
 		// R94: same literal-left rule as the stamp sibling above.
-		if nestedLoopJoinIsPartialCapable(x) {
+		// R95: the lateral probe shares it.
+		if nestedLoopJoinIsPartialCapable(x) || lateralProbeJoinIsPartialCapable(x) {
 			return drivingScan(x.Left)
 		}
 		if joinProbeSideIsLeft(x) {
@@ -749,11 +753,12 @@ func drivingScanCrossesSort(n Node) bool {
 	case *Project:
 		return drivingScanCrossesSort(x.Child)
 	case *Join:
-		if !hashJoinIsPartialCapable(x) && !mergeJoinIsPartialCapable(x) && !nestedLoopJoinIsPartialCapable(x) {
+		if !hashJoinIsPartialCapable(x) && !mergeJoinIsPartialCapable(x) && !nestedLoopJoinIsPartialCapable(x) && !lateralProbeJoinIsPartialCapable(x) {
 			return false
 		}
 		// R94: same literal-left rule as the two siblings above.
-		if nestedLoopJoinIsPartialCapable(x) {
+		// R95: the lateral probe shares it.
+		if nestedLoopJoinIsPartialCapable(x) || lateralProbeJoinIsPartialCapable(x) {
 			return drivingScanCrossesSort(x.Left)
 		}
 		if joinProbeSideIsLeft(x) {
@@ -812,6 +817,18 @@ func HasShareableHashJoin(n Node) bool {
 		return false
 	case *Join:
 		if !hashJoinIsPartialCapable(x) {
+			// R95: hashes below an approved nested-loop outer are still
+			// leader-prebuilt — descend the outer (left) literally so the
+			// prebuild sees what the claim walks will run. Without this,
+			// `collectShareableJoins` (which mirrors this descent)
+			// collects zero joins while workers partition the scan, and
+			// every worker builds a partial hash table with missing rows.
+			// R94's ordinary shape shares the rule (same silent-drop
+			// hazard); both predicates are named so a narrowing of either
+			// fails the agreement test instead of reopening the hole.
+			if nestedLoopJoinIsPartialCapable(x) || lateralProbeJoinIsPartialCapable(x) {
+				return HasShareableHashJoin(x.Left)
+			}
 			return false
 		}
 		return true
@@ -936,6 +953,68 @@ func mergeJoinIsPartialCapable(p *Join) bool {
 		return true
 	}
 	return false
+}
+
+// lateralProbeIsPartialProbe reports whether n is the bare parameterized
+// index probe R95 admits under a lateral join: an equality probe (Key or
+// Keys) with no SAOP multi-descent and no range bounds. SAOP is refused
+// because the `pidx` leaf filter is consulted only at the single-range
+// site (operators_index.go); range bounds are refused as
+// scope-minimization (Q96's probe is equality). An IndexOnlyScan has no
+// SAOP shape (promotion declines it), so only the range half applies.
+func lateralProbeIsPartialProbe(n Node) bool {
+	switch x := n.(type) {
+	case *IndexScan:
+		if x == nil || x.Index == nil {
+			return false
+		}
+		if len(x.SAOPKeys) > 0 || x.LowKey != nil || x.HighKey != nil {
+			return false
+		}
+		return x.Key != nil || len(x.Keys) > 0
+	case *IndexOnlyScan:
+		if x == nil || x.Index == nil {
+			return false
+		}
+		if x.LowKey != nil || x.HighKey != nil {
+			return false
+		}
+		return x.Key != nil || len(x.Keys) > 0
+	}
+	return false
+}
+
+// lateralProbeJoinIsPartialCapable states which lateral-probe nested loops
+// may run with a partial outer side (R95, plan-parity-fix-take2).
+//
+// This is R25's decomposed NLI shape (`createplannl.go:369`): a lateral
+// `Join` over a parameterized index probe with `OuterColumnRef` keys,
+// re-opened per outer tuple by the lateral stream. Partitioning the outer
+// is transparent — every worker re-opens the probe for its own outer rows
+// against its own correlation state (`OuterRows` is value-copied at
+// fan-out, `CTERowCache` is per-worker, the bind/unbind window is
+// per-call). The probe is never materialized whole, so unlike R94's
+// ordinary case there is no N× inner-memory term.
+//
+// Admitted narrowly: INNER only (Q96's comma joins plan as INNER;
+// CROSS/SEMI/ANTI/LEFT/RIGHT/FULL refused as scope-minimization), the
+// bare probe above (no wrappers — the BuildFast bridge implements
+// `lateralBindable` unconditionally, so a wrapped probe would double-bind;
+// no Memoize — covers R60's `getMemoizePath` loop output; no bitmap),
+// non-nil children. General lateral subtrees (aggregates, SRFs,
+// CTE-dependent inners) are refused: those are separate node shapes with
+// unmodelled per-worker semantics.
+func lateralProbeJoinIsPartialCapable(p *Join) bool {
+	if p == nil || p.Algo != JoinAlgoNestedLoop || !p.Lateral {
+		return false
+	}
+	if p.Type != JoinTypeInner {
+		return false
+	}
+	if p.Left == nil || p.Right == nil {
+		return false
+	}
+	return lateralProbeIsPartialProbe(p.Right)
 }
 
 // nestedLoopJoinIsPartialCapable states which ordinary nested loops may run

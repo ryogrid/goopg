@@ -273,6 +273,21 @@ func prebuildSharedHashJoins(ctx *Context, plan optimizer.Node, buildChild func(
 func collectShareableJoins(op Operator, out *[]*joinOp) {
 	switch x := op.(type) {
 	case *joinOp:
+		// R95 (plan-parity-fix-take2): descend the outer (left) of an
+		// approved nested loop — ordinary (R94) or lateral probe — so
+		// hashes below it are leader-prebuilt exactly as standalone
+		// hashes are. Without this, `HasShareableHashJoin` (which does
+		// descend) promises a prebuild the collection never performs,
+		// and every worker builds a PARTIAL hash table from its scan
+		// partition — silently dropped matches. The probe/lateral inner
+		// itself is never descended: it is re-opened per outer row, not
+		// prebuilt.
+		if x.plan != nil && x.plan.Algo == optimizer.JoinAlgoNestedLoop {
+			if ordinaryInnerNestedLoopPartial(x.plan) || lateralProbeJoinPartial(x.plan, x.right) {
+				collectShareableJoins(x.left, out)
+			}
+			return
+		}
 		if x.plan == nil || x.plan.Algo != optimizer.JoinAlgoHash || x.plan.Lateral {
 			return
 		}

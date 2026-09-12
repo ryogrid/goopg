@@ -40,6 +40,43 @@ func ordinaryInnerNestedLoopPartial(p *optimizer.Join) bool {
 	return p.Type == optimizer.JoinTypeInner
 }
 
+// lateralProbeJoinPartial is the executor-side half of R95's admission rule:
+// R25's decomposed probe (lateral Join over a bare parameterized index
+// probe). It must agree with `lateralProbeJoinIsPartialCapable` on the plan
+// shape, and additionally proves what only the BUILT tree can show — that
+// the probe operator takes no lateral slot binding. A wrapped probe (the
+// BuildFast bridge forwards `lateralBindable` unconditionally) would
+// double-bind: once through the slot, once through `ctx.OuterRows`. The
+// probe binds through `ctx.OuterRows` alone, exactly as serial execution
+// does, so per-worker re-opening is transparent.
+//
+// `right` is the join's built right operator. instrumentedOp wrappers are
+// transparent (they forward Next/Open, not bindings).
+func lateralProbeJoinPartial(p *optimizer.Join, right Operator) bool {
+	if p == nil || p.Algo != optimizer.JoinAlgoNestedLoop || !p.Lateral {
+		return false
+	}
+	if p.Type != optimizer.JoinTypeInner {
+		return false
+	}
+	if p.Left == nil || p.Right == nil || right == nil {
+		return false
+	}
+	inner := right
+	if iw, ok := inner.(*instrumentedOp); ok {
+		inner = iw.inner
+	}
+	switch inner.(type) {
+	case *indexScanOp, *indexOnlyScanOp:
+	default:
+		return false
+	}
+	if _, bindable := inner.(lateralBindable); bindable {
+		return false
+	}
+	return true
+}
+
 // parallelScanState is the work queue for one parallel sequential scan node.
 // The leader creates it; every worker's seqScanOp holds a pointer to the same
 // instance.
@@ -157,7 +194,12 @@ func attachParallelScan(op Operator, st *parallelScanState) bool {
 		// walk never descends right, so every worker reads the whole
 		// inner independently.
 		if x.plan != nil && x.plan.Algo == optimizer.JoinAlgoNestedLoop {
-			if !ordinaryInnerNestedLoopPartial(x.plan) || optimizer.HasBitmapScan(x.plan.Right) {
+			// R95: the lateral probe shares the literal-left rule — it
+			// re-opens per worker-local outer row and takes no claim.
+			if !ordinaryInnerNestedLoopPartial(x.plan) && !lateralProbeJoinPartial(x.plan, x.right) {
+				return false
+			}
+			if optimizer.HasBitmapScan(x.plan.Right) {
 				return false
 			}
 			return attachParallelScan(x.left, st)
@@ -256,10 +298,19 @@ func attachParallelBitmapScan(op Operator, st *parallelBitmapState) bool {
 		// nested loop is refused — the probeSideIsLeft fallthrough below
 		// must never answer for it, since BuildLeft is meaningless here.
 		if x.plan != nil && x.plan.Algo == optimizer.JoinAlgoNestedLoop {
-			if !ordinaryInnerNestedLoopPartial(x.plan) || optimizer.HasBitmapScan(x.plan.Right) {
+			if !ordinaryInnerNestedLoopPartial(x.plan) && !lateralProbeJoinPartial(x.plan, x.right) {
+				return false
+			}
+			if optimizer.HasBitmapScan(x.plan.Right) {
 				return false
 			}
 			return attachParallelBitmapScan(x.left, st)
+		}
+		// R95: nil plan refuses rather than panicking in
+		// probeSideIsLeft below — the walk is the last line of defence
+		// and its failure mode must be serial, never a throw.
+		if x.plan == nil {
+			return false
 		}
 		// P8: only the PROBE side is partial.
 		if probeSideIsLeft(x.plan) {
@@ -398,10 +449,17 @@ func attachParallelIndexScan(op Operator, st *parallelIndexScanState) bool {
 		// R94: same literal-left rule as the two siblings above; the
 		// inner never takes index claim state.
 		if x.plan != nil && x.plan.Algo == optimizer.JoinAlgoNestedLoop {
-			if !ordinaryInnerNestedLoopPartial(x.plan) || optimizer.HasBitmapScan(x.plan.Right) {
+			if !ordinaryInnerNestedLoopPartial(x.plan) && !lateralProbeJoinPartial(x.plan, x.right) {
+				return false
+			}
+			if optimizer.HasBitmapScan(x.plan.Right) {
 				return false
 			}
 			return attachParallelIndexScan(x.left, st)
+		}
+		// R95: same nil-plan refusal as the bitmap sibling above.
+		if x.plan == nil {
+			return false
 		}
 		// Probe side only, for the reason attachParallelScan's joinOp arm states.
 		if probeSideIsLeft(x.plan) {

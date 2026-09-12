@@ -407,10 +407,15 @@ func partialPathDrivingKind(p *Path) PathKind {
 	case PathNestLoop:
 		// R94 (plan-parity-fix-take2). An ordinary nested loop is partial
 		// through its OUTER side only: each worker joins its outer
-		// partition against the whole inner, which it materializes and
+		// partition against the WHOLE inner, which it materializes and
 		// replays itself. Admit ONLY the evidenced INNER shape — the
 		// node twin (nestedLoopJoinIsPartialCapable) agrees, and no path
 		// is admitted by PathKind alone.
+		//
+		// R95 extends the arm to the lateral-probe inner (parameterized
+		// index probe re-opened per worker-local outer row): the node
+		// twin is lateralProbeJoinIsPartialCapable, and the subset test
+		// below is re-checked rather than trusted.
 		//
 		// Only a path R60's producer built can appear here, and R60 files
 		// INNER only (its V1 gate refuses every other jointype for this
@@ -431,10 +436,38 @@ func partialPathDrivingKind(p *Path) PathKind {
 		if o == nil || o.ParallelWorkers <= 0 || !o.ParallelSafe || o.RequiredOuter != 0 {
 			return PathPrebuilt
 		}
-		// The inner is read WHOLE by every worker: it must be complete
-		// (unparameterised) and must not be a Memoize cache (per-probe
-		// semantics no worker can supply).
-		if in == nil || in.RequiredOuter != 0 || in.Kind == PathMemoize {
+		if in == nil || in.Kind == PathMemoize {
+			return PathPrebuilt
+		}
+		if in.RequiredOuter == 0 {
+			// The inner is read WHOLE by every worker: it must be complete
+			// (unparameterised) and must not be a Memoize cache (per-probe
+			// semantics no worker can supply).
+			return partialPathDrivingKind(o)
+		}
+		// R95 (plan-parity-fix-take2): the lateral-probe inner. A
+		// parameterized probe re-opened per worker-local outer row needs
+		// no outer claim and no whole-inner materialization — but only
+		// when the parameter is satisfiable by THIS outer: re-check the
+		// V8 subset test here rather than trusting the filing site (a
+		// producer that trusts a caller's gate is one refactor away from
+		// a hole). The probe shape itself (bare index equality probe) is
+		// proven at the node twin; here the kinds that can only be probes
+		// are admitted — a parameterized PathIndexScan from R60's
+		// producer (its Memoize loop output is PathMemoize, refused
+		// above) carrying index clauses. Anything else parameterized is
+		// refused: no worker can supply its parameter.
+		if p.Jointype != parser.JoinInner {
+			return PathPrebuilt
+		}
+		if in.Kind != PathIndexScan || len(in.IndexClauses) == 0 {
+			return PathPrebuilt
+		}
+		if p.OuterRelids == 0 || p.InnerRelids == 0 {
+			// Unpartitioned path: satisfiability is unprovable.
+			return PathPrebuilt
+		}
+		if req := calcNestloopRequiredOuter(p.OuterRelids, o.RequiredOuter, p.InnerRelids, in.RequiredOuter); req != 0 {
 			return PathPrebuilt
 		}
 		return partialPathDrivingKind(o)
