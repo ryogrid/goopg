@@ -4169,3 +4169,18 @@ R87 SCOPE READY 2026-09-12
 cost terms that create the 186.54 L2 / 53.21 L3 advantage for the non-PG
 prefix. No Gather/NLI execution support, GUC/default, estimator, or cost code
 is authorized. Next: agent review, commit/push SCOPE, then R87 measurement.
+R87 F-branch attribution DONE 2026-09-12
+(`r87-q96-f-prefix-cost/REPORT.md`, measurement-only; implementation review
+pending): outcome **F1**. Goopg's unique-index superkey shortcut consumes the
+L2 equality and charges `1/raw-key-rows`, so it misses the nullable
+`store_sales` key's PG `stanullfrac` (4.4066668% for `ss_hdemo_sk`, 4.38% for
+`ss_store_sk`). It consequently estimates partial `ss⋈hd` as 23222 rather
+than PG's 22198, and `ss⋈store` as 19352 rather than the PG-source-rule 18504.
+The 186.54 L2 advantage is not wholly the F1 effect: 147.8375 is faithful
+filtered-inner/hash startup, and the null-sensitive output-CPU portion is
+38.70 (the PG-null correction would reduce the gap by only about 1.76).
+No width/spill, partial-unit, or comparator defect is reached. Q96 values match (`266`),
+temporary tracing is gone, and Q9/Q41/Q91/Q96 trace controls are byte-identical.
+Next: review this report, commit/push it, then separately scope R88 to preserve
+unique-key fan-out bounds while applying PG's null-aware equality selectivity
+for non-FK joins in both estimator siblings.
