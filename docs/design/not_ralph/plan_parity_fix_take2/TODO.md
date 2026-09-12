@@ -4241,3 +4241,16 @@ geometry is not PG virtual-bucket geometry, so its executor-coordinate
 unmatched tuple-walk charge is zero rather than guessed from `NBuckets`.
 Next: agent review, correct if needed, commit -n/push the scope, then and only
 then implement with focused proof tests and the mandatory full parity gates.
+
+R90 DONE 2026-09-12 (`r90-inner-unique-hash-final-cost/REPORT.md`): production
+commit `b2b671e7f`, with direct partial-unique rejection test follow-up
+`3469163a6`, transports fail-closed INNER bare-unique evidence and one shared
+total-coordinate match fraction to serial/partial Hash Join final costing.
+Matched canonical-key probes are priced; unmatched map misses have zero tuple
+walk, explicitly not a guessed PG virtual-bucket cost. Q96 values remain `266`,
+natural/top and trace controls are byte-identical, and its non-PG prefix remains
+selected (top cost `25434.49` -> `24541.49`). Full gates pass: TPC-H digest
+24/24 MATCH, SF0.25 PASS=96 with zero correctness failures, and fresh live-PG
+census `2/67/0/27/3/0`. Next: separately scope any PG-compatible unmatched
+virtual-bucket/MCV/QualCost/pathtarget input; do not infer it from executor
+map geometry or force Q96's order.
