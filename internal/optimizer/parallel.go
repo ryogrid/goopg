@@ -520,7 +520,9 @@ func terminatesPartial(n Node) bool {
 
 // stampParallelScan is drivingScan's copy-on-write sibling: it performs the
 // EXACT SAME traversal decision (Filter/Project pass-through, Join probe-side
-// only under hashJoinIsPartialCapable, terminating on *SeqScan/*BitmapHeapScan)
+// only under hashJoinIsPartialCapable, outer-side only under
+// mergeJoinIsPartialCapable / nestedLoopJoinIsPartialCapable, terminating on
+// *SeqScan/*BitmapHeapScan)
 // but instead of merely locating the driving scan, it returns a NEW tree with
 // Parallel: true stamped on a COPY of that scan. This mirrors PostgreSQL's
 // parallel_aware, which is set per-PATH-CHOICE at path-construction time
@@ -605,8 +607,21 @@ func stampParallelScan(n Node) Node {
 		// (`partialPathDrivingKind` Children[0]), this label walk, and the
 		// executor walk (`attachParallelScan` JoinAlgoMerge) all descend
 		// the left.
-		if !hashJoinIsPartialCapable(x) && !mergeJoinIsPartialCapable(x) {
+		if !hashJoinIsPartialCapable(x) && !mergeJoinIsPartialCapable(x) && !nestedLoopJoinIsPartialCapable(x) {
 			return n
+		}
+		// R94: an ordinary nested loop is partial through its OUTER (left)
+		// side only, named literally — never via joinProbeSideIsLeft, which
+		// answers from BuildLeft, a field a nested loop leaves false by
+		// construction (the seq-arm trap documented on attachParallelScan).
+		if nestedLoopJoinIsPartialCapable(x) {
+			left := stampParallelScan(x.Left)
+			if left == x.Left {
+				return x
+			}
+			c := *x
+			c.Left = left
+			return &c
 		}
 		if joinProbeSideIsLeft(x) {
 			left := stampParallelScan(x.Left)
@@ -699,8 +714,12 @@ func drivingScan(n Node) Node {
 		// shared side logic below descends the outer with no special case —
 		// which is exactly what must stay true: if BuildLeft ever becomes
 		// meaningful for merge, this arm needs its own side test.
-		if !hashJoinIsPartialCapable(x) && !mergeJoinIsPartialCapable(x) {
+		if !hashJoinIsPartialCapable(x) && !mergeJoinIsPartialCapable(x) && !nestedLoopJoinIsPartialCapable(x) {
 			return nil
+		}
+		// R94: same literal-left rule as the stamp sibling above.
+		if nestedLoopJoinIsPartialCapable(x) {
+			return drivingScan(x.Left)
 		}
 		if joinProbeSideIsLeft(x) {
 			return drivingScan(x.Left)
@@ -730,8 +749,12 @@ func drivingScanCrossesSort(n Node) bool {
 	case *Project:
 		return drivingScanCrossesSort(x.Child)
 	case *Join:
-		if !hashJoinIsPartialCapable(x) && !mergeJoinIsPartialCapable(x) {
+		if !hashJoinIsPartialCapable(x) && !mergeJoinIsPartialCapable(x) && !nestedLoopJoinIsPartialCapable(x) {
 			return false
+		}
+		// R94: same literal-left rule as the two siblings above.
+		if nestedLoopJoinIsPartialCapable(x) {
+			return drivingScanCrossesSort(x.Left)
 		}
 		if joinProbeSideIsLeft(x) {
 			return drivingScanCrossesSort(x.Left)
@@ -913,6 +936,38 @@ func mergeJoinIsPartialCapable(p *Join) bool {
 		return true
 	}
 	return false
+}
+
+// nestedLoopJoinIsPartialCapable states which ordinary nested loops may run
+// with a partial outer side (R94, plan-parity-fix-take2).
+//
+// The rule is "a nested loop whose per-outer-row verdict is worker-local",
+// the same shape as the twins with the build/probe vocabulary replaced by
+// outer/whole-inner: each worker joins ITS partition of the outer against
+// the WHOLE inner, which it materializes and replays itself
+// (`openNestedLoop`, join_nl_stream.go) — there is no shared inner state,
+// so there is nothing for a prebuild step to adopt.
+//
+//   - INNER decides each outer row against the inner alone, so partitioning
+//     the outer is transparent. Only INNER is admitted: LEFT/SEMI/ANTI are
+//     worker-local on the same rationale as the twins, but Q96 (the only
+//     consumer) is INNER and the refusal is deliberate scope-minimization,
+//     not a correctness boundary — do not widen it without a separate scope.
+//   - FULL and RIGHT would require knowing which INNER rows went unmatched
+//     across ALL workers — the same cross-worker reduction the twins
+//     refuse. Refused rather than approximated.
+//
+// LATERAL is excluded on the same ground as the twins. A parameterized
+// (`*NestedLoopIndexJoin`) shape never reaches this predicate: it is a
+// different node type, not a flag.
+func nestedLoopJoinIsPartialCapable(p *Join) bool {
+	if p == nil || p.Algo != JoinAlgoNestedLoop || p.Lateral {
+		return false
+	}
+	if p.Left == nil || p.Right == nil {
+		return false
+	}
+	return p.Type == JoinTypeInner
 }
 
 // scanTable extracts the *catalog.Table from a scan node (SeqScan,

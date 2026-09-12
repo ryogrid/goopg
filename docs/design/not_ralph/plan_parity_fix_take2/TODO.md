@@ -4319,3 +4319,34 @@ removed. Optimizer/executor test and vet gates plus whitespace pass with an
 empty production diff. Next: separately scope ordinary nested-loop partial
 semantics (including worker identity and cost coordinates), or select a
 separately proven partial NLI candidate; do not infer either from `PathKind`.
+
+R94 SCOPE READY 2026-09-12
+(`r94-partial-plain-nestloop/SCOPE.md`): admit only the actually evidenced
+ordinary INNER nested-loop worker shape: each worker claims a disjoint outer
+scan partition and independently materializes the whole unparameterized inner.
+Thread that exact outer-only rule through the path classifier, optimizer
+stamping/driving walks, and every executor claim walker; prove values against
+serial before allowing Q96's partial aggregate source to use it. RIGHT/FULL,
+parameterized inners, NLI, Memoize, and cost/default changes remain refused.
+Next: agent review, revise if needed, commit -n/push scope, then implement.
+
+R94 SCOPE REVIEWED 2026-09-12 (APPROVE-WITH-NOTES, `0dccc34`): all 10
+review notes reflected (inner-memory proof-or-deferral, multi-bitmap
+guard, unstampParallelScan in matrix, Lateral exclusion, LEFT/SEMI/ANTI
+refusal as scope-minimization, literal-left rule, V5 outer checks,
+inner-no-claim assertions, R60 filing narrowing, -n kept per goal
+contract). Next: implement items 1–4, gates, REPORT.
+
+R94 PARTIAL 2026-09-12 (items 1–3 + tests): node twin
+`nestedLoopJoinIsPartialCapable` + four-walk agreement (unstamp needs
+no code change — both-side descent already covers NL, pinned by test);
+`partialPathDrivingKind` PathNestLoop arm (INNER-only, V5 outer checks,
+non-Memoize complete inner); R60 V1 filing narrowed to INNER (refused
+heads cannot starve siblings — head-only reader); executor literal-left
+arms on all three claim walkers + inner-bitmap refusal. Tests:
+optimizer agreement/classifier/filing pins; executor hand-Gathered
+identity (cross-join corpus — equi plans hash even disabled; Cross≡Inner
+for NL execution) incl. empty sides + large inner (memory deferral
+documented), inner-no-claim, refusal matrix. Full optimizer + executor
+suites green, vet clean. Next: item 4 (agg split source selection),
+full gates, REPORT.

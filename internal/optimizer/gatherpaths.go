@@ -45,6 +45,8 @@ package optimizer
 import (
 	"os"
 	"strings"
+
+	"github.com/goopg/goopg/internal/parser"
 )
 
 // gatherPathMode is the admission rule for the paths this file produces.
@@ -402,6 +404,40 @@ func partialPathDrivingKind(p *Path) PathKind {
 			return PathPrebuilt
 		}
 		return partialPathDrivingKind(p.Children[0])
+	case PathNestLoop:
+		// R94 (plan-parity-fix-take2). An ordinary nested loop is partial
+		// through its OUTER side only: each worker joins its outer
+		// partition against the whole inner, which it materializes and
+		// replays itself. Admit ONLY the evidenced INNER shape — the
+		// node twin (nestedLoopJoinIsPartialCapable) agrees, and no path
+		// is admitted by PathKind alone.
+		//
+		// Only a path R60's producer built can appear here, and R60 files
+		// INNER only (its V1 gate refuses every other jointype for this
+		// arm, since a refused head would starve admittable siblings —
+		// makeGatherPath reads PartialPathlist[0] only). The jointype
+		// test below re-asserts it rather than trusting the caller, for
+		// the reason createPartialGroupingPaths states: a producer that
+		// trusts a caller's gate is one refactor away from a hole.
+		if p.Jointype != parser.JoinInner {
+			return PathPrebuilt
+		}
+		if p.RequiredOuter != 0 || len(p.Children) != 2 {
+			return PathPrebuilt
+		}
+		o, in := p.Children[0], p.Children[1]
+		// The V5-class check every landed producer repeats: a 0-worker or
+		// parallel-unsafe outer breaks the ParallelWorkers convention.
+		if o == nil || o.ParallelWorkers <= 0 || !o.ParallelSafe || o.RequiredOuter != 0 {
+			return PathPrebuilt
+		}
+		// The inner is read WHOLE by every worker: it must be complete
+		// (unparameterised) and must not be a Memoize cache (per-probe
+		// semantics no worker can supply).
+		if in == nil || in.RequiredOuter != 0 || in.Kind == PathMemoize {
+			return PathPrebuilt
+		}
+		return partialPathDrivingKind(o)
 	default:
 		// PathPrebuilt, joins, Sort, Memoize, Agg: not modelled by any attach
 		// walk at this slice's scope. Refuse.

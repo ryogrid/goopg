@@ -410,6 +410,19 @@ func addPartialNestLoopPaths(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp
 		tracePVetoCtx(s, "nestloop", traceRelids(joinrel), traceRelids(outer), traceRelids(inner), "V1", "jt="+traceJoinTypeName(jt))
 		return
 	}
+	// R94 (plan-parity-fix-take2): file only the evidenced ordinary INNER
+	// shape. LEFT/SEMI/ANTI have no admitted consumer — the path
+	// classifier (partialPathDrivingKind) and the node twin
+	// (nestedLoopJoinIsPartialCapable) both refuse them — and a refused
+	// path filed at PartialPathlist[0] would starve admittable hash/merge
+	// siblings, since makeGatherPath reads the head only. Filing them
+	// would be costed-but-never-runnable noise at best. Narrowing the
+	// filing (rather than the classifier) keeps every filed partial NL
+	// runnable end to end.
+	if jt != parser.JoinInner {
+		tracePVetoCtx(s, "nestloop", traceRelids(joinrel), traceRelids(outer), traceRelids(inner), "V1-nl-inner", "jt="+traceJoinTypeName(jt))
+		return
+	}
 	// `joinrel->consider_parallel` (already propagated by
 	// joinrelConsiderParallel), as the partial-hash producer reads it.
 	if s == nil || !s.parallelModeOK || joinrel == nil || !joinrel.ConsiderParallel {

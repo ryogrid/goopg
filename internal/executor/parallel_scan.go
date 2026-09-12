@@ -21,6 +21,25 @@ import (
 	"github.com/goopg/goopg/internal/storage"
 )
 
+// ordinaryInnerNestedLoopPartial is the executor-side half of R94's
+// admission rule (plan-parity-fix-take2): the plan shapes whose per-worker
+// semantics the three attach walks model. It must agree with the
+// planner-side twin `nestedLoopJoinIsPartialCapable` (optimizer/parallel.go)
+// and the path classifier (`partialPathDrivingKind`'s PathNestLoop arm) —
+// a shape admitted here but refused there (or vice versa) either runs
+// unmodelled or never runs. Ordinary INNER only, non-nil children, never
+// lateral, never parameterized (an NLI is a different plan node,
+// *NestedLoopIndexJoin, and never reaches a joinOp).
+func ordinaryInnerNestedLoopPartial(p *optimizer.Join) bool {
+	if p == nil || p.Algo != optimizer.JoinAlgoNestedLoop || p.Lateral {
+		return false
+	}
+	if p.Left == nil || p.Right == nil {
+		return false
+	}
+	return p.Type == optimizer.JoinTypeInner
+}
+
 // parallelScanState is the work queue for one parallel sequential scan node.
 // The leader creates it; every worker's seqScanOp holds a pointer to the same
 // instance.
@@ -124,6 +143,25 @@ func attachParallelScan(op Operator, st *parallelScanState) bool {
 	case *instrumentedOp:
 		return attachParallelScan(x.inner, st)
 	case *joinOp:
+		// R94 (plan-parity-fix-take2). An approved ordinary INNER nested
+		// loop is partial through its OUTER (left) side only: each worker
+		// joins its outer partition against the WHOLE inner, which it
+		// materializes and replays itself (`openNestedLoop`). The side is
+		// named literally — never via probeSideIsLeft, which answers from
+		// BuildLeft, a field a nested loop leaves false by construction
+		// (the same trap the merge arm documents below). The inner
+		// receives no claim state; a bitmap scan anywhere in it is a
+		// refusal (prebuildBitmap shares nothing with >1 bitmap scan, so
+		// the outer would go unpartitioned — N+1 copies, silently).
+		// Seq/index inners are safe: they hold no shared state and this
+		// walk never descends right, so every worker reads the whole
+		// inner independently.
+		if x.plan != nil && x.plan.Algo == optimizer.JoinAlgoNestedLoop {
+			if !ordinaryInnerNestedLoopPartial(x.plan) || optimizer.HasBitmapScan(x.plan.Right) {
+				return false
+			}
+			return attachParallelScan(x.left, st)
+		}
 		// P8. Only the PROBE side is partial: the build side was drained once
 		// by the leader before fan-out. Attaching the allocator to the build
 		// side instead would give each worker a PARTITION of the build input,
@@ -212,6 +250,17 @@ func attachParallelBitmapScan(op Operator, st *parallelBitmapState) bool {
 	case *instrumentedOp:
 		return attachParallelBitmapScan(x.inner, st)
 	case *joinOp:
+		// R94: an approved ordinary INNER nested loop descends the OUTER
+		// (left) side literally; the inner never takes bitmap claim
+		// state (same guard as the sequential arm above). Every other
+		// nested loop is refused — the probeSideIsLeft fallthrough below
+		// must never answer for it, since BuildLeft is meaningless here.
+		if x.plan != nil && x.plan.Algo == optimizer.JoinAlgoNestedLoop {
+			if !ordinaryInnerNestedLoopPartial(x.plan) || optimizer.HasBitmapScan(x.plan.Right) {
+				return false
+			}
+			return attachParallelBitmapScan(x.left, st)
+		}
 		// P8: only the PROBE side is partial.
 		if probeSideIsLeft(x.plan) {
 			return attachParallelBitmapScan(x.left, st)
@@ -346,6 +395,14 @@ func attachParallelIndexScan(op Operator, st *parallelIndexScanState) bool {
 	case *instrumentedOp:
 		return attachParallelIndexScan(x.inner, st)
 	case *joinOp:
+		// R94: same literal-left rule as the two siblings above; the
+		// inner never takes index claim state.
+		if x.plan != nil && x.plan.Algo == optimizer.JoinAlgoNestedLoop {
+			if !ordinaryInnerNestedLoopPartial(x.plan) || optimizer.HasBitmapScan(x.plan.Right) {
+				return false
+			}
+			return attachParallelIndexScan(x.left, st)
+		}
 		// Probe side only, for the reason attachParallelScan's joinOp arm states.
 		if probeSideIsLeft(x.plan) {
 			return attachParallelIndexScan(x.left, st)
