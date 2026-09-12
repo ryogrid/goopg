@@ -4308,3 +4308,14 @@ after a focused serial-versus-parallel value proof. It must decline
 unsupported nodes, preserve the serial candidate, and never make a Gather win
 by force. Next: agent review, revise if needed, commit -n/push scope, then
 implement and run the mandatory correctness and parity gates.
+
+R93 DONE 2026-09-12 (`r93-isolated-partial-prebuilt/REPORT.md`): the
+copy-isolated construction probe succeeds without mutating the shared
+`PathPrebuilt` source, but Q96's first final-relset `PathNestLoop` builds an
+ordinary `*Join`, not `*NestedLoopIndexJoin`. It therefore has no approved
+worker spine and must remain serial; applying NLI outer-only claiming would
+have been a node-kind error. The temporary implementation and trace were
+removed. Optimizer/executor test and vet gates plus whitespace pass with an
+empty production diff. Next: separately scope ordinary nested-loop partial
+semantics (including worker identity and cost coordinates), or select a
+separately proven partial NLI candidate; do not infer either from `PathKind`.
