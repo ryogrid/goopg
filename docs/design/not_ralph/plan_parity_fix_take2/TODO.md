@@ -4195,3 +4195,17 @@ DP-only because completed `estimateJoin` has a separate semi path. The scope
 does not promise a Q96 flip: R87 measured that the null correction changes only
 about 1.76 of the 186.54 L2 gap. Next: agent review, reflect, commit -n/push
 scope, then implementation with mandatory Q96/Q9/full-corpus evidence.
+
+R88 DONE 2026-09-12 (`r88-q96-unique-key-null/REPORT.md`): implementation
+`0b98709ae` separates FK consumption from bare-unique row bounds in both
+estimators, retains null-aware no-MCV equality, and declines partial unique
+indexes. Review blockers on two-sided bound selection and FK-overlap test
+strength were fixed before approval. Q96 values match PG (`266`) and trace
+controls are byte-identical, but the natural tree remains the serial
+`(ss⋈store)⋈hd` prefix rather than PG's parallel `(ss⋈hd)⋈store` prefix. Global
+gates pass: TPC-H digest 24/24 and SF0.25 `PASS=96`, all-zero correctness
+failures; fresh live-PG census is `2/67/0/27/3/0` (not called unchanged versus
+R85 live’s `2/69/0/25/3/0`). Next: scope the measured same-relset Q96 partial
+prefix tournament (`ss⋈store` wins L2 by 184.79 and L3 by 50.81) before any
+conditional serial/parallel follow-up; do not undo the bare-unique/FK
+distinction.
