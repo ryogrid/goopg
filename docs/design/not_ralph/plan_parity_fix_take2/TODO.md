@@ -4184,3 +4184,14 @@ temporary tracing is gone, and Q9/Q41/Q91/Q96 trace controls are byte-identical.
 Next: review this report, commit/push it, then separately scope R88 to preserve
 unique-key fan-out bounds while applying PG's null-aware equality selectivity
 for non-FK joins in both estimator siblings.
+R88 SCOPE READY 2026-09-12
+(`r88-q96-unique-key-null/SCOPE.md`): split bare-unique evidence from declared
+FK selectivity in both cardinality coordinate spaces. A non-partial bare
+unique index may establish only a sound fan-out row bound; its equality remains
+in ordinary selectivity. R88 also fixes legacy non-MCV null complements,
+separates bound/FK-consumption state so unique cannot mask FK, and declines
+partial unique evidence fail-closed. Declared-FK SEMI/ANTI preservation is
+DP-only because completed `estimateJoin` has a separate semi path. The scope
+does not promise a Q96 flip: R87 measured that the null correction changes only
+about 1.76 of the 186.54 L2 gap. Next: agent review, reflect, commit -n/push
+scope, then implementation with mandatory Q96/Q9/full-corpus evidence.
