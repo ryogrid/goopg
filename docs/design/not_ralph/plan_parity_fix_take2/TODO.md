@@ -4396,3 +4396,10 @@ build-side rows (720-vs-1) with rows/sizing ruled out. Hypotheses
 ranked: (1) build-cost transcription audit, (2) conditional fuzz
 tiebreak (needs PG loser price). No code changed. Next: P1 slice
 menu → R97+ implementation (separate).
+R96 P1 DONE 2026-09-12 (`r96-q96-join-order/SLICE.md`, review
+APPROVE): term audit names the bucket-walk skip-vs-charge asymmetry
+(goopg skips at innerBucketSize==0, PG never skips, default 1.0) as
+the lead decider (outer×inner scaling dwarfs the margin); slices
+(a) audit-first minimal fix with global gates, (b) conditional fuzz
+tiebreak, (c) ruled-out list. Implementation is R97+ (separate
+scope); step-1 bs measurement may run under R96's P0 bar.
