@@ -5093,3 +5093,51 @@ NCols/AvgVarBytes/**OutputWidth** (all three, or it recreates R120's
 two-currency defect one level up); key on `jt` (`pathgen.go:78`,`:148`),
 `JoinRight` publishes BOTH sides so outer-only is SEMI/ANTI; and census
 the narrowed-vs-declined join pairs before reading its category deltas.
+
+R122 SCOPE READY 2026-09-14 (`r122-narrow-join-propagation/SCOPE.md`,
+review **BLOCK -> amended**): Slice B — join paths propagate narrowed
+widths. This is the round R121's own gate names ("if Slice B does not
+land in the next round-cluster, R121 is dead code").
+Cut: propagate in **`addPath`/`addPartialPath`** (`path.go:930`,`:977`),
+ONE choke point rather than seven constructors — verified the single
+funnel (Pathlist/PartialPathlist are written at exactly those two
+places; the semi-splice route goes through the same constructors; no
+join path is mutated after addPath). Timing is the subtle part and is
+correct: the constructor computes its own cost from its CHILDREN's
+widths before calling addPath, so stamping the join's own triple there
+is too late for its own cost — which is right, because that triple is
+consumed only when the path becomes a CHILD one level up.
+Rule: `NCols/AvgVarBytes/OutputWidth = outer + inner`, outer-only for
+`JoinSemi`/`JoinAnti` (verified against `joinPublishesInner`,
+`joinrelsize.go:127-133`; **`JoinRight` publishes BOTH**; `JoinFull`
+never produces a path but implement it as "both" so a future FULL
+executor cannot silently take the SEMI branch).
+Review caught, and the scope now carries: (1) **decline rule 4** —
+`NCols > 0` is NOT a proxy for "we narrowed it", because
+`pathindexonly.go:136-148` writes the whole triple UNCONDITIONALLY, so
+without the rule a declining rel's index-only path would launder its
+triple into a join sum while the NLI path for the SAME joinrel declined
+— R121's wrapper leak, one level up; (2) the Kind test must be an
+explicit **whitelist**, since `parser.JoinInner == 0` is the zero value
+and `PathSetOp` has exactly two children — "has 2 children" or "has a
+Jointype" both read a set-op as an inner join; (3) a mis-citation
+(`hashjoin_pgtuplesizing.go:57-58` is inside a trace function gated on
+`pathTraceEnabled` — justifying a decline rule with diagnostic-only code
+invites the next round to weaken it).
+Known scale, recorded BEFORE implementing: of the 100 TPC-DS query
+files **31 have a `WITH` and 28 a `FROM (`-subquery**; every such leaf
+has `ri.table == nil` -> nil `ColVarBytes` -> the rel declines -> under
+rule 1 every join above it declines. So narrowing dies partway up on
+roughly a third to a half of TPC-DS. The §2 census is therefore the
+round's actual deliverable and must be counted **per join and per
+pair** with the five decline arms broken out — R121's P1 went PARTIAL
+for skipping exactly this and it must not happen twice.
+No prediction claims a parity gain. If P3 holds flat again, the REPORT
+must explicitly ask whether the A+B+C chain is worth finishing rather
+than deferring a third time. Gates additionally require a
+`hashsize.Choose` geometry capture at both widths (R121 asked for it and
+the first draft dropped it) and merge-input-sort movement reported
+SEPARATELY from hash-geometry movement (`sortPathFor*` prices a merge
+input sort from the subpath triple, and with Slice B that subpath can be
+a JOIN — a join-METHOD lever, not a rounding difference).
+Next: implement, then gates.
