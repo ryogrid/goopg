@@ -4639,6 +4639,17 @@ still differs because Goopg loses trailing whitespace in `varchar`. Stop rule
 applied; scope a data-fidelity repair before common-data cost attribution or
 R108.
 
+R110 SCOPE READY 2026-09-13 (`r110-varchar-trailing-space-fidelity/SCOPE.md`):
+repair only varchar typmod coercion so in-range trailing whitespace survives,
+while PG's excess-space truncation remains intact. Next: agent review,
+`git commit -n`/push scope, then implement; no cost/election change is
+authorized.
+
+R110 SCOPE REVIEWED 2026-09-13 (APPROVE after one BLOCK correction):
+assignment/COPY overlength values may drop only trailing spaces, while explicit
+overlength `::varchar(n)` casts retain PG arbitrary truncation. Next: `git
+commit -n`/push scope, then implement.
+
 R108 PLANNED — PG hash-tuple sizing comparison, dependent on R107 DONE:
 only after R107 establishes common relation/schema/index inputs and records
 both engines' native statistics, scope and review an opt-in experiment that
