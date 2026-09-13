@@ -4610,6 +4610,17 @@ The forced-margin term attribution is unobservable; no cost/election change
 is authorized. Next: scope a common-data/stats oracle plus selected-Hash-Join
 component diagnostic before any cost work.
 
+R107 SCOPE READY 2026-09-13 (`r107-q96-common-data-oracle/SCOPE.md`): create
+fresh disposable PG18.3 and Goopg Q96 clusters from one SF0.25 input, prove
+relation/schema/index equivalence and record (not equate) engine-native
+statistics, then capture the immutable forced forms. No planner change is
+authorized. Next: agent review, `git commit -n`/push scope, then measurement.
+
+R107 SCOPE REVIEWED 2026-09-13 (APPROVE after one BLOCK correction): prove
+data/schema/index equivalence before ANALYZE, but record each engine's native
+statistics and controls rather than requiring their equality. Next: `git
+commit -n`/push scope, then measurement.
+
 TIMING SURVEY DONE 2026-09-13 (`r97-timing-survey/REPORT.md`,
 measurement-only, no code change, no review — survey not a design
 doc): TPC-DS SF0.25 all 96 queries timed (3-run medians, values
