@@ -4729,6 +4729,23 @@ byte reader, its exact PG formula and candidate reachability before authorizing
 one family-specific comparison. Next: agent review, correction if needed,
 `git commit -n`, and push; then inventory only.
 
+R112 DONE 2026-09-13 (`r112-pg-cost-family-inventory/REPORT.md`): source and
+fresh-plan inventory rejects a universal PG Datum-size substitution. Sort is
+the first evidence-backed candidate (`hashsize.EntryBytes` versus PG
+`relation_byte_size`), selected in 17/22 TPC-H and 89/99 TPC-DS plans; HashAgg
+and Memoize are separate candidates with different formulas. No source change
+was made. Next: scope a Sort-only comparison; do not combine it with HashAgg,
+Memoize, scan/index pages, or executor capacity.
+
+R113 PLANNED — PG relation-byte Sort-price comparison, dependent on R112 DONE:
+scope and review a default-off planner-only comparison of `costSortRun`'s
+external-sort byte model against PG18.3 `cost_tuplesort` / `relation_byte_size`
+using emitted path width and aligned heap-header representation. It must prove
+the width provenance at every Sort caller, preserve executor sort allocation
+and behaviour, distinguish selected from merely offered Sort paths, and record
+OFF/ON plan/value deltas against live PG18.3. Before source change: Design Doc,
+agent review, `git commit -n`, and push.
+
 TIMING SURVEY DONE 2026-09-13 (`r97-timing-survey/REPORT.md`,
 measurement-only, no code change, no review — survey not a design
 doc): TPC-DS SF0.25 all 96 queries timed (3-run medians, values
