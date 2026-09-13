@@ -96,9 +96,48 @@ func relNarrowedWidths(rel *RelOptInfo) narrowedWidths {
 		return narrowedWidths{}
 	}
 	out := rel.baseLeaf.Output()
-	if len(rel.ColVarBytes) == 0 {
+
+	// R124: a rel with NO per-column map may still narrow, when there is no
+	// statistic to lose.
+	//
+	// The decline below exists to stop us contributing a silent ZERO for a
+	// column whose width the map does not carry — it fails HIGH, the only safe
+	// direction for a hash build. But on a LEVEL-1 search rel `AvgVarBytes` and
+	// `ColVarBytes` are assigned together and only under the table guard
+	// (`joinsearch.go:403-411`), so a non-table leaf — a CTEScan, a planned
+	// sub-problem subtree, a SetOp, a Filter — arrives with BOTH nil and 0. Its
+	// un-narrowed fallback is therefore ALREADY `ncols = full, avgVar = 0`
+	// (`relNCols` / `pathAvgVarBytes`, path.go). Narrowing ncols while carrying
+	// avgVar = 0 hands the model the SAME variable-payload figure it already
+	// uses and only corrects the column count. No estimate is invented.
+	//
+	// MEASURED REACH (R124, TPC-DS SF0.25): 32 such rels — CTEScan 14,
+	// Project 9, SetOp 7, Filter 2, zero ordinary tables. Of those, only 10
+	// actually narrow (`kept < full`, the largest a Project 144 -> 28); the
+	// other 22 have `kept == full`, where this only replaces the NCols
+	// zero-sentinel with the same count. Both are correct; the second is
+	// numerically inert.
+	//
+	// The `AvgVarBytes == 0` guard is load-bearing and is a LIVE trip-wire: a
+	// nonzero relation-wide figure with no per-column map means the statistic
+	// EXISTS and cannot be attributed, so the original decline is right. Five
+	// UPPER-rel sites already assign `AvgVarBytes` alone (upperrel.go,
+	// groupingpaths.go, distinctpaths.go, windowsetoppaths.go), so any
+	// successor extending narrowing beyond joinrels[1] will trip it on real
+	// rels — correct behaviour, not a bug.
+	//
+	// KNOWN, ACCEPTED DIVERGENCE: avgVar = 0 under-states a leaf that really
+	// emits text columns. Pre-existing on both arms for these rels, but via
+	// R122's join propagation it now reaches join sums where the rel formerly
+	// declined, and there the planner can price below the executor's
+	// `buildAvgVarBytes` (which declines to the whole-relation sum).
+	// Cost-only: these Path fields never reach the executor, which sizes from
+	// `plan.AvgVarBytes` over REL fields (createplanjoin.go).
+	noColMap := len(rel.ColVarBytes) == 0
+	if noColMap && rel.AvgVarBytes != 0 {
 		return narrowedWidths{}
 	}
+
 	kept := make([]SchemaColumn, 0, len(keep))
 	var avg float64
 	for _, i := range keep {
@@ -106,17 +145,22 @@ func relNarrowedWidths(rel *RelOptInfo) narrowedWidths {
 			return narrowedWidths{}
 		}
 		col := out[i]
-		// Coordinate conversion, not an aside: neededKeepSet matches column
-		// names case-SENSITIVELY, while ColVarBytes is lowercase-keyed
-		// (tableColVarBytes).
-		w, found := rel.ColVarBytes[strings.ToLower(col.Name)]
-		if !found {
-			// Unattributed column — decline the whole rel rather than
-			// contribute a silent zero.
-			return narrowedWidths{}
+		if !noColMap {
+			// Coordinate conversion, not an aside: neededKeepSet matches column
+			// names case-SENSITIVELY, while ColVarBytes is lowercase-keyed
+			// (tableColVarBytes).
+			w, found := rel.ColVarBytes[strings.ToLower(col.Name)]
+			if !found {
+				// Unattributed column — decline the whole rel rather than
+				// contribute a silent zero.
+				return narrowedWidths{}
+			}
+			avg += w
 		}
-		avg += w
 		kept = append(kept, SchemaColumn{Name: col.Name, Type: col.Type})
+	}
+	if noColMap {
+		avg = 0 // literal, not defaulted — see the block comment above.
 	}
 	return narrowedWidths{
 		ncols:       len(keep),

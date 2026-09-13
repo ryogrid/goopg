@@ -5372,3 +5372,57 @@ gated `inAvgVarBytes > 0` (`cost_funcs.go:502`), false at avgVar=0 on
 both arms — that bounds what "readable" can reveal.
 Sizing unchanged: this makes TPC-DS categories READABLE, not matching.
 Next: implement, then gates.
+
+R124 DONE 2026-09-14 (`r124-nontable-leaf-widths/REPORT.md`, review
+**BLOCK -> both findings accepted; the round's conclusion CHANGED**):
+narrow the 32 non-table leaves. Cut fires on all 32; MIXED bucket
+42,679 -> 0; REL-NARROW 590 -> 622; arm (c) 32 -> 0; guard never fired;
+denominator conserved (116,271+0+8,345 = 124,616). Values PASS=96,
+TPC-H holds R122's gains (match 6, join-method 9, scan-type 8).
+**But the round changes NO plan and NO cost anywhere** — TPC-DS captures
+are identical to R122's modulo a header line and the K18 tempfile names;
+TPC-H byte-identical. My claim that this made TPC-DS's null "readable"
+where R122's was confounded is **WITHDRAWN**: the null is read off the
+same bytes R122 produced.
+Measured why (`kept` vs `full` over the 32): **22 are `kept == full`**,
+i.e. numerically inert — the cut only replaces the NCols zero-sentinel
+with the same count, so for those the "mixed currency" R122/R123 chased
+for two rounds was a **LABELLING artefact** whose two sides already
+carried identical numbers. **10 genuinely narrow** (CTEScan 9->8, 8->7,
+3->1; SetOp 4->3; and a **Project 144 -> 28**) — and that part is still
+UNEXPLAINED: a 116-column reduction that moves no cost. Do not read it
+as "narrowing doesn't matter"; those rels may sit in single-relation
+search problems with no join above them.
+**Second false claim of mine, retracted**: "join-order and parallelism
+are not width-driven". `joinpathsparallel.go:210-213` consumes the width
+triple directly, and the flag's own OFF/ON diff moves **Q6** (join order
++ Memoize key), **Q64** (84-line spine reorder) and **Q75** (Hash Left
+Join -> Nested Loop over Hash Right Join = a join-METHOD change), plus
+Q95 cost-only. I also failed to disclose those shape changes — R122 was
+forced to make exactly that disclosure one round earlier. Defensible
+claim: width DOES move TPC-DS join order/method, just not TOWARD PG.
+**R120's PAIRING HYPOTHESIS IS REFUTED** — the most valuable result
+here. R120 shipped as "NEGATIVE result, pair with ncols narrowing" and
+its promote-or-delete was re-pointed on that reasoning;
+`cost_funcs.go:502` even switches `armLive` to `inNcols > 0` under that
+flag, so R120's arm is *specifically* the consumer for R124's output.
+Run together on TPC-DS: GroupAgg 29 / HashAgg 123 / agg-strategy 71 —
+**identical to R120's arm alone**. Narrowing adds nothing; agg-strategy
+still worsens 69->71. **R120's flag should be DELETED**, not carried to
+another round: the condition it waited for arrived and changed nothing.
+Verdict on the chain for TPC-DS: **stop**, but for the corrected reason
+— not "narrowing can't touch these categories" (it can) but "with the
+chain complete and the confound bucket at zero, TPC-DS gains zero
+categories and zero matches while narrowing merely reshuffles its
+plans". Do NOT build the per-column width basis for CTE/SetOp outputs
+R123 floated: 22 of 32 rels were already at full-width parity and the 10
+real narrowings moved nothing.
+Also corrected: the accepted-divergence pin was a TAUTOLOGY (asserted
+`0+30==30`, already covered elsewhere; built no non-table leaf, never
+called `buildAvgVarBytes`) — it now calls `buildAvgVarBytes` and asserts
+the strict `planner < executor` inequality that IS the divergence; a
+stale pin name claimed subqueries/CTEs must decline, the opposite of
+what R124 ships; P4's TPC-H half is VACUOUS (zero eligible rels there);
+the values sweep ran on the INSTRUMENTED binary (plan-identical, but
+R123 stated this and R124 did not); and P2's zero-valued-arms clause was
+not met — the same omission R123 self-criticised.

@@ -78,7 +78,12 @@ func TestRelNarrowedWidthsDeclines(t *testing.T) {
 			ncRel([]string{"a", "b"}, nil, true, colVar)},
 		{"empty keep-set (SELECT count(*)) — NCols>0 is unrepresentable",
 			ncRel([]string{"a", "b"}, ncNeeded("zzz"), true, colVar)},
-		{"no ColVarBytes (un-ANALYZEd / subquery / CTE / VALUES)",
+		// R124 relabel: this fixture declines because ncRel sets
+		// AvgVarBytes=999 — a statistic that EXISTS but cannot be attributed.
+		// It is NOT "subqueries/CTEs decline"; since R124 those narrow (see
+		// TestRelNarrowedWidthsNarrowsNonTableLeaf). This is the live
+		// trip-wire.
+		{"nil ColVarBytes but a nonzero relation-wide figure (unattributable)",
 			ncRel([]string{"a", "b"}, ncNeeded("a"), true, nil)},
 		{"kept column unattributed in ColVarBytes — must fail HIGH",
 			ncRel([]string{"a", "q"}, ncNeeded("a", "q"), true, colVar)},
@@ -611,5 +616,120 @@ func TestNarrowJoinWidthsNarrowsANonTopJoinInALiveSearch(t *testing.T) {
 	if narrowed == 0 {
 		t.Fatal("no non-top join path was narrowed — Slice B did not reach the " +
 			"live search (this is P4, and it is the pin that replaces the dump)")
+	}
+}
+
+// ---- R124: non-table leaves narrow when there is no statistic to lose ----
+
+// ncRelNoStats is a non-table leaf: no per-column map AND no relation-wide
+// figure — the state a CTEScan / planned sub-problem / SetOp / Filter arrives
+// in, since both fields are assigned together and only under the table guard.
+func ncRelNoStats(cols []string, needed map[string]bool) *RelOptInfo {
+	rel := ncRel(cols, needed, true, nil)
+	rel.AvgVarBytes = 0
+	return rel
+}
+
+func TestRelNarrowedWidthsNarrowsNonTableLeaf(t *testing.T) {
+	defer setNarrowCostInputsForTest(true)()
+	rel := ncRelNoStats([]string{"a", "b", "c", "d"}, ncNeeded("a", "c"))
+	got := relNarrowedWidths(rel)
+	if !got.ok {
+		t.Fatal("a non-table leaf with no statistic to lose must narrow")
+	}
+	if got.ncols != 2 {
+		t.Errorf("ncols = %d, want 2 (the keep-set), not the full 4", got.ncols)
+	}
+	// avgVar is a LITERAL 0 — the same figure the un-narrowed fallback already
+	// uses for this rel. No estimate is invented.
+	if got.avgVarBytes != 0 {
+		t.Errorf("avgVarBytes = %v, want a literal 0", got.avgVarBytes)
+	}
+	if got.outputWidth <= 0 {
+		t.Errorf("outputWidth = %d, want > 0 (all-three-or-none)", got.outputWidth)
+	}
+}
+
+// The guard. A nonzero relation-wide figure with no per-column map means the
+// statistic EXISTS and cannot be attributed — the original decline is correct.
+// This is a LIVE trip-wire: five upper-rel sites assign AvgVarBytes alone, so
+// a successor extending narrowing beyond joinrels[1] will reach this state.
+func TestRelNarrowedWidthsDeclinesWhenAvgVarExistsButUnattributable(t *testing.T) {
+	defer setNarrowCostInputsForTest(true)()
+	rel := ncRel([]string{"a", "b"}, ncNeeded("a"), true, nil) // ncRel sets AvgVarBytes=999
+	if rel.AvgVarBytes == 0 {
+		t.Fatal("fixture: this case needs a nonzero relation-wide figure")
+	}
+	if got := relNarrowedWidths(rel); got.ok {
+		t.Fatalf("a statistic that exists but cannot be attributed must still "+
+			"decline (fail HIGH), got %+v", got)
+	}
+}
+
+// A table with real per-column stats is unaffected by the new arm: it still
+// sums the map and still declines on an unattributed kept column.
+func TestRelNarrowedWidthsTableWithStatsUnaffectedByR124(t *testing.T) {
+	defer setNarrowCostInputsForTest(true)()
+	ok := ncRel([]string{"a", "b"}, ncNeeded("a"), true, map[string]float64{"a": 10, "b": 100})
+	got := relNarrowedWidths(ok)
+	if !got.ok || got.avgVarBytes != 10 {
+		t.Errorf("a table with stats must still sum its map: %+v", got)
+	}
+	// Unattributed kept column: still declines, per the original contract.
+	bad := ncRel([]string{"a", "q"}, ncNeeded("a", "q"), true, map[string]float64{"a": 10})
+	if got := relNarrowedWidths(bad); got.ok {
+		t.Errorf("an unattributed kept column must still decline: %+v", got)
+	}
+}
+
+func TestRelNarrowedWidthsNonTableLeafInertWhenFlagOff(t *testing.T) {
+	defer setNarrowCostInputsForTest(false)()
+	rel := ncRelNoStats([]string{"a", "b"}, ncNeeded("a"))
+	if got := relNarrowedWidths(rel); got.ok {
+		t.Fatalf("flag off must narrow nothing, got %+v", got)
+	}
+}
+
+// R124 SCOPE §3 / review N1+N3: the ACCEPTED divergence, pinned against the
+// EXECUTOR's own function rather than against a synthetic constant.
+//
+// The first version of this pin asserted `0 + 30 == 30`, which is just
+// narrowJoinWidths' rule-2 sum and is already covered by
+// TestNarrowJoinWidthsSumsChildren — it constructed no non-table leaf and
+// never called buildAvgVarBytes, so it pinned nothing about the divergence it
+// was named for. This version calls buildAvgVarBytes directly and asserts the
+// inequality that IS the divergence.
+func TestR124AcceptedAvgVarDivergenceOnNonTableChild(t *testing.T) {
+	defer setNarrowCostInputsForTest(true)()
+
+	// A joinrel {non-table leaf, table}: ColVarBytes carries the table's
+	// columns only, and AvgVarBytes is the whole-relation sum, exactly as
+	// unionColVarBytes/joinsearchlevel build it.
+	joinrel := newRelOptInfo(3, 1000, 32)
+	joinrel.AvgVarBytes = 130 // 0 (CTE side) + 130 (table side, ALL columns)
+	joinrel.ColVarBytes = map[string]float64{"t_a": 30, "t_b": 100}
+
+	// The executor's charge: a retained schema naming a CTE-derived column the
+	// map cannot attribute makes buildAvgVarBytes decline to `full`.
+	retained := Schema{
+		{Name: "cte_x", Type: catalog.Type{Name: "int4"}},
+		{Name: "t_a", Type: catalog.Type{Name: "int4"}},
+	}
+	executorCharge := buildAvgVarBytes(&Path{Rel: joinrel}, retained)
+	if executorCharge != joinrel.AvgVarBytes {
+		t.Fatalf("fixture: buildAvgVarBytes should decline to the whole-relation "+
+			"sum %v for an unattributable column, got %v", joinrel.AvgVarBytes, executorCharge)
+	}
+
+	// The planner's charge after R124: the non-table child contributes a
+	// literal 0 and the table child its kept bytes.
+	j := njPath(PathHashJoin, parser.JoinInner, njNarrowed(1, 0, 8), njNarrowed(1, 30, 8))
+	narrowJoinWidths(j)
+
+	// THE DIVERGENCE: planner prices strictly below what the executor charges.
+	if !(j.AvgVarBytes < executorCharge) {
+		t.Fatalf("expected the ACCEPTED divergence (planner %v < executor %v); "+
+			"if this now holds, the divergence closed and the report must be updated",
+			j.AvgVarBytes, executorCharge)
 	}
 }
