@@ -206,3 +206,29 @@ baseline sits in a third epoch — re-take it rather than reusing these.
 The flag is default-off and P0 proves the default path is bit-identical
 to pre-round HEAD, so the gate's structural pins cannot have moved. This
 is recorded as a reasoned omission, not a silent skip.
+
+## 10. Amended 2026-09-14 by R121 rev 2 — the expiry is re-pointed to Slice C
+
+§7 above ties `GOOPG_HASHAGG_WIDTH_CURRENCY`'s promote-or-delete
+decision to R121 ("when ncols narrowing lands"). **R121 cannot
+discharge it.** That sentence stands as written — this is an appended
+amendment, not a rewrite, because a landed REPORT is an evidence
+artefact.
+
+Reason: R121's review established that Q10's aggregate input width is
+unreachable from `Path.NCols` **by invariant**.
+`aggInputWidth(child)` reads `len(child.Output())` off the built node
+(`groupingpaths.go:327-333`), and that node comes from
+`createPlanAtSearchRootRange`, which must publish the full binding
+concatenation — it panics on any hole and permits only a
+`fill`-licensed padded NULL (`createplanroot.go:100-140`). So no amount
+of path-level narrowing moves `inNcols=37`/`avgVar=2080`, and R120's arm
+would keep charging 3888 B/group regardless.
+
+R121 therefore narrows **cost inputs on scan and wrapper paths**
+(Slice A) and defers the upper/aggregate coordinate to **Slice C**.
+**The promote-or-delete decision for this flag moves to Slice C**, which
+is the round that can actually run the 2x2. R121 rev 1 had pre-registered
+that experiment and would have recorded a guaranteed "still flips" as a
+refutation — i.e. deleted a correct, PG-cited cost arm on an
+instrumentation artefact. It was withdrawn before implementation.

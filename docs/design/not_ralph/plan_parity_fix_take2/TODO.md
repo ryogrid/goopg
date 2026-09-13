@@ -4994,3 +4994,48 @@ that is 37 cols / avgVar 2080 against the ~7 cols / ~205 B PG carries.
 Narrowing removes R120's overshoot; only then is the currency correction
 safe to enable. R38's rejection is not a precedent against it — R38
 targeted `Width` (K66 says the input is `NCols`/`AvgVarBytes`).
+
+R121 SCOPE READY 2026-09-14 (`r121-narrow-cost-inputs/SCOPE.md` rev 2,
+review **BLOCK -> APPROVE-WITH-NOTES**, 5 BLOCKs remediated + 10 notes):
+narrow the planner's COST inputs (`Path.NCols`/`AvgVarBytes`/
+`OutputWidth`) — **Slice A only**.
+Design fixed by recon: narrow on the **Path, never the rel** (rel
+`AvgVarBytes`/`ColVarBytes` are `buildAvgVarBytes`'s deliberate
+over-charge decline for the EXECUTOR's hash entry,
+`entrywidth.go:49-71` -> `createplanjoin.go:572`; and rels are
+per-relset singletons shared across candidates). `NeededCols` is a
+NAME set that deliberately OVER-states and abandons wholesale on any
+unenumerable shape, so narrowing can only keep too MANY columns
+(`joinKeepSet ⊆ buildKeepSet ⊆ neededKeepSet`).
+Cut: **A(i)** write the triple at every base-rel scan constructor
+(prebuilt back-fill after `:700`/before `:707`, partial seqscan,
+bitmap, parameterised index `pathparamindex.go:416`, index-ordered
+`pathindexordered.go:251`; index-only EXEMPT — its `covered` set is a
+genuinely narrower emitted schema); **A(ii)** single-child wrappers
+copy the child's triple (Gather, GatherMerge, Sort, Memoize) and
+`costMemoizeRescan` switches off its direct `relNCols` read
+(`joinpathsmemoize.go:252`); **A(iii)** all-or-none PER REL among the
+paths this round writes.
+Three findings that would have shipped blind without review:
+(1) rev 1's "producers pick it up naturally" was FALSE — partial
+seqscan/Gather/Sort build fresh Paths with no triple, and since goopg's
+TPC-H plans are ALL parallel a back-fill alone would have narrowed
+~nothing; (2) partial narrowing makes sibling paths for the same
+joinrel **incomparable inside `addPath`** — a systematic bias no values
+or category gate can see, hence A(iii) plus a declined/mixed census in
+P1; (3) rev 1's headline P5 was **structurally unsatisfiable** —
+`createPlanAtSearchRootRange` must publish the full concatenation
+(`createplanroot.go:100-140`) and `aggInputWidth` reads the built node
+(`groupingpaths.go:327-333`), so Q10's aggregate input is unreachable
+from `Path.NCols`; the pre-registered miss-verdict would have DELETED
+R120's correct PG-cited arm on an instrumentation artefact. P5
+withdrawn; **R120's promote-or-delete expiry re-pointed to Slice C**
+(recorded as a dated addendum, R120 REPORT §10 — landed REPORTs are
+evidence artefacts and are appended to, never rewritten).
+Deferred: Slice B (join-path propagation — needs narrowed children
+first; key on `jt`, note `JoinRight` publishes BOTH sides, outer-only
+is SEMI/ANTI), Slice C (upper/aggregate input coordinate).
+Flag `GOOPG_NARROW_COST_INPUTS`, strict `=="1"`, default-off — the
+FIRST narrowing flag to gate a cost input (the existing `GOOPG_NARROW_*`
+are opt-OUT and gate plan shape only); watch the three-flag interaction
+with `GOOPG_NARROW_BUILD=0`. Next: implement Slice A, then gates.
