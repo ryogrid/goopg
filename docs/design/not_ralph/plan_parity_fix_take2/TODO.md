@@ -4688,6 +4688,21 @@ geometry must remain separate. Before any source change: Design Doc, agent
 review, `git commit -n`, and push. No cost/election change is authorized by
 this TODO entry.
 
+R108 SCOPE READY 2026-09-13 (`r108-pg-hash-tuple-sizing/DESIGN.md`): R111
+passed, so compare only an explicitly opt-in Hash Join spill-I/O price using
+PG18 packed HashJoinTuple geometry for batches and its separate heap-header
+page-size formula for I/O, while preserving Goopg map capacity and actual spill
+behavior. The switch is default-off, must expose both geometries in trace, and
+requires corpus/value/executor-spill evidence before any promotion decision.
+Next: agent review, correction if needed, `git commit -n` and push; no
+production edit is authorized first.
+
+R108 SCOPE REVIEWED 2026-09-13 (APPROVE after one formula correction): the
+experiment now separates packed HashJoinTuple batch geometry from PG's aligned
+HeapTupleHeader page-size I/O formula, with independent outer/inner width and
+PG-fit/Goopg-spill tests required. Next: `git commit -n`/push design, then
+implement the default-off experiment.
+
 TIMING SURVEY DONE 2026-09-13 (`r97-timing-survey/REPORT.md`,
 measurement-only, no code change, no review — survey not a design
 doc): TPC-DS SF0.25 all 96 queries timed (3-run medians, values
