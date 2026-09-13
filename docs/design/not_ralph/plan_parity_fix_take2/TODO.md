@@ -5321,3 +5321,54 @@ narrowed its own rels); for a CTEScan/SetOp it is NOT, and inventing one
 is forbidden — derive from the leaf Node's output schema plus whatever
 statistic the body supplies, or keep declining. Do not assume the
 sub-problem answer generalises to all 32.
+
+R124 SCOPE READY 2026-09-14 (`r124-nontable-leaf-widths/SCOPE.md`,
+review **APPROVE-WITH-NOTES**, no blocks, 3 mandatory amendments + 2
+applied): narrow the 32 non-table leaves R123 identified.
+**The cut is provably safe and changes exactly one number.** The arm-(c)
+decline exists to avoid contributing a silent zero where a real
+statistic is unattributable — but for these rels **there is no statistic
+to lose**: on a level-1 search rel `AvgVarBytes` and `ColVarBytes` are
+assigned together and only under the table guard
+(`joinsearch.go:403-411`), so a non-table leaf already has BOTH nil/0.
+Today's un-narrowed fallback is therefore already
+`ncols = len(baseLeaf.Output()), avgVar = 0`. Narrowing ncols while
+carrying `avgVar = 0` invents NO estimate — EntryBytes goes
+`48*full+24 -> 48*kept+24` in the model's own units. Guard: narrow on
+nil ColVarBytes ONLY when `AvgVarBytes == 0`.
+Review confirmed every link of that argument (all AvgVarBytes assignment
+sites enumerated; `pathAvgVarBytes` returns 0; the arithmetic; and that
+path fields never reach the executor — it reads `plan.AvgVarBytes` from
+`buildAvgVarBytes` over REL fields). It also confirmed the cut FIRES on
+all 32: `scanPathTarget` and the empty-keep-set check run BEFORE the
+ColVarBytes check, so a rel tagged arm=c already passed them — the
+renamed-CTE-column worry does not bite, and a mismatch would be a live
+wrong-answer bug today rather than a new risk.
+Three mandatory amendments, all applied:
+(1) **A statement of mine was FALSE**: "AvgVarBytes and ColVarBytes are
+always assigned together" — five UPPER-rel sites assign AvgVarBytes
+alone (`upperrel.go:187`, `groupingpaths.go:145`, `distinctpaths.go:112`,
+`windowsetoppaths.go:141`,`:323`). True only for LEVEL-1 rels, which is
+all `relNarrowedWidths` ever sees. So the guard is a LIVE trip-wire: any
+successor extending narrowing to upper rels will trip it on real rels.
+(2) **B4 is avoided in `ncols` but CREATED in `avgVar` one level up** —
+half my hazard claim was wrong. For a build side `{CTEScan, t}` the
+executor's `buildAvgVarBytes` declines to the whole-relation sum, and
+BEFORE this round the join path declined too, so planner and executor
+AGREED. After it the planner publishes `0 + kept-bytes(t)`, BELOW the
+executor's charge (~74 B/row at Q9 scale). Cost-only, nothing
+under-sized, but it is R120's defect in reverse by a different door —
+now named, with a pin required.
+(3) The predicate keys on the **statistic, not the leaf kind**, so it
+also admits un-ANALYZEd ordinary tables; P1's exact counts assume zero
+of those, true at this epoch only.
+Also: P2 now predicts the FULL bucket vector — BOTH-UNNARROWED must NOT
+rise, because R123 root-attributed only the MIXED bucket, so a pair
+whose other side declines for a different reason (rule-4 wrapper gap,
+R123's TPC-H mechanism) becomes MIXED after this cut and must be
+attributed rather than read as "R123 was wrong". And expect **no
+aggregation-strategy movement** from these 32: `costAgg`'s spill arm is
+gated `inAvgVarBytes > 0` (`cost_funcs.go:502`), false at avgVar=0 on
+both arms — that bounds what "readable" can reveal.
+Sizing unchanged: this makes TPC-DS categories READABLE, not matching.
+Next: implement, then gates.
