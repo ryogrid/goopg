@@ -4584,6 +4584,13 @@ private isolated execution, twice byte-identical EXPLAIN, value 266, forced
 spine/cost capture, and the no-code/no-election boundary. Next: `git commit
 -n`/push scope, then measurement.
 
+R105 DONE 2026-09-13 (`r105-q96-goopg-forced-order-capture/REPORT.md`):
+post-R104 Goopg makes both immutable forced forms repeatable and returns 266.
+hdem-first costs 27639.23 versus store-first 27641.15, a 1.92 forced-margin
+advantage versus PG18.3's 176.16. This is cost attribution input only, not
+natural-election evidence. Next: separately scope an attribution that can
+explain the forced-margin difference before considering any planner change.
+
 TIMING SURVEY DONE 2026-09-13 (`r97-timing-survey/REPORT.md`,
 measurement-only, no code change, no review — survey not a design
 doc): TPC-DS SF0.25 all 96 queries timed (3-run medians, values
