@@ -133,6 +133,12 @@ var flagResolvedState = map[string]func(string) string{
 	"GOOPG_PG_SORT_RELATION_BYTES_COST": func(v string) string {
 		return onOff(pgSortRelationBytesCostFromEnv(v))
 	},
+	// R120's HashAggregate spill-arm byte currency. Default-off and
+	// costing-only, but it decides whether the arm fires at all, so every A/B
+	// artefact must name which currency priced the aggregate.
+	"GOOPG_HASHAGG_WIDTH_CURRENCY": func(v string) string {
+		return onOff(hashAggWidthCurrencyFromEnv(v))
+	},
 	// A mode, not a boolean: the artefact carries the word an operator would
 	// export to reproduce the arm.
 	"GOOPG_NLI_COSTGATE": func(v string) string {
@@ -207,6 +213,8 @@ var flagProvenanceOrder = []string{
 	"GOOPG_PARTIAL_SORT_PATHS",
 	"GOOPG_PG_HASH_TUPLE_SPILL_COST",
 	"GOOPG_PG_SORT_RELATION_BYTES_COST",
+	// Joined at R120 (r120-hashagg-width-currency/SCOPE.md). Default `off`.
+	"GOOPG_HASHAGG_WIDTH_CURRENCY",
 }
 
 // flagProvenanceRetired names variables no code reads any more, and the

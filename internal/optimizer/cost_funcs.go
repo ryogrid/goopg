@@ -415,10 +415,13 @@ func sortByteBranch(cp costParams, tuples, output, inputBytes, outputBytes float
 // and differ only in startup (streams vs blocking), so sorted-wins-iff-
 // input-ordered falls out without a special case (costsize.c:2720-2732).
 //
-// No spill arm exists (see the NO-spill note at the function tail):
-// `aggregateOp` performs grouped aggregation in memory with no spill path,
-// so there is nothing to charge. inNcols/inAvgVarBytes are its future
-// inputs, kept so the resume does not re-plumb callers.
+// A spill arm DOES exist at the function tail (added by R3). The stanza that
+// stood here said the opposite — "No spill arm exists … inNcols/inAvgVarBytes
+// are its future inputs" — which has been false since R3 and was left in place
+// through R120's edit of that very arm. `aggregateOp` still aggregates in
+// memory with no spill path; the arm's purpose is not to predict goopg I/O but
+// to express "this hash table does not fit", which the tail comment explains.
+// inNcols/inAvgVarBytes are LIVE inputs: they decide whether the arm fires.
 func costAgg(cp costParams, strategy AggStrategy, inputRows, inputStartup, inputTotal float64, numGroupCols int, numGroups float64, nAggs int, inNcols int, inAvgVarBytes float64) Cost {
 	tuples := inputRows
 	if tuples < 0 {
@@ -479,8 +482,36 @@ func costAgg(cp costParams, strategy AggStrategy, inputRows, inputStartup, input
 	// Note the arm is INERT below the memory threshold: `hashAggSetLimits`
 	// returns early when the groups fit, which collapses nbatches to 1 and
 	// depth to 0, so a grouping that fits prices bit-identically to before.
-	if strategy == AggStrategyHashed && inAvgVarBytes > 0 {
-		entry := hashAggEntrySize(nAggs, inAvgVarBytes)
+	// R120 — byte currency of this arm. `inAvgVarBytes` is the VARIABLE
+	// payload only, but `hashAggEntrySize`'s parameter is a tuple WIDTH and
+	// the `pages` term below cites `relation_byte_size(input_tuples,
+	// input_width)`. PG hands one and the same `input_width` to both
+	// (costsize.c:2801-2802, :2824), and the SORTED rival is priced in that
+	// same currency on both sides — PG via `cost_tuplesort`
+	// (costsize.c:1903), Goopg via `hashsize.EntryBytes` (48*ncols + 24 +
+	// avgVar) in `costSortRunWithWidth`. Supplying the payload alone here
+	// therefore priced the two aggregation rivals in different currencies and,
+	// because it under-states the entry, made `hashAggSetLimits` early-return
+	// so this arm went inert where PG spills. Default-off; OFF is
+	// bit-identical to the pre-R120 arithmetic. See
+	// r120-hashagg-width-currency/SCOPE.md (incl. §1a: this buys
+	// Goopg-internal consistency, NOT PG alignment).
+	widthCurrency := hashAggWidthCurrencyEnabled()
+	// Arm C: a fixed-width input (avgVar == 0) still has a real 48*ncols+24
+	// footprint, so the arm must be reachable on ncols alone.
+	armLive := inAvgVarBytes > 0
+	if widthCurrency {
+		armLive = inNcols > 0
+	}
+	if strategy == AggStrategyHashed && armLive {
+		// Arm B: the bare tuple width, since hashAggEntrySize adds its own
+		// MAXALIGN(SizeofMinimalTupleHeader) exactly as PG's
+		// hash_agg_entry_size does (nodeAgg.c:1706-1707).
+		entryWidth := inAvgVarBytes
+		if widthCurrency {
+			entryWidth = hashAggTupleWidth(inNcols, inAvgVarBytes)
+		}
+		entry := hashAggEntrySize(nAggs, entryWidth)
 		memLimit, ngroupsLimit, numPartitions := hashAggSetLimits(cp, entry, groups)
 		nbatches := math.Max(groups*entry/memLimit, groups/ngroupsLimit)
 		nbatches = math.Max(math.Ceil(nbatches), 1)
@@ -490,7 +521,14 @@ func costAgg(cp costParams, strategy AggStrategy, inputRows, inputStartup, input
 		depth := math.Ceil(math.Log(nbatches) / math.Log(float64(numPartitions)))
 		if depth > 0 {
 			// `relation_byte_size(input_tuples, input_width) / BLCKSZ`.
-			pages := tuples * inAvgVarBytes / float64(blockSizeBytes)
+			// Arm A: EntryBytes (= tuple width + RowSliceBytes 24) is the
+			// per-row `relation_byte_size` analogue — Goopg's 24-byte row
+			// header lines up with PG's MAXALIGN(SizeofHeapTupleHeader).
+			rowBytes := inAvgVarBytes
+			if widthCurrency {
+				rowBytes = hashsize.EntryBytes(inNcols, inAvgVarBytes)
+			}
+			pages := tuples * rowBytes / float64(blockSizeBytes)
 			// "HashAgg has somewhat worse IO behavior than Sort on typical
 			// hardware/OS combinations" — PG's explicit generic penalty.
 			written := pages * depth * 2.0
@@ -506,7 +544,15 @@ func costAgg(cp costParams, strategy AggStrategy, inputRows, inputStartup, input
 }
 
 // hashAggEntrySize is `hash_agg_entry_size` (nodeAgg.c:1701): the bytes one
-// group occupies in the aggregate's hash table. transitionSpace is 0 — goopg
+// group occupies in the aggregate's hash table.
+//
+// Known PG divergence (R120): PG also adds `TupleHashEntrySize()`
+// (`sizeof(TupleHashEntryData)`, nodeAgg.c:1726-1730, executor.h:165)
+// unconditionally. goopg omits it. That is a pre-existing UNDER-charge and is
+// immaterial beside the `48*ncols` term, but this function claims PG fidelity,
+// so the gap is recorded rather than left for the next reader to rediscover.
+//
+// transitionSpace is 0 — goopg
 // has no per-aggregate transition-space estimate, and PG's own expression
 // degrades to the same when it is 0. Getting it wrong can only UNDER-charge,
 // never invent a spill that PG would not see.

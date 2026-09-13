@@ -4933,3 +4933,64 @@ outcome, not a failure to tune away. work_mem pinning is mandatory in
 every arm (BootVal 512MB vs PG 4MB; TPC-DS SF0.25 conf has none and
 relies on the capture script's session SET). Datum/`minimize_datum`
 stays CLOSED (R114). Next: implement behind the flag, then gates.
+
+R120 DONE 2026-09-14 (`r120-hashagg-width-currency/REPORT.md` rev 2,
+review **BLOCK -> APPROVE-WITH-NOTES**, 3 BLOCKs closed BY MEASUREMENT +
+notes applied): **NEGATIVE result, flag stays default-off.** The defect
+is real (confirmed both sides) and the correction is directionally
+right, but alone it is insufficient AND net-negative.
+Implemented `GOOPG_HASHAGG_WIDTH_CURRENCY` (strict `=="1"`, default-off,
+provenance-registered): Arm A `pages` uses
+`hashsize.EntryBytes(inNcols,inAvgVar)`, Arm B `hashAggEntrySize` gets
+the bare width `48*ncols+avgVar`, Arm C gate `inNcols>0`. 7 pins.
+Results vs pre-registered bars: P0 PASS (TPC-H OFF byte-identical, md5
+`19b1c9a1`; TPC-DS A/A identical bar header+psql PID) — **P1 FAIL**
+(TPC-DS GroupAgg 23->29, bar >=43; HashAgg 130->123 vs PG 126/38) —
+**P2 FAIL** (`aggregation-strategy` 69->**71**, WORSE) — **P3 FAIL**
+(TPC-H match **6->5**, Q10 lost) — P4 PASS (SF0.25 sweep stamped
+`GOOPG_HASHAGG_WIDTH_CURRENCY=1`: PASS=96 MISMATCH=0; Q10 result digest
+byte-identical OFF/ON) — P5 PASS (post-hoc; 57.8%-of-budget node
+unmoved; the 60-90% band is provably EMPTY on this corpus).
+**Q10 mechanism, MEASURED (not inferred — rev 1's arithmetic was
+self-refuting and the review caught it): `avgVar` is 2080, NOT the
+back-solved 334 (6.2x off).** entry 2112 -> 3888 B, groups x entry
+124,688,256 (92.9% of the 134,217,728 B budget) -> 229,539,744 (171%),
+so the arm newly fires and elects GroupAggregate where PG keeps
+HashAggregate (PG's entry for the same node ~224 B = **17x smaller**).
+The `48*ncols` term alone (1776 B) is what tips it. TPC-H over-budget
+nodes 4 -> 5: the correction newly tips exactly Q10.
+Finding: the correction **over-charges and under-reaches at once** —
+over-charges because `ncols` is still the full concatenated relation
+width (K65/K66), under-reaches because closing the GroupAgg gap needs
++103 nodes and currency buys +6. Inference (labelled as such): the
+~100-node residue is unlikely to be spill-driven and points at **K12**
+(sorted agg wins on ORDERING/pathkeys), evidenced directly only on Q4
+(R72 STEP-0).
+Hygiene traps recorded: a values sweep re-samples stats and opens a new
+EPOCH (two "worsenings" were drift, not the flag — all A/B numbers are
+same-epoch); A/A noise floor is 0; the ON sweep (01:52) postdates the
+A/B pair (01:38/01:39) so **R121 must re-take its OFF baseline**.
+`make plan-gate` not run — inapplicable (default-off + P0 bit-identity),
+recorded as a reasoned omission.
+**EXPIRY (do not let this rot):** `GOOPG_HASHAGG_WIDTH_CURRENCY` is the
+third default-off cost arm (with R108's and R113's). It is tied to R121
+— **promote or delete when ncols narrowing lands**; it must not outlive
+that decision. Recorded here rather than in `.ralph/deferral_ledger.md`
+because that file is a concurrent Ralph loop's state.
+Datum / `minimize_datum` stays CLOSED (R114).
+
+R121 CANDIDATE (the pairing, seam re-confirmed at HEAD): narrow the
+planner's `ncols`/`AvgVarBytes` COST inputs.
+`relfromjoinlist.go:699 stampNeededColsOnRels()` already lands
+`NeededCols` on the base rels BEFORE paths are costed at `:707-709`,
+while the existing narrowing machinery (`narrowoutput.go`;
+`deriveJoinKeeps` at `createplanroot.go:122`; `GOOPG_NARROW_BUILD`
+default ON) runs **entirely post-selection** at createPlan time and
+touches NO cost — so the planner costs joins at full concatenated width
+while the executor builds a narrowed hash table. `Path.NCols` narrows at
+exactly ONE production site (`pathindexonly.go:143-148`); join rels sum
+both inputs' FULL column counts (`joinsearchlevel.go:632-636`). For Q10
+that is 37 cols / avgVar 2080 against the ~7 cols / ~205 B PG carries.
+Narrowing removes R120's overshoot; only then is the currency correction
+safe to enable. R38's rejection is not a precedent against it — R38
+targeted `Width` (K66 says the input is `NCols`/`AvgVarBytes`).
