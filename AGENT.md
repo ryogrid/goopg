@@ -646,3 +646,64 @@ pre-round binary (build it at HEAD before the cut; same clone, same
 seed) — not celebration. Keep the pre-round binary + clone until the
 REPORT lands.
 
+### 6. Q96 plan-parity handoff (R117/R118)
+
+The current focused witness is TPC-DS Q96. Datum-size investigation R114 is
+explicitly deferred by user direction. Read these documents before changing
+planner code:
+
+- `docs/design/not_ralph/plan_parity_fix_take2/TODO.md` (round ledger);
+- `r111-q96-common-data-oracle-retry/REPORT.md` (common-data oracle/forms);
+- `r115-q96-nonspill-forced-order/REPORT.md` (normal HashJoin seam is not
+  reached);
+- `r116-q96-legacy-join-attribution/REPORT.md` (Hash/BuildRight boundary);
+- `r117-q96-legacy-child-cost/REPORT.md` (lower-Join ledger/checksums);
+- `r118-q96-lower-join-producers/SCOPE.md` (approved next task).
+
+R117's narrow conclusion: the selected upper Hash Join self term is equal,
+but its inherited child total differs by 7.68. The first differing selected
+root-lineage ledger is the lower Hash Join: hdem-first `688465 rows / width
+476`, store-first `688081 rows / width 1104`. The direct right scans also
+differ by forced order (`household_demographics`: 7200 rows, width 48, total
+72.00; `store`: 12 rows, width 676, total 0.12). The shared `store_sales` scan
+is 719876 rows, width 428, total 7198.76 in both forms. Both values are 266.
+
+R118 must map planning-time `estimateJoin` records to renderer-visible final
+lower-Join occurrences through an EXPLAIN-only, statement-local sidecar: make
+it at the outer `PlanWithSettings` EXPLAIN wrapper, pass it through recursive
+inner planning, freeze an immutable final report before constructing
+`&Explain{Child: inner}`, and discard planner pointers/maps. Do not use a
+process-global registry or pointer reuse. Cover clone/rewrite successors,
+direct/path-backed constructor routes, exact `EstimateRows` arithmetic, and
+full schema lineage (ordered position, origin, source identity, type/OID,
+typmod/collation, nullability/width inputs, and final `TupleWidth`). No
+production cardinality/schema/cost/Datum/statistics/Gather/search/executor
+change is authorized until the measurement identifies one source-level cause.
+
+For R118 reproducibility:
+
+```bash
+export PATH="$PWD/postgres/local_install/bin:$PATH"
+export LD_LIBRARY_PATH="$PWD/postgres/local_install/lib:${LD_LIBRARY_PATH:-}"
+export GOOPG_GATHER_PATHS=top GOOPG_PARTIAL_AGG_PATHS=on
+export GOGC=off GOMEMLIMIT=12GiB
+```
+
+Use `/tmp/r101-hdem-first.sql` and `/tmp/r101-store-first.sql` unchanged,
+with `work_mem=64MB`, `join_collapse_limit=1`, and
+`from_collapse_limit=1`. Use private `/tmp/r111-goopg-q96` on port 5568, never
+shared 6543x clusters. Start/stop through the cgroup wrapper and a unique
+unit, for example:
+
+```bash
+GOOPG_CG_UNIT=r118-q96 scripts/goopg-test-run.sh \
+  /tmp/r118-goopg start -D /tmp/r111-goopg-q96 -listen 127.0.0.1:5568
+/tmp/r118-goopg stop -D /tmp/r111-goopg-q96
+```
+
+The former R117 diagnostic was `GOOPG_Q96_LEGACY_CHILD_TRACE=1`; it was
+removed before the result commit and must not be reused without a new reviewed
+source task. Capture TEXT/JSON OFFx2/ONx2 checksums, trace paths/tokens, and
+values. Historical artifacts were `/tmp/r117-{hdem-first,store-first}-{off,on}-{1,2}.{plan,json}`,
+`/tmp/r117-goopg-q96{,-off}.log`, and `/tmp/r117-{hdem-first,store-first}.value`.
+Long tests and all server/query execution remain foreground and memory-capped.
