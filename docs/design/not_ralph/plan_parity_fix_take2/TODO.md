@@ -4656,9 +4656,21 @@ assignment and explicit-cast typmod boundaries are preserved. A fresh R109
 store witness normalizes to PG exactly. Next: rescope/rerun R107 common-data
 evidence before R108 or any cost attribution.
 
-R108 PLANNED — PG hash-tuple sizing comparison, dependent on R107 DONE:
-only after R107 establishes common relation/schema/index inputs and records
-both engines' native statistics, scope and review an opt-in experiment that
+R111 SCOPE READY 2026-09-13 (`r111-q96-common-data-oracle-retry/SCOPE.md`):
+after R110, rebuild private PG18.3/Goopg Q96 clusters from R107's identical
+TSVs, prove full type-aware relation equality, then record native stats and
+forced forms. No cost/election change is authorized. Next: agent review,
+`git commit -n`/push scope, then measurement.
+
+R111 SCOPE REVIEWED 2026-09-13 (APPROVE after two BLOCK corrections): R108
+depends on successful R111 rather than invalid R107; schema/index equivalence
+is now a pre-ANALYZE gate alongside raw/canonical relation witnesses. Next:
+`git commit -n`/push scope, then measurement.
+
+R108 PLANNED — PG hash-tuple sizing comparison, dependent on successful R111
+common-data oracle completion: only after R111 establishes common
+relation/schema/index inputs and records both engines' native statistics,
+scope and review an opt-in experiment that
 prices Hash Join planning geometry with PG18.3 packed Datum/HashJoinTuple
 sizes instead of Goopg's in-memory `[]Datum` footprint. It must capture the
 unchanged corpus's plan/value deltas, per-join PG-versus-Goopg geometry
