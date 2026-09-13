@@ -4420,6 +4420,21 @@ Reframed slice (a): audit outerMatchFrac + virtualBuckets geometry;
 (b) further deprioritized. Temp reverted, tree clean. Next: R97+
 slice SCOPE citing STEP1, then implementation.
 
+R98 SCOPE READY 2026-09-13
+(`r98-q96-innerunique-inputs/SCOPE.md`): measurement-only attribution of
+Q96's R90/R91 inner-unique inputs. Log the semifactors shortcut,
+candidate-coordinate matched/unmatched terms, and PG virtual geometry for
+both competing orientations; reconcile each filed cost, then either identify
+a representable mismatch or decline without a guessed constant. No production
+cost, election, path, executor, or default change is authorized. Next: agent
+review, revise if needed, `git commit -n`/push scope, then instrument.
+
+R98 SCOPE REVIEWED 2026-09-13 (APPROVE after one BLOCK correction): PG's
+private semifactors/virtual geometry must be called UNOBSERVABLE unless a
+lawful reproducible derivation is recorded; matching a final cost is not
+enough. The scope now also pins every Goopg term needed to reconcile a filed
+candidate. Next: commit -n/push scope, then temporary measurement.
+
 TIMING SURVEY DONE 2026-09-13 (`r97-timing-survey/REPORT.md`,
 measurement-only, no code change, no review — survey not a design
 doc): TPC-DS SF0.25 all 96 queries timed (3-run medians, values
