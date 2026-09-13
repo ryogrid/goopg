@@ -4794,9 +4794,18 @@ Next investigate cardinality/display-cost inputs within the equal legacy Hash
 Join shapes; no Datum, cost, statistics, Gather, search, executor, or
 production change was made.
 
-R117 PLANNED — Q96 legacy child-total attribution, dependent on R116 DONE:
-scope/review a measurement-only lower Hash Join cardinality and display-cost
-input audit. No Datum, cost, statistics, Gather, executor, or search change.
+R117 DONE 2026-09-13 (`r117-q96-legacy-child-cost/REPORT.md`): R111's 7.68
+forced-form margin reconciles exactly as the upper explicit Hash Join's
+inherited child-total delta; its self term is equal. The first differing
+selected/root-lineage legacy Join ledger is the lower Hash Join's rows/width
+(hdem-first 688465/476 vs store-first 688081/1104); its direct right scans
+also differ by forced order, while shared `store_sales` scan pricing agrees.
+R117 makes no Datum inference. TEXT/JSON OFFx2/ONx2 controls and value 266
+were byte-identical, retained checksums/paths are in the report, and all
+temporary source was removed. Next:
+separately scope a measurement-only producer audit of `estimateJoin` inputs
+and required-column/schema construction; no production cost or Datum change
+is authorized by R117.
 
 TIMING SURVEY DONE 2026-09-13 (`r97-timing-survey/REPORT.md`,
 measurement-only, no code change, no review — survey not a design
