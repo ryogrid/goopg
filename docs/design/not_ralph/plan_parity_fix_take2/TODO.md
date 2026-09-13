@@ -5261,3 +5261,63 @@ executor builds full width while the planner prices narrow. Planner
 UNDER-pricing = R120's defect in reverse; any revival must name it and
 add a timing check.
 Next: instrument, measure, resolve the table.
+
+R123 DONE 2026-09-14 (`r123-cost-needed-cols/REPORT.md`, review
+**BLOCK -> discharged by measurement**, measurement-only, **ZERO Go
+changes ship** — proved by an empty `git diff` over internal/cmd/scripts,
+not a grep):
+**The 42,679 TPC-DS mixed-currency join pairs are ONE cause, 100%.**
+Root attribution: every one traces to a base-rel leaf that declined on
+**arm (c) nil `ColVarBytes`**. Identity MEASURED (the first draft
+asserted it and review rightly objected that arm (c) fires for three
+indistinguishable populations): **CTEScan 14, Project 9, SetOp 7,
+Filter 2 = 32 non-table leaves, and ZERO ordinary tables.** Just 32
+declining rels poison 42,679 comparisons because one un-narrowed leaf
+appears in a combinatorial number of DP pairings.
+**Pre-registered decision-table row 2 FIRES** → R124 = give non-table
+leaves a per-column width basis. Both hypotheses were wrong: rev 1's
+collector story was refuted by arithmetic BEFORE implementation and the
+census confirms it (the 144 arm-(a) declines are search-problem-uniform,
+so they land in BOTH-UNNARROWED=8,588 and contribute ZERO mixed pairs —
+the pre-registered falsifier did NOT fire); and the review's
+Append/SetOp/HashAgg-**wrapper** hypothesis finds **zero** instances.
+Counter validated two ways: TPC-H reproduces 4,257/3/98/65/4 (0.07%
+mixed) and TPC-DS reproduces R122's totals exactly.
+Admitted-on-arrival share **59.6%** (25,450/42,679) — but relabelled on
+review: this is `pathlistVerdict==accepted`, i.e. survived ON ARRIVAL,
+which is an **UPPER BOUND** on the pre-registered "evicted the other
+candidate" share, and an accepted path can still be evicted by a later
+insert. The true decisive share is unmeasured, in (0, 59.6%]. Direction
+still holds: the "confound never moved a plan" row does not fire.
+Corrections carried (all from review): TPC-H denominator is **4,358**,
+not R122's 4,364 — R123's counter never emitted the rule-4 index-only
+bucket, so the two censuses are NOT bucket-for-bucket identical and
+"reproduces exactly" was an overstatement; SCOPE §3.2's per-gate-term
+top-level-vs-nested counter was **never built** and is still
+outstanding; SCOPE §3.1's raw per-Kind histogram was not emitted, so the
+cascade is inferred not shown; per-query spread unmeasured, so
+concentration in q64/q14-class queries is unknown.
+Second, smaller mechanism found and worth not losing: **TPC-H's 3 mixed
+pairs root at `wrapperGap-indexOnlyChild`**, not at the TPC-DS cause —
+R124 must not assume one mechanism.
+Method note worth keeping: the first draft escaped the decision table by
+inventing a narrower R124, and that escape rested on a **taxonomy
+artefact of my own instrumentation** — `nonWhitelistedKind` tagged on a
+base-rel SCAN path is uninformative by construction (the whitelist is
+the JOIN whitelist), and it pre-empted the `relDeclineArmC` tag the
+SCOPE had defined for exactly that case. The narrower proposal would
+also have missed 66% of the population (the 14 CTEScans + 7 SetOps).
+Raw dumps are **committed** this time (`census-tpcds.raw.gz`,
+`census-tpch.raw`, `rel-identity.txt`) — R122's were not and its figures
+were consequently unreproducible.
+Sizing unchanged and still honest: fixing this makes TPC-DS's categories
+READABLE, nothing more. R122's ceiling stands — TPC-DS's dominant
+categories are join-order (90) and parallelism (86), which this chain
+does not touch, so the realistic upside is a subset of join-method (62)
++ scan-type (57), and no TPC-DS query is close to a MATCH.
+Next: R124 — per-column width basis for non-table leaves. For a
+sub-problem leaf the width is already known internally (its own search
+narrowed its own rels); for a CTEScan/SetOp it is NOT, and inventing one
+is forbidden — derive from the leaf Node's output schema plus whatever
+statistic the body supplies, or keep declining. Do not assume the
+sub-problem answer generalises to all 32.
