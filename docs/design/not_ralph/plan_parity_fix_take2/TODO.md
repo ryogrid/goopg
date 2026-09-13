@@ -5566,3 +5566,17 @@ proof the FK arm never delivered (PG derives no bound from `fkey_list`).
 Caveat carried: §5's FK-persistence and 32.17s-validation figures came
 from a throwaway cluster and exist only as prose; (b)/(c) must re-measure
 and commit the artefact rather than cite this report.
+**SCOPING FACT for (d), from the review addendum and verified: the FK
+chain is TPC-H-ONLY.** The TPC-DS base DDL
+(`third-party/tpcds-postgres/.../tools/tpcds.sql`) declares **24 PRIMARY
+KEYs and ZERO FOREIGN KEYs**; TPC-DS's FKs live only in the separate
+`tools/tpcds_ri.sql`, which **nothing** under `bench/tpcds/`, `scripts/`
+or the `Makefile` references. So TPC-DS provably cannot carry an FK on
+the current build path, and (b)/(c)/(d) should be sized against TPC-H's
+14 join-order queries alone — not TPC-DS's 90 — unless someone
+deliberately wires `tpcds_ri.sql` into the load. (This also made P0's
+TPC-DS half zero-risk rather than merely low-risk; the capture was taken
+anyway and is bit-identical.)
+Values gate closed properly: the first draft substituted a judgement for
+the SF0.25 sweep; review flagged it, so it was RUN — PASS=96 MISMATCH=0
+(`sweep-20260914-053800.txt`).

@@ -114,11 +114,24 @@ round's only judgement call.
 | P3 | suites green | `internal/optimizer` + `internal/executor` green, `go vet` clean | **PASS** |
 | gates | per CLAUDE.md a planner change owes the spotcheck | `scripts/tpch-spotcheck.sh` **RESULT=PASS** (Q12=2, Q13=34) | **PASS** |
 
-**On the values gates, stated as a judgement rather than a pass:** the
-TPC-DS SF0.25 values sweep was **not run**. The reasoning is that a
-change which provably cannot alter a plan on either corpus (P0,
-byte-identical on both) cannot alter a value — but that substitutes an
-argument for a documented gate, and it is recorded as such.
+**Values gate, run rather than argued** (the first draft substituted a
+judgement for it; review flagged that, so it was run): TPC-DS SF0.25
+sweep **PASS=96 MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0 SKIP=3**
+(`sweep-20260914-053800.txt`).
+
+### TPC-DS can never carry an FK on the current build path
+
+Review's addendum settled why P0's TPC-DS half could not have moved, and
+the finding outlives this round: the TPC-DS base DDL
+(`third-party/tpcds-postgres/DSGen-software-code-3.2.0rc1/tools/tpcds.sql`)
+declares **24 PRIMARY KEYs and zero FOREIGN KEYs** — verified. TPC-DS's
+FKs live only in the separate `tools/tpcds_ri.sql`, and **nothing under
+`bench/tpcds/`, `scripts/` or the `Makefile` references that file**.
+
+So the entire FK chain — steps (b), (c), (d) — is a **TPC-H-only**
+programme unless someone deliberately wires `tpcds_ri.sql` into the
+TPC-DS load. Anyone scoping (d) should size it against TPC-H's 14
+`join-order` queries alone, not against TPC-DS's 90.
 
 ## 5. What this does NOT do
 
