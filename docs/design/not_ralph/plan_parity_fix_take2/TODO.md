@@ -4621,6 +4621,19 @@ data/schema/index equivalence before ANALYZE, but record each engine's native
 statistics and controls rather than requiring their equality. Next: `git
 commit -n`/push scope, then measurement.
 
+R108 PLANNED — PG hash-tuple sizing comparison, dependent on R107 DONE:
+only after R107 establishes common relation/schema/index inputs and records
+both engines' native statistics, scope and review an opt-in experiment that
+prices Hash Join planning geometry with PG18.3 packed Datum/HashJoinTuple
+sizes instead of Goopg's in-memory `[]Datum` footprint. It must capture the
+unchanged corpus's plan/value deltas, per-join PG-versus-Goopg geometry
+(`width`, entry bytes, buckets, batches, spill decision), and executor spill
+reality; it must not silently promote the experiment to a default. The task
+decides from evidence whether parity cost geometry and executor-capacity
+geometry must remain separate. Before any source change: Design Doc, agent
+review, `git commit -n`, and push. No cost/election change is authorized by
+this TODO entry.
+
 TIMING SURVEY DONE 2026-09-13 (`r97-timing-survey/REPORT.md`,
 measurement-only, no code change, no review — survey not a design
 doc): TPC-DS SF0.25 all 96 queries timed (3-run medians, values
