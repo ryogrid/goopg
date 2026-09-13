@@ -4774,18 +4774,15 @@ R114 DEFERRED 2026-09-13 by user direction: stop the Datum-size / cost-family
 investigation. Do not start the HashAggregate representation audit unless it
 is explicitly reprioritized after the unresolved Q96 plan breakdown.
 
-R115 PLANNED — Q96 non-spill forced-order cost attribution, dependent on R111
-DONE and R108 DONE: resume the Q96 breakdown at the remaining common-input
-forced-order discrepancy (PG18.3 prices hdem-first lower by 175.91; Goopg
-prices store-first lower by 7.68). Scope and review a measurement-only,
-default-off diagnostic that reconciles every selected Hash Join cost input and
-term for both forced forms on the validated common-data clusters, including
-base/filter cardinalities, output width, bucket/inner-unique data, qual costs,
-parallel divisor, and spill verdict. It must first distinguish a representable
-planner input defect from engine-native statistics divergence or an
-unobservable PG input; no Datum-size substitution, cost tuning, Gather force,
-or production change is authorized. Before any diagnostic or source change:
-Design Doc, agent review, `git commit -n`, and push.
+R115 DONE 2026-09-13 (`r115-q96-nonspill-forced-order/REPORT.md`): the
+reviewed, temporary `GOOPG_Q96_COST_TRACE=1` diagnostic was A/A inert on the
+two R111 forced forms, but neither form reached `addHashJoinPath` or
+`hashJoinCost`. A same-binary/server comma-join positive control emitted the
+expected cost/filed records, so this is a Q96 seam non-reachability result,
+not a trace-deployment failure. The final LATERAL chain declines the
+PG-shaped search and leaves the forced joins on the legacy/prebuilt route.
+No Datum, spill, Gather, statistic, or production-cost claim follows; all
+temporary source was removed. A successor must attribute that prebuilt route.
 
 TIMING SURVEY DONE 2026-09-13 (`r97-timing-survey/REPORT.md`,
 measurement-only, no code change, no review — survey not a design
