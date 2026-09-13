@@ -4478,6 +4478,14 @@ GUC command, SF0.25 relation witnesses, and Q96 value digest/direct witnesses
 matching the named historical baseline. Any failure is ORACLE INVALID and
 forbids ANALYZE/cost use. Next: commit -n/push, then private copy.
 
+R100 DONE 2026-09-13 (`r100-native-pg-q96-oracle/REPORT.md`): a private copy
+of the stopped native reference passes all oracle checks: query SHA/GUCs
+pinned, JSON EXPLAIN is repeatable and structurally matches the tracked PG
+Q96 plan, value is 266, and SF0.25 relation/stats/index witnesses are
+captured. Existing stats suffice; no ANALYZE ran and the source was untouched.
+Next: use this valid oracle in a separately reviewed Q96 cost/selectivity
+attribution scope; R99's Goopg-data copy remains invalid.
+
 TIMING SURVEY DONE 2026-09-13 (`r97-timing-survey/REPORT.md`,
 measurement-only, no code change, no review — survey not a design
 doc): TPC-DS SF0.25 all 96 queries timed (3-run medians, values
