@@ -22,23 +22,20 @@ benchmarks, `.claude*`, and untracked artifacts). Preserve it. Never use
 
 The authoritative progress and process are in:
 
-- [`TODO.md`](../../../../tmp/codex-to-other-260913/docs/TODO.md) — round
-  dependencies and status;
-- [`r111-q96-common-data-oracle-retry/REPORT.md`](../../../../tmp/codex-to-other-260913/docs/r111-report.md)
+- [`TODO.md`](TODO.md) — round dependencies and status;
+- [`r111-q96-common-data-oracle-retry/REPORT.md`](r111-q96-common-data-oracle-retry/REPORT.md)
   — valid common-input oracle and the two forced SQL forms;
-- [`r115-q96-nonspill-forced-order/REPORT.md`](../../../../tmp/codex-to-other-260913/docs/r115-report.md)
+- [`r115-q96-nonspill-forced-order/REPORT.md`](r115-q96-nonspill-forced-order/REPORT.md)
   — normal `addHashJoinPath`/`hashJoinCost` is not reached by Q96's forced
   LATERAL route;
-- [`r116-q96-legacy-join-attribution/REPORT.md`](../../../../tmp/codex-to-other-260913/docs/r116-report.md)
+- [`r116-q96-legacy-join-attribution/REPORT.md`](r116-q96-legacy-join-attribution/REPORT.md)
   — both explicit joins are Hash/BuildRight and the final LATERAL node is a
   separate legacy/prebuilt route;
-- [`r117-q96-legacy-child-cost/REPORT.md`](../../../../tmp/codex-to-other-260913/docs/r117-report.md)
+- [`r117-q96-legacy-child-cost/REPORT.md`](r117-q96-legacy-child-cost/REPORT.md)
   — exact lower-child ledger and artifact checksums;
-- [`r118-q96-lower-join-producers/SCOPE.md`](../../../../tmp/codex-to-other-260913/docs/r118-scope.md)
+- [`r118-q96-lower-join-producers/SCOPE.md`](r118-q96-lower-join-producers/SCOPE.md)
   — reviewed next task and its lifecycle/lineage requirements;
-- [`AGENT.md`](../../../../tmp/codex-to-other-260913/docs/AGENT.md) — memory
-  cap, server lifecycle, plan/value
-  gates, and Q96 handoff commands.
+- [`AGENT.md`](../../../../AGENT.md) — memory cap, server lifecycle, plan/value
 
 ## What R117 established
 
