@@ -4722,6 +4722,13 @@ election and value deltas against live PG18.3. It must not silently alter
 estimates or promote any result to default. Before source change: Design Doc,
 agent review, `git commit -n`, and push.
 
+R112 SCOPE READY 2026-09-13 (`r112-pg-cost-family-inventory/DESIGN.md`):
+start with a no-code, per-cost-family PG18.3 representation inventory rather
+than assuming a universal Datum size. It must classify every reached width/
+byte reader, its exact PG formula and candidate reachability before authorizing
+one family-specific comparison. Next: agent review, correction if needed,
+`git commit -n`, and push; then inventory only.
+
 TIMING SURVEY DONE 2026-09-13 (`r97-timing-survey/REPORT.md`,
 measurement-only, no code change, no review — survey not a design
 doc): TPC-DS SF0.25 all 96 queries timed (3-run medians, values
