@@ -4755,6 +4755,21 @@ requires focused provenance/boundary tests plus live-PG OFF/ON structural and
 value evidence before any default decision. Next: agent review, correction if
 needed, `git commit -n`, and push; no production edit is authorized first.
 
+R113 DONE 2026-09-13 (`r113-pg-sort-relation-bytes/REPORT.md`): the default-off
+PG18 relation-byte Sort pricing experiment is trace-proven, preserves values,
+and moves no selected TPC-H or TPC-DS SF0.25 plan. PG bytes do change reached
+disk/memory classifications, but no cost crossover occurs; fresh live-PG18.3
+TPC-DS census is identical OFF/ON. Keep the switch default-off. Do not fold
+the representation into HashAggregate, Memoize, or executor allocation.
+
+R114 PLANNED — HashAggregate PG representation/executor correspondence audit,
+dependent on R113 DONE: before any HashAggregate price experiment, scope and
+review the exact PG18.3 hash aggregate entry, partition, spill-page, and
+executor-spill correspondences. It must use R112's reached-candidate evidence,
+separate planner representation from Goopg aggregate execution capacity, and
+establish whether a default-off comparison can affect a live candidate. Before
+source change: Design Doc, agent review, `git commit -n`, and push.
+
 TIMING SURVEY DONE 2026-09-13 (`r97-timing-survey/REPORT.md`,
 measurement-only, no code change, no review — survey not a design
 doc): TPC-DS SF0.25 all 96 queries timed (3-run medians, values
