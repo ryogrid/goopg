@@ -4794,6 +4794,10 @@ Next investigate cardinality/display-cost inputs within the equal legacy Hash
 Join shapes; no Datum, cost, statistics, Gather, search, executor, or
 production change was made.
 
+R117 PLANNED — Q96 legacy child-total attribution, dependent on R116 DONE:
+scope/review a measurement-only lower Hash Join cardinality and display-cost
+input audit. No Datum, cost, statistics, Gather, executor, or search change.
+
 TIMING SURVEY DONE 2026-09-13 (`r97-timing-survey/REPORT.md`,
 measurement-only, no code change, no review — survey not a design
 doc): TPC-DS SF0.25 all 96 queries timed (3-run medians, values
