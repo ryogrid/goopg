@@ -4457,6 +4457,14 @@ record immutable source/destination identity and process ownership. The scope
 also requires full Q96 relation/index and predicate/join-column statistics
 provenance, not only four key rows. Next: commit -n/push, then provision.
 
+R99 DONE 2026-09-13 (`r99-q96-pg-oracle/REPORT.md`): copied stopped Goopg
+data/catalog can start under native PG18.3 and ANALYZE, but is not an oracle:
+Q96 JSON plans remain NL/Materialize and its value run aborts at PG btree
+`_bt_check_natts`, forcing postmaster recovery; `pg_relation_size` is also an
+invalid SQL function body. The capture and its post-ANALYZE stats must not
+drive Goopg costs. Next: obtain a genuine native-PG SF0.25 restore proven
+value-safe before reopening PG-cost attribution.
+
 TIMING SURVEY DONE 2026-09-13 (`r97-timing-survey/REPORT.md`,
 measurement-only, no code change, no review — survey not a design
 doc): TPC-DS SF0.25 all 96 queries timed (3-run medians, values
