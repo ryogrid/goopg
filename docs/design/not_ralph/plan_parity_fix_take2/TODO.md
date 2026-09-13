@@ -4465,6 +4465,19 @@ invalid SQL function body. The capture and its post-ANALYZE stats must not
 drive Goopg costs. Next: obtain a genuine native-PG SF0.25 restore proven
 value-safe before reopening PG-cost attribution.
 
+R100 SCOPE READY 2026-09-13 (`r100-native-pg-q96-oracle/SCOPE.md`):
+`bench/tpcds/runtime/pgdata` is a stopped PG18 native reference cluster, not
+the R99 Goopg data directory. Copy it only while verified stopped into one
+private destination; prove Q96 values and repeatable plans before any private
+ANALYZE, then establish or reject a genuine PG oracle without touching the
+reference source. Next: agent review, `git commit -n`/push, then copy.
+
+R100 SCOPE REVIEWED 2026-09-13 (APPROVE after one BLOCK correction): accept
+the oracle before ANALYZE only with pinned `tpcds025/public`, query SHA and
+GUC command, SF0.25 relation witnesses, and Q96 value digest/direct witnesses
+matching the named historical baseline. Any failure is ORACLE INVALID and
+forbids ANALYZE/cost use. Next: commit -n/push, then private copy.
+
 TIMING SURVEY DONE 2026-09-13 (`r97-timing-survey/REPORT.md`,
 measurement-only, no code change, no review — survey not a design
 doc): TPC-DS SF0.25 all 96 queries timed (3-run medians, values
