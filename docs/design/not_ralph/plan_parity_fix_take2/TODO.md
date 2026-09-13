@@ -4522,6 +4522,14 @@ explicit join aliases, and duplicate/USING visibility, and stops if correlated
 execution needs planner/executor work. Next: commit -n/push scope, then
 implement only the confirmed analyzer fix.
 
+R102 DONE 2026-09-13 (`r102-lateral-joined-left-namespace/REPORT.md`): PG18
+confirms the required grouped-JOIN LATERAL namespace rules, including aliases,
+USING, and non-LATERAL failure. A temporary analyzer fix passed focused tests
+but Goopg then failed resolving the next Q96 join qualification, proving that
+planner range binding is also required; scope stop rule applied and code was
+reverted. Next: separately scope end-to-end grouped-JOIN source binding; do
+not use forced Q96 forms as cost/election evidence.
+
 TIMING SURVEY DONE 2026-09-13 (`r97-timing-survey/REPORT.md`,
 measurement-only, no code change, no review — survey not a design
 doc): TPC-DS SF0.25 all 96 queries timed (3-run medians, values
