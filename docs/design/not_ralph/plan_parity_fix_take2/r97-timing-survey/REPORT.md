@@ -29,12 +29,25 @@ not committed): `time-sweep.sh` equivalent — median of 3, TIMEOUT
   hash/sort-heavy ones.
 - Q96 (the tracking query, PG-shaped parallel plan): goopg
   0.22–0.30s vs PG 0.044s (~5x).
-- Queries where goopg was faster (8; PG-side cold-cache effects
-  suspected on the extreme ones — treat 60x/30x with skepticism):
+- Queries where goopg was faster (8) — EXPLAINED, not cold cache:
   Q1 0.24s vs 15.187s (63.3x), Q74 1.75s vs 53.487s (30.6x),
   Q6 3.51s vs 33.416s (9.5x), Q81 0.46s vs 3.848s (8.4x),
   Q30 0.16s vs 0.87s (5.4x), Q4 7.02s vs 35.655s (5.1x),
   Q11 3.55s vs 8.257s (2.3x), Q54 1.59s vs 2.449s (1.5x).
+  Cause is a **PG-disadvantageous GUC asymmetry, not engine speed**:
+  the PG reference runs `work_mem` default **4MB** (unset in
+  `bench/tpcds/runtime/pgdata/postgresql.conf`), while goopg's
+  builder default is **512MB** (`hashsize.DefaultMemLimitBytes`),
+  and the oracle secs come from unpinned plain runs
+  (`scripts/tpcds-sf025-regression.sh` `cmd_oracle` issues no SET).
+  Hash/sort-heavy queries spill to disk on PG and stay in memory on
+  goopg — 128x apart. This is K10's known gap: K10 pinned
+  `work_mem=64MB` for PLAN captures, but the oracle SECS were never
+  re-captured under a pinned work_mem. No unfair bias on the goopg
+  side (client wall-clock includes connect+plan, i.e. against goopg;
+  96/96 checksums rule out shortcut results).
+  Follow-up: re-time the 8 queries on PG with `work_mem=512MB`
+  (fair rematch); expect the gaps to collapse.
 
 ## Reading guidance
 
