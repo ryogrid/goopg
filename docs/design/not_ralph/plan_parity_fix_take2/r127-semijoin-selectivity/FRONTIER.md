@@ -88,8 +88,8 @@ evidence for that is not speculative:
   eight FKs declared, `match=6` unchanged).
 - cost-input narrowing corpus-wide: **NOT parity-neutral — corrected by
   R128.** The chain buys TPC-H `join-method` 10→9 and `scan-type` 9→8; it
-  is default-OFF, and R124 §6 handed the promotion decision forward
-  deliberately. What it does not do is flip any query to MATCH, so it does
+  was default-OFF; **R128 promoted it to default ON** (commit
+  `9dc6ee6e5`), taking the decision R124 §6 handed forward. What it does not do is flip any query to MATCH, so it does
   not by itself unblock Q4 or Q9.
 
 **The honest next round is the projection-pushdown / DatumBytes

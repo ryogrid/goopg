@@ -346,7 +346,11 @@ func TestInheritNarrowedWidthsRefusesIndexOnlyChild(t *testing.T) {
 // an index-only inner — and it cannot, because memoizeCacheKeys declines an
 // inner with no IndexClauses and the index-only producer emits the
 // full-index-scan shape with none. If a parameterised index-only path is ever
-// added, this pin fails rather than the DEFAULT arm silently re-pricing.
+// added, this pin fails rather than that arm silently re-pricing.
+//
+// R128: the flag is now DEFAULT ON, so "the flag off" above describes the
+// opted-OUT arm (`=0`), not the default. The assertion is unchanged and still
+// correct; only which arm it is protecting has moved.
 func TestGetMemoizePathDeclinesIndexOnlyInner(t *testing.T) {
 	inner := &Path{IndexOnly: true, NCols: 2}
 	if len(inner.IndexClauses) != 0 {

@@ -254,9 +254,12 @@ func getMemoizePath(s *searchCtx, outer *RelOptInfo, outerPath, innerPath *Path,
 		// also the contract Path.NCols' own doc states ("read them through
 		// pathNCols ..., never directly").
 		//
-		// UNCONDITIONAL, so it must be inert with GOOPG_NARROW_COST_INPUTS
-		// off. It is, and the reason is an invariant worth stating rather than
-		// rediscovering: with that flag off the ONLY writer of Path.NCols is
+		// UNCONDITIONAL. R128 note: GOOPG_NARROW_COST_INPUTS is now DEFAULT
+		// ON, so the interesting arm is no longer the one this paragraph was
+		// written for -- narrowing normally DOES reach pathNCols here. The
+		// invariant below is still worth stating, and still holds, but read it
+		// as covering the opted-OUT arm (`=0`) rather than the default:
+		// with narrowing off the ONLY writer of Path.NCols is
 		// pathindexonly.go, and getMemoizePath cannot reach here on an
 		// index-only inner -- memoizeCacheKeys returns (nil,false) when
 		// len(innerPath.IndexClauses)==0, and the index-only producer emits
@@ -264,7 +267,7 @@ func getMemoizePath(s *searchCtx, outer *RelOptInfo, outerPath, innerPath *Path,
 		// a struct copy of the same). Pinned by
 		// TestGetMemoizePathDeclinesIndexOnlyInner: if a parameterised
 		// index-only path is ever added, that pin fails rather than the
-		// default arm silently re-pricing.
+		// narrowing-off arm silently re-pricing.
 		ndistinct, isDefault, pathNCols(innerPath), len(keys))
 
 	mp := &Path{
