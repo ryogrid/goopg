@@ -6110,3 +6110,113 @@ Not by picking the next plausible-looking query.
 **Standing hazard for this directory:** 125 rounds. Before scoping round
 N, `ls` the directory and grep prior rounds for BOTH the target query and
 the target mechanism. Recent-commit context is demonstrably insufficient.
+
+## R128 (scope) — parity work already built, measured, and switched OFF for a cost this goal disclaims
+
+Scope: `r128-parity-over-throughput/SCOPE.md`. Found by following R38's
+resume point ("check whether minimize_datum has moved DatumBytes") into
+`docs/design/not_ralph/minimize_datum/TODO_ALL.md` — i.e. the interrupted
+work of another worker, which the goal instructs me to pick up.
+
+**The observation.** The goal states 実行時間が延びてしまうことは
+regressionとはとらえません. Several changes here were implemented,
+measured, shown to move plan parity TOWARD PG, and then reverted or
+defaulted OFF **explicitly and only because they cost throughput**. They
+were judged under a performance goal; under this goal that judgement
+inverts. This round re-adjudicates finished work against the correct
+objective rather than inventing anything.
+
+**Measured this round** (live TPC-H corpus, same binary, estimate-audit
++ pg-plan-parity-diff):
+
+| | match | join-method | scan-type |
+|---|---|---|---|
+| `GOOPG_NARROW_COST_INPUTS` OFF (HEAD default) | 6 | 10 | 9 |
+| **ON** | 6 | **9** | **8** |
+
+Two category-instances strictly toward PG; nothing rose; no query flips
+to MATCH, so the headline stays 6/22. Stated as progress along the goal's
+metric, NOT as a win.
+
+**The rest of the reverted bundle** (`minimize_datum/TODO_ALL.md`
+~2900-2990), all reverted on cost alone:
+- cost-side narrowing (`take3-D-05-costside-unnarrowed`): cost side
+  agrees with the executor (Q9 orders 530.3→120.0 B/row), values 24
+  MATCH, TPC-DS PASS=95, **"moves plan parity toward PG"** — **+10.3%**.
+- bucket charge `MapSlotBytes` 48→96: bucket heap 586.7→286.0 MB,
+  per-worker peak −34.5%, values 24/24 MATCH — **+10.4%**, Q14 flipped.
+- build-cost charge: **+22.3%**; and "They did not lose a build-side
+  choice — they lost PARALLELISM".
+
+Two ledger facts that matter: `MapSlotBytes = 48` is documented **"KNOWN
+2x LOW … a hand-derived guess, not a measurement"** (go1.25 swisstable
+measures 96.1 B) with "do not read 48 as validated"; and the coupling is
+already resolved — "with it applied, the bucket-charge patch no longer
+flips Q14 … prerequisite #2 is unblocked but free."
+
+**Cut, in dependency order:** (1) flip `GOOPG_NARROW_COST_INPUTS` default
+ON; (2) then evaluate `MapSlotBytes` 48→96 on top (ledger says unblocked
+and free once (1) is in; patch preserved at
+`tmp/d05p2-bucket-charge.patch`); (3) build-cost charge **NOT** in this
+round — it loses PARALLELISM, which is TPC-DS's second-largest category
+and needs its own measurement.
+
+Bars: P3 **values unchanged is the real gate** (correctness is NOT
+disclaimed by the goal); P2 TPC-DS must not regress (R124 recorded 3
+TPC-DS shape changes from this chain — re-adjudicate ON-by-default, do
+not carry); P4 the ~+10% throughput cost must be MEASURED AND REPORTED,
+not hidden. No prediction that match rises above 6 — §1 already measured
+that it does not.
+
+### R128 scope rev 1 BLOCKED (2 fatals) → rev 2 APPROVED
+
+**Fatal 1 — my framing was refuted by the document I quoted, and my own
+memory already held the refutation.** Rev 1 said the D-05 changes were
+reverted "explicitly and only because they cost throughput", so this
+goal's disclaimer inverts the judgement. `TODO_ALL.md:2886-2890` actually
+says "**the last three all failed on ONE mechanism: goopg's cost model
+has no parallel dimension**", and `:4724` "Q5/Q9/Q10 **lost
+PARALLELISM**, not a build side". A lost Gather is a plan-shape
+divergence — `parallelism` is a first-class category
+(`pg-plan-parity-diff.py:98,822-828`) — so the recorded cost was a
+**PARITY** cost, which this goal does NOT disclaim. Memory entry
+`goopg_costmodel_has_no_parallel_dimension` records exactly this; I had
+it and did not apply it. Bundle framing deleted, not repaired.
+
+**Fatal 2 — I conflated two implementations.** `take3-D-05-costside-
+unnarrowed` (`deferral_ledger.md:2105`) is the DEFERRAL; the measured
+artefact is `tmp/d05p3-costside-narrow.patch`; R121 is the successor
+implementation. My own numbers prove they differ: the D-05 patch flipped
+Q5/Q7/Q9/Q10 build sides and moved join-method 12→10, scan-type 11→10;
+the flag moves 10→9, 9→8 and raises nothing. So the "no longer flips
+Q14" coupling was measured with the OTHER patch underneath. **`MapSlotBytes`
+48→96 CUT to a follow-up**, and the "≈+10%" figure deleted — this flag's
+SF=1 throughput is UNMEASURED (only datum: `r124:233` SF0.25 +2.2%,
+confounded by census stderr).
+
+**The warrant I failed to cite in rev 1**: `r124/REPORT.md:177-184`
+already handed this decision forward — "Keep default-off … Promotion is
+therefore a judgement … and **it should be taken deliberately rather than
+as a side effect of this round**." R128 is that decision round.
+
+**Why cutting MapSlotBytes is decisive, not tidy** (review): bundling
+destroys attribution (both re-price corpus-wide), and the bundled failure
+mode is **losing a MATCH** — 48→96 flipped **Q14**, which is one of the
+current six. Worst case 6/22 → 5/22 in a round warranted by "+2
+categories, no match flip".
+
+**Artefacts committed** (R123's standing requirement, which rev 1 missed):
+`tpch-narrow-{OFF,ON}.plans.txt`, `parity-{OFF,ON}.txt`. Both read
+`parallelism=0` — the D-05 killer mechanism measured NOT to fire here.
+
+**FRONTIER.md corrected in the same commit** (:52-62, :81-84): it said the
+narrowing chain was "parity-neutral, R124". R124's INCREMENT was neutral;
+R122's two categories are real. The true half (no MATCH flip, so Q4/Q9
+stay blocked) is kept.
+
+Gates hardened per review: P2 needs a plan-TEXT diff (the category counter
+is "structurally incapable" of seeing Q6/Q64/Q75-class changes,
+`r124:101-116`); P3 adds an SF=1 execution pass (the accepted
+planner-below-executor divergence is the OOM direction, and Q21 has OOMed
+at SF=1 before); P5 is `make plan-gate`, whose R124 reasoned-omission is
+annihilated by the flip.

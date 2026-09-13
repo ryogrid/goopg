@@ -1,0 +1,2 @@
+CATEGORIES: join-order=14 join-method=10 scan-type=9 parameterisation=5 aggregation-strategy=10 sort-strategy=9 parallelism=0 qual-placement=4 rendering=1
+NORMALISATION: N1 estimates-to-side-column, N2 strip-PG-Hash, N3 drop-true-filter, N4 alias/suffix-canonicalisation, N5 cast/operator-rendering, N6 qual/key-signatures, N7 right-join-canonicalisation

@@ -50,9 +50,17 @@ R120–R124 are that attempt, and their own reports are the evidence:
 - R120 found the cost-input currency defect (`hashsize.EntryBytes` over
   the FULL column set).
 - R121/R122 built narrowing and propagated it through joins.
-- R123 located the confound; R124 eliminated it — and **measured the
-  whole chain parity-neutral**, with 22 of 32 narrowed rels producing no
-  cost movement at all.
+- R123 located the confound; R124 eliminated it — and measured **R124's
+  own increment** parity-neutral, with 22 of 32 narrowed rels producing
+  no cost movement at all.
+
+**CORRECTION (R128).** The sentence above originally read "measured the
+whole chain parity-neutral". That is wrong and was corrected when R128
+re-measured the flag directly: with `GOOPG_NARROW_COST_INPUTS=1`, TPC-H
+`join-method` goes 10 → 9 and `scan-type` 9 → 8, no category rises, and
+`parallelism` stays 0. **R122's two categories are real; it was R124's
+increment on top of them that was neutral.** Artefacts:
+`../r128-parity-over-throughput/parity-{OFF,ON}.txt`.
 
 The distinction that matters, and that R120–R124 did not cross: they
 narrowed what the **cost model is told**, not what the executor
@@ -78,7 +86,11 @@ evidence for that is not speculative:
 - FK evidence on Q9: refuted this session
   (`../r126-fk-persistence/step-d-recon-fk-chain-is-a-no-go.md` — all
   eight FKs declared, `match=6` unchanged).
-- cost-input narrowing corpus-wide: parity-neutral, R124.
+- cost-input narrowing corpus-wide: **NOT parity-neutral — corrected by
+  R128.** The chain buys TPC-H `join-method` 10→9 and `scan-type` 9→8; it
+  is default-OFF, and R124 §6 handed the promotion decision forward
+  deliberately. What it does not do is flip any query to MATCH, so it does
+  not by itself unblock Q4 or Q9.
 
 **The honest next round is the projection-pushdown / DatumBytes
 capability itself** — infrastructure, not a parity tweak, with no parity
