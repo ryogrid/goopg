@@ -29,25 +29,25 @@ not committed): `time-sweep.sh` equivalent — median of 3, TIMEOUT
   hash/sort-heavy ones.
 - Q96 (the tracking query, PG-shaped parallel plan): goopg
   0.22–0.30s vs PG 0.044s (~5x).
-- Queries where goopg was faster (8) — EXPLAINED, not cold cache:
-  Q1 0.24s vs 15.187s (63.3x), Q74 1.75s vs 53.487s (30.6x),
-  Q6 3.51s vs 33.416s (9.5x), Q81 0.46s vs 3.848s (8.4x),
-  Q30 0.16s vs 0.87s (5.4x), Q4 7.02s vs 35.655s (5.1x),
-  Q11 3.55s vs 8.257s (2.3x), Q54 1.59s vs 2.449s (1.5x).
-  Cause is a **PG-disadvantageous GUC asymmetry, not engine speed**:
-  the PG reference runs `work_mem` default **4MB** (unset in
-  `bench/tpcds/runtime/pgdata/postgresql.conf`), while goopg's
-  builder default is **512MB** (`hashsize.DefaultMemLimitBytes`),
-  and the oracle secs come from unpinned plain runs
-  (`scripts/tpcds-sf025-regression.sh` `cmd_oracle` issues no SET).
-  Hash/sort-heavy queries spill to disk on PG and stay in memory on
-  goopg — 128x apart. This is K10's known gap: K10 pinned
-  `work_mem=64MB` for PLAN captures, but the oracle SECS were never
-  re-captured under a pinned work_mem. No unfair bias on the goopg
-  side (client wall-clock includes connect+plan, i.e. against goopg;
-  96/96 checksums rule out shortcut results).
-  Follow-up: re-time the 8 queries on PG with `work_mem=512MB`
-  (fair rematch); expect the gaps to collapse.
+- Queries where goopg was faster (8) — PG-side pathology, proven by
+  fair rematch (all 96 re-timed on live `:65438` with
+  `work_mem='512MB'` pinned, 3-run medians, values re-verified):
+  Q1 0.24s vs 15.03s, Q74 1.75s vs 53.91s, Q6 3.51s vs 35.53s,
+  Q81 0.46s vs 3.85s, Q30 0.16s vs 0.81s, Q4 7.02s vs 31.87s,
+  Q11 3.55s vs 7.59s, Q54 1.59s vs 2.50s —
+  the gaps do NOT collapse. CORRECTION of the earlier work_mem
+  entry: the 4MB-vs-512MB asymmetry is real
+  (`bench/tpcds/runtime/pgdata/postgresql.conf` leaves work_mem
+  unset; goopg default 512MB; oracle secs unpinned) but it is NOT
+  the cause — pinned PG stays slow, reproducibly warm (Q1 14.0s,
+  Q74 53.9s re-runs). PG's own plans are pathologically slow on this
+  sampled data (e.g. Q74: parallel nested-loop with per-row
+  `customer_pkey` probes under a CTE Append). No unfair bias on the
+  goopg side either (client wall-clock includes connect+plan, i.e.
+  against goopg; 96/96 checksums rule out shortcut results).
+  Fair-rematch totals: goopg 170.2s vs PG(512MB) 182.4s = 0.93x,
+  with 9 queries goopg-faster — same reading guidance as above
+  (aggregate, not superiority).
 
 ## Reading guidance
 
