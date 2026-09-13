@@ -92,6 +92,7 @@ func addHashJoinPath(joinRel, probe, build *RelOptInfo, cp costParams, jt parser
 		numHashClauses:  len(keys),
 		innerBucketSize: innerBucketSize,
 		final:           final,
+		outerWidth:      pathWidth(p),
 		innerWidth:      pathWidth(b),
 		// take2 P4-01: column counts come from the PATHS, falling back to the
 		// rels. The previous comment here read "Column counts come from the
@@ -103,6 +104,7 @@ func addHashJoinPath(joinRel, probe, build *RelOptInfo, cp costParams, jt parser
 		outerCols: pathNCols(p), innerCols: pathNCols(b),
 		outerAvgVarBytes: pathAvgVarBytes(p), innerAvgVarBytes: pathAvgVarBytes(b),
 	})
+	tracePGHashTupleGeometry(p, b, cp)
 	// The residual is evaluated only on tuples that already matched on the
 	// keys, so it rides the join's OUTPUT cardinality (PG charges qpqual on
 	// `hashjointuples`, costsize.c:4432).

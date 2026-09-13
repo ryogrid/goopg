@@ -207,10 +207,12 @@ func addPartialHashJoinPath(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp 
 		numHashClauses:  len(keys),
 		innerBucketSize: bucket,
 		final:           final,
+		outerWidth:      pathWidth(o),
 		innerWidth:      pathWidth(i),
 		outerCols:       pathNCols(o), innerCols: pathNCols(i),
 		outerAvgVarBytes: pathAvgVarBytes(o), innerAvgVarBytes: pathAvgVarBytes(i),
 	})
+	tracePGHashTupleGeometry(o, i, cp)
 	// The residual rides the join's OUTPUT cardinality, which for a partial
 	// path is the per-worker one — the same rule addHashJoinPath applies to the
 	// serial figure.

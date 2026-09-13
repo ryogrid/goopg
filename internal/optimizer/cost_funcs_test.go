@@ -182,6 +182,62 @@ func TestHashJoinCost_SpillDependsOnFitNotOnSize(t *testing.T) {
 	}
 }
 
+func TestPGHashTupleSpillCostSwitchUsesSeparateGeometryAndPageWidths(t *testing.T) {
+	cp := defaultCostParams()
+	cp.workMem = 64 << 10
+	in := hashJoinInputs{
+		outerRows: 110, innerRows: 650, outputRows: 110,
+		numHashClauses: 1,
+		// Forty Goopg Datums make the executor geometry spill, while the
+		// PG width-48 packed geometry is a one-batch fit at this memory.
+		outerCols: 40, innerCols: 40,
+		outerWidth: 48, innerWidth: 48,
+	}
+	if got := hashsize.Choose(in.innerRows, in.innerCols, 0, cp.workMem).NBatch; got <= 1 {
+		t.Fatalf("fixture must spill in Goopg map geometry, NBatch=%d", got)
+	}
+	if got, ok := pgHashGeometry(in.innerRows, in.innerWidth, cp.workMem); !ok || got.numBatches != 1 {
+		t.Fatalf("fixture must fit PG packed geometry, got=%+v ok=%v", got, ok)
+	}
+	restore := setPGHashTupleSpillCostForTest(false)
+	mapCost := hashJoinCost(cp, in)
+	restore()
+	restore = setPGHashTupleSpillCostForTest(true)
+	pgCost := hashJoinCost(cp, in)
+	restore()
+	if pgCost.Total >= mapCost.Total || pgCost.Startup >= mapCost.Startup {
+		t.Fatalf("PG-fit experiment must suppress map spill: pg=%+v map=%+v", pgCost, mapCost)
+	}
+
+	// Now make PG spill and vary only the outer emitted width across a
+	// MAXALIGN boundary. Its two outer read/write passes must add two pages.
+	in.innerWidth = 100
+	in.outerWidth = 48
+	restore = setPGHashTupleSpillCostForTest(true)
+	narrow := hashJoinCost(cp, in)
+	in.outerWidth = 49
+	wide := hashJoinCost(cp, in)
+	restore()
+	if got, ok := pgHashGeometry(in.innerRows, in.innerWidth, cp.workMem); !ok || got.numBatches <= 1 {
+		t.Fatalf("fixture must spill in PG geometry, got=%+v ok=%v", got, ok)
+	}
+	if got := wide.Total - narrow.Total; !approx(got, 2*cp.seqPageCost) {
+		t.Fatalf("outer width must affect exactly its two PG I/O passes: delta=%v want=%v", got, 2*cp.seqPageCost)
+	}
+
+	// An unknown PG width fails closed to the exact default map price.
+	in.outerWidth = 0
+	restore = setPGHashTupleSpillCostForTest(false)
+	wantFallback := hashJoinCost(cp, in)
+	restore()
+	restore = setPGHashTupleSpillCostForTest(true)
+	gotFallback := hashJoinCost(cp, in)
+	restore()
+	if gotFallback != wantFallback {
+		t.Fatalf("invalid PG geometry changed default map cost: got=%+v want=%+v", gotFallback, wantFallback)
+	}
+}
+
 // TestCostParamsWorkMemMatchesExecutorFallback is the other half of the
 // sibling-path rule: the budget the planner solves the geometry for must be
 // the one the executor falls back to when a session sets no work_mem. If these

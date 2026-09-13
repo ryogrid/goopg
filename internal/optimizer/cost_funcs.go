@@ -607,10 +607,11 @@ type hashJoinInputs struct {
 	// existing non-unique bucket-walk result exactly.
 	final hashJoinFinalCostInput
 
-	// innerWidth is the build path's emitted packed-tuple byte width. It feeds
-	// only PG's planner-private virtual-bucket geometry for unmatched
-	// inner-unique probes, never Goopg executor map sizing or spill I/O.
-	innerWidth int
+	// outerWidth / innerWidth are emitted PG-style byte widths. R91 feeds the
+	// inner one to planner-private virtual buckets. R108's default-off
+	// experiment additionally uses both only for PG's planner page-size spill
+	// price; neither field can affect Goopg executor map sizing.
+	outerWidth, innerWidth int
 
 	// `hashsize.Choose`. Populated from RelOptInfo.AvgVarBytes; zero when no
 	// ANALYZE stats exist (correct for fixed-width relations). M0128-P3.1.
@@ -689,6 +690,18 @@ func hashJoinCost(cp costParams, in hashJoinInputs) Cost {
 		bucketTuples := clampRowEst(in.innerRows * in.innerBucketSize)
 		run += cp.cpuOperatorCost * float64(in.numHashClauses) *
 			in.outerRows * bucketTuples * 0.5
+	}
+
+	// R108 is deliberately opt-in. PG decides hash-table batches using packed
+	// HashJoinTuple geometry, then prices its batch I/O through the distinct
+	// heap-tuple page_size formula. It must not become an executor claim: map
+	// capacity and actual spills remain hashsize.Choose below.
+	if geometry := pgHashTupleSpillGeometryFor(in, cp); geometry.usePG {
+		if geometry.hash.numBatches > 1 {
+			startup += cp.seqPageCost * geometry.innerPages
+			run += cp.seqPageCost * (geometry.innerPages + 2*geometry.outerPages)
+		}
+		return Cost{Startup: startup, Total: startup + run}
 	}
 
 	// M0128-P3.1: avgVarBytes from column stats replaces the hardcoded zero.

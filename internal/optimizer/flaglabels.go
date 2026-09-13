@@ -122,6 +122,12 @@ var flagResolvedState = map[string]func(string) string{
 	"GOOPG_PARTIAL_SORT_PATHS": func(v string) string {
 		return partialSortModeLabel(partialSortModeFromEnv(v))
 	},
+	// R108's experiment is intentionally default-off. Its plan-changing arm
+	// must nevertheless be stamped so every A/B artefact names the geometry
+	// currency it used.
+	"GOOPG_PG_HASH_TUPLE_SPILL_COST": func(v string) string {
+		return onOff(pgHashTupleSpillCostFromEnv(v))
+	},
 	// A mode, not a boolean: the artefact carries the word an operator would
 	// export to reproduce the arm.
 	"GOOPG_NLI_COSTGATE": func(v string) string {
@@ -194,6 +200,7 @@ var flagProvenanceOrder = []string{
 	// Joined at take3 C-19e (P5-05). Default `off` pending the measurement in
 	// docs/design/planner-c19e-partial-sort/DESIGN.md §5.
 	"GOOPG_PARTIAL_SORT_PATHS",
+	"GOOPG_PG_HASH_TUPLE_SPILL_COST",
 }
 
 // flagProvenanceRetired names variables no code reads any more, and the

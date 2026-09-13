@@ -87,6 +87,39 @@ func TestPGHashGeometryDeclinesUnsafeArithmetic(t *testing.T) {
 	}
 }
 
+func TestPGHashSpillPagesUsesHeapTuplePageSizeNotHashTupleSize(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		rows       float64
+		width      int
+		wantPages  float64
+	}{
+		// HeapTupleHeader is 24 bytes. Width 48 therefore occupies 72 bytes,
+		// so 113 rows fit in one 8KiB page but the 114th does not.
+		{"width 48 one page", 113, 48, 1},
+		{"width 48 boundary", 114, 48, 2},
+		// MAXALIGN(49) is 56, producing 80-byte heap tuples.
+		{"width 49 boundary", 103, 49, 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := pgHashSpillPages(tc.rows, tc.width)
+			if !ok || got != tc.wantPages {
+				t.Fatalf("pgHashSpillPages(%v,%d) = %v, ok=%v; want %v,true", tc.rows, tc.width, got, ok, tc.wantPages)
+			}
+		})
+	}
+	for _, tc := range []struct {
+		rows  float64
+		width int
+	}{
+		{math.NaN(), 48}, {math.Inf(1), 48}, {-1, 48}, {1, 0},
+	} {
+		if got, ok := pgHashSpillPages(tc.rows, tc.width); ok {
+			t.Fatalf("unsafe page-size input (%v,%d) = %v, want decline", tc.rows, tc.width, got)
+		}
+	}
+}
+
 func TestPathWidthUsesEmittedIndexOnlySchema(t *testing.T) {
 	covered := []catalog.Column{
 		{Name: "narrow_i", Type: catalog.Type{Name: "int4"}},

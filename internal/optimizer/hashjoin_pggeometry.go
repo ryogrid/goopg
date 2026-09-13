@@ -11,12 +11,14 @@ type pgHashGeometryResult struct {
 	numBuckets     int64
 	numBatches     int64
 	virtualBuckets int64
+	tupleBytes     int64
 }
 
 const (
 	pgHashAlign              int64 = 8
 	pgHashTupleOverhead      int64 = 16 // HJTUPLE_OVERHEAD
 	pgMinimalTupleHeader     int64 = 16 // MAXALIGN(SizeofMinimalTupleHeader)
+	pgHeapTupleHeaderBytes   int64 = 24 // SizeofHeapTupleHeader on LP64
 	pgHashBucketPointerBytes int64 = 8  // sizeof(HashJoinTuple)
 	pgSkewPointerBytes       int64 = 8 * 8
 	pgIntBytes               int64 = 4
@@ -176,7 +178,34 @@ func pgHashGeometry(ntuples float64, width int, hashMem int64) (pgHashGeometryRe
 	if !ok || virtual <= 0 {
 		return pgHashGeometryResult{}, false
 	}
-	return pgHashGeometryResult{numBuckets: nbuckets, numBatches: nbatches, virtualBuckets: virtual}, true
+	return pgHashGeometryResult{numBuckets: nbuckets, numBatches: nbatches, virtualBuckets: virtual, tupleBytes: tupsize}, true
+}
+
+// pgHashSpillPages is PG18 costsize.c's page_size(rows, width) used by
+// final_cost_hashjoin's batch-file I/O charge. It is deliberately not the
+// packed HashJoinTuple size used by pgHashGeometry: page_size models a heap
+// tuple as MAXALIGN(width) + MAXALIGN(SizeofHeapTupleHeader).
+func pgHashSpillPages(rows float64, width int) (float64, bool) {
+	if !(rows >= 0) || math.IsNaN(rows) || math.IsInf(rows, 0) || width <= 0 {
+		return 0, false
+	}
+	alignedWidth, ok := pgHashMaxAlign(int64(width))
+	if !ok {
+		return 0, false
+	}
+	header, ok := pgHashMaxAlign(pgHeapTupleHeaderBytes)
+	if !ok {
+		return 0, false
+	}
+	tupleBytes, ok := pgHashAdd(alignedWidth, header)
+	if !ok {
+		return 0, false
+	}
+	bytes := rows * float64(tupleBytes)
+	if math.IsNaN(bytes) || math.IsInf(bytes, 0) || bytes > float64(pgHashMaxInt64) {
+		return 0, false
+	}
+	return math.Ceil(bytes / float64(pgHashBlockSize)), true
 }
 
 func pgHashMaxAlign(n int64) (int64, bool) {
