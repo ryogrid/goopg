@@ -4507,6 +4507,21 @@ cost/value; scope stop rule applied. Next: separately scope that namespace
 semantic gap or another safe Goopg-order measurement; do not target PG's
 forced margin with a cost change.
 
+R102 SCOPE READY 2026-09-13
+(`r102-lateral-joined-left-namespace/SCOPE.md`): repair only the analyzer's
+LATERAL visibility of an explicit joined left operand, subject to native PG18
+success/error probes and focused positive/negative semantic tests. A
+post-fix R101 rerun may measure the already-pinned forms, but cannot justify a
+cost/election change. Next: agent review, revise if needed, `git commit -n`/
+push scope, then implement.
+
+R102 SCOPE REVIEWED 2026-09-13 (APPROVE after one BLOCK correction): the
+fault is the unaliased grouped-JOIN synthetic-range lowering, not ordinary
+JOIN-chain LATERAL scope. Scope now protects ordinary/non-LATERAL behavior,
+explicit join aliases, and duplicate/USING visibility, and stops if correlated
+execution needs planner/executor work. Next: commit -n/push scope, then
+implement only the confirmed analyzer fix.
+
 TIMING SURVEY DONE 2026-09-13 (`r97-timing-survey/REPORT.md`,
 measurement-only, no code change, no review — survey not a design
 doc): TPC-DS SF0.25 all 96 queries timed (3-run medians, values
