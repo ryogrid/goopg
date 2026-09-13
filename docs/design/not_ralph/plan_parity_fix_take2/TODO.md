@@ -5827,3 +5827,89 @@ rev 3's routing is sound where rev 2's was not.
 Also noted: renaming the PARENT table leaves the child's in-memory
 `fk.RefTable` stale (pre-existing `fkParentRel` bug) — the OID-keyed
 reload REPAIRS it at the next restart.
+
+## R126 (done) — FKs survive a restart, and so does enforcement
+
+Committed `fbf838c02`. Report: `r126-fk-persistence/REPORT.md`.
+**TPC-H 6/22 (measured this round), TPC-DS 2/99 — no plan moved and none
+was predicted.** Value: step (d) is now possible, and a silent
+correctness bug is gone.
+
+Gates: unit suites green; `go vet` clean; TPC-H spotcheck PASS (Q12=2,
+Q13=34); TPC-DS SF0.25 **PASS=96 MISMATCH=0**, plan-shape **99/99 same**;
+pg_constraint heap bytes identical on a fresh initdb; TPC-H parity
+`match=6 shapediff=14 unparsed=0 missingnode=2` (artefact
+`r126-tpch.plans.txt`). `make plan-gate` FAILS 20/22 **and fails
+identically on the R125 binary** — verified by re-running it against
+`goopg-r125` on the same data dir; it diffs goopg against PG, so it
+cannot pass until this workstream's goal is met.
+
+**The implementation review found two more instances of THIS ROUND'S OWN
+BUG**, both fixed and mutation-verified:
+- **ATTACH PARTITION** clones the parent's FKs onto the child *after* the
+  child's `syncTableToCatalogHeap` already ran (`operators_fk.go:615` vs
+  the sync ~15 lines earlier), so every attached partition silently lost
+  referential enforcement across a restart. The eighth mutator — the
+  scope had listed partition ATTACH as an implementation-time check.
+- **`resolveFKCatalogKeys` hardcoded `Schema:"public"`**, so an FK whose
+  parent lived in another schema was never persisted **while the
+  synthesised view kept displaying it**. Fixed with
+  `LookupTableByNameAnySchema`, which declines on cross-schema ambiguity
+  rather than guessing a parent.
+
+Also fixed: the `stamp-then-rewrite` idiom swallowed
+`MaterializeWriterXID` errors at BOTH `syncConstraintCatalogRow` and
+`resyncForeignKeyCatalogRow` — harmless while every rewritten row was
+keyed by table OID, but FK rows are APPENDED, so a skipped stamp
+duplicates them (the failure P3 exists to prevent, invisible to tests
+because the error never fires in the harness). Four silent `continue`s
+now `slog.Warn`, and an unresolvable `confdelsetcols` now declines on
+BOTH sides rather than widening `ON DELETE SET NULL (a)` to the whole key.
+
+**Seven restart pins** (`internal/initdb/fk_restart_test.go`), all in the
+ALTER form. This is the round's most durable artefact: the bug existed
+because nothing in the suite crossed an `Open→Close→Open` boundary with
+an FK declared, and a CREATE-form test would have passed against the
+broken code.
+
+### Carried into step (d) — read before scoping it
+
+1. **Why three FK-sensitivity fixtures all failed to move.**
+   `keysCovering` tries an **index** arm BEFORE the FK arm
+   (`joinrelsize.go:645-655`): any unique index whose columns are a
+   subset of the join columns already gives the exact clamp. Every
+   fixture gave the parent a PRIMARY KEY on the join columns, so the FK
+   arm was redundant *by construction*. A discriminating fixture needs a
+   parent with **no unique index on the referenced columns** — goopg's
+   ADD FOREIGN KEY does not require one, unlike PG. **This also means the
+   eight TPC-H FKs may move nothing: `lineitem→partsupp` references
+   `partsupp`'s PK, so the index arm already fires.** Size step (d)
+   against that before spending a load.
+2. **P1's "reaches the estimator" is composition, not measurement.** The
+   view iterates `tbl.ForeignKeys` so rendering proves the field is
+   populated; `keysCovering` reads the same field; R125 pinned that path.
+   But P1c (enforcement) is **not** an independent witness — it resolves
+   the parent with a normalising `im.LookupTable` while `fkParentRel`
+   does a raw case-sensitive byte compare (`joinrelsize.go:760`).
+3. **No in-process pin crosses a DATABASE boundary** — the harness's
+   parser rejects `CREATE DATABASE` (a dispatch-layer statement), so the
+   per-DB routing step (d) rides has manual psql evidence only.
+
+### Follow-ups this round created
+
+- `PhysicalTypeIsVarlena` has no `IsArray` arm — latent for ordinary user
+  `int4[]` columns, not just catalogs. Deserves its own round + ledger row.
+- `pg_constraint` returns 0 rows of ANY contype post-restart, including
+  `'p'`/`'u'` synthesised from indexes that demonstrably survive — a
+  SECOND, independent reload gap. Not conflated with the FK gap.
+- `catalog.ForeignKey` should carry the parent's OID, not an unschemed
+  name. Both sides already compute it; it retires the ambiguity decline,
+  `fkParentRel`'s fragile byte compare, and rename staleness at once.
+- An in-process per-DATABASE restart pin (blocked on the harness).
+- The six `deleteCatalogRowsForOID` sites that hardcode `DefaultDBOid`
+  are now FK-stamping sites with fixed routing; confirm none reach a
+  per-DB table.
+- Free win, named so nobody "fixes" it: `operators_tx.go:376` cleans a
+  rolled-back CREATE TABLE's FK row automatically now.
+- R125 §7's 32.17s FK-validation figure is STILL un-remeasured; it is the
+  input to "step (c) is optional", so step (c)'s scope inherits it.
