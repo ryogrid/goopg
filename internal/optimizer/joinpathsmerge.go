@@ -491,7 +491,7 @@ func sortPathForBounded(sub *Path, keys []PathKey, cp costParams, limitTuples fl
 	// rel's `AvgVarBytes` rides along for the same reason (spill-calibration
 	// Cut 1): it is the statistic `hashJoinCost` sizes the rival's build with.
 	s := costSortRunWithWidth(cp, sub.Rows, pathNCols(sub), pathAvgVarBytes(sub), limitTuples, pathWidth(sub), "sortpath")
-	return &Path{
+	sp := &Path{
 		Kind: PathSort,
 		// B-17a: `cost_sort`'s own flag on top of the input's count
 		// (costsize.c:2144). The producer is not skipped when off.
@@ -506,4 +506,10 @@ func sortPathForBounded(sub *Path, keys []PathKey, cp costParams, limitTuples fl
 		// subpath->parallel_safe`. C-19a.
 		ParallelSafe: parallelSafeWith(sub.Rel, sub),
 	}
+	// R121 Slice A(ii): a Sort reorders rows, it does not project them. NOTE
+	// goopg's Sort genuinely runs at the full row width -- this makes the
+	// PATH's declared width consistent with its child so `addPath` compares
+	// like with like; it does not claim the executor sorts narrower rows.
+	inheritNarrowedWidths(sp, sub)
+	return sp
 }

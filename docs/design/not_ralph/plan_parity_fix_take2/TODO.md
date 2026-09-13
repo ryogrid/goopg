@@ -5039,3 +5039,57 @@ Flag `GOOPG_NARROW_COST_INPUTS`, strict `=="1"`, default-off — the
 FIRST narrowing flag to gate a cost input (the existing `GOOPG_NARROW_*`
 are opt-OUT and gate plan shape only); watch the three-flag interaction
 with `GOOPG_NARROW_BUILD=0`. Next: implement Slice A, then gates.
+
+R121 SLICE A DONE 2026-09-14 (`r121-narrow-cost-inputs/REPORT.md`,
+review **BLOCK -> APPROVE-WITH-NOTES**, 3 BLOCKs closed + 10 notes):
+**mechanically correct, PARITY-NEUTRAL; flag stays default-off.**
+Implemented `GOOPG_NARROW_COST_INPUTS` (strict `=="1"`, default-off,
+provenance-registered): A(i) one sweep over the base-rel level after
+every scan producer (`relfromjoinlist.go`, after `addBaseRelIndexPaths`,
+before `addBaseRelGatherPaths`) — a sweep, not five constructor edits,
+so it cannot miss a producer and A(iii) holds by construction;
+A(ii) `inheritNarrowedWidths` on Gather/GatherMerge/Sort/Memoize plus
+`costMemoizeRescan`'s direct `relNCols` read switched to `pathNCols`;
+A(iii) all-or-none per rel, index-only exempt. Narrowing is on the
+**Path**, never the rel. 15 pins.
+It FIRES and by a lot — TPC-H Q10's four base rels 37 -> 16 columns
+(lineitem 16->4, orders 9->3, customer 8->7, nation 4->2). And it moves
+NOTHING on parity: **TPC-H ON-vs-OFF plan text byte-identical including
+every cost** (6/15/0/1/0 unchanged); **TPC-DS 152 diff lines with real
+join-order changes but match=2 and EVERY category identical** — the
+queries whose shapes moved were already SHAPE-DIFF and stayed so with
+the same category set. Narrowing traded one non-PG join order for
+another. Values PASS both corpora (sweep stamped
+`GOOPG_NARROW_COST_INPUTS=1`, PASS=96 MISMATCH=0; spotcheck PASS).
+Why bounded, now measured: with Slice B deferred the join path's own
+width is untouched (`pathNCols` falls back to the full
+`relNCols(joinrel)` sum, `joinsearchlevel.go:632-643`), so only
+first-level joins see anything; and the aggregate is unreachable from a
+Path at all (search root must publish the full concatenation). R120's
+17x entry gap therefore survives intact at the aggregate.
+Three review catches worth carrying: (1) rev 1 CLAIMED the
+production-producer pin the SCOPE mandated while every pin built
+`searchCtx` by hand — deleting the call site would have left the suite
+green; the replacement end-to-end pin is **mutation-tested**; (2) P1 is
+**PARTIAL** not PASS — its per-corpus declined/mixed census was never
+run (unit tests cannot produce one); (3) a REAL leak: index-only paths
+carry `NCols` unconditionally, so A(ii) would have laundered that triple
+onto a Gather over a DECLINING rel while its sibling Gather carried
+none — A(iii) violated through the wrapper; `inheritNarrowedWidths` now
+refuses an index-only child.
+Also recorded: P3's `sort-strategy` clause passed TRIVIALLY (goopg's
+Sort does not project, so a narrowed scan under-charges it — deferred,
+not discharged); the TPC-H zero-movement explanation is INFERRED, not
+measured (no `hashsize.Choose` pair captured) and is the null hypothesis
+Slice B must beat; parity captures are not machine-stamped with their
+arm (only the sweep is) — `capture-tpc*.sh` should adopt the stamp.
+**Disposition:** keep, but R121 is NOT a cost arm like R108/R113/R120 —
+it is enabling infrastructure with no consumer. Its gate is: **if Slice
+B does not land in the next round-cluster, R121 is dead code and gets
+deleted.** Separately, four default-off arms is the norm limit; that
+belongs in the take2 charter, not a round REPORT.
+Next: Slice B — sum narrowed child triples into the join path's own
+NCols/AvgVarBytes/**OutputWidth** (all three, or it recreates R120's
+two-currency defect one level up); key on `jt` (`pathgen.go:78`,`:148`),
+`JoinRight` publishes BOTH sides so outer-only is SEMI/ANTI; and census
+the narrowed-vs-declined join pairs before reading its category deltas.

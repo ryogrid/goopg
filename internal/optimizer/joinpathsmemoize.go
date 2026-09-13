@@ -249,9 +249,25 @@ func getMemoizePath(s *searchCtx, outer *RelOptInfo, outerPath, innerPath *Path,
 
 	ndistinct, isDefault := memoizeKeyNDistinct(s, innerPath, outer.Relids)
 	rescan, est := costMemoizeRescan(cp, innerPath.Cost, innerPath.Rows, outer.Rows,
-		ndistinct, isDefault, relNCols(innerPath.Rel), len(keys))
+		// R121 Slice A(ii): was relNCols(innerPath.Rel) -- a DIRECT rel read
+		// that bypassed pathNCols and so could never see any narrowing. It is
+		// also the contract Path.NCols' own doc states ("read them through
+		// pathNCols ..., never directly").
+		//
+		// UNCONDITIONAL, so it must be inert with GOOPG_NARROW_COST_INPUTS
+		// off. It is, and the reason is an invariant worth stating rather than
+		// rediscovering: with that flag off the ONLY writer of Path.NCols is
+		// pathindexonly.go, and getMemoizePath cannot reach here on an
+		// index-only inner -- memoizeCacheKeys returns (nil,false) when
+		// len(innerPath.IndexClauses)==0, and the index-only producer emits
+		// the full-index-scan shape with no index clauses (its partial twin is
+		// a struct copy of the same). Pinned by
+		// TestGetMemoizePathDeclinesIndexOnlyInner: if a parameterised
+		// index-only path is ever added, that pin fails rather than the
+		// default arm silently re-pricing.
+		ndistinct, isDefault, pathNCols(innerPath), len(keys))
 
-	return &Path{
+	mp := &Path{
 		Kind: PathMemoize,
 		// The wrapper stands for the same relation, the same rows and the same
 		// parameterisation as what it wraps — `create_memoize_path`
@@ -269,6 +285,10 @@ func getMemoizePath(s *searchCtx, outer *RelOptInfo, outerPath, innerPath *Path,
 		// C-19a.
 		ParallelSafe: innerPath.ParallelSafe,
 	}
+	// R121 Slice A(ii): Memoize is a single-child WRAPPER (same rel, same
+	// rows, same parameterisation), not a join — it emits its child's row.
+	inheritNarrowedWidths(mp, innerPath)
+	return mp
 }
 
 // memoizeCacheKeys is `paraminfo_get_equal_hashops` (joinpath.c:438) reduced to

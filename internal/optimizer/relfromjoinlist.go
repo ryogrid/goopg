@@ -707,6 +707,20 @@ func (prob *joinlistProblem) searchOneProblem(items []joinlistRel, tupleFraction
 	s.setBaseRelConsiderParallel(prob.cat)
 	s.addBaseRelPartialPaths()
 	s.addBaseRelIndexPaths(prob.cat)
+	// R121 Slice A(i): narrow the COST width triple on every base-rel scan
+	// path, in ONE sweep after all of them exist.
+	//
+	// A sweep rather than five constructor edits, deliberately: it cannot miss
+	// a producer (the prebuilt SeqScan above ran before the stamps and could
+	// not narrow itself; partial/index/bitmap/parameterised producers each
+	// build fresh Paths that set no triple), and it makes the all-or-none
+	// PER REL rule hold by construction rather than by five agreeing call
+	// sites. Placed before addBaseRelGatherPaths so Gather/GatherMerge inherit
+	// an already-narrowed child (Slice A(ii)).
+	//
+	// No re-costing is needed: costSeqscan is width-independent, so the
+	// already-costed prebuilt path's cost and setCheapest verdict do not move.
+	s.narrowBaseRelCostWidths()
 	// C-19d: `generate_useful_gather_paths` for every BASE rel, which
 	// upstream runs at the end of `set_rel_pathlist` (allpaths.c) — after
 	// every base path producer, before the rel's set_cheapest — and ONLY when

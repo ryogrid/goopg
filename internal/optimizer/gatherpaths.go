@@ -218,7 +218,7 @@ func makeGatherPath(rel *RelOptInfo, sub *Path, cp costParams) *Path {
 		return nil
 	}
 	rows := computeGatherRows(sub, cp)
-	return &Path{
+	g := &Path{
 		Kind:     PathGather,
 		Rel:      rel,
 		Rows:     rows,
@@ -232,6 +232,9 @@ func makeGatherPath(rel *RelOptInfo, sub *Path, cp costParams) *Path {
 		DisabledNodes:   sub.DisabledNodes,
 		Children:        []*Path{sub},
 	}
+	// R121 Slice A(ii): a Gather projects nothing, so it emits its child's row.
+	inheritNarrowedWidths(g, sub)
+	return g
 }
 
 // makeGatherMergePath is `create_gather_merge_path` (pathnode.c:2020) +
@@ -243,7 +246,7 @@ func makeGatherMergePath(rel *RelOptInfo, sub *Path, cp costParams) *Path {
 		return nil
 	}
 	rows := computeGatherRows(sub, cp)
-	return &Path{
+	gm := &Path{
 		Kind: PathGatherMerge,
 		Rel:  rel,
 		Rows: rows,
@@ -261,6 +264,9 @@ func makeGatherMergePath(rel *RelOptInfo, sub *Path, cp costParams) *Path {
 		DisabledNodes: sub.DisabledNodes + disabledNodesFor(!cp.enableGatherMerge),
 		Children:      []*Path{sub},
 	}
+	// R121 Slice A(ii): GatherMerge reorders rows, it does not project them.
+	inheritNarrowedWidths(gm, sub)
+	return gm
 }
 
 // gatherSubpathIsRunnable is the fail-closed admission test for a partial path

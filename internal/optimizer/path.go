@@ -267,7 +267,17 @@ type Path struct {
 
 	// NCols / AvgVarBytes describe what THIS PATH emits, when that is narrower
 	// than its relation — PG's `pathtarget` at the granularity goopg needs for
-	// executor hash sizing. OutputWidth is the separate emitted byte width for
+	// executor hash sizing.
+	//
+	// R121 widened that reading: with GOOPG_NARROW_COST_INPUTS on, a base-rel
+	// scan path carries the columns the STATEMENT needs, which is not
+	// literally what the path emits — goopg's SeqScan does not project, and
+	// neither does its Sort. The figures are a COST currency, and the safe
+	// direction is what licenses the gap: the keep-sets nest as
+	// joinKeepSet ⊆ buildKeepSet ⊆ neededKeepSet, so the planner-narrowed row
+	// is always a SUPERSET of the row the executor's own narrowing
+	// (narrowoutput.go) will actually build. It can over-charge, never
+	// under-size a real hash build. OutputWidth is the separate emitted byte width for
 	// planner-only PG packed-tuple geometry. Zero values mean "not narrowed";
 	// read them through pathNCols/pathAvgVarBytes/pathWidth, never directly, so
 	// the fallback to the rel's figures stays in one place.
@@ -283,9 +293,12 @@ type Path struct {
 	//
 	// Stored in EMITTED-SCHEMA order — ascending leaf-output positions, the
 	// shape `neededKeepSet` returns — so Slice 2's ascending checks pass
-	// without guard loosening. NEVER applied: no createPlan change, no cost
-	// change — behaviour-neutral by construction (modulo allocator noise: one
-	// small slice header per path). TargetKnown false means "unknown": the
+	// without guard loosening. This once read "NEVER applied: no createPlan
+	// change, no cost change"; both halves have since expired. Slice 2 wired
+	// `buildKeepSet` into narrowBuildInput/narrowMergeInput, so Target DOES
+	// reach createPlan, and R121 narrows COST inputs — though through
+	// NCols/AvgVarBytes/OutputWidth, not through this field, which still has
+	// exactly one production reader (buildKeepSet) and still feeds no cost. TargetKnown false means "unknown": the
 	// collector declined (NeededColsKnown false) or the rel carries no leaf
 	// schema, and no narrowing may be attempted. It is NOT the same as an
 	// empty list.
