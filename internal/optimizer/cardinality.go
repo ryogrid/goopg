@@ -606,12 +606,32 @@ func IsSmallDimensionSide(n Node) bool {
 //     nd-driven path would silently truncate genuine fan-out; the audit is
 //     what certifies that judgement (09 §5.3).
 func estimateJoin(j *Join) int64 {
+	return estimateJoinTraced(j, nil)
+}
+
+// estimateJoinTraced is estimateJoin with an optional equation trace. A nil
+// tr behaves identically to the old estimateJoin; a non-nil tr records every
+// arithmetic input the taken branch consumes (R118 producer audit). The trace
+// holds frozen scalars only.
+func estimateJoinTraced(j *Join, tr *JoinEstimateTrace) int64 {
 	l := EstimateRows(j.Left)
 	r := EstimateRows(j.Right)
+	if tr != nil {
+		tr.L, tr.R = l, r
+		tr.Jointype = joinTypeAuditName(j.Type)
+	}
 	if l <= 0 || r <= 0 {
+		if tr != nil {
+			tr.Branch = "degenerate"
+			tr.FinalRows = 0
+		}
 		return 0
 	}
 	if j.Type == JoinTypeCross {
+		if tr != nil {
+			tr.Branch = "cross"
+			tr.FinalRows = l * r
+		}
 		return l * r
 	}
 	// SEMI / ANTI: the output is a subset of the OUTER input, so the
@@ -620,12 +640,22 @@ func estimateJoin(j *Join) int64 {
 	// into `jselec` because a row only counts as matched when the whole
 	// join condition holds.
 	if j.Type == JoinTypeSemi || j.Type == JoinTypeAnti {
-		sel := semiJoinMatchFraction(j, r) * joinResidualSelectivity(j)
+		mf := semiJoinMatchFraction(j, r)
+		rs := joinResidualSelectivity(j)
+		sel := mf * rs
 		if sel > 1 {
 			sel = 1
 		}
+		branch := "semi"
 		if j.Type == JoinTypeAnti {
 			sel = 1 - sel
+			branch = "anti"
+		}
+		if tr != nil {
+			tr.Branch = branch
+			tr.MatchFrac = nanGuardedFloat(mf)
+			tr.ResidualSel = nanGuardedFloat(rs)
+			tr.FinalRows = scaleByFloat(l, sel)
 		}
 		return scaleByFloat(l, sel)
 	}
@@ -637,8 +667,19 @@ func estimateJoin(j *Join) int64 {
 		sk := superkeyJoinEstimate(j, pairs)
 		sel := sk.sel
 		measured := sk.fired || sk.boundProven
+		var psels []float64
+		var pmethods []string
+		var pnds []int64
+		if tr != nil {
+			tr.SuperkeySel = nanGuardedFloat(sk.sel)
+			tr.SuperkeyFired = sk.fired
+			tr.SuperkeyBoundProven = sk.boundProven
+		}
 		for i, p := range pairs {
 			if i < len(sk.covered) && sk.covered[i] {
+				if tr != nil {
+					pmethods = append(pmethods, "key-covered")
+				}
 				continue
 			}
 			// M0127-P5.6-e-iii: the right key is resolved in the MERGED
@@ -652,14 +693,27 @@ func estimateJoin(j *Join) int64 {
 				// informed than 1/max(nd).
 				sel *= mcvSel
 				measured = true
+				if tr != nil {
+					psels = append(psels, nanGuardedFloat(mcvSel))
+					pmethods = append(pmethods, "mcv")
+				}
 			} else if nd := pairNDistinct(j, p); nd > 0 {
 				sel *= pairNullSelectivity(j, p) / float64(nd)
 				measured = true
+				if tr != nil {
+					psels = append(psels, nanGuardedFloat(pairNullSelectivity(j, p)/float64(nd)))
+					pmethods = append(pmethods, "nd")
+					pnds = append(pnds, nd)
+				}
 			} else {
 				// `clauselist_selectivity` charges an unmeasurable
 				// equijoin the selfuncs.h constant and multiplies it in
 				// with the rest; it does not abandon the measured pairs.
 				sel *= defaultEqSelectivity * pairNullSelectivity(j, p)
+				if tr != nil {
+					psels = append(psels, nanGuardedFloat(defaultEqSelectivity*pairNullSelectivity(j, p)))
+					pmethods = append(pmethods, "default")
+				}
 			}
 		}
 		if measured {
@@ -668,7 +722,8 @@ func estimateJoin(j *Join) int64 {
 			// a deep chain's `l*r` would wrap int64 negative before the
 			// divide and `clampRowEst` would pin the garbage to 1. Same
 			// reason `satRowsMulDiv` exists on the DP side (bushy.go).
-			rows := float64(l) * float64(r) * sel * joinResidualSelectivity(j)
+			rs := joinResidualSelectivity(j)
+			rows := float64(l) * float64(r) * sel * rs
 			// The key-implied bound (04 §3.3). `rowsBound` is +Inf unless a
 			// proven key makes one side's rows an upper bound on the
 			// output, so this is a no-op on every join that proved nothing.
@@ -678,11 +733,35 @@ func estimateJoin(j *Join) int64 {
 			if rows > sk.rowsBound {
 				rows = sk.rowsBound
 			}
+			if tr != nil {
+				tr.Branch = "hash-merge-measured"
+				tr.PairSels = psels
+				tr.PairMethods = pmethods
+				tr.PairNDs = pnds
+				tr.ResidualSel = nanGuardedFloat(rs)
+				tr.RowsBound = sk.rowsBound
+				tr.RowsBoundInf = math.IsInf(sk.rowsBound, 0)
+				tr.RowsFloat = nanGuardedFloat(rows)
+				tr.Measured = true
+				tr.FinalRows = saturateRowEst(outerJoinRowFloor(j, rows, l, r))
+			}
 			return saturateRowEst(outerJoinRowFloor(j, rows, l, r))
+		}
+		if tr != nil {
+			tr.Branch = "hash-merge-fallback"
+			tr.PairSels = psels
+			tr.PairMethods = pmethods
+			tr.PairNDs = pnds
+			tr.SuperkeySel = nanGuardedFloat(sk.sel)
+			tr.ResidualSel = nanGuardedFloat(joinResidualSelectivity(j))
 		}
 	}
 	est := scaleByFloat(l*r, defaultEqSelectivity)
 	if est < 1 {
+		if tr != nil {
+			tr.Branch = "hash-merge-fallback"
+			tr.FinalRows = 1
+		}
 		return 1
 	}
 	// M0126-0010: cap fallback estimate at max input size.
@@ -690,8 +769,17 @@ func estimateJoin(j *Join) int64 {
 	if r > mx {
 		mx = r
 	}
+	capped := false
 	if est > mx {
 		est = mx
+		capped = true
+	}
+	if tr != nil {
+		if tr.Branch == "" {
+			tr.Branch = "hash-merge-fallback"
+		}
+		tr.Capped = capped
+		tr.FinalRows = saturateRowEst(outerJoinRowFloor(j, float64(est), l, r))
 	}
 	// Upstream applies the outer-join clamp to whatever `jselec` produced, not
 	// only to a measured one, so the unmeasurable fallback gets it too.
