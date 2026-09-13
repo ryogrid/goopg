@@ -4544,6 +4544,14 @@ PG witnesses now require exact row values and SQLSTATE 42P01/42702 assertions,
 not generic comparison. R101 remains measurement only. Next: commit -n/push
 scope, then implement within the parser/analyzer/planner boundary.
 
+R103 DONE 2026-09-13 (`r103-grouped-join-source-binding/REPORT.md`): a
+temporary parser/analyzer/planner source map lets both unchanged R101 forms
+return 266 and retain their forced hash-join/time-probe shapes, but grouped
+JOIN USING fails inside the LATERAL child with 42703 instead of PG's qualified
+source semantics. Stop rule applied and all code reverted. Next: separately
+scope durable grouped-source-to-output binding across LATERAL re-resolution;
+do not ship a Q96-only partial map or change costs.
+
 TIMING SURVEY DONE 2026-09-13 (`r97-timing-survey/REPORT.md`,
 measurement-only, no code change, no review — survey not a design
 doc): TPC-DS SF0.25 all 96 queries timed (3-run medians, values
