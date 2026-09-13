@@ -4633,6 +4633,12 @@ clusters, with positive and negative normalization controls. No data or
 planner change is authorized. Next: agent review, `git commit -n`/push scope,
 then measurement.
 
+R109 DONE 2026-09-13 (`r109-q96-normalized-relation-witness/REPORT.md`):
+allowed char/numeric normalization matches three Q96 relations, but `store`
+still differs because Goopg loses trailing whitespace in `varchar`. Stop rule
+applied; scope a data-fidelity repair before common-data cost attribution or
+R108.
+
 R108 PLANNED — PG hash-tuple sizing comparison, dependent on R107 DONE:
 only after R107 establishes common relation/schema/index inputs and records
 both engines' native statistics, scope and review an opt-in experiment that
