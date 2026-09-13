@@ -67,6 +67,23 @@ Stronger still: the SET demonstrably had nothing to fix — zero of
 cases are therefore genuine PG-plan pathology on this data, not a
 measurement artefact of a missed SET.
 
+## Dataset + shared_buffers audit (2026-09-13)
+
+- Row counts match exactly on all 10 probed tables (PG `:65438`
+  tpcds025 vs goopg clone): store_sales 719876, store_returns
+  71676, catalog_sales 360397, catalog_returns 36066, web_sales
+  179956, web_returns 17920, inventory 2355000, customer 100000,
+  date_dim 73049, store 12. Facts quartered as designed
+  (≈SF1/4), dimensions whole — SF0.25 equivalence holds.
+- shared_buffers is NOT aligned, in PG's favor this time: PG
+  effective **2GB** (config lists 128MB then 2GB; last wins) vs
+  goopg clone **128MB** default (unset → 16384 slots). Buffer
+  residency favors PG, so it cannot explain goopg's 8 wins — if
+  anything it strengthens the pathology reading (PG slow despite
+  the larger cache; cf. Q74's probe-heavy plan doing random heap
+  fetch). Both servers returned to found state (stopped) after
+  the audit.
+
 ## Reading guidance
 
 Same-shape timing compares execution engines; different-shape timing
