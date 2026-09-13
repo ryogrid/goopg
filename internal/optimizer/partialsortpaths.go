@@ -255,7 +255,7 @@ func createPartialSortPaths(srt *Sort, workers int, leaderParticipates bool, cp 
 	// they save exactly the log N factor and nothing else. `cost_sort` charges
 	// the comparisons as STARTUP on top of the input's total, which is why the
 	// two arms are assembled the same way `sortPathForBounded` assembles one.
-	wSort := costSortRun(cp, perWorkerRows, ncols, avgVar, -1)
+	wSort := costSortRunWithWidth(cp, perWorkerRows, ncols, avgVar, -1, ordered.Width, "partial.worker")
 	wSortCost := Cost{Startup: seed.Cost.Total + wSort.Startup, Total: seed.Cost.Total + wSort.Total}
 	// `compute_gather_rows` of the sort path: the per-worker count multiplied
 	// by the divisor it was priced with. Every input row crosses the boundary
@@ -285,7 +285,7 @@ func createPartialSortPaths(srt *Sort, workers int, leaderParticipates bool, cp 
 	// `findPartialSubtree` builds when the verdict is "decline", so the
 	// comparison is against the plan that really gets built.
 	gCost := gatherCost(cp, seed.Cost, inputRows)
-	lSort := costSortRun(cp, inputRows, ncols, avgVar, -1)
+	lSort := costSortRunWithWidth(cp, inputRows, ncols, avgVar, -1, ordered.Width, "partial.leader")
 	gather := &Path{
 		Kind: PathGather, Rel: ordered, Rows: inputRows, Cost: gCost,
 		DisabledNodes: seed.DisabledNodes,

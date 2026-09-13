@@ -117,6 +117,34 @@ func TestPartialSortTournamentPricesBothArms(t *testing.T) {
 	}
 }
 
+func TestPartialSortBothArmsUseTheEmittedInputWidth(t *testing.T) {
+	restore := setPGSortRelationBytesCostForTest(true)
+	defer restore()
+	cp := DefaultPlannerSettings().costParams()
+	tbl := bigTable(t, "psp_pgwidth")
+	child := seqScanOver(tbl)
+	child.setPlanCost(PlanCost{StartupCost: 3, TotalCost: 50000, PlanRows: 1000000, PlanWidth: 8})
+	srt := sortOver(child, testKeys())
+	tour := createPartialSortPaths(srt, 4, true, cp)
+	if tour == nil {
+		t.Fatal("no partial-sort tournament")
+	}
+	width := tupleWidth(child.Output())
+	if tour.ordered.Width != width {
+		t.Fatalf("ordered width = %d, want child emitted width %d", tour.ordered.Width, width)
+	}
+	wantWorker := costSortRunWithWidth(cp, tour.perWorkerRows, tour.ordered.NCols, tour.ordered.AvgVarBytes, -1, width, "test")
+	workerSort := tour.workerSide.Children[0]
+	if workerSort.Cost.Startup != workerSort.Children[0].Cost.Total+wantWorker.Startup || workerSort.Cost.Total != workerSort.Children[0].Cost.Total+wantWorker.Total {
+		t.Fatalf("worker Sort cost %+v does not use emitted width %d (%+v)", workerSort.Cost, width, wantWorker)
+	}
+	wantLeader := costSortRunWithWidth(cp, tour.inputRows, tour.ordered.NCols, tour.ordered.AvgVarBytes, -1, width, "test")
+	leaderSort := tour.leaderSide
+	if leaderSort.Cost.Startup != leaderSort.Children[0].Cost.Total+wantLeader.Startup || leaderSort.Cost.Total != leaderSort.Children[0].Cost.Total+wantLeader.Total {
+		t.Fatalf("leader Sort cost %+v does not use emitted width %d (%+v)", leaderSort.Cost, width, wantLeader)
+	}
+}
+
 // TestPartialSortVerdictIsCostDriven is the property that distinguishes this
 // from the rule it replaces: the SAME node type must be able to produce both
 // verdicts, decided by the numbers.

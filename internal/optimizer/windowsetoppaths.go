@@ -192,12 +192,12 @@ func seedRowsForNode(n Node) float64 {
 // (costsize.c:3178) has no analogue and is deliberately absent — it exists to
 // reward a streaming WindowAgg that can stop early, and goopg's cannot.
 func costWindow(cp costParams, inputTotal, inputRows float64,
-	numPartCols, numOrderCols, numFuncs, inNcols int, inAvgVarBytes float64) Cost {
+	numPartCols, numOrderCols, numFuncs, inNcols int, inAvgVarBytes float64, inWidth int) Cost {
 	tuples := inputRows
 	if tuples < 0 {
 		tuples = 0
 	}
-	sortRun := costSortRun(cp, tuples, inNcols, inAvgVarBytes, -1)
+	sortRun := costSortRunWithWidth(cp, tuples, inNcols, inAvgVarBytes, -1, inWidth, "window")
 	// The sort consumes the input in full, so the input's TOTAL is the
 	// blocking node's startup floor; `costSortRun` prices only the sort's own
 	// work, split the same way it splits it for a `PathSort`.
@@ -236,7 +236,7 @@ func addWindowPaths(winRel *RelOptInfo, seed *Path, windows []*WindowAgg, input 
 			DisabledNodes: below.DisabledNodes,
 			Cost: costWindow(cp, below.Cost.Total, below.Rows,
 				len(w.PartitionBy), len(w.OrderBy), len(w.Funcs),
-				len(cols), nodeAvgVarBytes(cols)),
+				len(cols), nodeAvgVarBytes(cols), nodeTupleWidth(belowNode)),
 			Children: []*Path{below},
 		}
 		below = p

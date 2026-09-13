@@ -145,6 +145,7 @@ func TestAddOrderedPathsOffersExactlyOneProducerPerInput(t *testing.T) {
 	lines := captureTrace(t, func() {
 		addOrderedPaths(unordered, newPrebuiltPath(unordered, upperOrderedInput(10)), keys, cp, -1)
 	})
+	lines = dppathLines(lines)
 	if len(lines) != 1 || !strings.Contains(lines[0], "producer="+upperOrderedSortProducer+" relids=- ") || !strings.Contains(lines[0], "verdict=accepted") {
 		t.Fatalf("unordered input: trace = %q, want one accepted %s line at relids=-", lines, upperOrderedSortProducer)
 	}
@@ -159,6 +160,7 @@ func TestAddOrderedPathsOffersExactlyOneProducerPerInput(t *testing.T) {
 	lines = captureTrace(t, func() {
 		addOrderedPaths(ordered, seed, keys, cp, -1)
 	})
+	lines = dppathLines(lines)
 	if len(lines) != 1 || !strings.Contains(lines[0], "producer="+upperOrderedInputProducer+" relids=- ") {
 		t.Fatalf("ordered input: trace = %q, want one %s line", lines, upperOrderedInputProducer)
 	}
@@ -179,9 +181,20 @@ func TestCreateOrderedPathsHonoursEnableSortAsAPreference(t *testing.T) {
 			t.Errorf("enable_sort=off must still emit the Sort")
 		}
 	})
+	lines = dppathLines(lines)
 	if len(lines) != 1 || !strings.Contains(lines[0], "disabled=1 ") {
 		t.Fatalf("trace = %q, want the sort path offered with disabled=1", lines)
 	}
+}
+
+func dppathLines(lines []string) []string {
+	out := lines[:0]
+	for _, line := range lines {
+		if strings.HasPrefix(line, "DPPATH ") {
+			out = append(out, line)
+		}
+	}
+	return out
 }
 
 // TestCreateOrderedPathsNeverDropsTheSort: no keys hands the input back; no

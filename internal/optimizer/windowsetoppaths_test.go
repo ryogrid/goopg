@@ -94,7 +94,7 @@ func TestCostWindowIsCostWindowaggTermByTerm(t *testing.T) {
 		cp.cpuOperatorCost*(numPart+numOrd)*rows +
 		cp.cpuTupleCost*rows
 
-	got := costWindow(cp, inputTotal, rows, numPart, numOrd, numFuncs, inNcols, inAvgVarBytes)
+	got := costWindow(cp, inputTotal, rows, numPart, numOrd, numFuncs, inNcols, inAvgVarBytes, 64)
 	if math.Abs(got.Startup-wantStartup) > 1e-9 {
 		t.Fatalf("costWindow startup = %v, want %v", got.Startup, wantStartup)
 	}
@@ -114,10 +114,38 @@ func TestCostWindowIsCostWindowaggTermByTerm(t *testing.T) {
 // the same key count.
 func TestCostWindowSortTermUsesRowWidthNotKeyCount(t *testing.T) {
 	cp := defaultCostParams()
-	narrow := costWindow(cp, 100, 5e6, 1, 1, 1, 2, 0)
-	wide := costWindow(cp, 100, 5e6, 1, 1, 1, 40, 400)
+	narrow := costWindow(cp, 100, 5e6, 1, 1, 1, 2, 0, 16)
+	wide := costWindow(cp, 100, 5e6, 1, 1, 1, 40, 400, 1024)
 	if !(wide.Total > narrow.Total) {
 		t.Fatalf("wide-row window total %v not above narrow-row %v; costSortRun is being fed the key count, not the row width", wide.Total, narrow.Total)
+	}
+}
+
+func TestAddWindowPathsUsesPreWindowEmittedWidth(t *testing.T) {
+	restore := setPGSortRelationBytesCostForTest(true)
+	defer restore()
+	cp := defaultCostParams()
+	cp.workMem = 100
+	in := upperOrderedInput(1000000)
+	win := windowTestNode(in, 1)
+	winRel := &RelOptInfo{}
+	sizeWindowRelFromNode(winRel, win, in)
+	seed := &Path{Rel: winRel, Rows: winRel.Rows, Cost: Cost{Total: 100}}
+	addWindowPaths(winRel, seed, []*WindowAgg{win}, in, cp)
+	if len(winRel.Pathlist) != 1 {
+		t.Fatalf("window paths = %d, want one", len(winRel.Pathlist))
+	}
+	want := costWindow(cp, seed.Cost.Total, seed.Rows,
+		len(win.PartitionBy), len(win.OrderBy), len(win.Funcs), len(in.Output()),
+		nodeAvgVarBytes(in.Output()), nodeTupleWidth(in))
+	postWindow := costWindow(cp, seed.Cost.Total, seed.Rows,
+		len(win.PartitionBy), len(win.OrderBy), len(win.Funcs), len(in.Output()),
+		nodeAvgVarBytes(in.Output()), nodeTupleWidth(win))
+	if want == postWindow {
+		t.Fatalf("fixture does not distinguish pre-window width %d from output width %d", nodeTupleWidth(in), nodeTupleWidth(win))
+	}
+	if got := winRel.Pathlist[0].Cost; got != want {
+		t.Fatalf("Window path cost %+v, want pre-window-width cost %+v, not post-window %+v", got, want, postWindow)
 	}
 }
 

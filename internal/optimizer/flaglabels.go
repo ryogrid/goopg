@@ -128,6 +128,11 @@ var flagResolvedState = map[string]func(string) string{
 	"GOOPG_PG_HASH_TUPLE_SPILL_COST": func(v string) string {
 		return onOff(pgHashTupleSpillCostFromEnv(v))
 	},
+	// R113's experiment is default-off and changes only Sort's planner byte
+	// price, but artefacts must name its currency for a reproducible A/B.
+	"GOOPG_PG_SORT_RELATION_BYTES_COST": func(v string) string {
+		return onOff(pgSortRelationBytesCostFromEnv(v))
+	},
 	// A mode, not a boolean: the artefact carries the word an operator would
 	// export to reproduce the arm.
 	"GOOPG_NLI_COSTGATE": func(v string) string {
@@ -201,6 +206,7 @@ var flagProvenanceOrder = []string{
 	// docs/design/planner-c19e-partial-sort/DESIGN.md §5.
 	"GOOPG_PARTIAL_SORT_PATHS",
 	"GOOPG_PG_HASH_TUPLE_SPILL_COST",
+	"GOOPG_PG_SORT_RELATION_BYTES_COST",
 }
 
 // flagProvenanceRetired names variables no code reads any more, and the

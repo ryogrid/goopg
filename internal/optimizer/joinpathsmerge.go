@@ -490,7 +490,7 @@ func sortPathForBounded(sub *Path, keys []PathKey, cp costParams, limitTuples fl
 	// exact: a Sort projects nothing, so its output rows are its input's. The
 	// rel's `AvgVarBytes` rides along for the same reason (spill-calibration
 	// Cut 1): it is the statistic `hashJoinCost` sizes the rival's build with.
-	s := costSortRun(cp, sub.Rows, relNCols(sub.Rel), relAvgVarBytes(sub.Rel), limitTuples)
+	s := costSortRunWithWidth(cp, sub.Rows, pathNCols(sub), pathAvgVarBytes(sub), limitTuples, pathWidth(sub), "sortpath")
 	return &Path{
 		Kind: PathSort,
 		// B-17a: `cost_sort`'s own flag on top of the input's count

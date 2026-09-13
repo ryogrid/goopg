@@ -287,6 +287,14 @@ func qualEvalCost(cp costParams, numQuals int, tuples float64) float64 {
 // hand in the rel's `AvgVarBytes`; zero stays a legitimate value ("no
 // ANALYZE, or every column fixed-width") and changes nothing.
 func costSortRun(cp costParams, inputRows float64, ncols int, avgVarBytes float64, limitTuples float64) Cost {
+	return costSortRunWithWidth(cp, inputRows, ncols, avgVarBytes, limitTuples, 0, "direct")
+}
+
+// costSortRunWithWidth is costSortRun with the path-target width that PG's
+// relation_byte_size consumes. Width is planner-only: Goopg's EntryBytes stays
+// the executor and default-off costing currency.
+func costSortRunWithWidth(cp costParams, inputRows float64, ncols int, avgVarBytes float64, limitTuples float64, width int, caller string) Cost {
+	rawInputRows := inputRows
 	// "We want to be sure the cost of a sort is never estimated as zero, even
 	// if passed-in tuple count is zero. Besides, mustn't do log(0)..."
 	// (costsize.c) — PG clamps rather than returning zero, and a zero here
@@ -304,11 +312,39 @@ func costSortRun(cp costParams, inputRows float64, ncols int, avgVarBytes float6
 	}
 	startup := comparisonCost * tuples * math.Log2(tuples)
 
-	if ncols > 0 && cp.workMem > 0 {
-		inputBytes := tuples * hashsize.EntryBytes(ncols, avgVarBytes)
-		outputBytes := output * hashsize.EntryBytes(ncols, avgVarBytes)
-		sortMemBytes := float64(cp.workMem)
-		if outputBytes > sortMemBytes {
+	currency := "goopg"
+	goopgInputBytes, goopgOutputBytes := 0.0, 0.0
+	pgInputBytes, pgOutputBytes := 0.0, 0.0
+	goopgBranch, pgBranch := "unknown-width", "unknown-width"
+	if cp.workMem > 0 {
+		goopgValid := ncols > 0
+		if goopgValid {
+			goopgInputBytes = tuples * hashsize.EntryBytes(ncols, avgVarBytes)
+			goopgOutputBytes = output * hashsize.EntryBytes(ncols, avgVarBytes)
+		}
+		// cost_tuplesort computes input_bytes before clamping tuples to two,
+		// then either reuses that exact input volume or computes a bounded
+		// output volume after the clamp. Calculate it even with the switch off
+		// so the trace can expose both currencies; elect it only with the flag.
+		pgValid := false
+		if input, ok := pgRelationByteSize(rawInputRows, width); ok {
+			pgInputBytes = input
+			pgOutputBytes = input
+			if limitTuples > 0 && limitTuples < tuples {
+				pgOutputBytes, pgValid = pgRelationByteSize(output, width)
+			} else {
+				pgValid = true
+			}
+		}
+		goopgBranch = sortByteBranch(cp, tuples, output, goopgInputBytes, goopgOutputBytes, goopgValid)
+		pgBranch = sortByteBranch(cp, tuples, output, pgInputBytes, pgOutputBytes, pgValid)
+		inputBytes, branch := goopgInputBytes, goopgBranch
+		if pgSortRelationBytesCostEnabled() && pgValid {
+			inputBytes, branch = pgInputBytes, pgBranch
+			currency = "pg"
+		}
+		switch branch {
+		case "disk":
 			// Disk-based sort of all the tuples (costsize.c:1936): the
 			// page/run math still sizes the INPUT — every tuple is
 			// written and re-read — while the branch itself is chosen on
@@ -316,7 +352,7 @@ func costSortRun(cp costParams, inputRows float64, ncols int, avgVarBytes float6
 			// never spills. Without a bound output == tuples and this
 			// is the old condition exactly.
 			npages := math.Ceil(inputBytes / blockSizeBytes)
-			nruns := inputBytes / sortMemBytes
+			nruns := inputBytes / float64(cp.workMem)
 			mergeorder := tuplesortMergeOrder(cp.workMem)
 			logRuns := 1.0
 			if nruns > mergeorder {
@@ -325,7 +361,7 @@ func costSortRun(cp costParams, inputRows float64, ncols int, avgVarBytes float6
 			npageaccesses := 2.0 * npages * logRuns
 			// "Assume 3/4ths of accesses are sequential, 1/4th are not."
 			startup += npageaccesses * (cp.seqPageCost*0.75 + cp.randomPageCost*0.25)
-		} else if tuples > 2*output || inputBytes > sortMemBytes {
+		case "bounded":
 			// Bounded heap-sort keeping just K tuples in memory
 			// (costsize.c:1960): N log2 K comparisons with the slightly
 			// higher constant PG tweaks for curve continuity at the
@@ -336,11 +372,27 @@ func costSortRun(cp costParams, inputRows float64, ncols int, avgVarBytes float6
 			startup = comparisonCost * tuples * math.Log2(2.0*output)
 		}
 	}
+	tracePGSortRelationBytes(caller, rawInputRows, tuples, output, limitTuples, width,
+		goopgInputBytes, goopgOutputBytes, pgInputBytes, pgOutputBytes, goopgBranch, pgBranch, currency)
 
 	// "a small amount (arbitrarily set equal to operator cost) per extracted
 	// tuple" — NOT cpu_tuple_cost, because a Sort does no qual-checking or
 	// projection.
 	return Cost{Startup: startup, Total: startup + cp.cpuOperatorCost*tuples}
+}
+
+func sortByteBranch(cp costParams, tuples, output, inputBytes, outputBytes float64, valid bool) string {
+	if !valid || cp.workMem <= 0 {
+		return "unknown-width"
+	}
+	sortMemBytes := float64(cp.workMem)
+	if outputBytes > sortMemBytes {
+		return "disk"
+	}
+	if tuples > 2*output || inputBytes > sortMemBytes {
+		return "bounded"
+	}
+	return "memory"
 }
 
 // costAgg is `cost_agg` (costsize.c:2682) for SORTED and HASHED — C-15's
