@@ -4770,6 +4770,23 @@ separate planner representation from Goopg aggregate execution capacity, and
 establish whether a default-off comparison can affect a live candidate. Before
 source change: Design Doc, agent review, `git commit -n`, and push.
 
+R114 DEFERRED 2026-09-13 by user direction: stop the Datum-size / cost-family
+investigation. Do not start the HashAggregate representation audit unless it
+is explicitly reprioritized after the unresolved Q96 plan breakdown.
+
+R115 PLANNED — Q96 non-spill forced-order cost attribution, dependent on R111
+DONE and R108 DONE: resume the Q96 breakdown at the remaining common-input
+forced-order discrepancy (PG18.3 prices hdem-first lower by 175.91; Goopg
+prices store-first lower by 7.68). Scope and review a measurement-only,
+default-off diagnostic that reconciles every selected Hash Join cost input and
+term for both forced forms on the validated common-data clusters, including
+base/filter cardinalities, output width, bucket/inner-unique data, qual costs,
+parallel divisor, and spill verdict. It must first distinguish a representable
+planner input defect from engine-native statistics divergence or an
+unobservable PG input; no Datum-size substitution, cost tuning, Gather force,
+or production change is authorized. Before any diagnostic or source change:
+Design Doc, agent review, `git commit -n`, and push.
+
 TIMING SURVEY DONE 2026-09-13 (`r97-timing-survey/REPORT.md`,
 measurement-only, no code change, no review — survey not a design
 doc): TPC-DS SF0.25 all 96 queries timed (3-run medians, values
