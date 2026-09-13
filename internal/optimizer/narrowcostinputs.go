@@ -45,12 +45,27 @@ import (
 // few, and `joinKeepSet ⊆ buildKeepSet ⊆ neededKeepSet` — planner-narrowed is
 // a superset of executor-narrowed.
 //
-// Default-off pending the round's A/B. Note the sibling `GOOPG_NARROW_*` flags
-// are opt-OUT (default ON) and gate executor plan shape; this is the first to
-// gate a planner COST input.
+// **Default ON since R128** — promoted by the decision round R124 handed
+// forward by name ("Promotion is therefore a judgement … and it should be
+// taken deliberately rather than as a side effect of this round",
+// r124-nontable-leaf-widths/REPORT.md). Measured warrant: TPC-H
+// `join-method` 10→9 and `scan-type` 9→8 with no category rising and
+// `parallelism` staying 0, artefacts in
+// docs/design/not_ralph/plan_parity_fix_take2/r128-parity-over-throughput/.
+//
+// It is now opt-OUT (`v != "0"`), matching the sibling `GOOPG_NARROW_*`
+// family. It remains the only one of them that gates a planner COST input
+// rather than executor plan shape — that distinction survives promotion even
+// though the opt-in/opt-out split no longer marks it.
+//
+// The trade is recorded rather than hidden (R128 SCOPE §4): promotion
+// re-baselines every plan pin, changes 3 TPC-DS shapes (Q6/Q64/Q75) for no
+// TPC-DS gain, and makes R124's accepted planner-publishes-below-executor
+// divergence the shipped default rather than an opt-in arm. It is taken
+// because the goal counts PG-likeness and disclaims runtime.
 var narrowCostInputs = narrowCostInputsFromEnv(os.Getenv("GOOPG_NARROW_COST_INPUTS"))
 
-func narrowCostInputsFromEnv(v string) bool { return v == "1" }
+func narrowCostInputsFromEnv(v string) bool { return v != "0" }
 
 func narrowCostInputsEnabled() bool { return narrowCostInputs }
 

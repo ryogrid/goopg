@@ -31,14 +31,21 @@ func ncNeeded(names ...string) map[string]bool {
 	return m
 }
 
-func TestNarrowCostInputsFlagIsStrictAndDefaultOff(t *testing.T) {
-	for _, v := range []string{"", "0", "true", "on", "yes", " 1", "1 ", "01"} {
-		if narrowCostInputsFromEnv(v) {
-			t.Errorf("value %q must NOT enable cost-input narrowing", v)
+// R128 re-pinned this to the promoted contract. It previously asserted the
+// opt-IN form (`v == "1"`, default OFF); the flag is now default ON and
+// opt-OUT, matching the sibling GOOPG_NARROW_* family. The test is inverted
+// rather than deleted so the contract stays pinned in both directions and a
+// silent reversion is caught.
+func TestNarrowCostInputsFlagIsOptOutAndDefaultOn(t *testing.T) {
+	// Only the exact string "0" disables. Everything else — including unset —
+	// leaves narrowing ON.
+	for _, v := range []string{"", "1", "true", "on", "yes", " 0", "0 ", "00", "false"} {
+		if !narrowCostInputsFromEnv(v) {
+			t.Errorf("value %q must leave cost-input narrowing ENABLED (default-on, opt-out)", v)
 		}
 	}
-	if !narrowCostInputsFromEnv("1") {
-		t.Error(`"1" must enable cost-input narrowing`)
+	if narrowCostInputsFromEnv("0") {
+		t.Error(`"0" must disable cost-input narrowing`)
 	}
 }
 

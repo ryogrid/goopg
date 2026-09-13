@@ -101,10 +101,14 @@ var flagResolvedState = map[string]func(string) string{
 	// shapes and an A/B that cannot separate them cannot attribute a
 	// regression. Default ON; `=0` opts back out, as does GOOPG_NARROW_UPPER=0.
 	"GOOPG_NARROW_UPPER_SORT": func(v string) string { return onOff(narrowUpperSortFromEnv(v)) },
-	// R121 Slice A. Unlike the three GOOPG_NARROW_* flags above -- which are
-	// opt-OUT and gate executor plan SHAPE -- this one is opt-IN and is the
-	// first to gate a planner COST input, so artefacts must never conflate it
-	// with them.
+	// R121 Slice A, PROMOTED TO DEFAULT ON BY R128. It now shares the
+	// opt-OUT form (`=0` opts back out) with the three GOOPG_NARROW_* flags
+	// above, so the in/out distinction no longer separates them -- but it is
+	// still the only one of the family that gates a planner COST input rather
+	// than executor plan SHAPE, and artefacts must keep them distinct on that
+	// basis. (The previous comment here asserted "this one is opt-IN"; that
+	// was true until the promotion and is corrected rather than dropped, so a
+	// reader of an older artefact can date it.)
 	"GOOPG_NARROW_COST_INPUTS": func(v string) string { return onOff(narrowCostInputsFromEnv(v)) },
 	// C-19d: a MODE, not a boolean — off / top / all. It decides whether the
 	// search may choose a Gather at all, and at which rels, so an artefact

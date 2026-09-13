@@ -6220,3 +6220,60 @@ is "structurally incapable" of seeing Q6/Q64/Q75-class changes,
 planner-below-executor divergence is the OOM direction, and Q21 has OOMed
 at SF=1 before); P5 is `make plan-gate`, whose R124 reasoned-omission is
 annihilated by the flip.
+
+## R128 (done) — `GOOPG_NARROW_COST_INPUTS` promoted to DEFAULT ON
+
+Report: `r128-parity-over-throughput/REPORT.md`. The promotion decision
+R124 handed forward by name, taken.
+
+**TPC-H `join-method` 10 → 9, `scan-type` 9 → 8.** match stays **6/22**,
+no query flips, `parallelism` stays 0 — predicted and confirmed.
+
+**The throughput cost is +0.2%, not the ~10% rev 1 assumed** (74.17s →
+74.33s over 24 SF=1 labels; Q19 −25.7%, Q3 +29.1%). The ~10% belonged to
+`tmp/d05p3-costside-narrow.patch`, a different implementation. The round
+was scoped to ACCEPT a 10% hit under the goal's runtime disclaimer and
+did not need to spend it.
+
+Cut: parser inverted `v == "1"` → `v != "0"` (`narrowcostinputs.go:51-53`),
+matching the `GOOPG_NARROW_*` opt-out family; the contract test inverted
+and RE-PINNED in both directions rather than deleted; `flaglabels.go`'s
+"this one is opt-IN" comment rewritten (it would otherwise contradict the
+code) while keeping the still-true distinction — it is the only flag in
+the family gating a planner COST input rather than executor SHAPE;
+`planner-flags.env` regenerated to `unset(on)`. **No planner logic
+changed** — only which arm runs by default.
+
+Gates: optimizer+executor suites green, `go vet` clean, flag-provenance
+test green; TPC-H spotcheck PASS (Q12=2, Q13=34); **SF=1 values 24/24
+MATCH** ("matched on values, not merely on row count", no OOM — required
+because this flag makes R124's planner-below-executor divergence the
+shipped default); TPC-DS SF0.25 PASS=96 MISMATCH=0; `make plan-gate`
+20/22 **unchanged** from the R125/R126 binaries on the same data dir.
+No pinned flag expectation in `ci/batch/` or the capture/sweep scripts.
+
+**P2 turned up a measurement trap worth reusing.** The raw TPC-DS SF=1
+diff showed SIX changed queries; **Q36/Q70/Q86 are spurious** — they are
+the three unplannable queries and `methodology/capture-tpcds.sh` embeds
+`$$` in its temp filename, so their ERROR TEXT carries the psql PID
+(`parity-capture-587413.sql` vs `…586757.sql`). **Strip the PID before
+reading any TPC-DS diff.** The three real changes — Q64 (Nested Loop
+subtree), Q75 (HashAggregate/HashSetOp/Hash Left Join), Q95 (**Hash Join
+→ Merge Join**, width **564 → 16**) — are all **parity-neutral**:
+same-epoch OFF vs ON gives identical match AND identical counts in all
+nine categories.
+
+Trade, recorded rather than sold as a free win: +2 TPC-H
+category-instances, against every plan pin re-baselined, 3 TPC-DS shapes
+moved for no TPC-DS gain, +0.2% runtime, and R124's accepted
+planner-below-executor divergence becoming **shipped default behaviour**
+(the SF=1 execution pass is evidence it does not bite today; the debt is
+assumed, not discharged).
+
+**NOT in this round, deliberately:** `MapSlotBytes` 48 → 96 ("KNOWN 2x
+LOW … do not read 48 as validated"). Its "no longer flips Q14" coupling
+was measured with the D-05 patch underneath, not this flag. Bundling
+would destroy attribution and its failure mode is **losing a MATCH** —
+48→96 flipped **Q14**, one of the current six. That round now has a clean
+baseline: flag default-ON as the floor, `tmp/d05p2-bucket-charge.patch`
+on top, one pre-registered prediction that Q14 holds MATCH.
