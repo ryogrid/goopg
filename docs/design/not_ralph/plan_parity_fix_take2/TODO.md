@@ -4486,6 +4486,19 @@ captured. Existing stats suffice; no ANALYZE ran and the source was untouched.
 Next: use this valid oracle in a separately reviewed Q96 cost/selectivity
 attribution scope; R99's Goopg-data copy remains invalid.
 
+R101 SCOPE READY 2026-09-13 (`r101-q96-forced-order-costs/SCOPE.md`): use
+R100's valid native PG oracle to price both explicit Q96 first-two-dimension
+orders, with collapse limits pinning each shape and values still 266; capture
+the same forms on isolated Goopg. This exposes PG's previously unobservable
+loser price without treating forced SQL order as a natural choice. Next:
+agent review, `git commit -n`/push, then measurement; no code change.
+
+R101 SCOPE REVIEWED 2026-09-13 (APPROVE after one BLOCK correction): record
+full rewritten SQL plus per-form SHA, and assert the two intended join leaves
+and final `time_dim` parameterized probe in each EXPLAIN. Forced SQL order is
+measurement only, never natural-election evidence. Next: commit -n/push,
+then capture both engines.
+
 TIMING SURVEY DONE 2026-09-13 (`r97-timing-survey/REPORT.md`,
 measurement-only, no code change, no review — survey not a design
 doc): TPC-DS SF0.25 all 96 queries timed (3-run medians, values
