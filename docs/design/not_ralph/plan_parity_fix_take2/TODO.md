@@ -5196,3 +5196,68 @@ declines the WHOLE statement on any unenumerable shape; making it
 per-relation would convert a large share of the 42,679 mixed pairs into
 uniform ones), re-measure the census per shape first. Then Slice C
 (aggregate coordinate), which still holds R120's promote-or-delete.
+
+R123 SCOPE READY 2026-09-14 (`r123-cost-needed-cols/SCOPE.md` rev 2,
+review **BLOCK -> APPROVE-WITH-NOTES**; rev 1's FIX WITHDRAWN wholesale,
+round is now MEASUREMENT-ONLY):
+Rev 1 proposed a cost-only needed-column set to stop the collector
+declining on WITH/set-op/window/grouping-sets. **Review refuted it with
+R122's own arithmetic and the refutation is correct.**
+`neededCols/neededColsKnown` is a SINGLE pair of fields on `searchCtx`
+(`joinsearch.go:195-196`) stamped uniformly onto every rel of a search,
+so a collector decline is **search-problem-uniform**: such a search has
+NO narrowed rel (index-only is excluded too — `pathindexonly.go:22`
+needs the set KNOWN), therefore contributes **ZERO mixed pairs**. All
+its joins land in "both un-narrowed" = **8,588/124,616 = 6.9%**, which
+BOUNDS the entire collector-decline population. The 42,679 mixed pairs
+(34.2%) come from searches the collector ACCEPTED. Worse, fixing
+declines moves joins out of both-un-narrowed into narrowed AND mixed —
+the share can only hold or RISE, so rev 1's own P3 ("34.2% -> under
+10%") was a bar the arithmetic already answered.
+Rev 1's error was methodological and worth remembering: it substituted a
+**static text grep over .sql files** for the RUNTIME AST measurement
+R122 explicitly asked for, then presented the agreement of "half the
+files" with "a third of comparisons" as confirmation. The grep was also
+wrong on its own terms — 100 files not 99, 45 gate-tripping not 48, and
+**0** queries trip `WindowClause` (the gate term is the named
+`WINDOW w AS (...)` clause; the 10 window queries decline at a different
+site, `collectExprColumnNames`'s `FuncCall.Over != nil` arm).
+New leading hypothesis (from the review, labelled as hypothesis):
+**non-whitelisted child kinds.** `narrowJoinWidths` whitelists only
+Hash/Merge/NL (`narrowcostinputs.go:227-231`) and
+`inheritNarrowedWidths` covers only Gather/GatherMerge/Sort/Memoize
+(`:287-315`), so every PathSetOp/Append/SubqueryScan/HashAgg/Unique in a
+spine publishes NCols==0 beside a narrowed sibling — a mixed pair at
+EVERY join above it. TPC-DS has 22 set-op queries and heavy Append/agg
+spines; TPC-H has neither. Fits 34.2%-vs-0.07% as the statement gate
+provably cannot.
+Three must-fixes applied before instrumenting: (1) the histogram must do
+**ROOT attribution** (stamp a reason on each non-publishing path and
+walk past `childCascade`) — keying on the immediate child's Kind would
+be swamped, since one leaf cause manufactures ~12 mixed pairs in a
+12-way spine, 11 reporting PathHashJoin; (2) the gate counter must
+separate **top-level from nested** calls — `collectStmtColumnNames` is
+re-entrant via the sublink arms and would double-count; (3) **there is
+no OFF baseline to take** — all four entry points are flag-gated, so the
+OFF census is 100% both-un-narrowed by construction; one ON census at a
+pinned epoch instead, with TPC-H's near-zero mixed share as a GATE on
+the counter's correctness.
+Decision table is falsifier-first: statement-gate declines appearing in
+the mixed histogram AT ALL means the instrumentation is wrong -> STOP.
+Thresholds demoted to a tiebreak in favour of reporting the
+distribution, the per-query spread, and the **decisive** (plan-evicting)
+share — the last being the only population where the currency bias could
+have moved a plan. A near-zero decisive share means TPC-DS's flat
+categories were a real null and R124 becomes a promotion-decision round.
+Carried forward for whichever lever wins: CTE `DMLBody` must decline
+(the "Stage A rejects" comment is STALE — parser/analyzer/optimizer all
+handle it); for `s.SetOp` the LEFT operand is `s` itself; grouping sets
+need the gate term DELETED and no walk (`prepareGroupingSets` already
+folded them into `s.GroupBy`); and **B4** — a cost-only set on a
+collector-declined statement INVERTS
+`joinKeepSet ⊆ buildKeepSet ⊆ neededKeepSet`, because
+`GOOPG_NARROW_BUILD` (default ON) inserts no Project there, so the
+executor builds full width while the planner prices narrow. Planner
+UNDER-pricing = R120's defect in reverse; any revival must name it and
+add a timing check.
+Next: instrument, measure, resolve the table.
