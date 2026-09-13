@@ -4603,6 +4603,13 @@ separate form/level ledger rows; and each trace artifact must be
 form/run-delimited and hashed. Next: `git commit -n`/push scope, then
 measurement.
 
+R106 DONE 2026-09-13 (`r106-q96-forced-margin-attribution/REPORT.md`): all
+four trace-on plans equal R105 trace-off plans and values retain 266, but the
+trace emits only upper paths and PG/Goopg base estimates differ materially.
+The forced-margin term attribution is unobservable; no cost/election change
+is authorized. Next: scope a common-data/stats oracle plus selected-Hash-Join
+component diagnostic before any cost work.
+
 TIMING SURVEY DONE 2026-09-13 (`r97-timing-survey/REPORT.md`,
 measurement-only, no code change, no review — survey not a design
 doc): TPC-DS SF0.25 all 96 queries timed (3-run medians, values
