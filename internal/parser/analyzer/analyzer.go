@@ -2911,7 +2911,15 @@ func buildSelectScopeIn(s *parser.SelectStmt, ctx *scope) ([]scopeRel, error) {
 			return nil, err
 		}
 		tbl = applyRangeVarColumnAliases(item.Base, tbl)
-		rels = append(rels, scopeRel{table: tbl, alias: item.Base.Alias})
+		if item.Base.GroupedJoinUnaliased {
+			groupedRels, err := buildSelectScopeIn(item.Base.Subquery, &scope{parent: ctx, cat: ctx.cat})
+			if err != nil {
+				return nil, err
+			}
+			rels = append(rels, groupedRels...)
+		} else {
+			rels = append(rels, scopeRel{table: tbl, alias: item.Base.Alias})
+		}
 		for _, j := range item.Joins {
 			var rt *catalog.Table
 			if j.Right.Subquery != nil {
@@ -2919,7 +2927,11 @@ func buildSelectScopeIn(s *parser.SelectStmt, ctx *scope) ([]scopeRel, error) {
 				// relations as the outer scope so the inner SELECT can
 				// resolve correlated references like t1.col where t1 is the
 				// left side of the JOIN. M0097-0064.
-				lateralCtx := &scope{parent: ctx, cat: ctx.cat, rels: append([]scopeRel(nil), rels...)}
+				lateralRels := make([]scopeRel, 0)
+				if j.Right.Lateral {
+					lateralRels = append(lateralRels, rels...)
+				}
+				lateralCtx := &scope{parent: ctx, cat: ctx.cat, rels: lateralRels}
 				rt, err = synthesizeSubqueryTable(ctx.cat, j.Right, lateralCtx)
 			} else {
 				rt, err = resolveTable(ctx, j.Right)

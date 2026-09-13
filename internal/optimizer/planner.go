@@ -550,6 +550,9 @@ type rangeBinding struct {
 	table  *catalog.Table
 	alias  string
 	offset int // first output-column index for this relation
+	// columnOffsets overrides the contiguous offset for source columns that
+	// share a physical output slot after JOIN USING. R104.
+	columnOffsets map[string]int
 	// qualifiedOnly hides this binding from the unqualified
 	// column-resolution path AND restricts qualified matches to
 	// alias-only (never via the underlying table's catalog name).
@@ -3219,7 +3222,13 @@ func planFromItem(item parser.FromExpr, cat catalog.Catalog, nextSourceIdx *int1
 		return nil, nil, err
 	}
 	*nextSourceIdx++
-	leftCtx := newResolveContext([]rangeBinding{leftBinding}, leftNode.Output(), ps)
+	leftBindings := []rangeBinding{leftBinding}
+	if item.Base.GroupedJoinUnaliased {
+		if grouped, ok := groupedJoinSourceBindings(item.Base, cat, leftNode.Output()); ok {
+			leftBindings = grouped
+		}
+	}
+	leftCtx := newResolveContext(leftBindings, leftNode.Output(), ps)
 	// M0134-0011c: give every per-join resolve context a catalog handle
 	// so IN (subquery) / EXISTS in a JOIN ... ON clause can plan the
 	// sublink via planInExpr (planner.go's `ctx.cat == nil` guard) the
@@ -3235,6 +3244,9 @@ func planFromItem(item parser.FromExpr, cat catalog.Catalog, nextSourceIdx *int1
 		// left side. Merge the outer lateralCtx with the current
 		// leftCtx so SRF args on the right see both. M0103-0008.
 		joinLateralCtx := mergeResolveContexts(lateralCtx, leftCtx)
+		if j.Right.Subquery != nil && !j.Right.Lateral {
+			joinLateralCtx = nil
+		}
 		rightNode, rightBinding, err := planScanRangeVar(j.Right, cat, *nextSourceIdx, joinLateralCtx, ps, scope)
 		if err != nil {
 			return nil, nil, err
@@ -3526,6 +3538,54 @@ func planFromItem(item parser.FromExpr, cat catalog.Catalog, nextSourceIdx *int1
 		}
 	}
 	return leftNode, leftCtx.bindings, nil
+}
+
+// groupedJoinSourceBindings maps source aliases of an unaliased grouped JOIN
+// onto the synthetic SELECT * output. A JOIN USING column has one output slot,
+// so both qualified source names map to that slot. R104.
+func groupedJoinSourceBindings(rv parser.RangeVar, cat catalog.Catalog, out Schema) ([]rangeBinding, bool) {
+	if rv.Subquery == nil || len(rv.Subquery.FromExprs) != 1 {
+		return nil, false
+	}
+	item := rv.Subquery.FromExprs[0]
+	rvars := append([]parser.RangeVar{item.Base}, func() []parser.RangeVar {
+		x := make([]parser.RangeVar, len(item.Joins))
+		for i := range item.Joins { x[i] = item.Joins[i].Right }
+		return x
+	}()...)
+	bindings := make([]rangeBinding, 0, len(rvars))
+	for source, inner := range rvars {
+		if inner.Subquery != nil || inner.TableFunc != nil { return nil, false }
+		tbl, ok := cat.LookupTable(parser.ObjectName{Schema: inner.Schema, Name: inner.Name})
+		if !ok { return nil, false }
+		b := rangeBinding{table: tbl, alias: inner.Alias, sourceIdx: int16(source + 1), columnOffsets: make(map[string]int)}
+		for _, c := range tbl.Columns {
+			for idx, sc := range out {
+				if sc.SourceTableIdx == b.sourceIdx && strings.EqualFold(sc.Name, c.Name) {
+					b.columnOffsets[strings.ToLower(c.Name)] = idx
+					break
+				}
+			}
+		}
+		if source > 0 {
+			b.usingHidden = append([]string(nil), item.Joins[source-1].Using...)
+			for _, name := range item.Joins[source-1].Using {
+				for idx, sc := range out {
+					if strings.EqualFold(sc.Name, name) {
+						b.columnOffsets[strings.ToLower(name)] = idx
+						break
+					}
+				}
+			}
+		}
+		bindings = append(bindings, b)
+	}
+	return bindings, true
+}
+
+func bindingColumnOffset(b rangeBinding, i int, name string) int {
+	if idx, ok := b.columnOffsets[strings.ToLower(name)]; ok { return idx }
+	return b.offset + i
 }
 
 func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, lateralCtx *resolveContext, ps PlannerSettings, scope *rtableScope) (Node, rangeBinding, error) {
@@ -13323,7 +13383,7 @@ func expandStarTarget(star *parser.StarExpr, ctx *resolveContext) ([]Expr, Schem
 					continue
 				}
 			}
-			idx := b.offset + i
+			idx := bindingColumnOffset(b, i, c.Name)
 			outExpr = append(outExpr, &ColumnRef{pos: star.Pos(), Index: idx, Name: c.Name, Type: c.Type, SourceTableIdx: b.sourceIdx})
 			outSchema = append(outSchema, SchemaColumn{Name: c.Name, Type: c.Type, SourceTableIdx: b.sourceIdx})
 		}
@@ -15835,7 +15895,7 @@ func resolveColumnRefAt(x *parser.ColumnRef, ctx *resolveContext, level int) (Ex
 		}
 		for i, c := range b.table.Columns {
 			if strings.EqualFold(c.Name, x.Column) {
-				idx := b.offset + i
+				idx := bindingColumnOffset(b, i, c.Name)
 				if level == 0 {
 					return &ColumnRef{pos: x.Pos(), Index: idx, Name: c.Name, Type: c.Type, SourceTableIdx: b.sourceIdx}, true, nil
 				}
@@ -15892,7 +15952,7 @@ func resolveColumnRefAt(x *parser.ColumnRef, ctx *resolveContext, level int) (Ex
 			if hidden {
 				continue
 			}
-			idx := b.offset + i
+			idx := bindingColumnOffset(b, i, c.Name)
 			if found != nil {
 				return nil, false, &PlanError{Pos: x.Pos(), Code: "42702", Message: fmt.Sprintf("column reference %q is ambiguous", x.Column)}
 			}

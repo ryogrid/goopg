@@ -1769,7 +1769,7 @@ base_table_ref:
 				// here created an unresolvable S/R against nested groups).
 				pos := $<p>1
 				sub := syntheticParenSelect(pos, fe)
-				$$ = derivedRangeVar(yylex.(*lexerState), pos, sub, alias, cols, lateral)
+				$$ = groupedJoinRangeVar(yylex.(*lexerState), pos, sub, alias, cols, lateral)
 			}
 	| select_with_parens opt_derived_alias
 			{

@@ -673,6 +673,7 @@ type RangeVar struct {
 	Lateral   bool          // the LATERAL keyword was written before this item; it may
 	// reference earlier FROM items, which is what makes a FROM
 	// permutation unsafe (planner/joinorder.go, M0125-0034)
+	GroupedJoinUnaliased bool // synthetic unaliased parenthesized JOIN; R104
 
 	// TableSample carries a TABLESAMPLE clause written on this FROM item
 	// (M0134-0175). Upstream models this as a separate RangeTableSample node

@@ -4566,6 +4566,13 @@ values, and SQLSTATEs. Both qualified USING names map to one merged physical
 slot, asserted in later ON and LATERAL contexts. Next: commit -n/push scope,
 then implement without changing layout or generic visibility.
 
+R104 DONE 2026-09-13 (`r104-grouped-join-using-lateral-output/REPORT.md`):
+unaliased grouped JOIN source bindings now map both qualified USING names to
+the shared merged physical slot through later ON and LATERAL planning. Exact
+PG controls and Goopg focused tests pass; both unchanged R101 forms return 266
+with the requested forced spines. Next: resume R101 repeated Goopg plan/cost
+measurement only; do not infer a natural-order cost change.
+
 TIMING SURVEY DONE 2026-09-13 (`r97-timing-survey/REPORT.md`,
 measurement-only, no code change, no review — survey not a design
 doc): TPC-DS SF0.25 all 96 queries timed (3-run medians, values

@@ -12681,7 +12681,7 @@ yydefault:
 			// here created an unresolvable S/R against nested groups).
 			pos := yyDollar[1].p
 			sub := syntheticParenSelect(pos, fe)
-			yyVAL.rvar = derivedRangeVar(yylex.(*lexerState), pos, sub, alias, cols, lateral)
+			yyVAL.rvar = groupedJoinRangeVar(yylex.(*lexerState), pos, sub, alias, cols, lateral)
 		}
 	case 323:
 		yyDollar = yyS[yypt-2 : yypt+1]
