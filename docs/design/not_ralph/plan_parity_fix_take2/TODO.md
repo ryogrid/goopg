@@ -5426,3 +5426,78 @@ what R124 ships; P4's TPC-H half is VACUOUS (zero eligible rels there);
 the values sweep ran on the INSTRUMENTED binary (plan-identical, but
 R123 stated this and R124 did not); and P2's zero-valued-arms clause was
 not met — the same omission R123 self-criticised.
+
+R125 SCOPE rev 2 READY 2026-09-14 (`r125-tpch-foreign-keys/SCOPE.md`,
+review **BLOCK on rev 1 -> re-scoped from the corpus to the ENGINE**).
+**A major corpus/engine finding, and it names a path to the first new
+MATCH.** TPC-H Q9 is the closest query in either corpus to matching —
+its ONLY category is `join-order` — and that divergence is entirely
+downstream of a cardinality bug: for `partsupp ⋈ part ⋈ lineitem`
+(`l_partkey=ps_partkey AND l_suppkey=ps_suppkey`) the **ground truth is
+318,748** (COUNT on live data), **PG estimates 363,341 (1.14x)** and
+**goopg estimates 116 — 2,748x UNDER**. With 116 believed, every join
+above looks free and goopg takes index nested loops all the way up.
+Cause: **PG's `tpch` declares 8 foreign keys; goopg's declares 0.** PG
+fires `get_foreign_key_join_selectivity`; goopg's faithful port of it,
+`superkeyJoinSelectivity` (`joinrelsize.go:312`), has no evidence.
+The FK path IS live — reviewer reproduced it end-to-end on a Q9-shaped
+fixture: adding the FK alone moved the estimate **rows=5 -> rows=1200,
+exactly ground truth**.
+Rev 1 proposed adding the 8 FKs to the bench DB. **BLOCKED, four
+findings, all correct and all worth keeping:**
+1. **goopg does NOT persist FK constraints across a restart** — proven
+   empirically (create -> pg_constraint shows it -> CHECKPOINT -> stop
+   -> start -> 0 rows, data intact). `catalog.Table.ForeignKeys`
+   (`catalog.go:641`) is the only store, `pg_constraint` is SYNTHESISED
+   from it (`:7248`), and startup has **no FK reload path**. Rev 1's
+   gates all cross a restart, so the cut was a no-op by measurement
+   time; "bake it into bench tooling" misdiagnosed it (per-restart, not
+   per-rebuild).
+2. **FK validation is O(child x parent) with no index path**
+   (`operators_ddl.go:9121` -> `validateFKConstraintExistingRows` ->
+   `scanRelForFKMatch`, full heap scan). Measured **32.17s for
+   40,000 x 8,000** -> `lineitem->partsupp` ~5.5 DAYS,
+   `lineitem->orders` ~10 days, **~2 weeks for the eight.** Rev 1 said
+   "may be slow" — five orders of magnitude off.
+3. **Rev 1's `NOT VALID` prohibition was FACTUALLY WRONG about PG.**
+   PG's planner never reads `convalidated`: `plancat.c:642-644` skips
+   only `!conenforced`, and `RelationGetFKeyList` (`relcache.c:4769`)
+   doesn't even carry `convalidated` into `ForeignKeyCacheInfo`. **PG
+   USES a NOT VALID FK for FK-join selectivity.** goopg does the
+   opposite (`joinrelsize.go:658`, `joinkeyproof.go:740` skip on
+   `fk.NotValid`) — a genuine, cheap, source-level parity defect.
+4. **Rev 1's causal story is refuted**: goopg ACCEPTED all 8 FKs at load
+   (HammerDB's CreateIndexes runs PKs, then FKs sql(9)-(16), then the 8
+   `*_fkidx` indexes, erroring on first failure — and goopg HAS all
+   eight `*_fkidx`). They were lost at a later restart; the ANALYZE
+   failure came afterwards and is unrelated. Validation was also a no-op
+   at that epoch (existing-row validation landed later, `0518b4a48`).
+**Rev 2 = the reviewer's step (a):** consume `NOT VALID` FKs as PG does.
+Smallest, PG-cited, and it UNBLOCKS the rest — with NOT VALID accepted,
+FK evidence becomes declarable in O(1) instead of O(child x parent).
+The one real design question the round must answer first: the two guard
+sites are NOT equivalent. `joinrelsize.go:658` feeds a SELECTIVITY (safe
+to relax, PG does), but the same struct carries `boundProven`/
+`rowsBound` — a "STRUCTURAL upper bound" — and `joinkeyproof.go:740` is
+a PROOF site. PG derives no such bound from `fkey_list`, so honouring an
+unvalidated FK there could be unsound where it is not in PG. **Enumerate
+every consumer before editing**; likely shape is relax the selectivity
+site, keep the guard on hard-bound/proof sites, documented at both.
+Dependency chain to Q9, accepted: (a) this round; (b) **persist FK
+constraints across restart** — the blocker for everything, and the
+reload must repopulate `catalog.Table.ForeignKeys`, not the synthesised
+view; (c) index path for FK validation (~2 weeks -> minutes);
+(d) then reload the corpus and measure Q9.
+Carried for (d): with the FK firing goopg's estimate is COMPUTABLE —
+`40,132 x 6,001,255 / 800,000 ~= 301,050`, NOT PG's 363,341 (PG's
+`partsupp ⋈ part` is 48,484 vs goopg's 40,132), so predict 301k;
+"moves toward 318,748" is unfalsifiable. And rev 1's "Q9 -> MATCH" was
+OVER-CONFIDENT: on the reviewer's reproduction the estimate corrected
+exactly while **the plan shape did not change at all**. Correcting
+cardinality != changing shape != matching PG's shape.
+Also noted: neither `tpch` DB is clean (both carry scratch tables — no
+FKs on them, but scope "like-for-like" to the 8 benchmark tables); one
+HammerDB FK is DEFERRABLE and seven are not, so a future catalog-match
+gate must not compare only `(conrelid,confrelid,conkey)`; and the TODO
+head's values gate still says "SF0.5 PASS=95" where CLAUDE.md and every
+round since R94 use SF0.25 PASS=96.
