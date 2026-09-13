@@ -4784,12 +4784,15 @@ PG-shaped search and leaves the forced joins on the legacy/prebuilt route.
 No Datum, spill, Gather, statistic, or production-cost claim follows; all
 temporary source was removed. A successor must attribute that prebuilt route.
 
-R116 PLANNED — legacy/prebuilt forced-join decision attribution, dependent on
-R115 DONE: scope and review a temporary, default-off observation of the actual
-Q96 forced-form `chooseInnerJoinAlgo`/BuildLeft route. It must map every
-selected legacy join to collision-free input and final-decision records and
-run R111 common-input OFFx2/ONx2/value controls. No Datum-size, cost,
-statistics, Gather, search, executor, or production change is authorized.
+R116 DONE 2026-09-13 (`r116-q96-legacy-join-attribution/REPORT.md`): R111
+common-input trace OFFx2/ON controls map both explicit forced-form joins to
+Hash/BuildRight in both forms. No CROSS-promotion mutation occurred; the
+final LATERAL nested-loop node is explicitly unmapped because it bypasses the
+explicit-join constructor. Thus `chooseInnerJoinAlgo`, BuildLeft, and the
+small-dimension override do not explain Goopg's 7.68 store-first margin.
+Next investigate cardinality/display-cost inputs within the equal legacy Hash
+Join shapes; no Datum, cost, statistics, Gather, search, executor, or
+production change was made.
 
 TIMING SURVEY DONE 2026-09-13 (`r97-timing-survey/REPORT.md`,
 measurement-only, no code change, no review — survey not a design
