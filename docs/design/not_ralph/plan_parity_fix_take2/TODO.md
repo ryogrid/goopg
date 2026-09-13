@@ -4403,3 +4403,19 @@ the lead decider (outer×inner scaling dwarfs the margin); slices
 (a) audit-first minimal fix with global gates, (b) conditional fuzz
 tiebreak, (c) ruled-out list. Implementation is R97+ (separate
 scope); step-1 bs measurement may run under R96's P0 bar.
+
+R97 STEP-1 RUNNING 2026-09-12 (scratch wiped by peer cleanup —
+rebuilding): innerBucketSize + walk-term measurement for the {0,1}
+/ {0,3} joins under R96's P0 bar (temp, foreground, byte-identity).
+Scratch moved to /tmp/r97goopg/ (away from the wiped /tmp/pp2/).
+Open question from the lost run: hdem-first filed total trails the
+hand-applied formula by 71.22 — relid-tagged per-call result logging
+will resolve which term differs. Next: measure, revert, STEP1 note,
+review, commit.
+R97 STEP-1 DONE 2026-09-12 (`r96-q96-join-order/STEP1.md`, review
+APPROVE): skip hypothesis FALSIFIED (bs valued); innerUnique branch
+active — walks ~13–15 not ~86; margin = oRun +127.44 / probe +28.64 /
+walk +1.43; per-row increments agree with PG (0.00353 vs 0.00356).
+Reframed slice (a): audit outerMatchFrac + virtualBuckets geometry;
+(b) further deprioritized. Temp reverted, tree clean. Next: R97+
+slice SCOPE citing STEP1, then implementation.
