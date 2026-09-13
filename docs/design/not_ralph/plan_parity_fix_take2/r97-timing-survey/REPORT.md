@@ -49,6 +49,24 @@ not committed): `time-sweep.sh` equivalent — median of 3, TIMEOUT
   with 9 queries goopg-faster — same reading guidance as above
   (aggregate, not superiority).
 
+## SET-application audit (2026-09-13, on the rematch harness)
+
+Q: did every rematch query actually run with work_mem=512MB (SET
+is session-scoped)? A: yes by construction, proven live —
+`psql ... -c "SET work_mem='512MB'" -f query` shares one session
+(psql runs -c/-f in command-line order) and the identical string
+returns `SHOW work_mem = 512MB` against live `:65438`. Documented
+failure mode: a misspelled SET prints ERROR yet continues at 4MB —
+not the case here (string proven valid), but the harness keeps no
+per-query SET receipt (`$res` deleted per query); future runs should
+retain one or prepend a SHOW guard.
+Stronger still: the SET demonstrably had nothing to fix — zero of
+96 queries moved >50% vs the unpinned oracle, and Q74's
+`EXPLAIN (ANALYZE, BUFFERS)` at 4MB shows in-memory quicksort
+(3MB) with no temp files and 60.2s execution. The 8 goopg-faster
+cases are therefore genuine PG-plan pathology on this data, not a
+measurement artefact of a missed SET.
+
 ## Reading guidance
 
 Same-shape timing compares execution engines; different-shape timing
