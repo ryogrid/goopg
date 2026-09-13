@@ -4443,6 +4443,20 @@ and no lawful derivation exists in the captured inputs: UNOBSERVABLE, not a
 cost-change license. Next: find a separately evidenced PG-visible input; do
 not tune inner-unique inputs or force Q96's order.
 
+R99 SCOPE READY 2026-09-13 (`r99-q96-pg-oracle/SCOPE.md`): a read-only native
+PG18.3 rerun found zero Q96 `pg_stats` rows and a radically different no-stats
+NL/Materialize plan, so the current clone is not a parity oracle. Provision a
+separate named native-PG copy, establish and record Q96 statistics, then
+capture repeatable JSON/text plans and values before pursuing any cost theory.
+Next: agent review, revise if needed, `git commit -n`/push scope, then create
+the private oracle; no Goopg production change is authorized.
+
+R99 SCOPE REVIEWED 2026-09-13 (APPROVE after one BLOCK correction): source
+must be stopped or use PG-consistent backup/restore, never a live-dir copy;
+record immutable source/destination identity and process ownership. The scope
+also requires full Q96 relation/index and predicate/join-column statistics
+provenance, not only four key rows. Next: commit -n/push, then provision.
+
 TIMING SURVEY DONE 2026-09-13 (`r97-timing-survey/REPORT.md`,
 measurement-only, no code change, no review — survey not a design
 doc): TPC-DS SF0.25 all 96 queries timed (3-run medians, values
