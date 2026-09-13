@@ -4818,6 +4818,16 @@ closed. All temp source removed; tree diff is docs-only. Next: a
 successor may scope a production change only with a PG18.3
 comparison on these inputs.
 
+R119 SCOPE READY 2026-09-13 (`r119-pg-nullfrac-compare/SCOPE.md`):
+PG18.3 comparison on R118's nullfrac inputs — measurement-only, no
+source change: pg_stats nullfracs for the four key columns +
+forced-form lower-join estimated rows on live `:65438` (shared
+sampled data — model-level comparison only, not value-level vs
+R111 clean inputs). Decides whether a production change is
+justified: PG agrees → close, no change; PG disagrees → scope R120
+with the exact divergence. Datum investigation stays closed. Next:
+agent review, commit -n/push scope, then measure.
+
 TIMING SURVEY DONE 2026-09-13 (`r97-timing-survey/REPORT.md`,
 measurement-only, no code change, no review — survey not a design
 doc): TPC-DS SF0.25 all 96 queries timed (3-run medians, values
