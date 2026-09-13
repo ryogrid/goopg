@@ -24,18 +24,28 @@ candidate cost or infer that a row estimate decided the plan.
 ## Temporary diagnostic
 
 `GOOPG_Q96_LEGACY_CHILD_TRACE=1` is parsed once at package initialization and
-is false by default. Its only effect is append-only server logging. It owns a
-trace-local, per-statement observational sidecar created and passed within one
-`PlanWithSettings` invocation, never a package-global mutable current sidecar.
-Explicit construction assigns an increasing identity once, keyed by the
-original `*Join` pointer. Each clone or rewrite site, rather than construction,
-must register its original-to-successor pointer mapping under the same identity.
-The sidecar is cleaned up on every normal and panic return; collision is a
-falsifier rather than a merge, and final traversal reports both identity and
-occurrence count. The sidecar is never stored in a
-`Node`, `PlanCost`, schema, or planner state, and neither planner nor executor
-reads it. A selected occurrence exists only when one final lower Hash Join
-maps to one construction identity; zero or multiple matches are recorded.
+is false by default. Its only effect is append-only server logging. The source
+census establishes whether the selected R116 explicit `*Join` objects survive
+to EXPLAIN without cloning; if it does, the final `*Join` pointer is the
+collision-free construction identity. A clone/copy/rebind writer that can
+replace it is a falsifier unless the source census proves a safe successor
+mapping. This corrects an earlier proposed planner sidecar: display derivation
+does not run inside `PlanWithSettings`; it is called by EXPLAIN's text and JSON
+renderers after planning.
+
+Any enabled observational state is therefore owned by one EXPLAIN render
+invocation and passed through that renderer only, never by `PlanWithSettings`
+or a package-global mutable registry. It is discarded on every normal or
+panic return, is never stored in a `Node`, `PlanCost`, schema, or planner
+state, and is read only by the opted-in EXPLAIN text/JSON rendering path, never
+by the planner or ordinary execution path. A fresh render-invocation token and
+renderer kind (TEXT or JSON) prefix every trace record; reports join
+only records carrying the retained artifact's token. Under the no-clone proof,
+the final pointer itself is construction identity and the form-local ordinal is
+deterministic final-walk order, not unavailable construction-time metadata.
+Final traversal reports pointer identity and occurrence count. A selected
+occurrence exists only when one final lower Hash Join is seen exactly once;
+zero or multiple matches are recorded.
 
 For each selected lower join, the trace emits:
 
@@ -53,15 +63,15 @@ For each selected lower join, the trace emits:
    recomputation discovered in the construction-to-final walk is logged by
    site and before/after rows or widths.
 
-No trace helper calls planner, executor, catalog, statistics, or selectivity
-logic. Hooks observe values already computed during the normal display
-derivation; they must not invoke fresh `EstimateRows` or
-`DeriveLegacyDisplayCost` calls. The diagnostic never stores a new plan cost,
-mutates a node, or recursively accumulates totals. Tests cover the
-formatter/ledger with absent and extreme inputs, and prove that the sidecar has
-no semantic reads and the disabled path allocates nothing and leaves the tree
-and costs unchanged. A race/concurrent-statement test proves there is no
-identity or record cross-talk. The generated planner-flag provenance file
+No trace helper calls planner, catalog, statistics, or selectivity logic.
+Hooks observe values already computed during the normal display derivation;
+they must not invoke fresh `EstimateRows` or `DeriveLegacyDisplayCost` calls.
+The diagnostic never stores a new plan cost, mutates a node, or recursively
+accumulates totals. Tests cover the formatter/ledger with absent and extreme
+inputs, and prove that the render-local observer has no semantic reads and the
+disabled path allocates nothing and leaves the tree and costs unchanged. A
+duplicate/collision test and a race/concurrent-EXPLAIN test prove that records
+remain separated by render token. The generated planner-flag provenance file
 includes the switch.
 
 ## Pre-code producer census
@@ -77,14 +87,14 @@ role for each lower-join side:
 | `cardinality.go: seqScanRows` and `filterSelectivity` | base scan cardinality and predicate reduction | table/stat source, predicate branch, before/after rows |
 | `cardinality.go: estimateJoin` | lower-join left/right rows, equality-pair/selectivity branch and output rows | left/right rows, branch, selectivity facts, output rows |
 | `plancost.go: legacyDisplayCostOf`, `legacyDisplayChildren`, and `DeriveLegacyDisplayCost` | stamped versus legacy fallback, child list, output width, and display arithmetic | child ordinal/type/source, rows/width/startup/total, ledger terms |
-| every clone/copy/rebind/final-plan rewrite reachable after construction (starting with `fillJoinHashKeys` and rebind/remap sites found by the census) | pointer successor, schema/key or row/width recomputation | source site, predecessor/successor identity, before/after rows and widths |
+| every clone/copy/rebind/final-plan rewrite reachable after construction (starting with `fillJoinHashKeys` and rebind/remap sites found by the census) | pointer successor, schema/key or row/width recomputation | source site, proof it cannot replace the selected join, or a falsifier |
 
 The census must enumerate every caller and every clone/copy/rebind writer
-found for these paths, and either instrument each reachable writer or prove it
-cannot affect the selected lineage. It must explicitly state whether the
-selected lower join has a stamped `PlanCost` or falls back to legacy derivation,
-and name the first observed divergence. A source-only possibility remains
-labelled inference unless the trace observes it.
+found for these paths, and either prove each reachable writer cannot replace
+the selected lineage or stop with a falsifier. It must explicitly state
+whether the selected lower join has a stamped `PlanCost` or falls back to
+legacy derivation, and name the first observed divergence. A source-only
+possibility remains labelled inference unless the trace observes it.
 
 ## Verification and stop rules
 
