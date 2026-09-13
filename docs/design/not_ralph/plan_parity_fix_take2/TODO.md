@@ -4784,6 +4784,13 @@ PG-shaped search and leaves the forced joins on the legacy/prebuilt route.
 No Datum, spill, Gather, statistic, or production-cost claim follows; all
 temporary source was removed. A successor must attribute that prebuilt route.
 
+R116 PLANNED — legacy/prebuilt forced-join decision attribution, dependent on
+R115 DONE: scope and review a temporary, default-off observation of the actual
+Q96 forced-form `chooseInnerJoinAlgo`/BuildLeft route. It must map every
+selected legacy join to collision-free input and final-decision records and
+run R111 common-input OFFx2/ONx2/value controls. No Datum-size, cost,
+statistics, Gather, search, executor, or production change is authorized.
+
 TIMING SURVEY DONE 2026-09-13 (`r97-timing-survey/REPORT.md`,
 measurement-only, no code change, no review — survey not a design
 doc): TPC-DS SF0.25 all 96 queries timed (3-run medians, values
