@@ -4530,6 +4530,20 @@ planner range binding is also required; scope stop rule applied and code was
 reverted. Next: separately scope end-to-end grouped-JOIN source binding; do
 not use forced Q96 forms as cost/election evidence.
 
+R103 SCOPE READY 2026-09-13
+(`r103-grouped-join-source-binding/SCOPE.md`): thread only unaliased grouped
+JOIN source identity through parser/analyzer/planner binding to later ON and
+LATERAL contexts, with PG-proven alias/USING/non-LATERAL controls and actual
+value execution. R101 forms may be rerun only after semantic success; no cost
+change is authorized. Next: agent review, revise if needed, `git commit -n`/
+push scope, then implement.
+
+R103 SCOPE REVIEWED 2026-09-13 (APPROVE after one BLOCK correction): parser
+changes must originate in `grammar/pg_grammar.y` and use `make gen-parser`;
+PG witnesses now require exact row values and SQLSTATE 42P01/42702 assertions,
+not generic comparison. R101 remains measurement only. Next: commit -n/push
+scope, then implement within the parser/analyzer/planner boundary.
+
 TIMING SURVEY DONE 2026-09-13 (`r97-timing-survey/REPORT.md`,
 measurement-only, no code change, no review — survey not a design
 doc): TPC-DS SF0.25 all 96 queries timed (3-run medians, values
