@@ -689,21 +689,26 @@ export GOOPG_GATHER_PATHS=top GOOPG_PARTIAL_AGG_PATHS=on
 export GOGC=off GOMEMLIMIT=12GiB
 ```
 
-Use `/tmp/r101-hdem-first.sql` and `/tmp/r101-store-first.sql` unchanged,
-with `work_mem=64MB`, `join_collapse_limit=1`, and
-`from_collapse_limit=1`. Use private `/tmp/r111-goopg-q96` on port 5568, never
+Use `tmp/codex-to-other-260913/sql/r101-hdem-first.sql` and
+`tmp/codex-to-other-260913/sql/r101-store-first.sql` unchanged, with
+`work_mem=64MB`, `join_collapse_limit=1`, and `from_collapse_limit=1`. Use
+private `tmp/codex-to-other-260913/data/r111-goopg-q96` on port 5568, never
 shared 6543x clusters. Start/stop through the cgroup wrapper and a unique
 unit, for example:
 
 ```bash
-GOOPG_CG_UNIT=r118-q96 scripts/goopg-test-run.sh \
-  /tmp/r118-goopg start -D /tmp/r111-goopg-q96 -listen 127.0.0.1:5568
-/tmp/r118-goopg stop -D /tmp/r111-goopg-q96
+GOOPG_CG_UNIT=r118-q96 tmp/codex-to-other-260913/scripts/goopg-test-run.sh \
+  tmp/codex-to-other-260913/bin/r118-goopg start \
+  -D tmp/codex-to-other-260913/data/r111-goopg-q96 -listen 127.0.0.1:5568
+tmp/codex-to-other-260913/bin/r118-goopg stop \
+  -D tmp/codex-to-other-260913/data/r111-goopg-q96
 ```
 
 The former R117 diagnostic was `GOOPG_Q96_LEGACY_CHILD_TRACE=1`; it was
 removed before the result commit and must not be reused without a new reviewed
 source task. Capture TEXT/JSON OFFx2/ONx2 checksums, trace paths/tokens, and
-values. Historical artifacts were `/tmp/r117-{hdem-first,store-first}-{off,on}-{1,2}.{plan,json}`,
-`/tmp/r117-goopg-q96{,-off}.log`, and `/tmp/r117-{hdem-first,store-first}.value`.
+values. Historical artifacts were copied under
+`tmp/codex-to-other-260913/artifacts/`: the
+`r117-{hdem-first,store-first}-{off,on}-{1,2}.{plan,json}` captures,
+`r117-goopg-q96{,-off}.log`, and `r117-{hdem-first,store-first}.value`.
 Long tests and all server/query execution remain foreground and memory-capped.

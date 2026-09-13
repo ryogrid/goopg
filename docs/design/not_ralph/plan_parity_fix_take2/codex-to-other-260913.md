@@ -22,20 +22,22 @@ benchmarks, `.claude*`, and untracked artifacts). Preserve it. Never use
 
 The authoritative progress and process are in:
 
-- [`TODO.md`](TODO.md) — round dependencies and status;
-- [`r111-q96-common-data-oracle-retry/REPORT.md`](r111-q96-common-data-oracle-retry/REPORT.md)
+- [`TODO.md`](../../../../tmp/codex-to-other-260913/docs/TODO.md) — round
+  dependencies and status;
+- [`r111-q96-common-data-oracle-retry/REPORT.md`](../../../../tmp/codex-to-other-260913/docs/r111-report.md)
   — valid common-input oracle and the two forced SQL forms;
-- [`r115-q96-nonspill-forced-order/REPORT.md`](r115-q96-nonspill-forced-order/REPORT.md)
+- [`r115-q96-nonspill-forced-order/REPORT.md`](../../../../tmp/codex-to-other-260913/docs/r115-report.md)
   — normal `addHashJoinPath`/`hashJoinCost` is not reached by Q96's forced
   LATERAL route;
-- [`r116-q96-legacy-join-attribution/REPORT.md`](r116-q96-legacy-join-attribution/REPORT.md)
+- [`r116-q96-legacy-join-attribution/REPORT.md`](../../../../tmp/codex-to-other-260913/docs/r116-report.md)
   — both explicit joins are Hash/BuildRight and the final LATERAL node is a
   separate legacy/prebuilt route;
-- [`r117-q96-legacy-child-cost/REPORT.md`](r117-q96-legacy-child-cost/REPORT.md)
+- [`r117-q96-legacy-child-cost/REPORT.md`](../../../../tmp/codex-to-other-260913/docs/r117-report.md)
   — exact lower-child ledger and artifact checksums;
-- [`r118-q96-lower-join-producers/SCOPE.md`](r118-q96-lower-join-producers/SCOPE.md)
+- [`r118-q96-lower-join-producers/SCOPE.md`](../../../../tmp/codex-to-other-260913/docs/r118-scope.md)
   — reviewed next task and its lifecycle/lineage requirements;
-- [`AGENT.md`](../../../../AGENT.md) — memory cap, server lifecycle, plan/value
+- [`AGENT.md`](../../../../tmp/codex-to-other-260913/docs/AGENT.md) — memory
+  cap, server lifecycle, plan/value
   gates, and Q96 handoff commands.
 
 ## What R117 established
@@ -127,17 +129,20 @@ export GOGC=off
 export GOMEMLIMIT=12GiB
 ```
 
-Use the private data clone `/tmp/r111-goopg-q96` and port `5568`. Never use a
+Use the private data clone `tmp/codex-to-other-260913/data/r111-goopg-q96`
+and port `5568`. Never use a
 shared 6543x bench port for manual work. All server starts/driven workloads
 must be memory-capped and foreground through `scripts/goopg-test-run.sh` with
 a unique `GOOPG_CG_UNIT`; use `-listen` (not `-p`). Example:
 
 ```bash
-go build -o /tmp/r118-goopg ./cmd/goopg
-GOOPG_CG_UNIT=r118-q96 scripts/goopg-test-run.sh \
-  /tmp/r118-goopg start -D /tmp/r111-goopg-q96 -listen 127.0.0.1:5568
+go build -o tmp/codex-to-other-260913/bin/r118-goopg ./cmd/goopg
+GOOPG_CG_UNIT=r118-q96 tmp/codex-to-other-260913/scripts/goopg-test-run.sh \
+  tmp/codex-to-other-260913/bin/r118-goopg start \
+  -D tmp/codex-to-other-260913/data/r111-goopg-q96 -listen 127.0.0.1:5568
 # run psql/EXPLAIN controls in the foreground
-/tmp/r118-goopg stop -D /tmp/r111-goopg-q96
+tmp/codex-to-other-260913/bin/r118-goopg stop \
+  -D tmp/codex-to-other-260913/data/r111-goopg-q96
 ```
 
 Session settings for both forced forms are:
@@ -148,10 +153,12 @@ SET join_collapse_limit = 1;
 SET from_collapse_limit = 1;
 ```
 
-The exact SQL inputs are `/tmp/r101-hdem-first.sql` and
-`/tmp/r101-store-first.sql`; preserve them unchanged. The historical R117
-capture used TEXT and JSON EXPLAIN OFF×2/ON×2. Its retained paths/checksums
-and values are listed in the R117 report; regenerate fresh artifacts for R118.
+The exact SQL inputs are `tmp/codex-to-other-260913/sql/r101-hdem-first.sql`
+and `tmp/codex-to-other-260913/sql/r101-store-first.sql`; preserve them
+unchanged. The historical R117 capture used TEXT and JSON EXPLAIN
+OFF×2/ON×2. Its retained paths/checksums and values are listed in the R117
+report and copied under `tmp/codex-to-other-260913/artifacts/`; regenerate
+fresh artifacts for R118.
 The former temporary flag was `GOOPG_Q96_LEGACY_CHILD_TRACE=1`, but its source
 was removed in `bf2e41458`; do not reintroduce it without reviewed R118 source.
 
