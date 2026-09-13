@@ -4499,6 +4499,14 @@ and final `time_dim` parameterized probe in each EXPLAIN. Forced SQL order is
 measurement only, never natural-election evidence. Next: commit -n/push,
 then capture both engines.
 
+R101 DONE 2026-09-13 (`r101-q96-forced-order-costs/REPORT.md`): valid PG18
+oracle directly prices hdem-first 176.16 below store-first, proving no PG
+tie. Goopg rejects both equivalent parenthesized JOIN + final LATERAL forms
+with missing outer namespace `store_sales`, so it has no comparable forced
+cost/value; scope stop rule applied. Next: separately scope that namespace
+semantic gap or another safe Goopg-order measurement; do not target PG's
+forced margin with a cost change.
+
 TIMING SURVEY DONE 2026-09-13 (`r97-timing-survey/REPORT.md`,
 measurement-only, no code change, no review — survey not a design
 doc): TPC-DS SF0.25 all 96 queries timed (3-run medians, values
