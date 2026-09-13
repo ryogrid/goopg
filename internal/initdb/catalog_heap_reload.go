@@ -10,6 +10,7 @@ package initdb
 import (
 	"encoding/binary"
 	"fmt"
+	"log/slog"
 	"sort"
 	"strconv"
 	"strings"
@@ -377,6 +378,231 @@ func loadInheritanceFromHeapForDB(mgr *storage.Manager, cat *catalog.InMemory, c
 		if len(parents) > 0 {
 			childTbl.InheritsParentOIDs = parents
 		}
+	}
+	return nil
+}
+
+// loadForeignKeysFromHeap restores every table's FOREIGN KEY constraints from
+// the pg_constraint heap (contype='f'), repopulating catalog.Table.ForeignKeys.
+//
+// R126. Before this, that field was the ONLY store — pg_constraint's FK rows
+// are synthesised from it (catalog.go:7237) — and nothing rewrote it at
+// startup, so every FK died at the first restart. That cost more than the
+// planner's FK selectivity arm: runtime enforcement reads the same field
+// (operators_fk.go:118, :170), so a post-restart orphan INSERT was silently
+// ACCEPTED.
+//
+// Runs as a standalone unconditional pass AFTER loadInheritanceFromHeap, for
+// that pass's reason plus one of its own: an FK is an EDGE between two tables,
+// and the referenced table may be registered after the referencing one, so the
+// resolution must happen once every table is in the catalog. It is deliberately
+// not folded into loadUserTablesFromHeap, which the M0114 catalog cache
+// bypasses (the cache stores no ForeignKeys, catalog_cache.go:67-90).
+//
+// The main pass reads DefaultDBOid, following loadColumnDefaultsFromHeap
+// exactly rather than cat.DBOID() — see loadStatisticsFromHeap's comment for
+// what reading cat.DBOID() here cost pg_statistic in practice. Note this pass
+// and reloadUserDomainsFromHeap both scan relation 2606 but in DIFFERENT
+// databases, by design: domain CHECK rows are pinned to DefaultDBOid + mirror
+// (pgConstraintRel), FK rows route per-database with their table
+// (pgConstraintTableRel).
+func loadForeignKeysFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *transam.CLog) error {
+	if cat == nil {
+		return nil
+	}
+	if err := loadForeignKeysFromHeapForDB(mgr, cat, clog, catalog.DefaultDBOid); err != nil {
+		return err
+	}
+	for _, dbName := range cat.ListDatabases() {
+		dbOid := cat.DatabaseOid(dbName)
+		if dbOid == 0 || dbOid == catalog.DefaultDBOid ||
+			dbOid == catalog.PostgresDBOid || dbOid == cat.DBOID() {
+			continue
+		}
+		if err := loadForeignKeysFromHeapForDB(mgr, cat, clog, dbOid); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// fkAttnumsFromArrayText parses a decoded int2[] column ("{2,3}", "{}" or "")
+// back into attnums. The decode side renders the ArrayType blob as canonical
+// array text (codec.go's int2[] arm → decodeArrayValuePGStyled).
+func fkAttnumsFromArrayText(s string) []int16 {
+	s = strings.TrimSpace(s)
+	s = strings.TrimPrefix(s, "{")
+	s = strings.TrimSuffix(s, "}")
+	if s == "" {
+		return nil
+	}
+	var out []int16
+	for _, part := range strings.Split(s, ",") {
+		n, err := strconv.Atoi(strings.TrimSpace(part))
+		if err != nil {
+			return nil
+		}
+		out = append(out, int16(n))
+	}
+	return out
+}
+
+// fkColumnNames maps 1-based attnums back to column names. goopg's FK store is
+// name-keyed (catalog.ForeignKey.Columns / RefColumns) while pg_constraint
+// stores attnums, so this is the inverse of the write side's resolution.
+//
+// Returns ok=false on any out-of-range attnum: a partially-resolved FK would
+// be worse than an absent one, because keysCovering matches on names
+// (joinrelsize.go:690) and a silently short Columns slice would change which
+// joins the FK arm fires for.
+func fkColumnNames(tbl *catalog.Table, attnums []int16) ([]string, bool) {
+	out := make([]string, 0, len(attnums))
+	for _, n := range attnums {
+		if n < 1 || int(n) > len(tbl.Columns) {
+			return nil, false
+		}
+		out = append(out, tbl.Columns[n-1].Name)
+	}
+	return out, true
+}
+
+func loadForeignKeysFromHeapForDB(mgr *storage.Manager, cat *catalog.InMemory, clog *transam.CLog, heapDBOid uint32) error {
+	type fkRow struct {
+		oid                      uint32
+		name                     string
+		conrelid, confrelid      uint32
+		conkey, confkey, setCols []int16
+		deferrable, deferred     bool
+		enforced, validated      bool
+		updAct, delAct, match    string
+	}
+	rel := storage.RelFileNode{DBOid: heapDBOid, RelOid: 2606, Fork: storage.MainFork}
+	cols := executor.PGConstraintColumnsPG18()
+	rows, err := scanCatalogHeapRows(mgr, rel, clog, "pg_constraint",
+		func(ht storage.HeapTuple, tid storage.ItemPointer) (any, bool, error) {
+			natts := int(ht.Header.Infomask2 & storage.HeapNattsMask)
+			decoded := make(executor.Row, len(cols))
+			if derr := executor.DecodeRowIntoMctxPGTuple(decoded, cols, ht.Data, ht.Bitmap, natts, nil); derr != nil {
+				return nil, false, derr
+			}
+			// Only foreign keys. Domain CHECK rows (contype='c') share this
+			// heap and are restored by reloadUserDomainsFromHeap.
+			if decoded[3].StringValue() != "f" {
+				return nil, false, errSkipBuiltinRow
+			}
+			return fkRow{
+				oid:        uint32(decoded[0].Int),
+				name:       decoded[1].StringValue(),
+				deferrable: decoded[4].BoolValue(),
+				deferred:   decoded[5].BoolValue(),
+				enforced:   decoded[6].BoolValue(),
+				validated:  decoded[7].BoolValue(),
+				conrelid:   uint32(decoded[8].Int),
+				confrelid:  uint32(decoded[12].Int),
+				updAct:     decoded[13].StringValue(),
+				delAct:     decoded[14].StringValue(),
+				match:      decoded[15].StringValue(),
+				conkey:     fkAttnumsFromArrayText(decoded[20].StringValue()),
+				confkey:    fkAttnumsFromArrayText(decoded[21].StringValue()),
+				setCols:    fkAttnumsFromArrayText(decoded[25].StringValue()),
+			}, false, nil
+		})
+	if err != nil {
+		return err
+	}
+
+	byTable := make(map[uint32][]fkRow, len(rows))
+	for _, r := range rows {
+		fr := r.(fkRow)
+		if fr.conrelid == 0 || fr.name == "" {
+			continue
+		}
+		byTable[fr.conrelid] = append(byTable[fr.conrelid], fr)
+	}
+	for conrelid, frs := range byTable {
+		tbl, _, ok := cat.LookupTableByOIDAllDBs(conrelid)
+		if !ok || tbl == nil {
+			continue // table dropped since the rows were written
+		}
+		// Rows are appended by the re-sync funnel, so restore in OID order to
+		// keep the declaration order stable across restarts rather than
+		// inheriting physical heap order.
+		sort.Slice(frs, func(i, j int) bool { return frs[i].oid < frs[j].oid })
+		fks := make([]catalog.ForeignKey, 0, len(frs))
+		for _, fr := range frs {
+			refTbl, _, rok := cat.LookupTableByOIDAllDBs(fr.confrelid)
+			if !rok || refTbl == nil {
+				// Referenced table is gone: drop the FK rather than restore it
+				// dangling. fkParentRel matches the parent by NAME
+				// (joinrelsize.go:760) and enforcement resolves it the same
+				// way, so a dangling entry would be a live landmine.
+				//
+				// Every decline in this loop LOGS. This round exists because
+				// an FK vanishing silently went unnoticed; a reload that drops
+				// one FK of three must not look identical to a healthy one.
+				slog.Warn("pg_constraint FK reload: referenced table missing, constraint dropped",
+					"constraint", fr.name, "table", tbl.Name, "confrelid", fr.confrelid)
+				continue
+			}
+			conkeyNames, cok := fkColumnNames(tbl, fr.conkey)
+			if !cok {
+				slog.Warn("pg_constraint FK reload: conkey attnum out of range, constraint dropped",
+					"constraint", fr.name, "table", tbl.Name, "conkey", fr.conkey)
+				continue
+			}
+			// An EMPTY confkey is meaningful, not missing: it is the stored
+			// form of "use the parent's PK" (catalog.go:1665), preserved
+			// verbatim by the writer.
+			confkeyNames, rcok := fkColumnNames(refTbl, fr.confkey)
+			if !rcok {
+				slog.Warn("pg_constraint FK reload: confkey attnum out of range, constraint dropped",
+					"constraint", fr.name, "reftable", refTbl.Name, "confkey", fr.confkey)
+				continue
+			}
+			// Unlike conkey/confkey, an unresolvable confdelsetcols must NOT
+			// silently degrade: dropping it would turn
+			// `ON DELETE SET NULL (a)` into an unrestricted SET NULL over the
+			// whole key — a behaviour change, not a lost estimate.
+			setColNames, sok := fkColumnNames(tbl, fr.setCols)
+			if !sok {
+				slog.Warn("pg_constraint FK reload: confdelsetcols attnum out of range, constraint dropped "+
+					"(restoring it would widen ON DELETE SET to the whole key)",
+					"constraint", fr.name, "table", tbl.Name, "confdelsetcols", fr.setCols)
+				continue
+			}
+			fks = append(fks, catalog.ForeignKey{
+				Name:    fr.name,
+				OID:     fr.oid,
+				Columns: conkeyNames,
+				// Resolved from confrelid (an OID) to the parent's CURRENT
+				// name, deliberately rather than round-tripping a stored name:
+				// a parent renamed between restarts comes back correct, where
+				// the name-keyed in-memory store goes stale today.
+				RefTable:          refTbl.Name,
+				RefColumns:        confkeyNames,
+				OnDelete:          catalog.FKActionFromChar(fr.delAct),
+				OnUpdate:          catalog.FKActionFromChar(fr.updAct),
+				OnDeleteSetCols:   setColNames,
+				Deferrable:        fr.deferrable,
+				InitiallyDeferred: fr.deferred,
+				NotValid:          !fr.validated,
+				MatchFull:         fr.match == "f",
+				NotEnforced:       !fr.enforced,
+			})
+			// The startup OID advance walks tables only (open.go's
+			// cat.AllTables loop), so a constraint OID living solely in 2606
+			// would otherwise be re-issuable to a new object.
+			if fr.oid >= catalog.FirstUserOID {
+				cat.AdvanceNextOIDPast(fr.oid)
+			}
+		}
+		// Assigned UNCONDITIONALLY: the heap is the truth. Guarding on
+		// len(fks) > 0 would make the pass "restore if any", so a table whose
+		// every FK failed to resolve would silently keep whatever was already
+		// in the field. That is a no-op today (nothing populates ForeignKeys
+		// before this pass — the M0114 cache stores none), but it would become
+		// a stale-data bug the moment something did.
+		tbl.ForeignKeys = fks
 	}
 	return nil
 }

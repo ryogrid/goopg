@@ -2084,6 +2084,26 @@ func decodePhysicalPGValueLowered(t *catalog.Type, tname string, data []byte, sc
 			return newStringArenaDatum(sctx, moff, mlen), n, nil
 		}
 		return NewStringDatum(string(payload)), n, nil
+	case "int2[]", "_int2", "oid[]", "_oid":
+		// R126: system-catalog array columns declared with the array spelling
+		// in their NAME (pg_constraint.conkey/confkey/conpfeqop/…) rather than
+		// as {Name:<elem>, IsArray:true}. encodeValuePGCtx writes these
+		// through the `case "int2[]"` / `case "oid[]"` KindBytes passthrough,
+		// so without a matching decode arm a non-null value fell into the
+		// default branch below and came back as varlena TEXT — silently, with
+		// no error. Nothing exercised it before R126 because every array
+		// column in both pg_constraint writers was NullDatum.
+		//
+		// The element type name MUST be handed down explicitly. decodeArray…
+		// → array.RenderTextStyled resolves the element by name and falls
+		// back to varlena-text elements on a miss (pgarray.go:277-280), so
+		// passing "int2[]" through would decode 2-byte ints as 4-byte varlena
+		// text: garbage, again with no error.
+		elem := "int2"
+		if tname == "oid[]" || tname == "_oid" {
+			elem = "oid"
+		}
+		return decodeArrayValuePGStyled(catalog.Type{Name: elem, IsArray: true}, data, st)
 	default:
 		// Unknown type (e.g. "point", "path", custom types).  goopg's
 		// encodeValuePG stores them as PG varlena text (the default branch

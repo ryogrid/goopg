@@ -1690,6 +1690,34 @@ type ForeignKey struct {
 	NotEnforced bool
 }
 
+// FKActionFromChar is FKActionChar's inverse, for the pg_constraint heap
+// reload (initdb.loadForeignKeysFromHeap, R126). Kept adjacent to its twin so
+// the two mappings cannot drift — the pairing is what makes an FK's
+// ON DELETE / ON UPDATE action survive a restart.
+//
+// An unrecognised code degrades to NO ACTION, which is PG's own default and
+// the direction that cannot invent a cascade.
+func FKActionFromChar(c string) parser.FKAction {
+	switch c {
+	case "r":
+		return parser.FKActionRestrict
+	case "c":
+		return parser.FKActionCascade
+	case "n":
+		return parser.FKActionSetNull
+	case "d":
+		return parser.FKActionSetDefault
+	default: // "a" and anything unexpected
+		return parser.FKActionNoAction
+	}
+}
+
+// FKActionChar exports fkActionChar for the pg_constraint heap writer
+// (executor.buildPGConstraintRowForForeignKey, R126), so the heap row and the
+// synthesised view derive confupdtype/confdeltype from the same mapping rather
+// than transcribing it twice.
+func FKActionChar(a parser.FKAction) byte { return fkActionChar(a) }
+
 // fkActionChar maps a parsed FK referential action to the single-char code
 // PostgreSQL stores in pg_constraint.confupdtype / confdeltype. DU-002 slice 51.
 func fkActionChar(a parser.FKAction) byte {
@@ -6728,6 +6756,48 @@ func (c *InMemory) tableByOID(oid uint32, dbOid uint32) (*Table, bool) {
 		}
 	}
 	return nil, false
+}
+
+// LookupTableByNameAnySchema resolves an UNSCHEMED table name within one
+// database, case-insensitively, ignoring schema. Returns nil when no table or
+// more than one candidate matches.
+//
+// R126: catalog.ForeignKey.RefTable is stored unschemed (see its comment), and
+// the synthesised pg_constraint view resolves it by the same kind of scan — a
+// case-insensitive walk of the namespace's tables, skipping Virtual/OID-0
+// (the `strings.EqualFold(cand.Name, fk.RefTable)` loop in pgConstraintRows).
+// The pg_constraint HEAP writer must agree with the view, or an FK is displayed
+// but never persisted — which is what a `public`-qualified lookup here did.
+//
+// It does NOT agree with the view in one case, deliberately: the view takes the
+// FIRST match and breaks, having no notion of ambiguity, so with two same-named
+// tables in different schemas it renders the FK against an arbitrary parent.
+// This returns nil instead, and the caller declines and warns — journalling an
+// FK that points at the wrong table is worse than not journalling it.
+//
+// The real fix is upstream of both: PG resolves the referenced relation through
+// the search path at DDL time and stores an OID, so ambiguity cannot survive.
+// catalog.ForeignKey should carry the parent's OID alongside the name (both
+// sides of R126 already compute it). Until then, preferring the referencing
+// table's own schema would resolve the common case deterministically.
+// Follow-up, not this round.
+func (c *InMemory) LookupTableByNameAnySchema(name string, dbOid uint32) *Table {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	var found *Table
+	for _, t := range c.ns(dbOid).tables {
+		if t.Virtual || t.OID == 0 {
+			continue
+		}
+		if !strings.EqualFold(t.Name, name) {
+			continue
+		}
+		if found != nil {
+			return nil // ambiguous across schemas
+		}
+		found = t
+	}
+	return found
 }
 
 // LookupTableByOID is the read-locked public accessor for tableByOID.

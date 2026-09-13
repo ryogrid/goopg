@@ -1658,6 +1658,24 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		return nil, fmt.Errorf("goopg: pg_inherits reload: %w", err)
 	}
 
+	// R126: FOREIGN KEY persistence from the pg_constraint HEAP rows
+	// (base/<dbOid>/2606, contype='f') written by the DDL funnel. Placed here
+	// for the SAME reason as the pg_inherits pass above and with the same
+	// shape — a foreign key is an EDGE, and the referenced table may reload
+	// after the referencing one, so both must already be registered.
+	//
+	// Until this pass existed, catalog.Table.ForeignKeys was rebuilt by
+	// nothing, so every FK vanished at the first restart — and that took
+	// runtime referential integrity with it, not just the planner's FK
+	// selectivity arm: enforcement reads the same field (operators_fk.go:118,
+	// :170), so an orphan INSERT was silently accepted post-restart.
+	if err := loadForeignKeysFromHeap(mgr, cat, clog); err != nil {
+		_ = pool.Close()
+		_ = walWriter.Close()
+		_ = mgr.Close()
+		return nil, fmt.Errorf("goopg: pg_constraint FK reload: %w", err)
+	}
+
 	// B5 Slice C: view / materialized-view query persistence from the pg_rewrite
 	// HEAP _RETURN rules (base/<dbOid>/2618) written by writeViewRewriteRow,
 	// replacing the retired RecordKindCreateMatView(102)/RecordKindCreateView(103)

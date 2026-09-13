@@ -203,6 +203,22 @@ func mirroredCatalogOIDs() []uint32 {
 		pgAttrdefRelOID,               // 2604 pg_attrdef
 		pgAttrdefAdrelidAdnumIndexOID, // 2656
 		pgAttrdefOidIndexOID,          // 2657
+		// R126: pg_constraint, so a real PG standby reading base/5 can see the
+		// FOREIGN KEY rows the DDL funnel writes to base/1.
+		//
+		// goopg's OWN reload does NOT depend on this — loadForeignKeysFromHeap
+		// mains at DefaultDBOid and sweeps the per-DB heaps directly, following
+		// loadColumnDefaultsFromHeap (pg_attrdef is mirrored AND still mains at
+		// DefaultDBOid, which is why "mirrored" is not a licence to read
+		// cat.DBOID()). This entry is for standby readability alone.
+		//
+		// Harmless alongside the explicit mirrorConstraintCatalogFiles() calls
+		// on the domain-CHECK paths: mirrorCatalogRelToPostgresDB skips pages
+		// that compare equal, so the second pass copies nothing. Consequence
+		// worth knowing: base/5/2606 is now overwritten wholesale from base/1
+		// on every table DDL, so nothing may write a pg_constraint row directly
+		// to base/5 — nothing does today.
+		pgConstraintRelOID, // 2606 pg_constraint
 		// AI-20260810-011258-003 blocker #8: both pg_index indexes. The
 		// pg_index HEAP was already mirrored, but a standby reading base/5
 		// resolves a relation's index list ONLY through 2678

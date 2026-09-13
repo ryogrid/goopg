@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"math"
 	"math/big"
 	"net"
@@ -9123,6 +9124,15 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 				}
 			}
 			tbl.ForeignKeys = append(tbl.ForeignKeys, fk)
+			// R126: persist it. Before this, ADD FOREIGN KEY was the ONE FK
+			// path with no catalog-heap sync at all — unlike the ADD COLUMN /
+			// ADD PRIMARY KEY / ADD UNIQUE siblings above — so an FK declared
+			// this way (the form HammerDB's TPC-H load and pg_dump restore
+			// both use) vanished at the next restart, taking runtime
+			// enforcement with it.
+			if err := o.syncConstraintCatalogRow(tbl); err != nil {
+				return err
+			}
 		case parser.AlterTableValidateConstraint:
 			// VALIDATE CONSTRAINT name — validate a constraint added with
 			// NOT VALID. PostgreSQL's AlterTableGetLockLevel maps
@@ -9169,6 +9179,24 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 							return err
 						}
 						tbl.ForeignKeys[i].NotValid = false
+						// R126: persist convalidated 'f'→'t', or the FK reverts
+						// to NOT VALID at the next restart.
+						//
+						// This is the ONE FK mutator that deliberately does NOT
+						// use syncConstraintCatalogRow. VALIDATE holds only
+						// ShareUpdateExclusiveLock (see the lock comment at the
+						// top of this case, mirroring PG's
+						// AlterTableGetLockLevel), so it does not conflict with
+						// concurrent INSERT/UPDATE/DELETE. The full funnel would
+						// delete and rewrite the table's ENTIRE catalog row set
+						// — pg_class, pg_attribute, pg_attrdef, pg_inherits,
+						// pg_rewrite — and re-insert index entries, all while
+						// that DML proceeds. Rewriting just this constraint's
+						// own row is sound precisely because convalidated is the
+						// only field that changed.
+						if err := o.resyncForeignKeyCatalogRow(tbl, tbl.ForeignKeys[i]); err != nil {
+							return err
+						}
 					}
 					found = true
 					break
@@ -9478,6 +9506,24 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			// as `<waiting ...>` and the eventual 23503 surfaces during the ALTER,
 			// exactly as upstream. No-op unless the parent has FKs. (fk-partitioned-1)
 			if err := cloneAndValidateAttachPartitionFKs(o.ctx, tbl, childTbl); err != nil {
+				return err
+			}
+			// R126: re-sync AFTER the clone. The child's catalog rows were
+			// written ~15 lines above, BEFORE cloneAndValidateAttachPartitionFKs
+			// appended the parent's FKs to childTbl.ForeignKeys
+			// (operators_fk.go:615) — so without this the cloned FKs are never
+			// journalled and the attached partition loses both its planner
+			// evidence and its referential ENFORCEMENT at the next restart.
+			// That is precisely the bug R126 exists to fix, reproduced for
+			// partitions.
+			//
+			// This is REDUNDANT with the hand-inlined delete-and-resync above
+			// (nothing between them mutates childTbl's catalog-visible state
+			// except the clone itself), and it is kept as the unconditional
+			// one because the clone is a no-op for FK-less parents while this
+			// is the only sync that can see the cloned FKs. Collapsing the two
+			// is a tidy-up, not a fix — do not "optimise" by deleting THIS one.
+			if err := o.syncConstraintCatalogRow(childTbl); err != nil {
 				return err
 			}
 			// Set partition metadata on the child.
@@ -10248,6 +10294,13 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 					return &ExecError{Code: "42710", Pos: act.Pos(), Message: fmt.Sprintf("constraint %q for relation %q already exists", newName, tbl.Name)}
 				}
 				tbl.ForeignKeys[i].Name = newName
+				// R126: persist the new conname. The heap row is keyed by the
+				// constraint's OID, which a rename leaves stable, so the funnel
+				// stamps the old row and re-emits with the new name — heap and
+				// registry stay in agreement rather than drifting.
+				if err := o.syncConstraintCatalogRow(tbl); err != nil {
+					return err
+				}
 				return nil
 			}
 
@@ -12860,11 +12913,20 @@ func (o *ddlOp) syncConstraintCatalogRow(tbl *catalog.Table) error {
 	if !catalogHeapSyncAvailable(o.ctx) {
 		return nil
 	}
-	if err := o.ctx.MaterializeWriterXID(); err == nil {
-		xmax := o.ctx.Tx.XID
-		for _, dbOid := range tableCatalogDBOids(o.ctx) {
-			deleteCatalogRowsForOID(o.ctx, dbOid, tbl.OID, xmax)
-		}
+	// R126: the stamp must SUCCEED, not merely be attempted. This used to
+	// swallow the MaterializeWriterXID error and re-sync anyway, which was
+	// tolerable while every row this funnel rewrites was keyed by the table's
+	// OID and therefore overwritten wholesale. FK rows changed that: they are
+	// APPENDED, so a skipped stamp leaves the old row live and the reload
+	// rebuilds duplicate ForeignKeys entries — the exact failure R126's P3
+	// exists to prevent, and one no test can see because the error never
+	// fires in the harness.
+	if err := o.ctx.MaterializeWriterXID(); err != nil {
+		return fmt.Errorf("DDL catalog sync: materialize writer XID: %w", err)
+	}
+	xmax := o.ctx.Tx.XID
+	for _, dbOid := range tableCatalogDBOids(o.ctx) {
+		deleteCatalogRowsForOID(o.ctx, dbOid, tbl.OID, xmax)
 	}
 	if syncErr := syncTableToCatalogHeap(o.ctx, tbl); syncErr != nil {
 		return fmt.Errorf("DDL catalog sync: %w", syncErr)
@@ -13240,6 +13302,14 @@ func (o *ddlOp) execAlterTableDropConstraint(tbl *catalog.Table, act parser.Alte
 			if isIM {
 				im.DropForeignKeyConstraint(tbl.OID, act.ConstraintName)
 			}
+			// R126: drop the heap row too, or the FK comes BACK at the next
+			// restart — a resurrected constraint being strictly worse than a
+			// lost one, since it would reject legitimate DML. The funnel
+			// stamps every contype='f' row for this table and re-emits from
+			// the (now shorter) in-memory slice.
+			if err := o.syncConstraintCatalogRow(tbl); err != nil {
+				return err
+			}
 			return nil
 		}
 	}
@@ -13476,6 +13546,13 @@ func (o *ddlOp) execAlterTableAlterConstraint(tbl *catalog.Table, act parser.Alt
 				tbl.ForeignKeys[i].NotEnforced = !act.AlterConstraintEnforced
 				tbl.ForeignKeys[i].NotValid = !act.AlterConstraintEnforced
 			}
+		}
+		// R126: this is the statement that sets conenforced/condeferrable, so
+		// without persisting here those fields silently revert at the next
+		// restart — and a reverted conenforced would undo R125's work, since
+		// the planner's FK arm gates on exactly that field.
+		if err := o.syncConstraintCatalogRow(tbl); err != nil {
+			return err
 		}
 		return nil
 	}
@@ -18028,6 +18105,20 @@ func (o *ddlOp) execDropFunction(s *parser.DropFunctionStmt) error {
 // deleteCatalogRowsForOID to physically mark rolled-back catalog rows as
 // deleted so the startup scan in loadUserTablesFromHeap skips them.
 func stampCatalogRows(ctx *Context, rel storage.RelFileNode, xmax storage.TransactionID, match func(data []byte) bool) {
+	stampCatalogRowsTuple(ctx, rel, xmax, func(ht storage.HeapTuple) bool { return match(ht.Data) })
+}
+
+// stampCatalogRowsTuple is stampCatalogRows with the whole HeapTuple handed to
+// the predicate.
+//
+// R126: the data-only form cannot decode a row that contains NULLs — it
+// exposes neither the null bitmap nor the stored attribute count, so
+// DecodeRowIntoMctxPGTuple would misparse. That is fine for pg_attrdef and
+// pg_inherits, whose predicates read a fixed leading offset, but a
+// pg_constraint FK row is NULL-bearing by construction (conbin, conpfeqop,
+// conppeqop, conffeqop, conexclop) and its conrelid sits behind a 64-byte
+// name, so it must be decoded properly.
+func stampCatalogRowsTuple(ctx *Context, rel storage.RelFileNode, xmax storage.TransactionID, match func(storage.HeapTuple) bool) {
 	nBlocks, err := ctx.Pool.NBlocks(rel)
 	if err != nil || nBlocks == 0 {
 		return
@@ -18052,7 +18143,7 @@ func stampCatalogRows(ctx *Context, rel storage.RelFileNode, xmax storage.Transa
 				if ht.Header.Xmax != storage.InvalidTransactionID {
 					continue
 				}
-				if !match(ht.Data) {
+				if !match(ht) {
 					continue
 				}
 				if err := storage.PageSetHeapTupleXmax(page, lineNo, xmax); err != nil {
@@ -18165,6 +18256,11 @@ func deleteCatalogRowsForOID(ctx *Context, dbOid uint32, relOID uint32, xmax sto
 	// relOID) so a dropped/re-synced view/matview leaves no stale rule visible to
 	// loadViewsFromHeap.
 	stampViewRewriteRows(ctx, dbOid, relOID, xmax)
+	// R126: stamp this relation's FOREIGN KEY rows so an ALTER re-sync, a DROP,
+	// or a rolled-back CREATE leaves no stale or DUPLICATE FK visible to
+	// loadForeignKeysFromHeap. Without this, every re-sync would append a
+	// second copy and the reload would rebuild N identical ForeignKeys entries.
+	stampForeignKeyConstraintRows(ctx, dbOid, relOID, xmax)
 }
 
 // syncEnumTypeToCatalogHeap writes a single pg_type row for an enum type into
@@ -18670,6 +18766,37 @@ func syncTableToCatalogHeap(ctx *Context, tbl *catalog.Table) error {
 		}
 		if err := writeInheritsRow(ctx, tbl.OID, parentOID, int32(i+1)); err != nil {
 			return fmt.Errorf("pg_inherits parent %d: %w", parentOID, err)
+		}
+	}
+
+	// R126: FOREIGN KEY persistence via real pg_constraint HEAP rows
+	// (base/<dbOid>/2606, contype='f'). Before this, catalog.Table.ForeignKeys
+	// was the ONLY store and pg_constraint's FK rows were synthesised from it
+	// (catalog.go:7237), so a restart lost every FK — not merely as planner
+	// evidence (superkeyJoinSelectivity's FK arm) but as ENFORCEMENT: the
+	// runtime checks read the same field (operators_fk.go:118, :170), so an
+	// orphan row was silently accepted after a restart. Emitted from this
+	// single funnel keeps CREATE and every later re-sync in step; the caller
+	// stamps the old rows first (deleteCatalogRowsForOID, which now covers
+	// 2606). loadForeignKeysFromHeap re-reads them.
+	for _, fk := range tbl.ForeignKeys {
+		// Match the synthesised view's skip rule (catalog.go:7249): an FK
+		// without a name/OID predates constraint-catalog tracking.
+		if fk.Name == "" || fk.OID == 0 {
+			continue
+		}
+		confrelid, conkey, confkey, setCols, ok := resolveFKCatalogKeys(ctx, tbl, fk)
+		if !ok {
+			// Declining here means the FK is NOT persisted while the
+			// synthesised view still shows it — the exact silent shape this
+			// round exists to eliminate, so it must never be quiet.
+			slog.Warn("pg_constraint FK sync: cannot resolve referenced table or columns; "+
+				"constraint will NOT survive a restart",
+				"constraint", fk.Name, "table", tbl.Name, "reftable", fk.RefTable)
+			continue
+		}
+		if err := writeForeignKeyConstraintRow(ctx, fk, tbl.OID, confrelid, conkey, confkey, setCols); err != nil {
+			return fmt.Errorf("pg_constraint fk %q: %w", fk.Name, err)
 		}
 	}
 
