@@ -5580,3 +5580,250 @@ anyway and is bit-identical.)
 Values gate closed properly: the first draft substituted a judgement for
 the SF0.25 sweep; review flagged it, so it was RUN — PASS=96 MISMATCH=0
 (`sweep-20260914-053800.txt`).
+
+## R126 (scope) — persist FOREIGN KEY constraints across restart
+
+Step (b) of R125's chain, and the blocker for (d)/Q9. Scope:
+`r126-fk-persistence/SCOPE.md`.
+
+**The defect has two halves, both confirmed by source read.** Write:
+`syncTableToCatalogHeap` (`operators_ddl.go:18575`) streams pg_class,
+pg_attribute, pg_attrdef, pg_inherits and pg_rewrite rows but emits **no
+`contype='f'` pg_constraint row** — no `ForeignKeys`/`contype`/`2606`/`'f'`
+anywhere in its body. Read: startup DOES scan pg_constraint (2606, a real
+heap, created at initdb `initdb.go:1360-1369`) at
+`catalog_heap_reload.go:1338`, but only for **domain CHECK** constraints
+(filters `contypid >= FirstUserOID`). So `catalog.Table.ForeignKeys`
+(`catalog.go:641`) is the only store and `pg_constraint`'s FK rows are
+*synthesised* from it (`catalog.go:7237`).
+
+**Recon done BEFORE the scope was submitted; two answers changed the cut.**
+
+1. **The template exists and is exact** — `internal/executor/sys_pg_constraint.go`
+   (B2.1b), whose own header names this round's residual: "Table
+   constraints stay registry-only until B3". `02d §2` scopes pg_constraint
+   into B3, so this is a planned conversion, not a novel design.
+2. **`conkey`/`confkey` cannot round-trip today.** Every array column in
+   BOTH existing writers is `NullDatum`, so the encoding has never
+   executed — and it is broken in both directions:
+   `PGConstraintColumnsPG18()` declares `{Name:"int2[]"}` with `IsArray`
+   FALSE, so encode misses the `t.IsArray` branch and
+   `case "int2[]"` returns `emptyArrayTypeBytes(21)` (**a non-null conkey
+   would silently write an EMPTY array**), while decode's array path is
+   likewise `IsArray`-gated and the scalar switch has no `int2[]` case, so
+   it reads back as varlena text. Fix: declare them
+   `{Name:"int2", IsArray:true}` — the tested M0118-0002 user-array
+   convention — which is byte-inert for all extant (all-NULL) rows. P0
+   MEASURES that rather than arguing it.
+3. **Routing is the TPC-H-shaped trap.** `pgConstraintRel(ctx)` hardcodes
+   `catalog.DefaultDBOid`; FK rows must instead route per-database via
+   `tableCatalogHeapDBOid(ctx)` like the tables they hang off, and the
+   reload must mirror the per-DB sweep at `open.go:1563-1571`. TPC-H's
+   tables live in database `tpch`, so getting this wrong makes step (d)
+   measure nothing — R125 rev 1's failure mode exactly. Pinned as P1b.
+4. OID/Name are DDL-assigned; persisting them makes them stable across
+   restart, which they are not today. `confrelid` is stored as an OID and
+   resolved back to the table's CURRENT name on reload (so a rename no
+   longer silently breaks the name-keyed store); a missing parent drops
+   the FK with a warning rather than restoring it dangling.
+5. `RefColumns` empty ("use parent PK") is preserved VERBATIM, not
+   materialised — materialising would change `pg_get_constraintdef`
+   output, which is out of scope.
+
+Predictions: P0 no behaviour change + the measured byte-identity of
+existing heap rows; P1/P1b FK survives a restart AND still reaches
+`superkeyJoinSelectivity` (assert the estimate, not the synthesised
+view), including in a non-`postgres` DB; P2 per-field round-trip with
+mutation tests on the two that degrade silently (multi-column `conkey`,
+`conenforced`); P3 DROP removes it with no orphan; P4 values gates
+MANDATORY (this touches a DDL write path — no R125-style judgement);
+P5 do not regress PG-standby readability.
+
+**No parity prediction**: this round declares no FK, so TPC-H stays 6/22
+and TPC-DS 2/99. Its value is that step (d) becomes possible at all.
+Gates also re-measure and commit R125 §7's two prose-only figures.
+
+**Measured before the scope was reviewed** (`r126-fk-persistence/fk-loss-across-restart.md`,
+HEAD `14a11488f`) — discharges R125 §7's flag that the FK-persistence
+figure was prose-only and unreproducible. It also found MORE than R125
+reported, and the extra finding raises the round's stakes:
+
+- FK gone after CHECKPOINT+stop+start in db `postgres` AND in a
+  `CREATE DATABASE`d db (`fkdb`); table data intact (500/500, 50/50);
+  indexes (`parent_pkey`, `child_pkey`) survive.
+- **Referential integrity is SILENTLY UNENFORCED after the restart**: an
+  orphan `INSERT INTO child VALUES (99999, 99999, …)` is ACCEPTED.
+  Runtime enforcement reads the same `catalog.Table.ForeignKeys`
+  (`operators_fk.go:118`,`:170`) that no reload repopulates. So R126 is a
+  **correctness** fix that happens to unblock Q9 — not a planner nicety.
+  New prediction P1c: the orphan insert must FAIL after the fix, which
+  also guards against a reload that repopulates the synthesised view
+  instead of the planner/executor store.
+- PK uniqueness still holds (rides the index, not the constraint catalog).
+- **Separate gap, NOT this round**: `pg_constraint` returns 0 rows of ANY
+  contype post-restart, including the `'p'`/`'u'` rows the view
+  synthesises from indexes (`catalog.go:7143-7153`) even though those
+  indexes reloaded. A second reload gap suppresses the PK projection;
+  a successor round should chase it. Must not be conflated with the FK gap.
+
+Environment gotcha worth keeping: a data dir under the long scratchpad
+path makes `<datadir>/.goopg.ctl.sock` exceed the ~108-byte AF_UNIX limit
+and the server exits with `control listener: bind: invalid argument`
+AFTER logging "goopg listener bound" — it looks like a successful start.
+Use a short path (`/tmp/r126fk`) for throwaway clusters.
+
+**R126 scope rev 1 BLOCKed (4 disqualifying findings) — rev 2 written.**
+All four verified against source before accepting; two were positive
+claims *I* had made about the code, not omissions:
+
+1. **Write surface is FOUR sites, not one.** `ALTER TABLE … ADD FOREIGN
+   KEY` (`operators_ddl.go:9032-9125`) ends at `tbl.ForeignKeys =
+   append(…)` with **no catalog sync of any kind**, unlike its ADD
+   COLUMN/PK/UNIQUE siblings. HammerDB and step (d) both use the ALTER
+   form — so rev 1's `CREATE TABLE … REFERENCES` pin would have passed
+   green while the form that matters persisted nothing. P1/P1b now
+   REQUIRE the ALTER form.
+2. **My deletion citations were both wrong.** `syncConstraintCatalogRow`
+   (`:12859`) calls `deleteCatalogRowsForOID`, not
+   `deleteConstraintRowByOID`; the latter's only 3 call sites
+   (`:25628`,`:25753`,`:26105`) are ALTER/DROP DOMAIN. And
+   `deleteCatalogRowsForOID` (`:18095-18180`) stamps
+   1259/1249/2604/2611/2618 — **2606 absent**. Without stamping it every
+   delete-then-resync ALTER DUPLICATES the FK row; P3 (DROP-only) missed
+   it. Added an N-repeated-ALTERs check.
+3. **Reload main pass at `cat.DBOID()` was wrong** — both cited siblings
+   main at `DefaultDBOid`, and `loadStatisticsFromHeap`
+   (`open.go:3841-3854`) documents that `cat.DBOID()` left the default
+   DB's stats reload "DEAD in practice since M0112 … pg_class survives
+   that split only because DDL mirrors its pages to base/5". **2606
+   appears NOWHERE in `sys_catalog_postgres_db_mirror.go`.** Decision:
+   write via `tableCatalogHeapDBOid` + ADD 2606 to `mirroredCatalogOIDs`
+   + two-tier reload; flag the double-mirror check against the existing
+   explicit `mirrorConstraintCatalogFiles()` calls.
+4. **The descriptor swap would have corrupted the catalog.**
+   `PhysicalTypeIsVarlena` (`physical_align.go:85-107`) switches on
+   `t.Name` with **no `IsArray` arm**, so `{Name:"int2",IsArray:true}`
+   returns FALSE → `HEAP_HASVARWIDTH` unset on a row whose only varlena
+   is a non-null `conkey` → precisely the PG18 `nocachegetattr`
+   assert `codec.go:1550-1557` warns about by name. goopg's own
+   encode/decode both branch on `IsArray`, so they stay symmetric and a
+   round-trip pin passes while the infomask is wrong — **no rev-1 gate
+   could see it.** REVERSED to: keep the `int2[]`/`oid[]` names, write
+   pre-built ArrayType blobs via the **`KindBytes` passthrough that
+   already exists** (`codec.go:962-966` — my "would silently write an
+   EMPTY array" omitted it), add `int2[]`/`oid[]` decode arms. Decode is
+   the only genuine gap. `PhysicalTypeIsVarlena`'s missing `IsArray` arm
+   is a latent bug for ordinary user `int4[]` columns too — recorded,
+   NOT fixed here, deserves its own round + ledger row.
+
+Also corrected: rev 1's "2664-2667 stay bootstrap-empty" was copied from
+a stale in-code comment — M0133-S1 DOES bootstrap 2665/2666/2667
+(`initdb.go:1360-1372`); 2664 is unwritten; the real residual is no
+*runtime* index maintenance. And rev 1's P0 was known-true by
+construction (encode skips NULLs before alignment `codec.go:1591-1594`,
+decode on the bitmap `:1451-1455`, and every array value in both writers
+is `NullDatum`) — an md5 that cannot move is not a measurement. Replaced
+with an infomask + non-null-`conkey` round-trip check; old md5 demoted to
+a labelled regression guard.
+
+Two further findings folded in: a restored FK OID can be re-issued
+because startup's OID advance walks `cat.AllTables()` only
+(`open.go:1501-1506`) → new P6; and `condeferred` can only be tested via
+the CREATE form because the ALTER builder never sets `InitiallyDeferred`.
+
+**R126 scope rev 2 BLOCKed (3 findings) — rev 3 written.** All verified
+against source before accepting. Rev 2's defects were the same class as
+rev 1's, which is the notable part:
+
+A. **Rev 2 asserted a "verified" FOUR-site write surface; there are
+   SEVEN.** Missing: `execAlterTableAlterConstraint` (`:13436-13481`,
+   sets Deferrable/InitiallyDeferred/**NotEnforced**/**NotValid** then
+   `return nil`) — **the statement that sets `conenforced`**, the field
+   P2 says would re-break R125 if lost; `AlterTableValidateConstraint`
+   (`:9126-9175`, clears `NotValid`, no heap work) — a VALIDATEd FK would
+   silently revert to NOT VALID across restart; and
+   `AlterTableRenameConstraint`'s FK arm. **Fix is not a fifth/sixth/
+   seventh emit — it is the existing funnel**: `syncConstraintCatalogRow`
+   (`:12859-12872`) already stamps for every `tableCatalogDBOids(ctx)`
+   then re-syncs via `syncTableToCatalogHeap`, so once 2606 is stamped
+   and FK emission lands in the funnel, ONE call per mutator covers
+   ADD/DROP/ALTER/VALIDATE/RENAME uniformly. Enumeration was the wrong
+   technique — exactly the "sibling paths must agree" trap.
+B. **Rev 2's routing contradicted its own mandatory-ALTER-form rule.**
+   `mirrorTouchedCatalogsToPostgresDB` has ONE caller here —
+   `syncTableToCatalogHeap`, gated `heapDBOid == DefaultDBOid`
+   (`:18708-18713`) — which none of rev 2's bespoke write sites used. So
+   an ALTER-added FK would write base/1, never mirror, and a
+   `cat.DBOID()` main pass reading base/5 would find nothing: **the round
+   would have failed its own headline pin.** And the precedent rev 2
+   quoted refutes it — `pg_attrdef` IS in the mirror set (mirror line
+   203) yet `loadColumnDefaultsFromHeap` still mains at `DefaultDBOid`
+   (`catalog_heap_reload.go:222`). REVERSED: main at `DefaultDBOid` +
+   `ListDatabases` loop, reload NOT dependent on the mirror, 2606 in the
+   mirror set for standby readability only. Double-mirror checked and
+   harmless (`bytes.Equal` page skip, `:115-127`).
+C. **"A non-empty int2 ArrayType builder is needed" was false.**
+   `encodeArrayValuePGCtx` (`codec_array.go:61-110`) already builds it —
+   including the `construct_md_array` trailing-pad fidelity fix
+   (`:97-101`) that a hand-rolled builder would drop and that
+   `pg_column_size`/pg_amcheck can see. Rev 2 would have written a
+   second, worse transcription of the 24-byte layout. Also missed: a
+   naive `case "int2[]"` decode arm passes `elemName="int2[]"` to
+   `RenderTextStyled`, misses `ElemTypeInfo`, and **silently decodes
+   2-byte ints as varlena text** (`pgarray.go:277-280`) — the arm must
+   construct the ELEMENT-named type first.
+
+Also folded in: P0 could be masked if the FK builder copies the domain
+writer's `conbin = ""` convention (an empty text is a non-null varlena →
+`HEAP_HASVARWIDTH` set unconditionally → P0 passes whatever the
+descriptor says), so P0 now asserts `conbin = NullDatum` and covers
+single-column `conkey` too; P6 softened (the pg_control checkpoint
+advance runs earlier, so it is belt-and-braces not a demonstrated live
+bug); and `conpfeqop`/`conppeqop`/`conffeqop` staying NULL is recorded as
+a standby-visible divergence.
+
+Sizing: stays ONE round on the reviewer's condition that §3 collapse to
+the funnel, which rev 3 does. The codec work does not split out — two
+decode arms plus one call to an existing encoder, with no independent
+test surface (an FK row is the only producer).
+
+**R126 scope rev 3 APPROVE-WITH-NOTES.** Four notes folded in before cutting:
+
+1. **2606 stamp predicate specified**: decode via `PGConstraintColumnsPG18()`
+   and compare `decoded[8]`, NOT a hand-computed offset (`conrelid` is the
+   9th column behind a 64-byte `name`, offset ~80 — the existing
+   pg_attrdef `data[4:8]` / pg_inherits `data[0:4]` arms would tempt the
+   wrong style). And key on `conrelid` **AND `contype='f'`**: domain rows
+   carry `conrelid=0` so they are safe today, but **B3 adds `contype='c'`
+   table CHECK rows with a real `conrelid`**, and this funnel re-emits
+   only FK rows — a conrelid-only predicate would silently delete every
+   table CHECK row on the next ALTER the moment B3 lands.
+2. **VALIDATE CONSTRAINT is a deliberate exception to the funnel.** It
+   takes `ShareUpdateExclusiveLock` on purpose (`:9137`, citing PG's
+   `AlterTableGetLockLevel`) and does not conflict with concurrent DML;
+   the full funnel would delete+rewrite the table's whole catalog row set
+   AND re-insert index entries under that weak lock. So VALIDATE stamps
+   and re-emits only its own 2606 row. Sound because `convalidated` is
+   the only field it changes.
+3. **P5 given a mechanism**: `pg_amcheck` on 2606 after an FK is written
+   — this is the first non-null varlena ARRAY goopg will ever write into
+   a system catalog. (Was an unfalsifiable bound; the infomask half is
+   already carried by P0.)
+4. Two implementation checks + one free win: six `deleteCatalogRowsForOID`
+   call sites hardcode `DefaultDBOid` (`:24974`,`:25014`,`:25057`,
+   `:25104`,`:25349`,`:25401`) and become FK-stamping sites with fixed
+   routing once 2606 is in — confirm none reach a per-DB table; and
+   `operators_tx.go:376` cleans a rolled-back CREATE TABLE's FK row for
+   free once 2606 is in the set (name it so nobody "fixes" it later).
+
+Confirmed symmetric by review: `catalog.NamespaceDBOid` maps both 0 and
+`PostgresDBOid` to `DefaultDBOid` (`catalog.go:25095-25100`), so the
+funnel's write routing and the reload's main-pass+loop are the same
+function applied from both ends — a `postgres` connection writes base/1
+and the main pass reads base/1; a `CREATE DATABASE`d db writes
+base/<dbOid> and the `ListDatabases` loop reads the same. This is why
+rev 3's routing is sound where rev 2's was not.
+
+Also noted: renaming the PARENT table leaves the child's in-memory
+`fk.RefTable` stale (pre-existing `fkParentRel` bug) — the OID-keyed
+reload REPAIRS it at the next restart.
