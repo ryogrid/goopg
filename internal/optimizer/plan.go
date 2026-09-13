@@ -2628,12 +2628,6 @@ type Explain struct {
 	pos     int
 	Options parser.ExplainOptions
 	Child   Node
-	// ProducerReport is R118's frozen producer-audit census
-	// (producer_audit.go, TEMPORARY — removed before REPORT.md). Nil
-	// unless the statement planned with the diagnostic sidecar; the
-	// TEXT/JSON renderers consume ONLY this frozen struct, never live
-	// planner state.
-	ProducerReport *ProducerAuditReport
 }
 
 func (n *Explain) Pos() int { return n.pos }

@@ -185,30 +185,6 @@ type PlannerSettings struct {
 	// the transaction's isolation level above all — cannot be known here at
 	// all, and are enforced POST-cache by `StripGather` (parallel.go).
 	ParallelStatementOK bool
-
-	// producerAudit is R118's statement-local producer-audit sidecar
-	// (producer_audit.go, TEMPORARY — removed before REPORT.md). It is set
-	// on a COPY of the settings at the outer EXPLAIN wrapper only and rides
-	// copies (pointer-shared, never cloned) into the recursive inner plan.
-	// Nil everywhere else, including every nested statement planned through
-	// DefaultPlannerSettings. It must NEVER join the plan-cache fingerprint:
-	// it is per-statement diagnostic state, not plan content, and a pointer
-	// in a cache key would both collide across statements and pin memory.
-	producerAudit *producerAuditSidecar
-}
-
-// producerAuditOf returns the R118 sidecar carried by ps, or nil. Nil-safe
-// on the settings value itself only in the sense that callers pass real
-// PlannerSettings; a nil sidecar means "diagnostic off".
-func (ps PlannerSettings) producerAuditOf() *producerAuditSidecar {
-	return ps.producerAudit
-}
-
-// withProducerAudit returns a copy of ps carrying sc. The original is
-// untouched; copies share the sidecar pointer by design (statement-local).
-func (ps PlannerSettings) withProducerAudit(sc *producerAuditSidecar) PlannerSettings {
-	ps.producerAudit = sc
-	return ps
 }
 
 // DefaultPlannerSettings returns the settings a statement plans under when no

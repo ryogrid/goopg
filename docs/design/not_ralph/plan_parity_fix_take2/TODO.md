@@ -4807,13 +4807,16 @@ separately scope a measurement-only producer audit of `estimateJoin` inputs
 and required-column/schema construction; no production cost or Datum change
 is authorized by R117.
 
-R118 PLANNED — Q96 lower Join producer audit, dependent on R117 DONE:
-measurement-only, collision-free attribution from R111's two selected lower
-Hash Join occurrences to `estimateJoin` selectivity/cardinality inputs and
-the final schema/layout writer. It must distinguish observed final fields from
-source-level inference, retain full OFFx2/ONx2 TEXT/JSON/value controls, and
-remove diagnostics before reporting. No production cardinality, schema,
-Datum, cost, statistics, Gather, executor, or search change.
+R118 DONE 2026-09-13 (`r118-q96-lower-join-producers/REPORT.md`,
+implementation reviewed APPROVE-WITH-NOTES, all 9 remediated,
+measurement before removal): sidecar/census/frozen-report diagnostic
+attributed both lower Hash Joins to estimateJoin nd-branch nullfrac
+inputs (0.956366666 vs 0.955833334 from ss_hdemo_sk 4.363% vs
+ss_store_sk 4.417%, inner nullfracs 0) with single-writer
+mergedSchema lineage; no model gap at the pricing site; Datum stays
+closed. All temp source removed; tree diff is docs-only. Next: a
+successor may scope a production change only with a PG18.3
+comparison on these inputs.
 
 TIMING SURVEY DONE 2026-09-13 (`r97-timing-survey/REPORT.md`,
 measurement-only, no code change, no review — survey not a design

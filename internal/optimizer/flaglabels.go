@@ -133,11 +133,6 @@ var flagResolvedState = map[string]func(string) string{
 	"GOOPG_PG_SORT_RELATION_BYTES_COST": func(v string) string {
 		return onOff(pgSortRelationBytesCostFromEnv(v))
 	},
-	// R118's EXPLAIN-only producer audit is default-off and changes no
-	// plan, cost, or estimate. Artefacts retain it so a captured ledger
-	// states whether temporary observation ran. TEMPORARY — removed
-	// before REPORT.md with the rest of the diagnostic.
-	"GOOPG_Q96_PRODUCER_AUDIT": func(v string) string { return onOff(v == "1") },
 	// A mode, not a boolean: the artefact carries the word an operator would
 	// export to reproduce the arm.
 	"GOOPG_NLI_COSTGATE": func(v string) string {
@@ -212,7 +207,6 @@ var flagProvenanceOrder = []string{
 	"GOOPG_PARTIAL_SORT_PATHS",
 	"GOOPG_PG_HASH_TUPLE_SPILL_COST",
 	"GOOPG_PG_SORT_RELATION_BYTES_COST",
-	"GOOPG_Q96_PRODUCER_AUDIT",
 }
 
 // flagProvenanceRetired names variables no code reads any more, and the

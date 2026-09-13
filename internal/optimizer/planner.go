@@ -200,23 +200,6 @@ func PlanWithSettings(stmt parser.Stmt, cat catalog.Catalog, plannerSet PlannerS
 	// the passes that turned out to be able to rewrite the map; this one runs
 	// after all of them. A no-op boolean test with `GOOPG_PGSHAPED_DP` off.
 	assertSearchedBoundariesIntact(node)
-	// R118 (TEMPORARY): freeze the producer census after every rewriter
-	// above has run, in every frame carrying the sidecar. Frames nest
-	// LIFO, so sequential overwrites converge on the outermost frame's
-	// full tree; view bodies and nested scopes plan through
-	// DefaultPlannerSettings (no sidecar) and never freeze. The outer
-	// EXPLAIN wrapper attaches the frozen report (see planStmtWithSettings'
-	// ExplainStmt case). Panics propagate without attaching
-	// anything (no partial report is ever published). A nested EXPLAIN
-	// shadows the outer sidecar for its subtree (its own report attaches
-	// to the inner Explain node); the outer frame then freezes over the
-	// inner Explain node itself, which the census does not descend into,
-	// so the degenerate outer wrapper carries an empty (zero-row) report
-	// rather than nothing — documented, not handled, since PG rejects
-	// such input upstream of planning.
-	if sc := plannerSet.producerAuditOf(); sc != nil {
-		sc.freeze(node)
-	}
 	return node, nil
 }
 
@@ -373,28 +356,11 @@ func planStmtWithSettings(stmt parser.Stmt, cat catalog.Catalog, plannerSet Plan
 		// every unit test passed — EXPLAIN is the only way a user OBSERVES a
 		// cost, so of all the recursive entry points this is the one that must
 		// not default.
-		//
-		// R118 (TEMPORARY): when the producer-audit diagnostic is on, a
-		// statement-local sidecar rides a COPY of the settings into the
-		// recursive call; nested statements planned through
-		// DefaultPlannerSettings never see it. The inner tail freezes the
-		// census after ALL rewrites; this case attaches it. On error the
-		// sidecar is dropped unattached.
-		ps := plannerSet
-		var sc *producerAuditSidecar
-		if producerAuditEnabled() {
-			sc = newProducerAuditSidecar()
-			ps = plannerSet.withProducerAudit(sc)
-		}
-		inner, err := PlanWithSettings(explainInner, cat, ps)
+		inner, err := PlanWithSettings(explainInner, cat, plannerSet)
 		if err != nil {
 			return nil, err
 		}
-		ex := &Explain{pos: s.Pos(), Options: s.Options, Child: inner}
-		if sc != nil {
-			ex.ProducerReport = sc.report()
-		}
-		return ex, nil
+		return &Explain{pos: s.Pos(), Options: s.Options, Child: inner}, nil
 
 	case *parser.CopyStmt:
 		// EX3-03 cut 1: COPY (SELECT …) plans a full SELECT, so it threads
@@ -3050,12 +3016,6 @@ func planFromClause(s *parser.SelectStmt, cat catalog.Catalog, ps PlannerSetting
 			schema:  appendSchema(root.Output(), itemNode.Output()),
 			Lateral: nodeReferencesOuter(itemNode),
 		}
-		// R118 (TEMPORARY): record legacy-direct CROSS accumulation.
-		// Intermediates are superseded, not cloned: only the final root
-		// can resolve in the census.
-		if rj, ok := root.(*Join); ok {
-			ps.producerAuditOf().recordJoinConstruction(rj, producerRouteLegacyDirect, "appendSchema@planFromClause-items")
-		}
 		bindings = append(bindings, shifted...)
 	}
 	if root == nil {
@@ -3119,12 +3079,6 @@ func planFromRangeVars(from []parser.RangeVar, cat catalog.Catalog, ps PlannerSe
 			Right:   n,
 			schema:  appendSchema(root.Output(), n.Output()),
 			Lateral: nodeReferencesOuter(n),
-		}
-		// R118 (TEMPORARY): record legacy-direct CROSS accumulation.
-		// Intermediates are superseded, not cloned: only the final root
-		// can resolve in the census.
-		if rj, ok := root.(*Join); ok {
-			ps.producerAuditOf().recordJoinConstruction(rj, producerRouteLegacyDirect, "appendSchema@planFromRangeVars")
 		}
 		bindings = append(bindings, b)
 	}
@@ -3572,10 +3526,6 @@ func planFromItem(item parser.FromExpr, cat catalog.Catalog, nextSourceIdx *int1
 		}
 		} // close else from allLeavesAreTableScans guard
 		leftNode = jn
-		// R118 (TEMPORARY): record after ALL post-construction mutation
-		// above (SEMI/ANTI schema narrowing, algo/build-side selection),
-		// so the snapshot matches what downstream planning observes.
-		ps.producerAuditOf().recordJoinConstruction(jn, producerRouteLegacyDirect, "mergedSchema@planFromItem")
 		// R40 §4d / K69: for Semi/Anti, `jn`'s Output() (plan.go) and its
 		// now-narrowed `.schema` (set above) equal exactly what `leftCtx`
 		// already described BEFORE this join — the right/nullable side

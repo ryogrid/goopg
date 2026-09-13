@@ -6,7 +6,6 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"sync/atomic"
 	"time"
 
 	"github.com/goopg/goopg/internal/catalog"
@@ -29,37 +28,6 @@ type explainOp struct {
 
 func newExplainOp(p *optimizer.Explain) *explainOp {
 	return &explainOp{plan: p}
-}
-
-// producerAuditRenderToken mints a per-render correlation token for the R118
-// diagnostic block. The frozen report already carries its per-statement
-// token; this one distinguishes concurrent renders of the same plan.
-var producerAuditRenderTokenCounter uint64
-
-func producerAuditRenderToken() string {
-	return fmt.Sprintf("r%x", atomic.AddUint64(&producerAuditRenderTokenCounter, 1))
-}
-
-// appendProducerAuditRows appends the frozen R118 producer report (if any) to
-// TEXT output. Nil report renders nothing: diagnostic-off silence.
-func appendProducerAuditRows(rows *[]Row, rep *optimizer.ProducerAuditReport) {
-	if rep == nil {
-		return
-	}
-	*rows = append(*rows, Row{NewStringDatum(
-		fmt.Sprintf("ProducerAuditRender: render=%s", producerAuditRenderToken()))})
-	for _, ln := range optimizer.ProducerAuditTextLines(rep) {
-		*rows = append(*rows, Row{NewStringDatum(ln)})
-	}
-}
-
-// producerAuditJSONGroup returns the frozen R118 report rows for the JSON
-// root (nil when the diagnostic is off).
-func producerAuditJSONGroup(rep *optimizer.ProducerAuditReport) []map[string]any {
-	if rep == nil {
-		return nil
-	}
-	return optimizer.ProducerAuditJSONRows(rep)
 }
 
 func (o *explainOp) Schema() optimizer.Schema {
@@ -142,31 +110,25 @@ func (o *explainOp) Open(ctx *Context) error {
 				root["Planning Time"] = nsToMs(planNs)
 				root["Execution Time"] = nsToMs(execNs)
 			}
-		addExplainSettingsGroup(ctx, opts, root)
-		// R118 (TEMPORARY): frozen producer report only; nil renders nothing.
-		if g := producerAuditJSONGroup(o.plan.ProducerReport); g != nil {
-			root["ProducerAudit"] = g
+			addExplainSettingsGroup(ctx, opts, root)
+			out, err := renderExplainTree(opts.Format, root)
+			if err != nil {
+				return err
+			}
+			o.rows = []Row{{NewStringDatum(out)}}
+			return nil
 		}
-		out, err := renderExplainTree(opts.Format, root)
-		if err != nil {
-			return err
+		var b strings.Builder
+		walkPlanAnalyze(&b, o.plan.Child, 0, &o.rows, opts, stats, ctx.SubPlanStats, ctx.MemoizeStats, ctx.HashJoinStats, ctx.GatherLaunched, ctx.GatherWorkerStats, ctx.SortStats, ctx.SortWorkerStats)
+		appendExplainSettingsRow(ctx, opts, &o.rows)
+		if summary {
+			o.rows = append(o.rows,
+				Row{NewStringDatum(fmt.Sprintf("Planning Time: %.3f ms", nsToMs(planNs)))},
+				Row{NewStringDatum(fmt.Sprintf("Execution Time: %.3f ms", nsToMs(execNs)))},
+			)
 		}
-		o.rows = []Row{{NewStringDatum(out)}}
 		return nil
 	}
-	var b strings.Builder
-	walkPlanAnalyze(&b, o.plan.Child, 0, &o.rows, opts, stats, ctx.SubPlanStats, ctx.MemoizeStats, ctx.HashJoinStats, ctx.GatherLaunched, ctx.GatherWorkerStats, ctx.SortStats, ctx.SortWorkerStats)
-	appendExplainSettingsRow(ctx, opts, &o.rows)
-	if summary {
-		o.rows = append(o.rows,
-			Row{NewStringDatum(fmt.Sprintf("Planning Time: %.3f ms", nsToMs(planNs)))},
-			Row{NewStringDatum(fmt.Sprintf("Execution Time: %.3f ms", nsToMs(execNs)))},
-		)
-	}
-	// R118 (TEMPORARY): frozen producer report only; nil renders nothing.
-	appendProducerAuditRows(&o.rows, o.plan.ProducerReport)
-	return nil
-}
 
 	if opts.Format == parser.ExplainFormatJSON || opts.Format == parser.ExplainFormatXML || opts.Format == parser.ExplainFormatYAML {
 		// FORMAT JSON/XML/YAML: emit one row whose cell is the
@@ -179,10 +141,6 @@ func (o *explainOp) Open(ctx *Context) error {
 			root["Planning"] = planningBufferUsageJSON(trackIOTiming)
 		}
 		addExplainSettingsGroup(ctx, opts, root)
-		// R118 (TEMPORARY): frozen producer report only; nil renders nothing.
-		if g := producerAuditJSONGroup(o.plan.ProducerReport); g != nil {
-			root["ProducerAudit"] = g
-		}
 		out, err := renderExplainTree(opts.Format, root)
 		if err != nil {
 			return err
@@ -193,8 +151,6 @@ func (o *explainOp) Open(ctx *Context) error {
 	var b strings.Builder
 	walkPlan(&b, o.plan.Child, 0, &o.rows, opts)
 	appendExplainSettingsRow(ctx, opts, &o.rows)
-	// R118 (TEMPORARY): frozen producer report only; nil renders nothing.
-	appendProducerAuditRows(&o.rows, o.plan.ProducerReport)
 	return nil
 }
 
