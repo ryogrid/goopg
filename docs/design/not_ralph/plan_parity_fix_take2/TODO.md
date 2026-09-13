@@ -5979,3 +5979,134 @@ was void. **The match count (6) is robust** across every capture in this
 workstream; the per-category deltas and Q9's exact cost are INDICATIVE,
 not pinned. Re-measure after the DROP bug is fixed if they need to bear
 weight.
+
+## R127 — WITHDRAWN (premise refuted on disk six rounds earlier); replaced by FRONTIER.md
+
+FK chain closed as a no-go, so the next target is chosen from the parity
+data rather than from a thesis. Scope: `r127-semijoin-selectivity/SCOPE.md`.
+
+**Ranking the 22 TPC-H queries by divergent-category count** (from the
+committed `r126-tpch.plans.txt`):
+- 0: Q1 Q6 Q11 Q14 (+Q15a) — MATCH
+- 1: Q10 (rendering, already MATCH); **Q9 (join-order)**
+- 2: **Q4 (aggregation-strategy, sort-strategy)**
+- 3: Q12 Q13 Q17 Q22 — 4: Q16 Q19 Q2 Q21 Q5 Q7 — 5: Q18 Q20 Q3 — 7: Q8
+
+**Q9 is closest but is a documented no-go** (M0126: "cost-driven Q9 MHJ
+cannot be cost-forced", final no-go after the -0013 penalties broke Q5).
+Not reopened.
+
+**Q4 chosen.** Its two categories are ONE decision — hashed aggregation
+forces a Sort ABOVE, sorted aggregation puts the Sort BELOW — so fixing
+the choice clears both. The pair is also the broadest non-join lever:
+`aggregation-strategy` in 10 of 22 queries, `sort-strategy` in 9, nearly
+always together (Q3 Q4 Q5 Q12 Q13 Q18 Q21 Q22).
+
+Q4's difference is perfectly isolated — the join subtree is IDENTICAL
+(same Nested Loop Semi Join, same index, same Index Cond and Filter):
+```
+goopg:  Sort -> HashAggregate -> NL Semi Join
+PG:     GroupAggregate -> Sort -> NL Semi Join
+```
+
+**Checked before theorising** (the `planner_verify_both_candidates_generated`
+lesson): **both candidates ARE generated.** `groupingpaths.go` emits the
+hashed arms (`:367`,`:384`) AND a real sort-then-group arm —
+`sortPathForBounded(...)` then `addPath(AggStrategySorted, Children:
+[sortedInput])` (`:432-440`). So this is a COST problem, not a missing
+producer. (The index-ordered no-Sort arm at `:424` is separate.)
+
+**Hypothesis, to be killed or confirmed BEFORE any edit:**
+| | goopg | PG |
+|---|---|---|
+| Seq Scan orders | 57,057 | 57,554 |
+| NL Semi Join | **57,057** | **13,628** |
+| subtree cost | 490,258 | 192,514 |
+
+goopg's semi-join estimate EQUALS its outer scan's row count exactly —
+the EXISTS is estimated to filter nothing — so a 4.2x larger input makes
+the Sort look 4.2x dearer and the hashed arm wins.
+
+**Stated up front because it is uncomfortable: goopg's estimate is
+probably the MORE ACCURATE one** (TPC-H Q4 at SF=1 really passes ~52k of
+57k orders; PG's 13,628 is a big under-estimate). So the round is
+"reproduce PG's selectivity formula", not "fix a wrong number" — which is
+exactly what the goal asks for, since slower/worse-estimating plans are
+not regressions when the target is PG parity.
+
+**Two hypotheses were refuted by measurement in the previous hour** (the
+index-arm-dead theory and the FK-redundancy theory), so §5 makes the
+diagnosis a GATE: instrument the producer, record BOTH candidate costs,
+and prove arithmetically that PG's input rows would flip the winner —
+before writing any fix. If it would not flip, the scope is rewritten.
+
+No prediction that the other 9 aggregation-strategy queries improve: a
+shared category label is not a shared cause (R122/R123/R124 each found
+the opposite).
+
+### R127 WITHDRAWN — and the process failure that produced it
+
+Review BLOCKed the R127 scope on nine findings, three fatal. **The scope
+is withdrawn, not revised**: `r127-semijoin-selectivity/SCOPE-WITHDRAWN.md`.
+
+**My failure:** the goal says to read TODO.md *および同ディレクトリ配下の
+ドキュメント*. I read R120–R126 and recent commits, and scoped a Q4 round
+without opening ANY of the **eight prior Q4 rounds** (R71 R72 R73 R74 R77
+R78 R79 R81). This directory has **125 round directories**.
+
+Everything that killed the scope was already on disk:
+1. **R71 already ran R127's central experiment**, forcing Q4's semi rows
+   to 57,066 / 30,000 / 13,490 (PG) / 3,439 — "**NO election change at
+   any point. Rows theory DEAD.**" My P2 was a refuted hypothesis.
+2. **R78 already bounded the fix**: goopg HAS `eqJoinSelectivitySemi`
+   (`joinselectivity.go:764`); wiring it to Q4 gives `wouldBe=44654` —
+   **1.28x**, not the 4.2x my table assumed. R78 closed BLOCKED on it.
+3. **R81 located the real decision point**, which my scope would not have
+   instrumented: not the grouping producer but `electOrderedGrouping`
+   (`upperorderedgrouping.go:148`), where goopg's startup ratio 1.0086
+   sits INSIDE `stdFuzzFactor=1.01` → tie-break → hashed, while **PG's
+   1.0118 is outside → sorted wins**. The lever is a ratio crossing 1.01.
+4. My causal story was arithmetically impossible (`costAgg` gives both
+   strategies the same tail terms; they differ by exactly the Sort, so
+   scaling rows cannot flip the sign — only the fuzz ratio).
+5. **My M0126/Q9 citation was stale**: M0126 closed a default-off MHJ
+   fusion flag whose node was deleted by M0127-P6.2, NOT Q9 in the
+   default planner. I used it to exclude Q9 while citing the document
+   that names Q9 as "the real lead".
+
+## FRONTIER — the two closest queries share ONE blocker
+
+`r127-semijoin-selectivity/FRONTIER.md`. Read before scheduling anything.
+
+**Q4 and Q9 both block on widths, and on nothing else first:**
+- Q4 (R81): election decided by a startup ratio vs the 1.01 fuzz band;
+  **widths dominate rows** — semi output 448 vs PG's 16, "widths ratio
+  28x EXCEEDS the rows ratio 16.6x". R81's unblock condition (i) is
+  **DatumBytes/projection pushdown — "neither exists"**.
+- Q9 (R69 §6, after the NLI audit): "Slice (b) width/footprint — **now
+  the load-bearing half of Q9**". R77 closes: "Next: rows/width program".
+
+**And the width program was already attempted: R120–R124, measured
+parity-neutral** (R124: 22 of 32 narrowed rels produced zero cost
+movement). The distinction never crossed: R120–R124 narrowed what the
+COST MODEL IS TOLD; R81's blocker is narrowing what the EXECUTOR
+PRODUCES. Corroborated by `goopg_optimizer_no_attr_needed_no_ios_path`:
+"inside a join tree there is no Project above the scan at all" — there is
+nowhere to hang a projection today.
+
+**Every cheaper lever at these two queries is now measured and rejected:**
+rows-only on Q4 (R71), semi-selectivity wiring (R78, 1.28x),
+FK evidence on Q9 (this session, match=6 unchanged), cost-input
+narrowing corpus-wide (R124, parity-neutral).
+
+So the next scheduler chooses deliberately between:
+(a) **build projection pushdown / DatumBytes** — infrastructure, the
+    shared dependency, no parity prediction on its first slice; or
+(b) accept TPC-H parity is capped near 6–7/22 until it exists, and
+    redirect at categories that do not depend on it.
+
+Not by picking the next plausible-looking query.
+
+**Standing hazard for this directory:** 125 rounds. Before scoping round
+N, `ls` the directory and grep prior rounds for BOTH the target query and
+the target mechanism. Recent-commit context is demonstrably insufficient.
