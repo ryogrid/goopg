@@ -3,9 +3,12 @@ package executor
 import (
 	"errors"
 	"fmt"
+	"log"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/goopg/goopg/internal/catalog"
@@ -24,6 +27,113 @@ type explainOp struct {
 	plan *optimizer.Explain
 	rows []Row
 	idx  int
+}
+
+var q96LegacyChildTrace = os.Getenv("GOOPG_Q96_LEGACY_CHILD_TRACE") == "1"
+var q96LegacyChildTraceSeq atomic.Uint64
+
+func explainCostsEnabled(opts parser.ExplainOptions) bool {
+	return !opts.Set.Costs || opts.Costs
+}
+
+type q96LegacyChildObserver struct {
+	token   string
+	kind    string
+	seen    map[*optimizer.Join]int
+	ordinal map[*optimizer.Join]int
+	counts  map[*optimizer.Join]int
+}
+
+func newQ96LegacyChildObserver(kind string, root optimizer.Node, costs bool) *q96LegacyChildObserver {
+	if !q96LegacyChildTrace || !costs {
+		return nil
+	}
+	o := &q96LegacyChildObserver{token: fmt.Sprintf("r%d", q96LegacyChildTraceSeq.Add(1)), kind: kind, seen: make(map[*optimizer.Join]int), ordinal: make(map[*optimizer.Join]int), counts: make(map[*optimizer.Join]int)}
+	var walk func(optimizer.Node)
+	walk = func(n optimizer.Node) {
+		if j, ok := n.(*optimizer.Join); ok {
+			o.counts[j]++
+			if o.ordinal[j] == 0 {
+				o.ordinal[j] = len(o.ordinal) + 1
+			}
+		}
+		for _, child := range planChildren(n) {
+			walk(child)
+		}
+	}
+	walk(root)
+	return o
+}
+
+func (o *q96LegacyChildObserver) callback() optimizer.LegacyDisplayCostObserver {
+	if o == nil {
+		return nil
+	}
+	return o.observe
+}
+
+func (o *q96LegacyChildObserver) observe(v optimizer.LegacyDisplayCostObservation) {
+	j, ok := v.Node.(*optimizer.Join)
+	if !ok {
+		return
+	}
+	o.seen[j]++
+	ordinal := o.ordinal[j]
+	if o.counts[j] != 1 || o.seen[j] != 1 {
+		return
+	}
+	log.Printf("Q96CHILD token=%s kind=%s ordinal=%d final_occurrences=%d join=%p left_sources=%s right_sources=%s rows=%d width=%d cpu_tuple=%.6f childtotal=%.2f childstartup=%.2f perrow=%.2f startup=%.2f total=%.2f", o.token, o.kind, ordinal, o.counts[j], j, q96SourceSet(j.Left), q96SourceSet(j.Right), v.Rows, v.Cost.PlanWidth, v.CPUTupleCost, v.ChildTotal, v.ChildStartup, v.PerRow, v.Cost.StartupCost, v.Cost.TotalCost)
+	for i, child := range v.Children {
+		log.Printf("Q96CHILD token=%s kind=%s ordinal=%d join=%p child=%d node=%T source=%s rows=%.0f width=%d startup=%.2f total=%.2f", o.token, o.kind, ordinal, j, i, child.Node, child.Source, child.Cost.PlanRows, child.Cost.PlanWidth, child.Cost.StartupCost, child.Cost.TotalCost)
+	}
+}
+
+func (o *q96LegacyChildObserver) finish() {
+	if o == nil {
+		return
+	}
+	if len(o.ordinal) == 0 {
+		log.Printf("Q96CHILD token=%s kind=%s mapping=none final_joins=0", o.token, o.kind)
+		return
+	}
+	joins := make([]*optimizer.Join, 0, len(o.ordinal))
+	for join := range o.ordinal {
+		joins = append(joins, join)
+	}
+	sort.Slice(joins, func(i, j int) bool { return o.ordinal[joins[i]] < o.ordinal[joins[j]] })
+	for _, join := range joins {
+		ordinal := o.ordinal[join]
+		mapping := "one-to-one"
+		ledger := "emitted"
+		if o.counts[join] != 1 {
+			mapping, ledger = "multiple", "suppressed"
+		} else if o.seen[join] == 0 {
+			ledger = "none"
+		}
+		log.Printf("Q96CHILD token=%s kind=%s mapping=%s ledger=%s ordinal=%d join=%p final_occurrences=%d ledger_callbacks=%d left_sources=%s right_sources=%s", o.token, o.kind, mapping, ledger, ordinal, join, o.counts[join], o.seen[join], q96SourceSet(join.Left), q96SourceSet(join.Right))
+	}
+}
+
+func q96SourceSet(n optimizer.Node) string {
+	if n == nil {
+		return "{}"
+	}
+	set := map[int16]bool{}
+	for _, c := range n.Output() {
+		if c.SourceTableIdx != 0 {
+			set[c.SourceTableIdx] = true
+		}
+	}
+	ids := make([]int, 0, len(set))
+	for id := range set {
+		ids = append(ids, int(id))
+	}
+	sort.Ints(ids)
+	parts := make([]string, len(ids))
+	for i, id := range ids {
+		parts[i] = strconv.Itoa(id)
+	}
+	return "{" + strings.Join(parts, ",") + "}"
 }
 
 func newExplainOp(p *optimizer.Explain) *explainOp {
@@ -409,7 +519,10 @@ func (o *explainOp) Close() error { return nil }
 // default). `EXPLAIN (COSTS OFF) ...` therefore renders bare
 // node labels, matching upstream `COSTS OFF` output.
 func walkPlan(b *strings.Builder, n optimizer.Node, depth int, rows *[]Row, opts parser.ExplainOptions) {
-	walkPlanFiltered(n, depth, rows, opts, nil, nil, &subPlanReg{rel: newExplainNames(n), cte: collectCTEHoist(n)})
+	census := newQ96LegacyChildObserver("TEXT", n, explainCostsEnabled(opts))
+	reg := &subPlanReg{rel: newExplainNames(n), cte: collectCTEHoist(n), legacyCostObserve: census.callback()}
+	defer census.finish()
+	walkPlanFiltered(n, depth, rows, opts, nil, nil, reg)
 }
 
 // walkPlanFiltered is the inner driver for walkPlan. attachedFilter
@@ -523,7 +636,7 @@ func walkPlanFiltered(n optimizer.Node, indent int, rows *[]Row, opts parser.Exp
 		// PG's cost annotation, from the path the planner chose (take2 P0-02).
 		// `rows=` comes from the SAME carrier since C-20a's successor, so the
 		// line no longer states one estimator's costs beside another's rows.
-		est, startup, total, width := explainCostFields(rowSrc, est)
+		est, startup, total, width := explainCostFields(rowSrc, est, reg.legacyCostObserve)
 		label += fmt.Sprintf("  (cost=%.2f..%.2f rows=%d width=%d)", startup, total, est, width)
 	}
 	*rows = append(*rows, Row{NewStringDatum(label)})
@@ -1726,8 +1839,9 @@ func forceParen(s string) string {
 // nothing, so callers without a registry (JSON rendering, direct
 // formatExprPG users) keep working unchanged.
 type subPlanReg struct {
-	num     map[optimizer.Expr]int
-	pending []subPlanEntry
+	num               map[optimizer.Expr]int
+	pending           []subPlanEntry
+	legacyCostObserve optimizer.LegacyDisplayCostObserver
 	// rel is the render's range-table name table (M0125-0039). It lives
 	// here rather than in its own parameter because subPlanReg is already
 	// the one piece of per-EXPLAIN state threaded through every walker and
@@ -2344,7 +2458,9 @@ func schemaColumnNames(n optimizer.Node) []string {
 // from the instrumentation table. Loops > 0 means the operator
 // ran at least once. Total time is in milliseconds.
 func walkPlanAnalyze(b *strings.Builder, n optimizer.Node, depth int, rows *[]Row, opts parser.ExplainOptions, stats nodeStatsTable, spStats map[optimizer.Expr]*SubPlanSiteStats, memoStats map[*optimizer.Memoize]*MemoizeStats, hashStats map[*optimizer.Join]*HashJoinStats, gatherLaunched gatherLaunchedTable, workerStats workerNodeStatsTable, sortStats map[*optimizer.Sort]SortStat, sortWorkers map[*optimizer.Sort][]SortStat) {
-	reg := &subPlanReg{rel: newExplainNames(n), cte: collectCTEHoist(n)}
+	census := newQ96LegacyChildObserver("TEXT", n, explainCostsEnabled(opts))
+	reg := &subPlanReg{rel: newExplainNames(n), cte: collectCTEHoist(n), legacyCostObserve: census.callback()}
+	defer census.finish()
 	reg.sortStats, reg.sortWorkers = sortStats, sortWorkers
 	walkPlanAnalyzeFiltered(n, depth, rows, opts, stats, spStats, memoStats, hashStats, gatherLaunched, workerStats, nil, nil, 0, reg)
 }
@@ -2428,7 +2544,7 @@ func walkPlanAnalyzeFiltered(n optimizer.Node, indent int, rows *[]Row, opts par
 		if est <= 0 {
 			est = 1
 		}
-		est, startup, total, width := explainCostFields(rowSrc, est)
+		est, startup, total, width := explainCostFields(rowSrc, est, reg.legacyCostObserve)
 		label += fmt.Sprintf("  (cost=%.2f..%.2f rows=%d width=%d)", startup, total, est, width)
 	}
 	// A collapsed Filter is rendered as part of THIS line, so the line's
@@ -2702,7 +2818,9 @@ func walkPlanAnalyzeFiltered(n optimizer.Node, indent int, rows *[]Row, opts par
 func planToJSONWithStats(n optimizer.Node, opts parser.ExplainOptions, stats nodeStatsTable, trackIOTiming bool) map[string]any {
 	// P0-04e: one name table for the whole plan, as in planToJSON.
 	nm := newExplainNames(n)
-	return planToJSONWithStatsNamed(n, opts, stats, trackIOTiming, &subPlanReg{rel: nm})
+	census := newQ96LegacyChildObserver("JSON", n, explainCostsEnabled(opts))
+	defer census.finish()
+	return planToJSONWithStatsNamed(n, opts, stats, trackIOTiming, &subPlanReg{rel: nm, legacyCostObserve: census.callback()})
 }
 
 // planToJSONWithStatsNamed is planToJSONWithStats with the shared render
@@ -2841,7 +2959,9 @@ func planToJSON(n optimizer.Node, opts parser.ExplainOptions) map[string]any {
 	// recursion — a per-node table would count only that subtree's
 	// relations and qualify differently from the text walker.
 	nm := newExplainNames(n)
-	return planToJSONNamed(n, opts, &subPlanReg{rel: nm})
+	census := newQ96LegacyChildObserver("JSON", n, explainCostsEnabled(opts))
+	defer census.finish()
+	return planToJSONNamed(n, opts, &subPlanReg{rel: nm, legacyCostObserve: census.callback()})
 }
 
 // planToJSONNamed is planToJSON with the shared render state threaded
@@ -2887,7 +3007,7 @@ func planToJSONNamed(n optimizer.Node, opts parser.ExplainOptions, reg *subPlanR
 	// `Plan Rows` is set from the carrier below, together with the three cost
 	// fields, so FORMAT JSON and the text walkers cannot state different rows
 	// for the same node (C-20a's successor).
-	estFromCarrier, startup, total, width := explainCostFields(costNode, est)
+	estFromCarrier, startup, total, width := explainCostFields(costNode, est, reg.legacyCostObserve)
 	if estFromCarrier > 0 {
 		est = estFromCarrier
 	}
@@ -2986,13 +3106,13 @@ func explainIndexName(i *catalog.Index) string {
 // printing zeros. A plan mixing real costs with 0.00 is WORSE than one where
 // every cost is 0.00: with all-zero, a reader knows nothing is priced; with a
 // mixture, a free node and an unpriced node look identical.
-func explainCostFields(n optimizer.Node, rows int64) (est int64, startup, total float64, width int) {
+func explainCostFields(n optimizer.Node, rows int64, observe optimizer.LegacyDisplayCostObserver) (est int64, startup, total float64, width int) {
 	if c, ok := n.(optimizer.PlanCostCarrier); ok {
 		if pc, set := c.PlanCostInfo(); set {
 			return planCostRows(pc.PlanRows, rows), pc.StartupCost, pc.TotalCost, pc.PlanWidth
 		}
 	}
-	d := optimizer.DeriveLegacyDisplayCost(n, rows)
+	d := optimizer.DeriveLegacyDisplayCostObserved(n, rows, observe)
 	return planCostRows(d.PlanRows, rows), d.StartupCost, d.TotalCost, d.PlanWidth
 }
 

@@ -113,7 +113,71 @@ func stampPlanCost(n Node, p *Path) {
 // visible" and nothing more.
 //
 // design: docs/design/not_ralph/planner_refactor_take2/impl/P0-A-explain-instrument.md §4
+// LegacyDisplayCostObservation is one nonrecursive legacy display-cost ledger.
+// It exists solely so EXPLAIN diagnostics can observe the same derivation
+// EXPLAIN is already performing; callers must not retain or mutate its Node.
+type LegacyDisplayCostObservation struct {
+	Node         Node
+	Rows         int64
+	CPUTupleCost float64
+	Children     []LegacyDisplayCostChild
+	ChildTotal   float64
+	ChildStartup float64
+	PerRow       float64
+	Cost         PlanCost
+}
+
+// LegacyDisplayCostSource identifies the exact accessor used for a display
+// child. The closed values keep an unreviewed source from reaching a trace.
+type LegacyDisplayCostSource uint8
+
+const (
+	LegacyDisplayCostSourceInvalid LegacyDisplayCostSource = iota
+	LegacyDisplayCostSourceNil
+	LegacyDisplayCostSourceStamped
+	LegacyDisplayCostSourceLegacy
+)
+
+func (s LegacyDisplayCostSource) String() string {
+	switch s {
+	case LegacyDisplayCostSourceInvalid:
+		return "invalid"
+	case LegacyDisplayCostSourceNil:
+		return "nil"
+	case LegacyDisplayCostSourceStamped:
+		return "stamped"
+	case LegacyDisplayCostSourceLegacy:
+		return "legacy"
+	default:
+		return "invalid"
+	}
+}
+
+// LegacyDisplayCostChild records the exact child accessor used by a legacy
+// display derivation.
+type LegacyDisplayCostChild struct {
+	Node   Node
+	Cost   PlanCost
+	Source LegacyDisplayCostSource
+}
+
+// LegacyDisplayCostObserver observes a completed legacy display-cost ledger.
+// It must consume scalar snapshots during the callback and must not retain or
+// mutate Node references; only the temporary EXPLAIN renderer may use it.
+type LegacyDisplayCostObserver func(LegacyDisplayCostObservation)
+
 func DeriveLegacyDisplayCost(n Node, rows int64) PlanCost {
+	return deriveLegacyDisplayCost(n, rows, nil)
+}
+
+// DeriveLegacyDisplayCostObserved is DeriveLegacyDisplayCost with an
+// append-only observer for the derivation it performs. It is intended only for
+// EXPLAIN diagnostics and has identical cost arithmetic.
+func DeriveLegacyDisplayCostObserved(n Node, rows int64, observe LegacyDisplayCostObserver) PlanCost {
+	return deriveLegacyDisplayCost(n, rows, observe)
+}
+
+func deriveLegacyDisplayCost(n Node, rows int64, observe LegacyDisplayCostObserver) PlanCost {
 	cp := defaultCostParams()
 	out := PlanCost{
 		PlanRows:  float64(rows),
@@ -125,8 +189,16 @@ func DeriveLegacyDisplayCost(n Node, rows int64) PlanCost {
 	out.PlanWidth = TupleWidth(n.Output())
 
 	childStartup, childTotal := 0.0, 0.0
-	for _, c := range legacyDisplayChildren(n) {
-		cc := legacyDisplayCostOf(c)
+	children := legacyDisplayChildren(n)
+	var childCosts []LegacyDisplayCostChild
+	if observe != nil {
+		childCosts = make([]LegacyDisplayCostChild, 0, len(children))
+	}
+	for _, c := range children {
+		cc, source := legacyDisplayCostOfObservedSource(c, observe)
+		if observe != nil {
+			childCosts = append(childCosts, LegacyDisplayCostChild{Node: c, Cost: cc, Source: source})
+		}
 		// A node with several children pays for all of them and cannot start
 		// before the slowest-to-start of them.
 		childTotal += cc.TotalCost
@@ -158,19 +230,31 @@ func DeriveLegacyDisplayCost(n Node, rows int64) PlanCost {
 		out.StartupCost = childStartup
 		out.TotalCost = childTotal + perRow
 	}
+	if observe != nil {
+		observe(LegacyDisplayCostObservation{Node: n, Rows: rows, CPUTupleCost: cp.cpuTupleCost, Children: childCosts, ChildTotal: childTotal, ChildStartup: childStartup, PerRow: perRow, Cost: out})
+	}
 	return out
 }
 
 func legacyDisplayCostOf(n Node) PlanCost {
+	return legacyDisplayCostOfObserved(n, nil)
+}
+
+func legacyDisplayCostOfObserved(n Node, observe LegacyDisplayCostObserver) PlanCost {
+	c, _ := legacyDisplayCostOfObservedSource(n, observe)
+	return c
+}
+
+func legacyDisplayCostOfObservedSource(n Node, observe LegacyDisplayCostObserver) (PlanCost, LegacyDisplayCostSource) {
 	if n == nil {
-		return PlanCost{}
+		return PlanCost{}, LegacyDisplayCostSourceNil
 	}
 	if c, ok := n.(PlanCostCarrier); ok {
 		if pc, set := c.PlanCostInfo(); set {
-			return pc
+			return pc, LegacyDisplayCostSourceStamped
 		}
 	}
-	return DeriveLegacyDisplayCost(n, EstimateRows(n))
+	return deriveLegacyDisplayCost(n, EstimateRows(n), observe), LegacyDisplayCostSourceLegacy
 }
 
 func childRowsOf(n Node) float64 {

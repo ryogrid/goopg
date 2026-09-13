@@ -77,13 +77,13 @@ func onOff(on bool) string {
 // Nothing here may be a literal that restates a default declared elsewhere —
 // that duplication IS the defect this file exists to make impossible.
 var flagResolvedState = map[string]func(string) string{
-	"GOOPG_MEMOIZE":           func(v string) string { return onOff(memoizeFromEnv(v)) },
-	"GOOPG_PARALLEL":          func(v string) string { return onOff(parallelFromEnv(v)) },
-	"GOOPG_PGSHAPED_DP":       func(v string) string { return onOff(pgShapedDPFromEnv(v)) },
-	"GOOPG_EXISTS_TO_ANY":     func(v string) string { return onOff(existsToAnyFromEnv(v)) },
-	"GOOPG_UNNEST_PREDP":      func(v string) string { return onOff(unnestPreDPFromEnv(v)) },
-	"GOOPG_INDEXKEY_HARVEST":  func(v string) string { return onOff(indexKeyHarvestFromEnv(v)) },
-	"GOOPG_HASH_OUTER_JOIN":   func(v string) string { return onOff(hashOuterJoinFromEnv(v)) },
+	"GOOPG_MEMOIZE":          func(v string) string { return onOff(memoizeFromEnv(v)) },
+	"GOOPG_PARALLEL":         func(v string) string { return onOff(parallelFromEnv(v)) },
+	"GOOPG_PGSHAPED_DP":      func(v string) string { return onOff(pgShapedDPFromEnv(v)) },
+	"GOOPG_EXISTS_TO_ANY":    func(v string) string { return onOff(existsToAnyFromEnv(v)) },
+	"GOOPG_UNNEST_PREDP":     func(v string) string { return onOff(unnestPreDPFromEnv(v)) },
+	"GOOPG_INDEXKEY_HARVEST": func(v string) string { return onOff(indexKeyHarvestFromEnv(v)) },
+	"GOOPG_HASH_OUTER_JOIN":  func(v string) string { return onOff(hashOuterJoinFromEnv(v)) },
 	// Take2 P4-01 rev 10 step 3: narrows hash-join build sides to the
 	// statement's needed columns. Default ON since step 5 (P4-A §18); `=0`
 	// opts back out to the un-narrowed arm.
@@ -133,6 +133,9 @@ var flagResolvedState = map[string]func(string) string{
 	"GOOPG_PG_SORT_RELATION_BYTES_COST": func(v string) string {
 		return onOff(pgSortRelationBytesCostFromEnv(v))
 	},
+	// R117's EXPLAIN-only diagnostic is default-off. Artefacts retain it so a
+	// captured child-cost ledger states whether temporary observation ran.
+	"GOOPG_Q96_LEGACY_CHILD_TRACE": func(v string) string { return onOff(v == "1") },
 	// A mode, not a boolean: the artefact carries the word an operator would
 	// export to reproduce the arm.
 	"GOOPG_NLI_COSTGATE": func(v string) string {
@@ -207,6 +210,7 @@ var flagProvenanceOrder = []string{
 	"GOOPG_PARTIAL_SORT_PATHS",
 	"GOOPG_PG_HASH_TUPLE_SPILL_COST",
 	"GOOPG_PG_SORT_RELATION_BYTES_COST",
+	"GOOPG_Q96_LEGACY_CHILD_TRACE",
 }
 
 // flagProvenanceRetired names variables no code reads any more, and the

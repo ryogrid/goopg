@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 
@@ -934,22 +935,22 @@ func TestProductionDefaultCostParamsCallersAreExactlyThree(t *testing.T) {
 			return true
 		})
 	}
-	want := map[string]string{
-		"plannersettings.go":  "DefaultPlannerSettings",
-		"plancost.go":         "DeriveLegacyDisplayCost",
-		"joinpathsmemoize.go": "pathRescanTotal",
+	want := map[string][]string{
+		"plannersettings.go":  {"DefaultPlannerSettings"},
+		"plancost.go":         {"deriveLegacyDisplayCost"},
+		"joinpathsmemoize.go": {"pathRescanTotal"},
 	}
 	if len(found) != len(want) {
 		t.Fatalf("production defaultCostParams() callers = %v, want exactly %v", found, want)
 	}
-	for file, fn := range want {
+	for file, fns := range want {
 		got, ok := found[file]
 		if !ok {
-			t.Errorf("missing production caller in %s (want %s); got %v", file, fn, found)
+			t.Errorf("missing production caller in %s (want %v); got %v", file, fns, found)
 			continue
 		}
-		if len(got) != 1 || got[0] != fn {
-			t.Errorf("%s: caller(s) = %v, want exactly [%s]", file, got, fn)
+		if len(got) != len(fns) || !slices.Equal(got, fns) {
+			t.Errorf("%s: caller(s) = %v, want exactly %v", file, got, fns)
 		}
 	}
 }
