@@ -4746,6 +4746,15 @@ and behaviour, distinguish selected from merely offered Sort paths, and record
 OFF/ON plan/value deltas against live PG18.3. Before source change: Design Doc,
 agent review, `git commit -n`, and push.
 
+R113 SCOPE READY 2026-09-13 (`r113-pg-sort-relation-bytes/DESIGN.md`): an
+opt-in Sort-price-only comparison will replace only `costSortRun`'s byte volume
+with PG18.3 `relation_byte_size(rows, PathTarget.width)`, threaded from each
+Sort caller's emitted width. It retains Goopg `hashsize.EntryBytes` for all
+executor allocation and all non-Sort costs, fails closed on unknown width, and
+requires focused provenance/boundary tests plus live-PG OFF/ON structural and
+value evidence before any default decision. Next: agent review, correction if
+needed, `git commit -n`, and push; no production edit is authorized first.
+
 TIMING SURVEY DONE 2026-09-13 (`r97-timing-survey/REPORT.md`,
 measurement-only, no code change, no review — survey not a design
 doc): TPC-DS SF0.25 all 96 queries timed (3-run medians, values
