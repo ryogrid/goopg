@@ -737,7 +737,12 @@ func provableJoinKeys(resolved []resolvedPair, covered []bool, admit func(proven
 			continue
 		}
 		for _, fk := range st.ref.table.ForeignKeys {
-			if fk.NotValid || fk.NotEnforced || !columnsSubset(fk.Columns, st.cols) {
+			// R125: `NotValid` is not a filter — see the long note in
+			// joinrelsize.go's twin loop. PG gates on `conenforced` only
+			// (plancat.c:642-644). This site can set `rowsBound`, but every
+			// consumer of it is a clamp on a row ESTIMATE, so an unvalidated
+			// constraint costs optimism, never correctness.
+			if fk.NotEnforced || !columnsSubset(fk.Columns, st.cols) {
 				continue
 			}
 			parent, ok := fkParentScan(resolved, covered, scan, fk)

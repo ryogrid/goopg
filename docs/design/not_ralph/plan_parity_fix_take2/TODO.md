@@ -5501,3 +5501,68 @@ HammerDB FK is DEFERRABLE and seven are not, so a future catalog-match
 gate must not compare only `(conrelid,confrelid,conkey)`; and the TODO
 head's values gate still says "SF0.5 PASS=95" where CLAUDE.md and every
 round since R94 use SF0.25 PASS=96.
+
+R125 DONE 2026-09-14 (`r125-tpch-foreign-keys/REPORT.md`, review
+**APPROVE-WITH-NOTES**, no blocks): goopg now consumes `NOT VALID`
+foreign keys as planner evidence, matching PG. Step (a) of the four-step
+chain to Q9, and the step that makes the rest affordable.
+Defect: PG's planner **never** consults `convalidated` —
+`get_relation_foreign_keys` skips only `!conenforced`
+(`plancat.c:642-644`) and `RelationGetFKeyList` (`relcache.c:4769-4776`)
+doesn't carry `convalidated` into `ForeignKeyCacheInfo`; `grep
+convalidated` over `optimizer/` returns ZERO hits. goopg skipped on
+`fk.NotValid` at `joinrelsize.go:658` and `joinkeyproof.go:740`. Both
+now gate on `NotEnforced` alone.
+**The upstream omission is DELIBERATE** (review found this and it
+settles the argument): PG DOES filter `convalidated` where it means
+something — `CheckConstraintFetch` skips unvalidated CHECK constraints
+(`relcache.c:4635`) — and pointedly does not in the FK path.
+Gate 1 enumeration, done before the edit: `rowsBound` has exactly two
+consumers, both `rows = min(rows, …)` clamps (`cardinality.go:678`,
+`joinrelsize.go:250`); `boundProven` has one, gating whether a default
+selectivity is substituted (`cardinality.go:639`). Extended past the
+optimizer boundary on review: the joinrel `rows` reaches
+`operators_join_agg.go:786` (hash presize — `NBuckets` only, map still
+grows, `NBatch` ignored) and `subq_cache.go:106` (reconciled against the
+measured size, falls back to the always-correct rescan path). **No
+consumer is a guarantee**, so the SCOPE's hedge (relax selectivity, keep
+the proof site) was unnecessary — relax both.
+**A documented prior decision was REVERSED, deliberately and in the
+open.** `TestCalcJoinrelSizeInvalidFKIgnored` asserted the opposite,
+reasoning "a NOT VALID constraint proves nothing about the rows already
+in the table". Correct about PROOF, wrong about PG. The pin is renamed
+and inverted (`…InvalidFKHonouredLikePG`) with the citation and an
+explicit failure message naming the old behaviour; its surviving half is
+split into `…NotEnforcedFKIgnored`.
+**The strongest safety argument, which I missed and review supplied:**
+the concern is QUANTITATIVELY IDENTICAL to PG's. A NOT VALID FK is still
+ENFORCED against every new row in goopg exactly as in PG — runtime
+enforcement gates on `NotEnforced` only (`operators_fk.go:118`,`:170`),
+never `NotValid` — so the unchecked set is the pre-existing rows alone,
+and only until VALIDATE CONSTRAINT. This is not parity overriding
+safety; it is the same safety.
+Results: P0 PASS on **both** corpora (TPC-H byte-identical md5
+`19b1c9a1`; TPC-DS `ds-r125` bit-identical — the first draft reported
+PASS having captured only TPC-H, corrected on review). goopg `tpch` has
+NO constraints of any type and `tpcds025` has 0 FKs, so nothing could
+move. P1 PASS — new pin over the REAL planner on a Q9-shaped 2-column
+join: **noFK=8000, validFK=40000, notValidFK=40000**, i.e. the FK arm
+corrects a 5x under-estimate to exact, and NOT VALID now behaves as
+validated; **mutation-tested** (restoring the guard gives
+`notValid=8000 valid=40000`). Suites + vet green; spotcheck PASS.
+No flag, deliberately: a default-off flag would be DEAD CODE (no corpus
+declares an FK, so it could never be A/B'd — the 5-way-A/A trap R124
+fell into), and the FK declaration itself is step (d)'s A/B knob.
+TPC-DS SF0.25 values sweep NOT run — recorded as a judgement, not a
+pass: a change that provably cannot alter a plan cannot alter a value.
+**Q9 does not move and cannot yet.** TPC-H stays 6/22, TPC-DS 2/99.
+Remaining: **(b) persist FK constraints across restart** — the blocker;
+the reload must repopulate `catalog.Table.ForeignKeys`, not the
+synthesised `pg_constraint` view. **(c)** index path for FK validation —
+now OPTIONAL rather than blocking, because NOT VALID FKs can be declared
+in O(1) and still feed the estimator. **(d)** declare and measure Q9.
+Follow-up worth doing: rename `boundProven`/`rowsBound` — they promise a
+proof the FK arm never delivered (PG derives no bound from `fkey_list`).
+Caveat carried: §5's FK-persistence and 32.17s-validation figures came
+from a throwaway cluster and exist only as prose; (b)/(c) must re-measure
+and commit the artefact rather than cite this report.

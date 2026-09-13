@@ -340,10 +340,45 @@ func TestCalcJoinrelSizeFKDividesByParentCount(t *testing.T) {
 	}
 }
 
-// TestCalcJoinrelSizeInvalidFKIgnored: a NOT VALID / NOT ENFORCED constraint
-// proves nothing about the rows already in the table, so it must not license a
-// no-fan-out estimate.
-func TestCalcJoinrelSizeInvalidFKIgnored(t *testing.T) {
+// TestCalcJoinrelSizeInvalidFKIgnored — REVERSED BY R125, deliberately.
+//
+// This pin used to read: "a NOT VALID / NOT ENFORCED constraint proves nothing
+// about the rows already in the table, so it must not license a no-fan-out
+// estimate", and asserted the NOT VALID FK was ignored.
+//
+// That reasoning is sound about PROOF and wrong about PG. PG's planner never
+// consults `convalidated`: `get_relation_foreign_keys` skips only unenforced
+// constraints (plancat.c:642-644) and `RelationGetFKeyList`
+// (relcache.c:4769-4776) does not even carry `convalidated` into
+// `ForeignKeyCacheInfo`. So upstream DOES feed a NOT VALID foreign key to
+// `get_foreign_key_join_selectivity`, and this workstream's goal is parity
+// with that behaviour.
+//
+// Why accepting it is safe here, checked rather than assumed (R125 gate 1
+// enumerated every consumer): the FK reaches only an ESTIMATE. `sel` is a
+// selectivity, and the `rowsBound` it can set has exactly two consumers
+// (cardinality.go, joinrelsize.go), both `rows = min(rows, rowsBound)` clamps;
+// `boundProven` has one, gating whether a default selectivity is substituted.
+// None is a guarantee — nothing allocates from it, elides work, or derives a
+// transform. A violated constraint therefore costs an optimistic estimate,
+// never a wrong answer. That is precisely the risk PG already accepts: an
+// FK-derived selectivity ASSUMES each child row matches exactly one parent,
+// which is the property an unvalidated constraint may violate.
+//
+// The strongest safety point, and the real answer to the old pin: a NOT VALID
+// FK is still ENFORCED against every new row, in goopg as in PG — runtime
+// enforcement gates on `NotEnforced` only (`operators_fk.go:118`, `:170`).
+// So the unchecked set is the pre-existing rows alone, and only until VALIDATE
+// CONSTRAINT. The planner's optimism is bounded by the same finite, shrinking
+// set in both engines; this is not parity overriding safety, it is the same
+// safety.
+//
+// NOT ENFORCED is still ignored — that IS PG's filter — and is pinned by
+// TestCalcJoinrelSizeNotEnforcedFKIgnored below. NOTE the pair is coupled:
+// that pin asserts `got == noFK`, which would also pass if the FK arm broke
+// outright; it is meaningful only because this test independently proves the
+// arm fires (validFK != noFK). Do not delete one without the other.
+func TestCalcJoinrelSizeInvalidFKHonouredLikePG(t *testing.T) {
 	c := catalog.NewInMemory()
 	orders := jsTable(t, c, "orders", []catalog.Column{
 		{Name: "o_orderkey", Type: catalog.Type{Name: "int4"}},
@@ -367,7 +402,44 @@ func TestCalcJoinrelSizeInvalidFKIgnored(t *testing.T) {
 	outer, inner := jrsRels(6000000, 1500000)
 
 	rows, _ := s.calcJoinrelSize(c, outer, inner, []*restrictInfo{jrsEq("l_orderkey", "o_orderkey", noEquivClass)}, nil)
-	wantRows(t, rows, clampRowEst(6000000.0*1500000.0/100000.0), "NOT VALID FK")
+	// The FK-driven answer: child rows, since each child row matches exactly
+	// one parent (divisor = the PARENT's raw count, `fkselec *= 1.0 /
+	// ref_tuples`, costsize.c:5844).
+	wantRows(t, rows, 6000000, "NOT VALID FK is honoured exactly as a validated one")
+	if rows == clampRowEst(6000000.0*1500000.0/100000.0) {
+		t.Fatal("the NOT VALID FK was ignored — this is the pre-R125 behaviour, " +
+			"which diverged from PG (plancat.c gates on conenforced, not convalidated)")
+	}
+}
+
+// TestCalcJoinrelSizeNotEnforcedFKIgnored: NOT ENFORCED is the filter PG
+// actually applies (`if (!cachedfk->conenforced) continue;`, plancat.c:643),
+// so it must still be ignored. This is the half of the old pin that survives.
+func TestCalcJoinrelSizeNotEnforcedFKIgnored(t *testing.T) {
+	c := catalog.NewInMemory()
+	orders := jsTable(t, c, "orders", []catalog.Column{
+		{Name: "o_orderkey", Type: catalog.Type{Name: "int4"}},
+	}, 1500000, catalog.ColumnStats{NDistinct: 100000})
+	lineitem := jsTable(t, c, "lineitem", []catalog.Column{
+		{Name: "l_orderkey", Type: catalog.Type{Name: "int4"}},
+	}, 6000000, catalog.ColumnStats{NDistinct: 100000})
+	lineitem.ForeignKeys = []catalog.ForeignKey{{
+		Name: "lineitem_orderkey_fkey", Columns: []string{"l_orderkey"},
+		RefTable: "orders", RefColumns: []string{"o_orderkey"}, NotEnforced: true,
+	}}
+
+	s, err := newSearchCtx(2, defaultCostParams(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.relInfos = []baseRelInfo{
+		{table: lineitem, baseRows: 6000000},
+		{table: orders, baseRows: 1500000},
+	}
+	outer, inner := jrsRels(6000000, 1500000)
+
+	rows, _ := s.calcJoinrelSize(c, outer, inner, []*restrictInfo{jrsEq("l_orderkey", "o_orderkey", noEquivClass)}, nil)
+	wantRows(t, rows, clampRowEst(6000000.0*1500000.0/100000.0), "NOT ENFORCED FK")
 }
 
 // TestCalcJoinrelSizeClauseConsumedOnce: when BOTH sides can prove a key over

@@ -655,7 +655,37 @@ func (s *searchCtx) keysCovering(cat catalog.Catalog, r int, cols map[string]boo
 	}
 
 	for _, fk := range info.table.ForeignKeys {
-		if fk.NotValid || fk.NotEnforced || !columnsSubset(fk.Columns, cols) {
+		// R125: `NotValid` is deliberately NOT a filter here — PG's planner
+		// does not consult `convalidated`.
+		//
+		// `get_relation_foreign_keys` skips only unenforced constraints
+		// ("skip constraints currently not enforced", plancat.c:642-644), and
+		// `RelationGetFKeyList` (relcache.c:4769-4776) copies `conenforced`
+		// into `ForeignKeyCacheInfo` without ever carrying `convalidated`. So
+		// upstream feeds a NOT VALID foreign key straight to
+		// `get_foreign_key_join_selectivity`, and goopg refusing it was a
+		// straight parity divergence in a function otherwise ported faithfully.
+		//
+		// The omission is DELIBERATE upstream, not an oversight: PG does
+		// filter on `convalidated` where it means something —
+		// `CheckConstraintFetch` skips unvalidated CHECK constraints
+		// (relcache.c:4635) — and pointedly does not in the FK path.
+		//
+		// Is it sound? It is exactly as sound as PG's own use, and for the
+		// same quantitative reason. A NOT VALID FK is still ENFORCED against
+		// every new row — in goopg as in PG, runtime enforcement gates on
+		// `NotEnforced` only (`operators_fk.go:118`, `:170`), never on
+		// `NotValid` — so the unchecked set is just the pre-existing rows,
+		// and only until VALIDATE CONSTRAINT. An FK-derived selectivity
+		// already ASSUMES each child row matches exactly one parent, which is
+		// precisely the property that finite, shrinking set may violate; the
+		// risk PG accepts for `sel` is the same risk, bounded the same way.
+		// The `rowsBound` this can set is likewise only ever a clamp on a row
+		// ESTIMATE (cardinality.go, joinrelsize.go below); no consumer treats
+		// it as a guarantee, allocates from it, or derives a transform from
+		// it, so a violated constraint costs an optimistic estimate and never
+		// a wrong answer. `NotEnforced` still excludes, matching `conenforced`.
+		if fk.NotEnforced || !columnsSubset(fk.Columns, cols) {
 			continue
 		}
 		parent, parentRows, ok := s.fkParentRel(fk, pairs, removed, r)
