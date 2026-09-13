@@ -4627,6 +4627,12 @@ relation COPY witness diverges on `char(n)` padding and numeric output. Stop
 rule applied; it is not a common-data cost oracle. Next: separately scope a
 type-normalized complete relation witness before R108 or cost attribution.
 
+R109 SCOPE READY 2026-09-13 (`r109-q96-normalized-relation-witness/SCOPE.md`):
+derive a DDL-type-constrained canonical full relation witness for the R107
+clusters, with positive and negative normalization controls. No data or
+planner change is authorized. Next: agent review, `git commit -n`/push scope,
+then measurement.
+
 R108 PLANNED — PG hash-tuple sizing comparison, dependent on R107 DONE:
 only after R107 establishes common relation/schema/index inputs and records
 both engines' native statistics, scope and review an opt-in experiment that
