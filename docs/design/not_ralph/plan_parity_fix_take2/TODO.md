@@ -4419,3 +4419,11 @@ walk +1.43; per-row increments agree with PG (0.00353 vs 0.00356).
 Reframed slice (a): audit outerMatchFrac + virtualBuckets geometry;
 (b) further deprioritized. Temp reverted, tree clean. Next: R97+
 slice SCOPE citing STEP1, then implementation.
+
+TIMING SURVEY DONE 2026-09-13 (`r97-timing-survey/REPORT.md`,
+measurement-only, no code change, no review — survey not a design
+doc): TPC-DS SF0.25 all 96 queries timed (3-run medians, values
+96/96 PASS vs oracle); totals goopg 170.2s vs PG 185.1s = 0.9x.
+Worst cliffs: Q61 70x, Q58 26x, Q55 23x, Q88 21x, Q24/Q80 ~20x;
+Q96 0.22–0.30s vs PG 0.044s (~5x, PG-shaped plan). Caveats in
+report (wall-clock vs server secs, shape verdicts not re-taken).
