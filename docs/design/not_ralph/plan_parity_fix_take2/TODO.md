@@ -4807,6 +4807,14 @@ separately scope a measurement-only producer audit of `estimateJoin` inputs
 and required-column/schema construction; no production cost or Datum change
 is authorized by R117.
 
+R118 PLANNED — Q96 lower Join producer audit, dependent on R117 DONE:
+measurement-only, collision-free attribution from R111's two selected lower
+Hash Join occurrences to `estimateJoin` selectivity/cardinality inputs and
+the final schema/layout writer. It must distinguish observed final fields from
+source-level inference, retain full OFFx2/ONx2 TEXT/JSON/value controls, and
+remove diagnostics before reporting. No production cardinality, schema,
+Datum, cost, statistics, Gather, executor, or search change.
+
 TIMING SURVEY DONE 2026-09-13 (`r97-timing-survey/REPORT.md`,
 measurement-only, no code change, no review — survey not a design
 doc): TPC-DS SF0.25 all 96 queries timed (3-run medians, values
