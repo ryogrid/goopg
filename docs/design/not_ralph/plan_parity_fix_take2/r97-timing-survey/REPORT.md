@@ -67,6 +67,28 @@ Stronger still: the SET demonstrably had nothing to fix — zero of
 cases are therefore genuine PG-plan pathology on this data, not a
 measurement artefact of a missed SET.
 
+## TPC-H SF1 timing (2026-09-13)
+
+GUC fairness pre-checked: PG `:65432` sets shared_buffers=2048MB,
+work_mem=64MB, effective_cache_size=2GB, parallel 4/8; goopg clone
+sets shared_buffers=2048MB, work_mem=64MB — aligned (no TPC-DS-style
+asymmetry). Dataset: 7/8 tables exact-match; lineitem PG 5998835 vs
+goopg 6001255 (Δ2420, 0.04%, same key range 1..6000000 — PG-side
+past DML or load variance, immaterial to timing). Queries are the
+HammerDB-verbatim texts (`internal/testutil/tpch`, same source as
+the values gate); Q15 skipped (view variant needs special
+handling). Method: private goopg clone `:5563` + live PG, 3 runs
+each, client wall-clock, TIMEOUT 900 — zero timeouts, all 21 ran.
+
+- Totals: **goopg 68.8s vs PG 16.8s = 4.1x**. No aggregate-parity
+  illusion here: PG is faster on 19/21.
+- goopg-faster (2): Q17 0.52s vs 1.70s (3.3x), Q20 0.16s vs
+  0.23s (1.4x).
+- Worst cliffs: Q19 25x (1.78/0.07), Q21 20x (12.49/0.61),
+  Q4 12x (1.62/0.14), Q9 9x (5.60/0.60), Q7/Q8 ~8x, Q13 5x
+  (8.76/1.70), Q18 3x (21.04/6.42 — biggest absolute gap).
+  Both servers returned to found state (stopped) after the run.
+
 ## Dataset + shared_buffers audit (2026-09-13)
 
 - Row counts match exactly on all 10 probed tables (PG `:65438`
