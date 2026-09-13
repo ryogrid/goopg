@@ -238,12 +238,17 @@ func coerceTextLikeDatum(t catalog.Type, d Datum) (string, error) {
 	if tname == "varchar" || tname == "character varying" {
 		if len(t.Args) > 0 {
 			n := int(t.Args[0])
-			stripped := strings.TrimRight(s, " ")
-			if utf8.RuneCountInString(stripped) > n {
-				return "", &ExecError{Code: "22001",
-					Message: fmt.Sprintf("value too long for type character varying(%d)", n)}
+			if utf8.RuneCountInString(s) > n {
+				// varchar_input removes excess trailing spaces only when the
+				// assignment value exceeds typmod. In-range trailing spaces are
+				// data and must survive COPY/INSERT/UPDATE unchanged.
+				stripped := strings.TrimRight(s, " ")
+				if utf8.RuneCountInString(stripped) > n {
+					return "", &ExecError{Code: "22001",
+						Message: fmt.Sprintf("value too long for type character varying(%d)", n)}
+				}
+				s = stripped
 			}
-			s = stripped
 		}
 	} else if tname == "char" || tname == "bpchar" || tname == "character" {
 		// A typmod-less type carries NO length limit upstream: bpchar_input's

@@ -71,7 +71,7 @@ func TestEncodeValuePGCharAlignmentMatches(t *testing.T) {
 	}
 }
 
-func TestEncodeValuePGVarcharCoercesIntAndTrimsSpaces(t *testing.T) {
+func TestEncodeValuePGVarcharCoercesIntAndTrimsOnlyExcessSpaces(t *testing.T) {
 	typ := catalog.Type{Name: "varchar", Args: []int64{1}}
 	out, err := encodeValuePG(typ, NewIntDatum(2))
 	if err != nil {
@@ -81,12 +81,29 @@ func TestEncodeValuePGVarcharCoercesIntAndTrimsSpaces(t *testing.T) {
 		t.Fatalf("encoded bytes = %v, want %v", out, want)
 	}
 
-	out, err = encodeValuePG(typ, NewStringDatum("c     "))
+	out, err = encodeValuePG(typ, NewStringDatum("c"))
 	if err != nil {
-		t.Fatalf("unexpected trim-space error: %v", err)
+		t.Fatalf("unexpected in-range error: %v", err)
 	}
 	if want := varlenaTextBytes("c"); !bytes.Equal(out, want) {
-		t.Fatalf("trimmed bytes = %v, want %v", out, want)
+		t.Fatalf("in-range bytes = %v, want %v", out, want)
+	}
+
+	typ = catalog.Type{Name: "varchar", Args: []int64{3}}
+	out, err = encodeValuePG(typ, NewStringDatum("x "))
+	if err != nil {
+		t.Fatalf("unexpected in-range trailing-space error: %v", err)
+	}
+	if want := varlenaTextBytes("x "); !bytes.Equal(out, want) {
+		t.Fatalf("in-range trailing-space bytes = %v, want %v", out, want)
+	}
+
+	out, err = encodeValuePG(typ, NewStringDatum("abc   "))
+	if err != nil {
+		t.Fatalf("unexpected excess-space error: %v", err)
+	}
+	if want := varlenaTextBytes("abc"); !bytes.Equal(out, want) {
+		t.Fatalf("excess-space bytes = %v, want %v", out, want)
 	}
 }
 

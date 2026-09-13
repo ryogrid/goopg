@@ -4650,6 +4650,12 @@ assignment/COPY overlength values may drop only trailing spaces, while explicit
 overlength `::varchar(n)` casts retain PG arbitrary truncation. Next: `git
 commit -n`/push scope, then implement.
 
+R110 DONE 2026-09-13 (`r110-varchar-trailing-space-fidelity/REPORT.md`):
+in-range varchar whitespace now survives assignment/COPY storage; PG's
+assignment and explicit-cast typmod boundaries are preserved. A fresh R109
+store witness normalizes to PG exactly. Next: rescope/rerun R107 common-data
+evidence before R108 or any cost attribution.
+
 R108 PLANNED — PG hash-tuple sizing comparison, dependent on R107 DONE:
 only after R107 establishes common relation/schema/index inputs and records
 both engines' native statistics, scope and review an opt-in experiment that
