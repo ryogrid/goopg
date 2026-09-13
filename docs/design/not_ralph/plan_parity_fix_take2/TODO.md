@@ -5141,3 +5141,58 @@ SEPARATELY from hash-geometry movement (`sortPathFor*` prices a merge
 input sort from the subpath triple, and with Slice B that subpath can be
 a JOIN — a join-METHOD lever, not a rounding difference).
 Next: implement, then gates.
+
+R122 SLICE B DONE 2026-09-14 (`r122-narrow-join-propagation/REPORT.md`,
+review **BLOCK -> both discharged by measurement**):
+**THE FIRST PARITY IMPROVEMENT OF THE SESSION.** TPC-H `join-method`
+10->9 and `scan-type` 9->8, match holds 6, nothing regressed, values
+byte-identical. Flag still default-off pending Slice D.
+Cut: `narrowJoinWidths` called from `addPath`/`addPartialPath` — the
+single funnel — publishing `NCols/AvgVarBytes/OutputWidth = outer+inner`,
+outer-only for SEMI/ANTI, with 5 decline rules (un-narrowed child;
+all-three-or-none; idempotent; **index-only child**; nil-safe) and an
+explicit Kind WHITELIST (because `parser.JoinInner` is the zero value
+and `PathSetOp` has two children). 25 pins.
+**Q3 is the win and it validates the whole R120->R121->R122 thesis.**
+It shed join-method AND scan-type, going 5 categories -> 3, and its join
+subtree is now **shape-identical to PG's**: `Hash Join(l_orderkey =
+o_orderkey)` over `Seq Scan on lineitem`, replacing a Nested Loop over
+an index probe. Its residual `join-order` entries are a POSITIONAL
+CASCADE from the extra Sort under GroupAggregate, not a real divergence
+— Q3 is now a pure aggregation-strategy case (Slice C / K12).
+**Mechanism MEASURED, not inferred** (SCOPE gate 7, dropped from the
+first draft and restored on review): `hashsize.Choose` geometry on Q3 —
+the 141,795-row build goes entry **1052 B -> 321 B**, taking **nbatch
+2 -> 1, i.e. SPILLING -> FITS**. That is why the hash join became
+affordable. **It also REFUTES R121's inferred story** that "nothing sits
+near a batch/spill boundary": things do; R121 just never reached a join
+because a join path published its full width. Artefact retained
+(`r122-geometry.txt`).
+**TPC-DS is live but parity-neutral** — and the first draft wrongly
+called it flat. 3 plans change STRUCTURE (Q6, Q64, Q75) + 1 cost-only
+(Q95); no category moves, no query regresses. NOTE Q36/Q70/Q86 differ
+only by the psql temp-file PID inside their ERROR text — the documented
+**K18 trap** resurfacing because `capture-tpcds.sh` uses `$$` (a review
+initially miscounted these as structural). Fix the script.
+**Census (P5, the round's deliverable):** TPC-H mixed-currency pairs
+**3/4364 = 0.07%** (so its category movement is real signal); TPC-DS
+**42,679/124,616 = 34.2%**. Per the SCOPE's pre-registered rule that
+means a TPC-DS category move could not have been ATTRIBUTED — but the
+measured null is still a result, not a void. Caveat the census cannot
+escape: the decline arms are **order-dependent** and
+`neededColumnNames` declines PER STATEMENT, so arm (a) collector-declined
+(144/176) MASKS arm (c) nil-ColVarBytes (32) — this round cannot say the
+SCOPE's CTE/subquery story was wrong, only that it fires one arm earlier.
+**Worth-finishing question ANSWERED (SCOPE required it, no third
+deferral):** YES for TPC-H on evidence. NOT PROVEN for TPC-DS, with a
+visible ceiling — its dominant categories are join-order (90) and
+parallelism (86), which this chain does not touch, so the realistic
+upside is a subset of join-method (62) + scan-type (57) AFTER Slice D.
+And the chain reaches no MATCH alone: even Q3 still needs Slice C.
+R121's dead-code gate is **discharged** — Slice B landed and R121 is
+now load-bearing.
+Next: **Slice D — reduce collector declines** (`neededColumnNames`
+declines the WHOLE statement on any unenumerable shape; making it
+per-relation would convert a large share of the 42,679 mixed pairs into
+uniform ones), re-measure the census per shape first. Then Slice C
+(aggregate coordinate), which still holds R120's promote-or-delete.

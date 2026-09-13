@@ -3,6 +3,8 @@ package optimizer
 import (
 	"os"
 	"strings"
+
+	"github.com/goopg/goopg/internal/parser"
 )
 
 // R121 Slice A — narrow the planner's COST inputs to the columns the statement
@@ -192,6 +194,85 @@ func (s *searchCtx) narrowBaseRelCostWidths() {
 			narrowed.applyTo(p)
 		}
 	}
+}
+
+// narrowJoinWidths is R122 Slice B: a join path publishes the SUM of its
+// children's narrowed widths, so the narrowing survives past the first join.
+//
+// Slice A narrowed base-rel scans and their single-child wrappers and was
+// parity-neutral for precisely this reason: a join path never set its own
+// triple, so `pathNCols` fell back to `relNCols(joinrel)` — the full sum of
+// both inputs' WHOLE schemas (joinsearchlevel.go) — and only first-level joins
+// ever saw a narrowed child.
+//
+// Called from `addPath`/`addPartialPath`, the single funnel every join path
+// passes through. The TIMING looks wrong and is not: the constructor has
+// already computed this path's own cost from its CHILDREN's widths before it
+// calls addPath, so stamping here cannot affect that cost — which is correct,
+// because the triple stamped here is consumed only when this path becomes a
+// child one level up.
+func narrowJoinWidths(p *Path) {
+	if p == nil || !narrowCostInputsEnabled() {
+		return
+	}
+	// Rule 3: idempotent — never overwrite an existing stamp.
+	if p.NCols > 0 {
+		return
+	}
+	// An explicit WHITELIST, never "has two children" and never "has a
+	// Jointype". `parser.JoinInner` is the ZERO VALUE, and `PathSetOp` has
+	// exactly two children, so either of those tests would read a set-op as an
+	// inner join and sum two widths that were never joined.
+	switch p.Kind {
+	case PathHashJoin, PathMergeJoin, PathNestLoop:
+	default:
+		return
+	}
+	if len(p.Children) != 2 {
+		return
+	}
+	outer, inner := p.Children[0], p.Children[1]
+	if outer == nil || inner == nil {
+		return
+	}
+
+	// Rule 4: an index-only child's triple is NOT this round's narrowing.
+	// pathindexonly.go writes NCols/AvgVarBytes/OutputWidth unconditionally,
+	// independent of this flag, so treating `NCols > 0` as "we narrowed it"
+	// would launder an IOS triple into a join sum on a rel that declined —
+	// while the NLI path for that same joinrel (inner from
+	// CheapestParameterized, NCols == 0) declined. Two paths of one joinrel in
+	// different currencies is exactly the bias this design exists to prevent;
+	// it is R121's wrapper leak one level up.
+	if outer.IndexOnly || inner.IndexOnly {
+		return
+	}
+
+	// Rule 1: both sides or neither. A sum that is narrow on one side and full
+	// on the other is not a currency.
+	if outer.NCols <= 0 || inner.NCols <= 0 {
+		return
+	}
+
+	// SEMI/ANTI publish the LHS only — the same rule the rel level applies via
+	// `joinPublishesInner`. Keyed on Jointype because the SpecialJoinInfo is
+	// not in scope at the constructors. JoinRight publishes BOTH sides;
+	// JoinFull never produces a path today, but is deliberately in the
+	// publishes-both arm so a future FULL executor cannot silently inherit the
+	// SEMI branch by falling through.
+	if p.Jointype == parser.JoinSemi || p.Jointype == parser.JoinAnti {
+		p.NCols = pathNCols(outer)
+		p.AvgVarBytes = pathAvgVarBytes(outer)
+		p.OutputWidth = pathWidth(outer)
+		return
+	}
+
+	// Rule 2: all three together. Hash cost reads pathWidth AND
+	// pathNCols/pathAvgVarBytes off the same path, so a triple narrowed in one
+	// currency and full in the other reproduces R120's defect one level up.
+	p.NCols = pathNCols(outer) + pathNCols(inner)
+	p.AvgVarBytes = pathAvgVarBytes(outer) + pathAvgVarBytes(inner)
+	p.OutputWidth = pathWidth(outer) + pathWidth(inner)
 }
 
 // inheritNarrowedWidths copies a single-child wrapper's child triple upward.

@@ -345,3 +345,271 @@ func TestGetMemoizePathDeclinesIndexOnlyInner(t *testing.T) {
 			"getMemoizePath's pathNCols swap is no longer inert with the flag off")
 	}
 }
+
+// ---- R122 Slice B: join-path propagation ----
+
+func njPath(kind PathKind, jt parser.JoinType, outer, inner *Path) *Path {
+	return &Path{Kind: kind, Jointype: jt, Children: []*Path{outer, inner}}
+}
+
+func njNarrowed(n int, avg float64, w int) *Path {
+	return &Path{NCols: n, AvgVarBytes: avg, OutputWidth: w}
+}
+
+func TestNarrowJoinWidthsSumsChildren(t *testing.T) {
+	defer setNarrowCostInputsForTest(true)()
+	for _, kind := range []PathKind{PathHashJoin, PathMergeJoin, PathNestLoop} {
+		p := njPath(kind, parser.JoinInner, njNarrowed(3, 10, 40), njNarrowed(2, 5, 24))
+		narrowJoinWidths(p)
+		if p.NCols != 5 || p.AvgVarBytes != 15 || p.OutputWidth != 64 {
+			t.Errorf("kind %v: want (5,15,64), got (%d,%v,%d)", kind, p.NCols, p.AvgVarBytes, p.OutputWidth)
+		}
+	}
+}
+
+// SEMI/ANTI publish the LHS only — the same rule joinPublishesInner applies at
+// the rel level. JoinRight publishes BOTH, and JoinFull is deliberately in the
+// publishes-both arm so a future FULL executor cannot inherit the SEMI branch
+// by falling through.
+func TestNarrowJoinWidthsSemiAntiTakeOuterOnly(t *testing.T) {
+	defer setNarrowCostInputsForTest(true)()
+	for _, jt := range []parser.JoinType{parser.JoinSemi, parser.JoinAnti} {
+		p := njPath(PathHashJoin, jt, njNarrowed(3, 10, 40), njNarrowed(2, 5, 24))
+		narrowJoinWidths(p)
+		if p.NCols != 3 || p.AvgVarBytes != 10 || p.OutputWidth != 40 {
+			t.Errorf("jointype %v must publish the LHS only, got (%d,%v,%d)",
+				jt, p.NCols, p.AvgVarBytes, p.OutputWidth)
+		}
+	}
+	for _, jt := range []parser.JoinType{parser.JoinLeft, parser.JoinRight, parser.JoinFull} {
+		p := njPath(PathHashJoin, jt, njNarrowed(3, 10, 40), njNarrowed(2, 5, 24))
+		narrowJoinWidths(p)
+		if p.NCols != 5 {
+			t.Errorf("jointype %v must publish BOTH sides, got NCols=%d", jt, p.NCols)
+		}
+	}
+}
+
+// Rule 1: a sum that is narrow on one side and full on the other is not a
+// currency.
+func TestNarrowJoinWidthsDeclinesOnUnnarrowedChild(t *testing.T) {
+	defer setNarrowCostInputsForTest(true)()
+	for name, p := range map[string]*Path{
+		"outer un-narrowed": njPath(PathHashJoin, parser.JoinInner, &Path{}, njNarrowed(2, 5, 24)),
+		"inner un-narrowed": njPath(PathHashJoin, parser.JoinInner, njNarrowed(3, 10, 40), &Path{}),
+		"both un-narrowed":  njPath(PathHashJoin, parser.JoinInner, &Path{}, &Path{}),
+	} {
+		narrowJoinWidths(p)
+		if p.NCols != 0 || p.AvgVarBytes != 0 || p.OutputWidth != 0 {
+			t.Errorf("%s: must decline, got (%d,%v,%d)", name, p.NCols, p.AvgVarBytes, p.OutputWidth)
+		}
+	}
+}
+
+// Rule 4 — the R121 leak one level up. Index-only paths carry the triple
+// UNCONDITIONALLY, so NCols>0 is not a proxy for "this round narrowed it".
+func TestNarrowJoinWidthsDeclinesOnIndexOnlyChild(t *testing.T) {
+	defer setNarrowCostInputsForTest(true)()
+	ios := &Path{IndexOnly: true, NCols: 2, AvgVarBytes: 5, OutputWidth: 24}
+	for name, p := range map[string]*Path{
+		"index-only outer": njPath(PathHashJoin, parser.JoinInner, ios, njNarrowed(3, 10, 40)),
+		"index-only inner": njPath(PathHashJoin, parser.JoinInner, njNarrowed(3, 10, 40), ios),
+	} {
+		narrowJoinWidths(p)
+		if p.NCols != 0 {
+			t.Errorf("%s: an index-only child must not be laundered into a join sum, got NCols=%d",
+				name, p.NCols)
+		}
+	}
+}
+
+// The Kind test must be an explicit whitelist: parser.JoinInner is the ZERO
+// value and PathSetOp has exactly two children, so "has 2 children" or "has a
+// Jointype" would both read a set-op as an inner join.
+func TestNarrowJoinWidthsRefusesNonJoinKinds(t *testing.T) {
+	defer setNarrowCostInputsForTest(true)()
+	for _, kind := range []PathKind{PathSetOp, PathGather, PathSort, PathMemoize, PathSeqScan} {
+		p := &Path{Kind: kind, Children: []*Path{njNarrowed(3, 10, 40), njNarrowed(2, 5, 24)}}
+		narrowJoinWidths(p)
+		if p.NCols != 0 {
+			t.Errorf("kind %v is not a join and must not be summed, got NCols=%d", kind, p.NCols)
+		}
+	}
+}
+
+func TestNarrowJoinWidthsIsIdempotentAndNilSafeAndFlagGated(t *testing.T) {
+	restore := setNarrowCostInputsForTest(true)
+	// Rule 3: never overwrite an existing stamp.
+	p := njPath(PathHashJoin, parser.JoinInner, njNarrowed(3, 10, 40), njNarrowed(2, 5, 24))
+	p.NCols, p.AvgVarBytes, p.OutputWidth = 99, 99, 99
+	narrowJoinWidths(p)
+	if p.NCols != 99 {
+		t.Errorf("must not overwrite an existing stamp, got %d", p.NCols)
+	}
+	narrowJoinWidths(nil) // must not panic
+	restore()
+
+	defer setNarrowCostInputsForTest(false)()
+	off := njPath(PathHashJoin, parser.JoinInner, njNarrowed(3, 10, 40), njNarrowed(2, 5, 24))
+	narrowJoinWidths(off)
+	if off.NCols != 0 {
+		t.Errorf("flag off must stamp nothing, got %d", off.NCols)
+	}
+}
+
+// OutputWidth > 0 whenever NCols > 0, on every path this round writes. Both
+// producers route through tupleWidth, which floors at 1 — pinned so a future
+// change to that floor cannot silently let a relation width be summed into a
+// narrowed one.
+func TestNarrowedTripleOutputWidthIsAlwaysPositive(t *testing.T) {
+	defer setNarrowCostInputsForTest(true)()
+	rel := ncRel([]string{"a", "b"}, ncNeeded("a"), true, map[string]float64{"a": 0, "b": 100})
+	got := relNarrowedWidths(rel)
+	if !got.ok {
+		t.Fatal("expected narrowing")
+	}
+	if got.ncols > 0 && got.outputWidth <= 0 {
+		t.Fatalf("NCols>0 must imply OutputWidth>0, got ncols=%d width=%d", got.ncols, got.outputWidth)
+	}
+	j := njPath(PathHashJoin, parser.JoinInner, njNarrowed(1, 0, 1), njNarrowed(1, 0, 1))
+	narrowJoinWidths(j)
+	if j.NCols > 0 && j.OutputWidth <= 0 {
+		t.Fatalf("join sum: NCols>0 must imply OutputWidth>0, got %+v", j)
+	}
+}
+
+// Slice B must never write a RelOptInfo field. The sum is computed from the
+// children, and the temptation to "also refresh joinrel.NCols" is one line
+// away — but the rel figures are buildAvgVarBytes's over-charge decline for
+// the EXECUTOR's hash entry, and rels are singletons shared across candidates.
+func TestNarrowJoinWidthsWritesNoRelField(t *testing.T) {
+	defer setNarrowCostInputsForTest(true)()
+	rel := newRelOptInfo(3, 1000, 32)
+	rel.NCols, rel.AvgVarBytes = 37, 2080
+	rel.ColVarBytes = map[string]float64{"a": 1}
+	p := njPath(PathHashJoin, parser.JoinInner, njNarrowed(3, 10, 40), njNarrowed(2, 5, 24))
+	p.Rel = rel
+	narrowJoinWidths(p)
+	if rel.NCols != 37 || rel.AvgVarBytes != 2080 || len(rel.ColVarBytes) != 1 {
+		t.Fatalf("no RelOptInfo field may be written: %+v", rel)
+	}
+	if p.NCols != 5 {
+		t.Fatalf("the path itself should still be stamped, got %d", p.NCols)
+	}
+}
+
+// TestAddPathStampsJoinWidths pins the WIRING: addPath and addPartialPath must
+// call narrowJoinWidths. Deleting either call makes this fail.
+//
+// Why this rather than a query-level A/B: Slice B shares Slice A's flag, and
+// Slice A alone already moves every join cost in a multi-table plan, so an
+// ON/OFF comparison over a planned statement passes whether or not Slice B is
+// wired — it cannot isolate this slice. (Verified: removing the addPath call
+// left such a test green.) The reachability argument is instead: every join
+// path is created inside an addPath/addPartialPath call — Pathlist and
+// PartialPathlist are written at exactly those two sites and nowhere else —
+// so pinning the funnel pins every producer, including future ones.
+func TestAddPathStampsJoinWidths(t *testing.T) {
+	defer setNarrowCostInputsForTest(true)()
+
+	serial := newRelOptInfo(3, 100, 32)
+	p := njPath(PathHashJoin, parser.JoinInner, njNarrowed(3, 10, 40), njNarrowed(2, 5, 24))
+	p.Rel = serial
+	addPath(serial, p, "test.slice-b-wiring")
+	if p.NCols != 5 || p.AvgVarBytes != 15 || p.OutputWidth != 64 {
+		t.Errorf("addPath must stamp a join path's triple, got (%d,%v,%d)",
+			p.NCols, p.AvgVarBytes, p.OutputWidth)
+	}
+
+	partial := newRelOptInfo(3, 100, 32)
+	partial.ConsiderParallel = true
+	q := njPath(PathMergeJoin, parser.JoinInner, njNarrowed(3, 10, 40), njNarrowed(2, 5, 24))
+	q.Rel, q.ParallelSafe = partial, true
+	addPartialPath(partial, q, "test.slice-b-wiring")
+	if q.NCols != 5 {
+		t.Errorf("addPartialPath must stamp a join path's triple, got NCols=%d", q.NCols)
+	}
+}
+
+// TestNarrowJoinWidthsNarrowsANonTopJoinInALiveSearch is R122's P4 turned into
+// a PERMANENT guard, replacing the temporary dump the round used to measure it.
+//
+// It runs the real search (buildInitialRels -> base producers -> joinSearch,
+// the same protocol searchOneProblem uses) over THREE relations and asserts
+// that a level-2 join path — a NON-TOP join, i.e. one whose triple actually
+// feeds a parent's cost — publishes a narrowed NCols strictly below the
+// joinrel's own full width.
+//
+// Non-top matters: the top join's triple has no consumer, so asserting there
+// would prove nothing.
+func TestNarrowJoinWidthsNarrowsANonTopJoinInALiveSearch(t *testing.T) {
+	defer setNarrowCostInputsForTest(true)()
+	names := []string{"a", "b", "c"}
+	prob := cpBigProblem(names)
+
+	// Give every rel per-column stats so ColVarBytes is populated (otherwise
+	// every rel declines and the search narrows nothing), and a needed-column
+	// set that keeps strictly fewer columns than the leaves emit.
+	needed := map[string]bool{}
+	for i := range names {
+		tbl := prob.relInfos[i].table
+		colStats := make([]catalog.ColumnStats, len(tbl.Columns))
+		for c := range tbl.Columns {
+			colStats[c] = catalog.ColumnStats{AvgWidth: 8}
+		}
+		tbl.Stats.Columns = colStats
+		// Keep only the FIRST column of each relation (leaves emit rfjWidth=2),
+		// so narrowing genuinely reduces.
+		needed[tbl.Columns[0].Name] = true
+	}
+	prob.neededCols, prob.neededColsKnown = needed, true
+
+	// The real protocol, in searchOneProblem's order. Inlined rather than via
+	// cpSearch because that helper is a hand-rolled replica that predates the
+	// R121 sweep and so would narrow nothing — worth knowing: it has drifted
+	// from production.
+	sc, err := buildInitialRels(prob.bindings, prob.scans, prob.relInfos, prob.cp, 0, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sc.clauses = buildRestrictInfos(prob.conjuncts, 0, prob.cumOffsets)
+	sc.neededCols, sc.neededColsKnown = prob.neededCols, prob.neededColsKnown
+	sc.stampNeededColsOnRels()
+	sc.setBaseRelConsiderParallel(prob.cat)
+	sc.addBaseRelPartialPaths()
+	sc.addBaseRelIndexPaths(prob.cat)
+	sc.narrowBaseRelCostWidths() // R121 Slice A
+	if _, err := sc.joinSearch(sc.clauses, newJoinRelBuilder(sc, prob.cat)); err != nil {
+		t.Fatal(err)
+	}
+	s := sc
+
+	// Level 2 = joins of exactly two base rels: non-top for a 3-rel problem.
+	if len(s.joinrels) < 3 {
+		t.Fatalf("expected at least 3 levels, got %d", len(s.joinrels))
+	}
+	narrowed := 0
+	for _, rel := range s.joinrels[2] {
+		if rel == nil {
+			continue
+		}
+		full := relNCols(rel)
+		for _, p := range rel.Pathlist {
+			if p == nil || p.NCols == 0 {
+				continue
+			}
+			if p.NCols >= full {
+				t.Errorf("a narrowed non-top join must publish fewer columns than its "+
+					"joinrel's full width: NCols=%d full=%d", p.NCols, full)
+			}
+			if p.OutputWidth <= 0 {
+				t.Errorf("NCols>0 must imply OutputWidth>0, got %+v", p)
+			}
+			narrowed++
+		}
+	}
+	if narrowed == 0 {
+		t.Fatal("no non-top join path was narrowed — Slice B did not reach the " +
+			"live search (this is P4, and it is the pin that replaces the dump)")
+	}
+}

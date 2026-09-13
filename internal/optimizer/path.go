@@ -928,6 +928,13 @@ func comparePaths(a, b *Path) pathRel {
 // duplicates do not accumulate — matching PG's practical behaviour of keeping the
 // first of two indistinguishable paths.
 func addPath(rel *RelOptInfo, newPath *Path, producer string) {
+	// R122 Slice B: a join path publishes the sum of its children's narrowed
+	// widths. Stamped here, in the single funnel every join path passes
+	// through, rather than in each of the seven constructors. Its own cost was
+	// computed from its children before this call, so this cannot change it —
+	// the triple is for the level above. Nil-safe (unlike addPartialPath,
+	// addPath has no nil guard of its own).
+	narrowJoinWidths(newPath)
 	before := len(rel.Pathlist)
 	rel.Pathlist = addToPathlist(rel.Pathlist, newPath)
 	// A candidate is accepted when it is present in the resulting list. Length
@@ -978,6 +985,8 @@ func addPartialPath(rel *RelOptInfo, newPath *Path, producer string) {
 	if newPath == nil || !newPath.ParallelSafe || !rel.ConsiderParallel {
 		return
 	}
+	// R122 Slice B — see addPath.
+	narrowJoinWidths(newPath)
 	rel.PartialPathlist = addToPartialPathlist(rel.PartialPathlist, newPath)
 	verdict := verdictDominated
 	for _, p := range rel.PartialPathlist {
