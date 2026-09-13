@@ -4591,6 +4591,18 @@ advantage versus PG18.3's 176.16. This is cost attribution input only, not
 natural-election evidence. Next: separately scope an attribution that can
 explain the forced-margin difference before considering any planner change.
 
+R106 SCOPE READY 2026-09-13 (`r106-q96-forced-margin-attribution/SCOPE.md`):
+compare the two immutable forced forms' observed PG/Goopg terms and an opt-in
+repeatable Goopg trace, then audit only reached cost/selectivity paths. No
+code or natural-election conclusion is authorized. Next: agent review,
+`git commit -n`/push scope, then measurement.
+
+R106 SCOPE REVIEWED 2026-09-13 (APPROVE after three BLOCK corrections):
+trace-on EXPLAIN must equal the R105 trace-off hash; all four joins require
+separate form/level ledger rows; and each trace artifact must be
+form/run-delimited and hashed. Next: `git commit -n`/push scope, then
+measurement.
+
 TIMING SURVEY DONE 2026-09-13 (`r97-timing-survey/REPORT.md`,
 measurement-only, no code change, no review — survey not a design
 doc): TPC-DS SF0.25 all 96 queries timed (3-run medians, values
