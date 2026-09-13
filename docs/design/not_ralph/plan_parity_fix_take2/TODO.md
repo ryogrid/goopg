@@ -4552,6 +4552,20 @@ source semantics. Stop rule applied and all code reverted. Next: separately
 scope durable grouped-source-to-output binding across LATERAL re-resolution;
 do not ship a Q96-only partial map or change costs.
 
+R104 SCOPE READY 2026-09-13
+(`r104-grouped-join-using-lateral-output/SCOPE.md`): preserve the unaliased
+grouped JOIN's source-to-output map, including USING's qualified/merged/
+ambiguous rules, through LATERAL child planning and re-resolution. R101 may
+resume only after exact semantic controls and values pass; no cost/election
+change is authorized. Next: agent review, revise if needed, `git commit -n`/
+push scope, then implement.
+
+R104 SCOPE REVIEWED 2026-09-13 (APPROVE after one BLOCK correction): report
+must preserve full reproducible PG18.3 and Goopg probes, binary/version,
+values, and SQLSTATEs. Both qualified USING names map to one merged physical
+slot, asserted in later ON and LATERAL contexts. Next: commit -n/push scope,
+then implement without changing layout or generic visibility.
+
 TIMING SURVEY DONE 2026-09-13 (`r97-timing-survey/REPORT.md`,
 measurement-only, no code change, no review — survey not a design
 doc): TPC-DS SF0.25 all 96 queries timed (3-run medians, values
