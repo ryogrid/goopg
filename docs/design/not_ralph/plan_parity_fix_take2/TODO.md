@@ -6318,3 +6318,104 @@ on Q9 (step-d recon), cost-input narrowing (R128 — real, +2 categories,
 no flip), and the bucket charge (inert, this recon). **The frontier is
 unchanged: Q4 and Q9 both block on projection pushdown / DatumBytes,
 which does not exist.**
+
+## R130 — WITHDRAWN at rev 3; the ground truth inverts the question
+
+Scope: `r130-q9-joinorder-remeasure/SCOPE.md`. **Measurement only**, R53 /
+R68 precedent; no planner, executor or costing change.
+
+**Why now: the last measurement is 5.7x stale.** Q9 is TPC-H's closest
+non-match — the ONLY query diverging on a single category
+(`join-order`); Q4 is next at two. R70 Step-A (2026-09-11) priced its
+hash-vs-NLI contest at **543,226.39** on a 41-col/461-varB build.
+Measured on the committed post-R128 capture, Q9 is now **94,913** and
+**NLI won throughout** — the orientation R70 priced is gone. PG's Q9 is
+139,669, so **goopg is now CHEAPER than PG on its own cost scale**, a
+different regime from the one every prior Q9 round reasoned in.
+
+**Both routes R70 pointed at are closed or unbuilt — checked, not
+assumed:**
+- **DatumBytes is not merely unbuilt, it is DECLINED.**
+  `unsafe.Sizeof(executor.Datum)` measures **48 bytes** today, so
+  `hashsize.DatumBytes = 48` is CORRECT, not a stale constant (I probed
+  it). And `minimize_datum/README.md` opens **"Status: NOT APPROVED TO
+  START"** — take3 declined `Datum` re-layout below 48 B, and the new row
+  representation has **"no stated re-proposal path at all"**.
+- **Projection pushdown does not exist** (R70: "no such machinery
+  exists — needs its own feature round"), corroborated by
+  `goopg_optimizer_no_attr_needed_no_ios_path`.
+
+So the two routes are one closed at project level and one unbuilt, while
+the thing R70 measured moved 5.7x. Re-measuring is the only action that
+distinguishes "still blocked on widths" from "the regime changed" — and
+that distinction decides whether the projection-pushdown programme is
+worth its (large) cost.
+
+**Correction carried:** M0126 does NOT cover Q9's current divergence. It
+closed `GOOPG_COST_DRIVEN_JOINORDER` MHJ *fusion*, a default-off flag
+whose node was deleted by M0127-P6.2 (`estimateMultiHashJoin` gone).
+Q9's `join-order` divergence today is in the DEFAULT planner. R127's
+scope was withdrawn partly for mis-citing this.
+
+Predictions: P1 locate the divergent level with both candidates' costs
+and the margin; P2 say explicitly whether it is SIZING or PRICING (R53's
+question); P3 answer **with a number** whether widths still dominate,
+rather than inheriting R70's cliff (avgVar≈48, measured before narrowing
+became the default); P4 instrument inert on >=4 queries. **No prediction
+that Q9 moves, and no code change** — a Step-0 that promises a fix is the
+failure R53/R68 were written to avoid.
+
+### R130 outcome — WITHDRAWN, and the finding is worth more than the round
+
+Three revisions, three blocks, and the third block's binding condition
+settled it. Writeup:
+`r130-q9-joinorder-remeasure/GROUND-TRUTH-INVERTS-THE-QUESTION.md`.
+
+**Q9's actual output is 175 rows** (`r128-.../sf1-values-{ON,OFF}.txt`,
+identical both arms). Against the estimates everyone has been reasoning
+about:
+
+| | estimate | vs actual 175 |
+|---|---|---|
+| goopg, no FKs | 122 | **1.4x low** |
+| goopg, current default | 97 | 1.8x low |
+| goopg, 8 FKs | 5,000 | 28.6x HIGH |
+| **PG 18.3** | **60,125** | **344x HIGH** |
+
+**"A more accurate Q9 cardinality produces a less PG-like plan" is
+FALSE.** The FK arm moved the estimate from 1.4x low to 28.6x high — 20x
+FURTHER from truth. A worse estimate produced a worse plan; there is no
+paradox. R126's recon said "41x closer to PG" and rev 3 read that as "41x
+more accurate". **Closer to PG is not more accurate when PG is 344x out.**
+Same subterm-vs-total family as rev 1's error: an estimate compared to
+another estimate instead of to ground truth. (R125's "ground truth
+318,748" is a DIFFERENT node — the contested join, not the top node.)
+
+**The reframing, which is bigger than Q9:** on this query goopg's
+estimator is dramatically BETTER than PG's (1.4x vs 344x). So Q9's
+join-order divergence is partly goopg estimating *well* where PG
+estimates catastrophically, and correctly choosing differently.
+**Matching PG's plan on Q9 may require reproducing a 344x PG estimation
+error.** The goal accepts slower plans; it says nothing about adopting
+PG's mistakes. That is a question for the goal's owner, recorded not
+resolved.
+
+**Three process rules this round earned:**
+1. **Read the whole document.** Rev 2 quoted `TODO_ALL.md:2837` and
+   missed `:2895`, which refutes it 58 lines below — these trackers
+   self-correct in place.
+2. **`git log -S` the mechanism before scoping a cut from a dated
+   finding.** Rev 2's cut had landed 642 commits earlier (`2e15b8ca3`),
+   whose message says "AND IT BUYS NOTHING" and whose file carries a
+   comment headed "WHAT THIS DOES NOT BUY".
+3. **Never compare an estimate to another estimate.** State the actual.
+   Three documents here reasoned about goopg-vs-PG estimate gaps without
+   one.
+
+Also carried from review, unused but true: the FK knob is not a clean
+cardinality knob — `joinrelsize.go:25-27` says a declared FK **removes
+its covered clauses**, so `qual-placement` has a direct non-cardinality
+explanation; and the isolated knob would be a forced-rows SWEEP (>=4
+values, R71's design) at the joinrel in `joinrelsize.go` with FKs OFF,
+not `cardinality.go:239` (that is the NLI arm, which Q9's contested hash
+join never reaches).
