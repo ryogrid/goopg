@@ -5913,3 +5913,69 @@ broken code.
   rolled-back CREATE TABLE's FK row automatically now.
 - R125 §7's 32.17s FK-validation figure is STILL un-remeasured; it is the
   input to "step (c) is optional", so step (c)'s scope inherits it.
+
+## Step (d) recon — THE FK CHAIN IS A NO-GO FOR PLAN PARITY
+
+Recon only (throwaway `cp -a` clone at /tmp/r127clone, port 5533,
+deleted; shared corpus untouched). Full writeup:
+`r126-fk-persistence/step-d-recon-fk-chain-is-a-no-go.md`.
+
+**Declaring all eight TPC-H FKs changes TPC-H parity NOT AT ALL:
+match=6 both with and without.** `join-order` stays 14 — the category the
+entire chain was aimed at. Three categories tick the WRONG way
+(join-method 10→11, scan-type 9→10, qual-placement 4→5).
+
+The machinery works: all 8 declared `NOT VALID` sub-second on the real
+SF=1 corpus, `conkey` arrays correct incl. the two-column `{8,5}` — R125
+(O(1) instead of ~2 weeks) + R126 (they persist) delivering end to end.
+
+**Q9, the target:**
+```
+no FKs : [join-order]                                    rows=122   cost=109733
+8 FKs  : [join-order,join-method,scan-type,qual-placement] rows=5000 cost=374413
+   PG  :                                                  rows=60125 cost=139669
+```
+The FK arm IS live and is **NOT** redundant with `keysCovering`'s index
+arm — the reviewer's hypothesis is REFUTED. `partsupp_pk` is unique on
+exactly the join columns and an instrumented `keysCovering` confirms the
+index arm sees it (`partsupp … indexes_default_dbOid=3`), yet the FK
+still moves the estimate 41x closer. The arms are not interchangeable:
+the index arm gives an upper BOUND, which cannot bind on an
+under-estimate; the FK arm gives the SELECTIVITY that raises it.
+
+**But the better cardinality makes the plan WORSE** — one divergent
+dimension becomes four, cost triples. R125's reviewer warned that a
+corrected cardinality need not change shape; it changed shape, away from
+PG.
+
+**Do not scope step (d) as a parity round.** R125/R126 stand on their own
+(R126 fixed a silent correctness bug), but the parity thesis behind them
+does not survive measurement. **The real lead is now the question this
+raises: why does a MORE accurate Q9 cardinality produce a LESS PG-like
+plan?** That points at the cost model or the join-order search, not at
+missing FK evidence — and `join-order` is TPC-H's largest category (14)
+and TPC-DS's (90).
+
+### NEW BUG found during the recon (pre-existing, not R126)
+
+`ALTER TABLE … DROP CONSTRAINT <fk>` **reports success and does nothing**
+on a non-default database:
+```
+ALTER TABLE nation DROP CONSTRAINT nation_region_fk;  --> ALTER TABLE
+SELECT count(*) ... WHERE contype='f';                --> 8   (unchanged)
+```
+`InMemory.DropForeignKeyConstraint` hardcodes
+`tableByOID(tableOID, DefaultDBOid)` (`catalog.go:22241`) and returns
+false when that misses; `execAlterTableDropConstraint` discards the
+result and returns nil (`operators_ddl.go:13275`). Same
+hardcoded-`DefaultDBOid` family as the bug R126's review caught in
+`resolveFKCatalogKeys`; `HasPrimaryKey` (`catalog.go:22261`) has it too.
+**Second per-DB defect in two rounds, and exactly the gap R126's reviewer
+named** (no in-process pin crosses a database boundary). R126 makes it
+worse in effect: an FK that cannot be dropped now also survives restarts.
+
+Because of this the same-epoch A/B could not be completed — the drop arm
+was void. **The match count (6) is robust** across every capture in this
+workstream; the per-category deltas and Q9's exact cost are INDICATIVE,
+not pinned. Re-measure after the DROP bug is fixed if they need to bear
+weight.
