@@ -4703,6 +4703,25 @@ HeapTupleHeader page-size I/O formula, with independent outer/inner width and
 PG-fit/Goopg-spill tests required. Next: `git commit -n`/push design, then
 implement the default-off experiment.
 
+R108 DONE 2026-09-13 (`r108-pg-hash-tuple-sizing/REPORT.md`): the opt-in PG
+packed HashJoinTuple batch/page spill-I/O price is trace-proven and leaves the
+fresh common-data Q96 forms, 99-query SF0.25 EXPLAIN capture, SF0.25 values,
+and live-PG structural census unchanged. The observed candidates fit in one
+PG batch, so no spill-I/O delta is due. Keep it default-off; executor map
+capacity remains intentionally separate from planner parity geometry.
+
+R112 PLANNED — whole-cost PG Datum-size election experiment, dependent on the
+R108 DONE report and its completed review: only after the current spill-term
+investigation establishes that its narrow PG HashJoinTuple substitution is
+inert, scope and review a default-off, planner-only experiment. Before any
+code, it must inventory every affected cost family and its exact PostgreSQL
+representation/formula, then justify an explicitly family-specific analogue;
+there is no universal PG Datum size. It must keep executor allocation/spill
+capacity on real Goopg Datum representation and capture per-query OFF/ON
+election and value deltas against live PG18.3. It must not silently alter
+estimates or promote any result to default. Before source change: Design Doc,
+agent review, `git commit -n`, and push.
+
 TIMING SURVEY DONE 2026-09-13 (`r97-timing-survey/REPORT.md`,
 measurement-only, no code change, no review — survey not a design
 doc): TPC-DS SF0.25 all 96 queries timed (3-run medians, values
