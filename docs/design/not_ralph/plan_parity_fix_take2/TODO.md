@@ -4573,6 +4573,17 @@ PG controls and Goopg focused tests pass; both unchanged R101 forms return 266
 with the requested forced spines. Next: resume R101 repeated Goopg plan/cost
 measurement only; do not infer a natural-order cost change.
 
+R105 SCOPE READY 2026-09-13 (`r105-q96-goopg-forced-order-capture/SCOPE.md`):
+capture R101's exact forced Q96 forms on the post-R104 Goopg source twice for
+byte-identical EXPLAIN and once for value 266, recording costs and forced
+spines only. No code or cost/election conclusion is authorized. Next: agent
+review, `git commit -n`/push scope, then measurement.
+
+R105 SCOPE REVIEWED 2026-09-13 (APPROVE): retain immutable R101 SQL digests,
+private isolated execution, twice byte-identical EXPLAIN, value 266, forced
+spine/cost capture, and the no-code/no-election boundary. Next: `git commit
+-n`/push scope, then measurement.
+
 TIMING SURVEY DONE 2026-09-13 (`r97-timing-survey/REPORT.md`,
 measurement-only, no code change, no review — survey not a design
 doc): TPC-DS SF0.25 all 96 queries timed (3-run medians, values
