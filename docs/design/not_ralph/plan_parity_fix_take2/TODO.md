@@ -6277,3 +6277,44 @@ would destroy attribution and its failure mode is **losing a MATCH** —
 48→96 flipped **Q14**, one of the current six. That round now has a clean
 baseline: flag default-ON as the floor, `tmp/d05p2-bucket-charge.patch`
 on top, one pre-registered prediction that Q14 holds MATCH.
+
+## R129 recon — the bucket charge is parity-INERT. Round NOT scoped.
+
+Recon only (one-line `MapSlotBytes` 48→96 probe, temp binary, reverted;
+tree clean). Writeup:
+`r128-parity-over-throughput/r129-bucket-charge-recon.md`.
+
+R128 cut this to a follow-up and left it a clean baseline. Measured on
+that baseline, it **moves no plan on TPC-H at all**: cost-stripped shapes
+IDENTICAL, every category unchanged, match 6/22.
+
+| | match | join-method | scan-type | Q14 |
+|---|---|---|---|---|
+| MapSlotBytes=48 (shipped) | 6 | 9 | 8 | MATCH |
+| MapSlotBytes=96 (corrected) | 6 | 9 | 8 | MATCH |
+
+Two things settled:
+1. **The historical blocker is gone**, confirmed on current code: the
+   ledger's "no longer flips Q14" coupling was measured against
+   `d05p3-costside-narrow.patch`, a different implementation — it now
+   reproduces against the shipped default. R128's cut-it-to-protect-Q14
+   argument was a correct precaution that does not fire in practice.
+2. **No parity reason to land it.** `MapSlotBytes = 48` IS wrong ("KNOWN
+   2x LOW", go1.25 measures 96.1 B) and correcting it is worth real
+   memory (bucket heap 586.7→286.0 MB, per-worker peak −34.5%) — but
+   that is memory accuracy, not plan parity, so it belongs to the
+   `minimize_datum` workstream that owns it.
+
+**Scoping fact if anyone does land it: the preserved patch is STALE and
+does NOT apply** (fails on `hashsize.go:51`, `join_batch.go:208`,
+`pathtarget_test.go:1350`). It is 197 lines across 5 files, not the
+one-constant edit its name suggests, and its `Choose`/`join_batch`/
+`entrywidth` parts have UNMEASURED interaction with R128's now-default
+narrowing.
+
+Measured-and-rejected levers at the two closest queries now number five:
+rows-only on Q4 (R71), semi-selectivity wiring (R78, 1.28x), FK evidence
+on Q9 (step-d recon), cost-input narrowing (R128 — real, +2 categories,
+no flip), and the bucket charge (inert, this recon). **The frontier is
+unchanged: Q4 and Q9 both block on projection pushdown / DatumBytes,
+which does not exist.**

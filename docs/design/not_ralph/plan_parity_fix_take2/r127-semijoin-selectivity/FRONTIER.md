@@ -86,6 +86,12 @@ evidence for that is not speculative:
 - FK evidence on Q9: refuted this session
   (`../r126-fk-persistence/step-d-recon-fk-chain-is-a-no-go.md` — all
   eight FKs declared, `match=6` unchanged).
+- **bucket charge (`MapSlotBytes` 48→96): INERT — measured R129 recon**
+  (`../r128-parity-over-throughput/r129-bucket-charge-recon.md`). Plan
+  shapes identical, categories identical, match 6/22 unchanged. Q14 does
+  hold MATCH now (the historical blocker is gone), but there is no parity
+  reason to land it; its value is memory accuracy and belongs to
+  `minimize_datum`.
 - cost-input narrowing corpus-wide: **NOT parity-neutral — corrected by
   R128.** The chain buys TPC-H `join-method` 10→9 and `scan-type` 9→8; it
   was default-OFF; **R128 promoted it to default ON** (commit
