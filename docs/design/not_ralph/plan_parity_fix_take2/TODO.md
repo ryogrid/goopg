@@ -4827,6 +4827,12 @@ R111 clean inputs). Decides whether a production change is
 justified: PG agrees → close, no change; PG disagrees → scope R120
 with the exact divergence. Datum investigation stays closed. Next:
 agent review, commit -n/push scope, then measure.
+R119 DONE 2026-09-13 (`r119-pg-nullfrac-compare/REPORT.md`, review
+APPROVE, measurement-only, no source change): PG uses the identical
+nullfrac-driven equi-selectivity model (values agree to 4 decimals);
+PG's own hdem-first lower is bigger yet cheaper — preference lives
+in cost terms (widths), not selectivity. Verdict (a): close, no
+production change. Datum stays closed. PG left running (found up).
 
 TIMING SURVEY DONE 2026-09-13 (`r97-timing-survey/REPORT.md`,
 measurement-only, no code change, no review — survey not a design
@@ -4835,3 +4841,95 @@ doc): TPC-DS SF0.25 all 96 queries timed (3-run medians, values
 Worst cliffs: Q61 70x, Q58 26x, Q55 23x, Q88 21x, Q24/Q80 ~20x;
 Q96 0.22–0.30s vs PG 0.044s (~5x, PG-shaped plan). Caveats in
 report (wall-clock vs server secs, shape verdicts not re-taken).
+
+R120 BASELINE RE-TAKEN 2026-09-14 (fresh live captures, both corpora,
+protocol-validated): **TPC-H 6/15/0/1/0** (match 6 = Q1 Q6 Q10 Q11 Q14
+Q15a; MISSING-NODE 1 = Q5, PG-only `Materialize`; unparsed 0) via
+`estimate-audit -plan-only` (single stats-warmed session, `-serial`,
+PG ref captured same protocol from :65432). **TPC-DS 2/69/0/25/3/0**
+(match Q9, Q41; ERROR 3 = Q36/Q70/Q86, unplannable BOTH engines;
+unparsed 0) via `r2-instrument/capture-tpcds.sh` on :65437 vs :65438 —
+**reproduces R94's census exactly**, so nothing drifted across
+R96–R119 (all measurement-only/reverted, as reported).
+Categories now — TPC-H: join-order 14, join-method 10,
+aggregation-strategy 10, scan-type 9, sort-strategy 9,
+parameterisation 5, qual-placement 3, rendering 1, parallelism 0
+(serial protocol). TPC-DS: join-order 89, parallelism 87,
+sort-strategy 76, aggregation-strategy 69, join-method 63,
+scan-type 57, parameterisation 48, rendering 20, qual-placement 16.
+
+METHODOLOGY TRAP RE-HIT AND RECORDED 2026-09-14 (cost ~1 capture pair,
+same trap as R65 §0): `r2-instrument/capture-tpch.sh` opens a FRESH
+psql session per query and never ANALYZEs, and goopg's ANALYZE stats
+are PER-CONNECTION (`cmd/estimate-audit/main.go:37-38,:286,:325`), so
+every goopg TPC-H plan it captures is planned on EMPTY stats. It
+scored 2/20/0/0 with tells like Q21 `cost=16.54` vs PG `268796`
+(default-estimate plans). The correct TPC-H protocol is
+`estimate-audit -plan-only` (warm-stats single session). TPC-DS is
+NOT affected — probed directly 2026-09-14 (query7 cold-session vs
+ANALYZE-warmed-session plans identical in shape, costs within 0.03%),
+so its cluster's stats are effectively persistent and
+`capture-tpcds.sh` remains valid there. Also: the PG side needs
+`PGPASSWORD` (:65432 postgres/postgres, :65433 tpch/tpch) and
+`postgres/local_install/bin` on PATH, else every query hangs 180s on
+a hidden password prompt and logs "(capture failed)".
+
+R120 SCOPE-INTENT 2026-09-14 — narrowed cost INPUTS (K65/K66 ncols),
+Step-0 counterfactual measurement, no production cost change.
+Rationale (convergence of two independent threads): R72 STEP-0
+attributed Q4's aggregation split to its INPUTS, not the election
+rule (widths 20-28x among them), and R119 closed the Q96 join-order
+thread pointing at the same place ("preference lives in cost terms
+(widths)", PG 4-8B vs goopg 428-1104B). K65 names the blast radius:
+width feeds hash geometry, spill/batch decisions, Gather transfer and
+sort footprints — "three of the four largest remaining categories".
+K66 fixes the target: the input is NOT `Width` (R38's error) but
+`NCols`/`AvgVarBytes` via `EntryBytes = 48*ncols + 24 + avgVarBytes`.
+The NEW and untested element: **R113 already swapped `costSortRun`'s
+byte FORMULA to PG `relation_byte_size` and nothing moved — because it
+threaded goopg's own inflated emitted width as the input.** Narrowing
+the input has never been measured. Q4 is the anchor: goopg sorts
+57066 rows x width 448 where PG sorts 13266 x 16 = 120x the byte
+volume (4.3x rows from the absent EXISTS reduction x 28x width), which
+is why its sorted arm (6077.69) loses to hashed (1426.71) at 4.26x
+where PG's sorted arm wins on pathkeys inside a 1% band.
+Bounds: Step-0 measures a counterfactual only (temporary, default-off,
+removed before commit); DatumBytes/`minimize_datum` stays CLOSED
+(R114 user-stop) — this round tests only the ncols lever, which is
+independent of it. Pre-registered decision bar and the corpus-wide
+election census go in the SCOPE. Next: Design Doc, agent review,
+`commit -n` + push, then Step-0 measurement only.
+
+R120 SCOPE READY 2026-09-14 (`r120-hashagg-width-currency/SCOPE.md`
+rev 2, review **BLOCK -> APPROVE-WITH-NOTES**, 3 BLOCKs remediated + 6
+notes applied): `costAgg`'s hashed spill arm supplies
+**`inAvgVarBytes` (variable payload only) where a TUPLE WIDTH is
+meant** — `hashAggEntrySize(nAggs, inAvgVarBytes)` whose param is
+literally `tupleWidth` (`cost_funcs.go:483`,`:513`), and
+`pages := tuples * inAvgVarBytes / blockSizeBytes` under a comment
+claiming `relation_byte_size(input_tuples, input_width)` (`:493`),
+gated on `inAvgVarBytes > 0` (`:482`). PG passes ONE `input_width` to
+both (`costsize.c:2801-2802`, `:2824`) and its SORTED rival uses the
+same currency (`cost_tuplesort` `:1903`, `relation_byte_size`
+`:6452-6456`). goopg's sorted rival meanwhile pays full
+`EntryBytes = 48*ncols+24+avgVar`. **Same input rows, two currencies**
+— a 12.4x discount to hash on a 9-col row, infinite when avgVar==0.
+Because the under-statement makes `hashAggSetLimits` early-return, the
+arm goes INERT exactly where PG spills.
+Measured OFF census (corrects the pre-R3/SF0.5 `1x/133x` comment
+figure — R3 DID move it, "ratio never moved" WITHDRAWN): TPC-DS SF0.25
+goopg **22 GroupAgg / 129 HashAgg** vs PG **126 / 38** (+4 Mixed);
+TPC-H goopg 6/13 vs PG 8/10 — a 5.7x GroupAgg deficit, 3.4x HashAgg
+excess. Cut = 3 arms (pages currency, entry currency
+`W = 48*ncols+avgVar` per review-confirmed PG-faithful mapping, gate
+`inNcols>0`) behind default-off `GOOPG_HASHAGG_WIDTH_CURRENCY`.
+Recorded limits: the cut buys goopg-INTERNAL rival consistency, NOT PG
+alignment (48B/Datum leaves ~6-7x residue), so on WIDE inputs it can
+convert under-charge into OVER-charge — **Q10 is a named watch**
+(currently MATCHing; ON entry 2126B x 59038 groups = 119.7 MiB vs the
+128 MiB budget = 6.5% margin). "Currency fix alone overshoots, must be
+paired with K65/K66 ncols narrowing (R121)" is a PERMITTED reportable
+outcome, not a failure to tune away. work_mem pinning is mandatory in
+every arm (BootVal 512MB vs PG 4MB; TPC-DS SF0.25 conf has none and
+relies on the capture script's session SET). Datum/`minimize_datum`
+stays CLOSED (R114). Next: implement behind the flag, then gates.
