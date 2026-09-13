@@ -4667,6 +4667,13 @@ depends on successful R111 rather than invalid R107; schema/index equivalence
 is now a pre-ANALYZE gate alongside raw/canonical relation witnesses. Next:
 `git commit -n`/push scope, then measurement.
 
+R111 DONE 2026-09-13 (`r111-q96-common-data-oracle-retry/REPORT.md`): fresh
+clusters rebuilt from the immutable R107 inputs pass row-count, pre-ANALYZE
+schema/index, and full type-aware relation gates; both engines captured native
+statistics and repeatable forced forms returning 266. PG still prices
+hdem-first 175.91 lower while Goopg prices store-first 7.68 lower on this
+common input. This clears R108's dependency but authorizes no cost change.
+
 R108 PLANNED — PG hash-tuple sizing comparison, dependent on successful R111
 common-data oracle completion: only after R111 establishes common
 relation/schema/index inputs and records both engines' native statistics,
