@@ -4435,6 +4435,14 @@ lawful reproducible derivation is recorded; matching a final cost is not
 enough. The scope now also pins every Goopg term needed to reconcile a filed
 candidate. Next: commit -n/push scope, then temporary measurement.
 
+R98 DONE 2026-09-13 (`r98-q96-innerunique-inputs/REPORT.md`): the reverted
+Q96 diagnostic reconciles every Goopg R90/R91 input and filed cost exactly;
+the two first-level alternatives differ by 275.274375 and store-first remains
+cheaper. PG EXPLAIN/source does not expose its semifactors or virtual geometry,
+and no lawful derivation exists in the captured inputs: UNOBSERVABLE, not a
+cost-change license. Next: find a separately evidenced PG-visible input; do
+not tune inner-unique inputs or force Q96's order.
+
 TIMING SURVEY DONE 2026-09-13 (`r97-timing-survey/REPORT.md`,
 measurement-only, no code change, no review — survey not a design
 doc): TPC-DS SF0.25 all 96 queries timed (3-run medians, values
