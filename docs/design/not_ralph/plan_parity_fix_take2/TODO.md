@@ -4621,6 +4621,12 @@ data/schema/index equivalence before ANALYZE, but record each engine's native
 statistics and controls rather than requiring their equality. Next: `git
 commit -n`/push scope, then measurement.
 
+R107 DONE 2026-09-13 (`r107-q96-common-data-oracle/REPORT.md`): identical
+TSVs and row counts yield matching Q96-only projections, but the full `store`
+relation COPY witness diverges on `char(n)` padding and numeric output. Stop
+rule applied; it is not a common-data cost oracle. Next: separately scope a
+type-normalized complete relation witness before R108 or cost attribution.
+
 R108 PLANNED — PG hash-tuple sizing comparison, dependent on R107 DONE:
 only after R107 establishes common relation/schema/index inputs and records
 both engines' native statistics, scope and review an opt-in experiment that
