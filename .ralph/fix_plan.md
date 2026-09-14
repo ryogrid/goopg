@@ -944,7 +944,7 @@ fallback both shift index-probe pricing corpus-wide. See `AGENT.md` §"The
 toward-oracle hazard"; a slower matching plan lands with a ledger row, an
 unmeasured one does not.
 
-- [ ] **M0138-0001 — divergence census (recon, no production change)** — measure and
+- [x] **M0138-0001 — divergence census (recon, no production change)** — measure and
   record exactly where goopg's ANALYZE differs from PG's `acquire_sample_rows`
   (`postgres/src/backend/commands/analyze.c:1199`). Already upstream-faithful:
   `upstreamDefaultStatsTarget = 100`, the `targrows = target * 300` multiplier
@@ -952,6 +952,17 @@ unmeasured one does not.
   physical-order re-sort, and the Duj1 estimator. The measured divergence is the
   **block representation** — goopg scans every block, PG samples random blocks. Produce
   a per-column divergence table over both corpora; no code change in this task.
+  DONE 2026-09-15: `docs/design/0100-0149/m0138-0001-analyze-divergence-census.md`.
+  Live `pg_stats` capture over all four bench clusters (TPC-H SF1 + TPC-DS SF0.25,
+  goopg vs PG) reconfirmed the block-representation gap and surfaced three
+  previously-unnamed divergences — `RowCount`/`reltuples` (goopg exact vs PG
+  extrapolated from `bs.m` sampled blocks), correlation tie-break (PG's
+  `tupnoLink`-deterministic tie order vs goopg's unspecified `sort.Slice` order,
+  live-correlated with a `[0.09,0.16]` correlation band on 36/118 TPC-DS columns
+  vs PG's 7/119), and `pg_stats.avg_width` (PG falls back to fixed `typlen` for
+  non-varlena types, goopg has no such fallback — `avg_width=0` on 32/61 TPC-H and
+  70/121 TPC-DS columns). Three ledger rows filed (`m0138-0001-*`), each citing a
+  resume point in M0138-0002 or M0138-0004. No production code touched.
 - [ ] **M0138-0002 — port PG's block sampler and two-stage row selection** —
   `BlockSampler_Init`/`BlockSampler_Next`
   (`postgres/src/backend/utils/misc/sampling.c:39,64`) plus
