@@ -47,6 +47,9 @@
 #              which is LARGER than the A/B signal most planner changes carry.
 #              Set to 0 to restore wall-clock seeding.
 #              See docs/design/planner-gate-reproducibility/DESIGN.md.
+#   TPCH_ACCEPTANCE_ARM_PORT        this arm's PRIVATE port (M0137-0007, default 5583)
+#   TPCH_ACCEPTANCE_ARM_CLONE_WAIT  seconds to wait for :65433 to go quiet
+#                                   before the snapshot clone (M0137-0007, default 60)
 #
 set -uo pipefail
 
@@ -54,6 +57,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 # shellcheck source=lib/bench-engine-id.sh
 source "${REPO_ROOT}/scripts/lib/bench-engine-id.sh"
+# shellcheck source=lib/tpch-private-clone.sh
+source "${REPO_ROOT}/scripts/lib/tpch-private-clone.sh"
 
 ARM="${1:?usage: $0 <arm-name> <out-file> [runner-args...]}"
 OUT="${2:?usage: $0 <arm-name> <out-file> [runner-args...]}"
@@ -64,12 +69,18 @@ export LD_LIBRARY_PATH="${PG_PREFIX}/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 export PATH="${PG_PREFIX}/bin:${PATH}"
 
 PG_HOST=127.0.0.1
-PG_PORT=65433
-PGDATA="${REPO_ROOT}/bench/tpch/runtime_goopg/data"
+# M0137-0007: this arm runs on a PRIVATE clone/port, never on the shared
+# bench cluster (bench/tpch/runtime_goopg/data, :65433) — see
+# scripts/lib/tpch-private-clone.sh.
+SRC_DATA="${REPO_ROOT}/bench/tpch/runtime_goopg/data"
+SRC_PORT=65433
+PG_PORT="${TPCH_ACCEPTANCE_ARM_PORT:-5583}"
+PGDATA="${REPO_ROOT}/tmp/goopg-acceptance-arm-tpch-data"
 GOOPG_BIN="${GOOPG_BIN:-${REPO_ROOT}/tmp/goopg-acceptance-bin}"
 RUNNER_BIN="${RUNNER_BIN:-${REPO_ROOT}/tmp/tpch-acceptance-runner}"
 CG_UNIT="goopg-tpch-acceptance-${ARM}"
 SRV_LOG="${REPO_ROOT}/tmp/tpch-acceptance-${ARM}.server.log"
+CLONE_WAIT="${TPCH_ACCEPTANCE_ARM_CLONE_WAIT:-60}"
 
 PER_Q="${PER_Q:-600}"
 QUERIES="${QUERIES:-}"
@@ -88,13 +99,14 @@ export GOOPG_MEM_SWAP_MAX="${GOOPG_MEM_SWAP_MAX:-0}"
 export GOOPG_PGSHAPED_DP="${PGSHAPED:-0}"
 
 # --- pre-flight ------------------------------------------------------------
-# A foreign server on the port would be measured instead of ours, and then
-# killed by our stop ladder. Refuse rather than guess.
+# A foreign server on this arm's PRIVATE port would be measured instead of
+# ours, and then killed by our stop ladder. Refuse rather than guess. This no
+# longer checks the shared 65433: this arm never binds it (M0137-0007).
 if pg_isready -h "${PG_HOST}" -p "${PG_PORT}" -q 2>/dev/null; then
-    echo "something is already listening on ${PG_HOST}:${PG_PORT} — stop it first (bench/tpch/stop_goopg.sh)" >&2
+    echo "something is already listening on ${PG_HOST}:${PG_PORT} (this arm's private port) — stop it first (${GOOPG_BIN} stop -D ${PGDATA})" >&2
     exit 3
 fi
-[[ -s "${PGDATA}/PG_VERSION" ]] || { echo "no loaded TPC-H cluster at ${PGDATA}" >&2; exit 3; }
+[[ -s "${SRC_DATA}/PG_VERSION" ]] || { echo "no loaded TPC-H cluster at ${SRC_DATA}" >&2; exit 3; }
 # The bracket around the first character keeps this pattern from matching the
 # guard's OWN command line — a bare `pgrep -f ci/batch/run-nightly.sh` self-
 # matches and refuses on a quiet host (observed at P5.9 run 2). Same class as
@@ -111,9 +123,15 @@ if [[ "${NO_BUILD:-0}" != "1" ]]; then
     ( cd "${REPO_ROOT}" && go build -o "${RUNNER_BIN}" ./cmd/tpch-runner ) || exit 4
 fi
 
+# Stop any stale instance left on the PRIVATE clone by a previous crashed
+# run, then snapshot-clone the shared cluster into it (M0137-0007) — the
+# only touchpoint with the shared cluster in this script; it never
+# stops/starts a server there.
 "${GOOPG_BIN}" stop -D "${PGDATA}" >/dev/null 2>&1 || true
 systemctl --user stop "${CG_UNIT}.scope" >/dev/null 2>&1 || true
 systemctl --user reset-failed "${CG_UNIT}.scope" >/dev/null 2>&1 || true
+tpch_private_clone_snapshot "${SRC_DATA}" "${PGDATA}" "${PG_HOST}" "${SRC_PORT}" "${CLONE_WAIT}" \
+    || { echo "could not snapshot the shared TPC-H cluster (see above)" >&2; exit 3; }
 
 GOOPG_CG_UNIT="${CG_UNIT}" "${REPO_ROOT}/scripts/goopg-test-run.sh" \
     "${GOOPG_BIN}" start -D "${PGDATA}" --listen "${PG_HOST}:${PG_PORT}" \

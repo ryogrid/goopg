@@ -52,11 +52,16 @@
 #   NO_BUILD   1 = trust the existing images (use this to hold ONE binary
 #              across both arms, which is what makes them comparable)
 #   FORCE      1 = run even if the nightly CI batch holds the host
+#   TPCH_AUDIT_ARM_PORT        this arm's PRIVATE port (M0137-0007, default 5582)
+#   TPCH_AUDIT_ARM_CLONE_WAIT  seconds to wait for :65433 to go quiet before
+#              the snapshot clone (M0137-0007, default 60)
 #
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+# shellcheck source=lib/tpch-private-clone.sh
+source "${REPO_ROOT}/scripts/lib/tpch-private-clone.sh"
 
 LABEL="${1:?usage: $0 <label> [estimate-audit args...]}"
 shift
@@ -66,12 +71,18 @@ export LD_LIBRARY_PATH="${PG_PREFIX}/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 export PATH="${PG_PREFIX}/bin:${PATH}"
 
 PG_HOST=127.0.0.1
-PG_PORT=65433
-PGDATA="${REPO_ROOT}/bench/tpch/runtime_goopg/data"
+# M0137-0007: this arm runs on a PRIVATE clone/port, never on the shared
+# bench cluster (bench/tpch/runtime_goopg/data, :65433) — see
+# scripts/lib/tpch-private-clone.sh.
+SRC_DATA="${REPO_ROOT}/bench/tpch/runtime_goopg/data"
+SRC_PORT=65433
+PG_PORT="${TPCH_AUDIT_ARM_PORT:-5582}"
+PGDATA="${REPO_ROOT}/tmp/goopg-audit-arm-tpch-data"
 GOOPG_BIN="${GOOPG_BIN:-${REPO_ROOT}/tmp/goopg-acceptance-bin}"
 AUDIT_BIN="${AUDIT_BIN:-${REPO_ROOT}/tmp/estimate-audit}"
 CG_UNIT="goopg-tpch-audit-${LABEL##*-}"
 SRV_LOG="${REPO_ROOT}/tmp/tpch-audit-${LABEL}.server.log"
+CLONE_WAIT="${TPCH_AUDIT_ARM_CLONE_WAIT:-60}"
 
 PER_Q="${PER_Q:-600s}"
 REFERENCE="${REFERENCE-${REPO_ROOT}/analysis/leftdeep-joins/2026-08-05-p56giii-parity.pg.plans.txt}"
@@ -83,10 +94,10 @@ export GOOPG_PGSHAPED_DP="${PGSHAPED:-0}"
 export GOOPG_PGSHAPED_DP_TRACE="${DP_TRACE:-0}"
 
 if pg_isready -h "${PG_HOST}" -p "${PG_PORT}" -q 2>/dev/null; then
-    echo "something is already listening on ${PG_HOST}:${PG_PORT} — stop it first (bench/tpch/stop_goopg.sh)" >&2
+    echo "something is already listening on ${PG_HOST}:${PG_PORT} (this arm's private port) — stop it first (${GOOPG_BIN} stop -D ${PGDATA})" >&2
     exit 3
 fi
-[[ -s "${PGDATA}/PG_VERSION" ]] || { echo "no loaded TPC-H cluster at ${PGDATA}" >&2; exit 3; }
+[[ -s "${SRC_DATA}/PG_VERSION" ]] || { echo "no loaded TPC-H cluster at ${SRC_DATA}" >&2; exit 3; }
 # Bracketed first character: a bare pattern self-matches this very shell.
 if pgrep -f "[c]i/batch/run-nightly.sh" >/dev/null 2>&1; then
     if [[ "${PLAN_ONLY:-0}" == "1" ]]; then
@@ -104,9 +115,15 @@ if [[ "${NO_BUILD:-0}" != "1" ]]; then
 fi
 ( cd "${REPO_ROOT}" && go build -o "${AUDIT_BIN}" ./cmd/estimate-audit ) || exit 4
 
+# Snapshot-clone the shared cluster into this lane's private data dir
+# (M0137-0007) — the only touchpoint with the shared cluster in this script;
+# it never stops/starts a server there. Stop any stale instance left on the
+# PRIVATE clone by a previous crashed run first.
 "${GOOPG_BIN}" stop -D "${PGDATA}" >/dev/null 2>&1 || true
 systemctl --user stop "${CG_UNIT}.scope" >/dev/null 2>&1 || true
 systemctl --user reset-failed "${CG_UNIT}.scope" >/dev/null 2>&1 || true
+tpch_private_clone_snapshot "${SRC_DATA}" "${PGDATA}" "${PG_HOST}" "${SRC_PORT}" "${CLONE_WAIT}" \
+    || { echo "could not snapshot the shared TPC-H cluster (see above)" >&2; exit 3; }
 
 GOOPG_CG_UNIT="${CG_UNIT}" "${REPO_ROOT}/scripts/goopg-test-run.sh" \
     "${GOOPG_BIN}" start -D "${PGDATA}" --listen "${PG_HOST}:${PG_PORT}" \

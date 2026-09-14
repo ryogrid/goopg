@@ -756,11 +756,28 @@ before/after proving the defect it closes.
     Makefile/precommit/CI wiring (matches every sibling regression test in this
     milestone, all run manually). No production planner/executor/catalog code
     touched.
-- [ ] **M0137-0007 — give each lane a private clone and a private port** —
+- [x] **M0137-0007 — give each lane a private clone and a private port** —
   shared-resource contention on `:65433` is the stated reason for most deferred gates
   (`tpch-spotcheck.sh` was deferred four rounds running while being the only gate that
   caught the Q13 33-vs-34 wrong-rows bug). This is an infrastructure problem with an
   infrastructure fix.
+  - Landed 2026-09-15: `docs/design/0100-0149/m0137-0007-private-clone-per-lane.md`.
+    Found the defect is wider than the cited example — FOUR scripts
+    (`tpch-spotcheck.sh`, `tpch-relsize-arm.sh`, `tpch-estimate-audit-arm.sh`,
+    `tpch-acceptance-arm.sh`) all independently `stop -D`/`start -D` the same shared
+    `bench/tpch/runtime_goopg/data`/`:65433`. New `scripts/lib/tpch-private-clone.sh`
+    generalises `ci/batch/stages/stage-tpch.sh`'s already-proven snapshot-clone
+    pattern; all four scripts now run on their own private port (5580-5583) and
+    private clone dir under `tmp/`, touching the shared cluster only via a passive
+    wait-then-copy (never stop/start).
+  - Live-validated end-to-end against the real 2 GB `:65433` cluster, including a
+    reproduced contention scenario (started a real server on `:65433`, ran spotcheck
+    with a short clone-wait against it) proving the shared server survives untouched
+    where the old code would have killed it via an unconditional `stop -D`.
+  - Out of scope, not ledgered: TPC-DS captures (no server stop/start, so the acute
+    hazard doesn't apply) and the M0137-0003 baseline-capture tools
+    (`estimate-audit -plan-only`/`capture-tpch.sh` deliberately target the shared
+    cluster itself — they measure ITS state).
 - [ ] **M0137-0008 — build `INDEX-by-query.md` and `INDEX-by-mechanism.md` over the
   round corpus** — one row per TPC-H/TPC-DS query and per mechanism, naming the rounds
   that touched it and their standing verdict, so a scope can cite prior work instead of

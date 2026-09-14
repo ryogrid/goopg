@@ -7,12 +7,19 @@ Hence: runs solo, memory-capped, and under a **2-hour total wall-clock limit**
 
 ## A. Preconditions & setup
 
-**Isolation from the loop's `tpch-spotcheck.sh` (requirement):** the loop's
-spotcheck unconditionally `goopg stop`s whatever server runs on the canonical
-bench data dir (`bench/tpch/runtime_goopg/data`, port 65433) — so the batch
-must NOT hold that dir/port for a multi-hour stage, and the two must be able
-to run concurrently (spotcheck is light: ~3–4 min, small footprint). The
-batch therefore runs on a **snapshot copy** of the data dir at its own port:
+**Isolation from the loop's `tpch-spotcheck.sh` (requirement):** at the time
+this stage was designed, the loop's spotcheck unconditionally `goopg stop`d
+whatever server ran on the canonical bench data dir (`bench/tpch/runtime_goopg/data`,
+port 65433) — so the batch had to NOT hold that dir/port for a multi-hour
+stage, and the two had to be able to run concurrently (spotcheck is light:
+~3–4 min, small footprint). The batch therefore runs on a **snapshot copy**
+of the data dir at its own port, same as it always did. **Update (M0137-0007,
+2026-09-15): `tpch-spotcheck.sh` no longer touches 65433 at all** — it takes
+its own private snapshot clone on a private port (5580) via
+`scripts/lib/tpch-private-clone.sh`, the same pattern this stage pioneered.
+The isolation this section describes is therefore now belt-and-braces rather
+than load-bearing — nothing changes here, and this stage's own clone-onto-65434
+approach is unaffected either way.
 
 1. **Data check** — canonical dir exists and ≥ 100 MB (mirrors
    `TPCH_SPOTCHECK_MIN_MB`); else stage = `skip(no-data)`, exit 0.
@@ -55,12 +62,15 @@ Stage-local `trap EXIT`: stop the server (`postmaster.pid` PID →
 Run Q12 and Q13 **directly against the stage's clone server (65434)** and
 compare with `bench/tpch/spotcheck_expected.env` (**Q12=2 structural, Q13=33
 pinned**) — the same semantics as `scripts/tpch-spotcheck.sh`, without
-invoking it. Invoking the script here would be wrong twice over: it runs its
-own fresh server on the CANONICAL dir/port (65433) — re-entering the lane the
-clone strategy exists to leave to the loop — and it would validate that
-server, not the clone the sweep actually runs on. The stage reuses the
-script's expected-values file and its superuser@`postgres` connection
-fallback (§A.5), not its server lifecycle.
+invoking it. Invoking the script here would still be wrong: even though
+`tpch-spotcheck.sh` no longer binds the canonical 65433 dir/port itself
+(M0137-0007 moved it to its own private clone/port 5580 — the "re-entering
+the loop's lane" hazard this paragraph used to name no longer applies), it
+would still validate ITS OWN fresh clone, not the clone this stage's 22-query
+sweep actually runs its plans against — a spotcheck PASS there would say
+nothing about the server under test here. The stage reuses the script's
+expected-values file and its superuser@`postgres` connection fallback
+(§A.5), not its server lifecycle.
 
 - **Mismatch ⇒ the stage is FAILED immediately and the 22-query sweep is
   skipped.** Rationale: the spotcheck failing means correctness is already

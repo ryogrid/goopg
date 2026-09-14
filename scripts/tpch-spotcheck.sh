@@ -14,10 +14,16 @@
 # Behaviour:
 #   - Exits 0 with a loud SKIPPED message when no populated TPC-H data dir
 #     exists (must not hard-block loops on machines without data).
-#   - Otherwise: stops any stale goopg on the bench data dir (via the goopg
-#     control socket — NEVER pkill, which self-matches the invoking shell),
-#     starts a fresh server under the memory-cap wrapper
-#     (scripts/goopg-test-run.sh, scope goopg-spotcheck), waits for
+#   - Otherwise (M0137-0007): waits for the shared bench cluster
+#     (bench/tpch/runtime_goopg/data, :65433) to go quiet and takes a
+#     snapshot clone of it into a PRIVATE data dir — this gate never
+#     stops/starts a server on the shared cluster itself, so it can never
+#     kill a capture or another gate that is using it. Stops any stale
+#     goopg left on ITS OWN private clone from a previous crashed run (via
+#     the goopg control socket — NEVER pkill, which self-matches the
+#     invoking shell), starts a fresh server on the clone under the
+#     memory-cap wrapper (scripts/goopg-test-run.sh, scope goopg-spotcheck,
+#     private port — see scripts/lib/tpch-private-clone.sh), waits for
 #     readiness, runs Q12 + Q13 via cmd/tpch-runner, compares row counts
 #     against bench/tpch/spotcheck_expected.env, stops the server.
 #   - Exits 1 on any row-count mismatch or operational failure, 0 on PASS.
@@ -40,6 +46,9 @@
 #   TPCH_SPOTCHECK_TIMEOUT        per-query budget for tpch-runner        (default 600s)
 #   TPCH_SPOTCHECK_MIN_MB         data-dir size below which we SKIP       (default 100)
 #   TPCH_SPOTCHECK_READY_TIMEOUT  seconds to wait for readiness           (default 120)
+#   TPCH_SPOTCHECK_PORT           this lane's PRIVATE port (M0137-0007)   (default 5580)
+#   TPCH_SPOTCHECK_CLONE_WAIT     seconds to wait for :65433 to go quiet
+#                                 before the snapshot clone (M0137-0007)  (default 60)
 #
 set -euo pipefail
 
@@ -47,18 +56,42 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 BENCH_DIR="${REPO_ROOT}/bench/tpch"
 
+# M0137-0007: this gate no longer runs against the shared bench cluster
+# (bench/tpch/runtime_goopg/data, :65433) — it takes a private snapshot clone
+# and a private port instead, so it can never fight another lane (a
+# concurrent M0137 baseline capture, one of the tpch-*-arm.sh scripts, or a
+# peer Ralph loop) for the shared server. See scripts/lib/tpch-private-clone.sh
+# for why, and ci/design/03-resources-and-parallelism.md §D /
+# ci/design/05-tpch-stage.md for the analogous fix ci/batch already shipped
+# for the nightly lane (this gate no longer needs that doc's "canonical 65433
+# stays the loop's spotcheck lane" carve-out — it never touches 65433 now).
+# Capture the caller's own GOOPG_BIN choice (if any) BEFORE env_goopg.sh's
+# `${GOOPG_BIN:-default}` resolves it to the SHARED tmp/goopg-bench-bin —
+# that shared path is itself a contention surface (env_goopg.sh's own
+# comment: a spotcheck build used to clobber the nightly's binary mid-run).
+CALLER_GOOPG_BIN="${GOOPG_BIN:-}"
+
 # Shared bench config: PGDATA, PG_HOST/PG_PORT (65433), GOOPG_BIN,
 # GOMEMLIMIT/GOGC, and postgres/local_install/bin on PATH (pg_isready).
 # shellcheck source=../bench/tpch/env_goopg.sh
 source "${BENCH_DIR}/env_goopg.sh"
+# shellcheck source=lib/tpch-private-clone.sh
+source "${SCRIPT_DIR}/lib/tpch-private-clone.sh"
+
+SRC_DATA="${PGDATA}"   # canonical dir — lane-external; NEVER stop/start a server on it
+SRC_PORT="${PG_PORT}"  # 65433
+[[ -n "${CALLER_GOOPG_BIN}" ]] || GOOPG_BIN="${REPO_ROOT}/tmp/goopg-spotcheck-bin"
+PGDATA="${REPO_ROOT}/tmp/goopg-spotcheck-tpch-data"       # this lane's private clone
+PG_PORT="${TPCH_SPOTCHECK_PORT:-5580}"                     # this lane's private port
 
 EXPECTED_FILE="${BENCH_DIR}/spotcheck_expected.env"
 RUNNER_BIN="${REPO_ROOT}/tmp/tpch-spotcheck-runner"
-SPOT_LOG="${RUNTIME_DIR}/goopg.spotcheck.log"
-SPOT_PIDFILE="${RUNTIME_DIR}/spotcheck.pid"
+SPOT_LOG="${REPO_ROOT}/tmp/goopg-spotcheck-tpch.log"
+SPOT_PIDFILE="${REPO_ROOT}/tmp/goopg-spotcheck-tpch.pid"
 CG_UNIT="goopg-spotcheck"
 QUERY_TIMEOUT="${TPCH_SPOTCHECK_TIMEOUT:-600s}"
 MIN_DATA_MB="${TPCH_SPOTCHECK_MIN_MB:-100}"
+CLONE_WAIT="${TPCH_SPOTCHECK_CLONE_WAIT:-60}"
 
 skip() {
     echo "=================================================================="
@@ -70,10 +103,11 @@ skip() {
 
 # ---------------------------------------------------------------------------
 # Prerequisite checks — SKIP (exit 0), never hard-fail, when data is absent.
+# Checked against the SOURCE dir: the private clone does not exist yet.
 # ---------------------------------------------------------------------------
-[[ -s "${PGDATA}/PG_VERSION" ]] || skip "no initialised cluster at ${PGDATA}"
+[[ -s "${SRC_DATA}/PG_VERSION" ]] || skip "no initialised cluster at ${SRC_DATA}"
 
-data_mb="$(du -sm "${PGDATA}" 2>/dev/null | awk '{print $1}')"
+data_mb="$(du -sm "${SRC_DATA}" 2>/dev/null | awk '{print $1}')"
 if [[ -z "${data_mb}" ]] || (( data_mb < MIN_DATA_MB )); then
     skip "data dir is only ${data_mb:-0} MB (< ${MIN_DATA_MB} MB) — TPC-H tables not loaded; run bench/tpch/setup_goopg.sh + build_schema_goopg.sh"
 fi
@@ -96,12 +130,14 @@ mkdir -p "$(dirname "${GOOPG_BIN}")"
 ( cd "${REPO_ROOT}" && go build -o "${RUNNER_BIN}" ./cmd/tpch-runner )
 
 # ---------------------------------------------------------------------------
-# Stop any stale instance on this data dir. Use the goopg control socket
-# (same mechanism as bench/tpch/stop_goopg.sh). NEVER `pkill -f goopg`:
-# it self-matches the invoking shell (memory: goopg_manual_server_test_workflow).
+# Stop any stale instance left on THIS LANE's private clone (a previous
+# spotcheck run that crashed before its own cleanup ran). Use the goopg
+# control socket (same mechanism as bench/tpch/stop_goopg.sh). NEVER
+# `pkill -f goopg`: it self-matches the invoking shell (memory:
+# goopg_manual_server_test_workflow). This never touches SRC_DATA/SRC_PORT.
 # ---------------------------------------------------------------------------
 if "${GOOPG_BIN}" stop -D "${PGDATA}" >/dev/null 2>&1; then
-    echo "tpch-spotcheck: stopped stale goopg instance"
+    echo "tpch-spotcheck: stopped stale goopg instance on the private clone"
 else
     rm -f "${PGDATA}/postmaster.pid"   # clean stale pidfile so start doesn't refuse
 fi
@@ -109,6 +145,20 @@ fi
 systemctl --user stop "${CG_UNIT}.scope" >/dev/null 2>&1 || true
 systemctl --user reset-failed "${CG_UNIT}.scope" >/dev/null 2>&1 || true
 rm -f "${SPOT_PIDFILE}"
+
+# ---------------------------------------------------------------------------
+# Snapshot-clone the shared, lane-external cluster into this lane's private
+# data dir (M0137-0007). Waits for SRC_PORT to go quiet, `cp -a`s, verifies
+# it stayed quiet during the copy (retried up to 3x on interference) — see
+# scripts/lib/tpch-private-clone.sh. This is the only touchpoint with the
+# shared cluster in this whole script, and it never stops/starts anything
+# there.
+# ---------------------------------------------------------------------------
+echo "tpch-spotcheck: snapshot-cloning ${SRC_DATA} -> ${PGDATA} (${data_mb} MB)"
+if ! tpch_private_clone_snapshot "${SRC_DATA}" "${PGDATA}" "${PG_HOST}" "${SRC_PORT}" "${CLONE_WAIT}"; then
+    echo "tpch-spotcheck: FATAL — could not snapshot the shared TPC-H cluster (see above); do NOT commit, retry the gate" >&2
+    exit 1
+fi
 
 # ---------------------------------------------------------------------------
 # Start a FRESH server under the memory-cap wrapper (MANDATORY for any

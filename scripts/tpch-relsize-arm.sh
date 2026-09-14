@@ -55,6 +55,9 @@
 #             NEVER the shared tmp/goopg-bench-bin, which ci/batch and the SF=1
 #             harness also run from: ledger row goopg_bench_bin_shared_lane)
 #   NO_BUILD  1 = trust the existing GOOPG_BIN / runner images
+#   TPCH_RELSIZE_ARM_PORT        this arm's PRIVATE port (M0137-0007, default 5581)
+#   TPCH_RELSIZE_ARM_CLONE_WAIT  seconds to wait for :65433 to go quiet before
+#                                the snapshot clone (M0137-0007, default 60)
 #
 # Output: ${OUTDIR}/<arm>.tsv (one row per query) + ${OUTDIR}/<arm>.log.
 set -uo pipefail
@@ -63,6 +66,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 # shellcheck source=lib/bench-engine-id.sh
 source "${REPO_ROOT}/scripts/lib/bench-engine-id.sh"
+# shellcheck source=lib/tpch-private-clone.sh
+source "${REPO_ROOT}/scripts/lib/tpch-private-clone.sh"
 
 ARM="${1:?usage: $0 <c1|c2|w1|w2|probe-analyze>}"
 
@@ -71,12 +76,20 @@ export LD_LIBRARY_PATH="${PG_PREFIX}/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 export PATH="${PG_PREFIX}/bin:${PATH}"
 
 PG_HOST=127.0.0.1
-PG_PORT=65433
-PGDATA="${REPO_ROOT}/bench/tpch/runtime_goopg/data"
+# M0137-0007: this arm runs entirely on a PRIVATE clone/port, never on the
+# shared bench cluster (bench/tpch/runtime_goopg/data, :65433) — see
+# scripts/lib/tpch-private-clone.sh. SRC_* names the shared, lane-external
+# dir/port this arm reads from exactly once (the snapshot below); every
+# start/stop cycle after that touches only the clone.
+SRC_DATA="${REPO_ROOT}/bench/tpch/runtime_goopg/data"
+SRC_PORT=65433
+PG_PORT="${TPCH_RELSIZE_ARM_PORT:-5581}"
+PGDATA="${REPO_ROOT}/tmp/goopg-relsize-arm-tpch-data"
 GOOPG_BIN="${GOOPG_BIN:-${REPO_ROOT}/tmp/goopg-relsize-bin}"
 RUNNER_BIN="${REPO_ROOT}/tmp/tpch-relsize-runner"
 CG_UNIT="goopg-relsize-arm"
 PPROF_ADDR="${PPROF_ADDR:-127.0.0.1:6161}"
+CLONE_WAIT="${TPCH_RELSIZE_ARM_CLONE_WAIT:-60}"
 
 PER_Q="${PER_Q:-300}"
 QUERIES="${QUERIES:-1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22}"
@@ -100,19 +113,20 @@ SERVER_LOG="${OUTDIR}/${ARM}.server.log"
 
 say() { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*" | tee -a "${LOG}"; }
 
-# --- pre-flight: we must OWN the port, and the data must be there ----------
-# A foreign server on 65433 would be measured instead of ours (and killed by our
-# stop ladder). The SF0.25 gate learned this the expensive way; refuse instead.
+# --- pre-flight: we must OWN the private port, and the source data must be
+# there. A foreign server on OUR private port would be measured instead of
+# ours (and killed by our stop ladder) — refuse instead. This no longer
+# checks the shared 65433: this arm never binds it (M0137-0007).
 if [[ -f "${PGDATA}/postmaster.pid" ]] && kill -0 "$(head -1 "${PGDATA}/postmaster.pid")" 2>/dev/null; then
     echo "a goopg server is already running at ${PGDATA} (pid $(head -1 "${PGDATA}/postmaster.pid")) — stop it first:" >&2
-    echo "  bench/tpch/stop_goopg.sh" >&2
+    echo "  ${GOOPG_BIN} stop -D ${PGDATA}" >&2
     exit 3
 fi
 if pg_isready -h "${PG_HOST}" -p "${PG_PORT}" -q 2>/dev/null; then
-    echo "something is already listening on ${PG_HOST}:${PG_PORT} and it is not our cluster — refusing" >&2
+    echo "something is already listening on ${PG_HOST}:${PG_PORT} (this arm's private port) and it is not our cluster — refusing" >&2
     exit 3
 fi
-[[ -s "${PGDATA}/PG_VERSION" ]] || { echo "no loaded TPC-H cluster at ${PGDATA}" >&2; exit 3; }
+[[ -s "${SRC_DATA}/PG_VERSION" ]] || { echo "no loaded TPC-H cluster at ${SRC_DATA}" >&2; exit 3; }
 if pgrep -f "ci/batch/run-nightly.sh" >/dev/null 2>&1; then
     echo "the nightly CI batch is running — every timing here would be void. Refusing." >&2
     exit 3
@@ -123,6 +137,15 @@ if [[ "${NO_BUILD:-0}" != "1" ]]; then
     ( cd "${REPO_ROOT}" && go build -o "${GOOPG_BIN}" ./cmd/goopg ) || exit 4
     ( cd "${REPO_ROOT}" && go build -o "${RUNNER_BIN}" ./cmd/tpch-runner ) || exit 4
 fi
+
+# --- snapshot-clone the shared cluster ONCE, up front (M0137-0007) ---------
+# Every start/stop cycle below (one per query, up to 22x) reuses this same
+# private clone — the data does not change between them, so there is no
+# reason to re-clone per query. This is the ONLY touchpoint with the shared
+# cluster in the whole script; it never stops/starts a server there.
+say "snapshot-cloning ${SRC_DATA} -> ${PGDATA}"
+tpch_private_clone_snapshot "${SRC_DATA}" "${PGDATA}" "${PG_HOST}" "${SRC_PORT}" "${CLONE_WAIT}" \
+    || { echo "could not snapshot the shared TPC-H cluster (see above)" >&2; exit 3; }
 
 # --- server lifecycle ------------------------------------------------------
 # GOGC=100 + GOMEMLIMIT=12GiB, not the bench default GOGC=off: CLAUDE.md records
