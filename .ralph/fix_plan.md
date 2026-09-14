@@ -889,22 +889,26 @@ before/after proving the defect it closes.
     ./internal/executor/...` clean. Design doc
     `docs/design/0100-0149/m0137-0010-qual-placement-census-and-duplicate-check.md`.
     No ledger row (both deliverables landed in full).
-- [ ] **M0137-0013 — close or delete the ten-plus-round ledger carries (filed
-  2026-09-15, split out of M0137-0009)** — `03-process-retrospective.md` P7's
-  "Ledger carry" finding: *"the same items appear verbatim across ten-plus rounds:
+- [x] **M0137-0013 — close or delete the ten-plus-round ledger carries (filed
+  2026-09-15, split out of M0137-0009; DONE 2026-09-15)** — `03-process-retrospective.md`
+  P7's "Ledger carry" finding: *"the same items appear verbatim across ten-plus rounds:
   R51 items 2–3, R52 §4.2, R54 follow-ups, '#6', R61-#4, the NLI staleness comment,
   R55 §3 tie-break, F3 procost, the Q8 gap, AGG_MIXED"* — and R67 §3's own
-  legislation against the pattern went unenforced (*"the carry continued"*). For
-  each named item: re-open the `TODO.md` round entries that carry it forward,
-  determine whether a later round already discharged it (many of the surrounding
-  round headings in `TODO.md` already read LANDED — check whether the carried item
-  specifically was covered or just rode along), and either (a) close it with a
-  citation of the discharging round, (b) file it as a proper `.ralph/deferral_ledger.md`
-  row with a mechanism and resume point (M0137-0012's pattern), or (c) delete it as
-  stale/superseded with the reason recorded. Filing/determination only; no
-  speculative code change. This is the task M0137-0009's design doc
-  (`docs/design/0100-0149/m0137-0009-retire-hashagg-width-currency.md` §"What
-  landed" 3) explains was too large to fold into that task.
+  legislation against the pattern went unenforced (*"the carry continued"*).
+  Traced all ten through `TODO.md`'s round log and `02-open-problems.md`. Result
+  (full determinations in
+  `docs/design/0100-0149/m0137-0013-ledger-carry-determinations.md`): 3 items
+  discharged by later rounds — **(a) close** (R52 §4.2 by R54's Redesign LANDED
+  2026-09-11; 2 of R54's 3 follow-ups by R55/R56 LANDED 2026-09-11); 1 item
+  superseded by broader instrumentation — **(c) delete** (R51's DP-trace
+  re-verification ask, superseded by R53 Step-0's DPTRACE machinery); 6 items
+  already carry ONE permanent non-duplicative home in `02-open-problems.md`
+  (N45, N50, B4/O9) — **(a) close the carry**, no new filing; 1 item was a real,
+  previously-unfiled gap — **(b) new `.ralph/deferral_ledger.md` row**
+  `m0137-0013-nli-semi-anti-match-fraction-gap` (`estimateNLIndexJoin` never
+  applies `semiJoinMatchFraction` for SEMI/ANTI, unlike its sibling
+  `estimateJoin`, confirmed live at HEAD). No `TODO.md`/`rNNN-*` round
+  directory edited. No production planner/executor/catalog code touched.
 
 ## M0138 — PG-faithful ANALYZE statistics (filed 2026-09-14)
 
