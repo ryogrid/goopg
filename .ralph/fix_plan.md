@@ -778,12 +778,28 @@ before/after proving the defect it closes.
     hazard doesn't apply) and the M0137-0003 baseline-capture tools
     (`estimate-audit -plan-only`/`capture-tpch.sh` deliberately target the shared
     cluster itself — they measure ITS state).
-- [ ] **M0137-0008 — build `INDEX-by-query.md` and `INDEX-by-mechanism.md` over the
+- [x] **M0137-0008 — build `INDEX-by-query.md` and `INDEX-by-mechanism.md` over the
   round corpus** — one row per TPC-H/TPC-DS query and per mechanism, naming the rounds
   that touched it and their standing verdict, so a scope can cite prior work instead of
   re-deriving it. R127 was withdrawn on nine findings, three fatal, every one refuted
   by a document already on disk; the written "grep the directory first" warning was
   authored *before* R130 and still did not work. Make citing the index a scope gate.
+  - DONE 2026-09-15: both files landed at
+    `docs/design/not_ralph/plan_parity_fix_take2/INDEX-by-query.md` (23 TPC-H +
+    86 TPC-DS query rows, oldest→newest round list + last verdict) and
+    `INDEX-by-mechanism.md` (14 mechanism-tag sections, 6-59 rounds each) —
+    alongside the round directories they index, matching where `AGENT.md`'s
+    harness section already expected them. Built from six parallel read-only
+    subagents (one per ~20-round slice of all 126 `rN-*` directories) each
+    extracting title/queries/mechanisms/verdict from `REPORT.md`/`DESIGN.md`
+    without reading the large `*.plans.txt`/`*.diff.txt` dumps, then a
+    one-shot Python regroup script (not committed — one-shot tool, not a
+    generator). One data-quality fix needed: 3 rounds folded a TPC-DS
+    control-query mention into the free-text TPC-H cell; fixed by capping
+    the TPC-H extraction to `Qn`, n<=22 (TPC-H's real range). Design doc
+    `docs/design/0100-0149/m0137-0008-round-corpus-index.md`. No production
+    code touched; no ledger row (retrieval tooling over already-written
+    reports).
 - [ ] **M0137-0009 — retire the flag and ledger debt** — delete
   `GOOPG_HASHAGG_WIDTH_CURRENCY` (R124 §7 resolved its promote-or-delete to **delete**;
   it ships default-OFF and net-negative), state the default-off arm cap in the harness,
