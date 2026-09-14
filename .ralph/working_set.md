@@ -1,59 +1,83 @@
-Task: M0138-0003 — verify `stadistinct` parity end to end.
-**COMPLETE and committed/pushed** this loop (`f60ba92e2`), branch
+Task: M0138-0004 — MCV, histogram and correlation from the shared sample.
+**COMPLETE and committed/pushed** this loop (`44085c3`), branch
 `plan-parity-with-pg-take2-ralph`.
 
-Files: `docs/design/0100-0149/m0138-0003-stadistinct-parity-verification.md`
-(new — full writeup), `docs/design/README.md` (+index row), `.ralph/fix_plan.md`
-(M0138-0003 checked off, DONE summary). No `.go` file touched — this was a
-verification-only task per its own text ("land a change only where a real
-divergence is found").
+Files: `internal/executor/operators_analyze.go` +
+`operators_analyze_test.go` (production fix + 2 new regression tests),
+`docs/design/0100-0149/m0138-0004-mcv-histogram-correlation-selection-rule.md`
+(new), `docs/design/README.md` (+index row), `.ralph/deferral_ledger.md`
+(flipped 2 rows to resolved, filed 1 new row), `.ralph/fix_plan.md`
+(M0138-0004 checked off + DONE summary, plus a blast-radius correction on
+the pre-existing parser AST-drift note).
 
-What was verified:
-  - Consumer audit: `catalog.ColumnStats.StaDistinct()` (`catalog.go:1942`) has
-    exactly 3 callers (`pg18_user_catalog_rows.go:1591` pg_stats view,
-    `pgstats.go:80` pg_statistic heap row, `joinselectivity.go:235` nd2 input)
-    — none reads a bare `NDistinct`. Convention was already correct.
-  - Re-measured R78's witness (`lineitem.l_orderkey`) on a **HEAD build**
-    (carrying M0138-0002) restarted against the persistent TPC-H bench pair
-    (goopg :65433 / PG oracle :65432, `GOOPG_ANALYZE_SEED=20260905` pinned via
-    `bench/tpch/env_goopg.sh`). Built to a **private** `/tmp/goopg-m0138-0003-bin`
-    (not `tmp/goopg-bench-bin`) because `ci/batch/nightly-scheduler.sh` (pid
-    849415) was live — see memory `goopg_bench_bin_shared_with_nightly_lane`.
-    Result: goopg `l_orderkey` ndistinct moved from pre-M0138-0002's `-0.1956`
-    frac (~1.17M, 3.4x off PG) to `327804` absolute — inside PG's own
-    unpinned 3-run noise band (`336410`-`366886`, ~9% spread). 5 more spot-check
-    columns (l_partkey, l_suppkey, l_linestatus, l_shipdate, customer.c_custkey
-    PK) all matched PG within noise; both engines report `-1` for the unique
-    PK, confirming the 10%-threshold switch fires identically.
-  - Conclusion: R78's divergence WAS the M0138-0001 block-representation gap,
-    already fixed by M0138-0002 — not a stadistinct-convention bug. No diff
-    earns landing (anti-tuning rule).
+Starting state (important for the next loop's trust calibration): found
+UNCOMMITTED WIP already in the working tree at loop start (a prior loop had
+applied 3 fixes from the M0138-0001 census — AvgWidth typlen fallback,
+correlation tie-break via `sort.SliceStable`, MCV bucket tie-break by
+ascending value — then got cut off before committing, leaving two orphaned
+bench servers `:65433`/`:65437` running from its own measurement work).
+Built on that WIP rather than discarding it; reaped the orphaned servers via
+`goopg stop -D <dir>` (never `pkill`) so `tpch-spotcheck.sh`'s snapshot-clone
+could get a quiescent copy.
 
-Key symbols: `catalog.ColumnStats.StaDistinct()` (`internal/catalog/catalog.go:1942`),
-its 3 call sites listed above. PG oracle: `get_variable_numdistinct`
-(`postgres/src/backend/utils/adt/selfuncs.c`).
+What was added this loop (3 more divergences, found reading
+`compute_scalar_stats`, analyze.c:2402-2919, line-by-line):
+  1. MCV "complete list" shortcut: was `len(buckets) <= statsTarget` alone;
+     PG's `track_cnt == ndistinct` requires EVERY distinct value to have
+     repeated (track[] never holds a singleton). Fixed to `nmultiple ==
+     len(buckets) && len(buckets) <= statsTarget && stats.StaDistinct() > 0`.
+  2. `analyzeMCVList`'s candidate cap was `len(buckets)` (ndistinct); PG caps
+     by `track_cnt` == `nmultiple`. Fixed to cap by `nmultiple`.
+  3. Histogram boundary dedup: removed. PG's `compute_scalar_stats`
+     (analyze.c:2806-2836) does NOT dedup adjacent equal boundaries; the
+     selectivity consumer (`bucketFraction`, selectivity.go) already
+     implements PG's own `binfrac = 0.5` equal-bounds fallback
+     (selfuncs.c:1234-1237). The old dedup only threw away information.
+  - Each fix verified empirically before committing: patched a throwaway
+    copy of the OLD logic (via a small Python edit to a `/tmp` backup, never
+    touching the working tree's real file) and re-ran a probe test to
+    confirm the buggy behavior actually differed from the fix — do this
+    before trusting a hand-derived "this should differ" claim; PG's
+    analyze_mcv_list arithmetic is not obviously monotonic in candidate-list
+    size, so a purely algebraic argument was not trusted alone.
+  - Two new regression tests:
+    `TestAnalyzeMCVExcludesSingletonsFromCompletenessAndCandidates` (60
+    repeated + 40 singleton values, target 100 — MCV goes from "all 60" to
+    "none", matching the near-uniform-rejection precedent) and
+    `TestAnalyzeHistogramKeepsAdjacentDuplicateBoundaries` (a rank-3 value
+    excluded from MCV candidacy but still spanning 2+ histogram boundary
+    picks).
+  - Deferred (ledger row `m0138-0004`): `compute_distinct_stats`
+    (non-orderable kinds, e.g. bytea/interval) still uses a plain
+    count-sort instead of PG's actual bounded track-list algorithm — no
+    TPC-H/TPC-DS column exercises this path, so left unported without a
+    corpus target to validate against.
 
-Gates run: `go build ./...` clean (no code changed). Pre-commit hook's
-pgbench smoke passed (commit succeeded). `make ralph-state-guard`: same
-running/in_progress marker mismatch as recent loops (previous loop's
-clean-exit marker), auto-repaired, then OK.
+Key symbols: `computeColumnStats` (`internal/executor/operators_analyze.go`,
+the `completeAndFits`/`mcvCount`/histogram-`bounds` sections), PG oracle
+`compute_scalar_stats` (`postgres/src/backend/commands/analyze.c:2402-2919`),
+`analyze_mcv_list` (`:2980`), `ineq_histogram_selectivity`
+(`postgres/src/backend/utils/adt/selfuncs.c:1049`).
 
-Bench-cluster side effect (intentional, matches M0138-0001 precedent of
-leaving clusters running post-measurement): TPC-H goopg bench (:65433) was
-stopped and restarted on the private HEAD build above (same PGDATA, no
---reset, no data loss) and had `ANALYZE lineitem;`/`ANALYZE orders;` run
-several times against it — this is now the standing state of that cluster
-(post-M0138-0002 stats, matches what any future HEAD build would produce).
-`tmp/goopg-bench-bin` (the shared nightly-lane artifact) was NOT touched.
+Gates run: `go build ./...` clean. `go test ./internal/executor/...
+./internal/optimizer/...` full packages green. `RALPH_PRECOMMIT_SCOPE=units
+scripts/ralph-precommit-test.sh`: green for `internal/executor` and
+`internal/optimizer`; `internal/parser` fails 60 test functions (pre-existing
+`RangeVar.GroupedJoinUnaliased` AST-drift, filed 2026-09-15, unrelated —
+confirmed the diff touches only executor files) plus the pre-existing
+untracked `bak/` build failure. `scripts/tpch-spotcheck.sh`: `RESULT=PASS`
+(Q12=2 rows / Q13=34 rows, canonical anchors) after reaping the two orphaned
+servers. `make ralph-state-guard`: consistent.
 
 In-flight: none.
 
-Next step: Per the banner, M0138's next unchecked task is **M0138-0004**
-("MCV, histogram and correlation from the shared sample") — apply PG's
-`compute_scalar_stats`/`compute_distinct_stats` selection rule to the sample
-M0138-0002 now produces. Re-check the banner in `.ralph/fix_plan.md` fresh
-next loop before committing (M0139/M0140 may have become topmost-unblocked
-instead) — selection is "topmost milestone (M0138) with an unblocked task"
-per the banner text. Also worth a quick look: M0138-0001's correlation
-tie-break divergence (36/118 TPC-DS columns vs PG's 7/119) is cited as an
-M0138-0004 input.
+Next step: Per the banner, re-check `.ralph/fix_plan.md`'s `## Current
+Priority` banner fresh (M0139/M0140 may now be the topmost-unblocked item in
+the M0138/M0139/M0140 independent-trio, or M0138-0005 "corpus re-measure at a
+declared epoch" — the natural follow-up to this loop's mechanism fix, which
+this loop deliberately did NOT do since the milestone's own task breakdown
+assigns it to M0138-0005 explicitly). Before starting M0138-0005 or any
+further M0138 corpus work, check for orphaned bench servers first (`ss -tlnp
+| grep -E '65433|65437'`) — this loop found two left running by an
+interrupted predecessor and had to reap them before the spotcheck gate could
+run.
