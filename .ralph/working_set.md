@@ -1,85 +1,90 @@
-Task: M0139-S1 — "a hook point inside the join tree" (executor-side
-narrowing / projection pushdown milestone). **COMPLETE and committed** this
-loop, branch `plan-parity-with-pg-take2-ralph`.
+Task: M0139-S2 — "narrow scan output at the new hook" (executor-side
+narrowing / projection pushdown milestone). **COMPLETE and committed**
+(`62df1ee65`) and pushed this loop, branch `plan-parity-with-pg-take2-ralph`.
 
-Files: `internal/optimizer/joinleghook.go` (new — the hook + flag),
-`internal/optimizer/joinleghook_test.go` (new — 3 tests),
-`internal/optimizer/createplanjoin.go` (call site in `joinInputsFor`),
-`internal/optimizer/flaglabels.go` (+`GOOPG_NARROW_LEG_HOOK` provenance row),
-`scripts/planner-flags.env` (regenerated via `go run
-./cmd/gen-planner-flag-labels`), `docs/design/0100-0149/m0139-s1-join-leg-hook.md`
-(new), `docs/design/README.md` (+index row), `.ralph/fix_plan.md` (M0139-S1
-checked off + summary).
+Files: `internal/optimizer/joinleghook.go` (narrowJoinLeg now reuses
+narrowBuildInput's keep-set chain instead of always declining; gained
+`*Path` + `nliInner bool` params), `internal/optimizer/createplanjoin.go`
+(call-site update, sets `nliInner` for both NLI kind strings),
+`internal/optimizer/joinleghook_test.go` (replaced S1's tests with
+`TestNarrowJoinLegCountsAndNarrows` / `TestNarrowJoinLegFiresAndNarrowsOnLiveJoinSearch`),
+`internal/optimizer/pathtarget_test.go` + `planner_test.go` +
+`internal/executor/owned_build_poison_test.go` (5 pre-existing tests
+re-baselined to the new, correct build/Project counts — see design doc for
+the derivation of each), `docs/design/0100-0149/m0139-s2-narrow-join-leg-output.md`
+(new), `docs/design/README.md` (+index row), `.ralph/fix_plan.md` (M0139-S2
+checked off + summary), `analysis/m0139/m0139s2-sf025-hookoff.txt` /
+`-hookon.txt` (qual-placement-census capture pair, committed as evidence).
 
-What was done: recon found the real gap narrower than the milestone doc's
-"no `*Project` above the scan at all" — `joinInputsFor` already narrows a
-hash join's inner/build side (`narrowBuildInput`) and both merge-join sides
-(`narrowMergeInput`); only a hash join's OUTER/probe side and BOTH nested-loop
-sides (plain + NLI) were never reached. `narrowPlanOutput` (the function that
-actually builds a `*Project`) already declines to wrap a no-op cut
-(`len(keep) >= len(lay)`), so an "identity-wrapping hook" built by calling it
-directly would be silently absorbed and prove nothing about reachability —
-the hook had to be a genuinely new call site, not a reuse of that function.
-Landed `narrowJoinLeg(n, lay)`, gated by new default-ON flag
-`GOOPG_NARROW_LEG_HOOK`, called from `joinInputsFor` on both legs of every
-join kind (safe uniformly because the function is proven to never mutate
-its input). For S1 it is UNCONDITIONALLY A DECLINE: counts every
-currently-unhooked eligible leg (`isNarrowableLeaf`) but always returns the
-pair byte-identical to input — "no parity movement" is guaranteed by
-construction, not merely predicted.
+What was done: filled S1's always-decline `narrowJoinLeg` body with the
+SAME 3-tier derivation `narrowBuildInput` uses (joinKeepSet -> buildKeepSet
+-> neededKeepSet -> narrowPlanOutput). Safety argument for NL legs (where
+`deriveJoinKeepsAt` never stamps JoinKeep): the tightest tier correctly
+reports "unknown" there and falls through to the two join-kind-agnostic,
+over-inclusive fallback tiers (buildKeepSet reads Path.Target; neededKeepSet
+reads a raw-AST-walk NAME set) — safe by the SAME argument narrowcostinputs.go
+already documents ("can only keep too many columns, never too few").
+ONE case is structurally forbidden regardless of keep-set safety: an NLI's
+INNER slot is typed concretely (`*IndexScan`/`*BitmapHeapScan` for the two
+NLI kind strings `"PathNestLoop(NLI)"`/`"PathNestLoop(NLI-bitmap)"`), so
+wrapping it in a `*Project` is a plan-TIME PANIC — caught live by
+`TestQ2DecorrelatedGroupKeyResolvesInAggregateInput` and
+`TestDerivedTableUnderIndexNLReturnsRows` before the `nliInner` exclusion
+was added (2 real bugs found and fixed mid-loop, not hypothetical). Landing
+real narrowing legitimately moved plan shape wherever a previously-unwrapped
+leg had something to drop, so 5 pre-existing tests needed their hard-coded
+build-count oracle RE-DERIVED (via throwaway zz_probe*_test.go files, always
+deleted before commit) rather than loosened — each new count was sanity-
+checked against the keep-set rules before being hardcoded, never accepted
+blind.
 
-Key symbols: `narrowJoinLeg`/`isNarrowableLeaf`/`legHookFireCount*`
-(`internal/optimizer/joinleghook.go`), the two new call-site lines in
-`joinInputsFor` (`internal/optimizer/createplanjoin.go`, right after the
-existing `narrowBuildInput`/`narrowMergeInput` calls), `narrowPlanOutput`
-(`narrowoutput.go:708`, the function M0139-S2 will reuse at this hook).
+Key symbols: `narrowJoinLeg` (joinleghook.go, now ~85 lines with the safety
+argument documented inline), `joinKeepSet`/`buildKeepSet`/`neededKeepSet`/
+`narrowPlanOutput` (narrowoutput.go, unchanged — reused not duplicated),
+`createNestLoopIndexJoinPlan`/`createNestLoopBitmapJoinPlan` (createplannl.go,
+the two panic sites that located the NLI-inner exclusion), `findFirstJoin`
+(small_dim_buildside_test.go, reused to fix TestPlanJoinPicksHashAlgo rather
+than writing a second tree-walker).
 
-Hypothesis/Findings: none open — this was plumbing with a mechanically
-proven zero-behaviour-change property, not a diagnosis task. M0139-S2's job
-(next slice, still unchecked in fix_plan.md) is to replace `narrowJoinLeg`'s
-always-decline body with the real keep-set derivation `narrowBuildInput`
-already uses (`buildKeepSet`/`joinKeepSet`/`neededKeepSet`), reusing it
-rather than duplicating it — that is where real narrowing (and the actual
-row-width win) happens, and where a corpus-wide "N queries narrowed" count
-becomes meaningful.
+Hypothesis/Findings: none open for S2 itself — implementation is complete,
+proven safe by construction (the "never fewer than needed" over-inclusion
+argument) AND validated live (qual-placement census 99/99 clean, TPC-DS
+SF0.25 values gate clean, no timing regression). The two NLI panics were
+real, found by running the existing suite (not hypothesised) — TRUST THE
+FULL TEST SUITE after any change to a hook this widely reachable; a green
+`go build` proves nothing about a type-assertion panic three calls deep.
 
 Gates run: `go build ./...` clean. `go test ./internal/optimizer/...
-./internal/executor/...` fully green (including
-`TestFlagProvenanceEnvIsGenerated`, which required regenerating
-`scripts/planner-flags.env`). `RALPH_PRECOMMIT_SCOPE=units
-scripts/ralph-precommit-test.sh`: green except the pre-existing,
-already-filed `internal/parser` `GroupedJoinUnaliased` AST-drift (60 test
-fns) and untracked `bak/` build failure — both confirmed unrelated (no
-optimizer/executor packages in the failure list). `scripts/tpcds-sf025-regression.sh
-sweep`: PASS=96 MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0 SKIP=3 (clean
-values gate on real data). `make ralph-state-guard`: same recurring stale
-status/progress.json pattern as prior loops, auto-repaired, then consistent.
+./internal/executor/... ./internal/testutil/tpch/... ./internal/postmaster/...`
+all green. `RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh`:
+green except the pre-existing, already-filed `internal/parser`
+`GroupedJoinUnaliased` AST-drift (60 test fns, unrelated — confirmed by a
+prior loop via git stash). Qual-placement census on full TPC-DS SF0.25
+corpus (99 queries, private clone `tmp/goopg-m0139s2-bin`, hook off vs
+default-on): `mismatch=0`. `scripts/tpcds-sf025-regression.sh sweep`:
+PASS=96 MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0 SKIP=3, status-delta
+verdict-changes=none total-delta=-1.7%. `make ralph-state-guard`: same
+recurring stale status/progress.json pattern as every prior loop,
+auto-repaired, then consistent.
 
-In-flight: `scripts/tpch-spotcheck.sh` **could not complete** — retried 3x
-over ~15 min, every attempt failed at
-`tpch-private-clone: 127.0.0.1:65433 still busy after 60s` because the
-SHARED TPC-H bench server was up the entire loop (peer-owned per the
-`goopg_shared_bench_cluster_collisions` memory — must not be stopped by this
-loop) and the private-clone snapshot step (`scripts/lib/tpch-private-clone.sh`)
-requires the shared server to be fully DOWN, not merely idle, before it will
-copy the data directory. Not treated as a values-safety gap: this specific
-change is proven a hard byte-identical no-op by `TestNarrowJoinLegDeclinesButCounts`
-(every return path pointer/content-identical to input, for every
-flag/shape combination), independent of which server answers the question,
-and the TPC-DS SF0.25 sweep above is a real, clean values gate on real data.
-Next loop (or a retry later in THIS loop before it ends, if the shared
-server frees up): re-run `scripts/tpch-spotcheck.sh` opportunistically;
-expected to reproduce the canonical Q12=2/Q13=34 anchors unchanged.
+In-flight: `scripts/tpch-spotcheck.sh` **still could not run** — shared
+`:65433` TPC-H bench server was up (peer-owned, per
+`goopg_shared_bench_cluster_collisions` memory) for this entire loop too
+(now 2 consecutive loops). Not treated as a values-safety gap: the TPC-DS
+SF0.25 sweep above is a real, clean, 99-query values gate on real data, and
+the narrowing mechanism itself is corpus-agnostic (same 3-tier chain, same
+census). Next loop (or whenever the shared server frees up): re-run
+`scripts/tpch-spotcheck.sh` opportunistically; expected to reproduce the
+canonical Q12=2/Q13=34 anchors unchanged (narrowing changes row WIDTH,
+never row COUNT).
 
-Next step: select **M0139-S2** ("narrow scan output at the new hook —
-reuse the existing narrowing rather than duplicating it") per the banner
-order (M0138 done, M0139 in progress, M0140 has M0140-0003 still open too —
-either is a valid pick; M0139-S2 has direct continuity with this loop's
-work). S2's job: replace `narrowJoinLeg`'s always-decline body with a real
-keep-set derivation reusing `buildKeepSet`/`joinKeepSet`/`neededKeepSet`
-(the same functions `narrowBuildInput` already calls in `narrowoutput.go`),
-call `narrowPlanOutput` with that real keep set instead of returning
-unchanged, and measure the actual row-width win corpus-wide (values gates +
-qual-placement census + per-query timing, per the milestone's own
-Definition-of-Done items still unchecked). Do not re-derive `attr_needed` as
-the blocker (ruled out twice already).
+Next step: select the next M0139 slice per the banner order — **M0139-S3**
+("measure the residue against K67's floor — even narrowed to one column
+goopg is 72 B/row -> 103 MB and still spills at work_mem=64MB where PG is
+22 B/row -> 31 MB; report the post-pushdown figure as a NUMBER") is the
+natural continuation now that S2's real narrowing is live and measurable.
+Alternatively M0139-0004 (re-measure the "duplicate hash build map" premise
+— independent of the slices, cheap to take if S3 needs a bigger corpus rig)
+or M0140's still-open M0140-0003 are both valid per the banner ("M0140 does
+not wait on M0139"). Do not re-open S1/S2 — both fully done, gated, and
+pushed.
