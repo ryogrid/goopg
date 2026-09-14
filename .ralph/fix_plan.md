@@ -1233,11 +1233,33 @@ Carry, do not rediscover: **K20** — `GOOPG_GATHER_PATHS` gates *partial paths
 only, not parallelism*; the post-pass emits a Gather regardless, so there is no
 setting that yields a serial plan.
 
-- [ ] **M0140-0001 — re-measure the failing test set under the `GOOPG_GATHER_PATHS`
-  flip at HEAD** — do **not** inherit the R43-era "5 failing, 4 needing adjudication"
-  list; it is ~87 rounds stale and at least `TestSlice3LiveQ9ShapeDerivation` was
-  re-baselined by R51 nine rounds later. The ledger's own adjacent note binds:
-  re-measure before relying on any prior round's figures.
+- [x] **M0140-0001 — re-measure the failing test set under the `GOOPG_GATHER_PATHS`
+  flip at HEAD** (recon, no production change; DONE 2026-09-15) — do **not** inherit
+  the R43-era "5 failing, 4 needing adjudication" list; it is ~87 rounds stale and
+  at least `TestSlice3LiveQ9ShapeDerivation` was re-baselined by R51 nine rounds
+  later. The ledger's own adjacent note binds: re-measure before relying on any
+  prior round's figures.
+  - Ran all four named tests (`TestSplitEqualityForHashMultiKey/searched_enumerator`,
+    `TestSlice3LiveQ9ShapeDerivation`, `TestSlice3FilterColumnSurvivesNarrowing`,
+    `TestOwnedBuildPoisonPrebuiltBoundary`) both at the current default
+    (`GOOPG_GATHER_PATHS` unset) and under `GOOPG_GATHER_PATHS=all`. None of the
+    tests set the env var internally, so the flip is applied purely via the
+    process environment — exactly what a default-on flip would change.
+  - Result: **all four PASS at the current default and all four FAIL under the
+    flip** — the identical four names R43 measured, none independently fixed by
+    the intervening ~87 rounds. The prerequisite list is exactly as large today
+    as it was at R43; it is stale in dating, not in content.
+  - Failure-mode read: the three optimizer/executor narrow-build tests
+    (`TestSlice3LiveQ9ShapeDerivation`, `TestSlice3FilterColumnSurvivesNarrowing`,
+    `TestOwnedBuildPoisonPrebuiltBoundary`) look like one shared mechanism —
+    partial-path admission changes which join-tree shape wins the search before
+    the narrowing pass runs, so their exact narrow-build column-set pins no
+    longer match. The multi-key hash-join test fails for a different reason
+    (falls back to Nested Loop instead of hash-joining under the flip).
+  - No adjudication against PG performed here — that is M0140-0002's job, per
+    the recon-task boundary. No ledger row: the divergence is between two
+    goopg-internal planner features, not a newly discovered PG-incompatibility.
+  - Design doc: `docs/design/0100-0149/m0140-0001-gather-paths-flip-failing-set-remeasure.md`.
 - [ ] **M0140-0002 — adjudicate whatever genuinely fails against PG 18.3** — R14's
   precedent applies: ask the oracle, the test can be wrong. Do not change planner
   behaviour to satisfy a pin the oracle contradicts.
