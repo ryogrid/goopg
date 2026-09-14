@@ -711,11 +711,21 @@ before/after proving the defect it closes.
     `METHODOLOGY3/` left untouched (frozen 2026-09-14 stocktake). No production
     code touched; no ledger row (Q2/Q75 is evidence about oracle stability, not an
     unimplemented PG behaviour in goopg).
-- [ ] **M0137-0005 — re-baseline `make plan-gate`** — it is a goopg-vs-committed-goopg
+- [x] **M0137-0005 — re-baseline `make plan-gate`** — it is a goopg-vs-committed-goopg
   baseline pin (`Makefile:431-453`), **not** a diff against live PG, and its baseline
   has not been refreshed across ~125 rounds of intentional plan change. Land the
   re-baseline as its own commit with the 20 diverging queries adjudicated or
   explicitly carried, so the gate is a live signal again.
+  - DONE 2026-09-15: confirmed the stale baseline (`warm-pin-20260905.txt`, mtime-newest
+    of 18 files) DIFFERed on exactly 20/22 queries as the line claimed. Node-type census
+    attributed the drift to already-landed mechanism classes (parallel/`Gather`
+    adoption, index-scan narrowing, `Memoize`, agg-strategy flips); a handful of
+    same-node-count-but-DIFFER queries flagged for M0137-0010's qual-placement census
+    rather than root-caused here. `scripts/tpch-spotcheck.sh` PASS (Q12=2, Q13=34)
+    before pinning. Captured `plan_snapshots/m0137-0005-rebaseline-20260915.txt`;
+    `make plan-gate` now 22/22 MATCH. Design doc
+    `docs/design/0100-0149/m0137-0005-plan-gate-rebaseline.md`. No production code
+    touched; no ledger row (instrument re-pin, not a discovered PG incompatibility).
 - [ ] **M0137-0006 — make the stats-epoch declaration a checked step** — a values
   sweep re-samples statistics and opens a new epoch; R120 attributed two apparent
   "worsenings" to drift rather than the flag and left a rule no tool enforces.

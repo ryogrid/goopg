@@ -1,72 +1,64 @@
-Task: M0137-0003 — write the canonical baseline-capture procedure.
-**COMPLETE and committed** (pending push in this loop).
+Task: M0137-0005 — re-baseline `make plan-gate`.
+**COMPLETE and committed** (this loop, `plan-parity-with-pg-take2-ralph`).
 
-Files: `docs/design/0100-0149/m0137-0003-baseline-capture-procedure.md`
-(new), `docs/design/README.md` (+index row), `docs/design/not_ralph/plan_parity_fix_take2/METHODOLOGY.md`
-(§4.1 TPC-H caveat + pointer to the new doc), `AGENT.md` (two dangling
-"plan-parity-take2 work appendix" pointers repointed at the new doc),
-`scripts/capture-tpch.sh` (fail-fast `TPCH_QUERY_DIR`/`TPCH_Q15A_FILE`
-existence guard + updated header comment), `.ralph/deferral_ledger.md`
-(M0137-0001's `TPCH_QUERY_DIR` row flipped `-` -> `resolved`),
-`.ralph/fix_plan.md` (M0137-0003 checked off).
+Files: `plan_snapshots/m0137-0005-rebaseline-20260915.txt` (new baseline,
+22 queries), `docs/design/0100-0149/m0137-0005-plan-gate-rebaseline.md`
+(new), `docs/design/README.md` (+index row), `.ralph/fix_plan.md`
+(M0137-0005 checked off).
 
-Key symbols: none (docs + a shell guard; no Go code touched).
+Key symbols: none (`make plan-snapshot-capture`/`plan-gate` +
+`cmd/plan-snapshot`, `scripts/pg-plan-parity-diff.py`; no Go code touched).
 
 Findings:
-- The AGENT.md "plan-parity-take2 work appendix" this task was meant to
-  replace was already DELETED (commit `baf40efcb`, same commit that filed
-  M0137-M0143) — its pointer text ("read its §0 and §1") pointed at nothing.
-  Recovered its still-needed bootstrap/port/auth content from
-  `git show baf40efcb -- AGENT.md` and folded it into the new design doc.
-- `docs/design/not_ralph/plan_parity_fix_take2/TODO.md:4861-4875` (path named
-  directly in the M0137 milestone doc's own task line, so citable per the
-  harness's round-directory access rule) settles BOTH halves of this task
-  with a direct 2026-09-14 probe: TPC-H's `r2-instrument/capture-tpch.sh`
-  plans on empty stats (re-hit trap, same as R65 §0) because goopg's ANALYZE
-  stats are per-connection and that script never ANALYZEs; TPC-DS is
-  confirmed NOT affected (query7 cold-session vs ANALYZE-warmed-session
-  plans shape-identical, costs within 0.03%) because its load-time ANALYZE
-  persists durably. This is why `capture-tpcds.sh` stays canonical for
-  TPC-DS while `estimate-audit -plan-only` is canonical for TPC-H — asymmetry
-  is deliberate and cited, not assumed.
-  - Went deep into the underlying mechanism first (SetTableStats storing a
-    SHARED `*Table.Stats` pointer, not obviously per-connection; a live
-    throwaway-server experiment on db `postgres` showed ANALYZE stats DO
-    persist across fresh connections there) before finding the TODO.md
-    citation above already settles it directly with a same-corpus probe.
-    Do not re-open this — trust the citation, not the code archaeology.
-  - Also resolved the M0137-0001 ledger row on `capture-tpch.sh`'s untracked
-    `TPCH_QUERY_DIR`: decided it's off the baseline critical path now
-    (estimate-audit reads `tpch.Queries()` directly), so relocating the
-    corpus into git tracking is optional polish, not required. Added a
-    fail-fast existence guard so a missing corpus errors once instead of 22
-    silent "MISSING QUERY FILE" sections.
-- Live-validated the exact `estimate-audit -plan-only` command end-to-end:
-  built the binary, stood up a throwaway private goopg server (never a
-  shared `:6543x` cluster), loaded `tpch.DDL()` + `tpch.SampleInserts()`,
-  ran `-plan-only -queries 1,6`, confirmed `=== Qn` section format matches
-  `pg-plan-parity-diff.py`'s `SECTION_RE`. Server stopped, all scratch files
-  removed, nothing committed from the run (same precedent as M0137-0002's
-  manual checks).
+- `make plan-gate` picks the mtime-newest `plan_snapshots/*.txt` file
+  (`Makefile:431-453`'s `ls -t … | head -1`); that was `warm-pin-20260905.txt`,
+  ~9 days / ~125 rounds of intentional plan-shape work stale, so it DIFFERed
+  on **20/22** queries (only `Q15a-VIEWBODY`, `Q19` MATCH) — reproducing the
+  fix_plan line's own figure exactly.
+- Per-query node-type census (added/removed EXPLAIN node counts from the
+  full diff) attributes the drift to already-landed, already-gated
+  mechanism classes: parallel/`Gather` adoption (Q1,Q3,Q5,Q9,Q12,Q16,Q18,Q22),
+  index-scan/`Nested Loop` narrowing (Q7,Q8,Q9,Q17,Q21), new `Memoize` (Q8),
+  `HashAggregate`<->`GroupAggregate` flips (Q3,Q13,Q16,Q18,Q7). Q1/Q10/Q11/
+  Q14/Q20 DIFFER with identical added/removed node-type counts — shape
+  moved sideways (operand/qual ordering, not node-type) — flagged for
+  M0137-0010's qual-placement census, not root-caused here (out of scope).
+- Correctness check before pinning: `scripts/tpch-spotcheck.sh` PASS
+  (Q12 rows=2, Q13 rows=34) — the drift above is plan-shape movement, not a
+  row-count regression riding along.
+- Re-baselined: `make plan-snapshot-capture LABEL=m0137-0005-rebaseline-20260915`
+  against goopg TPC-H `:65433` (started via `bench/tpch/setup_goopg.sh`,
+  persisted `tpch` DB from the 2026-07-27 HammerDB rebuild, no reload
+  needed). `make plan-gate` now reads **22/22 MATCH**. 18 pre-existing
+  snapshot files left in place as inert frozen history (only the
+  mtime-newest is ever consulted) — no cleanup was in scope.
+- No production planner/executor/catalog code touched (pure instrument
+  re-pin); no ledger row (nothing newly discovered about PG behaviour —
+  this is `plan-gate`'s own baseline currency, not a PG-incompatibility).
+- No TPC-DS re-baseline: `make plan-gate` is TPC-H-only
+  (`PLAN_PORT ?= 65433`, `PLAN_DB ?= tpch`); TPC-DS already has its own
+  current instrument (SF0.25 sweep, M0137-0004's subject).
 
 Next step: read `.ralph/fix_plan.md`'s M0137 section and select the next
-topmost unchecked M0137 task per the banner — **M0137-0004** (reconcile the
-TPC-DS `match=2` vs `match=1` discrepancy) is the next natural pick since
-this task's own doc explicitly declines to settle that question and named it
-as still open. Before starting, re-read `AGENT.md` §"Plan-parity harness"
-(fresh loop = fresh session per the loop-start discipline) and this task's
-new doc's §3 caveat about the reference question.
+topmost unchecked task per the banner. In file order after M0137-0005 that
+is **M0137-0006** (make the stats-epoch declaration a checked step). Before
+starting, re-read `AGENT.md` §"Plan-parity harness" (fresh loop = fresh
+session per the loop-start discipline).
 
 Gates run: `RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh` —
 ran in full; same single pre-existing FAIL (`internal/parser`
-`TestLockingClauseParity`, already filed under M-NIGHTLY, zero Go files
-touched this loop) and nothing else. `python3 scripts/capture-idempotent-test.py
--v` — 2/2 pass (unchanged count; the new guard is exercised on its success
-path by the existing fixture env). `bash -n` on `capture-tpch.sh`,
-`capture-tpcds.sh`, `capture-stamp.sh` — clean. Manual guard-rail check
-(missing `TPCH_QUERY_DIR` exits 1 with the new message instead of 22
-"MISSING QUERY FILE" sections) — as expected, not committed. `make
-ralph-state-guard` — repaired one stale running/completed mismatch from the
-prior loop's clean exit (same pattern as the last two loops), then OK.
+`TestLockingClauseParity`/`RangeVar.GroupedJoinUnaliased` package build
+drift, already filed under M-NIGHTLY, zero Go files touched this loop) and
+nothing else. `make ralph-state-guard` — repaired the same recurring
+running/completed marker mismatch from the prior loop's clean exit as the
+last several loops, then OK. `scripts/tpch-spotcheck.sh` — PASS (see above).
+`make plan-gate` — run twice (pre-rebaseline: 20/22 DIFFER confirming the
+task's premise; post-rebaseline: 22/22 MATCH confirming the fix).
+Pre-commit hook's mandatory pgbench smoke fires automatically on `git
+commit` (not run standalone this loop; the hook itself is the gate).
 
-In-flight: none.
+In-flight: none. TPC-H goopg bench server (`:65433`) was started by this
+loop (`bench/tpch/setup_goopg.sh`, was down at loop start) and stopped again
+(`bench/tpch/stop_goopg.sh`) before finishing — not left running. Nightly
+scheduler (`ci/batch/nightly-scheduler.sh`, PID 849415) was observed idle
+(sleeping, no active batch) throughout and untouched.
