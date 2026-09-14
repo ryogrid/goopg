@@ -1,74 +1,59 @@
-Task: M0138-0001 — ANALYZE divergence census. **COMPLETE and committed/pushed**
-this loop (`3b6643da9`), branch `plan-parity-with-pg-take2-ralph`. Recon task
-per the plan-parity harness (M0138-0001 is one of the three named
-no-production-change recon tasks) — filing/measurement only, no `.go` files
-touched.
+Task: M0138-0003 — verify `stadistinct` parity end to end.
+**COMPLETE and committed/pushed** this loop (`f60ba92e2`), branch
+`plan-parity-with-pg-take2-ralph`.
 
-Files: `docs/design/0100-0149/m0138-0001-analyze-divergence-census.md` (new),
-`docs/design/README.md` (+index row), `.ralph/deferral_ledger.md` (+3 rows,
-task-id `m0138-0001`), `.ralph/fix_plan.md` (M0138-0001 checked off, DONE
-summary).
+Files: `docs/design/0100-0149/m0138-0003-stadistinct-parity-verification.md`
+(new — full writeup), `docs/design/README.md` (+index row), `.ralph/fix_plan.md`
+(M0138-0003 checked off, DONE summary). No `.go` file touched — this was a
+verification-only task per its own text ("land a change only where a real
+divergence is found").
 
-What landed: started the two down goopg bench clusters (`bench/tpch/setup_goopg.sh`
-no `--reset` — idempotent restart of existing data; `bench/tpcds/server.sh
-start sf025`), left all four `:6543x` clusters (goopg/PG x TPC-H/TPC-DS)
-running per the shared-lane convention (never restart a reference). Captured
-`pg_stats` for 61 TPC-H columns + 121 TPC-DS columns per engine (raw at
-`/tmp/m0138-census/*.txt`, scratch not committed). Reconfirmed the milestone
-doc's named block-representation gap (goopg full-block-scan Algorithm R vs
-PG's `BlockSampler_Init`-bounded-blocks Vitter Algorithm Z) by source read
-(`operators_analyze.go:791-923`, `analyze.c:1199-1373`, `sampling.c:39-115`)
-plus live data (TPC-DS `customer`, small enough that PG also scans every
-block, shows near-identical n_distinct; `lineitem`/`store_sales`, far bigger
-than `targrows`, do not).
+What was verified:
+  - Consumer audit: `catalog.ColumnStats.StaDistinct()` (`catalog.go:1942`) has
+    exactly 3 callers (`pg18_user_catalog_rows.go:1591` pg_stats view,
+    `pgstats.go:80` pg_statistic heap row, `joinselectivity.go:235` nd2 input)
+    — none reads a bare `NDistinct`. Convention was already correct.
+  - Re-measured R78's witness (`lineitem.l_orderkey`) on a **HEAD build**
+    (carrying M0138-0002) restarted against the persistent TPC-H bench pair
+    (goopg :65433 / PG oracle :65432, `GOOPG_ANALYZE_SEED=20260905` pinned via
+    `bench/tpch/env_goopg.sh`). Built to a **private** `/tmp/goopg-m0138-0003-bin`
+    (not `tmp/goopg-bench-bin`) because `ci/batch/nightly-scheduler.sh` (pid
+    849415) was live — see memory `goopg_bench_bin_shared_with_nightly_lane`.
+    Result: goopg `l_orderkey` ndistinct moved from pre-M0138-0002's `-0.1956`
+    frac (~1.17M, 3.4x off PG) to `327804` absolute — inside PG's own
+    unpinned 3-run noise band (`336410`-`366886`, ~9% spread). 5 more spot-check
+    columns (l_partkey, l_suppkey, l_linestatus, l_shipdate, customer.c_custkey
+    PK) all matched PG within noise; both engines report `-1` for the unique
+    PK, confirming the 10%-threshold switch fires identically.
+  - Conclusion: R78's divergence WAS the M0138-0001 block-representation gap,
+    already fixed by M0138-0002 — not a stadistinct-convention bug. No diff
+    earns landing (anti-tuning rule).
 
-Three **new** divergences surfaced, none named in the milestone doc, each
-filed as a ledger row with a resume point:
-  - `RowCount`/`reltuples`: goopg exact (full scan) vs PG's
-    `floor((liverows/bs.m)*totalblocks+0.5)` sample extrapolation
-    (`analyze.c:1330-1339`) — scope question for **M0138-0002**.
-  - Correlation tie-break: PG's `compare_scalars`/`tupnoLink` breaks
-    value-sort ties deterministically by physical scan position
-    (`analyze.c:2438-2550,2931-2950`); goopg's `sort.Slice`
-    (`operators_analyze.go:1216-1247`) has no tie-breaker, unspecified tie
-    order. Live evidence: TPC-DS `store_sales`/`customer` — goopg
-    correlation bands to `[0.09,0.16]` on 36/118 columns vs PG's 7/119,
-    concentrated on highest-duplicate-density FK columns. **Hypothesis, not
-    confirmed** — needs a controlled synthetic-table test. Owner:
-    **M0138-0004**.
-  - `pg_stats.avg_width`: PG falls back to fixed catalog `typlen` for every
-    non-varlena type (`analyze.c:2026,2206,2381,2586,2902,2914`); goopg's
-    `datumVariablePayloadWidth` (`operators_analyze.go:1115-1130`) has no
-    `default:` fallback, so int2/int4/int8/date/float/numeric-fast-path
-    columns report `avg_width=0`. Live: 32/61 TPC-H + 70/121 TPC-DS columns
-    affected, reproduces even on a fully-scanned small table (independent of
-    block sampling). Clean, low-risk, well-understood fix — just out of this
-    task's no-code-change scope. Owner: **M0138-0004**.
+Key symbols: `catalog.ColumnStats.StaDistinct()` (`internal/catalog/catalog.go:1942`),
+its 3 call sites listed above. PG oracle: `get_variable_numdistinct`
+(`postgres/src/backend/utils/adt/selfuncs.c`).
 
-Key symbols: `analyzeRelationWith` (`operators_analyze.go:791`),
-`computeColumnStats` (`:1136`), `datumVariablePayloadWidth` (`:1115`) —
-goopg side. `acquire_sample_rows` / `compute_scalar_stats` / `compare_scalars`
-(`postgres/src/backend/commands/analyze.c`), `BlockSampler_*`
-(`postgres/src/backend/utils/misc/sampling.c`) — PG oracle side.
+Gates run: `go build ./...` clean (no code changed). Pre-commit hook's
+pgbench smoke passed (commit succeeded). `make ralph-state-guard`: same
+running/in_progress marker mismatch as recent loops (previous loop's
+clean-exit marker), auto-repaired, then OK.
 
-Gates run: recon task, no build/test gate applicable beyond the pre-commit
-hook's mandatory pgbench smoke, which ran and passed (commit succeeded, hook
-not bypassed). `make ralph-state-guard`: same running/completed marker
-mismatch as recent loops (previous loop's clean-exit marker), auto-repaired,
-then OK — still worth someone fixing at the marker-writer source if it keeps
-recurring every loop.
+Bench-cluster side effect (intentional, matches M0138-0001 precedent of
+leaving clusters running post-measurement): TPC-H goopg bench (:65433) was
+stopped and restarted on the private HEAD build above (same PGDATA, no
+--reset, no data loss) and had `ANALYZE lineitem;`/`ANALYZE orders;` run
+several times against it — this is now the standing state of that cluster
+(post-M0138-0002 stats, matches what any future HEAD build would produce).
+`tmp/goopg-bench-bin` (the shared nightly-lane artifact) was NOT touched.
 
-In-flight: none. The four `:6543x` bench clusters (goopg TPC-H `:65433`,
-PG TPC-H `:65432`, goopg TPC-DS SF0.25 `:65437`, PG TPC-DS `:65438`) are
-**left running** intentionally (shared lane, not throwaway) — verify with
-`pg_isready` before assuming down, do not restart them.
+In-flight: none.
 
-Next step: M0138-0001 done. Per the banner's selection order, M0138's next
-unblocked task is **M0138-0002** ("port PG's block sampler and two-stage row
-selection") — it is the natural next pick since it inherits this census's
-evidence directly and the RowCount/reltuples scope question needs answering
-before M0138-0004 can build on a settled sample source. Re-check the banner
-in `.ralph/fix_plan.md` fresh next loop before committing to M0138-0002 vs an
-M0139/M0140 task that might have become topmost-unblocked in the meantime —
-selection is "topmost milestone (M0138) with an unblocked task" per the
-banner text, and M0138-0002 is that milestone's next unchecked item.
+Next step: Per the banner, M0138's next unchecked task is **M0138-0004**
+("MCV, histogram and correlation from the shared sample") — apply PG's
+`compute_scalar_stats`/`compute_distinct_stats` selection rule to the sample
+M0138-0002 now produces. Re-check the banner in `.ralph/fix_plan.md` fresh
+next loop before committing (M0139/M0140 may have become topmost-unblocked
+instead) — selection is "topmost milestone (M0138) with an unblocked task"
+per the banner text. Also worth a quick look: M0138-0001's correlation
+tie-break divergence (36/118 TPC-DS columns vs PG's 7/119) is cited as an
+M0138-0004 input.
