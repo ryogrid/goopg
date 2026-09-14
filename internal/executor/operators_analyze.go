@@ -29,11 +29,14 @@ import (
 //
 // v0 collects:
 //
-//   - RowCount: visible-tuple count under a fresh
-//     ReadCommitted snapshot (matches upstream's reltuples
-//     definition; exact, not sample-scaled).
+//   - RowCount: extrapolated from the sampled blocks, matching upstream's
+//     reltuples definition exactly (analyze.c:1330-1339's
+//     `floor((liverows/bs.m)*totalblocks+0.5)`) — a random variable across
+//     runs whenever the relation has more blocks than the sample cap, same
+//     as PG's. Degrades to an exact count for a relation small enough that
+//     every block is sampled. M0138-0002.
 //   - Pages: raw block count.
-//   - AvgWidth: total decoded-row bytes / RowCount.
+//   - AvgWidth: total decoded-row bytes / live rows seen in the sample.
 //   - Per-column NDistinct, NullFrac, MCV list, and equi-depth
 //     histogram (computed from the sample).
 //
@@ -779,11 +782,14 @@ func analyzeRelation(pool *storage.Pool, mgr *transam.Manager, cat catalog.Catal
 	return analyzeRelationWith(pool, mgr, cat, tbl, upstreamDefaultStatsTarget, rand.New(rand.NewSource(analyzeSeedFor(tbl))), nil, nil)
 }
 
-// analyzeRelationWith walks every block of tbl under a fresh
-// snapshot, decodes visible tuples via the executor codec,
-// reservoir-samples them with `targrows = target *
-// upstreamSampleMultiplier`, and computes per-table + per-column
-// statistics from the sample (RowCount and Pages remain exact).
+// analyzeRelationWith runs PG's two-stage acquire_sample_rows
+// (analyze.c:1199, ported in analyze_block_sampler.go): stage one samples
+// up to `targrows = target * upstreamSampleMultiplier` BLOCKS at random
+// (blockSampler, Knuth Algorithm S), stage two reservoir-samples ROWS
+// within only those blocks (reservoirState, Vitter Algorithm Z), and
+// computes per-table + per-column statistics from the sample. RowCount is
+// extrapolated from the sampled blocks (see the extrapolation comment at
+// its assignment); Pages remains exact (a raw block count, not sampled).
 // dsCtx supplies session-GUC reachability for DateStyle-aware MCV/
 // histogram-bound rendering (formatDatumDateStyle); pass nil where no
 // session context is available (falls back to ISO/MDY, matching
@@ -830,9 +836,29 @@ func analyzeRelationWith(pool *storage.Pool, mgr *transam.Manager, cat catalog.C
 		Analyzed: true,
 	}
 	var totalBytes int64
-	var seen int64
+	// PG: liverows == samplerows. acquire_sample_rows keeps these as two
+	// counters because heapam_scan_analyze_next_tuple can also report
+	// deadrows (skipped without reaching the reservoir logic at all); goopg
+	// has no dead-row bookkeeping yet (ledger row
+	// m0138-0002-deadrows-not-tracked — nothing downstream consumes a dead
+	// count), so one counter serves both roles here.
+	var liverows float64
+	var rowstoskip float64 = -1
 
-	for blk := storage.BlockNumber(0); blk < nBlocks; blk++ {
+	// M0138-0002: PG's two-stage acquire_sample_rows (analyze.c:1199) — stage
+	// one selects up to sampleCap BLOCKS at random (blockSampler, Knuth
+	// Algorithm S), stage two reservoir-samples ROWS within only those
+	// blocks (reservoirState, Vitter Algorithm Z) — replacing the classic
+	// Algorithm R over EVERY block that ran here before this task. `rng`
+	// (analyzeSeedFor, GOOPG_ANALYZE_SEED-pinnable) is consulted exactly
+	// twice, standing in for PG's process-wide pg_global_prng_state that
+	// seeds both sub-generators (analyze.c:1225,1232) — see
+	// analyze_block_sampler.go's file comment for the full rationale.
+	blkSampler := newBlockSampler(uint32(nBlocks), sampleCap, uint64(rng.Int63()))
+	rstate := newReservoirState(sampleCap, uint64(rng.Int63()))
+
+	for blkSampler.hasMore() {
+		blk := storage.BlockNumber(blkSampler.next())
 		slot, err := pool.Pin(storage.BufferTag{Rel: rel, Block: blk})
 		if err != nil {
 			return nil, err
@@ -870,31 +896,37 @@ func analyzeRelationWith(pool *storage.Pool, mgr *transam.Manager, cat catalog.C
 			if !transam.TupleVisible(t.Header, snap, tx.XID, curcid, combo, mxs) {
 				continue
 			}
-			stats.RowCount++
 			totalBytes += int64(int(t.Header.Hoff) + len(t.Data))
 
 			// review/260831 EO1-4: decode ONLY the tuples the reservoir keeps.
 			// Every visible tuple used to be decoded into a fresh Row — a full
 			// per-column decode plus an allocation — and then dropped by the
 			// sampling test below, so a 10M-row table paid 10M decodes to keep
-			// a few thousand rows. The RNG is still consulted once per row past
-			// the cap, in the same order, so the sample is the same sample.
+			// a few thousand rows.
 			//
-			// Decode the PG-physical tuple body using the header (natts +
-			// null bitmap). Single on-disk row format since M0111-0002.
-			// Algorithm R: fill the reservoir, then for each
-			// subsequent row replace a uniformly-chosen slot
-			// with probability sampleCap/seen. `keep` is decided BEFORE the
-			// decode, and -1 means "this tuple is not in the sample".
+			// PG's Vitter Algorithm Z (analyze.c:1276-1301, mirrored exactly):
+			// the first sampleCap rows fill the reservoir outright ("if
+			// numrows < targrows"). After that, `rowstoskip` — computed by
+			// reservoirState.getNextS using `liverows` BEFORE this row is
+			// counted, exactly as PG's samplerows argument — counts down rows
+			// to pass over before the next replacement, which then picks its
+			// victim slot via a SEPARATE draw on the same PRNG state, not
+			// Algorithm R's per-row rng.Int63n(seen+1) draw this replaced.
 			keep := -1
-			if seen < int64(sampleCap) {
+			if len(reservoir) < sampleCap {
 				keep = len(reservoir)
 				reservoir = append(reservoir, nil)
 				reservoirTID = append(reservoirTID, analyzeSampleTID{})
-			} else if j := rng.Int63n(seen + 1); j < int64(sampleCap) {
-				keep = int(j)
+			} else {
+				if rowstoskip < 0 {
+					rowstoskip = rstate.getNextS(liverows, sampleCap)
+				}
+				if rowstoskip <= 0 {
+					keep = int(float64(sampleCap) * samplerRandomFract(&rstate.rand))
+				}
+				rowstoskip--
 			}
-			seen++
+			liverows++
 			if keep < 0 {
 				continue
 			}
@@ -921,8 +953,20 @@ func analyzeRelationWith(pool *storage.Pool, mgr *transam.Manager, cat catalog.C
 		sort.Sort(&analyzeSampleByTID{rows: reservoir, tids: reservoirTID})
 	}
 
-	if stats.RowCount > 0 {
-		stats.AvgWidth = float64(totalBytes) / float64(stats.RowCount)
+	// PG analyze.c:1330-1339: totalrows is an EXTRAPOLATED ESTIMATE from the
+	// sampled blocks, never an exact count once totalblocks > sampleCap — a
+	// consequence of the owner's Q2 decision (AGENT.md "Plan-parity
+	// harness": reproduce PG's estimates, errors included) that the
+	// M0138-0001 census flagged as a scope question for this task
+	// (ledger row m0138-0001-reltuples-sample-extrapolation). It degrades to
+	// an exact count when blkSampler.m == nBlocks (every block sampled),
+	// the same case PG's BlockSampler_Next degrades to a full scan.
+	if blkSampler.m > 0 {
+		stats.RowCount = int64(math.Floor((liverows/float64(blkSampler.m))*float64(nBlocks) + 0.5))
+	}
+
+	if liverows > 0 {
+		stats.AvgWidth = float64(totalBytes) / liverows
 	}
 
 	for i := range tbl.Columns {

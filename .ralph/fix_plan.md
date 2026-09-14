@@ -963,12 +963,34 @@ unmeasured one does not.
   non-varlena types, goopg has no such fallback — `avg_width=0` on 32/61 TPC-H and
   70/121 TPC-DS columns). Three ledger rows filed (`m0138-0001-*`), each citing a
   resume point in M0138-0002 or M0138-0004. No production code touched.
-- [ ] **M0138-0002 — port PG's block sampler and two-stage row selection** —
+- [x] **M0138-0002 — port PG's block sampler and two-stage row selection** —
   `BlockSampler_Init`/`BlockSampler_Next`
   (`postgres/src/backend/utils/misc/sampling.c:39,64`) plus
   `reservoir_init_selection_state` / `reservoir_get_next_S` / `sampler_random_fract`
   as `analyze.c:1228-1290` drives them, including PG's `pg_prng` sequence, so the
   sampled TID set matches PG's for a fixed seed on a shared relation.
+  DONE 2026-09-15: `docs/design/0100-0149/m0138-0002-block-sampler-two-stage-row-selection.md`.
+  New `internal/executor/analyze_block_sampler.go` ports `pgPRNGState`
+  (xoroshiro128**), `blockSampler` (Algorithm S) and `reservoirState`
+  (Algorithm Z) line-for-line from `sampling.c`; `analyzeRelationWith`'s block
+  loop now visits only sampled blocks and its row selection uses PG's
+  skip-count reservoir instead of Algorithm R. Resolved the M0138-0001
+  `reltuples` scope question (ledger row flipped to `resolved`): confirmed
+  VACUUM has its own separate reltuples path, so `RowCount` now
+  unconditionally extrapolates via `floor((liverows/bs.m)*totalblocks+0.5)`,
+  degrading to exact when every block is sampled -- every pre-existing
+  small-table ANALYZE unit test stayed green under that degenerate path.
+  `AvgWidth`'s denominator moved from `RowCount` to sampled-live-row-count to
+  match. New tests in `analyze_block_sampler_test.go` (block sampler +
+  reservoir primitives, plus a 60k-row integration case confirming actual
+  block skipping). Dead-row tracking deferred, no consumer yet (ledger row
+  `m0138-0002`). Gates: `go build ./...` clean;
+  `go test ./internal/executor/...` full package green;
+  `RALPH_PRECOMMIT_SCOPE=units` green except the pre-existing, already-filed,
+  confirmed-unrelated `internal/parser` `TestLockingClauseParity` AST-drift
+  failure (verified via `git stash` of this task's files reproducing the same
+  failure without them). Corpus-wide TPC-H/TPC-DS re-measurement intentionally
+  deferred to M0138-0005 (declared-epoch requirement).
 - [ ] **M0138-0003 — verify `stadistinct` parity end to end; do NOT re-implement what
   exists** — goopg stores upstream's one signed `stadistinct` as **two** fields,
   `NDistinct` (absolute) and `NDistinctFrac`
