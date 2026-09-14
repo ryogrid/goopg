@@ -191,6 +191,19 @@ heuristic stays live.)
   should ignore `GroupedJoinUnaliased` (it is not what the test is checking)
   or its `want` literals need the field added — not investigated further,
   out of scope for M0137-0001.
+  - Blast radius correction (found running the M0138-0004 pre-commit gate,
+    2026-09-15): the same drift is NOT limited to
+    `TestLockingClauseParity` — the full `RALPH_PRECOMMIT_SCOPE=units` run
+    shows 60 failing test functions in `go test ./internal/parser/...`
+    (e.g. `TestValuesTable`, `TestCopyStatement`,
+    `TestAggregateOrderByParity`, `TestVariadicCallParity`,
+    `TestParityGoldensAreCurrent`, …) plus the pre-existing
+    `github.com/goopg/goopg/bak` build failure (untracked scratch, not a
+    real regression) — every hand-written `want` AST literal in the
+    package that builds a `RangeVar` in a `FROM` clause is affected, not
+    just the locking-clause cases. Still unrelated to M0138-0004's
+    executor-only diff (`internal/executor/operators_analyze*.go`); `go
+    test ./internal/executor/... ./internal/optimizer/...` is fully green.
 
 ## Archived — complete (see `completed_milestones/completed_fix_plan_012.md`)
 
@@ -1016,9 +1029,41 @@ unmeasured one does not.
   production change: the gap was M0138-0002's block-sampler fix, not a
   `stadistinct`-convention bug, so no diff earns landing per the milestone's
   anti-tuning rule.
-- [ ] **M0138-0004 — MCV, histogram and correlation from the shared sample** — apply
+- [x] **M0138-0004 — MCV, histogram and correlation from the shared sample** — apply
   PG's `compute_scalar_stats` / `compute_distinct_stats` selection rule to the sample
   M0138-0002 produces, so every slot is computed from the same rows PG would have seen.
+  DONE 2026-09-15: `docs/design/0100-0149/m0138-0004-mcv-histogram-correlation-selection-rule.md`.
+  Built on a prior loop's uncommitted WIP found already in flight (AvgWidth typlen
+  fallback, correlation tie-break via `sort.SliceStable`, MCV bucket tie-break by
+  ascending value on a count tie — resolves the two open M0138-0001 ledger rows for
+  correlation tie-break and avg_width). Found and fixed three more divergences by
+  reading `compute_scalar_stats` (`analyze.c:2402-2919`) line-by-line: (1) the
+  "complete MCV list" shortcut wrongly fired whenever `len(buckets) <= statsTarget`,
+  regardless of whether any distinct value was a singleton — PG's `track_cnt ==
+  ndistinct` can only hold when EVERY distinct value repeated, since `track[]` never
+  gains a singleton entry at all; fixed to `nmultiple == len(buckets) &&
+  len(buckets) <= statsTarget && stats.StaDistinct() > 0`. (2) `analyzeMCVList`'s
+  candidate list was capped by the total distinct count instead of `nmultiple`
+  (PG's `track_cnt`), padding its significance walk with singleton noise; fixed to
+  cap by `nmultiple`. (3) the histogram deduped adjacent equal boundary values under
+  a comment claiming PG does too — checked against `analyze.c:2806-2836` and that's
+  false, PG stores raw evenly-spaced values with no distinctness check, and the
+  selectivity consumer already implements PG's own `binfrac = 0.5` equal-bounds
+  fallback (`selfuncs.c:1234-1237`); fixed by removing the dedup. Three new
+  regression tests pin all three fixes with hand-derived expected values (one
+  probed against the pre-fix code via a throwaway copy to confirm the behavior
+  actually changed before committing to it). Non-orderable-kind `compute_distinct_stats`
+  (bytea/interval) deliberately left unported — no TPC-H/TPC-DS column exercises it
+  (ledger row `m0138-0004`). Found two orphaned bench servers (`:65433`/`:65437`)
+  left running by the interrupted prior loop's own measurement work; reaped via
+  `goopg stop -D` (not `pkill`) so `scripts/tpch-spotcheck.sh` could get a
+  quiescent snapshot. Gates: `go build ./...`, `go test
+  ./internal/executor/... ./internal/optimizer/...` clean;
+  `RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh` green for both
+  touched packages (pre-existing unrelated `internal/parser` 60-test AST-drift and
+  `bak/` build failure — see the "Blast radius correction" note above);
+  `scripts/tpch-spotcheck.sh` `RESULT=PASS` (Q12=2/Q13=34, canonical anchors).
+  Corpus-wide plan/timing re-measurement is M0138-0005's job, not repeated here.
 - [ ] **M0138-0005 — corpus re-measure at a declared epoch** — commit a per-column
   statistics diff vs PG 18.3 over both corpora, then the plan and category movement it
   causes. Every remaining disagreement is explained or filed as a ledger row. Expect

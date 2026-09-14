@@ -974,7 +974,7 @@ func analyzeRelationWith(pool *storage.Pool, mgr *transam.Manager, cat catalog.C
 		if !ok {
 			continue
 		}
-		stats.Columns[i] = computeColumnStats(reservoir, i, colTarget, stats.RowCount, dsCtx)
+		stats.Columns[i] = computeColumnStats(reservoir, i, colTarget, stats.RowCount, tbl.Columns[i].Type, dsCtx)
 		// Honor a per-column `n_distinct` attribute option, mirroring
 		// upstream's override in compute_index_stats/do_analyze_rel
 		// (postgres/src/backend/commands/analyze.c:571-581): a manual
@@ -1177,10 +1177,30 @@ func datumVariablePayloadWidth(d Datum) int {
 // block and reservoir-samples, so the caller has measured it exactly). It is
 // what turns the sample's distinct count into a table-wide estimate — see
 // ndistinctEstimate. M0127-P5.6-e-iii.
-func computeColumnStats(sample []Row, colIdx int, statsTarget int, totalRows int64, dsCtx *Context) catalog.ColumnStats {
+func computeColumnStats(sample []Row, colIdx int, statsTarget int, totalRows int64, colType catalog.Type, dsCtx *Context) catalog.ColumnStats {
 	stats := catalog.ColumnStats{}
 	if len(sample) == 0 {
 		return stats
+	}
+
+	// M0138-0004 / M0138-0001 finding 3: PG's compute_scalar_stats never
+	// measures a fixed-width (non-varlena) type's average width from the
+	// data at all — `is_varwidth = !typbyval && typlen < 0` is false for
+	// every by-value type AND every fixed-length by-reference type (uuid,
+	// interval, macaddr, …), and in that case stawidth is simply the type's
+	// typlen (analyze.c:2565-2569, plus the too-wide-only and all-null
+	// branches at :2965 and :2975, which apply the same typlen literally).
+	// goopg's per-row loop only ever measures a *variable* payload
+	// (datumVariablePayloadWidth returns 0 for every fixed-width kind), so
+	// without this fallback every int4/int8/date/… column reported
+	// AvgWidth=0 — the census's finding 3 (32/61 TPC-H, 70/121 TPC-DS
+	// columns). `colTypeDescriptor` is the same name->OID->pg_type.dat
+	// bridge coltypeinfo.go already uses; TypLen<0 covers both varlena
+	// (-1) and cstring (-2), matching PG's is_varwidth exactly.
+	typLen := colTypeDescriptor(colType).TypLen
+	fixedWidth := typLen >= 0
+	if fixedWidth {
+		stats.AvgWidth = float64(typLen)
 	}
 
 	// Per-key counts plus a representative Datum per key (so we
@@ -1231,7 +1251,11 @@ func computeColumnStats(sample []Row, colIdx int, statsTarget int, totalRows int
 
 	stats.NullFrac = float64(nullCount) / float64(len(sample))
 
-	if nonNull > 0 {
+	// Variable-width types only: fixed-width types already got their
+	// typlen-derived AvgWidth above and PG never overwrites it with a
+	// measured value (analyze.c's is_varwidth branch guards the
+	// total_width/nonnull_cnt division the same way).
+	if !fixedWidth && nonNull > 0 {
 		stats.AvgWidth = float64(totalPayloadWidth) / float64(nonNull)
 	}
 
@@ -1266,7 +1290,20 @@ func computeColumnStats(sample []Row, colIdx int, statsTarget int, totalRows int
 	//   corr = (n * Σxy - Σx²) / (n * Σx² - Σx²)
 	// where Σxy is the sum of original_position[i] * sorted_position[i].
 	if len(corrPairs) > 1 && isOrderableKind(corrPairs[0].d.Kind) {
-		sort.Slice(corrPairs, func(i, j int) bool {
+		// M0138-0004 / M0138-0001 finding 2: PG's compare_scalars breaks a
+		// tie between equal-valued items by original scan position ---
+		// "for equal datums, sort by tupno" (analyze.c compare_scalars,
+		// `return ta - tb`) --- which is a deterministic total order, not
+		// "whatever qsort happens to do with equal keys". `sort.Slice` is
+		// documented non-stable, so two duplicate values could land in
+		// either relative order run-to-run; `corrPairs` is already built
+		// in ascending original-position order (the loop above appends in
+		// sample scan order), so a STABLE sort reproduces PG's ascending
+		// tupno tie-break exactly instead of leaving it undefined. Live
+		// evidence this mattered: 12/23 TPC-DS `store_sales` columns
+		// clustered inside an unrelated [0.12,0.15] correlation band under
+		// the old unstable sort.
+		sort.SliceStable(corrPairs, func(i, j int) bool {
 			cmp, err := compareDatum(corrPairs[i].d, corrPairs[j].d, 0)
 			if err != nil {
 				return false
@@ -1292,12 +1329,37 @@ func computeColumnStats(sample []Row, colIdx int, statsTarget int, totalRows int
 
 	// Sort buckets by count desc — primary input to the MCV /
 	// histogram split.
+	//
+	// M0138-0004: PG builds its MCV `track` list by walking values in
+	// ASCENDING sorted-by-value order and only replacing the current
+	// tail-of-list occupant when a new group's count is STRICTLY greater
+	// (analyze.c: `dups_cnt > track[track_cnt-1].count`); a count TIE at the
+	// truncation boundary is a no-op, so whichever value's group was
+	// encountered first --- i.e. the smaller value --- keeps the slot. A
+	// plain count-only sort here leaves ties in whatever order `freq`'s map
+	// iteration happened to produce, which is unspecified and can disagree
+	// with PG (and with itself run-to-run). Tie-breaking by ascending value
+	// reproduces PG's "earlier in the scan wins" rule for orderable kinds;
+	// non-orderable kinds have no PG-defined order to match here (they take
+	// compute_distinct_stats upstream, a different algorithm not ported),
+	// so their tie order is left as before.
 	buckets := make([]*bucket, 0, len(freq))
 	for _, b := range freq {
 		buckets = append(buckets, b)
 	}
+	orderable := len(buckets) > 0 && isOrderableKind(buckets[0].val.Kind)
 	sort.Slice(buckets, func(i, j int) bool {
-		return buckets[i].count > buckets[j].count
+		if buckets[i].count != buckets[j].count {
+			return buckets[i].count > buckets[j].count
+		}
+		if !orderable {
+			return false
+		}
+		cmp, err := compareDatum(buckets[i].val, buckets[j].val, 0)
+		if err != nil {
+			return false
+		}
+		return cmp < 0
 	})
 
 	// MCV split — take2 P1-08, following compute_scalar_stats
@@ -1316,21 +1378,56 @@ func computeColumnStats(sample []Row, colIdx int, statsTarget int, totalRows int
 	// `track_cnt == ndistinct && toowide_cnt == 0 && stadistinct > 0 &&
 	// track_cnt <= num_mcv`: every distinct value was seen and they all fit,
 	// so the list is complete and is kept whole.
-	completeAndFits := len(buckets) <= statsTarget
-	if !completeAndFits && mcvCount > 0 {
-		counts := make([]int, mcvCount)
-		for i := 0; i < mcvCount; i++ {
-			counts[i] = buckets[i].count
+	//
+	// M0138-0004: upstream's `track[]` only ever holds MULTIPLY-occurring
+	// values (`dups_cnt > 1` gates every insertion, analyze.c:2549-2552), so
+	// `track_cnt == ndistinct` can only be true when literally every distinct
+	// sample value repeated at least once — a single singleton disqualifies
+	// the whole list from "complete" regardless of how few distinct values
+	// there are. `len(buckets) <= statsTarget` alone (the previous condition
+	// here) checked only the total distinct-value count, not that they were
+	// all multi-occurring, so a column with e.g. 90 repeated values and 10
+	// singletons under a target of 100 wrongly took the "complete" branch and
+	// skipped analyzeMCVList's significance test entirely — keeping all 90
+	// repeated values as MCV members where PG would have narrowed them.
+	// `nmultiple == len(buckets)` is that "no singletons" condition
+	// (`nmultiple` already counts exactly the multiply-occurring distinct
+	// values, computed above for the ndistinct estimator).
+	// `stats.StaDistinct() > 0` reproduces the `stadistinct > 0` guard: PG's
+	// signed convention flips negative once the 10% row-count switch fires
+	// (see catalog.ColumnStats.StaDistinct), which the plain `len(buckets)`
+	// check never consulted at all.
+	completeAndFits := nmultiple == len(buckets) && len(buckets) <= statsTarget && stats.StaDistinct() > 0
+	if !completeAndFits {
+		// M0138-0004: upstream's `track[]` array is sized `num_mcv =
+		// attstattarget` and only ever gains an entry for a multiply-occurring
+		// group (`dups_cnt > 1`), so by construction it can hold at most
+		// `min(nmultiple, statsTarget)` entries — `analyze_mcv_list` never
+		// sees a singly-occurring value as a candidate at all. Capping here by
+		// `len(buckets)` (ndistinct) instead of `nmultiple` handed the
+		// significance test a candidate list padded with singleton noise at
+		// its tail, which is not what PG evaluates.
+		if mcvCount > nmultiple {
+			mcvCount = nmultiple
 		}
-		// staDistinct here is the absolute distinct count this sample implies;
-		// analyzeMCVList accepts PG's signed convention and this is the
-		// positive form.
-		mcvCount = analyzeMCVList(counts, mcvCount, float64(len(buckets)),
-			stats.NullFrac, len(sample), float64(totalRows))
+		if mcvCount > 0 {
+			counts := make([]int, mcvCount)
+			for i := 0; i < mcvCount; i++ {
+				counts[i] = buckets[i].count
+			}
+			// staDistinct here is the absolute distinct count this sample implies;
+			// analyzeMCVList accepts PG's signed convention and this is the
+			// positive form.
+			mcvCount = analyzeMCVList(counts, mcvCount, float64(len(buckets)),
+				stats.NullFrac, len(sample), float64(totalRows))
+		}
 	}
 	// A single-occurrence "most common value" carries no information; upstream
 	// reaches the same place via its `dups_cnt > 0` tracking, which never
-	// enters a value seen once into the track list at all.
+	// enters a value seen once into the track list at all. Now a pure safety
+	// net (both branches above already guarantee `buckets[:mcvCount]` is
+	// entirely multi-occurring) rather than load-bearing, kept in case that
+	// invariant ever regresses.
 	for mcvCount > 0 && buckets[mcvCount-1].count <= 1 {
 		mcvCount--
 	}
@@ -1390,20 +1487,24 @@ func computeColumnStats(sample []Row, colIdx int, statsTarget int, totalRows int
 		idx := i * last / bucketCount
 		bounds[i] = formatDatumDateStyle(expanded[idx], dsCtx)
 	}
-	// Drop adjacent duplicate boundaries; an equi-depth
-	// histogram with flat regions still emits ascending
-	// distinct boundaries upstream (see
-	// `compute_scalar_stats`). The dedup keeps the contract
-	// "boundaries are strictly ascending" predictable.
-	dedup := bounds[:0]
-	for i, v := range bounds {
-		if i == 0 || v != bounds[i-1] {
-			dedup = append(dedup, v)
-		}
-	}
-	if len(dedup) >= 2 {
-		stats.Histogram = dedup
-	}
+	// M0138-0004: upstream does NOT dedup adjacent equal boundaries.
+	// compute_scalar_stats (analyze.c:2806-2836) copies exactly `num_hist`
+	// evenly-spaced values out of the sorted non-MCV array with no
+	// distinctness check at all, so a value that's common but didn't make
+	// the MCV cut (analyze_mcv_list declined it as not "significant" enough)
+	// can legitimately occupy several adjacent histogram slots. The
+	// selectivity consumer already copes with that on both sides: PG's own
+	// ineq_histogram_selectivity falls back to `binfrac = 0.5` whenever a
+	// bin's two boundaries compare equal ("cope if bin boundaries appear
+	// identical", selfuncs.c:1234-1237), and goopg's bucketFraction /
+	// convertStringBucketScales (selectivity.go) already implement that same
+	// 0.5 fallback. A prior version of this function deduped here, which
+	// silently shrank the stored histogram (and therefore the exact bucket
+	// count and boundary positions used by every selectivity computed
+	// against it) relative to what PG would have stored for the identical
+	// sample — a real divergence in "the same statistics", not a rendering
+	// nicety.
+	stats.Histogram = bounds
 	return stats
 }
 

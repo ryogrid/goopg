@@ -475,44 +475,221 @@ func TestDatumVariablePayloadWidth(t *testing.T) {
 }
 
 // TestAnalyzePopulatesAvgWidth pins that computeColumnStats calculates
-// per-column AvgWidth from sampled non-null Datum values (M0128-P3.1).
+// per-column AvgWidth from sampled non-null Datum values (M0128-P3.1), and
+// (M0138-0004) that a fixed-width (non-varlena) column reports its type's
+// typlen rather than a measured value, mirroring PG's compute_scalar_stats
+// `is_varwidth` branch (analyze.c:2565-2569) — including in the all-null
+// case, where PG still reports typlen for a fixed-width type but 0
+// ("unknown") for a variable-width one (analyze.c:2975-2979).
 // It tests the computation directly rather than through the full
 // insert→heap→decode pipeline, so it controls the Datum shapes precisely.
 func TestAnalyzePopulatesAvgWidth(t *testing.T) {
-	// Build a sample of 20 rows: column 0 is fixed-width (int), column 1 is
-	// variable-width text with known byte lengths.
+	int4Type := catalog.Type{Name: "int4"}
+	textType := catalog.Type{Name: "text"}
+
+	// Build a sample of 20 rows: column 0 is fixed-width (int4, typlen 4),
+	// column 1 is variable-width text with known byte lengths.
 	sample := make([]Row, 20)
 	for i := 0; i < 20; i++ {
 		sample[i] = Row{
-			NewIntDatum(int64(i + 1)),                        // fixed-width: contributes 0
-			NewStringDatum(strings.Repeat("x", (i+1)*10)),    // 10, 20, …, 200 bytes
+			NewIntDatum(int64(i + 1)),                     // fixed-width: typlen fallback, not measured
+			NewStringDatum(strings.Repeat("x", (i+1)*10)), // 10, 20, …, 200 bytes
 		}
 	}
 	// Add one null row to verify nulls don't affect the average.
 	sample = append(sample, Row{NullDatum, NullDatum})
 
-	stats := computeColumnStats(sample, 0, 100, 21, nil)
-	if stats.AvgWidth != 0 {
-		t.Errorf("col 0 (fixed-width int): AvgWidth=%v, want 0", stats.AvgWidth)
+	stats := computeColumnStats(sample, 0, 100, 21, int4Type, nil)
+	if stats.AvgWidth != 4 {
+		t.Errorf("col 0 (int4, fixed-width): AvgWidth=%v, want 4 (typlen, not measured)", stats.AvgWidth)
 	}
 
-	stats1 := computeColumnStats(sample, 1, 100, 21, nil)
+	stats1 := computeColumnStats(sample, 1, 100, 21, textType, nil)
 	// 20 values: 10, 20, …, 200 bytes; avg = (10+200)*20/2/20 = 105.
 	if stats1.AvgWidth < 90 || stats1.AvgWidth > 120 {
 		t.Errorf("col 1 (text 10–200B): AvgWidth=%v, want ~105", stats1.AvgWidth)
 	}
 
-	// A sample with only nulls: AvgWidth = 0.
+	// A sample with only nulls, fixed-width type: PG still reports typlen.
 	nullSample := []Row{{NullDatum}, {NullDatum}, {NullDatum}}
-	nullStats := computeColumnStats(nullSample, 0, 100, 3, nil)
-	if nullStats.AvgWidth != 0 {
-		t.Errorf("all-null column: AvgWidth=%v, want 0", nullStats.AvgWidth)
+	nullFixedStats := computeColumnStats(nullSample, 0, 100, 3, int4Type, nil)
+	if nullFixedStats.AvgWidth != 4 {
+		t.Errorf("all-null int4 column: AvgWidth=%v, want 4 (typlen)", nullFixedStats.AvgWidth)
 	}
 
-	// An empty sample: AvgWidth = 0.
-	emptyStats := computeColumnStats(nil, 0, 100, 0, nil)
+	// A sample with only nulls, variable-width type: AvgWidth = 0 ("unknown").
+	nullVarStats := computeColumnStats(nullSample, 0, 100, 3, textType, nil)
+	if nullVarStats.AvgWidth != 0 {
+		t.Errorf("all-null text column: AvgWidth=%v, want 0", nullVarStats.AvgWidth)
+	}
+
+	// An empty sample: AvgWidth = 0 (no stats computed at all, matching PG
+	// leaving stats_valid false for a zero-row sample).
+	emptyStats := computeColumnStats(nil, 0, 100, 0, int4Type, nil)
 	if emptyStats.AvgWidth != 0 {
 		t.Errorf("empty sample: AvgWidth=%v, want 0", emptyStats.AvgWidth)
+	}
+}
+
+// TestAnalyzeCorrelationTieBreakMatchesPGTupnoOrder pins M0138-0004: PG's
+// compare_scalars breaks a tie between equal-valued sample items by original
+// scan position ("for equal datums, sort by tupno", analyze.c) --- a
+// deterministic total order, not an unspecified one. This hand-derives the
+// expected correlation from that exact rule (stable sort: ties keep their
+// original relative order) so the test fails if the production sort is ever
+// swapped back to a plain (unstable) `sort.Slice`.
+//
+// Six rows with two duplicate groups: values [3,3,3,1,1,2] at positions
+// [0,1,2,3,4,5]. PG's ascending-value order with ties broken by ascending
+// tupno places them as: pos3(1), pos4(1), pos5(2), pos0(3), pos1(3), pos2(3)
+// --- i.e. sortedPos i holds original position originalOf[i] below.
+func TestAnalyzeCorrelationTieBreakMatchesPGTupnoOrder(t *testing.T) {
+	sample := []Row{
+		{NewIntDatum(3)},
+		{NewIntDatum(3)},
+		{NewIntDatum(3)},
+		{NewIntDatum(1)},
+		{NewIntDatum(1)},
+		{NewIntDatum(2)},
+	}
+	originalOf := []int{3, 4, 5, 0, 1, 2}
+	n := float64(len(sample))
+	var corrXYSum float64
+	for sortedPos, orig := range originalOf {
+		corrXYSum += float64(orig) * float64(sortedPos)
+	}
+	corrXSum := (n - 1) * n / 2
+	corrX2Sum := (n - 1) * n * (2*n - 1) / 6
+	denom := n*corrX2Sum - corrXSum*corrXSum
+	want := (n*corrXYSum - corrXSum*corrXSum) / denom
+
+	stats := computeColumnStats(sample, 0, 100, 6, catalog.Type{Name: "int4"}, nil)
+	if math.Abs(stats.Correlation-want) > 1e-9 {
+		t.Errorf("Correlation=%v want %v (PG tupno-tie-break order)", stats.Correlation, want)
+	}
+}
+
+// TestAnalyzeMCVTieBreakIsDeterministicAndPGOrdered pins M0138-0004: PG's
+// compute_scalar_stats walks values in ascending sorted order and only
+// evicts the current MCV track-list tail on a STRICTLY greater count
+// (analyze.c: `dups_cnt > track[track_cnt-1].count`), so a count TIE at the
+// truncation boundary keeps whichever value was encountered first --- the
+// smaller one. Before this fix, goopg grouped values through a Go map
+// (`freq`, randomized iteration order) and an unstable sort, so which of two
+// equal-count candidates survived truncation was undefined and could vary
+// run to run for the identical input.
+func TestAnalyzeMCVTieBreakIsDeterministicAndPGOrdered(t *testing.T) {
+	const n = 1000
+	sample := make([]Row, n)
+	for i := 0; i < n; i++ {
+		switch {
+		case i < 400:
+			sample[i] = Row{NewStringDatum("AAAA")}
+		case i < 800:
+			sample[i] = Row{NewStringDatum("BBBB")}
+		default:
+			sample[i] = Row{NewStringDatum("s" + strconv.Itoa(i))}
+		}
+	}
+	textType := catalog.Type{Name: "text"}
+	for iter := 0; iter < 25; iter++ {
+		stats := computeColumnStats(sample, 0, 1, n, textType, nil)
+		if len(stats.MCV) != 1 {
+			t.Fatalf("iter %d: MCV=%v want exactly 1 entry", iter, stats.MCV)
+		}
+		if stats.MCV[0].Value != "AAAA" {
+			t.Errorf("iter %d: MCV[0].Value=%q want %q (PG keeps the value first encountered in ascending sort order on a count tie)",
+				iter, stats.MCV[0].Value, "AAAA")
+		}
+	}
+}
+
+// TestAnalyzeMCVExcludesSingletonsFromCompletenessAndCandidates pins M0138-0004:
+// upstream's `track[]` (compute_scalar_stats) only ever gains an entry for a
+// value that appeared more than once (`dups_cnt > 1`, analyze.c:2549-2552), so
+// (a) the "complete list, keep it all" shortcut (`track_cnt == ndistinct`,
+// analyze.c:2676-2678) can only fire when literally every distinct sample
+// value repeated, and (b) even on the ordinary path, `analyze_mcv_list` is
+// handed only the multiply-occurring candidates (`num_mcv = min(num_mcv,
+// track_cnt)`, analyze.c:2688-2689) — a singly-occurring value is never a
+// candidate at all.
+//
+// The sample here has 60 distinct values occurring exactly twice (a
+// near-uniform distribution — none of them is "significantly" more common
+// than the others) plus 40 distinct singletons, for 100 total distinct values
+// under a stats target of 100. Before this fix, `len(buckets) <= statsTarget`
+// (100 <= 100) alone declared the list "complete" and returned all 60
+// repeated values verbatim, skipping `analyzeMCVList` entirely — the same
+// near-uniform shape that `TestAnalyzeMCVListMatchesUpstream`'s
+// "near-uniform column admits nothing" case proves PG rejects.
+func TestAnalyzeMCVExcludesSingletonsFromCompletenessAndCandidates(t *testing.T) {
+	const nRepeated = 60
+	const nSingletons = 40
+	sample := make([]Row, 0, nRepeated*2+nSingletons)
+	for v := 0; v < nRepeated; v++ {
+		sample = append(sample, Row{NewIntDatum(int64(v))}, Row{NewIntDatum(int64(v))})
+	}
+	for v := nRepeated; v < nRepeated+nSingletons; v++ {
+		sample = append(sample, Row{NewIntDatum(int64(v))})
+	}
+	// totalRows large enough that the Duj1 estimate stays well under the 10%
+	// row-scaling threshold, isolating the singleton-exclusion behavior from
+	// the unrelated stadistinct-sign guard.
+	stats := computeColumnStats(sample, 0, 100, 100000, catalog.Type{Name: "int4"}, nil)
+	if len(stats.MCV) != 0 {
+		t.Errorf("MCV=%v (len %d) want empty — PG's analyze_mcv_list rejects a near-uniform count-2 distribution as not significant, and singletons were never candidates",
+			stats.MCV, len(stats.MCV))
+	}
+}
+
+// TestAnalyzeHistogramKeepsAdjacentDuplicateBoundaries pins M0138-0004:
+// upstream's compute_scalar_stats (analyze.c:2806-2836) copies exactly
+// `num_hist` evenly-spaced values straight out of the sorted non-MCV array
+// with no distinctness check, so a value that's common but never became an
+// MCV candidate can legitimately occupy several adjacent histogram slots.
+// goopg used to dedup those slots down (shrinking the stored histogram
+// relative to what PG would have stored for the identical sample); the
+// selectivity consumer already copes with equal-adjacent bounds via the
+// same `binfrac = 0.5` fallback PG itself uses (selfuncs.c:1234-1237,
+// mirrored in bucketFraction), so there is nothing left needing the dedup.
+//
+// Two values (2000000, 3000000) are overwhelmingly dominant and take both
+// MCV slots under a stats target of 2. A third value (-1000000, chosen as
+// the minimum so it sorts first) repeats 500 times — enough contiguous mass
+// that, ranked 3rd, it never becomes an MCV *candidate* at all (the target-2
+// candidate cap admits only the top 2 by count) yet still spans multiple of
+// the histogram's evenly-spaced sample points.
+func TestAnalyzeHistogramKeepsAdjacentDuplicateBoundaries(t *testing.T) {
+	var sample []Row
+	for i := 0; i < 1000; i++ {
+		sample = append(sample, Row{NewIntDatum(2000000)})
+	}
+	for i := 0; i < 1000; i++ {
+		sample = append(sample, Row{NewIntDatum(3000000)})
+	}
+	for i := 0; i < 500; i++ {
+		sample = append(sample, Row{NewIntDatum(-1000000)})
+	}
+	for v := int64(0); v < 10; v++ {
+		sample = append(sample, Row{NewIntDatum(v)})
+	}
+
+	stats := computeColumnStats(sample, 0, 2, 100000, catalog.Type{Name: "int4"}, nil)
+	if len(stats.MCV) != 2 {
+		t.Fatalf("MCV=%v want exactly the 2 dominant values", stats.MCV)
+	}
+	if len(stats.Histogram) < 2 || stats.Histogram[0] != "-1000000" {
+		t.Fatalf("Histogram=%v want to start with the repeated value -1000000", stats.Histogram)
+	}
+	dup := false
+	for i := 1; i < len(stats.Histogram); i++ {
+		if stats.Histogram[i] == stats.Histogram[i-1] {
+			dup = true
+			break
+		}
+	}
+	if !dup {
+		t.Errorf("Histogram=%v want at least one adjacent duplicate boundary (PG does not dedup; a prior goopg version wrongly did)", stats.Histogram)
 	}
 }
 
