@@ -865,12 +865,30 @@ before/after proving the defect it closes.
     against the tree at HEAD (exact file/line resume points) rather than copied
     verbatim from `METHODOLOGY3/02-open-problems.md`. Recon task, no production
     change. Design doc `docs/design/0100-0149/m0137-0012-unowned-carryover-ledger-rows.md`.
-- [ ] **M0137-0010 — add the qual-placement census and the duplicate-sensitive values
+- [x] **M0137-0010 — add the qual-placement census and the duplicate-sensitive values
   check** — both justified by bugs that shipped: R56's Q78 lost three `Filter:` lines
   with sweep checksums still passing, and R83's Limit-below-Unique truncation was
   masked on current data only because `78 < 100`. The census counts `Filter:` /
   `Index Cond:` lines per query and diffs them between arms; it becomes the gate every
   M0139 slice runs.
+  - DONE 2026-09-15: `scripts/qual-placement-census.py` (+ `-test.py`, 8 tests)
+    landed — a same-engine-arm-pair census (no PG oracle needed), report-only
+    sibling `pg-plan-parity-diff.py` cannot fill since it only diffs
+    (goopg, PG) pairs. Exits nonzero (a real gate, per K91) on any
+    `Filter:`/`Index Cond:` count change or a query present in only one arm.
+    Live-validated against a real on-disk flag-flip A/B
+    (`analysis/planner-refactor-take3/c06-flip-remeasure-20260907/`),
+    `mismatch=0`. Also closed C1 (`02-open-problems.md`): added the
+    ParamRef duplicate-sensitive synthetic case 04's M5 item 2 named
+    (`TestDistinctLimitAppliesAboveDistinct_ParamRef`), confirmed it failed
+    at HEAD as predicted, then fixed `limitBoundMovable`
+    (`internal/optimizer/tuplefraction.go`) to also accept `*ParamRef`
+    (a bound LIMIT value is exactly as position-independent as a literal
+    for this purpose) so `LIMIT $1` now moves above `DISTINCT` exactly like
+    `LIMIT 100`. `go build`/`go test ./internal/optimizer/...
+    ./internal/executor/...` clean. Design doc
+    `docs/design/0100-0149/m0137-0010-qual-placement-census-and-duplicate-check.md`.
+    No ledger row (both deliverables landed in full).
 - [ ] **M0137-0013 — close or delete the ten-plus-round ledger carries (filed
   2026-09-15, split out of M0137-0009)** — `03-process-retrospective.md` P7's
   "Ledger carry" finding: *"the same items appear verbatim across ten-plus rounds:

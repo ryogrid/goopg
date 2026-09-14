@@ -1,64 +1,63 @@
-Task: M0137-0011 — root-cause C3/K63 (the second display/estimator seam).
-**COMPLETE and committed this loop** (commit `1f860878f`, branch
-`plan-parity-with-pg-take2-ralph`). Recon task per the plan-parity harness:
-diagnosis + design note + ledger row, no production diff (instrumentation
-added, used against a live server, then fully reverted).
+Task: M0137-0010 — qual-placement census + duplicate-sensitive values check.
+**COMPLETE and committed this loop**, branch `plan-parity-with-pg-take2-ralph`.
+Implementation task (not recon) per the plan-parity harness.
 
-Files: `.ralph/deferral_ledger.md` (+1 row
-`m0137-0011-filter-node-missing-plancost-embed`),
-`docs/design/0100-0149/m0137-0011-c3-k63-display-seam-root-cause.md` (new),
-`docs/design/README.md` (+index row), `.ralph/fix_plan.md` (M0137-0011
-checked off with DONE note), `analysis/m0137-0011/*.txt` (raw
-`estimate-audit -plan-only` Q12 captures, kept as evidence per "Way of
-working").
+Files: `scripts/qual-placement-census.py` (new), `scripts/qual-placement-census-test.py`
+(new, 8 tests), `internal/executor/distinct_limit_paramref_test.go` (new),
+`internal/optimizer/tuplefraction.go` (`limitBoundMovable` extended),
+`docs/design/0100-0149/m0137-0010-qual-placement-census-and-duplicate-check.md`
+(new), `docs/design/README.md` (+index row), `.ralph/fix_plan.md` (M0137-0010
+checked off with DONE note).
 
-Root cause (confirmed by live trace, not inferred): `optimizer.SeqScan`
-embeds `PlanCost` (plan.go:641); `optimizer.Filter` does NOT (plan.go:1531,
-only `searchedTree`). Any base relation with a local qualifier
-(`attachRelationLocalFilters`) reaches `buildInitialRels` wrapped as
-`Filter{Child: SeqScan}`; `stampPlanCost`'s `n.(planCostSetter)` assertion
-silently fails on that Filter, so the search's correct cost (271,421.24 for
-Q12's `lineitem`) is discarded and EXPLAIN falls back to
-`DeriveLegacyDisplayCost`'s childless-leaf formula (page cost missing) —
-exactly R37's stale "legacy model" number (60,299.79). `orders` (no local
-qualifier, bare `SeqScan`) renders correctly. K62 stands (display-only,
-cannot move a plan-choice category); blast radius is wider than R37 knew —
-every base-local-filtered scan in the corpus, not just Q12's `lineitem`.
-Fix shape (embed `PlanCost` on `Filter`) is named in the ledger row but NOT
-implemented — left for a future task since landing it implies a
-corpus-wide before/after measurement, out of scope for a recon loop.
+Two deliverables, both named by the fix_plan line:
+1. `qual-placement-census.py`: counts `Filter:`/`Index Cond:` lines per query
+   across two `=== KEY`-section capture files, diffs between arms. Unlike
+   `pg-plan-parity-diff.py` (report-only, PG-oracle required), this is a real
+   gate (exit 1 on any mismatch/arm-only query, exit 2 unreadable input) that
+   works on a same-engine before/after pair — the shape every M0139 slice
+   produces. Live-validated against a real on-disk flag-flip A/B
+   (`analysis/planner-refactor-take3/c06-flip-remeasure-20260907/`), mismatch=0.
+2. Closed C1 (`METHODOLOGY3/02-open-problems.md`): `limitBoundMovable`
+   (tuplefraction.go:101-112) only accepted `*IntegerConst` for the R83
+   "defer LIMIT past DISTINCT" rewrite; `LIMIT $1` (`*ParamRef`) fell through
+   to the pre-R83 truncate-then-distinct order. Added
+   `TestDistinctLimitAppliesAboveDistinct_ParamRef`, confirmed it failed at
+   HEAD exactly as predicted, then extended the guard to also accept
+   `*ParamRef` (two type assertions, deliberately not a `switch` — avoids
+   registering a new site in `TestExprSwitchInventoryIsPinned`'s Expr-switch
+   census, which the first attempt tripped and had to be reverted).
 
-Key symbols: `stampPlanCost`/`explainCostFields`/`DeriveLegacyDisplayCost`/
-`legacyDisplayChildren` (internal/optimizer/plancost.go,
-internal/executor/operators_explain.go), `buildInitialRels`
-(internal/optimizer/joinsearch.go:433), `SeqScan`/`Filter` struct defs
-(internal/optimizer/plan.go:639-758, 1531-1569).
+Key symbols: `limitBoundMovable` (internal/optimizer/tuplefraction.go),
+`planSelect`'s LIMIT stage (internal/optimizer/planner.go:2067-2080, 2424-2427),
+`census()`/`count_conds()` (scripts/qual-placement-census.py).
 
-Next step: per `.ralph/fix_plan.md`'s M0137 section, remaining open tasks
-are **M0137-0010** (qual-placement census + duplicate-sensitive-values
-check — becomes the M0139 gate, largest remaining M0137 item, real
-implementation work) and **M0137-0013** (close/delete the ten-plus-round
-ledger carries — explicitly flagged as campaign-sized, own multi-loop
-budget, split out of M0137-0009). Re-read AGENT.md §"Plan-parity harness"
-fresh next loop before picking (loop-start discipline). M0137-0010 looks
-like the natural next pick since it's the M0139 prerequisite and is listed
-as real (non-recon) implementation work — confirm against the
-banner/fix_plan order first, same as this loop did.
+Gates run: `go build ./...` clean. `go test ./internal/optimizer/...
+./internal/executor/...` green (incl. `TestExprSwitchInventoryIsPinned`).
+`python3 scripts/qual-placement-census.py --self-test` 5/5,
+`qual-placement-census-test.py` 8/8. `scripts/tpch-spotcheck.sh` PASS
+(Q12=2 rows, Q13=34 rows — no regression from the planner change).
+`RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh`: same
+~59 `internal/parser` failures as a stashed-clean-HEAD control run (identical
+failure set, confirmed via `git stash`) — pre-existing, already tracked as
+nightly items AI-20260914-235643-001/003 and the "Manually discovered
+parser/TestLockingClauseParity" fix_plan entry (both filed 2026-09-15,
+`GroupedJoinUnaliased` field added by `dc91bd6b7` breaks the parity-golden
+comparison broadly, wider than that entry's original scope — worth noting
+for whoever picks that item up next). Not this loop's regression; not fixed
+here (out of scope for M0137-0010). `make ralph-state-guard`: same
+running/completed marker mismatch every recent loop has hit (previous loop's
+clean-exit marker), auto-repaired, then OK.
 
-Gates run: `go build ./...` clean at HEAD (both temporarily-traced files
-confirmed byte-identical to origin via `git diff --stat` before commit —
-empty). No `go test` gate needed (zero test-visible `.go` diff in the final
-commit). Pre-commit hook's pgbench smoke PASSED (both simple-update and
-select-only arms, 0 failed transactions) — see commit `1f860878f`.
-`make ralph-state-guard`: hit the same recurring running/completed marker
-mismatch every recent loop has seen (previous loop's clean-exit marker),
-auto-repaired, then OK.
+In-flight: none. No throwaway server left running — `tpch-spotcheck.sh`'s
+private clone/port (5580) and its own scope were torn down by the script
+itself on exit (fresh clone + fresh scope every invocation, per M0137-0007).
 
-In-flight: none. The `bench/tpch` 65433 goopg lane was started fresh this
-loop (it was down at loop start), used twice — once on the ordinary binary
-for a baseline capture, once restarted on a private traced binary
-(`/tmp/goopg-m0137-0011-trace`, since deleted) for the live-pointer trace —
-and then stopped again via `stop_goopg.sh`, restoring it to the down state
-it was found in. No throwaway server, no lingering PID, no private clone
-left running. `/tmp/estimate-audit-m0137-0011` and
-`/tmp/goopg-m0137-0011-trace` both deleted.
+Next step: per `.ralph/fix_plan.md`'s M0137 section, the one remaining open
+M0137 task is **M0137-0013** (close/delete the ten-plus-round ledger carries,
+split out of M0137-0009 — explicitly campaign-sized, its own multi-loop
+budget). Once M0137-0013 lands, M0137 is fully closed and M0138/M0139/M0140
+become the frontier per the banner's selection order (M0139's slices are now
+unblocked: M0139-S1/-S2/-S3 were all "gated on M0137-0010"). Re-read AGENT.md
+§"Plan-parity harness" fresh next loop before picking, per loop-start
+discipline — confirm against the banner before committing to M0137-0013 vs.
+starting an M0138/M0139/M0140 task if the banner has moved.

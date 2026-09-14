@@ -99,15 +99,28 @@ type limitEstimates struct {
 // later from a simplified version is how the "use the smaller of the two"
 // asymmetries get lost.
 // limitBoundMovable reports whether a resolved LIMIT/OFFSET bound may be
-// planned above DISTINCT (R83): only position-independent integer
-// constants move. Anything row- or scope-dependent (or of unexamined
-// shape) keeps today's order — the decline is fail-closed, and every
-// corpus LIMIT is a plain integer literal.
+// planned above DISTINCT (R83): only position-independent bounds move.
+// Anything row- or scope-dependent (or of unexamined shape) keeps today's
+// order — the decline is fail-closed.
+//
+// M0137-0010 (02-open-problems.md C1): a *ParamRef (extended-protocol
+// bound parameter, e.g. `LIMIT $1`) is exactly as position-independent as
+// an *IntegerConst for this purpose — it is evaluated once per statement
+// execution and never varies per row or by outer scope, the same
+// property the IntegerConst-only guard was written to require. Leaving
+// it on the old order was never a correctness necessity, just an
+// unextended allowlist ("every corpus LIMIT is a plain integer literal");
+// R83's synthetic 150×'a'+50×'b' DISTINCT+LIMIT probe reproduces the
+// truncation bug for `LIMIT $1(=100)` exactly as it did for `LIMIT 100`
+// before this fix (TestDistinctLimitAppliesAboveDistinct_ParamRef).
 func limitBoundMovable(e Expr) bool {
 	if e == nil {
 		return true
 	}
-	_, ok := e.(*IntegerConst)
+	if _, ok := e.(*IntegerConst); ok {
+		return true
+	}
+	_, ok := e.(*ParamRef)
 	return ok
 }
 
