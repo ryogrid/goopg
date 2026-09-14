@@ -1520,9 +1520,41 @@ setting that yields a serial plan.
     already filed as nightly `AI-20260914-235643-001` under M-NIGHTLY, before
     this task began.
   - Design doc: `docs/design/0100-0149/m0140-0003-gather-paths-flip-lands-default-on.md`.
-- [ ] **M0140-0004 — partial-Append producer (K43)** — there are currently zero
+- [x] **M0140-0004 — partial-Append producer (K43)** — there are currently zero
   partial paths on join rels via that route; PG uses Parallel Append in six TPC-DS
-  queries and only Q5 and Q76 miss.
+  queries and only Q5 and Q76 miss. (Recon done, DEFERRED 2026-09-15 — the
+  milestone DoD explicitly allows "or its absence is a filed ledger row with a
+  resume point" as the disposition.)
+  - Confirmed the K43 framing: Q5/Q76 both hinge on `UNION ALL` chains, and the
+    live PG oracle capture shows `Parallel Append` wrapping exactly those
+    branches.
+  - The gap is deeper than the task description implied (a K80-style
+    "flip a flag on an already-written mechanism"): goopg has **no cost-based
+    Append path producer at all**. `createSetOpPaths` (the real UNION-ALL
+    producer, `windowsetoppaths.go:259`) offers exactly one candidate per its
+    own header note, which already states "an APPEND path over an appendrel is
+    its own item".
+  - Root structural blocker: each UNION ALL branch is planned to a **finished,
+    opaque `Node`** (`planner.go:1114`'s `planSelectWithSettings`) before
+    `createSetOpPaths` ever sees it — `seedPathForNode` wraps a `Node`, not a
+    `RelOptInfo`, so a branch's own partial/parallel candidate has no channel
+    to reach the SetOp rel's `PartialPathlist`.
+  - Landing a real producer needs (1) branches exposed with a `PartialPathlist`
+    instead of a finished `Node` — a change to the shared SetOp-branch entry
+    point used by every SetOp query in the suite, not a Q5/Q76-scoped edit —
+    (2) a new partial-Append producer mirroring `addPartialHashJoinPath`'s
+    shape with PG's `cost_append` partial-path arithmetic, and (3) new
+    executor claim logic: a subagent recon found the executor's `setOp` node
+    has NO worker-partitioning at all (unlike `parallel_scan.go`'s claim-set
+    machinery for base scans), so wrapping it in a `Gather` today would
+    **duplicate every row N-fold** — a correctness gap, not just a missing
+    optimization. Each is comparable in size to an entire prior C-19-series
+    slice; out of reach for one loop. Two prior-phase rounds
+    (`r32-targetlist-subplan-display`, `r33-subquery-parallel-pass`)
+    independently reached the same "full round of its own" conclusion.
+  - No production change, no test pins moved. Ledger row:
+    `m0140-0004-partial-append-producer`. Design doc:
+    `docs/design/0100-0149/m0140-0004-partial-append-producer-recon-and-defer.md`.
 - [ ] **M0140-0005 — file the two out-of-reach items as ledger rows** — Q14's third
   category (K92: needs PG's real partial-inner execution model, "NOT cheap") and the
   non-planner floor (K14/K15 heap density; K41's unexplained dimension-table `relpages`
