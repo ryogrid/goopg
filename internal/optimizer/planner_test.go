@@ -181,9 +181,16 @@ func TestPlanJoinPicksHashAlgo(t *testing.T) {
 			t.Errorf("%q: root=%T want *Project", tc.sql, node)
 			continue
 		}
-		j, ok := proj.Child.(*Join)
-		if !ok {
-			t.Errorf("%q: child=%T want *Join", tc.sql, proj.Child)
+		// M0139-S2: `narrowJoinLeg` now also narrows a nested-loop's legs,
+		// which can insert a NULL-pad restoration Project directly below
+		// the SELECT-list Project (restoring the pre-narrow width at the
+		// search boundary — see TestSlice3LiveQ9ShapeDerivation's pad
+		// check) where none existed before. `findFirstJoin`
+		// (small_dim_buildside_test.go) already descends through any such
+		// wrapper, so use it instead of asserting the immediate child.
+		j := findFirstJoin(proj.Child)
+		if j == nil {
+			t.Errorf("%q: no *Join found under %T", tc.sql, proj.Child)
 			continue
 		}
 		gotHash := j.Algo == JoinAlgoHash

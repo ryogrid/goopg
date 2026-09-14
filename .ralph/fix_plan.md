@@ -1210,11 +1210,53 @@ that comment names as parity-inert.
     once the shared server frees up. Design doc:
     `docs/design/0100-0149/m0139-s1-join-leg-hook.md`. No ledger row (pure
     goopg-internal plumbing).
-- [ ] **M0139-S2 — narrow scan output at the new hook** (gated on M0137-0010) — reuse the existing
+- [x] **M0139-S2 — narrow scan output at the new hook** (gated on M0137-0010) — reuse the existing
   narrowing rather than duplicating it. It lives in three files, not one:
   `narrowoutput.go` (`GOOPG_NARROW_BUILD`, hash build + merge input),
   `upper_narrow_apply.go:90` (`GOOPG_NARROW_UPPER`) and `upper_narrow_chain.go:124`
   (`GOOPG_NARROW_UPPER_SORT`).
+  - DONE 2026-09-15: `narrowJoinLeg` (joinleghook.go) now reuses
+    `narrowBuildInput`'s exact chain (`joinKeepSet`→`buildKeepSet`→
+    `neededKeepSet`→`narrowPlanOutput`) instead of always declining;
+    signature grew `*Path` + `nliInner bool`. Safety for NL legs: the
+    tightest tier (`joinKeepSet`) correctly reports unknown under an NL
+    (deriveJoinKeepsAt never stamps JoinKeep there) and falls through to
+    the two join-kind-agnostic, over-inclusive fallback tiers. ONE case is
+    structurally forbidden regardless of keep-set: an NLI's INNER slot is
+    typed concretely (`*IndexScan`/`*BitmapHeapScan`), so wrapping it in a
+    `*Project` is a plan-time panic, not a narrower plan — caught LIVE by
+    two pre-existing tests
+    (`TestQ2DecorrelatedGroupKeyResolvesInAggregateInput`,
+    `TestDerivedTableUnderIndexNLReturnsRows`) before the `nliInner`
+    exclusion (covers both `"PathNestLoop(NLI)"` and
+    `"PathNestLoop(NLI-bitmap)"`) was added. Landing real narrowing
+    legitimately changed plan shape wherever a previously-unwrapped leg
+    had something to drop, so 5 pre-existing regression tests needed
+    their hard-coded build-count oracle re-derived (via throwaway probe
+    tests, deleted before commit), not loosened:
+    `TestSlice3LiveQ9ShapeDerivation` (5→7 builds),
+    `TestSlice3LateralDeclinesDerivation` + executor twin
+    `TestOwnedBuildPoisonCorrAboveDecline` (1→2),
+    `TestSlice3DerivedTableAliasMapping` (1→2),
+    `TestSlice3SelfJoinInDerivedTable` (one 6-col combined build splits
+    into two 3-col builds), `TestPlanJoinPicksHashAlgo` (a NULL-pad
+    restoration Project can now sit below the top SELECT Project; fixed
+    by reusing `findFirstJoin` instead of a single type assertion).
+    Gates: `go build ./...`; `go test ./internal/optimizer/...
+    ./internal/executor/... ./internal/testutil/tpch/...
+    ./internal/postmaster/...` clean; `RALPH_PRECOMMIT_SCOPE=units`
+    green except the pre-existing, already-filed `internal/parser`
+    AST-drift; **qual-placement census on the full TPC-DS SF0.25 corpus,
+    99/99 queries, mismatch=0** (private clone `tmp/goopg-m0139s2-bin`);
+    `scripts/tpcds-sf025-regression.sh sweep` PASS=96 MISMATCH=0
+    CKMISMATCH=0 ERROR=0 TIMEOUT=0 SKIP=3, non-blocking status-delta
+    verdict-changes=none total-delta=-1.7% (no timing regression).
+    `scripts/tpch-spotcheck.sh` could not run — shared `:65433` up the
+    whole task (peer-owned); not a values-safety gap given the
+    corpus-agnostic mechanism plus the clean TPC-DS gates; re-run
+    opportunistically. Design doc:
+    `docs/design/0100-0149/m0139-s2-narrow-join-leg-output.md`. No
+    ledger row (goopg-internal executor plumbing).
 - [ ] **M0139-S3 — measure the residue against K67's floor** (gated on M0137-0010) — even narrowed to one
   column goopg is 72 B/row -> 103 MB and still spills at `work_mem=64MB` where PG is
   22 B/row -> 31 MB. Report the post-pushdown figure as a **number**, not an argument.

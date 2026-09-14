@@ -1414,15 +1414,30 @@ func TestSlice3LiveQ9ShapeDerivation(t *testing.T) {
 	}
 
 	builds := slice3BuildProjects(plan)
-	if len(builds) != 5 {
-		t.Fatalf("narrow builds = %d, want 5 (every hash build narrows)", len(builds))
+	// M0139-S2 re-baseline: `slice3BuildProjectsExcept` collects a narrow
+	// Project on EITHER side of a `*Join` (`j.Left, j.Right`), not only the
+	// historical INNER/build side — so once `narrowJoinLeg` also narrows a
+	// hash join's OUTER/probe side, two previously-unwrapped legs each gain
+	// their own Project. The old 8-column build below (lineitem plus
+	// s_suppkey/n_name carried through unnarrowed from the
+	// supplier-join-nation subtree) SPLITS into two: the lineitem side
+	// narrows on its own (6 columns, s_suppkey/n_name no longer needed at
+	// that leaf), and the supplier-join-nation subtree's own output narrows
+	// separately (s_suppkey/n_name, now its own Project) — so what was one
+	// 8-column build becomes two, net +1. `orders` similarly goes from an
+	// unwrapped probe leg to its own 2-column build, net +1. Two splits/new
+	// legs on a previously-5 count give 7.
+	if len(builds) != 7 {
+		t.Fatalf("narrow builds = %d, want 7 (every hash build AND probe leg narrows, M0139-S2)", len(builds))
 	}
 	wantSets := []map[string]bool{
-		{"l_orderkey": true, "l_partkey": true, "l_suppkey": true, "l_quantity": true, "l_extendedprice": true, "l_discount": true, "s_suppkey": true, "n_name": true},
+		{"l_orderkey": true, "l_partkey": true, "l_suppkey": true, "l_quantity": true, "l_extendedprice": true, "l_discount": true},
 		{"s_suppkey": true, "n_name": true},
 		{"n_nationkey": true, "n_name": true},
 		{"p_partkey": true},
 		{"ps_partkey": true, "ps_suppkey": true, "ps_supplycost": true},
+		{"o_orderkey": true, "o_orderdate": true},
+		{"s_suppkey": true, "s_nationkey": true},
 	}
 	matched := make([]bool, len(wantSets))
 	for _, b := range builds {
@@ -1617,12 +1632,41 @@ func TestSlice3LateralDeclinesDerivation(t *testing.T) {
 	}
 	// …but narrows by the Slice-2 arms only: the orders build keeps the
 	// leaf-local filter column (3 cols, not the parent-aware 2).
+	//
+	// M0139-S2 re-baseline: `narrowJoinLeg` now also narrows the OTHER
+	// (lineitem) side of this same join — previously an unwrapped
+	// outer/probe leg — to its own 2-column build (l_orderkey, the join
+	// key, and l_suppkey, the correlation to the outer s.s_suppkey; both
+	// names the raw `collectStmtColumnNames` walk sees regardless of
+	// which level references them). One build becomes two.
 	bodyBuilds := slice3BuildProjects(lat.Right)
-	if len(bodyBuilds) != 1 {
-		t.Fatalf("body narrow builds = %d, want 1 (the orders build side)", len(bodyBuilds))
+	if len(bodyBuilds) != 2 {
+		t.Fatalf("body narrow builds = %d, want 2 (the orders build side AND the lineitem probe side, M0139-S2)", len(bodyBuilds))
 	}
-	if got := slice3NameSet(bodyBuilds[0]); !slice3SetEqual(got, "o_orderkey", "o_orderdate", "o_orderpriority") {
-		t.Errorf("body orders build = %v, want [o_orderkey o_orderdate o_orderpriority] (statement-wide, filter kept)", slice3ProjectNames(bodyBuilds[0]))
+	wantBodySets := []map[string]bool{
+		{"o_orderkey": true, "o_orderdate": true, "o_orderpriority": true},
+		{"l_orderkey": true, "l_suppkey": true},
+	}
+	matchedBody := make([]bool, len(wantBodySets))
+	for _, b := range bodyBuilds {
+		got := slice3NameSet(b)
+		hit := -1
+		for i, want := range wantBodySets {
+			if !matchedBody[i] && slice3SetEqual(got, keysOf(want)...) {
+				hit = i
+				break
+			}
+		}
+		if hit < 0 {
+			t.Errorf("unexpected body narrow build %v", slice3ProjectNames(b))
+			continue
+		}
+		matchedBody[hit] = true
+	}
+	for i, want := range wantBodySets {
+		if !matchedBody[i] {
+			t.Errorf("missing body narrow build %v", keysOf(want))
+		}
 	}
 }
 
@@ -1712,12 +1756,27 @@ func TestSlice3DerivedTableAliasMapping(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Plan: %v", err)
 	}
+	// M0139-S2 re-baseline: t2 needs only 2 of its 4 columns too (k, the
+	// join key, and y, published as py) — previously an unwrapped
+	// outer/probe leg, it now gains its own narrow build alongside t1's.
 	builds := slice3BuildProjects(plan)
-	if len(builds) != 1 {
-		t.Fatalf("narrow builds = %d, want 1 (the t1 build side)", len(builds))
+	if len(builds) != 2 {
+		t.Fatalf("narrow builds = %d, want 2 (the t1 build side AND the t2 probe side, M0139-S2)", len(builds))
 	}
-	if got := slice3ProjectNames(builds[0]); !slice3EqualNames(got, []string{"k", "x"}) {
-		t.Errorf("t1 build = %v, want [k x] (base names; f1 drops after filtering)", got)
+	var t1Build, t2Build *Project
+	for _, b := range builds {
+		switch {
+		case slice3EqualNames(slice3ProjectNames(b), []string{"k", "x"}):
+			t1Build = b
+		case slice3EqualNames(slice3ProjectNames(b), []string{"k", "y"}):
+			t2Build = b
+		}
+	}
+	if t1Build == nil {
+		t.Errorf("no t1 build = [k x] (base names; f1 drops after filtering) among %v", builds)
+	}
+	if t2Build == nil {
+		t.Errorf("no t2 build = [k y] among %v", builds)
 	}
 	for _, b := range builds {
 		for _, name := range slice3ProjectNames(b) {
@@ -1742,6 +1801,20 @@ func TestSlice3DerivedTableAliasMapping(t *testing.T) {
 // the (nation a ⋈ nation b) build keeps BOTH full 3-column copies
 // (n_nationkey/n_name/n_regionkey twice) — never exactly one of a pair —
 // while below-only columns still drop.
+//
+// M0139-S2 re-baseline: before S2, only ONE side of the a⋈b self-join was
+// ever a build side, so both copies of the over-kept names lived together in
+// one 6-column Project (a's child concatenated with b's). Now `narrowJoinLeg`
+// narrows BOTH sides of that join independently — a's own build and b's own
+// build each separately keep [n_nationkey n_name n_regionkey] — so the SAME
+// F4 property (neither copy of a name needed anywhere is dropped) now shows
+// up as two 3-column builds instead of one 6-column build; the F4 pair-rule
+// loop below (checking a single build's child for an internal duplicate) no
+// longer has anything to trip on, because the duplicate-name boundary moved
+// from within one build's child to the *Join* node these two builds are
+// children of, which this walk never inspects (only `*Project` children of a
+// `*Join` are builds). The two-separate-3-column-builds shape checked below
+// is the direct replacement assertion.
 func TestSlice3SelfJoinInDerivedTable(t *testing.T) {
 	c := catalog.NewInMemory()
 	mk := func(name string, rows int64, cols ...string) {
@@ -1766,14 +1839,19 @@ func TestSlice3SelfJoinInDerivedTable(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Plan: %v", err)
 	}
-	selfKept := false
+	selfCopies := 0
 	for _, b := range slice3BuildProjects(plan) {
 		got := slice3ProjectNames(b)
-		if slice3EqualNames(got, []string{"n_nationkey", "n_name", "n_regionkey", "n_nationkey", "n_name", "n_regionkey"}) {
-			selfKept = true
+		if slice3EqualNames(got, []string{"n_nationkey", "n_name", "n_regionkey"}) {
+			selfCopies++
 		}
-		// F4 pair rule: a name occurring twice in the narrowed child's
-		// schema is kept twice or not at all — never exactly once.
+		// F4 pair rule, for any build whose OWN child still carries a
+		// duplicate name (not the case for a's/b's own builds post-S2,
+		// since each child is a single unaliased base-table scan with no
+		// duplicate column names — but kept general for any build shape
+		// that does have one, e.g. a not-yet-narrowed sub-join child): a
+		// name occurring twice in the child's schema is kept twice or not
+		// at all — never exactly once.
 		counts := map[string]int{}
 		for _, name := range got {
 			counts[name]++
@@ -1788,8 +1866,9 @@ func TestSlice3SelfJoinInDerivedTable(t *testing.T) {
 			}
 		}
 	}
+	selfKept := selfCopies == 2
 	if !selfKept {
-		t.Error("no symmetric 3-column-pair self-join build; want the symmetric over-keep")
+		t.Errorf("found %d of 2 expected [n_nationkey n_name n_regionkey] self-join builds (a and b); want the symmetric over-keep", selfCopies)
 	}
 	if out := plan.Output(); len(out) != 2 || out[0].Name != "x" || out[1].Name != "count" {
 		t.Errorf("outer output = %v, want [x count]", out)

@@ -18,20 +18,26 @@ import "os"
 // reach their join parent as a bare scan node with nowhere for a narrowing
 // Project to attach.
 //
-// narrowJoinLeg is that attachment point. For M0139-S1 it is
-// UNCONDITIONALLY A DECLINE: it recognises exactly the legs a real
-// narrowing pass WOULD have something to say about (a still-bare
-// base-relation scan, optionally Filter-wrapped, that the existing narrow
-// calls did not already cover) and counts them, but returns the (Node,
-// outputLayout) pair completely unchanged either way. That is deliberate,
-// not a stub left mid-implementation: S1's own pre-registered prediction is
-// "no parity movement", and a function that never changes its input cannot
-// move a plan by construction — the safest possible way to stand up one
-// call site that every join constructor (hash, merge as a fallback when
-// narrowMergeInput declines, plain NL, and NLI) now reaches uniformly
-// through joinInputsFor, ready for M0139-S2 to fill in the SAME keep-set
-// derivation narrowBuildInput already uses (buildKeepSet / joinKeepSet /
-// neededKeepSet) rather than invent a second one.
+// narrowJoinLeg is that attachment point. M0139-S1 (2026-09-15) stood it up
+// as an UNCONDITIONAL DECLINE, proven byte-identical to its input by
+// construction: it recognised exactly the legs a real narrowing pass would
+// have something to say about (a still-bare base-relation scan, optionally
+// Filter-wrapped, that the existing narrow calls did not already cover) and
+// counted them, but returned the (Node, outputLayout) pair completely
+// unchanged either way — the safest possible way to stand up one call site
+// that every join constructor (hash, merge as a fallback when
+// narrowMergeInput declines, plain NL, and NLI) reaches uniformly through
+// joinInputsFor.
+//
+// M0139-S2 (this revision) fills the decline in: it reuses
+// narrowBuildInput's existing keep-set derivation (buildKeepSet /
+// joinKeepSet / neededKeepSet) rather than inventing a second one, and
+// calls narrowPlanOutput with the result — the same "wrap in a *Project
+// naming only the kept columns" mechanism GOOPG_NARROW_BUILD and
+// GOOPG_NARROW_UPPER/GOOPG_NARROW_UPPER_SORT already ship. It is now
+// genuinely load-bearing: a leg this hook narrows changes the plan (the new
+// *Project node) and the row width flowing into whatever join sits above
+// it.
 //
 // narrowLegHook resolves GOOPG_NARROW_LEG_HOOK at process start. Opt-out
 // polarity (`=0` disables), matching every other narrowing flag in this
@@ -57,8 +63,10 @@ var legHookFireCount int64
 // narrowMergeInput) has had its chance — that ordering is what lets this
 // function's `already a *Project` check tell "already covered" apart from
 // "nothing has looked at this leg yet" without duplicating either pass's
-// own preconditions.
-func narrowJoinLeg(n Node, lay outputLayout) (Node, outputLayout) {
+// own preconditions. `nliInner` must be true for, and only for, the inner
+// leg of an NLI join (`kind == "PathNestLoop(NLI)"` at the joinInputsFor
+// call site) — see the guard below for why.
+func narrowJoinLeg(n Node, lay outputLayout, p *Path, nliInner bool) (Node, outputLayout) {
 	if !narrowLegHook || n == nil {
 		return n, lay
 	}
@@ -76,7 +84,65 @@ func narrowJoinLeg(n Node, lay outputLayout) (Node, outputLayout) {
 		return n, lay
 	}
 	legHookFireCount++
-	return n, lay
+	if nliInner {
+		// Structural, not a keep-set question: `createNestLoopIndexJoinPlan`
+		// / `createNestLoopIndexJoinPlanFused` (createplannl.go) peel this
+		// exact (Node, outputLayout) pair with `absorbableLeafCond` and then
+		// require the base to be a bare `*IndexScan` — `NestedLoopIndexJoin.
+		// Inner` is typed `*IndexScan`, not `Node`, because the driver calls
+		// `Rescan` on it with the outer slot bound per probe row. Wrapping
+		// it in a `*Project` here is a plan-TIME panic ("NLI inner emitted a
+		// *optimizer.Project, but NestedLoopIndexJoin.Inner is an
+		// *IndexScan"), caught live by
+		// TestQ2DecorrelatedGroupKeyResolvesInAggregateInput before this
+		// guard existed. The milestone doc's own NL policy already excludes
+		// this leg from the *keep-set* derivation (`deriveJoinKeepsAt`'s
+		// "B-01a NL policy"); this is the second, independent reason it
+		// must also never be WRAPPED. The outer/probe side of the same NLI
+		// has no such constraint (`Outer` is typed `Node`) and narrows
+		// normally below.
+		return n, lay
+	}
+	// M0139-S2: the SAME three-tier derivation narrowBuildInput
+	// (narrowoutput.go) already uses for a hash join's build side, reused
+	// rather than duplicated, and applied uniformly to whatever leg reached
+	// this hook (a hash join's outer/probe side, a nested-loop's plain or
+	// NLI outer side, or either side of a join kind whose own narrowing arm
+	// declined). Every refusal below returns the pair untouched, exactly
+	// like the arms it reuses.
+	//
+	// Why this is safe for a leg under a nested loop, where
+	// `deriveJoinKeepsAt` deliberately never stamps `JoinKeep` ("F3-
+	// conservative, B-01a NL policy"): that policy is about the TIGHTEST
+	// tier only, `joinKeepSet`, whose derivation walks the JOIN PATH's own
+	// quals (`collectJoinQualNames`) and cannot see an NLI's per-row probe
+	// key, which lives on the INNER path's IndexClauses instead. Declining
+	// to stamp `JoinKeep` there makes `joinKeepSet` report "unknown" for any
+	// such leg (never a wrong answer), and this function then falls through
+	// to `buildKeepSet` / `neededKeepSet` — the same two fallback tiers
+	// `narrowBuildInput` and `narrowMergeInput` already trust for every
+	// join kind. Both are join-kind-agnostic by construction: `buildKeepSet`
+	// reads a path's `Target` (computed from the statement-wide `NeededCols`
+	// at path-creation time, Slice 1, independent of which join wraps the
+	// scan), and `neededKeepSet` reads `Rel.NeededCols` directly — a NAME
+	// set collected by a raw walk of the parse tree's WHERE/ON/FROM clauses
+	// (`collectStmtColumnNames`), so an NLI's index-qual reference to an
+	// outer column is already a name in that set, the same as any other
+	// qual reference. `narrowcostinputs.go`'s safety argument for this same
+	// chain ("this can only ever keep TOO MANY columns, never too few")
+	// therefore holds here unchanged.
+	if p == nil || p.Rel == nil || !p.Rel.NeededColsKnown {
+		// Same refusal narrowBuildInput/narrowMergeInput apply: no path, no
+		// rel, or an unknown needed set must not be read as "keep nothing".
+		return n, lay
+	}
+	if keep, ok := joinKeepSet(n, p); ok {
+		return narrowPlanOutput(n, lay, keep)
+	}
+	if keep, ok := buildKeepSet(n, p); ok {
+		return narrowPlanOutput(n, lay, keep)
+	}
+	return narrowPlanOutput(n, lay, neededKeepSet(n.Output(), p.Rel.NeededCols))
 }
 
 // isNarrowableLeaf reports whether n is a base-relation scan, optionally

@@ -378,14 +378,20 @@ func joinInputsFor(p *Path, kind string, outerPath, innerPath *Path) joinInputs 
 		outerNode, outerLay = narrowMergeInput(outerNode, outerLay, outerPath, p)
 		innerNode, innerLay = narrowMergeInput(innerNode, innerLay, innerPath, p)
 	}
-	// M0139-S1: the attachment point neither narrowBuildInput nor
+	// M0139-S1/S2: the attachment point neither narrowBuildInput nor
 	// narrowMergeInput reaches — a hash join's outer/probe side, both sides
 	// of a nested loop (plain and NLI), or either side above when the
-	// narrowing above declined. S1 is a pure decline (see joinleghook.go);
-	// it changes neither node, so it is safe to call unconditionally here,
-	// after whatever narrowing above already ran, for every join kind.
-	outerNode, outerLay = narrowJoinLeg(outerNode, outerLay)
-	innerNode, innerLay = narrowJoinLeg(innerNode, innerLay)
+	// narrowing above declined. Reuses the same keep-set derivation those
+	// two arms use (see joinleghook.go), so it is safe to call
+	// unconditionally here, after whatever narrowing above already ran, for
+	// every join kind — EXCEPT an NLI inner (both the `*IndexScan` shape
+	// and its `*BitmapHeapScan` sibling, "PathNestLoop(NLI)" and
+	// "PathNestLoop(NLI-bitmap)"), which `nliInner` excludes: those two
+	// inner slots are typed concretely, and wrapping either in a `*Project`
+	// is a plan-time panic, not a narrower plan (joinleghook.go).
+	outerNode, outerLay = narrowJoinLeg(outerNode, outerLay, outerPath, false)
+	innerNode, innerLay = narrowJoinLeg(innerNode, innerLay, innerPath,
+		kind == "PathNestLoop(NLI)" || kind == "PathNestLoop(NLI-bitmap)")
 	if outerNode == nil || innerNode == nil {
 		panic(fmt.Sprintf("createPlan: %s over a child path that built no node", kind))
 	}

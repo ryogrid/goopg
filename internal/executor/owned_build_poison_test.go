@@ -740,6 +740,14 @@ func obpWalkExcept(n, skip optimizer.Node, visit func(optimizer.Node), unknown *
 // body's WHERE reads the outer level, so parent-aware narrowing is declined
 // there — the orders build keeps the filter column o_orderpriority (3
 // cols), which a parent-aware keep would drop (2).
+//
+// M0139-S2 re-baseline: `narrowJoinLeg` now also narrows the OTHER
+// (lineitem) side of this same join — previously an unwrapped outer/probe
+// leg — to its own 2-column build (l_orderkey, the join key, and
+// l_suppkey, the correlation to the outer s.s_suppkey). One build becomes
+// two; see TestSlice3LateralDeclinesDerivation (internal/optimizer,
+// pathtarget_test.go) for the identical re-baseline on this same fixture
+// shape.
 func TestOwnedBuildPoisonCorrAboveDecline(t *testing.T) {
 	plan := obpPlan(t, obpLateralCatalog(t), obpLateralSQL)
 	var unknown obpUnknown
@@ -753,16 +761,37 @@ func TestOwnedBuildPoisonCorrAboveDecline(t *testing.T) {
 	}
 	body := obpNarrowBuilds(lat.Right, nil, &unknown)
 	obpNoUnknown(t, unknown)
-	if len(body) != 1 {
+	if len(body) != 2 {
 		for _, b := range body {
 			t.Logf("body narrow build %v", obpProjectNames(b.proj))
 		}
-		t.Fatalf("body narrow builds = %d, want 1 (the orders build side)", len(body))
+		t.Fatalf("body narrow builds = %d, want 2 (the orders build side AND the lineitem probe side, M0139-S2)", len(body))
 	}
 	obpAssertHashOnly(t, body)
-	if got := obpNameSet(body[0].proj); !obpSetEqual(got, "o_orderkey", "o_orderdate", "o_orderpriority") {
-		t.Errorf("body orders build = %v, want [o_orderkey o_orderdate o_orderpriority] (statement-wide, filter kept)",
-			obpProjectNames(body[0].proj))
+	wantBodySets := [][]string{
+		{"o_orderkey", "o_orderdate", "o_orderpriority"},
+		{"l_orderkey", "l_suppkey"},
+	}
+	matched := make([]bool, len(wantBodySets))
+	for _, b := range body {
+		got := obpNameSet(b.proj)
+		hit := -1
+		for i, want := range wantBodySets {
+			if !matched[i] && obpSetEqual(got, want...) {
+				hit = i
+				break
+			}
+		}
+		if hit < 0 {
+			t.Errorf("unexpected body narrow build %v", obpProjectNames(b.proj))
+			continue
+		}
+		matched[hit] = true
+	}
+	for i, want := range wantBodySets {
+		if !matched[i] {
+			t.Errorf("missing body narrow build %v", want)
+		}
 	}
 }
 
