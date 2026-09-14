@@ -1,30 +1,15 @@
-(R65 landed `cdfe9ed32`, pushed — see result below; nothing in flight)
+(idle — nothing in flight)
 
-## Plan-parity take2 R65 result (2026-09-11) — Q11→MATCH, 6/14/0/2
+**The R-round cadence is retired.** The plan-parity work moved into the Ralph
+loop on 2026-09-14 as milestones **M0137–M0143**. Do not create `rNNN-*`
+directories and do not follow the previous phase's SCOPE -> REPORT cadence — see
+`AGENT.md` §"Plan-parity harness — applies ONLY to M0137–M0143", which is
+binding, and select per the `## Current Priority` banner in `.ralph/fix_plan.md`.
 
-**Round:** renderer-only two-arm cut (`operators_explain.go` +151,
-`walk_export.go` +39, `flaglabels_test.go` 1-line, 4 new pins):
-Arm A Sort-key OUTER_VAR expansion through child agg targetlist
-(Aggs-only, fail-closed); Arm B `(InitPlan N).col1` value deparse
-(InitPlan-branch-only). P0–P4 all green: values 24/24 MATCH pre/post,
-explain A/B text-only, pp 6/14/0/2 vs fixtures AND live PG,
-DS SF0.25 PASS=96 SKIP=3, plan-gate opt-out (pre/post identical 20/22
-verdict sets vs stale Sep-05 baseline). Review APPROVE-WITH-NOTES.
-Commits: `fdb1a6774` (SCOPE) + `cdfe9ed32` (code+pins+REPORT+TODO),
-both pushed.
+The previous baton's "NEXT" queue (R63 re-triage ordering: Materialize, #6,
+R61 #4, Q4, R63-#1/#2) is **superseded** — that queue was written in the retired
+vocabulary and its items are either carried in `METHODOLOGY3/02-open-problems.md`
+or filed as M0137–M0143 tasks. R65 landed `cdfe9ed32` and was pushed; nothing
+from it is in flight.
 
-**Nightly triage:** run `20260905-011015` (9 items) filed — 6 new tasks
-(race/executor, IntraGrantInplace, IsolationStats,
-LockRowsSortOverJoin, PgDumpConnectionSetup, RegressSuite) + AI-ids
-appended to 3 open tasks (PGColdStart, PgStatActivity ×2).
-
-**NEXT:** re-triage queue per R63 ordering — (a) Materialize (R65 was
-the query-closing precondition), then #6, R61 #4, (b) Q4, R63-#1/#2,
-watches, P0-04 suffix remainder.
-
-**Hygiene notes:** first spotcheck attempt exit 137 transient (rerun
-PASS); `:65433` serves foreign `tmp/goopg-bench-bin` (started 19:00 by
-another lane — untouched); private clone `:5533` DOWN kept for A/B;
-pre-cut source worktree `/tmp/pp2/r65-pre-src`; evidence `/tmp/pp2/r65/`.
-
-**In-flight:** none. Scopes reaped, private ports quiet.
+**In-flight:** none.

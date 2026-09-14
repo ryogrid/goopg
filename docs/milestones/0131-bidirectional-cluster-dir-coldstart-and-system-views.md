@@ -10,9 +10,10 @@
 reverse-path parity" items 1–3; deferral-ledger rows #428, #490, #995, #996.
 (Throughout M0131, `#NNN` ledger references are **line numbers** in
 `.ralph/deferral_ledger.md` — that file has no ID column.)
-**Prerequisites:** M-NIGHTLY is the standing filing obligation (highest priority,
-unconditional); **M0131 is the top-priority milestone after M-NIGHTLY** (user
-directive 2026-08-11). Builds directly on M0130 S1–S11.6, which delivered the
+**Prerequisites:** M-NIGHTLY is the standing filing obligation (unconditional).
+M0131 was the top-priority milestone after M-NIGHTLY by user directive of
+2026-08-11; **that ranking is historical — since 2026-09-14 the
+`## Current Priority` banner ranks the plan-parity group M0137–M0143 first.** Builds directly on M0130 S1–S11.6, which delivered the
 on-disk format parity (per-relation FSM/VM forks, pg_class/pg_attribute/pg_type
 heap persistence, nbtree PG-identical pages and tuples, `RM_BTREE` WAL content
 parity, multi-timeline TLI reconciliation) that this milestone now exercises

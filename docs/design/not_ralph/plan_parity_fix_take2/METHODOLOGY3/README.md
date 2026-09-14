@@ -142,8 +142,13 @@ matching PG's plan may require reproducing PG's errors. Two independent arrivals
   default estimate is **97** (1.8× low). PG 18.3's is **60,125** — **344× high**.
 
 The goal accepts slower plans. It says nothing about adopting PG's mistakes.
-**Recorded, escalated, unanswered** — and it is load-bearing for Q9, for Q4, and
-potentially for the whole join-order programme.
+
+> **ANSWERED 2026-09-14: yes, reproduce them.** The owner's reasoning is that
+> identical plan generation is otherwise impossible. So R79's verdict (b) is
+> overturned, Q9 stays in the target, and 04 §1.2's proposed exclusion rule is
+> rejected. The correct frame is that the goal already requires the **same
+> statistics** — goopg's divergent sampler is a PG-incompatibility, and removing
+> it is faithfulness work, not error-injection. This became milestone **M0138**.
 
 ### 6. What is wrong with the method
 
@@ -184,8 +189,15 @@ Four pathologies, each with a measured cost (detail in
 
 Detail in [`04-forward-plan.md`](04-forward-plan.md). In short:
 
-**First, the owner decides** — this cannot be decided by another round. The
-question is **(a) or (b)**; **(c) is a scheduling decision that should be taken
+**First, the owner decides** — this cannot be decided by another round.
+
+> **ANSWERED 2026-09-14: (a) build it, and (c) = Go.** The plan below has been
+> converted into Ralph milestones **M0137–M0143** (`docs/milestones/0137-*.md` …
+> `0143-*.md`; tasks in `.ralph/fix_plan.md`; binding operating instructions in
+> `AGENT.md` §"Plan-parity harness — applies ONLY to M0137–M0143"). Read that
+> harness section rather than §2 below for how the work is actually run.
+
+The question was **(a) or (b)**; **(c) is a scheduling decision taken
 now regardless of which**:
 
 - **(a) Build executor-side narrowing.** Infrastructure. No parity prediction on

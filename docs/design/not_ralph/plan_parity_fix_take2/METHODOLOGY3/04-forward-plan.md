@@ -5,6 +5,32 @@ a real re-plan, not a tuning of the round cadence.*
 
 ---
 
+## DECISIONS TAKEN 2026-09-14 — read before anything below
+
+The goal's owner answered both questions this document raises. **Where this
+document and the answers differ, the answers win.**
+
+| question | answer | effect on this document |
+|---|---|---|
+| **Q1** (§1.1) — build executor-side narrowing, or accept the cap? | **(a) build it**, and **(c) split the goal = Go** | Phase 2's projection-pushdown campaign proceeds. TPC-DS (Phase 1) runs independently of it. |
+| **Q2** (§1.2) — reproduce PG's estimation errors? | **YES** — *"otherwise identical plan generation is impossible"* | **§1.2's proposed `PARITY-BLOCKED-BY-ORACLE-ERROR` rule is REJECTED.** R79's verdict (b) is OVERTURNED. Q9 stays in the target; Phase 3 is scopeable. |
+
+Q2 also creates a workstream this document does not have as a phase:
+**PG-faithful ANALYZE**. Frame it correctly — the goal statement already
+requires the same plan reached by the **same statistics**, so goopg's divergent
+sampler is a PG-incompatibility and removing it is faithfulness work. Port
+`acquire_sample_rows`; never tune a constant toward a target number.
+
+**The plan has been converted into Ralph milestones M0137–M0143**
+(`docs/milestones/0137-*.md` … `0143-*.md`, tasks in `.ralph/fix_plan.md`).
+The binding operating instructions are `AGENT.md` §"Plan-parity harness —
+applies ONLY to M0137–M0143", **not** this document's §2 — §2's two-tier model
+is mapped onto Ralph's one-task-per-loop discipline there. Phases map as:
+Phase 0 → M0137, Phase 1 → M0140 (Campaign A) + M0141 (Campaign B),
+Phase 2 → M0139, Phase 3 → M0142, Continuous → M0143, plus the new M0138.
+
+---
+
 # Part A — Summary
 
 ## The decision that must come first
@@ -166,7 +192,17 @@ deleting the duplicate build map (`lazyHash` **and** `lazyIntHash` both maintain
 which R129 proved **parity-inert**, so it belongs to `minimize_datum`, not here,
 and its preserved patch is stale (02 §N28).
 
-### 1.2 PG's estimation errors — a proposed answer
+### 1.2 PG's estimation errors — a proposed answer, PUT TO THE OWNER AND REJECTED
+
+> **OUTCOME (2026-09-14): the owner rejected the rule proposed below and
+> directed the opposite** — goopg reproduces PG's estimates, errors included,
+> *"because otherwise identical plan generation is impossible."* The section is
+> kept because this directory's convention is that superseded claims stay
+> legible next to what replaced them, but **do not implement any of it**:
+> there is no `PARITY-BLOCKED-BY-ORACLE-ERROR` state, Q9 does not leave the
+> target, and R79's verdict (b) no longer stands. The work this decision
+> created is milestone **M0138**. The final paragraph of this section
+> anticipated exactly this answer and called it legitimate.
 
 The record contains enough to propose a rule rather than leave the question open:
 

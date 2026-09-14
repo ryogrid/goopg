@@ -441,23 +441,36 @@ If Go symbol operations fail:
 
 - One item per loop. Pick the topmost unchecked task in
   `.ralph/fix_plan.md` unless **the `## Current Priority` banner** or a
-  dependency forces another order. The banner wins over topmost placement —
-  as of 2026-09-01 it ranks M-NIGHTLY first (standing filing + selection),
-  M0134 was the next-priority milestone until declared EXHAUSTED 2026-09-01,
-  and active selection now falls through to M0119; M0132 is archived complete.
-  The banner also outranks
-  `.ralph/working_set.md`'s "NEXT LOOP" note, which carries state, not
-  priority.
+  dependency forces another order. The banner wins over topmost placement, and
+  it also outranks `.ralph/working_set.md`'s "NEXT LOOP" note, which carries
+  state, not priority.
+- **As of 2026-09-14 the banner ranks the plan-parity group M0137–M0143 first**
+  (M0137 -> M0138/M0139/M0140 -> M0141/M0142 -> M0143). **M0143 is gated on
+  nothing — select it whenever everything above it is blocked**, which is what
+  prevents a stall when M0141/M0142 expose only their recon task. Below the
+  group come M-NIGHTLY's own items, then the pre-existing milestones.
+  **M-NIGHTLY's *filing* obligation is unchanged and still unconditional** —
+  every loop reads `ci/logs/action-items.md` and files each new `## AI-`
+  subject — but M-NIGHTLY items are no longer *selected* ahead of the group.
+  Two carve-outs still preempt: an item that breaks the build, and an item that
+  breaks a gate the group depends on. Before selecting any M0137–M0143 task,
+  read §"Plan-parity harness — applies ONLY to M0137–M0143" below; it is
+  binding.
 - Search before assuming something is missing. Prefer reading the spec and
   the upstream source over guessing.
 - Land a design doc alongside or just before any non-trivial subsystem. This
-  is a hard requirement, not optional documentation.
+  is a hard requirement, not optional documentation. **Overridden for
+  M0137–M0143 only** — see §"Plan-parity harness" below, where the design doc is
+  written when the task is *selected*.
 - For any non-trivial subsystem item, create/update the corresponding
   `docs/design/<milestone-or-spec-id>-NNNN-*.md` file and update
   `docs/design/README.md`
-  in the same loop and commit.
+  in the same loop and commit. (This same-loop indexing requirement is **not**
+  relaxed for M0137–M0143.)
 - Do not keep bare `NNNN-*` placeholders in active tasks. Replace them with
-  concrete `<id>-NNNN-*` filenames before implementation begins.
+  concrete `<id>-NNNN-*` filenames before implementation begins. **Overridden
+  for M0137–M0143 only**: the filename is reserved at task selection, not at
+  milestone filing.
 - Tests are valuable, but per `PROMPT.md` they should not exceed ~20% of a
   loop's effort. Implementation > documentation > tests when prioritising.
 - Update `.ralph/fix_plan.md` at the end of every loop: tick boxes, add
@@ -479,6 +492,264 @@ If Go symbol operations fail:
   source and destination entries.
 - "Partially complete" is still incomplete. Never mark partial completion as
   done.
+
+## Plan-parity harness — applies ONLY to M0137–M0143
+
+**Scope fence.** Everything in this section applies **only** while working a task
+in the plan-parity milestone group **M0137–M0143**. Outside that group,
+`## Loop discipline (for Ralph)` and its design-doc rules apply unchanged. Where
+this section and those rules disagree, this section wins **for these seven
+milestones and nothing else**.
+
+### The goal
+
+Every currently executable TPC-H (22) and TPC-DS (99) query must produce **the
+same plan as PG 18.3**, reached by the **same statistics**, the **same cost
+computation** and the **same planning logic**. Never by forcing shapes.
+**Within this milestone group only**, a slower plan that matches is **not** a
+regression — execution time is reported, never adjudicated. (Outside the group,
+performance regressions are judged normally; this clause must not be
+generalised.)
+
+State at the group's filing (2026-09-14): TPC-H **6/22**, TPC-DS **2/99**.
+
+The group's immediate objective is to complete
+`docs/design/not_ralph/plan_parity_fix_take2/METHODOLOGY3/04-forward-plan.md`
+with the owner's two decisions applied.
+
+### The two owner decisions (2026-09-14) — binding, and they override 04
+
+| question | answer |
+|---|---|
+| **Q1** — build executor-side narrowing, or accept a ~6–7/22 TPC-H cap? | **(a) build it** (M0139). And **(c) split the goal = Go**: TPC-DS work (M0140) proceeds independently of it. |
+| **Q2** — should goopg reproduce PG's estimation errors? | **YES** — *"because otherwise identical plan generation is impossible."* (M0138) |
+
+Two things follow that a reader of 04 alone would get wrong:
+
+- **04 §1.2's proposed `PARITY-BLOCKED-BY-ORACLE-ERROR` rule was put to the
+  owner and REJECTED.** Do not implement it and do not cite it.
+- **R79's verdict (b) — "keep the superior statistics, close Q4 elsewhere" — is
+  OVERTURNED.** Do not cite it to decline sampling work.
+
+**Q2 is not a licence to fudge.** The goal statement already requires the
+**same statistics**, so goopg's divergent ANALYZE sampler is a
+PG-incompatibility and removing it is faithfulness work of the same kind as
+porting a cost term. The method is: **port PG's `acquire_sample_rows` and let
+its output be whatever it is.** Never tune a constant toward a target number,
+never special-case a query, never add a fudge factor to "reach" PG's estimate.
+**A task whose diff contains a constant chosen to make an estimate match is
+rejected.** A number matched by tuning proves nothing about the mechanism and is
+exactly the arbitrary forcing the goal forbids — the same reasoning K92 applies to a
+mislabelled plan node, one layer down.
+
+### Design docs — timing override for this group
+
+**Write the design doc when the task is selected**, not before the milestone
+starts: `docs/design/<task-id>-NNNN-short-slug.md`, status `draft` -> `accepted`,
+indexed in `docs/design/README.md` **in the same commit**. This follows the
+M0134 precedent and **overrides** three rules for this group only:
+`docs/milestones/README.md` §"Workflow Per Milestone" step 2 ("write the design
+docs listed under Required Design Docs first"), this file's own "reserve a
+concrete design-doc filename before coding", and `.ralph/PROMPT.md`'s
+"Reserve a concrete design-doc filename before coding". There is no up-front
+Required-Design-Docs list for M0137–M0143.
+
+The same-loop, same-commit indexing requirement is **not** relaxed.
+
+### What to read, and what not to read
+
+The previous phase left **126 round directories** under
+`docs/design/not_ralph/plan_parity_fix_take2/` (`r0-*` … `r130-*`). They are raw
+evidence, not guidance, and browsing them is how R127 was withdrawn on nine
+findings, three fatal, **every one refuted by a document already on disk there**.
+
+Read in this order, and stop when answered:
+
+1. `METHODOLOGY3/README.md` — goal, current score, the frontier, the decisions.
+2. `METHODOLOGY3/01-what-we-learned.md` — the 20 durable findings, plus Part C
+   (claims that were established and then refuted).
+3. `METHODOLOGY3/02-open-problems.md` — blockers, correctness risks, the
+   numbered `N*` items the milestone tasks cite.
+4. `METHODOLOGY3/03-process-retrospective.md` / `04-forward-plan.md` — method
+   and plan, **read with the decisions above applied**.
+5. The milestone doc under `docs/milestones/01NN-*.md`.
+
+**Enter a round directory only via `INDEX-by-query.md` / `INDEX-by-mechanism.md`
+(built by M0137-0008), via an explicit citation in METHODOLOGY3, or via a path
+named in an M0137–M0143 task line** (the third exception exists because
+M0137-0001 must open `.../r2-instrument/` to move the capture scripts, and the
+index does not exist until the eighth task). Never browse
+`plan_parity_fix_take2/` to find out what was tried — that is what the index is
+for, and citing it is a scope gate.
+
+`METHODOLOGY3/README.md`'s "Review record" lists what an adversarial review
+already corrected in those documents; read it before treating any METHODOLOGY3
+claim as novel.
+
+### Known-stale claims — do not act on these
+
+Each of these is contradicted by the tree at HEAD or by a later measurement:
+
+- **K26 §9.3** describes the join-search seam as constants-only. It is a
+  **pre-R51 snapshot**; `joinsearchseam.go:461` calls
+  `inferTransitiveEqualities` unconditionally and both Slice-3 tests were
+  adjudicated against PG. Only the **costing** half of join-order is open.
+- **R35 FINDINGS §1** — "no estimate change can ever move a parity verdict" is
+  **false**. R30, R31b and R36 each moved categories. The accurate statement is
+  that an estimate change registers only insofar as it changes plan *structure*.
+- **The R43-era "5 failing tests, 4 needing adjudication" list** is ~87 rounds
+  stale; at least one member was re-baselined by R51. Re-measure (M0140-0001).
+- **`bench/tpch/plans-pg/`** is a stale, serial fixture and is **not** a parity
+  target (K9). The TPC-DS sibling's standing is M0137-0004's subject.
+- **"Four default-off cost arms"** — there are **three** at HEAD; R128 promoted
+  `GOOPG_NARROW_COST_INPUTS` to default ON.
+- **`METHODOLOGY.md` §2 and `ROADMAP-to-all-match.md` §1–2 numeric tables** were
+  superseded by `METHODOLOGY2.md`, which was superseded by `METHODOLOGY3`.
+- **`04-forward-plan.md` §1.2's proposed rule** — overruled by Q2 above.
+- **`make plan-gate` does not diff against live PG.** It is a
+  goopg-vs-committed-goopg baseline pin (`Makefile:431-453`). The claim that it
+  cannot pass until the goal is met appears in two round reports and is wrong.
+
+### Way of working — this is a Ralph loop, not the R-round cadence
+
+The previous phase ran an interactive cadence: SCOPE -> agent review -> commit ->
+implement -> REPORT -> review -> commit, one numbered round per step. **Do not
+reproduce it.** Concretely:
+
+- **Do not create `rNNN-*` directories.** New raw artefacts go under
+  `analysis/m01NN/`; conclusions go in the task's design doc.
+- Ralph's own discipline applies: **one task per loop**, the working-set baton,
+  the pre-commit gates, `make ralph-state-guard` before the status block.
+- 04's two-tier model maps onto tasks, not rounds. A **recon task** is
+  measurement plus a design note plus (where something is deferred) a ledger row,
+  with **no production change** — `M0138-0001`, `M0141-S0` and `M0142-0001` are
+  recon tasks, and a production diff in their commit is a scope violation. Every
+  other task is an implementation task and lands its own gates.
+- The two most productive results of the previous phase were cheap recons run
+  outside the heavyweight cadence. Prefer eliminating a hypothesis in one task
+  over scoping a campaign around it.
+
+### Measurement — pipeline, ports, and what the metric cannot see
+
+**Bootstrap first.** `psql`, `pgbench`, `pg_isready` and `pg_ctl` live ONLY in
+`./postgres/local_install/bin/`, never on a default PATH, and every bench port
+has its own user/password. The exports, the port->db/user/password table and the
+working `estimate-audit` / `tpch-runner` / `pg-plan-parity-diff.py` command lines
+are in §"plan-parity-take2 work appendix" at the foot of this file — **read its
+§0 and §1 before running anything**, including `make plan-gate` (without the PATH
+its `pg_isready` probe fails as *command not found* and the gate misreports the
+server as unreachable). That appendix is procedural reference for this group;
+where its round-cadence framing conflicts with §"Way of working" above, this
+section wins.
+
+**Canonical captures** live in `scripts/` after M0137-0001; until that lands,
+use the appendix's commands directly (M0137-0003 replaces them with one
+documented procedure). Two facts that have each cost a round:
+
+- **TPC-H baselines come from `estimate-audit -plan-only`, not
+  `capture-tpch.sh`** — the latter opens a fresh session per query and never
+  ANALYZEs, so it captures TPC-H plans on **empty statistics** (goopg's ANALYZE
+  results are per-connection).
+- **`-serial` defaults to `true`** (`cmd/estimate-audit/main.go:285`), setting
+  `max_parallel_workers_per_gather = 0` on **both** engines. That is why TPC-H
+  `parallelism` reads 0: the category is measured **out**, not solved. The last
+  real reading was 18->16 under the gather-paths flip.
+
+**Ports** (see also `CLAUDE.md`): PG TPC-H `:65432`, goopg TPC-H `:65433`, goopg
+TPC-DS SF0.25 `:65437`, PG TPC-DS `:65438`. Throwaway servers use `55xx` with a
+private data clone. The `:6543x` block is shared — **verify a reference, never
+restart it.**
+
+**Server traps** (each earned): verify the serving binary by inode **and** by
+behaviour — the inode check alone is insufficient, and a stale `tmp/` binary
+once produced a false 18-query diff. `pg_isready` READY is necessary, not
+sufficient: a surviving older server answers the port while your instance never
+binds. **Never `pkill -f goopg`** (it self-matches the invoking shell, exit 144).
+Always go through the cgroup cap wrapper (`scripts/goopg-test-run.sh`).
+
+**What the parity verdict is blind to (K50).** `scripts/pg-plan-parity-diff.py`
+normalises `cost=`, `rows=` and `width=` out before comparing, strips `::type`
+renderings, and compares quals by (columns, operator multiset) rather than by
+literal values. **An estimate, cost or width change registers only insofar as it
+changes plan STRUCTURE** — R34 corrected a 580x cardinality error and measured
+exactly zero. This is why a cost or statistics task is judged by category
+movement plus `shape-delta`, never by estimate movement alone.
+
+### The toward-oracle hazard — read before M0138 and M0142
+
+Moving an estimate or a cost **toward** PG is the change class that has already
+produced the programme's worst runtime regressions, because goopg's executor
+does not have PG's mitigations:
+
+- **B6** — R59 repriced index probes toward PG's constants, a correct and
+  PG-faithful change, and TPC-DS **Q72 went from 4 s PASS to a 320 s TIMEOUT**:
+  goopg has no Memoize on the NL probe path PG plans that shape with. Carried
+  unfixed since. Expect this class, do not be surprised by it.
+- **B8** — `indexProbeCostMultiplier = 2.0` deliberately departs from PG because
+  goopg's executor materialises the whole TID list eagerly. **At `mult = 1` the
+  DP picks PG-shaped NL plans that run 2–3x slower** (Q7 5.86 s -> 15.72 s). This
+  is the known parity-vs-runtime knob; touching it is a cross-layer programme
+  that has never been scoped, and K73's `Join.FromOuterReduction` is its sibling.
+- **B10** — `indexCorrelationFor` returns 0 when the leading column has no
+  correlation slot, pricing **every** such index scan at `max_IO_cost`; and
+  R30's residue is that ANALYZE never visits indexes, so `estimateIndexGeometry`
+  **synthesises** relpages/reltuples/tree_height. Both shift index-probe pricing
+  corpus-wide and both sit directly under M0142. M0138-0004 populates
+  correlation slots as a side effect — re-measure these two before concluding
+  anything about index-scan costs.
+
+**Time every query whose plan changed**, and file a ledger row for any that
+regresses. Per the precedence rule below, a slower matching plan lands; an
+unmeasured one does not.
+
+### What every M0137–M0143 task report must contain
+
+In the loop's report and in the task's design doc:
+
+1. **Category movement**, reported as `blocked-excluding-matches` alongside the
+   raw tool line (a MATCH can carry a category tag, so the raw count overstates
+   "blocked").
+2. **`shape-delta` counts.** A task with `shape-changed = 0` moved no plan at
+   all; one with shape changes and no category movement moved plans **sideways**.
+   Conflating the two produced a wrong conclusion once already.
+3. **The declared stats epoch** for both arms, and confirmation that the OFF
+   baseline was re-taken if a values sweep intervened.
+4. **A seam-decline census by class, not by total**, at a stated timeout — a
+   class can be *converted* rather than removed, and censuses are only
+   comparable at equal timeouts.
+5. **Which planning route the query took** — the PG-shaped path search, or the
+   legacy/prebuilt constructor. `tryJoinSearch` preserves the syntactic node when
+   `tryPGShapedJoinSearch` declines, and forced `join_collapse_limit=1` forms
+   never reach the path-cost seam at all. A whole class of experiment was
+   invalidated by measuring the wrong route.
+
+### Success criterion
+
+**Do not write a success test of the form "the match count rises."** No single
+fix flips a query: at the group's filing, non-matching queries differed from PG
+in several categories at once. Progress is **category movement**.
+
+**Keep the non-regression floor**: TPC-H match >= 6, and TPC-DS match >= the
+canonical figure **M0137-0004** declares — the programme currently quotes both 2
+(live-PG reference) and 1 (committed fixture), which is exactly what 0004 exists
+to settle, so the TPC-DS half of the floor is **re-pinned when 0004 lands**.
+Either way, none of the current matches may be lost. That floor is the one
+match-count clause the record shows earning its place — R120's caught the loss
+of Q10.
+
+Values gates bind on every task: TPC-H digest byte-identical to the baseline arm,
+TPC-DS SF0.25 sweep all-zero. **A values break stops the task.**
+
+**Precedence when a matching plan is slow enough to time out.** These two rules
+collide, and the collision is not hypothetical — B6 records a *toward-oracle*
+repricing taking TPC-DS Q72 from 4 s to a 320 s TIMEOUT, and M0138 and M0142 are
+exactly that class of change. The precedence is: **a matching plan that times out
+is not a parity regression, but it IS a coverage loss.** Land the plan, file a
+ledger row naming the query, the timeout and the suspected executor gap, and
+report the query in `Gates run:`. **Do not raise the timeout to hide it**, and do
+not revert a PG-faithful change solely because it got slower — execution time is
+reported, never adjudicated. A values *mismatch* (wrong rows) is a different
+thing entirely and always stops the task.
 
 ## GUC sample-file discipline
 

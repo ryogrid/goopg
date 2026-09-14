@@ -3,12 +3,11 @@
 **Status:** EXHAUSTED (2026-09-01) — all 189 filed cases sized; none currently
 selectable. See "Exhaustion note (2026-09-01)" below.
 **Filed:** 2026-08-15 (user directive)
-**Priority placement:** **next after M-NIGHTLY.** The `## Current Priority`
-banner in `.ralph/fix_plan.md` ranks M-NIGHTLY (nightly regression fixes) first
-and M0134 immediately after it (user directive 2026-08-15), ahead of M0119 and
-M0122's remaining items. **As of 2026-09-01, M0134 has no remaining selectable
-work (see exhaustion note below), so the banner's active milestone falls
-through to M0119.**
+**Priority placement:** historical. M0134 ranked next after M-NIGHTLY by user
+directive of 2026-08-15, and was declared EXHAUSTED on 2026-09-01 with no
+remaining selectable work (see the exhaustion note below). **Since 2026-09-14
+the `## Current Priority` banner ranks the plan-parity group M0137–M0143 first;
+M0134 sits below it with the other pre-existing milestones.**
 **Reference plan:** `.ralph/fix_plan.md` (M0134 section, at the foot of the file)
 **Prerequisite infrastructure:** the D-001 pg_regress runner
 (`scripts/pg-regress-runner.sh`, see `docs/test-port/README.md`) — the SQL-level

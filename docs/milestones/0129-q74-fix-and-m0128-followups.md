@@ -7,9 +7,11 @@ banner)
 **Implementation plan (authoritative task decomposition):**
 `docs/design/0129-q74-fix-and-m0128-followups.md`
 **Prerequisites:** none — M0124/M0125/M0127/M0128/M0123 are all CLOSED (banner
-`f18d3014`). **M0129 is the top-priority milestone** (user directive
-2026-08-08), ahead of the M-NIGHTLY backlog; the standing M-NIGHTLY *filing*
-obligation still applies to every loop.
+`f18d3014`). M0129 was the top-priority milestone by user directive of
+2026-08-08. **That ranking is historical: M0129 is CLOSED (accepted), and since
+2026-09-14 the `## Current Priority` banner ranks the plan-parity group
+M0137–M0143 first.** The standing M-NIGHTLY *filing* obligation still applies to
+every loop.
 **Branch:** inherits the current lineage and its discipline (worktrees off
 pinned clean HEAD, explicit pathspec staging, guard re-runs after
 rebase/handoff).

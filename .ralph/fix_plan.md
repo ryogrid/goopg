@@ -3,21 +3,52 @@
 ## Current Priority
 
 Roadmap derived from `.ralph/specs/GOAL_AND_REQUIREMENTS.md` (§10 "Definition of
-Done (Initial Milestone)"). Pick the topmost unchecked item **unless the Current
-Priority banner below or a dependency forces another order**.
-M-NIGHTLY is the standing filing obligation (highest priority); M0134
-(regress-sql `failed`/`not-tried` digestion) was the next-priority milestone
-after M-NIGHTLY, and as of 2026-09-01 M0134 is
-EXHAUSTED (see below) so active selection falls through to M0119.**
-The banner is the sole ordering
-authority — `.ralph/working_set.md`'s "NEXT LOOP" note carries state, not
+Done (Initial Milestone)"). Pick the topmost unchecked item **unless this banner
+or a dependency forces another order**. **This banner is the sole ordering
+authority** — `.ralph/working_set.md`'s "NEXT LOOP" note carries state, not
 priority, and does not outrank it.
 
-**M-NIGHTLY is the standing filing obligation (unconditional, highest priority):
-every loop reads `ci/logs/action-items.md` and files each new `## AI-` subject
-under the M-NIGHTLY milestone below.**
+### Selection order (rewritten 2026-09-14, user directive)
 
-**M-NIGHTLY selection rule (inherits prior M-NIGHTLY procedure §2, per
+**The plan-parity milestone group M0137–M0143 is the highest-priority work.**
+Its goal is the one in `.ralph/specs/GOAL_AND_REQUIREMENTS.md`: every currently
+executable TPC-H and TPC-DS query produces **the same plan as PG 18.3**, reached
+by the same statistics, the same costing and the same planning logic — never by
+forcing shapes. The group completes
+`docs/design/not_ralph/plan_parity_fix_take2/METHODOLOGY3/04-forward-plan.md`
+with the owner's two decisions of 2026-09-14 applied.
+
+**Before selecting any M0137–M0143 task, read `AGENT.md` §"Plan-parity harness —
+applies ONLY to M0137–M0143".** It is binding and it carries the goal, the two
+owner decisions, the reading order for the prior phase's evidence, the list of
+known-stale claims, and what every task report must contain.
+
+Select in this order:
+
+1. **M0137 — Parity measurement harness and instrument repair.** First, and a
+   prerequisite for the other six: every one of them is judged by instruments
+   this milestone repairs.
+2. **M0138 — PG-faithful ANALYZE statistics**, **M0139 — Executor-side
+   narrowing**, **M0140 — TPC-DS parallelism.** Independent of one another; take
+   the topmost with an unblocked task. M0140 does **not** wait on M0139 (owner
+   decision "(c) split the goal = Go").
+3. **M0141 — Upper-planner ordering contest** (only `M0141-S0`, its mandatory
+   scoping recon, is selectable until S0 files its slices) and **M0142 —
+   Join-order costing** (gated on M0138 having landed and been measured).
+4. **M0143 — Engine correctness carry-overs.** Gated on nothing; select it
+   whenever everything above is blocked.
+5. Then M-NIGHTLY's own open items, then the pre-existing milestones
+   (M0119 -> M0122 -> M0131 -> M0134 -> M0135/M0136 -> M0095/M0110).
+
+**M-NIGHTLY: filing stays unconditional, selection does not.** Every loop still
+reads `ci/logs/action-items.md` and files each new `## AI-` subject under the
+M-NIGHTLY milestone below — that obligation is unchanged and outranks
+everything, because it costs minutes and preserves nightly-regression
+visibility. **But M-NIGHTLY items are no longer selected ahead of M0137–M0143.**
+Two carve-outs still preempt: an item that breaks the build, and an item that
+breaks a gate the plan-parity group depends on.
+
+**M-NIGHTLY selection rule (applies when an M-NIGHTLY item is selected, per
 ci/design/07-ralph-feedback.md §B):**
 1. Before investigating, re-run the item's repro at HEAD — the log reflects the
    last nightly run and may be stale.
@@ -32,14 +63,17 @@ ci/design/07-ralph-feedback.md §B):**
   decompose any item larger than a single agent invocation.
 - Every non-trivial subsystem must land with (or just before) a design doc under
   `docs/design/<id>-NNNN-*.md` **and** a `docs/design/README.md` index entry —
-  hard requirement, same loop.
+  hard requirement, same loop. **Carve-out for M0137–M0143:** in that group the
+  design doc is written **when the task is selected**, not before the milestone
+  starts — see `AGENT.md` §"Plan-parity harness". The same-loop, same-commit
+  indexing requirement is unchanged.
 - Deferrals: never close a task silently with a forward reference. Append one row
   to `.ralph/deferral_ledger.md` (`date | task-id | landed | deferred | resume
   point | why`) and leave the fix_plan item unchecked. **The ledger is the source
   of truth for every "DEFERRED" note below** — consult it for full context/resume
   points.
 - Completed milestones are archived under `completed_milestones/` (latest:
-  `completed_fix_plan_011.md`); they are reference-only, NOT actionable, and must
+  `completed_fix_plan_012.md`); they are reference-only, NOT actionable, and must
   not be copied back here.
 
 
@@ -172,9 +206,9 @@ only the infeasible `deadlock-parallel` spec remains), M0119-0009 (UPDATE/DELETE
 conflict-wait), plus the landed sub-slices of -0004 (NULLS NOT DISTINCT
 enforcement + upsert arbiter) and -0005 (pg_waldump WD-003/WD-004 canonical
 prune-WAL round-trip — M0119-0005 is now fully landed, no open bullet
-remains). The one open item below carries the remaining unbuilt scope, and is
-now the milestone's (and, as of 2026-09-01, the whole file's) active task per
-the Current Priority banner (M0134 exhausted).
+remains). The one open item below carries the remaining unbuilt scope. It was
+the whole file's active task between 2026-09-01 and 2026-09-14; **since
+2026-09-14 the banner ranks M0137–M0143 above it.**
 
 - [ ] **M0119-0006 — pg_amcheck server tier**.
 > This task list is **seeded, not exhaustive.** M0119-0001 triage plus every future
@@ -218,13 +252,13 @@ _(completed `[x]` subtasks archived → `completed_milestones/completed_fix_plan
 
 ## M0131 — Bidirectional cluster-directory cold-start + real-PG system-view hosting (filed 2026-08-11)
 
-> **Demoted from top priority by the 2026-08-13 user directive** — M0134
-> (regress-sql digestion) became the next-priority milestone after M-NIGHTLY in
-> 2026-08-15; M0132 was completed and archived; M0134 was declared exhausted
-> 2026-09-01. This section sits at the end of the file for append-safety only —
+> **Demoted from top priority by the 2026-08-13 user directive**, and demoted
+> again on 2026-09-14 when the plan-parity group M0137–M0143 took the head of the
+> banner. This section sits in the middle of the file for append-safety only —
 > **document order does NOT reflect priority.** The `## Current Priority` banner
-> at the top of this file is the sole ordering authority. Work M0131's remaining
-> tasks after M0134 and M0119, before any remaining M0122 item.
+> at the top of this file is the sole ordering authority: work M0131's remaining
+> tasks below the plan-parity group, alongside the other pre-existing
+> milestones.
 
 **Milestone doc:** `docs/milestones/0131-bidirectional-cluster-dir-coldstart-and-system-views.md`
 **Implementation plan:** `docs/design/0131-bidirectional-cluster-dir-coldstart-and-system-views.md`
@@ -258,11 +292,11 @@ M0132 (Explicit transactions across the extended query protocol), M0133 (informa
 
 ## M0134 — regress-sql `failed`/`not-tried` test-case digestion (filed 2026-08-15)
 
-**Priority: next after M-NIGHTLY (user directive 2026-08-15).** The `## Current
-Priority` banner names M0134 immediately after M-NIGHTLY's standing filing
-obligation; work M0134 tasks right after M-NIGHTLY's regression fixes, ahead of
-M0119 and M0122's remaining items. **As of 2026-09-01 M0134 is EXHAUSTED** —
-active selection now falls through to M0119 per the banner. Milestone doc:
+**Priority: historical.** M0134 ranked next after M-NIGHTLY by user directive of
+2026-08-15, and **was declared EXHAUSTED on 2026-09-01** with no remaining
+selectable work. **Since 2026-09-14 the `## Current Priority` banner ranks the
+plan-parity group M0137–M0143 first; M0134 sits below it with the other
+pre-existing milestones.** Milestone doc:
 `docs/milestones/0134-regress-sql-failed-not-tried-digestion.md`.
 
 **Per-task discipline (binding, from the milestone doc):**
@@ -509,3 +543,403 @@ wants to unblock the shared type-kernel gap properly.
 - [ ] **M0136-S2 — `tsvector` comparison + editing/utility functions**.
 - [ ] **M0136-S3 — `@@` match operator + `<->` phrase-distance operator**.
 - [ ] **M0136-S4 — `ts_rank`/`ts_rank_cd` scoring**.
+## M0137 — Parity measurement harness and instrument repair (filed 2026-09-14)
+
+**Milestone doc:** `docs/milestones/0137-parity-measurement-harness-and-instrument-repair.md`
+**Harness (binding, read before selecting):** `AGENT.md` §"Plan-parity harness — applies ONLY to M0137–M0143"
+**Source:** `docs/design/not_ralph/plan_parity_fix_take2/METHODOLOGY3/04-forward-plan.md` Phase 0 (M2/M3/M5/M6)
+
+**First in the plan-parity group, and a prerequisite for the other six.** Every
+other milestone is judged by measurement, and the instruments have decayed: the
+K18 `$$`-tempfile trap produced false structural readings in four rounds (R122,
+R123, R124, R128) and is still live; captures are hand-stamped or unstamped;
+stats-epoch drift measured at 1.31x on Q9 exceeds most effects being claimed;
+`make plan-gate` has been a standing opt-out since R65. K91's rule is what this
+milestone restores — a harness must fail loudly, and an A/B must prove which
+binary answered; where it cannot, the result is not evidence.
+
+**Per-task discipline:** design note written **when the task is selected**
+(`docs/design/<task-id>-NNNN-short-slug.md`, indexed in `docs/design/README.md`
+in the same commit). No new `rNNN-*` round directories; raw artefacts go under
+`analysis/m0137/`. Every instrument change lands with a test or a recorded
+before/after proving the defect it closes.
+
+- [ ] **M0137-0001 — promote the parity capture pipeline into `scripts/` and fix the K18 `$$` trap** — two divergent copies exist inside round directories
+  (`plan_parity_fix_take2/methodology/` and `.../r2-instrument/`), both embedding `$$`
+  in the temp filename, which lands in Q36/Q70/Q86's psql ERROR text and makes any two
+  runs diff spuriously. Land one canonical copy under `scripts/`, fix the trap at
+  source, and add a test that two consecutive captures of an unchanged binary diff
+  empty. Retire the round-directory copies from every procedure.
+- [ ] **M0137-0002 — machine-stamp every capture artefact** — binary path, inode,
+  serving-PID `/proc/<pid>/exe` verification, flag arm, pinned GUCs and stats epoch,
+  written by the tool. R122 §10's own words are the defect: the headline arm
+  attribution "rests entirely on filename convention". This is the gap that let a
+  flag-OFF run be cited as ON evidence (R120 B1).
+- [ ] **M0137-0003 — write the canonical baseline-capture procedure** — record that
+  TPC-H baselines come from `estimate-audit -plan-only`, **not** `capture-tpch.sh`
+  (which opens a fresh session per query and never ANALYZEs, so it captures TPC-H
+  plans on empty stats); and that `-serial` defaults **true**
+  (`cmd/estimate-audit/main.go:285`), so TPC-H `parallelism 0` is measured *out*, not
+  solved. Include the TPC-DS procedure and the pinned GUCs for both corpora.
+- [ ] **M0137-0004 — reconcile the TPC-DS `match=2` vs `match=1` discrepancy** — both
+  figures come from the same capture-script family; the difference is the **reference
+  and the session GUCs** (live PG `:65438` vs the committed `bench/tpcds/plans-pg`
+  fixture), not the tool. Declare one canonical reference and rule on the fixture's
+  standing the way K9 rules on the TPC-H one. Stop the programme quoting both numbers.
+- [ ] **M0137-0005 — re-baseline `make plan-gate`** — it is a goopg-vs-committed-goopg
+  baseline pin (`Makefile:431-453`), **not** a diff against live PG, and its baseline
+  has not been refreshed across ~125 rounds of intentional plan change. Land the
+  re-baseline as its own commit with the 20 diverging queries adjudicated or
+  explicitly carried, so the gate is a live signal again.
+- [ ] **M0137-0006 — make the stats-epoch declaration a checked step** — a values
+  sweep re-samples statistics and opens a new epoch; R120 attributed two apparent
+  "worsenings" to drift rather than the flag and left a rule no tool enforces.
+  Every A/B artefact declares its epoch on both arms, and re-taking the OFF baseline
+  after a sweep becomes a verified step rather than a remembered one.
+- [ ] **M0137-0007 — give each lane a private clone and a private port** —
+  shared-resource contention on `:65433` is the stated reason for most deferred gates
+  (`tpch-spotcheck.sh` was deferred four rounds running while being the only gate that
+  caught the Q13 33-vs-34 wrong-rows bug). This is an infrastructure problem with an
+  infrastructure fix.
+- [ ] **M0137-0008 — build `INDEX-by-query.md` and `INDEX-by-mechanism.md` over the
+  round corpus** — one row per TPC-H/TPC-DS query and per mechanism, naming the rounds
+  that touched it and their standing verdict, so a scope can cite prior work instead of
+  re-deriving it. R127 was withdrawn on nine findings, three fatal, every one refuted
+  by a document already on disk; the written "grep the directory first" warning was
+  authored *before* R130 and still did not work. Make citing the index a scope gate.
+- [ ] **M0137-0009 — retire the flag and ledger debt** — delete
+  `GOOPG_HASHAGG_WIDTH_CURRENCY` (R124 §7 resolved its promote-or-delete to **delete**;
+  it ships default-OFF and net-negative), state the default-off arm cap in the harness,
+  and close or delete each ledger item carried unretired for ten or more rounds.
+- [ ] **M0137-0011 — root-cause the second display/estimator seam (C3/K63)** — R76 P1
+  saw Q22 display rows 16,666 against a stamped 18,200 and called it "a second
+  estimator seam"; R77 took the post-pass branch and noted "gates did not complain",
+  and it was never diagnosed. K63 is the general form: goopg's EXPLAIN reports a scan
+  cost the planner did not use (4.5x on Q12), which "corrupts every cost-based
+  artefact including `plan-gate MODE=semantic-cost` and estimate audits". This is an
+  **instrument** defect and therefore belongs in this milestone, not in a costing one.
+- [ ] **M0137-0012 — file ledger rows for the four unowned carry-overs** — one row each,
+  with mechanism and resume point, so they stop being invisible: **B6** (no Memoize on
+  the NL probe path R59 repriced; Q72 4s -> 320s TIMEOUT), **B8**
+  (`indexProbeCostMultiplier = 2.0` — parity vs wall-clock, 2–3x slower at `mult = 1`;
+  sibling K73 `Join.FromOuterReduction`), **B10** (`corr = 0` fallback pricing every
+  such index scan at `max_IO_cost`, plus R30's synthesised index geometry), and
+  **O15** (`*Gather` crossing still deliberately excluded from `pushConjunctTraced` —
+  the same class as R56's Q78 defect, which M0137-0010's census will *detect* but
+  nothing currently schedules *fixing*). Filing only; no code change.
+- [ ] **M0137-0010 — add the qual-placement census and the duplicate-sensitive values
+  check** — both justified by bugs that shipped: R56's Q78 lost three `Filter:` lines
+  with sweep checksums still passing, and R83's Limit-below-Unique truncation was
+  masked on current data only because `78 < 100`. The census counts `Filter:` /
+  `Index Cond:` lines per query and diffs them between arms; it becomes the gate every
+  M0139 slice runs.
+
+## M0138 — PG-faithful ANALYZE statistics (filed 2026-09-14)
+
+**Milestone doc:** `docs/milestones/0138-pg-faithful-analyze-statistics.md`
+**Harness (binding, read before selecting):** `AGENT.md` §"Plan-parity harness — applies ONLY to M0137–M0143"
+**Source:** the owner's answer of 2026-09-14 to `METHODOLOGY3/04-forward-plan.md` §1.2 Question 2
+**Prerequisite:** M0137.
+
+**The owner directed that goopg reproduce PG's estimates, errors included,
+because otherwise identical plan generation is impossible.** Two consequences:
+04 §1.2's proposed `PARITY-BLOCKED-BY-ORACLE-ERROR` rule is **rejected**, and
+**R79's verdict (b) — "keep the superior statistics" — is OVERTURNED**; do not
+cite it to decline sampling work. Q9 stays in the parity target and M0142
+becomes scopeable.
+
+**Frame it correctly: this is not error-injection.** The goal statement already
+requires the same plan reached by the **same statistics**, so goopg's sampler is
+a divergence from PG and removing it is PG-faithfulness work. **Port
+`acquire_sample_rows` and let its output be whatever it is** — never tune a
+constant toward a target number, never special-case a query, never add a fudge
+factor. A task whose diff contains a constant chosen to make an estimate match
+is rejected. If a faithfully ported sampler still disagrees with PG, that is a
+finding to record, not a gap to paper over.
+
+**Per-task discipline:** design note when the task is selected, indexed in the
+same commit; cite the PG oracle by `file:function`; same-epoch A/B only (this
+milestone moves estimates corpus-wide); values gates bind — large plan churn is
+expected and acceptable, wrong rows are not. **Time every query whose plan
+changed**: moving an estimate toward PG is the class that took TPC-DS Q72 from
+4s to a 320s TIMEOUT (B6 — goopg has no Memoize on the NL probe path PG plans
+that shape with), and B8's `indexProbeCostMultiplier = 2.0` and B10's `corr = 0`
+fallback both shift index-probe pricing corpus-wide. See `AGENT.md` §"The
+toward-oracle hazard"; a slower matching plan lands with a ledger row, an
+unmeasured one does not.
+
+- [ ] **M0138-0001 — divergence census (recon, no production change)** — measure and
+  record exactly where goopg's ANALYZE differs from PG's `acquire_sample_rows`
+  (`postgres/src/backend/commands/analyze.c:1199`). Already upstream-faithful:
+  `upstreamDefaultStatsTarget = 100`, the `targrows = target * 300` multiplier
+  (`internal/executor/operators_analyze.go:581-589`), the Algorithm-R reservoir, the
+  physical-order re-sort, and the Duj1 estimator. The measured divergence is the
+  **block representation** — goopg scans every block, PG samples random blocks. Produce
+  a per-column divergence table over both corpora; no code change in this task.
+- [ ] **M0138-0002 — port PG's block sampler and two-stage row selection** —
+  `BlockSampler_Init`/`BlockSampler_Next`
+  (`postgres/src/backend/utils/misc/sampling.c:39,64`) plus
+  `reservoir_init_selection_state` / `reservoir_get_next_S` / `sampler_random_fract`
+  as `analyze.c:1228-1290` drives them, including PG's `pg_prng` sequence, so the
+  sampled TID set matches PG's for a fixed seed on a shared relation.
+- [ ] **M0138-0003 — verify `stadistinct` parity end to end; do NOT re-implement what
+  exists** — goopg stores upstream's one signed `stadistinct` as **two** fields,
+  `NDistinct` (absolute) and `NDistinctFrac`
+  (`internal/catalog/catalog.go:1880-1903`), but `ColumnStats.StaDistinct()`
+  (`catalog.go:1942`) **already** reconstructs PG's signed convention including
+  upstream's 10% absolute-to-fraction switch (`analyze.c:2650-2658`), and it is already
+  consumed at the `pg_statistic` heap row, the `pg_stats` view and
+  `joinselectivity.go:235`. So the convention is not the gap. The task is to confirm
+  the switch fires where PG's does **on the sample M0138-0002 now produces**, and that
+  every consumer reads the reconstructed value rather than a bare `NDistinct` (the
+  take2 P2-09 class of bug, where a scaling column read as absolute-zero). R78's
+  witness: goopg `l_orderkey` `-0.1956` vs PG's absolute `347537` — re-measure it and
+  report. Land a change only where a real divergence is found.
+- [ ] **M0138-0004 — MCV, histogram and correlation from the shared sample** — apply
+  PG's `compute_scalar_stats` / `compute_distinct_stats` selection rule to the sample
+  M0138-0002 produces, so every slot is computed from the same rows PG would have seen.
+- [ ] **M0138-0005 — corpus re-measure at a declared epoch** — commit a per-column
+  statistics diff vs PG 18.3 over both corpora, then the plan and category movement it
+  causes. Every remaining disagreement is explained or filed as a ledger row. Expect
+  large plan churn; the values gates are the bar.
+- [ ] **M0138-0006 — re-measure Q9's estimate against R130's table and reconcile the
+  ANALYZE seed** — Q9's actual output is 175 rows; goopg estimated 97 and PG estimates
+  60,125. **Moving toward PG's 60,125 is the expected result** and is the empirical
+  test of the Question 2 decision; if it does not move, that is the finding and M0142's
+  premise must be re-examined before slices are scoped. In the same task, reconcile
+  `GOOPG_ANALYZE_SEED`'s determinism with PG's own sequence — retire it, or document
+  why both must coexist.
+
+## M0139 — Executor-side narrowing / projection pushdown (filed 2026-09-14)
+
+**Milestone doc:** `docs/milestones/0139-executor-side-narrowing-projection-pushdown.md`
+**Harness (binding, read before selecting):** `AGENT.md` §"Plan-parity harness — applies ONLY to M0137–M0143"
+**Source:** the owner's answer of 2026-09-14 to `METHODOLOGY3/04-forward-plan.md` §1.1 Question 1 — **(a) build it**
+**Prerequisite:** M0137 (M0137-0010's qual-placement census gates every slice here).
+
+**Scope is projection pushdown only.** The packed retention format
+(`PackedTuple`/`PackedSlot`) stays declined and needs an owner decision informed
+by S3's measurement; a `Datum` re-layout below 48 B is declined and nobody
+proposes it. `minimize_datum/README.md` states `Datum` **stays exactly 48 bytes**
+— so "the `DatumBytes` half" is the wrong label for the retention format and must
+not be used (`05-work-estimate.md` §1 calls confusing the two "the single most
+likely way to misprice this work").
+
+**The structural blocker is located:** inside a join tree there is no `*Project`
+above the scan at all — the join reads the scan directly, so there is nowhere to
+hang a projection. The machinery for *applying* a narrowing already exists and
+ships default-ON, but in **three separate files**: `GOOPG_NARROW_BUILD` in
+`internal/optimizer/narrowoutput.go` (hash build side and merge input),
+`GOOPG_NARROW_UPPER` in `upper_narrow_apply.go:90`, `GOOPG_NARROW_UPPER_SORT` in
+`upper_narrow_chain.go:124`. **`attr_needed` is NOT the blocker** — two earlier
+diagnoses said it was and both were wrong.
+
+**Argue this campaign on Q4 and the executor gap, not on Q9.**
+`internal/optimizer/entrywidth.go:38-48` carries a measured comment headed "WHAT
+THIS DOES NOT BUY": Q9's `nbatch` is non-monotone in entry width (4 at 112..194,
+2 only at 96..111, back to 4 below 96), commit `2e15b8ca3` records that a packed
+retention format would make Q9's batching **worse**, and R129 measured the lever
+that comment names as parity-inert.
+
+- [ ] **M0139-S1 — a hook point inside the join tree** (gated on M0137-0010) — pre-registered prediction:
+  **no parity movement; the pass fires N > 0 times**. A slice that predicts a match
+  flip is mis-scoped. Do not re-derive that `attr_needed` is the blocker.
+- [ ] **M0139-S2 — narrow scan output at the new hook** (gated on M0137-0010) — reuse the existing
+  narrowing rather than duplicating it. It lives in three files, not one:
+  `narrowoutput.go` (`GOOPG_NARROW_BUILD`, hash build + merge input),
+  `upper_narrow_apply.go:90` (`GOOPG_NARROW_UPPER`) and `upper_narrow_chain.go:124`
+  (`GOOPG_NARROW_UPPER_SORT`).
+- [ ] **M0139-S3 — measure the residue against K67's floor** (gated on M0137-0010) — even narrowed to one
+  column goopg is 72 B/row -> 103 MB and still spills at `work_mem=64MB` where PG is
+  22 B/row -> 31 MB. Report the post-pushdown figure as a **number**, not an argument.
+- [ ] **M0139-0004 — re-measure the "duplicate hash build map" premise, then act on
+  what you find** — `minimize_datum/05-work-estimate.md` §1.5 (quoting `02` §3) prices a
+  "delete the duplicate build map" win at "one commit", claiming `lazyHash` **and**
+  `lazyIntHash` are both maintained for ~2x peak build memory. **That premise appears
+  stale at HEAD:** `lazyHashInsertDatum` (`internal/executor/operators_join_agg.go:1238-1254`)
+  files into `lazyIntHash` **and returns**, or falls through to `lazyHash`, and
+  `demoteIntHash` (`:1325-1338`) migrates then sets `o.lazyIntHash = nil` — they read as
+  mutually exclusive lanes with no simultaneous double-retention. Verify that by
+  measurement before deleting anything; the int lane exists for speed and `demoteIntHash`
+  is its fallback. If the premise is refuted, **the deliverable is a ledger row recording
+  the refutation** and a correction to `minimize_datum/05` §1.5, not a code change.
+  Independent of the slices; take it whenever a slice is blocked.
+- [ ] **M0139-0005 — re-measure Q4's grouping election** — R81 located the divergence
+  one rel above the grouping contest, in `electOrderedGrouping`
+  (`upperorderedgrouping.go:148`), on a startup ratio against `stdFuzzFactor = 1.01`:
+  goopg 1.0086 (inside fuzz, tie-break picks hashed) vs PG 1.0118 (outside, sorted
+  wins). Report whether the narrowed widths move that ratio across the band.
+- [ ] **M0139-0006 — put the packed-retention decision to the owner** — carry S3's
+  measured residue, `entrywidth.go`'s non-monotonicity finding, and the two blockers
+  the `minimize_datum` review itself raised ("the premise was modelled, and the
+  measured answer is different — and smaller"; "sequencing violates take3 13 §8.2").
+  **Do not implement it** — `minimize_datum` is NOT APPROVED TO START.
+
+## M0140 — TPC-DS parallelism (filed 2026-09-14)
+
+**Milestone doc:** `docs/milestones/0140-tpcds-parallelism.md`
+**Harness (binding, read before selecting):** `AGENT.md` §"Plan-parity harness — applies ONLY to M0137–M0143"
+**Source:** `METHODOLOGY3/04-forward-plan.md` Phase 1 Campaign A
+**Prerequisite:** M0137. **Independent of M0139** per the owner's "(c) split the goal = Go".
+
+`parallelism` blocks **87 of 99** TPC-DS queries: PG plans 66 of 99 in parallel
+where goopg plans serial, **zero the other way**, and `Parallel Hash` appears 314
+times in PG's plans and 0 in goopg's. Three corrections already narrowed the
+lever — **K80** (`addPartialHashJoinPath` already sets `ParallelAware: true`; the
+arm is dead solely because `GOOPG_GATHER_PATHS` is default-OFF), **K82** (Q14 is
+byte-identical under the flip, so the tracks are independent), **K92**
+(relabelling goopg's leader-prebuild as `Parallel Hash` would be a
+misdescription, i.e. the forcing the goal forbids).
+
+Carry, do not rediscover: **K20** — `GOOPG_GATHER_PATHS` gates *partial paths
+only, not parallelism*; the post-pass emits a Gather regardless, so there is no
+setting that yields a serial plan.
+
+- [ ] **M0140-0001 — re-measure the failing test set under the `GOOPG_GATHER_PATHS`
+  flip at HEAD** — do **not** inherit the R43-era "5 failing, 4 needing adjudication"
+  list; it is ~87 rounds stale and at least `TestSlice3LiveQ9ShapeDerivation` was
+  re-baselined by R51 nine rounds later. The ledger's own adjacent note binds:
+  re-measure before relying on any prior round's figures.
+- [ ] **M0140-0002 — adjudicate whatever genuinely fails against PG 18.3** — R14's
+  precedent applies: ask the oracle, the test can be wrong. Do not change planner
+  behaviour to satisfy a pin the oracle contradicts.
+- [ ] **M0140-0003 — land the `GOOPG_GATHER_PATHS` flip on the category metric** —
+  pre-register **no match flip**: R43 rev 3 measured TPC-H `parallelism` 18->16 under
+  the flip with no new match, and K38 measured Gather 42->104 / `Parallel Hash` 0->167
+  at `all` with parity not improving. The category movement is the success criterion.
+- [ ] **M0140-0004 — partial-Append producer (K43)** — there are currently zero
+  partial paths on join rels via that route; PG uses Parallel Append in six TPC-DS
+  queries and only Q5 and Q76 miss.
+- [ ] **M0140-0005 — file the two out-of-reach items as ledger rows** — Q14's third
+  category (K92: needs PG's real partial-inner execution model, "NOT cheap") and the
+  non-planner floor (K14/K15 heap density; K41's unexplained dimension-table `relpages`
+  divergence, `customer` 1,979 vs 2,872 and `item` 716 vs 1,284). Each row names the
+  mechanism and what would unblock it; neither is silently dropped.
+
+## M0141 — Upper-planner ordering contest (filed 2026-09-14)
+
+**Milestone doc:** `docs/milestones/0141-upper-planner-ordering-contest.md`
+**Harness (binding, read before selecting):** `AGENT.md` §"Plan-parity harness — applies ONLY to M0137–M0143"
+**Source:** `METHODOLOGY3/04-forward-plan.md` Phase 1 Campaign B
+**Prerequisites:** M0137, **and this milestone's own S0.**
+
+The named lever for `aggregation-strategy` (TPC-DS 69, TPC-H 10) and, through
+the same mechanism, `sort-strategy` (76 / 9) — K24 calls it the largest single
+item in the workstream. **It is scoping-gated, not scheduled**, because the
+record refuses to size it: `METHODOLOGY3/02` §B4 calls it "named and unscoped",
+K96 says the shape PG picks is unreachable by construction, and K97 records R45's
+fix as rejected on review as architecturally impossible, naming the real item as
+PG's `AGGSPLIT_INITIAL_SERIAL` / `AGGSPLIT_FINAL_DESERIAL` — a multi-round
+executor programme of unstated size. This is the weakest link in the owner's
+"(c) split the goal" decision, and S0 exists to price it.
+
+Constraints to start from, not rediscover: goopg's Partial aggregate emits
+**zero rows** (K97), `aggregateOp` already sorts for determinism so incidental
+ordering is not a pathkey (K97), the upper planner receives a finished `Node`
+rather than the join rel's paths and K23/K12(B) share that root cause (K24), and
+PG's preference is **pathkey-driven, not spill-driven** — R120 already proved the
+spill route is net-negative.
+
+- [ ] **M0141-S0 — scoping recon (measurement only, no production change)** — size the
+  `AGGSPLIT_INITIAL_SERIAL` / `AGGSPLIT_FINAL_DESERIAL` programme in goopg terms
+  (which executor surfaces change, how many sites, what a row-borne partial-state
+  representation costs), produce a slice list, and file S1..Sn **into this section**
+  with an entry gate. A production diff in S0's commit is a scope violation. A recorded
+  no-go stating why the programme should not be attempted is an acceptable outcome.
+  Check this line off in the same commit that files the slices (or records the no-go).
+
+## M0142 — Join-order costing (filed 2026-09-14)
+
+**Milestone doc:** `docs/milestones/0142-join-order-costing.md`
+**Harness (binding, read before selecting):** `AGENT.md` §"Plan-parity harness — applies ONLY to M0137–M0143"
+**Source:** `METHODOLOGY3/04-forward-plan.md` Phase 3, unblocked by the Question 2 answer
+**Prerequisites:** **M0138** (landed and measured) and M0137.
+
+`join-order` is the largest category on both corpora — **TPC-H 14, TPC-DS 89** at
+the 2026-09-14 baseline (`estimate-audit -plan-only -serial` for TPC-H, live PG
+`:65438` for TPC-DS). The R51-era figures quoted below are **18 / 95**, measured on
+the pre-R66 capture protocol against different references; the two are not
+commensurable and must not be differenced. Re-measure rather than subtract.
+**The candidate half is already open at HEAD**: `joinsearchseam.go:461` calls
+`inferTransitiveEqualities` unconditionally and R51 adjudicated both Slice-3
+tests against PG, so **K26 §9.3's "constants-only" description is a pre-R51
+snapshot — do not schedule against it.** Only the costing half remains. R51 also
+measured what opening candidates buys on its own: TPC-H `join-order` 18->18,
+TPC-DS 95->95.
+
+Three attribution rounds converged independently on pricing (R53 and R68 on Q9;
+R96 on Q96, margin 157.50 = 0.68%), and **every pricing round then terminated
+blocked** — R70 on fragility, R89 C2 on missing inputs, R98 UNOBSERVABLE, R99
+ORACLE INVALID. That is why this milestone opens with a recon.
+
+Margins here are fractions of a percent and the elections are exact: `add_path`
+uses a 1% fuzzy comparator but `setCheapest` takes the exact raw minimum on both
+engines. **Instrument the term; never infer it from the sum** — K61 and K64 were
+both wrong for exactly that reason.
+
+**Two unowned inputs sit directly under this milestone and must be re-measured
+before any costing conclusion:** B10's `indexCorrelationFor` returning 0 when the
+leading column has no correlation slot (which prices **every** such index scan at
+`max_IO_cost`) and R30's residue that ANALYZE never visits indexes, so
+`estimateIndexGeometry` **synthesises** relpages/reltuples/tree_height. M0138-0004
+populates correlation slots as a side effect. Also carry B8: at
+`indexProbeCostMultiplier = 1` the DP picks PG-shaped NL plans that run 2–3x
+slower — the knob is the known parity-vs-runtime conflict, and changing it is a
+cross-layer programme that has never been scoped.
+
+- [ ] **M0142-0001 — entry recon: is the pricing blockage still the same one?**
+  (measurement only) — M0138 changed every estimate, so the question is whether the
+  blocked attribution still holds. A campaign that assumes the answer repeats the
+  pattern that produced four blocked rounds. Deliverable is a verdict plus, if the
+  blockage has moved, a slice list filed into this section.
+- [ ] **M0142-0002 — re-measure Q9's join order after M0138** — report against R130's
+  table (actual 175; pre-M0138 goopg 97; PG 60,125) and against Q9's category set. This
+  is the query the Question 2 decision was taken for.
+- [ ] **M0142-0003 — costing slices filed by M0142-0001** — placeholder for the work
+  the recon scopes; do not select before M0142-0001 lands. Check this line off in the
+  same commit that files the real slices, so it does not sit unchecked forever.
+
+## M0143 — Engine correctness carry-overs from the parity programme (filed 2026-09-14)
+
+**Milestone doc:** `docs/milestones/0143-engine-correctness-carry-overs.md`
+**Harness (binding, read before selecting):** `AGENT.md` §"Plan-parity harness — applies ONLY to M0137–M0143"
+**Source:** `METHODOLOGY3/04-forward-plan.md` §3 "Continuous — engine correctness, not gated on anything"
+**Prerequisites:** none. Select these whenever everything above is blocked.
+
+Real engine defects the parity programme discovered as a side effect. The case
+for treating them as a milestone rather than footnotes: **two genuine wrong-rows
+bugs were found by parity work, not by the correctness gates** — the Q13
+33-vs-34 Memoize-over-RIGHT-JOIN bug (R63/R64, latent since 2026-09-03, and that
+round's own gate should have caught it) and the Limit-below-Unique truncation
+(R83, masked on current data only because `78 < 100`).
+
+**Per-task discipline:** each fix lands with a test that fails before it — every
+item here exists because nothing in the suite crossed the boundary that would
+have caught it. These are not parity tasks: no category movement is expected or
+reported, and the values and unit gates are the bar.
+
+- [ ] **M0143-0001 — an in-process test that crosses a DATABASE boundary** —
+  `CREATE DATABASE` is a dispatch-layer statement the in-process parser rejects, so
+  `pgConstraintTableRel`'s per-DB branch and the reload's `ListDatabases` loop — the
+  exact paths TPC-H rides — have manual psql evidence only. This is *why* two per-DB
+  defects were found in two consecutive rounds; closing it makes the rest of this
+  milestone findable by the suite. Highest leverage of the six.
+- [ ] **M0143-0002 — `ALTER TABLE … DROP CONSTRAINT` on an FK reports success and does
+  nothing** — `InMemory.DropForeignKeyConstraint` hardcodes `DefaultDBOid`
+  (`catalog.go:22241`) and `execAlterTableDropConstraint` discards the result
+  (`operators_ddl.go:13303`). `HasPrimaryKey` (`catalog.go:22261`) has the same shape,
+  and six `deleteCatalogRowsForOID` sites were filed for the same check and never
+  confirmed. R126 made this worse in effect, because such an FK now survives restarts.
+- [ ] **M0143-0003 — `pg_constraint` returns 0 rows of any contype after a restart** —
+  including the `'p'`/`'u'` rows synthesised from indexes that demonstrably survive. A
+  second, independent reload gap that R126 explicitly did not touch.
+- [ ] **M0143-0004 — `PhysicalTypeIsVarlena` has no `IsArray` arm**
+  (`physical_align.go:85-107`) — latent for ordinary user `int4[]` columns, not just
+  catalogs.
+- [ ] **M0143-0005 — `ParamRef` LIMIT + DISTINCT returns wrong rows** — R83 fixed the
+  `IntegerConst` case and pinned it; the `ParamRef` allowlist was deliberately not
+  extended. Fail-closed with zero corpus impact today, which is exactly why it stays
+  invisible until someone writes the case.
+- [ ] **M0143-0006 — triage `internal/parser`'s 60 failing tests** — pre-existing,
+  verified unrelated to R126, and unowned. Fix them or convert them into filed, owned
+  tasks; "unowned" is not an end state.
