@@ -193,14 +193,48 @@ naming the wrong answer it prevents:
 
 ---
 
-## 5. Admission mode `GOOPG_GATHER_PATHS` — and why the default is `off`
+## 5. Admission mode `GOOPG_GATHER_PATHS` — LANDED default `all` (M0140-0003, 2026-09-15)
 
-`off` (default) | `top` (final rel only) | `all` (every rel, PG-faithful).
-Registered in the flag-provenance table (`flaglabels.go`) so every benchmark
-artefact names the arm it measured.
+`off` (pre-M0140-0003 default, still available as the serial-search control
+arm) | `top` (final rel only) | `all` (every rel, PG-faithful — **the default
+since M0140-0003**). Registered in the flag-provenance table (`flaglabels.go`)
+so every benchmark artefact names the arm it measured.
 
-**The default is a MEASURED decision, and the measurement has not been run.**
-The honest statement of the risk:
+**M0140-0003 ran the measurement §5 says was outstanding and landed `all` as
+the default** — full details in
+`docs/design/0100-0149/m0140-0003-gather-paths-flip-lands-default-on.md`. Two
+things this section's original analysis got right and one it could not have
+known:
+- The "ordering trap" this section predicts (a base-rel Gather sitting BELOW a
+  join, trading a whole-tree post-pass Gather for a scan-only one) is real —
+  M0140-0002 measured its consequence directly: TPC-H Q9's build count moved
+  5→4 and a filter-column-drop optimisation declines to fire once its leaf
+  sits under a Gather-admitted ancestor. Neither is a correctness break, and
+  neither closes any TPC-H/TPC-DS `parity` match; M0140-0003 pre-registered
+  that outcome (R43 rev 3 / K38) rather than treating a stable match count as
+  a blocker.
+- **This section's own premise that C-19f is "explicitly out of this slice"
+  is stale**: `addPartialHashJoinPath` (`joinpathsparallel.go`) — C-19f's
+  parallel-hash-join partial-path producer — already exists and already sets
+  `ParallelAware: true` on its output; per K80 it was dead **solely** because
+  `GOOPG_GATHER_PATHS` was default-off, not because the producer was missing.
+  Landing the flip is what activates it, and M0140-0003 found a second,
+  unrelated producer this exposed: the correlated-subquery decorrelation
+  cloner (`clonePlanReplacingOuter`, `unnest.go`) had no case for a `Gather`
+  appearing inside a subquery's own inner plan, which silently declined TPC-H
+  Q2's decorrelation the moment its 4-table inner join won a partial path —
+  fixed in the same task, not merely worked around.
+- What §5.1's arithmetic could not anticipate: once a joinrel (not just a base
+  rel) can carry a partial path, the boundary a Gather sits above shrinks to
+  the SIZE C-19f/g control, not the whole base relation — the case this
+  section's own final paragraph names as C-19f's to collect.
+
+The rest of this section is preserved as the pre-landing record — the analysis
+that correctly identified the risk and named the exact measurement needed to
+resolve it.
+
+**The default was a MEASURED decision.** The honest statement of the risk, as
+recorded before the measurement ran:
 
 - Today `PartialPathlist` is populated on BASE rels only. A Gather over a base
   rel therefore puts the Gather *below* every join, and the joins run serially

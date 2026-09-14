@@ -25,8 +25,9 @@ ordering contest (M0141), whose size nobody has established.
 
 The lever is narrower than it looks, because three corrections already narrowed
 it: **K80** — `Parallel Hash Join` needs no new `parallel_hash` work,
-`addPartialHashJoinPath` already sets `ParallelAware: true`; it is dead solely
-because `GOOPG_GATHER_PATHS` is default-OFF. **K82** — TPC-H Q14 is
+`addPartialHashJoinPath` already sets `ParallelAware: true`; it was dead solely
+because `GOOPG_GATHER_PATHS` defaulted OFF — **M0140-0003 landed the flip
+default-`all`**, so this producer is live at HEAD. **K82** — TPC-H Q14 is
 byte-identical under the flip, so the two tracks are independent. **K92** —
 relabelling goopg's leader-prebuild as `Parallel Hash` would be a
 *misdescription*, i.e. the arbitrary forcing the goal forbids.

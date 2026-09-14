@@ -1,83 +1,71 @@
-Task: M0139-0005 — "re-measure Q4's grouping election ratio" (plan-parity
-milestone group, recon task). **COMPLETE and committed** this loop, branch
-`plan-parity-with-pg-take2-ralph`.
+Task: M0140-0003 — "land the `GOOPG_GATHER_PATHS` flip on the category metric"
+(plan-parity milestone group, M0140 TPC-DS parallelism). **COMPLETE and
+committed/pushed** this loop, branch `plan-parity-with-pg-take2-ralph`.
 
-Files: `docs/design/0100-0149/m0139-0005-q4-grouping-ratio-remeasurement.md`
-(new, full method + verdict), `docs/design/README.md` (+index row),
-`.ralph/fix_plan.md` (M0139-0005 checked off + DONE summary). No production
-`.go` file changed — recon task per the plan-parity harness carve-out. Two
-production files were temporarily instrumented for live measurement then
-fully reverted before commit (`internal/optimizer/upperorderedgrouping.go`,
-`internal/optimizer/joinleghook.go` — `git diff --stat` confirmed empty on
-both). A throwaway probe test
-(`internal/testutil/tpch/zz_probe_m0139_0005_test.go`) was written, run, and
-deleted before commit, matching the M0139-S1/S2/S3 precedent.
+Files: `internal/optimizer/unnest.go` (the fix: `clonePlanReplacingOuter`
+`*Gather`/`*GatherMerge` arms), `internal/optimizer/gatherpaths.go` (default
+flip + comments), `internal/optimizer/flaglabels.go` (2 provenance comments),
+`scripts/planner-flags.env` (regenerated), `internal/optimizer/pathtarget_test.go`
++ `internal/optimizer/considerparallel_test.go` + `internal/executor/owned_build_poison_test.go`
+(4 stale-pin re-baselines), `docs/design/planner-c19d-gather-paths/DESIGN.md`
+(§5 landed-status addendum), `docs/milestones/0140-tpcds-parallelism.md` (K80
+status), `docs/design/0100-0149/m0140-0003-gather-paths-flip-lands-default-on.md`
+(new design doc), `docs/design/README.md` (+index row), `analysis/m0140/*`
+(12 capture artefacts, evidence), `.ralph/fix_plan.md` (M0140-0003 checked off).
 
-What was done: built a private, disposable HEAD cluster (20,000 orders via
-`internal/testutil/cluster` + `scaleLoader`, never touching the shared
-peer-owned `:65433` TPC-H bench server), set `GOOPG_DEBUG_M0139_0005=1` in
-the test process env before `cluster.Start()` (server subprocess inherits
-it), ran `EXPLAIN (VERBOSE, COSTS ON)` on canonical Q4, and read the
-server's log file for temporary debug lines added to `electOrderedGrouping`
-(dumps every ORDERED-rel candidate's Startup/Total cost) and `narrowJoinLeg`
-(dumps every call + decline reason + which keep-set tier fired). Result:
-**`narrowJoinLeg` is never called at all** for Q4 — zero debug lines in the
-whole server log, not even a decline. Traced why: Q4's `EXISTS` is
-decorrelated by `unnestExistsExpr` (`internal/optimizer/unnest.go:4078`),
-which builds `&Join{Type: JoinTypeSemi, Algo: JoinAlgoHash, ...}` DIRECTLY
-on the raw parse tree, before any search joinrel exists — never routing
-through `createHashJoinPlan`/`joinInputsFor`, the one call site
-`narrowJoinLeg` is wired into. This is the same fork METHODOLOGY3 F11/K63
-(R73-R77) already named for the costing symptom ("no SEMI path is ever
-filed... before any search joinrel exists, so no sjinfo -> no joinrel -> no
-path -> no price", later given a display-seam patch by R77 and further
-root-caused by the 2026-09-15 `m0137-0011` ledger row's `Filter`-embed gap).
-This task establishes the narrowing-specific corollary: the same bypass
-that stops a real Path/price from being filed for Q4's semi join also stops
-`joinInputsFor`'s narrowing chain from ever being invoked on it.
+What was done: root-caused M0140-0002's flagged Q2-decorrelation decline —
+instrumented every bail point in `canUnnestSubquery`/`unnestSubquery`
+(throwaway `println` probes, removed) and found `clonePlanReplacingOuter` had
+no `*Gather`/`*GatherMerge` case, so a partial path winning inside a scalar
+subquery's own inner plan made the correlation-substitution clone bail with
+"unsupported plan node", silently keeping the subquery a per-outer-row
+`SubPlan`. Two wrong hypotheses tried and refuted first (test walker
+Gather-blindness; `canUnnestSubquery` type-assertion bail) — see the design
+doc's numbered list. Fixed with a single-child recursion arm (same class as
+R11's `boundaryWalkChildren` and M0140-0002's `visit()` fixes). Flipped
+`gatherPathModeFromEnv`'s unset/empty default to `all` (was `off`). Re-pinned
+the four tests M0140-0002 pre-adjudicated as safe. Measured both arms (off vs
+all), same commit, same stats epoch: TPC-DS SF0.25 vs live PG (match held at
+canonical 2, `parallelism` 86->85, 50/99 shape-delta all tagged parallelism,
+values PASS=96/0/0/0/0) and TPC-H both the canonical serial protocol
+(confirmed inert, `parallelism=0`/`match=6` unmoved) and the non-serial
+diagnostic protocol matching R43/K38's own measurement (`parallelism 17->16,
+no new match`, independently reproducing R43 rev 3's historical `18->16`).
+`tpch-spotcheck.sh` PASS under the new default.
 
-Key symbols: `electOrderedGrouping`/`groupingEmissionPathkeys`
-(`internal/optimizer/upperorderedgrouping.go:148`), `narrowJoinLeg`
-(`internal/optimizer/joinleghook.go:69`), `unnestExistsExpr`
-(`internal/optimizer/unnest.go:4078`), `createHashJoinPlan`/`joinInputsFor`
-(`internal/optimizer/createplanjoin.go:545,361`).
+Key symbols: `clonePlanReplacingOuter` (unnest.go:1503, the fix site),
+`gatherPathModeFromEnv` (gatherpaths.go, the flip), `canUnnestSubquery`/
+`unnestSubquery` (unnest.go, the bail chain instrumented), `addPartialHashJoinPath`
+(joinpathsparallel.go, K80's now-live producer).
 
-Hypothesis/Findings: **verdict — the ratio has not moved and cannot move
-under the current mechanism.** Q4's grouping input width is byte-identical
-to before M0139-S1/S2 landed, independent of scale — a bigger-scale
-re-measurement of the exact 1.0086-vs-1.01 number would not be informative
-until the `unnestExistsExpr` bypass itself is addressed (a materially
-larger task: wiring a real Path, or the narrowing hook, into the
-EXISTS/IN-decorrelation rewrite — touches the already-tracked
-F11/K63/`m0137-0011` lineage, not a narrowing-only patch). Secondary,
-not-pursued-further finding: at 20,000-order scale the two ORDERED-rel
-candidates aren't even fuzzy-tied (only one survives `addPath` outright) —
-scale sensitivity in the underlying cost comparison, a different question
-than this task was scoped to answer. Feeds M0139-0006's owner packet
-alongside S3's residue finding (Q12: hook fires but retains more than
-hoped; Q4: hook cannot fire at all — same family of gap from opposite
-ends). Does not decide or advance `minimize_datum` (still NOT APPROVED TO
-START).
+Hypothesis/Findings: root cause fully isolated and fixed, not just adjudicated
+around. `internal/parser`'s ~60 golden-fixture "AST drift" failures + an
+untracked `bak/` build failure are PRE-EXISTING and unrelated (verified: zero
+diff under either path; the parser failure is already filed as nightly
+`AI-20260914-235643-001` under M-NIGHTLY, dated 2026-09-14, before this loop
+started) — do not re-investigate these as caused by this task.
 
-Gates run: recon task, no production diff (verified via `git diff --stat`
-after reverting the two instrumented files). `go build ./...` clean. No
-new/changed unit tests (probe deleted before commit, matching precedent).
-`make ralph-state-guard`: same recurring stale status/progress.json pattern
-as every prior loop, auto-repaired to consistent, then confirmed
-consistent. Nightly triage for this loop: `ci/logs/action-items.md`'s
-newest run (`20260914-235643`, 14 items) re-verified already fully filed by
-a prior loop; no new filing needed.
+Gates run: `go test ./internal/optimizer/... ./internal/executor/...` green
+in default/off/all arms. `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=34) —
+required stopping/restarting the shared `:65433` cluster via the sanctioned
+lifecycle scripts (verified zero `pg_stat_activity` connections + >24h-stale
+WAL first; never `pkill`) since its private-clone snapshot mechanism needs
+the port fully quiet, not merely idle — restored to the correct final state
+(unset env, default `all`) afterward. `scripts/tpcds-sf025-regression.sh
+sweep` PASS=96/0/0/0/0. `RALPH_PRECOMMIT_SCOPE=units
+scripts/ralph-precommit-test.sh`: only the two known-unrelated failures above.
+`make ralph-state-guard`: same recurring stale status="running"/
+progress="completed" pattern as every prior loop; auto-repaired, confirmed
+consistent.
 
 In-flight: none.
 
-Next step: select the next M0139 slice per the banner order. **M0139-0006**
-("put the packed-retention decision to the owner") is now the only open
-M0139 recon slice — it should carry BOTH S3's residue measurement (Q12:
-128.4 B/row, not K67's assumed 72) AND this task's finding (Q4's ratio
-can't move; the join-leg hook structurally cannot reach `unnestExistsExpr`
-semi/anti joins) into one owner packet. **Do not implement
-`minimize_datum`** — still NOT APPROVED TO START. Alternatively M0140's
-still-open M0140-0003 remains valid per the banner ("M0140 does not wait on
-M0139"): "land the `GOOPG_GATHER_PATHS` flip on the category metric",
-pre-registered "no match flip" per R43 rev 3 / K38. Do not re-open
-S1/S2/S3/-0004/-0005 — all five fully done, gated, and pushed.
+Next step: M0140-0003 is DONE. Per the banner order, re-check M0138 (fully
+done, all six [x]) and M0139 (fully done, all six [x]) — both closed. Select
+the next open **M0140** item: **M0140-0004** ("partial-Append producer, K43"
+— PG uses Parallel Append in six TPC-DS queries, goopg has zero partial paths
+on join rels via that route) if unblocked, else **M0140-0005** ("file the two
+out-of-reach items as ledger rows" — Q14's third category and the K14/K15/K41
+non-planner floor). If both are blocked, fall through per the banner to
+**M0141-S0** (scoping recon, the only selectable M0141 item) or **M0143**
+(gated on nothing). Do not re-open M0140-0001/-0002/-0003.

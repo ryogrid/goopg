@@ -1475,10 +1475,51 @@ setting that yields a serial plan.
     interactions (partial-path admission vs. narrowing / decorrelation / a
     test walker), not newly discovered PG-incompatibilities.
   - Design doc: `docs/design/0100-0149/m0140-0002-gather-paths-flip-failing-set-adjudication.md`.
-- [ ] **M0140-0003 — land the `GOOPG_GATHER_PATHS` flip on the category metric** —
+- [x] **M0140-0003 — land the `GOOPG_GATHER_PATHS` flip on the category metric** —
   pre-register **no match flip**: R43 rev 3 measured TPC-H `parallelism` 18->16 under
   the flip with no new match, and K38 measured Gather 42->104 / `Parallel Hash` 0->167
   at `all` with parity not improving. The category movement is the success criterion.
+  (DONE 2026-09-15)
+  - **Root-caused and fixed** the Q2-decorrelation decline M0140-0002 flagged as
+    the blocker to isolate before landing: `clonePlanReplacingOuter` (`unnest.go`)
+    had no `*Gather`/`*GatherMerge` case, so a partial path won inside a scalar
+    subquery's own inner plan made the correlation-substitution clone bail with
+    "unsupported plan node", silently keeping Q2's aggregate a per-outer-row
+    `SubPlan`. Fixed with a single-child recursion arm, the same bug class as
+    R11's `boundaryWalkChildren` fix and M0140-0002's `visit()` fix. Two wrong
+    hypotheses instrumented and refuted first (see the design doc's numbered
+    list) before finding the real bail point.
+  - **Flipped the default**: `gatherPathModeFromEnv`'s unset/empty case now
+    resolves to `all` (was `off`); `off`/`false` still reproduce the pre-flip
+    arm. Updated `gatherpaths.go`'s header comment, `flaglabels.go`'s two
+    provenance comments, `docs/design/planner-c19d-gather-paths/DESIGN.md` §5
+    (dated addendum, history preserved), and regenerated
+    `scripts/planner-flags.env` (`TestFlagProvenanceEnvIsGenerated` caught the
+    initial miss).
+  - **Re-pinned the four stale tests** M0140-0002 pre-adjudicated as safe:
+    `TestSlice3LiveQ9ShapeDerivation`, `TestSlice3FilterColumnSurvivesNarrowing`,
+    `TestOwnedBuildPoisonPrebuiltBoundary` (post-flip shape), and
+    `TestPartialPathIsNeverTheFinalPath` (join-rel-population timing check now
+    scoped to `gatherPathsMode==off`; its unconditional final-tree safety
+    property is untouched). Full optimizer+executor sweep green in all three
+    arms (default/`off`/`all`).
+  - **Measured, both arms, same commit, same stats epoch**: TPC-DS SF0.25 vs
+    live PG — match held at the canonical 2 (no new match, none lost),
+    `parallelism` 86->85, other categories absorbing the reshaped joins; a
+    clean off-vs-all diff shows 50/99 queries shape-changed, every one tagged
+    `parallelism`; values gate `PASS=96 MISMATCH=0 CKMISMATCH=0 ERROR=0
+    TIMEOUT=0`. TPC-H: canonical serial scoreboard protocol confirmed inert to
+    the flip (`parallelism=0`, `match=6` unmoved — partial-path admission needs
+    `max_parallel_workers_per_gather>0`); the non-serial diagnostic protocol
+    (matching R43/K38's own measurement) reproduces `parallelism 17->16, no new
+    match` at HEAD live against PG — independently reproducing R43 rev 3's
+    historical `18->16` finding. `tpch-spotcheck.sh` PASS (`Q12=2/Q13=34`) under
+    the new default.
+  - Pre-commit gate's only failures (`internal/parser` golden-fixture drift,
+    untracked `bak/` build failure) are pre-existing and unrelated — the former
+    already filed as nightly `AI-20260914-235643-001` under M-NIGHTLY, before
+    this task began.
+  - Design doc: `docs/design/0100-0149/m0140-0003-gather-paths-flip-lands-default-on.md`.
 - [ ] **M0140-0004 — partial-Append producer (K43)** — there are currently zero
   partial paths on join rels via that route; PG uses Parallel Append in six TPC-DS
   queries and only Q5 and Q76 miss.

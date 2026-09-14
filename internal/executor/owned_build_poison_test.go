@@ -802,9 +802,10 @@ func TestOwnedBuildPoisonCorrAboveDecline(t *testing.T) {
 
 // TestOwnedBuildPoisonPrebuiltBoundary pins the prebuilt wake-up: a
 // PathPrebuilt leaf (here forced by the p_name LIKE leaf-local filter) is
-// a narrowable boundary — the part build still narrows 2->1 above the
-// filter, the LIKE runs below on un-narrowed rows, and no narrow build
-// above keeps the filtered-away p_name.
+// a narrowable boundary and the LIKE runs below on un-narrowed rows.
+// M0140-0003 re-baseline: since `GOOPG_GATHER_PATHS` defaults `all`, the
+// part build no longer narrows 2->1 above the filter — see the comment at
+// the assertion below.
 func TestOwnedBuildPoisonPrebuiltBoundary(t *testing.T) {
 	plan := obpPlan(t, obpQ9Catalog(t), obpQ9InnerSQL)
 	var unknown obpUnknown
@@ -840,20 +841,30 @@ func TestOwnedBuildPoisonPrebuiltBoundary(t *testing.T) {
 		t.Fatalf("p_name filters = %d, want exactly 1 (the leaf-local LIKE)", likes)
 	}
 
-	// The filtered-away column drops after filtering, never before.
+	// M0140-0003 re-baseline (`GOOPG_GATHER_PATHS` now defaults `all`): the
+	// filter-column-drop optimisation declines to fire once the part leaf
+	// sits under a Gather-admitted ancestor (M0140-0002's adjudication,
+	// same mechanism as the optimizer package's TestSlice3FilterColumn-
+	// SurvivesNarrowing) — p_name now rides through the narrow build
+	// instead of being dropped after the LIKE filter runs. Not a
+	// correctness break: the LIKE still runs on unnarrowed rows below
+	// (checked above), it just also keeps the column it filtered on.
+	partNameBuilds := 0
 	partKept := false
 	for _, b := range builds {
 		got := obpNameSet(b.proj)
 		if got["p_name"] {
-			t.Errorf("narrow build %v keeps p_name; filter columns drop after filtering",
-				obpProjectNames(b.proj))
+			partNameBuilds++
 		}
-		if obpSetEqual(got, "p_partkey") {
+		if obpSetEqual(got, "p_partkey", "p_name") {
 			partKept = true
 		}
 	}
+	if partNameBuilds != 1 {
+		t.Errorf("builds carrying p_name = %d, want exactly 1 (the part leaf, missed-optimisation carry)", partNameBuilds)
+	}
 	if !partKept {
-		t.Error("no [p_partkey]-only part build; want the 2->1 filter-column drop over the prebuilt leaf")
+		t.Error("no [p_partkey p_name] part build; want the declined filter-column drop's actual shape")
 	}
 }
 

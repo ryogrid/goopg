@@ -215,8 +215,11 @@ var flagProvenanceOrder = []string{
 	// Joined at R121 (r121-narrow-cost-inputs/SCOPE.md). Default `off`.
 	"GOOPG_NARROW_COST_INPUTS",
 	// Joined at take3 C-19d (P5-04): admits `PathGather` / `PathGatherMerge`
-	// into the search. Default `off` pending the TPC-H A/B that decides it
-	// (docs/design/planner-c19d-gather-paths/DESIGN.md §5).
+	// into the search. Default `all` since M0140-0003 landed the TPC-H/
+	// TPC-DS A/B that decided it (docs/design/planner-c19d-gather-paths/
+	// DESIGN.md §5; docs/design/0100-0149/
+	// m0140-0003-gather-paths-flip-lands-default-on.md). `off` still
+	// reproduces the pre-M0140-0003 arm.
 	"GOOPG_GATHER_PATHS",
 	"GOOPG_PARTIAL_AGG_PATHS",
 	// Joined at take3 E-21 Cut 1: admits a one-FROM-item statement to the path

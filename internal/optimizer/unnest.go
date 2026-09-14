@@ -1961,6 +1961,38 @@ func clonePlanReplacingOuter(node Node, replace map[*OuterColumnRef]*ColumnRef) 
 		// with no body to rewrite, so the copy is unconditional.
 		c := *n
 		return &c, nil
+	case *Gather:
+		// M0140-0003: under `GOOPG_GATHER_PATHS`, the subquery's own inner
+		// plan can win a partial path on one of its base rels and come back
+		// from `Plan()` with a `Gather` sitting inside it — this cloner's
+		// node-kind list had never needed one before, the same gap R11 (see
+		// `createplanroot.go`'s `boundaryWalkChildren`) and D3.0's NLI arm
+		// above each hit once already. Without this arm every scalar/EXISTS
+		// subquery whose inner plan happened to admit a partial path failed
+		// this clone, the caller's swallowed error left the sublink a
+		// per-outer-row SubPlan, and TPC-H Q2's decorrelation silently
+		// declined the moment its 4-table inner join won a partial path. A
+		// `Gather` carries no probe key of its own — it is a pure pass-
+		// through — so recursing into `Child` is enough; any harvested
+		// correlation living on a scan beneath it is still reached by the
+		// existing `*IndexScan`/`*BitmapHeapScan` arms.
+		child, err := clonePlanReplacingOuter(n.Child, replace)
+		if err != nil {
+			return nil, err
+		}
+		g := *n
+		g.Child = child
+		return &g, nil
+	case *GatherMerge:
+		// Sibling of the *Gather arm immediately above — same pass-through,
+		// same reason.
+		child, err := clonePlanReplacingOuter(n.Child, replace)
+		if err != nil {
+			return nil, err
+		}
+		g := *n
+		g.Child = child
+		return &g, nil
 	default:
 		return nil, &PlanError{Pos: node.Pos(), Code: "XX000", Message: "clonePlanReplacingOuter: unsupported plan node"}
 	}

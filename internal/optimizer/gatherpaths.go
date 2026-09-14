@@ -18,12 +18,18 @@ package optimizer
 //
 // Design: docs/design/planner-c19d-gather-paths/DESIGN.md.
 //
-// ADMISSION IS OFF BY DEFAULT (`GOOPG_GATHER_PATHS`, §5 of that doc). Partial
-// paths exist on BASE rels only until C-19f gives a joinrel its own, so a
-// Gather chosen here sits BELOW every join and the joins run serially in the
-// leader — while the post-pass puts one Gather ABOVE the whole hash-join
-// subtree. Flipping the default is a measured decision (TPC-H A/B, timing per
-// moved plan) and this slice does not take it.
+// ADMISSION IS `all` BY DEFAULT SINCE M0140-0003 (`GOOPG_GATHER_PATHS`, §5 of
+// that doc). Partial paths exist on BASE rels only until C-19f gives a
+// joinrel its own, so a Gather chosen here can sit BELOW a join and the joins
+// above it run serially in the leader — while the post-pass instead puts one
+// Gather ABOVE the whole hash-join subtree. The measured decision this
+// comment used to defer (TPC-H A/B, timing per moved plan) is M0140-0003
+// (docs/design/0100-0149/m0140-0003-gather-paths-flip-lands-default-on.md):
+// pre-registered "no match flip" per R43 rev 3 / K38 — the category-movement
+// criterion the plan-parity harness holds this milestone to, not a match-
+// count rise — and TPC-H/TPC-DS values gates held at the baseline arm.
+// `GOOPG_GATHER_PATHS=off` still reproduces the pre-M0140-0003 serial-search
+// control arm exactly, for any future A/B that needs it.
 //
 // A BASE rel's Gather is WINNABLE since 2026-09-07 (ledger
 // `c19-baserel-scan-priced-on-output-rows`). It was not before: goopg priced a
@@ -52,13 +58,15 @@ import (
 // gatherPathMode is the admission rule for the paths this file produces.
 //
 //   - off  — produce none. The search is unchanged by construction, which is
-//     this slice's serial-control-arm argument.
+//     this slice's serial-control-arm argument, and reproduces goopg's
+//     pre-M0140-0003 behaviour exactly.
 //   - top  — produce them only at the search's FINAL rel: the node the
 //     post-pass targets today. Inert on any multi-rel statement until C-19f
 //     populates a joinrel's partial list, and live the moment it does.
 //   - all  — PG-faithful: every rel with partial paths, base rels included.
-//     This is the arm that carries the ordering trap (take2 07 §3.2) and the
-//     one a measurement must clear before it can become the default.
+//     This is the arm that carries the ordering trap (take2 07 §3.2), and
+//     the DEFAULT since M0140-0003 measured it clear (category movement, no
+//     match-count regression, values gates held).
 type gatherPathMode int
 
 const (
@@ -71,11 +79,17 @@ const (
 // knob in this package, so a plan cannot change shape mid-statement.
 var gatherPathsMode = gatherPathModeFromEnv(os.Getenv("GOOPG_GATHER_PATHS"))
 
-// gatherPathModeFromEnv resolves the knob. Anything unrecognised is `off`:
-// this is a fail-closed switch, and a typo must not silently enable a plan
-// shape whose measurement has not been run.
+// gatherPathModeFromEnv resolves the knob. An unset/empty environment
+// resolves to `all` — M0140-0003's landed default. An explicit,
+// unrecognised value (a typo, or the empty string spelled some other way)
+// resolves to `off` rather than falling through to the new default: this
+// stays a fail-closed switch for anyone deliberately typing an opt-out
+// string, on the same reasoning the pre-M0140-0003 version of this function
+// applied to the (then unmeasured) `all` arm.
 func gatherPathModeFromEnv(v string) gatherPathMode {
 	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "":
+		return gatherPathsAll
 	case "top":
 		return gatherPathsTop
 	case "all", "on":
