@@ -1,96 +1,101 @@
-Task: M0139-S3 — "measure the residue against K67's floor" (plan-parity
-milestone group, recon task). **COMPLETE and committed** (`9fb1f1f88`) and
-pushed this loop, branch `plan-parity-with-pg-take2-ralph`.
+Task: M0139-0004 — "re-measure the duplicate hash build map premise, then
+act on what you find" (plan-parity milestone group, recon task).
+**COMPLETE and committed** (`20af1c187`) and pushed this loop, branch
+`plan-parity-with-pg-take2-ralph`.
 
-Files: `docs/design/0100-0149/m0139-s3-k67-residue-measurement.md` (new,
-full method + numbers), `docs/design/README.md` (+index row), `.ralph/fix_plan.md`
-(M0139-S3 checked off + summary). No production `.go` file changed — this
-was a recon task per the plan-parity harness's carve-out (measurement + a
-design note, no production diff). The throwaway probe
-(`internal/testutil/tpch/zz_probe_m0139s3_test.go`) was deleted before
-commit, per the M0139-S1/S2 precedent — do not go looking for it.
+Files: `docs/design/0100-0149/m0139-0004-duplicate-hash-map-refutation.md`
+(new, full method + verdict), `docs/design/README.md` (+index row),
+`docs/design/not_ralph/minimize_datum/05-work-estimate.md` (§1.5 table row
+struck through + marked REFUTED, "two further observations" bullet
+annotated), `docs/design/not_ralph/minimize_datum/02-goopg-current-representation.md`
+(§3's originating claim struck through + marked REFUTED), `.ralph/fix_plan.md`
+(M0139-0004 checked off + DONE summary). No production `.go` file changed —
+recon task per the plan-parity harness carve-out (measurement + a design
+note + doc corrections, no production diff). No new test written — the
+premise was already refuted by PRE-EXISTING, already-green unit tests this
+loop only had to read and connect to the stale doc claim.
 
-What was done: K67's "72 B/row -> 103 MB, narrowed to one column" TPC-H Q12
-anchor was analytical (`hashsize.EntryBytes(1,0)=48+24+0=72`), never
-measured, and predates S1/S2's real join-leg narrowing. Built a PRIVATE,
-disposable goopg cluster from HEAD (`internal/testutil/cluster` +
-`tpch_scale_run_test.go`'s existing `scaleLoader`, 20,000 real-DDL
-orders/lineitem rows, real TPC-H categorical vocabularies) — deliberately
-never touched the shared, peer-owned `:65433` TPC-H bench server (a
-read-only EXPLAIN there first showed the shared binary is STALE relative to
-HEAD: it exhibits ZERO narrowing on Q12, so it was not used for any
-measurement). On the private HEAD cluster, `EXPLAIN (VERBOSE)` confirmed
-the join-leg hook DOES fire on Q12 (Hash Join `Output:` narrows from 16+9
-columns at the two scans down to 7), and the real orders-side retained set
-is `{o_orderkey, o_orderpriority}` — **2 columns, not K67's assumed 1** —
-because the join key must stay in the stored entry for probe-time
-verification even though nothing above the join references it. Real
-`pg_stats.avg_width(o_orderpriority)=8.3701` (K67 assumed 0). Formula
-`EntryBytes(2, 8.3701) ≈ 128.37 B/row`, cross-checked against the
-executor's own `EXPLAIN (ANALYZE, VERBOSE)` measured `Buckets: 32768
-Batches: 1 Memory Usage: 4044kB` (subtracting the `MapSlotBytes×NBuckets`
-bucket-table term reproduces 128.4 B/row to within rounding — two
-independent derivations agree). Extrapolated to SF=1's 1.5M orders the same
-way K67 did (entries only, apples-to-apples): **≈193 MB, vs K67's stated
-103 MB and PG's unchanged 22 B/row → 31 MB anchor.**
+What was done: `minimize_datum/05-work-estimate.md` §1.5 priced "delete the
+duplicate build map" as a one-commit ~2x peak-build-memory win, on the claim
+that `operators_join_agg.go` maintains BOTH `lazyHash` and `lazyIntHash` for
+the whole int-key hash-join build. Read `buildLazyHashTable`
+(`:598-716`): `o.lazyHashIsInt` is decided ONCE, before the first row, from
+the plan's STATIC key types (`:651`, `!o.multiKey() &&
+o.plan.HashKeysAreInt64()`). Read `presizeLazyHash` (`:822-855`): allocates
+exactly ONE of the two maps, selected by that same flag — confirmed both by
+the code and by pre-existing `join_presize_test.go` tests
+(`TestPresizeLazyHashChoosesTheLaneTheBuildCommittedTo`,
+`TestPresizeLazyHashKeepsAnExistingTable`). Read `lazyHashInsertDatum`
+(`:1238-1254`)/`lazyHashInsertKeyed` (`:1285-1309`): each insert commits to
+ONE lane per call — int-lane insert returns immediately, or falls through to
+the string lane. The ONLY place both maps are ever simultaneously non-nil is
+`demoteIntHash` (`:1325-1338`)'s own transient copy loop — a rare defensive
+fallback for a static "these keys are int64" promise turning out false
+mid-build (bounded by rows-inserted-so-far, not the full build), NOT a
+standing property of the routine int-key path — confirmed by
+`TestPresizedIntTableStillDemotes` and `dense_build_cut2_test.go`'s
+demotion tests (both pre-existing and green at HEAD). The parallel/coop
+build path (`parallel_hash_build.go:588-800`) reuses the SAME
+`presizeLazyHash`/`buildLoopLeft`/`buildLoopRight` rather than re-deriving
+lane logic, so it inherits the same mutual exclusion. A multi-column key
+never touches `lazyIntHash` at all (`join_composite_key_test.go`). Ran all
+four cited test functions live this loop (`go test ./internal/executor/ -run
+'TestPresizeLazyHash...|TestPresizedIntTableStillDemotes'`) — all PASS. `go
+build ./...` clean.
 
-Key symbols: `hashsize.EntryBytes`/`hashsize.MapSlotBytes`
-(`internal/executor/hashsize/hashsize.go:144,80`), `entrywidth.go`'s
-`buildAvgVarBytes` (the real consumer of `pg_stats.avg_width` via
-`RelOptInfo.AvgVarBytes`), `narrowJoinLeg` (joinleghook.go, the S1/S2
-mechanism being measured, unchanged this loop), `internal/testutil/cluster`
-+ `scaleLoader` (`internal/testutil/tpch/tpch_scale_run_test.go`, the reused
-private-cluster harness — this is the pattern to reuse for any future
-"real number off a live plan" measurement without touching a shared bench
-server).
+Key symbols: `joinOp.buildLazyHashTable`/`presizeLazyHash`/
+`lazyHashInsertDatum`/`lazyHashInsertKeyed`/`demoteIntHash`
+(`internal/executor/operators_join_agg.go:598,822,1238,1285,1325`),
+`parallelBuildLazyHashTable` (`internal/executor/parallel_hash_build.go:588`,
+confirms the parallel path shares the same lane logic, not a second
+implementation). Pre-existing test files that already pinned this before the
+loop started: `join_presize_test.go`, `dense_build_cut2_test.go`,
+`join_composite_key_test.go`.
 
-Hypothesis/Findings: **verdict is that S1/S2's real narrowing did NOT close
-the gap to K67's floor — the measured residue (128.4 B/row → ~193 MB) is
-WORSE than the anchor the campaign had been budgeting against, not better.**
-K67's "one column, 72 B/row" was itself too optimistic: it assumed a hash
-entry could shed the join key (it cannot — verification needs it) and that
-the surviving payload column costs 0 extra bytes (real TPC-H text content
-never does). Both engines have non-zero residues once real narrowing is
-applied; goopg's is now measured at ~5.8× PG's (128.4 vs 22 B/row), not the
-~3.3× K67's numbers implied. This feeds M0139-0006 (put the packed-retention
-decision to the owner) with a real number — it does NOT itself decide or
-advance `minimize_datum` (still NOT APPROVED TO START). A useful general
-lesson banked in the design doc: a shared bench-lane binary can silently
-predate the very mechanism you're trying to measure — always confirm
-against a fresh-from-HEAD private cluster before trusting a shared server's
-plan shape as "current behavior."
+Hypothesis/Findings: **verdict — the premise is REFUTED at HEAD.**
+`lazyHash` and `lazyIntHash` are two mutually-exclusive representations of
+ONE logical table, chosen once from static plan information, with no
+steady-state double retention on any build that completes without a
+key-type surprise (the overwhelmingly common case). "Delete the duplicate
+build map" prices a bug that does not exist in the current tree — nothing to
+delete; the fields already behave as a single table dispatched by
+`o.lazyHashIsInt`. This does NOT decide or advance `minimize_datum` (still
+NOT APPROVED TO START) — it removes one stale input from a document that
+feeds a FUTURE owner decision (M0139-0006's job, not this task's). Per the
+harness's browsing restriction, did NOT open `take2 07 §6`
+(`plan_parity_fix_take2/` round doc cited by 02 §3 as recording the same
+claim "separately") — no task line names it and it's not reached via the
+mechanism index; flagged in the design doc as a cheap separate follow-up if
+a future reader finds it repeats the same stale claim.
 
-Gates run: recon task, no production diff, so the heavy practice-card
-gates (tpch-spotcheck, tpcds sweep) do not apply — confirmed via `AGENT.md`
-§"Plan-parity harness" → "Way of working" (a recon task's own commit is a
-scope violation if it contains a production diff; this one has none). `go
-build ./...` clean (confirmed unaffected). Throwaway probe
-(`TestZZProbeM0139S3Residue`) passed standalone before deletion (`go test
--run TestZZProbeM0139S3Residue ./internal/testutil/tpch/`, ~5s, private
-cluster, never touched shared ports). `make ralph-state-guard`: same
-recurring stale status/progress.json pattern as every prior loop
-(status="running"/progress="completed" from the previous loop's clean
-exit), auto-repaired to consistent, then confirmed consistent.
+Gates run: recon task, no production diff, so the heavy practice-card gates
+(tpch-spotcheck, tpcds sweep) do not apply per the same M0139-S1/S2/S3
+precedent. `go build ./...` clean. The four cited pre-existing unit tests
+run live and PASS (`TestPresizeLazyHashChoosesTheLaneTheBuildCommittedTo`,
+`TestPresizeLazyHashSkipsWhenSizeIsUnknownOrTiny`,
+`TestPresizeLazyHashKeepsAnExistingTable`, `TestPresizedIntTableStillDemotes`
+— `go test ./internal/executor/ -run '...' -v`, all PASS). `make
+ralph-state-guard`: same recurring stale status/progress.json pattern as
+every prior loop (status="running"/progress="completed" from the previous
+loop's clean exit), auto-repaired to consistent, then confirmed consistent.
 
 In-flight: none. Nightly triage for this loop: `ci/logs/action-items.md`'s
 newest run (`20260914-235643`, 14 items) was already fully filed as of
-2026-09-15 by a prior loop (verified — every AI-id either has its own new
-task line or is appended to an existing open task per the "do not add
-another" rule); no new filing needed this loop.
+2026-09-15 by a PRIOR loop — re-verified this loop (every AI-id either has
+its own task line or is appended to an existing open task); no new filing
+needed.
 
-Next step: select the next M0139 slice per the banner order. Two of the
-three remaining M0139 items are now directly informed by this loop's
-number: **M0139-0006** ("put the packed-retention decision to the owner")
-can now cite S3's real 128.4 B/row / 193 MB figures instead of K67's
-analytical ones — still do NOT implement `minimize_datum`, only write up
-the decision packet. **M0139-0005** ("re-measure Q4's grouping election
-ratio") is independent and still open — R81 located the divergence in
-`electOrderedGrouping` (`upperorderedgrouping.go:148`) at a startup ratio
-vs `stdFuzzFactor=1.01` (goopg 1.0086 inside fuzz vs PG's 1.0118 outside);
-report whether S1/S2's narrowed widths move that ratio across the band —
-the private-cluster probe pattern from this loop is directly reusable there.
-**M0139-0004** ("re-measure the duplicate hash build map premise") is also
-still open and independent, cheap to take if a slice is blocked.
+Next step: select the next M0139 slice per the banner order. **M0139-0005**
+("re-measure Q4's grouping election ratio") is now the last open M0139
+recon slice besides M0139-0006 (which is gated on wanting to consolidate
+BOTH -0004's and S3's findings before writing the owner packet — could now
+be taken too, since -0004's refutation and S3's residue number are both
+banked). For -0005: R81 located the divergence in `electOrderedGrouping`
+(`upperorderedgrouping.go:148`) at a startup ratio vs `stdFuzzFactor=1.01`
+(goopg 1.0086 inside fuzz vs PG's 1.0118 outside); report whether S1/S2's
+narrowed widths move that ratio across the band — the private-cluster probe
+pattern from M0139-S3 (`internal/testutil/cluster` + `scaleLoader`, never
+touching the shared `:65433` bench server) is directly reusable there.
 Alternatively M0140's still-open M0140-0003 remains valid per the banner
-("M0140 does not wait on M0139"). Do not re-open S1/S2/S3 — all three fully
-done, gated, and pushed.
+("M0140 does not wait on M0139"). Do not re-open S1/S2/S3/-0004 — all four
+fully done, gated, and pushed.
