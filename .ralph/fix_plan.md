@@ -830,7 +830,7 @@ before/after proving the defect it closes.
   cost the planner did not use (4.5x on Q12), which "corrupts every cost-based
   artefact including `plan-gate MODE=semantic-cost` and estimate audits". This is an
   **instrument** defect and therefore belongs in this milestone, not in a costing one.
-- [ ] **M0137-0012 — file ledger rows for the four unowned carry-overs** — one row each,
+- [x] **M0137-0012 — file ledger rows for the four unowned carry-overs** — one row each,
   with mechanism and resume point, so they stop being invisible: **B6** (no Memoize on
   the NL probe path R59 repriced; Q72 4s -> 320s TIMEOUT), **B8**
   (`indexProbeCostMultiplier = 2.0` — parity vs wall-clock, 2–3x slower at `mult = 1`;
@@ -839,6 +839,13 @@ before/after proving the defect it closes.
   **O15** (`*Gather` crossing still deliberately excluded from `pushConjunctTraced` —
   the same class as R56's Q78 defect, which M0137-0010's census will *detect* but
   nothing currently schedules *fixing*). Filing only; no code change.
+  - DONE 2026-09-15: four rows appended to `.ralph/deferral_ledger.md`
+    (`m0137-0012-b6-no-memoize-nl-probe`, `m0137-0012-b8-indexprobe-multiplier-parity-vs-wallclock`,
+    `m0137-0012-b10-corr-zero-fallback-max-io-cost`,
+    `m0137-0012-o15-gather-crossing-excluded-pushconjuncttraced`), each re-derived
+    against the tree at HEAD (exact file/line resume points) rather than copied
+    verbatim from `METHODOLOGY3/02-open-problems.md`. Recon task, no production
+    change. Design doc `docs/design/0100-0149/m0137-0012-unowned-carryover-ledger-rows.md`.
 - [ ] **M0137-0010 — add the qual-placement census and the duplicate-sensitive values
   check** — both justified by bugs that shipped: R56's Q78 lost three `Filter:` lines
   with sweep checksums still passing, and R83's Limit-below-Unique truncation was
