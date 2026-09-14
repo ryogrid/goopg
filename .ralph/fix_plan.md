@@ -1260,9 +1260,57 @@ setting that yields a serial plan.
     the recon-task boundary. No ledger row: the divergence is between two
     goopg-internal planner features, not a newly discovered PG-incompatibility.
   - Design doc: `docs/design/0100-0149/m0140-0001-gather-paths-flip-failing-set-remeasure.md`.
-- [ ] **M0140-0002 — adjudicate whatever genuinely fails against PG 18.3** — R14's
-  precedent applies: ask the oracle, the test can be wrong. Do not change planner
-  behaviour to satisfy a pin the oracle contradicts.
+- [x] **M0140-0002 — adjudicate whatever genuinely fails against PG 18.3** (DONE
+  2026-09-15) — R14's precedent applies: ask the oracle, the test can be wrong.
+  Do not change planner behaviour to satisfy a pin the oracle contradicts.
+  - **Scope correction to M0140-0001**: a full `go test
+    ./internal/optimizer/... ./internal/executor/...` sweep under the flip
+    finds **seven** failures, not the four M0140-0001 named by re-running only
+    the R43-era list. Three new: `TestPartialPathIsNeverTheFinalPath`,
+    `TestQ2DecorrelatedGroupKeyResolvesInAggregateInput`,
+    `TestSlice3CorrelatedBodyDeclinesParentAware`. M0140-0003 must gate on a
+    full-package sweep, not a named list, or it will under-count again.
+  - Hit a `go test` result-cache false-PASS while measuring
+    `TestOwnedBuildPoisonPrebuiltBoundary` under the flip (no `-count=1`); every
+    number in the design doc was re-confirmed with `-count=1` after first
+    observing it without. Record for future GOOPG_GATHER_PATHS measurement
+    rounds.
+  - **`TestSplitEqualityForHashMultiKey/searched_enumerator` — FIXED, was a
+    test-harness bug.** Probed the actual plan: under the flip it correctly
+    chooses `JoinAlgoHash` with both keys set, wrapped in a `Gather` the
+    shared `visit()` test helper (`q21_live_test.go`) had no `case *Gather`
+    for (production code's `boundaryWalkChildren` was already fixed for the
+    identical reason under R11). Added `case *Gather`/`*GatherMerge` to
+    `visit()`; confirmed PASS under the flip, unaffected at default, full
+    `go test ./internal/optimizer/...` (default) still green.
+  - **`TestSlice3LiveQ9ShapeDerivation`, `TestSlice3FilterColumnSurvivesNarrowing`,
+    `TestOwnedBuildPoisonPrebuiltBoundary`** — stale shape/optimization pins,
+    not a correctness bug. Adjudicated against a live PG 18.3 `EXPLAIN` of the
+    real TPC-H Q9 query (SF=1, `bench/tpch` port 65432): PG's actual plan
+    (orders joined last via *Parallel* Hash Join under a `Gather`; lineitem
+    joined via Nested Loop + Index Scan, never hashed) matches **neither**
+    goopg arm, so "closer to PG" cannot decide between them — Q9's join-order
+    divergence predates this flip (K26/R51-53/R68, gated to M0142). Concrete
+    effect: a filter-column-drop optimization declines to fire once its leaf
+    sits under a Gather-admitted ancestor (one extra column carried, no data
+    loss, no wrong reads). Re-pin all three when M0140-0003 lands the flip.
+  - **`TestPartialPathIsNeverTheFinalPath`** — the safety property (no
+    partial path ever reaches the *chosen final* plan) still holds under the
+    flip; only a secondary staging-order assertion is stale, because the flip
+    also activates K80's `addPartialHashJoinPath` producer, not gated behind
+    the pass (`C-19d`) the fixture assumed was the sole source. Re-pin at
+    M0140-0003.
+  - **`TestQ2DecorrelatedGroupKeyResolvesInAggregateInput` /
+    `TestSlice3CorrelatedBodyDeclinesParentAware`** — real, most consequential
+    finding: TPC-H Q2's scalar-aggregate decorrelation **declines entirely**
+    under the flip (falls back to a per-outer-row `SubPlan`) — not proven
+    incorrect (SubPlan results are still right), but flagged as the strongest
+    candidate for a root-cause fix before M0140-0003 lands the flip
+    default-on. Root cause not isolated this loop (adjudication, not a fix).
+  - No ledger row: all seven failures are goopg-internal mechanism
+    interactions (partial-path admission vs. narrowing / decorrelation / a
+    test walker), not newly discovered PG-incompatibilities.
+  - Design doc: `docs/design/0100-0149/m0140-0002-gather-paths-flip-failing-set-adjudication.md`.
 - [ ] **M0140-0003 — land the `GOOPG_GATHER_PATHS` flip on the category metric** —
   pre-register **no match flip**: R43 rev 3 measured TPC-H `parallelism` 18->16 under
   the flip with no new match, and K38 measured Gather 42->104 / `Parallel Hash` 0->167
