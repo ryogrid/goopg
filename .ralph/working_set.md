@@ -1,92 +1,82 @@
-Task: M0138-0005 — corpus re-measure at a declared epoch.
-**COMPLETE and committed/pushed** this loop (`2d5cf731d`), branch
-`plan-parity-with-pg-take2-ralph`.
+Task: M0138-0006 — re-measure Q9's estimate vs R130's table + reconcile
+`GOOPG_ANALYZE_SEED`. **COMPLETE and committed** this loop (`dc471b6d3`),
+branch `plan-parity-with-pg-take2-ralph`. **M0138 is now fully landed and
+measured (all six tasks [x])** — M0142's prerequisite gate is satisfied.
 
-Files: `docs/design/0100-0149/m0138-0005-corpus-remeasure-declared-epoch.md`
-(new), `docs/design/README.md` (+index row), `.ralph/deferral_ledger.md`
-(reopened 1 row, filed 2 new rows), `.ralph/fix_plan.md` (M0138-0005 checked
-off + DONE summary), `.ralph/progress.json` (state-guard repair). No
-production code touched — this was a measurement-only recon task.
+Files: `docs/design/0100-0149/m0138-0006-q9-estimate-remeasure-and-seed-reconcile.md`
+(new), `docs/design/README.md` (+index row), `.ralph/fix_plan.md` (M0138-0006
+checked off + DONE summary), `.ralph/deferral_ledger.md` (1 new row,
+task-id `m0138-0006`), `.ralph/progress.json` (state-guard repair). No
+production code touched — measurement-only recon.
 
-What was done: started the two down goopg lanes (`bench/tpch/setup_goopg.sh`,
-`bench/tpcds/server.sh start sf025`; the two PG references were already up),
-captured TPC-H (`estimate-audit -plan-only`) and TPC-DS SF0.25
-(`scripts/capture-tpcds.sh`) plan sets, diffed vs PG with
-`pg-plan-parity-diff.py`, and re-ran M0138-0001's per-column `pg_stats`
-census (TPC-H 8 tables/61 cols, TPC-DS 5 tables/120 cols) post-M0138-0002/
--0003/-0004.
+What was done: built `/tmp/estimate-audit-m0138-0006`, ran
+`-plan-only -queries 9` against the already-running, already-seed-pinned
+(`GOOPG_ANALYZE_SEED=20260905`) `:65433`/`:65432` TPC-H lanes, compared the
+plan text's top-level row estimate to R130's table.
 
 Key findings (full detail in the design doc):
-  1. **TPC-H plan/category set is byte-identical** to the milestone-filing
-     baseline (`METHODOLOGY3/README.md` "post-R128") — same match set
-     (Q1/Q6/Q10/Q11/Q14/Q15a), all 9 category counts unchanged. Zero
-     structural movement from the M0138 stats fixes (K50-consistent).
-  2. **TPC-DS verdict tuple unchanged** (`2/69/0/25/3/0`, reproduces
-     `TODO.md:4845-4849`'s R120 baseline exactly) but `join-order` and
-     `qual-placement` each moved +1 with no verdict flip — one
-     unidentified query's plan shape moved sideways. Ledger row filed,
-     NOT bisected (99-query corpus, out of this recon task's budget).
-  3. **`n_distinct` sign/order-of-magnitude agreement is now near-total**
-     on both corpora (TPC-H 60/61, TPC-DS 120/120 sign match) — corpus-wide
-     confirmation of the earlier spot-checks.
-  4. **IMPORTANT CORRECTION**: the correlation-banding symptom M0138-0001
-     found (`[0.09,0.16]` band, 36/118 TPC-DS columns vs PG's 7/119,
-     concentrated on high-duplicate-density FK columns) was marked
-     `resolved` by M0138-0004's `sort.SliceStable` tie-break fix — **that
-     claim does not hold**. Post-fix re-measurement reads 36/120 vs 7/120,
-     essentially unchanged. Source-level re-check confirms the tie-break
-     port IS mechanically correct (both engines sort the reservoir into
-     physical TID order first; PG's `tupno` is exactly the post-sort array
-     index, same as goopg's `pos`) — so the fix stays landed as a genuine
-     improvement, it just isn't the (sole) cause of the corpus symptom.
-     **Reopened** the `m0138-0001` ledger row (status flipped `resolved`
-     -> `-`) with a corrected resume point: build a synthetic table with a
-     KNOWN physical-position/value relationship, load identically on both
-     engines, compare correlation directly — this is the only way to
-     separate "goopg computes it wrong" from "the two storage engines
-     genuinely place these TPC-DS SF0.25 rows differently for a reason
-     outside ANALYZE's control" (M0138-0001's original alternative
-     hypothesis, never eliminated, now the leading one).
-  5. **New, narrower finding**: `avg_width=0` still reproduces for goopg's
-     fast-path `numeric` (int64 mantissa inline, no heap arena) —
-     M0138-0004's typlen fallback correctly only covers fixed-width types,
-     but `numeric`'s measured-payload branch only measures the slow
-     (big-numeric) path. Reproduces on 28/61 TPC-H columns (every
-     numeric-typed key/price/cost column — HammerDB declares TPC-H keys
-     `numeric`) and 17/120 TPC-DS columns. Ledger row filed; needs PG's
-     actual numeric-varlena size formula (value-dependent), not a literal
-     constant (anti-tuning rule forbids a guessed constant here).
+  1. Q9's HEAD estimate moved **97 -> 146** (post M0138-0002/-0003/-0004),
+     closer to the actual **175** but explicitly **not** toward PG's
+     **60,125** — the milestone's own pre-registered "moves toward PG"
+     prediction did NOT hold.
+  2. Leaf-level check (`partsupp ⋈ part` filtered on `p_name LIKE
+     '%green%'`) shows the two engines now agree within 1.2x — the
+     underlying per-column statistics converged (consistent with
+     M0138-0005's corpus-wide `n_distinct` finding). So the 344x top-level
+     gap is **not** a residual statistics-precision gap M0138 could fix.
+  3. Hypothesis (filed, not adjudicated — recon-scoped, forcing shapes is
+     against the milestone's goal): the gap is **join-shape-driven**.
+     goopg drives Q9 with FK-indexed Nested Loops (each probe correctly
+     `rows=1`); PG runs an all-Hash-Join chain where `eqjoinsel`/
+     `calc_joinrel_size_estimate` compound independent per-join
+     selectivities down a correlated FK chain with no extended statistics.
+     Reproducing PG's estimate likely needs goopg to choose PG's Hash-Join
+     shape first — a join-order/method question (M0142), not an
+     ANALYZE-precision one (M0138). This narrows M0142-0001/-0002's
+     starting hypothesis instead of leaving "re-examine the premise" open.
+  4. `GOOPG_ANALYZE_SEED` reconciliation: PG's `acquire_sample_rows` draws
+     from a process-global PRNG (`pg_prng_uint32(&pg_global_prng_state)`,
+     `analyze.c:1227`) with no reproducibility GUC/env-var — there is
+     nothing to retire the goopg knob in favour of. goopg's unset/zero
+     path already reproduces PG's "fresh per-backend draw" property
+     exactly; the pinned path is a harness-only determinism knob with no
+     PG counterpart. **Verdict: keep, no code change** — confirmed the
+     existing code comment's claim against the actual PG source.
 
-Key symbols: `computeColumnStats`/`datumVariablePayloadWidth`/the
-`corrPairs` sort (`internal/executor/operators_analyze.go:1159-1328`),
-`analyzeSampleByTID` (`:952-953`, the TID-sort that both engines share),
-PG oracle `compare_rows` (`analyze.c:1358-1379`, confirms PG sorts `rows[]`
-by physical TID too) and `compute_scalar_stats`'s `tupno` assignment
-(`analyze.c:2495`, confirms `tupno` IS the post-sort array index).
+Key symbols: `analyzeSeedEnv`/`analyzeSeedFor`
+(`internal/executor/operators_analyze.go:702-760`), PG's
+`acquire_sample_rows` (`analyze.c:1199-1227`) and `sampler_random_init_state`
+(`sampling.c:52,139,234,271,286`), PG's `eqjoinsel`
+(`postgres/src/backend/utils/adt/selfuncs.c:2280`) and
+`calc_joinrel_size_estimate`
+(`postgres/src/backend/optimizer/path/costsize.c:5501`) — the two functions
+named as M0142's port target if the join-shape hypothesis holds.
 
 Gates run: `go build ./...` clean (no source changed). `make
-ralph-state-guard`: found and auto-repaired one stale
-status/progress.json inconsistency, then consistent. Pre-commit hook's
-pgbench smoke: PASS (144 TPS, 0 failed). No values-gate re-run needed —
-no production code touched this loop.
+ralph-state-guard`: found and auto-repaired one stale status/progress.json
+inconsistency (same pattern as the last two loops — the "completed" marker
+from the prior loop's clean commit-and-exit, not a project-completion
+signal), then consistent. No values-gate re-run needed — no production code
+touched this loop, matching the M0138-0001/-0005 precedent.
 
-Bench lanes: `:65433` (goopg TPC-H) and `:65437` (goopg TPC-DS SF0.25)
-were started this loop (idempotent, no `--reset`/data touch) and left
-running per the shared-`:6543x`-lane rule (verify, never restart). `:65432`
-and `:65438` (PG references) were already up at loop start.
+Bench lanes: `:65433` (goopg TPC-H) and `:65432` (PG TPC-H reference) were
+already up at loop start and were only read from (never restarted), per the
+shared-`:6543x`-lane rule.
 
 In-flight: none.
 
 Next step: Per the banner, re-check `.ralph/fix_plan.md`'s `## Current
-Priority` banner fresh. M0138's own task list now has only M0138-0006 left
-("re-measure Q9's estimate against R130's table and reconcile the ANALYZE
-seed") — a good next pick, OR the banner's independent-trio rule permits
-picking the topmost unblocked M0139 (`M0139-S1`, now unblocked since
-M0137-0010 landed) or M0140 (`M0140-0001`) task instead, whichever the next
-loop judges most valuable. Two open threads from THIS loop worth a future
-loop's attention but not yet actionable as a fix_plan task on their own:
-the correlation-banding synthetic-test resume point (item 4 above) and the
-numeric fast-path avg_width formula (item 5) — both already have ledger
-rows with concrete resume points, pick them up when a task explicitly
-targets ANALYZE precision again (most likely M0138-0006 or a future
-M0138-000N).
+Priority` banner fresh. **M0138 is done**, so the M0138/M0139/M0140
+independent trio narrows: M0139-S1 (hook point inside the join tree, gated
+on M0137-0010, already unblocked) or M0140-0001 (re-measure the failing
+test set under `GOOPG_GATHER_PATHS`) are the two open topmost picks in that
+trio, OR — since M0138 "landed and been measured" is now true — M0142-0001
+("entry recon: is the pricing blockage still the same one?") is *also*
+newly unblocked and comes with a head start from this loop's join-shape
+hypothesis. Banner order lists M0139/M0140 (step 2) ahead of M0141/M0142
+(step 3), so the next loop should pick from the M0138/M0139/M0140 trio
+first (M0139-S1 or M0140-0001) unless it judges M0142-0001 more valuable
+given the freshly narrowed hypothesis — use judgment, the banner permits
+either within its own ordering rules. Do not re-run the Q9 estimate capture
+again without cause — it is committed and reproducible via the exact
+command line in this loop's design doc.
