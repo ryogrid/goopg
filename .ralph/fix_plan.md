@@ -991,7 +991,7 @@ unmeasured one does not.
   failure (verified via `git stash` of this task's files reproducing the same
   failure without them). Corpus-wide TPC-H/TPC-DS re-measurement intentionally
   deferred to M0138-0005 (declared-epoch requirement).
-- [ ] **M0138-0003 — verify `stadistinct` parity end to end; do NOT re-implement what
+- [x] **M0138-0003 — verify `stadistinct` parity end to end; do NOT re-implement what
   exists** — goopg stores upstream's one signed `stadistinct` as **two** fields,
   `NDistinct` (absolute) and `NDistinctFrac`
   (`internal/catalog/catalog.go:1880-1903`), but `ColumnStats.StaDistinct()`
@@ -1004,6 +1004,18 @@ unmeasured one does not.
   take2 P2-09 class of bug, where a scaling column read as absolute-zero). R78's
   witness: goopg `l_orderkey` `-0.1956` vs PG's absolute `347537` — re-measure it and
   report. Land a change only where a real divergence is found.
+  DONE 2026-09-15: `docs/design/0100-0149/m0138-0003-stadistinct-parity-verification.md`.
+  Consumer audit confirmed all three call sites already go through
+  `StaDistinct()` (no bare-`NDistinct` reads). Re-measured R78's witness on a
+  HEAD build (carrying M0138-0002) against the live TPC-H bench pair
+  (:65433/:65432): goopg's `l_orderkey` ndistinct moved from the pre-M0138-0002
+  `-0.1956` frac (≈1.17M, 3.4x off) to `327804` absolute, landing inside PG's
+  own unpinned 3-run noise band (`336410`-`366886`). Five more spot-checked
+  columns matched PG within the same noise, including both engines reporting
+  `-1` for a unique PK (confirms the 10% switch fires identically). No
+  production change: the gap was M0138-0002's block-sampler fix, not a
+  `stadistinct`-convention bug, so no diff earns landing per the milestone's
+  anti-tuning rule.
 - [ ] **M0138-0004 — MCV, histogram and correlation from the shared sample** — apply
   PG's `compute_scalar_stats` / `compute_distinct_stats` selection rule to the sample
   M0138-0002 produces, so every slot is computed from the same rows PG would have seen.
