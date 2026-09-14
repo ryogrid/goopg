@@ -618,12 +618,36 @@ before/after proving the defect it closes.
     Design doc `docs/design/0100-0149/m0137-0002-capture-machine-stamp.md`.
     Deferred to M0137-0006: turning the stats-epoch stamp into a checked/
     enforced step rather than a passive artefact field.
-- [ ] **M0137-0003 — write the canonical baseline-capture procedure** — record that
+- [x] **M0137-0003 — write the canonical baseline-capture procedure** — record that
   TPC-H baselines come from `estimate-audit -plan-only`, **not** `capture-tpch.sh`
   (which opens a fresh session per query and never ANALYZEs, so it captures TPC-H
   plans on empty stats); and that `-serial` defaults **true**
   (`cmd/estimate-audit/main.go:285`), so TPC-H `parallelism 0` is measured *out*, not
   solved. Include the TPC-DS procedure and the pinned GUCs for both corpora.
+  - DONE 2026-09-15: `docs/design/0100-0149/m0137-0003-baseline-capture-procedure.md`
+    — replaces AGENT.md's deleted "plan-parity-take2 work appendix" (bootstrap
+    PATH/`PGPASSWORD`, port/db/user/password table for both corpora), gives
+    the exact `estimate-audit -plan-only` command for TPC-H and
+    `capture-tpcds.sh` invocation for TPC-DS, and cites the direct 2026-09-14
+    probe (`TODO.md:4861-4875`) establishing WHY TPC-DS is unaffected by the
+    same per-connection-stats trap that hits TPC-H (its load-time ANALYZE
+    persists durably; TPC-H's does not for a fresh session). Live-validated
+    the exact TPC-H command against a throwaway private server end-to-end
+    (schema+sample data via `tpch.DDL()`/`tpch.SampleInserts()`, not a shared
+    `:6543x` cluster).
+  - Also resolved the M0137-0001 ledger deferral on `capture-tpch.sh`'s
+    untracked `TPCH_QUERY_DIR`: decided the script is demoted to a
+    non-baseline convenience tool (off the critical path now that
+    `estimate-audit` owns TPC-H baselines), and added a fail-fast
+    `TPCH_QUERY_DIR`/`TPCH_Q15A_FILE` existence check so a missing corpus
+    errors once instead of emitting 22 silent "MISSING QUERY FILE" sections.
+    `.ralph/deferral_ledger.md` row flipped to `resolved`.
+  - Updated `AGENT.md`'s two dangling pointers to the deleted appendix (now
+    point at the new doc) and `METHODOLOGY.md` §4.1 (added the TPC-H caveat
+    inline, since it is still cited as the live measurement-pipeline doc).
+  - Left open, explicitly not this task's job: the TPC-DS `match=2` vs
+    `match=1` reference question (M0137-0004) and turning the stats-epoch
+    stamp into a checked step (M0137-0006).
 - [ ] **M0137-0004 — reconcile the TPC-DS `match=2` vs `match=1` discrepancy** — both
   figures come from the same capture-script family; the difference is the **reference
   and the session GUCs** (live PG `:65438` vs the committed `bench/tpcds/plans-pg`

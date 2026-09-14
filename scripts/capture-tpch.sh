@@ -41,14 +41,33 @@ source "${SCRIPT_DIR}/lib/capture-stamp.sh"
 
 PORT="$1"; DB="$2"; USER="$3"; OUT="$4"; HDR="$5"; DATADIR="${6:-}"
 
-# NOT git-tracked (deferral ledger M0137-0001, 2026-09-15): the durable query
-# source is the Go package internal/testutil/tpch (also what
+# NOT git-tracked (deferral ledger M0137-0001, 2026-09-15, resolved M0137-0003):
+# the durable query source is the Go package internal/testutil/tpch (also what
 # cmd/estimate-audit reads via tpch.Queries()/tpch.Q15ViewBody()), but this
 # script predates that tool and is a lighter-weight EXPLAIN-only capture.
 # Override both vars for a fresh checkout or CI where /tmp/parity-r0 was
 # never seeded.
+#
+# M0137-0003: this script is NOT the TPC-H baseline-capture procedure — see
+# docs/design/0100-0149/m0137-0003-baseline-capture-procedure.md. Use
+# `estimate-audit -plan-only` for a TPC-H baseline (it warm-ANALYZEs the one
+# held session itself, so it never depends on prior state). This script stays
+# useful for a quick raw-EXPLAIN structural capture against an
+# already-stats-warm long-running cluster; it does not ANALYZE anything
+# itself, so pointing it at a cold cluster silently measures the no-stats
+# planner. It fails loudly (below) rather than emitting 22
+# "MISSING QUERY FILE" sections when the query directory is missing, per the
+# deferred item's own complaint ("no error surfaced beyond per-query
+# 'MISSING QUERY FILE' lines").
 Q="${TPCH_QUERY_DIR:-/tmp/parity-r0/queries/tpch}"
 Q15A="${TPCH_Q15A_FILE:-/tmp/parity-r0/q15a.sql}"
+
+if [ ! -d "$Q" ] || [ ! -f "$Q15A" ]; then
+    echo "capture-tpch.sh: query source missing (TPCH_QUERY_DIR=$Q, TPCH_Q15A_FILE=$Q15A)." >&2
+    echo "  Neither is git-tracked; seed them or export both vars. See" >&2
+    echo "  docs/design/0100-0149/m0137-0003-baseline-capture-procedure.md." >&2
+    exit 1
+fi
 
 PIN=(-c "SET work_mem='64MB'" -c "SET max_parallel_workers_per_gather=4")
 PIN_DESC="work_mem=64MB max_parallel_workers_per_gather=4"

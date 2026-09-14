@@ -86,7 +86,7 @@ watching the log grow — the trace has no query id.
 
 ## 4. The measurement pipeline
 
-### 4.1 Capture (both engines, identical script)
+### 4.1 Capture (both engines, identical script — TPC-DS only, see the note below)
 
 **(M0137-0001, 2026-09-15): promoted to `scripts/`, retiring the two copies
 this section used to point at (`methodology/capture-tpch.sh` and
@@ -95,6 +95,20 @@ either round-directory copy in a new procedure.**
 
 `scripts/capture-tpch.sh <port> <db> <user> <out> <hdr> [datadir]`
 `scripts/capture-tpcds.sh <port> <db> <user> <out> <hdr> [datadir]`
+
+**(M0137-0003, 2026-09-15): `capture-tpch.sh` is NOT the TPC-H baseline
+procedure.** It opens a fresh `psql` session per query and never `ANALYZE`s;
+goopg's ANALYZE stats are per-connection, so it silently plans TPC-H on
+**empty** statistics unless the cluster happens to already be stats-warm from
+some other session. This trap was hit twice (R65 §0, then again 2026-09-14,
+`TODO.md:4861-4875`). The canonical TPC-H baseline tool is
+`estimate-audit -plan-only` (holds one session, `ANALYZE`s every table before
+the first `EXPLAIN`, regardless of prior cluster state). TPC-DS is
+**not** affected by this — its load procedure's one-time ANALYZE persists
+durably across fresh connections (probed directly 2026-09-14, same citation)
+— so `capture-tpcds.sh` above remains the canonical TPC-DS tool. Full command
+lines, pinned GUCs and the bootstrap/port/auth table for both corpora:
+`docs/design/0100-0149/m0137-0003-baseline-capture-procedure.md`.
 
 **(M0137-0002, 2026-09-15): every capture is now machine-stamped** — pass the
 server's `[datadir]` (6th arg) to get a populated `# engine-binary:` line

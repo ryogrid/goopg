@@ -633,18 +633,21 @@ reproduce it.** Concretely:
 
 **Bootstrap first.** `psql`, `pgbench`, `pg_isready` and `pg_ctl` live ONLY in
 `./postgres/local_install/bin/`, never on a default PATH, and every bench port
-has its own user/password. The exports, the port->db/user/password table and the
-working `estimate-audit` / `tpch-runner` / `pg-plan-parity-diff.py` command lines
-are in §"plan-parity-take2 work appendix" at the foot of this file — **read its
-§0 and §1 before running anything**, including `make plan-gate` (without the PATH
-its `pg_isready` probe fails as *command not found* and the gate misreports the
-server as unreachable). That appendix is procedural reference for this group;
-where its round-cadence framing conflicts with §"Way of working" above, this
-section wins.
+has its own user/password. The exports, the port->db/user/password table and
+the working `estimate-audit` / `capture-tpcds.sh` / `pg-plan-parity-diff.py`
+command lines are in
+`docs/design/0100-0149/m0137-0003-baseline-capture-procedure.md` (M0137-0003
+— **read it before running anything**), including `make plan-gate` (without
+the PATH its `pg_isready` probe fails as *command not found* and the gate
+misreports the server as unreachable). That doc superseded the old
+"plan-parity-take2 work appendix" this section used to point at (deleted by
+the commit that filed M0137-0003, on the expectation this task would replace
+it); where a round-cadence framing anywhere conflicts with §"Way of working"
+above, that section wins.
 
-**Canonical captures** live in `scripts/` after M0137-0001; until that lands,
-use the appendix's commands directly (M0137-0003 replaces them with one
-documented procedure). Two facts that have each cost a round:
+**Canonical captures** live in `scripts/` after M0137-0001; the M0137-0003 doc
+above is the one documented procedure for using them. Two facts that have
+each cost a round:
 
 - **TPC-H baselines come from `estimate-audit -plan-only`, not
   `capture-tpch.sh`** — the latter opens a fresh session per query and never
