@@ -1257,9 +1257,37 @@ that comment names as parity-inert.
     opportunistically. Design doc:
     `docs/design/0100-0149/m0139-s2-narrow-join-leg-output.md`. No
     ledger row (goopg-internal executor plumbing).
-- [ ] **M0139-S3 — measure the residue against K67's floor** (gated on M0137-0010) — even narrowed to one
+- [x] **M0139-S3 — measure the residue against K67's floor** (gated on M0137-0010) — even narrowed to one
   column goopg is 72 B/row -> 103 MB and still spills at `work_mem=64MB` where PG is
   22 B/row -> 31 MB. Report the post-pushdown figure as a **number**, not an argument.
+  - DONE 2026-09-15 (recon, no production diff): K67's "72 B/row -> 103 MB,
+    narrowed to one column" was analytical (`EntryBytes(1,0)`), never
+    measured, and predates S1/S2. A throwaway probe
+    (`internal/testutil/tpch/zz_probe_m0139s3_test.go`, deleted before
+    commit) built a private disposable cluster from HEAD (never touching
+    the shared, peer-owned `:65433` server — whose binary is stale and
+    shows zero narrowing on Q12) with `internal/testutil/cluster` +
+    `scaleLoader` (20,000 real-DDL orders/lineitem rows), then ran
+    `EXPLAIN (VERBOSE)`, `EXPLAIN (ANALYZE, VERBOSE)`, and a
+    `pg_stats.avg_width` read for Q12. Confirmed the hook fires (Hash
+    Join `Output:` narrows 16+9 columns down to 7), but the real
+    orders-side retained set is **`{o_orderkey, o_orderpriority}` — 2
+    columns, not K67's assumed 1** (the join key must stay for
+    probe-time verification even though nothing above the join
+    references it), with real `avg_width(o_orderpriority)=8.3701` (not
+    K67's assumed 0). Formula `EntryBytes(2, 8.3701) ~= 128.37 B/row`,
+    cross-checked against the executor's own measured `Buckets: 32768
+    Batches: 1 Memory Usage: 4044kB` (subtracting the bucket-table term
+    reproduces 128.4 B/row). Extrapolated to SF=1's 1.5M orders the same
+    way K67 did (entries only): **~193 MB vs K67's 103 MB and PG's
+    unchanged 22 B/row -> 31 MB** — S1/S2's real narrowing made the
+    measured residue *larger* than the campaign's own anchor, not
+    smaller. Still spills at PG 18's default `work_mem=64MB x
+    hash_mem_multiplier=2.0` = 128 MB budget vs 192.6 MB of entries.
+    Feeds M0139-0006's owner decision; does not itself decide
+    `minimize_datum` (still NOT APPROVED TO START). Design doc:
+    `docs/design/0100-0149/m0139-s3-k67-residue-measurement.md`. No
+    ledger row (no PG-incompatibility surfaced).
 - [ ] **M0139-0004 — re-measure the "duplicate hash build map" premise, then act on
   what you find** — `minimize_datum/05-work-estimate.md` §1.5 (quoting `02` §3) prices a
   "delete the duplicate build map" win at "one commit", claiming `lazyHash` **and**
