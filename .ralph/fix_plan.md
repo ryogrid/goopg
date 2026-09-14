@@ -1064,10 +1064,49 @@ unmeasured one does not.
   `bak/` build failure — see the "Blast radius correction" note above);
   `scripts/tpch-spotcheck.sh` `RESULT=PASS` (Q12=2/Q13=34, canonical anchors).
   Corpus-wide plan/timing re-measurement is M0138-0005's job, not repeated here.
-- [ ] **M0138-0005 — corpus re-measure at a declared epoch** — commit a per-column
+- [x] **M0138-0005 — corpus re-measure at a declared epoch** — commit a per-column
   statistics diff vs PG 18.3 over both corpora, then the plan and category movement it
   causes. Every remaining disagreement is explained or filed as a ledger row. Expect
   large plan churn; the values gates are the bar.
+  - **DONE 2026-09-15.** Measurement-only (no production change). Design doc
+    `docs/design/0100-0149/m0138-0005-corpus-remeasure-declared-epoch.md`.
+  - Plan/category movement vs the milestone-filing baseline
+    (`METHODOLOGY3/README.md` "post-R128"): **TPC-H byte-identical** — same
+    match set (Q1/Q6/Q10/Q11/Q14/Q15a), all nine category counts unchanged.
+    **TPC-DS verdict tuple unchanged** (`2/69/0/25/3/0`, reproduces
+    `TODO.md:4845-4849`'s R120 baseline exactly) but `join-order` and
+    `qual-placement` each +1 with no verdict flip — one unidentified query's
+    plan structure moved sideways; ledger row filed, not bisected (99-query
+    corpus, recon-scoped budget).
+  - Per-column `pg_stats` diff over M0138-0001's column set, re-run post-fix:
+    `n_distinct` sign/order-of-magnitude agreement now near-total (TPC-H
+    60/61, TPC-DS 120/120 sign match) — the corpus-wide confirmation the
+    earlier spot-checks predicted.
+  - **Important correction**: the correlation-banding symptom M0138-0001
+    found (`[0.09,0.16]` band on high-duplicate-density FK columns) **still
+    reads 36/120 vs PG's 7/120 after M0138-0004's tie-break fix landed** —
+    unchanged from the pre-fix 36/118 vs 7/119 reading. Re-verified the
+    tie-break mechanism is correctly ported (source-level re-check: both
+    engines sort the reservoir into physical TID order before computing
+    correlation, and PG's own `tupno` is the post-sort array index, exactly
+    what goopg's `pos` already is) — the fix itself is genuine and stays
+    landed, but it does not explain the corpus symptom it was credited with
+    resolving. **Reopened** the `.ralph/deferral_ledger.md` `m0138-0001`
+    correlation row (flipped from `resolved` back to `-`) with a corrected
+    resume point: a synthetic controlled-layout test to distinguish a
+    remaining goopg bug from a genuine TPC-DS-loader physical-layout
+    artifact between the two storage engines.
+  - New finding: `avg_width=0` still reproduces for goopg's **fast-path**
+    `numeric` (int64 mantissa inline, no heap arena) — M0138-0004's typlen
+    fallback correctly only covers fixed-width types, but `numeric`'s
+    measured-payload branch (`datumVariablePayloadWidth`'s `KindNumeric`
+    case) only measures the slow (big-numeric) path. Reproduces on 28/61
+    TPC-H columns (every numeric-typed key/price/cost column — HammerDB
+    declares TPC-H keys `numeric`) and 17/120 TPC-DS columns. Ledger row
+    filed; needs PG's actual numeric-varlena size formula, not a literal
+    constant (anti-tuning rule).
+  - Gates: `go build ./...` unaffected (no source changed this loop). No
+    values-gate re-run needed — no production code touched.
 - [ ] **M0138-0006 — re-measure Q9's estimate against R130's table and reconcile the
   ANALYZE seed** — Q9's actual output is 175 rows; goopg estimated 97 and PG estimates
   60,125. **Moving toward PG's 60,125 is the expected result** and is the empirical
