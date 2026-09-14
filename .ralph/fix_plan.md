@@ -1345,11 +1345,37 @@ that comment names as parity-inert.
     No ledger row: the narrowing-bypass finding is a corollary of the
     already-tracked F11/K63/`m0137-0011` lineage, not a newly discovered
     PG-incompatibility on its own.
-- [ ] **M0139-0006 — put the packed-retention decision to the owner** — carry S3's
-  measured residue, `entrywidth.go`'s non-monotonicity finding, and the two blockers
-  the `minimize_datum` review itself raised ("the premise was modelled, and the
-  measured answer is different — and smaller"; "sequencing violates take3 13 §8.2").
-  **Do not implement it** — `minimize_datum` is NOT APPROVED TO START.
+- [x] **M0139-0006 — put the packed-retention decision to the owner** (DONE
+  2026-09-15) — carried S3's measured residue, `entrywidth.go`'s
+  non-monotonicity finding, and the two blockers the `minimize_datum` review
+  itself raised into one packet. **Not implemented** — `minimize_datum`
+  remains NOT APPROVED TO START; this task only poses the owner question.
+  - Packet contents: (1) S3's Q12 residue — 128.4 B/row measured (≈193 MB at
+    SF=1) vs K67's analytical 72 B/row (103 MB) floor, ~5.8× PG's 22 B/row
+    (31 MB), worse than budgeted, not better. (2) `entrywidth.go`'s
+    non-monotonicity (`minimize_datum/TODO_ALL.md` "D-05 prereq #1"): entry
+    width 194→120 B/row left `NBatch` unchanged (4→4); 2-batch threshold is
+    ≤111.8 B/row; a further cut to 63 B/row lands back on 4 — batch count is
+    governed by `MapSlotBytes`, not monotonically by entry size, so a packing
+    win is not guaranteed to reduce spilling without re-deriving the batching
+    geometry. (3) The review's own B2/B3 (packing alone was estimated to
+    close only ~5× of a ~48× gap; narrowing — M0139's own mechanism — owns
+    the rest) and B5 (take3 13 §8.2 sequencing: EX1-before-geometry, now
+    concretely satisfied by M0139-S1/S2/S3 — the one thing that changed since
+    the review, but it clears only the sequencing gate, not effectiveness).
+  - Owner question posed explicitly, not answered: authorize `minimize_datum`
+    now that sequencing is clear, given packing was independently estimated
+    to close only a fraction of the residue, or hold it out-of-scope for a
+    milestone group whose success metric is plan-structure parity, not
+    memory footprint.
+  - Design doc:
+    `docs/design/0100-0149/m0139-0006-packed-retention-owner-decision.md`.
+  - No ledger row: no new PG-incompatibility surfaced, this is a synthesis
+    of existing evidence, not a new discovery.
+  - **All six M0139 tasks (S1, S2, S3, -0004, -0005, -0006) are now DONE.**
+    M0139 has no further open items; the next M0139-family work (if any)
+    would come from a future owner decision on `minimize_datum`, which is
+    out of scope until that decision is made.
 
 ## M0140 — TPC-DS parallelism (filed 2026-09-14)
 
