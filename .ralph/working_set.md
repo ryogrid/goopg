@@ -1,84 +1,85 @@
-Task: M0140-0002 — adjudicate the `GOOPG_GATHER_PATHS` flip's failing tests
-against PG 18.3. **COMPLETE and committed** this loop (`c4d8013e5`), branch
-`plan-parity-with-pg-take2-ralph`. One test-harness fix landed; no planner
-production code touched.
+Task: M0139-S1 — "a hook point inside the join tree" (executor-side
+narrowing / projection pushdown milestone). **COMPLETE and committed** this
+loop, branch `plan-parity-with-pg-take2-ralph`.
 
-Files: `docs/design/0100-0149/m0140-0002-gather-paths-flip-failing-set-adjudication.md`
-(new), `docs/design/README.md` (+index row), `.ralph/fix_plan.md`
-(M0140-0002 checked off + sub-bullets), `internal/optimizer/q21_live_test.go`
-(fixed `visit()`'s Gather-blindness).
+Files: `internal/optimizer/joinleghook.go` (new — the hook + flag),
+`internal/optimizer/joinleghook_test.go` (new — 3 tests),
+`internal/optimizer/createplanjoin.go` (call site in `joinInputsFor`),
+`internal/optimizer/flaglabels.go` (+`GOOPG_NARROW_LEG_HOOK` provenance row),
+`scripts/planner-flags.env` (regenerated via `go run
+./cmd/gen-planner-flag-labels`), `docs/design/0100-0149/m0139-s1-join-leg-hook.md`
+(new), `docs/design/README.md` (+index row), `.ralph/fix_plan.md` (M0139-S1
+checked off + summary).
 
-What was done:
-  1. **Scope-corrected M0140-0001**: a full `go test
-     ./internal/optimizer/... ./internal/executor/...` sweep under the flip
-     finds **seven** failures, not the four M0140-0001 got by re-running only
-     the R43-era named list. Three new: `TestPartialPathIsNeverTheFinalPath`,
-     `TestQ2DecorrelatedGroupKeyResolvesInAggregateInput`,
-     `TestSlice3CorrelatedBodyDeclinesParentAware`.
-  2. **Fixed one real false-failure**: `TestSplitEqualityForHashMultiKey/
-     searched_enumerator`. Probed the actual plan (throwaway
-     zz_probe_multikey_test.go, deleted after use) — under the flip it
-     correctly chooses `JoinAlgoHash` with both `LeftKey`/`RightKey` set; the
-     shared `visit()` test helper just had no `case *Gather` and silently
-     stopped descending once the flip wrapped the tree in one (production
-     code's `boundaryWalkChildren` was already fixed for the identical
-     reason under R11). Added `case *Gather`/`*GatherMerge` to `visit()`;
-     confirmed PASS under the flip and no regression at default
-     (`go test ./internal/optimizer/...` fully green).
-  3. **Adjudicated the 3 narrow-build shape tests + TestPartialPathIsNeverTheFinalPath**
-     as stale pins, not correctness bugs: ran a live PG 18.3 `EXPLAIN` of the
-     real TPC-H Q9 query (SF=1, `bench/tpch` port 65432) — PG's actual plan
-     matches **neither** goopg arm (orders joined last via Parallel Hash under
-     Gather; lineitem via Nested-Loop+Index-Scan, never hashed), so
-     "closer to PG" can't decide between default/flipped shapes here — Q9's
-     join-order gap predates this flip (K26/R51-53/R68, gated to M0142).
-     Concrete effect under the flip: a filter-column-drop optimization
-     declines to fire under a Gather-wrapped prebuilt leaf (extra column
-     carried, no data loss); a partial-path-production timing assumption
-     breaks because the flip also activates K80's `addPartialHashJoinPath`.
-     Action: re-pin all 4 when M0140-0003 lands the flip, not before.
-  4. **Flagged the real remaining finding**: `TestQ2DecorrelatedGroupKeyResolvesInAggregateInput`
-     / `TestSlice3CorrelatedBodyDeclinesParentAware` — TPC-H Q2's
-     scalar-aggregate decorrelation declines ENTIRELY under the flip,
-     falling back to a per-outer-row `SubPlan`. Not proven incorrect, but the
-     strongest candidate for a real root-cause fix before M0140-0003 lands
-     the flip default-on. Root cause NOT isolated (adjudication only).
-  5. **Cache hazard recorded**: a `go test` run for `TestOwnedBuildPoisonPrebuiltBoundary`
-     under the flip without `-count=1` returned a **stale PASS** from the
-     result cache even though the env var changed. Every number in the
-     design doc was reconfirmed with `-count=1`.
+What was done: recon found the real gap narrower than the milestone doc's
+"no `*Project` above the scan at all" — `joinInputsFor` already narrows a
+hash join's inner/build side (`narrowBuildInput`) and both merge-join sides
+(`narrowMergeInput`); only a hash join's OUTER/probe side and BOTH nested-loop
+sides (plain + NLI) were never reached. `narrowPlanOutput` (the function that
+actually builds a `*Project`) already declines to wrap a no-op cut
+(`len(keep) >= len(lay)`), so an "identity-wrapping hook" built by calling it
+directly would be silently absorbed and prove nothing about reachability —
+the hook had to be a genuinely new call site, not a reuse of that function.
+Landed `narrowJoinLeg(n, lay)`, gated by new default-ON flag
+`GOOPG_NARROW_LEG_HOOK`, called from `joinInputsFor` on both legs of every
+join kind (safe uniformly because the function is proven to never mutate
+its input). For S1 it is UNCONDITIONALLY A DECLINE: counts every
+currently-unhooked eligible leg (`isNarrowableLeaf`) but always returns the
+pair byte-identical to input — "no parity movement" is guaranteed by
+construction, not merely predicted.
 
-Key symbols: `visit()` (`internal/optimizer/q21_live_test.go:198`, now
-Gather-aware). `boundaryWalkChildren` (`internal/optimizer/createplanroot.go:427`,
-the production-code precedent for the same fix). `jsgDecorrelatedAgg`
-(`internal/optimizer/joinsearchunnestgroupkey_test.go`) — where the Q2
-decorrelation-decline symptom surfaces; root cause not yet located.
+Key symbols: `narrowJoinLeg`/`isNarrowableLeaf`/`legHookFireCount*`
+(`internal/optimizer/joinleghook.go`), the two new call-site lines in
+`joinInputsFor` (`internal/optimizer/createplanjoin.go`, right after the
+existing `narrowBuildInput`/`narrowMergeInput` calls), `narrowPlanOutput`
+(`narrowoutput.go:708`, the function M0139-S2 will reuse at this hook).
 
-Gates run: `go build ./...` clean. `go test ./internal/optimizer/...` and
-`./internal/executor/...` (default) both green. `RALPH_PRECOMMIT_SCOPE=units
-scripts/ralph-precommit-test.sh`: the only failures are the ALREADY-FILED,
-pre-existing `internal/parser` `GroupedJoinUnaliased` AST-drift (60 test
-functions, fix_plan.md lines ~181-206, explicitly unrelated to
-optimizer/executor diffs) and the pre-existing untracked `bak/` build
-failure — both confirmed unrelated to this loop's diff via `git stash`.
-pgbench smoke pre-commit hook PASS. `make ralph-state-guard`: same recurring
-stale status/progress.json pattern as prior loops, auto-repaired, then
-consistent.
+Hypothesis/Findings: none open — this was plumbing with a mechanically
+proven zero-behaviour-change property, not a diagnosis task. M0139-S2's job
+(next slice, still unchecked in fix_plan.md) is to replace `narrowJoinLeg`'s
+always-decline body with the real keep-set derivation `narrowBuildInput`
+already uses (`buildKeepSet`/`joinKeepSet`/`neededKeepSet`), reusing it
+rather than duplicating it — that is where real narrowing (and the actual
+row-width win) happens, and where a corpus-wide "N queries narrowed" count
+becomes meaningful.
 
-In-flight: none.
+Gates run: `go build ./...` clean. `go test ./internal/optimizer/...
+./internal/executor/...` fully green (including
+`TestFlagProvenanceEnvIsGenerated`, which required regenerating
+`scripts/planner-flags.env`). `RALPH_PRECOMMIT_SCOPE=units
+scripts/ralph-precommit-test.sh`: green except the pre-existing,
+already-filed `internal/parser` `GroupedJoinUnaliased` AST-drift (60 test
+fns) and untracked `bak/` build failure — both confirmed unrelated (no
+optimizer/executor packages in the failure list). `scripts/tpcds-sf025-regression.sh
+sweep`: PASS=96 MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0 SKIP=3 (clean
+values gate on real data). `make ralph-state-guard`: same recurring stale
+status/progress.json pattern as prior loops, auto-repaired, then consistent.
 
-Next step: Re-check `.ralph/fix_plan.md`'s `## Current Priority` banner
-fresh. With M0140-0001 and M0140-0002 both done, the strongest-continuity
-options are: **M0140-0003** (land the `GOOPG_GATHER_PATHS` flip on the
-category metric) — but it is NOT yet unblocked by this loop's own findings:
-the Q2 decorrelation-decline (item 4 above) should be root-caused first, or
-at minimum explicitly accepted as a known regression, before flipping the
-default; alternatively select **M0139-S1** (hook point inside the join tree,
-gated on M0137-0010, already unblocked) or another open M0139/M0140/M0142
-task per the banner. Do NOT re-run this loop's seven-test measurement again
-without cause — it is committed and reproducible via the exact commands in
-the design doc. If M0140-0003 is selected next, its first move should be
-isolating the Q2 decorrelation-decline root cause (leading hypothesis, NOT
-yet verified: another Gather-blind tree-walk in the decorrelation-eligibility
-check, by analogy with this loop's `visit()` finding — check that
-hypothesis with instrumentation before assuming it).
+In-flight: `scripts/tpch-spotcheck.sh` **could not complete** — retried 3x
+over ~15 min, every attempt failed at
+`tpch-private-clone: 127.0.0.1:65433 still busy after 60s` because the
+SHARED TPC-H bench server was up the entire loop (peer-owned per the
+`goopg_shared_bench_cluster_collisions` memory — must not be stopped by this
+loop) and the private-clone snapshot step (`scripts/lib/tpch-private-clone.sh`)
+requires the shared server to be fully DOWN, not merely idle, before it will
+copy the data directory. Not treated as a values-safety gap: this specific
+change is proven a hard byte-identical no-op by `TestNarrowJoinLegDeclinesButCounts`
+(every return path pointer/content-identical to input, for every
+flag/shape combination), independent of which server answers the question,
+and the TPC-DS SF0.25 sweep above is a real, clean values gate on real data.
+Next loop (or a retry later in THIS loop before it ends, if the shared
+server frees up): re-run `scripts/tpch-spotcheck.sh` opportunistically;
+expected to reproduce the canonical Q12=2/Q13=34 anchors unchanged.
+
+Next step: select **M0139-S2** ("narrow scan output at the new hook —
+reuse the existing narrowing rather than duplicating it") per the banner
+order (M0138 done, M0139 in progress, M0140 has M0140-0003 still open too —
+either is a valid pick; M0139-S2 has direct continuity with this loop's
+work). S2's job: replace `narrowJoinLeg`'s always-decline body with a real
+keep-set derivation reusing `buildKeepSet`/`joinKeepSet`/`neededKeepSet`
+(the same functions `narrowBuildInput` already calls in `narrowoutput.go`),
+call `narrowPlanOutput` with that real keep set instead of returning
+unchanged, and measure the actual row-width win corpus-wide (values gates +
+qual-placement census + per-query timing, per the milestone's own
+Definition-of-Done items still unchecked). Do not re-derive `attr_needed` as
+the blocker (ruled out twice already).

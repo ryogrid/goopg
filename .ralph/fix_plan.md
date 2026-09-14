@@ -1179,9 +1179,37 @@ THIS DOES NOT BUY": Q9's `nbatch` is non-monotone in entry width (4 at 112..194,
 retention format would make Q9's batching **worse**, and R129 measured the lever
 that comment names as parity-inert.
 
-- [ ] **M0139-S1 — a hook point inside the join tree** (gated on M0137-0010) — pre-registered prediction:
+- [x] **M0139-S1 — a hook point inside the join tree** (gated on M0137-0010) — pre-registered prediction:
   **no parity movement; the pass fires N > 0 times**. A slice that predicts a match
   flip is mis-scoped. Do not re-derive that `attr_needed` is the blocker.
+  - DONE 2026-09-15: recon narrowed the gap — `joinInputsFor` already narrows
+    a hash join's inner/build side and both merge-join sides; only a hash
+    join's outer/probe side and both nested-loop sides (plain + NLI) were
+    never reached. `narrowPlanOutput` itself already declines to wrap a
+    no-op cut, so the hook could not be "an identity Project" (it would be
+    silently absorbed) — it had to be a new call site instead. Landed
+    `internal/optimizer/joinleghook.go`'s `narrowJoinLeg`, gated by new
+    default-ON flag `GOOPG_NARROW_LEG_HOOK`, called from `joinInputsFor` on
+    both legs of every join kind. **Unconditionally a decline for S1**: it
+    counts every currently-unhooked eligible leg but returns the pair
+    byte-identical to its input in every case — "no parity movement" is
+    guaranteed by construction, not merely predicted, and proven directly
+    by `TestNarrowJoinLegDeclinesButCounts` plus a live two-table-join test
+    (`TestNarrowJoinLegFiresOnLiveJoinSearch`, fires 1 time, plan shape
+    identical hook-on vs off via `unaDump`). M0139-S2 reuses
+    `narrowBuildInput`'s existing keep-set derivation at this hook rather
+    than duplicating it. Gates: `go build`/`go test` clean for
+    `internal/optimizer`/`internal/executor`; `RALPH_PRECOMMIT_SCOPE=units`
+    green except the pre-existing, already-filed `internal/parser`
+    AST-drift + `bak/` build failure; `scripts/tpcds-sf025-regression.sh
+    sweep` PASS=96 MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0.
+    `scripts/tpch-spotcheck.sh` **could not run** — shared `:65433` was up
+    the whole task (peer-owned, not to be stopped) and the private-clone
+    snapshot step requires it fully down; retried 3x over ~15 min, still
+    busy. Not a values-safety gap given the mechanical no-op proof; re-run
+    once the shared server frees up. Design doc:
+    `docs/design/0100-0149/m0139-s1-join-leg-hook.md`. No ledger row (pure
+    goopg-internal plumbing).
 - [ ] **M0139-S2 — narrow scan output at the new hook** (gated on M0137-0010) — reuse the existing
   narrowing rather than duplicating it. It lives in three files, not one:
   `narrowoutput.go` (`GOOPG_NARROW_BUILD`, hash build + merge input),
