@@ -1,0 +1,11 @@
+=== Q12
+Sort  (cost=329130.40..329130.42 rows=7 width=60)
+  Sort Key: lineitem.l_shipmode
+  ->  HashAggregate  (cost=329058.39..329058.46 rows=7 width=60)
+        Group Key: lineitem.l_shipmode
+        ->  Hash Join  (cost=271780.29..328627.53 rows=28724 width=524)
+              Hash Cond: (orders.o_orderkey = lineitem.l_orderkey)
+              ->  Seq Scan on orders  (cost=0.00..43435.00 rows=1500000 width=448)
+              ->  Seq Scan on lineitem  (cost=0.00..60299.79 rows=28724 width=550)
+                    Filter: (((((l_shipmode = ANY ('MAIL', 'SHIP')) AND (l_commitdate < l_receiptdate)) AND (l_shipdate < l_commitdate)) AND (l_receiptdate >= '1994-01-01'::date)) AND (l_receiptdate < '1995-01-01 00:00:00'::timestamp))
+

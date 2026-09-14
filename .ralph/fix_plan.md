@@ -823,13 +823,32 @@ before/after proving the defect it closes.
     determinations across `TODO.md`'s round history is campaign-sized, a different
     kind of task from a single already-adjudicated flag deletion; the harness's own
     R121-vs-R108/R113/R120 distinction warns against flattening the two).
-- [ ] **M0137-0011 — root-cause the second display/estimator seam (C3/K63)** — R76 P1
+- [x] **M0137-0011 — root-cause the second display/estimator seam (C3/K63)** — R76 P1
   saw Q22 display rows 16,666 against a stamped 18,200 and called it "a second
   estimator seam"; R77 took the post-pass branch and noted "gates did not complain",
   and it was never diagnosed. K63 is the general form: goopg's EXPLAIN reports a scan
   cost the planner did not use (4.5x on Q12), which "corrupts every cost-based
   artefact including `plan-gate MODE=semantic-cost` and estimate audits". This is an
   **instrument** defect and therefore belongs in this milestone, not in a costing one.
+  - DONE 2026-09-15 (recon only, no production diff): reproduced R37's Q12 capture
+    byte-for-byte at HEAD, then instrumented `stampPlanCost`
+    (`internal/optimizer/plancost.go`) and `explainCostFields`
+    (`internal/executor/operators_explain.go`) with a temporary env-gated trace
+    against the live `bench/tpch` 65433 lane (fully reverted, `git diff --stat`
+    empty on both files). Root cause: `SeqScan` embeds `PlanCost`
+    (`plan.go:641`) but `Filter` does not (`plan.go:1531-1569`) — a base-local
+    filtered scan (`lineitem` in Q12) reaches `buildInitialRels` wrapped as
+    `Filter{Child: SeqScan}`, so `stampPlanCost`'s `n.(planCostSetter)`
+    assertion silently fails on it (traced: the correct 271,421.24 is stamped
+    onto the Filter and then read back `CostSet=false` at render time from the
+    SAME pointer), and EXPLAIN falls back to `DeriveLegacyDisplayCost`'s
+    childless-leaf formula (no page cost) — R37's exact "legacy model" number.
+    Confirms K62 (display-only, cannot move a plan-choice category) while
+    widening the blast radius from one query's symptom to every base-local-
+    filtered scan reaching `buildInitialRels`. Fix shape named (embed
+    `PlanCost` on `Filter`) but not implemented — filed as
+    `.ralph/deferral_ledger.md` row `m0137-0011-filter-node-missing-plancost-embed`.
+    Design doc `docs/design/0100-0149/m0137-0011-c3-k63-display-seam-root-cause.md`.
 - [x] **M0137-0012 — file ledger rows for the four unowned carry-overs** — one row each,
   with mechanism and resume point, so they stop being invisible: **B6** (no Memoize on
   the NL probe path R59 repriced; Q72 4s -> 320s TIMEOUT), **B8**
