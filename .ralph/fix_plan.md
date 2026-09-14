@@ -726,11 +726,36 @@ before/after proving the defect it closes.
     `make plan-gate` now 22/22 MATCH. Design doc
     `docs/design/0100-0149/m0137-0005-plan-gate-rebaseline.md`. No production code
     touched; no ledger row (instrument re-pin, not a discovered PG incompatibility).
-- [ ] **M0137-0006 — make the stats-epoch declaration a checked step** — a values
+- [x] **M0137-0006 — make the stats-epoch declaration a checked step** — a values
   sweep re-samples statistics and opens a new epoch; R120 attributed two apparent
   "worsenings" to drift rather than the flag and left a rule no tool enforces.
   Every A/B artefact declares its epoch on both arms, and re-taking the OFF baseline
   after a sweep becomes a verified step rather than a remembered one.
+  - DONE 2026-09-15: new `scripts/check-stats-epoch.sh <file> <file> [...]` reads
+    each artefact's `# stats-epoch:` line and exits 0 only if all present/known/
+    identical; exit 1 (both values printed) on a mismatch or an `UNKNOWN(reason)`
+    epoch on either side; exit 2 if a file has no stamp at all. Also stamped the
+    previously-unstamped canonical TPC-H tool `cmd/estimate-audit` (behind
+    `scripts/tpch-estimate-audit-arm.sh`'s `PGSHAPED=0`/`PGSHAPED=1` A/B runs) with
+    the SAME `sha256(relname|n_live_tup)`-first-16-hex fingerprint formula
+    `scripts/lib/capture-stamp.sh` uses (M0137-0002), computed from its own
+    already-open connection, degrading to `UNKNOWN(reason)` rather than `fatal()`.
+    Cross-tool formula equality pinned by `TestHashStatsEpochRowsMatchesCaptureStampFormula`
+    (hand-verified against the bash formula). `scripts/check-stats-epoch-test.py`
+    (8 tests, incl. an end-to-end run through the real stubbed-`psql`
+    `capture-tpch.sh`) plus 4 new Go tests in `cmd/estimate-audit/main_test.go`.
+    Live-validated against a real throwaway goopg server (M0137-0003's probe
+    precedent): two untouched-server captures MATCH on a real hash; after
+    doubling `nation`'s rows + `ANALYZE nation`, a third capture's epoch changed
+    and the checker reported MISMATCH — the exact live defect class this task
+    closes. `m0137-0003`'s procedure doc gains §4a naming this as the required
+    pre-diff step. Design doc
+    `docs/design/0100-0149/m0137-0006-stats-epoch-checked-step.md`. Named out of
+    scope: pure-timing arm runners (`tpch-acceptance-arm.sh`) that never touch a
+    plan/estimate artefact — a different instrument/question from N23's. No
+    Makefile/precommit/CI wiring (matches every sibling regression test in this
+    milestone, all run manually). No production planner/executor/catalog code
+    touched.
 - [ ] **M0137-0007 — give each lane a private clone and a private port** —
   shared-resource contention on `:65433` is the stated reason for most deferred gates
   (`tpch-spotcheck.sh` was deferred four rounds running while being the only gate that

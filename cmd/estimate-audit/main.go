@@ -48,6 +48,7 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"flag"
 	"fmt"
@@ -144,6 +145,13 @@ func main() {
 	} else {
 		out = estimateaudit.Render(reports, th)
 	}
+	// M0137-0006: stamp the primary (goopg) capture's stats epoch so a
+	// scripts/check-stats-epoch.sh run can catch a flag-OFF/flag-ON A/B whose
+	// arms straddle a re-ANALYZE (values sweep) rather than differing only by
+	// the flag — the drift N23 measured at 1.31x on Q9 that R120 attributed
+	// to the flag by hand. Always prepended, even in --plan-only or
+	// --from-plans mode, so an artefact's stats provenance is never implicit.
+	out = statsEpochLine(f) + out
 
 	// §4's parity column, when a PG 18.3 reference is available.
 	ref, refPlans, haveRef := referenceReports(f)
@@ -491,6 +499,83 @@ func openDB(f *flags, port int, dbName, user, pass string) *sql.DB {
 		fatal("ping: %v (is the cluster up on %s:%d? bench/tpch/setup_goopg.sh / setup_pg.sh)", err, f.host, port)
 	}
 	return db
+}
+
+// statsEpochLine renders the primary (f.host/f.port/f.db) capture's stats
+// epoch as a `# stats-epoch: <value>\n` header line, the same shape
+// scripts/lib/capture-stamp.sh writes for capture-tpch.sh/capture-tpcds.sh
+// (M0137-0002). It never calls fatal(): a stats-epoch read is a secondary
+// provenance channel, not the audit itself (the same reasoning renderEnum's
+// comment gives for a missing enum-trace log), so any failure degrades to an
+// explicit UNKNOWN(reason) rather than aborting a run that may have just cost
+// a full TPC-H power run.
+func statsEpochLine(f *flags) string {
+	if f.fromPlans != "" {
+		return "# stats-epoch: UNKNOWN(offline replay via --from-plans, no live connection)\n"
+	}
+	connStr := fmt.Sprintf("host=%s port=%d dbname=%s user=%s password=%s sslmode=disable",
+		f.host, f.port, f.db, f.user, f.pass)
+	db, err := sql.Open("postgres", connStr)
+	if err != nil {
+		return fmt.Sprintf("# stats-epoch: UNKNOWN(sql.Open: %v)\n", err)
+	}
+	defer db.Close()
+	epoch, err := queryStatsEpoch(db)
+	if err != nil {
+		return fmt.Sprintf("# stats-epoch: UNKNOWN(%v)\n", err)
+	}
+	return fmt.Sprintf("# stats-epoch: %s\n", epoch)
+}
+
+// queryStatsEpoch fingerprints pg_stat_user_tables(relname, n_live_tup) —
+// EXACTLY the way scripts/lib/capture-stamp.sh's _capture_stamp_stats_epoch
+// does (sha256 over "relname|n_live_tup" rows ordered by relname, joined by
+// "\n" with a trailing "\n", first 16 hex chars) — so an estimate-audit
+// epoch and a capture-tpch.sh/capture-tpcds.sh epoch are directly comparable
+// by the SAME scripts/check-stats-epoch.sh, one fingerprint format across
+// every M0137 A/B artefact rather than a second incompatible one. n_live_tup
+// is the field capture-stamp.sh's comment picks for the same reason here:
+// goopg's pg_stat_user_tables always reports last_analyze/last_autoanalyze
+// as NULL, but n_live_tup is real on both engines (PG's live counter, and
+// goopg's ANALYZE-persisted reltuples).
+func queryStatsEpoch(db *sql.DB) (string, error) {
+	rows, err := db.Query("SELECT relname, n_live_tup FROM pg_stat_user_tables ORDER BY relname")
+	if err != nil {
+		return "", fmt.Errorf("query failed: %w", err)
+	}
+	defer rows.Close()
+	var epochRows []statsEpochRow
+	for rows.Next() {
+		var r statsEpochRow
+		if err := rows.Scan(&r.relname, &r.nLiveTup); err != nil {
+			return "", fmt.Errorf("scan: %w", err)
+		}
+		epochRows = append(epochRows, r)
+	}
+	if err := rows.Err(); err != nil {
+		return "", err
+	}
+	if len(epochRows) == 0 {
+		return "", fmt.Errorf("empty pg_stat_user_tables read")
+	}
+	return hashStatsEpochRows(epochRows), nil
+}
+
+// statsEpochRow and hashStatsEpochRows are split out of queryStatsEpoch so
+// the fingerprint formula itself is unit-testable (cmd/estimate-audit/main_test.go)
+// without a live *sql.DB.
+type statsEpochRow struct {
+	relname  string
+	nLiveTup int64
+}
+
+func hashStatsEpochRows(rows []statsEpochRow) string {
+	var b strings.Builder
+	for _, r := range rows {
+		fmt.Fprintf(&b, "%s|%d\n", r.relname, r.nLiveTup)
+	}
+	sum := sha256.Sum256([]byte(b.String()))
+	return fmt.Sprintf("%x", sum[:])[:16]
 }
 
 func fatal(format string, args ...any) {

@@ -119,6 +119,13 @@ PGPASSWORD=tpch /tmp/estimate-audit -plan-only \
   (`shared_buffers=2048MB`, `autovacuum=on`, `work_mem=64MB`,
   `effective_cache_size=2GB` on both sides as of 2026-09-06) before trusting
   a capture — a drifted cluster measures configuration, not planning (K10).
+- **`<label>.txt` opens with a `# stats-epoch: <hash>` line (M0137-0006)** —
+  the same `sha256(relname|n_live_tup)`, first-16-hex-chars fingerprint
+  `scripts/lib/capture-stamp.sh` writes for `capture-tpch.sh`/
+  `capture-tpcds.sh`, computed here from the tool's own already-open
+  connection instead of a second `psql` round trip. Run
+  `scripts/check-stats-epoch.sh <off>.txt <on>.txt` on a flag-OFF/flag-ON
+  pair before trusting a diff between them — see §4a.
 - Output: `<out>/<label>.txt` (the §4/§5 report — empty of those sections in
   `-plan-only` mode), `<out>/<label>.plans.txt` (goopg `=== Qn` sections),
   `<out>/<label>.pg.plans.txt` (the PG reference, captured by the **same**
@@ -170,7 +177,32 @@ scripts/capture-tpcds.sh 65438 tpcds025 ryo \
   the `match=1` reading some earlier round reports quote did not reproduce).
   AGENT.md's "Success criterion" floor is TPC-DS `match >= 2`.
 
-### 4. Compare
+### 4a. Check the stats epoch BEFORE trusting an A/B (M0137-0006)
+
+```bash
+scripts/check-stats-epoch.sh <off-arm-artefact>.txt <on-arm-artefact>.txt
+```
+
+Run this on any pair of same-corpus artefacts you are about to diff against
+each other (a flag-OFF/flag-ON pair, or an OFF baseline re-taken after a
+values sweep against the one it is meant to replace). Exit 0 means both
+carry the identical `# stats-epoch:` fingerprint — the statistics an
+estimate or a cost was computed against did not move between the two
+captures. Exit 1 means either the epochs differ (statistics were
+re-sampled in between — R120 §6's drift) or one side is
+`UNKNOWN(reason)` (the fingerprint probe itself failed, so equality cannot
+be asserted either way); the message names which file and prints both
+values. Exit 2 is an operational failure (missing file, or a file that
+predates M0137-0002/-0006 and carries no stamp at all).
+
+This does **not** apply to the goopg-vs-PG comparison in §4 below — the two
+engines' `# stats-epoch:` values are never expected to match (different
+software, different `pg_stat_user_tables` population), and `pg-plan-parity-diff.py`
+does not read the field. It applies to a same-corpus, same-engine,
+different-arm-or-time comparison: exactly the "did the OFF baseline drift"
+question R120 could only answer by hand.
+
+### 4. Compare (goopg vs PG)
 
 ```bash
 python3 scripts/pg-plan-parity-diff.py <goopg>.plans.txt <pg>.plans.txt [--verbose]
@@ -202,9 +234,11 @@ remains optional future polish.
 
 - **The TPC-DS `match=2` vs `match=1` reference question** is named, not
   resolved — M0137-0004.
-- **The stats-epoch declaration is not yet a checked/enforced step** — that
-  is M0137-0006; this doc only tells a reader which tool to run, not how to
-  verify after the fact that nobody re-sampled statistics mid-campaign.
+- ~~The stats-epoch declaration is not yet a checked/enforced step~~ — landed
+  by M0137-0006 (`scripts/check-stats-epoch.sh`, §4a above); `estimate-audit`
+  now also stamps `# stats-epoch:` into `<label>.txt`, using the same
+  fingerprint formula as `capture-stamp.sh` so the two tools' artefacts are
+  directly comparable.
 - **`TPCH_QUERY_DIR`'s corpus is not relocated into git tracking** — accepted
   as optional polish now that it is off the baseline critical path (§5).
 - **No production planner/executor/catalog code was touched.** This is a

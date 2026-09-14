@@ -52,3 +52,62 @@ func TestSelectQueriesRejectsMalformedSpecs(t *testing.T) {
 		}
 	}
 }
+
+// TestHashStatsEpochRowsMatchesCaptureStampFormula pins the M0137-0006
+// fingerprint format to the SAME formula scripts/lib/capture-stamp.sh's
+// _capture_stamp_stats_epoch uses: sha256 over "relname|n_live_tup\n" rows
+// (ordered by relname, one trailing newline after the last row), first 16
+// hex chars. The want value was hand-verified against the bash formula
+// itself (`sha256sum <<<"${res}" | cut -c1-16` on "nation|25\nregion|5\n").
+// A mismatch here means an estimate-audit epoch and a
+// capture-tpch.sh/capture-tpcds.sh epoch would silently stop being
+// comparable by scripts/check-stats-epoch.sh even when the underlying
+// statistics are identical — exactly the false-drift-signal class M0137-0006
+// exists to prevent.
+func TestHashStatsEpochRowsMatchesCaptureStampFormula(t *testing.T) {
+	got := hashStatsEpochRows([]statsEpochRow{
+		{relname: "nation", nLiveTup: 25},
+		{relname: "region", nLiveTup: 5},
+	})
+	const want = "cd91584b25f11563"
+	if got != want {
+		t.Fatalf("hashStatsEpochRows = %q, want %q (cross-tool fingerprint format diverged)", got, want)
+	}
+}
+
+// TestHashStatsEpochRowsOrderSensitive: the SQL side orders by relname so two
+// captures of the SAME statistics always hash the rows in the same order;
+// this pins that the hash function itself does not silently re-sort or
+// otherwise mask a genuine ordering difference, which would hide a real
+// stats change instead of surfacing it as a mismatch.
+func TestHashStatsEpochRowsOrderSensitive(t *testing.T) {
+	a := hashStatsEpochRows([]statsEpochRow{{relname: "nation", nLiveTup: 25}, {relname: "region", nLiveTup: 5}})
+	b := hashStatsEpochRows([]statsEpochRow{{relname: "region", nLiveTup: 5}, {relname: "nation", nLiveTup: 25}})
+	if a == b {
+		t.Fatalf("hashStatsEpochRows ignored row order: both orderings hashed to %q", a)
+	}
+}
+
+// TestStatsEpochLineOfflineReplayIsUnknown: --from-plans has no live
+// connection, so the epoch must degrade to an explicit UNKNOWN(reason)
+// rather than silently omit the line or (worse) hang trying to dial a port
+// that was never given.
+func TestStatsEpochLineOfflineReplayIsUnknown(t *testing.T) {
+	f := &flags{fromPlans: "some.plans.txt"}
+	got := statsEpochLine(f)
+	if !strings.HasPrefix(got, "# stats-epoch: UNKNOWN(offline replay via --from-plans") {
+		t.Fatalf("statsEpochLine(--from-plans) = %q, want an UNKNOWN(offline replay...) line", got)
+	}
+}
+
+// TestStatsEpochLineUnreachablePortIsUnknown: a live run whose stats-epoch
+// probe cannot reach the server must not crash the whole audit (a run that
+// may have just cost a full TPC-H power run) — it degrades to UNKNOWN(reason)
+// the same way renderEnum degrades on a missing enum-trace log.
+func TestStatsEpochLineUnreachablePortIsUnknown(t *testing.T) {
+	f := &flags{host: "127.0.0.1", port: 1, db: "nope", user: "nope", pass: "nope"}
+	got := statsEpochLine(f)
+	if !strings.HasPrefix(got, "# stats-epoch: UNKNOWN(") {
+		t.Fatalf("statsEpochLine(unreachable) = %q, want an UNKNOWN(...) line, not a crash", got)
+	}
+}
