@@ -800,10 +800,29 @@ before/after proving the defect it closes.
     `docs/design/0100-0149/m0137-0008-round-corpus-index.md`. No production
     code touched; no ledger row (retrieval tooling over already-written
     reports).
-- [ ] **M0137-0009 — retire the flag and ledger debt** — delete
+- [x] **M0137-0009 — retire the flag and ledger debt** — delete
   `GOOPG_HASHAGG_WIDTH_CURRENCY` (R124 §7 resolved its promote-or-delete to **delete**;
   it ships default-OFF and net-negative), state the default-off arm cap in the harness,
   and close or delete each ledger item carried unretired for ten or more rounds.
+  - DONE 2026-09-15 (flag + cap clauses): `internal/optimizer/hashagg_widthcurrency.go`
+    and its test file deleted; `cost_funcs.go`'s HashAggregate spill arm permanently
+    reverted to the flag's former OFF arithmetic (bare `inAvgVarBytes` as the tuple
+    width, a known residual PG-currency divergence the doc comment now names,
+    pointing at K65/K66 ncols-narrowing as the real fix); `flaglabels.go` moves the
+    flag into `flagProvenanceRetired["GOOPG_HASHAGG_WIDTH_CURRENCY"] = "M0137-0009"`
+    (the same pattern used for the five prior retired flags); `scripts/planner-flags.env`
+    regenerated. `AGENT.md`'s harness "Known-stale claims" bullet now states R121 §6's
+    never-landed norm verbatim (a default-off cost arm needs an explicit expiry; past
+    ~4 at once is debt) and corrects the count to **two** arms at HEAD
+    (`GOOPG_PG_HASH_TUPLE_SPILL_COST`, `GOOPG_PG_SORT_RELATION_BYTES_COST`).
+    `go build`/`go test ./internal/optimizer/...` clean. Design doc
+    `docs/design/0100-0149/m0137-0009-retire-hashagg-width-currency.md`.
+  - The third clause (ten-plus-round ledger carry, `03-process-retrospective.md` P7)
+    is SPLIT OUT to **M0137-0013** below rather than attempted in the same loop — see
+    the design doc's "What landed" §3 for why (ten independent per-item
+    determinations across `TODO.md`'s round history is campaign-sized, a different
+    kind of task from a single already-adjudicated flag deletion; the harness's own
+    R121-vs-R108/R113/R120 distinction warns against flattening the two).
 - [ ] **M0137-0011 — root-cause the second display/estimator seam (C3/K63)** — R76 P1
   saw Q22 display rows 16,666 against a stamped 18,200 and called it "a second
   estimator seam"; R77 took the post-pass branch and noted "gates did not complain",
@@ -826,6 +845,22 @@ before/after proving the defect it closes.
   masked on current data only because `78 < 100`. The census counts `Filter:` /
   `Index Cond:` lines per query and diffs them between arms; it becomes the gate every
   M0139 slice runs.
+- [ ] **M0137-0013 — close or delete the ten-plus-round ledger carries (filed
+  2026-09-15, split out of M0137-0009)** — `03-process-retrospective.md` P7's
+  "Ledger carry" finding: *"the same items appear verbatim across ten-plus rounds:
+  R51 items 2–3, R52 §4.2, R54 follow-ups, '#6', R61-#4, the NLI staleness comment,
+  R55 §3 tie-break, F3 procost, the Q8 gap, AGG_MIXED"* — and R67 §3's own
+  legislation against the pattern went unenforced (*"the carry continued"*). For
+  each named item: re-open the `TODO.md` round entries that carry it forward,
+  determine whether a later round already discharged it (many of the surrounding
+  round headings in `TODO.md` already read LANDED — check whether the carried item
+  specifically was covered or just rode along), and either (a) close it with a
+  citation of the discharging round, (b) file it as a proper `.ralph/deferral_ledger.md`
+  row with a mechanism and resume point (M0137-0012's pattern), or (c) delete it as
+  stale/superseded with the reason recorded. Filing/determination only; no
+  speculative code change. This is the task M0137-0009's design doc
+  (`docs/design/0100-0149/m0137-0009-retire-hashagg-width-currency.md` §"What
+  landed" 3) explains was too large to fold into that task.
 
 ## M0138 — PG-faithful ANALYZE statistics (filed 2026-09-14)
 

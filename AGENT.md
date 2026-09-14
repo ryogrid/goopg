@@ -601,8 +601,17 @@ Each of these is contradicted by the tree at HEAD or by a later measurement:
   stale; at least one member was re-baselined by R51. Re-measure (M0140-0001).
 - **`bench/tpch/plans-pg/`** is a stale, serial fixture and is **not** a parity
   target (K9). The TPC-DS sibling's standing is M0137-0004's subject.
-- **"Four default-off cost arms"** — there are **three** at HEAD; R128 promoted
-  `GOOPG_NARROW_COST_INPUTS` to default ON.
+- **"Four default-off cost arms"** — there are **two** at HEAD:
+  `GOOPG_PG_HASH_TUPLE_SPILL_COST` (R108) and `GOOPG_PG_SORT_RELATION_BYTES_COST`
+  (R113). R128 promoted `GOOPG_NARROW_COST_INPUTS` to default ON, and M0137-0009
+  deleted `GOOPG_HASHAGG_WIDTH_CURRENCY` per R124 §7's promote-or-delete
+  resolution (the pairing hypothesis it was held for was refuted by measurement).
+  **The cap itself (R121 §6, previously "flagged for someone to move" and never
+  moved): a default-off cost arm is evidence, not a standing feature — past about
+  four of them accumulating at once they become debt, and each one carries an
+  explicit expiry (a measurement or a landed consumer) that resolves it to
+  promote or delete.** This is now that norm's home; do not let a new cost arm
+  join without one.
 - **`METHODOLOGY.md` §2 and `ROADMAP-to-all-match.md` §1–2 numeric tables** were
   superseded by `METHODOLOGY2.md`, which was superseded by `METHODOLOGY3`.
 - **`04-forward-plan.md` §1.2's proposed rule** — overruled by Q2 above.

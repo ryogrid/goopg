@@ -112,7 +112,8 @@ excluded from `pushConjunctTraced`, the same class as R56's Q78 defect).
 - `INDEX-by-query.md` and `INDEX-by-mechanism.md` exist and are cited by the
   first task scoped after them.
 - `GOOPG_HASHAGG_WIDTH_CURRENCY` is deleted; the default-off arm cap is stated
-  in the harness; the ten-plus-round ledger carries are each closed or deleted.
+  in the harness (both DONE, M0137-0009); the ten-plus-round ledger carries are
+  each closed or deleted (split out to M0137-0013, still open).
 - The qual-placement census and the duplicate-sensitive values check run as gate
   artefacts and are named in `AGENT.md`'s harness section.
 - The display-vs-consumed cost seam (C3/K63) is root-caused, so cost-bearing

@@ -421,7 +421,13 @@ func sortByteBranch(cp costParams, tuples, output, inputBytes, outputBytes float
 // through R120's edit of that very arm. `aggregateOp` still aggregates in
 // memory with no spill path; the arm's purpose is not to predict goopg I/O but
 // to express "this hash table does not fit", which the tail comment explains.
-// inNcols/inAvgVarBytes are LIVE inputs: they decide whether the arm fires.
+// inAvgVarBytes is a LIVE input: it decides whether the arm fires and prices
+// its entry width. inNcols is UNUSED within the arm as of M0137-0009 — it was
+// R120's corrected byte-currency input (GOOPG_HASHAGG_WIDTH_CURRENCY), deleted
+// per R124 §7's finding that the corrected currency, paired with ncols
+// narrowing, measured identically to R120's arm alone. The parameter is kept
+// (rather than re-plumbing every call site) for the K65/K66 ncols-narrowing
+// successor the tail comment names; it is not read until that work lands.
 func costAgg(cp costParams, strategy AggStrategy, inputRows, inputStartup, inputTotal float64, numGroupCols int, numGroups float64, nAggs int, inNcols int, inAvgVarBytes float64) Cost {
 	tuples := inputRows
 	if tuples < 0 {
@@ -482,36 +488,35 @@ func costAgg(cp costParams, strategy AggStrategy, inputRows, inputStartup, input
 	// Note the arm is INERT below the memory threshold: `hashAggSetLimits`
 	// returns early when the groups fit, which collapses nbatches to 1 and
 	// depth to 0, so a grouping that fits prices bit-identically to before.
-	// R120 — byte currency of this arm. `inAvgVarBytes` is the VARIABLE
-	// payload only, but `hashAggEntrySize`'s parameter is a tuple WIDTH and
-	// the `pages` term below cites `relation_byte_size(input_tuples,
-	// input_width)`. PG hands one and the same `input_width` to both
-	// (costsize.c:2801-2802, :2824), and the SORTED rival is priced in that
-	// same currency on both sides — PG via `cost_tuplesort`
+	// Byte currency of this arm (M0137-0009): `inAvgVarBytes` is the
+	// VARIABLE payload only, but `hashAggEntrySize`'s parameter is a tuple
+	// WIDTH and the `pages` term below cites `relation_byte_size
+	// (input_tuples, input_width)`. PG hands one and the same `input_width`
+	// to both (costsize.c:2801-2802, :2824), and the SORTED rival is priced
+	// in that same currency on both sides — PG via `cost_tuplesort`
 	// (costsize.c:1903), Goopg via `hashsize.EntryBytes` (48*ncols + 24 +
 	// avgVar) in `costSortRunWithWidth`. Supplying the payload alone here
-	// therefore priced the two aggregation rivals in different currencies and,
-	// because it under-states the entry, made `hashAggSetLimits` early-return
-	// so this arm went inert where PG spills. Default-off; OFF is
-	// bit-identical to the pre-R120 arithmetic. See
-	// r120-hashagg-width-currency/SCOPE.md (incl. §1a: this buys
-	// Goopg-internal consistency, NOT PG alignment).
-	widthCurrency := hashAggWidthCurrencyEnabled()
-	// Arm C: a fixed-width input (avgVar == 0) still has a real 48*ncols+24
-	// footprint, so the arm must be reachable on ncols alone.
-	armLive := inAvgVarBytes > 0
-	if widthCurrency {
-		armLive = inNcols > 0
-	}
-	if strategy == AggStrategyHashed && armLive {
-		// Arm B: the bare tuple width, since hashAggEntrySize adds its own
-		// MAXALIGN(SizeofMinimalTupleHeader) exactly as PG's
-		// hash_agg_entry_size does (nodeAgg.c:1706-1707).
-		entryWidth := inAvgVarBytes
-		if widthCurrency {
-			entryWidth = hashAggTupleWidth(inNcols, inAvgVarBytes)
-		}
-		entry := hashAggEntrySize(nAggs, entryWidth)
+	// therefore prices the two aggregation rivals in DIFFERENT currencies —
+	// a KNOWN, currently-accepted PG divergence, not an oversight. R120
+	// shipped a corrected currency (`hashAggTupleWidth`/`hashsize.EntryBytes`
+	// keyed on `inNcols`) behind default-off `GOOPG_HASHAGG_WIDTH_CURRENCY`,
+	// on the hypothesis that it needed pairing with ncols narrowing (R124) to
+	// be net-positive on TPC-DS. R124 §7 ran the pair and measured it
+	// identical to R120's arm alone — the pairing hypothesis was refuted, so
+	// R124 resolved the flag's promote-or-delete to DELETE rather than
+	// carrying it another round (r124-nontable-leaf-widths/REPORT.md §7), and
+	// this block is that deletion: permanently the flag's former OFF arm.
+	// Closing the currency gap for real is the K65/K66 ncols-narrowing family
+	// (see the doc comment above), deliberately not restored here.
+	//
+	// Arm C from that history no longer applies: a fixed-width input
+	// (avgVar == 0) has a real 48*ncols+24 footprint in PG's currency, but
+	// this arm keys on the variable payload alone and so declines on such
+	// inputs.
+	if strategy == AggStrategyHashed && inAvgVarBytes > 0 {
+		// hashAggEntrySize adds its own MAXALIGN(SizeofMinimalTupleHeader)
+		// exactly as PG's hash_agg_entry_size does (nodeAgg.c:1706-1707).
+		entry := hashAggEntrySize(nAggs, inAvgVarBytes)
 		memLimit, ngroupsLimit, numPartitions := hashAggSetLimits(cp, entry, groups)
 		nbatches := math.Max(groups*entry/memLimit, groups/ngroupsLimit)
 		nbatches = math.Max(math.Ceil(nbatches), 1)
@@ -520,15 +525,9 @@ func costAgg(cp costParams, strategy AggStrategy, inputRows, inputStartup, input
 		}
 		depth := math.Ceil(math.Log(nbatches) / math.Log(float64(numPartitions)))
 		if depth > 0 {
-			// `relation_byte_size(input_tuples, input_width) / BLCKSZ`.
-			// Arm A: EntryBytes (= tuple width + RowSliceBytes 24) is the
-			// per-row `relation_byte_size` analogue — Goopg's 24-byte row
-			// header lines up with PG's MAXALIGN(SizeofHeapTupleHeader).
-			rowBytes := inAvgVarBytes
-			if widthCurrency {
-				rowBytes = hashsize.EntryBytes(inNcols, inAvgVarBytes)
-			}
-			pages := tuples * rowBytes / float64(blockSizeBytes)
+			// `relation_byte_size(input_tuples, input_width) / BLCKSZ`, in
+			// the same under-stated currency as `entry` above.
+			pages := tuples * inAvgVarBytes / float64(blockSizeBytes)
 			// "HashAgg has somewhat worse IO behavior than Sort on typical
 			// hardware/OS combinations" — PG's explicit generic penalty.
 			written := pages * depth * 2.0

@@ -142,12 +142,6 @@ var flagResolvedState = map[string]func(string) string{
 	"GOOPG_PG_SORT_RELATION_BYTES_COST": func(v string) string {
 		return onOff(pgSortRelationBytesCostFromEnv(v))
 	},
-	// R120's HashAggregate spill-arm byte currency. Default-off and
-	// costing-only, but it decides whether the arm fires at all, so every A/B
-	// artefact must name which currency priced the aggregate.
-	"GOOPG_HASHAGG_WIDTH_CURRENCY": func(v string) string {
-		return onOff(hashAggWidthCurrencyFromEnv(v))
-	},
 	// A mode, not a boolean: the artefact carries the word an operator would
 	// export to reproduce the arm.
 	"GOOPG_NLI_COSTGATE": func(v string) string {
@@ -224,7 +218,8 @@ var flagProvenanceOrder = []string{
 	"GOOPG_PARTIAL_SORT_PATHS",
 	"GOOPG_PG_HASH_TUPLE_SPILL_COST",
 	"GOOPG_PG_SORT_RELATION_BYTES_COST",
-	// Joined at R120 (r120-hashagg-width-currency/SCOPE.md). Default `off`.
+	// Joined at R120 (r120-hashagg-width-currency/SCOPE.md), default `off`.
+	// Retired at M0137-0009 — see flagProvenanceRetired below.
 	"GOOPG_HASHAGG_WIDTH_CURRENCY",
 }
 
@@ -261,6 +256,13 @@ var flagProvenanceRetired = map[string]string{
 	// grouping-sets aggregate, so there is no source to share and nothing
 	// reads the variable.
 	"GOOPG_GS_SHARE_SOURCE": "M0125-0048",
+	// R120's HashAggregate spill-arm byte currency. R124 §7 ran it paired
+	// with ncols narrowing (the pairing it shipped waiting for) and measured
+	// it identical to R120's arm alone — the pairing hypothesis was refuted,
+	// so R124 resolved the flag's promote-or-delete to DELETE rather than
+	// carry it another round (r124-nontable-leaf-widths/REPORT.md §7).
+	// cost_funcs.go's spill arm is now permanently the flag's former OFF arm.
+	"GOOPG_HASHAGG_WIDTH_CURRENCY": "M0137-0009",
 }
 
 // FlagProvenanceTable is the authoritative list of planner env flags that a
