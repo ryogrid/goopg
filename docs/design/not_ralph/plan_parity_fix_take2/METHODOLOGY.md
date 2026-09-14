@@ -93,8 +93,13 @@ this section used to point at (`methodology/capture-tpch.sh` and
 `r2-instrument/capture-tpch.sh`, and their `-tpcds` siblings). Do not cite
 either round-directory copy in a new procedure.**
 
-`scripts/capture-tpch.sh <port> <db> <user> <out> <hdr>`
-`scripts/capture-tpcds.sh <port> <db> <user> <out> <hdr>`
+`scripts/capture-tpch.sh <port> <db> <user> <out> <hdr> [datadir]`
+`scripts/capture-tpcds.sh <port> <db> <user> <out> <hdr> [datadir]`
+
+**(M0137-0002, 2026-09-15): every capture is now machine-stamped** — pass the
+server's `[datadir]` (6th arg) to get a populated `# engine-binary:` line
+(path/inode/PID); omit it and that line reads an explicit
+`UNKNOWN(no datadir given)`. See `docs/design/0100-0149/m0137-0002-capture-machine-stamp.md`.
 
 Non-obvious requirements, each of which has burned a round:
 

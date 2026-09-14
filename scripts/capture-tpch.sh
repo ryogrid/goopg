@@ -22,15 +22,24 @@
 # derive the scratch path from the OUTPUT file's name, which is
 # caller-chosen and constant across repeats, never from $$.
 #
-# usage: capture-tpch.sh <port> <db> <user> <outfile> <header>
+# Every capture is also machine-stamped (M0137-0002): engine-id, repo HEAD,
+# planner-flags arm, pinned GUCs, serving-binary path/inode/PID and a
+# stats-epoch fingerprint, written by scripts/lib/capture-stamp.sh instead of
+# resting on the caller's hand-typed <header> the way R122 §10 found it. The
+# binary/PID stamp needs the server's datadir; pass it as an optional 6th arg
+# or it reads UNKNOWN(no datadir given) rather than guessing.
+#
+# usage: capture-tpch.sh <port> <db> <user> <outfile> <header> [datadir]
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 PG_BIN="${PG_BIN:-${REPO_ROOT}/postgres/local_install/bin}"
 export PATH="${PG_BIN}:${PATH}"
+# shellcheck disable=SC1091
+source "${SCRIPT_DIR}/lib/capture-stamp.sh"
 
-PORT="$1"; DB="$2"; USER="$3"; OUT="$4"; HDR="$5"
+PORT="$1"; DB="$2"; USER="$3"; OUT="$4"; HDR="$5"; DATADIR="${6:-}"
 
 # NOT git-tracked (deferral ledger M0137-0001, 2026-09-15): the durable query
 # source is the Go package internal/testutil/tpch (also what
@@ -42,9 +51,13 @@ Q="${TPCH_QUERY_DIR:-/tmp/parity-r0/queries/tpch}"
 Q15A="${TPCH_Q15A_FILE:-/tmp/parity-r0/q15a.sql}"
 
 PIN=(-c "SET work_mem='64MB'" -c "SET max_parallel_workers_per_gather=4")
+PIN_DESC="work_mem=64MB max_parallel_workers_per_gather=4"
 
 : > "$OUT"
-echo "# ${HDR}" >> "$OUT"
+{
+    echo "# ${HDR}"
+    capture_stamp_block "$PORT" "$DB" "$USER" "$DATADIR" "$PIN_DESC" "$(basename "$OUT")"
+} >> "$OUT"
 
 run() {
     echo "=== $1" >> "$OUT"

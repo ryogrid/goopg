@@ -98,6 +98,43 @@ class CaptureIdempotentTest(unittest.TestCase):
             self.assertEqual(text1, text2,
                               "%s: two captures of an unchanged binary "
                               "diverged (K18 trap regressed)" % script)
+            # M0137-0002: the capture is machine-stamped, not left resting on
+            # the caller's hand-typed <header> alone (R122 §10's own words:
+            # arm attribution "rests entirely on filename convention"). No
+            # datadir was passed (5-arg call, matching every existing
+            # caller), so the binary/PID field must degrade to an explicit
+            # UNKNOWN rather than guess or silently omit itself.
+            for field in ("# engine-id: ", "# repo-head: ", "# planner-flags: ",
+                          "# pinned-GUCs: ", "# engine-binary: ", "# stats-epoch: "):
+                self.assertIn(field, text1,
+                              "%s: missing machine stamp field %r" % (script, field))
+            self.assertIn("# engine-binary: UNKNOWN(no datadir given", text1)
+            return text1
+
+    def _run_with_datadir(self, script, extra_env, qdir_env):
+        # Exercises the OTHER half of the M0137-0002 stamp: with a datadir
+        # (a real postmaster.pid), the binary/PID fields must be populated,
+        # not UNKNOWN — this is the "serving-PID /proc/<pid>/exe
+        # verification" the milestone's Definition of Done names explicitly.
+        with tempfile.TemporaryDirectory() as tmp:
+            env = self._stub_env(tmp)
+            env.update(qdir_env(tmp))
+            datadir = os.path.join(tmp, "data")
+            os.makedirs(datadir)
+            with open(os.path.join(datadir, "postmaster.pid"), "w") as fh:
+                fh.write("%d\n" % os.getpid())
+            out = os.path.join(tmp, "out.txt")
+            proc = subprocess.run(
+                [os.path.join(ROOT, "scripts", script),
+                 "5599", "db", "user", out, "capture-idempotent-test", datadir],
+                env=env, capture_output=True, text=True)
+            self.assertEqual(proc.returncode, 0,
+                              "%s failed: %s" % (script, proc.stderr))
+            with open(out) as fh:
+                text = fh.read()
+            self.assertIn("# engine-binary: pid=%d pid-alive=yes " % os.getpid(), text,
+                           "%s: datadir given but binary/PID stamp not populated" % script)
+            self.assertNotIn("# engine-binary: UNKNOWN", text)
 
     def test_capture_tpch_idempotent(self):
         def qdir_env(tmp):
@@ -114,6 +151,7 @@ class CaptureIdempotentTest(unittest.TestCase):
                 fh.write("select 1")
             return {"TPCH_QUERY_DIR": qdir, "TPCH_Q15A_FILE": q15a}
         self._run_twice("capture-tpch.sh", {}, qdir_env)
+        self._run_with_datadir("capture-tpch.sh", {}, qdir_env)
 
     def test_capture_tpcds_idempotent(self):
         def qdir_env(tmp):
@@ -125,6 +163,7 @@ class CaptureIdempotentTest(unittest.TestCase):
                 fh.write("select * from BADQUERY;")
             return {"TPCDS_QUERY_DIR": qdir}
         self._run_twice("capture-tpcds.sh", {}, qdir_env)
+        self._run_with_datadir("capture-tpcds.sh", {}, qdir_env)
 
 
 if __name__ == "__main__":

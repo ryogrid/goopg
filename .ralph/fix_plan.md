@@ -596,11 +596,28 @@ before/after proving the defect it closes.
     Design doc `docs/design/0100-0149/m0137-0001-capture-pipeline-k18-fix.md`.
     Deferred: TPC-H query source (`TPCH_QUERY_DIR`) still defaults to an untracked
     `/tmp` path — ledger row filed 2026-09-15, resume point M0137-0003.
-- [ ] **M0137-0002 — machine-stamp every capture artefact** — binary path, inode,
+- [x] **M0137-0002 — machine-stamp every capture artefact** — binary path, inode,
   serving-PID `/proc/<pid>/exe` verification, flag arm, pinned GUCs and stats epoch,
   written by the tool. R122 §10's own words are the defect: the headline arm
   attribution "rests entirely on filename convention". This is the gap that let a
   flag-OFF run be cited as ON evidence (R120 B1).
+  - DONE 2026-09-15: `scripts/lib/capture-stamp.sh` (new) sourced by both
+    capture scripts, reusing `scripts/lib/bench-engine-id.sh` and
+    `scripts/planner-flags.sh` (the TPC-DS SF0.25 sweep's already-proven
+    provenance machinery) instead of a new format. Appends `# engine-id:`,
+    `# repo-head:`, `# planner-flags:`, `# pinned-GUCs:`, `# engine-binary:`,
+    `# stats-epoch:` to every capture header. Both scripts gained an optional
+    6th `[datadir]` arg so `# engine-binary:` can read `<datadir>/postmaster.pid`
+    and report `pid=/pid-alive=/path=/inode=/sha=`; omitted, it reads
+    `UNKNOWN(no datadir given)` rather than guessing. `# stats-epoch:` hashes
+    `(relname, n_live_tup)` over `pg_stat_user_tables` (a fingerprint, not
+    `last_analyze` — goopg's is always NULL) via a K18-safe deterministic
+    scratch file. Every field degrades to an explicit `UNKNOWN(reason)`,
+    verified for 3 failure modes. `capture-idempotent-test.py` extended
+    2->4 tests (stamp-field presence + populated-vs-UNKNOWN binary line).
+    Design doc `docs/design/0100-0149/m0137-0002-capture-machine-stamp.md`.
+    Deferred to M0137-0006: turning the stats-epoch stamp into a checked/
+    enforced step rather than a passive artefact field.
 - [ ] **M0137-0003 — write the canonical baseline-capture procedure** — record that
   TPC-H baselines come from `estimate-audit -plan-only`, **not** `capture-tpch.sh`
   (which opens a fresh session per query and never ANALYZEs, so it captures TPC-H
