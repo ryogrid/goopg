@@ -1288,18 +1288,30 @@ that comment names as parity-inert.
     `minimize_datum` (still NOT APPROVED TO START). Design doc:
     `docs/design/0100-0149/m0139-s3-k67-residue-measurement.md`. No
     ledger row (no PG-incompatibility surfaced).
-- [ ] **M0139-0004 — re-measure the "duplicate hash build map" premise, then act on
+- [x] **M0139-0004 — re-measure the "duplicate hash build map" premise, then act on
   what you find** — `minimize_datum/05-work-estimate.md` §1.5 (quoting `02` §3) prices a
   "delete the duplicate build map" win at "one commit", claiming `lazyHash` **and**
-  `lazyIntHash` are both maintained for ~2x peak build memory. **That premise appears
-  stale at HEAD:** `lazyHashInsertDatum` (`internal/executor/operators_join_agg.go:1238-1254`)
-  files into `lazyIntHash` **and returns**, or falls through to `lazyHash`, and
-  `demoteIntHash` (`:1325-1338`) migrates then sets `o.lazyIntHash = nil` — they read as
-  mutually exclusive lanes with no simultaneous double-retention. Verify that by
-  measurement before deleting anything; the int lane exists for speed and `demoteIntHash`
-  is its fallback. If the premise is refuted, **the deliverable is a ledger row recording
-  the refutation** and a correction to `minimize_datum/05` §1.5, not a code change.
-  Independent of the slices; take it whenever a slice is blocked.
+  `lazyIntHash` are both maintained for ~2x peak build memory.
+  - DONE 2026-09-15 (recon, no production diff): confirmed the premise **refuted**
+    at HEAD. `buildLazyHashTable` decides the lane once, before the first row,
+    from the plan's static key types (`operators_join_agg.go:651`);
+    `presizeLazyHash` allocates exactly one of the two maps (pinned by
+    pre-existing `join_presize_test.go` tests); every insert commits to one
+    lane per call; the only place both maps are ever non-nil is
+    `demoteIntHash`'s own transient copy loop — a rare fallback for a static
+    int64-key promise turning out false mid-build, not a standing property of
+    the routine path (pinned by `TestPresizedIntTableStillDemotes` and
+    `dense_build_cut2_test.go`). The parallel/cooperative build path reuses
+    the same presize/insert functions rather than re-deriving the lane logic.
+    Corrected `minimize_datum/05-work-estimate.md` §1.5's table row and the
+    originating claim in `02-goopg-current-representation.md` §3 (both now
+    marked refuted, citing the design doc). Does not decide or advance
+    `minimize_datum` (still NOT APPROVED TO START) — removes one stale input
+    from a document feeding a future owner decision. Design doc:
+    `docs/design/0100-0149/m0139-0004-duplicate-hash-map-refutation.md`. No
+    `.ralph/deferral_ledger.md` row (not a PG-incompatibility, out of that
+    ledger's scope; refutation recorded in the design docs directly, per the
+    M0139-S3 precedent).
 - [ ] **M0139-0005 — re-measure Q4's grouping election** — R81 located the divergence
   one rel above the grouping contest, in `electOrderedGrouping`
   (`upperorderedgrouping.go:148`), on a startup ratio against `stdFuzzFactor = 1.01`:

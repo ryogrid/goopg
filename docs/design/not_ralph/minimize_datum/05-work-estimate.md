@@ -37,7 +37,7 @@ compared here:
 
 | intervention | evidence | est. size | est. value |
 |---|---|---|---|
-| **Delete the duplicate build map** | 02 §3: `lazyHash` **and** `lazyIntHash` are both maintained, so "peak build memory on the int-key path is ~2×". take2 07 §6 lists it separately | **one commit** | **~2× on the build side** |
+| ~~**Delete the duplicate build map**~~ **REFUTED (M0139-0004, 2026-09-15)** | ~~02 §3: `lazyHash` **and** `lazyIntHash` are both maintained, so "peak build memory on the int-key path is ~2×". take2 07 §6 lists it separately~~ — re-measured against HEAD: the two fields are mutually-exclusive lanes chosen **once**, before the first build row, from the plan's static key types (`operators_join_agg.go:651`); `presizeLazyHash` allocates exactly one of them and every insert commits to that one lane. The only place both are ever non-nil is `demoteIntHash`'s own transient copy loop (a rare fallback for a static int64-key promise turning out false mid-build), not a standing property of the routine int-key path. There is nothing to delete. Detail: `docs/design/0100-0149/m0139-0004-duplicate-hash-map-refutation.md` | ~~one commit~~ n/a | ~~~2× on the build side~~ **0 — premise did not hold** |
 | **Fix probe-seam re-materialisation** | take2 07 §6: "the hash cascade re-materialises its probe input at every level, twice, on both execution paths; the pooled row is never released on the legacy path… ~18 M pool round-trips and ~2×2.3 GB of `Datum` traffic on a Q9-class query" | bounded, unscoped | large, same query |
 | **The 24 B pointer-free `Datum`** | `docs/design/perf-optimize/02-datum-pointer-free.md` targets **24 B (2×)**, and is partially landed (Kind→1 byte, `Big` removed, `ArenaID` added). What remains is `Buf []byte`, which §3 shows is already hidden behind ~43 non-test references | small, by §3's own numbers | **2×**, not the ~33 % 04 §0.1 prices |
 | **this bundle** | 04 §0.3 | ~1,750–3,050 LOC, 14 commits | ~5× of a ~48× width gap |
@@ -58,7 +58,11 @@ Two further observations from the same review:
   costs +23.1 %.
 - Deleting the duplicate build map is **not** in 04 §4.1. That section instead
   lists both maps as two things to *convert*, doubling this bundle's own Tier A
-  work.
+  work. (The "duplicate" framing itself is now refuted — see the table row
+  above; 04 §4.1's Tier A count of 6 fields across the two lanes is otherwise
+  unaffected, since `lazyHash` and `lazyIntHash` are still two distinct struct
+  fields that would each need a conversion, whether or not they are ever
+  populated simultaneously.)
 
 ---
 
