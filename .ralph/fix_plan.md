@@ -140,6 +140,21 @@ heuristic stays live.)
   AI-ids appended per the "do not add another" rule. Evidence for all:
   `ci/logs/20260905-011015/`.)
 
+### Manually discovered (not yet in a nightly `ci/logs/action-items.md` run) — filed 2026-09-15
+- [ ] **parser/TestLockingClauseParity** — deterministic FAIL, found while
+  running the M0137-0001 pre-commit gate (`RALPH_PRECOMMIT_SCOPE=units
+  scripts/ralph-precommit-test.sh`; unrelated to that task's scripts/docs-only
+  diff). `internal/parser/ast.go`'s `RangeVar.GroupedJoinUnaliased` field
+  (added by `dc91bd6b7` "fix(planner): preserve grouped USING bindings for
+  lateral", 2026-09-13) is now emitted by the parser on every `FROM`-clause
+  `RangeVar`, but `yacc_locking_test.go`'s hand-written `want` AST literals
+  predate that field and don't set it, so every locking-clause case now
+  reads as "AST drift". Repro: `go test ./internal/parser/ -run
+  TestLockingClauseParity -v`. Likely fix: either the test's comparison
+  should ignore `GroupedJoinUnaliased` (it is not what the test is checking)
+  or its `want` literals need the field added — not investigated further,
+  out of scope for M0137-0001.
+
 ## Archived — complete (see `completed_milestones/completed_fix_plan_012.md`)
 
 M0130 (Cluster-directory compat with PG 18.3 + PG physical replication).
@@ -564,12 +579,23 @@ in the same commit). No new `rNNN-*` round directories; raw artefacts go under
 `analysis/m0137/`. Every instrument change lands with a test or a recorded
 before/after proving the defect it closes.
 
-- [ ] **M0137-0001 — promote the parity capture pipeline into `scripts/` and fix the K18 `$$` trap** — two divergent copies exist inside round directories
+- [x] **M0137-0001 — promote the parity capture pipeline into `scripts/` and fix the K18 `$$` trap** — two divergent copies exist inside round directories
   (`plan_parity_fix_take2/methodology/` and `.../r2-instrument/`), both embedding `$$`
   in the temp filename, which lands in Q36/Q70/Q86's psql ERROR text and makes any two
   runs diff spuriously. Land one canonical copy under `scripts/`, fix the trap at
   source, and add a test that two consecutive captures of an unchanged binary diff
   empty. Retire the round-directory copies from every procedure.
+  - DONE 2026-09-15: `scripts/capture-tpch.sh` + `scripts/capture-tpcds.sh` landed
+    (5-arg `<port> <db> <user> <out> <hdr>` signature, `REPO_ROOT`/`PG_BIN`-relative
+    PATH like `pg-oracle-diff.sh`, TPC-DS sections normalised to `=== Qn` at capture
+    time). Scratch filename now derives from `$(basename "$OUT")`, never `$$`.
+    `scripts/capture-idempotent-test.py` stubs `psql` (no live cluster) and asserts
+    two captures into the same `$OUT` are byte-identical; manually verified it fails
+    against a reintroduced `$$` trap. `METHODOLOGY.md` §4.1 updated to point at the
+    new scripts; round-directory copies left as frozen history, not edited.
+    Design doc `docs/design/0100-0149/m0137-0001-capture-pipeline-k18-fix.md`.
+    Deferred: TPC-H query source (`TPCH_QUERY_DIR`) still defaults to an untracked
+    `/tmp` path — ledger row filed 2026-09-15, resume point M0137-0003.
 - [ ] **M0137-0002 — machine-stamp every capture artefact** — binary path, inode,
   serving-PID `/proc/<pid>/exe` verification, flag arm, pinned GUCs and stats epoch,
   written by the tool. R122 §10's own words are the defect: the headline arm

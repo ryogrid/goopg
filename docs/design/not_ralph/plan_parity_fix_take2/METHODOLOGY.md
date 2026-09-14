@@ -88,8 +88,13 @@ watching the log grow — the trace has no query id.
 
 ### 4.1 Capture (both engines, identical script)
 
-`methodology/capture-tpch.sh <port> <db> <user> <out> <hdr>`
-`methodology/capture-tpcds.sh <port> <out> <hdr>`
+**(M0137-0001, 2026-09-15): promoted to `scripts/`, retiring the two copies
+this section used to point at (`methodology/capture-tpch.sh` and
+`r2-instrument/capture-tpch.sh`, and their `-tpcds` siblings). Do not cite
+either round-directory copy in a new procedure.**
+
+`scripts/capture-tpch.sh <port> <db> <user> <out> <hdr>`
+`scripts/capture-tpcds.sh <port> <db> <user> <out> <hdr>`
 
 Non-obvious requirements, each of which has burned a round:
 
@@ -100,13 +105,20 @@ Non-obvious requirements, each of which has burned a round:
   planning).
 - **`SET` command tags are stripped** (`grep -vx SET`) — they parse as a
   plan node named `SET`.
-- **The temp SQL filename is FIXED**, never `mktemp` (K18): the path
-  appears in psql ERROR text for the unplannable queries, so a random
-  name makes two byte-identical captures diff.
-- TPC-H sections are `=== Qn`, with `Q15` replaced by `Q15a-VIEWBODY`
-  (the CREATE VIEW has no plan shape); TPC-DS sections are
-  `===== Qn =====` and multi-statement files need the per-statement
-  EXPLAIN split. Q36/70/86 fail to parse on *both* engines.
+- **The temp SQL filename is derived from `$out`, never `$$`** (K18, fixed
+  by M0137-0001): both retired copies used `parity-capture-$$.sql`, and
+  their own comments mislabelled this "fixed" — it is not, `$$` is the
+  capturing *process's* PID and differs on every invocation. The path
+  appears in psql ERROR text for the unplannable queries, so the PID
+  leaked into the capture and made two otherwise-identical captures diff
+  (this actually happened: R122, R123, R124, R128). `scripts/capture-idempotent-test.py`
+  guards the fix with a stubbed-psql regression test — no live cluster
+  needed to run it.
+- TPC-H and TPC-DS sections are both normalised to `=== Qn` (matching
+  `scripts/pg-plan-parity-diff.py`'s `SECTION_RE`), with TPC-H `Q15`
+  replaced by `Q15a-VIEWBODY` (the CREATE VIEW has no plan shape); TPC-DS
+  multi-statement files need the per-statement EXPLAIN split. Q36/70/86
+  fail to parse on *both* engines.
 
 ### 4.2 The PG reference must be captured LIVE
 
@@ -130,8 +142,11 @@ TIMEOUT`.
   `MISSING-NODE` in R2 precisely because conflating them asserted
   something much stronger than the evidence supported.
 - `MISSING-NODE` means a PG node kind goopg provably cannot emit.
-- TPC-DS needs section normalisation first:
-  `sed -E 's/^=====[[:space:]]*(Q[0-9]+)[[:space:]]*=====$/=== \1/'`
+- TPC-DS needed section normalisation before a capture with `=== Qn`
+  sections existed: `sed -E 's/^=====[[:space:]]*(Q[0-9]+)[[:space:]]*=====$/=== \1/'`.
+  `scripts/capture-tpcds.sh` (M0137-0001) now emits `=== Qn` directly, so
+  this step is unnecessary for anything captured with it — only needed for
+  pre-M0137-0001 artefacts still on disk.
 
 `scripts/tpcds-plan-diff.py` is **byte** equality — a goopg-vs-goopg
 movement detector only. It can never be a parity criterion, because
