@@ -103,11 +103,11 @@ placeholder is a comment, not a checkbox, so the plan-complete exit
 heuristic stays live.)
 
 ### Nightly run 20260901-010436 (sha `d93fb9edc669`, 7 items) — filed 2026-09-01
-- [ ] **testport/TestPort_PgStatActivity (AI-20260901-010436-005, AI-20260905-011015-007)**.
-- [ ] **testport/TestSyntax_Catalog_PgStatActivity (AI-20260901-010436-007, AI-20260905-011015-009)**.
+- [ ] **testport/TestPort_PgStatActivity (AI-20260901-010436-005, AI-20260905-011015-007, AI-20260914-235643-010)**.
+- [ ] **testport/TestSyntax_Catalog_PgStatActivity (AI-20260901-010436-007, AI-20260905-011015-009, AI-20260914-235643-012)**.
 
 ### Nightly run 20260902-005256 (sha `c11e55d253ff`, 8 items) — filed 2026-09-02
-- [ ] **testport/TestE2E_PGColdStartOnGoopgDataDir (AI-20260902-005256-001, AI-20260905-011015-002)**. New
+- [ ] **testport/TestE2E_PGColdStartOnGoopgDataDir (AI-20260902-005256-001, AI-20260905-011015-002, AI-20260914-235643-004)**. New
   tonight; possibly the M0131-S4 "FAIL-WHEN-FIXED" assertion flipping red
   because a Theme F fix landed rather than a real regression — re-run repro
   and check the M0131 Theme F findings list before treating as a bug.
@@ -121,24 +121,61 @@ heuristic stays live.)
   line filed for those per the "do not add another" rule.)
 
 ### Nightly run 20260905-011015 (sha `2e3deb52ba73`, 9 items) — filed 2026-09-11
-- [ ] **race/internal/executor (AI-20260905-011015-001)** — race suite failed
+- [ ] **race/internal/executor (AI-20260905-011015-001, AI-20260914-235643-002)** — race suite failed
   in `internal/executor` (also failed previous run; repro: `go test -race
   -timeout 45m ./internal/executor/`).
-- [ ] **testport/TestPort_IsolationIntraGrantInplace (AI-20260905-011015-003)** —
+- [ ] **testport/TestPort_IsolationIntraGrantInplace (AI-20260905-011015-003, AI-20260914-235643-006)** —
   FAILed, also failed previous run (repro: `go test -v -run
   '^TestPort_IsolationIntraGrantInplace$' ./internal/testport/`).
-- [ ] **testport/TestPort_IsolationStats (AI-20260905-011015-004)** — FAILed,
+- [ ] **testport/TestPort_IsolationStats (AI-20260905-011015-004, AI-20260914-235643-007)** — FAILed,
   also failed previous run (same testport repro pattern).
-- [ ] **testport/TestPort_LockRowsSortOverJoinTakesRowLock (AI-20260905-011015-005)** —
+- [ ] **testport/TestPort_LockRowsSortOverJoinTakesRowLock (AI-20260905-011015-005, AI-20260914-235643-008)** —
   FAILed subtests: join_no_sort, also failed previous run.
-- [ ] **testport/TestPort_PgDumpConnectionSetup (AI-20260905-011015-006)** —
+- [ ] **testport/TestPort_PgDumpConnectionSetup (AI-20260905-011015-006, AI-20260914-235643-009)** —
   FAILed, also failed previous run.
-- [ ] **testport/TestPort_RegressSuite (AI-20260905-011015-008)** — FAILed
-  subtests: limit, numerology, also failed previous run.
+- [ ] **testport/TestPort_RegressSuite (AI-20260905-011015-008, AI-20260914-235643-011)** — FAILed
+  subtests: limit, numerology, also failed previous run; 20260914-235643 adds subtests time, timetz.
   (Remaining 3 items — PGColdStart AI-…-002, PgStatActivity AI-…-007,
   Syntax_Catalog_PgStatActivity AI-…-009 — already have open tasks above;
   AI-ids appended per the "do not add another" rule. Evidence for all:
   `ci/logs/20260905-011015/`.)
+
+### Nightly run 20260914-235643 (sha `baf40efcbfbd`, 14 items) — filed 2026-09-15
+- [ ] **units/internal/parser (AI-20260914-235643-001)** — new tonight, units suite
+  failed to build/run `internal/parser` (repro: `go test -timeout 10m
+  ./internal/parser/`). Likely the same root cause as this file's own
+  "Manually discovered" `parser/TestLockingClauseParity` entry below (filed the
+  same day from an interactive gate run) — re-run both repros together before
+  treating as two separate bugs.
+- [ ] **race/internal/parser (AI-20260914-235643-003)** — new tonight, race suite
+  failed in `internal/parser` (repro: `go test -race -timeout 45m
+  ./internal/parser/`). Same likely-shared root cause note as the item above.
+- [ ] **testport/TestPort_IsolationEvalPlanQual (AI-20260914-235643-005)** — new
+  tonight, FAILed (repro: `go test -v -run '^TestPort_IsolationEvalPlanQual$'
+  ./internal/testport/`).
+- [ ] **units/build-broke-mid-stage (AI-20260914-235643-013)** and
+  **race/build-broke-mid-stage (AI-20260914-235643-014)** — `[infra]`, not
+  regressions per the nightly bot's own classification: 1 package failed to
+  *compile* in each stage, first error
+  `bak/explain_bitmap_index_cond_test.go:30:64: undefined: explainNames`.
+  `bak/` is untracked scratch (git status `?? bak/`, not part of any commit),
+  so a clean checkout is unaffected; the nightly runner builds the live
+  working tree, so this is contamination from stray untracked files, not a
+  code regression. Re-run repro at HEAD before investigating further — `go
+  build ./...` is clean as of this filing (2026-09-15); `bak/`'s `_test.go`
+  only breaks a `go vet`/`go test` walk, not `go build` itself, which the
+  nightly bot's own repro line does not distinguish.
+  (Remaining 8 items of this run — race/internal/executor AI-…-002,
+  testport/TestE2E_PGColdStartOnGoopgDataDir AI-…-004,
+  testport/TestPort_IsolationIntraGrantInplace AI-…-006,
+  testport/TestPort_IsolationStats AI-…-007,
+  testport/TestPort_LockRowsSortOverJoinTakesRowLock AI-…-008,
+  testport/TestPort_PgDumpConnectionSetup AI-…-009,
+  testport/TestPort_PgStatActivity AI-…-010,
+  testport/TestPort_RegressSuite AI-…-011,
+  testport/TestSyntax_Catalog_PgStatActivity AI-…-012 — already have open
+  tasks above; AI-ids appended per the "do not add another" rule. Evidence
+  for all: `ci/logs/20260914-235643/`.)
 
 ### Manually discovered (not yet in a nightly `ci/logs/action-items.md` run) — filed 2026-09-15
 - [ ] **parser/TestLockingClauseParity** — deterministic FAIL, found while
@@ -648,11 +685,32 @@ before/after proving the defect it closes.
   - Left open, explicitly not this task's job: the TPC-DS `match=2` vs
     `match=1` reference question (M0137-0004) and turning the stats-epoch
     stamp into a checked step (M0137-0006).
-- [ ] **M0137-0004 — reconcile the TPC-DS `match=2` vs `match=1` discrepancy** — both
+- [x] **M0137-0004 — reconcile the TPC-DS `match=2` vs `match=1` discrepancy** — both
   figures come from the same capture-script family; the difference is the **reference
   and the session GUCs** (live PG `:65438` vs the committed `bench/tpcds/plans-pg`
   fixture), not the tool. Declare one canonical reference and rule on the fixture's
   standing the way K9 rules on the TPC-H one. Stop the programme quoting both numbers.
+  - DONE 2026-09-15: re-measured with the current canonical `scripts/capture-tpcds.sh`
+    (post K18-fix, post machine-stamping) against goopg SF0.25 `:65437` — **both**
+    live PG `:65438` and the committed `bench/tpcds/plans-pg` fixture now give
+    `match=2` (Q9, Q41). R128's `match=1` (captured with the since-retired
+    `methodology/capture-tpcds.sh`, pre-fix/pre-stamping) does not reproduce at HEAD.
+  - The only per-query divergence between the two references is Q2 and Q75 (both
+    non-MATCH either way): PG's own plan for these two flips between the fixture's
+    2026-09-11 capture and today's live capture (Hash Join/HashAggregate/Gather vs
+    Merge Join/GroupAggregate/Gather Merge) — PG-side tied-cost-margin oscillation
+    (N26's class), not a goopg-side change.
+  - Ruling: canonical reference = live PG `:65438` via `scripts/capture-tpcds.sh`.
+    Unlike K9's TPC-H fixture (categorically stale/serial), `bench/tpcds/plans-pg`
+    is not categorically wrong — it currently reproduces the same match count as
+    live PG — so it stays a valid secondary/regression reference (e.g. `make
+    plan-gate`) but is demoted from co-canonical to corroborating for parity-count
+    claims. AGENT.md's "Success criterion" floor updated to TPC-DS `match >= 2`;
+    `m0137-0003`'s doc's open-question caveat dropped.
+  - Design doc `docs/design/0100-0149/m0137-0004-tpcds-match-reference-reconciliation.md`.
+    `METHODOLOGY3/` left untouched (frozen 2026-09-14 stocktake). No production
+    code touched; no ledger row (Q2/Q75 is evidence about oracle stability, not an
+    unimplemented PG behaviour in goopg).
 - [ ] **M0137-0005 — re-baseline `make plan-gate`** — it is a goopg-vs-committed-goopg
   baseline pin (`Makefile:431-453`), **not** a diff against live PG, and its baseline
   has not been refreshed across ~125 rounds of intentional plan change. Land the

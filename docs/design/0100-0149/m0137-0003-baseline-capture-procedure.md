@@ -161,17 +161,14 @@ scripts/capture-tpcds.sh 65438 tpcds025 ryo \
   (`work_mem='64MB' max_parallel_workers_per_gather=4`, identical to
   `capture-tpch.sh`'s `PIN` array) — no cluster-config alignment step is
   needed for this half.
-- **Which reference is canonical is still an open question — M0137-0004,
-  not this task.** `METHODOLOGY3/README.md`'s executive summary states it
-  plainly: TPC-DS `match=2` comes from `capture-tpcds.sh` on `:65437` against
-  **live** PG `:65438`; `match=1` comes from the same family against the
-  committed `bench/tpcds/plans-pg` fixture. Both are reproducible; the
-  programme currently quotes both. This procedure names live `:65438` as the
-  worked example above because it is what the higher, more-recent number
-  (`match=2`) used, but **do not cite this doc as having settled the
-  reference question** — cite M0137-0004's own resolution once it lands, and
-  until then keep the non-regression floor at TPC-DS `match >= 1` per
-  AGENT.md's "Success criterion".
+- **Which reference is canonical is now settled — M0137-0004.** Live PG
+  `:65438` via `scripts/capture-tpcds.sh` (the worked example above) is
+  canonical; the committed `bench/tpcds/plans-pg` fixture is a corroborating
+  secondary reference, not co-canonical — see
+  `docs/design/0100-0149/m0137-0004-tpcds-match-reference-reconciliation.md`
+  for the measurement (both references agreed `match=2` as of 2026-09-15;
+  the `match=1` reading some earlier round reports quote did not reproduce).
+  AGENT.md's "Success criterion" floor is TPC-DS `match >= 2`.
 
 ### 4. Compare
 

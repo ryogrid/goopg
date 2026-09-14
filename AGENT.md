@@ -732,13 +732,15 @@ In the loop's report and in the task's design doc:
 fix flips a query: at the group's filing, non-matching queries differed from PG
 in several categories at once. Progress is **category movement**.
 
-**Keep the non-regression floor**: TPC-H match >= 6, and TPC-DS match >= the
-canonical figure **M0137-0004** declares — the programme currently quotes both 2
-(live-PG reference) and 1 (committed fixture), which is exactly what 0004 exists
-to settle, so the TPC-DS half of the floor is **re-pinned when 0004 lands**.
-Either way, none of the current matches may be lost. That floor is the one
-match-count clause the record shows earning its place — R120's caught the loss
-of Q10.
+**Keep the non-regression floor**: TPC-H match >= 6, and TPC-DS match >= 2
+(Q9, Q41) — the canonical figure **M0137-0004** declared, against live PG
+`:65438` via `scripts/capture-tpcds.sh`
+(`docs/design/0100-0149/m0137-0004-tpcds-match-reference-reconciliation.md`).
+The `match=1` reading some earlier round reports quote does not reproduce at
+HEAD (measured against both live PG and the committed `bench/tpcds/plans-pg`
+fixture, 2026-09-15) and should not be requoted as a live alternative. None
+of the current matches may be lost. That floor is the one match-count clause
+the record shows earning its place — R120's caught the loss of Q10.
 
 Values gates bind on every task: TPC-H digest byte-identical to the baseline arm,
 TPC-DS SF0.25 sweep all-zero. **A values break stops the task.**
