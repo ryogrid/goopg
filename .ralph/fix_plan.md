@@ -1312,11 +1312,39 @@ that comment names as parity-inert.
     `.ralph/deferral_ledger.md` row (not a PG-incompatibility, out of that
     ledger's scope; refutation recorded in the design docs directly, per the
     M0139-S3 precedent).
-- [ ] **M0139-0005 — re-measure Q4's grouping election** — R81 located the divergence
+- [x] **M0139-0005 — re-measure Q4's grouping election** — R81 located the divergence
   one rel above the grouping contest, in `electOrderedGrouping`
   (`upperorderedgrouping.go:148`), on a startup ratio against `stdFuzzFactor = 1.01`:
   goopg 1.0086 (inside fuzz, tie-break picks hashed) vs PG 1.0118 (outside, sorted
   wins). Report whether the narrowed widths move that ratio across the band.
+  - DONE 2026-09-15 (recon, no production diff): a throwaway probe
+    (private HEAD cluster, 20,000 orders, deleted before commit) plus
+    temporary debug instrumentation in `electOrderedGrouping` and
+    `narrowJoinLeg` (both fully reverted — `git diff --stat` empty at HEAD)
+    found **zero narrowing anywhere in Q4's subtree**: `narrowJoinLeg` is
+    never called at all for this query. Root cause: Q4's `EXISTS` is
+    decorrelated by `unnestExistsExpr` (`unnest.go:4078`), which builds the
+    physical `Join{SEMI, Hash}` node directly on the raw parse tree, before
+    any search joinrel exists — the same fork METHODOLOGY3 F11/K63
+    (R73-R77) already named for the costing symptom ("no SEMI path is ever
+    filed... before any search joinrel exists, so no sjinfo -> no joinrel
+    -> no path -> no price") — so it never reaches
+    `createHashJoinPlan`/`joinInputsFor`, the one call site
+    `narrowJoinLeg` is wired into. **Verdict: the ratio has not moved and
+    cannot move under the current mechanism** — Q4's grouping input width
+    is byte-identical to before M0139-S1/S2, independent of scale, so a
+    bigger-scale re-measurement would not be informative until the bypass
+    itself is fixed (a materially larger task, out of this recon's scope).
+    Secondary finding: at 20,000-order scale the two ORDERED-rel
+    candidates aren't even fuzzy-tied (one dominates outright in
+    `addPath`) — a separate scale-sensitivity note, not pursued further.
+    Feeds M0139-0006's owner packet alongside S3's residue finding — both
+    point at "the join-leg hook doesn't reach every join the search can
+    produce," from opposite ends. Design doc:
+    `docs/design/0100-0149/m0139-0005-q4-grouping-ratio-remeasurement.md`.
+    No ledger row: the narrowing-bypass finding is a corollary of the
+    already-tracked F11/K63/`m0137-0011` lineage, not a newly discovered
+    PG-incompatibility on its own.
 - [ ] **M0139-0006 — put the packed-retention decision to the owner** — carry S3's
   measured residue, `entrywidth.go`'s non-monotonicity finding, and the two blockers
   the `minimize_datum` review itself raised ("the premise was modelled, and the
