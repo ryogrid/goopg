@@ -1107,13 +1107,46 @@ unmeasured one does not.
     constant (anti-tuning rule).
   - Gates: `go build ./...` unaffected (no source changed this loop). No
     values-gate re-run needed — no production code touched.
-- [ ] **M0138-0006 — re-measure Q9's estimate against R130's table and reconcile the
-  ANALYZE seed** — Q9's actual output is 175 rows; goopg estimated 97 and PG estimates
-  60,125. **Moving toward PG's 60,125 is the expected result** and is the empirical
-  test of the Question 2 decision; if it does not move, that is the finding and M0142's
-  premise must be re-examined before slices are scoped. In the same task, reconcile
-  `GOOPG_ANALYZE_SEED`'s determinism with PG's own sequence — retire it, or document
-  why both must coexist.
+- [x] **M0138-0006 — re-measure Q9's estimate against R130's table and reconcile the
+  ANALYZE seed (DONE 2026-09-15)** — Q9's actual output is 175 rows; goopg estimated 97
+  and PG estimates 60,125. **Moving toward PG's 60,125 is the expected result** and is
+  the empirical test of the Question 2 decision; if it does not move, that is the
+  finding and M0142's premise must be re-examined before slices are scoped. In the same
+  task, reconcile `GOOPG_ANALYZE_SEED`'s determinism with PG's own sequence — retire it,
+  or document why both must coexist.
+  - Re-measured at HEAD (`estimate-audit -plan-only -queries 9`, pinned
+    `GOOPG_ANALYZE_SEED=20260905`, live `:65433`/`:65432` lanes): goopg's estimate moved
+    **97 → 146** — closer to the actual 175, **not toward PG's 60,125**. The
+    pre-registered prediction did NOT hold; M0142's premise needs re-examination, now
+    with a narrowed starting hypothesis instead of an open-ended one (see below).
+  - Leaf-level check: the `partsupp ⋈ part` join (filtered `p_name LIKE '%green%'`)
+    estimates now agree within 1.2x between engines (12,121/48,484 goopg vs
+    10,101/40,404 PG) — the underlying per-column statistics converged (consistent with
+    M0138-0005's corpus-wide `n_distinct` finding). The 344x top-level gap is therefore
+    NOT a residual statistics-precision gap of the kind M0138 targets.
+  - Hypothesis for M0142-0001/-0002 (not adjudicated here — recon-scoped, and forcing
+    shapes is against the milestone's goal): the gap is **join-shape-driven**. goopg
+    drives Q9 with FK-indexed Nested Loops (each probe correctly `rows=1`); PG runs an
+    all-Hash-Join chain where `eqjoinsel`/`calc_joinrel_size_estimate`
+    (`postgres/src/backend/utils/adt/selfuncs.c:2280`,
+    `postgres/src/backend/optimizer/path/costsize.c:5501`) compound independent
+    per-join selectivities down a correlated FK chain with no extended statistics.
+    Reproducing PG's estimate likely requires goopg to choose PG's Hash-Join shape
+    first — a join-order/method question, not an ANALYZE-precision one.
+  - `GOOPG_ANALYZE_SEED` reconciliation: confirmed against PG's actual source
+    (`analyze.c:1227`'s `pg_prng_uint32(&pg_global_prng_state)`, a process-global PRNG
+    with no reproducibility knob) — PG has nothing to retire the variable in favour of.
+    goopg's unset/zero path already reproduces PG's "fresh per-backend draw" property
+    exactly; the pinned path is a harness-only determinism knob with no PG counterpart.
+    **Verdict: keep, no code change** — the existing code comment was already correct.
+  - Design doc:
+    `docs/design/0100-0149/m0138-0006-q9-estimate-remeasure-and-seed-reconcile.md`.
+    Ledger row filed narrowing M0142-0001/-0002's starting hypothesis (see
+    `.ralph/deferral_ledger.md`, task-id `m0138-0006`).
+  - Gates: `go build ./...` unaffected (no source changed). No values-gate re-run
+    needed — no production code touched this loop.
+  - **M0138 is now fully landed and measured** (all six tasks [x]) — M0142's
+    prerequisite gate is satisfied; M0142-0001 becomes selectable.
 
 ## M0139 — Executor-side narrowing / projection pushdown (filed 2026-09-14)
 
