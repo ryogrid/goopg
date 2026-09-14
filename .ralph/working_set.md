@@ -1,82 +1,64 @@
-Task: M0138-0006 — re-measure Q9's estimate vs R130's table + reconcile
-`GOOPG_ANALYZE_SEED`. **COMPLETE and committed** this loop (`dc471b6d3`),
-branch `plan-parity-with-pg-take2-ralph`. **M0138 is now fully landed and
-measured (all six tasks [x])** — M0142's prerequisite gate is satisfied.
+Task: M0140-0001 — re-measure the R43-era failing test set under the
+`GOOPG_GATHER_PATHS` flip at HEAD. **COMPLETE and committed** this loop
+(`e64cab7`), branch `plan-parity-with-pg-take2-ralph`. Recon-only, no
+production code touched.
 
-Files: `docs/design/0100-0149/m0138-0006-q9-estimate-remeasure-and-seed-reconcile.md`
-(new), `docs/design/README.md` (+index row), `.ralph/fix_plan.md` (M0138-0006
-checked off + DONE summary), `.ralph/deferral_ledger.md` (1 new row,
-task-id `m0138-0006`), `.ralph/progress.json` (state-guard repair). No
-production code touched — measurement-only recon.
+Files: `docs/design/0100-0149/m0140-0001-gather-paths-flip-failing-set-remeasure.md`
+(new), `docs/design/README.md` (+index row), `.ralph/fix_plan.md`
+(M0140-0001 checked off + sub-bullets).
 
-What was done: built `/tmp/estimate-audit-m0138-0006`, ran
-`-plan-only -queries 9` against the already-running, already-seed-pinned
-(`GOOPG_ANALYZE_SEED=20260905`) `:65433`/`:65432` TPC-H lanes, compared the
-plan text's top-level row estimate to R130's table.
+What was done: ran the four R43-named tests
+(`TestSplitEqualityForHashMultiKey/searched_enumerator`,
+`TestSlice3LiveQ9ShapeDerivation`, `TestSlice3FilterColumnSurvivesNarrowing`
+in `internal/optimizer`, `TestOwnedBuildPoisonPrebuiltBoundary` in
+`internal/executor`) both at the default (`GOOPG_GATHER_PATHS` unset) and
+under `GOOPG_GATHER_PATHS=all` (none of the tests set the var internally, so
+the env-var flip alone reproduces what a default-on flip would change).
 
-Key findings (full detail in the design doc):
-  1. Q9's HEAD estimate moved **97 -> 146** (post M0138-0002/-0003/-0004),
-     closer to the actual **175** but explicitly **not** toward PG's
-     **60,125** — the milestone's own pre-registered "moves toward PG"
-     prediction did NOT hold.
-  2. Leaf-level check (`partsupp ⋈ part` filtered on `p_name LIKE
-     '%green%'`) shows the two engines now agree within 1.2x — the
-     underlying per-column statistics converged (consistent with
-     M0138-0005's corpus-wide `n_distinct` finding). So the 344x top-level
-     gap is **not** a residual statistics-precision gap M0138 could fix.
-  3. Hypothesis (filed, not adjudicated — recon-scoped, forcing shapes is
-     against the milestone's goal): the gap is **join-shape-driven**.
-     goopg drives Q9 with FK-indexed Nested Loops (each probe correctly
-     `rows=1`); PG runs an all-Hash-Join chain where `eqjoinsel`/
-     `calc_joinrel_size_estimate` compound independent per-join
-     selectivities down a correlated FK chain with no extended statistics.
-     Reproducing PG's estimate likely needs goopg to choose PG's Hash-Join
-     shape first — a join-order/method question (M0142), not an
-     ANALYZE-precision one (M0138). This narrows M0142-0001/-0002's
-     starting hypothesis instead of leaving "re-examine the premise" open.
-  4. `GOOPG_ANALYZE_SEED` reconciliation: PG's `acquire_sample_rows` draws
-     from a process-global PRNG (`pg_prng_uint32(&pg_global_prng_state)`,
-     `analyze.c:1227`) with no reproducibility GUC/env-var — there is
-     nothing to retire the goopg knob in favour of. goopg's unset/zero
-     path already reproduces PG's "fresh per-backend draw" property
-     exactly; the pinned path is a harness-only determinism knob with no
-     PG counterpart. **Verdict: keep, no code change** — confirmed the
-     existing code comment's claim against the actual PG source.
+Findings:
+  1. **All four PASS at default, all four FAIL under the flip** — same four
+     names R43 identified ~87 rounds ago, none independently fixed by the
+     intervening work. The M0140 prerequisite ("clear the failing set before
+     landing the flip") is exactly as large today as R43 measured it.
+  2. Three of the four (the two `Slice3` narrow-build tests +
+     `TestOwnedBuildPoisonPrebuiltBoundary`) fail on what reads as **one
+     shared mechanism**: under the flip, partial-path admission changes
+     which join-tree shape wins the search *before* the narrowing pass runs,
+     so their exact-narrow-build-column-set pins no longer match the actual
+     (differently-shaped) plan. `TestSplitEqualityForHashMultiKey` fails for
+     a distinct, unrelated reason — falls back to Nested Loop instead of
+     hash-joining the multi-key equi-join under the flip.
+  3. Deliberately did NOT adjudicate any of the four against PG 18.3 — that
+     is M0140-0002's job per the recon-task boundary (a production/behavior
+     diff in a recon task's commit is a scope violation).
+  4. No ledger row filed: the divergence is an interaction between two
+     goopg-internal planner features (parallel-path admission vs the
+     narrowing pass), not a newly discovered PG-incompatibility.
 
-Key symbols: `analyzeSeedEnv`/`analyzeSeedFor`
-(`internal/executor/operators_analyze.go:702-760`), PG's
-`acquire_sample_rows` (`analyze.c:1199-1227`) and `sampler_random_init_state`
-(`sampling.c:52,139,234,271,286`), PG's `eqjoinsel`
-(`postgres/src/backend/utils/adt/selfuncs.c:2280`) and
-`calc_joinrel_size_estimate`
-(`postgres/src/backend/optimizer/path/costsize.c:5501`) — the two functions
-named as M0142's port target if the join-shape hypothesis holds.
+Key symbols: `gatherPathsMode`/`gatherPathModeFromEnv`
+(`internal/optimizer/gatherpaths.go:21,72`) — the flag this task flipped via
+env var only, no code touched. Test bodies:
+`internal/optimizer/multikey_hash_join_test.go:84`,
+`internal/optimizer/pathtarget_test.go:1389,1488`,
+`internal/executor/owned_build_poison_test.go:779`.
 
-Gates run: `go build ./...` clean (no source changed). `make
-ralph-state-guard`: found and auto-repaired one stale status/progress.json
-inconsistency (same pattern as the last two loops — the "completed" marker
-from the prior loop's clean commit-and-exit, not a project-completion
-signal), then consistent. No values-gate re-run needed — no production code
-touched this loop, matching the M0138-0001/-0005 precedent.
-
-Bench lanes: `:65433` (goopg TPC-H) and `:65432` (PG TPC-H reference) were
-already up at loop start and were only read from (never restarted), per the
-shared-`:6543x`-lane rule.
+Gates run: `go build ./...` clean (no source changed — measurement-only
+loop, matching the M0138-0001/-0006 precedent). `make ralph-state-guard`:
+found and auto-repaired the same recurring stale status/progress.json
+pattern as the last several loops (prior loop's clean-exit marker read as
+project-completion), then consistent.
 
 In-flight: none.
 
 Next step: Per the banner, re-check `.ralph/fix_plan.md`'s `## Current
-Priority` banner fresh. **M0138 is done**, so the M0138/M0139/M0140
-independent trio narrows: M0139-S1 (hook point inside the join tree, gated
-on M0137-0010, already unblocked) or M0140-0001 (re-measure the failing
-test set under `GOOPG_GATHER_PATHS`) are the two open topmost picks in that
-trio, OR — since M0138 "landed and been measured" is now true — M0142-0001
-("entry recon: is the pricing blockage still the same one?") is *also*
-newly unblocked and comes with a head start from this loop's join-shape
-hypothesis. Banner order lists M0139/M0140 (step 2) ahead of M0141/M0142
-(step 3), so the next loop should pick from the M0138/M0139/M0140 trio
-first (M0139-S1 or M0140-0001) unless it judges M0142-0001 more valuable
-given the freshly narrowed hypothesis — use judgment, the banner permits
-either within its own ordering rules. Do not re-run the Q9 estimate capture
-again without cause — it is committed and reproducible via the exact
-command line in this loop's design doc.
+Priority` banner fresh. With M0140-0001 now done, the M0138/M0139/M0140 trio
+narrows to: **M0140-0002** (adjudicate the four failures against PG 18.3,
+with this loop's head start that three of them may be one finding), **M0139-S1**
+(hook point inside the join tree, gated on M0137-0010, already unblocked),
+or other open M0139/M0140 tasks. M0140-0002 has the most direct continuity
+from this loop's findings (same test set, same mechanism hypothesis already
+narrowed) — recommend it next unless the banner's ordering or a fresher read
+suggests otherwise. M0142-0001 (join-order costing recon) also remains
+selectable per M0138's closure last loop. Do not re-run this loop's four-test
+measurement again without cause — it is committed and reproducible via the
+exact commands in the design doc.
