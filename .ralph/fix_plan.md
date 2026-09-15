@@ -2663,22 +2663,32 @@ cross-layer programme that has never been scoped.
   functional/perf test plus the full unit suite above substitute for the
   skipped gate, since this change touches only the FK-validation scan path,
   not query planning/execution. Follow-up filed as **M0142-0003i** (below).
-- [ ] **M0142-0003h — DDL issued after an explicit `BEGIN` did not wait for
+- [x] **M0142-0003h — DDL issued after an explicit `BEGIN` did not wait for
   `COMMIT`/`ROLLBACK` on the shared TPC-H bench cluster** — filed by -0003f,
-  untraced secondary finding. A `psql` session ran `BEGIN;` then 11
-  `ALTER TABLE ... ADD CONSTRAINT ...` statements intending a later
-  `ROLLBACK`; the client was killed before `ROLLBACK` was reached, yet a
-  fresh session immediately showed all 11 constraints already committed.
-  Consistent with the known `pg_class` heap-append vs. goopg-private
-  WAL+replay catalog-DDL split
-  (`goopg_catalog_ddl_durability_two_mechanisms` in memory) but not traced to
-  an exact commit point this loop — could be each DDL statement force
-  -committing its own sub-transaction regardless of an open explicit one, a
-  narrower bug than the architecture split alone would predict. Resume point:
-  a targeted repro (`BEGIN; ALTER TABLE <throwaway> ADD CONSTRAINT ...;` then
-  check visibility from a second session **before** issuing `ROLLBACK`, then
-  again **after**) to pin down whether the commit happens per-statement or
-  only reflects this one interrupted run.
+  untraced secondary finding. **DONE 2026-09-16, recon-only, no production
+  diff**, design doc
+  `docs/design/0100-0149/m0142-0003h-ddl-rollback-undo-scoped-to-create-only.md`.
+  Reproduced on a private throwaway cluster (`:5533`, never the shared
+  `:65433` one) with two real `psql` sessions. **DML control** (`INSERT`)
+  rolls back correctly — ordinary MVCC row visibility is sound. **`ALTER
+  TABLE ADD CONSTRAINT`**: visible to a second session before `ROLLBACK`
+  AND still present after `ROLLBACK` — never undone. **`CREATE TABLE`**:
+  also prematurely visible before `ROLLBACK`, but correctly gone after.
+  **Root cause**: the rollback-undo list (`DDLUndoEntry`/`RecordDDLCreate`,
+  `docs/design/0000-0049/0030-0006-transactional-ddl.md` Phase 1) is
+  populated at exactly six call sites in `operators_ddl.go`, covering only
+  `CREATE TABLE`/`CREATE INDEX` — no other DDL form was ever wired in.
+  **Two distinct findings**: (1) premature cross-session DDL visibility is
+  the **already-documented** Phase-1 "Concurrent DDL visibility...
+  deferred" limitation, re-confirmed, not new; (2) `ALTER TABLE`
+  subcommands having **zero** rollback-undo — a silent, permanent commit
+  regardless of `ROLLBACK`, not just deferred visibility — is the actually
+  novel finding, and is what -0003f's original observation really was.
+  Answers -0003h's own question: the commit is per-statement and
+  deterministic for any non-`CREATE TABLE`/`CREATE INDEX` DDL, not an
+  artifact of that one interrupted run. Follow-up filed as **M0143-0008**
+  (below, under the engine-correctness-carryover milestone — unrelated to
+  join-order costing, so not filed as another M0142 item).
 - [ ] **M0142-0003i — resume -0003f now that -0003g's index-accelerated FK
   validation has landed** — add the remaining 5 TPC-H FK constraints
   (`partsupp_part_fk`, `partsupp_supplier_fk`, `order_customer_fk`,
@@ -3594,6 +3604,31 @@ reported, and the values and unit gates are the bar.
   verified unrelated to R126, and unowned. Fix them or convert them into filed, owned
   tasks; "unowned" is not an end state.
 
+- [ ] **M0143-0008 — `ALTER TABLE` subcommands have no rollback-undo; a
+  `ROLLBACK` after e.g. `ADD CONSTRAINT` silently leaves it permanently
+  committed** — filed by M0142-0003h. `docs/design/0000-0049/0030-0006-transactional-ddl.md`
+  Phase 1 wired rollback-undo (`DDLUndoEntry`/`RecordDDLCreate`,
+  `session.go`; consumed by `execRollback` in `operators_tx.go:253`) for
+  exactly two DDL forms — `CREATE TABLE` and `CREATE INDEX` (six call
+  sites total, all in `operators_ddl.go`). Every other DDL form, confirmed
+  live for `ALTER TABLE ADD CONSTRAINT` (`syncConstraintCatalogRow`,
+  `operators_ddl.go:12912`) via a two-session repro on a throwaway cluster:
+  `BEGIN; ALTER TABLE t ADD CONSTRAINT ...; ROLLBACK;` leaves the
+  constraint permanently in `pg_constraint` — `ROLLBACK` reports success
+  but does nothing. This is a correctness bug (silent, permanent wrong
+  catalog state), not merely a documented-and-bounded limitation like the
+  separate "concurrent DDL visibility deferred" gap (also confirmed live in
+  the same repro, but pre-existing/known — do not conflate the two, see
+  the -0003h design doc). Resume point: extend the `DDLUndoEntry`
+  undo-list pattern (or design a small generalized "catalog mutation undo"
+  record, since `ALTER TABLE` forms vary widely — ADD/DROP CONSTRAINT, ADD
+  COLUMN, SET DEFAULT, ...) to cover at minimum `ADD CONSTRAINT`/`DROP
+  CONSTRAINT`; likely overlaps `M0143-0002`'s `DROP CONSTRAINT` FK bug
+  (same subsystem, `execAlterTableDropConstraint`,
+  `operators_ddl.go:13259`) — triage both together. Test precedent:
+  `transactional_ddl_test.go`'s `TestTransactionalCreateTableRollback` et
+  al.; add an `ALTER TABLE ADD CONSTRAINT` analogue that fails before the
+  fix.
 - [ ] **M0143-0007 — separate the dimension-table `relpages` divergence (K41)** —
   `customer` 1,979 pages vs PG's 2,872, `item` 716 vs 1,284. M0140-0005 filed it
   as out of planner reach and that is correct — **but `relpages` is an input to
