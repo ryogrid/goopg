@@ -2478,7 +2478,7 @@ cross-layer programme that has never been scoped.
   same task: -0003b's Finding 1 left open why the two candidates' bit-exact
   tie holds despite differently-composed (input, marginal) pairs — informative
   but not required to resolve -0003c.
-- [ ] **M0142-0004 — re-measure TPC-DS's row-estimate error at HEAD** — the
+- [x] **M0142-0004 — re-measure TPC-DS's row-estimate error at HEAD** — the
   ledger row `take3-rowest-collapse-diagnosed` (`.ralph/deferral_ledger.md:2120`,
   2026-09-06) named four cuts in order — **B1, A1, A2, A3** — and pinned the
   headline "3–5 orders out" (Q22 9,460,201 vs PG 11,987 = 789x; 22 of 100 Sort
@@ -2489,18 +2489,76 @@ cross-layer programme that has never been scoped.
   the `s2 += cs.NullFrac` term at `rangequery.go:211-215`; A2 is
   `rangeOpSelectivityStats` (`selectivity.go:322`), MCV-first as PG's
   `scalarineqsel` is; A3 is the `parser.JoinAnti` transplant at
-  `reduce_outer_joins.go:141`. **So there is no cut to make and no number to
-  quote — only a measurement to take.** Deliverable: re-score the corpus with
-  `make ea-ratchet` (M0137-0018) at a declared stats epoch, state the error
-  distribution at HEAD, and file whatever is left as new tasks with their own
-  evidence. The one mechanism the ledger recorded as STILL OPEN is **(B2) the
-  missing `*Append` arm in the same resolver** — Q76, goopg 67,352 vs PG 6,810
-  vs actual 470; note the ceiling is low because PG is 14x over too. Start by
-  confirming that arm is still absent (`joinkeyproof.go`, arm list ends at
-  `*Aggregate`). **Note the gate gap**: `scripts/pg-plan-parity-diff.py`'s nine
-  categories have no `rows=` dimension, so estimate error is invisible to every
-  parity gate — it reaches the metric only indirectly, by changing plan shape.
-  `make ea-ratchet` is the instrument that scores it directly.
+  `reduce_outer_joins.go:141`. **DONE 2026-09-15**, design doc
+  `docs/design/0100-0149/m0142-0004-tpcds-rowest-remeasure-at-head.md`.
+  Analyzed the `make ea-ratchet` artifacts M0137-0018 had already captured at
+  this same HEAD (no planner/executor/catalog diff since) rather than
+  re-running the ~10min capture for an unchanged code state. **Distribution**:
+  605 nodes scored, 140 flagged at `qerr>=10` — 20 findings >=1000x, 41 at
+  100x-1000x, 79 at 10x-100x, max 14,500x (Q47) — roughly 1-4 orders out for
+  the ~23% of nodes missing by 10x+; the old single-anecdote "3-5 orders"
+  headline's own subject (Q22) now has zero findings at qerr>=10. **B2
+  reclassified**: the missing `*Append` arm in `resolveBaseColumn` is still
+  structurally absent (confirmed by grep) but no longer reproduces at its
+  original witness (Q76 has zero findings now) — latent, not closed, no
+  live symptom to chase. **Two new mechanisms filed as M0142-0004a/0004b**
+  (below, under this same M0142 milestone) from evidence this pass surfaced
+  that the ledger never named: unique-pkey `IndexScan` nodes hard-coded to
+  `est=1` where PG's own estimate for the same index is also far from 1
+  (C1), and a 3-way CTE `UNION ALL`'s `estimateSetOp`("Append") landing at
+  `est=3` against actuals up to 1557 (C2). Both filed recon-scoped (root
+  cause not yet attributed) per this milestone's own precedent
+  (M0142-0003a/0003b/0003c). **Note the gate gap**:
+  `scripts/pg-plan-parity-diff.py`'s nine categories have no `rows=`
+  dimension, so estimate error is invisible to every parity gate — it
+  reaches the metric only indirectly, by changing plan shape. `make
+  ea-ratchet` is the instrument that scores it directly.
+- [ ] **M0142-0004a — recon: is the unique-pkey `IndexScan` `est=1` finding a
+  planner bug or a loops-vs-total capture artifact?** Filed by M0142-0004.
+  19 of that task's 140 `ea-ratchet` findings are `Index Scan using X_pkey`
+  nodes goopg estimates at `est=1` (`indexScanRows`, `cardinality.go:329`,
+  `idx.Unique && nEq >= len(idx.Columns)` — PG's own `btcostestimate`
+  unique-equality special case, correct for a single non-repeated probe).
+  Several carry a PG-side estimate that is *also* far from 1 for the same
+  named index on the same table (q34 `household_demographics_pkey`: goopg=1,
+  PG=489, actual=10082; q68 same index: goopg=1, PG=1800, actual=5899) — if
+  this were a genuine single unique-key equality lookup, PG would price it
+  at 1 too (identical special case upstream), so the two engines are likely
+  not looking at the same physical operation. Leading hypothesis: the scan
+  is executed once per outer row of a correlated subplan/lateral context,
+  and EXPLAIN ANALYZE's `rows=` is a **per-loop average** — if the capture
+  tooling (`scripts/estimate-parity-gate.sh` / its census parser) reads that
+  as a bare total without accounting for `loops=N`, every repeated-execution
+  index probe would show this exact signature regardless of planner
+  correctness. Concrete next step: pick one witness (q34, `store_pkey`, PG
+  qerr 830.8x is the most PG-divergent) and read its raw
+  `EXPLAIN (ANALYZE, ...)` output directly (not through the JSON summary) to
+  check `loops=`; if `loops > 1` and `rows= * loops ≈ actual`, this is a
+  measurement artifact in the estimate-audit tooling, not a planner defect,
+  and the fix belongs in the capture/scoring script, not `indexScanRows`.
+  Only if `loops<=1` genuinely is a single-probe miss should `indexScanRows`
+  itself be revisited. Evidence:
+  `analysis/planner-refactor-take3/c20a-estimator-census-20260915/ea-findings-20260915.json`.
+- [ ] **M0142-0004b — recon: why does a 3-way CTE `UNION ALL` land at
+  `est=3` against actuals up to 1557x higher?** Filed by M0142-0004. Q33,
+  Q56, Q60 each union three CTE branches (`cs`, `ss`, `ws`, each a filtered
+  fact-table query) and the resulting `Append`/`SetOp` node estimates
+  exactly `3` rows against actuals of 405/1452/1557 (135x/484x/519x); Q49's
+  `HashSetOp Union` estimates 1 against 12 actual. `est=3` for a 3-branch
+  union is the signature of each branch independently collapsing to ~1 and
+  `estimateSetOp` (`cardinality.go:208`) summing `1+1+1` — that function's
+  own UNION/INTERSECT/EXCEPT arithmetic already matches PG's `prepunion.c`
+  (see its header comment), so the defect is upstream of it, in how each
+  CTE branch's own row count is estimated. Concrete next step: instrument
+  `EstimateRows` on `cs`/`ss`/`ws`'s standalone plan (before the union wraps
+  them) for Q33 and find which node in that subtree collapses to 1 — likely
+  candidates given this milestone's other findings are a CTE-specific
+  estimation gap (see memory `cte_leaves_reach_search_wrapped_in_filter`) or
+  a heavy-filter selectivity underestimate the A1/A2/A3 cuts did not reach
+  for this predicate shape. Do not guess the mechanism from the outside;
+  the practice card's own history (`goopg_swallowed_error_in_rewrite_driver`,
+  five wrong hypotheses) is a standing warning to instrument before
+  theorising. Evidence: same `ea-findings-20260915.json` as -0004a.
 - [ ] **M0142-0005 — break the Memoize / probe-multiplier interlock (B6+B8)** —
   two ledger rows that lock each other. **B6**: goopg's executor has no Memoize
   on the NL probe path R59 repriced, so pricing probes PG-faithfully took
