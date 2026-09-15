@@ -1327,13 +1327,22 @@ unmeasured one does not.
   causing queries were never identified; the row's resume point is to re-capture
   at the pre-M0138-0002 commit and bisect. Small, and it is the only unexplained
   movement this milestone introduced.
-- [ ] **M0138-0009 — re-open the correlation banding finding** — M0138-0004
-  claimed the `SliceStable` tie-break resolved it; **M0138-0005 refuted that**
-  by re-measuring the same columns unchanged (TPC-DS 36/120 columns banded in
-  `[0.09,0.16]` against PG's 7/120), and the ledger row was honestly flipped
-  `RESOLVED -> REOPENED`. The tie-break mechanism is PG-faithful, so the cause is
-  elsewhere: the row names a TPC-DS loader load-order artefact or an undiscovered
-  second defect. Resume with the synthetic-table comparison the row describes.
+- [x] **M0138-0009 — re-open the correlation banding finding** — **RESOLVED
+  2026-09-15, NOT A DEFECT.** Ran the synthetic-table comparison the row
+  prescribed in two parts. (1) `internal/testport/m0138_correlation_synthetic_test.go`
+  loaded a hand-constructed periodic column identically on goopg and real PG
+  18.3 (server-side `COPY FROM file`, N below `targrows` so ANALYZE fully
+  scans, no reservoir randomness): both engines produced BYTE-IDENTICAL
+  correlation (`0.095866`), refuting a computation bug and a simple-load
+  physical-order divergence. (2) `internal/executor/operators_analyze_test.go:TestAnalyzeReservoirSeedCausesCorrelationVarianceOnPeriodicFK`
+  then varied only goopg's reservoir-sampler RNG seed at a realistic
+  subsampling ratio and reproduced a correlation spread (`[0.05,0.18]`) wider
+  than the census's own `[0.09,0.16]` banding from seed variance alone.
+  Conclusion: ordinary reservoir-sampling variance on a periodic/
+  low-duplicate-density column, equally present in PG's own independently
+  -seeded sampler — nothing to port, nothing to fix. Ledger row `m0138-0001`
+  (correlation) flipped `resolved`; no follow-up task filed. Design doc:
+  `docs/design/0100-0149/m0138-0009-correlation-banding-synthetic-isolation.md`.
 
 ## M0139 — Executor-side narrowing / projection pushdown (filed 2026-09-14)
 

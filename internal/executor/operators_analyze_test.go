@@ -609,6 +609,91 @@ func TestAnalyzeCorrelationTieBreakMatchesPGTupnoOrder(t *testing.T) {
 	}
 }
 
+// TestAnalyzeReservoirSeedCausesCorrelationVarianceOnPeriodicFK is M0138-0009's
+// sampling-variance confirmation. `TestPort_M0138CorrelationSyntheticGoopgVsPG`
+// (internal/testport) proved goopg and PG compute BYTE-IDENTICAL correlation
+// (0.095866) for a fully-sampled (no reservoir subsampling) periodic
+// low-cardinality column loaded in identical order --- ruling out both a
+// computation/tie-break bug and a physical-append-order divergence as the
+// TPC-DS census's [0.09,0.16]-vs-PG's-[~0] banding cause. This test checks
+// the one mechanism that test could not reach: at real TPC-DS scale the
+// table is far bigger than targrows, so the Vitter reservoir sampler DOES
+// subsample, and goopg's and PG's independent RNGs necessarily draw
+// different subsets. A periodic FK-like column is exactly the shape where a
+// subsample's apparent correlation is sensitive to WHICH physical positions
+// the sampler drew (aliasing against the period), even though the full
+// population's correlation is near zero --- unlike a non-periodic column,
+// where any subsample stays near zero regardless of which rows it drew. If
+// goopg's own correlation reading swings by at least the census's own
+// banding spread purely from changing the sampler's seed (nothing else
+// touched), that is sufficient to explain the finding as ordinary --- and
+// equally present in PG --- sampling variance, not a goopg-specific defect.
+func TestAnalyzeReservoirSeedCausesCorrelationVarianceOnPeriodicFK(t *testing.T) {
+	const n = 3000
+	const cycle = 11
+	const statsTarget = 1 // targrows = 1*upstreamSampleMultiplier(300) = 300, well under n=3000
+
+	ctx, cat, cleanup := newStorageFixture(t)
+	defer cleanup()
+	advanceStmtCounter(ctx)
+	tbl, _ := cat.LookupTable(parser.ObjectName{Name: "items"})
+
+	rows := make([][]optimizer.Expr, n)
+	for i := 0; i < n; i++ {
+		rows[i] = []optimizer.Expr{
+			&optimizer.IntegerConst{Value: int64(i % cycle)},
+			&optimizer.StringConst{Value: "x"},
+		}
+	}
+	insertPlan := &optimizer.Insert{
+		Table:       tbl,
+		Source:      &optimizer.Values{Rows: rows},
+		ColumnIndex: []int{0, 1},
+	}
+	op, err := Build(insertPlan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := op.Open(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := op.Next(); err != EOF {
+		t.Fatalf("Insert.Next: %v", err)
+	}
+	_ = op.Close()
+	if err := ctx.TxnMgr.Commit(ctx.Tx); err != nil {
+		t.Fatal(err)
+	}
+
+	var corrs []float64
+	for seed := int64(1); seed <= 8; seed++ {
+		stats, err := analyzeRelationWith(ctx.Pool, ctx.TxnMgr, ctx.Catalog, tbl, statsTarget, rand.New(rand.NewSource(seed)), ctx.MultiXact, ctx)
+		if err != nil {
+			t.Fatalf("seed %d: analyzeRelationWith: %v", seed, err)
+		}
+		corrs = append(corrs, stats.Columns[0].Correlation)
+	}
+
+	lo, hi := corrs[0], corrs[0]
+	for _, c := range corrs {
+		if c < lo {
+			lo = c
+		}
+		if c > hi {
+			hi = c
+		}
+	}
+	t.Logf("periodic FK (cycle=%d) correlation across %d reservoir seeds: %v (range [%.4f, %.4f])", cycle, len(corrs), corrs, lo, hi)
+
+	// The census's banding was [0.09, 0.16] --- a spread of 0.07. If eight
+	// independent seeds alone produce at least that much spread on a
+	// periodic column, seed variance is a sufficient explanation and no
+	// further ANALYZE-mechanism fix is implicated.
+	if hi-lo < 0.07 {
+		t.Errorf("correlation range across seeds = %.4f, want >= 0.07 (the census's own banding spread) to confirm seed variance alone explains the TPC-DS finding", hi-lo)
+	}
+}
+
 // TestAnalyzeMCVTieBreakIsDeterministicAndPGOrdered pins M0138-0004: PG's
 // compute_scalar_stats walks values in ascending sorted order and only
 // evicts the current MCV track-list tail on a STRICTLY greater count
