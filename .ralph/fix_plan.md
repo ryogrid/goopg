@@ -2559,7 +2559,7 @@ cross-layer programme that has never been scoped.
   confirm the C1 findings collapse post-fix, since this task fixed root
   cause without re-capturing the artifact that named it. Design doc:
   `docs/design/0100-0149/m0142-0004a-explain-analyze-loops-average.md`.
-- [ ] **M0142-0004b — recon: why does a 3-way CTE `UNION ALL` land at
+- [x] **M0142-0004b — recon: why does a 3-way CTE `UNION ALL` land at
   `est=3` against actuals up to 1557x higher?** Filed by M0142-0004. Q33,
   Q56, Q60 each union three CTE branches (`cs`, `ss`, `ws`, each a filtered
   fact-table query) and the resulting `Append`/`SetOp` node estimates
@@ -2578,7 +2578,35 @@ cross-layer programme that has never been scoped.
   for this predicate shape. Do not guess the mechanism from the outside;
   the practice card's own history (`goopg_swallowed_error_in_rewrite_driver`,
   five wrong hypotheses) is a standing warning to instrument before
-  theorising. Evidence: same `ea-findings-20260915.json` as -0004a.
+  theorising. Evidence: same `ea-findings-20260915.json` as -0004a. **DONE
+  2026-09-15, recon closed, no code change** (temporary `GOOPG_EA0004B_TRACE`
+  prints in `estimateJoin`/`semiPairMatchFraction`, fully reverted — `git
+  diff` on `cardinality.go` empty). Full writeup:
+  `docs/design/0100-0149/m0142-0004b-cte-union-branch-collapse-is-estimatejoin-recompute-gap.md`.
+  Traced Q33's standalone `ss` CTE body on the SF0.25 cluster: `est=3` is
+  exactly `1+1+1`, each branch's own `HashAggregate`/`Hash Semi Join`
+  independently collapses — neither the CTE-specific gap nor the A1/A2/A3
+  predicate-selectivity guess panned out. The SEMI join's match fraction is
+  itself correct (`matchFrac≈0.998`, M0142-0006's own code); the collapse is
+  in its OUTER input — `l = EstimateRows(j.Left)` returns **1** for a
+  4-relation join subtree the SAME `EXPLAIN` renders with `rows=32/91/99` at
+  every level (a `pattern_sibling_paths_must_agree` shape: two different call
+  sites disagree on one subtree's row count). Isolated to two undisambiguated
+  candidate mechanisms, filed together as **M0142-0011**: **(A)**
+  `estimateJoin`'s measured-selectivity branch is gated on `Algo ==
+  JoinAlgoHash || Algo == JoinAlgoMerge` (`cardinality.go:~792`), so a plain
+  `*Join{Algo: JoinAlgoNestedLoop}` proven-key equality lookup (`l≈91, r=1`)
+  falls to the `l*r*0.005` unmeasurable fallback instead of the measured
+  path, though PG's own joinrel sizing is algorithm-agnostic; **(B)**
+  `EstimateRows(*Join)` never consults the node's own already-costed
+  `PlanCost.PlanRows` the way `legacyDisplayCostOf`/the EXPLAIN renderer
+  (`operators_explain.go:3024-3028`) already do elsewhere, so a fresh
+  bottom-up recompute silently disagrees with the accurate cached value on
+  the same node. Not landed this loop: either fix touches `EstimateRows`/
+  `estimateJoin` broadly enough (every generic-NestedLoop-algo join in the
+  corpus, or `EstimateRows`' whole contract) to need its own scoping and
+  full floor-measurement pass, matching M0142-0005's own "sized like an
+  executor slice" treatment this loop already applied to it.
 - [x] **M0142-0004c — re-run `make ea-ratchet` to confirm the C1 findings
   collapse post-fix** — Filed by M0142-0004a. **DONE 2026-09-15.** Re-ran the
   ~10min capture (`make ea-ratchet`, fresh goopg build + its own clone/port,
@@ -2763,6 +2791,49 @@ cross-layer programme that has never been scoped.
   independently-verified symptom of M0142-0005, which now carries this
   corpus evidence as part of its resume point. Deferral ledger row filed
   (dated 2026-09-15) linking this evidence to M0142-0005.
+- [ ] **M0142-0011 — disambiguate and fix the `EstimateRows(*Join)`
+  recompute gap M0142-0004b found** — filed by M0142-0004b (full writeup:
+  `docs/design/0100-0149/m0142-0004b-cte-union-branch-collapse-is-estimatejoin-recompute-gap.md`).
+  A generic `*Join{Algo: JoinAlgoNestedLoop}` node beneath a SEMI join's
+  outer input (Q33/Q56/Q60's CTE branches: `store_sales⋈date_dim⋈
+  customer_address⋈item`, a proven-key equality chain) estimates `rows=1`
+  via `estimateJoin`'s fresh recursive `EstimateRows` call, while the SAME
+  node's own already-costed `PlanCost.PlanRows` (what `EXPLAIN` actually
+  prints for it, and what `internal/executor/operators_explain.go:3024-3028`
+  reads) is `32` — two disagreeing numbers for one subtree. Two candidate
+  mechanisms, NOT yet disambiguated:
+  **(A)** `estimateJoin`'s measured-selectivity branch
+  (`internal/optimizer/cardinality.go:~792`,
+  `if j.Algo == JoinAlgoHash || j.Algo == JoinAlgoMerge`) excludes
+  `JoinAlgoNestedLoop`, so a resolvable equi-key on a NestedLoop-algo join
+  falls to the `l*r*defaultEqSelectivity` (`0.005`) fallback instead of the
+  `pairNDistinct`/MCV/superkey-bound-key path Hash/Merge joins get, even
+  though PG's own `calc_joinrel_size_estimate` sizes a joinrel once,
+  independent of which Path/algorithm is cheapest.
+  **(B)** `EstimateRows(*Join)` (`cardinality.go:95-96`, `case *Join: return
+  estimateJoin(x)`) never consults the node's own `PlanCost`/`CostSet` the
+  way `legacyDisplayCostOf` (`plancost.go:164`) and its callers
+  (`distinctpaths.go`, `groupingpaths.go`, `partialaggpaths.go`,
+  `partialsortpaths.go`, `windowsetoppaths.go`) already do — it always
+  recomputes bottom-up from node structure alone, discarding an
+  already-accurate costed value when one exists.
+  Resume point: re-instrument (the reverted `GOOPG_EA0004B_TRACE` shape in
+  M0142-0004b's doc is a ready-made starting point) to determine (1) whether
+  Mechanism A alone (broadening the `Algo` gate) already fixes the witness
+  without touching B, (2) whether B is reachable/needed independently, and
+  (3) whether either fix is safe to apply during DP search (before a node's
+  `PlanCost` exists) vs. only at post-search call sites (EXPLAIN render,
+  `semiJoinMatchFraction`'s own `l:=EstimateRows(j.Left)` call, and any other
+  `EstimateRows` caller invoked on an already-costed subtree) — this bleeds
+  into the same "does the search see a stale or updated number" territory
+  the banner's item 1 (`M0141-S2a`/`M0139-0007`) just closed, so read that
+  resolution before assuming either fix is search-safe. Because either
+  mechanism, once fixed, changes `EstimateRows`'s answer for every
+  generic-NestedLoop-algo `*Join` (or every already-costed `*Join`) in the
+  corpus, run the full floor-measurement suite before landing (TPC-H
+  plan-parity `-serial`, TPC-DS plan-parity, `make ea-ratchet`, SF0.25
+  regression sweep) — the same treatment M0142-0006/M0142-0009 got, not the
+  lighter bar a pure-recon task uses.
 
 ## M0143 — Engine correctness carry-overs from the parity programme (filed 2026-09-14)
 
