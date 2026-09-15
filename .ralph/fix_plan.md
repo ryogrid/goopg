@@ -1471,7 +1471,7 @@ that comment names as parity-inert.
     M0139 has no further open items; the next M0139-family work (if any)
     would come from a future owner decision on `minimize_datum`, which is
     out of scope until that decision is made.
-- [ ] **M0139-0007 — absorb the irreducible width difference into the cost model
+- [x] **M0139-0007 — absorb the irreducible width difference into the cost model
   (owner decision B2)** — **TOP PRIORITY with M0141-S2a-fix.** M0139-S1/S2 landed
   real narrowing and moved **zero** plans, because `applyUpperNarrowing`
   (`planner.go:189`) runs after cost and strategy are decided in
@@ -1489,6 +1489,58 @@ that comment names as parity-inert.
   design-doc justification and a test pinning the two currencies apart. Expect a
   slower executor and unchanged values; a matching plan that runs slower is
   **not** a regression.
+  - **Recon DONE 2026-09-15, no production diff** (design doc
+    `docs/design/0100-0149/m0139-0007-absorption-scoping-recon.md`, full
+    inventory table). Findings:
+    - The task's own witness site is **half-absorbed already**:
+      `GOOPG_NARROW_COST_INPUTS` (R121/R128) landed the build-entry-footprint
+      half default-ON since R128 (moved TPC-H `join-method` 10→9); only the
+      **batch/spill decision** half remains — and that half's absorption is
+      **already built**, just never measured or promoted:
+      `hashjoin_pggeometry.go`/`hashjoin_pgtuplesizing.go` port PG's packed
+      `HashJoinTuple` sizing behind `GOOPG_PG_HASH_TUPLE_SPILL_COST` (R108,
+      default-off).
+    - A second, parallel arm exists for **Sort's** spill decision (which also
+      feeds WindowAgg's internal sort via `costWindow`):
+      `sort_pgrelationbytes.go` ports PG's `relation_byte_size` behind
+      `GOOPG_PG_SORT_RELATION_BYTES_COST` (R113, default-off). Neither R108
+      nor R113 has been measured against the post-M0137–M0142 corpus.
+    - HashAggregate's width currency is a **settled, already-decided
+      divergence** (R120 built a fix, R124 measured it net-neutral paired with
+      narrowing, M0137-0009 deleted the flag) — do **not** reopen without new
+      evidence.
+    - A genuinely **new, unabsorbed** site: Memoize's entry-byte estimate
+      (`joinpathsmemoize.go:133-139`) uses goopg's map currency where PG's
+      `cost_memoize_rescan` (`postgres/src/backend/optimizer/path/
+      costsize.c:2541`) uses `relation_byte_size` (already ported in-tree as
+      `pgRelationByteSize`, directly reusable) plus
+      `ExecEstimateCacheEntryOverheadBytes` (not yet ported, small named PG
+      function).
+    - Bitmap heap scan's entry sizing (`costbitmap.go:tbmEntryBytes`) is
+      planner/executor self-consistent within goopg, not a cross-currency
+      case — not sliced further.
+  - Two bounded next slices filed below: **M0139-0007a** (measure/adopt the
+    two already-built R108/R113 arms) and **M0139-0007b** (port Memoize's
+    currency). Ledger row appended (task-id `m0139-0007`).
+- [ ] **M0139-0007a — measure and adopt/hold the two already-built R108/R113
+  absorption arms.** `GOOPG_PG_HASH_TUPLE_SPILL_COST` (hash-join spill/batch
+  decision) and `GOOPG_PG_SORT_RELATION_BYTES_COST` (Sort spill decision, also
+  feeds WindowAgg) both already port a named PG formula (file:line cited in
+  their source comments) but have never been measured against the
+  post-M0137–M0142 corpus. Measure each independently first (row 3 of
+  M0139-0007's inventory feeds row 1's competing Sort-based plan shapes, so a
+  combined flip could move a plan for a reason neither arm alone explains),
+  decide adopt/hold per the plan-parity metric, one design doc per arm,
+  following the `GOOPG_GATHER_PATHS` promotion precedent
+  (`docs/design/0100-0149/m0140-0003-gather-paths-flip-lands-default-on.md`).
+- [ ] **M0139-0007b — port PG's Memoize entry-byte currency.** Give
+  `joinpathsmemoize.go`'s `estEntryBytes` (`:133-139`) PG's `cost_memoize_rescan`
+  currency (`postgres/src/backend/optimizer/path/costsize.c:2541-2578`):
+  `relation_byte_size(tuples, width)` (reuse the already-built
+  `pgRelationByteSize`, `sort_pgrelationbytes.go`) plus a ported
+  `ExecEstimateCacheEntryOverheadBytes` (PG's `nodeMemoize.c`). New absorption
+  site, no prior attempt exists. Needs a design-doc justification and a test
+  pinning the two currencies apart, per B2's rules.
 
 ## M0140 — TPC-DS parallelism (filed 2026-09-14)
 
