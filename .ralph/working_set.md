@@ -1,78 +1,71 @@
-Task: M0142-0016a — scoping recon: measure M0142-0016's blast radius before
-implementing the fix. **DONE and committed** this loop. M0142-0016 itself
-remains open (unstarted implementation), now with a concrete resume point.
+Task: M0142-0015 — recon: does M0142-0012 flip Q45's `item`/`customer_address`
+DP-search tie because its formula is wrong, or because of the same near-tie
+class M0142-0003b/0003c found for Q9? **DONE and committed** this loop.
+Measurement-only, no production code changed.
 
-Files: `docs/design/0100-0149/m0142-0016a-scoping-recon-blast-radius.md`
-(new), `docs/design/README.md` (indexed), `.ralph/fix_plan.md` (0016's own
-entry amended with an "UPDATE" block + new 0016a entry, both `[x]`/done).
-No production diff — `internal/optimizer/cardinality.go` was temporarily
-instrumented (env-gated `GOOPG_M0142016_TRACE` trace in both
-`estimateLateralIndexJoin`'s and `estimateNLIndexJoin`'s plain-INNER
-branches) then fully reverted before commit; `git diff` on it is empty.
+Files: `.ralph/fix_plan.md` (M0142-0015 `[x]`, M0142-0003c line annotated
+with the Q45 cross-reference). `docs/design/0100-0149/m0142-0015-q45-tie-break-is-near-exact-in-both-engines.md`
+(new). `docs/design/README.md` (indexed). `analysis/m0142/m0142-0015-q45-{goopg-explain,dptrace,pg-default-and-forced}.txt`
+(new, committed raw evidence).
 
-Key symbols: `estimateLateralIndexJoin` (`cardinality.go:382-396`),
-`estimateNLIndexJoin` (`:241-267`) — both twins' plain-INNER arms
-(`return l` unconditionally). `joinResidualSelectivity` (`:1316-1345`) —
-**ruled OUT as the fix mechanism**: its loop skips any clause where
-`exprSide(c, leftWidth) != sideMixed` (`planner.go:6795`), so a
-single-relation filter like Q95's `ca_state = 'VA'` (entirely on the
-right/inner side) is invisible to it. The actual fix target is
-`IndexScan.Cond`/`IndexOnlyScan.Cond` (`plan.go:836`/`:1022`) — the
-parameterized-probe leftover-residual field neither `nliSemiMatchFraction`
-nor `lateralNLIMatchFraction` reads today. This is new information not in
-M0142-0016's original filing; the next loop implementing 0016 should start
-from `Cond`, not from `joinResidualSelectivity`.
+Key symbols: none touched (recon-only). Trace instrument used:
+`GOOPG_PGSHAPED_DP_TRACE=1` (`internal/optimizer/joinsearchtrace.go`,
+`pathtrace.go`'s `DPPATH` lines) — already existed, same as M0142-0003a.
 
-Findings this loop: TPC-H 3/21 queries (Q7 25, Q8 33, Q21 19 call-site hits)
-carry a real defect (probe has `Cond`); 6 more queries (Q2/Q5/Q9/Q11/Q17/Q20)
-hit the shape but as a no-op (no `Cond`, current code already correct).
-TPC-DS SF0.25: 55/99 queries carry a real defect (Q77 427, Q49 404 highest),
-88/99 hit the shape at all. Cross-validated M0142-0013's Q95 finding
-independently via a DIFFERENT trace (43 real hits, matches) and confirmed
-Q9's 90 hits are ALL no-ops — consistent with M0142-0013's separate verdict
-that Q9's own error is PG-formula-identical, not this mechanism. Full method
-(two private throwaway servers, TPC-H port 5534 / TPC-DS port 65437,
-env-gated-trace-then-revert, same discipline as M0142-0012a) is in the
-design doc.
+Findings this loop: goopg's own level-5 DP search for Q45 has TWO
+`nestloop.index` candidates both `verdict=accepted` (neither dominated)
+differing by `2e-12` (`9674.299956003799` ca-first/PG-order vs
+`9674.299956003797` item-first/goopg's actual choice) — `setCheapest` just
+takes the literal float minimum; the PG-matching candidate is registered
+FIRST (`created=1`) but still loses, so this is NOT the Q9-style exact-tie/
+registration-order mechanism (M0142-0003b), it's a genuine (if
+imperceptibly small) numeric difference. The feeding level-4 legs are NOT
+tied (9606.17 vs 9596.43, real 9.74 gap) — level-5's marginal costs
+compensate almost exactly. Forced real PG 18.3 (`join_collapse_limit=1`,
+explicit left-deep JOIN) into the alternative order and got an IDENTICAL
+displayed top-level total (9827.36 both ways) despite a real 5.29 gap in
+the child Nested Loop node — same qualitative near-tie-by-cancellation
+shape in PG's own planner, at whatever precision its 2-decimal EXPLAIN
+output can show. Verdict: same class as M0142-0003c's still-open question,
+not a new M0142-0012 defect; no code change follows. Annotated M0142-0003c
+to use Q45 as a second corroborating witness (not a Q9-only question) when
+it's next picked up — did not file a brand-new task since M0142-0003c
+already covers exactly this question.
 
-Next step: implement M0142-0016 itself. Resume point: in both
-`estimateLateralIndexJoin` and `estimateNLIndexJoin`'s SEMI/ANTI *and* now
-plain-INNER arms, multiply by `Cond`'s own selectivity (likely via
-`clauseSelectivity` or an equivalent single-clause helper — `Cond` is a
-single `Expr`, not a list, so `splitAnd`+loop may be needed if it can be an
-AND-tree) when the probe node is `*IndexScan`/`*IndexOnlyScan` with non-nil
-`Cond`. Watch Q7/Q8/Q21 specifically for TPC-H plan-shape movement (the
-recon's own risk note — DP-search ties can flip, same mechanism
-M0142-0003c/M0142-0015 are chasing for Q9/Q45). Full floor-measurement suite
-required on landing (TPC-H/TPC-DS plan-parity capture, `make ea-ratchet`,
-SF0.25 sweep) — same treatment M0142-0006/M0142-0009/M0142-0012 got. Also
-noted but NOT filed as its own task (unconfirmed on any live witness this
-loop): `joinResidualSelectivity`'s SEMI/ANTI callers may have the same
-single-relation-filter blind spot for cases where the residual clause is
-carried in `Predicate` rather than `Cond` — worth a quick check when next in
-this code, not urgent enough to file blind.
+Next step: pick the next task per `.ralph/fix_plan.md`'s `## Current
+Priority` banner (still M0137–M0143, item 4: M0141/M0142 remaining
+slices). Open M0142 items as of this loop: **M0142-0003c** (now a 2-witness
+recon — Q9 + Q45 — level-6/level-5 enumeration-order-vs-cost-tie
+parity vs PG's `join_search_one_level`), **M0142-0005** (Memoize/
+probe-multiplier interlock, B6+B8, sized like an executor slice),
+**M0142-0008** (recon: how much of goopg's plan shape is chosen by forced
+shapes vs real costing — not yet read this loop, check its scope before
+picking), **M0142-0016c** (does PG qerr-match the M0142-0016b Q33/Q54/Q56
+residual-selectivity findings if forced into an analogous plan). None is
+mandated over the others by the banner; M0142-0003c is a reasonable next
+pick since it now has two corpus witnesses and was explicitly flagged as
+the natural continuation by both this loop and the M0142-0012/0014/0016
+chain, but M0142-0005/0008 are equally banner-eligible.
 
-Gates run: `go build ./...` clean; `go test ./internal/optimizer/...` PASS
-(2.8s, unchanged from HEAD — no production diff); `git diff
-internal/optimizer/cardinality.go` empty (instrumentation fully reverted);
-`make ralph-state-guard` self-repaired the same pre-existing stale
-progress-marker inconsistency as last loop (not caused by this loop) before
-passing. This was a measurement/doc-only recon — no TPC-H/TPC-DS parity gate
-or `make ea-ratchet` applies (nothing executable changed); pgbench
-pre-commit smoke still runs via the git hook on the actual commit.
+Gates run: no production code touched, so the practice-card gate suite was
+not required this loop (git diff -- internal/ empty, confirmed before
+finishing). `make ralph-state-guard`: found the same pre-existing stale
+progress-marker inconsistency as the last several loops (status=running vs
+a stale progress=completed marker from a prior loop's clean exit),
+self-repaired to in_progress, then passed clean.
 
-In-flight: none. Both private throwaway servers (TPC-H port 5534
-`/tmp/goopg-m0142016-tpch-data`, TPC-DS port 65437
-`bench/tpcds/runtime_goopg/data-sf025` — the git-tracked SF0.25 gate dir,
-confirmed idle before use) were stopped via `goopg stop -D …` and confirmed
-gone via `ps aux`; `systemctl --user reset-failed` run on both scope names.
-All scratch artefacts under `/tmp` removed. Pre-existing unrelated
-uncommitted changes in the tree at loop start (`.claude/settings.json`,
-`analysis/tpch-explain-baseline.md`, `ci/logs/launch.log`,
-`ci/logs/scheduler.log`, plus various untracked `bench/tpcds/runtime_goopg/`
-and `analysis/leftdeep-joins/` files, `.claude.json`, `.continue`,
-`.opencode/`) were left untouched and are NOT part of this loop's commit —
-staged this loop's own files by explicit pathspec only. Nightly triage
-(`ci/logs/action-items.md`, run `20260914-235643`) was checked at loop start:
-all 14 items already have open `## AI-` tasks filed under M-NIGHTLY as of
-2026-09-15 — no new filing needed this loop.
+In-flight: none. Nightly CI batch (run_id `20260916-035206`, started
+03:52) was running concurrently the whole loop — units/race/testport all
+already FAILed by the time this loop started (pre-existing, not caused by
+this loop; matches the already-filed M-NIGHTLY items from the
+20260914-235643 run, action-items.md for THIS run not yet generated since
+the batch hadn't reached its summary stage). Left it running untouched;
+this loop's own private throwaway servers (goopg :5534 on a
+`/tmp/pp-m0142-0015` SF0.25 data clone, PG reference `:65438` bracketed
+`start pg`/`stop pg`) were both stopped and reaped before finishing (`ps
+aux` and `bench/tpcds/server.sh status` both confirmed clear); `/tmp/pp-m0142-0015`
+and `/tmp/goopg-m0142-0015` scratch dirs removed. Did not re-check whether
+the new nightly run (once it completes) needs a fresh M-NIGHTLY triage
+pass — that's the very next loop's job per the PROMPT.md nightly-triage
+step, since action-items.md still reflects the OLDER 20260914-235643 run
+as of this loop's end.

@@ -1,0 +1,404 @@
+DPTRACE problem nrels=5 rels=web_sales,customer,customer_address,date_dim,item
+DPTRACE pair phase=1 lev=2 created=1 pair={customer} | {web_sales} outer={web_sales} inner={customer}
+DPTRACE pair phase=1 lev=2 created=1 pair={date_dim} | {web_sales} outer={web_sales} inner={date_dim}
+DPTRACE pair phase=1 lev=2 created=1 pair={item} | {web_sales} outer={web_sales} inner={item}
+DPTRACE pair phase=1 lev=2 created=1 pair={customer_address} | {customer} outer={customer} inner={customer_address}
+DPTRACE pair phase=1 lev=2 created=1 pair={customer_address} | {item} outer={customer_address} inner={item}
+DPTRACE pair phase=1 lev=3 created=1 pair={customer+web_sales} | {customer_address} outer={customer+web_sales} inner={customer_address}
+DPTRACE pair phase=1 lev=3 created=1 pair={customer+web_sales} | {date_dim} outer={customer+web_sales} inner={date_dim}
+DPTRACE pair phase=1 lev=3 created=1 pair={customer+web_sales} | {item} outer={customer+web_sales} inner={item}
+DPTRACE pair phase=1 lev=3 created=0 pair={customer} | {date_dim+web_sales} outer={date_dim+web_sales} inner={customer}
+DPTRACE pair phase=1 lev=3 created=1 pair={date_dim+web_sales} | {item} outer={date_dim+web_sales} inner={item}
+DPTRACE pair phase=1 lev=3 created=0 pair={customer} | {item+web_sales} outer={item+web_sales} inner={customer}
+DPTRACE pair phase=1 lev=3 created=1 pair={customer_address} | {item+web_sales} outer={item+web_sales} inner={customer_address}
+DPTRACE pair phase=1 lev=3 created=0 pair={date_dim} | {item+web_sales} outer={item+web_sales} inner={date_dim}
+DPTRACE pair phase=1 lev=3 created=0 pair={customer+customer_address} | {web_sales} outer={customer+customer_address} inner={web_sales}
+DPTRACE pair phase=1 lev=3 created=1 pair={customer+customer_address} | {item} outer={customer+customer_address} inner={item}
+DPTRACE pair phase=1 lev=3 created=0 pair={customer_address+item} | {web_sales} outer={customer_address+item} inner={web_sales}
+DPTRACE pair phase=1 lev=3 created=0 pair={customer_address+item} | {customer} outer={customer_address+item} inner={customer}
+DPTRACE pair phase=1 lev=4 created=1 pair={customer+customer_address+web_sales} | {date_dim} outer={customer+customer_address+web_sales} inner={date_dim}
+DPTRACE pair phase=1 lev=4 created=1 pair={customer+customer_address+web_sales} | {item} outer={customer+customer_address+web_sales} inner={item}
+DPTRACE pair phase=1 lev=4 created=0 pair={customer+date_dim+web_sales} | {customer_address} outer={customer+date_dim+web_sales} inner={customer_address}
+DPTRACE pair phase=1 lev=4 created=1 pair={customer+date_dim+web_sales} | {item} outer={customer+date_dim+web_sales} inner={item}
+DPTRACE pair phase=1 lev=4 created=0 pair={customer+item+web_sales} | {customer_address} outer={customer+item+web_sales} inner={customer_address}
+DPTRACE pair phase=1 lev=4 created=0 pair={customer+item+web_sales} | {date_dim} outer={customer+item+web_sales} inner={date_dim}
+DPTRACE pair phase=1 lev=4 created=0 pair={customer} | {date_dim+item+web_sales} outer={date_dim+item+web_sales} inner={customer}
+DPTRACE pair phase=1 lev=4 created=1 pair={customer_address} | {date_dim+item+web_sales} outer={date_dim+item+web_sales} inner={customer_address}
+DPTRACE pair phase=1 lev=4 created=0 pair={customer_address+item+web_sales} | {customer} outer={customer_address+item+web_sales} inner={customer}
+DPTRACE pair phase=1 lev=4 created=0 pair={customer_address+item+web_sales} | {date_dim} outer={customer_address+item+web_sales} inner={date_dim}
+DPTRACE pair phase=1 lev=4 created=0 pair={customer+customer_address+item} | {web_sales} outer={customer+customer_address+item} inner={web_sales}
+DPTRACE pair phase=2 lev=4 created=0 pair={customer+web_sales} | {customer_address+item} outer={customer+web_sales} inner={customer_address+item}
+DPTRACE pair phase=2 lev=4 created=0 pair={customer+customer_address} | {date_dim+web_sales} outer={date_dim+web_sales} inner={customer+customer_address}
+DPTRACE pair phase=2 lev=4 created=0 pair={customer_address+item} | {date_dim+web_sales} outer={date_dim+web_sales} inner={customer_address+item}
+DPTRACE pair phase=2 lev=4 created=0 pair={customer+customer_address} | {item+web_sales} outer={item+web_sales} inner={customer+customer_address}
+DPTRACE pair phase=1 lev=5 created=1 pair={customer+customer_address+date_dim+web_sales} | {item} outer={customer+customer_address+date_dim+web_sales} inner={item}
+DPTRACE pair phase=1 lev=5 created=0 pair={customer+customer_address+item+web_sales} | {date_dim} outer={customer+customer_address+item+web_sales} inner={date_dim}
+DPTRACE pair phase=1 lev=5 created=0 pair={customer+date_dim+item+web_sales} | {customer_address} outer={customer+date_dim+item+web_sales} inner={customer_address}
+DPTRACE pair phase=1 lev=5 created=0 pair={customer_address+date_dim+item+web_sales} | {customer} outer={customer_address+date_dim+item+web_sales} inner={customer}
+DPTRACE pair phase=2 lev=5 created=0 pair={customer+customer_address+item} | {date_dim+web_sales} outer={date_dim+web_sales} inner={customer+customer_address+item}
+DPTRACE pair phase=2 lev=5 created=0 pair={customer+customer_address} | {date_dim+item+web_sales} outer={customer+customer_address} inner={date_dim+item+web_sales}
+DPTRACE pair phase=2 lev=5 created=0 pair={customer+date_dim+web_sales} | {customer_address+item} outer={customer_address+item} inner={customer+date_dim+web_sales}
+DPTRACE decline phase=1 lev=2 reason=no-join-clause pair={customer_address} | {web_sales}
+DPTRACE decline phase=1 lev=2 reason=no-join-clause pair={customer} | {date_dim}
+DPTRACE decline phase=1 lev=2 reason=no-join-clause pair={customer} | {item}
+DPTRACE decline phase=1 lev=2 reason=no-join-clause pair={customer_address} | {date_dim}
+DPTRACE decline phase=1 lev=2 reason=no-join-clause pair={date_dim} | {item}
+DPTRACE decline phase=1 lev=3 reason=no-join-clause pair={customer_address} | {date_dim+web_sales}
+DPTRACE decline phase=1 lev=3 reason=no-join-clause pair={customer+customer_address} | {date_dim}
+DPTRACE decline phase=1 lev=3 reason=no-join-clause pair={customer_address+item} | {date_dim}
+DPTRACE decline phase=1 lev=4 reason=no-join-clause pair={customer+customer_address+item} | {date_dim}
+DPTRACE cost lev=2 rel={customer+web_sales} rows=179944 npaths=5 cheapest=hash reqouter={} total=13199.8215 second=nli secondtotal=15957.808034253156
+DPTRACE cost lev=2 rel={date_dim+web_sales} rows=219 npaths=5 cheapest=hash reqouter={} total=9447.228374999999 second=nli secondtotal=11606.283794462142
+DPTRACE cost lev=2 rel={item+web_sales} rows=179956 npaths=7 cheapest=hash reqouter={} total=10091.955 second=nli secondtotal=15754.33768465336
+DPTRACE cost lev=2 rel={customer+customer_address} rows=100000 npaths=5 cheapest=hash reqouter={} total=6346 second=merge secondtotal=15405.06001226953
+DPTRACE cost lev=2 rel={customer_address+item} rows=50000 npaths=1 cheapest=nl reqouter={} total=1.3502308e+07 second=none secondtotal=NaN
+DPTRACE cost lev=3 rel={customer+customer_address+web_sales} rows=179944 npaths=8 cheapest=hash reqouter={} total=16566.835 second=hash secondtotal=17666.0515
+DPTRACE cost lev=3 rel={customer+date_dim+web_sales} rows=219 npaths=5 cheapest=nli reqouter={} total=9528.842736844004 second=merge secondtotal=14939.172978951476
+DPTRACE cost lev=3 rel={customer+item+web_sales} rows=179944 npaths=6 cheapest=hash reqouter={} total=16795.0515 second=nli secondtotal=19553.203034253158
+DPTRACE cost lev=3 rel={date_dim+item+web_sales} rows=219 npaths=6 cheapest=nli reqouter={} total=9514.813574159793 second=merge secondtotal=10817.20132238582
+DPTRACE cost lev=3 rel={customer_address+item+web_sales} rows=179956 npaths=4 cheapest=merge reqouter={} total=1.3531364011838276e+07 second=merge secondtotal=1.3531364011838276e+07
+DPTRACE cost lev=3 rel={customer+customer_address+item} rows=100000 npaths=5 cheapest=hash reqouter={} total=1.3508912e+07 second=merge secondtotal=1.351924422013088e+07
+DPTRACE cost lev=4 rel={customer+customer_address+date_dim+web_sales} rows=219 npaths=7 cheapest=nli reqouter={} total=9606.167256844004 second=merge secondtotal=12161.89110628163
+DPTRACE cost lev=4 rel={customer+customer_address+item+web_sales} rows=134958 npaths=23 cheapest=hash reqouter={} total=19998.99075 second=hash secondtotal=21098.207250000003
+DPTRACE cost lev=4 rel={customer+date_dim+item+web_sales} rows=219 npaths=7 cheapest=nli reqouter={} total=9596.427936003798 second=merge secondtotal=10898.815684229825
+DPTRACE cost lev=4 rel={customer_address+date_dim+item+web_sales} rows=50000 npaths=5 cheapest=nl reqouter={} total=175132.3610741598 second=merge secondtotal=1.3516417232996551e+07
+DPTRACE cost lev=5 rel={customer+customer_address+date_dim+item+web_sales} rows=164 npaths=21 cheapest=nli reqouter={} total=9674.299956003797 second=merge secondtotal=10976.683537563158
+DPTRACE cpadmit src=base rel={web_sales} cp=0 leaf=seq
+DPTRACE cpadmit src=base rel={customer} cp=0 leaf=seq
+DPTRACE cpadmit src=base rel={customer_address} cp=0 leaf=seq
+DPTRACE cpadmit src=base rel={date_dim} cp=0 leaf=seq
+DPTRACE cpadmit src=base rel={item} cp=0 leaf=seq
+DPTRACE cpadmit src=join rel={customer+web_sales} cp=0 in1=0 in2=0 nclauses=1 failidx=-1 failkind=none
+DPTRACE cpadmit src=join rel={date_dim+web_sales} cp=0 in1=0 in2=0 nclauses=1 failidx=-1 failkind=none
+DPTRACE cpadmit src=join rel={item+web_sales} cp=0 in1=0 in2=0 nclauses=1 failidx=-1 failkind=none
+DPTRACE cpadmit src=join rel={customer+customer_address} cp=0 in1=0 in2=0 nclauses=1 failidx=-1 failkind=none
+DPTRACE cpadmit src=join rel={customer_address+item} cp=0 in1=0 in2=0 nclauses=1 failidx=0 failkind=*optimizer.BinaryOp
+DPTRACE cpadmit src=join rel={customer+customer_address+web_sales} cp=0 in1=0 in2=0 nclauses=1 failidx=-1 failkind=none
+DPTRACE cpadmit src=join rel={customer+date_dim+web_sales} cp=0 in1=0 in2=0 nclauses=1 failidx=-1 failkind=none
+DPTRACE cpadmit src=join rel={customer+item+web_sales} cp=0 in1=0 in2=0 nclauses=1 failidx=-1 failkind=none
+DPTRACE cpadmit src=join rel={date_dim+item+web_sales} cp=0 in1=0 in2=0 nclauses=1 failidx=-1 failkind=none
+DPTRACE cpadmit src=join rel={customer_address+item+web_sales} cp=0 in1=0 in2=0 nclauses=1 failidx=0 failkind=*optimizer.BinaryOp
+DPTRACE cpadmit src=join rel={customer+customer_address+item} cp=0 in1=0 in2=0 nclauses=1 failidx=0 failkind=*optimizer.BinaryOp
+DPTRACE cpadmit src=join rel={customer+customer_address+date_dim+web_sales} cp=0 in1=0 in2=0 nclauses=1 failidx=-1 failkind=none
+DPTRACE cpadmit src=join rel={customer+customer_address+item+web_sales} cp=0 in1=0 in2=0 nclauses=2 failidx=1 failkind=*optimizer.BinaryOp
+DPTRACE cpadmit src=join rel={customer+date_dim+item+web_sales} cp=0 in1=0 in2=0 nclauses=1 failidx=-1 failkind=none
+DPTRACE cpadmit src=join rel={customer_address+date_dim+item+web_sales} cp=0 in1=0 in2=0 nclauses=1 failidx=0 failkind=*optimizer.BinaryOp
+DPTRACE cpadmit src=join rel={customer+customer_address+date_dim+item+web_sales} cp=0 in1=0 in2=0 nclauses=2 failidx=1 failkind=*optimizer.BinaryOp
+DPTRACE cpgather rel={customer+web_sales} partials=0 verdict=no-partials
+DPTRACE cpgather rel={date_dim+web_sales} partials=0 verdict=no-partials
+DPTRACE cpgather rel={item+web_sales} partials=0 verdict=no-partials
+DPTRACE cpgather rel={customer+customer_address} partials=0 verdict=no-partials
+DPTRACE cpgather rel={customer_address+item} partials=0 verdict=no-partials
+DPTRACE cpgather rel={customer+customer_address+web_sales} partials=0 verdict=no-partials
+DPTRACE cpgather rel={customer+date_dim+web_sales} partials=0 verdict=no-partials
+DPTRACE cpgather rel={customer+item+web_sales} partials=0 verdict=no-partials
+DPTRACE cpgather rel={date_dim+item+web_sales} partials=0 verdict=no-partials
+DPTRACE cpgather rel={customer_address+item+web_sales} partials=0 verdict=no-partials
+DPTRACE cpgather rel={customer+customer_address+item} partials=0 verdict=no-partials
+DPTRACE cpgather rel={customer+customer_address+date_dim+web_sales} partials=0 verdict=no-partials
+DPTRACE cpgather rel={customer+customer_address+item+web_sales} partials=0 verdict=no-partials
+DPTRACE cpgather rel={customer+date_dim+item+web_sales} partials=0 verdict=no-partials
+DPTRACE cpgather rel={customer_address+date_dim+item+web_sales} partials=0 verdict=no-partials
+DPTRACE cpgather rel={customer+customer_address+date_dim+item+web_sales} partials=0 verdict=no-partials
+DPTRACE pveto site=base rel=- dir=- veto=B1 detail=sub=mode
+DPTRACE pveto site=merge rel={customer+web_sales} dir={web_sales}+{customer} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={customer+web_sales} dir={web_sales}+{customer} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={customer+web_sales} dir={web_sales}+{customer} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={customer+web_sales} dir={web_sales}+{customer} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={customer+web_sales} dir={customer}+{web_sales} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={customer+web_sales} dir={customer}+{web_sales} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={customer+web_sales} dir={customer}+{web_sales} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={customer+web_sales} dir={customer}+{web_sales} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={date_dim+web_sales} dir={web_sales}+{date_dim} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={date_dim+web_sales} dir={web_sales}+{date_dim} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={date_dim+web_sales} dir={web_sales}+{date_dim} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={date_dim+web_sales} dir={web_sales}+{date_dim} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={date_dim+web_sales} dir={date_dim}+{web_sales} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={date_dim+web_sales} dir={date_dim}+{web_sales} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={date_dim+web_sales} dir={date_dim}+{web_sales} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={date_dim+web_sales} dir={date_dim}+{web_sales} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={item+web_sales} dir={web_sales}+{item} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={item+web_sales} dir={web_sales}+{item} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={item+web_sales} dir={web_sales}+{item} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={item+web_sales} dir={web_sales}+{item} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={item+web_sales} dir={item}+{web_sales} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={item+web_sales} dir={item}+{web_sales} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={item+web_sales} dir={item}+{web_sales} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={item+web_sales} dir={item}+{web_sales} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={customer+customer_address} dir={customer}+{customer_address} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={customer+customer_address} dir={customer}+{customer_address} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={customer+customer_address} dir={customer}+{customer_address} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={customer+customer_address} dir={customer}+{customer_address} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={customer+customer_address} dir={customer_address}+{customer} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={customer+customer_address} dir={customer_address}+{customer} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={customer+customer_address} dir={customer_address}+{customer} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={customer+customer_address} dir={customer_address}+{customer} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={customer_address+item} dir={customer_address}+{item} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={customer_address+item} dir={item}+{customer_address} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={customer+customer_address+web_sales} dir={customer+web_sales}+{customer_address} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={customer+customer_address+web_sales} dir={customer+web_sales}+{customer_address} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={customer+customer_address+web_sales} dir={customer+web_sales}+{customer_address} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={customer+customer_address+web_sales} dir={customer+web_sales}+{customer_address} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={customer+customer_address+web_sales} dir={customer_address}+{customer+web_sales} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={customer+customer_address+web_sales} dir={customer_address}+{customer+web_sales} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={customer+customer_address+web_sales} dir={customer_address}+{customer+web_sales} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={customer+customer_address+web_sales} dir={customer_address}+{customer+web_sales} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={customer+date_dim+web_sales} dir={customer+web_sales}+{date_dim} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={customer+date_dim+web_sales} dir={customer+web_sales}+{date_dim} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={customer+date_dim+web_sales} dir={customer+web_sales}+{date_dim} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={customer+date_dim+web_sales} dir={customer+web_sales}+{date_dim} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={customer+date_dim+web_sales} dir={date_dim}+{customer+web_sales} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={customer+date_dim+web_sales} dir={date_dim}+{customer+web_sales} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={customer+date_dim+web_sales} dir={date_dim}+{customer+web_sales} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={customer+date_dim+web_sales} dir={date_dim}+{customer+web_sales} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={customer+item+web_sales} dir={customer+web_sales}+{item} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={customer+item+web_sales} dir={customer+web_sales}+{item} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={customer+item+web_sales} dir={customer+web_sales}+{item} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={customer+item+web_sales} dir={customer+web_sales}+{item} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={customer+item+web_sales} dir={item}+{customer+web_sales} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={customer+item+web_sales} dir={item}+{customer+web_sales} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={customer+item+web_sales} dir={item}+{customer+web_sales} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={customer+item+web_sales} dir={item}+{customer+web_sales} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={customer+date_dim+web_sales} dir={date_dim+web_sales}+{customer} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={customer+date_dim+web_sales} dir={date_dim+web_sales}+{customer} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={customer+date_dim+web_sales} dir={date_dim+web_sales}+{customer} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={customer+date_dim+web_sales} dir={date_dim+web_sales}+{customer} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={customer+date_dim+web_sales} dir={customer}+{date_dim+web_sales} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={customer+date_dim+web_sales} dir={customer}+{date_dim+web_sales} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={customer+date_dim+web_sales} dir={customer}+{date_dim+web_sales} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={customer+date_dim+web_sales} dir={customer}+{date_dim+web_sales} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={date_dim+item+web_sales} dir={date_dim+web_sales}+{item} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={date_dim+item+web_sales} dir={date_dim+web_sales}+{item} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={date_dim+item+web_sales} dir={date_dim+web_sales}+{item} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={date_dim+item+web_sales} dir={date_dim+web_sales}+{item} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={date_dim+item+web_sales} dir={item}+{date_dim+web_sales} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={date_dim+item+web_sales} dir={item}+{date_dim+web_sales} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={date_dim+item+web_sales} dir={item}+{date_dim+web_sales} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={date_dim+item+web_sales} dir={item}+{date_dim+web_sales} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={customer+item+web_sales} dir={item+web_sales}+{customer} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={customer+item+web_sales} dir={item+web_sales}+{customer} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={customer+item+web_sales} dir={item+web_sales}+{customer} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={customer+item+web_sales} dir={item+web_sales}+{customer} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={customer+item+web_sales} dir={customer}+{item+web_sales} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={customer+item+web_sales} dir={customer}+{item+web_sales} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={customer+item+web_sales} dir={customer}+{item+web_sales} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={customer+item+web_sales} dir={customer}+{item+web_sales} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={customer_address+item+web_sales} dir={item+web_sales}+{customer_address} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={customer_address+item+web_sales} dir={customer_address}+{item+web_sales} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={date_dim+item+web_sales} dir={item+web_sales}+{date_dim} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={date_dim+item+web_sales} dir={item+web_sales}+{date_dim} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={date_dim+item+web_sales} dir={item+web_sales}+{date_dim} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={date_dim+item+web_sales} dir={item+web_sales}+{date_dim} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={date_dim+item+web_sales} dir={date_dim}+{item+web_sales} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={date_dim+item+web_sales} dir={date_dim}+{item+web_sales} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={date_dim+item+web_sales} dir={date_dim}+{item+web_sales} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={date_dim+item+web_sales} dir={date_dim}+{item+web_sales} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={customer+customer_address+web_sales} dir={customer+customer_address}+{web_sales} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={customer+customer_address+web_sales} dir={customer+customer_address}+{web_sales} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={customer+customer_address+web_sales} dir={customer+customer_address}+{web_sales} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={customer+customer_address+web_sales} dir={customer+customer_address}+{web_sales} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={customer+customer_address+web_sales} dir={web_sales}+{customer+customer_address} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={customer+customer_address+web_sales} dir={web_sales}+{customer+customer_address} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={customer+customer_address+web_sales} dir={web_sales}+{customer+customer_address} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={customer+customer_address+web_sales} dir={web_sales}+{customer+customer_address} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={customer+customer_address+item} dir={customer+customer_address}+{item} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={customer+customer_address+item} dir={item}+{customer+customer_address} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={customer_address+item+web_sales} dir={customer_address+item}+{web_sales} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={customer_address+item+web_sales} dir={customer_address+item}+{web_sales} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={customer_address+item+web_sales} dir={customer_address+item}+{web_sales} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={customer_address+item+web_sales} dir={customer_address+item}+{web_sales} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={customer_address+item+web_sales} dir={web_sales}+{customer_address+item} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={customer_address+item+web_sales} dir={web_sales}+{customer_address+item} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={customer_address+item+web_sales} dir={web_sales}+{customer_address+item} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={customer_address+item+web_sales} dir={web_sales}+{customer_address+item} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={customer+customer_address+item} dir={customer_address+item}+{customer} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={customer+customer_address+item} dir={customer_address+item}+{customer} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={customer+customer_address+item} dir={customer_address+item}+{customer} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={customer+customer_address+item} dir={customer_address+item}+{customer} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={customer+customer_address+item} dir={customer}+{customer_address+item} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={customer+customer_address+item} dir={customer}+{customer_address+item} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={customer+customer_address+item} dir={customer}+{customer_address+item} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={customer+customer_address+item} dir={customer}+{customer_address+item} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={customer+customer_address+date_dim+web_sales} dir={customer+customer_address+web_sales}+{date_dim} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={customer+customer_address+date_dim+web_sales} dir={customer+customer_address+web_sales}+{date_dim} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={customer+customer_address+date_dim+web_sales} dir={customer+customer_address+web_sales}+{date_dim} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={customer+customer_address+date_dim+web_sales} dir={customer+customer_address+web_sales}+{date_dim} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={customer+customer_address+date_dim+web_sales} dir={date_dim}+{customer+customer_address+web_sales} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={customer+customer_address+date_dim+web_sales} dir={date_dim}+{customer+customer_address+web_sales} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={customer+customer_address+date_dim+web_sales} dir={date_dim}+{customer+customer_address+web_sales} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={customer+customer_address+date_dim+web_sales} dir={date_dim}+{customer+customer_address+web_sales} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={customer+customer_address+item+web_sales} dir={customer+customer_address+web_sales}+{item} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={customer+customer_address+item+web_sales} dir={customer+customer_address+web_sales}+{item} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={customer+customer_address+item+web_sales} dir={customer+customer_address+web_sales}+{item} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={customer+customer_address+item+web_sales} dir={customer+customer_address+web_sales}+{item} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={customer+customer_address+item+web_sales} dir={item}+{customer+customer_address+web_sales} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={customer+customer_address+item+web_sales} dir={item}+{customer+customer_address+web_sales} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={customer+customer_address+item+web_sales} dir={item}+{customer+customer_address+web_sales} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={customer+customer_address+item+web_sales} dir={item}+{customer+customer_address+web_sales} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={customer+customer_address+date_dim+web_sales} dir={customer+date_dim+web_sales}+{customer_address} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={customer+customer_address+date_dim+web_sales} dir={customer+date_dim+web_sales}+{customer_address} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={customer+customer_address+date_dim+web_sales} dir={customer+date_dim+web_sales}+{customer_address} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={customer+customer_address+date_dim+web_sales} dir={customer+date_dim+web_sales}+{customer_address} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={customer+customer_address+date_dim+web_sales} dir={customer_address}+{customer+date_dim+web_sales} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={customer+customer_address+date_dim+web_sales} dir={customer_address}+{customer+date_dim+web_sales} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={customer+customer_address+date_dim+web_sales} dir={customer_address}+{customer+date_dim+web_sales} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={customer+customer_address+date_dim+web_sales} dir={customer_address}+{customer+date_dim+web_sales} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={customer+date_dim+item+web_sales} dir={customer+date_dim+web_sales}+{item} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={customer+date_dim+item+web_sales} dir={customer+date_dim+web_sales}+{item} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={customer+date_dim+item+web_sales} dir={customer+date_dim+web_sales}+{item} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={customer+date_dim+item+web_sales} dir={customer+date_dim+web_sales}+{item} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={customer+date_dim+item+web_sales} dir={item}+{customer+date_dim+web_sales} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={customer+date_dim+item+web_sales} dir={item}+{customer+date_dim+web_sales} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={customer+date_dim+item+web_sales} dir={item}+{customer+date_dim+web_sales} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={customer+date_dim+item+web_sales} dir={item}+{customer+date_dim+web_sales} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={customer+customer_address+item+web_sales} dir={customer+item+web_sales}+{customer_address} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={customer+customer_address+item+web_sales} dir={customer+item+web_sales}+{customer_address} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={customer+customer_address+item+web_sales} dir={customer+item+web_sales}+{customer_address} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={customer+customer_address+item+web_sales} dir={customer+item+web_sales}+{customer_address} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={customer+customer_address+item+web_sales} dir={customer_address}+{customer+item+web_sales} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={customer+customer_address+item+web_sales} dir={customer_address}+{customer+item+web_sales} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={customer+customer_address+item+web_sales} dir={customer_address}+{customer+item+web_sales} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={customer+customer_address+item+web_sales} dir={customer_address}+{customer+item+web_sales} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={customer+date_dim+item+web_sales} dir={customer+item+web_sales}+{date_dim} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={customer+date_dim+item+web_sales} dir={customer+item+web_sales}+{date_dim} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={customer+date_dim+item+web_sales} dir={customer+item+web_sales}+{date_dim} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={customer+date_dim+item+web_sales} dir={customer+item+web_sales}+{date_dim} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={customer+date_dim+item+web_sales} dir={date_dim}+{customer+item+web_sales} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={customer+date_dim+item+web_sales} dir={date_dim}+{customer+item+web_sales} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={customer+date_dim+item+web_sales} dir={date_dim}+{customer+item+web_sales} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={customer+date_dim+item+web_sales} dir={date_dim}+{customer+item+web_sales} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={customer+date_dim+item+web_sales} dir={date_dim+item+web_sales}+{customer} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={customer+date_dim+item+web_sales} dir={date_dim+item+web_sales}+{customer} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={customer+date_dim+item+web_sales} dir={date_dim+item+web_sales}+{customer} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={customer+date_dim+item+web_sales} dir={date_dim+item+web_sales}+{customer} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={customer+date_dim+item+web_sales} dir={customer}+{date_dim+item+web_sales} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={customer+date_dim+item+web_sales} dir={customer}+{date_dim+item+web_sales} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={customer+date_dim+item+web_sales} dir={customer}+{date_dim+item+web_sales} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={customer+date_dim+item+web_sales} dir={customer}+{date_dim+item+web_sales} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={customer_address+date_dim+item+web_sales} dir={date_dim+item+web_sales}+{customer_address} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={customer_address+date_dim+item+web_sales} dir={customer_address}+{date_dim+item+web_sales} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={customer+customer_address+item+web_sales} dir={customer_address+item+web_sales}+{customer} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={customer+customer_address+item+web_sales} dir={customer_address+item+web_sales}+{customer} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={customer+customer_address+item+web_sales} dir={customer_address+item+web_sales}+{customer} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={customer+customer_address+item+web_sales} dir={customer_address+item+web_sales}+{customer} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={customer+customer_address+item+web_sales} dir={customer_address+item+web_sales}+{customer} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={customer+customer_address+item+web_sales} dir={customer}+{customer_address+item+web_sales} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={customer+customer_address+item+web_sales} dir={customer}+{customer_address+item+web_sales} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={customer+customer_address+item+web_sales} dir={customer}+{customer_address+item+web_sales} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={customer+customer_address+item+web_sales} dir={customer}+{customer_address+item+web_sales} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={customer+customer_address+item+web_sales} dir={customer}+{customer_address+item+web_sales} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={customer_address+date_dim+item+web_sales} dir={customer_address+item+web_sales}+{date_dim} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={customer_address+date_dim+item+web_sales} dir={customer_address+item+web_sales}+{date_dim} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={customer_address+date_dim+item+web_sales} dir={customer_address+item+web_sales}+{date_dim} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={customer_address+date_dim+item+web_sales} dir={customer_address+item+web_sales}+{date_dim} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={customer_address+date_dim+item+web_sales} dir={date_dim}+{customer_address+item+web_sales} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={customer_address+date_dim+item+web_sales} dir={date_dim}+{customer_address+item+web_sales} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={customer_address+date_dim+item+web_sales} dir={date_dim}+{customer_address+item+web_sales} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={customer_address+date_dim+item+web_sales} dir={date_dim}+{customer_address+item+web_sales} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={customer+customer_address+item+web_sales} dir={customer+customer_address+item}+{web_sales} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={customer+customer_address+item+web_sales} dir={customer+customer_address+item}+{web_sales} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={customer+customer_address+item+web_sales} dir={customer+customer_address+item}+{web_sales} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={customer+customer_address+item+web_sales} dir={customer+customer_address+item}+{web_sales} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={customer+customer_address+item+web_sales} dir={customer+customer_address+item}+{web_sales} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={customer+customer_address+item+web_sales} dir={web_sales}+{customer+customer_address+item} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={customer+customer_address+item+web_sales} dir={web_sales}+{customer+customer_address+item} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={customer+customer_address+item+web_sales} dir={web_sales}+{customer+customer_address+item} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={customer+customer_address+item+web_sales} dir={web_sales}+{customer+customer_address+item} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={customer+customer_address+item+web_sales} dir={web_sales}+{customer+customer_address+item} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={customer+customer_address+item+web_sales} dir={customer+web_sales}+{customer_address+item} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={customer+customer_address+item+web_sales} dir={customer+web_sales}+{customer_address+item} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={customer+customer_address+item+web_sales} dir={customer+web_sales}+{customer_address+item} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={customer+customer_address+item+web_sales} dir={customer+web_sales}+{customer_address+item} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={customer+customer_address+item+web_sales} dir={customer+web_sales}+{customer_address+item} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={customer+customer_address+item+web_sales} dir={customer_address+item}+{customer+web_sales} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={customer+customer_address+item+web_sales} dir={customer_address+item}+{customer+web_sales} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={customer+customer_address+item+web_sales} dir={customer_address+item}+{customer+web_sales} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={customer+customer_address+item+web_sales} dir={customer_address+item}+{customer+web_sales} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={customer+customer_address+item+web_sales} dir={customer_address+item}+{customer+web_sales} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={customer+customer_address+date_dim+web_sales} dir={date_dim+web_sales}+{customer+customer_address} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={customer+customer_address+date_dim+web_sales} dir={date_dim+web_sales}+{customer+customer_address} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={customer+customer_address+date_dim+web_sales} dir={date_dim+web_sales}+{customer+customer_address} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={customer+customer_address+date_dim+web_sales} dir={date_dim+web_sales}+{customer+customer_address} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={customer+customer_address+date_dim+web_sales} dir={customer+customer_address}+{date_dim+web_sales} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={customer+customer_address+date_dim+web_sales} dir={customer+customer_address}+{date_dim+web_sales} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={customer+customer_address+date_dim+web_sales} dir={customer+customer_address}+{date_dim+web_sales} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={customer+customer_address+date_dim+web_sales} dir={customer+customer_address}+{date_dim+web_sales} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={customer_address+date_dim+item+web_sales} dir={date_dim+web_sales}+{customer_address+item} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={customer_address+date_dim+item+web_sales} dir={date_dim+web_sales}+{customer_address+item} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={customer_address+date_dim+item+web_sales} dir={date_dim+web_sales}+{customer_address+item} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={customer_address+date_dim+item+web_sales} dir={date_dim+web_sales}+{customer_address+item} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={customer_address+date_dim+item+web_sales} dir={customer_address+item}+{date_dim+web_sales} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={customer_address+date_dim+item+web_sales} dir={customer_address+item}+{date_dim+web_sales} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={customer_address+date_dim+item+web_sales} dir={customer_address+item}+{date_dim+web_sales} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={customer_address+date_dim+item+web_sales} dir={customer_address+item}+{date_dim+web_sales} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={customer+customer_address+item+web_sales} dir={item+web_sales}+{customer+customer_address} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={customer+customer_address+item+web_sales} dir={item+web_sales}+{customer+customer_address} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={customer+customer_address+item+web_sales} dir={item+web_sales}+{customer+customer_address} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={customer+customer_address+item+web_sales} dir={item+web_sales}+{customer+customer_address} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={customer+customer_address+item+web_sales} dir={customer+customer_address}+{item+web_sales} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={customer+customer_address+item+web_sales} dir={customer+customer_address}+{item+web_sales} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={customer+customer_address+item+web_sales} dir={customer+customer_address}+{item+web_sales} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={customer+customer_address+item+web_sales} dir={customer+customer_address}+{item+web_sales} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={customer+customer_address+date_dim+item+web_sales} dir={customer+customer_address+date_dim+web_sales}+{item} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={customer+customer_address+date_dim+item+web_sales} dir={customer+customer_address+date_dim+web_sales}+{item} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={customer+customer_address+date_dim+item+web_sales} dir={customer+customer_address+date_dim+web_sales}+{item} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={customer+customer_address+date_dim+item+web_sales} dir={customer+customer_address+date_dim+web_sales}+{item} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={customer+customer_address+date_dim+item+web_sales} dir={item}+{customer+customer_address+date_dim+web_sales} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={customer+customer_address+date_dim+item+web_sales} dir={item}+{customer+customer_address+date_dim+web_sales} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={customer+customer_address+date_dim+item+web_sales} dir={item}+{customer+customer_address+date_dim+web_sales} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={customer+customer_address+date_dim+item+web_sales} dir={item}+{customer+customer_address+date_dim+web_sales} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={customer+customer_address+date_dim+item+web_sales} dir={customer+customer_address+item+web_sales}+{date_dim} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={customer+customer_address+date_dim+item+web_sales} dir={customer+customer_address+item+web_sales}+{date_dim} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={customer+customer_address+date_dim+item+web_sales} dir={customer+customer_address+item+web_sales}+{date_dim} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={customer+customer_address+date_dim+item+web_sales} dir={customer+customer_address+item+web_sales}+{date_dim} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={customer+customer_address+date_dim+item+web_sales} dir={date_dim}+{customer+customer_address+item+web_sales} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={customer+customer_address+date_dim+item+web_sales} dir={date_dim}+{customer+customer_address+item+web_sales} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={customer+customer_address+date_dim+item+web_sales} dir={date_dim}+{customer+customer_address+item+web_sales} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={customer+customer_address+date_dim+item+web_sales} dir={date_dim}+{customer+customer_address+item+web_sales} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={customer+customer_address+date_dim+item+web_sales} dir={customer+date_dim+item+web_sales}+{customer_address} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={customer+customer_address+date_dim+item+web_sales} dir={customer+date_dim+item+web_sales}+{customer_address} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={customer+customer_address+date_dim+item+web_sales} dir={customer+date_dim+item+web_sales}+{customer_address} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={customer+customer_address+date_dim+item+web_sales} dir={customer+date_dim+item+web_sales}+{customer_address} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={customer+customer_address+date_dim+item+web_sales} dir={customer_address}+{customer+date_dim+item+web_sales} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={customer+customer_address+date_dim+item+web_sales} dir={customer_address}+{customer+date_dim+item+web_sales} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={customer+customer_address+date_dim+item+web_sales} dir={customer_address}+{customer+date_dim+item+web_sales} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={customer+customer_address+date_dim+item+web_sales} dir={customer_address}+{customer+date_dim+item+web_sales} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={customer+customer_address+date_dim+item+web_sales} dir={customer_address+date_dim+item+web_sales}+{customer} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={customer+customer_address+date_dim+item+web_sales} dir={customer_address+date_dim+item+web_sales}+{customer} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={customer+customer_address+date_dim+item+web_sales} dir={customer_address+date_dim+item+web_sales}+{customer} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={customer+customer_address+date_dim+item+web_sales} dir={customer_address+date_dim+item+web_sales}+{customer} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={customer+customer_address+date_dim+item+web_sales} dir={customer_address+date_dim+item+web_sales}+{customer} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={customer+customer_address+date_dim+item+web_sales} dir={customer}+{customer_address+date_dim+item+web_sales} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={customer+customer_address+date_dim+item+web_sales} dir={customer}+{customer_address+date_dim+item+web_sales} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={customer+customer_address+date_dim+item+web_sales} dir={customer}+{customer_address+date_dim+item+web_sales} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={customer+customer_address+date_dim+item+web_sales} dir={customer}+{customer_address+date_dim+item+web_sales} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={customer+customer_address+date_dim+item+web_sales} dir={customer}+{customer_address+date_dim+item+web_sales} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={customer+customer_address+date_dim+item+web_sales} dir={date_dim+web_sales}+{customer+customer_address+item} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={customer+customer_address+date_dim+item+web_sales} dir={date_dim+web_sales}+{customer+customer_address+item} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={customer+customer_address+date_dim+item+web_sales} dir={date_dim+web_sales}+{customer+customer_address+item} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={customer+customer_address+date_dim+item+web_sales} dir={date_dim+web_sales}+{customer+customer_address+item} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={customer+customer_address+date_dim+item+web_sales} dir={date_dim+web_sales}+{customer+customer_address+item} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={customer+customer_address+date_dim+item+web_sales} dir={customer+customer_address+item}+{date_dim+web_sales} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={customer+customer_address+date_dim+item+web_sales} dir={customer+customer_address+item}+{date_dim+web_sales} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={customer+customer_address+date_dim+item+web_sales} dir={customer+customer_address+item}+{date_dim+web_sales} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={customer+customer_address+date_dim+item+web_sales} dir={customer+customer_address+item}+{date_dim+web_sales} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={customer+customer_address+date_dim+item+web_sales} dir={customer+customer_address+item}+{date_dim+web_sales} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={customer+customer_address+date_dim+item+web_sales} dir={customer+customer_address}+{date_dim+item+web_sales} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={customer+customer_address+date_dim+item+web_sales} dir={customer+customer_address}+{date_dim+item+web_sales} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={customer+customer_address+date_dim+item+web_sales} dir={customer+customer_address}+{date_dim+item+web_sales} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={customer+customer_address+date_dim+item+web_sales} dir={customer+customer_address}+{date_dim+item+web_sales} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={customer+customer_address+date_dim+item+web_sales} dir={date_dim+item+web_sales}+{customer+customer_address} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={customer+customer_address+date_dim+item+web_sales} dir={date_dim+item+web_sales}+{customer+customer_address} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={customer+customer_address+date_dim+item+web_sales} dir={date_dim+item+web_sales}+{customer+customer_address} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={customer+customer_address+date_dim+item+web_sales} dir={date_dim+item+web_sales}+{customer+customer_address} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={customer+customer_address+date_dim+item+web_sales} dir={customer_address+item}+{customer+date_dim+web_sales} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={customer+customer_address+date_dim+item+web_sales} dir={customer_address+item}+{customer+date_dim+web_sales} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={customer+customer_address+date_dim+item+web_sales} dir={customer_address+item}+{customer+date_dim+web_sales} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={customer+customer_address+date_dim+item+web_sales} dir={customer_address+item}+{customer+date_dim+web_sales} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={customer+customer_address+date_dim+item+web_sales} dir={customer_address+item}+{customer+date_dim+web_sales} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={customer+customer_address+date_dim+item+web_sales} dir={customer+date_dim+web_sales}+{customer_address+item} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={customer+customer_address+date_dim+item+web_sales} dir={customer+date_dim+web_sales}+{customer_address+item} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={customer+customer_address+date_dim+item+web_sales} dir={customer+date_dim+web_sales}+{customer_address+item} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={customer+customer_address+date_dim+item+web_sales} dir={customer+date_dim+web_sales}+{customer_address+item} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={customer+customer_address+date_dim+item+web_sales} dir={customer+date_dim+web_sales}+{customer_address+item} veto=V2 detail=sub=mode jt=INNER
+DPTRACE end top={customer+customer_address+date_dim+item+web_sales} pairs=39 declined=9 costs=16 status=ok

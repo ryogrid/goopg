@@ -2474,7 +2474,13 @@ cross-layer programme that has never been scoped.
   reordering fix — an enumeration-order change is exactly the class of
   planner-search-order surgery the practice card warns can move OTHER
   queries' plans sideways or worse (K50: any structural reordering can flip
-  candidates already matching PG). Lower-priority secondary thread from the
+  candidates already matching PG). **Second witness added by M0142-0015
+  (2026-09-16, TPC-DS Q45's `item`/`customer_address` level-5 tie) — unlike
+  Q9, Q45's near-tie was NOT an exact bit-for-bit dominance-eliminated pair
+  (both candidates stayed `verdict=accepted`, decided by a `2e-12` literal
+  float minimum, not registration order), so when this task is next picked
+  up it should treat Q9 and Q45 as two data points on the same question
+  rather than a single-witness recon.** Lower-priority secondary thread from the
   same task: -0003b's Finding 1 left open why the two candidates' bit-exact
   tie holds despite differently-composed (input, marginal) pairs — informative
   but not required to resolve -0003c.
@@ -2971,32 +2977,42 @@ cross-layer programme that has never been scoped.
   now-understood loss); Q45's pre-fix state was already `SHAPE-DIFF` not a
   `match`, so nothing regressed from match to non-match. Follow-up filed as
   **M0142-0015** below.
-- [ ] **M0142-0015 — recon: why does M0142-0012 flip Q45's
+- [x] **M0142-0015 — recon: why does M0142-0012 flip Q45's
   `item`/`customer_address` DP-search tie away from PG's own choice?** —
-  filed by M0142-0014. Pre-M0142-0012, goopg's join order for Q45
-  (`...⋈customer⋈customer_address⋈item`) matched real PG 18.3's own order
-  exactly (verified by reading both `=== Q45` EXPLAIN blocks in
-  `analysis/m0142/m0142-0001-tpcds-goopg.txt` and `-pg.txt`). Post-M0142-0012
-  the order is `...⋈customer⋈item⋈customer_address` — `item` and
-  `customer_address` swapped, `customer_address` now outermost. Both are
-  unmemoized index-probe nested loops (`item_pkey`, `customer_address_pkey`)
-  of exactly the decomposed-NLI `Join{Lateral:true}` shape M0142-0012 just
-  taught the estimator to price accurately, so this is very likely the DP
-  search's own close tie between the two orderings flipping once one leg's
-  cost estimate became more accurate — the same class of question
-  M0142-0003c already opened for Q9's level-6 tie (never run for Q45).
-  Resume point: instrument or read the DP search's level for this relset on
-  a private throwaway SF0.25 clone (same env-gated-trace-then-revert
-  discipline as M0142-0003a/0010/0011/0012a — never the shared `:65437`
-  gate cluster) and determine which of `item`/`customer_address` now prices
-  cheaper and whether that price is *more* accurate than the alternative
-  (in which case Q45's real defect is elsewhere — e.g. a downstream `Sort`/
-  `Gather` cost term the milestone hasn't reached yet — not in M0142-0012)
-  or *less* accurate for this specific pair (in which case M0142-0012's new
-  formula has an edge case worth tightening). Size as a recon first per the
-  milestone's own precedent; do not attempt a DP-search reordering fix
-  blind (K50: any structural reordering can flip candidates already
-  matching PG elsewhere in the corpus).
+  filed by M0142-0014. **DONE 2026-09-16, recon closed, no code change.**
+  Full writeup:
+  `docs/design/0100-0149/m0142-0015-q45-tie-break-is-near-exact-in-both-engines.md`.
+  Traced on a private SF0.25 clone (`GOOPG_PGSHAPED_DP_TRACE=1`, port 5534)
+  plus the shared PG `:65438` reference (bracketed `start pg`/`stop pg`, all
+  three TPC-DS lanes were down at recon start — no collision with the
+  concurrent nightly batch, which was still in its TPC-H stage).
+  **Finding: both orderings cost effectively identical in BOTH engines.**
+  goopg's own `DPPATH` at level 5 shows two `nestloop.index` candidates
+  both `verdict=accepted` differing by `2e-12` (`9674.299956003799` vs
+  `9674.299956003797`) — not an exact tie caught by `addToPathlist`'s
+  dominance check (unlike Q9's level-6 finding, M0142-0003b), just
+  `setCheapest` taking the literal float minimum of two near-equal
+  candidates; the PG-matching order is registered FIRST (`DPTRACE pair …
+  created=1`) yet still loses, by this sub-ULP margin. The two feeding
+  level-4 legs are NOT themselves tied (`9606.17` vs `9596.43`, a real 9.74
+  gap, ~0.1%) — the level-5 step's marginal costs (probing the one
+  remaining relation) compensate almost exactly in the opposite direction.
+  Forcing real PG 18.3 to try the alternative order
+  (`join_collapse_limit=1`+`from_collapse_limit=1`, explicit left-deep
+  `JOIN`) reproduces the identical shape: real, unequal per-step costs
+  (`9700.77` vs `9695.48`, a genuine 5.29 gap) canceling into an *identical*
+  displayed top-level total (`9827.36` both ways, PG's 2-decimal display
+  resolution hides whether PG's own margin is as fine as goopg's `2e-12`).
+  **Verdict: same class as M0142-0003b/0003c's Q9 level-6 tie, not a new
+  M0142-0012 formula defect** — tightening the cardinality/cost formula
+  cannot move a margin this small in any principled direction, since the
+  two orderings' true costs are effectively equal in both engines' own
+  models; the real open question is the cross-engine tie-break mechanism
+  itself, which M0142-0003c already tracks (filed for Q9). No new task
+  filed; M0142-0003c should widen to use Q45 as a second, cross-corpus
+  witness rather than a Q9-only question when it is next picked up. Per K50
+  no DP-search reordering fix was attempted. Evidence:
+  `analysis/m0142/m0142-0015-q45-{goopg-explain,dptrace,pg-default-and-forced}.txt`.
 - [x] **M0142-0016 — fix `estimateLateralIndexJoin`/`estimateNLIndexJoin`'s
   plain-INNER branches to apply residual selectivity** — filed by
   M0142-0013's instrumented finding. Both twins (`cardinality.go:382-396`
