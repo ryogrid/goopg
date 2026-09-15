@@ -1,71 +1,51 @@
-Task: M0140-0003 — "land the `GOOPG_GATHER_PATHS` flip on the category metric"
-(plan-parity milestone group, M0140 TPC-DS parallelism). **COMPLETE and
-committed/pushed** this loop, branch `plan-parity-with-pg-take2-ralph`.
+Task: M0140-0005 — "file the two out-of-reach items as ledger rows" (plan-parity
+milestone group, M0140 TPC-DS parallelism). **DONE, committed and pushed** this
+loop (branch `plan-parity-with-pg-take2-ralph`, commit `14561db1d`). No
+production code changed (filing-only task, matching M0140-0004's precedent).
+**M0140 is now fully closed — all five tasks [x].**
 
-Files: `internal/optimizer/unnest.go` (the fix: `clonePlanReplacingOuter`
-`*Gather`/`*GatherMerge` arms), `internal/optimizer/gatherpaths.go` (default
-flip + comments), `internal/optimizer/flaglabels.go` (2 provenance comments),
-`scripts/planner-flags.env` (regenerated), `internal/optimizer/pathtarget_test.go`
-+ `internal/optimizer/considerparallel_test.go` + `internal/executor/owned_build_poison_test.go`
-(4 stale-pin re-baselines), `docs/design/planner-c19d-gather-paths/DESIGN.md`
-(§5 landed-status addendum), `docs/milestones/0140-tpcds-parallelism.md` (K80
-status), `docs/design/0100-0149/m0140-0003-gather-paths-flip-lands-default-on.md`
-(new design doc), `docs/design/README.md` (+index row), `analysis/m0140/*`
-(12 capture artefacts, evidence), `.ralph/fix_plan.md` (M0140-0003 checked off).
+Files: `docs/design/0100-0149/m0140-0005-q14-third-category-and-nonplanner-floor-filing.md`
+(new design doc), `docs/design/README.md` (+index row), `.ralph/deferral_ledger.md`
+(+2 rows: `m0140-0005-q14-parallel-hash-execution-model`,
+`m0140-0005-nonplanner-heap-density-floor`), `.ralph/fix_plan.md` (M0140-0005
+checked off with nested findings).
 
-What was done: root-caused M0140-0002's flagged Q2-decorrelation decline —
-instrumented every bail point in `canUnnestSubquery`/`unnestSubquery`
-(throwaway `println` probes, removed) and found `clonePlanReplacingOuter` had
-no `*Gather`/`*GatherMerge` case, so a partial path winning inside a scalar
-subquery's own inner plan made the correlation-substitution clone bail with
-"unsupported plan node", silently keeping the subquery a per-outer-row
-`SubPlan`. Two wrong hypotheses tried and refuted first (test walker
-Gather-blindness; `canUnnestSubquery` type-assertion bail) — see the design
-doc's numbered list. Fixed with a single-child recursion arm (same class as
-R11's `boundaryWalkChildren` and M0140-0002's `visit()` fixes). Flipped
-`gatherPathModeFromEnv`'s unset/empty default to `all` (was `off`). Re-pinned
-the four tests M0140-0002 pre-adjudicated as safe. Measured both arms (off vs
-all), same commit, same stats epoch: TPC-DS SF0.25 vs live PG (match held at
-canonical 2, `parallelism` 86->85, 50/99 shape-delta all tagged parallelism,
-values PASS=96/0/0/0/0) and TPC-H both the canonical serial protocol
-(confirmed inert, `parallelism=0`/`match=6` unmoved) and the non-serial
-diagnostic protocol matching R43/K38's own measurement (`parallelism 17->16,
-no new match`, independently reproducing R43 rev 3's historical `18->16`).
-`tpch-spotcheck.sh` PASS under the new default.
+What was done: both filed items were already fully investigated in the prior
+phase's record (`docs/design/not_ralph/plan_parity_fix_take2/`), so this was
+citation + ledger filing, not new investigation. K92 (Q14's `parallelism`
+mismatch): confirmed PG's `Parallel Hash` needs workers building a shared hash
+from a partial inner path behind a barrier, while goopg's `joinOp` deliberately
+drains the build side once on the leader before fan-out (`parallel_scan.go`'s
+own comment warns the alternative "would silently drop matches") — not a
+labelling fix, needs new executor machinery. K14/K15/K41 (non-planner heap-
+density floor): `relpages` is a planner input; K39 already closed the
+fact-table direction but K41 (dimension tables diverging the OTHER way —
+`customer` 1,979 vs 2,872, `item` 716 vs 1,284) stays open, with `character(N)`
+blank-padding (R23) as leading-but-unverified candidate mechanism.
 
-Key symbols: `clonePlanReplacingOuter` (unnest.go:1503, the fix site),
-`gatherPathModeFromEnv` (gatherpaths.go, the flip), `canUnnestSubquery`/
-`unnestSubquery` (unnest.go, the bail chain instrumented), `addPartialHashJoinPath`
-(joinpathsparallel.go, K80's now-live producer).
+Key symbols: none touched (filing task). Referenced: `parallel_scan.go`
+(joinOp build-side-drain comment), `parallel_hash_build.go` (K16's existing
+cooperative build), `joinpathsparallel.go`'s `addPartialHashJoinPath` (future
+producer site if K92 is ever unblocked).
 
-Hypothesis/Findings: root cause fully isolated and fixed, not just adjudicated
-around. `internal/parser`'s ~60 golden-fixture "AST drift" failures + an
-untracked `bak/` build failure are PRE-EXISTING and unrelated (verified: zero
-diff under either path; the parser failure is already filed as nightly
-`AI-20260914-235643-001` under M-NIGHTLY, dated 2026-09-14, before this loop
-started) — do not re-investigate these as caused by this task.
-
-Gates run: `go test ./internal/optimizer/... ./internal/executor/...` green
-in default/off/all arms. `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=34) —
-required stopping/restarting the shared `:65433` cluster via the sanctioned
-lifecycle scripts (verified zero `pg_stat_activity` connections + >24h-stale
-WAL first; never `pkill`) since its private-clone snapshot mechanism needs
-the port fully quiet, not merely idle — restored to the correct final state
-(unset env, default `all`) afterward. `scripts/tpcds-sf025-regression.sh
-sweep` PASS=96/0/0/0/0. `RALPH_PRECOMMIT_SCOPE=units
-scripts/ralph-precommit-test.sh`: only the two known-unrelated failures above.
-`make ralph-state-guard`: same recurring stale status="running"/
-progress="completed" pattern as every prior loop; auto-repaired, confirmed
-consistent.
+Gates run: `go build ./...` clean (no code touched). Pre-commit hook (pgbench
+smoke) passed on `git commit` (not bypassed). `make ralph-state-guard`: same
+recurring stale status="running"/progress="completed" pattern as every prior
+loop this session; auto-repaired, confirmed consistent.
 
 In-flight: none.
 
-Next step: M0140-0003 is DONE. Per the banner order, re-check M0138 (fully
-done, all six [x]) and M0139 (fully done, all six [x]) — both closed. Select
-the next open **M0140** item: **M0140-0004** ("partial-Append producer, K43"
-— PG uses Parallel Append in six TPC-DS queries, goopg has zero partial paths
-on join rels via that route) if unblocked, else **M0140-0005** ("file the two
-out-of-reach items as ledger rows" — Q14's third category and the K14/K15/K41
-non-planner floor). If both are blocked, fall through per the banner to
-**M0141-S0** (scoping recon, the only selectable M0141 item) or **M0143**
-(gated on nothing). Do not re-open M0140-0001/-0002/-0003.
+Next step: M0140 is fully closed. Per the banner order (fix_plan.md
+"Selection order"), M0138/M0139/M0140 are all done or independent-and-done —
+select **M0141-S0** next: "scoping recon (measurement only, no production
+change)" — size the `AGGSPLIT_INITIAL_SERIAL`/`AGGSPLIT_FINAL_DESERIAL`
+programme in goopg terms (which executor surfaces change, how many sites, what
+a row-borne partial-state representation costs), produce a slice list, file
+S1..Sn into the M0141 section with an entry gate, OR record a no-go. Read
+`docs/milestones/0141-upper-planner-ordering-contest.md` and
+`METHODOLOGY3/02-open-problems.md` §B4 (K96/K97) before starting — a production
+diff in S0's commit is a scope violation. If M0141-S0 turns out to need more
+recon time than one loop affords, M0143 (gated on nothing, e.g. M0143-0001 "an
+in-process test that crosses a DATABASE boundary", named highest-leverage of
+its six items) is the fallback per the banner's step 4. Do not re-open
+M0140-0001 through -0005.
