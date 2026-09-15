@@ -2579,25 +2579,43 @@ cross-layer programme that has never been scoped.
   the practice card's own history (`goopg_swallowed_error_in_rewrite_driver`,
   five wrong hypotheses) is a standing warning to instrument before
   theorising. Evidence: same `ea-findings-20260915.json` as -0004a.
-- [ ] **M0142-0004c — re-run `make ea-ratchet` to confirm the C1 findings
-  collapse post-fix** — Filed by M0142-0004a. M0142-0004a fixed
-  `operators_explain.go`'s EXPLAIN ANALYZE `rows=` (text/JSON/per-worker) to
-  divide by `loops` instead of printing the cumulative total
-  (`rowsPerLoop`/`round2`, commit TBD), root-causing all 19 of the C1
-  `Index Scan using X_pkey est=1` findings from the 2026-09-15 census as a
-  measurement bug, not a cardinality-estimator bug — verified on one
-  witness (q34 `store_pkey`: 9969/10082=0.99≈est=1) but not yet
-  re-captured corpus-wide. This task is pure measurement: re-run
-  `make ea-ratchet` (fresh `ea-capture-<date>.txt` +
-  `ea-findings-<date>.json`, same harness M0137-0018/M0142-0004 used) and
-  confirm (a) all 19 C1-shaped findings drop below the `qerr>=10` flag
-  threshold, (b) the 140-finding total shrinks accordingly with no new
-  findings appearing (a `rows=` fix should only ever LOWER a qerr that was
-  inflated by the bug, never raise one), (c) whether any of the 100x-1000x
-  or >=1000x findings were ALSO loops>1 artifacts not yet named — the 2026-09-15
-  pass only picked the two cheapest new mechanisms (C1, C2) to file, not an
-  exhaustive per-finding `loops=` audit. Evidence base:
-  `analysis/planner-refactor-take3/c20a-estimator-census-20260915/ea-findings-20260915.json`.
+- [x] **M0142-0004c — re-run `make ea-ratchet` to confirm the C1 findings
+  collapse post-fix** — Filed by M0142-0004a. **DONE 2026-09-15.** Re-ran the
+  ~10min capture (`make ea-ratchet`, fresh goopg build + its own clone/port,
+  `GOOPG_ANALYZE_SEED=20260905` pinned) against the 2026-09-15 baseline.
+  **(a)** All 18 C1-shaped `Index Scan using X_pkey est=1` findings from the
+  prior census (not 19 — one query's count was mis-tallied in M0142-0004a's
+  prose; the actual old-census set had 18 members, listed in the ratchet's
+  `FIXED` output) are gone from the new findings list — confirmed by exact
+  `(query, node, relset)` set-difference against the old JSON, 18/18 dropped,
+  0 remaining. **(b)** Total findings **140 -> 122** (18 fewer, 0 new); the
+  script's own ratchet verdict is `EA-RATCHET: PASS (18 fixed)` — a `rows=`
+  fix only ever lowers an inflated qerr, never raises one, and that held
+  corpus-wide, not just on the witness. Re-pinned the baseline
+  (`EA_CAPTURE=tmp/c20a/ea-capture.txt EA_REPIN=1 bash
+  scripts/estimate-parity-gate.sh`, no second server run needed) to the new
+  122-entry set so future loops ratchet from the post-fix state; archived the
+  capture/findings as `ea-capture-20260915-post0004a.txt` /
+  `ea-findings-20260915-post0004a.json` alongside the original same-day
+  census in `analysis/planner-refactor-take3/c20a-estimator-census-20260915/`.
+  **(c)** Checked every one of the 25 highest-qerr remaining findings
+  (Q47/Q57 CTE Scan, Q25/Q34/Q73/Q29/Q53/Q63/Q68 Nested Loop, Q10/Q69/Q73/Q33/Q68
+  Gather, Q87 HashSetOp, Q5/Q68 Hash Join, Q33/Q60 CTE Scan) against the raw
+  capture text directly: **every one of them is itself `loops=1`** — the
+  fix already correctly divides the *children* of these nodes (their inner
+  Index Scan / per-Worker lines now read near-1 per-loop averages, e.g. Q34's
+  `household_demographics` index scan went from the old `rows=10082
+  loops=10082` misreport to `rows=0.11 loops=93640`, no longer flagged) but
+  the *parent* join/Gather/CTE node's own cardinality estimate is a separate,
+  genuine defect, not a second loops-capture artifact. **Verdict: no further
+  loops>1 artifacts remain in the corpus** — C1 was a clean, fully-collapsed
+  fix. Filed the newly-visible mechanism as **M0142-0009** (below): several
+  plain `Nested Loop` join nodes (not just NLI/SEMI/ANTI shapes) estimate
+  single-digit rows against four-to-five-digit actuals at `loops=1`,
+  independent of C1/C2 — e.g. Q34 `date_dim+household_demographics+store`
+  est=3 vs actual=9969 (qerr 3323), Q25 `date_dim+store_returns` est=1 vs
+  actual=6422. Gates: none beyond the gate itself (measurement-only task, no
+  production code touched this loop).
 - [ ] **M0142-0005 — break the Memoize / probe-multiplier interlock (B6+B8)** —
   two ledger rows that lock each other. **B6**: goopg's executor has no Memoize
   on the NL probe path R59 repriced, so pricing probes PG-faithfully took
@@ -2646,6 +2664,31 @@ cross-layer programme that has never been scoped.
   first). Deliverable: a per-query census of which plan nodes came from the
   search vs from a forced rewrite, and a verdict on whether a dedicated
   milestone is warranted.
+- [ ] **M0142-0009 — recon: plain `Nested Loop`/`Gather` join nodes estimate
+  single-digit rows against four-to-five-digit actuals, at `loops=1`** —
+  Filed by M0142-0004c from the post-C1-fix re-capture
+  (`ea-findings-20260915-post0004a.json`, 122 findings). Distinct from C1
+  (leaf `IndexScan est=1`, fixed by M0142-0004a — a capture bug) and C2
+  (`M0142-0004b`'s 3-way CTE `UNION ALL` `est=3`, still open): these are
+  **join-level** nodes, several of them plain `Nested Loop` (not the
+  NLI/SEMI/ANTI shapes M0142-0005/0006 already name), each confirmed
+  `loops=1` in the raw capture text (so not a second loops-capture
+  artifact — ruled out directly, not inferred). Witnesses: Q34
+  `date_dim+household_demographics+store` Nested Loop est=3 vs actual=9969
+  (qerr 3323, pg_est=15/pg_qerr=664 — PG is *also* wrong here, just 5x less
+  wrong); Q25 `date_dim+store_returns` Nested Loop est=1 vs actual=6422
+  (qerr 6422, pg_est=118/pg_qerr=54); Q10/Q69/Q73/Q33/Q68 `Gather` nodes
+  over similar relsets at 2-3 orders out. Concrete next step: pick the
+  smallest witness (Q25, two-relation join, no CTE/Gather layer) and
+  instrument `EstimateRows` on that specific `Nested Loop` path the way
+  M0142-0004a instrumented `indexScanRows` — establish whether this is one
+  mechanism (e.g. a join-selectivity term shared across all these witnesses)
+  or several coincidentally-similar ones before scoping a fix. Do not
+  assume it is the same mechanism as M0142-0006's `semiJoinMatchFraction`
+  gap without checking the join type on each witness first (`pattern
+  goopg_swallowed_error_in_rewrite_driver`'s standing warning against
+  guessing the mechanism from the outside applies here too). Evidence:
+  `analysis/planner-refactor-take3/c20a-estimator-census-20260915/ea-findings-20260915-post0004a.json`.
 
 ## M0143 — Engine correctness carry-overs from the parity programme (filed 2026-09-14)
 

@@ -129,12 +129,38 @@ captured output.
 
 ## Follow-up
 
-**M0142-0004c** (filed in `.ralph/fix_plan.md`): re-run `make ea-ratchet`
-to confirm the 19 C1 findings collapse below the `qerr>=10` flag threshold
-post-fix, and check whether any of the other 121 qerr>=10 findings in the
-2026-09-15 census also shared this `loops>1` shape without being named
-(this task's own scope was the one C1 mechanism, not an exhaustive
-`loops=` audit of the whole finding set).
+**M0142-0004c** (filed in `.ralph/fix_plan.md`, DONE 2026-09-15 same day):
+re-run `make ea-ratchet` to confirm the C1 findings collapse below the
+`qerr>=10` flag threshold post-fix, and check whether any of the other
+qerr>=10 findings in the 2026-09-15 census also shared this `loops>1` shape
+without being named.
+
+**Result.** Re-captured (`make ea-ratchet`, fresh build, same pinned
+`GOOPG_ANALYZE_SEED=20260905`). 140 -> 122 findings; the ratchet's own
+verdict is `PASS (18 fixed)`. Cross-checking the old census's `_pkey Index
+Scan` findings by exact `(query, node, relset)` set-difference: **18 of 18**
+dropped out of the new list, 0 remaining (the design doc's own earlier
+"19" figure was a one-off tally error — the true count was always 18,
+matching the ratchet's `FIXED` line count exactly). No finding not
+previously present appeared (a divide-by-`loops` fix cannot inflate a
+qerr, and that held). Re-pinned the baseline to the new 122-entry set
+(`EA_REPIN=1` re-score of the already-captured file, no second server run)
+and archived the capture/findings as `ea-capture-20260915-post0004a.txt` /
+`ea-findings-20260915-post0004a.json` next to the original same-day
+artifacts in `analysis/planner-refactor-take3/c20a-estimator-census-20260915/`.
+
+Audited the 25 highest-qerr remaining findings against the raw capture
+text directly (not inferred): every one is itself `loops=1` at its own
+node — their *children* (inner Index Scan / per-Worker lines) now read
+correct near-1 per-loop averages post-fix and are no longer flagged, but
+the parent join/Gather/CTE node's own cardinality estimate is wrong for
+an unrelated reason. **No second loops-capture artifact exists in the
+corpus** — C1 was the only mechanism of this shape. The newly-visible
+signal this audit surfaced — several plain `Nested Loop` join nodes
+estimate single-digit rows against four/five-digit actuals, e.g. Q34
+`date_dim+household_demographics+store` est=3 vs actual=9969, Q25
+`date_dim+store_returns` est=1 vs actual=6422, both `loops=1` — is filed
+as **M0142-0009**, a new recon task independent of this one.
 
 ## Gate-gap note
 
