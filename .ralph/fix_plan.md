@@ -1837,23 +1837,44 @@ cross-layer programme that has never been scoped.
   `SHAPE-DIFF [join-order]`, topology-divergence trace). Not run as a
   separate task since the recon already produced the report M0142-0002 asked
   for.
-- [ ] **M0142-0003a — join-search candidate trace (env-gated instrumentation,
-  measurement only)** — add a trace point in
-  `internal/optimizer/joinsearchseam.go`/`joinsearch.go`'s DP loop
-  (`GOOPG_JOINSEARCH_TRACE=1`-gated, no default-path change) logging every
-  relset pairing considered for a named query with its cost. Run it live
-  against Q9: does goopg's DP ever construct PG's topology
-  (`partsupp⋈part→⋈supplier→⋈nation→⋈lineitem→⋈orders`) as a candidate, and if
-  so at what cost vs the chosen NLI chain's 124,545? See M0142-0001's doc for
-  the full topology trace this resumes from.
-- [ ] **M0142-0003b — branch on M0142-0003a's finding** — not yet scoped,
-  depends on -0003a landing first. If PG's topology is generated but priced
-  worse: a costing-term audit (B8 `indexProbeCostMultiplier`, B10 index
-  correlation defaults are the named adjacent suspects — both already flagged
-  under M0142 as re-measure-first items). If PG's topology is never
-  generated: a join-search completeness gap, not a costing gap — re-scope
-  M0142's "candidates already open at HEAD" premise for Q9 specifically
-  before any implementation.
+- [x] **M0142-0003a — join-search candidate trace (env-gated instrumentation,
+  measurement only)** — DONE 2026-09-15, see
+  `docs/design/0100-0149/m0142-0003a-q9-joinsearch-candidate-trace.md`. The
+  proposed trace point turned out to already exist
+  (`GOOPG_PGSHAPED_DP_TRACE=1` — `joinsearchtrace.go`'s `DPTRACE pair/cost`
+  lines plus `pathtrace.go`'s `DPPATH` per-path partition attribution, both
+  landed by the prior R53 Step-0/slice-1 rounds), so the task ran it live
+  against Q9 post-M0138 instead of building anything. **Finding 1: PG's
+  topology is fully enumerated at every level (L2–L6), never declined — not
+  a completeness gap.** **Finding 2: at L6, PG's own chain's cheapest
+  candidate (`nestloop.index`, +orders onto PG's own L5) renders identically
+  to goopg's winner (`join.hash`, +nation) at two-decimal precision (both
+  `80099.64`) yet is marked `dominated`** — a near-exact tie, not a clear
+  cost gap; per-step marginal costs differ hugely (orders-last ~33 marginal
+  on PG's cheaper L5 base vs nation-last ~2.6 marginal on goopg's pricier L5
+  base) and happen to land almost on top of each other. Resolves
+  M0142-0003b's fork: costing-term branch, not completeness.
+- [ ] **M0142-0003b — L6 tie-break precision: does goopg's chosen plan
+  actually win on true cost?** Scoped by -0003a's finding (fork resolved:
+  costing, not completeness). `DPPATH`'s `formatPathLine`
+  (`internal/optimizer/pathtrace.go`) prints `total` at `%.2f`, which is not
+  enough precision to tell whether goopg's winning `join.hash` partition
+  (`{part,supplier,lineitem,partsupp,orders}⋈{nation}`, total≈80099.64) truly
+  beats PG's own chain's cheapest candidate (`nestloop.index` on
+  `{part,partsupp,supplier,nation,lineitem}⋈{orders}`, total≈80099.64) or
+  merely ties it and wins on DP processing/insertion order (goopg's
+  partition was paired first at L6 per the `DPTRACE pair` trace — see the
+  design doc's Method section). Concrete next step: either bump the trace's
+  precision (trace-only, env-gated, same class of change as -0003a — not a
+  default-path diff) or read `Path.Cost.Total` directly via a throwaway
+  instrumented probe, then read the sign. If goopg's total is genuinely
+  lower: which term (B8 `indexProbeCostMultiplier`, B10 index-correlation
+  defaults are the named adjacent suspects, both already flagged under
+  M0142) prices PG's `nestloop.index`-on-`orders` candidate high enough to
+  lose a two-decimal tie. If PG's total is lower or exactly equal: the DP's
+  tie-break rule itself (first-registered-partition-wins at exact ties) is
+  the finding, and a different kind of fix applies — do not assume which
+  case holds before measuring.
 
 ## M0143 — Engine correctness carry-overs from the parity programme (filed 2026-09-14)
 
