@@ -34,16 +34,32 @@ Setup / start / stop procedures:
   per-DB catalog work, goopg persists `CREATE DATABASE`: the tables live in a
   durable `tpch` database and `tpch@tpch` works across restarts (verified on
   the 2026-07-27 rebuild), so `make plan-gate` works against a restarted
-  server too. **Caveat added 2026-09-16 (M0142-0003j, unresolved):** that
-  verification covered a graceful restart only. An unclean shutdown
-  (`goopg stop -mode immediate`) + crash-recovery restart of the live
-  `:65433` cluster on 2026-09-16 came back with the `tpch` database's
-  entire TPC-H dataset and all constraints gone (replaced by unrelated
-  scratch tables, physical heap files orphaned on disk) — root cause not
-  yet pinned (candidates: a genuine WAL/checkpoint recovery gap, or an
-  unrelated process running test DDL against the shared database). Treat
-  "persists across restarts" as unproven for anything but a graceful
-  stop until M0142-0003j closes. Two known quirks of the rebuilt layout: HammerDB's final
+  server too. **Caveat updated 2026-09-16 (M0142-0003k, narrowed):**
+  M0142-0003j found the live `:65433` cluster's `tpch` database emptied of
+  its entire TPC-H dataset and all constraints (replaced by 12 unrelated
+  scratch tables) across an unclean-shutdown crash-recovery restart.
+  M0142-0003k then reproduced an unclean shutdown three ways on a scoped
+  throwaway cluster — plain `kill -KILL`, `goopg stop -mode immediate`, and
+  (closest to the real incident) `kill -KILL` mid-flight during an
+  uncommitted, long-running `ALTER TABLE ADD CONSTRAINT` scan — and **all
+  three correctly preserved every row and correctly rolled back the
+  incomplete DDL**. Crash recovery itself is therefore no longer a live
+  suspect. The scratch-table names match literal `CREATE TABLE` SQL inside
+  `internal/testport/mergejoin_all_clauses_test.go` and
+  `internal/testport/lockrows_sort_ctid_test.go`, but those tests provably
+  use an isolated per-test cluster (`cluster.New` → `t.TempDir()` + an
+  ephemeral port), not `:65433` — so the leading explanation is that the
+  same SQL was run **manually** against the shared cluster during past
+  debugging of those two test cases, not that the automated test connected
+  here. The exact destructive event is still not pinned. Treat "persists
+  across restarts" as re-confirmed for the storage engine itself; the open
+  risk is process discipline (ad hoc DDL against a shared cluster), not
+  durability. TPC-H bench data still needs a reload before further
+  `-0003i`/`-0003f`/`-0003g`-dependent work — see M0142-0003k in
+  `.ralph/fix_plan.md` for the blocker (dropping the scratch tables and
+  reloading is a shared-resource write the session's auto-mode classifier
+  declined to run unattended; needs a human to run it or grant it). Two
+  known quirks of the rebuilt layout: HammerDB's final
   ANALYZE step fails and `ANALYZE <table>` inside db `tpch` errors
   "relation does not exist" (per-DB scoping gap in the ANALYZE path — see
   the archived ledger row `bench-reorg ANALYZE-scope`, resolved 2026-07-27 by

@@ -2783,23 +2783,53 @@ cross-layer programme that has never been scoped.
   Follow-up filed as **M0142-0003k** (below).
 - [ ] **M0142-0003k — pin the M0142-0003j data-loss root cause, fix if it is
   a real recovery gap, then reload the TPC-H bench cluster** — filed by
-  -0003j. Resume point: (a) reproduce narrowly — on a throwaway cluster,
-  load a handful of rows, force an unclean shutdown (`goopg stop -mode
-  immediate` while a slow query is in flight, or an actual `kill -KILL` of
-  a throwaway/owned PID, which the classifier should permit for a private
-  test cluster the agent itself started this loop) mid-session, restart,
-  and check whether the loaded rows survive; this isolates "crash recovery
-  has a gap" (hypothesis A) from "something else wiped this one cluster"
-  (hypothesis B) without needing the full SF=1 dataset. (b) Read
-  `internal/testport/mergejoin_all_clauses_test.go` and
-  `internal/testport/lockrows_sort_ctid_test.go` for how they pick a
-  connection target, to close off or confirm hypothesis B. (c) Once the
-  cause is known — and fixed, if hypothesis A — reload TPC-H SF=1 via
-  HammerDB (`bench/tpch/README.md`, ~12 min) and re-land the 11 FK/PK
-  constraints -0003f/-0003g already designed (their DDL is recorded
-  verbatim in those two docs), then resume -0003i's remaining 5. (d) Once
-  the cause and scope are known, tighten or remove the interim caveat this
-  loop added to `CLAUDE.md`'s TPC-H section.
+  -0003j. Design doc:
+  `docs/design/0100-0149/m0142-0003k-crash-recovery-refuted-scratch-table-provenance.md`.
+  **(a) and (b) DONE 2026-09-16, (c)/(d) still open:**
+  - **(a) Hypothesis A (real crash-recovery gap): REFUTED.** Ran three
+    unclean-shutdown repros on a throwaway cluster (`:5533`,
+    `/tmp/goopg-crash-repro`, same HEAD binary as the shared cluster):
+    (i) plain `kill -KILL` after checkpointed + uncheckpointed committed
+    rows — all rows survived; (ii) `goopg stop -mode immediate` (the exact
+    mode the incident used) — same, all rows survived; (iii) `kill -KILL`
+    **mid-flight during an uncommitted, multi-second `ALTER TABLE ADD
+    CONSTRAINT` FK-validation scan** (3M-row unindexed child table, closest
+    match to the incident's PID-81 shape) — parent/child row counts exact,
+    incomplete constraint correctly absent from `pg_constraint`, all
+    earlier data intact. Crash recovery is sound in every scenario tried;
+    stop treating it as a live suspect.
+  - **(b) Hypothesis B (port/connection collision as literally stated):
+    REFUTED; refined explanation stands unproven.** Read
+    `internal/testport/tap_port_test.go`'s `newCluster` helper
+    (`cluster.New(name, cluster.Options{DataDir: filepath.Join(t.TempDir(),
+    "data"), ...})`, no `ListenAddr`) and `cluster.New`/`freePort` in
+    `internal/testutil/cluster/cluster.go` — both suspect test files always
+    get a fresh temp data dir and an OS-ephemeral ("`:0`") port, never a
+    fixed port, never `:65433`. The literal hypothesis (the automated Go
+    test connected to the shared cluster) cannot be true structurally.
+    But both files literally contain the `CREATE TABLE
+    mjq_a/mjq_b/lrs_acct/lrs_side` SQL matching the orphaned scratch tables
+    exactly — most consistent explanation is a past loop manually re-running
+    that repro SQL with `psql` directly against the shared `:65433` cluster
+    while debugging those two bugs, not the automated test itself. The
+    actual event that dropped the original TPC-H tables/constraints is
+    still not reconstructable (no query log retained).
+  - **(c) BLOCKED — needs a human decision.** Reload TPC-H SF=1 via
+    HammerDB (`bench/tpch/README.md`, ~12 min) and re-land the 11 FK/PK
+    constraints -0003f/-0003g already designed (DDL recorded verbatim in
+    those two docs), then resume -0003i's remaining 5. First requires
+    dropping the shared cluster's 12 orphaned scratch tables
+    (`agg_data`, `lrs_acct`, `lrs_side`, `mj_a`, `mj_b`, `mjq_a`, `mjq_b`,
+    `tmp1`, `zz_c`, `zz_p1`, `zz_q1`, `zz_tx`) — a `DROP TABLE` attempt
+    against the shared `:65433` cluster this loop was **declined by the
+    session's auto-mode classifier** ("Modify Shared Resources"); did not
+    attempt to bypass it. Needs a human to run the drop+reload directly, or
+    to explicitly authorize it for a future loop.
+  - **(d) DONE 2026-09-16** — `CLAUDE.md`'s TPC-H section caveat rewritten:
+    durability is re-confirmed (crash recovery is sound per (a)); the
+    residual, open risk is shared-cluster DDL process discipline, not a
+    storage-engine defect. It still points at this task for the pending
+    reload.
 - [x] **M0142-0004 — re-measure TPC-DS's row-estimate error at HEAD** — the
   ledger row `take3-rowest-collapse-diagnosed` (`.ralph/deferral_ledger.md:2120`,
   2026-09-06) named four cuts in order — **B1, A1, A2, A3** — and pinned the
