@@ -1818,17 +1818,42 @@ populates correlation slots as a side effect. Also carry B8: at
 slower — the knob is the known parity-vs-runtime conflict, and changing it is a
 cross-layer programme that has never been scoped.
 
-- [ ] **M0142-0001 — entry recon: is the pricing blockage still the same one?**
-  (measurement only) — M0138 changed every estimate, so the question is whether the
-  blocked attribution still holds. A campaign that assumes the answer repeats the
-  pattern that produced four blocked rounds. Deliverable is a verdict plus, if the
-  blockage has moved, a slice list filed into this section.
-- [ ] **M0142-0002 — re-measure Q9's join order after M0138** — report against R130's
-  table (actual 175; pre-M0138 goopg 97; PG 60,125) and against Q9's category set. This
-  is the query the Question 2 decision was taken for.
-- [ ] **M0142-0003 — costing slices filed by M0142-0001** — placeholder for the work
-  the recon scopes; do not select before M0142-0001 lands. Check this line off in the
-  same commit that files the real slices, so it does not sit unchecked forever.
+- [x] **M0142-0001 — entry recon: is the pricing blockage still the same one?**
+  (measurement only) — DONE 2026-09-15, see
+  `docs/design/0100-0149/m0142-0001-entry-recon-pricing-blockage-post-m0138.md`.
+  Corpus counts essentially unchanged (TPC-H join-order 14→14, TPC-DS 89→90,
+  floors held) but that hides per-query movement. **Verdict, split by the two
+  queries the blocked rounds were actually about**: **Q9/B2 — blockage MOVED**
+  (was a narrow-margin-instrumentation question, R53/R68; is now a join-search
+  topology-generation question — both engines share the first join
+  `partsupp⋈part` then diverge in relset choice at every later step, so there
+  is no longer "the same shape priced differently" for a margin audit to
+  attach to). **Q96/B5 — blockage UNCHANGED** (PG-side observability gap,
+  R98/R99, orthogonal to M0137-M0140). Slices filed below.
+- [x] **M0142-0002 — re-measure Q9's join order after M0138** — DONE, folded
+  into M0142-0001's task/doc above (same commit): estimate half already
+  covered by M0138-0006 (97→146, still 344x below PG's 60,125, not "toward
+  PG"); this task added the join-order/category half (single-category
+  `SHAPE-DIFF [join-order]`, topology-divergence trace). Not run as a
+  separate task since the recon already produced the report M0142-0002 asked
+  for.
+- [ ] **M0142-0003a — join-search candidate trace (env-gated instrumentation,
+  measurement only)** — add a trace point in
+  `internal/optimizer/joinsearchseam.go`/`joinsearch.go`'s DP loop
+  (`GOOPG_JOINSEARCH_TRACE=1`-gated, no default-path change) logging every
+  relset pairing considered for a named query with its cost. Run it live
+  against Q9: does goopg's DP ever construct PG's topology
+  (`partsupp⋈part→⋈supplier→⋈nation→⋈lineitem→⋈orders`) as a candidate, and if
+  so at what cost vs the chosen NLI chain's 124,545? See M0142-0001's doc for
+  the full topology trace this resumes from.
+- [ ] **M0142-0003b — branch on M0142-0003a's finding** — not yet scoped,
+  depends on -0003a landing first. If PG's topology is generated but priced
+  worse: a costing-term audit (B8 `indexProbeCostMultiplier`, B10 index
+  correlation defaults are the named adjacent suspects — both already flagged
+  under M0142 as re-measure-first items). If PG's topology is never
+  generated: a join-search completeness gap, not a costing gap — re-scope
+  M0142's "candidates already open at HEAD" premise for Q9 specifically
+  before any implementation.
 
 ## M0143 — Engine correctness carry-overs from the parity programme (filed 2026-09-14)
 
