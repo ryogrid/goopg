@@ -2575,26 +2575,74 @@ cross-layer programme that has never been scoped.
   estimate throughout, while the goopg-side shape being priced carried the
   2500x-collapsed one, so the two costs were never pricing comparably-sized
   intermediates. Follow-up filed as **M0142-0003f** (below).
-- [ ] **M0142-0003f — add the missing FK constraints to goopg's TPC-H bench
+- [x] **M0142-0003f — add the missing FK constraints to goopg's TPC-H bench
   cluster to restore parity with the PG oracle, then re-measure Q9** — filed
-  by -0003e. Add the canonical 8-constraint TPC-H FK set (`lineitem_partsupp_fk`
-  on `lineitem(l_partkey, l_suppkey) REFERENCES partsupp(ps_partkey,
-  ps_suppkey)`, `lineitem_order_fk`, `partsupp_part_fk`,
-  `partsupp_supplier_fk`, `order_customer_fk`, `supplier_nation_fk`,
-  `customer_nation_fk`, `nation_region_fk` — exact names/columns confirmed
-  live on the `:65432` PG oracle this loop, `pg_constraint WHERE
-  contype='f'`) to goopg's `:65433` bench cluster via `ALTER TABLE ... ADD
-  CONSTRAINT ... FOREIGN KEY ...` (parser support already exists,
-  `internal/parser/ast.go:3389`/`ddl.go:10276`). Add the DDL to
-  `bench/tpch/build_schema_goopg.sh` (or a new post-load step) so it survives
-  a `--reset` rebuild, not just a one-off manual `ALTER TABLE` against the
-  live cluster. After landing, re-run the Q9 `EXPLAIN`/estimate-audit capture
-  from -0003a/-0003d to see whether the row-estimate collapse is gone and
-  whether Q9's plan shape or cost gap changes — this is a fresh measurement,
-  not assumed. Also worth a quick corpus-wide `pg_constraint` diff between
-  the two clusters before trusting any OTHER M0142 "row-estimate collapse"
+  by -0003e. **DONE 2026-09-16, PARTIAL: 11/16 landed, Q9 re-measurement still
+  blocked** (design doc:
+  `docs/design/0100-0149/m0142-0003f-fk-add-blocked-by-unindexed-validation-scan.md`).
+  Adopted the 8 existing unique indexes as `PRIMARY KEY`s via `ADD CONSTRAINT
+  ... PRIMARY KEY USING INDEX` (cheap). The 3 FKs with tiny parent tables
+  (`nation_region_fk`, `customer_nation_fk`, `supplier_nation_fk`) landed and
+  are permanent, validated, PG-matching state on the live `:65433` cluster.
+  **The remaining 5** (`partsupp_part_fk`, `partsupp_supplier_fk`,
+  `order_customer_fk`, `lineitem_partsupp_fk`, `lineitem_order_fk` — the last
+  two are exactly what Q9's `lineitem ⋈ partsupp` collapse needs) are blocked
+  by a newly-discovered engine gap, not a scoping error: goopg's FK-constraint
+  validation is an **O(child rows × parent heap-scan distance) unindexed
+  nested-loop** with **no interrupt-checking** (so a started scan cannot be
+  cancelled via `pg_terminate_backend` either) — see -0003g below. Q9's
+  re-measurement stays deferred until -0003g lands or a scoped partial fix
+  covers at least `lineitem_partsupp_fk`.
+- [ ] **M0142-0003g — index-accelerate and interrupt-check goopg's FK
+  constraint validation scan** — filed by -0003f. Root cause traced to
+  `internal/executor/operators_ddl.go:13974`
+  (`validateFKConstraintExistingRows`) → `internal/executor/operators_fk.go:632`
+  (`assertParentExists`) → `:1318` (`scanRelForFKMatch`): for every live child
+  row, the parent table is scanned heap-block-by-heap-block from the start,
+  never consulting the parent's existing unique B-tree index even when one
+  exists on exactly the referenced columns (`partsupp_pk`, `part_pk`, …) —
+  O(child rows × average parent-scan distance), infeasible once the parent
+  exceeds a few hundred rows (`partsupp_part_fk`: child 800k / parent 200k,
+  did not complete in several minutes; `lineitem_partsupp_fk`/
+  `lineitem_order_fk`: child 6,000,000, never attempted for real). The scan
+  also does not call anything equivalent to PG's `CHECK_FOR_INTERRUPTS()`
+  (`postgres/src/backend/commands/tablecmds.c:13751`) — `pg_terminate_backend`
+  on an in-flight validation scan returned success but the backend kept
+  running 15+ seconds later with no sign of stopping, so a mis-sized FK add
+  cannot be aborted short of restarting the whole server. Fix: (a) route the
+  parent-existence check through `LookupIndex`/an index probe when a unique
+  index covers the referenced columns (PG's real fallback path,
+  `postgres/src/backend/commands/tablecmds.c:13694`
+  `validateForeignKeyConstraint`, still does only O(child rows) work via a
+  planner-chosen `LEFT JOIN` or an indexed per-row RI-trigger probe — never a
+  parent heap scan); (b) add a cancellation check inside the per-row loop.
+  After landing, resume -0003f: add the remaining 5 FKs (expect
+  `lineitem_partsupp_fk`/`lineitem_order_fk` to still take real time even
+  index-accelerated — 6M child-row index probes — but tractable, unlike an
+  unindexed scan) and land the DDL in `bench/tpch/build_schema_goopg.sh` (or
+  a new post-load step) so it survives a `--reset` rebuild. Then re-run the
+  Q9 `EXPLAIN`/estimate-audit capture from -0003a/-0003d to see whether the
+  row-estimate collapse is gone and whether Q9's plan shape or cost gap
+  changes. Also worth a quick corpus-wide `pg_constraint` diff between the
+  two clusters before trusting any OTHER M0142 "row-estimate collapse"
   finding's causal story, since this same gap could be masquerading as an
   estimator bug elsewhere.
+- [ ] **M0142-0003h — DDL issued after an explicit `BEGIN` did not wait for
+  `COMMIT`/`ROLLBACK` on the shared TPC-H bench cluster** — filed by -0003f,
+  untraced secondary finding. A `psql` session ran `BEGIN;` then 11
+  `ALTER TABLE ... ADD CONSTRAINT ...` statements intending a later
+  `ROLLBACK`; the client was killed before `ROLLBACK` was reached, yet a
+  fresh session immediately showed all 11 constraints already committed.
+  Consistent with the known `pg_class` heap-append vs. goopg-private
+  WAL+replay catalog-DDL split
+  (`goopg_catalog_ddl_durability_two_mechanisms` in memory) but not traced to
+  an exact commit point this loop — could be each DDL statement force
+  -committing its own sub-transaction regardless of an open explicit one, a
+  narrower bug than the architecture split alone would predict. Resume point:
+  a targeted repro (`BEGIN; ALTER TABLE <throwaway> ADD CONSTRAINT ...;` then
+  check visibility from a second session **before** issuing `ROLLBACK`, then
+  again **after**) to pin down whether the commit happens per-statement or
+  only reflects this one interrupted run.
 - [x] **M0142-0004 — re-measure TPC-DS's row-estimate error at HEAD** — the
   ledger row `take3-rowest-collapse-diagnosed` (`.ralph/deferral_ledger.md:2120`,
   2026-09-06) named four cuts in order — **B1, A1, A2, A3** — and pinned the
