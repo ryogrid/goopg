@@ -1666,15 +1666,57 @@ spill route is net-negative.
   "unseparated mix" placeholder. Caveat: marker search, not a structural
   proof the marker attaches to the query's aggregate specifically — S2
   should re-verify per query it actually works.
-- [ ] **M0141-S2 — land the serial fix** — per-query trace of the up-to-42
-  serial-shaped queries S1 named (TPC-H's 10/9, all serial; TPC-DS's 32-query
-  list) to determine, for each, whether goopg's Sorted `PathAgg` candidate was
-  priced-and-lost (a `costAgg` term disagrees with PG's `cost_agg`) or never
-  generated (`presortedAggKeysOrAbsent`/`groupingHasSpecialAgg` declines);
-  land the fix that trace implies (expected: a cost formula or
-  pathkey-availability gap in already-shipped machinery, not a new
-  subsystem), plus the one-line `plan.go:1343-1349` comment correction S1
-  diagnosed as stale. Needs S1's finding (done, see above).
+- [x] **M0141-S2 — serial Hashed-vs-Sorted mechanism trace** — DONE
+  2026-09-15, design doc
+  `docs/design/0100-0149/m0141-s2-serial-hashed-sorted-mechanism-trace.md`.
+  No production change beyond the one-line `plan.go:1343-1349` comment
+  correction S1 diagnosed as stale (landed). Traced TPC-H's 10
+  `aggregation-strategy` queries against S1's committed captures (no new live
+  capture): both candidates are **always** generated (S1's open question
+  resolves to uniformly "(a) priced-and-lost", never "(b) never generated"),
+  but "priced-and-lost" splits into two unrelated mechanisms neither of which
+  is the bounded local patch S2 was scoped to expect. **Mechanism (A)** (Q3
+  only): un-narrowed `Hash Join` output inflates `costAgg`'s R3 spill-arm
+  width term, over-charging HASHED — a known, already-decided tradeoff
+  (R3 reinstated the spill arm over this exact TPC-H objection to fix a
+  larger TPC-DS regression); gated on **M0139** (executor-side narrowing),
+  do not touch the spill arm before then. **Mechanism (B)** (the majority:
+  Q4, Q5, Q8, Q12, Q21, Q22 confirmed; Q13/Q18 mixed, not yet per-node-traced):
+  goopg's local cost is not wrong in isolation, but the top-level `ORDER BY`
+  step (`createOrderedPaths`/`addOrderedPaths`, `upperordered.go:64-128`)
+  consumes a single pre-collapsed `Node` from the GROUP_AGG rel rather than
+  its `Pathlist`, so the joint "Sorted-agg-skips-the-top-Sort vs
+  Hashed-agg-plus-top-Sort" comparison PG makes never happens — this is
+  METHODOLOGY3's already-named F15/K12(B)/K24 root cause ("the upper planner
+  receives a finished `Node`, not the join rel's paths ... the largest single
+  item in the workstream"), confirmed here as the *dominant* mechanism (6/8
+  classified queries) for this corpus specifically, not a new local gap.
+  **S2 does not land a fix**: mechanism (A) is M0139-gated, mechanism (B)
+  needs the same upper-planner Pathlist-not-Node surgery K24 already scoped
+  as the workstream's largest item — landing either here would be forcing a
+  shape or violating "one task per loop". Filed as two gated resume points
+  below (S2a, S2b) instead of closing S2 with a patch.
+- [ ] **M0141-S2a — mechanism (A) re-measure (Q3, and check Q10/Q13/Q18)** —
+  once M0139 (executor-side narrowing) lands and the GROUP_AGG rel's input
+  carries only the columns the aggregate needs, re-run S1's TPC-H capture and
+  check whether `costAgg`'s R3 spill arm (`cost_funcs.go:516-540`) still
+  over-charges HASHED for Q3 (and the three siblings
+  `groupingpaths_test.go`'s `TestCostAggHashedNeverChargesSpill` comment
+  names: Q10, Q13, Q18 — not reconfirmed by this task). Do **not** touch the
+  spill arm itself before M0139 lands — it is a deliberate R3 tradeoff that
+  fixed a larger TPC-DS regression. Needs M0139.
+- [ ] **M0141-S2b — GROUP_AGG rel publishes Pathlist, not Node, to the
+  ORDER BY step** — the K24 "ordering contest, slice 3" surgery: change
+  `createOrderedPaths`'s callers (every `createXPaths` -> `createOrderedPaths`
+  call site in `planner.go`) to hand it the producing rel's `Pathlist`
+  instead of a pre-collapsed `Node`, and change `addOrderedPaths`
+  (`upperordered.go:116-128`) to run its own cost contest per candidate
+  (`pathkeysContainedIn` match = no Sort; otherwise + `sortPathForBounded`)
+  rather than assuming a single input. This is the fix mechanism (B) in
+  M0141-S2's finding needs — real multi-call-site upper-planner surgery, size
+  it as its own scoping task before attempting it (K24 already calls this the
+  workstream's largest single item; do not attempt in one sitting). Needs
+  M0141-S2 (done, see above) for the concrete TPC-H query list motivating it.
 - [ ] **M0141-S3 — Partial-Sorted row emission** — a second Partial-mode code
   path (`Strategy = AggStrategySorted`) emitting real rows (group key + one
   serialized-state column per aggregate) instead of merging into

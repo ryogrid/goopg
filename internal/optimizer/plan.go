@@ -1343,9 +1343,16 @@ type Aggregate struct {
 	// Strategy selects hashed vs sorted aggregation. The zero value is
 	// AggStrategyHashed, so every existing construction site and test
 	// fixture keeps today's hash-only behavior without being touched.
-	// The planner does not set it yet (M0134-0001 S8 lands the executor
-	// capability first); sorted mode is reachable only via direct node
-	// construction until the pathkey slice wires the choice in.
+	// M0141-S1 (2026-09-15): the paragraph that stood here — "the planner
+	// does not set it yet ... sorted mode is reachable only via direct node
+	// construction" — is stale. `groupingpaths.go:addGroupingPaths` runs a
+	// genuine cost-based Hashed-vs-Sorted `PathAgg` contest via `addPath`,
+	// and `createplansimple.go`'s `createAggPlan`/`createFinalizeAggPlan`
+	// copy the winner's strategy onto this field (`out.Strategy =
+	// p.AggStrategy`). See
+	// docs/design/0100-0149/m0141-s1-serial-aggstrategy-audit.md for the
+	// full trace; the open question is why the contest doesn't always pick
+	// PG's shape, not whether it runs.
 	Strategy AggStrategy
 
 	// GroupKeyOrder is an EXPLAIN-only permutation: indices into GroupExprs,
