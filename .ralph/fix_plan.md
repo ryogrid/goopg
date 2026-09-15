@@ -2853,7 +2853,7 @@ cross-layer programme that has never been scoped.
   `go test ./internal/optimizer/...` green, `TestFallbackCapFiresForNonHashAlgoDespiteStats`
   untouched since Mechanism A is not being landed). Fix filed as **M0142-0012**
   below.
-- [ ] **M0142-0012 — teach cardinality estimation the decomposed-NLI
+- [x] **M0142-0012 — teach cardinality estimation the decomposed-NLI
   `Join{Lateral: true}` shape** — filed by M0142-0011 (full writeup:
   `docs/design/0100-0149/m0142-0011-disambiguate-estimatejoin-recompute-gap.md`).
   Since the R25 (plan-parity-fix-take2) decomposition, an unmemoized
@@ -2870,23 +2870,58 @@ cross-layer programme that has never been scoped.
   through the OLD fused `*NestedLoopIndexJoin` type, which
   `createNestLoopIndexJoinPlanFused` builds ONLY when the inner is
   Memoize-wrapped — the minority case per M0142-0005/B6.
-  Resume point: add a case ahead of (or inside) the generic `*Join` dispatch
-  in `EstimateRows` (`cardinality.go:95-96`) that recognizes
-  `j.Lateral && j.Right` is a bound `*IndexScan`/`*IndexOnlyScan`, and routes
-  to a generalized version of `estimateNLIndexJoin`'s logic (adapt it to read
-  `j.Left`/`j.Right`/`j.Predicate` instead of `j.Outer`/`j.Inner`/`j.Predicate`
-  — the INNER-join case is `return l` unchanged, the SEMI/ANTI case reuses
-  `nliSemiMatchFraction`'s formula sourced from the `*IndexScan`'s own
-  `Key`/`Keys`). Pin with a test mirroring
-  `TestEstimateRowsNLIndexJoinSemiScalesByMatchFraction` but built via the
-  decomposed shape (`Join{Lateral:true}`) instead of `*NestedLoopIndexJoin`,
-  and re-verify the Q33 CTE-branch witness directly (`rows=1` should become
-  `rows≈32`). **Likely large corpus-wide blast radius** (the common
-  unmemoized NLI shape appears throughout both corpora) — per M0142-0011's
-  own instruction, run the full floor-measurement suite before landing
-  (TPC-H plan-parity `-serial`, TPC-DS plan-parity, `make ea-ratchet`, SF0.25
-  regression sweep), the same treatment M0142-0006/M0142-0009 got, not the
-  lighter bar a pure-recon task uses.
+  **DONE 2026-09-15, landed. Full writeup:
+  `docs/design/0100-0149/m0142-0012-lateral-index-join-cardinality.md`.**
+  Added `isLateralIndexProbe`/`estimateLateralIndexJoin`/
+  `lateralNLIMatchFraction` (`cardinality.go`) — `estimateNLIndexJoin`'s twin
+  for the decomposed shape, dispatched from a new branch at the top of
+  `estimateJoin`. New test `TestEstimateRowsLateralIndexJoinSemiScalesByMatchFraction`
+  (`cardinality_propagation_test.go`) pins SEMI=100/ANTI=900/INNER=1000
+  against the decomposed `Join{Lateral:true}` shape, mirroring
+  `TestEstimateRowsNLIndexJoinSemiScalesByMatchFraction`. Gates: `go build
+  ./...` clean; `go test ./internal/optimizer/...` full-package green;
+  `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=34); `scripts/tpcds-sf025-regression.sh
+  sweep` PASS=96 MISMATCH=0 CKMISMATCH=0 (plan shape changed on 91/99
+  queries — the measured blast radius firing — zero correctness
+  regressions); `make ea-ratchet` 112→95 findings (22 FIXED incl. every
+  Q33/Q54/Q56 CTE-branch witness, 5 NEW one join-level up on Q23/Q84/Q95 —
+  the same unmasking pattern M0142-0009→M0142-0010 produced), baseline
+  re-pinned to 95 via `make ea-ratchet-repin`. **Per the harness's own
+  pre-authorization, the plan-parity floor-measurement suite itself (fresh
+  TPC-H/TPC-DS plan-parity capture + match/category re-scoring against PG
+  18.3) was NOT run this loop** — filed as follow-up **M0142-0012-verify**
+  below, plus a `.ralph/deferral_ledger.md` row (both required artefacts).
+  The 5 NEW ea-ratchet findings are filed separately as **M0142-0013**.
+- [ ] **M0142-0012-verify — run the plan-parity floor-measurement suite
+  M0142-0012 deferred** — filed by M0142-0012. M0142-0012 landed a
+  cardinality fix with a measured large blast radius (M0142-0012a: TPC-H
+  6/21 queries / 224 call-site hits, TPC-DS 69/99 queries / 6347 call-site
+  hits) and verified it via correctness gates only (tpch-spotcheck, SF0.25
+  sweep, ea-ratchet) — not against this milestone group's own headline
+  metric. Resume point: run a fresh TPC-H plan-parity capture (both
+  `-serial` and parallel, per M0137-0017's precedent) and a fresh TPC-DS
+  plan-parity capture, re-score each against the PG 18.3 oracle for
+  `match`/category counts, and record whether/how the current TPC-H 6/22 /
+  TPC-DS 2/99 headline moved. Cite the M0142-0012 commit as the delta point.
+- [ ] **M0142-0013 — recon: 5 NEW ea-ratchet findings one join-level up from
+  M0142-0012's fixes (Q23, Q84, Q95)** — filed by M0142-0012's `make
+  ea-ratchet` run. After M0142-0012 fixed 22 of the 112 pinned estimate
+  findings (mostly Q33/Q54/Q56's CTE-branch witnesses), 5 new findings
+  appeared: `Q23:catalog_sales+cte:frequent_ss_items+customer+date_dim`
+  (qerr 76.0, est=76 vs actual=0),
+  `Q23:cte:frequent_ss_items+customer+date_dim+web_sales`,
+  `Q84:customer+customer_address+customer_demographics+household_demographics+income_band+store_returns`,
+  and two `Q95:cte:ws_wh+...` nodes (`Sort` qerr 1782.7, `Hash Semi Join`
+  qerr 1363.1). M0142-0009's own fix produced the same "unmasking" pattern
+  (a join-level gap previously hidden behind a leaf's much larger error,
+  filed as M0142-0010, verdict: not a new defect, a second symptom of an
+  already-filed gap). Resume point: instrument each witness the same
+  env-gated-trace-then-revert way M0142-0010 did, on a private throwaway
+  SF0.25 clone (never the shared `:65437` gate cluster), and determine
+  whether these are a new mechanism or another symptom of an already-filed
+  gap (M0142-0005's missing-Memoize-on-NL-probe gap is the first thing to
+  rule in/out, since M0142-0012 changes exactly the estimator that gap's
+  workaround depends on).
 - [x] **M0142-0012a — scoping recon: measure M0142-0012's blast radius before
   implementing it** — filed by this loop from the working-set baton's own
   suggestion ("a 0142-0012 sub-scoping recon... is a reasonable first cut").

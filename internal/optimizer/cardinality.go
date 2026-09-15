@@ -354,6 +354,137 @@ func nliSemiMatchFraction(j *NestedLoopIndexJoin) float64 {
 	return sel
 }
 
+// isLateralIndexProbe reports whether n is the R25 decomposed-NLI shape's
+// bound probe leaf: a `*IndexScan`/`*IndexOnlyScan` with a real equality key
+// (not the unrelated full-range/ordering-only shape `indexScanRows` also
+// handles). Scoped to exactly these two types — not `nliInnerProbe`'s wider
+// set — because `createNestLoopBitmapJoinPlan` never builds the decomposed
+// `Join{Lateral}` shape for a bitmap probe; it stays fused (see that
+// function's own comment), so a `*BitmapHeapScan` reaching here would be a
+// genuine SQL `LATERAL` construct, not this mechanism.
+func isLateralIndexProbe(n Node) bool {
+	switch x := n.(type) {
+	case *IndexScan:
+		return x.Key != nil || len(x.Keys) > 0
+	case *IndexOnlyScan:
+		return x.Key != nil || len(x.Keys) > 0
+	}
+	return false
+}
+
+// estimateLateralIndexJoin is estimateNLIndexJoin's twin for the R25
+// (plan-parity-fix-take2) decomposed NLI shape: same INNER/LEFT-carries-
+// the-outer-unchanged, SEMI/ANTI-narrows-by-match-fraction reasoning (see
+// that function's header), adapted from Outer/Inner to Left/Right. Unlike
+// the fused node, `j` here already embeds a real `*Join`, so
+// `joinResidualSelectivity(j)` can be called directly — no synthetic
+// wrapper is needed the way estimateNLIndexJoin builds one.
+func estimateLateralIndexJoin(j *Join) int64 {
+	l := EstimateRows(j.Left)
+	if j.Type != JoinTypeSemi && j.Type != JoinTypeAnti {
+		return l
+	}
+	sel := lateralNLIMatchFraction(j)
+	sel *= joinResidualSelectivity(j)
+	if sel > 1 {
+		sel = 1
+	}
+	if j.Type == JoinTypeAnti {
+		sel = 1 - sel
+	}
+	return scaleByFloat(l, sel)
+}
+
+// lateralNLIMatchFraction is nliSemiMatchFraction's twin for the decomposed
+// shape. The one real difference is the outer-key expression's wrapper type:
+// `outerParamKey` (createplannl.go) re-roots every probe-key `*ColumnRef`
+// into an `*OuterColumnRef{Level: 1}` — a PG nestloop param — whose `Index`
+// is already a position in `j.Left`'s own output schema (the same
+// coordinate space the fused shape's plain `*ColumnRef.Index` used), so
+// resolving it against `j.Left` needs no extra translation. A plain
+// `*ColumnRef` is accepted too, for a genuine SQL `LATERAL` producer that
+// never rewrote its keys to outer params.
+func lateralNLIMatchFraction(j *Join) float64 {
+	idx, key, keys, ok := nliInnerProbe(j.Right)
+	if !ok || idx == nil || len(idx.Columns) == 0 {
+		return 1.0
+	}
+	var bound []Expr
+	switch {
+	case len(keys) > 0:
+		if len(keys) > len(idx.Columns) {
+			return 1.0
+		}
+		bound = keys
+	case key != nil:
+		bound = []Expr{key}
+	default:
+		return 1.0
+	}
+	var tbl *catalog.Table
+	switch in := j.Right.(type) {
+	case *IndexScan:
+		tbl = in.Table
+	case *IndexOnlyScan:
+		tbl = in.Table
+	}
+	if tbl == nil {
+		return 1.0
+	}
+	innerRows := tableRows(tbl)
+	sel := 1.0
+	for i, outerKey := range bound {
+		var outerRef baseColumnRef
+		var outerOK bool
+		if oc, isOuter := outerKey.(*OuterColumnRef); isOuter {
+			if oc.Level != 1 {
+				continue
+			}
+			outerRef, outerOK = resolveBaseColumn(oc.Index, j.Left)
+		} else if cr, isCol := outerKey.(*ColumnRef); isCol {
+			outerRef, outerOK = resolveBaseColumn(cr.Index, j.Left)
+		} else {
+			continue
+		}
+		colPos := -1
+		for c := range tbl.Columns {
+			if tbl.Columns[c].Name == idx.Columns[i] {
+				colPos = c
+				break
+			}
+		}
+		if colPos < 0 {
+			continue
+		}
+		innerRef, innerOK := resolveBaseColumn(colPos, j.Right)
+		var st1, st2 *catalog.ColumnStats
+		nd1, nd2 := 0.0, 0.0
+		nullfrac1 := 0.0
+		if outerOK {
+			st1 = outerRef.stats
+			nd1 = float64(outerRef.ndistinct)
+			if st1 != nil {
+				nullfrac1 = st1.NullFrac
+			}
+		}
+		if innerOK {
+			st2 = innerRef.stats
+			nd2 = float64(innerRef.ndistinct)
+		}
+		nd1Known := nd1 > 0
+		nd2Known := nd2 > 0
+		if !nd2Known {
+			nd2 = defaultNumDistinct
+		}
+		if innerRows > 0 && nd2 >= float64(innerRows) {
+			nd2 = float64(innerRows)
+			nd2Known = true
+		}
+		sel *= eqjoinselSemiCore(st1, st2, nd1, nd2, nd1Known, nd2Known, nullfrac1)
+	}
+	return sel
+}
+
 // `estimateMultiHashJoin` was deleted with the node by M0127-P6.2. It
 // mirrored the `*Join` arm's method — start at the probe table's row count,
 // walk the key chain, apply `l·r / max(nd_l, nd_r)` per step — and existed
@@ -720,6 +851,19 @@ func IsSmallDimensionSide(n Node) bool {
 //     nd-driven path would silently truncate genuine fan-out; the audit is
 //     what certifies that judgement (09 §5.3).
 func estimateJoin(j *Join) int64 {
+	// M0142-0012: R25 (plan-parity-fix-take2) decomposed the fused
+	// `*NestedLoopIndexJoin` into a generic `Join{Algo: NestedLoop,
+	// Lateral: true, Right: *IndexScan/*IndexOnlyScan}` whose probe key
+	// lives on the index leaf's own Key/Keys (an `*OuterColumnRef`
+	// nestloop param), not in Predicate — createNestLoopIndexJoinPlan /
+	// outerParamKey (createplannl.go). `joinEquiPairs` below always finds
+	// zero pairs on this shape, so without this arm every such join fell
+	// to the crude `l*r*0.005`/`max(l,r)`-capped fallback (measured at
+	// 224/6347 call-site hits across TPC-H/TPC-DS by M0142-0012a).
+	// estimateLateralIndexJoin is estimateNLIndexJoin's twin for it.
+	if j.Lateral && isLateralIndexProbe(j.Right) {
+		return estimateLateralIndexJoin(j)
+	}
 	l := EstimateRows(j.Left)
 	r := EstimateRows(j.Right)
 	if l <= 0 || r <= 0 {

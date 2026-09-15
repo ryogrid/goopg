@@ -132,6 +132,45 @@ func TestEstimateRowsNLIndexJoinSemiScalesByMatchFraction(t *testing.T) {
 	}
 }
 
+// TestEstimateRowsLateralIndexJoinSemiScalesByMatchFraction is M0142-0012:
+// the R25 (plan-parity-fix-take2) decomposition replaced the fused
+// *NestedLoopIndexJoin with a generic Join{Algo: NestedLoop, Lateral: true,
+// Right: *IndexScan} whose probe key is an *OuterColumnRef nestloop param
+// on the IndexScan leaf, not a Predicate equi-pair. Same inputs and same
+// expected numbers as TestEstimateRowsNLIndexJoinSemiScalesByMatchFraction
+// (nd1=1000, nd2=100 -> sel=0.1 of the outer's 1000 rows), wired the
+// decomposed way — before this fix, estimateJoin's generic *Join dispatch
+// found zero equi-pairs on this shape (Predicate carries only the leftover
+// residual) and fell to the l*r*0.005 fallback, which this test would catch
+// as a wrong (non-100/900) number.
+func TestEstimateRowsLateralIndexJoinSemiScalesByMatchFraction(t *testing.T) {
+	outer := &SeqScan{Table: statsTable("o", 1000, 1000)}
+	innerTbl := statsTable("i", 500, 100)
+	inner := &IndexScan{
+		Table: innerTbl,
+		Index: &catalog.Index{Table: innerTbl, Columns: []string{"c"}},
+		Key:   &OuterColumnRef{Level: 1, Index: 0}, // outerParamKey's rewrite of outer.c
+	}
+	semi := &Join{Type: JoinTypeSemi, Algo: JoinAlgoNestedLoop, Lateral: true, Left: outer, Right: inner}
+	if got, want := EstimateRows(semi), int64(100); got != want {
+		t.Fatalf("semi lateral-NLI estimate = %d, want %d (outer 1000 x nd2/nd1 = 0.1)", got, want)
+	}
+	if got := EstimateRows(semi); got >= EstimateRows(outer) {
+		t.Fatalf("semi lateral-NLI estimate %d did not narrow below outer input %d (match-fraction term is a no-op)",
+			got, EstimateRows(outer))
+	}
+
+	anti := &Join{Type: JoinTypeAnti, Algo: JoinAlgoNestedLoop, Lateral: true, Left: outer, Right: inner}
+	if got, want := EstimateRows(anti), int64(900); got != want {
+		t.Fatalf("anti lateral-NLI estimate = %d, want %d (outer 1000 x (1-0.1))", got, want)
+	}
+
+	inn := &Join{Type: JoinTypeInner, Algo: JoinAlgoNestedLoop, Lateral: true, Left: outer, Right: inner}
+	if got, want := EstimateRows(inn), int64(1000); got != want {
+		t.Fatalf("inner lateral-NLI estimate = %d, want %d (outer carried through unchanged)", got, want)
+	}
+}
+
 // TestJoinKeyNDistinctThroughProject pins the C5 selectivity fix: an
 // equi-join whose input is Project-wrapped must still resolve the key's
 // NDistinct instead of falling back to defaultEqSelectivity (Q10's
