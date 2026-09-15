@@ -1555,11 +1555,31 @@ setting that yields a serial plan.
   - No production change, no test pins moved. Ledger row:
     `m0140-0004-partial-append-producer`. Design doc:
     `docs/design/0100-0149/m0140-0004-partial-append-producer-recon-and-defer.md`.
-- [ ] **M0140-0005 — file the two out-of-reach items as ledger rows** — Q14's third
+- [x] **M0140-0005 — file the two out-of-reach items as ledger rows** — Q14's third
   category (K92: needs PG's real partial-inner execution model, "NOT cheap") and the
   non-planner floor (K14/K15 heap density; K41's unexplained dimension-table `relpages`
   divergence, `customer` 1,979 vs 2,872 and `item` 716 vs 1,284). Each row names the
-  mechanism and what would unblock it; neither is silently dropped.
+  mechanism and what would unblock it; neither is silently dropped. (DONE 2026-09-15
+  — filing only, no production change; both items were already fully investigated in
+  the prior phase's record, this task files them.)
+  - K92 (Q14's `parallelism` mismatch): PG's `Parallel Hash` needs workers building a
+    shared hash from a partial inner path behind a barrier; goopg's `joinOp`
+    deliberately drains the build side once on the leader before fan-out
+    (`parallel_scan.go`'s own comment warns the alternative "would silently drop
+    matches"). Not a labelling fix — needs new executor machinery (shared/DSM-
+    equivalent build target + barrier), comparable in size to a C-19-series slice.
+  - K14/K15/K41 (non-planner heap-density floor): `relpages` is a planner *input*, no
+    cost-model change can fix a wrong input. K39 already closed the fact-table
+    direction (`store_sales` 0.4% off PG); K41 (dimension tables, `customer`
+    1,979 vs 2,872, `item` 716 vs 1,284) stays open and unexplained — `character(N)`
+    blank-padding (R23) is the leading candidate mechanism but was never isolated as
+    K41's specific cause. Unblock: direct per-page free-space comparison, then R22
+    (heap fill) / R23 (blank-padding) — on-disk work, out of the planner remit.
+  - Ledger rows: `m0140-0005-q14-parallel-hash-execution-model`,
+    `m0140-0005-nonplanner-heap-density-floor`.
+  - Design doc:
+    `docs/design/0100-0149/m0140-0005-q14-third-category-and-nonplanner-floor-filing.md`.
+  - **M0140 is now fully closed** (all five tasks `[x]`).
 
 ## M0141 — Upper-planner ordering contest (filed 2026-09-14)
 
