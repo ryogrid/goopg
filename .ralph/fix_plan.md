@@ -2915,25 +2915,38 @@ cross-layer programme that has never been scoped.
   byte-level diff of the same TPC-DS captures falsely read 97/99 as changed
   (cost-number churn, not shape) — flagged in the doc as the wrong
   instrument for this question. Follow-up: **M0142-0014**.
-- [ ] **M0142-0013 — recon: 5 NEW ea-ratchet findings one join-level up from
+- [x] **M0142-0013 — recon: 5 NEW ea-ratchet findings one join-level up from
   M0142-0012's fixes (Q23, Q84, Q95)** — filed by M0142-0012's `make
-  ea-ratchet` run. After M0142-0012 fixed 22 of the 112 pinned estimate
-  findings (mostly Q33/Q54/Q56's CTE-branch witnesses), 5 new findings
-  appeared: `Q23:catalog_sales+cte:frequent_ss_items+customer+date_dim`
-  (qerr 76.0, est=76 vs actual=0),
-  `Q23:cte:frequent_ss_items+customer+date_dim+web_sales`,
-  `Q84:customer+customer_address+customer_demographics+household_demographics+income_band+store_returns`,
-  and two `Q95:cte:ws_wh+...` nodes (`Sort` qerr 1782.7, `Hash Semi Join`
-  qerr 1363.1). M0142-0009's own fix produced the same "unmasking" pattern
-  (a join-level gap previously hidden behind a leaf's much larger error,
-  filed as M0142-0010, verdict: not a new defect, a second symptom of an
-  already-filed gap). Resume point: instrument each witness the same
-  env-gated-trace-then-revert way M0142-0010 did, on a private throwaway
-  SF0.25 clone (never the shared `:65437` gate cluster), and determine
-  whether these are a new mechanism or another symptom of an already-filed
-  gap (M0142-0005's missing-Memoize-on-NL-probe gap is the first thing to
-  rule in/out, since M0142-0012 changes exactly the estimator that gap's
-  workaround depends on).
+  ea-ratchet` run. **DONE 2026-09-15, recon closed, no code change. Full
+  writeup:
+  `docs/design/0100-0149/m0142-0013-five-new-earatchet-findings-one-level-up.md`.**
+  Traced all 5 on a private SF0.25 clone (port 5533) plus the real PG 18.3
+  oracle. **Q23 (both)**: `frequent_ss_items`'s `HashAggregate … Filter:
+  (count(*) > 4)` over-estimate (4561 vs actual 0) is **PG-formula-identical**
+  — real PG estimates 4573 for the same node against the same actual=0, the
+  same `HAVING count(*) > k` weak spot in both engines. Closed, no defect,
+  same class as M0142-0010. **Q84**: the flagged `Limit` inherits a
+  compounded correlated-dimension-join estimate error; real (qerr 25 vs PG's
+  2.5) but the two engines' join orders diverge past the first two joins so
+  no single node isolates one defect — inconclusive at recon depth, not
+  urgent, noted as context only, no task filed. **Q95 (both) — genuine NEW
+  mechanism, confirmed by direct instrumentation**: a temporary trace in
+  `estimateJoin`'s SEMI/ANTI branch (`cardinality.go:880`) showed
+  `l = EstimateRows(j.Left)` evaluating to 29988 for a Lateral-index-join
+  chain whose own planner-costed `PlanCost.PlanRows` is 210 —
+  `estimateLateralIndexJoin`'s plain-INNER branch (`cardinality.go:382-396`)
+  returns the outer row count unconditionally, never applying
+  `joinResidualSelectivity` the way its own SEMI/ANTI branch three lines away
+  does, silently dropping the inner probe's `ca_state = 'VA'` filter whenever
+  a consumer recomputes through it (here, a SEMI join built on top during DP
+  search) instead of reading the costed value. The fused sibling
+  `estimateNLIndexJoin` (`cardinality.go:241-245`) has the identical
+  unconditional-return shape on its own INNER branch — both twins need the
+  fix (`pattern_sibling_paths_must_agree`). **M0142-0005 ruled OUT for all 5
+  findings** — no unmemoized NL-index probe is the amplifying step in any of
+  them (Q23/Q84 are pure Hash-Join chains; Q95's one Lateral-index probe is
+  an accurate 1:1 passthrough verified against its own actual data). Fix
+  filed as **M0142-0016** below.
 - [x] **M0142-0014 — triage the 17 TPC-DS plan-shape changes M0142-0012-verify
   found** — filed by M0142-0012-verify's self-diff (goopg-before vs
   goopg-after M0142-0012, cost-blind). **DONE 2026-09-15, recon closed, no
@@ -2984,6 +2997,34 @@ cross-layer programme that has never been scoped.
   milestone's own precedent; do not attempt a DP-search reordering fix
   blind (K50: any structural reordering can flip candidates already
   matching PG elsewhere in the corpus).
+- [ ] **M0142-0016 — fix `estimateLateralIndexJoin`/`estimateNLIndexJoin`'s
+  plain-INNER branches to apply residual selectivity** — filed by
+  M0142-0013's instrumented finding. Both twins (`cardinality.go:382-396`
+  and `:241-245`) return the outer row count completely unconditionally for
+  a plain INNER Lateral/NLI-index join, never consulting
+  `joinResidualSelectivity(j)` the way their own three-lines-away SEMI/ANTI
+  branches already do — so any filter carried on the inner index probe
+  (verified witness: Q95's `customer_address_pkey` probe's `Filter:
+  (ca_state = 'VA')`, ~4% true match rate) is silently dropped whenever a
+  consumer recomputes cardinality through the node via `EstimateRows` rather
+  than reading the already-costed `PlanCost.PlanRows` — confirmed by direct
+  trace to inflate a downstream SEMI join's estimate 142x past its own outer
+  input's costed value (Q95: `l=29988` vs the chain's own costed `210`), the
+  load-bearing cause of both Q95 `ea-ratchet` findings (qerr 1782.7, 1363.1).
+  Resume point: apply `joinResidualSelectivity` (or the equivalent
+  single-relation residual term — the SEMI/ANTI arm already builds the right
+  input shape via `j`/`adj`) to the plain-INNER return in BOTH functions,
+  mirroring the SEMI/ANTI arm each already has
+  (`pattern_sibling_paths_must_agree`). **Per K50, size this as a
+  blast-radius measurement first** (the M0142-0012a precedent) before
+  landing — a cardinality change on this shape can flip DP-search ties
+  elsewhere in the corpus (the exact mechanism M0142-0003c/M0142-0015 are
+  independently investigating for Q9/Q45's level-6 ties), and this shape's
+  call-site count was already measured at 224 TPC-H / 6347 TPC-DS hits by
+  M0142-0012a (a different but overlapping population — re-measure the
+  INNER-only subset before implementing). Full floor-measurement suite
+  required on landing (TPC-H/TPC-DS plan-parity, `make ea-ratchet`, SF0.25
+  sweep), same treatment M0142-0006/M0142-0009/M0142-0012 got.
 - [x] **M0142-0012a — scoping recon: measure M0142-0012's blast radius before
   implementing it** — filed by this loop from the working-set baton's own
   suggestion ("a 0142-0012 sub-scoping recon... is a reasonable first cut").
