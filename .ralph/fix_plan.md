@@ -2934,24 +2934,56 @@ cross-layer programme that has never been scoped.
   gap (M0142-0005's missing-Memoize-on-NL-probe gap is the first thing to
   rule in/out, since M0142-0012 changes exactly the estimator that gap's
   workaround depends on).
-- [ ] **M0142-0014 — triage the 17 TPC-DS plan-shape changes M0142-0012-verify
+- [x] **M0142-0014 — triage the 17 TPC-DS plan-shape changes M0142-0012-verify
   found** — filed by M0142-0012-verify's self-diff (goopg-before vs
-  goopg-after M0142-0012, cost-blind). 17 TPC-DS queries changed plan shape
-  (Q4, Q6, Q11, Q25, Q29, Q31, Q34, Q45, Q54, Q56, Q60, Q64, Q72, Q73, Q78,
-  Q79, Q88) with zero net change to the match count (still 2/99, Q9/Q41)
-  and only ±1–2 net category movement — read together with the flat
-  aggregate, this is the "moved plans sideways" case
-  (`AGENT.md` §"What every M0137–M0143 task report must contain", item 2),
-  not yet distinguished per-query from a masked regression. Resume point:
-  for each of the 17, read its `pg-plan-parity-diff.py` `SHAPE-DIFF [...]`
-  category tags in both `analysis/m0142/m0142-0001-tpcds-goopg.txt`
-  (pre-M0142-0012) and `analysis/m0142/m0142-0012verify-tpcds-goopg.txt`
-  (post) — already captured, no re-run needed — and classify each as
-  (a) traded one non-matching category set for a different non-matching set
-  of equal or better quality, or (b) picked up a *new* divergent category it
-  did not have before (a candidate regression, per K50's "aggregate hides
-  per-query movement" — the same read M0142-0001 applied to Q9/Q96
-  individually rather than trusting the corpus roll-up).
+  goopg-after M0142-0012, cost-blind). **DONE 2026-09-15, recon closed, no
+  code change. Full writeup:
+  `docs/design/0100-0149/m0142-0014-triage-17-tpcds-shape-changes.md`.**
+  Read each of the 17 queries' `pg-plan-parity-diff.py` category-tag set
+  against live PG pre- vs post-M0142-0012 (both already-committed captures,
+  no re-run). **13 neutral (tag set unchanged), 3 improved (Q31 -3, Q54 -2,
+  Q72 -2 divergent tags each), 1 genuine regression (Q45, +3: join-order,
+  scan-type, qual-placement)** — this exactly attributes every aggregate
+  category delta M0142-0012-verify measured (join-order +1 solely Q45,
+  join-method -1 solely Q54, aggregation-strategy/sort-strategy -1 solely
+  Q31, parallelism -2 Q31+Q54, scan-type/qual-placement net 0 as Q45's +1
+  cancels Q72's -1) — a residual-free accounting, not a guess. Confirmed
+  Q45 by reading raw EXPLAIN text: pre-fix goopg's join order
+  (`...⋈customer⋈customer_address⋈item`) matched real PG's own order
+  exactly; post-fix it's `...⋈customer⋈item⋈customer_address` —
+  M0142-0012's more-accurate index-probe cost flipped a close DP-search tie
+  away from PG's choice (same class as Q9's level-6 tie, M0142-0003b/0003c).
+  Q31/Q54/Q72 improvement mechanisms not traced (wins, no action needed).
+  **Verdict: M0142-0012 remains a net corpus improvement** (3 wins vs 1
+  now-understood loss); Q45's pre-fix state was already `SHAPE-DIFF` not a
+  `match`, so nothing regressed from match to non-match. Follow-up filed as
+  **M0142-0015** below.
+- [ ] **M0142-0015 — recon: why does M0142-0012 flip Q45's
+  `item`/`customer_address` DP-search tie away from PG's own choice?** —
+  filed by M0142-0014. Pre-M0142-0012, goopg's join order for Q45
+  (`...⋈customer⋈customer_address⋈item`) matched real PG 18.3's own order
+  exactly (verified by reading both `=== Q45` EXPLAIN blocks in
+  `analysis/m0142/m0142-0001-tpcds-goopg.txt` and `-pg.txt`). Post-M0142-0012
+  the order is `...⋈customer⋈item⋈customer_address` — `item` and
+  `customer_address` swapped, `customer_address` now outermost. Both are
+  unmemoized index-probe nested loops (`item_pkey`, `customer_address_pkey`)
+  of exactly the decomposed-NLI `Join{Lateral:true}` shape M0142-0012 just
+  taught the estimator to price accurately, so this is very likely the DP
+  search's own close tie between the two orderings flipping once one leg's
+  cost estimate became more accurate — the same class of question
+  M0142-0003c already opened for Q9's level-6 tie (never run for Q45).
+  Resume point: instrument or read the DP search's level for this relset on
+  a private throwaway SF0.25 clone (same env-gated-trace-then-revert
+  discipline as M0142-0003a/0010/0011/0012a — never the shared `:65437`
+  gate cluster) and determine which of `item`/`customer_address` now prices
+  cheaper and whether that price is *more* accurate than the alternative
+  (in which case Q45's real defect is elsewhere — e.g. a downstream `Sort`/
+  `Gather` cost term the milestone hasn't reached yet — not in M0142-0012)
+  or *less* accurate for this specific pair (in which case M0142-0012's new
+  formula has an edge case worth tightening). Size as a recon first per the
+  milestone's own precedent; do not attempt a DP-search reordering fix
+  blind (K50: any structural reordering can flip candidates already
+  matching PG elsewhere in the corpus).
 - [x] **M0142-0012a — scoping recon: measure M0142-0012's blast radius before
   implementing it** — filed by this loop from the working-set baton's own
   suggestion ("a 0142-0012 sub-scoping recon... is a reasonable first cut").
