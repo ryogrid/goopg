@@ -3025,6 +3025,33 @@ cross-layer programme that has never been scoped.
   INNER-only subset before implementing). Full floor-measurement suite
   required on landing (TPC-H/TPC-DS plan-parity, `make ea-ratchet`, SF0.25
   sweep), same treatment M0142-0006/M0142-0009/M0142-0012 got.
+  **UPDATE 2026-09-15 (M0142-0016a scoping recon, DONE): the fix target is
+  narrower than assumed above — `joinResidualSelectivity(j)` cannot see this
+  clause at all (its loop skips every non-`sideMixed` clause, and Q95's
+  `ca_state = 'VA'` is entirely on the inner/right side). The real fix target
+  is `IndexScan.Cond`/`IndexOnlyScan.Cond` (`plan.go:836`/`:1022`, the
+  parameterized-probe leftover-residual field), which neither
+  `nliSemiMatchFraction` nor `lateralNLIMatchFraction` reads today. Measured
+  blast radius: TPC-H 3/21 queries carry a real defect hit (Q7 25, Q8 33, Q21
+  19 call-sites; 6 more queries hit the shape as a no-op), TPC-DS SF0.25
+  55/99 queries carry a real defect hit (Q77 427, Q49 404 highest; 88/99 hit
+  the shape at all). Cross-validates M0142-0013's Q95 finding independently
+  (43 real hits) and confirms Q9's 90 hits are ALL no-ops (consistent with
+  M0142-0013's "PG-formula-identical" verdict for Q9). Full writeup:
+  `docs/design/0100-0149/m0142-0016a-scoping-recon-blast-radius.md`. Resume
+  point for the fix itself: multiply the match-fraction result by `Cond`'s
+  own selectivity (via `clauseSelectivity` or equivalent) in both functions'
+  SEMI/ANTI *and* now-justified INNER arms, watching Q7/Q8/Q21 for TPC-H
+  plan-shape movement per the recon's own risk note.**
+- [x] **M0142-0016a — scoping recon: measure M0142-0016's blast radius before
+  implementing it** — filed by this loop from M0142-0016's own K50 sizing
+  instruction (mirrors the M0142-0012a precedent). **DONE 2026-09-15, recon
+  closed, no code change. Full writeup in
+  `docs/design/0100-0149/m0142-0016a-scoping-recon-blast-radius.md`.** See
+  the M0142-0016 entry above for the findings (fix-target correction plus
+  per-query blast-radius numbers) — recorded there since it directly amends
+  that task's resume point, per this milestone's own precedent (M0142-0012a's
+  findings live on the M0142-0012 entry it scoped).
 - [x] **M0142-0012a — scoping recon: measure M0142-0012's blast radius before
   implementing it** — filed by this loop from the working-set baton's own
   suggestion ("a 0142-0012 sub-scoping recon... is a reasonable first cut").
