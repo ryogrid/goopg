@@ -163,11 +163,11 @@ placeholder is a comment, not a checkbox, so the plan-complete exit
 heuristic stays live.)
 
 ### Nightly run 20260901-010436 (sha `d93fb9edc669`, 7 items) — filed 2026-09-01
-- [ ] **testport/TestPort_PgStatActivity (AI-20260901-010436-005, AI-20260905-011015-007, AI-20260914-235643-010)**.
-- [ ] **testport/TestSyntax_Catalog_PgStatActivity (AI-20260901-010436-007, AI-20260905-011015-009, AI-20260914-235643-012)**.
+- [ ] **testport/TestPort_PgStatActivity (AI-20260901-010436-005, AI-20260905-011015-007, AI-20260914-235643-010, AI-20260916-035206-011)**.
+- [ ] **testport/TestSyntax_Catalog_PgStatActivity (AI-20260901-010436-007, AI-20260905-011015-009, AI-20260914-235643-012, AI-20260916-035206-013)**.
 
 ### Nightly run 20260902-005256 (sha `c11e55d253ff`, 8 items) — filed 2026-09-02
-- [ ] **testport/TestE2E_PGColdStartOnGoopgDataDir (AI-20260902-005256-001, AI-20260905-011015-002, AI-20260914-235643-004)**. New
+- [ ] **testport/TestE2E_PGColdStartOnGoopgDataDir (AI-20260902-005256-001, AI-20260905-011015-002, AI-20260914-235643-004, AI-20260916-035206-004)**. New
   tonight; possibly the M0131-S4 "FAIL-WHEN-FIXED" assertion flipping red
   because a Theme F fix landed rather than a real regression — re-run repro
   and check the M0131 Theme F findings list before treating as a bug.
@@ -181,19 +181,19 @@ heuristic stays live.)
   line filed for those per the "do not add another" rule.)
 
 ### Nightly run 20260905-011015 (sha `2e3deb52ba73`, 9 items) — filed 2026-09-11
-- [ ] **race/internal/executor (AI-20260905-011015-001, AI-20260914-235643-002)** — race suite failed
+- [ ] **race/internal/executor (AI-20260905-011015-001, AI-20260914-235643-002, AI-20260916-035206-002)** — race suite failed
   in `internal/executor` (also failed previous run; repro: `go test -race
   -timeout 45m ./internal/executor/`).
-- [ ] **testport/TestPort_IsolationIntraGrantInplace (AI-20260905-011015-003, AI-20260914-235643-006)** —
+- [ ] **testport/TestPort_IsolationIntraGrantInplace (AI-20260905-011015-003, AI-20260914-235643-006, AI-20260916-035206-006)** —
   FAILed, also failed previous run (repro: `go test -v -run
   '^TestPort_IsolationIntraGrantInplace$' ./internal/testport/`).
-- [ ] **testport/TestPort_IsolationStats (AI-20260905-011015-004, AI-20260914-235643-007)** — FAILed,
+- [ ] **testport/TestPort_IsolationStats (AI-20260905-011015-004, AI-20260914-235643-007, AI-20260916-035206-007)** — FAILed,
   also failed previous run (same testport repro pattern).
-- [ ] **testport/TestPort_LockRowsSortOverJoinTakesRowLock (AI-20260905-011015-005, AI-20260914-235643-008)** —
+- [ ] **testport/TestPort_LockRowsSortOverJoinTakesRowLock (AI-20260905-011015-005, AI-20260914-235643-008, AI-20260916-035206-009)** —
   FAILed subtests: join_no_sort, also failed previous run.
-- [ ] **testport/TestPort_PgDumpConnectionSetup (AI-20260905-011015-006, AI-20260914-235643-009)** —
+- [ ] **testport/TestPort_PgDumpConnectionSetup (AI-20260905-011015-006, AI-20260914-235643-009, AI-20260916-035206-010)** —
   FAILed, also failed previous run.
-- [ ] **testport/TestPort_RegressSuite (AI-20260905-011015-008, AI-20260914-235643-011)** — FAILed
+- [ ] **testport/TestPort_RegressSuite (AI-20260905-011015-008, AI-20260914-235643-011, AI-20260916-035206-012)** — FAILed
   subtests: limit, numerology, also failed previous run; 20260914-235643 adds subtests time, timetz.
   (Remaining 3 items — PGColdStart AI-…-002, PgStatActivity AI-…-007,
   Syntax_Catalog_PgStatActivity AI-…-009 — already have open tasks above;
@@ -201,16 +201,16 @@ heuristic stays live.)
   `ci/logs/20260905-011015/`.)
 
 ### Nightly run 20260914-235643 (sha `baf40efcbfbd`, 14 items) — filed 2026-09-15
-- [ ] **units/internal/parser (AI-20260914-235643-001)** — new tonight, units suite
+- [ ] **units/internal/parser (AI-20260914-235643-001, AI-20260916-035206-001)** — new tonight, units suite
   failed to build/run `internal/parser` (repro: `go test -timeout 10m
   ./internal/parser/`). Likely the same root cause as this file's own
   "Manually discovered" `parser/TestLockingClauseParity` entry below (filed the
   same day from an interactive gate run) — re-run both repros together before
   treating as two separate bugs.
-- [ ] **race/internal/parser (AI-20260914-235643-003)** — new tonight, race suite
+- [ ] **race/internal/parser (AI-20260914-235643-003, AI-20260916-035206-003)** — new tonight, race suite
   failed in `internal/parser` (repro: `go test -race -timeout 45m
   ./internal/parser/`). Same likely-shared root cause note as the item above.
-- [ ] **testport/TestPort_IsolationEvalPlanQual (AI-20260914-235643-005)** — new
+- [ ] **testport/TestPort_IsolationEvalPlanQual (AI-20260914-235643-005, AI-20260916-035206-005)** — new
   tonight, FAILed (repro: `go test -v -run '^TestPort_IsolationEvalPlanQual$'
   ./internal/testport/`).
 - [ ] **units/build-broke-mid-stage (AI-20260914-235643-013)** and
@@ -236,6 +236,25 @@ heuristic stays live.)
   testport/TestSyntax_Catalog_PgStatActivity AI-…-012 — already have open
   tasks above; AI-ids appended per the "do not add another" rule. Evidence
   for all: `ci/logs/20260914-235643/`.)
+
+### Nightly run 20260916-035206 (sha `48cf54f85429`, 13 items) — filed 2026-09-16
+- [ ] **testport/TestPort_IsolationSuite (AI-20260916-035206-008)** — new
+  tonight, FAILed (subtests: specs, specs/detach-partition-concurrently-1,
+  specs/tuplelock-upgrade-no-deadlock; repro: `go test -v -run
+  '^TestPort_IsolationSuite$' ./internal/testport/`).
+  (Remaining 12 items of this run — units/internal/parser AI-…-001,
+  race/internal/executor AI-…-002, race/internal/parser AI-…-003,
+  testport/TestE2E_PGColdStartOnGoopgDataDir AI-…-004,
+  testport/TestPort_IsolationEvalPlanQual AI-…-005,
+  testport/TestPort_IsolationIntraGrantInplace AI-…-006,
+  testport/TestPort_IsolationStats AI-…-007,
+  testport/TestPort_LockRowsSortOverJoinTakesRowLock AI-…-009,
+  testport/TestPort_PgDumpConnectionSetup AI-…-010,
+  testport/TestPort_PgStatActivity AI-…-011,
+  testport/TestPort_RegressSuite AI-…-012,
+  testport/TestSyntax_Catalog_PgStatActivity AI-…-013 — already have open
+  tasks above; AI-ids appended per the "do not add another" rule. Evidence
+  for all: `ci/logs/20260916-035206/`.)
 
 ### Manually discovered (not yet in a nightly `ci/logs/action-items.md` run) — filed 2026-09-15
 - [ ] **parser/TestLockingClauseParity** — deterministic FAIL, found while
@@ -2452,38 +2471,75 @@ cross-layer programme that has never been scoped.
   load-bearing divergence is DP enumeration ORDER at level 6, not a costing
   term (B8/B10 not implicated here).** Files M0142-0003c below as the
   concrete follow-on.
-- [ ] **M0142-0003c — level-6 enumeration-order parity vs PG's
-  `join_search_one_level`** — filed by -0003b's finding. goopg's own
-  partition is registered first at Q9's level 6 (`created=1` in `DPTRACE
-  pair`); PG's chain's equivalent pairing arrives later and loses an exact
-  cost tie to `addToPathlist`'s (PG-faithful) first-registered-wins
-  dominance rule. Real PG's planner produces PG's shape as Q9's winner,
-  which is only consistent with that same dominance rule if real PG's
-  `join_search_one_level` (`postgres/src/backend/optimizer/path/joinrels.c`)
-  visits/registers a PG-chain-equivalent relset pairing before goopg's
-  chain's equivalent at the analogous level. Concrete next step: instrument
-  or read goopg's level-6 relset-pair generation loop
-  (`internal/optimizer/joinsearch*.go`) and compare its visitation order
-  against `join_search_one_level`'s — same relation set, same clause
-  connectivity, does the two engines' iteration order over candidate pairs
-  actually differ, and if so does reordering it (to match PG's) flip which
-  partition gets registered first and thus which candidate wins the tie?
-  This is a genuinely new question (not previously scoped by K26/R53/R79 —
-  those examined connectivity/completeness/cost, not iteration order), so
-  size it as a recon task first (measurement only) before attempting any
-  reordering fix — an enumeration-order change is exactly the class of
-  planner-search-order surgery the practice card warns can move OTHER
-  queries' plans sideways or worse (K50: any structural reordering can flip
-  candidates already matching PG). **Second witness added by M0142-0015
-  (2026-09-16, TPC-DS Q45's `item`/`customer_address` level-5 tie) — unlike
-  Q9, Q45's near-tie was NOT an exact bit-for-bit dominance-eliminated pair
-  (both candidates stayed `verdict=accepted`, decided by a `2e-12` literal
-  float minimum, not registration order), so when this task is next picked
-  up it should treat Q9 and Q45 as two data points on the same question
-  rather than a single-witness recon.** Lower-priority secondary thread from the
-  same task: -0003b's Finding 1 left open why the two candidates' bit-exact
-  tie holds despite differently-composed (input, marginal) pairs — informative
-  but not required to resolve -0003c.
+- [x] **M0142-0003c — level-6 enumeration-order parity vs PG's
+  `join_search_one_level`** — **RECON DONE 2026-09-16, premise REFUTED for
+  Q9**, design doc
+  `docs/design/0100-0149/m0142-0003c-q9-real-pg-cost-gap-not-a-tie.md`. No
+  production change. Finding 1: goopg's `joinsearchlevel.go` is already a
+  faithful, line-cited structural port of PG's `join_search_one_level`
+  (phases 1/2/3, FROM-order initial rels, the level==2 dedup offset) —
+  verified against a closed-form pair-count test; the enumeration order does
+  NOT structurally differ, closing that branch of the fork. Finding 2
+  (decisive): forcing real PG 18.3 into goopg's own chosen Q9 join order
+  (`join_collapse_limit=1` + explicit left-deep `JOIN`, same method as
+  M0142-0015) costs **336207.55 vs PG's own default order's 204932.03 — a
+  64% gap, not a near-tie**. Real PG never needs a tie-break to prefer its
+  own chain; the near/exact tie -0003b measured is a property of GOOPG's cost
+  model alone. Finding 3: Q9 and Q45 (M0142-0015) turned out NOT to be two
+  witnesses of the same phenomenon as this task's own filing note assumed —
+  Q45 is a genuine near-tie in both engines (tie-break-class, unaffected by
+  this finding); Q9 is a real costing-term divergence goopg's model hides as
+  a coincidental exact tie. **Follow-up filed as M0142-0003d** (below):
+  which specific term underprices goopg's index-driven-NLI-over-lineitem
+  route (or overprices the hash-with-full-scan alternative) for this shape —
+  not scoped by this recon, which stopped at establishing the gap is real
+  and roughly where it originates (the lineitem access-path choice).
+  Lower-priority secondary thread, still open: -0003b's Finding 1's
+  bit-exact-tie-composition question (why goopg's two candidates' differently
+  composed (input, marginal) pairs sum to the identical float) — informative,
+  not required for -0003d.
+- [ ] **M0142-0003d — which cost term underprices goopg's index-driven NLI
+  over lineitem vs a hash-join-with-full-scan, for Q9's shape** — filed by
+  -0003c's Finding 2/3. Real PG's own default Q9 plan prices a Nested Loop
+  driving `lineitem` via `lineitem_part_supp_fkidx` from an already-shrunk
+  72728-row `{part,partsupp,supplier,nation}` composite at
+  `cost=7378.27..125204.04`; goopg's cost model, on the SAME partition,
+  prices its own `nestloop.index` candidate only ~3-9 units above its
+  `join.hash` winner (`80102.56`/`80108.48` vs `80099.64`,
+  -0003a Finding 2) — a tiny premium where PG's model assigns the identical
+  route a ~130000-unit-scale *discount* relative to the alternative
+  (hash-joining `lineitem` in as a base table, forcing a full 5,999,098-row
+  `Seq Scan`).
+  **A concrete lead exists, found by -0003c's own research pass, but it is
+  PRE-M0138 and needs RE-VERIFICATION, not blind reuse**:
+  `docs/design/not_ralph/plan_parity_fix_take2/r53-q9-costing-step0/SLICE1.md`
+  (2026-09-10) decomposed a same-shape, smaller (2.5%) pre-M0138 L6 margin
+  between these exact two partitions into exact arm terms and attributed it
+  entirely to **spill-page cost**: at 64MB `work_mem`, PG's real per-column
+  byte-width costing charges its winning build side zero spill (97740 rows
+  × ~60B ≈ 6MB, fits), while goopg's `hashJoinCost` (`cost_funcs.go:630`)
+  prices the analogous build via `hashsize.EntryBytes`'s 48-B/datum
+  column-count-based footprint (~743MB for the same rows — 11.6× over
+  budget), forcing a spill charge PG's own plan never pays. Roughly ten
+  cost-formula slices (M0138, M0142-0006..0016) landed between R53 and this
+  task, and goopg's OWN internal L6 margin moved from R53's 2.5% down to
+  -0003a/-0003b's exact tie across that interval while real PG's
+  whole-query margin (measured by -0003c) stayed large (64%) — consistent
+  with the interim changes shifting goopg's number by coincidence, not by
+  fixing the spill mechanism R53 named. Needs its own scoping recon
+  (measurement only) before any formula edit: (1) confirm goopg's DP search
+  at HEAD still generates a `hashsize.EntryBytes`-costed build comparable to
+  R53's finding for this exact partition (per
+  `planner_verify_both_candidates_generated` — don't assume R53's numbers
+  still apply verbatim, three cost-formula generations later), (2) get its
+  full cost breakdown (`internal/optimizer/cost_funcs.go`'s `hashJoinCost`
+  plus the NLI/index-probe terms in `pathparamindex.go`) against PG's
+  `cost_nestloop`/`cost_index`/`cost_hashjoin` (`costsize.c`), (3) check
+  whether `indexProbeCostMultiplier` (B8 — left explicitly UNSETTLED by
+  M0142-0005's 2026-09-16 recon,
+  `docs/design/0100-0149/m0142-0005-recon-partial-memoize-refused-by-gather-eligibility.md`)
+  is a second contributing term alongside the spill footprint, or unrelated.
+  Do NOT reopen B8 by assumption — measure first.
 - [x] **M0142-0004 — re-measure TPC-DS's row-estimate error at HEAD** — the
   ledger row `take3-rowest-collapse-diagnosed` (`.ralph/deferral_ledger.md:2120`,
   2026-09-06) named four cuts in order — **B1, A1, A2, A3** — and pinned the
