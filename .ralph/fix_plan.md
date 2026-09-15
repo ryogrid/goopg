@@ -2892,17 +2892,29 @@ cross-layer programme that has never been scoped.
   18.3) was NOT run this loop** — filed as follow-up **M0142-0012-verify**
   below, plus a `.ralph/deferral_ledger.md` row (both required artefacts).
   The 5 NEW ea-ratchet findings are filed separately as **M0142-0013**.
-- [ ] **M0142-0012-verify — run the plan-parity floor-measurement suite
+- [x] **M0142-0012-verify — run the plan-parity floor-measurement suite
   M0142-0012 deferred** — filed by M0142-0012. M0142-0012 landed a
   cardinality fix with a measured large blast radius (M0142-0012a: TPC-H
   6/21 queries / 224 call-site hits, TPC-DS 69/99 queries / 6347 call-site
   hits) and verified it via correctness gates only (tpch-spotcheck, SF0.25
   sweep, ea-ratchet) — not against this milestone group's own headline
-  metric. Resume point: run a fresh TPC-H plan-parity capture (both
-  `-serial` and parallel, per M0137-0017's precedent) and a fresh TPC-DS
-  plan-parity capture, re-score each against the PG 18.3 oracle for
-  `match`/category counts, and record whether/how the current TPC-H 6/22 /
-  TPC-DS 2/99 headline moved. Cite the M0142-0012 commit as the delta point.
+  metric. **DONE 2026-09-15.** Design doc:
+  `docs/design/0100-0149/m0142-0012-verify-plan-parity-floor-remeasure.md`.
+  Fresh TPC-H (`-serial` and `-serial=false`) and TPC-DS SF0.25 captures vs
+  live PG 18.3: **headline unmoved** — TPC-H `-serial` match=6/22, TPC-H
+  parallel match=2/22 (categories byte-identical to M0137-0017), TPC-DS
+  match=2/99 (Q9/Q41 floor intact); the `PLAN-PARITY` aggregate line and
+  eight of nine TPC-DS category counts are unchanged pre/post, the ninth
+  (`join-order`) moves by exactly 1. A cost-blind goopg-vs-goopg self-diff
+  (reusing `pg-plan-parity-diff.py`'s shape extraction) found the honest
+  shape-delta: TPC-H 0/22 shapes changed (despite 6/21 queries' costs
+  moving), TPC-DS 17/99 shapes changed (Q4/Q6/Q11/Q25/Q29/Q31/Q34/Q45/Q54/
+  Q56/Q60/Q64/Q72/Q73/Q78/Q79/Q88) with none becoming a new match and
+  neither existing match lost — "moved sideways," the report contract's
+  named failure mode for shape-delta-without-category-movement. A naive
+  byte-level diff of the same TPC-DS captures falsely read 97/99 as changed
+  (cost-number churn, not shape) — flagged in the doc as the wrong
+  instrument for this question. Follow-up: **M0142-0014**.
 - [ ] **M0142-0013 — recon: 5 NEW ea-ratchet findings one join-level up from
   M0142-0012's fixes (Q23, Q84, Q95)** — filed by M0142-0012's `make
   ea-ratchet` run. After M0142-0012 fixed 22 of the 112 pinned estimate
@@ -2922,6 +2934,24 @@ cross-layer programme that has never been scoped.
   gap (M0142-0005's missing-Memoize-on-NL-probe gap is the first thing to
   rule in/out, since M0142-0012 changes exactly the estimator that gap's
   workaround depends on).
+- [ ] **M0142-0014 — triage the 17 TPC-DS plan-shape changes M0142-0012-verify
+  found** — filed by M0142-0012-verify's self-diff (goopg-before vs
+  goopg-after M0142-0012, cost-blind). 17 TPC-DS queries changed plan shape
+  (Q4, Q6, Q11, Q25, Q29, Q31, Q34, Q45, Q54, Q56, Q60, Q64, Q72, Q73, Q78,
+  Q79, Q88) with zero net change to the match count (still 2/99, Q9/Q41)
+  and only ±1–2 net category movement — read together with the flat
+  aggregate, this is the "moved plans sideways" case
+  (`AGENT.md` §"What every M0137–M0143 task report must contain", item 2),
+  not yet distinguished per-query from a masked regression. Resume point:
+  for each of the 17, read its `pg-plan-parity-diff.py` `SHAPE-DIFF [...]`
+  category tags in both `analysis/m0142/m0142-0001-tpcds-goopg.txt`
+  (pre-M0142-0012) and `analysis/m0142/m0142-0012verify-tpcds-goopg.txt`
+  (post) — already captured, no re-run needed — and classify each as
+  (a) traded one non-matching category set for a different non-matching set
+  of equal or better quality, or (b) picked up a *new* divergent category it
+  did not have before (a candidate regression, per K50's "aggregate hides
+  per-query movement" — the same read M0142-0001 applied to Q9/Q96
+  individually rather than trusting the corpus roll-up).
 - [x] **M0142-0012a — scoping recon: measure M0142-0012's blast radius before
   implementing it** — filed by this loop from the working-set baton's own
   suggestion ("a 0142-0012 sub-scoping recon... is a reasonable first cut").
