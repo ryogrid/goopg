@@ -1981,13 +1981,41 @@ spill route is net-negative.
   set); TPC-DS shape-changed={Q31 (real), Q78 (cost-digits-only, verdict
   unchanged)}. Full method, artefacts and the "what every task must
   contain" census: `docs/design/0100-0149/m0141-s2a-fix1-agg-input-width-preview.md`.
-- [ ] **M0141-S2a-fix2 — `hashAggEntrySize` fixed-overhead currency
+- [x] **M0141-S2a-fix2 — `hashAggEntrySize` fixed-overhead currency
   correction** (gated on M0141-S2a-fix1 landing and being measured): add the
   missing `MAXALIGN(SizeofMinimalTupleHeader) + tupleWidth` fixed-overhead
   term PG's `hash_agg_entry_size` (`nodeAgg.c:1701-1730`) charges alongside
   the variable payload, re-derived per B2 (not a verbatim reinstatement of
   the deleted `GOOPG_HASHAGG_WIDTH_CURRENCY`, per M0141-S2a-fix's own text).
   Attempt only after fix1's isolated result is known.
+  - **ATTEMPTED and MEASURED 2026-09-15, decision: HOLD — not adopted.**
+    Design doc `docs/design/0100-0149/m0141-s2a-fix2-hashaggentrysize-currency-attempt.md`.
+    Implemented exactly as scoped: `costAgg`'s spill arm's guard changed to
+    `inNcols > 0 || inAvgVarBytes > 0` and its width argument to
+    `hashsize.EntryBytes(inNcols, inAvgVarBytes)` (was bare `inAvgVarBytes`),
+    restoring "Arm C" (fixed-width inputs now price a real 48·ncols+24
+    footprint). Measured clean against a same-PG-reference control (TPC-H,
+    to strip PG-side sampling noise between independent captures) and a
+    matching-stats-epoch comparison (TPC-DS): **TPC-H `match` unchanged at
+    8**, one query (Q18) changes shape LATERALLY (+1 `sort-strategy`, -1
+    `rendering`, stays `SHAPE-DIFF`); **TPC-DS `match` unchanged at 2**, one
+    query (Q31) changes shape and REGRESSES three categories
+    (`aggregation-strategy`/`sort-strategy`/`parallelism`, +1 each) back to
+    byte-identical with the PRE-fix1 baseline — fix2 exactly cancels fix1's
+    one TPC-DS gain. No `MATCH` lost anywhere (the hard non-regression floor
+    is unaffected), but no net category-movement gain either, and TPC-DS
+    nets negative with no compensating story (unlike B3's kept regression,
+    which had a genuine bug fix to weigh against it). This reproduces R124
+    §7's "measured net-neutral" verdict for the identical currency
+    correction a second time, now WITH fix1's live-at-cost-time `inNcols`
+    preview the task text hoped would change the outcome — it did not.
+    **Code reverted** (`git checkout --` on `cost_funcs.go` and its four
+    accompanying test files) after measurement, matching M0137-0009's
+    "DELETE rather than carry another round" precedent rather than
+    introducing a new flag. 4 measurement artefacts committed
+    (`analysis/m0141/m0141-s2a-fix2-*`). Treat `hashAggEntrySize`'s currency
+    as closed for this milestone group absent new evidence — do not
+    re-attempt without a different substitution or a different mechanism.
 - [ ] **M0141-S2b — GROUP_AGG rel publishes Pathlist, not Node, to the
   ORDER BY step** — the K24 "ordering contest, slice 3" surgery: change
   `createOrderedPaths`'s callers (every `createXPaths` -> `createOrderedPaths`
