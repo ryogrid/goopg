@@ -2629,6 +2629,16 @@ cross-layer programme that has never been scoped.
   Sibling K73 (`Join.FromOuterReduction`) retires with B8. Expect an executor
   slice; per the harness a matching plan that runs slower is not a regression,
   so the Memoize half may be scoped for correctness of the *cost*, not speed.
+  **New corpus evidence (M0142-0010, 2026-09-15)**: this gap is not only a
+  Q72-timeout/cost tradeoff — it is the diagnosed cause of two `make
+  ea-ratchet` findings (Q34/Q73, `date_dim+store+store_sales`, qerr ~42).
+  goopg's `estimateJoin` fallback for that relset is verified PG-formula-
+  identical (matches real PG's own `eqjoinsel_inner` no-mutual-MCV default
+  bit-for-bit against the oracle's `pg_stats`), so the qerr is purely a
+  consequence of being forced into a hash join instead of PG's chosen
+  `Nested Loop`+`Memoize`+`Index Scan using date_dim_pkey` — see
+  `docs/design/0100-0149/m0142-0010-join-level-gap-is-memoize-shape-not-cardinality-bug.md`
+  for the full trace.
 - [ ] **M0142-0006 — apply `semiJoinMatchFraction` in `estimateNLIndexJoin`** —
   `estimateNLIndexJoin` (`cardinality.go:239-241`) returns `EstimateRows(j.Outer)` for
   SEMI/ANTI, while its sibling `estimateJoin` (`:608-625`) applies the match
@@ -2703,20 +2713,35 @@ cross-layer programme that has never been scoped.
   `go test ./internal/optimizer/...` PASS incl. new
   `TestRangeOpSelectivityUsesMCVWithoutHistogram`; `scripts/tpch-spotcheck.sh`
   RESULT=PASS (Q12=2, Q13=34); `go build ./...` clean.
-- [ ] **M0142-0010 — recon: a join-level cardinality gap unmasked by
+- [x] **M0142-0010 — recon: a join-level cardinality gap unmasked by
   M0142-0009's leaf fix** — `date_dim+store+store_sales` estimates ~40x
   under actual in both Q34 (`Gather`, est=2105 vs actual=91450, qerr 43.4)
-  and Q73 (`Hash Join`, est=630 vs actual=26312, qerr 41.8), newly visible in
-  `make ea-ratchet` once M0142-0009's leaf-level `date_dim` filter stopped
-  drowning it out (previously masked under a qerr in the thousands at the
-  same relset). Resume point: instrument `estimateJoin`/`estimateNLIndexJoin`
-  on this specific relset the way M0142-0009 instrumented
-  `rangeOpSelectivityStats` — establish the mechanism (measured-branch
-  `pairNDistinct`/superkey selectivity vs an unmeasured fallback, per
-  `cardinality.go:607-698`) before proposing a fix; do not assume it is the
-  same mechanism M0142-0009 just fixed without checking directly. Evidence:
-  `analysis/planner-refactor-take3/c20a-estimator-census-20260915/ea-findings-20260915-post0009fix.json`,
-  `ea-baseline.txt` (112-entry, post-0009 pin).
+  and Q73 (`Hash Join`, est=630 vs actual=26312, qerr 41.8). **DONE
+  2026-09-15, recon closed, no code change. Full writeup in
+  `docs/design/0100-0149/m0142-0010-join-level-gap-is-memoize-shape-not-cardinality-bug.md`.**
+  Instrumented `estimateJoin` (temporary env-gated trace, reverted) on a
+  private SF0.25 clone: `pairNDistinct` returns `nd=73049`
+  (`date_dim.d_date_sk`'s row count, a PK) and the estimate is
+  `l * r * (nullSel/nd)`, the standard FK->PK uniform-domain formula.
+  Measured goopg's own stats: `store_sales.ss_sold_date_sk` has only 1823
+  distinct values (~5-year window) against `date_dim`'s 73049-row,
+  1900-2100 span. Checked PG's `eqjoinsel_inner`
+  (`postgres/src/backend/utils/adt/selfuncs.c:2445`): its no-mutual-MCV
+  default is `MIN(1/nd1,1/nd2)*(1-nullfrac1)*(1-nullfrac2)` — literally the
+  same formula. Queried the real PG 18.3 oracle's `pg_stats` on
+  identically-generated data: `ss_sold_date_sk` has a 100-entry MCV but
+  `d_date_sk` (unique PK) has none, so PG's own exact-overlap branch cannot
+  fire either and PG's planner would compute the **identical** `1.31e-5`
+  selectivity for this join shape — verified bit-for-bit against the trace.
+  **Verdict: goopg's cardinality math for this relset is PG-formula-identical,
+  not a defect.** Real PG's actual plan is accurate only because it picks a
+  different shape (`Nested Loop`+`Memoize`+`Index Scan using date_dim_pkey`,
+  pricing each outer row's probe directly instead of assuming uniform-over-
+  73049) — the already-filed **M0142-0005** gap (no Memoize on the NL probe
+  path) is why goopg cannot choose that shape. Not a new mechanism; a second,
+  independently-verified symptom of M0142-0005, which now carries this
+  corpus evidence as part of its resume point. Deferral ledger row filed
+  (dated 2026-09-15) linking this evidence to M0142-0005.
 
 ## M0143 — Engine correctness carry-overs from the parity programme (filed 2026-09-14)
 
