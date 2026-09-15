@@ -2513,32 +2513,52 @@ cross-layer programme that has never been scoped.
   dimension, so estimate error is invisible to every parity gate — it
   reaches the metric only indirectly, by changing plan shape. `make
   ea-ratchet` is the instrument that scores it directly.
-- [ ] **M0142-0004a — recon: is the unique-pkey `IndexScan` `est=1` finding a
+- [x] **M0142-0004a — recon: is the unique-pkey `IndexScan` `est=1` finding a
   planner bug or a loops-vs-total capture artifact?** Filed by M0142-0004.
-  19 of that task's 140 `ea-ratchet` findings are `Index Scan using X_pkey`
-  nodes goopg estimates at `est=1` (`indexScanRows`, `cardinality.go:329`,
-  `idx.Unique && nEq >= len(idx.Columns)` — PG's own `btcostestimate`
-  unique-equality special case, correct for a single non-repeated probe).
-  Several carry a PG-side estimate that is *also* far from 1 for the same
-  named index on the same table (q34 `household_demographics_pkey`: goopg=1,
-  PG=489, actual=10082; q68 same index: goopg=1, PG=1800, actual=5899) — if
-  this were a genuine single unique-key equality lookup, PG would price it
-  at 1 too (identical special case upstream), so the two engines are likely
-  not looking at the same physical operation. Leading hypothesis: the scan
-  is executed once per outer row of a correlated subplan/lateral context,
-  and EXPLAIN ANALYZE's `rows=` is a **per-loop average** — if the capture
-  tooling (`scripts/estimate-parity-gate.sh` / its census parser) reads that
-  as a bare total without accounting for `loops=N`, every repeated-execution
-  index probe would show this exact signature regardless of planner
-  correctness. Concrete next step: pick one witness (q34, `store_pkey`, PG
-  qerr 830.8x is the most PG-divergent) and read its raw
-  `EXPLAIN (ANALYZE, ...)` output directly (not through the JSON summary) to
-  check `loops=`; if `loops > 1` and `rows= * loops ≈ actual`, this is a
-  measurement artifact in the estimate-audit tooling, not a planner defect,
-  and the fix belongs in the capture/scoring script, not `indexScanRows`.
-  Only if `loops<=1` genuinely is a single-probe miss should `indexScanRows`
-  itself be revisited. Evidence:
-  `analysis/planner-refactor-take3/c20a-estimator-census-20260915/ea-findings-20260915.json`.
+  **DONE 2026-09-15, and FIXED (not just diagnosed)** — the hypothesis was
+  half right: `loops>1` is exactly the trigger, but the bug is neither in
+  `indexScanRows` nor in the capture/scoring script (`scripts/estimate-parity/parity.py`
+  already documents and implements PG's per-loop-average convention
+  correctly, lines 48-52). It is in the goopg **ENGINE's own EXPLAIN ANALYZE
+  renderer**: `operators_explain.go`'s text line (former :2472-2475), JSON
+  field (former :2718 `obj["Actual Rows"] = s.rowsOut`), and per-worker line
+  (former :2606) all printed the raw CUMULATIVE `rowsOut` counter
+  (`instrument.go`'s `nodeStats.rowsOut`, which accumulates across every
+  Open/Next cycle and is never reset on re-Open) instead of dividing by
+  `loops`. PG's own `rows=` is `instrument->ntuples / nloops`
+  (`postgres/src/backend/commands/explain.c:1835,1901`, confirmed by
+  reading the oracle source directly) — a PER-LOOP average, and the
+  renderer's own pre-existing comment (`operators_explain.go:2444`, still
+  there) already stated this PG convention correctly without the code
+  implementing it. Verified with the q34 witness the task named: `Index Scan
+  using store_pkey`, raw capture line `(actual rows=9969.00 loops=10082)` —
+  9969/10082 = 0.99, matching goopg's own `est=1` almost exactly (qerr would
+  drop from 9969x to ~1x), confirming this was never a cardinality-estimator
+  defect. **Fix landed**: added `rowsPerLoop(rowsOut, loops)` (divides,
+  loops<=0 falls back to the raw value to avoid NaN on an unexecuted node)
+  and wired all three call sites through it; added `round2` for the
+  JSON/XML/YAML path (`encoding/json` prints a float64 at full precision,
+  unlike the text path's free `%.2f` from `fmt`) matching PG's
+  `ExplainPropertyFloat(..., ndigits=2, ...)` (`explain_format.c:250`).
+  Tests: `TestRowsPerLoopIsPGsPerLoopAverage`, `TestRound2MatchesExplainPropertyFloatNdigits2`
+  (`internal/executor/explain_analyze_test.go`) pin the two helpers directly
+  — an end-to-end SQL regression test was attempted first via a correlated
+  scalar SubPlan (`t1.b > (SELECT t2.b FROM t2 WHERE t2.a=t1.a LIMIT 1)`)
+  but the SubPlan's inner subtree renders with NO `(actual ...)` annotation
+  at all under this harness (see the new deferral-ledger row below), so it
+  could not exercise the fix; a GUC-forced Nested Loop
+  (`SET enable_hashjoin=off`) was also tried but `SET` is unsupported at
+  this raw-executor test-fixture layer. Gates: full `internal/executor`
+  suite green, `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=34). **User-
+  visible impact beyond the estimator census**: any real `EXPLAIN (ANALYZE)`
+  over a correlated subplan or NL/NLI inner side previously printed a
+  `rows=` inflated by up to `loops`x versus real PG's output for the
+  identical plan — a genuine PG-compatibility defect this task's own
+  "fixed at HEAD" framing (from M0142-0004) did not anticipate finding.
+  Follow-up filed as **M0142-0004c** (below): re-run `make ea-ratchet` to
+  confirm the C1 findings collapse post-fix, since this task fixed root
+  cause without re-capturing the artifact that named it. Design doc:
+  `docs/design/0100-0149/m0142-0004a-explain-analyze-loops-average.md`.
 - [ ] **M0142-0004b — recon: why does a 3-way CTE `UNION ALL` land at
   `est=3` against actuals up to 1557x higher?** Filed by M0142-0004. Q33,
   Q56, Q60 each union three CTE branches (`cs`, `ss`, `ws`, each a filtered
@@ -2559,6 +2579,25 @@ cross-layer programme that has never been scoped.
   the practice card's own history (`goopg_swallowed_error_in_rewrite_driver`,
   five wrong hypotheses) is a standing warning to instrument before
   theorising. Evidence: same `ea-findings-20260915.json` as -0004a.
+- [ ] **M0142-0004c — re-run `make ea-ratchet` to confirm the C1 findings
+  collapse post-fix** — Filed by M0142-0004a. M0142-0004a fixed
+  `operators_explain.go`'s EXPLAIN ANALYZE `rows=` (text/JSON/per-worker) to
+  divide by `loops` instead of printing the cumulative total
+  (`rowsPerLoop`/`round2`, commit TBD), root-causing all 19 of the C1
+  `Index Scan using X_pkey est=1` findings from the 2026-09-15 census as a
+  measurement bug, not a cardinality-estimator bug — verified on one
+  witness (q34 `store_pkey`: 9969/10082=0.99≈est=1) but not yet
+  re-captured corpus-wide. This task is pure measurement: re-run
+  `make ea-ratchet` (fresh `ea-capture-<date>.txt` +
+  `ea-findings-<date>.json`, same harness M0137-0018/M0142-0004 used) and
+  confirm (a) all 19 C1-shaped findings drop below the `qerr>=10` flag
+  threshold, (b) the 140-finding total shrinks accordingly with no new
+  findings appearing (a `rows=` fix should only ever LOWER a qerr that was
+  inflated by the bug, never raise one), (c) whether any of the 100x-1000x
+  or >=1000x findings were ALSO loops>1 artifacts not yet named — the 2026-09-15
+  pass only picked the two cheapest new mechanisms (C1, C2) to file, not an
+  exhaustive per-finding `loops=` audit. Evidence base:
+  `analysis/planner-refactor-take3/c20a-estimator-census-20260915/ea-findings-20260915.json`.
 - [ ] **M0142-0005 — break the Memoize / probe-multiplier interlock (B6+B8)** —
   two ledger rows that lock each other. **B6**: goopg's executor has no Memoize
   on the NL probe path R59 repriced, so pricing probes PG-faithfully took

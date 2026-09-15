@@ -1,64 +1,61 @@
-Task: M0142-0004 — re-measure TPC-DS's row-estimate error at HEAD, per
-banner item 4. **DONE this loop, measurement-only** (matching the
-M0142-0003a/0003b recon-task precedent): analyzed the `make ea-ratchet`
-artifacts M0137-0018 (previous loop) had already captured at this same HEAD
-(no planner/executor/catalog diff between that commit and this one), rather
-than re-running the ~10min capture for an unchanged code state.
+Task: M0142-0004a — recon: is the unique-pkey `IndexScan` `est=1`
+finding a planner bug or a loops-vs-total capture artifact? **DONE and
+FIXED this loop** (banner item 4's M0142-0004 group, second pick after
+last loop's M0142-0004 itself).
 
-Files: `.ralph/fix_plan.md` (M0142-0004 marked `[x]`; two new `[ ]`
-sub-tasks filed: M0142-0004a/0004b), `.ralph/deferral_ledger.md` (new row
-`m0142-0004`, status `-`), `docs/design/0100-0149/m0142-0004-tpcds-rowest-remeasure-at-head.md`
-(new), `docs/design/README.md` (+1 row). Also refreshed the stale memory
-topic file `goopg_tpcds_rowest_off_by_orders.md` (its 2026-09-06 examples
-are all fixed at HEAD) and shrank `MEMORY.md` from 28.6KB to 17.1KB (it had
-silently exceeded its 24.4KB read limit — entries past line 127 were
-already being dropped on load; trimmed every line and removed ~10 fully
-narrow/stale entries). No production Go code touched this loop.
+Files: `internal/executor/operators_explain.go` (added `rowsPerLoop`/
+`round2` helpers, wired the text/JSON/per-worker EXPLAIN ANALYZE
+renderers through them instead of the raw cumulative `rowsOut`),
+`internal/executor/explain_analyze_test.go` (2 new unit tests),
+`.ralph/fix_plan.md` (M0142-0004a `[x]`, filed M0142-0004c follow-up),
+`.ralph/deferral_ledger.md` (2 new rows: the fix's own follow-up pointer,
++ a side-discovery about SubPlan child nodes rendering no `(actual ...)`
+annotation at all, unverified/unfixed), `docs/design/0100-0149/m0142-0004a-explain-analyze-loops-average.md`
+(new), `docs/design/README.md` (+1 row).
 
-Key symbols/tools: `analysis/planner-refactor-take3/c20a-estimator-census-20260915/ea-findings-20260915.json`
-(605 nodes scored, 140 flagged `qerr>=10` — the artifact this task's finding
-is built from); `internal/optimizer/cardinality.go:329` `indexScanRows`
-(the unique-pkey `est=1` special case, C1's subject); `:208` `estimateSetOp`
-(C2's subject — itself PG-faithful, so the bug is upstream of it);
-`internal/optimizer/joinkeyproof.go` `resolveBaseColumn` family (B2's arm
-list, confirmed still missing `*Append`/`*SetOp`, but latent — no live
-witness).
+Key symbols: `rowsPerLoop(rowsOut, loops int64) float64` and
+`round2(v float64) float64` (`operators_explain.go`, near `nsToMs`);
+call sites at the text renderer's `(actual ... rows=%.2f loops=%d)`
+line, `planToJSONWithStatsNamed`'s `obj["Actual Rows"]`, and the
+`Worker %d: ...` per-worker line. Root cause lived in `instrument.go`'s
+`nodeStats.rowsOut` (accumulates across every Open/Next cycle, never
+reset on re-Open) vs PG's `explain.c:1835,1901`
+(`rows = instrument->ntuples / nloops`).
 
-Findings: **distribution** 20 findings >=1000x, 41 at 100x-1000x, 79 at
-10x-100x, max 14,500x (Q47) — read as "~1-4 orders out for ~23% of scored
-nodes", NOT a repeat of the old single-anecdote "3-5 orders" (that anecdote,
-Q22, now has zero findings). **B2 reclassified**: structurally still absent
-in code, but its original witness (Q76) no longer shows any qerr>=10
-finding — latent, not closed, no active symptom to chase right now.
-**Two NEW mechanisms filed, neither previously in the ledger**: (C1) 19
-findings are `Index Scan using X_pkey` nodes at `est=1` where PG's OWN
-estimate for the same named index is ALSO far from 1 (q34
-`household_demographics_pkey`: PG=489 vs actual=10082) — leading hypothesis
-is a loops-vs-total EXPLAIN ANALYZE capture-tooling artifact (repeated
-per-outer-row subplan execution), not necessarily a shared planner bug;
-UNVERIFIED, next step is reading one witness's raw `loops=` field. (C2) a
-3-way CTE `UNION ALL` (Q33/56/60: `cs`/`ss`/`ws`) estimates `est=3` against
-actuals up to 1557 — `estimateSetOp`'s arithmetic is correct, so each CTE
-branch's OWN row estimate is what collapses to ~1; UNVERIFIED which node in
-the branch subtree does it.
+Findings: confirmed via the q34 witness M0142-0004a itself named
+(`store_pkey`, raw capture line `actual rows=9969.00 loops=10082`):
+9969/10082 ≈ 0.99, matching goopg's own `est=1` almost exactly — the
+finding was never a cardinality-estimator defect, it was goopg's own
+EXPLAIN ANALYZE misreporting `actual` as a cumulative total instead of
+PG's per-loop average. This is a genuine PG-compatibility bug beyond the
+estimator census: any real `EXPLAIN (ANALYZE)` over a correlated
+subplan or NL/NLI inner side previously printed `rows=` inflated by up
+to `loops`x vs real PG for the identical plan. Scoring script
+(`scripts/estimate-parity/parity.py`) was ruled OUT — it already
+implements PG's per-loop convention correctly.
+Side discovery (unverified, not chased — see ledger): a correlated
+scalar SubPlan's inner nodes render NO `(actual ...)` annotation at all
+under ANALYZE, even though the SubPlan's own `calls=N rebuilds=...`
+summary proves it re-executed. Two attempted end-to-end regression
+tests (SubPlan-based, GUC-forced-NestedLoop-based) both failed to
+exercise the fix for unrelated reasons (see design doc); settled for 2
+direct unit tests on the pure helpers instead.
 
 In-flight: none. No server/gate process left running.
 
-Next step: per the banner, item 4 is still open (M0142-0004 was only its
-first pick). Candidates for the next loop, all reasonable: **M0142-0004a**
-(recon: is C1 real or a capture artifact — cheapest, answers a measurement
-question about the harness itself before any more `ea-ratchet` output is
-trusted), **M0142-0004b** (recon: trace C2's CTE-branch collapse), or
-continuing item 4's other named work (M0141 S2b/S3-S7, M0142-0005 onward).
-M0142-0004a is the recommended pick — it is cheap (single-witness EXPLAIN
-read, no code change expected) and its answer determines whether 19 of the
-140 `ea-ratchet` findings are trustworthy going forward, which affects how
-every future loop reads that gate's output.
+Next step: per the banner, item 4 (M0137-M0143 group) is still open.
+Recommended pick for the next loop: **M0142-0004c** (just filed —
+re-run `make ea-ratchet`, confirm the 19 C1 findings collapse below
+qerr>=10 post-fix, check whether other findings share the unnoticed
+`loops>1` shape). Also open at the same priority: **M0142-0004b**
+(the C2 CTE-UNION-ALL recon, independent of this loop's fix),
+**M0142-0005/0006/0007/0008**, or M0141 S2b/S3-S7.
 
-Gates run: `make ralph-state-guard` — one self-repair (the same recurring
+Gates run: `go build ./...` clean; full `internal/executor` unit suite
+green (`go test ./internal/executor/...`, ~13s); `scripts/tpch-spotcheck.sh`
+PASS (Q12=2, Q13=34 — mandatory per Hard-won Rule #1, executor package
+touched); `make ralph-state-guard` — one self-repair (same recurring
 benign stale-clean-exit-marker pattern several prior loops have noted),
-clean after repair. Pre-commit hook's pgbench smoke will run at commit
-time. No `go test`/`tpch-spotcheck.sh`/TPC-DS sweep run this loop — no
-production Go code changed (measurement/filing-only, reusing an
-already-captured artifact), matching the precedent set by
-M0137-0020/M0139-0007/M0142-0003a/0003b's own recon-and-file closures.
+clean after repair. Did NOT re-run `make ea-ratchet` this loop (that
+~10min capture is M0142-0004c's own job, filed rather than run inline,
+matching this milestone's established two-artefact precedent).

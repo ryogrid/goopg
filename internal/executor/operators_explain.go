@@ -3,6 +3,7 @@ package executor
 import (
 	"errors"
 	"fmt"
+	"math"
 	"sort"
 	"strconv"
 	"strings"
@@ -194,6 +195,29 @@ func addExplainSettingsGroup(ctx *Context, opts parser.ExplainOptions, root map[
 }
 
 func nsToMs(ns int64) float64 { return float64(ns) / 1e6 }
+
+// rowsPerLoop mirrors PG's `rows = instrument->ntuples / nloops`
+// (explain.c:1835,1901): EXPLAIN ANALYZE's `rows=` is the PER-LOOP
+// average, not the cumulative total across every Open/Next cycle of a
+// repeatedly-executed node (a correlated subplan or an NL inner side is
+// re-Open'd once per outer row). `rowsOut` accumulates the cumulative
+// total across loops (instrument.go), so callers must divide before
+// rendering. loops<=0 (unexecuted node) returns the raw total to avoid
+// a division by zero; that path's rowsOut is 0 in practice.
+func rowsPerLoop(rowsOut, loops int64) float64 {
+	if loops <= 0 {
+		return float64(rowsOut)
+	}
+	return float64(rowsOut) / float64(loops)
+}
+
+// round2 matches PG's `ExplainPropertyFloat(qlabel, unit, value, 2, es)`
+// (explain_format.c:250, `psprintf("%.*f", ndigits, value)`) for
+// structured (JSON/XML/YAML) output: the text renderer gets this for
+// free from fmt's own "%.2f" verb, but a `map[string]any` value handed
+// to encoding/json prints at full float64 precision unless rounded
+// before insertion.
+func round2(v float64) float64 { return math.Round(v*100) / 100 }
 
 // formatBuffersLine renders the upstream "Buffers: shared hit=N read=N
 // dirtied=N written=N" text (show_buffer_usage's has_shared/shared-buffer
@@ -2467,12 +2491,18 @@ func walkPlanAnalyzeFiltered(n optimizer.Node, indent int, rows *[]Row, opts par
 		}
 	}
 	if s, ok := stats[statSrc]; ok && s != nil {
+		// PG's `rows=` is instrument->ntuples / nloops (explain.c:1835), a
+		// PER-LOOP average, not the cumulative total — a node re-Open'd once
+		// per outer row (correlated subplan / NL inner side) would otherwise
+		// print a total inflated by up to `loops`x versus PG's own output
+		// for the identical physical operation. See M0142-0004a.
+		rowsAvg := rowsPerLoop(s.rowsOut, s.loops)
 		if s.timing {
 			// PG formats rows as float (e.g. "rows=5.00") for ANALYZE output.
 			label += fmt.Sprintf(" (actual time=%.3f..%.3f rows=%.2f loops=%d)",
-				nsToMs(s.startupNs), nsToMs(s.totalNs), float64(s.rowsOut), s.loops)
+				nsToMs(s.startupNs), nsToMs(s.totalNs), rowsAvg, s.loops)
 		} else {
-			label += fmt.Sprintf(" (actual rows=%.2f loops=%d)", float64(s.rowsOut), s.loops)
+			label += fmt.Sprintf(" (actual rows=%.2f loops=%d)", rowsAvg, s.loops)
 		}
 	}
 	*rows = append(*rows, Row{NewStringDatum(label)})
@@ -2582,7 +2612,7 @@ func walkPlanAnalyzeFiltered(n optimizer.Node, indent int, rows *[]Row, opts par
 			for _, w := range ordered {
 				*rows = append(*rows, Row{NewStringDatum(detailIndent + fmt.Sprintf(
 					"Worker %d:  actual time=%.3f..%.3f rows=%.2f loops=%d",
-					w.Worker, nsToMs(w.StartupNs), nsToMs(w.TotalNs), float64(w.RowsOut), w.Loops))})
+					w.Worker, nsToMs(w.StartupNs), nsToMs(w.TotalNs), rowsPerLoop(w.RowsOut, w.Loops), w.Loops))})
 			}
 		}
 	}
@@ -2715,7 +2745,9 @@ func planToJSONWithStatsNamed(n optimizer.Node, opts parser.ExplainOptions, stat
 	// the surviving child's numbers is what makes the two walkers agree.
 	surviving, _, _ := jsonCollapse(n)
 	if s, ok := stats[surviving]; ok && s != nil {
-		obj["Actual Rows"] = s.rowsOut
+		// Per-loop average, matching the text renderer — see the comment
+		// on rowsPerLoop and M0142-0004a.
+		obj["Actual Rows"] = round2(rowsPerLoop(s.rowsOut, s.loops))
 		obj["Actual Loops"] = s.loops
 		if s.timing {
 			obj["Actual Startup Time"] = nsToMs(s.startupNs)
