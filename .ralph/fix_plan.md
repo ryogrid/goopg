@@ -967,15 +967,22 @@ before/after proving the defect it closes.
   `GOOPG_PGSHAPED_DP_TRACE=1` and emits counts by `reason=` class with the
   timeout stamped, in a form a report can paste. Sibling of the
   `CATEGORIES-EXCL-MATCH:` fix that closed the same defect for category movement.
-- [ ] **M0137-0015 — embed `PlanCost` in `optimizer.Filter`** — M0137-0011
-  root-caused C3/K63 and filed a ledger row but no task, so the fix is an orphan.
-  The row says it is **one line**: mirror `SeqScan`'s embed at `plan.go:642`;
-  `plancost.go:58`'s `PlanCostCarrier` is the consumer side and needs nothing
-  ("Embedding PlanCost is the whole of implementing it"). Closes the display seam
-  where goopg's EXPLAIN reports a scan cost the planner never used (Q12:
-  `60,299.79` rendered vs `271,421.24` consumed, 4.5x) for every
-  base-local-filtered scan — which corrupts `plan-gate MODE=semantic-cost` and
-  every estimate audit.
+- [x] **M0137-0015 — embed `PlanCost` in `optimizer.Filter`** — DONE
+  2026-09-15 (`docs/design/0100-0149/m0137-0015-filter-plancost-embed.md`).
+  `Filter` now embeds `PlanCost`, mirroring `SeqScan`'s embed; no other code
+  changed (`stampPlanCost`'s `planCostSetter` funnel and
+  `legacyDisplayChildren`'s pre-existing `*Filter` fallback arm both already
+  handled a carrier). Pinned by a new regression test
+  (`TestCreatePlanNode_StampsCostOnFilterWrappedPrebuiltLeaf`) and
+  live-verified: Q12's `Seq Scan on lineitem` now renders the search's own
+  `costSeqscan` number instead of the `DeriveLegacyDisplayCost` fallback.
+  Also closes the `*IndexScan`-with-residual-filter case M0137-0011 flagged
+  as unaudited (no separate fix needed — `IndexScan` already embeds
+  `PlanCost`, and the rebuild path produces the same `Filter` type).
+  Corpus-wide blast radius (previously unmeasured): 20/22 TPC-H, 85/99
+  TPC-DS queries carry a base-local-filtered scan, per the committed
+  PG-oracle plans. Closes `.ralph/deferral_ledger.md` row
+  `m0137-0011-filter-node-missing-plancost-embed` (now `resolved`).
 - [ ] **M0137-0016 — add the `*Gather` arm to `pushConjunctTraced` (O15)** —
   filed by M0137-0012 as a ledger row with **no owner**. Its stated gate
   ("requires M0137-0010's qual-placement census to exist first") **is already

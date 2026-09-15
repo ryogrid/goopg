@@ -14,6 +14,41 @@ func TestCreatePlan_PrebuiltReturnsWrappedNode(t *testing.T) {
 	}
 }
 
+// M0137-0015: buildInitialRels wraps a base-local-filtered leaf in
+// Filter{Child: SeqScan} and prices the WHOLE wrapper (baseSeqScanCostInputs
+// / costSeqscan), so createPlanNode's stampPlanCost call must land on the
+// *Filter it returns, not be silently dropped by a missing planCostSetter
+// arm (M0137-0011 root-caused exactly this: Q12's EXPLAIN rendered
+// 60,299.79 — DeriveLegacyDisplayCost's fallback — while the search had
+// actually costed 271,421.24).
+func TestCreatePlanNode_StampsCostOnFilterWrappedPrebuiltLeaf(t *testing.T) {
+	scan := &SeqScan{}
+	filter := &Filter{Child: scan, Predicate: &BooleanConst{Value: true}}
+	rel := &RelOptInfo{Relids: 1, Rows: 5}
+	p := newPrebuiltPath(rel, filter)
+	p.Cost = Cost{Startup: 12.5, Total: 271421.24}
+
+	node, _ := createPlanNode(p)
+	got, ok := node.(*Filter)
+	if !ok {
+		t.Fatalf("createPlanNode(PathPrebuilt) = %T, want *Filter", node)
+	}
+	pc, set := got.PlanCostInfo()
+	if !set {
+		t.Fatalf("Filter did not carry the path's cost — stampPlanCost's planCostSetter assertion failed silently again")
+	}
+	if pc.TotalCost != p.Cost.Total || pc.StartupCost != p.Cost.Startup {
+		t.Errorf("Filter.PlanCostInfo() = %+v, want startup=%v total=%v", pc, p.Cost.Startup, p.Cost.Total)
+	}
+	// The child SeqScan is the one PostgreSQL would price on its own
+	// (baserestrictinfo lives on the rel, not a wrapper node), so it is
+	// legitimately left unstamped — only the Filter (the actually-produced
+	// node) must carry the cost.
+	if _, childSet := scan.PlanCostInfo(); childSet {
+		t.Errorf("unexpected: the wrapped SeqScan child carries a cost too; only the Filter should")
+	}
+}
+
 func TestCreatePlanFromDPChoice_IsIdentity(t *testing.T) {
 	n := &Join{}
 	if got := createPlanFromDPChoice(n); got != Node(n) {

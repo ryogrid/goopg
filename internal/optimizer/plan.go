@@ -1537,6 +1537,14 @@ func (n *WindowAgg) Output() Schema { return n.schema }
 
 // Filter — applies a predicate to its child's rows.
 type Filter struct {
+	// PlanCost carries the search's cost for this node (plancost.go). Without
+	// this embed, stampPlanCost's `n.(planCostSetter)` assertion silently
+	// fails on a base-local-filtered leaf (buildInitialRels wraps it in
+	// Filter{Child: SeqScan} and prices the WHOLE wrapper), so the correct
+	// cost was discarded and neither this node nor its child ever carried it
+	// — EXPLAIN then fell back to DeriveLegacyDisplayCost's cruder formula for
+	// every such scan (M0137-0011/M0137-0015).
+	PlanCost
 	// searchedTree: the scan arms' leaf rewrapper can restore the leaf's
 	// original *Filter around a rebuilt scan, so a one-relation search root
 	// can be a Filter (searchedtree.go).
