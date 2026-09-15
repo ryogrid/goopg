@@ -2693,16 +2693,23 @@ cross-layer programme that has never been scoped.
   plan-shape `same=99 changed=0`; `make ea-ratchet` 112→112 unchanged (no
   query in the current SF0.25 corpus has its plan choice gated by this
   estimate). Does not touch M0142-0005 (orthogonal plan-shape-selection gap).
-- [ ] **M0142-0007 — re-measure the `corr = 0` index-pricing fallback (B10)** —
-  `indexCorrelationFor` (`costindex.go:479-495`) returns 0 when the leading
-  column has no correlation slot, pricing **every** such index scan at
-  `max_IO_cost` (the fully-random Mackert-Lohman bound); and ANALYZE never visits
-  indexes, so `estimateIndexGeometry` **synthesises** relpages/reltuples/
-  tree_height rather than measuring them. Both shift index-probe pricing
-  corpus-wide and both sit under this milestone's decisions. Re-ANALYZE the bench
-  clusters first and establish whether the fallback actually fires at HEAD —
-  M0138-0004 populated correlation slots as a side effect. Ledger:
-  `m0137-0012-b10-corr-zero-fallback-max-io-cost`.
+- [x] **M0142-0007 — re-measure the `corr = 0` index-pricing fallback (B10)** —
+  **DONE 2026-09-15, recon closed, no code change.** Full writeup in
+  `docs/design/0100-0149/m0142-0007-corr-zero-fallback-does-not-fire-post-analyze.md`.
+  Instrumented `indexCorrelationFor` (temporary env-gated trace, reverted) on
+  the TPC-DS SF0.25 cluster, re-ran `ANALYZE;`, then ran `EXPLAIN` over the
+  full 100-query corpus: **0 of 2905 calls hit the `nilstats` fallback** —
+  every leading-key column has a real correlation value (61% exact `1.0` on
+  PK columns, the rest genuinely-measured small non-zero values). **Verdict:
+  the `corr=0`-fallback half of B10 is closed as measured — M0138-0004's
+  correlation writer plus a plain `ANALYZE;` fully populate the slot; no fix
+  needed.** The ledger row's *other* bundled half —
+  `estimateIndexGeometry` synthesising relpages/reltuples/tree_height because
+  ANALYZE never visits indexes at all — is untouched and stays open (re-ANALYZE
+  cannot close it; there is nothing to visit). TPC-H's own fallback rate was
+  not measured (bench peer is another loop's live server). Ledger:
+  `m0137-0012-b10-corr-zero-fallback-max-io-cost` (updated with this
+  finding).
 - [ ] **M0142-0008 — recon: how much of goopg's plan shape is chosen by forced
   rewrites rather than by the search?** (measurement only, no production diff) —
   the goal says plans must be reached by **the same planning logic**, and several
