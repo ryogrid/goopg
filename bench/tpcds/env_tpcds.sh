@@ -110,6 +110,21 @@ TPCDS_PG_LOG="${TPCDS_RUNTIME_DIR}/pg.log"
 # --- goopg runtime knobs (same rationale as bench/tpch/env_goopg.sh) -------
 export GOMEMLIMIT="${GOMEMLIMIT:-12GiB}"
 export GOGC="${GOGC:-off}"
+# Pins ANALYZE's reservoir sampler (internal/executor/operators_analyze.go:704-748,
+# read ONCE at server-process startup — must be exported before `server.sh
+# start`, not by a client-side capture script) so a TPC-DS load's statistics —
+# and therefore every plan captured off this cluster — are reproducible across
+# server restarts, matching scripts/tpch-acceptance-arm.sh's identical default.
+# scripts/capture-tpcds.sh cannot pin this itself: it only opens client `psql`
+# sessions and never runs ANALYZE (bench/tpcds/README.md "3. ANALYZE each
+# table" happens once at load time via scripts/tpcds-load.sh, against whatever
+# seed the already-running server process was started with). M0138-0008 found
+# four unpinned before/after TPC-DS SF0.25 captures at two FIXED commits
+# produced different join-order/qual-placement/join-method/scan-type/
+# aggregation-strategy/parallelism category counts from seed variance alone
+# (docs/design/0100-0149/m0138-0008-category-shift-bisect.md); M0137-0020 pins
+# it here, the earliest point common to every TPC-DS goopg server start.
+export GOOPG_ANALYZE_SEED="${GOOPG_ANALYZE_SEED:-20260905}"
 
 # --- Legacy aliases --------------------------------------------------------
 # The tpcds scripts were written against bench/tpch/env_goopg.sh's variable

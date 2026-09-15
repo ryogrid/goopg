@@ -168,6 +168,21 @@ scripts/capture-tpcds.sh 65438 tpcds025 ryo \
   (`work_mem='64MB' max_parallel_workers_per_gather=4`, identical to
   `capture-tpch.sh`'s `PIN` array) — no cluster-config alignment step is
   needed for this half.
+- **`GOOPG_ANALYZE_SEED` is pinned by `bench/tpcds/env_tpcds.sh`** (default
+  `20260905`, M0137-0020), not by `capture-tpcds.sh` itself — the script only
+  opens client `psql` sessions and never runs `ANALYZE`, so it has no seam to
+  pin the sampler through; the pin has to land before the server process
+  starts (package-level var, read once). M0138-0008 measured the consequence
+  of an unpinned seed directly: four unpinned before/after captures at two
+  FIXED commits moved `join-order`/`qual-placement`/`join-method`/`scan-type`/
+  `aggregation-strategy`/`parallelism` category counts from reservoir-sampler
+  variance alone (`docs/design/0100-0149/m0138-0008-category-shift-bisect.md`).
+  The **shared** `:65436`/`:65437` clusters were loaded before this pin
+  landed, so their existing statistics remain wall-clock-seeded until their
+  next reload; only servers started (or reloaded) after this change get the
+  reproducible sample. A fresh private clone (same recipe as M0138-0008 used)
+  is required for reproducibility whenever the shared clusters cannot be
+  reloaded.
 - **Which reference is canonical is now settled — M0137-0004.** Live PG
   `:65438` via `scripts/capture-tpcds.sh` (the worked example above) is
   canonical; the committed `bench/tpcds/plans-pg` fixture is a corroborating

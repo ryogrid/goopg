@@ -19,6 +19,20 @@
 # comment for the full rationale. The binary/PID stamp needs the server's
 # datadir; pass it as an optional 6th arg or it reads UNKNOWN(no datadir given).
 #
+# This script cannot pin ANALYZE's reservoir-sampler seed itself (M0137-0020):
+# it only opens client `psql` sessions and never runs ANALYZE — the TPC-DS
+# load procedure ANALYZEs once, durably, at load time (bench/tpcds/README.md
+# "3. ANALYZE each table"), against whatever GOOPG_ANALYZE_SEED the server
+# process was started with. The seed is now pinned at the earliest common
+# point instead: bench/tpcds/env_tpcds.sh (sourced by bench/tpcds/server.sh
+# before it starts the server), default 20260905, same value
+# scripts/tpch-acceptance-arm.sh already pins. See that file's comment and
+# docs/design/0100-0149/m0138-0008-category-shift-bisect.md for why an
+# unpinned seed matters here: four unpinned trials at two FIXED commits moved
+# plan-parity category counts (join-order, qual-placement, join-method,
+# scan-type, aggregation-strategy, parallelism) from reservoir-sampler
+# variance alone.
+#
 # usage: capture-tpcds.sh <port> <db> <user> <outfile> <header> [datadir]
 set -uo pipefail
 

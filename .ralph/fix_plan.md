@@ -1062,29 +1062,51 @@ before/after proving the defect it closes.
   cause most cleanly. Do not re-run the capture; the artefacts are already
   committed and stats-epoch-pinned. Ledger:
   `m0137-0017-parallel-mode-divergence`.
-- [ ] **M0137-0020 — pin `GOOPG_ANALYZE_SEED` in the TPC-DS capture harness**
-  (filed by M0138-0008, 2026-09-15) — `scripts/capture-tpcds.sh` (canonical
-  per M0137-0003 §3) never sets `GOOPG_ANALYZE_SEED`, unlike
-  `scripts/tpch-acceptance-arm.sh`/`scripts/estimate-parity-gate.sh` which
-  already pin it to `20260905` for the identical reason. M0138-0008 measured
-  the consequence directly: four unpinned TPC-DS SF0.25 corpus captures at
-  two FIXED commits produced *different* `join-order`/`qual-placement`/
-  `join-method`/`scan-type`/`aggregation-strategy`/`parallelism` category
-  counts from reservoir-sampler seed variance alone (5 queries: Q26, Q45,
-  Q48, Q51, Q97), and the direction of a real, reproducible code-caused shift
-  (M0138-0005's 89->90/16->17) only stabilised once the seed was pinned.
-  Deliverable: add the same `GOOPG_ANALYZE_SEED="${GOOPG_ANALYZE_SEED:-20260905}"`
-  default `scripts/capture-tpcds.sh` already needs (or document why the
-  M0137-0003 procedure doc should set it at the call site instead — the
-  TPC-H acceptance-arm precedent does it inside the script itself, prefer
-  matching that unless a reason not to turns up), then re-verify
-  reproducibility (two fresh captures at one commit, expect byte-identical
-  `.plans.txt`). Out of scope for this task: re-measuring the review's
-  "525->540" TPC-DS category headline with the seed pinned — that is a
-  separate, larger corpus-wide re-measure a later task should do once this
-  lands. Design doc:
-  `docs/design/0100-0149/m0138-0008-category-shift-bisect.md` has the
-  supporting measurement.
+- [x] **M0137-0020 — pin `GOOPG_ANALYZE_SEED` in the TPC-DS capture harness**
+  (filed by M0138-0008, 2026-09-15) — **DONE 2026-09-15.** The fix does NOT
+  land inside `scripts/capture-tpcds.sh` as the task title/deliverable
+  assumed: that script only opens client `psql` sessions and never runs
+  `ANALYZE` (the TPC-DS load procedure ANALYZEs once, durably, at load time,
+  against whatever seed the already-running server process was started
+  with), and `GOOPG_ANALYZE_SEED` is a package-level var goopg reads exactly
+  once at server-process startup (`operators_analyze.go:704-733`) — an
+  `export` inside the capture script would be silently inert against a real
+  TPC-DS cluster. Landed instead in `bench/tpcds/env_tpcds.sh` (sourced by
+  `bench/tpcds/server.sh` before every goopg TPC-DS server start, and by
+  every other `tpcds-*.sh` script): `export
+  GOOPG_ANALYZE_SEED="${GOOPG_ANALYZE_SEED:-20260905}"`, same default/
+  rationale as `tpch-acceptance-arm.sh`. `scripts/capture-tpcds.sh` and
+  `docs/design/0100-0149/m0137-0003-baseline-capture-procedure.md` §3
+  updated to point at the new pin site. Verified the wiring read-only
+  (`unset GOOPG_ANALYZE_SEED; source bench/tpcds/server.sh status` picks up
+  the default; an explicit override is preserved) without starting or
+  touching either shared cluster — the underlying
+  export-before-server-start-implies-reproducible-sample mechanism was
+  already proven live at full 99-query scale by M0138-0008, so that
+  expensive experiment was not re-run. Design doc:
+  `docs/design/0100-0149/m0137-0020-pin-analyze-seed-tpcds-server.md`.
+  Deferral ledger: `m0138-0008-category-shift-bisect` row flipped to
+  `resolved`.
+  - Out of scope, filed as **M0137-0021** below (ledger row
+    `m0137-0020-recapture-headline-unowned`): the shared `:65436`/`:65437`
+    clusters were loaded before this pin landed and keep wall-clock-seeded
+    statistics until next reload, and the milestone review's "TPC-DS
+    categories net worse, 525->540" headline still has not been
+    re-measured with a pinned seed.
+- [ ] **M0137-0021 — re-measure the "TPC-DS categories 525->540" headline
+  with the seed pinned** (filed by M0137-0020, 2026-09-15) — the milestone
+  review's regression headline was taken with an unpinned
+  `GOOPG_ANALYZE_SEED` and, per M0138-0008, carries an unknown amount of
+  ±1..2-per-category noise on at least 5 queries (Q26/Q45/Q48/Q51/Q97) from
+  reservoir-sampler seed variance alone. M0137-0020 landed the pin
+  (`bench/tpcds/env_tpcds.sh`, default `20260905`) but the shared TPC-DS
+  clusters (`:65436`/`:65437`) were already loaded before it landed, so
+  their on-disk statistics are still wall-clock-seeded. Deliverable: reload
+  (or privately clone, per M0138-0008's method) the TPC-DS SF0.25 cluster
+  with the pin in effect, recapture the full `CATEGORIES:`/
+  `CATEGORIES-EXCL-MATCH:` lines against the same corpus the review used,
+  and republish the headline with a stated stats epoch. Ledger:
+  `m0137-0020-recapture-headline-unowned`.
 
 ## M0138 — PG-faithful ANALYZE statistics (filed 2026-09-14)
 
