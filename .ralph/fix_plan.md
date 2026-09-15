@@ -1062,6 +1062,29 @@ before/after proving the defect it closes.
   cause most cleanly. Do not re-run the capture; the artefacts are already
   committed and stats-epoch-pinned. Ledger:
   `m0137-0017-parallel-mode-divergence`.
+- [ ] **M0137-0020 — pin `GOOPG_ANALYZE_SEED` in the TPC-DS capture harness**
+  (filed by M0138-0008, 2026-09-15) — `scripts/capture-tpcds.sh` (canonical
+  per M0137-0003 §3) never sets `GOOPG_ANALYZE_SEED`, unlike
+  `scripts/tpch-acceptance-arm.sh`/`scripts/estimate-parity-gate.sh` which
+  already pin it to `20260905` for the identical reason. M0138-0008 measured
+  the consequence directly: four unpinned TPC-DS SF0.25 corpus captures at
+  two FIXED commits produced *different* `join-order`/`qual-placement`/
+  `join-method`/`scan-type`/`aggregation-strategy`/`parallelism` category
+  counts from reservoir-sampler seed variance alone (5 queries: Q26, Q45,
+  Q48, Q51, Q97), and the direction of a real, reproducible code-caused shift
+  (M0138-0005's 89->90/16->17) only stabilised once the seed was pinned.
+  Deliverable: add the same `GOOPG_ANALYZE_SEED="${GOOPG_ANALYZE_SEED:-20260905}"`
+  default `scripts/capture-tpcds.sh` already needs (or document why the
+  M0137-0003 procedure doc should set it at the call site instead — the
+  TPC-H acceptance-arm precedent does it inside the script itself, prefer
+  matching that unless a reason not to turns up), then re-verify
+  reproducibility (two fresh captures at one commit, expect byte-identical
+  `.plans.txt`). Out of scope for this task: re-measuring the review's
+  "525->540" TPC-DS category headline with the seed pinned — that is a
+  separate, larger corpus-wide re-measure a later task should do once this
+  lands. Design doc:
+  `docs/design/0100-0149/m0138-0008-category-shift-bisect.md` has the
+  supporting measurement.
 
 ## M0138 — PG-faithful ANALYZE statistics (filed 2026-09-14)
 
@@ -1322,11 +1345,23 @@ unmeasured one does not.
     confirmed unrelated); `scripts/tpch-spotcheck.sh` `RESULT=PASS`
     (Q12=2/Q13=34, canonical anchors — no plan/category shift observed at
     this scale).
-- [ ] **M0138-0008 — bisect the category shift M0138 caused** — the corpus
-  re-measure moved TPC-DS `join-order` 89->90 and `qual-placement` 16->17 and the
-  causing queries were never identified; the row's resume point is to re-capture
-  at the pre-M0138-0002 commit and bisect. Small, and it is the only unexplained
-  movement this milestone introduced.
+- [x] **M0138-0008 — bisect the category shift M0138 caused** — **DONE
+  2026-09-15.** Built goopg at the pre-M0138-0002 commit (`0e97c94b3`) and at
+  M0138-0004 (`44085c324`), loaded a private SF0.25 dataset with each (shared
+  `:65437` cluster untouched), diffed against the live PG reference. Four
+  unpinned trials found `join-order`/`qual-placement`/three other categories
+  move run-to-run at a FIXED commit from ANALYZE reservoir-seed variance alone
+  (`Q26`, `Q45`, `Q48`, `Q51`, `Q97` each flip a category tag) — the same
+  noise mechanism M0138-0009 found for `correlation`, now shown to also flip
+  plan-parity verdict categories, this milestone group's own success metric.
+  Pinning the existing (but here-unused) `GOOPG_ANALYZE_SEED` knob made
+  captures reproducible; with it pinned, the shift reproduces in M0138-0005's
+  original direction and narrows to exactly `Q21` (join-order, a
+  cardinality-estimate-driven join-spine change) and `Q48` (qual-placement, a
+  `store` access-path change). Design doc:
+  `docs/design/0100-0149/m0138-0008-category-shift-bisect.md`. Follow-up
+  **M0137-0020** (below, filed in this loop) owns pinning the seed in the
+  capture harness itself. Ledger row: `m0138-0008-category-shift-bisect`.
 - [x] **M0138-0009 — re-open the correlation banding finding** — **RESOLVED
   2026-09-15, NOT A DEFECT.** Ran the synthetic-table comparison the row
   prescribed in two parts. (1) `internal/testport/m0138_correlation_synthetic_test.go`
