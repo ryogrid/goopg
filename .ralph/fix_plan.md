@@ -2387,27 +2387,47 @@ spill route is net-negative.
     of its own to loop over until then).
   - [ ] **M0141-S2b-4** — SETOP rel-identity fix. No TPC-H/TPC-DS witness
     currently motivates it; keep filed, do not schedule ahead of 1-3.
-  - [ ] **M0141-S2b-5** — (filed 2026-09-16 by S2b-0's result) resolve
-    `electOrderedGrouping`'s `anyTranslated` decline for the GROUP_AGG
-    mechanism-B queries now that `len(cands)<2` is refuted. First step is
-    NOT a code change: instrument `anyTranslated` (or reuse `DPTRACE`) to
-    print which `groupingEmissionPathkeys` check fails per query, re-run the
-    same 6-query private-cluster probe S2b-0 used. Two live subquestions
-    the trace must answer before any fix is written: (1) whether Q8/Q22's
-    outer-query GROUP BY exprs (`o_year`, `cntrycode` — aliases of a
-    FROM-subquery's computed columns) arrive at `addGroupingPaths` as a
-    `*ColumnRef` into the derived table (translates fine, no gate to widen)
-    or as the raw computed expression re-derived post-pullup (blocked by
-    `groupingEmissionPathkeys`'s bare-`*ColumnRef`-only check,
-    `upperorderedgrouping.go:88`, in which case widening that check to
-    accept any `exprEqual` match, not just `*ColumnRef`, is the fix); (2)
-    why Q4/Q12 — GROUP BY and ORDER BY on the identical bare column, no
-    gate found on a code read — still decline; do not assume they are
-    already fixed without the trace. Q5/Q21 are excluded from this task's
-    scope: their ORDER BY leads on an aggregate VALUE, not a group key, so
-    no group-key-order Sort can ever satisfy them and a Sort node there may
-    be correct/PG-matching, not a bug — confirm against the PG reference
-    plan before spending effort, do not fold them into this fix blind.
+  - [x] **M0141-S2b-5** — resolve `electOrderedGrouping`'s `anyTranslated`
+    decline for the GROUP_AGG mechanism-B queries now that `len(cands)<2` is
+    refuted. **DONE 2026-09-16 — hypothesis ALSO REFUTED, root cause found
+    to be elsewhere.** Landed a small permanent `DPGROUP` trace
+    (`internal/optimizer/upperorderedgrouping.go`, gated on the existing
+    `GOOPG_PGSHAPED_DP_TRACE`, same convention as `pathTraceEnabled`) and
+    re-ran S2b-0's 6-query private-cluster probe. Result: `anyTranslated` is
+    `true` for all six queries — `electOrderedGrouping` never declines, runs
+    its full tournament, and reaches an election every time. For Q4/Q5/Q12/
+    Q21 the winner is `Sort`-over-`Hashed`-`Aggregate` (the cost comparison
+    picks Hashed+explicit-Sort over the translated sort-free Sorted
+    candidate); Q8/Q22 pick the sort-free Sorted candidate outright (no Sort
+    node). A stale scratch capture (`tmp/take4/runs/plansweep/q04.{pg,goopg}.txt`)
+    corroborates for Q4 specifically that real PG picks `GroupAggregate` fed
+    by a `Sort` **below** it (no Sort above), while goopg's plan is the
+    predicted Sort-above-Hashed shape — **the root cause is a cost-model
+    discrepancy in the Hashed-vs-Sorted `PathAgg` comparison, not a wiring
+    gap in `electOrderedGrouping`/`groupingEmissionPathkeys`.** Full trace
+    data, the cache-contamination trap hit and corrected in-loop (`go test`
+    silently replayed a stale cached result because the probe's package
+    reaches the changed code only through a `cluster.New`-spawned `go run`
+    subprocess — `-count=1` was required), and the resume point are in
+    `docs/design/0100-0149/m0141-s2b-scoping-decomposition.md` §"S2b-5
+    result". No scratch test file committed (deleted after use, same
+    precedent as S2b-0). Filed **M0141-S2b-6** below as the direct
+    continuation. Ledger row appended (task-id `m0141-s2b-5`).
+  - [ ] **M0141-S2b-6** — (filed 2026-09-16 by S2b-5's result) compare
+    goopg's actual costed Hashed vs. Sort-over-Sorted `PathAgg` candidate
+    numbers at Q4/Q5/Q12/Q21 (the existing `DPPATH` trace already carries
+    `startup`/`total` for both, no new instrumentation needed) against what
+    PG's cost formulas (`postgres/src/backend/optimizer/path/costsize.c`
+    `cost_agg`/`cost_sort`) would produce for the same shapes, to find which
+    specific term under/over-prices one side. **Caution before touching the
+    cost model**: M0141-S2a-fix2 already tried a plausible-looking fix in
+    this exact neighbourhood, measured net-negative/neutral, and was
+    reverted (banner item 1) — reproduce and understand the discrepancy
+    numerically before proposing a change, and re-measure end-to-end
+    (goopg_costmodel_has_no_parallel_dimension memory: check the parallel
+    dimension isn't lost by any fix). Verify against a FRESH PG capture for
+    Q5/Q12/Q21 too — S2b-5 only confirmed Q4 against a stale scratch
+    capture; Q5/Q12/Q21 are asserted by code-read symmetry only.
   Needs M0141-S2 (done, see above) for the concrete TPC-H query list
   motivating S2b-0/S2b-2. Ledger row appended (task-id `m0141-s2b`).
 - [ ] **M0141-S3 — Partial-Sorted row emission** — a second Partial-mode code

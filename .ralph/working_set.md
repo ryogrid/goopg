@@ -1,91 +1,91 @@
-Task: M0141-S2b — its own "size it as its own scoping task before attempting
-it" scoping pass (S2b's fix_plan text called for exactly this). DONE this loop
-(recon/decomposition-only, no production diff, same precedent as M0140-0006).
+Task: M0141-S2b-5 — instrumented-trace recon resolving whether
+`electOrderedGrouping`'s `anyTranslated` gate declines for the 6 GROUP_AGG
+mechanism-B TPC-H queries. DONE and committed this loop. Hypothesis REFUTED
+(again) — the real cause is one level further downstream than either S2b-0
+or S2b-5 assumed.
 
-Files: `.ralph/fix_plan.md` (M0141-S2b closed `[x]` as a decomposition into 5
-new unchecked sub-tasks S2b-0..S2b-4; M0141-S7's bullet gets a NARROWED note
-correcting its "all 14 witnesses need S2b" claim). `docs/design/README.md`
-(new m0141-s2b row indexed). New
-`docs/design/0100-0149/m0141-s2b-scoping-decomposition.md`.
-`.ralph/deferral_ledger.md` (new row, task-id `m0141-s2b`). No Go/production
-code touched — pure Serena/Read code census across
-`internal/optimizer/{upperordered.go,upperorderedinput.go,
-upperorderedgrouping.go,windowsetoppaths.go,distinctpaths.go,planner.go}` +
-`git log`/`git blame`-style dating of `upperorderedgrouping.go`. No
-server/cluster needed or touched.
+Files: `internal/optimizer/upperorderedgrouping.go` (PERMANENT change —
+added a `traceGroupDecline` helper + `DPGROUP` trace lines at every decline
+point in `groupingEmissionPathkeys`, a success-translation line, and a
+loop-decline/election-outcome line in `electOrderedGrouping`; all gated on
+the pre-existing `dpTrace`/`GOOPG_PGSHAPED_DP_TRACE`, zero behavior change
+when off, unit tests still pass). `docs/design/0100-0149/m0141-s2b-scoping-decomposition.md`
+(new "S2b-5 result" section). `docs/design/README.md` (index blurb updated).
+`.ralph/fix_plan.md` (S2b-5 closed `[x]` with result; new `M0141-S2b-6`
+filed as the direct continuation — now a cost-model investigation, not a
+wiring-gap search). `.ralph/deferral_ledger.md` (new row, task-id
+`m0141-s2b-5`). Scratch test file `internal/testutil/tpch/zzz_scoping_probe_test.go`
+was created to run the trace and deleted before commit (same precedent as
+S2b-0) — nothing from it is in the tree or history.
 
-Key symbols/paths: `internal/optimizer/upperorderedgrouping.go`
-(`electOrderedGrouping`/`groupingEmissionPathkeys`, landed 2026-09-11
-`e8a1215fd`, R47 slice 2/K101 — THE central finding this loop made: this file
-already implements S2b's "loop the producing rel's Pathlist into ORDER BY"
-mechanism, for GROUP_AGG only); `internal/optimizer/distinctpaths.go`
-(`createDistinctPaths`/`addDistinctPaths`, C-16a/b — has the same internal
-Hashed/Sorted-shaped plurality GROUP_AGG has, unwired to ORDER BY);
-`internal/optimizer/windowsetoppaths.go` (`createWindowPaths` — its own
-comment proves it NEVER has more than one candidate: "goopg's input is a
-single finished Node, so that loop has one iteration"; `createSetOpPaths` —
-has plurality via `addSetOpPaths` but `newUpperRelForNode` allocates a FRESH
-rel per call, relids always 0, not re-fetchable across a chain, per its own
-comment); `internal/optimizer/upperorderedinput.go` (`inputNodePathkeys`/
-`searchedTreePathkeys`/`validatedSearchPathkeys` — the C-07 seam that already
-recovers ONE winning candidate's pathkeys across the join/scan search's
-coordinate boundary, never a second one; file header explicitly names the
-coordinate-boundary translation risk — "bitten twice", "TOTALITY invariant
-panics on any hole").
+Key symbols/paths: `internal/optimizer/upperorderedgrouping.go` —
+`groupingEmissionPathkeys` (now traces every nil-return reason),
+`electOrderedGrouping` (now traces `decline(reason)`/`restore(reason)`
+call sites and the final elected shape: `Sort-over-Aggregate` vs
+`bare-Aggregate`, plus winning `AggStrategy`). `tmp/take4/runs/plansweep/
+q04.{pg,goopg}.txt` — uncommitted scratch capture cited as corroborating
+evidence (real PG picks `GroupAggregate` fed by a Sort BELOW it for Q4; no
+Sort above; goopg's captured plan is the mirror-image Sort-over-Hashed
+shape this loop's trace predicts).
 
-Findings this loop: (1) **Corrected a premise both M0141-S2 (2026-09-15) and
-M0141-S7 (2026-09-16) carried without checking**: `electOrderedGrouping`
-already exists and is live, landed BEFORE either task's own dated finding,
-yet neither cites it — both read `createOrderedPaths`/`addOrderedPaths`
-directly and missed the pre-check at `planner.go:1960`. S1's fresh
-2026-09-15 capture (which S2 used) ran WITH the loop live and still found
-mechanism (B) alive in Q4/Q5/Q8/Q12/Q21/Q22 — so the residual gap is real,
-just mis-described as "the loop was never built" instead of "the loop
-declines for these queries". (2) Census of all 4 `createOrderedPaths`
-callers' UPSTREAM rels for their own Pathlist plurality (table + citations in
-the design doc): GROUP_AGG plural+wired; DISTINCT plural+unwired (cheapest
-net-new slice, mirrors `electOrderedGrouping` almost exactly); WINDOW never
-plural at its own rel (no local fix possible, purely downstream-gated); SETOP
-plural but its rel is unaddressable later (separate identity problem, no
-current motivating witness); base join/scan ORDER BY (no aggregation) — the
-real K24/F15/K12(B) item, the DP search's own multi-candidate tournament is
-discarded at the `upperorderedinput.go` seam. (3) Working hypothesis (NOT
-traced live this loop — flagged explicitly as unconfirmed): GROUP_AGG's
-residual 6-query gap is `electOrderedGrouping`'s own `len(cands) < 2` decline
-firing because the join/scan tree beneath grouping never hands it a
-sort-shaped input to build a second (Sorted) `PathAgg` candidate from — the
-same one-Node-not-Pathlist seam repeated one level down. Filed as S2b-0 to
-settle this before spending effort elsewhere. (4) Structural ceiling
-independent of all of the above: `addOrderedPaths` only ever has 2 arms
-(no-sort / full-sort) — Incremental Sort's own third "prefix-match" arm
-(S7's job) is required on top of every S2b slice regardless of which lands.
-(5) Decomposed S2b into S2b-0 (trace recon), S2b-1 (DISTINCT loop-fix,
-cheapest), S2b-2 (the real K24 item: join/scan Pathlist across the
-coordinate boundary — needs its OWN further scoping pass first, per K24's
-"do not attempt in one sitting"), S2b-3 (WINDOW, gated on S2b-2), S2b-4
-(SETOP, no current motivating witness).
+Findings this loop: (1) A `go test` CACHE TRAP distinct from S2b-0's
+parallelism trap: the scratch probe lives in package `tpch_test`
+(`internal/testutil/tpch`), which does NOT import `internal/optimizer` at
+Go-compile-time — the server under test is a `go run ./cmd/goopg`
+subprocess. Editing `upperorderedgrouping.go` therefore does not change the
+probe package's own build inputs, and a first re-run after adding the
+instrumentation silently replayed a byte-identical CACHED `go test` result
+from before the trace existed (visible as `ok ... (cached)`, floating-point
+costs matching to 17 digits). Re-running with `-count=1` (the documented
+"one-off probe" carve-out, NOT a gate run) produced the real result.
+**Any future probe that changes code reached only through a
+`cluster.New`-spawned subprocess must force `-count=1`, or it silently
+re-reports stale findings.** Worth a memory note / AGENT.md line if this
+bites again. (2) The real trace: for ALL SIX of Q4/Q5/Q8/Q12/Q21/Q22,
+`electOrderedGrouping` reaches a real election — `anyTranslated` is `true`
+every time (only the trivially-excluded Hashed candidate ever hits a
+`DPGROUP decline` line; the Sorted candidate's translation always
+succeeds). Q4/Q5/Q12/Q21 elect `Sort`-over-`Hashed`-`Aggregate` (cost
+comparison prefers Hashed+explicit-Sort over the translated sort-free
+Sorted candidate); Q8/Q22 elect the sort-free Sorted candidate outright (no
+Sort node). (3) For Q4 specifically, a stale uncommitted scratch capture
+(`tmp/take4/...q04.{pg,goopg}.txt`) shows real PG's actual chosen shape is
+the mirror image: `Finalize GroupAggregate` fed by a `Sort` BELOW it (no
+Sort above) vs. goopg's Sort-above-HashAggregate. **Conclusion: the
+`electOrderedGrouping`/`groupingEmissionPathkeys` mechanism this whole
+design doc (S2b, S2b-0, S2b-5) set out to find a wiring gap in was ALREADY
+COMPLETE AND CORRECTLY WIRED the entire time for the GROUP_AGG rel** — the
+actual, newly-identified root cause for the 4 TPC-H "mechanism (B)"
+witnesses is a cost-model discrepancy in the Hashed-vs-Sorted `PathAgg`
+comparison (or the Sort/GroupAggregate cost terms feeding it), a
+completely different and larger class of bug than anything in the S2b
+decomposition. Filed **M0141-S2b-6** to chase it, with an explicit caution
+citing M0141-S2a-fix2's precedent (a plausible-looking fix in this same
+neighbourhood was tried, measured net-negative, and reverted) — reproduce
+and understand the discrepancy numerically before proposing any change.
 
-Next step: per the banner's item-4 ordering, the next loop should pick
-**M0141-S2b-0** (cheapest, pure trace recon, settles whether S2b-1 is worth
-doing standalone or everything funnels through S2b-2) — `GOOPG_PGSHAPED_DP_TRACE=1`
-capture of TPC-H Q4/Q5/Q8/Q12/Q21/Q22 via `./bin/estimate-audit -plan-only`
-per `m0137-0003-baseline-capture-procedure.md`, grep `producer=` lines
-feeding the GROUP_AGG rel, confirm/refute whether a Sorted `PathAgg`
-candidate is ever offered. **M0141-S2b-1** (DISTINCT loop-fix) is the
-next-cheapest if S2b-0's answer says DISTINCT is worth attempting standalone,
-or as a parallel/alternate pick regardless (it is cheap enough to attempt and
-measure even with a null-result risk). Do NOT attempt **M0141-S2b-2** blind —
-it needs its own scoping pass first, per K24. Alternative if the banner or a
-fresher read says otherwise: M0142's still-open items — M0142-0008a (SEMI/ANTI
-decorrelation scoping recon, unstarted) or M0142-0016c. M0142-0003i/-0003k(c)
-remain BLOCKED on a human decision (shared `:65433` TPC-H bench cluster
-reload) — do not re-attempt without explicit authorization. Re-read the
-`## Current Priority` banner first in case it was rewritten.
+Next step: pick per the `## Current Priority` banner (re-read it first in
+case it changed) — **M0141-S2b-6** is the direct continuation but is sized
+as a real cost-model investigation (diff goopg's DPPATH-captured
+startup/total for both candidates against PG's `cost_agg`/`cost_sort`
+formulas in `postgres/src/backend/optimizer/path/costsize.c`, then get a
+FRESH PG capture for Q5/Q12/Q21 — only Q4 was checked against a real
+capture this loop, Q5/Q12/Q21 are asserted by code-read symmetry only).
+**M0141-S2b-1** (DISTINCT loop-fix) remains available as an independent,
+cheaper pick if S2b-6 is deprioritized. Do NOT attempt **M0141-S2b-2**
+blind (needs its own scoping pass, per K24). M0142-0003i/-0003k(c) (shared
+`:65433` TPC-H cluster reload) remain BLOCKED on a human decision.
 
-Gates run: `make ralph-state-guard` — same pre-existing stale status/progress
-marker as recent loops (loop_count field lag from a concurrent driver),
-self-repaired, passed clean. No `go build`/`go test`/pgbench-smoke run (no
-Go/production code touched this loop — pure recon/decomposition, matching
-the M0140-0006 precedent which also ran no code gates).
+Gates run: `go build ./internal/optimizer/...` clean. `go test
+./internal/optimizer/...` (full package, not just the touched file) —
+PASS, no regressions from the trace instrumentation. `scripts/tpch-spotcheck.sh`
+run per the executor/planner practice card — SKIPPED (expected: shared
+`:65433` cluster's `tpch` schema is still gone, per M0142-0003k, exits 0
+cleanly, not a new failure). `make ralph-state-guard` — pass (see status
+block). Pre-commit hook's pgbench smoke will run automatically on commit.
 
-In-flight: none. Nothing left running; no server/cluster touched this loop.
+In-flight: none. The scratch probe's throwaway `cluster.New` server shut
+down cleanly via its own `defer c.Stop()`; verified via `ps aux | grep
+goopg` afterward (only the pre-existing shared `:65432`/`:65433` clusters
+remain running, untouched). Debug log `/tmp/goopg_cluster_debug/s2b5-probe.log`
+deleted.

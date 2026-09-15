@@ -215,3 +215,100 @@ production code changed. M0141-S7's fix_plan entry is updated in the same
 commit to stop claiming uniformly "all 14 witnesses need M0141-S2b" — see the
 per-rel table above for which witnesses map to which sub-task. Ledger row
 appended (task-id `m0141-s2b`).
+
+## S2b-5 result (2026-09-16) — `anyTranslated` hypothesis also REFUTED; the real cause is a cost-model election, not a wiring gap
+
+Measured, not inferred. Landed a small permanent instrumentation addition to
+`internal/optimizer/upperorderedgrouping.go` (gated on the existing
+`GOOPG_PGSHAPED_DP_TRACE`/`dpTrace`, same convention as `pathTraceEnabled` in
+`pathtrace.go` — a `DPGROUP` line per decline point inside
+`groupingEmissionPathkeys`, one on successful translation, one at each
+`electOrderedGrouping` decline point, and one recording the final elected
+shape (`Sort-over-Aggregate` vs `bare-Aggregate`, plus the winning
+`AggStrategy`)) and re-ran S2b-0's six-query private-cluster probe (same
+`cluster.New` + `tpch.DDL()` + a small synthetic load, `max_parallel_workers_per_gather
+= 0`, scratch test file deleted after use — nothing from the probe harness
+itself is committed, only the `DPGROUP` trace lines in
+`upperorderedgrouping.go`).
+
+**First attempt was itself cache-contaminated — a second methodology trap,
+distinct from S2b-0's parallel-contamination trap.** `internal/testutil/tpch`
+(the scratch probe's package) does not import `internal/optimizer` at
+Go-compile-time — the server under test is a separate `go run ./cmd/goopg`
+subprocess (`cluster.go:113`), so editing `upperorderedgrouping.go` does not
+change the `tpch_test` package's own build inputs and `go test` replayed a
+byte-identical CACHED result from before the instrumentation existed (visible
+as `ok  ... (cached)`, and by every floating-point cost in the DPPATH lines
+matching S2b-0's original capture to the same 17 significant digits). Re-run
+with `-count=1` — the documented "one-off probe" carve-out in
+`ci/design/test-gate-speedups/05` §1, not a gate run — produced the real,
+different result below. **Any future probe that changes code reached only
+through a `cluster.New`-spawned subprocess must force `-count=1`**, or it
+silently re-reports stale findings; this is now worth its own line in
+`AGENT.md`/a memory note.
+
+**The real result: `electOrderedGrouping` does not decline for any of the six
+queries.** For all of Q4/Q5/Q8/Q12/Q21/Q22: exactly one `DPGROUP decline`
+line (`reason=strategy-or-mode`, `strategy=0` — the Hashed candidate, which
+always short-circuits `groupingEmissionPathkeys` immediately since
+`AggStrategyHashed` is the zero value and can never equal
+`AggStrategySorted`), followed by one `DPGROUP translated ok` line for the
+Sorted candidate (`keys=1 strategy=1`), followed by one `DPGROUP elected`
+line. **`anyTranslated` is `true` for every one of the six — the second
+hypothesis this task was filed to check is also false as stated.** The loop
+runs its full tournament (`addOrderedPaths` on both candidates,
+`setCheapest`, `getCheapestFractionalPath`) and reaches an election every
+time:
+
+| query | elected shape | winning strategy |
+|---|---|---|
+| Q4 | `Sort` over `Aggregate` | `0` (Hashed) |
+| Q5 | `Sort` over `Aggregate` | `0` (Hashed) |
+| Q8 | bare `Aggregate` (no Sort) | `1` (Sorted) |
+| Q12 | `Sort` over `Aggregate` | `0` (Hashed) |
+| Q21 | `Sort` over `Aggregate` | `0` (Hashed) |
+| Q22 | bare `Aggregate` (no Sort) | `1` (Sorted) |
+
+For Q4/Q5/Q12/Q21 the loop **offers both** the translated sort-free Sorted
+candidate and a `Sort`-over-Hashed candidate to `setCheapest`, and the cost
+comparison picks **Hashed + an explicit Sort above it** as cheaper than the
+Sorted candidate's already-ordered output. Q8/Q22 pick the sort-free Sorted
+candidate and emit no Sort node at all — for these two the loop's job is
+already done; whatever residual "mechanism (B)" symptom a captured plan shows
+for them (if any) is not at this rel.
+
+**This means the loop is not declining or under-wired for Q4/Q5/Q12/Q21 —
+it is correctly running PG's own `create_ordered_paths` tournament and PG's
+own kind of answer (a cost comparison) is choosing the Hashed+Sort shape.**
+Whether that choice is *right* — i.e. whether PG 18.3 would make the same
+cost call for the same query — is a completely different question than
+"is the mechanism wired", and a stale scratch capture in this repo answers it
+for Q4 specifically: `tmp/take4/runs/plansweep/q04.{pg,goopg}.txt` (an old,
+uncommitted capture, cited here only as corroborating evidence, not as an
+authoritative plan-parity artifact) shows real PG choosing `Finalize
+GroupAggregate` fed by a `Sort` **below** the aggregate (Sorted strategy,
+group-key order falls out for free, no Sort above), while goopg's captured
+plan is exactly the `Sort` **above** `HashAggregate` shape this loop's trace
+predicts. **The root cause for at least Q4 (and plausibly Q5/Q12/Q21, same
+shape) is therefore a cost-model discrepancy in the Hashed-vs-Sorted
+`PathAgg` comparison** (or in the Sort's own cost, or in how cheaply PG's
+`GroupAggregate`-fed-by-Sort prices versus goopg's) — **not** a missing
+`electOrderedGrouping`/`groupingEmissionPathkeys` wiring gap. Both prior
+hypotheses this design doc chased (`len(cands)<2`, `anyTranslated=false`) are
+now refuted; the mechanism this doc set out to scope was already complete
+before this doc's own first task even started.
+
+**What this does NOT establish**: whether the Hashed-vs-Sorted cost
+comparison is wrong in general or only for this query shape; whether Q5/Q12/
+Q21 match Q4's exact PG plan shape (not verified against a fresh PG capture,
+only asserted by code-read symmetry — same GROUP BY-equals-ORDER BY-column
+shape); and whether fixing the cost comparison would actually flip these
+plans to PG's shape without regressing something else (M0141-S2a-fix2's
+precedent: a plausible-looking cost fix in this exact neighbourhood measured
+net-negative and was reverted, per the banner's item 1). **Resume point**:
+compare goopg's actual costed numbers for the Hashed and Sort-over-Sorted
+candidates at Q4/Q5/Q12/Q21 (the `DPPATH` lines this probe already captures
+carry `startup`/`total` for both — a fresh probe run needs no new
+instrumentation) against what PG's cost formulas would produce for the same
+shapes, to find which specific cost term is under- or over-pricing one side.
+Filed as **M0141-S2b-6** below.

@@ -1,5 +1,10 @@
 package optimizer
 
+import (
+	"fmt"
+	"os"
+)
+
 // R47 slice 2 (K101): the ORDERED upper rel adjudicates the GROUP_AGG
 // upper rel's surviving PathAgg candidates — PG's `create_ordered_paths`
 // iterating ALL input paths (planner.c:5345+ `foreach(lc,
@@ -17,6 +22,22 @@ package optimizer
 // Design: docs/design/not_ralph/plan_parity_fix_take2/r47-q4-upper-rel/
 // SLICE2.md. Measurement, not a pick rule: the corpus arbitrates, and
 // a no-flip outcome must still deliver the §3.3 census.
+
+// traceGroupDecline emits which specific groupingEmissionPathkeys check
+// declined a candidate — M0141-S2b-5's instrumentation, reusing
+// GOOPG_PGSHAPED_DP_TRACE (dpTrace, joinsearchtrace.go) rather than adding a
+// third diagnostic variable, same rationale as pathTraceEnabled in
+// pathtrace.go. Diagnostic only: never changes which candidate is chosen.
+func traceGroupDecline(reason string, cand *Path) {
+	if !dpTrace || cand == nil {
+		return
+	}
+	strategy := 0
+	if cand.Agg != nil {
+		strategy = int(cand.AggStrategy)
+	}
+	fmt.Fprintf(os.Stderr, "DPGROUP decline reason=%s strategy=%d\n", reason, strategy)
+}
 
 // groupingEmissionPathkeys is the emission order a sorted-aggregate
 // candidate delivers its grouped rows in, expressed in the aggregate
@@ -65,6 +86,7 @@ func groupingEmissionPathkeys(aggNode *Aggregate, cand *Path) []PathKey {
 	if cand.AggStrategy != AggStrategySorted || spec.GroupingSets != nil ||
 		len(spec.GroupExprs) == 0 || spec.Mode != AggModeSimple ||
 		spec.GroupKeyOrder != nil {
+		traceGroupDecline("strategy-or-mode", cand)
 		return nil
 	}
 	// R56: the worker-sort-under-GatherMerge no-split arm
@@ -81,6 +103,7 @@ func groupingEmissionPathkeys(aggNode *Aggregate, cand *Path) []PathKey {
 	// exactly like a mis-sorted Sort.
 	if len(cand.Children) == 0 || cand.Children[0] == nil ||
 		(cand.Children[0].Kind != PathSort && cand.Children[0].Kind != PathGatherMerge) {
+		traceGroupDecline("no-sort-or-gathermerge-child", cand)
 		return nil
 	}
 	childPK := cand.Children[0].Pathkeys
@@ -91,18 +114,22 @@ func groupingEmissionPathkeys(aggNode *Aggregate, cand *Path) []PathKey {
 		// here, so `exprEqual`'s positional `Index` equality is the
 		// match (Name/SourceTableIdx excluded, exprwalk.go:555+).
 		if _, ok := g.(*ColumnRef); !ok {
+			traceGroupDecline(fmt.Sprintf("group-expr[%d]-not-columnref(%T)", j, g), cand)
 			return nil
 		}
 		if j >= len(childPK) || !exprEqual(childPK[j].Expr, g) {
+			traceGroupDecline(fmt.Sprintf("group-expr[%d]-not-leading-child-sortkey", j), cand)
 			return nil
 		}
 	}
 	outCols := aggNode.Output()
 	if len(outCols) < len(groups) {
+		traceGroupDecline("fewer-outcols-than-groups", cand)
 		return nil
 	}
 	for j, g := range groups {
 		if outCols[j].Name != groupExprName(g) {
+			traceGroupDecline(fmt.Sprintf("outcol[%d]-name-mismatch(%s!=%s)", j, outCols[j].Name, groupExprName(g)), cand)
 			return nil
 		}
 	}
@@ -113,6 +140,9 @@ func groupingEmissionPathkeys(aggNode *Aggregate, cand *Path) []PathKey {
 			SortAsc:    childPK[j].SortAsc,
 			NullsFirst: childPK[j].NullsFirst,
 		}
+	}
+	if dpTrace {
+		fmt.Fprintf(os.Stderr, "DPGROUP translated ok keys=%d strategy=%d\n", len(emitted), int(cand.AggStrategy))
 	}
 	return emitted
 }
@@ -146,9 +176,14 @@ func groupingEmissionPathkeys(aggNode *Aggregate, cand *Path) []PathKey {
 // at least one candidate translates (a Sort-only loop could only
 // re-price, never change the election versus the normal call).
 func electOrderedGrouping(u *upperRels, agg *aggregateSurface, node Node, keys []SortKey, stmtPos int, cp costParams, tupleFraction, limitTuples float64) (Node, bool) {
-	decline := func() (Node, bool) { return nil, false }
+	decline := func(reason string) (Node, bool) {
+		if dpTrace {
+			fmt.Fprintf(os.Stderr, "DPGROUP loop-decline reason=%s\n", reason)
+		}
+		return nil, false
+	}
 	if u == nil || len(keys) == 0 || agg == nil || agg.node == nil || node != agg.node {
-		return decline()
+		return decline("gate-precondition")
 	}
 	grouped := fetchUpperRel(u, UpperGroupAgg, 0, tupleFraction)
 	var cands []*Path
@@ -158,13 +193,13 @@ func electOrderedGrouping(u *upperRels, agg *aggregateSurface, node Node, keys [
 		}
 		switch p.Kind {
 		case PathFinalizeAgg:
-			return decline()
+			return decline("parallel-finalize-agg-present")
 		case PathAgg:
 			cands = append(cands, p)
 		}
 	}
 	if len(cands) < 2 {
-		return decline()
+		return decline(fmt.Sprintf("cands<2(%d)", len(cands)))
 	}
 	translated := make([][]PathKey, len(cands))
 	anyTranslated := false
@@ -175,7 +210,7 @@ func electOrderedGrouping(u *upperRels, agg *aggregateSurface, node Node, keys [
 		}
 	}
 	if !anyTranslated {
-		return decline()
+		return decline("anyTranslated=false")
 	}
 
 	ordered := fetchUpperRel(u, UpperOrdered, 0, tupleFraction)
@@ -184,10 +219,10 @@ func electOrderedGrouping(u *upperRels, agg *aggregateSurface, node Node, keys [
 	sizeUpperRelFromNode(ordered, agg.node)
 	savedPathlist := append([]*Path(nil), ordered.Pathlist...)
 	savedTotal, savedStartup, savedParam := ordered.CheapestTotal, ordered.CheapestStartup, ordered.CheapestParameterized
-	restore := func() (Node, bool) {
+	restore := func(reason string) (Node, bool) {
 		ordered.Pathlist = savedPathlist
 		ordered.CheapestTotal, ordered.CheapestStartup, ordered.CheapestParameterized = savedTotal, savedStartup, savedParam
-		return decline()
+		return decline(reason)
 	}
 
 	sortKeys := pathkeysForSortKeys(keys)
@@ -209,7 +244,7 @@ func electOrderedGrouping(u *upperRels, agg *aggregateSurface, node Node, keys [
 
 	best := getCheapestFractionalPath(ordered, tupleFraction)
 	if best == nil {
-		return restore()
+		return restore("best=nil")
 	}
 	built, _ := createPlanNode(best)
 	switch b := built.(type) {
@@ -219,14 +254,20 @@ func electOrderedGrouping(u *upperRels, agg *aggregateSurface, node Node, keys [
 		// shapes cannot arise here; anything else restores.
 		ba, ok := b.Child.(*Aggregate)
 		if !ok {
-			return restore()
+			return restore("sort-child-not-aggregate")
 		}
 		b.pos = stmtPos
 		*agg.node = *ba
+		if dpTrace {
+			fmt.Fprintf(os.Stderr, "DPGROUP elected shape=Sort-over-Aggregate strategy=%d\n", int(ba.Strategy))
+		}
 	case *Aggregate:
 		*agg.node = *b
+		if dpTrace {
+			fmt.Fprintf(os.Stderr, "DPGROUP elected shape=bare-Aggregate strategy=%d\n", int(b.Strategy))
+		}
 	default:
-		return restore()
+		return restore("winner-shape-unexpected")
 	}
 	// The strategy changed under the node: recompute the keys-only keep
 	// (above still unknown — the B-01c above-aware re-stamp before
