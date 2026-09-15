@@ -20,11 +20,12 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/goopg/goopg/internal/catalog"
-	"github.com/goopg/goopg/internal/access/transam/multixact"
+	"github.com/goopg/goopg/internal/access/nbtree"
 	"github.com/goopg/goopg/internal/access/transam"
-	"github.com/goopg/goopg/internal/parser"
+	"github.com/goopg/goopg/internal/access/transam/multixact"
+	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/optimizer"
+	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/storage"
 )
 
@@ -507,6 +508,17 @@ func fullTableFKCheckRel(ctx *Context, ownerTbl, leafTbl *catalog.Table, fk cata
 		return err
 	}
 	for blk := storage.BlockNumber(0); blk < nBlocks; blk++ {
+		// M0142-0003g: this is now the dominant cost of ADD CONSTRAINT
+		// FOREIGN KEY validation (O(child rows), each row an
+		// index-accelerated parent probe via assertParentExists) — check
+		// for cancellation per block so pg_terminate_backend/statement
+		// timeout can actually interrupt a large validation scan, which
+		// it previously could not (M0142-0003f/-0003h finding).
+		if ctx.Ctx != nil {
+			if cerr := ctx.Ctx.Err(); cerr != nil {
+				return cerr
+			}
+		}
 		s, err := ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: blk})
 		if err != nil {
 			return err
@@ -1315,7 +1327,182 @@ type fkPendingRef struct {
 // visible matching row has no in-flight updater, it satisfies the FK
 // immediately without serialising.  When all matching rows are being updated,
 // the lock waits for the updater, mirroring our wait+retry loop.
-func scanRelForFKMatch(ctx *Context, tbl *catalog.Table, colNames []string, vals []Datum) (bool, *fkPendingRef, error) {
+// findFKCoveringUniqueIndex returns the first unique (or primary key) btree
+// index on tbl whose key columns are exactly colNames (order-independent —
+// PG requires an FK's referenced columns to be backed by such a constraint,
+// tablecmds.c transformFkeyCheckAttrs), or nil when none is found (e.g. the
+// index has not been created on this cluster yet), in which case the caller
+// falls back to the unindexed scan. M0142-0003g.
+func findFKCoveringUniqueIndex(ctx *Context, tbl *catalog.Table, colNames []string) *catalog.Index {
+	if ctx == nil || ctx.Catalog == nil || tbl == nil {
+		return nil
+	}
+	for _, idx := range ctx.Catalog.IndexesOnTable(tbl, catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)) {
+		if (!idx.Unique && !idx.Primary) || idx.HasPredicate || len(idx.Columns) != len(colNames) {
+			continue
+		}
+		covers := true
+		for _, c := range colNames {
+			found := false
+			for _, ic := range idx.Columns {
+				if ic != "" && strings.EqualFold(ic, c) {
+					found = true
+					break
+				}
+			}
+			if !found {
+				covers = false
+				break
+			}
+		}
+		if covers {
+			return idx
+		}
+	}
+	return nil
+}
+
+// fkProbeKeyForIndex encodes vals (aligned to colNames) into idx's btree
+// SEARCH key via ctx.indexRowProbeKey — the SAME probe-key builder
+// checkUniqueIndexesForInsert uses — by placing each value at its column's
+// position in a scratch row, rather than risking a second, divergent
+// encoder for the same on-disk key format. This matters concretely: an
+// index can be keyed in either the "blob" format (encodeIndexKeyFromCols
+// alone) or PG's real index-tuple format (pgIndexTupleKey, when
+// ctx.pgIndexKeyDesc(idx) is non-nil) — calling encodeIndexKeyFromCols
+// directly here would silently build the wrong key shape for the latter
+// and every RangeScan would report a false "not found". Returns nil when a
+// value is NULL (NULLs are absent from btree unique-index entries; caller
+// must fall back to the heap scan) or a column can't be resolved.
+// M0142-0003g.
+func fkProbeKeyForIndex(ctx *Context, idx *catalog.Index, tbl *catalog.Table, colNames []string, vals []Datum) []byte {
+	row := make(Row, len(tbl.Columns))
+	matched := 0
+	for i, name := range colNames {
+		for j := range tbl.Columns {
+			if strings.EqualFold(tbl.Columns[j].Name, name) {
+				row[j] = vals[i]
+				matched++
+				break
+			}
+		}
+	}
+	if matched != len(colNames) {
+		return nil
+	}
+	key, err := ctx.indexRowProbeKey(idx, tbl.Columns, row)
+	if err != nil || key == nil {
+		return nil
+	}
+	return key
+}
+
+// fkPendingOutcome classifies an already-visible, already-key-matched parent
+// tuple: is the FK match clean (no in-flight key-changing modification) or
+// must the caller wait for a pending xmax? Shared by the indexed probe
+// (scanIndexForFKMatch) and the unindexed fallback (scanRelForFKMatchSeq) so
+// the multixact / key-changing-wait semantics can never diverge between the
+// two scan strategies (pattern_sibling_paths_must_agree). Extracted verbatim
+// from the pre-M0142-0003g scanRelForFKMatch body.
+func fkPendingOutcome(ctx *Context, tuple storage.HeapTuple, rel storage.RelFileNode, blk storage.BlockNumber, slotIdx uint16) (clean bool, pending *fkPendingRef) {
+	// Decide whether to wait on the updater.  For an updater-bearing
+	// multixact xmax (IS_MULTI set, LOCK_ONLY clear) the raw t_xmax is a
+	// MultiXactId, not a transaction id — resolve the updater member
+	// before any single-transaction test, and never record a MultiXactId
+	// as the xid to wait on.
+	//
+	// FK enforcement performs the equivalent of SELECT ... FOR KEY SHARE
+	// on the matched parent row.  A KEY SHARE lock conflicts ONLY with a
+	// key-changing modification of that row — a key UPDATE or a DELETE
+	// (MultiXactStatusUpdate) — and is COMPATIBLE with a concurrent
+	// no-key UPDATE (StatusNoKeyUpdate) as well as with pure row locks.
+	// So we wait on the matched row's in-flight xmax only when it
+	// represents a key-changing modification; a no-key updater leaves the
+	// referenced key intact and the FK is satisfied immediately, without
+	// serialising (upstream RI_FKey_check; isolation spec fk-deadlock).
+	xmax := tuple.Header.Xmax
+	infomask := tuple.Header.Infomask
+	effXmax := xmax
+	isLockOnly := storage.IsHeapTupleLockOnly(infomask)
+	keyChanging := false
+	if storage.IsHeapTupleXmaxMulti(infomask) && !isLockOnly {
+		effXmax = multixactUpdaterXID(ctx.MultiXact, xmax)
+		if effXmax == storage.InvalidTransactionID {
+			// Only lockers (or an unknown multi / no store): lock
+			// holders do not delete the matched row, so this is a
+			// clean FK match just like a lock-only xmax.
+			isLockOnly = true
+		} else {
+			keyChanging = multixactUpdaterIsKeyChanging(ctx.MultiXact, xmax)
+		}
+	} else if !isLockOnly && xmax != storage.InvalidTransactionID {
+		keyChanging = fkXmaxIsKeyChanging(tuple.Header,
+			storage.ItemPointer{Block: blk, Offset: slotIdx})
+	}
+	if effXmax == storage.InvalidTransactionID || isLockOnly || !keyChanging ||
+		effXmax == ctx.Tx.XID || ctx.TxnMgr == nil || !ctx.TxnMgr.IsXIDActive(effXmax) {
+		// Clean match: no in-flight key-changing modification — FK is
+		// satisfied (FOR KEY SHARE is compatible with the in-flight
+		// no-key update / pure lock, if any).
+		return true, nil
+	}
+	// Pending: record only the first encountered.
+	return false, &fkPendingRef{xid: effXmax, rel: rel, blk: blk, slot: slotIdx}
+}
+
+// scanIndexForFKMatch is the index-probe twin of scanRelForFKMatchSeq: an
+// exact-key btree lookup instead of a full parent-heap scan, replacing the
+// O(child rows * parent-scan distance) cost that made ADD CONSTRAINT FOREIGN
+// KEY infeasible once the parent exceeded a few hundred rows (M0142-0003f
+// found this: partsupp/part, child 800k/parent 200k, did not finish in
+// several minutes). The per-tuple visibility/wait decision is delegated to
+// fkPendingOutcome so it stays identical to the unindexed path. Mirrors
+// uniqueCheckWithWait's scanOnce structure: pin/lock/read/unlock before
+// inspecting the tuple header, which is a value copy safe to read unlocked.
+func scanIndexForFKMatch(ctx *Context, rel storage.RelFileNode, tree *nbtree.BTree, key []byte) (bool, *fkPendingRef, error) {
+	var pending *fkPendingRef
+	found := false
+	err := tree.RangeScan(key, key, func(_ []byte, ptr storage.ItemPointer) (bool, error) {
+		if ctx.Ctx != nil {
+			if cerr := ctx.Ctx.Err(); cerr != nil {
+				return false, cerr
+			}
+		}
+		s, perr := ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: ptr.Block})
+		if perr != nil {
+			return true, nil
+		}
+		s.RLock()
+		tuple, terr := storage.PageGetHeapTuple(s.Page(), ptr.Offset)
+		s.RUnlock()
+		ctx.Pool.Unpin(s)
+		if terr != nil {
+			return true, nil
+		}
+		if !transam.TupleVisibleSubxact(tuple.Header, ctx.Snap, ctx.Tx.XID, ctx.TxnMgr, ctx.CmdID, ctx.comboStore(), ctx.MultiXact) {
+			return true, nil
+		}
+		if clean, pend := fkPendingOutcome(ctx, tuple, rel, ptr.Block, ptr.Offset); clean {
+			found = true
+			return false, nil
+		} else if pending == nil {
+			pending = pend
+		}
+		return true, nil
+	})
+	if err != nil {
+		return false, nil, err
+	}
+	return found, pending, nil
+}
+
+// scanRelForFKMatchSeq is the unindexed full-heap-scan fallback, used when no
+// unique index covers colNames (or the probe key can't be built, e.g. a NULL
+// value). Behaviour is unchanged from the pre-M0142-0003g scanRelForFKMatch
+// except the per-tuple wait decision now goes through fkPendingOutcome (see
+// its doc comment) and a cancellation check was added to the block loop —
+// pg_terminate_backend previously had no effect on an in-flight scan here.
+func scanRelForFKMatchSeq(ctx *Context, tbl *catalog.Table, colNames []string, vals []Datum) (bool, *fkPendingRef, error) {
 	rel := ctx.Catalog.RelFileNode(tbl)
 	cols := tbl.Columns
 	colIdx := fkColumnIndexes(cols, colNames)
@@ -1325,6 +1512,11 @@ func scanRelForFKMatch(ctx *Context, tbl *catalog.Table, colNames []string, vals
 	}
 	var pending *fkPendingRef
 	for blk := storage.BlockNumber(0); blk < nBlocks; blk++ {
+		if ctx.Ctx != nil {
+			if cerr := ctx.Ctx.Err(); cerr != nil {
+				return false, nil, cerr
+			}
+		}
 		s, err := ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: blk})
 		if err != nil {
 			return false, nil, err
@@ -1357,59 +1549,42 @@ func scanRelForFKMatch(ctx *Context, tbl *catalog.Table, colNames []string, vals
 			if !fkRowMatchesAt(colIdx, row, vals) {
 				continue
 			}
-			// Matched.  Decide whether to wait on the updater.  For an
-			// updater-bearing multixact xmax (IS_MULTI set, LOCK_ONLY clear)
-			// the raw t_xmax is a MultiXactId, not a transaction id — resolve
-			// the updater member before any single-transaction test, and never
-			// record a MultiXactId as the xid to wait on.
-			//
-			// FK enforcement performs the equivalent of SELECT ... FOR KEY
-			// SHARE on the matched parent row.  A KEY SHARE lock conflicts ONLY
-			// with a key-changing modification of that row — a key UPDATE or a
-			// DELETE (MultiXactStatusUpdate) — and is COMPATIBLE with a
-			// concurrent no-key UPDATE (StatusNoKeyUpdate) as well as with pure
-			// row locks.  So we wait on the matched row's in-flight xmax only
-			// when it represents a key-changing modification; a no-key updater
-			// leaves the referenced key intact and the FK is satisfied
-			// immediately, without serialising (upstream RI_FKey_check;
-			// isolation spec fk-deadlock).
-			xmax := tuple.Header.Xmax
-			infomask := tuple.Header.Infomask
-			effXmax := xmax
-			isLockOnly := storage.IsHeapTupleLockOnly(infomask)
-			keyChanging := false
-			if storage.IsHeapTupleXmaxMulti(infomask) && !isLockOnly {
-				effXmax = multixactUpdaterXID(ctx.MultiXact, xmax)
-				if effXmax == storage.InvalidTransactionID {
-					// Only lockers (or an unknown multi / no store): lock
-					// holders do not delete the matched row, so this is a
-					// clean FK match just like a lock-only xmax.
-					isLockOnly = true
-				} else {
-					keyChanging = multixactUpdaterIsKeyChanging(ctx.MultiXact, xmax)
-				}
-			} else if !isLockOnly && xmax != storage.InvalidTransactionID {
-				keyChanging = fkXmaxIsKeyChanging(tuple.Header,
-					storage.ItemPointer{Block: blk, Offset: slotIdx})
-			}
-			if effXmax == storage.InvalidTransactionID || isLockOnly || !keyChanging ||
-				effXmax == ctx.Tx.XID || ctx.TxnMgr == nil || !ctx.TxnMgr.IsXIDActive(effXmax) {
-				// Clean match: no in-flight key-changing modification —
-				// FK is satisfied (FOR KEY SHARE is compatible with the
-				// in-flight no-key update / pure lock, if any).
+			if clean, pend := fkPendingOutcome(ctx, tuple, rel, blk, slotIdx); clean {
 				s.RUnlock()
 				ctx.Pool.Unpin(s)
 				return true, nil, nil
-			}
-			// Pending: record only the first encountered.
-			if pending == nil {
-				pending = &fkPendingRef{xid: effXmax, rel: rel, blk: blk, slot: slotIdx}
+			} else if pending == nil {
+				pending = pend
 			}
 		}
 		s.RUnlock()
 		ctx.Pool.Unpin(s)
 	}
 	return false, pending, nil
+}
+
+// scanRelForFKMatch finds whether a live parent row exists in tbl matching
+// colNames==vals, for FK enforcement (INSERT-time checkFKInsert and ADD
+// CONSTRAINT-time fullTableFKCheckRel). When a unique index covers exactly
+// colNames — which PG's own FK-creation rule guarantees whenever the FK was
+// actually creatable — the lookup is an O(log parent rows) index probe
+// instead of the O(parent rows) full heap scan the pre-M0142-0003g version
+// always did: fullTableFKCheckRel's O(child rows) outer loop combined with
+// an O(parent rows) inner scan made validating a large-table FK
+// (partsupp/part: child 800k, parent 200k) infeasible, let alone
+// lineitem's 6M rows. Falls back to scanRelForFKMatchSeq when no covering
+// index exists or the probe key can't be built (e.g. a partial-NULL
+// multi-column FK value).
+func scanRelForFKMatch(ctx *Context, tbl *catalog.Table, colNames []string, vals []Datum) (bool, *fkPendingRef, error) {
+	if idx := findFKCoveringUniqueIndex(ctx, tbl, colNames); idx != nil {
+		if key := fkProbeKeyForIndex(ctx, idx, tbl, colNames, vals); key != nil {
+			idxRel := ctx.Catalog.IndexRelFileNode(idx)
+			if tree, err := openIndexBTree(ctx, idx, idxRel); err == nil {
+				return scanIndexForFKMatch(ctx, ctx.Catalog.RelFileNode(tbl), tree, key)
+			}
+		}
+	}
+	return scanRelForFKMatchSeq(ctx, tbl, colNames, vals)
 }
 
 // scanTableForMatchFKWait performs scanTableForMatch with row-level wait

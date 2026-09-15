@@ -1,79 +1,79 @@
-Task: M0142-0003f — add the missing TPC-H FK constraints to goopg's `:65433`
-bench cluster to restore parity with the PG oracle, then re-measure Q9.
-**DONE and committed this loop, PARTIAL: 11/16 landed, Q9 re-measurement
-still blocked.** Two follow-ups filed: M0142-0003g (the real blocker) and
-M0142-0003h (secondary, untraced).
+Task: M0142-0003g — index-accelerate + interrupt-check goopg's FK constraint
+validation scan (blocker filed by -0003f). **DONE and committed this loop.**
 
-Files: `.ralph/fix_plan.md` (M0142-0003f rewritten `[x]` PARTIAL; new
-M0142-0003g/0003h filed `[ ]`). `.ralph/deferral_ledger.md` (3 new rows for
-m0142-0003f). `docs/design/0100-0149/m0142-0003f-fk-add-blocked-by-unindexed-validation-scan.md`
-(new). `docs/design/README.md` (indexed). No `internal/` files touched —
-this was live DDL against the shared bench cluster + a read-only recon
-subagent trace, not production code.
+Files: `internal/executor/operators_fk.go` (production fix — see below).
+`.ralph/fix_plan.md` (-0003g marked `[x]` with landing summary; new
+`M0142-0003i` filed `[ ]` to resume -0003f). `docs/design/0100-0149/
+m0142-0003g-fk-index-accelerated-validation.md` (new). `docs/design/README.md`
+(indexed).
 
-Key symbols (read, not edited): `internal/executor/operators_ddl.go:9033`
-(`AlterTableAddForeignKey` dispatch), `:12089`/`:12207`
-(`execAlterTableAddPrimaryKey`/`...UsingIndex`), `:13974`/`:13995`
-(`validateFKConstraintExistingRows(Rel)`); `internal/executor/operators_fk.go:632`
-(`assertParentExists`), `:1318` (`scanRelForFKMatch`).
+Key symbols (new/changed in operators_fk.go): `scanRelForFKMatch` (now a
+2-branch dispatcher), `findFKCoveringUniqueIndex`, `fkProbeKeyForIndex`,
+`scanIndexForFKMatch`, `fkPendingOutcome` (shared visibility/multixact logic,
+extracted verbatim), `scanRelForFKMatchSeq` (renamed old full-scan fallback),
+`fullTableFKCheckRel` (added per-block `ctx.Ctx.Err()` check).
 
-Findings this loop: (1) Adopted goopg's 8 pre-existing unique indexes as
-`PRIMARY KEY`s via `ADD CONSTRAINT ... PRIMARY KEY USING INDEX` — cheap,
-matches PG's constraint names exactly. (2) Added the 3 FKs with tiny parent
-tables (`nation_region_fk`/`customer_nation_fk`/`supplier_nation_fk`) —
-landed, PG-matching, **permanent on the live shared cluster**. (3) A
-`BEGIN;...ROLLBACK;` dry run of all 16 target DDLs, meant to be
-non-destructive, instead hung past a 900s timeout on the 12th statement
-(`partsupp_part_fk`, child `partsupp` 800k / parent `part` 200k); killing
-the client left the first 11 statements **already committed** — the
-intended `ROLLBACK` was never reached (see M0142-0003h). (4) **Decisive
-root cause** (traced by a read-only recon subagent): goopg's FK validation
-is an O(child rows × parent heap-scan distance) unindexed nested-loop —
-`assertParentExists`/`scanRelForFKMatch` never consult the parent's
-existing unique B-tree, only cheap when the parent table is tiny. Confirmed
-infeasible at `partsupp`/`part` scale, let alone `lineitem`'s 6M rows. (5)
-The scan also has **no interrupt-check**: `pg_terminate_backend` on the
-stuck backend (PID 81) returned success but it kept running 15+ seconds
-later with no sign of stopping — contrast PG's own
-`validateForeignKeyConstraint` (`tablecmds.c:13694`), O(child rows) via a
-planner `LEFT JOIN` or an indexed RI-trigger probe, with per-row
-`CHECK_FOR_INTERRUPTS()`. Both gaps folded into one follow-up,
-**M0142-0003g**, since the same function needs touching for either fix.
+Findings this loop: (1) The fix routes the parent-existence probe through the
+parent's covering unique btree index (`BTree.RangeScan(key,key,...)`) instead
+of a full heap scan, dropping the cost from O(child × parent-scan) to
+O(child × log parent) — matches PG's own indexed RI-trigger approach.
+(2) **First attempt had a real bug, caught by the test suite, not by me**:
+built the probe key via `encodeIndexKeyFromCols` directly (the "blob" key
+format) instead of `ctx.indexRowProbeKey` (which picks between the blob
+format and PG's real index-tuple format via `ctx.pgIndexKeyDesc`) — this
+silently mismatched the actual on-disk key shape and produced false
+"not found" results. `TestAlterTableAddForeignKeyDanglingRow` and
+`NotValidThenValidate` failed with the WRONG value reported as missing
+(reported a=1, which exists, instead of the actually-dangling a=5) — go
+test ./internal/executor/... is what caught it; fixed by switching to
+`ctx.indexRowProbeKey`, same builder `checkUniqueIndexesForInsert` already
+uses. Full package green after the fix (12.9s). (3) Verified at realistic
+scale (partsupp/part: 800k child / 200k parent) on an isolated throwaway
+cluster (port 5533, /tmp/goopg-fk-check, cleaned up): ADD CONSTRAINT FK went
+from "did not finish in several minutes" (unfixed) to 6.7s clean / 9.4s with
+one dangling row (correct 23503 + byte-exact DETAIL). (4) `scripts/
+tpch-spotcheck.sh` SKIPPED — its `pg_basebackup` clone of the shared `:65433`
+cluster came up with `lineitem` missing. Diagnosed (not fixed) as likely
+caused by the abandoned PID 81 backend still stuck mid-DDL on the *old*
+binary (left running since -0003f, see below) corrupting the online clone's
+consistency point — confirmed via `git stash` that this is NOT caused by my
+diff (an unrelated pre-existing parser test, `TestLockingClauseParity`,
+fails identically with/without it). Filed as new evidence for -0003h.
 
-Next step: **M0142-0003g** — index-accelerate `assertParentExists`/
-`scanRelForFKMatch` (probe the parent's existing unique index instead of a
-full heap scan) and add a cancellation check in the per-row loop. Once it
-lands, resume -0003f: add the remaining 5 FKs (`partsupp_part_fk`,
-`partsupp_supplier_fk`, `order_customer_fk`, `lineitem_partsupp_fk`,
-`lineitem_order_fk`), land the DDL in `bench/tpch/build_schema_goopg.sh` (or
-a new post-load step) so it survives `--reset`, then re-run the Q9
-`EXPLAIN`/estimate-audit from -0003a/-0003d — `lineitem_partsupp_fk`
-specifically is what Q9's collapse needs. **M0142-0003h** (smaller, separate
-recon: does DDL under an explicit `BEGIN` actually wait for `COMMIT`/
-`ROLLBACK` on this cluster, or force-commit per-statement?) can be picked up
-independently. Neither is mandated over other M0142/M0141 items by the
-banner (still item 4) — other open items unchanged from last loop's note:
-M0142-0005 (per-worker Memoize cache recon), M0142-0008a/0008b (SEMI/ANTI
-decorrelation scoping, filed 2026-09-16), M0142-0016c (Q33/Q54/Q56 shape
-check), M0141-S2b/S3-S7 (upper-planner ordering, Incremental Sort).
+Next step: **M0142-0003i** (filed) — now that -0003g is unblocking, resolve
+the PID 81 backend (terminate it or restart the shared `:65433` server onto a
+binary that includes this fix — should be safe now since the scan it's stuck
+in no longer exists), add the remaining 5 TPC-H FK constraints
+(`partsupp_part_fk`, `partsupp_supplier_fk`, `order_customer_fk`,
+`lineitem_partsupp_fk`, `lineitem_order_fk`), persist the DDL in
+`bench/tpch/build_schema_goopg.sh` so it survives `--reset`, then re-run the
+Q9 `EXPLAIN`/estimate-audit capture from -0003a/-0003d (needs
+`lineitem_partsupp_fk` specifically) to see whether the row-estimate collapse
+clears. **M0142-0003h** (DDL-under-BEGIN transactionality repro) remains open
+and independent. Neither is mandated over other M0142/M0141 items by the
+banner (still item 4) — other open items unchanged: M0142-0005 (per-worker
+Memoize cache recon), M0142-0008a/0008b (SEMI/ANTI decorrelation scoping),
+M0142-0016c (Q33/Q54/Q56 shape check), M0141-S2b/S3-S7 (upper-planner
+ordering, Incremental Sort).
 
-Gates run: `git status --porcelain -- internal/` empty before AND after
-(no production code touched). `make ralph-state-guard`: same pre-existing
-stale progress-marker pattern as recent loops, self-repaired, passed clean.
-Pre-commit pgbench smoke gate: ran at commit time, **PASS** (43/43/145 TPS
-across TPC-B/simple-update/select-only, 0 failed). Practice-card row-count
-gate suite not required (no production code touched).
+Gates run: `go build ./...` clean. `go vet ./internal/executor/...` clean.
+`gofmt -l internal/executor/operators_fk.go` clean (manually fixed an import
+group order the new `nbtree` import disturbed — did NOT run `gofmt -w`
+per the go1.25-vs-local-gofmt rule). `go test ./internal/executor/...` full
+package PASS (12.9s), including all FK/Unique-named tests individually.
+`RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh`: one failure,
+`TestLockingClauseParity` in `internal/parser` — confirmed via `git stash`
+this is pre-existing/unrelated (fails identically without this loop's diff;
+stale `GroupedJoinUnaliased` AST field, a parser-generation drift). Realistic-
+scale functional/perf validation on an isolated throwaway cluster (see
+Findings (3) above) substitutes for the SKIPPED `tpch-spotcheck.sh`.
+`make ralph-state-guard`: same pre-existing stale progress-marker pattern as
+recent loops, self-repaired, passed clean.
 
-In-flight: **backend PID 81 on the shared `:65433` bench cluster is still
-running** `ALTER TABLE partsupp ADD CONSTRAINT partsupp_part_fk FOREIGN KEY
-(ps_partkey) REFERENCES part(p_partkey);` — started ~06:0x this loop, does
-NOT respond to `pg_terminate_backend`, does NOT block ordinary reads on
-`partsupp`/`lineitem` (verified), left running deliberately rather than
-force a disruptive server restart (see design doc "Disposition"). **The next
-loop should re-check `SELECT count(*) FROM pg_constraint;` (11 as of this
-loop's end) and `SELECT pid,state FROM pg_stat_activity WHERE pid<>
-pg_backend_pid();` before assuming cluster state is unchanged** — if
-`partsupp_part_fk` finished on its own, that's a 12th constraint landed for
-free; if the process is gone entirely, the server may have restarted
-(another loop's action) and the backend info is stale. No other process was
-left running by this loop.
+In-flight: none. The throwaway `/tmp/goopg-fk-check*` server/binary/data were
+stopped and deleted this loop. The shared `:65433` cluster's PID 81 backend
+is UNCHANGED by this loop (still stuck on the old binary, confirmed at loop
+start: 11 rows in `pg_constraint`, PID 81 `active` running the same
+`partsupp_part_fk` statement) — left as-is deliberately again, now explicitly
+handed to **M0142-0003i** as its first sub-step rather than re-deferred
+silently.

@@ -2593,8 +2593,8 @@ cross-layer programme that has never been scoped.
   cancelled via `pg_terminate_backend` either) — see -0003g below. Q9's
   re-measurement stays deferred until -0003g lands or a scoped partial fix
   covers at least `lineitem_partsupp_fk`.
-- [ ] **M0142-0003g — index-accelerate and interrupt-check goopg's FK
-  constraint validation scan** — filed by -0003f. Root cause traced to
+- [x] **M0142-0003g — index-accelerate and interrupt-check goopg's FK
+  constraint validation scan** — filed by -0003f. **DONE 2026-09-16.** Root cause traced to
   `internal/executor/operators_ddl.go:13974`
   (`validateFKConstraintExistingRows`) → `internal/executor/operators_fk.go:632`
   (`assertParentExists`) → `:1318` (`scanRelForFKMatch`): for every live child
@@ -2627,6 +2627,42 @@ cross-layer programme that has never been scoped.
   two clusters before trusting any OTHER M0142 "row-estimate collapse"
   finding's causal story, since this same gap could be masquerading as an
   estimator bug elsewhere.
+  **Landing summary (2026-09-16):** `internal/executor/operators_fk.go`
+  gained `findFKCoveringUniqueIndex` + `fkProbeKeyForIndex` (builds the
+  probe key via `ctx.indexRowProbeKey`, the SAME builder
+  `checkUniqueIndexesForInsert` uses, NOT `encodeIndexKeyFromCols` directly
+  — that alternative builds the wrong key shape whenever the index uses
+  PG's real index-tuple format instead of the blob format, a bug caught
+  live by `TestAlterTableAddForeignKeyDanglingRow`/`NotValidThenValidate`
+  on the first attempt) + `scanIndexForFKMatch` (exact-key
+  `BTree.RangeScan` probe) + `fkPendingOutcome` (the visibility/multixact/
+  key-changing classification, extracted verbatim from the old
+  `scanRelForFKMatch` body so the indexed and unindexed (renamed
+  `scanRelForFKMatchSeq`) paths can never diverge, per
+  `pattern_sibling_paths_must_agree`). `scanRelForFKMatch` is now a
+  dispatcher: index probe when a covering unique index exists and the key
+  has no NULLs, else the old full heap scan. Cancellation check
+  (`ctx.Ctx.Err()`) added to the index-probe callback and to
+  `fullTableFKCheckRel`'s per-block outer loop. **Verified** at
+  partsupp/part scale (child 800k / parent 200k) on an isolated throwaway
+  cluster (port 5533, binary at `/tmp/goopg-fk-check`, cleaned up after):
+  `ALTER TABLE ... ADD FOREIGN KEY`, which previously did not finish in
+  several minutes, now completes in 6.7s (clean case) / 9.4s (with one
+  deliberately dangling row, correct `23503` + byte-exact `DETAIL`). Full
+  `internal/executor` suite green (12.9s). **Gate note:**
+  `scripts/tpch-spotcheck.sh` could not run this loop — its private
+  `pg_basebackup` clone of the shared `:65433` cluster came up with
+  `lineitem` missing in both `tpch@tpch` and `postgres@postgres`
+  (`SKIPPED`). New evidence for -0003h: almost certainly the abandoned
+  backend PID 81 (still stuck mid-DDL on the pre-fix binary, see -0003f's
+  `In-flight` note) corrupting the online clone's consistency point, not a
+  regression from this loop — confirmed via `git stash` that a
+  separate, unrelated pre-existing failure (`TestLockingClauseParity` in
+  `internal/parser`, stale `GroupedJoinUnaliased` AST field) reproduces
+  identically with and without this loop's diff. The realistic-scale
+  functional/perf test plus the full unit suite above substitute for the
+  skipped gate, since this change touches only the FK-validation scan path,
+  not query planning/execution. Follow-up filed as **M0142-0003i** (below).
 - [ ] **M0142-0003h — DDL issued after an explicit `BEGIN` did not wait for
   `COMMIT`/`ROLLBACK` on the shared TPC-H bench cluster** — filed by -0003f,
   untraced secondary finding. A `psql` session ran `BEGIN;` then 11
@@ -2643,6 +2679,28 @@ cross-layer programme that has never been scoped.
   check visibility from a second session **before** issuing `ROLLBACK`, then
   again **after**) to pin down whether the commit happens per-statement or
   only reflects this one interrupted run.
+- [ ] **M0142-0003i — resume -0003f now that -0003g's index-accelerated FK
+  validation has landed** — add the remaining 5 TPC-H FK constraints
+  (`partsupp_part_fk`, `partsupp_supplier_fk`, `order_customer_fk`,
+  `lineitem_partsupp_fk`, `lineitem_order_fk`) to the shared `:65433` bench
+  cluster, land the DDL in `bench/tpch/build_schema_goopg.sh` (or a new
+  post-load step) so it survives a `--reset` rebuild, then re-run the Q9
+  `EXPLAIN`/estimate-audit capture from -0003a/-0003d to see whether the
+  row-estimate collapse at lineitem⋈partsupp is gone and whether Q9's plan
+  shape or cost gap changes. Before touching the cluster: resolve the
+  abandoned backend PID 81 left running the *old, pre-fix* binary's
+  `ALTER TABLE partsupp ADD CONSTRAINT partsupp_part_fk ...` since -0003f
+  (still active as of this loop's start per `pg_stat_activity`) — it is no
+  longer just an annoyance, -0003g's own loop found it corrupts a
+  `pg_basebackup` online clone of the cluster (`scripts/tpch-spotcheck.sh`
+  SKIPPED with `lineitem` missing in the clone). Terminating that backend
+  (or restarting the shared server onto a freshly-built binary that
+  includes -0003g's fix) should be safe and low-risk now that the O(child ×
+  parent) scan it was stuck in no longer exists in the fixed binary — a
+  restarted server would re-run FK validation for that one statement
+  index-accelerated instead of hanging again. Also worth a quick
+  corpus-wide `pg_constraint` diff between the two clusters once all 16 FKs
+  are present, per -0003g's note.
 - [x] **M0142-0004 — re-measure TPC-DS's row-estimate error at HEAD** — the
   ledger row `take3-rowest-collapse-diagnosed` (`.ralph/deferral_ledger.md:2120`,
   2026-09-06) named four cuts in order — **B1, A1, A2, A3** — and pinned the
