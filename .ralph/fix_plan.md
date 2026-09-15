@@ -2716,7 +2716,7 @@ cross-layer programme that has never been scoped.
   not measured (bench peer is another loop's live server). Ledger:
   `m0137-0012-b10-corr-zero-fallback-max-io-cost` (updated with this
   finding).
-- [ ] **M0142-0008 — recon: how much of goopg's plan shape is chosen by forced
+- [x] **M0142-0008 — recon: how much of goopg's plan shape is chosen by forced
   rewrites rather than by the search?** (measurement only, no production diff) —
   the goal says plans must be reached by **the same planning logic**, and several
   ledger rows claim goopg still depends on goopg-only forced rewrites that the
@@ -2726,16 +2726,68 @@ cross-layer programme that has never been scoped.
   `GOOPG_INDEXKEY_HARVEST`, `GOOPG_INDEX_PROBE_MULT`, `enable_nestloop_index`.
   Ledger: `take2-P6-03`, `take2-P6-04`, `take3-C-20c-blocked`, `-20d-calibrated`, `-20f-blocked`, `-20g-blocked`, `take2-P2-10`,
   `take3-C-09-declined`, `take2-P3-01`.
-  **Scope this as a measurement first, because a 2026-09-15 survey overstated
-  the case**: it reported that SEMI/ANTI "never enter the DP search", but
-  `parser.JoinSemi` is in fact handled at `joinpaths.go:195,265` and
-  `joinsearchlevel.go:98,160,228`. M0139-0005's narrower and verified finding is
-  that **no SEMI path is ever filed through `addPath`**. Establish which is true
-  at HEAD, per query, before proposing any milestone — the harness forbids
-  scoping from a dated claim without re-measuring (`git log -S` the mechanism
-  first). Deliverable: a per-query census of which plan nodes came from the
-  search vs from a forced rewrite, and a verdict on whether a dedicated
-  milestone is warranted.
+  **DONE 2026-09-16, recon closed, no code change. Full writeup:
+  `docs/design/0100-0149/m0142-0008-forced-rewrites-vs-search-census.md`.**
+  Read all six mechanisms' code and `git log -S` provenance directly (no
+  runtime trace needed). **Finding: both rewrite functions carry an explicit
+  `isSearchedTree` guard confining them to the portion of the tree the DP
+  search never reaches at all** — the ledger's 6.5x/12.5x "deletion
+  regresses" numbers are the rewrite being the sole decision-maker for
+  subtrees outside the search's current structural coverage, not the
+  rewrite beating a cost-based search on cost. **Q4** (`take2-P6-04`):
+  `unnestExistsExpr` builds the SEMI join directly on the raw parse tree
+  before any search joinrel exists (the already-verified M0139-0005/F11/K63
+  "no sjinfo → no joinrel → no path → no price" lineage) — `rewriteJoinsToNLI`
+  is the only producer despite `addNLIPaths` nominally admitting SEMI/ANTI.
+  **Q20** (`take2-P6-03`): the search's single-table index-scan mechanism is
+  structurally capable, but `planner.go:1590-94`'s own comment says a
+  filterless INNER/CROSS tree is left on the legacy path pending its own
+  gated widening. Of the four knobs: `GOOPG_NLI_COSTGATE`/
+  `GOOPG_INDEX_PROBE_MULT` are architecturally sound (tune inputs the
+  search's own `addPath` already consumes); `enable_nestloop_index` is a
+  clean, already-correctly-scoped kill switch (`take3-B-17e-blocked`); only
+  `GOOPG_INDEXKEY_HARVEST` joins the two rewrites as a genuine pre-search,
+  shape-determining mechanism (already correctly flagged in
+  `take3-C-20c-blocked`). **Verdict: a dedicated milestone is warranted,
+  scoped to closing the two named structural coverage gaps — not to
+  deleting the rewrites**, which would reproduce the measured regressions
+  until the gap is closed. Filed as scoping-recon follow-ups
+  **M0142-0008a** and **M0142-0008b** below.
+- [ ] **M0142-0008a — scoping recon: size wiring SEMI/ANTI decorrelation
+  into the DP search's joinrel machinery** — filed by M0142-0008. Q4-class
+  queries never reach `addPath` for their SEMI/ANTI join because
+  `unnestExistsExpr` (`unnest.go:4078`) builds the physical `Join{SEMI,
+  Hash}` node directly on the raw parse tree before any search joinrel
+  exists for it (no `SpecialJoinInfo` → no joinrel → no path → no price).
+  M0139-0005 named this bypass but explicitly declined to size it
+  ("materially larger task, out of this recon's scope"). Concrete next
+  step: read `unnestExistsExpr`'s call site alongside `deconstructFromItem`
+  (`collapse.go:398`, already identified by `take2-P3-01` as lacking a
+  catalog/resolver/binding at the point `SpecialJoinInfo` would need to be
+  built) and `joinsearchlevel.go`'s SEMI/ANTI handling, and produce: (1) a
+  per-query census of which TPC-H/TPC-DS queries hit this exact bypass
+  (Q4 is one instance; likely several EXISTS/IN-decorrelated queries share
+  it), (2) a concrete sizing (is this one slice or does it decompose like
+  M0140-0006 did), (3) the resume point for whichever piece is smallest.
+  Measurement/reading only — no code change — per K50 and the
+  M0142-0012a/M0142-0016a scoping-recon precedent, since this touches the
+  search's joinrel-construction machinery shared by every SEMI/ANTI query
+  in both corpora.
+- [ ] **M0142-0008b — scoping recon: measure the blast radius of widening
+  the DP-search gate to filterless INNER/CROSS trees** — filed by
+  M0142-0008. `planner.go:1590-94`'s own comment already names the fix
+  direction: `joinTreeHasOuterLink(node)` currently gates DP search to
+  trees with an OUTER link; a filterless INNER/CROSS tree (Q20's class)
+  stays on the legacy path, where only `rewriteScanInputsWithSingleTablePredicates`
+  promotes `SeqScan`→`IndexScan`. The same comment warns "widening to every
+  filterless join tree moves many long-stable plans at once" — measure
+  before implementing, per K50/M0142-0012a precedent. Concrete next step:
+  census which TPC-H/TPC-DS queries have a filterless INNER/CROSS top-level
+  FROM tree (or subtree) at HEAD, whether widening the gate condition would
+  actually change their plan (some may already coincide with the legacy
+  rewrite's output), and whether any currently-`match`ing query would move
+  away from PG's shape if the gate widened. Measurement only, no code
+  change.
 - [x] **M0142-0009 — recon: plain `Nested Loop`/`Gather` join nodes estimate
   single-digit rows against four-to-five-digit actuals, at `loops=1`** —
   Filed by M0142-0004c from the post-C1-fix re-capture
