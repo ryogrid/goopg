@@ -2349,11 +2349,29 @@ spill route is net-negative.
   (no-sort / full-sort) regardless of which rel feeds it — S7's own
   prefix-match third arm is required on top of every slice below, not
   replaced by any of them. **Decomposed into**:
-  - [ ] **M0141-S2b-0** — trace-only recon: `GOOPG_PGSHAPED_DP_TRACE=1` over
+  - [x] **M0141-S2b-0** — trace-only recon: `GOOPG_PGSHAPED_DP_TRACE=1` over
     TPC-H Q4/Q5/Q8/Q12/Q21/Q22 to confirm/refute whether a Sorted `PathAgg`
     candidate is ever added to the GROUP_AGG rel for these queries (the
-    `len(cands) < 2` decline hypothesis in the design doc). Decides whether
-    S2b-1 can move anything before S2b-2 lands. No production change.
+    `len(cands) < 2` decline hypothesis in the design doc). **DONE
+    2026-09-16 — hypothesis REFUTED.** A private throwaway-server trace (the
+    shared `:65433` TPC-H cluster is still emptied per M0142-0003k, reload
+    blocked) with parallelism correctly forced off (`max_parallel_workers_per_gather
+    = 0`; a first attempt without this pin was contaminated by real parallel
+    Partial/Finalize-Agg candidates and is not the reported result) shows all
+    six queries offer exactly 2 accepted `PathAgg` candidates
+    (`upper.groupagg.hashed` + `upper.groupagg.sort`) to the GROUP_AGG rel —
+    `len(cands)` is never `<2`. The decline narrows one level further, to
+    `electOrderedGrouping`'s `anyTranslated` gate
+    (`groupingEmissionPathkeys`, `upperorderedgrouping.go:56-117`), but which
+    specific check trips for which query is **not yet confirmed** — Q4/Q12
+    have no obvious blocking gate on a code read and need a live instrumented
+    re-trace, not further static reasoning. Full table and resume point in
+    `docs/design/0100-0149/m0141-s2b-scoping-decomposition.md` §"S2b-0
+    result". No production code changed (scratch test file deleted after
+    use, nothing committed). Filed **M0141-S2b-5** below to track the
+    specific next hypothesis (a possible `*ColumnRef`-only over-restriction
+    in `groupingEmissionPathkeys`) since it is now concrete enough to name as
+    its own task rather than leaving it embedded in S2b-0's prose.
   - [ ] **M0141-S2b-1** — DISTINCT loop-fix (`electOrderedDistinct` /
     `distinctEmissionPathkeys`, mirroring `electOrderedGrouping`/
     `groupingEmissionPathkeys`). Cheapest net-new slice, no new plumbing.
@@ -2369,6 +2387,27 @@ spill route is net-negative.
     of its own to loop over until then).
   - [ ] **M0141-S2b-4** — SETOP rel-identity fix. No TPC-H/TPC-DS witness
     currently motivates it; keep filed, do not schedule ahead of 1-3.
+  - [ ] **M0141-S2b-5** — (filed 2026-09-16 by S2b-0's result) resolve
+    `electOrderedGrouping`'s `anyTranslated` decline for the GROUP_AGG
+    mechanism-B queries now that `len(cands)<2` is refuted. First step is
+    NOT a code change: instrument `anyTranslated` (or reuse `DPTRACE`) to
+    print which `groupingEmissionPathkeys` check fails per query, re-run the
+    same 6-query private-cluster probe S2b-0 used. Two live subquestions
+    the trace must answer before any fix is written: (1) whether Q8/Q22's
+    outer-query GROUP BY exprs (`o_year`, `cntrycode` — aliases of a
+    FROM-subquery's computed columns) arrive at `addGroupingPaths` as a
+    `*ColumnRef` into the derived table (translates fine, no gate to widen)
+    or as the raw computed expression re-derived post-pullup (blocked by
+    `groupingEmissionPathkeys`'s bare-`*ColumnRef`-only check,
+    `upperorderedgrouping.go:88`, in which case widening that check to
+    accept any `exprEqual` match, not just `*ColumnRef`, is the fix); (2)
+    why Q4/Q12 — GROUP BY and ORDER BY on the identical bare column, no
+    gate found on a code read — still decline; do not assume they are
+    already fixed without the trace. Q5/Q21 are excluded from this task's
+    scope: their ORDER BY leads on an aggregate VALUE, not a group key, so
+    no group-key-order Sort can ever satisfy them and a Sort node there may
+    be correct/PG-matching, not a bug — confirm against the PG reference
+    plan before spending effort, do not fold them into this fix blind.
   Needs M0141-S2 (done, see above) for the concrete TPC-H query list
   motivating S2b-0/S2b-2. Ledger row appended (task-id `m0141-s2b`).
 - [ ] **M0141-S3 — Partial-Sorted row emission** — a second Partial-mode code

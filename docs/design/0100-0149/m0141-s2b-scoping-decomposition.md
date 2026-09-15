@@ -120,6 +120,90 @@ before S2b-2 lands.
    set operation in the 14-query census, and S2's six TPC-H queries are all
    plain SELECTs). Keep filed; do not schedule ahead of 1-3.
 
+## S2b-0 result (2026-09-16) — the `len(cands) < 2` hypothesis is REFUTED
+
+Measured, not inferred. A scratch `GOOPG_PGSHAPED_DP_TRACE=1` capture (throwaway
+`cluster.New` server, TPC-H DDL + a small synthetic load — see "Why not the
+shared `:65433` cluster" below) over Q4/Q5/Q8/Q12/Q21/Q22 with
+`max_parallel_workers_per_gather = 0` forced (matching `estimate-audit
+-plan-only`'s `-serial=true` default, `m0137-0003-baseline-capture-procedure.md`
+§2) shows, for **every one of the six queries**, exactly two `DPPATH`
+`producer=upper.groupagg.*` lines on the GROUP_AGG rel — one
+`upper.groupagg.hashed`, one `upper.groupagg.sort` — **both `verdict=accepted`**.
+`electOrderedGrouping`'s `cands` slice is therefore `len==2` for all six, every
+time. The hypothesis this loop was filed to check ("the join/scan tree beneath
+grouping never hands it a sort-shaped input, so `len(cands) < 2` fires") is
+**false as stated** — a Sorted `PathAgg` candidate is offered and survives
+`addPath` dominance for every one of the six witnesses.
+
+**First attempt was contaminated and corrected in-loop.** An initial run
+against `internal/testutil/tpch`'s existing `TestTPCHScaleLoadAndQueryRun`
+(no `-serial` pin — that flag is `estimate-audit`-only, not a GUC this test
+sets) showed the grouped rel's Pathlist ALSO growing
+`upper.groupagg.{gathered,gathermerge,finalize,split}` entries — i.e. real
+parallel Partial/Finalize-Agg candidates, because `max_parallel_workers_per_gather`
+defaulted on. `electOrderedGrouping`'s own first loop
+(`upperorderedgrouping.go:159-165`) declines **unconditionally** the instant it
+sees a `PathFinalizeAgg` in the Pathlist, before ever counting `cands` — so
+that first run could not have distinguished the `len(cands)<2` hypothesis from
+simple parallel contamination, and mirrors
+`[[goopg_tpch_bench_plans_are_all_parallel]]`'s standing warning almost
+exactly. Re-run with `max_parallel_workers_per_gather = 0` (a scratch test
+file's `AppendPostgresqlConf`, not a committed change — see below) removed
+every parallel producer from the trace and gave the clean 2-candidate result
+above.
+
+**Why not the shared `:65433` TPC-H bench cluster.** Per `CLAUDE.md`'s
+benchmark-clusters section and M0142-0003k, that cluster's `tpch` database is
+currently emptied of its dataset (12 unrelated scratch tables in its place)
+and its reload is a blocked, human-gated action
+(M0142-0003i/-0003k(c)) — reconfirmed live this loop
+(`\dt` on `:65433` still shows only `agg_data`/`lrs_*`/`mj_*`/`zz_*`, no
+`lineitem`). This recon used a private throwaway server instead (same
+precedent `m0137-0003-baseline-capture-procedure.md`'s own verification section
+set): `internal/testutil/tpch`'s `cluster.New` + `DDL()` +
+`tpch_scale_run_test.go`'s own `scaleLoader` at `GOOPG_TPCH_ORDERS=15000`
+(SF≈0.01). This answers the *structural* question (is a candidate ever
+offered at all) validly at any scale — `addGroupingPaths`'s HASHED/SORTED gate
+logic (`groupingpaths.go:379-482`) is a function of the aggregate's own shape
+(GROUP BY columns, special aggregates, GUCs), not of row-count statistics — but
+a *cost-comparison* question (which candidate a Sort would pick as cheapest)
+would need the real SF=1 load; none of this loop's findings below depend on
+relative costs at scale, only on candidate presence/absence and translation
+gates, both scale-independent.
+
+**Second-level narrowing — the real decline point is one step further in,
+UNCONFIRMED this loop.** With `cands` always `len==2`, `electOrderedGrouping`'s
+next gate is `anyTranslated` (`upperorderedgrouping.go:169-175`):
+`groupingEmissionPathkeys` is called on both candidates, and only the Sorted
+one can ever return non-nil (`cand.AggStrategy != AggStrategySorted` short-circuits
+the Hashed one to `nil` immediately, `upperorderedgrouping.go:65`). Reading
+`groupingEmissionPathkeys` (`upperorderedgrouping.go:56-117`) against each
+query's actual GROUP BY / ORDER BY clause (`internal/testutil/tpch/tpch.go`):
+
+| query | GROUP BY | ORDER BY | plausible gate |
+|---|---|---|---|
+| Q4 | `o_orderpriority` (bare column) | same column, ASC | none obvious — should translate; **unexplained, see below** |
+| Q5 | `n_name` (bare column) | `revenue desc` (an aggregate VALUE, not a group key) | **not a bug candidate**: no group-key-order Sort can ever satisfy an ORDER BY on an aggregate result — PG needs a Sort here too. Not yet cross-checked against the PG reference plan to confirm PG's shape matches goopg's for this query. |
+| Q8 | `o_year` — inside the query text this is `extract(year from o_orderdate)`, but Q8's GROUP BY sits in the OUTER query over the `all_nations` derived table, so by the time `addGroupingPaths` sees `spec.GroupExprs` it may already be a plain `*ColumnRef` into the subquery's output, not the raw `extract(...)` — **not verified this loop; do not assume the bare-`*ColumnRef` gate at line 88 is the cause without reading the actual `GroupExprs` AST goopg builds for this query** | `o_year` (same alias) | unconfirmed — could be the `*ColumnRef`-only gate (line 88), could translate fine |
+| Q12 | `l_shipmode` (bare column) | same column, ASC | none obvious — should translate; **unexplained, see below** |
+| Q21 | `s_name` (bare column) | `numwait desc, s_name` — leading sort key is an aggregate VALUE (`count(*)`), `s_name` only secondary | same non-bug shape as Q5 — leading ORDER BY key isn't the group key, so no group-key Sort can front the requested order; not cross-checked against PG |
+| Q22 | `cntrycode` — same derived-table shape as Q8 (`substr(c_phone,1,2)` aliased inside a FROM-subquery) | same alias | unconfirmed, same caveat as Q8 |
+
+**What this loop does NOT claim**: it does NOT claim the `*ColumnRef`-only gate
+in `groupingEmissionPathkeys` is a confirmed bug, and it does NOT claim Q4/Q12
+are explained — both translate structurally per a *read* of the code but were
+not traced live (the DPPATH channel does not print `anyTranslated`'s outcome
+or the final `getCheapestFractionalPath` winner's shape; that needs either a
+new trace line or a debugger/print-statement probe, out of scope for a
+recon-only loop). **Resume point for whichever loop picks this up next**: add
+a temporary trace line (or reuse `DPTRACE`) inside `electOrderedGrouping`
+printing `anyTranslated` and, on `!anyTranslated`, which candidate(s) failed
+which specific check inside `groupingEmissionPathkeys` — then re-run this same
+six-query probe. That single instrumented run should fully resolve the table
+above (both the Q4/Q12 mystery and the Q8/Q22 derived-table question) in one
+pass, without needing to reload the shared cluster.
+
 ## Disposition
 
 `.ralph/fix_plan.md` M0141-S2b is closed on this basis, same precedent as
