@@ -68,6 +68,17 @@ Select in this order:
    `numeric` `avg_width`, the category-shift bisect, the correlation banding
    re-open) and **M0140 — TPC-DS parallelism** (0006: the partial-Append
    producer that M0140-0004 deferred without an owner).
+   **RESOLVED 2026-09-15: item 3 is fully closed.** M0138 0007-0009 were
+   already `[x]` before this loop. M0140-0006 is closed as a decomposition
+   (design doc `docs/design/0100-0149/m0140-0006-decomposition-into-a-b-c.md`):
+   the recon's own sizing (three pieces, each a whole C-19-series slice) made
+   blind implementation a one-task-per-loop violation, so it is split into
+   **M0140-0006a/0006b/0006c** (filed under the M0140 milestone section
+   below) — none selected yet. **The next loop should select item 4 below**
+   (M0141's remaining slices / M0142) unless a later banner edit says
+   otherwise, or pick up M0140-0006a as the first of the new sub-tasks if it
+   judges that a better use of the banner's ordering (item 4's M0142-0004 is
+   itself just a re-measurement, so either is a reasonable next pick).
 4. **M0141's remaining slices** (S2b, S3–S6, and **S7 — Incremental Sort**,
    which 14 TPC-DS queries need before they can match at all) and **M0142 —
    Join-order costing** (0003c onward, plus 0004–0008 promoted from the ledger).
@@ -1969,7 +1980,7 @@ setting that yields a serial plan.
     `docs/design/0100-0149/m0140-0005-q14-third-category-and-nonplanner-floor-filing.md`.
   - Superseded 2026-09-15: M0140-0006 re-opens the producer K43 deferred, so
     the milestone is **5 of 6**, not closed.
-- [ ] **M0140-0006 — partial-Append producer (K43), the implementation** —
+- [x] **M0140-0006 — partial-Append producer (K43), the implementation** —
   M0140-0004 did the recon and filed a ledger row, but under the old DoD wording
   that was enough to close the task, leaving the producer an orphan. The recon is
   valuable and must be read first: each UNION ALL branch is folded into a
@@ -1987,6 +1998,59 @@ setting that yields a serial plan.
   fixture `bench/tpcds/plans-pg/` shows five (Q2/Q5/Q14/Q71/Q76) and the SF0.25
   capture shows six (adding Q75); settle which reference is canonical under
   M0137-0004/0005 before quoting a denominator.
+  - **DONE 2026-09-15 as decomposition, not implementation** (design doc
+    `docs/design/0100-0149/m0140-0006-decomposition-into-a-b-c.md`). Re-grounded
+    the M0140-0004 recon against current line numbers
+    (`planner.go:1106-1153`, `windowsetoppaths.go:258-293`, both unchanged in
+    shape) and reconfirmed its own sizing claim: landing a real producer needs
+    three structurally independent pieces, each comparable to a whole prior
+    C-19-series slice, and the shared SetOp-branch fold is dense with
+    precedence-correctness invariants (`M0125-0016`) that a blind edit risks
+    breaking across every SetOp query in both suites, not just Q5/Q76 — a
+    one-task-per-loop violation to attempt blind. Split into three loop-sized
+    sub-tasks below: **M0140-0006a** (branch `PartialPathlist` exposure, pure
+    plumbing), **M0140-0006b** (the partial-Append cost producer), **M0140-0006c**
+    (executor claim-set for `setOp` under `Gather` — correctness prerequisite,
+    must land before or with 0006b going live). No production code changed.
+    Ledger row appended (task-id `m0140-0006`).
+- [ ] **M0140-0006a — expose SetOp-branch `PartialPathlist`.** Give each UNION
+  ALL branch (`planner.go:1106` `planSegment`, folded via `applySetOp`/
+  `foldSetOpRange` at `planner.go:1120-1208`) a route to retain a `RelOptInfo`
+  with a `PartialPathlist` instead of collapsing straight to a finished `Node`
+  via `planSelectWithSettings` (`planner.go:1114`), so `createSetOpPaths`
+  (`windowsetoppaths.go:258-293`) has something other than `seedPathForNode`'s
+  opaque-`Node` wrap (`windowsetoppaths.go:298`) to read a partial candidate
+  from. Pure plumbing: no new cost producer, no new executor node — the field
+  can go unread until 0006b exists. **Acceptance:** TPC-H (`match=8`) and
+  TPC-DS (`match=2`) both byte-identical before/after
+  (`shape-delta.sh shape-changed=0`) — nothing should select a partial path
+  yet. Read `docs/design/0100-0149/m0140-0006-decomposition-into-a-b-c.md`
+  first.
+- [ ] **M0140-0006b — the partial-Append cost producer.** Depends on
+  M0140-0006a. The `addPartialHashJoinPath` counterpart
+  (`joinpathsparallel.go:82`'s shape): seed `setOpRel.PartialPathlist` from
+  0006a's branch partial paths, priced on PG's `cost_append` partial-path
+  arithmetic (`postgres/src/backend/optimizer/path/costsize.c:2250`,
+  streaming-UNION-ALL comment already cited by `windowsetoppaths.go:337-339`'s
+  serial arm), gated behind `gatherPathsMode` (`gatherpaths.go`) the same way
+  K80 is. Verify `generateUsefulGatherPaths` (`considerparallel.go`) reads the
+  new `PartialPathlist` for free as part of this task's own acceptance (expected
+  per the original recon, unverified). **Must not be promoted default-on, nor
+  exercised by any gate that could select it, until M0140-0006c lands** — see
+  0006c for why. Re-measure Q5/Q76 (and Q2/Q14/Q71/Q75 per the six-query
+  denominator note above) via `scripts/tpcds-sf025-regression.sh`.
+- [ ] **M0140-0006c — executor claim-set for `setOp` under `Gather`.** A
+  correctness prerequisite, not an optimization, and independent of
+  0006a/0006b's path-search work. `gatherOp` (`internal/executor/
+  operators_gather.go`) has each worker build its own full copy of the child
+  subtree — safe for a base scan only because `parallel_scan.go`'s
+  `ParallelGroup`/`claimed()`/`claimLeaf`/`parallelClaimSet` hand each worker a
+  distinct block range. `setOp` (`operators_setop.go:32` `newSetOp`) has no
+  equivalent claim logic — `Open` streams both children to completion
+  unconditionally. Landing 0006b without this first would make every parallel
+  worker replay both entire UNION ALL branches once `gatherPathsMode` picks the
+  new partial-Append candidate — silent row duplication, a wrong-answer defect
+  (Hard-won Rule #1). **Must land before or with 0006b's flag going live.**
 
 ## M0141 — Upper-planner ordering contest (filed 2026-09-14)
 
