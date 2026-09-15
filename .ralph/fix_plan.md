@@ -2319,25 +2319,58 @@ spill route is net-negative.
     (`analysis/m0141/m0141-s2a-fix2-*`). Treat `hashAggEntrySize`'s currency
     as closed for this milestone group absent new evidence — do not
     re-attempt without a different substitution or a different mechanism.
-- [ ] **M0141-S2b — GROUP_AGG rel publishes Pathlist, not Node, to the
-  ORDER BY step** — the K24 "ordering contest, slice 3" surgery: change
-  `createOrderedPaths`'s callers (every `createXPaths` -> `createOrderedPaths`
-  call site in `planner.go`) to hand it the producing rel's `Pathlist`
-  instead of a pre-collapsed `Node`, and change `addOrderedPaths`
-  (`upperordered.go:116-128`) to run its own cost contest per candidate
-  (`pathkeysContainedIn` match = no Sort; otherwise + `sortPathForBounded`)
-  rather than assuming a single input. This is the fix mechanism (B) in
-  M0141-S2's finding needs — real multi-call-site upper-planner surgery, size
-  it as its own scoping task before attempting it (K24 already calls this the
-  workstream's largest single item; do not attempt in one sitting). Needs
-  M0141-S2 (done, see above) for the concrete TPC-H query list motivating it.
-  **Second, independent motivation added 2026-09-16 (M0141-S7's re-adjudication
-  recon)**: this same surgery is also the sole prerequisite for all 14 of
-  M0141-S7's TPC-DS Incremental-Sort witnesses (confirmed by reading all 4 real
-  `createOrderedPaths` call sites in `planner.go` — none is GROUP_AGG-specific,
-  so this task's already-general scope covers the join/window/distinct
-  witnesses too, not just the aggregate ones). See
-  `docs/design/0100-0149/m0141-s7-readjudicate-and-scope-incremental-sort.md`.
+- [x] **M0141-S2b — GROUP_AGG rel publishes Pathlist, not Node, to the
+  ORDER BY step** — **CLOSED 2026-09-16 as a scoping decomposition (not an
+  implementation), same precedent as M0140-0006.** Design doc:
+  `docs/design/0100-0149/m0141-s2b-scoping-decomposition.md`. **Corrects the
+  record**: `electOrderedGrouping` (`upperorderedgrouping.go`, landed
+  2026-09-11, `e8a1215fd`, R47 slice 2/K101) already implements exactly this
+  surgery for GROUP_AGG — offers the GROUP_AGG rel's real Hashed-vs-Sorted
+  `Pathlist` to the ORDER BY step instead of a collapsed `Node`. Neither
+  M0141-S2 (2026-09-15) nor M0141-S7 (2026-09-16) cited it; both read
+  `createOrderedPaths`/`addOrderedPaths` directly and missed the
+  `electOrderedGrouping` pre-check at `planner.go:1960`. S1's fresh
+  2026-09-15 capture (used by S2) ran with the loop already live and still
+  found mechanism (B) alive in 6 TPC-H queries, so the residual gap is real —
+  it is just mis-scoped as "never built" rather than "insufficient as built".
+  **Census of `createOrderedPaths`'s upstream rels** (full detail + citations
+  in the design doc): GROUP_AGG — plural, wired (`electOrderedGrouping`).
+  DISTINCT — plural (hashed vs unique-over-sorted, C-16a/b,
+  `distinctpaths.go`), NOT wired. WINDOW — never plural at its own rel
+  (`windowsetoppaths.go`'s own comment: "goopg's input is a single finished
+  Node, so that loop has one iteration"), no local fix possible. SETOP —
+  plural (Append/Hashed) but its rel is allocated fresh per call
+  (`newUpperRelForNode`, relids always 0, not re-fetchable across a chain per
+  its own comment), a different problem. Base join/scan ORDER BY (no
+  aggregation) — the actual K24/F15/K12(B) item: the DP search's own
+  multi-candidate tournament is discarded at the `upperorderedinput.go` seam,
+  which recovers only the single cost-cheapest winner's pathkeys, never a
+  second candidate. **Also**: `addOrderedPaths` only ever has two arms
+  (no-sort / full-sort) regardless of which rel feeds it — S7's own
+  prefix-match third arm is required on top of every slice below, not
+  replaced by any of them. **Decomposed into**:
+  - [ ] **M0141-S2b-0** — trace-only recon: `GOOPG_PGSHAPED_DP_TRACE=1` over
+    TPC-H Q4/Q5/Q8/Q12/Q21/Q22 to confirm/refute whether a Sorted `PathAgg`
+    candidate is ever added to the GROUP_AGG rel for these queries (the
+    `len(cands) < 2` decline hypothesis in the design doc). Decides whether
+    S2b-1 can move anything before S2b-2 lands. No production change.
+  - [ ] **M0141-S2b-1** — DISTINCT loop-fix (`electOrderedDistinct` /
+    `distinctEmissionPathkeys`, mirroring `electOrderedGrouping`/
+    `groupingEmissionPathkeys`). Cheapest net-new slice, no new plumbing.
+    Motivated by S7's TPC-DS "Unique x1" witness.
+  - [ ] **M0141-S2b-2** — base join/scan Pathlist-across-the-search-boundary
+    surgery. This is the real K24 item; per K24's own warning, size it with
+    its OWN further scoping pass before writing code — do not attempt in one
+    sitting. Unlocks TPC-DS's Merge Join x2 + Nested Loop x4 (+ likely
+    Subquery Scan x1) S7 witnesses, is the prerequisite for S2b-3, and is the
+    most likely fix for the six TPC-H mechanism-B queries if S2b-0 confirms
+    the starvation hypothesis.
+  - [ ] **M0141-S2b-3** — WINDOW loop-fix. Gated on S2b-2 (WINDOW has nothing
+    of its own to loop over until then).
+  - [ ] **M0141-S2b-4** — SETOP rel-identity fix. No TPC-H/TPC-DS witness
+    currently motivates it; keep filed, do not schedule ahead of 1-3.
+  Needs M0141-S2 (done, see above) for the concrete TPC-H query list
+  motivating S2b-0/S2b-2. Ledger row appended (task-id `m0141-s2b`).
 - [ ] **M0141-S3 — Partial-Sorted row emission** — a second Partial-mode code
   path (`Strategy = AggStrategySorted`) emitting real rows (group key + one
   serialized-state column per aggregate) instead of merging into
@@ -2403,7 +2436,22 @@ spill route is net-negative.
   need M0141-S2b** (already filed, and already scoped generally as "every
   `createXPaths` -> `createOrderedPaths` call site", not GROUP_AGG-only — no
   widening needed) before an Incremental Sort candidate has anything to build
-  over. **Sizing beyond S2b**: most needed machinery already exists under a
+  over.
+  **NARROWED 2026-09-16 (M0141-S2b's own scoping decomposition,
+  `docs/design/0100-0149/m0141-s2b-scoping-decomposition.md`)**: this claim
+  missed that `electOrderedGrouping` (`upperorderedgrouping.go`) already
+  loops GROUP_AGG's real `Pathlist` into the ORDER BY step (landed
+  2026-09-11, before this task even ran) — this reading of
+  `createOrderedPaths`'s callers alone does not see it, since it runs before
+  the fallback to `createOrderedPaths` at `planner.go:1960`. The witnesses do
+  not map to a single monolithic "S2b" any more: `GroupAggregate`x5 ->
+  **M0141-S2b-0** (trace-confirm whether the loop's `len(cands)<2` decline is
+  why these still miss, not "S2b" wholesale); `Unique`x1 -> **M0141-S2b-1**;
+  `Merge Join`x2 + `Nested Loop`x4 (+ likely `Subquery Scan`x1) ->
+  **M0141-S2b-2**; `WindowAgg`x1 -> **M0141-S2b-3** (gated on S2b-2). Every
+  mapping above is still gated on S7's own not-yet-built third `addOrderedPaths`
+  arm (prefix-match -> Incremental Sort) regardless of which S2b sub-task
+  lands — none of them alone is sufficient. **Sizing beyond S2b**: most needed machinery already exists under a
   different name — `pathkeysContainedIn` (sibling of the needed prefix-count
   helper), `estimateNumGroups`, `costSortRunWithWidth`/`sortPathForBounded`
   (`cost_incremental_sort` composes the full-sort cost per group), and the
@@ -2411,9 +2459,11 @@ spill route is net-negative.
   `sortPrefixEqual` (`internal/executor/sort_presorted.go`, E-15) — sizing this
   increment closer to a single cardinality/cost slice (M0142-0012-class) than
   to the M0141-S3-S6 AggSplit programme. **Stays unchecked**: GO + scope
-  delivered, not implementation, which cannot start before S2b lands. Resume
-  point: once S2b lands, re-run this task's 14-query census against a post-S2b
-  capture, then implement in order (prefix-count helper -> cost function ->
+  delivered, not implementation, which cannot start before its relevant
+  M0141-S2b-N sub-task (see NARROWED note above) lands for each witness
+  group. Resume point: once the relevant sub-task(s) land, re-run this task's
+  14-query census against a post-fix capture, then implement in order
+  (prefix-count helper -> cost function ->
   `PathIncrementalSort`/`addOrderedPaths` third arm -> executor operator ->
   `createplansimple.go` wiring -> EXPLAIN rendering), each pinned by a test.
   Ledger row filed: `.ralph/deferral_ledger.md` (2026-09-16, `m0141-s7`).
