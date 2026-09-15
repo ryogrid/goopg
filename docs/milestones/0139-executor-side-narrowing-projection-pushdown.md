@@ -1,6 +1,8 @@
 # Milestone 0139 — Executor-side narrowing (projection pushdown)
 
-**Status:** planned
+**Status:** in-progress — S1/S2/S3 + 0004/0005/0006 complete (2026-09-15);
+**0007 (absorption) is now the milestone's live work**, replacing the rejected
+packed-retention option
 **Filed:** 2026-09-14 (user directive answering
 `METHODOLOGY3/04-forward-plan.md` §1.1 Question 1 with **(a) build it**)
 **Priority placement:** third in the plan-parity group. Independent of M0140 —
@@ -26,6 +28,33 @@ hash bucket charge (R129, parity-inert).
 
 The owner chose **(a): build executor-side narrowing.**
 
+## Outcome of the first pass (2026-09-15) — read before selecting any task here
+
+Six tasks landed and **this milestone contributed zero to the goal metric**, for
+a structural reason rather than a shortfall of effort:
+
+- **S1/S2 worked**: the join-leg hook exists and scans inside join trees now
+  emit narrowed rows (TPC-DS census mismatch=0, values sweep PASS=96).
+- **But narrowing runs AFTER costing.** `applyUpperNarrowing` is called at
+  `planner.go:189`; cost and strategy are already decided inside
+  `planStmtWithSettings` (`planner.go:141`). Measured consequence: after M0139
+  goopg's TPC-H costs are **byte-identical** to before — only `width=` shrank
+  (Q3 Hash Join `width=622 -> 176`). No plan moved, and under this ordering
+  none can. M0141-S2a pinned the root cause.
+- **S3 refuted K67's floor.** The real post-pushdown residue is **128.4 B/row**,
+  not the 72 B/row K67 assumed — K67's "narrowed to one column" was impossible
+  because the join key cannot be dropped. Against PG's 22 B/row that is 5.8x,
+  not 3.3x.
+- **0004 and 0005 refuted their own premises** (no duplicate build map exists at
+  HEAD; Q4's grouping ratio cannot move with narrowing).
+
+**Consequence.** Narrowing the rows is not enough, and shrinking the bytes per
+row is **rejected** (B1 NO-GO). The remaining route is the **absorption
+principle** (B2): give the cost model the PG-equivalent width while the executor
+keeps allocating what Go actually needs. That is **M0139-0007**, and it is this
+milestone's live work. It is also prerequisite reading for M0141-S2a-fix, which
+fixes the same ordering problem from the aggregation side.
+
 ## Scope — and what is NOT in scope
 
 `METHODOLOGY3/02-open-problems.md` §B1 splits the capability into three pieces
@@ -34,7 +63,7 @@ with different owners. **Only the first is in this milestone:**
 | half | reach | approval |
 |---|---|---|
 | **projection pushdown** — narrow what scans emit inside a join tree | planner + create-plan; `Datum` unchanged | **in scope; not covered by the `minimize_datum` decline** |
-| packed retention format (`PackedTuple`/`PackedSlot`) | ~70 non-test sites | **declined**; owner decision required, informed by S3's measurement |
+| packed retention format (`PackedTuple`/`PackedSlot`) | ~70 non-test sites | **NO-GO (owner, 2026-09-15)** — out of scope for M0137–M0143; do not re-propose inside this group. `AGENT.md` §"Further owner decisions" B1 |
 | a `Datum` re-layout below 48 B | ~3,090 non-test sites | declined by take3 13 §10; nobody proposes it |
 
 **Name the second half correctly.** `minimize_datum/README.md` states that
@@ -96,8 +125,11 @@ take3 13 §8.2."*
    `work_mem=64MB`, where PG is 22 B/row -> 31 MB — so projection pushdown alone
    is necessary and very likely not sufficient.
 3. **Every slice is gated on the qual-placement census** (M0137-0010).
-4. **Do not implement the packed retention format.** S3's measurement goes to
-   the owner as a decision request; `minimize_datum` is NOT APPROVED TO START.
+4. **Do not implement the packed retention format — the owner answered NO-GO
+   on 2026-09-15.** M0139-0006 escalated it; the decision is recorded in
+   `AGENT.md` §"Further owner decisions" B1. `minimize_datum` stays NOT
+   APPROVED TO START and is out of scope for this whole milestone group. The
+   replacement route is the **absorption principle** (B2) — M0139-0007.
 
 ## Definition of Done
 

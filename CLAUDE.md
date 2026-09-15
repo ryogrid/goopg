@@ -37,7 +37,10 @@ Setup / start / stop procedures:
   server too. Two known quirks of the rebuilt layout: HammerDB's final
   ANALYZE step fails and `ANALYZE <table>` inside db `tpch` errors
   "relation does not exist" (per-DB scoping gap in the ANALYZE path — see
-  the deferral ledger row `bench-reorg ANALYZE-scope`; the gate runs S-cold
+  the archived ledger row `bench-reorg ANALYZE-scope`, resolved 2026-07-27 by
+  M0125-0028 and since pruned from the live ledger — it survives only in
+  `analysis/deferral-ledger-summary-20260824/deferral_ledger_summary_fix.md`;
+  the gate runs S-cold
   regardless), and heavy queries at S-cold need GC headroom — Q21 drew a
   host-level OOM at `GOMEMLIMIT=18GiB` but completes at `GOGC=100` +
   `GOMEMLIMIT=12GiB`.

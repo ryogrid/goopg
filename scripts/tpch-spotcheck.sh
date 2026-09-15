@@ -14,11 +14,14 @@
 # Behaviour:
 #   - Exits 0 with a loud SKIPPED message when no populated TPC-H data dir
 #     exists (must not hard-block loops on machines without data).
-#   - Otherwise (M0137-0007): waits for the shared bench cluster
-#     (bench/tpch/runtime_goopg/data, :65433) to go quiet and takes a
-#     snapshot clone of it into a PRIVATE data dir — this gate never
-#     stops/starts a server on the shared cluster itself, so it can never
-#     kill a capture or another gate that is using it. Stops any stale
+#   - Otherwise (M0137-0007, online path added in the M0139 follow-up):
+#     takes a snapshot clone of the shared bench cluster
+#     (bench/tpch/runtime_goopg/data, :65433) into a PRIVATE data dir — via
+#     `pg_basebackup -X fetch` when that cluster is RUNNING (the normal
+#     case: it is a persistent cluster), via `cp -a` when it is at rest.
+#     This gate never stops/starts a server on the shared cluster itself and
+#     never requires it to be down, so it can neither kill nor be blocked by
+#     a capture or another gate that is using it. Stops any stale
 #     goopg left on ITS OWN private clone from a previous crashed run (via
 #     the goopg control socket — NEVER pkill, which self-matches the
 #     invoking shell), starts a fresh server on the clone under the
@@ -47,8 +50,12 @@
 #   TPCH_SPOTCHECK_MIN_MB         data-dir size below which we SKIP       (default 100)
 #   TPCH_SPOTCHECK_READY_TIMEOUT  seconds to wait for readiness           (default 120)
 #   TPCH_SPOTCHECK_PORT           this lane's PRIVATE port (M0137-0007)   (default 5580)
-#   TPCH_SPOTCHECK_CLONE_WAIT     seconds to wait for :65433 to go quiet
-#                                 before the snapshot clone (M0137-0007)  (default 60)
+#   TPCH_SPOTCHECK_CLONE_WAIT     seconds to wait for :65433 to go quiet in
+#                                 the `cp -a` fallback path only — the
+#                                 default online pg_basebackup path never
+#                                 waits for it                            (default 60)
+#   TPCH_CLONE_MODE               auto|online|copy — see
+#                                 scripts/lib/tpch-private-clone.sh       (default auto)
 #
 set -euo pipefail
 
@@ -148,8 +155,12 @@ rm -f "${SPOT_PIDFILE}"
 
 # ---------------------------------------------------------------------------
 # Snapshot-clone the shared, lane-external cluster into this lane's private
-# data dir (M0137-0007). Waits for SRC_PORT to go quiet, `cp -a`s, verifies
-# it stayed quiet during the copy (retried up to 3x on interference) — see
+# data dir (M0137-0007; online path added in the M0139 follow-up). When a
+# server is live on SRC_PORT this is `pg_basebackup -X fetch` against it —
+# consistent by PG's own online-backup contract (forced checkpoint + the WAL
+# back to its redo point + a pg_control naming it), and needing NO stop and
+# NO wait. When SRC_PORT answers nothing it is the cheaper `cp -a`, guarded
+# by a re-check that nothing started mid-copy. See
 # scripts/lib/tpch-private-clone.sh. This is the only touchpoint with the
 # shared cluster in this whole script, and it never stops/starts anything
 # there.
@@ -157,6 +168,7 @@ rm -f "${SPOT_PIDFILE}"
 echo "tpch-spotcheck: snapshot-cloning ${SRC_DATA} -> ${PGDATA} (${data_mb} MB)"
 if ! tpch_private_clone_snapshot "${SRC_DATA}" "${PGDATA}" "${PG_HOST}" "${SRC_PORT}" "${CLONE_WAIT}"; then
     echo "tpch-spotcheck: FATAL — could not snapshot the shared TPC-H cluster (see above); do NOT commit, retry the gate" >&2
+    echo "tpch-spotcheck: hint — the clone no longer needs :65433 to be DOWN; if the online pg_basebackup path failed, check that pg_basebackup is on PATH and that :65433 accepts a replication connection" >&2
     exit 1
 fi
 

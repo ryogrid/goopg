@@ -53,8 +53,10 @@
 #              across both arms, which is what makes them comparable)
 #   FORCE      1 = run even if the nightly CI batch holds the host
 #   TPCH_AUDIT_ARM_PORT        this arm's PRIVATE port (M0137-0007, default 5582)
-#   TPCH_AUDIT_ARM_CLONE_WAIT  seconds to wait for :65433 to go quiet before
-#              the snapshot clone (M0137-0007, default 60)
+#   TPCH_AUDIT_ARM_CLONE_WAIT  seconds to wait for :65433 to go quiet in the clone's
+#              `cp -a` FALLBACK path only; the default online pg_basebackup
+#              path never waits (M0137-0007, default 60)
+#   TPCH_CLONE_MODE  auto|online|copy — see scripts/lib/tpch-private-clone.sh
 #
 set -uo pipefail
 
@@ -117,8 +119,10 @@ fi
 
 # Snapshot-clone the shared cluster into this lane's private data dir
 # (M0137-0007) — the only touchpoint with the shared cluster in this script;
-# it never stops/starts a server there. Stop any stale instance left on the
-# PRIVATE clone by a previous crashed run first.
+# it never stops/starts a server there, and (since the M0139 follow-up) never
+# needs it to be down either: a live :65433 is cloned online via
+# `pg_basebackup -X fetch`. Stop any stale instance left on the PRIVATE clone
+# by a previous crashed run first.
 "${GOOPG_BIN}" stop -D "${PGDATA}" >/dev/null 2>&1 || true
 systemctl --user stop "${CG_UNIT}.scope" >/dev/null 2>&1 || true
 systemctl --user reset-failed "${CG_UNIT}.scope" >/dev/null 2>&1 || true

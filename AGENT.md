@@ -542,11 +542,119 @@ rejected.** A number matched by tuning proves nothing about the mechanism and is
 exactly the arbitrary forcing the goal forbids — the same reasoning K92 applies to a
 mislabelled plan node, one layer down.
 
+### Further owner decisions (2026-09-15) — binding
+
+Taken after the 2026-09-15 progress review (`tmp/METHODLOGY3_RALPH_CHECK0915/`),
+which found 36 tasks completed with the goal metric unmoved (TPC-H 6/22,
+TPC-DS 2/99) and TPC-DS categories net **worse** (525 -> 540).
+
+#### B1 — `minimize_datum` / packed retention: **NO-GO**
+
+M0139-0006 escalated the go/no-go. **The answer is NO-GO.** `minimize_datum`
+stays NOT APPROVED TO START and is **out of scope for M0137–M0143**. Do not
+propose it again inside this milestone group; do not write tasks that depend on
+it. If a task's only remaining lever is packed retention, the task is blocked
+and says so in a ledger row.
+
+Rationale, from M0139-S3's own measurement: the post-pushdown residue is
+**128.4 B/row** against PG's 22 B/row, but shrinking entry bytes does **not**
+reliably shrink the batch count (`entrywidth.go`'s measured non-monotonicity —
+194 -> 120 B/row leaves `NBatch` at 4, and 63 B/row returns to 4 because
+`MapSlotBytes` dominates). Packing alone closes ~5x of a ~48x gap, and its goal
+is **byte parity, which is not this group's currency**. This group's currency is
+**plan structure**.
+
+#### B2 — same statistics, same plan: **direction unchanged**, plus a new obligation
+
+The goal is unchanged: goopg reaches PG's plan through **the same statistics and
+the same costing**, and Q2's "reproduce PG's estimates" still stands.
+
+**But there is a new, binding obligation.** goopg and PG differ irreducibly in
+places fixed by implementation language and foundational design — `Datum` is
+48 B where PG's MinimalTuple is ~22 B; a Go `map[K][]Row` carries per-bucket
+overhead PG's pointer array does not. Feeding those goopg-native quantities into
+PG's cost formulas is **not** faithfulness; it is feeding PG's arithmetic the
+wrong inputs, and it is why identical statistics have not produced identical
+plans.
+
+> **Absorption principle.** Where a divergence is irreducible, the cost model is
+> given the **PG-equivalent logical quantity**, while the executor allocates
+> whatever the Go implementation actually needs. The two currencies are
+> separated deliberately, and the separation is pinned by a test.
+
+This is **not** tuning, and the distinction is the one that matters:
+
+| | what it does | verdict |
+|---|---|---|
+| **Tuning** (forbidden) | bends a goopg number until the *output* matches PG's | rejected — proves nothing about the mechanism |
+| **Absorption** (required) | gives PG's *formula* the same *input* PG would have | faithfulness work, same kind as porting a cost term |
+
+A worked example, and the reason this unblocks the width programme: PG's
+`cost_hashjoin` decides spill from a width expressed in PG's tuple
+representation. Handing it `48 * ncols + 24 + avgVar` makes goopg spill where PG
+does not, and the plans diverge. Handing it the PG-equivalent width makes the
+**spill decision** match — goopg may still really spill and run slower, and
+**that is explicitly acceptable**: a slower plan that matches is not a
+regression. Plan parity does not require goopg's memory footprint to equal PG's.
+
+Consequences to carry:
+- This, not packed retention, is the route for the M0139 width programme. It is
+  filed as **M0139-0007** and is a prerequisite reading for M0141-S2a-fix.
+- An absorption site must be **named and justified in its design doc** (which
+  irreducible difference, which PG quantity is substituted, why the substitution
+  is the PG-equivalent and not a fitted constant) and **pinned by a test** that
+  fails if the two currencies are silently re-merged.
+
+Two rules make the tuning/absorption line operational rather than a matter of
+self-assessment. Both are binding; a task that cannot satisfy them is **blocked,
+not absorbed**.
+
+1. **Derive before you measure.** The substituted quantity is fixed by
+   derivation and written into the design doc **before** any parity number is
+   taken. Writing several candidate expressions and keeping the one whose parity
+   result looks best is tuning by another name, whatever the expressions are
+   called. If a first derivation turns out wrong, say so in the doc and redo the
+   derivation — do not search.
+2. **The quantity must exist in PG.** An absorption is a **port of a named
+   function or expression under `./postgres/`**, and its design doc cites the
+   `file:line`. If PG has no expression that computes the quantity — a Go-only
+   cost such as GC pressure, interface dispatch, or `MapSlotBytes` bucket
+   overhead has no upstream counterpart — then there is nothing to absorb *to*,
+   and the right outcome is a ledger row saying the divergence is unabsorbable,
+   not a number chosen by the author.
+
+Two things this principle does **not** licence:
+- It does **not** apply to C3/K63, the display seam where EXPLAIN renders a scan
+  cost the planner never used (M0137-0015). That is an **instrument defect** and
+  must be repaid, not absorbed. Absorption separates two currencies on purpose;
+  C3/K63 reports one currency under the other's name by accident.
+- R124's accepted "planner publishes below what the executor charges" divergence
+  *is* an instance of the principle and not a debt to repay — but note why it is
+  safe: `r128-parity-over-throughput/SCOPE.md:137` calls it "the OOM direction",
+  and it is acceptable only because the SF=1 TPC-H execution path is a mandatory
+  gate (`scripts/tpch-acceptance-arm.sh`, all 22 queries). An absorption that
+  errs the other way — planner charging below what the executor needs — must
+  carry that same execution gate before it lands.
+
+#### B3 — `GOOPG_GATHER_PATHS=all` default: **keep (a)**
+
+M0140-0003's flip stays landed even though TPC-DS categories went 525 -> 540.
+Rationale: `match` held at 2, the values sweep was all-zero, the flip carried a
+genuine bug fix (`clonePlanReplacingOuter`'s missing `*Gather` arm, which had
+been silently swallowing an error and leaving TPC-H Q2 un-decorrelated), and the
+category rise is most plausibly newly-*visible* divergence in plans that only
+now go parallel. **This is a recorded decision, not an oversight** — a later
+task may not revert it on category count alone; reverting requires new evidence
+that the flip itself (not the visibility it created) causes the rise.
+
 ### Design docs — timing override for this group
 
 **Write the design doc when the task is selected**, not before the milestone
-starts: `docs/design/<task-id>-NNNN-short-slug.md`, status `draft` -> `accepted`,
-indexed in `docs/design/README.md` **in the same commit**. This follows the
+starts: `docs/design/0100-0149/<task-id>-<short-slug>.md` (lowercase task id, in
+the numbered bucket directory — this is the repository's actual convention and
+what the first 38 docs followed), status `draft` -> `accepted`, indexed in
+`docs/design/README.md` **in the same commit**. Slice ids (`-s1`) and letter
+branches (`-0003a`) are legitimate task ids; they need no `NNNN` sequence. This follows the
 M0134 precedent and **overrides** three rules for this group only:
 `docs/milestones/README.md` §"Workflow Per Milestone" step 2 ("write the design
 docs listed under Required Design Docs first"), this file's own "reserve a
@@ -586,6 +694,50 @@ for, and citing it is a scope gate.
 already corrected in those documents; read it before treating any METHODOLOGY3
 claim as novel.
 
+### Completion rule for this group — a deferral needs TWO artefacts
+
+**Binding for every M0137–M0143 task.** A ledger row records *what* was
+deferred; a `.ralph/fix_plan.md` `[ ]` task records *who owns it next*. Closing
+a task with only a ledger row leaves the mechanism an orphan — the 2026-09-15
+review found **eight mechanisms** in exactly that state, with no executable task
+anywhere in the tree.
+
+- Deferring any part of a task requires **(a)** a `.ralph/deferral_ledger.md` row
+  with a concrete resume point **and (b)** an unchecked `.ralph/fix_plan.md` task
+  under the milestone that will finish it. Both, or the task is not complete.
+- Wherever a milestone's Definition of Done says "*or* its absence is a filed
+  ledger row", read it as "**and** a filed follow-up task". The earlier wording
+  made "write a ledger row" a legitimate way to close an *implementation* task;
+  it is not.
+- If the follow-up genuinely belongs to no milestone in this group, say so in the
+  ledger row's `why` column and name where it does belong.
+- A **recon** task is the one exception, and only because its whole deliverable
+  is the filing: it completes when the measurement, the design note and the
+  follow-up tasks all exist.
+
+`docs/milestones/0137-*.md` and `0140-*.md` restate this rule locally; this
+section is the authority, and it binds the five milestone documents that do not.
+
+### The deferral ledger — how to read it for this group
+
+`.ralph/deferral_ledger.md` carries ~1,980 rows with `status = -`. Three things
+to know before mining it:
+
+- **`status` is not reliable.** Several `-` rows describe work that has since
+  landed — `take2-P1-16` (LIKE pattern selectivity) is marked open while
+  `internal/optimizer/patternsel.go` implements it and `selectivity.go` consumes
+  it; `M0127-P5.5-e-ii-b` (Memoize path/rescan cost) is open while
+  `joinpathsmemoize.go:125,216` has it. **Re-verify against the tree before
+  scheduling a row.** `git log -S <the mechanism>` is the cheap check.
+- **Most of it is out of scope.** Roughly three quarters is WAL/replication,
+  catalog/DDL, MVCC/locking, types/codec, parser and test harness — none of it
+  reaches plan selection. The planner-relevant rows cluster in the take2/take3 and
+  M0137–M0142 band near the end of the file.
+- **A closed milestone can leave live rows behind.** M0137–M0140 are all closed,
+  and the rows they filed had no follow-up task until 2026-09-15. When a ledger
+  row names a mechanism that matters for parity and no `[ ]` task owns it, that
+  is a filing bug — raise it rather than assuming someone declined it on purpose.
+
 ### Known-stale claims — do not act on these
 
 Each of these is contradicted by the tree at HEAD or by a later measurement:
@@ -615,6 +767,25 @@ Each of these is contradicted by the tree at HEAD or by a later measurement:
 - **`METHODOLOGY.md` §2 and `ROADMAP-to-all-match.md` §1–2 numeric tables** were
   superseded by `METHODOLOGY2.md`, which was superseded by `METHODOLOGY3`.
 - **`04-forward-plan.md` §1.2's proposed rule** — overruled by Q2 above.
+- **The parity verdict has no `rows=` dimension.** Its nine categories are
+  join-order, join-method, scan-type, parameterisation, aggregation-strategy,
+  sort-strategy, parallelism, qual-placement, rendering. A wrong row estimate is
+  invisible to every parity gate and reaches the metric only indirectly, by
+  changing plan shape. Do not read "no category movement" as "estimates are
+  fine". `make ea-ratchet` (`Makefile:616`) is the instrument that scores them
+  directly; it exists and runs — M0137-0018 re-scores it at HEAD.
+- **"TPC-DS row estimates are three to five orders out"** (Q22 9,460,201 vs PG's
+  11,987; 22 of 100 Sort inputs estimating 1) is a **2026-09-06 measurement
+  taken before its own fixes landed**. All four cuts the diagnosis named — B1
+  (`joinkeyproof.go:248`), A1 (`rangequery.go:211-215`), A2
+  (`selectivity.go:322`), A3 (`reduce_outer_joins.go:141`) — have since landed.
+  Nobody has re-measured. Quote no figure from that row; M0142-0004 is the
+  re-measurement.
+- **`take3-ea-ratchet-never-ran`** is superseded by a `resolved` row for the same
+  id thirteen lines below it. This is the general shape of the trap: **the ledger
+  can hold several rows with the same id and only the last one is current.**
+  `grep -n '<id>' .ralph/deferral_ledger.md` and read the **highest-numbered**
+  hit before scheduling anything from it.
 - **`make plan-gate` does not diff against live PG.** It is a
   goopg-vs-committed-goopg baseline pin (`Makefile:431-453`). The claim that it
   cannot pass until the goal is met appears in two round reports and is wrong.
@@ -627,6 +798,12 @@ reproduce it.** Concretely:
 
 - **Do not create `rNNN-*` directories.** New raw artefacts go under
   `analysis/m01NN/`; conclusions go in the task's design doc.
+- **Commit the raw artefacts, in the same commit as the design doc that cites
+  them.** A measurement whose evidence sits in `/tmp` or untracked is not
+  reproducible and the next task will re-run it. At the 2026-09-15 review the
+  primary evidence for the *current* metric values (`analysis/m0142/`) and every
+  file of `analysis/m0138/` were untracked; a design doc's prose summary is not
+  a substitute (K90: anything needed across sessions lives in the repo).
 - Ralph's own discipline applies: **one task per loop**, the working-set baton,
   the pre-commit gates, `make ralph-state-guard` before the status block.
 - 04's two-tier model maps onto tasks, not rounds. A **recon task** is
@@ -637,6 +814,38 @@ reproduce it.** Concretely:
 - The two most productive results of the previous phase were cheap recons run
   outside the heavyweight cadence. Prefer eliminating a hypothesis in one task
   over scoping a campaign around it.
+
+### Working-directory hygiene, gate honesty, commit labels
+
+The first three bullets below are **repository-wide** — they are placed in this
+section because this milestone group is where they were broken, not because they
+stop applying outside it. The `GOOPG_SKIP_PRECOMMIT` bullet is the one that is
+group-scoped, and says so.
+
+- **Never create a directory at the repository root.** Scratch goes in
+  `analysis/m01NN/`; throwaway files go in the session scratchpad. `bak/` once
+  held a root-level `package executor` test file and broke `go vet ./...` for
+  ten hours while **five consecutive tasks accepted the red as "pre-existing,
+  unrelated debris"** — debris the loop's own window had created. `/bak/` and
+  `/estimate-audit` are now gitignored; that is a backstop, not a licence.
+- **Never commit a build artefact.** A 9 MB `estimate-audit` binary reached the
+  repo root via a "commit Ralph loop WIP" sweep. Build to `bin/` or `tmp/`.
+- **A red gate is never "pre-existing" until you have proved it.** Before
+  accepting one, run it at `HEAD` with your change stashed. If it is genuinely
+  pre-existing, say so **with the command and its output**; if it is yours, fix
+  it. "Unrelated concurrent work" is a hypothesis, not a finding.
+  One red *is* already proved, so nobody need re-prove it: `go vet ./...` reports
+  two `lostcancel` findings in `cmd/goopg/main.go:837` and `:881`
+  (`cpCancel` not used on all paths). Verified pre-existing at HEAD on
+  2026-09-15 and unrelated to this group; every other package is clean. Any
+  **third** vet finding is yours.
+- **Do not bypass the pre-commit hook.** `--no-verify` is forbidden and leaves a
+  trace; `GOOPG_SKIP_PRECOMMIT=1` leaves **none**, so it is forbidden outright
+  for M0137–M0143. If the smoke cannot run, that is a blocked task with a ledger
+  row, not a skipped gate.
+- **The commit `area(scope):` prefix must reflect the largest surface touched.**
+  A commit that edits `internal/` is not `docs(...)`, even when the edit is only
+  comments — the loop's own audit trail is read by `area`.
 
 ### Measurement — pipeline, ports, and what the metric cannot see
 
@@ -716,11 +925,22 @@ unmeasured one does not.
 
 ### What every M0137–M0143 task report must contain
 
-In the loop's report and in the task's design doc:
+In the loop's report and in the task's design doc.
 
-1. **Category movement**, reported as `blocked-excluding-matches` alongside the
-   raw tool line (a MATCH can carry a category tag, so the raw count overstates
-   "blocked").
+**Every item is mandatory, and `N/A` is an allowed answer — silence is not.**
+A task that runs no corpus capture has no shape-delta and no stats epoch; write
+`N/A — no corpus run this task` against those items. An omitted item is a
+report defect, an explicit `N/A` is not. (This exemption exists because 11 of
+the first 22 tasks were pure recons that silently dropped items they could not
+physically produce.)
+
+1. **Category movement**, as the **two lines the tool prints**: `CATEGORIES:`
+   (raw) and `CATEGORIES-EXCL-MATCH:` (MATCH verdicts excluded). Paste both
+   verbatim from `scripts/pg-plan-parity-diff.py`; do not re-derive either by
+   hand. A MATCH can carry a category tag, so the raw line overstates "blocked"
+   — the second line is the honest one. (Before 2026-09-15 this item asked for
+   a `blocked-excluding-matches` figure no tool produced, and 0 of 22 tasks
+   could report it. The tool now emits it.)
 2. **`shape-delta` counts.** A task with `shape-changed = 0` moved no plan at
    all; one with shape changes and no category movement moved plans **sideways**.
    Conflating the two produced a wrong conclusion once already.
@@ -728,7 +948,11 @@ In the loop's report and in the task's design doc:
    baseline was re-taken if a values sweep intervened.
 4. **A seam-decline census by class, not by total**, at a stated timeout — a
    class can be *converted* rather than removed, and censuses are only
-   comparable at equal timeouts.
+   comparable at equal timeouts. **There is no tool for this yet**: produce it
+   by hand from `GOOPG_PGSHAPED_DP_TRACE=1` output
+   (`grep -oP "seam-decline reason=\\K\\S+" <log> | sort | uniq -c`), or write
+   `N/A` when the task ran no traced capture. Automating it is
+   **M0137-0014**.
 5. **Which planning route the query took** — the PG-shaped path search, or the
    legacy/prebuilt constructor. `tryJoinSearch` preserves the syntactic node when
    `tryPGShapedJoinSearch` declines, and forced `join_collapse_limit=1` forms
@@ -751,8 +975,62 @@ fixture, 2026-09-15) and should not be requoted as a live alternative. None
 of the current matches may be lost. That floor is the one match-count clause
 the record shows earning its place — R120's caught the loss of Q10.
 
-Values gates bind on every task: TPC-H digest byte-identical to the baseline arm,
-TPC-DS SF0.25 sweep all-zero. **A values break stops the task.**
+**Measure the floor inside the task that changes production code**, not three
+tasks later. M0138-0002 and M0138-0004 replaced the ANALYZE sampler and landed
+on `go test` alone, with the floor confirmed retroactively by M0138-0005 (it
+held, but that was luck, not process). Deferring the measurement is allowed
+only with a ledger row naming the task that will take it.
+
+**The floor measurement, by script name** — the same defect that made the values
+gate unciteable would otherwise repeat here:
+
+| corpus | capture | score |
+|---|---|---|
+| TPC-H | `./bin/estimate-audit -plan-only` per `m0137-0003-baseline-capture-procedure.md` (**not** `capture-tpch.sh` — empty-stats trap) | `scripts/pg-plan-parity-diff.py`, read `MATCH` count and `CATEGORIES-EXCL-MATCH:` |
+| TPC-DS | `scripts/capture-tpcds.sh` against goopg `:65437` and PG `:65438` | same |
+
+
+**The values gates, by script name** (the earlier wording said "TPC-H digest"
+without naming a script, and every implementation task silently substituted a
+different one):
+
+| corpus | canonical gate | bar |
+|---|---|---|
+| TPC-H | `scripts/tpch-spotcheck.sh` | canonical row counts (Q12/Q13), not "no error" |
+| TPC-H (full) | `scripts/tpch-acceptance-arm.sh` | digest byte-identical to the baseline arm — **required when the task changes statistics, costing or the executor**; the spotcheck alone is not sufficient for those |
+| TPC-DS | `scripts/tpcds-sf025-regression.sh sweep` | `MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0` |
+
+**A values break stops the task.**
+
+**These gates cost more than one loop, and that is expected.** The full TPC-H arm
+plus both floor captures is roughly an hour of wall clock, against a 2026-09-15
+measured average of ~17 min per completed task. A task that must run them is
+**explicitly exempt from finishing in one loop**: land the code with the gates
+still running, or split the measurement into its own immediately-following task
+named in the report. What is *not* allowed is substituting a cheaper gate and
+arguing it covers the same risk — that is the escape route D3 closed.
+
+**When a values gate cannot RUN** (shared port busy, missing data dir, peer-held
+server), it is not a pass. Produce all three of: (i) the exact command and the
+failure text, (ii) which substitute gate you ran instead and why it covers the
+same risk, and (iii) **a deferral-ledger row promising the re-run, naming the
+task that will do it.** A skip without that ledger row is a report defect.
+M0139-S1 and M0139-S2 landed planner changes with TPC-H values unverified on a
+self-made substitute argument and no ledger row; that is the hole this closes.
+
+**The specific cause of those two skips is fixed (2026-09-15).** The private-lane
+clone used to wait for the shared `:65433` to stop before `cp -a`, which never
+happens — that cluster is resident. `scripts/lib/tpch-private-clone.sh` now takes
+an **online `pg_basebackup` clone against the live server** (goopg implements the
+server side: `internal/backup/basebackup.go`), so no gate needs the shared server
+stopped. Verified with `:65433` up throughout: 1.9 GB cloned in 8–25 s and
+`scripts/tpch-spotcheck.sh` returning `PASS` (Q12=2, Q13=34) in 39.9 s — the run
+M0139-S1 could not complete in three attempts over fifteen minutes. Consistency
+is guaranteed by the backup protocol (IMMEDIATE checkpoint -> start LSN,
+`-X fetch` ships the WAL, `pg_control` written last), not by hoping the source is
+idle; it was tested against a cluster taking 200k concurrent INSERTs and the
+clone recovered to a clean committed prefix. `TPCH_CLONE_MODE=copy` restores the
+old offline behaviour for a lane that must not perturb the source at all.
 
 **Precedence when a matching plan is slow enough to time out.** These two rules
 collide, and the collision is not hypothetical — B6 records a *toward-oracle*

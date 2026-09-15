@@ -55,6 +55,27 @@ relabelling goopg's leader-prebuild as `Parallel Hash` would be a
    also §B5's terminal state — the inputs PG's final hash cost needs are
    **unobservable**, and the only oracle route crashed PG (R99).
 
+## Completion rule for this milestone group (added 2026-09-15 — binding)
+
+**A deferral needs two artefacts, not one.** A ledger row records *what* was
+deferred; a `.ralph/fix_plan.md` `[ ]` task records *who owns it next*. Closing
+a task with only a ledger row leaves the mechanism an orphan — the
+2026-09-15 review found **eight mechanisms** in exactly that state, with no
+executable task anywhere.
+
+So, for every M0137–M0143 task:
+
+- Deferring any part of the task requires **(a)** a `.ralph/deferral_ledger.md`
+  row with a concrete resume point **and (b)** an unchecked task in
+  `.ralph/fix_plan.md` under the milestone that will finish it. Both, or the
+  task is not complete.
+- Where a Definition of Done below says "*or* its absence is a filed ledger
+  row", read it as "**and** a filed follow-up task". The earlier wording made
+  "write a ledger row" a legitimate way to close an implementation task; it is
+  not.
+- If the follow-up genuinely belongs to no milestone in this group, say so
+  explicitly in the ledger row's `why` column and name where it does belong.
+
 ## Scope
 
 - Re-measure the failing set under `GOOPG_GATHER_PATHS`, then adjudicate what
@@ -62,8 +83,12 @@ relabelling goopg's leader-prebuild as `Parallel Hash` would be a
 - Land the flip judged on the category metric. Measured effect at `all`:
   Gather 42->104, `Parallel Hash` 0->167 — *and parity did not improve* (K38),
   so the flip is worth landing on categories, not on matches.
-- Partial-Append producer (K43): PG uses Parallel Append in six TPC-DS queries;
-  only Q5 and Q76 currently miss.
+- Partial-Append producer (K43): PG uses Parallel Append in the TPC-DS reference
+  plans; goopg emits it **nowhere** (0 of 99 plans, counted 2026-09-15). The
+  earlier "only Q5 and Q76 miss" reading was corrected by M0140-0004's own recon
+  (`m0140-0004-partial-append-producer-recon-and-defer.md:35-40`): Q2/Q14/Q71
+  also emit a plain serial `Append` and merely carry a compensating `Gather`
+  elsewhere. The producer is **M0140-0006**.
 - Record, do not attempt, the two items that are out of reach: **Q14's third
   category** (K92 — needs PG's real partial-inner execution model, *"NOT
   cheap"*) and the **non-planner floor** (K14/K15 heap density; K41's still
@@ -81,9 +106,21 @@ possible fix as a design question, not an edit.
   adjudicated against PG — with the R43-era list explicitly superseded.
 - The flip is landed (or a recorded no-go with its measurement), judged on
   category movement with the pre-registered "no match flip" scored honestly.
-- A partial-Append producer exists, or its absence is a filed ledger row with a
-  resume point.
+- A partial-Append producer exists, **or** its absence is a filed ledger row
+  with a resume point **and** an unchecked follow-up task in
+  `.ralph/fix_plan.md`. (Both artefacts — see the completion rule above.
+  M0140-0004 filed the row but no task, which is how the producer became an
+  orphan; the task now exists as **M0140-0006**.)
 - Q14's third category and the non-planner floor each carry a ledger row naming
   the mechanism and what would unblock them — neither is silently dropped.
+  **K92 and K14/K15 are deliberately left without a follow-up task in this
+  group**: K92 needs PG's real partial-inner execution model, and the heap-density
+  floor is a storage-density input no planner change can correct. The ledger row's
+  `why` column must say so, and must name where the work belongs instead — which
+  is what the group's completion rule (`AGENT.md`, "Completion rule for this
+  group") requires of any deferral that has no owner here. **K41 is the
+  exception**: its dimension-table `relpages` divergence is an on-disk defect
+  with a concrete probe, so it *does* have an owner — **M0143-0007**, under the
+  engine carry-overs rather than under a planner milestone.
 - TPC-DS values sweep all-zero; the non-regression floor (TPC-DS match >= 2)
   holds.

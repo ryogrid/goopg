@@ -56,8 +56,10 @@
 #             harness also run from: ledger row goopg_bench_bin_shared_lane)
 #   NO_BUILD  1 = trust the existing GOOPG_BIN / runner images
 #   TPCH_RELSIZE_ARM_PORT        this arm's PRIVATE port (M0137-0007, default 5581)
-#   TPCH_RELSIZE_ARM_CLONE_WAIT  seconds to wait for :65433 to go quiet before
-#                                the snapshot clone (M0137-0007, default 60)
+#   TPCH_RELSIZE_ARM_CLONE_WAIT  seconds to wait for :65433 to go quiet in the clone's
+#                                `cp -a` FALLBACK path only; the default online
+#                                pg_basebackup path never waits (M0137-0007, default 60)
+#   TPCH_CLONE_MODE              auto|online|copy — scripts/lib/tpch-private-clone.sh
 #
 # Output: ${OUTDIR}/<arm>.tsv (one row per query) + ${OUTDIR}/<arm>.log.
 set -uo pipefail
@@ -142,7 +144,9 @@ fi
 # Every start/stop cycle below (one per query, up to 22x) reuses this same
 # private clone — the data does not change between them, so there is no
 # reason to re-clone per query. This is the ONLY touchpoint with the shared
-# cluster in the whole script; it never stops/starts a server there.
+# cluster in the whole script; it never stops/starts a server there, and
+# (since the M0139 follow-up) never needs it to be down either: a live
+# :65433 is cloned online via `pg_basebackup -X fetch`.
 say "snapshot-cloning ${SRC_DATA} -> ${PGDATA}"
 tpch_private_clone_snapshot "${SRC_DATA}" "${PGDATA}" "${PG_HOST}" "${SRC_PORT}" "${CLONE_WAIT}" \
     || { echo "could not snapshot the shared TPC-H cluster (see above)" >&2; exit 3; }

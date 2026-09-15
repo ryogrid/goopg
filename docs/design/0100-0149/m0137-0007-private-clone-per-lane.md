@@ -207,3 +207,101 @@ unaffected; only shell scripts changed.
 - No ledger row: this is instrument/harness completeness work (the same
   class M0137-0004/-0005/-0006 judged as not needing one), not a discovered
   PG-behaviour gap — goopg's own engine semantics are untouched.
+
+## Update (M0139 follow-up, 2026-09-15) — the private lane no longer requires the shared server to be DOWN
+
+### What was wrong
+
+The task above gave each lane a private port and a private data dir, but left
+exactly ONE way to obtain the clone: `tpch_wait_port_free` + `cp -a`. That
+precondition is not "the shared cluster is momentarily idle" — it is **"no
+server is listening on :65433 at all"**, because `pg_isready` answering is
+the only thing the wait loop tests. And per `CLAUDE.md`'s port table, the
+:65433 TPC-H bench cluster is a **persistent** cluster that stays up for
+days at a time.
+
+So the snapshot step kept a hard dependency on stopping the very server this
+task existed to protect, and the "Consequences" claim above — "the mandatory
+gate can now run at any time" — was false in the normal case. The
+contention-scenario verification bullet even *recorded* the failure mode as a
+success: the gate refusing while the shared server stayed alive is only half
+the requirement; the other half is that the gate must still produce its
+answer.
+
+`M0139-S1` paid the bill (`m0139-s1-join-leg-hook.md` §"Gates run"): three
+retries across ~15 minutes, every attempt dying with
+`127.0.0.1:65433 still busy after 60s`, and **two production planner changes
+landed with the TPC-H values gate unverified**.
+
+### The fix
+
+Stop treating "a server is up" as un-snapshottable. PostgreSQL's answer for
+cloning a *running* cluster is the online base backup, and goopg implements
+the server side of it (`internal/backup/basebackup.go`, M0102-0001/-0007,
+M0095-0003 — `pg_basebackup` against a live goopg is already a landed,
+tested capability). `scripts/lib/tpch-private-clone.sh` now resolves:
+
+| source port | path taken |
+|---|---|
+| answers nothing | `cp -a` (unchanged — the dir is genuinely at rest, and this is cheapest) |
+| answers | `pg_basebackup -h … -X fetch --no-manifest --no-sync` — **no stop, no wait** |
+| online path failed | falls back to the old quiesce-then-`cp -a` loop, which still REFUSES rather than copy mid-write |
+
+`TPCH_CLONE_MODE=auto|online|copy` forces a path (`copy` restores the exact
+pre-fix behaviour). Helper functions `tpch_private_clone_online` and
+`tpch_private_clone_copy` are split out of `tpch_private_clone_snapshot`;
+`tpch_wait_port_free` is untouched. All four lane scripts call the same
+unchanged `tpch_private_clone_snapshot` signature, so none of them needed a
+code change — only their comments and their `*_CLONE_WAIT` tunable docs
+(that timeout is now fallback-path-only).
+
+### Why the online path is consistent (not "we hope nothing was written")
+
+It is PG's standard online-backup contract, and every piece of it is
+implemented on the goopg side:
+
+1. `BASE_BACKUP` forces a **synchronous IMMEDIATE checkpoint** before
+   streaming and reports that checkpoint's REDO LSN as the start LSN
+   (`basebackup.go` "Force a synchronous IMMEDIATE checkpoint…").
+2. `-X fetch` (`INCLUDE_WAL`) makes the server append **every WAL segment
+   from that redo point to the stop LSN** into the same archive, so the
+   clone carries the WAL that reconciles pages copied at different instants.
+3. `global/pg_control` is written **last** and is patched to name that
+   checkpoint, so the clone's first start does
+   `database system was not properly shut down; automatic recovery in
+   progress` and replays to a consistent state before accepting connections.
+
+Nothing is ever written into the shared data dir, and no server on it is
+stopped or started. The one new effect on the shared cluster is load — one
+immediate checkpoint plus a ~2 GB sequential read — which is a *timing*
+perturbation, not a correctness one, and strictly less invasive than the
+`stop -D` this library replaced. A lane that must not perturb it at all can
+still pass `TPCH_CLONE_MODE=copy`.
+
+### Verification (2026-09-15, against the live shared cluster)
+
+- `pg_basebackup -X fetch` against the **running** `:65433` (pid 1221143,
+  up ~3 h): 1.9 GB clone in 8-25 s; `:65433` `pg_isready`-live before,
+  during and after, same pid throughout.
+- A goopg server started on that clone recovered cleanly and returned
+  data **identical to the live source**: `lineitem`=6 001 255,
+  `orders`=1 500 000, `customer`=150 000, `part`=200 000,
+  `sum(l_extendedprice)`=229 455 983 170.26 on both.
+- **`scripts/tpch-spotcheck.sh`: RESULT=PASS** (`Q12=2`, `Q13=34` — the
+  canonical anchors) in **39.9 s wall clock total**, with `:65433` up the
+  whole time. This is the exact invocation that could not run at all during
+  M0139-S1.
+- **Concurrent-writer consistency test** (on a private copy — the shared
+  cluster is never written): a source cluster taking 200 000 committed
+  inserts was cloned online mid-stream; the clone started, replayed WAL
+  (`redo=3988174424 → checkpoint=3989827400`), and showed a **committed
+  prefix** of 105 000 rows with every row intact
+  (`sum(length(pad))`=21 000 000 = 105 000 × 200) alongside unchanged
+  `lineitem`/`orders` counts and sums. That is precisely the
+  "consistent as of the backup's stop LSN" guarantee, demonstrated under
+  writes rather than assumed.
+- Fallback/error paths exercised directly: `TPCH_CLONE_MODE=copy` against
+  live `:65433` still refuses (rc=5) and leaves it alive; `copy` against a
+  quiescent dir on a dead port still succeeds (rc=0, no stale
+  `postmaster.pid`); unknown mode → rc=2; missing source → rc=3.
+- `bash -n` clean on all five changed files. No Go code touched.

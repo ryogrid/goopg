@@ -1,0 +1,30 @@
+# stats-epoch: 253df6b1d97f9f5b
+=== PLAN-ONLY RUN — §4 clause 6 channel only (09 §5 and the §4 parity ratchet are NOT measured)
+  Queries were EXPLAINed, not EXPLAIN ANALYZEd. Both the §5 estimate audit
+  and the §4 parity ratchet score an estimate against an ACTUAL row count,
+  which this run does not have, so both sections are omitted rather than
+  printed empty, and --fail-on-violation is off. Do not cite this artifact
+  as a §5 or §4 result.
+  What IS measured: the join-spine pairing diff and, with --enum-trace, the
+  clause-6 enumeration provenance. Both are properties of PLANNING, decided
+  before a single tuple moves, so a plan-only run answers clause 6 exactly
+  as a full audit would — in seconds instead of a power run, and without
+  timing content that a co-resident workload could contaminate.
+
+=== JOIN SPINE PAIRINGS vs PG 18.3 (09 §4 clause 6)
+--- Q9
+  F goopg d4  left-deep {lineitem+orders+part+partsupp+supplier} ⋈ {nation}   GOOPG-ONLY PAIRING
+    goopg d7  left-deep {lineitem+part+partsupp+supplier} ⋈ {orders}   GOOPG-ONLY PAIRING
+    goopg d10 left-deep {lineitem+part+partsupp} ⋈ {supplier}   GOOPG-ONLY PAIRING
+    goopg d13 left-deep {part+partsupp} ⋈ {lineitem}   GOOPG-ONLY PAIRING
+    both  d16 left-deep {partsupp} ⋈ {part}
+  F PG    d4  left-deep {orders} ⋈ {lineitem+nation+part+partsupp+supplier}   PG-ONLY PAIRING
+    PG    d10 left-deep {nation+part+partsupp+supplier} ⋈ {lineitem}   PG-ONLY PAIRING
+    PG    d13 left-deep {part+partsupp+supplier} ⋈ {nation}   PG-ONLY PAIRING
+    PG    d16 left-deep {part+partsupp} ⋈ {supplier}   PG-ONLY PAIRING
+
+=== SPINE SUMMARY (09 §4 clause 6)
+  queries compared: 1; pairings: 1 matched, 4 goopg-only, 4 PG-only
+  bushy spine chosen by: goopg none | PG none
+  no bushy partition PG chose is absent from goopg's plans
+  RATCHET spine_pg_only=4 spine_goopg_only=4 bushy_pg=0 bushy_goopg=0 clause6_candidates=0

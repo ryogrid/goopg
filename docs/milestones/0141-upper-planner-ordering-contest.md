@@ -3,8 +3,11 @@
 **Status:** planned — **scoping-gated**
 **Filed:** 2026-09-14 (user directive, from
 `METHODOLOGY3/04-forward-plan.md` Phase 1 Campaign B)
-**Priority placement:** in the plan-parity group, after M0140. **No
-implementation task exists in this milestone until S0 lands.**
+**Priority placement:** **S0 has landed (2026-09-15), and the gate below is
+satisfied.** `M0141-S2a-fix` is now joint TOP PRIORITY for the whole group with
+`M0139-0007` — see the `## Current Priority` banner in `.ralph/fix_plan.md`. The
+sentence this line used to carry ("no implementation task exists until S0
+lands") is historical and no longer describes the milestone.
 **Reference plan:** `.ralph/fix_plan.md` (M0141 section)
 **Harness:** `AGENT.md` §"Plan-parity harness — applies ONLY to M0137–M0143"
 **Prerequisites:** M0137; and **M0141-S0**, this milestone's own mandatory
@@ -39,7 +42,24 @@ lacks:
    by S0 itself.
 3. An entry gate: the condition under which S1 may be selected.
 
-Until S0 lands, this milestone contributes exactly one selectable task.
+S0 landed on 2026-09-15 and filed S1–S6. Two further slices were added by the
+loop review the same day and are **not** S0's output, so record where they came
+from:
+
+- **`M0141-S2a-fix`** — the costing-order half of the width defect: narrowing
+  information reaches the cost model too late, or in the wrong currency, to
+  affect plan selection. It is joint TOP PRIORITY with `M0139-0007`, which
+  establishes the **absorption principle** it applies. Read `AGENT.md`
+  §"B2 — same statistics, same plan; absorb what cannot be made identical"
+  **before** scoping it: the two rules there (derive before you measure; the
+  substituted quantity must be a port of a named expression under `./postgres/`)
+  are what separate this work from tuning, and a slice that cannot satisfy them
+  is blocked rather than absorbed.
+- **`M0141-S7` — Incremental Sort.** Owner-filed, not S0-filed: PG emits it in
+  14 of the 99 TPC-DS reference plans and goopg has no implementation, so those
+  queries cannot MATCH whatever the costing does. The entry gate in
+  §"Per-task discipline" below governs S0's slices; S7 is independent of it and
+  may be selected on its own.
 
 ## Known constraints — start from these, do not rediscover them
 
@@ -68,7 +88,9 @@ Until S0 lands, this milestone contributes exactly one selectable task.
    `docs/milestones/README.md` §"Workflow Per Milestone" step 2 for this group.
 2. **S0 is measurement-only.** A production diff in S0's commit is a scope
    violation.
-3. **No slice may be selected before S0's entry gate is satisfied.**
+3. **No S0-filed slice (S1–S6) may be selected before S0's entry gate is
+   satisfied.** S0 landed 2026-09-15 and the gate is satisfied. `S2a-fix` and
+   `S7` are not S0-filed and are not governed by that gate.
 
 ## Definition of Done
 

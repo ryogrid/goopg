@@ -23,22 +23,52 @@ applies ONLY to M0137–M0143".** It is binding and it carries the goal, the two
 owner decisions, the reading order for the prior phase's evidence, the list of
 known-stale claims, and what every task report must contain.
 
+### Re-ordered 2026-09-15 after the first-pass review
+
+36 tasks completed, **goal metric unmoved** (TPC-H 6/22, TPC-DS 2/99) and
+TPC-DS categories net worse (525 -> 540). The review
+(`tmp/METHODLOGY3_RALPH_CHECK0915/`) found one dominant reason and it decides
+this ordering: **narrowing runs after costing, so M0139's landed work cannot
+move a single plan.** Unblocking that comes before starting anything new.
+
 Select in this order:
 
-1. **M0137 — Parity measurement harness and instrument repair.** First, and a
-   prerequisite for the other six: every one of them is judged by instruments
-   this milestone repairs.
-2. **M0138 — PG-faithful ANALYZE statistics**, **M0139 — Executor-side
-   narrowing**, **M0140 — TPC-DS parallelism.** Independent of one another; take
-   the topmost with an unblocked task. M0140 does **not** wait on M0139 (owner
-   decision "(c) split the goal = Go").
-3. **M0141 — Upper-planner ordering contest** (only `M0141-S0`, its mandatory
-   scoping recon, is selectable until S0 files its slices) and **M0142 —
-   Join-order costing** (gated on M0138 having landed and been measured).
-4. **M0143 — Engine correctness carry-overs.** Gated on nothing; select it
-   whenever everything above is blocked.
-5. Then M-NIGHTLY's own open items, then the pre-existing milestones
+1. **M0141-S2a-fix and M0139-0007 — the costing-order unblock. TOP PRIORITY.**
+   These are the same defect seen from two sides: narrowing/width information
+   reaches the cost model too late (or in the wrong currency) to affect plan
+   selection. Until one of them lands, **M0139's entire +671 lines contribute
+   nothing to the metric and M0141's remaining slices cannot be judged.**
+   Take `M0139-0007` first (it establishes the absorption principle the
+   S2a-fix then applies), unless its scoping recon says otherwise.
+2. **M0137's re-opened tasks (0014–0017).** Instrument and orphan-mechanism
+   debt found by the review. 0015 is one line and 0016's gate is already
+   satisfied. **0017 matters more than its size suggests**: TPC-H plans are
+   captured `-serial` only, so `parallelism` is measured *out* of the headline
+   6/22 and one of the nine categories is currently unscoreable.
+3. **M0138 — PG-faithful ANALYZE statistics** (0007–0009: the orphaned
+   `numeric` `avg_width`, the category-shift bisect, the correlation banding
+   re-open) and **M0140 — TPC-DS parallelism** (0006: the partial-Append
+   producer that M0140-0004 deferred without an owner).
+4. **M0141's remaining slices** (S2b, S3–S6, and **S7 — Incremental Sort**,
+   which 14 TPC-DS queries need before they can match at all) and **M0142 —
+   Join-order costing** (0003c onward, plus 0004–0008 promoted from the ledger).
+   Take **M0142-0004** first inside that milestone: it is a re-measurement, and
+   until it runs, nothing is known about how large TPC-DS's row-estimate error
+   still is — all four cuts the ledger named have since landed and the "3–5
+   orders out" figure predates every one of them.
+5. **M0143 — Engine correctness carry-overs.** Gated on nothing; select it
+   whenever everything above is blocked. **Still 7/7 untouched.**
+6. Then M-NIGHTLY's own open items, then the pre-existing milestones
    (M0119 -> M0122 -> M0131 -> M0134 -> M0135/M0136 -> M0095/M0110).
+
+**Three owner decisions of 2026-09-15 bind every M0137–M0143 task below** (full text in
+`AGENT.md` §"Further owner decisions"): **B1** `minimize_datum`/packed retention
+is **NO-GO** and out of scope — do not re-propose it; **B2** the direction (same
+statistics, same plan) is unchanged, but irreducible goopg/PG representation
+differences must be **absorbed** by giving the cost model the PG-equivalent
+quantity rather than goopg's native one — this is not tuning, and it is the
+route that replaces packed retention; **B3** `GOOPG_GATHER_PATHS=all` stays
+default-on and may not be reverted on category count alone.
 
 **M-NIGHTLY: filing stays unconditional, selection does not.** Every loop still
 reads `ci/logs/action-items.md` and files each new `## AI-` subject under the
@@ -849,7 +879,7 @@ before/after proving the defect it closes.
     (`internal/executor/operators_explain.go`) with a temporary env-gated trace
     against the live `bench/tpch` 65433 lane (fully reverted, `git diff --stat`
     empty on both files). Root cause: `SeqScan` embeds `PlanCost`
-    (`plan.go:641`) but `Filter` does not (`plan.go:1531-1569`) — a base-local
+    (`plan.go:642`) but `Filter` does not (`plan.go:1531-1569`) — a base-local
     filtered scan (`lineitem` in Q12) reaches `buildInitialRels` wrapped as
     `Filter{Child: SeqScan}`, so `stampPlanCost`'s `n.(planCostSetter)`
     assertion silently fails on it (traced: the correct 271,421.24 is stamped
@@ -922,6 +952,52 @@ before/after proving the defect it closes.
   applies `semiJoinMatchFraction` for SEMI/ANTI, unlike its sibling
   `estimateJoin`, confirmed live at HEAD). No `TODO.md`/`rNNN-*` round
   directory edited. No production planner/executor/catalog code touched.
+- [ ] **M0137-0014 — automate the seam-decline census** — the harness requires a
+  per-class decline census at a stated timeout, and **no tool produces one**, so
+  three of 22 task reports carried it and only by hand-classifying trace output.
+  Add a small script under `scripts/` that runs a capture with
+  `GOOPG_PGSHAPED_DP_TRACE=1` and emits counts by `reason=` class with the
+  timeout stamped, in a form a report can paste. Sibling of the
+  `CATEGORIES-EXCL-MATCH:` fix that closed the same defect for category movement.
+- [ ] **M0137-0015 — embed `PlanCost` in `optimizer.Filter`** — M0137-0011
+  root-caused C3/K63 and filed a ledger row but no task, so the fix is an orphan.
+  The row says it is **one line**: mirror `SeqScan`'s embed at `plan.go:642`;
+  `plancost.go:58`'s `PlanCostCarrier` is the consumer side and needs nothing
+  ("Embedding PlanCost is the whole of implementing it"). Closes the display seam
+  where goopg's EXPLAIN reports a scan cost the planner never used (Q12:
+  `60,299.79` rendered vs `271,421.24` consumed, 4.5x) for every
+  base-local-filtered scan — which corrupts `plan-gate MODE=semantic-cost` and
+  every estimate audit.
+- [ ] **M0137-0016 — add the `*Gather` arm to `pushConjunctTraced` (O15)** —
+  filed by M0137-0012 as a ledger row with **no owner**. Its stated gate
+  ("requires M0137-0010's qual-placement census to exist first") **is already
+  satisfied** — M0137-0010 is complete and every M0139 slice ran the census. The
+  ledger row carries the recipe: add a `*Gather` case that descends to
+  `x.Child`, simpler than the existing `*Join` arm. Same defect class as R56's
+  Q78, which lost three `Filter:` lines with sweep checksums still green.
+- [ ] **M0137-0017 — capture plans in BOTH serial and parallel modes** — the
+  TPC-H scoreboard is captured with `estimate-audit`'s `-serial`, which defaults
+  **true** (`cmd/estimate-audit/main.go:293`), so `parallelism` reads 0 because
+  it is measured **out**, not solved — M0137-0003 says so in writing, and
+  M0140-0003 confirmed the flip is inert against this protocol. **The headline
+  TPC-H 6/22 therefore cannot score one of the nine categories at all.** Capture
+  with `-serial` and `-serial=false`, each against its own PG baseline; the
+  parallel-mode PG baseline does not exist yet (`bench/tpch/plans-pg/` is serial)
+  and building it is part of this task. Ledger: `take3-plan-capture-is-serial-only`.
+- [ ] **M0137-0018 — bring `make ea-ratchet` into this group's gate set** — the
+  ratchet exists and runs (`Makefile:616` -> `scripts/estimate-parity-gate.sh`,
+  landed by C-20a `d0b4f96e4`: TPC-DS SF0.5 `EXPLAIN ANALYZE`, relation-set
+  keying so base-rel *and* joinrel granularity come from one keying, PG-relative
+  bar, first run 99/99 rc=0, 844 nodes scored, 178 findings pinned). What is
+  missing is not the instrument but its **standing here**: no M0137–M0143 task
+  cites it, the harness's values-gate table does not name it, and its pinned
+  findings have not been re-scored since 2026-09-07. Deliverable: re-score at
+  HEAD (`EA_CAPTURE=<file> make ea-ratchet` needs no server), record the
+  finding-identity delta against the pinned set, and either add it to the
+  harness's declared gate table or file a ledger row saying why it does not
+  belong there. **Do not rebuild it** — the row `take3-ea-ratchet-never-ran`
+  that says it has never run is superseded by the `resolved` row nine lines
+  below it (`.ralph/deferral_ledger.md:2121` then `:2134`); read the later row.
 
 ## M0138 — PG-faithful ANALYZE statistics (filed 2026-09-14)
 
@@ -1147,6 +1223,25 @@ unmeasured one does not.
     needed — no production code touched this loop.
   - **M0138 is now fully landed and measured** (all six tasks [x]) — M0142's
     prerequisite gate is satisfied; M0142-0001 becomes selectable.
+- [ ] **M0138-0007 — give `numeric` columns a real `avg_width`** — M0138-0005
+  measured that the `numeric` fast path leaves `avg_width=0`, affecting **28 of
+  61 TPC-H columns and 17 of 120 TPC-DS columns**, and filed a ledger row with no
+  owner. HammerDB's TPC-H declares every primary and foreign key `NUMERIC`, so
+  this hits the join columns the whole programme turns on. Resume point in the
+  row: `operators_analyze.go:1159-1174` plus PG's `numeric_size` arithmetic. A
+  width of zero is not a PG-faithful statistic — this is squarely M0138's remit.
+- [ ] **M0138-0008 — bisect the category shift M0138 caused** — the corpus
+  re-measure moved TPC-DS `join-order` 89->90 and `qual-placement` 16->17 and the
+  causing queries were never identified; the row's resume point is to re-capture
+  at the pre-M0138-0002 commit and bisect. Small, and it is the only unexplained
+  movement this milestone introduced.
+- [ ] **M0138-0009 — re-open the correlation banding finding** — M0138-0004
+  claimed the `SliceStable` tie-break resolved it; **M0138-0005 refuted that**
+  by re-measuring the same columns unchanged (TPC-DS 36/120 columns banded in
+  `[0.09,0.16]` against PG's 7/120), and the ledger row was honestly flipped
+  `RESOLVED -> REOPENED`. The tie-break mechanism is PG-faithful, so the cause is
+  elsewhere: the row names a TPC-DS loader load-order artefact or an undiscovered
+  second defect. Resume with the synthetic-table comparison the row describes.
 
 ## M0139 — Executor-side narrowing / projection pushdown (filed 2026-09-14)
 
@@ -1376,6 +1471,24 @@ that comment names as parity-inert.
     M0139 has no further open items; the next M0139-family work (if any)
     would come from a future owner decision on `minimize_datum`, which is
     out of scope until that decision is made.
+- [ ] **M0139-0007 — absorb the irreducible width difference into the cost model
+  (owner decision B2)** — **TOP PRIORITY with M0141-S2a-fix.** M0139-S1/S2 landed
+  real narrowing and moved **zero** plans, because `applyUpperNarrowing`
+  (`planner.go:189`) runs after cost and strategy are decided in
+  `planStmtWithSettings` (defined `planner.go:210`, called `:141`); measured proof is that TPC-H costs
+  are byte-identical pre/post M0139 while only `width=` shrank. Packed retention
+  is **NO-GO** (B1), so the route is B2's absorption principle: give the cost
+  model the **PG-equivalent** width — what PG's own tuple representation would
+  be for the same logical row — while the executor keeps allocating goopg's real
+  `48*ncols + 24 + avgVar`. **This is not tuning**: it feeds PG's formula PG's
+  input, rather than bending a goopg number until the output matches. Start with
+  a scoping recon (no production diff) that names every site where a goopg-native
+  quantity currently reaches a PG-derived cost formula — `hashsize.EntryBytes`
+  into the hash-join spill decision is the witness, `MapSlotBytes` and the sort
+  footprint are the other candidates — then slice. Each absorption site needs a
+  design-doc justification and a test pinning the two currencies apart. Expect a
+  slower executor and unchanged values; a matching plan that runs slower is
+  **not** a regression.
 
 ## M0140 — TPC-DS parallelism (filed 2026-09-14)
 
@@ -1575,11 +1688,33 @@ setting that yields a serial plan.
     blank-padding (R23) is the leading candidate mechanism but was never isolated as
     K41's specific cause. Unblock: direct per-page free-space comparison, then R22
     (heap fill) / R23 (blank-padding) — on-disk work, out of the planner remit.
+    **K41 now has an owner** (2026-09-15): `M0143-0007`, filed under the engine
+    carry-overs because it is an on-disk defect, not a planner one. K14/K15 stay
+    deferred.
   - Ledger rows: `m0140-0005-q14-parallel-hash-execution-model`,
     `m0140-0005-nonplanner-heap-density-floor`.
   - Design doc:
     `docs/design/0100-0149/m0140-0005-q14-third-category-and-nonplanner-floor-filing.md`.
-  - **M0140 is now fully closed** (all five tasks `[x]`).
+  - Superseded 2026-09-15: M0140-0006 re-opens the producer K43 deferred, so
+    the milestone is **5 of 6**, not closed.
+- [ ] **M0140-0006 — partial-Append producer (K43), the implementation** —
+  M0140-0004 did the recon and filed a ledger row, but under the old DoD wording
+  that was enough to close the task, leaving the producer an orphan. The recon is
+  valuable and must be read first: each UNION ALL branch is folded into a
+  finished opaque `Node` at `planner.go:1114` before `createSetOpPaths` sees it,
+  so there is no route to a `PartialPathlist`; and **wrapping today's `setOp`
+  node in a `Gather` would silently duplicate every row** because it has no
+  claim-set analogue of `parallel_scan.go`. That row-duplication defect is a
+  correctness bug in its own right and must be fixed before or with the producer.
+  **Scope from the recon's own correction, not from the task title it replaces**:
+  the "only Q5 and Q76 miss" framing is wrong — `m0140-0004-…-recon-and-defer.md:35-40`
+  records that Q2/Q14/Q71 also emit a plain serial `Append` and merely carry a
+  compensating `Gather`/`Gather Merge` elsewhere, and a 2026-09-15 count of
+  goopg's 99 TPC-DS plans finds **`Parallel Append` zero times**. Treat all six
+  as missing. The six-query list itself is reference-dependent — the committed
+  fixture `bench/tpcds/plans-pg/` shows five (Q2/Q5/Q14/Q71/Q76) and the SF0.25
+  capture shows six (adding Q75); settle which reference is canonical under
+  M0137-0004/0005 before quoting a denominator.
 
 ## M0141 — Upper-planner ordering contest (filed 2026-09-14)
 
@@ -1739,6 +1874,13 @@ spill route is net-negative.
   TPC-DS 51-query AGGSPLIT-touched set, out of scope until M0140's floor)
   after. Needs a dedicated scoping pass before attempting — size which half
   is cheaper first, per M0141-S2a's finding.
+  **Prerequisite reading, binding**: `AGENT.md` §"B2 — same statistics, same
+  plan; absorb what cannot be made identical", and `M0139-0007`, which
+  establishes the absorption principle half (2) applies. Half (2) *is* an
+  absorption site, so it inherits both of B2's operational rules — derive the
+  substituted width before taking any parity number, and cite the
+  `./postgres/` `file:line` whose expression it ports. A width chosen because
+  it made the parity number look better is tuning and is rejected.
 - [ ] **M0141-S2b — GROUP_AGG rel publishes Pathlist, not Node, to the
   ORDER BY step** — the K24 "ordering contest, slice 3" surgery: change
   `createOrderedPaths`'s callers (every `createXPaths` -> `createOrderedPaths`
@@ -1778,6 +1920,24 @@ spill route is net-negative.
   `Aggregate`/`GroupAggregate (N keys)` EXPLAIN mislabel (doc
   `parallel-query/06` §4.1 — both currently render as a hash aggregate
   regardless of `Strategy`); re-measure the full corpus. Needs S5.
+- [ ] **M0141-S7 — re-adjudicate and implement Incremental Sort** — **verified
+  2026-09-15: PG emits `Incremental Sort` in 14 of the 99 TPC-DS reference plans
+  (`bench/tpcds/plans-pg/`), and goopg has no implementation at all** — the only
+  occurrences in `internal/` are **7 hits across 7 files, every one a comment or
+  a test string**: `windowsetoppaths.go:23`, `createplansimple.go:267`,
+  `groupagg_indexorder.go:18`, `groupagg_indexorder_test.go:129`,
+  `executor/sort_presorted_test.go:5`, `estimateaudit/spine.go:176`, and a live
+  map key `"Incremental Sort": false` in `estimateaudit/parity_test.go:58`.
+  **No executor or planner node implements it.** Those 14
+  queries are therefore **structurally unable to MATCH**, whatever the costing
+  does. The ledger row `take3-C-14-dropped` declined it, but **on the previous
+  goal**: its stated reasons were performance-shaped ("TPC-H has no LIMIT",
+  "0/100 TPC-DS sorts spill", "0.015% of the corpus") and it says outright that
+  "plan parity alone is NOT sufficient grounds". **Under the current goal that
+  judgement inverts** and the row needs re-adjudicating before implementation.
+  Port `create_incremental_sort_path` and the executor node; PG oracle
+  `postgres/src/backend/optimizer/path/pathkeys.c` + `nodeIncrementalSort.c`.
+  Owner of the `sort-strategy` category (TPC-DS 76 / TPC-H 9).
 
 ## M0142 — Join-order costing (filed 2026-09-14)
 
@@ -1899,6 +2059,77 @@ cross-layer programme that has never been scoped.
   same task: -0003b's Finding 1 left open why the two candidates' bit-exact
   tie holds despite differently-composed (input, marginal) pairs — informative
   but not required to resolve -0003c.
+- [ ] **M0142-0004 — re-measure TPC-DS's row-estimate error at HEAD** — the
+  ledger row `take3-rowest-collapse-diagnosed` (`.ralph/deferral_ledger.md:2120`,
+  2026-09-06) named four cuts in order — **B1, A1, A2, A3** — and pinned the
+  headline "3–5 orders out" (Q22 9,460,201 vs PG 11,987 = 789x; 22 of 100 Sort
+  inputs estimate 1) *before any of them*. **Verified 2026-09-15: all four have
+  since landed.** B1 is `joinkeyproof.go:248` (`case *NestedLoopIndexJoin:`,
+  commit `9b43c67f3`, its own comment recording Q99 720,657 -> 90 exact and
+  Q62 359,432 -> 150 exact, pinned by `TestResolverFamilyArmListsAgree`); A1 is
+  the `s2 += cs.NullFrac` term at `rangequery.go:211-215`; A2 is
+  `rangeOpSelectivityStats` (`selectivity.go:322`), MCV-first as PG's
+  `scalarineqsel` is; A3 is the `parser.JoinAnti` transplant at
+  `reduce_outer_joins.go:141`. **So there is no cut to make and no number to
+  quote — only a measurement to take.** Deliverable: re-score the corpus with
+  `make ea-ratchet` (M0137-0018) at a declared stats epoch, state the error
+  distribution at HEAD, and file whatever is left as new tasks with their own
+  evidence. The one mechanism the ledger recorded as STILL OPEN is **(B2) the
+  missing `*Append` arm in the same resolver** — Q76, goopg 67,352 vs PG 6,810
+  vs actual 470; note the ceiling is low because PG is 14x over too. Start by
+  confirming that arm is still absent (`joinkeyproof.go`, arm list ends at
+  `*Aggregate`). **Note the gate gap**: `scripts/pg-plan-parity-diff.py`'s nine
+  categories have no `rows=` dimension, so estimate error is invisible to every
+  parity gate — it reaches the metric only indirectly, by changing plan shape.
+  `make ea-ratchet` is the instrument that scores it directly.
+- [ ] **M0142-0005 — break the Memoize / probe-multiplier interlock (B6+B8)** —
+  two ledger rows that lock each other. **B6**: goopg's executor has no Memoize
+  on the NL probe path R59 repriced, so pricing probes PG-faithfully took
+  TPC-DS Q72 from 4 s to a 320 s TIMEOUT (unfixed since R59; carried through
+  R60–R62). **B8**: `indexProbeCostMultiplier = 2.0` (`cost_funcs.go:1053`, value at `:1077`)
+  deliberately departs from PG because the executor materialises the whole TID
+  list eagerly — at `mult = 1` the DP picks PG-shaped NL plans that run 2–3x
+  slower (Q7 5.86 s -> 15.72 s). **Neither can move alone**: PG-faithful probe
+  pricing without Memoize produces Q72-class timeouts. Resume points:
+  `nl_index_join.go:127`, `joinpathsnli.go:313,498`, `cost_funcs.go:1053`.
+  Sibling K73 (`Join.FromOuterReduction`) retires with B8. Expect an executor
+  slice; per the harness a matching plan that runs slower is not a regression,
+  so the Memoize half may be scoped for correctness of the *cost*, not speed.
+- [ ] **M0142-0006 — apply `semiJoinMatchFraction` in `estimateNLIndexJoin`** —
+  `estimateNLIndexJoin` (`cardinality.go:239-241`) returns `EstimateRows(j.Outer)` for
+  SEMI/ANTI, while its sibling `estimateJoin` (`:608-625`) applies the match
+  fraction. Textbook `pattern_sibling_paths_must_agree` defect; the ledger says
+  mirror lines 621-628 at `:240`. Ledger: `m0137-0013-nli-semi-anti-match-fraction-gap`.
+- [ ] **M0142-0007 — re-measure the `corr = 0` index-pricing fallback (B10)** —
+  `indexCorrelationFor` (`costindex.go:479-495`) returns 0 when the leading
+  column has no correlation slot, pricing **every** such index scan at
+  `max_IO_cost` (the fully-random Mackert-Lohman bound); and ANALYZE never visits
+  indexes, so `estimateIndexGeometry` **synthesises** relpages/reltuples/
+  tree_height rather than measuring them. Both shift index-probe pricing
+  corpus-wide and both sit under this milestone's decisions. Re-ANALYZE the bench
+  clusters first and establish whether the fallback actually fires at HEAD —
+  M0138-0004 populated correlation slots as a side effect. Ledger:
+  `m0137-0012-b10-corr-zero-fallback-max-io-cost`.
+- [ ] **M0142-0008 — recon: how much of goopg's plan shape is chosen by forced
+  rewrites rather than by the search?** (measurement only, no production diff) —
+  the goal says plans must be reached by **the same planning logic**, and several
+  ledger rows claim goopg still depends on goopg-only forced rewrites that the
+  search cannot yet reproduce: `rewriteScanInputsWithSingleTablePredicates`
+  (deleting it costs Q20 6.5x), `rewriteJoinsToNLI` (deleting it costs Q4's
+  semi-join 12.5x), plus the PG-absent knobs `GOOPG_NLI_COSTGATE`,
+  `GOOPG_INDEXKEY_HARVEST`, `GOOPG_INDEX_PROBE_MULT`, `enable_nestloop_index`.
+  Ledger: `take2-P6-03`, `take2-P6-04`, `take3-C-20c-blocked`, `-20d-calibrated`, `-20f-blocked`, `-20g-blocked`, `take2-P2-10`,
+  `take3-C-09-declined`, `take2-P3-01`.
+  **Scope this as a measurement first, because a 2026-09-15 survey overstated
+  the case**: it reported that SEMI/ANTI "never enter the DP search", but
+  `parser.JoinSemi` is in fact handled at `joinpaths.go:195,265` and
+  `joinsearchlevel.go:98,160,228`. M0139-0005's narrower and verified finding is
+  that **no SEMI path is ever filed through `addPath`**. Establish which is true
+  at HEAD, per query, before proposing any milestone — the harness forbids
+  scoping from a dated claim without re-measuring (`git log -S` the mechanism
+  first). Deliverable: a per-query census of which plan nodes came from the
+  search vs from a forced rewrite, and a verdict on whether a dedicated
+  milestone is warranted.
 
 ## M0143 — Engine correctness carry-overs from the parity programme (filed 2026-09-14)
 
@@ -1944,3 +2175,13 @@ reported, and the values and unit gates are the bar.
 - [ ] **M0143-0006 — triage `internal/parser`'s 60 failing tests** — pre-existing,
   verified unrelated to R126, and unowned. Fix them or convert them into filed, owned
   tasks; "unowned" is not an end state.
+
+- [ ] **M0143-0007 — separate the dimension-table `relpages` divergence (K41)** —
+  `customer` 1,979 pages vs PG's 2,872, `item` 716 vs 1,284. M0140-0005 filed it
+  as out of planner reach and that is correct — **but `relpages` is an input to
+  every page-priced cost term and to `compute_parallel_worker`'s size ladder, so
+  no cost-model change can ever correct it.** The leading candidate is R23's
+  `character(N)` blank-padding, a real PG-compat defect that shifts `relpages` on
+  every `bpchar` table; R22 (per-page free-space comparison) separates the two.
+  Storage work, not planner work, which is why it belongs here. Ledger:
+  `m0140-0005-nonplanner-heap-density-floor`.

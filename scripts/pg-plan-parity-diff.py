@@ -38,6 +38,14 @@ Nine-category taxonomy (spec order): join-order, join-method, scan-type,
 parameterisation, aggregation-strategy, sort-strategy, parallelism,
 qual-placement, rendering. Categories are recorded per query; the corpus
 roll-up counts queries exhibiting each category (the pinned mismatch budget).
+Two roll-up lines are printed: `CATEGORIES:` is that raw per-category query
+count, and `CATEGORIES-EXCL-MATCH:` is the same tally with every MATCH query
+dropped -- the `blocked-excluding-matches` figure AGENT.md's plan-parity
+harness requires. They differ because a MATCH can carry a category tag (a
+verdict-neutral `rendering` tag is the usual case; TPC-H Q13 is the witness),
+so the raw count overstates how many queries a category blocks. Both lines
+carry every category in spec order, so the raw line stays byte-compatible for
+existing parsers.
 
 Declared normalisation policy (applied before comparison, printed with
 --verbose and summarised in the roll-up):
@@ -1163,11 +1171,27 @@ def run_corpus(goopg_path, pg_path):
 def print_report(results, verbose=False):
     counts = {v: 0 for v in VERDICTS}
     catcounts = {c: 0 for c in CATEGORIES}
+    # Same tally with MATCH queries excluded, and with NOTHING else excluded.
+    # A MATCH can still carry a category tag (a verdict-neutral `rendering`
+    # difference is the common case), so the raw CATEGORIES roll-up counts
+    # queries that are in fact already matching PG and overstates how many
+    # queries a category actually blocks. AGENT.md's plan-parity harness asks
+    # every M0137-M0143 report for `blocked-excluding-matches`; this is the
+    # line that supplies it.
+    #
+    # Tags on MISSING-NODE / UNPARSED / ERROR / TIMEOUT queries are kept on
+    # purpose. Those are a separate over-count source -- the query is blocked
+    # by the capture, not by the category -- but excluding them here would
+    # hide real blockage behind a broken capture, so this line addresses the
+    # MATCH source only. Judge capture health from the VERDICTS line instead.
+    catcounts_excl = {c: 0 for c in CATEGORIES}
     for key in sorted(results):
         verdict, cats, divs, gest, pest, notes, unknowns = results[key]
         counts[verdict] += 1
         for c in cats:
             catcounts[c] += 1
+            if verdict != "MATCH":
+                catcounts_excl[c] += 1
         print("%s %s [%s] estimates(goopg %s | pg %s)" % (
             key, verdict, ",".join(sorted(cats, key=CATEGORIES.index)),
             fmt_est(gest), fmt_est(pest)))
@@ -1184,11 +1208,13 @@ def print_report(results, verbose=False):
                     for v in VERDICTS)))
     print("CATEGORIES: %s" % " ".join("%s=%d" % (c, catcounts[c])
                                       for c in CATEGORIES))
+    print("CATEGORIES-EXCL-MATCH: %s" % " ".join(
+        "%s=%d" % (c, catcounts_excl[c]) for c in CATEGORIES))
     print("NORMALISATION: N1 estimates-to-side-column, N2 strip-PG-Hash, "
           "N3 drop-true-filter, N4 alias/suffix-canonicalisation, "
           "N5 cast/operator-rendering, N6 qual/key-signatures, "
           "N7 right-join-canonicalisation")
-    return counts, catcounts
+    return counts, catcounts, catcounts_excl
 
 
 # ---------------------------------------------------------------- self-test
