@@ -989,6 +989,26 @@ gate unciteable would otherwise repeat here:
 | TPC-H | `./bin/estimate-audit -plan-only` per `m0137-0003-baseline-capture-procedure.md` (**not** `capture-tpch.sh` — empty-stats trap) | `scripts/pg-plan-parity-diff.py`, read `MATCH` count and `CATEGORIES-EXCL-MATCH:` |
 | TPC-DS | `scripts/capture-tpcds.sh` against goopg `:65437` and PG `:65438` | same |
 
+**The estimate-accuracy instrument — `make ea-ratchet`, a third table, not a
+substitute for either above.** Neither table above can see estimate quality:
+`pg-plan-parity-diff.py` normalises `rows=` out entirely (K50), and the values
+gates check result correctness, not cardinality error. `make ea-ratchet`
+(`scripts/estimate-parity-gate.sh`, C-20a) is the only instrument that scores
+goopg's `EXPLAIN ANALYZE` estimate against its own actual row count, PG-relative,
+over TPC-DS SF0.25 — the corpus Q2 ("reproduce PG's estimates") and M0138/M0142
+estimator work should consult before and after a statistics/selectivity change.
+It is **not** required by any task in this group by default; cite it explicitly
+when a task's claim is about estimate accuracy rather than plan shape.
+`EA_CAPTURE=<file> make ea-ratchet` re-scores an existing capture with no
+server. **Re-pin the baseline (`make ea-ratchet-repin`) whenever the underlying
+corpus changes** — M0137-0018 found the 2026-09-07 baseline had silently gone
+stale across the SF0.5→SF0.25 dev-gate migration (`e2a50de40`, 2026-09-11): the
+goopg-side data *and* the `bench/tpcds/plans-pg` PG fixtures moved together, but
+`ea-baseline.txt` did not, so every ratchet run between the two dates was
+comparing finding identities across two different corpus scales. Current
+baseline: `analysis/planner-refactor-take3/c20a-estimator-census-20260915/`
+(140 findings, commit `4c5c13905`).
+
 
 **The values gates, by script name** (the earlier wording said "TPC-H digest"
 without naming a script, and every implementation task silently substituted a

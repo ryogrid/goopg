@@ -40,7 +40,7 @@ EA_OUT="${EA_OUT:-${REPO_ROOT}/tmp/c20a}"
 EA_CG_UNIT="${EA_CG_UNIT:-goopg-ea-ratchet}"
 EA_QDIR="${EA_QDIR:-${TPCDS_DATA_DIR}/queries}"
 EA_PGDIR="${EA_PGDIR:-${REPO_ROOT}/bench/tpcds/plans-pg}"
-EA_BASELINE="${EA_BASELINE:-${REPO_ROOT}/analysis/planner-refactor-take3/c20a-estimator-census-20260907/ea-baseline.txt}"
+EA_BASELINE="${EA_BASELINE:-${REPO_ROOT}/analysis/planner-refactor-take3/c20a-estimator-census-20260915/ea-baseline.txt}"
 EA_TIMEOUT="${EA_TIMEOUT:-300}"
 EA_NQ="${EA_NQ:-99}"
 # The planner is BLIND without an ANALYZE, and a blind planner would make

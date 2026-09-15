@@ -68,7 +68,7 @@ help:
 	@echo "  make pgbench-compare-report Generate markdown report from latest pgbench results."
 	@echo "  make race-gate          Run concurrency-critical packages under -race (Go data race detector)."
 	@echo "  make plan-gate          Diff EXPLAIN plans against latest baseline; FAILS when unavailable (strict)."
-	@echo "  make ea-ratchet         Estimate-accuracy parity ratchet vs PG 18.3 over TPC-DS SF0.5 (~1h)."
+	@echo "  make ea-ratchet         Estimate-accuracy parity ratchet vs PG 18.3 over TPC-DS SF0.25 (~10min)."
 	@echo "  make parity-dashboard   Generate docs/parity-dashboard.md (GUC/SQLSTATE/catalog parity vs PG 18.3)."
 	@echo
 	@echo "  scripts/pg-oracle-diff.sh   Run SQL against goopg AND vanilla PG 18.3, diff output."
@@ -603,15 +603,18 @@ nightly-batch:
 # it cannot silently not-run again.
 #
 # It measures goopg's EXPLAIN ANALYZE estimate against its own actual
-# row count over the TPC-DS SF0.5 corpus, at base-relation AND joinrel
+# row count over the TPC-DS SF0.25 corpus (migrated from SF0.5 by
+# e2a50de40, 2026-09-11 — M0137-0018 found the comments here and the
+# pinned baseline had not followed), at base-relation AND joinrel
 # granularity, and fails a node only when goopg is materially worse
 # than PostgreSQL 18.3 on the same relation set (bench/tpcds/plans-pg).
 # That PG-relative bar is the only one that passes Q47 — where PG also
 # emits rows=1 — and fails Q99's 8007x.
 #
-# Runs on its own clone and its own port; it never touches the SF0.5
-# gate's cluster on 65437.  ~1 h for a full capture.  To re-score a
-# capture without a server:  EA_CAPTURE=<file> make ea-ratchet
+# Runs on its own clone and its own port; it never touches the SF0.25
+# gate's cluster on 65437.  ~10 min for a full capture (SF0.5's old
+# ~1h estimate predates the migration).  To re-score a capture without
+# a server:  EA_CAPTURE=<file> make ea-ratchet
 # ---------------------------------------------------------------
 ea-ratchet:
 	@bash "$(REPO_ROOT)/scripts/estimate-parity-gate.sh"

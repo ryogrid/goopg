@@ -1031,20 +1031,23 @@ before/after proving the defect it closes.
   NOT attempt to close any divergence — follow-up is **M0137-0019** below,
   per the completion rule's two-artefact requirement (also
   `.ralph/deferral_ledger.md` row `m0137-0017-parallel-mode-divergence`).
-- [ ] **M0137-0018 — bring `make ea-ratchet` into this group's gate set** — the
-  ratchet exists and runs (`Makefile:616` -> `scripts/estimate-parity-gate.sh`,
-  landed by C-20a `d0b4f96e4`: TPC-DS SF0.5 `EXPLAIN ANALYZE`, relation-set
-  keying so base-rel *and* joinrel granularity come from one keying, PG-relative
-  bar, first run 99/99 rc=0, 844 nodes scored, 178 findings pinned). What is
-  missing is not the instrument but its **standing here**: no M0137–M0143 task
-  cites it, the harness's values-gate table does not name it, and its pinned
-  findings have not been re-scored since 2026-09-07. Deliverable: re-score at
-  HEAD (`EA_CAPTURE=<file> make ea-ratchet` needs no server), record the
-  finding-identity delta against the pinned set, and either add it to the
-  harness's declared gate table or file a ledger row saying why it does not
-  belong there. **Do not rebuild it** — the row `take3-ea-ratchet-never-ran`
-  that says it has never run is superseded by the `resolved` row nine lines
-  below it (`.ralph/deferral_ledger.md:2121` then `:2134`); read the later row.
+- [x] **M0137-0018 — bring `make ea-ratchet` into this group's gate set** —
+  **DONE 2026-09-15**, design doc
+  `docs/design/0100-0149/m0137-0018-ea-ratchet-rescore-and-harness-standing.md`.
+  Re-scored at HEAD (`4c5c13905`): 99/99 clean capture, `FINDINGS: 140` vs the
+  2026-09-07 baseline's 178 (99 FIXED, 61 NEW, `EA-RATCHET: FAIL`). Tracing the
+  delta before trusting it as a regression signal found it contaminated: the
+  SF0.5->SF0.25 dev-gate migration (`e2a50de40`, 2026-09-11) moved the goopg
+  corpus and every PG plan fixture but never re-pinned `ea-baseline.txt`, so
+  every ratchet run since has compared across two corpus scales. Resolved by
+  re-pinning a fresh, scale-consistent baseline
+  (`analysis/planner-refactor-take3/c20a-estimator-census-20260915/`, 140
+  findings) and repointing `scripts/estimate-parity-gate.sh`'s `EA_BASELINE`
+  default at it; also fixed three stale `SF0.5`/`~1h` mentions in `Makefile`.
+  Added `make ea-ratchet` to `AGENT.md`'s harness measurement section as a
+  third table (distinct from values-gates and plan-parity capture/score).
+  Ledger row `m0137-0018-ea-ratchet-stale-baseline` (resolved). No production
+  planner/executor/catalog code touched.
 - [ ] **M0137-0019 — triage the 16 parallel-mode `parallelism`-category
   divergences M0137-0017 surfaced** — that task built the first-ever
   parallel-mode PG baseline and measured `parallelism=16/22`,
