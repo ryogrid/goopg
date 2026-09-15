@@ -2997,7 +2997,7 @@ cross-layer programme that has never been scoped.
   milestone's own precedent; do not attempt a DP-search reordering fix
   blind (K50: any structural reordering can flip candidates already
   matching PG elsewhere in the corpus).
-- [ ] **M0142-0016 — fix `estimateLateralIndexJoin`/`estimateNLIndexJoin`'s
+- [x] **M0142-0016 — fix `estimateLateralIndexJoin`/`estimateNLIndexJoin`'s
   plain-INNER branches to apply residual selectivity** — filed by
   M0142-0013's instrumented finding. Both twins (`cardinality.go:382-396`
   and `:241-245`) return the outer row count completely unconditionally for
@@ -3043,6 +3043,51 @@ cross-layer programme that has never been scoped.
   own selectivity (via `clauseSelectivity` or equivalent) in both functions'
   SEMI/ANTI *and* now-justified INNER arms, watching Q7/Q8/Q21 for TPC-H
   plan-shape movement per the recon's own risk note.**
+  **UPDATE 2026-09-16 (M0142-0016b, DONE, LANDED): implemented exactly as
+  scoped — new `probeResidualCond` helper reads `Cond` off
+  `*IndexScan`/`*IndexOnlyScan`/`*BitmapHeapScan`; both functions' plain-INNER
+  arms (gated to `j.Type == JoinTypeInner` specifically — LEFT is excluded and
+  stays on the unconditional `return l`, since a LEFT join emits one
+  null-extended row per failed probe regardless of the residual) now scale by
+  `clauseSelectivity(cond, probe)`. Values clean (`tpch-spotcheck.sh` PASS,
+  TPC-DS SF0.25 sweep `MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0`). Shape
+  clean: TPC-H before/after A/B `shapediff=0/22` (stats-epoch MATCH), TPC-DS
+  SF0.25 `changed=0/99`, TPC-H after-vs-PG `match=8/22` (floor 6, the Q7/Q8/Q21
+  DP-tie-flip risk the recon flagged did not materialise). `make ea-ratchet`
+  went 95→110 findings (FAIL): 2 FIXED (Q16, Q95 — the task's own witness) but
+  17 NEW across Q33/Q54/Q56, traced to ground truth and NOT treated as a
+  blocker — see `docs/design/0100-0149/m0142-0016b-implementation-and-ea-ratchet-analysis.md`
+  for the full read (all 17 are `UNMATCHED-IN-PG`, so the PG-relative bar has
+  no floor to check against; the traced Q54 case is the independence-assumption
+  marginal-selectivity product applied correctly to real, non-default
+  statistics — the same formula class PG's own planner would apply in an
+  analogous shape, which is the milestone's own binding Q2 answer). Follow-up
+  filed as M0142-0016c below for the open PG-forced-plan-comparator
+  question.**
+- [ ] **M0142-0016c — does PG qerr-match the M0142-0016b `Q33`/`Q54`/`Q56`
+  shape if forced into an analogous parameterized-probe-with-residual plan,
+  and should the resulting cost signal move those queries' plan choice?** —
+  filed by M0142-0016b's own ea-ratchet read. M0142-0016b's 17 new `ea-ratchet`
+  findings (all `UNMATCHED-IN-PG`) were read as "goopg now reproduces a
+  PG-analogous estimation weakness, not a novel defect" on the strength of one
+  traced example (Q54's `my_customers` Nested Loop, `rows=1` vs `actual=121`,
+  traced to a correct independence-assumption product over real `date_dim`
+  stats) — but that reading was never checked against PG's OWN number for the
+  same shape, because PG does not choose this shape for these three queries
+  and so `pg-plan-parity-diff.py`/`ea-ratchet` have no comparator node to read.
+  Resume point: force an analogous plan out of PG for one of the three
+  (`join_collapse_limit`/`enable_hashjoin=off`/similar knobs, or hand-build the
+  equivalent query fragment) and compare its residual-clause row estimate
+  against goopg's — confirms or refutes the "PG would do the same" claim
+  directly instead of by architectural analogy. If confirmed, no further
+  action needed (the milestone's Q2 already licenses this). If refuted (PG's
+  actual formula differs enough to land closer to truth), M0142-0016b's read
+  should be revisited and `clauseSelectivity`'s treatment of a probe's `Cond`
+  may need the same kind of correlation-aware handling PG itself has that
+  goopg does not yet port. Separately, check whether costing this same
+  narrowed row estimate (not just displaying it) would move the DP search away
+  from the NLI shape entirely for `Q33`/`Q54`/`Q56` — unexercised this loop
+  since none of the three queries' plan shape moved.
 - [x] **M0142-0016a — scoping recon: measure M0142-0016's blast radius before
   implementing it** — filed by this loop from M0142-0016's own K50 sizing
   instruction (mirrors the M0142-0012a precedent). **DONE 2026-09-15, recon

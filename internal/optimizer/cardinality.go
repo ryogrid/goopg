@@ -238,8 +238,39 @@ func estimateSetOp(s *SetOp) int64 {
 // unchanged (LEFT by null-extension). SEMI/ANTI narrow that by match
 // fraction instead — see the SEMI/ANTI arm below and
 // m0137-0013-nli-semi-anti-match-fraction-gap.
+// probeResidualCond returns the residual filter PostgreSQL's `Filter:` line
+// carries alongside a parameterized index/bitmap probe node's `Index Cond:`/
+// `Recheck Cond:` — `IndexScan.Cond`, `IndexOnlyScan.Cond`,
+// `BitmapHeapScan.Cond` (plan.go) — or nil when `n` is not one of those or
+// carries no residual. Its ColumnRefs are leaf-local (the scan's own output
+// coordinates), the same space a `*Filter` wrapping the same scan would use,
+// so a caller scores it with `clauseSelectivity(cond, n)` exactly as
+// `filterSelectivity` scores `f.Predicate` against `f.Child` (:165).
+func probeResidualCond(n Node) Expr {
+	switch x := n.(type) {
+	case *IndexScan:
+		return x.Cond
+	case *IndexOnlyScan:
+		return x.Cond
+	case *BitmapHeapScan:
+		return x.Cond
+	}
+	return nil
+}
+
 func estimateNLIndexJoin(j *NestedLoopIndexJoin) int64 {
 	l := EstimateRows(j.Outer)
+	if j.Type == JoinTypeInner {
+		// M0142-0016: the probe's own residual (PG's inner-`Filter:` line,
+		// lowered onto the leaf as `Cond` — see `probeResidualCond`) narrows
+		// how many outer rows find a match, exactly like a `*Filter` wrapping
+		// the same scan would. LEFT stays unconditional `return l` below: a
+		// LEFT join outputs one null-extended row for every outer row that
+		// fails the probe, so a residual there does not shrink the count.
+		if cond := probeResidualCond(j.Inner); cond != nil {
+			return scaleByFloat(l, clauseSelectivity(cond, j.Inner))
+		}
+	}
 	if j.Type != JoinTypeSemi && j.Type != JoinTypeAnti {
 		return l
 	}
@@ -381,6 +412,15 @@ func isLateralIndexProbe(n Node) bool {
 // wrapper is needed the way estimateNLIndexJoin builds one.
 func estimateLateralIndexJoin(j *Join) int64 {
 	l := EstimateRows(j.Left)
+	if j.Type == JoinTypeInner {
+		// M0142-0016: see estimateNLIndexJoin's twin comment — the probe's
+		// own residual (`Cond`, leaf-local coords) narrows the match count
+		// for a plain INNER join exactly as a `*Filter` wrapping the same
+		// scan would. LEFT is excluded for the same reason as the twin.
+		if cond := probeResidualCond(j.Right); cond != nil {
+			return scaleByFloat(l, clauseSelectivity(cond, j.Right))
+		}
+	}
 	if j.Type != JoinTypeSemi && j.Type != JoinTypeAnti {
 		return l
 	}
