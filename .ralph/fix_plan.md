@@ -2639,11 +2639,32 @@ cross-layer programme that has never been scoped.
   `Nested Loop`+`Memoize`+`Index Scan using date_dim_pkey` — see
   `docs/design/0100-0149/m0142-0010-join-level-gap-is-memoize-shape-not-cardinality-bug.md`
   for the full trace.
-- [ ] **M0142-0006 — apply `semiJoinMatchFraction` in `estimateNLIndexJoin`** —
+- [x] **M0142-0006 — apply `semiJoinMatchFraction` in `estimateNLIndexJoin`** —
   `estimateNLIndexJoin` (`cardinality.go:239-241`) returns `EstimateRows(j.Outer)` for
   SEMI/ANTI, while its sibling `estimateJoin` (`:608-625`) applies the match
   fraction. Textbook `pattern_sibling_paths_must_agree` defect; the ledger says
   mirror lines 621-628 at `:240`. Ledger: `m0137-0013-nli-semi-anti-match-fraction-gap`.
+  **DONE 2026-09-15, full writeup in
+  `docs/design/0100-0149/m0142-0006-nli-semi-anti-match-fraction.md`.** The
+  ledger's "mirror lines 621-628" framing does not literally work: an NLI's
+  `Predicate` is residual-only (the equi-clause is stripped into
+  `Inner.Key`/`Inner.Keys` at `createplannl.go:418-422`), so a synthetic-`Join`
+  wrapper reading `Predicate` finds zero equi-pairs and is a silent no-op on
+  the common fully-bound probe — caught by hand-building a SEMI-NLI fixture
+  before committing to that approach (no pre-existing test exercised NLI
+  SEMI/ANTI narrowing). Fix: new `nliSemiMatchFraction` sources the key term
+  from `Inner.Key`/`Inner.Keys` instead, resolving both sides via the
+  existing generic `resolveBaseColumn` and feeding `eqjoinselSemiCore` (same
+  core formula/`ResolvedNDistinct`/unique-index-override/`innerRows`-clamp as
+  the `*Join` arm's `semiPairMatchFraction`, without its merged-coordinate
+  assumption, which does not hold for NLI's asymmetric Outer/Inner shape).
+  New test `TestEstimateRowsNLIndexJoinSemiScalesByMatchFraction` pins SEMI
+  1000→100 / ANTI 1000→900. Gates: `go build ./...` clean; `go test
+  ./internal/optimizer/...` PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2,
+  Q13=34); `scripts/tpcds-sf025-regression.sh sweep` PASS=96 MISMATCH=0,
+  plan-shape `same=99 changed=0`; `make ea-ratchet` 112→112 unchanged (no
+  query in the current SF0.25 corpus has its plan choice gated by this
+  estimate). Does not touch M0142-0005 (orthogonal plan-shape-selection gap).
 - [ ] **M0142-0007 — re-measure the `corr = 0` index-pricing fallback (B10)** —
   `indexCorrelationFor` (`costindex.go:479-495`) returns 0 when the leading
   column has no correlation slot, pricing **every** such index scan at

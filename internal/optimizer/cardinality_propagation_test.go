@@ -99,6 +99,39 @@ func TestEstimateRowsNLIndexJoinCarriesOuter(t *testing.T) {
 	}
 }
 
+// TestEstimateRowsNLIndexJoinSemiScalesByMatchFraction is M0142-0006: a
+// SEMI/ANTI NestedLoopIndexJoin used to return EstimateRows(Outer)
+// unconditionally (the INNER/LEFT formula, no narrowing at all), the
+// NLI-shaped twin of the l·r/nd bug TestEstimateJoinSemiScalesOuterByMatchFraction
+// pins for hash/merge *Join. Same inputs (nd1=1000, nd2=100 -> sel=0.1 of
+// the outer's 1000 rows), but wired the NLI way: the equi-condition lives
+// in Inner.Key (bound to Index.Columns), not in Predicate — a synthetic
+// Join wrapper reading Predicate (the naive "mirror the *Join arm" fix)
+// would find zero equi-pairs and stay a no-op, which is exactly the trap
+// this test guards against.
+func TestEstimateRowsNLIndexJoinSemiScalesByMatchFraction(t *testing.T) {
+	outer := &SeqScan{Table: statsTable("o", 1000, 1000)}
+	innerTbl := statsTable("i", 500, 100)
+	inner := &IndexScan{
+		Table: innerTbl,
+		Index: &catalog.Index{Table: innerTbl, Columns: []string{"c"}},
+		Key:   &ColumnRef{Index: 0}, // outer.c, bound to the index's leading (only) column
+	}
+	nli := &NestedLoopIndexJoin{Type: JoinTypeSemi, Outer: outer, Inner: inner}
+	if got, want := EstimateRows(nli), int64(100); got != want {
+		t.Fatalf("semi NLI estimate = %d, want %d (outer 1000 x nd2/nd1 = 0.1)", got, want)
+	}
+	if got := EstimateRows(nli); got >= EstimateRows(outer) {
+		t.Fatalf("semi NLI estimate %d did not narrow below outer input %d (match-fraction term is a no-op)",
+			got, EstimateRows(outer))
+	}
+
+	anti := &NestedLoopIndexJoin{Type: JoinTypeAnti, Outer: outer, Inner: inner}
+	if got, want := EstimateRows(anti), int64(900); got != want {
+		t.Fatalf("anti NLI estimate = %d, want %d (outer 1000 x (1-0.1))", got, want)
+	}
+}
+
 // TestJoinKeyNDistinctThroughProject pins the C5 selectivity fix: an
 // equi-join whose input is Project-wrapped must still resolve the key's
 // NDistinct instead of falling back to defaultEqSelectivity (Q10's

@@ -234,10 +234,124 @@ func estimateSetOp(s *SetOp) int64 {
 
 // estimateNLIndexJoin: the inner side is an equality index probe,
 // which this file already estimates at 1 row per call site
-// (*IndexScan above), so the join carries the outer's cardinality.
-// LEFT keeps the same count by null-extension.
+// (*IndexScan above), so INNER/LEFT carry the outer's cardinality
+// unchanged (LEFT by null-extension). SEMI/ANTI narrow that by match
+// fraction instead — see the SEMI/ANTI arm below and
+// m0137-0013-nli-semi-anti-match-fraction-gap.
 func estimateNLIndexJoin(j *NestedLoopIndexJoin) int64 {
-	return EstimateRows(j.Outer)
+	l := EstimateRows(j.Outer)
+	if j.Type != JoinTypeSemi && j.Type != JoinTypeAnti {
+		return l
+	}
+	// SEMI/ANTI: the output is a subset of the OUTER, sized by match
+	// fraction — mirrors estimateJoin's SEMI/ANTI arm (:622-631) formula-
+	// for-formula (eqjoinselSemiCore), but the KEY term is sourced from the
+	// probe's own representation (Inner.Key/Keys bound to Index.Columns),
+	// not from joinEquiPairs(Predicate): createplannl.go:418-422 strips
+	// every index-clause column into is.Key/is.Keys before building
+	// Predicate from the LEFTOVER residual (p.Residual), so for the common
+	// fully-bound probe the equi-condition this join is keyed on is never
+	// IN Predicate — joinEquiPairs would find zero pairs there and this arm
+	// would be a silent no-op. Only the genuine residual (if any) is priced
+	// through joinResidualSelectivity below, same as the *Join arm.
+	sel := nliSemiMatchFraction(j)
+	adj := &Join{Left: j.Outer, Right: j.Inner, Predicate: j.Predicate}
+	sel *= joinResidualSelectivity(adj)
+	if sel > 1 {
+		sel = 1
+	}
+	if j.Type == JoinTypeAnti {
+		sel = 1 - sel
+	}
+	return scaleByFloat(l, sel)
+}
+
+// nliSemiMatchFraction is estimateNLIndexJoin's SEMI/ANTI key term: the
+// product, over every index column the probe binds, of
+// eqjoinselSemiCore's per-key match fraction. Both sides resolve through
+// resolveBaseColumn — the outer key expression against j.Outer (whatever
+// wrapper chain sits above the base relation), the bound index column
+// against j.Inner directly (an *IndexScan/*IndexOnlyScan is itself a
+// resolveBaseColumn leaf) — so both get the SAME ndistinct normalisation
+// (ResolvedNDistinct's negative-fraction handling, the unique-index
+// override) the *Join arm's siblings (keyColumnStats/rightExprStats) use,
+// without borrowing their merged-left‖right coordinate arithmetic, which
+// does not apply to an NLI's asymmetric Outer/Inner shape.
+func nliSemiMatchFraction(j *NestedLoopIndexJoin) float64 {
+	idx, key, keys, ok := nliInnerProbe(j.Inner)
+	if !ok || idx == nil || len(idx.Columns) == 0 {
+		return 1.0
+	}
+	var bound []Expr
+	switch {
+	case len(keys) > 0:
+		if len(keys) > len(idx.Columns) {
+			return 1.0
+		}
+		bound = keys
+	case key != nil:
+		bound = []Expr{key}
+	default:
+		return 1.0
+	}
+	var tbl *catalog.Table
+	switch in := j.Inner.(type) {
+	case *IndexScan:
+		tbl = in.Table
+	case *IndexOnlyScan:
+		tbl = in.Table
+	}
+	if tbl == nil {
+		return 1.0
+	}
+	innerRows := tableRows(tbl)
+	sel := 1.0
+	for i, outerKey := range bound {
+		cr, isCol := outerKey.(*ColumnRef)
+		if !isCol {
+			continue
+		}
+		outerRef, outerOK := resolveBaseColumn(cr.Index, j.Outer)
+		colPos := -1
+		for c := range tbl.Columns {
+			if tbl.Columns[c].Name == idx.Columns[i] {
+				colPos = c
+				break
+			}
+		}
+		if colPos < 0 {
+			continue
+		}
+		innerRef, innerOK := resolveBaseColumn(colPos, j.Inner)
+		var st1, st2 *catalog.ColumnStats
+		nd1, nd2 := 0.0, 0.0
+		nullfrac1 := 0.0
+		if outerOK {
+			st1 = outerRef.stats
+			nd1 = float64(outerRef.ndistinct)
+			if st1 != nil {
+				nullfrac1 = st1.NullFrac
+			}
+		}
+		if innerOK {
+			st2 = innerRef.stats
+			nd2 = float64(innerRef.ndistinct)
+		}
+		nd1Known := nd1 > 0
+		nd2Known := nd2 > 0
+		if !nd2Known {
+			nd2 = defaultNumDistinct
+		}
+		// Same rel-rows clamp on nd2 as semiPairMatchFraction (ledger
+		// C-05 plan-node-semi-nd2-rel-rows), sourced here from the
+		// indexed table's own row count rather than a RelOptInfo.Rows.
+		if innerRows > 0 && nd2 >= float64(innerRows) {
+			nd2 = float64(innerRows)
+			nd2Known = true
+		}
+		sel *= eqjoinselSemiCore(st1, st2, nd1, nd2, nd1Known, nd2Known, nullfrac1)
+	}
+	return sel
 }
 
 // `estimateMultiHashJoin` was deleted with the node by M0127-P6.2. It
