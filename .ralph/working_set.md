@@ -1,88 +1,91 @@
-Task: nightly triage (M-NIGHTLY filing, unconditional) + M0142-0003c —
-re-verify the enumeration-order/tie-break premise for Q9's L6 divergence
-before attempting any DP-search reordering. **Both DONE and committed this
-loop.** Measurement-only for 0003c (two read-only `EXPLAIN`s against the
-always-on shared PG `:65432` TPC-H reference cluster; no goopg server run, no
-production code changed).
+Task: M0142-0003d — recon whether the earlier framing ("which cost term
+underprices goopg's index-driven NLI over lineitem") was even the right
+question for Q9's L6 divergence. **DONE and committed this loop
+(`26f40b7ba`).** Measurement-only (private throwaway clone of TPC-H data +
+scratch server; the shared `:65433` bench cluster and `:65432` PG oracle were
+read-only touched or never touched at all; no production code changed).
 
-Files: `.ralph/fix_plan.md` (nightly run `20260916-035206`'s 13 AI-ids filed —
-12 appended to existing open M-NIGHTLY bullets, 1 new bullet for
-`TestPort_IsolationSuite`; M0142-0003c entry rewritten `[x]` with the
-refutation finding, new `M0142-0003d` follow-up filed `[ ]`).
-`.ralph/deferral_ledger.md` (new `m0142-0003c` row → resume point M0142-0003d).
-`docs/design/0100-0149/m0142-0003c-q9-real-pg-cost-gap-not-a-tie.md` (new).
-`docs/design/README.md` (indexed). `analysis/m0142/m0142-0003c-pg-{default,
-serial-default,forced-goopg-order}.txt` (new, committed evidence).
+Files: `.ralph/fix_plan.md` (M0142-0003d rewritten `[x]` with the finding;
+new M0142-0003e filed `[ ]`). `.ralph/deferral_ledger.md` (new m0142-0003d
+row). `docs/design/0100-0149/m0142-0003d-q9-row-estimate-collapse-not-cost-formula.md`
+(new). `docs/design/README.md` (indexed). No `internal/` files touched.
 
-Key symbols: `internal/optimizer/joinsearchlevel.go` (`joinSearchOneLevel`,
-confirmed a faithful line-cited port of PG's `join_search_one_level` —
-NOT touched, just read); `internal/optimizer/joinsearch.go`
-(`buildInitialRels`, confirmed FROM-order initial rels). No goopg code edited
-this loop. PG side: real PG 18.3 on the shared `:65432` TPC-H reference,
-`join_collapse_limit=1`+`from_collapse_limit=1`+explicit left-deep `JOIN`
-(same forcing method M0142-0015 used for TPC-DS Q45).
+Key symbols (read, not edited): `internal/optimizer/joinkeyproof.go`
+(`superkeyJoinEstimate`) and `internal/optimizer/joinrelsize.go`
+(`superkeyJoinSelectivity`) — the PG-shaped-DP arm's existing FK/superkey
+no-fan-out mechanism, whose own header names Q9's exact
+`l_partkey=ps_partkey AND l_suppkey=ps_suppkey` clause pair as its motivating
+case. `internal/optimizer/cardinality.go`'s `estimateJoin` — the production
+twin, not yet compared side by side.
 
-Findings this loop: M0142-0003c was filed on the premise (from -0003b's
-Verdict) that Q9's L6 tie is an enumeration-order question — reordering
-goopg's pair-visitation to match PG's `join_search_one_level` might flip
-which of two exactly-tied candidates wins. **That premise is refuted.**
-(1) goopg's enumeration STRUCTURE already matches PG's exactly (verified by
-reading the code, not just asserting it — phases 1/2/3, dedup offsets,
-FROM-order initial rels, all cited against `joinrels.c` line numbers, plus an
-existing pair-count completeness test). (2) Forcing real PG into goopg's own
-chosen Q9 order costs **336207.55 vs PG's own default 204932.03 — a 64% gap,
-not a near-tie.** Real PG needs no tie-break; it wins outright in its own
-cost model. The exact float64 tie M0142-0003b measured is a property of
-**goopg's** cost model alone. (3) This means Q9 and TPC-DS Q45 (M0142-0015)
-are NOT two witnesses of the same phenomenon, contrary to this task's own
-filing note — Q45 is a genuine both-engines near-tie (unaffected, stays
-tie-break-class); Q9 is a real costing-term divergence goopg's model hides
-behind a coincidental exact tie, most likely centered on how goopg prices an
-index-driven Nested Loop against an already-shrunk composite relative to a
-hash join that forces a full base-table scan of `lineitem` (real PG's default
-plan discounts the index route by ~130000 cost units over the hash
-alternative on this exact join; goopg's model prices the analogous
-`nestloop.index` candidate only ~3-9 units above its own `join.hash` winner).
+Findings this loop (supersedes -0003c's causal story, does NOT reopen its
+Finding 1): (1) -0003c's "forced-goopg-order" PG measurement
+(336207.55 vs 204932.03) forced PG into a FROM-clause literal left-deep
+chain that was never actually goopg's own winning Q9 shape — verified via a
+fresh unforced `EXPLAIN` against a private clone: goopg's real winner is an
+all-index-nested-loop chain (`part⋈partsupp` hash, then
+`lineitem`/`supplier`/`orders` each NL-indexed via their PK/FK indexes,
+`nation` hashed in last), never scanning `lineitem` or `orders` in full.
+Forcing PG into *that* actual shape with `enable_hashjoin=off` prices it at
+372230.53 — same order of magnitude, different mechanism (PG's cost model
+penalizes NL-indexing through `orders`'s 1.5M rows) — so -0003c's 64% gap
+survives as a real finding, just mislabeled as to which order was forced.
+(2) **The decisive finding**: goopg's own DPPATH trace shows the row
+estimate for `lineitem ⋈ partsupp` on the composite key is **2406**, ~2500x
+below the true value (~5,999,098 — verified `partsupp_pk` is a genuine
+2-column UNIQUE index on exactly `(ps_partkey, ps_suppkey)` via a live
+`\d partsupp` against the shared bench cluster). Every relset containing
+both relations inherits roughly this floor all the way to the top
+(`{0,1,2,3}` through the full 6-way all read `rows=146`, byte-identical to
+the query's own final output cardinality) — this row-estimate collapse, not
+any hash/NL cost-formula constant, is what makes the all-NL-index chain look
+nearly free. B8 (`indexProbeCostMultiplier`) is NOT implicated by this
+finding. (3) goopg already has purpose-built code for exactly this Q9
+pattern (`joinkeyproof.go`/`joinrelsize.go`'s superkey mechanism,
+M0127-P5.6-f) but it evidently is not preventing the 2500x collapse at
+HEAD for this relid pairing — WHY is not confirmed, deliberately left
+unresolved (recon discipline: don't guess between "wrong arm is live" vs
+"clause-matching precondition fails" without a unit test).
 
-Next step: **M0142-0003d** (filed this loop) — scope which specific cost term
-underprices goopg's index-driven-NLI-over-lineitem route (or overprices the
-hash-with-full-scan alternative). Concrete first move per
-`planner_verify_both_candidates_generated`: confirm goopg's DP search
-actually generates a candidate comparable to PG's
-index-driven-NLI-from-the-shrunk-composite at the right level (don't assume
-it exists just because -0003a saw a `nestloop.index` verdict=dominated line —
-confirm it's driving the SAME composite PG's plan drives), then get its full
-`internal/optimizer/cost_funcs.go` breakdown against PG's
-`cost_nestloop`/`cost_index` (`costsize.c`). Check whether B8
-(`indexProbeCostMultiplier`, left explicitly unsettled by last loop's
-M0142-0005 recon) is the mismatched term — but measure first, don't assume.
-Other still-open M0142/M0141 items as of this loop: **M0142-0005** (large,
-needs its own scoping recon — per-worker Memoize cache), **M0142-0008a/0008b**
-(SEMI/ANTI decorrelation scoping), **M0142-0016c** (Q33/Q54/Q56 shape check),
-**M0141-S2b/S3-S7** (upper-planner ordering, Incremental Sort). None mandated
-over the others by the banner (still item 4).
+Next step: **M0142-0003e** (filed this loop) — write a targeted unit test in
+`internal/optimizer/joinrelsize_test.go` or `cardinality_test.go` (NOT
+another full-query trace) reproducing a bare 2-relation join of `lineitem`
+and `partsupp` on the composite key with a genuine composite UNIQUE index on
+the `partsupp` side, and step through `superkeyJoinSelectivity`/
+`estimateJoin` to see whether either reaches/matches this case. First
+re-confirm which arm (`GOOPG_PGSHAPED_DP` on/off) is actually live by
+default at HEAD — don't assume, per `goopg_arm_scripts_disable_dp_search` in
+memory (an arm script disabling DP search would make a real fix look like a
+no-op). Do NOT edit `joinkeyproof.go`/`joinrelsize.go`/`cardinality.go`
+blind before the unit test pins the exact failure mode. Other still-open
+M0142/M0141 items as of this loop, none mandated over 0003e by the banner
+(still item 4): **M0142-0005** (per-worker Memoize cache, large, needs its
+own scoping recon), **M0142-0008a/0008b** (SEMI/ANTI decorrelation
+scoping), **M0142-0016c** (Q33/Q54/Q56 shape check), **M0141-S2b/S3-S7**
+(upper-planner ordering, Incremental Sort).
 
 Gates run: `git status --porcelain -- internal/` empty before AND after this
-loop's work (no production code touched — confirmed, not assumed). `go build
-./...` clean. `make ralph-state-guard`: same pre-existing stale
-progress-marker inconsistency as the last several loops (status=running vs a
-stale progress=completed marker from a prior loop's clean exit), self-repaired
-to in_progress, then passed clean. Practice-card row-count gate suite not
-required (no production code touched, same reasoning as last loop's
-M0142-0005 recon). Pre-commit pgbench smoke gate: runs at commit time per the
-mandatory-on-every-commit policy.
+loop's work. `go build ./...` clean (built the unmodified HEAD binary to a
+private path for the scratch server; no source edited so no separate build
+check was needed post-work). `make ralph-state-guard`: same pre-existing
+stale progress-marker inconsistency as the last several loops (status=running
+vs a stale progress=completed marker from a prior loop's clean exit),
+self-repaired to in_progress, then passed clean. Pre-commit pgbench smoke
+gate: ran at commit time, PASS (TPC-B ~44 tps, simple-update ~44 tps,
+select-only ~149 tps, 0 failed across all three). Practice-card row-count
+gate suite not required (no production code touched, same reasoning as
+-0003c/-0005/-0008).
 
-In-flight: none. A background Explore-agent research task (PG
-`join_search_one_level` vs goopg DP enumeration order comparison) was launched
-early this loop as a safety hedge against Ralph's headless -p mode risk of
-losing async Agent-tool results at turn end — direct investigation in-session
-answered the core question first (Finding 1/2 above), but the agent's report
-still arrived and turned out to add real value: it surfaced a pre-M0138 round
-(`docs/design/not_ralph/plan_parity_fix_take2/r53-q9-costing-step0/SLICE1.md`,
-2026-09-10) that had already attributed a same-shape L6 cost gap to
-`hashsize.EntryBytes`'s spill-footprint model — folded into the design doc's
-Addendum and M0142-0003d's fix_plan entry as a concrete (but re-verification-
-needed) resume point, not discarded. Nightly CI batch
-(`ci/logs/action-items.md`, run `20260916-035206`, mtime 2026-09-16 04:45):
-all 13 items now filed under M-NIGHTLY. The next loop should check whether a
-newer run has landed before re-checking triage.
+In-flight: none. Private scratch server (`GOOPG_CG_UNIT=m0142-0003d`, port
+5533) stopped cleanly via `goopg stop -D`; port confirmed free. The 2GB data
+clone at `/tmp/m0142-0003d/data` was deleted after use; small evidence files
+(`server.log`, `*.plan`, `*.txt`) kept under `/tmp/m0142-0003d/` per the
+project's existing tmp-evidence convention (referenced from the design doc,
+not committed — `tmp/` is git-ignored and this is outside the repo tree
+entirely so it isn't even in `tmp/`). The shared TPC-H bench cluster
+(`:65433`) was never restarted, stopped, or written to — only a single
+read-only `\d partsupp` / `pg_indexes` query. Nightly CI batch
+(`ci/logs/action-items.md`) mtime unchanged since last loop's triage
+(2026-09-16 04:45) — no new run landed, so triage was correctly skipped this
+loop per the working-set instruction; the next loop should re-check mtime
+before assuming it's still current.
