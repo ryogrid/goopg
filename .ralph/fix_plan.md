@@ -3329,26 +3329,56 @@ cross-layer programme that has never been scoped.
   deleting the rewrites**, which would reproduce the measured regressions
   until the gap is closed. Filed as scoping-recon follow-ups
   **M0142-0008a** and **M0142-0008b** below.
-- [ ] **M0142-0008a — scoping recon: size wiring SEMI/ANTI decorrelation
-  into the DP search's joinrel machinery** — filed by M0142-0008. Q4-class
-  queries never reach `addPath` for their SEMI/ANTI join because
-  `unnestExistsExpr` (`unnest.go:4078`) builds the physical `Join{SEMI,
-  Hash}` node directly on the raw parse tree before any search joinrel
-  exists for it (no `SpecialJoinInfo` → no joinrel → no path → no price).
-  M0139-0005 named this bypass but explicitly declined to size it
-  ("materially larger task, out of this recon's scope"). Concrete next
-  step: read `unnestExistsExpr`'s call site alongside `deconstructFromItem`
-  (`collapse.go:398`, already identified by `take2-P3-01` as lacking a
-  catalog/resolver/binding at the point `SpecialJoinInfo` would need to be
-  built) and `joinsearchlevel.go`'s SEMI/ANTI handling, and produce: (1) a
-  per-query census of which TPC-H/TPC-DS queries hit this exact bypass
-  (Q4 is one instance; likely several EXISTS/IN-decorrelated queries share
-  it), (2) a concrete sizing (is this one slice or does it decompose like
-  M0140-0006 did), (3) the resume point for whichever piece is smallest.
-  Measurement/reading only — no code change — per K50 and the
-  M0142-0012a/M0142-0016a scoping-recon precedent, since this touches the
-  search's joinrel-construction machinery shared by every SEMI/ANTI query
-  in both corpora.
+- [x] **M0142-0008a — scoping recon: size wiring SEMI/ANTI decorrelation
+  into the DP search's joinrel machinery** — filed by M0142-0008. **DONE
+  2026-09-16, recon closed, no code change.** Design doc:
+  `docs/design/0100-0149/m0142-0008a-scoping-recon-semi-anti-decorrelation-census.md`.
+  **Corrects M0142-0008's own framing**: since S5a (`GOOPG_UNNEST_PREDP`,
+  default ON), a correlated `EXISTS`/`NOT EXISTS`'s pulled-up semi/anti join
+  is *pinned* above a DP search that already runs on the subtree below it
+  (`runJoinSearchBelowPinned`, `predp.go`) — the residual gap is narrower
+  than "no search at all": the pinned join itself never gets a joinrel/
+  `SpecialJoinInfo` and so never competes in `addPath` for placement or
+  Hash-vs-NLI algorithm choice. A second, worse shape also exists: a WHERE
+  clause mixing a correlated EXISTS with a co-resident scalar subquery fails
+  `whereEligibleForPreDPUnnest`'s all-or-nothing gate and falls to the
+  legacy post-DP path — a TOTAL bypass, no partial win (TPC-H Q22).
+  **Census**: 8 real corpus queries carry a correlated EXISTS/NOT EXISTS
+  (TPC-H Q4/Q21/Q22; TPC-DS query10/16/35/69/94), 6 of them stacking 2-3
+  pinned semi/anti joins each (TPC-DS's recurring store/web/catalog
+  "channel comparison" idiom) — not a niche gap. All corpus `IN (subquery)`
+  hits are non-correlated (CTE or self-contained bodies), a different
+  mechanism, not a witness here. **PG oracle citation** (`pathnodes.h:3027-3042`
+  `SpecialJoinInfo`, `joinrels.c:350` `join_is_legal`, `prepjointree.c:468`
+  `pull_up_sublinks`) confirms M0139-0005's "materially larger task" call
+  was correct: wiring this needs semi/anti join-order *legality* constraints
+  (`min_lefthand`/`min_righthand`), not just one more `addPath` candidate.
+  **Verdict: do not attempt in one sitting** (K24 precedent, same as S2b-2).
+  Decomposed into:
+  - [ ] **M0142-0008a-1** — design-only: read PG's `join_is_legal`
+    (`joinrels.c:350`) and `SpecialJoinInfo` construction in
+    `pull_up_sublinks`/`deconstruct_jointree` in full, and produce a
+    concrete goopg design (data structure + where it is built + how
+    `joinsearchlevel.go` would consult it). This is the actual K24-style
+    "further scoping pass" — reading code snippets (as this recon did) is
+    not enough to size the implementation.
+  - [ ] **M0142-0008a-2** — implement the `SpecialJoinInfo`-equivalent
+    construction for correlated `EXISTS`/`NOT EXISTS`, gated behind a
+    rollback flag alongside `GOOPG_UNNEST_PREDP`, without yet changing
+    `joinsearchlevel.go`'s enumeration — a landable, unit-testable slice on
+    its own (no plan-shape change expected). Gated on M0142-0008a-1.
+  - [ ] **M0142-0008a-3** — wire `joinsearchlevel.go`'s enumeration to
+    consult the new legality sets and let `addPath`/`addNLIPaths`
+    cost-compare semi/anti placement and algorithm; retire or bypass
+    `runJoinSearchBelowPinned`'s splice-and-reresolve path for the
+    now-natively-searched cases (keep it for Q22's legacy-post-DP class
+    until that is separately addressed). This is the slice that can
+    actually move TPC-DS query10/16/35/69/94 and TPC-H Q4/Q21's plan
+    shapes. Gated on M0142-0008a-2.
+  **Independent, unfiled resume-point hint** (not sized/numbered — noted for
+  whoever picks up S5a's own eligibility gate): relaxing
+  `whereEligibleForPreDPUnnest` to per-sublink granularity would upgrade
+  Q22 out of its total-bypass class on its own, independent of -1..-3.
 - [x] **M0142-0008b — scoping recon: measure the blast radius of widening
   the DP-search gate to filterless INNER/CROSS trees** — filed by
   M0142-0008. `planner.go:1590-94`'s own comment already names the fix
