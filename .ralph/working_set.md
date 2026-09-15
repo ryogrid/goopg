@@ -1,94 +1,79 @@
-Task: M0142-0003e — determine why goopg's existing superkey/FK no-fan-out
-mechanism doesn't fire for the bare `lineitem ⋈ partsupp` composite join.
-**DONE and committed this loop.** Measurement-only (two read-only `psql`
-queries against the shared `:65433` bench cluster and `:65432` PG oracle;
-`go test` runs against existing unit tests; no production code changed, no
-server started/stopped/restarted).
+Task: M0142-0003f — add the missing TPC-H FK constraints to goopg's `:65433`
+bench cluster to restore parity with the PG oracle, then re-measure Q9.
+**DONE and committed this loop, PARTIAL: 11/16 landed, Q9 re-measurement
+still blocked.** Two follow-ups filed: M0142-0003g (the real blocker) and
+M0142-0003h (secondary, untraced).
 
-Files: `.ralph/fix_plan.md` (M0142-0003e rewritten `[x]` with the finding;
-new M0142-0003f filed `[ ]`). `.ralph/deferral_ledger.md` (new m0142-0003e
-row). `docs/design/0100-0149/m0142-0003e-bench-cluster-missing-fk-constraints.md`
-(new). `docs/design/README.md` (indexed). No `internal/` files touched.
+Files: `.ralph/fix_plan.md` (M0142-0003f rewritten `[x]` PARTIAL; new
+M0142-0003g/0003h filed `[ ]`). `.ralph/deferral_ledger.md` (3 new rows for
+m0142-0003f). `docs/design/0100-0149/m0142-0003f-fk-add-blocked-by-unindexed-validation-scan.md`
+(new). `docs/design/README.md` (indexed). No `internal/` files touched —
+this was live DDL against the shared bench cluster + a read-only recon
+subagent trace, not production code.
 
-Key symbols (read, not edited): `internal/optimizer/joinkeyproof.go`'s
-`provableJoinKeys` (the `!k.fromFK` bound-only loop vs the `k.fromFK`
-selectivity-firing loop) and `superkeyJoinEstimate`;
-`internal/optimizer/joinrelsize.go`'s `superkeyJoinSelectivity`;
-`internal/catalog/catalog.go`'s `ForeignKey` struct (fully implemented, not
-a stub); `internal/parser/ast.go:3389` (purpose-built HammerDB-TPC-H FK-shape
-support already exists in the parser).
+Key symbols (read, not edited): `internal/executor/operators_ddl.go:9033`
+(`AlterTableAddForeignKey` dispatch), `:12089`/`:12207`
+(`execAlterTableAddPrimaryKey`/`...UsingIndex`), `:13974`/`:13995`
+(`validateFKConstraintExistingRows(Rel)`); `internal/executor/operators_fk.go:632`
+(`assertParentExists`), `:1318` (`scanRelForFKMatch`).
 
-Findings this loop (settles -0003e, no code change indicated): (1)
-`GOOPG_PGSHAPED_DP` re-confirmed ON by default (`joinsearch.go:76`) — the
-FK/superkey arm is live in production. (2) The exact repro is ALREADY covered
-byte-for-byte by existing tests in `internal/optimizer/joinrelsize_test.go`
-(`TestCalcJoinrelSizeCompositeUniqueRetainsEqualities`,
-`TestCalcJoinrelSizeBareCompositeDefaultsKeepEqualityAndBound`,
-`TestCalcJoinrelSizeFKDividesByParentCount` — all 4 relevant tests PASS at
-HEAD) — same 6,000,000/800,000 row counts, same NDistinct 200000/10000, same
-composite UNIQUE index. They prove `superkeyJoinSelectivity` DOES recognize
-`partsupp_pk` against this clause shape but DELIBERATELY treats a bare
-non-FK UNIQUE index as bound-only evidence (never fires the `1/rawTuples`
-selectivity substitution) — matching PG's own `get_foreign_key_join_selectivity`
-(selfuncs.c), which also requires a declared `pg_constraint` FK row, not
-just a unique index on the referenced side. (3) **The decisive check**: read
--only `pg_constraint`/`\d`/`pg_indexes` queries against BOTH live clusters
-showed goopg's `:65433` TPC-H bench cluster has **zero** FK constraints on
-any table (`lineitem_part_supp_fkidx` is just a plain index despite its
-name), while the `:65432` PG 18.3 oracle has the **full canonical 8-row TPC-H
-FK set** (`lineitem_partsupp_fk`, `lineitem_order_fk`, `partsupp_part_fk`,
-`partsupp_supplier_fk`, `order_customer_fk`, `supplier_nation_fk`,
-`customer_nation_fk`, `nation_region_fk`), added by an untracked manual step
-outside any script in the repo, never mirrored onto goopg's cluster. PG's own
-`EXPLAIN` on the bare join gets `rows=5999098` (essentially exact) via that
-declared FK + `Memoize`+`Index Scan using lineitem_part_supp_fkidx`.
-`grep` across `bench/tpch/*.sh`/`bench/tpch/tcl/build_schema.tcl` for
-`FOREIGN KEY`/`ADD CONSTRAINT`: zero matches — HammerDB's own schema builder
-declares none of these on EITHER side. **Conclusion: this is a bench-cluster
-schema/data-load parity gap, not a planner or cost-model defect.** goopg's FK
-machinery is fully implemented and ready (not the blocker). This also
-reframes -0003c's "real 64% PG-side cost gap": that PG measurement carried
-PG's own FK-informed near-exact row estimate throughout, while the
-goopg-side shape being priced carried the 2500x-collapsed one — the two
-costs were never pricing comparably-sized intermediates, so -0003c's 64%
-figure cannot yet be trusted as a pure cost-formula discrepancy.
+Findings this loop: (1) Adopted goopg's 8 pre-existing unique indexes as
+`PRIMARY KEY`s via `ADD CONSTRAINT ... PRIMARY KEY USING INDEX` — cheap,
+matches PG's constraint names exactly. (2) Added the 3 FKs with tiny parent
+tables (`nation_region_fk`/`customer_nation_fk`/`supplier_nation_fk`) —
+landed, PG-matching, **permanent on the live shared cluster**. (3) A
+`BEGIN;...ROLLBACK;` dry run of all 16 target DDLs, meant to be
+non-destructive, instead hung past a 900s timeout on the 12th statement
+(`partsupp_part_fk`, child `partsupp` 800k / parent `part` 200k); killing
+the client left the first 11 statements **already committed** — the
+intended `ROLLBACK` was never reached (see M0142-0003h). (4) **Decisive
+root cause** (traced by a read-only recon subagent): goopg's FK validation
+is an O(child rows × parent heap-scan distance) unindexed nested-loop —
+`assertParentExists`/`scanRelForFKMatch` never consult the parent's
+existing unique B-tree, only cheap when the parent table is tiny. Confirmed
+infeasible at `partsupp`/`part` scale, let alone `lineitem`'s 6M rows. (5)
+The scan also has **no interrupt-check**: `pg_terminate_backend` on the
+stuck backend (PID 81) returned success but it kept running 15+ seconds
+later with no sign of stopping — contrast PG's own
+`validateForeignKeyConstraint` (`tablecmds.c:13694`), O(child rows) via a
+planner `LEFT JOIN` or an indexed RI-trigger probe, with per-row
+`CHECK_FOR_INTERRUPTS()`. Both gaps folded into one follow-up,
+**M0142-0003g**, since the same function needs touching for either fix.
 
-Next step: **M0142-0003f** (filed this loop) — add the missing 8 FK
-constraints to goopg's `:65433` TPC-H bench cluster (exact names/columns
-captured this loop from the PG oracle's `pg_constraint`) via `ALTER TABLE
-... ADD CONSTRAINT ... FOREIGN KEY ...` (parser support already exists,
-`ast.go:3389`/`ddl.go:10276` — untested at runtime this loop, worth a small
-smoke check first). Land the DDL in `bench/tpch/build_schema_goopg.sh` (or a
-new post-load step) so it survives a `--reset` rebuild rather than being a
-one-off manual `ALTER TABLE` against the live cluster, then re-run the Q9
-`EXPLAIN`/estimate-audit capture from -0003a/-0003d to see whether the
-collapse is gone and whether Q9's plan shape or cost gap actually changes —
-a fresh measurement, not assumed. Also worth a quick corpus-wide
-`pg_constraint` diff between the two clusters before trusting any OTHER
-M0142 "row-estimate collapse" finding's causal story (this same gap could be
-masquerading as an estimator bug elsewhere in M0142-0004a/0004b/0009/0010
-etc.). Other still-open M0142/M0141 items, none mandated over 0003f by the
-banner (still item 4): **M0142-0005** (per-worker Memoize cache, large,
-needs its own scoping recon), **M0142-0008a/0008b** (SEMI/ANTI decorrelation
-scoping), **M0142-0016c** (Q33/Q54/Q56 shape check), **M0141-S2b/S3-S7**
-(upper-planner ordering, Incremental Sort).
+Next step: **M0142-0003g** — index-accelerate `assertParentExists`/
+`scanRelForFKMatch` (probe the parent's existing unique index instead of a
+full heap scan) and add a cancellation check in the per-row loop. Once it
+lands, resume -0003f: add the remaining 5 FKs (`partsupp_part_fk`,
+`partsupp_supplier_fk`, `order_customer_fk`, `lineitem_partsupp_fk`,
+`lineitem_order_fk`), land the DDL in `bench/tpch/build_schema_goopg.sh` (or
+a new post-load step) so it survives `--reset`, then re-run the Q9
+`EXPLAIN`/estimate-audit from -0003a/-0003d — `lineitem_partsupp_fk`
+specifically is what Q9's collapse needs. **M0142-0003h** (smaller, separate
+recon: does DDL under an explicit `BEGIN` actually wait for `COMMIT`/
+`ROLLBACK` on this cluster, or force-commit per-statement?) can be picked up
+independently. Neither is mandated over other M0142/M0141 items by the
+banner (still item 4) — other open items unchanged from last loop's note:
+M0142-0005 (per-worker Memoize cache recon), M0142-0008a/0008b (SEMI/ANTI
+decorrelation scoping, filed 2026-09-16), M0142-0016c (Q33/Q54/Q56 shape
+check), M0141-S2b/S3-S7 (upper-planner ordering, Incremental Sort).
 
-Gates run: `git status --porcelain -- internal/` empty before AND after this
-loop's work (no production code touched). `go test ./internal/optimizer/...
--run '<the 4 relevant tests>'`: all PASS. `make ralph-state-guard`: same
-pre-existing stale progress-marker inconsistency as the last several loops
-(status=running vs a stale progress=completed marker from a prior loop's
-clean exit), self-repaired to in_progress, then passed clean. Pre-commit
-pgbench smoke gate: ran at commit time (see commit for PASS/FAIL). Practice
--card row-count gate suite not required (no production code touched, same
-reasoning as -0003c/-0003d/-0005/-0008).
+Gates run: `git status --porcelain -- internal/` empty before AND after
+(no production code touched). `make ralph-state-guard`: same pre-existing
+stale progress-marker pattern as recent loops, self-repaired, passed clean.
+Pre-commit pgbench smoke gate: ran at commit time, **PASS** (43/43/145 TPS
+across TPC-B/simple-update/select-only, 0 failed). Practice-card row-count
+gate suite not required (no production code touched).
 
-In-flight: none. No server started or stopped this loop. Two read-only
-`psql` queries were run against the shared `:65433` bench cluster (`\d
-lineitem`, `pg_constraint`/`pg_indexes` SELECTs) and two against the
-`:65432` PG oracle (`pg_constraint` SELECT, one `EXPLAIN`) — no writes, no
-restarts, no data changed on either cluster. Nightly CI batch
-(`ci/logs/action-items.md`) mtime unchanged since the last two loops'
-triage (2026-09-16 04:45) — no new run landed, so triage was correctly
-skipped again this loop per the working-set instruction; the next loop
-should re-check mtime before assuming it's still current.
+In-flight: **backend PID 81 on the shared `:65433` bench cluster is still
+running** `ALTER TABLE partsupp ADD CONSTRAINT partsupp_part_fk FOREIGN KEY
+(ps_partkey) REFERENCES part(p_partkey);` — started ~06:0x this loop, does
+NOT respond to `pg_terminate_backend`, does NOT block ordinary reads on
+`partsupp`/`lineitem` (verified), left running deliberately rather than
+force a disruptive server restart (see design doc "Disposition"). **The next
+loop should re-check `SELECT count(*) FROM pg_constraint;` (11 as of this
+loop's end) and `SELECT pid,state FROM pg_stat_activity WHERE pid<>
+pg_backend_pid();` before assuming cluster state is unchanged** — if
+`partsupp_part_fk` finished on its own, that's a 12th constraint landed for
+free; if the process is gone entirely, the server may have restarted
+(another loop's action) and the backend info is stale. No other process was
+left running by this loop.
