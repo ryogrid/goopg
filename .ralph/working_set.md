@@ -1,60 +1,51 @@
-Task: M0142-0003h — pin root cause of -0003f's "ROLLBACK never reached but
-DDL committed" observation. DONE this loop (recon-only, no production diff).
-Follow-up (the actual fix) filed as M0143-0008.
+Task: M0142-0008b — scoping recon: size widening the DP-search gate
+(`joinTreeHasOuterLink`) to filterless INNER/CROSS join trees. DONE this loop
+(recon-only, no production diff). Verdict: do NOT widen the gate; no
+implementation task filed.
 
-Files: `.ralph/fix_plan.md` (M0142-0003h marked `[x]` with findings; new
-`M0143-0008` filed under the engine-correctness-carryover milestone).
-`.ralph/deferral_ledger.md` (new row, task-id `m0142-0003h`).
-`docs/design/0100-0149/m0142-0003h-ddl-rollback-undo-scoped-to-create-only.md`
-(new). `docs/design/README.md` (indexed). No Go/production code touched —
-pure recon on a private throwaway cluster (built, used, fully torn down;
-never touched the shared `:65433` bench cluster, which is still down per
-M0142-0003k(c), still blocked on a human decision).
+Files: `.ralph/fix_plan.md` (M0142-0008b marked `[x]` with findings).
+`docs/design/README.md` (indexed). New
+`docs/design/0100-0149/m0142-0008b-scoping-recon-filterless-inner-cross-census.md`.
+No Go/production code touched — pure AST-analysis recon via a throwaway
+`/tmp` scratch Go program (deleted after use), delegated to a subagent and
+verified. No server/cluster needed or touched.
 
-Key symbols/paths: `internal/executor/operators_tx.go:253` (`execRollback`),
-`internal/executor/session.go` (`DDLUndoEntry`/`RecordDDLCreate`/
-`TakePendingDDLCreates` — populated at exactly 6 call sites in
-`operators_ddl.go`, all `CREATE TABLE`/`CREATE INDEX`, grep `DDLUndoEntry{`
-to re-find them). `internal/executor/operators_ddl.go:12912`
-(`syncConstraintCatalogRow` — the ADD-CONSTRAINT mutation with no undo
-counterpart). `docs/design/0000-0049/0030-0006-transactional-ddl.md` (Phase-1
-scope statement: only CREATE TABLE/INDEX ever got rollback-undo;
-"concurrent DDL visibility... deferred" is the separate, already-known gap
-— do not conflate with the new finding).
+Key symbols/paths: `internal/optimizer/planner.go:1373-1611` (the two-arm
+`s.Where != nil` / `joinTreeHasOuterLink` gate before `tryJoinSearch`),
+`planner.go:16898` (`joinTreeHasOuterLink`, left-spine-only walk).
 
-Findings this loop: two-session repro (session A held open via a named pipe,
-session B a fresh probe backend) on `/tmp/goopg-0003h-repro` (:5533, HEAD
-binary `78f67549d`, since fully torn down). **DML control** (`INSERT`) rolls
-back correctly — ordinary MVCC row visibility is sound, this is a DDL-only
-gap. **`ALTER TABLE ADD CONSTRAINT`**: visible to session B before
-`ROLLBACK`, AND still present after `ROLLBACK` — never undone at all, a
-silent permanent commit. **`CREATE TABLE`**: also prematurely visible before
-`ROLLBACK` (same symptom, but this half is the ALREADY-DOCUMENTED Phase-1
-"concurrent DDL visibility deferred" limitation, re-confirmed not new) yet
-correctly gone after `ROLLBACK` (it IS covered by the 6 undo call sites).
-Root cause for the novel half: `RecordDDLCreate` was simply never extended
-past `CREATE TABLE`/`CREATE INDEX` in Phase 1, so every other DDL form
-(confirmed for ADD CONSTRAINT; structurally implied for all `ALTER TABLE`
-subcommands by the same code read) has zero rollback-undo.
+Findings this loop: parsed all 22 TPC-H (Q15 skipped by design) + 99 TPC-DS
+queries (3 unrelated corpus-data parse failures in the "hierarchy rank"
+family — stray semicolon before a derived table's closing paren, not a
+goopg parser gap), walked all 429 reachable `SelectStmt`s (top-level, CTEs,
+derived tables, sublinks, UNION arms). **Only 5/429 (1.2%, all TPC-DS, zero
+TPC-H) hit the "neither arm runs" gap**: `query28`/`query61`/`query77`/
+`query88`/`query90`. 4 of 5 comma-cross provably-1-row scalar aggregate
+subqueries (join order cannot matter there). Only `query77`'s `cs, cr`
+cross (genuinely multi-row, and the query's only channel branch using
+implicit cross instead of the `LEFT JOIN` its store/web UNION siblings use)
+is a plausible real target — but its fix is a narrower per-query rewrite,
+not a gate change. Separately confirmed the gate's own left-spine-only walk
+has a real blind spot (outer join present but not on the left spine is
+invisible to it) but **zero corpus matches** for that shape today. Net:
+gate-widening is not worth doing against this corpus.
 
-Next step: **M0143-0008** (filed, not started) — extend rollback-undo to
-`ALTER TABLE` subcommands, starting with ADD/DROP CONSTRAINT. Likely overlaps
-`M0143-0002`'s DROP-CONSTRAINT-FK bug (`execAlterTableDropConstraint`,
-`operators_ddl.go:13259`) — triage together before implementing, since both
-sit in the same subsystem. Test precedent: `transactional_ddl_test.go`'s
-`TestTransactionalCreateTableRollback` et al.
-Separately, **M0142-0003k(c)/M0142-0003i remain BLOCKED** on a human
-decision (drop the shared `:65433` cluster's 12 orphaned scratch tables +
-HammerDB SF=1 reload + re-land 11 FK/PK constraints) — nothing changed on
-that front this loop; do not re-attempt without explicit authorization, per
-last loop's finding that the auto-mode classifier declines it.
+Next step: per the banner's item-4 ordering (M0141 remaining slices /
+M0142's open items), the next loop should pick among the still-open M0142
+items — **M0142-0008a** (SEMI/ANTI decorrelation scoping recon, sibling of
+this task, still unstarted — Q4-class queries never reach `addPath` for
+their SEMI/ANTI join; see fix_plan for its full scope) or **M0142-0016c**
+(does PG qerr-match the M0142-0016b Q33/Q54/Q56 findings) or one of
+M0141's larger remaining slices (S2b/S3-S7). M0142-0003i/-0003k remain
+BLOCKED on a human decision (shared `:65433` TPC-H bench cluster reload) —
+do not re-attempt without explicit authorization. Re-read the `## Current
+Priority` banner in `.ralph/fix_plan.md` first in case it was rewritten.
 
 Gates run: `make ralph-state-guard` — same pre-existing stale
 status/progress marker as recent loops (loop_count field lag), self-repaired,
-passed clean. No `go build`/`go test` run (no Go/production code touched this
-loop — pure recon + docs/fix_plan/ledger updates).
+passed clean. No `go build`/`go test` run (no Go/production code touched
+this loop — pure recon via a throwaway `/tmp` scratch program + docs/
+fix_plan updates).
 
-In-flight: none. The throwaway repro cluster (binary `/tmp/goopg-0003h-bin`,
-data dir `/tmp/goopg-0003h-repro`, cgroup unit `goopg-0003h-repro`, port
-5533) was stopped cleanly (`goopg stop -mode fast`, exit "server stopped")
-and all its files removed before this loop ended. Nothing left running.
+In-flight: none. The `/tmp/joingate_scan` scratch dir (subagent's analysis
+program, outside the repo) was removed after use. Nothing left running.

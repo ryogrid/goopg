@@ -3145,7 +3145,7 @@ cross-layer programme that has never been scoped.
   M0142-0012a/M0142-0016a scoping-recon precedent, since this touches the
   search's joinrel-construction machinery shared by every SEMI/ANTI query
   in both corpora.
-- [ ] **M0142-0008b — scoping recon: measure the blast radius of widening
+- [x] **M0142-0008b — scoping recon: measure the blast radius of widening
   the DP-search gate to filterless INNER/CROSS trees** — filed by
   M0142-0008. `planner.go:1590-94`'s own comment already names the fix
   direction: `joinTreeHasOuterLink(node)` currently gates DP search to
@@ -3160,6 +3160,28 @@ cross-layer programme that has never been scoped.
   rewrite's output), and whether any currently-`match`ing query would move
   away from PG's shape if the gate widened. Measurement only, no code
   change.
+  **DONE 2026-09-16, recon closed, no code change.** Design doc:
+  `docs/design/0100-0149/m0142-0008b-scoping-recon-filterless-inner-cross-census.md`.
+  Parsed all 22 TPC-H (Q15 skipped by design) + 99 TPC-DS queries (3
+  corpus-data parse failures, unrelated "hierarchy rank" family) with
+  `internal/parser`, walked all 429 reachable `SelectStmt`s (top-level,
+  CTEs, derived tables, sublinks, UNION arms) with a verified
+  reimplementation of `joinTreeHasOuterLink`'s left-spine semantics.
+  **Finding 1**: only 5/429 SELECTs (1.2%, all TPC-DS, zero TPC-H) hit the
+  "neither arm runs" gap (`query28`/`query61`/`query77`/`query88`/`query90`).
+  **Finding 2**: the gate's own left-spine-only walk has a separate,
+  mechanically-confirmed blind spot (an outer join not on the left spine is
+  invisible to it) but zero corpus matches today. **Verdict: do NOT widen
+  the gate** — 4 of the 5 Finding-1 matches comma-cross provably-1-row
+  scalar aggregate subqueries where join order cannot matter; only
+  `query77`'s `cs, cr` cross (genuinely multi-row, and the query's only
+  channel branch using implicit cross instead of the `LEFT JOIN` its
+  store/web siblings use) looks like a plausible real target, and its fix
+  is a narrower per-query rewrite, not a gate change. **No implementation
+  task filed** — re-open only if `query77` is independently confirmed as a
+  live plan mismatch. Gates: none beyond the recon itself (measurement-only,
+  parser-AST analysis via a throwaway `/tmp` scratch program, no production
+  code touched, no server/cluster needed).
 - [x] **M0142-0009 — recon: plain `Nested Loop`/`Gather` join nodes estimate
   single-digit rows against four-to-five-digit actuals, at `loops=1`** —
   Filed by M0142-0004c from the post-C1-fix re-capture
