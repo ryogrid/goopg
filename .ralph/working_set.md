@@ -1,77 +1,74 @@
-Task: M0142-0004b — recon: why does a 3-way CTE `UNION ALL` land at `est=3`
-against actuals up to 1557x higher. **DONE and COMMITTED** this loop (banner
-item 4, M0142 sub-group), recon closed with NO production code change
-(instrumentation added and fully reverted — `git diff` on `cardinality.go`
-was empty before commit).
+Task: M0142-0011 — disambiguate Mechanism A vs B for the `EstimateRows(*Join)`
+recompute gap M0142-0004b found. **DONE and about to be committed** this loop
+(banner item 4, M0142 sub-group). Recon closed with NO production code
+change (candidate Algo-gate broadening + temporary trace both added and
+fully reverted — `git diff` on `internal/optimizer/cardinality.go` empty
+before commit).
 
-Files: `docs/design/0100-0149/m0142-0004b-cte-union-branch-collapse-is-estimatejoin-recompute-gap.md`
+Files: `docs/design/0100-0149/m0142-0011-disambiguate-estimatejoin-recompute-gap.md`
 (new, full writeup), `docs/design/README.md` (indexed), `.ralph/fix_plan.md`
-(0004b `[x]` + new **M0142-0011** filed with both candidate mechanisms and
-resume points).
+(0011 `[x]`, new 0012 filed), `.ralph/deferral_ledger.md` (new row).
 
-Key symbols: `estimateJoin` (cardinality.go:724, SEMI/ANTI branch ~738-748,
-measured-branch Algo gate ~792 `if j.Algo == JoinAlgoHash || j.Algo ==
-JoinAlgoMerge`), `EstimateRows` (cardinality.go:45, `case *Join: return
-estimateJoin(x)` at ~95-96 — never consults `PlanCost`), `semiJoinMatchFraction`/
-`semiPairMatchFraction` (cardinality.go:868/908 — verified CORRECT, not the
-defect), `legacyDisplayCostOf` (plancost.go:164, the "prefer cached PlanRows"
-pattern already used by `distinctpaths.go`/`groupingpaths.go`/
-`partialaggpaths.go`/`partialsortpaths.go`/`windowsetoppaths.go` but NOT by
-`EstimateRows(*Join)`), `operators_explain.go:3024-3028` (EXPLAIN's `rows=`
-renderer, reads `PlanCost.PlanRows` — the value that DISAGREES with
-`EstimateRows`'s fresh recompute for the same node).
+Key symbols: `estimateJoin`/`joinEquiPairs` (`internal/optimizer/cardinality.go:722,1129`),
+`estimateNLIndexJoin` (`cardinality.go:240`, already correct, M0142-0006's
+SEMI/ANTI fix included), `createNestLoopIndexJoinPlan`/
+`createNestLoopIndexJoinPlanFused` (`createplannl.go:107,208,265`) — the
+R25 decomposition point.
 
-Findings: instrumented Q33's standalone `ss` CTE body (temporary
-`GOOPG_EA0004B_TRACE`-gated prints, SF0.25 cluster port 65437) and confirmed
-`est=3` is exactly `1+1+1` — each CTE branch's `HashAggregate`/`Hash Semi
-Join` independently collapses to rows=1. Two hypotheses from M0142-0004b's
-own filing (CTE-specific gap, heavy-filter selectivity) were BOTH ruled out:
-the real mechanism is the SEMI join's OUTER input `l = EstimateRows(j.Left)`
-returning 1 for a 4-relation join subtree the SAME EXPLAIN renders with
-rows=32/91/99 at every level — `semiJoinMatchFraction` itself computes a
-correct ~0.998 match fraction (M0142-0006's own code, not implicated).
-Traced further: every node in that subtree is a plain `*Join{Algo:
-JoinAlgoNestedLoop}` (NOT `*NestedLoopIndexJoin`), and `estimateJoin`'s
-measured-selectivity branch (pairNDistinct/MCV/superkey) is gated on
-`Algo==Hash||Merge` only — NestedLoop-algo joins fall to the crude
-`l*r*0.005` fallback regardless of whether an equi-key is resolvable
-(Mechanism A). Separately, `EstimateRows(*Join)` never checks the node's own
-`PlanCost.CostSet`/`PlanRows` the way `legacyDisplayCostOf` does for other
-node kinds, so it recomputes fresh even when an accurate costed value already
-sits on the node (Mechanism B). NOT disambiguated which one is the true fix,
-or whether both are needed, or whether either is safe to apply during DP
-search (before PlanCost exists) — this intersects the exact "costing order"
-territory the banner's item 1 (M0141-S2a/M0139-0007) just resolved, so
-M0142-0011 (filed) must re-read that resolution before assuming either fix
-is search-safe. Filed as its own slice rather than fixed blind because either
-mechanism's fix touches `EstimateRows`/`estimateJoin` broadly enough to need
-the full floor-measurement suite (TPC-H/TPC-DS plan-parity, `make
-ea-ratchet`, SF0.25 sweep) before landing — matching the M0142-0006/0009
-precedent, not the lighter bar pure recon uses.
+Findings: tested Mechanism A directly (broadened `estimateJoin`'s
+`j.Algo == Hash||Merge` gate, rebuilt, re-ran Q33's CTE-branch witness on a
+private SF0.25 clone) — plan byte-identical, A alone does NOT fix it. Traced
+the collapsing nodes: generic `*optimizer.Join` with `Predicate == nil`,
+zero equi-pairs regardless of the gate. Read `createplannl.go` instead of
+tracing further: since R25 (plan-parity-fix-take2), an unmemoized
+index-probe nested loop is built as `Join{Algo:NestedLoop, Lateral:true,
+Right:*IndexScan}` whose equi-key lives on the `*IndexScan` child's own
+`Key`/`Keys` (an `OuterColumnRef` nestloop param), NOT in `Predicate`.
+`estimateJoin` has no `Lateral` arm — `joinEquiPairs` never looks at
+`j.Right`'s own bound key — so EVERY unmemoized index-probe nested loop in
+both corpora (the common case; M0142-0005/B6 already established goopg
+rarely gets a Memoize on the NL probe path) falls to the crude
+`l*r*0.005`/`max(l,r)`-capped fallback, even though `estimateNLIndexJoin`
+already has the correct per-probe logic for the OLD fused
+`*NestedLoopIndexJoin` type — reachable only through
+`createNestLoopIndexJoinPlanFused` (Memoize-wrapped minority). Neither
+Mechanism A nor B; a third, more precise mechanism (Mechanism C),
+structurally DP-search-safe (construction-time fields only, no `PlanCost`
+consultation — same argument that makes `estimateNLIndexJoin` itself safe
+today). Filed the fix as **M0142-0012**: teach `EstimateRows`/`estimateJoin`
+the `Lateral`+bound-`*IndexScan` shape by generalizing `estimateNLIndexJoin`'s
+logic. Flagged likely LARGE corpus-wide blast radius (common shape) — 0012
+needs the full floor-measurement suite (TPC-H plan-parity, TPC-DS
+plan-parity, `make ea-ratchet`, SF0.25 sweep) before landing, not the
+lighter recon bar.
 
-In-flight: none. sf025 goopg server (started for this probe) stopped via
-`bench/tpcds/server.sh stop sf025` before commit; verified via `ps aux` no
-goopg process remains except the pre-existing TPC-H bench peer on :65433
-(not touched by this loop). No server/gate process left running.
+In-flight: none. sf025 goopg server (private binary `tmp/goopg-m0142-0011-bin`,
+port 65437) stopped via `bench/tpcds/server.sh stop sf025` and the binary
+removed before this write-up. Verified via `ps aux` no stray goopg process
+remains except the pre-existing TPC-H bench peer on :65433 (another loop's
+live server, never touched this loop).
 
-Next step: per the banner, item 4 (M0141/M0142 group) is still open.
-M0142-0004b is now closed; M0142-0011 (the fix this recon filed) is the
-freshest, most-specific open item, but is NOT yet scoped as smaller than
-M0142-0005 — the next loop should treat 0011 and 0005 as comparable in size
-(both "sized like an executor slice, scope into sub-tasks before
-implementing") and pick whichever it judges more tractable to decompose
-first, OR pick a smaller still-open recon (0003c level-6 enumeration-order
-parity, 0007 corr=0 fallback re-measure, 0008 forced-rewrite-vs-search
-census) if it wants another bounded-recon loop before tackling either
-executor-sized slice. Also open: M0141 S2b/S3-S7 (S7 Incremental Sort blocks
-14 TPC-DS queries).
+Next step: per the banner, item 4 (M0141/M0142 group) is still open. Pick
+per judgement among: **M0142-0012** (the fix just filed — executor-sized,
+needs full floor-measurement, likely the highest-value single item in the
+group given its probable blast radius across both corpora), **M0142-0003c**
+(level-6 enumeration-order recon, bounded), **M0142-0008** (forced-rewrite-
+vs-search census, bounded), **M0142-0005** (Memoize/probe-multiplier
+interlock, now carries M0142-0010's extra corpus evidence), or **M0141-S7**
+(Incremental Sort — 14 TPC-DS queries, likely the single highest-leverage
+item in the whole group by query count, but a bigger executor+planner slice
+to scope). A 0142-0012 sub-scoping recon (measure how many corpus nodes are
+actually the `Lateral`+`*IndexScan` shape before implementing, mirroring
+this milestone's own measure-first discipline) is a reasonable first cut if
+the next loop wants to size 0012 rather than implement it blind.
 
 Gates run: `go build ./...` clean (no production diff this loop — recon +
-docs only); `git status`/`git diff` on `internal/optimizer/cardinality.go`
-confirmed empty (clean revert of the temporary trace); `make
-ralph-state-guard` — one self-repair (same recurring benign
-stale-clean-exit-marker pattern several prior loops have noted), clean after
-repair. Full tpch-spotcheck/ea-ratchet/SF025-sweep NOT run this loop —
-correctly skipped per the recon-only precedent (M0142-0003a/0003b/0010 also
+docs only); `go test ./internal/optimizer/...` PASS (including
+`TestFallbackCapFiresForNonHashAlgoDespiteStats`, confirming the reverted
+Algo-gate experiment left no trace); `git status`/`git diff` on
+`internal/optimizer/cardinality.go` confirmed empty. Full
+tpch-spotcheck/ea-ratchet/SF025-sweep NOT run this loop — correctly skipped
+per the recon-only precedent (M0142-0003a/0003b/0004b/0007/0010 also
 required only build-clean + empty-diff, not the full floor suite, since no
-production code changed).
+production code changed). `make ralph-state-guard` to be run immediately
+before the status block.

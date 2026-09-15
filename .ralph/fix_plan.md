@@ -2798,7 +2798,7 @@ cross-layer programme that has never been scoped.
   independently-verified symptom of M0142-0005, which now carries this
   corpus evidence as part of its resume point. Deferral ledger row filed
   (dated 2026-09-15) linking this evidence to M0142-0005.
-- [ ] **M0142-0011 — disambiguate and fix the `EstimateRows(*Join)`
+- [x] **M0142-0011 — disambiguate and fix the `EstimateRows(*Join)`
   recompute gap M0142-0004b found** — filed by M0142-0004b (full writeup:
   `docs/design/0100-0149/m0142-0004b-cte-union-branch-collapse-is-estimatejoin-recompute-gap.md`).
   A generic `*Join{Algo: JoinAlgoNestedLoop}` node beneath a SEMI join's
@@ -2824,22 +2824,68 @@ cross-layer programme that has never been scoped.
   `partialsortpaths.go`, `windowsetoppaths.go`) already do — it always
   recomputes bottom-up from node structure alone, discarding an
   already-accurate costed value when one exists.
-  Resume point: re-instrument (the reverted `GOOPG_EA0004B_TRACE` shape in
-  M0142-0004b's doc is a ready-made starting point) to determine (1) whether
-  Mechanism A alone (broadening the `Algo` gate) already fixes the witness
-  without touching B, (2) whether B is reachable/needed independently, and
-  (3) whether either fix is safe to apply during DP search (before a node's
-  `PlanCost` exists) vs. only at post-search call sites (EXPLAIN render,
-  `semiJoinMatchFraction`'s own `l:=EstimateRows(j.Left)` call, and any other
-  `EstimateRows` caller invoked on an already-costed subtree) — this bleeds
-  into the same "does the search see a stale or updated number" territory
-  the banner's item 1 (`M0141-S2a`/`M0139-0007`) just closed, so read that
-  resolution before assuming either fix is search-safe. Because either
-  mechanism, once fixed, changes `EstimateRows`'s answer for every
-  generic-NestedLoop-algo `*Join` (or every already-costed `*Join`) in the
-  corpus, run the full floor-measurement suite before landing (TPC-H
-  plan-parity `-serial`, TPC-DS plan-parity, `make ea-ratchet`, SF0.25
-  regression sweep) — the same treatment M0142-0006/M0142-0009 got, not the
+  **DONE 2026-09-15, recon closed, NEITHER mechanism — root cause is a
+  third one. Full writeup:
+  `docs/design/0100-0149/m0142-0011-disambiguate-estimatejoin-recompute-gap.md`.**
+  Tested Mechanism A directly (broadened the `Algo` gate, rebuilt, re-ran the
+  Q33 CTE-branch witness): the plan was byte-identical — A alone does not
+  fix it. Traced further: the collapsing nodes (`Nested Loop -> Index Scan`
+  on `customer_address_pkey`/`item_pkey`) are generic `*optimizer.Join` with
+  `Predicate == nil` and zero equi-pairs findable regardless of the Algo
+  gate — Mechanism A cannot reach these nodes at all. Root cause found by
+  reading `createplannl.go`: `createNestLoopIndexJoinPlan`'s own comment
+  names it — the R25 (plan-parity-fix-take2) decomposition replaced the
+  fused `*NestedLoopIndexJoin` type with a generic
+  `Join{Algo: NestedLoop, Lateral: true, Right: *IndexScan}` whose actual
+  equi-key lives on the `*IndexScan` child's own `Key`/`Keys` (an
+  `OuterColumnRef` nestloop param), not in `Predicate`. `estimateJoin` (the
+  generic dispatcher used for this NEW decomposed shape) has no `Lateral`
+  arm, so `joinEquiPairs` always finds zero pairs on it and every unmemoized
+  index-probe nested loop in both corpora falls to the crude
+  `l*r*0.005`/`max(l,r)`-capped fallback. `estimateNLIndexJoin` (M0142-0006's
+  already-correct fix) is reachable only on the Memoize-wrapped minority
+  (`createNestLoopIndexJoinPlanFused`, the sole remaining producer of the OLD
+  fused type) — the majority (per M0142-0005/B6) silently reverts to the
+  fallback. This is Mechanism C, structurally DP-search-safe by the same
+  argument that makes `estimateNLIndexJoin` itself safe today (construction-time
+  fields only, no `PlanCost` consultation). Both the Algo-gate broadening and
+  the temporary trace were fully reverted (`git status`/`git diff` empty;
+  `go test ./internal/optimizer/...` green, `TestFallbackCapFiresForNonHashAlgoDespiteStats`
+  untouched since Mechanism A is not being landed). Fix filed as **M0142-0012**
+  below.
+- [ ] **M0142-0012 — teach cardinality estimation the decomposed-NLI
+  `Join{Lateral: true}` shape** — filed by M0142-0011 (full writeup:
+  `docs/design/0100-0149/m0142-0011-disambiguate-estimatejoin-recompute-gap.md`).
+  Since the R25 (plan-parity-fix-take2) decomposition, an unmemoized
+  index-probe nested loop is built (`createplannl.go:355-364`) as a generic
+  `Join{Algo: JoinAlgoNestedLoop, Lateral: true, Right: *IndexScan}` whose
+  equi-key lives on the `*IndexScan` child's own `Key`/`Keys`
+  (`OuterColumnRef` nestloop param), not in `Predicate`. `EstimateRows`/
+  `estimateJoin` (`internal/optimizer/cardinality.go`) has no arm for this
+  shape, so `joinEquiPairs` always finds zero pairs on it and every such join
+  in both corpora falls to the crude `l*r*0.005`/`max(l,r)`-capped fallback
+  instead of the accurate per-probe estimate — `estimateNLIndexJoin`
+  (`cardinality.go:240-266`, already carries M0142-0006's SEMI/ANTI
+  match-fraction fix) already has the correct logic but is reachable only
+  through the OLD fused `*NestedLoopIndexJoin` type, which
+  `createNestLoopIndexJoinPlanFused` builds ONLY when the inner is
+  Memoize-wrapped — the minority case per M0142-0005/B6.
+  Resume point: add a case ahead of (or inside) the generic `*Join` dispatch
+  in `EstimateRows` (`cardinality.go:95-96`) that recognizes
+  `j.Lateral && j.Right` is a bound `*IndexScan`/`*IndexOnlyScan`, and routes
+  to a generalized version of `estimateNLIndexJoin`'s logic (adapt it to read
+  `j.Left`/`j.Right`/`j.Predicate` instead of `j.Outer`/`j.Inner`/`j.Predicate`
+  — the INNER-join case is `return l` unchanged, the SEMI/ANTI case reuses
+  `nliSemiMatchFraction`'s formula sourced from the `*IndexScan`'s own
+  `Key`/`Keys`). Pin with a test mirroring
+  `TestEstimateRowsNLIndexJoinSemiScalesByMatchFraction` but built via the
+  decomposed shape (`Join{Lateral:true}`) instead of `*NestedLoopIndexJoin`,
+  and re-verify the Q33 CTE-branch witness directly (`rows=1` should become
+  `rows≈32`). **Likely large corpus-wide blast radius** (the common
+  unmemoized NLI shape appears throughout both corpora) — per M0142-0011's
+  own instruction, run the full floor-measurement suite before landing
+  (TPC-H plan-parity `-serial`, TPC-DS plan-parity, `make ea-ratchet`, SF0.25
+  regression sweep), the same treatment M0142-0006/M0142-0009 got, not the
   lighter bar a pure-recon task uses.
 
 ## M0143 — Engine correctness carry-overs from the parity programme (filed 2026-09-14)
