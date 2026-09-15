@@ -1,77 +1,60 @@
-Task: M0141-S2a-fix scoping recon (banner's TOP-PRIORITY pairing, other half
-of "M0141-S2a-fix and M0139-0007"; M0139-0007 was closed last loop). **DONE
-this loop, recon-only, NO production diff** (verified: `git diff --stat --
-'*.go'` empty; committed 86af308).
+Task: M0141-S2a-fix1 (banner's TOP-PRIORITY group, "M0141-S2a-fix and
+M0139-0007 — costing-order unblock"). **DONE and committed this loop**
+(`ca574113c`, pushed). Build/tests green, `scripts/tpch-spotcheck.sh` PASS,
+`make ralph-state-guard` clean (self-repaired the usual prior-loop clean-exit
+marker).
 
-Files: `docs/design/0100-0149/m0141-s2a-fix-scoping-recon.md` (new),
-`docs/design/README.md` (+index row), `.ralph/fix_plan.md` (M0141-S2a-fix
-annotated with the scoping findings; filed M0141-S2a-fix1 and
-M0141-S2a-fix2 as the two concrete next slices), `.ralph/deferral_ledger.md`
-(+1 row, task-id `m0141-s2a-fix-scoping`).
+Files: `internal/optimizer/groupingpaths.go` (`aggInputWidth` gained an
+`*Aggregate` param, reads `agg.InputTarget`'s kept columns when
+`InputTargetKnown`), `partialaggpaths.go`/`partialaggupper.go`/
+`partialsortpaths.go` (call-site updates, `nil` at the one non-Aggregate
+site), `internal/optimizer/agginputwidth_test.go` (new, 2 pinning tests),
+`docs/design/0100-0149/m0141-s2a-fix1-agg-input-width-preview.md` (new,
+full B2 derivation + measurement), `docs/design/README.md` (+index row),
+`.ralph/fix_plan.md` (M0141-S2a-fix1 checked off with results),
+`analysis/m0141/m0141-s2a-fix1-{tpch,tpcds}*` (6 committed capture
+artefacts).
 
-What was found: M0141-S2a-fix's own text framed half (1) ("move narrowing
-earlier or compute a preview at cost time") as possible
-planner-search-order surgery. Tracing the call graph shows it is NOT:
-`agg.InputTarget []int` (a NAME-derived keep-list) is already stamped by
-`stampAggregateInputTarget` inside `buildAggregateStage` (`planner.go:8219`)
-— strictly BEFORE `createGroupingPaths`'s Hashed-vs-Sorted cost contest runs
-(`planner.go:1760`) — and `addGroupingPaths` (which calls `aggInputWidth`,
-`groupingpaths.go:344`) already receives `aggNode` as a parameter. The
-"preview" half (1) asked for already exists, unused, right at the call
-site. B2 derivation from `./postgres/`: `cost_agg`'s caller
-(`pathnode.c:3430`) passes `subpath->pathtarget->width`; the executor's
-`hash_agg_entry_size` (`nodeAgg.c:1701`, called at `:3701-3703`) uses
-`outerplan->plan_width` — both PG sites key on the SAME quantity, the
-query-wide up-front narrow target-list PG's planner builds once
-(`build_joinrel_tlist` etc.), which `agg.InputTarget` is goopg's own
-per-node/later equivalent of. Sizing verdict: attempt the width-preview
-wiring ALONE first (cheap, 3-line, composes across all 3 `aggInputWidth`
-call sites); gate the `hashAggEntrySize` fixed-overhead currency correction
-on that result — R124 §7's prior "currency + narrowing" test never had a
-live-at-cost-time preview to pair with, so it isn't dispositive against
-retrying now. Also recorded (design doc's "Correctness note"): feeding a
-narrowed preview to the HASHED candidate is safe under B2 even though
-goopg's real narrowing commit (`narrowAggregateInput`) later DECLINES for
-Hashed strategy (no `*Sort` to sink a Project below, per its `pastSort`
-retention-site condition) — PG's own entry-size formula charges width
-regardless of row retention, matching B2's "goopg may still really run at
-its old footprint; that is not a regression" worked example.
+Key symbols: `aggInputWidth` (`groupingpaths.go`, now
+`(child Node, agg *Aggregate)`), `Aggregate.InputTarget`/
+`InputTargetKnown` (`plan.go:1394-1395`), `stampAggregateInputTarget`
+(`group_input_target.go:268`, unchanged — already ran before this task),
+`narrowAggregateInput`/`pastSort` (`upper_narrow_apply.go`, the REAL
+narrowing commit this preview is deliberately separate from).
 
-Key symbols: `internal/optimizer/group_input_target.go`
-(`stampAggregateInputTarget:267`, `deriveAggregateInputKeep:190`),
-`internal/optimizer/planner.go` (`buildAggregateStage` call `:1738` ->
-internal stamp `:8219`; `createGroupingPaths` call `:1760`),
-`internal/optimizer/groupingpaths.go` (`aggInputWidth:326`,
-`addGroupingPaths:340` — the M0141-S2a-fix1 target, plus its two siblings
-`partialaggpaths.go:338`, `partialaggupper.go:327`),
-`internal/optimizer/cost_funcs.go` (`costAgg:431`, HASHED spill arm
-`:516-540` — the M0141-S2a-fix2 target, `hashAggEntrySize`),
-`internal/optimizer/upper_narrow_apply.go` (`narrowAggregateInput:210`,
-`pastSort` retention-site condition `:267` — cited for the correctness
-note, not touched).
-
-Gates run: no `.go` files touched this loop (confirmed via `git diff
---stat -- '*.go'`), so no build/test gate was needed for the recon itself.
-`make ralph-state-guard`: found a stale status/progress mismatch from a
-prior loop's clean-exit marker (status="running"/progress="completed"),
-self-repaired to consistent ("running"/"in_progress"), exit clean on
-second run. Nightly triage checked: `ci/logs/action-items.md`'s
-20260914-235643 run (14 items) was already fully filed under M-NIGHTLY as
-of the "filed 2026-09-15" section — no new filing needed this loop.
+Findings/measured result: TPC-H match 6 -> 8 (Q3, Q13 flip SHAPE-DIFF ->
+MATCH, exactly the task's named queries; Q18 partial — drops
+sort-strategy, still SHAPE-DIFF on join-order/join-method/scan-type/
+aggregation-strategy). TPC-DS match floor held at 2; Q31 (inside M0141-S1's
+named 32-query serial set) drops aggregation-strategy/sort-strategy/
+parallelism, still SHAPE-DIFF on the rest. No category regressed in either
+corpus. `shape-delta.sh` confirms exactly {Q3,Q13,Q18} / {Q31,Q78(cosmetic)}
+changed plan shape. Measured on a private clone/port only — shared
+:65432/:65433/:65437/:65438 clusters were read from (BASE_BACKUP clone,
+live EXPLAIN) but never stopped/started/rebuilt; all private binaries/clone
+dirs/cgroup scopes removed after use.
 
 In-flight: none.
 
-Next step: re-read the `## Current Priority` banner fresh. The banner's
-pairing "M0141-S2a-fix and M0139-0007" is now BOTH scoped (M0139-0007 last
-loop, M0141-S2a-fix this loop) — re-check whether the banner has been
-rewritten to reflect this before picking. If unchanged, the natural next
-pick is **M0141-S2a-fix1** (the width-preview wiring: restrict
-`aggInputWidth`'s three call sites to `agg.InputTarget`'s kept columns when
-`InputTargetKnown`; pin with a test per B2's "pinned by a test" rule;
-re-measure Q3/Q13/Q18 + the TPC-DS 32-query serial-only set from M0141-S1
-after). This is now a genuinely small, well-derived, bounded change — not
-"surgery" — per this loop's scoping. Do NOT attempt M0141-S2a-fix2 (the
-currency correction) before fix1 lands and is measured in isolation. Also
-still open and cheap: M0139-0007a (measure the two already-built
-R108/R113 arms) and M0139-0007b (port Memoize's currency) from last loop's
-recon, if the banner ranks those ahead of M0141-S2a-fix1 for any reason.
+Next step: re-read the `## Current Priority` banner fresh (it may have been
+rewritten since 2026-09-15's "Re-ordered" text — check the date/content
+match before trusting this note). If the banner is unchanged, **M0141-S2a-fix2**
+(the `hashAggEntrySize` fixed-overhead currency correction) is the natural
+next pick inside the same top-priority group — it is now legitimately
+attemptable, since fix1 supplies the live-at-cost-time preview R124 §7's
+prior attempt lacked. Candidates to re-check once fix2 lands: Q18's residual
+`aggregation-strategy` mismatch (TPC-H) and Q31's residual mismatches
+(TPC-DS) — neither is proven currency-shaped rather than a different
+mechanism; re-diagnose, do not assume. Also still open in this same
+top-priority group: **M0139-0007a** (measure/adopt the two already-built
+R108/R113 arms) and **M0139-0007b** (port Memoize's currency) from an
+earlier loop's recon, if the banner ranks those ahead of fix2 for any
+reason.
+
+Gates run: `go build ./...` clean. `go test ./internal/optimizer/...` all
+pass (incl. the 2 new tests). `scripts/tpch-spotcheck.sh` RESULT=PASS
+(Q12=2, Q13=34). Pre-commit pgbench smoke PASS (hook-enforced, not
+skippable). `make ralph-state-guard` clean after one self-repair (same
+stale clean-exit-marker pattern as the last several loops — harmless,
+repairs itself every time; if this recurs indefinitely it may be worth a
+dedicated task to find why the marker keeps arriving stale).
