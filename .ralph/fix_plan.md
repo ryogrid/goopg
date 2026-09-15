@@ -2887,6 +2887,27 @@ cross-layer programme that has never been scoped.
   (TPC-H plan-parity `-serial`, TPC-DS plan-parity, `make ea-ratchet`, SF0.25
   regression sweep), the same treatment M0142-0006/M0142-0009 got, not the
   lighter bar a pure-recon task uses.
+- [x] **M0142-0012a — scoping recon: measure M0142-0012's blast radius before
+  implementing it** — filed by this loop from the working-set baton's own
+  suggestion ("a 0142-0012 sub-scoping recon... is a reasonable first cut").
+  **DONE 2026-09-15, recon closed, no code change. Full writeup in
+  `docs/design/0100-0149/m0142-0012a-scoping-recon-blast-radius.md`.**
+  Reused the M0142-0010/M0142-0011 env-gated-trace-then-revert method on
+  private throwaway servers (never the shared `:6543x`/`tmp/goopg-bench-bin`
+  lanes): counted `estimateJoin` calls hitting `j.Lateral && j.Right` bound
+  `*IndexScan`/`*IndexOnlyScan` with zero `joinEquiPairs`. **TPC-H 6/21
+  queries hit it** (Q2, Q7, Q8, Q9, Q11, Q21 — including flagship Q9 and the
+  M0077-era Q21 NLI witness), **224 total call-site hits**. **TPC-DS SF0.25
+  69/99 queries hit it**, **6347 total call-site hits** (Q14 highest, 1009).
+  Confirms "likely large corpus-wide blast radius" with a number — small
+  overlap with M0142-0005/0009/0010's own witness populations (corroborating,
+  not duplicate fixes). Counts are call-site hits during DP-search costing,
+  not final-plan node counts (not measured — flagged as the recon's own
+  scope boundary). `git diff` on `cardinality.go` empty after revert;
+  `go build ./internal/optimizer/...` and `go test ./internal/optimizer/...`
+  clean. **M0142-0012 is now sized with real numbers, not just code
+  inspection — the next loop can implement it directly** (resume point
+  unchanged from the entry above).
 
 ## M0143 — Engine correctness carry-overs from the parity programme (filed 2026-09-14)
 
