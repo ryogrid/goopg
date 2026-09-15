@@ -53,6 +53,17 @@ Select in this order:
    satisfied. **0017 matters more than its size suggests**: TPC-H plans are
    captured `-serial` only, so `parallelism` is measured *out* of the headline
    6/22 and one of the nine categories is currently unscoreable.
+   **RESOLVED 2026-09-15: item 2 is fully closed (0014, 0015, 0016, 0017 all
+   `[x]`).** 0017 landed the parallel-mode PG baseline and measured
+   `parallelism=16/22`, `match=2/22` at `-serial=false` — see
+   `docs/design/0100-0149/m0137-0017-serial-and-parallel-capture.md`. Its own
+   follow-up (triage the 16 divergences) is filed separately as **M0137-0019**
+   (listed under the M0137 milestone section below, not in this fixed
+   0014-0017 set) — it is new investigative work sized like M0141/M0142's
+   remaining slices, not a re-opened harness debt, so it does not inherit
+   item 2's priority; the next loop applies normal banner order to it.
+   **The next loop should select item 3 below** (M0138 0007-0009 /
+   M0140-0006) unless a later banner edit says otherwise.
 3. **M0138 — PG-faithful ANALYZE statistics** (0007–0009: the orphaned
    `numeric` `avg_width`, the category-shift bisect, the correlation banding
    re-open) and **M0140 — TPC-DS parallelism** (0006: the partial-Append
@@ -1006,15 +1017,20 @@ before/after proving the defect it closes.
   M0140-0003's standing caution. Closes `.ralph/deferral_ledger.md` row
   `m0137-0012-o15-gather-crossing-excluded-pushconjuncttraced` (now
   `resolved`).
-- [ ] **M0137-0017 — capture plans in BOTH serial and parallel modes** — the
-  TPC-H scoreboard is captured with `estimate-audit`'s `-serial`, which defaults
-  **true** (`cmd/estimate-audit/main.go:293`), so `parallelism` reads 0 because
-  it is measured **out**, not solved — M0137-0003 says so in writing, and
-  M0140-0003 confirmed the flip is inert against this protocol. **The headline
-  TPC-H 6/22 therefore cannot score one of the nine categories at all.** Capture
-  with `-serial` and `-serial=false`, each against its own PG baseline; the
-  parallel-mode PG baseline does not exist yet (`bench/tpch/plans-pg/` is serial)
-  and building it is part of this task. Ledger: `take3-plan-capture-is-serial-only`.
+- [x] **M0137-0017 — capture plans in BOTH serial and parallel modes** — DONE
+  2026-09-15. Ran `estimate-audit -plan-only` with `-serial=true` and
+  `-serial=false` against the live TPC-H clusters (goopg `:65433`, PG
+  `:65432`), building for the first time a parallel-mode PG reference
+  (`bench/tpch/plans-pg/` stays serial-only/non-canonical per K9). Committed
+  `analysis/m0137/m0137-0017-{serial,parallel}.*`. Result: `parallelism` —
+  read `0` in every prior report because the serial control arm measures it
+  *out* — is now scoreable at **16/22**, the largest category besides
+  `join-order`; the serial headline's 6/22 match set drops to **2/22**
+  (only Q6, Q11 survive) once parallel workers are allowed. Design:
+  `docs/design/0100-0149/m0137-0017-serial-and-parallel-capture.md`. Does
+  NOT attempt to close any divergence — follow-up is **M0137-0019** below,
+  per the completion rule's two-artefact requirement (also
+  `.ralph/deferral_ledger.md` row `m0137-0017-parallel-mode-divergence`).
 - [ ] **M0137-0018 — bring `make ea-ratchet` into this group's gate set** — the
   ratchet exists and runs (`Makefile:616` -> `scripts/estimate-parity-gate.sh`,
   landed by C-20a `d0b4f96e4`: TPC-DS SF0.5 `EXPLAIN ANALYZE`, relation-set
@@ -1029,6 +1045,23 @@ before/after proving the defect it closes.
   belong there. **Do not rebuild it** — the row `take3-ea-ratchet-never-ran`
   that says it has never run is superseded by the `resolved` row nine lines
   below it (`.ralph/deferral_ledger.md:2121` then `:2134`); read the later row.
+- [ ] **M0137-0019 — triage the 16 parallel-mode `parallelism`-category
+  divergences M0137-0017 surfaced** — that task built the first-ever
+  parallel-mode PG baseline and measured `parallelism=16/22`,
+  `match=2/22` at `-serial=false` (committed:
+  `analysis/m0137/m0137-0017-parallel.*`, diffed by
+  `scripts/pg-plan-parity-diff.py`; design doc
+  `docs/design/0100-0149/m0137-0017-serial-and-parallel-capture.md`). It
+  deliberately made no attempt to close any of them. Per-query, decide
+  whether each divergence is a plan-selection defect already in M0139's /
+  M0141's / M0142's territory, or a Gather-placement/costing gap specific
+  to the parallel path (M0140's `GOOPG_GATHER_PATHS=all` territory) —
+  start from the 4 queries that regress specifically when parallelism is
+  turned on (Q1, Q10, Q14, Q15a-VIEWBODY: MATCH at `-serial=true`,
+  SHAPE-DIFF at `-serial=false`), since those isolate a parallelism-only
+  cause most cleanly. Do not re-run the capture; the artefacts are already
+  committed and stats-epoch-pinned. Ledger:
+  `m0137-0017-parallel-mode-divergence`.
 
 ## M0138 — PG-faithful ANALYZE statistics (filed 2026-09-14)
 
