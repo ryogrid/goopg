@@ -2533,30 +2533,68 @@ cross-layer programme that has never been scoped.
   now-identified 2500x-wrong row estimate, so it is very likely a
   second-order effect, not primary; do not resume it before M0142-0003e is
   resolved. Follow-up filed as **M0142-0003e** (below).
-- [ ] **M0142-0003e — why doesn't goopg's existing superkey/FK-based
+- [x] **M0142-0003e — why doesn't goopg's existing superkey/FK-based
   no-fan-out substitution fire for the bare `lineitem ⋈ partsupp` composite
-  join?** — filed by -0003d's Finding 1/2. Concrete repro: a 2-relation join
-  of `lineitem` and `partsupp` on `l_partkey = ps_partkey AND l_suppkey =
-  ps_suppkey`, where `partsupp` has a genuine composite UNIQUE index on
-  exactly those two columns (`partsupp_pk`) — goopg's DP search estimates
-  this join at 2406 rows against a true value of ~5,999,098 (every
-  `lineitem` row has exactly one matching `partsupp` row). Read
-  `internal/optimizer/joinkeyproof.go`'s `superkeyJoinEstimate` +
-  `internal/optimizer/joinrelsize.go`'s `superkeyJoinSelectivity` (the
-  PG-shaped-DP arm) side by side with the production twin
-  (`internal/optimizer/cardinality.go`'s `estimateJoin`) against this exact
-  repro. Determine with a **targeted unit test**
-  (`internal/optimizer/joinrelsize_test.go` or `cardinality_test.go`, NOT
-  another full-query trace) whether the mechanism reaches this case and, if
-  not, why: (a) which arm is live by default — re-confirm
-  `GOOPG_PGSHAPED_DP`'s current default, don't assume it per
-  `goopg_arm_scripts_disable_dp_search` in memory; (b) whether
-  `uniqueKeyColumnSets`/the clause-matching precondition actually recognizes
-  `partsupp_pk` against this exact `AND`-of-two-equalities clause shape. Do
-  NOT assume which explanation is correct before the unit test settles it,
-  and do NOT edit `joinkeyproof.go`/`joinrelsize.go`/`cardinality.go` blind
-  — confirm the failure mode first, per
-  `planner_verify_both_candidates_generated`.
+  join?** — filed by -0003d's Finding 1/2. **DONE 2026-09-16, recon-only, no
+  production diff** (design doc:
+  `docs/design/0100-0149/m0142-0003e-bench-cluster-missing-fk-constraints.md`).
+  (a) `GOOPG_PGSHAPED_DP` re-confirmed **ON by default**
+  (`joinsearch.go:76`) — the FK/superkey arm is live in production, not
+  disabled. (b) The clause-matching precondition DOES recognize
+  `partsupp_pk` against this exact clause shape — proven by existing tests
+  that already reproduce this scenario byte-for-byte:
+  `TestCalcJoinrelSizeCompositeUniqueRetainsEqualities` and
+  `TestCalcJoinrelSizeBareCompositeDefaultsKeepEqualityAndBound`
+  (`internal/optimizer/joinrelsize_test.go`, both PASS at HEAD) use the SAME
+  6,000,000/800,000 row counts and NDistinct values as the real Q9 repro and
+  assert `superkeyJoinSelectivity` returns `boundProven=true, fired=false` —
+  i.e. a bare (non-FK) composite UNIQUE index is **deliberately** bound-only
+  evidence, never a selectivity substitution; only a **declared foreign
+  key** (`provableJoinKeys`'s second, `fromFK`-gated loop) fires the
+  `1/rawTuples` substitution. This matches PG's own
+  `get_foreign_key_join_selectivity` (`selfuncs.c`), which also requires a
+  `pg_constraint` row, not just a unique index on the referenced side.
+  **The mechanism is correct and reaches this case; it does not fire because
+  the join genuinely is not backed by a declared FK in goopg's schema.**
+  Checked live (read-only `pg_constraint`/`\d`/`pg_indexes`, no writes, no
+  restarts): goopg's HammerDB-loaded `:65433` TPC-H cluster has **zero**
+  FK constraints on any table (`lineitem_part_supp_fkidx` is a plain index
+  despite its name); the PG 18.3 oracle at `:65432` has the **full canonical
+  8-constraint TPC-H FK set** (`lineitem_partsupp_fk` etc.), added by an
+  untracked manual step outside any script in the repo, never mirrored onto
+  goopg's cluster. PG's own `EXPLAIN` on the bare join gets `rows=5999098`
+  (essentially exact) via that declared FK;
+  `TestCalcJoinrelSizeFKDividesByParentCount` shows goopg's identical
+  mechanism would produce the equivalent near-exact estimate given the same
+  FK metadata — goopg's FK machinery (`catalog.ForeignKey`,
+  `internal/parser/ast.go:3389`'s purpose-built HammerDB-TPC-H-FK-shape
+  support) is not the blocker either. **Conclusion: no code change
+  indicated — this is a bench-cluster schema/data-load parity gap, not a
+  planner or cost-model defect**, and it reframes -0003c's "real 64% cost
+  gap": that PG measurement carried PG's own FK-informed near-exact row
+  estimate throughout, while the goopg-side shape being priced carried the
+  2500x-collapsed one, so the two costs were never pricing comparably-sized
+  intermediates. Follow-up filed as **M0142-0003f** (below).
+- [ ] **M0142-0003f — add the missing FK constraints to goopg's TPC-H bench
+  cluster to restore parity with the PG oracle, then re-measure Q9** — filed
+  by -0003e. Add the canonical 8-constraint TPC-H FK set (`lineitem_partsupp_fk`
+  on `lineitem(l_partkey, l_suppkey) REFERENCES partsupp(ps_partkey,
+  ps_suppkey)`, `lineitem_order_fk`, `partsupp_part_fk`,
+  `partsupp_supplier_fk`, `order_customer_fk`, `supplier_nation_fk`,
+  `customer_nation_fk`, `nation_region_fk` — exact names/columns confirmed
+  live on the `:65432` PG oracle this loop, `pg_constraint WHERE
+  contype='f'`) to goopg's `:65433` bench cluster via `ALTER TABLE ... ADD
+  CONSTRAINT ... FOREIGN KEY ...` (parser support already exists,
+  `internal/parser/ast.go:3389`/`ddl.go:10276`). Add the DDL to
+  `bench/tpch/build_schema_goopg.sh` (or a new post-load step) so it survives
+  a `--reset` rebuild, not just a one-off manual `ALTER TABLE` against the
+  live cluster. After landing, re-run the Q9 `EXPLAIN`/estimate-audit capture
+  from -0003a/-0003d to see whether the row-estimate collapse is gone and
+  whether Q9's plan shape or cost gap changes — this is a fresh measurement,
+  not assumed. Also worth a quick corpus-wide `pg_constraint` diff between
+  the two clusters before trusting any OTHER M0142 "row-estimate collapse"
+  finding's causal story, since this same gap could be masquerading as an
+  estimator bug elsewhere.
 - [x] **M0142-0004 — re-measure TPC-DS's row-estimate error at HEAD** — the
   ledger row `take3-rowest-collapse-diagnosed` (`.ralph/deferral_ledger.md:2120`,
   2026-09-06) named four cuts in order — **B1, A1, A2, A3** — and pinned the
