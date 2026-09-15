@@ -34,7 +34,16 @@ Setup / start / stop procedures:
   per-DB catalog work, goopg persists `CREATE DATABASE`: the tables live in a
   durable `tpch` database and `tpch@tpch` works across restarts (verified on
   the 2026-07-27 rebuild), so `make plan-gate` works against a restarted
-  server too. Two known quirks of the rebuilt layout: HammerDB's final
+  server too. **Caveat added 2026-09-16 (M0142-0003j, unresolved):** that
+  verification covered a graceful restart only. An unclean shutdown
+  (`goopg stop -mode immediate`) + crash-recovery restart of the live
+  `:65433` cluster on 2026-09-16 came back with the `tpch` database's
+  entire TPC-H dataset and all constraints gone (replaced by unrelated
+  scratch tables, physical heap files orphaned on disk) — root cause not
+  yet pinned (candidates: a genuine WAL/checkpoint recovery gap, or an
+  unrelated process running test DDL against the shared database). Treat
+  "persists across restarts" as unproven for anything but a graceful
+  stop until M0142-0003j closes. Two known quirks of the rebuilt layout: HammerDB's final
   ANALYZE step fails and `ANALYZE <table>` inside db `tpch` errors
   "relation does not exist" (per-DB scoping gap in the ANALYZE path — see
   the archived ledger row `bench-reorg ANALYZE-scope`, resolved 2026-07-27 by

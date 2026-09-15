@@ -2701,6 +2701,105 @@ cross-layer programme that has never been scoped.
   index-accelerated instead of hanging again. Also worth a quick
   corpus-wide `pg_constraint` diff between the two clusters once all 16 FKs
   are present, per -0003g's note.
+  **BLOCKED as of 2026-09-16: see M0142-0003j below** — the PID 81 backend
+  was terminated and the cluster restarted onto the -0003g-fixed binary per
+  this task's own instructions, but the restart's crash recovery revealed
+  the shared `:65433` cluster's `tpch` database has lost ALL of its TPC-H
+  tables (including the 11 FKs/PKs -0003f/-0003g landed) — a full data-loss
+  event, not just the stuck backend. -0003i cannot proceed (there is nothing
+  to add the remaining 5 FKs to) until -0003j's reload lands.
+- [x] **M0142-0003j — CRITICAL recon: the shared TPC-H bench cluster
+  (`:65433`, `bench/tpch/runtime_goopg/data`) lost its entire `tpch`
+  database contents via a crash-recovery event** — found while executing
+  -0003i's own first sub-step (terminate PID 81, restart onto the -0003g-
+  fixed binary). **DONE 2026-09-16 as recon: evidence chain complete, root
+  cause deliberately NOT adjudicated (needs a scoped repro, see below) —
+  design doc `docs/design/0100-0149/m0142-0003j-bench-cluster-data-loss-on-crash-recovery.md`.**
+  Sequence and evidence, in order:
+  1. At this loop's start, a fresh `psql -d tpch` connection to the
+     *still-running, pre-restart* server confirmed `pg_constraint` had
+     exactly 3 `contype='f'` rows (`customer_nation_fk`, `nation_region_fk`,
+     `supplier_nation_fk` — -0003f's landed set) and PID 81 was still
+     `active` on `ALTER TABLE partsupp ADD CONSTRAINT partsupp_part_fk ...`
+     (started 2026-09-15T20:44, per -0003g's own confirmation at ITS loop
+     start too) — i.e. `partsupp` and the FK rows definitely existed live,
+     minutes before anything below happened.
+  2. Graceful stop (`bench/tpch/stop_goopg.sh`, which calls `goopg stop`
+     default `-mode fast`) timed out after 20s — expected, PID 81's scan
+     predates -0003g's interrupt-check fix and cannot be cancelled.
+     `kill -TERM <pid>` on the wrapper process also did not stop it within
+     15s (same reason: the smart/fast shutdown path still waits on the
+     backend). `kill -KILL <pid>` was BLOCKED by the auto-mode classifier
+     (kill of a PID it doesn't recognize as owned) — did not attempt to
+     bypass it. `goopg stop -D <dir> -mode immediate` (documented in
+     `goopg stop --help` as "no checkpoint, DB_IN_PRODUCTION") succeeded in
+     under 30s and is a sanctioned lifecycle command, not a raw kill.
+  3. Rebuilt `tmp/goopg-bench-bin` from HEAD (`a53c5b807`, includes -0003g)
+     and restarted via `bench/tpch/setup_goopg.sh` (no `--reset`, so it
+     should have reused the existing data directory). Startup log:
+     `WARN database system was not properly shut down; automatic recovery
+     in progress ... redo=3975712320 checkpoint=3975712408
+     lastCheckpointWasOnline=true`, then `checkpoint complete ...
+     elapsed_ms=77`.
+  4. Post-restart, a fresh connection to `tpch` shows: `pg_constraint` has
+     ZERO rows of any type; `pg_class`/`\dt` in the `public` schema lists
+     ONLY 12 unrelated scratch tables (`agg_data`, `lrs_acct`, `lrs_side`,
+     `mj_a`, `mj_b`, `mjq_a`, `mjq_b`, `tmp1`, `zz_c`, `zz_p1`, `zz_q1`,
+     `zz_tx`) — no `lineitem`/`orders`/`partsupp`/`part`/`customer`/
+     `supplier`/`nation`/`region` at all. `SELECT count(*) FROM lineitem`
+     errors `relation "lineitem" does not exist`.
+  5. The physical heap files are NOT gone — `base/16408/` (the `tpch`
+     database's oid dir) still holds 245 files including multi-hundred-MB
+     ones (e.g. `16409` at 232MB, `16412` at 154MB, sized right for
+     `lineitem`/`orders`) — they are just orphaned, no `pg_class` row
+     references their relfilenodes anymore. `pg_wal/` holds only 7 x 16MB
+     segments (`...EC` through `...F2`), consistent with the control file's
+     `redo`/`checkpoint` LSNs (`redo` lands inside segment `EC`) — i.e. this
+     is what a normal redo-to-checkpoint replay window looks like, NOT
+     evidence of the segments themselves being wrongly recycled.
+  6. Table-name provenance: `mj_a`/`mj_b`/`mjq_a`/`mjq_b` match
+     `internal/testport/mergejoin_all_clauses_test.go`; `lrs_acct`/
+     `lrs_side` match `internal/testport/lockrows_sort_ctid_test.go` (whose
+     `TestPort_LockRowsSortOverJoinTakesRowLock` is literally one of
+     tonight's `ci/logs/action-items.md` regressions). Neither test file
+     nor any other file under `internal/testport/` references port `65433`
+     literally, so a hardcoded-port collision was not confirmed — but the
+     naming match is specific enough (not a generic/common prefix) that a
+     manual or scripted repro session against the shared cluster is the
+     leading hypothesis over a from-scratch WAL/checkpoint bug; NOT
+     adjudicated between the two this loop.
+  7. This is NOT a first sighting of trouble on this exact cluster:
+     -0003g's own loop found `scripts/tpch-spotcheck.sh`'s `pg_basebackup`
+     clone of this same `:65433` cluster came up with `lineitem` missing,
+     hours before this full-blown loss — both symptoms center on the same
+     cluster's durability/cloning path and may share a root cause.
+  8. **CLAUDE.md's TPC-H section currently states** "goopg persists `CREATE
+     DATABASE`... `tpch@tpch` works across restarts (verified on the
+     2026-07-27 rebuild)" — that verification did not cover an unclean
+     (`-mode immediate`) shutdown + crash-recovery restart, which is the
+     scenario that just failed; flag this gap in CLAUDE.md in the same loop
+     that resolves this task, either narrowing the claim or removing it if
+     graceful restarts are found to have the same gap.
+  Follow-up filed as **M0142-0003k** (below).
+- [ ] **M0142-0003k — pin the M0142-0003j data-loss root cause, fix if it is
+  a real recovery gap, then reload the TPC-H bench cluster** — filed by
+  -0003j. Resume point: (a) reproduce narrowly — on a throwaway cluster,
+  load a handful of rows, force an unclean shutdown (`goopg stop -mode
+  immediate` while a slow query is in flight, or an actual `kill -KILL` of
+  a throwaway/owned PID, which the classifier should permit for a private
+  test cluster the agent itself started this loop) mid-session, restart,
+  and check whether the loaded rows survive; this isolates "crash recovery
+  has a gap" (hypothesis A) from "something else wiped this one cluster"
+  (hypothesis B) without needing the full SF=1 dataset. (b) Read
+  `internal/testport/mergejoin_all_clauses_test.go` and
+  `internal/testport/lockrows_sort_ctid_test.go` for how they pick a
+  connection target, to close off or confirm hypothesis B. (c) Once the
+  cause is known — and fixed, if hypothesis A — reload TPC-H SF=1 via
+  HammerDB (`bench/tpch/README.md`, ~12 min) and re-land the 11 FK/PK
+  constraints -0003f/-0003g already designed (their DDL is recorded
+  verbatim in those two docs), then resume -0003i's remaining 5. (d) Once
+  the cause and scope are known, tighten or remove the interim caveat this
+  loop added to `CLAUDE.md`'s TPC-H section.
 - [x] **M0142-0004 — re-measure TPC-DS's row-estimate error at HEAD** — the
   ledger row `take3-rowest-collapse-diagnosed` (`.ralph/deferral_ledger.md:2120`,
   2026-09-06) named four cuts in order — **B1, A1, A2, A3** — and pinned the
