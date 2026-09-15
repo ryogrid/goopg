@@ -1637,22 +1637,44 @@ spill route is net-negative.
     parallel-shaped residual large enough to justify them — do not start S3
     on K96/K97's say-so alone.
 
-- [ ] **M0141-S1 — serial Hashed-vs-Sorted audit (selectable now)** — audit why
-  goopg's existing cost-based Hashed/Sorted `PathAgg` candidate contest
-  (`groupingpaths.go`) doesn't produce PG's shape for TPC-H's `aggregation-strategy`(10)/
-  `sort-strategy`(9) queries, none of which can involve Gather/GatherMerge under
-  the canonical `-serial=true` protocol. First action: resolve the apparent
-  contradiction between `plan.go:1346-1348`'s comment ("planner does not set
-  [`Strategy`] yet") and `createplansimple.go:173,219`, which already wires a
-  winning path's `AggStrategy` onto the executor node. Second action: a live
-  capture+`pg-plan-parity-diff.py` pass to split TPC-DS's 69/76 into
-  serial-shaped (in S1/S2's scope) vs already-parallel-blocked (M0140's floor,
-  out of scope here). Recon task, per the plan-parity harness — measurement
-  first, fix in S2.
-- [ ] **M0141-S2 — land the serial fix** — implement whatever S1 finds (expected:
-  a cost formula or pathkey-availability gap in already-shipped machinery, not
-  a new subsystem) for TPC-H first, then the TPC-DS non-parallel-blocked subset
-  S1 identified. Needs S1's finding.
+- [x] **M0141-S1 — serial Hashed-vs-Sorted audit (selectable now)** — DONE
+  2026-09-15, design doc
+  `docs/design/0100-0149/m0141-s1-serial-aggstrategy-audit.md`. No production
+  change. **Action 1** (resolve the `plan.go:1346-1348` vs
+  `createplansimple.go:173,219` contradiction): the comment is stale/wrong.
+  `groupingpaths.go:addGroupingPaths` already runs a genuine cost-based
+  Hashed-vs-Sorted `PathAgg` contest via `addPath`; `createAggPlan`/
+  `createFinalizeAggPlan` copy the winner's `AggStrategy` onto the executor
+  node (`out.Strategy = p.AggStrategy`); `operators_join_agg.go:2222`'s
+  `openSorted` dispatch guard's `Mode == AggModeSimple` clause is
+  unconditionally true under `-serial=true` — so the serial path is wired
+  end to end, no missing link. Open for S2: *why* the contest doesn't pick
+  PG's shape (cost-term mismatch vs candidate never generated), not whether
+  it runs. **Action 2** (live capture + split): fresh capture against the
+  live bench clusters confirmed TPC-H's 10 aggregation-strategy/9
+  sort-strategy tags are serial-shaped by construction (`parallelism=0`
+  under `-serial=true` on both engines — match=6 floor held). For TPC-DS
+  (SF0.25, `capture-tpcds.sh`, parallelism NOT forced off —
+  `max_parallel_workers_per_gather=4`), classified each of 83 union-tagged
+  queries by whether **PG's own reference plan** contains a
+  `Partial`/`Finalize (Group)?Aggregate` or `Gather Merge` marker: 51 are
+  AGGSPLIT-touched (stays gated per S0's entry gate + M0140's parallelism
+  floor), **32 are fully serial in PG's own plan** — in S1/S2 scope right
+  now (list: Q1, Q2, Q8, Q10, Q18, Q22, Q23, Q24, Q26, Q30, Q31, Q32, Q42,
+  Q45, Q49, Q52, Q53, Q54, Q55, Q56, Q59, Q60, Q63, Q69, Q71, Q80, Q81, Q83,
+  Q91, Q92, Q93, Q94; match=2 floor held). Materially sharper than S0's
+  "unseparated mix" placeholder. Caveat: marker search, not a structural
+  proof the marker attaches to the query's aggregate specifically — S2
+  should re-verify per query it actually works.
+- [ ] **M0141-S2 — land the serial fix** — per-query trace of the up-to-42
+  serial-shaped queries S1 named (TPC-H's 10/9, all serial; TPC-DS's 32-query
+  list) to determine, for each, whether goopg's Sorted `PathAgg` candidate was
+  priced-and-lost (a `costAgg` term disagrees with PG's `cost_agg`) or never
+  generated (`presortedAggKeysOrAbsent`/`groupingHasSpecialAgg` declines);
+  land the fix that trace implies (expected: a cost formula or
+  pathkey-availability gap in already-shipped machinery, not a new
+  subsystem), plus the one-line `plan.go:1343-1349` comment correction S1
+  diagnosed as stale. Needs S1's finding (done, see above).
 - [ ] **M0141-S3 — Partial-Sorted row emission** — a second Partial-mode code
   path (`Strategy = AggStrategySorted`) emitting real rows (group key + one
   serialized-state column per aggregate) instead of merging into
