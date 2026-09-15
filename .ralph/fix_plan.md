@@ -2331,6 +2331,13 @@ spill route is net-negative.
   it as its own scoping task before attempting it (K24 already calls this the
   workstream's largest single item; do not attempt in one sitting). Needs
   M0141-S2 (done, see above) for the concrete TPC-H query list motivating it.
+  **Second, independent motivation added 2026-09-16 (M0141-S7's re-adjudication
+  recon)**: this same surgery is also the sole prerequisite for all 14 of
+  M0141-S7's TPC-DS Incremental-Sort witnesses (confirmed by reading all 4 real
+  `createOrderedPaths` call sites in `planner.go` — none is GROUP_AGG-specific,
+  so this task's already-general scope covers the join/window/distinct
+  witnesses too, not just the aggregate ones). See
+  `docs/design/0100-0149/m0141-s7-readjudicate-and-scope-incremental-sort.md`.
 - [ ] **M0141-S3 — Partial-Sorted row emission** — a second Partial-mode code
   path (`Strategy = AggStrategySorted`) emitting real rows (group key + one
   serialized-state column per aggregate) instead of merging into
@@ -2376,6 +2383,40 @@ spill route is net-negative.
   Port `create_incremental_sort_path` and the executor node; PG oracle
   `postgres/src/backend/optimizer/path/pathkeys.c` + `nodeIncrementalSort.c`.
   Owner of the `sort-strategy` category (TPC-DS 76 / TPC-H 9).
+  **UPDATE 2026-09-16 (re-adjudication + scoping recon, DONE, no production
+  change): verdict GO, but implementation is gated on M0141-S2b.** Design doc:
+  `docs/design/0100-0149/m0141-s7-readjudicate-and-scope-incremental-sort.md`.
+  **Re-adjudication**: `take3-C-14-dropped`'s performance measurement stands
+  and is not disputed; it is simply no longer the deciding question under the
+  plan-parity harness's "a slower plan that matches is not a regression" —
+  **GO**. **Decisive new finding**: read all 14 TPC-DS witnesses in
+  `bench/tpcds/plans-pg/*.txt` directly — every one sits immediately above a
+  node whose own output is already ordered by a prefix of the downstream
+  `ORDER BY` (`GroupAggregate`x5 by GROUP KEY, `WindowAgg`x1 by PARTITION BY,
+  `Merge Join`x2 by its own Merge Cond, `Nested Loop`x4 by its outer child's
+  order, `Unique`x1 trivially, `Subquery Scan`x1 passthrough) — never an
+  arbitrary scan/join. Read `createOrderedPaths`/`addOrderedPaths`
+  (`upperordered.go:63-127`) directly: all 4 real `planner.go` call sites
+  (799/1965/2023/11022) already collapse their producing rel to a single
+  executor `Node` before calling here, so only one synthetic single-candidate
+  `*Path` ever reaches the ORDER BY contest — confirming **all 14 witnesses
+  need M0141-S2b** (already filed, and already scoped generally as "every
+  `createXPaths` -> `createOrderedPaths` call site", not GROUP_AGG-only — no
+  widening needed) before an Incremental Sort candidate has anything to build
+  over. **Sizing beyond S2b**: most needed machinery already exists under a
+  different name — `pathkeysContainedIn` (sibling of the needed prefix-count
+  helper), `estimateNumGroups`, `costSortRunWithWidth`/`sortPathForBounded`
+  (`cost_incremental_sort` composes the full-sort cost per group), and the
+  executor's already-landed, zero-caller presorted-prefix grouping contract
+  `sortPrefixEqual` (`internal/executor/sort_presorted.go`, E-15) — sizing this
+  increment closer to a single cardinality/cost slice (M0142-0012-class) than
+  to the M0141-S3-S6 AggSplit programme. **Stays unchecked**: GO + scope
+  delivered, not implementation, which cannot start before S2b lands. Resume
+  point: once S2b lands, re-run this task's 14-query census against a post-S2b
+  capture, then implement in order (prefix-count helper -> cost function ->
+  `PathIncrementalSort`/`addOrderedPaths` third arm -> executor operator ->
+  `createplansimple.go` wiring -> EXPLAIN rendering), each pinned by a test.
+  Ledger row filed: `.ralph/deferral_ledger.md` (2026-09-16, `m0141-s7`).
 
 ## M0142 — Join-order costing (filed 2026-09-14)
 
