@@ -1,91 +1,81 @@
-Task: M0141-S2b-5 — instrumented-trace recon resolving whether
-`electOrderedGrouping`'s `anyTranslated` gate declines for the 6 GROUP_AGG
-mechanism-B TPC-H queries. DONE and committed this loop. Hypothesis REFUTED
-(again) — the real cause is one level further downstream than either S2b-0
-or S2b-5 assumed.
+Task: M0141-S2b-6 — compare goopg's costed Hashed vs. Sort-over-Sorted
+`PathAgg` candidate numbers at Q4/Q5/Q12/Q21 against PG's cost formulas.
+DONE and committed this loop, as a recon (measurement + design note +
+follow-up task, per the group's recon exception). Result: S2b-5's own
+numbers do NOT reproduce — the synthetic-dataset probe pattern this whole
+S2b sub-thread relied on cannot answer this question.
 
-Files: `internal/optimizer/upperorderedgrouping.go` (PERMANENT change —
-added a `traceGroupDecline` helper + `DPGROUP` trace lines at every decline
-point in `groupingEmissionPathkeys`, a success-translation line, and a
-loop-decline/election-outcome line in `electOrderedGrouping`; all gated on
-the pre-existing `dpTrace`/`GOOPG_PGSHAPED_DP_TRACE`, zero behavior change
-when off, unit tests still pass). `docs/design/0100-0149/m0141-s2b-scoping-decomposition.md`
-(new "S2b-5 result" section). `docs/design/README.md` (index blurb updated).
-`.ralph/fix_plan.md` (S2b-5 closed `[x]` with result; new `M0141-S2b-6`
-filed as the direct continuation — now a cost-model investigation, not a
-wiring-gap search). `.ralph/deferral_ledger.md` (new row, task-id
-`m0141-s2b-5`). Scratch test file `internal/testutil/tpch/zzz_scoping_probe_test.go`
-was created to run the trace and deleted before commit (same precedent as
-S2b-0) — nothing from it is in the tree or history.
+Files: `docs/design/0100-0149/m0141-s2b-scoping-decomposition.md` (new
+"S2b-6 result" section — the per-query cost table, the methodology note
+explaining why it disagrees with S2b-5 on the same commit, the resume
+point). `docs/design/README.md` (index blurb updated). `.ralph/fix_plan.md`
+(S2b-6 closed `[x]` with result; new `M0141-S2b-6-resume` filed, gated on
+M0142-0003k). `.ralph/deferral_ledger.md` (new row, task-id `m0141-s2b-6`).
+Scratch test file `internal/testutil/tpch/zzz_s2b6_probe_test.go` was
+created to run the probe and deleted before finishing (same precedent as
+S2b-0/S2b-5) — nothing from it is in the tree or history.
 
-Key symbols/paths: `internal/optimizer/upperorderedgrouping.go` —
-`groupingEmissionPathkeys` (now traces every nil-return reason),
-`electOrderedGrouping` (now traces `decline(reason)`/`restore(reason)`
-call sites and the final elected shape: `Sort-over-Aggregate` vs
-`bare-Aggregate`, plus winning `AggStrategy`). `tmp/take4/runs/plansweep/
-q04.{pg,goopg}.txt` — uncommitted scratch capture cited as corroborating
-evidence (real PG picks `GroupAggregate` fed by a Sort BELOW it for Q4; no
-Sort above; goopg's captured plan is the mirror-image Sort-over-Hashed
-shape this loop's trace predicts).
+Key symbols/paths: `internal/optimizer/groupingpaths.go` (`addGroupingPaths`
+— confirmed both Hashed and Sorted `PathAgg` candidates are built here, and
+the Sorted candidate always carries a real group-keys Sort over the RAW
+input via `sortPathForBounded`, unless `indexOrderedAggInput` matches — it
+did not for any of these 4 queries). `internal/optimizer/cost_funcs.go`
+(`costAgg`, `costSortRunWithWidth` — hand-verified term-by-term against
+`postgres/src/backend/optimizer/path/costsize.c:1898-1985` (`cost_tuplesort`)
+and `:2682-2768` (`cost_agg`); no divergence found in the formulas).
+`internal/optimizer/pathtrace.go` (`DPPATH` trace format, read not
+changed). `internal/optimizer/upperorderedgrouping.go` (`DPGROUP` trace
+from S2b-5, read not changed).
 
-Findings this loop: (1) A `go test` CACHE TRAP distinct from S2b-0's
-parallelism trap: the scratch probe lives in package `tpch_test`
-(`internal/testutil/tpch`), which does NOT import `internal/optimizer` at
-Go-compile-time — the server under test is a `go run ./cmd/goopg`
-subprocess. Editing `upperorderedgrouping.go` therefore does not change the
-probe package's own build inputs, and a first re-run after adding the
-instrumentation silently replayed a byte-identical CACHED `go test` result
-from before the trace existed (visible as `ok ... (cached)`, floating-point
-costs matching to 17 digits). Re-running with `-count=1` (the documented
-"one-off probe" carve-out, NOT a gate run) produced the real result.
-**Any future probe that changes code reached only through a
-`cluster.New`-spawned subprocess must force `-count=1`, or it silently
-re-reports stale findings.** Worth a memory note / AGENT.md line if this
-bites again. (2) The real trace: for ALL SIX of Q4/Q5/Q8/Q12/Q21/Q22,
-`electOrderedGrouping` reaches a real election — `anyTranslated` is `true`
-every time (only the trivially-excluded Hashed candidate ever hits a
-`DPGROUP decline` line; the Sorted candidate's translation always
-succeeds). Q4/Q5/Q12/Q21 elect `Sort`-over-`Hashed`-`Aggregate` (cost
-comparison prefers Hashed+explicit-Sort over the translated sort-free
-Sorted candidate); Q8/Q22 elect the sort-free Sorted candidate outright (no
-Sort node). (3) For Q4 specifically, a stale uncommitted scratch capture
-(`tmp/take4/...q04.{pg,goopg}.txt`) shows real PG's actual chosen shape is
-the mirror image: `Finalize GroupAggregate` fed by a `Sort` BELOW it (no
-Sort above) vs. goopg's Sort-above-HashAggregate. **Conclusion: the
-`electOrderedGrouping`/`groupingEmissionPathkeys` mechanism this whole
-design doc (S2b, S2b-0, S2b-5) set out to find a wiring gap in was ALREADY
-COMPLETE AND CORRECTLY WIRED the entire time for the GROUP_AGG rel** — the
-actual, newly-identified root cause for the 4 TPC-H "mechanism (B)"
-witnesses is a cost-model discrepancy in the Hashed-vs-Sorted `PathAgg`
-comparison (or the Sort/GroupAggregate cost terms feeding it), a
-completely different and larger class of bug than anything in the S2b
-decomposition. Filed **M0141-S2b-6** to chase it, with an explicit caution
-citing M0141-S2a-fix2's precedent (a plausible-looking fix in this same
-neighbourhood was tried, measured net-negative, and reverted) — reproduce
-and understand the discrepancy numerically before proposing any change.
+Findings this loop: re-ran the S2b-0/S2b-5 probe pattern (`cluster.New` +
+`tpch.DDL()` + synthetic load) but with **`ANALYZE` on all 8 tables**
+(S2b-0/S2b-5 used `ANALYZE region` only, borrowed from `tpch_run_test.go`'s
+convention). At the SAME commit S2b-5 measured (`51a2d176d`): Q5/Q21 still
+cleanly elect Hashed+Sort-above (genuinely correct — their ORDER BY doesn't
+match GROUP BY columns, so the Sorted candidate needs an extra dominated
+Sort). **Q4/Q12 now elect Sorted (bare Aggregate) — the OPPOSITE of
+S2b-5's table**, on the identical commit. Traced why: Q4/Q12's join inputs
+estimate `rows≈1` on this 5-16-row synthetic dataset, so `numGroups ≈
+inputRows` (both clamp to 2 by the "never log(0)" floor both `cost_tuplesort`
+and `costSortRunWithWidth` share) — the Sorted candidate's input-Sort term
+(nominally the expensive `O(N log N)` term at real scale) and the Hashed
+candidate's output-Sort term (nominally the cheap `O(G log G)` term) price
+the IDENTICAL two clamped tuples and land on bit-identical totals (0.3525,
+2.54 — verified in the `DPPATH`/`DPGROUP` trace, both runs). The election is
+an exact tie broken only by a <0.02-cost-unit startup-cost tiebreak that
+ANALYZE coverage nudges either way — noise, not a cost-model bug. **This
+means the synthetic-dataset probe this whole S2b sub-thread has used cannot
+answer S2b-6's specific question**: the input-Sort vs output-Sort terms only
+separate into a real signal when `inputRows >> numGroups`, which needs real
+SF1-scale cardinalities (tens of thousands of rows vs a handful of groups),
+not a hand-built tiny fixture of any size. It does NOT confirm or refute
+S1/S2's original 6-query TPC-H "mechanism (B)" finding (that was measured
+against the real SF1 HammerDB-loaded `:65433` cluster, not this synthetic
+one) — it only shows this specific probe methodology was the wrong
+instrument for S2b-6's question, even though it was the right instrument
+for S2b-0/S2b-5's binary questions (does a gate decline / does a
+translation succeed).
 
-Next step: pick per the `## Current Priority` banner (re-read it first in
-case it changed) — **M0141-S2b-6** is the direct continuation but is sized
-as a real cost-model investigation (diff goopg's DPPATH-captured
-startup/total for both candidates against PG's `cost_agg`/`cost_sort`
-formulas in `postgres/src/backend/optimizer/path/costsize.c`, then get a
-FRESH PG capture for Q5/Q12/Q21 — only Q4 was checked against a real
-capture this loop, Q5/Q12/Q21 are asserted by code-read symmetry only).
-**M0141-S2b-1** (DISTINCT loop-fix) remains available as an independent,
-cheaper pick if S2b-6 is deprioritized. Do NOT attempt **M0141-S2b-2**
-blind (needs its own scoping pass, per K24). M0142-0003i/-0003k(c) (shared
-`:65433` TPC-H cluster reload) remain BLOCKED on a human decision.
+Next step: pick per the `## Current Priority` banner (re-read first in case
+it changed). **M0141-S2b-6-resume** (repeat this same term-by-term diff
+against the real SF1-loaded `:65433` cluster) is gated on **M0142-0003k**'s
+TPC-H cluster reload — a human-authorized shared-resource write, not
+something to attempt unattended. Until that reload happens,
+**M0141-S2b-1** (DISTINCT loop-fix, cheapest net-new slice, no new
+plumbing, independent of the S2b-6 cost-model question) is the next
+concretely actionable pick inside M0141-S2b. Do NOT attempt **M0141-S2b-2**
+blind (needs its own scoping pass, per K24). M0142-0003i/-0003k(c) (the
+shared cluster reload itself) remain BLOCKED on a human decision, as before.
 
-Gates run: `go build ./internal/optimizer/...` clean. `go test
-./internal/optimizer/...` (full package, not just the touched file) —
-PASS, no regressions from the trace instrumentation. `scripts/tpch-spotcheck.sh`
-run per the executor/planner practice card — SKIPPED (expected: shared
-`:65433` cluster's `tpch` schema is still gone, per M0142-0003k, exits 0
-cleanly, not a new failure). `make ralph-state-guard` — pass (see status
-block). Pre-commit hook's pgbench smoke will run automatically on commit.
+Gates run: `go build ./...` clean (no production code changed this loop —
+pure recon/measurement + docs). `make ralph-state-guard` — found a
+status/progress inconsistency from the previous loop's clean-exit marker,
+auto-repaired, then passed (see status block). Pre-commit hook's pgbench
+smoke will run automatically on commit. No `go test` gate run since no
+production code changed (the scratch probe itself passed, then was
+deleted).
 
 In-flight: none. The scratch probe's throwaway `cluster.New` server shut
-down cleanly via its own `defer c.Stop()`; verified via `ps aux | grep
-goopg` afterward (only the pre-existing shared `:65432`/`:65433` clusters
-remain running, untouched). Debug log `/tmp/goopg_cluster_debug/s2b5-probe.log`
-deleted.
+down cleanly via its own `defer c.Stop()`; verified via the debug log
+(`/tmp/goopg_cluster_debug/s2b6probe.log`, deleted after extracting the
+numbers cited above — nothing else references it).

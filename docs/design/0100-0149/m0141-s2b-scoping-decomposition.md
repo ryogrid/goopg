@@ -312,3 +312,101 @@ carry `startup`/`total` for both — a fresh probe run needs no new
 instrumentation) against what PG's cost formulas would produce for the same
 shapes, to find which specific cost term is under- or over-pricing one side.
 Filed as **M0141-S2b-6** below.
+
+## S2b-6 result (2026-09-16) — synthetic-data probe REFUTES its own inputs; the real question needs SF1 scale, not a code-read
+
+Ran the same `cluster.New` + `tpch.DDL()` + synthetic-load probe pattern as
+S2b-0/S2b-5, this time with **`ANALYZE` run on all eight tables** (S2b-0/
+S2b-5 followed `tpch_run_test.go`'s convention of `ANALYZE region` only —
+see the methodology note below) and captured the live `DPPATH`/`DPGROUP`
+numbers for Q4/Q5/Q12/Q21 at HEAD (`51a2d176d`, same commit S2b-5 measured
+against). Scratch test file `internal/testutil/tpch/zzz_s2b6_probe_test.go`
+deleted after use (same precedent as S2b-0/S2b-5); nothing from the probe
+harness itself is committed.
+
+**The result does not reproduce S2b-5's table.** With full `ANALYZE`
+coverage, only Q5 and Q21 elect `Sort-over-Aggregate`/`strategy=0` (Hashed);
+Q4 and Q12 elect `bare-Aggregate`/`strategy=1` (Sorted) — the opposite of
+what S2b-5 reported for those two. Concretely, from the `DPGROUP`/`DPPATH`
+trace:
+
+| query | ORDER BY vs GROUP BY | Hashed own total | Sorted own total (incl. input Sort) | Hashed+Sort-above total | Sorted-passthrough total | elected |
+|---|---|---|---|---|---|---|
+| Q4  | same column (`o_orderpriority`) | 0.3375 | 0.3525 | 0.3525 | 0.3525 | **tie → Sorted** (lower startup 0.330 vs 0.3475) |
+| Q5  | different (`sum(...)` DESC) | 6.82 | 6.835 | 6.835 | 6.85 (extra Sort needed, dominated) | **Hashed**, cleanly |
+| Q12 | same column (`l_shipmode`) | 2.525 | 2.54 | 2.54 | 2.54 | **tie → Sorted** (lower startup 2.5125 vs 2.535) |
+| Q21 | different (`count(*) DESC, s_name`) | 5.00 | 5.015 | 5.015 | 5.03 (extra Sort needed, dominated) | **Hashed**, cleanly |
+
+Two findings, not one:
+
+1. **Q5/Q21 are not a discrepancy at all.** Their `ORDER BY` does not match
+   their `GROUP BY` columns (an aggregate expression, or a second column),
+   so the translated Sorted candidate still needs an *extra* Sort on top —
+   `groupingEmissionPathkeys` correctly prices that extra wrap (visible as
+   the second, `dominated` `upper.ordered.sort` line at 6.85/5.03) and
+   Hashed+cheap-output-sort correctly wins. This matches the EXPLAIN shape
+   goopg actually emits for both (`Sort` over `HashAggregate`) and is, on a
+   structural read, the same shape PG would choose for the same reason —
+   no cost-model bug here.
+2. **Q4/Q12's "election" is an exact tie broken by startup cost, not a
+   clean win either way**, and the tie is a **degeneracy of the synthetic
+   dataset, not a signal about the real cost model.** Both queries' join
+   inputs estimate at `rows≈1` on this 5-16-row synthetic load, so
+   `numGroups ≈ inputRows ≈ 1` (clamped to 2 by both `cost_tuplesort` and
+   `costSortRunWithWidth`'s "never log(0)" floor) — the Sorted candidate's
+   *input* Sort (nominally `O(inputRows · log inputRows)`, the expensive
+   term at real scale) and the Hashed candidate's *output* Sort (nominally
+   `O(numGroups · log numGroups)`, the cheap term) are pricing **the exact
+   same two clamped tuples** and land on bit-identical totals (`0.3525`,
+   `2.54`). At TPC-H SF1 scale `inputRows` (orders/lineitem-derived, tens of
+   thousands to millions of rows post-join) and `numGroups` (a handful of
+   `o_orderpriority`/`l_shipmode` values) are nowhere near equal, so this
+   tie **cannot occur** at the scale that actually motivated S2b-0/S1 — a
+   probe built on this dataset structurally cannot separate "which term is
+   under/over-priced" for Q4/Q12's shape, because the two terms it would
+   need to separate happen to collapse to the same input at this data size.
+   S2b-5's opposite result for the same two queries is the same degeneracy
+   resolved the other way by a small ANALYZE-driven perturbation (partial
+   vs full table coverage nudges the sub-0.02-cost-unit startup comparison
+   across the tie), not evidence of a different cost bug.
+
+**Methodology note, since this refutes S2b-5's own numbers on the same
+commit:** S2b-0/S2b-5's probe (deleted, unrecoverable verbatim) followed
+`tpch_run_test.go`'s `ANALYZE region` convention — i.e. `orders`/`lineitem`/
+etc. carried **no real statistics**, only planner defaults. This probe
+`ANALYZE`d all eight tables. That is very likely why Q4/Q12 fall on
+different sides of the tie between the two loops: different default-vs-real
+selectivity/ndistinct inputs perturb the already-near-zero-margin startup
+comparison. Neither run is "the bug" — **both are noise from a dataset too
+small to carry a real signal for this specific question.**
+
+**What this settles and what it does not:**
+- It does **not** reproduce, confirm, or refute S1/S2's original TPC-H
+  "mechanism (B)" 6-query finding — that finding was measured against the
+  real HammerDB SF1-loaded cluster (`:65433`), where `inputRows` and
+  `numGroups` are genuinely separated by orders of magnitude, not this
+  synthetic 5-16-row fixture.
+- It **does** establish that the tiny-synthetic-dataset probe pattern this
+  whole S2b sub-thread (S2b-0, S2b-5, and this task) has relied on is the
+  wrong instrument for S2b-6's specific question (a cost-term-under/over-
+  pricing comparison that only separates at real cardinality ratios), even
+  though it was the right instrument for S2b-0/S2b-5's questions (whether a
+  gate declines / whether a translation succeeds — both binary, both
+  reproduce regardless of scale).
+- It does **not** find any cost-model bug to fix. `costSortRunWithWidth`'s
+  clamp-at-2 and `costAgg`'s SORTED/HASHED arms both price the degenerate
+  tied case exactly as PG's `cost_tuplesort`/`cost_agg` would (hand-verified
+  term-by-term against `costsize.c:1898-1985`/`2682-2768` while writing this
+  section — no divergence found in the formulas themselves, only in the
+  data feeding them).
+
+**Resume point:** the real Hashed-vs-Sorted `PathAgg` comparison for Q4/Q5/
+Q12/Q21 can only be measured against real SF1-scale row/group cardinalities
+— i.e. it is **blocked on the same TPC-H bench cluster reload M0142-0003i/
+-0003k(c) already blocks** (`.ralph/fix_plan.md` M0142-0003k, `CLAUDE.md`
+"Benchmark clusters" §TPC-H caveat). Once the `tpch` database on `:65433` is
+reloaded, capture live `EXPLAIN`/`DPGROUP`/`DPPATH` for Q4/Q5/Q12/Q21 there
+directly (no synthetic fixture) and repeat this same term-by-term diff — at
+that scale a genuine discrepancy, if one exists, will show as a clean win/
+loss rather than a coincidental tie. Filed as **M0141-S2b-6-resume** below,
+gated on the reload.

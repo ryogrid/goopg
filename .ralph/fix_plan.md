@@ -2413,21 +2413,44 @@ spill route is net-negative.
     result". No scratch test file committed (deleted after use, same
     precedent as S2b-0). Filed **M0141-S2b-6** below as the direct
     continuation. Ledger row appended (task-id `m0141-s2b-5`).
-  - [ ] **M0141-S2b-6** — (filed 2026-09-16 by S2b-5's result) compare
+  - [x] **M0141-S2b-6** — (filed 2026-09-16 by S2b-5's result) compare
     goopg's actual costed Hashed vs. Sort-over-Sorted `PathAgg` candidate
-    numbers at Q4/Q5/Q12/Q21 (the existing `DPPATH` trace already carries
-    `startup`/`total` for both, no new instrumentation needed) against what
-    PG's cost formulas (`postgres/src/backend/optimizer/path/costsize.c`
-    `cost_agg`/`cost_sort`) would produce for the same shapes, to find which
-    specific term under/over-prices one side. **Caution before touching the
-    cost model**: M0141-S2a-fix2 already tried a plausible-looking fix in
-    this exact neighbourhood, measured net-negative/neutral, and was
-    reverted (banner item 1) — reproduce and understand the discrepancy
-    numerically before proposing a change, and re-measure end-to-end
-    (goopg_costmodel_has_no_parallel_dimension memory: check the parallel
-    dimension isn't lost by any fix). Verify against a FRESH PG capture for
-    Q5/Q12/Q21 too — S2b-5 only confirmed Q4 against a stale scratch
-    capture; Q5/Q12/Q21 are asserted by code-read symmetry only.
+    numbers at Q4/Q5/Q12/Q21 against PG's cost formulas. **DONE 2026-09-16 —
+    recon complete, S2b-5's own numbers do NOT reproduce.** Re-ran the same
+    synthetic-cluster probe with full (all-8-table) `ANALYZE`, vs. S2b-5's
+    `ANALYZE region`-only coverage: Q5/Q21 cleanly elect Hashed+Sort-above
+    (correct — their ORDER BY doesn't match GROUP BY, no cost bug), but Q4/
+    Q12 now elect Sorted (bare Aggregate), the OPPOSITE of S2b-5's table, on
+    the SAME commit. Root cause: Q4/Q12's join inputs estimate `rows≈1` on
+    this synthetic 5-16-row dataset, so `numGroups ≈ inputRows` (both clamp
+    to 2) and the Sorted candidate's input-Sort term and the Hashed
+    candidate's output-Sort term price the identical two clamped tuples —
+    an **exact tie** (`0.3525`/`2.54` both runs, down to the float) broken
+    only by a sub-0.02-unit startup-cost tiebreak that ANALYZE coverage
+    perturbs either way. Hand-verified `costSortRunWithWidth`/`costAgg`
+    against `costsize.c:1898-1985`/`2682-2768` term-by-term while at it: no
+    divergence in the formulas, only in the (degenerate) data feeding them.
+    **This synthetic-dataset probe pattern cannot answer S2b-6's question**
+    — the two terms it needs to separate only diverge when `inputRows >>
+    numGroups`, which requires real SF1 cardinalities. Full result, the
+    per-query cost table, and the methodology note in
+    `docs/design/0100-0149/m0141-s2b-scoping-decomposition.md` §"S2b-6
+    result". No production code changed; scratch probe deleted after use
+    (same precedent as S2b-0/S2b-5). Ledger row appended (task-id
+    `m0141-s2b-6`). Follow-up filed as **M0141-S2b-6-resume** below, gated
+    on the M0142-0003k TPC-H cluster reload (same blocker, not a new one).
+  - [ ] **M0141-S2b-6-resume** — repeat S2b-6's Hashed-vs-Sorted `PathAgg`
+    term-by-term cost diff for Q4/Q5/Q12/Q21 against the real HammerDB
+    SF1-loaded `:65433` cluster once reloaded (no synthetic fixture — real
+    `inputRows`/`numGroups` cardinalities, which is what separates the
+    input-Sort and output-Sort terms enough to show a genuine win/loss
+    instead of a tie). **Gated on M0142-0003k** (the shared cluster's
+    `tpch` database is currently empty; reload is a human-authorized
+    shared-resource write per that entry). Do not re-attempt with a bigger
+    synthetic dataset first — S2b-6 already showed the synthetic-fixture
+    approach is the wrong instrument for this question regardless of size
+    tuning, since the point is to observe PG's own real-data cost
+    comparison at genuinely separated cardinalities, not to construct one.
   Needs M0141-S2 (done, see above) for the concrete TPC-H query list
   motivating S2b-0/S2b-2. Ledger row appended (task-id `m0141-s2b`).
 - [ ] **M0141-S3 — Partial-Sorted row emission** — a second Partial-mode code
