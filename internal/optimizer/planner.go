@@ -2416,8 +2416,16 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 				}
 				outerKeys = append(outerKeys, SortKey{Expr: e, Desc: sb.Desc, NullsFirst: sortByNullsFirst(sb)})
 			}
-			if len(outerKeys) > 0 && !distinctOutputSatisfiesOrder(out, outerKeys) {
-				out = &Sort{pos: s.Pos(), Child: out, Keys: outerKeys}
+			if len(outerKeys) > 0 {
+				// M0141-S2b-1: let the ORDERED rel adjudicate BOTH
+				// `addDistinctPaths` candidates (hashed, unique-over-sorted)
+				// against outerKeys before falling back to the legacy
+				// single-node `distinctOutputSatisfiesOrder` check + always-Sort.
+				if built, ok := electOrderedDistinct(upper, spec, outerKeys, s.Pos(), plannerSet.costParams(), orderTupleFraction, orderLimitTuples); ok {
+					out = built
+				} else if !distinctOutputSatisfiesOrder(out, outerKeys) {
+					out = &Sort{pos: s.Pos(), Child: out, Keys: outerKeys}
+				}
 			}
 		}
 	}

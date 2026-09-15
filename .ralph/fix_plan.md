@@ -2372,10 +2372,30 @@ spill route is net-negative.
     specific next hypothesis (a possible `*ColumnRef`-only over-restriction
     in `groupingEmissionPathkeys`) since it is now concrete enough to name as
     its own task rather than leaving it embedded in S2b-0's prose.
-  - [ ] **M0141-S2b-1** — DISTINCT loop-fix (`electOrderedDistinct` /
+  - [x] **M0141-S2b-1** — DISTINCT loop-fix (`electOrderedDistinct` /
     `distinctEmissionPathkeys`, mirroring `electOrderedGrouping`/
-    `groupingEmissionPathkeys`). Cheapest net-new slice, no new plumbing.
-    Motivated by S7's TPC-DS "Unique x1" witness.
+    `groupingEmissionPathkeys`). **DONE 2026-09-16 — landed, tested, live-
+    verified; corpus has no witness that flips.** Implemented
+    `internal/optimizer/upperordereddistinct.go`, wired into `planner.go`'s
+    `s.Distinct` arm ahead of the legacy `distinctOutputSatisfiesOrder`
+    check. Caught and fixed a real bug during live verification: the first
+    version shared the caller's `UpperOrdered` rel (safe for grouping,
+    whose call site is always the first thing to touch it; unsafe for
+    DISTINCT, whose wrapper runs AFTER the generic ORDER BY block already
+    populated that same rel over the pre-distinct child) — fixed by using a
+    dedicated throwaway registry, regression-tested
+    (`TestElectOrderedDistinctIgnoresStalePreDistinctOrderedEntry`, verified
+    to fail pre-fix). **Correction**: this task's own motivating witness was
+    wrong — S7's TPC-DS "Unique x1" witness is Q49, whose `Unique` comes
+    from a plain `UNION` (SETOP/`addSetOpPaths`), not `SELECT DISTINCT`; it
+    belongs to **S2b-4**, not here (S7's witness table below is corrected in
+    the same edit). Of the corpus's real `SELECT DISTINCT` queries, only
+    TPC-DS Q41 pairs one with a matching ORDER BY, and it already matched
+    before this task (Hashed already won the ORDER-BY-blind tournament and
+    already passed the legacy check) — verified via TPC-DS SF0.25 cluster
+    `EXPLAIN` + `GOOPG_PGSHAPED_DP_TRACE=1`, before/after binary diff. Full
+    writeup: `docs/design/0100-0149/m0141-s2b-scoping-decomposition.md`
+    §"S2b-1 result".
   - [ ] **M0141-S2b-2** — base join/scan Pathlist-across-the-search-boundary
     surgery. This is the real K24 item; per K24's own warning, size it with
     its OWN further scoping pass before writing code — do not attempt in one
@@ -2385,8 +2405,12 @@ spill route is net-negative.
     the starvation hypothesis.
   - [ ] **M0141-S2b-3** — WINDOW loop-fix. Gated on S2b-2 (WINDOW has nothing
     of its own to loop over until then).
-  - [ ] **M0141-S2b-4** — SETOP rel-identity fix. No TPC-H/TPC-DS witness
-    currently motivates it; keep filed, do not schedule ahead of 1-3.
+  - [ ] **M0141-S2b-4** — SETOP rel-identity fix. **UPDATE 2026-09-16 (S2b-1's
+    own result section)**: DOES now have a witness — TPC-DS Q49's `Unique`
+    (S7's mis-mapped "Unique x1"; `select ... union select ... union select
+    ...`) is goopg's SETOP upper rel, not `SELECT DISTINCT`, so this is its
+    real home. Still not scheduled ahead of 1-3 on that basis alone (single
+    witness, same-sized surgery K24 already flagged as risky).
   - [x] **M0141-S2b-5** — resolve `electOrderedGrouping`'s `anyTranslated`
     decline for the GROUP_AGG mechanism-B queries now that `len(cands)<2` is
     refuted. **DONE 2026-09-16 — hypothesis ALSO REFUTED, root cause found
@@ -2528,9 +2552,16 @@ spill route is net-negative.
   the fallback to `createOrderedPaths` at `planner.go:1960`. The witnesses do
   not map to a single monolithic "S2b" any more: `GroupAggregate`x5 ->
   **M0141-S2b-0** (trace-confirm whether the loop's `len(cands)<2` decline is
-  why these still miss, not "S2b" wholesale); `Unique`x1 -> **M0141-S2b-1**;
+  why these still miss, not "S2b" wholesale);
   `Merge Join`x2 + `Nested Loop`x4 (+ likely `Subquery Scan`x1) ->
-  **M0141-S2b-2**; `WindowAgg`x1 -> **M0141-S2b-3** (gated on S2b-2). Every
+  **M0141-S2b-2**; `WindowAgg`x1 -> **M0141-S2b-3** (gated on S2b-2).
+  **CORRECTED 2026-09-16 (S2b-1's own result section)**: this row originally
+  read `Unique`x1 -> **M0141-S2b-1**, but Q49's `Unique` comes from a plain
+  `UNION` (goopg's separate SETOP upper rel, `addSetOpPaths`), not a
+  `SELECT DISTINCT` clause — it needs **S2b-4** (SETOP rel-identity), not
+  S2b-1 (now landed regardless, on its own genuine — if currently
+  witness-free — merit; see `docs/design/0100-0149/m0141-s2b-scoping-decomposition.md`
+  §"S2b-1 result"). Every
   mapping above is still gated on S7's own not-yet-built third `addOrderedPaths`
   arm (prefix-match -> Incremental Sort) regardless of which S2b sub-task
   lands — none of them alone is sufficient. **Sizing beyond S2b**: most needed machinery already exists under a

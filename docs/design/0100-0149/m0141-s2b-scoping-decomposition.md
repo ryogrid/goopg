@@ -410,3 +410,109 @@ directly (no synthetic fixture) and repeat this same term-by-term diff — at
 that scale a genuine discrepancy, if one exists, will show as a clean win/
 loss rather than a coincidental tie. Filed as **M0141-S2b-6-resume** below,
 gated on the reload.
+
+## S2b-1 result (2026-09-16) — landed; a real bug found and fixed along the way; the corpus has no witness that flips
+
+Implemented, not recon: `internal/optimizer/upperordereddistinct.go`
+(`distinctEmissionPathkeys`, `electOrderedDistinct`), mirroring
+`groupingEmissionPathkeys`/`electOrderedGrouping` for the DISTINCT upper rel.
+Wired into `planner.go`'s `s.Distinct` arm, replacing the legacy
+`distinctOutputSatisfiesOrder` static check as the FIRST thing tried (the
+legacy check + unconditional-Sort fallback still runs on decline — same
+"never regress, only widen" contract grouping's own wiring uses).
+
+**Simpler than grouping in one respect**: DISTINCT never renames or reorders
+columns (`p.Distinct.schema` is always the pre-distinct child's own schema),
+so there is no input-to-output coordinate boundary to translate across —
+`distinctEmissionPathkeys` only has to answer "does this candidate's
+executor contract guarantee a fixed order", not "where did this expression
+move to". Both shapes `addDistinctPaths` builds are unconditionally,
+statically ordered: `distinctOp` (hashed) hash-dedups then always re-sorts
+ascending/nulls-last over every output column (`operators_distinct.go`), and
+`distinctOnOp` (unique) streams its producer Sort's order verbatim — no cost
+dependency, no data dependency, unlike grouping's `AggStrategySorted`-only
+gate.
+
+**A real bug found and fixed before landing, not by code review but by live
+verification.** The first version reused the caller's shared `upperRels`
+registry for `electOrderedDistinct`'s internal `UpperOrdered` rel fetch,
+exactly like `electOrderedGrouping` does. That is safe for grouping because
+`electOrderedGrouping`'s call site is the FIRST thing to touch the
+statement's `(UpperOrdered, 0)` entry. It is NOT safe for DISTINCT: per the
+per-call-site census above, planner.go's `s.Distinct` wrapper runs AFTER the
+*generic* ORDER BY block already called `createOrderedPaths` once for the
+SAME `s.OrderBy` keys, over the PRE-distinct child (the file's own comment:
+"Applied after sorting so ORDER BY is respected" — a structural inversion
+from PG's real DISTINCT-then-ORDER-BY sequence, not something this task
+changed). Sharing the registry meant `setCheapest` could — and, live, did —
+pick that stale, semantically unrelated Sort candidate (built over a Node
+that is not even `distinctNode`) right back out from under the election.
+Caught by running the FIXED build against the git-tracked TPC-DS SF0.25
+cluster (`bench/tpcds/server.sh start sf025`, a private `GOOPG_BIN` per
+`[[goopg_bench_bin_shared_with_nightly_lane]]`) on Q41 (`select distinct
+i_product_name from item ... order by i_product_name limit 100` — the one
+TPC-DS query with both a real `SELECT DISTINCT` and a matching ORDER BY; see
+below for why `bench/tpcds/plans-pg/Q49.txt`'s `Unique` is NOT this
+mechanism's witness) with `GOOPG_PGSHAPED_DP_TRACE=1`: the trace showed a
+successful 2-candidate translation followed by `loop-decline
+reason=sort-child-not-distinct` — the tournament's own winner was a `*Sort`
+wrapping something other than `*Distinct`/`*DistinctOn`, tripping the
+shape-gate defensively (a wrong answer was never emitted — the decline
+correctly fell back to the legacy path — but the mechanism was not doing its
+intended job). Fix: `electOrderedDistinct` now fetches its `UpperOrdered` rel
+from a **dedicated, throwaway `newUpperRels()`**, never the caller's `u` —
+isolating the election from anything an earlier stage of the SAME statement
+already put there. This also let the decline path drop the
+snapshot/restore-on-decline machinery grouping's version needs (nothing
+shared to restore). Regression-tested directly:
+`TestElectOrderedDistinctIgnoresStalePreDistinctOrderedEntry` pre-populates
+`(UpperOrdered, 0)` on the shared registry with an artificially cheap stale
+Sort before calling `electOrderedDistinct`, and was verified to FAIL against
+the pre-fix code (confirmed by temporarily reverting the one-line fix and
+re-running) and PASS against the fix.
+
+**Verified live, not just unit-tested.** Rebuilt goopg with the fix, started
+the SF0.25 cluster, ran `EXPLAIN` on Q41 with `GOOPG_PGSHAPED_DP_TRACE=1`:
+trace now ends `DPDISTINCT elected shape=bare-*optimizer.Distinct` (the
+mechanism actively elects, not merely declines-to-a-lucky-legacy-answer),
+plan is `Limit -> Unique -> Sort -> Seq Scan` — byte-shape-identical to
+`bench/tpcds/plans-pg/Q41.txt`'s PG reference. Diffed against the pre-S2b-1
+build (`git stash` of just the `planner.go` hunk, same binary rebuild
+procedure) to separate "already correct" from "fixed by this task": **Q41
+was already correct before S2b-1** (its ORDER-BY-blind cost tournament picks
+Hashed, whose node type `*Distinct` already passed the legacy
+`distinctOutputSatisfiesOrder` check) — S2b-1 does not regress it, but does
+not flip it either. Forcing `set enable_hashagg=off` to make Unique
+(`*DistinctOn`, the exact case the legacy check could never recognize) the
+*only* survivor demonstrates the mechanism declines cleanly
+(`cands<2(1)` — `addPath`'s own dominance tournament prunes the disabled
+Hashed candidate before `electOrderedDistinct` ever sees it, so there is
+nothing to compare, by the same design grouping's own `cands<2` gate uses)
+rather than misfiring — a known, intentionally-scoped-out edge (a genuine
+single-survivor "just check its own order" case would be a real widening,
+not implemented here, no witness currently motivates it).
+
+**Why the corpus shows no flip, and why `Unique x1` was the wrong witness
+name.** `.ralph/fix_plan.md`'s own mapping ("`Unique`x1 -> **M0141-S2b-1**")
+pointed at Q49 (`docs/design/0100-0149/m0141-s7-readjudicate-and-scope-incremental-sort.md`'s
+witness table). **That mapping is wrong**: reading `bench/tpcds/runtime_goopg/tpcds-data/queries/query49.sql`
+shows its `Unique` comes from a plain `UNION` (three-way `SELECT ... UNION
+SELECT ... UNION SELECT ...`, PG's own dedup strategy for non-ALL set
+operations), which goopg plans through the entirely separate SETOP upper rel
+(`addSetOpPaths`, `windowsetoppaths.go`) — **not** `createDistinctPaths`.
+Q49's witness belongs to **S2b-4** (SETOP rel-identity), not S2b-1. Grepping
+the actual TPC-DS query corpus for a real `SELECT DISTINCT` clause finds six
+hits (Q6, Q38, Q41, Q54, Q87, plus a scratch `query_0.sql`); of those, only
+Q41 pairs a `DISTINCT` clause with an outer `ORDER BY` on the same column —
+every other hit's `DISTINCT` sits inside a scalar subquery or a set-operation
+leg with no ORDER BY of its own, so `electOrderedDistinct` (which only ever
+fires when `len(keys) > 0`) cannot apply to them regardless of correctness.
+TPC-H has zero `SELECT DISTINCT` queries in its canonical 22 at all (it uses
+`GROUP BY` throughout). **Net: S2b-1 is a genuine, tested, live-verified
+generalization of the ORDER BY / DISTINCT interaction with a real bug caught
+and fixed in the process, but the current TPC-H/TPC-DS corpus has exactly
+one candidate query (Q41) and it already matched before this task — a null
+result on the goal metric, honestly reported, same precedent as S2b-0/S2b-5/
+S2b-6.** `.ralph/fix_plan.md`'s S7 witness table should be corrected to drop
+the `Unique`x1 -> S2b-1 mapping and fold Q49 into S2b-4's scope instead;
+noted here so a future loop does not re-expect S2b-1 to move Q49.
