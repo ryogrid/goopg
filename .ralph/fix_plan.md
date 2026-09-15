@@ -1522,7 +1522,7 @@ that comment names as parity-inert.
   - Two bounded next slices filed below: **M0139-0007a** (measure/adopt the
     two already-built R108/R113 arms) and **M0139-0007b** (port Memoize's
     currency). Ledger row appended (task-id `m0139-0007`).
-- [ ] **M0139-0007a — measure and adopt/hold the two already-built R108/R113
+- [x] **M0139-0007a — measure and adopt/hold the two already-built R108/R113
   absorption arms.** `GOOPG_PG_HASH_TUPLE_SPILL_COST` (hash-join spill/batch
   decision) and `GOOPG_PG_SORT_RELATION_BYTES_COST` (Sort spill decision, also
   feeds WindowAgg) both already port a named PG formula (file:line cited in
@@ -1533,6 +1533,38 @@ that comment names as parity-inert.
   decide adopt/hold per the plan-parity metric, one design doc per arm,
   following the `GOOPG_GATHER_PATHS` promotion precedent
   (`docs/design/0100-0149/m0140-0003-gather-paths-flip-lands-default-on.md`).
+  - **DONE 2026-09-15, both arms measured, both HOLD (design docs
+    `docs/design/0100-0149/m0139-0007a-hash-tuple-spill-cost-measurement.md`,
+    `docs/design/0100-0149/m0139-0007a-sort-relation-bytes-cost-measurement.md`).**
+    Single HEAD binary (env vars read once at package-var init, so on/off
+    share one build); measured independently, never combined. **TPC-H: both
+    arms byte-identical to the current-HEAD-default baseline for all 22
+    queries** (`match=8` unchanged either way, `shape-delta.sh`
+    `shape-changed=0` on both, same-PG-reference control against fix1's
+    committed capture to strip PG-side ANALYZE sampling noise). **TPC-DS:
+    both arms leave every one of the 9 category counts unchanged**
+    (`match=2` unchanged); R108 moves Q64's cost digits, R113 moves Q4's and
+    Q64's, but all three stay `MISSING-NODE` (PG plans them with Incremental
+    Sort or an order-of-magnitude-different estimate) before and after, so no
+    category tag is affected — verified via `pg-plan-parity-diff.py
+    --verbose`, not assumed from the totals agreeing. **Decision: HOLD for
+    both, stay default-off.** No plan-parity upside anywhere to weigh a
+    promotion against (unlike `GOOPG_GATHER_PATHS`, which had a genuine bug
+    fix to weigh against its category rise); B2 also flags both arms'
+    direction as the risky one — PG's tuple/row currency is smaller than
+    goopg's real executor allocation for both hash-join spill and Sort spill,
+    so promoting either needs the TPC-H SF=1 execution acceptance-arm gate
+    first, not run here because nothing in this measurement justifies
+    running it. Neither arm deleted (both are correctly-derived PG-formula
+    ports, kept as controls). Ledger row appended (task-id `m0139-0007a`).
+    M0139-0007's recon inventory rows 1 and 3 are now fully resolved; only
+    M0139-0007b (Memoize) remains open below as the one remaining sub-task of
+    the banner's top-priority "M0141-S2a-fix and M0139-0007 — costing-order
+    unblock" line — M0141-S2a's fix1/fix2 pair is landed-and-decided, and of
+    M0139-0007's three filed pieces (recon, 0007a, 0007b) only 0007b is still
+    open. The next loop should take M0139-0007b next (still inside the
+    top-priority group) unless its own recon surfaces a reason to defer it,
+    in which case the banner's item 2 (M0137's re-opened 0014–0017) is next.
 - [ ] **M0139-0007b — port PG's Memoize entry-byte currency.** Give
   `joinpathsmemoize.go`'s `estEntryBytes` (`:133-139`) PG's `cost_memoize_rescan`
   currency (`postgres/src/backend/optimizer/path/costsize.c:2541-2578`):
