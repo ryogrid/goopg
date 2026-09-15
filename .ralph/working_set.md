@@ -1,70 +1,86 @@
-Task: M0138-0008 — bisect the TPC-DS category shift M0138 caused. **DONE
-this loop** (`bcaf86757`, committed). Banner's item 3 (M0138 0007-0009 /
-M0140-0006) is now down to one task: **M0140-0006** (TPC-DS parallelism
-partial-Append producer, deferred by M0140-0004 without an owner). A new
-follow-up, **M0137-0020** (pin `GOOPG_ANALYZE_SEED` in
-`scripts/capture-tpcds.sh`), was filed by this loop and sits in item 2's
-milestone section even though item 2 itself was already marked fully closed
-— it is new, unowned work discovered mid-task, not re-opened harness debt,
-so it does not inherit item 2's priority (same reasoning M0137-0019 was
-given). Re-read the banner fresh; as last read, remaining candidates at
-roughly equal priority are M0140-0006, M0137-0020, and M0137-0018/0019.
+Task: M0137-0018 — re-score `make ea-ratchet` at HEAD, settle its harness
+standing. **DONE this loop** (`c89615911`, committed). Banner item 3
+(M0138 0007-0009) was already fully `[x]` before this loop. M0137-0018 was
+selected instead of M0140-0006 (item 3's other remaining task) because
+M0140-0006's own recon sizes it as **three separate C-19-series-slice-sized
+sub-parts** (shared SetOp-branch entry point rework, a new partial-Append
+cost producer, new executor claim-set logic) — out of reach for one loop —
+while M0137-0018 was a bounded, well-scoped measurement/harness task sitting
+earlier in the file, matching the working_set precedent from two loops ago
+("re-check whether the banner has promoted something smaller").
 
-Files: `docs/design/0100-0149/m0138-0008-category-shift-bisect.md` (new),
-`docs/design/README.md` (+1 row), `.ralph/fix_plan.md` (M0138-0008 `[x]`,
-M0137-0020 filed `[ ]`), `.ralph/deferral_ledger.md` (`m0138-0008-category-
-shift-bisect` row). No production code touched (measurement-only task).
+Files: `AGENT.md` (+new "estimate-accuracy instrument" table under
+Plan-parity-harness measurement section), `Makefile` (3 stale `SF0.5`/`~1h`
+mentions corrected to `SF0.25`/`~10min`, one also mislabelled port 65437),
+`scripts/estimate-parity-gate.sh` (`EA_BASELINE` default repointed at the
+new 20260915 baseline dir), `docs/design/0100-0149/
+m0137-0018-ea-ratchet-rescore-and-harness-standing.md` (new),
+`docs/design/README.md` (+1 row), `.ralph/fix_plan.md` (M0137-0018 `[x]`),
+`.ralph/deferral_ledger.md` (new row `m0137-0018-ea-ratchet-stale-baseline`,
+resolved), `analysis/planner-refactor-take3/c20a-estimator-census-20260915/`
+(new: ea-baseline.txt, ea-capture-20260915.txt(+.header), ea-findings.json).
+No production Go code touched (measurement/harness-only task).
 
-Key symbols/tools: `scripts/pg-plan-parity-diff.py --verbose` (per-query
-category tags), `scripts/capture-tpcds.sh` (TPC-DS EXPLAIN capture — does
-**not** pin `GOOPG_ANALYZE_SEED`), `GOOPG_ANALYZE_SEED` env var
-(`internal/executor/operators_analyze.go:704-748`, seeds the block/reservoir
-sampler; already pinned by `scripts/tpch-acceptance-arm.sh` /
-`scripts/estimate-parity-gate.sh` but not by the TPC-DS path).
+Key symbols/tools: `scripts/estimate-parity-gate.sh` (EA_SRC_DATA/EA_BASELINE
+env vars, `score()` function); `scripts/estimate-parity/parity.py`
+(`--write-baseline` re-pins, `--baseline` ratchets); the re-score ran via
+`EA_PORT=5534 EA_CG_UNIT=goopg-ea-ratchet make ea-ratchet` (private clone
+`tmp/c20a/data-sf025`, own cgroup, never touches shared `:65437`).
 
-Findings: bisected M0138-0005's unexplained TPC-DS `join-order` 89->90 /
-`qual-placement` 16->17 shift by building goopg at `0e97c94b3` (pre-M0138-
-0002) and `44085c324` (M0138-0004), loading a **private** SF0.25 dataset
-with each on port 5533 (shared `:65437` cluster never touched), diffing
-against the live PG `:65438` reference. **Unpinned trials showed the
-category counts are noisy at a FIXED commit** (ANALYZE reservoir-seed
-variance — same mechanism as M0138-0009's correlation finding, but now shown
-to flip plan-parity verdict CATEGORY tags, the milestone's own success
-metric): `Q26`, `Q45`, `Q48`, `Q51`, `Q97` each flip a category tag between
-same-commit trials; the naive before/after read even came out backwards
-(90->89) from noise alone. Pinning `GOOPG_ANALYZE_SEED=20260905` (already
-used elsewhere, just never by the TPC-DS capture path) made two fresh
-same-commit captures byte-identical. With the seed pinned identically on
-both commits, the shift **is real and reproducible** in M0138-0005's
-original direction, and narrows to exactly **Q21** (join-order — a
-cardinality-estimate-driven join-spine change moving `warehouse` out of
-goopg's inner join tree) and **Q48** (qual-placement — a `store`/
-`store_sales` access-path change). Both are genuine consequences of
-M0138-0002..-0004's improved statistics, not defects. Filed **M0137-0020**
-to pin the seed in the harness itself, since the milestone review's own
-"TPC-DS categories net worse 525->540" headline was measured unpinned and
-therefore carries an unknown amount of this same noise — re-measuring that
-headline with the seed pinned is separate follow-on work, NOT done this
-loop (scoped out, named in the design doc's "what was not done").
+Findings: re-scored at HEAD (commit `4c5c13905`), clean 99/99-query capture,
+`FINDINGS: 140` vs the 2026-09-07 pinned baseline's 178 — RATCHET showed 99
+FIXED / 61 NEW, `EA-RATCHET: FAIL`. Before trusting that as a real
+regression signal, traced why: `git log -p` on
+`scripts/estimate-parity-gate.sh` showed commit `e2a50de40` ("SF0.5→SF0.25
+dev-gate migration", 2026-09-11 — **4 days after** the baseline was pinned)
+moved `EA_SRC_DATA` from the SF0.5 to the SF0.25 goopg cluster **and**
+regenerated every `bench/tpcds/plans-pg/Q*.txt` PG fixture in the same
+commit, but never re-pinned `ea-baseline.txt`. Every `make ea-ratchet` run
+since 2026-09-11 (including this task's first re-score) has therefore been
+comparing SF0.25 finding identities against an SF0.5-era pinned set — the
+61-new/99-fixed delta is contaminated by an unknown mix of real estimator
+drift and pure scale-mismatch artifact, and the two are not separable after
+the fact (the SF0.5 corpus was replaced, not archived, by the migration).
+Resolved by re-pinning a fresh baseline off the same capture
+(`analysis/planner-refactor-take3/c20a-estimator-census-20260915/`, 140
+findings) and verifying it scores clean (`EA-RATCHET: PASS`, `baseline
+findings: 140 current: 140`) via `EA_CAPTURE=<file> make ea-ratchet`
+(no server). Added `make ea-ratchet` to AGENT.md's harness measurement
+section (a third table, since it measures estimate quality — a K50 blind
+spot neither the plan-parity nor the values-gate tables can see) with the
+re-pin-on-corpus-change rule spelled out so this exact trap doesn't recur.
+Scoped out (per the design doc): no individual finding in the 61-new/99-fixed
+lists was triaged — this task establishes a trustworthy baseline going
+forward, it does not investigate any specific estimator's correctness.
 
-In-flight: none. Two git worktrees (`/tmp/m0138-0008-wt-{before,after}`),
-their private binaries, private data dirs (port 5533,
-`/tmp/m0138-0008-data-*`), and cgroup scopes were all torn down before the
-status block (`git worktree remove --force` x2, verified `port 5533 clear`,
-`no leftover cgroup scopes`). Shared TPC-DS bench cluster confirmed UP and
-untouched (`bench/tpcds/server.sh status`: sf025 :65437 UP, postgres :65438
-UP) after the loop's work.
+In-flight: none. The EA scratch server (port 5534, cgroup goopg-ea-ratchet)
+was stopped cleanly by the script's own `trap stop_server EXIT` — verified
+`pg_isready -p 5534` refuses after the run. No shared cluster (`:65436`,
+`:65437`) touched or restarted this loop.
 
 Next step: re-read the `## Current Priority` banner fresh. Per this loop's
-read, select **M0140-0006** (TPC-DS parallelism partial-Append producer —
-resume point is in its own fix_plan entry, deferred by M0140-0004 without an
-owner) unless the banner has moved M0137-0020 or M0137-0018/0019 ahead of it
-by then.
+read, banner item 3 (M0138 + M0140) has only **M0140-0006** left, and it is
+oversized for one loop per its own recon (3 C-19-slice-sized sub-parts: (1)
+expose SetOp branches' `PartialPathlist` instead of a finished `Node` at
+`planner.go:1114` — a shared entry point every SetOp query uses, not a
+Q5/Q76-scoped edit, (2) a new partial-Append cost producer mirroring
+`addPartialHashJoinPath`'s shape, (3) new executor claim-set logic since
+`setOp` has no `parallel_scan.go`-style worker-partitioning — wrapping it in
+`Gather` today would duplicate every row). Next loop should either: (a)
+decompose M0140-0006 into a first bounded sub-slice (e.g. just the
+SetOp-branch `PartialPathlist` exposure, with the cost producer and claim-set
+logic filed as its own follow-on tasks per the group's two-artefact deferral
+rule), or (b) check M0137-0019/M0137-0021 (both filed, unowned,
+investigative/re-measure tasks — no longer flagged as "smaller" now that
+M0137-0018 is closed, so normal banner order applies: they rank after M0138/
+M0140 per the banner's own item-3 listing, not before).
 
-Gates run: `go build ./...` clean (no production code changed this loop).
-`make ralph-state-guard`: one self-repair (the same recurring benign
-stale-clean-exit-marker pattern several prior loops have noted), clean after
-repair. Pre-commit hook's pgbench smoke: PASS (tps ~43-150, 0 failed).
-No `go test`/`tpch-spotcheck.sh`/`tpcds` sweep run this loop — measurement-
-only task, no executor/planner code touched, matching M0138-0005's own
-verification-scope precedent (see that design doc's "Verification" section).
+Gates run: `bash -n scripts/estimate-parity-gate.sh` clean. Direct re-pin
+verification (`EA_CAPTURE=<file> make ea-ratchet` twice: once against the
+old 20260907 baseline showing FAIL 61-new, once against the new 20260915
+baseline showing PASS) — both ran clean, no server needed for either.
+`make ralph-state-guard`: one self-repair (same recurring benign
+stale-clean-exit-marker pattern several prior loops have noted), clean
+after repair. Pre-commit hook's pgbench smoke: PASS (tps 43-151, 0 failed).
+No `go test`/`tpch-spotcheck.sh`/TPC-DS sweep run this loop — no production
+Go code changed, matching M0137-0020's own precedent for harness-only tasks.
