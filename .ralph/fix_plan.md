@@ -960,13 +960,20 @@ before/after proving the defect it closes.
   applies `semiJoinMatchFraction` for SEMI/ANTI, unlike its sibling
   `estimateJoin`, confirmed live at HEAD). No `TODO.md`/`rNNN-*` round
   directory edited. No production planner/executor/catalog code touched.
-- [ ] **M0137-0014 — automate the seam-decline census** — the harness requires a
-  per-class decline census at a stated timeout, and **no tool produces one**, so
-  three of 22 task reports carried it and only by hand-classifying trace output.
-  Add a small script under `scripts/` that runs a capture with
-  `GOOPG_PGSHAPED_DP_TRACE=1` and emits counts by `reason=` class with the
-  timeout stamped, in a form a report can paste. Sibling of the
-  `CATEGORIES-EXCL-MATCH:` fix that closed the same defect for category movement.
+- [x] **M0137-0014 — automate the seam-decline census** — DONE 2026-09-15
+  (`docs/design/0100-0149/m0137-0014-seam-decline-census-tool.md`). New
+  `scripts/seam-decline-census.py` (+ `-test.py`) aggregates
+  `traceSeamDecline`'s `seam-decline reason=<class>` lines from one or more
+  `GOOPG_PGSHAPED_DP_TRACE=1` logs into a `SEAM-DECLINE-CENSUS:
+  timeout=<label> logs=<n> classes=<k> declines=<total>` report plus a
+  sorted per-class count list. `--timeout` is a required free-text label
+  (censuses are only comparable at equal timeouts, so the tool refuses to
+  let a report omit it). Report-only (exit 0); exit 2 on an unreadable log
+  or missing `--timeout`. Verified via `--self-test` (4/4), the `unittest`
+  companion (7/7), and a live cross-check against a real committed capture
+  (`analysis/planner-refactor-take3/c06-q13-diagnosis-20260907/evidence/dppath-on.txt`)
+  matching the manual `grep|sort|uniq -c` fallback byte-for-byte. No
+  production code touched; no new ledger row (pure tooling).
 - [x] **M0137-0015 — embed `PlanCost` in `optimizer.Filter`** — DONE
   2026-09-15 (`docs/design/0100-0149/m0137-0015-filter-plancost-embed.md`).
   `Filter` now embeds `PlanCost`, mirroring `SeqScan`'s embed; no other code
