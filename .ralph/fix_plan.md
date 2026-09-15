@@ -1605,13 +1605,81 @@ rather than the join rel's paths and K23/K12(B) share that root cause (K24), and
 PG's preference is **pathkey-driven, not spill-driven** — R120 already proved the
 spill route is net-negative.
 
-- [ ] **M0141-S0 — scoping recon (measurement only, no production change)** — size the
-  `AGGSPLIT_INITIAL_SERIAL` / `AGGSPLIT_FINAL_DESERIAL` programme in goopg terms
-  (which executor surfaces change, how many sites, what a row-borne partial-state
-  representation costs), produce a slice list, and file S1..Sn **into this section**
-  with an entry gate. A production diff in S0's commit is a scope violation. A recorded
-  no-go stating why the programme should not be attempted is an acceptable outcome.
-  Check this line off in the same commit that files the slices (or records the no-go).
+- [x] **M0141-S0 — scoping recon (measurement only, no production change)** — DONE
+  2026-09-15, design doc
+  `docs/design/0100-0149/m0141-s0-aggsplit-programme-scoping-recon.md`. No
+  production change. Corrects K96/K97's framing rather than just sizing it:
+  goopg already has a working Partial/Finalize split (`AggMode`,
+  `combineAggRuntime`'s per-aggregate combine rules, `AggregateIsDecomposable`'s
+  whitelist, two independent plan producers — do not rebuild any of this). What
+  is genuinely missing is one combination, `AggStrategySorted ×
+  AggMode∈{Partial,Final}` (PG's `Finalize GroupAggregate <- Gather Merge <-
+  Partial GroupAggregate`), and it is **structurally incompatible** with
+  today's design, not just absent: today's Partial mode emits zero rows via an
+  in-process side-channel accumulator specifically so `Gather` stays
+  aggregation-agnostic, but `GatherMerge` must interleave real per-group rows
+  by sort key — the side channel has none to interleave, so the row-emitting
+  path (plus `aggRuntime` serialize/deserialize, PG's `aggserialfn`/
+  `aggdeserialfn`, deliberately never built) is a second mechanism needed
+  alongside the first, not a fix to it.
+  - **Decisive scoping fact**: TPC-H's canonical scoring protocol runs
+    `-serial=true` (`max_parallel_workers_per_gather=0` on both engines), so
+    **none** of TPC-H's `aggregation-strategy`(10)/`sort-strategy`(9) can
+    involve the missing Gather-Merge machinery — it's a serial
+    Hashed-vs-Sorted cost/path-selection question over machinery
+    (`openSorted`, the sorted `PathAgg` candidate, `createplansimple.go`'s
+    existing `Strategy` wiring) that already exists. TPC-DS's 69/76 is an
+    unseparated mix of that same serial question and genuinely parallel cases
+    already gated behind M0140's own open floor (K92, K41).
+  - Filed six slices below. **S1 is selectable now** (cheap, no
+    prerequisite beyond M0137); **S3-S6** (the real multi-round AGGSPLIT
+    machinery) are gated on S1/S2's live measurement showing a
+    parallel-shaped residual large enough to justify them — do not start S3
+    on K96/K97's say-so alone.
+
+- [ ] **M0141-S1 — serial Hashed-vs-Sorted audit (selectable now)** — audit why
+  goopg's existing cost-based Hashed/Sorted `PathAgg` candidate contest
+  (`groupingpaths.go`) doesn't produce PG's shape for TPC-H's `aggregation-strategy`(10)/
+  `sort-strategy`(9) queries, none of which can involve Gather/GatherMerge under
+  the canonical `-serial=true` protocol. First action: resolve the apparent
+  contradiction between `plan.go:1346-1348`'s comment ("planner does not set
+  [`Strategy`] yet") and `createplansimple.go:173,219`, which already wires a
+  winning path's `AggStrategy` onto the executor node. Second action: a live
+  capture+`pg-plan-parity-diff.py` pass to split TPC-DS's 69/76 into
+  serial-shaped (in S1/S2's scope) vs already-parallel-blocked (M0140's floor,
+  out of scope here). Recon task, per the plan-parity harness — measurement
+  first, fix in S2.
+- [ ] **M0141-S2 — land the serial fix** — implement whatever S1 finds (expected:
+  a cost formula or pathkey-availability gap in already-shipped machinery, not
+  a new subsystem) for TPC-H first, then the TPC-DS non-parallel-blocked subset
+  S1 identified. Needs S1's finding.
+- [ ] **M0141-S3 — Partial-Sorted row emission** — a second Partial-mode code
+  path (`Strategy = AggStrategySorted`) emitting real rows (group key + one
+  serialized-state column per aggregate) instead of merging into
+  `aggPartialAccum`; reuses `combineAggRuntime`'s existing rules; leaves the
+  hash-strategy accumulator path untouched. **Entry gate: needs S1/S2's live
+  measurement to show a TPC-DS-specific, genuinely parallel-shaped residual
+  large enough to justify it.**
+- [ ] **M0141-S4 — `aggRuntime` serialize/deserialize** — PG's
+  `aggserialfn`/`aggdeserialfn`, bounded to the decomposable whitelist's actual
+  pointer surface (`numericSum`, `intSx`/`intSxx *big.Int`,
+  `numericSx`/`numericSxx *big.Rat`, `userState`, the float/bool/count/sum
+  scalars — `DISTINCT`/`WITHIN GROUP`/`array_agg`/`string_agg` are already
+  refused by `AggregateIsDecomposable`). Needs S3 (defines the transport
+  shape).
+- [ ] **M0141-S5 — GatherMerge-fed Finalize-Sorted** — a new merge-combine
+  executor operator consuming the key-interleaved stream `GatherMerge`
+  produces from S3/S4's rows, folding same-key runs across workers via
+  `combineAggRuntime` before finalizing (today's Finalize path only handles
+  "drain the Gather to EOF, read the whole accumulator", which is wrong for a
+  merge-ordered stream where a key can recur). Needs S3+S4.
+- [ ] **M0141-S6 — wire and measure** — pick which of the two existing
+  producers (`parallel.go`'s legacy pass, or `partialaggupper.go`'s costed-path
+  version — note its own unresolved 7/22-vs-12/22 regression against the
+  legacy pass, out of scope to fix here) hosts the new shape; fix the
+  `Aggregate`/`GroupAggregate (N keys)` EXPLAIN mislabel (doc
+  `parallel-query/06` §4.1 — both currently render as a hash aggregate
+  regardless of `Strategy`); re-measure the full corpus. Needs S5.
 
 ## M0142 — Join-order costing (filed 2026-09-14)
 
