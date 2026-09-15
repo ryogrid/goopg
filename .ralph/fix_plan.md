@@ -2498,48 +2498,65 @@ cross-layer programme that has never been scoped.
   bit-exact-tie-composition question (why goopg's two candidates' differently
   composed (input, marginal) pairs sum to the identical float) — informative,
   not required for -0003d.
-- [ ] **M0142-0003d — which cost term underprices goopg's index-driven NLI
+- [x] **M0142-0003d — which cost term underprices goopg's index-driven NLI
   over lineitem vs a hash-join-with-full-scan, for Q9's shape** — filed by
-  -0003c's Finding 2/3. Real PG's own default Q9 plan prices a Nested Loop
-  driving `lineitem` via `lineitem_part_supp_fkidx` from an already-shrunk
-  72728-row `{part,partsupp,supplier,nation}` composite at
-  `cost=7378.27..125204.04`; goopg's cost model, on the SAME partition,
-  prices its own `nestloop.index` candidate only ~3-9 units above its
-  `join.hash` winner (`80102.56`/`80108.48` vs `80099.64`,
-  -0003a Finding 2) — a tiny premium where PG's model assigns the identical
-  route a ~130000-unit-scale *discount* relative to the alternative
-  (hash-joining `lineitem` in as a base table, forcing a full 5,999,098-row
-  `Seq Scan`).
-  **A concrete lead exists, found by -0003c's own research pass, but it is
-  PRE-M0138 and needs RE-VERIFICATION, not blind reuse**:
-  `docs/design/not_ralph/plan_parity_fix_take2/r53-q9-costing-step0/SLICE1.md`
-  (2026-09-10) decomposed a same-shape, smaller (2.5%) pre-M0138 L6 margin
-  between these exact two partitions into exact arm terms and attributed it
-  entirely to **spill-page cost**: at 64MB `work_mem`, PG's real per-column
-  byte-width costing charges its winning build side zero spill (97740 rows
-  × ~60B ≈ 6MB, fits), while goopg's `hashJoinCost` (`cost_funcs.go:630`)
-  prices the analogous build via `hashsize.EntryBytes`'s 48-B/datum
-  column-count-based footprint (~743MB for the same rows — 11.6× over
-  budget), forcing a spill charge PG's own plan never pays. Roughly ten
-  cost-formula slices (M0138, M0142-0006..0016) landed between R53 and this
-  task, and goopg's OWN internal L6 margin moved from R53's 2.5% down to
-  -0003a/-0003b's exact tie across that interval while real PG's
-  whole-query margin (measured by -0003c) stayed large (64%) — consistent
-  with the interim changes shifting goopg's number by coincidence, not by
-  fixing the spill mechanism R53 named. Needs its own scoping recon
-  (measurement only) before any formula edit: (1) confirm goopg's DP search
-  at HEAD still generates a `hashsize.EntryBytes`-costed build comparable to
-  R53's finding for this exact partition (per
-  `planner_verify_both_candidates_generated` — don't assume R53's numbers
-  still apply verbatim, three cost-formula generations later), (2) get its
-  full cost breakdown (`internal/optimizer/cost_funcs.go`'s `hashJoinCost`
-  plus the NLI/index-probe terms in `pathparamindex.go`) against PG's
-  `cost_nestloop`/`cost_index`/`cost_hashjoin` (`costsize.c`), (3) check
-  whether `indexProbeCostMultiplier` (B8 — left explicitly UNSETTLED by
-  M0142-0005's 2026-09-16 recon,
-  `docs/design/0100-0149/m0142-0005-recon-partial-memoize-refused-by-gather-eligibility.md`)
-  is a second contributing term alongside the spill footprint, or unrelated.
-  Do NOT reopen B8 by assumption — measure first.
+  -0003c's Finding 2/3. **RECON DONE 2026-09-16, premise REFUTED**, design
+  doc
+  `docs/design/0100-0149/m0142-0003d-q9-row-estimate-collapse-not-cost-formula.md`.
+  No production change. Finding 0: -0003c's own "forced-goopg-order" PG
+  measurement (336207.55 vs 204932.03) turns out to have forced PG into a
+  FROM-clause literal left-deep chain that was **never actually goopg's own
+  winning shape** — goopg's real (unforced) Q9 winner is an all-index-NL
+  chain (`part⋈partsupp` hash, then `lineitem`/`supplier`/`orders` each
+  NL-indexed, `nation` hashed last), confirmed via a fresh `EXPLAIN` against
+  a private throwaway clone (never touched the shared `:65433` bench
+  cluster). Forcing PG into *that* actual shape with hash disabled prices it
+  at 372230.53 — same magnitude, different cause (PG's cost model penalizes
+  NL-indexing through `orders`'s 1.5M rows) — so -0003c's 64% gap finding
+  survives, just mislabeled. **Finding 1 (decisive): the real divergence is
+  upstream of costing.** goopg's own DP-search row estimate for
+  `lineitem ⋈ partsupp` on the composite key `l_partkey=ps_partkey AND
+  l_suppkey=ps_suppkey` is **2406**, ~2500x below the true value
+  (~5,999,098 — `partsupp_pk` is a genuine composite UNIQUE index on exactly
+  those two columns, verified live on the bench cluster). Every relset
+  containing both relations inherits this ~146-row floor all the way to the
+  top of the plan tree — this, not any hash/NL cost-formula constant (B8 /
+  `indexProbeCostMultiplier` NOT implicated), is what makes the all-NL-index
+  chain look nearly free. **Finding 2**: goopg already has purpose-built code
+  for exactly this pattern (`internal/optimizer/joinkeyproof.go`'s
+  `superkeyJoinEstimate`, M0127-P5.6-f — its own header names this exact Q9
+  clause pair as the motivating case) but it is evidently not preventing the
+  collapse at HEAD for this relid pairing; why is not confirmed, left to the
+  follow-up. **Supersedes** the pre-M0138 R53 spill-footprint lead
+  (`.../r53-q9-costing-step0/SLICE1.md`) as the primary driver — that
+  analysis is not wrong on its own terms but was built on this same
+  now-identified 2500x-wrong row estimate, so it is very likely a
+  second-order effect, not primary; do not resume it before M0142-0003e is
+  resolved. Follow-up filed as **M0142-0003e** (below).
+- [ ] **M0142-0003e — why doesn't goopg's existing superkey/FK-based
+  no-fan-out substitution fire for the bare `lineitem ⋈ partsupp` composite
+  join?** — filed by -0003d's Finding 1/2. Concrete repro: a 2-relation join
+  of `lineitem` and `partsupp` on `l_partkey = ps_partkey AND l_suppkey =
+  ps_suppkey`, where `partsupp` has a genuine composite UNIQUE index on
+  exactly those two columns (`partsupp_pk`) — goopg's DP search estimates
+  this join at 2406 rows against a true value of ~5,999,098 (every
+  `lineitem` row has exactly one matching `partsupp` row). Read
+  `internal/optimizer/joinkeyproof.go`'s `superkeyJoinEstimate` +
+  `internal/optimizer/joinrelsize.go`'s `superkeyJoinSelectivity` (the
+  PG-shaped-DP arm) side by side with the production twin
+  (`internal/optimizer/cardinality.go`'s `estimateJoin`) against this exact
+  repro. Determine with a **targeted unit test**
+  (`internal/optimizer/joinrelsize_test.go` or `cardinality_test.go`, NOT
+  another full-query trace) whether the mechanism reaches this case and, if
+  not, why: (a) which arm is live by default — re-confirm
+  `GOOPG_PGSHAPED_DP`'s current default, don't assume it per
+  `goopg_arm_scripts_disable_dp_search` in memory; (b) whether
+  `uniqueKeyColumnSets`/the clause-matching precondition actually recognizes
+  `partsupp_pk` against this exact `AND`-of-two-equalities clause shape. Do
+  NOT assume which explanation is correct before the unit test settles it,
+  and do NOT edit `joinkeyproof.go`/`joinrelsize.go`/`cardinality.go` blind
+  — confirm the failure mode first, per
+  `planner_verify_both_candidates_generated`.
 - [x] **M0142-0004 — re-measure TPC-DS's row-estimate error at HEAD** — the
   ledger row `take3-rowest-collapse-diagnosed` (`.ralph/deferral_ledger.md:2120`,
   2026-09-06) named four cuts in order — **B1, A1, A2, A3** — and pinned the
