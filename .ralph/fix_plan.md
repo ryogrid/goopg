@@ -1854,27 +1854,51 @@ cross-layer programme that has never been scoped.
   on PG's cheaper L5 base vs nation-last ~2.6 marginal on goopg's pricier L5
   base) and happen to land almost on top of each other. Resolves
   M0142-0003b's fork: costing-term branch, not completeness.
-- [ ] **M0142-0003b — L6 tie-break precision: does goopg's chosen plan
-  actually win on true cost?** Scoped by -0003a's finding (fork resolved:
-  costing, not completeness). `DPPATH`'s `formatPathLine`
-  (`internal/optimizer/pathtrace.go`) prints `total` at `%.2f`, which is not
-  enough precision to tell whether goopg's winning `join.hash` partition
-  (`{part,supplier,lineitem,partsupp,orders}⋈{nation}`, total≈80099.64) truly
-  beats PG's own chain's cheapest candidate (`nestloop.index` on
-  `{part,partsupp,supplier,nation,lineitem}⋈{orders}`, total≈80099.64) or
-  merely ties it and wins on DP processing/insertion order (goopg's
-  partition was paired first at L6 per the `DPTRACE pair` trace — see the
-  design doc's Method section). Concrete next step: either bump the trace's
-  precision (trace-only, env-gated, same class of change as -0003a — not a
-  default-path diff) or read `Path.Cost.Total` directly via a throwaway
-  instrumented probe, then read the sign. If goopg's total is genuinely
-  lower: which term (B8 `indexProbeCostMultiplier`, B10 index-correlation
-  defaults are the named adjacent suspects, both already flagged under
-  M0142) prices PG's `nestloop.index`-on-`orders` candidate high enough to
-  lose a two-decimal tie. If PG's total is lower or exactly equal: the DP's
-  tie-break rule itself (first-registered-partition-wins at exact ties) is
-  the finding, and a different kind of fix applies — do not assume which
-  case holds before measuring.
+- [x] **M0142-0003b — L6 tie-break precision: does goopg's chosen plan
+  actually win on true cost?** DONE 2026-09-15
+  (`docs/design/0100-0149/m0142-0003b-q9-l6-tie-break-precision.md`).
+  Bumped `DPPATH`'s `formatPathLine` (`internal/optimizer/pathtrace.go`)
+  from `%.2f` to `%g` for `startup`/`total`/`inputtotal` (matches the
+  sibling `DPTRACE cost` channel's existing precision; env-gated, no
+  default-path change) and re-ran -0003a's Q9 recon. **The L6 tie is
+  EXACT**: goopg's winning `join.hash` and PG's own chain's `nestloop.index`
+  candidate both total `108806.04332442369` bit-for-bit, despite different
+  (input, marginal) compositions. goopg's own partition is registered FIRST
+  at level 6 (`DPTRACE pair created=1`); PG's chain arrives later
+  (`created=0`) and is rejected by `addToPathlist`'s exact-tie dominance
+  check — which itself ports PG's real `compare_path_costs_fuzzily`/
+  `STD_FUZZ_FACTOR` verbatim, not a goopg shortcut. **Verdict: goopg does
+  not win on true cost (settles the fork: no clear cost gap), and the
+  tie-break mechanism is not the defect either (it's PG-faithful) — the
+  load-bearing divergence is DP enumeration ORDER at level 6, not a costing
+  term (B8/B10 not implicated here).** Files M0142-0003c below as the
+  concrete follow-on.
+- [ ] **M0142-0003c — level-6 enumeration-order parity vs PG's
+  `join_search_one_level`** — filed by -0003b's finding. goopg's own
+  partition is registered first at Q9's level 6 (`created=1` in `DPTRACE
+  pair`); PG's chain's equivalent pairing arrives later and loses an exact
+  cost tie to `addToPathlist`'s (PG-faithful) first-registered-wins
+  dominance rule. Real PG's planner produces PG's shape as Q9's winner,
+  which is only consistent with that same dominance rule if real PG's
+  `join_search_one_level` (`postgres/src/backend/optimizer/path/joinrels.c`)
+  visits/registers a PG-chain-equivalent relset pairing before goopg's
+  chain's equivalent at the analogous level. Concrete next step: instrument
+  or read goopg's level-6 relset-pair generation loop
+  (`internal/optimizer/joinsearch*.go`) and compare its visitation order
+  against `join_search_one_level`'s — same relation set, same clause
+  connectivity, does the two engines' iteration order over candidate pairs
+  actually differ, and if so does reordering it (to match PG's) flip which
+  partition gets registered first and thus which candidate wins the tie?
+  This is a genuinely new question (not previously scoped by K26/R53/R79 —
+  those examined connectivity/completeness/cost, not iteration order), so
+  size it as a recon task first (measurement only) before attempting any
+  reordering fix — an enumeration-order change is exactly the class of
+  planner-search-order surgery the practice card warns can move OTHER
+  queries' plans sideways or worse (K50: any structural reordering can flip
+  candidates already matching PG). Lower-priority secondary thread from the
+  same task: -0003b's Finding 1 left open why the two candidates' bit-exact
+  tie holds despite differently-composed (input, marginal) pairs — informative
+  but not required to resolve -0003c.
 
 ## M0143 — Engine correctness carry-overs from the parity programme (filed 2026-09-14)
 

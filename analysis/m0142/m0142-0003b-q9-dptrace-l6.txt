@@ -1,0 +1,38 @@
+DPTRACE problem nrels=6 rels=part,supplier,lineitem,partsupp,orders,nation
+DPTRACE pair phase=1 lev=6 created=1 pair={lineitem+orders+part+partsupp+supplier} | {nation} outer={lineitem+orders+part+partsupp+supplier} inner={nation}
+DPTRACE pair phase=1 lev=6 created=0 pair={lineitem+nation+part+partsupp+supplier} | {orders} outer={lineitem+nation+part+partsupp+supplier} inner={orders}
+DPTRACE pair phase=1 lev=6 created=0 pair={lineitem+nation+orders+part+supplier} | {partsupp} outer={lineitem+nation+orders+part+supplier} inner={partsupp}
+DPTRACE pair phase=1 lev=6 created=0 pair={lineitem+nation+orders+partsupp+supplier} | {part} outer={lineitem+nation+orders+partsupp+supplier} inner={part}
+DPTRACE pair phase=2 lev=6 created=0 pair={lineitem+nation+orders+supplier} | {part+partsupp} outer={part+partsupp} inner={lineitem+nation+orders+supplier}
+DPTRACE pair phase=2 lev=6 created=0 pair={lineitem+orders+part+partsupp} | {nation+supplier} outer={nation+supplier} inner={lineitem+orders+part+partsupp}
+DPTRACE pair phase=2 lev=6 created=0 pair={lineitem+orders} | {nation+part+partsupp+supplier} outer={lineitem+orders} inner={nation+part+partsupp+supplier}
+DPTRACE pair phase=2 lev=6 created=0 pair={lineitem+orders+part} | {nation+partsupp+supplier} outer={lineitem+orders+part} inner={nation+partsupp+supplier}
+DPTRACE cost lev=2 rel={lineitem+part} rows=303115 npaths=3 cheapest=hash reqouter={} total=222311.727875 second=merge secondtotal=1.2549225544004946e+06
+DPTRACE cost lev=2 rel={part+partsupp} rows=39901 npaths=4 cheapest=hash reqouter={} total=36235.161125 second=merge secondtotal=49429.71591891931
+DPTRACE cost lev=2 rel={lineitem+supplier} rows=6.001688e+06 npaths=3 cheapest=hash reqouter={} total=279386.08999999997 second=merge secondtotal=1.7627895996823818e+06
+DPTRACE cost lev=2 rel={partsupp+supplier} rows=800000 npaths=3 cheapest=hash reqouter={} total=38369 second=merge secondtotal=175405.31189774725
+DPTRACE cost lev=2 rel={nation+supplier} rows=10000 npaths=3 cheapest=hash reqouter={} total=467.0625 second=merge secondtotal=1144.3411010011941
+DPTRACE cost lev=2 rel={lineitem+partsupp} rows=2376 npaths=5 cheapest=hash reqouter={} total=756855.6680000001 second=merge secondtotal=1.3532105034220782e+06
+DPTRACE cost lev=2 rel={lineitem+orders} rows=6.001688e+06 npaths=2 cheapest=merge reqouter={} total=454477.769532284 second=merge secondtotal=454477.769532284
+DPTRACE cost lev=3 rel={lineitem+part+supplier} rows=303115 npaths=5 cheapest=hash reqouter={} total=226932.559125 second=merge secondtotal=255082.57450928015
+DPTRACE cost lev=3 rel={lineitem+part+partsupp} rows=120 npaths=7 cheapest=nli reqouter={} total=108716.3487623105 second=merge secondtotal=308054.4791265402
+DPTRACE cost lev=3 rel={lineitem+orders+part} rows=303115 npaths=4 cheapest=merge reqouter={} total=338804.5949284797 second=merge secondtotal=541298.2029538198
+DPTRACE cost lev=3 rel={part+partsupp+supplier} rows=39901 npaths=5 cheapest=hash reqouter={} total=37236.799875 second=merge secondtotal=40509.18793370764
+DPTRACE cost lev=3 rel={lineitem+partsupp+supplier} rows=2376 npaths=9 cheapest=hash reqouter={} total=757375.248 second=merge secondtotal=757650.7841111551
+DPTRACE cost lev=3 rel={lineitem+orders+supplier} rows=6.001688e+06 npaths=5 cheapest=hash reqouter={} total=537453.979532284 second=merge secondtotal=2.1756513639787375e+06
+DPTRACE cost lev=3 rel={lineitem+nation+supplier} rows=6.001688e+06 npaths=5 cheapest=hash reqouter={} total=279525.15249999997 second=merge secondtotal=1.7633447978013593e+06
+DPTRACE cost lev=3 rel={nation+partsupp+supplier} rows=800000 npaths=5 cheapest=hash reqouter={} total=38508.0625 second=merge secondtotal=175960.51001672473
+DPTRACE cost lev=3 rel={lineitem+orders+partsupp} rows=2376 npaths=7 cheapest=nli reqouter={} total=757907.8652170497 second=merge secondtotal=841372.9082913871
+DPTRACE cost lev=4 rel={lineitem+part+partsupp+supplier} rows=120 npaths=10 cheapest=nli reqouter={} total=108749.68955083533 second=merge secondtotal=109348.54289666787
+DPTRACE cost lev=4 rel={lineitem+orders+part+supplier} rows=303115 npaths=7 cheapest=hash reqouter={} total=343425.4261784797 second=merge secondtotal=412938.9261784797
+DPTRACE cost lev=4 rel={lineitem+nation+part+supplier} rows=303115 npaths=7 cheapest=hash reqouter={} total=227071.621625 second=merge secondtotal=255637.77262825763
+DPTRACE cost lev=4 rel={lineitem+orders+part+partsupp} rows=120 npaths=9 cheapest=nli reqouter={} total=108769.49003589887 second=merge secondtotal=193070.66785526543
+DPTRACE cost lev=4 rel={nation+part+partsupp+supplier} rows=39901 npaths=7 cheapest=hash reqouter={} total=37375.862375 second=merge secondtotal=40886.53216573136
+DPTRACE cost lev=4 rel={lineitem+orders+partsupp+supplier} rows=2376 npaths=11 cheapest=nli reqouter={} total=758427.4452170497 second=merge secondtotal=758702.9813282047
+DPTRACE cost lev=4 rel={lineitem+nation+partsupp+supplier} rows=2376 npaths=11 cheapest=hash reqouter={} total=757409.4805 second=merge secondtotal=757546.0695931788
+DPTRACE cost lev=4 rel={lineitem+nation+orders+supplier} rows=6.001688e+06 npaths=7 cheapest=hash reqouter={} total=537593.042032284 second=merge secondtotal=2.288091687333643e+06
+DPTRACE cost lev=5 rel={lineitem+orders+part+partsupp+supplier} rows=120 npaths=12 cheapest=nli reqouter={} total=108802.8308244237 second=merge secondtotal=109401.68417025624
+DPTRACE cost lev=5 rel={lineitem+nation+part+partsupp+supplier} rows=120 npaths=12 cheapest=hash reqouter={} total=108752.90205083533 second=merge secondtotal=108757.58916721643
+DPTRACE cost lev=5 rel={lineitem+nation+orders+part+supplier} rows=303115 npaths=9 cheapest=hash reqouter={} total=343564.4886784797 second=merge secondtotal=426426.9886784797
+DPTRACE cost lev=5 rel={lineitem+nation+orders+partsupp+supplier} rows=2376 npaths=13 cheapest=hash reqouter={} total=758461.6777170496 second=merge secondtotal=758598.2668102285
+DPTRACE cost lev=6 rel={lineitem+nation+orders+part+partsupp+supplier} rows=120 npaths=14 cheapest=hash reqouter={} total=108806.04332442369 second=merge secondtotal=108810.7304408048

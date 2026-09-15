@@ -95,7 +95,7 @@ func TestPathTraceRendersOuterInnerPartition(t *testing.T) {
 	if !strings.Contains(line, "outer={0,1} inner={2} width=") {
 		t.Errorf("partition labels are displaced from the trailing block:\n%s", line)
 	}
-	if !strings.HasSuffix(strings.TrimRight(line, "\n"), "inputtotal=-1.00") {
+	if !strings.HasSuffix(strings.TrimRight(line, "\n"), "inputtotal=-1") {
 		t.Errorf("width/inputtotal are not the trailing fields:\n%s", line)
 	}
 
@@ -110,7 +110,7 @@ func TestPathTraceRendersOuterInnerPartition(t *testing.T) {
 // DPPATH line carries the rel's byte width and the input path's total, so the
 // priced upper decision (serial agg vs Finalize+Gather+Partial on the same
 // join input) reads join-leg delta and upper-leg delta off one line each. A
-// path with no input renders inputtotal=-1.00, never a zero that would parse
+// path with no input renders inputtotal=-1, never a zero that would parse
 // as a free input.
 func TestPathTraceRendersWidthAndInputTotal(t *testing.T) {
 	rel := &RelOptInfo{Relids: 0, Rows: 1, Width: 3154}
@@ -125,7 +125,7 @@ func TestPathTraceRendersWidthAndInputTotal(t *testing.T) {
 	scan := &Path{Kind: PathSeqScan, Rel: &RelOptInfo{Relids: 1, Width: 550},
 		Rows: 10, Cost: Cost{Total: 10}}
 	line = formatPathLine("path", scan.Rel, scan, "scan.seq", "0", verdictAccepted)
-	if !strings.Contains(line, "width=550 inputtotal=-1.00") {
+	if !strings.Contains(line, "width=550 inputtotal=-1") {
 		t.Errorf("inputless line must render width with sentinel inputtotal:\n%s", line)
 	}
 }

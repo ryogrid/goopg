@@ -99,13 +99,23 @@ func tracePath(rel *RelOptInfo, p *Path, producer string, partial bool, verdict 
 // arm is the priced input the candidate was costed against. Appended at the
 // END under the same rule as jointype/partition labels, so a reader
 // splitting on key=value pairs keeps working unchanged.
+//
+// M0142-0003b: `startup`/`total`/`inputtotal` render via `%g`, not `%.2f`.
+// M0142-0003a found a near-tie at the full join for TPC-H Q9 — goopg's
+// winning candidate and PG's own chain's cheapest candidate both rounded to
+// `80099.64` at two decimals, and the fixed `%.2f` could not say whether that
+// was a genuine tie decided by DP insertion order or a real (if small) cost
+// gap. `%g` matches the sibling `DPTRACE cost`/`decline` channel
+// (joinsearchtrace.go's `total=%g`), which already prints full precision for
+// exactly this reason — bringing DPPATH in line closes the one place the two
+// channels disagreed on precision, rather than inventing a second format.
 func formatPathLine(list string, rel *RelOptInfo, p *Path, producer, pathkeys string, verdict pathVerdict) string {
 	inputTotal := -1.0
 	if len(p.Children) > 0 && p.Children[0] != nil {
 		inputTotal = p.Children[0].Cost.Total
 	}
 	return fmt.Sprintf(
-		"%s %s producer=%s relids=%s kind=%d reqouter=%s rows=%.0f startup=%.2f total=%.2f disabled=%d pathkeys=%s verdict=%s jointype=%s outer=%s inner=%s width=%d inputtotal=%.2f\n",
+		"%s %s producer=%s relids=%s kind=%d reqouter=%s rows=%.0f startup=%g total=%g disabled=%d pathkeys=%s verdict=%s jointype=%s outer=%s inner=%s width=%d inputtotal=%g\n",
 		pathTraceTag, list, producer, relSetBits(rel.Relids), int(p.Kind),
 		relSetBits(p.RequiredOuter), p.Rows, p.Cost.Startup, p.Cost.Total,
 		p.DisabledNodes, pathkeys, verdict, strings.ToLower(joinTypeName(p.Jointype)),
