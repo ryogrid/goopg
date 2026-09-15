@@ -1933,6 +1933,43 @@ spill route is net-negative.
   substituted width before taking any parity number, and cite the
   `./postgres/` `file:line` whose expression it ports. A width chosen because
   it made the parity number look better is tuning and is rejected.
+  - **Scoping done 2026-09-15**, design doc
+    `docs/design/0100-0149/m0141-s2a-fix-scoping-recon.md`. No production
+    change. **Half (1) is the cheap half, and it is not planner-search-order
+    surgery**: `agg.InputTarget []int` (a NAME-derived keep-list) is already
+    stamped inside `buildAggregateStage` (`planner.go:8219`) *before*
+    `createGroupingPaths`'s cost contest runs (`:1760`), and
+    `addGroupingPaths` already receives `aggNode` — the "preview at cost
+    time" half (1) asked for already exists, unused, at the exact call site
+    `aggInputWidth` runs from. B2 derivation (PG's `cost_agg`/
+    `hash_agg_entry_size`, `pathnode.c:3430` /`nodeAgg.c:1701,3701-3703`)
+    confirms `agg.InputTarget` is the correct PG-equivalent substitute for
+    PG's `subpath->pathtarget->width`. Split into **M0141-S2a-fix1** (wire
+    `agg.InputTarget` into the three `aggInputWidth` call sites — cheap,
+    attempt first, alone) and **M0141-S2a-fix2** (the `hashAggEntrySize`
+    fixed-overhead currency correction — gated on fix1's own measured
+    result; R124 §7's prior "currency + narrowing" pairing never had a
+    live-at-cost-time preview, so it is not dispositive against retrying
+    once fix1 supplies one).
+- [ ] **M0141-S2a-fix1 — wire `agg.InputTarget` into `aggInputWidth`'s three
+  call sites** (`groupingpaths.go:344`, `partialaggpaths.go:338`,
+  `partialaggupper.go:327`): when `agg.InputTargetKnown`, compute
+  `(ncols, avgVarBytes)` from the KEPT columns (`agg.Child.Output()` indexed
+  by `agg.InputTarget`) instead of the full `child.Output()`; fall back to
+  today's full-width behavior when unknown. Pin with a test asserting the
+  cost-preview currency and the executor's actually-committed-or-declined
+  narrowing stay deliberately separate (B2's "pinned by a test" rule — see
+  the design doc's correctness note on why a declined Hashed-strategy commit
+  does not invalidate the preview). Re-measure Q3/Q13/Q18 (TPC-H) and the
+  TPC-DS 32-query serial-only set from M0141-S1 after. No currency-formula
+  change in this slice — isolate half (1)'s effect before pairing with fix2.
+- [ ] **M0141-S2a-fix2 — `hashAggEntrySize` fixed-overhead currency
+  correction** (gated on M0141-S2a-fix1 landing and being measured): add the
+  missing `MAXALIGN(SizeofMinimalTupleHeader) + tupleWidth` fixed-overhead
+  term PG's `hash_agg_entry_size` (`nodeAgg.c:1701-1730`) charges alongside
+  the variable payload, re-derived per B2 (not a verbatim reinstatement of
+  the deleted `GOOPG_HASHAGG_WIDTH_CURRENCY`, per M0141-S2a-fix's own text).
+  Attempt only after fix1's isolated result is known.
 - [ ] **M0141-S2b — GROUP_AGG rel publishes Pathlist, not Node, to the
   ORDER BY step** — the K24 "ordering contest, slice 3" surgery: change
   `createOrderedPaths`'s callers (every `createXPaths` -> `createOrderedPaths`
