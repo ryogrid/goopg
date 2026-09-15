@@ -1,86 +1,72 @@
-Task: M0139-0007b — port PG's Memoize entry-byte currency (the last sub-task
-of the banner's top-priority "M0141-S2a-fix and M0139-0007 — costing-order
-unblock" line). **DONE this loop** (`5319e22b7`, committed). New absorption
-code (not a re-measurement like 0007a): gave `costMemoizeRescan` a PG-currency
-arm behind a new default-off flag, measured, decided HOLD.
+Task: M0137-0015 — embed `PlanCost` in `optimizer.Filter` (banner's item 2,
+"M0137's re-opened tasks 0014-0017"). **DONE this loop** (`4e25a872c`,
+committed). Landed the one-line fix M0137-0011 root-caused but did not
+implement.
 
-Files: `internal/optimizer/memoize_pgentrybytes.go` (new: the
-`GOOPG_PG_MEMOIZE_ENTRY_BYTES_COST` switch + ported
-`pgMemoizeEntryOverheadBytes`), `internal/optimizer/joinpathsmemoize.go`
-(`costMemoizeRescan` gained a `width int` param; call site now passes
-`pathWidth(innerPath)`), `internal/optimizer/joinpathsmemoize_test.go` (3
-existing call sites updated for the new param), `internal/optimizer/
-memoize_pgentrybytes_test.go` (new: 3 tests pinning the two currencies apart),
-`internal/optimizer/flaglabels.go` + `scripts/planner-flags.env` (regenerated
-via `go run ./cmd/gen-planner-flag-labels`) to name the new flag,
-`docs/design/0100-0149/m0139-0007b-memoize-entry-bytes-absorption.md` (new,
-full derivation/measurement), `docs/design/README.md` (+1 row),
-`.ralph/fix_plan.md` (M0139-0007b checked `[x]`; M0139-0007c filed as the
-open follow-up; banner's item-1 marked RESOLVED, pointing the next loop at
-item 2); `.ralph/deferral_ledger.md` (+row, task-id `m0139-0007b`),
-`analysis/leftdeep-joins/m0139-0007b-memoize-{off,on}.*` +
-`analysis/m0139/m0139-0007b-memoize-{off,on}-tpcds-goopg.txt` (6 committed
-measurement artefacts).
+Files: `internal/optimizer/plan.go` (`Filter` struct gained a `PlanCost`
+embed, mirroring `SeqScan`'s), `internal/optimizer/createplan_test.go` (new
+`TestCreatePlanNode_StampsCostOnFilterWrappedPrebuiltLeaf`, pins the
+mechanism), `docs/design/0100-0149/m0137-0015-filter-plancost-embed.md` (new,
+full verification), `docs/design/README.md` (+1 row), `.ralph/fix_plan.md`
+(M0137-0015 checked `[x]`), `.ralph/deferral_ledger.md`
+(`m0137-0011-filter-node-missing-plancost-embed` row flipped to `resolved`).
 
-Key symbols: `pgRelationByteSize`/`pathWidth` (reused verbatim from R113,
-`sort_pgrelationbytes.go`/`path.go:691`), `pgMemoizeEntryOverheadBytes` (new
-port of `ExecEstimateCacheEntryOverheadBytes`, nodeMemoize.c:1171-1176 —
-`48 + 16*tuples` from the actual `MemoizeEntry`(24)/`MemoizeKey`(24)/
-`MemoizeTuple`(16) C struct sizes), `costMemoizeRescan` (joinpathsmemoize.go).
+Key symbols: `Filter` (plan.go:1538), `stampPlanCost`/`legacyDisplayChildren`
+(plancost.go — neither needed changing, the `*Filter` fallback arm already
+existed and was simply unreachable), `scanLeafFor`'s `rewrap` closure
+(createplanindex.go:158) — confirmed it produces the SAME `Filter` type, so
+the `*IndexScan`-with-residual-filter case M0137-0011 flagged as unaudited
+needed no separate fix (`IndexScan` already embeds `PlanCost`).
 
-Findings: derived the substitution BEFORE measuring (B2 rule 1): term 1
-(`relation_byte_size`) and term 2 (`ExecEstimateCacheEntryOverheadBytes`) are
-both named PG quantities and got absorbed; term 3 (`get_expr_width` summed
-over cache-key exprs) has NO goopg per-expression-width statistic to absorb to
-— stays `hashsize.EntryBytes(nkeys,0)` in both currencies, ledgered +
-follow-up filed as M0139-0007c (not on the critical path). **Measured:
-byte-identical on both corpora.** TPC-H: first diff attempt against an
-older committed baseline (`m0141-s2a-fix1-tpch.plans.txt`) showed ~111
-modified lines, but ALL were unrelated Seq-Scan/Hash-Join row/cost drift with
-different `stats-epoch` stamps — a stale-baseline trap, not a real signal.
-Recaptured OFF fresh in the same session/binary and diffed ON vs that: byte-
-identical except the header line; the corpus's one Memoize node
-(`rows=1 width=490`) prices identically in both arms. TPC-DS SF0.25 (private
-clone, ports 5596/5598, never touched shared `:65433`/`:65437`): byte-
-identical; 13 Memoize nodes, all `rows=1`. Root cause of the null result
-(not a bug): the byte currency only reaches the cost through `evictRatio`,
-and every observed candidate's `estCacheEntries` swamps `ndistinct` under a
-64MB `work_mem` regardless of which currency computed it — same "arm never
-reaches its own memory-constrained regime" shape 0007a found for R108/R113.
-**Decision: HOLD, stays default-off** (now the THIRD such arm — AGENT.md's
-informal cap is "about four"; this task supplied its own expiry in-loop so it
-does not join the debt the cap warns about). **With this, ALL THREE of
-M0139-0007's filed pieces (recon, 0007a, 0007b) are resolved**, and the
-banner's top-priority line ("M0141-S2a-fix and M0139-0007") is FULLY
-discharged — M0141-S2a's fix1/fix2 pair was already landed-and-decided.
+Findings: live-verified against a private `bench/tpch` clone (port 5581,
+`tmp/goopg-spotcheck-tpch-data`, shared `:65433` never touched) — M0137-0011's
+exact Q12 symptom (`Seq Scan on lineitem cost=0.00..60299.79`, the
+`DeriveLegacyDisplayCost` fallback) now renders `cost=0.00..271421.46`, the
+search's own `costSeqscan` number. An `awk` sweep of every `optimizer` struct
+embedding `searchedTree` but not `PlanCost` found one other hit, `Project` —
+not a `buildInitialRels`/`scanLeafFor` leaf shape, out of scope, noted in the
+design doc for a later slice if one ever needs it. Corpus-wide blast radius
+(M0137-0011 left this unmeasured): counted directly from the committed
+PG-oracle plans (`bench/tpch/plans-pg/`, `bench/tpcds/plans-pg/`) — 20/22
+TPC-H and 85/99 TPC-DS queries carry at least one base-local-filtered scan,
+so the majority of both corpora were rendering a corrupted EXPLAIN cost
+column before this fix (corrupting `plan-gate MODE=semantic-cost` and every
+estimate-audit table entry that reads a rendered scan cost).
 
-In-flight: none. All private artefacts (1 binary `tmp/goopg-m0139-0007b-bin`,
-private ports 5596/5598, 1 TPC-DS clone dir, cgroup scopes, server logs under
-`tmp/`) removed/stopped after use; shared clusters (`:65432`/`:65433`/
-`:65437`/`:65438`) read-only or online-cloned (never stopped/started),
-verified quiet after use. `tmp/goopg-audit-arm-tpch-data` intentionally left
-in place — it is `tpch-estimate-audit-arm.sh`'s own reusable private-lane
-data dir (its `cleanup()` stops the server/scope but not the dir by design;
-matches the script's documented convention, not leftover WIP).
+In-flight: none. The private verify server (port 5581, scope
+`goopg-m0137-0015-verify`) was stopped and its transient systemd scope
+confirmed gone; the throwaway binary `tmp/goopg-m0137-0015-bin` was removed.
+Shared clusters (`:65432`/`:65433`/`:65437`/`:65438`) confirmed still
+listening, untouched throughout.
 
-Next step: re-read the `## Current Priority` banner fresh (check date/content
-match before trusting this note — the banner itself was edited this loop to
-mark item 1 RESOLVED). Per the banner, item 1 ("costing-order unblock") is
-now fully discharged; **select item 2 next: M0137's re-opened tasks
-(0014–0017)** — read `AGENT.md` §"Plan-parity harness" first (binding for
-every M0137–M0143 task), then `.ralph/fix_plan.md`'s M0137 section for the
-0014–0017 task text and any scoping notes already recorded there. 0015 is
-noted as one line; 0016's gate is noted as already satisfied; 0017 is flagged
-as mattering more than its size suggests (TPC-H plans captured `-serial`
-only, so `parallelism` is unscoreable in the current headline 6/22).
+Next step: re-read the `## Current Priority` banner fresh in
+`.ralph/fix_plan.md` (check date/content before trusting this note). Per the
+banner as last read, item 2 ("M0137's re-opened tasks 0014-0017") is now
+1-of-4 done (0015). The remaining three in that item: **M0137-0014**
+(automate the seam-decline census — a new `scripts/` tool that runs
+`GOOPG_PGSHAPED_DP_TRACE=1` and emits per-class decline counts with the
+timeout stamped), **M0137-0016** (add a `*Gather` arm to
+`pushConjunctTraced`/O15 — ledger row already carries the recipe, its stated
+gate is satisfied), **M0137-0017** (capture TPC-H plans in both `-serial` and
+`-serial=false` modes against separate PG baselines — flagged as mattering
+more than its size suggests, since `parallelism` is currently unscoreable in
+the TPC-H 6/22 headline). Pick whichever the banner still ranks next; if the
+banner is unchanged, 0016 looks like the next quick win (small, gate already
+satisfied) before tackling 0017's larger baseline-capture work.
 
-Gates run: `go build ./...` clean. `go vet ./internal/optimizer/...` clean
-(no new findings beyond the two pre-existing/verified lostcancel ones in
-`cmd/goopg/main.go`). `go test ./internal/optimizer/...` full package `ok`
-(includes 3 new + 3 updated Memoize tests). `scripts/tpch-spotcheck.sh`
-RESULT=PASS (Q12=2, Q13=34, canonical; private port 5580, clone never
-touched `:65433`). Pre-commit pgbench smoke PASS (hook-enforced; tps
-~42-152 across the three builtin scripts, 0 failed). `make
-ralph-state-guard`: one self-repair (same recurring benign stale-clean-exit-
-marker pattern several prior loops have noted — status/progress reconciled,
-not a real inconsistency), clean after repair.
+Gates run: `go build ./...` clean. `go test ./internal/optimizer/...` full
+package `ok` (includes the new pinning test). `go test ./internal/executor/...
+-run Explain` `ok`. `scripts/tpch-spotcheck.sh` RESULT=PASS (Q12=2, Q13=34,
+canonical; private port 5580, clone never touched `:65433`). Manual
+`RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh` surfaced ONE
+failing package, `internal/parser` (`TestLockingClauseParity` and ~60 other
+functions, `GroupedJoinUnaliased` AST-drift) — reproduced it on a stash of
+this loop's own diff too, confirming it is baked into HEAD already and wholly
+unrelated to this task (different subsystem, no uncommitted diff in
+`internal/parser`); it is already a filed, known issue in `.ralph/fix_plan.md`
+under "Manually discovered... filed 2026-09-15" — not this loop's to fix.
+Pre-commit pgbench smoke PASS (hook-enforced; tps ~43-147 across the three
+builtin scripts, 0 failed). `make ralph-state-guard`: one self-repair (same
+recurring benign stale-clean-exit-marker pattern several prior loops have
+noted — status/progress reconciled, not a real inconsistency), clean after
+repair.
