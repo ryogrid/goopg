@@ -1,70 +1,86 @@
-Task: M0141-S2a-fix2 (banner's TOP-PRIORITY group, "M0141-S2a-fix and
-M0139-0007 — costing-order unblock"). **ATTEMPTED, MEASURED, and DECLINED
-this loop** (`1ed4c023e`, pushed). Code implemented, tested green, measured
-cleanly on private clones, then REVERTED after measurement showed no net
-gain (TPC-DS regression, TPC-H lateral). This is a closed decision, not
-unfinished work.
+Task: M0139-0007b — port PG's Memoize entry-byte currency (the last sub-task
+of the banner's top-priority "M0141-S2a-fix and M0139-0007 — costing-order
+unblock" line). **DONE this loop** (`5319e22b7`, committed). New absorption
+code (not a re-measurement like 0007a): gave `costMemoizeRescan` a PG-currency
+arm behind a new default-off flag, measured, decided HOLD.
 
-Files: `docs/design/0100-0149/m0141-s2a-fix2-hashaggentrysize-currency-attempt.md`
-(new, full derivation + both measurements + HOLD decision),
-`docs/design/README.md` (+index row), `.ralph/fix_plan.md` (M0141-S2a-fix2
-checked off `[x]` with the HOLD result, NOT a production change),
-`.ralph/deferral_ledger.md` (+row, task-id `m0141-s2a-fix2`),
-`analysis/m0141/m0141-s2a-fix2-{tpch,tpcds}*` (4 committed measurement
-artefacts). `internal/optimizer/cost_funcs.go` and its 4 test-file
-companions were edited, measured, THEN `git checkout --`'d back to HEAD —
-the tree carries NO `costAgg` diff from this task; do not expect to find
-one.
+Files: `internal/optimizer/memoize_pgentrybytes.go` (new: the
+`GOOPG_PG_MEMOIZE_ENTRY_BYTES_COST` switch + ported
+`pgMemoizeEntryOverheadBytes`), `internal/optimizer/joinpathsmemoize.go`
+(`costMemoizeRescan` gained a `width int` param; call site now passes
+`pathWidth(innerPath)`), `internal/optimizer/joinpathsmemoize_test.go` (3
+existing call sites updated for the new param), `internal/optimizer/
+memoize_pgentrybytes_test.go` (new: 3 tests pinning the two currencies apart),
+`internal/optimizer/flaglabels.go` + `scripts/planner-flags.env` (regenerated
+via `go run ./cmd/gen-planner-flag-labels`) to name the new flag,
+`docs/design/0100-0149/m0139-0007b-memoize-entry-bytes-absorption.md` (new,
+full derivation/measurement), `docs/design/README.md` (+1 row),
+`.ralph/fix_plan.md` (M0139-0007b checked `[x]`; M0139-0007c filed as the
+open follow-up; banner's item-1 marked RESOLVED, pointing the next loop at
+item 2); `.ralph/deferral_ledger.md` (+row, task-id `m0139-0007b`),
+`analysis/leftdeep-joins/m0139-0007b-memoize-{off,on}.*` +
+`analysis/m0139/m0139-0007b-memoize-{off,on}-tpcds-goopg.txt` (6 committed
+measurement artefacts).
 
-Key symbols: `costAgg`'s SPILL ARM (`cost_funcs.go:431-542`, unchanged at
-HEAD), `hashAggEntrySize` (unchanged), `hashsize.EntryBytes` (the
-PG-equivalent full-row currency that WAS tried as the arm's `tupleWidth`
-input instead of bare `inAvgVarBytes` — declined).
+Key symbols: `pgRelationByteSize`/`pathWidth` (reused verbatim from R113,
+`sort_pgrelationbytes.go`/`path.go:691`), `pgMemoizeEntryOverheadBytes` (new
+port of `ExecEstimateCacheEntryOverheadBytes`, nodeMemoize.c:1171-1176 —
+`48 + 16*tuples` from the actual `MemoizeEntry`(24)/`MemoizeKey`(24)/
+`MemoizeTuple`(16) C struct sizes), `costMemoizeRescan` (joinpathsmemoize.go).
 
-Findings: fix2 restores "Arm C" (fixed-width/avgVar=0 aggregate inputs
-pricing a real spill footprint) exactly as R120 once did. Measured with a
-same-PG-reference control (TPC-H, to strip PG-side ANALYZE sampling noise
-between independent captures — the naive same-run diff showed spurious
-multi-category movement that `shape-delta.sh` proved was NOT a shape
-change) and matching-stats-epoch comparison (TPC-DS): TPC-H match held at 8,
-Q18 shape-changes LATERALLY (+1 sort-strategy, -1 rendering, still
-SHAPE-DIFF); TPC-DS match held at 2, Q31 shape-changes and REGRESSES 3
-categories (aggregation-strategy/sort-strategy/parallelism, +1 each) back
-to byte-identical with the PRE-fix1 baseline — exactly cancelling fix1's
-one TPC-DS gain. No MATCH lost anywhere (hard floor safe), but zero net
-category gain, reproducing R124 §7's identical net-neutral verdict for the
-same currency correction a SECOND time, now with fix1's live-at-cost-time
-`inNcols` preview the task hoped would change the outcome. It did not.
-**Treat this currency as closed** — do not re-attempt the same substitution
-without new evidence (different mechanism or different quantity).
+Findings: derived the substitution BEFORE measuring (B2 rule 1): term 1
+(`relation_byte_size`) and term 2 (`ExecEstimateCacheEntryOverheadBytes`) are
+both named PG quantities and got absorbed; term 3 (`get_expr_width` summed
+over cache-key exprs) has NO goopg per-expression-width statistic to absorb to
+— stays `hashsize.EntryBytes(nkeys,0)` in both currencies, ledgered +
+follow-up filed as M0139-0007c (not on the critical path). **Measured:
+byte-identical on both corpora.** TPC-H: first diff attempt against an
+older committed baseline (`m0141-s2a-fix1-tpch.plans.txt`) showed ~111
+modified lines, but ALL were unrelated Seq-Scan/Hash-Join row/cost drift with
+different `stats-epoch` stamps — a stale-baseline trap, not a real signal.
+Recaptured OFF fresh in the same session/binary and diffed ON vs that: byte-
+identical except the header line; the corpus's one Memoize node
+(`rows=1 width=490`) prices identically in both arms. TPC-DS SF0.25 (private
+clone, ports 5596/5598, never touched shared `:65433`/`:65437`): byte-
+identical; 13 Memoize nodes, all `rows=1`. Root cause of the null result
+(not a bug): the byte currency only reaches the cost through `evictRatio`,
+and every observed candidate's `estCacheEntries` swamps `ndistinct` under a
+64MB `work_mem` regardless of which currency computed it — same "arm never
+reaches its own memory-constrained regime" shape 0007a found for R108/R113.
+**Decision: HOLD, stays default-off** (now the THIRD such arm — AGENT.md's
+informal cap is "about four"; this task supplied its own expiry in-loop so it
+does not join the debt the cap warns about). **With this, ALL THREE of
+M0139-0007's filed pieces (recon, 0007a, 0007b) are resolved**, and the
+banner's top-priority line ("M0141-S2a-fix and M0139-0007") is FULLY
+discharged — M0141-S2a's fix1/fix2 pair was already landed-and-decided.
 
-In-flight: none. All private artefacts (binary, TPC-H/TPC-DS clone dirs,
-server logs, cgroup scopes) removed after use; shared clusters
-(:65432/:65433/:65437/:65438) read-only, never restarted.
+In-flight: none. All private artefacts (1 binary `tmp/goopg-m0139-0007b-bin`,
+private ports 5596/5598, 1 TPC-DS clone dir, cgroup scopes, server logs under
+`tmp/`) removed/stopped after use; shared clusters (`:65432`/`:65433`/
+`:65437`/`:65438`) read-only or online-cloned (never stopped/started),
+verified quiet after use. `tmp/goopg-audit-arm-tpch-data` intentionally left
+in place — it is `tpch-estimate-audit-arm.sh`'s own reusable private-lane
+data dir (its `cleanup()` stops the server/scope but not the dir by design;
+matches the script's documented convention, not leftover WIP).
 
 Next step: re-read the `## Current Priority` banner fresh (check date/content
-match before trusting this note). If unchanged, the top-priority group's
-M0141-S2a-fix/M0139-0007 line is now FULLY EXHAUSTED as scoped (fix1 landed,
-fix2 attempted-and-declined) — move to the next items the banner names inside
-the SAME top-priority group: **M0139-0007a** (measure/adopt-or-hold the two
-already-built R108/R113 absorption arms — `GOOPG_PG_HASH_TUPLE_SPILL_COST` and
-`GOOPG_PG_SORT_RELATION_BYTES_COST`, both default-off, never measured against
-the post-M0137–M0142 corpus) or **M0139-0007b** (port Memoize's entry-byte
-currency via `pgRelationByteSide`/`ExecEstimateCacheEntryOverheadBytes`).
-Neither depends on this loop's outcome. If the banner has since moved the
-top-priority group past M0141-S2a/M0139-0007 entirely, follow the banner
-instead — it is the sole ordering authority per PROMPT.md's precedence rule.
+match before trusting this note — the banner itself was edited this loop to
+mark item 1 RESOLVED). Per the banner, item 1 ("costing-order unblock") is
+now fully discharged; **select item 2 next: M0137's re-opened tasks
+(0014–0017)** — read `AGENT.md` §"Plan-parity harness" first (binding for
+every M0137–M0143 task), then `.ralph/fix_plan.md`'s M0137 section for the
+0014–0017 task text and any scoping notes already recorded there. 0015 is
+noted as one line; 0016's gate is noted as already satisfied; 0017 is flagged
+as mattering more than its size suggests (TPC-H plans captured `-serial`
+only, so `parallelism` is unscoreable in the current headline 6/22).
 
-Gates run: `go build ./...` clean (both with the attempted change and after
-revert). `go test ./internal/optimizer/...` all pass (both states). Live
-TPC-H/TPC-DS parity measurement on private clones (see design doc for full
-numbers). `RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh`:
-FAILS on `internal/parser` only — this is the PRE-EXISTING, already-tracked
-`RangeVar.GroupedJoinUnaliased` AST-drift regression (nightly
-AI-20260914-235643-001/003, and this file's own "Manually discovered"
-section, dated 2026-09-15, predates this loop) — unrelated to this task's
-diff (confirmed: this loop touches zero files under `internal/`).
-`internal/optimizer` itself reports `ok` (cached) inside that same run.
-Pre-commit pgbench smoke PASS (hook-enforced; commit succeeded). `make
-ralph-state-guard` clean after one self-repair (same recurring benign
-stale-clean-exit-marker pattern noted by the last several loops).
+Gates run: `go build ./...` clean. `go vet ./internal/optimizer/...` clean
+(no new findings beyond the two pre-existing/verified lostcancel ones in
+`cmd/goopg/main.go`). `go test ./internal/optimizer/...` full package `ok`
+(includes 3 new + 3 updated Memoize tests). `scripts/tpch-spotcheck.sh`
+RESULT=PASS (Q12=2, Q13=34, canonical; private port 5580, clone never
+touched `:65433`). Pre-commit pgbench smoke PASS (hook-enforced; tps
+~42-152 across the three builtin scripts, 0 failed). `make
+ralph-state-guard`: one self-repair (same recurring benign stale-clean-exit-
+marker pattern several prior loops have noted — status/progress reconciled,
+not a real inconsistency), clean after repair.
