@@ -1,74 +1,80 @@
-Task: M0142-0011 — disambiguate Mechanism A vs B for the `EstimateRows(*Join)`
-recompute gap M0142-0004b found. **DONE and about to be committed** this loop
-(banner item 4, M0142 sub-group). Recon closed with NO production code
-change (candidate Algo-gate broadening + temporary trace both added and
-fully reverted — `git diff` on `internal/optimizer/cardinality.go` empty
-before commit).
+Task: M0142-0012a — scoping recon for M0142-0012's blast radius. **DONE and
+committed** this loop (`181b2e9a2`). M0142-0012 itself (the actual fix) is
+still open and is now the clear next pick in the M0142 milestone.
 
-Files: `docs/design/0100-0149/m0142-0011-disambiguate-estimatejoin-recompute-gap.md`
+Files: `docs/design/0100-0149/m0142-0012a-scoping-recon-blast-radius.md`
 (new, full writeup), `docs/design/README.md` (indexed), `.ralph/fix_plan.md`
-(0011 `[x]`, new 0012 filed), `.ralph/deferral_ledger.md` (new row).
+(0012a `[x]`), `.ralph/deferral_ledger.md` (new row). `git diff` on
+`internal/optimizer/cardinality.go` is empty — temporary trace added,
+measured, fully reverted (same discipline as M0142-0010/0011).
 
-Key symbols: `estimateJoin`/`joinEquiPairs` (`internal/optimizer/cardinality.go:722,1129`),
-`estimateNLIndexJoin` (`cardinality.go:240`, already correct, M0142-0006's
-SEMI/ANTI fix included), `createNestLoopIndexJoinPlan`/
-`createNestLoopIndexJoinPlanFused` (`createplannl.go:107,208,265`) — the
-R25 decomposition point.
+Key symbols (for the NEXT loop implementing M0142-0012 itself):
+`EstimateRows`/`estimateJoin`/`joinEquiPairs` (`internal/optimizer/
+cardinality.go:93-96,722,1129`) — needs a new `j.Lateral`-aware arm.
+`estimateNLIndexJoin` (`cardinality.go:240-266`, already correct incl.
+M0142-0006's SEMI/ANTI fix) is the logic to generalize/reuse.
+`createNestLoopIndexJoinPlan`/`createNestLoopIndexJoinPlanFused`
+(`createplannl.go:107,208,265,355-364`) build the `Join{Algo:NestedLoop,
+Lateral:true, Right:*IndexScan}` shape whose equi-key lives on the
+`*IndexScan` child's own `Key`/`Keys` (`OuterColumnRef` nestloop param),
+invisible to `joinEquiPairs` today.
 
-Findings: tested Mechanism A directly (broadened `estimateJoin`'s
-`j.Algo == Hash||Merge` gate, rebuilt, re-ran Q33's CTE-branch witness on a
-private SF0.25 clone) — plan byte-identical, A alone does NOT fix it. Traced
-the collapsing nodes: generic `*optimizer.Join` with `Predicate == nil`,
-zero equi-pairs regardless of the gate. Read `createplannl.go` instead of
-tracing further: since R25 (plan-parity-fix-take2), an unmemoized
-index-probe nested loop is built as `Join{Algo:NestedLoop, Lateral:true,
-Right:*IndexScan}` whose equi-key lives on the `*IndexScan` child's own
-`Key`/`Keys` (an `OuterColumnRef` nestloop param), NOT in `Predicate`.
-`estimateJoin` has no `Lateral` arm — `joinEquiPairs` never looks at
-`j.Right`'s own bound key — so EVERY unmemoized index-probe nested loop in
-both corpora (the common case; M0142-0005/B6 already established goopg
-rarely gets a Memoize on the NL probe path) falls to the crude
-`l*r*0.005`/`max(l,r)`-capped fallback, even though `estimateNLIndexJoin`
-already has the correct per-probe logic for the OLD fused
-`*NestedLoopIndexJoin` type — reachable only through
-`createNestLoopIndexJoinPlanFused` (Memoize-wrapped minority). Neither
-Mechanism A nor B; a third, more precise mechanism (Mechanism C),
-structurally DP-search-safe (construction-time fields only, no `PlanCost`
-consultation — same argument that makes `estimateNLIndexJoin` itself safe
-today). Filed the fix as **M0142-0012**: teach `EstimateRows`/`estimateJoin`
-the `Lateral`+bound-`*IndexScan` shape by generalizing `estimateNLIndexJoin`'s
-logic. Flagged likely LARGE corpus-wide blast radius (common shape) — 0012
-needs the full floor-measurement suite (TPC-H plan-parity, TPC-DS
-plan-parity, `make ea-ratchet`, SF0.25 sweep) before landing, not the
-lighter recon bar.
+Findings this loop: measured (not just inspected) the blast radius flagged
+by M0142-0011. Env-gated trace (`GOOPG_M0142012_TRACE=1`) on `estimateJoin`,
+counting calls where `j.Lateral && j.Right` is a bound `*IndexScan`/
+`*IndexOnlyScan` with zero `joinEquiPairs`. Ran on two PRIVATE throwaway
+servers (never the shared `:6543x`/`tmp/goopg-bench-bin` lanes — the TPC-H
+`:65433` bench cluster had a live peer loop's server on it all loop, never
+touched): TPC-H (SF=1 data dir copied to `/tmp/goopg-m0142012-tpch-data`,
+private instrumented binary, port 5534, cgroup unit `m0142012-tpch`) and
+TPC-DS SF0.25 (private instrumented binary `tmp/goopg-m0142012-bin` against
+the idle `:65437` gate cluster's own data dir). **TPC-H 6/21 queries hit it**
+(Q2 10, Q7 51, Q8 94, Q9 29, Q11 21, Q21 19 — 224 total call-site hits,
+includes flagship Q9 and the M0077-era Q21 NLI witness). **TPC-DS 69/99
+queries hit it** (6347 total call-site hits; Q14 highest at 1009, then
+Q80/Q49/Q64/Q88/Q23/Q60/Q56/Q33/Q61/Q66/Q38/Q87/Q24/Q72 all >90 hits).
+Counts are DP-search call-site hits (candidates costed during planning), not
+final-plan node counts — a discarded candidate still increments the total,
+so these numbers overstate final-plan impact but are the right signal for
+"is this worth fixing" (yes, decisively). Small overlap with M0142-0005's/
+M0142-0009's/M0142-0010's own witness populations (corroborating, not
+duplicate fixes — confirmed by name-checking their witness lists against
+this loop's hit lists).
 
-In-flight: none. sf025 goopg server (private binary `tmp/goopg-m0142-0011-bin`,
-port 65437) stopped via `bench/tpcds/server.sh stop sf025` and the binary
-removed before this write-up. Verified via `ps aux` no stray goopg process
-remains except the pre-existing TPC-H bench peer on :65433 (another loop's
-live server, never touched this loop).
+Next step: **implement M0142-0012** (`.ralph/fix_plan.md`, full resume point
+already written by M0142-0011, now backed by real numbers from 0012a). Add a
+case ahead of/inside the generic `*Join` dispatch in `EstimateRows`
+(`cardinality.go:95-96`) recognizing `j.Lateral && j.Right` is a bound
+`*IndexScan`/`*IndexOnlyScan`, routing to a generalized version of
+`estimateNLIndexJoin`'s logic (adapt `j.Outer`/`j.Inner` reads to
+`j.Left`/`j.Right`/`j.Predicate`; INNER case stays `return l`; SEMI/ANTI
+reuses `nliSemiMatchFraction`'s formula sourced from the `*IndexScan`'s own
+bound key). Pin with a test mirroring
+`TestEstimateRowsNLIndexJoinSemiScalesByMatchFraction` built via the
+decomposed `Join{Lateral:true}` shape. Re-verify the Q33 CTE-branch witness
+directly (`rows=1` should become `rows≈32`). Given the measured blast
+radius (69/99 TPC-DS, 6/21 TPC-H, including Q9/Q21), this task is EXEMPT
+from finishing in one loop per AGENT.md's plan-parity harness — land the
+code + unit test in one loop if time allows, but the full floor-measurement
+suite (TPC-H plan-parity `-serial`, TPC-DS plan-parity, `make ea-ratchet`,
+SF0.25 regression sweep) may need to be its own immediately-following task;
+name it explicitly in the report if so, per the harness's own rule (do not
+substitute a cheaper gate).
 
-Next step: per the banner, item 4 (M0141/M0142 group) is still open. Pick
-per judgement among: **M0142-0012** (the fix just filed — executor-sized,
-needs full floor-measurement, likely the highest-value single item in the
-group given its probable blast radius across both corpora), **M0142-0003c**
-(level-6 enumeration-order recon, bounded), **M0142-0008** (forced-rewrite-
-vs-search census, bounded), **M0142-0005** (Memoize/probe-multiplier
-interlock, now carries M0142-0010's extra corpus evidence), or **M0141-S7**
-(Incremental Sort — 14 TPC-DS queries, likely the single highest-leverage
-item in the whole group by query count, but a bigger executor+planner slice
-to scope). A 0142-0012 sub-scoping recon (measure how many corpus nodes are
-actually the `Lateral`+`*IndexScan` shape before implementing, mirroring
-this milestone's own measure-first discipline) is a reasonable first cut if
-the next loop wants to size 0012 rather than implement it blind.
+Gates run: `go build ./...` clean; `go build ./internal/optimizer/...` and
+`go test ./internal/optimizer/...` PASS (both before and after the
+trace-add-then-revert — confirms zero production diff); `git status`/
+`git diff` on `cardinality.go` confirmed empty pre-commit; `make
+ralph-state-guard` ran clean (self-repaired a stale `progress.status` marker
+from the previous loop's clean exit, not a project-completion marker — no
+action needed, already reconciled). Pre-commit pgbench smoke PASS (ran as
+part of `git commit`). Full tpch-spotcheck/ea-ratchet/SF025-sweep NOT run
+this loop — correctly skipped per the recon-only precedent (no production
+code changed).
 
-Gates run: `go build ./...` clean (no production diff this loop — recon +
-docs only); `go test ./internal/optimizer/...` PASS (including
-`TestFallbackCapFiresForNonHashAlgoDespiteStats`, confirming the reverted
-Algo-gate experiment left no trace); `git status`/`git diff` on
-`internal/optimizer/cardinality.go` confirmed empty. Full
-tpch-spotcheck/ea-ratchet/SF025-sweep NOT run this loop — correctly skipped
-per the recon-only precedent (M0142-0003a/0003b/0004b/0007/0010 also
-required only build-clean + empty-diff, not the full floor suite, since no
-production code changed). `make ralph-state-guard` to be run immediately
-before the status block.
+In-flight: none. Both private servers (TPC-H `m0142012-tpch` cgroup scope
+on port 5534, TPC-DS `sf025` scope under the private binary on port 65437)
+stopped via their normal lifecycle commands before this write-up, verified
+via `ps aux` — no stray `m0142012`/port-5534 process remains. All scratch
+artefacts removed (`/tmp/goopg-m0142012-tpch-data`, `/tmp/m0142012-*`,
+`tmp/goopg-m0142012-bin`, `/tmp/estimate-audit-m0142012`).
