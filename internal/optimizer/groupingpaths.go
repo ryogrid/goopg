@@ -324,11 +324,50 @@ func groupKeysSortKeys(aggNode *Aggregate) []SortKey {
 // AvgVarBytes follows the same `nodeAvgVarBytes` rule base rels take from
 // ANALYZE. (Kept for the spill arm's resume — costAgg takes both as future
 // inputs; see the NO-spill note there.)
-func aggInputWidth(child Node) (ncols int, avgVarBytes float64) {
+// aggInputWidth reads the seed child's width: the width of the rows being
+// hashed (input side), never the GROUP_AGG rel's output sizing. The child
+// is a finished Node, so its own output schema is the honest source;
+// AvgVarBytes follows the same `nodeAvgVarBytes` rule base rels take from
+// ANALYZE.
+//
+// When agg is non-nil and agg.InputTargetKnown, the width is computed over
+// agg.InputTarget's kept columns (indices into child.Output()) instead of
+// the full row — M0141-S2a-fix1, the B2 absorption for cost_agg's width
+// currency. PG's own cost_agg/hash_agg_entry_size both key off
+// subpath->pathtarget->width / outerplan->plan_width
+// (pathnode.c:3430-3434, nodeAgg.c:1701-1730,3701-3703): the width of the
+// input node PG's planner has ALREADY narrowed by the time it costs or
+// executes the aggregate, via its query-wide attr_needed/pathtarget
+// machinery. goopg has no query-wide equivalent (that is the K24/M0141-S2b
+// item); agg.InputTarget — the NAME-derived keep-list
+// stampAggregateInputTarget computes before createGroupingPaths runs
+// (group_input_target.go) — is goopg's own per-node substitute for the
+// same quantity, so feeding it here is absorption, not tuning (see
+// docs/design/0100-0149/m0141-s2a-fix-scoping-recon.md Findings 1-2).
+//
+// This is a cost-time PREVIEW ONLY: it does not insert a Project, does not
+// change the schema, and is deliberately separate from whether
+// narrowAggregateInput (upper_narrow_apply.go) later actually COMMITS a
+// narrowing Project for the winning strategy — a HASHED winner declines
+// that commit (no Sort to sink a Project below), and that decline does not
+// invalidate this preview: PG's hash_agg_entry_size charges entry size from
+// the input width regardless of row-storage retention (design doc's
+// "Correctness note"). agg == nil or InputTargetKnown == false falls back
+// to the full child.Output() width unchanged (no narrowing derivable).
+func aggInputWidth(child Node, agg *Aggregate) (ncols int, avgVarBytes float64) {
 	if child == nil {
 		return 0, 0
 	}
 	cols := child.Output()
+	if agg != nil && agg.InputTargetKnown {
+		kept := make(Schema, 0, len(agg.InputTarget))
+		for _, idx := range agg.InputTarget {
+			if idx >= 0 && idx < len(cols) {
+				kept = append(kept, cols[idx])
+			}
+		}
+		return len(kept), nodeAvgVarBytes(kept)
+	}
 	return len(cols), nodeAvgVarBytes(cols)
 }
 
@@ -341,7 +380,7 @@ func addGroupingPaths(grouped *RelOptInfo, seed *Path, aggNode *Aggregate, child
 	inputRows := seed.Rows
 	inputStartup, inputTotal := seed.Cost.Startup, seed.Cost.Total
 	numGroups := grouped.Rows
-	inNcols, inAvgVar := aggInputWidth(child)
+	inNcols, inAvgVar := aggInputWidth(child, aggNode)
 
 	groupedOut := len(aggNode.GroupExprs) > 0 || aggNode.GroupingSets != nil
 	presortedKeys, presorted := presortedAggKeysOrAbsent(aggNode, ps)
@@ -419,7 +458,7 @@ func addGroupingPaths(grouped *RelOptInfo, seed *Path, aggNode *Aggregate, child
 			if pc := legacyDisplayCostOf(idxChild); pc.PlanRows > 0 || pc.TotalCost > 0 {
 				idxSeed.Cost = Cost{Startup: pc.StartupCost, Total: pc.TotalCost}
 			}
-			idxNcols, idxAvgVar := aggInputWidth(idxChild)
+			idxNcols, idxAvgVar := aggInputWidth(idxChild, idxSpec)
 			addPath(grouped, &Path{
 				Kind: PathAgg, AggStrategy: AggStrategySorted, Agg: idxSpec,
 				Rel: grouped, Rows: numGroups,

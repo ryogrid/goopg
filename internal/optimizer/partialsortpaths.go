@@ -227,7 +227,7 @@ func createPartialSortPaths(srt *Sort, workers int, leaderParticipates bool, cp 
 	u := newUpperRels()
 	ordered := fetchUpperRel(u, UpperOrdered, 0, 0)
 	ordered.Rows = inputRows
-	ordered.NCols, ordered.AvgVarBytes = aggInputWidth(child)
+	ordered.NCols, ordered.AvgVarBytes = aggInputWidth(child, nil)
 	ordered.Width = tupleWidth(child.Output())
 	// The caller has already established that the subtree is parallel-capable
 	// (`drivingScan(srt.Child) != nil`), which is what this stands for at the

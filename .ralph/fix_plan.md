@@ -1951,7 +1951,7 @@ spill route is net-negative.
     result; R124 §7's prior "currency + narrowing" pairing never had a
     live-at-cost-time preview, so it is not dispositive against retrying
     once fix1 supplies one).
-- [ ] **M0141-S2a-fix1 — wire `agg.InputTarget` into `aggInputWidth`'s three
+- [x] **M0141-S2a-fix1 — wire `agg.InputTarget` into `aggInputWidth`'s three
   call sites** (`groupingpaths.go:344`, `partialaggpaths.go:338`,
   `partialaggupper.go:327`): when `agg.InputTargetKnown`, compute
   `(ncols, avgVarBytes)` from the KEPT columns (`agg.Child.Output()` indexed
@@ -1963,6 +1963,24 @@ spill route is net-negative.
   does not invalidate the preview). Re-measure Q3/Q13/Q18 (TPC-H) and the
   TPC-DS 32-query serial-only set from M0141-S1 after. No currency-formula
   change in this slice — isolate half (1)'s effect before pairing with fix2.
+  **DONE 2026-09-15** — landed exactly as scoped, plus the two other real
+  call sites the recon's Finding 3 didn't enumerate individually
+  (`groupingpaths.go`'s index-ordered variant passes its own narrowed
+  `idxSpec`; `partialsortpaths.go`'s bare-`*Sort` site correctly takes the
+  unchanged nil-agg fallback, no `Aggregate` in scope there). Pinned by
+  `internal/optimizer/agginputwidth_test.go` (2 tests). **Measured on a
+  private clone/port only — shared `:65432/:65433/:65437/:65438` clusters
+  never restarted**: TPC-H `match` 6 -> 8 (Q3, Q13 flip `SHAPE-DIFF` ->
+  `MATCH`, exactly the named queries; Q18 partially improves, drops
+  `sort-strategy`); `aggregation-strategy` 10->8, `sort-strategy` 9->6,
+  `join-order` 14->12, no category regressed. TPC-DS `match` floor held at
+  2; `Q31` (inside M0141-S1's named 32-query serial-shaped set) drops
+  `aggregation-strategy`/`sort-strategy`/`parallelism`; those three
+  categories fall by 1 each corpus-wide, no category regressed.
+  `shape-delta.sh`: TPC-H shape-changed={Q3,Q13,Q18} (exactly the task's
+  set); TPC-DS shape-changed={Q31 (real), Q78 (cost-digits-only, verdict
+  unchanged)}. Full method, artefacts and the "what every task must
+  contain" census: `docs/design/0100-0149/m0141-s2a-fix1-agg-input-width-preview.md`.
 - [ ] **M0141-S2a-fix2 — `hashAggEntrySize` fixed-overhead currency
   correction** (gated on M0141-S2a-fix1 landing and being measured): add the
   missing `MAXALIGN(SizeofMinimalTupleHeader) + tupleWidth` fixed-overhead

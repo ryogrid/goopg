@@ -335,7 +335,7 @@ func createPartialGroupingPaths(agg *Aggregate, workers int, leaderParticipates 
 
 	nAggs := len(agg.Aggs)
 	nGroupCols := len(agg.GroupExprs)
-	inNcols, inAvgVar := aggInputWidth(child)
+	inNcols, inAvgVar := aggInputWidth(child, agg)
 	strategy := agg.Strategy
 
 	t := &partialAggTournament{

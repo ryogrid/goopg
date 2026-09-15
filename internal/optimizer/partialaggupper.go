@@ -324,7 +324,7 @@ func addPartialAggSplitPath(u *upperRels, grouped *RelOptInfo, seed *Path, aggNo
 
 	nAggs := len(aggNode.Aggs)
 	nGroupCols := len(aggNode.GroupExprs)
-	inNcols, inAvgVar := aggInputWidth(child)
+	inNcols, inAvgVar := aggInputWidth(child, aggNode)
 	strategy := aggNode.Strategy
 
 	// ── the SPLIT family, offered only for a DECOMPOSABLE aggregate ─────────
