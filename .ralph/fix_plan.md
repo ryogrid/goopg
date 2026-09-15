@@ -983,13 +983,22 @@ before/after proving the defect it closes.
   TPC-DS queries carry a base-local-filtered scan, per the committed
   PG-oracle plans. Closes `.ralph/deferral_ledger.md` row
   `m0137-0011-filter-node-missing-plancost-embed` (now `resolved`).
-- [ ] **M0137-0016 — add the `*Gather` arm to `pushConjunctTraced` (O15)** —
-  filed by M0137-0012 as a ledger row with **no owner**. Its stated gate
-  ("requires M0137-0010's qual-placement census to exist first") **is already
-  satisfied** — M0137-0010 is complete and every M0139 slice ran the census. The
-  ledger row carries the recipe: add a `*Gather` case that descends to
-  `x.Child`, simpler than the existing `*Join` arm. Same defect class as R56's
-  Q78, which lost three `Filter:` lines with sweep checksums still green.
+- [x] **M0137-0016 — add the `*Gather` arm to `pushConjunctTraced` (O15)** —
+  DONE 2026-09-15
+  (`docs/design/0100-0149/m0137-0016-gather-arm-pushconjuncttraced.md`).
+  Added a bare pass-through `*Gather` case to `pushConjunctTraced`'s switch
+  (`internal/optimizer/inner_join_qual_pushdown.go`): recurses into
+  `x.Child` and rewraps, leaving `st.proven` untouched since `Gather.Output()
+  == Child.Output()` (no coordinate shift, unlike `*Join`; no remap-failure
+  surface, unlike `*Project`). Pinned by three new tests
+  (`internal/optimizer/pushdown_gather_crossing_test.go`): crosses to the
+  correct leaf, proof survives the crossing, composes with a multi-level
+  join spine. Corpus-wide blast radius (measured from the committed
+  PG-oracle plans): TPC-H 0/22, TPC-DS 37/99 queries place a filter below a
+  Gather in PG's own reference plans — no category-count claim made per
+  M0140-0003's standing caution. Closes `.ralph/deferral_ledger.md` row
+  `m0137-0012-o15-gather-crossing-excluded-pushconjuncttraced` (now
+  `resolved`).
 - [ ] **M0137-0017 — capture plans in BOTH serial and parallel modes** — the
   TPC-H scoreboard is captured with `estimate-audit`'s `-serial`, which defaults
   **true** (`cmd/estimate-audit/main.go:293`), so `parallelism` reads 0 because

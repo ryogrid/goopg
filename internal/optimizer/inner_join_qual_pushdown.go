@@ -453,6 +453,24 @@ func pushConjunctTraced(n Node, c Expr, st *pushTrace) (Node, bool) {
 		x.Child = repl
 		return x, true
 
+	case *Gather:
+		// O15 (M0137-0016): a Gather is a single-child pass-through — its
+		// Output() is exactly Child.Output() (NewGather), unlike *Join, so
+		// no coordinate shift and no side/preservation gate apply, and
+		// unlike *Project there is no remap to fail closed on. Without
+		// this arm the descent fell through to the terminal-target check
+		// below and declined at any Gather boundary, silently keeping a
+		// PG-placeable restriction as a post-parallel residual — the same
+		// defect class as R56's Q78 loss (three `Filter:` lines dropped
+		// with sweep checksums still green): a values-only gate cannot see
+		// a qual-placement divergence from PG.
+		repl, ok := pushConjunctTraced(x.Child, c, st)
+		if !ok {
+			return n, false
+		}
+		x.Child = repl
+		return x, true
+
 	case *Join:
 		leftOK, rightOK, pushable := joinRestrictionSides(x)
 		if !pushable {
