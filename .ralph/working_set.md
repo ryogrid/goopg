@@ -1,68 +1,67 @@
-Task: M0142-0009 — recon: plain `Nested Loop`/`Gather` join nodes estimate
-single-digit rows against four-to-five-digit actuals. **DONE and COMMITTED**
-this loop (banner item 4, M0142 sub-group). Root-caused to a single-table
-filter bug (not a join-estimation bug) and fixed.
+Task: M0142-0010 — recon: the `date_dim+store+store_sales` join-level
+cardinality gap (qerr ~42, Q34/Q73) that M0142-0009's leaf fix unmasked.
+**DONE and COMMITTED** this loop (banner item 4, M0142 sub-group). Verdict:
+not a new mechanism — recon-closed with NO production code change.
 
-Files: `internal/optimizer/selectivity.go` (`rangeOpSelectivityStats` guard
-relaxed: `len(Histogram)<2 && len(MCV)==0`, was `len(Histogram)<2` alone),
-`internal/optimizer/rangequery_test.go` (new
-`TestRangeOpSelectivityUsesMCVWithoutHistogram`),
-`docs/design/0100-0149/m0142-0009-mcv-only-range-selectivity.md` (new, full
-method+floor-measurement writeup), `docs/design/README.md` (indexed),
-`.ralph/fix_plan.md` (0009 `[x]`, 0010 follow-up filed),
-`.ralph/deferral_ledger.md` (0009 row, names 0010's resume point),
-`analysis/planner-refactor-take3/c20a-estimator-census-20260915/ea-baseline.txt`
-(re-pinned 122->112), same dir's new `ea-capture-20260915-post0009fix.txt`
-(+`.header`) / `ea-findings-20260915-post0009fix.json`.
+Files: `docs/design/0100-0149/m0142-0010-join-level-gap-is-memoize-shape-not-cardinality-bug.md`
+(new, full trace+oracle-verification writeup), `docs/design/README.md`
+(indexed), `.ralph/fix_plan.md` (0010 `[x]`, 0005's entry enriched with this
+corpus evidence), `.ralph/deferral_ledger.md` (0010 row, names M0142-0005 as
+the resume point). `internal/optimizer/cardinality.go` was temporarily
+instrumented (env-gated `GOOPG_JOIN_TRACE` trace in `estimateJoin`) then
+**reverted** before commit — `git diff` on it is clean.
 
-Key symbols: `rangeOpSelectivityStats` (selectivity.go:333, the fix),
-`computeColumnStats` (operators_analyze.go:1441,1489-1495, confirmed
-PG-faithful — NOT touched), `histogramOpSelectivity`'s `k<1` fallback
-(unchanged, now reachable with a real MCV mass instead of a histogram).
+Key symbols: `estimateJoin` (cardinality.go:608, hash/merge branch
+608-699, NOT modified — verified PG-faithful), `pairNDistinct` (returns
+`nd=73049` for `date_dim.d_date_sk`, a PK), PG oracle's `eqjoinsel_inner`
+(`postgres/src/backend/utils/adt/selfuncs.c:2445`, the no-mutual-MCV default
+branch at :2601 — `MIN(1/nd1,1/nd2)*(1-nullfrac1)*(1-nullfrac2)`, bit-for-bit
+matches goopg's fallback).
 
-Findings: instrumented Q25 (the recon's smallest witness) down to a
-single-table repro with NO join involved: `date_dim WHERE d_moy BETWEEN 4
-AND 10 AND d_year = 1999` estimated `rows=1` vs live PG 18.3's `rows=212`
-(actual 214) on identically-generated SF0.25 data — the join-level qerr the
-task was filed against was only a downstream symptom. Root cause:
-`rangeOpSelectivityStats` bailed out on `len(Histogram)<2` alone, discarding
-a column's MCV list even when (as for `d_moy`, 12 distinct values) the MCV
-list legitimately covers 100% of the mass and the missing histogram is
-CORRECT ANALYZE behavior (mirrors PG's own `compute_scalar_stats`), not a
-gap. PG's `scalarineqsel` sums `mcv_selec` and only defaults the (here empty)
-non-MCV remainder; goopg defaulted the whole clause. One-line guard fix;
-verified post-fix `date_dim` filter reads `rows=211`.
-Floor measurements (mandatory for M0137-M0143, all done this loop, not
-deferred): TPC-H `estimate-audit -plan-only` plan-parity match=8/22
-**unchanged** pre/post-fix (A/B via `git stash` on a private HammerDB-data
-clone); TPC-DS `pg-plan-parity-diff.py` vs the committed `bench/tpcds/plans-pg`
-fixture match=2/99 (Q9, Q41) **unchanged**, byte-identical CATEGORIES lines
-despite 83/99 plan shapes changing underneath (more accurate stats, still
-not full-match); TPC-DS SF0.25 regression sweep `PASS=96 MISMATCH=0`; `make
-ea-ratchet` **122->112 findings, 12 FIXED** (Q10/Q25/Q29/Q34x3/Q68x2/Q69/
-Q73x2/Q79 — every named witness except the still-open C2/CTE-UNION-ALL
-shape), **2 NEW smaller findings** one join-level up
-(`date_dim+store+store_sales`, qerr~42 in Q34/Q73, previously masked by the
-leaf's much larger error) — filed as **M0142-0010**, not chased this loop.
-Baseline re-pinned; `make ea-ratchet` now PASSes clean.
-All throwaway servers (private clones on ports 5533/5534, `tmp/m0142-0009/`)
-stopped and removed before commit — none left running.
+Findings: instrumented `estimateJoin` on a private SF0.25 clone, reproduced
+Q34's `Gather est=2111` (filed as 2105) over `store_sales`(719876)⋈
+`date_dim`(235, correctly filtered) hash join, actual=93640. Traced the
+formula to `l*r*(nullSel/nd)`, textbook FK->PK "uniform over referenced
+domain". Measured goopg's own stats: `ss_sold_date_sk` has only 1823
+distinct values (~5yr window) vs `date_dim`'s 73049-row 1900-2100 span — a
+real 40x domain mismatch. Read PG's `eqjoinsel_inner`: its no-mutual-MCV
+default is the SAME formula. Queried the REAL PG 18.3 oracle's own
+`pg_stats` on identically-generated data: `ss_sold_date_sk` has a 100-entry
+MCV, `d_date_sk` (unique PK) has NONE — so PG's own exact-overlap branch
+can't fire there either, and PG's planner would compute the IDENTICAL
+1.31e-5 selectivity for this exact join shape (verified bit-for-bit against
+the trace). **goopg's cardinality math is PG-formula-identical here — no
+defect to fix.** Real PG's actual plan is accurate only because it picks a
+different SHAPE (`Nested Loop`+`Memoize`+`Index Scan using date_dim_pkey`,
+pricing each probe directly instead of assuming uniformity) — a shape goopg
+cannot select today for the already-filed **M0142-0005** reason (no Memoize
+on the NL probe path). Conclusion: M0142-0010 is a second, independently-
+verified symptom of M0142-0005, not a new mechanism. Ledger row + fix_plan
+0005 entry both updated with this evidence so a future M0142-0005 pass has
+it in hand.
+Throwaway server/clone (port 5533, `tmp/m0142-0010/`) stopped and removed
+before commit — none left running. `tmp/m0142-0009-sf025-bin` stray leftover
+binary from the PRIOR loop also cleaned up this loop (42MB, unused).
 
 In-flight: none. No server/gate process left running.
 
-Next step: per the banner, item 4 (M0137-M0143 group) is still open.
-Recommended pick for the next loop: **M0142-0010** (the 2 new
-join-level findings this loop's fix unmasked — instrument
-`estimateJoin`/`estimateNLIndexJoin` on `date_dim+store+store_sales` the way
-this loop instrumented `rangeOpSelectivityStats`) or **M0142-0004b** (the
-still-open C2 CTE-UNION-ALL recon). Also open at the same priority:
-M0142-0005/0006/0007/0008, or M0141 S2b/S3-S7.
+Next step: per the banner, item 4 (M0141/M0142 group) is still open.
+M0142-0010 is now closed; M0142-0005 (Memoize/probe-multiplier interlock)
+is the natural next pick given it now has TWO independent lines of evidence
+(Q72 timeout + this loop's Q34/Q73 corpus findings) — but it is sized like
+an executor slice (`nl_index_join.go:127`), not a recon, so scope it
+carefully as its own task. Other open M0142 items at the same priority:
+0003c (level-6 enumeration-order parity), 0004b (still-open C2 CTE-UNION-ALL
+recon), 0006 (semiJoinMatchFraction NLI gap), 0007 (corr=0 index fallback,
+re-measure first), 0008 (forced-rewrite-vs-search census). Also open: M0141
+S2b/S3-S7 (S7 Incremental Sort blocks 14 TPC-DS queries).
 
-Gates run: `go build ./...` clean; `go test ./internal/optimizer/...` PASS
-(incl. new test); `scripts/tpch-spotcheck.sh` RESULT=PASS (Q12=2, Q13=34);
-`scripts/tpcds-sf025-regression.sh sweep` PASS=96 MISMATCH=0 CKMISMATCH=0
-ERROR=0 TIMEOUT=0; `make ea-ratchet` PASS (post-repin, clean); TPC-H/TPC-DS
-plan-parity floor checks (see Findings) both held; `make ralph-state-guard`
-— one self-repair (same recurring benign stale-clean-exit-marker pattern
-several prior loops have noted), clean after repair; pre-commit hook's
-mandatory pgbench smoke PASS (all 3 transaction types, 0 failed).
+Gates run: `go build ./...` clean (post-revert, nothing to build-test beyond
+that since no production code changed); `make ralph-state-guard` — one
+self-repair (same recurring benign stale-clean-exit-marker pattern several
+prior loops have noted), clean after repair; pre-commit hook's mandatory
+pgbench smoke PASS (all 3 transaction types, 0 failed). No ea-ratchet/
+tpch-spotcheck/SF0.25-sweep re-run needed — this task landed zero production
+diff, so the 112-entry ea-ratchet baseline M0142-0009 pinned is unchanged by
+construction (confirmed: `cardinality.go` is byte-identical to before this
+loop via `git diff`).
