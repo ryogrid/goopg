@@ -2650,29 +2650,45 @@ cross-layer programme that has never been scoped.
   est=3 vs actual=9969 (qerr 3323), Q25 `date_dim+store_returns` est=1 vs
   actual=6422. Gates: none beyond the gate itself (measurement-only task, no
   production code touched this loop).
-- [ ] **M0142-0005 — break the Memoize / probe-multiplier interlock (B6+B8)** —
-  two ledger rows that lock each other. **B6**: goopg's executor has no Memoize
-  on the NL probe path R59 repriced, so pricing probes PG-faithfully took
-  TPC-DS Q72 from 4 s to a 320 s TIMEOUT (unfixed since R59; carried through
-  R60–R62). **B8**: `indexProbeCostMultiplier = 2.0` (`cost_funcs.go:1053`, value at `:1077`)
-  deliberately departs from PG because the executor materialises the whole TID
-  list eagerly — at `mult = 1` the DP picks PG-shaped NL plans that run 2–3x
-  slower (Q7 5.86 s -> 15.72 s). **Neither can move alone**: PG-faithful probe
-  pricing without Memoize produces Q72-class timeouts. Resume points:
-  `nl_index_join.go:127`, `joinpathsnli.go:313,498`, `cost_funcs.go:1053`.
-  Sibling K73 (`Join.FromOuterReduction`) retires with B8. Expect an executor
-  slice; per the harness a matching plan that runs slower is not a regression,
-  so the Memoize half may be scoped for correctness of the *cost*, not speed.
-  **New corpus evidence (M0142-0010, 2026-09-15)**: this gap is not only a
-  Q72-timeout/cost tradeoff — it is the diagnosed cause of two `make
-  ea-ratchet` findings (Q34/Q73, `date_dim+store+store_sales`, qerr ~42).
-  goopg's `estimateJoin` fallback for that relset is verified PG-formula-
-  identical (matches real PG's own `eqjoinsel_inner` no-mutual-MCV default
-  bit-for-bit against the oracle's `pg_stats`), so the qerr is purely a
-  consequence of being forced into a hash join instead of PG's chosen
-  `Nested Loop`+`Memoize`+`Index Scan using date_dim_pkey` — see
-  `docs/design/0100-0149/m0142-0010-join-level-gap-is-memoize-shape-not-cardinality-bug.md`
-  for the full trace.
+- [ ] **M0142-0005 — give the executor a per-worker Memoize so a Gather-wrapped
+  partial NLI+Memoize candidate can compete (RE-SCOPED 2026-09-16)** — the
+  2026-09-16 recon (`docs/design/0100-0149/m0142-0005-recon-partial-memoize-refused-by-gather-eligibility.md`)
+  found the original B6/B8 framing below is **stale**: Memoize already exists
+  (executor `operators_memoize.go`, cost-based DP-search path
+  `joinpathsmemoize.go`, live since `894485ba7` 2026-07-21) and, on TPC-DS
+  Q34, the DP search already generates and correctly costs the PG-matching
+  `Nested Loop`+`Memoize`+`Index Scan using date_dim_pkey` shape as a
+  **partial** path (`total=16463.24`, cheapest survivor in its joinrel's
+  `PartialPathlist`, near-identical to PG's own real per-worker cost
+  `16125.21`) — the join-order/cardinality layer is already PG-faithful here.
+  **The actual blocker**: `gatherpaths.go`'s `partialPathDrivingKind`'s
+  `PathNestLoop` case (`:456-490`) unconditionally refuses to build a Gather
+  path over any Memoize-wrapped inner (`in.Kind == PathMemoize` /
+  `in.Kind != PathIndexScan`), so the candidate never becomes a competing
+  TOTAL path and a plain serial/gathered hash join wins by default. This is a
+  deliberate, already-reasoned restriction, not an oversight: the executor's
+  `memoizeOp` (`internal/executor/operators_memoize.go`) is a single cache
+  instance with no per-worker claim-set partitioning story
+  (`parallelClaimSet`/`attachAll`, `gatherpaths.go:322-328`, models only
+  `PathSeqScan`/`PathIndexScan`/`PathBitmapHeapScan`/`PathHashJoin`/
+  `PathMergeJoin`/plain `PathNestLoop`). **Resume point**: either (a) give the
+  executor a per-worker-partitioned Memoize cache (PG oracle:
+  `nodeMemoize.c`'s `parallel_worker_number`-keyed model) and then relax
+  `partialPathDrivingKind`'s lateral-probe branch to admit `PathMemoize`, or
+  (b) find a narrower relaxation if (a) is not directly portable. Sized as an
+  executor+planner slice — needs its own scoping/floor-measurement pass before
+  implementation, same discipline as M0142-0012's `-verify`/`a` split.
+  **B8** (`indexProbeCostMultiplier = 2.0`, `cost_funcs.go:1053`/`:1077`) is a
+  separate, narrower, UNSETTLED question this recon did not re-measure: its
+  calibration (`c61781d6`, 2026-09-05) post-dates Memoize's own landing, so its
+  continued need against the current binary is unverified — do not assume it
+  is still required OR that it is now dead weight; measure before touching it.
+  **Corpus evidence this task now carries** (M0142-0010, 2026-09-15): the
+  `date_dim+store+store_sales` `make ea-ratchet` findings (Q34/Q73, qerr ~42)
+  — goopg's `estimateJoin` fallback there is verified PG-formula-identical, so
+  the qerr is purely a consequence of being forced into a hash join instead of
+  the Gather-blocked NLI+Memoize shape; see
+  `docs/design/0100-0149/m0142-0010-join-level-gap-is-memoize-shape-not-cardinality-bug.md`.
 - [x] **M0142-0006 — apply `semiJoinMatchFraction` in `estimateNLIndexJoin`** —
   `estimateNLIndexJoin` (`cardinality.go:239-241`) returns `EstimateRows(j.Outer)` for
   SEMI/ANTI, while its sibling `estimateJoin` (`:608-625`) applies the match
