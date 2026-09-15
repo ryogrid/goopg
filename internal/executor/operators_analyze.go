@@ -15,6 +15,7 @@ import (
 	"github.com/goopg/goopg/internal/access/transam"
 	"github.com/goopg/goopg/internal/access/transam/multixact"
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/nodes"
 	"github.com/goopg/goopg/internal/optimizer"
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/storage"
@@ -1167,10 +1168,50 @@ func datumVariablePayloadWidth(d Datum) int {
 		if d.Flags&flagBigNumeric != 0 {
 			return int(uint32(d.Int & 0xFFFFFFFF))
 		}
-		return 0 // fast-path int64 mantissa fits in Datum.Int
+		return numericFastPathOnDiskWidth(d.Int, d.Scale)
 	default:
 		return 0
 	}
+}
+
+// pgVarlenaShortMaxBody is PG's VARATT_SHORT_MAX (postgres/src/include/varatt.h:257)
+// minus VARHDRSZ_SHORT (:255) — the largest varlena BODY (header excluded) that
+// still fits a 1-byte "short" varlena header. numeric_size-equivalent width
+// computation below wraps its NumericData body in this same header the way a
+// small on-heap value actually is.
+const pgVarlenaShortMaxBody = 0x7F - 1
+
+// numericFastPathOnDiskWidth is M0138-0007's fix: PG's `compute_scalar_stats`
+// measures `VARSIZE_ANY(DatumGetPointer(value))` (analyze.c:2008,2124,2471) —
+// the FULL on-disk varlena size, header included, of the sample row's raw
+// (not detoasted-and-repacked) attribute Datum. For a NUMERIC column that is
+// PG's NumericData struct (`postgres/src/backend/utils/adt/numeric.c:130-146`,
+// short 2-byte internal header when `NUMERIC_CAN_BE_SHORT` holds, else the
+// 4-byte long form) wrapped in the varlena's own 1-byte ("short", body <= 126
+// bytes) or 4-byte header — every fast-path value here is well under that
+// bound, since it is bounded by int64.
+//
+// Oracle-verified rather than assumed: PG 18.3 on the TPC-H bench cluster
+// (`:65432`) reports `pg_column_size(l_quantity)=5` for `18` (dscale 0,
+// 1 digit: 1-byte varlena hdr + 2-byte short numeric hdr + 1 digit*2 bytes)
+// and `pg_stats.avg_width=8` for `l_extendedprice` (dscale 2, 2-3 digits:
+// 7 or 9 bytes depending on magnitude) — both match this formula exactly and
+// refute the NUMERIC_HDRSZ-only (long-form, no short-varlena) guess this
+// ticket's ledger row originally floated.
+//
+// Reuses `nodes.NumericBodyFromText` (the same port `codec.go` uses for the
+// heap's on-disk numeric column form) rather than re-deriving the base-10000
+// digit grouping here, so the two callers cannot drift on ndigits/weight
+// rules.
+func numericFastPathOnDiskWidth(mantissa int64, scale int16) int {
+	body, err := nodes.NumericBodyFromText(formatNumeric(mantissa, scale))
+	if err != nil {
+		return 0
+	}
+	if len(body) <= pgVarlenaShortMaxBody {
+		return 1 + len(body)
+	}
+	return 4 + len(body)
 }
 
 // totalRows is the relation's FULL live-row count (goopg's ANALYZE walks every

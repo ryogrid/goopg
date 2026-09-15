@@ -459,7 +459,11 @@ func TestDatumVariablePayloadWidth(t *testing.T) {
 		{"string long", NewStringDatum(strings.Repeat("x", 2000)), 2000},
 		{"bytes empty", NewBytesDatum(nil), 0},
 		{"bytes small", NewBytesDatum([]byte{1, 2, 3}), 3},
-		{"numeric fast", NewNumericInt64Datum(12345, 0), 0}, // int64 fast-path, no Buf
+		// M0138-0007: the int64 fast-path measures PG's actual on-disk
+		// NumericData width (short varlena header + short numeric header +
+		// digits) instead of reporting 0 — see TestNumericFastPathOnDiskWidth
+		// for the oracle-verified cases this value comes from.
+		{"numeric fast", NewNumericInt64Datum(12345, 0), 7},
 		{"time", NewTimeDatum(time.Unix(1, 0)), 0},
 		{"date", NewDateDatum(time.Date(2026, time.August, 7, 0, 0, 0, 0, time.UTC)), 0},
 		{"interval", NewIntervalDatum(0, 0), 0},
@@ -469,6 +473,42 @@ func TestDatumVariablePayloadWidth(t *testing.T) {
 			got := datumVariablePayloadWidth(tc.d)
 			if got != tc.want {
 				t.Errorf("datumVariablePayloadWidth(%v) = %d, want %d", tc.name, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestNumericFastPathOnDiskWidth pins numericFastPathOnDiskWidth against
+// values measured directly off a live PG 18.3 TPC-H `lineitem` (M0138-0007):
+// `pg_column_size(l_quantity)` reads 5 for the value `18` (dscale 0), and
+// `pg_stats.avg_width` for `l_extendedprice` (dscale 2) reads 8, which this
+// formula reproduces as 7 or 9 depending on the row's magnitude — those two
+// straddle the reported average. Zero must not regress to 0 ("unknown"): a
+// width-0 NUMERIC column was M0138-0005's finding (HammerDB declares every
+// TPC-H key column NUMERIC, so this hits 28/61 TPC-H and 17/120 TPC-DS
+// columns corpus-wide).
+func TestNumericFastPathOnDiskWidth(t *testing.T) {
+	tests := []struct {
+		name  string
+		mant  int64
+		scale int16
+		want  int
+	}{
+		{"18 dscale0 (PG pg_column_size=5)", 18, 0, 5},
+		{"27153.18 dscale2 (PG pg_column_size=9)", 2715318, 2, 9},
+		{"5000.00 dscale2, trailing-zero digit stripped", 500000, 2, 5},
+		{"zero", 0, 0, 3},
+		{"negative", -12345, 2, 7},
+		{"trailing-zero mantissa", 1500, 0, 5},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := numericFastPathOnDiskWidth(tc.mant, tc.scale)
+			if got != tc.want {
+				t.Errorf("numericFastPathOnDiskWidth(%d, %d) = %d, want %d", tc.mant, tc.scale, got, tc.want)
+			}
+			if got == 0 {
+				t.Errorf("numericFastPathOnDiskWidth(%d, %d) = 0 (M0138-0005's regression)", tc.mant, tc.scale)
 			}
 		})
 	}

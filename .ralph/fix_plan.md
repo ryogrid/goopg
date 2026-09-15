@@ -1287,13 +1287,41 @@ unmeasured one does not.
     needed — no production code touched this loop.
   - **M0138 is now fully landed and measured** (all six tasks [x]) — M0142's
     prerequisite gate is satisfied; M0142-0001 becomes selectable.
-- [ ] **M0138-0007 — give `numeric` columns a real `avg_width`** — M0138-0005
+- [x] **M0138-0007 — give `numeric` columns a real `avg_width`** — M0138-0005
   measured that the `numeric` fast path leaves `avg_width=0`, affecting **28 of
   61 TPC-H columns and 17 of 120 TPC-DS columns**, and filed a ledger row with no
   owner. HammerDB's TPC-H declares every primary and foreign key `NUMERIC`, so
   this hits the join columns the whole programme turns on. Resume point in the
   row: `operators_analyze.go:1159-1174` plus PG's `numeric_size` arithmetic. A
   width of zero is not a PG-faithful statistic — this is squarely M0138's remit.
+  - **DONE 2026-09-15.** The ledger row's own guessed formula (`NUMERIC_HDRSZ`
+    plus digits) turned out to be the wrong PG function — that is
+    `numeric_maximum_size`'s typmod-derived worst case (already used
+    elsewhere, `relsize.go`'s `numericHeaderSize`, for the planner's row-width
+    *upper bound*), not what `compute_scalar_stats` measures. Verified against
+    live PG 18.3 instead: `VARSIZE_ANY` of the raw on-heap Datum —
+    `pg_column_size(l_quantity)=5` for `18`, `pg_stats.avg_width=8` for
+    `l_extendedprice`, both reproduced exactly by (1-or-4-byte short/long
+    varlena header) + (PG NumericData's own 2-or-4-byte internal header) +
+    (2 bytes per stripped base-10000 digit). New `numericFastPathOnDiskWidth`
+    reuses `internal/nodes.NumericBodyFromText` (the same `numeric_in` port
+    `codec.go` already uses for the heap's on-disk numeric form) instead of
+    re-deriving digit-grouping. Sibling-path check: `spill.go`'s
+    `estimatedRowBytes` correctly stays at `+0` for this arm (in-memory
+    footprint, a different, already-documented-as-divergent quantity from the
+    on-disk stats ruler) — its cross-check test's coincidental equality for
+    this one case was removed with an explanatory comment, not silently left
+    to bit-rot. Design doc:
+    `docs/design/0100-0149/m0138-0007-numeric-avg-width.md`. Ledger row
+    `m0138-0005` (numeric avg_width) flipped `resolved`. Gates: `go build
+    ./...`; `go test ./internal/executor/... ./internal/optimizer/...` clean
+    (new `TestNumericFastPathOnDiskWidth`, updated
+    `TestDatumVariablePayloadWidth` + `TestEstimatedRowBytesCountsEnumAndBigNumeric`);
+    `RALPH_PRECOMMIT_SCOPE=units` green except the pre-existing, already-filed
+    `internal/parser` `GroupedJoinUnaliased` AST-drift (60 test functions,
+    confirmed unrelated); `scripts/tpch-spotcheck.sh` `RESULT=PASS`
+    (Q12=2/Q13=34, canonical anchors — no plan/category shift observed at
+    this scale).
 - [ ] **M0138-0008 — bisect the category shift M0138 caused** — the corpus
   re-measure moved TPC-DS `join-order` 89->90 and `qual-placement` 16->17 and the
   causing queries were never identified; the row's resume point is to re-capture
