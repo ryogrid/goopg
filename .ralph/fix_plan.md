@@ -1696,15 +1696,49 @@ spill route is net-negative.
   as the workstream's largest item — landing either here would be forcing a
   shape or violating "one task per loop". Filed as two gated resume points
   below (S2a, S2b) instead of closing S2 with a patch.
-- [ ] **M0141-S2a — mechanism (A) re-measure (Q3, and check Q10/Q13/Q18)** —
-  once M0139 (executor-side narrowing) lands and the GROUP_AGG rel's input
-  carries only the columns the aggregate needs, re-run S1's TPC-H capture and
-  check whether `costAgg`'s R3 spill arm (`cost_funcs.go:516-540`) still
-  over-charges HASHED for Q3 (and the three siblings
-  `groupingpaths_test.go`'s `TestCostAggHashedNeverChargesSpill` comment
-  names: Q10, Q13, Q18 — not reconfirmed by this task). Do **not** touch the
-  spill arm itself before M0139 lands — it is a deliberate R3 tradeoff that
-  fixed a larger TPC-DS regression. Needs M0139.
+- [x] **M0141-S2a — mechanism (A) re-measure (Q3, and check Q10/Q13/Q18)** — DONE
+  2026-09-15, design doc
+  `docs/design/0100-0149/m0141-s2a-mechanism-a-remeasure-post-m0139.md`. No
+  production change. M0139 landed in full (all six slices DONE) since S2
+  gated this task on it; live re-capture against the same bench clusters
+  shows Q3/Q13/Q18 **byte-for-byte unchanged** from S1/S2's capture — same
+  costs to two decimal places, same Sorted/Hashed choice, confirmed against
+  a serving binary verified (behaviorally, via a known-narrowed two-table
+  join) to carry M0139's narrowing. Root-caused: `applyUpperNarrowing`
+  (M0139's narrowing entry point) runs at `Plan()`'s tail
+  (`planner.go:189`), strictly *after* `planStmtWithSettings` (`:141`) has
+  already built, costed and strategy-decided the full tree via
+  `createGroupingPaths`/`addGroupingPaths` (`:1760` ->
+  `groupingpaths.go:340`) — live `EXPLAIN (VERBOSE)` shows the Hash Join's
+  `Output:` list genuinely narrowed to 7 columns while its cost/width
+  figures stay identical to pre-M0139. **M0139, as landed and sequenced,
+  structurally cannot feed back into `costAgg`'s spill-arm currency for any
+  query** — S2's gating assumption ("re-measure once M0139 lands") is
+  refuted, not merely unconfirmed. R124 §7 (pre-M0139) already tested an
+  adjacent "corrected currency + ncols narrowing" pairing and found it
+  measured identical to the currency fix alone — a second, independent data
+  point against "narrow, then re-measure" being sufficient. Also: Q10 (named
+  by a unit test's doc comment, not by S1's own TPC-H list) already matches
+  PG at SF=1 — the test's flip is a small-scale artefact, not a live
+  mismatch; not pursued further. Filed **M0141-S2a-fix** below rather than
+  attempting the fix here (two coupled changes: move/preview narrowing
+  before cost time, and correct the width currency — R124 already falsified
+  "currency alone").
+- [ ] **M0141-S2a-fix — make `costAgg`'s width currency see the
+  post-narrowing input** — `aggInputWidth` (`groupingpaths.go:327`) must read
+  a width reflecting what `applyUpperNarrowing`/`narrowJoinLeg` would produce
+  for the aggregate's input, evaluated *before or during*
+  `createGroupingPaths`'s cost contest, not after `Plan()` returns
+  (`planner.go:189`'s current position). Two coupled changes, not a
+  one-line patch: (1) move narrowing earlier or compute a narrowing preview
+  at cost time (planner-search-order surgery — scope which is cheaper before
+  starting); (2) pair it with a corrected `inAvgVarBytes` currency (R120's
+  `hashAggTupleWidth` shape — R124 §7 already falsified "currency fix
+  alone", so this cannot be reinstating the deleted
+  `GOOPG_HASHAGG_WIDTH_CURRENCY` verbatim). Re-measure Q3/Q13/Q18 (and the
+  TPC-DS 51-query AGGSPLIT-touched set, out of scope until M0140's floor)
+  after. Needs a dedicated scoping pass before attempting — size which half
+  is cheaper first, per M0141-S2a's finding.
 - [ ] **M0141-S2b — GROUP_AGG rel publishes Pathlist, not Node, to the
   ORDER BY step** — the K24 "ordering contest, slice 3" surgery: change
   `createOrderedPaths`'s callers (every `createXPaths` -> `createOrderedPaths`
