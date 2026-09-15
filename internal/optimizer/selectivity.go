@@ -331,7 +331,18 @@ func rangeOpSelectivity(op parser.OpCode, left, right Expr, child Node) float64 
 // short histogram, or a non-constant) and the caller keeps its own
 // default.
 func rangeOpSelectivityStats(op parser.OpCode, col *ColumnRef, val Expr, stats *catalog.ColumnStats) (float64, bool) {
-	if stats == nil || len(stats.Histogram) < 2 {
+	// M0142-0009: a column whose distinct values all fit the MCV list
+	// (analyze.c's `nmultiple == ndistinct` case, `computeColumnStats`
+	// mirrors it at operators_analyze.go:1441) legitimately stores NO
+	// histogram — the non-MCV remainder is empty by construction, not
+	// unmeasured. Bailing out here on histogram length alone discarded
+	// that fully-measured MCV mass and fell back to defaultIneqSelectivity
+	// for the WHOLE clause; PG's scalarineqsel instead sums mcv_selec with
+	// a defaulted contribution over only the (here empty) non-MCV mass.
+	// TPC-DS date_dim.d_moy (12 distinct values, always MCV-complete at
+	// SF0.25/SF1) is the reproducing case: `d_moy BETWEEN 4 AND 10 AND
+	// d_year = 1999` collapsed 212-actual rows to est=1.
+	if stats == nil || (len(stats.Histogram) < 2 && len(stats.MCV) == 0) {
 		return 0, false
 	}
 	literal, ok := formatExprConstant(val)

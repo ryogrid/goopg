@@ -1,6 +1,5 @@
 # EA parity ratchet baseline — one line per finding.
 # tol=2.0 floor=10.0
-Q10:date_dim+store_sales
 Q14:catalog_sales+date_dim
 Q14:catalog_sales+date_dim+item
 Q14:date_dim+item+web_sales
@@ -9,9 +8,7 @@ Q16:call_center+catalog_sales+customer_address+date_dim
 Q19:customer+date_dim+store_sales
 Q23:catalog_sales+customer+date_dim
 Q23:customer+date_dim+web_sales
-Q25:date_dim+store_returns
 Q27:customer_demographics+date_dim+item+store_sales
-Q29:date_dim+store_returns
 Q33:cs.catalog_sales+cs.customer_address+cs.date_dim+cs.item
 Q33:cte:cs
 Q33:cte:cs+cte:ss+cte:ws
@@ -20,9 +17,7 @@ Q33:cte:ws
 Q33:ss.customer_address+ss.date_dim+ss.item+ss.store_sales
 Q33:ws.customer_address+ws.date_dim+ws.item+ws.web_sales
 Q34:customer+date_dim+household_demographics+store+store_sales
-Q34:date_dim+household_demographics+store+store_sales
-Q34:date_dim+household_demographics+store_sales
-Q34:date_dim+store_sales
+Q34:date_dim+store+store_sales
 Q46:customer_address+date_dim+store+store_sales
 Q47:cte:v2
 Q48:customer_address+customer_demographics+date_dim+store_sales
@@ -71,17 +66,13 @@ Q61:customer+customer_address+date_dim+item+promotion+store_sales
 Q61:customer+customer_address+date_dim+promotion+store_sales
 Q61:customer+customer_address+date_dim+store_sales
 Q63:date_dim+item+store_sales
-Q68:customer+customer_address+date_dim+household_demographics+store+store_sales
-Q68:customer_address+date_dim+household_demographics+store+store_sales
 Q68:customer_address+date_dim+store+store_sales
 Q68:customer_address+date_dim+store_sales
 Q69:catalog_sales+customer+customer_address+customer_demographics+date_dim+store_sales+web_sales
 Q69:customer+customer_address+customer_demographics+date_dim+store_sales
 Q69:customer+customer_address+customer_demographics+date_dim+store_sales+web_sales
-Q69:date_dim+store_sales
 Q72:catalog_returns+catalog_sales+customer_demographics+date_dim+household_demographics+inventory+item+promotion+warehouse
-Q73:date_dim+household_demographics+store+store_sales
-Q73:date_dim+household_demographics+store_sales
+Q73:date_dim+store+store_sales
 Q73:date_dim+store_sales
 Q77:cr.catalog_returns+cr.date_dim
 Q77:sr.date_dim+sr.store+sr.store_returns
@@ -95,7 +86,6 @@ Q78:cte:cs
 Q78:cte:ss
 Q78:cte:ss+cte:ws
 Q78:cte:ws
-Q79:date_dim+household_demographics+store_sales
 Q80:csr.catalog_page+csr.catalog_returns+csr.catalog_sales+csr.date_dim+csr.item
 Q80:csr.catalog_page+csr.catalog_returns+csr.catalog_sales+csr.date_dim+csr.item+csr.promotion
 Q80:csr.catalog_returns+csr.catalog_sales+csr.date_dim+csr.item

@@ -2664,31 +2664,59 @@ cross-layer programme that has never been scoped.
   first). Deliverable: a per-query census of which plan nodes came from the
   search vs from a forced rewrite, and a verdict on whether a dedicated
   milestone is warranted.
-- [ ] **M0142-0009 — recon: plain `Nested Loop`/`Gather` join nodes estimate
+- [x] **M0142-0009 — recon: plain `Nested Loop`/`Gather` join nodes estimate
   single-digit rows against four-to-five-digit actuals, at `loops=1`** —
   Filed by M0142-0004c from the post-C1-fix re-capture
-  (`ea-findings-20260915-post0004a.json`, 122 findings). Distinct from C1
-  (leaf `IndexScan est=1`, fixed by M0142-0004a — a capture bug) and C2
-  (`M0142-0004b`'s 3-way CTE `UNION ALL` `est=3`, still open): these are
-  **join-level** nodes, several of them plain `Nested Loop` (not the
-  NLI/SEMI/ANTI shapes M0142-0005/0006 already name), each confirmed
-  `loops=1` in the raw capture text (so not a second loops-capture
-  artifact — ruled out directly, not inferred). Witnesses: Q34
-  `date_dim+household_demographics+store` Nested Loop est=3 vs actual=9969
-  (qerr 3323, pg_est=15/pg_qerr=664 — PG is *also* wrong here, just 5x less
-  wrong); Q25 `date_dim+store_returns` Nested Loop est=1 vs actual=6422
-  (qerr 6422, pg_est=118/pg_qerr=54); Q10/Q69/Q73/Q33/Q68 `Gather` nodes
-  over similar relsets at 2-3 orders out. Concrete next step: pick the
-  smallest witness (Q25, two-relation join, no CTE/Gather layer) and
-  instrument `EstimateRows` on that specific `Nested Loop` path the way
-  M0142-0004a instrumented `indexScanRows` — establish whether this is one
-  mechanism (e.g. a join-selectivity term shared across all these witnesses)
-  or several coincidentally-similar ones before scoping a fix. Do not
-  assume it is the same mechanism as M0142-0006's `semiJoinMatchFraction`
-  gap without checking the join type on each witness first (`pattern
-  goopg_swallowed_error_in_rewrite_driver`'s standing warning against
-  guessing the mechanism from the outside applies here too). Evidence:
-  `analysis/planner-refactor-take3/c20a-estimator-census-20260915/ea-findings-20260915-post0004a.json`.
+  (`ea-findings-20260915-post0004a.json`, 122 findings). **DONE 2026-09-15,
+  full writeup in
+  `docs/design/0100-0149/m0142-0009-mcv-only-range-selectivity.md`.**
+  Instrumented the smallest witness (Q25) down to a **single-table filter**
+  with no join at all: `date_dim WHERE d_moy BETWEEN 4 AND 10 AND d_year =
+  1999` estimated `rows=1` against real PG 18.3's `rows=212` (actual 214) on
+  identically-generated data — the join-level qerr the task was filed
+  against was only a downstream symptom. Root cause:
+  `rangeOpSelectivityStats` (`internal/optimizer/selectivity.go:333`)
+  discarded a column's entire MCV list whenever its histogram had `<2`
+  boundaries; `d_moy` (12 distinct values) is MCV-complete by construction
+  (`computeColumnStats`'s `nmultiple == ndistinct` case correctly leaves its
+  histogram empty, mirroring PG's own `compute_scalar_stats` — both engines
+  make the identical ANALYZE decision), so the guard punted the whole clause
+  to `defaultIneqSelectivity`/`defaultRangeIneqSel` every time instead of
+  using the fully-measured MCV mass it already had, unlike PG's
+  `scalarineqsel` which sums `mcv_selec` and defaults only the (here empty)
+  non-MCV remainder. Fix: relaxed the guard to `len(Histogram) < 2 &&
+  len(MCV) == 0` — one line; the function's existing MCV-mass loop and
+  `histogramOpSelectivity`'s existing `k<1` fallback already compose PG's
+  formula once the guard stops skipping them (absorption, not tuning — no
+  constant added, per owner decision B2). Mandatory M0137-M0143 floor
+  measurements (all in the design doc): TPC-H plan-parity match=8/22
+  unchanged pre/post-fix (private-clone A/B via `git stash`, same build);
+  TPC-DS plan-parity match=2/99 (Q9, Q41) unchanged, byte-identical
+  `CATEGORIES`/`CATEGORIES-EXCL-MATCH` despite 83/99 plan shapes changing
+  underneath; TPC-DS SF0.25 regression sweep `PASS=96 MISMATCH=0
+  CKMISMATCH=0 ERROR=0`; `make ea-ratchet` **122 -> 112 findings** (12
+  FIXED: Q10, Q25, Q29, Q34 x3, Q68 x2, Q69, Q73 x2, Q79 — every named
+  witness except the CTE-`UNION ALL`-shaped ones, which are M0142-0004b's
+  still-open C2; 2 NEW smaller findings one join level up, previously
+  masked by the leaf's much larger error — filed as **M0142-0010**, not
+  chased in this task). Baseline re-pinned to the new 112-entry set.
+  `go test ./internal/optimizer/...` PASS incl. new
+  `TestRangeOpSelectivityUsesMCVWithoutHistogram`; `scripts/tpch-spotcheck.sh`
+  RESULT=PASS (Q12=2, Q13=34); `go build ./...` clean.
+- [ ] **M0142-0010 — recon: a join-level cardinality gap unmasked by
+  M0142-0009's leaf fix** — `date_dim+store+store_sales` estimates ~40x
+  under actual in both Q34 (`Gather`, est=2105 vs actual=91450, qerr 43.4)
+  and Q73 (`Hash Join`, est=630 vs actual=26312, qerr 41.8), newly visible in
+  `make ea-ratchet` once M0142-0009's leaf-level `date_dim` filter stopped
+  drowning it out (previously masked under a qerr in the thousands at the
+  same relset). Resume point: instrument `estimateJoin`/`estimateNLIndexJoin`
+  on this specific relset the way M0142-0009 instrumented
+  `rangeOpSelectivityStats` — establish the mechanism (measured-branch
+  `pairNDistinct`/superkey selectivity vs an unmeasured fallback, per
+  `cardinality.go:607-698`) before proposing a fix; do not assume it is the
+  same mechanism M0142-0009 just fixed without checking directly. Evidence:
+  `analysis/planner-refactor-take3/c20a-estimator-census-20260915/ea-findings-20260915-post0009fix.json`,
+  `ea-baseline.txt` (112-entry, post-0009 pin).
 
 ## M0143 — Engine correctness carry-overs from the parity programme (filed 2026-09-14)
 

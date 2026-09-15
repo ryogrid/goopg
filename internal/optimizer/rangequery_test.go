@@ -565,3 +565,71 @@ func TestPathCarriesItsOwnWidth(t *testing.T) {
 			narrowSizing.NBatch)
 	}
 }
+
+
+// mcvCompleteScan builds a SeqScan on a low-ndistinct int4 column whose
+// ANALYZE-equivalent stats put EVERY distinct value into the MCV list and
+// leave Histogram empty — `computeColumnStats`'s `nmultiple == ndistinct`
+// case (operators_analyze.go:1441), which TPC-DS's date_dim.d_moy (12
+// distinct months) hits at both SF0.25 and SF1.
+func mcvCompleteScan(t *testing.T) *SeqScan {
+	t.Helper()
+	cat := catalog.NewInMemory()
+	tbl, err := cat.CreateTable(parser.ObjectName{Name: "d"},
+		[]catalog.Column{{Name: "moy", Type: catalog.Type{Name: "int4"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mcv := make([]catalog.MCVEntry, 12)
+	for i := range mcv {
+		mcv[i] = catalog.MCVEntry{Value: strconv.Itoa(i + 1), Frequency: 1.0 / 12.0}
+	}
+	tbl.Stats = &catalog.TableStats{
+		RowCount: 73049,
+		Analyzed: true,
+		Columns:  []catalog.ColumnStats{{NDistinct: 12, MCV: mcv}},
+	}
+	return &SeqScan{Table: tbl, EstRelRows: 73049}
+}
+
+func mcvBound(op parser.OpCode, v int64) Expr {
+	return &BinaryOp{
+		Op:    op,
+		Left:  &ColumnRef{Name: "moy", Index: 0, SourceTableIdx: 1, Type: catalog.Type{Name: "int4"}},
+		Right: &IntegerConst{Value: v},
+	}
+}
+
+// TestRangeOpSelectivityUsesMCVWithoutHistogram is M0142-0009's pin: a
+// column whose MCV list covers all of its mass (so ANALYZE legitimately
+// stored no histogram — the non-MCV remainder is empty, not unmeasured)
+// must still price a bound from that MCV mass, not fall back to
+// defaultIneqSelectivity for the whole clause. Before the fix,
+// `rangeOpSelectivityStats` bailed out on `len(Histogram) < 2` alone and
+// TPC-DS Q25's `date_dim.d_moy BETWEEN 4 AND 10 AND d_year = 1999`
+// collapsed a 212-actual-row filter to est=1.
+func TestRangeOpSelectivityUsesMCVWithoutHistogram(t *testing.T) {
+	scan := mcvCompleteScan(t)
+	col := mcvBound(parser.OpGe, 4).(*BinaryOp).Left.(*ColumnRef)
+
+	sel, measured := rangeOpSelectivityStats(parser.OpGe, col, &IntegerConst{Value: 4}, columnStatsByName(scan.Table, "moy"))
+	if !measured {
+		t.Fatal("MCV-complete stats (no histogram) were reported as unmeasured; the clause falls back to the 1/3 default")
+	}
+	// Months 4..12 of 12 are >= 4: 9/12.
+	if want := 9.0 / 12.0; math.Abs(sel-want) > 1e-9 {
+		t.Fatalf("sel=%v, want %v (the MCV mass for moy>=4)", sel, want)
+	}
+
+	// The BETWEEN pairing (conjunctionSelectivity, rangequery.go) must
+	// compose the two now-measured bounds into the band, not punt to
+	// defaultRangeIneqSel because it mistakes the measured value for a
+	// default (the old bug: both single-bound punts happened to equal
+	// defaultIneqSelectivity by coincidence, which is NOT the case here).
+	and := &BinaryOp{Op: parser.OpAnd, Left: mcvBound(parser.OpGe, 4), Right: mcvBound(parser.OpLe, 10)}
+	got := clauseSelectivity(and, scan)
+	// Months 4..10 of 12: 7/12.
+	if want := 7.0 / 12.0; math.Abs(got-want) > 1e-9 {
+		t.Fatalf("BETWEEN sel=%v, want %v (7 of 12 months, from the MCV mass)", got, want)
+	}
+}
