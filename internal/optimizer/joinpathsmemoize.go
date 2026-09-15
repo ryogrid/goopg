@@ -122,7 +122,7 @@ func memoizeEntryOverheadBytes(tuples float64) float64 {
 // `isDefaultND` is PG's `SELFLAG_USED_DEFAULT` (:2592): a guessed ndistinct is
 // replaced by `calls`, which drives the hit ratio to zero and makes the wrapped
 // path strictly more expensive than the one it wraps.
-func costMemoizeRescan(cp costParams, inner Cost, tuples, calls, ndistinct float64, isDefaultND bool, ncols, nkeys int) (Cost, int64) {
+func costMemoizeRescan(cp costParams, inner Cost, tuples, calls, ndistinct float64, isDefaultND bool, ncols, nkeys, width int) (Cost, int64) {
 	if calls < 1 {
 		calls = 1
 	}
@@ -130,9 +130,27 @@ func costMemoizeRescan(cp costParams, inner Cost, tuples, calls, ndistinct float
 		tuples = 0
 	}
 
-	estEntryBytes := hashsize.EntryBytes(ncols, 0)*tuples +
-		memoizeEntryOverheadBytes(tuples) +
-		hashsize.EntryBytes(nkeys, 0)
+	// R108/R113-shaped absorption arm (M0139-0007b): PG prices the cached
+	// tuple bytes with `relation_byte_size(tuples, width)` +
+	// `ExecEstimateCacheEntryOverheadBytes(tuples)` (costsize.c:2565-2566),
+	// where `width` is the PG-equivalent pathtarget width, not goopg's
+	// Datum/kvcache entry size. Off by default like its two siblings; the
+	// per-key term (`hashsize.EntryBytes(nkeys, 0)`, standing in for PG's
+	// `get_expr_width` sum over `param_exprs`) is unchanged in both
+	// currencies — goopg has no per-expression width statistic to port that
+	// call to (ledgered, m0139-0007b).
+	var tupleBytes float64
+	if pgMemoizeEntryBytesCostEnabled() {
+		if pgBytes, ok := pgRelationByteSize(tuples, width); ok {
+			tupleBytes = pgBytes + pgMemoizeEntryOverheadBytes(tuples)
+		} else {
+			tupleBytes = hashsize.EntryBytes(ncols, 0)*tuples + memoizeEntryOverheadBytes(tuples)
+		}
+	} else {
+		tupleBytes = hashsize.EntryBytes(ncols, 0)*tuples + memoizeEntryOverheadBytes(tuples)
+	}
+
+	estEntryBytes := tupleBytes + hashsize.EntryBytes(nkeys, 0)
 	if estEntryBytes < memoizeMinEntryBytes {
 		estEntryBytes = memoizeMinEntryBytes
 	}
@@ -268,7 +286,7 @@ func getMemoizePath(s *searchCtx, outer *RelOptInfo, outerPath, innerPath *Path,
 		// TestGetMemoizePathDeclinesIndexOnlyInner: if a parameterised
 		// index-only path is ever added, that pin fails rather than the
 		// narrowing-off arm silently re-pricing.
-		ndistinct, isDefault, pathNCols(innerPath), len(keys))
+		ndistinct, isDefault, pathNCols(innerPath), len(keys), pathWidth(innerPath))
 
 	mp := &Path{
 		Kind: PathMemoize,

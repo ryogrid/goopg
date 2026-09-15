@@ -149,6 +149,12 @@ var flagResolvedState = map[string]func(string) string{
 	"GOOPG_PG_SORT_RELATION_BYTES_COST": func(v string) string {
 		return onOff(pgSortRelationBytesCostFromEnv(v))
 	},
+	// M0139-0007b's experiment is default-off and changes only Memoize's
+	// planner cache-entry byte price, but artefacts must name its currency for
+	// a reproducible A/B.
+	"GOOPG_PG_MEMOIZE_ENTRY_BYTES_COST": func(v string) string {
+		return onOff(pgMemoizeEntryBytesCostFromEnv(v))
+	},
 	// A mode, not a boolean: the artefact carries the word an operator would
 	// export to reproduce the arm.
 	"GOOPG_NLI_COSTGATE": func(v string) string {
@@ -232,6 +238,11 @@ var flagProvenanceOrder = []string{
 	"GOOPG_PARTIAL_SORT_PATHS",
 	"GOOPG_PG_HASH_TUPLE_SPILL_COST",
 	"GOOPG_PG_SORT_RELATION_BYTES_COST",
+	// Joined at M0139-0007b: gives cost_memoize_rescan's cache-entry byte
+	// estimate PG's relation_byte_size/ExecEstimateCacheEntryOverheadBytes
+	// currency instead of goopg's kvcache entry size. Default `off`, R108/
+	// R113-shaped.
+	"GOOPG_PG_MEMOIZE_ENTRY_BYTES_COST",
 	// Joined at R120 (r120-hashagg-width-currency/SCOPE.md), default `off`.
 	// Retired at M0137-0009 — see flagProvenanceRetired below.
 	"GOOPG_HASHAGG_WIDTH_CURRENCY",

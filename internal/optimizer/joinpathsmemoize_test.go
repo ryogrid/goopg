@@ -106,7 +106,7 @@ func memoInnerRel(relids RelSet, param RelSet, probeCost float64) (*RelOptInfo, 
 func TestMemoizeWithoutStatisticsIsStrictlyMoreExpensive(t *testing.T) {
 	cp := defaultCostParams()
 	inner := Cost{Startup: 1, Total: 100}
-	rescan, est := costMemoizeRescan(cp, inner, 1, 10000, 200, true, 4, 1)
+	rescan, est := costMemoizeRescan(cp, inner, 1, 10000, 200, true, 4, 1, 8)
 	if rescan.Total <= inner.Total {
 		t.Fatalf("rescan total %.4f <= probe total %.4f; a defaulted ndistinct must never buy a discount",
 			rescan.Total, inner.Total)
@@ -124,7 +124,7 @@ func TestMemoizeWithoutStatisticsIsStrictlyMoreExpensive(t *testing.T) {
 func TestMemoizeWithStatisticsPricesTheHitRatio(t *testing.T) {
 	cp := defaultCostParams()
 	inner := Cost{Startup: 1, Total: 100}
-	rescan, est := costMemoizeRescan(cp, inner, 1, 10000, 200, false, 4, 1)
+	rescan, est := costMemoizeRescan(cp, inner, 1, 10000, 200, false, 4, 1, 8)
 	if rescan.Total >= inner.Total {
 		t.Fatalf("rescan total %.4f >= probe total %.4f; a 98%% hit ratio must be cheaper than probing",
 			rescan.Total, inner.Total)
@@ -142,7 +142,7 @@ func TestMemoizeWithStatisticsPricesTheHitRatio(t *testing.T) {
 func TestMemoizeNDistinctClampedToCalls(t *testing.T) {
 	cp := defaultCostParams()
 	inner := Cost{Startup: 1, Total: 100}
-	rescan, _ := costMemoizeRescan(cp, inner, 1, 100, 1_000_000, false, 4, 1)
+	rescan, _ := costMemoizeRescan(cp, inner, 1, 100, 1_000_000, false, 4, 1, 8)
 	if rescan.Total < inner.Total {
 		t.Fatalf("rescan total %.4f < probe total %.4f; an unclamped ndistinct produced a negative hit ratio",
 			rescan.Total, inner.Total)

@@ -40,6 +40,14 @@ Select in this order:
    nothing to the metric and M0141's remaining slices cannot be judged.**
    Take `M0139-0007` first (it establishes the absorption principle the
    S2a-fix then applies), unless its scoping recon says otherwise.
+   **RESOLVED 2026-09-15: both halves are now landed-and-decided.**
+   M0141-S2a-fix1 landed (TPC-H `match` 6→8); fix2 was attempted and declined
+   (measured net-neutral/negative, reverted). M0139-0007's three filed pieces
+   — the recon, 0007a (R108/R113 measurement, both HOLD), 0007b (Memoize
+   absorption, HOLD) — are all complete; only the narrow M0139-0007c follow-up
+   (Memoize's un-absorbed per-key width term, not on the critical path) is
+   still open. **The next loop should select item 2 below (M0137's re-opened
+   0014–0017)** unless a later banner edit says otherwise.
 2. **M0137's re-opened tasks (0014–0017).** Instrument and orphan-mechanism
    debt found by the review. 0015 is one line and 0016's gate is already
    satisfied. **0017 matters more than its size suggests**: TPC-H plans are
@@ -1565,14 +1573,41 @@ that comment names as parity-inert.
     open. The next loop should take M0139-0007b next (still inside the
     top-priority group) unless its own recon surfaces a reason to defer it,
     in which case the banner's item 2 (M0137's re-opened 0014–0017) is next.
-- [ ] **M0139-0007b — port PG's Memoize entry-byte currency.** Give
-  `joinpathsmemoize.go`'s `estEntryBytes` (`:133-139`) PG's `cost_memoize_rescan`
-  currency (`postgres/src/backend/optimizer/path/costsize.c:2541-2578`):
-  `relation_byte_size(tuples, width)` (reuse the already-built
-  `pgRelationByteSize`, `sort_pgrelationbytes.go`) plus a ported
-  `ExecEstimateCacheEntryOverheadBytes` (PG's `nodeMemoize.c`). New absorption
-  site, no prior attempt exists. Needs a design-doc justification and a test
-  pinning the two currencies apart, per B2's rules.
+- [x] **M0139-0007b — port PG's Memoize entry-byte currency** (DONE
+  2026-09-15). Gave `joinpathsmemoize.go`'s `costMemoizeRescan` a new
+  default-off arm, `GOOPG_PG_MEMOIZE_ENTRY_BYTES_COST` (R108/R113-shaped):
+  `pgRelationByteSize(tuples, pathWidth(innerPath))` (reused verbatim from
+  R113) plus a newly-ported `pgMemoizeEntryOverheadBytes`
+  (`ExecEstimateCacheEntryOverheadBytes`, `nodeMemoize.c:1171-1176`, derived
+  from the actual `MemoizeEntry`/`MemoizeKey`/`MemoizeTuple` C struct sizes:
+  24+24+16·tuples). Pinned by 3 new tests
+  (`internal/optimizer/memoize_pgentrybytes_test.go`).
+  - **Measured: byte-identical on both corpora.** TPC-H's one Memoize node
+    (`rows=1 width=490`) and TPC-DS SF0.25's 13 Memoize nodes (all `rows=1`)
+    price identically in both arms — the byte currency only reaches the final
+    cost via `evictRatio`, and every candidate's `estCacheEntries` swamps
+    `ndistinct` under a 64 MB `work_mem` regardless of currency. Same
+    "arm never reaches its own memory-constrained regime" shape 0007a found
+    for R108/R113. **Decision: HOLD, stays default-off.**
+  - Deferred: the per-key `get_expr_width` term is not absorbed (no goopg
+    per-expression width statistic exists yet) — ledger row `m0139-0007b`,
+    follow-up filed as **M0139-0007c** below.
+  - Design doc: `docs/design/0100-0149/m0139-0007b-memoize-entry-bytes-absorption.md`.
+  - **With this, all three of M0139-0007's filed pieces (recon, 0007a, 0007b)
+    are resolved** — the banner's "M0141-S2a-fix and M0139-0007" line's
+    `M0139-0007` half is complete.
+- [ ] **M0139-0007c — port `get_expr_width` for Memoize's cache-key width
+  term.** `costMemoizeRescan`'s per-key contribution
+  (`hashsize.EntryBytes(nkeys, 0)`, both currencies) still stands in for PG's
+  `get_expr_width` sum over `mpath->param_exprs`
+  (`postgres/src/backend/optimizer/path/costsize.c:2566-2567`) because goopg
+  has no per-expression average-width statistic wired to this site. Needs a
+  per-column/per-expression width lookup (candidate: extend
+  `pathAvgVarBytes`/`typeWidth`-style catalog lookups to a bare `*ColumnRef`
+  cache key, since `getMemoizePath`'s gates already guarantee every key is
+  one) before it can be absorbed rather than approximated. Not currently
+  gating the banner's top-priority line — pick up per the milestone's normal
+  ordering.
 
 ## M0140 — TPC-DS parallelism (filed 2026-09-14)
 
