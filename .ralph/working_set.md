@@ -1,60 +1,70 @@
-Task: M0141-S2a-fix1 (banner's TOP-PRIORITY group, "M0141-S2a-fix and
-M0139-0007 — costing-order unblock"). **DONE and committed this loop**
-(`ca574113c`, pushed). Build/tests green, `scripts/tpch-spotcheck.sh` PASS,
-`make ralph-state-guard` clean (self-repaired the usual prior-loop clean-exit
-marker).
+Task: M0141-S2a-fix2 (banner's TOP-PRIORITY group, "M0141-S2a-fix and
+M0139-0007 — costing-order unblock"). **ATTEMPTED, MEASURED, and DECLINED
+this loop** (`1ed4c023e`, pushed). Code implemented, tested green, measured
+cleanly on private clones, then REVERTED after measurement showed no net
+gain (TPC-DS regression, TPC-H lateral). This is a closed decision, not
+unfinished work.
 
-Files: `internal/optimizer/groupingpaths.go` (`aggInputWidth` gained an
-`*Aggregate` param, reads `agg.InputTarget`'s kept columns when
-`InputTargetKnown`), `partialaggpaths.go`/`partialaggupper.go`/
-`partialsortpaths.go` (call-site updates, `nil` at the one non-Aggregate
-site), `internal/optimizer/agginputwidth_test.go` (new, 2 pinning tests),
-`docs/design/0100-0149/m0141-s2a-fix1-agg-input-width-preview.md` (new,
-full B2 derivation + measurement), `docs/design/README.md` (+index row),
-`.ralph/fix_plan.md` (M0141-S2a-fix1 checked off with results),
-`analysis/m0141/m0141-s2a-fix1-{tpch,tpcds}*` (6 committed capture
-artefacts).
+Files: `docs/design/0100-0149/m0141-s2a-fix2-hashaggentrysize-currency-attempt.md`
+(new, full derivation + both measurements + HOLD decision),
+`docs/design/README.md` (+index row), `.ralph/fix_plan.md` (M0141-S2a-fix2
+checked off `[x]` with the HOLD result, NOT a production change),
+`.ralph/deferral_ledger.md` (+row, task-id `m0141-s2a-fix2`),
+`analysis/m0141/m0141-s2a-fix2-{tpch,tpcds}*` (4 committed measurement
+artefacts). `internal/optimizer/cost_funcs.go` and its 4 test-file
+companions were edited, measured, THEN `git checkout --`'d back to HEAD —
+the tree carries NO `costAgg` diff from this task; do not expect to find
+one.
 
-Key symbols: `aggInputWidth` (`groupingpaths.go`, now
-`(child Node, agg *Aggregate)`), `Aggregate.InputTarget`/
-`InputTargetKnown` (`plan.go:1394-1395`), `stampAggregateInputTarget`
-(`group_input_target.go:268`, unchanged — already ran before this task),
-`narrowAggregateInput`/`pastSort` (`upper_narrow_apply.go`, the REAL
-narrowing commit this preview is deliberately separate from).
+Key symbols: `costAgg`'s SPILL ARM (`cost_funcs.go:431-542`, unchanged at
+HEAD), `hashAggEntrySize` (unchanged), `hashsize.EntryBytes` (the
+PG-equivalent full-row currency that WAS tried as the arm's `tupleWidth`
+input instead of bare `inAvgVarBytes` — declined).
 
-Findings/measured result: TPC-H match 6 -> 8 (Q3, Q13 flip SHAPE-DIFF ->
-MATCH, exactly the task's named queries; Q18 partial — drops
-sort-strategy, still SHAPE-DIFF on join-order/join-method/scan-type/
-aggregation-strategy). TPC-DS match floor held at 2; Q31 (inside M0141-S1's
-named 32-query serial set) drops aggregation-strategy/sort-strategy/
-parallelism, still SHAPE-DIFF on the rest. No category regressed in either
-corpus. `shape-delta.sh` confirms exactly {Q3,Q13,Q18} / {Q31,Q78(cosmetic)}
-changed plan shape. Measured on a private clone/port only — shared
-:65432/:65433/:65437/:65438 clusters were read from (BASE_BACKUP clone,
-live EXPLAIN) but never stopped/started/rebuilt; all private binaries/clone
-dirs/cgroup scopes removed after use.
+Findings: fix2 restores "Arm C" (fixed-width/avgVar=0 aggregate inputs
+pricing a real spill footprint) exactly as R120 once did. Measured with a
+same-PG-reference control (TPC-H, to strip PG-side ANALYZE sampling noise
+between independent captures — the naive same-run diff showed spurious
+multi-category movement that `shape-delta.sh` proved was NOT a shape
+change) and matching-stats-epoch comparison (TPC-DS): TPC-H match held at 8,
+Q18 shape-changes LATERALLY (+1 sort-strategy, -1 rendering, still
+SHAPE-DIFF); TPC-DS match held at 2, Q31 shape-changes and REGRESSES 3
+categories (aggregation-strategy/sort-strategy/parallelism, +1 each) back
+to byte-identical with the PRE-fix1 baseline — exactly cancelling fix1's
+one TPC-DS gain. No MATCH lost anywhere (hard floor safe), but zero net
+category gain, reproducing R124 §7's identical net-neutral verdict for the
+same currency correction a SECOND time, now with fix1's live-at-cost-time
+`inNcols` preview the task hoped would change the outcome. It did not.
+**Treat this currency as closed** — do not re-attempt the same substitution
+without new evidence (different mechanism or different quantity).
 
-In-flight: none.
+In-flight: none. All private artefacts (binary, TPC-H/TPC-DS clone dirs,
+server logs, cgroup scopes) removed after use; shared clusters
+(:65432/:65433/:65437/:65438) read-only, never restarted.
 
-Next step: re-read the `## Current Priority` banner fresh (it may have been
-rewritten since 2026-09-15's "Re-ordered" text — check the date/content
-match before trusting this note). If the banner is unchanged, **M0141-S2a-fix2**
-(the `hashAggEntrySize` fixed-overhead currency correction) is the natural
-next pick inside the same top-priority group — it is now legitimately
-attemptable, since fix1 supplies the live-at-cost-time preview R124 §7's
-prior attempt lacked. Candidates to re-check once fix2 lands: Q18's residual
-`aggregation-strategy` mismatch (TPC-H) and Q31's residual mismatches
-(TPC-DS) — neither is proven currency-shaped rather than a different
-mechanism; re-diagnose, do not assume. Also still open in this same
-top-priority group: **M0139-0007a** (measure/adopt the two already-built
-R108/R113 arms) and **M0139-0007b** (port Memoize's currency) from an
-earlier loop's recon, if the banner ranks those ahead of fix2 for any
-reason.
+Next step: re-read the `## Current Priority` banner fresh (check date/content
+match before trusting this note). If unchanged, the top-priority group's
+M0141-S2a-fix/M0139-0007 line is now FULLY EXHAUSTED as scoped (fix1 landed,
+fix2 attempted-and-declined) — move to the next items the banner names inside
+the SAME top-priority group: **M0139-0007a** (measure/adopt-or-hold the two
+already-built R108/R113 absorption arms — `GOOPG_PG_HASH_TUPLE_SPILL_COST` and
+`GOOPG_PG_SORT_RELATION_BYTES_COST`, both default-off, never measured against
+the post-M0137–M0142 corpus) or **M0139-0007b** (port Memoize's entry-byte
+currency via `pgRelationByteSide`/`ExecEstimateCacheEntryOverheadBytes`).
+Neither depends on this loop's outcome. If the banner has since moved the
+top-priority group past M0141-S2a/M0139-0007 entirely, follow the banner
+instead — it is the sole ordering authority per PROMPT.md's precedence rule.
 
-Gates run: `go build ./...` clean. `go test ./internal/optimizer/...` all
-pass (incl. the 2 new tests). `scripts/tpch-spotcheck.sh` RESULT=PASS
-(Q12=2, Q13=34). Pre-commit pgbench smoke PASS (hook-enforced, not
-skippable). `make ralph-state-guard` clean after one self-repair (same
-stale clean-exit-marker pattern as the last several loops — harmless,
-repairs itself every time; if this recurs indefinitely it may be worth a
-dedicated task to find why the marker keeps arriving stale).
+Gates run: `go build ./...` clean (both with the attempted change and after
+revert). `go test ./internal/optimizer/...` all pass (both states). Live
+TPC-H/TPC-DS parity measurement on private clones (see design doc for full
+numbers). `RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh`:
+FAILS on `internal/parser` only — this is the PRE-EXISTING, already-tracked
+`RangeVar.GroupedJoinUnaliased` AST-drift regression (nightly
+AI-20260914-235643-001/003, and this file's own "Manually discovered"
+section, dated 2026-09-15, predates this loop) — unrelated to this task's
+diff (confirmed: this loop touches zero files under `internal/`).
+`internal/optimizer` itself reports `ok` (cached) inside that same run.
+Pre-commit pgbench smoke PASS (hook-enforced; commit succeeded). `make
+ralph-state-guard` clean after one self-repair (same recurring benign
+stale-clean-exit-marker pattern noted by the last several loops).
