@@ -4088,3 +4088,116 @@ recon. The real next step for the whole `-0008c` family is
 (or fix) whether the renumbered `j.SJInfo` reaches `ctx.joinInfoList` for the
 DP level driver to find — only after that can `-3c`/`-3d`/`-4`'s acceptance
 bars (Q10/Q35 plan-shape parity) even be attempted.
+
+## 36. `M0142-0008a-3i-plumbing-c` — sizing recon: the admission-wiring gap is FIVE pieces, not two
+
+This loop picked up `-3i-plumbing-c` (filed §35.4) and read every code path
+between `extractSearchLeaves`'s SEMI/ANTI arm and `addPathsToJoinrel` to
+answer resume-point item (1): does the renumbered `j.SJInfo` reach
+`ctx.joinInfoList`? **No — and the reason rules out a one-line fix.**
+`ctx.joinInfoList` is built once, by `deconstructJointreeScopedSJI`
+(`planner.go:3051`), from the SELECT's `FromExprs` **before**
+`unnestSubqueriesInPlan` ever runs (the same fact `unnest.go:4385`'s own
+comment already states about why `existsUnnestSJInfo` cannot reuse it). A
+Semi/Anti join's `SJInfo` is created later, during unnesting
+(`existsUnnestSJInfo`, throwaway `synL=1/synR=2` numbering), so it is a
+freshly-allocated object `deconstructJointreeScopedSJI` never saw and
+structurally cannot be a member of `ctx.joinInfoList` — `j.SJInfo` being
+renumbered in place (`joinsearchseam.go:1223-1226`) changes the object's
+fields but not which slice holds a pointer to it. Confirmed by reading
+`semiAntiLinksHaveSJInfos` itself (`joinsearchseam.go:1552-1567`): it does a
+literal membership scan (`sj.Jointype == lk.jointype && sj.SynLefthand ==
+lk.lhs && sj.SynRighthand == lk.rhs`) over whatever list it is handed — wiring
+the call in without first putting `j.SJInfo` into that list would make it
+decline on every query, unconditionally, which would look identical to
+today's silent zero (a false sense of "wired" with no reachability gain).
+
+Tracing further — what does the corpus-wide zero actually cost, beyond the
+missing membership — found **four more gaps**, all upstream of the two named
+consumers:
+
+1. **The semiAnti join's own predicate never reaches the DP search's
+   conjunct list.** `semiAntiChainLink.pred` (the ON/EXISTS equality,
+   `joinsearchseam.go:1211`) is recorded but never merged into `conjuncts` —
+   contrast with `outerLinks`, whose `onOuter` IS merged
+   (`joinsearchseam.go:552`). Without this, `semiAntiOnQualsOK`'s own
+   `searchConsumes(c, spans)` check (`joinsearchseam.go:1581-1599`) can never
+   pass, because the search was never given the clause to consume in the
+   first place — wiring the two named consumers in without this fix would
+   make `semiAntiOnQualsOK` decline unconditionally too.
+
+2. **The synthetic RHS leaf never becomes a `leaves`/`relInfos` entry.**
+   `extractSearchLeaves` appends the RHS to `scans` (so
+   `len(scans) == nprefix+len(semiAnti)`, checked at
+   `joinsearchseam.go:325`), but the loop that builds what the search actually
+   receives (`joinsearchseam.go:556-581`) is `for i, b := range
+   ctx.bindings[:nprefix]` — it only ever visits real FROM items. `scans[nprefix:]`
+   (the semiAnti leaves) are silently dropped: they are computed, checked for
+   count, and then never handed to `planJoinlistSearch` at all. This is
+   independent of gap 1 and of the `joinInfoList` gap — fixing only those two
+   would still leave the search with no rel to place the SJInfo ON, so
+   `joinIsLegal` would never even be asked about the pair.
+
+3. **`prob.bindings`/`scans`/`relInfos` must ALL grow to
+   `nprefix+len(semiAnti)`, and each needs a `rangeBinding` for the synthetic
+   leaf even though it has no `ctx.bindings` entry.** `leafRel`
+   (`relfromjoinlist.go:387-401`) only requires `rel < len(prob.bindings)` —
+   it does not require the index to name a real statement FROM item — so a
+   degenerate `rangeBinding{table: nil, offset: cumOffsets[nprefix+k]}` is
+   plumbing-feasible, but `estimateBaseRelInfo` (`cardinality.go:719-736`)
+   reads `binding.table` for `baseRows` and would return a zero estimate for
+   every such leaf; the fallback that runs afterward for every leaf,
+   `applyRelSizeFallback`, needs to be checked against a real fixture (not
+   assumed) before trusting the row count a Semi/Anti RHS leaf gets, since a
+   wrong estimate here feeds directly into the DP tournament's costing, not
+   just a shape decision.
+
+4. **The local `jl` handed to `planJoinlistSearch` must also grow.**
+   `validateJoinlistProblem` (`relfromjoinlist.go:246-276`) hard-requires
+   `jl.leafRange() == (0, len(prob.bindings))` — `jl` (from
+   `splitOuterSpine(node, ctx.joinlist)`, itself sourced from the pre-unnest
+   `ctx.joinlist`) has exactly `nprefix` leaves and cannot describe the
+   synthetic ones. The call site needs its OWN locally-built joinlist —
+   `append(jlCopy, leafItem(nprefix), leafItem(nprefix+1), …)` for each
+   semiAnti link — rather than reusing `ctx.joinlist`/`jl` unmodified;
+   `leafItem`/`joinlist` (`collapse.go:154-176`) impose no constraint beyond
+   the index bound, so this is buildable, but it is a NEW construction step,
+   not a parameter tweak.
+
+**Revised scope, decomposed into five sub-steps (filed below, none started)**
+— roughly in dependency order, since 2-4 are a single "give the search a real
+leaf" unit and 1/5 are each independently tractable:
+
+- **`-3i-plumbing-c1`**: merge `semiAnti[*].pred`'s split conjuncts into
+  `conjuncts`, mirroring `onOuter`'s treatment (gap 1). Smallest, most
+  isolated piece; safe to land and verify alone since with gaps 2-5 still
+  open the new conjuncts have no synthetic leaf to attribute to and
+  `partitionConjunctsForJoinPlanning` will hold them in the residual — a
+  behavior-neutral no-op until the rest lands, the same "build it, verify
+  inert" precedent `-3i-plumbing-b1` and `-0008c-3c` both already used.
+- **`-3i-plumbing-c2`**: extend `prob.bindings`/`scans`/`relInfos` (gaps 2-3)
+  — synthesize a `rangeBinding` per semiAnti leaf, populate
+  `estimateBaseRelInfo`/`applyRelSizeFallback` for it, and confirm against a
+  live Q78-shaped fixture that the row estimate is sane (not silently zero).
+- **`-3i-plumbing-c3`**: build the call-site-local extended `jl` (gap 4) —
+  the `append(jlCopy, leafItem(...))` construction — and confirm
+  `validateJoinlistProblem` accepts it.
+- **`-3i-plumbing-c4`**: build the augmented `joinInfoList` (`ctx.joinInfoList`
+  plus each semiAnti link's `j.SJInfo` pointer — requires adding an `sjinfo
+  *SpecialJoinInfo` field to `semiAntiChainLink`, captured alongside `lhs`/
+  `rhs`/`pred` at `joinsearchseam.go:1211`) and thread it into
+  `joinlistProblem.joinInfoList` (replacing the bare `ctx.joinInfoList` at
+  `joinsearchseam.go:633`).
+- **`-3i-plumbing-c5`**: wire `semiAntiLinksHaveSJInfos`/`semiAntiOnQualsOK`
+  as decline gates (mirroring the `outerLinks` block,
+  `joinsearchseam.go:517-538`) — the step the task was originally filed
+  for — and re-run the full-corpus `GOOPG_PGSHAPED_DP_TRACE=1` sweep (§35.1's
+  method) to confirm at least one `jointype=semi`/`anti` `DPPATH` line
+  appears. Only meaningful once c1-c4 are all landed; wiring it earlier
+  would just decline unconditionally (see the false-sense-of-progress note
+  above) and prove nothing.
+
+None of c1-c5 is picked up this loop (recon only, one task per loop). c1 is
+the natural next pickup: independently landable and verifiable, per the same
+"safe to build ahead of its own reachability" precedent this milestone has
+used repeatedly (`-3b`, `-3c`).
