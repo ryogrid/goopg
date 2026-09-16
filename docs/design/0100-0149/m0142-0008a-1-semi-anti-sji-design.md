@@ -2960,3 +2960,122 @@ width contribute to `baseOffset` for everything after it" design question.
 `-b2`'s fix does NOT pre-solve this — it lives in the other coordinate
 space entirely — so treat it as a fresh design question when that work
 starts, informed by but not settled by §25/§26.
+
+## 27. §25.4 step (2) landed — `cumOffsets []int` replaced by a per-leaf
+`[]leafSpan` table across the chain layer (2026-09-16)
+
+Coded §25.4's step (2) (build the `(lo,hi)` table and update
+`relidsOfExpr`/`tableForCol` to scan it) and, since Go signatures are
+call-site-wide, its unavoidable transitive closure: every function that
+threads `cumOffsets` through to those two — `buildRestrictInfos`,
+`searchConsumes`, `deriveOuterLinkConstants`, `outerOnQualsOK`,
+`innerOnQualsBelowNullableOK`, `semiAntiOnQualsOK`
+(all `joinsearchseam.go`/`joinrestrict.go`), and
+`partitionConjunctsForJoinPlanning` (`local_filters.go`) — now take
+`[]leafSpan` (`joinrestrict.go`, new type: `struct{ lo, hi int }`). The
+production construction site (`joinsearchseam.go`'s `tryPGShapedJoinSearch`,
+~line 322) now calls a new `buildLeafSpans(widths, semiAnti)` instead of
+hand-rolling the cumulative sum; with `semiAnti` empty (admitSemiAnti stays
+false there today) it reduces to the identical arithmetic the old code did,
+by construction (own unit test: `TestBuildLeafSpansAttributesRealLeafAfterSyntheticCorrectly`,
+`semiantichain_test.go`).
+
+### 27.1 Correction to §26.3: the shared functions DO reach `relfromjoinlist.go`, even though flavor 2's own state does not
+
+§26.3 stated the fix "does not reach `relfromjoinlist.go`." That is true of
+flavor 2's OWN field (`joinlistProblem.cumOffsets`, still `[]int`,
+still built by `relfromjoinlist.go` exactly as before) and its own local
+`cum` variable — but it is **not** true of the call graph: §26.1 already
+noted `relidsOfExpr`/`tableForCol` are generic, reused by both layers, and
+building this loop surfaced the concrete production proof —
+`relfromjoinlist.go:679`'s `s.clauses = buildRestrictInfos(prob.conjuncts, 0,
+cum)` is flavor 2's own live call into the newly-`[]leafSpan`-typed function,
+not a test-only artefact. Reconciled with a one-line adapter,
+`spansFromCumulative(cum []int) []leafSpan` (`joinrestrict.go`), which
+reshapes a plain monotonic prefix-sum array into the per-leaf table with NO
+behavior change (flavor 2 has no synthetic leaves, per §26.1, so the reshape
+is exact) — `relfromjoinlist.go:679` now reads
+`buildRestrictInfos(prob.conjuncts, 0, spansFromCumulative(cum))`. The
+inverse, `cumulativeFromSpans(spans []leafSpan) []int`, does the same job at
+the one point flavor-1 state flows INTO a flavor-2 struct: the chain-layer
+seam's own `joinlistProblem{cumOffsets: ...}` literal
+(`joinsearchseam.go`, ~line 577) now reads
+`cumulativeFromSpans(cumOffsets)`. Both adapters are valid only for a
+contiguous, monotonic span table (no out-of-band synthetic range) — true at
+both call sites today because production never reaches them with
+`admitSemiAnti=true`; that constraint is documented at each adapter's
+definition, not just here.
+
+### 27.2 Step (3) — unnest.go's `innerKey.Index` — explicitly NOT landed this loop, and why it needs its own investigation
+
+§25.4 listed step (3) ("point `unnestExistsExpr`'s `innerKey.Index`
+construction at the new 'next synthetic slot' counter") as the next
+sub-step after (2). It is deliberately **not** done here. Reading
+`unnest.go:4680-4706` before touching it surfaced a fact §25.3's own
+proposal did not account for: `innerKey.Index = outerWidth +
+params[0].SubCol.Index` is not dead/test-only scaffolding — it is LIVE
+production code, reached by every `EXISTS`/`NOT EXISTS` unnest today
+(`admitSemiAnti` gates the SEARCH's descent into a Semi/Anti node, not
+whether `unnestExistsExpr` itself runs), and the comment directly above it
+states its consumer: "The executor's `evalHashKey` is given a padded row of
+width `(leftWidth + rightWidth)` ... its `Index` must be `outerWidth +
+innerColIndex`" — i.e. this value is read at EXECUTION time against a
+padded row built from exactly this join's OWN two children, a strictly
+LOCAL two-input coordinate space, not the wider statement's FROM-cumulative
+one `buildLeafSpans` operates in.
+
+Naively swapping its base for "the next synthetic slot" (a quantity that,
+per §25.3, is only knowable once the FULL statement's real leaf set is
+final — i.e., at SEARCH time) would require `unnestExistsExpr` — which runs
+at REWRITE time, per-`EXISTS`, typically before the enclosing statement's
+full real leaf set is even assembled — to know a number it structurally
+cannot compute yet, and any change here risks corrupting the (LeftKey,
+RightKey) pair the executor's `evalHashKey` reads for EVERY existing
+`EXISTS` query, not just the ones this milestone's cutover targets. That is
+a correctness-critical, high-blast-radius change on live code, not a
+"thread the type through" mechanical step like (2) was. It needs its own
+scoping pass — specifically, tracing whether `j.Predicate`'s copy of this
+index (consumed by the search, pre-method-selection) and `j.LeftKey`/
+`j.RightKey`'s copy (consumed by the executor, post-method-selection) are
+actually the SAME embedded value or can be allowed to diverge — before any
+code changes, not folded into a loop already carrying step (2)'s blast
+radius.
+
+### 27.3 Verification
+
+`go build ./...` clean. `go test ./internal/optimizer/...` — all tests pass
+(including the 9 pre-existing chain-layer/semi-anti tests this loop's type
+change touched, and the new
+`TestBuildLeafSpansAttributesRealLeafAfterSyntheticCorrectly`, which pins
+§25.1's `qualAC` misattribution as FIXED: a 3-leaf `(A SEMI JOIN B) JOIN C`
+shape with `B`'s real width nonzero now attributes `C`'s qual to leaf 2, not
+leaf 1). `RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh`: only
+`internal/parser` fails, and every failure is the pre-existing
+`GroupedJoinUnaliased` AST-drift gap (`dc91bd6b7`, unrelated, tracked
+separately, unchanged by this loop). Live plan-shape/row-count check since
+this is a planner-package change: TPC-DS SF0.25 fast regression gate
+(`scripts/tpcds-sf025-regression.sh sweep`) — `PASS=96 MISMATCH=0
+CKMISMATCH=0 ERROR=0`, `PLAN-SHAPE: queries=99 same=99 changed=0`, i.e.
+byte-identical to the pre-change baseline, exactly as predicted: production
+never exercises `admitSemiAnti=true`, so `buildLeafSpans`/`spansFromCumulative`/
+`cumulativeFromSpans` are all pure reshapes of the same values the old code
+computed. TPC-H spotcheck (`scripts/tpch-spotcheck.sh`) SKIPPED — the
+already-tracked M0142-0003k blocker (shared `:65433` cluster's `tpch`
+database still emptied, reload blocked on human authorization), unrelated
+to this change.
+
+### 27.4 Resume point
+
+§25.4's steps (1) and (2) are done. Step (3) (unnest.go) needs its own
+dedicated scoping pass per §27.2 before it can be coded — trace whether
+`j.Predicate`'s and `j.LeftKey`/`j.RightKey`'s copies of the RHS index are
+the same embedded value or may diverge, first. Step (4) (item 6a's
+`*resolveContext` plumbing) stays understood as unnecessary, per §25.4's
+own text — the per-leaf table replaces it outright, nothing left to do
+there. Still do NOT flip `admitSemiAnti=true` in production before step (3)
+lands and is verified against a live fixture exercising
+`(A SEMI JOIN B) JOIN C ON qualAC` through the REAL `unnestExistsExpr` +
+search path end to end (this loop's new test exercises the mechanism
+directly via manually-built `semiAntiChainLink`s, not through the rewrite —
+by design, since the rewrite path is exactly what step (3) has not yet
+touched).

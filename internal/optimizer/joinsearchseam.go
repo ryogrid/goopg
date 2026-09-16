@@ -319,14 +319,18 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 		traceSeamDecline("lateral", nrels, len(scans))
 		return node, pred, false
 	}
-	cumOffsets := make([]int, nprefix+1)
 	for i := range scans {
 		if scans[i] == nil {
 			traceSeamDecline("nil-leaf", nrels, len(scans))
 			return node, pred, false
 		}
-		cumOffsets[i+1] = cumOffsets[i] + widths[i]
-		if ctx.bindings[i].offset != cumOffsets[i] {
+	}
+	// admitSemiAnti is false above (line ~309), so `extractSearchLeaves`
+	// never returns a synthetic leaf here and `buildLeafSpans` reduces to a
+	// plain walk-order cumulative sum — same shape `ctx.bindings` assigned.
+	cumOffsets := buildLeafSpans(widths, nil)
+	for i := range scans {
+		if ctx.bindings[i].offset != cumOffsets[i].lo {
 			traceSeamDecline("offset-disagreement", nrels, len(scans))
 			return node, pred, false
 		}
@@ -336,7 +340,11 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 	// statement, which every conjunct decision below relies on: a spine column
 	// that landed INSIDE the window would be attributed to a prefix leaf and
 	// pushed under the outer join.
-	if nprefix < nrels && ctx.bindings[nprefix].offset != cumOffsets[nprefix] {
+	prefixTotalWidth := 0
+	if len(cumOffsets) > 0 {
+		prefixTotalWidth = cumOffsets[len(cumOffsets)-1].hi
+	}
+	if nprefix < nrels && ctx.bindings[nprefix].offset != prefixTotalWidth {
 		traceSeamDecline("spine-offset-disagreement", nrels, nprefix)
 		return node, pred, false
 	}
@@ -566,7 +574,7 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 		scans:      leaves,
 		relInfos:   relInfos,
 		conjuncts:  searchConjuncts,
-		cumOffsets: cumOffsets,
+		cumOffsets: cumulativeFromSpans(cumOffsets),
 		// take2 P2-01: the search prices with the STATEMENT's settings, not a
 		// hard-wired constant list. tryJoinSearch is reached only from inside
 		// planSelect (predp.go and two sites in planner.go), so this ctx is
@@ -835,7 +843,7 @@ func outerLinksHaveSJInfos(links []outerChainLink, list []*SpecialJoinInfo) bool
 //
 // Like the closure it extends it is deterministic in the link and conjunct
 // order it was given, so the synthesised list is reproducible run to run.
-func deriveOuterLinkConstants(links []outerChainLink, conjuncts []Expr, cumOffsets []int) []Expr {
+func deriveOuterLinkConstants(links []outerChainLink, conjuncts []Expr, spans []leafSpan) []Expr {
 	if len(links) == 0 {
 		return nil
 	}
@@ -864,8 +872,8 @@ func deriveOuterLinkConstants(links []outerChainLink, conjuncts []Expr, cumOffse
 			if !ok {
 				continue
 			}
-			ra, okA := relidsOfExpr(a, cumOffsets)
-			rb, okB := relidsOfExpr(b, cumOffsets)
+			ra, okA := relidsOfExpr(a, spans)
+			rb, okB := relidsOfExpr(b, spans)
 			if !okA || !okB || ra == 0 || rb == 0 {
 				continue
 			}
@@ -887,7 +895,7 @@ func deriveOuterLinkConstants(links []outerChainLink, conjuncts []Expr, cumOffse
 				continue
 			}
 			d := &BinaryOp{Op: parser.OpEq, Left: null, Right: konst}
-			if !conjunctIsLocalEligible(d) || tableForCol(d, cumOffsets) < 0 {
+			if !conjunctIsLocalEligible(d) || tableForCol(d, spans) < 0 {
 				continue
 			}
 			out = append(out, d)
@@ -930,7 +938,7 @@ func deriveOuterLinkConstants(links []outerChainLink, conjuncts []Expr, cumOffse
 // relation outside the link, an attribution the seam cannot make — declines the
 // statement. Each of those is a shape whose correct placement is AT the link,
 // and the searched tree has no way to say "at this link and nowhere else".
-func outerOnQualsOK(links []outerChainLink, cumOffsets []int) bool {
+func outerOnQualsOK(links []outerChainLink, spans []leafSpan) bool {
 	for _, lk := range links {
 		if lk.pred == nil {
 			// A qual-less outer link is a cartesian LEFT join; nothing to
@@ -941,17 +949,17 @@ func outerOnQualsOK(links []outerChainLink, cumOffsets []int) bool {
 			continue
 		}
 		for _, c := range splitAnd(lk.pred) {
-			rs, ok := relidsOfExpr(c, cumOffsets)
+			rs, ok := relidsOfExpr(c, spans)
 			if !ok || rs == 0 || !relsSubset(rs, lk.preserved|lk.nullable) {
 				return false
 			}
 			switch {
 			case relsOverlap(rs, lk.preserved) && relsOverlap(rs, lk.nullable):
-				if !searchConsumes(c, cumOffsets) {
+				if !searchConsumes(c, spans) {
 					return false
 				}
 			case relsSubset(rs, lk.nullable):
-				if !conjunctIsLocalEligible(c) || tableForCol(c, cumOffsets) < 0 {
+				if !conjunctIsLocalEligible(c) || tableForCol(c, spans) < 0 {
 					return false
 				}
 			default:
@@ -996,7 +1004,7 @@ func outerOnQualsOK(links []outerChainLink, cumOffsets []int) bool {
 //
 // Only multi-leaf nullable sides are tested, so C-04a's shapes take exactly
 // the path they took before: a single-leaf nullable side holds no inner link.
-func innerOnQualsBelowNullableOK(onQuals []chainOnQual, links []outerChainLink, cumOffsets []int) bool {
+func innerOnQualsBelowNullableOK(onQuals []chainOnQual, links []outerChainLink, spans []leafSpan) bool {
 	var nullable RelSet
 	for _, lk := range links {
 		if lk.nullable != 0 && lk.nullable&(lk.nullable-1) != 0 {
@@ -1008,7 +1016,7 @@ func innerOnQualsBelowNullableOK(onQuals []chainOnQual, links []outerChainLink, 
 	}
 	for _, q := range onQuals {
 		for _, c := range splitAnd(q.pred) {
-			rs, ok := relidsOfExpr(c, cumOffsets)
+			rs, ok := relidsOfExpr(c, spans)
 			if !ok {
 				// Unattributable: the seam cannot say which side it reads,
 				// so it cannot say the residual would be a safe place.
@@ -1017,10 +1025,10 @@ func innerOnQualsBelowNullableOK(onQuals []chainOnQual, links []outerChainLink, 
 			if !relsOverlap(rs, nullable) {
 				continue
 			}
-			if conjunctIsLocalEligible(c) && tableForCol(c, cumOffsets) >= 0 {
+			if conjunctIsLocalEligible(c) && tableForCol(c, spans) >= 0 {
 				continue
 			}
-			if !searchConsumes(c, cumOffsets) {
+			if !searchConsumes(c, spans) {
 				return false
 			}
 		}
@@ -1040,8 +1048,8 @@ func innerOnQualsBelowNullableOK(onQuals []chainOnQual, links []outerChainLink, 
 // OR-of-ANDs makes the producer emit the equalities COMMON to its branches, and
 // those are implied by the OR rather than equal to it, so the OR itself stays
 // residual and is evaluated above the join exactly as it is today.
-func searchConsumes(c Expr, cumOffsets []int) bool {
-	for _, ri := range buildRestrictInfos([]Expr{c}, 0, cumOffsets).all {
+func searchConsumes(c Expr, spans []leafSpan) bool {
+	for _, ri := range buildRestrictInfos([]Expr{c}, 0, spans).all {
 		if ri.clause == c {
 			return true
 		}
@@ -1272,6 +1280,61 @@ func extractSearchLeaves(node Node, admitSemiAnti bool) (scans []Node, widths []
 	return scans, widths, onQuals, outer, semiAnti, true
 }
 
+// buildLeafSpans builds extractSearchLeaves's per-leaf (lo, hi) table
+// (M0142-0008a-3i-plumbing-b2 design doc §25.3/§26): every REAL leaf keeps
+// exactly the column-index range a plain walk-order cumulative sum would
+// give it, computed while SKIPPING synthetic leaves' widths, so a later real
+// leaf's range is never shifted by an earlier synthetic one — §25.1's traced
+// `qualAC` misattribution, where a real leaf following an admitted Semi/Anti
+// link inherited that link's RHS leaf's stolen column range. Every SYNTHETIC
+// (Semi/Anti RHS) leaf's range is instead appended AFTER the total real
+// width, in walk order among themselves. `semiAnti[*].rhs` marks which walk
+// positions are synthetic; every other leaf is real. With no semiAnti links
+// (today's only production shape — admitSemiAnti stays false at the one
+// production call site) this reduces to the old plain cumulative sum.
+func buildLeafSpans(widths []int, semiAnti []semiAntiChainLink) []leafSpan {
+	var synthetic RelSet
+	for _, lk := range semiAnti {
+		synthetic |= lk.rhs
+	}
+	spans := make([]leafSpan, len(widths))
+	realOffset := 0
+	for i, w := range widths {
+		if synthetic&leafRangeRelSet(i, i+1) != 0 {
+			continue
+		}
+		spans[i] = leafSpan{lo: realOffset, hi: realOffset + w}
+		realOffset += w
+	}
+	syntheticOffset := realOffset
+	for i, w := range widths {
+		if synthetic&leafRangeRelSet(i, i+1) == 0 {
+			continue
+		}
+		spans[i] = leafSpan{lo: syntheticOffset, hi: syntheticOffset + w}
+		syntheticOffset += w
+	}
+	return spans
+}
+
+// cumulativeFromSpans reconstructs a plain monotonic prefix-sum array from a
+// per-leaf span table, for the one caller (`joinlistProblem.cumOffsets`, the
+// bushy/joinlist layer's own coordinate space — §26.1's "flavor 2") that
+// still speaks that shape. Valid only when `spans` is contiguous and
+// monotonic (no out-of-band synthetic range) — true today because this
+// function's only caller is reached with admitSemiAnti=false (§26.3: the fix
+// is confined to the chain layer and does not reach the bushy layer).
+func cumulativeFromSpans(spans []leafSpan) []int {
+	cum := make([]int, len(spans)+1)
+	for i, sp := range spans {
+		cum[i] = sp.lo
+	}
+	if len(spans) > 0 {
+		cum[len(spans)] = spans[len(spans)-1].hi
+	}
+	return cum
+}
+
 // chainOnQual is one INNER link's `ON` qual as the walk flattened it, plus the
 // union of the nullable sides of every admitted outer link STRICTLY BELOW that
 // link — C-04c.
@@ -1422,20 +1485,20 @@ func semiAntiLinksHaveSJInfos(links []semiAntiChainLink, list []*SpecialJoinInfo
 // (`searchConsumes`); anything else — a conjunct confined to one side, or one
 // the search cannot attribute — declines, mirroring `outerOnQualsOK`'s own
 // conservative default for a shape it does not recognize.
-func semiAntiOnQualsOK(links []semiAntiChainLink, cumOffsets []int) bool {
+func semiAntiOnQualsOK(links []semiAntiChainLink, spans []leafSpan) bool {
 	for _, lk := range links {
 		if lk.pred == nil {
 			return false
 		}
 		for _, c := range splitAnd(lk.pred) {
-			rs, ok := relidsOfExpr(c, cumOffsets)
+			rs, ok := relidsOfExpr(c, spans)
 			if !ok || rs == 0 || !relsSubset(rs, lk.lhs|lk.rhs) {
 				return false
 			}
 			if !relsOverlap(rs, lk.lhs) || !relsOverlap(rs, lk.rhs) {
 				return false
 			}
-			if !searchConsumes(c, cumOffsets) {
+			if !searchConsumes(c, spans) {
 				return false
 			}
 		}

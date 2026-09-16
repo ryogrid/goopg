@@ -226,7 +226,7 @@ func TestTableForCol_InSubqueryAttributesToOperandTable(t *testing.T) {
 	p, _, _ := innerPlanWithOuterRef(5, 7)
 	e := &InExpr{Operand: &ColumnRef{Index: 1, Name: "c"}, Plan: p}
 	// Tables: t0 = cols [0,3), t1 = cols [3,5).
-	cum := []int{0, 3, 5}
+	cum := spansFromCumulative([]int{0, 3, 5})
 	if got := tableForCol(e, cum); got != 0 {
 		t.Errorf("tableForCol(col-1 IN (subquery)) = %d, want 0 — the operand is "+
 			"the conjunct's only same-scope reference", got)
@@ -237,7 +237,7 @@ func TestTableForCol_SpanningTablesStaysMinusOne(t *testing.T) {
 	e := &BinaryOp{Op: parser.OpEq,
 		Left:  &ColumnRef{Index: 1, Name: "a"},
 		Right: &ColumnRef{Index: 4, Name: "b"}}
-	cum := []int{0, 3, 5}
+	cum := spansFromCumulative([]int{0, 3, 5})
 	if got := tableForCol(e, cum); got != -1 {
 		t.Errorf("tableForCol(join predicate) = %d, want -1", got)
 	}

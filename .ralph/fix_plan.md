@@ -3762,6 +3762,32 @@ cross-layer programme that has never been scoped.
     confined to the chain layer only. New unit
     test needed: a `(A SEMI JOIN B) JOIN C`-shaped fixture, not covered by
     any `-b1` test.
+    **Step (2) landed (design doc §27, 2026-09-16)**: `cumOffsets []int`
+    replaced by a per-leaf `[]leafSpan` table (`joinrestrict.go`) across
+    `relidsOfExpr`/`tableForCol`/`buildRestrictInfos`/`searchConsumes`/
+    `deriveOuterLinkConstants`/`outerOnQualsOK`/`innerOnQualsBelowNullableOK`/
+    `semiAntiOnQualsOK`/`partitionConjunctsForJoinPlanning`, fed by a new
+    `buildLeafSpans` producer implementing §25.3's scheme. Corrected §26.3:
+    the shared functions DO reach `relfromjoinlist.go` (flavor 2's live
+    call, `:679`) — reconciled with `spansFromCumulative`/
+    `cumulativeFromSpans` adapters rather than changing flavor 2's own
+    `[]int` field. New test `TestBuildLeafSpansAttributesRealLeafAfterSyntheticCorrectly`
+    (`semiantichain_test.go`) pins §25.1's `qualAC` misattribution as fixed
+    — the `(A SEMI JOIN B) JOIN C` case above, at the mechanism level (not
+    through the real `unnestExistsExpr` rewrite, since step (3) below is
+    what would wire that). Verified as zero production behavior change
+    (`admitSemiAnti` stays false everywhere reachable): TPC-DS SF0.25
+    sweep PASS=96/0 mismatches, plan-shape 99/99 identical;
+    `go test ./internal/optimizer/...` all pass; units precommit gate's
+    only failure is the pre-existing unrelated `GroupedJoinUnaliased`
+    parser gap. **Step (3) (`unnest.go`'s `innerKey.Index`) explicitly NOT
+    landed** — found to be LIVE production code (every `EXISTS` unnest
+    reaches it, feeds the executor's `evalHashKey`), not the test-only
+    scaffolding §25.3 assumed; needs its own scoping pass (design doc
+    §27.2) before coding, not a mechanical "thread the type through" step.
+    Step (4) (6a's `*resolveContext` plumbing) confirmed unneeded, per
+    §25.4's own text. **Next loop: scope step (3)** before attempting the
+    `admitSemiAnti=true` cutover.
   **Independent, unfiled resume-point hint** (not sized/numbered — noted for
   whoever picks up S5a's own eligibility gate): relaxing
   `whereEligibleForPreDPUnnest` to per-sublink granularity would upgrade

@@ -26,7 +26,7 @@ func makeColRefBinding(name string, cumIdx int, srcIdx int16) *ColumnRef {
 func TestPartitionConjunctsSplitsByBinding(t *testing.T) {
 	// Two bindings: t0 has 3 cols (offsets 0..2); t1 has 2 cols
 	// (offsets 3..4). cumOffsets = [0, 3, 5].
-	cumOffsets := []int{0, 3, 5}
+	cumOffsets := spansFromCumulative([]int{0, 3, 5})
 	t0col0 := makeColRefBinding("a", 0, 1) // t0.a
 	t0col1 := makeColRefBinding("b", 1, 1) // t0.b
 	t1col0 := makeColRefBinding("x", 3, 2) // t1.x
@@ -55,7 +55,7 @@ func TestPartitionConjunctsSplitsByBinding(t *testing.T) {
 // ExistsExpr / OuterColumnRef / InExpr-with-Plan are
 // INELIGIBLE for local attachment.
 func TestPartitionConjunctsSubqueryStaysJoinSide(t *testing.T) {
-	cumOffsets := []int{0, 3}
+	cumOffsets := spansFromCumulative([]int{0, 3})
 	col := makeColRefBinding("a", 0, 1)
 	// `a IN (subquery)` — InExpr with Plan != nil.
 	subq := &InExpr{

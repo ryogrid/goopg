@@ -54,16 +54,14 @@ type relationLocalFilters struct {
 //     corresponding leaf scan BEFORE the search runs
 //     (joinsearchseam.go).
 //
-// `cumOffsets` maps the FROM-cumulative output column
-// offsets — index `i` maps to bindings[i]'s first
-// output-column index; index `len(bindings)` is the
-// total schema width. This matches `tableForCol`'s
-// contract (joinrestrict.go).
+// `spans` maps the FROM-cumulative output column offsets to each leaf's
+// (lo, hi) range — the per-leaf table `tableForCol`'s contract now uses
+// (joinrestrict.go, M0142-0008a-3i-plumbing-b2 design doc §25.3/§26).
 //
 // (M0077-0001.)
 func partitionConjunctsForJoinPlanning(
 	conjuncts []Expr,
-	cumOffsets []int,
+	spans []leafSpan,
 ) (joinConjuncts []Expr, locals relationLocalFilters) {
 	locals = relationLocalFilters{byBinding: make(map[int][]Expr)}
 	for _, c := range conjuncts {
@@ -75,7 +73,7 @@ func partitionConjunctsForJoinPlanning(
 			joinConjuncts = append(joinConjuncts, c)
 			continue
 		}
-		bidx := tableForCol(c, cumOffsets)
+		bidx := tableForCol(c, spans)
 		if bidx < 0 {
 			// Multi-binding (or ColumnRef-out-of-range — rare but
 			// possible during error recovery). Treat as join-side.

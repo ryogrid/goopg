@@ -210,7 +210,7 @@ func TestJoinrelConsiderParallel_BothInputsAndClauses(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			s.clauses = buildRestrictInfos(prob.conjuncts, 0, prob.cumOffsets)
+			s.clauses = buildRestrictInfos(prob.conjuncts, 0, spansFromCumulative(prob.cumOffsets))
 			s.setBaseRelConsiderParallel(nil)
 			s.builder = newJoinRelBuilder(s, nil)
 			joinrel, err := s.makeJoinRel(s.joinrels[1][0], s.joinrels[1][1])
@@ -265,7 +265,7 @@ func cpSearch(t *testing.T, prob *joinlistProblem) *searchCtx {
 	if err != nil {
 		t.Fatal(err)
 	}
-	s.clauses = buildRestrictInfos(prob.conjuncts, 0, prob.cumOffsets)
+	s.clauses = buildRestrictInfos(prob.conjuncts, 0, spansFromCumulative(prob.cumOffsets))
 	s.setBaseRelConsiderParallel(prob.cat)
 	s.addBaseRelPartialPaths()
 	s.addBaseRelIndexPaths(prob.cat)

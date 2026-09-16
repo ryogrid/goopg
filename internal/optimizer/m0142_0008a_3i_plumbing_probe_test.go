@@ -193,11 +193,15 @@ func TestM0142_0008a_3iPlumbing_AdmitSemiAnti(t *testing.T) {
 
 	// cumOffsets in the same coordinate space extractSearchLeaves's own
 	// callers build it in (joinsearchseam.go:317-324): cumulative leaf
-	// widths, one entry per leaf plus a trailing total.
-	cumOffsets := make([]int, len(widths)+1)
+	// widths, one entry per leaf plus a trailing total. This probe predates
+	// the per-leaf `[]leafSpan` table (M0142-0008a-3i-plumbing-b2 design doc
+	// §25/§26) and only ever exercises a two-leaf, no-synthetic-leaf shape,
+	// so the plain-cumulative reshape is exact, not an approximation.
+	cum := make([]int, len(widths)+1)
 	for i, w := range widths {
-		cumOffsets[i+1] = cumOffsets[i] + w
+		cum[i+1] = cum[i] + w
 	}
+	cumOffsets := spansFromCumulative(cum)
 	t.Logf("cumOffsets = %v, pred relids = %v", cumOffsets, mustRelids(t, lk.pred, cumOffsets))
 
 	// Consumer #1: outerOnQualsOK. It requires `relsSubset(rs, lk.preserved|lk.nullable)`
@@ -256,7 +260,7 @@ func TestM0142_0008a_3iPlumbing_AdmitSemiAnti(t *testing.T) {
 	}
 }
 
-func mustRelids(t *testing.T, e Expr, cumOffsets []int) RelSet {
+func mustRelids(t *testing.T, e Expr, cumOffsets []leafSpan) RelSet {
 	t.Helper()
 	rs, ok := relidsOfExpr(e, cumOffsets)
 	if !ok {

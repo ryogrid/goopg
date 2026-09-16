@@ -35,7 +35,7 @@ func gpSearch(t *testing.T, prob *joinlistProblem, mode gatherPathMode) *searchC
 	if err != nil {
 		t.Fatal(err)
 	}
-	s.clauses = buildRestrictInfos(prob.conjuncts, 0, prob.cumOffsets)
+	s.clauses = buildRestrictInfos(prob.conjuncts, 0, spansFromCumulative(prob.cumOffsets))
 	s.setBaseRelConsiderParallel(prob.cat)
 	s.addBaseRelPartialPaths()
 	s.addBaseRelIndexPaths(prob.cat)

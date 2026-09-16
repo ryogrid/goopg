@@ -676,7 +676,7 @@ func (prob *joinlistProblem) searchOneProblem(items []joinlistRel, tupleFraction
 	// `addParameterizedIndexPaths` reads `s.clauses`, and `joinSearch` sets it
 	// — so the list is published here, before the producers that consume it,
 	// and handed to `joinSearch` as well rather than left implicit.
-	s.clauses = buildRestrictInfos(prob.conjuncts, 0, cum)
+	s.clauses = buildRestrictInfos(prob.conjuncts, 0, spansFromCumulative(cum))
 	// C-07: `root->query_pathkeys`, published beside the clause list because
 	// `hasUsefulPathkeys` reads both.
 	s.queryPathkeys = prob.queryPathkeys

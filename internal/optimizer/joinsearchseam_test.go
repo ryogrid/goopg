@@ -297,7 +297,7 @@ func TestPGShapedSeamSearchesAnExplicitInnerChain(t *testing.T) {
 // test — which is why the rule is a question put to the producer.
 func TestSearchConsumesAsksTheProducer(t *testing.T) {
 	names := []string{"a", "b", "c"}
-	cum := []int{0, rfjWidth, 2 * rfjWidth, 3 * rfjWidth}
+	cum := spansFromCumulative([]int{0, rfjWidth, 2 * rfjWidth, 3 * rfjWidth})
 	threeRel := &BinaryOp{Op: parser.OpLt,
 		Left:  &ColumnRef{Name: "a0", Index: 0, SourceTableIdx: 0},
 		Right: &BinaryOp{Op: parser.OpAdd, Left: &ColumnRef{Name: "b0", Index: rfjWidth}, Right: &ColumnRef{Name: "c0", Index: 2 * rfjWidth}}}

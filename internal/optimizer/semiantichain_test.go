@@ -38,10 +38,11 @@ func TestSemiAntiOnQualsOK_AcceptsWellFormedLink(t *testing.T) {
 	if !ok || len(scans) != 2 {
 		t.Fatalf("extractSearchLeavesAdmitSemiAnti(j) = (%v leaves, ok=%v), want 2 leaves ok=true", len(scans), ok)
 	}
-	cumOffsets := make([]int, len(widths)+1)
+	cum := make([]int, len(widths)+1)
 	for i, w := range widths {
-		cumOffsets[i+1] = cumOffsets[i] + w
+		cum[i+1] = cum[i] + w
 	}
+	cumOffsets := spansFromCumulative(cum)
 
 	pred := j.Predicate
 	if pred == nil && j.LeftKey != nil && j.RightKey != nil {
@@ -76,7 +77,7 @@ func TestSemiAntiOnQualsOK_DeclinesSingleSideConjunct(t *testing.T) {
 		rhs:      leafRangeRelSet(1, 2),
 		pred:     &BinaryOp{Op: parser.OpEq, Left: col0, Right: &IntegerConst{Value: int64(5)}},
 	}
-	cumOffsets := []int{0, 1, 2}
+	cumOffsets := spansFromCumulative([]int{0, 1, 2})
 	if semiAntiOnQualsOK([]semiAntiChainLink{link}, cumOffsets) {
 		t.Errorf("semiAntiOnQualsOK(single-side conjunct) = true, want false")
 	}
@@ -84,7 +85,7 @@ func TestSemiAntiOnQualsOK_DeclinesSingleSideConjunct(t *testing.T) {
 
 func TestSemiAntiOnQualsOK_DeclinesNilPredicate(t *testing.T) {
 	link := semiAntiChainLink{jointype: parser.JoinSemi, lhs: 1, rhs: 2, pred: nil}
-	if semiAntiOnQualsOK([]semiAntiChainLink{link}, []int{0, 1, 2}) {
+	if semiAntiOnQualsOK([]semiAntiChainLink{link}, spansFromCumulative([]int{0, 1, 2})) {
 		t.Errorf("semiAntiOnQualsOK(nil pred) = true, want false — unlike a cartesian LEFT join, a Semi/Anti link always carries a correlation predicate by construction (unnestExistsExpr's own belt check)")
 	}
 }
@@ -243,10 +244,7 @@ func TestExtractSearchLeaves_AdmitSemiAnti_BuildsLinkAndRebuildsSJInfo(t *testin
 		t.Fatalf("semiAnti[0].pred = nil, want the correlation predicate")
 	}
 
-	cumOffsets := make([]int, len(widths)+1)
-	for i, w := range widths {
-		cumOffsets[i+1] = cumOffsets[i] + w
-	}
+	cumOffsets := buildLeafSpans(widths, semiAnti)
 	if !semiAntiOnQualsOK(semiAnti, cumOffsets) {
 		t.Errorf("semiAntiOnQualsOK(semiAnti, cumOffsets) = false, want true — the walk's own link must satisfy the consumer it was built to feed")
 	}
@@ -296,5 +294,65 @@ func TestExtractSearchLeaves_AdmitSemiAntiFalse_UnchangedFromProduction(t *testi
 	}
 	if j.SJInfo != nil && (j.SJInfo.SynLefthand != 1 || j.SJInfo.SynRighthand != 2) {
 		t.Errorf("j.SJInfo.{SynLefthand,SynRighthand} = {%#x,%#x}, want the untouched {1,2} placeholder — admitSemiAnti=false must not rebuild it", j.SJInfo.SynLefthand, j.SJInfo.SynRighthand)
+	}
+}
+
+// TestBuildLeafSpansAttributesRealLeafAfterSyntheticCorrectly pins §25.1's
+// traced bug and §25.3's fix directly, at the `(A SEMI JOIN B) JOIN C ON
+// qualAC`-shaped level design doc §25.4 named as the one case no existing
+// `-b1` test covers: a REAL leaf (C) positioned AFTER a Semi/Anti node's
+// synthetic RHS leaf (B) in walk order, with B's real width NONZERO (the
+// M14/R3-4 shapes §25.1 named, not the dormant `wB=0` bare-EXISTS case that
+// happens to survive under the old cumulative scheme too).
+//
+// Old `cumOffsets` (plain cumulative sum over walk-order widths) put B's
+// range at [wA, wA+wB) and C's at [wA+wB, wA+wB+wC) — so a qual referencing
+// C at its REAL, `ctx.bindings`-resolved absolute index `wA+k` (for any
+// `k < wB`) fell inside B's range and was misattributed to the synthetic
+// leaf instead of C. `buildLeafSpans` (§25.3) fixes this by keeping every
+// real leaf's range exactly as `ctx.bindings` assigned it (skipping
+// synthetic widths when accumulating) and appending the synthetic leaf's
+// range out of band, after the total real width.
+func TestBuildLeafSpansAttributesRealLeafAfterSyntheticCorrectly(t *testing.T) {
+	const wA, wB, wC = 2, 2, 2
+	widths := []int{wA, wB, wC} // walk order: A (real), B (synthetic RHS), C (real)
+	semiAnti := []semiAntiChainLink{{
+		jointype: parser.JoinSemi,
+		lhs:      leafRangeRelSet(0, 1), // A
+		rhs:      leafRangeRelSet(1, 2), // B, synthetic
+	}}
+
+	spans := buildLeafSpans(widths, semiAnti)
+	if len(spans) != 3 {
+		t.Fatalf("len(spans) = %d, want 3", len(spans))
+	}
+	// A (real leaf 0): untouched, matches what ctx.bindings would assign —
+	// [0, wA).
+	if spans[0] != (leafSpan{lo: 0, hi: wA}) {
+		t.Errorf("spans[0] (A) = %+v, want {lo:0, hi:%d}", spans[0], wA)
+	}
+	// C (real leaf 2): appended right after A's real width, NOT shifted by
+	// B's synthetic width — [wA, wA+wC), exactly what ctx.bindings resolved
+	// C's columns against pre-unnest, since B never existed in that
+	// coordinate space.
+	if spans[2] != (leafSpan{lo: wA, hi: wA + wC}) {
+		t.Errorf("spans[2] (C) = %+v, want {lo:%d, hi:%d} — a real leaf after a synthetic one must not inherit the synthetic leaf's width", spans[2], wA, wA+wC)
+	}
+	// B (synthetic leaf 1): out-of-band, after the total real width (wA+wC).
+	if spans[1] != (leafSpan{lo: wA + wC, hi: wA + wC + wB}) {
+		t.Errorf("spans[1] (B, synthetic) = %+v, want {lo:%d, hi:%d} (appended after total real width)", spans[1], wA+wC, wA+wC+wB)
+	}
+
+	// qualAC: C's first column, at its REAL absolute index wA+0 = wA — the
+	// exact index §25.1 traced falling inside B's OLD (buggy) range whenever
+	// k < wB, which holds here (k=0 < wB=2).
+	qualAC := &ColumnRef{Index: wA}
+	rs, ok := relidsOfExpr(qualAC, spans)
+	if !ok {
+		t.Fatalf("relidsOfExpr(qualAC, spans) ok=false, want true")
+	}
+	wantLeaf2 := leafRangeRelSet(2, 3)
+	if rs != wantLeaf2 {
+		t.Errorf("relidsOfExpr(qualAC, spans) = %#x, want %#x (leaf 2, C) — got attributed to a different leaf, which is exactly §25.1's misattribution if it reproduces leaf 1 (B, %#x)", rs, wantLeaf2, leafRangeRelSet(1, 2))
 	}
 }
