@@ -1,92 +1,129 @@
-Task: M0142-0008a-3i-plumbing-b2 — item 6b design pass, closing §25.4's
-open question (design doc §26). Recon/design-only this loop (no production
-diff), continuing the established "prove/scope before coding" pattern.
-Item 6b's DIRECTION was already settled last loop (§25.3); this loop
-answered the remaining open question that gated starting to code it.
-NOT complete — b2 stays open, now unblocked to start coding next loop.
+Task: M0142-0008a-3i-plumbing-b2 — §25.4 step (3) scoping pass (the
+`unnest.go` `innerKey.Index`/`j.Predicate` divergence question §27.4 left
+open). LANDED and committed (87ef300f6), design-only, no production code
+touched. NOT complete overall — this refutes step (3)'s original framing
+and surfaces a bigger, previously-unstated gap; see Next step.
 
-Files this loop:
-- docs/design/0100-0149/m0142-0008a-1-semi-anti-sji-design.md: §26 added.
-- docs/design/README.md: m0142-0008a-1 index row extended with a §26
-  summary (also flagged, honestly, that the row's §19.5-25 summaries were
-  never written — a pre-existing gap from earlier loops, not touched
-  beyond noting it; not this loop's job to backfill).
-- .ralph/fix_plan.md: -3i-plumbing-b2's item 6b entry extended with §26's
-  answer.
+Files this loop (all committed):
+- docs/design/0100-0149/m0142-0008a-1-semi-anti-sji-design.md: §28 added
+  (§28.1/§28.2 refute the index-rebase premise with live traces, §28.3
+  finds the real production-reachability gap, §28.4 finds a correctness
+  gap for the future plan-build arm, §28.5 resume point).
+- .ralph/fix_plan.md: -3i-plumbing-b2's entry extended with this loop's
+  finding (mirrors §28, condensed).
+- docs/design/README.md: m0142-0008a-1 index row extended with a §28
+  summary.
 
-Key symbols (unchanged from last loop): `extractSearchLeaves`
-(joinsearchseam.go:1085), `cumOffsets` (joinsearchseam.go, chain-level —
-THE ONE WITH THE BUG), `relidsOfExpr`/`tableForCol` (joinrestrict.go:470,575,
-GENERIC over whichever cumOffsets is passed in), `unnestExistsExpr`'s
-`innerKey.Index` (unnest.go:4680-4705).
-NEW this loop: `joinlistProblem.cumOffsets`/`.bindings`
-(relfromjoinlist.go:84-99, a SEPARATE array, per-joinlist-ITEM not
-per-chain-leaf, built from real `ctx.bindings` only), `RelOptInfo.baseOffset`
-(path.go:636-654, set at joinsearch.go:430 from `bindings[i].offset`),
-`baseRelLayout`/`translateToLayout` (createplanjoin.go:114-171,205-,
-goopg's `set_join_references` analogue — the actual mechanism that rewrites
-clause ColumnRefs into the EMITTED plan's coordinates at build time).
+Key symbols traced (no new symbols added):
+- `unnest.go:4681-4726` (`unnestExistsExpr`'s `outerKey`/`innerKey`/
+  `joinPredicate` construction) — read again, this time cross-checked
+  against the walk's own conventions rather than in isolation.
+- `joinsearchseam.go:1093-1281` (`extractSearchLeaves`, esp. the Semi/Anti
+  arm 1132-1193 and the generic `base`/`rebaseChainQual` treatment every
+  join type shares).
+- `joinlayout.go:623-745` (`reresolveJoinByName`) and `:543-550`
+  (`reconcileNLILayoutBody`'s `*Join` case, which already special-cases
+  Semi/Anti by skipping the `.Right` recursion) — the codebase's OWN
+  existing by-name key/predicate reconciliation idiom, previously
+  unnoticed by this design doc's prior sections.
+- `createplanjoin.go:492-504` (`joinInputs.joinPredicate`) and `:545-599`
+  (`createHashJoinPlan`, esp. the "SEMI/ANTI are nestloop-only" comment at
+  C-03c) — the ordinary-join convention of folding every hash-key pair
+  into `Predicate` too, which `unnestExistsExpr` does NOT follow for its
+  own primary key.
+- `planner.go:1524-1536` — traced `origChain`'s capture point relative to
+  `unnestSubqueriesInPlan`, the actual fact that answers §28.3.
+- `semiAntiChainLink` (joinsearchseam.go:1449-1453, `jointype, lhs, rhs,
+  pred` — confirmed via Serena `find_symbol`, no key fields at all).
 
-Finding this loop (§26): there are TWO DISTINCT `cumOffsets` arrays sharing
-a name, not one — (1) joinsearchseam.go's chain-level array (§25's bug,
-includes synthetic Semi/Anti leaf width), consumed only by
-joinrestrict.go/local_filters.go's legality functions; (2)
-relfromjoinlist.go's joinlist-item-level array, built exclusively from real
-`ctx.bindings` FROM items (bushy.go's pre-search pipeline), which is what
-actually feeds `RelOptInfo.baseOffset` -> `createplanjoin.go`'s
-`translateToLayout`, the mechanism that builds the REAL emitted plan's
-predicates. `relidsOfExpr`/`tableForCol` are generic functions each layer
-calls with its OWN array — same function, non-interacting coordinate
-spaces. Cross-checked every actual plan-BUILD site in the optimizer package
-(createplannl.go:311, unnest.go:2692/2911/3373/3537/4634, memoize.go:109,
-nl_index_join.go:839/1542): ALL re-derive width/offset fresh from the
-actually-built Node's real Output() at build time, matching
-unnestExistsExpr's established idiom; NONE read cumOffsets (either flavor).
-Also confirmed: the bushy/joinlist layer has ZERO Semi/Anti awareness
-today — no code threads a synthetic RHS leaf into
-`joinlistProblem.bindings`, because a Semi/Anti pair is not yet admissible
-as a joinable unit in the bushy DP at all (that gap is
-M0142-0008c-3c/-3d/-4's still-unstarted job, not -b2's).
+Findings this loop (supersede §25.3/§27.2's framing):
+1. `j.Predicate`'s index convention was never at risk — it already matches
+   every other join type's "local, 0-based at this join's own leftmost
+   leaf" convention, and `extractSearchLeaves`'s existing generic
+   `rebaseChainQual` call (not Semi/Anti-specific) already handles it,
+   pinned by the prior loop's own `TestBuildLeafSpansAttributesRealLeafAfterSyntheticCorrectly`.
+2. `j.LeftKey`/`j.RightKey` are read by NO search-time function (grepped
+   `extractSearchLeaves`/`buildLeafSpans`/`relidsOfExpr`/`tableForCol` —
+   none touch them). Their only non-execution reader,
+   `joinlayout.go`'s `reresolveJoinByName`, already handles Semi/Anti
+   correctly wherever IT runs (but is explicitly skipped for
+   PG-shaped-search-produced trees via `isSearchedTree`/
+   `assertSearchedTreeNeedsNoReconcile`, so it doesn't apply to anything
+   `tryPGShapedJoinSearch` builds today). **Step (3), as originally
+   framed ("rebase innerKey.Index"), is moot — not deferred, not risky,
+   just not a real problem.**
+3. THE REAL GAP: `extractSearchLeaves`'s ONE production call
+   (`joinsearchseam.go:309`) receives `chain = origChain`, and
+   `planner.go:1533` captures `origChain := f.Child` BEFORE
+   `unnestSubqueriesInPlan(node)` runs on line 1534 — so `origChain`
+   structurally CANNOT contain a Semi/Anti join, ever. Flipping
+   `admitSemiAnti=true` at today's one call site is STILL a guaranteed
+   no-op, independent of everything §25-§27 already fixed. A NEW call
+   over the POST-unnest tree — some form of the `predp.go` descend-loop
+   extension already named in this item's existing fix_plan.md scope
+   ("extend predp.go's descend loop to pass through non-Semi/Anti *Join
+   nodes") — is the reachability PRECONDITION for the rest of item 6b's
+   scope, not a parallel/optional piece of it. This was implicit before
+   but not previously stated as the gate.
+4. A genuine, previously undocumented correctness gap for whoever DOES
+   wire that call: `semiAntiChainLink{pred: j.Predicate}` silently drops
+   the join's own equijoin condition in the common single-equi-key case
+   (params[0]'s equality lives ONLY in `LeftKey`/`RightKey`, deliberately
+   excluded from `Predicate` since the hash match already enforces it —
+   contrast `createplanjoin.go`'s `joinInputs.joinPredicate`, which DOES
+   fold every hash-key pair into the emitted node's `Predicate`, the
+   discipline the Q9 multi-equality bug was fixed by). Any future
+   `-0008c-3c/-3d/-4` plan-build arm that reconstructs a node from `pred`
+   alone would build an unconditional (Cartesian-like) Semi/Anti instead
+   of the correct equi-semi-join. Cheap, localized fix when that work
+   starts: fold `LeftKey`/`RightKey` into an explicit `OpEq` conjunct at
+   `extractSearchLeaves`'s capture site, mirroring `joinPredicate`'s own
+   idiom — NOT a change to `unnestExistsExpr` itself.
 
-Answer: -3i-plumbing-b2's fix (§25.3's per-leaf (lo,hi) table) is CONFINED
-to the chain layer — joinsearchseam.go / joinrestrict.go / local_filters.go
-/ unnest.go's unnestExistsExpr. It does NOT reach relfromjoinlist.go,
-path.go's baseOffset, or any createplan*.go builder. §25.4's 4-step resume
-order is UNCHANGED by this finding; step (1) is now closed with evidence.
-Filed a forward note (design doc §26, not a scope change to -b2): when
-M0142-0008c-3c/-3d/-4 eventually makes a Semi/Anti pair bushy-DP-admissible,
-the bushy layer will face an analogous but SEPARATE "does the RHS get its
-own binding slot" question — -b2's fix does not pre-solve it.
+Next step: wire the predp.go descend-loop extension (already named in
+fix_plan.md's -3i-plumbing-b2 scope: "extend predp.go's descend loop to
+pass through non-Semi/Anti *Join nodes instead of hard-bailing,
+predp.go:96-101") so SOME call reaches the post-unnest tree with
+`admitSemiAnti=true` — this is now understood to be the reachability
+precondition for everything else, not an independent sub-item. Land
+finding 4's dropped-equijoin fix (fold LeftKey/RightKey into `pred` as an
+explicit conjunct in `extractSearchLeaves`'s semi/anti capture) in the SAME
+loop that lands the descend-loop extension — do NOT wire reachability
+without it, or `admitSemiAnti=true` becomes a live wrong-rows bug the
+moment it does anything. Only after both land does flipping
+`admitSemiAnti=true` behind a real end-to-end fixture (§27.4's existing
+gate) become a meaningful test. Also still likely depends on enough of
+`M0142-0008c-3c`/`-3d`/`-4` (bushy-DP admission of a Semi/Anti pair as a
+joinable unit) existing — this loop did not re-examine that dependency,
+per §26.3's forward note.
 
-Next step: §25.4's steps are now fully unblocked to CODE (not just design):
-(1) [DONE by this loop — was step 1, now closed] (2) replace `cumOffsets
-[]int` with the per-leaf (lo,hi) table in joinsearchseam.go; (3) update
-relidsOfExpr/tableForCol (joinrestrict.go) to scan an explicit per-leaf
-table instead of assuming a monotonic prefix sum; (4) point
-unnestExistsExpr's innerKey.Index at the new out-of-band "next synthetic
-slot" counter; (5) THEN code item 6a's *resolveContext plumbing (understood
-to be unnecessary as a ctx.bindings append — the per-leaf table replaces it
-outright); (6) write a new unit test exercising `(A SEMI JOIN B) JOIN C`
-directly — no existing -b1 test covers a real leaf after a Semi/Anti node.
-Do NOT flip `admitSemiAnti=true` in production before this lands.
+Do NOT pick up M0142-0008c-3c/-3d before -3i-plumbing-b2 fully lands —
+both still blocked on a real Semi/Anti SJInfo reaching addPathsToJoinrel
+(fix_plan.md, grep `M0142-0008c-3c`/`-3d` — re-grep line numbers, they
+shift every loop this doc is touched).
 
-Do NOT pick up M0142-0008c-3c/-3d before -3i-plumbing-b2 lands — both
-still blocked on a real Semi/Anti SJInfo reaching addPathsToJoinrel
-(fix_plan.md lines ~3891, ~3899).
+Alternatives if -3i-plumbing-b2 is judged not worth continuing
+immediately: M0141-S2b-2 (base join/scan Pathlist-across-search-boundary
+surgery — still needs its own scoping pass). M0142-0003i/0003k remain
+BLOCKED on a human-authorized shared `:65433` cluster reload — do not
+attempt. Unrelated, NOT to be picked up under this banner unless
+explicitly re-prioritized: `internal/parser`'s `GroupedJoinUnaliased`
+AST-drift gap (pre-existing, traced to `dc91bd6b7`, ~60 failing test
+functions — still the ONLY package failing in the units precommit gate,
+unchanged by this loop, confirmed unrelated). Nightly triage
+(ci/logs/action-items.md, run 20260916-035206, 13 items): already fully
+filed under M-NIGHTLY in fix_plan.md by a prior loop — verified this loop,
+all 13 AI-ids already appear (no new filing needed).
 
-Alternatives if -3i-plumbing-b2 is judged not worth continuing immediately:
-M0141-S2b-2 (base join/scan Pathlist-across-search-boundary surgery — still
-needs its own scoping pass). M0142-0003i/0003k remain BLOCKED on a
-human-authorized shared `:65433` cluster reload — do not attempt.
-Unrelated, NOT to be picked up under this banner unless explicitly
-re-prioritized: `internal/parser`'s `GroupedJoinUnaliased` AST-drift gap
-(pre-existing, traced to `dc91bd6b7`, ~60 failing test functions,
-reconfirmed unchanged across 5+ consecutive loops now).
+Gates run this loop: `go build ./...` clean (no .go files touched this
+loop — design-doc-only change, verified build is unaffected).
+`make ralph-state-guard`: found and auto-repaired the same benign
+prior-loop clean-exit marker as several prior loops; consistent after
+repair. Pre-commit hook's mandatory CI-parity pgbench smoke: PASS (TPC-B
+42 tps, simple-update 42 tps, select-only 147 tps, 0 failed). No
+`go test`/TPC-DS sweep run this loop — no production code changed, so
+nothing to regression-gate beyond the trace-against-live-source already
+embedded in §28's citations.
 
-Gates run this loop: `go build ./...` clean (no production code touched,
-docs/plan-only loop). `make ralph-state-guard`: found and auto-repaired
-the same benign prior-loop clean-exit marker as the last several loops;
-consistent after repair.
-
-In-flight: none. Nothing outstanding from this loop — ready to commit
-docs/fix_plan/ledger changes.
+In-flight: none. Committed as 87ef300f6. Nothing outstanding from this
+loop.
