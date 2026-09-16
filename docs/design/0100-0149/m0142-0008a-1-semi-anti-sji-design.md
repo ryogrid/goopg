@@ -1750,3 +1750,197 @@ no-op in production**, same shape as `-0008c-1`. `-0008c-3` (threading
 reach a unique-ified candidate at all. `-0008c-4` (the NOOP unique-index fast
 path) stays a plan-shape-only concern, not a correctness blocker, unchanged
 from §16.3's own sizing.
+
+## 19. M0142-0008c-3 recon — the actual PG plan shape narrows the blast radius; decomposed into 3a/3b/3c/3d, none implemented (2026-09-16)
+
+Per the working-set baton's own instruction ("recon it as its own sub-task
+before implementing, given this project's track record"), this section sizes
+`-0008c-3` against goopg's real call graph AND against what PG's actual
+chosen plan for the two named witnesses (Q10/Q35) needs — the latter turns
+out to matter a great deal.
+
+### 19.1 What Q10/Q35 actually need — read from the committed PG plans, not assumed
+
+`bench/tpcds/plans-pg/Q10.txt` and `Q35.txt` (both `EXISTS(store_sales…) AND
+(EXISTS(web_sales…) OR EXISTS(catalog_sales…))`, isomorphic queries) show the
+**identical** join shape for the `create_unique_path`-relevant EXISTS:
+
+```
+Nested Loop
+  Join Filter: (customer_demographics.cd_demo_sk = c.c_current_cdemo_sk)
+  -> Nested Loop            <- the create_unique_path join
+       -> HashAggregate (Group Key: store_sales.ss_customer_sk)   <- unique-ified OUTER
+            -> Gather -> Parallel Hash Join(store_sales, date_dim)
+       -> Index Scan using customer_pkey on customer c            <- indexed INNER
+            Index Cond: (c_customer_sk = store_sales.ss_customer_sk)
+            Filter: (ANY(...=(hashed SubPlan 2)) OR ANY(...=(hashed SubPlan 4)))
+```
+
+Two findings, both narrowing scope:
+
+1. **Only the first EXISTS (store_sales) is decorrelated to a join at all.**
+   The other two are inside an `OR`, which SQL semantics forbid pulling up to
+   a semijoin (a semijoin is an AND-only rewrite) — PG leaves them as
+   correlated `ANY(... = (hashed SubPlan N))` filters evaluated inside the
+   `Index Scan`'s `Filter`. This is **not** part of `-0008c`'s scope and not
+   a cost decision either; it is a legality fact PG's own SubLink-pullup
+   already respects. Whatever gap (if any) keeps goopg from matching this
+   shape belongs to the SubLink-pullup-eligibility area (`existsUnnestSJInfo`
+   / `whereEligibleForPreDPUnnest`, §4.2/§6), not to `-0008c-3`. Recorded here
+   so a future loop does not mistake "goopg still doesn't match Q10" for a
+   `-0008c-3` bug once `-0008c-3` lands — the OR'd pair is a **separate**,
+   unrelated divergence that will still be there.
+2. **The `create_unique_path` join itself is `JOIN_UNIQUE_OUTER` + an
+   INDEXED nested loop (NLI), never hash or merge.** `store_sales` (deduped
+   by `ss_customer_sk` via `HashAggregate`) is the OUTER child; `customer`,
+   probed by its PK index on `c_customer_sk`, is the INNER child. This is the
+   PG shape `match_unsorted_outer` builds when `save_jointype ==
+   JOIN_UNIQUE_OUTER` and `innerrel->cheapest_parameterized_paths` has an
+   indexed candidate (`joinpath.c:1918-1923`, read live — quoted in full
+   below). **Neither witness exercises hash-join or merge-join at all.**
+   Also notable: the `HashAggregate`'s group key (`ss_customer_sk`) is the
+   *only* column that survives to the join — there are no other passthrough
+   columns — so `-0008c-1a`'s HASH-method blocker (goopg's `*Distinct` being
+   full-row-only, unable to express "group by keys, pass through the rest
+   ungrouped") **does not apply to this witness**: a plain single-column
+   dedup is already representable. Whether `create_unique_path`'s SORT method
+   (landed by `-0008c-1`) or a future HASH method wins the cost race for
+   Q10/Q35 is an open question for whichever loop measures it, but the
+   *executor* has no gap either way here.
+
+### 19.2 PG's actual per-builder mechanism, read live (not from memory)
+
+`join_is_legal`/`create_unique_path`'s consumers are exactly the 3 functions
+already named in §16.1, but the mechanism is more specific than "add a case
+that substitutes a path and demotes the jointype" — it differs BY FUNCTION
+in a way that matters for splitting the work:
+
+- **`sort_inner_and_outer`** (merge, `joinpath.c:1403-1417`, quoted in full in
+  the file at those lines): substitutes `outer_path`/`inner_path` with
+  `create_unique_path(...)` **locally** (a stack variable, never mutating
+  `rel->cheapest_total_path`) and sets a local `jointype = JOIN_INNER` before
+  any cost/build call. A SEPARATE `save_jointype` (the pre-demotion value) is
+  kept and consulted later purely to gate **parallel** eligibility
+  (`joinpath.c:1422-1441`): `JOIN_UNIQUE_OUTER` disables partial-merge
+  entirely ("the outer path will be partial, and therefore we won't be able
+  to properly guarantee uniqueness" — direct quote, `:1424-1426`);
+  `JOIN_UNIQUE_INNER` disables the safe-parallel-inner search. The serial
+  path itself is otherwise the ordinary merge-join builder with substituted
+  inputs.
+- **`match_unsorted_outer`** (nestloop + NLI, `joinpath.c:1811-1957`, quoted
+  in full above in §19.1's evidence) is the ONE function both plain-NL and
+  indexed-NL run through in PG. `JOIN_UNIQUE_INNER` takes an entirely
+  separate, narrower branch: it substitutes `inner_cheapest_total` ONCE
+  before the outer loop and calls `try_nestloop_path` with ONLY that single
+  substituted inner — it never touches
+  `innerrel->cheapest_parameterized_paths` (no indexed variant is considered
+  for `JOIN_UNIQUE_INNER`; PG's own `XXX` comment at `:1916` admits this is a
+  deliberate, possibly-suboptimal simplification: "we don't consider
+  parameterized outers, nor inners, for unique-ified cases. Should we?").
+  `JOIN_UNIQUE_OUTER` instead restricts the **outer loop** to
+  `outerpath == outerrel->cheapest_total_path` (skip every other outer
+  path), substitutes THAT ONE via `create_unique_path`, demotes jointype
+  once, and then falls through into the SAME generic
+  `innerrel->cheapest_parameterized_paths` loop ordinary nested loop and NLI
+  share (`:1918-1957`) — meaning Q10/Q35's plan (indexed inner) is produced
+  by the *ordinary* parameterized-inner loop, just fed a pre-substituted
+  outer path.
+- **`hash_inner_and_outer`** (hash, not read in full this loop —
+  `joinpath.c:2100-2140` per §16.1's citation — same substitute-then-demote
+  shape per the earlier grep, not re-verified live since neither witness
+  exercises it).
+
+### 19.3 Mapping onto goopg's actual functions
+
+goopg's shape is NOT a 1:1 mirror of PG's file-per-strategy layout, which
+changes where the substitution belongs:
+
+- goopg's `addNLIPaths` (`joinpathsnli.go:269-372`) is PG's
+  `match_unsorted_outer`'s **indexed-inner branch only** — it already reduces
+  to a single outer candidate (`o := outer.CheapestTotal`, no pathlist loop),
+  so the "restrict `JOIN_UNIQUE_OUTER` to the cheapest-total outer" constraint
+  PG enforces with an explicit `if outerpath != outerrel->cheapest_total_path
+  continue` is **already structurally true** in goopg — nothing to add there.
+  The needed change is narrow: when `jt == JoinTypeUniqueOuter`, substitute
+  `o := createUniquePath(outer, outer.CheapestTotal, sjinfo, cp)` (declining
+  the whole call if nil) instead of `outer.CheapestTotal`, and pass a
+  demoted `parser.JoinInner` into the constructed `Path{Jointype: ...}` (the
+  plan node itself must read as a plain inner join, matching the PG EXPLAIN
+  in §19.1 showing an unlabeled `Nested Loop`, not a `Semi` one). This is the
+  function that produces Q10/Q35's actual witnessed shape.
+- goopg's `addNestLoopPath` (`pathgen.go:149`) is PG's plain-NL half AND is
+  where `JOIN_UNIQUE_INNER` belongs (PG's separate, narrower `try_nestloop_path`
+  call using only the substituted cheapest-total inner, never an indexed
+  one) — substitute `inner.CheapestUnique`-equivalent for the `JoinTypeUniqueInner`
+  case, demote to `JoinInner`, and do NOT thread this case into `addNLIPaths`
+  at all (matching PG's own asymmetry, not an oversight to "fix").
+- `createUniquePath` (`createuniquepath.go:49`) already caches into
+  `rel.CheapestUnique` on the RelOptInfo itself (`-0008c-1`, landed), so
+  either builder can call it directly and cheaply on a repeat visit — no new
+  cache plumbing needed here.
+- `jointypeForDirection` (`joinpaths.go:160-213`) is the actual gap
+  `-0008c-2`'s working-set note pointed at: its `JoinSemi` arm requires BOTH
+  `MinLefthand`/`MinRighthand` subset containment, which by construction
+  fails for a unique-ify-admitted pair. It needs a new fallback, symmetric in
+  direction: given `sjinfo.Jointype == JoinSemi` and the ordinary subset
+  check fails, if `sjinfo.SynRighthand == inner` (bit-set equality, not
+  subset) and `createUniquePath` on that rel succeeds, return
+  `JoinTypeUniqueInner`; if `sjinfo.SynRighthand == outer` under the same
+  conditions, return `JoinTypeUniqueOuter`. **This requires a signature
+  change**: `jointypeForDirection(sjinfo, outer, inner RelSet)` only receives
+  bitmasks today, not the `*RelOptInfo` needed to reach `.CheapestTotal`/
+  `.CheapestUnique` or the `costParams` needed to call `createUniquePath`.
+  Confirmed by `find_referencing_symbols`: **exactly one production caller**
+  (`addPathsToJoinrel`, which already has both `*RelOptInfo`s and `cp` in
+  scope) plus one test file — the signature change itself is cheap, unlike
+  the builder-side work.
+- **New type needed**: PG's comment (`joinpath.c:116-121`, quoted in §16.1)
+  is explicit that `JOIN_UNIQUE_OUTER`/`INNER` "are not allowed to propagate
+  outside this module" — they are a `joinpath.c`-private sentinel over the
+  same `JoinType` enum, demoted to `JOIN_INNER` before any Path is built or
+  costed. goopg's analogue should NOT add `JoinTypeUniqueInner/Outer` as new
+  `parser.JoinType` consts (that enum is shared with the parser and
+  executor, which must never see a "unique" jointype) — it should be a small
+  `internal/optimizer`-private type (or a second return value alongside
+  `parser.JoinType`) that `addPathsToJoinrel` consumes and fully resolves
+  (substitute + demote to `parser.JoinInner`) before calling ANY builder,
+  narrowing "thread through every builder" to "thread through the two
+  builders that need the substitution"; every other builder keeps receiving
+  plain `parser.JoinInner` and needs **zero changes**, which is a materially
+  smaller blast radius than §16.3's original framing assumed (that framing
+  pre-dated reading `match_unsorted_outer`'s actual branch structure and the
+  Q10/Q35 evidence).
+
+### 19.4 Revised sizing and decomposition
+
+`-0008c-3` as filed was one task covering hash, merge, AND nestloop/NLI
+uniformly. §19.1's evidence (neither witness exercises hash or merge) plus
+§19.3's finding (the demote-before-dispatch pattern means most builders need
+no change at all) together shrink the *required-for-Q10/Q35* slice to just
+the dispatch layer plus two builders. Decomposed into four loop-sized pieces,
+filed as `M0142-0008c-3a..3d` below (fix_plan.md):
+
+- **3a** — `jointypeForDirection` signature change + new admission-return
+  type + `addPathsToJoinrel`'s substitute-and-demote dispatch. No builder
+  changes yet; every existing builder keeps seeing `parser.JoinInner` exactly
+  as it does for an ordinary inner join today, so `-0008c-1`/`-0008c-2`
+  remain otherwise inert until 3b lands (no plan-shape change expected from
+  3a alone — an explicit acceptance check, not a hope).
+- **3b** — `addNestLoopPath`'s `JoinTypeUniqueInner` substitution and
+  `addNLIPaths`'s `JoinTypeUniqueOuter` substitution (§19.3). This is the
+  piece that should move Q10/Q35 — verify against
+  `bench/tpcds/plans-pg/Q10.txt`/`Q35.txt`'s exact shape (§19.1), not just
+  "a plan now exists."
+- **3c** — `addHashJoinPath`/`addPartialHashJoinPath` substitution. Deferred:
+  not exercised by either named witness; pick up only if a future measurement
+  finds a query where the unique-ified hash path wins the cost race.
+- **3d** — `sortInnerAndOuter`/`matchUnsortedOuterMerge`/
+  `matchUnsortedOuterMergePartial` (merge) and `addPartialNestLoopPaths`
+  (parallel NL) substitution. Deferred for the same reason as 3c, plus merge
+  is already `mergeDeclined` for SEMI/ANTI generally (§8) — worth checking
+  whether that decline should also cover the demoted-INNER case before
+  enabling it.
+
+No production code changed this loop (recon only). Q10/Q35 remain
+un-parity'd; the OR'd-EXISTS divergence named in §19.1 item 1 will remain
+even after 3a-3d land in full, and is out of scope for this milestone group.

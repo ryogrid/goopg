@@ -3722,19 +3722,83 @@ cross-layer programme that has never been scoped.
   `SemiCanBtree`/`SemiCanHash` together, so `createUniquePath`'s
   `SemiCanBtree`-only gate never actually declines a real query — this item
   only matters once a second SEMI producer sets the flags independently.
-- [ ] **M0142-0008c-3 — thread `JoinTypeUniqueInner`/`JoinTypeUniqueOuter`
+- [x] **M0142-0008c-3 — thread `JoinTypeUniqueInner`/`JoinTypeUniqueOuter`
   through every join-path builder** — filed by M0142-0008c (design doc §16.3
-  item 3). Depends on M0142-0008c-1/-2. Add the two synthetic jointypes
-  (PG oracle: `joinpath.c:113-121`) and give every goopg join-path builder
-  (hash-join, merge-join, and NLI producers under `internal/optimizer/` that
-  `addPath` calls per join level — goopg's analogues of PG's
-  `sort_inner_and_outer`/`match_unsorted_outer`, `joinpath.c:1356`/`:1811`)
-  a case that substitutes the unique-ified path for the appropriate side and
-  demotes the jointype to plain `INNER` before costing/building. Widest
-  blast radius of the four — comparable to how -0008a-3(iii)'s much
-  narrower MERGE-decline split (design doc §8) rippled across multiple
-  builders. Resume point: design doc §16.1 (PG's 7 call sites cited), §16.3
-  item 3.
+  item 3). Depends on M0142-0008c-1/-2. **DONE 2026-09-16 as a recon +
+  decomposition, no production change** (design doc §19, per the working-set
+  baton's own instruction to recon this piece before implementing, given its
+  §16.3-flagged size). Reading Q10/Q35's actual committed PG plans
+  (`bench/tpcds/plans-pg/Q10.txt`/`Q35.txt`) found the task as filed was both
+  over- and under-scoped: **neither witness exercises hash-join or
+  merge-join at all** (only `JOIN_UNIQUE_OUTER` + an indexed nested loop —
+  `HashAggregate`-deduped `store_sales` as outer, `customer_pkey`-indexed
+  `customer` as inner), and **only one of Q10/Q35's three `OR`-connected
+  `EXISTS` clauses is even eligible for `create_unique_path`** (the other two
+  stay correlated `hashed SubPlan` filters by SQL legality — a separate,
+  still-open divergence unrelated to `-0008c`). Reading PG's
+  `match_unsorted_outer`/`sort_inner_and_outer` live (not from memory) found
+  each strategy substitutes-and-demotes LOCALLY per builder rather than via
+  one shared dispatch, but goopg's own `addNLIPaths` already collapses to a
+  single outer candidate, so PG's "restrict to cheapest-total outer" guard is
+  already structurally true there — combined with the Q10/Q35 evidence, the
+  real blast radius shrinks to `jointypeForDirection`'s dispatch (exactly one
+  production caller, confirmed via `find_referencing_symbols`) plus exactly
+  two builders. Decomposed into **M0142-0008c-3a..3d** below, ordered by the
+  Q10/Q35 evidence (3a/3b are what the witnesses need; 3c/3d are deferred,
+  unexercised). Resume point: design doc §19.
+- [ ] **M0142-0008c-3a — `jointypeForDirection` admission dispatch for
+  unique-ify** — filed by M0142-0008c-3's recon (design doc §19.3-19.4 item
+  3a). Depends on M0142-0008c-1/-2. Change `jointypeForDirection`'s signature
+  from `(sjinfo, outer, inner RelSet)` to accept the `*RelOptInfo`s (and
+  `costParams`) it needs to call `createUniquePath`; add the symmetric
+  fallback arm for `JoinSemi` when the ordinary `MinLefthand`/`MinRighthand`
+  subset check fails: `sjinfo.SynRighthand == inner` (bit-equality, not
+  subset) + a successful `createUniquePath` on that rel → admit as
+  `JoinTypeUniqueInner`; `sjinfo.SynRighthand == outer` under the same
+  conditions → `JoinTypeUniqueOuter`. Represent the two synthetic values as a
+  small `internal/optimizer`-private type, NOT new `parser.JoinType` consts
+  (PG's own comment, `joinpath.c:116-121`, is explicit these must never
+  propagate outside the join-path module — goopg's parser/executor must
+  never see one). `addPathsToJoinrel` fully resolves the sentinel
+  (substitute + demote to `parser.JoinInner`) before calling ANY builder, so
+  this task alone should produce **zero plan-shape change** anywhere
+  (explicit acceptance check via `tpcds-sf025-regression.sh sweep`, not just
+  "no crash") — 3b is what makes it live. Resume point: design doc §19.3-19.4
+  item 3a.
+- [ ] **M0142-0008c-3b — `addNestLoopPath`/`addNLIPaths` unique-ify
+  substitution** — filed by M0142-0008c-3's recon (design doc §19.3-19.4 item
+  3b). Depends on M0142-0008c-3a. `addNLIPaths` (`joinpathsnli.go:269`):
+  when the dispatch resolves to `JoinTypeUniqueOuter`, substitute
+  `outer.CheapestTotal` with `createUniquePath(outer, outer.CheapestTotal,
+  sjinfo, cp)` (decline the call if nil) before the existing
+  `inner.CheapestParameterized` loop — this is the exact PG shape
+  (`match_unsorted_outer`'s `JOIN_UNIQUE_OUTER` branch falls through into the
+  SAME parameterized-inner loop ordinary NLI uses) that produces Q10/Q35's
+  witnessed plan. `addNestLoopPath` (`pathgen.go:149`): when the dispatch
+  resolves to `JoinTypeUniqueInner`, substitute the inner the same way
+  (PG's own separate, narrower `try_nestloop_path`-only branch — do NOT also
+  thread `JoinTypeUniqueInner` into `addNLIPaths`; that asymmetry is PG's own
+  design, not a gap to close). **Acceptance: Q10/Q35's plan shape must match
+  `bench/tpcds/plans-pg/Q10.txt`/`Q35.txt`'s exact node shape** (§19.1) for
+  the `store_sales`/`customer` sub-join specifically, not just "a plan now
+  exists" — plus the full TPC-DS SF0.25 sweep for regressions elsewhere.
+  Resume point: design doc §19.3-19.4 item 3b.
+- [ ] **M0142-0008c-3c — `addHashJoinPath`/`addPartialHashJoinPath`
+  unique-ify substitution** — filed by M0142-0008c-3's recon (design doc
+  §19.4 item 3c). Depends on M0142-0008c-3a. Deferred: not exercised by
+  either named witness (§19.1). Pick up only once a measurement finds a
+  query where the unique-ified hash path wins the cost race against 3b's
+  NLI/nestloop candidates. PG oracle: `hash_inner_and_outer`,
+  `joinpath.c:2100-2140` (cited by §16.1, not yet read live).
+- [ ] **M0142-0008c-3d — merge + partial-nestloop unique-ify substitution**
+  — filed by M0142-0008c-3's recon (design doc §19.4 item 3d). Depends on
+  M0142-0008c-3a. Deferred for the same reason as 3c:
+  `sortInnerAndOuter`/`matchUnsortedOuterMerge`/`matchUnsortedOuterMergePartial`
+  (merge) and `addPartialNestLoopPaths` (parallel NL), PG oracle
+  `sort_inner_and_outer`/`match_unsorted_outer`, `joinpath.c:1403-1441`
+  (read live this loop, §19.2). Before enabling merge here, check whether
+  `mergeDeclined`'s existing SEMI/ANTI decline (§8) should also cover the
+  demoted-INNER case.
 - [ ] **M0142-0008c-4 — `innerrel_is_unique`/unique-index NOOP fast path** —
   filed by M0142-0008c (design doc §16.3 item 4). Depends on
   M0142-0008c-1. Not needed for correctness (the expensive Sort+Unique/

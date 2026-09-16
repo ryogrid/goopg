@@ -1,70 +1,80 @@
-Task: M0142-0008c-2 — `joinIsLegal`'s missing SEMI unique-ify admission arm
-(PG's `create_unique_path` mechanism, item 2 of 4, M0142-0008c group for
-TPC-DS Q10/Q35 parity). DONE and committed this loop.
+Task: M0142-0008c-3 — recon + decomposition (per the previous loop's own
+plan: "recon it as its own sub-task before implementing"). DONE and
+committed this loop, NO production code changed (pure recon/decomposition,
+matching the M0140-0006 precedent).
 
-Files this loop: internal/optimizer/joinsearchlevel.go (two new `else if`
-arms in `joinIsLegal`, ported joinrels.c:445-489), internal/optimizer/
-specialjoin_test.go (3 new tests: TestJoinIsLegalSemiUniqueIfyAdmitsNonRHSPair
-/...ReversedPair/TestJoinIsLegalSemiRejectsWhenNotUniqueIfiable, plus
-semiUniqueIfyFixture helper reusing createuniquepath_test.go's
-uniquePathFixture), docs/design/0100-0149/m0142-0008a-1-semi-anti-sji-design.md
-(§18 added), docs/design/README.md (index row extended), .ralph/fix_plan.md
-(M0142-0008c-2 marked [x]).
+Files this loop: docs/design/0100-0149/m0142-0008a-1-semi-anti-sji-design.md
+(§19 added — full recon writeup), docs/design/README.md (index row extended
+with a §19 summary sentence), .ralph/fix_plan.md (M0142-0008c-3 marked [x]
+as closed-as-decomposition; four new sub-tasks filed: M0142-0008c-3a/3b/3c/3d).
 
-Key symbols: `(*searchCtx).joinIsLegal` (joinsearchlevel.go:198 — the two new
-arms sit between the reversed ordinary-match branch and the "both overlap
-RHS" fallback, exactly PG's own order), `createUniquePath` (called as
-`createUniquePath(relX, relX.CheapestTotal, sj, s.cp)`), `jointypeForDirection`
-(joinpaths.go:161 — the downstream consumer whose MinLefthand-subset check is
-what makes this arm currently inert), `joinOrderRestricted`/
-`makeRelsByClauseJoins` (joinsearchlevel.go — the pair-admission heuristics
-that never offer a unique-ify-only pair to joinIsLegal today).
+Key symbols (all read live this loop, not from memory): `jointypeForDirection`
+(joinpaths.go:160 — the ONE production caller is `addPathsToJoinrel`,
+confirmed via find_referencing_symbols, so its signature change is cheap),
+`addPathsToJoinrel` (joinpaths.go:249 — calls 8 builder functions with `jt`),
+`addNLIPaths` (joinpathsnli.go:269 — already collapses outer to a single
+`outer.CheapestTotal` candidate, so PG's "restrict UNIQUE_OUTER to
+cheapest-total outer" guard is already structurally true here), `addNestLoopPath`
+(pathgen.go:149), `createUniquePath`/`RelOptInfo.CheapestUnique`
+(createuniquepath.go:49, path.go:568 — landed by -0008c-1, cache-backed,
+callable directly). PG oracle read live: `match_unsorted_outer` and
+`sort_inner_and_outer` (postgres/src/backend/optimizer/path/joinpath.c:1403-1441,
+1811-1957) — each substitutes-and-demotes LOCALLY, not via shared dispatch;
+`make_join_rel` (joinrels.c:960-1013) — the actual PG call site that invokes
+JOIN_UNIQUE_INNER/OUTER (goopg's analogue is `makeJoinRel`, joinsearchlevel.go:572,
+already unconditionally tries both directions via `jointypeForDirection`, so
+no new goopg dispatch site is needed there — confirmed while tracing this).
 
-Hypothesis/Findings: this loop's main risk was NOT "does the port match PG"
-(it does, mechanically) but "does admitting a pair -0008c-3 can't yet finish
-building turn a previously-harmless decline into a hard planner failure?" —
-traced precisely: `makeJoinRel` registers the joinrel via `s.addRel` BEFORE
-calling `addPaths`, so if both orientations decline (which `jointypeForDirection`
-does for any pair reachable only via this arm, since MinLefthand isn't a
-subset of either single input by construction), the joinrel is left with an
-EMPTY Pathlist, and `joinSearch`'s per-level loop hard-fails the WHOLE search
-on ANY empty-Pathlist rel. Confirmed this is NOT triggered today: the search's
-own pair-admission gate (`joinOrderRestricted`) returns false for exactly this
-shape (`FROM a,b WHERE (a.x,b.y) IN (SELECT c1 FROM c)`) because it requires
-BOTH inputs to overlap MinLefthand/MinRighthand, and a unique-ify-only pair by
-definition has only one input overlapping — so such a pair is never proposed
-to `joinIsLegal` in the first place. Empirically confirmed via a full TPC-DS
-SF0.25 sweep on the dirty tree: PASS=96 MISMATCH=0 ERROR=0 TIMEOUT=0, Q10/Q35
-plan shape unchanged (expected — matches -0008c-1's own "no live caller"
-finding; -0008c-3 is what will make both pieces live).
+Hypothesis/Findings: the key result this loop is that reading Q10/Q35's
+ACTUAL committed PG plans (bench/tpcds/plans-pg/Q10.txt, Q35.txt) sharply
+narrows -0008c-3's real scope versus how §16.3 originally sized it.
+(1) Neither witness exercises hash-join or merge-join AT ALL — both use
+JOIN_UNIQUE_OUTER + an INDEXED nested loop: store_sales deduped via
+HashAggregate(ss_customer_sk) as the outer, customer probed by customer_pkey
+as the indexed inner. So the "thread through every builder" framing was too
+broad; only addNestLoopPath (JoinTypeUniqueInner) and addNLIPaths
+(JoinTypeUniqueOuter) are actually needed for these two witnesses — hash/merge
+threading (3c/3d) is deferred as unexercised. (2) Only ONE of Q10/Q35's three
+OR-connected EXISTS clauses is even eligible for create_unique_path — the
+other two (inside the OR) stay as correlated "hashed SubPlan" filters by SQL
+legality (an OR'd EXISTS cannot decorrelate to a semijoin), which is a
+SEPARATE, unrelated divergence from any SubLink-pullup-eligibility gap, out
+of scope for -0008c entirely. Even after 3a-3d land in full, goopg's Q10/Q35
+plans will NOT byte-match PG's unless that separate gap is also closed —
+recorded explicitly so a future loop doesn't mistake it for a -0008c-3 bug.
+(3) -0008c-1a's HASH-method blocker (goopg's *Distinct being full-row-only)
+does NOT apply to this specific witness, since the HashAggregate's only
+surviving column is the group key itself (no ungrouped passthrough columns) —
+narrows -0008c-1a's relevance but doesn't resolve it generally.
+Decomposition rationale: 3a (dispatch — jointypeForDirection's signature
+change + new admission arm + a NEW internal/optimizer-private synthetic type,
+explicitly NOT new parser.JoinType consts since PG's own comment says these
+must never propagate outside the join-path module) is a pure-plumbing slice
+expected to produce ZERO plan-shape change on its own (explicit acceptance
+check for whoever implements it); 3b (the two builder substitutions) is what
+should actually move Q10/Q35; 3c/3d (hash/merge/partial-NL) are deferred,
+unexercised by any known witness.
 
-Next step: per banner order (M0137-M0143 group), the natural continuation is
-**M0142-0008c-3** (thread `JoinTypeUniqueInner`/`JoinTypeUniqueOuter` through
-every join-path builder — hash/merge/NLI producers under internal/optimizer/,
-PG oracle joinpath.c:113-121 + the 7 call sites design doc §16.1 cites). This
-is the WIDEST-blast-radius piece of the four (comparable to -0008a-3(iii)'s
-MERGE-decline split, design doc §8, which rippled across multiple builders
-for a much narrower change) and is now the SOLE remaining blocker before
-either -0008c-1 or -0008c-2 affects a real plan — recon it as its own
-sub-task before implementing, given this project's track record on
-similarly-scoped joinrels.c/joinpath.c ports (every prior -0008a/-0008c piece
-needed a recon-then-implement split). Alternatives if this group is judged
-not worth continuing: M0141-S2b-2 (base join/scan Pathlist-across-search-
-boundary surgery — flagged by its own filing as needing "its OWN further
-scoping pass before writing code", not yet done), M0142-0008a-3i-plumbing
-items 3-5 (still 3-subsystem-spanning). M0142-0003i/0003k remain BLOCKED on a
-human-authorized shared `:65433` cluster reload — do not attempt.
+Next step: per banner order (M0137-M0143 group, item 4), select
+**M0142-0008c-3a** next (the dispatch layer — jointypeForDirection signature
+change + admission arm + synthetic type). It is the smallest, most
+self-contained of the four new sub-tasks (single production caller, no
+builder changes, explicit "zero plan-shape change" acceptance bar makes it
+easy to verify), and unblocks 3b. Read design doc §19.3-19.4 item 3a first.
+Alternatives if this group is judged not worth continuing: M0141-S2b-2 (base
+join/scan Pathlist-across-search-boundary surgery — still needs its own
+scoping pass, not done), M0142-0008a-3i-plumbing items 3-5 (still
+3-subsystem-spanning). M0142-0003i/0003k remain BLOCKED on a human-authorized
+shared `:65433` cluster reload — do not attempt.
 
-Gates run: `go build ./...` (clean). `go test ./internal/optimizer/...`
-(PASS, full package including 3 new joinIsLegal tests). `RALPH_PRECOMMIT_SCOPE=units
-scripts/ralph-precommit-test.sh` (PASS except the ALREADY-KNOWN, unrelated,
-pre-existing `internal/parser` TestLockingClauseParity AST-drift failure filed
-2026-09-15, GroupedJoinUnaliased field added by a different commit, not
-touched this loop). `scripts/tpcds-sf025-regression.sh sweep` (PASS=96
-MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0 SKIP=3 — ran against the dirty tree
-with this loop's change, foreground, ~3 min). `scripts/tpch-spotcheck.sh`
-SKIPPED (shared `:65433` tpch DB still empty per M0142-0003k, pre-existing/
-documented blocker, exit 0 — expected). `make ralph-state-guard` — to run
-before finishing.
+Gates run: `go build ./...` (clean — this loop touched only docs/markdown,
+no .go files). `make ralph-state-guard` — found and safely auto-repaired a
+stale status/progress mismatch from the previous loop's clean exit (status
+still said "running"/"executing" while progress said "completed"; guard
+reconciled progress to "in_progress" since the completed marker was the
+prior loop's own exit marker, not a real project completion), then passed
+clean. `go test ./internal/optimizer/...` NOT re-run this loop (no .go files
+changed — nothing to regress). `scripts/tpch-spotcheck.sh`/`tpcds-sf025-regression.sh`
+NOT run this loop (docs-only change, no plan/row-count risk).
 
 In-flight: none.
