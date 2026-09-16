@@ -3504,11 +3504,50 @@ cross-layer programme that has never been scoped.
     a real relset bit the search can place anywhere. **Verdict: -3(i) is a
     re-scope, not a start** — do not attempt the descend-loop extension
     directly. Follow-up filed as **M0142-0008a-3i-recon2** (below).
-  - [ ] **M0142-0008a-3i-recon2 — size option 1 vs option 2 (§11) against a
+  - [x] **M0142-0008a-3i-recon2 — size option 1 vs option 2 (§11) against a
     real multi-table-EXISTS-body TPC-DS witness** — filed by -3(i)'s recon.
-    Use `query10`/`query35`'s class (per M0142-0008c's own census) as the
-    concrete witness before writing any DP-search code; design-only, no
-    implementation.
+    **DONE 2026-09-16 as a recon (design doc §12), no production change.**
+    Two findings, both correcting the filing: **(1) the named witness was
+    wrong** — `query10`/`query35`'s PG-chosen plans have ZERO Semi/Anti join
+    nodes anywhere (PG reaches them via `create_unique_path`
+    dedupe-then-probe, M0142-0008c's actual subject); Q69 (same census) is
+    the real multi-table-EXISTS-body witness for THIS mechanism, and a
+    richer one than hoped — it exercises the RHS-as-participant shape three
+    times in one query (one Semi + two Anti joins, each RHS a genuine
+    2-relation `channel ⋈ date_dim` body), with goopg already independently
+    landing on the matching `Hash Semi/Anti Join` node kind. **(2) §11's
+    blast-radius estimate for option 1 was too pessimistic**: reading (not
+    just grepping) `baseSeqScanCostInputs`, `PathPrebuilt`/`createPlan`, and
+    `EstimateRows` shows the first two are ALREADY fully generic over any
+    wrapped Node kind (zero new code), and the third already has a `*Join`
+    case that covers Q69's witness directly (`x.Right`'s top node is
+    `*Join{Inner}`) — only `explain_names.go` remains genuinely unverified,
+    and any gap there is display-only per the M0142-0008d/e precedent. The
+    obvious reuse shortcut (wrap `x.Right` in the existing `*CTEScan`) is a
+    **trap, not a shortcut**: `cteScanOp` materializes-and-caches keyed by
+    `DeclKey()`, and Q69 needs three independent RHS wraps that would
+    collide on the same bare-name cache key. A plain no-op
+    `*Filter{Predicate: nil, Child: x.Right}` looks like the correct,
+    near-zero-blast-radius wrapper instead (stops `extractSearchLeaves`'s
+    walk, `EstimateRows`'s `*Filter` case is an exact pass-through, `Filter`
+    is already generic everywhere else) — **unverified this loop, static
+    read only**. `reresolveJoinByName`'s post-search-splice problem (§11)
+    is untouched by any of this and still needs its own resolution. Next
+    step filed as **M0142-0008a-3i-verify** (below): a throwaway
+    instrumented probe against Q69 confirming the Filter-wrapper hypothesis
+    before any real DP-search plumbing is written.
+  - [ ] **M0142-0008a-3i-verify — confirm the `*Filter`-wrapper hypothesis
+    against the Q69 witness with a live instrumented run** — filed by
+    -3i-recon2 (design doc §12.3/12.4). Build a small throwaway probe
+    (style of §5's -3(iii) trace-through) that (1) confirms all three of
+    Q69's EXISTS-body top nodes are `*Join{Inner}`, (2) confirms wrapping
+    one in `*Filter{Predicate: nil, Child: x.Right}` and splicing it into
+    `origChain` as one more leaf reproduces the SAME row/cost estimate
+    `EstimateRows`/`baseSeqScanCostInputs` already compute for it today
+    (i.e. the wrapper is a no-op for cost/cardinality, only changing what
+    `extractSearchLeaves` does with it). Design/instrumentation-only until
+    confirmed; only after this should (a)/(b)/(c) of §12.4 (new
+    `RelOptInfo`/`SJInfo` registration, post-search splice) be attempted.
   **Independent, unfiled resume-point hint** (not sized/numbered — noted for
   whoever picks up S5a's own eligibility gate): relaxing
   `whereEligibleForPreDPUnnest` to per-sublink granularity would upgrade

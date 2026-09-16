@@ -912,3 +912,168 @@ multi-table-EXISTS-body TPC-DS witness — `query10`/`query35`'s class,
 per M0142-0008c's own census — before writing any DP-search code), rather
 than attempting the descend-loop extension directly. Filed as
 **M0142-0008a-3i-recon2** in `fix_plan.md`.
+
+## 12. M0142-0008a-3i-recon2 — the named witness was wrong, and the real blast
+radius is far smaller than either §11 option (2026-09-16)
+
+**No production code changed. Design-only, per the task's own filing.**
+
+### 12.1 `query10`/`query35` are the WRONG witness — they carry no Semi/Anti
+join at all
+
+§11's own closing recommendation named `query10`/`query35` as "a real
+multi-table-EXISTS-body TPC-DS witness," attributing the class to
+M0142-0008c's census. Reading that census
+(`tmp/m0142-0008a-census/{pg,goopg}_explains.txt`, captured 2026-09-16, still
+on disk) shows this is backwards: PG's **actual chosen plan** for both Q10 and
+Q35 has **zero** Semi/Anti join nodes anywhere in the tree. PG reaches both
+via `create_unique_path` instead — `HashAggregate` dedupes
+`store_sales.ss_customer_sk`, then a plain `Nested Loop` probes
+`customer_pkey` by that unique set, with the two OR'd EXISTS arms folded into
+`hashed SubPlan` filters on the index probe. That is exactly M0142-0008c's
+own subject (`create_unique_path`), not -3(i)'s (RHS-as-DP-search-participant
+inside a pinned Semi/Anti join). Sizing -3(i)'s options against Q10/Q35 would
+size the wrong mechanism — no amount of RHS-participant work converges goopg
+onto PG's Q10/Q35 shape, because PG's shape for these two queries never goes
+through a Semi/Anti join to begin with. (goopg's own current Q10/Q35 plans
+DO use `Hash Semi Join` — confirming goopg failed to consider PG's
+`create_unique_path` alternative, which is precisely 0008c's open question,
+not a costing gap inside the semi-join path.)
+
+**Corrected witness: Q69** (same five-query census) is the real
+multi-table-EXISTS-body class -3(i) targets, and it is a richer witness than
+originally hoped — it exercises the mechanism **three times in one query**.
+PG's chosen plan has a `Parallel Hash Semi Join` (against `store_sales ⋈
+date_dim`, filtered by `d_year`/`d_moy`) feeding two stacked `Nested Loop
+Anti Join`s (against `web_sales ⋈ date_dim` and `catalog_sales ⋈ date_dim`
+respectively) — every one of the three RHS bodies is a genuine 2-relation
+join, the "channel comparison" idiom §3.4 already named as the costliest
+hole. goopg's own Q69 plan already independently arrives at the matching
+`Hash Semi Join` / `Hash Anti Join` shape with the same 2-table RHS bodies —
+so, unlike Q10/Q35, the join-node *kind* already matches PG's; what's
+untested is whether the RHS's cost/cardinality is being priced as a real
+participant or is an artifact of the existing (pre-`existsUnnestSJInfo`)
+plumbing. Q16 and Q94 also show genuine `Semi`/`Anti Join` nodes in PG's
+chosen plan and are secondary witnesses of the same class. **Any future
+-3(i) work should scope and verify against Q69, not Q10/Q35**; -0008c should
+keep Q10/Q35.
+
+### 12.2 Re-sizing option 1 against Q69: three of the four named call sites
+already handle an opaque leaf generically — only one needs a new line
+
+§11 sized option 1 (a new opaque-participant wrapper node) as expensive
+because it assumed `baseSeqScanCostInputs`, `createPlan`'s leaf-lowering arm,
+and `explain_names.go`'s `bySrc` walk would each need a new per-Node-kind
+case. Reading those functions (not just grepping for `CTEScan`, which
+undersells it — the reach is broader and mostly already generic) refutes
+most of that:
+
+- **`extractSearchLeaves`'s type test** (`joinsearchseam.go:1070`) already
+  stops at ANY node that is not `*Join{Cross,Inner,Left,Right}` — this was
+  already known from §11, restated here as the one confirmed real gate.
+- **`baseSeqScanCostInputs`** (`joinsearch.go:479`) already has a universal
+  fallback: `if _, ok := leafBaseScan(leaf).(*SeqScan); !ok { return
+  estScanPages(fallbackRows, fallbackWidth), fallbackRows, 0 }`. Its own
+  doc comment says this explicitly: "a subquery or CTE leaf has no
+  `baserel->tuples` to speak of" — ANY non-`*SeqScan` leaf, of ANY concrete
+  Node kind, already gets a correct fallback with **zero new code**.
+- **`createPlan`'s leaf-lowering arm** is `PathPrebuilt` (`path.go:49-55`,
+  `createplan.go:13-59`): "wraps an already-constructed executor Node…
+  createPlan on a PathPrebuilt returns the wrapped node unchanged" —
+  confirmed by `createplan_test.go`'s own assertion text
+  ("createPlan(PathPrebuilt) must return the wrapped node unchanged"). This
+  is generic over ANY Node kind already — **zero new code**. It is also
+  exactly the mechanism EVERY existing search leaf already goes through
+  (`joinsearch.go:434`, `newPrebuiltPath(rel, leaf)`), not something specific
+  to base tables.
+- **`EstimateRows`/`cardinality.go`** is the one REAL gap: its switch
+  (`cardinality.go:43-137`) has no `default:` arm and falls through to
+  `return 0` for an unhandled concrete Node kind. BUT for Q69's specific
+  case, `x.Right`'s top node is literally `*Join{Type:Inner}` (per §11's own
+  finding), and `EstimateRows` already has `case *Join: return
+  estimateJoin(x)` — the full real join-cardinality estimator. **No new
+  case is needed for Q69's witness at all**; it would only be needed if some
+  OTHER query's EXISTS body's top node were a kind `EstimateRows` doesn't
+  already list (e.g. a bare `*Aggregate` or `*SetOp` top — both of which
+  are, in fact, already-handled cases too).
+- **`explain_names.go`'s `bySrc` walk** was not fully re-verified this loop
+  (out of scope for a design-only pass) but is the one place M0142-0008d/e's
+  precedent applies directly: a labeling mismatch here is display-only, not
+  a row-count/plan-shape defect, and can be deferred the same way -0008d was
+  before -0008e fixed it.
+
+**Net finding: for Q69's witness, THREE of the four named call sites need
+zero new code, and the fourth needs zero new code too** (because the
+concrete Node kind already has a case) — the false general fear in §11 was
+treating "some Node kind switch might not have a case" as if it always
+applies, when in this concrete instance it doesn't.
+
+### 12.3 The real, narrower gap — and reusing `CTEScan` is a trap, not a
+shortcut
+
+If cost/cardinality/createPlan already work generically for an arbitrary
+wrapped subtree, the ONLY thing missing is a signal `extractSearchLeaves`'s
+type test can key on to stop at `x.Right` even though its top node is
+`*Join{Inner}` (which the test would otherwise wrongly recurse into).
+
+The obvious shortcut — reuse the existing `CTEScan` wrapper (`plan.go:1659`,
+already a generic "wrap an already-planned subtree as one opaque leaf," and
+already handled by name in `cardinality.go`, `joinsearch.go:514`, and
+`narrowcostinputs.go:122`'s "already-planned sub-problem subtree" fallback
+class) — **is a trap, not a free ride**: `cteScanOp`
+(`internal/executor/operators_cte_dml.go:306`) is not a transparent
+passthrough. Its materializing mode buffers ALL rows on first `Open()` and
+replays them from `ctx.CTERowCache` keyed by `DeclKey()` (bare `Name` when
+built outside `preplanWithClause`) on every subsequent `Open()` in the same
+statement. Q69 needs **three** independent RHS wraps (the Semi Join's and
+both Anti Joins'); reusing bare `*CTEScan{Name: "", cte: nil}` for all three
+would either collide on the same cache key (wrong: the second and third
+would replay the first's rows) or require inventing a disambiguating unique
+name per call site anyway — at which point it is no longer "free reuse," it
+is carrying CTE-only caching semantics a plain join input was never meant to
+have, for no benefit.
+
+**A plain no-op `*Filter{Predicate: nil, Child: x.Right}` wrapper looks like
+the cheaper correct answer, unverified this loop:**
+`extractSearchLeaves`'s `isJoin` test is false for `*Filter` (stops
+immediately, no recursion into `x.Right`); `leafBaseScan`
+(`joinsearch.go:539`) unwraps `*Filter` chains down to the real leaf for
+classification, so `initialRelRows`'s `default:` branch still correctly
+calls `EstimateRows(leaf)` (the Filter-wrapped node, NOT the unwrapped one —
+`EstimateRows`'s own `*Filter` case recurses into `Child` and applies
+`filterSelectivity`, which returns `1.0` for a nil `Predicate`, i.e. an exact
+pass-through); `*Filter` is already fully generic in `createPlan`, the
+executor `Build` switch, and (unlike a purpose-built new type) in
+`explain_names.go` too, since real `Filter` nodes are the single most common
+node kind in the tree already. This has **not been confirmed with a live
+instrumented run** — it is a static-read conclusion from the four functions
+above, not a tested one, and the remaining, still-open problem from §11
+(`reresolveJoinByName`'s post-search splice assuming the pinned spine's shape
+survives search unchanged) is completely orthogonal to which leaf-wrapper
+choice is made and must still be solved separately.
+
+### 12.4 What plumbing is still real, regardless of wrapper choice
+
+Neither §12.2 nor §12.3 makes registering `x.Right` as a new search
+participant free — `runJoinSearchBelowPinned` (or its caller) still needs to:
+(a) build a `RelOptInfo`/`baseRelInfo` entry for the wrapped leaf and append
+it to `bindings`/`relInfos` before the call into `tryJoinSearch`, (b) extend
+`ctx.joinInfoList`/`SJInfo` bookkeeping so the search's own join-legality
+checks (§2) see the Semi/Anti restriction against the new bit correctly, and
+(c) resolve the post-search splice (§11's still-open `reresolveJoinByName`
+problem, unaffected by anything in §12.2/12.3). None of that is new relative
+to §11 — what changed is which of the FOUR downstream call sites §11 worried
+about are actually load-bearing (one, not four) and which existing node type
+is safe to reuse as the leaf wrapper (plain `*Filter`, not `*CTEScan`).
+
+**Concrete next step** (unfiled as a numbered task pending a decision on
+priority — this recon leaves -3(i) still not started): build a small,
+throwaway instrumented probe against the Q69 witness (mirrors the style of
+§5's -3(iii) trace-through) that (1) confirms `x.Right`'s top node really is
+`*Join{Inner}` for all three of Q69's EXISTS bodies, (2) confirms wrapping it
+in a bare `*Filter{Predicate:nil}` and splicing it into `origChain` as one
+more leaf produces the SAME row/cost estimate `EstimateRows`/
+`baseSeqScanCostInputs` already compute for it today (i.e., the wrapper is
+provably a no-op for cost/cardinality, only changing what
+`extractSearchLeaves` does with it), before writing any real DP-search
+plumbing for (a)/(b)/(c) above.
