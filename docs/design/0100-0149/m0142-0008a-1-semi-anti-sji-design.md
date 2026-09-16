@@ -6118,3 +6118,127 @@ reverted after live-testing disproved it (`git diff --stat --
 internal/optimizer/ internal/executor/` empty, confirmed). Private
 binary/data/logs (`tmp/goopg-c13-bin`, `tmp/c13-sf025-data`,
 `tmp/c13-server.log`, `tmp/c13-q69-*`) removed before this write-up.
+
+## 49. c14 landed — root cause was a mirroring gap between `chainCarriesLateral`
+and `extractSearchLeaves`, and it explains BOTH of §48's defects with ONE fix
+(2026-09-17)
+
+### 49.1 Method
+
+Read, not traced first: `buildInitialRels` (`joinsearch.go:367-443`) showed
+`newPrebuiltPath`'s only non-test call site relevant here builds `p :=
+newPrebuiltPath(rel, leaf)` straight from `scans[i]`, populated one relation
+at a time by `extractSearchLeaves` (§48.5's own finding). Reading
+`extractSearchLeaves` itself (`joinsearchseam.go:1242-1504`) rather than
+re-instrumenting it found the mechanism directly: its Semi/Anti arm (the
+`admitSemiAnti` branch landed by b1/b2) calls `walk(j.Left, preserved)` —
+i.e. it DOES decompose a Semi/Anti join's `Left` subtree looking for further
+reorderable structure, while `j.Right` is always appended as ONE opaque
+leaf, never decomposed. `predp.go`'s Phase A/Phase B split
+(`runJoinSearchBelowPinned`, §46.1 already named this file) runs Phase A's
+own `tryJoinSearch` call (line 148) on the subtree BELOW the whole pinned
+Semi/Anti spine — `origChain`, `{customer, customer_address,
+customer_demographics}` for Q69 — splices its winning, ALREADY-`createPlan`'d
+tree back into the spine's innermost `Left` (`put(newTarget)`, line 157),
+and only THEN does Phase B (`tryPGShapedJoinSearch(spineJoins[0], ...)`,
+line 179) walk the WHOLE spine — including straight through Phase A's
+now-materialized result, sitting at the bottom of the spine's `Left` chain.
+
+`createNestLoopIndexJoinPlan` (`createplannl.go:208-375`, the constructor
+§48.3 already traced) returns its decomposed-lateral shape as a plain
+`j := &Join{Type: jtNLI, Lateral: true, Right: is, ...}` — an ordinary
+`*Join` struct with NO marker distinguishing "already planned by createPlan"
+from "still-raw AST awaiting a search". `jtNLI` is an ordinary
+`JoinTypeInner` for Q69's shape, so when Phase B's `extractSearchLeaves`
+walk reaches this node it is indistinguishable, by the `isJoin &&
+j.Type ∈ {Cross,Inner,Left,Right}` gate, from any other reorderable inner
+join — it gets DECOMPOSED, `walk(j.Left, ...)` and `walk(j.Right, ...)` run
+independently, and `j.Right` (== `is`, the outer-parameterized `*IndexScan`
+built moments earlier by Phase A) is appended to `scans[]` as its OWN plain
+leaf — exactly the corrupted `PathPrebuilt` §48.3 pinned by pointer
+identity. `j.Left` (`customer` alone, or `customer` already merged with
+`customer_address` depending on Phase A's own winning shape) becomes a
+SEPARATE leaf too — which is §48.3's second defect: `customer_demographics`
+ends up split away from `customer`/`customer_address` because THIS is the
+walk step that splits them, decomposing a join Phase A had already legally
+and correctly decided.
+
+The guard that should have caught this and declined the whole Phase B
+search — `chainCarriesLateral` (`joinsearchseam.go`, checked at
+`tryPGShapedJoinSearch` line 328, right after `extractSearchLeaves` runs) —
+has its own doc comment claiming it "descends exactly the links
+`extractSearchLeaves` flattens" (C-04a/b, written when that meant Cross/
+Inner/Left/Right only). It was never extended when b1/b2 added the
+Semi/Anti `walk(j.Left, ...)` arm to `extractSearchLeaves`: for a
+`*Join{Type: Semi|Anti}` node, `chainCarriesLateral`'s type-switch falls
+through to `nodeReferencesOuter` → `planHasOuterRef` →
+`planHasEscapingOuterRef`, which asks a DIFFERENT, finer-grained question —
+"does an `OuterColumnRef` here escape UNBOUND" — and correctly answers NO
+for `is.Key`, since its `OuterColumnRef` is properly bound by its own
+immediate `Lateral: true` parent (that function's own `*Join` case tracks
+binder depth exactly for this reason). `chainCarriesLateral`'s coarse "ANY
+Lateral reachable = decline" rule — the one that actually matches what
+`extractSearchLeaves` is about to do — never got a chance to see the nested
+Lateral join at all, because nothing walked down through the Semi/Anti node
+to reach it.
+
+### 49.2 The fix
+
+One function, `chainCarriesLateral` (`joinsearchseam.go`): added a
+Semi/Anti arm that descends `j.Left` with the SAME coarse rule the
+Cross/Inner/Left/Right arm already applies, mirroring
+`extractSearchLeaves`'s own Semi/Anti walk exactly — `j.Right` is
+deliberately excluded from the new recursion because the walk it mirrors
+never decomposes `j.Right` either (it is always appended as one opaque
+leaf), so a Lateral join buried inside it is never at risk of being split
+regardless.
+
+### 49.3 Live verification — both of §48's defects, ONE fix, no other query moved
+
+Private binary + a private copy of the SF0.25 data dir (`tmp/c14-bin`,
+`tmp/c14-sf025-data`, same method as §46.1, run directly — no cgroup
+wrapper — with `GOMEMLIMIT=4GiB` set by hand). Q69, which crashed on every
+prior c9-c13 loop's HEAD, now runs clean (100 rows, no panic). `EXPLAIN`
+shows the corrected shape: `customer` hash-joined to `customer_address`,
+THEN nested-loop-indexed into `customer_demographics` via `Index Scan using
+customer_demographics_pkey ... Index Cond: (cd_demo_sk =
+c.c_current_cdemo_sk)` — i.e. `customer_demographics` is back where its own
+correlation predicate requires it, resolving §48.5's open question (whether
+the Lateral-loss crash and the illegal `{customer_demographics} × {one
+EXISTS leaf}` pairing were one root cause or two): they were ONE. Fixing
+the mirroring gap fixed both, because both were downstream of the SAME
+decomposition step.
+
+`go build ./...` clean. `go test ./internal/optimizer/...` and
+`./internal/executor/...` both PASS (the latter is the sibling-path check —
+`chainCarriesLateral` has no executor-side twin, but the practice card's
+gate list names it explicitly). Two new direct unit tests pin the fix
+(`chaincarrieslateral_test.go`):
+`TestChainCarriesLateralDescendsSemiAntiLeft` (a Lateral join under a
+Semi/Anti's `Left` must be found, both `JoinTypeSemi` and `JoinTypeAnti`)
+and `TestChainCarriesLateralAdmitsNonLateralUnderSemiAnti` (a non-lateral
+chain under a Semi join's `Left` must NOT be declined — guards against an
+over-broad fix that declines every Semi/Anti-rooted search). A full
+`scripts/tpcds-sf025-regression.sh sweep` with `GOOPG_BIN=tmp/c14-bin`:
+`PASS=96 MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0 SKIP=3` (the 3 skips are
+the pre-existing dsqgen-artifact exclusions, Q36/Q70/Q86), and the
+plan-shape channel reports `queries=99 same=99 changed=0` against the prior
+commit — i.e. Q69 went from crash to PASS and NO other query's plan moved.
+Private binary/data/log (`tmp/c14-bin`, `tmp/c14-sf025-data`,
+`tmp/c14-server.log`) removed after verification.
+
+### 49.4 What's still open
+
+`predp.go:159-176`'s Phase B doc comment (carried pending since c11, "`used`
+is therefore false on every production call today") was NOT touched this
+loop — it is orthogonal to this fix and, if anything, this fix likely makes
+Phase B decline MORE often (any spine whose `Left` contains an NLI-index
+probe now correctly triggers the `lateral` decline), so the claim needs
+re-verification rather than a same-direction edit; left for a future loop
+to re-check rather than guessed at here. c9's `joinIsLegal` legality-check
+question from §48.6 (whether a zero-predicate pairing needed its own fix in
+that function) turned out to be moot for Q69 specifically — the pairing
+never reaches `joinIsLegal` after this fix, because the Lateral join is no
+longer decomposed into separate leaves in the first place — but a
+DIFFERENT query that legitimately reaches `joinIsLegal` with a genuine
+zero-predicate pair is not ruled out by this loop and was not probed.

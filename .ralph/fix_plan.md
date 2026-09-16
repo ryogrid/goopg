@@ -4602,7 +4602,7 @@ cross-layer programme that has never been scoped.
   Still pending (carried from c11/c12/c13, not yet actioned): fix
   `predp.go:159-176`'s Phase B doc comment (stale/misleading "`used` is
   therefore false on every production call today" claim).**
-- [ ] **M0142-0008a-3i-plumbing-c14 — find WHO captures Q69's
+- [x] **M0142-0008a-3i-plumbing-c14 — find WHO captures Q69's
   outer-parameterized `customer_demographics` `*IndexScan` (built by
   `createNestLoopIndexJoinPlan`) into a PLAIN, per-relation leaf slot
   reused by an unrelated join pairing** (design doc §48.5-48.6, filed by
@@ -4638,6 +4638,54 @@ cross-layer programme that has never been scoped.
   c11-c13, not yet actioned): fix `predp.go:159-176`'s Phase B doc
   comment (stale/misleading "`used` is therefore false on every
   production call today" claim).
+
+  **LANDED (this loop, design doc §49): root cause was a mirroring gap
+  between `chainCarriesLateral` and `extractSearchLeaves`, and it explains
+  BOTH of c13's defects (the Lateral-loss crash AND the illegal
+  `{customer_demographics} x {one EXISTS leaf}` pairing) with ONE fix —
+  they were never two independent bugs.** `extractSearchLeaves`'s Semi/Anti
+  arm (landed by b1/b2) descends a Semi/Anti join's `Left` looking for
+  further reorderable structure; `predp.go`'s Phase A search (run on the
+  subtree BELOW the pinned Semi/Anti spine, BEFORE Phase B walks the whole
+  spine) splices its own already-`createPlan`'d winning tree into that
+  `Left` — for Q69 this includes the correctly-built `*Join{Type:Inner,
+  Lateral:true, Right: is}` `createNestLoopIndexJoinPlan` builds, an
+  ordinary `*Join` struct with no marker distinguishing "already planned"
+  from "still-raw AST". Phase B's `extractSearchLeaves` walk cannot tell
+  the difference either and DECOMPOSES this already-decided Lateral join
+  back into two independent leaves — `is` (the outer-parameterized
+  `*IndexScan`) becomes its own plain `PathPrebuilt` leaf (c13's crash),
+  and `customer`/`customer_address` become a separate leaf, orphaned from
+  `customer_demographics` (c13's illegal pairing). The guard meant to catch
+  this, `chainCarriesLateral`, was never extended when b1/b2 added
+  `extractSearchLeaves`'s Semi/Anti descent: for a `*Join{Type:Semi|Anti}`
+  it fell through to `nodeReferencesOuter`'s finer-grained "does an
+  `OuterColumnRef` escape UNBOUND" check (answers NO — `is.Key` IS
+  correctly bound by its own immediate Lateral parent) instead of this
+  function's own coarser "any Lateral reachable = decline" rule that
+  actually matches what `extractSearchLeaves` is about to do. **Fix**: one
+  new arm in `chainCarriesLateral` (`joinsearchseam.go`) descending a
+  Semi/Anti join's `Left` with the same coarse rule, mirroring
+  `extractSearchLeaves`'s own walk exactly (`Right` excluded — the mirrored
+  walk never decomposes it either, so nothing inside it is ever at risk).
+  **Live-verified**, private binary + private SF0.25 data copy (same
+  method as c9-c13, `tmp/c14-bin`/`tmp/c14-sf025-data`, both removed after):
+  Q69 (crashed on every c9-c13 HEAD) now runs clean, 100 rows, and
+  `EXPLAIN` shows the corrected shape — `customer_demographics` joined back
+  to `customer`/`customer_address` via `Index Scan using
+  customer_demographics_pkey ... Index Cond: (cd_demo_sk =
+  c.c_current_cdemo_sk)`. Gates: `go build ./...` clean; `go test
+  ./internal/optimizer/...` and `./internal/executor/...` both PASS; two
+  new direct unit tests (`chaincarrieslateral_test.go`) pin the fix and its
+  non-overreach (a non-lateral chain under a Semi join's `Left` must NOT be
+  declined); full `scripts/tpcds-sf025-regression.sh sweep` with a private
+  `GOOPG_BIN`: `PASS=96 MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0 SKIP=3`,
+  `PLAN-SHAPE: same=99 changed=0` — only Q69 moved (crash→pass), no other
+  query's plan shifted. `predp.go:159-176`'s stale Phase B doc comment
+  (carried from c11-c13) is STILL not actioned — this fix likely makes
+  Phase B decline MORE often, not less, so the claim needs re-verification
+  rather than a same-direction edit; left for a future loop. Design doc
+  §49.
 - [x] **M0142-0008c — scoping recon: does goopg need PG's `create_unique_path`
   (semi-join → de-duplicate RHS + inner join) to reach parity on TPC-DS
   Q10/Q35?** — filed by M0142-0008a-3(iii)'s §4.3 gate re-run (design doc §6).

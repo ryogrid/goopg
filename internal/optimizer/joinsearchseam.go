@@ -1910,6 +1910,29 @@ func chainCarriesLateral(n Node) bool {
 	if j, ok := n.(*Join); ok && (j.Type == JoinTypeCross || j.Type == JoinTypeInner || j.Type == JoinTypeLeft || j.Type == JoinTypeRight) {
 		return j.Lateral || chainCarriesLateral(j.Left) || chainCarriesLateral(j.Right)
 	}
+	// M0142-0008a-3i-plumbing-c14 (design doc §48/§49): `extractSearchLeaves`
+	// (with `admitSemiAnti` now unconditionally true in production, b2 step
+	// (iii)) ALSO descends into a Semi/Anti join's `Left` — its own semiAnti
+	// arm's `walk(j.Left, preserved)` — while its `Right` stays one opaque,
+	// never-decomposed leaf regardless of what it contains. Before this fix
+	// this function had no matching arm: a Semi/Anti join fell straight to
+	// the `nodeReferencesOuter` fallback below, which asks a DIFFERENT
+	// question ("does an OuterColumnRef here escape unbound") rather than
+	// this function's own coarse "is a Lateral join reachable here at all" —
+	// a Lateral join nested inside a Semi/Anti's `Left` (the exact shape a
+	// pre-DP-unnest join-order search, predp.go's Phase A, splices in when
+	// its own winning tree contains a parameterized index probe) has its
+	// `OuterColumnRef` correctly bound by its own immediate parent, so it
+	// never reads as "escaping" — the decline never fired, and
+	// `extractSearchLeaves` went on to flatten the Lateral join's `Left`/
+	// `Right` into two independent leaves, corrupting the outer-parameterized
+	// probe into a plain per-relation leaf (§48's live-traced crash). `Right`
+	// is excluded from this recursion because it mirrors the walk exactly:
+	// the walk never decomposes it, so a Lateral join buried inside it is
+	// never at risk of being split.
+	if j, ok := n.(*Join); ok && (j.Type == JoinTypeSemi || j.Type == JoinTypeAnti) {
+		return chainCarriesLateral(j.Left)
+	}
 	return nodeReferencesOuter(n)
 }
 
