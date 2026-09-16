@@ -7004,3 +7004,118 @@ Separately, still open and untouched since c19: Q10/Q16/Q35/Q69/Q94 (the
 EXISTS/IN family) show ZERO semiAnti trace of any kind corpus-wide — a
 different, still-unfiled gap (their Semi/Anti joins may never reach the
 search's admission arm at all, unrelated to Q78's now-resolved rebase bug).
+
+## 57. c21 — the "ZERO semiAnti trace" open question from c18/c19 is CLOSED: it was a mis-attribution, not a gap; Q10/Q16/Q35/Q69/Q94 all reach correct Semi/Anti joins already
+
+c20's resume point handed c21 exactly one instruction: instrument
+`whereEligibleForPreDPUnnest` (predp.go:35) for Q10/Q16/Q35/Q69/Q94 "before
+assuming any further DP-search-layer fix could matter for that family at
+all" — because c18/c19 had found these five queries show zero
+`jointype=semi`/`anti` **DPPATH** lines in a `GOOPG_PGSHAPED_DP_TRACE=1`
+capture and left open whether the WHERE-clause eligibility gate silently
+declined them.
+
+**Read `whereEligibleForPreDPUnnest` first, before tracing anything.** Its
+body (predp.go:35-44) is a `walkExprTree` that only flips `eligible=false`
+for `*SubqueryExpr`, `*ArraySubqueryExpr`, `*MultiAssignSubqRow` — the
+three scalar-sublink types. It has no `case` for `*ExistsExpr` or
+`*InExpr` at all. All five queries' WHERE clauses are pure EXISTS/NOT
+EXISTS combinations (verified by reading
+`bench/tpcds/runtime_goopg/tpcds-data/queries/query{10,16,35,69,94}.sql`
+directly) — no scalar sublink appears anywhere in any of them. So by
+inspection alone, this gate returns `true` (eligible) for all five, and
+cannot be their blocker.
+
+**Verified live, not just by inspection.** Temporary env-gated
+(`GOOPG_C21DEBUG=1`) `fmt.Fprintf(os.Stderr, ...)` calls were added at
+three points — the `whereEligibleForPreDPUnnest` call site
+(planner.go:1524), `canUnnestExistsExpr`'s four bail arms (unnest.go:4086),
+and `unnestExistsExpr`'s `topConjunct == nil` bail (unnest.go:4591, the
+"EXISTS buried in a non-conjunct context (OR)" arm) — then run against a
+disposable schema-only cluster (`/tmp/c21data`, port 5534,
+`GOOPG_CG_UNIT=goopg-c21-test`; loaded only the 11 relevant tables' DDL
+from `third-party/tpcds-postgres/.../tools/tpcds.sql`, zero rows, so the
+result is pure planning-structure signal with no cost-model noise) via
+`EXPLAIN` on all five queries. Result: **every one of the 10 (5 queries ×
+2 checkpoints) `whereEligibleForPreDPUnnest` trace lines read `true`** —
+the gate never declines any of these statements. The only bail seen at
+all was `topConjunct=nil (EXISTS buried in OR/non-conjunct)`, exactly
+twice — once for Q10, once for Q35, both correctly attributable to their
+`(EXISTS(web_sales…) OR EXISTS(catalog_sales…))` clause (see below); Q16,
+Q69, Q94 produced zero bails of any kind (their EXISTS/NOT EXISTS clauses
+are pure top-level AND conjuncts, all liftable). All instrumentation was
+reverted (`git checkout -- internal/optimizer/unnest.go
+internal/optimizer/planner.go`) before this doc update; `go build
+./internal/optimizer/...` clean afterward. The scratch cluster, binary,
+and logs (`/tmp/c21data`, `/tmp/c21-*.log`, `tmp/goopg-c21-bin`) were fully
+removed; `goopg-c21-test.scope` confirmed not loaded (already exited with
+the server stop).
+
+**The EXPLAIN output itself settles the question — every one of the five
+already has a Semi/Anti join in its plan**, on both the schema-only
+cluster above and (independently) the real SF0.25-data census already on
+disk from an earlier loop (`tmp/m0142-0008a-census/goopg_explains.txt`,
+predates this task):
+
+| query | schema-only plan (this task) | SF0.25 real-data census (pre-existing artifact) |
+|---|---|---|
+| Q10 | `Hash Semi Join` on store_sales, `Filter: (c_customer_sk = ANY (SubPlan 1)) OR (... SubPlan 2)` | `Hash Semi Join` (line 35) |
+| Q16 | `Hash Anti Join` over `Hash Semi Join` | `Hash Anti Join` + `Hash Semi Join` (lines 80/82) |
+| Q35 | `Hash Semi Join` on store_sales, same OR-SubPlan filter shape as Q10 | `Hash Semi Join` (line 9 of its block) |
+| Q69 | `Hash Anti Join` over `Hash Anti Join` over `Hash Semi Join` (3 EXISTS/NOT EXISTS → 3 joins) | `Hash Anti Join` × 2 + `Hash Semi Join` (lines 54/56/58) |
+| Q94 | `Hash Anti Join` over `Hash Semi Join` | `Hash Anti Join` + `Hash Semi Join` (lines 100/102) |
+
+Q10 and Q35 correctly leave their `OR`-combined pair of EXISTS clauses as
+two `SubPlan`s riding on a `Filter` above the pinned Semi Join for their
+first (AND-conjunct) EXISTS — exactly what
+`unnestExistsExpr`'s `topConjunct == nil` bail is *for*: an EXISTS inside
+an OR branch cannot become a join without changing the WHERE clause's
+semantics (a semi/anti join only ever narrows the *outer* side; it cannot
+express "OR this other condition instead"), so PostgreSQL's own
+`pull_up_sublinks` has the identical restriction (only lifts sublinks that
+are themselves, or are ANDed into, a top-level qual — see
+`postgres/src/backend/optimizer/prep/prepjointree.c`'s
+`pull_up_sublinks_qual_recurse`, which only descends through `AND_EXPR`
+and never `OR_EXPR`). Q16/Q69/Q94's EXISTS/NOT EXISTS clauses are pure AND
+conjunctions, so every one of them lifts.
+
+**Root cause of the false "zero trace" reading (c18/c19's actual mistake):
+a measurement/interpretation gap, not an engine gap.** c18's "0 DPPATH
+lines" measurement counted `jointype=semi`/`anti` lines from
+`GOOPG_PGSHAPED_DP_TRACE=1`'s **DP-enumeration** trace
+(`joinsearchtrace.go`, fired only from inside `tryPGShapedJoinSearch`'s own
+`makeJoinRel` loop). But S5a's whole design (predp.go's file-header
+comment, `runJoinSearchBelowPinned`'s doc comment) is that an EXISTS/IN
+family statement's Semi/Anti join is built and **pinned** by
+`unnestSubqueriesInPlan`/`unnestExistsExpr` *before* the DP search ever
+runs, and the DP search subsequently runs only on the subtree strictly
+*below* that pinned spine (`runJoinSearchBelowPinned`, planner.go:1535).
+A pinned semi/anti join is therefore **never a DP-search candidate** for
+any of these five queries — it is not offered to `makeJoinRel`, so it
+generates zero DPPATH trace lines *by design*, exactly as it would for
+every other EXISTS/IN query in the corpus that unnests cleanly. "Zero
+DPPATH trace" was silently read as "the Semi/Anti join never happens",
+when the correct reading is "this family's Semi/Anti joins are built by a
+different, earlier, non-DP-search mechanism that this trace channel was
+never wired to observe" — a blind spot in the trace channel's *coverage*,
+not a blind spot in the *engine*. Q78 (c18's one query that DID show
+semiAnti-related trace) is the outlier for exactly the reason its own
+mechanism is different: `reduce_outer_joins.go`'s LEFT-JOIN→ANTI-JOIN
+strength reduction builds its ANTI join as an ordinary joinlist member
+that DOES reach the DP search's own admission arm as a link (which is
+what c18-c20's whole investigation thread correctly chased) — it was
+never representative of the EXISTS/IN family's own (working, pinned-spine)
+path.
+
+**Disposition: no code change.** `whereEligibleForPreDPUnnest` and the
+`unnestExistsExpr`/`canUnnestExistsExpr` pipeline are confirmed correct
+for this family on both a schema-only cluster and the pre-existing
+SF0.25-data census; both agree. The "still-unfiled, materially larger
+question" that c18/c19/c20 each carried forward is closed as **answered:
+there is no gap** — it was a stale reading of a trace channel that was
+never meant to (and cannot, by design) observe the pre-DP pinned-spine
+path. No deferral-ledger row: nothing was left unimplemented, deferred, or
+short-cut — the recon's conclusion is that the prior "0/96" framing itself
+was the defect, now corrected, and the family already has full parity on
+this axis. Nothing else in the M0142-0008a-3i-plumbing chain currently
+depends on this question, so there is no follow-on resume point.

@@ -5084,6 +5084,52 @@ cross-layer programme that has never been scoped.
   Q10/Q16/Q35/Q69/Q94 (the EXISTS/IN family) show ZERO semiAnti trace of
   any kind corpus-wide — their Semi/Anti joins may never reach the search's
   admission arm at all, a different gap than Q78's.
+- [x] **M0142-0008a-3i-plumbing-c21 — closed c18/c19's "ZERO semiAnti
+  trace" open question: mis-attribution, not a gap. Q10/Q16/Q35/Q69/Q94 all
+  already reach correct Semi/Anti joins** (design doc §57). **DONE
+  2026-09-17, no production change.** Per c20's resume point, instrumented
+  `whereEligibleForPreDPUnnest` (predp.go:35) live (temporary
+  `GOOPG_C21DEBUG=1` stderr prints at the gate's call site plus
+  `canUnnestExistsExpr`'s 4 bail arms and `unnestExistsExpr`'s
+  `topConjunct==nil` bail; reverted before commit) against a disposable
+  schema-only cluster (`/tmp/c21data` port 5534, 11-table DDL from
+  `third-party/tpcds-postgres/.../tools/tpcds.sql`, zero rows). Result: the
+  gate returns `true` (eligible) for all 5 queries at every call — reading
+  its body first would have shown why: it only checks for
+  `*SubqueryExpr`/`*ArraySubqueryExpr`/`*MultiAssignSubqRow` (scalar
+  sublinks), and none of these 5 queries' WHERE clauses contain any scalar
+  sublink at all (verified by reading the query files directly). The only
+  bail seen was the correct, expected `topConjunct=nil` (EXISTS inside an
+  OR) for Q10 and Q35's `(EXISTS(web_sales) OR EXISTS(catalog_sales))`
+  clause — exactly matching PG's own `pull_up_sublinks_qual_recurse`
+  restriction (only descends AND, never OR). EXPLAIN on all 5 confirmed
+  every one already builds the right Semi/Anti joins (Q10/Q35: 1 Hash Semi
+  Join + 2 correctly-retained SubPlans for the OR pair; Q16/Q94: Hash Anti
+  Join over Hash Semi Join; Q69: 2 Hash Anti Joins over 1 Hash Semi Join,
+  all 3 of its EXISTS/NOT EXISTS lifted) — independently reconfirmed
+  against the pre-existing real-SF0.25-data census
+  (`tmp/m0142-0008a-census/goopg_explains.txt`, predates this task; same
+  Semi/Anti shapes present there too). **Root cause of c18's false
+  reading**: its "0 DPPATH lines" measurement counted
+  `GOOPG_PGSHAPED_DP_TRACE=1`'s DP-**enumeration** trace
+  (`joinsearchtrace.go`, fires only inside `tryPGShapedJoinSearch`'s own
+  `makeJoinRel`), but S5a's design pins this family's Semi/Anti joins
+  BEFORE the DP search runs and the DP search subsequently runs only on
+  the subtree below that pinned spine (`runJoinSearchBelowPinned`,
+  planner.go:1535) — a pinned join is never a DP-search candidate, so it
+  is structurally impossible for it to emit a DPPATH line, regardless of
+  whether it built correctly. "Zero DPPATH trace" was misread as "the join
+  never happens" when the correct reading is "this trace channel was never
+  wired to observe the pre-DP pinned-spine path" — a trace-coverage blind
+  spot, not an engine gap. Disposition: no code change; the family already
+  has full parity on this axis. No deferral-ledger row (nothing left
+  unimplemented — the recon's conclusion is that the prior "0/96" framing
+  was itself the defect). All instrumentation reverted (`git checkout --
+  internal/optimizer/unnest.go internal/optimizer/planner.go`,
+  confirmed via `git diff --stat` showing empty); `go build
+  ./internal/optimizer/...` clean after revert. Scratch cluster/binary/logs
+  (`/tmp/c21data`, `/tmp/c21-*.log`, `tmp/goopg-c21-bin`) fully removed;
+  `goopg-c21-test.scope` confirmed not loaded.
 - [x] **M0142-0008c — scoping recon: does goopg need PG's `create_unique_path`
   (semi-join → de-duplicate RHS + inner join) to reach parity on TPC-DS
   Q10/Q35?** — filed by M0142-0008a-3(iii)'s §4.3 gate re-run (design doc §6).
