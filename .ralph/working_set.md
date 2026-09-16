@@ -1,109 +1,92 @@
-Task: M0142-0008a-3i-plumbing-a — land `semiAntiChainLink` + its
-`semiAntiLinksHaveSJInfos`/`semiAntiOnQualsOK` legality consumers, plus
-`problemPairsOuterWithDerived`'s Semi/Anti firewall arm, as INERT
-infrastructure (design doc §15's settled item 2 + its new safety finding).
-DONE and committed this loop. Also ran a live call-chain trace that settles
-an open dependency question the previous three loops left unresolved — see
-"Hypothesis/Findings" below, this is the important carry-forward.
+Task: M0142-0008a-3i-plumbing-b — SCOPING PASS ONLY (design doc §22). No
+production code changed this loop; this was the "needs its own dedicated
+scoping pass before coding" deliverable §21.4 explicitly asked for.
 
-Files this loop: internal/optimizer/joinsearchseam.go (new `semiAntiChainLink`
-type + `semiAntiLinksHaveSJInfos`/`semiAntiOnQualsOK`, placed next to
-`outerChainLink`/`outerLinksHaveSJInfos`/`outerOnQualsOK`),
-internal/optimizer/relfromjoinlist.go (`problemPairsOuterWithDerived`'s
-switch gained `parser.JoinSemi, parser.JoinAnti`, one line),
-internal/optimizer/semiantichain_test.go (NEW: 9 tests — both consumers'
-accept/decline cases plus the firewall arm's Semi/Anti-over-derived and
-Anti-over-derived positive cases),
-internal/optimizer/m0142_0008a_3i_plumbing_probe_test.go (updated consumer-#3
-assertion: its nil-table fixture now correctly declines via the new arm,
-flipping from the old "want false" to "want true"),
-docs/design/0100-0149/m0142-0008a-1-semi-anti-sji-design.md (§21 added),
-docs/design/README.md (index row extended), .ralph/fix_plan.md (old
-undifferentiated `M0142-0008a-3i-plumbing` replaced by `-3i-plumbing-a` [x]
-and `-3i-plumbing-b` [ ]; `M0142-0008c-3c`/`-3d`'s "blocked on" references
-retargeted from "items 3-5" to `-3i-plumbing-b`), .ralph/deferral_ledger.md
-(`M0142-0008a-3i-plumbing-a` row appended).
+Files this loop: docs/design/0100-0149/m0142-0008a-1-semi-anti-sji-design.md
+(§22 added — both §21.4 open questions answered + a new §22.3 finding),
+docs/design/README.md (index row extended with §22 summary),
+.ralph/fix_plan.md (`-3i-plumbing-b` flipped to `[x]` scoping-only, replaced
+by two new sub-items `-3i-plumbing-b1`/`-b2`; the two `M0142-0008c-3c`/`-3d`
+"blocked on" references retargeted from `-3i-plumbing-b` to
+`-3i-plumbing-b2` specifically), .ralph/deferral_ledger.md
+(`M0142-0008a-3i-plumbing-b` row appended).
 
-Key symbols: `semiAntiChainLink`/`semiAntiLinksHaveSJInfos`/`semiAntiOnQualsOK`
-(joinsearchseam.go, right after `outerChainLink` at ~line 1284),
-`problemPairsOuterWithDerived` (relfromjoinlist.go:564, switch at :589-593),
-`extractSearchLeaves` (joinsearchseam.go:1071, STILL treats Semi/Anti as an
-opaque leaf — unchanged this loop), `origChain` capture (planner.go:1532-1536),
-`runJoinSearchBelowPinned`'s descend loop (predp.go:83-115).
+Key symbols (unchanged locations, just re-confirmed by trace):
+`origChain` (planner.go:1533, predp.go:73/87/107 — ONLY 2 use sites,
+grep-confirmed), `extractSearchLeaves`'s walk (joinsearchseam.go:1104-1191),
+`chainOnQual.belowNullable` (joinsearchseam.go:1217-1220),
+`tryPGShapedJoinSearch` (joinsearchseam.go:216-), `splitOuterSpine`
+(joinsearchseam.go:710-725, a DIFFERENT pre-existing spine mechanism for
+ORIGINAL-FROM-clause OUTER joins — NOT reusable for the EXISTS-derived
+Semi/Anti spine, confirmed by reading it), `existsUnnestSJInfo`
+(unnest.go:4397-4458, the throwaway synL=1/synR=2 numbering item 4 needs to
+replace), `unnestSubqueriesInPlan`/`unnestExistsExpr` (unnest.go:424,4461 —
+confirmed NEITHER takes a `*resolveContext`).
 
-Hypothesis/Findings (IMPORTANT — read before picking up -3i-plumbing-b or any
-more Semi/Anti-admission work): a live traced call chain (not inference) found
-that extending `extractSearchLeaves`'s type test to admit Semi/Anti (the old
-filing's "item 1") is DEAD CODE for every real query on its own, because TWO
-independent gates block a Semi/Anti node from ever reaching it: (a)
-`planner.go:1532-1536` captures `origChain := f.Child` BEFORE
-`unnestSubqueriesInPlan` runs, so `origChain` never contains a Semi/Anti node
-by construction (unnesting hasn't happened yet); (b) `predp.go:83-115`'s
-descend loop is hard-coded to walk through Semi/Anti `*Join` nodes ONLY,
-bailing (`predp.go:100`, `return newRoot`) on any OTHER `*Join` type it might
-need to pass through — it never reaches past a plain Inner/Left/Right join to
-find `origChain`'s Filter wrapper in a hypothetical Semi/Anti-bearing chain
-anyway. So items 1 (walk extension), 4 (retire predp.go's splice), and 5
-(reduceOuterJoins precedent) from the old `-3i-plumbing` filing are ONE
-coupled step that must land together, not three separable pieces — the
-numbering in §14.3/§15 implied separability that doesn't actually exist.
-What DOES separate cleanly (and is what landed this loop): the new
-`semiAntiChainLink` type + its two legality consumers + the Q78-firewall arm
-are pure, callable-but-uncalled functions — fully unit-testable and PROVEN
-empirically zero-impact (TPC-DS SF0.25 sweep, see Gates below) without
-touching the walk or predp.go at all. This is the same "dispatch-layer-first"
-shape M0142-0008c-1/-2/-3a already used successfully.
+Hypothesis/Findings (IMPORTANT — read before picking up -3i-plumbing-b1):
+1. §21.4 Q1 (does origChain's capture point need to move?) — NO. origChain
+   has exactly one use site; "move the capture post-unnest" was never the
+   right fix because origChain structurally never contains a Semi/Anti node
+   NO MATTER WHEN captured (unnesting wraps it from above, never replaces
+   it). The real content of item 1 is "feed tryJoinSearch a tree that
+   includes the spine," a predp.go-level tree-shape change, not a
+   planner.go-level timing change.
+2. §21.4 Q2 (does belowNullable need a Semi/Anti-aware arm?) — NO. A
+   Semi/Anti walk arm should recurse j.Left and return `below` UNCHANGED,
+   exactly like the existing INNER-link arm (joinsearchseam.go:1173),
+   because Semi/Anti null-extends NEITHER side. This REMOVES an item from
+   scope, doesn't add one.
+3. NEW finding, not in §21.4's original 5-item list: `ctx.bindings`/
+   `ctx.joinlist` are fixed at FROM-clause-resolution time (planner.go:3096-
+   3103, the ONLY assignment site, grep-confirmed), strictly BEFORE
+   unnestSubqueriesInPlan runs — and neither unnestSubqueriesInPlan nor
+   unnestExistsExpr take a *resolveContext at all. So a Semi/Anti RHS leaf
+   the walk would admit has NO ctx.bindings entry, and
+   tryPGShapedJoinSearch's existing leaf-count/offset checks
+   (joinsearchseam.go:309 `len(scans)!=nprefix`, :324 offset-agreement) would
+   DECLINE the search outright — silently inert, not a crash, but a real
+   6th coupled item (call it item 6) that must be solved before items 2-4
+   can ever actually fire in production. Filed as the whole of
+   -3i-plumbing-b2's scope.
 
 Next step: per banner order (M0137-M0143 group), pick up
-**M0142-0008a-3i-plumbing-b** (fix_plan.md, newly filed this loop, design doc
-§21.4) — the coupled change: (1) move/duplicate the `origChain` capture to
-after `unnestSubqueriesInPlan` runs (or otherwise route a Semi/Anti-bearing
-tree to `tryJoinSearch`); (2) extend predp.go's descend loop to pass through
-non-Semi/Anti `*Join` nodes instead of hard-bailing; (3) extend
-`extractSearchLeaves`'s type test to admit Semi/Anti and build
-`semiAntiChainLink`s via the walk (consumers already exist from this loop);
-(4) rebuild `existsUnnestSJInfo`'s throwaway 2-bit numbering with real
-`leafRangeRelSet` bits at admission time; (5) retire predp.go's
-splice-and-reresolve for the newly-admitted cases. **Explicitly NOT sized for
-one loop** (design doc §21.4) — do its own scoping pass first: what breaks in
-`origChain`'s other callers/assumptions if the capture point moves post-unnest,
-and whether `chainOnQual`'s `belowNullable` bookkeeping needs a
-Semi/Anti-aware arm for INNER links sitting above an admitted Semi/Anti link
-(§14.3's still-open question, never answered by any of the last 4 loops).
-Do NOT pick up M0142-0008c-3c/-3d before -3i-plumbing-b lands — both are
-explicitly blocked on it (no TPC-DS measurement can distinguish "correct but
-unreachable" from "wrong" while `addPathsToJoinrel` never receives a real
-SEMI/ANTI sjinfo).
+**M0142-0008a-3i-plumbing-b1** (fix_plan.md, design doc §22.4) — the INERT
+scaffold: (1) extend predp.go's descend loop (predp.go:96-101) to pass
+through non-Semi/Anti *Join nodes instead of hard-bailing; (2) extend
+extractSearchLeaves's *Join type-switch to admit Semi/Anti per §22.2's now-
+SETTLED semantics (recurse j.Left, append j.Right as ONE opaque leaf via the
+same `scans = append(scans, n)` path the existing "not an admitted type"
+branch already uses at :1111-1114, return `below` unchanged, build a
+semiAntiChainLink); (3) rebuild the matched SpecialJoinInfo's
+Syn/MinLefthand/Righthand from real leaf-index bits using
+`semiAntiLinksHaveSJInfos` (landed by -3i-plumbing-a) to find the match,
+replacing existsUnnestSJInfo's synL=1/synR=2 placeholder. MUST land gated
+behind an eligibility check that PROVABLY cannot fire in production yet
+(item 6 is not done) — same "prove inert before wiring" verification shape
+as -3i-plumbing-a/-0008c-1/-2/-3a: new unit tests on the extended walk
+directly, plus a TPC-DS SF0.25 sweep proving zero plan-shape change.
+Do NOT attempt item 6 (ctx.bindings/joinlist extension into
+unnestSubqueriesInPlan's signature) or the actual cutover in the same loop —
+that's -3i-plumbing-b2, which needs its OWN scoping pass into
+unnestSubqueriesInPlan's other internal call sites (IN-family unnesting
+etc.) first, not investigated yet.
+Do NOT pick up M0142-0008c-3c/-3d before -3i-plumbing-b2 lands (retargeted
+this loop from "-b" to "-b2" specifically) — both still blocked on a real
+Semi/Anti SJInfo reaching addPathsToJoinrel.
 
-Alternatives if -3i-plumbing-b's scoping pass is judged not worth continuing
-immediately: M0141-S2b-2 (base join/scan Pathlist-across-search-boundary
-surgery — still needs its own scoping pass). M0142-0003i/0003k remain BLOCKED
-on a human-authorized shared `:65433` cluster reload — do not attempt.
+Alternatives if -3i-plumbing-b1 is judged not worth continuing immediately:
+M0141-S2b-2 (base join/scan Pathlist-across-search-boundary surgery — still
+needs its own scoping pass). M0142-0003i/0003k remain BLOCKED on a
+human-authorized shared `:65433` cluster reload — do not attempt.
 Unrelated, NOT to be picked up under this banner unless explicitly
 re-prioritized: `internal/parser`'s `GroupedJoinUnaliased` AST-drift gap
-(pre-existing, traced to `dc91bd6b7`, ~60 failing test functions in
-`internal/parser`, reproduces identically on clean HEAD, reconfirmed AGAIN
-this loop via the pre-commit units gate — now confirmed unchanged across 4
-consecutive loops).
+(pre-existing, traced to `dc91bd6b7`, ~60 failing test functions,
+reconfirmed unchanged across 4 consecutive loops as of the prior loop — not
+re-run this loop since no code changed).
 
-Gates run: `go build ./...` (clean). `go vet ./internal/optimizer/...`
-(clean). `go test ./internal/optimizer/...` (full pass, incl. all 9 new
-`semiantichain_test.go` cases and the updated probe test, run together and
-individually with `-v`). `scripts/tpcds-sf025-regression.sh sweep` (private
-`GOOPG_BIN=tmp/goopg-sf025-bin`, foreground) — `PASS=96 MISMATCH=0
-CKMISMATCH=0 ERROR=0 TIMEOUT=0`, `PLAN-SHAPE: same=99 changed=0` — this is a
-real empirical gate result, not a formality: it specifically checks whether
-the new `problemPairsOuterWithDerived` Semi/Anti arm changed anything for
-`reduceOuterJoins`'s LEFT→ANTI demotion, the one live producer of a real
-Semi/Anti `SpecialJoinInfo` already reaching that function in production
-today — it did not. `RALPH_PRECOMMIT_SCOPE=units
-scripts/ralph-precommit-test.sh` — same single pre-existing unrelated
-`internal/parser` package failure as the prior three loops (confirmed
-identical failure set, ~60 test functions, `GroupedJoinUnaliased` AST-drift);
-everything else including `internal/optimizer` green. `make
-ralph-state-guard` — found and auto-repaired the same stale
-clean-exit-marker pattern as the prior three loops, then passed clean.
+Gates run: `go build ./...` (clean — expected, no production code touched
+this loop, doc/plan-file changes only). `make ralph-state-guard` — clean,
+no repair needed. Full test suite / TPC-DS sweep NOT re-run this loop
+(nothing that could affect them changed — docs and fix_plan/ledger only).
 
-In-flight: none. The private sf025 server used by the sweep script is
-started/stopped internally by `scripts/tpcds-sf025-regression.sh` itself (no
-manually-started server to clean up this loop).
+In-flight: none.

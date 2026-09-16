@@ -2248,3 +2248,174 @@ own dedicated scoping pass before coding (in particular: what happens to
 whether `chainOnQual`'s `belowNullable` bookkeeping needs a Semi/Anti-aware
 arm for INNER links sitting above an admitted Semi/Anti link, per §14.3's own
 open question).
+
+## 22. M0142-0008a-3i-plumbing-b scoping pass (2026-09-16) — both §21.4 open
+questions answered, PLUS a sixth coupled dependency §21.4 did not name; still
+not one loop, decomposition revised
+
+Per §21.4's own instruction ("needs its own dedicated scoping pass before
+coding"), this loop did the scoping pass only — no production code changed.
+Two things were live-traced (not inferred): the two questions §21.4 asked, and
+— because tracing the second one required reading the caller stack one level
+further out — a dependency the original 5-item filing never named.
+
+### 22.1 Question 1 answered: `origChain` has no other callers
+
+Grepped every occurrence of the identifier `origChain` in
+`internal/optimizer` (not just the two files §21 already named): it appears
+in exactly two places, both inside the same block —
+`planner.go:1533` (the capture) and `planner.go:1535` /
+`predp.go:73,87,107` (the one call site and the one function it is passed
+to). There is no third caller, no struct field, no package-level variable —
+`origChain` is a plain local `Node` alive only for the duration of one `if
+unnestPreDPEnabled() && ...` branch. **This de-risks item 1 by a lot**: there
+is no hidden assumption elsewhere in the codebase keyed off when in the
+pipeline that pointer is captured.
+
+But the more useful finding is that "move the capture in time" is not
+actually the right description of what item 1 needs, and understanding why
+matters for scoping the rest. `origChain` is captured as `f.Child` where `f`
+is the Filter directly wrapping the *pre-unnest* WHERE-processed tree, and
+`unnestSubqueriesInPlan` **wraps that same subtree from above** — it never
+replaces or moves `origChain` itself (confirmed by predp.go's own descend
+loop successfully finding `x.Child == origChain` *after* unnesting has run,
+which would be impossible if unnesting had invalidated the pointer). So
+`origChain`, however it is captured, **structurally never contains a
+Semi/Anti node** under the current EXISTS/IN-only engagement scope: every
+Semi/Anti node `unnestExistsExpr` synthesizes sits strictly on the spine
+*above* `origChain`, by construction, for every statement shape S5a currently
+engages. "Moving the capture post-unnest" would capture the exact same
+pointer value — there is nothing to move.
+
+The real content of item 1 is therefore not a capture-timing fix, it is
+**"stop calling `tryJoinSearch` only on the subtree below the pinned spine;
+call it on a tree that includes the spine's Semi/Anti nodes too."** That is a
+`predp.go`-level (and, per §22.3 below, `joinsearchseam.go`-level) change to
+*which tree the search receives*, not a `planner.go`-level change to *when a
+variable is captured*. §21.4's "(or otherwise route a Semi/Anti-bearing tree
+to `tryJoinSearch`)" parenthetical was the accurate half of the description;
+the "move the origChain capture" half is now superseded by this finding.
+
+### 22.2 Question 2 answered: `belowNullable` needs NO Semi/Anti-aware arm
+
+Traced `extractSearchLeaves`'s walk (`joinsearchseam.go:1104-1191`) for what
+`below` (the value threaded through `chainOnQual.belowNullable`) would need
+to be if the walk's `*Join` type-switch admitted `JoinTypeSemi`/`JoinTypeAnti`
+alongside Cross/Inner/Left/Right. `below` exists so an INNER link's own `ON`
+qual can be tested against the union of NULL-extended sides at or below it
+(§14.3/§19's finding: an `IS NULL` conjunct must not be pushed below the
+outer join that produces the NULLs it is testing). SEMI and ANTI joins do not
+null-extend *either* side — `reresolveJoinByName`'s own doc comment ("emit
+Outer (=Left) only at runtime") and `semiAntiChainLink`'s doc comment
+(§21.2, landed this loop's predecessor) already state this for the
+`preserved`/`nullable` fields; the same fact applies directly to `below`.
+
+Concretely: a Semi/Anti arm added to the walk's `*Join` type-switch should
+recurse into `j.Left` exactly as the existing INNER arm does (computing
+`nullLeft`), and — because the RHS stays an opaque, non-reorderable
+participant under current S5b-deferral scope (§11-§13; making `x.Right` a
+real DP-reorderable relset bit is the *bigger*, still out-of-scope mechanism)
+— append `j.Right` as a single leaf via the same path the top-level "not an
+admitted join type" branch already uses (`scans = append(scans, n)`,
+`joinsearchseam.go:1111-1114`) rather than recursing into it. The arm should
+then **return `below` (i.e. `nullLeft`) unchanged**, exactly like the
+existing `if j.Type != JoinTypeInner { … }` / `return below, true` line
+(`joinsearchseam.go:1173`) — a Semi/Anti link contributes zero to the
+NULL-extended set, the same as an INNER link does today. No new field, no new
+bit-tracking, no Semi/Anti-aware arm in `chainOnQual` or its consumers
+(`joinsearchseam.go:420-440`) is needed. This is a **negative scoping
+result**: §14.3's open question is answered "no such arm is needed," which
+removes one item from the eventual implementation's surface rather than
+adding one.
+
+### 22.3 A sixth coupled dependency §21.4 did not name: `ctx.bindings`/`ctx.joinlist` have no slot for the Semi/Anti RHS
+
+Tracing question 1's "call `tryJoinSearch` on a tree that includes the spine"
+one level further out, into what `tryPGShapedJoinSearch` actually does with
+its `node` argument, surfaced a gap none of §14/§15/§19/§21 named.
+
+`tryPGShapedJoinSearch` (`joinsearchseam.go:216-`) does not derive relation
+count purely from the tree it is handed — it cross-checks the walk's output
+against `ctx.bindings`/`ctx.joinlist`, which are **fixed at FROM-clause
+resolution time**, before `s.Where` is even resolved
+(`planner.go:3096-3103`, `rctx.joinlist = deconstructRangeVars(len(bindings))`,
+called from `planFromClause`/`planScanRangeVar` — grepped: this is the ONLY
+assignment site of `.joinlist =`/`.bindings = append(...rangeBinding{...})`
+in the package). Three separate checks in `tryPGShapedJoinSearch` depend on
+this: `nrels := len(ctx.bindings)` (line 226, used for the search's own size
+gates); `len(scans) != nprefix` (line 309, `nprefix := jl.nrels()`, a hard
+decline on mismatch); and `ctx.bindings[i].offset != cumOffsets[i]` (line
+324, per-leaf offset agreement, also a hard decline on mismatch).
+
+The Semi/Anti RHS subtree `unnestExistsExpr` synthesizes is **not a FROM-item
+of the original statement** — it is the pulled-up EXISTS subquery body,
+built entirely inside `unnestSubqueriesInPlan(node Node) Node` /
+`unnestExistsExpr(ex *ExistsExpr, outer Node) (Node, error)`
+(`unnest.go:424`, `unnest.go:4461`), and **neither function takes a
+`*resolveContext` parameter at all** (grepped both signatures). So if §22.2's
+walk extension appends `j.Right` as one more opaque leaf, that leaf has no
+corresponding `ctx.bindings[i]` entry and no `ctx.joinlist` representation —
+`tryPGShapedJoinSearch`'s existing `len(scans) != nprefix` and per-leaf
+offset checks would **decline** the search outright (the safe failure mode:
+it declines rather than panicking or miscounting, per the same guard style as
+R41/K75's `nprefix > nrels` check at line 277), which means item 3's walk
+extension is *itself* inert without also either (a) teaching
+`unnestSubqueriesInPlan`'s call chain to append a synthetic `rangeBinding` +
+joinlist entry for the Semi/Anti RHS at synthesis time (a `*resolveContext`
+plumbing change through `unnestSubqueriesInPlan`/`unnestExistsExpr`'s
+signatures — unknown blast radius across their other internal call sites,
+e.g. IN-family unnesting, not investigated this loop), or (b) relaxing
+`tryPGShapedJoinSearch`'s leaf-count/offset checks specifically for the
+walk's Semi/Anti-RHS leaves (harder to get right: those checks are exactly
+what catches a genuine desync elsewhere, per R41/K75's own comment, and
+carving a special case into them narrows the tripwire for every OTHER caller
+too).
+
+This is a real, previously-undocumented **sixth** coupled item — call it
+item 6 — on top of §21.4's five. It is discovered by, not solved by, this
+scoping pass.
+
+### 22.4 Revised recommendation: this is not one loop, and not two either — split an INERT scaffold from the correctness-changing cutover
+
+§21.4 already said "not sized for one loop." This pass both shrinks two of
+the five named items to zero work (§22.1, §22.2) and adds one the original
+filing missed (§22.3), so the honest updated shape is: **items 2 (predp.go
+pass-through), 3 (walk extension using §22.2's now-settled semantics), 4
+(SJInfo rebuild), and 6 (the `ctx.bindings`/`joinlist` gap) are one coupled
+step; item 1 turned out to already be satisfied (§22.1); item 5 (retiring the
+splice-and-reresolve) must NOT land until the new path is proven to always
+succeed for every statement the old path used to handle** — `tryJoinSearch`'s
+own decline contract (`joinsearchseam.go:201-206`: `used=false` →
+`return node, pred` unchanged) is a *graceful* no-op, but `predp.go`'s
+splice-and-reresolve is the thing that currently guarantees a plan for every
+engaged EXISTS/IN statement; removing it before the new path is proven
+correct on that whole family would regress real queries from "planned" to
+"declined; WHERE-clause EXISTS silently unhandled" — a correctness bug, not
+a missed optimization. Recommend two sub-tasks, not one, matching the
+already-successful `-0008a-3i-plumbing-a` / `-0008c-1/-2/-3a` "dispatch-layer-
+first, prove inert before wiring" shape:
+
+- **`M0142-0008a-3i-plumbing-b1`**: land items 2-4 as an INERT scaffold —
+  extend `extractSearchLeaves`'s walk (§22.2's semantics), build
+  `semiAntiChainLink`s, rebuild the matched `SpecialJoinInfo`'s
+  Syn/MinLefthand/Righthand from real leaf bits (item 4, using
+  `semiAntiLinksHaveSJInfos` from `-3i-plumbing-a` to find the match) — but
+  gate the whole arm behind a conservative eligibility check that, absent
+  item 6's `ctx.bindings`/`joinlist` extension, can never actually fire in
+  production (the same "callable but never called / proven zero-impact by
+  sweep" shape `-3i-plumbing-a` and `-0008c-1/-2` already used). This is the
+  next loop-sized task.
+- **`M0142-0008a-3i-plumbing-b2`**: item 6's `ctx.bindings`/`joinlist`
+  extension (with its own scoping pass into `unnestSubqueriesInPlan`'s other
+  call sites first) plus the actual cutover — feed the full spine+origChain
+  tree to `tryJoinSearch`, and retire `predp.go`'s splice-and-reresolve
+  *only* for the statement shapes empirically proven (TPC-DS sweep, plus a
+  dedicated EXISTS/NOT-EXISTS regression set) to be handled end-to-end by the
+  new path, keeping the old splice as the fallback for everything else.
+  Depends on `-b1` landing first, and likely also depends on enough of
+  `M0142-0008c-3c`/`-3d`/`-4`'s path-builder work existing for a real
+  Semi/Anti pair to be admissible during DP at all (today `-0008c-2`'s
+  admission arm is itself still inert for the same reason, per its own
+  landing note).
+
+`fix_plan.md`'s `-3i-plumbing-b` entry is replaced by these two sub-items.

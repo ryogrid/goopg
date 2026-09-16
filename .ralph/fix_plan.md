@@ -3630,37 +3630,75 @@ cross-layer programme that has never been scoped.
     pre-existing, unrelated `internal/parser` `GroupedJoinUnaliased`
     AST-drift failure the prior three loops already found; `internal/optimizer`
     passes. Resume point: design doc §21.
-  - [ ] **M0142-0008a-3i-plumbing-b — the coupled walk-extension +
-    predp.go/planner.go call-sequence change (design doc §21.1/§21.4)** —
-    filed by -3i-plumbing-a's live trace. Settles §14.3/§15's open
-    "items 1/4/5 separable?" question: NO — extending
-    `extractSearchLeaves`'s type test to admit `JoinTypeSemi`/`JoinTypeAnti`
-    only matters if a Semi/Anti-bearing chain actually reaches
-    `tryJoinSearch`, and today two independent gates prevent that: (a)
-    `planner.go:1532-1536` snapshots `origChain` BEFORE
-    `unnestSubqueriesInPlan` runs, so it never contains a Semi/Anti node;
-    (b) `predp.go:83-115`'s descend loop is hard-coded to walk through
-    Semi/Anti `*Join` nodes ONLY, bailing (`predp.go:100`) on any other
-    `*Join` type it might need to pass through. Concrete scope: (1) move or
-    duplicate the `origChain` capture to after unnesting (or otherwise route
-    a Semi/Anti-bearing tree to `tryJoinSearch`); (2) extend predp.go's
-    descend loop to pass through non-Semi/Anti `*Join` nodes instead of
-    hard-bailing; (3) extend `extractSearchLeaves`'s type test to admit
-    Semi/Anti and build `semiAntiChainLink`s via the walk (the type +
-    consumers landed by -3i-plumbing-a, now finally with a producer); (4)
-    rebuild `existsUnnestSJInfo`'s throwaway 2-bit numbering with real
-    `leafRangeRelSet` bits at admission time; (5) retire `predp.go`'s
-    splice-and-reresolve (`reresolveJoinByName`) for the newly-admitted
-    cases. Precedent that a live Semi/Anti `SpecialJoinInfo` inside
-    `ctx.joinInfoList` already works in production today:
-    `reduceOuterJoins`'s LEFT→ANTI demotion. **Not sized for one loop** —
-    needs its own dedicated scoping pass first: what happens to
-    `origChain`'s other callers/assumptions if it moves post-unnest, and
-    whether `chainOnQual`'s `belowNullable` bookkeeping needs a
-    Semi/Anti-aware arm for INNER links sitting above an admitted Semi/Anti
-    link (§14.3's own open question, still unanswered). This is the actual
+  - [x] **M0142-0008a-3i-plumbing-b — scoping pass ONLY (design doc §22)** —
+    filed by -3i-plumbing-a's live trace as "needs its own dedicated scoping
+    pass before coding." **DONE 2026-09-16 as a recon, no production
+    change.** Both of §21.4's open questions are now answered: `origChain`
+    has exactly one use site (grepped, no other callers/assumptions to
+    worry about) and "move the capture post-unnest" was never the right fix
+    anyway — `origChain` structurally never contains a Semi/Anti node under
+    current engagement scope no matter when it's captured, because
+    unnesting wraps it from above rather than replacing it; the real content
+    of item 1 is "feed `tryJoinSearch` a tree that includes the spine," a
+    `predp.go`-level change, not a `planner.go` timing change (§22.1).
+    `chainOnQual.belowNullable` needs NO Semi/Anti-aware arm: a Semi/Anti
+    arm in the walk should recurse into `j.Left` and return `below`
+    unchanged, exactly like the existing INNER-link arm, because Semi/Anti
+    null-extends neither side (§22.2) — this REMOVES an item from scope
+    rather than adding one. But tracing question 1 one level further out
+    surfaced a **sixth coupled dependency neither §14.3 nor §21.4 named**:
+    `ctx.bindings`/`ctx.joinlist` are fixed at FROM-clause-resolution time,
+    strictly before `unnestSubqueriesInPlan` runs, and
+    `unnestSubqueriesInPlan`/`unnestExistsExpr` take no `*resolveContext` at
+    all — so a Semi/Anti RHS leaf the walk admits has no `ctx.bindings`
+    entry, and `tryPGShapedJoinSearch`'s existing leaf-count/offset checks
+    (`joinsearchseam.go:309,324`) would decline the search outright without
+    also either plumbing a `*resolveContext` through the unnest call chain
+    to append a synthetic binding, or relaxing those checks specifically for
+    Semi/Anti-RHS leaves (§22.3). Revised decomposition, replacing this
+    item: **`M0142-0008a-3i-plumbing-b1`** (walk extension + `predp.go`
+    pass-through + `semiAntiChainLink` production + item 4's SJInfo rebuild,
+    landed as an INERT scaffold gated behind an eligibility check that can't
+    fire without item 6, same "prove inert before wiring" shape as
+    `-3i-plumbing-a`/`-0008c-1/-2/-3a` — **the next loop-sized task**) and
+    **`M0142-0008a-3i-plumbing-b2`** (the `ctx.bindings`/`joinlist`
+    extension + the actual cutover + retiring `predp.go`'s
+    splice-and-reresolve only for statement shapes proven to be handled
+    end-to-end by the new path — depends on `-b1` and likely on more of
+    `M0142-0008c-3c`/`-3d`/`-4` landing first). This is still the actual
     unblock for TPC-DS Q10/Q35 and for `M0142-0008c-3c`/`-3d` (both still
     blocked on it) to ever affect a real plan.
+  - [ ] **M0142-0008a-3i-plumbing-b1 — INERT scaffold: walk extension +
+    predp.go pass-through + SJInfo rebuild (design doc §22.4)** — filed by
+    -3i-plumbing-b's scoping pass. Scope: extend `extractSearchLeaves`'s
+    `*Join` type-switch to admit `JoinTypeSemi`/`JoinTypeAnti` per §22.2's
+    settled semantics (recurse `j.Left`, append `j.Right` as one opaque
+    leaf, return `below` unchanged, build a `semiAntiChainLink`); extend
+    `predp.go`'s descend loop to pass through non-Semi/Anti `*Join` nodes
+    instead of hard-bailing (`predp.go:96-101`); rebuild the matched
+    `SpecialJoinInfo`'s Syn/MinLefthand/Righthand from real leaf-index bits
+    at admission time using `semiAntiLinksHaveSJInfos` (landed by
+    -3i-plumbing-a) to find the match, replacing `existsUnnestSJInfo`'s
+    throwaway `synL=1`/`synR=2` numbering. Must land gated behind an
+    eligibility check that provably cannot fire in production yet (item 6 —
+    `ctx.bindings`/`joinlist` — is not done), verified the same way as
+    -3i-plumbing-a: unit tests on the new code paths directly, plus a
+    TPC-DS SF0.25 sweep showing zero plan-shape change.
+  - [ ] **M0142-0008a-3i-plumbing-b2 — ctx.bindings/joinlist extension +
+    cutover (design doc §22.3/§22.4)** — filed by -3i-plumbing-b's scoping
+    pass. Depends on -3i-plumbing-b1. Scope: give the Semi/Anti RHS subtree
+    a `ctx.bindings`/`ctx.joinlist` representation (plumb a
+    `*resolveContext` through `unnestSubqueriesInPlan`/`unnestExistsExpr`,
+    with its own scoping pass into their other internal call sites first —
+    not investigated this loop); feed the full spine+origChain tree to
+    `tryJoinSearch`; retire `predp.go`'s splice-and-reresolve
+    (`reresolveJoinByName`) ONLY for statement shapes empirically proven
+    (TPC-DS sweep + a dedicated EXISTS/NOT-EXISTS regression set) to be
+    handled end-to-end by the new path, keeping the old splice as fallback
+    for everything else — never remove the fallback before proving it's
+    unreachable for the engaged family. Likely also depends on enough of
+    `M0142-0008c-3c`/`-3d`/`-4`'s path-builder work existing for a real
+    Semi/Anti pair to be admissible during DP at all.
   **Independent, unfiled resume-point hint** (not sized/numbered — noted for
   whoever picks up S5a's own eligibility gate): relaxing
   `whereEligibleForPreDPUnnest` to per-sublink granularity would upgrade
@@ -3837,16 +3875,16 @@ cross-layer programme that has never been scoped.
   unique-ify substitution** — filed by M0142-0008c-3's recon (design doc
   §19.4 item 3c). Depends on M0142-0008c-3a. Deferred: not exercised by
   either named witness (§19.1). **Also now blocked on
-  M0142-0008a-3i-plumbing-b** (design doc §21) — do not pick up before that
-  lands; no
+  M0142-0008a-3i-plumbing-b2** (design doc §21/§22) — do not pick up before
+  that lands; no
   TPC-DS measurement can distinguish "correct but unreachable" from "wrong"
   while `addPathsToJoinrel` never receives a real SEMI/ANTI `sjinfo`. PG
   oracle: `hash_inner_and_outer`, `joinpath.c:2100-2140` (cited by §16.1, not
   yet read live).
 - [ ] **M0142-0008c-3d — merge + partial-nestloop unique-ify substitution**
   — filed by M0142-0008c-3's recon (design doc §19.4 item 3d). Depends on
-  M0142-0008c-3a. **Also now blocked on M0142-0008a-3i-plumbing-b**,
-  same reason as 3c (design doc §21). Deferred for the same reason as 3c
+  M0142-0008c-3a. **Also now blocked on M0142-0008a-3i-plumbing-b2**,
+  same reason as 3c (design doc §21/§22). Deferred for the same reason as 3c
   otherwise: `sortInnerAndOuter`/`matchUnsortedOuterMerge`/
   `matchUnsortedOuterMergePartial` (merge) and `addPartialNestLoopPaths`
   (parallel NL), PG oracle `sort_inner_and_outer`/`match_unsorted_outer`,
