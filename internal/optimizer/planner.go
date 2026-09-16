@@ -3390,6 +3390,12 @@ func planFromItem(item parser.FromExpr, cat catalog.Catalog, nextSourceIdx *int1
 			// in unnest.go, never here. See Join.FromOuterReduction for why
 			// the NLI cost gate needs to tell the two populations apart.
 			jn.FromOuterReduction = true
+			// M0142-0008a-3i-plumbing-c19 (design doc §55): give this
+			// producer the same placeholder `.SJInfo` `existsUnnestSJInfo`
+			// already attaches for its own SEMI/ANTI joins — see
+			// `demotedAntiSJInfo`'s doc comment (specialjoin.go) for why
+			// `ctx.joinInfoList` cannot supply one instead.
+			jn.SJInfo = demotedAntiSJInfo(joinType)
 		}
 		// M0097-0060: For FULL JOIN USING / FULL JOIN NATURAL, populate
 		// UsingLeftCols/UsingRightCols so the executor can coalesce USING

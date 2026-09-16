@@ -4868,7 +4868,7 @@ cross-layer programme that has never been scoped.
   documentation-only fix. Verification: `go build ./...` clean,
   `go test ./internal/optimizer/...` green, diff is comment-only (no
   production code changed, no gate re-run needed).
-- [ ] **M0142-0008a-3i-plumbing-c18 — full-corpus (96-query) SF0.25 recheck
+- [x] **M0142-0008a-3i-plumbing-c18 — full-corpus (96-query) SF0.25 recheck
   of Semi/Anti DPPATH reachability after c1-c17 all landed: still 0/96;
   root-caused to a SECOND, unrelated `.SJInfo`-population gap in the ONE
   query that reaches the admission arm at all (Q78, LEFT-JOIN-to-ANTI-JOIN
@@ -4930,6 +4930,85 @@ cross-layer programme that has never been scoped.
   above; no `internal/` files changed (instrumentation + `psql -f` runs
   against a private, disposable cluster only); `tmp/goopg-sf025-trace-bin`
   and its throwaway data/log removed after the recon.
+- [x] **M0142-0008a-3i-plumbing-c19 — landed a placeholder `.SJInfo` for the
+  `reduce_outer_joins`-demoted ANTI producer; Q78's declines move one gate
+  deeper (`semianti-link-no-sjinfo` -> `semianti-on-qual`), reachability
+  still 0/96, no plan movement anywhere** (design doc §55, filed/landed by
+  this loop). **DONE 2026-09-17.** c18's own candidate (b) — "fall back to a
+  relids-keyed lookup in `ctx.joinInfoList`" — turned out to be unworkable,
+  confirmed by instrumentation before writing any production code: a
+  temporary trace showed `ctx.joinInfoList` has **zero** entries at the
+  point Q78 declines, not a relids mismatch. Root cause traced one level
+  further than c18 saw: Q78's ANTI join is the LEADING join in its
+  FromExpr's chain, and `antiCollapsedJoins` (collapse.go, R41/K74)
+  deliberately excludes a LEADING semi/anti link from
+  `deconstructFromItemScoped`'s leaf/SJI numbering (space 1 — no
+  `rangeBinding`, no leaf index, no `makeSpecialJoinInfoScoped` call for
+  it), while `extractSearchLeaves`'s own walk (space 2, joinsearchseam.go)
+  numbers the SAME join's opaque RHS as a real leaf regardless. The two
+  spaces are incompatible by design for this exact shape (space 1
+  deliberately has FEWER leaves than space 2 so `len(ctx.bindings)` and
+  `jl.nrels()` do not desync — R41/K74's own stated reason), so no relids
+  key built in space 1 could ever match `lk.lhs`/`lk.rhs` (space 2) — (b) as
+  literally written would have found nothing to fall back to, confirmed by
+  running the actual query, not by re-reading the code.
+  **What landed instead (closer to candidate (a)):** `demotedAntiSJInfo`
+  (`specialjoin.go`, new function) attaches a self-contained bit0/bit1
+  placeholder `*SpecialJoinInfo` to `jn.SJInfo` at the ONE call site
+  (`planFromItem`, planner.go, inside the existing `if joinType ==
+  JoinTypeSemi || joinType == JoinTypeAnti` block) that builds this
+  producer's plan-tree `*Join` node — the exact convention
+  `existsUnnestSJInfo` (unnest.go:4390-4397) already uses for the EXISTS/IN
+  unnesting producer, chosen specifically because `extractSearchLeaves`
+  ALREADY renumbers a placeholder's `SynLefthand`/`SynRighthand`/
+  `MinLefthand`/`MinRighthand` in place once it walks the node
+  (joinsearchseam.go:1415-1418, landed by c16) and ALREADY threads the
+  result into `ctx.joinInfoList` (c6) — no new plumbing needed beyond
+  giving this one producer the placeholder to begin with.
+  **Verified, not assumed:** a temporary trace confirmed, before removal,
+  that (1) `demotedAntiSJInfo` fires exactly 3x per Q78 run (matching its 3
+  CTEs) with `joinType=JoinTypeAnti`; (2) `semiAntiLinksHaveSJInfos` no
+  longer declines (zero `seam-decline reason=semianti-link-no-sjinfo` lines,
+  down from c18's 6); (3) the search now reaches `semiAntiOnQualsOK`, which
+  declines instead (6x `reason=semianti-on-qual`, matching the 6 `-link-
+  no-sjinfo` declines it replaced) — one real gate deeper, exactly c5/c6's
+  own "moves ONE gate deeper" pattern. Full-corpus verification: private
+  `GOOPG_BIN`, `scripts/tpcds-sf025-regression.sh sweep` (`PASS=96
+  MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0 SKIP=3`, unchanged from c18);
+  `scripts/tpcds-plan-diff.py` against a pre-fix baseline capture
+  (`bench/tpcds/runtime_goopg/tpcds-results-sf025/plans-20260917-052136.txt`,
+  predating even c16) shows **`queries=99 same=99 changed=0`** — the fix is
+  currently a pure no-op on every plan in the corpus, zero regression risk.
+  `go test ./internal/optimizer/...` and `./internal/executor/...` both
+  green; `tpch-spotcheck.sh` SKIPPED per the still-open M0142-0003k data
+  blocker (unrelated); a pre-existing, unrelated `internal/parser`
+  `yacc_locking_test.go` AST-drift failure was confirmed present with this
+  loop's diff stashed out too (not caused by this change, not investigated
+  further — out of scope).
+  **Concrete resume point for c20**: `semiAntiOnQualsOK`
+  (joinsearchseam.go:1835) requires `lk.pred != nil` and every conjunct of
+  it to span both `lk.lhs` and `lk.rhs` and pass `searchConsumes`. Checked
+  this loop (read, not traced live): `splitEqualityForHash` (planner.go:3438)
+  does NOT mutate `jn.Predicate` — it only reads `pred` to populate
+  `jn.LeftKey`/`jn.RightKey`, so `jn.Predicate` keeps the FULL original
+  2-conjunct AND (`wr_order_number=ws_order_number and ws_item_sk=
+  wr_item_sk`) for Q78's link. `extractSearchLeaves`'s walk then ALSO folds
+  `LeftKey`/`RightKey` back in as a NEW top-level equality conjunct
+  (joinsearchseam.go ~1329-1349, the `j.LeftKey != nil && j.RightKey !=
+  nil` branch, mirroring `unnestExistsExpr`'s convention of excluding its
+  own primary equijoin from `Predicate` so this fold-in is the ONLY copy —
+  which does NOT hold here, since this producer's `Predicate` was never
+  stripped). So `lk.pred` for Q78 is most likely a 3-conjunct AND with one
+  REDUNDANT duplicate equality (the folded-in `LeftKey=RightKey` plus the
+  same equality already present verbatim in the original ON clause) — not
+  nil. `semiAntiOnQualsOK` splits on `splitAnd` and checks each conjunct
+  independently, so a harmless duplicate conjunct should not by itself
+  cause the decline; the next loop should instrument `semiAntiOnQualsOK`
+  directly (print each conjunct + `relidsOfExpr`'s `ok`/`rs` +
+  `searchConsumes`'s verdict) to find which specific conjunct/check fails,
+  rather than assume the `lk.pred == nil` arm is the cause — this loop's
+  read of the code did not confirm that guess and time ran out before a
+  live trace could.
 - [x] **M0142-0008c — scoping recon: does goopg need PG's `create_unique_path`
   (semi-join → de-duplicate RHS + inner join) to reach parity on TPC-DS
   Q10/Q35?** — filed by M0142-0008a-3(iii)'s §4.3 gate re-run (design doc §6).

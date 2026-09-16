@@ -124,6 +124,47 @@ func reduceRightLink(left, right RelSet) (jointype parser.JoinType, preserved, n
 	return parser.JoinLeft, right, left
 }
 
+// demotedAntiSJInfo builds an inert placeholder *SpecialJoinInfo for a
+// reduce_outer_joins-demoted ANTI join, at the ONE call site (planFromItem,
+// planner.go) that constructs its plan-tree *Join node — the SAME
+// self-contained bit0/bit1 numbering `existsUnnestSJInfo` (unnest.go:4390-
+// 4397) uses for the EXISTS/IN unnesting producer's own SEMI/ANTI joins,
+// for the identical reason: neither producer has the search's real
+// per-call leaf numbering available at construction time.
+//
+// M0142-0008a-3i-plumbing-c18 (design doc §54) found this producer left
+// `.SJInfo` nil, unlike `existsUnnestSJInfo` — the ONE thing that made
+// `semiAntiLinksHaveSJInfos` decline every Q78-shaped ANTI join
+// (design doc §55, c19). `ctx.joinInfoList`'s deconstruction-time entries
+// (`makeSpecialJoinInfoScoped`) are NOT a usable fallback here: a leading
+// SEMI/ANTI link is deliberately excluded from that numbering by
+// `antiCollapsedJoins` (collapse.go, R41/K74) because it gets no
+// `rangeBinding`/leaf index there at all, so no relids in that space could
+// ever match `extractSearchLeaves`'s own — a fresh placeholder, renumbered
+// in place exactly as `existsUnnestSJInfo`'s is, is the only representation
+// that lines up.
+//
+// `extractSearchLeaves` (joinsearchseam.go) overwrites SynLefthand/
+// SynRighthand/MinLefthand/MinRighthand with real leaf-index bits once it
+// walks this node (mirroring `existsUnnestSJInfo`'s placeholder exactly),
+// and `LhsStrict` is left at its zero value: SEMI/ANTI never reads it
+// (`LhsStrict` gates only `Jointype == parser.JoinLeft`, joinsearchlevel.go
+// :288), so there is nothing to compute here that any reader would consult.
+func demotedAntiSJInfo(jt JoinType) *SpecialJoinInfo {
+	const synL, synR RelSet = 1, 2
+	pjt := parser.JoinSemi
+	if jt == JoinTypeAnti {
+		pjt = parser.JoinAnti
+	}
+	return &SpecialJoinInfo{
+		Jointype:     pjt,
+		SynLefthand:  synL,
+		SynRighthand: synR,
+		MinLefthand:  synL,
+		MinRighthand: synR,
+	}
+}
+
 func makeSpecialJoinInfoScoped(jointype parser.JoinType, left, right joinlist, joinQual parser.Expr, sc *sjiScope, item int, lower []*SpecialJoinInfo) *SpecialJoinInfo {
 	sj := &SpecialJoinInfo{
 		SynLefthand:  joinlistRelSet(left),
