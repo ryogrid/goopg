@@ -248,7 +248,7 @@ func TestM0142_0008a_3iPlumbing_AdmitSemiAnti(t *testing.T) {
 	// not-derived positive/negative pair lives in
 	// TestProblemPairsOuterWithDerivedSemiOverDerived and its sibling in
 	// semiantichain_test.go, which use real (non-nil) table leaves.
-	sj := existsUnnestSJInfo(JoinTypeSemi, nil, []Expr{lk.pred})
+	sj := existsUnnestSJInfo(JoinTypeSemi, nil, []Expr{lk.pred}, 0)
 	items := []joinlistRel{{lo: 0, hi: 1}, {lo: 1, hi: 2}}
 	relInfos := []baseRelInfo{{}, {}}
 	scansArg := []Node{scans[0], scans[1]}

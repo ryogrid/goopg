@@ -59,6 +59,22 @@ func TestExistsUnnestSJInfoSemiHashKey(t *testing.T) {
 	if cr.Name != "z" {
 		t.Errorf("SemiRhsExprs[0].Name = %q, want %q", cr.Name, "z")
 	}
+	// M0142-0008a-3i-plumbing-c9: SemiRhsExprs[0] and j.RightKey are both
+	// built from the same params[0].SubCol, so they must carry the SAME
+	// (post-remapSourceTableIdx) SourceTableIdx. Before the c9 fix,
+	// SemiRhsExprs held the verbatim pre-remap value while RightKey already
+	// had +srcTableOffset applied, so this assertion catches a regression
+	// back to that drift — the exact mismatch createUniquePath's own
+	// schema-drift guard (createuniquepath.go) declines on, silently making
+	// every SEMI unique-ify attempt fail even when Name/Index both agree.
+	rightKey, ok := j.RightKey.(*ColumnRef)
+	if !ok {
+		t.Fatalf("j.RightKey = %T, want *ColumnRef (hash-keyed SEMI fixture)", j.RightKey)
+	}
+	if cr.SourceTableIdx != rightKey.SourceTableIdx {
+		t.Errorf("SemiRhsExprs[0].SourceTableIdx = %d, want %d (j.RightKey.SourceTableIdx)",
+			cr.SourceTableIdx, rightKey.SourceTableIdx)
+	}
 }
 
 func TestExistsUnnestSJInfoAntiHashKey(t *testing.T) {

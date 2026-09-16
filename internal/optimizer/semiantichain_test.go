@@ -107,7 +107,7 @@ func TestSemiAntiLinksHaveSJInfos_MatchesRealSJInfo(t *testing.T) {
 		pred = &BinaryOp{Op: parser.OpEq, Left: j.LeftKey, Right: j.RightKey}
 	}
 
-	sj := existsUnnestSJInfo(JoinTypeSemi, nil, []Expr{pred})
+	sj := existsUnnestSJInfo(JoinTypeSemi, nil, []Expr{pred}, 0)
 	link := semiAntiChainLink{jointype: parser.JoinSemi, lhs: sj.SynLefthand, rhs: sj.SynRighthand, pred: pred}
 
 	if !semiAntiLinksHaveSJInfos([]semiAntiChainLink{link}, []*SpecialJoinInfo{sj}) {

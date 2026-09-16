@@ -4247,34 +4247,82 @@ cross-layer programme that has never been scoped.
   entirely, filed as `-3i-plumbing-c9` below. TPC-DS SF0.25 sweep
   unaffected (`PASS=96 MISMATCH=0`, `PLAN-SHAPE same=99`, Q78
   byte-identical).**
-- [ ] **M0142-0008a-3i-plumbing-c9 — find what blocks `jointype=semi`/`anti`
+- [x] **M0142-0008a-3i-plumbing-c9 — find what blocks `jointype=semi`/`anti`
   now that Q69 clears every seam-level gate** (design doc §43.6, filed by
-  c8). Q69's DP search now runs with no semiAnti-specific seam decline at
-  all, yet 150,255+ `DPPATH` lines still contain zero `jointype=semi`/
-  `anti` — the blocker (if any single one exists; it may instead be that
-  costing simply never prefers a semiAnti-shaped candidate once one is
-  built, which is a different kind of task than an admission bug) is
-  downstream of `searchOneProblem`'s pre-DP firewalls, inside
-  `joinIsLegal`/`makeJoinRel` (joinsearchlevel.go) or the join-path
-  builders. Concrete, not-yet-chased lead: `(*searchCtx).joinIsLegal`
-  (joinsearchlevel.go:197) already has a SEMI "unique-ified RHS" admission
-  arm calling `createUniquePath` (M0142-0008c-1/-2 — landed independently
-  of this c-series, AFTER the M0142-0008c recon row above said the
-  mechanism didn't exist yet; that recon's "goopg has zero
-  create_unique_path" finding is now STALE, do not trust it without
-  re-checking). Whether that arm is what Q69's pairing needs — and whether
-  `createUniquePath`'s three preconditions
-  (`sjinfo.SemiCanBtree`/`len(sjinfo.SemiRhsExprs)!=0`/`subpath.Kind ==
-  PathPrebuilt`) actually hold for the leaf-index-rebuilt `j.SJInfo` c7
-  mutates in place — is unconfirmed by inspection only
-  (`buildInitialRels`/joinsearch.go:434 does wrap every leaf, including the
-  synthetic one, in a `PathPrebuilt`, so that ONE precondition looks
-  satisfied, but was not traced end to end with instrumentation). Start by
-  instrumenting `joinIsLegal`'s SEMI arms and `createUniquePath`'s early
-  returns for Q69 specifically before assuming a new mechanism is needed.
-  Also confirm what a genuinely-admitted semiAnti path's DPPATH line would
-  even look like (check `pathtrace.go`'s jointype-label source) so the
-  "reachability" signal is trusted correctly.
+  c8). **DONE 2026-09-17 (design doc §44): one real bug found and fixed,
+  the actual next blocker root-caused and filed as c10.** Instrumented
+  `joinIsLegal`/`createUniquePath` (throwaway, env-gated, reverted before
+  commit) against Q69 on the SF0.25 cluster. Found: `createUniquePath`
+  declined on EVERY call — `cr.Name`/`cr.Index` correctly matched the RHS
+  leaf's schema, but `cr.SourceTableIdx` (1) disagreed with
+  `oc.SourceTableIdx` (5), tripping the schema-drift guard. Root cause:
+  `existsUnnestSJInfo` (unnest.go) built `SemiRhsExprs[i]` directly from
+  `prm.SubCol` — the PRE-remap correlation column — while the sibling field
+  `innerKey` (built from the SAME `prm.SubCol`, a few lines above) already
+  applies `+srcTableOffset` for exactly this reason (comment: "SubCol was
+  harvested from the PRE-remap EXISTS body"). `SemiRhsExprs` was simply
+  never given the same treatment — an oversight pre-dating any live caller
+  ever reaching this path (createUniquePath's own comment: "this gate never
+  actually declines a real query today," now false). **Fixed**:
+  `existsUnnestSJInfo` gained a `srcTableOffset int16` parameter;
+  `SemiRhsExprs[i]` is now a fresh `*ColumnRef` with
+  `SourceTableIdx: prm.SubCol.SourceTableIdx + srcTableOffset`, matching
+  `innerKey`'s existing expression exactly. New assertion in
+  `TestExistsUnnestSJInfoSemiHashKey` (exists_unnest_sjinfo_test.go) pins
+  `SemiRhsExprs[0].SourceTableIdx == j.RightKey.SourceTableIdx`; verified to
+  FAIL pre-fix (`= 1, want 3`), passes post-fix. Re-ran Q69: `createUniquePath`
+  now logs `SUCCESS` for the first time ever. Row-count spot-check against
+  the git-tracked SF0.25 oracle: Q69 still 100 rows, Q78 still 15 rows /
+  checksum `c06cf981a7819a37` (both unchanged, as expected — Q69 still
+  plans via syntactic fallback per the NEXT blocker below; Q78's EXISTS body
+  is single-relation and never reaches this code path). Full
+  `scripts/tpcds-sf025-regression.sh sweep` could NOT run this loop —
+  `ci/batch`'s nightly run held the shared SF0.25 lane all session (its own
+  collision guard fired); the two spot-checks above substitute — run the
+  full sweep at the next opportunity. **Next blocker (NOT fixed, filed as
+  c10 below)**: fixing `createUniquePath` was necessary but not sufficient.
+  Both of Q69's ANTI links still decline `reason=illegal` at every DP level
+  — their `MinLefthand` (0x0f / 0x1f) requires the ENTIRE preceding
+  composite (`{c,ca,cd,semiLeaf}` / `+antiLeaf1`) because
+  `existsUnnestSJInfo`'s 2-bit atomic-LHS convention is NEVER narrowed past
+  "the whole outer side" once `len(params)>0` (its own `minL = clause & synL
+  = synL` line) — and unlike SEMI, ANTI has no unique-ify escape valve in
+  `jointypeForDirection` (correctly, matching PG). Confirmed this is a real
+  gap, not a Q69 quirk: all 3 of Q69's links correlate on the single column
+  `c.c_customer_sk`, so their TRUE minimal `MinLefthand` is just
+  `{customer}` for all three — the broadening to "whole composite" is a
+  processing-order artifact of `unnestExistsExpr` nesting each new
+  conjunct's join around the accumulated tree, not a real data dependency.
+- [ ] **M0142-0008a-3i-plumbing-c10 — narrow a semiAnti link's `MinLefthand`/
+  `MinRighthand` to the correlation's REAL referenced relation(s), not the
+  whole atomic outer/inner participant** (design doc §44.3-44.4, filed by
+  c9). `existsUnnestSJInfo` (unnest.go) sets `MinLefthand = SynLefthand`
+  unconditionally whenever `len(params)>0` (every live semiAnti link), which
+  is "the whole outer side as one opaque bit" — correct for `SynLefthand`
+  itself (the atomic-RHS convention is deliberate there) but wrong for
+  `MinLefthand`, which PG's real `min_lefthand` computation narrows to just
+  the relations the correlation clause actually touches
+  (`pull_varnos(clause)`). `MinLefthand` this broad means an ANTI link (no
+  unique-ify escape valve, unlike SEMI) can only ever be admitted once the
+  ENTIRE outer composite is already built — which is why Q69's two ANTI
+  links still decline `reason=illegal` at every DP level even after c9's
+  fix, and why the whole 6-relation search still fails and falls back to
+  the syntactic join order. Approach: since `params[i].OuterRef` is a real,
+  resolvable `ColumnRef`, the narrowing must happen AT SPLICE TIME (the
+  search-seam's semiAnti synthetic-leaf loop, joinsearchseam.go ~line
+  665-686 — the same site c8 added `isSemiAntiSyntheticLeaf` to) once the
+  outer side's REAL flat-leaf numbering is known, not at
+  `existsUnnestSJInfo` construction time (before that numbering exists) —
+  analogous to what `sjiClauseRelids`/`makeSpecialJoinInfoScoped`
+  (specialjoin.go) already do for ordinary FROM-clause outer joins. MUST
+  NOT regress `TestExistsUnnestSJInfoSemiHashKey`/`AntiHashKey`/
+  `KeylessSemi` (exists_unnest_sjinfo_test.go) — those correctly pin
+  `existsUnnestSJInfo`'s OWN un-narrowed `Min == Syn` output; the narrowing
+  is a later seam-side transformation, same relationship c7's
+  `rebaseSemiAntiChainQual` already has to the un-rebased qual. Re-run the
+  Q69 `EXPLAIN` + full-corpus `GOOPG_PGSHAPED_DP_TRACE=1` sweep AND the
+  TPC-DS SF0.25 sweep after landing (the real reachability test is still a
+  `jointype=semi`/`anti` DPPATH line finally appearing for Q69).
 - [x] **M0142-0008c — scoping recon: does goopg need PG's `create_unique_path`
   (semi-join → de-duplicate RHS + inner join) to reach parity on TPC-DS
   Q10/Q35?** — filed by M0142-0008a-3(iii)'s §4.3 gate re-run (design doc §6).

@@ -4980,3 +4980,231 @@ including the synthetic semiAnti one — in a `PathPrebuilt`
 (`newPrebuiltPath`), so that specific precondition looks satisfied by
 inspection, but this was not traced end to end with instrumentation. Start
 there before assuming a NEW mechanism is needed.
+
+## 44. M0142-0008a-3i-plumbing-c9: instrumented `joinIsLegal`/`createUniquePath` for Q69 — one real bug found and fixed, the actual blocker is one level up
+
+### 44.1 Method: throwaway env-gated instrumentation, per this milestone's discipline
+
+c8's static-inspection lead (`(*searchCtx).joinIsLegal`'s SEMI unique-ify
+admission arm, `createUniquePath`'s three preconditions) had exhausted what
+reading the code could tell us — the working set's own next step said so.
+This loop added temporary `os.Getenv("GOOPG_C9DEBUG")`-gated `fmt.Fprintf`
+calls to `joinIsLegal` (every SEMI/ANTI `SpecialJoinInfo` considered per
+call, the call's eventual match/no-match outcome, and the catchall "illegal"
+branch) and to `createUniquePath` (which of its early-return guards actually
+fired). Built a private binary (`tmp/goopg-m0142-c9-bin`), ran it against
+the SF0.25 TPC-DS cluster, and captured Q69's own `EXPLAIN` with both
+`GOOPG_PGSHAPED_DP_TRACE=1` and `GOOPG_C9DEBUG=1`. All of this
+instrumentation was **reverted before committing** — `git diff` against
+`internal/optimizer/joinsearchlevel.go`, `joinpaths.go`, and
+`createuniquepath.go` is empty in the landed commit; only the real fix
+(§44.2, in `unnest.go`) and its regression test survive.
+
+### 44.2 Finding 1 (root-caused and FIXED): `SemiRhsExprs`' `SourceTableIdx` was never rebased, so `createUniquePath` declined on every real call
+
+The first run's `createUniquePath` instrumentation showed, for every single
+call reaching it (the SEMI link's own RHS leaf, `rel={?3}` i.e. relset bit 3
+in Q69's 6-relation problem):
+
+```
+C9DEBUG createUniquePath: decline schema drift cr.Index=3 cr.Name=ss_customer_sk cr.SourceTableIdx=1 oc.Name=ss_customer_sk oc.SourceTableIdx=5 rel=0x00000008
+```
+
+`cr.Name == oc.Name` (both `ss_customer_sk`) and `cr.Index` correctly
+indexed `child.Output()` — but `cr.SourceTableIdx` (1) disagreed with
+`oc.SourceTableIdx` (5), tripping `createUniquePath`'s schema-drift guard
+(`createuniquepath.go`, "the index no longer names the same column").
+
+Root cause, confirmed by reading `unnestExistsExpr` (`unnest.go`) top to
+bottom: `existsUnnestSJInfo` builds `SemiRhsExprs[i]` directly from
+`prm.SubCol` — the correlation column as it was harvested from the EXISTS
+body **before** that body gets remapped into the outer tree's numbering.
+`unnestExistsExpr` already had to solve this EXACT problem once, for a
+sibling field: `innerKey` (the join's own `RightKey`, used by the executor's
+hash-join operator) is built with `SourceTableIdx:
+params[0].SubCol.SourceTableIdx + srcTableOffset` — a comment right there
+explains why: *"SubCol was harvested from the PRE-remap EXISTS body, so it
+still carries the pre-shift value — without the offset this would disagree
+with the scan explainNames now registers under the shifted numbering
+(M0142-0008e)."* `SemiRhsExprs` is built from the exact same `prm.SubCol`,
+a few lines below `innerKey`, but was never given the same `+srcTableOffset`
+treatment — an oversight from when `SemiRhsExprs` was first populated
+(M0142-0008c-1), which pre-dates any live caller ever reaching this code
+path (the file's own comment: *"this gate never actually declines a real
+query today"* — true until this very call, the first time `createUniquePath`
+was ever exercised against a real, spliced multi-relation semiAnti leaf
+rather than a hand-built unit-test fixture).
+
+This is **not** the same class of bug as c6/c7's qual-rebase work (those
+rebased `.Index` inside the join predicate via `rebaseChainQual`/
+`rebaseSemiAntiChainQual`, run by the search-seam walk at splice time).
+`SemiRhsExprs` lives on the `SpecialJoinInfo`, not inside any `Expr` tree the
+seam walks, and its `.Index` was **already correct** (confirmed: the
+`cr.Name == oc.Name` match at `cr.Index=3` above) — only the cosmetic-looking
+but load-bearing `SourceTableIdx` field had drifted, and it drifted at
+`unnestExistsExpr`'s OWN remap point (`remapSourceTableIdx`, called on
+`innerPlan` a few lines before `existsUnnestSJInfo`), not at the seam.
+
+**Fix**: `existsUnnestSJInfo` gained a fourth parameter, `srcTableOffset
+int16`, and `SemiRhsExprs[i]` is now built as a fresh `*ColumnRef` (Index/
+Name/Type copied from `prm.SubCol`, `SourceTableIdx: prm.SubCol.SourceTableIdx
++ srcTableOffset` — the identical expression `innerKey` already uses) instead
+of assigning `prm.SubCol` verbatim. The one production call site
+(`unnest.go`, `unnestExistsExpr`) passes its own `srcTableOffset`; the two
+unit-test call sites that pass `params: nil` (`semiantichain_test.go`,
+`m0142_0008a_3i_plumbing_probe_test.go`) pass `0` since the loop never
+executes for them.
+
+**Regression test**: `TestExistsUnnestSJInfoSemiHashKey`
+(`exists_unnest_sjinfo_test.go`) gained an assertion that
+`sj.SemiRhsExprs[0].SourceTableIdx == j.RightKey.SourceTableIdx` — the two
+fields are built from the same `prm.SubCol` and must always agree. Verified
+FAILS on pre-fix code (temporarily reverted just the `+srcTableOffset`
+addition, confirmed `SemiRhsExprs[0].SourceTableIdx = 1, want 3`, restored
+the fix) before landing.
+
+**Verification this loop**: `go build ./...` clean; `go test
+./internal/optimizer/...` green (includes the fail-then-pass check above,
+plus the full targeted SEMI/ANTI/`createUniquePath`/`existsUnnestSJInfo`
+test set). Re-ran the same Q69 `EXPLAIN` against the fixed build:
+`createUniquePath` now logs `SUCCESS rel=0x00000008 keyCols=[3]` — the very
+first time this mechanism has ever actually succeeded for a live query,
+confirmed by the file's own "never actually declines a real query today"
+comment becoming false as of this fix. Row-count check against the
+git-tracked SF0.25 oracle (`bench/tpcds/runtime_goopg/tpcds-results-sf025/oracle.txt`):
+Q69 still returns exactly 100 rows (unchanged — it still plans via the
+syntactic fallback, see §44.3) and the pinned Q78 still returns exactly 15
+rows with checksum `c06cf981a7819a37` (byte-identical to the oracle,
+unaffected as expected since Q78's EXISTS body is single-relation and never
+reaches `createUniquePath`'s multi-relation domain). The full
+`scripts/tpcds-sf025-regression.sh sweep` gate could not be run this loop —
+`ci/batch`'s nightly run held the shared SF0.25/SF1 lanes for the whole
+session (its own FATAL guard: *"the nightly CI batch is running ... would
+contaminate these timings"*) — the two spot-checks above are the
+substitute evidence; a full sweep should still be run at the next
+opportunity per this milestone's standing gate list.
+
+### 44.3 Finding 2 (root-caused, NOT fixed — filed as c10): fixing createUniquePath was necessary but not sufficient — the ANTI links have no equivalent escape valve, and their `MinLefthand` is over-broad by the same "atomic-LHS" convention
+
+Even with §44.2's fix landed, Q69's `jointype=semi`/`anti` DPPATH
+reachability is **still zero** and the DP search still fails with `"join
+search: failed to build any 4-way joins"` (unchanged from every prior c-series
+loop). Root cause, read directly off the corpus trace's `DPTRACE
+problem`/`pair`/`decline` lines for Q69's own top-level 6-relation search
+(`problem nrels=6 rels=c,ca,customer_demographics,?3,?4,?5` — `?3` is the
+SEMI leaf, `?4`/`?5` the two ANTI leaves):
+
+- **The SEMI leaf (`?3`) now admits at level 2** against `{c}` alone via the
+  fixed `createUniquePath` unique-ify fallback (confirmed directly: the
+  `C9DEBUG joinIsLegal` instrumentation showed `rel1=customer(0x1)
+  rel2={?3}(0x8)` matching via that branch, no error). This is real
+  forward progress: before this loop, the branch's condition
+  (`createUniquePath(...) != nil`) was NEVER true for a live query.
+- **Both ANTI leaves (`?4`, `?5`) still decline as `reason=illegal` at
+  EVERY level** they are tried at (2, 3, and 4, plus phase 3's last-ditch
+  pass) — confirmed via a second instrumentation pass (a debug print at
+  `joinIsLegal`'s final `else { return nil, false, err }` catchall)
+  showing every one of these declines names an ANTI `SpecialJoinInfo`,
+  never the (now-fixed) SEMI one.
+
+The reason is structural, not a small bug: `?4`'s `SpecialJoinInfo` carries
+`MinLefthand = 0x0f` (bits 0-3 — **all of** `{c, ca, customer_demographics,
+?3}`) and `?5`'s carries `MinLefthand = 0x1f` (bits 0-4 — those four PLUS
+`?4`). Since `jointypeForDirection`'s ANTI arm (`joinpaths.go`) has **no**
+unique-ify fallback (correctly — PG's own `create_unique_path` call sites
+are SEMI-only; ANTI cannot be legally reordered past an arbitrary other rel
+by de-duplicating its RHS, since ANTI's "no match" semantics do not survive
+naive unique-ification the way SEMI's "first match" semantics do), an ANTI
+link's ONLY admission route is the direct `MinLefthand`/`MinRighthand`
+containment check. With `MinLefthand` this broad, `?4` cannot be admitted
+against anything smaller than the FULL `{c,ca,customer_demographics,?3}`
+composite — and the DP search never successfully builds that composite as
+ONE rel at level 4 before phase 1/3 both exhaust themselves (all `illegal`),
+so the whole 6-way problem fails and the query falls back to the syntactic
+join order (which the executor still plans and executes correctly — Q69's
+row count is right — just not via a genuine DP-costed plan).
+
+**Why `MinLefthand` is this broad — the SAME "atomic 2-bit convention"
+already named as a limitation in `existsUnnestSJInfo`'s own doc comment**:
+`existsUnnestSJInfo` (`unnest.go`) builds every semiAnti link's
+`SpecialJoinInfo` using a **self-contained 2-bit scheme** — `SynLefthand =
+1` (the WHOLE outer side, as ONE opaque participant) and `SynRighthand = 2`
+(the WHOLE EXISTS/NOT-EXISTS body, also ONE opaque participant) — because at
+the point `unnestExistsExpr` runs, the outer side has not yet been
+decomposed into its real base relations from the search's point of view.
+Since `len(params) > 0` for every semiAnti link in Q69 (each has a real
+equijoin correlation column), `existsUnnestSJInfo`'s own narrowing logic
+sets `clause = synL | synR` (unconditionally — "any param/residual makes the
+clause span both sides", per its own comment) and therefore `minL = clause &
+synL = synL` — i.e. **`MinLefthand` always equals the WHOLE outer side,
+never narrowed to the actual referenced relation(s)**, for every live
+producer of a semiAnti `SpecialJoinInfo`, not just Q69's chained ones. This
+is intentional and documented as a KNOWN gap at construction time ("-3
+recomputes real bits once the RHS actually joins the search" — but nothing
+in the c5-c9 series has actually done that narrowing yet; c6/c7/c9 all
+narrowed or fixed OTHER fields — `ctx.joinInfoList` population, the join
+QUAL's `.Index` rebase, and now `SemiRhsExprs`' `SourceTableIdx` — but never
+`MinLefthand`/`MinRighthand` themselves).
+
+**Confirmed this is NOT merely a "chained sibling" artifact of Q69
+specifically**: all three of Q69's semiAnti links correlate on the exact
+same single outer column, `c.c_customer_sk` (`store_sales`/`web_sales`/
+`catalog_sales` each join `customer` on that one column, confirmed by
+reading `/home/ryo/work/TPC-DS-QUERIES-FOR-PG/query69.sql` directly) — so
+the TRUE minimal `MinLefthand` for ALL THREE links is just `{customer}`
+(one bit), not `{customer,ca,cd}` (the SEMI link, bits 0-2) or
+`{customer,ca,cd,?3}`/`{customer,ca,cd,?3,?4}` (the two ANTI links, which
+additionally and artificially inherit every EARLIER semiAnti leaf's bit
+purely because `unnestExistsExpr` processes WHERE-clause conjuncts one at a
+time and nests each new join around the accumulated tree — a
+processing-order artifact, not a real data dependency between the three
+conjuncts, which are independent ANDed predicates at the SQL level). Real
+PG's planner is not subject to this: its `min_lefthand` is computed from
+`pull_varnos(clause)` against the REAL base-relation numbering PG already
+has at deconstruction time, so PG's own chosen plan for Q69 (§44.4) applies
+the SEMI join right after `customer` alone (via its OWN unique-ify, a
+`HashAggregate GROUP BY ss_customer_sk`) and defers both ANTI joins to the
+very end — a COST decision PG's planner was free to make either way, not a
+legality constraint forced by an inflated `min_lefthand`.
+
+### 44.4 What c10 needs to do
+
+Narrow `MinLefthand`/`MinRighthand` for a semiAnti link's `SpecialJoinInfo`
+from "the whole atomic outer/inner participant" down to "the real base
+relation(s) the correlation clause(s) actually reference," analogous to
+what `makeSpecialJoinInfoScoped` (`specialjoin.go`) already does for
+ordinary FROM-clause outer joins via `sjiClauseRelids`. Candidate approach:
+since `params[i].OuterRef` is a real, resolvable `ColumnRef` into the outer
+side's schema, the narrowing has to happen **at splice time** (the same
+search-seam code c6/c7/c8 already touch, `joinsearchseam.go`'s semiAnti
+synthetic-leaf construction loop, ~line 665-686) rather than at
+`existsUnnestSJInfo` construction time (unnest.go, before the outer side has
+been decomposed into real search leaves) — resolve each `OuterRef`/residual
+correlation column against the outer's REAL flat-leaf numbering (the same
+numbering the seam already computes for the qual rebase) and intersect
+against that, instead of leaving `MinLefthand = SynLefthand` unconditionally.
+Must NOT regress `TestExistsUnnestSJInfoSemiHashKey`/`AntiHashKey`/
+`KeylessSemi` (which pin the CURRENT unnarrowed `Min == Syn` behavior at
+`existsUnnestSJInfo`'s own construction boundary — those stay correct
+statements about what `existsUnnestSJInfo` itself produces; the narrowing is
+a SEPARATE, later transformation the seam applies, the same relationship c7's
+`rebaseSemiAntiChainQual` already has to `existsUnnestSJInfo`'s un-rebased
+qual). Also confirm whether `MinRighthand` needs any equivalent narrowing (a
+priori no — `SynRighthand`/`MinRighthand` already correctly names exactly one
+atomic leaf, the whole EXISTS/NOT-EXISTS body, and PG's own plan treats that
+whole body as one unit too, e.g. the `Gather`/`HashAggregate` subtree over
+`store_sales`+`date_dim`).
+
+### 44.5 What Q69's real PG plan tells us about the target shape
+
+`bench/tpcds/plans-pg/Q69.txt` (real PG 18.3): innermost, `customer` joins
+directly to a `HashAggregate(GROUP BY ss_customer_sk)` over the
+`store_sales`⋈`date_dim` composite (PG's own unique-ify SEMI mechanism) via
+Nested Loop — BEFORE joining `customer_address` or `customer_demographics`
+at all. `ca`/`cd` join in next (both Nested Loop, both trivial single-row
+index lookups). Only at the very TOP does PG apply BOTH anti joins, as `Hash
+Right Anti Join` against the `web_sales`/`catalog_sales` composites, spanning
+the entire `{customer,ca,cd,semi}` composite by then. This is the shape
+c10's narrowing needs to make REACHABLE (not necessarily the shape goopg's
+own cost model will PICK — that is a separate, later question once the DP
+search can enumerate it at all).

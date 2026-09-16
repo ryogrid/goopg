@@ -1,129 +1,111 @@
-Task: M0142-0008a-3i-plumbing-c8 — LANDED and committed.
-`problemPairsOuterWithDerived`'s derived-input guard was misclassifying a
-semiAnti link's own multi-relation RHS leaf as "no statistics" purely
-because it has no single base table. Fixed with a provenance flag (not
-either candidate direction c7 filed literally — both failed on inspection,
-see below), verified with a real regression test + controlled
-fail-then-pass check, then root-caused the NEXT blocker (c9) as far as
-static inspection allows without instrumentation.
+Task: M0142-0008a-3i-plumbing-c9 — LANDED and committed. One real bug found
+and fixed (createUniquePath's schema-drift guard was declining on EVERY
+call), the next blocker root-caused and filed as c10.
 
 Files this loop:
-- internal/optimizer/cardinality.go: `baseRelInfo` gains
-  `isSemiAntiSyntheticLeaf bool` (new field, doc comment explains it).
-- internal/optimizer/joinsearchseam.go: the semiAnti synthetic-leaf loop
-  (`for k := range semiAnti`, ~line 665-686) now sets
-  `isSemiAntiSyntheticLeaf: true` on that leaf's `baseRelInfo` literal —
-  the same site that already prices it via `EstimateRows(scan)` instead of
-  a catalog lookup.
-- internal/optimizer/relfromjoinlist.go: `leafIsDerivedInput` (~line 522)
-  checks `info.isSemiAntiSyntheticLeaf` FIRST, returns `false` immediately
-  if set, before the Filter/Project-unwrap loop and the
-  CTEScan/WorkTableScan type switch.
-- internal/optimizer/semiantichain_test.go: new
-  `TestProblemPairsOuterWithDerivedSemiOverMultiRelationRHSDoesNotDecline`
-  — a Semi sj whose RHS item has the flag set must NOT decline. Verified
-  FAILS on pre-fix code (temporarily gated the check behind `if false &&
-  …`, confirmed the predicted failure, then restored the real fix).
-- docs/design/0100-0149/m0142-0008a-1-semi-anti-sji-design.md: new §43 —
-  why neither candidate (a) [fragile EstimateRows-value signal] nor
-  literal (b) [bitmask hand-exemption breaks the 2 pinned CTE tests]
-  survived (§43.1), the actual fix (§43.2), a residual gap deliberately
-  NOT fixed this loop (§43.3, nested CTE inside a multi-relation semiAnti
-  RHS body — no corpus query hits this), verification (§43.4-43.5), and
-  §43.6's root-cause lead for the next blocker (c9).
-- docs/design/README.md: m0142-0008a-1 row tail extended (Python exact-
-  string-replace on the c7-row anchor — do NOT full-file-rewrite this row,
-  it has embedded raw newlines/quotes).
-- .ralph/fix_plan.md: `-3i-plumbing-c8` flipped `[x]`; new
-  `-3i-plumbing-c9` filed (find what blocks `jointype=semi`/`anti` now
-  that Q69 clears every seam gate).
-- .ralph/deferral_ledger.md: new row, task-id `m0142-0008a-3i-plumbing-c8`
-  (covers both the c9 handoff AND the nested-CTE residual gap).
+- internal/optimizer/unnest.go: `existsUnnestSJInfo` gained a
+  `srcTableOffset int16` parameter; `SemiRhsExprs[i]` is now a fresh
+  `*ColumnRef` with `SourceTableIdx: prm.SubCol.SourceTableIdx +
+  srcTableOffset` (matching the sibling `innerKey` field's existing
+  expression) instead of assigning `prm.SubCol` verbatim. One production
+  call site updated (`unnestExistsExpr`).
+- internal/optimizer/exists_unnest_sjinfo_test.go: new assertion in
+  `TestExistsUnnestSJInfoSemiHashKey` pinning
+  `SemiRhsExprs[0].SourceTableIdx == j.RightKey.SourceTableIdx`. Verified
+  FAILS on pre-fix code (temporarily reverted just the `+srcTableOffset`
+  term, confirmed `= 1, want 3`, restored the fix).
+- internal/optimizer/semiantichain_test.go,
+  internal/optimizer/m0142_0008a_3i_plumbing_probe_test.go: updated the two
+  `existsUnnestSJInfo(...)` test call sites for the new 4th parameter
+  (pass `0`, both call with `params: nil` so the loop never executes).
+- docs/design/0100-0149/m0142-0008a-1-semi-anti-sji-design.md: new §44 —
+  method (throwaway env-gated instrumentation, reverted before commit),
+  finding 1 (the fixed bug, §44.2), finding 2 (the NOT-fixed c10 blocker,
+  §44.3), what c10 needs to do (§44.4), and PG's real Q69 plan shape as the
+  eventual target (§44.5).
+- docs/design/README.md: m0142-0008a-1 row tail extended (exact-string
+  Edit anchored on the c8-row's own trailing sentence — do NOT full-file
+  rewrite this row, it is one ~41KB line).
+- .ralph/fix_plan.md: `-3i-plumbing-c9` flipped `[x]`; new
+  `-3i-plumbing-c10` filed (narrow a semiAnti link's `MinLefthand`/
+  `MinRighthand` to the real referenced relation(s) instead of "whole
+  atomic outer/inner participant").
+- .ralph/deferral_ledger.md: new row, task-id `m0142-0008a-3i-plumbing-c9`
+  (covers the c10 handoff).
 
-Key symbols: `isSemiAntiSyntheticLeaf` (new field, cardinality.go
-baseRelInfo struct); `leafIsDerivedInput` (relfromjoinlist.go:522, now
-checks the flag first); the semiAnti synthetic-leaf loop in
-`tryPGShapedJoinSearch`-adjacent code (joinsearchseam.go ~line 665-686,
-sets the flag); `(*searchCtx).joinIsLegal` (joinsearchlevel.go:197) — the
-NEXT blocker's prime suspect, already has a SEMI "unique-ified RHS" arm
-calling `createUniquePath` (createuniquepath.go, landed as M0142-0008c-1/-2
-independently of this c-series, confirmed via `git log` to exist NOW even
-though the M0142-0008c recon row said it didn't back on 2026-09-16 — that
-recon finding is stale, don't trust it without re-checking); `buildInitialRels`
-(joinsearch.go:434, wraps every leaf incl. the synthetic one in
-`PathPrebuilt` via `newPrebuiltPath` — by inspection this satisfies one of
-createUniquePath's 3 preconditions, NOT traced with instrumentation).
+Key symbols: `existsUnnestSJInfo` (unnest.go:4398, now takes
+`srcTableOffset`); `unnestExistsExpr`'s `srcTableOffset` computation
+(unnest.go ~4644, unchanged — already correctly sized against
+`outerChild.Output()`); `createUniquePath` (createuniquepath.go, unchanged
+— its schema-drift guard was CORRECT, the bug was upstream of it);
+`jointypeForDirection`'s ANTI arm (joinpaths.go, unchanged — confirmed it
+has NO unique-ify fallback, correctly matching PG, which is WHY c10 must
+narrow `MinLefthand` rather than add one) — the c10 fix site is
+`joinsearchseam.go`'s semiAnti synthetic-leaf loop (~line 665-686).
 
-Findings: (1) c8's fix is real — full-corpus sweep still shows
-`semianti-on-qual`=0 (unchanged from c7) and NEW: `outer-over-derived` is
-gone from Q69's own decline set entirely (the 3 corpus-wide occurrences
-that remain are a DIFFERENT, unrelated query, confirmed by isolating Q69
-alone and seeing zero of that reason). (2) Per-query isolation on Q69
-alone: ZERO semiAnti-related or derived-input seam-declines — only ordinary
-DP-search noise (`reason=illegal`x22, `reason=no-join-clause`x6,
-`reason=strategy-or-mode`x1), the same channel every other query's search
-also emits while exploring join orders, not semiAnti-specific. This is
-qualitatively different from c5-c7's findings: Q69 no longer has ANY named
-seam-level blocker left to fix — the remaining gap is somewhere in
-ordinary DP-search legality/costing, not a firewall this milestone's
-c-series built. (3) `jointype=semi`/`anti` DPPATH is STILL zero, both
-corpus-wide and for Q69 specifically — reachability is NOT achieved this
-loop, only every seam-level precondition for it. (4) Checked
-`(*searchCtx).joinIsLegal` directly (not instrumentation): it already has
-real production code (not a stub) for a SEMI "already unique-ified, treat
-as ordinary inner join" admission arm via `createUniquePath`, landed as
-M0142-0008c-1/-2 at some point AFTER the M0142-0008c recon row (which said
-this mechanism was entirely absent) — did not confirm whether this is
-what Q69 needs. IMPORTANT correction to keep straight: Q69 is `customer,
-customer_address, customer_demographics WHERE … EXISTS(store_sales JOIN
-date_dim …) AND NOT EXISTS(web_sales JOIN date_dim …) AND NOT
-EXISTS(catalog_sales JOIN date_dim …)` (design doc §41.3) — ONE Semi link
-(the EXISTS) plus TWO Anti links (the two NOT EXISTS), not uniformly one
-or the other. `createUniquePath` explicitly requires `sjinfo.Jointype ==
-parser.JoinSemi`, so it can only ever apply to Q69's FIRST link; the two
-Anti links structurally cannot reach it regardless of what else is fixed.
-Whether the Semi link's own pairing is what's still blocked, and whether
-the two Anti links have some entirely different (not yet identified)
-blocker of their own, are both open — do not assume a single fix covers
-all three links. (5) Verified
-the flag-based fix cannot regress the two existing pinned CTE-on-RHS tests
-because they build `relInfos` directly in the test without ever setting
-the new flag or going through the synthetic-leaf construction site.
+Findings: (1) `createUniquePath` declined on every real call for Q69's
+SEMI leaf: `cr.Name`/`cr.Index` matched `child.Output()` correctly, but
+`cr.SourceTableIdx` (1, pre-remap) disagreed with `oc.SourceTableIdx` (5,
+post-remap). (2) Root cause: `SemiRhsExprs[i] = prm.SubCol` assigned the
+PRE-remap column verbatim, while the sibling `innerKey` field (built from
+the SAME `prm.SubCol`, a few lines above) already applies
+`+srcTableOffset` for the documented reason ("SubCol was harvested from the
+PRE-remap EXISTS body"). Fixed by giving `SemiRhsExprs` the identical
+treatment. (3) Post-fix, `createUniquePath` succeeds for Q69's SEMI leaf
+for the first time ever (confirmed via instrumentation: `SUCCESS
+rel=0x00000008 keyCols=[3]`) — `joinIsLegal`'s unique-ify admission arm now
+matches `rel1={customer} rel2={SEMI leaf}` with no error. (4) DP-search
+reachability (`jointype=semi`/`anti` DPPATH) is STILL zero for Q69 — the
+whole 6-relation search still fails ("failed to build any 4-way joins")
+because BOTH of Q69's ANTI links decline `illegal` at every level: their
+`MinLefthand` (0x0f / 0x1f) requires the ENTIRE preceding composite, not
+just `{customer}`. (5) This traces to `existsUnnestSJInfo`'s own
+`minL = clause & synL = synL` line (never narrows past "whole outer side"
+once a correlation column exists) — a KNOWN, documented gap ("-3 recomputes
+real bits once the RHS actually joins the search") that no loop in this
+c-series has actually closed yet; c6/c7/c9 each fixed a DIFFERENT field
+(joinInfoList population, qual `.Index` rebase, `SemiRhsExprs`
+`SourceTableIdx`) but never `MinLefthand` itself. (6) Confirmed via the
+actual SQL (`c.c_customer_sk` is the ONLY correlation column in all 3 of
+Q69's semiAnti links) that the true minimal `MinLefthand` is `{customer}`
+for all three — the broadening to "whole composite so far" is a
+processing-order artifact of `unnestExistsExpr` nesting each new conjunct's
+join around the accumulated tree, not a real dependency between the three
+independent (ANDed) WHERE-clause conjuncts.
 
-Next step: pick up **M0142-0008a-3i-plumbing-c9** — per finding (4),
-`createUniquePath`'s SEMI-only gate can only ever matter for Q69's ONE
-Semi link (the EXISTS), never its two Anti links (the two NOT EXISTS), so
-do not assume fixing/confirming one gives you all three. Also check
-whether the search DOES admit the pairing but costing simply never
-prefers it (a different class of task than an admission bug — grep DPPATH
-for `jointype=anti`/`semi` with `verdict=` to see if any such candidate is
-ever OFFERED at all, dominated or not, rather than assuming zero DPPATH
-lines means zero offers were even attempted). Start by instrumenting Q69's
-specific pairing attempts in `joinIsLegal` (env-gated, throwaway, revert
-before commit per this milestone's established discipline) — static
-reading has likely exhausted its value for this specific blocker.
+Next step: pick up **M0142-0008a-3i-plumbing-c10** — narrow `MinLefthand`/
+`MinRighthand` at SPLICE TIME (joinsearchseam.go's semiAnti synthetic-leaf
+loop, ~line 665-686 — NOT at `existsUnnestSJInfo` construction time, before
+the outer side's real flat-leaf numbering exists) by resolving each
+correlation column (`params[i].OuterRef`/residual columns) against the
+outer's real numbering and intersecting, analogous to
+`sjiClauseRelids`/`makeSpecialJoinInfoScoped` (specialjoin.go). Must not
+regress `TestExistsUnnestSJInfoSemiHashKey`/`AntiHashKey`/`KeylessSemi`
+(those correctly pin `existsUnnestSJInfo`'s OWN un-narrowed output; the
+narrowing is a later seam-side transformation). Re-run Q69's `EXPLAIN` +
+full-corpus `GOOPG_PGSHAPED_DP_TRACE=1` sweep + TPC-DS SF0.25 sweep after
+landing.
 
 Gates run this loop: `go build ./...` clean; `go test
-./internal/optimizer/...` green (13/13 TestProblemPairsOuterWithDerived*
-cases including the new one; includes a controlled fail-then-pass check
-against the pre-fix code before committing). Full-corpus
-`GOOPG_PGSHAPED_DP_TRACE=1` sweep (private binary `tmp/goopg-m0142-c8-bin`,
-built+removed this loop) — 96/100 EXPLAINs succeeded (4 pre-existing
-unrelated parse gaps, unchanged), 150,255 DPPATH lines, 0
-`jointype=semi`/`anti`, seam-decline reasons: `semianti-link-no-sjinfo`=3
-(unchanged), `semianti-on-qual`=0 (unchanged from c7), `outer-over-derived`=3
-(now a different, unrelated query — confirmed via per-query isolation that
-Q69 contributes zero of these). `scripts/tpcds-sf025-regression.sh sweep`
-(private binary) PASS=96 MISMATCH=0 CKMISMATCH=0 ERROR=0, PLAN-SHAPE
-same=99 changed=0 vs the c7 commit (Q78 byte-identical, checksum unchanged
-since c2). `RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh` —
-same pre-existing `internal/parser` `GroupedJoinUnaliased` AST-drift
-failure as every recent loop (`internal/optimizer` itself green,
-re-confirmed with a direct `go test ./internal/optimizer/...` run). `make
-ralph-state-guard` auto-repaired the same benign prior-loop clean-exit
-marker seen every recent loop, then PASS. Commit's own pre-commit hook
-runs the pgbench smoke.
+./internal/optimizer/...` green (includes the fail-then-pass check above,
+plus the full targeted SEMI/ANTI/`createUniquePath`/`existsUnnestSJInfo`
+test set run individually first). Row-count spot-check against the
+git-tracked SF0.25 oracle via direct psql queries against a freshly
+restarted sf025 server (private binary `tmp/goopg-m0142-c9-bin`,
+built+removed this loop): Q69 = 100 rows (oracle: 100), Q78 = 15 rows /
+checksum `c06cf981a7819a37` (oracle: identical) — both unchanged, as
+expected. **Could NOT run** `scripts/tpcds-sf025-regression.sh sweep` —
+`ci/batch`'s nightly run held the shared SF0.25/SF1 lanes all session (its
+own collision guard: "the nightly CI batch is running ... would
+contaminate these timings"); the spot-checks above are the substitute
+evidence — run the full sweep at the next opportunity.
+`RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh` — PASS except
+the same pre-existing `internal/parser` `GroupedJoinUnaliased` AST-drift
+failure every recent loop has hit (unrelated, already tracked under
+M-NIGHTLY); `internal/optimizer` itself green. `make ralph-state-guard`
+auto-repaired the same benign prior-loop clean-exit marker seen every
+recent loop, then PASS. Commit's own pre-commit hook runs the pgbench
+smoke.
 
 In-flight: none. Private trace binary and sf025 server both stopped/removed
-(`GOOPG_BIN=tmp/goopg-m0142-c8-bin bench/tpcds/server.sh stop sf025`, then
-`rm tmp/goopg-m0142-c8-bin`).
+this loop before the final gates ran.

@@ -4395,7 +4395,7 @@ func liftResidualConjunctsWithOffset(residuals, innerOnly []Expr, outerSchema Sc
 // -3 recomputes real bits once the RHS actually joins the search. The field
 // is attached but has no reader today, so this numbering choice cannot
 // change any plan.
-func existsUnnestSJInfo(jt JoinType, params []unnestParam, residuals []Expr) *SpecialJoinInfo {
+func existsUnnestSJInfo(jt JoinType, params []unnestParam, residuals []Expr, srcTableOffset int16) *SpecialJoinInfo {
 	const synL, synR RelSet = 1, 2
 
 	pjt := parser.JoinSemi
@@ -4449,9 +4449,23 @@ func existsUnnestSJInfo(jt JoinType, params []unnestParam, residuals []Expr) *Sp
 		// param here IS one such conjunct by construction (the EXISTS
 		// pull-up only produces equijoin pairs), and SubCol is already its
 		// RHS (subquery-side) operand — no re-derivation needed.
+		//
+		// M0142-0008a-3i-plumbing-c9: SubCol was harvested from the
+		// PRE-remap EXISTS body, same as innerKey above — cloned with
+		// +srcTableOffset rather than assigned verbatim, or
+		// createUniquePath's schema-drift guard (comparing against
+		// child.Output(), which IS post-remap) declines every call ("oc.
+		// SourceTableIdx != cr.SourceTableIdx") even though Name and Index
+		// both already agree.
 		sj.SemiRhsExprs = make([]Expr, len(params))
 		for i, prm := range params {
-			sj.SemiRhsExprs[i] = prm.SubCol
+			sj.SemiRhsExprs[i] = &ColumnRef{
+				pos:            prm.SubCol.Pos(),
+				Index:          prm.SubCol.Index,
+				Name:           prm.SubCol.Name,
+				Type:           prm.SubCol.Type,
+				SourceTableIdx: prm.SubCol.SourceTableIdx + srcTableOffset,
+			}
 		}
 	}
 
@@ -4777,7 +4791,7 @@ func unnestExistsExpr(ex *ExistsExpr, outer Node) (Node, error) {
 		Right:     innerPlan,
 		Predicate: joinPredicate,
 		schema:    append(Schema(nil), outerChild.Output()...),
-		SJInfo:    existsUnnestSJInfo(joinType, params, eup.Residuals),
+		SJInfo:    existsUnnestSJInfo(joinType, params, eup.Residuals, srcTableOffset),
 	}
 	if outerKey != nil {
 		join.LeftKey = outerKey
