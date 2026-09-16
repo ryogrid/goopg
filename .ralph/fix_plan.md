@@ -3873,11 +3873,30 @@ cross-layer programme that has never been scoped.
     narrower — only 3 preamble reads need it, not the whole chain walk);
     (b) a parallel entry point bypassing `tryPGShapedJoinSearch`'s
     preamble that reuses only its post-preamble, already-unnest-agnostic
-    DP-core logic. **Next: decide between (a)/(b) (design decision, not
-    yet scoped as code) before touching `predp.go` or `joinsearchseam.go`
-    again** — coding the `predp.go` descend-loop extension as originally
-    planned would have hit the same "leaf-count" decline and stayed just
-    as inert, for a reason that change alone cannot fix.
+    DP-core logic.
+    **§30's (a)/(b) decision SETTLED (design doc §31, 2026-09-16) — neither:
+    a third option (c).** `extractSearchLeaves` already returns `semiAnti
+    []semiAntiChainLink`, whose `.rhs RelSet` bits mark exactly which
+    `scans` indices are synthetic; `tryPGShapedJoinSearch` (`:309`) already
+    receives this value and just discards it (`_`). Reusing it needs no
+    `ctx.bindings`/`ctx.joinlist` mutation (beats (a): no reopening of
+    §24.2's ~24-consumer visibility risk) and no duplicate code path (beats
+    (b): no second seam to keep in sync). Fix, not yet coded: (1) leaf-count
+    check becomes `len(scans) != nprefix+numSynthetic`, `nprefix` itself
+    UNCHANGED; (2) the per-leaf offset-agreement loop walks `ctx.bindings`
+    with a separate counter that skips synthetic indices; (3) **a THIRD,
+    previously-undiscovered bug in the same preamble**: the
+    spine-offset-disagreement check's `prefixTotalWidth :=
+    cumOffsets[len(cumOffsets)-1].hi` silently reads a SYNTHETIC leaf's
+    out-of-band span whenever that leaf is LAST in walk order (a bare
+    trailing `EXISTS`, plausibly the common case) instead of the real total
+    width — needs `buildLeafSpans` to also return the real-only running
+    total, or an equivalent local recomputation. **Next loop: code §31.3's
+    three-check fix in `tryPGShapedJoinSearch`, gated behind a direct
+    unit-test call only (production stays `admitSemiAnti=false`, so this
+    stays fully inert) — do NOT combine with the `predp.go` descend-loop
+    reachability change (§30's original step (i) target); that remains a
+    separate, later, higher-blast-radius loop per §31.4.**
   **Independent, unfiled resume-point hint** (not sized/numbered — noted for
   whoever picks up S5a's own eligibility gate): relaxing
   `whereEligibleForPreDPUnnest` to per-sublink granularity would upgrade

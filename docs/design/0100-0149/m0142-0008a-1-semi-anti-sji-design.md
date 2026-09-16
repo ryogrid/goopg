@@ -3438,3 +3438,118 @@ the `:314` "leaf-count" decline and is therefore just as inert as today, for
 a reason the descend-loop change itself cannot fix. `M0142-0008c-3c`/`-3d`
 remain available to pick up independently once `-3i-plumbing-b2` lands
 (Finding 1) but are not themselves blocking step (i)'s design decision.
+
+## 31. §30's (a)/(b) decision settled — neither: a third option, (c), reuses
+`semiAnti`'s own leaf-position data and touches neither `ctx.bindings` nor
+`tryPGShapedJoinSearch`'s call shape (2026-09-16)
+
+Re-read §30's two candidates against `extractSearchLeaves`'s actual return
+shape (`joinsearchseam.go:1093`) and `buildLeafSpans`'s actual body
+(`:1316-1335`, landed by §27) before choosing, rather than picking blind
+between the two framed options. Both turn out to be worse than a third
+option neither §24.2 nor §30 considered, because both were framed before
+`semiAnti []semiAntiChainLink` existed as a return value with enough
+information to avoid the trade-off entirely.
+
+### 31.1 `extractSearchLeaves` already tells the caller exactly which `scans`
+indices are synthetic — `tryPGShapedJoinSearch` just never asked
+
+Every `semiAntiChainLink` carries `rhs RelSet` — a single-bit set marking the
+synthetic leaf's own walk position (`joinsearchseam.go:1152-1159`:
+`loRight := len(scans)` captured immediately before the one `scans = append(
+scans, j.Right)`, so `rhs` always covers exactly one index). `len(semiAnti)`
+is therefore the exact count of synthetic leaves in `scans`, and OR-ing every
+`.rhs` together (exactly what `buildLeafSpans:1317-1319` already does
+locally, as `synthetic RelSet`) gives the caller a bitset answering "is
+`scans[i]` synthetic" for every `i`, using data `extractSearchLeaves` already
+computes and already returns. `tryPGShapedJoinSearch` (`:309`) captures
+`semiAnti` today only to discard it (`_` — the fifth return value, verified
+live at `:309`); it never needed a NEW field or a NEW call, only to stop
+throwing this one away.
+
+### 31.2 Why this beats both §30 candidates
+
+- **vs. (a) — widen `ctx.bindings`/`ctx.joinlist`:** (a) was framed as
+  "narrower than §24.2's full audit, since only 3 preamble reads need the
+  count" — true, but "the count" was never the hard part; the hard part
+  §24.2 found was a LIVE entry becoming visible to whichever of the ~24
+  consumer sites iterate `ctx.bindings` without a guard (the `FOR UPDATE`
+  nil-deref). Any live append to the shared slice reopens that regardless of
+  how few of *this* function's own reads intended to use it — visibility is
+  a property of the slice, not of the reader. §31.1 needs zero entries
+  appended anywhere: `semiAnti` is a value already flowing into this exact
+  function on every call, scoped to its own stack frame.
+- **vs. (b) — a parallel entry point reusing only the post-preamble DP
+  core:** (b)'s own stated cost was "a second code path through the search
+  seam that has to be kept in sync with the first" — a real ongoing
+  maintenance tax, and it does not remove the preamble's actual job (the
+  `nrels`/`nprefix`/size/offset checks exist to catch a real desync class,
+  per the `R41` comment at `:263-266` — TPC-DS Q78 hit exactly this before
+  R41 existed). Duplicating the seam does not need to happen: §31.1's data
+  lets the EXISTING preamble absorb synthetic leaves with local arithmetic,
+  not a bypass.
+
+### 31.3 The three preamble checks, corrected (design only — not coded this
+loop)
+
+Using `synthetic := OR of semiAnti[*].rhs` (computed once, mirroring
+`buildLeafSpans`'s own local variable) and `numSynthetic := len(semiAnti)`:
+
+1. **`:314`'s leaf-count check** — `len(scans) != nprefix` becomes
+   `len(scans) != nprefix+numSynthetic`. `nprefix` itself (`jl.nrels()`,
+   real-FROM-item count from `ctx.joinlist`) is UNCHANGED — synthetic leaves
+   are never real FROM items, so widening `nprefix` itself (part of what
+   (a) proposed) would have been wrong on its own terms, independent of the
+   visibility question.
+2. **`:333`'s per-leaf offset-agreement loop** (`ctx.bindings[i].offset !=
+   cumOffsets[i].lo`) — currently assumes `scans[i]` and `ctx.bindings[i]`
+   are the same real item at the same index, which a synthetic leaf breaks
+   for every real leaf positioned at-or-after it (an off-by-however-many-
+   synthetic-leaves-precede-it shift, not just a length mismatch). Fix: walk
+   `scans` with `i`, walk `ctx.bindings` with a SEPARATE counter `j` that
+   only advances past real leaves — `if synthetic&leafRangeRelSet(i,i+1) !=
+   0 { continue }` (skip: no real-FROM oracle exists to check a synthetic
+   leaf against), else compare `ctx.bindings[j].offset == cumOffsets[i].lo`
+   and `j++`.
+3. **`:347`'s spine-offset-disagreement check** (`ctx.bindings[nprefix]
+   .offset != prefixTotalWidth`, `prefixTotalWidth := cumOffsets[len(
+   cumOffsets)-1].hi`) — **found broken by this same trace, independent of
+   (a)/(b)/(c):** `buildLeafSpans` (§27) places synthetic leaves' spans
+   OUT-OF-BAND, appended after the total REAL width, but `spans[]` itself
+   stays indexed by WALK position, not partitioned real-then-synthetic — so
+   whenever the LAST leaf in walk order happens to be the synthetic one (an
+   `EXISTS` clause with nothing joined after it inside the prefix — plausibly
+   the common case, not a corner one), `cumOffsets[len(cumOffsets)-1].hi`
+   reads the SYNTHETIC leaf's out-of-band `hi`, which is `totalRealWidth +
+   (that leaf's own width)`, not `totalRealWidth`. Comparing that against
+   `ctx.bindings[nprefix].offset` (a real, FROM-clause-derived quantity) would
+   false-decline every such shape. Fix: `prefixTotalWidth` must be the REAL
+   total width only — either have `buildLeafSpans` additionally return the
+   `realOffset` value it already computes internally (`:1327`) as a second
+   result, or compute it locally in the preamble as `sum(widths[i] for i
+   where synthetic bit at i is unset)`. This was not visible from §30's
+   framing (which treated `cumOffsets`/`prefixTotalWidth` as already correct
+   and only `nrels`/`nprefix` as needing attention) — it only surfaced from
+   reading `buildLeafSpans`'s body against this specific call site's usage,
+   not from re-deriving the design.
+
+### 31.4 Resume point
+
+Design settled: **(c)**, not (a) or (b) — reuse `semiAnti`'s own
+leaf-position bits, no `ctx.bindings`/`ctx.joinlist` mutation, no duplicate
+DP entry point. §31.3 items 1-2 are mechanical once `synthetic`/`numSynthetic`
+exist locally; item 3's `prefixTotalWidth` fix is a small, separate
+correction inside the same change (not a new blocker — same commit). None of
+this is coded yet: this loop is design-only, matching §30's own scoping-pass
+precedent. Next loop should: (i) land §31.3's three-check fix in
+`tryPGShapedJoinSearch` gated behind a direct unit-test call (mirroring
+`-3i-plumbing-b1`'s "prove inert before wiring" shape: `admitSemiAnti` stays
+`false` at the one production call site, so this is still fully inert in
+production); (ii) THEN, in a later loop, do the `predp.go` descend-loop
+extension (§30's original step (i) target) to actually feed a Semi/Anti-
+bearing tree into `tryJoinSearch` and flip `admitSemiAnti=true` at the
+production call site, verified against a live end-to-end fixture per §27.4's
+existing gate. Do not collapse (i) and (ii) into one loop — (i) alone is
+already a full preamble-logic change worth its own verification pass, and
+(ii) is the higher-blast-radius live-DP-routing change §28.3/§29 already
+flagged as needing to be bounded on its own.
