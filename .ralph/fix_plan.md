@@ -5130,6 +5130,41 @@ cross-layer programme that has never been scoped.
   ./internal/optimizer/...` clean after revert. Scratch cluster/binary/logs
   (`/tmp/c21data`, `/tmp/c21-*.log`, `tmp/goopg-c21-bin`) fully removed;
   `goopg-c21-test.scope` confirmed not loaded.
+- [x] **M0142-0008a-3i-plumbing-c22 — recheck: does closing c1-c21 finally
+  make `M0142-0008c-3c`/`-3d`/`-4`'s unique-ify substitution reachable?**
+  — filed by this loop, prompted by c21's closure of the plumbing chain
+  and by `-3c`'s own "blocked on plumbing-c" framing (design doc §35),
+  which needed re-checking now that the cited blocker is resolved. **DONE
+  2026-09-17 (design doc §58), answer is NO, for a structural reason
+  independent of c1-c21 and independent of Q78's firewall.**
+  `jointypeForDirection`'s SEMI/ANTI/RIGHT arm (`joinpaths.go:216-243`) is
+  the sole entry point `-3a`/`-3b`/`-3c`/`-3d`/`-4` share; its unique-ify
+  fallback only fires for `sjinfo.Jointype == parser.JoinSemi`. Live-traced
+  (temporary `GOOPG_C22DEBUG=1` `fmt.Fprintf` calls at the arm's entry and
+  at the fallback itself, reverted before commit) against the full TPC-DS
+  SF0.25 corpus (`scripts/tpcds-sf025-regression.sh sweep`, private
+  `GOOPG_BIN=tmp/goopg-c22-bin` to avoid the shared-binary collision with
+  the live nightly TPC-H lane): the arm is entered **zero times** across
+  all 96 completing queries. Root cause: the EXISTS/IN family never reaches
+  it (pinned pre-DP, c21 §57); IN-unnesting never sets `.SJInfo` (c6 §41);
+  and the one confirmed DP-reachable producer (`reduce_outer_joins`'s ANTI
+  demotion, c19) is unconditionally `parser.JoinAnti`, which the
+  `JoinSemi`-only fallback gate excludes — so even fully lifting Q78's
+  `outer-over-derived` firewall (gated on B-06) would NOT make `-3d`/`-4`
+  reachable, correcting their prior resume-point framing. Sweep unchanged
+  (`PASS=96 MISMATCH=0`, `PLAN-SHAPE: same=99 changed=0`). All
+  instrumentation reverted (`git checkout -- internal/optimizer/joinpaths.go`,
+  confirmed empty `git diff --stat`); `go build ./internal/optimizer/...`
+  clean after revert. Private binary (`tmp/goopg-c22-bin`) removed; the
+  shared SF0.25 goopg cluster (`:65437`) left running per this milestone's
+  convention for that semi-persistent resource. No deferral-ledger row:
+  nothing new left unimplemented — `-3d`/`-4`'s existing unchecked entries
+  already record the open work; this recon only corrects their resume
+  point (now updated in place, see M0142-0008c-3d/-4 below). The actual
+  unblock — teaching an IN-unnesting path to set `.SJInfo` on a
+  DP-search-visible `JoinSemi` link, the way c19 did for ANTI — is
+  unfiled, separate, larger work, not sized for a single loop; a future
+  loop should file it as its own scoping recon before implementing.
 - [x] **M0142-0008c — scoping recon: does goopg need PG's `create_unique_path`
   (semi-join → de-duplicate RHS + inner join) to reach parity on TPC-DS
   Q10/Q35?** — filed by M0142-0008a-3(iii)'s §4.3 gate re-run (design doc §6).
@@ -5325,9 +5360,26 @@ cross-layer programme that has never been scoped.
   **M0142-0008a-3i-plumbing-c** (under the M0142-0008a milestone section).
 - [ ] **M0142-0008c-3d — merge + partial-nestloop unique-ify substitution**
   — filed by M0142-0008c-3's recon (design doc §19.4 item 3d). Depends on
-  M0142-0008c-3a. **Shares -3c's exact blocker (design doc §35, 2026-09-16)**:
-  read §35 before re-running the reachability recon — it is already answered
-  and points at `M0142-0008a-3i-plumbing-c`, not at this item. Still not
+  M0142-0008c-3a. **RECHECKED 2026-09-17 (design doc §58), still deferred,
+  updated reason**: `M0142-0008a-3i-plumbing-c`'s whole chain (c1-c21) is
+  now closed and the DP search's semiAnti admission logic is confirmed
+  correct end-to-end, so §35's original "blocked on plumbing-c" framing no
+  longer applies — but a live `GOOPG_C22DEBUG=1` trace over the full
+  TPC-DS SF0.25 corpus found `jointypeForDirection`'s SEMI/ANTI/RIGHT arm
+  (the only entry point -3c/-3d/-4 share) is entered **zero times**
+  corpus-wide even now. The real, structural reason: no code path anywhere
+  in the corpus hands it a `parser.JoinSemi` `*SpecialJoinInfo` for a
+  searched pair — the EXISTS/IN family is pinned pre-DP (never reaches
+  this arm, c21 §57), IN-unnesting never sets `.SJInfo` (c6 §41), and the
+  one confirmed DP-reachable producer (`reduce_outer_joins`'s ANTI
+  demotion, c19) is unconditionally ANTI, which the unique-ify fallback's
+  own `sjinfo.Jointype == parser.JoinSemi` gate excludes regardless of
+  Q78's `outer-over-derived` firewall. **Do not pick this up by lifting
+  Q78's firewall or waiting on B-06** — that would not unblock it. The
+  actual unblock is unfiled: teach an IN-unnesting path (or a future EXISTS
+  variant) to set `.SJInfo` on a DP-search-visible `JoinSemi` link, the
+  same way c19 did for ANTI. Read design doc §58 before re-running this
+  recon again. Still not
   picked up. Deferred for the same reason as 3c
   otherwise: `sortInnerAndOuter`/`matchUnsortedOuterMerge`/
   `matchUnsortedOuterMergePartial` (merge) and `addPartialNestLoopPaths`
@@ -5343,7 +5395,14 @@ cross-layer programme that has never been scoped.
   PG's plan has none because a unique index already proved distinctness
   (PG oracle: `pathnode.c:1932-1985`'s NOOP branches — unique-index proof
   and provably-distinct-subquery-output proof). Resume point: design doc
-  §16.1-16.2.
+  §16.1-16.2. **RECHECKED 2026-09-17 (design doc §58): shares -3d's
+  reachability gap.** `createUniquePath` (the function -4 would modify) is
+  only ever invoked from `jointypeForDirection`'s unique-ify fallback
+  today, which a corpus-wide live trace confirmed is entered zero times
+  (see -3d's updated entry for the full finding) — so -4 would be
+  unreachable in production the moment it lands too, for the same
+  structural reason (no `parser.JoinSemi` producer reaches the search yet),
+  independent of Q78's firewall. Do not pick up ahead of that unblock.
 - [x] **M0142-0008d — EXPLAIN mislabels the outer relation's alias in a
   self-correlated EXISTS where inner and outer share a table name** — filed
   by M0142-0008a-3(iii)'s §4.3 gate re-run (design doc §6). **DONE 2026-09-16

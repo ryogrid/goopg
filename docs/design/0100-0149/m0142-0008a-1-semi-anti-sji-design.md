@@ -7119,3 +7119,92 @@ short-cut — the recon's conclusion is that the prior "0/96" framing itself
 was the defect, now corrected, and the family already has full parity on
 this axis. Nothing else in the M0142-0008a-3i-plumbing chain currently
 depends on this question, so there is no follow-on resume point.
+
+## 58. M0142-0008c-3d/-4 recheck — `jointypeForDirection`'s SEMI/ANTI/RIGHT arm is confirmed UNREACHED corpus-wide, even after c21; do NOT implement -3d/-4 yet
+
+**Question.** With `M0142-0008a-3i-plumbing-c` (c1-c21) now fully closed —
+the DP search's semiAnti admission logic (SJInfo threading, on-qual
+placement, coordinate rebase) is "fully correct end-to-end" per c21's own
+resume note — is `M0142-0008c-3c`'s blocker ("no real Semi/Anti
+`SpecialJoinInfo` ever reaches `addPathsToJoinrel`") now lifted? If so,
+`-3d` (merge/parallel-NL unique-ify) and `-4` (unique-index NOOP fast path)
+would be doing real, reachable work the moment they land, changing their
+priority relative to the rest of the banner.
+
+**Answer: no, and the reason is structural, not Q78's firewall.**
+`jointypeForDirection`'s `case parser.JoinRight, parser.JoinSemi,
+parser.JoinAnti:` arm (joinpaths.go:216-243) is the ONLY place
+`M0142-0008c-3a`/`-3b`/`-3c`'s unique-ify substitution can fire from — and
+it requires a searched pair whose `*SpecialJoinInfo` is already sitting in
+`ctx.joinInfoList` (`addPathsToJoinrel`'s caller reads it off there, per
+c6/§41). Reading who can put one there, corpus-wide, for TPC-DS:
+
+1. The EXISTS/IN family (Q10/Q16/Q35/Q69/Q94, and by extension every other
+   TPC-DS query that unnests cleanly) never reaches this arm at all — c21
+   (§57) already established their Semi/Anti joins are pinned OUTSIDE the
+   DP search by `unnestExistsExpr`/S5a, so `jointypeForDirection` is never
+   even called for them; `runJoinSearchBelowPinned` only re-searches the
+   subtree strictly below the pin.
+2. `unnest.go`'s IN/NOT-IN unnesting paths (`:3453`/`:3588`/`:4726`) never
+   set `.SJInfo` at all (c6's own doc comment, §41) — even if they did
+   reach the search, they contribute nothing to `ctx.joinInfoList` today.
+3. The one confirmed DP-search-reachable producer, `reduce_outer_joins`'s
+   LEFT→ANTI strength reduction (c19's placeholder `.SJInfo`, exercised by
+   Q78), is unconditionally `parser.JoinAnti`. Line 235 of
+   `jointypeForDirection` gates the entire unique-ify fallback on
+   `sjinfo.Jointype == parser.JoinSemi` — **ANTI never takes this branch,
+   regardless of whether Q78's own `outer-over-derived` firewall (c20,
+   §56) is lifted.** Lifting B-06 and un-firewalling Q78 would still not
+   make `-3c`/`-3d`/`-4` reachable, because Q78's join is the wrong
+   jointype for the fallback that exists.
+
+So today there is no code path, anywhere in the corpus, that hands
+`jointypeForDirection` a `parser.JoinSemi` `*SpecialJoinInfo` for a
+searched pair — the unique-ify fallback's precondition is unmet
+independent of Q78.
+
+**Verified live, not just by inspection.** Two temporary
+`GOOPG_C22DEBUG=1`-gated `fmt.Fprintf(os.Stderr, ...)` calls were added:
+one at the `case parser.JoinRight, parser.JoinSemi, parser.JoinAnti:` entry
+(logs jointype/outer/inner/MinLefthand/MinRighthand on every call reaching
+the arm, i.e. before either the containment check or the unique-ify
+fallback can decide anything) and one immediately before the unique-ify
+fallback itself (would additionally log `SynRighthand` for calls that fall
+through the containment check). Ran the full TPC-DS SF0.25 corpus
+(`scripts/tpcds-sf025-regression.sh sweep`, private `GOOPG_BIN=tmp/goopg-c22-bin`
+to avoid the shared-binary collision with the live nightly TPC-H lane
+already running from `tmp/goopg-bench-bin`) with the env var exported.
+Result: `grep -c C22DEBUG bench/tpcds/runtime_goopg/goopg.sf025.log` → **0**.
+Neither print fired even once across all 96 completing queries — the
+`case` arm itself is never entered, confirming finding 1/2/3 above by
+direct observation rather than by code-reading alone. Sweep itself:
+`PASS=96 MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0 SKIP=3` (unchanged from
+the pre-instrumentation baseline), `PLAN-SHAPE: queries=99 same=99
+changed=0` (the temporary print is on a decline/no-op path either way, so
+zero plan impact was expected and confirmed). Both `fmt.Fprintf` calls and
+their `os` import were reverted (`git checkout --
+internal/optimizer/joinpaths.go`), confirmed by an empty `git diff --stat`
+on that file; `go build ./internal/optimizer/...` clean after revert. The
+private binary (`tmp/goopg-c22-bin`) was removed; the shared SF0.25 goopg
+cluster (`:65437`) was left running, matching this milestone's convention
+for that semi-persistent bench resource (it is not a throwaway per-task
+cluster, unlike the schema-only clusters c20/c21 each stood up and tore
+down).
+
+**Disposition: no code change; `M0142-0008c-3d`/`-4` stay unchecked and
+correctly deferred, but for a firmer reason than either carried before.**
+Their existing fix_plan entries cited Q78's `outer-over-derived` firewall
+as the shared blocker (via `-3c`'s design-doc §35 pointer); that framing
+undersold the gap. Implementing `-3d`/`-4` today would add more code
+reachable only from direct unit tests, exactly like `-3a`/`-3b`/`-3c`
+already are — not a wrong thing to eventually do (PG's own `SEMI` unique-
+ify precedent is real and Q10/Q35 may need it once a SEMI-jointype
+producer exists), but not yet a productive use of a loop, since nothing in
+the corpus can exercise it. The actual unblock is a **new, unfiled**
+mechanism — teaching one of the IN-unnesting paths (or a future EXISTS
+variant) to set `.SJInfo` on a DP-search-visible `parser.JoinSemi` link,
+the same way c19 did for the ANTI case — not Q78's firewall and not B-06.
+No deferral-ledger row: nothing new was left unimplemented this loop:
+`-3d`/`-4`'s existing unchecked fix_plan entries already record the
+open work, and this recon only replaces their resume-point framing with a
+correct one (see fix_plan.md M0142-0008c-3d/-4 for the updated text).
