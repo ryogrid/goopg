@@ -113,6 +113,16 @@ const (
 	// subtree off the bottom of that chain and hands the shape to
 	// `splitAggregate`, the same constructor the post-pass uses.
 	PathFinalizeAgg
+
+	// PathUnique is `createUniquePath`'s (M0142-0008c-1) SEMI-join
+	// de-duplication candidate — PG's `UniquePath` (pathnodes.h:2229).
+	// Produced only by `createUniquePath` (createuniquepath.go) and
+	// consumed only by `createUniquePlan`: goopg has no hash-keyed-subset
+	// dedup node (`*Distinct` hash-dedups on every output column, never a
+	// subset), so unlike `PathDistinct` this kind always emits `*DistinctOn`
+	// — the streaming keyed dedup already reused for DISTINCT's own
+	// unique-over-sorted candidate — over the Sort child this path stacks.
+	PathUnique
 )
 
 // Path is one way to produce a relation, with a cost and an ordering. It is kept
@@ -194,6 +204,14 @@ type Path struct {
 	// (C-16b). Never pruned on: costs alone decide, exactly as for every
 	// other path attribute above.
 	Unique bool
+
+	// UniqueKeyCols is a PathUnique's dedup key: positions into
+	// Children[0]'s eventual built `Node.Output()` (validated against
+	// `SpecialJoinInfo.SemiRhsExprs` by `createUniquePath` at Path-build
+	// time — see its doc comment for why this requires Children[0] to be a
+	// `PathPrebuilt` today). `createUniquePlan` passes it straight to the
+	// emitted `*DistinctOn.KeyCols`. nil for every other kind.
+	UniqueKeyCols []int
 
 	// Window is the window SPEC a PathWindow evaluates — the `*WindowAgg`
 	// `buildWindowStage` built for one spec group (PartitionBy, OrderBy,
@@ -533,6 +551,21 @@ type RelOptInfo struct {
 
 	CheapestTotal   *Path
 	CheapestStartup *Path
+
+	// CheapestUnique is PG's `RelOptInfo.cheapest_unique_path`
+	// (pathnodes.h:967): the cached, at-most-once-built result of
+	// `createUniquePath` (M0142-0008c-1) — a dedup of this rel's
+	// `CheapestTotal` keyed by a SEMI join's correlation columns
+	// (`SpecialJoinInfo.SemiRhsExprs`), letting `joinIsLegal`'s
+	// `unique_ified` admission arm (M0142-0008c-2, not yet wired) join the
+	// unique-ified RHS with any LHS rather than only its syntactic
+	// `MinRighthand`. nil until `createUniquePath` succeeds; also nil,
+	// permanently, when the rel cannot be unique-ified
+	// (`!SemiCanBtree && !SemiCanHash`, or no correlation columns) — PG
+	// re-derives that failure every call rather than caching it (a Go
+	// sentinel would need a tri-state), which is cheap: the guard clauses
+	// short-circuit before any Path is built.
+	CheapestUnique *Path
 
 	// ConsiderStartup / ConsiderParamStartup are PG's per-rel
 	// `consider_startup` / `consider_param_startup` (pathnodes.h:889-890), and

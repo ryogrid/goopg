@@ -4442,6 +4442,17 @@ func existsUnnestSJInfo(jt JoinType, params []unnestParam, residuals []Expr) *Sp
 	// rather than re-parsing the predicate.
 	if pjt == parser.JoinSemi && len(params) > 0 {
 		sj.SemiCanBtree, sj.SemiCanHash = true, true
+		// SemiRhsExprs (specialjoin.go's declared, previously-never-
+		// populated field — M0142-0008c-1 found this by grep, not
+		// inference): PG's compute_semijoin_info collects the RHS operand
+		// of each AND'ed equality conjunct (initsplan.c:2129-2138). Every
+		// param here IS one such conjunct by construction (the EXISTS
+		// pull-up only produces equijoin pairs), and SubCol is already its
+		// RHS (subquery-side) operand — no re-derivation needed.
+		sj.SemiRhsExprs = make([]Expr, len(params))
+		for i, prm := range params {
+			sj.SemiRhsExprs[i] = prm.SubCol
+		}
 	}
 
 	return sj

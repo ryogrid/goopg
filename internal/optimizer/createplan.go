@@ -149,6 +149,10 @@ func createPlanNodeUnpriced(p *Path) (Node, outputLayout) {
 	case PathDistinct:
 		// C-16: the DISTINCT upper rel's candidate. createplansimple.go.
 		return createDistinctPlan(p)
+	case PathUnique:
+		// M0142-0008c-1: createUniquePath's SEMI-join dedup candidate.
+		// createplansimple.go.
+		return createUniquePlan(p)
 	case PathWindow:
 		// C-18: the WINDOW upper rel's candidate. createplansimple.go.
 		return createWindowPlan(p)

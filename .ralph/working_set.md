@@ -1,67 +1,72 @@
-Task: M0142-0008a-3i-plumbing, item 1 of design doc §14.3 (probe landed this
-loop) — item 2's "parallel type vs shared type" question is now DECIDED by
-live evidence. Items 3-5 remain open and still not sized for one loop.
+Task: M0142-0008c-1 — `RelOptInfo.CheapestUnique` cache field +
+`createUniquePath` producer (PG's `create_unique_path`, item 1 of the
+M0142-0008c 4-item decomposition for Q10/Q35 parity). DONE and committed
+this loop, SORT method only, no live caller yet (that's M0142-0008c-2).
 
-Files this loop: internal/optimizer/m0142_0008a_3i_plumbing_probe_test.go
-(NEW — throwaway probe, no production diff), docs/design/0100-0149/
-m0142-0008a-1-semi-anti-sji-design.md (§15 added), docs/design/README.md
-(index row extended), .ralph/fix_plan.md (M0142-0008a-3i-plumbing bullet
-updated in place, still unchecked), .ralph/deferral_ledger.md (new row
-M0142-0008a-3i-plumbing-probe1).
+Files this loop: internal/optimizer/path.go (CheapestUnique field, PathUnique
+kind, Path.UniqueKeyCols field), internal/optimizer/createuniquepath.go (NEW
+— createUniquePath), internal/optimizer/createplansimple.go
+(createUniquePlan arm), internal/optimizer/createplan.go (PathUnique
+dispatch), internal/optimizer/unnest.go (existsUnnestSJInfo now populates
+SemiRhsExprs), internal/optimizer/createuniquepath_test.go (NEW, 4 tests),
+internal/optimizer/exists_unnest_sjinfo_test.go (SemiRhsExprs assertions
+added to 2 existing tests), docs/design/0100-0149/m0142-0008a-1-semi-anti-sji-design.md
+(§17 added), docs/design/README.md (index row extended),
+.ralph/fix_plan.md (M0142-0008c-1 marked [x], M0142-0008c-1a filed),
+.ralph/deferral_ledger.md (row appended).
 
-Key symbols: `extractSearchLeavesAdmitSemiAnti` (the probe file's local copy
-of `extractSearchLeaves`, joinsearchseam.go:1070 — copied not edited),
-`outerChainLink`/`outerOnQualsOK` (joinsearchseam.go:1283/927 — the existing
-consumer that DECLINES a Semi/Anti link with nullable=0, live-confirmed),
-`deriveOuterLinkConstants` (joinsearchseam.go:832 — the reason nullable
-cannot just be re-encoded to the RHS range: its whole correctness argument
-is NULL-extension, which Semi/Anti has none of), `problemPairsOuterWithDerived`
-(relfromjoinlist.go:563 — confirmed LIVE, not just re-read, to skip Semi/Anti
-`SpecialJoinInfo` values via `default: continue`), `existsUnnestSJInfo`
-(unnest.go:4397 — used in the probe to build a real SpecialJoinInfo rather
-than a hand-rolled one).
+Key symbols: `RelOptInfo.CheapestUnique`/`PathUnique`/`Path.UniqueKeyCols`
+(path.go), `createUniquePath` (createuniquepath.go — gates on
+`sjinfo.Jointype==JoinSemi`, `SemiCanBtree`, non-empty `SemiRhsExprs`,
+`subpath.Kind==PathPrebuilt`; requires cr.Index to still name the same
+column in subpath.node.Output()), `createUniquePlan` (createplansimple.go —
+always emits *DistinctOn, never *Distinct), `existsUnnestSJInfo`
+(unnest.go — now sets `sj.SemiRhsExprs` from each `unnestParam.SubCol`).
 
-Hypothesis/Findings: (1) leaf-list prediction from §14.3 item 1 held exactly
-(2 leaves: t1, RHS *Project as one opaque leaf) — zero surprises. (2) On the
-FINAL planned tree, a hash-keyed Semi/Anti's correlation lives in
-(j.LeftKey, j.RightKey), not j.Predicate (came back nil) — a probe-only
-artifact of inspecting the post-method-selection tree rather than predp.go's
-real pre-search origChain; reconstructed via a BinaryOp for the probe only.
-(3) Item 2 DECIDED: build a genuinely separate `semiAntiChainLink` type with
-its own legality consumers, NOT a Jointype-discriminated outerChainLink.
-Evidence: nullable=0 gets an unconditional `outerOnQualsOK` decline
-(relids-subset check fails on a well-formed link); the alternative of
-encoding nullable=RHS-range to satisfy that arithmetic would make
-`deriveOuterLinkConstants` silently apply NULL-extension reasoning to a join
-type that has none — a correctness trap, not a workaround. (4) NEW safety
-finding, ledgered: `problemPairsOuterWithDerived` (Q78 firewall) has ZERO
-Semi/Anti coverage today, live-confirmed with a real existsUnnestSJInfo
-value. Items 3-5 (admitting a real Semi/Anti link into production search)
-MUST add this firewall's Semi/Anti arm in the same change, not after —
-`take3-C-04a-Q78-firewall-classifier` (deferral ledger) is the cautionary
-precedent for what happens when that's deferred.
+Hypothesis/Findings: two things recon (M0142-0008c's own §16) did not
+predict, both found only while writing the producer, not by static
+reading: (1) `SpecialJoinInfo.SemiRhsExprs` was declared since M0128-P1.4
+but had ZERO writers anywhere before this loop — fixed. (2) PG's HASH
+method needs a hash-keyed-SUBSET dedup with ungrouped passthrough columns
+that NO goopg executor node can express (`*Distinct` is full-row-only,
+`*DistinctOn` is sorted-only) — filed as M0142-0008c-1a, NOT on the
+critical path (the one live SemiRhsExprs producer always sets
+SemiCanBtree/SemiCanHash together, so the SemiCanBtree-only gate never
+actually declines a real query today). `createUniquePath` requires
+`subpath.Kind==PathPrebuilt` — confirmed (not just assumed) this is the
+WHOLE reachable domain today, not a temporary restriction: SemiRhsExprs is
+only ever populated by the EXISTS/IN-unnest atomic-RHS wrapping, and
+ordinary FROM-clause SEMI never reaches deconstruction (specialjoin.go's
+own comment). Zero behavior change to any existing plan this loop:
+grep-confirmed createUniquePath/PathUnique have no caller outside my new
+files, and SemiRhsExprs had zero readers before this loop either.
 
-Next step: M0142-0008a-3i-plumbing items 3-5 (still open, still spans three
-subsystems — extractSearchLeaves's PRODUCTION walk, existsUnnestSJInfo, and
-predp.go's splice retirement — so still not sized for a single loop): (3)
-define `semiAntiChainLink` (LHS/RHS RelSet, Jointype, pred — no
-preserved/nullable fields) and its own `semiAntiOnQualsOK`/
-`semiAntiLinksHaveSJInfos` consumers mirroring the outer ones' RelSet-subset
-reasoning minus every NULL-extension branch; (4) actually extend PRODUCTION
-`extractSearchLeaves` (joinsearchseam.go:1110) to admit JoinTypeSemi/Anti
-using the probe's now-validated shape; (5) rebuild `existsUnnestSJInfo`'s
-throwaway synL=1/synR=2 numbering with real leafRangeRelSet bits at
-admission time, add the firewall's Semi/Anti arm in the SAME change, and
-retire runJoinSearchBelowPinned's splice for admitted cases. Alternatives if
-still judged too large: M0142-0008c (create_unique_path scoping, independent,
-concrete PG-source resume point) or M0142-0005 (per-worker Memoize scoping,
-independent) are both open and unblocked. M0142-0003i/0003k remain BLOCKED
-on a human-authorized shared `:65433` cluster reload — do not attempt.
+Next step: per banner order (M0137-M0143 group, item 4), the natural
+continuation is **M0142-0008c-2** (`joinIsLegal`'s missing SEMI
+unique-ify admission arm, joinsearchlevel.go:198 — a direct ~20-line port
+of `joinrels.c:445-489`, now unblocked since -0008c-1 supplies
+`createUniquePath` to call). That is the item that would first give
+Q10/Q35 a *reachable* unique-ified join candidate, though -0008c-3
+(threading JoinTypeUniqueInner/Outer through every join-path builder)
+is still needed after it before any plan can actually USE the result —
+size that dependency before assuming -0008c-2 alone moves the metric.
+Alternatives if this group is judged not worth continuing: M0141-S2b-2
+(base join/scan Pathlist-across-search-boundary surgery — flagged by its
+own filing as needing "its OWN further scoping pass before writing code",
+not yet done), M0142-0008a-3i-plumbing items 3-5 (still 3-subsystem-
+spanning). M0142-0003i/0003k remain BLOCKED on a human-authorized shared
+`:65433` cluster reload — do not attempt.
 
 Gates run: `go build ./...` (clean), `go test ./internal/optimizer/...`
-(PASS, 2.8s, includes the new probe test), `gofmt -l` on the new file (clean,
-no diff). `make ralph-state-guard` run before finishing — found a stale
-status/progress mismatch from the previous loop's clean-exit marker,
-auto-repaired to in_progress, then consistent (see status block).
+(PASS, includes 4 new createUniquePath/createUniquePlan tests + 2 extended
+existsUnnestSJInfo tests). `RALPH_PRECOMMIT_SCOPE=units
+scripts/ralph-precommit-test.sh` (PASS except the ALREADY-KNOWN, unrelated,
+pre-existing `internal/parser` TestLockingClauseParity AST-drift failure
+filed 2026-09-15 in fix_plan.md's "Manually discovered" section —
+GroupedJoinUnaliased field added by a different commit, not touched this
+loop). `scripts/tpch-spotcheck.sh` SKIPPED (shared `:65433` tpch DB still
+empty per M0142-0003k, pre-existing/documented blocker, exit 0 — expected
+and low-risk since this loop's code has no live caller). `make
+ralph-state-guard` — to run before finishing.
 
 In-flight: none.

@@ -46,6 +46,19 @@ func TestExistsUnnestSJInfoSemiHashKey(t *testing.T) {
 	if !sj.SemiCanHash || !sj.SemiCanBtree {
 		t.Errorf("SemiCanHash=%v SemiCanBtree=%v, want true/true (hash-keyed SEMI)", sj.SemiCanHash, sj.SemiCanBtree)
 	}
+	// M0142-0008c-1: SemiRhsExprs must carry the subquery-side ("z")
+	// operand of the equijoin, not the outer-side ("t1.x") one —
+	// createUniquePath keys the RHS's own dedup on this list.
+	if len(sj.SemiRhsExprs) != 1 {
+		t.Fatalf("len(SemiRhsExprs) = %d, want 1", len(sj.SemiRhsExprs))
+	}
+	cr, ok := sj.SemiRhsExprs[0].(*ColumnRef)
+	if !ok {
+		t.Fatalf("SemiRhsExprs[0] = %T, want *ColumnRef", sj.SemiRhsExprs[0])
+	}
+	if cr.Name != "z" {
+		t.Errorf("SemiRhsExprs[0].Name = %q, want %q", cr.Name, "z")
+	}
 }
 
 func TestExistsUnnestSJInfoAntiHashKey(t *testing.T) {
@@ -76,6 +89,9 @@ func TestExistsUnnestSJInfoAntiHashKey(t *testing.T) {
 	// JOIN_ANTI (specialjoin.go:239-247) — ANTI must stay false/false.
 	if sj.SemiCanHash || sj.SemiCanBtree {
 		t.Errorf("SemiCanHash=%v SemiCanBtree=%v, want false/false for ANTI", sj.SemiCanHash, sj.SemiCanBtree)
+	}
+	if sj.SemiRhsExprs != nil {
+		t.Errorf("SemiRhsExprs = %v, want nil for ANTI", sj.SemiRhsExprs)
 	}
 }
 

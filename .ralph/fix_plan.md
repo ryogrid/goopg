@@ -3657,19 +3657,32 @@ cross-layer programme that has never been scoped.
   `tmp/m0142-0008a-census/{goopg,pg}_explains.txt` (Q10/Q35 sections).
   Q16/Q69/Q94 (§6's 3-of-5 pure-algorithm-choice queries) are unaffected
   and remain reachable via -0008a-2/-3 alone.
-- [ ] **M0142-0008c-1 — `RelOptInfo.CheapestUnique` cache field +
+- [x] **M0142-0008c-1 — `RelOptInfo.CheapestUnique` cache field +
   `createUniquePath` producer** — filed by M0142-0008c (design doc §16.3
-  item 1). Add a `CheapestUnique *Path` cache slot to `RelOptInfo`
-  (`internal/optimizer/path.go:423`, alongside `CheapestTotal`/
-  `CheapestStartup`/`CheapestParameterized`) and a `createUniquePath(rel,
-  subpath, sjinfo) *Path` producer that builds a `Unique`/`DistinctOn`-shaped
-  path over `rel.CheapestTotal` keyed by the SEMI join's RHS correlation
-  columns, with its own cost function (no existing goopg cost function
-  prices a mid-search dedup — PG's oracle is `pathnode.c:1729` proper, the
-  Sort+Unique / HashAggregate cost branches after the NOOP fast-paths).
-  Reuses the existing `Unique`/`DistinctOn` Plan node and executor operator
-  (`distinctOp`/`distinctOnOp`) — no new executor code. Resume point: design
-  doc §16.2-16.3.
+  item 1). **DONE 2026-09-16 — SORT method only, no live caller yet (that is
+  -0008c-2).** Design doc §17. Landed `RelOptInfo.CheapestUnique *Path`
+  (`internal/optimizer/path.go`), a new `PathUnique` kind +
+  `Path.UniqueKeyCols []int`, `createUniquePath(rel, subpath, sjinfo, cp)
+  *Path` (`internal/optimizer/createuniquepath.go`, ports
+  `pathnode.c:1729-2081`) and its `createPlanNode` arm (`createUniquePlan`,
+  createplansimple.go) — always emits `*DistinctOn` over a stacked Sort
+  (goopg has no hash-keyed-subset dedup node, see below). Unit-tested
+  standalone (`createuniquepath_test.go`): success shape/cost, the
+  rel-level cache, and every decline guard (not SEMI, `!SemiCanBtree`, no
+  correlation columns, subpath not the atomic-RHS `PathPrebuilt` shape, an
+  out-of-range or identity-drifted correlation column, a non-`*ColumnRef`
+  correlation expression). Zero behavior change to any existing plan
+  (`createUniquePath`/`PathUnique` have no other caller; confirmed by grep).
+  Two findings surfaced only while writing this, both recorded in §17:
+  `SpecialJoinInfo.SemiRhsExprs` was declared (M0128-P1.4) but never
+  populated by any producer — fixed in `existsUnnestSJInfo` (unnest.go),
+  pinned by `TestExistsUnnestSJInfoSemiHashKey`/`...AntiHashKey`; and PG's
+  HASH method (`UNIQUE_PATH_HASH`) needs a hash-keyed-SUBSET dedup with
+  ungrouped passthrough columns that no goopg executor node can express
+  (`*Distinct` is full-row-only, `*DistinctOn` is sorted-only) — filed as
+  **M0142-0008c-1a** below, currently unreachable in practice since
+  `existsUnnestSJInfo` always sets `SemiCanBtree`/`SemiCanHash` together.
+  Ledger row appended (task-id `m0142-0008c-1`).
 - [ ] **M0142-0008c-2 — `joinIsLegal`'s missing SEMI unique-ify admission
   arm** — filed by M0142-0008c (design doc §16.3 item 2). Depends on
   M0142-0008c-1 (needs `createUniquePath` to call). Port PG's
@@ -3681,6 +3694,21 @@ cross-layer programme that has never been scoped.
   outer-join constraint" error. Cheapest, most self-contained piece of the
   four — a direct ~20-line port. Resume point: design doc §16.2 (exact
   current code quoted), PG oracle `joinrels.c:445-489`.
+- [ ] **M0142-0008c-1a — HASH method for `createUniquePath`** — filed by
+  M0142-0008c-1 (design doc §17 item 2). PG's `UNIQUE_PATH_HASH`
+  (`pathnode.c:2026-2043`) groups by `uniq_exprs` while passing every OTHER
+  needed target-list column through UNGROUPED (`createplan.c:1796-1811`),
+  a shape goopg cannot express today: `*Distinct`/`distinctOp` hash-dedups
+  the FULL input row, never a column subset, and `*DistinctOn` (the only
+  subset-keyed dedup) is a SORTED streaming operator, not a hash. Needs
+  either a new subset-keyed hash-dedup executor node, or a `HashAggregate`-
+  shaped path whose non-grouped columns are allowed to pass through
+  ungrouped (goopg's `*Aggregate`/`aggOp` may already refuse this — check
+  before assuming either route is free). **Not on the critical path**:
+  `existsUnnestSJInfo` (the only live `SemiRhsExprs` producer) always sets
+  `SemiCanBtree`/`SemiCanHash` together, so `createUniquePath`'s
+  `SemiCanBtree`-only gate never actually declines a real query — this item
+  only matters once a second SEMI producer sets the flags independently.
 - [ ] **M0142-0008c-3 — thread `JoinTypeUniqueInner`/`JoinTypeUniqueOuter`
   through every join-path builder** — filed by M0142-0008c (design doc §16.3
   item 3). Depends on M0142-0008c-1/-2. Add the two synthetic jointypes

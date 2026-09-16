@@ -261,6 +261,23 @@ func createDistinctPlan(p *Path) (Node, outputLayout) {
 	return &Distinct{pos: p.Distinct.pos, Child: child, schema: p.Distinct.schema}, nil
 }
 
+// createUniquePlan is the PathUnique arm (M0142-0008c-1): emit a
+// `*DistinctOn` keyed by `p.UniqueKeyCols` over the built child — always
+// `DistinctOn`, never `*Distinct` (unlike PathDistinct's two-shape choice),
+// because `createUniquePath` never builds the HASHED candidate (see its own
+// doc comment for why). The child is `p.Children[0]`, the Sort
+// `createUniquePath` stacked over the SEMI RHS's cheapest-total path.
+func createUniquePlan(p *Path) (Node, outputLayout) {
+	if len(p.Children) != 1 {
+		panic(fmt.Sprintf("createPlan: PathUnique with %d children, want exactly 1", len(p.Children)))
+	}
+	child, _ := createPlanNode(p.Children[0])
+	if child == nil {
+		panic("createPlan: PathUnique over a child path that built no node")
+	}
+	return &DistinctOn{pos: child.Pos(), Child: child, KeyCols: p.UniqueKeyCols, schema: child.Output()}, nil
+}
+
 // createWindowPlan is the PathWindow arm (C-18): emit the path's window
 // spec over the built input. The spec is COPIED, never rebound in place —
 // the same rule `createAggPlan` follows, so a sibling candidate (C-14's

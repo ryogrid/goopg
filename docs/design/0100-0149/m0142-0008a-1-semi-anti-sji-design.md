@@ -1590,3 +1590,71 @@ arm) as the cheapest, most self-contained starting point once the group is
 picked up. Q10/Q35 remain un-parity'd until this lands; Q16/Q69/Q94 (the
 3-of-5 queries §6 confirmed are pure algorithm-choice gaps) are unaffected
 and remain reachable via -0008a-2/-3 alone.
+
+## 17. M0142-0008c-1 landed — cache field + producer, SORT method only (2026-09-16)
+
+Landed the item-1 piece §16.3 sized: `RelOptInfo.CheapestUnique *Path`
+(`path.go`), a new `PathUnique` kind + `Path.UniqueKeyCols []int`
+(`path.go`), `createUniquePath` (`createuniquepath.go`, ports
+`pathnode.c:1729-2081`) and its `createPlanNode`/`createplansimple.go` arm
+(`createUniquePlan`). Not wired into `joinIsLegal` — that is -0008c-2 and
+this producer has no live caller yet; it is built and unit-tested standalone
+(`createuniquepath_test.go`), the same precedent path.go's `NeededCols`
+field comment already documents for this codebase ("nothing reads these
+yet"). Zero behavior change to any existing plan: `go build`/`go test
+./internal/optimizer/...` confirm `createUniquePath`/`PathUnique` have no
+production caller, and the one other live edit
+(`SemiRhsExprs` — see below) had zero readers before this loop.
+
+**Two findings this loop's writing surfaced that recon alone did not
+predict:**
+
+1. **`SpecialJoinInfo.SemiRhsExprs` was declared but never populated.**
+   `specialjoin.go`'s own field comment (written for M0128-P1.4) states
+   "SemiOperators/SemiRhsExprs stay empty" for `makeSpecialJoinInfoScoped` —
+   true, and irrelevant, because that producer's SEMI arm is unreachable
+   (ordinary FROM-clause SEMI never reaches deconstruction). The live SEMI
+   producer, `existsUnnestSJInfo` (unnest.go), set `SemiCanBtree`/
+   `SemiCanHash` but never `SemiRhsExprs` either — nobody had needed it
+   until this producer did. Fixed alongside this task (unnest.go): each
+   `unnestParam.SubCol` (already the subquery-side/RHS `*ColumnRef` of one
+   equijoin conjunct, exactly PG's `compute_semijoin_info`
+   (`initsplan.c:2129-2138`) RHS-operand collection) is appended directly —
+   no re-derivation needed, because `unnestExistsExpr`'s pull-up only ever
+   produces equijoin pairs. Pinned by
+   `TestExistsUnnestSJInfoSemiHashKey`/`...AntiHashKey` (`exists_unnest_sjinfo_test.go`).
+2. **HASH is a real, currently-unimplemented gap (filed M0142-0008c-1a,
+   ledger row appended) — found only once the producer was written, not by
+   static reading.** PG's `UNIQUE_PATH_HASH` groups by `uniq_exprs` while
+   passing every OTHER needed target-list column through UNGROUPED
+   (`createplan.c:1796-1811`: `groupColIdx` is a strict subset of the Agg's
+   own tlist — legal only because this Agg is planner-internal, never
+   user SQL, so PG's parse-analysis "every non-grouped column must be
+   aggregated" rule does not apply here). goopg has no node that can express
+   this: `*Distinct` (`distinctOp`) hash-dedups its FULL input row, never a
+   column subset; `*DistinctOn` supports a column subset but is a SORTED
+   streaming dedup, not a hash. Inserting an early `Project` down to just the
+   key columns would sidestep the executor gap but contradicts goopg's own
+   established convention that path generation costs/carries FULL width and
+   narrows only post-selection (`path.go`'s `NeededCols`/`OutputCols`
+   doc comments; `cost_model_design_bundle` memory note "narrowing is
+   post-selection") — so the fix is new executor surface, not a producer-side
+   workaround, and is out of this item's original "no new executor code"
+   boundary. `createUniquePath` therefore gates on `SemiCanBtree` alone and
+   always takes the SORT branch; `!SemiCanBtree && SemiCanHash` declines
+   (returns nil) rather than silently mis-costing. **Currently unreachable in
+   practice**: `existsUnnestSJInfo` is the only live `SemiRhsExprs` producer
+   and it always sets both flags together, so this gate never actually
+   declines a real query today — recorded for when a second SEMI producer
+   (e.g. ordinary FROM-clause SEMI, if that ever reaches deconstruction)
+   might set them independently.
+
+**Resume points for the rest of the M0142-0008c-1..4 group**: -0008c-2
+(`joinIsLegal`'s admission arm) can now call `createUniquePath(rel,
+rel.CheapestTotal, sjinfo, cp)` directly — the domain restriction in
+`createUniquePath`'s own doc comment (`subpath.Kind == PathPrebuilt`) is not
+a blocker for -0008c-2's own scope, since the SEMI RHS rel it will call this
+against IS exactly that atomic-wrapped-subquery shape today. -0008c-1a (HASH)
+is NOT on the critical path for Q10/Q35 parity — SemiCanBtree alone is
+sufficient for every currently-reachable query — and should stay filed rather
+than picked up ahead of -0008c-2/-3.
