@@ -31,6 +31,17 @@ recon described it, which turns out to have been an incomplete picture (see
 4. §4 gives per-item concrete resume points for -2 and -3, each tied to file
    + line, plus the open questions a future scoping pass still needs before
    coding starts.
+5. **M0142-0008a-3(iii)'s trace-through is now done — CONFIRMED generic, not
+   assumed.** §5 traces `createHashJoinPlan`/`planJoinTypeFor`/`joinInputsFor`
+   (`createplanjoin.go`) and finds no `Jointype`-specific refusal for
+   `Semi`/`Anti` anywhere in the Path-to-Join lowering; PG's
+   `create_unique_path` entanglement the original comment worried about turns
+   out to be real but narrowly scoped to ONE cost-refinement input
+   (`hashJoinFinalCostInputFor`'s inner-unique optimisation), which already
+   fails closed to a safe default for non-`JoinInner` rather than blocking
+   anything. Lifting `jointypeForDirection`'s `nestloopOnly` gate is therefore
+   executor-safe; the only residual cost is a costing-tightness gap, not a
+   correctness risk.
 
 ## 1. This is S5b, and its reopen criterion may already be met
 
@@ -334,3 +345,87 @@ semi/anti placement/algorithm is the ONLY PG divergence (§1) — this is what
 actually reopens S5b and should gate whether -2/-3 are worth doing at all
 versus queries where the divergence is dominated by an unrelated M0141/M0138
 gap.
+
+## 5. -3(iii) trace-through — CONFIRMED, not assumed (M0142-0008a-3 increment (iii))
+
+§3.4's open question was whether `createPlan`'s hash-join lowering is
+"actually generic over `Jointype: Semi/Anti`" or whether PG's
+`create_unique_path` entanglement (the reason `jointypeForDirection` declines
+the keyed arms for SEMI/ANTI — `joinpaths.go:141-148`) also blocks the
+executor/lowering side. Traced bottom-up rather than assumed:
+
+1. **The Path→Join lowering itself never discriminates by jointype for hash
+   joins.** `createHashJoinPlan` (`createplanjoin.go:545-600`) calls
+   `planJoinTypeFor` (`:325-349`) to get the executor `JoinType`, and that
+   function is a plain `switch` over every jointype the search can legally
+   produce a `Path` for — `JoinSemi`/`JoinAnti` map to `JoinTypeSemi`/
+   `JoinTypeAnti` on exactly the same footing as `JoinInner`/`JoinLeft`/
+   `JoinRight` (`:337-340`). The function's own doc comment (`:560-564`)
+   states this plainly: "Today the search only ever files INNER hash paths
+   … so this is the same value it always was" — i.e. the code path was never
+   narrowed to INNER, it was simply never *called* with anything else,
+   because `jointypeForDirection` never emits a `PathHashJoin` candidate for
+   SEMI/ANTI in the first place. The lowering function itself contains no
+   refusal to remove.
+2. **`joinInputsFor`'s schema/layout handling is already SEMI/ANTI-aware.**
+   `publishedSchema`/`publishedLayout` (`:291-303`) both special-case
+   `JoinTypeSemi`/`JoinTypeAnti` to publish the outer-only slice of the
+   merged schema — the same narrowing `unnestExistsExpr`'s hand-built nodes
+   rely on today. `narrowBuildInput` (`narrowoutput.go:52`) has no
+   jointype branch at all — it narrows the build side purely from attr-needed
+   columns, independent of what kind of join it feeds.
+3. **The executor's runtime hash-join operator is already proven correct for
+   Hash Semi/Anti in production** — not hypothetically: `unnestExistsExpr`
+   and its IN/scalar-subquery siblings (`unnest.go:3200-3208, 3335-3342,
+   4383-4399`) construct `Join{Type: JoinTypeSemi/Anti, Algo: JoinAlgoHash}`
+   nodes directly (bypassing the DP search's `Path` representation entirely)
+   for every census query with an equijoin pair, and these are what TPC-H
+   Q4/Q21/Q22 and the TPC-DS channel-comparison queries execute today with
+   canonical row counts. Whatever code path actually *runs* a hash join at
+   execution time cannot be jointype-INNER-only, because it already runs
+   SEMI/ANTI ones every day.
+4. **Even the PARALLEL hash-join variant already treats SEMI/ANTI as
+   first-class.** `hashJoinIsPartialCapable` and `partialHashJoinTypeOK`
+   (`parallel.go:873-921`) both list `JoinTypeSemi`/`JoinTypeAnti` (alongside
+   `JoinTypeInner` and conditionally `JoinTypeLeft`) as partial-capable,
+   citing PG's own `hash_inner_and_outer` parallel block
+   (`joinpath.c:2418`) as filing partial hash joins for exactly this set.
+   This is further, independent evidence that goopg's executor has no
+   SEMI/ANTI-specific hash-join gap — parallel hash join is a strictly
+   harder case (shared build, cross-worker visibility) and it is already
+   considered safe here.
+5. **PG's `create_unique_path` concern is real, but narrower than §3.4
+   assumed — it lives in exactly one place, and that place already fails
+   closed.** `hashJoinFinalCostInputFor` (`hashjoin_innerunique.go:32-64`,
+   the goopg analogue of PG's `compute_semi_anti_join_factors`/inner-unique
+   costing refinement) explicitly early-returns the zero-value
+   `hashJoinFinalCostInput{}` for `jt != parser.JoinInner` (`:34`), with a
+   doc comment stating outright: "goopg can prove only the INNER case here
+   … SEMI and ANTI have their own executor and join-semantics work, and
+   remain on their existing paths." That zero value "deliberately selects
+   the old non-unique bucket walk" — i.e. a SEMI/ANTI hash path costed after
+   the gate is lifted would simply skip this one refinement and cost via the
+   same conservative default every non-provably-unique INNER hash join
+   already costs through today. It is a costing-*tightness* gap (a SEMI/ANTI
+   hash join might be costed slightly higher than PG's fully-refined
+   estimate), not a correctness or executor-capability gap.
+6. **`cardinality.go` already has explicit non-multiplying SEMI/ANTI row
+   estimation arms** (`:274, 294, 424, 432, 920, 925`) that operate on the
+   already-lowered `*Join` node — these apply identically regardless of
+   which producer built the node (`unnestExistsExpr` today, a future
+   DP-search `Path` tomorrow), so no new row-estimation logic is needed
+   either.
+
+**Verdict for -3(iii): CONFIRMED generic — no lowering or execution change is
+needed to let the DP search emit a Hash Semi/Anti path.** The only code that
+needs to change to lift §3.4's gate is `jointypeForDirection`'s
+`nestloopOnly` line (`joinpaths.go:265`, and the `!nestloopOnly` guard at
+`:318`) — narrowing or removing it is executor-safe by the trace above. What
+should NOT be assumed still true without its own check when -3(iii) is
+actually implemented: `hashJoinFinalCostInputFor`'s fail-closed default means
+the newly-enabled SEMI/ANTI hash paths will be costed conservatively (never
+wrong, possibly non-optimal versus a hand-tuned PG-parity cost), so the
+plan-compare re-check in §4.3 is still the gate that decides whether that
+conservative costing is tight enough to win the `addPath` competition against
+the existing nested-loop paths for each census query — this trace-through
+answers "is it safe to build the path", not "will the cost model pick it".

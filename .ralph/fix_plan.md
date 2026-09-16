@@ -3401,12 +3401,22 @@ cross-layer programme that has never been scoped.
     now-natively-searched cases (keep it for Q22's legacy-post-DP class);
     (iii) **must happen before or alongside (i)/(ii), not after** — lift
     `joinpaths.go`'s `nestloopOnly` hash-decline gate for SEMI/ANTI in the
-    natively-searched case (confirm `createPlan`'s hash-join lowering is
-    actually generic over `Jointype: Semi/Anti` first — `addHashJoinPath`
-    already threads `Jointype` through the same as `LEFT`, suggesting the
-    executor side is not the real blocker PG's `create_unique_path`
-    entanglement describes for goopg, but this needs confirming, not
-    assuming). This is the slice that can actually move TPC-DS
+    natively-searched case. **Trace-through DONE 2026-09-16 (no code
+    change): CONFIRMED generic**, not assumed — design doc §5 traces
+    `createHashJoinPlan`/`planJoinTypeFor`/`joinInputsFor`
+    (`createplanjoin.go`) end to end and finds no `Jointype`-specific
+    refusal; PG's `create_unique_path` entanglement is real but scoped to
+    exactly one cost-refinement input (`hashJoinFinalCostInputFor`,
+    `hashjoin_innerunique.go:34`) that already fails closed to a safe
+    default for non-`JoinInner` rather than blocking anything, and the
+    executor's hash-join runtime is independently proven correct for
+    Hash Semi/Anti in production today via `unnestExistsExpr`'s hand-built
+    `Join{Type:Semi/Anti, Algo:Hash}` nodes (TPC-H Q4/Q21/Q22 canonical
+    counts). Remaining risk is costing-tightness only (conservative
+    non-unique-bucket costing, never wrong) — the §4.3 plan-compare gate
+    still decides whether that's tight enough to win `addPath`, so (iii)'s
+    actual gate-lift edit is unblocked to implement but its OUTCOME is not
+    yet known. This is the slice that can actually move TPC-DS
     query10/16/35/69/94 and TPC-H Q4/Q21's plan shapes. Gated on
     M0142-0008a-2; re-confirm the §4.3 plan-compare gate first.
   **Independent, unfiled resume-point hint** (not sized/numbered — noted for
