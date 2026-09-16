@@ -301,12 +301,16 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 		traceSeamDecline("prefix-not-a-prefix", nrels, nprefix)
 		return node, pred, false
 	}
-	// admitSemiAnti stays false here: production entry (M0142-0008a-3i-plumbing-b1,
-	// design doc §22.4) — the "-b1" scaffold below can only ever fire from a
-	// direct unit-test call, since `chain` here is `origChain`, which
-	// structurally never contains a Semi/Anti node under the current
-	// pre-`-3i-plumbing-b2` engagement scope (§22.1's finding).
-	scans, widths, onQuals, outerLinks, semiAnti, ok := extractSearchLeaves(chain, false)
+	// admitSemiAnti=true (M0142-0008a-3i-plumbing-b2 step (iii), design doc
+	// §33.4/§34): safe unconditionally at this ONE call site (§32.1's
+	// finding) since the other 3 `tryJoinSearch` callers' chains are always
+	// captured pre-unnest and can never contain a Semi/Anti node — only
+	// Phase B's second call (`predp.go`, `chain == spineJoins[0]`, reached
+	// post-unnest) can ever hand this a tree that actually has one. Phase
+	// A's own call (`chain == origChain`, captured before
+	// `unnestSubqueriesInPlan` runs) stays structurally unable to contain a
+	// Semi/Anti node regardless of this flag, per §28.3's finding.
+	scans, widths, onQuals, outerLinks, semiAnti, ok := extractSearchLeaves(chain, true)
 	if !ok {
 		traceSeamDecline("chain-not-flattenable", nrels, len(scans))
 		return node, pred, false
@@ -314,10 +318,10 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 	// §31.3 item 1 (design doc §31): with synthetic (Semi/Anti RHS) leaves
 	// mixed into `scans`, the leaf count is real-FROM-items-plus-synthetic,
 	// not just real-FROM-items — `nprefix` itself stays unchanged, since a
-	// synthetic leaf is never a real FROM item. `semiAnti` is always empty
-	// here (admitSemiAnti is false above), so this reduces to the old
-	// `len(scans) != nprefix` check and is inert in production until
-	// -3i-plumbing-b2 flips admitSemiAnti to true at this call site.
+	// synthetic leaf is never a real FROM item. `semiAnti` is empty for
+	// every Phase A call (`chain == origChain`, never has a Semi/Anti node)
+	// and populated only for a Phase B call that actually admits one, per
+	// step (iii)'s flip above.
 	if len(scans) != nprefix+len(semiAnti) {
 		traceSeamDecline("leaf-count", nrels, len(scans))
 		return node, pred, false
@@ -332,13 +336,11 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 			return node, pred, false
 		}
 	}
-	// §31.3 items 2-3: `semiAnti` is always empty here (admitSemiAnti is
-	// false above), so `pgShapedOffsetChecksOK`'s synthetic-aware arithmetic
+	// §31.3 items 2-3: `pgShapedOffsetChecksOK`'s synthetic-aware arithmetic
 	// reduces to the old plain per-index comparison and REAL-total-width
-	// spine check — inert in production until -3i-plumbing-b2 flips
-	// admitSemiAnti to true at this call site. See the function's own doc
-	// comment for the numSynthetic>0 case, exercised only by a direct
-	// unit-test call today.
+	// spine check whenever `semiAnti` is empty (every Phase A call), and
+	// exercises the numSynthetic>0 case for a Phase B call that admits one.
+	// See the function's own doc comment for details.
 	cumOffsets := buildLeafSpans(widths, semiAnti)
 	bindingOffsets := make([]int, nprefix)
 	for i := range nprefix {

@@ -3823,3 +3823,110 @@ not done this loop, not done by this scaffold. This is the strictly later,
 separate step (iii) §32.4 named, and it is the only remaining piece before
 this milestone's own cited unblock targets (Q10/Q35) can see a different
 plan.
+
+## 34. Step (iii) — `admitSemiAnti` flipped to `true` in production; Phase B
+is now genuinely live, but Q10/Q35 did not converge this loop (2026-09-16)
+
+Flipped `extractSearchLeaves(chain, false)` to
+`extractSearchLeaves(chain, true)` at `joinsearchseam.go:309`, the one
+production call site inside `tryPGShapedJoinSearch`, exactly as §33.4
+specified. Updated the three stale comments in the same block that used to
+justify why `semiAnti` stays empty in production (`:304-312`, `:318-324`,
+`:339-343`) — they now explain the actual split: Phase A's own call
+(`chain == origChain`, captured before `unnestSubqueriesInPlan` runs) stays
+structurally unable to contain a Semi/Anti node regardless of the flag
+(§28.3), so only Phase B's second call (`chain == spineJoins[0]`, reached
+post-unnest) can ever populate `semiAnti`.
+
+### 34.1 Verification
+
+`go build ./...` clean, `go vet ./internal/optimizer/...` clean, full
+`go test ./internal/optimizer/...` passes unchanged (including all Phase A/B
+scaffold tests from §31-§33 — none of them assumed the literal's value, so
+none needed updating). `RALPH_PRECOMMIT_SCOPE=units
+scripts/ralph-precommit-test.sh`: only the pre-existing, unrelated
+`internal/parser` `GroupedJoinUnaliased` AST-drift failure
+(`internal/optimizer` itself `ok`).
+
+TPC-DS SF0.25 sweep (`scripts/tpcds-sf025-regression.sh sweep`):
+`PASS=96 (60 ck-verified, 36 ck=n/a) MISMATCH=0 CKMISMATCH=0 ERROR=0
+TIMEOUT=0 SKIP=3`. Every row count and every content checksum is identical
+to the pre-flip baseline — **zero correctness regressions** anywhere in the
+99-query corpus. This is the load-bearing result: the flip is safe to keep
+in production regardless of what else this section finds.
+
+Crucially, the plan-shape channel — self-diff against the immediately prior
+commit's capture, `scripts/tpcds-plan-diff.py` — for the first time since
+step (i) landed (§31.4) shows a **non-empty** delta:
+`PLAN-SHAPE: queries=99 same=98 changed=1 added=0 removed=0`,
+`changed (1): Q78`. Every previous "prove inert" loop in this milestone
+(§27.3, §29, §31.4, §33.3) reported `same=99 changed=0` by construction —
+this is the first empirical confirmation that Phase B is doing real work in
+production, not just passing its own unit tests.
+
+### 34.2 What changed: Q78, not Q10/Q35 — and why that is expected, not a
+bug in this loop's change
+
+Q78 has no `EXISTS`/`NOT EXISTS` in its SQL text (`query78.sql`): its three
+CTEs (`ws`/`cs`/`ss`) each use `LEFT JOIN ... WHERE <col> IS NULL`, PG's
+standard antijoin-strength-reduction idiom, which goopg also lowers to a
+`JoinTypeAnti` node before this seam ever runs. `extractSearchLeaves`'s
+Semi/Anti admission arm keys off `JoinType`, not provenance, so it is
+correctly agnostic between an antijoin born from `NOT EXISTS` unnesting and
+one born from this LEFT-JOIN rewrite — Q78 is therefore exactly the kind of
+"real EXISTS/NOT-EXISTS-equivalent fixture" §33.4/§27.4's gate asked for,
+even though it does not contain the literal keyword.
+
+Q10 and Q35 — this milestone's own cited unblock targets — are unchanged
+(`same=98` includes both). This is the expected outcome, not a regression:
+§32.2's live trace already established Q10 hits the "sunk" shape (all
+conjuncts legally pushed, Phase A already leaves a Filter-free subtree under
+the pinned Semi/Anti join), and the design doc's Current-Priority framing
+(`M0142-0008c`'s recon, §16) independently concluded Q10/Q35 need PG's
+`create_unique_path` mechanism to reach parity — a separate, still-partially-
+landed sub-milestone (`-0008c-1`/`-2` done, `-0008c-3c`/`-3d`/`-4` not yet)
+this loop did not touch. "Phase B now runs for real" and "Q10/Q35 reach PG
+parity" were never the same claim; §33.4 phrased the fixture requirement as
+"a real EXISTS/NOT-EXISTS TPC-DS fixture", not specifically Q10/Q35, and
+Q78 satisfies it.
+
+### 34.3 A plan-quality question surfaced by Q78's diff, deferred rather than
+chased this loop
+
+Q78's `ws`/`cs` CTEs each lost a `Memoize`-wrapped `Index Scan using
+date_dim_pkey` probe (a per-outer-row indexed lookup keyed on
+`ws_sold_date_sk`/`cs_sold_date_sk`) and gained either a `Nested Loop` with a
+bare post-join `Filter: (ws_sold_date_sk = date_dim_2.d_date_sk)` (the `ws`
+CTE) or a `Hash Join` (the `cs` CTE) against an apparently-unfiltered
+`date_dim`/`date_dim_1` scan. The `ws` CTE's new Nested Loop's own cost
+estimate (`cost=0.00..944.11 rows=94411`) is implausibly cheap for what its
+shape describes — a loop joining a full `date_dim` scan against 94411
+antijoin-survivor rows with only a post-hoc equality filter, not a keyed
+probe — which reads as a **cost-model estimation gap** for whatever new join
+shape Phase B's wider search is now choosing here, not a correctness bug
+(TPC-DS oracle checksums matched exactly, and the wall-clock delta for Q78
+specifically did not cross the status-delta channel's 2x-or-5s-floor
+threshold: `runtime-moves=0` across the whole 99-query sweep). Not chased
+further this loop — the practice card's "measure end-to-end, do not chase a
+single cost number" applies, and diagnosing it needs its own scoping pass
+into whichever new path-building arm Phase B's wider search is now reaching
+for these two CTEs (plausibly `M0142-0008c`'s still-unfinished `-3c`/`-3d`
+dispatch work, since a real Semi/Anti pair only became DP-admissible partway
+through that sub-milestone). Deferral-ledger row appended
+(task-id `m0142-0008a-3i-plumbing-b2`).
+
+### 34.4 Resume point
+
+`M0142-0008a-3i-plumbing-b2` is now **DONE**: all three steps (i)/(ii)/(iii)
+of §31.4/§32.4's resume order are landed, verified inert-then-live in the
+correct order, with zero correctness regressions at any point. Two follow-on
+threads, neither part of this item's own scope: (1) `M0142-0008c-3c`/`-3d`/
+`-4` (already filed, independently blocked-until-this-item, now unblocked)
+still need to land before Q10/Q35 can be re-measured for actual PG-plan
+parity; (2) §34.3's Q78 cost-estimate anomaly, filed as a fresh deferral
+rather than a numbered sub-item, since it was discovered as a side effect of
+this loop's live sweep rather than scoped in advance — whoever next touches
+the Semi/Anti path-building arms should re-run the SF0.25 `plans` diff for
+Q78 specifically and check whether the Nested-Loop/Filter shape is a genuine
+new join-order choice or a missing index-probe candidate in the newly
+reachable code path.

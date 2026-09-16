@@ -3691,7 +3691,7 @@ cross-layer programme that has never been scoped.
     guarantees cannot occur, so generalizing it is unverifiable dead code
     without an unrealistic fixture) and only has real meaning paired with
     `-b2`'s actual tree-routing cutover — re-filed into `-b2` below.
-  - [ ] **M0142-0008a-3i-plumbing-b2 — predp.go pass-through +
+  - [x] **M0142-0008a-3i-plumbing-b2 — predp.go pass-through +
     ctx.bindings/joinlist extension + cutover (design doc §22.3/§22.4,
     §23.4, §24)** — filed by -3i-plumbing-b's scoping pass, scope corrected
     by -3i-plumbing-b1's §23.4 finding, item 6 split by this loop's §24
@@ -3965,12 +3965,37 @@ cross-layer programme that has never been scoped.
     `PLAN-SHAPE: same=99 changed=0`,
     `RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh` shows only
     the pre-existing unrelated `internal/parser` `GroupedJoinUnaliased`
-    failure (`internal/optimizer` itself `ok`). **Still open — step (iii),
-    a separate later loop:** flip `admitSemiAnti` to `true` at
-    `joinsearchseam.go:309` and verify the now-live Phase B success path
-    against a real EXISTS/NOT-EXISTS TPC-DS fixture (§27.4's gate) plus a
-    full SF0.25 sweep for an ACTUAL plan-shape change — the only remaining
-    piece before Q10/Q35 see a different plan.
+    failure (`internal/optimizer` itself `ok`).
+    **Step (iii) LANDED (design doc §34, 2026-09-16) — item DONE:** flipped
+    `extractSearchLeaves(chain, false)` to `extractSearchLeaves(chain, true)`
+    at the one production call site (`joinsearchseam.go:309`); updated the
+    three stale nearby comments that used to justify why `semiAnti` stays
+    empty in production. `go build`/`go vet ./internal/optimizer/...` clean,
+    full `go test ./internal/optimizer/...` pass unchanged. TPC-DS SF0.25
+    sweep: `PASS=96 MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0` — zero
+    correctness regressions across the 99-query corpus. For the first time
+    this milestone, the plan-shape self-diff is non-empty:
+    `PLAN-SHAPE: same=98 changed=1` (`Q78`), confirming Phase B is now
+    genuinely live in production, not merely unit-tested. Q78 has no literal
+    `EXISTS`/`NOT EXISTS` — its antijoins come from PG's
+    `LEFT JOIN ... WHERE col IS NULL` strength-reduction idiom, which the
+    `JoinType`-keyed admission arm correctly treats the same as an
+    `unnestExistsExpr`-born antijoin, satisfying §27.4/§33.4's "real
+    EXISTS/NOT-EXISTS-equivalent fixture" requirement. Q10/Q35 (this
+    milestone's own cited unblock targets) are unchanged, as expected —
+    §16/§19 already established they need `M0142-0008c`'s separate,
+    partially-landed `create_unique_path` mechanism (`-3c`/`-3d`/`-4` not yet
+    done), which this flip could not reach on its own; that dependency is now
+    unblocked (§30 Finding 1) and is the natural next pickup for
+    Q10/Q35-parity work, filed separately. One follow-up surfaced and
+    deferred (ledger row appended, task-id `m0142-0008a-3i-plumbing-b2`): the
+    `ws` CTE's new Nested-Loop-with-Filter shape for Q78 carries an
+    implausibly cheap EXPLAIN cost estimate — correctness-neutral
+    (checksums matched, no wall-clock regression) but a likely cost-model gap
+    in the newly-reached Semi/Anti path-building arm, not chased this loop.
+    `RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh` shows only
+    the pre-existing unrelated `internal/parser` `GroupedJoinUnaliased`
+    failure (`internal/optimizer` itself `ok`).
   **Independent, unfiled resume-point hint** (not sized/numbered — noted for
   whoever picks up S5a's own eligibility gate): relaxing
   `whereEligibleForPreDPUnnest` to per-sublink granularity would upgrade
@@ -4146,17 +4171,17 @@ cross-layer programme that has never been scoped.
 - [ ] **M0142-0008c-3c — `addHashJoinPath`/`addPartialHashJoinPath`
   unique-ify substitution** — filed by M0142-0008c-3's recon (design doc
   §19.4 item 3c). Depends on M0142-0008c-3a. Deferred: not exercised by
-  either named witness (§19.1). **Also now blocked on
-  M0142-0008a-3i-plumbing-b2** (design doc §21/§22) — do not pick up before
-  that lands; no
-  TPC-DS measurement can distinguish "correct but unreachable" from "wrong"
-  while `addPathsToJoinrel` never receives a real SEMI/ANTI `sjinfo`. PG
+  either named witness (§19.1). **Unblocked 2026-09-16: `M0142-0008a-3i-plumbing-b2`
+  landed (design doc §34)** — `admitSemiAnti=true` is now live in production
+  and a real Semi/Anti pair reaches the DP search for at least one query
+  (`Q78`), so a TPC-DS measurement can now distinguish "correct but
+  unreachable" from "wrong" for this item. Not yet picked up. PG
   oracle: `hash_inner_and_outer`, `joinpath.c:2100-2140` (cited by §16.1, not
   yet read live).
 - [ ] **M0142-0008c-3d — merge + partial-nestloop unique-ify substitution**
   — filed by M0142-0008c-3's recon (design doc §19.4 item 3d). Depends on
-  M0142-0008c-3a. **Also now blocked on M0142-0008a-3i-plumbing-b2**,
-  same reason as 3c (design doc §21/§22). Deferred for the same reason as 3c
+  M0142-0008c-3a. **Unblocked 2026-09-16, same reason as 3c** (design doc
+  §34) — not yet picked up. Deferred for the same reason as 3c
   otherwise: `sortInnerAndOuter`/`matchUnsortedOuterMerge`/
   `matchUnsortedOuterMergePartial` (merge) and `addPartialNestLoopPaths`
   (parallel NL), PG oracle `sort_inner_and_outer`/`match_unsorted_outer`,
