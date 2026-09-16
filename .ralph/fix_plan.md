@@ -3668,36 +3668,49 @@ cross-layer programme that has never been scoped.
     `M0142-0008c-3c`/`-3d`/`-4` landing first). This is still the actual
     unblock for TPC-DS Q10/Q35 and for `M0142-0008c-3c`/`-3d` (both still
     blocked on it) to ever affect a real plan.
-  - [ ] **M0142-0008a-3i-plumbing-b1 — INERT scaffold: walk extension +
-    predp.go pass-through + SJInfo rebuild (design doc §22.4)** — filed by
-    -3i-plumbing-b's scoping pass. Scope: extend `extractSearchLeaves`'s
-    `*Join` type-switch to admit `JoinTypeSemi`/`JoinTypeAnti` per §22.2's
-    settled semantics (recurse `j.Left`, append `j.Right` as one opaque
-    leaf, return `below` unchanged, build a `semiAntiChainLink`); extend
-    `predp.go`'s descend loop to pass through non-Semi/Anti `*Join` nodes
-    instead of hard-bailing (`predp.go:96-101`); rebuild the matched
-    `SpecialJoinInfo`'s Syn/MinLefthand/Righthand from real leaf-index bits
-    at admission time using `semiAntiLinksHaveSJInfos` (landed by
-    -3i-plumbing-a) to find the match, replacing `existsUnnestSJInfo`'s
-    throwaway `synL=1`/`synR=2` numbering. Must land gated behind an
-    eligibility check that provably cannot fire in production yet (item 6 —
-    `ctx.bindings`/`joinlist` — is not done), verified the same way as
-    -3i-plumbing-a: unit tests on the new code paths directly, plus a
-    TPC-DS SF0.25 sweep showing zero plan-shape change.
-  - [ ] **M0142-0008a-3i-plumbing-b2 — ctx.bindings/joinlist extension +
-    cutover (design doc §22.3/§22.4)** — filed by -3i-plumbing-b's scoping
-    pass. Depends on -3i-plumbing-b1. Scope: give the Semi/Anti RHS subtree
-    a `ctx.bindings`/`ctx.joinlist` representation (plumb a
+  - [x] **M0142-0008a-3i-plumbing-b1 — INERT scaffold: walk extension +
+    SJInfo rebuild (design doc §22.4, narrowed by §23.4)** — filed by
+    -3i-plumbing-b's scoping pass. **DONE 2026-09-16.** Landed: extended
+    `extractSearchLeaves`'s `*Join` type-switch (new `admitSemiAnti bool`
+    parameter, literal `false` at the one production call site) to admit
+    `JoinTypeSemi`/`JoinTypeAnti` per §22.2's settled semantics (recurse
+    `j.Left`, append `j.Right` as one opaque leaf, return `below` unchanged,
+    build a `semiAntiChainLink`); rebuilt the matched join's `SJInfo`'s
+    Syn/MinLefthand/Righthand from real leaf-index bits at admission time,
+    replacing `existsUnnestSJInfo`'s throwaway `synL=1`/`synR=2` numbering
+    (item 4). Verified: `go build`/`go vet ./internal/optimizer/...` clean,
+    full `go test ./internal/optimizer/...` pass (2 new tests exercising the
+    real function directly, not the throwaway probe copy), TPC-DS SF0.25
+    sweep `PASS=96 MISMATCH=0 CKMISMATCH=0 ERROR=0` `PLAN-SHAPE: same=99
+    changed=0`, `RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh`
+    shows only the pre-existing unrelated `internal/parser`
+    `GroupedJoinUnaliased` failure. **Narrowing correction (design doc
+    §23.4)**: `predp.go`'s pass-through (originally filed as this item's
+    "item 2") does NOT land here — it lacks items 3/4's caller-visible inert
+    gate (its bail already only fires on a shape the eligibility pre-check
+    guarantees cannot occur, so generalizing it is unverifiable dead code
+    without an unrealistic fixture) and only has real meaning paired with
+    `-b2`'s actual tree-routing cutover — re-filed into `-b2` below.
+  - [ ] **M0142-0008a-3i-plumbing-b2 — predp.go pass-through +
+    ctx.bindings/joinlist extension + cutover (design doc §22.3/§22.4,
+    §23.4)** — filed by -3i-plumbing-b's scoping pass, scope corrected by
+    -3i-plumbing-b1's §23.4 finding. Depends on -3i-plumbing-b1 (done).
+    Scope: extend `predp.go`'s descend loop to pass through non-Semi/Anti
+    `*Join` nodes instead of hard-bailing (`predp.go:96-101`) — now coupled
+    here rather than to -b1, since it only has meaning once this item's
+    cutover actually routes a wider tree through it; give the Semi/Anti RHS
+    subtree a `ctx.bindings`/`ctx.joinlist` representation (plumb a
     `*resolveContext` through `unnestSubqueriesInPlan`/`unnestExistsExpr`,
     with its own scoping pass into their other internal call sites first —
     not investigated this loop); feed the full spine+origChain tree to
-    `tryJoinSearch`; retire `predp.go`'s splice-and-reresolve
-    (`reresolveJoinByName`) ONLY for statement shapes empirically proven
-    (TPC-DS sweep + a dedicated EXISTS/NOT-EXISTS regression set) to be
-    handled end-to-end by the new path, keeping the old splice as fallback
-    for everything else — never remove the fallback before proving it's
-    unreachable for the engaged family. Likely also depends on enough of
-    `M0142-0008c-3c`/`-3d`/`-4`'s path-builder work existing for a real
+    `tryJoinSearch`; flip the production call site's `admitSemiAnti` to
+    `true` once the walk's new leaves are resolvable; retire `predp.go`'s
+    splice-and-reresolve (`reresolveJoinByName`) ONLY for statement shapes
+    empirically proven (TPC-DS sweep + a dedicated EXISTS/NOT-EXISTS
+    regression set) to be handled end-to-end by the new path, keeping the
+    old splice as fallback for everything else — never remove the fallback
+    before proving it's unreachable for the engaged family. Likely also
+    depends on enough of `M0142-0008c-3c`/`-3d`/`-4`'s path-builder work existing for a real
     Semi/Anti pair to be admissible during DP at all.
   **Independent, unfiled resume-point hint** (not sized/numbered — noted for
   whoever picks up S5a's own eligibility gate): relaxing

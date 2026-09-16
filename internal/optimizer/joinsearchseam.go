@@ -301,7 +301,12 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 		traceSeamDecline("prefix-not-a-prefix", nrels, nprefix)
 		return node, pred, false
 	}
-	scans, widths, onQuals, outerLinks, ok := extractSearchLeaves(chain)
+	// admitSemiAnti stays false here: production entry (M0142-0008a-3i-plumbing-b1,
+	// design doc §22.4) — the "-b1" scaffold below can only ever fire from a
+	// direct unit-test call, since `chain` here is `origChain`, which
+	// structurally never contains a Semi/Anti node under the current
+	// pre-`-3i-plumbing-b2` engagement scope (§22.1's finding).
+	scans, widths, onQuals, outerLinks, _, ok := extractSearchLeaves(chain, false)
 	if !ok {
 		traceSeamDecline("chain-not-flattenable", nrels, len(scans))
 		return node, pred, false
@@ -1068,7 +1073,16 @@ func searchConsumes(c Expr, cumOffsets []int) bool {
 // numbers a chain's bindings left to right and `planFromClause` appends items
 // in FROM order (03 §6.1's leaf-numbering guarantee), and this walk visits Left
 // before Right at every level.
-func extractSearchLeaves(node Node) (scans []Node, widths []int, onQuals []chainOnQual, outer []outerChainLink, ok bool) {
+// admitSemiAnti gates M0142-0008a-3i-plumbing-b1's Semi/Anti-admission arm
+// (design doc §22.4). It is a plain parameter, not a package-level flag,
+// specifically so the ONE production call site (this function's caller in
+// tryPGShapedJoinSearch) can pass a literal `false` and every reader can see,
+// without tracing further, that the arm is provably inert in production
+// until M0142-0008a-3i-plumbing-b2 (item 6: giving the Semi/Anti RHS a
+// ctx.bindings/joinlist representation) lands — mirroring the
+// "callable but never called" shape `-3i-plumbing-a` already used for
+// `semiAntiChainLink`'s two consumers.
+func extractSearchLeaves(node Node, admitSemiAnti bool) (scans []Node, widths []int, onQuals []chainOnQual, outer []outerChainLink, semiAnti []semiAntiChainLink, ok bool) {
 	width := 0
 	// `preserved` marks a subtree NO admitted outer link null-extends, and it
 	// is C-04a/b's `onSpine` flag WIDENED rather than deleted.
@@ -1107,6 +1121,69 @@ func extractSearchLeaves(node Node) (scans []Node, widths []int, onQuals []chain
 			return 0, false
 		}
 		j, isJoin := n.(*Join)
+		if isJoin && admitSemiAnti && (j.Type == JoinTypeSemi || j.Type == JoinTypeAnti) {
+			// M0142-0008a-3i-plumbing-b1 (design doc §22.2's settled
+			// semantics, INERT until admitSemiAnti is true): SEMI/ANTI
+			// null-extends neither side, so it is declined exactly like an
+			// outer link when it sits on a subtree an admitted outer link
+			// above it already null-extends (mirrors the Left/Right
+			// `!preserved` decline immediately below), but unlike an outer
+			// link its RHS stays ONE opaque leaf rather than being split
+			// into preserved/nullable leaf ranges — making the RHS itself a
+			// real DP-reorderable participant is the separate, still
+			// out-of-scope S5b mechanism (§11-§13, §22.2).
+			if !preserved {
+				return 0, false
+			}
+			base := width
+			loLeft := len(scans)
+			nullLeft, okLeft := walk(j.Left, preserved)
+			if !okLeft {
+				return 0, false
+			}
+			loRight := len(scans)
+			// j.Right as ONE opaque leaf — the same append path the
+			// "not an admitted join type" branch below uses for any other
+			// non-reorderable node.
+			scans = append(scans, j.Right)
+			widths = append(widths, len(j.Right.Output()))
+			width += len(j.Right.Output())
+			hiRight := len(scans)
+			pred := j.Predicate
+			if pred != nil && base != 0 {
+				shifted, okShift := rebaseChainQual(pred, base)
+				if !okShift {
+					return 0, false
+				}
+				pred = shifted
+			}
+			pjt := parser.JoinSemi
+			if j.Type == JoinTypeAnti {
+				pjt = parser.JoinAnti
+			}
+			lhs := leafRangeRelSet(loLeft, loRight)
+			rhs := leafRangeRelSet(loRight, hiRight)
+			semiAnti = append(semiAnti, semiAntiChainLink{jointype: pjt, lhs: lhs, rhs: rhs, pred: pred})
+			// Item 4: rebuild the placeholder SJInfo `unnestExistsExpr`
+			// attached at synthesis time (`existsUnnestSJInfo`'s
+			// throwaway synL=1/synR=2 — unnest.go:4390-4397, the only
+			// self-contained numbering available before this walk ever
+			// runs) with the real leaf-index bits just derived.
+			// `existsUnnestSJInfo` always sets MinLefthand==SynLefthand
+			// and MinRighthand==SynRighthand (unnest.go:4419-4430:
+			// `clause` is always `synL|synR` because `unnestExistsExpr`'s
+			// own belt check refuses a keyless join with no residual), so
+			// replacing both hands of both pairs with the new bits
+			// preserves that invariant under real numbering.
+			if j.SJInfo != nil {
+				j.SJInfo.SynLefthand, j.SJInfo.MinLefthand = lhs, lhs
+				j.SJInfo.SynRighthand, j.SJInfo.MinRighthand = rhs, rhs
+			}
+			// Semi/Anti contributes nothing to the NULL-extended union an
+			// INNER link above it needs (§22.2) — `below` is `nullLeft`
+			// unchanged, exactly like the existing INNER-link arm.
+			return nullLeft, true
+		}
 		if !isJoin || (j.Type != JoinTypeCross && j.Type != JoinTypeInner && j.Type != JoinTypeLeft && j.Type != JoinTypeRight) {
 			scans = append(scans, n)
 			widths = append(widths, len(n.Output()))
@@ -1190,9 +1267,9 @@ func extractSearchLeaves(node Node) (scans []Node, widths []int, onQuals []chain
 		return below, true
 	}
 	if _, okWalk := walk(node, true); !okWalk {
-		return nil, nil, nil, nil, false
+		return nil, nil, nil, nil, nil, false
 	}
-	return scans, widths, onQuals, outer, true
+	return scans, widths, onQuals, outer, semiAnti, true
 }
 
 // chainOnQual is one INNER link's `ON` qual as the walk flattened it, plus the

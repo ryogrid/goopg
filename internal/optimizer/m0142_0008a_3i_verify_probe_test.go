@@ -87,7 +87,7 @@ func TestExistsUnnestTwoRelationRHSTopNodeIsProjectNotBareJoin(t *testing.T) {
 
 	// extractSearchLeaves already stops at j.Right (the *Project) as one
 	// opaque leaf, out of the box — no new wrapper node needed.
-	scans, _, _, _, walkOK := extractSearchLeaves(j.Right)
+	scans, _, _, _, _, walkOK := extractSearchLeaves(j.Right, false)
 	if !walkOK {
 		t.Fatalf("extractSearchLeaves(j.Right) ok=false, want true (a *Project must not be declined)")
 	}

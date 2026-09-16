@@ -2419,3 +2419,153 @@ first, prove inert before wiring" shape:
   landing note).
 
 `fix_plan.md`'s `-3i-plumbing-b` entry is replaced by these two sub-items.
+
+## 23. M0142-0008a-3i-plumbing-b1 landed — the INERT scaffold (2026-09-16)
+
+Per §22.4's decomposition, this loop landed items 2-4 as a scaffold gated
+behind an eligibility check the same way `-3i-plumbing-a`/`-0008c-1/-2/-3a`
+already proved out: new code exists, is unit-tested directly, and is
+provably unreachable from the one production call site.
+
+### 23.1 What landed
+
+`extractSearchLeaves` (`joinsearchseam.go`) gained an `admitSemiAnti bool`
+parameter. When `false` — the literal value the ONE production call site
+(`tryPGShapedJoinSearch`) passes — the function is byte-identical to before:
+a Semi/Anti `*Join` still falls through to the generic "not an admitted join
+type" branch and becomes one opaque leaf, exactly as it always has (this
+was already true before this loop, since `origChain` never contains a
+Semi/Anti node under current engagement scope — §22.1).
+
+When `true`, a new arm intercepted right after the `n.(*Join)` type
+assertion (before the generic non-admitted-type branch, so it must run
+first):
+
+1. Declines (`return 0, false`) if `!preserved`, mirroring the existing
+   Left/Right outer-link decline for the same reason — a link sitting on a
+   subtree an admitted outer link above it already null-extends is not a
+   shape this walk has proven safe to interpret, whether the link itself
+   null-extends anything or not.
+2. Recurses into `j.Left` with `preserved` UNCHANGED (Semi/Anti null-extends
+   neither side, so nothing needs to clear).
+3. Appends `j.Right` as ONE opaque leaf via the exact same
+   `scans = append(scans, n)` / `widths = append(...)` / `width += ...`
+   triplet the generic non-admitted-type branch uses — no new leaf-append
+   mechanism, reusing the existing one directly (§22.2's "RHS stays
+   non-reorderable" instruction).
+4. Rebases `j.Predicate` into the walk's coordinate space (`rebaseChainQual`,
+   same helper the Left/Right/Inner arms already use) and builds a
+   `semiAntiChainLink{jointype, lhs, rhs, pred}` from the real leaf-index
+   bits (`lhs = leafRangeRelSet(loLeft, loRight)`,
+   `rhs = leafRangeRelSet(loRight, hiRight)`), appended to a new `semiAnti
+   []semiAntiChainLink` return value.
+5. **Item 4**: if the join carries a non-nil `SJInfo` (attached by
+   `unnestExistsExpr` via `existsUnnestSJInfo` at synthesis time, always with
+   the throwaway `synL=1`/`synR=2` 2-bit numbering — unnest.go:4398-4399),
+   overwrites `SJInfo.SynLefthand`/`SynRighthand` AND
+   `SJInfo.MinLefthand`/`MinRighthand` with the same `lhs`/`rhs` bits, in
+   place, on the same struct the `*Join` node already points at. This is
+   safe under `existsUnnestSJInfo`'s own invariant
+   (unnest.go:4419-4430: `clause` is always `synL|synR` because
+   `unnestExistsExpr`'s belt check refuses a keyless join with no residual,
+   so `MinLefthand == SynLefthand` and `MinRighthand == SynRighthand`
+   already held under the placeholder numbering) — replacing both hands of
+   both pairs with the new bits preserves that same equality under real
+   numbering.
+6. Returns `nullLeft` unchanged as `below` (§22.2's settled semantics: a
+   Semi/Anti link contributes nothing to the NULL-extended union an INNER
+   link above it needs).
+
+The one production call site (`joinsearchseam.go`'s `tryPGShapedJoinSearch`)
+was updated to `extractSearchLeaves(chain, false)`, discarding the new
+`semiAnti` return with `_` — no behavior change, by construction.
+
+### 23.2 Verification
+
+Two new tests in `semiantichain_test.go`, both built on the same
+Q69-witness-class fixture (`SELECT x FROM t1 WHERE EXISTS (SELECT 1 FROM
+t2, t3 WHERE t2.z = t1.x AND t2.y = t3.a)`) the probe and prior sections
+already established produces `j.Right = *Project{Child: *Join{Inner}}`:
+
+- `TestExtractSearchLeaves_AdmitSemiAnti_BuildsLinkAndRebuildsSJInfo` calls
+  the REAL `extractSearchLeaves(j, true)` (not the throwaway probe copy) and
+  checks the full chain: 2 leaves (t1, RHS `*Project` as one opaque leaf),
+  zero `onQuals`/`outer`, exactly one `semiAntiChainLink` with the correct
+  `lhs`/`rhs`/`pred`, that `semiAntiOnQualsOK` accepts it, and that
+  `j.SJInfo`'s four hands were rebuilt from the `{1,2}` placeholder to the
+  real bits and that `semiAntiLinksHaveSJInfos` then matches the rebuilt
+  `SJInfo` against the link. (The fixture is the FINAL planned tree, so
+  `j.Predicate` is nil post-hash-method-selection exactly as the §21 probe
+  found; the test reconstructs it from `j.LeftKey`/`j.RightKey` before
+  calling `extractSearchLeaves`, mirroring the already-established pattern
+  in `TestSemiAntiLinksHaveSJInfos_MatchesRealSJInfo` — production's real
+  entry point always has `Predicate` populated pre-method-selection, so this
+  reconstruction is a test-fixture concern only, not new production logic.)
+- `TestExtractSearchLeaves_AdmitSemiAntiFalse_UnchangedFromProduction` calls
+  `extractSearchLeaves(j, false)` on the same class of fixture and checks the
+  Semi join comes back as the single opaque leaf it always was, with
+  `j.SJInfo` untouched — the inertness claim, checked directly rather than
+  only argued from the call site.
+
+`go build ./...` clean. `go vet ./internal/optimizer/...` clean. `go test
+./internal/optimizer/...` full pass. TPC-DS SF0.25 sweep (private
+`GOOPG_BIN=tmp/goopg-sf025-bin`, foreground): `PASS=96 MISMATCH=0
+CKMISMATCH=0 ERROR=0 TIMEOUT=0`, `PLAN-SHAPE: same=99 changed=0` — empirically
+confirms zero plan-shape impact, as required for a scaffold change touching
+the search's own leaf-extraction seam. `RALPH_PRECOMMIT_SCOPE=units
+scripts/ralph-precommit-test.sh`: `internal/optimizer` passes; the only
+failure is the same pre-existing, unrelated `internal/parser`
+`GroupedJoinUnaliased` AST-drift issue the prior four loops already found.
+
+### 23.3 Resume point
+
+Unchanged from §22.4: `M0142-0008a-3i-plumbing-b2` — item 6's
+`ctx.bindings`/`ctx.joinlist` extension (give the Semi/Anti RHS a
+`rangeBinding`/joinlist representation by plumbing a `*resolveContext`
+through `unnestSubqueriesInPlan`/`unnestExistsExpr`, with its own scoping
+pass into their other internal call sites first — e.g. IN-family unnesting,
+not investigated by any loop so far) plus the actual cutover (feed the full
+spine+`origChain` tree to `tryJoinSearch`, flip the production call site's
+`admitSemiAnti` to `true` only once item 6 makes the walk's new leaves
+resolvable, and retire `predp.go`'s splice-and-reresolve only for statement
+shapes empirically proven handled end-to-end by the new path). Still likely
+also depends on enough of `M0142-0008c-3c`/`-3d`/`-4`'s path-builder work
+existing for a real Semi/Anti pair to be admissible during DP at all.
+
+### 23.4 Narrowing correction: item 2 (`predp.go` pass-through) moves to `-b2`, not landed here
+
+§22.4's own text bundled item 2 ("`predp.go`'s descend loop pass through
+non-Semi/Anti `*Join` nodes instead of hard-bailing," `predp.go:96-101`) into
+`-b1`'s scope alongside items 3/4. Attempting it this loop found it does not
+have the same INERT-by-construction property items 3/4 have, and should not
+land under `-b1`'s banner:
+
+- Items 3/4 are inert because they are reached only when the NEW
+  `admitSemiAnti` parameter is `true`, and the one production call site
+  passes a literal `false` — a caller-visible, grep-checkable gate.
+- `predp.go`'s descend-loop bail (`predp.go:96-101`) has no equivalent gate
+  to attach a parameter to: it already only ever fires on a shape "the
+  eligibility pre-check" guarantees cannot occur today (no non-Semi/Anti
+  `*Join` node is ever placed on the pinned spine under the current
+  EXISTS/IN-only engagement scope — §21.1). Generalizing "bail" to "pass
+  through" would therefore be dead code by the SAME "cannot happen under
+  current construction" argument the pre-existing comment already makes,
+  not by an explicit, independently-checkable condition — a strictly weaker
+  and harder-to-verify inertness claim than items 3/4's, and one this loop
+  could not falsify with a realistic fixture (constructing a tree with a
+  non-Semi/Anti `*Join` on the spine means fabricating a shape no real
+  rewrite produces, which tests the change against nothing PG-faithful).
+- More importantly, tracing what "pass through" would need to DO once it is
+  no longer dead code shows it is not separable scaffolding at all: it only
+  has meaning paired with `-b2`'s actual cutover, which changes what tree
+  `predp.go` hands to `tryJoinSearch` in the first place (§22.1's "call
+  `tryJoinSearch` on a tree that includes the spine"). Landing a
+  "pass-through" arm now, with nothing yet routing a wider tree through it,
+  would be a change with no caller-visible gate AND no way to exercise it
+  even in a unit test without inventing an unrealistic fixture — worse than
+  simply deferring it to the task that actually needs it.
+
+`predp.go`'s pass-through is therefore re-filed into `M0142-0008a-3i-plumbing-b2`'s
+scope (updated in `fix_plan.md`), alongside item 6 and the cutover, rather
+than split out. `-b1`'s landed scope is precisely items 3 (walk extension)
+and 4 (SJInfo rebuild), as verified in §23.1-§23.2.

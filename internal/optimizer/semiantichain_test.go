@@ -163,3 +163,138 @@ func TestProblemPairsOuterWithDerivedAntiOverDerived(t *testing.T) {
 		t.Errorf("an Anti join whose RHS hand touches a derived (CTE) input must decline, same as LEFT/RIGHT/FULL")
 	}
 }
+
+// M0142-0008a-3i-plumbing-b1 (design doc §22.4): unit tests for the REAL
+// `extractSearchLeaves`'s Semi/Anti-admission arm, gated behind the new
+// `admitSemiAnti` parameter. These exercise the production function itself
+// (not the throwaway `extractSearchLeavesAdmitSemiAnti` probe copy), against
+// the same Q69-witness-class fixture the probe and the two tests above
+// already established produces `j.Right = *Project{Child: *Join{Inner}}`.
+
+// TestExtractSearchLeaves_AdmitSemiAnti_BuildsLinkAndRebuildsSJInfo proves
+// items 2-4 of §22.4's scaffold together: the walk extension flattens the
+// Semi join's LHS while keeping its RHS one opaque leaf, builds a
+// `semiAntiChainLink` real consumers (`semiAntiOnQualsOK`,
+// `semiAntiLinksHaveSJInfos`) accept, and rebuilds the join's own attached
+// `SJInfo` (originally `existsUnnestSJInfo`'s throwaway synL=1/synR=2) with
+// the real leaf-index bits.
+func TestExtractSearchLeaves_AdmitSemiAnti_BuildsLinkAndRebuildsSJInfo(t *testing.T) {
+	cat := analyzedThreeTablesCatalog(t)
+	sql := "SELECT x FROM t1 WHERE EXISTS (" +
+		"SELECT 1 FROM t2, t3 WHERE t2.z = t1.x AND t2.y = t3.a)"
+	node, err := Plan(parseOne(t, sql), cat)
+	if err != nil {
+		t.Fatal(err)
+	}
+	j := findFirstJoinByType(node, JoinTypeSemi)
+	if j == nil {
+		t.Fatalf("no JoinTypeSemi found: %s", planString(node))
+	}
+	if j.SJInfo == nil {
+		t.Fatalf("j.SJInfo = nil, want the inert SpecialJoinInfo unnestExistsExpr attaches")
+	}
+	// The placeholder this loop's change replaces (unnest.go's
+	// existsUnnestSJInfo, §22.4 item 4's stated target).
+	if j.SJInfo.SynLefthand != 1 || j.SJInfo.SynRighthand != 2 {
+		t.Fatalf("j.SJInfo.{SynLefthand,SynRighthand} = {%#x,%#x} before admission, want the throwaway {1,2} placeholder — fixture or existsUnnestSJInfo changed out from under this test", j.SJInfo.SynLefthand, j.SJInfo.SynRighthand)
+	}
+	// This fixture is the FINAL planned tree (post join-method selection):
+	// a hash-keyed Semi/Anti carries its correlation as (LeftKey, RightKey),
+	// not j.Predicate (m0142_0008a_3i_plumbing_probe_test.go's own finding).
+	// extractSearchLeaves's real production call site (predp.go's pre-search
+	// origChain) runs BEFORE method selection, so Predicate is always
+	// populated there — reconstruct it here purely to exercise that real,
+	// predicate-bearing case against this post-selection fixture.
+	if j.Predicate == nil && j.LeftKey != nil && j.RightKey != nil {
+		j.Predicate = &BinaryOp{Op: parser.OpEq, Left: j.LeftKey, Right: j.RightKey}
+	}
+	if j.Predicate == nil {
+		t.Fatalf("no correlation predicate on the Semi join: %#v", j)
+	}
+
+	scans, widths, onQuals, outer, semiAnti, ok := extractSearchLeaves(j, true)
+	if !ok {
+		t.Fatalf("extractSearchLeaves(j, true) ok=false, want true: %s", planString(node))
+	}
+	if len(scans) != 2 {
+		t.Fatalf("scans = %d leaves (%v), want 2 (t1, and the RHS *Project as one opaque leaf) — widths=%v", len(scans), scans, widths)
+	}
+	if _, isProj := scans[1].(*Project); !isProj {
+		t.Errorf("scans[1] = %T, want *Project (RHS stays opaque, no recursion into inner t2/t3)", scans[1])
+	}
+	if len(onQuals) != 0 {
+		t.Errorf("onQuals = %v, want none — the Semi join's predicate must land in `semiAnti`, not `onQuals`", onQuals)
+	}
+	if len(outer) != 0 {
+		t.Errorf("outer = %v, want none — a Semi/Anti link is a semiAntiChainLink, not an outerChainLink", outer)
+	}
+	if len(semiAnti) != 1 {
+		t.Fatalf("semiAnti = %d links, want exactly 1: %+v", len(semiAnti), semiAnti)
+	}
+	lk := semiAnti[0]
+	wantLHS, wantRHS := leafRangeRelSet(0, 1), leafRangeRelSet(1, 2)
+	if lk.jointype != parser.JoinSemi {
+		t.Errorf("semiAnti[0].jointype = %v, want parser.JoinSemi", lk.jointype)
+	}
+	if lk.lhs != wantLHS || lk.rhs != wantRHS {
+		t.Errorf("semiAnti[0] = {lhs:%#x, rhs:%#x}, want {lhs:%#x, rhs:%#x}", lk.lhs, lk.rhs, wantLHS, wantRHS)
+	}
+	if lk.pred == nil {
+		t.Fatalf("semiAnti[0].pred = nil, want the correlation predicate")
+	}
+
+	cumOffsets := make([]int, len(widths)+1)
+	for i, w := range widths {
+		cumOffsets[i+1] = cumOffsets[i] + w
+	}
+	if !semiAntiOnQualsOK(semiAnti, cumOffsets) {
+		t.Errorf("semiAntiOnQualsOK(semiAnti, cumOffsets) = false, want true — the walk's own link must satisfy the consumer it was built to feed")
+	}
+
+	// Item 4: the placeholder synL=1/synR=2 must be REPLACED by the real
+	// leaf-index bits, in place, on the same *SpecialJoinInfo the Join node
+	// already carries.
+	if j.SJInfo.SynLefthand != wantLHS || j.SJInfo.SynRighthand != wantRHS {
+		t.Errorf("after admission, j.SJInfo.{SynLefthand,SynRighthand} = {%#x,%#x}, want {%#x,%#x} (rebuilt from real leaf-index bits, replacing the {1,2} placeholder)", j.SJInfo.SynLefthand, j.SJInfo.SynRighthand, wantLHS, wantRHS)
+	}
+	if j.SJInfo.MinLefthand != wantLHS || j.SJInfo.MinRighthand != wantRHS {
+		t.Errorf("after admission, j.SJInfo.{MinLefthand,MinRighthand} = {%#x,%#x}, want {%#x,%#x}", j.SJInfo.MinLefthand, j.SJInfo.MinRighthand, wantLHS, wantRHS)
+	}
+	if !semiAntiLinksHaveSJInfos(semiAnti, []*SpecialJoinInfo{j.SJInfo}) {
+		t.Errorf("semiAntiLinksHaveSJInfos(semiAnti, [j.SJInfo]) = false, want true — the rebuilt SJInfo must match the link the same walk just built")
+	}
+}
+
+// TestExtractSearchLeaves_AdmitSemiAntiFalse_UnchangedFromProduction proves
+// the scaffold is inert exactly as design doc §22.4 requires: with
+// `admitSemiAnti=false` (the literal value the ONE production call site
+// passes, joinsearchseam.go's tryPGShapedJoinSearch), the Semi join is
+// treated as an ordinary opaque leaf — byte-identical to
+// pre-M0142-0008a-3i-plumbing-b1 behavior — and its SJInfo is left untouched.
+func TestExtractSearchLeaves_AdmitSemiAntiFalse_UnchangedFromProduction(t *testing.T) {
+	cat := analyzedThreeTablesCatalog(t)
+	sql := "SELECT x FROM t1 WHERE EXISTS (" +
+		"SELECT 1 FROM t2, t3 WHERE t2.z = t1.x AND t2.y = t3.a)"
+	node, err := Plan(parseOne(t, sql), cat)
+	if err != nil {
+		t.Fatal(err)
+	}
+	j := findFirstJoinByType(node, JoinTypeSemi)
+	if j == nil {
+		t.Fatalf("no JoinTypeSemi found: %s", planString(node))
+	}
+
+	scans, _, onQuals, outer, semiAnti, ok := extractSearchLeaves(j, false)
+	if !ok {
+		t.Fatalf("extractSearchLeaves(j, false) ok=false, want true (a Semi *Join must still be a valid opaque leaf)")
+	}
+	if len(scans) != 1 || scans[0] != Node(j) {
+		t.Errorf("scans = %v, want exactly [j] (admitSemiAnti=false: the Semi join itself is one opaque leaf, no descent)", scans)
+	}
+	if len(onQuals) != 0 || len(outer) != 0 || len(semiAnti) != 0 {
+		t.Errorf("onQuals=%v outer=%v semiAnti=%v, want all empty with admitSemiAnti=false", onQuals, outer, semiAnti)
+	}
+	if j.SJInfo != nil && (j.SJInfo.SynLefthand != 1 || j.SJInfo.SynRighthand != 2) {
+		t.Errorf("j.SJInfo.{SynLefthand,SynRighthand} = {%#x,%#x}, want the untouched {1,2} placeholder — admitSemiAnti=false must not rebuild it", j.SJInfo.SynLefthand, j.SJInfo.SynRighthand)
+	}
+}
