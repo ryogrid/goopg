@@ -286,6 +286,86 @@ func TestExtractSearchLeaves_AdmitSemiAnti_BuildsLinkAndRebuildsSJInfo(t *testin
 	}
 }
 
+// TestExtractSearchLeaves_AdmitSemiAnti_NarrowsMinLefthandToCorrelatedRelation
+// (M0142-0008a-3i-plumbing-c10, design doc §44.3-44.4, filed by c9) proves the
+// positive case none of the existing SJInfo-rebuild tests can: with only ONE
+// outer relation, `lhs` is already a single bit and "narrowed" is
+// indistinguishable from "un-narrowed" (see the BuildsLinkAndRebuildsSJInfo
+// test above, whose own assertion — `MinLefthand == wantLHS` — passes either
+// way). This fixture gives EXISTS a TWO-relation outer (t1, t3) but
+// correlates it to only t1, so a correct fix must produce
+// `MinLefthand != lhs` while `SynLefthand` stays the whole composite.
+func TestExtractSearchLeaves_AdmitSemiAnti_NarrowsMinLefthandToCorrelatedRelation(t *testing.T) {
+	cat := analyzedThreeTablesCatalog(t)
+	// Every outer column is selected (t1.x, t3.a, t3.b) so the narrowing
+	// pass has nothing to prune and leaves t1 JOIN t3 as a raw *Join chain
+	// instead of wrapping it in a *Project — extractSearchLeaves only
+	// flattens *Join nodes, so a Project in between would opaque the whole
+	// composite into one leaf and defeat this test's purpose.
+	sql := "SELECT t1.x, t3.a, t3.b FROM t1, t3 WHERE t1.x = t3.a AND EXISTS (" +
+		"SELECT 1 FROM t2 WHERE t2.z = t1.x)"
+	node, err := Plan(parseOne(t, sql), cat)
+	if err != nil {
+		t.Fatal(err)
+	}
+	j := findFirstJoinByType(node, JoinTypeSemi)
+	if j == nil {
+		t.Fatalf("no JoinTypeSemi found: %s", planString(node))
+	}
+	if j.SJInfo == nil {
+		t.Fatalf("j.SJInfo = nil, want the inert SpecialJoinInfo unnestExistsExpr attaches")
+	}
+	// Same reconstruction TestExtractSearchLeaves_AdmitSemiAnti_BuildsLinkAndRebuildsSJInfo
+	// uses: this is the post-method-selection fixture, so the correlation
+	// lives in (LeftKey, RightKey), not Predicate.
+	if j.Predicate == nil && j.LeftKey != nil && j.RightKey != nil {
+		j.Predicate = &BinaryOp{Op: parser.OpEq, Left: j.LeftKey, Right: j.RightKey}
+	}
+	if j.Predicate == nil {
+		t.Fatalf("no correlation predicate on the Semi join: %#v", j)
+	}
+
+	scans, widths, _, _, semiAnti, ok := extractSearchLeaves(j, true)
+	if !ok {
+		t.Fatalf("extractSearchLeaves(j, true) ok=false, want true: %s", planString(node))
+	}
+	if len(scans) != 3 {
+		t.Fatalf("scans = %d leaves, want 3 (t1+t3 flattened, plus the RHS opaque leaf): %v widths=%v", len(scans), scans, widths)
+	}
+	// t1's leaf position depends on join-order costing, not source-text
+	// order, so find it rather than assuming index 0.
+	t1Idx := -1
+	for i, s := range scans[:2] {
+		if seq, isSeq := s.(*SeqScan); isSeq && seq.Table != nil && seq.Table.Name == "t1" {
+			t1Idx = i
+		}
+	}
+	if t1Idx == -1 {
+		t.Fatalf("could not find t1's leaf among the outer scans: %#v", scans[:2])
+	}
+	if len(semiAnti) != 1 {
+		t.Fatalf("semiAnti = %d links, want exactly 1: %+v", len(semiAnti), semiAnti)
+	}
+	wantLHS := leafRangeRelSet(0, 2)
+	if lk := semiAnti[0]; lk.lhs != wantLHS {
+		t.Fatalf("semiAnti[0].lhs = %#x, want %#x (the whole 2-relation outer)", lk.lhs, wantLHS)
+	}
+	if j.SJInfo.SynLefthand != wantLHS {
+		t.Errorf("j.SJInfo.SynLefthand = %#x, want %#x — SynLefthand must stay the WHOLE atomic outer side (existsUnnestSJInfo's deliberate convention), narrowing applies to MinLefthand only", j.SJInfo.SynLefthand, wantLHS)
+	}
+	wantMinL := leafRangeRelSet(t1Idx, t1Idx+1)
+	if j.SJInfo.MinLefthand != wantMinL {
+		t.Errorf("j.SJInfo.MinLefthand = %#x, want %#x (narrowed to just t1, the correlation's real referenced relation) — got the un-narrowed %#x instead", j.SJInfo.MinLefthand, wantMinL, j.SJInfo.MinLefthand)
+	}
+	// MinRighthand cannot narrow below the single-bit synthetic RHS leaf —
+	// still pinned as a sanity check that the symmetric computation didn't
+	// zero it out or otherwise corrupt it.
+	wantRHS := leafRangeRelSet(2, 3)
+	if j.SJInfo.MinRighthand != wantRHS {
+		t.Errorf("j.SJInfo.MinRighthand = %#x, want %#x (the single synthetic RHS leaf, unchanged)", j.SJInfo.MinRighthand, wantRHS)
+	}
+}
+
 // TestExtractSearchLeaves_AdmitSemiAnti_FoldsKeyEquijoinIntoPred pins design
 // doc §28.4's finding (M0142-0008a-3i-plumbing-b2 step 3 scoping pass): a
 // bare correlated EXISTS with no OTHER residual leaves `j.Predicate` nil —

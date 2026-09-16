@@ -1361,15 +1361,55 @@ func extractSearchLeaves(node Node, admitSemiAnti bool) (scans []Node, widths []
 			// throwaway synL=1/synR=2 — unnest.go:4390-4397, the only
 			// self-contained numbering available before this walk ever
 			// runs) with the real leaf-index bits just derived.
-			// `existsUnnestSJInfo` always sets MinLefthand==SynLefthand
-			// and MinRighthand==SynRighthand (unnest.go:4419-4430:
-			// `clause` is always `synL|synR` because `unnestExistsExpr`'s
-			// own belt check refuses a keyless join with no residual), so
-			// replacing both hands of both pairs with the new bits
-			// preserves that invariant under real numbering.
+			// `SynLefthand`/`SynRighthand` stay the WHOLE atomic lhs/rhs —
+			// that breadth is `existsUnnestSJInfo`'s deliberate convention
+			// for the syntactic sides (unnest.go:4405-4409) and is still
+			// correct here, real numbering or not.
+			//
+			// M0142-0008a-3i-plumbing-c10 (design doc §44.3-44.4, filed by
+			// c9): `MinLefthand`/`MinRighthand` do NOT inherit that same
+			// breadth. `existsUnnestSJInfo` sets `MinLefthand==SynLefthand`
+			// unconditionally (unnest.go:4419-4430) only because at
+			// construction time it has no real leaf numbering to narrow
+			// against — the synthetic synL=1 bit IS "the whole outer side,"
+			// full stop. Now that this walk has real numbering, PG's own
+			// `min_lefthand` computation (`pull_varnos(clause)` intersected
+			// with the syntactic side — see `sjiClauseRelids`'s doc comment,
+			// specialjoin.go) narrows to just the relations the correlation
+			// clause actually touches. Skipping that narrowing pins every
+			// real DP admission check to "wait for the entire outer
+			// composite," which is fatal for ANTI (no unique-ify escape
+			// valve unlike SEMI): an ANTI link could then never be admitted
+			// below the full outer join order.
+			//
+			// `pred` was just rebased (above) into THIS walk's own running
+			// cumulative column-index space — `base`/`rightBase` advance in
+			// walk order and count every leaf's width, synthetic or not.
+			// `buildLeafSpans(widths, nil)` with a nil semiAnti list forces
+			// its "no semiAnti links" branch (its own doc comment: reduces
+			// to a plain cumulative sum), reconstructing that EXACT same
+			// space for the leaves appended so far — NOT the canonical
+			// post-walk "real-then-synthetic-out-of-band" space the finished
+			// `semiAnti` list would otherwise trigger. `relidsOfExpr` then
+			// resolves each of `pred`'s ColumnRefs back to its real leaf.
+			// An unresolvable clause, or a computed set that misses either
+			// side entirely, falls back to the old un-narrowed bit — the
+			// same safe default `existsUnnestSJInfo` uses when it cannot see
+			// real numbering at all.
+			minL, minR := lhs, rhs
+			if pred != nil {
+				if relids, ok := relidsOfExpr(pred, buildLeafSpans(widths, nil)); ok {
+					if nl := relids & lhs; nl != 0 {
+						minL = nl
+					}
+					if nr := relids & rhs; nr != 0 {
+						minR = nr
+					}
+				}
+			}
 			if j.SJInfo != nil {
-				j.SJInfo.SynLefthand, j.SJInfo.MinLefthand = lhs, lhs
-				j.SJInfo.SynRighthand, j.SJInfo.MinRighthand = rhs, rhs
+				j.SJInfo.SynLefthand, j.SJInfo.MinLefthand = lhs, minL
+				j.SJInfo.SynRighthand, j.SJInfo.MinRighthand = rhs, minR
 			}
 			// Semi/Anti contributes nothing to the NULL-extended union an
 			// INNER link above it needs (§22.2) — `below` is `nullLeft`

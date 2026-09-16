@@ -5208,3 +5208,167 @@ the entire `{customer,ca,cd,semi}` composite by then. This is the shape
 c10's narrowing needs to make REACHABLE (not necessarily the shape goopg's
 own cost model will PICK — that is a separate, later question once the DP
 search can enumerate it at all).
+
+## 45. c10 — MinLefthand/MinRighthand narrowed at splice time; reachability STILL zero, root cause pinned to a `ctx.joinInfoList` duplication bug (next: c11)
+
+### 45.1 Landed: the narrowing itself, exactly as c9 filed it
+
+`joinsearchseam.go`'s semiAnti synthetic-leaf splice site (the walk's
+`JoinTypeSemi`/`JoinTypeAnti` admission arm, where `j.SJInfo.SynLefthand,
+MinLefthand = lhs, lhs` used to fire) now computes a narrowed `minL`/`minR`
+separately from the un-narrowed `lhs`/`rhs`: `buildLeafSpans(widths, nil)`
+(the "no semiAnti links" branch — a plain cumulative sum) reconstructs the
+SAME per-leaf column-index table `rebaseSemiAntiChainQual` just wrote
+`pred` into (both are the walk's own naive running-cumulative space, NOT
+`buildLeafSpans`'s canonical post-walk "real-then-synthetic-out-of-band"
+space — passing the REAL `semiAnti` list here would have been wrong,
+exactly the trap §44.4 flagged). `relidsOfExpr(pred, spans)` then resolves
+`pred`'s ColumnRefs back to real leaves; intersecting with `lhs`/`rhs`
+gives the narrowed bits, with a safe fallback to the old un-narrowed value
+whenever the clause can't be resolved. `SynLefthand`/`SynRighthand` are
+left untouched at the full `lhs`/`rhs` (deliberately — see the unnest.go
+comment cited in §44.4).
+
+New unit test `TestExtractSearchLeaves_AdmitSemiAnti_NarrowsMinLefthandToCorrelatedRelation`
+(semiantichain_test.go) proves this positively, which none of the prior
+tests could: `TestExtractSearchLeaves_AdmitSemiAnti_BuildsLinkAndRebuildsSJInfo`'s
+own `MinLefthand == wantLHS` assertion passes whether or not narrowing
+happens at all, because its fixture's outer side is a SINGLE relation (`t1`
+alone) — `lhs` is already a single bit there. The new fixture gives EXISTS
+a TWO-relation outer (`t1, t3`, joined `t1.x = t3.a`, correlated to `t1`
+only) so `lhs` (2 bits) and a correctly-narrowed `MinLefthand` (1 bit) are
+distinguishable; the fixture also had to select every outer column
+(`t1.x, t3.a, t3.b`) — selecting fewer triggers goopg's narrowing PASS
+(unrelated to this task, same name coincidence) to insert a `*Project`
+between `t1 JOIN t3` and the Semi join, which opaques the whole composite
+into ONE leaf and defeats the test (`extractSearchLeaves` only flattens
+`*Join` chains, not `*Project`-wrapped ones). Confirmed fail-then-pass:
+reverting just the narrowing computation (keeping `minL, minR := lhs, rhs`
+with no override) reproduces `MinLefthand = 0x3, want 0x1`.
+
+### 45.2 Confirmed correct in production, via a live SF0.25 trace — and still not enough
+
+A private-binary SF0.25 server (`tmp/goopg-m0142-c10-bin`, built and
+removed at the end of this loop) with `GOOPG_PGSHAPED_DP_TRACE=1` and a
+temporary (reverted before commit) `C10DEBUG` print inside `joinIsLegal`
+confirmed the fix reaches production exactly as intended: all three of
+Q69's semiAnti `SpecialJoinInfo`s report `MinLefthand=0x00000001`
+(`{customer}` alone) while `SynLefthand` correctly stays broad (`0x7`,
+`0xf`, `0x1f`) — §44.3's predicted values, exactly.
+
+Despite that, `GOOPG_PGSHAPED_DP_TRACE=1`'s own `DPTRACE end top={}
+... status=join search: failed to build any 4-way joins` line is
+UNCHANGED — the DP search for Q69's 6-relation problem still fails
+completely, and `jointype=semi`/`anti` still never appears in a `DPPATH`
+line. **c10 alone does not make Q69 reachable.**
+
+*Method note, since this took several iterations to pin down correctly*:
+the first read of `bench/tpcds/runtime_goopg/goopg.sf025.log` for this
+investigation was contaminated by STALE content — `server.sh`'s log
+redirect is `>>` (append), so a `C9DEBUG`-tagged trace left over from c9's
+own (already-reverted-from-source) investigation was still sitting in the
+file and got mixed in with this loop's fresh output. Truncating the log
+(`: > .../goopg.sf025.log`) before each restart is necessary for a clean
+read; do not trust a `grep` across this file without first confirming
+which run's output you're looking at.
+
+### 45.3 Root cause, pinned precisely: `ctx.joinInfoList` gets Q69's three semiAnti `SpecialJoinInfo`s TWICE, as pointer-distinct duplicates
+
+Tracing WHY the exactly-correct pairing — `joinIsLegal(rel1={customer,ca,
+customer_demographics}=0x7, rel2={?3 store_sales-EXISTS leaf}=0x8)` — still
+declines `reason=illegal`, with two more temporary (reverted) debug prints:
+
+- `len(s.joinInfoList) == 6`, not the expected 3 (one `*SpecialJoinInfo`
+  per semiAnti link — SEMI for the `EXISTS store_sales`, ANTI for each
+  `NOT EXISTS`).
+- For the `(0x7, 0x8)` pair specifically, the search finds **two**
+  candidate matches — both `SEMI`, both `MinLefthand=0x1`/
+  `MinRighthand=0x8` (identical values, i.e. this loop's narrowing landed
+  correctly on BOTH copies), but at **different pointer addresses**
+  (`0x...c0e0` vs `0x...c2a0`, confirmed via `matchSJInfo == sj` printing
+  `false`) — so `joinIsLegal`'s own "matches multiple SpecialJoinInfos —
+  invalid" guard (correct in intent: a pair must match at most ONE SJ)
+  fires and declines a pairing that is legitimately legal exactly once.
+
+`joinInfoListHas` (`relfromjoinlist.go:407`) — the only guard standing
+between `ctx.joinInfoList` and a duplicate append — dedupes by POINTER
+IDENTITY only. Two structurally-identical-but-distinct `*SpecialJoinInfo`
+objects sail straight past it.
+
+`ctx.joinInfoList` has exactly two writers in the whole codebase:
+`planner.go:3051` (`deconstructJointreeScopedSJI`, ONE-TIME initialization
+from the FROM clause's ordinary outer joins) and the monotonic `append` at
+`joinsearchseam.go:595` inside the semiAnti-population loop — **there is no
+third site that ever clears or rolls back `ctx.joinInfoList`.** Meanwhile
+`tryPGShapedJoinSearch` (the function whose call reaches that append) has
+**two live call sites for the very same statement**, both in `predp.go`,
+and the comment on the second one is now STALE:
+
+- **Phase A** — `predp.go:148`, `tryJoinSearch(f.Child, f.Predicate, ctx,
+  cat)` — the ordinary top-level search over the Filter's whole child tree.
+- **Phase B** — `predp.go:179`, `tryPGShapedJoinSearch(spineJoins[0], nil,
+  ctx, cat)` directly — "a second, additive join-order search rooted at
+  the outermost pinned Semi/Anti join," explicitly run AFTER Phase A. Its
+  own doc comment (§32.3, written when `admitSemiAnti` was still the
+  literal `false`) says *"`used` is therefore false on every production
+  call today"* — **no longer true**: `admitSemiAnti` was flipped to the
+  literal `true` at the one production call site by an earlier loop in
+  this same c-series (b2, `joinsearchseam.go:313`), so Phase B's call now
+  genuinely walks and populates `semiAnti`/`ctx.joinInfoList` too, not just
+  Phase A's.
+
+The semiAnti-population loop (`joinsearchseam.go:593-597`) runs
+UNCONDITIONALLY early in `tryPGShapedJoinSearch`, before any of the later
+checks that can still cause the OVERALL call to return `used=false` (a
+leaf-count mismatch, an on-qual failure, etc. — see `tryJoinSearch`'s own
+"declined → falls back to syntactic order" contract, §package-header
+comment). So even a call whose search ultimately fails/declines has
+ALREADY appended its freshly-built `*SpecialJoinInfo` pointers to the
+shared, never-rolled-back `ctx.joinInfoList` as a side effect. If Phase A's
+attempt over the WHOLE tree declines for an unrelated reason (very
+plausible — Phase A's `chain` covers all 6 relations at once, a much
+larger/pickier `nprefix`/leaf-count surface than Phase B's narrower
+`spineJoins[0]`-rooted retry) while still reaching the population loop
+before declining, and Phase B then independently re-walks
+`spineJoins[0]`'s own (structurally identical) semiAnti chain and appends
+ITS freshly-built SJInfo pointers too, `ctx.joinInfoList` ends up with two
+generations of the same three links — exactly the observed `len == 6`.
+This mechanism (a discarded/declined search attempt's side effects
+surviving in shared context state) is the leading hypothesis; the exact
+point where Phase A's `*SpecialJoinInfo` objects diverge from
+`spineJoins[0]`'s own (same node reference vs. a clone somewhere in the
+pipeline) was not traced further this loop and is c11's first step.
+
+### 45.4 What c11 needs to do
+
+Stop `ctx.joinInfoList` from accumulating duplicate/stale `*SpecialJoinInfo`
+entries across the two `tryPGShapedJoinSearch` call sites for one
+statement. Two shapes of fix, in ascending order of invasiveness:
+
+1. **Structural dedup at append time.** Extend `joinInfoListHas` (or add a
+   sibling check called alongside it) to also treat two SJInfos as
+   duplicates when they are STRUCTURALLY identical for the fields
+   `joinIsLegal` actually reads (`Jointype`, `MinLefthand`, `MinRighthand`,
+   `SynLefthand`, `SynRighthand`) rather than requiring pointer identity —
+   cheapest, most self-contained, but treats a symptom (the shared list
+   ending up "morally deduplicated" already) rather than the cause (why
+   two independent builds happen at all).
+2. **Stop Phase A and Phase B from both reaching the population loop for
+   the same links.** Trace whether Phase A's attempt over the whole tree
+   is EXPECTED to decline for Q69 (if so, is skipping its semiAnti
+   population loop on the declining path enough — i.e. defer the
+   `ctx.joinInfoList` append until the call is about to return
+   `used=true`, matching a transactional "commit on success only"
+   discipline PG's own single-pass `deconstruct_jointree` never has to
+   solve because it only builds `join_info_list` once). This is the
+   higher-value fix: it also plugs the same latent hazard for OTHER
+   two-call-site combinations of `tryJoinSearch`/`tryPGShapedJoinSearch`
+   that don't involve semiAnti at all, not just this one.
+
+Either way, re-verify with the SAME method §45.2 used (private SF0.25
+binary + `GOOPG_PGSHAPED_DP_TRACE=1`, log TRUNCATED before each restart)
+that `len(s.joinInfoList) == 3` for Q69 post-fix, then re-check for the
+`jointype=semi`/`anti` `DPPATH` line this whole c-series has been chasing
+since c5. Also update `predp.go:159-176`'s Phase B doc comment — its
+"`used` is therefore false on every production call today" claim is now
+false and actively misleading to the next reader.
