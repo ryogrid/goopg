@@ -4115,15 +4115,58 @@ cross-layer programme that has never been scoped.
   AST-drift failure (`internal/optimizer` itself green). Next:
   `-3i-plumbing-c5` (decline-gate wiring + `GOOPG_PGSHAPED_DP_TRACE=1`
   reachability confirmation).
-- [ ] **M0142-0008a-3i-plumbing-c5 — wire `semiAntiLinksHaveSJInfos`/
+- [x] **M0142-0008a-3i-plumbing-c5 — wire `semiAntiLinksHaveSJInfos`/
   `semiAntiOnQualsOK` as decline gates and confirm reachability** (design
-  doc §36, gap 5 — what the task was originally filed for). Mirror the
-  `outerLinks` block (`joinsearchseam.go:517-538`). Gated on c1-c4 all
-  landing first — wiring it earlier declines unconditionally and proves
-  nothing (§36's false-sense-of-progress warning). Re-run the full-corpus
-  `GOOPG_PGSHAPED_DP_TRACE=1` sweep (§35.1's method) to confirm at least one
-  `jointype=semi`/`anti` `DPPATH` line appears; only then is `-0008c-3c`/
-  `-3d`/`-4`'s Q10/Q35 acceptance bar even attemptable.
+  doc §36, gap 5 — what the task was originally filed for). **DONE
+  2026-09-16 (design doc §40).** Wired both checks as a FAIL-CLOSED gate
+  mirroring the `outerLinks` block (`joinsearchseam.go:517-538`), placed
+  right before the c1 conjunct-merge loop. Re-ran the full-corpus
+  `GOOPG_PGSHAPED_DP_TRACE=1` sweep (§35.1's method, private binary, all 100
+  query files, 96 succeeded): **reachability is STILL zero** — 150,137
+  `DPPATH` lines, none `jointype=semi`/`anti` — but this run also captured 5
+  `seam-decline reason=semianti-link-no-sjinfo` lines, confirming the new
+  gate itself is what declines, not an earlier unrelated decline. Root
+  cause, confirmed by grepping every `.joinInfoList` assignment site in the
+  package (exactly one, `planner.go:3051`'s `deconstructJointreeScopedSJI(
+  s.FromExprs, …)`, built once from the PRE-unnest parser jointree):
+  `ctx.joinInfoList` is structurally incapable of ever containing a semiAnti
+  `SpecialJoinInfo`, because that SJInfo is created later and independently
+  by `existsUnnestSJInfo`/`unnestExistsExpr` (a rewrite over the
+  already-built plan `Node` tree, not over `s.FromExprs`) — the two
+  pipelines never rejoin. `unnest.go:4385`'s own pre-existing doc comment
+  already said as much ("`ctx.joinInfoList` belongs to jointree
+  deconstruction, which this rewrite runs independently of"); this loop is
+  the first to measure the consequence directly. Considered and rejected:
+  checking against `semiAntiJoinInfoList` instead (vacuous, matches a link
+  against its own copy) and loosening the gate for semiAnti specifically
+  (would undo §39's Q21 safety fix). Verified safe: TPC-DS SF0.25 sweep
+  `PASS=96 MISMATCH=0 CKMISMATCH=0 ERROR=0`, `PLAN-SHAPE: same=99 changed=0`
+  vs the c3+c4 commit (Q78 still byte-identical); `go build ./...` clean;
+  `go test ./internal/optimizer/...` green; units precommit gate shows only
+  the pre-existing unrelated `internal/parser` `GroupedJoinUnaliased`
+  failure. `-0008c-3c`/`-3d`/`-4`'s Q10/Q35 acceptance bar is still NOT
+  attemptable — now for a specific, nameable reason. Next:
+  `-3i-plumbing-c6` (below).
+- [ ] **M0142-0008a-3i-plumbing-c6 — thread each semiAnti link's SJInfo into
+  `ctx.joinInfoList` itself** (design doc §40.5, filed by c5). The
+  prerequisite c5's gate is blocked on: something must populate
+  `ctx.joinInfoList` (or an equivalent list `semiAntiLinksHaveSJInfos` can
+  legitimately validate against — NOT the search-local
+  `semiAntiJoinInfoList` output, which is vacuous to check against itself)
+  with each semiAnti link's `SpecialJoinInfo`, from a point in the pipeline
+  that runs AFTER `unnestExistsExpr`/`existsUnnestSJInfo` creates it —
+  `deconstructJointreeScopedSJI` (`planner.go:3051`) itself cannot do this,
+  since it runs on `s.FromExprs` before unnesting exists. Likely needs
+  either (a) `unnestExistsExpr` itself to append its new SJInfo onto the
+  in-flight `ctx.joinInfoList` at rewrite time, or (b) a dedicated
+  post-unnest collection pass before `tryPGShapedJoinSearch` is ever called.
+  Scope this before coding — check whether `ctx` is even mutable/shared at
+  the point `unnestExistsExpr` runs, or whether it operates on a detached
+  `Node` tree with no `*resolveContext` in scope at all (unnest.go:4385's
+  comment suggests the latter). Only once this lands can the full-corpus
+  `GOOPG_PGSHAPED_DP_TRACE=1` sweep actually test whether
+  `semiAntiLinksHaveSJInfos` can PASS for a real query, which is the real
+  precondition for `-0008c-3c`/`-3d`/`-4`'s Q10/Q35 acceptance bar.
 - [x] **M0142-0008c — scoping recon: does goopg need PG's `create_unique_path`
   (semi-join → de-duplicate RHS + inner join) to reach parity on TPC-DS
   Q10/Q35?** — filed by M0142-0008a-3(iii)'s §4.3 gate re-run (design doc §6).

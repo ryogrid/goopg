@@ -4431,3 +4431,117 @@ as decline gates and confirming DPPATH reachability via
 `GOOPG_PGSHAPED_DP_TRACE=1`) is still open and still the right next pickup;
 this section exists so `-c5` does not re-derive the c3+c4 coupling from
 scratch.
+
+## 40. `-3i-plumbing-c5` — decline gates wired; reachability CONFIRMED still zero, and now precisely diagnosed
+
+Landed the mirror of the `outerLinks` FAIL-CLOSED block (§design pattern at
+`joinsearchseam.go:517-538`) for `semiAnti`, placed immediately before the
+c1 conjunct-merge loop so a decline never lets an un-placeable semiAnti
+clause reach the search at all:
+
+```go
+if len(semiAnti) > 0 {
+    if !semiAntiLinksHaveSJInfos(semiAnti, ctx.joinInfoList) {
+        traceSeamDecline("semianti-link-no-sjinfo", nrels, nprefix)
+        return node, pred, false
+    }
+    if !semiAntiOnQualsOK(semiAnti, cumOffsets) {
+        traceSeamDecline("semianti-on-qual", nrels, nprefix)
+        return node, pred, false
+    }
+}
+```
+
+### 40.1 Verification
+
+`go build ./...` clean; `go test ./internal/optimizer/...` green (no
+existing test exercises a live semiAnti link through this new gate, since
+none of the corpus reaches it — see 40.2 — but `semiantichain_test.go`'s
+direct-input tests for both helper functions are unaffected).
+
+### 40.2 Corpus reachability re-check — the task's actual question
+
+Repeated §35.1's method at the new HEAD (private binary
+`tmp/goopg-m0142-c5-bin`, `bench/tpcds/server.sh start sf025` with
+`GOOPG_PGSHAPED_DP_TRACE=1`, `EXPLAIN` on all 100 `query*.sql` files against
+the SF0.25 dataset — 96 succeeded, 4 pre-existing unrelated parse gaps,
+consistent with prior loops' count): **150,137 total `DPPATH` lines, ZERO**
+with `jointype=semi` or `jointype=anti` — reachability is STILL not met.
+
+But this run additionally captured 5 `DPTRACE seam-decline
+reason=semianti-link-no-sjinfo` lines (3× `nrels=2`, 2× `nrels=3` — one
+query, almost certainly Q78, the corpus's one EXISTS/NOT-EXISTS-unnested
+query per §34/§38/§39). **The new c5 gate is reachable and is exactly what
+declines those combos** — not some earlier, unrelated decline. Read as a
+data point, this answers the reachability question precisely for the first
+time: the search DOES reach the point of attempting to admit the synthetic
+semiAnti leaf (c2's leaf + c3's `searchJl` growth both work), but
+`semiAntiLinksHaveSJInfos(semiAnti, ctx.joinInfoList)` always returns false
+for every such combo.
+
+### 40.3 Root cause: `ctx.joinInfoList` structurally cannot contain a semiAnti SJInfo, by construction — not a bug, an already-documented architectural gap
+
+Grepped every assignment site of `.joinInfoList` in `internal/optimizer`
+(not just the seam): there is exactly ONE, `planner.go:3051`,
+`rctx.joinlist, rctx.joinInfoList = deconstructJointreeScopedSJI(s.FromExprs,
+…)` — built once, from the parser-level `s.FromExprs` jointree, which
+reflects the statement's SQL-syntax joins (able to see real `LEFT`/`RIGHT`/
+`FULL` outer joins). Nothing ever appends to it afterward.
+
+The semiAnti `SpecialJoinInfo` comes from a completely different, later, and
+independent pipeline stage: `existsUnnestSJInfo` (called from
+`unnestExistsExpr`, `unnest.go:4461`), which rewrites a `WHERE`-clause
+EXISTS/NOT EXISTS into a physical `Join` **plan node** carrying its own
+`SJInfo` — a rewrite over the already-built plan `Node` tree, not over
+`s.FromExprs`. `existsUnnestSJInfo`'s own doc comment already says this
+explicitly (unnest.go:4385, written well before this loop): "`ctx.joinInfoList`
+belongs to jointree deconstruction, which this rewrite runs independently
+of." This loop is the first to make that independence's CONSEQUENCE
+concrete and measured: because the two pipelines never rejoin, `ctx.joinInfoList`
+is not merely *usually* missing the semiAnti SJInfo — it is
+**structurally incapable of ever containing one**, for any query, under the
+current architecture. `semiAntiLinksHaveSJInfos(semiAnti, ctx.joinInfoList)`
+as coded (correctly mirroring `outerLinksHaveSJInfos`'s pattern) will
+therefore always return `false` whenever `semiAnti` is non-empty, until
+something threads the semiAnti SJInfo into `ctx.joinInfoList` itself from a
+point in the pipeline that runs AFTER unnesting.
+
+Two alternatives considered and rejected for THIS loop:
+- Checking against `semiAntiJoinInfoList(ctx.joinInfoList, semiAnti)` (the
+  search-local extended list c4 already builds) instead of the bare
+  `ctx.joinInfoList` — rejected as vacuous: that list is unconditionally
+  built FROM `semiAnti`'s own `.sjinfo` field, so the match is against
+  itself and always succeeds regardless of whether the SJInfo is legitimate
+  — exactly the "false-sense-of-progress" trap §36 already warned about for
+  landing a gate before its precondition is real.
+- Loosening the gate to skip the SJInfo check for semiAnti specifically —
+  rejected: that removes the one safety property (§39's Q21 finding) that
+  makes admitting the synthetic leaf safe at all; a decline here is the
+  CORRECT fail-closed behavior given today's architecture, not a defect to
+  route around.
+
+### 40.4 Verified safe: plan output unaffected
+
+TPC-DS SF0.25 sweep at the new HEAD (c5 applied):
+`PASS=96 (60 ck-verified, 36 ck=n/a) MISMATCH=0 CKMISMATCH=0 ERROR=0`,
+`PLAN-SHAPE: queries=99 same=99 changed=0 added=0 removed=0` against the
+c3+c4 commit — Q78 still byte-identical (15 rows, checksum
+`c06cf981a7819a37`, unchanged across c2/c3+c4/c5). `RALPH_PRECOMMIT_SCOPE=units
+scripts/ralph-precommit-test.sh` shows only the pre-existing unrelated
+`internal/parser` `GroupedJoinUnaliased` AST-drift failure. TPC-H spotcheck
+SKIPPED (pre-existing M0142-0003k data-dir blocker, unrelated). The decline
+this loop's gate adds is a pure safety net on an already-unreachable path
+(§40.3), so a plan-shape-identical sweep is the expected and required
+result, not a surprise.
+
+### 40.5 What this means for the rest of the `-0008c` family
+
+**`-0008c-3c`/`-3d`/`-4`'s Q10/Q35 acceptance bar is still NOT attemptable**
+— reachability is not just "not yet confirmed," it is now known to be
+blocked on a specific, nameable prerequisite: something must thread each
+semiAnti link's `SpecialJoinInfo` into `ctx.joinInfoList` (or an equivalent
+authoritative list the seam's `outerLinksHaveSJInfos`-style check can
+legitimately validate against) from a point in the pipeline that runs AFTER
+`unnestExistsExpr` creates it — `deconstructJointreeScopedSJI` itself cannot
+do this (it runs on `s.FromExprs`, before unnesting exists). Filed below as
+`-3i-plumbing-c6`.

@@ -552,17 +552,39 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 		conjuncts = append(conjuncts, onOuter...)
 		conjuncts = append(conjuncts, derived...)
 	}
+	// M0142-0008a-3i-plumbing-c5 (design doc §36, gap 5): mirrors the
+	// `outerLinks` FAIL-CLOSED gate above, now that c2-c4 give the search a
+	// real leaf and a real SpecialJoinInfo for every semiAnti link.
+	// `semiAntiLinksHaveSJInfos` is the same safety argument as
+	// `outerLinksHaveSJInfos`: `joinIsLegal` only refuses to reorder across
+	// the synthetic leaf if `ctx.joinInfoList` actually carries its
+	// SpecialJoinInfo (c4's contribution), so this checks the production
+	// caller did populate it rather than assuming so. `semiAntiOnQualsOK`
+	// is `outerOnQualsOK`'s narrower SEMI/ANTI analogue (no preserved/
+	// nullable placement question, see its own doc comment) and declines
+	// any link whose ON predicate the search cannot fully attribute and
+	// place. Both run BEFORE the link's conjuncts join `conjuncts` below,
+	// so a decline here never lets an un-placeable semiAnti clause reach
+	// the search at all.
+	if len(semiAnti) > 0 {
+		if !semiAntiLinksHaveSJInfos(semiAnti, ctx.joinInfoList) {
+			traceSeamDecline("semianti-link-no-sjinfo", nrels, nprefix)
+			return node, pred, false
+		}
+		if !semiAntiOnQualsOK(semiAnti, cumOffsets) {
+			traceSeamDecline("semianti-on-qual", nrels, nprefix)
+			return node, pred, false
+		}
+	}
 	// M0142-0008a-3i-plumbing-c1 (design doc §36, gap 1): a semiAnti link's
 	// correlation predicate joins `conjuncts` only HERE, mirroring `onOuter`
 	// above. Every split conjunct's relids necessarily span both `lk.lhs`
-	// (real leaves) and `lk.rhs` (the synthetic RHS leaf, per
-	// `semiAntiOnQualsOK`'s own contract) — and until `-3i-plumbing-c2`..`c4`
-	// give the search an actual leaf at the `rhs` bit position, no join built
-	// from real leaves alone can ever satisfy a relid set that includes it.
-	// `buildRestrictInfos` still records the clause (so `searchConsumes`
-	// reports it "seen"), but the search itself never forms the relset
-	// needed to place it. Behaviour-neutral until c2-c5 land (§36's "build
-	// it, verify inert" precedent, same as `-3i-plumbing-b1`/`-0008c-3c`).
+	// (real leaves) and `lk.rhs` (the synthetic RHS leaf) — c2-c4 now give
+	// the search a real leaf, a real SJInfo and coverage in `joinInfoList`
+	// for the position, and c5's gate above has already confirmed every
+	// conjunct is placeable, so this loop is no longer inert as of c5: the
+	// search can now actually visit the synthetic leaf and satisfy relid
+	// sets that include it.
 	for _, lk := range semiAnti {
 		conjuncts = append(conjuncts, splitAnd(lk.pred)...)
 	}
