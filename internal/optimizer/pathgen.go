@@ -146,8 +146,23 @@ func addHashJoinPath(joinRel, probe, build *RelOptInfo, cp costParams, jt parser
 // P5.7's (leftdeep-joins 04 §4 / the P4.3 ledger row). Until it lands this
 // over-charges a rescan of a cheap inner, which biases against nested loops —
 // the safe direction.
-func addNestLoopPath(joinRel, outer, inner *RelOptInfo, cp costParams, jt parser.JoinType, quals []*restrictInfo) {
+//
+// M0142-0008c-3b: `uniq == uniqueSideInner` is PG's separate, narrower
+// `JOIN_UNIQUE_INNER` branch of `match_unsorted_outer` (joinpath.c, design
+// doc §19.2/§19.3) — it substitutes the inner's cheapest-total path with
+// `createUniquePath`'s result ONCE, before this function's own cost/build
+// logic runs, and never considers a parameterised (indexed) inner for this
+// case (PG's own `XXX` comment at `:1916` admits the omission is deliberate).
+// That asymmetry is why `addNLIPaths` does NOT also take a
+// `uniqueSideInner` arm: PG's `JOIN_UNIQUE_INNER` only ever calls
+// `try_nestloop_path` with the single substituted inner, this function's
+// domain. A nil substitution declines the whole path, matching
+// `create_unique_path`'s own "can't unique-ify, return NULL" contract.
+func addNestLoopPath(joinRel, outer, inner *RelOptInfo, cp costParams, jt parser.JoinType, quals []*restrictInfo, uniq uniqueSide, sjinfo *SpecialJoinInfo) {
 	o, i := outer.CheapestTotal, inner.CheapestTotal
+	if uniq == uniqueSideInner {
+		i = createUniquePath(inner, inner.CheapestTotal, sjinfo, cp)
+	}
 	if o == nil || i == nil {
 		return
 	}

@@ -2008,3 +2008,101 @@ Next: `-0008c-3b` threads `uniq` into `addNestLoopPath`
 builders will need the `uniqueSide` value `addPathsToJoinrel` currently
 discards, so its signature (or a parallel plumbing path) must carry `uniq`
 alongside `jt` once 3b starts.
+
+## 20. M0142-0008c-3b landed, correct and tested — but a live probe shows the whole `-0008c` family is provably UNREACHABLE for real queries today, blocked on `-3i-plumbing` items 3-5 (2026-09-16)
+
+Implemented exactly as scoped in §19.3/19.4 item 3b and the fix_plan entry:
+`addNestLoopPath` (`pathgen.go:149`) gained `uniq uniqueSide, sjinfo
+*SpecialJoinInfo` params and substitutes `i := createUniquePath(inner,
+inner.CheapestTotal, sjinfo, cp)` when `uniq == uniqueSideInner`, declining
+the whole path when the substitution is nil; `addNLIPaths`
+(`joinpathsnli.go:270`) gained the same two params and substitutes `o`
+analogously for `uniqueSideOuter`, before its existing
+`inner.CheapestParameterized` loop. `addPathsToJoinrel` threads `uniq`/`sjinfo`
+into both calls (`joinpaths.go:438,443`) — no other builder touched, per
+§19.3's asymmetric split. New tests
+(`internal/optimizer/uniqueify_builders_test.go`) pin the substitution
+directly at both builders (asserting the built Path's substituted child is a
+`PathUnique`, never the plain `CheapestTotal`, with a decline control for each)
+plus one end-to-end `addPathsToJoinrel` test proving the dispatch-through-
+builder wiring produces a demoted-`JoinInner` nested loop over the
+unique-ified inner when only the fallback admits the pair. All green; `go
+build ./...`, `go vet ./internal/optimizer/...` clean.
+
+**But 3b's OWN acceptance bar — "Q10/Q35's plan shape must match
+`bench/tpcds/plans-pg/Q10.txt`/`Q35.txt`'s exact node shape … not just 'a
+plan now exists'" — could not be met, and the reason is more serious than a
+lost cost race.** A live probe (private `GOOPG_BIN=tmp/goopg-sf025-bin`,
+`bench/tpcds/server.sh start sf025` with `GOOPG_PGSHAPED_DP_TRACE=1`,
+`EXPLAIN` on the real `query10.sql` against the sf025 dataset) shows:
+
+1. goopg's actual EXPLAIN for Q10 already produces a `Hash Semi Join`
+   (`Hash Cond: (c.c_customer_sk = ss_customer_sk)`) for the store_sales
+   EXISTS — a *different* shape from both PG's NLI+unique-ify plan and from
+   anything `-0008c` builds.
+2. Grepping the server log's `DPPATH` lines (the `addPath`-call provenance
+   channel, `pathtrace.go`) for the whole Q10 statement — 162 lines total —
+   shows **zero** `jointype=semi` (or `anti`) entries; every single one is
+   `jointype=inner`. `addPathsToJoinrel` has exactly one production caller
+   (`joinrelsize.go:91`, the DP search's `joinRelBuilder`), so this is
+   conclusive: for this real query, **`addPathsToJoinrel` is never once
+   called with a SEMI/ANTI `sjinfo`** — not "called and declined", not
+   "called and lost on cost" — never invoked for that jointype at all.
+3. The `Hash Semi Join` in the printed plan is therefore built entirely by
+   `unnestExistsExpr`'s direct plan-node construction (`unnest.go:4769-4780`,
+   quoted in §5/§9's own trace-through): it picks `Algo: JoinAlgoHash` (or
+   `JoinAlgoNestedLoop` with zero equijoin params) **heuristically, at rewrite
+   time**, attaches an `SJInfo` for legality bookkeeping, and that fixed
+   `Join` node is handed to `createPlanNode` as an already-decided plan
+   fragment — it is never re-derived or re-costed by the `addPathsToJoinrel`
+   cost tournament `-0008c-1/-2/-3a/-3b` all extend.
+
+This is not a new discovery contradicted by §16-19's own framing — it is
+`-3i-plumbing`'s **already-recorded, still-open** blocker, read again live
+instead of re-derived from memory. §15 (this same design doc, same day)
+already found and explicitly deferred exactly this gap: `extractSearchLeaves`
+does not yet admit a Semi/Anti chain link into the production search walk,
+`existsUnnestSJInfo`'s real `RelSet` bits are not yet rebuilt at admission
+time, and `predp.go`'s splice is not yet retired for the admitted case —
+"items 3-5 … [are] not sized for one loop on its own." `-0008c-1` through
+`-3b` were built and landed on TOP of that acknowledged gap without anyone
+re-checking, before now, whether the SEMI `SpecialJoinInfo`s they dispatch on
+ever actually reach `addPathsToJoinrel` in a real plan — they do not, today,
+for any production query, because the prerequisite chain-admission plumbing
+(`-3i-plumbing` items 3-5) has not landed. `-0008c-1..-3b` are exactly as
+*correct* as their own unit tests prove (hand-built `SpecialJoinInfo`
+fixtures reach them directly and behave exactly as designed) and exactly as
+*unreachable* as `-3i-plumbing`'s own §15 already said the mechanism would be
+until items 3-5 land — two true statements about two different layers, not a
+contradiction.
+
+**Consequence for the rest of `-0008c`:**
+
+- `-0008c-3c`/`-3d` (hash/merge unique-ify substitution) should **not** be
+  picked up next: they extend a dispatch path that is provably dead for every
+  real query today, and no TPC-DS SF0.25 measurement can distinguish "correct
+  but unreachable" from "wrong" while that holds.
+- Re-running the TPC-DS SF0.25 sweep after 3b landed reconfirms zero
+  plan-shape change across all 99 queries (`PASS=96 MISMATCH=0 CKMISMATCH=0
+  ERROR=0 TIMEOUT=0`, `PLAN-SHAPE: queries=99 same=99 changed=0 added=0
+  removed=0`) — now understood as the DIRECT, expected consequence of finding
+  1-3 above, not a separate lucky inertness result the way 3a's own
+  (correctly scoped, narrower) inertness claim was.
+- The actual unblock for Q10/Q35 — and for `-0008c` ever mattering to a real
+  plan — is `-3i-plumbing` items 3-5 (§15's own resume point: define
+  `semiAntiChainLink` + its `semiAntiLinksHaveSJInfos`/`semiAntiOnQualsOK`
+  legality consumers, rebuild `existsUnnestSJInfo`'s real `RelSet` bits at
+  admission time, retire `predp.go`'s splice for the admitted case, and add
+  `problemPairsOuterWithDerived`'s Semi/Anti arm in the same change per §15's
+  own safety finding). That work is unrelated in mechanism to anything
+  `-0008c` builds (it is chain-admission into the search, not path
+  generation once admitted) and is explicitly sized in §15 as its own
+  multi-subsystem task, not a one-loop follow-on to 3b.
+- `-0008c-3b` itself is not wasted: once `-3i-plumbing` lands and a real SEMI
+  `SpecialJoinInfo` does reach `addPathsToJoinrel`, 3a/3b's dispatch and
+  substitution are the mechanism that will pick it up with zero further
+  change — this loop's tests are what make that claim checkable rather than
+  a hope, the same standard 3a set for itself.
+
+Deferral ledger: see the `M0142-0008c-3b` row appended this loop (cites this
+section and `-3i-plumbing`'s §15 as the shared blocker).

@@ -3770,45 +3770,47 @@ cross-layer programme that has never been scoped.
   gap from earlier commit `dc91bd6b7`, reproduces identically on a
   git-stash-clean HEAD) — not a regression from this task, left for whoever
   owns `internal/parser` next. Resume point: design doc §19.5.
-- [ ] **M0142-0008c-3b — `addNestLoopPath`/`addNLIPaths` unique-ify
+- [x] **M0142-0008c-3b — `addNestLoopPath`/`addNLIPaths` unique-ify
   substitution** — filed by M0142-0008c-3's recon (design doc §19.3-19.4 item
-  3b). Depends on M0142-0008c-3a (DONE). `addPathsToJoinrel` currently
-  computes `uniq` and discards it (demotes `jt` to `parser.JoinInner` without
-  passing `uniq` anywhere) — 3b's first step is threading `uniq` down to the
-  two builders (a new parameter, or read it back off a `jointypeForDirection`
-  re-call inside each builder — decide which is cheaper once inside the
-  code). `addNLIPaths` (`joinpathsnli.go:269`):
-  when the dispatch resolves to `JoinTypeUniqueOuter`, substitute
-  `outer.CheapestTotal` with `createUniquePath(outer, outer.CheapestTotal,
-  sjinfo, cp)` (decline the call if nil) before the existing
-  `inner.CheapestParameterized` loop — this is the exact PG shape
-  (`match_unsorted_outer`'s `JOIN_UNIQUE_OUTER` branch falls through into the
-  SAME parameterized-inner loop ordinary NLI uses) that produces Q10/Q35's
-  witnessed plan. `addNestLoopPath` (`pathgen.go:149`): when the dispatch
-  resolves to `JoinTypeUniqueInner`, substitute the inner the same way
-  (PG's own separate, narrower `try_nestloop_path`-only branch — do NOT also
-  thread `JoinTypeUniqueInner` into `addNLIPaths`; that asymmetry is PG's own
-  design, not a gap to close). **Acceptance: Q10/Q35's plan shape must match
-  `bench/tpcds/plans-pg/Q10.txt`/`Q35.txt`'s exact node shape** (§19.1) for
-  the `store_sales`/`customer` sub-join specifically, not just "a plan now
-  exists" — plus the full TPC-DS SF0.25 sweep for regressions elsewhere.
-  Resume point: design doc §19.3-19.4 item 3b.
+  3b). Depends on M0142-0008c-3a (DONE). **DONE 2026-09-16** (design doc
+  §20): threaded `uniq uniqueSide, sjinfo *SpecialJoinInfo` into both
+  `addNestLoopPath` (substitutes the inner for `uniqueSideInner`) and
+  `addNLIPaths` (substitutes the outer for `uniqueSideOuter`, before its
+  `inner.CheapestParameterized` loop), each declining the path on a nil
+  `createUniquePath` result; `addPathsToJoinrel` threads `uniq`/`sjinfo` into
+  both calls. Unit-tested directly at both builders plus one end-to-end
+  `addPathsToJoinrel` test (`internal/optimizer/uniqueify_builders_test.go`)
+  proving the substitution actually happens, not just compiles.
+  **Acceptance NOT met and cannot be met yet**: a live probe (private sf025
+  server, `GOOPG_PGSHAPED_DP_TRACE=1`, real `query10.sql`) found
+  `addPathsToJoinrel` is NEVER called with a SEMI/ANTI `sjinfo` for any real
+  query today (0 of 162 `DPPATH` lines were `jointype=semi`/`anti`) —
+  `-3i-plumbing` items 3-5 (chain-admission of a real Semi/Anti link into the
+  DP search) have not landed, so 3a/3b's whole dispatch path is provably
+  unreachable in production regardless of what it builds. TPC-DS SF0.25
+  sweep reconfirms zero plan-shape change (`PASS=96 MISMATCH=0 CKMISMATCH=0
+  ERROR=0 TIMEOUT=0`, `PLAN-SHAPE: same=99 changed=0`) — now understood as
+  the direct consequence of that finding. See design doc §20 and the
+  `M0142-0008c-3b` deferral-ledger row for the full evidence.
 - [ ] **M0142-0008c-3c — `addHashJoinPath`/`addPartialHashJoinPath`
   unique-ify substitution** — filed by M0142-0008c-3's recon (design doc
   §19.4 item 3c). Depends on M0142-0008c-3a. Deferred: not exercised by
-  either named witness (§19.1). Pick up only once a measurement finds a
-  query where the unique-ified hash path wins the cost race against 3b's
-  NLI/nestloop candidates. PG oracle: `hash_inner_and_outer`,
-  `joinpath.c:2100-2140` (cited by §16.1, not yet read live).
+  either named witness (§19.1). **Also now blocked on M0142-0008a-3i-plumbing
+  items 3-5** (design doc §20) — do not pick up before that lands; no
+  TPC-DS measurement can distinguish "correct but unreachable" from "wrong"
+  while `addPathsToJoinrel` never receives a real SEMI/ANTI `sjinfo`. PG
+  oracle: `hash_inner_and_outer`, `joinpath.c:2100-2140` (cited by §16.1, not
+  yet read live).
 - [ ] **M0142-0008c-3d — merge + partial-nestloop unique-ify substitution**
   — filed by M0142-0008c-3's recon (design doc §19.4 item 3d). Depends on
-  M0142-0008c-3a. Deferred for the same reason as 3c:
-  `sortInnerAndOuter`/`matchUnsortedOuterMerge`/`matchUnsortedOuterMergePartial`
-  (merge) and `addPartialNestLoopPaths` (parallel NL), PG oracle
-  `sort_inner_and_outer`/`match_unsorted_outer`, `joinpath.c:1403-1441`
-  (read live this loop, §19.2). Before enabling merge here, check whether
-  `mergeDeclined`'s existing SEMI/ANTI decline (§8) should also cover the
-  demoted-INNER case.
+  M0142-0008c-3a. **Also now blocked on M0142-0008a-3i-plumbing items 3-5**,
+  same reason as 3c (design doc §20). Deferred for the same reason as 3c
+  otherwise: `sortInnerAndOuter`/`matchUnsortedOuterMerge`/
+  `matchUnsortedOuterMergePartial` (merge) and `addPartialNestLoopPaths`
+  (parallel NL), PG oracle `sort_inner_and_outer`/`match_unsorted_outer`,
+  `joinpath.c:1403-1441` (read live this loop, §19.2). Before enabling merge
+  here, check whether `mergeDeclined`'s existing SEMI/ANTI decline (§8)
+  should also cover the demoted-INNER case.
 - [ ] **M0142-0008c-4 — `innerrel_is_unique`/unique-index NOOP fast path** —
   filed by M0142-0008c (design doc §16.3 item 4). Depends on
   M0142-0008c-1. Not needed for correctness (the expensive Sort+Unique/

@@ -267,7 +267,17 @@ func probeEnforcedClauses(p *Path) map[*restrictInfo]bool {
 // `Rows: joinRel.Rows` unconditionally without a `ppi_rows` of their own —
 // both read `CheapestTotal`-only inputs, which a parameterised path can
 // never win (03 §9 rule 1), so the merge exception cannot reach them.
-func addNLIPaths(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp costParams, jt parser.JoinType, clauses []*restrictInfo, paramSrc RelSet) {
+// M0142-0008c-3b: `uniq == uniqueSideOuter` is PG's `JOIN_UNIQUE_OUTER`
+// branch of `match_unsorted_outer` (joinpath.c, design doc §19.2/§19.3). PG
+// restricts that branch's outer loop to `outerrel->cheapest_total_path`
+// only, substitutes it via `create_unique_path`, demotes the jointype once,
+// then falls through into this SAME generic `cheapest_parameterized_paths`
+// loop ordinary nested loop and NLI share — which is why goopg's addNLIPaths
+// (already reduced to a single `outer.CheapestTotal` candidate, no pathlist
+// loop) is where the substitution belongs, before the loop below runs. A nil
+// substitution declines the whole call, matching `create_unique_path`'s own
+// "can't unique-ify, return NULL" contract.
+func addNLIPaths(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp costParams, jt parser.JoinType, clauses []*restrictInfo, paramSrc RelSet, uniq uniqueSide, sjinfo *SpecialJoinInfo) {
 	// R64 (ledger R63-#3): decline when the inner is the preserved side. A
 	// RIGHT join preserves its inner child, which in this arm is a
 	// parameterized probe — unmatched preserved rows surface from no probe
@@ -282,6 +292,9 @@ func addNLIPaths(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp costParams,
 		return
 	}
 	o := outer.CheapestTotal
+	if uniq == uniqueSideOuter {
+		o = createUniquePath(outer, outer.CheapestTotal, sjinfo, cp)
+	}
 	if o == nil || o.RequiredOuter != 0 {
 		return
 	}
