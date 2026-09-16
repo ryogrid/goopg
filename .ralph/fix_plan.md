@@ -4730,7 +4730,7 @@ cross-layer programme that has never been scoped.
   `scripts/tpcds-sf025-regression.sh sweep` with a private `GOOPG_BIN`
   before landing either piece together. Also still pending (carried from
   c11-c13, not actioned): `predp.go:159-176`'s stale Phase B doc comment.**
-- [ ] **M0142-0008a-3i-plumbing-c16 — implement c15's resume point (SJInfo
+- [x] **M0142-0008a-3i-plumbing-c16 — implement c15's resume point (SJInfo
   Path→Join carrier for BOTH the nestloop AND hash arms — hash included
   because M0142-0008a-3(iii) already lifted its SEMI/ANTI decline, making
   c15's "nestloop is the one reachable arm" comment stale) and re-apply the
@@ -4811,6 +4811,19 @@ cross-layer programme that has never been scoped.
   per-call, so `t.Setenv` in a test has no effect on an already-running
   binary. Still pending (carried since c11): `predp.go:159-176`'s stale
   Phase B doc comment.**
+  **LANDED 2026-09-17**: re-applied the four-piece diff unchanged, then
+  fixed the test by hand-building its `*SeqScan`/`*Join` fixture directly
+  (option (a) from the resume point above) instead of calling `Plan()` —
+  now a true white-box unit test of `extractSearchLeaves`, independent of
+  the DP search's join-order tie-breaking. `go build ./...` clean,
+  `go test ./internal/optimizer/...` fully green. Also deleted the now-dead
+  `semiAntiJoinInfoList` helper (no remaining callers, no test referenced
+  it directly). Gates: `scripts/tpcds-sf025-regression.sh sweep` (private
+  `GOOPG_BIN`) `PASS=96 MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0`,
+  `PLAN-SHAPE: queries=99 same=99 changed=0` — the carrier fix changes no
+  TPC-DS SF0.25 plan shape or result. `scripts/tpch-spotcheck.sh` SKIPPED
+  (pre-existing, unrelated: `:65433`'s `tpch` database is still empty
+  pending the M0142-0003k reload — see CLAUDE.md). Design doc §52.
 - [x] **M0142-0008c — scoping recon: does goopg need PG's `create_unique_path`
   (semi-join → de-duplicate RHS + inner join) to reach parity on TPC-DS
   Q10/Q35?** — filed by M0142-0008a-3(iii)'s §4.3 gate re-run (design doc §6).

@@ -557,10 +557,12 @@ func createHashJoinPlan(p *Path) (Node, outputLayout) {
 	in := joinInputsFor(p, "PathHashJoin", p.Children[0], p.Children[1])
 	pairs := in.keyPairs("PathHashJoin", p.HashKeys)
 
-	// C-03c: the join the PATH says it performs, not a constant. Today the
-	// search only ever files INNER hash paths — `jointypeForDirection` gives
-	// the keyed arms nothing else, since SEMI/ANTI are nestloop-only and FULL
-	// is declined outright — so this is the same value it always was.
+	// C-03c: the join the PATH says it performs, not a constant. Stale claim
+	// corrected by M0142-0008a-3i-plumbing-c16: this comment used to say
+	// "SEMI/ANTI are nestloop-only", but M0142-0008a-3(iii) (joinpaths.go's
+	// `addPathsToJoinrel`, mergeDeclined comment) already lifted the hash
+	// arm's SEMI/ANTI decline — only MERGE stays nestloop-only for those
+	// jointypes. FULL is still declined outright.
 	jt := planJoinTypeFor(p, "PathHashJoin")
 	j := &Join{
 		pos:  in.outer.Pos(),
@@ -589,6 +591,7 @@ func createHashJoinPlan(p *Path) (Node, outputLayout) {
 		// one estimate — M0128-P3.2 / 09 §3.23).
 		OuterRows: p.Children[0].Rows,
 		InnerRows: p.Children[1].Rows,
+		SJInfo:    p.SJInfo,
 	}
 	// R7 (plan-parity-fix-take2): the flag is read ONCE, here, for both of
 	// its purposes — the fail-closed assertion below and the node's own

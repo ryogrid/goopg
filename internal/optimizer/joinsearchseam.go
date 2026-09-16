@@ -764,7 +764,12 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 		// regression (AntiJoin silently disappearing) traced to exactly this
 		// gap, so c3 and c4 must land together, not "independent" as
 		// originally filed.
-		joinInfoList: semiAntiJoinInfoList(ctx.joinInfoList, semiAnti),
+		// M0142-0008a-3i-plumbing-c16: ctx.joinInfoList already carries
+		// every semiAnti link's SJInfo by this point (the DEDUPING append
+		// above, joinInfoListHas guard, landed by c4). Re-running
+		// semiAntiJoinInfoList here appended a SECOND, undeduped copy of
+		// each entry on top; deleted as a confirmed duplicate-list bug.
+		joinInfoList: ctx.joinInfoList,
 	})
 	if err != nil || searched == nil {
 		return node, pred, false
@@ -1785,26 +1790,6 @@ type semiAntiChainLink struct {
 	// this pointer's fields, not a freshly built one, so the two must never
 	// drift apart.
 	sjinfo *SpecialJoinInfo
-}
-
-// semiAntiJoinInfoList appends each link's SJInfo (skipping nil ones — a link
-// whose source `*Join` never carried one) to a COPY of `base`, leaving `base`
-// itself untouched (it may alias `ctx.joinInfoList`, shared with callers
-// elsewhere in the same statement). Returns `base` unchanged, by identity,
-// when `links` is empty — the overwhelmingly common case — so this never
-// forces an allocation queries with no EXISTS/NOT EXISTS unnesting.
-func semiAntiJoinInfoList(base []*SpecialJoinInfo, links []semiAntiChainLink) []*SpecialJoinInfo {
-	if len(links) == 0 {
-		return base
-	}
-	out := make([]*SpecialJoinInfo, 0, len(base)+len(links))
-	out = append(out, base...)
-	for _, lk := range links {
-		if lk.sjinfo != nil {
-			out = append(out, lk.sjinfo)
-		}
-	}
-	return out
 }
 
 // semiAntiLinksHaveSJInfos is `outerLinksHaveSJInfos`'s SEMI/ANTI analogue:

@@ -3,6 +3,7 @@ package optimizer
 import (
 	"testing"
 
+	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/parser"
 )
 
@@ -295,45 +296,75 @@ func TestExtractSearchLeaves_AdmitSemiAnti_BuildsLinkAndRebuildsSJInfo(t *testin
 // way). This fixture gives EXISTS a TWO-relation outer (t1, t3) but
 // correlates it to only t1, so a correct fix must produce
 // `MinLefthand != lhs` while `SynLefthand` stays the whole composite.
+//
+// M0142-0008a-3i-plumbing-c16 (design doc §51.1) rewrote this from a
+// `Plan()`-driven fixture to a hand-built one. Once c16's SJInfo Path→Join
+// carrier landed, the real DP search legally reorders this query as
+// `InnerJoin(SemiJoin(t1, t2), t3)` — t1 SEMI t2 evaluated before t3 joins
+// in, since the EXISTS correlates only to t1 (exactly the narrowing this
+// test exists to prove) — instead of the `SemiJoin(InnerJoin(t1, t3), t2)`
+// shape this test's assertions assume. Depending on `Plan()`'s DP-search
+// tie-breaking to produce one specific legal shape is exactly the hidden
+// coupling this project's history warns against, so the fixture is now
+// built directly from `*SeqScan`/`*Join` literals — a true white-box unit
+// test of `extractSearchLeaves` alone, independent of join-order costing.
 func TestExtractSearchLeaves_AdmitSemiAnti_NarrowsMinLefthandToCorrelatedRelation(t *testing.T) {
-	cat := analyzedThreeTablesCatalog(t)
-	// Every outer column is selected (t1.x, t3.a, t3.b) so the narrowing
-	// pass has nothing to prune and leaves t1 JOIN t3 as a raw *Join chain
-	// instead of wrapping it in a *Project — extractSearchLeaves only
-	// flattens *Join nodes, so a Project in between would opaque the whole
-	// composite into one leaf and defeat this test's purpose.
-	sql := "SELECT t1.x, t3.a, t3.b FROM t1, t3 WHERE t1.x = t3.a AND EXISTS (" +
-		"SELECT 1 FROM t2 WHERE t2.z = t1.x)"
-	node, err := Plan(parseOne(t, sql), cat)
-	if err != nil {
-		t.Fatal(err)
+	t1Tbl := &catalog.Table{Name: "t1", Columns: []catalog.Column{
+		{Name: "x", Type: catalog.Type{Name: "int4"}},
+	}}
+	t3Tbl := &catalog.Table{Name: "t3", Columns: []catalog.Column{
+		{Name: "a", Type: catalog.Type{Name: "int4"}},
+		{Name: "b", Type: catalog.Type{Name: "int4"}},
+	}}
+	t2Tbl := &catalog.Table{Name: "t2", Columns: []catalog.Column{
+		{Name: "y", Type: catalog.Type{Name: "int4"}},
+		{Name: "z", Type: catalog.Type{Name: "int4"}},
+	}}
+	t1 := &SeqScan{Table: t1Tbl, schema: tableSchema(t1Tbl)}
+	t3 := &SeqScan{Table: t3Tbl, schema: tableSchema(t3Tbl)}
+	t2 := &SeqScan{Table: t2Tbl, schema: tableSchema(t2Tbl)}
+
+	// t1 JOIN t3 ON t1.x = t3.a. t1 is this join's Left, so within its own
+	// composite (Left++Right) schema t1.x is index 0 and t3.a is index 1
+	// (t1 contributes 1 column ahead of it).
+	outerJoin := &Join{
+		Type:  JoinTypeInner,
+		Left:  t1,
+		Right: t3,
+		Predicate: &BinaryOp{
+			Op:    parser.OpEq,
+			Left:  &ColumnRef{Index: 0, Name: "x"},
+			Right: &ColumnRef{Index: 1, Name: "a"},
+		},
+		schema: append(append(Schema{}, t1.Output()...), t3.Output()...),
 	}
-	j := findFirstJoinByType(node, JoinTypeSemi)
-	if j == nil {
-		t.Fatalf("no JoinTypeSemi found: %s", planString(node))
-	}
-	if j.SJInfo == nil {
-		t.Fatalf("j.SJInfo = nil, want the inert SpecialJoinInfo unnestExistsExpr attaches")
-	}
-	// Same reconstruction TestExtractSearchLeaves_AdmitSemiAnti_BuildsLinkAndRebuildsSJInfo
-	// uses: this is the post-method-selection fixture, so the correlation
-	// lives in (LeftKey, RightKey), not Predicate.
-	if j.Predicate == nil && j.LeftKey != nil && j.RightKey != nil {
-		j.Predicate = &BinaryOp{Op: parser.OpEq, Left: j.LeftKey, Right: j.RightKey}
-	}
-	if j.Predicate == nil {
-		t.Fatalf("no correlation predicate on the Semi join: %#v", j)
+	outerWidth := len(outerJoin.Output()) // 3: t1.x, t3.a, t3.b
+
+	// SELECT ... FROM t1, t3 WHERE t1.x = t3.a AND EXISTS (SELECT 1 FROM t2
+	// WHERE t2.z = t1.x), in unnestExistsExpr's post-method-selection shape
+	// (unnest.go:4738-4762): LeftKey reads the outer's own local index
+	// (t1.x, index 0 in outerJoin's composite schema); RightKey is
+	// `outerWidth + innerColIndex` (t2.z, local index 1 in t2's own
+	// 2-column schema).
+	j := &Join{
+		Type:     JoinTypeSemi,
+		Left:     outerJoin,
+		Right:    t2,
+		LeftKey:  &ColumnRef{Index: 0, Name: "x"},
+		RightKey: &ColumnRef{Index: outerWidth + 1, Name: "z"},
+		SJInfo:   &SpecialJoinInfo{Jointype: parser.JoinSemi},
 	}
 
 	scans, widths, _, _, semiAnti, ok := extractSearchLeaves(j, true)
 	if !ok {
-		t.Fatalf("extractSearchLeaves(j, true) ok=false, want true: %s", planString(node))
+		t.Fatalf("extractSearchLeaves(j, true) ok=false, want true")
 	}
 	if len(scans) != 3 {
 		t.Fatalf("scans = %d leaves, want 3 (t1+t3 flattened, plus the RHS opaque leaf): %v widths=%v", len(scans), scans, widths)
 	}
-	// t1's leaf position depends on join-order costing, not source-text
-	// order, so find it rather than assuming index 0.
+	// t1 is deterministically scans[0] in this hand-built tree (no search
+	// reordering), but look it up rather than assume it, matching how a
+	// real search-produced fixture would still need to.
 	t1Idx := -1
 	for i, s := range scans[:2] {
 		if seq, isSeq := s.(*SeqScan); isSeq && seq.Table != nil && seq.Table.Name == "t1" {

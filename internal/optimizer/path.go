@@ -160,6 +160,17 @@ type Path struct {
 	// with the enumeration that produces it.
 	Jointype parser.JoinType
 
+	// SJInfo carries the Semi/Anti join's SpecialJoinInfo from the DP search
+	// through to the *Join node createNestLoopPlan/createHashJoinPlan build
+	// (M0142-0008a-3i-plumbing-c16, design doc §51.1). unnestExistsExpr's
+	// direct construction path already stamps Join.SJInfo itself; this field
+	// is the missing carrier for the SEPARATE case where the search
+	// reorders/rebuilds the Semi/Anti join as part of a *Path (join_paths.go)
+	// rather than reusing the syntactic Join node verbatim — without it, the
+	// rebuilt Join loses its SJInfo and extractSearchLeaves's SynLefthand/
+	// MinLefthand rebuild (joinsearchseam.go) has nothing to write into.
+	SJInfo *SpecialJoinInfo
+
 	// AggStrategy is the aggregation this path PERFORMS — PG's
 	// `AggPath.aggstrategy`, set per path by `add_paths_to_grouping_rel`
 	// (planner.c:7114). Same carrier rule as Jointype above: the PATH, never

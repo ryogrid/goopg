@@ -155,6 +155,7 @@ func createNestLoopPlan(p *Path) (Node, outputLayout) {
 		// (`Join.Predicate` is documented nil for CROSS JOIN, plan.go:812).
 		Predicate: in.joinPredicate("PathNestLoop", nil, p.Residual),
 		schema:    in.publishedSchema(jt),
+		SJInfo:    p.SJInfo,
 	}
 	return j, in.publishedLayout(jt)
 }

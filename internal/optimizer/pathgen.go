@@ -132,6 +132,7 @@ func addHashJoinPath(joinRel, probe, build *RelOptInfo, cp costParams, jt parser
 		// orthogonal: hash/merge/nestloop is the ALGORITHM, jointype is WHAT IS
 		// COMPUTED.
 		Jointype:      jt,
+		SJInfo:        sjinfo,
 		DisabledNodes: disabledNodesFor(!cp.enableHashJoin, p, b),
 		Rel:           joinRel,
 		Rows:          joinRel.Rows,
@@ -193,6 +194,7 @@ func addNestLoopPath(joinRel, outer, inner *RelOptInfo, cp costParams, jt parser
 	addPath(joinRel, &Path{
 		Kind:          PathNestLoop,
 		Jointype:      jt, // C-03b; see addHashJoinPath.
+		SJInfo:        sjinfo,
 		DisabledNodes: disabledNodesFor(!cp.enableNestLoop, o, i),
 		Rel:           joinRel,
 		Rows:     joinRel.Rows,

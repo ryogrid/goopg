@@ -6477,3 +6477,58 @@ c16 entry.
 
 Still pending, unrelated, carried since c11 (not this loop's job):
 `predp.go:159-176`'s stale Phase B doc comment.
+
+## 52. c16 — LANDED: the four-piece diff plus the test rewrite
+
+Re-applied §51.1's four pieces exactly as specified, then fixed the test
+per §51.4 option (a) (the preferred one):
+
+1. `Path.SJInfo *SpecialJoinInfo` (path.go).
+2. `addNestLoopPath` and `addHashJoinPath` (pathgen.go) both stamp
+   `SJInfo: sjinfo` on the `*Path` they build.
+3. `createNestLoopPlan` (createplannl.go) and `createHashJoinPlan`
+   (createplanjoin.go) both copy `SJInfo: p.SJInfo` onto the `*Join` they
+   build. `createHashJoinPlan`'s stale "SEMI/ANTI are nestloop-only"
+   comment (contradicted by M0142-0008a-3(iii), which already lifted the
+   hash arm's decline — `joinpaths.go`'s `addPathsToJoinrel`,
+   `mergeDeclined` comment) is corrected in the same edit.
+4. `joinInfoList: ctx.joinInfoList` (joinsearchseam.go) replaces the
+   dead `semiAntiJoinInfoList(ctx.joinInfoList, semiAnti)` call, which
+   appended a SECOND, undeduped copy of each semiAnti link's SJInfo on
+   top of the list c4's deduping append (joinInfoListHas guard,
+   ~line 594-595) had already populated. The now-unused
+   `semiAntiJoinInfoList` helper function was deleted with it (no test
+   referenced it directly).
+
+`TestExtractSearchLeaves_AdmitSemiAnti_NarrowsMinLefthandToCorrelatedRelation`
+(semiantichain_test.go) was rewritten per §51.4(a): it no longer calls
+`Plan()` at all. It hand-builds `t1 JOIN t3 ON t1.x = t3.a` as a literal
+`*Join{Type: JoinTypeInner}` over two `*SeqScan` literals, then a literal
+`*Join{Type: JoinTypeSemi}` over that composite and a `t2` `*SeqScan`,
+with `LeftKey`/`RightKey` set following unnestExistsExpr's own convention
+(unnest.go:4738-4762): `LeftKey.Index` is the outer's own local index
+(0, for `t1.x` — the leftmost column of the composite Left), `RightKey.Index`
+is `outerWidth + innerColIndex` (`3+1=4`, for `t2.z` — local index 1 in
+t2's own 2-column schema). This is now a true white-box unit test of
+`extractSearchLeaves` alone: it fixes the input tree by construction
+instead of depending on which legal join order the DP search happens to
+prefer, so it can no longer regress the way it did in c16's first attempt
+(the search legally reordering the query to
+`InnerJoin(SemiJoin(t1, t2), t3)` once the SJInfo carrier fix made that
+order admissible, which broke the `Plan()`-driven fixture's implicit
+assumption of the OLD `SemiJoin(InnerJoin(t1, t3), t2)` shape).
+
+Verification: `go build ./...` clean; `go test ./internal/optimizer/...`
+fully green (including the rewritten test and every other test in the
+package); `scripts/tpcds-sf025-regression.sh sweep` (private `GOOPG_BIN`)
+— `PASS=96 MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0 SKIP=3`,
+`PLAN-SHAPE: queries=99 same=99 changed=0` — the SJInfo carrier fix does
+not alter any TPC-DS SF0.25 plan shape or result, as expected (it makes a
+previously-silently-dropped SJInfo available to the search; it does not
+change which orders are legal for any query in this corpus).
+`scripts/tpch-spotcheck.sh` SKIPPED — pre-existing, unrelated blocker
+(the shared `:65433` `tpch` database is still empty pending the
+M0142-0003k reload, see CLAUDE.md's TPC-H row).
+
+Committed. Still pending, unrelated, carried since c11: `predp.go:159-176`'s
+stale Phase B doc comment.
