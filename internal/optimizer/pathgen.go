@@ -75,8 +75,22 @@ func generateScanPaths(rel *RelOptInfo, cp costParams, relPages int64, numQualOp
 //
 // Child convention: Children[0] is the probe (outer) side, Children[1] is the
 // build (inner) side. createPlan reads it to set the executor Join's BuildLeft.
-func addHashJoinPath(joinRel, probe, build *RelOptInfo, cp costParams, jt parser.JoinType, keys, residual []*restrictInfo, innerBucketSize float64, final hashJoinFinalCostInput) {
+func addHashJoinPath(joinRel, probe, build *RelOptInfo, cp costParams, jt parser.JoinType, keys, residual []*restrictInfo, innerBucketSize float64, final hashJoinFinalCostInput, uniq uniqueSide, sjinfo *SpecialJoinInfo) {
 	p, b := probe.CheapestTotal, build.CheapestTotal
+	// M0142-0008c-3c: `hash_inner_and_outer`'s own unique-ify substitution
+	// (joinpath.c:2301-2341) — JOIN_UNIQUE_OUTER replaces the probe with its
+	// unique-ified cheapest-total (one try, no cheap-startup variant, since
+	// goopg has no cheapest-startup-outer arm for hash to begin with);
+	// JOIN_UNIQUE_INNER replaces the build side the same way. `jt` has
+	// already been demoted to JoinInner by `addPathsToJoinrel` before this
+	// call (M0142-0008c-3a), exactly mirroring PG's own `jointype = JOIN_INNER`
+	// reassignment at the same two call sites.
+	switch uniq {
+	case uniqueSideOuter:
+		p = createUniquePath(probe, probe.CheapestTotal, sjinfo, cp)
+	case uniqueSideInner:
+		b = createUniquePath(build, build.CheapestTotal, sjinfo, cp)
+	}
 	if p == nil || b == nil {
 		return
 	}
@@ -217,11 +231,13 @@ func generateHashJoinPaths(joinRel, outer, inner *RelOptInfo, cp costParams, jt 
 		}
 		return bucketFor(build.Relids)
 	}
-	// Orientation 1: build the inner side.
-	addHashJoinPath(joinRel, outer, inner, cp, jt, keys, residual, bucket(inner), hashJoinFinalCostInput{})
+	// Orientation 1: build the inner side. Test-only helper (no production
+	// caller — see doc comment): never a unique-ify candidate, so uniq/sjinfo
+	// are always the no-op values.
+	addHashJoinPath(joinRel, outer, inner, cp, jt, keys, residual, bucket(inner), hashJoinFinalCostInput{}, uniqueSideNone, nil)
 	// Orientation 2: build the outer side (swap the roles). The join output is
 	// the same; only which side is hashed differs.
-	addHashJoinPath(joinRel, inner, outer, cp, jt, keys, residual, bucket(outer), hashJoinFinalCostInput{})
+	addHashJoinPath(joinRel, inner, outer, cp, jt, keys, residual, bucket(outer), hashJoinFinalCostInput{}, uniqueSideNone, nil)
 }
 
 // The C1-era `generateNLIPath` used to live here. It was retired by

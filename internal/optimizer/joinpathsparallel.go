@@ -80,8 +80,19 @@ import "strconv"
 import "github.com/goopg/goopg/internal/parser"
 
 func addPartialHashJoinPath(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp costParams,
-	jt parser.JoinType, keys, residual []*restrictInfo, bucket float64, final hashJoinFinalCostInput) {
+	jt parser.JoinType, keys, residual []*restrictInfo, bucket float64, final hashJoinFinalCostInput,
+	uniq uniqueSide, sjinfo *SpecialJoinInfo) {
 
+	// M0142-0008c-3c: PG's own `save_jointype != JOIN_UNIQUE_OUTER` gate
+	// (joinpath.c:2419) — a JOIN_UNIQUE_OUTER path needs the OUTER unique-ified,
+	// but a partial hash join's outer is a PARTIAL (per-worker) path, and
+	// `create_unique_path`'s Sort+Unique has no parallel-safe shape to offer
+	// one. "we won't be able to properly guarantee uniqueness" (PG's own
+	// comment) — decline outright, before touching PartialPathlist.
+	if uniq == uniqueSideOuter {
+		tracePVetoCtx(s, "hash", traceRelids(joinrel), traceRelids(outer), traceRelids(inner), "V-uniq-outer", "jt="+traceJoinTypeName(jt))
+		return
+	}
 	// The only reader of a partial path is `generateUsefulGatherPaths`, which
 	// is gated by the same mode — so producing under `off` buys nothing and
 	// costs one hashJoinCost per pair per direction per level on a search whose
@@ -159,10 +170,27 @@ func addPartialHashJoinPath(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp 
 	// tries `cheapest_total_inner` and falls back to this scan; the two are
 	// folded here because CheapestTotal is itself on Pathlist and would be
 	// found by the same scan.
-	i := cheapestParallelSafeTotalInner(inner.Pathlist)
-	if i == nil {
-		tracePVetoCtx(s, "hash", traceRelids(joinrel), traceRelids(outer), traceRelids(inner), "V7", "jt="+traceJoinTypeName(jt))
-		return
+	//
+	// M0142-0008c-3c: JOIN_UNIQUE_INNER is the one exception — PG "can't use
+	// any alternative inner path" (joinpath.c:2453-2454), only the
+	// ALREADY-unique-ified `cheapest_total_inner`, and only if IT happens to
+	// be parallel-safe (:2462-2466 `else if (save_jointype !=
+	// JOIN_UNIQUE_INNER)` — the alternative-search branch is skipped
+	// entirely for this jointype, so a non-parallel-safe unique path means no
+	// partial hash join at all, not a fallback search).
+	var i *Path
+	if uniq == uniqueSideInner {
+		i = createUniquePath(inner, inner.CheapestTotal, sjinfo, cp)
+		if i == nil || !i.ParallelSafe {
+			tracePVetoCtx(s, "hash", traceRelids(joinrel), traceRelids(outer), traceRelids(inner), "V7-uniq-inner", "jt="+traceJoinTypeName(jt))
+			return
+		}
+	} else {
+		i = cheapestParallelSafeTotalInner(inner.Pathlist)
+		if i == nil {
+			tracePVetoCtx(s, "hash", traceRelids(joinrel), traceRelids(outer), traceRelids(inner), "V7", "jt="+traceJoinTypeName(jt))
+			return
+		}
 	}
 
 	// `try_partial_hashjoin_path`'s own refusals (:1315-1318). Upstream asserts

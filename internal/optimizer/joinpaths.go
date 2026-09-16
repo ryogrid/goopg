@@ -419,7 +419,7 @@ func addPathsToJoinrel(s *searchCtx, joinrel, outer, inner *RelOptInfo, clauses 
 			// because the searchCtx — and so the statistics — is in scope,
 			// exactly as mergeTuplesFor is.
 			bucket := s.estimateHashBucketSize(keys, inner.Relids)
-			addHashJoinPath(joinrel, outer, inner, cp, jt, keys, residual, bucket, final)
+			addHashJoinPath(joinrel, outer, inner, cp, jt, keys, residual, bucket, final, uniq, sjinfo)
 			// C-19f: `hash_inner_and_outer`'s parallel block (joinpath.c:2418)
 			// sits immediately after the serial `try_hashjoin_path` loop
 			// (:2398), and is passed the SAME hashclauses — so the partial
@@ -429,7 +429,7 @@ func addPathsToJoinrel(s *searchCtx, joinrel, outer, inner *RelOptInfo, clauses 
 			// generateUsefulGatherPaths and the next level's own partial
 			// producer reads; with GOOPG_GATHER_PATHS off it produces nothing
 			// at all (joinpathsparallel.go).
-			addPartialHashJoinPath(s, joinrel, outer, inner, cp, jt, keys, residual, bucket, final)
+			addPartialHashJoinPath(s, joinrel, outer, inner, cp, jt, keys, residual, bucket, final, uniq, sjinfo)
 		}
 		// The nested loop keys on nothing, so the key set rejoins the
 		// residual: it evaluates every clause, on every pair. Passing

@@ -3930,3 +3930,161 @@ the Semi/Anti path-building arms should re-run the SF0.25 `plans` diff for
 Q78 specifically and check whether the Nested-Loop/Filter shape is a genuine
 new join-order choice or a missing index-probe candidate in the newly
 reachable code path.
+
+## 35. M0142-0008c-3c landed — hash-join unique-ify substitution, AND the corpus-wide reachability re-check plus a deeper root cause for why it (still) never fires (2026-09-16)
+
+Picked per §34.4's own pointer to `M0142-0008c-3c`/`-3d` as the natural next
+item now that `-3i-plumbing-b2` is fully landed. Per the fix_plan/working-set
+baton's own instruction ("neither has been live-traced yet, only
+recon-sized"), this loop live-traced reachability FIRST, then implemented
+`-3c` following `-3b`'s exact precedent (§20): build the correct dispatch,
+pin it with direct hand-built-input unit tests, and report the reachability
+finding as data rather than silently skip the implementation because it is
+currently unreachable (`dead_code_is_not_a_reference_impl` — a DIRECTLY
+tested builder is not "dead code" in that rule's sense, `-3b` already
+established this precedent and it is followed here again).
+
+### 35.1 Corpus-wide re-check: reachability is STILL zero after the step-(iii) flip
+
+`-3b`'s own recon (§20) found, via a single live probe (Q10 only), that
+`addPathsToJoinrel` was never once called with a SEMI/ANTI `SpecialJoinInfo`
+in production — the entire `-0008c` unique-ify family was "correct but
+unreachable," blocked on `-3i-plumbing` items 3-5. Those items are now
+landed (`-3i-plumbing-b2`, §33-34). This loop re-ran the check at the new
+HEAD, widened from one query to the full corpus:
+
+- Built a private HEAD binary (`tmp/goopg-sf025-scope-bin`, never touched the
+  shared TPC-H `:65433` cluster the `M0142-0003k` blocker still covers).
+- Started the shared TPC-DS SF0.25 regression cluster (`:65437`,
+  `GOOPG_PGSHAPED_DP_TRACE=1`) — read-only `EXPLAIN`s only, safe on a
+  git-tracked oracle-comparison cluster.
+- Ran `EXPLAIN` on all 100 TPC-DS query files (7 pre-existing, unrelated
+  parse-gap errors on multi-CTE-with-syntax/`lochierarchy` queries — not
+  investigated, out of scope) and grepped the server log for every `DPPATH`
+  line.
+
+Result: **145,191 total `DPPATH` lines, ZERO with `jointype=semi` or
+`jointype=anti`.** Re-confirms `-3b`'s verdict at full-corpus scale, not just
+Q10: `jointypeForDirection`'s SEMI/ANTI branch — the code this milestone's
+entire `-0008c` family extends — is not reached by any query in the standard
+regression corpus, even with Phase B genuinely live and changing Q78's plan
+(§34).
+
+### 35.2 The deeper reason: `semiAnti`'s two named consumers are wired to zero production call sites
+
+Chasing *why* Phase B's admission (which DOES walk into a real ANTI join for
+Q78, per §34.2) never produces a SEMI/ANTI `DPPATH` line found a specific,
+previously-undocumented gap. `extractSearchLeaves`'s own doc comment (just
+above its signature, `joinsearchseam.go:1108`) names "`semiAntiChainLink`'s
+two consumers" — `semiAntiLinksHaveSJInfos` (the SJInfo-legality check,
+`outerLinksHaveSJInfos`'s SEMI/ANTI analogue) and `semiAntiOnQualsOK` (the
+qual-placement proof, `outerOnQualsOK`'s analogue). Grepping every call site
+of both functions across the package: **each has calls ONLY from
+`semiantichain_test.go`.** Neither is called anywhere inside
+`tryPGShapedJoinSearch` itself — contrast with `outerLinksHaveSJInfos`, whose
+outer-link analogue IS called in production at `joinsearchseam.go:312` (now;
+line numbers have shifted across this design doc's many rounds).
+
+What `extractSearchLeaves`'s SEMI/ANTI arm DOES do in production (traced live
+at `joinsearchseam.go:1148-1230`, admission code unchanged by this loop): it
+renumbers the ORIGINAL `j.SJInfo` object's `SynLefthand`/`MinLefthand`/
+`SynRighthand`/`MinRighthand` in place (lines 1223-1226) to match the newly
+derived leaf-index bits, and records a `semiAntiChainLink` used only by the
+THREE preamble checks already landed (`pgShapedOffsetChecksOK`,
+`buildLeafSpans`, the `len(scans) != nprefix+len(semiAnti)` leaf-count check —
+all §31.3's work, all about chain-shape bookkeeping, none about SJInfo
+legality or DP-level admission). Whether the renumbered `j.SJInfo` object is
+actually a member of `ctx.joinInfoList` — the list `jointypeForDirection`'s
+caller consults to find a pair's `SpecialJoinInfo` during the DP tournament —
+was not traced to a definitive per-query yes/no this loop; what IS certain
+from §35.1's measurement is that if it does reach `joinInfoList`, something
+else in the admission/legality chain still declines before `addPathsToJoinrel`
+ever sees it, since the observed count is exactly zero, not "occasionally
+declined."
+
+**Conclusion for `-0008c-3c`/`-3d`'s resume path:** the blocker is no longer
+correctly described as "the search doesn't yet admit a Semi/Anti chain link"
+(§20's framing, now stale) — it DOES admit one, structurally, for at least
+Q78. The blocker is that admission's two purpose-built LEGALITY consumers
+(`semiAntiLinksHaveSJInfos`, `semiAntiOnQualsOK`) are tested but never wired
+into `tryPGShapedJoinSearch`, so nothing currently causes a real SEMI/ANTI
+`SpecialJoinInfo` to reach the DP tournament's `addPathsToJoinrel` call for
+costing purposes — Q78's plan changed through Phase B's SPLICE mechanism
+(`spliceSearchedSpine`, §33) re-arranging what surrounds a FIXED, reused
+Semi/Anti join node, not through the DP tournament re-costing alternative
+placements of that node itself. Wiring those two consumers into production
+(and confirming `ctx.joinInfoList` actually carries the renumbered `j.SJInfo`
+across into the DP level driver) is the concrete next step before `-0008c`'s
+family can ever fire — filed as **M0142-0008a-3i-plumbing-c** below, since it
+is `-3i-plumbing`'s own admission-wiring work, not a `-0008c` costing item.
+
+### 35.3 `-3c` implementation: hash-join unique-ify substitution
+
+Landed exactly the shape `-3b`'s own "Next" pointer (§19, end) described:
+`addHashJoinPath` (`pathgen.go`) gained `uniq uniqueSide, sjinfo
+*SpecialJoinInfo`, substituting the PROBE side for `uniqueSideOuter` and the
+BUILD side for `uniqueSideInner` (`hash_inner_and_outer`'s own two arms,
+`joinpath.c:2301-2341`, read live) — a single builder handling BOTH
+directions, unlike the NL split across two builders, since PG's own
+`hash_inner_and_outer` is one function for both. `addPartialHashJoinPath`
+(`joinpathsparallel.go`) gained the same two params:
+`uniqueSideOuter` declines unconditionally before even inspecting
+`PartialPathlist` (PG's own `save_jointype != JOIN_UNIQUE_OUTER` gate,
+`joinpath.c:2419` — a partial outer's per-worker shape cannot be
+unique-ified); `uniqueSideInner` substitutes `createUniquePath`'s cached
+result for the ordinarily-searched `cheapestParallelSafeTotalInner`, but only
+when that result is ALSO `ParallelSafe` (PG's own "we can't use any
+alternative inner path," `joinpath.c:2453-2466`) — `createUniquePath`'s
+`PathUnique` literal never sets `ParallelSafe` (`createuniquepath.go`, no such
+field in the literal), so this arm always declines today, a faithful
+consequence of a real field rather than an approximation. `addPathsToJoinrel`
+threads `uniq`/`sjinfo` into both calls (`joinpaths.go`).
+
+Six new direct unit tests
+(`internal/optimizer/uniqueify_hash_builders_test.go`), mirroring `-3b`'s
+`uniqueify_builders_test.go` pattern exactly: `addHashJoinPath` substitutes
+the probe (outer) and separately the build (inner) side, with a
+fail-closed decline control for each; `addPartialHashJoinPath` always
+declines `uniqueSideOuter` and always declines `uniqueSideInner` (since
+`ParallelSafe` is never true), both asserted directly rather than assumed;
+one end-to-end `addPathsToJoinrel` test (`TestAddPathsToJoinrel_UniqueSideInner_HashPlanShape`)
+proves the dispatch-through-builder wiring produces a demoted-`JoinInner`
+hash join over the unique-ified inner when only the unique-ify fallback
+admits the pair — the hash-join analogue of `-3b`'s own
+`TestAddPathsToJoinrel_UniqueSideInner_PlanShape`, exercising the KEYED arm
+of `addPathsToJoinrel` (which the NL-only test never reached) with a
+hand-built equijoin `restrictInfo`.
+
+One test-only caller, `generateHashJoinPaths` (no production call site,
+`pathgen.go` — used only by `pathgen_test.go`/`nestloop_ntuples_test.go`),
+was updated to pass `uniqueSideNone, nil` at both its internal call sites
+(never a unique-ify candidate by construction).
+
+**Acceptance, per §35.1**: NOT met and cannot be met yet, for the same
+structural reason `-3b` already found and this loop re-confirmed at full
+corpus scale — the same `M0142-0008a-3i-plumbing-c` follow-up blocks both.
+
+**Verification**: `go build ./...` clean; `go vet ./internal/optimizer/...`
+clean; full `go test ./internal/optimizer/...` pass (all pre-existing tests
+plus the 6 new ones); TPC-DS SF0.25 sweep against a rebuilt private binary,
+`PASS=96 MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0 SKIP=3`,
+`PLAN-SHAPE: same=99 changed=0` — zero production behavior change, as
+expected from §35.1's reachability finding;
+`RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh` shows only the
+pre-existing, unrelated `internal/parser` `GroupedJoinUnaliased` AST-drift
+failure (`internal/optimizer` itself `ok`, cached).
+
+### 35.4 Resume point
+
+`M0142-0008c-3c` is DONE in the same sense `-3b` was: correctly built,
+directly tested, empirically confirmed still-unreachable in production.
+`M0142-0008c-3d` (merge + partial-nestloop unique-ify substitution) is
+NOT done — it was not picked up this loop (one task per loop) — but shares
+the EXACT same blocker identified in §35.2, so whoever picks it up next
+should read this section first rather than re-running the same reachability
+recon. The real next step for the whole `-0008c` family is
+**M0142-0008a-3i-plumbing-c** (filed below): wire `semiAntiLinksHaveSJInfos`/
+`semiAntiOnQualsOK` into `tryPGShapedJoinSearch`'s production path and confirm
+(or fix) whether the renumbered `j.SJInfo` reaches `ctx.joinInfoList` for the
+DP level driver to find — only after that can `-3c`/`-3d`/`-4`'s acceptance
+bars (Q10/Q35 plan-shape parity) even be attempted.

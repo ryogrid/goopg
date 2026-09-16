@@ -3996,6 +3996,40 @@ cross-layer programme that has never been scoped.
     `RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh` shows only
     the pre-existing unrelated `internal/parser` `GroupedJoinUnaliased`
     failure (`internal/optimizer` itself `ok`).
+- [ ] **M0142-0008a-3i-plumbing-c — wire `semiAntiLinksHaveSJInfos`/
+  `semiAntiOnQualsOK` into `tryPGShapedJoinSearch`'s production path, and
+  confirm/fix whether the renumbered `j.SJInfo` reaches `ctx.joinInfoList`**
+  — filed by M0142-0008c-3c's recon (design doc §35.2). A full-corpus
+  (100-query) `GOOPG_PGSHAPED_DP_TRACE=1` sweep found 145,191 total `DPPATH`
+  lines and ZERO `jointype=semi`/`anti`, even with `-3i-plumbing-b2`'s
+  Phase B genuinely live and changing a real query's plan (Q78) — so the
+  entire `M0142-0008c` unique-ify family (`-3c` DONE, `-3d`/`-4` not started)
+  stays provably unreachable regardless of how much of it gets built.
+  Root cause: `extractSearchLeaves`'s own doc comment names
+  `semiAntiLinksHaveSJInfos` (the SJInfo-legality check,
+  `outerLinksHaveSJInfos`'s SEMI/ANTI analogue) and `semiAntiOnQualsOK` (the
+  qual-placement proof) as the admitted chain link's "two consumers" — but
+  grepping every call site of both shows they are called ONLY from
+  `semiantichain_test.go`, never from `tryPGShapedJoinSearch` itself.
+  `extractSearchLeaves`'s SEMI/ANTI arm DOES renumber the original
+  `j.SJInfo`'s `SynLefthand`/`MinLefthand`/`SynRighthand`/`MinRighthand` in
+  place (`joinsearchseam.go:1223-1226`) to match the derived leaf-index bits,
+  but whether that renumbered object is actually a member of
+  `ctx.joinInfoList` — the list `jointypeForDirection`'s caller consults to
+  find a pair's `SpecialJoinInfo` during the DP tournament — was not traced
+  to a definitive yes/no; the corpus-wide zero count means something in the
+  admission/legality chain still declines before `addPathsToJoinrel` ever
+  sees it. Resume point: design doc §35.2. Scope for whoever picks this up:
+  (1) trace live whether `j.SJInfo` is a `ctx.joinInfoList` member at all for
+  a Q78-shaped query; (2) if not, find the right place to register it (likely
+  where Phase B's `spineJoins[0]`-rooted search context is built,
+  `predp.go`); (3) wire `semiAntiLinksHaveSJInfos`/`semiAntiOnQualsOK` into
+  `tryPGShapedJoinSearch`'s admission checks alongside the existing
+  `outerLinksHaveSJInfos`/`outerOnQualsOK` calls; (4) re-run the full-corpus
+  DPPATH sweep and confirm at least one `jointype=semi`/`anti` line appears
+  before declaring `-0008c-3c`/`-3d`/`-4` reachable. Likely a real, non-trivial
+  admission-wiring task, not a one-line fix — size it with its own recon
+  before committing to a design.
   **Independent, unfiled resume-point hint** (not sized/numbered — noted for
   whoever picks up S5a's own eligibility gate): relaxing
   `whereEligibleForPreDPUnnest` to per-sublink granularity would upgrade
@@ -4168,20 +4202,37 @@ cross-layer programme that has never been scoped.
   ERROR=0 TIMEOUT=0`, `PLAN-SHAPE: same=99 changed=0`) — now understood as
   the direct consequence of that finding. See design doc §20 and the
   `M0142-0008c-3b` deferral-ledger row for the full evidence.
-- [ ] **M0142-0008c-3c — `addHashJoinPath`/`addPartialHashJoinPath`
+- [x] **M0142-0008c-3c — `addHashJoinPath`/`addPartialHashJoinPath`
   unique-ify substitution** — filed by M0142-0008c-3's recon (design doc
-  §19.4 item 3c). Depends on M0142-0008c-3a. Deferred: not exercised by
-  either named witness (§19.1). **Unblocked 2026-09-16: `M0142-0008a-3i-plumbing-b2`
-  landed (design doc §34)** — `admitSemiAnti=true` is now live in production
-  and a real Semi/Anti pair reaches the DP search for at least one query
-  (`Q78`), so a TPC-DS measurement can now distinguish "correct but
-  unreachable" from "wrong" for this item. Not yet picked up. PG
-  oracle: `hash_inner_and_outer`, `joinpath.c:2100-2140` (cited by §16.1, not
-  yet read live).
+  §19.4 item 3c). Depends on M0142-0008c-3a. **DONE 2026-09-16** (design doc
+  §35), following `-3b`'s exact precedent: build correct, direct-unit-test,
+  report reachability as data. `addHashJoinPath` (`pathgen.go`) and
+  `addPartialHashJoinPath` (`joinpathsparallel.go`) gained
+  `uniq uniqueSide, sjinfo *SpecialJoinInfo` (PG oracle `hash_inner_and_outer`,
+  `joinpath.c:2301-2341`/`:2418-2474`, read live) — one hash builder handles
+  BOTH `JOIN_UNIQUE_OUTER`(probe)/`JOIN_UNIQUE_INNER`(build) substitutions,
+  unlike the NL split across two builders; the partial arm declines
+  `uniqueSideOuter` outright (PG's own `save_jointype != JOIN_UNIQUE_OUTER`
+  gate) and declines `uniqueSideInner` too in practice today since
+  `createUniquePath`'s `PathUnique` never sets `ParallelSafe`. 6 new direct
+  unit tests (`uniqueify_hash_builders_test.go`), TPC-DS SF0.25 sweep
+  `PASS=96 MISMATCH=0`/`PLAN-SHAPE: same=99 changed=0`, full
+  `go test ./internal/optimizer/...` green. **Acceptance NOT met and cannot
+  be met yet, root-caused further this loop**: a full-corpus (100-query)
+  `GOOPG_PGSHAPED_DP_TRACE=1` sweep found ZERO `jointype=semi`/`anti` DPPATH
+  lines even with `M0142-0008a-3i-plumbing-b2`'s Phase B genuinely live
+  (Q78) — `extractSearchLeaves`'s own two named legality consumers,
+  `semiAntiLinksHaveSJInfos`/`semiAntiOnQualsOK`, are called only from
+  `semiantichain_test.go`, never wired into `tryPGShapedJoinSearch`
+  production code, so no real Semi/Anti `SpecialJoinInfo` ever reaches
+  `addPathsToJoinrel`. Actual next blocker filed as
+  **M0142-0008a-3i-plumbing-c** (under the M0142-0008a milestone section).
 - [ ] **M0142-0008c-3d — merge + partial-nestloop unique-ify substitution**
   — filed by M0142-0008c-3's recon (design doc §19.4 item 3d). Depends on
-  M0142-0008c-3a. **Unblocked 2026-09-16, same reason as 3c** (design doc
-  §34) — not yet picked up. Deferred for the same reason as 3c
+  M0142-0008c-3a. **Shares -3c's exact blocker (design doc §35, 2026-09-16)**:
+  read §35 before re-running the reachability recon — it is already answered
+  and points at `M0142-0008a-3i-plumbing-c`, not at this item. Still not
+  picked up. Deferred for the same reason as 3c
   otherwise: `sortInnerAndOuter`/`matchUnsortedOuterMerge`/
   `matchUnsortedOuterMergePartial` (merge) and `addPartialNestLoopPaths`
   (parallel NL), PG oracle `sort_inner_and_outer`/`match_unsorted_outer`,
