@@ -4373,7 +4373,7 @@ cross-layer programme that has never been scoped.
   dedup can't catch two independently-built copies, so `joinIsLegal`'s own
   "matches multiple SpecialJoinInfos" guard correctly-per-its-own-logic
   declines a pairing that is legitimately legal exactly once.
-- [ ] **M0142-0008a-3i-plumbing-c11 — stop `ctx.joinInfoList` from
+- [x] **M0142-0008a-3i-plumbing-c11 — stop `ctx.joinInfoList` from
   accumulating duplicate/stale `*SpecialJoinInfo` entries across
   `tryPGShapedJoinSearch`'s two call sites for one statement** (design doc
   §45.3-45.4, filed by c10). **Item (a) LANDED 2026-09-17 (design doc §46.5):
@@ -4492,6 +4492,22 @@ cross-layer programme that has never been scoped.
   `predp.go:159-176`'s Phase B doc comment — its "`used` is therefore
   false on every production call today" claim is stale and actively
   misleading.
+  **CLOSED 2026-09-17: all three items resolved.** (a) landed (above).
+  (b)'s re-scoped root cause was pinned and fixed by **c12** (the
+  index-path-candidate eligibility bug). (c) — re-applying the
+  `joinInfoList: ctx.joinInfoList` one-liner — was landed for good by
+  **c16** together with its own prerequisite (the SJInfo Path→Join
+  carrier c15 found missing), verified via a full TPC-DS SF0.25 sweep
+  (`PASS=96 MISMATCH=0 CKMISMATCH=0 ERROR=0`) and confirmed present in the
+  current tree (`grep joinInfoList: ctx.joinInfoList joinsearchseam.go`,
+  `semiAntiJoinInfoList` has zero remaining references). The carried
+  `predp.go` doc-comment debt was closed separately by **c17**. **c18**
+  then re-measured reachability against the FULL SF0.25 corpus (not a
+  hand-probe) and found it is STILL zero for the EXISTS/IN family this
+  item targeted (Q10/Q16/Q35/Q69/Q94) — see **c18** below for the
+  now-current state and its own, narrower resume point (Q78, a
+  completely different producer, is the only query that reaches the
+  admission arm at all).
 - [x] **M0142-0008a-3i-plumbing-c12 — fix the actual cause of Q69's `outer
   column ref c_current_cdemo_sk/level=1 out of range (depth=0)` runtime
   crash: an index-path candidate whose required relids are not a subset of
@@ -4852,6 +4868,68 @@ cross-layer programme that has never been scoped.
   documentation-only fix. Verification: `go build ./...` clean,
   `go test ./internal/optimizer/...` green, diff is comment-only (no
   production code changed, no gate re-run needed).
+- [ ] **M0142-0008a-3i-plumbing-c18 — full-corpus (96-query) SF0.25 recheck
+  of Semi/Anti DPPATH reachability after c1-c17 all landed: still 0/96;
+  root-caused to a SECOND, unrelated `.SJInfo`-population gap in the ONE
+  query that reaches the admission arm at all (Q78, LEFT-JOIN-to-ANTI-JOIN
+  strength reduction, not EXISTS/IN unnesting)** (design doc §54, filed by
+  this loop, prompted by M0142-0008c-3b/3c/3d's stale "0 of 162 DPPATH
+  lines" measurement predating c1-c17). **DONE as a recon 2026-09-17, no
+  production change.** Private `GOOPG_BIN`, `GOOPG_PGSHAPED_DP_TRACE=1`,
+  full `scripts/tpcds-sf025-regression.sh sweep` (`PASS=96 MISMATCH=0
+  CKMISMATCH=0 ERROR=0 TIMEOUT=0 SKIP=3`, unchanged — expected, c1-c17 is a
+  no-op on this corpus), then each of the 96 non-skipped `query*.sql` run
+  ONE AT A TIME against the same cluster with the trace log truncated
+  between runs, for a real per-query attribution (the sweep's own log has
+  no per-query markers). Result: `jointype=semi`/`anti` DPPATH lines = 0,
+  same as before the whole chain. Exactly one query produces ANY
+  semiAnti-related trace at all: **Q78**, 3x `seam-decline
+  reason=semianti-link-no-sjinfo` (matching its 3 independent CTEs) — every
+  other candidate (Q10/Q16/Q35/Q69/Q94, the family every c9-c17 note
+  assumed was "most likely to hit this shape") shows ZERO semiAnti trace
+  lines of any kind, meaning `extractSearchLeaves`'s admission arm
+  (joinsearchseam.go:1287) is never even reached walking their trees — a
+  separate, still-open, unfiled question (not this task's scope; needs
+  tracing why their Semi/Anti joins don't reach `tryPGShapedJoinSearch`'s
+  input tree at all, possibly `whereEligibleForPreDPUnnest`
+  (predp.go:35) declining the whole statement for an unrelated scalar-
+  sublink reason and sending it down the legacy DP-before-unnest order).
+  **Q78 root-caused**: `query78.sql` has no EXISTS/IN sublink at all — its
+  three CTEs use `left join … where <key> IS NULL`, the classical
+  outer-join-to-anti-join idiom, demoted at the AST level by
+  `reduce_outer_joins.go`'s `demotedForPlan` (line 102), a completely
+  different, older mechanism than `existsUnnestSJInfo` (unnest.go:4837,
+  the only thing that has EVER set `.SJInfo` on a `*Join` node, per c15).
+  The resulting `JoinTypeAnti` node DOES reach the admission arm (3
+  declines = 3 CTEs) but `sjinfo: j.SJInfo` (joinsearchseam.go:1360) reads
+  a field this producer never populates, so it is always nil and
+  `semiAntiLinksHaveSJInfos` correctly declines — exactly as designed for
+  "a link whose source `*Join` never carried an SJInfo" (existing comment
+  at joinsearchseam.go:588-591), just via a producer nobody had traced
+  through yet. Very likely (unverified this loop) `ctx.joinInfoList`
+  already holds a matching `*SpecialJoinInfo` for each of Q78's ANTI
+  joins — `deconstructJointreeScopedSJI` (planner.go:3051) snapshots from
+  `s.FromExprs` BEFORE unnesting runs, and Q78's ANTI type is already set
+  in `FromExprs` at that point (unlike an EXISTS/IN join, which doesn't
+  exist as a `*Join` node yet when that snapshot runs) — the gap is purely
+  that nothing threads a pointer from that list back onto the `*Join`
+  node's own field for this producer.
+  **Concrete resume point (design doc §54)**: two candidate fixes — (a)
+  at the point the resolver builds the `*Join{Type: JoinTypeAnti}` literal
+  for a `reduce_outer_joins.go`-demoted item, look up and set `.SJInfo`
+  there too (mirrors `existsUnnestSJInfo`'s own convention); or (b) make
+  the semiAnti link constructor (joinsearchseam.go:1360) fall back to a
+  relids-keyed lookup in `ctx.joinInfoList` when `j.SJInfo == nil` (more
+  PG-faithful: PG's own `join_is_legal` always looks up `join_info_list` by
+  relids, never a stored per-node pointer) — try (b) first, it is smaller
+  and touches one call site. After either fix, re-run this task's exact
+  per-query attribution method on Q78 alone to confirm 3 declines become 3
+  accepts with real `jointype=anti` DPPATH lines, then the full SF0.25
+  sweep to confirm Q78's own result and every other query's plan stay
+  byte-identical to the oracle. Verification this loop: sweep green as
+  above; no `internal/` files changed (instrumentation + `psql -f` runs
+  against a private, disposable cluster only); `tmp/goopg-sf025-trace-bin`
+  and its throwaway data/log removed after the recon.
 - [x] **M0142-0008c — scoping recon: does goopg need PG's `create_unique_path`
   (semi-join → de-duplicate RHS + inner join) to reach parity on TPC-DS
   Q10/Q35?** — filed by M0142-0008a-3(iii)'s §4.3 gate re-run (design doc §6).

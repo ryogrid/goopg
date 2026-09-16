@@ -6578,3 +6578,119 @@ carried debt item, not a new production change.
 Verification: `go build ./...` clean; `go test ./internal/optimizer/...`
 green (comment-only diff, no production code changed). No TPC-DS/TPC-H
 gate re-run needed — nothing outside a comment moved.
+
+## 54. c18 — full-corpus recheck after c1-c17: reachability is STILL zero
+for every EXISTS/IN-unnested query; the ONE query that reaches the
+semiAnti admission arm at all is Q78, via a completely different producer
+(LEFT-JOIN-to-ANTI-JOIN strength reduction), and it declines on a newly
+pinned cause
+
+M0142-0008c-3b/3c/3d's own acceptance criterion ("0 of 162 `jointype=semi`/
+`anti` DPPATH lines" — §35/§40) was measured BEFORE the c1-c17 chain wired
+`semiAntiLinksHaveSJInfos`/`semiAntiOnQualsOK` into production and landed
+the SJInfo Path→Join carrier (c16) — every subsequent c-note claimed or
+implied reachability was fixed (c11 itself: "the DP search completes the
+FULL 6-relation problem with real jointype=semi/anti DPPATH lines"), but
+that claim came from a private, manually-probed binary, never from a
+recheck against the actual SF0.25 harness corpus. This task closes that
+gap with a real measurement.
+
+**Method**: private `GOOPG_BIN=tmp/goopg-sf025-trace-bin`, fresh SF0.25
+cluster (port 65437, no collision — verified nothing else was listening),
+`GOOPG_PGSHAPED_DP_TRACE=1` exported to the server process.
+`scripts/tpcds-sf025-regression.sh sweep` first (full-corpus correctness
+gate: `PASS=96 MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0 SKIP=3` — the
+whole c1-c17 chain remains a byte-identical no-op on this corpus, expected
+and consistent with every prior c-note). Then, to attribute trace lines to
+individual queries (the sweep's own log has no per-query markers), each of
+the 96 non-skipped `query*.sql` files was run ONE AT A TIME against the
+same cluster with the trace log truncated between runs (`: > "${SF025_LOG}"`,
+then one `psql -f query<N>.sql`, then grep, repeat) — a plain linear
+correlation, not a guess.
+
+**Result across the full 96-query pass**: `grep -c 'jointype=semi\|jointype=anti' `
+on the combined trace log is **0**, exactly as it was before c1-c17 (§40's
+figure). `grep -c 'seam-decline reason=semianti'` is **non-zero exactly
+once**, for **Q78**, and nowhere else — not Q10, not Q16, not Q35, not Q69,
+not Q94 (the five queries every prior c-note names as "the stacked
+EXISTS/NOT EXISTS family most likely to hit this shape", most recently
+§53's own closing paragraph). Those five show ZERO semiAnti-related trace
+lines of ANY kind (no accept, no `semianti-link-no-sjinfo`, no
+`semianti-on-qual`) — meaning `extractSearchLeaves`'s semiAnti-admission
+arm (joinsearchseam.go:1287, `isJoin && admitSemiAnti && (j.Type ==
+JoinTypeSemi || j.Type == JoinTypeAnti)`) is never even reached while
+walking their trees in production. Given `admitSemiAnti` is unconditionally
+`true` at the call site (joinsearchseam.go:311-312), the only remaining
+explanation is upstream: those queries' Semi/Anti joins either never
+reach `tryPGShapedJoinSearch`'s input `chain` at all, or `whereEligible-
+ForPreDPUnnest` (predp.go:35) declines them for an unrelated scalar-sublink
+reason elsewhere in the same statement, sending them down the legacy
+order where — per predp.go's own file header (§“Engagement is deliberately
+narrowed”) — unnesting runs AFTER the DP search, so no Semi/Anti node
+exists in the tree the search ever walks. **This is a real, still-open
+question, left as an unfiled hint (not sized/numbered) for whoever revisits
+Q10/16/35/69/94** — it is materially different work from what closes below,
+because it requires tracing five separate statements' full pre-DP pipeline,
+not one localized field-population gap.
+
+**Q78's decline, root-caused**: `query78.sql` (`bench/tpcds/runtime_goopg/
+tpcds-data/queries/query78.sql`) has NO `EXISTS`/`IN` sublink anywhere —
+its three CTEs each use `left join … on (...) where <right-side-key> IS
+NULL`, the classical outer-join-to-anti-join SQL idiom. goopg's
+`reduce_outer_joins.go` (`demotedForPlan`, line 102) recognises this at the
+AST level and demotes the `parser.FromExpr`'s join type to ANTI *before*
+resolution — a completely different, older mechanism than `existsUnnestSJInfo`
+(unnest.go:4837, the EXISTS/IN family's producer, c15 pinned it as "the
+`.SJInfo` field is set exactly once in production"). The resulting `*Join`
+node IS `JoinTypeAnti` and DOES reach `extractSearchLeaves`'s admission arm
+(confirmed: Q78 alone produces 3 `semianti-link-no-sjinfo` decline lines,
+`nrels=2 nleaves=2`, matching its 3 independent CTEs) — but the semiAnti
+link literal reads `sjinfo: j.SJInfo` directly off the `*Join` node
+(joinsearchseam.go:1360), and nothing on the outer-join-demotion path ever
+sets that field, so it is always nil for a Q78-shaped ANTI join, and
+`semiAntiLinksHaveSJInfos` correctly declines it (exactly as the comment at
+joinsearchseam.go:588-591 says it should for "a link whose source `*Join`
+never carried an SJInfo").
+
+**Is there actually a `*SpecialJoinInfo` available to attach?** Very likely
+yes, unverified this loop: `deconstructJointreeScopedSJI` (planner.go:3051)
+snapshots `ctx.joinInfoList` from the statement's `s.FromExprs` BEFORE
+unnesting runs — and Q78's ANTI join is ALREADY that JoinType in
+`FromExprs` at that point (the demotion in `reduce_outer_joins.go` runs
+even earlier, at pure-AST level), unlike an EXISTS/IN join which does not
+exist as a `*Join` node until unnesting builds it. So `ctx.joinInfoList`
+almost certainly already contains the matching `*SpecialJoinInfo` for
+Q78's three ANTI joins — the gap is purely that nothing threads a pointer
+from that list back onto the `*Join` node's own `.SJInfo` field for this
+producer, unlike `existsUnnestSJInfo`, which sets both in the same
+constructor.
+
+**Concrete resume point (two candidate fixes, pick after re-reading
+`deconstructJointreeScopedSJI` and the resolver stage that turns a demoted
+`parser.FromExpr` into a resolved `*Join`)**:
+(a) at the point the resolver builds the `*Join{Type: JoinTypeAnti, …}`
+literal for a `reduce_outer_joins.go`-demoted item, look up its own
+matching `*SpecialJoinInfo` (by relids, the same way `deconstructJointreeScopedSJI`
+built it) and set `.SJInfo` there too, mirroring `existsUnnestSJInfo`'s
+convention exactly; or
+(b) make the semiAnti link constructor (joinsearchseam.go:1360) fall back
+to a relids-keyed lookup in `ctx.joinInfoList` when `j.SJInfo == nil`,
+which would fix Q78 without touching the demotion/resolution path at all
+and is more PG-faithful besides (PG's `join_is_legal` always looks up
+`root->join_info_list` by relids — a stored per-node pointer is goopg's own
+convention, not PG's). (b) is probably the smaller, more principled fix;
+try it first. Either way, re-run the SAME per-query attribution method
+this task used (full sweep first, then a truncated-log single-query
+`psql -f query78.sql` pass) to confirm the fix turns Q78's 3 declines into
+3 accepts with a real `jointype=anti` DPPATH line, then re-run the full
+SF0.25 sweep to confirm no plan-shape regression elsewhere (Q78's own
+result must stay byte-identical to the oracle even if its search now
+enumerates a wider space — `PASS=96` must not move).
+
+Verification this loop: `scripts/tpcds-sf025-regression.sh sweep` PASS=96
+MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0 SKIP=3 (private `GOOPG_BIN`, no
+code change — recon only). No files under `internal/` changed; this task
+is instrumentation-only (the trace flag is a pre-existing, already-landed
+mechanism) plus a batch of `psql -f` runs against a private cluster.
+`tmp/goopg-sf025-trace-bin` and its throwaway data/log removed after the
+recon (not committed).
