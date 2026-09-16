@@ -4049,18 +4049,37 @@ cross-layer programme that has never been scoped.
   spotcheck SKIPPED (pre-existing M0142-0003k data-dir blocker, unrelated).
   Next: `-3i-plumbing-c2` (give the synthetic RHS leaf a real
   `rangeBinding`/`baseRelInfo` and grow `prob.bindings`/`scans`/`relInfos`).
-- [ ] **M0142-0008a-3i-plumbing-c2 — give the synthetic Semi/Anti RHS leaf a
+- [x] **M0142-0008a-3i-plumbing-c2 — give the synthetic Semi/Anti RHS leaf a
   `rangeBinding`/`baseRelInfo` and extend `prob.bindings`/`scans`/`relInfos`
-  to `nprefix+len(semiAnti)`** (design doc §36, gaps 2-3). The
-  `for i, b := range ctx.bindings[:nprefix]` loop
-  (`joinsearchseam.go:556-581`) currently drops `scans[nprefix:]` on the
-  floor entirely. `leafRel` (`relfromjoinlist.go:387-401`) only requires
-  `rel < len(prob.bindings)`, so a degenerate `rangeBinding{table: nil,
-  offset: cumOffsets[nprefix+k]}` is plumbing-feasible, but
-  `estimateBaseRelInfo` reads `binding.table` for `baseRows` and needs a
-  live Q78-shaped fixture check (not an assumption) that
-  `applyRelSizeFallback` produces a sane, non-zero row estimate for it —
-  costing feeds the DP tournament directly.
+  to `nprefix+len(semiAnti)`** (design doc §36, gaps 2-3). **DONE
+  2026-09-16 (design doc §38).** `joinsearchseam.go`'s leaf-building loop
+  now sizes `leaves`/`relInfos`/a new local `bindings` slice to
+  `nleaves := nprefix+len(semiAnti)` and fills index `nprefix+k` for each
+  `semiAnti[k]` (confirmed 1:1 by tracing `extractSearchLeaves`'s walk:
+  `scans[nprefix+k]` and `semiAnti[k]` are appended in the SAME case-branch
+  of the SAME walk step, and `unnestExistsExpr`'s always-wrap-the-whole-tree
+  shape (unnest.go:491) guarantees real leaves are walk-contiguous at
+  `[0,nprefix)` and synthetic ones at `[nprefix,nleaves)`, in `semiAnti`
+  order). The row-estimate trap this item flagged was real: a synthetic
+  leaf's `table == nil` binding fed through `estimateBaseRelInfo`/
+  `applyRelSizeFallback` bottoms out at `estimateTableRowsFallback`'s `if
+  tbl == nil { return 0 }` — a silent ZERO-row estimate, not a fallback. Sized
+  via `EstimateRows(Node)` instead (the same general-purpose estimator every
+  other non-base-relation node already uses). Also verified — not
+  assumed — that growing `prob.bindings` to `nleaves` ahead of
+  `-3i-plumbing-c3`'s matching `jl` growth does not trip
+  `validateJoinlistProblem`'s `jl.leafRange()` check on the SF0.25 corpus.
+  Verified via the full TPC-DS SF0.25 sweep (not just code trace):
+  `go build ./...` clean, `go test ./internal/optimizer/...` green,
+  `PASS=96 MISMATCH=0 CKMISMATCH=0 ERROR=0`, `PLAN-SHAPE: same=99 changed=0`
+  vs the immediately prior commit — Q78 (the query the b2/c1 notes name as
+  reaching the semiAnti arm) byte-identical (15 rows, same checksum).
+  TPC-H spotcheck SKIPPED (pre-existing M0142-0003k data-dir blocker,
+  unrelated). `RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh`
+  shows only the pre-existing unrelated `internal/parser`
+  `GroupedJoinUnaliased` AST-drift failure. Next: `-3i-plumbing-c3` (extend
+  the call-site-local `jl` so `validateJoinlistProblem` covers the grown
+  `nleaves` bindings end-to-end).
 - [ ] **M0142-0008a-3i-plumbing-c3 — build the call-site-local extended
   joinlist** (design doc §36, gap 4). `validateJoinlistProblem`
   (`relfromjoinlist.go:246-276`) hard-requires `jl.leafRange() == (0,

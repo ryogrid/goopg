@@ -567,8 +567,17 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 		conjuncts = append(conjuncts, splitAnd(lk.pred)...)
 	}
 	searchConjuncts, locals := partitionConjunctsForJoinPlanning(conjuncts, cumOffsets)
-	leaves := make([]Node, nprefix)
-	relInfos := make([]baseRelInfo, nprefix)
+	// M0142-0008a-3i-plumbing-c2 (design doc §36, gaps 2-3): `leaves`/
+	// `relInfos`/the bindings handed to the search all grow from `nprefix` to
+	// `nprefix+len(semiAnti)` — one extra slot per synthetic Semi/Anti RHS
+	// leaf, at the SAME walk position `extractSearchLeaves` gave it
+	// (`scans[nprefix:]`, in `semiAnti` order — both are appended in the same
+	// walk step, so position `nprefix+k` is `semiAnti[k]`'s own leaf).
+	nleaves := nprefix + len(semiAnti)
+	leaves := make([]Node, nleaves)
+	relInfos := make([]baseRelInfo, nleaves)
+	bindings := make([]rangeBinding, nleaves)
+	copy(bindings, ctx.bindings[:nprefix])
 	for i, b := range ctx.bindings[:nprefix] {
 		leaves[i] = scans[i]
 		var local Expr
@@ -593,6 +602,38 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 		// gate rather than by refusing to scale. See `applyRelSizeFallback`.
 		applyRelSizeFallback(&relInfos[i], b, scans[i], local, cat)
 	}
+	// A synthetic leaf has no `*catalog.Table` — it is an opaque, already-
+	// planned subtree (the Semi/Anti join's RHS), not a base relation — so
+	// `estimateBaseRelInfo`/`applyRelSizeFallback`'s catalog-stats path is
+	// the wrong tool: both read `binding.table`, and with it nil,
+	// `estimateTableRowsFallback` returns 0 outright (relsize.go), flooring
+	// the leaf at a ZERO row estimate rather than a sane fallback. `scan`
+	// itself is a real, already-sized plan subtree, so it is priced with
+	// `EstimateRows` — the same general-purpose estimator every other
+	// non-base-relation node (Join, Filter, Aggregate, …) already goes
+	// through — instead.
+	for k := range semiAnti {
+		i := nprefix + k
+		b := rangeBinding{offset: cumOffsets[i].lo}
+		bindings[i] = b
+		scan := scans[i]
+		leaves[i] = scan
+		var local Expr
+		if preds := locals.byBinding[i]; len(preds) > 0 {
+			local = combineAnd(preds)
+			localized := make([]Expr, 0, len(preds))
+			for _, p := range preds {
+				localized = append(localized, localizeExprToLeaf(p, b))
+			}
+			leaves[i] = &Filter{Child: scan, Predicate: combineAnd(localized), LeafLocal: true}
+		}
+		baseRows := EstimateRows(scan)
+		relInfos[i] = baseRelInfo{
+			bindingIdx:   i,
+			baseRows:     baseRows,
+			filteredRows: applyLocalFilterSelectivity(baseRows, b, scan, local),
+		}
+	}
 
 	// R21 slice 1 (plan-parity-fix-take2, K24): the search's own RelOptInfo
 	// now comes back instead of being discarded. Slice 1 CARRIES it only —
@@ -600,7 +641,7 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 	// partial aggregation see `PartialPathlist` (K23) and the grouping/window
 	// stages see `Pathkeys` (K12 slice B).
 	searched, _, err := planJoinlistSearch(jl, &joinlistProblem{
-		bindings:   ctx.bindings[:nprefix],
+		bindings:   bindings,
 		scans:      leaves,
 		relInfos:   relInfos,
 		conjuncts:  searchConjuncts,

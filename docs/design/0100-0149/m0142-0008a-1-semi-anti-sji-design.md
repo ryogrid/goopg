@@ -4267,3 +4267,82 @@ Next pickup: `-3i-plumbing-c2` — give the synthetic Semi/Anti RHS leaf a real
 actually starts to move plan shapes, so it needs its own dedicated loop with
 a live Q78-shaped fixture check on the resulting row estimate — not assumed
 correct the way c1's inertness could be fully derived from the code alone.
+
+## 38. `M0142-0008a-3i-plumbing-c2` — landed, verified inert (surprise: even
+    growing `prob.bindings` did not flip any plan)
+
+`joinsearchseam.go`'s leaf-building loop (formerly `for i, b := range
+ctx.bindings[:nprefix]`, sizing `leaves`/`relInfos` to `nprefix`) now sizes
+all three of `leaves`, `relInfos`, and a new local `bindings` slice to
+`nleaves := nprefix+len(semiAnti)`, then runs a second loop over `semiAnti`
+that fills index `nprefix+k` for each `semiAnti[k]`. `scans[nprefix+k]` is
+the correct leaf for `semiAnti[k]`: `extractSearchLeaves` appends a
+semiAnti link's RHS scan (`scans = append(scans, j.Right)`) and its
+`semiAntiChainLink` entry in the SAME case-branch of the SAME walk step
+(joinsearchseam.go's `walk` closure), so position `nprefix+k` in `scans` and
+element `k` of `semiAnti` are always the same leaf — confirmed by tracing
+`unnestExistsExpr`'s call site (unnest.go:491): each newly-unnested EXISTS
+wraps the ENTIRE accumulated tree so far as `j.Left` and the new correlated
+subquery as `j.Right`, so a DFS walk always visits every real leaf and every
+earlier synthetic leaf (all inside `j.Left`) before appending the new
+leaf — real leaves are walk-contiguous at `[0,nprefix)` and synthetic ones
+are walk-contiguous at `[nprefix,nleaves)`, in `semiAnti` order, for both a
+single EXISTS and nested (multi-EXISTS) unnesting alike.
+
+**The row-estimate trap this loop's task description specifically flagged
+was real, not hypothetical.** A synthetic leaf's degenerate binding has
+`table == nil` (it is an opaque already-planned subtree, not a base
+relation). Feeding that straight through `estimateBaseRelInfo`/
+`applyRelSizeFallback` — both read `binding.table` — bottoms out at
+`estimateTableRowsFallback` (relsize.go:571), whose first line is `if tbl ==
+nil || tbl.Virtual { return 0 }`: a **silent zero-row estimate**, not a sane
+fallback, which would have handed the DP tournament a free-looking synthetic
+leaf. The fix uses the general-purpose `EstimateRows(Node)` (cardinality.go)
+instead — the same estimator every other non-base-relation plan node
+(`*Join`, `*Filter`, `*Aggregate`, `*CTEScan`, …) already goes through — to
+size `scans[nprefix+k]` directly from its own already-built subtree, then
+still routes local-filter selectivity through the existing
+`applyLocalFilterSelectivity` (mirroring the real-leaf loop) for the case —
+believed unreachable today, since no other conjunct can bind to a synthetic
+leaf's bit alone before c4/c5 land, but wired for symmetry rather than
+assumed away.
+
+**The `prob.bindings` growth risk this loop weighed before writing code:**
+`validateJoinlistProblem` (relfromjoinlist.go:246) hard-requires
+`jl.leafRange() == (0, len(prob.bindings))`, and `jl` is NOT extended by this
+task (that is c3's job, filed separately). Growing `prob.bindings` to
+`nleaves` while `jl` still only covers `[0,nprefix)` therefore looked, by
+code inspection alone, like it should flip `validateJoinlistProblem` from
+pass to fail for the one class of statement this matters for (`semiAnti`
+non-empty) — turning a search that (per the b2/c1 landing notes) currently
+runs to completion, mishandling the semiAnti predicate but still producing a
+plan, into an outright decline that falls back to the pre-DP-search
+syntactic-tree path. That would not be "inert" the way c1 was, so this was
+not assumed away: the TPC-DS SF0.25 sweep was run and checked specifically
+for a shape change on Q78 (the one query these landing notes have
+consistently named as reaching the semiAnti arm at all, per b2's "implausibly
+cheap EXPLAIN cost" finding).
+
+**Empirical result: no shape change, anywhere.** `go build ./...` clean;
+`go test ./internal/optimizer/...` green; TPC-DS SF0.25 sweep
+`PASS=96 (60 ck-verified, 36 ck=n/a) MISMATCH=0 CKMISMATCH=0 ERROR=0`,
+`PLAN-SHAPE: queries=99 same=99 changed=0 added=0 removed=0` against the
+immediately prior commit (`ae557bf10`, the c1 landing) — Q78 itself unchanged
+(15 rows, checksum `c06cf981a7819a37`, identical to the c1-era capture).
+TPC-H spotcheck SKIPPED (pre-existing M0142-0003k data-dir blocker,
+unrelated). The likely reading (not chased further — out of this task's
+scope): the SF0.25 corpus's one semiAnti-reaching query shape does not
+actually make it past some OTHER earlier decline point in
+`tryPGShapedJoinSearch` before reaching this loop at all (candidates: the
+`chainCarriesLateral`/`pgShapedOffsetChecksOK` gates, or `jl` construction
+upstream already excluding it some other way) — c3 is still needed before
+`validateJoinlistProblem`'s check is verified to pass end-to-end for a
+statement that DOES reach this far with `len(prob.bindings) == nleaves`, and
+should re-run this same Q78 checksum/shape comparison as its own gate rather
+than trusting this loop's absence-of-regression as proof the c2+c3 pairing
+works.
+
+Next pickup: `-3i-plumbing-c3` — build the call-site-local extended
+joinlist (`jl`) so `validateJoinlistProblem`'s `jl.leafRange() ==
+(0,len(prob.bindings))` check actually covers the grown `nleaves` bindings
+this loop introduced (design doc §36, gap 4; `relfromjoinlist.go:246-276`).
