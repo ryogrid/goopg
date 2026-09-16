@@ -429,3 +429,79 @@ plan-compare re-check in §4.3 is still the gate that decides whether that
 conservative costing is tight enough to win the `addPath` competition against
 the existing nested-loop paths for each census query — this trace-through
 answers "is it safe to build the path", not "will the cost model pick it".
+
+## 6. Section 4.3 gate re-run — TPC-DS half of the 8-query census (2026-09-16)
+
+§4.3 said: re-run plan-compare for the census and confirm, per query, whether
+semi/anti placement/algorithm is the ONLY PG divergence, before -2/-3 start.
+This loop ran that check for the 5 TPC-DS queries (query10/16/35/69/94);
+**TPC-H's 3 (Q4/Q21/Q22) remain unmeasurable** — the shared `:65433` bench
+cluster's `tpch` database still holds only the M0142-0003j/-0003k scratch
+tables (re-confirmed live this loop: `\dt` lists `agg_data`, `lrs_acct`, …,
+zero TPC-H tables), and the reload is still blocked on the human-authorized
+shared-cluster-write decision. Method: `bench/tpcds/server.sh start sf1 pg`,
+one warm-ANALYZE'd goopg session (per-connection stats, same protocol as
+`cmd/estimate-audit`) plus one plain PG session (global stats), plain
+`EXPLAIN` (no `ANALYZE` execution needed for a shape comparison) on all 5
+queries both sides, `max_parallel_workers_per_gather = 2` pinned identically.
+Result files: `tmp/m0142-0008a-census/{goopg,pg}_explains.txt`. Also ran every
+query for real on both engines to rule out a correctness gap riding along
+with the shape diff — **all 5 results matched PG exactly** (Q10/Q16/Q69/Q94
+row-for-row identical; Q35's few cosmetic `0` vs `0.00000000000000000000`
+numeric-display and `char(N)` trailing-space diffs are pre-existing, unrelated
+formatting, not new).
+
+**First, a correction to the premise this whole census carried since
+M0142-0008a**: goopg does *not* currently plan these 5 queries through
+nested-loop-only paths waiting on a hash-decline gate. `unnestExistsExpr`'s
+S5a hand-built nodes (§0/§5) already choose **Hash** Semi/Anti unconditionally
+for every one of the 5 — the census's original framing ("goopg loses the
+Hash-vs-NLI competition because Hash is declined") doesn't describe what's on
+disk. The real, verified mechanism is the mirror image: **`unnestExistsExpr`
+hardcodes `Algo: JoinAlgoHash` with no cost comparison against NLI at all**
+(§0/§5's own citations, `unnest.go:3200-3208, 3335-3342, 4383-4399`) — there
+is currently no competition to lose or win; Hash is simply the only option
+this producer ever emits. That is exactly the wiring gap -2/-3 target (give
+the DP search the participant so `addPath` can cost-compare Hash against NLI
+instead of one producer picking unconditionally), so the census's target
+mechanism is still correct even though its stated symptom was backwards.
+
+**Per-query verdict** (PG shape vs. goopg shape, both `EXPLAIN`-only, no `.txt`
+reproduced inline — see the capture files):
+
+| query | goopg (today) | PG 18.3 | isolated to semi/anti placement/algorithm? |
+|---|---|---|---|
+| **Q10** | `Hash Semi Join` (customer⋈store_sales) with the two OR'd EXISTS (web_sales/catalog_sales) as hashed `SubPlan`s in a residual `Filter` | **No semi-join node at all** — `HashAggregate` de-duplicates `store_sales.ss_customer_sk`, then `Nested Loop` probes `customer_pkey` by that unique set, with the OR'd EXISTS as hashed `SubPlan` filters on the *index probe* | **NO.** PG used `create_unique_path` (semi-join → uniquify + inner join), a distinct path-generation strategy §3.4/finding 5 named but that neither -2 nor -3 build. Lifting the hash-decline gate and wiring DP participation cannot reach this shape — a different, currently-unfiled mechanism would be needed. |
+| **Q16** | `Hash Anti Join(Hash Semi Join(...))`, hardcoded Hash throughout | `Nested Loop Semi Join(Nested Loop Anti Join(...))`, fully index-driven (`catalog_returns_pkey`, `date_dim_pkey`) | **Plausibly yes** — placement (nesting order: Anti-over-Semi in both) already matches; only the per-join algorithm (Hash vs indexed NLI) differs, which is precisely what cost-competing via DP-search participation would let goopg's own cost model decide. (See also the EXPLAIN cosmetic bug noted below, found on this query — execution itself is unaffected: goopg's result matches PG exactly.) |
+| **Q35** | Same `Hash Semi Join` shape as Q10 | Same `create_unique_path` shape as Q10, **plus** an `Incremental Sort` at the top (`Presorted Key: ca.ca_state`) | **NO** — entangled with Q10's create_unique_path gap *and* a second, already-filed, unrelated gap (M0141-S7 Incremental Sort). Neither is in -2/-3's scope. |
+| **Q69** | `Hash Anti(Hash Anti(Hash Semi(...)))`, uniform Hash | `Nested Loop Anti(Nested Loop Anti(Parallel **Hash** Semi Join(...)))` — PG itself picks Hash for the innermost EXISTS (`ss_customer_sk`, same as goopg) and NLI only for the two outer NOT EXISTS | **YES — cleanest of the 5.** Nesting order matches goopg's exactly (Anti(Anti(Semi))); PG even agrees with goopg's Hash choice for one of the three joins. The only divergence is per-predicate algorithm choice on the other two, which is exactly the cost-competition -2/-3 would introduce. |
+| **Q94** | `Hash Anti(Hash Semi(...))`, hardcoded Hash | `Nested Loop Anti(Nested Loop Semi(...))`, fully index-driven | Same read as Q16: placement matches, algorithm differs, same EXPLAIN cosmetic bug present (see below). |
+
+**Verdict on the reopen criterion**: **3 of 5 (Q16, Q69, Q94) support it**
+(divergence isolated to semi/anti algorithm choice, which -2/-3 targets); **2
+of 5 (Q10, Q35) do not** — both need PG's `create_unique_path` strategy, a
+mechanism outside -2/-3's scope entirely, and Q35 separately needs M0141-S7.
+This is a **partial, not a blocking, confirmation**: unlike the 2026-07-21
+`csq-R2` deferral (low measured prize, bushy-reorder regression precedent),
+here a majority of the measured sample directly supports proceeding, and the
+2 that don't fail for a *different*, independently-nameable reason rather than
+undermining the mechanism itself. **Recommendation: M0142-0008a-2 is cleared
+to start.** `create_unique_path` needs its own scoping recon, filed as
+**M0142-0008c** (fix_plan.md) since it is a materially different, previously
+uncensused mechanism (a new *Path*-generation strategy, not a join-algorithm
+choice within an existing one).
+
+**Incidental discovery, not part of the semi/anti question**: both Q16 and
+Q94's goopg `EXPLAIN` output mislabels the *outer*, correlated relation's
+alias in the innermost `Hash Cond`/`Join Filter` lines — Q16 prints
+`Hash Cond: (cs2.cs_order_number = cs2.cs_order_number)` where the real SQL
+correlates `cs1.cs_order_number = cs2.cs_order_number` (`cs1`/`cs2` both alias
+`catalog_sales`; the outer `cs1` is mislabeled `cs2`, colliding with the
+genuinely-inner `cs2` printed two lines below it), and Q94 does the
+identical thing with `ws1`/`ws2`. **Verified execution-only cosmetic**: both
+queries' actual results match PG row-for-row, so the join itself resolves the
+correct columns — only the plan-printer's alias resolution for a
+self-correlated EXISTS where inner and outer share a table is wrong. Filed as
+**M0142-0008d** (fix_plan.md) since a wrong alias in EXPLAIN is a real,
+user-visible PG-compatibility defect (a DBA reading this plan sees the wrong
+join key) even though it never reaches execution.

@@ -3419,10 +3419,55 @@ cross-layer programme that has never been scoped.
     yet known. This is the slice that can actually move TPC-DS
     query10/16/35/69/94 and TPC-H Q4/Q21's plan shapes. Gated on
     M0142-0008a-2; re-confirm the §4.3 plan-compare gate first.
+    **§4.3 gate re-run DONE 2026-09-16 (design doc §6, TPC-DS half only —
+    TPC-H's Q4/Q21/Q22 remain unmeasurable, `:65433`'s `tpch` DB still holds
+    only M0142-0003k's scratch tables).** Corrects the census's own premise:
+    goopg is not losing a Hash-vs-NLI competition on these 5 queries today —
+    `unnestExistsExpr` hardcodes `Algo:Hash` unconditionally, so there is
+    currently no competition to lose. 3/5 (Q16/Q69/Q94) show the PG
+    divergence isolated to semi/anti algorithm choice (placement/nesting
+    order already matches PG in all three) — **this clears M0142-0008a-2 to
+    start.** 2/5 (Q10/Q35) instead need PG's `create_unique_path`
+    uniquify-then-inner-join strategy, a materially different mechanism -2/-3
+    do not build — filed separately as **M0142-0008c** (below), not a reason
+    to decline -2/-3. Also incidentally found an EXPLAIN alias-mislabeling
+    cosmetic bug on Q16/Q94 (execution-verified correct, display-only) —
+    filed as **M0142-0008d** (below).
   **Independent, unfiled resume-point hint** (not sized/numbered — noted for
   whoever picks up S5a's own eligibility gate): relaxing
   `whereEligibleForPreDPUnnest` to per-sublink granularity would upgrade
   Q22 out of its total-bypass class on its own, independent of -1..-3.
+- [ ] **M0142-0008c — scoping recon: does goopg need PG's `create_unique_path`
+  (semi-join → de-duplicate RHS + inner join) to reach parity on TPC-DS
+  Q10/Q35?** — filed by M0142-0008a-3(iii)'s §4.3 gate re-run (design doc §6).
+  PG's chosen plan for both queries has **no semi-join node at all**: a
+  `HashAggregate` de-duplicates the correlated column (`store_sales.ss_customer_sk`)
+  and a `Nested Loop` then probes `customer_pkey` by that unique set, with the
+  OR'd EXISTS predicates evaluated as hashed `SubPlan` filters on the index
+  probe — PG's own `create_unique_path`/`create_unique_paths` mechanism, cited
+  but explicitly out of scope in §3.4/finding 5. Goopg's DP search does not
+  implement an equivalent path-generation strategy today. Resume point: read
+  PG's `create_unique_path` (`postgres/src/backend/optimizer/path/allpaths.c`,
+  grep `create_unique_path`) and size whether adding it as a competing
+  `addPath` candidate for a pinned SEMI join is a K24-class "materially larger
+  task" (like -0008a itself was) before doing anything else. Captures:
+  `tmp/m0142-0008a-census/{goopg,pg}_explains.txt` (Q10/Q35 sections).
+- [ ] **M0142-0008d — EXPLAIN mislabels the outer relation's alias in a
+  self-correlated EXISTS where inner and outer share a table name** — filed
+  by M0142-0008a-3(iii)'s §4.3 gate re-run (design doc §6). TPC-DS Q16/Q94
+  both correlate `outer_alias.col = inner_alias.col` on the SAME base table
+  (`catalog_sales cs1`/`cs2`, `web_sales ws1`/`ws2`); goopg's `EXPLAIN` prints
+  the OUTER relation's column with the INNER alias in the `Hash Cond`/`Join
+  Filter` lines (e.g. `Hash Cond: (cs2.cs_order_number = cs2.cs_order_number)`
+  where the real predicate is `cs1.cs_order_number = cs2.cs_order_number`) —
+  a real user-visible PG-compatibility defect (a DBA reading the plan sees
+  the wrong join key) even though **execution is unaffected**: both queries'
+  actual results match PG row-for-row (verified this loop). Resume point:
+  the plan-printer's column-to-RTE alias resolution for a correlated
+  subquery's outer reference, likely in the `unnestExistsExpr`/`predp.go`
+  lowering path where the outer reference gets rebound to the subquery's own
+  RTE numbering. Captures: `tmp/m0142-0008a-census/goopg_explains.txt`
+  (Q16/Q94 sections).
 - [x] **M0142-0008b — scoping recon: measure the blast radius of widening
   the DP-search gate to filterless INNER/CROSS trees** — filed by
   M0142-0008. `planner.go:1590-94`'s own comment already names the fix
