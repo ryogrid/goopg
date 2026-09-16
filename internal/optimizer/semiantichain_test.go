@@ -322,6 +322,78 @@ func TestExtractSearchLeaves_AdmitSemiAnti_FoldsKeyEquijoinIntoPred(t *testing.T
 	}
 }
 
+// TestExtractSearchLeaves_AdmitSemiAnti_ChainedLinksRebaseInnerKeyCorrectly
+// pins the c7 fix (design doc §41.3): TWO semiAnti links chained over the
+// same outer (Q69's pattern — three EXISTS/NOT EXISTS conjuncts over one
+// outer, here reduced to the minimal two-link case) must each resolve their
+// own equijoin's INNER operand to their OWN opaque leaf, not to an earlier
+// sibling link's leaf. `rebaseChainQual`'s single additive `base` gets the
+// FIRST (unchained) link right by construction but silently mis-shifts the
+// SECOND link's inner operand into the first link's leaf range, since
+// unnestExistsExpr's RightKey.Index (`outerWidth + subcol`, unnest.go:4694)
+// is encoded relative to the SEMANTIC outer width
+// (`len(j.Left.Output())`), not the walk's own flat leaf count — the two
+// diverge exactly when `j.Left` already has an earlier chained link's
+// opaque leaf spliced into it, which is the second link's situation here.
+// Before the fix, `semiAntiOnQualsOK` declines (the inner operand doesn't
+// overlap `rhs`) — the exact `overlapR=false` symptom the design doc's
+// throwaway Q69 instrumentation measured.
+func TestExtractSearchLeaves_AdmitSemiAnti_ChainedLinksRebaseInnerKeyCorrectly(t *testing.T) {
+	cat := analyzedThreeTablesCatalog(t)
+	sql := "SELECT x FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.z = t1.x) " +
+		"AND EXISTS (SELECT 1 FROM t3 WHERE t3.a = t1.x)"
+	node, err := Plan(parseOne(t, sql), cat)
+	if err != nil {
+		t.Fatal(err)
+	}
+	j := findFirstJoinByType(node, JoinTypeSemi)
+	if j == nil {
+		t.Fatalf("no JoinTypeSemi found: %s", planString(node))
+	}
+	inner, isJoin := j.Left.(*Join)
+	if !isJoin || inner.Type != JoinTypeSemi {
+		t.Fatalf("j.Left = %T, want a chained *Join{Type:Semi} (the FIRST EXISTS's link) — fixture shape drifted from the expected chained tree: %s", j.Left, planString(node))
+	}
+
+	scans, widths, _, _, semiAnti, ok := extractSearchLeaves(j, true)
+	if !ok {
+		t.Fatalf("extractSearchLeaves(j, true) ok=false, want true: %s", planString(node))
+	}
+	if len(scans) != 3 {
+		t.Fatalf("scans = %d leaves, want 3 (t1, RHS1, RHS2): widths=%v", len(scans), widths)
+	}
+	if len(semiAnti) != 2 {
+		t.Fatalf("semiAnti = %d links, want exactly 2 (chained): %+v", len(semiAnti), semiAnti)
+	}
+
+	link1, link2 := semiAnti[0], semiAnti[1]
+	wantLHS1, wantRHS1 := leafRangeRelSet(0, 1), leafRangeRelSet(1, 2)
+	if link1.lhs != wantLHS1 || link1.rhs != wantRHS1 {
+		t.Errorf("semiAnti[0] = {lhs:%#x, rhs:%#x}, want {lhs:%#x, rhs:%#x}", link1.lhs, link1.rhs, wantLHS1, wantRHS1)
+	}
+	wantLHS2, wantRHS2 := leafRangeRelSet(0, 2), leafRangeRelSet(2, 3)
+	if link2.lhs != wantLHS2 || link2.rhs != wantRHS2 {
+		t.Errorf("semiAnti[1] = {lhs:%#x, rhs:%#x}, want {lhs:%#x, rhs:%#x}", link2.lhs, link2.rhs, wantLHS2, wantRHS2)
+	}
+
+	cumOffsets := buildLeafSpans(widths, semiAnti)
+	// The load-bearing assertion: before c7, link2's folded equality
+	// resolves its inner operand into leaf 1 (link1's own opaque leaf)
+	// instead of leaf 2 (link2's own), so `relidsOfExpr` lands OUTSIDE
+	// `link2.rhs` and this declines.
+	for i, lk := range []semiAntiChainLink{link1, link2} {
+		for _, c := range splitAnd(lk.pred) {
+			rs, ok := relidsOfExpr(c, cumOffsets)
+			if !ok || !relsOverlap(rs, lk.rhs) {
+				t.Errorf("semiAnti[%d] conjunct %#v: relidsOfExpr = %#x (ok=%v), want overlap with rhs=%#x", i, c, rs, ok, lk.rhs)
+			}
+		}
+	}
+	if !semiAntiOnQualsOK(semiAnti, cumOffsets) {
+		t.Errorf("semiAntiOnQualsOK(semiAnti, cumOffsets) = false, want true — both chained links' quals must resolve within their own {lhs,rhs}")
+	}
+}
+
 // TestExtractSearchLeaves_AdmitSemiAntiFalse_UnchangedFromProduction proves
 // the scaffold is inert exactly as design doc §22.4 requires: with
 // `admitSemiAnti=false` (the literal value the ONE production call site

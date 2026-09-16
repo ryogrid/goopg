@@ -1294,6 +1294,19 @@ func extractSearchLeaves(node Node, admitSemiAnti bool) (scans []Node, widths []
 				return 0, false
 			}
 			loRight := len(scans)
+			// c7 (design doc §41.3): `rightBase` is the flat-space position
+			// where j.Right's own opaque leaf starts, and `outerWidth` is
+			// the SEMANTIC width unnestExistsExpr used to build LeftKey/
+			// RightKey/Predicate (unnest.go:4694, len(j.Left.Output()) at
+			// synthesis time). The two diverge whenever j.Left already has
+			// an earlier chained semiAnti link's opaque RHS leaf spliced
+			// into it: `width` (the walk's flat leaf count) then counts
+			// that extra leaf too, so `rightBase > base + outerWidth`.
+			// `rebaseSemiAntiChainQual` needs both to shift the outer and
+			// inner operands by different deltas; a single `rebaseChainQual`
+			// call (one additive `base`) is only correct when they coincide.
+			outerWidth := len(j.Left.Output())
+			rightBase := width
 			// j.Right as ONE opaque leaf — the same append path the
 			// "not an admitted join type" branch below uses for any other
 			// non-reorderable node.
@@ -1323,8 +1336,8 @@ func extractSearchLeaves(node Node, admitSemiAnti bool) (scans []Node, widths []
 				}
 				pred = combineAnd(conjuncts)
 			}
-			if pred != nil && base != 0 {
-				shifted, okShift := rebaseChainQual(pred, base)
+			if pred != nil {
+				shifted, okShift := rebaseSemiAntiChainQual(pred, outerWidth, base, rightBase)
 				if !okShift {
 					return 0, false
 				}
@@ -1620,6 +1633,52 @@ func rebaseChainQual(e Expr, delta int) (Expr, bool) {
 		Rewrite: func(x Expr) Expr {
 			if cr, isCol := x.(*ColumnRef); isCol {
 				cr.Index += delta
+			}
+			return x
+		},
+	})
+	if !ok {
+		return nil, false
+	}
+	return out, true
+}
+
+// rebaseSemiAntiChainQual re-expresses a semi/anti chain link's qual (the
+// folded LeftKey=RightKey equality plus any lifted Predicate residual) from
+// unnestExistsExpr's own MIXED convention into the walk's flat leaf-index
+// space. unnestExistsExpr writes the outer operand of every ColumnRef
+// 0-based in the outer's OWN schema and the inner operand as
+// `outerWidth + subcol` (unnest.go:4694, `outerWidth = len(j.Left.Output())`
+// at synthesis time) — a single hash-joined padded row convention, not a
+// flat-leaf one.
+//
+// `rebaseChainQual`'s single additive `delta` is only a correct translation
+// of that convention when `j.Left` contributes exactly `outerWidth` flat
+// leaves to the walk, i.e. an UNCHAINED link. For a chained link — a later
+// semiAnti link whose `j.Left` already has an earlier link's opaque RHS leaf
+// spliced into it (c7, design doc §41.3) — the walk counts MORE flat leaves
+// under `j.Left` than `outerWidth` (the extra sibling leaf), so the outer
+// operand must still shift by `base` (the true original outer's leaves are
+// always the FIRST leaves the walk appends under `j.Left`, chained or not)
+// while the inner operand must shift to `rightBase + (cr.Index - outerWidth)`
+// instead — `rightBase` is the flat-space position where `j.Right`'s own
+// opaque leaf starts, which already absorbs any extra sibling leaves via
+// the walk's own leaf count.
+func rebaseSemiAntiChainQual(e Expr, outerWidth, base, rightBase int) (Expr, bool) {
+	if e == nil {
+		return nil, true
+	}
+	if base == 0 && rightBase == outerWidth {
+		return e, true
+	}
+	out, ok := cloneExprRefs(e, scopeVeto, exprRewriter{
+		Rewrite: func(x Expr) Expr {
+			if cr, isCol := x.(*ColumnRef); isCol {
+				if cr.Index < outerWidth {
+					cr.Index += base
+				} else {
+					cr.Index = rightBase + (cr.Index - outerWidth)
+				}
 			}
 			return x
 		},

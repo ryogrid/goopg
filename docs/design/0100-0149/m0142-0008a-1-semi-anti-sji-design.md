@@ -4692,3 +4692,148 @@ presumably Q10/Q35 once whatever declines them earlier is separately
 fixed) are NOT affected by this specific bug — it only manifests when a
 second (or later) chained link's inner key coordinate is computed relative
 to an `outerChild` that already has an earlier sibling link spliced into it.
+
+## 42. `-3i-plumbing-c7` landed — chained-link inner-key rebase fixed; the next blocker is a pre-existing guard that is over-broad for a semiAnti RHS leaf (2026-09-17)
+
+### 42.1 The fix
+
+`extractSearchLeaves`'s semiAnti walk arm (joinsearchseam.go, inside
+`walk`) now captures two more values right before appending `j.Right` as
+the opaque leaf: `outerWidth := len(j.Left.Output())` (the SEMANTIC width
+`unnestExistsExpr` used when it built `LeftKey`/`RightKey`/`Predicate` —
+unnest.go:4694/4762, always `len(outerChild.Output())` at synthesis time)
+and `rightBase := width` (the walk's own flat-leaf-space position where
+`j.Right`'s opaque leaf is about to start). The single `rebaseChainQual(pred,
+base)` call is replaced with a new `rebaseSemiAntiChainQual(pred,
+outerWidth, base, rightBase)`, which rewrites each `ColumnRef` in `pred`
+piecewise instead of by one uniform `+= base`:
+
+- `cr.Index < outerWidth` (the OUTER operand, 0-based in the true original
+  outer's own schema per `unnest.go`'s convention): shift by `base`, same
+  as before — the true original outer's leaves are always the FIRST leaves
+  the walk appends under `j.Left`, chained or not, so this half of the old
+  code was already correct.
+- `cr.Index >= outerWidth` (the INNER operand, encoded as `outerWidth +
+  subcol`): shift to `rightBase + (cr.Index - outerWidth)` instead — the
+  flat-space position of `j.Right`'s own leaf, plus the inner column's
+  local offset.
+
+The two shifts coincide (`rightBase == base + outerWidth`) exactly when
+`j.Left` contributes NO extra flat leaves beyond `outerWidth` — the
+unchained case, where `rebaseSemiAntiChainQual` is a no-op fast path
+(`base == 0 && rightBase == outerWidth`) identical to the old skip-if-`base
+!= 0` behavior. They diverge whenever `j.Left` is itself a chained semiAnti
+link: the walk recurses into it and appends its own opaque RHS leaf, so the
+flat leaf count under `j.Left` (`rightBase - base`) exceeds `outerWidth` by
+exactly that extra leaf's width — which is precisely Q69's second (and
+third) EXISTS link's situation, and exactly the gap `-3i-plumbing-c6`'s
+§41.3 root-caused via throwaway instrumentation.
+
+### 42.2 Verification
+
+`go build ./...` clean; `go test ./internal/optimizer/...` green, including
+a NEW regression test,
+`TestExtractSearchLeaves_AdmitSemiAnti_ChainedLinksRebaseInnerKeyCorrectly`
+(semiantichain_test.go) — a two-link chained fixture (`t1` outer, two
+independent single-table `EXISTS` bodies over `t2`/`t3`) that asserts both
+links' folded equality resolves within their own `{lhs,rhs}` via
+`relidsOfExpr`/`relsOverlap`, then calls `semiAntiOnQualsOK` end to end.
+Verified this test is a REAL pin, not a tautology: temporarily reverted
+just the `rebaseSemiAntiChainQual` call to the old uniform
+`rebaseChainQual(pred, base)` (kept `outerWidth`/`rightBase` declared but
+blanked to keep the build compiling) and re-ran — the test FAILS with
+`relidsOfExpr = 0x3 (bits {0,1}), want overlap with rhs=0x4 (bit {2})`,
+i.e. the second link's inner operand lands in leaf 1 (the first link's own
+opaque leaf) instead of leaf 2 (its own) — the same `overlapR=false`
+symptom §41.3's Q69 instrumentation measured, reproduced here in a minimal,
+permanent, checked-in fixture instead of a throwaway debug print. Reverted
+back to the real fix before commit; full suite re-confirmed green.
+
+Full-corpus `GOOPG_PGSHAPED_DP_TRACE=1` sweep (private binary
+`tmp/goopg-m0142-c7-bin`, sf025 log truncated before each pass): 96/100
+EXPLAINs succeeded (same 4 pre-existing unrelated parse gaps). `DPPATH`
+count 150,137 (stable vs the pre-c6 baseline — c6's own +34,567 delta was
+specific to reaching `semianti-on-qual` at all; once c7 lets that gate
+pass, the combo declines one gate later inside `searchOneProblem` before
+generating as many candidate paths, per §42.3, so the aggregate count
+alone is not read as a progress signal by itself — the decline-reason
+table is). Still **ZERO** `jointype=semi`/`anti` DPPATH lines. Decline
+reasons, `seam-decline` lines only:
+
+| reason | before (c6, §41.2) | after (c7, this loop) |
+|---|---|---|
+| `semianti-link-no-sjinfo` | 3 (nrels=2 only) | 3 (nrels=2 only, unchanged) |
+| `semianti-on-qual` | 1 (nrels=3, pinned to Q69) | **0** |
+
+A per-query isolation pass on Q69 alone (fresh-truncated log, single
+`EXPLAIN`) confirms `reason=semianti-on-qual` never appears — Q69's chain
+now clears BOTH semiAnti gates — and shows exactly one NEW seam-decline,
+`reason=outer-over-derived nrels=6`, root-caused in §42.3.
+
+TPC-DS SF0.25 sweep at the new HEAD: `PASS=96 (60 ck-verified, 36 ck=n/a)
+MISMATCH=0 CKMISMATCH=0 ERROR=0`, `PLAN-SHAPE: queries=99 same=99
+changed=0 added=0 removed=0` against the c6 commit — Q78 still
+byte-identical (15 rows, checksum `c06cf981a7819a37`, unchanged across
+every c2-c7 loop); Q69 unaffected in output (`ck=n/a`, 100 rows, a
+saturated `LIMIT` — this fix cannot yet change Q69's chosen plan since a
+later gate still declines it, per §42.3).
+
+### 42.3 Root cause of the NEXT blocker: `problemPairsOuterWithDerived` treats a semiAnti RHS leaf's `nil` `baseRelInfo.table` as "no statistics," which is true of a genuine CTE/subquery but NOT of a multi-relation EXISTS body
+
+Q69's isolated run's one `seam-decline` line reads `reason=outer-over-derived
+nrels=6`, traced from `relfromjoinlist.go:665` — inside `searchOneProblem`,
+a LATER stage of the same PG-shaped pipeline that runs only after
+`tryPGShapedJoinSearch`'s own admission gates (leaf-count,
+`semianti-link-no-sjinfo`, `semianti-on-qual`) all pass. This is why it was
+never visible before c7: Q69 never reached this far.
+
+`problemPairsOuterWithDerived` (relfromjoinlist.go:564, C-04a's Q78 fix —
+see the function's own doc comment) declines a problem whenever an OUTER
+hand of some `SpecialJoinInfo` in scope touches an item classified
+"derived" by `leafIsDerivedInput` (:523). That classifier descends through
+`*Filter`/`*Project` wrappers to the underlying scan node, and returns true
+for `*CTEScan`/`*WorkTableScan` OR whenever `info.table == nil`. The
+function's `switch sj.Jointype` arm already includes `parser.JoinSemi,
+parser.JoinAnti` alongside `Left/Right/Full` — deliberately, per
+`TestProblemPairsOuterWithDerivedSemiOverDerived`/`...AntiOverDerived`
+(semiantichain_test.go:140/154), which pin a Semi/Anti RHS touching a CTE
+as correctly declined, same as an outer join.
+
+The gap: `baseRelInfo.table` is nil not only for a genuine CTE/subquery
+(which truly has no base-table statistics, the C-04a hazard) but for ANY
+leaf built from more than one base table — including a semiAnti's own
+opaque RHS leaf whenever the EXISTS/NOT EXISTS body joins ≥2 relations
+(Q69's `store_sales JOIN date_dim` / `web_sales JOIN date_dim` / `catalog_sales
+JOIN date_dim`, each wrapped as one opaque `*Project{*Join{...}}` leaf by
+the walk — §12.4/§13's finding that this shape is `*Project` over a real
+`*Join`, not a CTE). That opaque leaf's row estimate is NOT a defaulted
+guess: it comes from the already-cost-estimated join subplan underneath,
+the same subplan `unnestExistsExpr` spliced in wholesale. `leafIsDerivedInput`
+cannot currently tell the difference — it only asks "is there a single
+base table," not "does this leaf's estimate rest on real statistics" —
+so it misclassifies every multi-relation EXISTS/NOT-EXISTS body as
+`derived`, and every semiAnti chain whose RHS is multi-relation trips this
+guard once it reaches `searchOneProblem`.
+
+This also explains why Q78 (single-table EXISTS body — `t2` alone, or
+TPC-DS's own single-relation EXISTS shape) stays unaffected end to end:
+its RHS leaf descends to an actual base-table scan with a real
+`info.table`, so `leafIsDerivedInput` returns false and this specific guard
+never fires for it — Q78's continued byte-identical plan is explained by
+some OTHER, not-yet-found gate declining it (still open, not this one).
+
+Filed below as `-3i-plumbing-c8`. Candidate fix directions (not
+implemented this loop): (a) give `leafIsDerivedInput` a THIRD signal
+distinguishing "provably no stats" (CTE/subquery/function-scan) from
+"multi-relation subtree with real per-child stats" (a semiAnti RHS leaf,
+or any opaque join leaf built by this package's own rewrites) — e.g. read
+whether the leaf's `Node.EstimateRows()` traces back to a non-default
+value rather than keying on `.table == nil`; (b) narrow
+`problemPairsOuterWithDerived`'s Semi/Anti arm to skip touching ITS OWN
+RHS hand specifically (the one hand that is ALWAYS opaque-by-construction
+for a semiAnti link, as opposed to an outer join's nullable side, which is
+a real, independently-searchable subtree) while still declining if a
+DIFFERENT derived input (an actual CTE elsewhere in the problem) is
+touched. (b) is likely closer to the guard's original C-04a intent and
+would not require plumbing a new stats-confidence signal through
+`baseRelInfo`.

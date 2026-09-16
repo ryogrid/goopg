@@ -4165,38 +4165,73 @@ cross-layer programme that has never been scoped.
   corpus-wide — TPC-DS SF0.25 sweep unaffected (`PASS=96 MISMATCH=0`,
   `PLAN-SHAPE same=99`, Q78 byte-identical) as expected. Next blocker
   root-caused and filed as `-3i-plumbing-c7` (below).
-- [ ] **M0142-0008a-3i-plumbing-c7 — split `rebaseChainQual`'s single
+- [x] **M0142-0008a-3i-plumbing-c7 — split `rebaseChainQual`'s single
   `base` shift into per-operand shifts for chained semiAnti links**
-  (design doc §41.3, filed by c6). Q69 (TPC-DS's only query chaining more
-  than one EXISTS/NOT-EXISTS over the same outer) now reaches
-  `semiAntiOnQualsOK` and fails it: the SECOND (and any later) chained
-  link's inner join-key coordinate (`unnest.go:4694`,
-  `innerKey.Index = outerWidth + params[0].SubCol.Index` — correct for
-  EXECUTION, since the Join operator's own padded row is always
-  `[this join's outer row][this join's inner row]` and `outerWidth` is
-  exactly that width) gets rebased WRONG by the search seam's
-  `extractSearchLeaves` walk (joinsearchseam.go, the
-  `rebaseChainQual(pred, base)` call ~line 1298): `base` is captured ONCE,
-  before recursing into `j.Left`, and is the correct flat-leaf-space shift
-  for the OUTER operand (LeftKey, 0-based from the true original outer
-  schema) but the WRONG shift for the INNER operand (RightKey/innerKey,
-  0-based from THIS join's own 2-participant coordinate space) whenever an
-  earlier sibling semiAnti link's opaque leaf has already been spliced into
-  `j.Left` — the inner operand needs `base + (columns contributed by
-  j.Left's entire subtree)` instead, a value the walk already computes as
-  `width` right after `walk(j.Left, preserved)` returns but never captures
-  under its own name. Fix: split the eq/residual rebase so the
-  outer-side sub-expression(s) shift by `base` and the inner-side
-  sub-expression(s) shift by the post-left-recursion `width` value: identify
-  which operand of each conjunct is outer-vs-inner (the eq's `Left`/`Right`
-  halves are already known at construction — joinsearchseam.go ~line 1291 —
-  so this may be as simple as rebasing `j.LeftKey`/`j.RightKey` SEPARATELY
-  before folding them into one `eq`, rather than rebasing the folded `eq` as
-  one expression) before it reaches `rebaseChainQual`. MUST NOT regress the
-  single-EXISTS case (Q78, byte-identical since c2) — re-run the TPC-DS
-  SF0.25 sweep AND the full-corpus `GOOPG_PGSHAPED_DP_TRACE=1` sweep (the
-  real test — full reachability is confirmed only once a `jointype=semi`/
-  `anti` DPPATH line actually appears) after landing.
+  (design doc §41.3, filed by c6). **DONE 2026-09-17 (design doc §42).**
+  Landed: `extractSearchLeaves`'s semiAnti walk arm now captures
+  `outerWidth := len(j.Left.Output())` (the SEMANTIC width
+  `unnestExistsExpr` used to encode `RightKey.Index = outerWidth + subcol`,
+  unnest.go:4694/4762) and `rightBase := width` (the walk's own flat-space
+  position where `j.Right`'s opaque leaf starts), and rebases `pred`
+  piecewise via a new `rebaseSemiAntiChainQual` instead of one uniform
+  `rebaseChainQual(pred, base)`: an operand with `cr.Index < outerWidth`
+  (outer) still shifts by `base`; an operand with `cr.Index >= outerWidth`
+  (inner) shifts to `rightBase + (cr.Index - outerWidth)` instead. The two
+  coincide (no-op) for an unchained link and diverge exactly when `j.Left`
+  already has an earlier chained semiAnti link's opaque leaf spliced into
+  it. Pinned by a new permanent regression test,
+  `TestExtractSearchLeaves_AdmitSemiAnti_ChainedLinksRebaseInnerKeyCorrectly`
+  (semiantichain_test.go) — verified to FAIL on the old uniform-`base` code
+  with the exact `overlapR=false` symptom §41.3's throwaway Q69
+  instrumentation measured, then confirmed to PASS with the real fix.
+  Full-corpus `GOOPG_PGSHAPED_DP_TRACE=1` sweep: `semianti-on-qual` declines
+  dropped 1→0 corpus-wide (Q69 clears both semiAnti gates now);
+  `semianti-link-no-sjinfo` unchanged at 3 (unrelated to this fix).
+  `jointype=semi`/`anti` DPPATH reachability is STILL zero — TPC-DS SF0.25
+  sweep unaffected (`PASS=96 MISMATCH=0`, `PLAN-SHAPE same=99`, Q78
+  byte-identical) as expected. Next blocker root-caused and filed as
+  `-3i-plumbing-c8` (below): Q69 now advances past BOTH semiAnti gates and
+  is declined one stage later by a pre-existing, over-broad guard.
+- [ ] **M0142-0008a-3i-plumbing-c8 — `problemPairsOuterWithDerived` must not
+  treat a semiAnti RHS leaf's own opacity as "no statistics"** (design doc
+  §42.3, filed by c7). With c7 landed, Q69 clears both semiAnti admission
+  gates and reaches `searchOneProblem` (relfromjoinlist.go), where
+  `problemPairsOuterWithDerived` (:564) declines it with
+  `reason=outer-over-derived`. Root cause: `leafIsDerivedInput` (:523)
+  returns true whenever a leaf's underlying scan is not a single base table
+  (`info.table == nil`) — correct for a genuine CTE/subquery/function scan
+  (the C-04a/Q78 hazard this guard was built for: no statistics, so the
+  cost comparison runs on a defaulted `rows=1` guess), but ALSO true for
+  ANY semiAnti RHS leaf whose EXISTS/NOT-EXISTS body joins ≥2 relations
+  (Q69's `store_sales JOIN date_dim` etc., wrapped as one opaque
+  `*Project{*Join{...}}` leaf by the search-seam walk per §12.4/§13) — that
+  leaf's row estimate is NOT a defaulted guess, it comes from the
+  already-cost-estimated join subplan `unnestExistsExpr` splices in
+  wholesale. The guard's `switch sj.Jointype` arm deliberately includes
+  `JoinSemi`/`JoinAnti` (pinned by
+  `TestProblemPairsOuterWithDerivedSemiOverDerived`/`...AntiOverDerived`,
+  semiantichain_test.go:140/154 — a Semi/Anti RHS touching a REAL CTE must
+  still decline), so the fix must narrow WHICH leaf counts as "derived,"
+  not remove Semi/Anti from the jointype switch. Two candidate directions
+  (§42.3, neither implemented yet): (a) give `leafIsDerivedInput` a signal
+  for "multi-relation subtree with real per-child stats" distinct from
+  "provably no stats," e.g. keyed off whether the leaf's row estimate
+  traces to a non-default `EstimateRows()` rather than `.table == nil`; (b)
+  narrow `problemPairsOuterWithDerived`'s Semi/Anti arm to exempt a link's
+  OWN `rhs` hand specifically (always opaque-by-construction, unlike an
+  outer join's nullable side, which is a real independently-searchable
+  subtree) while still declining on any OTHER derived input the problem
+  touches — likely closer to the guard's original intent and avoids
+  plumbing a new stats-confidence signal through `baseRelInfo`. Q78 stays
+  unaffected either way (single-table EXISTS body already has a real
+  `info.table`, so this guard never fires for it — its own continued
+  byte-identical plan traces to a SEPARATE, still-unfound gate). MUST NOT
+  regress `TestProblemPairsOuterWithDerivedSemiOverDerived`/
+  `...AntiOverDerived`'s CTE case — add a THIRD unit test alongside them
+  for the "multi-relation EXISTS body must NOT decline via this guard"
+  case before landing. Re-run the TPC-DS SF0.25 sweep AND the full-corpus
+  `GOOPG_PGSHAPED_DP_TRACE=1` sweep after landing (the real test is still a
+  `jointype=semi`/`anti` DPPATH line finally appearing).
 - [x] **M0142-0008c — scoping recon: does goopg need PG's `create_unique_path`
   (semi-join → de-duplicate RHS + inner join) to reach parity on TPC-DS
   Q10/Q35?** — filed by M0142-0008a-3(iii)'s §4.3 gate re-run (design doc §6).
