@@ -76,6 +76,12 @@ func runJoinSearchBelowPinned(root Node, origChain Node, ctx *resolveContext, ca
 
 	var spineJoins []*Join
 	var spineFilters []*Filter
+	// spineRootPut is the setter that places spineJoins[0] (the outermost
+	// pinned Semi/Anti join) into its parent slot — captured once, at the
+	// moment that node is identified, so Phase B (design doc §32.3) can
+	// replace the whole spine..origChain subtree in one call rather than
+	// re-deriving which closure reaches it.
+	var spineRootPut func(Node)
 
 	put := setResult
 	cur := root
@@ -98,6 +104,9 @@ descend:
 				// the eligibility pre-check. Leave the tree as built
 				// (correct, unoptimised join order).
 				return newRoot
+			}
+			if len(spineJoins) == 0 {
+				spineRootPut = put
 			}
 			spineJoins = append(spineJoins, x)
 			j := x
@@ -146,6 +155,32 @@ descend:
 		newTarget = pushPredicatesIntoCrossJoins(f)
 	}
 	put(newTarget)
+
+	// Phase B (M0142-0008a-3i-plumbing-b2, design doc §32.3): a second,
+	// additive join-order search rooted at the outermost pinned Semi/Anti
+	// join (spineJoins[0]), attempted AFTER Phase A's splice above so it
+	// sees the (usually Filter-free, per §32.2) searched origChain already
+	// in place. `pred` is nil: there is no residual predicate above the
+	// spine's own joins to push — any retained Filter predicates above the
+	// whole spine stay handled by spineFilters' existing bottom-up remap.
+	//
+	// Gracefully declining while §32.1's `admitSemiAnti` literal
+	// (joinsearchseam.go:309) stays `false` in production: with the literal
+	// false, extractSearchLeaves never admits a Semi/Anti node, spineJoins[0]
+	// becomes ONE opaque leaf, and `len(scans)==1` almost certainly mismatches
+	// the frozen `nprefix` — the same "leaf-count" decline step (i) already
+	// proved inert (design doc §31.4). `used` is therefore false on every
+	// production call today; the success branch below is exercised only by a
+	// direct unit test with a hand-built result (§32.4 —
+	// dead_code_is_not_a_reference_impl: an unreachable branch is not a
+	// verified implementation until it has its own test).
+	if len(spineJoins) > 0 {
+		oldSpineSchema := append(Schema(nil), spineJoins[0].Output()...)
+		if searched, residual, used := tryPGShapedJoinSearch(spineJoins[0], nil, ctx, cat); used && residual == nil {
+			spliceSearchedSpine(oldSpineSchema, searched, spineRootPut, spineFilters)
+			return newRoot
+		}
+	}
 
 	// Re-resolve the pinned spine only when join search changed the
 	// outer layout. On a shape the search declines tryJoinSearch is a no-op and
@@ -199,6 +234,37 @@ descend:
 		remapSublinkOuterRefs(fl.Predicate, pm)
 	}
 	return newRoot
+}
+
+// spliceSearchedSpine performs Phase B's splice-in (design doc §32.3): it
+// places a successfully re-searched replacement for the pinned Semi/Anti
+// spine — everything from the outermost pinned join down to origChain — via
+// spineRootPut, and remaps spineFilters' predicates (any retained Filters
+// still sitting above the whole spine) for the resulting schema change.
+// spineJoins' own bottom-up reresolveJoinByName loop is deliberately not run
+// here: `searched` is the search's own plan-build output, already correctly
+// resolved end to end, the same reasoning splicedSearchedRoot's existing
+// skip (above) already relies on for the boundary-map case.
+//
+// Extracted to its own function, taking the searched replacement as a plain
+// argument rather than calling the search itself, so the success path can be
+// unit-tested DIRECTLY with a hand-built "search succeeded" tree — per
+// dead_code_is_not_a_reference_impl, that path is unreachable from any live
+// fixture while `admitSemiAnti` stays `false` in production
+// (joinsearchseam.go:309, design doc §32.1/§32.4), so it needs its own
+// verification independent of ever actually being called with a real search
+// result today.
+func spliceSearchedSpine(oldSpineSchema Schema, searched Node, spineRootPut func(Node), spineFilters []*Filter) {
+	spineRootPut(searched)
+	pm := layoutPosMap(oldSpineSchema, searched.Output())
+	if pm == nil {
+		return
+	}
+	for i := len(spineFilters) - 1; i >= 0; i-- {
+		fl := spineFilters[i]
+		remapByPosMap(&fl.Predicate, pm)
+		remapSublinkOuterRefs(fl.Predicate, pm)
+	}
 }
 
 // layoutPosMap builds an old-index → new-index map between two layouts

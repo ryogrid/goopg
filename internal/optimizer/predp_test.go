@@ -260,6 +260,97 @@ func TestPreDPEligibility(t *testing.T) {
 	}
 }
 
+// spliceTestSchema is a 2-column schema builder for spliceSearchedSpine
+// tests — bare SeqScan leaves stand in for "the outer schema a pinned
+// Semi/Anti spine publishes" and "the schema a Phase B search returned",
+// without needing a real join tree.
+func spliceTestSchema(names ...string) Schema {
+	s := make(Schema, len(names))
+	for i, n := range names {
+		s[i] = SchemaColumn{Name: n, Type: catalog.Type{Name: "int4"}}
+	}
+	return s
+}
+
+// TestSpliceSearchedSpine_PlacesResultAndSkipsReresolution is Phase B's
+// (design doc §32.3) mandatory direct unit test: the success path is
+// unreachable via any live fixture while `admitSemiAnti` stays `false` in
+// production (§32.1), so `dead_code_is_not_a_reference_impl` requires it be
+// proved correct against a hand-built "search succeeded" result instead.
+//
+// This asserts the placement half: spineRootPut receives exactly the
+// searched replacement, and — since spliceSearchedSpine never calls
+// reresolveJoinByName — a pinned join's stale key surviving in spineJoins
+// (not exercised here, there are none to reresolve) is not this function's
+// job; TestPinnedSpineSkipsReresolutionOverASearchedSubtree already pins
+// that skip for the sibling boundary-map case Phase B's comment says it
+// mirrors.
+func TestSpliceSearchedSpine_PlacesResultAndSkipsReresolution(t *testing.T) {
+	oldSchema := spliceTestSchema("a0", "a1")
+	searched := &SeqScan{Table: &catalog.Table{Name: "searched"}, Alias: "searched", schema: append(Schema(nil), oldSchema...)}
+
+	var placed Node
+	put := func(n Node) { placed = n }
+
+	spliceSearchedSpine(oldSchema, searched, put, nil)
+
+	if placed != Node(searched) {
+		t.Fatalf("spineRootPut was not called with the searched replacement: got %v", placed)
+	}
+}
+
+// TestSpliceSearchedSpine_RemapsFiltersOnLayoutChange is Phase B's success
+// path second half: when the search returns a DIFFERENT column order than
+// the spine used to publish, any retained Filter still sitting above the
+// whole absorbed spine must have its predicate's column indices remapped —
+// exactly the remap spineFilters' existing bottom-up loop performs today for
+// the Phase-A-only path, per §32.3 ("any outer retained-Filter predicates
+// stay handled exactly as today").
+func TestSpliceSearchedSpine_RemapsFiltersOnLayoutChange(t *testing.T) {
+	oldSchema := spliceTestSchema("a0", "a1")
+	// The search reordered the two columns.
+	searched := &SeqScan{Table: &catalog.Table{Name: "searched"}, Alias: "searched", schema: spliceTestSchema("a1", "a0")}
+
+	// A retained Filter above the spine referencing "a0" at its OLD index 0.
+	retained := &Filter{Predicate: etCol(0, "a0")}
+
+	var placed Node
+	put := func(n Node) { placed = n }
+
+	spliceSearchedSpine(oldSchema, searched, put, []*Filter{retained})
+
+	if placed != Node(searched) {
+		t.Fatalf("spineRootPut was not called with the searched replacement: got %v", placed)
+	}
+	cr, ok := retained.Predicate.(*ColumnRef)
+	if !ok {
+		t.Fatalf("retained filter predicate is %T, want *ColumnRef", retained.Predicate)
+	}
+	if cr.Name != "a0" || cr.Index != 1 {
+		t.Fatalf("retained filter predicate not remapped to a0's new position: got %s#%d, want a0#1", cr.Name, cr.Index)
+	}
+}
+
+// TestSpliceSearchedSpine_NoRemapWhenLayoutUnchanged pins the identity-map
+// fast path: when the search returns the SAME column order, layoutPosMap
+// returns nil and no Filter predicate is touched at all (not even
+// rewritten to an equal value) — the same "widths differ or identical →
+// refuse/skip" contract every other layoutPosMap caller in this file relies
+// on.
+func TestSpliceSearchedSpine_NoRemapWhenLayoutUnchanged(t *testing.T) {
+	oldSchema := spliceTestSchema("a0", "a1")
+	searched := &SeqScan{Table: &catalog.Table{Name: "searched"}, Alias: "searched", schema: append(Schema(nil), oldSchema...)}
+
+	retained := &Filter{Predicate: etCol(0, "a0")}
+	original := retained.Predicate
+
+	spliceSearchedSpine(oldSchema, searched, func(Node) {}, []*Filter{retained})
+
+	if retained.Predicate != original {
+		t.Fatalf("identical layout must leave the retained filter's predicate untouched (same pointer); got a rewritten node")
+	}
+}
+
 // planShapeString renders a stable structural signature of a plan for
 // equality comparison (node types, join types, key/predicate exprs).
 func planShapeString(n Node) string {

@@ -3946,6 +3946,31 @@ cross-layer programme that has never been scoped.
     (`dead_code_is_not_a_reference_impl`). Flipping the literal to `true` +
     the live end-to-end fixture verification is a still-later step (iii) —
     do not collapse either into the Phase B scaffold loop.
+    **Step (ii) Phase B scaffold LANDED (design doc §33, 2026-09-16):**
+    `runJoinSearchBelowPinned` now captures `spineRootPut` (the setter for
+    `spineJoins[0]`) during its descend loop, and — after Phase A's existing
+    splice, only when `len(spineJoins) > 0` — attempts a second
+    `tryPGShapedJoinSearch(spineJoins[0], nil, ctx, cat)` call; on success
+    (`used && residual == nil`) the new `spliceSearchedSpine` helper places
+    the result and remaps `spineFilters`, skipping `spineJoins`' bottom-up
+    `reresolveJoinByName` loop entirely; on decline, falls through unchanged
+    to today's Phase-A-only path. `spliceSearchedSpine` was extracted to take
+    the searched replacement as a plain argument (not compute it), so its
+    success path — unreachable from any live fixture while `admitSemiAnti`
+    stays `false` — is unit-tested DIRECTLY with 3 new hand-built-result
+    tests (`predp_test.go`: placement, filter-predicate remap on a layout
+    change, identity no-remap fast path). Verified inert: `go build`/`go vet
+    ./internal/optimizer/...` clean, full `go test ./internal/optimizer/...`
+    pass, TPC-DS SF0.25 sweep `PASS=96 MISMATCH=0 CKMISMATCH=0 ERROR=0`
+    `PLAN-SHAPE: same=99 changed=0`,
+    `RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh` shows only
+    the pre-existing unrelated `internal/parser` `GroupedJoinUnaliased`
+    failure (`internal/optimizer` itself `ok`). **Still open — step (iii),
+    a separate later loop:** flip `admitSemiAnti` to `true` at
+    `joinsearchseam.go:309` and verify the now-live Phase B success path
+    against a real EXISTS/NOT-EXISTS TPC-DS fixture (§27.4's gate) plus a
+    full SF0.25 sweep for an ACTUAL plan-shape change — the only remaining
+    piece before Q10/Q35 see a different plan.
   **Independent, unfiled resume-point hint** (not sized/numbered — noted for
   whoever picks up S5a's own eligibility gate): relaxing
   `whereEligibleForPreDPUnnest` to per-sublink granularity would upgrade

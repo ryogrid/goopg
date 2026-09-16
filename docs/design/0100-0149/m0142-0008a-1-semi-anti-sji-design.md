@@ -3723,3 +3723,103 @@ inertness end-to-end. That test, plus the actual descend-loop wiring, plus
 fixture (§27.4's existing gate) and the SF0.25 sweep for a REAL plan-shape
 change this time, is next loop's fully-specified resume point — not done
 this loop, which is scoping-only.
+
+## 33. Step (ii) — Phase B scaffold landed (2026-09-16)
+
+Coded exactly the §32.3 design, no deviation found necessary during
+implementation.
+
+### 33.1 What changed in `predp.go`
+
+`runJoinSearchBelowPinned`'s descend loop now captures `spineRootPut`, the
+setter that places `spineJoins[0]` (the outermost pinned Semi/Anti join)
+into its parent slot — either `setResult` (spine is the tree root) or a
+retained `spineFilter`'s `Child` setter — at the moment that node is first
+appended to `spineJoins`. This is the one piece §32.3's design needed that
+did not already exist as a named value: every other closure in the descend
+loop is rebound per-iteration and thrown away once the loop moves on, so
+without capturing it here Phase B would have to re-derive "who points at
+`spineJoins[0]`" a second time.
+
+Immediately after Phase A's existing `put(newTarget)` splice, and only when
+`len(spineJoins) > 0` (a spine actually exists — the degenerate
+"unnest declined" shape has none, and there is nothing for Phase B to
+widen), a second call attempts the wider search:
+
+```go
+oldSpineSchema := append(Schema(nil), spineJoins[0].Output()...)
+if searched, residual, used := tryPGShapedJoinSearch(spineJoins[0], nil, ctx, cat); used && residual == nil {
+    spliceSearchedSpine(oldSpineSchema, searched, spineRootPut, spineFilters)
+    return newRoot
+}
+```
+
+`residual == nil` is required, not just `used`: passing `pred = nil` means
+there is no residual predicate this call site is prepared to hold above the
+spine (§32.3's own stated precondition — "there is no additional residual
+predicate above the spine's own joins to push"), so a hypothetical future
+shape where the search returns a non-nil residual despite a nil input
+declines gracefully here rather than silently dropping a predicate.
+
+On decline (the case for every production call today, per §32.3's inertness
+argument), execution falls through unchanged into the existing
+Phase-A-only code below — byte-identical to before this loop.
+
+### 33.2 `spliceSearchedSpine` — extracted for direct testability
+
+Per §32.4's `dead_code_is_not_a_reference_impl` mandate, the success branch
+above cannot be exercised by calling the real search (it always declines
+while `admitSemiAnti` stays `false`), so the splice-in logic itself was
+pulled into a standalone function that takes the searched replacement as a
+plain argument rather than computing it:
+
+```go
+func spliceSearchedSpine(oldSpineSchema Schema, searched Node, spineRootPut func(Node), spineFilters []*Filter)
+```
+
+It does exactly two things: (1) `spineRootPut(searched)` — place the
+replacement; (2) compute `layoutPosMap(oldSpineSchema, searched.Output())`
+and, when non-nil (the layouts differ), remap every retained `spineFilters`
+predicate via the existing `remapByPosMap`/`remapSublinkOuterRefs` pair —
+identical machinery to Phase A's own bottom-of-function loop, just aimed at
+the spine-level schema instead of the origChain-level one. It deliberately
+never touches `spineJoins` or calls `reresolveJoinByName`: `searched` is the
+search's own plan-build output, already fully resolved, the same reasoning
+`splicedSearchedRoot`'s pre-existing skip (§32.3, mirrored) already relies
+on for the boundary-map case.
+
+Three new direct unit tests (`predp_test.go`) exercise it without a
+`*resolveContext` or a real search at all:
+
+- `TestSpliceSearchedSpine_PlacesResultAndSkipsReresolution` — the setter
+  passed in receives exactly the `searched` node.
+- `TestSpliceSearchedSpine_RemapsFiltersOnLayoutChange` — a retained
+  filter's `ColumnRef` pointing at a column by its OLD index is rewritten to
+  that column's new index when the hand-built "search result" reorders the
+  two columns.
+- `TestSpliceSearchedSpine_NoRemapWhenLayoutUnchanged` — when the layout is
+  identical, the retained filter's predicate is left as the exact same
+  pointer (not just an equal value), pinning `layoutPosMap`'s nil-on-identity
+  contract this function relies on to skip work.
+
+### 33.3 Verification
+
+`go build`/`go vet ./internal/optimizer/...` clean. Full
+`go test ./internal/optimizer/...` passes (all pre-existing tests plus the
+3 new ones above). TPC-DS SF0.25 sweep: `PASS=96 MISMATCH=0 CKMISMATCH=0
+ERROR=0`, `PLAN-SHAPE: queries=99 same=99 changed=0` — confirms Phase B is
+inert against the real corpus, not just by the leaf-count argument.
+`RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh` shows only the
+pre-existing, unrelated `internal/parser` `GroupedJoinUnaliased` failure
+(`internal/optimizer` itself reported `ok`).
+
+### 33.4 What is still open — step (iii)
+
+Flipping §32.1's `admitSemiAnti` literal to `true` at the one production
+call site (`joinsearchseam.go:309`), and verifying the now-live Phase B
+success path against a real EXISTS/NOT-EXISTS TPC-DS fixture (§27.4's
+existing gate) plus a full SF0.25 sweep for an ACTUAL plan-shape change —
+not done this loop, not done by this scaffold. This is the strictly later,
+separate step (iii) §32.4 named, and it is the only remaining piece before
+this milestone's own cited unblock targets (Q10/Q35) can see a different
+plan.
