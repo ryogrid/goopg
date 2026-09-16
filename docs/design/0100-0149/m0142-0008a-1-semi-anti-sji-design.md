@@ -3539,17 +3539,45 @@ Design settled: **(c)**, not (a) or (b) — reuse `semiAnti`'s own
 leaf-position bits, no `ctx.bindings`/`ctx.joinlist` mutation, no duplicate
 DP entry point. §31.3 items 1-2 are mechanical once `synthetic`/`numSynthetic`
 exist locally; item 3's `prefixTotalWidth` fix is a small, separate
-correction inside the same change (not a new blocker — same commit). None of
-this is coded yet: this loop is design-only, matching §30's own scoping-pass
-precedent. Next loop should: (i) land §31.3's three-check fix in
-`tryPGShapedJoinSearch` gated behind a direct unit-test call (mirroring
-`-3i-plumbing-b1`'s "prove inert before wiring" shape: `admitSemiAnti` stays
-`false` at the one production call site, so this is still fully inert in
-production); (ii) THEN, in a later loop, do the `predp.go` descend-loop
-extension (§30's original step (i) target) to actually feed a Semi/Anti-
-bearing tree into `tryJoinSearch` and flip `admitSemiAnti=true` at the
-production call site, verified against a live end-to-end fixture per §27.4's
-existing gate. Do not collapse (i) and (ii) into one loop — (i) alone is
-already a full preamble-logic change worth its own verification pass, and
-(ii) is the higher-blast-radius live-DP-routing change §28.3/§29 already
-flagged as needing to be bounded on its own.
+correction inside the same change (not a new blocker — same commit).
+
+**Step (i) landed 2026-09-16 (`M0142-0008a-3i-plumbing-b2`, this section's own
+next step).** `tryPGShapedJoinSearch` (`joinsearchseam.go`) now:
+item 1 — the leaf-count check reads `len(scans) != nprefix+len(semiAnti)`
+inline (no helper needed, pure arithmetic); items 2-3 — extracted into a new
+package function `pgShapedOffsetChecksOK(cumOffsets, semiAnti, widths,
+bindingOffsets, hasSpine, spineOffset) (declineReason string, ok bool)`
+(`joinsearchseam.go`, right after `buildLeafSpans`), which walks `cumOffsets`
+with a separate real-leaf-only counter into `bindingOffsets` (item 2) and
+compares the spine's offset against a REAL-only total width recomputed from
+`widths` while skipping synthetic indices (item 3), exactly as designed
+above. `extractSearchLeaves(chain, false)`'s discarded 5th return (`_`) is
+now captured as `semiAnti` and threaded through; the production call site's
+`admitSemiAnti` literal is UNCHANGED (`false`), so `semiAnti` is always `nil`
+there and every new branch reduces to the old plain checks — confirmed by
+the TPC-DS SF0.25 sweep (`PASS=96 MISMATCH=0 CKMISMATCH=0 ERROR=0`,
+`PLAN-SHAPE: same=99 changed=0`, comparing directly against the pre-change
+commit) and by `go test ./internal/optimizer/...` (full package, no
+regressions). Three new direct unit tests exercise the previously-inert
+`numSynthetic>0` arithmetic against `pgShapedOffsetChecksOK` itself (no
+`*resolveContext`/full-tree fixture needed, mirroring `-3i-plumbing-b1`'s
+"prove inert before wiring" shape): `TestPgShapedOffsetChecksOK_
+ReducesToPlainChecksWhenNoSemiAnti` (the inertness claim itself),
+`TestPgShapedOffsetChecksOK_RealLeafAfterSynthetic` (item 2 — the shape
+`§25.1`/`§31.3` traced: a real leaf positioned after a synthetic one, which
+the OLD plain per-index loop would have compared against the wrong
+`ctx.bindings` entry, or panicked outright since `len(scans) >
+len(ctx.bindings)` whenever any synthetic leaf exists), and
+`TestPgShapedOffsetChecksOK_SyntheticLastInWalkOrder` (item 3 — a trailing
+synthetic leaf, where the OLD `cumOffsets[len-1].hi` read a
+`totalRealWidth + thatLeaf'sOwnWidth` value and would have false-declined a
+well-formed spine). All three live in `semiantichain_test.go`, next to the
+existing `-3i-plumbing-b1`/`buildLeafSpans` tests they build on.
+
+**Still not done (step (ii), a separate later loop, do not collapse into
+this one):** the `predp.go` descend-loop extension (§30's original step (i)
+target) to actually feed a Semi/Anti-bearing tree into `tryJoinSearch`, plus
+flipping `admitSemiAnti=true` at the production call site, verified against
+a live end-to-end fixture per §27.4's existing gate — the higher-blast-radius
+live-DP-routing change §28.3/§29 already flagged as needing to be bounded on
+its own.

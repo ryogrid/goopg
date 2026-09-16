@@ -3723,9 +3723,30 @@ cross-layer programme that has never been scoped.
     before proving it's unreachable for the engaged family. Likely also
     depends on enough of `M0142-0008c-3c`/`-3d`/`-4`'s path-builder work existing for a real
     Semi/Anti pair to be admissible during DP at all.
-    **Item 6b design pass (design doc §25, 2026-09-16)**: found a second,
-    worse problem than the ctx.bindings-visibility question above — the
-    search's own `cumOffsets` array (shared into `relidsOfExpr`/
+    **§30/§31 design pass (2026-09-16)**: settled the (a)/(b) choice §24.2
+    raised as neither — a third option (c) reuses `extractSearchLeaves`'s
+    own `semiAnti` return value's leaf-position bits with purely local
+    arithmetic, no `ctx.bindings`/`ctx.joinlist` mutation, no duplicate DP
+    entry point. Also found a third preamble bug (`prefixTotalWidth` reading
+    a synthetic leaf's out-of-band span when that leaf is last in walk
+    order). **Step (i) of §31.4's two-step resume order LANDED 2026-09-16**:
+    `tryPGShapedJoinSearch`'s leaf-count check is now
+    `len(scans) != nprefix+len(semiAnti)`; a new `pgShapedOffsetChecksOK`
+    (`joinsearchseam.go`, next to `buildLeafSpans`) replaces the old
+    per-index offset-agreement loop and spine-offset check with
+    synthetic-leaf-aware versions. Production's `admitSemiAnti` literal is
+    unchanged (`false`), so this is provably inert — TPC-DS SF0.25 sweep
+    `PASS=96 MISMATCH=0`/`PLAN-SHAPE: same=99 changed=0`, full
+    `go test ./internal/optimizer/...` pass, 3 new direct unit tests in
+    `semiantichain_test.go` exercise the numSynthetic\>0 arithmetic without a
+    full fixture. Design doc §31.4/README updated in the same commit.
+    **Still open (step (ii), a separate later loop):** the `predp.go`
+    descend-loop reachability extension (§30's original target) — feed a
+    Semi/Anti-bearing tree into `tryJoinSearch` and flip `admitSemiAnti=true`
+    at the production call site, verified against a live end-to-end fixture.
+    Earlier item 6b design pass (design doc §25, 2026-09-16) for reference:
+    found a second, worse problem than the ctx.bindings-visibility question
+    above — the search's own `cumOffsets` array (shared into `relidsOfExpr`/
     `tableForCol` from every legality/restriction-list consumer in
     `joinsearchseam.go`/`joinrestrict.go`/`local_filters.go`) misattributes
     a REAL leaf's pre-existing qual to the synthetic Semi/Anti RHS leaf's

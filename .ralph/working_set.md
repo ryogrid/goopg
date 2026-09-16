@@ -1,88 +1,68 @@
-Task: M0142-0008a-3i-plumbing-b2 — step (i) reachability, §30's (a)/(b)
-decision settled as a third option (c) (design doc §31). Design-only loop,
-no production code touched.
+Task: M0142-0008a-3i-plumbing-b2 — design doc §31.4 step (i) landed: the
+three-check preamble fix in `tryPGShapedJoinSearch`, gated by production's
+`admitSemiAnti=false` staying unchanged (fully inert). Step (ii) — the
+`predp.go` reachability wiring — is the next selectable item under this task.
 
 Files this loop:
-- docs/design/0100-0149/m0142-0008a-1-semi-anti-sji-design.md: §31 added.
-- .ralph/fix_plan.md: -3i-plumbing-b2's entry extended with §31's decision
-  + corrected next-step (code §31.3, not the predp.go reachability change).
-- docs/design/README.md: m0142-0008a-1 index row extended with a §31
-  summary sentence.
+- internal/optimizer/joinsearchseam.go: leaf-count check now
+  `len(scans) != nprefix+len(semiAnti)`; new function
+  `pgShapedOffsetChecksOK` (next to `buildLeafSpans`) replaces the old
+  per-index offset-agreement loop + spine-offset check with
+  synthetic-leaf-aware versions; `extractSearchLeaves`'s discarded 5th
+  return is now captured as `semiAnti` and threaded through.
+- internal/optimizer/semiantichain_test.go: 3 new tests —
+  `TestPgShapedOffsetChecksOK_ReducesToPlainChecksWhenNoSemiAnti`,
+  `TestPgShapedOffsetChecksOK_RealLeafAfterSynthetic`,
+  `TestPgShapedOffsetChecksOK_SyntheticLastInWalkOrder`.
+- docs/design/0100-0149/m0142-0008a-1-semi-anti-sji-design.md: §31.4 extended
+  with the landing summary.
+- docs/design/README.md: m0142-0008a-1 index row extended.
+- .ralph/fix_plan.md: -3i-plumbing-b2's entry extended with the step (i)
+  landing + step (ii) still-open note.
 
 Key symbols:
-- `tryPGShapedJoinSearch` (joinsearchseam.go:216) — preamble checks at
-  `:243` (nrels bound), `:261` (nprefix := jl.nrels()), `:309`
-  (`extractSearchLeaves(chain, false)` — 5th return `semiAnti` is
-  discarded via `_` today), `:314` leaf-count decline, `:333` per-leaf
-  offset-agreement loop, `:347` spine-offset-disagreement check.
-- `extractSearchLeaves` (joinsearchseam.go:1093) — its `semiAnti
-  []semiAntiChainLink` return already carries `.rhs RelSet`, a single-bit
-  set marking each synthetic leaf's `scans` index (`loRight :=
-  len(scans)` at `:1152`, one `scans = append(scans, j.Right)` at `:1156`,
-  `hiRight := len(scans)` at `:1159` — always exactly one bit).
-- `buildLeafSpans` (joinsearchseam.go:1316) — landed by §27; places real
-  leaves' spans verbatim (skipping synthetic widths) and synthetic
-  leaves' spans out-of-band, appended AFTER the real total width,
-  *indexed by walk position, not partitioned real-then-synthetic*. This
-  is the source of §31's newly-found third bug (see below).
+- `tryPGShapedJoinSearch` (joinsearchseam.go:216) — production call site,
+  `admitSemiAnti` literal at `:309` UNCHANGED (`false`).
+- `pgShapedOffsetChecksOK` (joinsearchseam.go, right after `buildLeafSpans`)
+  — new, `(cumOffsets []leafSpan, semiAnti []semiAntiChainLink, widths []int,
+  bindingOffsets []int, hasSpine bool, spineOffset int) (declineReason
+  string, ok bool)`.
+- `buildLeafSpans` (joinsearchseam.go:1316) — unchanged this loop, already
+  places synthetic leaves' spans out-of-band after the real total width.
 
-Finding this loop (from live tracing, not re-derivation):
-§30 framed the choice as (a) widen ctx.bindings/ctx.joinlist vs (b) a
-parallel/duplicate entry point bypassing the preamble. Neither is needed:
-`semiAnti` already gives the caller everything required to make the
-existing three preamble checks synthetic-leaf-aware with purely local
-arithmetic — no ctx.bindings mutation (avoids §24.2's ~24-consumer-site
-FOR UPDATE nil-deref risk) and no duplicate seam to keep in sync. Settled
-design (c), detailed in design doc §31.3:
-1. `:314` leaf-count: `len(scans) != nprefix` -> `!= nprefix+numSynthetic`
-   (`numSynthetic := len(semiAnti)`). `nprefix` itself stays unchanged —
-   synthetic leaves are never real FROM items.
-2. `:333` offset-agreement: walk `scans` with `i`, walk `ctx.bindings`
-   with a separate counter `j` that skips synthetic indices (build
-   `synthetic RelSet` = OR of `semiAnti[*].rhs`, same pattern
-   `buildLeafSpans` already uses locally); only advance/compare `j` on
-   real leaves.
-3. `:347` spine-offset-disagreement — **a third bug found this loop,
-   independent of (a)/(b)/(c)**: `prefixTotalWidth :=
-   cumOffsets[len(cumOffsets)-1].hi` silently reads a SYNTHETIC leaf's
-   out-of-band span (== totalRealWidth + that leaf's own width) whenever
-   the synthetic leaf is LAST in walk order (a bare trailing `EXISTS` —
-   plausibly the common case), instead of the real total width. Fix:
-   `buildLeafSpans` needs to also return the real-only running total (the
-   `realOffset` it already computes internally at `:1327`), or recompute
-   it locally as `sum(widths[i] for non-synthetic i)`.
+Hypothesis/Findings: none new — this loop implemented design doc §31.3's
+already-settled three-check fix exactly as specified; no live tracing done.
+Ruled out: nothing to rule out, this was a pure "code the settled design"
+loop per §31.4's own instruction not to collapse step (i) and step (ii).
 
-Next step: code §31.3's three-check fix inside `tryPGShapedJoinSearch`,
-gated behind a DIRECT UNIT-TEST CALL only (mirror `-3i-plumbing-b1`'s
-"prove inert before wiring": production keeps passing `admitSemiAnti=
-false` at the one call site, so this stays fully inert). New unit test
-needed exercising all three: a shape with a real leaf AFTER a synthetic
-one (offset-agreement + leaf-count) AND a shape with the synthetic leaf
-LAST in walk order (the new prefixTotalWidth bug). Do NOT combine this
-with the separate `predp.go` descend-loop reachability change (§30's
-original step (i) target, still not started) — that stays its own later,
-higher-blast-radius loop per design doc §31.4.
+Next step: step (ii) — extend `predp.go`'s descend loop (currently hard-bails
+on any `*Join` node, `predp.go:96-101`) to pass through non-Semi/Anti `*Join`
+nodes and feed the wider spine+origChain tree to `tryJoinSearch`, per design
+doc §22.3/§24's item 6a (plumb a `*resolveContext` through
+`unnestSubqueriesInPlan`/`unnestExistsExpr`, 7 signatures in unnest.go,
+already scoped as mechanical) and item 6b (now unblocked by this loop's
+preamble fix). Flip `admitSemiAnti=true` at the one production call site only
+once 6a/6b are both wired, verified against a live end-to-end fixture (Q69
+witness class) plus the TPC-DS SF0.25 sweep. This is the higher-blast-radius
+live-DP-routing change §28.3/§29/§31.4 already flagged as needing its own
+loop — do not attempt it inside a loop that also touches something else.
 
-M0142-0008c-3c/-3d remain independently available once -3i-plumbing-b2
-lands but are not blocking this item's own next step.
+Gates run this loop: `go build ./...` clean. `go vet ./internal/optimizer/...`
+clean. `go test ./internal/optimizer/...` full package pass (includes the 3
+new tests + all pre-existing -3i-plumbing-b1/§25-29 tests). TPC-DS SF0.25
+sweep: `PASS=96 MISMATCH=0 CKMISMATCH=0 ERROR=0`, `PLAN-SHAPE: same=99
+changed=0` (confirms full inertness vs the pre-change commit). Units
+precommit gate (`RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh`):
+only the pre-existing unrelated `internal/parser` `GroupedJoinUnaliased`
+AST-drift failure, unchanged. TPC-H spotcheck: SKIPPED (tpch schema not
+loaded on `:65433` — still the M0142-0003k-documented blocker, unrelated to
+this change; not a planner/executor gate this change needed since it's a
+non-TPC-H-touching, fully-inert optimizer-internal change). `make
+ralph-state-guard`: found and auto-repaired the same benign prior-loop
+clean-exit marker several prior loops have also seen; consistent after
+repair.
+Nightly triage: `ci/logs/action-items.md` run 20260916-035206 (13 items) was
+already filed by a prior loop (visible in fix_plan.md's M-NIGHTLY section) —
+no new run this loop, nothing further to file.
 
-Alternatives if -3i-plumbing-b2 is judged not worth continuing
-immediately: M0141-S2b-2 (base join/scan Pathlist-across-search-boundary
-surgery — still needs its own scoping pass). M0142-0003i/0003k remain
-BLOCKED on a human-authorized shared `:65433` cluster reload — do not
-attempt. Unrelated, NOT to be picked up under this banner unless
-explicitly re-prioritized: `internal/parser`'s `GroupedJoinUnaliased`
-AST-drift gap (pre-existing, ~60 failing test functions — still the ONLY
-package failing in the units precommit gate, unchanged by this loop).
-
-Gates run this loop: `go build ./...` clean (no .go files touched this
-loop; ran as a sanity check anyway). `make ralph-state-guard`: found and
-auto-repaired the same benign prior-loop clean-exit marker as several
-prior loops; consistent after repair. No optimizer/executor code changed,
-so `go test ./internal/optimizer/...` and the TPC-DS SF0.25 sweep were not
-re-run (nothing to regress — design-doc/fix_plan/README edits only).
-Nightly triage: checked ci/logs/action-items.md — still the same run
-(20260916-035206, 13 items) a prior loop already filed; no new run,
-nothing to file this loop.
-
-In-flight: none. Nothing outstanding from this loop once committed.
+In-flight: none. Nothing outstanding once this loop's diff is committed.

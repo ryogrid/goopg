@@ -306,12 +306,19 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 	// direct unit-test call, since `chain` here is `origChain`, which
 	// structurally never contains a Semi/Anti node under the current
 	// pre-`-3i-plumbing-b2` engagement scope (§22.1's finding).
-	scans, widths, onQuals, outerLinks, _, ok := extractSearchLeaves(chain, false)
+	scans, widths, onQuals, outerLinks, semiAnti, ok := extractSearchLeaves(chain, false)
 	if !ok {
 		traceSeamDecline("chain-not-flattenable", nrels, len(scans))
 		return node, pred, false
 	}
-	if len(scans) != nprefix {
+	// §31.3 item 1 (design doc §31): with synthetic (Semi/Anti RHS) leaves
+	// mixed into `scans`, the leaf count is real-FROM-items-plus-synthetic,
+	// not just real-FROM-items — `nprefix` itself stays unchanged, since a
+	// synthetic leaf is never a real FROM item. `semiAnti` is always empty
+	// here (admitSemiAnti is false above), so this reduces to the old
+	// `len(scans) != nprefix` check and is inert in production until
+	// -3i-plumbing-b2 flips admitSemiAnti to true at this call site.
+	if len(scans) != nprefix+len(semiAnti) {
 		traceSeamDecline("leaf-count", nrels, len(scans))
 		return node, pred, false
 	}
@@ -325,27 +332,34 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 			return node, pred, false
 		}
 	}
-	// admitSemiAnti is false above (line ~309), so `extractSearchLeaves`
-	// never returns a synthetic leaf here and `buildLeafSpans` reduces to a
-	// plain walk-order cumulative sum — same shape `ctx.bindings` assigned.
-	cumOffsets := buildLeafSpans(widths, nil)
-	for i := range scans {
-		if ctx.bindings[i].offset != cumOffsets[i].lo {
-			traceSeamDecline("offset-disagreement", nrels, len(scans))
-			return node, pred, false
-		}
+	// §31.3 items 2-3: `semiAnti` is always empty here (admitSemiAnti is
+	// false above), so `pgShapedOffsetChecksOK`'s synthetic-aware arithmetic
+	// reduces to the old plain per-index comparison and REAL-total-width
+	// spine check — inert in production until -3i-plumbing-b2 flips
+	// admitSemiAnti to true at this call site. See the function's own doc
+	// comment for the numSynthetic>0 case, exercised only by a direct
+	// unit-test call today.
+	cumOffsets := buildLeafSpans(widths, semiAnti)
+	bindingOffsets := make([]int, nprefix)
+	for i := range nprefix {
+		bindingOffsets[i] = ctx.bindings[i].offset
 	}
 	// The spine's first relation must begin exactly where the prefix ends. That
 	// is what makes "beyond the prefix window" and "on the spine" the same
 	// statement, which every conjunct decision below relies on: a spine column
 	// that landed INSIDE the window would be attributed to a prefix leaf and
 	// pushed under the outer join.
-	prefixTotalWidth := 0
-	if len(cumOffsets) > 0 {
-		prefixTotalWidth = cumOffsets[len(cumOffsets)-1].hi
+	hasSpine := nprefix < nrels
+	spineOffset := 0
+	if hasSpine {
+		spineOffset = ctx.bindings[nprefix].offset
 	}
-	if nprefix < nrels && ctx.bindings[nprefix].offset != prefixTotalWidth {
-		traceSeamDecline("spine-offset-disagreement", nrels, nprefix)
+	if reason, checksOK := pgShapedOffsetChecksOK(cumOffsets, semiAnti, widths, bindingOffsets, hasSpine, spineOffset); !checksOK {
+		if reason == "offset-disagreement" {
+			traceSeamDecline(reason, nrels, len(scans))
+		} else {
+			traceSeamDecline(reason, nrels, nprefix)
+		}
 		return node, pred, false
 	}
 
@@ -1336,6 +1350,62 @@ func buildLeafSpans(widths []int, semiAnti []semiAntiChainLink) []leafSpan {
 		syntheticOffset += w
 	}
 	return spans
+}
+
+// pgShapedOffsetChecksOK implements design doc §31.3 items 2 and 3:
+// `tryPGShapedJoinSearch`'s per-leaf offset-agreement check and its
+// spine-offset-disagreement check, both widened to admit synthetic
+// (Semi/Anti RHS) leaves interleaved into `cumOffsets` at arbitrary walk
+// positions.
+//
+// Item 2: a plain index-for-index comparison of `cumOffsets[i]` against
+// `bindingOffsets[i]` (real, FROM-clause-derived offsets, one per real
+// leaf) breaks the moment a synthetic leaf precedes a real one — every real
+// leaf at-or-after it shifts by however many synthetic leaves came first.
+// This walks `cumOffsets` with `i` and `bindingOffsets` with a SEPARATE
+// counter that only advances past real leaves (there is no real-FROM oracle
+// to check a synthetic leaf against, so it is simply skipped).
+//
+// Item 3: `buildLeafSpans` places every synthetic leaf's span OUT-OF-BAND,
+// after the total REAL width — so whenever the LAST leaf in walk order is
+// synthetic, `cumOffsets`'s raw last entry overshoots the real total by
+// that leaf's own width. The spine (if any) must begin at the REAL total
+// width, computed here by summing `widths` while skipping synthetic
+// indices, not at `cumOffsets`'s raw last entry.
+//
+// With `semiAnti` empty — today's only production shape, since
+// `extractSearchLeaves`'s one production call site (`tryPGShapedJoinSearch`,
+// this file) always passes `admitSemiAnti=false` — `synthetic` is the zero
+// RelSet and every branch below reduces exactly to the pre-existing plain
+// checks: this function is fully inert in production. Only a direct
+// unit-test call exercises the numSynthetic>0 arithmetic until
+// M0142-0008a-3i-plumbing-b2 flips admitSemiAnti to true at that call site.
+func pgShapedOffsetChecksOK(cumOffsets []leafSpan, semiAnti []semiAntiChainLink, widths []int, bindingOffsets []int, hasSpine bool, spineOffset int) (declineReason string, ok bool) {
+	var synthetic RelSet
+	for _, lk := range semiAnti {
+		synthetic |= lk.rhs
+	}
+	j := 0
+	for i := range cumOffsets {
+		if synthetic&leafRangeRelSet(i, i+1) != 0 {
+			continue
+		}
+		if j >= len(bindingOffsets) || bindingOffsets[j] != cumOffsets[i].lo {
+			return "offset-disagreement", false
+		}
+		j++
+	}
+	realTotalWidth := 0
+	for i, w := range widths {
+		if synthetic&leafRangeRelSet(i, i+1) != 0 {
+			continue
+		}
+		realTotalWidth += w
+	}
+	if hasSpine && spineOffset != realTotalWidth {
+		return "spine-offset-disagreement", false
+	}
+	return "", true
 }
 
 // cumulativeFromSpans reconstructs a plain monotonic prefix-sum array from a

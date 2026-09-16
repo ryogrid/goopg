@@ -415,3 +415,96 @@ func TestBuildLeafSpansAttributesRealLeafAfterSyntheticCorrectly(t *testing.T) {
 		t.Errorf("relidsOfExpr(qualAC, spans) = %#x, want %#x (leaf 2, C) — got attributed to a different leaf, which is exactly §25.1's misattribution if it reproduces leaf 1 (B, %#x)", rs, wantLeaf2, leafRangeRelSet(1, 2))
 	}
 }
+
+// TestPgShapedOffsetChecksOK_ReducesToPlainChecksWhenNoSemiAnti pins design
+// doc §31.3's inertness claim: with `semiAnti` empty (today's only
+// production shape, since `tryPGShapedJoinSearch`'s one call site always
+// passes `admitSemiAnti=false` to `extractSearchLeaves`),
+// `pgShapedOffsetChecksOK` must behave exactly like the plain per-index
+// comparison it replaced — both accepting a well-formed two-leaf-plus-spine
+// shape and declining a mismatched one.
+func TestPgShapedOffsetChecksOK_ReducesToPlainChecksWhenNoSemiAnti(t *testing.T) {
+	widths := []int{2, 3} // two real leaves, no synthetic ones
+	cumOffsets := buildLeafSpans(widths, nil)
+	bindingOffsets := []int{0, 2} // matches cumOffsets exactly
+
+	if reason, ok := pgShapedOffsetChecksOK(cumOffsets, nil, widths, bindingOffsets, true, 5); !ok {
+		t.Errorf("pgShapedOffsetChecksOK(...) declined (%q), want accepted — matches the old plain checks on a well-formed shape", reason)
+	}
+	if reason, ok := pgShapedOffsetChecksOK(cumOffsets, nil, widths, []int{0, 99}, true, 5); ok {
+		t.Errorf("pgShapedOffsetChecksOK(...) = accepted, want declined (offset-disagreement) — bindingOffsets[1] deliberately mismatches cumOffsets[1].lo")
+	} else if reason != "offset-disagreement" {
+		t.Errorf("declineReason = %q, want %q", reason, "offset-disagreement")
+	}
+	if reason, ok := pgShapedOffsetChecksOK(cumOffsets, nil, widths, bindingOffsets, true, 99); ok {
+		t.Errorf("pgShapedOffsetChecksOK(...) = accepted, want declined (spine-offset-disagreement) — spineOffset deliberately mismatches the real total width")
+	} else if reason != "spine-offset-disagreement" {
+		t.Errorf("declineReason = %q, want %q", reason, "spine-offset-disagreement")
+	}
+}
+
+// TestPgShapedOffsetChecksOK_RealLeafAfterSynthetic pins design doc §31.3
+// item 2's fix directly: a REAL leaf (C) positioned AFTER a Semi/Anti
+// synthetic RHS leaf (B) in walk order must be compared against its own
+// ctx.bindings entry, not shifted by B's presence — the exact shape the old
+// plain `ctx.bindings[i].offset != cumOffsets[i].lo` loop got wrong (and,
+// since `len(scans) > len(ctx.bindings)` whenever a synthetic leaf is
+// present, would have PANICKED on an index out of range rather than merely
+// mis-comparing).
+func TestPgShapedOffsetChecksOK_RealLeafAfterSynthetic(t *testing.T) {
+	const wA, wB, wC = 2, 2, 2
+	widths := []int{wA, wB, wC} // walk order: A (real), B (synthetic RHS), C (real)
+	semiAnti := []semiAntiChainLink{{
+		jointype: parser.JoinSemi,
+		lhs:      leafRangeRelSet(0, 1), // A
+		rhs:      leafRangeRelSet(1, 2), // B, synthetic
+	}}
+	cumOffsets := buildLeafSpans(widths, semiAnti)
+	// ctx.bindings only ever holds REAL leaves: A at offset 0, C at offset
+	// wA (B was never a FROM item and has no entry).
+	bindingOffsets := []int{0, wA}
+
+	if reason, ok := pgShapedOffsetChecksOK(cumOffsets, semiAnti, widths, bindingOffsets, false, 0); !ok {
+		t.Errorf("pgShapedOffsetChecksOK(...) declined (%q), want accepted — A and C both agree with their real ctx.bindings offsets once B is skipped", reason)
+	}
+	// A deliberate mismatch on C's binding offset must still be caught.
+	if reason, ok := pgShapedOffsetChecksOK(cumOffsets, semiAnti, widths, []int{0, wA + 1}, false, 0); ok {
+		t.Errorf("pgShapedOffsetChecksOK(...) = accepted, want declined (offset-disagreement) — C's binding offset deliberately mismatches")
+	} else if reason != "offset-disagreement" {
+		t.Errorf("declineReason = %q, want %q", reason, "offset-disagreement")
+	}
+}
+
+// TestPgShapedOffsetChecksOK_SyntheticLastInWalkOrder pins design doc
+// §31.3 item 3's fix: when the Semi/Anti synthetic leaf is LAST in walk
+// order (a bare trailing EXISTS with a spine above it — plausibly the
+// common case, not a corner one), the spine's own offset must be compared
+// against the REAL total width, not `cumOffsets`'s raw last entry, which
+// `buildLeafSpans` places out-of-band past the real total and therefore
+// overshoots by the synthetic leaf's own width.
+func TestPgShapedOffsetChecksOK_SyntheticLastInWalkOrder(t *testing.T) {
+	const wA, wB = 3, 2
+	widths := []int{wA, wB} // walk order: A (real), B (synthetic RHS, LAST)
+	semiAnti := []semiAntiChainLink{{
+		jointype: parser.JoinSemi,
+		lhs:      leafRangeRelSet(0, 1), // A
+		rhs:      leafRangeRelSet(1, 2), // B, synthetic, last
+	}}
+	cumOffsets := buildLeafSpans(widths, semiAnti)
+	bindingOffsets := []int{0} // A alone
+
+	// The spine begins right after A's real width (wA) — NOT after
+	// cumOffsets's raw last entry, which would be wA+wB (B's out-of-band
+	// span's `hi`) and would false-decline this well-formed shape.
+	if reason, ok := pgShapedOffsetChecksOK(cumOffsets, semiAnti, widths, bindingOffsets, true, wA); !ok {
+		t.Errorf("pgShapedOffsetChecksOK(...) declined (%q), want accepted — spine offset %d correctly matches the REAL total width (%d), not cumOffsets' raw last entry (%d)", reason, wA, wA, cumOffsets[len(cumOffsets)-1].hi)
+	}
+	// The old (buggy) comparison target, `cumOffsets[len-1].hi` = wA+wB, must
+	// NOT be what this function accepts — passing it as spineOffset proves
+	// the fix is live, not accidentally still comparing against the old value.
+	if reason, ok := pgShapedOffsetChecksOK(cumOffsets, semiAnti, widths, bindingOffsets, true, wA+wB); ok {
+		t.Errorf("pgShapedOffsetChecksOK(...) = accepted for spineOffset=%d (the OLD buggy target, cumOffsets' raw last .hi), want declined — this would mean the fix regressed back to comparing against the synthetic leaf's out-of-band span", wA+wB)
+	} else if reason != "spine-offset-disagreement" {
+		t.Errorf("declineReason = %q, want %q", reason, "spine-offset-disagreement")
+	}
+}
