@@ -1,91 +1,89 @@
-Task: M0142-0008a-3i-plumbing-c14 — LANDED and COMMITTED this loop
-(design doc §49). Root-caused and fixed the actual crash c9-c13 chased
-across 5 loops: Q69 (TPC-DS) now runs clean instead of panicking.
+Task: M0142-0008a-3i-plumbing-c15 — re-attempted this loop, REVERTED and
+refiled with a concrete resume point (design doc §50, fix_plan.md, deferral
+ledger). No production code landed this loop.
 
-Files this loop:
-- internal/optimizer/joinsearchseam.go: `chainCarriesLateral` gained a
-  Semi/Anti arm (descends `j.Left` with the function's existing coarse
-  "any Lateral reachable = decline" rule, mirroring
-  `extractSearchLeaves`'s own Semi/Anti descent exactly). This is the
-  ENTIRE production fix — one function, ~25 lines including comment.
-- internal/optimizer/chaincarrieslateral_test.go (NEW): two direct unit
-  tests — a Lateral join under a Semi/Anti's Left must be caught (both
-  JoinTypeSemi and JoinTypeAnti), and a non-lateral chain under a Semi
-  join's Left must NOT be declined (guards against over-broad decline).
-- docs/design/0100-0149/m0142-0008a-1-semi-anti-sji-design.md: new §49
-  (49.1 method/root-cause trace by code-reading not re-instrumentation,
-  49.2 the fix, 49.3 live verification incl. full SF0.25 sweep, 49.4
-  what's still open).
-- docs/design/README.md: appended a §49 summary to the m0142-0008a-1
-  index row (the row is ~196 raw lines of flowing text per a known
-  pre-existing broken-table-cell quirk — appended at the row's true
-  physical end, matching the established per-loop convention).
-- .ralph/fix_plan.md: c14 marked [x] with full outcome; c9-c13's carried
-  "predp.go:159-176 stale comment" item explicitly left NOT actioned
-  (reasoned, not measured, to be orthogonal — see ledger row).
-- .ralph/deferral_ledger.md: new row for the still-open predp.go:159-176
-  comment (carried since c11, now explicitly why-not-touched-this-loop
-  too).
+What happened: c14 (previous loop) fixed Q69's crash via `chainCarriesLateral`.
+That unblocked c11 item (c): re-apply `joinInfoList: ctx.joinInfoList`
+(delete the duplicate-appending `semiAntiJoinInfoList` helper,
+joinsearchseam.go:767). The fix itself is CONFIRMED CORRECT for its own
+mechanism — it built clean and go-tested clean except for exactly one
+failure:
+`TestExtractSearchLeaves_AdmitSemiAnti_NarrowsMinLefthandToCorrelatedRelation`
+(semiantichain_test.go:316) now finds a `JoinTypeSemi` node in `Plan()`'s
+returned tree with `.SJInfo == nil`.
 
-Key symbols: `chainCarriesLateral` (joinsearchseam.go, the fix site),
-`extractSearchLeaves` (joinsearchseam.go, the function it now correctly
-mirrors), `createNestLoopIndexJoinPlan` (createplannl.go, builds the
-`*Join{Lateral:true}` node that was being mis-decomposed),
-`runJoinSearchBelowPinned`/Phase A+B (predp.go, the two-search structure
-whose interaction created the corrupted splice).
+Root cause (confirmed by reading, not yet re-instrumented after the
+revert): `.SJInfo` is set exactly ONCE in production
+(`unnest.go:4837`, `existsUnnestSJInfo`, at AST-unnesting time, long before
+the DP search runs). NO `createPlan` join constructor
+(`createHashJoinPlan` createplanjoin.go:565, `createMergeJoinPlan`
+createplanjoin.go:724, the plain-nestloop constructor createplannl.go:143
+— "the one arm a searched SEMI or ANTI join can reach" per its own comment
+— or the NLI constructors createplannl.go:360+) ever copies `.SJInfo` onto
+the fresh `*Join` node it builds. Before this fix the duplicate-list bug
+always declined the search for any Semi/Anti statement, so the ORIGINAL
+AST-built `*Join` node (carrying `.SJInfo` directly from unnesting) always
+reached the final tree unchanged. With the search now succeeding, the
+final tree's Semi join is a NEW node `createPlan` built from a `Path`,
+which had nowhere to carry `.SJInfo` forward — a THIRD latent,
+previously-untested defect in the same "unwinnable path is untested path"
+family as c12/c13 (`goopg_unwinnable_path_is_untested` memory).
 
-Root cause (confirmed, not just theorized): `extractSearchLeaves`'s
-Semi/Anti arm (landed by b1/b2) descends a Semi/Anti join's `Left`
-looking for reorderable structure. `predp.go`'s Phase A search runs on
-the subtree BELOW the pinned Semi/Anti spine and splices its own
-already-`createPlan`'d winning tree into that `Left` BEFORE Phase B ever
-walks the spine. For Q69 that spliced tree contains a correctly-built
-`*Join{Type:Inner, Lateral:true, Right: is}` (an ordinary `*Join`
-struct — no marker distinguishes "already planned" from "raw AST").
-Phase B's `extractSearchLeaves` walk can't tell the difference either
-and decomposes this already-decided Lateral join into two independent
-leaves — `is` (the outer-parameterized `*IndexScan`) becomes a
-standalone plain leaf (c13's crash), and `customer`/`customer_address`
-become a separate leaf orphaned from `customer_demographics` (c13's
-"illegal pairing", now proven to be the SAME root cause, not a second
-bug). `chainCarriesLateral` (the guard meant to catch this) was never
-extended when b1/b2 added `extractSearchLeaves`'s Semi/Anti descent — it
-fell to a finer-grained "does an OuterColumnRef escape unbound" check
-(answers NO — `is.Key` is correctly bound) instead of its own coarse
-"any Lateral reachable" rule. One new arm fixes it.
+Scope: `grep -rln '\.SJInfo\b' internal/` returns exactly 3 files
+(joinsearchseam.go — search-time only, strictly before createPlan — and
+two `_test.go` files). Nothing downstream of `createPlan` reads
+`Join.SJInfo` today, so this is not (yet) a live wrong-query-result bug,
+but it breaks a real protected unit-test invariant and is filed as a
+genuine defect rather than waved off — landing the joinInfoList fix with a
+known-broken invariant would repeat the exact "ship a partial fix that
+silently exposes an untested path" mistake this whole c-chain has been
+careful to avoid.
 
-Gates run this loop: `go build ./...` clean. `go vet
-./internal/optimizer/...` clean (pre-existing unrelated diagnostics
-only). `go test ./internal/optimizer/...` PASS (incl. 2 new tests).
-`go test ./internal/executor/...` PASS (sibling-path/practice-card
-gate). Live repro: private binary (`tmp/c14-bin`) + private SF0.25 data
-copy (`tmp/c14-sf025-data`), both removed after — Q69 runs clean (100
-rows), EXPLAIN confirms correct plan shape. Full
-`scripts/tpcds-sf025-regression.sh sweep` with `GOOPG_BIN=tmp/c14-bin`:
-`PASS=96 MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0 SKIP=3`,
-`PLAN-SHAPE: same=99 changed=0` (only Q69 moved, crash→pass). `make
-ralph-state-guard`: self-repaired a stale status/progress marker from
-the prior loop's clean exit (same pattern noted in the previous baton),
-then reported OK.
+Files touched this loop (all committed, commit 10ceb8e7c):
+- .ralph/fix_plan.md: new item M0142-0008a-3i-plumbing-c15 (unchecked),
+  full diagnosis + resume point.
+- .ralph/deferral_ledger.md: new row for c15.
+- docs/design/0100-0149/m0142-0008a-1-semi-anti-sji-design.md: new §50.
+- docs/design/README.md: appended §50 summary to the m0142-0008a-1 index
+  row (same "row's true physical end" convention as §49).
+- internal/optimizer/joinsearchseam.go, semiantichain_test.go: edited
+  then FULLY REVERTED (`git checkout --`) — not part of the commit,
+  `git diff --stat` empty, confirmed before committing.
 
-Next step: NOT YET SELECTED — this task is fully closed. Per the banner
-(`fix_plan.md` §"Current Priority", item 4), the next pick should be
-either another M0141/M0142 slice or, given `-3i-plumbing`'s whole c-chain
-(c1-c14) is now closed with a real fix landed, re-run the
-`GOOPG_PGSHAPED_DP_TRACE=1` corpus check c35/c36 used to confirm whether
-`jointype=semi`/`anti` DPPATH reachability (long stuck at zero
-corpus-wide) has moved now that Phase B no longer corrupts the one query
-that used to reach it — that re-measurement is the natural immediate
-follow-up but was NOT started this loop (one task per loop) and is not
-yet filed as its own fix_plan item. A future loop should file it
-explicitly before starting it. Also still open (not this loop's job):
-`predp.go:159-176`'s stale comment (ledger row filed), and c9's
-`joinIsLegal` zero-predicate-pairing legality question for a
-DIFFERENT query than Q69 (§49.4 — Q69 no longer reaches that code path
-after this fix, so it's unconfirmed either way for a query that does).
+Key symbols: `addNestLoopPath` (pathgen.go:175 — already receives
+`sjinfo` as a parameter, currently drops it), `Path` struct (path.go —
+needs a new `SJInfo *SpecialJoinInfo` field), the plain-nestloop
+constructor (createplannl.go:143, the `j := &Join{...}` literal —
+needs `SJInfo: p.SJInfo`), `existsUnnestSJInfo` (unnest.go:4837, the sole
+producer of `.SJInfo` today).
 
-In-flight: none. Private diagnostic binary/data/log (`tmp/c14-bin`,
-`tmp/c14-sf025-data`, `tmp/c14-server.log`) all removed after
-verification. Unrelated pre-existing `tmp/c14-q67.*`/`tmp/goopg-c14`
-files (from a different, older milestone's numbering, dated well before
-this loop) were left untouched — not mine, out of scope.
+Next step (concrete, sized like a single loop): (1) add `SJInfo
+*SpecialJoinInfo` to `Path`; (2) `addNestLoopPath` (pathgen.go:192-206)
+sets `SJInfo: sjinfo` on the `&Path{...}` it builds — also thread the
+`sjinfo` param through the hash/merge path constructors for uniformity
+even though only nestloop is reachable for Semi/Anti today; (3)
+createplannl.go's plain-nestloop constructor adds `SJInfo: p.SJInfo` to
+its `&Join{...}` literal (nil is correct/harmless for every non-Semi/Anti
+join); (4) re-run `go test ./internal/optimizer/...` (the narrowing test
+above is the tripwire — must go green); (5) THEN re-apply the
+`joinInfoList: ctx.joinInfoList` one-liner (c11 item (c) / this loop's
+reverted diff) and run the FULL `scripts/tpcds-sf025-regression.sh sweep`
+with a private `GOOPG_BIN` before landing both pieces together. Still
+pending, unrelated, carried since c11 (not this loop's job):
+`predp.go:159-176`'s stale Phase B doc comment.
+
+Gates run this loop: `go build ./...` clean (both with the temporary fix
+applied and after revert). `go test ./internal/optimizer/...` — FAILED
+with the fix applied (1 test, diagnosed above), PASS after revert. `go
+test ./internal/executor/...` PASS (sibling-path/practice-card gate, run
+after revert). `make ralph-state-guard`: self-repaired the same stale
+"completed" progress marker from the prior loop's clean exit (same
+pattern noted the last two loops), then reported OK. Pre-commit pgbench
+smoke: PASS (TPC-B ~43 tps, select-only ~146 tps, 0 failed — the
+"no connection to server" lines during warmup are the documented flaky
+vacuum-phase probe, not a real failure; all three phases completed with
+0 failed transactions).
+
+In-flight: none. No private binaries/data copies were created this loop
+(the diagnosis was done via the existing unit test + temporary `t.Logf`,
+not a live SF0.25 repro) — nothing to clean up.
