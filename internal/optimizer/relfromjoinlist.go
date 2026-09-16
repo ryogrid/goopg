@@ -784,31 +784,43 @@ func (prob *joinlistProblem) searchOneProblem(items []joinlistRel, tupleFraction
 		// padded coordinate — the totality assertion stays loud for real
 		// producer bugs (M0134-0187, DESIGN §21).
 		node: createPlanAtSearchRootRange(p, base, width, func(coord int) (SchemaColumn, bool) {
-			if !prob.neededColsKnown {
-				return SchemaColumn{}, false
-			}
 			for i := range items {
-				if coord >= cum[i] && coord < cum[i+1] {
-					leafSchema := scans[i].Output()
-					pos := coord - cum[i]
-					if pos < 0 || pos >= len(leafSchema) {
-						return SchemaColumn{}, false
-					}
-					col := leafSchema[pos]
-					if col.Name == "" {
-						return SchemaColumn{}, false
-					}
-					if prob.outputColsKnown && prob.outputCols != nil {
-						if prob.outputCols[col.Name] {
-							return SchemaColumn{}, false
-						}
-						return col, true
-					}
-					if prob.neededCols[col.Name] {
+				if coord < cum[i] || coord >= cum[i+1] {
+					continue
+				}
+				leafSchema := scans[i].Output()
+				pos := coord - cum[i]
+				if pos < 0 || pos >= len(leafSchema) {
+					return SchemaColumn{}, false
+				}
+				col := leafSchema[pos]
+				if col.Name == "" {
+					return SchemaColumn{}, false
+				}
+				// c11 (design doc §46.4 item 1): a SEMI/ANTI join never
+				// projects its RHS columns above itself, so nothing outside
+				// the search can ever reference a semiAnti synthetic leaf's
+				// own coordinate range — it is always fillable, independent
+				// of the statement's needed/output-column sets (which may
+				// even be unknown here). Checked before neededColsKnown
+				// because that gate exists for the OTHER leaf kinds, where
+				// "unknown" must fail closed.
+				if infos[i].isSemiAntiSyntheticLeaf {
+					return col, true
+				}
+				if !prob.neededColsKnown {
+					return SchemaColumn{}, false
+				}
+				if prob.outputColsKnown && prob.outputCols != nil {
+					if prob.outputCols[col.Name] {
 						return SchemaColumn{}, false
 					}
 					return col, true
 				}
+				if prob.neededCols[col.Name] {
+					return SchemaColumn{}, false
+				}
+				return col, true
 			}
 			return SchemaColumn{}, false
 		}),

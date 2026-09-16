@@ -4335,10 +4335,28 @@ cross-layer programme that has never been scoped.
 - [ ] **M0142-0008a-3i-plumbing-c11 — stop `ctx.joinInfoList` from
   accumulating duplicate/stale `*SpecialJoinInfo` entries across
   `tryPGShapedJoinSearch`'s two call sites for one statement** (design doc
-  §45.3-45.4, filed by c10). **Root cause CONFIRMED live and the exact
-  one-line fix identified (design doc §46), but NOT landed — reverted this
-  loop after the fix surfaced two further pre-existing regressions on the
-  SF0.25 gate. Re-opened with a narrower, corrected scope below.**
+  §45.3-45.4, filed by c10). **Item (a) LANDED 2026-09-17 (design doc §46.5):
+  `searchOneProblem`'s boundary hole-filler (relfromjoinlist.go) now exempts
+  a semiAnti synthetic leaf's own coordinate range from the
+  needed/output-column gates — verified via private binary that it clears
+  Q69's boundary-totality panic (real `EXPLAIN` reordering: 2×`Hash Anti
+  Join` + `Hash Join` + `Nested Loop`) when combined with the (still
+  temporary) §46.3 `joinInfoList` fix, AND that alone (§46.3 fix reverted,
+  matching production) it is a byte-identical no-op — full SF0.25 sweep
+  PASS=96/ERROR=0/MISMATCH=0 with a private `GOOPG_BIN`. Item (b) is
+  RE-SCOPED, not closed: Q69 (a pure AND-EXISTS-chain, no OR shape at all)
+  hits the IDENTICAL `outer column ref c_current_cdemo_sk/level=1 out of
+  range (depth=0)` error §46.3 filed as Q10-specific/OR-admission-specific,
+  once the boundary panic no longer masks it — so the OR-combined-EXISTS
+  admission theory cannot be the whole fix; see design doc §46.5 for the
+  two next-instrumentation candidates (`rebaseSemiAntiChainQual`'s
+  coverage of nested `*OuterColumnRef` nodes, and whether
+  `unnestExistsExpr` fully rebases every EXISTS's correlation refs in a
+  MULTI-EXISTS statement). Root cause CONFIRMED live and the exact
+  one-line fix identified (design doc §46), but item (c) (re-applying it)
+  is still NOT landed — it was reverted in the c11-filing loop after
+  surfacing item (a) and (b)'s two pre-existing regressions on the SF0.25
+  gate. Re-opened with the narrower, corrected scope below.**
   Root cause (§46.2, live-traced, no longer a hypothesis): it is NOT two
   independently-built pointer-distinct clones. `tryPGShapedJoinSearch`'s
   semiAnti population loop (joinsearchseam.go:593-597, c6) already folds
@@ -4385,19 +4403,20 @@ cross-layer programme that has never been scoped.
   guarded — a `recover()` scoped to the boundary panic (tried this loop)
   does NOT also cover Q10's failure mode, which is a plain returned error
   from a different pipeline stage, not a panic.
-  **Next steps, in order (design doc §46.4)**: (a) fix
-  `createPlanAtSearchRootRange`/`boundaryMap`'s totality contract to
-  exempt a semiAnti synthetic leaf's own coordinate range (never a real
-  "must-publish" requirement, since nothing reads a SEMI/ANTI join's RHS
-  columns above the join — same idea as the existing `fill`-licensed
-  narrowed-index-only-leaf pass); (b) root-cause whether Q10's OR-combined
-  EXISTS pair should ever have been admitted into the semiAnti chain at
-  all (PG itself only flattens a TOP-level AND-connected EXISTS into a
-  Join; an OR-combined EXISTS stays a correlated SubPlan) — the fix may be
-  to correctly DECLINE Q10's shape upstream rather than debug what happens
-  once it is wrongly admitted; (c) re-apply the one-line
-  `joinInfoList: ctx.joinInfoList` fix and re-run the FULL SF0.25 sweep
-  (not just Q69/Q10 in isolation) before landing. Also still pending: fix
+  **Next steps, in order (design doc §46.4, (a) DONE per §46.5)**: (a)
+  DONE — `createPlanAtSearchRootRange`/`boundaryMap`'s totality contract
+  now exempts a semiAnti synthetic leaf's own coordinate range, landed
+  2026-09-17. (b) **re-scoped, still open**: root-cause the
+  `outer column ref .../level=1 out of range (depth=0)` error — proven
+  NOT Q10/OR-admission-specific (Q69's pure AND-chain hits the identical
+  error once (a) stops masking it with a panic first); instrument
+  `rebaseSemiAntiChainQual` (joinsearchseam.go:1713) for `*OuterColumnRef`
+  coverage and `unnestExistsExpr`'s rebasing completeness on a
+  MULTI-EXISTS statement (design doc §46.5) before assuming it is
+  OR-shape-specific at all; (c) once (b) is fixed, re-apply the one-line
+  `joinInfoList: ctx.joinInfoList` fix (delete `semiAntiJoinInfoList`)
+  and re-run the FULL SF0.25 sweep (not just Q69/Q10 in isolation) before
+  landing. Also still pending: fix
   `predp.go:159-176`'s Phase B doc comment — its "`used` is therefore
   false on every production call today" claim is stale and actively
   misleading.

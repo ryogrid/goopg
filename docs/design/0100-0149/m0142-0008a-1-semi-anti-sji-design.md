@@ -5553,3 +5553,93 @@ In order, since (a) is required before (b) can even be evaluated safely:
    (delete `semiAntiJoinInfoList`) and re-run the FULL
    `scripts/tpcds-sf025-regression.sh sweep` (not just Q69/Q10 in
    isolation) to confirm zero verdict regressions before landing.
+
+### 46.5 Item (a) LANDED: boundaryMap now exempts a semiAnti synthetic leaf's own coordinate range — and item (b)'s scope was narrower than filed
+
+**Landed this loop** (production diff is `internal/optimizer/relfromjoinlist.go`
+only): `searchOneProblem`'s hole-filler closure — the `fill` callback passed to
+`createPlanAtSearchRootRange` (§46.4 item 1) — now checks
+`infos[i].isSemiAntiSyntheticLeaf` (the marker §42.4/c8 already established,
+`cardinality.go`/`relfromjoinlist.go:leafIsDerivedInput`) BEFORE the
+`neededColsKnown`/`outputCols`/`neededCols` gates that exist for every OTHER
+leaf kind. A SEMI/ANTI join never projects its RHS columns above itself by
+definition, so a binding coordinate inside a semiAnti synthetic leaf's own
+range is always licensed to be padded — independent of whether the
+statement's needed-column set was computed at all (§46.3 item 1's own framing:
+"never a real must-publish requirement"). The three existing failure modes
+(hole with no filler, out-of-range leaf lookup, empty column name) are
+untouched and still panic.
+
+**Verification method**: same private-binary + `GOOPG_PGSHAPED_DP_TRACE=1`
+technique as §46.1-46.2, but this time run TWICE:
+
+1. With the §46.3 `joinInfoList: ctx.joinInfoList` one-liner ALSO applied
+   (temporarily, to actually reach the boundary — the double-append bug
+   still blocks the search from completing without it): Q69's `EXPLAIN`
+   now returns a real plan — `Hash Anti Join` × 2 (the two `NOT EXISTS`
+   arms) feeding a `Hash Join` (the address join) feeding a `Nested Loop`
+   against the `store_sales+date_dim` `EXISTS` arm — the FIRST real
+   semi/anti-reordered plan shape this entire c-series (c5-c11) has ever
+   produced. No panic. This confirms item (a) as specified in §46.4 is
+   correct and sufficient to fix the boundary-totality crash.
+2. With the temporary `joinInfoList` line reverted back to production
+   (`semiAntiJoinInfoList(ctx.joinInfoList, semiAnti)`, i.e. ONLY the
+   `relfromjoinlist.go` fill-closure change is live) and a private
+   `GOOPG_BIN`: `scripts/tpcds-sf025-regression.sh sweep` — **PASS=96
+   MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0 SKIP=3** (the 2 permanent
+   `SKIP_QUERYGEN` oracle gaps plus nothing else), i.e. byte-identical to
+   HEAD's known-good state. This is the expected result: without the
+   joinInfoList fix, `joinIsLegal`'s "matches multiple SpecialJoinInfos"
+   guard still declines every semiAnti-admitted search before it can ever
+   reach a boundary hole, so the new fill-closure branch is inert in
+   today's production traffic — a true prerequisite landing, not a
+   behavior change, exactly as §46.4's ordering intended.
+
+**Item (b)'s scope was mis-filed as Q10-specific — it is not.** Running Q69
+standalone (step 1 above, both fixes applied) did not stop at the boundary
+fix: with the panic gone, `psql -f query69.sql` returned a RUNTIME error,
+not the EXPLAIN-only success the trace initially suggested:
+
+```
+ERROR:  outer column ref c_current_cdemo_sk/level=1 out of range (depth=0)
+LINE 15:   cd_demo_sk = c.c_current_cdemo_sk and
+```
+
+This is the IDENTICAL error signature §46.3 item 2 filed as a Q10-only
+regression (`outer column ref c_current_cdemo_sk/level=1 out of range
+(depth=0)`, `internal/executor/expr.go:478`: an `*optimizer.OuterColumnRef`
+evaluated with `len(ctx.OuterRows)==0`, i.e. reached OUTSIDE any
+`evalSubquery`/`evalInExpr`/`evalExistsExpr` frame that would have pushed an
+outer row). Q69's WHERE has no OR-combined EXISTS at all — `cd_demo_sk =
+c.c_current_cdemo_sk` is a plain top-level join predicate between `customer`
+and `customer_demographics`, unrelated to any of Q69's three chained
+(AND-connected) `EXISTS`/`NOT EXISTS` clauses. §46.4 item 2's hypothesis
+("PG only flattens a TOP-level AND-connected EXISTS; Q10's OR-combined EXISTS
+should have been declined upstream") therefore cannot be the whole story:
+Q69's pure AND-chain shape hits the exact same failure once it reaches this
+stage, so whatever leaves a stray `OuterColumnRef` unrebased is a general
+semiAnti-admission defect, not an OR-admission-specific one. §46.4 item 2 is
+re-scoped below rather than closed; the OR-admission question may still be a
+CONTRIBUTING factor for Q10 specifically, but it cannot be the fix for Q69's
+occurrence of the same error, and Q69 is the cheaper repro (no OR-shape
+subtlety to reason about first). Likely suspects for the next loop to
+instrument, in probable-cost order: (1) `rebaseSemiAntiChainQual`
+(joinsearchseam.go:1713) — does it walk into and rebase every
+`*OuterColumnRef` node inside a semiAnti link's `pred`, or only the outer
+`Expr` shape it pattern-matches, potentially leaving a nested one untouched
+when the predicate also touches an UNRELATED real leaf pairing (Q69's
+`cd_demo_sk` join is between two REAL leaves, not the semiAnti RHS — so the
+stray `OuterColumnRef` may not even be inside `semiAnti[*].pred` at all, but
+somewhere in the ordinary conjunct list `unnestExistsExpr` left half-rebased
+when it originally flattened the three `EXISTS` clauses); (2) whether
+`unnestExistsExpr`'s original flattening pass ever fully converts the
+`customer`-side correlation refs to plain `ColumnRef`s for a MULTI-EXISTS
+statement (Q69 has three), or only for the single-EXISTS case every prior
+c-series fixture exercised. Not re-attempted this loop — this is genuinely
+item (b)'s next diagnostic step, filed here rather than guessed at blind
+(`m0074_partial_scope_lessons`: bound the change, verify incrementally).
+
+The temporary `joinInfoList` edit used for step 1 was reverted
+(`git checkout -- internal/optimizer/joinsearchseam.go`) before commit,
+confirmed via `git diff --stat` showing zero changes to that file; only
+`relfromjoinlist.go` is part of this loop's landed commit.
