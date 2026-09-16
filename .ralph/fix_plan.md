@@ -4335,34 +4335,72 @@ cross-layer programme that has never been scoped.
 - [ ] **M0142-0008a-3i-plumbing-c11 — stop `ctx.joinInfoList` from
   accumulating duplicate/stale `*SpecialJoinInfo` entries across
   `tryPGShapedJoinSearch`'s two call sites for one statement** (design doc
-  §45.3-45.4, filed by c10). Two candidate fixes, ascending invasiveness:
-  (1) extend `joinInfoListHas` (relfromjoinlist.go:407, currently pointer-
-  identity only) to also dedup two SJInfos that are structurally identical
-  in the fields `joinIsLegal` reads (`Jointype`, `MinLefthand`,
-  `MinRighthand`, `SynLefthand`, `SynRighthand`) — cheapest, but treats the
-  symptom; (2) stop Phase A (`predp.go:148`, `tryJoinSearch`) and Phase B
-  (`predp.go:179`, direct `tryPGShapedJoinSearch` on `spineJoins[0]`) from
-  BOTH reaching the population loop for the same links — e.g. defer the
-  `ctx.joinInfoList` append (joinsearchseam.go:593-597) until the call is
-  about to return `used=true`, a "commit on success only" discipline PG's
-  own single-pass `deconstruct_jointree` never needs. (2) is higher-value:
-  it also plugs the same latent hazard for any OTHER
-  `tryJoinSearch`/`tryPGShapedJoinSearch` double-call combination, not just
-  this one. Either way, first pin down WHY Phase A's attempt (which reaches
-  the population loop) does not end up referencing the exact same
-  `j.SJInfo` pointer `spineJoins[0]` carries when Phase B walks it (same
-  node vs. a clone somewhere in the pipeline — not traced this loop). Re-
-  verify with the SAME method c10 used (private SF0.25 binary +
-  `GOOPG_PGSHAPED_DP_TRACE=1`, log TRUNCATED with `: > ...log` before each
-  restart — c10's own first pass was contaminated by stale `>>`-appended
-  content from c9's already-reverted debug prints) that
-  `len(s.joinInfoList) == 3` for Q69 post-fix, then re-check for the
-  `jointype=semi`/`anti` DPPATH line this whole c-series has chased since
-  c5. Also fix `predp.go:159-176`'s Phase B doc comment — its "`used` is
-  therefore false on every production call today" claim is stale and
-  actively misleading. Re-run Q69 `EXPLAIN` + full-corpus
-  `GOOPG_PGSHAPED_DP_TRACE=1` sweep AND the TPC-DS SF0.25 sweep after
-  landing.
+  §45.3-45.4, filed by c10). **Root cause CONFIRMED live and the exact
+  one-line fix identified (design doc §46), but NOT landed — reverted this
+  loop after the fix surfaced two further pre-existing regressions on the
+  SF0.25 gate. Re-opened with a narrower, corrected scope below.**
+  Root cause (§46.2, live-traced, no longer a hypothesis): it is NOT two
+  independently-built pointer-distinct clones. `tryPGShapedJoinSearch`'s
+  semiAnti population loop (joinsearchseam.go:593-597, c6) already folds
+  each semiAnti link's `*SpecialJoinInfo` into `ctx.joinInfoList`
+  (confirmed live: exactly 3 unique pointers for Q69 right after that
+  loop). ~20 lines later, `joinInfoList:
+  semiAntiJoinInfoList(ctx.joinInfoList, semiAnti)` appends the SAME
+  `semiAnti[*].sjinfo` pointers a SECOND time onto that already-complete
+  `base`, with no dedup at all — a mechanical double-count, provable by
+  reading the two call sites together. `joinIsLegal`
+  (joinsearchlevel.go:239-259) iterates the whole 6-entry list per
+  candidate pair and its "matches multiple SpecialJoinInfos" guard fires
+  on the pair's second (duplicate) occurrence, declining a pairing that
+  is legitimately legal exactly once.
+  **The fix**: replace `joinInfoList: semiAntiJoinInfoList(ctx.joinInfoList,
+  semiAnti)` with `joinInfoList: ctx.joinInfoList` (delete
+  `semiAntiJoinInfoList`, zero other call sites). Verified live
+  (private SF0.25 binary + `GOOPG_PGSHAPED_DP_TRACE=1`, log truncated
+  before each restart): `ctx.joinInfoList` drops to the correct 3 entries,
+  the `joinIsLegal` "multi" decline for Q69's `(0x1,0x8)`-class pairs
+  disappears, and Q69's DP search completes the FULL 6-relation problem
+  with real `jointype=semi`/`anti` `DPPATH` lines — the first time in this
+  entire c-series (c5-c11) reachability has moved at all.
+  **Why it was reverted instead of landed**: this success immediately
+  exposed two further, independent, pre-existing defects that were simply
+  unreachable before (design doc §46.3, "unwinnable path is untested
+  path" pattern): (1) `createPlanAtSearchRootRange`/`boundaryMap`
+  (createplanroot.go:264) panics building Q69's winning plan — "search
+  root does not publish binding coordinate(s) [91..214]", 124 columns,
+  almost certainly the semiAnti synthetic leaves' OWN internal columns,
+  which a SEMI/ANTI join never projects above itself and which the
+  boundary's totality contract was never taught to exempt; (2) TPC-DS
+  Q10 — a DIFFERENT query, OR-combined `EXISTS(...) AND (EXISTS(...) OR
+  EXISTS(...))` rather than Q69's pure AND-chain — regresses from PASS to
+  a hard `outer column ref c_current_cdemo_sk/level=1 out of range
+  (depth=0)` error once it too reaches the newly-unblocked search.
+  Confirmed via `scripts/tpcds-sf025-regression.sh sweep` (run with a
+  private `GOOPG_BIN` to avoid the shared nightly binary):
+  `PASS -Q10` / `ERROR +Q10` in the status-delta. Since the SF0.25 sweep
+  is a required gate for planner changes and Q10 is a currently-passing
+  query, the fix was reverted in full this loop
+  (`git checkout -- internal/optimizer/joinsearchseam.go`; `git diff`
+  confirmed empty, `go build ./...` clean) rather than shipped partially
+  guarded — a `recover()` scoped to the boundary panic (tried this loop)
+  does NOT also cover Q10's failure mode, which is a plain returned error
+  from a different pipeline stage, not a panic.
+  **Next steps, in order (design doc §46.4)**: (a) fix
+  `createPlanAtSearchRootRange`/`boundaryMap`'s totality contract to
+  exempt a semiAnti synthetic leaf's own coordinate range (never a real
+  "must-publish" requirement, since nothing reads a SEMI/ANTI join's RHS
+  columns above the join — same idea as the existing `fill`-licensed
+  narrowed-index-only-leaf pass); (b) root-cause whether Q10's OR-combined
+  EXISTS pair should ever have been admitted into the semiAnti chain at
+  all (PG itself only flattens a TOP-level AND-connected EXISTS into a
+  Join; an OR-combined EXISTS stays a correlated SubPlan) — the fix may be
+  to correctly DECLINE Q10's shape upstream rather than debug what happens
+  once it is wrongly admitted; (c) re-apply the one-line
+  `joinInfoList: ctx.joinInfoList` fix and re-run the FULL SF0.25 sweep
+  (not just Q69/Q10 in isolation) before landing. Also still pending: fix
+  `predp.go:159-176`'s Phase B doc comment — its "`used` is therefore
+  false on every production call today" claim is stale and actively
+  misleading.
 - [x] **M0142-0008c — scoping recon: does goopg need PG's `create_unique_path`
   (semi-join → de-duplicate RHS + inner join) to reach parity on TPC-DS
   Q10/Q35?** — filed by M0142-0008a-3(iii)'s §4.3 gate re-run (design doc §6).

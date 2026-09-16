@@ -5372,3 +5372,184 @@ that `len(s.joinInfoList) == 3` for Q69 post-fix, then re-check for the
 since c5. Also update `predp.go:159-176`'s Phase B doc comment — its
 "`used` is therefore false on every production call today" claim is now
 false and actively misleading to the next reader.
+
+## 46. c11 — root cause CONFIRMED live; the one-line fix unblocks the DP search but surfaces two further, pre-existing defects (both now REQUIRED before landing)
+
+### 46.1 Method
+
+Same private-binary method as c10 (§45.2), extended: a private SF0.25 data
+directory copy (`tmp/c11-sf025-data`, removed at the end of this loop) run
+WITHOUT the cgroup wrapper (`scripts/goopg-test-run.sh` does not forward
+env vars through `systemd-run --user --scope` unless `--setenv` is passed,
+so `GOOPG_PGSHAPED_DP_TRACE=1` silently failed to reach the server under
+the wrapper — confirmed by an all-zero-byte trace log; running the private
+binary directly, with `GOMEMLIMIT=4GiB` set by hand, fixed it). Temporary
+(reverted before commit) pointer-identity prints were added at three
+points: `tryPGShapedJoinSearch`'s entry, its semiAnti population loop
+(joinsearchseam.go:593-597), and `joinIsLegal`'s two error-return arms
+(joinsearchlevel.go).
+
+### 46.2 Root cause: NOT two independently-built clones — a single, unconditional double-append
+
+c10 (§45.3) hypothesised "two independently-built pointer-distinct
+`*SpecialJoinInfo` copies," provenance untraced. Live tracing this loop
+found the true mechanism, and it is simpler and fully explained by reading
+the code — no clone theory needed:
+
+`tryPGShapedJoinSearch`'s semiAnti population loop
+(joinsearchseam.go:593-597, landed by c6) already threads each semiAnti
+link's `*SpecialJoinInfo` into `ctx.joinInfoList`, deduplicated by pointer
+via `joinInfoListHas`. A live trace confirmed this leaves `ctx.joinInfoList`
+holding exactly 3 unique pointers for Q69, immediately after the loop.
+
+Twenty-odd lines later, the SAME function builds the search's own local
+`joinInfoList` field with:
+
+```go
+joinInfoList: semiAntiJoinInfoList(ctx.joinInfoList, semiAnti),
+```
+
+`semiAntiJoinInfoList` (pre-c11) unconditionally appends `semiAnti`'s own
+`.sjinfo` pointers onto `base` (== `ctx.joinInfoList`) with NO dedup at
+all. Since `semiAnti`'s `.sjinfo` values are — by construction — the EXACT
+SAME pointers c6's loop had already folded into `ctx.joinInfoList` two
+dozen lines earlier, this appends each of the 3 links a SECOND time. The
+list `planJoinlistSearch` actually searches with therefore has 6 entries:
+`[A, B, C, A, B, C]`. `joinIsLegal` (joinsearchlevel.go:239-259) iterates
+the WHOLE list per candidate pair and its own "matches multiple
+SpecialJoinInfos" guard does not special-case re-visiting the identical
+pointer — it fires on the second occurrence of `A` exactly as it would for
+a genuine second, different SJInfo. Confirmed live:
+`joinIsLegal-multi rel1=0x1 rel2=0x8 prev=0x...dc00 cur=0x...dd50` — two
+DIFFERENT addresses in THIS particular run's numbers, which momentarily
+looked like it disproved the "same pointer twice" theory, until cross-
+checked against the population loop's OWN trace from the SAME run
+(`sjinfo=0x...ab0/b20/b90`) — a THIRD, still different set of addresses.
+This is explained by `semiAntiJoinInfoList`'s doc comment (pre-c11): it
+returns a COPY (`out := make(...); out = append(out, base...)`), so the
+`s.joinInfoList` slice `joinIsLegal` iterates over is a freshly-allocated
+array holding COPIES OF THE SAME POINTER VALUES twice — the pointer
+VALUES stored at index 0 and index 3 of that array are identical (both
+equal `ctx.joinInfoList[0]`), but printing `%p` of the loop variable `sj`
+mid-iteration for two DIFFERENT slice INDICES holding the SAME pointer
+value should still print the SAME address twice, not two different ones —
+so the address mismatch was a genuine puzzle, not just an artefact of
+copying the slice header. It was never resolved to the byte: two
+consecutive server rebuild-and-restart cycles between the three capture
+points (population-loop trace, then a rebuild adding the joinIsLegal
+prints, then a further rebuild) each reallocate the whole heap from
+scratch, so ASLR/allocator layout differs per PROCESS run and the three
+address groups (`ab0`-group, `dc00`-group, `dd50`-group) were captured
+across what turned out to be non-comparable process instances in the
+first two capture attempts — only the FINAL, single-process capture (one
+truncated log, one `psql -f -` invocation, both `joinIsLegal-multi` and
+the population trace lines within it) is the trustworthy one, and in that
+capture the `joinIsLegal-multi` pair's `prev`/`cur` were still two
+different addresses from EACH OTHER within the same run. That residual
+puzzle does not change the fix or its verification, though: regardless of
+the precise identity of the two colliding entries, reading
+`semiAntiJoinInfoList`'s call site shows it is handed a `base` that ALREADY
+contains what it is about to append again, so the list is a mechanical
+double-count by construction, and the fix (drop the second append) is
+correct independent of resolving exactly which two entries `joinIsLegal`
+printed.
+
+### 46.3 The fix landed, then reverted this same loop
+
+The fix: `joinInfoList: ctx.joinInfoList` (no wrapper call at all) — since
+`ctx.joinInfoList` is already complete by the time this struct literal is
+built, thanks to c6's population loop. `semiAntiJoinInfoList` becomes
+unreferenced and was deleted (`safe_delete_symbol`, zero other call sites
+in production or test code).
+
+Verified live via the SAME private-binary method: `ctx.joinInfoList` (and
+therefore `s.joinInfoList`) now holds exactly 3 entries; the
+`joinIsLegal-multi` decline for `(0x1, 0x8)` and its siblings disappeared;
+Q69's DP search — for the FIRST time in this entire c-series (c5 through
+c11) — produced `jointype=semi`/`jointype=anti` `DPPATH` lines and
+completed the full 6-relation problem (`DPTRACE end
+top={?3+?4+?5+c+ca+customer_demographics} ... status=ok`), where every
+prior loop's trace ended in `failed to build any 4-way joins`.
+
+**This success immediately exposed two further, pre-existing, entirely
+separate defects — both now on the critical path before this fix can
+ship:**
+
+1. **`createPlanAtSearchRootRange`'s boundary-totality panic
+   (createplanroot.go:264, via `boundaryMap`).** Once the DP search
+   actually PICKS a winning 6-leaf tree and tries to materialise it, it
+   panics: `"search root does not publish binding coordinate(s)
+   [91 92 ... 214]"` — 124 missing coordinates, a suspiciously round
+   number for "the semiAnti synthetic leaves' own internal columns"
+   (3 leaves × roughly 40 columns each, for `store_sales+date_dim`-style
+   sub-joins). The boundary's own doc comment (§21.1-ish region,
+   createplanroot.go:196-222) states its contract as "the root's layout
+   must be a PERMUTATION of `[0, bindingWidth)`" — i.e. EVERY leaf's
+   columns, including a semiAnti synthetic leaf's, must be individually
+   traceable to an output column of the searched root. That is almost
+   certainly the wrong contract for a semiAnti leaf specifically: a
+   SEMI/ANTI join never projects its RHS columns above itself by
+   definition (the RHS exists only to be tested, not read), so nothing
+   above the join should ever need to "publish" a semiAnti leaf's
+   internal columns at all — the boundary's totality check was written
+   before any leaf could BE a semiAnti synthetic leaf (S5b was always
+   out of scope until this c-series) and was never taught to exempt one.
+   This reads as a real, scoped, fixable gap — likely "treat a semiAnti
+   leaf's own coordinate range as always-fillable/prunable, the same way
+   `fill` already licenses a narrowed index-only leaf's dropped columns"
+   — but it is its own task, not a one-line change discovered in passing.
+2. **A genuinely different statement (TPC-DS Q10) that ALSO reaches the
+   newly-unblocked search regresses from PASS to a hard error**:
+   `outer column ref c_current_cdemo_sk/level=1 out of range (depth=0)`.
+   Q10's WHERE is `EXISTS(...) AND (EXISTS(...) OR EXISTS(...))` — an
+   OR-combined pair of EXISTS clauses, structurally different from Q69's
+   pure AND-chain of three EXISTS/NOT EXISTS. The error is a normal
+   returned error (not a panic; the server and connection survive), most
+   likely raised later than planning — during correlated-subplan
+   execution setup — which means the earlier `len(semiAnti) > 0`-scoped
+   `recover()` guard this loop first tried (to neutralise defect 1) does
+   NOT also neutralise defect 2: they are different failure modes at
+   different pipeline stages, not two symptoms of one bug. Confirmed via
+   `scripts/tpcds-sf025-regression.sh sweep` (run with a private
+   `GOOPG_BIN` to avoid the shared nightly binary): `PASS -Q10` /
+   `ERROR +Q10` in the status-delta, with Q69 correctly flipping to
+   `PASS  100 rows` (matching the git-tracked oracle) in the same sweep.
+
+Given a CONFIRMED regression on a currently-passing gate query
+(`scripts/tpcds-sf025-regression.sh sweep` is one of this project's
+required gates for planner/executor changes — see AGENT.md "Plan-parity
+harness" and CLAUDE.md's test-gate section), the fix was **reverted in
+full this same loop** (`git checkout -- internal/optimizer/joinsearchseam.go`,
+confirmed `git diff` empty for both touched files, `go build ./...`
+clean) rather than shipped with only a partial safety net. The double-
+append bug, its exact one-line fix, and the full live-trace evidence
+above are preserved here so the NEXT loop does not have to re-derive any
+of it — see c11 in `.ralph/fix_plan.md` for the concrete next steps.
+
+### 46.4 What lands c11 for real
+
+In order, since (a) is required before (b) can even be evaluated safely:
+
+1. **Fix `createPlanAtSearchRootRange`/`boundaryMap`'s totality contract
+   for a semiAnti synthetic leaf** (§46.3 item 1) — teach it that a
+   semiAnti leaf's own coordinate range is never a real "must-publish"
+   requirement, the same way a narrowed index-only leaf's dropped columns
+   already get a `fill`-licensed pass. Re-run this loop's exact repro
+   (private SF0.25 binary + `GOOPG_PGSHAPED_DP_TRACE=1`, apply ONLY the
+   `joinInfoList: ctx.joinInfoList` one-line fix from §46.3, run Q69) and
+   confirm the panic is gone and the `EXPLAIN` plan now shows a REAL
+   reordering (not just "search succeeded, still fell back").
+2. **Root-cause Q10's `outer column ref ... out of range (depth=0)`**
+   (§46.3 item 2) — first determine whether Q10's OR-combined EXISTS
+   pair should ever have been admitted into the semiAnti chain in the
+   first place (PG's own SEMI/ANTI unnesting only ever applies to a
+   TOP-level AND-connected EXISTS; an OR-combined EXISTS is a shape PG
+   itself keeps as a correlated SubPlan, never flattens into a Join) —
+   if `unnestExistsExpr`/`whereEligibleForPreDPUnnest` is over-admitting
+   Q10's OR shape, the right fix may be to correctly DECLINE it upstream
+   (matching PG's own scope) rather than debug what happens once it is
+   wrongly admitted.
+3. Re-apply the §46.3 one-line `joinInfoList: ctx.joinInfoList` fix
+   (delete `semiAntiJoinInfoList`) and re-run the FULL
+   `scripts/tpcds-sf025-regression.sh sweep` (not just Q69/Q10 in
+   isolation) to confirm zero verdict regressions before landing.

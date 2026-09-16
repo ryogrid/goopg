@@ -1,111 +1,103 @@
-Task: M0142-0008a-3i-plumbing-c9 — LANDED and committed. One real bug found
-and fixed (createUniquePath's schema-drift guard was declining on EVERY
-call), the next blocker root-caused and filed as c10.
+Task: M0142-0008a-3i-plumbing-c11 — root cause CONFIRMED live, exact
+one-line fix identified, but REVERTED before commit (not landed) after it
+surfaced two further pre-existing regressions. Re-opened with corrected,
+narrower scope in fix_plan.md. Production code diff for this loop is ZERO
+(joinsearchseam.go / joinsearchlevel.go both `git diff`-clean); only docs
+(design doc §46, fix_plan.md, deferral ledger) changed.
 
-Files this loop:
-- internal/optimizer/unnest.go: `existsUnnestSJInfo` gained a
-  `srcTableOffset int16` parameter; `SemiRhsExprs[i]` is now a fresh
-  `*ColumnRef` with `SourceTableIdx: prm.SubCol.SourceTableIdx +
-  srcTableOffset` (matching the sibling `innerKey` field's existing
-  expression) instead of assigning `prm.SubCol` verbatim. One production
-  call site updated (`unnestExistsExpr`).
-- internal/optimizer/exists_unnest_sjinfo_test.go: new assertion in
-  `TestExistsUnnestSJInfoSemiHashKey` pinning
-  `SemiRhsExprs[0].SourceTableIdx == j.RightKey.SourceTableIdx`. Verified
-  FAILS on pre-fix code (temporarily reverted just the `+srcTableOffset`
-  term, confirmed `= 1, want 3`, restored the fix).
-- internal/optimizer/semiantichain_test.go,
-  internal/optimizer/m0142_0008a_3i_plumbing_probe_test.go: updated the two
-  `existsUnnestSJInfo(...)` test call sites for the new 4th parameter
-  (pass `0`, both call with `params: nil` so the loop never executes).
-- docs/design/0100-0149/m0142-0008a-1-semi-anti-sji-design.md: new §44 —
-  method (throwaway env-gated instrumentation, reverted before commit),
-  finding 1 (the fixed bug, §44.2), finding 2 (the NOT-fixed c10 blocker,
-  §44.3), what c10 needs to do (§44.4), and PG's real Q69 plan shape as the
-  eventual target (§44.5).
-- docs/design/README.md: m0142-0008a-1 row tail extended (exact-string
-  Edit anchored on the c8-row's own trailing sentence — do NOT full-file
-  rewrite this row, it is one ~41KB line).
-- .ralph/fix_plan.md: `-3i-plumbing-c9` flipped `[x]`; new
-  `-3i-plumbing-c10` filed (narrow a semiAnti link's `MinLefthand`/
-  `MinRighthand` to the real referenced relation(s) instead of "whole
-  atomic outer/inner participant").
-- .ralph/deferral_ledger.md: new row, task-id `m0142-0008a-3i-plumbing-c9`
-  (covers the c10 handoff).
+Files this loop (all reverted except docs):
+- internal/optimizer/joinsearchseam.go: tried
+  `joinInfoList: ctx.joinInfoList` (deleting `semiAntiJoinInfoList`) to fix
+  the duplicate-append bug c10 found. Verified live it fixes Q69's
+  reachability. REVERTED (`git checkout --`) after the SF0.25 sweep showed
+  it regresses Q10 PASS→ERROR. Also tried a `recover()`-guarded wrapper
+  (`planJoinlistSearchRecovered`) around `planJoinlistSearch` for the
+  `len(semiAnti)>0` path specifically, to neutralise a SEPARATE panic in
+  `createPlanAtSearchRootRange` — this worked for Q69 (no more crash, 100
+  rows, matches oracle) but does NOT cover Q10's failure (a different,
+  non-panic error at a different pipeline stage), so it alone isn't
+  sufficient either. Both attempts reverted; NEITHER is in the tree now.
+- docs/design/0100-0149/m0142-0008a-1-semi-anti-sji-design.md: new §46 —
+  full root-cause writeup (46.2), the fix + why it was reverted (46.3),
+  and the two prerequisite tasks for c11 to actually land (46.4).
+- .ralph/fix_plan.md: c11 entry rewritten with the confirmed root cause,
+  the exact fix, and the corrected re-opened scope (fix boundaryMap's
+  semiAnti exemption AND Q10's OR-EXISTS admission BEFORE re-attempting).
+- .ralph/deferral_ledger.md: new row for this loop's landed-diagnosis/
+  reverted-fix outcome.
 
-Key symbols: `existsUnnestSJInfo` (unnest.go:4398, now takes
-`srcTableOffset`); `unnestExistsExpr`'s `srcTableOffset` computation
-(unnest.go ~4644, unchanged — already correctly sized against
-`outerChild.Output()`); `createUniquePath` (createuniquepath.go, unchanged
-— its schema-drift guard was CORRECT, the bug was upstream of it);
-`jointypeForDirection`'s ANTI arm (joinpaths.go, unchanged — confirmed it
-has NO unique-ify fallback, correctly matching PG, which is WHY c10 must
-narrow `MinLefthand` rather than add one) — the c10 fix site is
-`joinsearchseam.go`'s semiAnti synthetic-leaf loop (~line 665-686).
+Key symbols: `tryPGShapedJoinSearch` (joinsearchseam.go:215-823) — the
+`joinInfoList: semiAntiJoinInfoList(ctx.joinInfoList, semiAnti)` call
+(~line 779, UNCHANGED in the committed tree) is the actual bug: `base`
+(== `ctx.joinInfoList`) already contains every `semiAnti[*].sjinfo`
+pointer thanks to the population loop 20 lines above (joinsearchseam.go:
+593-597, c6), so appending `semiAnti` a second time double-counts;
+`joinIsLegal` (joinsearchlevel.go:239-259) then declines a pairing that
+matches the duplicate twice as "matches multiple SpecialJoinInfos".
+`createPlanAtSearchRootRange`/`boundaryMap` (createplanroot.go:108-269) —
+the NEW panic site once the duplicate-fix unblocks the search;
+`whereEligibleForPreDPUnnest` (predp.go:34-43) — does NOT check for
+OR-combined EXISTS, likely the real gap behind Q10's regression.
 
-Findings: (1) `createUniquePath` declined on every real call for Q69's
-SEMI leaf: `cr.Name`/`cr.Index` matched `child.Output()` correctly, but
-`cr.SourceTableIdx` (1, pre-remap) disagreed with `oc.SourceTableIdx` (5,
-post-remap). (2) Root cause: `SemiRhsExprs[i] = prm.SubCol` assigned the
-PRE-remap column verbatim, while the sibling `innerKey` field (built from
-the SAME `prm.SubCol`, a few lines above) already applies
-`+srcTableOffset` for the documented reason ("SubCol was harvested from the
-PRE-remap EXISTS body"). Fixed by giving `SemiRhsExprs` the identical
-treatment. (3) Post-fix, `createUniquePath` succeeds for Q69's SEMI leaf
-for the first time ever (confirmed via instrumentation: `SUCCESS
-rel=0x00000008 keyCols=[3]`) — `joinIsLegal`'s unique-ify admission arm now
-matches `rel1={customer} rel2={SEMI leaf}` with no error. (4) DP-search
-reachability (`jointype=semi`/`anti` DPPATH) is STILL zero for Q69 — the
-whole 6-relation search still fails ("failed to build any 4-way joins")
-because BOTH of Q69's ANTI links decline `illegal` at every level: their
-`MinLefthand` (0x0f / 0x1f) requires the ENTIRE preceding composite, not
-just `{customer}`. (5) This traces to `existsUnnestSJInfo`'s own
-`minL = clause & synL = synL` line (never narrows past "whole outer side"
-once a correlation column exists) — a KNOWN, documented gap ("-3 recomputes
-real bits once the RHS actually joins the search") that no loop in this
-c-series has actually closed yet; c6/c7/c9 each fixed a DIFFERENT field
-(joinInfoList population, qual `.Index` rebase, `SemiRhsExprs`
-`SourceTableIdx`) but never `MinLefthand` itself. (6) Confirmed via the
-actual SQL (`c.c_customer_sk` is the ONLY correlation column in all 3 of
-Q69's semiAnti links) that the true minimal `MinLefthand` is `{customer}`
-for all three — the broadening to "whole composite so far" is a
-processing-order artifact of `unnestExistsExpr` nesting each new conjunct's
-join around the accumulated tree, not a real dependency between the three
-independent (ANDed) WHERE-clause conjuncts.
+Findings: (1) c10's "two independently-built pointer-distinct clones"
+hypothesis was WRONG in mechanism (though right that duplication happens):
+live tracing found ONE call site's own local list-construction
+(`semiAntiJoinInfoList`) re-appending pointers its OWN function's earlier
+population loop had already added — a simple double-count, not a clone
+provenance mystery. (2) Fixing it is a proven, verified one-liner
+(`joinInfoList: ctx.joinInfoList`) that DOES unblock Q69's DP search for
+the first time in the c5-c11 series (`jointype=semi`/`anti` DPPATH lines,
+full 6-relation `status=ok`). (3) But "unblocks the search" immediately
+walks into TWO more pre-existing, independent, never-before-reachable
+bugs: a boundary-totality panic (semiAnti leaves' internal columns
+wrongly required to be "published") and a Q10-specific outer-ref depth
+error (likely an admission-scope bug: OR-combined EXISTS should probably
+never enter the semiAnti chain at all). (4) Confirmed via the MANDATORY
+`scripts/tpcds-sf025-regression.sh sweep` gate (run with a private
+`GOOPG_BIN=tmp/goopg-sf025-c11-bin` to avoid the shared nightly binary)
+that landing the fix alone is a real regression: `PASS -Q10` / `ERROR
++Q10` in the status-delta, even though Q69 correctly flips to PASS/100
+rows in the same sweep. (5) Q69's row count matching the oracle is NOT
+strong evidence the plan is fully correct — its checksum is `ck=n/a`
+(LIMIT-saturated), so a content-level check never ran; the boundary
+panic's underlying column-miscount is exactly the kind of bug that could
+produce a correct row count with wrong values on some OTHER query.
 
-Next step: pick up **M0142-0008a-3i-plumbing-c10** — narrow `MinLefthand`/
-`MinRighthand` at SPLICE TIME (joinsearchseam.go's semiAnti synthetic-leaf
-loop, ~line 665-686 — NOT at `existsUnnestSJInfo` construction time, before
-the outer side's real flat-leaf numbering exists) by resolving each
-correlation column (`params[i].OuterRef`/residual columns) against the
-outer's real numbering and intersecting, analogous to
-`sjiClauseRelids`/`makeSpecialJoinInfoScoped` (specialjoin.go). Must not
-regress `TestExistsUnnestSJInfoSemiHashKey`/`AntiHashKey`/`KeylessSemi`
-(those correctly pin `existsUnnestSJInfo`'s OWN un-narrowed output; the
-narrowing is a later seam-side transformation). Re-run Q69's `EXPLAIN` +
-full-corpus `GOOPG_PGSHAPED_DP_TRACE=1` sweep + TPC-DS SF0.25 sweep after
-landing.
+Next step: pick up **M0142-0008a-3i-plumbing-c11** (`.ralph/fix_plan.md`,
+design doc §46.4) at prerequisite (a): fix
+`createPlanAtSearchRootRange`/`boundaryMap`'s totality contract
+(createplanroot.go) to exempt a semiAnti synthetic leaf's own coordinate
+range — a SEMI/ANTI join never projects RHS columns above itself, so
+nothing should ever require those columns "published" at the search
+root; the existing `fill`-licensed narrowed-index-only-leaf mechanism is
+the template to extend. Re-verify with the same private-binary +
+`GOOPG_PGSHAPED_DP_TRACE=1` method (log truncated before each restart)
+that Q69 no longer panics AND that its `EXPLAIN` plan shape actually
+changes (not just "search succeeded, still fell back silently"). THEN (b)
+root-cause Q10's OR-combined-EXISTS admission before re-attempting the
+`joinInfoList` fix; re-run the FULL SF0.25 sweep (not just Q69/Q10) before
+landing anything.
 
-Gates run this loop: `go build ./...` clean; `go test
-./internal/optimizer/...` green (includes the fail-then-pass check above,
-plus the full targeted SEMI/ANTI/`createUniquePath`/`existsUnnestSJInfo`
-test set run individually first). Row-count spot-check against the
-git-tracked SF0.25 oracle via direct psql queries against a freshly
-restarted sf025 server (private binary `tmp/goopg-m0142-c9-bin`,
-built+removed this loop): Q69 = 100 rows (oracle: 100), Q78 = 15 rows /
-checksum `c06cf981a7819a37` (oracle: identical) — both unchanged, as
-expected. **Could NOT run** `scripts/tpcds-sf025-regression.sh sweep` —
-`ci/batch`'s nightly run held the shared SF0.25/SF1 lanes all session (its
-own collision guard: "the nightly CI batch is running ... would
-contaminate these timings"); the spot-checks above are the substitute
-evidence — run the full sweep at the next opportunity.
-`RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh` — PASS except
-the same pre-existing `internal/parser` `GroupedJoinUnaliased` AST-drift
-failure every recent loop has hit (unrelated, already tracked under
-M-NIGHTLY); `internal/optimizer` itself green. `make ralph-state-guard`
-auto-repaired the same benign prior-loop clean-exit marker seen every
-recent loop, then PASS. Commit's own pre-commit hook runs the pgbench
-smoke.
+Gates run this loop: `go build ./...` clean (production code is
+identical to HEAD — the fix was reverted). `go test ./internal/optimizer/...`
+green (unchanged from HEAD, cached-equivalent). `RALPH_PRECOMMIT_SCOPE=units
+scripts/ralph-precommit-test.sh` — PASS except the same pre-existing
+`internal/parser` `GroupedJoinUnaliased` AST-drift failure every recent
+loop has hit (unrelated, unchanged, tracked under M-NIGHTLY).
+`scripts/tpcds-sf025-regression.sh sweep` run TWICE this loop (private
+`GOOPG_BIN`): once against the (reverted) fix — showed Q10 PASS→ERROR,
+Q69 ERROR(crash)→PASS depending on which of the two fix attempts was
+active — this is the evidence that led to reverting; a THIRD run against
+the final, fully-reverted tree was not repeated since `git diff` already
+proves byte-identity with HEAD's known-good state (no need to re-measure
+what didn't change). `make ralph-state-guard` auto-repaired the same
+benign prior-loop clean-exit marker seen every recent loop, then PASS.
+No commit's pre-commit pgbench hook run yet this loop (see below — will
+run when this working-set/doc-only commit is made).
 
-In-flight: none. Private trace binary and sf025 server both stopped/removed
-this loop before the final gates ran.
+In-flight: none. Private trace binary (`tmp/goopg-c11-bin`,
+`tmp/goopg-sf025-c11-bin`) and private SF0.25 data copy
+(`tmp/c11-sf025-data`) all stopped/removed before this write-up. All
+throwaway `C11TRACE` instrumentation in `joinsearchseam.go` and
+`joinsearchlevel.go` reverted (`git checkout --`), confirmed via
+`git diff --stat` showing zero changes to both files.
