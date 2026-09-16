@@ -2694,3 +2694,191 @@ what shape the append takes would just be unused plumbing). Do not attempt
 the cutover (flipping `admitSemiAnti` to `true` in production) before 6b
 is resolved — the `FOR UPDATE` crash in §24.2 is a real regression risk,
 not a style concern.
+
+## 25. Item 6b design pass (2026-09-16) — Finding C: `cumOffsets` itself
+misattributes any real leaf positioned after a Semi/Anti RHS leaf, a
+wrong-answer bug independent of and worse than §24.2's `ctx.bindings`
+crash risk
+
+Picking up §24.3's "design item 6b concretely" resume point (side-channel
+vs. audited-flag was framed purely as a `ctx.bindings`-visibility question).
+Live-traced what actually happens once a synthetic leaf sits inside
+`extractSearchLeaves`'s walk, rather than assuming the walk's own
+`cumOffsets` bookkeeping is fine once `ctx.bindings` is handled. It is not:
+the search's internal coordinate system breaks on its own, with no
+`ctx.bindings` involvement at all.
+
+### 25.1 Confirmed live: `qualAC` gets attributed to the wrong leaf
+
+Trace of the shape `(A SEMI JOIN B) JOIN C ON qualAC` (qualAC references
+`C`, resolved pre-unnest against real `ctx.bindings` at absolute column
+index `wA+k`, where `wA` = A's real width, `k` = C's column offset within
+its own row):
+
+- `extractSearchLeaves`'s walk (joinsearchseam.go:1118-1273) reaches the
+  outer INNER join (`j.Left`=Semi(A,B), `j.Right`=C) as the ROOT call
+  (`walk(node, true)`, line 1269). `base := width` (line 1199) is captured
+  **before** recursing into `j.Left`/`j.Right`, and since this is the root
+  call, `width` is `0` at that instant regardless of what the Semi/Anti
+  node inside `j.Left` later appends. `if pred != nil && base != 0` (line
+  1224 / the general-INNER-link arm) is therefore false, and `qualAC` is
+  stored into `onQuals` **completely unrebased** — it stays at absolute
+  index `wA+k`, exactly as `ctx.bindings` originally resolved it.
+- Walking `j.Left` triggers the Semi arm (lines 1124-1186): walks `A` (a
+  real leaf, `width` 0→`wA`), then unconditionally appends `j.Right`=`B`
+  as one opaque leaf and adds ITS real width too (`width +=
+  len(j.Right.Output())`, line 1150) — `width` is now `wA+wB`.
+- Walking `j.Right`=`C` appends it as leaf index 2, so `cumOffsets` (built
+  at joinsearchseam.go:322-328 purely from `widths[]` in walk order) has
+  `cumOffsets[2] = wA+wB` — **not** `wA`.
+- `relidsOfExpr(qualAC, cumOffsets)` (joinrestrict.go:470-493) attributes
+  a `ColumnRef.Index` to a leaf by pure numeric containment against
+  `cumOffsets`'s ranges, checked in leaf order. `qualAC`'s reference to
+  `C` carries index `wA+k`. For any `k < wB`, that index falls inside
+  `cumOffsets[1]..cumOffsets[2]` = `[wA, wA+wB)` — leaf **1**, the
+  synthetic `B` — and is misattributed there instead of to leaf 2 (`C`),
+  because leaf 1 is checked first in `relidsOfExpr`'s linear scan and the
+  ranges overlap in absolute-index terms whenever `wB > 0`.
+- This is not a corner case gated behind a rare shape: `wB` (the RHS
+  leaf's real output width) is **not guaranteed to be 0**. A bare
+  `EXISTS(SELECT 1 …)` has `wB=0` (dormant), but the M14 zero-equijoin NL
+  path (unnest.go:4469-4478, already inside `-b1`'s targeted shape set)
+  and the R3-4 composite-equijoin path (unnest.go:4480-4516) both keep
+  real columns live in `j.Right.Output()`, so `wB>0` for exactly the
+  shapes item 6 exists to admit.
+- `cumOffsets` is not a private array the offset-agreement check alone
+  reads: grepping every caller confirms it is the **same** array (no
+  per-caller copies) fed into `relidsOfExpr`/`tableForCol` from
+  `buildRestrictInfos`, `partitionConjunctsForJoinPlanning`,
+  `deriveOuterLinkConstants`, `outerOnQualsOK`,
+  `innerOnQualsBelowNullableOK`, `searchConsumes`, AND `semiAntiOnQualsOK`
+  itself — every one of them would misattribute a real leaf's qual to a
+  preceding synthetic leaf the same way once ANY leaf follows an admitted
+  Semi/Anti node in walk order. This is strictly worse than §24.2's
+  finding: not a crash on an unusual statement shape, but a silent
+  **wrong join-legality / wrong-rows** risk on the exact statement shapes
+  item 6 is being built to admit.
+
+### 25.2 Why "just zero the synthetic leaf's width in `cumOffsets`" does not work
+
+The tempting fix — give the synthetic leaf's own slot 0 width so it never
+steals a later leaf's columns — collides with a genuine, already-landed
+consumer that needs the OPPOSITE:
+
+- `unnestExistsExpr` (unnest.go:4680-4705) builds the Semi/Anti join's own
+  correlation predicate using `outerKey.Index = params[0].OuterRef.Index`
+  (the outer/LHS reference, untouched) and `innerKey.Index = outerWidth +
+  params[0].SubCol.Index` (the RHS reference) — i.e. it ALREADY encodes
+  "the RHS leaf occupies a real-width slice starting right after
+  `outerWidth`", the same scheme `cumOffsets` uses today.
+- `semiAntiOnQualsOK` (joinsearchseam.go:1425-1444) requires
+  `relidsOfExpr(c, cumOffsets)` to find the semi/anti link's own predicate
+  spanning both `lk.lhs` and `lk.rhs` — i.e. it depends on the RHS's real
+  width being visible in `cumOffsets` at the RHS's own slot. Zeroing it
+  breaks this existing, already-tested check instead of fixing the
+  ancestor-qual misattribution.
+- Zeroing only the FORWARD PROPAGATION (RHS keeps its own [lo,hi) range
+  for self-classification, but does not advance the running total for
+  what comes after) does not fix it either: it just makes `B`'s range
+  `[wA, wA+wB)` and `C`'s range `[wA, wA+wC)` **overlap** instead of `C`
+  landing past `B` entirely — `relidsOfExpr`'s first-match linear scan
+  still resolves any `k < wB` to `B`, not `C`. The two interpretations of
+  "index `wA+k`" (an RHS-local reference vs. a real ctx.bindings-resolved
+  `C` reference) are genuinely different quantities that happen to share
+  the same integer, not an off-by-a-constant problem a single shift can
+  repair.
+- Rebasing every ordinary qual near a Semi/Anti insertion point via the
+  existing `rebaseChainQual`/`cloneExprRefs` machinery was also
+  considered and ruled out as the general answer: the shift a given qual
+  needs is a function of WHICH leaf(s) it references, not of which join
+  node it is attached to — a qual naming two real leaves that straddle
+  the insertion point would need a piecewise shift the current one
+  scalar `base` per join node cannot express, and rewriting AST
+  `ColumnRef` nodes that are otherwise expected to stay byte-identical to
+  what the parser produced is exactly the class of change this project
+  treats as high-risk (`pattern_sibling_paths_must_agree`-shaped: a missed
+  qual site is a silent wrong-rows bug, not a build error).
+
+### 25.3 Direction that avoids rewriting any pre-existing qual: decouple
+leaf/RelSet-bit space from column-index space
+
+The conflict exists only because the code currently conflates two spaces
+into one `cumOffsets []int`:
+
+1. **leaf/RelSet-bit space** — walk position (`0..nprefix-1`), what
+   `scans`/`widths`/`semiAntiChainLink.lhs`/`.rhs`/DP itself speak. Must
+   stay in natural walk order; nothing here needs to change.
+2. **column-index space** — what `ColumnRef.Index` values live in and what
+   `relidsOfExpr`/`tableForCol` classify against. Currently assumed to be
+   a monotonic prefix-sum of walk-order `widths[]`, which is exactly the
+   assumption a synthetic leaf violates.
+
+Proposed direction: leave every REAL leaf's column-index range **exactly**
+as `ctx.bindings` already assigned it — untouched, no rewriting, so every
+pre-existing qual (onQuals, outer-link quals, anything already resolved
+against the real FROM list) keeps working with zero code changes at the
+qual site. Give each SYNTHETIC (Semi/Anti RHS) leaf a column-index range
+**appended after the total real width** instead of inline at its walk
+position — e.g. the first synthetic leaf's range starts at `totalRealWidth`,
+the second at `totalRealWidth + firstSyntheticWidth`, and so on, regardless
+of where each sits in walk order. `unnestExistsExpr`'s `innerKey.Index`
+construction (unnest.go:4694-4705) would source its base from this
+"next synthetic slot" counter instead of `outerWidth` — a small, local
+change confined to unnest.go's own index construction.
+
+Consequence for the shared machinery: `relidsOfExpr`/`tableForCol`'s
+single monotonic `cumOffsets []int` assumption no longer holds once
+synthetic ranges are appended out of walk-position order — their
+range-matching loops (joinrestrict.go:470-493, :575-584) need generalizing
+from "scan a monotonic prefix-sum array" to "scan an explicit per-leaf
+`(lo, hi)` table" (still one linear pass per call, just not required to be
+sorted). This is the concrete code change item 6b's eventual coding step
+must make: build the `(lo, hi)` pairs once in `joinsearchseam.go` (real
+leaves keep their `ctx.bindings`-derived ranges verbatim; synthetic
+leaves get the out-of-band ranges above) instead of the bare
+`cumOffsets []int` at lines 322-328, and thread that table everywhere
+`cumOffsets` is threaded today.
+
+This resolves §24.2's Finding B for free, as a side effect rather than a
+separate design choice: since no `ctx.bindings` entry is ever added or
+mutated under this scheme, none of the ~24 unaudited `ctx.bindings`
+consumer sites (including the unguarded `FOR UPDATE` crash site) are
+touched at all. The "side-channel" §24.2 left undesigned and the fix for
+Finding C turn out to be the same mechanism: a per-leaf table
+`joinsearchseam.go` owns and reads directly, never exposed to
+`resolveColumnRef`, star-expansion, locking, or any other `planner.go`
+consumer.
+
+**Not yet resolved by this loop** (next concrete step): whether the
+FINAL winning plan's build/emit step — wherever `-b1`'s SJInfo-rebuild
+(item 4, §22.4) currently re-derives real leaf-index bits post-search —
+also needs an analogous re-derivation of `innerKey`/`outerKey`.Index once
+the winning tree's actual real LHS width is known at build time. It may
+already re-derive `outerWidth` fresh from `outerChild.Output()` when the
+final `Join` node is constructed (mirroring how `unnestExistsExpr` builds
+it today), in which case the out-of-band synthetic region only matters
+during the search's own legality/costing decisions and never reaches the
+emitted plan — this needs a live trace of the "rebuild the tree from the
+winning leaf order" step before coding, not an assumption either way.
+
+### 25.4 Resume point
+
+`M0142-0008a-3i-plumbing-b2` item 6b is now two coupled sub-decisions,
+not one: (a) §24's `ctx.bindings`-visibility question, and (b) this
+section's `cumOffsets`/`relidsOfExpr` coordinate-space conflict — and
+§25.3 shows a single mechanism (the per-leaf `(lo,hi)` side-channel
+table) settles both at once, which is the reason to treat them as one
+design, not two. Concrete next steps, in order: (1) verify §25.3's open
+question about the final-tree build step; (2) replace `cumOffsets []int`
+in `joinsearchseam.go` with the per-leaf `(lo,hi)` table and update
+`relidsOfExpr`/`tableForCol` (joinrestrict.go) to scan it instead of
+assuming a monotonic prefix sum; (3) point `unnestExistsExpr`'s
+`innerKey.Index` construction at the new "next synthetic slot" counter;
+(4) only then code item 6a's `*resolveContext` plumbing, since 6a's
+`ctx.bindings` append is now understood to be unnecessary rather than
+merely undesigned — the per-leaf table replaces it outright. Do not
+attempt the cutover (`admitSemiAnti=true` in production) before this
+lands and is verified against a live fixture exercising the
+`(A SEMI JOIN B) JOIN C ON qualAC`-shaped case directly (a new unit test,
+not just the existing `-b1` tests, none of which exercise a real leaf
+positioned after a Semi/Anti node).

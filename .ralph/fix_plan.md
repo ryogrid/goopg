@@ -3723,6 +3723,32 @@ cross-layer programme that has never been scoped.
     before proving it's unreachable for the engaged family. Likely also
     depends on enough of `M0142-0008c-3c`/`-3d`/`-4`'s path-builder work existing for a real
     Semi/Anti pair to be admissible during DP at all.
+    **Item 6b design pass (design doc §25, 2026-09-16)**: found a second,
+    worse problem than the ctx.bindings-visibility question above — the
+    search's own `cumOffsets` array (shared into `relidsOfExpr`/
+    `tableForCol` from every legality/restriction-list consumer in
+    `joinsearchseam.go`/`joinrestrict.go`/`local_filters.go`) misattributes
+    a REAL leaf's pre-existing qual to the synthetic Semi/Anti RHS leaf's
+    bit whenever that leaf's real output width is nonzero (live-traced on
+    `(A SEMI JOIN B) JOIN C ON qualAC`; not a crash, a silent wrong-rows
+    risk, and independent of `ctx.bindings` entirely). Settled direction
+    (§25.3): decouple leaf/RelSet-bit space (unaffected) from column-index
+    space — leave every real leaf's `ctx.bindings` range untouched, give
+    each synthetic leaf an out-of-band range appended after the total real
+    width, and generalize `relidsOfExpr`/`tableForCol` from a monotonic
+    prefix-sum scan to an explicit per-leaf `(lo,hi)` table. This SAME
+    mechanism is also §24.2's undesigned side-channel (no `ctx.bindings`
+    entry ever created, so none of the ~24 sites, including `FOR UPDATE`,
+    are touched) — 6b is one design, not two. Concrete next steps before
+    coding 6a: (1) verify whether the final winning-plan build step already
+    re-derives `outerWidth` fresh at build time or also needs this fix;
+    (2) replace `cumOffsets []int` with the per-leaf `(lo,hi)` table in
+    `joinsearchseam.go` and update `relidsOfExpr`/`tableForCol`; (3) point
+    `unnestExistsExpr`'s `innerKey.Index` construction at the new
+    out-of-band counter; (4) THEN code 6a (now understood to be unnecessary
+    as a `ctx.bindings` append — the per-leaf table replaces it). New unit
+    test needed: a `(A SEMI JOIN B) JOIN C`-shaped fixture, not covered by
+    any `-b1` test.
   **Independent, unfiled resume-point hint** (not sized/numbered — noted for
   whoever picks up S5a's own eligibility gate): relaxing
   `whereEligibleForPreDPUnnest` to per-sublink granularity would upgrade
