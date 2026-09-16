@@ -4730,6 +4730,87 @@ cross-layer programme that has never been scoped.
   `scripts/tpcds-sf025-regression.sh sweep` with a private `GOOPG_BIN`
   before landing either piece together. Also still pending (carried from
   c11-c13, not actioned): `predp.go:159-176`'s stale Phase B doc comment.**
+- [ ] **M0142-0008a-3i-plumbing-c16 — implement c15's resume point (SJInfo
+  Path→Join carrier for BOTH the nestloop AND hash arms — hash included
+  because M0142-0008a-3(iii) already lifted its SEMI/ANTI decline, making
+  c15's "nestloop is the one reachable arm" comment stale) and re-apply the
+  `joinInfoList: ctx.joinInfoList` fix; both build and unit-test clean
+  except for ONE test, whose failure is evidence the fix works, not a
+  regression.** Design doc §51.
+  **What landed and was verified, then reverted (see below)**: (1)
+  `Path.SJInfo *SpecialJoinInfo` field (path.go); (2) `addNestLoopPath`
+  AND `addHashJoinPath` (pathgen.go) both now store `SJInfo: sjinfo` on the
+  `&Path{...}` they build — hash needed it too, since `jointypeForDirection`
+  no longer declines SEMI/ANTI for the hash arm (createHashJoinPlan's own
+  comment was stale, claiming "SEMI/ANTI are nestloop-only"; fixed in the
+  same edit); (3) `createNestLoopPlan` and `createHashJoinPlan` (createplannl.go,
+  createplanjoin.go) both copy `SJInfo: p.SJInfo` onto the `*Join` node they
+  build; (4) `joinInfoList: ctx.joinInfoList` (joinsearchseam.go, replacing
+  the unconditional-duplicate-append `semiAntiJoinInfoList` call, which is
+  now dead and was deleted) — confirmed SAFE by reading: `ctx.joinInfoList`
+  already receives every semiAnti link's SJInfo via a DEDUPING append
+  (`joinInfoListHas` guard, joinsearchseam.go:594-595, landed by c4) earlier
+  in the same function, so the deleted call was adding a second,
+  undeduped copy of each entry — a real, confirmed duplicate-list bug, not
+  a false lead. With (1)-(4) applied: `go build ./...` clean,
+  `TestExtractSearchLeaves_AdmitSemiAnti_NarrowsMinLefthandToCorrelatedRelation`
+  (semiantichain_test.go:316, the SJInfo-nil tripwire c15 left) went GREEN —
+  proof the Path→Join carrier fix is correct — but a LATER assertion in the
+  SAME test then failed: `scans = 2 leaves, want 3`.
+  **Root cause of the new failure (confirmed by direct instrumentation, not
+  guessed)**: for this test's fixture (`SELECT t1.x, t3.a, t3.b FROM t1, t3
+  WHERE t1.x = t3.a AND EXISTS (SELECT 1 FROM t2 WHERE t2.z = t1.x)`),
+  `Plan()`'s FINAL tree is now `Project(Filter(Project(InnerJoin(SemiJoin(
+  SeqScan(t1), Project(SeqScan(t2))), SeqScan(t3)))))` — the search
+  evaluates `t1 SEMI t2` FIRST (t1 alone, not the {t1,t3} composite the test
+  fixture assumed), THEN joins t3 in above it. This is CORRECT and is the
+  whole point of the MinLefthand-narrowing work this c-chain built: since
+  the EXISTS correlates only to t1 (not t3), `joinIsLegal` now has enough
+  SJInfo data (thanks to c4's dedup-append actually reaching the search via
+  this loop's item (4)) to know the semi join may legally be evaluated
+  before t3 joins in, and the search finds/prefers that shape. The test's
+  fixture comment ("leaves t1 JOIN t3 as a raw *Join chain… reaching the
+  Semi join's LHS") is an assumption that was only ever true because the
+  search was DECLINING for Semi/Anti (the c11-era bug) — once the search
+  actually runs, it is free to choose a DIFFERENT, valid reordering, and
+  for this fixture, does. The failing assertion is downstream evidence the
+  underlying fix is right, not a sign anything in (1)-(4) is wrong.
+  **Reverted in full** (`git checkout -- internal/optimizer/createplanjoin.go
+  internal/optimizer/createplannl.go internal/optimizer/joinsearchseam.go
+  internal/optimizer/path.go internal/optimizer/pathgen.go`; diff empty
+  confirmed, `go test ./internal/optimizer/...` green) because the
+  pre-commit discipline requires green tests and fixing the test properly
+  needs more than a one-line patch (see resume point) — landing (1)-(4)
+  with a known-red test would repeat exactly the mistake this whole c-chain
+  has been careful to avoid.
+  **Concrete resume point**: re-apply (1)-(4) exactly as described above
+  (they are correct and were fully re-derived this loop; diff is small —
+  ~40 lines across 5 files, straightforward to reconstruct from this
+  entry), THEN fix
+  `TestExtractSearchLeaves_AdmitSemiAnti_NarrowsMinLefthandToCorrelatedRelation`
+  (semiantichain_test.go:296-364). Do NOT try to force the old tree shape
+  by hand-splicing fragments from two separately-`Plan()`-built queries —
+  position/coordinate spaces are per-statement (leftdeep-joins 03 §9 /
+  `goopg_two_column_coordinate_boundaries` memory) and splicing risks a
+  silently-wrong offset that makes the test pass for the wrong reason.
+  Two real options: (a) hand-construct the fixture tree directly from
+  `*SeqScan`/`*Join` literals (schema/position conventions already
+  demonstrated by `m0142_0008a_3i_verify_probe_test.go` and
+  `analyzedThreeTablesCatalog`), bypassing `Plan()`'s search entirely so the
+  test is a true white-box unit test of `extractSearchLeaves` again; or
+  (b) accept that the search may now legally choose either order, and
+  rewrite the test to locate the ACTUAL join-tree root reachable from
+  `node` (not hardcode "first Semi found") and assert the SJInfo-narrowing
+  invariant against whichever shape resulted, branching on which relation
+  (t1 vs the {t1,t3} composite) ended up on the semi join's LHS. (a) is
+  probably safer/more principled — it also stops the test depending on the
+  DP search's cost tie-breaking, which is exactly the kind of hidden
+  coupling this project's history warns about. `GOOPG_PGSHAPED_DP` (the
+  search on/off kill switch) does NOT help here — it is read into a
+  package-level `var` at init time (`joinsearch.go:76`), not re-read
+  per-call, so `t.Setenv` in a test has no effect on an already-running
+  binary. Still pending (carried since c11): `predp.go:159-176`'s stale
+  Phase B doc comment.**
 - [x] **M0142-0008c — scoping recon: does goopg need PG's `create_unique_path`
   (semi-join → de-duplicate RHS + inner join) to reach parity on TPC-DS
   Q10/Q35?** — filed by M0142-0008a-3(iii)'s §4.3 gate re-run (design doc §6).
