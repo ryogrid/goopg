@@ -231,3 +231,79 @@ Resume point unchanged from the Verdict section above: still gated on
 `M0141-S2b`'s relevant sub-task landing per witness group before the next
 Finding-3 step (the `cost_incremental_sort` composition) can be built and
 exercised against real candidates.
+
+## Update 2026-09-17b — cost_incremental_sort composition landed (Finding 3, table row 2)
+
+Landed `costIncrementalSort` (`internal/optimizer/cost_funcs.go`, next to
+`sortByteBranch`/before `costAgg`), Finding 3's table row 2:
+`cost_incremental_sort` (`postgres/.../costsize.c:2000-2126`) composed over
+the already-existing `costSortRunWithWidth` (`cost_tuplesort`). Same
+groundwork posture as the prefix-count helper from the 2026-09-17 update
+above: zero production callers, independently unit-tested (4 new tests in
+`internal/optimizer/cost_incremental_sort_test.go`), does not touch
+`addOrderedPaths` or any candidate-producing path.
+
+**Resolved the open question from the prior update**: whether this step
+needs S2b's real multi-candidate `Pathlist` to be meaningfully testable, or
+is testable standalone like the prefix-count helper. Reading
+`cost_incremental_sort` closely shows every one of its inputs is a plain
+scalar (`input_tuples`, `width`, `input_startup_cost`/`input_total_cost`,
+`presorted_keys`/`pathkeys` length, `sort_mem`, `limit_tuples`) except
+`input_groups`, which upstream derives via `estimate_num_groups` *inside the
+same function*. This composition splits that one call out into a caller-
+supplied `inputGroups float64` parameter instead of computing it inline —
+the same split `costSortRunWithWidth` already uses for `ncols`/
+`avgVarBytes`/`width` (caller-computed, not re-derived). That makes the
+formula itself, which is what actually needed pinning against PG, fully
+testable with synthetic numbers; only the *wiring* that will call
+`estimateNumGroups` over a real presorted-key prefix needs S2b's rel to
+exist, and that wiring is a separate later step (the `addOrderedPaths` third
+arm, Finding 3 table row 4), not this one.
+
+One correctness note found while writing the independent pin: the function's
+per-tuple overhead term uses `comparisonCost=0` (folded, not a parameter),
+matching upstream — `cost_incremental_sort`'s only real caller
+(`costsize.c:3701`, the merge-join outer-sort case) always passes
+`comparison_cost=0.0`, and `cost_tuplesort` only adds `2*cpu_operator_cost`
+to its own local copy of that parameter, not the caller's, so PG's own
+per-tuple overhead term never sees the `+2*cpu_operator_cost` addition
+either. `costSortRunWithWidth` already encodes that same "always 0"
+convention (no external `comparisonCost` parameter at all), so
+`costIncrementalSort` follows it rather than inventing a parameter nothing
+upstream would ever set.
+
+Also found, while property-testing: the formula is **not monotonic** in
+`inputGroups` — cost decreases as groups grow (smaller per-group full-sorts
+dominate) until the fixed per-group reset overhead (`2*cpu_tuple_cost` per
+group) turns the curve back up near one-row-per-group. Verified by direct
+probing (`inputTuples=50000`: cost falls from groups=1 to a minimum near
+groups=25000, then rises again by groups=50000, staying below the groups=1
+baseline throughout the swept range) — an initial test asserting plain
+monotonicity was wrong and was corrected to the real invariant (bounded
+above by the single-group/fully-presorted case) before landing.
+
+Also updated `sort_pgrelationbytes_test.go`'s
+`TestCostSortRunWithWidthProductionCallersAreComplete` census (`cost_funcs.go`
+count 2 -> 3): `costIncrementalSort` is a genuine new `costSortRunWithWidth`
+call site (the per-group full-sort price) even though it has no callers of
+its own yet — the census tracks call sites, not reachability.
+
+- **Category movement**: none — still zero callers into any
+  candidate-producing path.
+- **shape-delta**: 0 (TPC-DS SF0.25 sweep re-run: PASS=96 MISMATCH=0,
+  PLAN-SHAPE changed=0).
+- **Stats epoch**: not applicable.
+- **Seam-decline census**: not applicable.
+- **Planning route**: not applicable.
+
+Resume point: Finding 3's table rows 1-2 (prefix-count helper, cost
+composition) are both now landed and independently tested. Still blocked on
+`M0141-S2b`'s relevant per-witness sub-task before row 3
+(`PathIncrementalSort`/`addOrderedPaths` third arm) can be attempted — that
+step needs a real multi-candidate `Pathlist` to build a presorted-prefix
+candidate over, which is exactly what S2b provides and today's callers do
+not. Re-check after each S2b sub-task lands whether the executor operator
+(row 5, built on the already-landed `sortPrefixEqual`/E-15) and EXPLAIN
+rendering (row 6) can also be staged ahead of the `addOrderedPaths` wiring,
+following the same "independently testable primitive first" pattern this
+task and the 2026-09-17 update both used.

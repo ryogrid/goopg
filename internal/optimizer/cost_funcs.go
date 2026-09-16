@@ -395,6 +395,82 @@ func sortByteBranch(cp costParams, tuples, output, inputBytes, outputBytes float
 	return "memory"
 }
 
+// costIncrementalSort is `cost_incremental_sort` (costsize.c:2000-2126): the
+// cost of sorting input that already arrives ordered by a leading prefix of
+// the requested pathkeys, one group per distinct value of that prefix. It
+// estimates the cost of fully sorting a single average-sized group with
+// `costSortRunWithWidth` (the same `cost_tuplesort` this package already
+// uses for a from-scratch Sort — `sortPathForBounded`'s producer), then
+// blends that per-group price across `inputGroups` groups plus two small
+// per-tuple/per-group bookkeeping terms PG itself charges for detecting
+// group boundaries and resetting the tuplesort between groups.
+//
+// `inputGroups` is `estimate_num_groups`'s result over the presorted-key
+// prefix (`costsize.c:2078`) — this composition takes it as a caller-
+// supplied number rather than computing it internally, the same split
+// `costSortRunWithWidth` already uses for `ncols`/`avgVarBytes`/`width`
+// (caller-computed, not re-derived here). That keeps this function callable
+// with synthetic numbers in a unit test today; the still-unbuilt wiring step
+// (Finding 3, table row 3 of the S7 design doc) is what will call goopg's
+// `estimateNumGroups` over the presorted key list and pass the result in —
+// this function itself has zero production callers, same groundwork posture
+// as `pathkeysCountContainedIn`.
+//
+// `comparisonCost` is always 0 at PG's own call site (`costsize.c:3701`,
+// the merge-join outer-sort case, the only real caller `cost_incremental_sort`
+// has upstream): `cost_tuplesort` adds its own `2*cpu_operator_cost` to a
+// *local copy* of the parameter, so the 0 that reaches this function's
+// per-tuple overhead term is not a simplification, it is what upstream
+// actually does. `costSortRunWithWidth` already encodes that same "always
+// 0, always +2*cpu_operator_cost internally" convention, so this function
+// follows it rather than exposing a comparisonCost parameter nothing would
+// ever set to nonzero.
+func costIncrementalSort(cp costParams, inputCost Cost, inputTuples float64, inputGroups float64, ncols int, avgVarBytes float64, limitTuples float64, width int) Cost {
+	if inputTuples < 2.0 {
+		inputTuples = 2.0
+	}
+	// Defensive clamp only: PG's own `input_groups` source
+	// (`estimate_num_groups`) already guarantees `1 <= input_groups <=
+	// input_tuples`; this composition re-asserts that invariant on its
+	// caller-supplied number rather than trusting it, since a bad group
+	// count would divide by (near) zero below.
+	if inputGroups < 1.0 {
+		inputGroups = 1.0
+	}
+	if inputGroups > inputTuples {
+		inputGroups = inputTuples
+	}
+
+	inputRunCost := inputCost.Total - inputCost.Startup
+	groupTuples := inputTuples / inputGroups
+	groupInputRunCost := inputRunCost / inputGroups
+
+	group := costSortRunWithWidth(cp, groupTuples, ncols, avgVarBytes, limitTuples, width, "incremental-sort-group")
+	groupStartupCost := group.Startup
+	groupRunCost := group.Total - group.Startup
+
+	// "Startup cost of incremental sort is the startup cost of its first
+	// group plus the cost of its input."
+	startup := groupStartupCost + inputCost.Startup + groupInputRunCost
+
+	// "After we started producing tuples from the first group, the cost of
+	// producing all the tuples is given by the cost to finish processing
+	// this group, plus the total cost to process the remaining groups, plus
+	// the remaining cost of input."
+	run := groupRunCost + (groupRunCost+groupStartupCost)*(inputGroups-1) + groupInputRunCost*(inputGroups-1)
+
+	// "Incremental sort adds some overhead by itself. Firstly, it has to
+	// detect the sort groups. This is roughly equal to one extra copy and
+	// comparison per tuple." (comparisonCost folded in as 0 — see doc above.)
+	run += cp.cpuTupleCost * inputTuples
+
+	// "Additionally, we charge double cpu_tuple_cost for each input group to
+	// account for the tuplesort_reset that's performed after each group."
+	run += 2.0 * cp.cpuTupleCost * inputGroups
+
+	return Cost{Startup: startup, Total: startup + run}
+}
+
 // costAgg is `cost_agg` (costsize.c:2682) for SORTED and HASHED — C-15's
 // replacement for the three aggregate rules' outcome-guessing. (The PLAIN
 // candidate is priced by the HASHED arm at 0 group columns and 1 group,

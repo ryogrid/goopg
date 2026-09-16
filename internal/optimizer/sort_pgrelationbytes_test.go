@@ -157,10 +157,10 @@ func TestCostSortRunWithWidthProductionCallersAreComplete(t *testing.T) {
 	}
 	dir := filepath.Dir(thisFile)
 	wantWidthCalls := map[string]int{
-		"cost_funcs.go":          2, // definition plus legacy compatibility wrapper
-		"joinpathsmerge.go":      1,
-		"partialsortpaths.go":    2,
-		"windowsetoppaths.go":    1,
+		"cost_funcs.go":       3, // definition, legacy compatibility wrapper, costIncrementalSort's per-group composition (M0141-S7 Finding 3 row 2, zero production callers itself yet)
+		"joinpathsmerge.go":   1,
+		"partialsortpaths.go": 2,
+		"windowsetoppaths.go": 1,
 	}
 	seenWidthCalls := make(map[string]int)
 	files, err := filepath.Glob(filepath.Join(dir, "*.go"))

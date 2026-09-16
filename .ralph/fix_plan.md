@@ -2670,9 +2670,25 @@ spill route is net-negative.
   production callers by design (same posture as E-15's `sortPrefixEqual`):
   it does not touch `createOrderedPaths`/`addOrderedPaths`, so no plan can
   change and the usual byte-identical/shape-delta gates do not apply (see
-  design doc's 2026-09-17 update). **Still unchecked, still blocked on
-  M0141-S2b** for the next step (the `cost_incremental_sort` composition,
-  which needs real multi-candidate input to test against).
+  design doc's 2026-09-17 update).
+  **UPDATE 2026-09-17b**: landed the second implementation-order step,
+  `costIncrementalSort` (`internal/optimizer/cost_funcs.go`, next to
+  `sortByteBranch`) — `cost_incremental_sort` (`costsize.c:2000-2126`)
+  composed over the existing `costSortRunWithWidth`, 4 new unit tests
+  (`cost_incremental_sort_test.go`) pinned against an independent
+  transliteration of the upstream formula. Resolved the prior update's open
+  question: the formula's only non-scalar input (`estimate_num_groups`'s
+  result) is taken as a caller-supplied parameter, same split
+  `costSortRunWithWidth` already uses for `ncols`/`avgVarBytes`/`width` — so
+  the formula is fully standalone-testable and did NOT need to wait on
+  M0141-S2b; only the later `estimateNumGroups`-calling wiring step does.
+  Zero production callers, same groundwork posture. TPC-DS SF0.25 sweep
+  re-run: PASS=96 MISMATCH=0, PLAN-SHAPE changed=0. See design doc's
+  2026-09-17b update for the monotonicity-shape and comparisonCost=0
+  findings. **Still unchecked, still blocked on M0141-S2b** for the next
+  step (Finding 3 table row 3, the `PathIncrementalSort`/`addOrderedPaths`
+  third arm, which genuinely needs a real multi-candidate `Pathlist` to
+  build a presorted-prefix candidate over).
 
 ## M0142 — Join-order costing (filed 2026-09-14)
 
