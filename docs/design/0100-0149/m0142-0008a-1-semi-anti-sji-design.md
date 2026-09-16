@@ -4545,3 +4545,150 @@ legitimately validate against) from a point in the pipeline that runs AFTER
 `unnestExistsExpr` creates it — `deconstructJointreeScopedSJI` itself cannot
 do this (it runs on `s.FromExprs`, before unnesting exists). Filed below as
 `-3i-plumbing-c6`.
+
+## 41. `-3i-plumbing-c6` — real population landed; reachability moves ONE gate deeper, and the next blocker is now precisely diagnosed too
+
+### 41.1 The fix
+
+Populated `ctx.joinInfoList` for real, at the one point in the pipeline
+that has both a correctly-renumbered semiAnti `SpecialJoinInfo` (c1-c4's
+`extractSearchLeaves` walk already renumbers `j.SJInfo` from
+`existsUnnestSJInfo`'s synthetic `synL=1/synR=2` placeholder to real
+leaf-index bits — §37/§38's finding, unchanged) and a mutable `ctx`
+(`tryPGShapedJoinSearch`'s own `*resolveContext` parameter), immediately
+before the c5 gate:
+
+```go
+for _, lk := range semiAnti {
+    if lk.sjinfo != nil && !joinInfoListHas(ctx.joinInfoList, lk.sjinfo) {
+        ctx.joinInfoList = append(ctx.joinInfoList, lk.sjinfo)
+    }
+}
+```
+
+`joinInfoListHas` (relfromjoinlist.go:408, pointer identity) guards a
+duplicate append if the seam ever runs more than once against the same
+`ctx` for one statement.
+
+**Why this is not §40.3's rejected "vacuous" alternative.** §40.3 rejected
+checking `semiAntiLinksHaveSJInfos(semiAnti, semiAntiJoinInfoList(ctx.joinInfoList,
+semiAnti))` — a list built FROM `semiAnti`'s own `.sjinfo` field and then
+matched against itself, proving nothing about production wiring. This
+loop's fix is different in kind, not just in form: it performs a REAL
+production write into the actual `ctx.joinInfoList` field — the same field
+`deconstructJointreeScopedSJI` populates for outer links, and the same
+field any FUTURE consumer of `ctx.joinInfoList` (not just this one gate)
+will read. It also still declines correctly whenever `lk.sjinfo == nil` —
+the IN/NOT-IN unnesting paths (`unnest.go:3453`, `:3588`, `:4726`) never set
+`.SJInfo` on the joins they build, so a semiAnti link sourced from one of
+those still fails to find a match and the gate still declines it,
+unchanged from before this loop.
+
+This also turns out to match upstream PG's own architecture, not just
+goopg's local safety convention: PG's `pull_up_sublinks` (which performs
+the EXISTS/NOT-EXISTS → semi/anti-join rewrite) runs BEFORE
+`deconstruct_jointree` (which builds `root->join_info_list`) —
+`subquery_planner` (postgres/src/backend/optimizer/plan/planner.c) calls
+`pull_up_sublinks` during preprocessing, and `query_planner` calls
+`deconstruct_jointree` afterward, on the already-rewritten tree. PG's
+`join_info_list` is therefore ALWAYS built from a jointree that already
+contains every semi-join JoinExpr — there is no second, independent
+pipeline to desynchronise from, unlike goopg's `ctx.joinInfoList` (built
+pre-unnest) versus `existsUnnestSJInfo` (built post-unnest, over the plan
+`Node` tree). This fix does not change goopg's two-pipeline architecture,
+but it does make `ctx.joinInfoList` end up in the same POPULATED state PG's
+single pipeline would leave it in, for the one purpose (`outerLinksHaveSJInfos`
+-style legality checks) that state exists to serve.
+
+### 41.2 Verification
+
+`go build ./...` clean; `go test ./internal/optimizer/...` green. Full-corpus
+`GOOPG_PGSHAPED_DP_TRACE=1` sweep (private binary `tmp/goopg-m0142-c6-bin`,
+built+removed this loop; sf025 log truncated before each pass): 96/100
+EXPLAINs succeeded (same 4 pre-existing unrelated parse gaps as every prior
+loop), 184,704 `DPPATH` lines, still **ZERO** `jointype=semi`/`anti` — full
+reachability is NOT yet achieved — but the `seam-decline` reason
+distribution changed in exactly the way the fix predicts:
+
+| reason | before (c5, §40.2) | after (c6, this loop) |
+|---|---|---|
+| `semianti-link-no-sjinfo` | 5 (3×nrels=2, 2×nrels=3) | 3 (nrels=2 only) |
+| `semianti-on-qual` | 0 | 1 (nrels=3) |
+
+A per-query isolation pass (EXPLAIN each of the 6 corpus files containing
+`EXISTS`/`NOT EXISTS` — Q10, Q16, Q35, Q69, Q94, `query_0` — individually
+against a freshly-truncated log) pinpoints the new `semianti-on-qual`
+decline to **Q69** specifically; Q10/Q16/Q35/Q94 all decline earlier
+(`leaf-count` or `outer-over-derived`, upstream of the semiAnti gate
+entirely — unrelated to this change) and never reach either semiAnti check.
+Q69 was previously blocked at `semianti-link-no-sjinfo`
+(the exact bug this loop fixes) and now reaches `semianti-on-qual` instead —
+direct, per-query evidence that the population is real and not a no-op,
+not just an aggregate count shift that could be explained another way.
+
+TPC-DS SF0.25 sweep at the new HEAD: `PASS=96 (60 ck-verified, 36 ck=n/a)
+MISMATCH=0 CKMISMATCH=0 ERROR=0`, `PLAN-SHAPE: queries=99 same=99 changed=0
+added=0 removed=0` against the c5 commit — Q78 still byte-identical
+(15 rows, checksum `c06cf981a7819a37`, unchanged across every c2-c6 loop).
+The decline this loop's fix newly PERMITS (progress past the sjinfo gate)
+does not flip Q69's plan output because `semianti-on-qual` still declines
+it one gate later — a plan-shape-identical sweep is therefore still the
+expected and required result, not a surprise.
+
+### 41.3 Root cause of the new blocker, diagnosed via temporary instrumentation (reverted, not landed)
+
+Added throwaway per-conjunct debug prints inside `semiAntiOnQualsOK`
+(env-gated, built into the private `tmp/goopg-m0142-c6-bin`, then fully
+reverted via `git checkout` before this loop's commit — no debug code
+landed) and ran Q69 alone. Q69 is TPC-DS's only chained-multi-EXISTS query:
+`customer, customer_address, customer_demographics WHERE … EXISTS(store_sales
+JOIN date_dim …) AND NOT EXISTS(web_sales JOIN date_dim …) AND NOT
+EXISTS(catalog_sales JOIN date_dim …)`, i.e. THREE semiAnti links chained
+over the same 3-relation outer, each an independent correlation on
+`c.c_customer_sk`.
+
+The instrumented run showed the FIRST link's (EXISTS store_sales) equijoin
+conjunct passing cleanly (`lhs=7` bits 0-2 = customer/ca/cd, `rhs=8` bit 3 =
+the store_sales+date_dim opaque leaf, both operands correctly resolve).
+The SECOND link's (NOT EXISTS web_sales) equijoin conjunct — `lhs=15` bits
+0-3 (customer/ca/cd + the FIRST link's now-spliced-in opaque leaf), `rhs=16`
+bit 4 (the web_sales+date_dim opaque leaf) — resolves to `rs=9` = bits {0,3}:
+the outer operand (`c.c_customer_sk`) correctly lands in leaf 0 (customer),
+but the inner operand lands in leaf **3** (the FIRST link's own opaque
+leaf) instead of leaf **4** (this link's own opaque leaf) — `overlapR=false`,
+which is what trips the decline.
+
+**Root cause:** `unnest.go:4694`'s `innerKey.Index = outerWidth +
+params[0].SubCol.Index` is correct for EXECUTION (the Join operator's own
+padded row is always `[this join's outer row][this join's inner row]`,
+and `outerWidth = len(outerChild.Output())` is exactly that outer row's
+width, unaffected by any semiAnti link nested inside `outerChild` — Semi/
+Anti's `Output()` republishes the outer schema only, per plan.go's own
+`JoinTypeSemi` doc comment, so chaining never changes what `outerWidth`
+reports here). It is WRONG for the search seam's flat leaf-space, which
+`extractSearchLeaves`'s walk (joinsearchseam.go, the `rebaseChainQual(pred,
+base)` call) tries to convert it into using a SINGLE additive `base`
+captured once, at function entry, before recursing into `j.Left`. `base`
+is the correct shift for the OUTER operand (LeftKey's raw index is already
+0-based from the TRUE original outer schema, so `base` — the true flat
+offset of `j.Left`'s first leaf — lands it correctly). It is the WRONG
+shift for the INNER operand (RightKey/innerKey's raw index is `outerWidth
++ innerColIndex` in THIS join's own 2-participant coordinate space, so its
+correct flat-space shift is not `base` but `base + (columns contributed by
+j.Left's ENTIRE subtree)` — the value `width` holds right AFTER `walk(j.Left,
+preserved)` returns, which the walk already computes but never captures
+under its own name, and never uses for this purpose). Whenever a semiAnti
+link is chained BELOW another one (Q69's pattern: link 2 built with link 1
+already spliced into its `outerChild`), the two operands need two DIFFERENT
+shifts and a uniform `base` can only get one of them right — which is
+exactly what the instrumented run measured.
+
+This is a distinct, harder bug from `-3i-plumbing-c1` through `-c6`
+(which are all about WHETHER `ctx.joinInfoList` carries an entry at all);
+this one is about whether an entry that IS present carries the RIGHT
+`RelSet` bits once more than one semiAnti link is chained over the same
+outer. Filed below as `-3i-plumbing-c7`; single-EXISTS queries (Q78, and
+presumably Q10/Q35 once whatever declines them earlier is separately
+fixed) are NOT affected by this specific bug — it only manifests when a
+second (or later) chained link's inner key coordinate is computed relative
+to an `outerChild` that already has an earlier sibling link spliced into it.

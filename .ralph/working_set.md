@@ -1,87 +1,92 @@
-Task: M0142-0008a-3i-plumbing-c2 — LANDED and committed. Grew
-`leaves`/`relInfos`/a local `bindings` slice in `tryPGShapedJoinSearch` from
-`nprefix` to `nprefix+len(semiAnti)`, giving each synthetic Semi/Anti RHS
-leaf a real (if degenerate) `rangeBinding`/`baseRelInfo` (design doc §36
-gaps 2-3 / §38 landing note).
+Task: M0142-0008a-3i-plumbing-c6 — LANDED and committed.
+Real production population of `ctx.joinInfoList` for semiAnti links (not the
+rejected §40.3 "vacuous" pattern). Corpus sweep proved it's real (a NEW
+decline reason appeared), then root-caused the NEXT blocker to a precise
+line via reverted throwaway instrumentation, and filed it as c7.
 
 Files this loop:
-- internal/optimizer/joinsearchseam.go: the leaf-building block right after
-  `partitionConjunctsForJoinPlanning` (was line 570-595). Real-leaf loop
-  unchanged in effect; added a second loop over `semiAnti` filling index
-  `nprefix+k`, sized via `EstimateRows(scans[nprefix+k])` (NOT
-  `estimateBaseRelInfo`/`applyRelSizeFallback` — both read `binding.table`
-  and silently floor a nil-table binding at 0 rows via
-  `estimateTableRowsFallback`'s `tbl == nil` guard, relsize.go:571-572).
-  `planJoinlistSearch`'s `joinlistProblem.bindings` now gets the grown
-  `bindings` slice instead of `ctx.bindings[:nprefix]`.
-- docs/design/0100-0149/m0142-0008a-1-semi-anti-sji-design.md: new §38 —
-  the walk-position 1:1 correspondence proof (`extractSearchLeaves` +
-  `unnestExistsExpr`'s always-wrap-the-whole-tree shape, unnest.go:491),
-  the row-estimate trap finding, and the `validateJoinlistProblem` risk
-  this loop weighed BEFORE coding (see Findings below) plus the empirical
-  sweep result.
-- docs/design/README.md: m0142-0008a-1 row appended with a closer for the
-  previously-truncated §37 (`-3i-plumbing-c1`) summary plus a new §38
-  (`-3i-plumbing-c2`) summary — the row's stored text literally cut off
-  mid-sentence after "**`-3i-plumbing-c1`" before this loop; closed it
-  rather than leaving a second truncation next to it.
-- .ralph/fix_plan.md: `-3i-plumbing-c2` flipped `[x]`, landing note with
-  gate results, "Next" pointer to c3.
+- internal/optimizer/joinsearchseam.go: ~line 569 (right before the c5 gate),
+  new loop appending each semiAnti link's non-nil `.sjinfo` into
+  `ctx.joinInfoList` via `joinInfoListHas` for idempotency. This IS the c6
+  deliverable — 28 lines, all comment + the 4-line append loop.
+- docs/design/0100-0149/m0142-0008a-1-semi-anti-sji-design.md: new §41 —
+  the c6 fix + why it differs from §40.3's rejected alternative + PG-oracle
+  cross-check (`pull_up_sublinks` before `deconstruct_jointree`), the
+  before/after decline-reason table, per-query isolation pinning the new
+  decline to Q69, and §41.3's full root-cause of Q69's NEW blocker.
+- docs/design/README.md: m0142-0008a-1 row tail extended (Python exact-
+  string-replace on the c5-row anchor — same technique as last loop; do NOT
+  full-file-rewrite this row, it has embedded raw newlines from older loops).
+- .ralph/fix_plan.md: `-3i-plumbing-c6` flipped `[x]`; new
+  `-3i-plumbing-c7` filed (split `rebaseChainQual`'s single `base` shift
+  into per-operand shifts for chained semiAnti links).
+- .ralph/deferral_ledger.md: new row, task-id `m0142-0008a-3i-plumbing-c6`.
 
-Key symbols: `tryPGShapedJoinSearch` (`joinsearchseam.go:216`), the extended
-leaf-building block (`joinsearchseam.go:569-~630` post-edit);
-`extractSearchLeaves` (`:1122`, unchanged this loop — already appended
-`scans`/`semiAnti` 1:1 per walk step); `unnestExistsExpr` (`unnest.go:4461`,
-called from `unnest.go:491`); `EstimateRows` (`cardinality.go:43`);
-`estimateBaseRelInfo`/`applyRelSizeFallback` (`cardinality.go:719`,
-`relsize.go:186`) — NOT used for synthetic leaves, see Findings;
-`estimateTableRowsFallback` (`relsize.go:571`); `validateJoinlistProblem`/
-`leafRange` (`relfromjoinlist.go:246`, `:287`).
+Key symbols: the new population loop (`joinsearchseam.go` ~line 569, right
+before `if !semiAntiLinksHaveSJInfos(...)`); `joinInfoListHas`
+(`relfromjoinlist.go:408`, pointer-identity idempotency guard);
+`unnest.go:4694`'s `innerKey.Index = outerWidth + params[0].SubCol.Index`
+(correct for execution, root cause of c7's blocker when rebased into flat
+leaf-space); `rebaseChainQual` call in `extractSearchLeaves`'s walk
+(joinsearchseam.go ~line 1298, uses ONE `base` for both operands — wrong
+for chained links); `semiAntiOnQualsOK` (:1737, now the live decline point
+for Q69).
 
-Findings: (1) confirmed by tracing `unnestExistsExpr`'s call site that
-`scans[nprefix+k]` and `semiAnti[k]` are always the same leaf — real leaves
-walk-contiguous at `[0,nprefix)`, synthetic ones at `[nprefix,nleaves)` in
-`semiAnti` order, for single or nested EXISTS unnesting alike. (2) The
-task's own flagged row-estimate trap was real: a naive
-`rangeBinding{table:nil}` through the existing base-table estimator path
-zeros out silently; fixed by using `EstimateRows` on the leaf's own
-already-built subtree instead. (3) Before writing code, reasoned that
-growing `prob.bindings` to `nleaves` WITHOUT also growing `jl` (that is
-`-3i-plumbing-c3`, filed separately, not done this loop) should — by
-`validateJoinlistProblem`'s own `jl.leafRange()==(0,len(prob.bindings))`
-check — flip any search that currently reaches this point with `semiAnti`
-non-empty from "runs to completion" (mishandling the semiAnti predicate but
-producing SOME plan, per the b2/c1 notes on TPC-DS Q78) to "declines and
-falls back to the syntactic-tree path" — NOT inert the way c1 provably was.
-Verified rather than assumed: the TPC-DS SF0.25 sweep came back fully
-unchanged (`PLAN-SHAPE: same=99 changed=0`, Q78 byte-identical). Likely
-reading, NOT chased further (out of this task's scope): the SF0.25 corpus's
-one semiAnti-reaching query doesn't actually survive to
-`validateJoinlistProblem` with a nonempty `semiAnti` at all — some earlier
-gate in `tryPGShapedJoinSearch` (candidates noted in §38) already declines
-it, independent of this loop's change. `-3i-plumbing-c3` should re-run this
-same Q78 checksum/shape comparison as its own gate rather than treating this
-loop's clean sweep as proof the c2+c3 pairing works end-to-end.
+Findings: (1) c6's fix IS reachable and genuinely changes behavior — full-
+corpus sweep: `semianti-link-no-sjinfo` declines 5→3, NEW
+`semianti-on-qual` decline 0→1. Per-query isolation (EXPLAIN each of the 6
+EXISTS/NOT-EXISTS corpus files individually) pinned the new decline to
+**Q69** specifically (TPC-DS's only chained-multi-EXISTS query — 3 EXISTS/
+NOT-EXISTS conjuncts over the same 3-relation outer); Q10/Q16/Q35/Q94 all
+decline earlier (`leaf-count`/`outer-over-derived`), unrelated to this
+change. (2) Root-caused Q69's new blocker via THROWAWAY debug instrumentation
+(added, run, then fully `git checkout`-reverted before commit — no debug
+code landed): Q69's SECOND chained link's inner-key equality resolves to
+relset bits {0,3} instead of the correct {0,4} — the outer operand
+(`c.c_customer_sk`) correctly lands in leaf 0, but the inner operand lands
+in leaf 3 (the FIRST link's own opaque leaf) instead of leaf 4 (this
+link's own opaque leaf). Cause: `rebaseChainQual(pred, base)` applies ONE
+additive `base` (captured before recursing into `j.Left`) to the WHOLE
+folded eq expression; `base` is correct for the outer operand (0-based from
+the true original outer schema) but wrong for the inner operand
+(`outerWidth + innerColIndex`-encoded, needs `base + width-contributed-by-
+j.Left's-subtree` instead) whenever an earlier sibling semiAnti leaf is
+already spliced into `j.Left`. (3) Full corpus-wide `jointype=semi`/`anti`
+DPPATH reachability is STILL zero — c6 alone doesn't achieve it, but it
+does prove the population mechanism works and hands off a precisely
+diagnosed next blocker rather than a vague one.
 
-Next step: pick up **M0142-0008a-3i-plumbing-c3** — build the call-site-local
-extended joinlist so `validateJoinlistProblem`'s `jl.leafRange() ==
-(0,len(prob.bindings))` check covers the grown `nleaves` bindings this loop
-introduced (design doc §36 gap 4, §38's own "Next pickup" note;
-`relfromjoinlist.go:246-276`). Depends on c2 (this loop) for the bindings
-length to size against. After c3, re-run the SF0.25 sweep with a specific
-eye on Q78 — c2's clean sweep does NOT yet prove the c2+c3 pairing is
-correct, only that c2 alone didn't regress anything.
+Next step: pick up **M0142-0008a-3i-plumbing-c7** — split the
+`rebaseChainQual` call (or the eq/residual construction feeding it, around
+joinsearchseam.go ~line 1291-1304) so the outer-side operand(s) shift by
+`base` and the inner-side operand(s) shift by the post-left-recursion
+`width` value (available right after `walk(j.Left, preserved)` returns,
+currently uncaptured under its own name). Likely cleanest: rebase
+`j.LeftKey`/`j.RightKey` SEPARATELY before folding them into the `eq`
+BinaryOp, rather than rebasing the folded `eq` as one expression. MUST NOT
+regress Q78 (single-EXISTS, byte-identical since c2) — re-run BOTH the
+TPC-DS SF0.25 sweep AND the full-corpus `GOOPG_PGSHAPED_DP_TRACE=1` sweep
+after landing; the real test is a `jointype=semi`/`anti` DPPATH line
+finally appearing, not just a decline-reason shift like this loop's.
 
 Gates run this loop: `go build ./...` clean; `go test
-./internal/optimizer/...` PASS; `scripts/tpcds-sf025-regression.sh sweep`
-PASS=96 MISMATCH=0 CKMISMATCH=0 ERROR=0, PLAN-SHAPE same=99 changed=0 vs
-prior commit (Q78 byte-identical, 15 rows, same checksum);
-`scripts/tpch-spotcheck.sh` SKIPPED (pre-existing M0142-0003k data-dir
-blocker, confirmed unrelated — see CLAUDE.md); `RALPH_PRECOMMIT_SCOPE=units
-scripts/ralph-precommit-test.sh` — same pre-existing `internal/parser`
-`yacc_locking_test.go` `GroupedJoinUnaliased` AST-drift failure as every
-recent loop (internal/optimizer itself green). `make ralph-state-guard`
-auto-repaired the same benign prior-loop clean-exit marker seen every recent
-loop, then PASS. Commit's own pre-commit hook runs the pgbench smoke.
+./internal/optimizer/...` green; full-corpus `GOOPG_PGSHAPED_DP_TRACE=1`
+sweep (private binary `tmp/goopg-m0142-c6-bin`, built+removed this loop) —
+96/100 EXPLAINs succeeded (4 pre-existing unrelated parse gaps), 184704
+DPPATH lines, 0 `jointype=semi`/`anti`, decline reasons: 3
+`semianti-link-no-sjinfo` + 1 `semianti-on-qual` (was 5+0 before this
+loop); per-query isolation pass on the 6 EXISTS-family files; instrumented
+Q69-only run (temporary debug prints, reverted before commit — `git diff`
+confirms only the real 28-line c6 fix remains in the tracked file);
+`scripts/tpcds-sf025-regression.sh sweep` PASS=96 MISMATCH=0 CKMISMATCH=0
+ERROR=0, PLAN-SHAPE same=99 changed=0 vs the c5 commit (Q78 byte-identical);
+`RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh` — same
+pre-existing `internal/parser` `GroupedJoinUnaliased` AST-drift failure as
+every recent loop (`internal/optimizer` itself green). `make
+ralph-state-guard` auto-repaired the same benign prior-loop clean-exit
+marker seen every recent loop, then PASS. Commit's own pre-commit hook runs
+the pgbench smoke.
 
-In-flight: none.
+In-flight: none. Private trace binary and sf025 server both stopped/removed
+(`GOOPG_BIN=tmp/goopg-m0142-c6-bin bench/tpcds/server.sh stop sf025`, then
+`rm tmp/goopg-m0142-c6-bin`).

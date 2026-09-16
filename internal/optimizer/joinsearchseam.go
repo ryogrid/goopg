@@ -567,6 +567,34 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 	// so a decline here never lets an un-placeable semiAnti clause reach
 	// the search at all.
 	if len(semiAnti) > 0 {
+		// M0142-0008a-3i-plumbing-c6 (design doc §41, gap named by c5's §40.3/
+		// §40.5): threads each semiAnti link's `*SpecialJoinInfo` into
+		// `ctx.joinInfoList` itself, from the one point in the pipeline that
+		// runs AFTER `unnestExistsExpr`/`existsUnnestSJInfo` builds it AND
+		// after `extractSearchLeaves`'s walk (line ~1323 above) has already
+		// renumbered it from the synthetic synL=1/synR=2 placeholder to real
+		// leaf-index bits — `deconstructJointreeScopedSJI` (planner.go:3051)
+		// cannot do this itself, since it runs on `s.FromExprs` before
+		// unnesting exists (§40.3). This mirrors upstream PG's own ordering:
+		// `deconstruct_jointree` (which builds `root->join_info_list`) always
+		// runs AFTER `pull_up_sublinks` has already rewritten EXISTS/NOT
+		// EXISTS into the jointree's semi/anti JoinExpr nodes, so PG's list
+		// is populated from the SAME already-unnested tree its legality
+		// checks consult — there is no second, independent pipeline to
+		// desynchronise from. `joinInfoListHas` (relfromjoinlist.go:408, by
+		// pointer identity) guards against a duplicate append if this seam
+		// ever runs more than once against the same `ctx` for one statement.
+		// A link whose source `*Join` never carried an SJInfo (the IN/NOT-IN
+		// unnesting paths — unnest.go:3453/3588/4726 — never set `.SJInfo`)
+		// contributes nothing here and so still correctly fails the gate
+		// below, exactly as it did before this loop: this is real production
+		// population, not the rejected "check against a list built from
+		// itself" pattern §40.3 already ruled out.
+		for _, lk := range semiAnti {
+			if lk.sjinfo != nil && !joinInfoListHas(ctx.joinInfoList, lk.sjinfo) {
+				ctx.joinInfoList = append(ctx.joinInfoList, lk.sjinfo)
+			}
+		}
 		if !semiAntiLinksHaveSJInfos(semiAnti, ctx.joinInfoList) {
 			traceSeamDecline("semianti-link-no-sjinfo", nrels, nprefix)
 			return node, pred, false

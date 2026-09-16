@@ -4147,26 +4147,56 @@ cross-layer programme that has never been scoped.
   failure. `-0008c-3c`/`-3d`/`-4`'s Q10/Q35 acceptance bar is still NOT
   attemptable — now for a specific, nameable reason. Next:
   `-3i-plumbing-c6` (below).
-- [ ] **M0142-0008a-3i-plumbing-c6 — thread each semiAnti link's SJInfo into
-  `ctx.joinInfoList` itself** (design doc §40.5, filed by c5). The
-  prerequisite c5's gate is blocked on: something must populate
-  `ctx.joinInfoList` (or an equivalent list `semiAntiLinksHaveSJInfos` can
-  legitimately validate against — NOT the search-local
-  `semiAntiJoinInfoList` output, which is vacuous to check against itself)
-  with each semiAnti link's `SpecialJoinInfo`, from a point in the pipeline
-  that runs AFTER `unnestExistsExpr`/`existsUnnestSJInfo` creates it —
-  `deconstructJointreeScopedSJI` (`planner.go:3051`) itself cannot do this,
-  since it runs on `s.FromExprs` before unnesting exists. Likely needs
-  either (a) `unnestExistsExpr` itself to append its new SJInfo onto the
-  in-flight `ctx.joinInfoList` at rewrite time, or (b) a dedicated
-  post-unnest collection pass before `tryPGShapedJoinSearch` is ever called.
-  Scope this before coding — check whether `ctx` is even mutable/shared at
-  the point `unnestExistsExpr` runs, or whether it operates on a detached
-  `Node` tree with no `*resolveContext` in scope at all (unnest.go:4385's
-  comment suggests the latter). Only once this lands can the full-corpus
-  `GOOPG_PGSHAPED_DP_TRACE=1` sweep actually test whether
-  `semiAntiLinksHaveSJInfos` can PASS for a real query, which is the real
-  precondition for `-0008c-3c`/`-3d`/`-4`'s Q10/Q35 acceptance bar.
+- [x] **M0142-0008a-3i-plumbing-c6 — thread each semiAnti link's SJInfo into
+  `ctx.joinInfoList` itself** (design doc §40.5, filed by c5). **DONE
+  2026-09-16 (design doc §41).** Landed: `tryPGShapedJoinSearch`
+  (joinsearchseam.go, immediately before the c5 gate) now appends each
+  semiAnti link's already-renumbered `*SpecialJoinInfo` into `ctx.joinInfoList`
+  for real (guarded by `joinInfoListHas` for idempotency) — a genuine
+  production write into the same field `deconstructJointreeScopedSJI`
+  populates for outer links, not the rejected "check against a list built
+  from itself" pattern §40.3 ruled out; matches upstream PG's own ordering
+  (`deconstruct_jointree` always runs after `pull_up_sublinks`). Corpus
+  sweep evidence it is real: `semianti-link-no-sjinfo` declines dropped 5→3
+  and a NEW decline (`semianti-on-qual`, 0→1) appeared, isolated via
+  per-query EXPLAIN to **Q69** (TPC-DS's only chained-multi-EXISTS query),
+  which used to fail the sjinfo gate and now passes it and fails one gate
+  later instead. `jointype=semi`/`anti` DPPATH reachability is still zero
+  corpus-wide — TPC-DS SF0.25 sweep unaffected (`PASS=96 MISMATCH=0`,
+  `PLAN-SHAPE same=99`, Q78 byte-identical) as expected. Next blocker
+  root-caused and filed as `-3i-plumbing-c7` (below).
+- [ ] **M0142-0008a-3i-plumbing-c7 — split `rebaseChainQual`'s single
+  `base` shift into per-operand shifts for chained semiAnti links**
+  (design doc §41.3, filed by c6). Q69 (TPC-DS's only query chaining more
+  than one EXISTS/NOT-EXISTS over the same outer) now reaches
+  `semiAntiOnQualsOK` and fails it: the SECOND (and any later) chained
+  link's inner join-key coordinate (`unnest.go:4694`,
+  `innerKey.Index = outerWidth + params[0].SubCol.Index` — correct for
+  EXECUTION, since the Join operator's own padded row is always
+  `[this join's outer row][this join's inner row]` and `outerWidth` is
+  exactly that width) gets rebased WRONG by the search seam's
+  `extractSearchLeaves` walk (joinsearchseam.go, the
+  `rebaseChainQual(pred, base)` call ~line 1298): `base` is captured ONCE,
+  before recursing into `j.Left`, and is the correct flat-leaf-space shift
+  for the OUTER operand (LeftKey, 0-based from the true original outer
+  schema) but the WRONG shift for the INNER operand (RightKey/innerKey,
+  0-based from THIS join's own 2-participant coordinate space) whenever an
+  earlier sibling semiAnti link's opaque leaf has already been spliced into
+  `j.Left` — the inner operand needs `base + (columns contributed by
+  j.Left's entire subtree)` instead, a value the walk already computes as
+  `width` right after `walk(j.Left, preserved)` returns but never captures
+  under its own name. Fix: split the eq/residual rebase so the
+  outer-side sub-expression(s) shift by `base` and the inner-side
+  sub-expression(s) shift by the post-left-recursion `width` value: identify
+  which operand of each conjunct is outer-vs-inner (the eq's `Left`/`Right`
+  halves are already known at construction — joinsearchseam.go ~line 1291 —
+  so this may be as simple as rebasing `j.LeftKey`/`j.RightKey` SEPARATELY
+  before folding them into one `eq`, rather than rebasing the folded `eq` as
+  one expression) before it reaches `rebaseChainQual`. MUST NOT regress the
+  single-EXISTS case (Q78, byte-identical since c2) — re-run the TPC-DS
+  SF0.25 sweep AND the full-corpus `GOOPG_PGSHAPED_DP_TRACE=1` sweep (the
+  real test — full reachability is confirmed only once a `jointype=semi`/
+  `anti` DPPATH line actually appears) after landing.
 - [x] **M0142-0008c — scoping recon: does goopg need PG's `create_unique_path`
   (semi-join → de-duplicate RHS + inner join) to reach parity on TPC-DS
   Q10/Q35?** — filed by M0142-0008a-3(iii)'s §4.3 gate re-run (design doc §6).
