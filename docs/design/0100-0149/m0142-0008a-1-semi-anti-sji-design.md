@@ -1473,3 +1473,120 @@ for one loop on its own — items 3-5 still touch `extractSearchLeaves`'s
 production walk, `existsUnnestSJInfo`, and `predp.go`'s splice retirement
 together, the same three-subsystem span that made -recon3 defer whole-cloth
 implementation before this loop's probe.
+
+## 16. M0142-0008c — scoping recon: does goopg need `create_unique_path`? Answer: yes for Q10/Q35, and it is a materially new mechanism, not a plumbing add-on (2026-09-16)
+
+Filed by §6's gate re-run: Q10/Q35 use PG's `create_unique_path`
+(semi-join → de-duplicate RHS, then plain inner join), a path-generation
+strategy neither -2 nor -3 touch. This section sizes it, per the filing's own
+instruction, before anything is implemented.
+
+### 16.1 What PG's mechanism actually is (read live, not from memory)
+
+Two cooperating pieces, both in
+`postgres/src/backend/optimizer/`:
+
+- **`join_is_legal`** (`path/joinrels.c:412-489`) has a THIRD admission arm
+  beyond "one input covers `min_lefthand`, the other `min_righthand`": for a
+  `JOIN_SEMI` whose full RHS sits in exactly one input, it calls
+  `create_unique_path(root, rel, rel->cheapest_total_path, sjinfo)` and, if
+  that returns non-NULL, **admits the join anyway** — the RHS is unique-ified
+  first, so joining it to *anything* (not just its `min_lefthand` partner) is
+  legal (`joinrels.c:445-489`, the `unique_ified` branch, comment at :450-471
+  explains the `a,b,c` motivating example directly). This is a *legality*
+  relaxation, not a costing choice: without it, no path reaching Q10/Q35's
+  shape is even considered.
+- **`create_unique_path`** (`util/pathnode.c:1729`) builds and caches
+  (`rel->cheapest_unique_path`) a `UniquePath` over a rel's
+  `cheapest_total_path`: fast-path NOOP if a unique index or a
+  provably-distinct subquery output already proves uniqueness
+  (`pathnode.c:1932-1985`), else a real `Sort+Unique` or `HashAggregate`
+  path costed against `sjinfo->semi_rhs_exprs`. The result is consumed by
+  `sort_inner_and_outer`/`match_unsorted_outer`
+  (`path/joinpath.c:1408,1415,1887,1923,2180,2305,2321` — 7 call sites) via
+  two synthetic jointypes, `JOIN_UNIQUE_OUTER`/`JOIN_UNIQUE_INNER`
+  (`joinpath.c:113-121`), which every builder converts to a plain
+  `JOIN_INNER` after substituting the unique-ified path for one side.
+
+### 16.2 goopg's current state: confirmed, by grep, not by inference
+
+- `internal/optimizer/joinsearchlevel.go:198`'s `(*searchCtx).joinIsLegal` —
+  the direct, unit-tested port of `join_is_legal` (§2.3 above) — has the
+  RHS-overlap **skip** arm (`joinrels.c:412-420`, "already unique-ified,
+  irrelevant now") but **not** the admission arm that creates that state in
+  the first place (`joinrels.c:445-489`). Read live (lines 190-267): the
+  `else` branch at the bottom of the SJ-matching chain unconditionally
+  returns an error ("violates outer-join constraint") for exactly the case
+  PG's `unique_ified` branch would admit. This is the single precise
+  legality gap.
+- `create_unique_path` has **zero** goopg analogue: `grep -rn
+  "PathUnique|UniquePath|createUniquePath"` across `internal/optimizer` and
+  `internal/executor` returns nothing production (only `distinctpaths.go`'s
+  doc comment mentioning the executor already prints `"Unique"` for an
+  unrelated node). `RelOptInfo` (`internal/optimizer/path.go:423-560`) has
+  `CheapestTotal`/`CheapestStartup`/`CheapestParameterized` but no
+  `CheapestUnique` cache slot.
+- `innerrel_is_unique`/`relation_has_unique_index_for` (PG's NOOP fast-path
+  proofs) have **zero** goopg analogue either: `grep -rn
+  "innerrel_is_unique|innerRelIsUnique|relation_has_unique_index"` across
+  `internal/optimizer` returns nothing. Every `create_unique_path` call in
+  goopg would therefore always take the expensive Sort+Unique/HashAggregate
+  path, never the free NOOP one PG takes whenever a unique index already
+  proves it — a correctness-neutral but cost-model-relevant gap (a spurious
+  Unique node would be priced where PG's plan has none).
+- The executor-node reuse hoped for at first glance is real but partial: a
+  `"Unique"`/`"DistinctOn"` **executor** operator already exists
+  (`internal/executor`, wired via `distinctOp`/`distinctOnOp`,
+  `distinctpaths.go`), so no new *executor* node kind is needed. But its
+  *planner*-side producer (`createDistinctPaths`, `distinctpaths.go:43`) is
+  wired as a single Phase-4 **upper-rel** wrapper applied once above the
+  whole finished plan (`fetchUpperRel(u, UpperDistinct, 0, ...)`) — the
+  opposite shape from PG's `create_unique_path`, which is a **per-RelOptInfo**
+  path competing and caching *inside* the DP search, callable from
+  `join_is_legal` while the search is still choosing join order. Reusing the
+  executor node does not reuse the producer; a new producer is needed at a
+  different layer of the planner.
+
+### 16.3 Sizing verdict: a new mechanism comparable to -0008a itself, not a plumbing add-on
+
+Four independent pieces, none trivial alone, all needed together for a
+first correct instance:
+
+1. **New `RelOptInfo.CheapestUnique *Path` cache field** plus a
+   `createUniquePath(rel, subpath, sjinfo) *Path` producer built at the
+   base/join-rel level (not the upper-rel level) — the actual new
+   path-generation code, reusing the existing `Unique`/`DistinctOn` Plan
+   node and its executor operator, but needing its own cost function (no
+   existing goopg cost function prices a mid-search dedup).
+2. **`joinIsLegal`'s missing admission arm** (`joinsearchlevel.go`, the
+   `unique_ified` branch) — the smallest piece, a direct ~20-line port once
+   (1) exists to call.
+3. **Two synthetic jointypes threaded through every join-path builder** —
+   goopg's analogues of PG's `sort_inner_and_outer`/`match_unsorted_outer`
+   (hash-join, merge-join, and NLI builders under `internal/optimizer/`, the
+   producers `addPath` calls per join level) all need a
+   `JoinTypeUniqueInner`/`JoinTypeUniqueOuter` case that substitutes in the
+   unique-ified path and demotes the jointype to plain `INNER` before
+   costing/building — this is the widest-blast-radius piece, comparable to
+   how -0008a-3(iii) touching MERGE's decline arm (§8) rippled across
+   multiple builders for a much narrower change.
+4. **`innerrel_is_unique`/unique-index NOOP fast path** — optional for
+   *correctness* (the expensive path still produces the right rows) but
+   needed for *plan-shape parity*: without it, goopg would show a `Unique`
+   node in cases where PG's plan has none because a unique index already
+   proved it, which is itself a new class of plan-shape mismatch this
+   mechanism would introduce if skipped.
+
+**Verdict: this is a new, from-scratch Path-generation strategy on the scale
+of M0142-0008a's own SEMI/ANTI-in-DP-search work (items 1-4 above touch four
+different layers: RelOptInfo caching, legality, every join-path builder, and
+uniqueness-proof infrastructure), not a follow-up patch.** It should be
+tracked as its own milestone-sized item, decomposed the way -0008a-3i was
+(items 1-4 above as separate sub-tasks, each its own recon-then-implement
+pair given this project's track record on similarly-scoped joinrels.c ports).
+**Not selected this loop** — filed as **M0142-0008c-1..4** (fix_plan.md)
+mirroring this section's four-item breakdown, with item 2 (the `joinIsLegal`
+arm) as the cheapest, most self-contained starting point once the group is
+picked up. Q10/Q35 remain un-parity'd until this lands; Q16/Q69/Q94 (the
+3-of-5 queries §6 confirmed are pure algorithm-choice gaps) are unaffected
+and remain reachable via -0008a-2/-3 alone.

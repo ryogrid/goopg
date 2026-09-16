@@ -3624,21 +3624,85 @@ cross-layer programme that has never been scoped.
   whoever picks up S5a's own eligibility gate): relaxing
   `whereEligibleForPreDPUnnest` to per-sublink granularity would upgrade
   Q22 out of its total-bypass class on its own, independent of -1..-3.
-- [ ] **M0142-0008c — scoping recon: does goopg need PG's `create_unique_path`
+- [x] **M0142-0008c — scoping recon: does goopg need PG's `create_unique_path`
   (semi-join → de-duplicate RHS + inner join) to reach parity on TPC-DS
   Q10/Q35?** — filed by M0142-0008a-3(iii)'s §4.3 gate re-run (design doc §6).
-  PG's chosen plan for both queries has **no semi-join node at all**: a
-  `HashAggregate` de-duplicates the correlated column (`store_sales.ss_customer_sk`)
-  and a `Nested Loop` then probes `customer_pkey` by that unique set, with the
-  OR'd EXISTS predicates evaluated as hashed `SubPlan` filters on the index
-  probe — PG's own `create_unique_path`/`create_unique_paths` mechanism, cited
-  but explicitly out of scope in §3.4/finding 5. Goopg's DP search does not
-  implement an equivalent path-generation strategy today. Resume point: read
-  PG's `create_unique_path` (`postgres/src/backend/optimizer/path/allpaths.c`,
-  grep `create_unique_path`) and size whether adding it as a competing
-  `addPath` candidate for a pinned SEMI join is a K24-class "materially larger
-  task" (like -0008a itself was) before doing anything else. Captures:
+  **DONE 2026-09-16 as a recon (design doc §16), no production change.
+  Answer: yes, goopg needs it for Q10/Q35, and it is a from-scratch
+  mechanism comparable in size to M0142-0008a itself, not a plumbing
+  add-on.** Read PG's `create_unique_path` live
+  (`postgres/src/backend/optimizer/util/pathnode.c:1729`, NOT
+  `allpaths.c` as originally filed) plus its 7 call sites in
+  `path/joinpath.c` and the `join_is_legal` admission arm that gates it
+  (`path/joinrels.c:445-489`). Confirmed by grep, not inference: goopg's
+  `(*searchCtx).joinIsLegal` (`joinsearchlevel.go:198`) already ports the
+  SEMI "already unique-ified, skip" arm but not the admission arm that
+  *creates* that state; goopg has zero `create_unique_path`/
+  `cheapest_unique_path`/`innerrel_is_unique` analogue anywhere in
+  `internal/optimizer`; `RelOptInfo` (`path.go:423`) has no
+  `CheapestUnique` cache slot; the existing `"Unique"` **executor** node is
+  reusable (already wired for DISTINCT via `distinctOp`), but its only
+  **planner**-side producer (`createDistinctPaths`, `distinctpaths.go:43`)
+  is a single whole-query upper-rel wrapper — the opposite shape from PG's
+  per-`RelOptInfo`, DP-search-internal path. Four separable pieces, filed
+  as sub-items below (none selected yet): (1) new `RelOptInfo.CheapestUnique`
+  cache field + a `createUniquePath` producer at the base/join-rel level
+  with its own cost function; (2) the `joinIsLegal` admission arm itself
+  (cheapest, most self-contained — direct ~20-line port once (1) exists to
+  call); (3) two synthetic jointypes (`JoinTypeUniqueInner`/`Outer`)
+  threaded through every join-path builder (hash/merge/NLI), widest blast
+  radius; (4) an `innerrel_is_unique`/unique-index NOOP fast path (not
+  needed for correctness, needed so goopg doesn't show a spurious `Unique`
+  node PG's plan doesn't have). Captures:
   `tmp/m0142-0008a-census/{goopg,pg}_explains.txt` (Q10/Q35 sections).
+  Q16/Q69/Q94 (§6's 3-of-5 pure-algorithm-choice queries) are unaffected
+  and remain reachable via -0008a-2/-3 alone.
+- [ ] **M0142-0008c-1 — `RelOptInfo.CheapestUnique` cache field +
+  `createUniquePath` producer** — filed by M0142-0008c (design doc §16.3
+  item 1). Add a `CheapestUnique *Path` cache slot to `RelOptInfo`
+  (`internal/optimizer/path.go:423`, alongside `CheapestTotal`/
+  `CheapestStartup`/`CheapestParameterized`) and a `createUniquePath(rel,
+  subpath, sjinfo) *Path` producer that builds a `Unique`/`DistinctOn`-shaped
+  path over `rel.CheapestTotal` keyed by the SEMI join's RHS correlation
+  columns, with its own cost function (no existing goopg cost function
+  prices a mid-search dedup — PG's oracle is `pathnode.c:1729` proper, the
+  Sort+Unique / HashAggregate cost branches after the NOOP fast-paths).
+  Reuses the existing `Unique`/`DistinctOn` Plan node and executor operator
+  (`distinctOp`/`distinctOnOp`) — no new executor code. Resume point: design
+  doc §16.2-16.3.
+- [ ] **M0142-0008c-2 — `joinIsLegal`'s missing SEMI unique-ify admission
+  arm** — filed by M0142-0008c (design doc §16.3 item 2). Depends on
+  M0142-0008c-1 (needs `createUniquePath` to call). Port PG's
+  `joinrels.c:445-489` `unique_ified` branch into
+  `(*searchCtx).joinIsLegal` (`joinsearchlevel.go:198`): when a `JOIN_SEMI`'s
+  full `SynRighthand` sits in exactly one input and `createUniquePath`
+  succeeds for it, admit the join (record `matchSJInfo`/`unique_ified`)
+  instead of falling through to the current unconditional "violates
+  outer-join constraint" error. Cheapest, most self-contained piece of the
+  four — a direct ~20-line port. Resume point: design doc §16.2 (exact
+  current code quoted), PG oracle `joinrels.c:445-489`.
+- [ ] **M0142-0008c-3 — thread `JoinTypeUniqueInner`/`JoinTypeUniqueOuter`
+  through every join-path builder** — filed by M0142-0008c (design doc §16.3
+  item 3). Depends on M0142-0008c-1/-2. Add the two synthetic jointypes
+  (PG oracle: `joinpath.c:113-121`) and give every goopg join-path builder
+  (hash-join, merge-join, and NLI producers under `internal/optimizer/` that
+  `addPath` calls per join level — goopg's analogues of PG's
+  `sort_inner_and_outer`/`match_unsorted_outer`, `joinpath.c:1356`/`:1811`)
+  a case that substitutes the unique-ified path for the appropriate side and
+  demotes the jointype to plain `INNER` before costing/building. Widest
+  blast radius of the four — comparable to how -0008a-3(iii)'s much
+  narrower MERGE-decline split (design doc §8) rippled across multiple
+  builders. Resume point: design doc §16.1 (PG's 7 call sites cited), §16.3
+  item 3.
+- [ ] **M0142-0008c-4 — `innerrel_is_unique`/unique-index NOOP fast path** —
+  filed by M0142-0008c (design doc §16.3 item 4). Depends on
+  M0142-0008c-1. Not needed for correctness (the expensive Sort+Unique/
+  HashAggregate path still produces the right rows) but needed for
+  plan-shape parity: without it, goopg shows a `Unique` node in cases where
+  PG's plan has none because a unique index already proved distinctness
+  (PG oracle: `pathnode.c:1932-1985`'s NOOP branches — unique-index proof
+  and provably-distinct-subquery-output proof). Resume point: design doc
+  §16.1-16.2.
 - [x] **M0142-0008d — EXPLAIN mislabels the outer relation's alias in a
   self-correlated EXISTS where inner and outer share a table name** — filed
   by M0142-0008a-3(iii)'s §4.3 gate re-run (design doc §6). **DONE 2026-09-16
