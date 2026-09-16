@@ -198,3 +198,36 @@ complete is still incomplete."
   aggregation-strategy motivation.
 - Ledger row filed: `.ralph/deferral_ledger.md` (2026-09-16, task-id
   `m0141-s7`).
+
+## Update 2026-09-17 — prefix-count helper landed (Finding 3, table row 1)
+
+Landed the first primitive Finding 3's implementation-order table names:
+`pathkeysCountContainedIn(keys, required []PathKey) (contained bool, nCommon
+int)` (`internal/optimizer/pathkeys.go`, next to `pathkeysContainedIn`),
+reproducing `pathkeys_count_contained_in` (`postgres/.../pathkeys.c:558`).
+Unlike the boolean-only sibling, it reports the length of the longest common
+prefix even when `required` is not fully satisfied — the exact quantity an
+Incremental Sort candidate needs to know how much of `required` still needs
+sorting once a producing node's own order (GROUP KEY / PARTITION BY / Merge
+Cond / outer-child order, per Finding 1) is credited.
+
+This is **groundwork, not the S2b/S7 wiring** — same posture as the executor's
+already-landed `sortPrefixEqual` (E-15): a tested, fully-specified primitive
+with **zero production callers today**, landed ahead of its consumer because
+it is independently correct and independently testable (4 new unit tests:
+full-prefix-equals-`pathkeysContainedIn`, partial-prefix count, immediate
+divergence, empty requirement). It does not touch `createOrderedPaths`,
+`addOrderedPaths`, or any call site, so it cannot move a plan and the
+S2b-2a-style "byte-identical" gate does not apply — there is nothing yet for
+it to change.
+
+- **Category movement**: none — no call site wired, so no plan can change.
+- **shape-delta**: 0 (no capture taken; nothing calls the new function).
+- **Stats epoch**: not applicable.
+- **Seam-decline census**: not applicable.
+- **Planning route**: not applicable.
+
+Resume point unchanged from the Verdict section above: still gated on
+`M0141-S2b`'s relevant sub-task landing per witness group before the next
+Finding-3 step (the `cost_incremental_sort` composition) can be built and
+exercised against real candidates.

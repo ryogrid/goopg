@@ -2663,6 +2663,16 @@ spill route is net-negative.
   `PathIncrementalSort`/`addOrderedPaths` third arm -> executor operator ->
   `createplansimple.go` wiring -> EXPLAIN rendering), each pinned by a test.
   Ledger row filed: `.ralph/deferral_ledger.md` (2026-09-16, `m0141-s7`).
+  **UPDATE 2026-09-17**: landed the first implementation-order step,
+  `pathkeysCountContainedIn` (`internal/optimizer/pathkeys.go`, 4 new unit
+  tests) — the prefix-*count* sibling of `pathkeysContainedIn`, reproducing
+  `pathkeys_count_contained_in` (`postgres/.../pathkeys.c:558`). Zero
+  production callers by design (same posture as E-15's `sortPrefixEqual`):
+  it does not touch `createOrderedPaths`/`addOrderedPaths`, so no plan can
+  change and the usual byte-identical/shape-delta gates do not apply (see
+  design doc's 2026-09-17 update). **Still unchecked, still blocked on
+  M0141-S2b** for the next step (the `cost_incremental_sort` composition,
+  which needs real multi-candidate input to test against).
 
 ## M0142 — Join-order costing (filed 2026-09-14)
 

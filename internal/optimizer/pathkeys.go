@@ -73,6 +73,27 @@ func pathkeysContainedIn(keys, required []PathKey) bool {
 	return true
 }
 
+// pathkeysCountContainedIn is pathkeysContainedIn's sibling: instead of a
+// yes/no answer it also reports how many leading keys of `required` are
+// already satisfied by `keys`, even when the full requirement is not met.
+// Reproduces pathkeys_count_contained_in (pathkeys.c:558) — PG's own doc
+// comment there is "Same as pathkeys_contained_in, but also sets length of
+// longest common prefix". `nCommon` is the length of that shared prefix;
+// `contained` is true iff `nCommon == len(required)`, i.e. identical to what
+// pathkeysContainedIn(keys, required) would return. A partial prefix is what
+// an Incremental Sort candidate needs: it lets the planner sort only the
+// unmatched suffix of `required` instead of the whole thing (M0141-S7).
+// Zero production callers yet — landed ahead of its consumer, same shape as
+// the executor's sortPrefixEqual (E-15); see M0141-S7's design doc for the
+// consumer this unblocks.
+func pathkeysCountContainedIn(keys, required []PathKey) (contained bool, nCommon int) {
+	n := 0
+	for n < len(required) && n < len(keys) && pathKeyEqual(keys[n], required[n]) {
+		n++
+	}
+	return n == len(required), n
+}
+
 // pathkeysForSortKeys builds the pathkeys a Sort node's keys guarantee — the
 // make_pathkeys_for_sortclauses analogue (pathkeys.c:1336). A Sort path, an
 // ORDER-BY-satisfying scan, or a Gather Merge carries these so add_path can keep
