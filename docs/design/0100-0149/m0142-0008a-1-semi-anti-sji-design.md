@@ -5643,3 +5643,116 @@ The temporary `joinInfoList` edit used for step 1 was reverted
 (`git checkout -- internal/optimizer/joinsearchseam.go`) before commit,
 confirmed via `git diff --stat` showing zero changes to that file; only
 `relfromjoinlist.go` is part of this loop's landed commit.
+
+### 46.6 c11 item (b), continued: a real, independently-shipping `SourceTableIdx` collision bug FOUND and FIXED — but it is NOT Q69's runtime-crash cause; the crash persists, re-filed as c12
+
+**Method**: same private-binary SF0.25 technique as §46.1, extended with two
+temporary (reverted before commit) instruments: (1) `walkPlanExprsDeep` calls
+in `planner.go`'s S5a pre-DP arm, printing every `*OuterColumnRef` node
+immediately before and after `runJoinSearchBelowPinned`; (2) a print inside
+`unnestExistsExpr` of `srcTableOffset` and the `SourceTableIdx` sets of
+`outerChild.Output()` and the remapped `innerPlan.Output()`.
+
+**Finding 1 (root-caused and FIXED): `unnestExistsExpr`'s `srcTableOffset`
+under-counts across sibling EXISTS clauses in the same statement.** The
+offset that shifts each EXISTS body's own `SourceTableIdx` numbering out of
+the outer query's range is computed by scanning `outerChild.Output()`
+(unnest.go, the code right after the `M0142-0008e` comment). But
+`Output()` for a `Join{Type:Semi/Anti}` deliberately omits its RHS columns
+(plan.go's Semi/Anti special case — needed for correctness elsewhere: an
+ANTI join's Output() must not carry the anti-joined table's columns). Once
+the FIRST of several sibling EXISTS clauses has already spliced its semi/
+anti join onto `outerChild`, that first EXISTS body's `SourceTableIdx`
+range becomes invisible to an `Output()`-only scan, and the SECOND sibling
+EXISTS is handed the exact same offset the first one was — for Q69 (three
+chained `EXISTS`/`NOT EXISTS`), live tracing confirmed `store_sales`,
+`web_sales` and `catalog_sales` all landed on `SourceTableIdx=5`, and all
+three `date_dim` occurrences on `SourceTableIdx=6`. This is a *general*
+multi-EXISTS bug, live in production today regardless of the semiAnti DP
+search or the still-broken `joinInfoList` double-append (§46.2) —
+`unnestExistsExpr` runs for any statement `GOOPG_UNNEST_PREDP` admits,
+independent of whether the downstream search ever runs at all.
+
+**The fix**: `maxSourceTableIdxDeep` (unnest.go, added directly above
+`unnestExistsExpr`) replaces the `Output()`-only scan. It walks
+`outerChild`'s actual node tree — recursing explicitly through
+`*Join.Left`/`*Join.Right` and `*Filter.Child` rather than trusting
+`Output()` — so a previously-spliced semi/anti RHS is counted even though
+it no longer appears in the parent Join's published schema.
+
+**Verification**: `go build ./...` and `go test ./internal/optimizer/...`
+clean. Full production `scripts/tpcds-sf025-regression.sh sweep` (private
+`GOOPG_BIN`, `joinInfoList` NOT modified — this fix ships independent of
+the still-reverted §46.3 one-liner): **PASS=96 MISMATCH=0 CKMISMATCH=0
+ERROR=0 TIMEOUT=0 SKIP=3**, zero row-count/checksum regressions. The
+sweep's own plan-shape channel (non-blocking, informational) shows exactly
+3 queries with a textual plan diff — **Q16, Q69, Q94** — and in all three
+the ONLY difference is `EXPLAIN` alias disambiguation that was previously
+ambiguous or wrong: `cs_ship_customer_sk` → `catalog_sales.cs_ship_customer_sk`,
+a bare `date_dim` (used for TWO distinct correlated `date_dim` scans) →
+correctly split into `date_dim_1`/`date_dim_2`, `cr_order_number` →
+`cr1.cr_order_number`, `wr_order_number` → `wr1.wr_order_number`. This is a
+real (if previously silent, since row counts never depended on it) EXPLAIN
+correctness bug — two structurally different scans of the same table
+rendering under the SAME unqualified name — now fixed, independent of and
+prior to Q69's crash.
+
+**Finding 2 (the actual target, NOT fixed): the collision was not Q69's
+crash cause.** Re-running Q69 through the private-binary method — STI fix
+applied, the §46.3 `joinInfoList` one-liner ALSO applied temporarily to
+reach the search — produced a **byte-identical EXPLAIN plan and the
+identical runtime error** to §46.5's pre-fix capture: the same `Nested
+Loop` whose LEFT child is the `store_sales`+`date_dim` EXISTS arm and whose
+RIGHT child is `Index Scan using customer_demographics_pkey ... Index
+Cond: (cd_demo_sk = c.c_current_cdemo_sk)`, and the identical `ERROR:
+outer column ref c_current_cdemo_sk/level=1 out of range (depth=0)` at
+runtime. Since fixing the real `SourceTableIdx` collision changed nothing
+about this shape, the collision was a coincidental red herring for this
+specific symptom (a genuine bug, independently worth fixing, but not on
+this bug's causal path) — refuting §46.5's suspicion #2 from the prior
+loop.
+
+**What the EXPLAIN shape actually says, read carefully**: the customer_demographics
+index probe is keyed by `c.c_current_cdemo_sk` — an ordinary equi-join
+predicate between `customer` (`c`) and `customer_demographics`, wholly
+unrelated to any of Q69's three `EXISTS` clauses (confirmed against the
+query text, `tmp/m0142-0008a-census/explain-queries/explain_q69.sql` lines
+13-15). The DP search converted this into an NLI-shaped path
+(`createNestLoopIndexJoinPlan`, `createplannl.go:178-193`'s `outerParamKey`
+is the only production call site that turns a `*ColumnRef` into a
+`*OuterColumnRef`) — which is the *correct* rewrite in general, but here
+`p.Children[0]` (the Path's own "outer"/driving side, `in.outer` in
+`createNestLoopIndexJoinPlan`) is the `store_sales`+`date_dim` EXISTS
+synthetic leaf, NOT `customer`. `customer` (`c`) is not in that subtree's
+relids at all — `c_current_cdemo_sk` cannot resolve there under ANY
+coordinate numbering. So the bug is not a coordinate/rebase mistake
+downstream of a correctly-chosen pairing; **the search itself built and
+won a candidate pairing the predicate cannot legally attach to** — an
+eligibility/relids-coverage bug in whatever code path decided
+`customer_demographics` could be probed via this index using this
+predicate against THIS particular outer grouping. The likely site is the
+index-path candidate generator for the join search (the code that, given a
+candidate outer relset and an inner leaf, checks whether an available
+index-qualifying clause's required relids are a SUBSET of the outer
+relset's own relids before emitting a parameterized index path) — if that
+subset check is missing, weakened, or keyed off stale bookkeeping for a
+semiAnti-chain-adjacent relset, it would explain building an NLI candidate
+whose outer side does not actually produce the key column. NOT
+instrumented this loop (budget); **filed as c12**. Concrete next step for
+c12: instrument the index-path candidate builder (likely in the cost/path
+generation code that calls or feeds `createNestLoopIndexJoinPlan`'s
+`Path`, upstream of `createPlan` — search for where `RequiredOuter` gets
+set on an index `Path` during the DP search, e.g. near
+`considerIndexPaths`/the NLI cost-gate machinery referenced by
+`GOOPG_NLI_COSTGATE`) and print, for every candidate NLI path it builds
+during Q69's search, the candidate's own outer relset alongside the
+clause's own required relids — the first candidate where the clause's
+required relids are NOT a subset of the outer relset is the bug.
+
+Both temporary instruments (the `planner.go` `OuterColumnRef` walk and the
+`unnestExistsExpr` offset/STI print) were reverted before commit; only
+`unnest.go`'s `maxSourceTableIdxDeep` addition and offset-computation
+change are part of this loop's landed diff. The private binaries, SF0.25
+data copy, and logs used this loop (`tmp/goopg-c11b-bin`,
+`tmp/goopg-c11b-sweep-bin`, `tmp/c11b-sf025-data`, `tmp/c11b-server.log`,
+`tmp/c11b-q69-runtime.sql`) were all removed before this write-up.

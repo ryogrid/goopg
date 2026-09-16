@@ -4472,6 +4472,39 @@ func existsUnnestSJInfo(jt JoinType, params []unnestParam, residuals []Expr, src
 	return sj
 }
 
+// maxSourceTableIdxDeep returns the highest SourceTableIdx anywhere in
+// node's tree. It walks *Join.Left/*Join.Right and *Filter.Child
+// explicitly, falling back to node.Output() for every other kind — a
+// semi/anti Join's own Output() deliberately omits its RHS columns
+// (plan.go's Semi/Anti special case), so an Output()-only scan would
+// miss a previously-spliced EXISTS body's SourceTableIdx range. See the
+// call site in unnestExistsExpr for why that matters (M0142-0008a c11
+// item b).
+func maxSourceTableIdxDeep(node Node) int16 {
+	var maxIdx int16
+	var walk func(Node)
+	walk = func(n Node) {
+		if n == nil {
+			return
+		}
+		switch x := n.(type) {
+		case *Join:
+			walk(x.Left)
+			walk(x.Right)
+		case *Filter:
+			walk(x.Child)
+		default:
+			for _, c := range n.Output() {
+				if c.SourceTableIdx > maxIdx {
+					maxIdx = c.SourceTableIdx
+				}
+			}
+		}
+	}
+	walk(node)
+	return maxIdx
+}
+
 func unnestExistsExpr(ex *ExistsExpr, outer Node) (Node, error) {
 	if !canUnnestExistsExpr(ex) {
 		return nil, nil
@@ -4654,17 +4687,27 @@ func unnestExistsExpr(ex *ExistsExpr, outer Node) (Node, error) {
 	// EXISTS body numbers its own scan "1" just like the outer query's
 	// first FROM item, and splicing innerPlan in as an ordinary join
 	// child puts both scans under one EXPLAIN naming pass. The offset is
-	// sized against outerChild.Output() — the outer-side columns this
-	// specific join exposes, the only subtree innerPlan is being spliced
-	// next to here — and applied to every ColumnRef this function itself
-	// builds against the inner side afterward (innerKey,
-	// liftResidualConjunctsWithOffset's inner-ColumnRef case) so all three
-	// stay in the same shifted numbering.
+	// sized against outerChild's FULL tree (M0142-0008a c11 item b), not
+	// just outerChild.Output(): a semi/anti Join's Output() deliberately
+	// omits its RHS columns (plan.go's Semi/Anti special case), so once a
+	// PRIOR EXISTS in the same statement has already spliced a semi/anti
+	// join onto outerChild, that prior EXISTS body's SourceTableIdx range
+	// is invisible to an Output()-only scan — a chained multi-EXISTS
+	// statement (Q69: three sibling EXISTS/NOT EXISTS) then hands every
+	// sibling the SAME offset, colliding their inner tables' SourceTableIdx
+	// (confirmed live: store_sales/web_sales/catalog_sales all landed on
+	// SourceTableIdx=5, all three date_dim occurrences on 6). That
+	// collision is what let the DP search's index-path costing pair a
+	// customer_demographics index-probe keyed on customer's
+	// c_current_cdemo_sk with the wrong outer side, producing a
+	// nestloop-param `*OuterColumnRef` no operator ever pushes a row for
+	// ("outer column ref ... out of range (depth=0)" at runtime).
+	// maxSourceTableIdxDeep walks through Join.Left/Right and Filter.Child
+	// explicitly so a previously-spliced semi/anti RHS is counted even
+	// though it no longer appears in outerChild.Output().
 	var srcTableOffset int16 = 1
-	for _, c := range outerChild.Output() {
-		if c.SourceTableIdx >= srcTableOffset {
-			srcTableOffset = c.SourceTableIdx + 1
-		}
+	if m := maxSourceTableIdxDeep(outerChild); m >= srcTableOffset {
+		srcTableOffset = m + 1
 	}
 	innerPlan, err = remapSourceTableIdx(innerPlan, srcTableOffset)
 	if err != nil {

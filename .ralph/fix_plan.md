@@ -163,11 +163,11 @@ placeholder is a comment, not a checkbox, so the plan-complete exit
 heuristic stays live.)
 
 ### Nightly run 20260901-010436 (sha `d93fb9edc669`, 7 items) — filed 2026-09-01
-- [ ] **testport/TestPort_PgStatActivity (AI-20260901-010436-005, AI-20260905-011015-007, AI-20260914-235643-010, AI-20260916-035206-011)**.
-- [ ] **testport/TestSyntax_Catalog_PgStatActivity (AI-20260901-010436-007, AI-20260905-011015-009, AI-20260914-235643-012, AI-20260916-035206-013)**.
+- [ ] **testport/TestPort_PgStatActivity (AI-20260901-010436-005, AI-20260905-011015-007, AI-20260914-235643-010, AI-20260916-035206-011, AI-20260917-004357-015)**.
+- [ ] **testport/TestSyntax_Catalog_PgStatActivity (AI-20260901-010436-007, AI-20260905-011015-009, AI-20260914-235643-012, AI-20260916-035206-013, AI-20260917-004357-017)**.
 
 ### Nightly run 20260902-005256 (sha `c11e55d253ff`, 8 items) — filed 2026-09-02
-- [ ] **testport/TestE2E_PGColdStartOnGoopgDataDir (AI-20260902-005256-001, AI-20260905-011015-002, AI-20260914-235643-004, AI-20260916-035206-004)**. New
+- [ ] **testport/TestE2E_PGColdStartOnGoopgDataDir (AI-20260902-005256-001, AI-20260905-011015-002, AI-20260914-235643-004, AI-20260916-035206-004, AI-20260917-004357-006)**. New
   tonight; possibly the M0131-S4 "FAIL-WHEN-FIXED" assertion flipping red
   because a Theme F fix landed rather than a real regression — re-run repro
   and check the M0131 Theme F findings list before treating as a bug.
@@ -181,19 +181,19 @@ heuristic stays live.)
   line filed for those per the "do not add another" rule.)
 
 ### Nightly run 20260905-011015 (sha `2e3deb52ba73`, 9 items) — filed 2026-09-11
-- [ ] **race/internal/executor (AI-20260905-011015-001, AI-20260914-235643-002, AI-20260916-035206-002)** — race suite failed
+- [ ] **race/internal/executor (AI-20260905-011015-001, AI-20260914-235643-002, AI-20260916-035206-002, AI-20260917-004357-003)** — race suite failed
   in `internal/executor` (also failed previous run; repro: `go test -race
   -timeout 45m ./internal/executor/`).
-- [ ] **testport/TestPort_IsolationIntraGrantInplace (AI-20260905-011015-003, AI-20260914-235643-006, AI-20260916-035206-006)** —
+- [ ] **testport/TestPort_IsolationIntraGrantInplace (AI-20260905-011015-003, AI-20260914-235643-006, AI-20260916-035206-006, AI-20260917-004357-010)** —
   FAILed, also failed previous run (repro: `go test -v -run
   '^TestPort_IsolationIntraGrantInplace$' ./internal/testport/`).
-- [ ] **testport/TestPort_IsolationStats (AI-20260905-011015-004, AI-20260914-235643-007, AI-20260916-035206-007)** — FAILed,
+- [ ] **testport/TestPort_IsolationStats (AI-20260905-011015-004, AI-20260914-235643-007, AI-20260916-035206-007, AI-20260917-004357-011)** — FAILed,
   also failed previous run (same testport repro pattern).
-- [ ] **testport/TestPort_LockRowsSortOverJoinTakesRowLock (AI-20260905-011015-005, AI-20260914-235643-008, AI-20260916-035206-009)** —
+- [ ] **testport/TestPort_LockRowsSortOverJoinTakesRowLock (AI-20260905-011015-005, AI-20260914-235643-008, AI-20260916-035206-009, AI-20260917-004357-013)** —
   FAILed subtests: join_no_sort, also failed previous run.
-- [ ] **testport/TestPort_PgDumpConnectionSetup (AI-20260905-011015-006, AI-20260914-235643-009, AI-20260916-035206-010)** —
+- [ ] **testport/TestPort_PgDumpConnectionSetup (AI-20260905-011015-006, AI-20260914-235643-009, AI-20260916-035206-010, AI-20260917-004357-014)** —
   FAILed, also failed previous run.
-- [ ] **testport/TestPort_RegressSuite (AI-20260905-011015-008, AI-20260914-235643-011, AI-20260916-035206-012)** — FAILed
+- [ ] **testport/TestPort_RegressSuite (AI-20260905-011015-008, AI-20260914-235643-011, AI-20260916-035206-012, AI-20260917-004357-016)** — FAILed
   subtests: limit, numerology, also failed previous run; 20260914-235643 adds subtests time, timetz.
   (Remaining 3 items — PGColdStart AI-…-002, PgStatActivity AI-…-007,
   Syntax_Catalog_PgStatActivity AI-…-009 — already have open tasks above;
@@ -201,16 +201,16 @@ heuristic stays live.)
   `ci/logs/20260905-011015/`.)
 
 ### Nightly run 20260914-235643 (sha `baf40efcbfbd`, 14 items) — filed 2026-09-15
-- [ ] **units/internal/parser (AI-20260914-235643-001, AI-20260916-035206-001)** — new tonight, units suite
+- [ ] **units/internal/parser (AI-20260914-235643-001, AI-20260916-035206-001, AI-20260917-004357-002)** — new tonight, units suite
   failed to build/run `internal/parser` (repro: `go test -timeout 10m
   ./internal/parser/`). Likely the same root cause as this file's own
   "Manually discovered" `parser/TestLockingClauseParity` entry below (filed the
   same day from an interactive gate run) — re-run both repros together before
   treating as two separate bugs.
-- [ ] **race/internal/parser (AI-20260914-235643-003, AI-20260916-035206-003)** — new tonight, race suite
+- [ ] **race/internal/parser (AI-20260914-235643-003, AI-20260916-035206-003, AI-20260917-004357-005)** — new tonight, race suite
   failed in `internal/parser` (repro: `go test -race -timeout 45m
   ./internal/parser/`). Same likely-shared root cause note as the item above.
-- [ ] **testport/TestPort_IsolationEvalPlanQual (AI-20260914-235643-005, AI-20260916-035206-005)** — new
+- [ ] **testport/TestPort_IsolationEvalPlanQual (AI-20260914-235643-005, AI-20260916-035206-005, AI-20260917-004357-007)** — new
   tonight, FAILed (repro: `go test -v -run '^TestPort_IsolationEvalPlanQual$'
   ./internal/testport/`).
 - [ ] **units/build-broke-mid-stage (AI-20260914-235643-013)** and
@@ -255,6 +255,47 @@ heuristic stays live.)
   testport/TestSyntax_Catalog_PgStatActivity AI-…-013 — already have open
   tasks above; AI-ids appended per the "do not add another" rule. Evidence
   for all: `ci/logs/20260916-035206/`.)
+
+### Nightly run 20260917-004357 (sha `1b54b00f80f1`, 17 items) — filed 2026-09-17
+- [x] **units/internal/optimizer (AI-20260917-004357-001)** — new tonight, units
+  suite FAILed `TestFlagProvenanceTableCoversPlannerEnv`: "joinsearchlevel.go
+  names GOOPG_C9DEBUG, which no benchmark artefact names." **Stale — re-run
+  at HEAD passes** (`go test -timeout 10m ./internal/optimizer/` clean).
+  `git log --all -S"GOOPG_C9DEBUG"` shows the string was introduced by
+  commit 232b80811 (c9, committed 2026-09-17 01:17) and no longer exists
+  anywhere in the tree; `git show 1b54b00f80f1:internal/optimizer/joinsearchlevel.go`
+  (the exact sha the nightly log cites) also does not contain the string —
+  i.e. the failure doesn't match the tree at the cited sha at all. Most
+  likely explanation: the nightly batch's checkout raced against this
+  session's own concurrent commits (c9/c10/c11 landing 01:17-02:49, nightly
+  generated 01:36) and picked up transient WIP mid-run. Closing as stale;
+  re-open if a future nightly reproduces on a clean, non-racing checkout.
+- [x] **race/internal/optimizer (AI-20260917-004357-004)** — new tonight, race
+  suite FAILed in `internal/optimizer`. Same root cause as the units item
+  directly above (identical `GOOPG_C9DEBUG` provenance-table failure signature
+  in the log); closing stale for the same reason.
+- [ ] **testport/TestPort_IsolationFkContention (AI-20260917-004357-008)** — new
+  tonight, FAILed (repro: `go test -v -run '^TestPort_IsolationFkContention$'
+  ./internal/testport/`).
+- [ ] **testport/TestPort_IsolationFkDeadlock (AI-20260917-004357-009)** — new
+  tonight, FAILed (repro: `go test -v -run '^TestPort_IsolationFkDeadlock$'
+  ./internal/testport/`).
+- [ ] **testport/TestPort_UpdateLockedTuple (AI-20260917-004357-012)** — new
+  tonight, FAILed (repro: `go test -v -run '^TestPort_IsolationUpdateLockedTuple$'
+  ./internal/testport/`).
+  (Remaining 12 items of this run — units/internal/parser AI-…-002,
+  race/internal/executor AI-…-003, race/internal/parser AI-…-005,
+  testport/TestE2E_PGColdStartOnGoopgDataDir AI-…-006,
+  testport/TestPort_IsolationEvalPlanQual AI-…-007,
+  testport/TestPort_IsolationIntraGrantInplace AI-…-010,
+  testport/TestPort_IsolationStats AI-…-011,
+  testport/TestPort_LockRowsSortOverJoinTakesRowLock AI-…-013,
+  testport/TestPort_PgDumpConnectionSetup AI-…-014,
+  testport/TestPort_PgStatActivity AI-…-015,
+  testport/TestPort_RegressSuite AI-…-016,
+  testport/TestSyntax_Catalog_PgStatActivity AI-…-017 — already have open
+  tasks above; AI-ids appended per the "do not add another" rule. Evidence
+  for all: `ci/logs/20260917-004357/`.)
 
 ### Manually discovered (not yet in a nightly `ci/logs/action-items.md` run) — filed 2026-09-15
 - [ ] **parser/TestLockingClauseParity** — deterministic FAIL, found while
@@ -4357,6 +4398,37 @@ cross-layer programme that has never been scoped.
   is still NOT landed — it was reverted in the c11-filing loop after
   surfacing item (a) and (b)'s two pre-existing regressions on the SF0.25
   gate. Re-opened with the narrower, corrected scope below.**
+  - **2026-09-17 update (design doc §46.6): item (b) pursued further.
+    Found and LANDED a real, independently-shipping bug — `unnestExistsExpr`'s
+    `srcTableOffset` (unnest.go) under-counted across sibling EXISTS clauses
+    in the same statement, because it scanned `outerChild.Output()`, which a
+    semi/anti Join deliberately does not grow after splicing (RHS columns
+    never appear in a Semi/Anti Output()). For Q69 (three chained EXISTS)
+    this collided `store_sales`/`web_sales`/`catalog_sales` all onto
+    `SourceTableIdx=5` and all three `date_dim` occurrences onto `6`. Fixed
+    via a new `maxSourceTableIdxDeep` helper that walks the actual node tree
+    (`*Join.Left`/`*Join.Right`, `*Filter.Child`) instead of trusting
+    `Output()`. This runs in PRODUCTION today for any multi-EXISTS
+    statement, independent of the still-broken `joinInfoList` double-append
+    — verified with the `joinInfoList` fix NOT applied:
+    `scripts/tpcds-sf025-regression.sh sweep` PASS=96/MISMATCH=0/ERROR=0/
+    SKIP=3, only 3 queries (Q16, Q69, Q94) show any plan-text diff and in
+    all three it is purely an EXPLAIN alias-disambiguation fix (e.g. a bare
+    `date_dim` used for two distinct correlated scans becomes `date_dim_1`/
+    `date_dim_2`). **This did NOT fix Q69's actual target bug** — re-run
+    with the STI fix plus the temporary `joinInfoList` one-liner produced a
+    byte-identical EXPLAIN and the identical runtime crash to §46.5,
+    refuting the prior loop's suspicion that a stray unrebased
+    `OuterColumnRef` was the mechanism. The real cause: the DP search
+    itself builds and WINS an NLI candidate pairing `customer_demographics`
+    (indexed on `cd_demo_sk = c.c_current_cdemo_sk`) against the
+    `store_sales`+`date_dim` EXISTS synthetic leaf as the "outer" side —
+    but `customer` is not in that leaf's relids at all, so no coordinate
+    numbering could ever make `c.c_current_cdemo_sk` resolve there. This is
+    an eligibility/relids-coverage bug in the index-path candidate
+    generator (which relset a candidate index qual's required relids must
+    be a subset of), not a coordinate-rebase bug — filed as **c12** with a
+    concrete instrumentation starting point in design doc §46.6.**
   Root cause (§46.2, live-traced, no longer a hypothesis): it is NOT two
   independently-built pointer-distinct clones. `tryPGShapedJoinSearch`'s
   semiAnti population loop (joinsearchseam.go:593-597, c6) already folds
@@ -4420,6 +4492,40 @@ cross-layer programme that has never been scoped.
   `predp.go:159-176`'s Phase B doc comment — its "`used` is therefore
   false on every production call today" claim is stale and actively
   misleading.
+- [ ] **M0142-0008a-3i-plumbing-c12 — fix the actual cause of Q69's `outer
+  column ref c_current_cdemo_sk/level=1 out of range (depth=0)` runtime
+  crash: an index-path candidate whose required relids are not a subset of
+  its own candidate outer relset** (design doc §46.6, filed by c11's
+  2026-09-17 continuation). c11 item (b) ruled OUT the SourceTableIdx-
+  collision/stray-OuterColumnRef theory (byte-identical EXPLAIN before and
+  after that fix) and pinned the real mechanism via live instrumentation:
+  the DP search builds and WINS an NLI (`createNestLoopIndexJoinPlan`)
+  candidate that probes `customer_demographics` on `cd_demo_sk =
+  c.c_current_cdemo_sk`, using the `store_sales`+`date_dim` EXISTS
+  synthetic leaf as the candidate's "outer"/driving side (`p.Children[0]`)
+  — but `customer` (`c`) is not in that leaf's relids at all, so
+  `c.c_current_cdemo_sk` cannot legally resolve there under ANY coordinate
+  numbering. `outerParamKey` (`internal/optimizer/createplannl.go:178-193`,
+  the only production site building a `*OuterColumnRef` from a
+  `*ColumnRef`) faithfully converts whatever it is handed — it is not
+  itself buggy. **Next step**: instrument the DP search's index-path
+  candidate generator (upstream of `createPlan`, wherever `RequiredOuter`
+  gets set on a candidate index `Path` — search near the
+  `GOOPG_NLI_COSTGATE` machinery) to print, for every NLI candidate it
+  builds while searching Q69, the candidate's own outer relset alongside
+  the index qual clause's required relids; the first candidate where the
+  clause's relids are NOT a subset of the outer relset is the bug. Use the
+  same private-binary SF0.25 method as c9-c11 (§46.1), with the temporary
+  `joinInfoList: ctx.joinInfoList` one-liner (§46.3) re-applied locally to
+  reach the search. Gate: `go build ./...`, `go test
+  ./internal/optimizer/...`, and a full `scripts/tpcds-sf025-regression.sh
+  sweep` with a private `GOOPG_BIN` (both with and without the temporary
+  joinInfoList fix, per c11 item (a)'s precedent) before landing. Once (b)
+  is genuinely fixed, item (c) — re-applying the joinInfoList fix
+  permanently and re-running the FULL sweep — can finally proceed. Also
+  still pending: fix `predp.go:159-176`'s Phase B doc comment (stale/
+  misleading "`used` is therefore false on every production call today"
+  claim), noted by the prior loop and not yet actioned.
 - [x] **M0142-0008c — scoping recon: does goopg need PG's `create_unique_path`
   (semi-join → de-duplicate RHS + inner join) to reach parity on TPC-DS
   Q10/Q35?** — filed by M0142-0008a-3(iii)'s §4.3 gate re-run (design doc §6).
