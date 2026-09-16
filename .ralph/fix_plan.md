@@ -2437,15 +2437,57 @@ spill route is net-negative.
     `EXPLAIN` + `GOOPG_PGSHAPED_DP_TRACE=1`, before/after binary diff. Full
     writeup: `docs/design/0100-0149/m0141-s2b-scoping-decomposition.md`
     §"S2b-1 result".
-  - [ ] **M0141-S2b-2** — base join/scan Pathlist-across-the-search-boundary
+  - [x] **M0141-S2b-2** — base join/scan Pathlist-across-the-search-boundary
     surgery. This is the real K24 item; per K24's own warning, size it with
     its OWN further scoping pass before writing code — do not attempt in one
-    sitting. Unlocks TPC-DS's Merge Join x2 + Nested Loop x4 (+ likely
-    Subquery Scan x1) S7 witnesses, is the prerequisite for S2b-3, and is the
-    most likely fix for the six TPC-H mechanism-B queries if S2b-0 confirms
-    the starvation hypothesis.
-  - [ ] **M0141-S2b-3** — WINDOW loop-fix. Gated on S2b-2 (WINDOW has nothing
-    of its own to loop over until then).
+    sitting. **DONE 2026-09-17 as a scoping recon, no production change**,
+    design doc `docs/design/0100-0149/m0141-s2b-scoping-decomposition.md`
+    §"S2b-2 result". `searchedRelOf` (R21 slice 2a) already gives
+    `createOrderedPaths` a path to the search rel's full `Pathlist`; the gap
+    is that nothing downstream asks for more than the current single seed.
+    Live-traced against the full TPC-DS SF0.25 corpus (temporary
+    `GOOPG_S2B2DEBUG=1` prints, reverted before commit,
+    `scripts/tpcds-sf025-regression.sh sweep`+`plans` both
+    `PASS=96 MISMATCH=0`/`PLAN-SHAPE changed=0` before AND after the revert):
+    the seam is real and reached 38 times corpus-wide, `Pathlist` sizes 3-16
+    (median ~7) — but **PROVEN inert without Incremental Sort**: every
+    candidate of one call shares the same `Rows` (36/38 blocks exactly; 2
+    differ by 1 row, a `kind=11`/LIMIT rounding artefact) and
+    `sr.CheapestTotal` is always the exact minimum-cost entry already —
+    `costSortRun` prices only rel-level `(rows, width)`, identical for every
+    candidate, so the Sort cost added on top is a constant and cannot change
+    which candidate ranks cheapest. Same "moves nothing" verdict R21 Slice 1
+    measured for its own plumbing cut. **Re-orders M0141's sequencing**:
+    S2b-2 and **M0141-S7** (Incremental Sort, `cost_incremental_sort`'s
+    per-candidate prefix credit is what would make candidates genuinely
+    differ post-Sort) are not independent — each is dead weight without the
+    other. Decomposed into **M0141-S2b-2a/2b/2c** below (none selected yet;
+    2c is explicitly blocked on S7). No ledger row: the gap (S7) is already
+    filed and unchecked; this recon only corrects the sequencing between two
+    already-filed items.
+  - [ ] **M0141-S2b-2a** — plumbing only: thread `searchedRelOf(input)` into
+    `createOrderedPaths`/`addOrderedPaths` so the full `Pathlist` is visible
+    at the call site. Filed by S2b-2 (design doc §"S2b-2 result" item 1).
+    Gate: byte-identical plans on both corpora — per S2b-2's Finding 2 this
+    is a *predicted*, not merely hoped-for, null result, same precedent as
+    R21 Slice 1.
+  - [ ] **M0141-S2b-2b** — materialize-on-demand: defer `createPlanNode` on
+    any non-seed candidate until `setCheapest` has chosen a winner (avoid
+    paying materialization cost for N-1 discarded candidates per query), and
+    generalize `validatedSearchPathkeys` (`upperorderedinput.go`) to run
+    per-candidate rather than once for the single seed. Filed by S2b-2
+    (design doc item 2). Depends on S2b-2a.
+  - [ ] **M0141-S2b-2c** — the actual payoff: once `cost_incremental_sort`'s
+    per-candidate prefix credit exists (M0141-S7), let `addOrderedPaths` run
+    a real tournament across `Pathlist` instead of the single
+    always-cheapest-pre-Sort seed. Filed by S2b-2 (design doc item 3).
+    **BLOCKED on M0141-S7.** Do not attempt before S7 lands — S2b-2's own
+    recon is the proof that doing so earlier cannot move a plan.
+  - [ ] **M0141-S2b-3** — WINDOW loop-fix. Gated on S2b-2's actual payoff
+    (WINDOW has nothing of its own to loop over until the Pathlist
+    tournament exists) — per S2b-2's 2026-09-17 recon, that means gated on
+    **M0141-S2b-2c specifically** (blocked on M0141-S7), not on S2b-2a/2b's
+    inert plumbing alone.
   - [ ] **M0141-S2b-4** — SETOP rel-identity fix. **UPDATE 2026-09-16 (S2b-1's
     own result section)**: DOES now have a witness — TPC-DS Q49's `Unique`
     (S7's mis-mapped "Unique x1"; `select ... union select ... union select

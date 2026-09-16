@@ -516,3 +516,125 @@ result on the goal metric, honestly reported, same precedent as S2b-0/S2b-5/
 S2b-6.** `.ralph/fix_plan.md`'s S7 witness table should be corrected to drop
 the `Unique`x1 -> S2b-1 mapping and fold Q49 into S2b-4's scope instead;
 noted here so a future loop does not re-expect S2b-1 to move Q49.
+
+## S2b-2 result (2026-09-17) — the base-rel Pathlist surgery is REAL and reachable, but PROVABLY INERT until Incremental Sort exists
+
+**Scope-only, no production diff.** S2b-2 as filed reads "base join/scan
+Pathlist-across-the-search-boundary surgery... the real K24 item," with its
+own warning to size it before writing code. This is that sizing pass.
+
+**The seam, read first.** `createOrderedPaths` (`upperordered.go:64`) takes
+exactly one `input Node` — the search's own already-materialized winner —
+wraps it in a single `seed *Path` via `newPrebuiltPath`, and hands that one
+seed to `addOrderedPaths` (`upperordered.go:122`), which offers it to the
+`ORDERED` rel as-is if `seed.Pathkeys` already satisfies the ORDER BY, else
+stacks a `*Sort` on it. Exactly one candidate ever reaches this tournament.
+Contrast PG's oracle, `create_ordered_paths` (`planner.c:5308`): it loops
+`input_rel->pathlist` — every surviving candidate from the DP search, not
+just the cheapest — offering each (as-is or Sorted) to `add_path` on the
+`ORDERED` rel, so a candidate that is not cheapest-total pre-Sort can still
+win post-Sort (PG's own reason to keep more than one candidate alive at all).
+R21 slice 2a already built the accessor this surgery would need:
+`searchedRelOf(node) *RelOptInfo` (`searchedtree.go:169`) walks the boundary
+wrapper chain and returns the search's own `RelOptInfo`, `Pathlist` included
+— so **the missing plumbing is not "no way to reach the candidates," it is
+"nothing downstream ever asks for more than the one seed already carries."**
+
+**Live-traced against the full TPC-DS SF0.25 corpus** (temporary
+`GOOPG_S2B2DEBUG=1`-gated `fmt.Fprintf` calls in `createOrderedPaths`,
+printing `searchedRelOf(input)`'s `Rows`/`Pathlist` — length, cost, rows,
+pathkeys count of every candidate — right where `seed` is built; reverted
+before commit via `git checkout --`, confirmed empty `git diff --stat`).
+`scripts/tpcds-sf025-regression.sh sweep` then `plans`, private
+`GOOPG_BIN=tmp/goopg-s2b2-bin` (shared `tmp/goopg-bench-bin` is in active use
+by the nightly lane). Both runs: `PASS=96 MISMATCH=0`, `PLAN-SHAPE:
+changed=0` — the instrumentation is read-only and moved nothing, as
+expected. **Finding 1: the seam is real and reached constantly** — 38
+distinct `createOrderedPaths` calls across the corpus reach a non-nil
+`searchedRelOf(input)`, with `Pathlist` sizes from 3 to 16 (median ~7) — i.e.
+`addOrderedPaths` is discarding a median of ~6 real alternative candidates
+per call, corpus-wide, exactly as the task's framing predicted. **Finding 2,
+decisive:** parsed all 38 blocks programmatically (script run inline, not
+committed) and checked two invariants PG's cost model does NOT share but
+goopg's currently does: (a) **every candidate in a given call's `Pathlist`
+carries the SAME `Rows`** (36/38 blocks exactly; the remaining 2 differ by
+1 row, traced to a `kind=11` — LIMIT-bearing — candidate's own rounding, not
+a genuine cardinality split) — candidates of one rel are alternate physical
+strategies for the SAME logical relation, so `costSortRun`'s only inputs
+(`rows`, `width`, both rel-level) are identical across every candidate; and
+(b) **the candidate `sr.CheapestTotal` already points at is, in all 38
+blocks with no exception, the exact minimum-cost entry in `Pathlist`** (the
+search's own `setCheapest` already found it), and that candidate's cost
+tracks the seed's `legacyDisplayCostOf` value used today (small numeric
+drift expected — two different cost derivations of the same materialized
+Node, not two different candidates).
+
+**Why (a)+(b) together mean the surgery cannot move a plan today.** Since
+every candidate of a rel prices its Sort from the identical `(rows, width)`
+pair, and goopg's sort cost function (`costSortRun`) has no term that varies
+by a candidate's OWN `Pathkeys` — no incremental-sort prefix credit exists
+yet (M0141-S7 is unimplemented, confirmed `[ ]` and gated on S1-S6) — the
+Sort cost added on top is a CONSTANT across every candidate in the list.
+Adding an identical constant to every candidate's cost cannot change their
+relative order: whichever candidate was cheapest-total BEFORE the Sort
+(`sr.CheapestTotal`, confirmed (b) above) remains cheapest-total AFTER it.
+That candidate is exactly the one `createOrderedPaths` already uses as its
+single seed today. **Opening the full `Pathlist` to the ORDERED tournament,
+on its own, is therefore provably a zero-plan-movement change on this
+corpus** — the same "moves nothing" verdict R21 Slice 1 predicted and
+measured for its own plumbing-only cut
+(`docs/design/not_ralph/plan_parity_fix_take2/r21-upper-planner-seam/DESIGN.md`
+§5), not a defect in this recon's method.
+
+**What would actually make the surgery pay off: per-candidate Pathkeys
+credit in the sort cost, i.e. Incremental Sort (M0141-S7).** PG's
+`cost_incremental_sort` (`costsize.c`) prices a sort whose input already
+satisfies a PREFIX of the required key list cheaper than a full
+`cost_sort` — a genuinely per-candidate term, since different candidates in
+the same `Pathlist` carry different `Pathkeys` prefixes (observed directly
+in the trace: within one 16-candidate block, `pathkeys` values of 0 and 1
+coexist at wildly different base costs). Only once that asymmetry exists
+does "which candidate is cheapest AFTER an appropriately-priced Sort" become
+a real question distinct from "which candidate is cheapest before any Sort"
+— which is the whole reason PG's `create_ordered_paths` bothers to loop the
+full pathlist instead of picking `cheapest_total` and sorting it. **This
+re-orders M0141's own remaining-slices sequencing**: S2b-2's Pathlist-surgery
+plumbing and S7's Incremental Sort are not independent, sequential slices —
+S2b-2 is dead weight without S7, symmetrically to how S7's own prefix-match
+arm (already noted in S2b's census above) needs a real multi-candidate
+Pathlist to have anything to choose among. Building either alone, in
+isolation, reproduces the "byte-identical plans" non-result this recon just
+demonstrated for S2b-2.
+
+**Decomposition for whichever loop picks this back up** (mirrors R21's own
+slice discipline):
+
+1. **S2b-2a (plumbing, no behavior change)** — thread `searchedRelOf(input)`
+   into `createOrderedPaths`/`addOrderedPaths` so the full `Pathlist` is
+   *visible* at the call site (today it is reachable via the accessor but
+   nothing in this file calls it). Gate: byte-identical plans on both
+   corpora, matching R21 Slice 1's own gate — per Finding 2 above, this is
+   now a *predicted*, not merely hoped-for, null result.
+2. **S2b-2b (materialize-on-demand, no behavior change)** — for each
+   candidate beyond the current seed, defer `createPlanNode` until
+   `setCheapest` has already chosen a winner (mirrors how the existing code
+   defers materialization to the very end today), so a corpus-wide surgery
+   does not pay a `createPlanNode` cost for N-1 discarded candidates per
+   query. Needs the same `validatedSearchPathkeys`
+   (`upperorderedinput.go`) coordinate-boundary check generalized to run
+   per-candidate rather than once for the single seed — every candidate's
+   `Pathkeys` are in the SEARCH's inner coordinate space and must be
+   validated against the schema the boundary publishes before being trusted,
+   the same rule the file's header already states for the one seed it
+   handles today.
+3. **S2b-2c (the actual payoff, blocked on M0141-S7)** — once
+   `cost_incremental_sort`'s per-candidate prefix credit exists, 2a+2b's
+   plumbing is what lets `addOrderedPaths` run a REAL tournament across
+   `Pathlist` instead of the single always-cheapest-pre-Sort seed. Do not
+   attempt before S7 lands; this recon's Finding 2 is the proof that doing
+   so earlier cannot move a plan.
+
+No ledger row needed for new unimplemented scope: the gap (Incremental Sort
+as S2b-2's real prerequisite) is already M0141-S7, filed and unchecked; this
+recon corrects the SEQUENCING between two already-filed items, it does not
+discover a new one.
