@@ -4192,7 +4192,7 @@ cross-layer programme that has never been scoped.
   byte-identical) as expected. Next blocker root-caused and filed as
   `-3i-plumbing-c8` (below): Q69 now advances past BOTH semiAnti gates and
   is declined one stage later by a pre-existing, over-broad guard.
-- [ ] **M0142-0008a-3i-plumbing-c8 — `problemPairsOuterWithDerived` must not
+- [x] **M0142-0008a-3i-plumbing-c8 — `problemPairsOuterWithDerived` must not
   treat a semiAnti RHS leaf's own opacity as "no statistics"** (design doc
   §42.3, filed by c7). With c7 landed, Q69 clears both semiAnti admission
   gates and reaches `searchOneProblem` (relfromjoinlist.go), where
@@ -4232,6 +4232,49 @@ cross-layer programme that has never been scoped.
   case before landing. Re-run the TPC-DS SF0.25 sweep AND the full-corpus
   `GOOPG_PGSHAPED_DP_TRACE=1` sweep after landing (the real test is still a
   `jointype=semi`/`anti` DPPATH line finally appearing).
+  **DONE 2026-09-17 (design doc §43): landed `isSemiAntiSyntheticLeaf`, a
+  provenance flag on `baseRelInfo` set only at the semiAnti synthetic-leaf
+  construction site (joinsearchseam.go), checked first in
+  `leafIsDerivedInput` (neither candidate (a) nor literal (b) survived —
+  §43.1 — this is the third option that actually satisfies both pinned
+  tests AND the new one). New pinned test
+  `TestProblemPairsOuterWithDerivedSemiOverMultiRelationRHSDoesNotDecline`,
+  verified to fail pre-fix. Corpus sweep: Q69 now clears EVERY seam-level
+  gate c5-c8 landed — its only remaining seam-declines are ordinary
+  DP-search noise (`illegal`/`no-join-clause`/`strategy-or-mode`), zero
+  semiAnti-specific reasons. `jointype=semi`/`anti` DPPATH reachability
+  STILL zero corpus-wide — next blocker is downstream of the seam
+  entirely, filed as `-3i-plumbing-c9` below. TPC-DS SF0.25 sweep
+  unaffected (`PASS=96 MISMATCH=0`, `PLAN-SHAPE same=99`, Q78
+  byte-identical).**
+- [ ] **M0142-0008a-3i-plumbing-c9 — find what blocks `jointype=semi`/`anti`
+  now that Q69 clears every seam-level gate** (design doc §43.6, filed by
+  c8). Q69's DP search now runs with no semiAnti-specific seam decline at
+  all, yet 150,255+ `DPPATH` lines still contain zero `jointype=semi`/
+  `anti` — the blocker (if any single one exists; it may instead be that
+  costing simply never prefers a semiAnti-shaped candidate once one is
+  built, which is a different kind of task than an admission bug) is
+  downstream of `searchOneProblem`'s pre-DP firewalls, inside
+  `joinIsLegal`/`makeJoinRel` (joinsearchlevel.go) or the join-path
+  builders. Concrete, not-yet-chased lead: `(*searchCtx).joinIsLegal`
+  (joinsearchlevel.go:197) already has a SEMI "unique-ified RHS" admission
+  arm calling `createUniquePath` (M0142-0008c-1/-2 — landed independently
+  of this c-series, AFTER the M0142-0008c recon row above said the
+  mechanism didn't exist yet; that recon's "goopg has zero
+  create_unique_path" finding is now STALE, do not trust it without
+  re-checking). Whether that arm is what Q69's pairing needs — and whether
+  `createUniquePath`'s three preconditions
+  (`sjinfo.SemiCanBtree`/`len(sjinfo.SemiRhsExprs)!=0`/`subpath.Kind ==
+  PathPrebuilt`) actually hold for the leaf-index-rebuilt `j.SJInfo` c7
+  mutates in place — is unconfirmed by inspection only
+  (`buildInitialRels`/joinsearch.go:434 does wrap every leaf, including the
+  synthetic one, in a `PathPrebuilt`, so that ONE precondition looks
+  satisfied, but was not traced end to end with instrumentation). Start by
+  instrumenting `joinIsLegal`'s SEMI arms and `createUniquePath`'s early
+  returns for Q69 specifically before assuming a new mechanism is needed.
+  Also confirm what a genuinely-admitted semiAnti path's DPPATH line would
+  even look like (check `pathtrace.go`'s jointype-label source) so the
+  "reachability" signal is trusted correctly.
 - [x] **M0142-0008c — scoping recon: does goopg need PG's `create_unique_path`
   (semi-join → de-duplicate RHS + inner join) to reach parity on TPC-DS
   Q10/Q35?** — filed by M0142-0008a-3(iii)'s §4.3 gate re-run (design doc §6).

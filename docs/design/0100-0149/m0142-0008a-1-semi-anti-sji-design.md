@@ -4837,3 +4837,146 @@ DIFFERENT derived input (an actual CTE elsewhere in the problem) is
 touched. (b) is likely closer to the guard's original C-04a intent and
 would not require plumbing a new stats-confidence signal through
 `baseRelInfo`.
+
+## 43. M0142-0008a-3i-plumbing-c8: a provenance flag, not (a) or literal (b)
+
+### 43.1 Why neither candidate direction survived as written
+
+(a) was rejected as fragile: `EstimateRows` returns a plain `int64`, and a
+"non-default value" test cannot distinguish a genuinely no-stats CTE that
+happens to estimate to, say, 40 rows from a real per-child estimate that
+happens to be 1 — the C-04a Q78 hazard was specifically a **rows=1**
+default, but nothing guarantees every derived input defaults to exactly
+that value, and nothing guarantees a real join estimate never lands on a
+small number either. Keying a safety guard on a numeric coincidence is the
+wrong kind of signal.
+
+(b) read literally — exempt `sj.SynRighthand` from the bitmask `touched`
+test for a Semi/Anti `sj` — was checked against the two existing pinned
+tests (`TestProblemPairsOuterWithDerivedSemiOverDerived`/
+`...AntiOverDerived`, semiantichain_test.go:140/154) and found to BREAK
+them: both fixtures place the derived (CTE) item exactly on the semiAnti
+sj's own `SynRighthand` (`sjis[0] = {JoinSemi, SynLefthand:1<<0,
+SynRighthand:1<<1}`, `items[1] = cteLeaf`), and both assert the problem
+MUST decline. Removing `SynRighthand` from the bitmask this sj tests would
+make `touched` collapse to `SynLefthand` alone, `derived[1]` would no
+longer be reachable through this sj, and the guard would silently stop
+declining the exact CTE-on-RHS shape it was built to catch. (b)'s prose
+("exempt a link's own rhs hand") turns out to describe a narrower target
+than the SJInfo bitmask can express: it means "exempt THIS SPECIFIC LEAF
+being classified derived because IT HAPPENS TO BE this link's own
+synthetic opaque leaf" — a per-item distinction, not a per-hand one.
+
+### 43.2 The actual fix: mark the leaf's provenance where it is built
+
+`baseRelInfo` gains one new field, `isSemiAntiSyntheticLeaf bool`
+(cardinality.go). It is set to `true` at exactly one construction site —
+joinsearchseam.go's Semi/Anti synthetic-leaf loop (the `for k := range
+semiAnti` block predp.go's c2 added), the same place that already prices
+the leaf with `EstimateRows(scan)` over the spliced-in join subtree instead
+of a catalog lookup, with a comment explaining why (`scan` is a real,
+already-sized plan subtree). `leafIsDerivedInput` (relfromjoinlist.go)
+checks the flag FIRST and returns `false` immediately when set, before the
+Filter/Project-unwrap loop or the `CTEScan`/`WorkTableScan` type switch ever
+run.
+
+This is narrower than either candidate: it does not touch the
+`SynLefthand`/`SynRighthand` bitmask logic `problemPairsOuterWithDerived`
+uses at all (so the two pinned CTE-on-RHS tests are untouched — their
+fixtures build `relInfos` directly in the test, never set the new flag, and
+never go through the synthetic-leaf construction site), and it does not
+infer anything from a numeric row estimate (so it cannot be fooled by a
+coincidental small number). It reads as "was this baseRelInfo built by the
+one code path that prices an opaque multi-relation subtree with real
+stats," which is exactly the distinction 43.1 needed and the C-04a guard's
+comment (relfromjoinlist.go:495-511) already draws in prose ("derived
+inputs carry no statistics") — the flag makes that prose machine-checkable
+at the one site where it was previously approximated by `table == nil`.
+
+### 43.3 A residual gap, noted rather than fixed here
+
+The flag is leaf-scoped, not subtree-scoped: if a semiAnti RHS body itself
+contains a genuine CTE nested inside a multi-relation join (e.g. `EXISTS
+(SELECT 1 FROM cte_x JOIN t3 ON …)`), the synthetic leaf's TOP node is
+`*Join`, the flag is set, and `leafIsDerivedInput` now returns `false`
+without ever seeing the `*CTEScan` one level down — this differs from
+BEFORE this fix, where the same case accidentally declined via the
+`info.table == nil` fallback (right answer, wrong reason: EVERY
+multi-relation semiAnti RHS had `table == nil`, whether or not it
+contained a real CTE). Whether this nested shape occurs in the TPC-H/
+TPC-DS corpus is not known to be the case today (no corpus query nests a
+CTE inside an EXISTS/NOT-EXISTS body), and neither candidate direction in
+§42.3 asked for it — the task's own MUST-NOT list is only the two existing
+pinned tests plus a new one for "multi-relation EXISTS body must not
+decline," which this fix satisfies. Recorded as a deferral-ledger row
+rather than silently accepted.
+
+### 43.4 Unit test and controlled revert-and-check
+
+`TestProblemPairsOuterWithDerivedSemiOverMultiRelationRHSDoesNotDecline`
+(semiantichain_test.go) is the third test §42's task description asked
+for: a Semi sj whose RHS item has `isSemiAntiSyntheticLeaf: true` and no
+`table` must NOT decline. Verified to FAIL against the pre-fix code
+(temporarily gated the new check behind `if false && …`, confirmed the
+exact same "must NOT decline" failure the design predicted, then restored
+the real fix) before landing — same discipline c7 introduced. The two
+pre-existing pinned tests
+(`TestProblemPairsOuterWithDerivedSemiOverDerived`/`...AntiOverDerived`)
+were re-run alongside it and still pass unchanged.
+
+### 43.5 Verification
+
+`go build ./...` clean; `go test ./internal/optimizer/...` green (13/13
+`TestProblemPairsOuterWithDerived*` cases, including the new one).
+
+Full-corpus `GOOPG_PGSHAPED_DP_TRACE=1` sweep (private binary
+`tmp/goopg-m0142-c8-bin`, built+removed this loop; `bench/tpcds/server.sh
+start sf025` with the flag exported): 96/100 EXPLAINs succeeded (same 4
+pre-existing unrelated parse gaps as every prior loop in this line), 150,255
+`DPPATH` lines, still **ZERO** `jointype=semi`/`anti` — full DP-search
+reachability is NOT yet achieved. `seam-decline` reason counts corpus-wide:
+`semianti-link-no-sjinfo`=3 (unchanged), `semianti-on-qual`=0 (unchanged
+from c7), `outer-over-derived`=3 (down from being Q69's own decline
+reason at c7 — see below, these 3 are now a DIFFERENT, unrelated query's
+pre-existing decline, not Q69's).
+
+Per-query isolation on Q69 alone (freshly truncated log, `EXPLAIN` Q69
+only): **ZERO** semiAnti-related or `outer-over-derived` seam-declines of
+any kind — Q69 now clears every seam-level gate this milestone has landed
+(c5 sjinfo check, c6 population, c7 rebase, c8 derived-input guard). Its
+only seam-decline reasons are ordinary per-pair DP-search noise
+(`reason=illegal` x22, `reason=no-join-clause` x6,
+`reason=strategy-or-mode` x1) — the same `DPTRACE decline` channel every
+other query's DP search also emits while exploring join orders, not a
+semiAnti-specific gate. `jointype=semi`/`anti` DPPATH is still zero for Q69
+specifically too.
+
+TPC-DS SF0.25 sweep (private binary, same run): `PASS=96 (60 ck-verified, 36
+ck=n/a) MISMATCH=0 CKMISMATCH=0 ERROR=0`, `PLAN-SHAPE: queries=99 same=99
+changed=0` against the c7 commit — Q78 still byte-identical (15 rows,
+checksum `c06cf981a7819a37`, unchanged since c2). Exactly the expected
+result: c8 lets Q69 progress further through admission gates without
+changing which plan wins, because costing/DP-search still doesn't reach a
+semiAnti path.
+
+### 43.6 Next blocker (not root-caused this loop — filed as c9)
+
+Q69 clearing every seam-level gate and landing on ordinary `illegal`/
+`no-join-clause` DP-search noise, with zero `jointype=semi`/`anti` DPPATH
+lines, means the next blocker is downstream of the seam entirely — inside
+`joinIsLegal`/`makeJoinRel` (joinsearchlevel.go) or the join-path builders
+themselves, not `searchOneProblem`'s pre-DP firewalls c5-c8 covered. One
+concrete lead, not yet chased: `(*searchCtx).joinIsLegal`
+(joinsearchlevel.go:197) already carries a SEMI "unique-ified RHS" admission
+arm calling `createUniquePath` (M0142-0008c-1/-2, landed independently of
+this milestone's c-series, AFTER the M0142-0008c recon that said this
+mechanism did not exist yet — that recon's finding is now stale) — whether
+that arm is what Q69's pairing needs, and if so whether
+`createUniquePath`'s preconditions (`sjinfo.SemiCanBtree`,
+`len(sjinfo.SemiRhsExprs) != 0`, `subpath.Kind == PathPrebuilt`) actually
+hold for the leaf-index-rebuilt `j.SJInfo` c7 mutates in place, is
+unconfirmed. `buildInitialRels` (joinsearch.go:434) does wrap every leaf —
+including the synthetic semiAnti one — in a `PathPrebuilt`
+(`newPrebuiltPath`), so that specific precondition looks satisfied by
+inspection, but this was not traced end to end with instrumentation. Start
+there before assuming a NEW mechanism is needed.

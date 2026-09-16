@@ -521,6 +521,17 @@ func sjInfosInItemSpace(list []*SpecialJoinInfo, items []joinlistRel) ([]*Specia
 // timeout. The `table == nil` arm is kept as a fallback for a leaf that has
 // no binding table at all.
 func leafIsDerivedInput(scan Node, info baseRelInfo) bool {
+	// c8 (design doc §42.4): a Semi/Anti link's own opaque RHS leaf also has
+	// `table == nil` (it is a spliced-in join subtree, not a single base
+	// relation), but its `baseRows` came from `EstimateRows` over an
+	// already-cost-estimated subtree — real stats, not the C-04a "no
+	// statistics" case this function exists to catch. The flag is set only
+	// at that one construction site (joinsearchseam.go), never for a
+	// genuine CTE/worktable/subquery leaf, so this exemption cannot mask
+	// the CTE case the switch below still catches by node type.
+	if info.isSemiAntiSyntheticLeaf {
+		return false
+	}
 	// A statement leaf reaches the search WRAPPED: a CTE output with a
 	// pushed-down predicate is `*Filter{Child: *CTEScan}`, not a bare
 	// `*CTEScan`, and a type switch on the top node sees only the Filter.

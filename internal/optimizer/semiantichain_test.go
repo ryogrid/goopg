@@ -165,6 +165,29 @@ func TestProblemPairsOuterWithDerivedAntiOverDerived(t *testing.T) {
 	}
 }
 
+// TestProblemPairsOuterWithDerivedSemiOverMultiRelationRHSDoesNotDecline is
+// the c8 fix (design doc §42.4): a Semi/Anti link's own opaque RHS leaf has
+// no single base table (`table == nil`, same as a genuine CTE leaf above),
+// but that is NOT the same "no statistics" signal — joinsearchseam.go's
+// synthetic-leaf construction site prices it with `EstimateRows` over an
+// already-cost-estimated join subtree and marks it
+// `isSemiAntiSyntheticLeaf`, so `problemPairsOuterWithDerived` must not
+// decline solely because of it (unlike the two tests above, which must keep
+// declining on a REAL derived leaf).
+func TestProblemPairsOuterWithDerivedSemiOverMultiRelationRHSDoesNotDecline(t *testing.T) {
+	prob := &joinlistProblem{
+		scans:    []Node{baseLeaf(), &Join{Type: JoinTypeInner, Left: baseLeaf(), Right: baseLeaf()}},
+		relInfos: []baseRelInfo{{table: baseTable()}, {isSemiAntiSyntheticLeaf: true}},
+	}
+	items := []joinlistRel{{lo: 0, hi: 1}, {lo: 1, hi: 2}}
+	sjis := []*SpecialJoinInfo{
+		{Jointype: parser.JoinSemi, SynLefthand: 1 << 0, SynRighthand: 1 << 1},
+	}
+	if problemPairsOuterWithDerived(sjis, items, prob) {
+		t.Errorf("a Semi join's own multi-relation RHS leaf (real per-child stats, no single base table) must NOT decline via the derived-input guard")
+	}
+}
+
 // M0142-0008a-3i-plumbing-b1 (design doc §22.4): unit tests for the REAL
 // `extractSearchLeaves`'s Semi/Anti-admission arm, gated behind the new
 // `admitSemiAnti` parameter. These exercise the production function itself

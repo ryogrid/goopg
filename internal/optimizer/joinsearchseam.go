@@ -682,6 +682,12 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 			bindingIdx:   i,
 			baseRows:     baseRows,
 			filteredRows: applyLocalFilterSelectivity(baseRows, b, scan, local),
+			// c8 (design doc §42.4): this leaf's `table == nil` reflects
+			// "not a single base relation," not "no real stats" —
+			// `baseRows` above already came from `EstimateRows` over a
+			// real, already-cost-estimated join subtree. Mark it so
+			// `leafIsDerivedInput` doesn't conflate the two.
+			isSemiAntiSyntheticLeaf: true,
 		}
 	}
 

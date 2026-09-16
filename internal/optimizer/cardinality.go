@@ -704,6 +704,16 @@ type baseRelInfo struct {
 	localFilter      Expr
 	hasLocalFilter   bool
 	isSmallDimension bool
+	// isSemiAntiSyntheticLeaf marks a leaf built by joinsearchseam.go's
+	// Semi/Anti admission arm for a link's own opaque RHS subtree (the
+	// `j.Right` spliced in wholesale, `table` left nil because it is not a
+	// single base relation). Unlike a genuine derived input (CTE scan,
+	// worktable scan, or any other leaf with no real per-child stats), this
+	// leaf's `baseRows` comes from `EstimateRows(scan)` over an
+	// already-cost-estimated join subtree (M0142-0008a-3i-plumbing-c8) — so
+	// `leafIsDerivedInput` must not treat its `table == nil` as the same
+	// "no statistics" signal a genuine derived input's nil table is.
+	isSemiAntiSyntheticLeaf bool
 }
 
 // estimateBaseRelInfo computes a `baseRelInfo` for one FROM
