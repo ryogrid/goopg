@@ -294,18 +294,20 @@ func TestAddPaths_SemiAntiNestloopOnly(t *testing.T) {
 				t.Fatalf("legal direction: %v", err)
 			}
 			kinds := kindsOf(joinrel.Pathlist)
-			if kinds[PathNestLoop] == 0 {
-				t.Fatalf("%v generated %v; want at least one nested loop — a joinrel "+
-					"with an empty pathlist is a hard search failure", jtype, kinds)
+			if kinds[PathNestLoop] == 0 && kinds[PathHashJoin] == 0 {
+				t.Fatalf("%v generated %v; want at least a nested loop or a hash join — a "+
+					"joinrel with an empty pathlist is a hard search failure", jtype, kinds)
 			}
-			if kinds[PathHashJoin] != 0 || kinds[PathMergeJoin] != 0 {
-				t.Errorf("%v generated %v; want nestloop only — goopg has no "+
-					"unique-ification proof, so a keyed SEMI/ANTI would multiply rows",
-					jtype, kinds)
-			}
-			if len(joinrel.PartialPathlist) != 0 {
-				t.Errorf("%v generated %d partial paths; the partial hash arm is keyed "+
-					"and must decline with its serial twin", jtype, len(joinrel.PartialPathlist))
+			// M0142-0008a-3(iii): hash is no longer declined for SEMI/ANTI —
+			// the design doc's §5 trace-through confirmed the executor
+			// (join_batch.go) already implements Semi/Anti hash semantics
+			// natively, proven in production via unnestExistsExpr's
+			// hand-built Hash Semi/Anti nodes. MERGE remains declined: the
+			// merge-join executor has no equivalent, traced dedup handling.
+			if kinds[PathMergeJoin] != 0 {
+				t.Errorf("%v generated %v; want no merge join — goopg's merge-join executor "+
+					"has no early-exit/dedup handling for SEMI/ANTI and a keyed merge would "+
+					"multiply rows", jtype, kinds)
 			}
 			for _, p := range joinrel.Pathlist {
 				if p.Jointype != jtype {
@@ -371,8 +373,11 @@ func TestDPPATHAdjudicatesOfferedAndAccepted(t *testing.T) {
 		bannedKind   string // a producer that must NOT
 	}{
 		{parser.JoinLeft, "join.hash", ""},
-		{parser.JoinSemi, "join.nestloop", "join.hash"},
-		{parser.JoinAnti, "join.nestloop", "join.hash"},
+		// M0142-0008a-3(iii): hash is no longer declined for SEMI/ANTI (see
+		// mergeDeclined in joinpaths.go) — only mergejoin still is, since
+		// goopg's merge-join executor has no traced Semi/Anti dedup handling.
+		{parser.JoinSemi, "join.nestloop", "mergejoin"},
+		{parser.JoinAnti, "join.nestloop", "mergejoin"},
 	} {
 		t.Run(joinTypeName(tc.jtype), func(t *testing.T) {
 			a, b, outer, inner, joinrel, clauses := jointypeProblem(t)

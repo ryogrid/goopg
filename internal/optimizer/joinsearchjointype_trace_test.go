@@ -162,14 +162,19 @@ func TestEnumTraceSemiPairingIsNestloopOnly(t *testing.T) {
 		}
 	}
 	if !got["join.nestloop"] {
-		t.Fatal("no nested loop offered for the SEMI pairing; it is the only arm " +
+		t.Fatal("no nested loop offered for the SEMI pairing; it is one of the two arms " +
 			"C-03b leaves open, so its absence is a hard failure, not a decline")
 	}
-	for _, banned := range []string{"join.hash", "mergejoin"} {
-		if got[banned] {
-			t.Errorf("producer %s ran for a SEMI pairing; goopg has no unique-ification "+
-				"proof and a keyed SEMI would multiply rows", banned)
-		}
+	// M0142-0008a-3(iii): hash is no longer declined for SEMI/ANTI — the
+	// design doc's §5 trace-through confirmed the executor already
+	// implements Semi/Anti hash semantics natively (join_batch.go), so this
+	// equi-keyed spine now also offers a hash candidate.
+	if !got["join.hash"] {
+		t.Fatal("no hash path offered for the SEMI pairing; M0142-0008a-3(iii) lifted the decline")
+	}
+	if got["mergejoin"] {
+		t.Error("producer mergejoin ran for a SEMI pairing; goopg's merge-join executor has " +
+			"no early-exit/dedup handling for SEMI/ANTI and a keyed merge would multiply rows")
 	}
 }
 

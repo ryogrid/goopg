@@ -20,27 +20,46 @@ func TestSemiAdmissionFilesPricedNLI(t *testing.T) {
 	clauses := []*restrictInfo{equiClause(a, b)}
 	sj := mkSJ(parser.JoinSemi, a, b)
 
-	if err := addPathsToJoinrel(nil, joinrel, outer, inner, clauses, cp, sj); err != nil {
-		t.Fatalf("addPathsToJoinrel: %v", err)
+	// M0142-0008a-3(iii) lifted the hash decline for SEMI/ANTI, so this
+	// equi-keyed pairing now also gets a hash candidate that competes with
+	// NLI on cost — the cheaper one wins addPath's dominance pruning and the
+	// other need not survive into Pathlist. What R75 actually needs to keep
+	// proving is that admission through addPathsToJoinrel reaches
+	// addNLIPaths (and now addHashJoinPath) and prices whichever wins
+	// correctly — not that the NLI path specifically survives — so this
+	// checks both were OFFERED (traced) and that the SURVIVING SEMI path
+	// satisfies the PG inequality.
+	lines := captureTrace(t, func() {
+		if err := addPathsToJoinrel(nil, joinrel, outer, inner, clauses, cp, sj); err != nil {
+			t.Fatalf("addPathsToJoinrel: %v", err)
+		}
+	})
+	offered := producersIn(lines)
+	if !offered["join.nestloop"] {
+		t.Fatal("no nested-loop path OFFERED for the SEMI pairing")
 	}
-	var nli *Path
+	if !offered["join.hash"] {
+		t.Fatal("no hash path OFFERED for the SEMI pairing — M0142-0008a-3(iii) should have lifted the decline")
+	}
+
+	var winner *Path
 	for _, p := range joinrel.Pathlist {
-		if p.Kind == PathNestLoop && p.Jointype == parser.JoinSemi {
-			nli = p
+		if p.Jointype == parser.JoinSemi {
+			winner = p
 			break
 		}
 	}
-	if nli == nil {
-		t.Fatalf("no SEMI nested-loop path filed (pathlist=%v) — admission BLOCKED here",
+	if winner == nil {
+		t.Fatalf("no SEMI path survived to Pathlist (pathlist=%v) — admission BLOCKED here",
 			kindsOf(joinrel.Pathlist))
 	}
 	outerTotal := outer.CheapestTotal.Cost.Total
-	if nli.Cost.Total < outerTotal {
-		t.Fatalf("SEMI NLI total %.2f < outer total %.2f — violates the PG inequality",
-			nli.Cost.Total, outerTotal)
+	if winner.Cost.Total < outerTotal {
+		t.Fatalf("SEMI winner (kind=%d) total %.2f < outer total %.2f — violates the PG inequality",
+			winner.Kind, winner.Cost.Total, outerTotal)
 	}
-	t.Logf("SEMI NLI filed: rows=%.0f total=%.2f (outer %.2f)",
-		nli.Rows, nli.Cost.Total, outerTotal)
+	t.Logf("SEMI winner: kind=%d rows=%.0f total=%.2f (outer %.2f)",
+		winner.Kind, winner.Rows, winner.Cost.Total, outerTotal)
 }
 
 // TestSemiProbeSpliceStampsPricedCost is R77's keeper: the production

@@ -568,3 +568,77 @@ already confirmed `createPlan`'s hash-join lowering is generic over
 Semi/Anti, so (3) is unblocked to implement; (1) is the larger, still-open
 design question (atomic-RHS vs full participation for the EXISTS body's own
 internal joins).
+
+## 8. M0142-0008a-3(iii) landed (2026-09-16) — HASH lifted, MERGE stays declined
+
+Implemented per §4.2 item 3 and §5's trace-through, with one correction §5
+itself did not surface: §5 traced only `createHashJoinPlan`'s lowering and
+the hash-join executor — it never examined the MERGE arms, but
+`joinpaths.go`'s single `nestloopOnly` boolean gated both keyed families
+(hash AND merge) as one block (`addPathsToJoinrel`'s own comment named
+"both merge arms, the serial hash arm and its partial twin" as one group).
+Grepping `internal/executor/join_merge_stream.go` for `Semi`/`Anti` returns
+**zero matches** — unlike `join_batch.go:340,363`'s explicit hash-join
+early-exit/dedup handling, goopg's merge-join executor has never been given
+(or verified to already have) Semi/Anti semantics. Lifting the combined gate
+wholesale would have enabled untested merge paths alongside the
+now-confirmed-safe hash paths, which §5's own verdict does not license.
+
+**What landed**: `joinpaths.go`'s single `nestloopOnly` boolean is split into
+two independently-gated groups inside `addPathsToJoinrel`. `mergeDeclined :=
+jt == parser.JoinSemi || jt == parser.JoinAnti` is unchanged in effect from
+the old `nestloopOnly` and still gates `sortInnerAndOuter`/
+`matchUnsortedOuterMerge`/`matchUnsortedOuterMergePartial`. The hash arms
+(`addHashJoinPath`, `addPartialHashJoinPath`) are now **unconditional** —
+reachable for SEMI/ANTI on the same footing as every other jointype. Updated
+in the same change: the file's stale "SEMI/ANTI contract" doc comment (it
+previously asserted goopg's hash executor would "MULTIPLY rows" if used for
+SEMI — false; `join_batch.go` already runs Semi/Anti hash joins correctly in
+production via `unnestExistsExpr`), and four unit tests that encoded the old
+nestloop-only assumption (`TestAddPaths_SemiAntiNestloopOnly`,
+`TestDPPATHAdjudicatesOfferedAndAccepted`,
+`TestEnumTraceSemiPairingIsNestloopOnly`, `TestSemiAdmissionFilesPricedNLI`)
+— each now asserts hash is offered/reachable and merge is not, rather than
+asserting neither.
+
+**A live-producer risk this section closes, not just -2's inert one.**
+Unlike -2 (whose `Join.SJInfo` field had zero readers, making "no plan-shape
+change" structural), this gate sits inside the DP search's own path
+generator, which already runs for one real SEMI/ANTI producer today:
+`reduceOuterJoins`'s LEFT→ANTI demotion (S9.3, `reduce_outer_joins.go`)
+mutates the parser's `FromExpr` tree *before* `deconstructJointreeScopedSJI`
+(`planner.go:3042` runs before `:3051`), so a `LEFT JOIN ... WHERE
+right.col IS NULL` idiom produces a real `SpecialJoinInfo{Jointype: JoinAnti}`
+that reaches `ctx.joinInfoList` and the ordinary DP search — `addPathsToJoinrel`
+was therefore already being called with `jt == JoinAnti` in production before
+this change, independent of M0142-0008a-3(i)/(ii) (EXISTS/NOT EXISTS
+decorrelation) landing at all. Lifting the hash decline could in principle
+have changed a real plan shape today, not just prepared for a future one.
+**Measured, not assumed**: `scripts/tpcds-sf025-regression.sh sweep` (full
+99-query TPC-DS SF0.25 corpus) reports `PLAN-SHAPE: queries=99 same=99
+changed=0`, `PASS=96 MISMATCH=0 CKMISMATCH=0 ERROR=0` against the
+pre-change baseline — byte-identical plans and results. `scripts/tpch-
+spotcheck.sh` SKIPPED (pre-existing, unrelated: `:65433`'s `tpch` DB still
+holds no TPC-H tables, M0142-0003k). The zero-change result means either no
+corpus query's `reduceOuterJoins`-produced ANTI joinrel has a usable
+equijoin key, or the newly-admitted hash path's conservative
+`hashJoinFinalCostInputFor`-fail-closed cost never beats the existing
+nested-loop/NLI candidates for the ones that do — either way, today's shipped
+plans are unaffected; the risk was real but did not materialise on this
+corpus. `internal/optimizer`'s full suite is green (updated tests pass;
+no other test depends on the old nestloop-only behavior).
+
+**Deferred, not closed**: MERGE stays declined for SEMI/ANTI because
+`join_merge_stream.go` has never been traced or verified for Semi/Anti
+early-exit/dedup semantics — a distinct, unstarted piece of work from this
+increment's hash trace. See `.ralph/deferral_ledger.md` row `M0142-0008a-3iii`.
+
+**Next step**: M0142-0008a-3 increments (i) (RHS-as-participant — make the
+decorrelated EXISTS/NOT EXISTS RHS a real DP-search leaf) and (ii) (legality
+wiring / end-to-end integration verification) are still open; §4.2's own
+open question (atomic-RHS vs full internal-join participation) is unresolved
+and gates (i). Once (i)/(ii) land, this loop's hash-admission work is what
+lets `addPath` actually cost-compare Hash against NLI for the EXISTS/NOT
+EXISTS-decorrelated joins the original census (M0142-0008a-3(iii)'s §4.3
+gate re-run, §6 above) named as the prize — TPC-DS query10/16/35/69/94 and,
+once `:65433` is reloaded, TPC-H Q4/Q21.

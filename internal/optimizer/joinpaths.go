@@ -140,12 +140,15 @@ func isKeyableFor(ri *restrictInfo, outer, inner RelSet) bool {
 //
 // SEMI/ANTI contract. PG runs `hash_inner_and_outer` for JOIN_SEMI
 // (joinpath.c:2229) and its executor early-outs on the first inner match.
-// goopg declines the keyed operators for SEMI/ANTI and offers only the nested
-// loops, for the same fail-closed reason: `hash_inner_and_outer`'s semi
-// handling is bound up with `create_unique_path` unique-ification, which goopg
-// has no analogue of, and a semi-join hashed as though it were an inner join
-// would MULTIPLY rows rather than merely mis-cost them. Declining is the safe
-// direction and costs nothing while the paths are unreachable.
+// goopg's hash-join operator (`join_batch.go:340,363`) already implements the
+// same early-exit/dedup semantics natively — it is not a plain INNER hash in
+// disguise — and is proven correct in production via `unnestExistsExpr`'s
+// hand-built Hash Semi/Anti nodes (M0142-0008a-1 §5's trace-through). So
+// `addPathsToJoinrel` offers a hash path for SEMI/ANTI the same as any other
+// jointype (M0142-0008a-3(iii)) — see `mergeDeclined` below for what is
+// STILL declined: the merge-join executor (`join_merge_stream.go`) has no
+// such handling, so a merge path for SEMI/ANTI would multiply rows exactly
+// the way this comment used to warn ALL keyed operators would.
 //
 // FULL is DECLINED outright, in both directions (C-03c). goopg's executor has
 // no FULL hash semantics, so `createPlanNode` has no arm that could emit one and
@@ -260,9 +263,20 @@ func addPathsToJoinrel(s *searchCtx, joinrel, outer, inner *RelOptInfo, clauses 
 	if !legal {
 		return nil
 	}
-	// SEMI/ANTI are nestloop-only in goopg. See jointypeForDirection's contract
-	// note for why the keyed operators decline rather than being ported.
-	nestloopOnly := jt == parser.JoinSemi || jt == parser.JoinAnti
+	// M0142-0008a-3(iii): SEMI/ANTI remain MERGE-declined — goopg's merge-join
+	// executor (join_merge_stream.go) has no early-exit/dedup handling for
+	// Semi/Anti (grep-confirmed zero references), so a merge path built for
+	// either would multiply rows exactly the way this file used to warn ALL
+	// keyed operators would. HASH is no longer declined: the design doc's §5
+	// trace-through (docs/design/0100-0149/m0142-0008a-1-semi-anti-sji-design.md)
+	// confirms `createHashJoinPlan`/`planJoinTypeFor` lower Semi/Anti on the
+	// same footing as INNER/LEFT, the executor's hash-join operator
+	// (`join_batch.go:340,363`) already implements Semi/Anti semantics in
+	// production via `unnestExistsExpr`'s hand-built nodes, and
+	// `hashJoinFinalCostInputFor` fails closed for non-INNER (skips one
+	// PG-specific refinement, never wrong). See jointypeForDirection's
+	// contract note above.
+	mergeDeclined := jt == parser.JoinSemi || jt == parser.JoinAnti
 
 	// 03 §9 rule 2 — PATH_PARAM_BY_REL (joinpath.c:43-47). The two directions
 	// are refused for genuinely different reasons, so they are named
@@ -311,44 +325,49 @@ func addPathsToJoinrel(s *searchCtx, joinrel, outer, inner *RelOptInfo, clauses 
 		// order arms are offered in IS the tie-break, and a tie between a merge
 		// and a hash path must resolve the way PG resolves it.
 		//
-		// C-03b adds the second conjunct: the keyed arms (both merge arms, the
-		// serial hash arm and its partial twin) are the ones a SEMI/ANTI join
-		// may not use here, so they are gated as a block rather than each
-		// re-deriving the rule.
-		if len(keys) > 0 && !nestloopOnly {
+		// C-03b: the keyed arms are split into two independently-gated
+		// groups. MERGE (both arms + its partial twin) stays gated on
+		// mergeDeclined — untraced for SEMI/ANTI, see above. HASH (the
+		// serial arm and its partial twin) is now unconditional: M0142-0008a-3(iii)
+		// lifted its SEMI/ANTI decline once the design doc's §5 trace-through
+		// confirmed the lowering/execution path is generic (see mergeDeclined's
+		// comment above for the citation).
+		if len(keys) > 0 {
+			if !mergeDeclined {
+				// mergejointuples: what the merge operator emits, before the
+				// residual filters it to joinrel.Rows. Computed ONCE here, where
+				// the searchCtx (and so the selectivity model) is in scope, and
+				// threaded into both merge arms as a scalar rather than widening
+				// their coupling to the search.
+				// A closure, not a scalar: the match_unsorted_outer arm TRIMS its
+				// merge-clause list per trial and demotes the dropped clauses into
+				// the residual, so its mergejointuples differs per call. Passing
+				// the rule lets each site apply it to its own residual, while the
+				// searchCtx stays out of the merge helpers' signatures.
+				mergeTuplesFor := func(res []*restrictInfo) float64 {
+					return s.mergeJoinTuples(joinrel.Rows, res, outer.Rows, inner.Rows)
+				}
+				scanSelFor := func(mc []*restrictInfo) (float64, float64) {
+					return s.mergeJoinScanSel(mc, outer.Relids)
+				}
+				sortInnerAndOuter(s, joinrel, outer, inner, cp, jt, keys, residual, mergeTuplesFor, scanSelFor, paramSrc)
+				// PG's arm 2, `match_unsorted_outer` (:290), sits between arm 1
+				// and arm 4 — so a merge over an already-ordered outer is offered
+				// to `addPath` BEFORE the hash path, and wins an exact tie against
+				// it exactly as it does in PG. Only the merge half of that arm is
+				// here; goopg's nested-loop halves (`addNestLoopPath` /
+				// `addNLIPaths`) were landed separately and still run after the
+				// hash arm, which can only change a hash-vs-nestloop exact tie.
+				matchUnsortedOuterMerge(joinrel, outer, inner, cp, jt, keys, residual, mergeTuplesFor, scanSelFor, paramSrc)
+				// E-20 Cut 3: PG's `consider_parallel_mergejoin`
+				// (joinpath.c:2071-2097) beside the serial arm above — every
+				// already-ordered partial outer (the cheapest is almost never
+				// the ordered one) against the cheapest parallel-safe complete
+				// inner. First candidate per outer only; the truncation search
+				// is a follow-up the A/B can motivate.
+				matchUnsortedOuterMergePartial(s, joinrel, outer, inner, cp, jt, keys, residual, mergeTuplesFor, scanSelFor, paramSrc)
+			}
 			final := s.hashJoinFinalCostInputFor(joinrel, outer, inner, jt, keys)
-			// mergejointuples: what the merge operator emits, before the
-			// residual filters it to joinrel.Rows. Computed ONCE here, where
-			// the searchCtx (and so the selectivity model) is in scope, and
-			// threaded into both merge arms as a scalar rather than widening
-			// their coupling to the search.
-			// A closure, not a scalar: the match_unsorted_outer arm TRIMS its
-			// merge-clause list per trial and demotes the dropped clauses into
-			// the residual, so its mergejointuples differs per call. Passing
-			// the rule lets each site apply it to its own residual, while the
-			// searchCtx stays out of the merge helpers' signatures.
-			mergeTuplesFor := func(res []*restrictInfo) float64 {
-				return s.mergeJoinTuples(joinrel.Rows, res, outer.Rows, inner.Rows)
-			}
-			scanSelFor := func(mc []*restrictInfo) (float64, float64) {
-				return s.mergeJoinScanSel(mc, outer.Relids)
-			}
-			sortInnerAndOuter(s, joinrel, outer, inner, cp, jt, keys, residual, mergeTuplesFor, scanSelFor, paramSrc)
-			// PG's arm 2, `match_unsorted_outer` (:290), sits between arm 1
-			// and arm 4 — so a merge over an already-ordered outer is offered
-			// to `addPath` BEFORE the hash path, and wins an exact tie against
-			// it exactly as it does in PG. Only the merge half of that arm is
-			// here; goopg's nested-loop halves (`addNestLoopPath` /
-			// `addNLIPaths`) were landed separately and still run after the
-			// hash arm, which can only change a hash-vs-nestloop exact tie.
-			matchUnsortedOuterMerge(joinrel, outer, inner, cp, jt, keys, residual, mergeTuplesFor, scanSelFor, paramSrc)
-			// E-20 Cut 3: PG's `consider_parallel_mergejoin`
-			// (joinpath.c:2071-2097) beside the serial arm above — every
-			// already-ordered partial outer (the cheapest is almost never
-			// the ordered one) against the cheapest parallel-safe complete
-			// inner. First candidate per outer only; the truncation search
-			// is a follow-up the A/B can motivate.
-			matchUnsortedOuterMergePartial(s, joinrel, outer, inner, cp, jt, keys, residual, mergeTuplesFor, scanSelFor, paramSrc)
 			// take2 P2-11: the inner side is the BUILD side here, so the
 			// bucket fraction is measured on its keys. Computed at this site
 			// because the searchCtx — and so the statistics — is in scope,

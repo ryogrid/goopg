@@ -3448,6 +3448,35 @@ cross-layer programme that has never been scoped.
     to decline -2/-3. Also incidentally found an EXPLAIN alias-mislabeling
     cosmetic bug on Q16/Q94 (execution-verified correct, display-only) —
     filed as **M0142-0008d** (below).
+    - [x] **M0142-0008a-3(iii) — lift the hash-decline gate — LANDED
+      2026-09-16 (design doc §8).** `joinpaths.go`'s single `nestloopOnly`
+      boolean (gated BOTH the hash arms AND the merge arms as one block) is
+      split into `mergeDeclined` (unchanged: still true for SEMI/ANTI,
+      since `join_merge_stream.go` has zero Semi/Anti references — the §5
+      trace-through never examined merge, only hash) and an unconditional
+      hash path (`addHashJoinPath`/`addPartialHashJoinPath` now reachable
+      for SEMI/ANTI same as any other jointype). Corrected the file's own
+      stale "SEMI/ANTI contract" doc comment (it claimed hash would
+      "MULTIPLY rows" for SEMI — false; `join_batch.go:340,363` already
+      runs Semi/Anti hash joins correctly in production via
+      `unnestExistsExpr`). Updated 4 unit tests that encoded the old
+      nestloop-only assumption. **Live-producer risk found and closed, not
+      just measured for -2's inert field**: `reduceOuterJoins`'s LEFT→ANTI
+      demotion (S9.3) already produces a real `SpecialJoinInfo{Jointype:
+      JoinAnti}` that reaches the ordinary DP search TODAY, independent of
+      -3(i)/(ii) landing — so this gate-lift could in principle have moved
+      a real plan shape, not just prepared for a future one. Empirically
+      verified it did not: `scripts/tpcds-sf025-regression.sh sweep`
+      (99-query TPC-DS SF0.25 corpus) — `PLAN-SHAPE: queries=99 same=99
+      changed=0`, `PASS=96 MISMATCH=0 CKMISMATCH=0 ERROR=0`.
+      `scripts/tpch-spotcheck.sh` SKIPPED (pre-existing, unrelated —
+      M0142-0003k). Full `internal/optimizer` suite green. Deferred: MERGE
+      staying declined for SEMI/ANTI is a real, unstarted gap (ledger row
+      `M0142-0008a-3iii`) — `join_merge_stream.go` needs its own Semi/Anti
+      early-exit/dedup trace before `mergeDeclined` can be lifted the same
+      way. **Still open in -3: increments (i) RHS-as-participant and (ii)
+      legality wiring/integration verification** — this hash-admission
+      work is what lets `addPath` cost-compare once those land.
   **Independent, unfiled resume-point hint** (not sized/numbered — noted for
   whoever picks up S5a's own eligibility gate): relaxing
   `whereEligibleForPreDPUnnest` to per-sublink granularity would upgrade
