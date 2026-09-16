@@ -6242,3 +6242,103 @@ never reaches `joinIsLegal` after this fix, because the Lateral join is no
 longer decomposed into separate leaves in the first place — but a
 DIFFERENT query that legitimately reaches `joinIsLegal` with a genuine
 zero-predicate pair is not ruled out by this loop and was not probed.
+
+## 50. c15 — re-attempted c11 item (c) now that c14 closed item (b)'s Q69
+crash; the one-line `joinInfoList` fix DOES land cleanly on the SF0.25
+corpus, but exposed a THIRD, independent, pre-existing defect (SJInfo lost
+at `createPlan` time) — reverted again, fix pinpointed for the next loop
+
+### 50.1 What this loop did
+
+c14 closed Q69's crash (§49) without touching `joinInfoList`. With that
+blocker gone, c11 item (c) — re-apply `joinInfoList: ctx.joinInfoList`
+(delete the unused `semiAntiJoinInfoList` double-append helper,
+joinsearchseam.go:767) — was the natural next step and was re-attempted
+this loop.
+
+`go build ./...` was clean and `go test ./internal/optimizer/...` failed
+exactly one test:
+`TestExtractSearchLeaves_AdmitSemiAnti_NarrowsMinLefthandToCorrelatedRelation`
+(semiantichain_test.go:316), which asserts `j.SJInfo != nil` on the
+`JoinTypeSemi` node found in the tree `Plan()` returns. With the fix
+applied, a temporary `t.Logf(planString(node))` showed the returned tree
+IS shaped correctly —
+`Project(Filter(Project(InnerJoin(SemiJoin(SeqScan(t1),
+Project(SeqScan(t2))), SeqScan(t3)))))` — but the `SemiJoin` node's
+`.SJInfo` field is `nil`.
+
+### 50.2 Root cause (confirmed by reading, not yet re-instrumented after
+the revert)
+
+`grep -rn "SJInfo:" internal/optimizer` has exactly ONE hit outside tests:
+`unnest.go:4837` (`existsUnnestSJInfo`, called from `unnestExistsExpr` at
+AST-unnesting time, long before the DP search runs). **No `createPlan`
+join constructor ever sets `.SJInfo` on the node it builds** —
+`createHashJoinPlan` (createplanjoin.go:565), `createMergeJoinPlan`
+(createplanjoin.go:724), the plain-nestloop constructor
+(createplannl.go:143, "the one arm a searched SEMI or ANTI join can
+reach" per its own comment) and the NLI constructors
+(createplannl.go:360+) all build a fresh `&Join{...}` literal from a
+`Path`/`joinInputs` with no `SJInfo:` field at all.
+
+Before this fix, `joinIsLegal`'s duplicate-list bug (c11 §46.2) always
+declined the search for any statement containing a Semi/Anti link, so
+`extractSearchLeaves`'s seam always returned `ok=false` and the ORIGINAL
+AST-built `*Join` node (the one `unnestExistsExpr` attached `.SJInfo` to
+directly) reached the final tree unchanged. With the duplicate-list bug
+fixed, the search now actually SUCCEEDS for statements this simple, and
+the final tree's Semi join is a NEW node `createPlan` built from a
+`Path` — which never had anywhere to carry `.SJInfo` forward, so it
+comes out nil. Textbook `goopg_unwinnable_path_is_untested` (memory):
+fixing the DP-search decline immediately exposed a THIRD latent bug in a
+code path that had never actually run to completion in production
+before c14+this attempt.
+
+**Scope check — is this cosmetic or does it matter?** `grep -rln
+"\.SJInfo\b" internal/` returns exactly 3 files: this fix's own
+`joinsearchseam.go` (search-time only, reads `ctx.joinInfoList`/`j.SJInfo`
+strictly BEFORE `createPlan` runs) and two `_test.go` files. Nothing in
+`internal/executor` or anywhere downstream of `createPlan` reads
+`Join.SJInfo`, so this specific gap does not (today) produce a wrong
+QUERY RESULT — but it silently breaks the invariant a dedicated unit test
+exists to protect, and any future planner pass that re-examines the
+final tree (a second search stage, EXPLAIN-adjacent tooling, etc.) would
+silently see "no special join here" on a node that is in fact one. Given
+the project's "an unwinnable path is an untested path" history (§48.6,
+§46.3), treating this as harmless because nothing consumes it YET is
+exactly the reasoning that let the last two latent bugs (c12's, c13's)
+ship unnoticed for as long as they did — so this is filed as a real
+defect, not a test-only nuisance, and the `joinInfoList` fix is reverted
+again rather than landed with a known-broken invariant.
+
+### 50.3 Fix, next loop (concrete resume point)
+
+1. Add a `SJInfo *SpecialJoinInfo` field to `Path` (path.go, alongside
+   `Jointype`).
+2. `addNestLoopPath` (pathgen.go:175) already RECEIVES `sjinfo` as a
+   parameter (passed by joinpaths.go:438) but never stores it — add
+   `SJInfo: sjinfo` to the `&Path{...}` literal it builds
+   (pathgen.go:192-206). `addHashJoinPath`/merge-path constructors take
+   the same parameter shape (`uniq uniqueSide, sjinfo *SpecialJoinInfo`)
+   for `createUniquePath`'s sake — thread it the same way there too, even
+   though today's search only ever reaches SEMI/ANTI via the nestloop arm
+   (createplannl.go:157's own comment), so the invariant holds for every
+   constructor rather than just the one currently reachable.
+3. In the plain-nestloop constructor (createplannl.go, the `j := &Join{...}`
+   literal around line 141), add `SJInfo: p.SJInfo` (nil is the correct,
+   harmless value for every non-Semi/Anti join, so no conditional is
+   needed).
+4. Re-run `TestExtractSearchLeaves_AdmitSemiAnti_NarrowsMinLefthandToCorrelatedRelation`
+   plus the rest of `go test ./internal/optimizer/...`, then re-apply the
+   `joinInfoList: ctx.joinInfoList` one-liner (c11 item (c) again) and run
+   the FULL `scripts/tpcds-sf025-regression.sh sweep` with a private
+   `GOOPG_BIN` before landing either piece.
+
+### 50.4 What was reverted this loop
+
+`git checkout -- internal/optimizer/joinsearchseam.go
+internal/optimizer/semiantichain_test.go` (the one-line `joinInfoList`
+fix plus a temporary diagnostic `t.Logf`) — `git diff --stat --
+internal/optimizer/` empty afterward, `go build ./...` clean, `go test
+./internal/optimizer/...` back to green. No production code changed this
+loop.

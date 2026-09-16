@@ -4686,6 +4686,50 @@ cross-layer programme that has never been scoped.
   Phase B decline MORE often, not less, so the claim needs re-verification
   rather than a same-direction edit; left for a future loop. Design doc
   §49.
+- [ ] **M0142-0008a-3i-plumbing-c15 — re-apply c11 item (c)'s
+  `joinInfoList: ctx.joinInfoList` fix (delete the duplicate-appending
+  `semiAntiJoinInfoList` helper) now that c14 closed item (b)'s Q69 crash,
+  and fix the new defect it exposes: no `createPlan` join constructor
+  propagates `.SJInfo` onto the `*Join` node it builds** (design doc §50,
+  filed by this loop's re-attempt of c11 item (c)). **Attempted
+  2026-09-17: the fix itself builds and `go test`s clean EXCEPT for
+  `TestExtractSearchLeaves_AdmitSemiAnti_NarrowsMinLefthandToCorrelatedRelation`,
+  which now finds a `JoinTypeSemi` node in `Plan()`'s returned tree with
+  `.SJInfo == nil`. Root cause: `.SJInfo` is set exactly once in
+  production (`unnest.go:4837`, `existsUnnestSJInfo`, at AST-unnesting
+  time) and no `createPlan` constructor (`createHashJoinPlan`,
+  `createMergeJoinPlan`, the plain-nestloop constructor at
+  createplannl.go:143 — "the one arm a searched SEMI or ANTI join can
+  reach" per its own comment — or the NLI constructors) ever copies it
+  onto the freshly built node. Before this fix the `joinInfoList`
+  duplicate-list bug always declined the search for any Semi/Anti
+  statement, so the ORIGINAL AST-built `*Join` (carrying `.SJInfo`
+  directly from unnesting) always reached the final tree unchanged; with
+  the search now succeeding, the final tree's Semi join is a NEW node
+  `createPlan` built from a `Path`, which had nowhere to carry `.SJInfo`
+  forward. A third latent, previously-untested defect in the same
+  "unwinnable path is untested path" family as c12/c13 — `grep -rln
+  "\.SJInfo\b" internal/` shows nothing downstream of `createPlan`
+  consumes the field today, so it is not (yet) a wrong-query-result bug,
+  but it breaks a real protected invariant and is filed as a genuine
+  defect rather than waved off. Reverted in full (`git checkout --
+  internal/optimizer/joinsearchseam.go
+  internal/optimizer/semiantichain_test.go`; diff empty, `go build ./...`
+  clean, `go test ./internal/optimizer/...` green).
+  **Concrete resume point**: (1) add a `SJInfo *SpecialJoinInfo` field to
+  `Path` (path.go); (2) `addNestLoopPath` (pathgen.go:175) already
+  receives `sjinfo` as a parameter but never stores it on the `&Path{...}`
+  it builds (pathgen.go:192-206) — add `SJInfo: sjinfo`; thread the same
+  parameter into the hash/merge path constructors too, even though only
+  the nestloop arm is reachable for Semi/Anti today, so the invariant
+  holds uniformly; (3) in createplannl.go's plain-nestloop constructor's
+  `j := &Join{...}` literal (~line 141), add `SJInfo: p.SJInfo` (nil is
+  correct/harmless for every non-Semi/Anti join); (4) re-run
+  `go test ./internal/optimizer/...` (the narrowing test above is the
+  tripwire), then re-apply the `joinInfoList` one-liner and run the FULL
+  `scripts/tpcds-sf025-regression.sh sweep` with a private `GOOPG_BIN`
+  before landing either piece together. Also still pending (carried from
+  c11-c13, not actioned): `predp.go:159-176`'s stale Phase B doc comment.**
 - [x] **M0142-0008c — scoping recon: does goopg need PG's `create_unique_path`
   (semi-join → de-duplicate RHS + inner join) to reach parity on TPC-DS
   Q10/Q35?** — filed by M0142-0008a-3(iii)'s §4.3 gate re-run (design doc §6).
