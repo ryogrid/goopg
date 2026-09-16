@@ -1,82 +1,77 @@
-Task: M0142-0008a-3i-plumbing-c22 (DONE, about to commit) — rechecked
-whether closing the c1-c21 plumbing chain makes M0142-0008c-3c/-3d/-4's
-create_unique_path unique-ify substitution reachable in production.
-Answer: NO, for a structural reason independent of c1-c21 and independent
-of Q78's outer-over-derived firewall. Design-doc-only change, no
-production code touched (temporary debug instrumentation added then fully
-reverted before commit).
+Task: M0141-S2b-2 (DONE, committed `00ed0ff84`) — scoping recon for "base
+join/scan Pathlist-across-the-search-boundary surgery" (the K24 item),
+following the fix_plan.md banner's item 4 (M0141 remaining slices before
+M0142). Nightly triage for `ci/logs/action-items.md` run
+`20260917-004357` was already fully filed in fix_plan.md before this loop
+started (all 17 items accounted for, -001/-004 already marked stale/
+re-run-passes) — no new M-NIGHTLY filing was needed this loop.
 
-Files: docs/design/0100-0149/m0142-0008a-1-semi-anti-sji-design.md (new
-§58), docs/design/README.md (m0142-0008a-1 row: appended c22 summary after
-c21's), .ralph/fix_plan.md (new c22 entry after c21; -3d/-4 entries
-corrected with the real resume point).
+Files: docs/design/0100-0149/m0141-s2b-scoping-decomposition.md (new
+"S2b-2 result" section), docs/design/README.md (m0141-s2b row appended),
+.ralph/fix_plan.md (S2b-2 marked [x] as recon; new S2b-2a/2b/2c sub-items;
+S2b-3's gate text corrected to name S2b-2c specifically). Temporary
+`GOOPG_S2B2DEBUG=1`-gated instrumentation in
+internal/optimizer/upperordered.go was added, used, then fully reverted via
+`git checkout --` before commit (confirmed empty diff).
 
-Key symbols: `jointypeForDirection` (joinpaths.go:179-249 — the ONLY entry
-point -3a/-3b/-3c/-3d/-4 share; its unique-ify fallback at line ~235 gates
-on `sjinfo.Jointype == parser.JoinSemi`, never ANTI), `reduce_outer_joins`'s
-ANTI-demotion producer (specialjoin.go, c19's `demotedAntiSJInfo` —
-unconditionally `parser.JoinAnti`, confirmed the only DP-search-reachable
-SJInfo producer today), `unnestExistsExpr`/S5a (pins EXISTS/IN family
-Semi/Anti joins OUTSIDE the DP search entirely — c21 §57 — so they never
-call `jointypeForDirection` at all).
+Key symbols: `createOrderedPaths`/`addOrderedPaths` (upperordered.go —
+today's single-seed bottleneck), `searchedRelOf` (searchedtree.go:169 — R21
+slice 2a's accessor, already gives the full `*RelOptInfo.Pathlist`, just
+unused by this seam), `costSortRun` (rel-level `rows`/`width` only, no
+per-candidate prefix-credit term — the actual reason the surgery is inert).
 
-Findings: live-traced (temporary `GOOPG_C22DEBUG=1` stderr prints at the
-`case parser.JoinRight, parser.JoinSemi, parser.JoinAnti:` entry and at the
-unique-ify fallback itself, in joinpaths.go, fully reverted before commit)
-against the FULL TPC-DS SF0.25 corpus (`scripts/tpcds-sf025-regression.sh
-sweep`, private `GOOPG_BIN=tmp/goopg-c22-bin` — the shared
-`tmp/goopg-bench-bin` is in active use by the running nightly TPC-H lane,
-see `goopg_bench_bin_shared_with_nightly_lane` memory). Result: the arm is
-entered **zero times** across all 96 completing queries —
-`grep -c C22DEBUG goopg.sf025.log` = 0. Root cause, confirmed by direct
-observation not just code-reading: (1) EXISTS/IN family (Q10/16/35/69/94
-and everything else that unnests cleanly) never reaches this arm — pinned
-pre-DP by S5a, per c21. (2) IN-unnesting (unnest.go:3453/3588/4726) never
-sets `.SJInfo` at all. (3) The one confirmed DP-search-reachable producer
-(reduce_outer_joins ANTI demotion, exercised only by Q78) is
-unconditionally ANTI, and the unique-ify fallback's own
-`sjinfo.Jointype == parser.JoinSemi` gate excludes ANTI outright — so even
-if Q78's `outer-over-derived` firewall (blocked on TODO_ALL B-06,
-CTE-output stats) were fully lifted today, `-3d`/`-4` would STILL be
-unreachable, because Q78 is the wrong jointype for the fallback that
-exists. This corrects `-3c`'s original "blocked on plumbing-c" framing
-(now resolved and no longer the limiting factor) and `-3d`/`-4`'s
-inherited "shares -3c's blocker" framing (now updated to name the real
-gap). Sweep: `PASS=96 MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0 SKIP=3`,
-`PLAN-SHAPE: queries=99 same=99 changed=0` — zero regression risk (the
-temporary print sits on a decline/no-op path either way). No
-deferral-ledger row: nothing NEW left unimplemented — `-3d`/`-4` were
-already unchecked/deferred; this recon only corrects their resume point.
+Findings: live-traced the seam against the full TPC-DS SF0.25 corpus (temp
+prints, `scripts/tpcds-sf025-regression.sh sweep`+`plans`, private
+`GOOPG_BIN=tmp/goopg-s2b2-bin`, removed after). 38 real `createOrderedPaths`
+calls reach a non-nil `searchedRelOf(input)` with Pathlist sizes 3-16
+(median ~7) — the seam IS reached constantly, confirming the task's own
+framing. But parsed all 38 blocks: every candidate in one call shares the
+SAME `Rows` (36/38 exact, 2 off by 1 row via a LIMIT-kind rounding
+artefact), and `sr.CheapestTotal` is ALWAYS the exact min-cost entry
+already. Since `costSortRun` has no per-candidate variable term (no
+Incremental Sort prefix credit exists — M0141-S7 unimplemented), the Sort
+cost added on top of every candidate is an identical constant, so ranking
+by cost is invariant under it: the search's own already-chosen
+cheapest-total candidate (== today's single seed) remains cheapest even in
+a hypothetical full-Pathlist tournament. **Conclusion: this surgery, in
+isolation, is empirically proven to move zero plans** (verified: sweep +
+plans both PASS=96/changed=0, before AND after the revert) — same "moves
+nothing" verdict R21 Slice 1 predicted for its own plumbing-only cut.
+M0141-S7 (Incremental Sort's per-candidate prefix credit) is the real
+prerequisite that would make a Pathlist tournament here meaningful; the two
+are mutually blocking, not independent sequential slices (S7's own
+fix_plan entry already said "implementation is gated on M0141-S2b" — this
+loop supplies the missing reverse-direction link).
 
-Next step: re-read `.ralph/fix_plan.md`'s `## Current Priority` banner
-fresh before picking the next M0137-M0143 task. With M0142-0008c-3d/-4 now
-confirmed unreachable until a NEW, unfiled mechanism lands (teach an
-IN-unnesting path to set `.SJInfo` on a DP-search-visible `JoinSemi` link
-— not sized for blind pickup, needs its own scoping recon first), do NOT
-implement -3d/-4 next. Remaining open, explicitly named resume points in
-this area: (a) file a scoping recon for the IN-unnesting `.SJInfo` gap
-just found (new work, unfiled, would need its own design-doc section) —
-candidate but unscoped; (b) Q78's `outer-over-derived` firewall itself
-(relfromjoinlist.go:654-678), still gated on CTE-output statistics
-(TODO_ALL B-06 step 4) — out of scope until that prerequisite lands.
-Otherwise fall through to M0141's remaining slices (S2b/S3-S7) or
-M0142-0004 onward per the banner's item 4, or M0143 (7/7 untouched) if
-those are blocked. Read AGENT.md's plan-parity harness section again
-before selecting (required every loop touching M0137-M0143).
+Next step: per the fix_plan banner (M0141 slices before M0142, `## Current
+Priority` item 4), the next real M0141 candidate is now **M0141-S7** itself
+(re-adjudicated GO, already has its own scoping design doc
+`docs/design/0100-0149/m0141-s7-readjudicate-and-scope-incremental-sort.md`)
+— but it was assessed by both the design doc and a subagent survey this
+loop as a large multi-part build (14/99 TPC-DS witnesses, ZERO existing
+implementation — no executor node, no planner producer), not sized for one
+loop as-is; a future loop should re-read that design doc and either find an
+already-decomposed first slice inside it or write one, mirroring this
+loop's own S2b-2a/2b/2c split. Do NOT attempt M0141-S2b-2a/2b (the now-filed
+plumbing-only slices) before scoping S7's own first implementable slice,
+since 2a/2b's own gate is a predicted null result and they exist only to
+support 2c, which is blocked on S7. Alternative fallback per the banner:
+M0142's remaining open items if S7 also proves too large this loop
+(M0142-0016c has no stated blocker; M0142-0005/M0142-0008a-3 need their own
+recon passes first; M0142-0008c-1a/-3d/-4 are explicitly NOT ready — see
+this session's earlier subagent survey). Read AGENT.md's plan-parity
+harness section again before selecting (required every loop touching
+M0137-M0143).
 
-Gates run: `go build ./...` clean, `go test ./internal/optimizer/...`
-PASS. TPC-DS SF0.25 sweep run TWICE this loop (once for the recheck,
-report already captured) — `PASS=96 MISMATCH=0`, plan-shape `changed=0`.
+Gates run: `go build ./...` clean, `go test ./internal/optimizer/...` PASS.
+TPC-DS SF0.25 sweep + plans run twice each (before/after instrumentation
+enhancement) — `PASS=96 MISMATCH=0`, `PLAN-SHAPE changed=0` every time.
 `make ralph-state-guard` self-repaired the same stale running/completed
 mismatch seen in prior loops, then passed. No production code changed
 (instrumentation fully reverted), so tpch-spotcheck does not apply; commit
-still goes through the pre-commit hook's mandatory pgbench smoke.
+went through the pre-commit hook's mandatory pgbench smoke (PASS).
 
-In-flight: none. Temporary `GOOPG_C22DEBUG=1` instrumentation (2 fmt/os-
-gated Fprintf calls plus the `os` import in internal/optimizer/joinpaths.go)
-was reverted via `git checkout --` before commit, confirmed by empty `git
-diff --stat` on that file. Private binary `tmp/goopg-c22-bin` removed. The
+In-flight: none. Private binary `tmp/goopg-s2b2-bin` removed after use. The
 shared SF0.25 goopg cluster (port 65437, `bench/tpcds/runtime_goopg/data-sf025`)
-was left running — it is a semi-persistent bench resource per
-`bench/tpcds/env_tpcds.sh`, not a throwaway, unlike c20/c21's disposable
-schema-only clusters (which were torn down).
+was left running per this milestone's established convention for that
+semi-persistent resource (same as prior c-series loops).
