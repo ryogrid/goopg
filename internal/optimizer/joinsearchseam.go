@@ -1158,6 +1158,27 @@ func extractSearchLeaves(node Node, admitSemiAnti bool) (scans []Node, widths []
 			width += len(j.Right.Output())
 			hiRight := len(scans)
 			pred := j.Predicate
+			if j.LeftKey != nil && j.RightKey != nil {
+				// Design doc §28.4: unnestExistsExpr (this walk's only
+				// producer of a keyed Semi/Anti join) deliberately excludes
+				// its own primary equijoin condition from Predicate — the
+				// hash match enforces it directly via LeftKey/RightKey, the
+				// same convention fillOneJoinHashKeys relies on rather than
+				// deriving HashKeys[0] from Predicate
+				// (join_hash_keys.go:198). A semiAntiChainLink is consumed
+				// by future code as if `pred` were the join's WHOLE
+				// condition, so fold the key equality in here too,
+				// mirroring joinInputs.joinPredicate's idiom
+				// (createplanjoin.go:492-504) — otherwise a plan built from
+				// `pred` alone would silently become an unconditional
+				// (Cartesian-like) Semi/Anti.
+				eq := &BinaryOp{pos: j.LeftKey.Pos(), Op: parser.OpEq, Left: j.LeftKey, Right: j.RightKey}
+				conjuncts := []Expr{eq}
+				if pred != nil {
+					conjuncts = append(conjuncts, pred)
+				}
+				pred = combineAnd(conjuncts)
+			}
 			if pred != nil && base != 0 {
 				shifted, okShift := rebaseChainQual(pred, base)
 				if !okShift {

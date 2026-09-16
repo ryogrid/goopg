@@ -263,6 +263,65 @@ func TestExtractSearchLeaves_AdmitSemiAnti_BuildsLinkAndRebuildsSJInfo(t *testin
 	}
 }
 
+// TestExtractSearchLeaves_AdmitSemiAnti_FoldsKeyEquijoinIntoPred pins design
+// doc §28.4's finding (M0142-0008a-3i-plumbing-b2 step 3 scoping pass): a
+// bare correlated EXISTS with no OTHER residual leaves `j.Predicate` nil —
+// its whole correlation lives in (LeftKey, RightKey), which unnestExistsExpr
+// deliberately excludes from Predicate since the hash match enforces it at
+// execution time (unnest.go's `join := &Join{Predicate: joinPredicate}`
+// followed by a SEPARATE `join.LeftKey = outerKey` assignment). Unlike
+// TestExtractSearchLeaves_AdmitSemiAnti_BuildsLinkAndRebuildsSJInfo (which
+// hand-patches j.Predicate before calling extractSearchLeaves, working around
+// exactly this gap), this fixture calls extractSearchLeaves against the
+// UNPATCHED, naturally-nil Predicate: before the §28.4 fix the resulting
+// semiAntiChainLink.pred would be nil (semiAntiOnQualsOK declines a nil pred,
+// per TestSemiAntiOnQualsOK_DeclinesNilPredicate) — a future plan-build arm
+// consuming `pred` alone would silently build an unconditional (Cartesian-
+// like) Semi/Anti the moment admitSemiAnti is ever wired live.
+func TestExtractSearchLeaves_AdmitSemiAnti_FoldsKeyEquijoinIntoPred(t *testing.T) {
+	cat := analyzedThreeTablesCatalog(t)
+	sql := "SELECT x FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.z = t1.x)"
+	node, err := Plan(parseOne(t, sql), cat)
+	if err != nil {
+		t.Fatal(err)
+	}
+	j := findFirstJoinByType(node, JoinTypeSemi)
+	if j == nil {
+		t.Fatalf("no JoinTypeSemi found: %s", planString(node))
+	}
+	if j.Predicate != nil {
+		t.Fatalf("j.Predicate = %#v, want nil — this fixture is only a witness for the gap if the equijoin is ENTIRELY absent from Predicate (fixture drifted, or unnestExistsExpr's own convention changed)", j.Predicate)
+	}
+	if j.LeftKey == nil || j.RightKey == nil {
+		t.Fatalf("j.{LeftKey,RightKey} = {%v,%v}, want both set — this fixture must produce a hash-keyed Semi join", j.LeftKey, j.RightKey)
+	}
+
+	_, widths, _, _, semiAnti, ok := extractSearchLeaves(j, true)
+	if !ok {
+		t.Fatalf("extractSearchLeaves(j, true) ok=false, want true: %s", planString(node))
+	}
+	if len(semiAnti) != 1 {
+		t.Fatalf("semiAnti = %d links, want exactly 1: %+v", len(semiAnti), semiAnti)
+	}
+	lk := semiAnti[0]
+	if lk.pred == nil {
+		t.Fatalf("semiAnti[0].pred = nil, want the (LeftKey = RightKey) equijoin folded in — the equality is otherwise dropped entirely (§28.4)")
+	}
+	conjuncts := splitAnd(lk.pred)
+	if len(conjuncts) != 1 {
+		t.Fatalf("splitAnd(semiAnti[0].pred) = %d conjuncts, want exactly 1 (Predicate was nil, so only the folded-in key equality should be present): %+v", len(conjuncts), conjuncts)
+	}
+	eq, ok := conjuncts[0].(*BinaryOp)
+	if !ok || eq.Op != parser.OpEq || eq.Left != Expr(j.LeftKey) || eq.Right != Expr(j.RightKey) {
+		t.Errorf("semiAnti[0].pred's conjunct = %#v, want (LeftKey = RightKey) built from j.LeftKey/j.RightKey by pointer", conjuncts[0])
+	}
+
+	cumOffsets := buildLeafSpans(widths, semiAnti)
+	if !semiAntiOnQualsOK(semiAnti, cumOffsets) {
+		t.Errorf("semiAntiOnQualsOK(semiAnti, cumOffsets) = false, want true — the walk's own link must satisfy the consumer it was built to feed")
+	}
+}
+
 // TestExtractSearchLeaves_AdmitSemiAntiFalse_UnchangedFromProduction proves
 // the scaffold is inert exactly as design doc §22.4 requires: with
 // `admitSemiAnti=false` (the literal value the ONE production call site

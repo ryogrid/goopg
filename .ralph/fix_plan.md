@@ -3821,10 +3821,39 @@ cross-layer programme that has never been scoped.
     `createplanjoin.go`'s `joinInputs.joinPredicate` idiom) in the SAME
     loop that wires the new call, or `admitSemiAnti=true` would silently
     turn into an unconditional (Cartesian-like) Semi/Anti the moment it
-    does anything. **Next: wire the predp.go descend-loop extension (item
-    6b's own already-filed scope item) as the reachability step, landing
-    the dropped-equijoin fix alongside it before attempting to flip
-    `admitSemiAnti=true` against a real fixture.**
+    does anything.
+    **Dropped-equijoin fix landed standalone (design doc §29, 2026-09-16)**:
+    the ordering constraint above is about exposure, not coding order — with
+    the one production call site still passing `admitSemiAnti=false`
+    unchanged, the fix is fully inert, so it landed on its own this loop
+    rather than bundled with the harder `predp.go` reachability change
+    (`m0074_partial_scope_lessons`: bound the change, verify incrementally).
+    `extractSearchLeaves`'s Semi/Anti arm (`joinsearchseam.go`, just before
+    the existing `rebaseChainQual` call) now folds `j.LeftKey`/`j.RightKey`
+    into an explicit `OpEq` conjunct ANDed onto `j.Predicate` before
+    capturing `pred`, gated on `j.LeftKey != nil && j.RightKey != nil`. New
+    test `TestExtractSearchLeaves_AdmitSemiAnti_FoldsKeyEquijoinIntoPred`
+    (`semiantichain_test.go`) pins the actual gap: a bare correlated
+    `EXISTS` with no other residual leaves `j.Predicate` naturally `nil`
+    (asserted, not assumed) — before the fix `semiAnti[0].pred` would have
+    been `nil` too (declined by `semiAntiOnQualsOK`); after, it is exactly
+    the `(LeftKey = RightKey)` conjunct, verified by pointer identity, and
+    accepted by `semiAntiOnQualsOK`. Verified zero production behavior
+    change: `go build ./...` clean, `go vet ./internal/optimizer/...`
+    clean, full `go test ./internal/optimizer/...` pass, TPC-DS SF0.25
+    sweep `PASS=96 MISMATCH=0 CKMISMATCH=0 ERROR=0`
+    `PLAN-SHAPE: same=99 changed=0`,
+    `RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh` shows
+    only the pre-existing unrelated `internal/parser`
+    `GroupedJoinUnaliased` failure (`internal/optimizer` itself passes).
+    TPC-H spotcheck SKIPPED per the standing M0142-0003k blocker (shared
+    `:65433` cluster's `tpch` data still needs the human-authorized
+    reload — unrelated to this change). **Next: wire the predp.go
+    descend-loop extension (item 6b's own already-filed scope item,
+    `predp.go:96-101`'s current hard-bail on a non-Semi/Anti `*Join`) as
+    the reachability step — this is now the ONLY remaining piece before
+    flipping `admitSemiAnti=true` against a real end-to-end fixture
+    (§27.4's existing gate) becomes a meaningful test.**
   **Independent, unfiled resume-point hint** (not sized/numbered — noted for
   whoever picks up S5a's own eligibility gate): relaxing
   `whereEligibleForPreDPUnnest` to per-sublink granularity would upgrade

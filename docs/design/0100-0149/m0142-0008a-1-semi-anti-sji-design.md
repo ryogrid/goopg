@@ -3266,3 +3266,78 @@ scoping pass did not re-examine that dependency.
 Still design-only this loop: no production code changed, nothing to
 regression-gate beyond confirming the trace against live source (every
 file/line cited above was read this loop, not recalled).
+
+## 29. §28.4's dropped-equijoin fix landed standalone, ahead of reachability wiring (2026-09-16)
+
+§28.5 ordered the remaining work as (i) wire reachability, (ii) fix §28.4's
+dropped-equijoin gap in the SAME loop as (i) — "or `admitSemiAnti=true`
+would silently turn into an unconditional (Cartesian-like) Semi/Anti the
+moment it does anything." That ordering constraint is about **exposure**,
+not about which piece must be coded first: (ii) only matters once (i) makes
+`admitSemiAnti=true` reachable, but nothing stops (ii) from landing standalone
+first, since with the one production call site still passing `admitSemiAnti
+=false` (unchanged — `joinsearchseam.go`'s `tryPGShapedJoinSearch`), the arm
+this fix touches stays fully inert, exactly the same "prove inert before
+wiring" precedent `-3i-plumbing-b1` used. This loop landed (ii) alone, as
+its own bounded, independently-testable step, deferring (i) (the harder,
+higher-blast-radius `predp.go` descend-loop change touching the live DP
+routing path) to the next loop rather than bundling both into one change —
+consistent with `m0074_partial_scope_lessons`'s "bound the change, verify
+incrementally" instinct memory and the practice card's Q9-rebind hang
+precedent (`M0072-0002`).
+
+**Landed:** `extractSearchLeaves`'s Semi/Anti arm (`joinsearchseam.go`,
+immediately before the existing `rebaseChainQual`/`base` handling) now folds
+`j.LeftKey`/`j.RightKey` into an explicit `OpEq` conjunct ANDed onto
+`j.Predicate` before capturing `pred` into the `semiAntiChainLink`, gated on
+`j.LeftKey != nil && j.RightKey != nil` (true exactly when `unnestExistsExpr`
+built a hash-keyed join, i.e. `len(params) > 0`) — mirroring
+`joinInputs.joinPredicate`'s idiom (`createplanjoin.go:492-504`) exactly as
+§28.4 specified. The fold happens BEFORE the `rebaseChainQual` call: the key
+expressions live in the same "local, 0-based at this join's own leftmost
+leaf" coordinate space `j.Predicate` already uses (confirmed live: `RightKey
+.Index = outerWidth + params[0].SubCol.Index`, `unnest.go:4694-4705` — a
+LOCAL merged-schema offset, not a global one), so one `rebaseChainQual` call
+over the combined predicate is correct; rebasing the key equality and the
+residual separately would have been redundant at best and a coordinate-space
+mismatch at worst if the two conventions ever diverged.
+
+**New test** `TestExtractSearchLeaves_AdmitSemiAnti_FoldsKeyEquijoinIntoPred`
+(`semiantichain_test.go`) pins the actual gap directly: a bare correlated
+`EXISTS (SELECT 1 FROM t2 WHERE t2.z = t1.x)` — no residual beyond the single
+equijoin — leaves `j.Predicate` naturally `nil` after `Plan()` (asserted, not
+assumed). Before this fix, `extractSearchLeaves(j, true)` would have produced
+`semiAnti[0].pred == nil` (declined by `semiAntiOnQualsOK`, per
+`TestSemiAntiOnQualsOK_DeclinesNilPredicate`); after, it asserts exactly one
+conjunct, structurally `(LeftKey = RightKey)` by pointer identity, and that
+`semiAntiOnQualsOK` accepts it. This is a stronger witness than the existing
+`TestExtractSearchLeaves_AdmitSemiAnti_BuildsLinkAndRebuildsSJInfo`, which
+pre-patches `j.Predicate` by hand before calling `extractSearchLeaves` —
+exactly the gap this fix closes, so that test's own workaround is no longer
+load-bearing (left in place unmodified: it still exercises the
+already-populated-Predicate case, a real second shape `unnestExistsExpr` can
+produce when residuals exist alongside the key).
+
+**Verified zero production behavior change** (as expected — `admitSemiAnti`
+is `false` at every reachable call site, so this arm never runs in
+production yet): `go build ./...` clean; `go vet ./internal/optimizer/...`
+clean; full `go test ./internal/optimizer/...` pass (all existing tests plus
+the new one); TPC-DS SF0.25 sweep `PASS=96 MISMATCH=0 CKMISMATCH=0 ERROR=0`,
+`PLAN-SHAPE: same=99 changed=0`; `RALPH_PRECOMMIT_SCOPE=units
+scripts/ralph-precommit-test.sh` shows only the pre-existing unrelated
+`internal/parser` `GroupedJoinUnaliased` failure (`internal/optimizer` itself
+passes). TPC-H spotcheck SKIPPED per the standing M0142-0003k blocker
+(shared `:65433` cluster's `tpch` data still needs the human-authorized
+reload; unrelated to this change).
+
+**Resume point (unchanged from §28.5 otherwise):** the remaining scope is
+step (i) alone now — wire a call that reaches the post-unnest tree
+(`predp.go`'s descend-loop extension, `predp.go:96-101`'s current hard-bail
+on a non-Semi/Anti `*Join`, or an equivalent new call site) so `admitSemiAnti
+=true` stops being a guaranteed no-op. Only once that lands does flipping the
+flag behind a real end-to-end fixture (§27.4's existing gate) become a
+meaningful test — this loop's fix removes what would otherwise have been a
+LIVE wrong-rows trap the moment (i) lands, but does not itself make
+`admitSemiAnti=true` reachable. Likely still depends on enough of
+`M0142-0008c-3c`/`-3d`/`-4` existing for a real Semi/Anti pair to be
+bushy-DP-admissible, per §26.3's forward note.
