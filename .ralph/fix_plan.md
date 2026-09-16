@@ -3519,28 +3519,37 @@ cross-layer programme that has never been scoped.
   ~500 lines) applied to the EXISTS body before splicing. Execution/row
   counts are unaffected (verified) — display-only. Follow-up filed as
   **M0142-0008e** (below), not blocking M0142-0008a-3(i)/(ii)/(iii).
-- [ ] **M0142-0008e — fix the EXPLAIN self-correlated-EXISTS alias collision
-  found by M0142-0008d's recon (design doc §9)** — implement
-  `remapSourceTableIdx(node Node, offset int16) Node` in
-  `internal/optimizer/unnest.go` mirroring `clonePlanReplacingOuter`'s
-  Node-case set (`unnest.go:1492-1998`), rewriting every
-  `SchemaColumn.SourceTableIdx` (on the node types that store their own
-  `schema` field — `SeqScan`/`IndexScan`/`Project`/`Aggregate`/`CTEScan`/etc;
-  `Filter`/`Sort`/`Limit`/`Memoize` delegate to `Child.Output()` and need no
-  change) and every `ColumnRef`/`OuterColumnRef.SourceTableIdx` by `offset`.
-  Apply it to `innerPlan` right after `clonePlanReplacingOuter` builds it
-  (`unnest.go:4277`) with an offset guaranteed larger than any
-  `SourceTableIdx` used in `outerChild.Output()`, and apply the SAME offset
-  when constructing `innerKey` (`unnest.go:~4390`) and the residual's
-  inner-side `ColumnRef`s (`liftResidualConjuncts`'s `*ColumnRef` case,
-  `unnest.go:~4056`). Add a unit test asserting the EXPLAIN text directly
-  (`cs1.cs_order_number = cs2.cs_order_number`, not a self-comparison) —
-  the plan-shape/row-count gates cannot catch this bug class (execution is
-  correct; only the printed text is wrong). Repro query (works on any
-  scratch cluster, no TPC-DS data needed):
-  `CREATE TABLE t(a int, b int); EXPLAIN SELECT 1 FROM t t1 WHERE EXISTS
-  (SELECT 1 FROM t t2 WHERE t2.a = t1.a AND t2.b <> t1.b);`. Display-only —
-  does not block M0142-0008a-3(i)/(ii)/(iii) or M0142-0008c.
+- [x] **M0142-0008e — fix the EXPLAIN self-correlated-EXISTS alias collision
+  found by M0142-0008d's recon (design doc §9)** — DONE 2026-09-16.
+  Implemented `remapSourceTableIdx(node Node, offset int16) (Node, error)`
+  and `remapExprSourceTableIdx` in `internal/optimizer/unnest.go` (right
+  after `clonePlanReplacingOuter`), mirroring its 15-case Node-kind set and
+  built on the exhaustive `CloneExprReplacingColumnRefs` walker (so a future
+  33rd Expr type cannot silently pass through unshifted). Wired into
+  `unnestExistsExpr`: applied to `innerPlan` right after `outerWidth` is
+  computed, with `srcTableOffset` sized one past the max `SourceTableIdx` in
+  `outerChild.Output()`; the same offset is added to `innerKey`'s
+  `SourceTableIdx` and threaded through a new `liftResidualConjunctsWithOffset`
+  (the old `liftResidualConjuncts` is now a thin 0-offset wrapper, so its two
+  other callers — `unnestScalarWithResiduals`, `unnestInExpr` — are unchanged)
+  for the residual's inner-side `ColumnRef`. Regression test
+  `TestExplainSelfCorrelatedExistsDoesNotAliasCollide`
+  (`internal/executor/exists_unnest_alias_test.go`) asserts the EXPLAIN text
+  directly and was verified to FAIL with the exact `t1.a = t1.a` collision
+  when the offset is temporarily forced to 0, confirming it actually catches
+  the bug class the row-count/plan-shape gates cannot. `go test
+  ./internal/optimizer/... ./internal/executor/...` green (includes the
+  `TestExprSwitchInventoryIsPinned` exhaustiveness gate, whose inventory
+  entry was renamed alongside `liftResidualConjuncts`). TPC-H spot-check
+  gate SKIPPED (pre-existing, documented: the shared `:65433` cluster's
+  `tpch` dataset is still emptied per M0142-0003k, unrelated to this change)
+  — not re-run since this is a pure EXPLAIN-naming change with no cost/plan-
+  shape/execution impact (confirmed by M0142-0008d's own measurement and
+  unaffected by this fix, which only ever touches `SourceTableIdx`, a field
+  `explain_names.go` alone reads). Deferred: `unnestScalarWithResiduals`/
+  `unnestInExpr` were NOT measured for the same collision class and pass
+  offset=0 (a no-op) into the renamed helper — see the ledger row for the
+  repro shape to try if a witness ever surfaces there.
 - [x] **M0142-0008b — scoping recon: measure the blast radius of widening
   the DP-search gate to filterless INNER/CROSS trees** — filed by
   M0142-0008. `planner.go:1590-94`'s own comment already names the fix

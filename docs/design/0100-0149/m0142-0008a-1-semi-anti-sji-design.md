@@ -757,3 +757,66 @@ cannot catch this class of bug at all, since execution is unaffected and
 row counts are correct; only the printed text is wrong. Not on the critical
 path for M0142-0008a-3(i)/(ii)/(iii)'s TPC-DS query10/16/35/69/94 prize —
 purely a display-correctness defect, deferred without blocking anything.
+
+## 10. M0142-0008e landed (2026-09-16)
+
+Implemented exactly the shape §9 scoped, with two additions the case-by-case
+build surfaced.
+
+`remapSourceTableIdx(node Node, offset int16) (Node, error)` and its Expr-side
+helper `remapExprSourceTableIdx` sit right after `clonePlanReplacingOuter` in
+`unnest.go`, mirroring its 15-case `Node` switch (`Join`,
+`NestedLoopIndexJoin`, `Filter`, `Project`, `Aggregate`, `Sort`, `Limit`,
+`SeqScan`, `IndexScan`, `BitmapHeapScan`, `Values`, `CTEScan`,
+`MaterializedCTEScan`, `Gather`, `GatherMerge`). Two deliberate departures
+from a literal mirror:
+
+- **Schema fields, not just exprs.** `clonePlanReplacingOuter` never needs to
+  touch a node's own `schema` field (replacing `OuterColumnRef` with
+  `ColumnRef` doesn't change column count or naming), but that field is
+  *exactly* what `explain_names.go`'s `collect()` reads to resolve a raw
+  `SourceTableIdx` to a relation name — so every case here also remaps
+  `n.schema` (or, for `SeqScan`/`IndexScan`/`BitmapHeapScan`/`Values`/
+  `CTEScan`/`MaterializedCTEScan`, remaps *only* `n.schema`, since those leaf
+  kinds carry no OuterColumnRef-bearing exprs left to touch after
+  `clonePlanReplacingOuter` already ran).
+- **Built on the exhaustive walker, not a hand-copy of
+  `cloneExprReplacingOuter`'s hand-written expr switch.** `remapExprSourceTableIdx`
+  clones via `CloneExprReplacingColumnRefs` (`walk_export.go`), which is
+  itself built on `cloneExprRefs`'s exhaustive, gate-tested 32-type coverage
+  (`exprwalk.go`) rather than a fifth hand-written switch over `Expr`. This
+  closes off the RC-1a defect class (a new Expr type silently passing through
+  unshifted) that a literal `cloneExprReplacingOuter`-style copy would have
+  reopened.
+
+Scan-node probe/residual exprs (`IndexScan.Key/Keys/LowKey/HighKey/Cond`,
+`BitmapIndexScan.Key/Keys/Pred`, `BitmapHeapScan.Cond/BitmapQual`) are
+deliberately left unshifted: PG's `varprefix=false` rule for scan quals
+(re-confirmed by §9's own repro) means they never render qualified regardless
+of `SourceTableIdx`, so shifting them would add case-set surface for zero
+visible effect.
+
+`liftResidualConjuncts` is now a thin `offset=0` wrapper around a new
+`liftResidualConjunctsWithOffset`, whose `*ColumnRef` arm adds the same
+`srcTableOffset` `unnestExistsExpr` used to remap `innerPlan` — otherwise the
+residual's inner-side `ColumnRef` (built fresh from the PRE-remap EXISTS body,
+since `collectUnnestParamsAndResiduals` harvests it before the remap runs)
+would carry the stale value and reopen the exact collision one level up (the
+join `Predicate` instead of the join key). The other two callers
+(`unnestScalarWithResiduals`, `unnestInExpr`) pass `0` — see the ledger row
+filed alongside this task for why they were not measured for the same bug.
+
+**Verification.** `TestExplainSelfCorrelatedExistsDoesNotAliasCollide`
+(`internal/executor/exists_unnest_alias_test.go`) runs §9's exact repro
+end-to-end (`CREATE TABLE t(a int, b int)` + the self-correlated EXISTS) and
+asserts the EXPLAIN text names both `t1` and `t2`. Confirmed to actually catch
+the bug class (not just pass vacuously): temporarily forcing
+`srcTableOffset = 0` reproduces the exact `Hash Cond: (t1.a = t1.a)` /
+`Join Filter: (t1.b <> t1.b)` collision from §9's repro, and the test fails on
+it. `go test ./internal/optimizer/... ./internal/executor/...` is green,
+including `TestExprSwitchInventoryIsPinned` (its inventory entry was renamed
+`unnest.go:liftResidualConjunctsWithOffset` in the same commit). No plan-shape
+or row-count gate applies — `SourceTableIdx` is read only by
+`explain_names.go`, never by planning or execution — and the TPC-H spot-check
+gate is independently SKIPPED right now for the pre-existing, documented
+M0142-0003k data-reload blocker, unrelated to this change.

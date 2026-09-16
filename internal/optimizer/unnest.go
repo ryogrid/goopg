@@ -1998,6 +1998,259 @@ func clonePlanReplacingOuter(node Node, replace map[*OuterColumnRef]*ColumnRef) 
 	}
 }
 
+// remapSourceTableIdx shifts the SourceTableIdx of every schema column and
+// embedded ColumnRef in node's own subtree by offset, without mutating node
+// (same copy-on-write discipline as clonePlanReplacingOuter). It exists for
+// exactly the node-kind universe clonePlanReplacingOuter produces —
+// unnestExistsExpr's `innerPlan` — and must be extended alongside that
+// function's case set if it ever grows.
+//
+// Why this is needed (M0142-0008d/0008e, design doc §9): explainNames' bySrc
+// map keys a relation's printed alias by the RAW SourceTableIdx a scan's OWN
+// schema carries. unnestExistsExpr splices innerPlan into the outer tree as
+// an ordinary join child, so once the outer and (former) EXISTS-body trees
+// are walked together by one EXPLAIN pass, any scan whose SourceTableIdx
+// happens to collide with an outer-tree scan's value — and SourceTableIdx
+// restarts at 1 per query level, so "first table in its own FROM list"
+// collides constantly — has its printed alias overwritten by whichever scan
+// collect() visits second (e.g. `cs1.x = cs1.x` instead of `cs1.x = cs2.x`).
+// Shifting every inner-tree value by an offset larger than anything the
+// outer tree uses makes that collision structurally impossible. Execution is
+// unaffected either way: SourceTableIdx is read only by the EXPLAIN naming
+// pass, never by evaluation (which is Index-based).
+//
+// OuterColumnRef is deliberately left untouched: by the time this runs,
+// every in-scope correlation has already been harvested into a plain
+// ColumnRef by clonePlanReplacingOuter, and a genuine OuterColumnRef still
+// present here names a FURTHER-out query level with its own independent
+// numbering, not this level's collision space.
+//
+// Scan-node probe/residual expressions (IndexScan.Key/Keys/LowKey/HighKey/
+// Cond, BitmapIndexScan.Key/Keys/Pred, BitmapHeapScan.Cond/BitmapQual) are
+// deliberately NOT remapped: PostgreSQL's varprefix=false rule for scan
+// quals means they always render unqualified regardless of SourceTableIdx
+// (confirmed by M0142-0008d's repro), so their SourceTableIdx going stale is
+// inert for display — remapping them would only add case-set surface beyond
+// clonePlanReplacingOuter's own precedent for no visible effect.
+func remapSourceTableIdx(node Node, offset int16) (Node, error) {
+	if node == nil {
+		return nil, nil
+	}
+	remapSchema := func(s Schema) Schema {
+		if len(s) == 0 {
+			return s
+		}
+		out := make(Schema, len(s))
+		for i, c := range s {
+			out[i] = c
+			out[i].SourceTableIdx += offset
+		}
+		return out
+	}
+	remapExpr := func(e Expr) (Expr, error) { return remapExprSourceTableIdx(e, offset) }
+	remapKeys := func(keys []SortKey) ([]SortKey, error) {
+		if len(keys) == 0 {
+			return keys, nil
+		}
+		out := make([]SortKey, len(keys))
+		for i, k := range keys {
+			ke, err := remapExpr(k.Expr)
+			if err != nil {
+				return nil, err
+			}
+			out[i] = SortKey{Expr: ke, Desc: k.Desc, NullsFirst: k.NullsFirst}
+		}
+		return out, nil
+	}
+	var err error
+	switch n := node.(type) {
+	case *Join:
+		jn := *n
+		if jn.Left, err = remapSourceTableIdx(n.Left, offset); err != nil {
+			return nil, err
+		}
+		if jn.Right, err = remapSourceTableIdx(n.Right, offset); err != nil {
+			return nil, err
+		}
+		if jn.Predicate, err = remapExpr(n.Predicate); err != nil {
+			return nil, err
+		}
+		if jn.LeftKey, err = remapExpr(n.LeftKey); err != nil {
+			return nil, err
+		}
+		if jn.RightKey, err = remapExpr(n.RightKey); err != nil {
+			return nil, err
+		}
+		jn.schema = remapSchema(n.schema)
+		return &jn, nil
+	case *NestedLoopIndexJoin:
+		nl := *n
+		if nl.Outer, err = remapSourceTableIdx(n.Outer, offset); err != nil {
+			return nil, err
+		}
+		if nl.Inner, err = remapSourceTableIdx(n.Inner, offset); err != nil {
+			return nil, err
+		}
+		if nl.Predicate, err = remapExpr(n.Predicate); err != nil {
+			return nil, err
+		}
+		nl.schema = remapSchema(n.schema)
+		// InnerMemo.Child aliases the pre-remap Inner (same reasoning as
+		// clonePlanReplacingOuter's identical arm) — drop it rather than
+		// point the cache at a scan the remap replaced.
+		nl.InnerMemo = nil
+		return &nl, nil
+	case *Filter:
+		f := *n
+		if f.Child, err = remapSourceTableIdx(n.Child, offset); err != nil {
+			return nil, err
+		}
+		if f.Predicate, err = remapExpr(n.Predicate); err != nil {
+			return nil, err
+		}
+		return &f, nil
+	case *Project:
+		p := *n
+		if p.Child, err = remapSourceTableIdx(n.Child, offset); err != nil {
+			return nil, err
+		}
+		p.schema = remapSchema(n.schema)
+		p.Targets = make([]Expr, len(n.Targets))
+		for i, t := range n.Targets {
+			if p.Targets[i], err = remapExpr(t); err != nil {
+				return nil, err
+			}
+		}
+		return &p, nil
+	case *Aggregate:
+		a := *n
+		if a.Child, err = remapSourceTableIdx(n.Child, offset); err != nil {
+			return nil, err
+		}
+		a.schema = remapSchema(n.schema)
+		a.GroupExprs = make([]Expr, len(n.GroupExprs))
+		for i, g := range n.GroupExprs {
+			if a.GroupExprs[i], err = remapExpr(g); err != nil {
+				return nil, err
+			}
+		}
+		a.Aggs = make([]AggregateCall, len(n.Aggs))
+		for i, ag := range n.Aggs {
+			a.Aggs[i] = ag
+			if a.Aggs[i].Arg, err = remapExpr(ag.Arg); err != nil {
+				return nil, err
+			}
+			if a.Aggs[i].Arg2, err = remapExpr(ag.Arg2); err != nil {
+				return nil, err
+			}
+			if len(ag.ExtraArgs) > 0 {
+				a.Aggs[i].ExtraArgs = make([]Expr, len(ag.ExtraArgs))
+				for j, ea := range ag.ExtraArgs {
+					if a.Aggs[i].ExtraArgs[j], err = remapExpr(ea); err != nil {
+						return nil, err
+					}
+				}
+			}
+		}
+		return &a, nil
+	case *Sort:
+		s := *n
+		if s.Child, err = remapSourceTableIdx(n.Child, offset); err != nil {
+			return nil, err
+		}
+		if s.Keys, err = remapKeys(n.Keys); err != nil {
+			return nil, err
+		}
+		return &s, nil
+	case *Limit:
+		l := *n
+		if l.Child, err = remapSourceTableIdx(n.Child, offset); err != nil {
+			return nil, err
+		}
+		if l.Limit, err = remapExpr(n.Limit); err != nil {
+			return nil, err
+		}
+		if l.Offset, err = remapExpr(n.Offset); err != nil {
+			return nil, err
+		}
+		return &l, nil
+	case *SeqScan:
+		c := *n
+		c.schema = remapSchema(n.schema)
+		return &c, nil
+	case *IndexScan:
+		c := *n
+		c.schema = remapSchema(n.schema)
+		return &c, nil
+	case *BitmapHeapScan:
+		c := *n
+		c.schema = remapSchema(n.schema)
+		return &c, nil
+	case *Values:
+		c := *n
+		c.schema = remapSchema(n.schema)
+		c.Rows = make([][]Expr, len(n.Rows))
+		for i, row := range n.Rows {
+			c.Rows[i] = make([]Expr, len(row))
+			for j, e := range row {
+				if c.Rows[i][j], err = remapExpr(e); err != nil {
+					return nil, err
+				}
+			}
+		}
+		return &c, nil
+	case *CTEScan:
+		c := *n
+		c.schema = remapSchema(n.schema)
+		return &c, nil
+	case *MaterializedCTEScan:
+		c := *n
+		c.schema = remapSchema(n.schema)
+		return &c, nil
+	case *Gather:
+		g := *n
+		if g.Child, err = remapSourceTableIdx(n.Child, offset); err != nil {
+			return nil, err
+		}
+		g.schema = remapSchema(n.schema)
+		return &g, nil
+	case *GatherMerge:
+		g := *n
+		if g.Child, err = remapSourceTableIdx(n.Child, offset); err != nil {
+			return nil, err
+		}
+		if g.Keys, err = remapKeys(n.Keys); err != nil {
+			return nil, err
+		}
+		g.schema = remapSchema(n.schema)
+		return &g, nil
+	default:
+		return nil, &PlanError{Pos: node.Pos(), Code: "XX000", Message: "remapSourceTableIdx: unsupported plan node"}
+	}
+}
+
+// remapExprSourceTableIdx clones e with every ColumnRef's SourceTableIdx
+// shifted by offset. Built on the exhaustive CloneExprReplacingColumnRefs
+// walker (exprwalk.go) rather than a hand-written type switch, so a new Expr
+// kind is covered automatically instead of silently passing through
+// unremapped (the RC-1a defect class exprwalk.go exists to kill).
+// OuterColumnRef is a distinct type from ColumnRef and is never touched —
+// see remapSourceTableIdx's doc comment for why that is correct here.
+func remapExprSourceTableIdx(e Expr, offset int16) (Expr, error) {
+	if e == nil {
+		return nil, nil
+	}
+	out, ok := CloneExprReplacingColumnRefs(e, func(c *ColumnRef) Expr {
+		cl := *c
+		cl.SourceTableIdx += offset
+		return &cl
+	})
+	if !ok {
+		return nil, &PlanError{Pos: e.Pos(), Code: "XX000", Message: "remapSourceTableIdx: unenumerated expr type"}
+	}
+	return out, nil
+}
+
 func cloneExprReplacingOuter(e Expr, replace map[*OuterColumnRef]*ColumnRef) Expr {
 	if e == nil {
 		return nil
@@ -4036,6 +4289,21 @@ func resolveOuterSchemaIdx(outerSchema Schema, name string, fallback int, source
 // unchanged), and an inner ColumnRef is shifted by innerShift (the
 // left side's total width). Returns nil when there is nothing to lift.
 func liftResidualConjuncts(residuals, innerOnly []Expr, outerSchema Schema, innerShift int) Expr {
+	return liftResidualConjunctsWithOffset(residuals, innerOnly, outerSchema, innerShift, 0)
+}
+
+// liftResidualConjunctsWithOffset is liftResidualConjuncts plus
+// innerSourceTableOffset, the SAME offset remapSourceTableIdx applied to the
+// inner plan's own SourceTableIdx values (M0142-0008e). A lifted residual's
+// inner-side ColumnRef is a fresh copy built from the PRE-remap EXISTS body
+// (collectUnnestParamsAndResiduals harvests it before the inner plan is
+// remapped), so without this it would carry the pre-offset SourceTableIdx —
+// disagreeing with the scan explainNames now registers under the shifted
+// value, reintroducing the exact collision remapSourceTableIdx exists to
+// remove, just one level up (the join Predicate instead of the join key).
+// unnestExistsExpr is the only caller that has ever remapped its inner
+// plan, so it is the only one that passes non-zero here.
+func liftResidualConjunctsWithOffset(residuals, innerOnly []Expr, outerSchema Schema, innerShift int, innerSourceTableOffset int16) Expr {
 	if len(residuals) == 0 && len(innerOnly) == 0 {
 		return nil
 	}
@@ -4056,6 +4324,7 @@ func liftResidualConjuncts(residuals, innerOnly []Expr, outerSchema Schema, inne
 		case *ColumnRef:
 			cl := *x
 			cl.Index = innerShift + x.Index
+			cl.SourceTableIdx += innerSourceTableOffset
 			return &cl
 		case *BinaryOp:
 			return &BinaryOp{
@@ -4353,6 +4622,30 @@ func unnestExistsExpr(ex *ExistsExpr, outer Node) (Node, error) {
 	outerChild := filter.Child
 	outerWidth := len(outerChild.Output())
 
+	// M0142-0008e: shift innerPlan's own SourceTableIdx numbering so it
+	// cannot collide with the outer side's — see remapSourceTableIdx's doc
+	// comment (design doc §9) for why the collision is otherwise real:
+	// SourceTableIdx restarts at 1 per query level, so a single-table
+	// EXISTS body numbers its own scan "1" just like the outer query's
+	// first FROM item, and splicing innerPlan in as an ordinary join
+	// child puts both scans under one EXPLAIN naming pass. The offset is
+	// sized against outerChild.Output() — the outer-side columns this
+	// specific join exposes, the only subtree innerPlan is being spliced
+	// next to here — and applied to every ColumnRef this function itself
+	// builds against the inner side afterward (innerKey,
+	// liftResidualConjunctsWithOffset's inner-ColumnRef case) so all three
+	// stay in the same shifted numbering.
+	var srcTableOffset int16 = 1
+	for _, c := range outerChild.Output() {
+		if c.SourceTableIdx >= srcTableOffset {
+			srcTableOffset = c.SourceTableIdx + 1
+		}
+	}
+	innerPlan, err = remapSourceTableIdx(innerPlan, srcTableOffset)
+	if err != nil {
+		return nil, err
+	}
+
 	// Belt (checked BEFORE any tree mutation below): a keyless
 	// semi/anti needs at least one residual to serve as its join
 	// predicate — an unconditional cross semi must never be built.
@@ -4388,11 +4681,16 @@ func unnestExistsExpr(ex *ExistsExpr, outer Node) (Node, error) {
 		// the inner column from the right-side region of that padded
 		// row, so its Index must be `outerWidth + innerColIndex`.
 		innerKey = &ColumnRef{
-			pos:            params[0].SubCol.Pos(),
-			Index:          outerWidth + params[0].SubCol.Index,
-			Name:           params[0].SubCol.Name,
-			Type:           params[0].SubCol.Type,
-			SourceTableIdx: params[0].SubCol.SourceTableIdx,
+			pos:   params[0].SubCol.Pos(),
+			Index: outerWidth + params[0].SubCol.Index,
+			Name:  params[0].SubCol.Name,
+			Type:  params[0].SubCol.Type,
+			// +srcTableOffset: SubCol was harvested from the PRE-remap
+			// EXISTS body, so it still carries the pre-shift value —
+			// without the offset this would disagree with the scan
+			// explainNames now registers under the shifted numbering
+			// (M0142-0008e).
+			SourceTableIdx: params[0].SubCol.SourceTableIdx + srcTableOffset,
 		}
 	}
 
@@ -4449,7 +4747,7 @@ func unnestExistsExpr(ex *ExistsExpr, outer Node) (Node, error) {
 		residualsWithPairs = append(residualsWithPairs, eup.Residuals...)
 		residualsWithPairs = append(residualsWithPairs, extraPairConjuncts...)
 	}
-	joinPredicate := liftResidualConjuncts(residualsWithPairs, innerOnlyLifted, outerSchema, outerWidth)
+	joinPredicate := liftResidualConjunctsWithOffset(residualsWithPairs, innerOnlyLifted, outerSchema, outerWidth, srcTableOffset)
 
 	algo := JoinAlgoHash
 	if len(params) == 0 {

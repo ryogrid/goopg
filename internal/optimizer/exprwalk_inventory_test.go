@@ -318,20 +318,20 @@ var exprSwitchInventory = map[string]walkerRole{
 	// deepVisitSublinkChildren descends through walkExprTreeDeep, which is a
 	// PLAN walker with no Expr switch of its own, so the census's mutual-
 	// recursion pass reports it non-recursive. It is a walker.
-	"unnest.go:deepVisitSublinkChildren":   walkerPending, // 5 of 32 arms
-	"unnest.go:findExistsExprInExpr":       walkerPending, // 5 of 32 arms
-	"unnest.go:findExprInExpr":             walkerPending, // 3 of 32 arms
-	"unnest.go:findInExprInExpr":           walkerPending, // 5 of 32 arms
-	"unnest.go:findSubqueryInExpr":         walkerPending, // 5 of 32 arms
-	"unnest.go:liftResidualConjuncts":      walkerPending, // 5 of 32 arms
-	"unnest.go:nullPreservingScalarTarget": walkerPending, // 9 of 32 arms
-	"unnest.go:planCloneSupported":         walkerPending, // 5 of 32 arms
-	"unnest.go:replaceExprInConjunct":      walkerPending, // 5 of 32 arms
-	"unnest.go:residualExprLiftable":       walkerPending, // 12 of 32 arms
-	"unnest.go:shiftExprColumnIdx":         walkerPending, // 5 of 32 arms
-	"unnest.go:subqueryANDReachable":       walkerPending, // 2 of 32 arms
-	"unnest.go:walkExprTree":               walkerPending, // 8 of 32 arms
-	"unnest.go:walkSubqueryPlansInExpr":    walkerPending, // 9 of 32 arms
+	"unnest.go:deepVisitSublinkChildren":        walkerPending, // 5 of 32 arms
+	"unnest.go:findExistsExprInExpr":            walkerPending, // 5 of 32 arms
+	"unnest.go:findExprInExpr":                  walkerPending, // 3 of 32 arms
+	"unnest.go:findInExprInExpr":                walkerPending, // 5 of 32 arms
+	"unnest.go:findSubqueryInExpr":              walkerPending, // 5 of 32 arms
+	"unnest.go:liftResidualConjunctsWithOffset": walkerPending, // 5 of 32 arms
+	"unnest.go:nullPreservingScalarTarget":      walkerPending, // 9 of 32 arms
+	"unnest.go:planCloneSupported":              walkerPending, // 5 of 32 arms
+	"unnest.go:replaceExprInConjunct":           walkerPending, // 5 of 32 arms
+	"unnest.go:residualExprLiftable":            walkerPending, // 12 of 32 arms
+	"unnest.go:shiftExprColumnIdx":              walkerPending, // 5 of 32 arms
+	"unnest.go:subqueryANDReachable":            walkerPending, // 2 of 32 arms
+	"unnest.go:walkExprTree":                    walkerPending, // 8 of 32 arms
+	"unnest.go:walkSubqueryPlansInExpr":         walkerPending, // 9 of 32 arms
 	// Added by B-01c APPLYING half slice (a), 2026-09-07. Built on
 	// cloneExprRefs (which carries both the recursion and the
 	// exhaustiveness); what the census sees is the four-arm dispatch
