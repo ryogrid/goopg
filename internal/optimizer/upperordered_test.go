@@ -36,6 +36,15 @@ func upperOrderedInput(rows float64) *pricedNode {
 	return n
 }
 
+// searchedPricedNode is pricedNode plus the searchedTree tag, standing in for
+// a search root (`*SeqScan`/`*Join`/... in production) without dragging in
+// catalog.Table — M0141-S2b-2a's plumbing test needs `searchedRelOf` to
+// resolve on the input Node the way it does for a real searched subtree.
+type searchedPricedNode struct {
+	pricedNode
+	searchedTree
+}
+
 func upperOrderedKeys() []SortKey {
 	return []SortKey{
 		{Expr: &ColumnRef{Index: 1, Name: "v", Type: catalog.Type{Name: "text"}}, Desc: true},
@@ -128,6 +137,55 @@ func TestCreateOrderedPathsChargesTheSpillOfALargeSort(t *testing.T) {
 	legacy := DeriveLegacyDisplayCost(srt, int64(rows))
 	if !(pc.StartupCost > legacy.StartupCost) {
 		t.Fatalf("cost_sort price %v is not above the legacy display price %v — the negative result DESIGN §5.7 names", pc.StartupCost, legacy.StartupCost)
+	}
+}
+
+// TestCreateOrderedPathsThreadsSearchCandidatesOntoOrderedRel is M0141-S2b-2a's
+// gate: `searchedRelOf(input)`'s Pathlist becomes reachable off the ORDERED
+// rel (`RelOptInfo.SearchCandidates`) once `input` is a searched-tree root —
+// and, per S2b-2's own scoping recon (design doc
+// m0141-s2b-scoping-decomposition.md §"S2b-2 result"), reaching it changes
+// NOTHING about the elected plan yet: `addOrderedPaths` still offers only the
+// one seed, so `ordered.Pathlist` stays exactly what a non-searched input
+// produces (TestCreateOrderedPathsEmitsTheRewritesSortWithCostSortsPrice).
+func TestCreateOrderedPathsThreadsSearchCandidatesOntoOrderedRel(t *testing.T) {
+	cp := defaultCostParams()
+	keys := upperOrderedKeys()
+	u := newUpperRels()
+
+	searchRel := &RelOptInfo{}
+	cand1 := &Path{Kind: PathAgg, Rows: 5, Cost: Cost{Total: 10}}
+	cand2 := &Path{Kind: PathAgg, Rows: 5, Cost: Cost{Total: 20}}
+	searchRel.Pathlist = []*Path{cand1, cand2}
+
+	in := &searchedPricedNode{pricedNode: *upperOrderedInput(1000)}
+	in.markFromJoinSearch()
+	in.setSearchRel(searchRel)
+
+	got := createOrderedPaths(u, in, keys, 0, cp, 0, -1)
+	if _, ok := got.(*Sort); !ok {
+		t.Fatalf("got %T, want *Sort (the searched tag alone, with no searchPathkeys claimed, must still stack the Sort)", got)
+	}
+
+	ordered := fetchUpperRel(u, UpperOrdered, 0, 0)
+	if len(ordered.SearchCandidates) != 2 || ordered.SearchCandidates[0] != cand1 || ordered.SearchCandidates[1] != cand2 {
+		t.Fatalf("ordered.SearchCandidates = %v, want the search rel's own 2-entry Pathlist by identity", ordered.SearchCandidates)
+	}
+	// Plumbing only: the tournament still offers exactly the one seed.
+	if len(ordered.Pathlist) != 1 {
+		t.Fatalf("ordered.Pathlist = %d entries, want 1 — SearchCandidates must not be offered to the tournament yet", len(ordered.Pathlist))
+	}
+}
+
+// TestCreateOrderedPathsLeavesSearchCandidatesNilForANonSearchedInput pins the
+// negative case: a plain Node with no searched-tree tag leaves the new field
+// at its zero value, exactly like today (no field, no behavior).
+func TestCreateOrderedPathsLeavesSearchCandidatesNilForANonSearchedInput(t *testing.T) {
+	u := newUpperRels()
+	createOrderedPaths(u, upperOrderedInput(10), upperOrderedKeys(), 0, defaultCostParams(), 0, -1)
+	ordered := fetchUpperRel(u, UpperOrdered, 0, 0)
+	if ordered.SearchCandidates != nil {
+		t.Fatalf("ordered.SearchCandidates = %v, want nil for a non-searched input", ordered.SearchCandidates)
 	}
 }
 

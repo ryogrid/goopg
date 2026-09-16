@@ -638,3 +638,36 @@ No ledger row needed for new unimplemented scope: the gap (Incremental Sort
 as S2b-2's real prerequisite) is already M0141-S7, filed and unchecked; this
 recon corrects the SEQUENCING between two already-filed items, it does not
 discover a new one.
+
+## S2b-2a landed (2026-09-17)
+
+Implemented decomposition item 1 above: `createOrderedPaths`
+(`internal/optimizer/upperordered.go`) now calls `searchedRelOf(input)` right
+where `seed` is built and, when it resolves, stores the search rel's own
+`Pathlist` onto a new field, `RelOptInfo.SearchCandidates`
+(`internal/optimizer/path.go`) — following the same "travels as DATA on the
+rel" precedent `NeededCols`/`OutputCols` already use for a value one future
+consumer reads and nothing reads yet. `addOrderedPaths` needed no signature
+change: it already receives `ordered *RelOptInfo` as its first parameter, so
+the field alone makes the list reachable at its call site without a new
+parameter threaded through 3 production call sites (`upperordered.go`,
+`upperordereddistinct.go`, `upperorderedgrouping.go`) and 6 test call sites —
+narrower than the literal "thread into `addOrderedPaths`" reading, and lower
+risk, since `addOrderedPaths`'s body is intentionally untouched this slice.
+
+Two new tests in `upperordered_test.go` pin the gate: a searched-root input
+(a new `searchedPricedNode` test fixture — `pricedNode` plus the
+`searchedTree` tag) gets its search rel's 2-entry `Pathlist` copied onto
+`ordered.SearchCandidates` by identity, while `ordered.Pathlist` itself stays
+at exactly 1 entry (the seed) — the *Sort* still comes back, matching a
+non-searched input. A non-searched input leaves the field nil. `go test
+./internal/optimizer/...` full package PASS. TPC-DS SF0.25 sweep (private
+bin, nightly batch was live): `PASS=96 MISMATCH=0`, `PLAN-SHAPE: changed=0` —
+byte-identical, confirming Finding 2's prediction. **S2b-2a is DONE.**
+
+**Next in the decomposition**: S2b-2b (materialize-on-demand — defer
+`createPlanNode` on any non-seed candidate until `setCheapest` picks a
+winner, and generalize `validatedSearchPathkeys` to run per-candidate) can
+now read `ordered.SearchCandidates` directly instead of re-deriving
+`searchedRelOf`. S2b-2c (the actual tournament) stays blocked on M0141-S7's
+`addOrderedPaths` third arm.

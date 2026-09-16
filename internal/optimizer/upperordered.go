@@ -99,6 +99,17 @@ func createOrderedPaths(u *upperRels, input Node, keys []SortKey, pos int, cp co
 	// the pre-C-07 answer and stacks the Sort exactly as before.
 	seed.Pathkeys = inputNodePathkeys(input)
 
+	// M0141-S2b-2a: thread the search's own Pathlist onto the ORDERED rel
+	// (RelOptInfo.SearchCandidates) so it is visible to `addOrderedPaths`
+	// below — and to a later consumer — without re-deriving
+	// `searchedRelOf(input)`. Plumbing only: `addOrderedPaths` does not read
+	// it yet, so `seed` remains the only candidate offered and the chosen
+	// plan cannot change (see the field's doc comment for why offering more
+	// candidates today is provably inert).
+	if sr := searchedRelOf(input); sr != nil {
+		ordered.SearchCandidates = sr.Pathlist
+	}
+
 	addOrderedPaths(ordered, seed, pathkeysForSortKeys(keys), cp, limitTuples)
 	setCheapest(ordered)
 

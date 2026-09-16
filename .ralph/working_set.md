@@ -1,90 +1,76 @@
-Task: M0141-S7 groundwork, continuing the Finding-3 implementation-order
-chain from the prior loop's `pathkeysCountContainedIn` landing. Landed the
-second primitive: `costIncrementalSort` (per fix_plan banner item 4, M0141
-remaining slices before M0142).
+Task: M0141-S2b-2a — the plumbing-only step of S2b-2's decomposition
+(`docs/design/0100-0149/m0141-s2b-scoping-decomposition.md` §"S2b-2 result"
+item 1). Per fix_plan banner item 4 (M0141's remaining slices). DONE and
+committed this loop.
 
-Files: internal/optimizer/cost_funcs.go (new `costIncrementalSort`, right
-after `sortByteBranch`, before `costAgg`), internal/optimizer/
-cost_incremental_sort_test.go (new, 4 unit tests), internal/optimizer/
-sort_pgrelationbytes_test.go (census guard `cost_funcs.go` count 2->3),
-docs/design/0100-0149/m0141-s7-readjudicate-and-scope-incremental-sort.md
-(new "Update 2026-09-17b" section), docs/design/README.md (m0141-s7 row
-appended), .ralph/fix_plan.md (S7 entry appended, stays unchecked).
+Files: internal/optimizer/path.go (new `RelOptInfo.SearchCandidates []*Path`
+field, "travels as DATA on the rel" precedent alongside NeededCols/OutputCols),
+internal/optimizer/upperordered.go (`createOrderedPaths` now calls
+`searchedRelOf(input)` where `seed` is built and stores the result onto
+`ordered.SearchCandidates`), internal/optimizer/upperordered_test.go (2 new
+tests + `searchedPricedNode` fixture), docs/design/0100-0149/
+m0141-s2b-scoping-decomposition.md ("S2b-2a landed" section),
+docs/design/README.md (m0141-s2b row appended), .ralph/fix_plan.md (S2b-2a
+checked off with full landing note).
 
-Key symbols: `costIncrementalSort(cp costParams, inputCost Cost, inputTuples,
-inputGroups float64, ncols int, avgVarBytes, limitTuples float64, width int)
-Cost` — ports PG's `cost_incremental_sort` (`costsize.c:2000-2126`),
-composing the existing `costSortRunWithWidth` (`cost_tuplesort`) as the
-per-group full-sort price. Zero production callers — does not touch
-`addOrderedPaths`, so it cannot move any plan yet.
+Key symbols: `searchedRelOf` (searchedtree.go:169, pre-existing R21 slice 2a
+accessor — unchanged), `RelOptInfo.SearchCandidates` (new), `createOrderedPaths`
+(upperordered.go:64, only production write site this loop),
+`addOrderedPaths` (upperordered.go:122, UNCHANGED body — reads nothing new;
+it already takes `ordered *RelOptInfo` as its first param, so the new field
+is reachable there with zero signature change and zero of its 3 production +
+6 test call sites touched).
 
-Findings: resolved the open question the prior loop's working_set left —
-whether this Finding-3 step needs S2b's real multi-candidate Pathlist to be
-testable, or is standalone-testable like the prefix-count helper. Answer:
-standalone. Every input to `cost_incremental_sort` is a plain scalar except
-`input_groups`, which upstream computes via `estimate_num_groups` *inside*
-the same function; this composition splits that into a caller-supplied
-`inputGroups` parameter (same split `costSortRunWithWidth` already uses for
-`ncols`/`avgVarBytes`/`width`), so the formula is fully pinnable against an
-independent transliteration of PG's C with synthetic numbers. Only the later
-*wiring* step (Finding 3 table row 3-4: the `addOrderedPaths` third arm,
-which calls `estimateNumGroups` over a real presorted-key prefix) needs
-S2b's rel to exist — not this one. Two things caught while writing the
-independent pin (both now documented in code comments + design doc):
-(1) `comparisonCost` is always 0 at PG's only real call site
-(`costsize.c:3701`) and `cost_tuplesort`'s internal `+= 2*cpu_operator_cost`
-mutates its own local copy, never the caller's, so the per-tuple overhead
-term correctly uses 0, matching `costSortRunWithWidth`'s existing "no
-external comparisonCost parameter" convention; (2) the formula is NOT
-monotonic in `inputGroups` — cost falls as groups grow (smaller per-group
-sorts dominate) until fixed per-group reset overhead turns the curve back up
-near one-row-per-group (verified by direct probing at inputTuples=50000: min
-near groups=25000, rises again by groups=50000, but stays below the
-groups=1 baseline throughout) — an initial test asserting plain
-monotonicity was wrong and was corrected before landing.
+Findings: chose "carry as a struct field" over "add a new parameter to
+addOrderedPaths" specifically to avoid touching upperordereddistinct.go's and
+upperorderedgrouping.go's own addOrderedPaths calls (neither has a
+`searchedRelOf`-shaped input — they already loop real candidates a different
+way, S2b-1/S2b-5's mechanism) for zero benefit this loop. This is a narrower,
+lower-risk reading of the filed task text ("thread ... into
+createOrderedPaths/addOrderedPaths") than a literal new-parameter thread
+would have been, and it is fully precedented by the existing NeededCols/
+OutputCols/JoinKeep fields' own doc comments ("travels as DATA on the rel...
+added first and separately so commit changes one thing"). Verified via two
+unit tests: a searched-root input's search-rel Pathlist lands on
+`ordered.SearchCandidates` by identity (2 entries), while `ordered.Pathlist`
+itself stays at exactly 1 (the seed) — i.e. still *Sort* elected, still
+byte-identical to a non-searched input. A non-searched input leaves the
+field nil.
 
-Finding 3's table now has rows 1-2 landed (prefix-count helper, cost
-composition), both zero-caller, both independently tested. Rows 3-6
-(`PathIncrementalSort`/`addOrderedPaths` third arm, executor operator,
-`createplansimple.go` wiring, EXPLAIN rendering) remain, and row 3 genuinely
-needs M0141-S2b's Pathlist-forwarding surgery to land first (per witness
-group, per the S7 design doc's NARROWED mapping) — there is nothing yet for
-a presorted-prefix candidate to be built over without it.
-
-Next step: before attempting row 3, re-check whether row 5 (the executor
-operator, built on the already-landed zero-caller `sortPrefixEqual`/E-15) or
-row 6 (EXPLAIN rendering) can ALSO be staged standalone ahead of the
-`addOrderedPaths` wiring, following the same "independently testable
-primitive first" pattern used for rows 1-2 — read `sortPrefixEqual`'s
-contract doc comment (`internal/executor/sort_presorted.go`) and
-`operators_explain.go`'s existing `Sort`/`Sort Key:` rendering to judge
-whether an operator/rendering arm can be pinned by a synthetic-input unit
-test without a real `PathIncrementalSort` Path.Kind existing yet (it likely
-CANNOT for the executor operator specifically, since an operator needs a
-concrete plan node type to attach to — check before assuming). If both turn
-out to require the Path.Kind/addOrderedPaths wiring to exist first, this
-chaining approach has reached its natural end and the next loop should defer
-to M0141-S2b's relevant sub-task (S2b-0 for the 5 GroupAggregate witnesses,
-S2b-2 for MergeJoin/NestedLoop/SubqueryScan) landing first, or fall back to
-M0142's remaining open items per the banner (M0142-0016c has no stated
-blocker; M0142-0005/M0142-0008a-3 need their own recon;
-M0142-0008c-1a/-3d/-4 not ready). Read AGENT.md's plan-parity harness
+Next step: S2b-2b (materialize-on-demand: defer `createPlanNode` on any
+non-seed candidate until `setCheapest` has chosen a winner, and generalize
+`validatedSearchPathkeys` (upperorderedinput.go) to run per-candidate rather
+than once for the single seed) is now unblocked and can read
+`ordered.SearchCandidates` directly instead of re-deriving `searchedRelOf`.
+It is still "no behavior change" (same gate as 2a) since S2b-2c (the actual
+tournament, blocked on M0141-S7's `addOrderedPaths` third arm / prefix-match
+Incremental Sort candidate) is the step that can move a plan. Read
+`upperorderedinput.go`'s `validatedSearchPathkeys` and its two-rule contract
+doc comment before starting 2b — it validates ONE seed's pathkeys against the
+coordinate schema the boundary publishes today; 2b needs that generalized to
+run once per `SearchCandidates` entry, not just the winner. Alternatively,
+since S7's own row-3 wiring (the `addOrderedPaths` third arm itself) is the
+piece that actually needs a real multi-candidate Pathlist to build a
+presorted-prefix candidate over, it may be more direct to skip 2b's pure
+materialize-on-demand refactor and go straight to scoping S2b-2c/S7's wiring
+together, now that 2a supplies `ordered.SearchCandidates` as the exact input
+both would consume — worth 10 minutes of design-doc re-reading before
+picking one over the other next loop. Read AGENT.md's plan-parity harness
 section again before selecting (required every loop touching M0137-M0143).
 
-Gates run: `go build ./...` clean, `go build ./internal/optimizer/...`
-clean, `go test ./internal/optimizer/...` PASS (full package, not just new
-tests — this run also caught and required fixing a census guard test,
-`TestCostSortRunWithWidthProductionCallersAreComplete`, which pins the exact
-count of `costSortRunWithWidth` call sites per file; updated `cost_funcs.go`
-2->3). TPC-DS SF0.25 sweep: PASS=96 MISMATCH=0, PLAN-SHAPE changed=0.
-tpch-spotcheck.sh: SKIPPED (known pre-existing blocker M0142-0003k, not this
-change). `make ralph-state-guard` self-repaired the same stale
-running/completed mismatch seen in prior loops, then passed. `gofmt -l`
-flagged pre-existing unrelated formatting drift in `cost_funcs.go` (go1.26.3
-local vs go1.25 repo baseline — left untouched per CLAUDE.md); one alignment
-issue in `sort_pgrelationbytes_test.go` WAS caused by my own edit (a long
-trailing comment shifted a map literal's column width) and was fixed
-manually (not via `gofmt -w`). Commit going through the pre-commit hook's
-mandatory pgbench smoke.
+Gates run: `go build ./...` clean. `go test ./internal/optimizer/...` full
+package PASS (includes the 2 new tests + all pre-existing S2b/S7/upperordered
+tests). TPC-DS SF0.25 sweep (private bin `tmp/goopg-s2b2a-bin`, since
+nightly batch `ci/batch/nightly-scheduler.sh` was live and shares
+`tmp/goopg-bench-bin`; binary deleted after the run): PASS=96 MISMATCH=0,
+PLAN-SHAPE changed=0 — byte-identical as predicted, confirming the S2b-2
+recon's Finding 2. tpch-spotcheck.sh not run (pre-existing blocker
+M0142-0003k, TPC-H bench data still empty — unrelated to this change,
+optimizer-package-only edit with no TPC-H-specific surface). `gofmt -l`
+flagged only the same pre-existing go1.26.3-vs-go1.25 drift in
+upperordered_test.go noted by prior loops (two unrelated struct-literal
+alignment lines, not touched by this edit — left alone per CLAUDE.md).
+`make ralph-state-guard` self-repaired the same stale running/completed
+mismatch seen in prior loops, then passed.
 
 In-flight: none.

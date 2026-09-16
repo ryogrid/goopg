@@ -544,6 +544,26 @@ type RelOptInfo struct {
 	Pathlist        []*Path
 	PartialPathlist []*Path
 
+	// SearchCandidates is the SEARCH rel's own Pathlist (`searchedRelOf(input)
+	// .Pathlist`), carried onto the ORDERED rel by `createOrderedPaths`
+	// (M0141-S2b-2a, upperordered.go) so a later consumer does not need to
+	// re-derive `searchedRelOf` itself. It travels as DATA on the rel, the
+	// way NeededCols/OutputCols already do (same P2-A rationale: no spare
+	// parameter down `createOrderedPaths`/`addOrderedPaths` for one list one
+	// future consumer reads).
+	//
+	// Nothing reads this yet, and that is the slice's gate. S2b-2's own
+	// scoping recon (docs/design/0100-0149/m0141-s2b-scoping-decomposition.md
+	// §"S2b-2 result") proved that OFFERING these candidates to the ORDERED
+	// tournament today cannot move a plan — every candidate of one rel
+	// shares the same (rows, width), so `costSortRun`'s constant Sort charge
+	// on top cannot change which one ranks cheapest — so this field is
+	// visibility only until M0141-S7's per-candidate Pathkeys credit
+	// (`cost_incremental_sort`) exists for S2b-2c to spend it on. nil when
+	// `input` is not a searched-tree root, or the search published no
+	// Pathlist.
+	SearchCandidates []*Path
+
 	// ConsiderParallel is PG's `RelOptInfo.consider_parallel`
 	// (pathnodes.h:911): whether it is worth generating partial paths for
 	// this rel at all — the relation can be read by a worker (not temp, not

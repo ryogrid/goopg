@@ -2465,12 +2465,29 @@ spill route is net-negative.
     2c is explicitly blocked on S7). No ledger row: the gap (S7) is already
     filed and unchecked; this recon only corrects the sequencing between two
     already-filed items.
-  - [ ] **M0141-S2b-2a** — plumbing only: thread `searchedRelOf(input)` into
+  - [x] **M0141-S2b-2a** — plumbing only: thread `searchedRelOf(input)` into
     `createOrderedPaths`/`addOrderedPaths` so the full `Pathlist` is visible
     at the call site. Filed by S2b-2 (design doc §"S2b-2 result" item 1).
     Gate: byte-identical plans on both corpora — per S2b-2's Finding 2 this
     is a *predicted*, not merely hoped-for, null result, same precedent as
-    R21 Slice 1.
+    R21 Slice 1. **DONE 2026-09-17.** `createOrderedPaths`
+    (`internal/optimizer/upperordered.go`) now calls `searchedRelOf(input)`
+    where `seed` is built and stores the result's `Pathlist` onto a new
+    `RelOptInfo.SearchCandidates` field (`internal/optimizer/path.go`,
+    same "travels as DATA on the rel" precedent as `NeededCols`/`OutputCols`)
+    — `addOrderedPaths` needed no signature change since it already receives
+    `ordered *RelOptInfo`, so the field alone makes the list reachable there
+    without touching 3 production + 6 test call sites. Nothing reads the
+    field yet (by design, matches the gate). Two new tests in
+    `upperordered_test.go` (`TestCreateOrderedPathsThreadsSearchCandidatesOntoOrderedRel`,
+    `TestCreateOrderedPathsLeavesSearchCandidatesNilForANonSearchedInput`).
+    `go test ./internal/optimizer/...` full package PASS. TPC-DS SF0.25
+    sweep (private bin, nightly batch was live): `PASS=96 MISMATCH=0`,
+    `PLAN-SHAPE changed=0` — byte-identical as predicted. Design doc:
+    `docs/design/0100-0149/m0141-s2b-scoping-decomposition.md` §"S2b-2a
+    landed". **Next**: S2b-2b (materialize-on-demand + per-candidate
+    `validatedSearchPathkeys`) can now read `ordered.SearchCandidates`
+    directly; S2b-2c stays blocked on M0141-S7's `addOrderedPaths` third arm.
   - [ ] **M0141-S2b-2b** — materialize-on-demand: defer `createPlanNode` on
     any non-seed candidate until `setCheapest` has chosen a winner (avoid
     paying materialization cost for N-1 discarded candidates per query), and
