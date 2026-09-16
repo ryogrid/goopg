@@ -1,78 +1,107 @@
-Task: M0142-0008a-3i-plumbing-c12, completed as a REFUTATION this loop
-(design doc §47). c12's own filed hypothesis (missing relids-subset check
-in the index-path candidate generator) is disproved by exhaustive live
-evidence. Filed follow-on **c13** (fix_plan.md) with a concrete, different
-next instrumentation layer. No production code changed this loop.
+Task: M0142-0008a-3i-plumbing-c13, completed as an ANSWER-AND-REFRAME this
+loop (design doc §48). c13's own filed question ("why is ctx.OuterRows
+empty") is answered — it's never pushed because the crash never reaches
+the lateral driver at all — but the deeper root cause (reference sharing
+of a parameterized IndexScan into a plain leaf slot) is only narrowed,
+not pinned. Filed follow-on **c14** (fix_plan.md) with a concrete,
+different next instrumentation layer. No production code changed this
+loop (a clone-before-mutate fix was tried, live-tested, DISPROVED, and
+fully reverted).
 
 Files this loop (all documentation/planning, zero production diff):
-- docs/design/0100-0149/m0142-0008a-1-semi-anti-sji-design.md: new §47
-  (§47.1 method, §47.2 the refutation evidence, §47.3 EXPLAIN-text-is-
-  unreliable-here caveat, §47.4 the `depth=0` reframing, §47.5 c13's
+- docs/design/0100-0149/m0142-0008a-1-semi-anti-sji-design.md: new §48
+  (§48.1 method, §48.2 both of §47.5's predictions refuted by stack
+  trace, §48.3 the pointer-identity finding, §48.4 the disproved
+  clone-fix attempt, §48.5 where the real defect must live, §48.6 c14's
   concrete next step).
-- .ralph/fix_plan.md: c12 marked [x] (concluded, refuted — matches the
-  established c10-style convention of checking off a recon/diagnostic
-  task that reaches a definitive answer without landing a fix); new task
-  **M0142-0008a-3i-plumbing-c13** filed.
+- .ralph/fix_plan.md: c13 marked [x] (concluded — its own question
+  answered, real cause re-scoped and re-filed, matching the established
+  c10/c12-style convention); new task **M0142-0008a-3i-plumbing-c14**
+  filed.
 - .ralph/deferral_ledger.md: new row for this loop.
-- internal/optimizer/{joinpathsnli,createplannl,joinsearchseam,nl_index_join}.go:
-  temporary instrumentation added AND FULLY REVERTED before commit
-  (`git checkout --`); `git diff --stat -- internal/optimizer/` is empty.
+- internal/optimizer/{createplan,createplannl,joinsearchseam}.go,
+  internal/executor/{expr,operators_join_agg,operators_nljoin}.go:
+  temporary instrumentation AND a clone-before-mutate fix attempt added,
+  live-tested (build private binary, private SF0.25 data copy, direct
+  server start, run Q69 via psql), then FULLY REVERTED (`git checkout --`)
+  before commit; `git status --porcelain -- internal/` is empty.
 
-Key symbols this loop's instrumentation touched (all reverted, listed for
-the next loop's benefit): `addNLIPaths`/`addPartialNestLoopPaths`
-(joinpathsnli.go) — exhaustively traced, never build the suspected illegal
-pairing. `createNestLoopIndexJoinPlan` (createplannl.go) — the DP search's
-only create-plan-phase constructor of `*NestedLoopIndexJoin`; traced
-twice per crashing run, both times SAFE (`outer={customer,
-customer_address}`). `tryBuildNLI`/`rewriteJoinsToNLI` (nl_index_join.go)
-— the OTHER, "legacy" post-search constructor of the same node type;
-traced, zero successful conversions for Q69. The panic site itself:
-`internal/executor/expr.go:472-478` (`*optimizer.OuterColumnRef`
-evaluation, `depth=%d` = `len(ctx.OuterRows)`).
+Key symbols this loop's instrumentation touched (all reverted): the
+`expr.go:472` `*optimizer.OuterColumnRef` panic site (added
+`debug.PrintStack()`, gated) — got the exact crash call stack.
+`joinOp.Open` (operators_join_agg.go) — printed plan pointer/Type/Algo/
+Lateral/Right-type/Right-pointer on every call. `createNestLoopPlan`
+(createplannl.go) — printed at BOTH dispatch branches (NLI vs plain).
+`createNestLoopIndexJoinPlan`'s `j := &Join{...}` construction site —
+printed the built Join's own pointer/Lateral/inner-IndexScan pointer.
+`createPlanNodeUnpriced` (createplan.go) — printed EVERY Path→Node
+translation during one query run (pointer, Kind, relids, RequiredOuter
+in; Node pointer/type out) — this was the instrument that finally
+nailed the sharing by pointer identity, run twice with matching results.
 
-Findings: (1) Both known producers of a `*NestedLoopIndexJoin` node build
-it, when they build it at all, in the ONE provably-safe shape for Q69 —
-path selection/construction is NOT the defect, contrary to every theory
-c9 through c12 pursued. (2) The `EXPLAIN` text's printed indentation/
-widths (which the c11-filing loop read as proof of an illegal
-`store_sales`-leaf-outer pairing) is NOT reliable evidence here — it may
-be a display-only artifact (`nlipricesplice.go` documents an analogous,
-though not identical, "stamped after the fact" display seam for
-SEMI/ANTI NLI nodes). Do not re-trust it without re-deriving from a live
-node-type instrument. (3) The executor's own error text says `depth=0`,
-i.e. the lateral outer-row stack (`ctx.OuterRows`) is COMPLETELY EMPTY at
-evaluation time — not "wrong relation in scope" but "no lateral push
-happened at all". This is the sharpest, most concrete lead: either (a)
-the executor never actually opens/rescans the confirmed-correct
-`*Join{Lateral:true}` node (meaning the executed tree diverges from what
-`createPlan` returned — some post-createPlan pass, `nlipricesplice.go`
-being the leading suspect, mutated/misplaced it), or (b) it does open it
-but the dispatch that's supposed to push `ctx.OuterRows` before
-rescanning the inner `*IndexScan` doesn't trigger for this specific
-shape (an M0134-0001-style "wrap type doesn't trigger the lateral push"
-gap — see `join_lateral_stream_test.go`'s doc comment for that prior,
-analogous incident).
+Findings: (1) The crash's call stack (expr.go:481 → operators_index.go
+:968/496/324 → join_nl_stream.go:104 → operators_join_agg.go:428 →
+join_nl_stream.go:101 → operators_join_agg.go:428) proves it goes through
+`join_nl_stream.go`'s `openNestedLoop` (ordinary, non-lateral,
+materialize-and-replay), NEVER `join_lateral_stream.go`'s `openLateral` —
+both of §47.5's predicted branches (execution-dispatch gap vs.
+post-createPlan tree mutation by `nlipricesplice.go`) are wrong;
+`nlipricesplice.go` never touches `*optimizer.Join` at all (grep
+confirmed, only `*NestedLoopIndexJoin`). (2) `createNestLoopPlan` is
+called exactly 3 times for Q69's crashing run; exactly ONE call takes the
+NLI branch and correctly builds `*Join{Lateral:true}` wrapping a FRESH
+(confirmed via `createIndexScanPlan`'s source: `is := &IndexScan{...}`
+bare struct literal) `OuterColumnRef`-keyed `*IndexScan`. (3) A SEPARATE
+`*Join{Lateral:false}` — customer_demographics paired with ONE of Q69's
+three EXISTS leaves, with NO connecting predicate at all — wraps the
+EXACT SAME `*IndexScan` pointer as its `Right` child, via a `PathPrebuilt`
+whose `.node` field was set (at Path-construction time, before
+createPlan's tree walk even starts — confirmed the ONLY site that ever
+assigns the private `node` field is `newPrebuiltPath`) to that same
+parameterized probe. THIS `*Join{Lateral:false}` is what's actually
+executed (pointer-matched to the crash). (4) A clone-before-mutate fix
+(shallow-copy `is` before `createNestLoopIndexJoinPlan`/
+`createNestLoopIndexJoinPlanFused` write `.Cond`/`.Key`/`.Keys`) was
+implemented and live-tested against the SAME repro: **the crash persisted
+identically**, and the `PathPrebuilt` resolved to the CLONE's address —
+proving the defect is REFERENCE SHARING (something else captures the
+already-built parameterized probe as a reusable plain leaf), not in-place
+mutation of a shared object as the file's own (now-known-wrong) comment
+claimed. (5) A second, likely-independent defect is visible alongside:
+the winning tree splits customer_demographics away from customer/
+customer_address entirely (they end up joined to the OTHER two EXISTS
+leaves later in the same tree) — a join-legality gap (pairing two relsets
+with zero connecting predicate should never be legal), not merely a
+lost-Lateral-flag bug.
 
-Next step: c13 (fix_plan.md, filed this loop). Instrument the executor's
-lateral-outer push/pop (near `operators_nljoin.go`'s
-`nestedLoopIndexJoinOp` and the generic `bindOuter`/`lateralBindable`
-dispatch) to print every push/pop of `ctx.OuterRows` alongside the Go
-type of the node being opened/rescanned, then reproduce Q69's crash live
-and read off which of (a)/(b) above is true. Same private-binary SF0.25
-method as c9-c12 (design doc §46.1: private data-dir copy, private
-binary, direct start bypassing the cgroup wrapper so env vars reach the
-process, temporary `joinInfoList: ctx.joinInfoList` one-liner in
-joinsearchseam.go re-applied locally to reach the search — revert before
-commit either way).
+Next step: c14 (fix_plan.md, filed this loop). Instrument
+`joinsearchseam.go`'s leaf-assembly path (`extractSearchLeaves`, the
+`scans`/`leaves` construction ~lines 624-717) to print, for every REAL
+FROM-item entry (i < nprefix, not synthetic semiAnti leaves), the Go
+pointer/type of `scans[i]` at the moment it's captured — cross-reference
+against the parameterized probe's pointer to catch the exact write that
+puts it into a plain per-relation leaf slot. Likely fix: a decline gate
+("don't let this adapter capture a RequiredOuter!=0 path as a plain
+leaf"), not a clone. Separately, check `joinIsLegal`
+(joinsearchlevel.go, c9's fix target) for why a zero-predicate pairing
+was ever accepted — may be the same legality-gap class, not yet extended
+to this shape. Same private-binary SF0.25 method as c9-c13 (design doc
+§46.1: private data-dir copy, private binary, direct start bypassing the
+cgroup wrapper, temporary `joinInfoList: ctx.joinInfoList` one-liner
+re-applied locally to reach the search, reverted before commit either
+way).
 
 Gates run this loop: `go build ./...` clean (after full instrumentation
-revert). `go test ./internal/optimizer/...` PASS. No sweep/spotcheck
-needed — zero production diff this loop (pure investigation +
-documentation), so the usual planner-change gates are not applicable;
-`make ralph-state-guard` run after this write-up, see status block.
++ fix revert). `go test ./internal/optimizer/...` PASS. `make
+ralph-state-guard` ran and self-repaired a stale status/progress
+mismatch from the prior loop's clean-exit marker (see status block). No
+sweep/spotcheck needed — zero production diff this loop (pure
+investigation + a disproved-and-reverted fix attempt), so the usual
+planner-change gates are not applicable.
 
 In-flight: none. Private diagnostic binary/data/logs
-(`tmp/goopg-c12-bin`, `tmp/c12-sf025-data`, `tmp/c12-server.log`,
-`tmp/c12-q69-*`) all stopped/removed before this write-up (`tmp/` is
-gitignored regardless). All four files' temporary instrumentation
-reverted via `git checkout --` before commit; verified empty diff.
+(`tmp/goopg-c13-bin`, `tmp/c13-sf025-data`, `tmp/c13-server.log`,
+`tmp/c13-q69-*`) all stopped/removed before this write-up (`tmp/` is
+gitignored regardless). All six files' temporary instrumentation and the
+clone fix reverted via `git checkout --` before commit; verified empty
+diff (`git status --porcelain -- internal/`).

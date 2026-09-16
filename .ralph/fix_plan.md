@@ -4563,40 +4563,81 @@ cross-layer programme that has never been scoped.
     instruments reverted (`git diff --stat -- internal/optimizer/`
     empty), gates: `go build ./...` clean, `go test
     ./internal/optimizer/...` PASS.**
-- [ ] **M0142-0008a-3i-plumbing-c13 — find why `ctx.OuterRows` is EMPTY
+- [x] **M0142-0008a-3i-plumbing-c13 — find why `ctx.OuterRows` is EMPTY
   (`depth=0`) when Q69's `customer_demographics` index probe evaluates its
   `OuterColumnRef` for `c_current_cdemo_sk`, given the `*Join{Lateral:true}`
   node that probe belongs to is confirmed CORRECTLY built with
   `outer={customer,customer_address}`** (design doc §47.5, filed by c12's
-  2026-09-17 refutation). Not a relids/coordinate bug: the outer node's
-  `Output()` schema genuinely contains `c_current_cdemo_sk`
-  (`SourceTableIdx=1`) — the defect is that the executor apparently never
-  pushes a row onto `ctx.OuterRows` before this specific probe evaluates,
-  or the executor never actually reaches/opens the correctly-built node at
-  all (the tree it runs may diverge from what `createPlan` returned).
-  **Next step**: instrument the executor's lateral-outer push/pop
-  (`internal/executor`, near `operators_nljoin.go`'s
-  `nestedLoopIndexJoinOp` and the generic `bindOuter`/`lateralBindable`
-  dispatch `join_lateral_stream_test.go`'s `TestLateralAggregateOuterRef`
-  doc comment describes — a PRIOR, analogous incident, M0134-0001, where a
-  wrapped child type failed to trigger the lateral push) to print every
-  push/pop of `ctx.OuterRows` alongside the Go type of the node being
-  opened/rescanned. Reproduce Q69's crash live and determine: (a) is the
-  confirmed-correct `*Join{Lateral:true}` node ever opened/rescanned by
-  the executor at all; (b) if yes, does ITS OWN open/rescan push a row
-  before recursing into its `*IndexScan` inner, and if not, why (what sits
-  between them); (c) if the node is never reached, what post-`createPlan`
-  pass mutated/relocated it (`nlipricesplice.go` is the leading suspect,
-  given it explicitly documents operating on the FINAL tree). Same
-  private-binary SF0.25 method as c9-c12 (design doc §46.1), temporary
+  2026-09-17 refutation). **DONE 2026-09-17 (design doc §48): c13's own
+  framed question (ctx.OuterRows push-vs-diverged-tree) is ANSWERED, and
+  it is NEITHER of the two branches filed — a live stack trace
+  (`debug.PrintStack()` at the panic site) shows the crash never reaches
+  `join_lateral_stream.go`'s `openLateral`/`bindOuter` at all; it goes
+  through `join_nl_stream.go`'s `openNestedLoop` (the ordinary,
+  non-lateral, materialize-and-replay driver), which structurally never
+  touches `ctx.OuterRows`. Pointer-identity tracing (5 rounds of
+  instrumentation, reproduced identically across 2 independent process
+  runs) pins the mechanism precisely: exactly ONE call to
+  `createNestLoopIndexJoinPlan` (createplannl.go) builds the CORRECT
+  `*Join{Lateral:true}` wrapping a fresh, `OuterColumnRef`-keyed
+  `*IndexScan` (`outer={customer,customer_address}`) — but a SEPARATE
+  `*Join{Lateral:false}` (customer_demographics-alone paired with ONE of
+  Q69's three EXISTS leaves, via a `PathPrebuilt` at Path-construction
+  time, `newPrebuiltPath`/`joinsearch.go:434`) wraps the EXACT SAME
+  `*IndexScan` pointer, and THIS is the node actually embedded in the
+  executed tree. A clone-before-mutate fix (shallow-copy `is` before
+  `createNestLoopIndexJoinPlan`/`createNestLoopIndexJoinPlanFused` write
+  `.Cond`/`.Key`/`.Keys`) was implemented and live-tested: **it does NOT
+  stop the crash** — the `PathPrebuilt` resolves to the CLONE's address,
+  proving the defect is REFERENCE SHARING (something captures the
+  already-built parameterized probe as a plain per-relation leaf), not
+  in-place mutation of a shared object. Fix reverted in full. A SECOND,
+  possibly-related defect is also now visible: the winning tree splits
+  `customer_demographics` away from `customer`/`customer_address`
+  entirely, pairing it with an EXISTS leaf it has no predicate
+  relationship to at all — a join-legality gap, not just a lost-flag
+  bug. Re-filed with a concrete next instrumentation target as **c14**.
+  No production code changed this loop (clone fix fully reverted,
+  `git diff --stat -- internal/optimizer/ internal/executor/` empty).
+  Still pending (carried from c11/c12/c13, not yet actioned): fix
+  `predp.go:159-176`'s Phase B doc comment (stale/misleading "`used` is
+  therefore false on every production call today" claim).**
+- [ ] **M0142-0008a-3i-plumbing-c14 — find WHO captures Q69's
+  outer-parameterized `customer_demographics` `*IndexScan` (built by
+  `createNestLoopIndexJoinPlan`) into a PLAIN, per-relation leaf slot
+  reused by an unrelated join pairing** (design doc §48.5-48.6, filed by
+  c13's 2026-09-17 pointer-identity trace). c13 proved WHERE the
+  corrupted reference surfaces (a `PathPrebuilt(relids matching
+  customer_demographics alone)` whose `.node` equals the parameterized
+  probe, set at Path-construction time via `newPrebuiltPath`,
+  `joinsearch.go:434`, inside `buildInitialRels`) but not WHO writes it
+  there — that write happens before `createPlan`'s own tree walk starts,
+  so createPlan-side instrumentation cannot see it. **Next step**:
+  instrument `joinsearchseam.go`'s leaf-assembly path
+  (`extractSearchLeaves`, the `scans`/`leaves` construction around lines
+  624-717 per design doc §46-47's prior reading) to print, for every
+  REAL FROM-item entry (`i < nprefix`, NOT the synthetic semiAnti
+  leaves), the Go pointer/type of `scans[i]` at the moment it is
+  captured — cross-referenced against the parameterized probe's own
+  pointer (same `debug.PrintStack()`/pointer-print technique as c13) to
+  catch the exact write. The likely fix is a DECLINE GATE ("don't let
+  this adapter capture a `RequiredOuter != 0` access path as a
+  relation's plain per-item leaf"), not a clone. Separately (possibly the
+  SAME fix): instrument whichever code decided the winning tree's overall
+  relation grouping to learn why `{customer_demographics} × {one EXISTS
+  leaf}` — a pair with NO connecting predicate — was ever accepted as
+  legal; compare against `joinIsLegal` (joinsearchlevel.go, c9's fix
+  target) to check whether this is the same legality-check gap class
+  semiAnti leaves needed a fix for, not yet extended to this shape. Same
+  private-binary SF0.25 method as c9-c13 (design doc §46.1), temporary
   `joinInfoList: ctx.joinInfoList` one-liner re-applied locally to reach
   the search, reverted before commit either way. Gate before landing
   anything: `go build ./...`, `go test ./internal/optimizer/...
   ./internal/executor/...`, and a full `scripts/tpcds-sf025-regression.sh
-  sweep` with a private `GOOPG_BIN`. Also still pending (carried from c11/
-  c12, not yet actioned): fix `predp.go:159-176`'s Phase B doc comment
-  (stale/misleading "`used` is therefore false on every production call
-  today" claim).
+  sweep` with a private `GOOPG_BIN`. Also still pending (carried from
+  c11-c13, not yet actioned): fix `predp.go:159-176`'s Phase B doc
+  comment (stale/misleading "`used` is therefore false on every
+  production call today" claim).
 - [x] **M0142-0008c — scoping recon: does goopg need PG's `create_unique_path`
   (semi-join → de-duplicate RHS + inner join) to reach parity on TPC-DS
   Q10/Q35?** — filed by M0142-0008a-3(iii)'s §4.3 gate re-run (design doc §6).

@@ -5910,3 +5910,211 @@ empty). The private binary, SF0.25 data copy, and server log
 (`tmp/goopg-c12-bin`, `tmp/c12-sf025-data`, `tmp/c12-server.log`, and the
 `tmp/c12-q69-*` query/output scratch files) were all removed before this
 write-up.
+
+## 48. c13 — §47.5's own question ANSWERED, by pointer identity, and it is
+NEITHER of the two branches §47.5 predicted; a tentative shared-node fix
+was tried and DISPROVED, narrowing the real defect to the join-order
+search itself
+
+### 48.1 Method
+
+Same private-binary SF0.25 technique as §46-47 (fresh copy of
+`bench/tpcds/runtime_goopg/data-sf025`, private binary, direct start
+bypassing the cgroup wrapper, the `joinInfoList: ctx.joinInfoList`
+one-liner re-applied locally in `joinsearchseam.go` to reach the search —
+all reverted before commit). Five rounds of temporary (all reverted)
+instrumentation, each answering exactly the question §47.5 posed and then
+one more it did not anticipate:
+
+1. `debug.PrintStack()` at the `expr.go:472` `OuterColumnRef` panic site
+   (gated) — got the exact Go call stack for the live crash instead of
+   guessing from the error text.
+2. A print in `joinOp.Open` (`operators_join_agg.go`) of `o.plan`'s
+   pointer, `Type`/`Algo`/`Lateral`, and `Right`'s Go type + pointer.
+3. A print in `createNestLoopPlan` (`createplannl.go`) at BOTH of its
+   dispatch branches (the NLI arm and the "plain nested loop" arm),
+   showing which one a given call took and the child Path's
+   kind/relids/`RequiredOuter`.
+4. A print of the built `*Join`'s own pointer, `.Lateral`, and its
+   `Right`'s pointer, right where `createNestLoopIndexJoinPlan`'s
+   decomposed arm constructs it (`j := &Join{...}`, createplannl.go:374).
+5. A print at the TOP of `createPlanNodeUnpriced` (`createplan.go`), for
+   EVERY Path translated during the run, showing the Path's own pointer,
+   `Kind`, `relids`, `RequiredOuter`, and (on exit) the produced Node's
+   pointer and Go type — a complete, ordered ledger of every
+   Path→Node translation `createPlan` performs for one query.
+
+### 48.2 §47.5's own two predictions are BOTH wrong
+
+§47.5 framed the resume point as a binary choice: (a) the correctly-built
+`*Join{Lateral:true}` node is never reached by the executor at all
+(implicating a post-`createPlan` mutation pass, `nlipricesplice.go` named
+as the leading suspect), or (b) it is reached but its own
+`bindOuter`/lateral-dispatch fails to push `ctx.OuterRows` (an
+M0134-0001-style gap). The stack trace from instrument 1 refutes both in
+one shot:
+
+```
+expr.go:481                          (OuterColumnRef panic)
+operators_index.go:968               (indexScanOp.lookupKey)
+operators_index.go:496               (Rescan)
+operators_index.go:324               (BindOuter call site)
+join_nl_stream.go:104                (openNestedLoop: o.right.Open)
+operators_join_agg.go:428            (joinOp.Open → openNestedLoop(ctx,true), the UNIVERSAL FALLBACK)
+join_nl_stream.go:101                (openNestedLoop: o.left.Open, ONE LEVEL UP)
+operators_join_agg.go:428            (a SECOND joinOp.Open → same fallback)
+```
+
+The crash is inside `join_nl_stream.go`'s `openNestedLoop` — the
+MATERIALIZE-AND-REPLAY driver for an ordinary (non-lateral) nested loop
+— not inside `join_lateral_stream.go`'s `openLateral` at all.
+`openNestedLoop` never touches `ctx.OuterRows` (confirmed by grep: zero
+references in that file), and it opens its `Right` child exactly ONCE,
+then replays a materialized cache per outer row — a driver that is
+*structurally* incompatible with a parameterized inner, independent of
+whether `ctx.OuterRows` gets pushed. Instrument 2 confirmed the specific
+node: `type=Inner algo=NestedLoop lateral=FALSE rightType=*optimizer.IndexScan
+rightKeyType=*optimizer.OuterColumnRef` — i.e. a `*Join` with `Lateral`
+at its Go zero value wraps an `*IndexScan` whose `Key` is exactly the
+node type only `outerParamKey` (createplannl.go, ONE call site,
+confirmed by grep) ever produces. `nlipricesplice.go` never constructs or
+mutates a `*optimizer.Join` at all (only `*NestedLoopIndexJoin` — grep
+confirmed) — §47.3's suspicion of it was unfounded for this bug.
+
+### 48.3 The real question: how does a `Lateral:true`-shaped inner end up wrapped by a `Lateral:false` `*Join`
+
+Instruments 3-5 pinned this by POINTER IDENTITY, run twice (two
+independent process runs, two independently-ASLR'd address spaces, same
+result both times — ruling out a Go GC address-reuse coincidence):
+
+- `createNestLoopPlan` is called exactly 3 times for Q69's crashing run.
+  Exactly ONE call takes the NLI branch: `Children[1]` is a fresh
+  `PathIndexScan` (`RequiredOuter=0x1`, the customer relation),
+  `Children[0]`'s relids are `0x3` (`{customer, customer_address}`).
+  This call's `createNestLoopIndexJoinPlan` builds `is := &IndexScan{...}`
+  FRESH (confirmed by reading `createIndexScanPlan`: `is := &IndexScan{...}`
+  is a bare struct literal every call, never a cache lookup) and wraps it
+  correctly: `j := &Join{... Lateral: true, Right: is ...}`. This `j` is
+  the ONLY place in the whole call graph that ever constructs a `*Join`
+  wrapping an `OuterColumnRef`-keyed `*IndexScan` with `Lateral: true` —
+  and it is provably correct.
+- One of the other two `createNestLoopPlan` calls takes the "plain nested
+  loop" branch with `Children[1].Kind == PathPrebuilt` (`RequiredOuter=0`,
+  relids `0x4` — customer_demographics ALONE, not the `{c,ca,cd}` trio).
+  Per instrument 5, THIS Path's `createPlanNodeUnpriced` call hits the
+  `case PathPrebuilt: return p.node, ...` shortcut and returns `p.node`
+  **byte-identical, by pointer, to the SAME `is`** the NLI branch built
+  moments earlier (both runs: exact address match). `PathPrebuilt.node`
+  is set exactly once, at Path construction (`newPrebuiltPath`, grepped —
+  the only site that ever assigns the private `node` field; no setter
+  method exists), so this Path was built by wrapping the ALREADY-BUILT,
+  OUTER-PARAMETERIZED `is` as if it were a plain, standalone leaf for
+  customer_demographics — the exact opposite of what an `OuterColumnRef`
+  key requires.
+- This "plain" `*Join` (customer_demographics-alone ⋈ one of the
+  store_sales/web_sales/catalog_sales EXISTS leaves, via a NestedLoop with
+  **no join predicate connecting them at all** — Q69 has no relationship
+  between `customer_demographics` and any of the three EXISTS subqueries)
+  is not a discarded cost-comparison candidate: it is embedded in the
+  FINAL, EXECUTED tree (confirmed: its address matches `C13JOINOPEN`'s
+  crash-adjacent line exactly). Separately, `customer` and
+  `customer_address` (bits 0/1) reappear LATER in the tree, joined to the
+  *other* two EXISTS leaves — i.e. **the winning plan splits
+  `customer_demographics` away from `customer`/`customer_address`
+  entirely**, which is already wrong independent of the `Lateral` bug:
+  `cd`'s only predicate (`cd_demo_sk = c.c_current_cdemo_sk`) requires
+  `customer`, and pairing it with an EXISTS leaf instead is a
+  join-LEGALITY defect, not merely a lost-flag defect.
+
+### 48.4 A clone-before-mutate fix was tried and did NOT stop the sharing — ruling out the leading theory
+
+The natural read of §48.3 is "shared mutable node, in-place `is.Key`
+mutation corrupts a cache" — `createNestLoopIndexJoinPlan`'s own comment
+even asserts the (now-falsified) invariant: *"The probe rebuilt by
+`createIndexScanPlan` is a fresh node this arm owns... so setting Cond
+here cannot disturb the leaf the search still references by pointer."*
+This loop tried the direct fix: shallow-clone `is` (`isCopy := *is; is =
+&isCopy`) before any field mutation, in both `createNestLoopIndexJoinPlan`
+and its `createNestLoopIndexJoinPlanFused` sibling (same pattern, same
+risk). Rebuilt, re-ran the identical live repro: **Q69 still crashes,
+identically**, and instrument 5's pointer ledger shows the "plain"
+`PathPrebuilt(relids=0x4)` now resolves to the CLONE's address, not the
+pre-clone original — i.e. the PathPrebuilt genuinely captures a reference
+to whatever `createNestLoopIndexJoinPlan` returns, clone or not; nothing
+about `is` being freshly allocated stops a SEPARATE piece of code from
+independently deciding to treat that returned reference as a reusable
+plain leaf. Mutation was never the mechanism — REFERENCE SHARING is, and
+cloning the mutated object doesn't touch the sharing. The fix was
+reverted in full (`git diff --stat -- internal/optimizer/ internal/executor/`
+empty, confirmed).
+
+### 48.5 Where the real defect must live — narrowed but not pinned
+
+`PathPrebuilt.node` for the customer_demographics-alone Path is set at
+Path-construction time, before `createPlan` ever runs on the winning
+tree — meaning some part of the SEARCH itself (not `createPlan`) already
+called into `createNestLoopIndexJoinPlan`'s machinery once, during path
+exploration/costing, and fed the result into `newPrebuiltPath` for
+relids `0x4`. `newPrebuiltPath`'s only OTHER call site relevant here is
+`joinsearch.go:434`, inside `buildInitialRels` — which builds it from
+`scans[i]`, an ALREADY-BUILT-Node input parameter, once per relation, at
+DP-search bootstrap (`rel.baseLeaf = leaf` right above it, same
+function). `scans[]` itself is populated by whatever assembles the
+FROM-item leaf list before the search runs — for Q69's flat
+`FROM customer c, customer_address, customer_demographics` (no explicit
+join syntax), this is almost certainly `joinsearchseam.go`'s semiAnti
+adapter (`extractSearchLeaves`/`leaves[i] = scans[i]` for `i < nprefix`,
+§46-47's whole subject), which is the one piece of code in this whole
+call graph already known (c9-c12) to build SYNTHETIC structure around the
+real FROM-item leaves for this exact query shape. The exact site that
+captures `is`(customer_demographics' outer-parameterized probe) into
+`scans[]`'s plain per-relation slot is NOT YET FOUND — §48.1's
+instrument 5 proves WHERE the corrupted reference surfaces
+(`PathPrebuilt` at Path-construction time) but not WHO writes it there,
+since that write happens before the traced `createPlanNodeUnpriced` walk
+begins.
+
+A second, independent defect is now visible alongside the sharing bug
+(§48.3's last bullet): the winning tree pairs `customer_demographics`
+with an EXISTS leaf it has NO predicate relationship to, while
+`customer`/`customer_address` end up elsewhither in the same tree — a
+join-order/legality bug, not merely a lost-Lateral-flag bug. Fixing the
+`Lateral` propagation alone (even if the sharing site were found and
+fixed) would not by itself make this pairing sensible; both need
+resolving, and it is not yet established whether they share one root
+cause or are two independent defects that happen to compound on the same
+query.
+
+### 48.6 c14 — next step
+
+Instrument `joinsearchseam.go`'s leaf-assembly path (`extractSearchLeaves`,
+the `scans`/`leaves` construction around lines 624-717 per §46-47's prior
+reading) to print, for EVERY entry `i < nprefix` (the REAL FROM items,
+not the synthetic semiAnti leaves), the Go pointer and type of
+`scans[i]` at the moment it is captured into `leaves[i]`/handed to
+`buildInitialRels`. Cross-reference against §48's `is` pointer (rebuild
+with `debug.PrintStack()` still armed, or a simpler one-line print,
+gated by a fresh env var) to catch the EXACT write that puts the
+outer-parameterized probe into the plain per-relation leaf slot for
+customer_demographics. Once found, the fix is almost certainly "don't let
+this adapter build/capture a parameterized (`RequiredOuter != 0`) access
+path as a relation's plain per-item leaf" — a decline-gate, not a
+clone. Separately, and possibly as the SAME fix: instrument whichever
+code decides the winning tree's overall relation grouping (the DP level
+that chose `{customer_demographics} × {one EXISTS leaf}` as a pairing) to
+learn why a pair with NO connecting predicate and no shared relset
+lineage was ever considered legal — compare against `joinIsLegal`
+(joinsearchlevel.go, c9's own fix target) to see whether this is the
+SAME class of legality-check gap semiAnti leaves already needed one
+fix for (c9), just not yet extended to cover this shape. Same
+private-binary SF0.25 method as §46-48 (temporary `joinInfoList:
+ctx.joinInfoList` one-liner, reverted either way). Gate before landing
+anything: `go build ./...`, `go test ./internal/optimizer/...
+./internal/executor/...`, and a full `scripts/tpcds-sf025-regression.sh
+sweep` with a private `GOOPG_BIN`.
+
+No production code changed this loop — the clone fix (§48.4) was fully
+reverted after live-testing disproved it (`git diff --stat --
+internal/optimizer/ internal/executor/` empty, confirmed). Private
+binary/data/logs (`tmp/goopg-c13-bin`, `tmp/c13-sf025-data`,
+`tmp/c13-server.log`, `tmp/c13-q69-*`) removed before this write-up.
