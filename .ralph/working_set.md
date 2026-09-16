@@ -1,78 +1,67 @@
-Task: M0142-0008a-3i-plumbing-recon3 (DONE this loop) — a design recon that
-corrects the -3i-plumbing task's own decomposition before any DP-search code
-lands. No production code changed.
+Task: M0142-0008a-3i-plumbing, item 1 of design doc §14.3 (probe landed this
+loop) — item 2's "parallel type vs shared type" question is now DECIDED by
+live evidence. Items 3-5 remain open and still not sized for one loop.
 
-Files this loop: docs/design/0100-0149/m0142-0008a-1-semi-anti-sji-design.md
-(§14 added), docs/design/README.md (index row extended), .ralph/fix_plan.md
-(M0142-0008a-3i-plumbing-recon3 filed+checked, M0142-0008a-3i-plumbing
-rescoped). Committed together with this file.
+Files this loop: internal/optimizer/m0142_0008a_3i_plumbing_probe_test.go
+(NEW — throwaway probe, no production diff), docs/design/0100-0149/
+m0142-0008a-1-semi-anti-sji-design.md (§15 added), docs/design/README.md
+(index row extended), .ralph/fix_plan.md (M0142-0008a-3i-plumbing bullet
+updated in place, still unchecked), .ralph/deferral_ledger.md (new row
+M0142-0008a-3i-plumbing-probe1).
 
-Key symbols: `extractSearchLeaves` (joinsearchseam.go:1071, the walk closure
-at :1104-1191 — type test at :1110, Left/Right admission branch at
-:1116-1170 building `outerChainLink`), `reresolveJoinByName`
-(joinlayout.go:623 — re-resolves an ALREADY-PLACED join in place, cannot
-relocate one), `runJoinSearchBelowPinned` (predp.go:73 — the splice model
-this recon found cannot reach PG's Q69 shape no matter how it's extended),
-`rangeBinding`/`rangeBinding.table` (planner.go:549, *catalog.Table
-dereferenced unconditionally dozens of times in planner.go — this is why
-appending x.Right as a bare struct is unsafe), `baseRelInfo.table`
-(cardinality.go:694, a SEPARATE field, already nil-safe everywhere:
-joinsearch.go:403/480, joinrelsize.go:638, relfromjoinlist.go:233/546),
-`problemPairsOuterWithDerived` (relfromjoinlist.go:564 — the Q78
-catastrophic-mis-costing firewall; confirmed it skips Semi/Anti entirely,
-`:589-593`), `existsUnnestSJInfo` (unnest.go:4398, throwaway 2-bit numbering
-still waiting for admission-time real bits).
+Key symbols: `extractSearchLeavesAdmitSemiAnti` (the probe file's local copy
+of `extractSearchLeaves`, joinsearchseam.go:1070 — copied not edited),
+`outerChainLink`/`outerOnQualsOK` (joinsearchseam.go:1283/927 — the existing
+consumer that DECLINES a Semi/Anti link with nullable=0, live-confirmed),
+`deriveOuterLinkConstants` (joinsearchseam.go:832 — the reason nullable
+cannot just be re-encoded to the RHS range: its whole correctness argument
+is NULL-extension, which Semi/Anti has none of), `problemPairsOuterWithDerived`
+(relfromjoinlist.go:563 — confirmed LIVE, not just re-read, to skip Semi/Anti
+`SpecialJoinInfo` values via `default: continue`), `existsUnnestSJInfo`
+(unnest.go:4397 — used in the probe to build a real SpecialJoinInfo rather
+than a hand-rolled one).
 
-Hypothesis/Findings: §12.4's own "(a) append x.Right to bindings/relInfos,
-(b) SJInfo bookkeeping, (c) fix the post-search splice" decomposition is
-WRONG-LAYERED, not just under-verified. Three findings, all live-code-cited
-(design doc §14): (1) x.Right cannot become a rangeBinding by bare append —
-needs the same synthetic-&catalog.Table{} pattern every derived-table/CTE
-leaf already uses (planner.go has ~15 examples); this part is buildable and
-cheap once done right. (2) The REAL blocker is one layer up:
-reresolveJoinByName only patches an already-placed join's predicate; it
-cannot relocate the join or let the search build a new Semi/Anti node at a
-chosen position, so (a)+(b)+(c) built on runJoinSearchBelowPinned's splice
-model can NEVER reach an interleaved shape like PG's real Q69 plan (Semi
-Join low in the tree, two Anti Joins stacked above it, not beside it) — the
-pin itself is the obstacle. (3) goopg already has the right mechanism for
-the sibling LEFT/RIGHT case: extractSearchLeaves's existing chain ADMISSION
-(flatten both sides into the ordinary leaf list, record a link struct, let
-the search's own join_is_legal-fed legality machinery place the join) is
-the actual S5b reopening mechanism — reuses ~90% of already-tested
-outer-join-admission infrastructure instead of (b)/(c)'s from-scratch
-bookkeeping+splice-repair. This is bigger than §12.4 estimated (touches
-extractSearchLeaves, a function 3 past C-04-series silent-regression fixes
-already hardened) — correctly not sized for one loop, hence recon-only again
-this loop rather than coding blind into the highest-risk subsystem in the
-project's history.
+Hypothesis/Findings: (1) leaf-list prediction from §14.3 item 1 held exactly
+(2 leaves: t1, RHS *Project as one opaque leaf) — zero surprises. (2) On the
+FINAL planned tree, a hash-keyed Semi/Anti's correlation lives in
+(j.LeftKey, j.RightKey), not j.Predicate (came back nil) — a probe-only
+artifact of inspecting the post-method-selection tree rather than predp.go's
+real pre-search origChain; reconstructed via a BinaryOp for the probe only.
+(3) Item 2 DECIDED: build a genuinely separate `semiAntiChainLink` type with
+its own legality consumers, NOT a Jointype-discriminated outerChainLink.
+Evidence: nullable=0 gets an unconditional `outerOnQualsOK` decline
+(relids-subset check fails on a well-formed link); the alternative of
+encoding nullable=RHS-range to satisfy that arithmetic would make
+`deriveOuterLinkConstants` silently apply NULL-extension reasoning to a join
+type that has none — a correctness trap, not a workaround. (4) NEW safety
+finding, ledgered: `problemPairsOuterWithDerived` (Q78 firewall) has ZERO
+Semi/Anti coverage today, live-confirmed with a real existsUnnestSJInfo
+value. Items 3-5 (admitting a real Semi/Anti link into production search)
+MUST add this firewall's Semi/Anti arm in the same change, not after —
+`take3-C-04a-Q78-firewall-classifier` (deferral ledger) is the cautionary
+precedent for what happens when that's deferred.
 
-Next step: M0142-0008a-3i-plumbing (rescoped, still open) — per design doc
-§14.3's 5-item plan: (1) a throwaway probe (style of §13's
-m0142_0008a_3i_verify_probe_test.go) against the Q69 fixture that extends
-extractSearchLeaves's type test (joinsearchseam.go:1110) LOCALLY in a test
-file to admit JoinTypeSemi/JoinTypeAnti, descending both sides the way
-Left/Right already do, confirming the flattened leaf list matches
-prediction and checking whether outerChainLink's existing consumers
-(outerOnQualsOK, deriveOuterLinkConstants, problemPairsOuterWithDerived)
-choke on a link with empty `nullable` bits; (2) decide new
-`semiAntiChainLink` type vs. a Jointype field on the existing
-`outerChainLink`; (3) rebuild existsUnnestSJInfo's real RelSet bits at
-admission time via leafRangeRelSet; (4) retire
-runJoinSearchBelowPinned's splice for the now-admitted cases (this is what
-resolves the old (c) — no separate splice-repair needed once the search
-places the join itself); (5) reduceOuterJoins's LEFT->ANTI demotion is
-existing, live, production precedent that a real Semi/Anti SpecialJoinInfo
-in ctx.joinInfoList already works with the ordinary search's legality
-checks today — corroborating, not a drop-in. Alternatives if this is
-blocked or judged still too large: M0142-0008c (create_unique_path scoping,
-independent, same census, has a concrete PG-source resume point) or
-M0142-0005 (per-worker Memoize scoping, independent, needs its own
-scoping/floor-measurement pass per its own filing) are both open and
-unblocked. M0142-0003i/0003k remain BLOCKED on a human-authorized shared
-`:65433` cluster reload — do not attempt.
+Next step: M0142-0008a-3i-plumbing items 3-5 (still open, still spans three
+subsystems — extractSearchLeaves's PRODUCTION walk, existsUnnestSJInfo, and
+predp.go's splice retirement — so still not sized for a single loop): (3)
+define `semiAntiChainLink` (LHS/RHS RelSet, Jointype, pred — no
+preserved/nullable fields) and its own `semiAntiOnQualsOK`/
+`semiAntiLinksHaveSJInfos` consumers mirroring the outer ones' RelSet-subset
+reasoning minus every NULL-extension branch; (4) actually extend PRODUCTION
+`extractSearchLeaves` (joinsearchseam.go:1110) to admit JoinTypeSemi/Anti
+using the probe's now-validated shape; (5) rebuild `existsUnnestSJInfo`'s
+throwaway synL=1/synR=2 numbering with real leafRangeRelSet bits at
+admission time, add the firewall's Semi/Anti arm in the SAME change, and
+retire runJoinSearchBelowPinned's splice for admitted cases. Alternatives if
+still judged too large: M0142-0008c (create_unique_path scoping, independent,
+concrete PG-source resume point) or M0142-0005 (per-worker Memoize scoping,
+independent) are both open and unblocked. M0142-0003i/0003k remain BLOCKED
+on a human-authorized shared `:65433` cluster reload — do not attempt.
 
-Gates run: none needed (docs/plan-file-only change, no production code
-touched). `make ralph-state-guard` run before finishing (see status block).
+Gates run: `go build ./...` (clean), `go test ./internal/optimizer/...`
+(PASS, 2.8s, includes the new probe test), `gofmt -l` on the new file (clean,
+no diff). `make ralph-state-guard` run before finishing — found a stale
+status/progress mismatch from the previous loop's clean-exit marker,
+auto-repaired to in_progress, then consistent (see status block).
 
 In-flight: none.

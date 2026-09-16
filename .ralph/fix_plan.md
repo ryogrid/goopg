@@ -3590,18 +3590,31 @@ cross-layer programme that has never been scoped.
   - [ ] **M0142-0008a-3i-plumbing — extend `extractSearchLeaves` to admit
     Semi/Anti as a chain participant (rescoped by -recon3, design doc
     §14.3)** — RESCOPED 2026-09-16, no longer the RelOptInfo-append shape
-    the original filing described. Concrete next step per §14.3: a
-    throwaway probe (style of §13) against Q69 that extends
-    `extractSearchLeaves`'s type test (`joinsearchseam.go:1110`) LOCALLY in
-    a test file to also admit `JoinTypeSemi`/`JoinTypeAnti`, descending both
-    sides the way Left/Right already do, and checks (i) the flattened leaf
-    list matches §14.3 item 1's prediction and (ii) whether the existing
-    `outerChainLink` consumers (`outerOnQualsOK`, `deriveOuterLinkConstants`,
-    `problemPairsOuterWithDerived`) choke on a link with empty `nullable`
-    bits — before deciding §14.3 item 2's "new `semiAntiChainLink` type vs.
-    a `Jointype` field on the existing one" question. Only after that:
+    the original filing described. **Item 1 landed 2026-09-16 as a probe,
+    item 2 now DECIDED by live evidence (design doc §15,
+    `internal/optimizer/m0142_0008a_3i_plumbing_probe_test.go`,
+    `.ralph/deferral_ledger.md` row `M0142-0008a-3i-plumbing-probe1`)** — no
+    production code changed. Findings: (1) the flattened-leaf-list
+    prediction held exactly (2 leaves: `t1`, RHS `*Project` as one opaque
+    leaf); (2) feeding a `nullable=0` link to `outerOnQualsOK` gets an
+    unconditional decline (relids-subset check fails, live-confirmed), and
+    the tempting fix — encode `nullable` as the RHS range instead, purely to
+    satisfy that arithmetic — would make `deriveOuterLinkConstants` silently
+    apply NULL-extension reasoning to a join type that has none in either
+    direction, a correctness trap rather than a workaround; **decided:
+    build a genuinely separate `semiAntiChainLink` type with its own
+    legality consumers, not a `Jointype`-discriminated `outerChainLink`**;
+    (3) `problemPairsOuterWithDerived` (the Q78 firewall) already ignores
+    Semi/Anti `SpecialJoinInfo` values, live-value-confirmed (not just
+    re-read from §12.2) — **new safety requirement for items 3-5**: add this
+    firewall's Semi/Anti arm in the SAME change that first admits a real
+    Semi/Anti link, not as a follow-up (ledger row cites
+    `take3-C-04a-Q78-firewall-classifier` as the cautionary precedent for
+    deferring it). Remaining, still open and still not sized for one loop:
     rebuild `existsUnnestSJInfo`'s throwaway 2-bit numbering with real
-    `leafRangeRelSet` bits at admission time (item 3), and retire
+    `leafRangeRelSet` bits at admission time (item 3), define
+    `semiAntiChainLink` + `semiAntiOnQualsOK`/`semiAntiLinksHaveSJInfos`
+    (item 2's now-settled shape) and wire the firewall arm, and retire
     `runJoinSearchBelowPinned`'s splice for the now-admitted cases (item 4;
     this is what resolves the old (c) — there is no separate splice-repair
     step once the join is placed BY the search). Precedent that a live

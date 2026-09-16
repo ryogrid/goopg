@@ -1356,3 +1356,120 @@ confirms it produces the flattened leaf list step 1 predicts, and checks
 whether the existing `outerChainLink` consumers choke on a link with no
 `nullable` bits set (empty `RelSet`) before deciding step 2's "parallel type
 vs. shared type" question.
+
+## 15. M0142-0008a-3i-plumbing item 1 — live probe run: item 2's question is
+now answered by evidence, not speculation (2026-09-16)
+
+`internal/optimizer/m0142_0008a_3i_plumbing_probe_test.go`
+(`TestM0142_0008a_3iPlumbing_AdmitSemiAnti`) copies `extractSearchLeaves`'s
+walk into a local, throwaway function extended to admit
+`JoinTypeSemi`/`JoinTypeAnti` (§14.3 item 1) and runs it against the same
+Q69-witness-class fixture §13 used. Production code
+(`joinsearchseam.go`) is unchanged. Three findings:
+
+**(0) Representation correction, orthogonal to §14.3's own claim.** On the
+FINAL planned tree (post join-method selection, which is the only tree this
+probe file's helpers can reach — `predp.go`'s real call site runs on the
+PRE-search `origChain`, where `j.Predicate` is always populated), a
+hash-keyed Semi/Anti join's correlation is `(j.LeftKey, j.RightKey)`, not
+`j.Predicate` — `j.Predicate` came back `nil` for this fixture. The probe
+reconstructs `pred = &BinaryOp{Op: OpEq, Left: j.LeftKey, Right: j.RightKey}`
+when `Predicate == nil`; this reconstruction is a probe-only artifact of
+inspecting the wrong tree stage, not a new production gap (`origChain` still
+carries `Predicate` directly, as the original Left/Right code this walk was
+copied from already assumes).
+
+**(1) Leaf-list prediction confirmed exactly.** `extractSearchLeavesAdmitSemiAnti(j)`
+on the Semi join returns exactly 2 leaves — `t1` and the RHS `*Project` as
+one opaque leaf — `onQuals` empty, and `outer` holding exactly one link for
+the Semi join itself, matching §14.3 item 1's prediction with zero surprises.
+(Aside, not chased further: the RHS `*Project`'s own `Output()` width came
+back 4, not the `SELECT 1` body's apparent width of 1 — the unnest rewrite
+evidently threads extra columns through the body's projection that this
+probe did not need to explain to answer item 2.)
+
+**(2) Item 2 decided: a genuinely separate type, not a `Jointype`-discriminated
+`outerChainLink`.** The probe builds the link with the literal reading
+`nullable: 0` (Semi/Anti never null-extends — RHS is invisible above the join
+either way) and feeds it to all three existing consumers named in §14.3's own
+resume point:
+
+- `outerOnQualsOK` returns **false** — CONFIRMED, not merely predicted. Its
+  `relsSubset(rs, lk.preserved|lk.nullable)` check requires every conjunct's
+  relids to fit inside `preserved|nullable`; with `nullable=0`,
+  `preserved|nullable` is the LHS leaf alone, but the correlation predicate's
+  relids span BOTH the LHS leaf and the RHS opaque leaf (`pred relids = 3`
+  against `cumOffsets = [0 1 5]` in the probe's log) — so a well-formed
+  Semi/Anti link is unconditionally declined by this consumer as written.
+  The declination is not a bug in `outerOnQualsOK`: that function's contract
+  is specifically about *outer-join* qual placement (which side may read
+  which columns without breaking NULL-extension semantics), a question that
+  does not exist for Semi/Anti.
+- `deriveOuterLinkConstants` returns **nil** for the same link — a silent
+  no-op (not a crash), because every branch requires
+  `relsSubset(rb, lk.nullable)` for the "null-extended" operand and
+  `nullable=0` makes that provable only when `rb==0` too. Silent-no-op is
+  survivable but wrong at the SEMANTIC level, not just the mechanical one:
+  this function's entire premise is "a constant known on the *preserved*
+  side can be pushed onto the *nullable* side because outer-join NULL-
+  extension is the only way the pushed equality could fail" — Semi/Anti has
+  no NULL-extension at all, so the function's reasoning does not apply in
+  either direction, empty-nullable or not. Feeding it a Semi/Anti link is
+  answering a question it was not designed to answer, regardless of the
+  encoding chosen for `nullable`.
+- `problemPairsOuterWithDerived` (which takes `[]*SpecialJoinInfo`, not
+  `[]outerChainLink`) declines to flag a real `existsUnnestSJInfo`-built
+  Semi `SpecialJoinInfo` at all — CONFIRMED live, not merely re-read: its
+  `switch sj.Jointype { case parser.JoinLeft, parser.JoinRight,
+  parser.JoinFull: default: continue }` skips Semi/Anti unconditionally, the
+  same finding §12.2 made from static reading, now reproduced against a real
+  value the unnest rewrite actually builds.
+
+**Decision, superseding §14.3 item 2's open question**: build a **separate**
+`semiAntiChainLink` type (LHS `RelSet`, RHS `RelSet`, `Jointype`, `pred` —
+no `preserved`/`nullable` fields at all, since neither concept is meaningful)
+with its **own** legality/costing consumers, rather than a `Jointype`-
+discriminated `outerChainLink`. The evidence is not merely that the existing
+consumers happen to reject `nullable=0` mechanically (§12.4/§14.3 might have
+read that as "encode `nullable` as the RHS range instead, so the subset
+check passes") — it is that `deriveOuterLinkConstants`'s CORRECTNESS
+argument is built entirely on NULL-extension, which has no Semi/Anti
+analogue in either direction. Encoding `nullable = RHS range` to satisfy
+`outerOnQualsOK`'s arithmetic would make `deriveOuterLinkConstants` and any
+other current or future `outerChainLink` consumer that reasons about
+"nullable = may read NULL through this join" silently apply outer-join logic
+to a join type that cannot produce a NULL-extended row — a correctness trap
+waiting for the next consumer added to that struct's already-long list,
+not merely a missed case in the two consumers this probe exercised.
+
+**New safety finding for -3i-plumbing's remaining items (3-5), not previously
+ledgered**: `problemPairsOuterWithDerived` — the Q78 catastrophic-mis-costing
+firewall — has **zero** Semi/Anti coverage today (confirmed live, above).
+Admitting Semi/Anti into the chain-flattening search (items 3-5) creates
+exactly the shape that firewall exists to catch: a derived/CTE-sourced
+relation joined through a special join type with a rows≈1 estimate that can
+win an epsilon cost tie it should not. Recorded as a resume-point-bearing
+deferral (`.ralph/deferral_ledger.md`, `M0142-0008a-3i-plumbing-probe1` row)
+rather than left as an implicit assumption — a Semi/Anti arm for this
+firewall (or an explicit argument that Semi/Anti's `RHS` classification
+already makes it moot) belongs BEFORE items 3-5 admit real Semi/Anti links
+into production search, not after a regression surfaces the gap the way
+`take3-C-04a-Q78-firewall-classifier` did for the LEFT/RIGHT case.
+
+**Revised resume point**: -3i-plumbing's items 3-5 (rebuild
+`existsUnnestSJInfo`'s real `RelSet` bits at admission time, retire
+`runJoinSearchBelowPinned`'s splice for admitted cases, cite
+`reduceOuterJoins`'s precedent) now have a settled item-2 answer to build on:
+define `semiAntiChainLink` and its own `semiAntiLinksHaveSJInfos`/
+`semiAntiOnQualsOK`-shaped legality consumers (mirroring `outerLinksHaveSJInfos`/
+`outerOnQualsOK`'s STRUCTURE — same `RelSet`-subset reasoning for "does this
+predicate connect exactly the LHS and RHS ranges" — but dropping every
+NULL-extension-specific branch, since Semi/Anti's contract is simply
+"a valid equi-correlation between two disjoint RelSets," a strict subset of
+what the outer-join consumers must reason about). Add
+`problemPairsOuterWithDerived`'s Semi/Anti arm in the SAME change that first
+admits a real Semi/Anti link into the search, not as a follow-up. Not sized
+for one loop on its own — items 3-5 still touch `extractSearchLeaves`'s
+production walk, `existsUnnestSJInfo`, and `predp.go`'s splice retirement
+together, the same three-subsystem span that made -recon3 defer whole-cloth
+implementation before this loop's probe.
