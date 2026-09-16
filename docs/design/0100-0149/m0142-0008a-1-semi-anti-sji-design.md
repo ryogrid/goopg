@@ -1166,3 +1166,193 @@ already handle a `*Project` leaf identically to a `*SeqScan`/`*Join` one? —
 §12.2 says yes for "any wrapped Node kind" but that claim was itself a static
 read and this loop's lesson is: verify claims like that live, not by
 re-reading).
+
+## 14. M0142-0008a-3i-plumbing-recon3 — §12.4's (a)/(b)/(c) decomposition is
+the wrong layer; the real mechanism is chain ADMISSION, not spine splicing
+(2026-09-16)
+
+**No production code changed. Design-only, following the same discipline as
+§11/§12/§13.** Filed as a correction while scoping -3i-plumbing's actual
+implementation, before writing any DP-search code (the task's own working-set
+handoff flagged §12.2's "any wrapped Node kind" claim as unverified and asked
+for live re-verification of point (a) specifically — this recon instead found
+a structural problem one layer up that makes (a) as literally described
+unbuildable, and identifies the mechanism that IS buildable).
+
+### 14.1 §12.4's (a) is not representable: `x.Right` cannot become a
+`rangeBinding`
+
+§12.4 (a) reads "build a `RelOptInfo`/`baseRelInfo` entry for `x.Right` …
+and append it to `bindings`/`relInfos`". `bindings` is `[]rangeBinding`
+(`planner.go:549`), and `rangeBinding.table` is a `*catalog.Table` —
+dereferenced **unconditionally, dozens of times**, by the statement-wide
+column-resolution/star-expansion/diagnostic code in `planner.go` (e.g.
+`:1296-1299`, `:2603`, `:4651`, `:6648-6655`, `:7825`, `:9278`, `:15810-15928`
+— none of these nil-check `b.table` first). `ctx.bindings` is the **one**
+range-table list for the whole statement, read by all of that code, so any
+literal read of "append to `bindings`" that mutates `ctx.bindings` itself
+would plant a `nil`-table entry that the very next `SELECT *` or ambiguous-
+column diagnostic elsewhere in the same statement dereferences and panics
+on — not a hypothetical, `x.Right` genuinely has no single backing
+`*catalog.Table` (it is `unnestExistsExpr`'s already-planned `Project(Join(t2,
+t3))` subtree per §13).
+
+This is not fatal on its own: the codebase already has the fix for exactly
+this shape, used dozens of times for FROM-subqueries/CTEs/derived tables
+(`planner.go:4707,4817,4861,5570,5906,5970,6030,…`, one per derived-table
+kind) — synthesize `tbl := &catalog.Table{Name: alias, Columns: cols}` from
+the leaf's own output schema and use that as `rangeBinding.table`, so every
+statement-wide consumer keeps working. `with.go`'s CTE bindings do precisely
+this (cited by name at `relfromjoinlist.go:513-514`). **So (a) is buildable,
+but only via this synthesis, not via a bare append of an ad hoc struct** —
+worth stating explicitly since §12.4's phrasing reads like the append is the
+whole step.
+
+Two things make this reuse safer than it first looks, both already true in
+production and unrelated to this task:
+
+- `baseRelInfo.table` (a **separate** field from `rangeBinding.table`,
+  `cardinality.go:694`) is independently nil-safe everywhere it is read
+  inside the search's own cost machinery (`joinsearch.go:403,480`,
+  `joinrelsize.go:638`, `relfromjoinlist.go:233,546`) — confirmed by grep,
+  all four sites nil-check before dereferencing. A synthesized leaf can
+  therefore leave `baseRelInfo.table` nil (no real ANALYZE stats to report)
+  even while `rangeBinding.table` is the non-nil synthetic table column
+  resolution needs — the two fields are allowed to disagree, and the search
+  already relies on that disagreement for ordinary derived-table leaves.
+- The catastrophic-mis-costing firewall named in §11/§12 as a general worry
+  — `problemPairsOuterWithDerived` (`relfromjoinlist.go:564`, the Q78
+  15s→327s regression) — **does not apply to this task at all**: it only
+  fires for `sj.Jointype ∈ {JoinLeft, JoinRight, JoinFull}`
+  (`relfromjoinlist.go:589-593`, `default: continue` for everything else,
+  Semi/Anti included). And even where it might have mattered, -3i-verify
+  already showed (§13.2) `x.Right`'s `EstimateRows` is not a stats-less
+  `rows=1` default the way a CTE's is — it recurses to the real
+  join-cardinality estimator over `t2`/`t3`'s own (real) `ANALYZE` stats.
+  Net: no new firewall interaction to design around.
+
+### 14.2 The real blocker: a pinned-spine `*Join` cannot be RELOCATED by a
+search that only rebinds it in place
+
+§11 already named the open problem ("the search's own winning tree decides
+WHERE … the search must recover that point … which `reresolveJoinByName` was
+never built to do") but framed it as (c), a separate cleanup step after (a)
+and (b) land. Reading `reresolveJoinByName` (`joinlayout.go:623`) shows it is
+not a smaller version of that job, it is a **different** job entirely:
+it takes an already-placed `*Join` `j` and re-resolves `j`'s own
+predicate/keys against `j.Left`/`j.Right`'s CURRENT schemas by name — it does
+not (and structurally cannot) choose WHERE in a tree `j` sits, create a new
+`*Join{Type:Semi/Anti}` node at a different position, or decide that the
+search's winning tree should nest the semi/anti probe partway down instead
+of at the top. `runJoinSearchBelowPinned`'s whole splice model
+(predp.go:73-201) is built on exactly this constraint: the pinned join node
+`j` is **never rebuilt**, only `j.Left` is replaced by whatever the search
+returns for `origChain`, and `reresolveJoinByName` merely patches `j`'s own
+predicate afterward. There is no version of "(a) append x.Right as a leaf,
+(b) add SJInfo bookkeeping, (c) fix the splice" that produces a plan where
+the search is free to interleave the semi/anti probe with `origChain`'s
+other joins (e.g. `(a ⋈ b) SEMI-JOIN x.Right ⋈ c` instead of
+`(a ⋈ b ⋈ c) SEMI-JOIN x.Right`) — PG's own Q69 plan (§12.1: `Parallel Hash
+Semi Join` low in the tree, two `Nested Loop Anti Join`s stacked ABOVE it,
+not beside it) is exactly this interleaved shape. Appending x.Right as one
+more leaf to a search whose OUTPUT still gets spliced back under a
+fixed-position pinned join cannot reach that shape no matter how (a)/(b) are
+built — the pin itself is the obstacle, not a missing bookkeeping field.
+
+### 14.3 goopg already has the right mechanism, for a sibling case: chain
+ADMISSION, not post-search splicing
+
+`extractSearchLeaves` (`joinsearchseam.go:1071`) already solves precisely
+this problem for LEFT/RIGHT outer joins, and is already exercised in
+production on every TPC-H/TPC-DS query with an outer join: its `walk`
+(`:1104-1191`) treats `*Join{Cross,Inner,Left,Right}` as **admissible** —
+for Left/Right it descends BOTH `j.Left` and `j.Right` (flattening the outer
+join's own two sides into the SAME `scans` list every ordinary inner-join
+leaf lands in, `:1116-1170`), records an `outerChainLink{jointype,
+preserved, nullable, pred}` capturing exactly which `RelSet` range is the
+preserved/nullable side, and lets the search's own `join_is_legal`-style
+machinery (fed by `ctx.joinInfoList`, consumed via `outerLinksHaveSJInfos`/
+`outerOnQualsOK` at `joinsearchseam.go:498-524`) decide, AS PART OF THE
+SEARCH, where the outer join is legally allowed to land — not pin it and
+patch it afterward. **This is the S5b mechanism the design doc's §1 already
+named as possibly-already-reopened** ("DP participation for semi/anti (S5b)
+is deferred by user decision… this is S5b, and its reopen criterion may
+already be met") — §12.4's (a)/(b)/(c) was an attempt to reopen S5b by
+extending the SPLICE model (predp.go), when the codebase's own working
+precedent for "a special-jointype relation the search must place legally"
+already exists one file over and does not use the splice model at all.
+
+Concretely, the buildable version of -3i-plumbing is:
+
+1. Extend `extractSearchLeaves`'s type test (`joinsearchseam.go:1110`) to
+   also admit `JoinTypeSemi`/`JoinTypeAnti`, descending both sides the same
+   way Left/Right already do (§13's finding makes this safe: `x.Right`'s own
+   top node is `*Project`, not `*Join`, so the RHS descent stops at one
+   opaque leaf exactly as extractSearchLeaves already does for any
+   non-flattenable node — no risk of wrongly recursing into `x.Right`'s
+   internal `t2 ⋈ t3`).
+2. Semi/Anti needs its **own** link record, not a reuse of
+   `outerChainLink` — that struct's `nullable`/`preserved` fields and every
+   consumer (`outerOnQualsOK`, `deriveOuterLinkConstants`,
+   `problemPairsOuterWithDerived`) exist to answer "which columns read NULL
+   through this join," which has no meaning for Semi/Anti (no NULL-extension;
+   `reresolveJoinByName:630-646` already documents that Semi/Anti "emit
+   Outer (=Left) only at runtime" — the RHS never becomes visible above the
+   join at all, a strictly simpler contract than an outer join's). A
+   parallel `semiAntiChainLink` (or a `Jointype` field discriminating the one
+   `outerChainLink` type, if the two families turn out to share more logic
+   than expected on closer reading) records the LHS/RHS `RelSet` ranges and
+   the join predicate; a parallel legality consumer (mirroring
+   `outerLinksHaveSJInfos`) checks it against `ctx.joinInfoList`.
+3. `existsUnnestSJInfo` (unnest.go:4398) already anticipated exactly this
+   moment in its own doc comment ("-3 recomputes real bits once the RHS
+   actually joins the search") — its throwaway `synL=1/synR=2` numbering is
+   replaced by the SAME `leafRangeRelSet(loLeft, loRight)` /
+   `leafRangeRelSet(loRight, hiRight)` computation the Left/Right branch
+   already performs (`joinsearchseam.go:1156-1157`) once the walk knows the
+   real local leaf indices, i.e. it is rebuilt at admission time, not
+   invented fresh.
+4. **This retires predp.go's separate pinned-spine mechanism for the
+   admitted cases** (exactly what -3(ii)'s own filing text already
+   anticipated: "retire `runJoinSearchBelowPinned`'s splice-and-reresolve
+   path for the now-natively-searched cases") — once a pinned Semi/Anti join
+   is admitted into the ordinary chain flattening, it is placed by the
+   search like any other join and needs no post-search splice at all,
+   which is also what resolves §11/§12.4's (c): there is no separate
+   "recover the join point from the winning tree" step to build, because
+   the search builds the tree with the join already in it. `origChain`
+   without any pinned Semi/Anti above it (the "unnest declined" / Q22
+   legacy-post-DP shape, per -3's own note) keeps going through
+   `runJoinSearchBelowPinned` unchanged — only the admitted cases move.
+5. Precedent that a live Semi/Anti `SpecialJoinInfo` inside
+   `ctx.joinInfoList`, checked by the ordinary search's legality machinery,
+   already works in production **today**, for a different producer:
+   `reduceOuterJoins`'s LEFT→ANTI strength reduction (S9.3, cited by
+   -3(iii)'s own landing note) puts a real `SpecialJoinInfo{Jointype:
+   JoinAnti}` into the ordinary flow, and the search costs/legality-checks
+   it correctly. That path arrives via the Left/Right branch (the RHS was
+   already an ordinary FROM-clause relation, only the label changes after
+   admission) rather than via a fresh synthesis at admission time the way
+   step 3 above would need, so it is corroborating evidence, not a
+   drop-in implementation.
+
+**This is a bigger change than §12.4 described** — it touches
+`extractSearchLeaves`'s flattening contract (a heavily-hardened function:
+the C-04a/b/c comments throughout it document several past silent-regression
+fixes) rather than predp.go alone — but it is also smaller in a different
+sense: it reuses ~90% of already-built, already-tested outer-join admission
+machinery instead of inventing new bookkeeping (§12.4's (b)) and a new splice
+repair (§12.4's (c)) from scratch. **Not sized for a single loop**: step 1
+alone touches the same function three separate C-04-series regressions have
+already been found in, so it needs its own dedicated scoping pass (does
+Semi/Anti's simpler "no NULL-extension" contract let it skip the
+`preserved`/`nullable`-threading entirely, or does `chainOnQual`'s
+`belowNullable` bookkeeping still need a Semi/Anti-aware arm for INNER links
+that sit ABOVE an admitted Semi/Anti link?) before any code lands. **Revised
+resume point for whoever picks up -3i-plumbing next**: start from §14.3's
+5-item list, beginning with a throwaway probe (mirroring §13's style)
+against Q69 that extends `extractSearchLeaves` locally in a test file only,
+confirms it produces the flattened leaf list step 1 predicts, and checks
+whether the existing `outerChainLink` consumers choke on a link with no
+`nullable` bits set (empty `RelSet`) before deciding step 2's "parallel type
+vs. shared type" question.

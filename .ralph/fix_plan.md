@@ -3556,27 +3556,57 @@ cross-layer programme that has never been scoped.
     reading. **Follow-up filed as M0142-0008a-3i-plumbing** (below): -3(i)
     can now skip straight to §12.4's (a)/(b)/(c) DP-search plumbing with no
     wrapper-node step first.
-  - [ ] **M0142-0008a-3i-plumbing — wire `x.Right` as a real DP-search
-    participant: RelOptInfo/SJInfo registration + post-search splice** —
-    filed by M0142-0008a-3i-verify (design doc §13.3). §12.4's three items,
-    unchanged by -3i-verify and now the entire remaining scope (no
-    wrapper-node increment needed, per -3i-verify): (a)
-    `runJoinSearchBelowPinned` (or its caller) must build a
-    `RelOptInfo`/`baseRelInfo` entry for `x.Right` (concrete top node
-    `*Project` per the Q69/-3i-verify witness, though a body shape neither
-    probe exercised may differ) and append it to `bindings`/`relInfos`
-    before calling into `tryJoinSearch`; (b) extend
-    `ctx.joinInfoList`/`SJInfo` bookkeeping so the search's own
-    join-legality checks (design doc §2) see the Semi/Anti restriction
-    against the new bit correctly; (c) resolve `reresolveJoinByName`'s
-    post-search splice (§11, still completely untouched) — the pinned
-    spine's shape assumption stops holding once the RHS is a real relset
-    bit the search can place anywhere. Also re-verify LIVE (not by
-    re-reading) whether `newPrebuiltPath`/`PathPrebuilt` truly handles a
-    `*Project`-topped leaf identically to a `*SeqScan`/`*Join` one — §12.2's
-    "any wrapped Node kind" claim was itself a static read that -3i-verify's
-    own finding shows was one detail wrong (the concrete node kind), so it
-    should not be trusted un-reverified for this next step either.
+  - [x] **M0142-0008a-3i-plumbing-recon3 — is §12.4's (a)/(b)/(c) the right
+    decomposition to implement?** Filed by M0142-0008a-3i-verify (design doc
+    §13.3), worked instead of coding (a)/(b)/(c) blind. **DONE 2026-09-16 as
+    a recon (design doc §14), no production change. Answer: no** — §12.4's
+    framing (append `x.Right` to `bindings`/`relInfos`, patch SJInfo
+    bookkeeping, then fix `reresolveJoinByName`'s splice) is not buildable as
+    literally stated and, even fixed up, cannot reach PG's Q69 shape.
+    Three findings: **(1)** `x.Right` cannot become a `rangeBinding` by a
+    bare append — `rangeBinding.table` (`*catalog.Table`) is dereferenced
+    unconditionally by dozens of statement-wide column-resolution call sites
+    in `planner.go`; it is buildable only via the same synthetic-`&catalog.
+    Table{}` pattern every derived-table/CTE leaf already uses, which also
+    turns out to sidestep the Q78 catastrophic-mis-costing firewall entirely
+    (`problemPairsOuterWithDerived` explicitly skips non-outer jointypes).
+    **(2)** The actual blocker is one layer up: `reresolveJoinByName`
+    re-resolves an ALREADY-PLACED join's predicate in place — it cannot
+    relocate the join or let the search build a new Semi/Anti node at a
+    chosen position, so no version of (a)+(b)+(c) built on top of
+    `runJoinSearchBelowPinned`'s splice model can reach an interleaved shape
+    like PG's Q69 plan (Semi Join low in the tree, two Anti Joins stacked
+    above it). **(3)** goopg already has the right mechanism for a sibling
+    problem: `extractSearchLeaves`'s existing LEFT/RIGHT **admission** (not
+    splicing) — flatten both sides into the ordinary leaf list, record a
+    chain-link struct, let the search's own `join_is_legal`-fed legality
+    machinery place the join — is the S5b mechanism the design doc's §1
+    already named as possibly-reopenable, and reuses ~90% of already-tested
+    infrastructure instead of the from-scratch (b)/(c). Revised, buildable
+    5-item plan in design doc §14.3. **Bigger than §12.4 estimated** (touches
+    `extractSearchLeaves`, a function three past C-04-series regressions
+    already hardened) — not sized for one loop. Follow-up
+    (`M0142-0008a-3i-plumbing`, below) is rescoped to match.
+  - [ ] **M0142-0008a-3i-plumbing — extend `extractSearchLeaves` to admit
+    Semi/Anti as a chain participant (rescoped by -recon3, design doc
+    §14.3)** — RESCOPED 2026-09-16, no longer the RelOptInfo-append shape
+    the original filing described. Concrete next step per §14.3: a
+    throwaway probe (style of §13) against Q69 that extends
+    `extractSearchLeaves`'s type test (`joinsearchseam.go:1110`) LOCALLY in
+    a test file to also admit `JoinTypeSemi`/`JoinTypeAnti`, descending both
+    sides the way Left/Right already do, and checks (i) the flattened leaf
+    list matches §14.3 item 1's prediction and (ii) whether the existing
+    `outerChainLink` consumers (`outerOnQualsOK`, `deriveOuterLinkConstants`,
+    `problemPairsOuterWithDerived`) choke on a link with empty `nullable`
+    bits — before deciding §14.3 item 2's "new `semiAntiChainLink` type vs.
+    a `Jointype` field on the existing one" question. Only after that:
+    rebuild `existsUnnestSJInfo`'s throwaway 2-bit numbering with real
+    `leafRangeRelSet` bits at admission time (item 3), and retire
+    `runJoinSearchBelowPinned`'s splice for the now-admitted cases (item 4;
+    this is what resolves the old (c) — there is no separate splice-repair
+    step once the join is placed BY the search). Precedent that a live
+    Semi/Anti `SpecialJoinInfo` in `ctx.joinInfoList` already works in
+    production today: `reduceOuterJoins`'s LEFT→ANTI demotion (item 5).
   **Independent, unfiled resume-point hint** (not sized/numbered — noted for
   whoever picks up S5a's own eligibility gate): relaxing
   `whereEligibleForPreDPUnnest` to per-sublink granularity would upgrade
