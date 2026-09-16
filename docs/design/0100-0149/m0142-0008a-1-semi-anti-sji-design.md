@@ -6532,3 +6532,49 @@ M0142-0003k reload, see CLAUDE.md's TPC-H row).
 
 Committed. Still pending, unrelated, carried since c11: `predp.go:159-176`'s
 stale Phase B doc comment.
+
+## 53. c17 — the stale Phase B doc comment is fixed, and turns out to have
+been actively wrong, not just stale
+
+The pending cleanup carried since c11 (§46) was `runJoinSearchBelowPinned`'s
+(`predp.go`) doc comment for its "Phase B" splice block (b2, design doc
+§32.3): it claimed §32.1's `admitSemiAnti` literal "stays `false` in
+production", making the splice branch (`used && residual == nil`)
+unreachable outside a hand-built unit test — a `dead_code_is_not_a_reference_impl`
+citation justifying why the branch's correctness was unverified.
+
+That claim was checked, not just reworded. A temporary `fmt.Fprintf(os.Stderr,
+…)` probe was inserted right after the `tryPGShapedJoinSearch(spineJoins[0],
+…)` call, printing `len(spineJoins)`/`used`/`residual==nil`, and the full
+`internal/optimizer` suite was run with `-v` (non-verbose `go test` buffers
+raw stderr writes per-test and only flushes them for failing tests, which
+is why an initial non-`-v` run showed nothing — a red herring worth noting
+for future probes in this package). Result: the block is reached 17 times
+by the *existing* suite, and 4 of those take the splice branch (`used=true`)
+— all via `TestPlanQ21LiveSQL` and `TestM0070Q21InnerOnlyConjunctsStay`,
+both ordinary `Plan()`-driven tests of Q21's stacked EXISTS/NOT EXISTS
+shape (4 base relations under two pinned Semi/Anti joins), not a hand-built
+result. Both tests already pass. The probe was reverted before commit; the
+diff that lands is comment-only.
+
+Root cause of the staleness: the `admitSemiAnti` literal was flipped from
+`false` to `true` by b2 step (iii) (§34), which landed *before* the c1-c16
+chain started — so the comment was already describing a bygone state on
+c11's very first mention of it, and every subsequent c-loop (c12-c16)
+carried the same unverified claim forward as "still pending" without
+re-deriving it from the current call site. This is the inverse of the
+"unwinnable path is untested path" risk this project usually watches for
+(a path presumed live turning out to be dead): here a path presumed dead
+turned out to be live and already covered.
+
+No behavior or plan-shape risk follows from this: the splice branch has
+been reachable in production since b2 (well before c16), c16's own TPC-DS
+SF0.25 sweep (§52: 99/99 plan shapes unchanged) already covers the query
+family most likely to hit this shape (Q10/Q16/Q35/Q69/Q94, all stacked
+EXISTS/NOT EXISTS), and the two tests that exercise `used=true` today
+already pass. This is a documentation correction closing out the c11-c16
+carried debt item, not a new production change.
+
+Verification: `go build ./...` clean; `go test ./internal/optimizer/...`
+green (comment-only diff, no production code changed). No TPC-DS/TPC-H
+gate re-run needed — nothing outside a comment moved.

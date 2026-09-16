@@ -4686,7 +4686,7 @@ cross-layer programme that has never been scoped.
   Phase B decline MORE often, not less, so the claim needs re-verification
   rather than a same-direction edit; left for a future loop. Design doc
   §49.
-- [ ] **M0142-0008a-3i-plumbing-c15 — re-apply c11 item (c)'s
+- [x] **M0142-0008a-3i-plumbing-c15 — re-apply c11 item (c)'s
   `joinInfoList: ctx.joinInfoList` fix (delete the duplicate-appending
   `semiAntiJoinInfoList` helper) now that c14 closed item (b)'s Q69 crash,
   and fix the new defect it exposes: no `createPlan` join constructor
@@ -4811,6 +4811,12 @@ cross-layer programme that has never been scoped.
   per-call, so `t.Setenv` in a test has no effect on an already-running
   binary. Still pending (carried since c11): `predp.go:159-176`'s stale
   Phase B doc comment.**
+  **CLOSED 2026-09-17: subsumed by M0142-0008a-3i-plumbing-c16**, which
+  implemented this item's resume point in full (the SJInfo Path→Join
+  carrier for both nestloop and hash arms, plus the `joinInfoList`
+  one-liner) and landed it. The one item c15 left pending on top of that
+  (the stale `predp.go` doc comment) is closed separately by
+  **M0142-0008a-3i-plumbing-c17** below.
   **LANDED 2026-09-17**: re-applied the four-piece diff unchanged, then
   fixed the test by hand-building its `*SeqScan`/`*Join` fixture directly
   (option (a) from the resume point above) instead of calling `Plan()` —
@@ -4824,6 +4830,28 @@ cross-layer programme that has never been scoped.
   TPC-DS SF0.25 plan shape or result. `scripts/tpch-spotcheck.sh` SKIPPED
   (pre-existing, unrelated: `:65433`'s `tpch` database is still empty
   pending the M0142-0003k reload — see CLAUDE.md). Design doc §52.
+- [x] **M0142-0008a-3i-plumbing-c17 — fix `predp.go:159-176`'s stale Phase B
+  doc comment (carried since c11).** **DONE 2026-09-17 (design doc §53).**
+  The comment claimed the splice branch (`used && residual == nil` inside
+  `runJoinSearchBelowPinned`'s Phase B block) is unreachable in production
+  because §32.1's `admitSemiAnti` literal "stays `false`" — checked, not
+  just reworded, via a temporary stderr probe (reverted before commit):
+  the branch is reached 17 times by the existing `internal/optimizer`
+  suite alone and taken (`used=true`) 4 of those times, via ordinary
+  `Plan()`-driven tests of Q21's stacked EXISTS/NOT EXISTS shape
+  (`TestPlanQ21LiveSQL`, `TestM0070Q21InnerOnlyConjunctsStay`), both
+  already passing — not a hand-built result as the old comment claimed.
+  Root cause of the staleness: `admitSemiAnti` was flipped to `true` by
+  b2 step (iii), which landed *before* the c1-c16 chain started, so the
+  claim was already wrong when c11 first flagged it as pending debt, and
+  every loop since (c12-c16) carried it forward unverified. No behavior
+  or plan-shape risk: the splice has been live since b2 (well before
+  c16), c16's own TPC-DS SF0.25 sweep (99/99 unchanged) already covers
+  the query family most likely to hit this shape (Q10/Q16/Q35/Q69/Q94),
+  and the tests exercising `used=true` already pass — this is a
+  documentation-only fix. Verification: `go build ./...` clean,
+  `go test ./internal/optimizer/...` green, diff is comment-only (no
+  production code changed, no gate re-run needed).
 - [x] **M0142-0008c — scoping recon: does goopg need PG's `create_unique_path`
   (semi-join → de-duplicate RHS + inner join) to reach parity on TPC-DS
   Q10/Q35?** — filed by M0142-0008a-3(iii)'s §4.3 gate re-run (design doc §6).

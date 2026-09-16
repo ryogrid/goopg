@@ -164,16 +164,29 @@ descend:
 	// spine's own joins to push — any retained Filter predicates above the
 	// whole spine stay handled by spineFilters' existing bottom-up remap.
 	//
-	// Gracefully declining while §32.1's `admitSemiAnti` literal
-	// (joinsearchseam.go:309) stays `false` in production: with the literal
-	// false, extractSearchLeaves never admits a Semi/Anti node, spineJoins[0]
-	// becomes ONE opaque leaf, and `len(scans)==1` almost certainly mismatches
-	// the frozen `nprefix` — the same "leaf-count" decline step (i) already
-	// proved inert (design doc §31.4). `used` is therefore false on every
-	// production call today; the success branch below is exercised only by a
-	// direct unit test with a hand-built result (§32.4 —
-	// dead_code_is_not_a_reference_impl: an unreachable branch is not a
-	// verified implementation until it has its own test).
+	// STALE COMMENT CORRECTED (M0142-0008a-3i-plumbing-c17, design doc §53):
+	// this used to say §32.1's `admitSemiAnti` literal (joinsearchseam.go's
+	// one `extractSearchLeaves` call site inside `tryPGShapedJoinSearch`)
+	// "stays `false` in production", making the splice below unreachable
+	// outside a hand-built unit test. That was already wrong by the time
+	// c11 first flagged it as pending debt: the call site passes a literal
+	// `true` (flipped by b2 step (iii), landed before the c1-c16 chain even
+	// started), and the c1-c16 chain kept carrying the stale claim forward
+	// without re-checking it. Measured directly (temporary stderr probe on
+	// `len(spineJoins)`/`used`, reverted before commit, not left in tree):
+	// running the existing `internal/optimizer` suite alone reaches this
+	// block 17 times and takes the splice branch (`used=true`) 4 of them —
+	// via ordinary production-shaped tests (`TestPlanQ21LiveSQL`,
+	// `TestM0070Q21InnerOnlyConjunctsStay`, both Q21's stacked EXISTS/NOT
+	// EXISTS over 4 relations), not a hand-built result. Those tests already
+	// pass and M0142-0008a-3i-plumbing-c16's TPC-DS SF0.25 sweep (99/99
+	// plan shapes unchanged) covers the corpus most likely to exercise this
+	// same shape (Q10/Q16/Q35/Q69/Q94 all stack EXISTS/NOT EXISTS), so this
+	// is a documentation correction, not a newly-discovered correctness
+	// gap — but it does mean the splice has been live in production since
+	// b2, not since c16, and the "unwinnable path is untested path" worry
+	// this comment used to raise does not apply here: the path is winnable
+	// and already under test.
 	if len(spineJoins) > 0 {
 		oldSpineSchema := append(Schema(nil), spineJoins[0].Output()...)
 		if searched, residual, used := tryPGShapedJoinSearch(spineJoins[0], nil, ctx, cat); used && residual == nil {
