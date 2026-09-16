@@ -3693,18 +3693,29 @@ cross-layer programme that has never been scoped.
     `-b2`'s actual tree-routing cutover — re-filed into `-b2` below.
   - [ ] **M0142-0008a-3i-plumbing-b2 — predp.go pass-through +
     ctx.bindings/joinlist extension + cutover (design doc §22.3/§22.4,
-    §23.4)** — filed by -3i-plumbing-b's scoping pass, scope corrected by
-    -3i-plumbing-b1's §23.4 finding. Depends on -3i-plumbing-b1 (done).
+    §23.4, §24)** — filed by -3i-plumbing-b's scoping pass, scope corrected
+    by -3i-plumbing-b1's §23.4 finding, item 6 split by this loop's §24
+    scoping pass. Depends on -3i-plumbing-b1 (done).
     Scope: extend `predp.go`'s descend loop to pass through non-Semi/Anti
-    `*Join` nodes instead of hard-bailing (`predp.go:96-101`) — now coupled
+    `*Join` nodes instead of hard-bailing (`predp.go:96-101`) — coupled
     here rather than to -b1, since it only has meaning once this item's
-    cutover actually routes a wider tree through it; give the Semi/Anti RHS
-    subtree a `ctx.bindings`/`ctx.joinlist` representation (plumb a
-    `*resolveContext` through `unnestSubqueriesInPlan`/`unnestExistsExpr`,
-    with its own scoping pass into their other internal call sites first —
-    not investigated this loop); feed the full spine+origChain tree to
+    cutover actually routes a wider tree through it; item 6a: plumb a
+    `*resolveContext` through `unnestSubqueriesInPlan`/`unnestExistsExpr`
+    (7 signatures, all in unnest.go, rooted at planner.go:1533/:1619 which
+    already hold ctx — §24.1 confirms this half is mechanical, DONE
+    scoping, ready to code); item 6b (**blocking, undecided — do this
+    before 6a is wired to append anything**): decide how the Semi/Anti RHS
+    leaf's offset/width reaches `joinsearchseam.go:329`'s check without
+    making it a live `ctx.bindings` entry — a synthetic `rangeBinding`
+    there is visible to ~24 other consumer sites across `planner.go`, and
+    §24.2 found at least one (`FOR UPDATE`/`FOR SHARE` no-target-list
+    locking, `planner.go:2523`/`:2539`) nil-pointer-panics on it
+    unconditionally (`qualifiedOnly` does NOT gate that site); choose
+    between auditing/gating all ~24 sites vs. a side-channel invisible to
+    `ctx.bindings`'s other consumers (§24.2 leans toward the side-channel
+    but it is undesigned); feed the full spine+origChain tree to
     `tryJoinSearch`; flip the production call site's `admitSemiAnti` to
-    `true` once the walk's new leaves are resolvable; retire `predp.go`'s
+    `true` once 6b's leaves are resolvable; retire `predp.go`'s
     splice-and-reresolve (`reresolveJoinByName`) ONLY for statement shapes
     empirically proven (TPC-DS sweep + a dedicated EXISTS/NOT-EXISTS
     regression set) to be handled end-to-end by the new path, keeping the

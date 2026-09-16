@@ -2569,3 +2569,128 @@ land under `-b1`'s banner:
 scope (updated in `fix_plan.md`), alongside item 6 and the cutover, rather
 than split out. `-b1`'s landed scope is precisely items 3 (walk extension)
 and 4 (SJInfo rebuild), as verified in §23.1-§23.2.
+
+## 24. M0142-0008a-3i-plumbing-b2 — item 6's own scoping pass (2026-09-16):
+the call-graph plumbing is small, but the real cost is the synthetic
+binding's downstream visibility
+
+§23.3 carried forward an unstarted obligation from §22.3: before coding
+item 6 (give the Semi/Anti RHS leaf a `ctx.bindings`/`ctx.joinlist`
+representation), do "its own scoping pass into their other internal call
+sites first — e.g. IN-family unnesting, not investigated by any loop so
+far." This loop did that pass — no production diff, same recon shape as
+§22. Two separable findings, of very different size.
+
+### 24.1 Finding A — the `*resolveContext` call-graph is small and self-contained (settled, low risk)
+
+Traced every caller of `unnestSubqueriesInPlan` via `find_referencing_symbols`
+(not grep — grep would double-count the identifier appearing in comments,
+e.g. unnest.go:4133's reference). The full call graph is exactly two roots
+and five internal functions, **all inside `internal/optimizer/unnest.go`**,
+with **zero callers outside the package and zero test-file callers of
+`unnestSubqueriesInPlan` itself**:
+
+- **Root 1**: `planner.go:1533` (S5a pre-DP path, inside the
+  `unnestPreDPEnabled()` arm) — `ctx *resolveContext` and `cat
+  catalog.Catalog` are both already in scope (same block stamps
+  `ctx.queryPathkeys` two lines earlier).
+- **Root 2**: `planner.go:1619` (legacy post-search path) — same function
+  (`planSelectWithSettings`), same `ctx`/`cat` already in scope.
+- **Five internal functions**, each needing the new parameter threaded
+  through so their own `unnestSubqueriesInPlan(...)` calls can pass it
+  down: `unnestSubqueriesInPlan` itself (7 recursive self-calls across its
+  `*Filter`/`*Join`/`*Project`/`*Aggregate`/`*Sort`/`*Limit` arms),
+  `walkSubqueryPlansInExpr` (called from `unnestSubqueriesInPlan`'s
+  `*Filter` arm, itself recurses across `*SubqueryExpr`/`*InExpr`/
+  `*ExistsExpr`/`*BinaryOp`/etc.), `unnestScalarWithResiduals` (called
+  from `unnestSubquery`), and the three driver functions named in the
+  task filing: `unnestSubquery`, `unnestInExpr` (which itself calls
+  `unnestNonCorrelatedInExpr` for the non-correlated case — so that's a
+  sixth signature, not a separate call site), and `unnestExistsExpr`.
+
+So: **7 function signatures total** (`unnestSubqueriesInPlan`,
+`walkSubqueryPlansInExpr`, `unnestScalarWithResiduals`, `unnestSubquery`,
+`unnestInExpr`, `unnestNonCorrelatedInExpr`, `unnestExistsExpr`), confined
+to one file, rooted at two call sites that already hold the context they'd
+need to pass in. The "IN-family unnesting" call sites §22.3 flagged as
+unexamined (`unnestInExpr`/`unnestNonCorrelatedInExpr`, `unnest.go:3351`/
+`:3494`) are ordinary recursive self-calls in the same shape as the
+EXISTS side (`unnestExistsExpr`, `unnest.go:4582`) — no divergent wiring
+needed. **This half of item 6 is mechanical and low-risk**: add a
+`*resolveContext` parameter to all 7, pass it through unchanged at every
+recursive call, no design decision required.
+
+### 24.2 Finding B — the synthetic binding's *consumption* side is the actual size of item 6, and it is not small
+
+The plumbing above only gets a `*resolveContext` to the point where
+`unnestExistsExpr` builds the Semi/Anti join. What item 6 actually needs
+is for `joinsearchseam.go:329`'s offset-agreement check (`ctx.bindings[i].offset
+!= cumOffsets[i]`, guarding the leaf-count/offset seam `-3i-plumbing-b1`'s
+walk extension feeds into) to find a `ctx.bindings` entry for the RHS leaf
+whose `.offset` matches the leaf's position in the walk's left-to-right
+order — i.e. `unnestExistsExpr` must **append a new, synthetic
+`rangeBinding`** to the OUTER `ctx.bindings` representing the whole RHS
+subtree as one opaque relation (offset = current bindings' tail, width =
+the RHS leaf's own output-column count).
+
+That synthetic binding does not stay contained to the join-search seam —
+`ctx.bindings` is a shared slice read by roughly two dozen other sites
+across `planner.go` (`grep -c '\.bindings\b' planner.go` → 24 occurrences,
+none audited before this loop for behavior on a binding with `table: nil`
+that represents no real catalog relation). Two were spot-checked directly
+this loop and the result is a real, evidenced hazard, not a hypothetical
+one:
+
+- `planner.go:7821-7833` (unqualified column-name lookup, part of
+  `resolveColumnRef`'s fallback path) skips a binding when
+  `b.qualifiedOnly` is set, **before** touching `b.table.Columns` — so a
+  synthetic binding marked `qualifiedOnly: true` is safe here.
+- `planner.go:2523-2533` (the `FOR UPDATE`/`FOR SHARE` locking `emit`
+  closure, reached via the no-explicit-target-list loop at
+  `planner.go:2539-2546`) has **no `qualifiedOnly` check at all** — it
+  iterates every entry in `ctx.bindings` unconditionally and dereferences
+  `b.table.OID` in its very first statement. A query shaped like `SELECT
+  ... WHERE EXISTS (...) FOR UPDATE` (no target list) would reach this
+  loop with the synthetic binding present and **nil-pointer-panic on
+  `b.table.OID`**, `qualifiedOnly` or not.
+
+So `qualifiedOnly` — the one existing escape hatch on `rangeBinding` —
+already fails to cover every consumer, and the honest scope of item 6 is
+auditing (or bypassing) all ~24 sites, not adding one flag. Two structural
+options, neither attempted or decided yet:
+
+1. **Extend the flag.** Add a stronger `opaque bool` (or repurpose/harden
+   `qualifiedOnly` semantics) and individually audit and gate all ~24
+   `ctx.bindings` iteration sites to skip an opaque binding — correct but
+   large, and every miss is a live crash risk on a real query shape
+   (`FOR UPDATE` alone already proves the risk is not theoretical).
+2. **Side-channel instead of a shared-slice entry.** Keep the RHS leaf's
+   offset/width bookkeeping in a structure `joinsearchseam.go` reads
+   directly (parallel to, not inside, `ctx.bindings`) and never expose it
+   to `resolveColumnRef`, star-expansion, locking, or any other consumer
+   at all. This matches the leaf's own semantics better — `-3i-plumbing-b1`
+   made it explicitly **opaque and non-reorderable** (§22.2/§23.1 item 3),
+   i.e. never meant to be individually resolved by name — so a channel
+   that is invisible to name resolution by construction removes the audit
+   burden entirely rather than trying to gate every consumer correctly by
+   hand.
+
+Option 2 looks like the right direction (it also avoids the tuning-vs-
+absorption question entirely — there is no PG quantity being substituted
+here, just an internal bookkeeping representation) but has not been
+designed in any detail — figuring out its exact shape and how
+`joinsearchseam.go:329/339` would read from it instead of `ctx.bindings[i]`
+is the concrete next step, not yet started.
+
+### 24.3 Resume point
+
+`M0142-0008a-3i-plumbing-b2` stays open, scope unchanged in `fix_plan.md`
+apart from this narrowing: item 6 splits into 6a (§24.1's `*resolveContext`
+plumbing — mechanical, ready to code) and 6b (§24.2's binding-visibility
+design decision — side-channel vs. audited-flag, needs its own design
+paragraph and a settled choice **before** 6a is wired up to actually
+append anything, since coding 6a in isolation with nothing yet deciding
+what shape the append takes would just be unused plumbing). Do not attempt
+the cutover (flipping `admitSemiAnti` to `true` in production) before 6b
+is resolved — the `FOR UPDATE` crash in §24.2 is a real regression risk,
+not a style concern.
