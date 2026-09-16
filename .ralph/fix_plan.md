@@ -3477,6 +3477,38 @@ cross-layer programme that has never been scoped.
       way. **Still open in -3: increments (i) RHS-as-participant and (ii)
       legality wiring/integration verification** — this hash-admission
       work is what lets `addPath` cost-compare once those land.
+  - [x] **M0142-0008a-3(i) — recon: what does "make the RHS a real DP-search
+    participant" actually require?** DONE 2026-09-16 as a recon (design doc
+    §11), no production change. Confirmed the starting shape (one
+    `tryJoinSearch` call at the bottom, `x.Left`-only descend,
+    `tryPGShapedJoinSearch` reads `ctx.bindings`/`joinlist`/`joinInfoList`
+    directly with no seam for an extra ad hoc participant) and that
+    -0008a-2's `existsUnnestSJInfo` already anticipated the atomic-RHS
+    2-bit numbering this increment is meant to make real. **Decisive
+    finding: `extractSearchLeaves` (the flattener `tryPGShapedJoinSearch`
+    uses) already treats any non-Cross/Inner/Left/Right node as ONE opaque
+    leaf — the right primitive for "atomic RHS" — but `x.Right` is not
+    guaranteed opaque to it**, since a multi-table EXISTS body (TPC-DS's
+    channel-comparison idiom, Q10/Q35's class) plans to a top node that is
+    itself `*Join{Type:Inner}`, which the walk would wrongly recurse into
+    and try to re-flatten using `Node`s never registered in
+    `ctx.bindings`/`relInfos`. Two closing options sized in §11 (a new
+    opaque-participant wrapper Node type threaded through every leaf-Node-kind
+    switch downstream — `baseSeqScanCostInputs`, `createPlan`'s leaf arm,
+    `explain_names.go` — vs. hand-constructing the bindings/joinlist and
+    calling `planJoinlistSearch` directly, bypassing the shared seam and
+    duplicating its conjunct-partitioning/boundary-identity contracts), plus
+    a still-open second problem independent of either option: the
+    post-search splice (`reresolveJoinByName`) assumes the pinned spine's
+    shape survives search unchanged, which stops being true once the RHS is
+    a real relset bit the search can place anywhere. **Verdict: -3(i) is a
+    re-scope, not a start** — do not attempt the descend-loop extension
+    directly. Follow-up filed as **M0142-0008a-3i-recon2** (below).
+  - [ ] **M0142-0008a-3i-recon2 — size option 1 vs option 2 (§11) against a
+    real multi-table-EXISTS-body TPC-DS witness** — filed by -3(i)'s recon.
+    Use `query10`/`query35`'s class (per M0142-0008c's own census) as the
+    concrete witness before writing any DP-search code; design-only, no
+    implementation.
   **Independent, unfiled resume-point hint** (not sized/numbered — noted for
   whoever picks up S5a's own eligibility gate): relaxing
   `whereEligibleForPreDPUnnest` to per-sublink granularity would upgrade

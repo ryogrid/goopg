@@ -820,3 +820,95 @@ or row-count gate applies — `SourceTableIdx` is read only by
 `explain_names.go`, never by planning or execution — and the TPC-H spot-check
 gate is independently SKIPPED right now for the pre-existing, documented
 M0142-0003k data-reload blocker, unrelated to this change.
+
+## 11. M0142-0008a-3(i) — RHS-as-participant recon: the mechanism is bigger than "feed extra bindings" (2026-09-16)
+
+Increment (1) of §4.2 reads as plumbing ("assigning [the RHS] a `RelSet` bit
+... is a concrete piece of plumbing -2/-3 must add, not a conceptual gap") and
+recommends the atomic-RHS shape. This recon traced the concrete mechanism
+`runJoinSearchBelowPinned` (`predp.go:73`) would need to call to make that
+true, and finds it is not a local plumbing change to that one function — it
+needs a new node-tree concept threaded through a second subsystem. **No
+production code changed.**
+
+**Confirmed starting shape.** `runJoinSearchBelowPinned`'s descend loop walks
+only `x.Left` at each pinned `*Join{Semi,Anti}` and calls `tryJoinSearch`
+exactly once, at the `Filter` immediately wrapping `origChain` — every pinned
+spine join above that point is reattached afterward by `reresolveJoinByName`,
+unchanged in shape. `tryJoinSearch` → `tryPGShapedJoinSearch`
+(`joinsearchseam.go:215`) reads `ctx.bindings`/`ctx.joinlist`/
+`ctx.joinInfoList` directly — there is no parameter seam for injecting one
+extra ad hoc participant into a single call.
+
+**Confirmed: -0008a-2's `existsUnnestSJInfo` (`unnest.go:4398`) already
+anticipated exactly this** — its own comment names "the design's atomic-RHS
+recommendation for -3" and uses a self-contained 2-bit LHS/RHS numbering,
+explicitly deferring the real per-call bits to -3. This recon is the -3 side
+of that handoff.
+
+**The blocking finding.** `extractSearchLeaves` (`joinsearchseam.go:1070`),
+the function `tryPGShapedJoinSearch` uses to flatten a chain into
+`scans`/`onQuals`/`outerLinks`, only descends through `*Join{Cross, Inner,
+Left, Right}` — anything else (including `*Join{Semi, Anti}`, and any other
+`Node` kind) is treated as **one opaque scan leaf** (the `!isJoin ||
+j.Type not in {...}` branch at the top of its `walk` closure). That is
+actually the RIGHT primitive for "atomic RHS" — no new code would be needed
+IF `x.Right` could simply be spliced into `origChain`'s tree as one more
+cross-joined leaf and handed to the existing walk. It cannot, for one
+concrete reason: **`x.Right` is not opaque to this walk's *type test* unless
+its own top node happens to not be `*Join{Cross,Inner,Left,Right}`.** `x.Right`
+is `unnestExistsExpr`'s already-planned EXISTS-body subtree; when the EXISTS
+body itself joins ≥2 tables (the TPC-DS "channel comparison" idiom named in
+§3.4, and the open question in §4.2 item 1 flags this exact case), its own
+top node is very likely `*Join{Type: Inner}` — the walk would recurse INTO
+it and try to re-flatten its internal joins as new search leaves, using
+`Node`s that were never registered in `ctx.bindings`/`relInfos` and whose
+sub-join `Predicate`s are resolved in a numbering space `rebaseChainQual`
+has no way to reconcile with the outer chain's. That silently produces
+leaf-count mismatches or, if the counts happen to line up, wrong-column
+`baseRelInfo` estimates — not a decline, a wrong plan.
+
+Two ways to close this, neither of them a same-loop-sized plumbing change:
+
+1. **A new opaque-participant wrapper node** (e.g. `*OpaqueSearchLeaf{Node
+   Node, Rows float64, Width int}`) that `extractSearchLeaves`'s type test
+   special-cases as an unconditional stop, with `x.Right` wrapped in it
+   before splicing. This is the smaller diff to `extractSearchLeaves` itself
+   (one more case in the type test) but pushes the real cost onto every
+   OTHER place that switches on leaf `Node` kind expecting a "real" scan —
+   `baseSeqScanCostInputs`, `newPrebuiltPath`, `createPlan`'s leaf-lowering
+   arm, and `explain_names.go`'s `bySrc` walk (the exact class of Node-kind
+   switch M0142-0008d/e's "15/32-case exhaustiveness" fix pattern exists to
+   police) would each need to either unwrap it or gain a case, or the
+   already-planned `x.Right` subtree needs re-deriving as `baseRelInfo`
+   stats (rows/width) rather than executed literally, since `createPlan`
+   does not know how to lower an opaque wrapper it has never seen.
+2. **Bypass `extractSearchLeaves` for this one caller**: have
+   `runJoinSearchBelowPinned` hand-construct the extended
+   `bindings`/`scans`/`relInfos`/`joinlist` (origChain's own, unchanged, plus
+   one manually-appended entry for `x.Right` with directly-computed
+   `baseRelInfo` stats) and call `planJoinlistSearch` directly instead of
+   going through `tryJoinSearch`/`tryPGShapedJoinSearch` at all. This avoids
+   touching the shared seam but means re-deriving, by hand, several things
+   `tryPGShapedJoinSearch` currently does for every other caller (conjunct
+   partitioning via `partitionConjunctsForJoinPlanning`, the pinned-spine
+   width/identity-boundary contract `assertSpineConsumesIdentityBoundaryMap`
+   already asserts) — a second, parallel seam implementation to keep in sync
+   with the first (`pattern_sibling_paths_must_agree` risk).
+
+Neither option is what "extend the descend loop to also walk `x.Right`"
+reads as at filing time. **Also still open, independent of which option is
+chosen:** the post-search splice. Today `reresolveJoinByName` assumes the
+pinned spine's *shape* survives search unchanged (only leaf identities
+inside `origChain` moved) — once the RHS is a real relset bit, the search's
+own winning tree decides WHERE among `origChain`'s relations the semi/anti
+join point sits, so the post-search step must recover that point from the
+winning `Path`/`Node` rather than re-wrap a shape it already knows, which
+`reresolveJoinByName` was never built to do.
+
+**Verdict: -3(i) is a re-scope, not a start.** Recommend filing the concrete
+next step as a design-only sub-task (size option 1 vs 2 above against a real
+multi-table-EXISTS-body TPC-DS witness — `query10`/`query35`'s class,
+per M0142-0008c's own census — before writing any DP-search code), rather
+than attempting the descend-loop extension directly. Filed as
+**M0142-0008a-3i-recon2** in `fix_plan.md`.
