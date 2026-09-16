@@ -2488,12 +2488,37 @@ spill route is net-negative.
     landed". **Next**: S2b-2b (materialize-on-demand + per-candidate
     `validatedSearchPathkeys`) can now read `ordered.SearchCandidates`
     directly; S2b-2c stays blocked on M0141-S7's `addOrderedPaths` third arm.
-  - [ ] **M0141-S2b-2b** — materialize-on-demand: defer `createPlanNode` on
+  - [x] **M0141-S2b-2b** — materialize-on-demand: defer `createPlanNode` on
     any non-seed candidate until `setCheapest` has chosen a winner (avoid
     paying materialization cost for N-1 discarded candidates per query), and
     generalize `validatedSearchPathkeys` (`upperorderedinput.go`) to run
     per-candidate rather than once for the single seed. Filed by S2b-2
-    (design doc item 2). Depends on S2b-2a.
+    (design doc item 2). Depends on S2b-2a. **DONE 2026-09-17, pathkeys half
+    only.** Landed `validatedSearchCandidateKeys` (`upperorderedinput.go`),
+    mapping the existing `validatedSearchPathkeys` re-earn-against-published-
+    schema check over every `RelOptInfo.SearchCandidates` entry into a new
+    parallel-indexed `RelOptInfo.SearchCandidateKeys` field (`path.go`),
+    populated by `createOrderedPaths` (`upperordered.go`) in the same
+    `sr != nil` branch S2b-2a added. The materialize-on-demand half has
+    nothing to defer yet — no production code builds a `Node` from a
+    `SearchCandidates` entry until S2b-2c exists to do it — so it is
+    recorded as a contract S2b-2c must follow (materialize lazily, after
+    `setCheapest`, never eagerly per candidate) rather than built against an
+    interface that does not exist yet (`PathIncrementalSort`, S7's own
+    unbuilt step). New test `TestCreateOrderedPathsValidatesSearchCandidatePathkeys`
+    (`upperordered_test.go`) pins full-validation, truncate-on-bad-second-key,
+    and no-claim-at-all cases; `ordered.Pathlist` stays at 1 (plumbing only,
+    same gate as S2b-2a). `go test ./internal/optimizer/...` full package
+    PASS. TPC-DS SF0.25 sweep (private bin `tmp/goopg-s2b2b-bin`, deleted
+    after; nightly batch was live and holds `tmp/goopg-bench-bin`):
+    `PASS=96 MISMATCH=0`, `PLAN-SHAPE changed=0` — byte-identical as
+    predicted. Design doc:
+    `docs/design/0100-0149/m0141-s2b-scoping-decomposition.md` §"S2b-2b
+    landed". **Next**: S2b-2c can now read both `SearchCandidates` and
+    `SearchCandidateKeys` directly; still blocked on M0141-S7's
+    `addOrderedPaths` third arm and its executor operator (a path kind that
+    could win the tournament with no node to emit is a new risk class, not
+    yet present in the groundwork-only steps S7 has landed so far).
   - [ ] **M0141-S2b-2c** — the actual payoff: once `cost_incremental_sort`'s
     per-candidate prefix credit exists (M0141-S7), let `addOrderedPaths` run
     a real tournament across `Pathlist` instead of the single

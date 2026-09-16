@@ -108,6 +108,14 @@ func createOrderedPaths(u *upperRels, input Node, keys []SortKey, pos int, cp co
 	// candidates today is provably inert).
 	if sr := searchedRelOf(input); sr != nil {
 		ordered.SearchCandidates = sr.Pathlist
+		// M0141-S2b-2b: re-earn every OTHER candidate's ordering claim
+		// against this rel's own published schema, the same rule
+		// `stampSearchPathkeys` already applies to the single WINNING path
+		// (upperorderedinput.go's file header, rule 1) — generalized from
+		// "the one winner" to "every candidate", since a losing candidate's
+		// Pathkeys are just as much a claim made in the search's inner
+		// coordinate space. Still plumbing only: nothing below reads it.
+		ordered.SearchCandidateKeys = validatedSearchCandidateKeys(sr.Pathlist, input.Output())
 	}
 
 	addOrderedPaths(ordered, seed, pathkeysForSortKeys(keys), cp, limitTuples)

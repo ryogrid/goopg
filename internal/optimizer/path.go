@@ -564,6 +564,25 @@ type RelOptInfo struct {
 	// Pathlist.
 	SearchCandidates []*Path
 
+	// SearchCandidateKeys is SearchCandidates[i].Pathkeys re-earned against
+	// this rel's own published schema, one entry per SearchCandidates entry
+	// (M0141-S2b-2b, upperorderedinput.go's `validatedSearchCandidateKeys`).
+	// Every candidate in a search rel's Pathlist carries its Pathkeys in the
+	// SEARCH's inner coordinate space — the same reason `stampSearchPathkeys`
+	// re-validates the single WINNING path's claim instead of trusting it
+	// (upperorderedinput.go's file header, rule 1) applies identically to
+	// every OTHER candidate the search never crowned. This generalizes that
+	// same rule from "the one winner" to "every candidate", which S2b-2c's
+	// Incremental Sort tournament needs before it can trust any non-seed
+	// candidate's ordering claim.
+	//
+	// Nothing reads this yet, same gate as SearchCandidates: computing it
+	// cannot move a plan because nothing offers these candidates to
+	// `addOrderedPaths` yet. nil when SearchCandidates is nil; an individual
+	// entry is nil when that candidate's own Pathkeys validate to nothing
+	// (no ordering claim survives, same truncation rule as the winner's).
+	SearchCandidateKeys [][]PathKey
+
 	// ConsiderParallel is PG's `RelOptInfo.consider_parallel`
 	// (pathnodes.h:911): whether it is worth generating partial paths for
 	// this rel at all — the relation can be read by a worker (not temp, not

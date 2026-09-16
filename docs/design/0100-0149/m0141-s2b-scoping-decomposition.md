@@ -671,3 +671,64 @@ winner, and generalize `validatedSearchPathkeys` to run per-candidate) can
 now read `ordered.SearchCandidates` directly instead of re-deriving
 `searchedRelOf`. S2b-2c (the actual tournament) stays blocked on M0141-S7's
 `addOrderedPaths` third arm.
+
+## S2b-2b landed (2026-09-17) — pathkeys half only; the materialize-on-demand half has nothing to defer yet
+
+Implemented the buildable half of decomposition item 2: generalized
+`validatedSearchPathkeys` (upperorderedinput.go, rule 1 — re-earn a path's
+ordering claim against the schema the boundary actually publishes, since it
+was resolved in the search's own inner coordinate space) from running once
+for the single WINNING path (`stampSearchPathkeys`'s own call, unchanged) to
+running once per entry of `RelOptInfo.SearchCandidates` — the new function
+`validatedSearchCandidateKeys` (upperorderedinput.go) maps it over the
+candidate list and returns a parallel-indexed `[][]PathKey`, stored on a new
+field `RelOptInfo.SearchCandidateKeys` (path.go), populated by
+`createOrderedPaths` (upperordered.go) in the same `sr != nil` branch S2b-2a
+added. Same "travels as DATA, nothing reads it yet" posture as
+`SearchCandidates` itself — no new call site downstream.
+
+**Why the materialize-on-demand half is deferred, not skipped.** Re-reading
+S2b-2b's own filed text: "defer `createPlanNode` on any non-seed candidate
+until `setCheapest` has chosen a winner." That describes a *cost* to avoid —
+paying `createPlanNode` for the N-1 candidates a real tournament would build
+and then discard. But nothing in production builds a `Node` for any
+`SearchCandidates` entry today (S2b-2c, which is what would ever call
+`createPlanNode` on one of them, is still blocked on M0141-S7's
+`addOrderedPaths` third arm) — there is no eager path to defer yet. Sizing
+this half now would mean writing dead code against an interface S2b-2c
+hasn't defined (what a materialized incremental-sort candidate even looks
+like — `PathIncrementalSort`, per S7's own implementation-order list, does
+not exist). The design constraint itself is recorded here instead, as the
+contract S2b-2c must follow when it starts building real candidates from
+`SearchCandidates`/`SearchCandidateKeys`: materialize lazily, after
+`setCheapest`, never eagerly per candidate.
+
+**Gate**: same as S2b-2a — a new test,
+`TestCreateOrderedPathsValidatesSearchCandidatePathkeys`
+(upperordered_test.go), pins three cases in one search rel's Pathlist: a
+candidate whose one key fully validates, a candidate whose first key
+validates and second key (bad column index) truncates the claim rather than
+invalidating it entirely (file header rule 1's own contract), and a
+candidate with no Pathkeys at all (nil in, nil out). `ordered.Pathlist`
+stays at exactly 1 (the seed) in the same test — still plumbing only. `go
+test ./internal/optimizer/...` full package PASS. TPC-DS SF0.25 sweep
+(private bin `tmp/goopg-s2b2b-bin`, nightly batch was live and holds
+`tmp/goopg-bench-bin`; binary deleted after the run): `PASS=96 MISMATCH=0`,
+`PLAN-SHAPE: changed=0` — byte-identical, as predicted. **S2b-2b's pathkeys
+half is DONE; its materialize-on-demand half folds into S2b-2c** (there is
+no standalone artifact to land for it before S2b-2c exists to consume it).
+
+**Next in the decomposition**: S2b-2c (the actual tournament — build a
+`PathIncrementalSort` candidate over each `SearchCandidates` entry using its
+`SearchCandidateKeys` prefix and M0141-S7's `costIncrementalSort`, offer it
+to `addOrderedPaths`'s new third arm, materializing lazily per this update's
+contract) is still **blocked on M0141-S7**: `costIncrementalSort` and
+`pathkeysCountContainedIn` are landed groundwork with zero production
+callers, but the executor has no Incremental Sort operator, so a candidate
+that actually won the ORDERED tournament today would reach `createPlanNode`
+with no node kind to emit. S7's own implementation-order list (fix_plan.md)
+sequences the executor operator AFTER the `addOrderedPaths` third arm — that
+ordering needs re-checking before S2b-2c starts: offering an
+executor-unbacked path kind to a real tournament, where it could actually
+win, is a materially different risk than the groundwork-only steps landed
+so far.

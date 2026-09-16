@@ -187,6 +187,62 @@ func TestCreateOrderedPathsLeavesSearchCandidatesNilForANonSearchedInput(t *test
 	if ordered.SearchCandidates != nil {
 		t.Fatalf("ordered.SearchCandidates = %v, want nil for a non-searched input", ordered.SearchCandidates)
 	}
+	if ordered.SearchCandidateKeys != nil {
+		t.Fatalf("ordered.SearchCandidateKeys = %v, want nil for a non-searched input", ordered.SearchCandidateKeys)
+	}
+}
+
+// TestCreateOrderedPathsValidatesSearchCandidatePathkeys is M0141-S2b-2b's
+// gate: every OTHER candidate in the search rel's Pathlist gets its own
+// Pathkeys re-earned against the ORDERED rel's published schema
+// (`ordered.SearchCandidateKeys`), the same truncation rule
+// `stampSearchPathkeys` already applies to the single winning path —
+// generalized to every candidate, parallel-indexed to SearchCandidates. Still
+// plumbing only: `ordered.Pathlist` stays at exactly 1 (the seed), same as
+// S2b-2a's own gate.
+func TestCreateOrderedPathsValidatesSearchCandidatePathkeys(t *testing.T) {
+	cp := defaultCostParams()
+	keys := upperOrderedKeys()
+	u := newUpperRels()
+
+	// cand1's one key ("k") fully validates against the input's schema.
+	kKey := PathKey{Expr: &ColumnRef{Index: 0, Name: "k", Type: catalog.Type{Name: "int4"}}, SortAsc: true}
+	// cand2's first key ("v") validates; its second key addresses a column
+	// index the schema doesn't have, so validation truncates after the
+	// first — a shorter, not a wrong, ordering claim (file header rule 1).
+	vKey := PathKey{Expr: &ColumnRef{Index: 1, Name: "v", Type: catalog.Type{Name: "text"}}}
+	badKey := PathKey{Expr: &ColumnRef{Index: 99, Name: "bogus", Type: catalog.Type{Name: "int4"}}}
+	// cand3 carries no ordering claim at all.
+
+	searchRel := &RelOptInfo{}
+	cand1 := &Path{Kind: PathAgg, Rows: 5, Cost: Cost{Total: 10}, Pathkeys: []PathKey{kKey}}
+	cand2 := &Path{Kind: PathAgg, Rows: 5, Cost: Cost{Total: 20}, Pathkeys: []PathKey{vKey, badKey}}
+	cand3 := &Path{Kind: PathAgg, Rows: 5, Cost: Cost{Total: 30}}
+	searchRel.Pathlist = []*Path{cand1, cand2, cand3}
+
+	in := &searchedPricedNode{pricedNode: *upperOrderedInput(1000)}
+	in.markFromJoinSearch()
+	in.setSearchRel(searchRel)
+
+	createOrderedPaths(u, in, keys, 0, cp, 0, -1)
+
+	ordered := fetchUpperRel(u, UpperOrdered, 0, 0)
+	if len(ordered.SearchCandidateKeys) != 3 {
+		t.Fatalf("ordered.SearchCandidateKeys = %d entries, want 3 (parallel-indexed to SearchCandidates)", len(ordered.SearchCandidateKeys))
+	}
+	if len(ordered.SearchCandidateKeys[0]) != 1 || !pathKeyEqual(ordered.SearchCandidateKeys[0][0], kKey) {
+		t.Fatalf("cand1's validated keys = %v, want [%v] (fully validates)", ordered.SearchCandidateKeys[0], kKey)
+	}
+	if len(ordered.SearchCandidateKeys[1]) != 1 || !pathKeyEqual(ordered.SearchCandidateKeys[1][0], vKey) {
+		t.Fatalf("cand2's validated keys = %v, want [%v] (truncated after the bad second key)", ordered.SearchCandidateKeys[1], vKey)
+	}
+	if ordered.SearchCandidateKeys[2] != nil {
+		t.Fatalf("cand3's validated keys = %v, want nil (no Pathkeys claimed)", ordered.SearchCandidateKeys[2])
+	}
+	// Plumbing only: the tournament still offers exactly the one seed.
+	if len(ordered.Pathlist) != 1 {
+		t.Fatalf("ordered.Pathlist = %d entries, want 1 — SearchCandidateKeys must not be offered to the tournament yet", len(ordered.Pathlist))
+	}
 }
 
 // TestAddOrderedPathsOffersExactlyOneProducerPerInput: both producers exist

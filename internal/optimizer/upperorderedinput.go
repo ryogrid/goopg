@@ -110,6 +110,33 @@ func validatedSearchPathkeys(keys []PathKey, out Schema) []PathKey {
 	return kept
 }
 
+// validatedSearchCandidateKeys is rule 1 generalized from the single winning
+// path (`stampSearchPathkeys`'s own call) to every candidate a search rel's
+// Pathlist carries (M0141-S2b-2b). PG has no analogue here either, for the
+// same reason the file header gives for `validatedSearchPathkeys`: goopg's
+// search boundary re-coordinates once per search, and a losing candidate's
+// ordering claim is just as much a claim made in the search's inner space as
+// the winner's — nothing about NOT being chosen by `setCheapest` exempts a
+// candidate from re-earning its claim against the schema `out` actually
+// publishes.
+//
+// Returns one entry per `candidates`, parallel-indexed (nil where that
+// candidate's own claim validates to nothing) — never a shorter slice, so a
+// caller can zip it against `candidates` by index without a length check.
+func validatedSearchCandidateKeys(candidates []*Path, out Schema) [][]PathKey {
+	if len(candidates) == 0 {
+		return nil
+	}
+	keys := make([][]PathKey, len(candidates))
+	for i, c := range candidates {
+		if c == nil {
+			continue
+		}
+		keys[i] = validatedSearchPathkeys(c.Pathkeys, out)
+	}
+	return keys
+}
+
 // schemaCoordinatesAgree reports whether two schemas address the same columns
 // at the same positions — the check rule 2 re-runs at every step of the walk
 // instead of trusting that a node kind is schema-preserving.
