@@ -732,3 +732,98 @@ ordering needs re-checking before S2b-2c starts: offering an
 executor-unbacked path kind to a real tournament, where it could actually
 win, is a materially different risk than the groundwork-only steps landed
 so far.
+
+## S2b-2c landed (2026-09-17c) — the third arm, gated off by default
+
+Resolved the risk the prior update flagged (offering an executor-unbacked
+path kind to a real tournament) by following the SAME off-by-default env-var
+convention every other experimental path family in `internal/optimizer`
+already uses (`GOOPG_PARTIAL_SORT_PATHS`, `GOOPG_PARTIAL_AGG_PATHS`, …)
+rather than reordering S7's own stated implementation sequence
+(`addOrderedPaths` third arm before the executor operator). New file
+`internal/optimizer/incrementalsortpaths.go`:
+
+- **`PathIncrementalSort`** (`path.go`), a new `PathKind`. It has
+  deliberately no `createPlanNode` arm — `createplan.go`'s own header states
+  the philosophy this follows: "the real path-kind arms... panic loudly
+  rather than silently mis-build, because a constructed-but-unhandled kind
+  would be a bug in the phase that adds it." Reaching `createPlanNode` with
+  this kind therefore panics via the existing `default` arm — by design, not
+  as an oversight — and `GOOPG_INCREMENTAL_SORT`'s off default keeps that
+  panic unreachable in production until the executor operator lands.
+- **`addIncrementalSortPaths`**, called from `addOrderedPaths`'s tail
+  (`upperordered.go`) right after arm 2's full Sort: for each
+  `ordered.SearchCandidates[i]` whose `ordered.SearchCandidateKeys[i]`
+  shares a genuine PARTIAL prefix with `sortPathkeys`
+  (`pathkeysCountContainedIn`, 0 < nCommon < len(required) — a full match is
+  arm 1's territory for the seed only, a zero-length match is arm 2's), it
+  builds a `PathIncrementalSort` over that candidate priced by
+  `costIncrementalSort(cp, candidate.Cost, candidate.Rows, groups, ncols,
+  avgVarBytes, limitTuples, width)` and offers it to `addPath`.
+- **`groups` (the prefix's `estimate_num_groups`)** is computed via
+  `estimateNumGroups(sortPathkeys[:nCommon]'s Exprs, input.node,
+  int64(candidate.Rows))` — reusing the SEED's own materialized Node as the
+  `child` statistics source for a DIFFERENT candidate's prefix. This is sound
+  specifically because of S2b-2's own Finding 2 (§"S2b-2 result" above):
+  every entry in one call's `Pathlist` is an alternate PHYSICAL strategy for
+  the SAME logical relids, sharing the same base tables/columns/statistics —
+  the seed's Node is a faithful stats source for a sibling's prefix, not an
+  approximation. (`estimateNumGroups`'s `child`-typed-switch column resolver
+  is also nil-safe for a Node it does not recognise, degrading to
+  `defaultNumDistinct` rather than panicking — verified by reading
+  `resolveBaseColumn`/`groupUniqueNDistinct`, joinkeyproof.go/cardinality.go
+  — so an opaque test fixture's `.node` is safe to pass too.)
+- **Materialization stays lazy**, satisfying S2b-2b's own contract: building
+  a `*Path` here allocates no executor Node (`Children: []*Path{candidate}`
+  only), so offering N-1 losing candidates costs nothing beyond the struct
+  itself, and `createPlanNode` still runs exactly once, on whichever path
+  `setCheapest` picks.
+- **GUC note**: PG prices this under its own `enable_incremental_sort` GUC
+  (declared in `catalog.go`/`defaults.go`, default on, but not read by
+  `costParams` — the familiar "declared but unconsumed" shape). This arm
+  reuses `cp.enableSort` instead of wiring a second still-unconsumed flag;
+  deferred to the ledger (`m0141-s7-incremental-sort-guc`) since it is
+  orthogonal to whether the arm exists and the mode gate already keeps
+  production inert.
+
+**Verified, not merely argued, that the fail-loud panic is real**: an
+initial test that ran the new arm through `createOrderedPaths` end-to-end
+with the flag on hit `panic("createPlan: path kind 20 not yet translatable
+(P5.5)")` exactly where the design predicted, because the synthetic
+candidate genuinely won the tournament. The test suite was restructured to
+call `addOrderedPaths` directly (mirroring the existing
+`TestAddOrderedPathsOffersExactlyOneProducerPerInput`) so the ADDED arm is
+exercised without materializing a winner the executor cannot yet emit — the
+same boundary S2b-2b already drew around "never call `createPlanNode` on a
+non-seed candidate before it wins."
+
+**A genuine dominance result, not just a plumbing check**: with a realistic
+seed cost stamped (`legacyDisplayCostOf`, matching what `createOrderedPaths`
+does in production before calling `addOrderedPaths` — the first version of
+the positive test skipped this and got a false negative, since
+`newPrebuiltPath`'s zero-cost seed made the untouched full Sort look
+artificially free), the Incremental Sort candidate's prefix credit correctly
+PRUNES the dominated full-Sort candidate via `addPath`'s ordinary fuzzy-cost
+comparison — both share the identical `Pathkeys` (the full requirement; an
+Incremental Sort still delivers everything, only its cost differs), so a
+strictly cheaper one legitimately evicts the other. That is the entire
+reason this arm exists.
+
+Four new tests (`incrementalsortpaths_test.go`): default-off inertness
+(end-to-end through `createOrderedPaths`, safe because the flag being off
+means the new kind can never be constructed), the positive dominance case
+above, a fully-contained-candidate skip, and a zero-shared-prefix skip.
+`GOOPG_INCREMENTAL_SORT` registered in `flaglabels.go`
+(`flagResolvedState`/`flagProvenanceOrder`) and `scripts/planner-flags.env`
+regenerated (`go run ./cmd/gen-planner-flag-labels`). `go build ./...`,
+`go vet ./internal/optimizer/...`, and `go test ./internal/optimizer/...`
+(full package, including `TestFlagProvenanceEnvIsGenerated`) all clean.
+TPC-DS SF0.25 sweep at the default (flag off, private bin
+`tmp/goopg-s2b2c-bin`, nightly batch was live and holds
+`tmp/goopg-bench-bin`; binary deleted after the run): `PASS=96 MISMATCH=0`,
+`PLAN-SHAPE: changed=0` — byte-identical, confirming production is
+untouched. **S2b-2c is DONE for its filed scope** (the third arm exists,
+gated). The still-open resume points — flip `GOOPG_INCREMENTAL_SORT` on for
+real measurement, build the executor operator, `createplansimple.go`
+wiring, `EXPLAIN` rendering, and re-run S7's 14-query TPC-DS census — belong
+to M0141-S7's own remaining implementation-order steps, not to S2b-2c.

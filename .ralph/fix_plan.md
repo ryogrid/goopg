@@ -2519,12 +2519,49 @@ spill route is net-negative.
     `addOrderedPaths` third arm and its executor operator (a path kind that
     could win the tournament with no node to emit is a new risk class, not
     yet present in the groundwork-only steps S7 has landed so far).
-  - [ ] **M0141-S2b-2c** — the actual payoff: once `cost_incremental_sort`'s
+  - [x] **M0141-S2b-2c** — the actual payoff: once `cost_incremental_sort`'s
     per-candidate prefix credit exists (M0141-S7), let `addOrderedPaths` run
     a real tournament across `Pathlist` instead of the single
     always-cheapest-pre-Sort seed. Filed by S2b-2 (design doc item 3).
-    **BLOCKED on M0141-S7.** Do not attempt before S7 lands — S2b-2's own
-    recon is the proof that doing so earlier cannot move a plan.
+    **DONE 2026-09-17c.** `cost_incremental_sort` and
+    `pathkeysCountContainedIn` had both landed (2026-09-17/2026-09-17b), so
+    this was unblocked; landed as `addIncrementalSortPaths`
+    (`internal/optimizer/incrementalsortpaths.go`), called from
+    `addOrderedPaths`'s tail (`upperordered.go`). Gated off by default
+    (`GOOPG_INCREMENTAL_SORT`, same convention as `GOOPG_PARTIAL_SORT_PATHS`)
+    because `createPlanNode` has no arm for the new `PathIncrementalSort`
+    kind until the executor operator lands — reaching it panics via
+    `createplan.go`'s existing `default` case, deliberately (that file's own
+    "panic loudly rather than silently mis-build" philosophy), which the
+    flag's off default keeps unreachable in production. Verified live: an
+    early test version ran the arm through `createOrderedPaths` end-to-end
+    with the flag on and hit exactly that panic (the synthetic candidate
+    genuinely won); restructured to call `addOrderedPaths` directly so the
+    arm is exercised without materializing a winner the executor cannot emit
+    yet — same boundary S2b-2b's "materialize lazily" contract already
+    drew. With a realistic seed cost stamped (matching what
+    `createOrderedPaths` does in production), the incremental-sort
+    candidate's prefix credit correctly dominates and PRUNES the costlier
+    full-Sort seed candidate via ordinary `addPath` comparison — a genuine
+    cost-driven result, not a plumbing check (the reason this arm exists at
+    all). Four new tests (`incrementalsortpaths_test.go`): default-off
+    inertness, the positive dominance case, a fully-contained-candidate skip,
+    a zero-shared-prefix skip. `GOOPG_INCREMENTAL_SORT` registered in
+    `flaglabels.go` and `scripts/planner-flags.env` regenerated. Gates:
+    `go build ./...`, `go vet ./internal/optimizer/...`,
+    `go test ./internal/optimizer/...` (full package,
+    `TestFlagProvenanceEnvIsGenerated` included) all clean; TPC-DS SF0.25
+    sweep at the default (flag off, private bin `tmp/goopg-s2b2c-bin`,
+    deleted after the run): `PASS=96 MISMATCH=0 PLAN-SHAPE changed=0` —
+    byte-identical, confirming production is untouched. GUC note: reused
+    `cp.enableSort` rather than wiring the dedicated (declared-but-unconsumed)
+    `enable_incremental_sort` GUC — deferred, ledger row
+    `m0141-s7-incremental-sort-guc`. Design doc:
+    `docs/design/0100-0149/m0141-s2b-scoping-decomposition.md` §"S2b-2c
+    landed". **Next**: the executor operator (M0141-S7's own next
+    implementation-order step) is now the concrete blocker for turning
+    `GOOPG_INCREMENTAL_SORT` on to measure — a query where the arm wins would
+    panic today.
   - [ ] **M0141-S2b-3** — WINDOW loop-fix. Gated on S2b-2's actual payoff
     (WINDOW has nothing of its own to loop over until the Pathlist
     tournament exists) — per S2b-2's 2026-09-17 recon, that means gated on
@@ -2731,6 +2768,15 @@ spill route is net-negative.
   step (Finding 3 table row 3, the `PathIncrementalSort`/`addOrderedPaths`
   third arm, which genuinely needs a real multi-candidate `Pathlist` to
   build a presorted-prefix candidate over).
+  **UPDATE 2026-09-17c**: row 3 landed as **M0141-S2b-2c** (see that task's
+  own entry above for the full writeup) — `addOrderedPaths`'s third arm now
+  exists (`internal/optimizer/incrementalsortpaths.go`), gated off by
+  default (`GOOPG_INCREMENTAL_SORT`) because the executor still has no
+  Incremental Sort operator to materialize a winner with. **Still
+  unchecked**: the executor operator is now the concrete next step — without
+  it, turning the flag on to measure against the corpus would panic on the
+  first query where the arm actually wins. `createplansimple.go` wiring and
+  EXPLAIN rendering remain after that.
 
 ## M0142 — Join-order costing (filed 2026-09-14)
 

@@ -123,6 +123,23 @@ const (
 	// — the streaming keyed dedup already reused for DISTINCT's own
 	// unique-over-sorted candidate — over the Sort child this path stacks.
 	PathUnique
+
+	// PathIncrementalSort is M0141-S2b-2c / S7's `addOrderedPaths` third arm
+	// (upperordered.go) — PG's `IncrementalSortPath` (pathnodes.h): a Sort
+	// over a child whose own ordering already satisfies a PREFIX of the
+	// required pathkeys, priced by `costIncrementalSort` (cheaper than a
+	// full `PathSort` because only each prefix-group needs a full in-memory
+	// sort, not the whole input). Produced only by `addIncrementalSortPaths`
+	// (incrementalsortpaths.go), gated off by default
+	// (`GOOPG_INCREMENTAL_SORT`) because `createPlanNode` has no arm for it
+	// yet — no executor node implements Incremental Sort (S7's own
+	// implementation-order list puts the executor operator AFTER this arm).
+	// Reaching `createPlanNode` with this kind therefore panics, by the same
+	// "panic loudly rather than silently mis-build" rule createplan.go's own
+	// header states for every constructed-but-unhandled kind; the flag's
+	// default keeps that panic unreachable in production until the executor
+	// operator lands.
+	PathIncrementalSort
 )
 
 // Path is one way to produce a relation, with a cost and an ordering. It is kept

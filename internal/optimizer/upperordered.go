@@ -144,4 +144,10 @@ func addOrderedPaths(ordered *RelOptInfo, input *Path, sortPathkeys []PathKey, c
 		return
 	}
 	addPath(ordered, sortPathForBounded(input, sortPathkeys, cp, limitTuples), upperOrderedSortProducer)
+
+	// M0141-S2b-2c / S7: the third arm — every OTHER surviving search
+	// candidate that already satisfies a genuine partial prefix of
+	// sortPathkeys gets an Incremental Sort offer too, not just the seed's
+	// full Sort above. Gated off by default; see incrementalsortpaths.go.
+	addIncrementalSortPaths(ordered, input, sortPathkeys, cp, limitTuples)
 }

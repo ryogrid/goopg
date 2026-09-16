@@ -172,6 +172,12 @@ var flagResolvedState = map[string]func(string) string{
 	"GOOPG_INDEX_PROBE_MULT": func(v string) string {
 		return strconv.FormatFloat(indexProbeMultFromEnv(v), 'g', -1, 64)
 	},
+	// M0141-S2b-2c / S7: gates addOrderedPaths' third arm (Incremental Sort
+	// over a losing search candidate). Default off — createPlanNode has no
+	// arm for PathIncrementalSort until the executor operator lands.
+	"GOOPG_INCREMENTAL_SORT": func(v string) string {
+		return incrementalSortModeLabel(incrementalSortModeFromEnv(v))
+	},
 }
 
 // flagProvenanceOrder is the order the flags are stamped in. The first six are
@@ -246,6 +252,10 @@ var flagProvenanceOrder = []string{
 	// Joined at R120 (r120-hashagg-width-currency/SCOPE.md), default `off`.
 	// Retired at M0137-0009 — see flagProvenanceRetired below.
 	"GOOPG_HASHAGG_WIDTH_CURRENCY",
+	// Joined at M0141-S2b-2c / S7: gates addOrderedPaths' third arm
+	// (incrementalsortpaths.go). Default `off` — createPlanNode has no arm
+	// for PathIncrementalSort until the executor operator lands.
+	"GOOPG_INCREMENTAL_SORT",
 }
 
 // flagProvenanceRetired names variables no code reads any more, and the

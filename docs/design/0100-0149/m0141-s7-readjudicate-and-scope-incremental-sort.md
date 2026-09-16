@@ -307,3 +307,39 @@ not. Re-check after each S2b sub-task lands whether the executor operator
 rendering (row 6) can also be staged ahead of the `addOrderedPaths` wiring,
 following the same "independently testable primitive first" pattern this
 task and the 2026-09-17 update both used.
+
+## Update 2026-09-17c — Finding 3 row 3 landed, gated off by default
+
+`M0141-S2b-2c` (`m0141-s2b-scoping-decomposition.md` §"S2b-2c landed") is
+this row: `addOrderedPaths`'s third arm now exists
+(`internal/optimizer/incrementalsortpaths.go`, `addIncrementalSortPaths`),
+consuming `ordered.SearchCandidates`/`SearchCandidateKeys` (S2b-2a/2b),
+`pathkeysCountContainedIn`, and `costIncrementalSort` exactly as this doc's
+own "implement in order" list named. The prior update's open risk —
+"reaching `createPlanNode` with no node kind to emit" if the new arm ever
+won — is resolved by gating the whole arm behind `GOOPG_INCREMENTAL_SORT`
+(default off), the SAME convention `GOOPG_PARTIAL_SORT_PATHS`/
+`GOOPG_PARTIAL_AGG_PATHS` already use, rather than resequencing the executor
+operator ahead of this step. `createPlanNode` still has no
+`PathIncrementalSort` arm — reaching it panics via `createplan.go`'s
+existing `default` case, deliberately, per that file's own "panic loudly
+rather than silently mis-build" philosophy — and the flag's off default
+keeps that panic unreachable in production. Verified live in a test: an
+early version of this change ran the new arm through `createOrderedPaths`
+end-to-end with the flag on and hit exactly that panic, because the
+synthetic candidate genuinely won; the test was restructured to call
+`addOrderedPaths` directly instead, so the arm is exercised without
+materializing a winner the executor cannot emit yet.
+
+TPC-DS SF0.25 sweep at the default (flag off): `PASS=96 MISMATCH=0`,
+`PLAN-SHAPE: changed=0` — byte-identical, confirming this row's landing
+moved nothing in production, as it must at this stage.
+
+**Still unchecked.** Finding 3's remaining rows — flip
+`GOOPG_INCREMENTAL_SORT` on and re-measure against the corpus, row 5 (the
+executor operator), row 4 continuation (`createplansimple.go` wiring), and
+row 6 (EXPLAIN rendering) — are the resume point for whichever loop picks
+this back up next. The executor operator is now the actual blocker for
+`GOOPG_INCREMENTAL_SORT=on` to be safe to measure with at all (today it
+would panic on the first query where the arm wins), so it is the natural
+next step rather than an arbitrary pick.
