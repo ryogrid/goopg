@@ -3079,3 +3079,190 @@ search path end to end (this loop's new test exercises the mechanism
 directly via manually-built `semiAntiChainLink`s, not through the rewrite —
 by design, since the rewrite path is exactly what step (3) has not yet
 touched).
+
+## 28. Step (3) scoping pass — traced live, not assumed: the index-rebase
+premise is wrong, and the real gap is bigger than `unnest.go` (2026-09-16)
+
+Did the dedicated scoping pass §27.4 asked for — traced whether
+`j.Predicate`'s and `j.LeftKey`/`j.RightKey`'s copies of the RHS index are
+the same embedded value or may diverge, per §27.2's open question — by
+reading the actual producer and consumer code, not by re-deriving from the
+comment. Three findings, each changing the shape of the remaining work.
+
+### 28.1 Finding A: `j.Predicate` already uses the SAME local-per-subtree
+convention as every other join type, and `extractSearchLeaves`'s existing
+rebase already handles it — zero special-casing needed
+
+`unnestExistsExpr`'s `outerKey`/`innerKey` (unnest.go:4681-4706) and its
+`joinPredicate` (built by `liftResidualConjunctsWithOffset` over
+`residualsWithPairs`, unnest.go:4760) use IDENTICAL index arithmetic: the
+outer operand is re-resolved by NAME against `outerChild.Output()` (R3-4,
+so its `Index` is LOCAL to `outerChild`, 0-based), and the inner operand
+gets `outerWidth + originalIndex`. This is exactly the "local numbering,
+0-based at this join's own leftmost leaf" convention `extractSearchLeaves`'s
+walk already assumes for EVERY join type (`joinsearchseam.go`:1204-1207's
+own comment: "its qual was resolved against a schema that starts at its
+leftmost leaf"). The Semi/Anti admission arm (lines 1160-1167) reuses the
+walk's existing, type-generic `rebaseChainQual(pred, base)` call verbatim —
+no Semi/Anti-specific rebase code exists or is needed. §27's own new test
+(`TestBuildLeafSpansAttributesRealLeafAfterSyntheticCorrectly`) already
+pins this compatibility at the mechanism level. **Conclusion: `j.Predicate`
+was never at risk; §25.3's "rebase `innerKey.Index`" proposal targeted the
+wrong field.**
+
+### 28.2 Finding B: `j.LeftKey`/`j.RightKey` are execution-only and outside
+every search-time function's reach — and the codebase's OWN convention for
+reconciling a join's keys after its children move already exists and
+already covers Semi/Anti
+
+Grepped every reader of `j.LeftKey`/`j.RightKey` in the optimizer package:
+`extractSearchLeaves`, `buildLeafSpans`, `relidsOfExpr`, `tableForCol` — the
+entire chain layer this milestone touches — read NONE of them. Their only
+readers are execution/cost code (`cardinality.go`, `join_hash_keys.go`,
+`join_exec_keys.go`, `nl_index_join.go`) and one reconciliation pass:
+`joinlayout.go`'s `reresolveJoinByName(j)` re-binds `j.LeftKey`/`j.RightKey`
+(and `j.Predicate`, separately) by NAME+SourceTableIdx against the join's
+ACTUAL current `n.Left`/`n.Right` schemas — the same idiom §26.2 found at
+every `createplan*.go` site, applied here to the "old DP/MHJ-packer moved a
+subtree in place and left stale indices" case rather than a fresh build.
+Its caller, `reconcileNLILayoutBody` (joinlayout.go:543-550), already
+special-cases Semi/Anti CORRECTLY: it recurses into `n.Left` (so a
+reordered/rebuilt left subtree gets its indices re-derived) but SKIPS
+recursing into `n.Right` for `JoinTypeSemi`/`JoinTypeAnti` — matching
+`extractSearchLeaves`'s "RHS stays one opaque leaf" rule exactly — then
+still calls `reresolveJoinByName(n)` unconditionally, which rebinds
+`LeftKey`/`RightKey` too. **This pass is explicitly skipped for a
+PG-shaped-search-produced tree** (`reconcileNLILayout`'s
+`isSearchedTree(node)` guard, backed by `assertSearchedTreeNeedsNoReconcile`
+in searchedtree.go — the search's own coordinate math is asserted to need
+no by-name fallback at all), so it does not currently apply to anything
+`tryPGShapedJoinSearch` produces — but its EXISTENCE and its already-correct
+Semi/Anti carve-out show the codebase already has a working, generalizable
+answer to "how does a join's keys get re-derived when its children's
+internal shape changes", and it required zero new code for Semi/Anti. If a
+future PG-shaped-search plan-build arm for an admitted Semi/Anti pair needs
+the analogous treatment, this is the pattern to extend (by-name rebind
+against the actually-built child, mirroring `reresolveJoinByName`), not an
+index-arithmetic scheme computed at `unnestExistsExpr`'s rewrite time.
+
+**Conclusion: `innerKey.Index`/`outerKey.Index` are never read at search
+time, and the codebase's existing key-reconciliation idiom already handles
+Semi/Anti as a first-class case wherever it currently runs. §25.4's step
+(3), as originally framed ("point `innerKey.Index` at the next synthetic
+slot counter"), targets a field no search-time consumer reads and solves a
+problem the by-name reconciliation idiom already has a generic answer for.
+Step (3) is NOT a coding task — it is moot.**
+
+### 28.3 Finding C (the one that matters): the ONE production call site
+cannot reach a Semi/Anti node at all today, regardless of `admitSemiAnti`,
+and this is a bigger gap than step (3) ever was
+
+Traced `extractSearchLeaves`'s one production caller
+(`joinsearchseam.go:309`, inside `tryPGShapedJoinSearch`) back to where its
+`chain` argument comes from: `runJoinSearchBelowPinned(node, origChain, ctx,
+cat)` (predp.go), called from `planner.go:1533-1535`:
+
+```go
+f := node.(*Filter)
+origChain := f.Child          // captured BEFORE unnest runs
+node = unnestSubqueriesInPlan(node)     // unnestExistsExpr runs HERE
+node = runJoinSearchBelowPinned(node, origChain, ctx, cat)
+```
+
+`origChain` is a snapshot of `f.Child` taken strictly BEFORE
+`unnestSubqueriesInPlan` (which is what actually invokes `unnestExistsExpr`
+and splices in the Semi/Anti `*Join`). `origChain` therefore structurally
+CANNOT contain a Semi/Anti join — not "contains one but the flag declines
+it", but "the tree handed to `extractSearchLeaves` never has one to find".
+This matches `semiantichain_test.go`'s
+`TestExtractSearchLeaves_AdmitSemiAnti_BuildsLinkAndRebuildsSJInfo`, whose
+own setup comment (written by a prior loop, lines 202-208) already flags
+this: it has to hand-splice a Semi/Anti `*Join` into a **post-planned**
+fixture and reconstruct a `Predicate` from `LeftKey`/`RightKey` to exercise
+the arm at all, because no real call reaches it with one.
+
+**Consequence: flipping `admitSemiAnti=true` at the one existing production
+call site (`joinsearchseam.go:309`) is STILL a no-op**, independent of
+anything §25-§27 fixed. Making it matter requires a NEW call that walks the
+POST-unnest tree — i.e. some form of the `predp.go` descend-loop extension
+already named in `-3i-plumbing-b2`'s own fix_plan.md scope ("extend
+`predp.go`'s descend loop to pass through non-Semi/Anti `*Join` nodes
+instead of hard-bailing") turns out to be **load-bearing for reachability,
+not just an optimization** — without it (or an equivalent new call site),
+none of items 6a/6b's remaining wiring has anything to operate on. This was
+implicit in the existing fix_plan.md scope but not previously stated as the
+gating precondition for `admitSemiAnti` to have ANY effect.
+
+### 28.4 Finding D: a genuine, previously undocumented correctness gap for
+whoever DOES wire that call — `semiAntiChainLink.pred` silently drops the
+join's own equijoin condition in the common single-key case
+
+Once a future call reaches a real Semi/Anti join, `extractSearchLeaves`
+captures `semiAntiChainLink{pred: j.Predicate}` — nothing else
+(`semiAntiChainLink` has exactly four fields: `jointype, lhs, rhs, pred`,
+joinsearchseam.go:1449-1453). But `j.Predicate`, for the common
+single-equi-key EXISTS/NOT EXISTS case (`params[0]`, no extra residuals),
+deliberately does NOT contain that equality — it lives ONLY in
+`j.LeftKey`/`j.RightKey` (unnest.go:4708-4726: the EXISTS conjunct is
+dropped from `newConjuncts`/`filter.Predicate` entirely, "the join encodes
+the equality predicate via (LeftKey, RightKey)"). This is a deliberate,
+CORRECT optimization for direct execution — the hash match already enforces
+it, so re-checking it in `Predicate` would be redundant — but it means
+`pred` alone is NOT a complete description of the join's semantics.
+
+Contrast with the ordinary-join convention: `createplanjoin.go`'s
+`joinInputs.joinPredicate` (line 492-504) explicitly appends an equality
+conjunct for EVERY hash-key pair into the emitted node's `Predicate`, on
+top of any residual — this is exactly the discipline the Q9 multi-equality
+bug (cited in that function's own doc comment) was fixed by, and it is what
+makes an ordinary hash join's `Predicate` self-sufficient. `unnestExistsExpr`
+does NOT follow this discipline for `params[0]` (params[1:] DO get folded
+into the predicate as residuals via `extraPairConjuncts`, per R3-4 — only
+the ONE key actually used for the hash is omitted).
+
+**Consequence: any future consumer that reconstructs a plan node from
+`semiAntiChainLink.pred` alone — which is exactly what `-0008c-3c`/`-3d`/`-4`'s
+still-unbuilt Semi/Anti plan-build arm will need to do once a pair is
+admitted into the bushy DP (§26.3's forward note already flagged that layer
+as a fresh design question; this is the specific correctness content that
+design must not miss) — would silently build an unconditional Semi/Anti
+join for the single-key case (matching PG's own nestloop-only Semi/Anti
+convention confirmed by `createplanjoin.go`'s `createHashJoinPlan` comment,
+C-03c: "SEMI/ANTI are nestloop-only" in the search's own path generator
+today), over-matching every LHS row instead of the correct equi-semi-join.
+The fix, when that work starts, is cheap and localized: fold
+`j.LeftKey`/`j.RightKey` into an explicit `OpEq` conjunct before capturing
+`pred` in `extractSearchLeaves`'s semi/anti arm (mirroring
+`joinInputs.joinPredicate`'s own idiom), not a change to `unnestExistsExpr`
+itself.**
+
+### 28.5 Resume point
+
+§25.4's 4-step plan is now fully resolved, but not the way it was framed:
+step (1) design — done (§25/§26). Step (2) leafSpan table — landed (§27).
+Step (3) `innerKey.Index` rebase — **moot** (§28.1/§28.2: no search-time
+reader exists, and the codebase's by-name reconciliation idiom already
+covers Semi/Anti wherever it runs today). Step (4) item 6a's
+`*resolveContext` plumbing — already understood as unnecessary (§25.4/§27.4,
+unchanged).
+
+None of that closes `-3i-plumbing-b2`, because §28.3 surfaces a gap step
+(3) never named: **the predp.go descend-loop extension is not an
+optional/parallel piece of item 6b's scope — it is the precondition for
+`admitSemiAnti=true` to reach any Semi/Anti node at all.** The item's
+remaining scope (fix_plan.md's existing text: predp.go pass-through, item
+6a's `ctx` plumbing, the flip itself) is unchanged in kind but now known to
+require, in this order: (i) wire a call that reaches the post-unnest tree
+(predp.go's descend-loop extension or equivalent — reachability, blocking
+everything else), (ii) when that lands, fix §28.4's dropped-equijoin gap in
+the SAME loop (it would otherwise be a live wrong-rows bug the moment
+`admitSemiAnti` starts doing anything), (iii) only then does flipping
+`admitSemiAnti=true` behind a real end-to-end fixture (§27.4's existing
+gate) become a meaningful test rather than a guaranteed no-op. Likely still
+depends on enough of `M0142-0008c-3c`/`-3d`/`-4` existing for a real
+Semi/Anti pair to be bushy-DP-admissible, per §26.3's forward note — this
+scoping pass did not re-examine that dependency.
+
+Still design-only this loop: no production code changed, nothing to
+regression-gate beyond confirming the trace against live source (every
+file/line cited above was read this loop, not recalled).

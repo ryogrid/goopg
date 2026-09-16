@@ -3788,6 +3788,43 @@ cross-layer programme that has never been scoped.
     Step (4) (6a's `*resolveContext` plumbing) confirmed unneeded, per
     §25.4's own text. **Next loop: scope step (3)** before attempting the
     `admitSemiAnti=true` cutover.
+    **Step (3) scoped (design doc §28, 2026-09-16) — the index-rebase
+    premise was wrong, and the real gap is bigger:** traced live (not
+    assumed) whether `j.Predicate`'s and `j.LeftKey`/`j.RightKey`'s copies
+    of the RHS index diverge. They don't matter the way §25.3/§27.2 framed
+    it: (a) `j.Predicate` already uses the exact local-per-subtree
+    convention every other join type uses, and `extractSearchLeaves`'s
+    existing `rebaseChainQual` call already handles it with zero
+    Semi/Anti-specific code — pinned by §27's own new test; (b)
+    `j.LeftKey`/`j.RightKey` are read by NO search-time function at all
+    (grepped `extractSearchLeaves`/`buildLeafSpans`/`relidsOfExpr`/
+    `tableForCol`) — their only readers are execution/cost code and
+    `joinlayout.go`'s `reresolveJoinByName`, a by-NAME reconciliation pass
+    that ALREADY special-cases Semi/Anti correctly (skips recursing into
+    `n.Right`, still rebinds `LeftKey`/`RightKey`) wherever it runs — so
+    step (3) as coding work is moot, not deferred. **But tracing the one
+    production call site (`joinsearchseam.go:309`'s `chain` argument, back
+    through `runJoinSearchBelowPinned`/`predp.go` to `planner.go:1533-1535`)
+    found `origChain` is captured BEFORE `unnestSubqueriesInPlan` runs — it
+    structurally CANNOT contain a Semi/Anti join, ever, regardless of
+    `admitSemiAnti`.** Flipping the flag at the one existing call site is
+    therefore still a guaranteed no-op; a NEW call over the POST-unnest
+    tree (the predp.go descend-loop extension already named below) is not
+    an optional part of this item's scope, it is the reachability
+    precondition for everything else in it. Also found a genuine,
+    previously undocumented correctness gap for whoever wires that call:
+    `semiAntiChainLink{pred: j.Predicate}` silently drops the join's own
+    equijoin condition in the common single-key case (it lives only in
+    `LeftKey`/`RightKey`, deliberately excluded from `Predicate` since the
+    hash match already enforces it) — must be folded in as an explicit
+    `OpEq` conjunct at capture time (mirroring
+    `createplanjoin.go`'s `joinInputs.joinPredicate` idiom) in the SAME
+    loop that wires the new call, or `admitSemiAnti=true` would silently
+    turn into an unconditional (Cartesian-like) Semi/Anti the moment it
+    does anything. **Next: wire the predp.go descend-loop extension (item
+    6b's own already-filed scope item) as the reachability step, landing
+    the dropped-equijoin fix alongside it before attempting to flip
+    `admitSemiAnti=true` against a real fixture.**
   **Independent, unfiled resume-point hint** (not sized/numbered — noted for
   whoever picks up S5a's own eligibility gate): relaxing
   `whereEligibleForPreDPUnnest` to per-sublink granularity would upgrade
