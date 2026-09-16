@@ -3355,26 +3355,60 @@ cross-layer programme that has never been scoped.
   (`min_lefthand`/`min_righthand`), not just one more `addPath` candidate.
   **Verdict: do not attempt in one sitting** (K24 precedent, same as S2b-2).
   Decomposed into:
-  - [ ] **M0142-0008a-1** — design-only: read PG's `join_is_legal`
+  - [x] **M0142-0008a-1** — design-only: read PG's `join_is_legal`
     (`joinrels.c:350`) and `SpecialJoinInfo` construction in
     `pull_up_sublinks`/`deconstruct_jointree` in full, and produce a
     concrete goopg design (data structure + where it is built + how
-    `joinsearchlevel.go` would consult it). This is the actual K24-style
-    "further scoping pass" — reading code snippets (as this recon did) is
-    not enough to size the implementation.
-  - [ ] **M0142-0008a-2** — implement the `SpecialJoinInfo`-equivalent
-    construction for correlated `EXISTS`/`NOT EXISTS`, gated behind a
-    rollback flag alongside `GOOPG_UNNEST_PREDP`, without yet changing
-    `joinsearchlevel.go`'s enumeration — a landable, unit-testable slice on
-    its own (no plan-shape change expected). Gated on M0142-0008a-1.
-  - [ ] **M0142-0008a-3** — wire `joinsearchlevel.go`'s enumeration to
-    consult the new legality sets and let `addPath`/`addNLIPaths`
-    cost-compare semi/anti placement and algorithm; retire or bypass
+    `joinsearchlevel.go` would consult it). **DONE 2026-09-16, design-only,
+    no production diff.** Design doc:
+    `docs/design/0100-0149/m0142-0008a-1-semi-anti-sji-design.md`. **Two
+    corrections to M0142-0008a's own framing**: (1) this is PG's own
+    previously-scoped-and-deferred "S5b" item (deferral ledger row
+    `csq-R2`, deferred 2026-07-21, explicit reopen criterion — "a query
+    differing from PG ONLY by semi/anti placement" — that the census is
+    suggestive but not yet CONFIRMED evidence for; re-run plan-compare
+    per query before -2/-3 start); (2) goopg already has PG's
+    `SpecialJoinInfo`/`join_is_legal` fully ported and unit-tested for
+    `JOIN_SEMI`/`JOIN_ANTI` (`specialjoin.go`, wired via `collapse.go:514`
+    for ordinary FROM-clause joins) — no new struct/legality algorithm
+    needed. Real gap is four wiring holes, the costliest being that
+    `joinpaths.go`'s `addPathsToJoinrel` declines to build a HASH join
+    for SEMI/ANTI at all today (nested-loop only), while `unnestExistsExpr`
+    already builds hash semi/anti joins directly for every census query
+    with an equijoin pair — wiring -3 without first lifting this gate
+    would regress Q4/Q21/Q22 and the TPC-DS channel-comparison queries
+    from Hash to Nested-Loop-only. Re-scopes -2 (smaller than filed) and
+    splits -3 into three separately-sizable increments — see the design
+    doc §4 for file+line resume points.
+  - [ ] **M0142-0008a-2** — RE-SCOPED by -1 (smaller than originally
+    filed): attach an inert `*SpecialJoinInfo` to `unnestExistsExpr`'s
+    built `*Join` node using the existing `makeSpecialJoinInfoScoped`
+    shrink algorithm (not its parser-facing `sc`/`item`/`lower` signature —
+    the same min-lefthand/min-righthand computation), with nothing
+    consuming it yet — trivially satisfies "no plan-shape change
+    expected". New unit tests from a real `unnestExistsExpr` fixture
+    (today's `JoinSemi`/`JoinAnti` legality tests are unit-only, never
+    exercised end-to-end). See design doc §4.1. Gated on M0142-0008a-1
+    (done).
+  - [ ] **M0142-0008a-3** — RE-SCOPED by -1 into three separately-landable
+    increments (see design doc §4.2): (i) make the decorrelated RHS a
+    real DP-search participant (extend `runJoinSearchBelowPinned` to walk
+    the pinned join's RIGHT child too, give its base rel(s) `RelSet` bits
+    in the same per-search-call numbering as the LHS `bindings`); (ii)
+    legality wiring / end-to-end integration verification of the
+    already-ported `joinIsLegal` SEMI/ANTI arms, then retire
     `runJoinSearchBelowPinned`'s splice-and-reresolve path for the
-    now-natively-searched cases (keep it for Q22's legacy-post-DP class
-    until that is separately addressed). This is the slice that can
-    actually move TPC-DS query10/16/35/69/94 and TPC-H Q4/Q21's plan
-    shapes. Gated on M0142-0008a-2.
+    now-natively-searched cases (keep it for Q22's legacy-post-DP class);
+    (iii) **must happen before or alongside (i)/(ii), not after** — lift
+    `joinpaths.go`'s `nestloopOnly` hash-decline gate for SEMI/ANTI in the
+    natively-searched case (confirm `createPlan`'s hash-join lowering is
+    actually generic over `Jointype: Semi/Anti` first — `addHashJoinPath`
+    already threads `Jointype` through the same as `LEFT`, suggesting the
+    executor side is not the real blocker PG's `create_unique_path`
+    entanglement describes for goopg, but this needs confirming, not
+    assuming). This is the slice that can actually move TPC-DS
+    query10/16/35/69/94 and TPC-H Q4/Q21's plan shapes. Gated on
+    M0142-0008a-2; re-confirm the §4.3 plan-compare gate first.
   **Independent, unfiled resume-point hint** (not sized/numbered — noted for
   whoever picks up S5a's own eligibility gate): relaxing
   `whereEligibleForPreDPUnnest` to per-sublink granularity would upgrade
