@@ -3746,7 +3746,20 @@ cross-layer programme that has never been scoped.
     `joinsearchseam.go` and update `relidsOfExpr`/`tableForCol`; (3) point
     `unnestExistsExpr`'s `innerKey.Index` construction at the new
     out-of-band counter; (4) THEN code 6a (now understood to be unnecessary
-    as a `ctx.bindings` append — the per-leaf table replaces it). New unit
+    as a `ctx.bindings` append — the per-leaf table replaces it).
+    **§25.4's open question CLOSED (design doc §26, 2026-09-16)**: verified
+    the fix does NOT reach the emitted plan. There are two distinct
+    `cumOffsets` arrays sharing a name — `joinsearchseam.go`'s chain-level
+    one (§25's bug) and `relfromjoinlist.go`'s joinlist-item-level one
+    (built from real `ctx.bindings` only, feeds `RelOptInfo.baseOffset` /
+    `createplanjoin.go`'s `translateToLayout`, the mechanism that actually
+    rewrites clause indices into the emitted plan). Every real
+    `createplan*.go` build site re-derives width/offset fresh from the
+    built node's `Output()` (same idiom as `unnestExistsExpr`), never from
+    either `cumOffsets`. The bushy/joinlist layer has zero Semi/Anti
+    awareness today (no code threads a synthetic RHS into it — that is
+    `M0142-0008c-3c`/`-3d`/`-4`'s still-unstarted job), so `-b2`'s fix is
+    confined to the chain layer only. New unit
     test needed: a `(A SEMI JOIN B) JOIN C`-shaped fixture, not covered by
     any `-b1` test.
   **Independent, unfiled resume-point hint** (not sized/numbered — noted for

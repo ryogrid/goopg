@@ -2882,3 +2882,81 @@ lands and is verified against a live fixture exercising the
 `(A SEMI JOIN B) JOIN C ON qualAC`-shaped case directly (a new unit test,
 not just the existing `-b1` tests, none of which exercise a real leaf
 positioned after a Semi/Anti node).
+
+## 26. §25.4's open question answered: the fix is confined to search-internal
+bookkeeping, and does not reach the emitted plan (2026-09-16)
+
+Traced §25.4's remaining open question ("does the final winning-plan build
+step already re-derive `outerWidth` fresh, or does it also need the
+out-of-band scheme") by reading, not assuming.
+
+### 26.1 There are TWO distinct `cumOffsets` arrays sharing a name
+
+`grep -l cumOffsets internal/optimizer/*.go` (excluding tests) returns five
+files, and they split into two unrelated coordinate spaces:
+
+1. **Chain layer** (`joinsearchseam.go`): the `cumOffsets` §25 diagnosed,
+   built from `extractSearchLeaves`'s `widths[]` in WALK order — includes
+   the synthetic Semi/Anti RHS leaf's real width, which is §25's bug.
+   Consumed only by `joinrestrict.go`'s `relidsOfExpr`/`tableForCol` and
+   the chain-recognition/legality functions the working set already lists
+   (`buildRestrictInfos`, `partitionConjunctsForJoinPlanning`,
+   `deriveOuterLinkConstants`, `outerOnQualsOK`,
+   `innerOnQualsBelowNullableOK`, `searchConsumes`, `semiAntiOnQualsOK`)
+   plus `local_filters.go`.
+2. **Bushy/joinlist layer** (`relfromjoinlist.go`): `joinlistProblem.cumOffsets`
+   — one entry per joinlist ITEM (not per chain leaf), built from the
+   `bindings []rangeBinding` slice `bushy.go`'s pre-search pipeline
+   assembles directly from `ctx.bindings` (real FROM items only; see
+   `relfromjoinlist.go`'s `joinlistProblem` doc comment, lines 84-99). This
+   is what `joinsearch.go:430` reads (`rel.baseOffset = bindings[i].offset`)
+   to set `RelOptInfo.baseOffset` (`path.go:636-654`), which
+   `createplanjoin.go`'s `baseRelLayout`/`translateToLayout`
+   (lines 114-171, 205-...) use to rewrite every join clause's `ColumnRef`
+   from search coordinates into the coordinates of the ACTUALLY EMITTED
+   node at plan-build time — goopg's `set_join_references` analogue (the
+   function's own header cites `setrefs.c:2557`).
+
+`relidsOfExpr`/`tableForCol` are generic, parameterized by whichever
+`cumOffsets` their caller passes (`joinrestrict.go:470,575`) — the same
+function serves both layers, with two independent, non-interacting
+coordinate spaces. §25's bug lives entirely in flavor 1; flavor 2 has no
+Semi/Anti-awareness at all today, buggy or otherwise, because nothing feeds
+it one: `joinlistProblem.bindings` is built exclusively from real
+`ctx.bindings` FROM items, and a Semi/Anti pair is not yet an admissible
+joinable unit in the bushy DP — building that admission is exactly
+`M0142-0008c-3c`/`-3d`/`-4`'s still-unstarted job (fix_plan.md ~3668-3670,
+~3724-3725).
+
+### 26.2 Every actual plan-build site already re-derives width fresh, never from search bookkeeping
+
+Cross-checked the codebase's own established idiom at every site that
+constructs a REAL emitted node's coordinates, not just `unnestExistsExpr`:
+`createplannl.go:311` (`outerLay := in.lay[:len(in.outer.Output())]`),
+`unnest.go:2692,2911,3373,3537,4634` (`outerWidth := len(outerChild.Output())`),
+`memoize.go:109`, `nl_index_join.go:839,1542`. Every one re-derives its
+width/offset FRESH from the actually-built `Node`'s real `Output()` at build
+time; none reads either flavor of `cumOffsets`. `cumOffsets` (both flavors)
+is exclusively a SEARCH-time/legality-time artifact — no `createplan*.go`
+function reads it, confirmed by the same five-file grep in §26.1 (none of
+the `createplan*.go` files appear in it).
+
+### 26.3 Answer and its consequence for the resume plan
+
+The fix is confined to search-internal (chain-layer) bookkeeping —
+`joinsearchseam.go` / `joinrestrict.go` / `local_filters.go` /
+`unnest.go`'s `unnestExistsExpr` — and does not reach `relfromjoinlist.go`,
+`path.go`'s `baseOffset`, or any `createplan*.go` build function, because
+those consume the wholly separate, currently synthetic-leaf-free flavor-2
+coordinate space. §25.4's four-step resume order is unchanged; step (1) is
+now closed with evidence instead of open.
+
+**Forward note for whoever picks up `M0142-0008c-3c`/`-3d`/`-4`** (not a
+scope addition to `-b2`, filed here only so it is not rediscovered from
+scratch): once a Semi/Anti pair becomes a real bushy-DP-admissible joinable
+unit, `joinlistProblem.bindings`/`cumOffsets` (flavor 2) will face an
+analogous "does the RHS get its own binding slot, and if so how does its
+width contribute to `baseOffset` for everything after it" design question.
+`-b2`'s fix does NOT pre-solve this — it lives in the other coordinate
+space entirely — so treat it as a fresh design question when that work
+starts, informed by but not settled by §25/§26.
