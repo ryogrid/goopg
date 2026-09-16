@@ -3848,12 +3848,36 @@ cross-layer programme that has never been scoped.
     `GroupedJoinUnaliased` failure (`internal/optimizer` itself passes).
     TPC-H spotcheck SKIPPED per the standing M0142-0003k blocker (shared
     `:65433` cluster's `tpch` data still needs the human-authorized
-    reload — unrelated to this change). **Next: wire the predp.go
-    descend-loop extension (item 6b's own already-filed scope item,
-    `predp.go:96-101`'s current hard-bail on a non-Semi/Anti `*Join`) as
-    the reachability step — this is now the ONLY remaining piece before
-    flipping `admitSemiAnti=true` against a real end-to-end fixture
-    (§27.4's existing gate) becomes a meaningful test.**
+    reload — unrelated to this change).
+    **Step (i) scoping pass (design doc §30, 2026-09-16) — two findings,
+    no production change:** (1) the recurring "likely depends on
+    `M0142-0008c-3c`/`-3d`/`-4`" note (§26.3, repeated in §28.5/§29) is
+    **backwards** — those three items' own fix_plan entries say they are
+    blocked ON this item, not the reverse (`-3c`/`-3d` explicitly: "Also
+    now blocked on `M0142-0008a-3i-plumbing-b2` — do not pick up before
+    that lands"), so this item does NOT need them first. (2) traced live
+    that the obvious design (thread `admitSemiAnti` through `tryJoinSearch`
+    + have `predp.go`'s descend loop stop pinning the outermost spine
+    Semi/Anti join) is **not sufficient**: `tryPGShapedJoinSearch`'s own
+    preamble (`joinsearchseam.go:226-350`) gates on `nrels`/`nprefix`
+    computed from `ctx.bindings`/`ctx.joinlist`, BOTH frozen before
+    `unnestSubqueriesInPlan` runs; a chain rooted above a Semi/Anti join
+    returns one more leaf than `nprefix` knows about, so line 314's
+    `len(scans) != nprefix` "leaf-count" decline fires unconditionally —
+    a DIFFERENT, deeper blocker than the one §28 already found for
+    `origChain`, and NOT fixed by §25-§27's `cumOffsets`→`[]leafSpan` work
+    (that work fixed chain-internal attribution, not this outer
+    ctx.bindings-keyed size gate). Two candidate designs recorded in §30,
+    neither coded: (a) widen `ctx.joinlist`/`ctx.bindings`'s counts to
+    include the synthetic leaf (reopens §24.2's ~24-site audit, though
+    narrower — only 3 preamble reads need it, not the whole chain walk);
+    (b) a parallel entry point bypassing `tryPGShapedJoinSearch`'s
+    preamble that reuses only its post-preamble, already-unnest-agnostic
+    DP-core logic. **Next: decide between (a)/(b) (design decision, not
+    yet scoped as code) before touching `predp.go` or `joinsearchseam.go`
+    again** — coding the `predp.go` descend-loop extension as originally
+    planned would have hit the same "leaf-count" decline and stayed just
+    as inert, for a reason that change alone cannot fix.
   **Independent, unfiled resume-point hint** (not sized/numbered — noted for
   whoever picks up S5a's own eligibility gate): relaxing
   `whereEligibleForPreDPUnnest` to per-sublink granularity would upgrade

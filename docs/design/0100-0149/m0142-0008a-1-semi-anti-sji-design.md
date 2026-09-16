@@ -3341,3 +3341,100 @@ LIVE wrong-rows trap the moment (i) lands, but does not itself make
 `admitSemiAnti=true` reachable. Likely still depends on enough of
 `M0142-0008c-3c`/`-3d`/`-4` existing for a real Semi/Anti pair to be
 bushy-DP-admissible, per §26.3's forward note.
+
+## 30. Step (i) scoping pass — the §26.3 dependency note was backwards, and a
+new, deeper blocker found (2026-09-16)
+
+Two findings this loop, both from live tracing (fix_plan.md cross-check +
+`joinsearchseam.go` read), neither from re-deriving the prior 29 sections.
+
+**Finding 1 — §26.3's "depends on `M0142-0008c-3c`/`-3d`/`-4`" note is
+backwards.** `.ralph/fix_plan.md`'s own `M0142-0008c-3c`/`-3d` entries state
+the dependency in the OPPOSITE direction: *"Also now blocked on
+`M0142-0008a-3i-plumbing-b2` — do not pick up before that lands; no TPC-DS
+measurement can distinguish 'correct but unreachable' from 'wrong' while
+`addPathsToJoinrel` never receives a real SEMI/ANTI `sjinfo`."* `-0008c-3a`/
+`-3b` (the dispatch-arm ports these two items build on) are already `[x]`
+DONE. So the true shape is: **`-3i-plumbing-b2` unblocks `-0008c-3c`/`-3d`,
+not the reverse** — §26.3's forward note (repeated verbatim at the tail of
+§28.5 and §29) was carried forward across three sections without
+re-verification against fix_plan.md's own text. This removes one false
+prerequisite from step (i)'s critical path: `-3i-plumbing-b2` does NOT need
+`-0008c-3c`/`-3d`/`-4` to land first.
+
+**Finding 2 — a second, deeper reachability blocker, independent of the
+`predp.go` descend loop, inside `tryPGShapedJoinSearch` itself
+(`joinsearchseam.go:216-350`).** The obvious first design for step (i) —
+thread an `admitSemiAnti bool` through `tryJoinSearch` (4 call sites:
+`predp.go:139`, `planner.go:1544/1569/1606`; only `predp.go:139` would ever
+pass `true`) and have `predp.go`'s descend loop stop pinning the outermost
+spine Semi/Anti `*Join` so the tree it hands to `tryJoinSearch` actually
+contains one — is **not sufficient by itself**, traced live line by line:
+
+- `tryPGShapedJoinSearch`'s preamble computes `nrels := len(ctx.bindings)`
+  (`:226`) and `nprefix := jl.nrels()` from `ctx.joinlist` (`:261`), **both
+  fixed at FROM-clause-resolution time, strictly before
+  `unnestSubqueriesInPlan` runs** (re-confirmed live this loop, matching
+  §22.3's original finding for a different call site).
+- After `extractSearchLeaves(chain, admitSemiAnti)` returns (`:309`), the verify
+  `if len(scans) != nprefix { … return … false }` at `:314-317` ("leaf-count"
+  decline) compares the search's own leaf count against that FROZEN
+  pre-unnest `nprefix`. A chain rooted above a Semi/Anti join with
+  `admitSemiAnti=true` returns one MORE leaf (the synthetic RHS leaf `-b1`
+  already builds) than `ctx.joinlist` knows about, so `len(scans) ==
+  nprefix+1` and this exact line declines the search with `"leaf-count"`
+  every time. Two more `ctx.bindings`-keyed checks downstream
+  (`:333`'s per-leaf `offset` agreement, `:347`'s `spine-offset-disagreement`)
+  would fail the same way for the same reason if `:314` were bypassed.
+- This is a **different** mechanism than what §25/§26/§27 already fixed.
+  §25-§27's `cumOffsets`→`[]leafSpan` work fixed attribution INSIDE the
+  chain walk (`relidsOfExpr`/`tableForCol`, fed by `extractSearchLeaves`'s
+  own `widths` return, e.g. the `cumOffsets := buildLeafSpans(widths, nil)`
+  local at `:331` and the `relidsOfExpr(c, cumOffsets)` call at `:408`) —
+  those are fine with a widened `scans`/`widths` because they derive fresh
+  from `extractSearchLeaves`'s own return values, not from `ctx.bindings`/
+  `ctx.joinlist`. The blocker found here is the OUTER gating in
+  `tryPGShapedJoinSearch`'s preamble, which is keyed off the frozen
+  pre-unnest `ctx.bindings`/`ctx.joinlist` and has no knowledge of a
+  synthetic leaf at all.
+
+**Consequence for §25.4's item-6a verdict.** §25.4 confirmed "6a's
+`*resolveContext` plumbing" unneeded, but that finding was scoped to
+whether a live `ctx.bindings` ENTRY is needed for the chain-internal
+column-index mechanism (answer: no, the per-leaf span table replaces it).
+It did not examine — and this loop confirms it did NOT cover —
+`tryPGShapedJoinSearch`'s own SEPARATE, earlier use of `ctx.bindings`/
+`ctx.joinlist` as SIZE/COUNT oracles (`nrels`, `nprefix`, the three decline
+checks above). Those are a genuinely different consumer of the same two
+fields. §25.4's "unneeded" verdict stands for the mechanism it examined and
+does NOT extend to this one.
+
+**Two candidate designs for step (i), neither coded this loop:**
+
+1. **Widen `ctx.joinlist`/`ctx.bindings`** (or a fresh, unnest-aware
+   equivalent of the two counts they supply) so `nrels`/`nprefix` account
+   for the synthetic Semi/Anti RHS leaf before `tryPGShapedJoinSearch`'s
+   preamble runs. Reopens the exact side-channel-vs.-audit question §24.2
+   raised (a live `ctx.bindings` append is visible to ~24 other consumer
+   sites, one of which — `FOR UPDATE`/`FOR SHARE` no-target-list locking,
+   `planner.go:2523`/`:2539` — nil-pointer-panics on it unconditionally) —
+   except now the append only needs to be visible to `tryPGShapedJoinSearch`'s
+   three preamble reads, not to the chain walk, which narrows the audit
+   surface versus §24.2's framing.
+2. **A dedicated, parallel entry point** for the "search includes one pinned
+   Semi/Anti leaf" case that bypasses `tryPGShapedJoinSearch`'s
+   `ctx.bindings`/`ctx.joinlist`-keyed preamble (`:223-350`) entirely and
+   reuses only the post-preamble DP-core logic (conjunct partitioning
+   onward, `:396+`, which is already `cumOffsets`/`widths`-driven and
+   therefore already unnest-agnostic). Avoids touching the ~24-site
+   `ctx.bindings` consumer surface at all, at the cost of a second code path
+   through the search seam that has to be kept in sync with the first.
+
+**Next step:** decide between the two designs above (design-doc-only
+decision, not scoped this loop) before touching `predp.go` or
+`joinsearchseam.go` again — coding the `predp.go` descend-loop extension
+first, as originally planned, would have produced a change that still hits
+the `:314` "leaf-count" decline and is therefore just as inert as today, for
+a reason the descend-loop change itself cannot fix. `M0142-0008c-3c`/`-3d`
+remain available to pick up independently once `-3i-plumbing-b2` lands
+(Finding 1) but are not themselves blocking step (i)'s design decision.
