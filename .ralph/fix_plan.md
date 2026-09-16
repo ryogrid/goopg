@@ -3496,22 +3496,51 @@ cross-layer programme that has never been scoped.
   `addPath` candidate for a pinned SEMI join is a K24-class "materially larger
   task" (like -0008a itself was) before doing anything else. Captures:
   `tmp/m0142-0008a-census/{goopg,pg}_explains.txt` (Q10/Q35 sections).
-- [ ] **M0142-0008d — EXPLAIN mislabels the outer relation's alias in a
+- [x] **M0142-0008d — EXPLAIN mislabels the outer relation's alias in a
   self-correlated EXISTS where inner and outer share a table name** — filed
-  by M0142-0008a-3(iii)'s §4.3 gate re-run (design doc §6). TPC-DS Q16/Q94
-  both correlate `outer_alias.col = inner_alias.col` on the SAME base table
-  (`catalog_sales cs1`/`cs2`, `web_sales ws1`/`ws2`); goopg's `EXPLAIN` prints
-  the OUTER relation's column with the INNER alias in the `Hash Cond`/`Join
-  Filter` lines (e.g. `Hash Cond: (cs2.cs_order_number = cs2.cs_order_number)`
-  where the real predicate is `cs1.cs_order_number = cs2.cs_order_number`) —
-  a real user-visible PG-compatibility defect (a DBA reading the plan sees
-  the wrong join key) even though **execution is unaffected**: both queries'
-  actual results match PG row-for-row (verified this loop). Resume point:
-  the plan-printer's column-to-RTE alias resolution for a correlated
-  subquery's outer reference, likely in the `unnestExistsExpr`/`predp.go`
-  lowering path where the outer reference gets rebound to the subquery's own
-  RTE numbering. Captures: `tmp/m0142-0008a-census/goopg_explains.txt`
-  (Q16/Q94 sections).
+  by M0142-0008a-3(iii)'s §4.3 gate re-run (design doc §6). **DONE 2026-09-16
+  as a recon (design doc §9): root cause found and REPRODUCED
+  independently of TPC-DS** (a throwaway single-table self-correlated
+  EXISTS on a scratch cluster shows the identical bug), correcting the
+  original filing's "small/self-contained" framing. Real cause:
+  `ColumnRef.SourceTableIdx` restarts at 1 per query level, so the outer
+  table and the EXISTS body's table can collide on the same raw value once
+  `unnestExistsExpr` splices the body into the outer tree as an ordinary
+  join child; `explain_names.go`'s `bySrc` map holds one relation name per
+  raw value, so whichever scan wins the walk-order race supplies the name
+  for *both* sides' `Hash Cond`/`Join Filter`. Blast radius is narrower than
+  it looks (join.schema only exposes outer columns, so the collision is
+  reachable only through the join's own Predicate/LeftKey/RightKey; node
+  *labels* are unaffected, a separate disambiguation pass) but the fix is
+  bigger than it looks — a one-site patch to the join-key construction does
+  NOT fix it, because `collect()` resolves names off the *scan node's own
+  schema*, not off the join-level ColumnRefs; a faithful fix needs a
+  `clonePlanReplacingOuter`-shaped tree-wide renumber (15 `Node` cases,
+  ~500 lines) applied to the EXISTS body before splicing. Execution/row
+  counts are unaffected (verified) — display-only. Follow-up filed as
+  **M0142-0008e** (below), not blocking M0142-0008a-3(i)/(ii)/(iii).
+- [ ] **M0142-0008e — fix the EXPLAIN self-correlated-EXISTS alias collision
+  found by M0142-0008d's recon (design doc §9)** — implement
+  `remapSourceTableIdx(node Node, offset int16) Node` in
+  `internal/optimizer/unnest.go` mirroring `clonePlanReplacingOuter`'s
+  Node-case set (`unnest.go:1492-1998`), rewriting every
+  `SchemaColumn.SourceTableIdx` (on the node types that store their own
+  `schema` field — `SeqScan`/`IndexScan`/`Project`/`Aggregate`/`CTEScan`/etc;
+  `Filter`/`Sort`/`Limit`/`Memoize` delegate to `Child.Output()` and need no
+  change) and every `ColumnRef`/`OuterColumnRef.SourceTableIdx` by `offset`.
+  Apply it to `innerPlan` right after `clonePlanReplacingOuter` builds it
+  (`unnest.go:4277`) with an offset guaranteed larger than any
+  `SourceTableIdx` used in `outerChild.Output()`, and apply the SAME offset
+  when constructing `innerKey` (`unnest.go:~4390`) and the residual's
+  inner-side `ColumnRef`s (`liftResidualConjuncts`'s `*ColumnRef` case,
+  `unnest.go:~4056`). Add a unit test asserting the EXPLAIN text directly
+  (`cs1.cs_order_number = cs2.cs_order_number`, not a self-comparison) —
+  the plan-shape/row-count gates cannot catch this bug class (execution is
+  correct; only the printed text is wrong). Repro query (works on any
+  scratch cluster, no TPC-DS data needed):
+  `CREATE TABLE t(a int, b int); EXPLAIN SELECT 1 FROM t t1 WHERE EXISTS
+  (SELECT 1 FROM t t2 WHERE t2.a = t1.a AND t2.b <> t1.b);`. Display-only —
+  does not block M0142-0008a-3(i)/(ii)/(iii) or M0142-0008c.
 - [x] **M0142-0008b — scoping recon: measure the blast radius of widening
   the DP-search gate to filterless INNER/CROSS trees** — filed by
   M0142-0008. `planner.go:1590-94`'s own comment already names the fix

@@ -642,3 +642,118 @@ lets `addPath` actually cost-compare Hash against NLI for the EXISTS/NOT
 EXISTS-decorrelated joins the original census (M0142-0008a-3(iii)'s §4.3
 gate re-run, §6 above) named as the prize — TPC-DS query10/16/35/69/94 and,
 once `:65433` is reloaded, TPC-H Q4/Q21.
+
+## 9. M0142-0008d root-cause found — re-scoped, NOT a small fix (2026-09-16)
+
+M0142-0008d was filed by §6's census as "EXPLAIN mislabels the outer
+relation's alias" and described as small/self-contained. This section's
+investigation (empirical repro, not just reading) finds the real defect and
+corrects the sizing: it is a genuine cross-scope identity collision, and a
+faithful fix needs the same tree-wide-rewrite shape as `clonePlanReplacingOuter`
+(~500 lines, 15 `Node` cases), not a one-site patch.
+
+**Repro** (`/tmp` throwaway cluster, port 5533, not TPC-DS-dependent — the
+bug is general to any self-correlated EXISTS, confirmed independent of the
+TPC-DS schema):
+
+```sql
+CREATE TABLE catalog_sales (cs_order_number int, cs_warehouse_sk int, cs_ship_date_sk int);
+EXPLAIN SELECT count(distinct cs1.cs_order_number)
+FROM catalog_sales cs1
+WHERE EXISTS (
+  SELECT 1 FROM catalog_sales cs2
+  WHERE cs2.cs_order_number = cs1.cs_order_number
+  AND cs2.cs_warehouse_sk <> cs1.cs_warehouse_sk
+);
+--        ->  Hash Semi Join
+--              Hash Cond: (cs1.cs_order_number = cs1.cs_order_number)   -- should be cs1 = cs2
+--              Join Filter: (cs1.cs_warehouse_sk <> cs1.cs_warehouse_sk) -- should be cs1 <> cs2
+--              ->  Seq Scan on catalog_sales cs1
+--              ->  Seq Scan on catalog_sales cs2
+```
+
+(TPC-DS Q16/Q94 show the identical bug with the losing side flipped — both
+print `cs2`/`ws2` instead of `cs1`/`ws1`, confirming the direction of the
+collision is walk-order-dependent, not fixed.)
+
+**Root cause.** `ColumnRef.SourceTableIdx`/`OuterColumnRef.SourceTableIdx`
+(`plan.go:434,458`) is a *per-query-level* counter that restarts at 1 for
+every subquery scope (documented at `explain_names.go:70-81`). Two
+independent tables that each happen to be first-in-their-FROM-list — here
+`cs1` (outer level 0) and `cs2` (EXISTS body, its own level 1) — land on the
+*same* raw `SourceTableIdx` value while they are two separate scopes with
+their own scan node and RTID. `unnestExistsExpr`'s hash-key and residual
+construction (`joinpaths`-adjacent code at `unnest.go:4379-4396`, the
+`outerKey`/`innerKey` `ColumnRef` literals, and `liftResidualConjuncts`'s
+`*ColumnRef` case at `unnest.go:~4056`) copies each side's `SourceTableIdx`
+verbatim from its pre-flatten per-level value into the merged Join's
+Predicate/LeftKey/RightKey. Once the EXISTS body is spliced into the outer
+tree as an ordinary `Join.Right` child (no longer a "hanging" sublink body
+reached via `NodeSubplans`), `explain_names.go`'s `collect()` walks it as
+part of the *same* tree and both the `cs1` scan and the `cs2` scan attempt to
+register the *same* `SourceTableIdx` key in `nm.bySrc: map[int16]int32`
+(`explain_names.go:82`, `explainSingleSourceIdx`, `explain_names.go:355`).
+That map holds one relation name per raw value; whichever scan node's
+registration wins the walk-order race is the name *every* `ColumnRef`
+carrying that raw value renders with — including the ColumnRef that meant
+the *other* table. This is the same `bySrc` mechanism §0/`explain_names.go`'s
+own doc comment credits for correctly resolving an `OuterColumnRef` printed
+*as* an `OuterColumnRef` (Q30's `ctr1.ctr_state` case, still correct today,
+re-verified) — it was designed for exactly one collision direction (outer
+level 0 always registers before a still-nested sublink body) and silently
+breaks once `unnestExistsExpr` turns the inner scope into an ordinary sibling
+in the *same* level instead.
+
+**Blast radius is narrower than "any column in the EXISTS body", not wider.**
+Two things keep this from being a bigger bug than it looks:
+- The Semi/Anti join's own `schema` field is `outerChild.Output()` only
+  (`unnest.go:4470`) — nothing above the join ever sees an inner-scope
+  column, so the collision is reachable *only* through the join's own
+  `Predicate`/`LeftKey`/`RightKey` — confirmed by testing a residual that is
+  *not* lifted (`cs2.cs_ship_date_sk > 3`, left on the scan): it renders
+  bare/unqualified (`Filter: (cs_ship_date_sk > 3)`), because upstream's own
+  `varprefix=false` rule for a plain scan qual (`formatExprQual`'s
+  `*optimizer.ColumnRef` comment) means a scan-local filter never calls
+  `column()` with `qualify=true` in the first place — the collision is dormant
+  there regardless of which scan won the `bySrc` race.
+- Node *labels* ("Seq Scan on catalog_sales cs2") are correct in both repros
+  above — label disambiguation is a separate pass (`nodeLabels`,
+  `explain_names.go:83-92`, M0128-P5.1) untouched by this bug.
+
+**Why the fix is not a one-site patch.** Fixing only `outerKey`/`innerKey`/the
+residual `ColumnRef` case's `SourceTableIdx` does not fix the bug: `collect()`
+resolves a `SourceTableIdx` back to a relation name by reading it off the
+*scan node's own schema* (`explainSingleSourceIdx(node)` over `n.Output()`),
+not off the join-level `ColumnRef`s. A ColumnRef with a fresh, non-colliding
+value would only fall through to bare/unqualified (`bySrc` has no entry for
+it) rather than resolve to the right name — correct-ish but not PG-faithful.
+A fully correct fix must renumber the *scan node's own* `Output()` schema
+(and every intermediate node's own schema copy — `SeqScan`/`IndexScan`/
+`Project`/`Aggregate`/`CTEScan`/etc. each store `schema` directly; only
+`Filter`/`Sort`/`Limit`/`Memoize` delegate to `Child.Output()` and need no
+change, per `plan.go`'s `Output()` methods) for the *entire* `innerPlan`
+subtree to a value range disjoint from the outer scope, consistently with
+whatever value the join-level `ColumnRef`s are given. The only existing code
+that walks every `Node` kind `innerPlan` can contain post-strip is
+`clonePlanReplacingOuter` (`unnest.go:1492-1998`, 15 `Node` cases, ~500
+lines) — a faithful fix is a sibling of that function (a
+`remapSourceTableIdx(node Node, offset int16) Node` walking the same case
+set, rewriting every `SchemaColumn.SourceTableIdx` and every
+`ColumnRef`/`OuterColumnRef.SourceTableIdx` it finds by `offset`), not a
+3-line change to `unnest.go:4379-4396`. Sizing this against the M0142-0008a
+scoping precedent (a task this size gets split, not blindly implemented):
+this is its own K24-class increment.
+
+**Resume point** (filed as **M0142-0008e**, below — 0008d is closed as this
+recon): implement `remapSourceTableIdx` mirroring `clonePlanReplacingOuter`'s
+case set, apply it to `innerPlan` in `unnestExistsExpr` (`unnest.go:4277`,
+right after `clonePlanReplacingOuter` builds it) with an offset guaranteed
+larger than any `SourceTableIdx` used in `outerChild.Output()`, and apply the
+*same* offset to `innerKey`/the residual's inner-side `ColumnRef`s built
+afterward. Needs a targeted unit test asserting the EXPLAIN text directly
+(`cs1.cs_order_number = cs2.cs_order_number`, not the self-comparison) —
+the existing plan-shape/row-count gates (TPC-DS SF0.25, TPC-H spot-check)
+cannot catch this class of bug at all, since execution is unaffected and
+row counts are correct; only the printed text is wrong. Not on the critical
+path for M0142-0008a-3(i)/(ii)/(iii)'s TPC-DS query10/16/35/69/94 prize —
+purely a display-correctness defect, deferred without blocking anything.
