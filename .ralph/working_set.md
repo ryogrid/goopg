@@ -115,9 +115,5 @@ failure the prior 4 loops already found; `internal/optimizer` passes.
 status/progress-completed inconsistency (previous loop's clean-exit marker,
 not a real project-completion signal) — consistent after repair.
 
-In-flight: none. Uncommitted: yes — this loop's diff (joinsearchseam.go,
-the two test files, fix_plan.md, deferral_ledger.md, the design doc, and
-docs/design/README.md) has NOT been committed yet; the next loop (or this
-one, if turns remain) should `git add` those specific paths and commit
-before doing anything else, per the "commit at a natural checkpoint" rule —
-the suite is green and this is a coherent stopping point.
+In-flight: none. Committed as b68e29e92 (pgbench smoke pre-commit gate
+PASS). Nothing outstanding from this loop.
