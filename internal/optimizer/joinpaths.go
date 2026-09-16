@@ -158,27 +158,45 @@ func isKeyableFor(ri *restrictInfo, outer, inner RelSet) bool {
 // answers by falling back to the syntactic join shape — the same outcome the
 // pre-C-03 tree reaches by declining the whole search for FULL, and the reason
 // this is inert. Deferral ledger: `C-03c FULL-join-search-decline`.
-func jointypeForDirection(sjinfo *SpecialJoinInfo, outer, inner RelSet) (parser.JoinType, bool) {
+// uniqueSide is joinpath.c's private JOIN_UNIQUE_OUTER/JOIN_UNIQUE_INNER
+// sentinel (joinpath.c:116-121, quoted in design doc §16.1): PG's own comment
+// is explicit that these "are not allowed to propagate outside this module"
+// — they ride alongside the real `parser.JoinType` (which stays JoinSemi)
+// rather than replacing it, so the parser and executor never see one.
+// `addPathsToJoinrel` demotes any non-`uniqueSideNone` result to
+// `parser.JoinInner` before calling a builder; M0142-0008c-3b is what
+// teaches `addNestLoopPath`/`addNLIPaths` to also substitute the named side's
+// path with `createUniquePath`'s result — until it lands, this value names
+// which side WOULD be substituted without yet substituting it.
+type uniqueSide int
+
+const (
+	uniqueSideNone uniqueSide = iota
+	uniqueSideOuter
+	uniqueSideInner
+)
+
+func jointypeForDirection(sjinfo *SpecialJoinInfo, outer, inner *RelOptInfo, cp costParams) (parser.JoinType, uniqueSide, bool) {
 	// No SpecialJoinInfo: a plain inner join, which is what `joinIsLegal`
 	// returns for every pair in a query with no outer/semi/anti join at all
 	// (its `len(s.joinInfoList) == 0` fast path). Both directions are legal —
 	// PG's JOIN_INNER arm, joinrels.c:908-921.
 	if sjinfo == nil {
-		return parser.JoinInner, true
+		return parser.JoinInner, uniqueSideNone, true
 	}
 	switch sjinfo.Jointype {
 	case parser.JoinInner, parser.JoinCross:
 		// A SpecialJoinInfo is never built for these, but a caller that
 		// synthesises one must not accidentally take the outer-join path.
-		return parser.JoinInner, true
+		return parser.JoinInner, uniqueSideNone, true
 	case parser.JoinFull:
 		// See the FULL note above: no direction, no path, no plan.
-		return parser.JoinFull, false
+		return parser.JoinFull, uniqueSideNone, false
 	case parser.JoinLeft:
 		// Forward: the outer covers MinLefthand, the inner MinRighthand —
 		// PG's JOIN_LEFT arm (joinrels.c:932-935).
-		if relsSubset(sjinfo.MinLefthand, outer) && relsSubset(sjinfo.MinRighthand, inner) {
-			return parser.JoinLeft, true
+		if relsSubset(sjinfo.MinLefthand, outer.Relids) && relsSubset(sjinfo.MinRighthand, inner.Relids) {
+			return parser.JoinLeft, uniqueSideNone, true
 		}
 		// C-06s — the commuted direction: the outer covers MinRighthand,
 		// the inner MinLefthand. PG's JOIN_LEFT arm calls
@@ -191,25 +209,43 @@ func jointypeForDirection(sjinfo *SpecialJoinInfo, outer, inner RelSet) (parser.
 		// PG's `Hash Right Join` shape, byte-identical values, ~30% faster
 		// measured). Scope is LEFT ONLY and fail-closed: SEMI/ANTI keep
 		// declining below (no executor arms), FULL above.
-		if relsSubset(sjinfo.MinRighthand, outer) && relsSubset(sjinfo.MinLefthand, inner) {
-			return parser.JoinRight, true
+		if relsSubset(sjinfo.MinRighthand, outer.Relids) && relsSubset(sjinfo.MinLefthand, inner.Relids) {
+			return parser.JoinRight, uniqueSideNone, true
 		}
-		return parser.JoinLeft, false
+		return parser.JoinLeft, uniqueSideNone, false
 	case parser.JoinRight, parser.JoinSemi, parser.JoinAnti:
 		// JoinRight keeps forward-only containment: a surviving JoinRight
 		// SJI names a deep-nested RIGHT link (S9.4 flips first-position
 		// RIGHTs to LEFT at the jointree), whose commuted admission needs
 		// the nested-AST work ledgered there — out of scope for C-06s,
 		// which withholds one direction, never a wrong answer.
-		if relsSubset(sjinfo.MinLefthand, outer) && relsSubset(sjinfo.MinRighthand, inner) {
-			return sjinfo.Jointype, true
+		if relsSubset(sjinfo.MinLefthand, outer.Relids) && relsSubset(sjinfo.MinRighthand, inner.Relids) {
+			return sjinfo.Jointype, uniqueSideNone, true
 		}
-		return sjinfo.Jointype, false
+		// M0142-0008c-3a — the symmetric unique-ify fallback, SEMI only.
+		// PG's admission for JOIN_UNIQUE_OUTER/INNER (joinpath.c, quoted in
+		// design doc §16.1/19.3) does not require MinLefthand/MinRighthand
+		// containment at all: it fires whenever the candidate rel is
+		// EXACTLY the semijoin's syntactic RHS (bit-EQUALITY against
+		// SynRighthand, not subset — the ordinary check above already
+		// covers subset containment) and `create_unique_path` can actually
+		// unique-ify it. Declines (returns false) rather than guesses when
+		// createUniquePath itself declines (e.g. SemiCanBtree false, or a
+		// non-ColumnRef uniq expr — see createUniquePath's own comments).
+		if sjinfo.Jointype == parser.JoinSemi {
+			if sjinfo.SynRighthand == inner.Relids && createUniquePath(inner, inner.CheapestTotal, sjinfo, cp) != nil {
+				return sjinfo.Jointype, uniqueSideInner, true
+			}
+			if sjinfo.SynRighthand == outer.Relids && createUniquePath(outer, outer.CheapestTotal, sjinfo, cp) != nil {
+				return sjinfo.Jointype, uniqueSideOuter, true
+			}
+		}
+		return sjinfo.Jointype, uniqueSideNone, false
 	default:
 		// An unrecognised jointype is PG's `elog(ERROR)` (joinrels.c:1031).
 		// goopg cannot raise from path generation, so it declines the
 		// direction — the fail-closed equivalent.
-		return sjinfo.Jointype, false
+		return sjinfo.Jointype, uniqueSideNone, false
 	}
 }
 
@@ -259,9 +295,19 @@ func addPathsToJoinrel(s *searchCtx, joinrel, outer, inner *RelOptInfo, clauses 
 
 	// C-03b — which join does THIS direction perform, and may it be performed
 	// at all. See jointypeForDirection.
-	jt, legal := jointypeForDirection(sjinfo, outer.Relids, inner.Relids)
+	jt, uniq, legal := jointypeForDirection(sjinfo, outer, inner, cp)
 	if !legal {
 		return nil
+	}
+	// M0142-0008c-3a: fully resolve the sentinel before calling ANY builder.
+	// `uniq` names which side jointypeForDirection found unique-ifiable, but
+	// no builder yet knows to substitute that side's path with
+	// `createUniquePath`'s result (M0142-0008c-3b) — until then, demote to a
+	// plain inner join, which is exactly the PG-side shape a caller sees
+	// once `create_unique_path` succeeds and the jointype is demoted to
+	// JOIN_INNER before any Path is built (joinpath.c:116-121).
+	if uniq != uniqueSideNone {
+		jt = parser.JoinInner
 	}
 	// M0142-0008a-3(iii): SEMI/ANTI remain MERGE-declined — goopg's merge-join
 	// executor (join_merge_stream.go) has no early-exit/dedup handling for

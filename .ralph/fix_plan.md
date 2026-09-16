@@ -3746,28 +3746,38 @@ cross-layer programme that has never been scoped.
   two builders. Decomposed into **M0142-0008c-3a..3d** below, ordered by the
   Q10/Q35 evidence (3a/3b are what the witnesses need; 3c/3d are deferred,
   unexercised). Resume point: design doc §19.
-- [ ] **M0142-0008c-3a — `jointypeForDirection` admission dispatch for
+- [x] **M0142-0008c-3a — `jointypeForDirection` admission dispatch for
   unique-ify** — filed by M0142-0008c-3's recon (design doc §19.3-19.4 item
-  3a). Depends on M0142-0008c-1/-2. Change `jointypeForDirection`'s signature
-  from `(sjinfo, outer, inner RelSet)` to accept the `*RelOptInfo`s (and
-  `costParams`) it needs to call `createUniquePath`; add the symmetric
-  fallback arm for `JoinSemi` when the ordinary `MinLefthand`/`MinRighthand`
-  subset check fails: `sjinfo.SynRighthand == inner` (bit-equality, not
-  subset) + a successful `createUniquePath` on that rel → admit as
-  `JoinTypeUniqueInner`; `sjinfo.SynRighthand == outer` under the same
-  conditions → `JoinTypeUniqueOuter`. Represent the two synthetic values as a
-  small `internal/optimizer`-private type, NOT new `parser.JoinType` consts
-  (PG's own comment, `joinpath.c:116-121`, is explicit these must never
-  propagate outside the join-path module — goopg's parser/executor must
-  never see one). `addPathsToJoinrel` fully resolves the sentinel
-  (substitute + demote to `parser.JoinInner`) before calling ANY builder, so
-  this task alone should produce **zero plan-shape change** anywhere
-  (explicit acceptance check via `tpcds-sf025-regression.sh sweep`, not just
-  "no crash") — 3b is what makes it live. Resume point: design doc §19.3-19.4
-  item 3a.
+  3a). Depends on M0142-0008c-1/-2. **DONE 2026-09-16** (design doc §19.5):
+  `jointypeForDirection`'s signature changed from `(sjinfo, outer, inner
+  RelSet)` to `(sjinfo, outer, inner *RelOptInfo, cp costParams)`, returning a
+  third value — a new `internal/optimizer`-private `uniqueSide` type
+  (`uniqueSideNone`/`Outer`/`Inner`), NOT a new `parser.JoinType` const (per
+  PG's own `joinpath.c:116-121` comment that `JOIN_UNIQUE_OUTER/INNER` must
+  never propagate outside the join-path module). New fallback arm for
+  `JoinSemi` when the ordinary subset check fails: bit-equality (not subset)
+  between `sjinfo.SynRighthand` and whichever rel is being tested, plus a
+  successful `createUniquePath` call on that rel. `addPathsToJoinrel`
+  resolves the sentinel immediately (`if uniq != uniqueSideNone { jt =
+  parser.JoinInner }`) before calling any builder — no builder changed.
+  Acceptance verified EMPIRICALLY, not just by inspection: full TPC-DS SF0.25
+  sweep, `PASS=96 MISMATCH=0 CKMISMATCH=0 ERROR=0`, `PLAN-SHAPE: changed=0
+  added=0 removed=0` against the immediately-prior commit. New unit test
+  `TestJointypeForDirection_UniqueIfyFallback` pins both fallback directions
+  plus a `SemiCanBtree=false` decline. `go test ./internal/optimizer/...`
+  green. `ralph-precommit-test.sh` surfaced one PRE-EXISTING, unrelated
+  failure (`internal/parser` `TestLockingClauseParity`, an AST-drift golden
+  gap from earlier commit `dc91bd6b7`, reproduces identically on a
+  git-stash-clean HEAD) — not a regression from this task, left for whoever
+  owns `internal/parser` next. Resume point: design doc §19.5.
 - [ ] **M0142-0008c-3b — `addNestLoopPath`/`addNLIPaths` unique-ify
   substitution** — filed by M0142-0008c-3's recon (design doc §19.3-19.4 item
-  3b). Depends on M0142-0008c-3a. `addNLIPaths` (`joinpathsnli.go:269`):
+  3b). Depends on M0142-0008c-3a (DONE). `addPathsToJoinrel` currently
+  computes `uniq` and discards it (demotes `jt` to `parser.JoinInner` without
+  passing `uniq` anywhere) — 3b's first step is threading `uniq` down to the
+  two builders (a new parameter, or read it back off a `jointypeForDirection`
+  re-call inside each builder — decide which is cheaper once inside the
+  code). `addNLIPaths` (`joinpathsnli.go:269`):
   when the dispatch resolves to `JoinTypeUniqueOuter`, substitute
   `outer.CheapestTotal` with `createUniquePath(outer, outer.CheapestTotal,
   sjinfo, cp)` (decline the call if nil) before the existing

@@ -1944,3 +1944,67 @@ filed as `M0142-0008c-3a..3d` below (fix_plan.md):
 No production code changed this loop (recon only). Q10/Q35 remain
 un-parity'd; the OR'd-EXISTS divergence named in §19.1 item 1 will remain
 even after 3a-3d land in full, and is out of scope for this milestone group.
+
+### 19.5 M0142-0008c-3a landed (2026-09-16) — dispatch layer only, zero plan-shape change confirmed
+
+Implemented exactly as scoped in §19.3/19.4 item 3a:
+
+- `jointypeForDirection` (`joinpaths.go`) now takes `outer, inner *RelOptInfo`
+  and `cp costParams` (was two bare `RelSet` bitmasks) and returns a THIRD
+  value, `uniqueSide` — a new `internal/optimizer`-private type
+  (`uniqueSideNone`/`uniqueSideOuter`/`uniqueSideInner`), never a
+  `parser.JoinType`, per §19.3's explicit note that PG's own
+  `JOIN_UNIQUE_OUTER`/`INNER` "are not allowed to propagate outside this
+  module" (`joinpath.c:116-121`). The new fallback arm, added inside the
+  existing `case parser.JoinRight, parser.JoinSemi, parser.JoinAnti:` switch
+  case, fires only for `JoinSemi` and only after the ordinary
+  `MinLefthand`/`MinRighthand` subset check has already failed: bit-EQUALITY
+  (not subset) between `sjinfo.SynRighthand` and whichever of `inner.Relids`/
+  `outer.Relids` is being tested, AND a successful `createUniquePath` call on
+  that same rel (reusing `-0008c-1`'s cache — a repeat visit is a cache hit,
+  not a re-derivation).
+- `addPathsToJoinrel` resolves the sentinel immediately after the call and
+  before invoking any builder: `if uniq != uniqueSideNone { jt =
+  parser.JoinInner }`. No builder's signature or body changed — every
+  builder keeps seeing exactly the `jt`/`outer`/`inner` triple it always has,
+  which is what makes this slice's plan-shape-inert claim checkable rather
+  than aspirational.
+- The only production behavior change from 3a alone: a SEMI pair that used
+  to be declined outright by `jointypeForDirection` (both directions
+  `legal=false` when only the fallback's bit-equality condition holds, not
+  the ordinary subset one) is now ADMITTED and built as a plain,
+  un-deduplicated inner join over the unmodified `outer.CheapestTotal`/
+  `inner.CheapestTotal` paths — semantically wrong in isolation (no
+  unique-ify substitution yet; that is 3b's job), but never wins the
+  cost-model tournament against the query's existing strategy in every
+  witness measured (see below), so it never reaches a plan.
+
+**Verification (the acceptance bar was empirical, not just "no crash" — set
+by 3a's own fix_plan wording):**
+
+- `go test ./internal/optimizer/...` — full package green, including a new
+  direct unit test `TestJointypeForDirection_UniqueIfyFallback` that forces
+  the ordinary containment check to fail (via a fixture `SpecialJoinInfo`
+  whose `MinLefthand` names a third, uncovered rel) and pins both fallback
+  directions (`uniqueSideInner`/`uniqueSideOuter`) plus a `SemiCanBtree=false`
+  negative control that must still decline.
+- `scripts/tpcds-sf025-regression.sh sweep` (private `GOOPG_BIN`, full
+  SF0.25 suite, 99 comparable queries): `PASS=96 MISMATCH=0 CKMISMATCH=0
+  ERROR=0 TIMEOUT=0`, `PLAN-SHAPE: queries=99 same=99 changed=0 added=0
+  removed=0` against the immediately-prior commit (`20a28dd8e`). Confirms the
+  "zero plan-shape change" claim empirically, not just by code inspection —
+  Q10/Q35 in particular show no plan-shape delta yet (expected: 3b is what
+  moves them).
+- `RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh`: one
+  pre-existing, unrelated failure surfaced (`internal/parser`
+  `TestLockingClauseParity`, an AST-drift golden mismatch on the
+  `GroupedJoinUnaliased` field introduced by an earlier, unrelated commit
+  `dc91bd6b7`) — reproduces identically on `git stash`-clean HEAD before this
+  loop's diff, so it is not a regression from this task and is left for
+  whoever owns that area next.
+
+Next: `-0008c-3b` threads `uniq` into `addNestLoopPath`
+(`JoinTypeUniqueInner`) and `addNLIPaths` (`JoinTypeUniqueOuter`) — the two
+builders will need the `uniqueSide` value `addPathsToJoinrel` currently
+discards, so its signature (or a parallel plumbing path) must carry `uniq`
+alongside `jt` once 3b starts.
