@@ -622,6 +622,77 @@ func TestBuildLeafSpansAttributesRealLeafAfterSyntheticCorrectly(t *testing.T) {
 	}
 }
 
+// TestRemapWalkOrderFlatToSpans_RealLeafAfterSyntheticRHS pins
+// M0142-0008a-3i-plumbing-c20 (design doc §56) directly, at unit-test size:
+// TPC-DS Q78's live shape is `(A ANTI B) JOIN C`, walk order A(real,leaf0)
+// B(synthetic RHS,leaf1) C(real,leaf2) — the exact shape
+// `TestBuildLeafSpansAttributesRealLeafAfterSyntheticCorrectly` above already
+// pins at the `buildLeafSpans` level. What THAT test did not cover is a
+// semiAnti link's own folded `LeftKey=RightKey` predicate, which
+// `extractSearchLeaves` rebases into WALK-ORDER flat space (leaf B's columns
+// start right after leaf A's, at index wA) — a space `buildLeafSpans`'s
+// `cumOffsets` does NOT share, since it relocates B (synthetic) out-of-band
+// after C (real). A predicate ColumnRef pointing at B's first column
+// (walk-order-flat index wA) must resolve, after remapping, to leaf 1 (B),
+// never to leaf 2 (C) — the exact misattribution Q78 hit live.
+func TestRemapWalkOrderFlatToSpans_RealLeafAfterSyntheticRHS(t *testing.T) {
+	const wA, wB, wC = 2, 2, 2
+	widths := []int{wA, wB, wC} // walk order: A (real), B (synthetic RHS), C (real)
+	semiAnti := []semiAntiChainLink{{
+		jointype: parser.JoinAnti,
+		lhs:      leafRangeRelSet(0, 1), // A
+		rhs:      leafRangeRelSet(1, 2), // B, synthetic
+	}}
+	cumOffsets := buildLeafSpans(widths, semiAnti)
+
+	// A folded equality conjunct, in `extractSearchLeaves`'s own walk-order
+	// flat space: A's second column (index 1, well within A's [0,wA)) equals
+	// B's first column (index wA, walk-order-flat — the ANTI join's synthetic
+	// RHS leaf starts right after A in WALK order, base=0/rightBase=outerWidth
+	// exactly like Q78's live trace).
+	pred := &BinaryOp{
+		Op:    parser.OpEq,
+		Left:  &ColumnRef{Index: 1},
+		Right: &ColumnRef{Index: wA},
+	}
+
+	remapped, ok := remapWalkOrderFlatToSpans(pred, widths, cumOffsets)
+	if !ok {
+		t.Fatalf("remapWalkOrderFlatToSpans(...) ok=false, want true")
+	}
+	bo, isBinOp := remapped.(*BinaryOp)
+	if !isBinOp {
+		t.Fatalf("remapped = %T, want *BinaryOp", remapped)
+	}
+	left, isCol := bo.Left.(*ColumnRef)
+	if !isCol {
+		t.Fatalf("remapped.Left = %T, want *ColumnRef", bo.Left)
+	}
+	right, isCol := bo.Right.(*ColumnRef)
+	if !isCol {
+		t.Fatalf("remapped.Right = %T, want *ColumnRef", bo.Right)
+	}
+
+	if left.Index != cumOffsets[0].lo+1 {
+		t.Errorf("remapped Left.Index = %d, want %d (leaf 0/A, local offset 1)", left.Index, cumOffsets[0].lo+1)
+	}
+	// This is the exact bug: without the fix, Right.Index stays at the
+	// walk-order-flat value `wA`, which lands inside leaf 2 (C)'s cumOffsets
+	// range, not leaf 1 (B)'s.
+	if right.Index != cumOffsets[1].lo {
+		t.Errorf("remapped Right.Index = %d, want %d (leaf 1/B's cumOffsets.lo, NOT leaf 2/C's range %v)", right.Index, cumOffsets[1].lo, cumOffsets[2])
+	}
+
+	rs, okRelids := relidsOfExpr(bo.Right, cumOffsets)
+	if !okRelids {
+		t.Fatalf("relidsOfExpr(remapped.Right, cumOffsets) ok=false, want true")
+	}
+	wantLeaf1 := leafRangeRelSet(1, 2)
+	if rs != wantLeaf1 {
+		t.Errorf("relidsOfExpr(remapped.Right, cumOffsets) = %#x, want %#x (leaf 1, B) — got attributed to a different leaf (leaf 2/C is %#x), which is exactly the Q78 misattribution this fix corrects", rs, wantLeaf1, leafRangeRelSet(2, 3))
+	}
+}
+
 // TestPgShapedOffsetChecksOK_ReducesToPlainChecksWhenNoSemiAnti pins design
 // doc §31.3's inertness claim: with `semiAnti` empty (today's only
 // production shape, since `tryPGShapedJoinSearch`'s one call site always

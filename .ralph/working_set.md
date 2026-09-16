@@ -1,53 +1,81 @@
-Task: M0142-0008a-3i-plumbing-c18 (recon, DONE) — full-corpus SF0.25 recheck
-of Semi/Anti DPPATH reachability after c1-c17 landed. Also closed out c11's
-stale checkbox (its (a)/(b)/(c) were all actually resolved by c12/c16).
+Task: M0142-0008a-3i-plumbing-c20 (DONE, ready to commit) — found and fixed
+the real `semianti-on-qual` decline c19's own resume point pointed at: a
+coordinate-space bug in `extractSearchLeaves`'s semiAnti chain-link rebase
+(latent since c6/c7, not introduced by c19 — c19 only gave the first
+producer enough reachability to expose it live).
 
-Files: .ralph/fix_plan.md (c11 -> [x] with closing note; new c18 entry),
-.ralph/deferral_ledger.md (c18 row), docs/design/0100-0149/
-m0142-0008a-1-semi-anti-sji-design.md (§54), docs/design/README.md
-(m0142-0008a-1 row: added missing c17 summary + new c18 summary — c17 had
-landed its design-doc section but never updated this index row).
-No internal/ source changed this loop (recon only).
+Files: internal/optimizer/joinsearchseam.go (new `remapWalkOrderFlatToSpans`
+func next to `buildLeafSpans`, + a ~15-line call site right after
+`cumOffsets := buildLeafSpans(...)`), internal/optimizer/semiantichain_test.go
+(new `TestRemapWalkOrderFlatToSpans_RealLeafAfterSyntheticRHS`). Docs:
+.ralph/fix_plan.md (c20 entry after c19), .ralph/deferral_ledger.md (c20 row),
+docs/design/0100-0149/m0142-0008a-1-semi-anti-sji-design.md (new §56),
+docs/design/README.md (m0142-0008a-1 row: appended c20 summary after c19's).
 
-Key symbols: extractSearchLeaves (joinsearchseam.go:1248, admission arm at
-1287), semiAntiLinksHaveSJInfos (the decline at line ~591), semiAntiChainLink
-.sjinfo = j.SJInfo (line ~1360), reduce_outer_joins.go's demotedForPlan
-(line 102, Q78's ANTI-join producer), existsUnnestSJInfo (unnest.go:4837,
-the ONLY current .SJInfo setter), deconstructJointreeScopedSJI
-(planner.go:3051), whereEligibleForPreDPUnnest (predp.go:35).
+Key symbols: `remapWalkOrderFlatToSpans` (new), `buildLeafSpans`
+(joinsearchseam.go:1561, unchanged — its out-of-band synthetic-leaf
+placement was correct all along, just not consulted by the semiAnti
+predicate rebase until now), `rebaseSemiAntiChainQual` (unchanged — its
+walk-order-flat output was ALSO correct all along; the gap was nobody ever
+converted that into `cumOffsets` space), `semiAntiOnQualsOK`
+(joinsearchseam.go:1834, unchanged — it was declining CORRECTLY on bad
+input, not buggy itself), `relfromjoinlist.go:654-678`'s `outer-over-derived`
+firewall (pre-existing, deliberate, now the thing Q78 correctly hits next).
 
-Findings: full 96-query SF0.25 sweep (private GOOPG_BIN, sf025 gate green:
-PASS=96 MISMATCH=0 ERROR=0) + GOOPG_PGSHAPED_DP_TRACE=1 + per-query
-truncated-log attribution (run each query*.sql alone, grep the trace
-between runs — the sweep log itself has no per-query markers) shows STILL
-0 jointype=semi/anti DPPATH lines even with the whole c1-c17 chain landed.
-Exactly one query (Q78) reaches the semiAnti admission arm at all (3
-declines, reason=semianti-link-no-sjinfo, matching its 3 CTEs) — via
-reduce_outer_joins.go's LEFT-JOIN-to-ANTI-JOIN strength reduction, NOT
-EXISTS/IN unnesting, so existsUnnestSJInfo never touches it and .SJInfo
-stays nil on that *Join node. Q10/Q16/Q35/Q69/Q94 (the family every prior
-c9-c17 note assumed was "most likely") show ZERO semiAnti trace of any
-kind — their Semi/Anti joins apparently never reach the search's input
-tree at all (separate, unfiled, larger question — not this loop's scope).
+Findings: live-traced (temporary `GOOPG_C20DEBUG=1`, fully reverted before
+commit) that the failing conjunct in `semiAntiOnQualsOK` was the FOLDED
+`LeftKey=RightKey` synthetic equality (not either of `j.Predicate`'s own
+2 conjuncts — refutes c19's "redundant duplicate, probably harmless" guess).
+Root cause: `extractSearchLeaves` rebases a semiAnti link's pred into
+WALK-ORDER flat column space, but `relidsOfExpr`/`searchConsumes` read
+`buildLeafSpans`'s `cumOffsets`, which relocates every SYNTHETIC (semiAnti
+RHS) leaf's span OUT-OF-BAND after the total REAL-leaf width. The two spaces
+coincide only when no real leaf follows a semiAnti link's synthetic leaf in
+walk order — Q78's `(websales ANTI webreturns) JOIN date_dim` shape breaks
+that (date_dim, real, trails the pair). Fix: deferred remap pass, right
+after `cumOffsets` is known (only then is the synthetic leaf's true
+out-of-band target computable). Verified live: after the fix,
+`semiAntiOnQualsOK` passes ALL conjuncts for ALL 3 of Q78's CTEs; Q78's
+decline moves to a DIFFERENT, LATER, PRE-EXISTING, DELIBERATE firewall
+(`outer-over-derived`, names Q78 explicitly, guards a documented
+15s->327s-timeout regression, resume gated on TODO_ALL B-06's CTE-output
+stats) — so Q78 correctly still declines, now for the right reason, never
+touching the timeout shape.
 
-Next step: pick ONE of design doc §54's two candidate fixes for Q78 —
-(b) is recommended first (smaller, more PG-faithful): in the semiAnti link
-constructor (joinsearchseam.go:1360), when j.SJInfo == nil, fall back to a
-relids-keyed lookup in ctx.joinInfoList instead of declining outright.
-Verify via this loop's exact method (per-query truncated trace on Q78
-alone: 3 declines should become 3 accepts with real jointype=anti DPPATH
-lines), then a full SF0.25 sweep to confirm no plan-shape regression
-anywhere (PASS=96 must hold, Q78's own result must stay byte-identical to
-oracle). Separately — NOT blocking, can be picked up independently or
-later — the bigger Q10/16/35/69/94 non-reachability question from design
-doc §54 remains completely untraced.
+Next step: c21 should NOT try to lift `outer-over-derived` directly (that
+needs CTE-output-stats synthesis, a separate milestone-sized prerequisite
+per its own doc comment). Instead pick up the STILL-UNFILED, materially
+larger question flagged by both c18 and c19 and re-confirmed untouched this
+loop: Q10/Q16/Q35/Q69/Q94 (the EXISTS/IN family the c1-c17 chain was BUILT
+for) show ZERO semiAnti trace of any kind corpuswide — instrument
+`whereEligibleForPreDPUnnest` (predp.go:35) for those 5 statements
+specifically (does it decline the WHOLE statement for an unrelated
+scalar-sublink reason, sending them down the legacy DP-before-unnest order
+where no Semi/Anti node exists yet when the search runs) before assuming
+any further DP-search-layer fix could matter for that family at all.
 
-Gates run: make ralph-state-guard (self-repaired a stale
-running/completed mismatch, passed). scripts/tpcds-sf025-regression.sh
-sweep x2 this loop (both PASS=96 MISMATCH=0 CKMISMATCH=0 ERROR=0
-TIMEOUT=0 SKIP=3, private GOOPG_BIN, no production diff). tpch-spotcheck
-not run (no code change, N/A; also still blocked on M0142-0003k's data
-reload per CLAUDE.md).
+Gates run: `go test ./internal/optimizer/...` PASS (incl. new test),
+`go test ./internal/executor/...` PASS. `scripts/tpcds-sf025-regression.sh
+sweep` (private GOOPG_BIN) PASS=96 MISMATCH=0 CKMISMATCH=0 ERROR=0
+TIMEOUT=0 SKIP=3, `scripts/tpcds-plan-diff.py` vs pre-fix baseline:
+changed=0/99 (pure no-op on every chosen plan — Q78 still declines overall,
+just via a different, correct gate). `tpch-spotcheck.sh` SKIPPED
+(pre-existing M0142-0003k data-reload blocker, unrelated). `make
+ralph-state-guard` self-repaired a stale running/completed mismatch, passed.
+`go build ./...` clean. `gofmt` diff on both touched files shows ONLY
+pre-existing, unrelated skew (go1.26.3 local vs go1.25 repo baseline,
+per-project convention: never `gofmt -w` wholesale) — confirmed by diffing
+gofmt's output against the committed file and checking every hunk predates
+this loop's own edits.
 
-In-flight: none. Private trace server stopped, tmp/goopg-sf025-trace-bin
-and tmp/m0142-c11-recheck-sf025/ removed after the recon.
+In-flight: none. All temporary `GOOPG_C20DEBUG=1` trace instrumentation
+(fmt.Fprintf/os imports in joinsearchseam.go, added during investigation)
+was reverted before the final build; the committed diff is the real fix
+only (2 files: joinsearchseam.go +52/-0, semiantichain_test.go +71/-0) plus
+docs. Scratch binaries (tmp/goopg-c20-scratch-bin, tmp/goopg-c20-bin) and
+scratch logs (/tmp/c20-*.log, /tmp/c20-*.txt) removed. The private SF0.25
+server this loop started/stopped (port 65437, GOOPG_CG_UNIT=goopg-c20-*) is
+fully stopped — confirmed via `ps aux` and `systemctl --user list-units`,
+zero leaked processes. Pre-existing, unrelated `tmp/c20a`/`tmp/c20b-*`
+scratch files (dated 2026-09-07/2026-09-16, a different task's shorthand,
+NOT created this loop) were found but left untouched — not mine to clean up.

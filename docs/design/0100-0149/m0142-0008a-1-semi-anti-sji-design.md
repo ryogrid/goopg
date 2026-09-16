@@ -6838,3 +6838,169 @@ tolerate a harmless duplicate. **This is a read, not a trace** — c20 should
 instrument `semiAntiOnQualsOK` directly (each conjunct, `relidsOfExpr`'s
 `ok`/`rs`, `searchConsumes`'s verdict) rather than assume which check fails;
 this loop ran out of time before confirming it live.
+
+## 56. c20 — the real `semianti-on-qual` cause: a coordinate-space bug in
+    the chain-link rebase, exposed (not introduced) by c19
+
+c19 guessed the redundant-duplicate-equality fold-in was "probably
+harmless." It was not the cause. This loop instrumented `semiAntiOnQualsOK`
+(joinsearchseam.go:1835) and `extractSearchLeaves`'s fold-in block directly
+(temporary `GOOPG_C20DEBUG=1` prints, private `GOOPG_BIN`, TPC-DS SF0.25
+`:65437`, reverted before commit) and found the actual failing conjunct.
+
+### 56.1 What the trace showed
+
+The failing conjunct was the FOLDED `LeftKey=RightKey` synthetic equality
+(pos matching `j.LeftKey.Pos()`), not either of `j.Predicate`'s own two
+original conjuncts. Its `relidsOfExpr` result spanned leaves `{0,2}`
+(websales, date_dim) instead of the correct `{0,1}` (websales, webreturns) —
+`semiAntiOnQualsOK`'s subset check (`relsSubset(rs, lk.lhs|lk.rhs)`)
+correctly declined it, since `lk.lhs|lk.rhs` for this link is only
+`{0,1}`.
+
+A second trace, printed at the fold-in site itself, showed exactly why:
+`outerWidth=34`, `rightBase=34` (`rightBase==outerWidth`), `base=0`, and
+`rightRealWidth=len(j.Right.Output())=24` — so `rebaseSemiAntiChainQual`'s
+fast path (`base==0 && rightBase==outerWidth`) fires and returns the
+folded predicate UNCHANGED. The RHS operand (`wr_order_number`, local index
+47 in the 2-input `[0,34)=websales / [34,58)=webreturns` numbering) stays
+at raw index 47.
+
+### 56.2 Root cause: two DIFFERENT flat column spaces that only coincide
+     by accident
+
+`extractSearchLeaves`'s walk (joinsearchseam.go, the `admitSemiAnti` arm)
+rebases a semiAnti link's `pred` into **walk-order flat** column space:
+leaf i's columns occupy `[sum(widths[:i]), sum(widths[:i])+widths[i])`, in
+the order the walk visits leaves. `base`, `outerWidth`, `rightBase` are all
+walk-order accumulations of `width`, and — checked directly — the existing
+rebase code (both the fast path AND the general `cr.Index = rightBase +
+(cr.Index - outerWidth)` branch) computes this walk-order-flat position
+correctly. That was never the bug.
+
+The bug is that `relidsOfExpr`/`searchConsumes` do NOT read walk-order-flat
+positions — they read `cumOffsets`, built by `buildLeafSpans(widths,
+semiAnti)` right after the walk completes (joinsearchseam.go:347,
+1561-1584). `buildLeafSpans` deliberately does NOT use walk order for
+synthetic leaves: it assigns every REAL leaf a cumulative offset first
+(skipping synthetic ones), then appends every SYNTHETIC (semiAnti RHS)
+leaf's span AFTER the total real width, in walk order among themselves
+(its own doc comment, item 3 — landed for the unrelated §25.1 `qualAC`
+misattribution, where a REAL leaf following an admitted semiAnti link had
+inherited that link's RHS leaf's stolen column range; this out-of-band
+placement is what FIXED that bug).
+
+The two spaces — walk-order-flat and `cumOffsets` — coincide only when NO
+real leaf follows a semiAnti link's synthetic RHS leaf in walk order. Q78
+breaks that coincidence: each CTE's shape is `(websales ANTI webreturns)
+JOIN date_dim`, so in walk order, leaf 0 = websales (real), leaf 1 =
+webreturns (synthetic, the ANTI join's opaque RHS), leaf 2 = date_dim
+(real) — a REAL leaf (date_dim) follows the synthetic leaf. In
+`buildLeafSpans`'s real-first pass, date_dim (real) is assigned the
+cumulative offset immediately after websales — `[34, 34+ddWidth)` — the
+EXACT walk-order-flat range that webreturns (synthetic) occupies
+(`[rightBase=34, rightBase+rightRealWidth=58)`, since `rightBase ==
+outerWidth == 34` for this shape). `wr_order_number`'s rebased index (47)
+falls inside `[34, 34+ddWidth)` — date_dim's real `cumOffsets` slot — not
+webreturns's, because webreturns's TRUE `cumOffsets` slot is somewhere
+out-of-band, after the total real width across the WHOLE CTE tree (a value
+not known until the walk finishes visiting every leaf, including leaves
+not yet reached when this semiAnti link was processed mid-walk).
+
+This is a **latent bug in the c6/c7 rebase machinery**, not something c19
+introduced. c19 only gave the FIRST producer for which this shape is
+reachable (`reduce_outer_joins`-demoted ANTI joins, via the new
+`demotedAntiSJInfo` placeholder) enough plumbing to reach
+`semiAntiOnQualsOK` at all. `unnestExistsExpr`'s own keyed producer never
+triggers it in the current corpus because none of the queries it fires for
+today have a REAL leaf trailing the semiAnti pair in walk order — the bug
+was always latent in `rebaseSemiAntiChainQual`/`buildLeafSpans`'s
+interaction, waiting for a shape (any semiAnti link followed by ANY real
+leaf) that c19 was the first to expose live.
+
+### 56.3 Fix: defer the RHS-side rebase to AFTER `cumOffsets` exists
+
+The fix cannot live inside `extractSearchLeaves`'s per-link, mid-walk
+rebase — the synthetic leaf's correct `cumOffsets` target (out-of-band,
+after the total REAL width) is only knowable once every leaf's width is
+known, i.e. after the whole walk finishes. So the fix is a second,
+DEFERRED remap pass, added right after `cumOffsets := buildLeafSpans(...)`
+(joinsearchseam.go:347):
+
+```go
+cumOffsets := buildLeafSpans(widths, semiAnti)
+for i := range semiAnti {
+    remapped, okRemap := remapWalkOrderFlatToSpans(semiAnti[i].pred, widths, cumOffsets)
+    if !okRemap {
+        traceSeamDecline("semianti-pred-remap", nrels, len(scans))
+        return node, pred, false
+    }
+    semiAnti[i].pred = remapped
+}
+```
+
+`remapWalkOrderFlatToSpans` (new, next to `buildLeafSpans`) decomposes each
+`ColumnRef.Index` in a link's (already walk-order-flat-rebased) `pred` into
+`(leaf, localOffset)` using `widths`' own walk-order prefix sums, then
+re-targets it to `cumOffsets[leaf].lo + localOffset` — the space
+`relidsOfExpr` actually reads. It declines (returns `ok=false`) if a leaf
+can't be found for some index, which should be unreachable given
+`extractSearchLeaves`'s own construction (defensive, not expected to fire
+in production).
+
+This composes cleanly with `buildLeafSpans`'s existing real/synthetic
+split: the remap is a pure re-indexing step that trusts `cumOffsets` as the
+single source of truth for "where does leaf i's span actually live",
+rather than trying to duplicate that logic inside the walk where the
+answer isn't yet computable.
+
+### 56.4 Verified effect: Q78 now reaches the LAST, deliberate gate — zero
+     plan movement, zero regression
+
+Before removing the temporary trace, re-ran it after the fix:
+`semiAntiOnQualsOK` now passes all 3 conjuncts for all 3 of Q78's CTEs
+(`rs` correctly resolves to leaves `{0,1}`, `subset=true`, both overlaps
+true, `consumes=true` in every case). Q78's decline moved from
+`semianti-on-qual` to a DIFFERENT, LATER gate: `outer-over-derived`
+(`relfromjoinlist.go:676`).
+
+That gate is not a bug — it is a pre-existing, DELIBERATE firewall with its
+own doc comment naming Q78 explicitly:
+
+> C-04a firewall (Q78): a problem that pairs an OUTER hand with a derived
+> (table-less) input declines... Q78's outer problem costed Nested Loop
+> 3.07 against Hash 3.09 with every path at rows=1... the epsilon victory
+> ran Nested Loop with a Join Filter over full multi-year CTE outputs (15 s
+> Hash shape -> 327 s timeout)... Resume: lift when B-06 wires CTE-output
+> stats (TODO_ALL B-06 step 4).
+
+So after this fix, Q78 correctly still declines — but now for the RIGHT,
+already-documented, intentional reason, rather than an artifact of the
+rebase bug. It does NOT fall through into the known 327s-timeout shape
+that firewall guards against; the fix is safe by construction, not just by
+the sweep below.
+
+Full-corpus safety: private `GOOPG_BIN`,
+`scripts/tpcds-sf025-regression.sh sweep` — `PASS=96 MISMATCH=0
+CKMISMATCH=0 ERROR=0 TIMEOUT=0 SKIP=3` (unchanged from c19).
+`scripts/tpcds-plan-diff.py` reports `queries=99 same=99 changed=0
+added=0 removed=0` — the fix is a pure no-op on every CHOSEN plan in the
+corpus; it only corrects an intermediate diagnostic decline reason for
+Q78's own three CTEs. `go test ./internal/optimizer/...` green.
+
+### 56.5 Resume point for c21
+
+The search's own admission logic for the `reduce_outer_joins`-demoted ANTI
+producer is now fully correct end-to-end: SJInfo (c19), on-qual placement
+(this loop, `semiAntiOnQualsOK` itself was already correct — the bug was
+purely in the coordinate feeding it), and the walk's flat-column rebase
+(this loop). The remaining blocker for Q78 specifically is the
+`outer-over-derived` firewall (`relfromjoinlist.go:654-678`), which needs
+CTE-output statistics (TODO_ALL B-06 step 4) before it can safely lift —
+that is a materially larger, separate task (CTE-output stats synthesis),
+out of scope for this plumbing sub-track.
+
+Separately, still open and untouched since c19: Q10/Q16/Q35/Q69/Q94 (the
+EXISTS/IN family) show ZERO semiAnti trace of any kind corpus-wide — a
+different, still-unfiled gap (their Semi/Anti joins may never reach the
+search's admission arm at all, unrelated to Q78's now-resolved rebase bug).

@@ -342,6 +342,36 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 	// exercises the numSynthetic>0 case for a Phase B call that admits one.
 	// See the function's own doc comment for details.
 	cumOffsets := buildLeafSpans(widths, semiAnti)
+	// M0142-0008a-3i-plumbing-c20 (design doc §56): each `semiAnti[i].pred`
+	// left `extractSearchLeaves`'s walk already rebased into WALK-ORDER flat
+	// column offsets (leaf i's columns start at the sum of `widths[0:i]`,
+	// visit order) — correct as its own coordinate space, but not the one
+	// `relidsOfExpr`/`searchConsumes` read: those consult `cumOffsets`, which
+	// `buildLeafSpans` just built in a DIFFERENT space that relocates every
+	// synthetic (Semi/Anti RHS) leaf's span out-of-band, after the total
+	// width of every REAL leaf (that function's own doc comment, item 3).
+	// The two coincide only when no real leaf follows a semiAnti link's
+	// opaque RHS in walk order. Q78 (TPC-DS) breaks that: the demoted ANTI
+	// join (`web_sales`/`web_returns`) is immediately followed by a plain
+	// `JOIN date_dim`, so `date_dim` (real, leaf 2) lands in walk order
+	// between the ANTI join's own two leaves and the tree's total-real-width
+	// boundary — `buildLeafSpans` gives `date_dim` the walk-order-flat span
+	// the ANTI join's synthetic RHS leaf (`web_returns`) actually occupies in
+	// walk-order-flat terms, so a folded `LeftKey=RightKey` conjunct whose
+	// RHS operand was rebased to that walk-order-flat position resolves, via
+	// `cumOffsets`, to `date_dim`'s relid instead of `web_returns`'s —
+	// `semiAntiOnQualsOK` then declines it as spanning a THIRD, unrelated
+	// leaf. Caught live via `GOOPG_C20DEBUG=1` on TPC-DS SF0.25 Q78 (this
+	// task's own trace: `rs` for the folded eq conjunct came back spanning
+	// leaves {0,2} instead of {0,1}).
+	for i := range semiAnti {
+		remapped, okRemap := remapWalkOrderFlatToSpans(semiAnti[i].pred, widths, cumOffsets)
+		if !okRemap {
+			traceSeamDecline("semianti-pred-remap", nrels, len(scans))
+			return node, pred, false
+		}
+		semiAnti[i].pred = remapped
+	}
 	bindingOffsets := make([]int, nprefix)
 	for i := range nprefix {
 		bindingOffsets[i] = ctx.bindings[i].offset
@@ -1544,6 +1574,58 @@ func buildLeafSpans(widths []int, semiAnti []semiAntiChainLink) []leafSpan {
 		syntheticOffset += w
 	}
 	return spans
+}
+
+// remapWalkOrderFlatToSpans re-expresses `e`'s `ColumnRef.Index` values from
+// `extractSearchLeaves`'s own WALK-ORDER flat column space — leaf i's columns
+// occupy `[sum(widths[:i]), sum(widths[:i])+widths[i])`, the order the walk
+// visited leaves in — into `buildLeafSpans`'s output space, `cumOffsets`.
+// M0142-0008a-3i-plumbing-c20 (design doc §56): the two spaces coincide only
+// when no REAL leaf follows a semiAnti link's opaque RHS leaf in walk
+// order — `buildLeafSpans` relocates every synthetic leaf's span out-of-band,
+// after the total width of every real leaf, so a later real leaf inherits
+// the walk-order-flat range a synthetic leaf actually occupies. A `semiAnti`
+// link's `pred` — rebased into walk-order-flat terms by
+// `rebaseSemiAntiChainQual` while the walk still had it in hand, before any
+// LATER leaf's width was knowable — must therefore be re-targeted here, once
+// `widths` is complete and `cumOffsets` exists, before `relidsOfExpr`
+// (which reads `cumOffsets`, not walk order) ever sees it.
+func remapWalkOrderFlatToSpans(e Expr, widths []int, cumOffsets []leafSpan) (Expr, bool) {
+	if e == nil {
+		return nil, true
+	}
+	prefix := make([]int, len(widths)+1)
+	for i, w := range widths {
+		prefix[i+1] = prefix[i] + w
+	}
+	leafOf := func(walkOrderFlat int) (int, bool) {
+		for i := range widths {
+			if walkOrderFlat >= prefix[i] && walkOrderFlat < prefix[i+1] {
+				return i, true
+			}
+		}
+		return 0, false
+	}
+	failed := false
+	out, ok := cloneExprRefs(e, scopeVeto, exprRewriter{
+		Rewrite: func(x Expr) Expr {
+			cr, isCol := x.(*ColumnRef)
+			if !isCol {
+				return x
+			}
+			leaf, found := leafOf(cr.Index)
+			if !found {
+				failed = true
+				return x
+			}
+			cr.Index = cumOffsets[leaf].lo + (cr.Index - prefix[leaf])
+			return x
+		},
+	})
+	if !ok || failed {
+		return nil, false
+	}
+	return out, true
 }
 
 // pgShapedOffsetChecksOK implements design doc §31.3 items 2 and 3:
