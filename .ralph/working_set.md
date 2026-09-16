@@ -1,90 +1,78 @@
-Task: M0142-0008a-3i-plumbing-c11 item (b), continued. Found + LANDED a
-real bug (SourceTableIdx collision across sibling EXISTS clauses) but it
-did NOT fix Q69's actual crash. New root cause pinned via live
-instrumentation; follow-on filed as **c12** (fix_plan.md, not yet started).
+Task: M0142-0008a-3i-plumbing-c12, completed as a REFUTATION this loop
+(design doc §47). c12's own filed hypothesis (missing relids-subset check
+in the index-path candidate generator) is disproved by exhaustive live
+evidence. Filed follow-on **c13** (fix_plan.md) with a concrete, different
+next instrumentation layer. No production code changed this loop.
 
-Files this loop:
-- internal/optimizer/unnest.go: new `maxSourceTableIdxDeep` helper (walks
-  *Join.Left/*Join.Right/*Filter.Child rather than trusting Output()) +
-  `unnestExistsExpr`'s `srcTableOffset` computation now uses it instead of
-  scanning `outerChild.Output()` alone. LANDED, this is the loop's only
-  production diff.
-- docs/design/0100-0149/m0142-0008a-1-semi-anti-sji-design.md: new §46.6 —
-  method, both findings (STI collision fixed; real cause pinned, not
-  fixed), verification evidence, concrete c12 next step.
-- .ralph/fix_plan.md: (1) nightly triage — filed/merged all 17 items from
-  run 20260917-004357 (2 closed as stale/racing-checkout artifacts, 3 new
-  testport subjects opened, rest AI-id-appended to existing tasks); (2)
-  c11 entry updated with this loop's finding; (3) new task
-  **M0142-0008a-3i-plumbing-c12** filed with the concrete next
-  instrumentation step.
+Files this loop (all documentation/planning, zero production diff):
+- docs/design/0100-0149/m0142-0008a-1-semi-anti-sji-design.md: new §47
+  (§47.1 method, §47.2 the refutation evidence, §47.3 EXPLAIN-text-is-
+  unreliable-here caveat, §47.4 the `depth=0` reframing, §47.5 c13's
+  concrete next step).
+- .ralph/fix_plan.md: c12 marked [x] (concluded, refuted — matches the
+  established c10-style convention of checking off a recon/diagnostic
+  task that reaches a definitive answer without landing a fix); new task
+  **M0142-0008a-3i-plumbing-c13** filed.
 - .ralph/deferral_ledger.md: new row for this loop.
+- internal/optimizer/{joinpathsnli,createplannl,joinsearchseam,nl_index_join}.go:
+  temporary instrumentation added AND FULLY REVERTED before commit
+  (`git checkout --`); `git diff --stat -- internal/optimizer/` is empty.
 
-Key symbols: `unnestExistsExpr` (unnest.go ~4476) and its new
-`maxSourceTableIdxDeep` sibling (added just above it) — landed.
-`createNestLoopIndexJoinPlan`/`outerParamKey` (createplannl.go:178-209) —
-confirmed NOT buggy, faithfully converts whatever ColumnRef it's handed.
-The REAL c12 target is upstream of these: whatever DP-search code sets
-`RequiredOuter` on a candidate index Path (near `GOOPG_NLI_COSTGATE`) —
-not yet located, only proven to exist by elimination.
+Key symbols this loop's instrumentation touched (all reverted, listed for
+the next loop's benefit): `addNLIPaths`/`addPartialNestLoopPaths`
+(joinpathsnli.go) — exhaustively traced, never build the suspected illegal
+pairing. `createNestLoopIndexJoinPlan` (createplannl.go) — the DP search's
+only create-plan-phase constructor of `*NestedLoopIndexJoin`; traced
+twice per crashing run, both times SAFE (`outer={customer,
+customer_address}`). `tryBuildNLI`/`rewriteJoinsToNLI` (nl_index_join.go)
+— the OTHER, "legacy" post-search constructor of the same node type;
+traced, zero successful conversions for Q69. The panic site itself:
+`internal/executor/expr.go:472-478` (`*optimizer.OuterColumnRef`
+evaluation, `depth=%d` = `len(ctx.OuterRows)`).
 
-Findings: (1) unnestExistsExpr's srcTableOffset was computed from
-outerChild.Output(), which a Semi/Anti Join deliberately does not grow
-after splicing (RHS columns never publish through Semi/Anti's Output()) —
-so a 2nd/3rd sibling EXISTS in one statement reused the SAME offset as the
-1st, colliding SourceTableIdx (Q69: store_sales/web_sales/catalog_sales
-all got STI=5, all 3 date_dim occurrences got STI=6). Fixed, verified live
-production-safe via full SF0.25 sweep (private GOOPG_BIN, joinInfoList
-untouched): PASS=96/MISMATCH=0/ERROR=0/SKIP=3; only 3 queries (Q16,Q69,
-Q94) show a plan-text diff and in all 3 it's purely an EXPLAIN
-alias-disambiguation correction (e.g. bare "date_dim" used for 2 distinct
-correlated scans -> date_dim_1/date_dim_2). (2) This did NOT fix Q69's
-actual runtime crash: re-run with the STI fix + the temporary
-`joinInfoList: ctx.joinInfoList` one-liner (§46.3, needed to reach the
-search at all) produced a BYTE-IDENTICAL EXPLAIN and the IDENTICAL error
-to before the fix — refuting the "stray unrebased OuterColumnRef" theory
-the c11-filing loop proposed. (3) Root cause of the ACTUAL crash, pinned
-via live instrumentation (temporary walkPlanExprsDeep prints around
-runJoinSearchBelowPinned, reverted before commit): the DP search builds
-AND WINS an NLI candidate that probes customer_demographics keyed on
-`cd_demo_sk = c.c_current_cdemo_sk`, using the store_sales+date_dim
-EXISTS synthetic leaf as the candidate's OUTER/driving side — but
-`customer` is not in that leaf's relids at all, so no coordinate
-numbering could ever make c.c_current_cdemo_sk resolve there. This is a
-missing/broken "clause's required relids subset-of candidate outer
-relset" check in the index-path candidate generator, not a
-coordinate-rebase bug.
+Findings: (1) Both known producers of a `*NestedLoopIndexJoin` node build
+it, when they build it at all, in the ONE provably-safe shape for Q69 —
+path selection/construction is NOT the defect, contrary to every theory
+c9 through c12 pursued. (2) The `EXPLAIN` text's printed indentation/
+widths (which the c11-filing loop read as proof of an illegal
+`store_sales`-leaf-outer pairing) is NOT reliable evidence here — it may
+be a display-only artifact (`nlipricesplice.go` documents an analogous,
+though not identical, "stamped after the fact" display seam for
+SEMI/ANTI NLI nodes). Do not re-trust it without re-deriving from a live
+node-type instrument. (3) The executor's own error text says `depth=0`,
+i.e. the lateral outer-row stack (`ctx.OuterRows`) is COMPLETELY EMPTY at
+evaluation time — not "wrong relation in scope" but "no lateral push
+happened at all". This is the sharpest, most concrete lead: either (a)
+the executor never actually opens/rescans the confirmed-correct
+`*Join{Lateral:true}` node (meaning the executed tree diverges from what
+`createPlan` returned — some post-createPlan pass, `nlipricesplice.go`
+being the leading suspect, mutated/misplaced it), or (b) it does open it
+but the dispatch that's supposed to push `ctx.OuterRows` before
+rescanning the inner `*IndexScan` doesn't trigger for this specific
+shape (an M0134-0001-style "wrap type doesn't trigger the lateral push"
+gap — see `join_lateral_stream_test.go`'s doc comment for that prior,
+analogous incident).
 
-Next step: c12 (fix_plan.md, filed this loop). Instrument the DP search's
-index-path candidate generator (upstream of createPlan, wherever
-RequiredOuter gets set on a candidate index Path — search near the
-GOOPG_NLI_COSTGATE machinery) to print, for every NLI candidate built
-while searching Q69, the candidate's outer relset alongside the index
-qual clause's required relids. The first candidate where the clause's
-relids are NOT a subset of the outer relset is the bug. Same private-
-binary SF0.25 method as c9-c11 (§46.1), with the temporary joinInfoList
-one-liner re-applied locally to reach the search — revert it before
-commit either way, per the c9-c11 established discipline.
+Next step: c13 (fix_plan.md, filed this loop). Instrument the executor's
+lateral-outer push/pop (near `operators_nljoin.go`'s
+`nestedLoopIndexJoinOp` and the generic `bindOuter`/`lateralBindable`
+dispatch) to print every push/pop of `ctx.OuterRows` alongside the Go
+type of the node being opened/rescanned, then reproduce Q69's crash live
+and read off which of (a)/(b) above is true. Same private-binary SF0.25
+method as c9-c12 (design doc §46.1: private data-dir copy, private
+binary, direct start bypassing the cgroup wrapper so env vars reach the
+process, temporary `joinInfoList: ctx.joinInfoList` one-liner in
+joinsearchseam.go re-applied locally to reach the search — revert before
+commit either way).
 
-Gates run this loop: `go build ./...` clean. `go test
-./internal/optimizer/...` PASS. `RALPH_PRECOMMIT_SCOPE=units
-scripts/ralph-precommit-test.sh` PASS except the same pre-existing
-`internal/parser` GroupedJoinUnaliased AST-drift failure every recent loop
-has hit (unrelated, unchanged, tracked under M-NIGHTLY; optimizer/executor
-both explicitly confirmed `ok` inside this same run). `scripts/tpch-
-spotcheck.sh` SKIPPED (documented, pre-existing: TPC-H bench data still
-needs a reload per CLAUDE.md's M0142-0003k note — not this loop's
-regression). `scripts/tpcds-sf025-regression.sh sweep` run with a private
-GOOPG_BIN, joinInfoList untouched (production state): PASS=96 MISMATCH=0
-CKMISMATCH=0 ERROR=0 TIMEOUT=0 SKIP=3 — the gate for this loop's actual
-landed diff. `make ralph-state-guard`: run after this write-up, see status
-block.
+Gates run this loop: `go build ./...` clean (after full instrumentation
+revert). `go test ./internal/optimizer/...` PASS. No sweep/spotcheck
+needed — zero production diff this loop (pure investigation +
+documentation), so the usual planner-change gates are not applicable;
+`make ralph-state-guard` run after this write-up, see status block.
 
-In-flight: none. Private diagnostic binaries/data (`tmp/goopg-c11b-bin`,
-`tmp/goopg-c11b-sweep-bin`, `tmp/c11b-sf025-data`, `tmp/c11b-server.log`,
-`tmp/c11b-q69-runtime.sql`) all stopped/removed before this write-up
-(`tmp/` is gitignored regardless). All temporary instrumentation (the
-planner.go OuterColumnRef walk, the unnest.go srcTableOffset print, the
-temporary joinInfoList one-liner) reverted before commit — `git diff
---stat` shows only unnest.go as the production diff plus the doc/ledger/
-fix_plan/working_set bookkeeping files.
+In-flight: none. Private diagnostic binary/data/logs
+(`tmp/goopg-c12-bin`, `tmp/c12-sf025-data`, `tmp/c12-server.log`,
+`tmp/c12-q69-*`) all stopped/removed before this write-up (`tmp/` is
+gitignored regardless). All four files' temporary instrumentation
+reverted via `git checkout --` before commit; verified empty diff.

@@ -5756,3 +5756,157 @@ change are part of this loop's landed diff. The private binaries, SF0.25
 data copy, and logs used this loop (`tmp/goopg-c11b-bin`,
 `tmp/goopg-c11b-sweep-bin`, `tmp/c11b-sf025-data`, `tmp/c11b-server.log`,
 `tmp/c11b-q69-runtime.sql`) were all removed before this write-up.
+
+## 47. c12 — the index-path-candidate-generator hypothesis is REFUTED; the real defect is downstream of path construction, narrowed to an empty `ctx.OuterRows` at runtime
+
+### 47.1 Method
+
+Same private-binary SF0.25 technique as §46 (`tmp/c12-sf025-data`, a copy of
+`bench/tpcds/runtime_goopg/data-sf025`; `tmp/goopg-c12-bin`; port 65491;
+started directly, not via the cgroup wrapper, so env vars reach the
+process — §46.1's finding). The temporary `joinInfoList:
+ctx.joinInfoList` one-liner (§46.3) was re-applied locally throughout to
+reach the search, exactly as c9-c12 established. Four rounds of temporary
+(all reverted before commit) instrumentation, each disproving the
+previous round's leading hypothesis:
+
+1. A print in `addNLIPaths` (joinpathsnli.go) and `addPartialNestLoopPaths`
+   (the partial/parallel arm), gated by `GOOPG_C12_NLI_TRACE=1`, printing
+   every candidate's `outerRelids`/`innerRelids`/`RequiredOuter`/`req`
+   pair — testing c12's own filed hypothesis (a missing relids-subset
+   check in the index-path candidate generator).
+2. A print in `createNestLoopIndexJoinPlan` (createplannl.go), printing
+   `outerPath.Rel.Relids`, `innerPath.RequiredOuter`, and the ACTUAL
+   built outer node's `Output()` schema — testing whether the DP search's
+   own createPlan phase materialises a Path whose claimed relids diverge
+   from what the recursively-built Plan node really publishes.
+3. A print in `tryBuildNLI` (nl_index_join.go), the SEPARATE "legacy"
+   post-search rewrite pass (`rewriteJoinsToNLI`) that pattern-matches
+   plain `*Join` nodes for a profitable NLI conversion with NO relids/
+   subset validation at all — testing whether THIS constructor (not the
+   DP-search one) builds the crashing node.
+4. Reading the executor source for the exact panic site
+   (`internal/executor/expr.go:472-478`) to learn what `depth=0` in the
+   error text actually means.
+
+### 47.2 Finding: neither `*NestedLoopIndexJoin` constructor ever builds the suspected illegal pairing
+
+Bit-mapping for Q69's 6-relation search, cross-validated against the
+`DPPATH` dump's own per-relation `width` annotations (customer=324,
+customer_address=388, customer_demographics=148, matching the catalog
+column widths): `bit0=customer(c)`, `bit1=customer_address(ca)`,
+`bit2=customer_demographics(cd)`, `bit3`/`bit4`/`bit5` = the
+`store_sales`/`web_sales`/`catalog_sales` EXISTS synthetic leaves.
+
+Exhaustively enumerating every `addNLIPaths`/`addPartialNestLoopPaths`
+candidate during a full, real (crashing) Q69 run: `cd` (bit2) appears as
+`inner` in exactly two lines, both with `outer ⊇ {customer}` (outer=
+`0x1`=`{c}` and `0x3`=`{c,ca}`) — i.e. every candidate the DP search's own
+NLI arms ever considered for `customer_demographics` legitimately
+supplies `customer`. The suspected illegal pairing (`outer={store_sales
+leaf}` alone, `inner=cd`) **never appears in the trace at all** — c12's
+filed hypothesis is refuted by direct, exhaustive evidence, not merely
+un-reproduced.
+
+Separately, `createNestLoopIndexJoinPlan` (the DP search's own
+create-plan-phase constructor) was invoked exactly twice for `cd` during
+one crashing run — once while building the `EXPLAIN`-only plan, once
+while building the plan actually executed — and **both calls used
+`outerPathRelids=0x3` (`{customer, customer_address}`)**, with the
+built outer node's `Output()` schema genuinely containing
+`c_current_cdemo_sk` (`SourceTableIdx=1`, i.e. customer). This
+construction is provably safe: `c_current_cdemo_sk` is directly
+resolvable from the outer row `createNestLoopIndexJoinPlan` actually
+built, both times.
+
+`tryBuildNLI`/`rewriteJoinsToNLI` (nl_index_join.go) — the OTHER, and
+only other, production constructor of a `*NestedLoopIndexJoin` node, a
+post-search textual rewrite pass with no relids validation whatsoever —
+**never successfully converts anything for this query** (zero
+`C12LEGACYNLI` trace lines across the same crashing run). Ruled out too.
+
+So both known constructors of the node type involved in the crash build
+it (when they build it at all) in the ONE safe shape, and the crash still
+reproduces 100% of the time. The two `EXPLAIN`-derived hypotheses from
+§46.6 (an eligibility gap in the index-path candidate generator; a
+coordinate-rebase bug) are both wrong — the defect is not in path
+selection or construction.
+
+### 47.3 The `EXPLAIN` text's apparent shape is not reliable evidence of the true tree
+
+§46.6 read `EXPLAIN`'s printed indentation and per-node `width` figures
+(a `Nested Loop` combining a `Gather(store_sales+date_dim)` child of
+width 848 with an `Index Scan … customer_demographics` child of width
+148, total 996) as proof that the executed tree pairs the bare
+`store_sales` leaf with `cd`. §47.2's direct instrumentation of the ONLY
+two node constructors contradicts that reading. Two explanations remain
+open and are NOT distinguished yet: (a) `EXPLAIN`'s cost/width display
+for a stamped-after-the-fact `*NestedLoopIndexJoin` node is computed from
+a stale/wrong source — `nlipricesplice.go`'s `stampSemiProbePrices`
+already documents a related "carrier-unset" display-only seam for
+SEMI/ANTI NLI nodes built outside the search, so an analogous
+display-only mislabeling for this ORDINARY (non-semi/anti) NLI is
+plausible but unconfirmed; or (b) the indentation is accurate and a
+THIRD, still-unfound constructor exists. Do not re-trust `EXPLAIN` text
+alone as ground truth for this bug without first re-deriving the claim
+from a live node-type instrument, as this loop had to.
+
+### 47.4 The sharper clue: `depth=0` means the lateral outer-row stack is EMPTY, not "wrong relation"
+
+`internal/executor/expr.go:472-478` evaluates an `*optimizer.OuterColumnRef`
+by `idx := len(ctx.OuterRows) - x.Level; if idx < 0 || idx >= len(ctx.OuterRows) { …
+out of range (depth=%d)… }`, where `depth` in the error message is
+`len(ctx.OuterRows)`. Q69's crash prints `depth=0` — **the lexical-scope
+outer-row stack is completely empty**, not merely missing the right
+entry. This reframes the whole search: the bug is not necessarily "the
+wrong relation is in scope" (a relids/coordinate bug, the whole line of
+inquiry c9-c12 has pursued) but potentially "no lateral outer was pushed
+at all" — i.e. an EXECUTION-side dispatch bug, where the specific
+`*Join{Lateral:true}` node §47.2 proved is correctly built (outer=
+`{customer,customer_address}`, which legitimately carries
+`c_current_cdemo_sk`) ends up embedded somewhere in the final tree where
+the operator that opens/rescans it does not go through whatever driver
+is responsible for pushing `ctx.OuterRows` before evaluating the inner's
+key — e.g. if it is reachable through a generic child-opening path
+(nested under a `Gather`, or as a non-driving child of some other
+operator) that does not honor the `Lateral` flag the way the dedicated
+lateral-stream driver does.
+
+### 47.5 c13 — next step (not started this loop)
+
+Instrument at the EXECUTION boundary instead of at plan CONSTRUCTION:
+print, every time `ctx.OuterRows` is pushed/popped (the lateral-stream
+driver in `internal/executor`, likely near `operators_nljoin.go`'s
+`nestedLoopIndexJoinOp` and whatever generic `bindOuter`/`lateralBindable`
+machinery `join_lateral_stream_test.go`'s doc comment describes — see
+§47.4), alongside a stack of the Go type of every node currently being
+opened/rescanned. Reproduce Q69's crash with that instrument live and
+read off: (a) is the correct `*Join{Lateral:true}` node (outer=
+`{customer,customer_address}`, confirmed correctly built in §47.2) ever
+actually opened/rescanned by the executor at all, and if so, (b) does its
+own open/rescan push a row onto `ctx.OuterRows` before recursing into its
+`Inner` `*IndexScan`, and if not, why not (what operator sits between the
+correctly-built lateral join and the probe that fails to relay the
+push). If the correct node is confirmed reachable but the push is
+skipped, the defect is in the executor's lateral-dispatch predicate
+(something like `lateralBindable`/`bindOuter`, per `M0134-0001`'s prior
+incident cited in `join_lateral_stream_test.go` — a DIFFERENT but
+analogous "wrap type doesn't trigger the lateral push" gap). If the
+correct node is NEVER reached at all, the tree the executor actually runs
+diverges from what `createPlan` returned, which would point back at a
+plan-tree-mutation pass running AFTER `createPlan` (a stamping/splice
+pass, `nlipricesplice.go` being the leading candidate given its own
+documented "operates on the FINAL tree" scope) that is rewriting or
+relocating this specific `*Join{Lateral:true}` node incorrectly. Use the
+same private-binary SF0.25 method as §46-47 (temporary
+`joinInfoList: ctx.joinInfoList` one-liner reapplied locally, reverted
+before commit either way); gate before landing anything with `go build
+./...`, `go test ./internal/optimizer/... ./internal/executor/...`, and a
+full `scripts/tpcds-sf025-regression.sh sweep` with a private `GOOPG_BIN`.
+
+No production code changed this loop — every instrument listed in §47.1
+was reverted before commit (`git diff --stat -- internal/optimizer/`
+empty). The private binary, SF0.25 data copy, and server log
+(`tmp/goopg-c12-bin`, `tmp/c12-sf025-data`, `tmp/c12-server.log`, and the
+`tmp/c12-q69-*` query/output scratch files) were all removed before this
+write-up.
