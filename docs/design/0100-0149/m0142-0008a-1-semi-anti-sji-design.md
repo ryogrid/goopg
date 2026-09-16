@@ -4201,3 +4201,69 @@ None of c1-c5 is picked up this loop (recon only, one task per loop). c1 is
 the natural next pickup: independently landable and verifiable, per the same
 "safe to build ahead of its own reachability" precedent this milestone has
 used repeatedly (`-3b`, `-3c`).
+
+## 37. `M0142-0008a-3i-plumbing-c1` — landed, verified inert
+
+Implemented exactly as §36 scoped: a `for _, lk := range semiAnti { conjuncts
+= append(conjuncts, splitAnd(lk.pred)...) }` loop, placed right after the
+`outerLinks` block (`joinsearchseam.go:555-565`, mirroring `onOuter`'s own
+merge one block above it) and before `partitionConjunctsForJoinPlanning`
+consumes `conjuncts`.
+
+**Why this is provably inert, not just argued to be** (traced through the two
+consumers before landing, since §36's own claim — "no synthetic leaf to
+attribute to" — deserved checking against the actual code rather than taken
+on faith):
+
+- `semiAntiOnQualsOK`'s own contract (`joinsearchseam.go:1570-1580`) already
+  establishes that every conjunct of `lk.pred` spans BOTH `lk.lhs` (real
+  leaves) and `lk.rhs` (the synthetic RHS leaf) — a same-side-only conjunct
+  would already have been pushed into the EXISTS body's own opaque leaf by
+  the unnest rewrite, before this link is ever built. So every conjunct this
+  loop adds necessarily carries the synthetic leaf's bit in its relids.
+- `partitionConjunctsForJoinPlanning` (`local_filters.go:62-86`) calls
+  `tableForCol`, which returns `-2` (multi-table) for any conjunct spanning
+  more than one leaf — including a real+synthetic pair — so the conjunct
+  lands in `joinConjuncts` (passed to the search), never silently dropped
+  into a `locals.byBinding` map entry the leaf-building loop wouldn't visit.
+- Inside `buildRestrictInfos` (`joinrestrict.go:167-200`), the conjunct DOES
+  get turned into a `restrictInfo` (relids computed relative to the FULL
+  `cumOffsets`, which already includes the semiAnti leaf's span per
+  `buildLeafSpans`) — but the DP search itself (`planJoinlistSearch`) only
+  ever builds `RelSet`s from `prob.bindings`, which — until `-3i-plumbing-c2`
+  extends it — has length `nprefix` (real leaves only). No subset of real
+  leaves can ever equal a relid set that requires the synthetic leaf's bit,
+  so the join that would "consume" this restrictInfo is never formed, and it
+  never influences a cost or shape decision among the real leaves.
+- One side effect worth recording precisely (not a regression, but a
+  pre-existing gap this loop's tracing surfaced rather than caused): because
+  `buildRestrictInfos` still records the clause, `searchConsumes` (line
+  ~1067) reports it as "seen" in the final residual computation
+  (`joinsearchseam.go:642-648`), so the semiAnti ON qual is not re-added to
+  the residual `Filter` either. Net effect: the predicate is silently
+  unenforced with or without c1 — before c1 it was never added to any list
+  at all; after c1 it is added, never joins a real leaf set, and is then
+  treated as "already consumed" for residual purposes. Same observable
+  outcome (predicate not enforced anywhere in the final plan) either way, so
+  c1 changes no plan's semantics — it only relocates where in the pipeline
+  the (still real, still-to-be-closed-by-c4/c5) gap manifests. This is the
+  concrete backing for "behaviour-neutral," not an assumption.
+
+**Empirical confirmation** (not just code tracing): optimizer package tests
+green (`go test ./internal/optimizer/...`), full `go build ./...` clean, and
+the TPC-DS SF0.25 regression sweep (`scripts/tpcds-sf025-regression.sh
+sweep`) against the git-tracked PG oracle came back `PASS=96 (60
+ck-verified, 36 ck=n/a) MISMATCH=0 CKMISMATCH=0 ERROR=0` with the
+status-delta and plan-diff channels reporting `PLAN-SHAPE: queries=99
+same=99 changed=0 added=0 removed=0` against the immediately prior commit
+(`ef898b7e3`, the b2 landing) — not one plan shape moved. TPC-H spotcheck
+(`scripts/tpch-spotcheck.sh`) reported its known pre-existing SKIPPED state
+(M0142-0003k's TPC-H data-dir blocker, unrelated to this change — see
+`CLAUDE.md`'s TPC-H bench row).
+
+Next pickup: `-3i-plumbing-c2` — give the synthetic Semi/Anti RHS leaf a real
+`rangeBinding`/`baseRelInfo` and extend `prob.bindings`/`scans`/`relInfos` to
+`nprefix+len(semiAnti)` (design doc §36, gaps 2-3). This is the piece that
+actually starts to move plan shapes, so it needs its own dedicated loop with
+a live Q78-shaped fixture check on the resulting row estimate — not assumed
+correct the way c1's inertness could be fully derived from the code alone.

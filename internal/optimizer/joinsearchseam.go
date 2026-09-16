@@ -552,6 +552,20 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 		conjuncts = append(conjuncts, onOuter...)
 		conjuncts = append(conjuncts, derived...)
 	}
+	// M0142-0008a-3i-plumbing-c1 (design doc §36, gap 1): a semiAnti link's
+	// correlation predicate joins `conjuncts` only HERE, mirroring `onOuter`
+	// above. Every split conjunct's relids necessarily span both `lk.lhs`
+	// (real leaves) and `lk.rhs` (the synthetic RHS leaf, per
+	// `semiAntiOnQualsOK`'s own contract) — and until `-3i-plumbing-c2`..`c4`
+	// give the search an actual leaf at the `rhs` bit position, no join built
+	// from real leaves alone can ever satisfy a relid set that includes it.
+	// `buildRestrictInfos` still records the clause (so `searchConsumes`
+	// reports it "seen"), but the search itself never forms the relset
+	// needed to place it. Behaviour-neutral until c2-c5 land (§36's "build
+	// it, verify inert" precedent, same as `-3i-plumbing-b1`/`-0008c-3c`).
+	for _, lk := range semiAnti {
+		conjuncts = append(conjuncts, splitAnd(lk.pred)...)
+	}
 	searchConjuncts, locals := partitionConjunctsForJoinPlanning(conjuncts, cumOffsets)
 	leaves := make([]Node, nprefix)
 	relInfos := make([]baseRelInfo, nprefix)

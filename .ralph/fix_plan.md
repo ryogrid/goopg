@@ -4036,14 +4036,19 @@ cross-layer programme that has never been scoped.
   whoever picks up S5a's own eligibility gate): relaxing
   `whereEligibleForPreDPUnnest` to per-sublink granularity would upgrade
   Q22 out of its total-bypass class on its own, independent of -1..-3.
-- [ ] **M0142-0008a-3i-plumbing-c1 — merge `semiAnti[*].pred`'s split
-  conjuncts into `conjuncts`** (design doc §36, gap 1). Mirror `outerLinks`'
-  `onOuter` treatment (`joinsearchseam.go:552`). Smallest, most isolated
-  piece of the five; with c2-c5 still open the new conjuncts have no
-  synthetic leaf to attribute to, so `partitionConjunctsForJoinPlanning`
-  holds them in the residual — behavior-neutral until the rest lands, same
-  "build it, verify inert" precedent `-3i-plumbing-b1`/`-0008c-3c` used.
-  Natural next pickup.
+- [x] **M0142-0008a-3i-plumbing-c1 — merge `semiAnti[*].pred`'s split
+  conjuncts into `conjuncts`** (design doc §36, gap 1; §37 landing note).
+  Mirrored `outerLinks`' `onOuter` treatment (`joinsearchseam.go:555-565`,
+  right after the `outerLinks` block). Verified inert (not just argued):
+  optimizer package tests green, full `go build ./...` clean, and the
+  TPC-DS SF0.25 sweep against the git-tracked oracle came back
+  `PASS=96 MISMATCH=0 CKMISMATCH=0 ERROR=0` with `PLAN-SHAPE: same=99
+  changed=0` versus the prior commit — the conjunct never binds to any
+  join of real leaves alone (its relids always include the not-yet-real
+  synthetic leaf bit), so nothing in the searched plan moved. TPC-H
+  spotcheck SKIPPED (pre-existing M0142-0003k data-dir blocker, unrelated).
+  Next: `-3i-plumbing-c2` (give the synthetic RHS leaf a real
+  `rangeBinding`/`baseRelInfo` and grow `prob.bindings`/`scans`/`relInfos`).
 - [ ] **M0142-0008a-3i-plumbing-c2 — give the synthetic Semi/Anti RHS leaf a
   `rangeBinding`/`baseRelInfo` and extend `prob.bindings`/`scans`/`relInfos`
   to `nprefix+len(semiAnti)`** (design doc §36, gaps 2-3). The
