@@ -3380,7 +3380,7 @@ cross-layer programme that has never been scoped.
     from Hash to Nested-Loop-only. Re-scopes -2 (smaller than filed) and
     splits -3 into three separately-sizable increments — see the design
     doc §4 for file+line resume points.
-  - [ ] **M0142-0008a-2** — RE-SCOPED by -1 (smaller than originally
+  - [x] **M0142-0008a-2** — RE-SCOPED by -1 (smaller than originally
     filed): attach an inert `*SpecialJoinInfo` to `unnestExistsExpr`'s
     built `*Join` node using the existing `makeSpecialJoinInfoScoped`
     shrink algorithm (not its parser-facing `sc`/`item`/`lower` signature —
@@ -3389,7 +3389,22 @@ cross-layer programme that has never been scoped.
     expected". New unit tests from a real `unnestExistsExpr` fixture
     (today's `JoinSemi`/`JoinAnti` legality tests are unit-only, never
     exercised end-to-end). See design doc §4.1. Gated on M0142-0008a-1
-    (done).
+    (done). **LANDED 2026-09-16 (design doc §7):** new
+    `existsUnnestSJInfo` helper (`unnest.go`, package-local — the
+    parser-facing `makeSpecialJoinInfoScoped` signature does not apply
+    to this producer's already-resolved `unnestParam`/residual data), a
+    new `Join.SJInfo *SpecialJoinInfo` field (`plan.go`), wired at
+    `unnestExistsExpr`'s single `&Join{...}` construction site. Uses a
+    self-contained 2-bit RelSet (LHS=1, RHS=2), NOT the search's global
+    per-call numbering — -3 must remap, not reuse, these bits if it
+    lands the atomic-RHS version. Zero readers today (grep-confirmed).
+    Verified: full `internal/optimizer` suite green; TPC-DS SF0.25 sweep
+    `PLAN-SHAPE: queries=99 same=99 changed=0`, `MISMATCH=0`; TPC-H
+    Q12/Q13 spot-check SKIPPED (pre-existing `:65433` data gap,
+    M0142-0003k, unrelated). Three new unit tests in
+    `exists_unnest_sjinfo_test.go` (hash-keyed Semi, hash-keyed Anti,
+    keyless nested-loop Semi) pin the computed values from real
+    `unnestExistsExpr` fixtures.
   - [ ] **M0142-0008a-3** — RE-SCOPED by -1 into three separately-landable
     increments (see design doc §4.2): (i) make the decorrelated RHS a
     real DP-search participant (extend `runJoinSearchBelowPinned` to walk

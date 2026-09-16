@@ -1,0 +1,115 @@
+package optimizer
+
+import (
+	"testing"
+
+	"github.com/goopg/goopg/internal/parser"
+)
+
+// M0142-0008a-2: unit tests for existsUnnestSJInfo, built from real
+// unnestExistsExpr fixtures rather than the parser-facing
+// makeSpecialJoinInfoScoped path — specialjoin_test.go's existing
+// TestSpecialJoinInfoSemiJoin/TestSpecialJoinInfoAntiJoin never exercise a
+// real SEMI/ANTI join (the parser has no SEMI JOIN syntax, so those tests
+// stand in with LEFT JOIN); these close that "never exercised end-to-end"
+// gap for the EXISTS/NOT EXISTS producer. Join.SJInfo is inert today (no
+// consumer reads it) — these tests pin its VALUE for when M0142-0008a-3
+// wires a reader, not any observable plan-shape change.
+
+func TestExistsUnnestSJInfoSemiHashKey(t *testing.T) {
+	cat := twoTablesCatalog(t)
+	sql := "SELECT x FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE z = t1.x)"
+	node, err := Plan(parseOne(t, sql), cat)
+	if err != nil {
+		t.Fatal(err)
+	}
+	j := findFirstJoinByType(node, JoinTypeSemi)
+	if j == nil {
+		t.Fatalf("no JoinTypeSemi found: %s", planString(node))
+	}
+	sj := j.SJInfo
+	if sj == nil {
+		t.Fatal("Join.SJInfo is nil")
+	}
+	if sj.Jointype != parser.JoinSemi {
+		t.Errorf("Jointype = %v, want JoinSemi", sj.Jointype)
+	}
+	if sj.SynLefthand != RelSet(1) || sj.SynRighthand != RelSet(2) {
+		t.Errorf("Syn = {%v,%v}, want {1,2}", sj.SynLefthand, sj.SynRighthand)
+	}
+	if sj.MinLefthand != RelSet(1) || sj.MinRighthand != RelSet(2) {
+		t.Errorf("Min = {%v,%v}, want {1,2} (2-relation join: min==syn)", sj.MinLefthand, sj.MinRighthand)
+	}
+	if !sj.LhsStrict {
+		t.Error("LhsStrict = false, want true (equijoin key is a strict operator)")
+	}
+	if !sj.SemiCanHash || !sj.SemiCanBtree {
+		t.Errorf("SemiCanHash=%v SemiCanBtree=%v, want true/true (hash-keyed SEMI)", sj.SemiCanHash, sj.SemiCanBtree)
+	}
+}
+
+func TestExistsUnnestSJInfoAntiHashKey(t *testing.T) {
+	cat := twoTablesCatalog(t)
+	sql := "SELECT x FROM t1 WHERE NOT EXISTS (SELECT 1 FROM t2 WHERE z = t1.x)"
+	node, err := Plan(parseOne(t, sql), cat)
+	if err != nil {
+		t.Fatal(err)
+	}
+	j := findFirstJoinByType(node, JoinTypeAnti)
+	if j == nil {
+		t.Fatalf("no JoinTypeAnti found: %s", planString(node))
+	}
+	sj := j.SJInfo
+	if sj == nil {
+		t.Fatal("Join.SJInfo is nil")
+	}
+	if sj.Jointype != parser.JoinAnti {
+		t.Errorf("Jointype = %v, want JoinAnti", sj.Jointype)
+	}
+	if sj.MinLefthand != RelSet(1) || sj.MinRighthand != RelSet(2) {
+		t.Errorf("Min = {%v,%v}, want {1,2}", sj.MinLefthand, sj.MinRighthand)
+	}
+	if !sj.LhsStrict {
+		t.Error("LhsStrict = false, want true (equijoin key is a strict operator)")
+	}
+	// PG's compute_semijoin_info populates Semi* only for JOIN_SEMI, never
+	// JOIN_ANTI (specialjoin.go:239-247) — ANTI must stay false/false.
+	if sj.SemiCanHash || sj.SemiCanBtree {
+		t.Errorf("SemiCanHash=%v SemiCanBtree=%v, want false/false for ANTI", sj.SemiCanHash, sj.SemiCanBtree)
+	}
+}
+
+func TestExistsUnnestSJInfoKeylessSemi(t *testing.T) {
+	// Matrix M14 (S4a/D3.2): zero-equijoin EXISTS, decorrelated as a
+	// nested-loop semi join carrying the residual as its predicate — no
+	// hash key exists, so LhsStrict and the Semi* capability flags must
+	// fall back to their safe defaults even though the clause still spans
+	// both sides (the residual alone is enough to avoid the empty-clause
+	// punt).
+	cat := twoTablesCatalog(t)
+	sql := "SELECT x FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE z > t1.x)"
+	node, err := Plan(parseOne(t, sql), cat)
+	if err != nil {
+		t.Fatal(err)
+	}
+	j := findFirstJoinByType(node, JoinTypeSemi)
+	if j == nil {
+		t.Fatalf("no JoinTypeSemi found: %s", planString(node))
+	}
+	if j.Algo != JoinAlgoNestedLoop {
+		t.Fatalf("Algo = %d, want JoinAlgoNestedLoop (keyless fixture)", j.Algo)
+	}
+	sj := j.SJInfo
+	if sj == nil {
+		t.Fatal("Join.SJInfo is nil")
+	}
+	if sj.MinLefthand != RelSet(1) || sj.MinRighthand != RelSet(2) {
+		t.Errorf("Min = {%v,%v}, want {1,2} (residual alone spans both sides)", sj.MinLefthand, sj.MinRighthand)
+	}
+	if sj.LhsStrict {
+		t.Error("LhsStrict = true, want false (no equijoin key, PG's safe default)")
+	}
+	if sj.SemiCanHash || sj.SemiCanBtree {
+		t.Errorf("SemiCanHash=%v SemiCanBtree=%v, want false/false (no hash key to derive them from)", sj.SemiCanHash, sj.SemiCanBtree)
+	}
+}

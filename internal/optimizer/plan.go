@@ -1211,7 +1211,15 @@ type Join struct {
 	// RelOptInfo.Rows has baserestrictinfo selectivity already applied (§3.23).
 	OuterRows float64
 	InnerRows float64
-	schema     Schema
+	// SJInfo is an inert SpecialJoinInfo attached by unnestExistsExpr for
+	// JoinTypeSemi/JoinTypeAnti joins built from EXISTS/NOT EXISTS
+	// unnesting. M0142-0008a-2: nil for every other join constructor, and
+	// UNREAD by every existing consumer — it exists so a future DP-search
+	// participant (M0142-0008a-3) has a ready-built value rather than
+	// reconstructing it, not to change today's plan shape. See
+	// docs/design/0100-0149/m0142-0008a-1-semi-anti-sji-design.md §4.1.
+	SJInfo *SpecialJoinInfo
+	schema Schema
 }
 
 func (n *Join) Pos() int { return n.pos }

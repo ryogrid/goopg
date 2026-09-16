@@ -505,3 +505,66 @@ self-correlated EXISTS where inner and outer share a table is wrong. Filed as
 **M0142-0008d** (fix_plan.md) since a wrong alias in EXPLAIN is a real,
 user-visible PG-compatibility defect (a DBA reading this plan sees the wrong
 join key) even though it never reaches execution.
+
+## 7. M0142-0008a-2 landed (2026-09-16)
+
+Implemented per §4.1, with one adaptation the section flagged as open: §4.1
+said to call `makeSpecialJoinInfoScoped`'s *shrink logic*, not its
+`sc`/`item`/`lower` signature. In practice that meant a **new, small helper**
+(`existsUnnestSJInfo`, `unnest.go`, inserted immediately before
+`unnestExistsExpr`) rather than a call into `specialjoin.go` at all —
+`unnestExistsExpr` has no `sjiScope`/catalog/`parser.FromExpr` to resolve
+against, only already-resolved `unnestParam{OuterRef, SubCol}` pairs and
+lifted-residual `Expr`s, so the shrink computation is re-expressed directly
+over that data instead of forced through the parser-facing entry point.
+
+**RelSet numbering choice.** §4.2 item 1 flagged the atomic-RHS-vs-full-
+participation question as open for -3 and recommended atomic-RHS as the
+right-sized first step. -2 commits to that recommendation now, one increment
+early: `existsUnnestSJInfo` uses a self-contained 2-bit scheme
+(`LHS=RelSet(1)`, `RHS=RelSet(2)`) rather than any of the join search's real
+per-call numbering (which does not exist at this pipeline stage — this
+rewrite runs before the DP search, not inside it). Because every
+`unnestExistsExpr` join has by construction exactly one param/residual set
+tying one outer column to one inner column, `clause_relids` always spans
+both bits whenever any param or residual exists (guaranteed — the function's
+own belt check refuses a keyless join with no residual), so `MinLefthand ==
+SynLefthand` and `MinRighthand == SynRighthand` always hold for this
+producer: a 2-relation join has nothing to shrink from. The "shrink" pass
+(specialjoin.go:190-219, the lower-outer-join ordering scan) is still called
+in spirit but is a structural no-op here (`lower` is implicitly empty —
+`ctx.joinInfoList` belongs to ordinary jointree deconstruction, which this
+rewrite runs independently of).
+
+**What -3 must NOT assume.** If -3 lands the atomic-RHS version, this
+numbering is directly reusable as the join's own 2-relation local view, but
+the DP search's *global* `RelSet` bits (per §3.3, per-search-call) are a
+different, larger numbering the RHS's base rel(s) must be assigned into —
+`existsUnnestSJInfo`'s output is NOT pre-numbered for that global space and
+-3 will need to remap or rebuild it, not consume the bits as-is.
+
+**Verification.** `Join.SJInfo` is set but has **zero readers** anywhere in
+the tree today (confirmed: it is a new field, and nothing added in this
+change reads it) — "no plan-shape change expected" (§4.1) is therefore
+structural, not merely measured, but it was measured anyway per the
+milestone group's gate discipline: full `internal/optimizer` suite green
+(no behavioral test depends on the new field), and the TPC-DS SF0.25 sweep
+(`scripts/tpcds-sf025-regression.sh sweep`) reports `PLAN-SHAPE: queries=99
+same=99 changed=0` and `MISMATCH=0` against the pre-change baseline — byte-
+identical plans and results. TPC-H's Q12/Q13 spot-check gate SKIPPED (known,
+pre-existing: `:65433`'s `tpch` DB still holds no TPC-H tables — M0142-0003k,
+unrelated to this change). Three new unit tests
+(`exists_unnest_sjinfo_test.go`) built from real `unnestExistsExpr` fixtures
+(hash-keyed Semi, hash-keyed Anti, keyless nested-loop Semi from matrix M14)
+pin the computed `SpecialJoinInfo` values, closing the "never exercised
+end-to-end" gap §2.3 flagged in the existing `specialjoin_test.go` Semi/Anti
+cases (which stand in with `LEFT JOIN` because the parser has no SEMI JOIN
+syntax).
+
+**Next step**: M0142-0008a-3, re-scoped into three increments by §4.2. Per
+§4.2's own recommendation, increment (3) (lift the hash-decline gate) should
+land before or alongside (1) (RHS-as-participant) — §5's trace-through
+already confirmed `createPlan`'s hash-join lowering is generic over
+Semi/Anti, so (3) is unblocked to implement; (1) is the larger, still-open
+design question (atomic-RHS vs full participation for the EXISTS body's own
+internal joins).

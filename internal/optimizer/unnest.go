@@ -4107,6 +4107,77 @@ func liftResidualConjuncts(residuals, innerOnly []Expr, outerSchema Schema, inne
 //
 // The join's output schema is the LEFT (outer) schema only —
 // downstream column indices are unchanged from before unnesting.
+// existsUnnestSJInfo builds an inert *SpecialJoinInfo for the Join
+// unnestExistsExpr is about to construct, using the same shrink logic as
+// makeSpecialJoinInfoScoped (specialjoin.go:127) — not its sc/item/lower
+// parser-facing signature, which has no meaning here: this producer already
+// holds resolved OuterColumnRef/ColumnRef pairs (params, residuals) instead
+// of a raw parser.FromExpr, and builds exactly one join with no sibling SJIs
+// in scope (ctx.joinInfoList belongs to jointree deconstruction, which this
+// rewrite runs independently of), so the lower-outer-join ordering scan
+// (specialjoin.go:190-219) is a no-op by construction — equivalent to
+// calling makeSpecialJoinInfoScoped with lower=nil.
+//
+// M0142-0008a-2 (design doc §4.1): the RelSet numbering is a self-contained
+// 2-bit scheme (LHS=bit0, RHS=bit1), matching the design's "atomic-RHS"
+// recommendation for -3 (§4.2 item 1) — the whole outer side and the whole
+// EXISTS-body side are ONE participant each. This is NOT the join search's
+// real per-call global numbering (which does not exist yet at this phase);
+// -3 recomputes real bits once the RHS actually joins the search. The field
+// is attached but has no reader today, so this numbering choice cannot
+// change any plan.
+func existsUnnestSJInfo(jt JoinType, params []unnestParam, residuals []Expr) *SpecialJoinInfo {
+	const synL, synR RelSet = 1, 2
+
+	pjt := parser.JoinSemi
+	if jt == JoinTypeAnti {
+		pjt = parser.JoinAnti
+	}
+	sj := &SpecialJoinInfo{
+		SynLefthand:  synL,
+		SynRighthand: synR,
+		Jointype:     pjt,
+	}
+
+	// clause_relids (specialjoin.go:177-185): every param/residual conjunct
+	// relates exactly one outer (LHS) column to exactly one inner (RHS)
+	// column by construction of the EXISTS pull-up, so any param/residual
+	// makes the clause span both sides. The "no relations required" punt
+	// (specialjoin.go:220-229, PG initsplan.c:2007-2013) is unreachable in
+	// practice — unnestExistsExpr's own belt check refuses a keyless join
+	// with no residual — but is kept for the same defensive reason PG keeps
+	// it.
+	var clause RelSet
+	if len(params) > 0 || len(residuals) > 0 {
+		clause = synL | synR
+	}
+	minL, minR := clause&synL, clause&synR
+	if minL == 0 {
+		minL = synL
+	}
+	if minR == 0 {
+		minR = synR
+	}
+	sj.MinLefthand, sj.MinRighthand = minL, minR
+
+	// LhsStrict (specialjoin.go:178): the join's equijoin key comparison(s)
+	// use `=`, a strict operator, so the clause is strict for the LHS
+	// whenever at least one equijoin param exists. The keyless shape
+	// (matrix M14, params==0) falls back to false, PG's safe default.
+	sj.LhsStrict = len(params) > 0
+
+	// Semi-only fields (specialjoin.go:239-247, PG's compute_semijoin_info):
+	// populated only for SEMI. A hash-keyed join here always came from an
+	// equality operator — the only way unnestExistsExpr sets
+	// LeftKey/RightKey — so both flags follow directly from key presence
+	// rather than re-parsing the predicate.
+	if pjt == parser.JoinSemi && len(params) > 0 {
+		sj.SemiCanBtree, sj.SemiCanHash = true, true
+	}
+
+	return sj
+}
+
 func unnestExistsExpr(ex *ExistsExpr, outer Node) (Node, error) {
 	if !canUnnestExistsExpr(ex) {
 		return nil, nil
@@ -4397,6 +4468,7 @@ func unnestExistsExpr(ex *ExistsExpr, outer Node) (Node, error) {
 		Right:     innerPlan,
 		Predicate: joinPredicate,
 		schema:    append(Schema(nil), outerChild.Output()...),
+		SJInfo:    existsUnnestSJInfo(joinType, params, eup.Residuals),
 	}
 	if outerKey != nil {
 		join.LeftKey = outerKey
