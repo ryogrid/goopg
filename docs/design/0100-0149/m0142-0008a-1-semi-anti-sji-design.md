@@ -1077,3 +1077,92 @@ more leaf produces the SAME row/cost estimate `EstimateRows`/
 provably a no-op for cost/cardinality, only changing what
 `extractSearchLeaves` does with it), before writing any real DP-search
 plumbing for (a)/(b)/(c) above.
+
+## 13. M0142-0008a-3i-verify — live probe run: §12.3's claim was WRONG, and
+the correct finding is BETTER than the hypothesis it was testing (2026-09-16)
+
+**No production code changed.** Added
+`internal/optimizer/m0142_0008a_3i_verify_probe_test.go`
+(`TestExistsUnnestTwoRelationRHSTopNodeIsProjectNotBareJoin`), a live,
+end-to-end (`Plan(sql, cat)`) instrumented probe — not another static read —
+built on the smallest fixture that reproduces Q69's witness shape:
+`threeTablesCatalog`'s `t1(x)`/`t2(y,z)`/`t3(a,b)`, with `SELECT x FROM t1
+WHERE EXISTS (SELECT 1 FROM t2, t3 WHERE t2.z = t1.x AND t2.y = t3.a)` standing
+in for Q69's `EXISTS (SELECT 1 FROM web_sales, date_dim WHERE … )` idiom
+(RowCount stats seeded manually — `threeTablesCatalog`'s own tests
+deliberately leave tables un-ANALYZEd, which makes `EstimateRows` correctly
+return 0 and would have hidden the comparison this probe needs).
+
+### 13.1 The literal claim in §11/§12 is false
+
+§11 stated, and §12.2/§12.3 repeated, that "`x.Right`'s top node is literally
+`*Join{Type:Inner}`" for a multi-table EXISTS body. The live run refutes
+this: `j.Right` is `*Project{Child: *Join{Type:JoinTypeInner}}`, not a bare
+`*Join`. The reason is structural, not incidental to this fixture:
+`unnestExistsExpr` builds the RHS by cloning `ex.Plan`
+(`clonePlanReplacingOuter`, unnest.go:4546) — the EXISTS body's **own,
+already-fully-planned** subquery tree — and every planned `SELECT`, including
+a constant list like `SELECT 1`, carries its own top-level output-list
+`*Project`. A two-relation EXISTS body's `ex.Plan` is therefore always
+`Project(Join(...))` in the general case, not a bare `Join`; the earlier
+single-table fixtures in `exists_unnest_sjinfo_test.go` never exposed this
+because a one-relation body plans straight to `*SeqScan` with no join (and
+often no Project either, once column-pruning elides a pure passthrough) to
+begin with.
+
+### 13.2 The consequence is the opposite of what §12.3 assumed: no wrapper is needed at all
+
+§12.3's entire proposal — a bare `*Filter{Predicate:nil, Child: x.Right}` — 
+existed to give `extractSearchLeaves` a non-`*Join` node to stop at instead of
+wrongly recursing into `x.Right`'s join structure. The live run shows
+`x.Right` **already is** a non-`*Join` node (`*Project`) with zero new code:
+
+- `extractSearchLeaves(j.Right)` already returns a single opaque leaf
+  (`scans == [j.Right]`, confirmed by the probe) — the `isJoin` type test
+  (joinsearchseam.go:1110) is false for `*Project` on exactly the same
+  footing it would have been false for the proposed `*Filter`.
+- `EstimateRows(j.Right)` already recurses correctly to the real join
+  cardinality underneath via the existing generic case (`case *Project:
+  return EstimateRows(x.Child)`, cardinality.go:74-75) — confirmed
+  numerically equal to `EstimateRows(inner)` by the probe, i.e. `*Project` is
+  exactly as cardinality-neutral as the proposed `*Filter{Predicate:nil}`
+  would have been, because it is already a member of the same
+  "pass-through wrapper" family the M0125-0038 comment block
+  (cardinality.go:108-136) documents (`*Gather`, `*GatherMerge`, `*LockRows`,
+  `*Memoize`, `*CTEScan`, …).
+- `baseSeqScanCostInputs(ri, j.Right, …)` already takes the documented
+  generic non-`*SeqScan` fallback (`leafBaseScan` does not unwrap `*Project`,
+  so `leafBaseScan(j.Right) == j.Right`, which is not `*SeqScan` either way) —
+  confirmed by the probe's `(pages, tuples, ops)` shape check.
+
+**Net effect: §12.3's proposed wrapper-node engineering step is unnecessary.**
+The plan shape `unnestExistsExpr` already produces for a multi-table EXISTS
+body is, by construction, already an opaque leaf as far as every downstream
+consumer named in §12.2 is concerned — the "narrower gap" §12.3 identified
+(needing *some* non-`*Join` marker) turns out to already be filled by the
+ordinary output of planning the subquery, not by anything -3(i) has to add.
+
+### 13.3 What is actually still open — unchanged from §12.4, now confirmed to be the WHOLE remaining task
+
+Nothing in this probe touches §12.4's three real plumbing items, and nothing
+here makes them smaller or larger:
+
+(a) `runJoinSearchBelowPinned` (or its caller) still has to build a
+`RelOptInfo`/`baseRelInfo` entry for `j.Right` (whatever its concrete top
+node — `*Project` today, confirmed; possibly something else for a body shape
+this probe didn't exercise) and append it to `bindings`/`relInfos` before
+calling into `tryJoinSearch`;
+(b) `ctx.joinInfoList`/`SJInfo` bookkeeping still needs extending so the
+search's own join-legality checks (§2) see the Semi/Anti restriction against
+the new bit correctly;
+(c) `reresolveJoinByName`'s post-search splice (§11) — the pinned spine's
+shape assumption — is completely untouched and still open.
+
+**Revised next step:** -3(i) can now skip straight to (a)/(b)/(c) — no
+wrapper-node design/implementation increment is needed first. Whoever picks
+this up should re-verify point (a) does not itself need special-casing for
+`*Project`-topped leaves (e.g. does `newPrebuiltPath`/`PathPrebuilt`
+already handle a `*Project` leaf identically to a `*SeqScan`/`*Join` one? —
+§12.2 says yes for "any wrapped Node kind" but that claim was itself a static
+read and this loop's lesson is: verify claims like that live, not by
+re-reading).

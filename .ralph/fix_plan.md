@@ -3536,18 +3536,47 @@ cross-layer programme that has never been scoped.
     step filed as **M0142-0008a-3i-verify** (below): a throwaway
     instrumented probe against Q69 confirming the Filter-wrapper hypothesis
     before any real DP-search plumbing is written.
-  - [ ] **M0142-0008a-3i-verify — confirm the `*Filter`-wrapper hypothesis
+  - [x] **M0142-0008a-3i-verify — confirm the `*Filter`-wrapper hypothesis
     against the Q69 witness with a live instrumented run** — filed by
-    -3i-recon2 (design doc §12.3/12.4). Build a small throwaway probe
-    (style of §5's -3(iii) trace-through) that (1) confirms all three of
-    Q69's EXISTS-body top nodes are `*Join{Inner}`, (2) confirms wrapping
-    one in `*Filter{Predicate: nil, Child: x.Right}` and splicing it into
-    `origChain` as one more leaf reproduces the SAME row/cost estimate
-    `EstimateRows`/`baseSeqScanCostInputs` already compute for it today
-    (i.e. the wrapper is a no-op for cost/cardinality, only changing what
-    `extractSearchLeaves` does with it). Design/instrumentation-only until
-    confirmed; only after this should (a)/(b)/(c) of §12.4 (new
-    `RelOptInfo`/`SJInfo` registration, post-search splice) be attempted.
+    -3i-recon2 (design doc §12.3/12.4). **DONE 2026-09-16 (design doc §13),
+    no production change.** The live probe
+    (`internal/optimizer/m0142_0008a_3i_verify_probe_test.go`,
+    `TestExistsUnnestTwoRelationRHSTopNodeIsProjectNotBareJoin`) REFUTES the
+    literal claim it set out to confirm: `x.Right`'s top node is
+    `*Project{Child: *Join{Inner}}`, not a bare `*Join` — `unnestExistsExpr`
+    clones the EXISTS body's own already-planned subquery tree, and every
+    planned `SELECT` (even `SELECT 1`) carries its own top-level
+    output-list `*Project`. The consequence is BETTER than the hypothesis:
+    no `*Filter` wrapper (or any new node) is needed at all —
+    `extractSearchLeaves` already stops at the `*Project` as one opaque
+    leaf, `EstimateRows` already has a generic `*Project` pass-through case
+    (confirmed numerically equal to the inner Join's own estimate), and
+    `baseSeqScanCostInputs` already takes its documented generic
+    non-`*SeqScan` fallback — all three confirmed live, not re-derived from
+    reading. **Follow-up filed as M0142-0008a-3i-plumbing** (below): -3(i)
+    can now skip straight to §12.4's (a)/(b)/(c) DP-search plumbing with no
+    wrapper-node step first.
+  - [ ] **M0142-0008a-3i-plumbing — wire `x.Right` as a real DP-search
+    participant: RelOptInfo/SJInfo registration + post-search splice** —
+    filed by M0142-0008a-3i-verify (design doc §13.3). §12.4's three items,
+    unchanged by -3i-verify and now the entire remaining scope (no
+    wrapper-node increment needed, per -3i-verify): (a)
+    `runJoinSearchBelowPinned` (or its caller) must build a
+    `RelOptInfo`/`baseRelInfo` entry for `x.Right` (concrete top node
+    `*Project` per the Q69/-3i-verify witness, though a body shape neither
+    probe exercised may differ) and append it to `bindings`/`relInfos`
+    before calling into `tryJoinSearch`; (b) extend
+    `ctx.joinInfoList`/`SJInfo` bookkeeping so the search's own
+    join-legality checks (design doc §2) see the Semi/Anti restriction
+    against the new bit correctly; (c) resolve `reresolveJoinByName`'s
+    post-search splice (§11, still completely untouched) — the pinned
+    spine's shape assumption stops holding once the RHS is a real relset
+    bit the search can place anywhere. Also re-verify LIVE (not by
+    re-reading) whether `newPrebuiltPath`/`PathPrebuilt` truly handles a
+    `*Project`-topped leaf identically to a `*SeqScan`/`*Join` one — §12.2's
+    "any wrapped Node kind" claim was itself a static read that -3i-verify's
+    own finding shows was one detail wrong (the concrete node kind), so it
+    should not be trusted un-reverified for this next step either.
   **Independent, unfiled resume-point hint** (not sized/numbered — noted for
   whoever picks up S5a's own eligibility gate): relaxing
   `whereEligibleForPreDPUnnest` to per-sublink granularity would upgrade
