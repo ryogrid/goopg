@@ -225,20 +225,34 @@ func TestM0142_0008a_3iPlumbing_AdmitSemiAnti(t *testing.T) {
 	}
 
 	// Consumer #3: problemPairsOuterWithDerived operates on []*SpecialJoinInfo
-	// (not []outerChainLink), switching on sj.Jointype with an explicit
-	// `case parser.JoinLeft, parser.JoinRight, parser.JoinFull: default:
-	// continue` — recon2 already found this skips Semi/Anti entirely.
-	// Confirm directly with a real existsUnnestSJInfo-shaped SpecialJoinInfo
-	// rather than trusting the prior static read.
+	// (not []outerChainLink). At the time this probe was written it switched
+	// on sj.Jointype with an explicit `case parser.JoinLeft, parser.JoinRight,
+	// parser.JoinFull: default: continue` — recon2 found this skipped
+	// Semi/Anti entirely, and this probe live-confirmed it (design doc §15's
+	// "new safety finding"). -3i-plumbing-a (design doc §21) has SINCE added
+	// a `parser.JoinSemi, parser.JoinAnti` arm to that switch (relfromjoinlist.go),
+	// per §15's own instruction to land the firewall arm in the same change
+	// that first makes Semi/Anti admission possible rather than as a
+	// follow-up. This fixture's `relInfos` are the zero value (`table: nil`
+	// on both), which `leafIsDerivedInput`'s fallback arm conservatively
+	// treats as "derived" regardless of node type (see
+	// TestProblemPairsOuterWithDerivedNilTableFallback in
+	// outer_over_derived_test.go for the LEFT/RIGHT precedent of the same
+	// fallback) — so with the new arm live, this now correctly declines
+	// (`true`), where the old code silently accepted it purely because
+	// Semi/Anti was skipped, not because the shape was actually safe. The
+	// not-derived positive/negative pair lives in
+	// TestProblemPairsOuterWithDerivedSemiOverDerived and its sibling in
+	// semiantichain_test.go, which use real (non-nil) table leaves.
 	sj := existsUnnestSJInfo(JoinTypeSemi, nil, []Expr{lk.pred})
 	items := []joinlistRel{{lo: 0, hi: 1}, {lo: 1, hi: 2}}
 	relInfos := []baseRelInfo{{}, {}}
 	scansArg := []Node{scans[0], scans[1]}
 	prob := &joinlistProblem{scans: scansArg, relInfos: relInfos}
-	if got := problemPairsOuterWithDerived([]*SpecialJoinInfo{sj}, items, prob); got {
-		t.Errorf("problemPairsOuterWithDerived([]*SpecialJoinInfo{semiSJI}, ...) = true — recon2's finding that Semi/Anti is skipped no longer holds, re-check design doc §12.2")
+	if got := problemPairsOuterWithDerived([]*SpecialJoinInfo{sj}, items, prob); !got {
+		t.Errorf("problemPairsOuterWithDerived([]*SpecialJoinInfo{semiSJI}, ...) = false, want true — both leaves have a nil `table` (leafIsDerivedInput's fallback arm), so the new Semi/Anti arm (landed -3i-plumbing-a) must decline")
 	} else {
-		t.Logf("CONFIRMED (re-verifies recon2's static read): problemPairsOuterWithDerived declines to flag a Semi SpecialJoinInfo at all (default: continue on sj.Jointype) — the Q78 catastrophic-mis-costing firewall does not see Semi/Anti today, live-probe-confirmed rather than merely read")
+		t.Logf("CONFIRMED: problemPairsOuterWithDerived now declines a Semi SpecialJoinInfo over nil-table leaves via the new Semi/Anti-aware arm (-3i-plumbing-a), superseding the old blanket `default: continue` skip this probe originally found")
 	}
 }
 

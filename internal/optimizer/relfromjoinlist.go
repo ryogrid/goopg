@@ -587,7 +587,7 @@ func problemPairsOuterWithDerived(sjis []*SpecialJoinInfo, items []joinlistRel, 
 			continue
 		}
 		switch sj.Jointype {
-		case parser.JoinLeft, parser.JoinRight, parser.JoinFull:
+		case parser.JoinLeft, parser.JoinRight, parser.JoinFull, parser.JoinSemi, parser.JoinAnti:
 		default:
 			continue
 		}

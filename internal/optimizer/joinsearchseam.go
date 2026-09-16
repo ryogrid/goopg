@@ -1287,6 +1287,85 @@ type outerChainLink struct {
 	pred                 Expr
 }
 
+// semiAntiChainLink is the SEMI/ANTI analogue of outerChainLink, kept as its
+// own type rather than a `jointype`-discriminated arm of outerChainLink
+// (M0142-0008a-3i-plumbing, design doc §15 item 2): SEMI/ANTI never
+// null-extends in either direction (`reresolveJoinByName`'s own doc comment —
+// "emit Outer (=Left) only at runtime"), so `outerChainLink`'s
+// preserved/nullable fields, and every consumer built on that NULL-extension
+// contract (`outerOnQualsOK`, `deriveOuterLinkConstants`), do not apply and
+// must not be reused by encoding one side as "nullable" purely to satisfy
+// their arithmetic — §15 found that trap live. `lhs`/`rhs` are the two
+// disjoint LEAF-INDEX relsets `extractSearchLeaves` would flatten a SEMI/ANTI
+// join's syntactic sides into, mirroring `SpecialJoinInfo.SynLefthand`/
+// `SynRighthand` for the same join (`existsUnnestSJInfo`, unnest.go).
+//
+// NOT YET PRODUCED by `extractSearchLeaves` — landed here, with its
+// consumers below, as inert/unit-tested-only infrastructure ahead of the
+// walk-extension step, which is coupled to a separate, larger change
+// (planner.go's pre-unnest `origChain` snapshot and predp.go's pinned-spine
+// descend loop both currently prevent any SEMI/ANTI node from ever reaching
+// `extractSearchLeaves`, so extending the walk alone would be dead code —
+// see design doc §21).
+type semiAntiChainLink struct {
+	jointype parser.JoinType
+	lhs, rhs RelSet
+	pred     Expr
+}
+
+// semiAntiLinksHaveSJInfos is `outerLinksHaveSJInfos`'s SEMI/ANTI analogue:
+// every admitted link must be backed by a real `SpecialJoinInfo` the search's
+// legality machinery already knows about, matched by jointype and by the two
+// syntactic sides (no preserved/nullable distinction to match).
+func semiAntiLinksHaveSJInfos(links []semiAntiChainLink, list []*SpecialJoinInfo) bool {
+	for _, lk := range links {
+		found := false
+		for _, sj := range list {
+			if sj != nil && sj.Jointype == lk.jointype &&
+				sj.SynLefthand == lk.lhs && sj.SynRighthand == lk.rhs {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
+}
+
+// semiAntiOnQualsOK is `outerOnQualsOK`'s SEMI/ANTI analogue, simplified per
+// design doc §15's finding that SEMI/ANTI's contract is strictly narrower
+// than an outer join's: "a valid equi-correlation between two disjoint
+// RelSets," with no preserved-side-only or nullable-side-only placement
+// question to answer (a RHS-only conjunct would already have been pushed
+// into the EXISTS body's own opaque leaf by the unnest rewrite, before this
+// link is ever built). Every conjunct of the link's predicate must therefore
+// span BOTH `lhs` and `rhs` and be one the search itself will place
+// (`searchConsumes`); anything else — a conjunct confined to one side, or one
+// the search cannot attribute — declines, mirroring `outerOnQualsOK`'s own
+// conservative default for a shape it does not recognize.
+func semiAntiOnQualsOK(links []semiAntiChainLink, cumOffsets []int) bool {
+	for _, lk := range links {
+		if lk.pred == nil {
+			return false
+		}
+		for _, c := range splitAnd(lk.pred) {
+			rs, ok := relidsOfExpr(c, cumOffsets)
+			if !ok || rs == 0 || !relsSubset(rs, lk.lhs|lk.rhs) {
+				return false
+			}
+			if !relsOverlap(rs, lk.lhs) || !relsOverlap(rs, lk.rhs) {
+				return false
+			}
+			if !searchConsumes(c, cumOffsets) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
 // chainOnQualPreds is the bare predicate list of a `chainOnQual` slice, for the
 // two consumers that ask a question about the EXPRESSIONS alone (outer-reference
 // detection) rather than about where they sit in the chain.

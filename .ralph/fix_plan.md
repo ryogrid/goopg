@@ -3587,39 +3587,80 @@ cross-layer programme that has never been scoped.
     `extractSearchLeaves`, a function three past C-04-series regressions
     already hardened) — not sized for one loop. Follow-up
     (`M0142-0008a-3i-plumbing`, below) is rescoped to match.
-  - [ ] **M0142-0008a-3i-plumbing — extend `extractSearchLeaves` to admit
-    Semi/Anti as a chain participant (rescoped by -recon3, design doc
-    §14.3)** — RESCOPED 2026-09-16, no longer the RelOptInfo-append shape
-    the original filing described. **Item 1 landed 2026-09-16 as a probe,
-    item 2 now DECIDED by live evidence (design doc §15,
-    `internal/optimizer/m0142_0008a_3i_plumbing_probe_test.go`,
-    `.ralph/deferral_ledger.md` row `M0142-0008a-3i-plumbing-probe1`)** — no
-    production code changed. Findings: (1) the flattened-leaf-list
-    prediction held exactly (2 leaves: `t1`, RHS `*Project` as one opaque
-    leaf); (2) feeding a `nullable=0` link to `outerOnQualsOK` gets an
-    unconditional decline (relids-subset check fails, live-confirmed), and
-    the tempting fix — encode `nullable` as the RHS range instead, purely to
-    satisfy that arithmetic — would make `deriveOuterLinkConstants` silently
-    apply NULL-extension reasoning to a join type that has none in either
-    direction, a correctness trap rather than a workaround; **decided:
-    build a genuinely separate `semiAntiChainLink` type with its own
-    legality consumers, not a `Jointype`-discriminated `outerChainLink`**;
-    (3) `problemPairsOuterWithDerived` (the Q78 firewall) already ignores
-    Semi/Anti `SpecialJoinInfo` values, live-value-confirmed (not just
-    re-read from §12.2) — **new safety requirement for items 3-5**: add this
-    firewall's Semi/Anti arm in the SAME change that first admits a real
-    Semi/Anti link, not as a follow-up (ledger row cites
-    `take3-C-04a-Q78-firewall-classifier` as the cautionary precedent for
-    deferring it). Remaining, still open and still not sized for one loop:
+  - [x] **M0142-0008a-3i-plumbing-a — `semiAntiChainLink` type + its
+    `semiAntiLinksHaveSJInfos`/`semiAntiOnQualsOK` legality consumers, plus
+    `problemPairsOuterWithDerived`'s Semi/Anti firewall arm, as INERT
+    infrastructure (design doc §15's settled item 2 + its new safety
+    finding)** — supersedes the old undifferentiated
+    `M0142-0008a-3i-plumbing` filing (design doc §21). **DONE 2026-09-16.**
+    Landed exactly §15's settled shape: `semiAntiChainLink{jointype, lhs,
+    rhs RelSet, pred Expr}` (no `preserved`/`nullable` — neither concept
+    applies to a join with no NULL-extension), `semiAntiLinksHaveSJInfos`
+    (mirrors `outerLinksHaveSJInfos`), `semiAntiOnQualsOK` (mirrors
+    `outerOnQualsOK`, simplified to "every conjunct spans both `lhs` and
+    `rhs` and is search-consumed" per Semi/Anti's narrower contract) —
+    `internal/optimizer/joinsearchseam.go`. Added `parser.JoinSemi,
+    parser.JoinAnti` to `problemPairsOuterWithDerived`'s switch
+    (`relfromjoinlist.go:590`) in the SAME change, per §15's own instruction
+    not to defer the firewall arm past the change that first makes Semi/Anti
+    admission possible. 9 new tests (`internal/optimizer/semiantichain_test.go`)
+    prove the POSITIVE case §15 could only predict: `semiAntiOnQualsOK`
+    ACCEPTS the exact well-formed Q69-witness link `outerOnQualsOK` was
+    proven to incorrectly decline, plus decline cases for both consumers and
+    a not-derived/derived pair for the firewall arm (mirroring
+    `outer_over_derived_test.go`'s LEFT/RIGHT precedent). Updated
+    `m0142_0008a_3i_plumbing_probe_test.go`'s consumer-#3 assertion, whose
+    nil-table fixture now correctly declines via the new arm instead of via
+    the old blanket skip. **Not wired into `extractSearchLeaves` or
+    predp.go** — a live call-chain trace this loop (design doc §21.1) found
+    that would-be "item 1" (the walk's type-test extension) is dead code on
+    its own: `planner.go`'s `origChain` is snapshotted BEFORE unnesting runs
+    (never contains Semi/Anti) and `predp.go`'s descend loop hard-bails on
+    any non-Semi/Anti `*Join`, so items 1/4/5 from the old filing are ONE
+    coupled step, not three — re-filed as **M0142-0008a-3i-plumbing-b**
+    below. Verified empirically, not just by inspection: `go build ./...`
+    clean, `go vet ./internal/optimizer/...` clean, `go test
+    ./internal/optimizer/...` full pass, TPC-DS SF0.25 sweep (private
+    `GOOPG_BIN=tmp/goopg-sf025-bin`) `PASS=96 MISMATCH=0 CKMISMATCH=0
+    ERROR=0`, `PLAN-SHAPE: same=99 changed=0` — importantly including
+    `reduceOuterJoins`'s LEFT→ANTI demotion, the one live producer of a real
+    Semi/Anti `SpecialJoinInfo` already in `ctx.joinInfoList` today, which
+    the new firewall arm could in principle have affected.
+    `RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh`: same
+    pre-existing, unrelated `internal/parser` `GroupedJoinUnaliased`
+    AST-drift failure the prior three loops already found; `internal/optimizer`
+    passes. Resume point: design doc §21.
+  - [ ] **M0142-0008a-3i-plumbing-b — the coupled walk-extension +
+    predp.go/planner.go call-sequence change (design doc §21.1/§21.4)** —
+    filed by -3i-plumbing-a's live trace. Settles §14.3/§15's open
+    "items 1/4/5 separable?" question: NO — extending
+    `extractSearchLeaves`'s type test to admit `JoinTypeSemi`/`JoinTypeAnti`
+    only matters if a Semi/Anti-bearing chain actually reaches
+    `tryJoinSearch`, and today two independent gates prevent that: (a)
+    `planner.go:1532-1536` snapshots `origChain` BEFORE
+    `unnestSubqueriesInPlan` runs, so it never contains a Semi/Anti node;
+    (b) `predp.go:83-115`'s descend loop is hard-coded to walk through
+    Semi/Anti `*Join` nodes ONLY, bailing (`predp.go:100`) on any other
+    `*Join` type it might need to pass through. Concrete scope: (1) move or
+    duplicate the `origChain` capture to after unnesting (or otherwise route
+    a Semi/Anti-bearing tree to `tryJoinSearch`); (2) extend predp.go's
+    descend loop to pass through non-Semi/Anti `*Join` nodes instead of
+    hard-bailing; (3) extend `extractSearchLeaves`'s type test to admit
+    Semi/Anti and build `semiAntiChainLink`s via the walk (the type +
+    consumers landed by -3i-plumbing-a, now finally with a producer); (4)
     rebuild `existsUnnestSJInfo`'s throwaway 2-bit numbering with real
-    `leafRangeRelSet` bits at admission time (item 3), define
-    `semiAntiChainLink` + `semiAntiOnQualsOK`/`semiAntiLinksHaveSJInfos`
-    (item 2's now-settled shape) and wire the firewall arm, and retire
-    `runJoinSearchBelowPinned`'s splice for the now-admitted cases (item 4;
-    this is what resolves the old (c) — there is no separate splice-repair
-    step once the join is placed BY the search). Precedent that a live
-    Semi/Anti `SpecialJoinInfo` in `ctx.joinInfoList` already works in
-    production today: `reduceOuterJoins`'s LEFT→ANTI demotion (item 5).
+    `leafRangeRelSet` bits at admission time; (5) retire `predp.go`'s
+    splice-and-reresolve (`reresolveJoinByName`) for the newly-admitted
+    cases. Precedent that a live Semi/Anti `SpecialJoinInfo` inside
+    `ctx.joinInfoList` already works in production today:
+    `reduceOuterJoins`'s LEFT→ANTI demotion. **Not sized for one loop** —
+    needs its own dedicated scoping pass first: what happens to
+    `origChain`'s other callers/assumptions if it moves post-unnest, and
+    whether `chainOnQual`'s `belowNullable` bookkeeping needs a
+    Semi/Anti-aware arm for INNER links sitting above an admitted Semi/Anti
+    link (§14.3's own open question, still unanswered). This is the actual
+    unblock for TPC-DS Q10/Q35 and for `M0142-0008c-3c`/`-3d` (both still
+    blocked on it) to ever affect a real plan.
   **Independent, unfiled resume-point hint** (not sized/numbered — noted for
   whoever picks up S5a's own eligibility gate): relaxing
   `whereEligibleForPreDPUnnest` to per-sublink granularity would upgrade
@@ -3795,16 +3836,17 @@ cross-layer programme that has never been scoped.
 - [ ] **M0142-0008c-3c — `addHashJoinPath`/`addPartialHashJoinPath`
   unique-ify substitution** — filed by M0142-0008c-3's recon (design doc
   §19.4 item 3c). Depends on M0142-0008c-3a. Deferred: not exercised by
-  either named witness (§19.1). **Also now blocked on M0142-0008a-3i-plumbing
-  items 3-5** (design doc §20) — do not pick up before that lands; no
+  either named witness (§19.1). **Also now blocked on
+  M0142-0008a-3i-plumbing-b** (design doc §21) — do not pick up before that
+  lands; no
   TPC-DS measurement can distinguish "correct but unreachable" from "wrong"
   while `addPathsToJoinrel` never receives a real SEMI/ANTI `sjinfo`. PG
   oracle: `hash_inner_and_outer`, `joinpath.c:2100-2140` (cited by §16.1, not
   yet read live).
 - [ ] **M0142-0008c-3d — merge + partial-nestloop unique-ify substitution**
   — filed by M0142-0008c-3's recon (design doc §19.4 item 3d). Depends on
-  M0142-0008c-3a. **Also now blocked on M0142-0008a-3i-plumbing items 3-5**,
-  same reason as 3c (design doc §20). Deferred for the same reason as 3c
+  M0142-0008c-3a. **Also now blocked on M0142-0008a-3i-plumbing-b**,
+  same reason as 3c (design doc §21). Deferred for the same reason as 3c
   otherwise: `sortInnerAndOuter`/`matchUnsortedOuterMerge`/
   `matchUnsortedOuterMergePartial` (merge) and `addPartialNestLoopPaths`
   (parallel NL), PG oracle `sort_inner_and_outer`/`match_unsorted_outer`,

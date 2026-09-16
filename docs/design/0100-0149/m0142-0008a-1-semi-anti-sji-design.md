@@ -2106,3 +2106,145 @@ contradiction.
 
 Deferral ledger: see the `M0142-0008c-3b` row appended this loop (cites this
 section and `-3i-plumbing`'s §15 as the shared blocker).
+
+## 21. M0142-0008a-3i-plumbing-a landed — `semiAntiChainLink` + consumers +
+Q78-firewall arm, as INERT infrastructure; a live trace also settles §14.3's
+open dependency question: item 1's walk extension is dead code without a
+coupled predp.go/planner.go change (2026-09-16)
+
+Picked up per the working-set baton's own instruction (§15's "revised resume
+point"): items 3-5 of `-3i-plumbing` were filed as one task and repeatedly
+found "not sized for one loop" (§14.3, §15). Before writing any of items
+3/4/5, this loop traced the exact call chain from `unnestExistsExpr`'s
+Semi/Anti node synthesis through to `extractSearchLeaves`'s call site, to
+settle a question §14.3/§15 had left open: does extending
+`extractSearchLeaves`'s type test alone (item 1) do anything for a real
+query, or is it coupled to other changes?
+
+### 21.1 Settled: item 1 is coupled to predp.go, not independently landable
+
+Traced live (not from memory), file:line:
+
+1. `planner.go:1532-1536`: `origChain := f.Child` is captured **before**
+   `unnestSubqueriesInPlan` runs — by construction, `origChain` never
+   contains a Semi/Anti node, because unnesting has not happened yet.
+2. `planner.go:1534`: `unnestSubqueriesInPlan` → `unnestExistsExpr`
+   (`unnest.go:4461`, builds the `*Join{Semi/Anti}` node at
+   `unnest.go:4772-4781`) wraps `origChain` from ABOVE — the Semi/Anti node
+   sits strictly above `origChain`, never inside it.
+3. `planner.go:1535`: `runJoinSearchBelowPinned(node, origChain, ctx, cat)` —
+   receives the Semi/Anti-bearing `node` plus the original pre-unnest
+   `origChain` pointer.
+4. `predp.go:83-115`'s descend loop is hard-coded to walk through Semi/Anti
+   `*Join` nodes ONLY: its `case *Join` arm requires `x.Type ==
+   JoinTypeSemi || JoinTypeAnti` to continue descending (collecting
+   `spineJoins`) and explicitly bails (`return newRoot`, `predp.go:100`) on
+   any OTHER `*Join` type it might need to pass through. It stops at the
+   `*Filter` wrapping `origChain` (`predp.go:86-90`), stored as `target`.
+5. `predp.go:139`: `tryJoinSearch(f.Child, f.Predicate, ctx, cat)` is called
+   with `f.Child == origChain` — the search's entry point is, by
+   construction, always the subtree strictly BELOW every pinned Semi/Anti
+   node.
+6. `joinsearchseam.go:202,304`: `tryJoinSearch` calls
+   `extractSearchLeaves(chain)` where `chain` derives from that same
+   `origChain` — which never contained a Semi/Anti node (step 1).
+
+**Consequence**: extending `extractSearchLeaves`'s type test to admit
+`JoinTypeSemi`/`JoinTypeAnti` (§14.3 item 1), on its own, is unreachable dead
+code for every real query — two independent gates block it (the pre-unnest
+`origChain` snapshot, and predp.go's hard bail on non-Semi/Anti `*Join`
+nodes), and both must be addressed TOGETHER with the walk extension, not
+sequenced as separate loops. This re-sizes items "1" and "4"/"5" from §15's
+list into one coupled step; they were never actually separable the way the
+numbering implied.
+
+### 21.2 What landed this loop: the inert, independently-verifiable half
+
+Per the corrected sequencing (a Semi/Anti-aware chain-link type is useless
+until something calls it, but is ALSO free of plan-shape risk until then —
+the same "dispatch-layer-first" shape `-0008c-1/-2/-3a` already used
+successfully), this loop landed:
+
+1. **`semiAntiChainLink`** (`internal/optimizer/joinsearchseam.go`) — a
+   genuinely separate type from `outerChainLink`, per §15's settled item-2
+   answer: `{jointype, lhs, rhs RelSet, pred Expr}`, no
+   `preserved`/`nullable` fields (neither concept is meaningful for a join
+   with no NULL-extension in either direction).
+2. **`semiAntiLinksHaveSJInfos`** — `outerLinksHaveSJInfos`'s analogue:
+   matches a link against `ctx.joinInfoList` by jointype + both syntactic
+   sides.
+3. **`semiAntiOnQualsOK`** — `outerOnQualsOK`'s analogue, simplified per
+   §15's "valid equi-correlation between two disjoint RelSets" framing: every
+   conjunct of the link's predicate must span BOTH `lhs` and `rhs` and be one
+   the search will place (`searchConsumes`); anything else (nil predicate, a
+   conjunct confined to one side) declines. Verified against the REAL
+   Q69-witness fixture (reusing `extractSearchLeavesAdmitSemiAnti` from the
+   §15 probe file) that this ACCEPTS the exact well-formed link
+   `outerOnQualsOK` was proven to incorrectly decline in §15 — the positive
+   case §15 predicted but did not build.
+4. **`problemPairsOuterWithDerived`'s Semi/Anti arm**
+   (`relfromjoinlist.go:590`) — added `parser.JoinSemi, parser.JoinAnti` to
+   the switch, in the SAME change as items 1-3 above, per §15's own
+   instruction not to defer this past the change that first makes Semi/Anti
+   admission possible (citing `take3-C-04a-Q78-firewall-classifier` as the
+   cautionary precedent). The function's existing "touched" bit computation
+   (`sj.SynLefthand | sj.SynRighthand` against each item's derived-ness) does
+   not depend on NULL-extension semantics at all, so the fix is exactly this
+   one line — no Semi/Anti-specific logic was needed beyond admitting the
+   jointype into the switch.
+5. Updated `m0142_0008a_3i_plumbing_probe_test.go`'s consumer-#3 assertion:
+   its fixture uses nil-table (`baseRelInfo{}`) leaves, which
+   `leafIsDerivedInput`'s existing fallback arm conservatively treats as
+   derived regardless of node type — so with the new arm live, that
+   fixture's expected outcome flips from "declines to flag" (the historical
+   gap) to "correctly declines the join" (`true`). New tests in
+   `semiantichain_test.go` cover the not-derived case explicitly
+   (`TestProblemPairsOuterWithDerivedSemiOverDerived`/`...AntiOverDerived`,
+   mirroring the LEFT/RIGHT precedent in `outer_over_derived_test.go`) so the
+   nil-table fixture is no longer the only witness for this arm.
+
+**None of this is wired into `extractSearchLeaves`'s production walk or
+`predp.go`.** `semiAntiChainLink` has no producer yet; `extractSearchLeaves`
+still treats Semi/Anti as an opaque leaf exactly as before. This is
+deliberate, matching the sequencing conclusion of §21.1 — the walk extension
+is only meaningful bundled with the predp.go/planner.go call-sequence change,
+which is a separate, larger, and riskier step (it changes what tree the
+search's own `tryJoinSearch` entry point receives for every EXISTS/NOT-EXISTS
+query, not just an isolated function's internals).
+
+### 21.3 Verification
+
+`go build ./...` clean. `go vet ./internal/optimizer/...` clean. `go test
+./internal/optimizer/...` full pass, including 9 new tests in
+`semiantichain_test.go` (positive/negative for both consumers, plus the two
+new firewall-arm cases) and the updated probe test. TPC-DS SF0.25 sweep
+(private `GOOPG_BIN=tmp/goopg-sf025-bin`, foreground): `PASS=96 MISMATCH=0
+CKMISMATCH=0 ERROR=0 TIMEOUT=0`, `PLAN-SHAPE: same=99 changed=0` — empirically
+confirms zero plan-shape impact, importantly INCLUDING the one live producer
+of a real Semi/Anti `SpecialJoinInfo` already in `ctx.joinInfoList` today
+(`reduceOuterJoins`'s LEFT→ANTI strength reduction, §14.3 item 5's cited
+precedent) — the new firewall arm could in principle have changed a plan for
+that path alone, and the sweep confirms it does not for any TPC-DS SF0.25
+query. `RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh`: only
+the same pre-existing, unrelated `internal/parser` `GroupedJoinUnaliased`
+AST-drift failure seen by the three prior loops; `internal/optimizer` passes.
+
+### 21.4 Resume point
+
+Named `M0142-0008a-3i-plumbing-b` in `fix_plan.md`: the coupled change §21.1
+found — move (or duplicate) the `origChain` capture to after
+`unnestSubqueriesInPlan` runs (or otherwise make a Semi/Anti-bearing chain
+reach `tryJoinSearch`), extend predp.go's descend loop to pass through
+non-Semi/Anti `*Join` nodes instead of hard-bailing, extend
+`extractSearchLeaves`'s type test to admit `JoinTypeSemi`/`JoinTypeAnti` and
+build `semiAntiChainLink`s (landed this loop) via the walk, rebuild
+`existsUnnestSJInfo`'s real `RelSet` bits at admission time (§15 item 3), and
+retire `predp.go`'s splice-and-reresolve for the newly-admitted cases (§15
+item 4). This is still a single, larger, and now more precisely bounded
+change — not further decomposable into independently-landable pieces, per
+§21.1's finding that items 1/4/5 are one coupled step, not three. Needs its
+own dedicated scoping pass before coding (in particular: what happens to
+`origChain`'s *other* callers/assumptions if it moves post-unnest, and
+whether `chainOnQual`'s `belowNullable` bookkeeping needs a Semi/Anti-aware
+arm for INNER links sitting above an admitted Semi/Anti link, per §14.3's own
+open question).
