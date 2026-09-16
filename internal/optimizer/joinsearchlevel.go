@@ -248,6 +248,27 @@ func (s *searchCtx) joinIsLegal(rel1, rel2 *RelOptInfo) (sjinfo *SpecialJoinInfo
 			}
 			matchSJInfo = sj
 			matchReversed = true
+		} else if sj.Jointype == parser.JoinSemi && sj.SynRighthand == rel2.Relids &&
+			createUniquePath(rel2, rel2.CheapestTotal, sj, s.cp) != nil {
+			// M0142-0008c-2: for a semijoin, the RHS can be joined to
+			// anything else by unique-ifying it first, then treating the
+			// result as a plain inner join (joinrels.c:445-467). Only
+			// reachable once M0142-0008c-1's createUniquePath succeeds for
+			// rel2 — see its own doc comment for exactly which SEMI shapes
+			// that is today (the EXISTS/IN-unnest atomic-RHS wrapping).
+			if matchSJInfo != nil {
+				return nil, false, fmt.Errorf("join search: join %#08x⋈%#08x matches multiple SpecialJoinInfos — invalid", uint32(rel1.Relids), uint32(rel2.Relids))
+			}
+			matchSJInfo = sj
+			matchReversed = false
+		} else if sj.Jointype == parser.JoinSemi && sj.SynRighthand == rel1.Relids &&
+			createUniquePath(rel1, rel1.CheapestTotal, sj, s.cp) != nil {
+			// Reversed semijoin case (joinrels.c:469-489).
+			if matchSJInfo != nil {
+				return nil, false, fmt.Errorf("join search: join %#08x⋈%#08x matches multiple SpecialJoinInfos — invalid", uint32(rel1.Relids), uint32(rel2.Relids))
+			}
+			matchSJInfo = sj
+			matchReversed = true
 		} else if relsOverlap(sj.MinRighthand, rel1.Relids) && relsOverlap(sj.MinRighthand, rel2.Relids) {
 			// Both inputs overlap RHS — assume valid previous commutation (joinrels.c:509-511).
 			continue

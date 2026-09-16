@@ -1658,3 +1658,95 @@ against IS exactly that atomic-wrapped-subquery shape today. -0008c-1a (HASH)
 is NOT on the critical path for Q10/Q35 parity — SemiCanBtree alone is
 sufficient for every currently-reachable query — and should stay filed rather
 than picked up ahead of -0008c-2/-3.
+
+## 18. M0142-0008c-2 landed — `joinIsLegal`'s SEMI unique-ify admission arm (2026-09-16)
+
+Landed exactly the item-2 piece §16.3 sized: two new `else if` arms in
+`(*searchCtx).joinIsLegal` (`joinsearchlevel.go:198`), inserted at the same
+position PG's own chain has them — after the two ordinary
+MinLefthand/MinRighthand subset-match branches, before the "both inputs
+overlap RHS" fallback — porting `joinrels.c:445-467` (RHS = rel2, forward)
+and `joinrels.c:469-489` (RHS = rel1, reversed). Each arm calls
+`createUniquePath(relX, relX.CheapestTotal, sj, s.cp)` and admits the pair
+(`matchSJInfo = sj`, `matchReversed` set per direction) only when it
+succeeds; when it returns nil the pair falls through to PG's existing
+"otherwise ... invalid join path" `else`, unchanged from before this loop.
+Confirmed by build (`go build ./...` clean) and by the package suite
+(`go test ./internal/optimizer/...` — full pass, not just the new tests).
+
+**What is NOT propagated, and why that is correct, not incomplete:** PG's
+`unique_ified` local variable is scoped to `join_is_legal` itself and is
+never returned to `make_join_rel` — its only other read in the same function
+is a LATERAL-reference restriction (`joinrels.c:578,590`) that goopg's port
+does not implement (no lateral-rel handling in `joinIsLegal` at all, confirmed
+by reading the whole function to its end). Downstream,
+`populate_joinrel_with_paths`'s SEMI case (`joinrels.c:965-1013`)
+**independently re-derives** whether to unique-ify by re-running the same
+`bms_equal(syn_righthand, ...) && create_unique_path(...) != NULL` check —
+PG's own comment calls this redundant-but-cheap-because-cached. So
+`joinIsLegal`'s admission arm and the eventual path-building arm are
+deliberately decoupled in upstream PG too; goopg's `-0008c-2` need carry
+nothing forward to `-0008c-3` beyond what `sjinfo`/`reversed` already carry.
+
+**Reachability check — live-probed, not just read, because this is exactly
+the kind of "admits a pair the rest of the pipeline can't yet finish" risk
+that could turn a previously-harmless decline into a hard planning failure.**
+Traced what happens to a pair this arm newly admits, given `-0008c-3` (the
+synthetic-jointype threading through the join-path builders) has NOT landed
+yet:
+
+- `joinIsLegal`'s caller, `makeJoinRel` (`joinsearchlevel.go:572`), proceeds
+  to create/find the joinrel for the pair and calls
+  `s.builder.addPaths` for both orientations
+  (`addPathsToJoinrel`, `joinpaths.go:248`).
+- `addPathsToJoinrel` immediately calls `jointypeForDirection(sjinfo, outer,
+  inner)` (`joinpaths.go:161`) — for `JoinSemi` it checks
+  `relsSubset(sjinfo.MinLefthand, outer) && relsSubset(sjinfo.MinRighthand,
+  inner)` and returns `legal=false` otherwise. A pair admitted ONLY via the
+  new unique-ify arm (by construction, `MinLefthand` is NOT a subset of
+  either single input — that is exactly why the ordinary subset-match
+  branches didn't fire first) fails this check in **both** orientations, so
+  `addPathsToJoinrel` returns `nil` immediately (`if !legal { return nil
+  }`) — no paths added, no error.
+- The risk this creates: `makeJoinRel` still registers the joinrel via
+  `s.addRel` before calling `addPaths` (`joinsearchlevel.go:612-682`), so if
+  BOTH orientations decline, the joinrel is left in `s.joinrels[lev]` with an
+  **empty Pathlist**. `joinSearch`'s per-level loop
+  (`joinsearchlevel.go:312-317`) hard-fails the ENTIRE search
+  (`"joinrel %#08x has no paths"`) for ANY rel with zero paths — previously
+  this exact case never arose because `joinIsLegal` declined the pair
+  outright (an error `makeJoinRel` swallows into a silent skip,
+  `joinsearchlevel.go:593-596`, never creating the joinrel at all).
+- **Confirmed NOT triggered today**, by tracing whether the search phase
+  functions (`joinSearchOneLevel`'s phase-1 `makeRelsByClauseJoins`, gated on
+  `haveRelevantJoinClause(old,other) || joinOrderRestricted(old,other)`,
+  `joinsearchlevel.go:376-421`) ever offer such a pair to `joinIsLegal` in
+  the first place. For the canonical `FROM a,b WHERE (a.x,b.y) IN (SELECT c1
+  FROM c)` shape (`MinLefthand={A,B}`, `MinRighthand=SynRighthand={C}`),
+  `joinOrderRestricted(A,C)` (`joinsearchlevel.go:83`) returns `false`: the
+  ordinary-match checks fail (`MinLefthand` subset of neither), and both the
+  "both overlap RHS" and "both overlap LHS" checks require BOTH inputs to
+  overlap — here only `A` overlaps `MinLefthand`, `C` does not. So `(A,C)` is
+  never proposed as a candidate pair unless an actual `restrictInfo` join
+  clause independently connects them — meaning `-0008c-2` alone changes
+  nothing observable yet, exactly mirroring `-0008c-1`'s own "no live caller"
+  finding.
+- **Verified empirically, not just traced**: ran the TPC-DS SF0.25 fast
+  regression gate (`scripts/tpcds-sf025-regression.sh sweep`,
+  `bench/tpcds/runtime_goopg/tpcds-results-sf025/sweep-20260916-120048.txt`)
+  against the dirty tree with this loop's change. Result:
+  `PASS=96 MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0 SKIP=3` (the 3 skips are
+  the pre-existing dsqgen-artifact queries, unrelated) — no row-count
+  regression, no hard planning failure, and Q10/Q35's plan shape is
+  byte-identical to the `-0008c-1` commit's own capture (expected: neither
+  piece alone can move a plan without `-0008c-3`).
+
+**Net effect of this loop: a correct, unit-tested port that is currently a
+no-op in production**, same shape as `-0008c-1`. `-0008c-3` (threading
+`JoinTypeUniqueInner`/`Outer` through the join-path builders so
+`jointypeForDirection` has something to return other than
+"decline both directions") remains the piece that makes both `-0008c-1` and
+`-0008c-2` live, and is now the sole remaining blocker before Q10/Q35 can
+reach a unique-ified candidate at all. `-0008c-4` (the NOOP unique-index fast
+path) stays a plan-shape-only concern, not a correctness blocker, unchanged
+from §16.3's own sizing.

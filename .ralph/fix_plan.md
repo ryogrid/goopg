@@ -3683,17 +3683,30 @@ cross-layer programme that has never been scoped.
   **M0142-0008c-1a** below, currently unreachable in practice since
   `existsUnnestSJInfo` always sets `SemiCanBtree`/`SemiCanHash` together.
   Ledger row appended (task-id `m0142-0008c-1`).
-- [ ] **M0142-0008c-2 — `joinIsLegal`'s missing SEMI unique-ify admission
-  arm** — filed by M0142-0008c (design doc §16.3 item 2). Depends on
-  M0142-0008c-1 (needs `createUniquePath` to call). Port PG's
-  `joinrels.c:445-489` `unique_ified` branch into
-  `(*searchCtx).joinIsLegal` (`joinsearchlevel.go:198`): when a `JOIN_SEMI`'s
-  full `SynRighthand` sits in exactly one input and `createUniquePath`
-  succeeds for it, admit the join (record `matchSJInfo`/`unique_ified`)
-  instead of falling through to the current unconditional "violates
-  outer-join constraint" error. Cheapest, most self-contained piece of the
-  four — a direct ~20-line port. Resume point: design doc §16.2 (exact
-  current code quoted), PG oracle `joinrels.c:445-489`.
+- [x] **M0142-0008c-2 — `joinIsLegal`'s missing SEMI unique-ify admission
+  arm** — filed by M0142-0008c (design doc §16.3 item 2). **DONE
+  2026-09-16.** Design doc §18. Ported PG's `joinrels.c:445-489` into
+  `(*searchCtx).joinIsLegal` (`joinsearchlevel.go:198`) as two new `else if`
+  arms at the same position PG's own chain has them (after the ordinary
+  subset-match branches, before the "both overlap RHS" fallback): when a
+  `JOIN_SEMI`'s full `SynRighthand` equals exactly one input and
+  `createUniquePath(relX, relX.CheapestTotal, sj, s.cp)` succeeds, admit the
+  join instead of falling through to the unconditional "violates outer-join
+  constraint" error. 3 new unit tests (`specialjoin_test.go`:
+  `TestJoinIsLegalSemiUniqueIfyAdmitsNonRHSPair`/`...ReversedPair`/
+  `TestJoinIsLegalSemiRejectsWhenNotUniqueIfiable`). Live-probed (not just
+  read) whether admitting a pair `-0008c-3`'s path builders can't yet finish
+  risks a hard "joinrel has no paths" search failure — confirmed it does not:
+  `jointypeForDirection` (`joinpaths.go:161`) already declines both
+  orientations for such a pair (its own `MinLefthand` subset check fails by
+  construction), and the search's own pair-admission heuristics
+  (`joinOrderRestricted`/`haveRelevantJoinClause`) never offer such a pair to
+  `joinIsLegal` at all for the canonical multi-relation-LHS shape today — so
+  this loop is a correct, currently-inert port, same shape as -0008c-1.
+  Verified empirically: TPC-DS SF0.25 sweep on the dirty tree,
+  `PASS=96 MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0 SKIP=3`, Q10/Q35 plan
+  shape unchanged (expected — neither -0008c-1 nor -2 alone can move a plan).
+  `go build ./...` clean; `go test ./internal/optimizer/...` full pass.
 - [ ] **M0142-0008c-1a — HASH method for `createUniquePath`** — filed by
   M0142-0008c-1 (design doc §17 item 2). PG's `UNIQUE_PATH_HASH`
   (`pathnode.c:2026-2043`) groups by `uniq_exprs` while passing every OTHER

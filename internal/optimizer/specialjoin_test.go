@@ -494,6 +494,75 @@ func TestJoinIsLegalMatchesFullJoin(t *testing.T) {
 	}
 }
 
+// ── joinIsLegal: SEMI unique-ify admission arm (M0142-0008c-2) ──
+
+// semiUniqueIfyFixture builds the classic PG example's shape: `SELECT ...
+// FROM a, b WHERE (a.x, b.y) IN (SELECT c1 FROM c)` — a SEMI whose
+// MinLefthand needs BOTH a and b, so the ordinary subset-match rules in
+// joinIsLegal never fire for a pair holding only one of them. The RHS rel
+// (C) reuses createuniquepath_test.go's uniquePathFixture so
+// createUniquePath actually succeeds for it — the fixture the admission arm
+// is gated on, not a stand-in.
+func semiUniqueIfyFixture() (relC *RelOptInfo, sjinfo *SpecialJoinInfo) {
+	relC, subpath, sjinfo := uniquePathFixture(1000)
+	relC.Relids = 0b100 // C
+	relC.CheapestTotal = subpath
+	sjinfo.MinLefthand = 0b011 // A|B
+	sjinfo.MinRighthand = 0b100
+	sjinfo.SynLefthand = 0b011
+	sjinfo.SynRighthand = 0b100
+	return relC, sjinfo
+}
+
+func TestJoinIsLegalSemiUniqueIfyAdmitsNonRHSPair(t *testing.T) {
+	relC, sjinfo := semiUniqueIfyFixture()
+	s := mkTestSearchCtx(t, 3, []*SpecialJoinInfo{sjinfo})
+	relA := mkTestRel(0b001)
+
+	sj, rev, err := s.joinIsLegal(relA, relC)
+	if err != nil {
+		t.Fatalf("joinIsLegal(A,C) returned error: %v", err)
+	}
+	if sj != sjinfo {
+		t.Fatalf("joinIsLegal(A,C) sj = %v; want the SEMI SpecialJoinInfo", sj)
+	}
+	if rev {
+		t.Error("joinIsLegal(A,C) reversed = true; want false — C is rel2, matches unreversed")
+	}
+}
+
+func TestJoinIsLegalSemiUniqueIfyAdmitsReversedPair(t *testing.T) {
+	relC, sjinfo := semiUniqueIfyFixture()
+	s := mkTestSearchCtx(t, 3, []*SpecialJoinInfo{sjinfo})
+	relA := mkTestRel(0b001)
+
+	sj, rev, err := s.joinIsLegal(relC, relA)
+	if err != nil {
+		t.Fatalf("joinIsLegal(C,A) returned error: %v", err)
+	}
+	if sj != sjinfo {
+		t.Fatalf("joinIsLegal(C,A) sj = %v; want the SEMI SpecialJoinInfo", sj)
+	}
+	if !rev {
+		t.Error("joinIsLegal(C,A) reversed = false; want true — C is rel1, matches reversed")
+	}
+}
+
+func TestJoinIsLegalSemiRejectsWhenNotUniqueIfiable(t *testing.T) {
+	// Same shape, but createUniquePath declines (SemiCanBtree=false) — PG's
+	// fallback "otherwise ... invalid join path" must still fire
+	// (joinrels.c:490-530), same as any non-unique-ifiable SEMI always has.
+	relC, sjinfo := semiUniqueIfyFixture()
+	sjinfo.SemiCanBtree = false
+	s := mkTestSearchCtx(t, 3, []*SpecialJoinInfo{sjinfo})
+	relA := mkTestRel(0b001)
+
+	_, _, err := s.joinIsLegal(relA, relC)
+	if err == nil {
+		t.Error("joinIsLegal(A,C) should reject — SEMI RHS is not unique-ifiable and A alone doesn't cover MinLefthand")
+	}
+}
+
 // ── joinOrderRestricted ──
 
 func TestJoinOrderRestrictedEmptyJoinInfoList(t *testing.T) {
