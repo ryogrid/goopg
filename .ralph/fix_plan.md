@@ -3918,6 +3918,34 @@ cross-layer programme that has never been scoped.
     stays fully inert) — do NOT combine with the `predp.go` descend-loop
     reachability change (§30's original step (i) target); that remains a
     separate, later, higher-blast-radius loop per §31.4.**
+    **Step (i) LANDED (design doc §31.4, 2026-09-16):** §31.3's three-check
+    fix coded exactly as designed, production `admitSemiAnti` literal
+    unchanged (`false`) — fully inert, confirmed by TPC-DS SF0.25 sweep
+    (`PASS=96 MISMATCH=0`, `PLAN-SHAPE: same=99 changed=0`) and full
+    `go test ./internal/optimizer/...`. Three new direct unit tests pin the
+    previously-untestable `numSynthetic>0` arithmetic.
+    **Step (ii) scoping pass (design doc §32, 2026-09-16), no production
+    change:** corrected §30 Finding 2's stale framing — `admitSemiAnti` is
+    ONE local literal at `joinsearchseam.go:309`, not a parameter needing to
+    thread through 4 call sites; flipping it is safe unconditionally since
+    the other 3 `tryJoinSearch` callers' chains are always captured
+    pre-unnest and can never contain a Semi/Anti node. Live-traced TPC-DS
+    `query10.sql` (this milestone's own cited unblock target): it hits the
+    "sunk" shape, not "nothing sunk", and the existing splice already drops
+    the wrapping Filter for free once all sunk conjuncts are legally pushed
+    — leaving a Filter-free, walkable subtree under the innermost pinned
+    Semi/Anti join once Phase A (unchanged) completes. Settled design:
+    Phase A stays exactly as today; Phase B is a new, additive,
+    gracefully-declining second `tryJoinSearch` call rooted at the outermost
+    pinned Semi/Anti join (nil predicate), inert while §32.1's literal stays
+    `false` (same "leaf-count"-decline mechanism §31.4 already proved).
+    **Next loop codes Phase B** as its own inert scaffold (literal stays
+    `false` in production), with the success path unit-tested DIRECTLY
+    against a hand-built search result (mirroring `pgShapedOffsetChecksOK`'s
+    extraction) rather than landed as unverified dead code
+    (`dead_code_is_not_a_reference_impl`). Flipping the literal to `true` +
+    the live end-to-end fixture verification is a still-later step (iii) —
+    do not collapse either into the Phase B scaffold loop.
   **Independent, unfiled resume-point hint** (not sized/numbered — noted for
   whoever picks up S5a's own eligibility gate): relaxing
   `whereEligibleForPreDPUnnest` to per-sublink granularity would upgrade

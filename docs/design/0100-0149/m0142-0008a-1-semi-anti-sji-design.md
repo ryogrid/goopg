@@ -3581,3 +3581,145 @@ flipping `admitSemiAnti=true` at the production call site, verified against
 a live end-to-end fixture per §27.4's existing gate — the higher-blast-radius
 live-DP-routing change §28.3/§29 already flagged as needing to be bounded on
 its own.
+
+## 32. Step (ii) scoping pass (2026-09-16) — corrected mechanism, a live
+Q10 trace, and the two-phase design that makes the wiring low-risk
+
+Traced live (`joinsearchseam.go`, `predp.go`, `planner.go`, and TPC-DS
+`query10.sql`) before touching either file. Three findings, no production
+change.
+
+### 32.1 §30 Finding 2's "4 call sites" framing was the pre-step-(i) plan,
+not the current mechanism — `admitSemiAnti` is ONE literal, not a parameter
+
+§30 (written before the preamble fix) proposed threading a `bool` through
+`tryJoinSearch`'s 4 call sites (`predp.go:139`, `planner.go:1544/1569/1606`).
+That plan predates §31's actual implementation and was never updated to
+match it. What step (i) actually built: `admitSemiAnti` is a **local literal
+argument** to `extractSearchLeaves(chain, false)` inside
+`tryPGShapedJoinSearch` (`joinsearchseam.go:309`) — there is no parameter on
+`tryJoinSearch`, `tryPGShapedJoinSearch`, or any of the 4 call sites. "Flip
+`admitSemiAnti` to `true` at the production call site" (§31.4's own words)
+means **changing that one literal from `false` to `true`**, full stop.
+
+This is provably safe for the other 3 callers without any gating: `chain`
+only ever contains a Semi/Anti node when it was captured AFTER
+`unnestSubqueriesInPlan` ran. `planner.go:1544` (Filter-wrapped legacy path)
+and `:1569`/`:1606` (the two nil-predicate legacy calls, R40/K69's
+whereQual==nil case and M0134-0188's outer-link-with-no-WHERE case
+respectively) all run BEFORE `unnestSubqueriesInPlan` in every code path
+that reaches them (confirmed by reading the surrounding `if`/`else if`
+chain: the S5a branch and the legacy branches are mutually exclusive at
+`planner.go:1524-1574`, and the outer-link branch at `:1581` is a
+completely separate `else if` off the top-level `s.Where != nil` check).
+So flipping the literal makes `semiAnti` always empty for those 3 callers —
+identical to today — and only `predp.go`'s call (the one call site that
+runs post-unnest) can ever produce a non-empty `semiAnti`. **No gating,
+feature flag, or new parameter is needed for the flip itself** — the actual
+gating is entirely in whether `predp.go` ever hands `tryJoinSearch` a chain
+that structurally contains a Semi/Anti node, which today it does not (§28.3).
+
+### 32.2 Live Q10 trace: the real TPC-DS witnesses hit the SUNK shape, not
+the "nothing sunk" one — and the common case already drops the Filter for
+free
+
+Read `bench/tpcds/runtime_goopg/tpcds-data/queries/query10.sql` (one of
+this task's own cited unblock targets) end to end: its WHERE is
+`c.c_current_addr_sk = ca_address_sk AND ca_county IN (...) AND cd_demo_sk
+= c.c_current_cdemo_sk AND EXISTS(...) AND (EXISTS(...) OR EXISTS(...))`.
+The three non-EXISTS conjuncts reference only `origChain`'s own three
+relations (`customer`, `customer_address`, `customer_demographics`) — they
+are exactly `predp.go`'s documented "sunk" case
+(`[Filter{retained}](Semi/Anti…(Filter{sunk}(origChain)))`), not the
+"nothing sunk" shape. This matters for two reasons:
+
+1. It confirms Phase A (`runJoinSearchBelowPinned`'s existing, unchanged
+   narrow `tryJoinSearch(f.Child=origChain, f.Predicate=sunk pred, …)` call)
+   already runs for the query this milestone cites as its unblock target —
+   nothing about step (ii) needs to touch Phase A.
+2. `runJoinSearchBelowPinned`'s own splice logic (`predp.go:135-143`) already
+   has the property step (ii) needs for free: `if newChild, newPred :=
+   tryJoinSearch(...); newPred == nil { newTarget = newChild }` — when the
+   sunk predicate's conjuncts are ALL legally pushable into the searched
+   join tree (the common case: simple equalities between origChain's own
+   relations), the wrapping Filter is **removed entirely**, and the spliced
+   result is the searched join tree with no Filter node above it. So for
+   the case that matters, after Phase A splices back, the tree directly
+   under the innermost pinned Semi/Anti join (`spineJoins[len-1].Left`) is
+   already Filter-free and walkable end-to-end by
+   `extractSearchLeaves`'s admitted-Semi/Anti arm (§23.1's `walk`, which
+   only breaks on a `*Filter` node — confirmed by reading the switch:
+   `*Join` is the only admitted-recursion case, everything else including
+   `*Filter` becomes ONE opaque leaf). The residual-Filter-survives case
+   (some sunk conjunct is not legally pushable) is the one shape a Phase B
+   widened search would have to decline on, gracefully, not something that
+   needs its own code path — see §32.3.
+
+The "nothing sunk" shape (§30/predp.go's third documented case) is
+real per the doc comment but **not exercised by either cited unblock
+target** — deferred as a separate, smaller, lower-priority question (does
+`runJoinSearchBelowPinned`'s current unconditional no-op for that shape ever
+fire for an ENGAGED statement, and if so is it a live gap relative to
+`planner.go:1569`/`:1606`'s own nil-predicate `tryJoinSearch` idiom for the
+same "no Filter, still want DP" situation) — not blocking, not filed as its
+own item yet pending a concrete witness.
+
+### 32.3 The two-phase design
+
+**Phase A — unchanged.** `runJoinSearchBelowPinned`'s existing narrow
+`tryJoinSearch(f.Child, f.Predicate, ctx, cat)` call and splice, exactly as
+today. Nothing here changes; §32.2 confirms it already does the right thing
+for the cited witnesses.
+
+**Phase B — new, additive, gracefully-declining.** After Phase A's existing
+splice-back completes (`put(newTarget)` in the current code), and only when
+`len(spineJoins) > 0` (a Semi/Anti spine actually exists — the degenerate
+"unnest declined" shape has none), attempt a SECOND `tryJoinSearch` call
+rooted at `spineJoins[0]` (the outermost pinned Semi/Anti join) with a
+`nil` top predicate — there is no additional residual predicate above the
+spine's own joins to push (any outer retained-Filter predicates stay
+handled exactly as today, by `spineFilters`'s existing bottom-up remap).
+This call reaches `tryPGShapedJoinSearch` → `extractSearchLeaves(spineJoins[0],
+true)` once §32.1's literal is flipped, and its `walk` recurses through
+every nested pinned Semi/Anti join (§23.1's arm already handles arbitrary
+nesting — confirmed by re-reading: the recursive `walk(j.Left, preserved)`
+call hits the SAME Semi/Anti arm again for a nested one) down to the
+(already Phase-A-searched, per §32.2, usually Filter-free) origChain leaves.
+
+On success (`ok`), the result REPLACES the entire `spineJoins[0]`..origChain
+subtree in `newRoot`, and `spineJoins`' own bottom-up
+`reresolveJoinByName`/schema-refresh loop (`predp.go:187-195`) is skipped
+for every join now absorbed into the search's own output — the search's
+plan-build step already produces a correctly resolved tree, the same
+reasoning `splicedSearchedRoot`'s existing skip (`predp.go:175-179`)
+already uses for the boundary-map case. On decline (`ok==false` — e.g. the
+residual-Filter-survives sub-case from §32.2, or any of `-3i-plumbing-b2`'s
+own preamble checks §31.3 declining for an unrelated shape reason), `newRoot`
+is left exactly as Phase A already produced it — byte-identical to today's
+behavior. This is why Phase B is safe to land as code before flipping
+§32.1's literal: with the literal still `false`, `extractSearchLeaves`'s
+Semi/Anti arm never fires, the top-level `spineJoins[0]` node itself becomes
+one opaque leaf, `len(scans)==1` almost certainly mismatches the frozen
+`nprefix`, and the call declines via the existing `"leaf-count"` reason —
+fully inert, by the same mechanism §31.4 already used to prove step (i)
+inert, NOT a new gate that needs inventing.
+
+### 32.4 What genuinely needs a live fixture before the literal flips, and
+why coding Phase B is deferred to its own loop rather than done here
+
+Per `dead_code_is_not_a_reference_impl` (an unreachable branch is not a
+verified implementation): Phase B's SUCCESS path — the splice-in and the
+skip of `spineJoins`' reresolution loop — cannot be exercised by the TPC-DS
+sweep while §32.1's literal stays `false` (guaranteed decline, by
+construction). It must instead be unit-tested DIRECTLY, the same way
+`-3i-plumbing-b1`/step (i) proved their new arithmetic before any cutover:
+call the splice-in logic (once extracted into its own testable function,
+mirroring `pgShapedOffsetChecksOK`'s extraction) with a HAND-BUILT
+"search succeeded" `tryJoinSearch` result and assert the resulting tree
+shape and the skipped-reresolution set, rather than only asserting
+inertness end-to-end. That test, plus the actual descend-loop wiring, plus
+(as a strictly later, separate step (iii)) flipping §32.1's literal to
+`true` in production and verifying against a live EXISTS/NOT-EXISTS TPC-DS
+fixture (§27.4's existing gate) and the SF0.25 sweep for a REAL plan-shape
+change this time, is next loop's fully-specified resume point — not done
+this loop, which is scoping-only.
