@@ -640,7 +640,23 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 	// `_` here is deliberate and temporary, and its replacement is what lets
 	// partial aggregation see `PartialPathlist` (K23) and the grouping/window
 	// stages see `Pathkeys` (K12 slice B).
-	searched, _, err := planJoinlistSearch(jl, &joinlistProblem{
+	// M0142-0008a-3i-plumbing-c3 (design doc §36, gap 4): `jl` (== `prefix`
+	// from `splitOuterSpine`, checked above at [0,nprefix)) has no leaf items
+	// for the synthetic Semi/Anti RHS leaves c2 added to `bindings`/`leaves`/
+	// `relInfos` at [nprefix,nleaves). `validateJoinlistProblem` hard-requires
+	// `jl.leafRange() == (0,len(prob.bindings))`, so search with a copy that
+	// appends one `leafItem(nprefix+k)` per `semiAnti[k]` — same walk-position
+	// correspondence c2 already established — rather than mutating `jl` itself
+	// (it may alias `ctx.joinlist` directly per the P5.9-r comment above).
+	searchJl := jl
+	if len(semiAnti) > 0 {
+		searchJl = make(joinlist, 0, len(jl)+len(semiAnti))
+		searchJl = append(searchJl, jl...)
+		for k := range semiAnti {
+			searchJl = append(searchJl, leafItem(nprefix+k))
+		}
+	}
+	searched, _, err := planJoinlistSearch(searchJl, &joinlistProblem{
 		bindings:   bindings,
 		scans:      leaves,
 		relInfos:   relInfos,
@@ -685,7 +701,14 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 		// joinInfoList is root->join_info_list from jointree deconstruction,
 		// consumed by join_is_legal/joinOrderRestricted/hasJoinRestriction
 		// inside the search (M0128-P1.2).
-		joinInfoList: ctx.joinInfoList,
+		// M0142-0008a-3i-plumbing-c4 (design doc §36, gap 4): without each
+		// semiAnti link's SJInfo, `joinIsLegal` (joinsearchlevel.go:198) has
+		// no SpecialJoinInfo constraint on the synthetic RHS leaf's relid and
+		// treats it as an ordinary INNER-joinable rel — c3's Q21 unit-test
+		// regression (AntiJoin silently disappearing) traced to exactly this
+		// gap, so c3 and c4 must land together, not "independent" as
+		// originally filed.
+		joinInfoList: semiAntiJoinInfoList(ctx.joinInfoList, semiAnti),
 	})
 	if err != nil || searched == nil {
 		return node, pred, false
@@ -1263,7 +1286,7 @@ func extractSearchLeaves(node Node, admitSemiAnti bool) (scans []Node, widths []
 			}
 			lhs := leafRangeRelSet(loLeft, loRight)
 			rhs := leafRangeRelSet(loRight, hiRight)
-			semiAnti = append(semiAnti, semiAntiChainLink{jointype: pjt, lhs: lhs, rhs: rhs, pred: pred})
+			semiAnti = append(semiAnti, semiAntiChainLink{jointype: pjt, lhs: lhs, rhs: rhs, pred: pred, sjinfo: j.SJInfo})
 			// Item 4: rebuild the placeholder SJInfo `unnestExistsExpr`
 			// attached at synthesis time (`existsUnnestSJInfo`'s
 			// throwaway synL=1/synR=2 — unnest.go:4390-4397, the only
@@ -1599,6 +1622,34 @@ type semiAntiChainLink struct {
 	jointype parser.JoinType
 	lhs, rhs RelSet
 	pred     Expr
+	// M0142-0008a-3i-plumbing-c4 (design doc §36, gap 4's own dependency):
+	// the same `*SpecialJoinInfo` the walk already renumbers in place at the
+	// append site below (`j.SJInfo`, real leaf-index `SynLefthand`/
+	// `SynRighthand`/`MinLefthand`/`MinRighthand`) — nil if the source
+	// `*Join` never carried one. `semiAntiLinksHaveSJInfos` matches against
+	// this pointer's fields, not a freshly built one, so the two must never
+	// drift apart.
+	sjinfo *SpecialJoinInfo
+}
+
+// semiAntiJoinInfoList appends each link's SJInfo (skipping nil ones — a link
+// whose source `*Join` never carried one) to a COPY of `base`, leaving `base`
+// itself untouched (it may alias `ctx.joinInfoList`, shared with callers
+// elsewhere in the same statement). Returns `base` unchanged, by identity,
+// when `links` is empty — the overwhelmingly common case — so this never
+// forces an allocation queries with no EXISTS/NOT EXISTS unnesting.
+func semiAntiJoinInfoList(base []*SpecialJoinInfo, links []semiAntiChainLink) []*SpecialJoinInfo {
+	if len(links) == 0 {
+		return base
+	}
+	out := make([]*SpecialJoinInfo, 0, len(base)+len(links))
+	out = append(out, base...)
+	for _, lk := range links {
+		if lk.sjinfo != nil {
+			out = append(out, lk.sjinfo)
+		}
+	}
+	return out
 }
 
 // semiAntiLinksHaveSJInfos is `outerLinksHaveSJInfos`'s SEMI/ANTI analogue:

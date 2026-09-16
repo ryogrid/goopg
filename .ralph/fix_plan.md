@@ -4080,20 +4080,41 @@ cross-layer programme that has never been scoped.
   `GroupedJoinUnaliased` AST-drift failure. Next: `-3i-plumbing-c3` (extend
   the call-site-local `jl` so `validateJoinlistProblem` covers the grown
   `nleaves` bindings end-to-end).
-- [ ] **M0142-0008a-3i-plumbing-c3 — build the call-site-local extended
-  joinlist** (design doc §36, gap 4). `validateJoinlistProblem`
+- [x] **M0142-0008a-3i-plumbing-c3 — build the call-site-local extended
+  joinlist** (design doc §36, gap 4). **DONE 2026-09-16, landed TOGETHER with
+  c4 (design doc §39) — NOT independently, see below.** `validateJoinlistProblem`
   (`relfromjoinlist.go:246-276`) hard-requires `jl.leafRange() == (0,
-  len(prob.bindings))`; the pre-unnest `ctx.joinlist`-derived `jl` has no
-  entries for the synthetic leaves, so the call site needs its own
-  `append(jlCopy, leafItem(nprefix), leafItem(nprefix+1), …)` construction.
-  Depends on c2 (needs the grown `bindings` length to size against).
-- [ ] **M0142-0008a-3i-plumbing-c4 — augment `joinInfoList` with each
-  semiAnti link's `j.SJInfo`** (design doc §36, the core finding). Add an
-  `sjinfo *SpecialJoinInfo` field to `semiAntiChainLink`, captured alongside
-  `lhs`/`rhs`/`pred` at `joinsearchseam.go:1211`; build `append(ctx.joinInfoList,
-  semiAnti[*].sjinfo...)` and thread it into `joinlistProblem.joinInfoList`
-  (replacing the bare `ctx.joinInfoList` at `joinsearchseam.go:633`).
-  Independent of c1-c3; can land in parallel or either order.
+  len(prob.bindings))`; built a call-site-local `searchJl` in
+  `tryPGShapedJoinSearch` (copy of `jl` plus one `leafItem(nprefix+k)` per
+  `semiAnti[k]`, `jl` itself never mutated since it may alias `ctx.joinlist`)
+  and passed that to `planJoinlistSearch` instead of `jl`.
+- [x] **M0142-0008a-3i-plumbing-c4 — augment `joinInfoList` with each
+  semiAnti link's `j.SJInfo`** (design doc §36, the core finding). **DONE
+  2026-09-16, landed TOGETHER with c3, NOT "independent... can land in
+  parallel or either order" as originally filed here — see design doc §39.**
+  `go test ./internal/optimizer/...` with c3 applied alone (before this fix)
+  failed `TestM0070Q21InnerOnlyConjunctsStay`: the search now actually
+  reaches the synthetic leaf (c3's whole point) but `joinIsLegal`
+  (`joinsearchlevel.go:198`) had no `SpecialJoinInfo` telling it the leaf
+  could only be joined via SEMI/ANTI, so it silently formed a plain INNER
+  join instead — the AntiJoin vanished from Q21's plan. Fixed by adding
+  `sjinfo *SpecialJoinInfo` to `semiAntiChainLink`, populated from `j.SJInfo`
+  at the link's construction site (the same pointer the walk already
+  renumbers in place with real leaf-index bits — no separate rebuild
+  needed), and a new `semiAntiJoinInfoList(base, links)` helper (returns
+  `base` unchanged, by identity, when `links` is empty) feeding
+  `joinlistProblem.joinInfoList` instead of the bare `ctx.joinInfoList`.
+  Verified: `go build ./...` clean, `go test ./internal/optimizer/...` green
+  (Q21's AntiJoin restored) with BOTH c3+c4 applied, TPC-DS SF0.25 sweep
+  `PASS=96 (60 ck-verified, 36 ck=n/a) MISMATCH=0 CKMISMATCH=0 ERROR=0`,
+  `PLAN-SHAPE: queries=99 same=99 changed=0 added=0 removed=0` vs the c2
+  commit (Q78 still byte-identical, 15 rows, same checksum). TPC-H spotcheck
+  SKIPPED (pre-existing M0142-0003k data-dir blocker, unrelated).
+  `RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh` shows only
+  the pre-existing unrelated `internal/parser` `GroupedJoinUnaliased`
+  AST-drift failure (`internal/optimizer` itself green). Next:
+  `-3i-plumbing-c5` (decline-gate wiring + `GOOPG_PGSHAPED_DP_TRACE=1`
+  reachability confirmation).
 - [ ] **M0142-0008a-3i-plumbing-c5 — wire `semiAntiLinksHaveSJInfos`/
   `semiAntiOnQualsOK` as decline gates and confirm reachability** (design
   doc §36, gap 5 — what the task was originally filed for). Mirror the

@@ -4346,3 +4346,88 @@ Next pickup: `-3i-plumbing-c3` — build the call-site-local extended
 joinlist (`jl`) so `validateJoinlistProblem`'s `jl.leafRange() ==
 (0,len(prob.bindings))` check actually covers the grown `nleaves` bindings
 this loop introduced (design doc §36, gap 4; `relfromjoinlist.go:246-276`).
+
+## 39. `M0142-0008a-3i-plumbing-c3` + `-c4` — landed TOGETHER, not
+    independently as originally filed: c3 alone is a real correctness
+    regression (2026-09-16)
+
+**c3 as scoped** — build a call-site-local `searchJl` in
+`tryPGShapedJoinSearch` (`joinsearchseam.go`, right before the
+`planJoinlistSearch` call) that appends one `leafItem(nprefix+k)` per
+`semiAnti[k]` on top of a COPY of `jl` (never mutating `jl` itself — it may
+alias `ctx.joinlist` directly per the existing "spine empty, `jl ==
+ctx.joinlist`" comment at the top of the function, shared with other code
+paths). `cumOffsets` already spans all `nleaves` leaves from `buildLeafSpans`
+(unaffected by this gap), so only `jl`'s leaf set needed extending —
+confirmed by grep, not assumed: `jl` is read only three times in the whole
+function (`nrels()` and `leafRange()` before the leaf-building block, both
+already checked against `nprefix`, and the `planJoinlistSearch` call site
+itself), so a search-local copy cannot desync anything upstream.
+
+**c3 alone broke a passing unit test.** `go test ./internal/optimizer/...`
+with c3 applied and c4 NOT yet applied: `TestM0070Q21InnerOnlyConjunctsStay`
+failed — `AntiJoin (NOT EXISTS) not found in Q21 plan; M0061-0001
+regression?` — the search now runs to completion (validateJoinlistProblem
+passes, per c3's whole point) but silently drops the semi/anti semantics and
+joins the RHS leaf in as a plain `Join`, producing wrong results for any
+statement whose join order search actually reaches this point with
+`len(semiAnti) > 0`. **Root cause, traced not guessed:** `joinIsLegal`
+(`joinsearchlevel.go:198`) has `if len(s.joinInfoList) == 0 { … treat as an
+ordinary admissible pair … }` and, before this loop, `s.joinInfoList` was
+always the bare `ctx.joinInfoList` — it never carried the semiAnti link's own
+`SpecialJoinInfo`, so the search's legality machinery had literally no
+constraint telling it the synthetic leaf could only be joined via SEMI/ANTI.
+c1/c2 could not have surfaced this: c1's conjunct merge is inert until a real
+join relset includes the synthetic leaf's bit (impossible before c2), and
+c2's own new leaf never actually got searched until c3 extended `jl`. This
+is why the fix_plan's "c4 independent of c1-c3, can land in parallel or
+either order" framing does not hold in practice — c3 is the FIRST step of
+this chain that makes the search actually visit the synthetic leaf during
+the DP tournament, so c3 and c4 are a single atomic correctness unit and were
+landed together in this loop rather than as separate tasks.
+
+**c4, landed alongside c3:** `semiAntiChainLink` gained an `sjinfo
+*SpecialJoinInfo` field, populated at the link's construction site
+(`joinsearchseam.go`, the `walk` closure's SEMI/ANTI case) directly from
+`j.SJInfo` — the SAME pointer the walk already renumbers in place a few lines
+later (`j.SJInfo.SynLefthand, j.SJInfo.MinLefthand = lhs, lhs` etc.), so no
+separate "rebuild the SJInfo" step was needed; storing the pointer before the
+mutation is safe because Go structs behind a pointer share state — by the
+time anything reads `lk.sjinfo`'s fields, the walk has already finished and
+the real leaf-index numbering is in place. A new helper,
+`semiAntiJoinInfoList(base []*SpecialJoinInfo, links []semiAntiChainLink)
+[]*SpecialJoinInfo`, returns `base` UNCHANGED, by identity, when `links` is
+empty (the overwhelmingly common case — no allocation for any query without
+EXISTS/NOT EXISTS unnesting) and otherwise returns a fresh copy of `base`
+with each link's non-nil `sjinfo` appended; `joinlistProblem.joinInfoList`
+now reads `semiAntiJoinInfoList(ctx.joinInfoList, semiAnti)` instead of the
+bare `ctx.joinInfoList`.
+
+### 39.1 Verification
+
+`go build ./...` clean; `go test ./internal/optimizer/...` green
+(`TestM0070Q21InnerOnlyConjunctsStay` passes again — the AntiJoin is back in
+the Q21 plan) with BOTH c3 and c4 applied; TPC-DS SF0.25 sweep `PASS=96 (60
+ck-verified, 36 ck=n/a) MISMATCH=0 CKMISMATCH=0 ERROR=0`, `PLAN-SHAPE:
+queries=99 same=99 changed=0 added=0 removed=0` against the immediately prior
+commit (the c2 landing) — Q78 still byte-identical (15 rows, checksum
+`c06cf981a7819a37`), consistent with §38's reading that the SF0.25 corpus's
+one semiAnti-reaching query still declines somewhere upstream of this code,
+independent of c1-c4. `RALPH_PRECOMMIT_SCOPE=units
+scripts/ralph-precommit-test.sh` shows only the pre-existing unrelated
+`internal/parser` `GroupedJoinUnaliased` AST-drift failure (every recent
+loop; `internal/optimizer` itself green). TPC-H spotcheck SKIPPED
+(pre-existing M0142-0003k data-dir blocker, unrelated).
+
+### 39.2 What this means for `-3i-plumbing-c5`
+
+`-c5`'s own fix_plan text ("wiring it earlier declines unconditionally and
+proves nothing") assumed c1-c4 landing first was safe on its own. This loop's
+Q21 discovery shows the SAFETY property that assumption depends on
+(searching a semi/anti leaf without dropping its semantics) does not hold
+until c4's `joinInfoList` wiring is present — which it now is, as of this
+loop. `-c5`'s own job (wiring `semiAntiLinksHaveSJInfos`/`semiAntiOnQualsOK`
+as decline gates and confirming DPPATH reachability via
+`GOOPG_PGSHAPED_DP_TRACE=1`) is still open and still the right next pickup;
+this section exists so `-c5` does not re-derive the c3+c4 coupling from
+scratch.
