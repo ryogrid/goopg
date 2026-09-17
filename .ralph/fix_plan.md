@@ -6903,7 +6903,7 @@ reported, and the values and unit gates are the bar.
     any end-to-end SQL assertion (an end-to-end test would show nothing
     different yet). M0143-0002f (write-side route-through) is next, in
     order, now unblocked.
-- [ ] **M0143-0002f — route type-catalog heap writes through
+- [x] **M0143-0002f — route type-catalog heap writes through
   `tableCatalogHeapDBOid(ctx)` (write side of M0143-0002d).**
   Parent: M0143-0002d. Depends on M0143-0002e `[x]`. Filed 2026-09-17 from
   M0143-0002d's design doc, fix-shape step 4. Change
@@ -6925,6 +6925,70 @@ reported, and the values and unit gates are the bar.
   database's `pg_type`/`pg_attribute`/`pg_dump` output shows only its own
   type's shape (the M0143-0002c repro, now also across a restart, not just
   live-session).
+  - **Done 2026-09-17.**
+    Movement: yes — a same-named composite/domain/range type declared in two
+    non-default databases now shows each database's own shape (not the
+    M0143-0002c UNION) in both a live session and, after this task's own
+    restart bug fix below, across a `Close`/`Open` restart; confirmed by a
+    new SQL-observable test, not just a unit-level structural check.
+    All enumerated sites changed to
+    `tableCatalogHeapDBOid(ctx)`/`tableCatalogHeapDBOid(o.ctx)` in one
+    commit; live pre-restart verification matched the design (each
+    database's composite type shows only its own fields, not the union).
+    **The restart test caught a second, independent bug** in M0143-0002e's
+    own landing: its per-database `pg_type`/`pg_attribute` registration loop
+    lived inside `loadSystemCatalogsIfPresent` (`internal/initdb/open.go`),
+    called (line 1376) *before* `reloadDatabasesFromHeap` (line 1546)
+    populates `cat.ListDatabases()` — the very list the loop iterates — so
+    it silently registered zero non-default databases on every restart
+    (symptom: 0 rows post-restart, not the union, for either database's own
+    type). Fixed by relocating the per-DB loop to run right after
+    `reloadDatabasesFromHeap`'s `loadUserTablesFromHeapForDB` loop (same
+    precondition, same shape); `loadSystemCatalogsIfPresent` is now just the
+    DefaultDBOid pass again. New test:
+    `internal/postmaster/database_ddl_type_reload_test.go`
+    (`TestDatabaseDDLTypeCatalogReloadAcrossRestart`), covering composite
+    (pg_attribute join, the exact M0143-0002c repro), domain (typbasetype
+    identity), and range (pg_type isolation only — `pg_range`'s own
+    DBOid routing is a separate, still-hardcoded catalog, out of this
+    task's enumerated scope). Two write sites found while re-auditing every
+    remaining `catalog.DefaultDBOid` literal were deliberately NOT touched
+    since they were never in M0143-0002d's enumerated list — `pgRangeRel`
+    (`internal/executor/sys_pg_range.go:54-59`) and `execDropDomain`/the
+    ACL-resync functions (`resyncTypeACLHeapRow`/`resyncAttrACLHeapRow`,
+    `operators_ddl.go:23537,23667-23669,26366,26369`) — filed as
+    **M0143-0002g** below with a `.ralph/deferral_ledger.md` row (dated
+    2026-09-17). Design doc updated:
+    `docs/design/0100-0149/m0143-0002d-per-database-type-catalog.md` (§
+    M0143-0002f Done note) and `docs/design/README.md` (status → done).
+    Gates: `go build ./...` clean; `go test ./internal/postmaster/...
+    ./internal/executor/... ./internal/initdb/... ./internal/catalog/...`
+    PASS; `RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh` full
+    green; `scripts/tpcds-sf025-regression.sh sweep` PASS=96 MISMATCH=0
+    ERROR=0 TIMEOUT=0, plan-shapes 99/99 identical, gate-stamp PASS against
+    the staged tree. `tpch-spotcheck` not run — no TPC-H data needed for
+    this unit-scoped fix, consistent with the P0-E6-wait selection rule.
+- [ ] **M0143-0002g — the two write-site gaps M0143-0002f's own audit found
+  but did not fix (out of that task's enumerated scope).**
+  Parent: M0143-0002d. Filed 2026-09-17 from M0143-0002f's Done note. (1)
+  `pgRangeRel` (`internal/executor/sys_pg_range.go:54-59`, backs
+  `writeRangeCatalogRow`/`deleteRangeCatalogRow`) still hardcodes
+  `catalog.DefaultDBOid` — a range type's `pg_range` row (subtype/
+  collation/opclass linkage) always lands in the default database's heap
+  regardless of which database declared the range, even though its
+  `pg_type` rows are now correctly per-database (M0143-0002f). (2)
+  `execDropDomain`'s two `deleteTypeFromCatalogHeap` calls
+  (`operators_ddl.go:26366`,`:26369`) and the GRANT/REVOKE re-sync functions
+  `resyncTypeACLHeapRow`/`resyncAttrACLHeapRow`
+  (`operators_ddl.go:23537`,`:23667-23669`) were never in M0143-0002d's
+  enumerated write-site list, so DROP DOMAIN and GRANT/REVOKE ON
+  TYPE/table-column-ACL on a non-default database still target the wrong
+  heap file. Fix: same one-line `catalog.DefaultDBOid` →
+  `tableCatalogHeapDBOid(ctx)` swap at each site; for (1), also extend
+  `TestDatabaseDDLTypeCatalogReloadAcrossRestart`'s range assertion from
+  pg_type-only to the `rngsubtype` join it currently avoids. Each needs its
+  own regression test (a non-default-DB DROP DOMAIN / GRANT ON TYPE /
+  CREATE TYPE AS RANGE case).
 - [ ] **M0143-0003 — `pg_constraint` returns 0 rows of any contype after a restart** —
   including the `'p'`/`'u'` rows synthesised from indexes that demonstrably survive. A
   second, independent reload gap that R126 explicitly did not touch.

@@ -18446,7 +18446,7 @@ func syncEnumTypeToCatalogHeap(ctx *Context, et *catalog.EnumType) {
 // its index entries by construction.
 func writeTypeHeapRowWithIndexes(ctx *Context, row Row) error {
 	typeRel := storage.RelFileNode{
-		DBOid:  catalog.DefaultDBOid,
+		DBOid:  tableCatalogHeapDBOid(ctx),
 		RelOid: catalog.TypeRelationId,
 		Fork:   storage.MainFork,
 	}
@@ -18491,7 +18491,7 @@ func updateTypeHeapRowWithIndexes(ctx *Context, row Row) error {
 		return writeTypeHeapRowWithIndexes(ctx, row)
 	}
 	typeRel := storage.RelFileNode{
-		DBOid:  catalog.DefaultDBOid,
+		DBOid:  tableCatalogHeapDBOid(ctx),
 		RelOid: catalog.TypeRelationId,
 		Fork:   storage.MainFork,
 	}
@@ -18537,7 +18537,7 @@ func syncCompositeTypeToCatalogHeap(ctx *Context, ct *catalog.CompositeType) {
 	// re-emit `CREATE TYPE x AS (...)`. Index entries mirror syncTableToCatalogHeap
 	// so the rows are reachable by OID / relname-nsp lookups too. DU-002 slice 243.
 	classRel := storage.RelFileNode{
-		DBOid:  catalog.DefaultDBOid,
+		DBOid:  tableCatalogHeapDBOid(ctx),
 		RelOid: catalog.RelationRelationId,
 		Fork:   storage.MainFork,
 	}
@@ -18553,7 +18553,7 @@ func syncCompositeTypeToCatalogHeap(ctx *Context, ct *catalog.CompositeType) {
 	}
 
 	attrRel := storage.RelFileNode{
-		DBOid:  catalog.DefaultDBOid,
+		DBOid:  tableCatalogHeapDBOid(ctx),
 		RelOid: catalog.AttributeRelationId,
 		Fork:   storage.MainFork,
 	}
@@ -25237,9 +25237,9 @@ func (o *ddlOp) execAlterType(s *parser.AlterTypeStmt) error {
 		// implicit pg_class relation + its pg_attribute field rows) before the
 		// re-sync re-writes them, mirroring execDropType's composite branch.
 		if catalogHeapSyncAvailable(o.ctx) && o.ctx.MaterializeWriterXID() == nil {
-			deleteTypeFromCatalogHeap(o.ctx, catalog.DefaultDBOid, ct.OID, o.ctx.Tx.XID)
-			deleteTypeFromCatalogHeap(o.ctx, catalog.DefaultDBOid, ct.ArrayOID, o.ctx.Tx.XID)
-			deleteCatalogRowsForOID(o.ctx, catalog.DefaultDBOid, ct.RelOID, o.ctx.Tx.XID)
+			deleteTypeFromCatalogHeap(o.ctx, tableCatalogHeapDBOid(o.ctx), ct.OID, o.ctx.Tx.XID)
+			deleteTypeFromCatalogHeap(o.ctx, tableCatalogHeapDBOid(o.ctx), ct.ArrayOID, o.ctx.Tx.XID)
+			deleteCatalogRowsForOID(o.ctx, tableCatalogHeapDBOid(o.ctx), ct.RelOID, o.ctx.Tx.XID)
 			_ = mirrorCatalogRelToPostgresDB(o.ctx, catalog.TypeRelationId)
 			_ = mirrorCatalogRelToPostgresDB(o.ctx, catalog.RelationRelationId)
 			_ = mirrorCatalogRelToPostgresDB(o.ctx, catalog.AttributeRelationId)
@@ -25277,9 +25277,9 @@ func (o *ddlOp) execAlterType(s *parser.AlterTypeStmt) error {
 		copy(newFields, ct.Fields)
 		newFields[idx].Name = s.RenameAttrNew
 		if catalogHeapSyncAvailable(o.ctx) && o.ctx.MaterializeWriterXID() == nil {
-			deleteTypeFromCatalogHeap(o.ctx, catalog.DefaultDBOid, ct.OID, o.ctx.Tx.XID)
-			deleteTypeFromCatalogHeap(o.ctx, catalog.DefaultDBOid, ct.ArrayOID, o.ctx.Tx.XID)
-			deleteCatalogRowsForOID(o.ctx, catalog.DefaultDBOid, ct.RelOID, o.ctx.Tx.XID)
+			deleteTypeFromCatalogHeap(o.ctx, tableCatalogHeapDBOid(o.ctx), ct.OID, o.ctx.Tx.XID)
+			deleteTypeFromCatalogHeap(o.ctx, tableCatalogHeapDBOid(o.ctx), ct.ArrayOID, o.ctx.Tx.XID)
+			deleteCatalogRowsForOID(o.ctx, tableCatalogHeapDBOid(o.ctx), ct.RelOID, o.ctx.Tx.XID)
 			_ = mirrorCatalogRelToPostgresDB(o.ctx, catalog.TypeRelationId)
 			_ = mirrorCatalogRelToPostgresDB(o.ctx, catalog.RelationRelationId)
 			_ = mirrorCatalogRelToPostgresDB(o.ctx, catalog.AttributeRelationId)
@@ -25320,9 +25320,9 @@ func (o *ddlOp) execAlterType(s *parser.AlterTypeStmt) error {
 		newFields = append(newFields, ct.Fields[:idx]...)
 		newFields = append(newFields, ct.Fields[idx+1:]...)
 		if catalogHeapSyncAvailable(o.ctx) && o.ctx.MaterializeWriterXID() == nil {
-			deleteTypeFromCatalogHeap(o.ctx, catalog.DefaultDBOid, ct.OID, o.ctx.Tx.XID)
-			deleteTypeFromCatalogHeap(o.ctx, catalog.DefaultDBOid, ct.ArrayOID, o.ctx.Tx.XID)
-			deleteCatalogRowsForOID(o.ctx, catalog.DefaultDBOid, ct.RelOID, o.ctx.Tx.XID)
+			deleteTypeFromCatalogHeap(o.ctx, tableCatalogHeapDBOid(o.ctx), ct.OID, o.ctx.Tx.XID)
+			deleteTypeFromCatalogHeap(o.ctx, tableCatalogHeapDBOid(o.ctx), ct.ArrayOID, o.ctx.Tx.XID)
+			deleteCatalogRowsForOID(o.ctx, tableCatalogHeapDBOid(o.ctx), ct.RelOID, o.ctx.Tx.XID)
 			_ = mirrorCatalogRelToPostgresDB(o.ctx, catalog.TypeRelationId)
 			_ = mirrorCatalogRelToPostgresDB(o.ctx, catalog.RelationRelationId)
 			_ = mirrorCatalogRelToPostgresDB(o.ctx, catalog.AttributeRelationId)
@@ -25367,9 +25367,9 @@ func (o *ddlOp) execAlterType(s *parser.AlterTypeStmt) error {
 		// present (DU-002 slice 259), else reset to the new type's default (empty).
 		newFields[idx].Collation = s.AlterAttrCollation
 		if catalogHeapSyncAvailable(o.ctx) && o.ctx.MaterializeWriterXID() == nil {
-			deleteTypeFromCatalogHeap(o.ctx, catalog.DefaultDBOid, ct.OID, o.ctx.Tx.XID)
-			deleteTypeFromCatalogHeap(o.ctx, catalog.DefaultDBOid, ct.ArrayOID, o.ctx.Tx.XID)
-			deleteCatalogRowsForOID(o.ctx, catalog.DefaultDBOid, ct.RelOID, o.ctx.Tx.XID)
+			deleteTypeFromCatalogHeap(o.ctx, tableCatalogHeapDBOid(o.ctx), ct.OID, o.ctx.Tx.XID)
+			deleteTypeFromCatalogHeap(o.ctx, tableCatalogHeapDBOid(o.ctx), ct.ArrayOID, o.ctx.Tx.XID)
+			deleteCatalogRowsForOID(o.ctx, tableCatalogHeapDBOid(o.ctx), ct.RelOID, o.ctx.Tx.XID)
 			_ = mirrorCatalogRelToPostgresDB(o.ctx, catalog.TypeRelationId)
 			_ = mirrorCatalogRelToPostgresDB(o.ctx, catalog.RelationRelationId)
 			_ = mirrorCatalogRelToPostgresDB(o.ctx, catalog.AttributeRelationId)
@@ -25612,9 +25612,9 @@ func (o *ddlOp) execAlterTypeAttrCmds(cat *catalog.InMemory, s *parser.AlterType
 	// One xmax-stamp + re-sync for the whole combined statement (see execAlterType's
 	// single-subcommand branches for the per-relation rationale).
 	if catalogHeapSyncAvailable(o.ctx) && o.ctx.MaterializeWriterXID() == nil {
-		deleteTypeFromCatalogHeap(o.ctx, catalog.DefaultDBOid, ct.OID, o.ctx.Tx.XID)
-		deleteTypeFromCatalogHeap(o.ctx, catalog.DefaultDBOid, ct.ArrayOID, o.ctx.Tx.XID)
-		deleteCatalogRowsForOID(o.ctx, catalog.DefaultDBOid, ct.RelOID, o.ctx.Tx.XID)
+		deleteTypeFromCatalogHeap(o.ctx, tableCatalogHeapDBOid(o.ctx), ct.OID, o.ctx.Tx.XID)
+		deleteTypeFromCatalogHeap(o.ctx, tableCatalogHeapDBOid(o.ctx), ct.ArrayOID, o.ctx.Tx.XID)
+		deleteCatalogRowsForOID(o.ctx, tableCatalogHeapDBOid(o.ctx), ct.RelOID, o.ctx.Tx.XID)
 		_ = mirrorCatalogRelToPostgresDB(o.ctx, catalog.TypeRelationId)
 		_ = mirrorCatalogRelToPostgresDB(o.ctx, catalog.RelationRelationId)
 		_ = mirrorCatalogRelToPostgresDB(o.ctx, catalog.AttributeRelationId)
@@ -25641,9 +25641,9 @@ func (o *ddlOp) execDropType(s *parser.DropTypeStmt) error {
 		// remain InvalidTransactionID (0), which is a no-op stamp. M0097-0022.
 		if et, ok := cat.LookupEnum(n, o.ctx.CurrentDatabaseOid); ok && catalogHeapSyncAvailable(o.ctx) {
 			if o.ctx.MaterializeWriterXID() == nil {
-				deleteTypeFromCatalogHeap(o.ctx, catalog.DefaultDBOid, et.OID, o.ctx.Tx.XID)
+				deleteTypeFromCatalogHeap(o.ctx, tableCatalogHeapDBOid(o.ctx), et.OID, o.ctx.Tx.XID)
 				// Also stamp the auto-generated array type row (`_name`). DU-002 slice 89.
-				deleteTypeFromCatalogHeap(o.ctx, catalog.DefaultDBOid, et.ArrayOID, o.ctx.Tx.XID)
+				deleteTypeFromCatalogHeap(o.ctx, tableCatalogHeapDBOid(o.ctx), et.ArrayOID, o.ctx.Tx.XID)
 				// B2.1d: the enum's pg_enum label rows die with it.
 				deleteEnumLabelRowsByTypid(o.ctx, et.OID, o.ctx.Tx.XID)
 				// Mirror pg_type + pg_enum to postgres db so the xmax stamps
@@ -25661,12 +25661,12 @@ func (o *ddlOp) execDropType(s *parser.DropTypeStmt) error {
 		// slice 242 — mirrors the enum branch above.
 		if ct := cat.LookupCompositeType(n, o.ctx.CurrentDatabaseOid); ct != nil && catalogHeapSyncAvailable(o.ctx) {
 			if o.ctx.MaterializeWriterXID() == nil {
-				deleteTypeFromCatalogHeap(o.ctx, catalog.DefaultDBOid, ct.OID, o.ctx.Tx.XID)
-				deleteTypeFromCatalogHeap(o.ctx, catalog.DefaultDBOid, ct.ArrayOID, o.ctx.Tx.XID)
+				deleteTypeFromCatalogHeap(o.ctx, tableCatalogHeapDBOid(o.ctx), ct.OID, o.ctx.Tx.XID)
+				deleteTypeFromCatalogHeap(o.ctx, tableCatalogHeapDBOid(o.ctx), ct.ArrayOID, o.ctx.Tx.XID)
 				// Stamp xmax on the implicit pg_class relation + its pg_attribute
 				// field rows so the dropped composite type leaves no orphan rows
 				// for pg_dump's getTypes/dumpCompositeType. DU-002 slice 243.
-				deleteCatalogRowsForOID(o.ctx, catalog.DefaultDBOid, ct.RelOID, o.ctx.Tx.XID)
+				deleteCatalogRowsForOID(o.ctx, tableCatalogHeapDBOid(o.ctx), ct.RelOID, o.ctx.Tx.XID)
 				_ = mirrorCatalogRelToPostgresDB(o.ctx, catalog.TypeRelationId)
 				_ = mirrorCatalogRelToPostgresDB(o.ctx, catalog.RelationRelationId)
 				_ = mirrorCatalogRelToPostgresDB(o.ctx, catalog.AttributeRelationId)
@@ -25681,10 +25681,10 @@ func (o *ddlOp) execDropType(s *parser.DropTypeStmt) error {
 		// branches above. DU-002 (M0110-0001).
 		if rt, ok := cat.LookupRangeType(n, o.ctx.CurrentDatabaseOid); ok && catalogHeapSyncAvailable(o.ctx) {
 			if o.ctx.MaterializeWriterXID() == nil {
-				deleteTypeFromCatalogHeap(o.ctx, catalog.DefaultDBOid, rt.OID, o.ctx.Tx.XID)
-				deleteTypeFromCatalogHeap(o.ctx, catalog.DefaultDBOid, rt.ArrayOID, o.ctx.Tx.XID)
-				deleteTypeFromCatalogHeap(o.ctx, catalog.DefaultDBOid, rt.MultirangeOID, o.ctx.Tx.XID)
-				deleteTypeFromCatalogHeap(o.ctx, catalog.DefaultDBOid, rt.MultirangeArrayOID, o.ctx.Tx.XID)
+				deleteTypeFromCatalogHeap(o.ctx, tableCatalogHeapDBOid(o.ctx), rt.OID, o.ctx.Tx.XID)
+				deleteTypeFromCatalogHeap(o.ctx, tableCatalogHeapDBOid(o.ctx), rt.ArrayOID, o.ctx.Tx.XID)
+				deleteTypeFromCatalogHeap(o.ctx, tableCatalogHeapDBOid(o.ctx), rt.MultirangeOID, o.ctx.Tx.XID)
+				deleteTypeFromCatalogHeap(o.ctx, tableCatalogHeapDBOid(o.ctx), rt.MultirangeArrayOID, o.ctx.Tx.XID)
 				// B2.1c: the pg_range row dies with the type.
 				deleteRangeCatalogRow(o.ctx, rt.OID, o.ctx.Tx.XID)
 				mirrorTypeCatalogFiles(o.ctx)

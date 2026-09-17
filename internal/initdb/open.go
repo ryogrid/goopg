@@ -1575,6 +1575,28 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		}
 	}
 
+	// M0143-0002f: register each distinct-dbOid database's OWN
+	// pg_type/pg_attribute heap tables (base/<dbOid>/1247|1249) into that
+	// database's catalog namespace, mirroring the loadUserTablesFromHeapForDB
+	// loop directly above. Must run here (after reloadDatabasesFromHeap
+	// populated cat.ListDatabases(), the source of the per-DB dbOid list) —
+	// loadSystemCatalogsIfPresent's call further up in this function only
+	// covers the shared DefaultDBOid pass, since ListDatabases() is still
+	// empty at that point on every restart.
+	for _, dbName := range cat.ListDatabases() {
+		dbOid := cat.DatabaseOid(dbName)
+		if dbOid == 0 || dbOid == catalog.DefaultDBOid ||
+			dbOid == catalog.PostgresDBOid || dbOid == cat.DBOID() {
+			continue
+		}
+		if err := loadSystemCatalogsIfPresentForDB(abs, cat, dbOid, dbOid); err != nil {
+			_ = pool.Close()
+			_ = walWriter.Close()
+			_ = mgr.Close()
+			return nil, fmt.Errorf("goopg: system catalog load (db %q oid %d): %w", dbName, dbOid, err)
+		}
+	}
+
 	// B4.2: restore ALTER DATABASE/ROLE SET overrides from the pg_db_role_setting
 	// SHARED heap (global/2964), replacing the retired replayDatabaseConfigRecords
 	// + replayRoleConfigRecords WAL scans (RecordKinds 73-78). Each row carries
@@ -2930,34 +2952,19 @@ func registerStatCheckpointerView(cat *catalog.InMemory, cp *xlog.Checkpointer) 
 // heap relfile.  The rows are visible to all sessions because they
 // were written with xmin=BootstrapTransactionID (1).
 //
-// M0143-0002e: before this loop pg_type/pg_attribute were registered exactly
-// once, as a single process-wide catalog.Table with DBOid left at its zero
-// value — every connection's SeqScan on them resolved through the one
-// process-wide c.dbOid regardless of ctx.CurrentDatabaseOid, so two
-// databases' user-defined types' pg_type/pg_attribute rows appeared as the
-// UNION of both (docs/design/0100-0149/m0143-0002d-per-database-type-catalog.md).
-// Mirrors the identical fix already applied to indexes
-// (loadUserIndexesFromHeap's cat.ListDatabases() loop, M0127-P5.6-f-pre):
-// the main pass keeps the historical asymmetry (reads base/<cat.DBOID()>,
-// registers into DefaultDBOid's namespace), every other database reads and
-// registers under its own oid. Registration-only — no observable SQL
-// behavior change yet, since the write side (M0143-0002f) still hardcodes
-// DefaultDBOid until that task lands.
+// M0143-0002e added a per-database companion pass for pg_type/pg_attribute
+// (docs/design/0100-0149/m0143-0002d-per-database-type-catalog.md), mirroring
+// the identical fix already applied to indexes (loadUserIndexesFromHeap's
+// cat.ListDatabases() loop, M0127-P5.6-f-pre). That companion pass lives at
+// this function's call site in Open — NOT inside this function — because
+// cat.ListDatabases() is empty until reloadDatabasesFromHeap runs, which
+// happens well after this function's call site (M0143-0002f fixed an
+// ordering bug where the loop lived here and silently iterated zero
+// databases on every restart, confirmed live by
+// TestDatabaseDDLTypeCatalogReloadAcrossRestart). See the per-DB loop next to
+// the loadUserTablesFromHeapForDB one below reloadDatabasesFromHeap.
 func loadSystemCatalogsIfPresent(dataDir string, cat *catalog.InMemory) error {
-	if err := loadSystemCatalogsIfPresentForDB(dataDir, cat, cat.DBOID(), catalog.DefaultDBOid); err != nil {
-		return err
-	}
-	for _, dbName := range cat.ListDatabases() {
-		dbOid := cat.DatabaseOid(dbName)
-		if dbOid == 0 || dbOid == catalog.DefaultDBOid ||
-			dbOid == catalog.PostgresDBOid || dbOid == cat.DBOID() {
-			continue
-		}
-		if err := loadSystemCatalogsIfPresentForDB(dataDir, cat, dbOid, dbOid); err != nil {
-			return err
-		}
-	}
-	return nil
+	return loadSystemCatalogsIfPresentForDB(dataDir, cat, cat.DBOID(), catalog.DefaultDBOid)
 }
 
 // loadSystemCatalogsIfPresentForDB is loadSystemCatalogsIfPresent restricted

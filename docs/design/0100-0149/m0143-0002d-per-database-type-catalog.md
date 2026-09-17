@@ -168,6 +168,45 @@ rows they point at were wrong.
   (`.ralph/fix_plan.md` M0143-0002c) now returns each database's own type
   shape only, plus a restart round trip (see Test below) confirming the fix
   survives `Close`/`Open` — not just live-session visibility.
+  - **Done 2026-09-17.** All named write sites
+    (`writeTypeHeapRowWithIndexes`, `updateTypeHeapRowWithIndexes`,
+    `syncCompositeTypeToCatalogHeap`'s `classRel`/`attrRel`, and every
+    composite/enum/range delete-side `catalog.DefaultDBOid` literal
+    M0143-0002c inventoried) now route through `tableCatalogHeapDBOid(ctx)`.
+    Live (pre-restart) verification matched the design exactly: a composite
+    type declared identically-named in two databases returned each
+    database's own field list, not the union. **The restart half surfaced a
+    second, independent bug** in M0143-0002e's own read-side landing: its
+    per-database registration loop lived inside `loadSystemCatalogsIfPresent`
+    (`internal/initdb/open.go`), called at the function's line 1376 — well
+    *before* `reloadDatabasesFromHeap` (line 1546) populates
+    `cat.ListDatabases()`, the very list the loop iterates. Every restart
+    therefore silently registered zero non-default databases' pg_type/
+    pg_attribute Tables, so a distinct-dbOid database's own types vanished
+    (0 rows, not the union) after `Close`/`Open` even with this task's
+    write-side fix landed. Fixed by moving the per-DB loop out of
+    `loadSystemCatalogsIfPresent` (now just the DefaultDBOid pass again) to
+    run immediately after the pre-existing `loadUserTablesFromHeapForDB`
+    per-DB loop (both iterate the same post-reload `cat.ListDatabases()`).
+    New test `TestDatabaseDDLTypeCatalogReloadAcrossRestart`
+    (`internal/postmaster/database_ddl_type_reload_test.go`) mirrors
+    `TestDatabaseDDLReloadAcrossRestart`'s shape and caught this live (empty
+    result, not union, was the tell) before the ordering fix; it covers
+    composite (pg_attribute join, the M0143-0002c repro exactly), domain
+    (typbasetype identity via `format_type`), and range (pg_type isolation
+    only — see "What this does NOT do" below for why the range assertion
+    stops short of `pg_range`). Two write sites intentionally NOT touched
+    because they were never in this task's enumerated scope —
+    `pgRangeRel` (`internal/executor/sys_pg_range.go`, still hardcodes
+    DefaultDBOid) and `execDropDomain`/the ACL-resync functions
+    (`resyncTypeACLHeapRow`/`resyncAttrACLHeapRow`, `operators_ddl.go`) —
+    are recorded as a `.ralph/deferral_ledger.md` row dated 2026-09-17
+    rather than folded in here. Gates: `go build ./...` clean; `go test
+    ./internal/postmaster/... ./internal/executor/... ./internal/initdb/...
+    ./internal/catalog/...` PASS; `RALPH_PRECOMMIT_SCOPE=units
+    scripts/ralph-precommit-test.sh` full green;
+    `scripts/tpcds-sf025-regression.sh sweep` PASS=96 MISMATCH=0 ERROR=0,
+    plan-shapes 99/99 identical (gate-stamp PASS against the staged tree).
 
 ## Test
 
