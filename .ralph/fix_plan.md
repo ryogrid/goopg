@@ -7192,7 +7192,7 @@ reported, and the values and unit gates are the bar.
     TIMEOUT=0, plan-shapes 99/99 identical, gate-stamp PASS against the
     staged tree. No TPC-H data needed, consistent with the P0-E6-wait
     selection rule.
-- [ ] **M0143-0003c — UNIQUE (non-PRIMARY-KEY) constraint-backed index
+- [x] **M0143-0003c — UNIQUE (non-PRIMARY-KEY) constraint-backed index
   `IsConstraint` durability.**
   Parent: M0143-0003. Depends on: sequence after
   M0143-0003b (smaller diff if its write-path plumbing exists to reuse).
@@ -7200,10 +7200,58 @@ reported, and the values and unit gates are the bar.
   `ALTER TABLE t ADD CONSTRAINT u UNIQUE (col)` from a bare `CREATE UNIQUE
   INDEX u ON t(col)` after a restart — real PG uses
   `pg_constraint.conindid`, which goopg does not persist for `contype IN
-  ('u','x')`. Two candidate fixes not yet evaluated against each other are in
-  the design doc's "M0143-0003c" section (extend 0003b's write path to also
-  cover `contype='u'`, vs. a new persisted bit directly on the `pg_index`
-  heap row, same shape as M0143-0003e).
+  ('u','x')`.
+  - **Done 2026-09-18.** Resolved the schema decision in favor of option (a)
+    (a `pg_constraint` heap row) over option (b) (a new `pg_index` bit): PG
+    already solves this via `conindid`, so a heap row is the PG-faithful
+    mechanism and reuses 0003b/0003d's exact funnel. Write:
+    `buildPGConstraintRowForUnique`/`writeUniqueConstraintRow`/
+    `stampUniqueConstraintRows` (`internal/executor/sys_pg_constraint.go`),
+    `contype='u'`, `conindid=idx.OID`, `conkey` = key-column ordinals,
+    `condeferrable`/`condeferred` sourced from `idx.Deferrable`/
+    `idx.InitiallyDeferred` (closes an unrelated latent gap for free — neither
+    field reloaded from anywhere before this). PRIMARY KEY excluded from the
+    write loop (0003a already covers it). Wired into the same
+    `syncTableToCatalogHeap`/`deleteCatalogRowsForOID` funnel. Resync
+    coverage: since the constraint object here IS the index (no `Table`-owned
+    list to length-check), added `tableHasUniqueConstraintIndex` (scans
+    `IndexesOnTable` for `Unique && !Primary && IsConstraint`) as the
+    equivalent dirty-trigger in `execCreateTable`'s and
+    `execCreatePartitionChild`'s resync gates; the three ALTER-path sites that
+    set `IsConstraint=true` outside those two functions
+    (`execAlterTableAddUnique`'s build-new-index branch,
+    `adoptExistingIndexAsConstraint`'s USING-INDEX branch, guarded to
+    `!primary`) each gained a `syncConstraintCatalogRow` call, mirroring
+    0003b's precedent for its own ALTER-path sites. Reload:
+    `loadUniqueConstraintsFromHeap`/`loadUniqueConstraintsFromHeapForDB`
+    (`internal/initdb/catalog_heap_reload.go`), wired in `open.go` right
+    after `loadNotNullConstraintsFromHeap`; resolves `conindid` via a new
+    `catalog.InMemory.LookupIndexByOIDAllDBs` (mirrors
+    `LookupTableByOIDAllDBs`'s cross-database fallback). Test:
+    `TestDatabaseDDLReloadAcrossRestart` extended — `gauge` now also carries
+    `tag text CONSTRAINT gauge_tag_unique UNIQUE`; post-restart assertions
+    check the `pg_constraint` row AND a behavior gated on `IsConstraint`
+    (`RENAME CONSTRAINT`, which real PG/goopg both require
+    `!Primary && Unique && IsConstraint` for) plus a genuine UNIQUE-violation
+    INSERT. Verified live: temporarily no-op'd `loadUniqueConstraintsFromHeap`
+    in `open.go` — failed with the predicted symptom (empty row, RENAME
+    42704), restored, re-ran green. Found but deliberately NOT fixed
+    (pre-existing, unrelated bug — ledgered): `execCreatePartitionChild`'s
+    `poc.UniqueColumns` and `LIKE ... INCLUDING INDEXES` both clone/create a
+    unique index without ever setting `IsConstraint=true`, even live,
+    pre-restart.
+    Gates: `go build ./...` clean; `go test ./internal/catalog/...
+    ./internal/postmaster/... ./internal/executor/... ./internal/initdb/...`
+    all PASS; `TestDatabaseDDLReloadAcrossRestart` green and via the
+    temporary-revert probe (red as predicted); `RALPH_PRECOMMIT_SCOPE=units
+    scripts/ralph-precommit-test.sh` full green; `scripts/tpcds-sf025-regression.sh
+    sweep` PASS=96 MISMATCH=0 ERROR=0 TIMEOUT=0, plan-shapes 99/99 identical,
+    gate-stamp PASS against the staged tree; `tpch-spotcheck.sh`
+    SKIP-BLOCKED (expected — `:65433` still under the P0-E6 evidence hold),
+    accepted via the standing G6 exception (ledger: P0-E7 remains the re-run
+    owner); `python3 scripts/ralph-lineage-guard.py` exit 0. No TPC-H data
+    needed for the change itself, consistent with the P0-E6-wait selection
+    rule.
 - [x] **M0143-0003d — NOT NULL constraint named-metadata durable
   persistence.**
   Parent: M0143-0003. Depends on: sequence after M0143-0003b
@@ -7260,8 +7308,14 @@ reported, and the values and unit gates are the bar.
     predicted). No TPC-H data needed, consistent with the P0-E6-wait
     selection rule.
 - [ ] **M0143-0003e — EXCLUDE constraint `indisexclusion` durability.**
-  Parent: M0143-0003. Depends on: do together with M0143-0003c (same new
-  `pg_index`-heap-row-bit decision). `indisexclusion` is a declared
+  Parent: M0143-0003. Depends on: M0143-0003c `[x]` (done 2026-09-18) — reuse
+  its landed shape directly: a `contype='x'` sibling of
+  `buildPGConstraintRowForUnique`/`writeUniqueConstraintRow`/
+  `stampUniqueConstraintRows` (same `conindid`-keyed `pg_constraint` row,
+  not a new `pg_index` bit — 0003c's design doc section records why that
+  option was dropped), and a reload loader that sets `idx.IsExclusion = true`
+  (mirroring `loadUniqueConstraintsFromHeapForDB`'s `idx.IsConstraint = true`)
+  instead of a new schema/heap-format decision. `indisexclusion` is a declared
   `pg_index` heap column (`internal/initdb/initdb.go:4766`) but is never
   written by the real index-creation path (confirmed by grep: zero
   non-comment hits for `indisexclusion`/`IndIsExclusion` outside catalog
@@ -7270,6 +7324,21 @@ reported, and the values and unit gates are the bar.
   reload — `Index.IsExclusion` is lost on every restart, taking `x`-contype
   `pg_constraint` rows and `deferred_exclusion.go`'s deferred-exclusion-check
   machinery with it for any EXCLUDE constraint surviving a restart.
+- [ ] **M0143-0003f — `poc.UniqueColumns`/`LIKE ... INCLUDING INDEXES` never
+  set `IsConstraint` (live bug, not restart-related).**
+  Parent: M0143-0003. Filed 2026-09-18, discovered while researching
+  M0143-0003c's write-loop call sites (deferral-ledger row dated 2026-09-18).
+  `execCreatePartitionChild`'s `PARTITION OF ... (col UNIQUE)` inline-column
+  path (`poc.UniqueColumns`) and the `LIKE ... INCLUDING INDEXES` unique-index
+  clone both call `createBTreeIndex` but never set `idx.IsConstraint = true`
+  afterward, unlike every sibling UNIQUE-constraint path (inline column,
+  table-level, named, PK auto-index). This is a LIVE bug — the resulting index
+  never shows up in `pg_constraint` even before any restart — not a repeat of
+  M0143-0003c's restart-durability gap. Fix: add `idx.IsConstraint = true`
+  (plus a `syncConstraintCatalogRow` call, now that M0143-0003c's write path
+  exists) right after both `createBTreeIndex` calls; add a regression test
+  (`PARTITION OF ... (col UNIQUE)` and `LIKE ... INCLUDING INDEXES` each
+  asserting the resulting index appears in `pg_constraint` with `contype='u'`).
 - [ ] **M0143-0004 — `PhysicalTypeIsVarlena` has no `IsArray` arm**
   (`physical_align.go:85-107`) — latent for ordinary user `int4[]` columns, not just
   catalogs.
