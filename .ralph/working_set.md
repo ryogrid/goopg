@@ -1,58 +1,60 @@
-Task: M0141-S7-cd-q64 (recon, `.ralph/fix_plan.md` item 4's "cost diagnosis
-only" scope, selected via banner's P0-E6-wait fallback: M0143 has only the
-owner-gated M0143-0007b left, so fell through to "recon-only tasks from items
-3-6" -> M0141-S7's two open cd-* recon tasks -> cd-q64 (listed first).
-DONE and committed this loop.
+Task: M0141-S7-cd-q64-reclassify (recon, `.ralph/fix_plan.md` item 4's
+"cost diagnosis only" scope, selected via banner's P0-E6-wait fallback: M0143
+has only the owner-gated M0143-0007b left, item 3 is implementation (not
+selectable), so item 4's two open recon tasks -> cd-q64-reclassify, the
+one prior loop's baton pointed at next). DONE and committed this loop
+(`18390e924`).
 
-Files: `internal/optimizer/pathtrace.go` (2 new trace helpers,
-`traceOrderedCandidatePopulation` + `traceIncrementalSortCandidate`, both
-gated on existing `pathTraceEnabled`/`GOOPG_PGSHAPED_DP_TRACE`), 
-`internal/optimizer/upperordered.go` (1 call site in `createOrderedPaths`),
-`internal/optimizer/incrementalsortpaths.go` (1 call site in
-`addIncrementalSortPaths`'s loop), `internal/optimizer/upperordered_test.go`
-(fixed `dppathLines` — it matched bare "DPPATH " prefix, which now also
-matches the 2 new record kinds; narrowed to "DPPATH path "/"DPPATH partial "
-only), `docs/design/0100-0149/m0141-s7-readjudicate-and-scope-incremental-sort.md`
-+ `docs/design/README.md` (Update 2026-09-18b), `.ralph/fix_plan.md`
-(M0141-S7-cd-q64 ticked + follow-up M0141-S7-cd-q64-reclassify filed).
+Files: `docs/design/0100-0149/m0141-s7-readjudicate-and-scope-incremental-sort.md`
+(new "Update 2026-09-18c" section), `docs/design/README.md` (appended
+Update-2026-09-18c summary to the m0141-s7 index row), `.ralph/fix_plan.md`
+(M0141-S7-cd-q64-reclassify ticked with its finding; new implementation task
+**M0141-S2b-8** filed under M0141-S7's nested list, right after
+M0141-S7-cd-candidatepool). No production code touched — pure recon-by-reading,
+no server/trace needed for this task (unlike its sibling cd-q64/candidatepool
+tasks which needed a live DPPATH trace).
 
-Key symbols: `createOrderedPaths` (upperordered.go:63), `searchedRelOf`
-(searchedtree.go:169), `addIncrementalSortPaths` (incrementalsortpaths.go:149).
+Key symbols: `electOrderedGrouping` (`upperorderedgrouping.go:178`, call site
+`planner.go:1960`, gated on `len(s.OrderBy)>0`), `preplanWithClause`
+(`with.go:210`, plans a CTE body via the SAME `planSelectWithSettings`),
+`addGroupingPaths` (`groupingpaths.go:379`, SORTED arm at :441-495),
+`sortPathForBounded` (`joinpathsmerge.go:480-515`, always full `PathSort`,
+never checks `seed.Pathkeys` for a partial-prefix match).
 
-Findings: traced the REAL Q64 (not a synthetic repro — loaded actual SF0.25
-TPC-DS data into a private port-5533 cluster since the RALPH_LOOP guard now
-blocks restarting shared `:65437`). Both of the prior loop's hypotheses were
-WRONG: `searchedRelOf(input)` returns non-nil (`searchedrel=true`),
-`SearchCandidates` has 7 entries, 6 with non-empty validated keys. All 6 are
-`PathMergeJoin` (kind=4) with `ncommon=0` against the outer ORDER BY — zero
-shared columns, not a partial-prefix miss. Root cause: Q64's outer `ORDER BY`
-(`cs1.product_name, cs1.store_name, cs2.cnt, cs1.s1, cs2.s1`) sorts on the
-CTE `cross_sales`'s own AGGREGATE OUTPUT columns — no join-shaped candidate
-can ever carry a prefix of that. PG's own plan satisfies the outer level with
-a plain `Sort`; the ONE `Incremental Sort` node in PG's Q64 plan
-(`Presorted Key: item.i_item_sk`) is INSIDE the CTE's own `GroupAggregate`
-build — a completely different call site than `createOrderedPaths` (which
-only ever sees the statement's OUTER `ORDER BY`). Q64 was miscategorized in
-the original 14-witness census, not under-served by a gap at this call site.
+Findings: the task's own (a)/(b)/(c) decision tree turned out not to need a
+trace — `electOrderedGrouping` only ever runs when the statement/CTE HAS an
+`ORDER BY` of its own, and Q64's `cross_sales` CTE has none (verified by
+reading `query64.sql`), so the "does the CTE caller reach it" question is
+moot: it can't reach it regardless of caller wiring, there's no ORDER BY to
+adjudicate. PG's `Presorted Key: item.i_item_sk` / `GroupAggregate` inside
+the CTE is a DIFFERENT mechanism entirely — a plain-GROUP-BY (no ORDER BY
+anywhere) sorted-vs-hashed strategy election. goopg's equivalent,
+`addGroupingPaths`'s SORTED arm, always builds a full `Sort`
+(`sortPathForBounded`) and has NO Incremental-Sort-over-partial-prefix-seed
+offer at all, for any query — a genuinely un-audited gap, case (c). Filed as
+**M0141-S2b-8** (implementation, not recon — not selectable while banner item
+4 restricts to diagnosis-only). Tally correction applied: "Nested Loop x4" ->
+"Nested Loop x3 (Q4, Q11, Q35)" in both the design doc's Update-18c prose and
+fix_plan's task text (the historical producer-shape table itself, like
+Update-18b before it, is left as a historical snapshot with a prose
+correction rather than edited in place — matches 18b's own precedent).
 
-Next step: **M0141-S7-cd-q64-reclassify** (fix_plan.md, just filed) — confirm
-whether `electOrderedGrouping`'s scope already covers a CTE's own internal
-aggregate-strategy election, or whether that's an un-audited path; correct
-the "Nested Loop x4" tally to x3 (Q4/Q11/Q35) either way. After that (or if
-skipped), re-check the banner: M0141-S7's other open recon task,
-**M0141-S7-cd-candidatepool** (7-witness cost-gap investigation, unaffected
-by this loop's Q64 finding — Q64 was never one of its 7), is next in file
-order under item 4. If both close, item 3's leftover implementation tasks
-(M0141-S2a-fix1-sweep-a/b, M0141-S2b-6-resume, M0139-0007c) are NOT
-selectable while P0-E6 waits (recon-only restriction) — re-check whether
-M0143-0007b's owner-decision gate has been resolved, else fall to M-NIGHTLY.
+Next step: re-check the banner. M0141-S7's recon-only tasks (item 4) are now
+BOTH closed (cd-q64, cd-q64-reclassify) except **M0141-S7-cd-candidatepool**
+(still open, needs a live DPPATH trace — investigate whether
+`addIncrementalSortPaths` should also build over the same cheap seed
+`createOrderedPaths`'s arm 1/2 uses when it has a genuine partial-prefix
+match). That's the next selectable recon-only task under the P0-E6-wait
+fallback order, unless P0-E6 has been marked `[x]` by the owner by the next
+loop (re-check the banner's `[!]` marker first — if resolved, P0-E7 becomes
+selectable and takes priority over everything in items 2+).
 
-Gates run: `go build ./...` clean; `go vet ./internal/optimizer/` clean;
-`go test ./internal/optimizer/...` PASS (caught+fixed the `dppathLines`
-collision itself); `RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh`
-all PASS; `make ralph-state-guard` auto-repaired a stale completed-marker,
-clean after. No TPC-H dependency (TPC-DS-only recon). `:65437`/`:65438`
-verified untouched (`bench/tpcds/server.sh status` before/after); private
-`tmp/m0141s7cdq64/` cluster stopped and deleted before finishing.
+Gates run: `go build ./...` clean; `go vet ./internal/optimizer/` clean (no
+code changed, ran as a courtesy). `make ralph-state-guard` auto-repaired a
+stale `progress.json`/`status` mismatch (previous loop's clean-exit marker
+misread as project-completion), clean after. Pre-commit hook's pgbench smoke
+PASS (mandatory on every commit per AGENT.md, ran despite docs-only diff).
+No TPC-H/TPC-DS dependency — no server started, `:65437`/`:65438` untouched
+(never even checked status this loop since no cluster was needed).
 
 In-flight: none.
