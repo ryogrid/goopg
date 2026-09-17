@@ -4744,8 +4744,13 @@ afterExistsCheck:
 	// (:4076/:4176/:4200) are the same story — a constraint-backed UNIQUE
 	// index created by any of them also postdates the early sync, so
 	// tableHasUniqueConstraintIndex joins the same trigger.
+	//
+	// M0143-0003e: the named EXCLUDE constraint block above (:4042, both the
+	// btree-equality and stub-index arms) sets idx.IsExclusion after the same
+	// early sync — tableHasExclusionConstraintIndex joins the trigger too.
 	if (notNullHeapDirty || len(tbl.NamedChecks) > 0 ||
-		tableHasUniqueConstraintIndex(o.ctx, tbl, tableCatalogHeapDBOid(o.ctx))) &&
+		tableHasUniqueConstraintIndex(o.ctx, tbl, tableCatalogHeapDBOid(o.ctx)) ||
+		tableHasExclusionConstraintIndex(o.ctx, tbl, tableCatalogHeapDBOid(o.ctx))) &&
 		catalogHeapSyncAvailable(o.ctx) {
 		if err := o.ctx.MaterializeWriterXID(); err == nil {
 			xmax := o.ctx.Tx.XID
@@ -5671,8 +5676,13 @@ func (o *ddlOp) execCreatePartitionChild(s *parser.CreateTableStmt) error {
 	// before this same early sync and can produce a constraint-backed UNIQUE
 	// index (IsConstraint forwarded from the parent's own index), so
 	// tableHasUniqueConstraintIndex joins the same trigger.
+	//
+	// M0143-0003e: an EXCLUDE constraint cloned from the parent (IsExclusion
+	// forwarded the same way) is the identical story, so
+	// tableHasExclusionConstraintIndex joins the trigger too.
 	if (len(tbl.NamedChecks) > 0 || len(tbl.NotNullConstraints) > 0 ||
-		tableHasUniqueConstraintIndex(o.ctx, tbl, tableCatalogHeapDBOid(o.ctx))) &&
+		tableHasUniqueConstraintIndex(o.ctx, tbl, tableCatalogHeapDBOid(o.ctx)) ||
+		tableHasExclusionConstraintIndex(o.ctx, tbl, tableCatalogHeapDBOid(o.ctx))) &&
 		catalogHeapSyncAvailable(o.ctx) {
 		if err := o.ctx.MaterializeWriterXID(); err == nil {
 			xmax := o.ctx.Tx.XID
@@ -12877,6 +12887,12 @@ func (o *ddlOp) execAlterTableAddExclude(tbl *catalog.Table, act parser.AlterTab
 			idx.Deferrable = act.Deferrable
 			idx.InitiallyDeferred = act.InitiallyDeferred
 			applyExclusionPredicate(idx, act.ExclusionWhere)
+			// M0143-0003e: a durable pg_constraint row so IsExclusion (and
+			// ExclusionOp/Deferrable/InitiallyDeferred) survive a restart —
+			// see execAlterTableAddUnique's identical call.
+			if err := o.syncConstraintCatalogRow(tbl); err != nil {
+				return err
+			}
 		}
 	} else {
 		// Other exclusion operators: stub catalog entry; no enforcement in v0.
@@ -12892,6 +12908,13 @@ func (o *ddlOp) execAlterTableAddExclude(tbl *catalog.Table, act parser.AlterTab
 			ExclusionWhere:   act.ExclusionWhere,
 		}
 		if err := o.createExclusionIndexStub(act.Pos(), idxName, tbl, ec); err != nil {
+			return err
+		}
+		// M0143-0003e: createExclusionIndexStub's own sync
+		// (syncIndexToCatalogHeap) only writes pg_class/pg_index/pg_attribute
+		// for the index relation — the durable pg_constraint 'x' row needs
+		// the table-level funnel, same as the btree-equality branch above.
+		if err := o.syncConstraintCatalogRow(tbl); err != nil {
 			return err
 		}
 	}
@@ -18491,6 +18514,9 @@ func deleteCatalogRowsForOID(ctx *Context, dbOid uint32, relOID uint32, xmax sto
 	// M0143-0003c: stamp this relation's UNIQUE-constraint-backed index rows
 	// too (contype='u', conrelid=relOID), same reason.
 	stampUniqueConstraintRows(ctx, dbOid, relOID, xmax)
+	// M0143-0003e: stamp this relation's EXCLUDE-constraint-backed index rows
+	// too (contype='x', conrelid=relOID), same reason.
+	stampExclusionConstraintRows(ctx, dbOid, relOID, xmax)
 }
 
 // syncEnumTypeToCatalogHeap writes a single pg_type row for an enum type into
@@ -18905,6 +18931,21 @@ func tableHasUniqueConstraintIndex(ctx *Context, tbl *catalog.Table, dbOid uint3
 	return false
 }
 
+// tableHasExclusionConstraintIndex reports whether tbl carries at least one
+// EXCLUDE-constraint-backed index (M0143-0003e). Sibling of
+// tableHasUniqueConstraintIndex, gated on idx.IsExclusion alone — unlike
+// UNIQUE, the non-btree-equality EXCLUDE arm (createExclusionIndexStub) never
+// sets idx.IsConstraint, yet still needs a durable pg_constraint row (see
+// syncTableToCatalogHeap's EXCLUDE loop for why).
+func tableHasExclusionConstraintIndex(ctx *Context, tbl *catalog.Table, dbOid uint32) bool {
+	for _, idx := range ctx.Catalog.IndexesOnTable(tbl, dbOid) {
+		if idx != nil && idx.IsExclusion {
+			return true
+		}
+	}
+	return false
+}
+
 // syncTableToCatalogHeap writes one pg_class row and one pg_attribute row per
 // column for tbl. Called by execCreateTable after in-memory catalog is updated.
 //
@@ -19104,6 +19145,28 @@ func syncTableToCatalogHeap(ctx *Context, tbl *catalog.Table) error {
 		}
 		if err := writeUniqueConstraintRow(ctx, tbl, idx); err != nil {
 			return fmt.Errorf("pg_constraint unique %q: %w", idx.Name, err)
+		}
+	}
+
+	// M0143-0003e: EXCLUDE constraint persistence via real pg_constraint HEAP
+	// rows (contype='x', conindid=<index OID>), same funnel and stamp-old-
+	// then-rewrite-current contract as the UNIQUE loop directly above.
+	// Unlike UNIQUE, the gate is idx.IsExclusion alone (not idx.IsConstraint):
+	// the non-btree-equality EXCLUDE path (createExclusionIndexStub, e.g.
+	// `EXCLUDE USING gist (c WITH &&)`) never sets IsConstraint, yet real PG
+	// always creates a pg_constraint row for ANY EXCLUDE constraint — the
+	// synthesised view already emits it on that same OR condition
+	// (catalog.go's PGConstraintRowsForDBOid: `!idx.IsConstraint &&
+	// !idx.IsExclusion`). Before this, catalog.Index.IsExclusion was the ONLY
+	// signal and nothing reloaded it, so every EXCLUDE constraint silently
+	// stopped being ENFORCED (checkExclusionConstraintsForInsert gates on
+	// idx.IsExclusion) after a restart, not merely lost from pg_dump.
+	for _, idx := range ctx.Catalog.IndexesOnTable(tbl, heapDBOid) {
+		if idx == nil || !idx.IsExclusion || idx.Name == "" || idx.OID == 0 {
+			continue
+		}
+		if err := writeExclusionConstraintRow(ctx, tbl, idx); err != nil {
+			return fmt.Errorf("pg_constraint exclude %q: %w", idx.Name, err)
 		}
 	}
 

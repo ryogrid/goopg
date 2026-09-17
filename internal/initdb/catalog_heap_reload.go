@@ -942,6 +942,89 @@ func loadUniqueConstraintsFromHeapForDB(mgr *storage.Manager, cat *catalog.InMem
 	return nil
 }
 
+// loadExclusionConstraintsFromHeap restores catalog.Index.IsExclusion (and
+// ExclusionOp/Deferrable/InitiallyDeferred) from durable pg_constraint
+// contype='x' heap rows (M0143-0003e). Sibling of
+// loadUniqueConstraintsFromHeap — same conindid-keyed shape, mirroring
+// idx.IsConstraint's restoration with idx.IsExclusion. Before this,
+// catalog.Index.IsExclusion had no reload path at all, so every EXCLUDE
+// constraint (btree-equality or GiST-stub) silently reverted to looking like
+// a bare/no-op index after a restart — losing not just pg_constraint/pg_dump
+// visibility but runtime ENFORCEMENT (checkExclusionConstraintsForInsert and
+// deferred_exclusion.go both gate on idx.IsExclusion).
+func loadExclusionConstraintsFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *transam.CLog) error {
+	if cat == nil {
+		return nil
+	}
+	if err := loadExclusionConstraintsFromHeapForDB(mgr, cat, clog, catalog.DefaultDBOid); err != nil {
+		return err
+	}
+	for _, dbName := range cat.ListDatabases() {
+		dbOid := cat.DatabaseOid(dbName)
+		if dbOid == 0 || dbOid == catalog.DefaultDBOid ||
+			dbOid == catalog.PostgresDBOid || dbOid == cat.DBOID() {
+			continue
+		}
+		if err := loadExclusionConstraintsFromHeapForDB(mgr, cat, clog, dbOid); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// loadExclusionConstraintsFromHeapForDB is loadExclusionConstraintsFromHeap's
+// per-DB body. See pgConstraintTableRel's routing note (sys_pg_constraint.go)
+// for why a non-default-DB table's rows live ONLY in that database's own heap.
+func loadExclusionConstraintsFromHeapForDB(mgr *storage.Manager, cat *catalog.InMemory, clog *transam.CLog, heapDBOid uint32) error {
+	type exclRow struct {
+		conindid             uint32
+		exclusionOp          string
+		deferrable, deferred bool
+	}
+	rel := storage.RelFileNode{DBOid: heapDBOid, RelOid: 2606, Fork: storage.MainFork}
+	cols := executor.PGConstraintColumnsPG18()
+	rows, err := scanCatalogHeapRows(mgr, rel, clog, "pg_constraint",
+		func(ht storage.HeapTuple, tid storage.ItemPointer) (any, bool, error) {
+			natts := int(ht.Header.Infomask2 & storage.HeapNattsMask)
+			decoded := make(executor.Row, len(cols))
+			if derr := executor.DecodeRowIntoMctxPGTuple(decoded, cols, ht.Data, ht.Bitmap, natts, nil); derr != nil {
+				return nil, false, derr
+			}
+			// Only contype='x' rows with a real conindid — the field this
+			// loader exists to restore. writeExclusionConstraintRow always
+			// sets it; a zero would mean a malformed/foreign row.
+			if decoded[3].StringValue() != "x" || decoded[10].Int == 0 {
+				return nil, false, errSkipBuiltinRow
+			}
+			return exclRow{
+				conindid:    uint32(decoded[10].Int),
+				exclusionOp: decoded[27].StringValue(),
+				deferrable:  decoded[4].BoolValue(),
+				deferred:    decoded[5].BoolValue(),
+			}, false, nil
+		})
+	if err != nil {
+		return err
+	}
+	for _, r := range rows {
+		er := r.(exclRow)
+		idx, ok := cat.LookupIndexByOID(er.conindid, heapDBOid)
+		if !ok || idx == nil {
+			// Fall back to a cross-database scan — same defensive posture as
+			// loadUniqueConstraintsFromHeapForDB's identical fallback.
+			idx, _, ok = cat.LookupIndexByOIDAllDBs(er.conindid)
+			if !ok || idx == nil {
+				continue // index dropped since the row was written
+			}
+		}
+		idx.IsExclusion = true
+		idx.ExclusionOp = er.exclusionOp
+		idx.Deferrable = er.deferrable
+		idx.InitiallyDeferred = er.deferred
+	}
+	return nil
+}
+
 // rebuildAttrdefExpr turns a stored pg_attrdef.adbin back into a goopg
 // default-expression AST. M0123-S2 (sub-slice 2): adbin now comes in two forms,
 // discriminated by the first byte — a canonical PG18 pg_node_tree always opens

@@ -7307,7 +7307,7 @@ reported, and the values and unit gates are the bar.
     with `-count=1` both green and via the temporary-revert probe (red as
     predicted). No TPC-H data needed, consistent with the P0-E6-wait
     selection rule.
-- [ ] **M0143-0003e — EXCLUDE constraint `indisexclusion` durability.**
+- [x] **M0143-0003e — EXCLUDE constraint `indisexclusion` durability.**
   Parent: M0143-0003. Depends on: M0143-0003c `[x]` (done 2026-09-18) — reuse
   its landed shape directly: a `contype='x'` sibling of
   `buildPGConstraintRowForUnique`/`writeUniqueConstraintRow`/
@@ -7324,6 +7324,67 @@ reported, and the values and unit gates are the bar.
   reload — `Index.IsExclusion` is lost on every restart, taking `x`-contype
   `pg_constraint` rows and `deferred_exclusion.go`'s deferred-exclusion-check
   machinery with it for any EXCLUDE constraint surviving a restart.
+  - **Done 2026-09-18.** `buildPGConstraintRowForExclude`/
+    `writeExclusionConstraintRow`/`stampExclusionConstraintRows`
+    (`internal/executor/sys_pg_constraint.go`) mirror 0003c's UNIQUE shape
+    exactly (`contype='x'`, `conindid=idx.OID`), but the write-loop gate in
+    `syncTableToCatalogHeap` is `idx.IsExclusion` alone, not `idx.IsConstraint
+    && idx.Unique` — the non-btree-equality EXCLUDE path
+    (`createExclusionIndexStub`, e.g. `EXCLUDE USING gist (c WITH &&)`) sets
+    neither, yet real PG still creates a `pg_constraint` row for it (the
+    synthesised view already emits on this same OR condition,
+    `catalog.go:7242`). New `tableHasExclusionConstraintIndex` widens the
+    `execCreateTable`/`execCreatePartitionChild` resync-dirty triggers
+    alongside `tableHasUniqueConstraintIndex`; `execAlterTableAddExclude`
+    gained `syncConstraintCatalogRow` calls on BOTH branches (neither called
+    it before — the btree-equality branch had no durability call at all, and
+    the stub branch's own `createExclusionIndexStub` → `syncIndexToCatalogHeap`
+    writes pg_class/pg_index/pg_attribute for the index relation only, never
+    pg_constraint). Reload: `loadExclusionConstraintsFromHeap`/
+    `loadExclusionConstraintsFromHeapForDB`
+    (`internal/initdb/catalog_heap_reload.go`), wired in `open.go` right
+    after `loadUniqueConstraintsFromHeap`. Unlike 0003c, restoring the flag
+    alone would not be enough for enforcement to survive: `idx.ExclusionOp`
+    ("=" or "&&") gates `checkExclusionConstraintsForInsert`'s switch
+    (`operators_storage.go:8808`, no default arm), so an empty `ExclusionOp`
+    post-reload would silently disable the check even with `IsExclusion=true`
+    restored. `ExclusionOp` has no natural `pg_constraint` column (`conexclop`
+    is a real `oid[]` goopg does not resolve operators into), so it rides the
+    otherwise-NULL `conbin` column as raw text — the same smuggling
+    convention `sys_pg_constraint.go`'s header comment already documents for
+    CHECK/domain `adbin`; real PG never reads `conbin` for an `x` row. Test:
+    `TestDatabaseDDLReloadAcrossRestart` extended with `gauge` gaining a
+    `zone int4` column and `CONSTRAINT gauge_zone_excl EXCLUDE USING btree
+    (zone WITH =)`. Verified live: temporarily no-op'd
+    `loadExclusionConstraintsFromHeap` in `open.go`, re-ran — failed with
+    BOTH predicted symptoms at once (empty `pg_constraint` row AND a
+    duplicate-key INSERT that should raise `23P01` succeeding silently),
+    restored, re-ran green. Gates: `go build ./...` clean; `go vet` (targeted
+    packages) clean; `go test ./internal/catalog/... ./internal/postmaster/...
+    ./internal/executor/... ./internal/initdb/...` all PASS (one
+    `TestSimpleQueryBatchAbortUndoesEarlierCreateTable` failure under
+    full-package run, reproduced as flaky — passes solo and passes on a
+    second full-package run, unrelated real-TCP-socket timing test, not this
+    change); `RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh`
+    full green; `FORCE=1 scripts/tpcds-sf025-regression.sh sweep` PASS=96
+    MISMATCH=0 ERROR=0 TIMEOUT=0, plan-shapes 99/99 identical, gate-stamp PASS
+    against the staged tree; `tpch-spotcheck.sh` SKIP-BLOCKED (expected —
+    `:65433` still under the P0-E6 evidence hold), gate stamp refreshed
+    against the staged tree, commit accepted via the documented
+    `ledger:`/SKIP-BLOCKED exception (P0-E7 is the re-run owner);
+    `make ralph-state-guard` clean (auto-repaired a stale `status`/`progress`
+    mismatch from the previous loop's exit, unrelated to this change).
+    Residual found while auditing every DROP-CONSTRAINT call site for where
+    the new sync calls belonged: the UNIQUE/EXCLUDE branches of
+    `execAlterTableDropConstraint` never remove the dropped index's own
+    `pg_class`/`pg_index` heap rows, so it should resurrect after a restart —
+    out of scope here (indexes that should NOT survive a restart, not
+    indexes that should). **Not filed as a new fix_plan task**:
+    `scripts/ralph-lineage-guard.py` rejected the commit with a new
+    M0143-0003g descendant, since M0143-0003's last 5 completed descendants
+    (0003a-e) all carry `Movement: none` and the lineage budget is exhausted
+    — recorded ledger-only (`.ralph/deferral_ledger.md`, 2026-09-18
+    M0143-0003e row) per the guard's own remedy instead of a fix_plan item.
 - [ ] **M0143-0003f — `poc.UniqueColumns`/`LIKE ... INCLUDING INDEXES` never
   set `IsConstraint` (live bug, not restart-related).**
   Parent: M0143-0003. Filed 2026-09-18, discovered while researching

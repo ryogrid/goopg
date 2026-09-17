@@ -229,8 +229,13 @@ func TestDatabaseDDLReloadAcrossRestart(t *testing.T) {
 	// ONLY thing distinguishing "ADD CONSTRAINT ... UNIQUE" from a bare
 	// unique index — was never persisted or reloaded, so the constraint
 	// silently reverted to looking like a bare index after every restart.
+	// M0143-0003e: a named btree-equality EXCLUDE constraint. Unlike UNIQUE,
+	// catalog.Index.IsExclusion had NO reload path at all before this fix —
+	// so restoring it wrong would not just mislabel the index (like the
+	// UNIQUE gap did), it would leave checkExclusionConstraintsForInsert with
+	// nothing to gate on, silently disabling enforcement entirely.
 	runChainDDLDurable(t, rt1, s1, "r1",
-		"CREATE TABLE gauge (id int4 PRIMARY KEY, level int4 CONSTRAINT gauge_level_check CHECK (level >= 0), code text CONSTRAINT gauge_code_not_null NOT NULL, tag text CONSTRAINT gauge_tag_unique UNIQUE)")
+		"CREATE TABLE gauge (id int4 PRIMARY KEY, level int4 CONSTRAINT gauge_level_check CHECK (level >= 0), code text CONSTRAINT gauge_code_not_null NOT NULL, tag text CONSTRAINT gauge_tag_unique UNIQUE, zone int4, CONSTRAINT gauge_zone_excl EXCLUDE USING btree (zone WITH =))")
 
 	if err := rt1.SaveCatalog(); err != nil {
 		t.Fatalf("SaveCatalog: %v", err)
@@ -369,6 +374,24 @@ func TestDatabaseDDLReloadAcrossRestart(t *testing.T) {
 	queryUnderDBReloadDurable(t, rt2, s2, "r1", "INSERT INTO gauge (id, level, code, tag) VALUES (4, 1, 'ok', 'dup')")
 	if _, err := queryUnderDBReload(t, rt2, s2, "r1", "INSERT INTO gauge (id, level, code, tag) VALUES (5, 1, 'ok', 'dup')"); err == nil {
 		t.Error("db r1 post-restart: INSERT violating gauge_tag_uniq2 unexpectedly succeeded — UNIQUE enforcement did not survive the restart")
+	}
+
+	// M0143-0003e: the EXCLUDE constraint row itself, then actual runtime
+	// enforcement — checkExclusionConstraintsForInsert gates on
+	// idx.IsExclusion/idx.ExclusionOp, neither of which reloaded before this
+	// fix, so a pre-fix restart left the row AND the check both silently gone
+	// (not merely mislabeled, unlike the UNIQUE case above).
+	rowsR1Excl, err := queryUnderDBReload(t, rt2, s2, "r1",
+		"SELECT conname FROM pg_constraint WHERE contype = 'x' AND conrelid = 'gauge'::regclass")
+	if err != nil {
+		t.Fatalf("db r1 post-restart: SELECT pg_constraint contype=x: %v", err)
+	}
+	if len(rowsR1Excl) != 1 || string(rowsR1Excl[0][0].Buf) != "gauge_zone_excl" {
+		t.Errorf("db r1 post-restart: pg_constraint EXCLUDE rows = %v, want exactly [gauge_zone_excl]", rowsR1Excl)
+	}
+	queryUnderDBReloadDurable(t, rt2, s2, "r1", "INSERT INTO gauge (id, level, code, zone) VALUES (10, 1, 'ok', 7)")
+	if _, err := queryUnderDBReload(t, rt2, s2, "r1", "INSERT INTO gauge (id, level, code, zone) VALUES (11, 1, 'ok', 7)"); err == nil {
+		t.Error("db r1 post-restart: INSERT violating gauge_zone_excl unexpectedly succeeded — EXCLUDE enforcement did not survive the restart")
 	}
 
 	// Namespace isolation must also survive reload: a table created in one

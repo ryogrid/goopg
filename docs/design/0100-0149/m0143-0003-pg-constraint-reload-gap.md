@@ -1,9 +1,15 @@
-Status: in-progress — M0143-0003a (PRIMARY KEY `IsConstraint` restoration),
-M0143-0003b (CHECK constraint write+reload), M0143-0003d (NOT NULL
-named-metadata write+reload), and M0143-0003c (UNIQUE non-PK
-constraint-backed index `IsConstraint` write+reload) landed 2026-09-17/18;
-M0143-0003e (EXCLUDE `indisexclusion`) remains as the last follow-up, not yet
-started.
+Status: all four reload gaps closed — M0143-0003a (PRIMARY KEY `IsConstraint`
+restoration), M0143-0003b (CHECK constraint write+reload), M0143-0003d (NOT
+NULL named-metadata write+reload), M0143-0003c (UNIQUE non-PK
+constraint-backed index `IsConstraint` write+reload), and M0143-0003e
+(EXCLUDE `indisexclusion`/`ExclusionOp` write+reload) all landed
+2026-09-17/18. A DROP-CONSTRAINT-side residual discovered while landing 0003e
+(the index-backed constraint's own `pg_class`/`pg_index` heap rows are never
+removed, so the dropped index should resurrect after a restart) is recorded
+ledger-only, not as a new fix_plan task — `scripts/ralph-lineage-guard.py`
+rejected a new M0143-0003 descendant since the last 5 completed descendants
+(0003a-e) all carry `Movement: none`, exhausting the lineage budget. See
+`.ralph/deferral_ledger.md` (2026-09-18, M0143-0003e row).
 Date: 2026-09-17
 Supersedes: none
 
@@ -27,7 +33,7 @@ separate reload gap; there is no single root cause.
 | `c` (CHECK, table-level) | `catalog.Table.CheckConstraints`/`NamedChecks` | **fixed** — M0143-0003b (`writeCheckConstraintRow` / `loadCheckConstraintsFromHeapForDB`) |
 | `n` (NOT NULL, PG18 named) | `catalog.Table.NotNullConstraints` | **fixed** — M0143-0003d (`writeNotNullConstraintRow` / `loadNotNullConstraintsFromHeapForDB`; enforcement itself always survived via `pg_attribute.attnotnull`/`Column.NotNull` — only the named-constraint metadata was lost) |
 | `p`/`u` (PRIMARY KEY / UNIQUE, index-backed) | `catalog.Index.IsConstraint` (`catalog.go:2060`) | **fixed** — `p` via M0143-0003a (indisprimary already durable, no new state); `u` via M0143-0003c (`writeUniqueConstraintRow` / `loadUniqueConstraintsFromHeapForDB`, new `contype='u'` heap row keyed by `conindid`) |
-| `x` (EXCLUDE) | `catalog.Index.IsExclusion` | **never restored** — M0143-0003e |
+| `x` (EXCLUDE) | `catalog.Index.IsExclusion`/`ExclusionOp` | **fixed** — M0143-0003e (`writeExclusionConstraintRow` / `loadExclusionConstraintsFromHeapForDB`, new `contype='x'` heap row keyed by `conindid`, `ExclusionOp` smuggled through `conbin`) |
 
 Confirmed by exhaustive grep, not inference: `grep -in
 "checkconstraints\|namedchecks" internal/initdb/*.go` and `grep -in
@@ -257,28 +263,78 @@ directly rather than a new wrapper:
   — failed with the predicted symptom (`pg_constraint NOT NULL rows = []`),
   restored, re-ran green.
 
-## M0143-0003e — EXCLUDE constraint `indisexclusion` durability
+## M0143-0003e — EXCLUDE constraint `indisexclusion`/`ExclusionOp` durability (landed 2026-09-18)
 
-**Not started.** `indisexclusion` is a declared `pg_index` heap column
-(`internal/initdb/initdb.go:4766`) but is never written by the real
+`indisexclusion` is a declared `pg_index` heap column
+(`internal/initdb/initdb.go:4766`) but was never written by the real
 index-creation path (confirmed by grep: zero non-comment hits for
 `indisexclusion`/`IndIsExclusion` outside catalog schema declarations and the
 unrelated `pg18_user_catalog_rows.go:1460` hardcoded-false synthetic row) and
-never decoded on reload, so `Index.IsExclusion` is lost on every restart —
-`x`-contype `pg_constraint` rows and `deferred_exclusion.go`'s
-deferred-exclusion-check machinery both silently stop working for any EXCLUDE
-constraint surviving a restart. 0003c's landed shape (a `pg_constraint` heap
-row keyed by `conindid`, reusing the same funnel) generalizes directly:
-EXCLUDE already sets `idx.IsConstraint = true` alongside `IsExclusion` for its
-btree-equality special case (`execAlterTableAddExclude`,
-`operators_ddl.go:12846`/`:4238`), so the natural fix is a `contype='x'`
-sibling of `buildPGConstraintRowForUnique` that also stamps
-`idx.IsExclusion = true` on reload — not a new `pg_index` bit after all, now
-that 0003c has proven the `pg_constraint`-row approach out.
+never decoded on reload, so `Index.IsExclusion` was lost on every restart —
+`x`-contype `pg_constraint` rows AND `deferred_exclusion.go`'s
+deferred-exclusion-check machinery both silently stopped working for any
+EXCLUDE constraint surviving a restart, exactly as this doc originally
+predicted.
+
+Fix, reusing 0003c's exact `conindid`-keyed `pg_constraint` shape:
+`buildPGConstraintRowForExclude`/`writeExclusionConstraintRow`/
+`stampExclusionConstraintRows` (`internal/executor/sys_pg_constraint.go`,
+`contype='x'`) and `loadExclusionConstraintsFromHeap`/
+`loadExclusionConstraintsFromHeapForDB` (`internal/initdb/catalog_heap_reload.go`),
+wired in `open.go` right after the UNIQUE reload. One deviation from 0003c's
+UNIQUE shape, forced by a difference this doc did not anticipate: the write
+loop's gate is `idx.IsExclusion` **alone**, not `idx.IsConstraint &&
+idx.Unique` — the non-btree-equality EXCLUDE path
+(`createExclusionIndexStub`, e.g. `EXCLUDE USING gist (c WITH &&)`) sets
+neither `IsConstraint` nor `Unique`, yet real PG always creates a
+`pg_constraint` row for any EXCLUDE constraint (the synthesised view already
+emits on this same OR condition, `catalog.go:7242`).
+
+The other deviation: restoring `idx.IsExclusion` alone is not enough for
+*enforcement* to survive, only for the row/metadata to. `idx.ExclusionOp`
+("=" or "&&") gates `checkExclusionConstraintsForInsert`'s switch
+(`operators_storage.go:8808`), which has no default arm — an empty
+`ExclusionOp` after reload would silently disable the check for every
+EXCLUDE constraint, a regression hiding behind a metadata-only-looking fix.
+`ExclusionOp` has no natural PG column (`conexclop` is a real `oid[]` of
+operator OIDs, which goopg does not resolve), so it rides the otherwise-NULL
+`conbin` column as raw text — the same "smuggle a string through a
+nominally-structured column" convention this file's header comment already
+documents for CHECK/domain `adbin`. Real PG never reads `conbin` for an `x`
+row (`pg_get_constraintdef` decompiles `conkey`+`conexclop` instead), so the
+column is safe to repurpose.
+
+Verified live: temporarily no-op'd `loadExclusionConstraintsFromHeap` in
+`open.go`, re-ran `TestDatabaseDDLReloadAcrossRestart` (extended with a
+`CONSTRAINT gauge_zone_excl EXCLUDE USING btree (zone WITH =)` column) —
+failed with both predicted symptoms at once (empty `pg_constraint` row AND a
+duplicate-key INSERT that should have raised `23P01` succeeding silently),
+restored, re-ran green.
+
+**Residual found, not fixed here (ledger-only — see below):** auditing every
+`ALTER TABLE ... DROP CONSTRAINT` branch to place the new sync/trigger calls
+found that the UNIQUE and EXCLUDE branches of `execAlterTableDropConstraint`
+unregister the backing index from the in-memory catalog only
+(`im.DropUniqueConstraint`/`im.DropExclusionConstraint`, pure map removal)
+and never call `syncConstraintCatalogRow` or remove the index's own
+`pg_class`/`pg_index` heap rows — unlike the CHECK and FK branches
+immediately above them, which do. Since `DROP INDEX` itself refuses to touch
+a constraint-backed index (`2BP01`), `DROP CONSTRAINT` is the only removal
+path there is, and it leaves the dropped index's heap rows live — the whole
+index, not just its constraint metadata, should resurrect after a restart.
+Pre-existing (since at least M0143-0002b), not introduced by 0003e, and not
+live-reproduced this loop. Recorded ledger-only, not as a new fix_plan
+task — `scripts/ralph-lineage-guard.py` rejected a new M0143-0003 descendant
+since the last 5 completed descendants (0003a-e) all carry `Movement: none`,
+exhausting the lineage budget; the resume point lives in
+`.ralph/deferral_ledger.md` (2026-09-18, M0143-0003e row) instead.
 
 ## Sequencing
 
-0003a (done) → 0003b (CHECK, highest severity, no dependency) → 0003d (NOT
-NULL, reuses 0003b's wrapper pattern) → 0003c (done, UNIQUE via
-`pg_constraint.conindid`) → 0003e (EXCLUDE, reuses 0003c's exact shape with
-contype='x').
+0003a (done) → 0003b (done, CHECK) → 0003d (done, NOT NULL) → 0003c (done,
+UNIQUE via `pg_constraint.conindid`) → 0003e (done, EXCLUDE via the same
+shape plus `ExclusionOp`-through-`conbin`). All four contypes now survive a
+restart with both correct `pg_constraint` visibility and correct runtime
+enforcement. Follow-up (ledger-only, not a fix_plan task — see above): the
+DROP CONSTRAINT heap-residual for index-backed constraints, found while
+landing 0003e.

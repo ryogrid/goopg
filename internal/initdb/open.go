@@ -1738,6 +1738,19 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		_ = mgr.Close()
 		return nil, fmt.Errorf("goopg: pg_constraint UNIQUE reload: %w", err)
 	}
+	// M0143-0003e: restore catalog.Index.IsExclusion (and ExclusionOp/
+	// Deferrable/InitiallyDeferred) for EXCLUDE-constraint-backed indexes from
+	// the pg_constraint HEAP written by writeExclusionConstraintRow. Same
+	// shape as the UNIQUE reload directly above — see
+	// loadExclusionConstraintsFromHeap's doc comment for why the flag being
+	// lost silently disabled runtime exclusion-check enforcement, not just
+	// pg_dump visibility.
+	if err := loadExclusionConstraintsFromHeap(mgr, cat, clog); err != nil {
+		_ = pool.Close()
+		_ = walWriter.Close()
+		_ = mgr.Close()
+		return nil, fmt.Errorf("goopg: pg_constraint EXCLUDE reload: %w", err)
+	}
 
 	// B5 Slice C: view / materialized-view query persistence from the pg_rewrite
 	// HEAP _RETURN rules (base/<dbOid>/2618) written by writeViewRewriteRow,

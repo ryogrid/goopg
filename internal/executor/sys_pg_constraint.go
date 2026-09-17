@@ -432,6 +432,118 @@ func buildPGConstraintRowForUnique(tbl *catalog.Table, idx *catalog.Index) (Row,
 	}, nil
 }
 
+// buildPGConstraintRowForExclude builds the contype='x' pg_constraint row for
+// one EXCLUDE-constraint-backed index (M0143-0003e). Sibling of
+// buildPGConstraintRowForUnique — same conindid-keyed identity (the
+// constraint object IS the index) and the same field values otherwise
+// (synthesised view's contype='u'/'p'/'x' block), with two differences:
+//
+//   - conbin carries idx.ExclusionOp ("=" or "&&") as raw text, the same
+//     smuggling convention this file's header comment documents for
+//     CHECK/domain adbin — real PG never populates conbin for an EXCLUDE
+//     constraint (pg_get_constraintdef decompiles conkey+conexclop instead),
+//     so the column is otherwise unused and safe to repurpose. Without this,
+//     reload would restore idx.IsExclusion but leave idx.ExclusionOp empty,
+//     which checkExclusionConstraintsForInsert's switch (no default case)
+//     silently treats as "no enforcement" — restoring the metadata but not
+//     the runtime check, worse than an obviously-missing feature.
+//   - the gate for which indexes get a row is idx.IsExclusion alone, not
+//     idx.Unique && idx.IsConstraint: the non-btree-equality EXCLUDE path
+//     (createExclusionIndexStub) never sets IsConstraint or Unique, yet real
+//     PG always creates a pg_constraint row for any EXCLUDE constraint (see
+//     the call site in syncTableToCatalogHeap for the full reasoning).
+func buildPGConstraintRowForExclude(tbl *catalog.Table, idx *catalog.Index) (Row, error) {
+	conkeyDatum := NullDatum
+	if len(idx.Columns) > 0 {
+		attnums := make([]int16, 0, len(idx.Columns))
+		resolved := true
+		for _, colName := range idx.Columns {
+			if colName == "" { // expression key column — no attnum to record
+				resolved = false
+				break
+			}
+			ord, found := int16(0), false
+			for i, col := range tbl.Columns {
+				if strings.EqualFold(col.Name, colName) {
+					ord = int16(i + 1)
+					found = true
+					break
+				}
+			}
+			if !found {
+				resolved = false
+				break
+			}
+			attnums = append(attnums, ord)
+		}
+		if resolved {
+			var err error
+			conkeyDatum, err = int2ArrayDatum(attnums)
+			if err != nil {
+				return nil, err
+			}
+		}
+	}
+	return Row{
+		NewIntDatum(int64(idx.OID)),                    // 1  oid
+		NewStringDatum(idx.Name),                       // 2  conname
+		NewIntDatum(int64(catalog.PublicNamespaceOID)), // 3  connamespace
+		NewStringDatum("x"),                            // 4  contype
+		NewBoolDatum(idx.Deferrable),                   // 5  condeferrable
+		NewBoolDatum(idx.InitiallyDeferred),            // 6  condeferred
+		NewBoolDatum(true),                             // 7  conenforced
+		NewBoolDatum(true),                             // 8  convalidated
+		NewIntDatum(int64(tbl.OID)),                    // 9  conrelid
+		NewIntDatum(0),                                 // 10 contypid (not a domain constraint)
+		NewIntDatum(int64(idx.OID)),                    // 11 conindid — the durable EXCLUDE-constraint signal
+		NewIntDatum(0),                                 // 12 conparentid
+		NewIntDatum(0),                                 // 13 confrelid
+		NewStringDatum(""),                             // 14 confupdtype (zero char, non-FK)
+		NewStringDatum(""),                             // 15 confdeltype
+		NewStringDatum(""),                             // 16 confmatchtype
+		NewBoolDatum(true),                             // 17 conislocal
+		NewIntDatum(0),                                 // 18 coninhcount
+		NewBoolDatum(false),                            // 19 connoinherit
+		NewBoolDatum(false),                            // 20 conperiod
+		conkeyDatum,                                    // 21 conkey — the constraint's key columns
+		NullDatum,                                      // 22 confkey
+		NullDatum,                                      // 23 conpfeqop
+		NullDatum,                                      // 24 conppeqop
+		NullDatum,                                      // 25 conffeqop
+		NullDatum,                                      // 26 confdelsetcols
+		NullDatum,                                      // 27 conexclop — see note above (not oid[]-encoded)
+		NewStringDatum(idx.ExclusionOp),                // 28 conbin — repurposed to carry ExclusionOp text
+	}, nil
+}
+
+// writeExclusionConstraintRow journals one EXCLUDE-constraint-backed index as
+// a pg_constraint heap INSERT into the TABLE's database (same per-DB routing
+// as writeUniqueConstraintRow, M0143-0003e).
+func writeExclusionConstraintRow(ctx *Context, tbl *catalog.Table, idx *catalog.Index) error {
+	row, err := buildPGConstraintRowForExclude(tbl, idx)
+	if err != nil {
+		return err
+	}
+	_, err = writeHeapRowCanonical(ctx, pgConstraintTableRel(ctx), PGConstraintColumnsPG18(), row)
+	return err
+}
+
+// stampExclusionConstraintRows stamps xmax on every contype='x' TABLE-level
+// row (conrelid=relOID) in the given database's pg_constraint heap. Mirrors
+// stampUniqueConstraintRows exactly (M0143-0003e).
+func stampExclusionConstraintRows(ctx *Context, dbOid, relOID uint32, xmax storage.TransactionID) {
+	rel := storage.RelFileNode{DBOid: dbOid, RelOid: pgConstraintRelOID, Fork: storage.MainFork}
+	cols := PGConstraintColumnsPG18()
+	stampCatalogRowsTuple(ctx, rel, xmax, func(ht storage.HeapTuple) bool {
+		natts := int(ht.Header.Infomask2 & storage.HeapNattsMask)
+		decoded := make(Row, len(cols))
+		if err := DecodeRowIntoMctxPGTuple(decoded, cols, ht.Data, ht.Bitmap, natts, nil); err != nil {
+			return false
+		}
+		return decoded[3].StringValue() == "x" && uint32(decoded[8].Int) == relOID
+	})
+}
+
 // writeUniqueConstraintRow journals one UNIQUE-constraint-backed index as a
 // pg_constraint heap INSERT into the TABLE's database (same per-DB routing as
 // writeCheckConstraintRow/writeNotNullConstraintRow, M0143-0003c).
