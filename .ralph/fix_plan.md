@@ -6732,7 +6732,7 @@ reported, and the values and unit gates are the bar.
     as its resume point. Ledger: 1 new row (`.ralph/deferral_ledger.md`).
     Gates: none run (no code changed — investigation-only loop, mirrors the
     M0143-0001 scoping loop's precedent).
-- [ ] **M0143-0002d — user-defined type catalog-heap storage
+- [x] **M0143-0002d — user-defined type catalog-heap storage
   (pg_type/pg_class/pg_attribute for enum/domain/composite/range types) is a
   single un-partitioned store shared by every database, unlike pg_constraint.**
   Parent: M0143-0002c. Filed 2026-09-17 from M0143-0002c's re-identification
@@ -6812,6 +6812,73 @@ reported, and the values and unit gates are the bar.
   shows only its own type's shape after the fix. Needs a design note
   (non-trivial, cross-cutting reload-adjacent change) per AGENT.md's
   Plan-parity harness D3.
+  - **Done 2026-09-17 (design-first, per this task's own filing
+    instruction — no production diff).** Design doc:
+    `docs/design/0100-0149/m0143-0002d-per-database-type-catalog.md`
+    (indexed in `docs/design/README.md`). Confirms both root causes with
+    file:line citations and, live-checked this loop, **refutes the
+    "materially bigger... provisioning" fear the original filing carried**:
+    every database already gets its own physical `base/<dbOid>/1247`/`1249`
+    heap file at `CREATE DATABASE` time (`copyBootstrapCatalogImage`,
+    `internal/initdb/initdb.go:426-473`, copies template0's whole catalog
+    image) — the remaining gap is in-memory registration/routing only, not
+    disk layout. Also explains, newly, why ordinary tables don't share the
+    bug despite `pg_class` being an equally-global singleton `catalog.Table`:
+    `pg_class` output is virtual (per-database-filtered already), while
+    `pg_type`/`pg_attribute` are real heap-backed relations reached by an
+    actual `SeqScan` through the buggy `RelFileNode` resolution. Fix shape
+    mirrors the identical problem already solved for indexes
+    (`RegisterIndexDuringRecoveryForDB`), decomposed below into two
+    loop-sized tasks (read-side registration must land before the write-side
+    hardcode fix — reversed order would make a distinct-dbOid connection's
+    own new type invisible to itself, worse than today's union bug). No
+    ledger row: recon/design only, no production diff; the two child tasks
+    below own the actual fix and their own deferral bookkeeping if either
+    lands partially.
+- [ ] **M0143-0002e — per-database `catalog.Table` registration for
+  `pg_type`/`pg_attribute` (read side of M0143-0002d).**
+  Parent: M0143-0002d. Filed 2026-09-17 from M0143-0002d's design doc, fix-shape steps 1-3. Add a
+  `catalog.InMemory` method that registers a `Table` for a system relation
+  (pg_type/pg_attribute shape) into `c.ns(dbOid)` with `Table.DBOid = dbOid`
+  set (mirrors `RegisterIndexDuringRecoveryForDB`,
+  `internal/catalog/catalog.go:6584-6698`); wire it into (a) a startup reload
+  loop over `cat.ListDatabases()` right after `loadSystemCatalogsIfPresent`'s
+  existing `DefaultDBOid` call (`internal/initdb/open.go:1376`), mirroring
+  the index precedent's loop at `open.go:3576-3585` (skip
+  DefaultDBOid/PostgresDBOid/`cat.DBOID()`, check `heapFilePresent` on
+  `base/<dbOid>/1247|1249` before registering); and (b) `CREATE DATABASE`
+  time, next to `copyTemplateTables`'s existing
+  `im.TryRegisterUserTable(newTbl, newOid)` call
+  (`internal/postmaster/database_ddl.go:995`) — registration-only, the
+  physical files already exist from `copyBootstrapCatalogImage`. **No
+  observable SQL behavior change yet** (write side still hardcodes
+  DefaultDBOid until M0143-0002f) — gate is a new unit test confirming
+  `pg_type`/`pg_attribute` `RelFileNode` resolution differs per
+  `ctx.CurrentDatabaseOid` after this lands, plus the full existing
+  unit/regress suite staying green (the DefaultDBOid path is every existing
+  test and must be byte-identical).
+- [ ] **M0143-0002f — route type-catalog heap writes through
+  `tableCatalogHeapDBOid(ctx)` (write side of M0143-0002d).**
+  Parent: M0143-0002d. Depends on M0143-0002e `[x]`. Filed 2026-09-17 from
+  M0143-0002d's design doc, fix-shape step 4. Change
+  `writeTypeHeapRowWithIndexes`
+  (`internal/executor/operators_ddl.go:18447-18458`),
+  `updateTypeHeapRowWithIndexes` (`:18483-18504`),
+  `syncCompositeTypeToCatalogHeap`'s `classRel`/`attrRel` pair
+  (`:18539-18543`/`:18555-18559`), and the M0143-0002c delete-side sites
+  (`execAlterType` `:25242`/`:25282`/`:25325`/`:25372`,
+  `execAlterTypeAttrCmds` `:25617`, `execDropType`'s composite/enum/range
+  branches `~:25644-25689`) from the `catalog.DefaultDBOid` literal to
+  `tableCatalogHeapDBOid(ctx)` (`:18697-18699`, already
+  `catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)`) — **all sites in the same
+  commit**, per the design doc's sequencing note (a partial change is worse
+  than today's uniform bug). Test: mirror
+  `internal/postmaster/database_ddl_reload_test.go`'s
+  `TestDatabaseDDLReloadAcrossRestart` shape — two databases each declare a
+  same-named enum/domain/composite/range type, restart, confirm each
+  database's `pg_type`/`pg_attribute`/`pg_dump` output shows only its own
+  type's shape (the M0143-0002c repro, now also across a restart, not just
+  live-session).
 - [ ] **M0143-0003 — `pg_constraint` returns 0 rows of any contype after a restart** —
   including the `'p'`/`'u'` rows synthesised from indexes that demonstrably survive. A
   second, independent reload gap that R126 explicitly did not touch.
