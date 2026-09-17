@@ -6573,7 +6573,7 @@ reported, and the values and unit gates are the bar.
     `tpch-spotcheck`/`tpch-acceptance-arm` still SKIP-BLOCKED by the
     `:65433` hold (same accepted G6 exception, P0-E7 remains the re-run
     owner).
-- [ ] **M0143-0002c — re-identify the "six `deleteCatalogRowsForOID` sites"
+- [x] **M0143-0002c — re-identify the "six `deleteCatalogRowsForOID` sites"
   M0143-0002's original text named.**
   Parent: M0143-0002b. Filed 2026-09-17
   when M0143-0002b closed without resolving this forward-reference (it was
@@ -6591,6 +6591,124 @@ reported, and the values and unit gates are the bar.
   fixed), and check `git log`/blame around the M0143-0002 filing date
   (2026-09-14, `METHODOLOGY3/04-forward-plan.md` §3) for the original
   six-sites claim's source context.
+  - **Done 2026-09-17 (investigation only, no code changed — see
+    M0143-0002d for the fix).** The original claim's source is
+    `docs/design/not_ralph/plan_parity_fix_take2/METHODOLOGY3/02-open-problems.md`
+    §N11 (via `r126-fk-persistence/SCOPE.md:155-160`, `REPORT.md:273-276`,
+    `TODO.md:5812-5817`) — "N11: Six `deleteCatalogRowsForOID` call sites
+    hardcode `catalog.DefaultDBOid` ... at :24974/:25014/:25057/:25104/
+    :25349/:25401 [historical line numbers from R126's era] instead of
+    looping `tableCatalogDBOids`." Re-grepping at HEAD (`operators_ddl.go`
+    has grown to 27,475 lines) finds exactly six live matches for
+    `deleteCatalogRowsForOID(.*catalog\.DefaultDBOid` — confirmed as the
+    composite-type re-sync branches of `execAlterType` (four
+    single-subcommand forms: ADD/RENAME/DROP/ALTER ATTRIBUTE, `:25242`,
+    `:25282`, `:25325`, `:25372`), `execAlterTypeAttrCmds`'s combined form
+    (`:25617`), and `execDropType`'s composite branch (`:25669`). These are
+    genuinely distinct from the M0143-0002/-0002b hardcode (which was
+    `c.ns(DefaultDBOid)` inside `catalog.InMemory`'s table/index registries)
+    — this one is a `storage.RelFileNode{DBOid: catalog.DefaultDBOid, ...}`
+    literal picking which database's *physical heap file* to xmax-stamp.
+    **The re-identification surfaced something much bigger than "these six
+    call sites are wrong in isolation":** their sibling *write* paths —
+    `writeTypeHeapRowWithIndexes` (`:18447-18458`, the pg_type row writer
+    shared by every `CREATE TYPE` of any kind — enum/domain/composite/range)
+    and `syncCompositeTypeToCatalogHeap`'s `classRel`/`attrRel`
+    (`:18539-18544`/`:18555-18561`, the composite's implicit pg_class/
+    pg_attribute row writer) — hardcode the exact same `catalog.DefaultDBOid`
+    literal. So the six ALTER/DROP delete sites are *consistent* with
+    CREATE, not independently broken: every user-declared type's physical
+    catalog-heap row, in every database, has always landed in the shared
+    DEFAULT database's pg_type/pg_class/pg_attribute heap files. **Live-
+    confirmed the consequence on a throwaway 55xx cluster** (test written,
+    run, and DELETED after confirming — not committed, since this loop
+    lands no fix): `CREATE TYPE samename AS (a int)` in the default
+    database, then `CREATE DATABASE r; \c r; CREATE TYPE samename AS (x
+    text, y text)` — the second CREATE TYPE succeeds with **no name-
+    collision error** (PG would reject neither, since composite types are
+    correctly scoped per-database in the in-memory registry — `compositeKey`
+    folds in dbOid — so no error is actually wrong here), but
+    `SELECT a.attname FROM pg_attribute a JOIN pg_type t ON
+    t.typrelid=a.attrelid WHERE t.typname='samename'` run from **either**
+    database returns the **union** `[a, x, y]` instead of each database's
+    own `[a]` / `[x, y]` — genuine cross-database catalog corruption visible
+    to plain SQL (pg_dump, `\d`, information_schema all ride this same
+    path). Contrast: `pg_constraint` already has the correct pattern for
+    this class of problem — `pgConstraintTableRel`
+    (`sys_pg_constraint.go:133`) resolves via `tableCatalogHeapDBOid(ctx)`,
+    and even the TYPE-catalog's own **index** inserts already route
+    correctly the same way (`insertCanonicalSysBtreeLeaf`,
+    `sys_catalog_index_insert.go:423-428`, routes via
+    `tableCatalogHeapDBOid(ctx)` — comment says "a distinct-dbOid database
+    now has its own bootstrapped catalog btrees") — so per-DB index files
+    already exist and are already used correctly; only the **heap row
+    writes/reads** for user-defined types never got the same treatment.
+    **Why this loop does not attempt the fix:** changing only the six
+    ALTER/DROP delete sites to target the connection's real dbOid, while
+    CREATE (`writeTypeHeapRowWithIndexes`/`syncCompositeTypeToCatalogHeap`)
+    keeps writing to `DefaultDBOid`, would make ALTER/DROP's xmax-stamp
+    target a heap location with **no matching row** (the real row is in
+    Default) — a *new*, different no-op regression, not a fix. The correct
+    fix must move CREATE, ALTER, and DROP together across all four type
+    kinds (enum/domain/composite/range all share `writeTypeHeapRowWithIndexes`),
+    and must also account for the read side (SeqScan of pg_type/pg_class/
+    pg_attribute appears to read the same shared Default file regardless of
+    the querying connection's database, per the live repro above) — too
+    large and too risky for a single-task loop, especially with the
+    milestone banner's "no reverts" rule (R3) raising the cost of a wrong
+    first attempt. Filed as **M0143-0002d** below with this loop's findings
+    as its resume point. Ledger: 1 new row (`.ralph/deferral_ledger.md`).
+    Gates: none run (no code changed — investigation-only loop, mirrors the
+    M0143-0001 scoping loop's precedent).
+- [ ] **M0143-0002d — user-defined type catalog-heap storage
+  (pg_type/pg_class/pg_attribute for enum/domain/composite/range types) is a
+  single un-partitioned store shared by every database, unlike pg_constraint.**
+  Parent: M0143-0002c. Filed 2026-09-17 from M0143-0002c's re-identification
+  loop, which found the "six `deleteCatalogRowsForOID` sites" are a symptom
+  of this much larger gap, not an independently fixable bug. **Live-confirmed
+  repro** (see M0143-0002c's Done note for the exact commands and query): two
+  databases each declaring a composite type of the same name do not collision-
+  error (correctly — they're separate types) but their pg_attribute/pg_type
+  rows are visibly the UNION of both types' fields from *either* database,
+  because every user type's physical row always lands in `catalog.DefaultDBOid`'s
+  heap files regardless of which database's session created it.
+  **Write-side hardcodes to fix together** (all `storage.RelFileNode{DBOid:
+  catalog.DefaultDBOid, ...}` literals in `internal/executor/operators_ddl.go`):
+  `writeTypeHeapRowWithIndexes` (`:18447-18458`, shared pg_type writer — every
+  `CREATE TYPE`/`CREATE DOMAIN` of any kind funnels through this), the
+  `syncCompositeTypeToCatalogHeap` `classRel`/`attrRel` pair (`:18539-18544`/
+  `:18555-18561`, composite's implicit pg_class/pg_attribute), and the six
+  M0143-0002c delete-side sites (`execAlterType` `:25242`/`:25282`/`:25325`/
+  `:25372`, `execAlterTypeAttrCmds` `:25617`, `execDropType`'s composite
+  branch `:25669`) plus its enum branch (`~:25644-25648`, same hardcode for
+  `deleteTypeFromCatalogHeap`/`deleteEnumLabelRowsByTypid`) and range branch
+  (`~:25684-25689`) — not independently counted in "the six" but sharing the
+  identical shape and needing the same fix. **Fix these together, not
+  piecemeal**: changing only a subset would make some paths target the
+  connection's real dbOid while others still write to Default, which is a
+  *worse* inconsistency than today's uniform (wrong) DefaultDBOid — every
+  write site above must move to `catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)`
+  (or the resolved `o.ctx.CurrentDatabaseOid` if already normalized at the
+  call site — check `NamespaceDBOid`'s 0/`PostgresDBOid` folding, `catalog.go:25196`)
+  in the same commit. **Read-side must also be audited**: the live repro
+  shows a `SELECT ... FROM pg_type`/`pg_attribute` query reads the same
+  shared file regardless of the connection's own database, so whatever
+  resolves those tables' `RelFileNode` for a `SELECT` (not yet located this
+  loop — grep for how `pg_constraint`'s `pgConstraintTableRel`
+  (`sys_pg_constraint.go:133`, routes via `tableCatalogHeapDBOid(ctx)`) differs
+  from pg_type/pg_class/pg_attribute's read-path resolution) needs the
+  identical fix, or the write-side fix alone will make types simply
+  invisible cross-database instead of merged-wrong. **Index entries are
+  already correct** — `insertCanonicalSysBtreeLeaf` (`sys_catalog_index_insert.go:423-428`)
+  already routes via `tableCatalogHeapDBOid(ctx)`, so `pg_type_oid_index`/
+  `pg_type_typname_nsp_index`/`pg_class_relname_nsp_index`/
+  `pg_attribute_relid_attnum_index` inserts do not need to change — only the
+  heap rows they point at. Test with two databases each declaring a
+  same-named enum, domain, composite, and range type (mirrors the live repro
+  above) and confirm each database's `pg_dump`/`SELECT ... FROM pg_type`
+  shows only its own type's shape after the fix. Needs a design note
+  (non-trivial, cross-cutting reload-adjacent change) per AGENT.md's
+  Plan-parity harness D3.
 - [ ] **M0143-0003 — `pg_constraint` returns 0 rows of any contype after a restart** —
   including the `'p'`/`'u'` rows synthesised from indexes that demonstrably survive. A
   second, independent reload gap that R126 explicitly did not touch.

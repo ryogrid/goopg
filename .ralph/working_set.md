@@ -1,101 +1,96 @@
-Task: M0143-0002b — PK/UNIQUE/EXCLUDE `DROP CONSTRAINT` silently no-opping on
-a non-default database (same shape M0143-0002 fixed for FK). LANDED AND
-COMMITTED this loop (commit 7b22ae810).
+Task: M0143-0002c — re-identify the "six `deleteCatalogRowsForOID` sites"
+M0143-0002's original text named. DONE this loop as investigation-only (no
+code changed) — closed with a much bigger finding than expected; the real
+fix is filed as M0143-0002d (unchecked, concrete resume point).
 
-Files: internal/catalog/catalog.go (`dropIndexByName` signature changed from
-`(tableOID uint32, name string) bool` to `(tbl *Table, name string) bool`,
-keys `c.ns()` off `tbl.DBOid` instead of hardcoded `DefaultDBOid`;
-`DropPrimaryKeyConstraint`/`DropUniqueConstraint`/`DropExclusionConstraint`
-all changed to take `*Table`; `HasPrimaryKey` keys off `table.DBOid` in
-place, no signature change), internal/executor/operators_ddl.go (3 call
-sites updated: PK/UNIQUE/EXCLUDE branches of execAlterTableDropConstraint),
-internal/catalog/catalog_test.go (2 calls updated), internal/testport/
-m0143_0002b_index_backed_drop_constraint_nondefault_db_test.go (new — one
-sub-test per constraint kind in db "r", confirmed genuinely red pre-fix via
-git stash), .ralph/fix_plan.md (M0143-0002b [x] + Done note; new
-M0143-0002c filed, Parent: M0143-0002b — **note the lineage guard requires
-`Parent:` at the START of its own body line, not inline after the bold
-title on a continuation line — bit me once this loop, fixed by giving it
-its own line**), .ralph/deferral_ledger.md (1 new row), docs/design/
-0100-0149/p0-e4-catalog-xmax-loss-repro.md (new "M0143-0002b" section),
-docs/design/README.md (p0-e4 row title + description updated).
+Files: .ralph/fix_plan.md (M0143-0002c marked [x] with a long Done note;
+new M0143-0002d task filed, Parent: M0143-0002c), .ralph/deferral_ledger.md
+(1 new row). No source files changed — two scratch test files
+(internal/testport/m0143_0002c_composite_type_nondefault_db_test.go,
+internal/testport/zzz_probe_composite_test.go) were written, run to gather
+evidence, and DELETED before finishing (git status confirms clean — verify
+with `git status --porcelain -- internal/testport/` before trusting this).
 
-Key symbols: dropIndexByName (catalog.go) — the fixed shared helper;
-Table.DBOid (catalog.go ~466) — "already NamespaceDBOid-translated... matching
-c.ns(DefaultDBOid)"; the `dbOid := DefaultDBOid; if tbl.DBOid != 0 { dbOid =
-tbl.DBOid }` idiom (matches TableRealPages/relAllVisibleCell) is the
-established pattern for this kind of fix — reuse it for any future
-DefaultDBOid-hardcode sibling instead of re-deriving.
+Key symbols: `writeTypeHeapRowWithIndexes` (operators_ddl.go:18447-18458,
+pg_type writer shared by every CREATE TYPE/DOMAIN of any kind) and
+`syncCompositeTypeToCatalogHeap`'s `classRel`/`attrRel`
+(:18539-18544/:18555-18561) — both hardcode
+`storage.RelFileNode{DBOid: catalog.DefaultDBOid, ...}` unconditionally.
+The six delete-side sites M0143-0002c was asked to find: `execAlterType`'s
+4 single-subcommand branches (:25242/:25282/:25325/:25372),
+`execAlterTypeAttrCmds` (:25617), `execDropType`'s composite branch
+(:25669) — same hardcode, `deleteCatalogRowsForOID`/`deleteTypeFromCatalogHeap`.
+Contrast (the ALREADY-correct pattern to mirror): `pgConstraintTableRel`
+(sys_pg_constraint.go:133, routes via `tableCatalogHeapDBOid(ctx)`) and
+`insertCanonicalSysBtreeLeaf` (sys_catalog_index_insert.go:423-428, same
+routing — already used for these same types' OWN index entries, so the
+per-DB index files already exist and work).
 
-Findings: confirmed live (not just by reading) that `dropIndexByName` and
-`HasPrimaryKey` shared the exact M0143-0002 hardcode shape — index
-registration is genuinely per-DB (`c.ns(dbOid).byTable[tbl.OID]` at every
-registration site) so a PK/UNIQUE/EXCLUDE-backed table in a non-default DB
-had its DROP CONSTRAINT silently no-op while reporting success. All 5 call
-sites had `tbl *Table` already in scope, so no relookup needed anywhere.
-The task's own "six `deleteCatalogRowsForOID` sites" forward-reference is
-STILL unresolved after two loops carrying it forward (M0143-0002 →
-M0143-0002b) — those call sites already take an explicit `dbOid` param
-(confirmed by grep both times), so the note describes something else and
-needs fresh identification, not a third assumption; filed as M0143-0002c
-with a concrete resume point (grep operators_ddl.go for
-deleteCatalogRowsForOID, check METHODOLOGY3/04-forward-plan.md §3 for the
-original claim's source).
+Findings: the six sites are real but NOT independently fixable — they're
+consistent with, not separate from, a much larger pre-existing gap:
+EVERY user-defined type's (enum/domain/composite/range, all sharing
+`writeTypeHeapRowWithIndexes`) physical pg_type/pg_class/pg_attribute row
+always lands in the shared DEFAULT database's heap files, regardless of
+which database's session ran the CREATE/ALTER/DROP TYPE. Live-confirmed on
+a throwaway 55xx cluster (test wrote + ran + deleted, not committed):
+`CREATE TYPE samename AS (a int)` in default db, then inside
+`CREATE DATABASE r; \c r`, `CREATE TYPE samename AS (x text, y text)`
+succeeds with NO name-collision error (correct — they're genuinely
+different per-DB types in the in-memory registry, `compositeKey` folds in
+dbOid), but `SELECT a.attname FROM pg_attribute a JOIN pg_type t ON
+t.typrelid=a.attrelid WHERE t.typname='samename'` run from EITHER database
+returns the UNION `[a, x, y]` instead of each database's own `[a]` /
+`[x, y]` — genuine cross-database catalog corruption reachable by plain
+SQL (pg_dump, `\d`, information_schema all ride this same serving path).
+Ruled out: this is NOT the M0143-0002/-0002b hardcode shape (that was
+`c.ns(DefaultDBOid)` inside `catalog.InMemory`'s own table/index
+registries, already fixed both times) — this one is a
+`storage.RelFileNode{DBOid: ...}` literal choosing which database's
+PHYSICAL HEAP FILE to write/read, a different layer entirely. Also ruled
+out via a live probe (test written and deleted): pg_attribute rows for a
+composite type in a LIVE session show blank `ctid`, so a naive "does ALTER
+duplicate a live-queryable row" test (my first attempt) always passes
+regardless of the bug — it doesn't prove anything, because per the union
+finding above the SAME shared file is scanned by both connections'
+queries, not two, so there's no dbOid-scoped visibility to differentially
+observe from a single-DB vantage point; only a cross-database query
+comparison (the samename repro) actually demonstrates the defect. Also
+ruled out: read-side is NOT served from the in-memory
+`cat.compositeTypeFields` registry (which IS correctly per-DB-keyed) — if
+it were, the cross-DB union would be impossible; the read path for
+`pg_type`/`pg_attribute` genuinely re-derives from the shared heap file,
+not yet located precisely (M0143-0002d's open item).
 
-Also this loop: launched a background investigation agent on M0143-0001
-("an in-process test that crosses a DATABASE boundary", the task the
-milestone doc calls "highest leverage of the six") purely to scope it before
-committing a loop to it. Findings are now recorded directly in fix_plan.md's
-M0143-0001 entry (read-only, no code changed) — key takeaway: the
-"manual psql evidence only" framing is half-stale, since
-`internal/postmaster/database_ddl_test.go` and `database_oid_wiring_test.go`
-already have in-process (no socket/psql) precedent for both halves
-separately (calling `tryHandleDatabaseDDL` directly, and setting
-`ectx.CurrentDatabaseOid` directly) — the real gap is a test that CHAINS
-both in one file, which belongs in `internal/postmaster` (not
-`internal/executor` — import-cycle blocked) and is concrete/low-risk. The
-harder half (reload `ListDatabases` loop under genuine WAL-replay/restart)
-has a known wrinkle: `database_template_oid_collision_test.go`'s own
-comment says the in-process `*postmaster.Server` harness "hangs on
-multi-DB-write shutdown" — scope that as a likely-separate follow-up.
-
-Next step: banner item 0 still gates on P0-E7 (needs P0-E6, owner-run,
-`[!]`); sub-order unchanged: M0143 tasks whose gates don't need TPC-H data
-first. Nightly triage confirmed complete this loop (all 17 items of run
-20260917-004357 already filed). Good next picks, all not gated on TPC-H
-data: M0143-0001 (now has a concrete scoped resume point in fix_plan.md —
-start with the `internal/postmaster`-level chain test), M0143-0002c (just
-filed, concrete grep-first resume point), M0143-0003 (pg_constraint 0-rows
+Next step: `## Current Priority` banner still gates on P0-E7 (needs P0-E6,
+owner-run, `[!]`) for everything from item 1 onward. Sub-order unchanged
+while P0-E6 waits: M0143 tasks whose gates don't need TPC-H data first.
+Good next picks, none gated on TPC-H data: M0143-0002d (this loop's
+follow-up — has a full write-side site list and a design-doc requirement,
+but the read-side resolver for pg_type/pg_class/pg_attribute SeqScans
+still needs locating before any fix can land — start there, e.g. grep how
+`SysScan`/`SeqScan` resolves a system catalog table's `RelFileNode` in
+general, compare against `pgConstraintTableRel`'s special-cased override,
+to find whether pg_type/pg_class/pg_attribute have an equivalent override
+that's ALSO hardcoded, or fall through to some other generic default),
+M0143-0001 (has a concrete `internal/postmaster`-level chain-test resume
+point from 2 loops ago, not yet started), M0143-0003 (pg_constraint 0-rows
 after restart), M0143-0004 (PhysicalTypeIsVarlena IsArray), M0143-0005
 (ParamRef LIMIT+DISTINCT), M0143-0006 (parser's 60 failing tests, still
-unowned — same count/shape seen 3 loops running now). Re-check `## Current
-Priority` fresh next loop per the Precedence rule before picking.
+unowned — same count/shape seen 4 loops running now, consider actually
+triaging it next since "unowned" is explicitly called out as not an end
+state). Re-check the banner fresh next loop per the Precedence rule.
 
-Gates run: `go build ./...` clean. `go vet ./internal/testport/...
-./internal/catalog/... ./internal/executor/...` clean. `go test
-./internal/catalog/... ./internal/executor/...` PASS. `go test -v -run
-'TestPort_M0143_0002|TestPort_M0143_0002b|TestPort_M0143_0008b|TestPort_P0E4|TestPort_P0E5'
-./internal/testport/` PASS 12/12 (new tests independently verified to fail
-pre-fix via git stash of the 3 touched source files, pass post-fix).
-`RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh` — 60
-pre-existing `internal/parser` failures (M0143-0006, unrelated, same
-count/shape as prior loops, no parser file touched), every other package
-PASS. `scripts/tpcds-sf025-regression.sh sweep` (re-run against staged
-content so the gate-stamp's code_tree hash matched what was committed) —
-PASS=96 MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0, plan-shapes 99/99
-identical, gate-stamp PASS. `scripts/tpch-spotcheck.sh` and
-`scripts/tpch-acceptance-arm.sh off <outfile>` (note: needs BOTH args, arm
-name AND an out-file path, or it's a usage error before the HOLD check ever
-runs) — both SKIP-BLOCKED (exit 3) by the `:65433` evidence hold, same
-accepted G6 exception naming P0-E7 as re-run owner. Pre-commit hook's
-pgbench smoke: PASS (both commit attempts — first rejected only by the
-fix_plan lineage guard on M0143-0002c's `Parent:` line placement, fixed and
-re-committed clean; commit-msg hook also required a `PARITY: N/A — <reason>`
-line and a staged-content-matched tpch-acceptance-arm gate-stamp, both
-supplied).
-`make ralph-state-guard`: consistent both before and after commit.
+Gates run: no source files changed this loop, so no build/test gate was
+required by AGENT.md's risk-based policy (investigation-only, mirrors
+M0143-0001's precedent). `go vet ./internal/testport/...` was run while the
+two scratch test files existed (clean) and again after deleting them
+(clean, confirms no orphaned references). `make ralph-state-guard` — found
+a PRE-EXISTING inconsistency from a prior loop's stale progress marker
+(status="running" vs progress="completed"), auto-repaired by the guard
+itself to progress="in_progress"; not something this loop's edits caused
+(this loop touched only fix_plan.md/deferral_ledger.md). Consistent after
+repair.
 
-In-flight: none. No servers or background processes left running (all test
-clusters use cluster.New's t.Cleanup). The M0143-0001 investigation subagent
-completed and its report is already folded into fix_plan.md — nothing to
-resume there.
+In-flight: none. No servers or background processes running (the deleted
+scratch tests used `t.Cleanup`-managed throwaway clusters via
+`cluster.New`, already torn down when `go test` exited).
