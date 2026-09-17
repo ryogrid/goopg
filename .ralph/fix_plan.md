@@ -6477,6 +6477,42 @@ reported, and the values and unit gates are the bar.
     "manual psql evidence" gap for the DDL-execution half); scope the
     reload-loop half as a likely-separate follow-up once the shutdown-hang
     wrinkle is understood, rather than attempting both in one sitting.
+  - **Landed 2026-09-17 (DDL-execution half only — still open for the
+    reload-loop half; not ticked).** `TestDatabaseDDLChainedExecutorDML`
+    (`internal/postmaster/database_ddl_chain_test.go`): chains
+    `s.tryHandleDatabaseDDL("CREATE DATABASE r", ...)` with
+    `s.wireExtensionRows(ectx, "r")` (the real per-connection oid-resolution
+    path, not a synthetic `ctx.CurrentDatabaseOid` constant) and runs
+    CREATE TABLE + a REFERENCES FK against the new database's own real oid
+    via the executor pipeline, mirroring
+    `internal/executor/storage_ddl_test.go`'s `runDDL`/
+    `fk_dbid_routing_test.go`'s `runQueryUnderDBOid` patterns (reimplemented
+    locally in `internal/postmaster` since those are unexported executor
+    test helpers). A second context bound to `"postgres"` gets its own
+    table+FK. Verifies `pg_constraint`'s FK row (`pgConstraintTableRel`'s
+    per-database branch, reached via `wireExtensionRows`' `PgConstraintRows`
+    wiring) by `conname` identity, not just count, and cross-database
+    namespace isolation (each database's table is invisible under the
+    other's oid). Test-design finding worth keeping: a count-only assertion
+    would NOT have caught a real regression here — temporarily forcing
+    `PGConstraintRowsForDBOid`'s `dbOid` argument to `DefaultDBOid`
+    (mirroring the exact hardcode shape `M0143-0002`/`-0002b` fixed
+    elsewhere) left both databases' row counts at 1 while `db r`'s query
+    silently returned `db postgres`'s FK row instead of its own — caught
+    only because the assertion checks the actual `conname` value. Verified
+    the mutation makes the test fail, then reverted it (temporary,
+    `catalog.go` carries no diff). No production code changed. Design doc:
+    `docs/design/0100-0149/m0143-0001-database-boundary-chain-test.md`
+    (indexed in `docs/design/README.md`). Gates: `go build ./...` clean;
+    `go test ./internal/postmaster/... ./internal/catalog/...
+    ./internal/executor/...` PASS; `RALPH_PRECOMMIT_SCOPE=units
+    scripts/ralph-precommit-test.sh` PASS (units scope excludes
+    `internal/postmaster`, run separately above). **Still open**: the
+    reload-loop half (`internal/initdb`'s multi-database `ListDatabases`
+    loop under a genuine WAL-replay/restart) — no existing in-process
+    precedent, and `database_template_oid_collision_test.go`'s "hangs on
+    multi-DB-write shutdown" harness limitation needs understanding first;
+    resume there next.
 - [x] **M0143-0002 — `ALTER TABLE … DROP CONSTRAINT` on an FK reports success and does
   nothing** — `InMemory.DropForeignKeyConstraint` hardcodes `DefaultDBOid`
   (`catalog.go:22241`) and `execAlterTableDropConstraint` discards the result
