@@ -3353,7 +3353,7 @@ spill route is net-negative.
       vet ./internal/optimizer/` clean, `go test ./internal/optimizer/...`
       PASS, `RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh`
       PASS, no TPC-H dependency.
-  - [ ] **M0141-S7-cd-q64-reclassify** — decide where Q64 actually belongs
+  - [x] **M0141-S7-cd-q64-reclassify** — decide where Q64 actually belongs
     in the 14-witness corpus tally now that M0141-S7-cd-q64 shows its
     Incremental Sort node is CTE-internal-GroupAggregate-scoped
     (`Presorted Key: item.i_item_sk` feeding `cross_sales`'s own
@@ -3373,6 +3373,30 @@ spill route is net-negative.
     2026-09-18b; (c) if NOT covered, file the CTE-internal gap as its own
     M0141-S2b-N-class task. No TPC-H dependency; recon-only until (c)'s
     outcome is known.
+    - **Done 2026-09-18 — case (c), NOT covered.** Read-only recon (no
+      server, no trace needed for this half): `electOrderedGrouping`'s
+      call site (`planner.go:1960`) only runs when `len(s.OrderBy) > 0`,
+      and `cross_sales`'s own `SELECT` (the CTE body) has NO `ORDER BY` of
+      its own (`query64.sql`) — so the question "does the CTE-materialization
+      caller reach `electOrderedGrouping`" doesn't apply; that function is
+      structurally irrelevant to the CTE's own planning pass regardless of
+      caller wiring. The mechanism PG's `Presorted Key: item.i_item_sk` /
+      `GroupAggregate` actually exercises — a sorted-input GROUP BY
+      strategy chosen with NO `ORDER BY` anywhere in the query — is a
+      different goopg code path: `addGroupingPaths`'s SORTED arm
+      (`groupingpaths.go:441-495`), which always calls
+      `sortPathForBounded` (`joinpathsmerge.go:480-515`, unconditionally
+      builds a full `PathSort`) and never offers an
+      Incremental-Sort-over-partial-prefix-seed candidate the way
+      `addIncrementalSortPaths` does for the outer-ORDER-BY case — for ANY
+      query, not just Q64. Genuinely un-audited, distinct from
+      M0141-S2b-0/S2b-7's scope. Tally correction: producer-shape table's
+      "Nested Loop x4" -> "Nested Loop x3 (Q4, Q11, Q35)" (Q64 is neither
+      an outer-ORDER-BY Nested Loop witness nor a GroupAggregate-family
+      member). New task filed: **M0141-S2b-8** below. Full writeup: design
+      doc's "Update 2026-09-18c". No ledger row (closes an open question
+      with a definite answer, files its own follow-up directly). Gates:
+      none needed, no code changed.
   - [ ] **M0141-S7-cd-candidatepool** — investigate whether
     `addIncrementalSortPaths` (`incrementalsortpaths.go:161-166`) should
     also consider building its `PathIncrementalSort` over the SAME cheap
@@ -3399,6 +3423,42 @@ spill route is net-negative.
     (`shape-delta.sh`, category movement) as the no-regression gate,
     same `[65437]`-only requirement as the recon that filed this, no TPC-H
     dependency.
+  - [ ] **M0141-S2b-8** — `addGroupingPaths`'s SORTED arm
+    (`groupingpaths.go:441-495`) never offers an
+    Incremental-Sort-over-partial-prefix-seed candidate for a plain
+    `GROUP BY` with no `ORDER BY` in the query — it always calls
+    `sortPathForBounded` (`joinpathsmerge.go:480-515`), which
+    unconditionally builds a full `PathSort` over `seed` regardless of
+    whether `seed.Pathkeys` already shares a partial prefix with the group
+    keys. This is the mechanism PG's Q64 plan exercises inside the
+    `cross_sales` CTE (`Presorted Key: item.i_item_sk` feeding a
+    `GroupAggregate`, no `ORDER BY` anywhere in that CTE) — distinct from
+    `electOrderedGrouping`/M0141-S2b-0/S2b-7, which only runs when the
+    query (or CTE) HAS an `ORDER BY` of its own.
+    Parent: M0141-S7 (filed by M0141-S7-cd-q64-reclassify, case (c); design
+    doc's Update 2026-09-18c). Depends on nothing new — same DPPATH trace
+    infra (`pathtrace.go`) M0141-S7's other arms already use applies here.
+    Scope: (1) confirm live whether `seed.Pathkeys` for Q64's CTE actually
+    carries a genuine partial prefix of the group keys at the point
+    `addGroupingPaths` runs (the read-only recon above establishes the
+    STRUCTURAL gap — no code path exists to even try — but does not yet
+    trace whether Q64 specifically would benefit, vs. some other witness);
+    (2) if confirmed, add a `PathIncrementalSort`-over-`seed` candidate to
+    the SORTED arm, gated the same way as `addIncrementalSortPaths`
+    (`pathkeysCountContainedIn`, `nCommon>0` check), priced via the
+    existing `costIncrementalSort` helper M0141-S7-exec-a/b landed; (3)
+    sibling-path audit: check whether `AggStrategySorted`'s executor side
+    already tolerates an `IncrementalSort` child (it does for the OUTER
+    ORDER BY case per M0141-S7-exec-a/b/c — confirm the same operator
+    works unchanged as a GROUP_AGG child, or file a further gap). This is
+    an implementation task (not recon) — not selectable while M0141's
+    banner item 4 restricts to "cost diagnosis only, no executor work";
+    wait for the banner to open item 3/4's implementation tasks, or select
+    per whatever priority governs M0141-S2b-* implementation work at that
+    time. Gate: TPC-DS SF0.25 sweep (category movement, no regression) +
+    `go test ./internal/optimizer/...`; no TPC-H dependency (TPC-H's own
+    corpus has 9 sort-strategy witnesses per M0141-S7's header — re-check
+    whether any are this same shape once implemented).
 
 ## M0142 — Join-order costing (filed 2026-09-14)
 
