@@ -12,6 +12,25 @@ when the candidate:
       select a task elsewhere.
   Rule B (lineage required): adds a task whose id matches M0137..M0143 or P0-
       without a `Parent:` line.
+  Rule D (field hygiene — audit hole D): a NEWLY ADDED line may not
+      (1) be a task's ONLY `Parent:` / `Movement: yes` declaration while
+          written mid-sentence on a body line. The guard reads those fields
+          only at the start of a body line or anywhere on the task's own title
+          line, so a mid-line `... prefix match. Parent: M0141-S7.` silently
+          escapes descendant counting (M0141-S7-cd-candidatepool did exactly
+          this). A mid-line repetition of a field the task also declares
+          readably is harmless prose and is not reported; nor is a mid-line
+          `Movement: none`, which is what the guard already assumes; nor a
+          field on a baseline task that USED to declare it readably (the owner
+          reshaping an existing entry is not the loop gaming it).
+      (2) claim `Movement: yes` without citing one of S3's three instruments on
+          the SAME line — a `match` count, `CATEGORIES-EXCL-MATCH`, or
+          `ea-ratchet` — together with a number. A non-conforming
+          `Movement: yes` is additionally TREATED AS `none` for Rule A, so it
+          cannot reset the lineage budget (three such lines in HEAD did).
+      Only lines that are new in the candidate are reported, so pre-existing
+      offenders in HEAD do not block unrelated edits (they already count as
+      `Movement: none`).
   Rule C (frozen): the frozen set is a list of id PREFIXES taken from the
       BASELINE: every `[!]` task mentioning FROZEN contributes its id, plus the
       tokens of any `FROZEN-PREFIXES: A B C` line in the owner-only
@@ -50,16 +69,31 @@ MOVE_RE = re.compile(r"^\s*Movement:\s*(\S+)")
 PARENT_INLINE_RE = re.compile(r"(?:^|\s)Parent:\s*`?([^\s`]+)`?")
 MOVE_INLINE_RE = re.compile(r"(?:^|\s)Movement:\s*(\S+)")
 NEWID_RE = re.compile(r"^(M01(3[7-9]|4[0-3])|P0-)")
+# Rule D: `Movement: yes` must cite an instrument with a number on the SAME
+# line — a `match` count (this also covers CATEGORIES-EXCL-MATCH) or
+# `ea-ratchet`.
+MOVE_YES_RE = re.compile(r"(?:^|\s)Movement:\s*yes", re.I)
+INSTRUMENT_RE = re.compile(r"\bmatch\b|CATEGORIES-EXCL-MATCH|\bea-ratchet\b", re.I)
+NUMBER_RE = re.compile(r"[0-9]")
+
+
+def movement_yes_conforms(line):
+    """True when a `Movement: yes` line cites an instrument AND a number."""
+    return bool(INSTRUMENT_RE.search(line)) and bool(NUMBER_RE.search(line))
 
 
 class Task:
     __slots__ = ("id", "status", "indent", "parent", "has_parent", "movement",
-                 "frozen", "line", "idx", "enclosing")
+                 "frozen", "line", "idx", "enclosing", "bad_move_lines",
+                 "midline_lines")
 
     def __init__(self, tid, status, indent, line, idx):
         self.id, self.status, self.indent, self.line, self.idx = tid, status, indent, line, idx
         self.parent, self.has_parent, self.movement = None, False, None
         self.frozen, self.enclosing = False, None
+        # Rule D bookkeeping: (lineno, raw line) pairs.
+        self.bad_move_lines = []      # non-conforming `Movement: yes`
+        self.midline_lines = []       # mid-sentence Parent:/Movement: on a body line
 
 
 def parse(text):
@@ -75,7 +109,7 @@ def parse(text):
             cur = Task(tid, status, indent, n, len(order))
             if "FROZEN" in ln:
                 cur.frozen = True
-            _fields(cur, ln, PARENT_INLINE_RE, MOVE_INLINE_RE)
+            _fields(cur, ln, n, True)
             while stack and stack[-1][0] >= indent:
                 stack.pop()
             cur.enclosing = stack[-1][1].id if stack else None
@@ -91,19 +125,46 @@ def parse(text):
             continue
         if "FROZEN" in ln:
             cur.frozen = True
-        _fields(cur, ln, PARENT_RE, MOVE_RE)
+        _fields(cur, ln, n, False)
     return tasks, order
 
 
-def _fields(cur, ln, pre, mre):
-    mp = pre.search(ln) if pre is PARENT_INLINE_RE else pre.match(ln)
+def _fields(cur, ln, n, inline):
+    """Read Parent:/Movement: off one line. `inline` is True for the task's own
+    title line (fields may sit anywhere on it) and False for a body line (only
+    line-start fields are read — Rule D reports the rest)."""
+    pre = PARENT_INLINE_RE if inline else PARENT_RE
+    mre = MOVE_INLINE_RE if inline else MOVE_RE
+    mp = pre.search(ln) if inline else pre.match(ln)
     if mp and not cur.has_parent:
         cur.has_parent = True
         p = mp.group(1).rstrip(".,;")
         cur.parent = None if p.lower() == "none" else p
-    mm = mre.search(ln) if mre is MOVE_INLINE_RE else mre.match(ln)
+    mm = mre.search(ln) if inline else mre.match(ln)
     if mm and cur.movement is None:
-        cur.movement = mm.group(1).lower().rstrip(".,;—")
+        val = mm.group(1).lower().rstrip(".,;—")
+        # Rule D(2): `Movement: yes` with no instrument+number is treated as
+        # `none`, so it cannot reset the Rule A lineage budget.
+        if val.startswith("yes") and not movement_yes_conforms(ln):
+            val = "none"
+        cur.movement = val
+    # Rule D bookkeeping (reported only for lines new in the candidate).
+    if MOVE_YES_RE.search(ln) and not movement_yes_conforms(ln):
+        cur.bad_move_lines.append((n, ln))
+    elif not inline:
+        # A mid-sentence field the readers above could not see. Reported only
+        # when the task has NO readable field of that kind (the actual gaming
+        # vector: M0141-S7-cd-candidatepool's only `Parent:` was mid-sentence).
+        # A mid-line repetition of a field already declared at line start / on
+        # the title line is harmless prose.
+        if PARENT_INLINE_RE.search(ln) and not PARENT_RE.match(ln):
+            cur.midline_lines.append((n, ln, "Parent"))
+        mmid = MOVE_INLINE_RE.search(ln)
+        if mmid and not MOVE_RE.match(ln) and \
+                mmid.group(1).lower().rstrip(".,;\u2014").startswith("yes"):
+            # A mid-line `Movement: none` is what the guard already assumes, so
+            # it changes nothing; only an unread `Movement: yes` CLAIM matters.
+            cur.midline_lines.append((n, ln, "Movement"))
 
 
 FROZEN_PREFIXES_TOKEN = "FROZEN-PREFIXES:"
@@ -240,6 +301,40 @@ def check(baseline, candidate):
                     f"[C] new task {t.id} (line {t.line}) is a child of frozen task "
                     f"{hit[0]} (frozen prefix {fz(hit[0])}). Do not extend a frozen lineage; "
                     f"select elsewhere or escalate.")
+
+    # Rule D — field hygiene, NEWLY ADDED lines only.
+    base_lines = {ln.rstrip() for ln in baseline.splitlines()}
+    for t in corder:
+        for n, ln in t.bad_move_lines:
+            if ln.rstrip() in base_lines:
+                continue
+            errs.append(
+                f"[D] task {t.id} (line {n}) claims `Movement: yes` without citing an "
+                f"instrument on the same line. `Movement: yes` must name one of S3's three "
+                f"instruments WITH a number: a `match` count change, `CATEGORIES-EXCL-MATCH`, "
+                f"or `ea-ratchet` (e.g. `Movement: yes — match 539 -> 530`). Until then it "
+                f"counts as `Movement: none` and does NOT reset the lineage budget. Line: "
+                f"{ln.strip()[:120]}")
+        for n, ln, field in t.midline_lines:
+            if ln.rstrip() in base_lines:
+                continue
+            bt = btasks.get(t.id)
+            if field == "Parent":
+                if t.has_parent:
+                    continue      # already declared readably elsewhere
+                if bt is not None and bt.has_parent:
+                    continue      # a baseline task that LOST a readable field
+            else:
+                if t.movement is not None:
+                    continue
+                if bt is not None and bt.movement is not None:
+                    continue
+            errs.append(
+                f"[D] task {t.id} (line {n}) declares `{field}:` mid-sentence on a body line, "
+                f"where the guard does not read it, and the task declares it nowhere else "
+                f"(descendant counting and the lineage budget both miss it). Put the field at "
+                f"the START of its own line, or on the task's title line. "
+                f"Line: {ln.strip()[:120]}")
     return errs
 
 

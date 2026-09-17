@@ -150,6 +150,53 @@ case("C: frozen task disappears -> violation", bf, plan(ROOT), "C")
 case("C: prefix match by startswith (banner M0142-0008c-1a covers -1a-x)",
      fplan(ROOT), fplan(ROOT) + task("M0142-0008c-1a-x", " ", parent="none"), "C")
 
+# --- Rule D: field hygiene (audit hole D) -----------------------------------
+# (1) Parent:/Movement: written mid-sentence on a body line is invisible to the
+#     guard, which is how M0141-S7-cd-candidatepool escaped descendant counting.
+case("D: mid-line Parent on a body line -> violation", base,
+     base + "- [ ] **M0142-0040 — t**\n  narrowed to a prefix match. Parent: M0142-0008.\n", "D")
+case("D: mid-line Parent still leaves the task parentless (Rule B too)", base,
+     base + "- [ ] **M0143-0041 — t**\n  narrowed to a prefix match. Parent: M0143-0009.\n", "B")
+case("D: Parent at the start of a body line -> ok", base,
+     base + "- [ ] **M0142-0042 — t**\n  Parent: M0142-0008\n", None)
+case("D: Parent on the task's own title line -> ok", base,
+     base + "- [ ] **M0142-0043 — t.** Parent: M0142-0008.\n  body\n", None)
+case("D: mid-line Movement: yes claim on a body line -> violation", base,
+     base + "- [x] **M0142-0044 — t**\n  Parent: M0142-0008\n  it shipped: Movement: yes — match 539 -> 530 here.\n", "D")
+case("D: mid-line Movement: none changes nothing -> ok", base,
+     base + "- [x] **M0142-0047 — t**\n  Parent: M0142-0008\n  it shipped, so Movement: none here.\n", None)
+case("D: a pre-existing mid-line Parent is not re-reported",
+     base + "- [ ] **M0142-0045 — t**\n  a prefix match. Parent: M0142-0008.\n",
+     base + "- [ ] **M0142-0045 — t**\n  a prefix match. Parent: M0142-0008.\n"
+     + task("M0142-0046", " ", parent="M0142-0008"), None)
+
+# (2) `Movement: yes` must cite one of S3's three instruments WITH a number.
+NC = "- [x] **M0142-0050 — t**\n  Parent: M0142-0008\n  Movement: yes — a same-named composite type declared in two schemas now resolves.\n"
+case("D: Movement: yes with no instrument -> violation", base, base + NC, "D")
+case("D: Movement: yes citing a match count -> ok", base,
+     base + "- [x] **M0142-0051 — t**\n  Parent: M0142-0008\n  Movement: yes — match 539 -> 530\n", None)
+case("D: Movement: yes citing CATEGORIES-EXCL-MATCH -> ok", base,
+     base + "- [x] **M0142-0052 — t**\n  Parent: M0142-0008\n  Movement: yes — CATEGORIES-EXCL-MATCH 21 -> 19\n", None)
+case("D: Movement: yes citing ea-ratchet -> ok", base,
+     base + "- [x] **M0142-0053 — t**\n  Parent: M0142-0008\n  Movement: yes — ea-ratchet 140 -> 131 nodes\n", None)
+case("D: Movement: yes naming an instrument but no number -> violation", base,
+     base + "- [x] **M0142-0054 — t**\n  Parent: M0142-0008\n  Movement: yes — the match count moved\n", "D")
+case("D: a pre-existing non-conforming Movement: yes is not re-reported",
+     base + NC, base + NC + task("M0142-0055", " ", parent="M0142-0008"), None)
+
+# (2b) a non-conforming `Movement: yes` counts as `none`, so it cannot reset the
+#      lineage budget (three such lines silently did in HEAD).
+NCCHAIN = plan(ROOT, *[
+    "- [x] **M0142-0008a-%d — t**\n  Parent: %s\n  Movement: yes — the plan looks better now.\n"
+    % (i, "M0142-0008" if i == 0 else "M0142-0008a-%d" % (i - 1)) for i in range(5)])
+case("D: 5 non-conforming Movement: yes do NOT reset the budget", NCCHAIN,
+     NCCHAIN + task("M0142-0008a-5", " ", parent="M0142-0008a-4"), "A")
+CONFCHAIN = plan(ROOT, *[
+    "- [x] **M0142-0008a-%d — t**\n  Parent: %s\n  Movement: yes — match 100 -> %d\n"
+    % (i, "M0142-0008" if i == 0 else "M0142-0008a-%d" % (i - 1), 99 - i) for i in range(5)])
+case("D: 5 conforming Movement: yes keep the budget open", CONFCHAIN,
+     CONFCHAIN + task("M0142-0008a-5", " ", parent="M0142-0008a-4"), None)
+
 # --- misc -------------------------------------------------------------------
 case("unchanged -> ok", b, b, None)
 case("heading ends a task body (Parent after heading ignored)",

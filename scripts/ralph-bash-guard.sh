@@ -12,6 +12,10 @@
 #   {"hookSpecificOutput":{"hookEventName":"PreToolUse",
 #     "permissionDecision":"deny","permissionDecisionReason":"..."}}
 #
+# Every denial is also appended to ci/logs/ralph-guard-denials.log (timestamp,
+# tool, rule, first 200 chars of the command) so a denial the loop never reports
+# is still visible to an audit. A log-write failure never fails the hook.
+#
 # Test: scripts/ralph-bash-guard-test.sh
 #
 # KNOWN LIMITATIONS (heuristic text matching, not a shell parser):
@@ -57,8 +61,27 @@ except Exception: pass' 2>/dev/null)"
 fi
 [ -n "$cmd" ] || exit 0
 
+# Every denial is appended to ci/logs/ralph-guard-denials.log, so a denial the
+# loop does not report in its task body is still visible to an audit. RULE is
+# set per rule section below. Logging NEVER fails the hook.
+RULE="unknown"
+guard_log() { # <tool> <rule> <subject>
+  local root logf
+  root="${CLAUDE_PROJECT_DIR:-}"
+  [ -n "$root" ] || root="$(git -C "${hook_cwd:-.}" rev-parse --show-toplevel 2>/dev/null)" || true
+  [ -n "$root" ] || return 0
+  logf="$root/ci/logs/ralph-guard-denials.log"
+  mkdir -p "$root/ci/logs" 2>/dev/null || return 0
+  printf '%s tool=%s rule=%s subject=%s\n' \
+    "$(date -Iseconds 2>/dev/null || echo unknown-time)" "$1" "$2" \
+    "$(printf '%s' "$3" | tr '\n\t' '  ' | cut -c1-200)" \
+    >>"$logf" 2>/dev/null || true
+  return 0
+}
+
 deny() {
   local reason="$1" esc
+  guard_log Bash "${RULE}:${BASH_LINENO[0]:-0}" "$cmd" || true
   esc="$(printf '%s' "RALPH_LOOP guard: $reason" | sed 's/\\/\\\\/g; s/"/\\"/g' | tr '\n' ' ')"
   printf '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"%s"}}\n' "$esc"
   exit 0
@@ -171,6 +194,7 @@ if mc "$REFPORT_RE" "$nomsg" || [ "$REFENV" -eq 1 ]; then REFPORT=1; fi
 # ---------------------------------------------------------------------------
 # 0. Disabling the loop guards themselves (RALPH_LOOP, hooks path)
 # ---------------------------------------------------------------------------
+RULE=loop-guard-disable
 LOOP_ESCAPE="The RALPH_LOOP guards and git hooks are part of the harness; the loop may not disable, unset or re-route them. If a gate cannot run, mark the task [!] with an escalation block."
 if assigns RALPH_LOOP '' "$nomsg"; then
   deny "RALPH_LOOP= assignment. $LOOP_ESCAPE"
@@ -194,6 +218,7 @@ fi
 # ---------------------------------------------------------------------------
 # 1. Writes / backend kills against reference clusters :65432 :65433 :65438
 # ---------------------------------------------------------------------------
+RULE=ref-cluster-write
 if [ "$REFPORT" -eq 1 ]; then
   client='(^|[^A-Za-z0-9_-])(psql|pgbench|vacuumdb|reindexdb|clusterdb|createdb|dropdb|createuser|dropuser|pg_restore|python3?|perl|ruby|node|PGPORT=|DATABASE_URL=)'
   if m "$client" "$nomsg"; then
@@ -224,6 +249,7 @@ fi
 # ---------------------------------------------------------------------------
 # 2. Starting / stopping / resetting / deleting a reference cluster
 # ---------------------------------------------------------------------------
+RULE=ref-cluster-lifecycle
 REFDIR='bench/tpch/runtime_goopg/data([^A-Za-z0-9_.-]|$)|bench/tpch/runtime/pgdata|bench/tpcds/runtime/pgdata|bench/tpch/runtime_goopg/preloss-clone-'
 while IFS= read -r seg; do
   if m "${LC}(stop_goopg|stop_pg)\.sh" "$seg" && ! is_reader "$seg"; then
@@ -280,6 +306,7 @@ fi
 # ---------------------------------------------------------------------------
 # 3. Gate bypass / history rewriting
 # ---------------------------------------------------------------------------
+RULE=gate-bypass
 if assigns GOOPG_SKIP_PRECOMMIT "[\"']?1" "$nomsg"; then
   deny "GOOPG_SKIP_PRECOMMIT=1 bypasses the pre-commit gate. Run the commit normally; if the gate cannot run, mark the task [!] with an escalation block."
 fi
@@ -323,6 +350,7 @@ done < <(printf '%s\n' "$unq" | perl -ne '
 # ---------------------------------------------------------------------------
 # 4. Blanket process kills
 # ---------------------------------------------------------------------------
+RULE=blanket-kill
 if m "${LC}pkill${R}[^;&|]*-[A-Za-z]*f[^;&|]*goopg" "$nomsg" || m "${LC}killall${R}[^;&|]*goopg" "$nomsg"; then
   deny "pkill -f goopg / killall goopg self-matches the shell and kills peers' and reference servers. Stop YOUR private server via goopg stop -D <your dir> or its PID file."
 fi
@@ -330,14 +358,15 @@ fi
 # ---------------------------------------------------------------------------
 # 5. Shell writes to instruction files and harness mechanism files
 # ---------------------------------------------------------------------------
+RULE=protected-file-write
 IF='(CLAUDE|AGENT)\.md'
 if writes_to "$IF" "$nomsg"; then
   deny "shell write to CLAUDE.md/AGENT.md. The loop does not edit its instruction files (H4). A rule that looks wrong is an escalation: write an escalation block into the task and mark it [!]."
 fi
 HB="([\"'[:space:];&|)/]|$)"
-PROT="ralph-[A-Za-z0-9_-]*guard[A-Za-z0-9_.-]*|ralph_protected_regions\.py|ralph-githooks-test\.sh|\.githooks${HB}|\.claude/settings\.json|\.ralph/PROMPT\.md|ref-clusters-ensure\.sh|lib/ref-clusters\.sh|tpch-ref-recover\.sh|lib/gate-stamp\.sh|(~|\\\$HOME|\\\$\{HOME\}|/home/[A-Za-z0-9_.-]+|/root)/\.ralph${HB}|\.git/(config|hooks)"
+PROT="ralph-[A-Za-z0-9_-]*guard[A-Za-z0-9_.-]*|ralph_protected_regions\.py|ralph-githooks-test\.sh|\.githooks${HB}|\.claude/settings\.json|\.ralph/PROMPT\.md|\.ralph/gate-exceptions\.md|ref-clusters-ensure\.sh|lib/ref-clusters\.sh|tpch-ref-recover\.sh|lib/gate-stamp\.sh|(~|\\\$HOME|\\\$\{HOME\}|/home/[A-Za-z0-9_.-]+|/root)/\.ralph${HB}|\.git/(config|hooks)"
 if writes_to "$PROT" "$nomsg"; then
-  deny "shell write/rm/mv/chmod of a harness mechanism file (ralph guards, .githooks, .claude/settings.json, .ralph/PROMPT.md, ref-cluster / gate-stamp plumbing, .git/config, ~/.ralph/). These are owner-only (M5): write an escalation block into the task and mark it [!]."
+  deny "shell write/rm/mv/chmod of a harness mechanism file (ralph guards, .githooks, .claude/settings.json, .ralph/PROMPT.md, .ralph/gate-exceptions.md, ref-cluster / gate-stamp plumbing, .git/config, ~/.ralph/). These are owner-only (M5): write an escalation block into the task and mark it [!]."
 fi
 
 exit 0

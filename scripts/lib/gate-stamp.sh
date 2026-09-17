@@ -10,7 +10,8 @@
 #    "dirty_code": true|false,
 #    "binary_sha256": "<sha256 of the engine binary, or empty>",
 #    "result": "PASS|FAIL|FAIL-TIMEOUT|NO-COMPARE|SKIP-BLOCKED|SKIP",
-#    "reason": "<why the result was overridden, or empty>",
+#    "reason": "<why this is not a PASS; always set for FAIL/FAIL-TIMEOUT/
+#                NO-COMPARE/SKIP-BLOCKED, from the caller or a default>",
 #    "time": "<date -Iseconds>"}
 #
 # `code_tree` is INDEX-based (the staged blob ids of the engine source), so it
@@ -42,18 +43,36 @@ _gate_stamp_json_str() {
     printf '"%s"' "${s}"
 }
 
-# gate_stamp_write <gate> <result> [binary_path]
-# GATE_STAMP_REASON (optional) is recorded as "reason" (e.g. why a gate stamped
-# NO-COMPARE or FAIL-TIMEOUT); the dirty_code override replaces it.
+# gate_stamp_write <gate> <result> [binary_path] [reason]
+# The 4th argument, or GATE_STAMP_REASON, is recorded as "reason": WHY the
+# result is not a PASS. Every non-PASS/non-SKIP result gets one — when the
+# caller passes none, a generic per-result default is filled in, so an audit
+# never reads a bare "FAIL"/"SKIP-BLOCKED" with an empty reason field (the
+# commit-msg hook quotes it back when it rejects a commit). The dirty_code
+# override replaces whatever the caller passed.
+_gate_stamp_default_reason() { # <gate> <result>
+    case "${2}" in
+        SKIP-BLOCKED) printf '%s' "${1}: a precondition of the gate is unavailable (blocked); the gate did not compare anything. A blocked gate is a failed gate unless an owner row in .ralph/gate-exceptions.md covers it." ;;
+        FAIL)         printf '%s' "${1}: gate reported FAIL (non-zero exit); see the gate's own log for the failing case." ;;
+        FAIL-TIMEOUT) printf '%s' "${1}: at least one query exceeded the gate timeout; a timeout is a FAIL, not a slow PASS." ;;
+        NO-COMPARE)   printf '%s' "${1}: gate exited 0 without comparing against its baseline (subset probe, missing baseline, or digest off), so it is not evidence for this tree." ;;
+        *)            printf '%s' "" ;;
+    esac
+}
+
 gate_stamp_write() {
-    local gate="${1:-}" result="${2:-}" bin="${3:-}"
-    local dir tree head sha="" now tmpf code_tree dirty_code=false reason="${GATE_STAMP_REASON:-}" orig="${2:-}"
+    local gate="${1:-}" result="${2:-}" bin="${3:-}" argreason="${4:-}"
+    local dir tree head sha="" now tmpf code_tree dirty_code=false reason="${argreason:-${GATE_STAMP_REASON:-}}" orig="${2:-}"
     case "${result}" in
         PASS|FAIL|FAIL-TIMEOUT|NO-COMPARE|SKIP-BLOCKED|SKIP) ;;
         *) echo "gate-stamp: invalid result '${result}' for gate '${gate}' — not stamped" >&2; return 0 ;;
     esac
     [[ "${gate}" =~ ^[A-Za-z0-9._-]+$ ]] || {
         echo "gate-stamp: invalid gate name '${gate}' — not stamped" >&2; return 0; }
+    # Fill the reason for every non-PASS result the caller left unexplained.
+    if [[ -z "${reason}" ]]; then
+        reason="$(_gate_stamp_default_reason "${gate}" "${result}")"
+    fi
     dir="${GATE_STAMP_DIR:-${GATE_STAMP_ROOT}/tmp/gate-stamps}"
     mkdir -p "${dir}" 2>/dev/null || {
         echo "gate-stamp: cannot create ${dir} — not stamped" >&2; return 0; }

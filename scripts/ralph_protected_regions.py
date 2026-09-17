@@ -9,6 +9,8 @@ The loop (RALPH_LOOP=1) may not edit:
       from the line `## Current Priority` up to (not incl.) the next `## ` line
   * harness mechanism files                         (whole file; HARNESS_SUFFIXES,
       scripts/ralph-*guard*, .githooks/*, anything under ~/.ralph/)
+      — this includes .ralph/gate-exceptions.md, the owner-only table that
+      decides when a SKIP-BLOCKED gate stamp may be committed
 
 Two entry points share the region logic so they cannot drift:
 
@@ -59,6 +61,7 @@ HARNESS_SUFFIXES = (
     "scripts/ralph-githooks-test.sh",
     ".claude/settings.json",
     ".ralph/PROMPT.md",
+    ".ralph/gate-exceptions.md",
     "scripts/ref-clusters-ensure.sh",
     "scripts/lib/ref-clusters.sh",
     "scripts/tpch-ref-recover.sh",

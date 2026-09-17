@@ -219,11 +219,47 @@ check allow 'grep -n PGDATA bench/tpch/stop_goopg.sh | head'
 check allow 'less bench/tpch/stop_pg.sh'
 check allow 'grep -rn GOOPG_SKIP_PRECOMMIT=1 .githooks/'
 check deny  'export GOOPG_SKIP_PRECOMMIT=1; git commit -m x'
+# --- hole C: .ralph/gate-exceptions.md is owner-only -------------------------
+check deny  'printf "| P0-E5 | tpcds-sf025 | 99 | 2099-01-01 | x |\n" >> .ralph/gate-exceptions.md'
+check deny  'sed -i "s/2026-09-20/2099-01-01/" .ralph/gate-exceptions.md'
+check deny  'rm .ralph/gate-exceptions.md'
+check deny  'cp /tmp/mine.md .ralph/gate-exceptions.md'
+check allow 'cat .ralph/gate-exceptions.md'
+check allow 'grep -n tpcds-sf025 .ralph/gate-exceptions.md'
+check allow 'cp .ralph/gate-exceptions.md /tmp/copy.md'
 check deny  'bash bench/tpch/stop_goopg.sh'
 # --- interactive sessions are unaffected ------------------------------------
 check allow 'pkill -f goopg' 0
 check allow 'psql -p 65433 -c "DROP TABLE x"' ''
 check allow 'git commit --no-verify -m x' 0
+
+# --- denial logging: ci/logs/ralph-guard-denials.log --------------------------
+LOGROOT="$(mktemp -d)"
+( cd "$LOGROOT" && git init -q . ) >/dev/null 2>&1
+bash_json 'psql -p 65433 -c "DROP TABLE x"' \
+  | RALPH_LOOP=1 CLAUDE_PROJECT_DIR="$LOGROOT" "$GUARD" >/dev/null
+if grep -q 'tool=Bash rule=ref-cluster-write:[0-9]* subject=psql -p 65433' "$LOGROOT/ci/logs/ralph-guard-denials.log" 2>/dev/null
+then pass=$((pass + 1)); else fail=$((fail + 1)); echo "FAIL(log) bash denial not logged"; cat "$LOGROOT/ci/logs/ralph-guard-denials.log" 2>/dev/null; fi
+bash_json 'git commit --no-verify -m x' \
+  | RALPH_LOOP=1 CLAUDE_PROJECT_DIR="$LOGROOT" "$GUARD" >/dev/null
+if [ "$(wc -l < "$LOGROOT/ci/logs/ralph-guard-denials.log")" = 2 ] \
+   && grep -q 'rule=gate-bypass' "$LOGROOT/ci/logs/ralph-guard-denials.log"
+then pass=$((pass + 1)); else fail=$((fail + 1)); echo "FAIL(log) second denial not appended"; fi
+bash_json 'psql -p 5533 -c "select 1"' \
+  | RALPH_LOOP=1 CLAUDE_PROJECT_DIR="$LOGROOT" "$GUARD" >/dev/null
+if [ "$(wc -l < "$LOGROOT/ci/logs/ralph-guard-denials.log")" = 2 ]
+then pass=$((pass + 1)); else fail=$((fail + 1)); echo "FAIL(log) allowed command was logged"; fi
+# a long command is truncated to 200 chars of subject and the hook still denies
+LONG="psql -p 65433 -c \"DROP TABLE x\" # $(printf 'y%.0s' $(seq 1 400))"
+if [ "$(run_bash 1 "$LONG")" = deny ]; then pass=$((pass + 1)); else fail=$((fail + 1)); echo "FAIL(log) long cmd not denied"; fi
+if [ "$(awk -F'subject=' 'END{print length($2)}' "$LOGROOT/ci/logs/ralph-guard-denials.log")" -le 200 ]
+then pass=$((pass + 1)); else fail=$((fail + 1)); echo "FAIL(log) subject not truncated"; fi
+# an unwritable log directory must not change the decision
+UNW="$(mktemp -d)"; ( cd "$UNW" && git init -q . ) >/dev/null 2>&1; chmod 500 "$UNW"
+if [ "$(bash_json 'psql -p 65433 -c "DROP TABLE x"' | RALPH_LOOP=1 CLAUDE_PROJECT_DIR="$UNW" "$GUARD" \
+        | grep -c '"deny"')" = 1 ]
+then pass=$((pass + 1)); else fail=$((fail + 1)); echo "FAIL(log) unwritable log changed the decision"; fi
+chmod 700 "$UNW"; rm -rf "$UNW"
 
 # --- file guard (Edit|Write|MultiEdit) ---------------------------------------
 TD="$(mktemp -d)"; trap 'rm -rf "$TD"' EXIT
@@ -269,7 +305,7 @@ fcheck deny  "$(ej Edit "$TD/.ralph/fix_plan.md" '1. do the important thing' '1.
 fcheck allow "$(ej Edit "$TD/.ralph/fix_plan.md" '- [ ] **M0142-0001' '- [x] **M0142-0001')"
 fcheck allow "$(ej Edit "$TD/other.md" a b)"
 mkdir -p "$TD/scripts/lib" "$TD/.githooks" "$TD/.claude"
-for f in scripts/ralph-bash-guard.sh scripts/lib/gate-stamp.sh .githooks/pre-commit .claude/settings.json .ralph/PROMPT.md scripts/other.sh; do
+for f in scripts/ralph-bash-guard.sh scripts/lib/gate-stamp.sh .githooks/pre-commit .claude/settings.json .ralph/PROMPT.md .ralph/gate-exceptions.md scripts/other.sh; do
   printf 'x\n' > "$TD/$f"
 done
 fcheck deny  "$(ej Edit "$TD/scripts/ralph-bash-guard.sh" x y)"
@@ -277,6 +313,8 @@ fcheck deny  "$(ej Write "$TD/.githooks/pre-commit" 'exit 0' '')"
 fcheck deny  "$(ej MultiEdit "$TD/.claude/settings.json" x y)"
 fcheck deny  "$(ej Edit "$TD/.ralph/PROMPT.md" x y)"
 fcheck deny  "$(ej Edit "$TD/scripts/lib/gate-stamp.sh" x y)"
+fcheck deny  "$(ej Edit "$TD/.ralph/gate-exceptions.md" x y)"
+fcheck deny  "$(ej Write "$TD/.ralph/gate-exceptions.md" '| P0-E5 | tpcds-sf025 | 99 | 2099-01-01 | x |' '')"
 fcheck deny  "$(ej Write "$HOME/.ralph/state.json" '{}' '')"
 fcheck allow "$(ej Edit "$TD/scripts/other.sh" x y)"
 sj() { python3 -c 'import json,sys; t,cwd=sys.argv[1:3]; ti=json.loads(sys.argv[3])
@@ -295,6 +333,16 @@ fcheck allow "$(sj replace_in_files "$TD" '{"needle":"x","repl":"y","mode":"lite
 fcheck allow "$(sj find_symbol "$TD" '{"relative_path":"CLAUDE.md","name_path_pattern":"x"}')"
 fcheck deny  "$(sj execute_shell_command "$TD" '{"command":"rm .githooks/pre-commit"}')"
 fcheck allow "$(sj execute_shell_command "$TD" '{"command":"ls"}')"
+# file-guard denials are logged too
+FLOGROOT="$(mktemp -d)"
+ej Edit "$TD/CLAUDE.md" claude x | RALPH_LOOP=1 CLAUDE_PROJECT_DIR="$FLOGROOT" "$FGUARD" >/dev/null
+if grep -q "tool=file-guard rule=protected-region subject=Edit $TD/CLAUDE.md" "$FLOGROOT/ci/logs/ralph-guard-denials.log" 2>/dev/null
+then pass=$((pass + 1)); else fail=$((fail + 1)); echo "FAIL(log) file-guard denial not logged"; cat "$FLOGROOT/ci/logs/ralph-guard-denials.log" 2>/dev/null; fi
+ej Edit "$TD/other.md" a b | RALPH_LOOP=1 CLAUDE_PROJECT_DIR="$FLOGROOT" "$FGUARD" >/dev/null
+if [ "$(wc -l < "$FLOGROOT/ci/logs/ralph-guard-denials.log")" = 1 ]
+then pass=$((pass + 1)); else fail=$((fail + 1)); echo "FAIL(log) allowed edit was logged"; fi
+rm -rf "$FLOGROOT" "$LOGROOT"
+
 out="$(ej Edit "$TD/CLAUDE.md" claude x 2>/dev/null | RALPH_LOOP=0 "$FGUARD")"
 if [ -z "$out" ]; then pass=$((pass + 1)); else fail=$((fail + 1)); echo "FAIL(file) RALPH_LOOP=0 not silent"; fi
 

@@ -124,6 +124,9 @@ ci/logs/
 *.pyc
 
 !ci/logs
+# `ci/logs/*` below already covers the harness audit logs
+# (precommit-skips.log, ralph-guard-denials.log, gate-exception-usage.log):
+# they are machine-appended run state, never committed.
 ci/logs/*
 !ci/logs/action-items.md
 !ci/logs/launch.log

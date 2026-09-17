@@ -18,11 +18,11 @@ the order written inside the item. `[!]` tasks are not selectable.
    P0-E5 (fix it together with M0143-0008) → P0-E6 (owner restores `:65433`;
    `[!]` until the owner marks it done — do not work around it) →
    P0-E7 (bulk re-measurement of everything landed since 2026-09-16 05:44).
-   **While P0-E6 waits on the owner**, select in this order: M0143 tasks whose
-   gates do not need TPC-H data (unit/regress/sf025 only), then recon-only tasks
-   (no production diff) from items 3–6, then M-NIGHTLY items; if none is
-   selectable, follow AGENT.md S8 (escalate and stop). Code whose required gate
-   needs TPC-H data is not committed before P0-E6 (G6).
+   **P0-E4, P0-E5 and P0-E6 are `[x]` as of 2026-09-18** — TPC-H on `:65433` is
+   restored, `data.HOLD` is released and `tpch-spotcheck` PASSes, so **P0-E7 is
+   the next task and the TPC-H gates run normally again**. There is no standing
+   SKIP-BLOCKED exception any more: `.ralph/gate-exceptions.md` is empty, so a
+   blocked TPC-H gate is a failed gate (AGENT.md G1).
 1. **Regressions found by P0-E7**, one task each, in the order P0-E7 lists them.
 2. **M0141-S2a-fix2r** — re-apply the PG-faithful `hashAggEntrySize` change that
    was discarded for parity reasons (owner Q4: no reverts). Degradations it
@@ -32,13 +32,23 @@ the order written inside the item. `[!]` tasks are not selectable.
    M0141-S2b-6-resume, then M0139-0007c.
 4. **M0141-S7 — cost diagnosis only.** The Incremental Sort candidate exists
    but loses on cost (S2b-7: 3733.01 vs 3730.89). Compare the cost breakdown
-   with PG for the 14 queries. **No executor work.**
+   with PG for the 14 queries. **No production-code change under this item** —
+   not even a trace inside an existing trace guard. If instrumentation is
+   genuinely needed, file a separate `Kind: impl` task, run the values gates and
+   report the parity numbers (this is what `073ab2748`/`c7e231ae1` got wrong).
 5. **M0140-0006a → 0006b → 0006c** (partial-Append).
 6. **M0142-0005**, then **M0142-0016c**, then **M0142-0003i** (0003i only after
    P0-E5 and P0-E6 are `[x]`).
 7. **M0143 remaining tasks**, top to bottom (includes the parser failures).
 8. M-NIGHTLY open items, then the pre-existing milestones
    (M0119 → M0122 → M0131 → M0134 → M0135/M0136 → M0095/M0110).
+
+**New task fields (2026-09-18).** Every task filed from now on carries, each at
+the start of its own line: `Kind: recon|impl`, `Parent: <task-id|none>`, and on
+completion `Movement: yes — <instrument + number>` or `Movement: none`. A
+trace-only change to `internal/` or `cmd/` is `Kind: impl`, never a recon
+(AGENT.md C1). Production commits now need their gate stamps **whatever
+milestone they name**, M-NIGHTLY included.
 
 FROZEN-PREFIXES: M0142-0008a-3 M0142-0008c-1a M0142-0008c-3d M0142-0008c-4
 
@@ -159,7 +169,18 @@ uncommitted `ALTER TABLE … ADD CONSTRAINT` transaction on it was stopped with
     `scripts/tpcds-sf025-regression.sh sweep` — PASS=96 MISMATCH=0 ERROR=0
     TIMEOUT=0, plan-shapes 99/99 identical. `tpch-spotcheck` SKIP-BLOCKED by
     the `:65433` hold; ledger: P0-E7 is the re-run owner.
-- [!] **P0-E6 — restore `:65433` (OWNER-RUN).** Parent: none. The owner runs
+- [x] **P0-E6 — restore `:65433` (OWNER-RUN).** **DONE 2026-09-18 by the owner:**
+  `--evidence-only` preserved the damaged cluster at
+  `bench/tpch/runtime_goopg/evidence-20260918/` (875 entries, 2,131,351,563 B,
+  verified), the full run restored from the pre-loss clone (868 entries,
+  2,046,680,662 B; clone untouched), rebuilt the pinned
+  `bench/tpch/runtime_goopg/goopg-bin` at `080323cbd`
+  (sha256 9c9f0410…), restarted `:65433` capped and
+  `scripts/tpch-spotcheck.sh` returned **PASS (Q12=2, Q13=34)**, so `data.HOLD`
+  is released. The previous data dir is kept at
+  `data.pre-restore-20260918-071005`. **P0-E7 is now selectable and the TPC-H
+  gates must run normally again.** Parent: none. Kind: impl. Movement: none.
+  Original instructions: the owner runs
   `scripts/tpch-ref-recover.sh --i-am-owner --evidence-only` **now** (graceful stop
   + evidence copy; leaves `:65433` stopped with HOLD), then after P0-E5
   `scripts/tpch-ref-recover.sh --i-am-owner`: restore from the pre-loss clone
@@ -168,7 +189,13 @@ uncommitted `ALTER TABLE … ADD CONSTRAINT` transaction on it was stopped with
   `scripts/tpch-spotcheck.sh` PASS. **The loop does not run it, and does not
   mark this task.**
 - [ ] **P0-E7 — bulk re-measurement since 2026-09-16 05:44.** Parent: none.
-  Depends on P0-E6 `[x]`. On a private lane with a HEAD binary: `tpch-spotcheck`,
+  Kind: impl. **Now selectable (P0-E6 done 2026-09-18).** Scope note added by the
+  owner: this also clears the debt of the **18 commits between `4f6f81734` and
+  `c7e231ae1` that landed on a SKIP-BLOCKED `tpch-spotcheck` stamp** plus the
+  three M-NIGHTLY production commits that were checked by nothing
+  (`c03742e2f` `internal/executor/expr.go`, `6122fb3c8`
+  `internal/postmaster/dispatch.go`, `2a99ff338` `internal/parser/*`); name each
+  in the report with its TPC-H values result at HEAD. On a private lane with a HEAD binary: `tpch-spotcheck`,
   `tpch-acceptance-arm`, sf025 sweep, TPC-H parity serial and parallel, TPC-DS
   parity. Compare with `27d4ae001` (TPC-H match 8). For any regression, bisect
   to the commit and file one task per regression (banner item 1) — **no
@@ -177,7 +204,17 @@ uncommitted `ALTER TABLE … ADD CONSTRAINT` transaction on it was stopped with
   match, categories, values) and write the numbers for the owner's freeze
   decision; this A/B is also the evidence csq-R2's reopen condition names.
   Record every gate stamp and plan-file sha256.
+- [ ] **P0-D3 — split the M0141-S7 design doc and fix its `Status:`.**
+  Parent: none. Kind: impl (docs only).
+  `docs/design/0100-0149/m0141-s7-readjudicate-and-scope-incremental-sort.md` is
+  **1501 lines** (D3's limit is 800) and its `Status:` still reads "recon landed
+  2026-09-16, no production change" although `073ab2748` and `c7e231ae1` landed
+  production traces through it. Split by task id (one doc per `-cd-*` sub-task,
+  linking back), correct every `Status:` line, and index the new docs in
+  `docs/design/README.md` in the same commit. Do this before appending anything
+  else to that doc.
 - [ ] **P0-H11 — stale-comment cleanup after the owner's M0142-0008 decision.**
+  Kind: impl
   Parent: P0-E7. Not selectable until the owner records the decision in the
   banner. Remove "admitSemiAnti stays false" comments (e.g.
   `joinsearchseam.go:1552`) and the two probe tests if the chain is removed.
@@ -2137,6 +2174,7 @@ that comment names as parity-inert.
     are resolved** — the banner's "M0141-S2a-fix and M0139-0007" line's
     `M0139-0007` half is complete.
 - [ ] **M0139-0007c — port `get_expr_width` for Memoize's cache-key width
+  Kind: impl
   term.** `costMemoizeRescan`'s per-key contribution
   (`hashsize.EntryBytes(nkeys, 0)`, both currencies) still stands in for PG's
   `get_expr_width` sum over `mpath->param_exprs`
@@ -2390,6 +2428,7 @@ setting that yields a serial plan.
     must land before or with 0006b going live). No production code changed.
     Ledger row appended (task-id `m0140-0006`).
 - [ ] **M0140-0006a — expose SetOp-branch `PartialPathlist`.** Give each UNION
+  Kind: impl
   ALL branch (`planner.go:1106` `planSegment`, folded via `applySetOp`/
   `foldSetOpRange` at `planner.go:1120-1208`) a route to retain a `RelOptInfo`
   with a `PartialPathlist` instead of collapsing straight to a finished `Node`
@@ -2403,6 +2442,7 @@ setting that yields a serial plan.
   yet. Read `docs/design/0100-0149/m0140-0006-decomposition-into-a-b-c.md`
   first.
 - [ ] **M0140-0006b — the partial-Append cost producer.** Depends on
+  Kind: impl
   M0140-0006a. The `addPartialHashJoinPath` counterpart
   (`joinpathsparallel.go:82`'s shape): seed `setOpRel.PartialPathlist` from
   0006a's branch partial paths, priced on PG's `cost_append` partial-path
@@ -2416,6 +2456,7 @@ setting that yields a serial plan.
   0006c for why. Re-measure Q5/Q76 (and Q2/Q14/Q71/Q75 per the six-query
   denominator note above) via `scripts/tpcds-sf025-regression.sh`.
 - [ ] **M0140-0006c — executor claim-set for `setOp` under `Gather`.** A
+  Kind: impl
   correctness prerequisite, not an optimization, and independent of
   0006a/0006b's path-search work. `gatherOp` (`internal/executor/
   operators_gather.go`) has each worker build its own full copy of the child
@@ -2677,6 +2718,7 @@ spill route is net-negative.
     as closed for this milestone group absent new evidence — do not
     re-attempt without a different substitution or a different mechanism.
 - [ ] **M0141-S2a-fix2r — re-apply S2a-fix2 (owner Q4: no reverts).**
+  Kind: impl
   Parent: none. Depends on P0-E7 `[x]`. S2a-fix2 was implemented, measured and
   discarded before commit for parity reasons only (no wrong rows); its
   predecessor idea `GOOPG_HASHAGG_WIDTH_CURRENCY` (R120 `9333db6b6`) was deleted
@@ -3094,6 +3136,7 @@ spill route is net-negative.
     `m0141-s2b-6`). Follow-up filed as **M0141-S2b-6-resume** below, gated
     on the M0142-0003k TPC-H cluster reload (same blocker, not a new one).
   - [ ] **M0141-S2b-6-resume** — repeat S2b-6's Hashed-vs-Sorted `PathAgg`
+    Kind: impl
     term-by-term cost diff for Q4/Q5/Q12/Q21 against the real HammerDB
     SF1-loaded `:65433` cluster once reloaded (no synthetic fixture — real
     `inputRows`/`numGroups` cardinalities, which is what separates the
@@ -3191,6 +3234,7 @@ spill route is net-negative.
   `parallel-query/06` §4.1 — both currently render as a hash aggregate
   regardless of `Strategy`); re-measure the full corpus. Needs S5.
 - [ ] **M0141-S7 — re-adjudicate and implement Incremental Sort** — **verified
+  Kind: recon
   2026-09-15: PG emits `Incremental Sort` in 14 of the 99 TPC-DS reference plans
   (`bench/tpcds/plans-pg/`), and goopg has no implementation at all** — the only
   occurrences in `internal/` are **7 hits across 7 files, every one a comment or
@@ -3427,6 +3471,7 @@ spill route is net-negative.
     writeup: design doc's "Update 2026-09-17g" section. exec-a/b/c are now
     ALL LANDED.
   - [ ] **M0141-S7-exec-d (deferred, ledger row filed 2026-09-17)** —
+    Kind: impl
     `sortOp` feature parity once exec-a/b/c land and the corpus is
     measured: spill-to-disk, packed-tuple retention (`GOOPG_SORT_PACKED`),
     ctid passthrough (`ORDER BY ... FOR UPDATE` over an Incremental Sort),
@@ -3503,8 +3548,11 @@ spill route is net-negative.
     `upper.ordered` producer lines of ANY kind besides the winning seed
     Sort) despite being classified alongside Q4/Q11 as a Nested-Loop-shaped
     witness that DOES reach the arm.
-    Parent: M0141-S7. Hypothesis
-    (unverified): Q64's outer join is over two references to the same
+    Kind: impl (owner reclassification 2026-09-18 — it landed env-gated
+    traces in non-test internal/optimizer files, which C1 forbids for a recon)
+    Parent: M0141-S7
+    Movement: none
+    Hypothesis (unverified): Q64's outer join is over two references to the same
     materialized CTE (`cross_sales cs1, cross_sales cs2`); a CTE-scan
     boundary may drop `SearchCandidateKeys` for one or both self-join legs —
     same family as [[cte_leaves_reach_search_wrapped_in_filter]] but for
@@ -3607,7 +3655,11 @@ spill route is net-negative.
     also consider building its `PathIncrementalSort` over the SAME cheap
     seed candidate `createOrderedPaths`'s arm 1/2 already uses, when that
     seed's own claimed ordering has a genuine partial (not full, not empty)
-    prefix match. Parent: M0141-S7.
+    prefix match.
+    Kind: impl (owner reclassification 2026-09-18 — same reason as
+    M0141-S7-cd-q64: env-gated traces in non-test internal/optimizer files)
+    Parent: M0141-S7
+    Movement: none
     - **Done 2026-09-18d — mixed verdict, one real gap confirmed (Q4),
       six witnesses cleared.** The corpus splits across two different
       `addOrderedPaths` callers with different `SearchCandidates`
@@ -4026,6 +4078,7 @@ cross-layer programme that has never been scoped.
   (below, under the engine-correctness-carryover milestone — unrelated to
   join-order costing, so not filed as another M0142 item).
 - [ ] **M0142-0003i — resume -0003f now that -0003g's index-accelerated FK
+  Kind: impl
   validation has landed** — **OWNER AMENDMENT 2026-09-17 (overrides the text
   below): depends on P0-E5 and P0-E6 `[x]`. Never run DDL on the shared `:65433`
   (AGENT.md R1): add the FKs in `bench/tpch/build_schema_goopg.sh` (or a
@@ -4352,6 +4405,7 @@ cross-layer programme that has never been scoped.
   actual=6422. Gates: none beyond the gate itself (measurement-only task, no
   production code touched this loop).
 - [ ] **M0142-0005 — give the executor a per-worker Memoize so a Gather-wrapped
+  Kind: recon
   partial NLI+Memoize candidate can compete (RE-SCOPED 2026-09-16)** — the
   2026-09-16 recon (`docs/design/0100-0149/m0142-0005-recon-partial-memoize-refused-by-gather-eligibility.md`)
   found the original B6/B8 framing below is **stale**: Memoize already exists
@@ -7607,7 +7661,9 @@ reported, and the values and unit gates are the bar.
   type's shape (the M0143-0002c repro, now also across a restart, not just
   live-session).
   - **Done 2026-09-17.**
-    Movement: yes — a same-named composite/domain/range type declared in two
+    Movement: none — real correctness work, but not one of S3's three
+    instruments (owner reclassification 2026-09-18). What it achieved: a
+    same-named composite/domain/range type declared in two
     non-default databases now shows each database's own shape (not the
     M0143-0002c UNION) in both a live session and, after this task's own
     restart bug fix below, across a `Close`/`Open` restart; confirmed by a
@@ -7671,7 +7727,8 @@ reported, and the values and unit gates are the bar.
   own regression test (a non-default-DB DROP DOMAIN / GRANT ON TYPE /
   CREATE TYPE AS RANGE case).
   - **Done 2026-09-17 (item 2 only — item 1 carved out to M0143-0002h).**
-    Movement: yes — a GRANT/REVOKE ON TYPE or DROP DOMAIN issued against a
+    Movement: none — real correctness work, not S3 movement (owner
+    reclassification 2026-09-18). What it achieved: a GRANT/REVOKE ON TYPE or DROP DOMAIN issued against a
     type declared in a non-default database now correctly mutates that
     database's own `pg_type`/`pg_attribute` heap instead of silently
     corrupting it (a stray duplicate row on GRANT, a surviving row on DROP);
@@ -8082,7 +8139,8 @@ reported, and the values and unit gates are the bar.
   (`PARTITION OF ... (col UNIQUE)` and `LIKE ... INCLUDING INDEXES` each
   asserting the resulting index appears in `pg_constraint` with `contype='u'`).
   - **Done 2026-09-18.**
-    Movement: yes — two independent CREATE-TABLE-time UNIQUE-index creation
+    Movement: none — real correctness work, not S3 movement (owner
+    reclassification 2026-09-18). What it achieved: two independent CREATE-TABLE-time UNIQUE-index creation
     paths (`operators_ddl.go`'s `likeUniqueIndexes` loop and
     `execCreatePartitionChild`'s `poc.UniqueColumns` loop) now populate
     `pg_constraint` with a `contype='u'` row, matching every sibling

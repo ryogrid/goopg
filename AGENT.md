@@ -561,10 +561,15 @@ obstacle: do not look for another command that achieves the same effect.
   a shared resource: file it as a task, add an escalation block naming it, and
   continue with the banner. The owner places it in the banner (normally at
   position 0). Do not reorder the banner yourself.
-- **S3** Every new task carries `Parent: <task-id|none>`; every task completed
-  from now on carries `Movement: yes — <evidence>` or `Movement: none`.
+- **S3** Every new task carries `Kind: recon|impl` and `Parent: <task-id|none>`;
+  every task completed from now on carries `Movement: yes — <evidence>` or
+  `Movement: none`. Write each field **at the start of its own line** — a field
+  buried mid-sentence does not count and the guard rejects it.
   *Movement* = PG match count changed, or a `CATEGORIES-EXCL-MATCH:` category
-  moved beyond ±3, or `make ea-ratchet` findings decreased.
+  moved beyond ±3, or `make ea-ratchet` findings decreased. `Movement: yes` must
+  cite one of those three instruments **with a number** on the same line;
+  anything else (a unit test now passing, a feature now working) is
+  `Movement: none` — real work, but not movement toward this goal.
 - **S4 Lineage budget.** After **5 consecutive** completed descendants of one
   root with `Movement: none`, do not select or file another descendant. Write an
   escalation block into the root (what was tried, what each step proved, the
@@ -585,7 +590,10 @@ obstacle: do not look for another command that achieves the same effect.
 
 ### C — Changes
 - **C1 Recon** commits touch no non-test file under `internal/` or `cmd/`
-  (comments and env-gated traces included).
+  (comments and env-gated traces included). **Adding a trace — even one fully
+  inside an existing `if …TraceEnabled` guard — makes the task an impl task**:
+  file one with `Kind: impl`, run the gates, and say so. The hooks read the
+  task's `Kind:` from `.ralph/fix_plan.md`, not the commit subject.
 - **C2 PG citation.** Every change claiming PG-faithfulness cites
   `./postgres/<file>:<line>` in its design doc.
 - **C3 Absorption (B2).** Where goopg and PG differ irreducibly (Datum 48 B vs
@@ -603,7 +611,8 @@ obstacle: do not look for another command that achieves the same effect.
   task and measurement that decide it. It resolves to *promote* or *delete*;
   HOLD is not an outcome. At most ~4 at once.
 - **C6** A production commit claimed unreachable/inert includes the evidence
-  (trace count zero over the full corpus) and still runs the values gates.
+  (a trace count of zero over the full corpus) **and** still runs the values
+  gates. "Inert by default" is a claim, not evidence.
 
 ### G — Gates and measurement
 Run on the change, in the task that changes production code:
@@ -620,6 +629,11 @@ Run on the change, in the task that changes production code:
   gate cannot run, produce: the command and failure text, the substitute gate
   and why it covers the risk, and a ledger row + `[ ]` task for the re-run. A
   gate this loop broke blocks every later production task until cleared.
+  A commit may land on a SKIP-BLOCKED stamp **only** when the owner has listed
+  that task id and gate in `.ralph/gate-exceptions.md` (with a commit cap and an
+  expiry) and the body carries a `ledger:` line. The loop never edits that file
+  and never generalises one task's exception into a standing one; without a row,
+  a blocked gate means: mark the task `[!]`, escalate, select elsewhere.
 - **G2** Gate scripts write `tmp/gate-stamps/<gate>.json` (tree hash, binary
   sha256, result). `.githooks/commit-msg` rejects an M0137–M0143 planner/executor
   commit without matching PASS stamps and a `CATEGORIES-EXCL-MATCH:` line (or

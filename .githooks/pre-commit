@@ -51,7 +51,10 @@ fi
 #   - no edits to CLAUDE.md, the fix_plan '## Current Priority' banner, or the
 #     AGENT.md PLAN-PARITY-HARNESS section (region text of HEAD vs index),
 #     nor to the harness mechanism files (guards, .githooks, settings.json,
-#     .ralph/PROMPT.md, ref-cluster / gate-stamp plumbing);
+#     .ralph/PROMPT.md, .ralph/gate-exceptions.md, ref-cluster / gate-stamp
+#     plumbing) — .ralph/gate-exceptions.md decides when a SKIP-BLOCKED gate
+#     stamp may be committed, so a loop that could edit it could waive its own
+#     gates (audit hole C);
 #   - .ralph/deferral_ledger.md is append-only and owner rows stay owner rows;
 #   - fix_plan lineage budget / Parent: / FROZEN rules.
 if [ "${RALPH_LOOP:-}" = "1" ]; then
