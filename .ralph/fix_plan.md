@@ -2444,7 +2444,7 @@ spill route is net-negative.
   `costsize.c:2801/2824`), default-on, no flag. Run all values gates (values must
   hold — a wrong-rows result stops the task). File every query whose categories
   worsen (Q31, Q18 were seen) as its own task with `Parent: M0141-S2a-fix2r`.
-- [ ] **M0141-S2a-fix1-sweep — recon: other late/wrong width currencies.**
+- [x] **M0141-S2a-fix1-sweep — recon: other late/wrong width currencies.**
   Parent: none. fix1 (`ca574113c`, TPC-H match 6→8) is the only change in this
   programme proven to move the metric: width reached costing too late. Find every
   other cost-function input that is a goopg-native width/byte quantity, or is
@@ -2453,6 +2453,69 @@ spill route is net-negative.
   goopg site, and the expected movement (named queries/categories) — S5. File
   one implementation task per site with `Parent: M0141-S2a-fix1-sweep`. No
   production diff (C1).
+  - **Done 2026-09-18.** Full survey in
+    `docs/design/0100-0149/m0141-s2a-fix1-sweep.md`. Already covered and not
+    resweept: hash/merge/NL join + Gather/GatherMerge/(merge-join)Sort/Memoize
+    + base-rel-scan narrowing (`narrowcostinputs.go`, R121/R122); Memoize's
+    own cache-entry-size currency (already filed separately, M0139-0007c);
+    Append/Material (no such `PathKind` exists yet in goopg's planner — N/A
+    until M0140-0006 lands). Two new sites filed below. Two considered and
+    declined with reasons recorded in the design doc: DISTINCT (`distinctCost`
+    has no width/byte term at all — narrowing it would not change any cost it
+    charges) and SETOP (`costSetOp`'s full-row `numCols` is the semantically
+    correct quantity for whole-row dedup, not a currency defect). No code
+    changed (recon only, C1) — no unit-gate run needed; pre-commit hook's
+    pgbench smoke ran and PASSED.
+- [ ] **M0141-S2a-fix1-sweep-a — narrow the ORDERED upper rel's Sort pricing.**
+  Parent: M0141-S2a-fix1-sweep. `sizeUpperRelFromNode`
+  (`internal/optimizer/upperrel.go:177-187`) sizes `NCols`/`AvgVarBytes` from
+  the finished input Node's FULL `child.Output()`; `createOrderedPaths`
+  (`internal/optimizer/upperordered.go:64-133`) → `addOrderedPaths` →
+  `sortPathForBounded` (`internal/optimizer/joinpathsmerge.go:480-514`) then
+  prices the top-level ORDER BY Sort from that unnarrowed rel via
+  `pathNCols(sub)`/`pathAvgVarBytes(sub)`/`pathWidth(sub)`. PG's
+  `create_sort_path` (`postgres/src/backend/optimizer/util/pathnode.c:3221-3250`)
+  reads the already-narrow `subpath->pathtarget->width` instead
+  (`cost_sort`, `costsize.c:2144`). A ready-made keep-set mechanism already
+  exists — `sort.InputTarget`/`InputTargetKnown`
+  (`internal/optimizer/sort_input_target.go`, `deriveSortInputKeep`: sort-key
+  columns ∪ whatever the plan chain above the Sort reads) — but is stamped
+  too late (post-cost, `planner.go:1972/2027/2441`, all downstream of
+  `createOrderedPaths`) to be read at `sortPathForBounded`'s call site today.
+  Implementation: derive the same keep-set BEFORE `createOrderedPaths` runs
+  (sort keys ∪ the statement's own final SELECT-list output target, which is
+  knowable before costing for a top-level ORDER BY — no further Node sits
+  above it) and feed it into `sizeUpperRelFromNode` in place of the full
+  `child.Output()`, mirroring fix1's "compute once ahead of costing, consume
+  at the existing read site" shape. Gate: TPC-H Q18 (this file's own header
+  names its 1.5M-row Sort as the largest in the suite, and fix1's design doc
+  named its residual `aggregation-strategy`/`sort-strategy` mismatch as a
+  fix1-successor candidate) plus a TPC-DS SF0.25 serial-shaped re-capture,
+  `shape-delta.sh` diff, category movement (S5) — no category may rise.
+- [ ] **M0141-S2a-fix1-sweep-b — narrow WINDOW's internal sort costing.**
+  Parent: M0141-S2a-fix1-sweep. goopg's `windowOp` sorts internally
+  (`operators_window.go` `Open`) rather than taking pre-sorted input the way
+  PG's `WindowAgg` does, so `costWindow`
+  (`internal/optimizer/windowsetoppaths.go:206-238`) folds PG's separate
+  `create_sort_path` step into itself — but its caller, `addWindowPaths`
+  (`windowsetoppaths.go:260-284`), feeds it `len(cols)`/`nodeAvgVarBytes(cols)`/
+  `nodeTupleWidth(belowNode)` from `cols := belowNode.Output()`, the FULL row
+  of the node one level below, never narrowed; `sizeWindowRelFromNode`
+  (`windowsetoppaths.go:132-141`) makes the same full-`Output()` choice for
+  the rel's own published width. PG's real window-input Sort
+  (`create_one_window_path`, `postgres/src/backend/optimizer/plan/planner.c:4620-4760`)
+  is priced via `create_sort_path`'s already-narrow `subpath->pathtarget->width`
+  exactly as the ORDERED-rel case (sweep-a) — `cost_windowagg` itself
+  (`costsize.c:3098+`) takes no width parameter at all. Implementation: no
+  `InputTarget`-style stamp exists yet for Window (unlike Sort's); derive one
+  mirroring `sort_input_target.go`'s pattern — keep-set = PARTITION BY ∪
+  ORDER BY ∪ window-function argument columns ∪ whatever the plan chain above
+  this window level reads (`addWindowPaths` already threads `below`/
+  `belowNode` per spec group, so the "above" context is locally available
+  without a new tree walk). Gate: full TPC-DS SF0.25 serial capture (window
+  functions are far more common there than in TPC-H; no specific query
+  pre-identified), `shape-delta.sh` diff on any query whose tag set includes
+  a window/ranking shape, category movement (S5) — no category may rise.
 - [x] **M0141-S2b — GROUP_AGG rel publishes Pathlist, not Node, to the
   ORDER BY step** — **CLOSED 2026-09-16 as a scoping decomposition (not an
   implementation), same precedent as M0140-0006.** Design doc:

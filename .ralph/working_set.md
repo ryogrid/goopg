@@ -1,52 +1,56 @@
 (idle — nothing in flight)
 
-Last completed: **M0143-0007** — separated the K41 dimension-table `relpages`
-divergence's two candidate causes (R22 heap-fill vs R23 bpchar blank-padding)
-via a direct per-page free-space walk, settling the question the ledger had
-explicitly required ("do NOT infer from totals again").
+Last completed: **M0141-S2a-fix1-sweep** — the recon task banner item 3 names
+("find every other cost-function input that is a goopg-native width/byte
+quantity, or is narrowed after costing"). Selected per banner item 0's
+fallback order (P0-E6 `bench/tpch/runtime_goopg/data.HOLD` marker still
+present — owner has not cleared it; M0143 has no more selectable tasks,
+M0143-0007b is the sole `[ ]` item and stays blocked on an owner decision per
+its own text; this sweep is explicitly recon-only/no-production-diff, so it
+was next in the fallback list ahead of anything gated on P0-E7).
 
-Method (no cluster start needed — a permission block on starting the goopg
-sf025 cluster turned out to be a non-issue): both engines share PG18's exact
-page-header byte layout (`internal/storage/page.go`), so `pd_lower`/`pd_upper`
-were parsed directly off the raw on-disk relation files for TPC-DS SF0.25
-`customer`/`item` (files ID'd by exact byte-size match against `relpages`,
-cross-checked against a live read-only `SELECT` on the already-running
-`:65438` PG oracle). Result: goopg's pages are packed MORE tightly than PG's
-(smaller avg free/page on both tables) — rules out R22 — while the page-count
-ratio tracks the used-bytes ratio almost exactly (0.689/0.696 customer;
-0.558/0.584 item) — confirms R23 (bpchar blank-padding) as ~the whole cause.
-Cross-checked by a parallel investigation subagent's independent TSV-column
--length method, which agreed to a few percent.
+Method: read `narrowcostinputs.go`'s existing R121/R122 mechanism
+(`narrowJoinWidths`/`inheritNarrowedWidths`/`narrowBaseRelCostWidths`) to
+establish what is ALREADY covered, then grepped every remaining `sizeXRelFromNode`
+producer (`upperrel.go`, `distinctpaths.go`, `windowsetoppaths.go` x2) for the
+same "full `child.Output()`" pattern fix1 fixed for Aggregate, then checked
+each site's actual cost FUNCTION to see whether it reads that width at all
+(some don't — DISTINCT's `distinctCost` is pure per-row CPU) and cross-checked
+against the real PG source (`./postgres`) to confirm PG's own width there is
+already-narrow (so the goopg gap is real) rather than PG itself being
+full-width (SETOP: `costSetOp`'s whole-row `numCols` is semantically required,
+not a currency bug).
 
-What landed: `docs/design/0100-0149/m0143-0007-relpages-bpchar-padding-confirmed.md`
-(full method+numbers), `docs/design/README.md` index row, `.ralph/fix_plan.md`
-M0143-0007 `[x]` + new M0143-0007b filed (implement-or-decline R23 itself —
-NOT done this loop, since it reverses `internal/catalog/bpchar.go`'s
-documented, load-bearing trimmed-storage convention across multiple sibling
-paths (compareDatum, codec.go coerceTextLikeDatum, nbtree comparators, WAL
-pgoutput) — needs an owner decision + its own design before any code),
-`.ralph/deferral_ledger.md` row dated 2026-09-18. Commit `1e120eba7`.
-Recon/docs only — no Go files touched, so no unit-gate run was needed; the
-mandatory pgbench pre-commit smoke ran and PASSED (tps ~42-148 across the
-three builtin scripts, 0 failed).
+What landed: `docs/design/0100-0149/m0141-s2a-fix1-sweep.md` (full survey:
+covered/declined/filed sections with PG file:line citations),
+`docs/design/README.md` index row, `.ralph/fix_plan.md` M0141-S2a-fix1-sweep
+`[x]` + two new child tasks filed (`M0141-S2a-fix1-sweep-a` — ORDERED upper
+rel's Sort pricing, has a ready-made `sort.InputTarget` stamp that fires too
+late to be read at cost time; `M0141-S2a-fix1-sweep-b` — WINDOW's internal
+sort costing, no InputTarget-style stamp exists yet, needs a fresh
+derivation). Both are `Parent: M0141-S2a-fix1-sweep`, both are themselves
+selectable under the SAME banner-item-0 fallback only if they turn out to be
+recon-shaped too — they are NOT: they are real implementation tasks (S5-gated
+plan-parity measurement against `:65437` TPC-DS SF0.25 + TPC-H), so they are
+NOT selectable while P0-E6 is still waiting; they wait behind banner item 3's
+own position until P0-E7 clears, same as M0141-S2a-fix2r/-S2b-6-resume/
+M0139-0007c. Recon/docs only this loop — no Go files touched, no unit-gate
+run needed; the mandatory pgbench pre-commit smoke ran and PASSED.
 
-Gates run: `make ralph-state-guard` — found the same stale
-running/completed marker mismatch as prior loops (previous loop's clean-exit
-artifact), auto-repaired, clean after. Pre-commit hook's pgbench smoke: PASS.
-`ralph-lineage-guard` (via the hook): caught a real format bug in my first
-attempt — a new-task `Parent:` line must start its own body line, not sit
-mid-sentence after the bold title closes on a later line — fixed and re-committed
-clean.
+Gates run: `make ralph-state-guard` — found the same stale running/completed
+marker mismatch prior loops have hit (a previous loop's clean-exit artifact),
+auto-repaired, clean after. Pre-commit hook's pgbench smoke: PASS (checked at
+commit time).
 
 Next step: re-read `.ralph/fix_plan.md`'s `## Current Priority` banner.
-`bench/tpch/runtime_goopg/data.HOLD` (P0-E6) was still present as of this
-loop's start — re-check whether the owner has cleared it. If still held,
-continue the fallback order from the banner: next selectable M0143 item is
-whatever remains after M0143-0007/0007b in top-to-bottom order (check
-fix_plan for what's still `[ ]` — M0143-0007b itself is selectable but is
-explicitly gated on an owner decision before any code, so treat it as
-blocked and skip to the next M0143 task unless the owner has weighed in).
+Check `bench/tpch/runtime_goopg/data.HOLD` (P0-E6) again — if still present,
+continue the fallback order: M0143 has nothing selectable left
+(M0143-0007b blocked on owner decision); re-scan items 3-6 for any OTHER
+recon-only sub-task not yet done (M0141-S7's own remaining `[ ]` children,
+e.g. `M0141-S7-exec-d`, may or may not be recon-shaped — check its own text
+before selecting), then M-NIGHTLY items (many open, e.g.
+`testport/TestPort_PgStatActivity`, `race/internal/executor` — these do NOT
+need TPC-H data and are real candidates if no recon-only M0141/M0142 item
+remains).
 
-In-flight: none. (The background investigation subagent aa4452c5ed9219695
-completed and was thanked/closed via SendMessage — no further action needed
-from it.)
+In-flight: none.
