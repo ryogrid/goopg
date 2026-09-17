@@ -29,11 +29,23 @@ import (
 // / M0106-0010) — doc 02a §2.3 is the normative statement of these rules:
 //
 //  1. xmin == Invalid → not a real tuple.
-//  2. Any non-zero xmax → dead. Unconditional today: catalog mutations are
-//     delete+reinsert, and an aborted DDL's reinserted row dies by rule 3.
-//     (B0.2 — catalog heap UPDATE — upgrades this rule to consult the xmax's
-//     CLOG status so an ABORTED updater does not kill the only live version;
-//     that change lands WITH the update emit, not here.)
+//  2. Non-zero xmax → dead UNLESS the xmax transaction aborted (P0-E5 / B0.2:
+//     consult the xmax's CLOG status instead of the old unconditional-dead
+//     rule, so an ABORTED updater/deleter does not kill the only live
+//     version — see docs/design/0100-0149/p0-e4-catalog-xmax-loss-repro.md).
+//     "committed or in the recovered-CLOG unknown window → dead; aborted →
+//     live" (doc 02a §2.3's B0.2 rule). The crash-recovery implicit-abort
+//     sweep (initdb.Open, MarkUnknownAsAborted) always runs BEFORE any
+//     catalog reload, so a genuinely in-flight-at-crash xmax has already been
+//     resolved to Aborted by the time this filter runs; a residual Unknown
+//     status here means the XID predates the CLOG's retained horizon (frozen/
+//     truncated — treated as committed, matching storage.XidCommitted's
+//     OldestClogXid short-circuit and PG's own frozen-XID convention) or is a
+//     subtransaction XID that production never individually stamps in CLOG
+//     (M0143-0008's sibling gap — see the deferral ledger; a superseded row
+//     deleted by a committed-but-never-directly-stamped subxact can
+//     resurrect after a sufficiently later restart, out of scope for P0-E5's
+//     top-level-transaction incident).
 //  3. Aborted xmin → dead, for every layout. This is deliberately the ONLY
 //     xmin check for PG18-canonical rows: basebackup tuples carry upstream
 //     xmin values that are out-of-range for the local clog (GetStatus →
@@ -45,7 +57,16 @@ func catalogRowLive(clog *transam.CLog, ht storage.HeapTuple, requireCommittedXm
 		return false
 	}
 	if ht.Header.Xmax != storage.InvalidTransactionID {
-		return false
+		// No CLOG context (bootstrap/unit path without recovery wiring):
+		// conservative default, matches the pre-B0.2 behavior.
+		if clog == nil {
+			return false
+		}
+		if clog.GetStatus(ht.Header.Xmax) != transam.TxnStatusAborted {
+			return false // committed, sub-committed, or unknown/horizon: dead
+		}
+		// xmax aborted: this version was never actually superseded — it is
+		// still the live row. Fall through to the xmin checks below.
 	}
 	if clog == nil {
 		return true
@@ -94,10 +115,15 @@ func scanCatalogHeapRows(mgr *storage.Manager, rel storage.RelFileNode, clog *tr
 			if err != nil {
 				continue
 			}
-			if ht.Header.Xmin == storage.InvalidTransactionID ||
-				ht.Header.Xmax != storage.InvalidTransactionID {
+			if ht.Header.Xmin == storage.InvalidTransactionID {
 				continue
 			}
+			// P0-E5/B0.2: a non-zero Xmax is NOT rejected here — that was the
+			// bug (this pre-filter ran BEFORE catalogRowLive's CLOG-aware
+			// check below could ever see the tuple, so upgrading rule 2 in
+			// catalogRowLive alone was a no-op against production reload
+			// calls). catalogRowLive below is the single source of truth for
+			// xmax liveness now; decode only needs a real (xmin-valid) tuple.
 			row, requireCommitted, derr := decode(ht, storage.ItemPointer{Block: blk, Offset: slot})
 			if derr != nil {
 				continue

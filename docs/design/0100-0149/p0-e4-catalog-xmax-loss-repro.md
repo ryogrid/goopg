@@ -1,6 +1,7 @@
 # P0-E4 — reproducing the catalog-xmax/commit-status loss (2026-09-17)
 
-Status: landed (repro + regression tests). Fix is **P0-E5** (not yet done).
+Status: landed (repro + regression tests). **P0-E5 (the fix) has landed —
+see "P0-E5 — the fix" below.**
 
 ## Background
 
@@ -139,3 +140,98 @@ designed). No planner/executor/statistics production code changed, so
 are not required gates for this task (per AGENT.md's Plan-parity harness G
 table — those gates apply to production planner/executor/statistics
 changes).
+
+## P0-E5 — the fix (2026-09-17)
+
+Both halves landed together, per the resume point above.
+
+### Disk side: `catalogRowLive` + `scanCatalogHeapRows`'s OWN pre-filter
+
+`catalogRowLive` (`internal/initdb/catalog_heap_reload.go:43`) rule 2 was
+upgraded exactly as designed: a non-zero `Xmax` is dead only if
+`clog.GetStatus(Xmax) != TxnStatusAborted` (committed, sub-committed, or an
+unresolved/horizon "unknown" status are all treated as dead — matching doc
+`wal-pg-identical-stream/02a-phase-b0-enablers.md` §2.3's B0.2 rule: "xmax
+committed or in the recovered-CLOG unknown window → dead; aborted → live").
+The crash-recovery implicit-abort sweep (`initdb.Open`'s
+`clog.MarkUnknownAsAborted`) always runs before any catalog reload, so a
+genuinely in-flight-at-crash `Xmax` is already resolved to `Aborted` by the
+time this filter runs.
+
+**A second bug surfaced while verifying live**: `scanCatalogHeapRows`
+(`catalog_heap_reload.go:~105`) had its OWN inline pre-filter —
+`if ht.Header.Xmin == Invalid || ht.Header.Xmax != Invalid { continue }` —
+that ran BEFORE `catalogRowLive` was ever called, so the rule-2 upgrade above
+was a no-op against every production reload call until this pre-filter's
+`Xmax` half was removed too (the pre-filter now only rejects `Xmin ==
+Invalid`; `catalogRowLive` is the sole liveness decision). The design doc's
+§2.3 literally named this exact trap ("`scanCatalogHeapRows`'s own pre-filter
+never even reaches `catalogRowLive`'s xmax check") but the first pass at this
+fix missed it anyway — caught only because the P0-E4 regression tests were
+run LIVE against the actual fix, not just built. Two more inline copies of
+the identical pre-B0.1 pattern were found and fixed the same way in
+`internal/initdb/open.go`: `loadUserIndexesFromHeapForDB`'s two scans
+(pg_class RelKind='i' pass and pg_index pass) and the pg_statistic reload —
+all three now delegate to `catalogRowLive` instead of duplicating (and
+under-fixing) the filter inline. `detectCatalogDBOID` (`open.go:3310`, an
+early-bootstrap pg_database OID lookup with no `*transam.CLog` available at
+all) was deliberately left alone — it has no CLOG to consult and was already
+maximally conservative.
+
+**Known residual gap (not fixed, ledgered)**: a catalog row deleted by a
+SUBTRANSACTION whose parent later committed can still resurrect after a
+restart far enough in the future that `MarkUnknownAsAborted`'s sweep has
+already force-stamped the never-individually-marked sub-XID `Aborted` (goopg
+never calls `CLog.SetSubCommitted`/individually stamps sub-XIDs at
+parent-commit time, unlike PG's `TransactionIdCommitTree`) — see the deferral
+ledger row dated 2026-09-17 for task P0-E5. Out of scope: P0-E4's incident
+used only top-level transactions (no `SAVEPOINT`).
+
+### In-memory side: M0143-0008 (ALTER rollback-undo) — partially landed
+
+`AlterIndexUndoEntry` and `NotNullUndoEntry` (`internal/executor/session.go`)
+were added alongside the existing `DDLUndoEntry`/`DDLDropUndoEntry` pattern,
+recorded by `adoptExistingIndexAsConstraint` and `finishPrimaryKeyConstraint`
+(`operators_ddl.go`) and consumed by `ProcessRollbackUndos`
+(`operators_tx.go`), so a ROLLBACKed `ALTER TABLE ... ADD CONSTRAINT ...
+{PRIMARY KEY|UNIQUE} USING INDEX ...` now reverts `idx.IsConstraint`/
+`idx.Primary`/`idx.Deferrable`/`idx.InitiallyDeferred`/a constraint rename,
+plus any PRIMARY KEY NOT-NULL synthesis (`col.NotNull` and
+`tbl.NotNullConstraints`, including on every inheritance/partition child the
+synthesis cascade reached) — in the SAME session, with no restart, closing
+the exact symptom M0143-0008 described ("ROLLBACK reports success but does
+nothing"). Covered by
+`internal/testport/p0e5_alter_rollback_undo_test.go`.
+
+`ALTER TABLE ... DROP CONSTRAINT` also got undo for its three index-backed
+forms (PRIMARY KEY / UNIQUE / EXCLUDE — `execAlterTableDropConstraint`,
+`operators_ddl.go`): these drops are pure map-removals structurally identical
+to `DROP INDEX`, so they reuse the EXISTING `DDLDropUndoEntry`/`RestoreIndex`
+mechanism (`Table` is now allowed to be `nil` on that entry — guarded in
+`ProcessRollbackUndos` — for an index-only restore).
+
+**Deliberately NOT covered this task** (M0143-0008's own text scoped itself
+to "at minimum ADD CONSTRAINT/DROP CONSTRAINT", and the CHECK/FOREIGN
+KEY/NOT-NULL `DROP CONSTRAINT` branches mutate table-owned slices in place —
+`tbl.CheckConstraints`/`NamedChecks`/`ForeignKeys`/`NotNullConstraints`/
+`Columns[i].NotNull`, with their own cascades — rather than the simple
+map-removal the index-backed branches get for free): `DROP CONSTRAINT` for
+CHECK, FOREIGN KEY, and NOT NULL constraints still has no rollback-undo. See
+the deferral ledger row dated 2026-09-17 for task P0-E5 and the new
+`M0143-0008b` fix_plan item.
+
+### Gates run for the fix
+
+`go build ./...` clean. `go test ./internal/initdb/...
+./internal/catalog/... ./internal/executor/...` PASS.
+`go test -v -run 'TestPort_P0E4|TestPort_P0E5' ./internal/testport/` — all 5
+PASS (the three P0-E4 repro cases, unskipped, plus the two new P0-E5 live-
+session M0143-0008 tests). `RALPH_PRECOMMIT_SCOPE=units
+scripts/ralph-precommit-test.sh` — every package passes except the
+pre-existing, already-documented `internal/parser` `GroupedJoinUnaliased`
+AST-drift (unrelated; this task touched no parser file).
+`scripts/tpcds-sf025-regression.sh sweep` — PASS=96 MISMATCH=0 ERROR=0
+TIMEOUT=0, plan-shapes identical (99/99), status-delta verdict-changes=none.
+`scripts/tpch-spotcheck.sh` is SKIP-BLOCKED by the `:65433` evidence hold
+(the one allowed G6 exception per the P0-E5 fix_plan entry) — P0-E7 is the
+named re-run owner once P0-E6 restores that cluster.

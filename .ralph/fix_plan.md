@@ -111,7 +111,7 @@ uncommitted `ALTER TABLE … ADD CONSTRAINT` transaction on it was stopped with
     diff or PG-match change — P0-E5 is where the fix and its measurement
     land). Gates: `go build ./...` clean, `go vet ./internal/testport/`
     clean, `go test -run TestPort_P0E4 ./internal/testport/` PASS (3 SKIP).
-- [ ] **P0-E5 — fix the catalog-loss defect and M0143-0008 together.**
+- [x] **P0-E5 — fix the catalog-loss defect and M0143-0008 together.**
   Parent: none. Depends on P0-E4. **Disk side**: the loader decides a row's
   xmax by commit status (CLOG; subtransactions resolved to parent — PG
   `HeapTupleSatisfies*`/`TransactionIdDidCommit`), and `XmaxCommitted` is set
@@ -124,6 +124,41 @@ uncommitted `ALTER TABLE … ADD CONSTRAINT` transaction on it was stopped with
   must PASS; `tpch-spotcheck` will be SKIP-BLOCKED by the `:65433` hold — this is
   the one allowed exception to G6: commit with a `ledger:` line naming P0-E7 as
   the re-run owner (commit-msg accepts SKIP-BLOCKED + `ledger:`).
+  - **Done 2026-09-17.** Disk side: `catalogRowLive`
+    (`internal/initdb/catalog_heap_reload.go:43`) now consults CLOG for a
+    non-zero xmax — dead unless the xmax transaction aborted (B0.2,
+    `docs/design/wal-pg-identical-stream/02a-phase-b0-enablers.md` §2.3).
+    Caught live (not just by code reading): `scanCatalogHeapRows`'s OWN
+    inline pre-filter shadowed that fix entirely for every production reload
+    call (it rejected any non-zero xmax BEFORE `catalogRowLive` ever ran) —
+    fixed in the same commit, plus two more duplicate copies of the same
+    stale pattern in `internal/initdb/open.go` (`loadUserIndexesFromHeapForDB`
+    ×2, pg_statistic reload), all now delegating to `catalogRowLive`.
+    In-memory side: `AlterIndexUndoEntry`/`NotNullUndoEntry`
+    (`internal/executor/session.go`), recorded by
+    `adoptExistingIndexAsConstraint`/`finishPrimaryKeyConstraint` and consumed
+    by `ProcessRollbackUndos`, undo `ALTER TABLE ADD CONSTRAINT ...
+    {PRIMARY KEY|UNIQUE} USING INDEX` on ROLLBACK (index fields + PK NOT-NULL
+    synthesis, including cascaded inheritance/partition children); `DROP
+    CONSTRAINT`'s three index-backed forms (PK/UNIQUE/EXCLUDE) reuse the
+    existing `DDLDropUndoEntry`/`RestoreIndex` mechanism. CHECK/FK/NOT-NULL
+    `DROP CONSTRAINT` undo is NOT covered (M0143-0008's own text scoped
+    itself to "at minimum ADD CONSTRAINT/DROP CONSTRAINT") — filed as
+    **M0143-0008b** below. All three P0-E4 tests unskipped and passing, plus
+    two new live-session (no restart) tests in
+    `internal/testport/p0e5_alter_rollback_undo_test.go`. Full writeup:
+    `docs/design/0100-0149/p0-e4-catalog-xmax-loss-repro.md` §"P0-E5 — the
+    fix". Ledger: two rows dated 2026-09-17 (subxact-CLOG residual gap;
+    CHECK/FK/NOT-NULL DROP CONSTRAINT undo gap). Gates: `go build ./...`
+    clean; `go test ./internal/initdb/... ./internal/catalog/...
+    ./internal/executor/...` PASS; `go test -v -run
+    'TestPort_P0E4|TestPort_P0E5' ./internal/testport/` PASS (5/5);
+    `RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh` — all
+    packages PASS except the pre-existing `internal/parser`
+    GroupedJoinUnaliased AST-drift (unrelated, no parser file touched);
+    `scripts/tpcds-sf025-regression.sh sweep` — PASS=96 MISMATCH=0 ERROR=0
+    TIMEOUT=0, plan-shapes 99/99 identical. `tpch-spotcheck` SKIP-BLOCKED by
+    the `:65433` hold; ledger: P0-E7 is the re-run owner.
 - [!] **P0-E6 — restore `:65433` (OWNER-RUN).** Parent: none. The owner runs
   `scripts/tpch-ref-recover.sh --i-am-owner --evidence-only` **now** (graceful stop
   + evidence copy; leaves `:65433` stopped with HOLD), then after P0-E5
@@ -6419,7 +6454,7 @@ reported, and the values and unit gates are the bar.
   verified unrelated to R126, and unowned. Fix them or convert them into filed, owned
   tasks; "unowned" is not an end state.
 
-- [ ] **M0143-0008 — `ALTER TABLE` subcommands have no rollback-undo; a
+- [x] **M0143-0008 — `ALTER TABLE` subcommands have no rollback-undo; a
   `ROLLBACK` after e.g. `ADD CONSTRAINT` silently leaves it permanently
   committed** — filed by M0142-0003h. `docs/design/0000-0049/0030-0006-transactional-ddl.md`
   Phase 1 wired rollback-undo (`DDLUndoEntry`/`RecordDDLCreate`,
@@ -6444,6 +6479,47 @@ reported, and the values and unit gates are the bar.
   `transactional_ddl_test.go`'s `TestTransactionalCreateTableRollback` et
   al.; add an `ALTER TABLE ADD CONSTRAINT` analogue that fails before the
   fix.
+  - **Done 2026-09-17 (landed as part of P0-E5).** `ADD CONSTRAINT ...
+    {PRIMARY KEY|UNIQUE} USING INDEX` (`AlterIndexUndoEntry`/
+    `NotNullUndoEntry`) and `DROP CONSTRAINT`'s three index-backed forms
+    (PK/UNIQUE/EXCLUDE, via the existing `DDLDropUndoEntry`/`RestoreIndex`
+    mechanism) now undo on ROLLBACK — this is the "at minimum ADD
+    CONSTRAINT/DROP CONSTRAINT" bar this task's own text set. See P0-E5's
+    entry above and `docs/design/0100-0149/p0-e4-catalog-xmax-loss-repro.md`
+    §"P0-E5 — the fix" for the full mutation-mapping/design rationale.
+    Remaining `DROP CONSTRAINT` forms (CHECK/FOREIGN KEY/NOT NULL — in-place
+    slice/field mutations, not map-removals, so they need their own
+    snapshot/restore rather than reusing `DDLDropUndoEntry`) are **not**
+    covered — filed as **M0143-0008b** below; also the column-list `ADD
+    CONSTRAINT ... PRIMARY KEY (cols)` form's brand-new-index creation
+    already gets undone by the existing CREATE-INDEX `DDLUndoEntry` path
+    (unaffected/unchanged by this task), but was not itself re-verified with
+    a dedicated test this loop.
+- [ ] **M0143-0008b — `ALTER TABLE DROP CONSTRAINT` on CHECK/FOREIGN
+  KEY/NOT NULL still has no rollback-undo.**
+  Parent: M0143-0008. Filed
+  2026-09-17 when P0-E5 landed undo for `ADD CONSTRAINT`/`DROP CONSTRAINT`'s
+  index-backed forms (PK/UNIQUE/EXCLUDE) but explicitly scoped out these
+  three: `execAlterTableDropConstraint`'s CHECK branch splices
+  `tbl.CheckConstraints`/`tbl.NamedChecks` in place (and cascades via
+  `cascadeCheckDropToChildren`); its FOREIGN KEY branch splices
+  `tbl.ForeignKeys` in place (`catalog.InMemory.DropForeignKeyConstraint`);
+  its NOT NULL branch (`clearNotNullConstraint`) sets
+  `tbl.Columns[i].NotNull = false` and filters `tbl.NotNullConstraints` in
+  place (and cascades via `cascadeNotNullDropToChildren`) — all three are
+  real field/slice mutations on a pointer that stays live and reachable
+  throughout, not the map-removal-only shape `DDLDropUndoEntry`/
+  `RestoreIndex` already handles for the index-backed forms, so they need
+  their own snapshot-and-restore (the same pattern P0-E5's
+  `NotNullUndoEntry` already established for the ADD-direction NOT NULL
+  synthesis — a DROP-direction sibling snapshotting `CheckConstraints`/
+  `NamedChecks`/`ForeignKeys`/`NotNullConstraints`/`Columns[i].NotNull`
+  wholesale before the mutation, restoring the whole slice/value on
+  ROLLBACK, applied to the target table plus every cascade-reachable child
+  — mirror `collectNotNullCascadeClosure`'s read-only pre-walk pattern,
+  `operators_ddl.go`, added by P0-E5). Likely overlaps `M0143-0002`'s
+  `DROP CONSTRAINT` FK bug (same subsystem) — triage together. Test
+  precedent: `internal/testport/p0e5_alter_rollback_undo_test.go` (P0-E5).
 - [ ] **M0143-0007 — separate the dimension-table `relpages` divergence (K41)** —
   `customer` 1,979 pages vs PG's 2,872, `item` 716 vs 1,284. M0140-0005 filed it
   as out of planner reach and that is correct — **but `relpages` is an input to

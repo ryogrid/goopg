@@ -12250,6 +12250,19 @@ func (o *ddlOp) execAlterTableAddPrimaryKeyUsingIndex(tbl *catalog.Table, act pa
 // and the ATPrepAddPrimaryKey column-list path. Extracted from
 // execAlterTableAddPrimaryKey by M0134-0005x (previously inline).
 func (o *ddlOp) finishPrimaryKeyConstraint(tbl *catalog.Table, act parser.AlterTableAction, idx *catalog.Index) error {
+	// P0-E5/M0143-0008: snapshot every table this call might mutate — tbl
+	// itself plus the full inheritance/partition-child closure
+	// cascadeNotNullToChildren can reach below — BEFORE any NOT NULL
+	// synthesis, so ROLLBACK can restore them verbatim. Cheap when there is
+	// no cascade (the common case: the closure is empty).
+	if sess, ok := o.ctx.Session.(*BasicSession); ok {
+		sess.RecordNotNullUndo(snapshotNotNullState(tbl))
+		if im, isIM := o.ctx.Catalog.(*catalog.InMemory); isIM {
+			for _, child := range collectNotNullCascadeClosure(im, tbl) {
+				sess.RecordNotNullUndo(snapshotNotNullState(child))
+			}
+		}
+	}
 	if idx != nil {
 		idx.IsConstraint = true
 		// USING INDEX carries no INCLUDE (…) clause of its own — only
@@ -12317,6 +12330,47 @@ func (o *ddlOp) finishPrimaryKeyConstraint(tbl *catalog.Table, act parser.AlterT
 	return nil
 }
 
+// snapshotNotNullState captures tbl's pre-mutation per-column NOT NULL
+// flags and NotNullConstraints list into a NotNullUndoEntry
+// (P0-E5/M0143-0008).
+func snapshotNotNullState(tbl *catalog.Table) NotNullUndoEntry {
+	colNotNull := make(map[int]bool, len(tbl.Columns))
+	for i := range tbl.Columns {
+		colNotNull[i] = tbl.Columns[i].NotNull
+	}
+	return NotNullUndoEntry{
+		Table:              tbl,
+		ColNotNull:         colNotNull,
+		NotNullConstraints: append([]catalog.NamedNotNullConstraint(nil), tbl.NotNullConstraints...),
+	}
+}
+
+// collectNotNullCascadeClosure enumerates every inheritance/partition
+// descendant cascadeNotNullToChildren could reach from tbl — transitively,
+// depth-bounded (maxNotNullCascadeDepth) and OID-deduped like the cascade
+// itself. A pure read-only walk, run BEFORE the cascade so its result is a
+// safe superset of whatever the cascade actually touches (P0-E5/M0143-0008).
+func collectNotNullCascadeClosure(im *catalog.InMemory, tbl *catalog.Table) []*catalog.Table {
+	var out []*catalog.Table
+	visited := map[uint32]bool{tbl.OID: true}
+	frontier := []*catalog.Table{tbl}
+	for depth := 0; depth < maxNotNullCascadeDepth && len(frontier) > 0; depth++ {
+		var next []*catalog.Table
+		for _, t := range frontier {
+			for _, child := range collectInheritanceAndPartitionChildren(im, t) {
+				if visited[child.OID] {
+					continue
+				}
+				visited[child.OID] = true
+				out = append(out, child)
+				next = append(next, child)
+			}
+		}
+		frontier = next
+	}
+	return out
+}
+
 // adoptExistingIndexAsConstraint locates the index named by `USING INDEX
 // idxname` on tbl, validates it per PG's transformIndexConstraint
 // (parse_utilcmd.c:2391-2492) and ATExecAddIndexConstraint
@@ -12364,6 +12418,23 @@ func (o *ddlOp) adoptExistingIndexAsConstraint(tbl *catalog.Table, act parser.Al
 			Message: fmt.Sprintf("%q is a partial index", idx.Name),
 			Detail:  "Cannot create a primary key or unique constraint using such an index."}
 	}
+	dbOid := catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)
+	// P0-E5/M0143-0008: snapshot idx's pre-mutation fields (including its
+	// current name, in case this call renames it below) BEFORE any
+	// mutation, so ROLLBACK can restore them — this function mutates idx in
+	// place rather than registering/unregistering it, so the DDLUndoEntry
+	// create/drop pattern does not apply.
+	if sess, ok := o.ctx.Session.(*BasicSession); ok {
+		sess.RecordAlterIndexUndo(AlterIndexUndoEntry{
+			Index:             idx,
+			DBOid:             dbOid,
+			OldName:           idx.Name,
+			IsConstraint:      idx.IsConstraint,
+			Primary:           idx.Primary,
+			Deferrable:        idx.Deferrable,
+			InitiallyDeferred: idx.InitiallyDeferred,
+		})
+	}
 	// Constraint name defaults to the index's own name; an explicit name
 	// that differs renames the index (and emits PG's NOTICE).
 	// tablecmds.c:9739-9755.
@@ -12377,7 +12448,7 @@ func (o *ddlOp) adoptExistingIndexAsConstraint(tbl *catalog.Table, act parser.Al
 		}
 		oldObjName := parser.ObjectName{Schema: idx.Schema, Name: idx.Name}
 		newObjName := parser.ObjectName{Schema: idx.Schema, Name: constraintName}
-		if err := im.RenameIndex(oldObjName, newObjName, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)); err != nil {
+		if err := im.RenameIndex(oldObjName, newObjName, dbOid); err != nil {
 			return nil, &ExecError{Code: "42P07", Pos: pos, Message: err.Error()}
 		}
 		if catalogHeapSyncAvailable(o.ctx) {
@@ -13326,6 +13397,13 @@ func (o *ddlOp) execAlterTableDropConstraint(tbl *catalog.Table, act parser.Alte
 	}
 	if uqIdx != nil {
 		if isIM {
+			// P0-E5/M0143-0008: DropUniqueConstraint only unregisters uqIdx
+			// from the name-keyed index maps (like DROP INDEX) — it does not
+			// mutate the *catalog.Index itself — so the existing DROP-inside-
+			// savepoint restore mechanism (RestoreIndex) undoes it verbatim.
+			if sess, ok := o.ctx.Session.(*BasicSession); ok {
+				sess.RecordDDLDrop(DDLDropUndoEntry{Indexes: []*catalog.Index{uqIdx}, SavepointDepth: sess.SavepointDepth()})
+			}
 			im.DropUniqueConstraint(tbl.OID, act.ConstraintName)
 		}
 		return nil
@@ -13345,6 +13423,11 @@ func (o *ddlOp) execAlterTableDropConstraint(tbl *catalog.Table, act parser.Alte
 	}
 	if exclIdx != nil {
 		if isIM {
+			// P0-E5/M0143-0008: see the UNIQUE branch above — same
+			// map-removal-only shape, same RestoreIndex undo path.
+			if sess, ok := o.ctx.Session.(*BasicSession); ok {
+				sess.RecordDDLDrop(DDLDropUndoEntry{Indexes: []*catalog.Index{exclIdx}, SavepointDepth: sess.SavepointDepth()})
+			}
 			im.DropExclusionConstraint(tbl.OID, act.ConstraintName)
 		}
 		return nil
@@ -13478,6 +13561,11 @@ func (o *ddlOp) execAlterTableDropConstraint(tbl *catalog.Table, act parser.Alte
 		}
 	}
 	if isIM {
+		// P0-E5/M0143-0008: see the UNIQUE branch above — same
+		// map-removal-only shape, same RestoreIndex undo path.
+		if sess, ok := o.ctx.Session.(*BasicSession); ok {
+			sess.RecordDDLDrop(DDLDropUndoEntry{Indexes: []*catalog.Index{pkIdx}, SavepointDepth: sess.SavepointDepth()})
+		}
 		im.DropPrimaryKeyConstraint(tbl.OID, act.ConstraintName)
 	}
 	return nil

@@ -5,24 +5,30 @@ package testport
 // 2026-09-16 shared-cluster `:65433` TPC-H data-loss incident) and written up
 // in docs/design/0100-0149/p0-e4-catalog-xmax-loss-repro.md.
 //
-// Root cause (two independent bugs that must land together as P0-E5):
+// Root cause (two independent bugs that had to land together as P0-E5 — both
+// FIXED):
 //   - stampCatalogRowsTuple (internal/executor/operators_ddl.go:18121), called
 //     from deleteCatalogRowsForOID (:18186) by every DDL path that replaces a
 //     catalog row in place (e.g. finishPrimaryKeyConstraint adopting a UNIQUE
 //     INDEX via `ADD CONSTRAINT ... PRIMARY KEY USING INDEX`, :12252), stamps
 //     the OLD catalog row's xmax — and the XmaxCommitted hint bit — BEFORE the
 //     owning transaction commits.
-//   - ProcessRollbackUndos (internal/executor/operators_tx.go:388) never
-//     undoes that stamp on abort (M0143-0008 — it only restores
-//     CREATE/TRUNCATE/sequence undo entries).
+//   - ProcessRollbackUndos (internal/executor/operators_tx.go:388) did not
+//     undo that stamp on abort (M0143-0008 — it only restored
+//     CREATE/TRUNCATE/sequence undo entries); P0-E5 added AlterIndexUndoEntry/
+//     NotNullUndoEntry (session.go) so ADD/DROP CONSTRAINT's in-memory catalog
+//     mutations are undone on ROLLBACK too (see p0e5_alter_rollback_undo_test.go
+//     for the live, no-restart regression coverage of this half).
 //   - The startup catalog loader (scanCatalogHeapRows/catalogRowLive,
-//     internal/initdb/catalog_heap_reload.go:43,75) then discards ANY row
-//     with Xmax != InvalidTransactionID unconditionally, never checking
-//     whether that xmax's transaction actually committed (CLOG). The NEW row
-//     is correctly dropped (its xmin is aborted), but the OLD row is
+//     internal/initdb/catalog_heap_reload.go:43,75) discarded ANY row with
+//     Xmax != InvalidTransactionID unconditionally, never checking whether
+//     that xmax's transaction actually committed (CLOG). The NEW row was
+//     correctly dropped (its xmin is aborted), but the OLD row was
 //     incorrectly dropped too — so the table's pg_class/pg_attribute rows
-//     both vanish across the next restart even though the ALTER never
-//     committed.
+//     both vanished across the next restart even though the ALTER never
+//     committed. Fixed by making catalogRowLive consult CLOG for a non-zero
+//     Xmax (B0.2, docs/design/wal-pg-identical-stream/02a-phase-b0-enablers.md
+//     §2.3): dead unless the xmax transaction aborted.
 //
 // All three probes below reproduce the loss via a distinct abort path per
 // P0-E4's repro instructions (fix_plan.md P0-E4): (a) explicit ROLLBACK,
@@ -35,9 +41,8 @@ package testport
 // would never exercise the loader and the probe would false-negative
 // (internal/initdb/open.go ~1135-1147, ~1468-1489).
 //
-// All three are t.Skip'd pending P0-E5 so they do not fail the unit gate
-// before the fix lands; P0-E5 removes the t.Skip calls as part of landing
-// the fix — these ARE that task's regression tests.
+// All three were t.Skip'd pending P0-E5; P0-E5 removed the t.Skip calls as
+// part of landing the fix — these ARE that task's regression tests.
 
 import (
 	"context"
@@ -133,7 +138,7 @@ func p0e4HeapFileExists(t *testing.T, dataDir, relfilenode string) bool {
 // `SELECT count(*) FROM t` and relation-file presence, captured after a
 // restart.
 type p0e4State struct {
-	regclass   string // "" if to_regclass('t') came back NULL (table gone)
+	regclass   string // "" if 't'::regclass errored (table gone)
 	count      string // "" if the count query errored
 	countErr   string
 	heapExists bool
@@ -148,7 +153,15 @@ func p0e4Probe(t *testing.T, r *cluster.Cluster, dataDir, relfilenode string) p0
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	var st p0e4State
-	if rows, err := r.Query(ctx, "SELECT coalesce(to_regclass('t')::text, '')"); err == nil && len(rows) == 1 {
+	// `to_regclass` itself is a separate, pre-existing, already-ledgered gap
+	// (the whole to_reg* family is unimplemented — 42883 "function does not
+	// exist" — docs/design/0100-0149/m0134-0168-regclass-string-input-regclassin.md
+	// "Ledgered 0168f"), unrelated to this probe; using it here would make an
+	// unimplemented-function error indistinguishable from "table gone". The
+	// `::regclass` CAST is implemented (regIdentifierInput,
+	// reg_identifier.go) and raises 42P01 on a genuine miss, which the error
+	// check below already treats the same way coalesce-to-NULL would.
+	if rows, err := r.Query(ctx, "SELECT 't'::regclass::text"); err == nil && len(rows) == 1 {
 		st.regclass = rows[0][0]
 	}
 	if rows, err := r.Query(ctx, "SELECT count(*) FROM t"); err != nil {
@@ -182,15 +195,9 @@ func p0e4WaitSettled(r *cluster.Cluster) error {
 	return fmt.Errorf("never settled before the deadline")
 }
 
-const p0e4SkipReason = "pending P0-E5 (catalog loader discards a row with " +
-	"xmax!=0 regardless of the xmax transaction's commit status) — this test " +
-	"IS P0-E5's regression lock; remove the Skip when landing that fix. See " +
-	"docs/design/0100-0149/p0-e4-catalog-xmax-loss-repro.md"
-
 // TestPort_P0E4CatalogXmaxRollback is repro case (a): an explicit ROLLBACK of
 // the ADD CONSTRAINT ... PRIMARY KEY USING INDEX transaction.
 func TestPort_P0E4CatalogXmaxRollback(t *testing.T) {
-	t.Skip(p0e4SkipReason)
 	c, r := startP0E4Cluster(t, "p0e4-rollback")
 	p0e4CreateTable(t, r)
 	relfilenode := p0e4Relfilenode(t, r)
@@ -224,7 +231,6 @@ func TestPort_P0E4CatalogXmaxRollback(t *testing.T) {
 // TestPort_P0E4CatalogXmaxClientKill is repro case (b): the client
 // disconnects (SIGKILL of the psql process) without ever sending ROLLBACK.
 func TestPort_P0E4CatalogXmaxClientKill(t *testing.T) {
-	t.Skip(p0e4SkipReason)
 	c, r := startP0E4Cluster(t, "p0e4-clientkill")
 	p0e4CreateTable(t, r)
 	relfilenode := p0e4Relfilenode(t, r)
@@ -266,7 +272,6 @@ func TestPort_P0E4CatalogXmaxClientKill(t *testing.T) {
 // -mode immediate` while the ALTER's transaction is still open — the
 // 2026-09-16 `:65433` incident's own shape.
 func TestPort_P0E4CatalogXmaxServerImmediateStop(t *testing.T) {
-	t.Skip(p0e4SkipReason)
 	c, r := startP0E4Cluster(t, "p0e4-immediate")
 	p0e4CreateTable(t, r)
 	relfilenode := p0e4Relfilenode(t, r)

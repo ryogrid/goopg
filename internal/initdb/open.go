@@ -3629,10 +3629,11 @@ func loadUserIndexesFromHeapForDB(mgr *storage.Manager, cat *catalog.InMemory, c
 			if err != nil {
 				continue
 			}
-			if ht.Header.Xmin == storage.InvalidTransactionID || ht.Header.Xmax != storage.InvalidTransactionID {
-				continue
-			}
-			if clog != nil && clog.GetStatus(ht.Header.Xmin) == transam.TxnStatusAborted {
+			// P0-E5/B0.2: catalogRowLive is the single source of truth for
+			// xmax/xmin liveness (an inline "any non-zero xmax = dead" copy
+			// here had the same bug scanCatalogHeapRows's own pre-filter did
+			// — see catalog_heap_reload.go).
+			if !catalogRowLive(clog, ht, false) {
 				continue
 			}
 			row, err := catalog.DecodePGClassPhysicalRow(ht.Data)
@@ -3705,10 +3706,8 @@ func loadUserIndexesFromHeapForDB(mgr *storage.Manager, cat *catalog.InMemory, c
 			if err != nil {
 				continue
 			}
-			if ht.Header.Xmin == storage.InvalidTransactionID || ht.Header.Xmax != storage.InvalidTransactionID {
-				continue
-			}
-			if clog != nil && clog.GetStatus(ht.Header.Xmin) == transam.TxnStatusAborted {
+			// P0-E5/B0.2: see the pg_class scan above — same fix.
+			if !catalogRowLive(clog, ht, false) {
 				continue
 			}
 			row, err := catalog.DecodePGIndexPhysicalRow(ht.Data, ht.Bitmap)
@@ -3928,10 +3927,8 @@ func loadStatisticsFromHeapForDB(mgr *storage.Manager, cat *catalog.InMemory, cl
 			if err != nil {
 				continue
 			}
-			if ht.Header.Xmin == storage.InvalidTransactionID || ht.Header.Xmax != storage.InvalidTransactionID {
-				continue
-			}
-			if clog != nil && clog.GetStatus(ht.Header.Xmin) == transam.TxnStatusAborted {
+			// P0-E5/B0.2: see the pg_class scan above — same fix.
+			if !catalogRowLive(clog, ht, false) {
 				continue
 			}
 			row, err := catalog.DecodePGStatisticPhysicalRow(ht.Data, ht.Bitmap)
