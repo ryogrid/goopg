@@ -28,5 +28,19 @@ the current state — every `SKIP-BLOCKED` stamp is a hard commit failure.** A
 blocked gate with no row is an escalation: mark the task `[!]` with an
 escalation block naming the blocker.
 
+## If you put a reference cluster back under HOLD
+
+Placing `bench/tpch/runtime_goopg/data.HOLD` (or any `<datadir>.HOLD`) now has
+two effects at once, and they are both intentional: the Ralph bash guard refuses
+to run `scripts/tpch-estimate-audit-arm.sh`
+(`scripts/ralph-bash-guard.sh`, rule `ref-cluster-lifecycle`), and the TPC-H
+gates go SKIP-BLOCKED, which this file no longer waives automatically. The
+consequence is that **no commit touching `internal/optimizer`,
+`internal/planner`, `internal/executor` or a cost/stat path can land at all**
+until a row below grants it. So when you place a HOLD, decide in the same step
+whether the loop should keep working that code, and if so add the row here with
+a small `max-commits` and a near expiry. Before 2026-09-18 this waiver was
+automatic while the HOLD existed, which is how one grant became 18 commits.
+
 | task-id | gate | max-commits | expires | reason |
 | --- | --- | --- | --- | --- |
