@@ -7097,9 +7097,90 @@ reported, and the values and unit gates are the bar.
     fix, consistent with the P0-E6-wait selection rule. This closes the
     M0143-0002 lineage's pg_range gap; the `M0143-0002g` deferral-ledger row
     stays `-` (status flips are M0119's job, not the filer's).
-- [ ] **M0143-0003 — `pg_constraint` returns 0 rows of any contype after a restart** —
+- [x] **M0143-0003 — `pg_constraint` returns 0 rows of any contype after a restart** —
   including the `'p'`/`'u'` rows synthesised from indexes that demonstrably survive. A
   second, independent reload gap that R126 explicitly did not touch.
+  - **Done 2026-09-17 (recon + decomposition; see
+    `docs/design/0100-0149/m0143-0003-pg-constraint-reload-gap.md`).**
+    `pg_constraint` is fully virtual, synthesised per-connection from FOUR
+    independent in-memory sources (one per contype) — not one root cause.
+    `f` (FK) was already fixed by R126. `p`/`u`/`x` (index-backed) all depend
+    on `catalog.Index.IsConstraint`, never restored by
+    `RegisterIndexDuringRecoveryForDB` (`internal/catalog/catalog.go:6595`) —
+    every reloaded index vanished from `pg_constraint` regardless of type.
+    Split into M0143-0003a (landed this loop) through M0143-0003e (filed
+    below); parent ticked because the recon+decomposition milestone this
+    task's text named is complete, mirroring M0143-0002d's own precedent.
+- [x] **M0143-0003a — restore `Index.IsConstraint` for PRIMARY KEY on reload.**
+  Parent: M0143-0003. `IsConstraint: primary` at `RegisterIndexDuringRecoveryForDB`'s
+  `Index{}` construction (`internal/catalog/catalog.go:6595`) — lossless for
+  PRIMARY KEY specifically (PG's `indisprimary` always implies a
+  `pg_constraint` row; no "bare primary index" concept, unlike UNIQUE/EXCLUDE).
+  - **Done 2026-09-17.** Verified pre-fix failure by temporarily reverting to
+    `IsConstraint: false`: `TestDatabaseDDLReloadAcrossRestart`'s new PK
+    assertions (added this loop, `internal/postmaster/database_ddl_reload_test.go`)
+    failed with the exact predicted symptom (`pg_constraint PK rows = [],
+    want exactly [parent_pkey]` for both `r1`/`r2`), restored the fix,
+    re-ran green. Gates: `go build ./...` clean; `go test
+    ./internal/catalog/... ./internal/postmaster/... ./internal/executor/...
+    ./internal/initdb/...` PASS (postmaster 49s, initdb 131s). No TPC-H data
+    needed for this unit-scoped fix, consistent with the P0-E6-wait
+    selection rule.
+- [ ] **M0143-0003b — CHECK constraint durable persistence (write + reload).**
+  Parent: M0143-0003. **Highest-severity remaining piece — this is an
+  enforcement-loss correctness bug, not a display gap.**
+  `catalog.Table.CheckConstraints`/`NamedChecks` are never written to any
+  heap and never reloaded (confirmed by exhaustive grep: zero hits for
+  `checkconstraints`/`namedchecks` in `internal/initdb/*.go` outside this
+  citation). `copy.go`/`operators_fk.go`/`operators_storage.go` all gate
+  CHECK enforcement on `len(tbl.CheckConstraints) > 0`, so **every CHECK
+  constraint on every table silently stops being enforced after any server
+  restart**, with no error at restart or at the first violating write.
+  Full scope (mirrors R126's FK precedent exactly) is written out in the
+  design doc's "M0143-0003b" section: new
+  `buildPGConstraintRowForTableCheck`/`writeCheckConstraintRow` in
+  `internal/executor/sys_pg_constraint.go`; wire via ONE new executor-level
+  wrapper at all 9 in-memory call sites found this loop
+  (`operators_ddl.go:4319,4338,4345,4372,4405,5556,5582,9368,13106`) rather
+  than hand-pairing each (sibling-path-desync risk); stamp `xmax` on DROP
+  CONSTRAINT (`operators_ddl.go:13154-13155`/`:13384-13385`); new
+  `loadCheckConstraintsFromHeapForDB` in `catalog_heap_reload.go` mirroring
+  `loadForeignKeysFromHeapForDB`, wired after `loadForeignKeysFromHeap` in
+  `open.go`. Test: extend `TestDatabaseDDLReloadAcrossRestart` with a
+  CHECK-bearing table, asserting BOTH the `pg_constraint` row AND actual
+  post-restart enforcement (an `INSERT` violating the CHECK must still fail).
+- [ ] **M0143-0003c — UNIQUE (non-PRIMARY-KEY) constraint-backed index
+  `IsConstraint` durability.**
+  Parent: M0143-0003. Depends on: sequence after
+  M0143-0003b (smaller diff if its write-path plumbing exists to reuse).
+  Architecturally harder than 0003b: no durable signal today distinguishes
+  `ALTER TABLE t ADD CONSTRAINT u UNIQUE (col)` from a bare `CREATE UNIQUE
+  INDEX u ON t(col)` after a restart — real PG uses
+  `pg_constraint.conindid`, which goopg does not persist for `contype IN
+  ('u','x')`. Two candidate fixes not yet evaluated against each other are in
+  the design doc's "M0143-0003c" section (extend 0003b's write path to also
+  cover `contype='u'`, vs. a new persisted bit directly on the `pg_index`
+  heap row, same shape as M0143-0003e).
+- [ ] **M0143-0003d — NOT NULL constraint named-metadata durable
+  persistence.**
+  Parent: M0143-0003. Depends on: sequence after M0143-0003b
+  (reuses its wrapper pattern). Lower severity than 0003b: `Column.NotNull`
+  (actual enforcement) already reloads correctly via `pg_attribute.attnotnull`
+  (`internal/initdb/open.go`'s `loadUserTablesFromHeapForDB`, `NotNull:
+  ar.AttNotNull` — confirmed by grep, NOT a repeat of the CHECK gap). Only
+  `catalog.Table.NotNullConstraints` (the PG18 named-constraint list used for
+  `pg_constraint` `contype='n'` rows) is unreloaded — metadata only.
+- [ ] **M0143-0003e — EXCLUDE constraint `indisexclusion` durability.**
+  Parent: M0143-0003. Depends on: do together with M0143-0003c (same new
+  `pg_index`-heap-row-bit decision). `indisexclusion` is a declared
+  `pg_index` heap column (`internal/initdb/initdb.go:4766`) but is never
+  written by the real index-creation path (confirmed by grep: zero
+  non-comment hits for `indisexclusion`/`IndIsExclusion` outside catalog
+  schema declarations and an unrelated hardcoded-false synthetic row,
+  `internal/executor/pg18_user_catalog_rows.go:1460`) and never decoded on
+  reload — `Index.IsExclusion` is lost on every restart, taking `x`-contype
+  `pg_constraint` rows and `deferred_exclusion.go`'s deferred-exclusion-check
+  machinery with it for any EXCLUDE constraint surviving a restart.
 - [ ] **M0143-0004 — `PhysicalTypeIsVarlena` has no `IsArray` arm**
   (`physical_align.go:85-107`) — latent for ordinary user `int4[]` columns, not just
   catalogs.

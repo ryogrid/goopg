@@ -6656,6 +6656,19 @@ func (c *InMemory) RegisterIndexDuringRecoveryForDB(
 		Unique:        unique,
 		Method:        strings.ToLower(method),
 		Primary:       primary,
+		// IsConstraint gates whether PGConstraintRowsForDBOid synthesises a
+		// pg_constraint row for this index (catalog.go's per-connection view,
+		// filter at the "Emit UNIQUE, PRIMARY KEY..." loop). Recovery has no
+		// durable source for a plain UNIQUE index's IsConstraint (real PG
+		// distinguishes `ALTER TABLE ADD CONSTRAINT UNIQUE` from a bare
+		// `CREATE UNIQUE INDEX` via pg_constraint.conindid, which goopg does
+		// not persist for contype IN ('u','x') — M0143-0003b/e). A PRIMARY
+		// KEY index is always constraint-backed in PG (indisprimary implies
+		// a pg_constraint row unconditionally; there is no "bare primary
+		// index" concept), so `primary` alone is a safe, lossless signal —
+		// restoring it here closes the pg_constraint contype='p' half of
+		// M0143-0003 without new durable state. M0143-0003a.
+		IsConstraint:  primary,
 		OID:           oid,
 		ColDescending: append([]bool(nil), colDescending...),
 		ColNullsFirst: append([]bool(nil), colNullsFirst...),

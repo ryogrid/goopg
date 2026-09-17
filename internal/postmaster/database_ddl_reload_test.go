@@ -215,6 +215,29 @@ func TestDatabaseDDLReloadAcrossRestart(t *testing.T) {
 		t.Errorf("db r2 post-restart: pg_constraint FK rows = %v, want exactly [otherchild_pid_fkey]", rowsR2)
 	}
 
+	// M0143-0003a: "parent"/"other" above are both `id int4 PRIMARY KEY` —
+	// their backing unique index survives reload (RegisterIndexDuringRecoveryForDB
+	// restores Primary/Unique from pg_index), but PGConstraintRowsForDBOid's
+	// synthesised pg_constraint row additionally requires idx.IsConstraint,
+	// which recovery never set before this fix — every PK vanished from
+	// pg_constraint (contype='p') post-restart though the index itself, and
+	// its enforcement, kept working.
+	rowsR1PK, err := queryUnderDBReload(t, rt2, s2, "r1", "SELECT conname FROM pg_constraint WHERE contype = 'p'")
+	if err != nil {
+		t.Fatalf("db r1 post-restart: SELECT pg_constraint contype=p: %v", err)
+	}
+	if len(rowsR1PK) != 1 || string(rowsR1PK[0][0].Buf) != "parent_pkey" {
+		t.Errorf("db r1 post-restart: pg_constraint PK rows = %v, want exactly [parent_pkey]", rowsR1PK)
+	}
+
+	rowsR2PK, err := queryUnderDBReload(t, rt2, s2, "r2", "SELECT conname FROM pg_constraint WHERE contype = 'p'")
+	if err != nil {
+		t.Fatalf("db r2 post-restart: SELECT pg_constraint contype=p: %v", err)
+	}
+	if len(rowsR2PK) != 1 || string(rowsR2PK[0][0].Buf) != "other_pkey" {
+		t.Errorf("db r2 post-restart: pg_constraint PK rows = %v, want exactly [other_pkey]", rowsR2PK)
+	}
+
 	// Namespace isolation must also survive reload: a table created in one
 	// database must stay invisible when queried under the other database's
 	// own oid.
