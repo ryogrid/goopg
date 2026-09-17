@@ -3214,6 +3214,92 @@ spill route is net-negative.
     against the actual child AST node, not just Sort Key text), and the two
     stale doc-comment corrections this update made (`path.go`,
     `incrementalsortpaths.go`): design doc's "Update 2026-09-17h" section.
+  - **UPDATE 2026-09-18 (banner item 4's "compare the cost breakdown with PG
+    for the 14 queries," DONE, no production change).** Traced the remaining
+    13 witnesses (only Q3 had been traced before) on `:65437` with
+    `GOOPG_INCREMENTAL_SORT=on GOOPG_PGSHAPED_DP_TRACE=1`. 7 of 13
+    (Q4/Q11/Q43/Q54/Q58/Q60/Q83) reach the arm; the other 6 (Q35/Q49/Q63/
+    Q64/Q67/Q89) don't, and 5 of those 6 are already explained by open tasks
+    (Q35: full ORDER-BY/GROUP-BY match, arm 1's own case by design; Q63/Q67/
+    Q89: all three are `WindowAgg`-wrapped ORDER BYs — reclassifies Q89 out
+    of "GroupAggregate" — and are `M0141-S2b-3b`'s stated gate, not a new
+    finding; Q49: `M0141-S2b-4`'s SETOP gate). **Q64 is a genuinely new,
+    unexplained gap** — zero `upper.ordered` producer lines beyond the seed
+    Sort in a 134k-line trace, can't tell from the trace alone whether
+    `SearchCandidates` is empty or every candidate's keys are unusable;
+    filed as **M0141-S7-cd-q64** below. For the 7 that DO reach the arm,
+    decomposing each one's incrementalsort-vs-sort total-cost gap into
+    "different input candidate priced" vs. "sort-formula overhead itself"
+    shows the **input-candidate divergence dominates in 6 of 7** (from ~55%
+    of the gap up to ~99.9% for Q43) — `addIncrementalSortPaths` can only
+    attach to a `SearchCandidates` entry with a partial (non-full,
+    non-empty) prefix match, and on this corpus the candidates that qualify
+    are consistently pricier than the cheapest overall seed (most plausibly
+    the parallel/`Gather Merge`-shaped candidates PG uses that goopg's own
+    plan doesn't reach at all for these queries — same compounding-upstream-
+    divergence caveat 2026-09-17i already raised for Q3). This is sharper
+    than, and does not resolve or get resolved by,
+    `M0141-S2b-6-resume`'s open Hashed-vs-Sorted tie (that tie is about
+    which `PathAgg` STRATEGY feeds each arm for one query; this is about
+    candidate-set MEMBERSHIP — which candidates have a usable order to
+    credit at all). Filed as **M0141-S7-cd-candidatepool** below. Full
+    per-query cost table and the Q43/Q54/Q60 absolute-number breakdown:
+    design doc's "Update 2026-09-18" section. `GOOPG_INCREMENTAL_SORT` stays
+    default-off (unchanged verdict). No ledger row — every component named
+    is already a filed, tracked task, not a newly-discovered undocumented
+    gap. Gates: none beyond the trace captures (no `internal/`/`cmd/` file
+    touched); `make ralph-state-guard` passed; pre-commit pgbench smoke
+    PASS. The `:65437` cluster was restarted with the two env vars, traced,
+    then restarted again at its default flag state before this commit (env
+    vars unset from the systemd `--user` manager's environment block too, so
+    they can't leak into an unrelated later gate in this session).
+  - [ ] **M0141-S7-cd-q64** — root-cause why Q64's ORDER BY offers zero
+    `upper.ordered.incrementalsort` (and, on the 2026-09-18 trace, zero
+    `upper.ordered` producer lines of ANY kind besides the winning seed
+    Sort) despite being classified alongside Q4/Q11 as a Nested-Loop-shaped
+    witness that DOES reach the arm.
+    Parent: M0141-S7. Hypothesis
+    (unverified): Q64's outer join is over two references to the same
+    materialized CTE (`cross_sales cs1, cross_sales cs2`); a CTE-scan
+    boundary may drop `SearchCandidateKeys` for one or both self-join legs —
+    same family as [[cte_leaves_reach_search_wrapped_in_filter]] but for
+    pathkey propagation, not residual-filter placement, and NOT yet
+    confirmed. Distinguishing "`SearchCandidates` empty" from "every
+    candidate's `keys` is `len==0`" needs instrumenting
+    `createOrderedPaths`'s candidate-count at population time
+    (`upperordered.go:106-118`) — an `internal/` file, hence deferred past
+    this recon-only loop. Expected movement (S5): if the hypothesis holds
+    and is fixed, Q64 moves from "arm 3 unreachable" to "arm 3 reachable but
+    still cost-dominated" (per the candidatepool finding below, this would
+    NOT by itself flip Q64's plan shape) — measured by a repeat
+    `GOOPG_PGSHAPED_DP_TRACE=1` capture on Q64 showing a nonzero count of
+    `upper.ordered.incrementalsort` lines, no TPC-H dependency.
+  - [ ] **M0141-S7-cd-candidatepool** — investigate whether
+    `addIncrementalSortPaths` (`incrementalsortpaths.go:161-166`) should
+    also consider building its `PathIncrementalSort` over the SAME cheap
+    seed candidate `createOrderedPaths`'s arm 1/2 already uses, when that
+    seed's own claimed ordering has a genuine partial (not full, not empty)
+    prefix match — today's loop only walks `ordered.SearchCandidates`,
+    which on this corpus's 6 non-Q4/Q11 witnesses never includes a
+    cheap-AND-partially-ordered option; confirm (a) whether the cheap seed
+    itself always fails the partial-prefix test structurally (e.g. it is
+    hash-shaped so `SearchCandidateKeys` is empty for it, in which case
+    there is nothing to fix here) or (b) whether it has a usable partial
+    key that the current loop is simply never offered because of how
+    `SearchCandidates` is populated.
+    Parent: M0141-S7. Depends on reading
+    `createOrderedPaths`'s / `electOrderedGrouping`'s candidate-population
+    order side by side with which entry becomes the arm-1/2 "seed" `input`
+    parameter `addIncrementalSortPaths` receives — not yet done, this task's
+    own recon step. Expected movement (S5): if (b) holds for any of
+    Q43/Q54/Q58/Q60, a code fix could shrink or close the corresponding
+    input-divergence share in the 2026-09-18 cost table (up to ~199 cost
+    units for Q43) without needing real SF1 cardinalities at all — measured
+    by re-running this update's same per-query DPPATH capture and comparing
+    each witness's Δinput column before/after; full TPC-DS SF0.25 sweep
+    (`shape-delta.sh`, category movement) as the no-regression gate,
+    same `[65437]`-only requirement as the recon that filed this, no TPC-H
+    dependency.
 
 ## M0142 — Join-order costing (filed 2026-09-14)
 

@@ -977,3 +977,153 @@ with that cluster reloaded should re-run this same corpus measurement to see
 how many of the 5 GroupAgg witnesses (and possibly some of the 9 others,
 which share upstream `PathAgg`/join cost machinery) flip once real
 cardinalities separate the Hashed/Sorted cost tie.
+
+## Update 2026-09-18 — cost-breakdown diagnosis for the remaining 13 witnesses (banner item 4)
+
+Banner item 4 (`.ralph/fix_plan.md` Current Priority, written 2026-09-17):
+"M0141-S7 — cost diagnosis only... Compare the cost breakdown with PG for the
+14 queries. No executor work." Only Q3 had been traced so far (2026-09-17i
+above). This update traces the remaining 13 on the private `:65437` TPC-DS
+SF0.25 cluster (started with `GOOPG_INCREMENTAL_SORT=on
+GOOPG_PGSHAPED_DP_TRACE=1`, both confirmed via `/proc/<pid>/environ` before
+capturing — same discipline as every prior trace in this doc) against the 13
+witness queries' own `.sql` files
+(`bench/tpcds/runtime_goopg/tpcds-data/queries/query{N}.sql`, loaded into the
+cluster's `postgres` database). Raw per-query psql output + the log-slice
+captured between `wc -l` markers before/after each run: `tmp/m0141-s7-trace/`
+(not committed — scratch, same precedent as every earlier probe in this file).
+Recon-only: no `internal/`/`cmd/` file touched, `go build ./...` unaffected.
+
+### Which of the 13 even reach the arm
+
+Grepping each query's log slice for `producer=upper.ordered.(sort|
+incrementalsort)`:
+
+| witness | `upper.ordered.incrementalsort` line present? |
+|---|---|
+| Q4, Q11, Q43, Q54, Q58, Q60, Q83 | yes (7 of 13) |
+| Q35, Q49, Q63, Q64, Q67, Q89 | **no** (6 of 13) |
+
+For 5 of those 6 "no" cases the reason is already known and tracked, not a
+new finding:
+
+- **Q35** — its `ORDER BY` list is byte-identical to its `GROUP BY` list
+  (`ca_state, cd_gender, cd_marital_status, cd_dep_count,
+  cd_dep_employed_count, cd_dep_college_count`), so `addIncrementalSortPaths`'s
+  own `contained` check (`incrementalsortpaths.go:166`) is true for the
+  GROUP_AGG seed candidate — a full match is arm 1/2's case by design, not a
+  gap arm 3 should fill (`incrementalsortpaths.go`'s own header: "a full
+  match is arm 1's case for the seed... buys nothing new here").
+- **Q63, Q67, Q89** — re-reading these three's SQL text (not just the design
+  doc's earlier "shape" label, which named the *witness's PG plan's own*
+  aggregate strategy) shows all three wrap their aggregate in an OUTER query
+  whose `ORDER BY` sits above a **window function** (`avg(...) OVER
+  (PARTITION BY ...)` for Q63/Q89, `rank() OVER (...)` for Q67) — this
+  reclassifies Q89 from "GroupAggregate" to the same bucket as Q63/Q67. All
+  three are **M0141-S2b-3b**'s stated gate ("TPC-DS Q67... is the sole corpus
+  witness and the gate" — Q63/Q89 share the identical shape and are an
+  implicit second/third witness for the same still-open task): `addWindowPaths`
+  sees one collapsed input `Node`, never a `Pathlist`, so there is nothing for
+  arm 3 to iterate over yet. Zero lines is exactly what an unbuilt call site
+  produces — not a new defect.
+- **Q49** — outer `UNION` (`Unique` node in PG's plan), `M0141-S2b-4`'s
+  already-filed "SETOP rel-identity fix" gate, same unbuilt-call-site shape.
+
+**Q64 is the one genuine open question.** Its classification in the table
+above ("Nested Loop, outer side's own order") predicted it would behave like
+its siblings Q4/Q11/Q35 — but grepping its full log slice (134106 lines, the
+largest of the 13 — a 17-table self-join of two CTE references) for
+`producer=upper.ordered` finds **exactly one line, the seed `sort`, and zero
+`incrementalsort` attempts, zero of any other ordered-rel producer**. This
+cannot be told apart, from the trace alone, between "`ordered.SearchCandidates`
+is empty for this rel" and "every candidate's `SearchCandidateKeys` has
+`len(keys)==0`" — `addIncrementalSortPaths`'s loop (`incrementalsortpaths.go:161-166`)
+`continue`s silently in both cases; only an *offered* candidate ever emits a
+DPPATH line. A plausible (unverified) hypothesis, consistent with
+[[cte_leaves_reach_search_wrapped_in_filter]]: Q64's outer join is over two
+references to the same materialized CTE (`cross_sales cs1, cross_sales cs2`),
+and a CTE-scan boundary may be where the search's own ordering-claim tracking
+(`SearchCandidateKeys`) gets lost for one or both self-join legs — the same
+family of gap that memory names for a different mechanism (residual-filter
+placement), not yet confirmed for pathkey propagation specifically. Filed as
+**M0141-S7-cd-q64** below rather than root-caused now: distinguishing the two
+cases needs either instrumenting `createOrderedPaths`'s candidate-count at
+population time or a debugger session, both of which are `internal/`-file
+changes even if read-only in spirit, and this update's mandate is diagnosis
+without executor/planner-file edits.
+
+### Cost breakdown for the 7 that DO reach the arm
+
+Each row decomposes the incrementalsort-vs-sort **total cost gap** into two
+parts: how much comes from the two arms pricing a **different input
+candidate** (`inputtotal` field — arm 1/2's seed vs. whichever
+`ordered.SearchCandidates[i]` arm 3 built its `PathIncrementalSort` over), vs.
+how much comes from the **sort-vs-incrementalsort pricing formula itself**
+(`total - inputtotal`, i.e. each arm's own added overhead). Numbers are the
+DPPATH line's own `total`/`inputtotal` fields, cheapest instance per producer
+when a query offered more than one (Q43/Q54/Q60 each show two, one per
+Hashed/Sorted `PathAgg` seed — see M0141-S2b-6/-6-resume; only the eventual
+tournament winner's numbers matter for "why did Sort win," so the table uses
+the accepted/cheapest pair):
+
+| witness | shape | Δinput (arm-3 seed − arm-1/2 seed) | Δoverhead (incsort own − sort own) | Δtotal | input-divergence share |
+|---|---|---|---|---|---|
+| Q4  | Nested Loop | ~0 (7.7250 both) | +0.040 | +0.040 | ~0% |
+| Q11 | Nested Loop | +0.010 | +0.040 | +0.050 | ~20% |
+| Q83 | Merge Join  | +0.055 | +0.040 | +0.095 | ~58% |
+| Q58 | Merge Join  | +0.762 | +0.040 | +0.802 | ~95% |
+| Q54 | GroupAgg (2-level, `Subquery Scan`-nested) | +0.545 | +0.445 | +0.990 | ~55% |
+| Q60 | GroupAgg (`Merge Append`) | +1.021 | +0.599 | +1.620 | ~63% |
+| Q43 | GroupAgg (`Finalize`, parallel in PG) | +198.790 | +0.220 | +199.010 | **~99.9%** |
+
+(Q43's absolute numbers: Sort's seed totals 47505.972, Sort itself
+47506.112 — a mere +0.140 own-overhead; IncrementalSort's seed totals
+47704.762, IncrementalSort itself 47705.122 — a comparably small +0.360
+own-overhead. The two arms are pricing their OWN sort step almost
+identically; Sort wins here almost entirely because its seed candidate is
+~199 cost units cheaper, not because `costIncrementalSort` misprices
+anything.)
+
+**Reading this table**: in every case but Q4 (and to a lesser extent Q11),
+most-to-nearly-all of why Incremental Sort loses is that
+`addIncrementalSortPaths` (`incrementalsortpaths.go:161`) iterates
+`ordered.SearchCandidates` and can only stack a `PathIncrementalSort` over a
+candidate whose own claimed ordering (`SearchCandidateKeys[i]`) shares a
+**partial, non-full, non-empty** prefix with the required sort keys
+(`incrementalsortpaths.go:166`: `if contained || nCommon == 0 { continue }`).
+The single cheapest candidate at each of these rels apparently fails that
+test — either it has no claimed ordering at all (parallel/hash-shaped, most
+likely for Q43's `Finalize`-labelled PG counterpart, which not surprisingly is
+the biggest gap: PG parallelizes this witness with a `Gather Merge`, which
+goopg's own plan for the same query does not reach — see the 2026-09-17i
+Q3 finding's identical caveat about compounding upstream divergences) or a
+FULL match (already arm 1's case, so it never reaches arm 3's loop as a
+distinct offer). The candidates arm 3 CAN attach to are, by construction,
+the ones with a partially-useful existing order — which on this corpus are
+consistently the pricier siblings. This is a sharper, corpus-wide version of
+what 2026-09-17i already flagged as a caveat for Q3 alone; it does not
+contradict `M0141-S2b-6-resume`'s open Hashed-vs-Sorted tie question (that
+tie is specifically about which `PathAgg` STRATEGY the Sort/IncrementalSort
+arms are each fed for the SAME query, and both arms in the table above
+already reflect whichever strategy each individually cheapest option was) —
+it is a distinct, corpus-general observation that no amount of resolving the
+Hashed/Sorted tie can fix on its own, since it is about candidate-set
+MEMBERSHIP (which candidates even have a usable partial order to credit),
+not about the tie itself. Filed as **M0141-S7-cd-candidatepool** below.
+
+### What this changes
+
+Nothing production-facing (recon only, per the banner's "no executor work").
+It refines the resume point: **M0141-S2b-6-resume** (real SF1 cardinalities)
+answers "does the Hashed-vs-Sorted tie flip with real data," which is
+necessary but this update shows it is **not sufficient** even if it flips —
+Q43's ~199-unit gap dwarfs anything a tie-break could produce, and it comes
+entirely from candidate-set membership, a question SF1 cardinalities cannot
+answer by themselves. `GOOPG_INCREMENTAL_SORT` stays default-off (unchanged
+verdict). No ledger row: this is pure diagnosis of already-declined/deferred
+scope, not a new gap discovered outside the ledger's own definition (every
+component named above already has a filed, tracked task).
+
+Gates run: none beyond the trace captures themselves — no production file
+touched. `make ralph-state-guard` passed at commit time. Pre-commit hook's
+pgbench smoke: PASS.
