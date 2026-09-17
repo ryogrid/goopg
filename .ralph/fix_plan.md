@@ -77,7 +77,7 @@ uncommitted `ALTER TABLE … ADD CONSTRAINT` transaction on it was stopped with
 `-mode immediate`. The cluster is under an evidence hold
 (`bench/tpch/runtime_goopg/data.HOLD`); the loop never touches it (R1).
 
-- [ ] **P0-E4 — reproduce the catalog-loss defect.** Parent: none.
+- [x] **P0-E4 — reproduce the catalog-loss defect.** Parent: none.
   Throwaway cluster on `55xx` only. Inside `CREATE DATABASE r; \c r` (the default
   DB bypasses the heap loader via the JSON catalog cache — false negative), with
   no restart between setup and ALTER: `CREATE TABLE t(id int NOT NULL);
@@ -92,6 +92,25 @@ uncommitted `ALTER TABLE … ADD CONSTRAINT` transaction on it was stopped with
   rows as aborted. Deliverable: the three cases as failing regression tests
   (committed, skipped with the P0-E5 id if they would break the unit gate) and a
   design note with which case loses the table.
+  - **Done 2026-09-17.** Reproduced all three cases live on a throwaway
+    `go test`-spawned cluster (real `psql` client, not a shared `55xx`/`6543x`
+    server) — every one loses `t`'s `pg_class`/`pg_attribute` rows identically
+    (`to_regclass('t')` NULL, `SELECT count(*) FROM t` → 42P01) while the heap
+    data FILE for `t`'s `relfilenode` always survives; confirms the suspected
+    path exactly (the loader's `Xmax != Invalid` filter is the single common
+    cause, independent of which abort mechanism triggered it). Three
+    regression tests (`TestPort_P0E4CatalogXmaxRollback`,
+    `TestPort_P0E4CatalogXmaxClientKill`,
+    `TestPort_P0E4CatalogXmaxServerImmediateStop`) landed in
+    `internal/testport/p0e4_catalog_xmax_loss_test.go`, `t.Skip`'d naming
+    P0-E5 (verified: skipped they PASS the unit gate today; temporarily
+    un-skipped they reproduce the FAIL shown above, then re-skipped before
+    commit). Design note:
+    `docs/design/0100-0149/p0-e4-catalog-xmax-loss-repro.md` (indexed in
+    `docs/design/README.md`). Movement: none (test/recon-only, no production
+    diff or PG-match change — P0-E5 is where the fix and its measurement
+    land). Gates: `go build ./...` clean, `go vet ./internal/testport/`
+    clean, `go test -run TestPort_P0E4 ./internal/testport/` PASS (3 SKIP).
 - [ ] **P0-E5 — fix the catalog-loss defect and M0143-0008 together.**
   Parent: none. Depends on P0-E4. **Disk side**: the loader decides a row's
   xmax by commit status (CLOG; subtransactions resolved to parent — PG
