@@ -7654,7 +7654,7 @@ reported, and the values and unit gates are the bar.
     AST-drift (unrelated, no parser file touched); `scripts/tpcds-sf025-regression.sh
     sweep` — `PASS=96 MISMATCH=0 ERROR=0 TIMEOUT=0`, plan-shapes 99/99
     identical.
-- [ ] **M0143-0007 — separate the dimension-table `relpages` divergence (K41)** —
+- [x] **M0143-0007 — separate the dimension-table `relpages` divergence (K41)** —
   `customer` 1,979 pages vs PG's 2,872, `item` 716 vs 1,284. M0140-0005 filed it
   as out of planner reach and that is correct — **but `relpages` is an input to
   every page-priced cost term and to `compute_parallel_worker`'s size ladder, so
@@ -7663,3 +7663,45 @@ reported, and the values and unit gates are the bar.
   every `bpchar` table; R22 (per-page free-space comparison) separates the two.
   Storage work, not planner work, which is why it belongs here. Ledger:
   `m0140-0005-nonplanner-heap-density-floor`.
+  - **Done 2026-09-18.** Direct per-page free-space walk (raw `pd_lower`/
+    `pd_upper` parse, both engines share PG18's byte-identical page header —
+    `internal/storage/page.go`) on `customer`/`item` at TPC-DS SF0.25, no
+    server start needed (read the on-disk relation files directly; PG side
+    cross-checked live against the already-running read-only `:65438`
+    oracle's `pg_class.relpages`/`reltuples`, SELECT-only). Result: goopg's
+    per-page free space is SMALLER than PG's on both tables (82.8B vs
+    117.3B customer; 173.4B vs 255.5B item — goopg packs pages MORE
+    tightly, ruling out R22/fill in this direction), while the page-count
+    ratio and the used-bytes ratio are nearly identical (0.689/0.696
+    customer; 0.558/0.584 item) — the entire K41 gap is tuple width, not
+    page fill. Cross-checked by an independent TSV-column-length estimate
+    (67.9/229.3 B/row) agreeing with the page-derived deltas (69.8/226.2
+    B/row) to a few percent. **R23 (`character(N)` blank-padding) confirmed
+    as ~full explanation; R22 ruled out** for these two tables. Full
+    writeup: `docs/design/0100-0149/m0143-0007-relpages-bpchar-padding-confirmed.md`.
+    Recon/measurement only, no production diff — implementing R23 itself is
+    filed as **M0143-0007b** below since it reverses a documented,
+    load-bearing design convention (trimmed bpchar storage,
+    `internal/catalog/bpchar.go`) across multiple sibling paths. Ledger:
+    `.ralph/deferral_ledger.md`, row dated 2026-09-18.
+- [ ] **M0143-0007b — implement (or owner-decline) R23 `character(N)` on-disk
+  blank-padding.**
+  Parent: M0143-0007. M0143-0007 confirmed PG pads `bpchar`
+  storage to its declared width and goopg does not, and that this fully
+  explains the K41 `relpages` gap on `customer`/`item`. Closing the gap for
+  real means storing `bpchar` padded — but goopg's trimmed convention is
+  explicit, documented, load-bearing design (`internal/catalog/bpchar.go`,
+  "M0103-0007 rung 24"; `compareDatum`'s padding-insensitive bpchar equality
+  and `codec.go`'s `coerceTextLikeDatum` both rest on it;
+  `bpchar_declared_width_test.go:78-86` states explicitly why padding on
+  decode instead would be wrong). Before writing code: get an owner decision
+  on whether to reverse the trimmed-storage convention at all (it is a
+  genuine on-disk PG-compat defect per the project's absolute-compatibility
+  rule, but reversing it touches heap comparisons, `internal/access/nbtree`
+  key comparators, and WAL `pgoutput` encoding — every sibling boundary that
+  currently assumes trimmed storage — plus TOAST thresholds/index key
+  sizes/WAL record sizes store-wide). If approved: design doc first (own
+  `docs/design/<id>-*.md`), then land per-boundary with the sibling-path
+  audit this project's practice card requires, each slice gated by its own
+  regress run plus the sf025 sweep. Ledger:
+  `.ralph/deferral_ledger.md`, row dated 2026-09-18 (task M0143-0007).
