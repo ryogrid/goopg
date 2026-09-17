@@ -2869,18 +2869,39 @@ spill route is net-negative.
     both `ok`); `scripts/tpch-spotcheck.sh` SKIPPED (bench schema not
     loaded, pre-existing M0142-0003k blocker, moot — flag stays
     default-off). Full writeup: design doc's "Update 2026-09-17f" section.
-  - [ ] **M0141-S7-exec-c — EXPLAIN rendering**. **NARROWED 2026-09-17e**:
-    2 of the original 6 `operators_explain.go` sites (`describePlanMode`'s
-    label, `planChildren`'s walk) already landed as part of exec-a (they
-    were hard-gated by coverage tests regardless of reachability — see
-    exec-a's own update above). Remaining scope: 3 safe-to-decline sites
-    (`resolveKeySource`, `childNodeOf`, `execParamOwnerChildren` — none
-    gated by a test, correct to leave declining until a real node can
-    reach them) and the one real item — extend the `Sort Key:` rendering
-    site (`emitNodeDetailLines`, `:1195`) with PG's `Presorted Key:` line
-    (`nodeIncrementalSort.c`/`explain.c` oracle). Needs exec-b (**landed
-    2026-09-17f** — a real node can now reach `createPlanNode`/`Build`, so
-    this is unblocked; next task to select in this sub-group).
+  - [x] **M0141-S7-exec-c — EXPLAIN rendering**. **LANDED 2026-09-17g**.
+    Extracted the `*optimizer.Sort` case's per-key formatting loop
+    (`operators_explain.go`'s `emitNodeDetailLines`) into a shared
+    `sortKeyParts(child, keys, reg, qualify) (full, bare []string)` helper
+    — `full` is the existing decorated string (byte-identical `Sort Key:`
+    behaviour), `bare` is the newly-captured pre-suffix string PG's own
+    `show_sort_group_keys` (`explain.c:2792-2818`) also computes
+    internally before `show_sortorder_options` appends the DESC/NULLS
+    text. Added `case *optimizer.IncrementalSort:` emitting `Sort Key:`
+    from `full` (same as Sort) plus a second row, `Presorted Key: ` +
+    `bare[:PresortedCount]` joined — matching PG's
+    `show_incremental_sort_keys` (`explain.c:2583-2594`) exactly, including
+    that the presorted line carries NO direction/NULLS decoration even for
+    a DESC key (PG's own oracle strips it). `PresortedCount` is always in
+    `(0, len(Keys))` (exec-b's `createIncrementalSortPlan` panic check), so
+    PG's `if (nPresortedKeys > 0)` guard always fires here — no
+    conditional needed. The 3 safe-to-decline sites (`resolveKeySource`,
+    `childNodeOf`, `execParamOwnerChildren`) re-checked, confirmed still
+    correct to leave declining. New test:
+    `TestExplainIncrementalSortPresortedKey`
+    (`operators_incremental_sort_build_test.go`, reuses exec-b's
+    `firstSort`/`replaceSort` hand-built-plan technique, wraps in
+    `&optimizer.Explain{Options:{Costs off}}`) pins `Sort Key: grp, v DESC`
+    + `Presorted Key: grp` (no DESC, no second key) against a
+    `PresortedCount=1` node. Gates: `go build ./...` clean; `go test
+    ./internal/optimizer/... ./internal/executor/...` both green;
+    `RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh` — only
+    failure is the pre-existing tracked `internal/parser`
+    `GroupedJoinUnaliased` AST-drift issue (optimizer/executor both `ok`);
+    `scripts/tpch-spotcheck.sh` SKIPPED (bench schema not loaded,
+    pre-existing M0142-0003k blocker, moot — flag stays default-off). Full
+    writeup: design doc's "Update 2026-09-17g" section. exec-a/b/c are now
+    ALL LANDED.
   - [ ] **M0141-S7-exec-d (deferred, ledger row filed 2026-09-17)** —
     `sortOp` feature parity once exec-a/b/c land and the corpus is
     measured: spill-to-disk, packed-tuple retention (`GOOPG_SORT_PACKED`),

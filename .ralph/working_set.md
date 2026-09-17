@@ -1,62 +1,61 @@
-Task: M0141-S7-exec-a — `IncrementalSort` optimizer Node type + the
-executor operator, standalone/unit-tested, zero createPlanNode/Plan()
-callers. LANDED AND COMMITTED this loop.
+Task: M0141-S7-exec-c — EXPLAIN rendering for *optimizer.IncrementalSort
+(`Sort Key:` + PG's `Presorted Key:` line). LANDED AND COMMITTED this loop.
+exec-a/b/c are now ALL LANDED for M0141-S7.
 
-Files: internal/optimizer/incrementalsort.go (new: IncrementalSort Node
-type, mirrors Sort + PresortedCount), internal/optimizer/incrementalsort_test.go
-(new), internal/executor/operators_incremental_sort.go (new:
-incrementalSortOp — groups via sortPrefixEqual, full-sorts each group,
-streams in arrival order), internal/executor/operators_incremental_sort_test.go
-(new, 5 tests incl. order-equivalence vs sortOp oracle),
-internal/executor/operators_explain.go (2 new `case *optimizer.IncrementalSort:`
-arms — describePlanMode label + planChildren walk — see Findings),
-docs/design/0100-0149/m0141-s7-readjudicate-and-scope-incremental-sort.md
-("Update 2026-09-17e" section), docs/design/README.md (m0141-s7 index row),
-.ralph/fix_plan.md (exec-a checked off with landing note, exec-b gets a
-sizing note re: nCommon/PresortedCount, exec-c scope narrowed to 4
-remaining sites).
+Files: internal/executor/operators_explain.go (extracted the *optimizer.Sort
+case's per-key formatting loop into a new shared `sortKeyParts(child, keys,
+reg, qualify) (full, bare []string)` helper; Sort case now calls it; new
+`case *optimizer.IncrementalSort:` emits `Sort Key:` from `full` plus
+`Presorted Key: ` + `bare[:PresortedCount]`), internal/executor/
+operators_incremental_sort_build_test.go (+1 test,
+TestExplainIncrementalSortPresortedKey). Docs: docs/design/0100-0149/
+m0141-s7-readjudicate-and-scope-incremental-sort.md ("Update 2026-09-17g"),
+docs/design/README.md (m0141-s7 row extended), .ralph/fix_plan.md (exec-c
+checked off).
 
-Key symbols: optimizer.IncrementalSort (Pos/Output), executor.incrementalSortOp
-(Open/Next/Close/Schema, sortKeyVals/lessKeyVals/sortGroup),
-executor.sortPrefixEqual (E-15, reused unmodified), executor.evalSortKeyValue
-/compareDatum (reused unmodified).
+Key symbols: executor.sortKeyParts (new), the *optimizer.IncrementalSort
+case in emitNodeDetailLines.
 
-Findings: adding the bare Go Node type (zero callers) still tripped two
-HARD gates — TestEveryPlanNodeTypeHasAnExplainArm and
-TestEveryPlanNodeWithChildrenIsWalked (internal/executor/explain_node_coverage_test.go)
-— because they enumerate by type existence via reflection/AST-scan, not by
-construction reachability. Fixed by adding exactly the 2 gated arms
-(describePlanMode, planChildren), mirroring Sort's own arms exactly; this
-pulls 2 of exec-c's originally-planned "6 operators_explain.go sites"
-forward into exec-a's commit, narrowing exec-c to the remaining 4 (3
-safe-to-decline, 1 real: the Presorted Key: line in emitNodeDetailLines).
-Also found while reading incrementalsortpaths.go: addIncrementalSortPaths
-computes nCommon locally but never stashes it on the *Path — exec-b will
-need a Path field or a re-derivation at createPlanNode time.
+Findings: PG's show_incremental_sort_keys (explain.c:2583-2594) just calls
+the SAME show_sort_group_keys a plain Sort uses, with nPresortedCols instead
+of 0 — the function internally captures each key's pre-suffix exprstr (the
+deparse output before show_sortorder_options appends DESC/COLLATE/NULLS)
+and, if nPresortedKeys>0, emits its leading nPresortedKeys entries as a
+second `Presorted Key:` property (explain.c:2816-2822) with NO
+direction/NULLS decoration even for a DESC key — confirmed this is PG's own
+oracle behaviour, not a goopg simplification, and pinned it in the new test
+(`Presorted Key: grp` renders bare even though the full ORDER BY was
+`grp, v DESC`). PresortedCount is always in (0, len(Keys)) by exec-b's own
+createIncrementalSortPlan panic check, so PG's `if (nPresortedKeys > 0)`
+guard always fires — no conditional needed in the new case. The 3
+safe-to-decline sites named in exec-c's original scope (resolveKeySource,
+childNodeOf, execParamOwnerChildren) were re-checked and are still correct
+to leave declining.
 
-Next step: M0141-S7-exec-b — createplansimple.go's createPlanNode arm for
-PathIncrementalSort (resolve the nCommon/PresortedCount sizing question
-first), both executor.go builder sites (classic buildNode :179, slab/tree
-fast path :675), and the 4 mechanical tree-walkers (scan_deform.go x2,
-subplan.go, operators_cte_dml.go). This is the correctness gate before
-GOOPG_INCREMENTAL_SORT=on can ever be pointed at the corpus. Re-check the
-fix_plan banner and re-read AGENT.md's plan-parity harness section again
-before selecting (required every loop touching M0137-M0143).
+Next step: M0141-S7-exec-d is deferred (ledger row already filed from
+exec-b) — pending a corpus measurement (run the 14 TPC-DS witnesses with
+GOOPG_INCREMENTAL_SORT=on) to see whether any actually needs sortOp's
+spill/packed-retention/ctid/per-group-stat features before implementing
+them. That measurement is the next open action in M0141-S7, but it's not
+necessarily the next loop-sized pick — re-read the `## Current Priority`
+banner in .ralph/fix_plan.md fresh next loop (it may have moved on to
+M0141's other slices S2b/S3-S6, or M0142) and re-read AGENT.md's
+plan-parity harness section again before selecting (required every loop
+touching M0137-M0143).
 
 Gates run: `go build ./...` clean. `go test ./internal/optimizer/...
-./internal/executor/...` both green (new tests + full pre-existing suites).
+./internal/executor/...` both green (includes the new test).
 `RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh` — only
 failure is the pre-existing, already-tracked `internal/parser`
-GroupedJoinUnaliased AST-drift issue (fix_plan's "Manually discovered"
-entry, filed 2026-09-15, confirmed untouched by this diff via package
-isolation: optimizer/executor packages both `ok`). `scripts/tpch-spotcheck.sh`
-SKIPPED (TPC-H bench schema not currently loaded on this host — CLAUDE.md's
-M0142-0003k blocker, pre-existing/unrelated; moot regardless since this
-change has zero production callers and cannot move any plan).
-`make ralph-state-guard` — see below.
+GroupedJoinUnaliased AST-drift issue (optimizer/executor both `ok`,
+confirmed untouched). `scripts/tpch-spotcheck.sh` SKIPPED (TPC-H bench
+schema still not loaded, CLAUDE.md's M0142-0003k blocker, pre-existing/
+unrelated; moot regardless, GOOPG_INCREMENTAL_SORT confirmed unset(off) in
+the skip output). Nightly triage: all 17 AI- items from
+ci/logs/action-items.md's 20260917-004357 run already had fix_plan.md
+entries before this loop (confirmed by grep — no new filing needed this
+loop). Pre-commit hook's pgbench smoke: pending (runs automatically on the
+commit this loop makes). `make ralph-state-guard`: pending, run before the
+status block.
 
-In-flight: none. Nightly triage (ci/logs/action-items.md run
-20260917-004357, 17 items) was already filed into fix_plan.md's M-NIGHTLY
-section by the PRIOR loop (same commit as the M0141-S7 exec scoping) —
-verified via `git log -1 -- .ralph/fix_plan.md` showing it landed in
-ff5234006, so no re-filing was needed this loop.
+In-flight: none.

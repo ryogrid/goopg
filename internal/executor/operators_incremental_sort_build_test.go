@@ -24,9 +24,11 @@ package executor
 
 import (
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/goopg/goopg/internal/optimizer"
+	"github.com/goopg/goopg/internal/parser"
 )
 
 // firstSort finds the first *optimizer.Sort in a plan tree, descending
@@ -158,4 +160,64 @@ func TestIncrementalSortReachesBothBuilders(t *testing.T) {
 	// (2) Build vs BuildFast agreement — neither executor.go builder site
 	// was missed.
 	runBothAndCompare(t, incPlan, ctx)
+}
+
+// TestExplainIncrementalSortPresortedKey is M0141-S7-exec-c's own gate: a
+// hand-built *optimizer.IncrementalSort must render PG's two-line
+// `Sort Key:` / `Presorted Key:` pair (nodeIncrementalSort.c's
+// show_incremental_sort_keys, explain.c:2583-2823), not just the plain
+// Sort's single `Sort Key:` line. Reuses the same hand-built-plan technique
+// as TestIncrementalSortReachesBothBuilders above (GOOPG_INCREMENTAL_SORT
+// stays off, so a real query can never plan this node itself yet).
+func TestExplainIncrementalSortPresortedKey(t *testing.T) {
+	ctx, cat, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, "CREATE TABLE inc_explain (grp int4, v int4)"); err != nil {
+		t.Fatalf("CREATE TABLE: %v", err)
+	}
+
+	basePlan := planOne(t, "SELECT grp, v FROM inc_explain ORDER BY grp, v DESC", cat)
+	sortNode := firstSort(basePlan)
+	if sortNode == nil {
+		t.Fatalf("plan %T has no *optimizer.Sort node to replace", basePlan)
+	}
+	if len(sortNode.Keys) != 2 {
+		t.Fatalf("planner Sort has %d keys, want 2 (grp, v)", len(sortNode.Keys))
+	}
+	incNode := &optimizer.IncrementalSort{
+		Child:          sortNode.Child,
+		Keys:           sortNode.Keys,
+		PresortedCount: 1,
+	}
+	incPlan := replaceSort(basePlan, incNode)
+
+	ex := &optimizer.Explain{Child: incPlan, Options: parser.ExplainOptions{
+		Costs: false,
+		Set:   parser.ExplainOptionsSet{Costs: true},
+	}}
+	op, err := Build(ex)
+	if err != nil {
+		t.Fatalf("Build(explain): %v", err)
+	}
+	if err := op.Open(ctx); err != nil {
+		t.Fatalf("Open(explain): %v", err)
+	}
+	rows, err := drainScan(op)
+	if err != nil {
+		t.Fatalf("drain(explain): %v", err)
+	}
+	_ = op.Close()
+	lines := renderRows(rows)
+	joined := strings.Join(lines, "\n")
+
+	if !strings.Contains(joined, "Sort Key: grp, v DESC") {
+		t.Errorf("expected `Sort Key: grp, v DESC` detail line; got:\n%s", joined)
+	}
+	if !strings.Contains(joined, "Presorted Key: grp") {
+		t.Errorf("expected `Presorted Key: grp` detail line (no DESC/NULLS suffix, only the first PresortedCount=1 key); got:\n%s", joined)
+	}
+	if strings.Contains(joined, "Presorted Key: grp DESC") || strings.Contains(joined, "Presorted Key: grp, v") {
+		t.Errorf("Presorted Key must be the bare undecorated leading-prefix expression only; got:\n%s", joined)
+	}
 }

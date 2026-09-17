@@ -1122,6 +1122,83 @@ func expandAggOutputRefsInFilter(filt optimizer.Expr, agg *optimizer.Aggregate) 
 // belong under n (Sort Key / Index Cond / Filter). attachedFilter
 // is a Filter.Predicate from a Filter wrapper above n that was
 // skipped — it surfaces as `Filter:` when n is a scan-like node.
+// sortKeyParts renders each key of a Sort/IncrementalSort node the way PG's
+// show_sort_group_keys does (explain.c:2768-2823): `full` is the decorated
+// form (expression plus DESC/NULLS suffix) used for the `Sort Key:` line;
+// `bare` is the same expression WITHOUT that suffix — PG feeds the
+// undecorated `exprstr` (captured before show_sortorder_options appends the
+// direction/NULLS text) into the `Presorted Key:` line's leading
+// nPresortedCols slice. Shared by *optimizer.Sort and *optimizer.IncrementalSort
+// (M0141-S7-exec-c) since both nodes carry the identical Child/Keys shape.
+func sortKeyParts(child optimizer.Node, keys []optimizer.SortKey, reg *subPlanReg, qualify bool) (full, bare []string) {
+	full = make([]string, 0, len(keys))
+	bare = make([]string, 0, len(keys))
+	for _, k := range keys {
+		// R65 Arm A: a key naming a child-aggregate output the
+		// child computed (e.g. Q11's `sum`) is PG's OUTER_VAR
+		// chased through the child's targetlist — render the
+		// underlying call. The S18 wrap below then fires on the
+		// EXPANDED form (a non-Var referent), yielding PG's
+		// `(sum(...)) DESC`; unexpanded keys behave exactly as
+		// before.
+		keyExpr := k.Expr
+		if col, ok := k.Expr.(*optimizer.ColumnRef); ok {
+			if agg := childAggregateThroughFilters(child); agg != nil {
+				// Entry (i) — Sort above agg: Arm-S guard, then
+				// the Slice-2 chase down past republishing
+				// layers; a chase-miss falls back to the Arm-S
+				// render (Slice-1 behaviour, byte-identical).
+				// Aggs-section keys fall through to R65's call
+				// expansion (now Star/Distinct-capable).
+				if src, hit := sortGroupKeySource(col, agg); hit {
+					if chased, ok := resolveKeySource(src, agg.Child, reg); ok {
+						keyExpr = chased
+					} else {
+						keyExpr = src
+					}
+				} else if expanded, hit := expandAggOutputRef(col, agg); hit {
+					keyExpr = expanded
+				}
+			} else if proj := childProjectThroughFilters(child); proj != nil {
+				// Entry (ii) — grouping-input / order-by Sort
+				// over a Project (Q7's Sort: Arm-S never sees
+				// an agg): chase the key through the child's
+				// targets with the re-anchored name guard.
+				cout := proj.Output()
+				if j := col.Index; j >= 0 && j < len(cout) && cout[j].Name == col.Name {
+					if chased, ok := resolveKeySource(col, proj, reg); ok {
+						keyExpr = chased
+					}
+				}
+			}
+		}
+		s := formatExprQual(keyExpr, reg, qualify)
+		// S18: a Sort never evaluates expressions — its key is
+		// always PG's OUTER_VAR reference into the child's target
+		// list, so get_special_variable's "force parentheses for a
+		// non-Var referent" rule applies unconditionally here.
+		// Placed BEFORE the DESC/NULLS suffix: PG prints
+		// `Sort Key: ((g % 10000)) DESC`, keeping the decoration
+		// outside the added pair.
+		if _, isVar := keyExpr.(*optimizer.ColumnRef); !isVar {
+			s = forceParen(s)
+		}
+		bare = append(bare, s)
+		if k.Desc {
+			s += " DESC"
+		}
+		// Emit NULLS FIRST/LAST only when it's non-default.
+		// Default: ASC → NULLS LAST, DESC → NULLS FIRST.
+		if k.NullsFirst && !k.Desc {
+			s += " NULLS FIRST"
+		} else if !k.NullsFirst && k.Desc {
+			s += " NULLS LAST"
+		}
+		full = append(full, s)
+	}
+	return full, bare
+}
+
 func emitNodeDetailLines(n optimizer.Node, indent string, verbose bool, rows *[]Row, attachedFilter optimizer.Expr, reg *subPlanReg) {
 	// M0125-0039: whether this node's detail lines print qualified column
 	// references. Upstream splits the decision by node kind — show_scan_qual
@@ -1194,70 +1271,23 @@ func emitNodeDetailLines(n optimizer.Node, indent string, verbose bool, rows *[]
 	// so the pair still agrees position-by-position by construction.
 	case *optimizer.Sort:
 		if len(p.Keys) > 0 {
-			parts := make([]string, 0, len(p.Keys))
-			for _, k := range p.Keys {
-				// R65 Arm A: a key naming a child-aggregate output the
-				// child computed (e.g. Q11's `sum`) is PG's OUTER_VAR
-				// chased through the child's targetlist — render the
-				// underlying call. The S18 wrap below then fires on the
-				// EXPANDED form (a non-Var referent), yielding PG's
-				// `(sum(...)) DESC`; unexpanded keys behave exactly as
-				// before.
-				keyExpr := k.Expr
-				if col, ok := k.Expr.(*optimizer.ColumnRef); ok {
-					if agg := childAggregateThroughFilters(p.Child); agg != nil {
-						// Entry (i) — Sort above agg: Arm-S guard, then
-						// the Slice-2 chase down past republishing
-						// layers; a chase-miss falls back to the Arm-S
-						// render (Slice-1 behaviour, byte-identical).
-						// Aggs-section keys fall through to R65's call
-						// expansion (now Star/Distinct-capable).
-						if src, hit := sortGroupKeySource(col, agg); hit {
-							if chased, ok := resolveKeySource(src, agg.Child, reg); ok {
-								keyExpr = chased
-							} else {
-								keyExpr = src
-							}
-						} else if expanded, hit := expandAggOutputRef(col, agg); hit {
-							keyExpr = expanded
-						}
-					} else if proj := childProjectThroughFilters(p.Child); proj != nil {
-						// Entry (ii) — grouping-input / order-by Sort
-						// over a Project (Q7's Sort: Arm-S never sees
-						// an agg): chase the key through the child's
-						// targets with the re-anchored name guard.
-						cout := proj.Output()
-						if j := col.Index; j >= 0 && j < len(cout) && cout[j].Name == col.Name {
-							if chased, ok := resolveKeySource(col, proj, reg); ok {
-								keyExpr = chased
-							}
-						}
-					}
-				}
-				s := formatExprQual(keyExpr, reg, qualify)
-				// S18: a Sort never evaluates expressions — its key is
-				// always PG's OUTER_VAR reference into the child's target
-				// list, so get_special_variable's "force parentheses for a
-				// non-Var referent" rule applies unconditionally here.
-				// Placed BEFORE the DESC/NULLS suffix: PG prints
-				// `Sort Key: ((g % 10000)) DESC`, keeping the decoration
-				// outside the added pair.
-				if _, isVar := keyExpr.(*optimizer.ColumnRef); !isVar {
-					s = forceParen(s)
-				}
-				if k.Desc {
-					s += " DESC"
-				}
-				// Emit NULLS FIRST/LAST only when it's non-default.
-				// Default: ASC → NULLS LAST, DESC → NULLS FIRST.
-				if k.NullsFirst && !k.Desc {
-					s += " NULLS FIRST"
-				} else if !k.NullsFirst && k.Desc {
-					s += " NULLS LAST"
-				}
-				parts = append(parts, s)
-			}
-			*rows = append(*rows, Row{NewStringDatum(indent + "Sort Key: " + strings.Join(parts, ", "))})
+			full, _ := sortKeyParts(p.Child, p.Keys, reg, qualify)
+			*rows = append(*rows, Row{NewStringDatum(indent + "Sort Key: " + strings.Join(full, ", "))})
+		}
+	case *optimizer.IncrementalSort:
+		// M0141-S7-exec-c: mirrors the *optimizer.Sort arm above (same
+		// show_sort_group_keys oracle, explain.c:2588-2593 calls it with
+		// plan->nPresortedCols) plus PG's own `show_incremental_sort_keys`
+		// addition — a `Presorted Key:` line listing the leading
+		// PresortedCount keys WITHOUT their DESC/NULLS suffix (explain.c
+		// appends resultPresorted from the pre-show_sortorder_options
+		// exprstr). PresortedCount is always in (0, len(Keys)) —
+		// createIncrementalSortPlan panics otherwise — so PG's
+		// `if (nPresortedKeys > 0)` guard (explain.c:2821) always fires here.
+		if len(p.Keys) > 0 {
+			full, bare := sortKeyParts(p.Child, p.Keys, reg, qualify)
+			*rows = append(*rows, Row{NewStringDatum(indent + "Sort Key: " + strings.Join(full, ", "))})
+			*rows = append(*rows, Row{NewStringDatum(indent + "Presorted Key: " + strings.Join(bare[:p.PresortedCount], ", "))})
 		}
 	case *optimizer.IndexScan:
 		if cond := formatIndexCond(p, reg); cond != "" {
