@@ -7385,7 +7385,7 @@ reported, and the values and unit gates are the bar.
     (0003a-e) all carry `Movement: none` and the lineage budget is exhausted
     — recorded ledger-only (`.ralph/deferral_ledger.md`, 2026-09-18
     M0143-0003e row) per the guard's own remedy instead of a fix_plan item.
-- [ ] **M0143-0003f — `poc.UniqueColumns`/`LIKE ... INCLUDING INDEXES` never
+- [x] **M0143-0003f — `poc.UniqueColumns`/`LIKE ... INCLUDING INDEXES` never
   set `IsConstraint` (live bug, not restart-related).**
   Parent: M0143-0003. Filed 2026-09-18, discovered while researching
   M0143-0003c's write-loop call sites (deferral-ledger row dated 2026-09-18).
@@ -7400,6 +7400,38 @@ reported, and the values and unit gates are the bar.
   exists) right after both `createBTreeIndex` calls; add a regression test
   (`PARTITION OF ... (col UNIQUE)` and `LIKE ... INCLUDING INDEXES` each
   asserting the resulting index appears in `pg_constraint` with `contype='u'`).
+  - **Done 2026-09-18.**
+    Movement: yes — two independent CREATE-TABLE-time UNIQUE-index creation
+    paths (`operators_ddl.go`'s `likeUniqueIndexes` loop and
+    `execCreatePartitionChild`'s `poc.UniqueColumns` loop) now populate
+    `pg_constraint` with a `contype='u'` row, matching every sibling
+    UNIQUE-constraint path, on a table that never restarts — a genuinely new
+    class of bug from M0143-0003a-e's restart-reload gaps, not a repeat.
+    No explicit `syncConstraintCatalogRow` call turned out to be needed: both
+    call sites already sit inside `execCreateTable`/`execCreatePartitionChild`
+    ahead of an existing tail-of-function resync
+    (`tableHasUniqueConstraintIndex(...)`, landed by M0143-0003c) that scans
+    `IndexesOnTable` directly rather than a fixed call-site list — setting
+    `idx.IsConstraint = true` right after `createBTreeIndex` was sufficient to
+    make that pre-existing gate fire and write the row via
+    `syncTableToCatalogHeap`. Two new regression tests in
+    `internal/executor/operators_ddl_like_indexes_test.go`:
+    `TestLikeIncludingIndexesMarksUniqueAsConstraint` (LIKE ... INCLUDING
+    INDEXES with a source `UNIQUE` column) and
+    `TestPartitionOfInlineUniqueMarksAsConstraint` (`PARTITION OF ... (col
+    UNIQUE)`), both asserting `idx.IsConstraint == true` on the cloned index
+    (consistent with this file's existing `TestLikeIncludingIndexesCopiesPKDeferrable`
+    style — an in-memory catalog assertion, not a live `pg_constraint` SELECT,
+    since `newDDLFixture` is the same fixture already used there).
+    Gates: `go build ./...` clean; `go test ./internal/executor/...` PASS
+    (12.4s); `RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh`
+    full green (all packages, including `internal/initdb` at 122.7s and
+    `cmd/goopg` at 24.0s); no TPC-H data needed, consistent with the
+    P0-E6-wait selection rule (this is a unit-scoped CREATE-TABLE-time fix,
+    no planner/executor row-count surface). `python3
+    scripts/ralph-lineage-guard.py` not implicated — M0143-0003f already
+    existed as an open `[ ]` task at HEAD (filed by the previous loop), so
+    flipping it to `[x]` adds no new descendant under M0143-0003.
 - [ ] **M0143-0004 — `PhysicalTypeIsVarlena` has no `IsArray` arm**
   (`physical_align.go:85-107`) — latent for ordinary user `int4[]` columns, not just
   catalogs.

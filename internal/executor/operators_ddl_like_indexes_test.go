@@ -106,6 +106,91 @@ func TestLikeIncludingIndexesMultiplePKError(t *testing.T) {
 	}
 }
 
+// TestLikeIncludingIndexesMarksUniqueAsConstraint verifies that a UNIQUE
+// (non-PK) index cloned via LIKE ... INCLUDING INDEXES is marked
+// constraint-backed (IsConstraint), matching every other UNIQUE-index
+// creation path (inline column, table-level, named, PK auto-index). Before
+// M0143-0003f this clone never set IsConstraint, so the resulting index
+// never appeared in pg_constraint even without any restart — a live bug, not
+// a restart-durability gap (see M0143-0003c/e's sibling fixes, which only
+// address indexes that already carried IsConstraint/IsExclusion but lost it
+// on reload).
+func TestLikeIncludingIndexesMarksUniqueAsConstraint(t *testing.T) {
+	ctx, cat, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, `CREATE TABLE src (id int PRIMARY KEY, val text UNIQUE)`); err != nil {
+		t.Fatalf("CREATE TABLE src: %v", err)
+	}
+	if err := runDDL(t, ctx, `CREATE TABLE dst (extra text, LIKE src INCLUDING INDEXES)`); err != nil {
+		t.Fatalf("CREATE TABLE dst: %v", err)
+	}
+
+	im, ok := cat.(*catalog.InMemory)
+	if !ok {
+		t.Fatal("catalog is not InMemory")
+	}
+	dstTbl, ok := cat.LookupTable(parser.ObjectName{Name: "dst"})
+	if !ok {
+		t.Fatal("dst table not found")
+	}
+	var uniqIdx *catalog.Index
+	for _, idx := range im.IndexesOnTable(dstTbl, catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)) {
+		if idx.Unique && !idx.Primary {
+			uniqIdx = idx
+			break
+		}
+	}
+	if uniqIdx == nil {
+		t.Fatal("dst has no cloned UNIQUE (non-PK) index")
+	}
+	if !uniqIdx.IsConstraint {
+		t.Errorf("cloned UNIQUE index %q: IsConstraint=false, want true (must appear in pg_constraint)", uniqIdx.Name)
+	}
+}
+
+// TestPartitionOfInlineUniqueMarksAsConstraint verifies that a UNIQUE column
+// constraint declared directly in a PARTITION OF child's column list
+// (`CREATE TABLE child PARTITION OF parent (col UNIQUE) FOR VALUES …`,
+// poc.UniqueColumns) is marked constraint-backed, matching every other
+// UNIQUE-index creation path. Companion to
+// TestLikeIncludingIndexesMarksUniqueAsConstraint (M0143-0003f).
+func TestPartitionOfInlineUniqueMarksAsConstraint(t *testing.T) {
+	ctx, cat, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	for _, s := range []string{
+		"CREATE TABLE rp (i int, j text) PARTITION BY RANGE (i)",
+		"CREATE TABLE rp_1 PARTITION OF rp (j UNIQUE) FOR VALUES FROM (0) TO (100)",
+	} {
+		if err := runDDL(t, ctx, s); err != nil {
+			t.Fatalf("runDDL(%q): %v", s, err)
+		}
+	}
+
+	im, ok := cat.(*catalog.InMemory)
+	if !ok {
+		t.Fatal("catalog is not InMemory")
+	}
+	childTbl, ok := cat.LookupTable(parser.ObjectName{Name: "rp_1"})
+	if !ok {
+		t.Fatal("rp_1 table not found")
+	}
+	var uniqIdx *catalog.Index
+	for _, idx := range im.IndexesOnTable(childTbl, catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)) {
+		if idx.Unique && !idx.Primary {
+			uniqIdx = idx
+			break
+		}
+	}
+	if uniqIdx == nil {
+		t.Fatal("rp_1 has no UNIQUE (non-PK) index for its inline column-constraint")
+	}
+	if !uniqIdx.IsConstraint {
+		t.Errorf("PARTITION OF inline UNIQUE index %q: IsConstraint=false, want true (must appear in pg_constraint)", uniqIdx.Name)
+	}
+}
+
 // TestDropTableSkipsAlreadyCascadedChildren verifies that when a table is
 // cascade-dropped as a child of an earlier table in the same DROP TABLE
 // statement, it is not errored on when encountered explicitly later.

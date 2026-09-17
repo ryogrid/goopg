@@ -4256,6 +4256,14 @@ afterExistsCheck:
 		if err := o.createBTreeIndex(s.Pos(), idxName, tbl, idx.Columns, nil, true, false, idx.NullsNotDistinct, nil, nil); err != nil {
 			return err
 		}
+		// M0143-0003f: unlike every sibling UNIQUE-index path (inline column,
+		// table-level, named, PK auto-index), this clone never marked the
+		// resulting index as constraint-backed, so it never appeared in
+		// pg_constraint even before any restart. tableHasUniqueConstraintIndex
+		// below (M0143-0003c) picks this up automatically once set.
+		if newIdx, ok := o.ctx.Catalog.LookupIndex(idxName, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)); ok {
+			newIdx.IsConstraint = true
+		}
 	}
 	// Create btree indexes for LIKE INCLUDING INDEXES non-unique plain indexes.
 	// PostgreSQL copies all non-partial non-PK non-exclusion indexes; non-unique
@@ -5506,6 +5514,13 @@ func (o *ddlOp) execCreatePartitionChild(s *parser.CreateTableStmt) error {
 		childIdxName := parser.ObjectName{Schema: s.Name.Schema, Name: tbl.Name + "_" + colName + "_key"}
 		if err := o.createBTreeIndex(s.Pos(), childIdxName, tbl, []string{colName}, nil, true, false, false, nil, nil); err != nil {
 			return err
+		}
+		// M0143-0003f: mark constraint-backed like every sibling UNIQUE path
+		// (inline column, table-level, named, PK auto-index) — the
+		// tableHasUniqueConstraintIndex resync trigger a few hundred lines
+		// below (M0143-0003c) picks this up automatically once set.
+		if childIdx, ok := o.ctx.Catalog.LookupIndex(childIdxName, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)); ok {
+			childIdx.IsConstraint = true
 		}
 	}
 	// Inherit regular (non-PK, non-unique) btree indexes from parent onto the

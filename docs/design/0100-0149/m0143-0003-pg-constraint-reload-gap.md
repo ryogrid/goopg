@@ -329,12 +329,39 @@ since the last 5 completed descendants (0003a-e) all carry `Movement: none`,
 exhausting the lineage budget; the resume point lives in
 `.ralph/deferral_ledger.md` (2026-09-18, M0143-0003e row) instead.
 
+## M0143-0003f — `poc.UniqueColumns`/`LIKE ... INCLUDING INDEXES` never set `IsConstraint` (landed 2026-09-18)
+
+Out of scope for this document's title ("reload gap") but filed as a
+M0143-0003 descendant and landed in the same investigation: two
+CREATE-TABLE-time UNIQUE-index creation paths never set `idx.IsConstraint`
+in the first place, so the resulting index never appeared in
+`pg_constraint` even on a table that never restarts — a LIVE bug, not a
+reload gap. `execCreateTable`'s `LIKE ... INCLUDING INDEXES` clone loop
+(`likeUniqueIndexes`) and `execCreatePartitionChild`'s `PARTITION OF ...
+(col UNIQUE)` inline-column loop (`poc.UniqueColumns`) both call
+`createBTreeIndex` but, unlike every sibling UNIQUE-constraint path (inline
+column, table-level, named, PK auto-index), never flip `IsConstraint` on
+the result.
+
+Fix: `idx.IsConstraint = true` right after each `createBTreeIndex` call, no
+more. No explicit `syncConstraintCatalogRow` call was needed — both loops
+already run ahead of an existing tail-of-function resync gate,
+`tableHasUniqueConstraintIndex(...)` (landed by 0003c), which scans
+`IndexesOnTable` directly rather than a fixed call-site list, so it picks up
+the newly-flipped flag automatically and writes the row via
+`syncTableToCatalogHeap`. Tests:
+`TestLikeIncludingIndexesMarksUniqueAsConstraint` and
+`TestPartitionOfInlineUniqueMarksAsConstraint`
+(`internal/executor/operators_ddl_like_indexes_test.go`).
+
 ## Sequencing
 
 0003a (done) → 0003b (done, CHECK) → 0003d (done, NOT NULL) → 0003c (done,
 UNIQUE via `pg_constraint.conindid`) → 0003e (done, EXCLUDE via the same
-shape plus `ExclusionOp`-through-`conbin`). All four contypes now survive a
-restart with both correct `pg_constraint` visibility and correct runtime
-enforcement. Follow-up (ledger-only, not a fix_plan task — see above): the
-DROP CONSTRAINT heap-residual for index-backed constraints, found while
-landing 0003e.
+shape plus `ExclusionOp`-through-`conbin`) → 0003f (done, two live
+UNIQUE-index-creation paths that never set `IsConstraint` in the first
+place, unrelated to restart). All four contypes now survive a restart with
+both correct `pg_constraint` visibility and correct runtime enforcement.
+Follow-up (ledger-only, not a fix_plan task — see above): the DROP
+CONSTRAINT heap-residual for index-backed constraints, found while landing
+0003e.
