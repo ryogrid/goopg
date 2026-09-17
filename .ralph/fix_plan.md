@@ -211,8 +211,30 @@ placeholder is a comment, not a checkbox, so the plan-complete exit
 heuristic stays live.)
 
 ### Nightly run 20260901-010436 (sha `d93fb9edc669`, 7 items) — filed 2026-09-01
-- [ ] **testport/TestPort_PgStatActivity (AI-20260901-010436-005, AI-20260905-011015-007, AI-20260914-235643-010, AI-20260916-035206-011, AI-20260917-004357-015)**.
-- [ ] **testport/TestSyntax_Catalog_PgStatActivity (AI-20260901-010436-007, AI-20260905-011015-009, AI-20260914-235643-012, AI-20260916-035206-013, AI-20260917-004357-017)**.
+- [x] **testport/TestPort_PgStatActivity (AI-20260901-010436-005, AI-20260905-011015-007, AI-20260914-235643-010, AI-20260916-035206-011, AI-20260917-004357-015)**.
+  **Fixed 2026-09-18 — test bug, not an engine bug.** `internal/testport/plpgsql_test.go`'s
+  assertion compared `row[2] != "client_backend"` (underscore) against the
+  `backend_type` column, but real PG's literal is `"client backend"` (WITH A
+  SPACE) — confirmed via `postgres/src/backend/po/*.po` (`msgid "client
+  backend"`) and via the engine's own code
+  (`internal/initdb/pg_stat_activity_view.go:104-108`, which already has an
+  explicit comment: upstream uses `"client backend"` with a space, not
+  `"client_backend"`, and maps the internal code to that display literal).
+  The test's own query at line 313 even filters
+  `WHERE backend_type = 'client backend'` and gets a row back — proof goopg
+  was already byte-correct; only the assertion's string literal was wrong
+  (didn't match its own error-message string one line below it). Fixed by
+  changing the comparison to `"client backend"`. No engine change.
+- [x] **testport/TestSyntax_Catalog_PgStatActivity (AI-20260901-010436-007, AI-20260905-011015-009, AI-20260914-235643-012, AI-20260916-035206-013, AI-20260917-004357-017)**.
+  **Fixed 2026-09-18, same commit** — identical typo
+  (`internal/testport/syntax_catalog_test.go:53`, sibling test file,
+  `pattern_sibling_paths_must_agree`), same fix, same root cause as the task
+  above. Gates: `go build ./...` clean; `go test -v -run
+  '^(TestPort_PgStatActivity|TestSyntax_Catalog_PgStatActivity)$'
+  ./internal/testport/` PASS (both); `RALPH_PRECOMMIT_SCOPE=units
+  scripts/ralph-precommit-test.sh` PASS (all in-scope packages). Test-only
+  change (both files are `_test.go`), no TPC-H/sf025 gate needed — not
+  affected by the `:65433` P0-E6 evidence hold.
 
 ### Nightly run 20260902-005256 (sha `c11e55d253ff`, 8 items) — filed 2026-09-02
 - [ ] **testport/TestE2E_PGColdStartOnGoopgDataDir (AI-20260902-005256-001, AI-20260905-011015-002, AI-20260914-235643-004, AI-20260916-035206-004, AI-20260917-004357-006)**. New
