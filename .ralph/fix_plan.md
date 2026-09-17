@@ -345,6 +345,29 @@ heuristic stays live.)
   tasks above; AI-ids appended per the "do not add another" rule. Evidence
   for all: `ci/logs/20260917-004357/`.)
 
+### Nightly run 20260918-010720 (sha `f489e72e78ab`, 5 items) — filed 2026-09-18
+- [x] **testport/build (AI-20260918-010720-001)**, **race/stage
+  (AI-20260918-010720-002)**, **units/stage (AI-20260918-010720-003)**,
+  **units/build-broke-mid-stage (AI-20260918-010720-004)**, **race/build-broke-mid-stage
+  (AI-20260918-010720-005)** — all five share one root cause per the bot's own
+  classification on -004/-005: `internal/executor/operators_ddl.go:18519:2:
+  undefined: stampExclusionConstraintRows`, and the bot flags "the working
+  tree is built live, so a concurrent edit/commit is the likely cause". The
+  cited sha `f489e72e78ab` is the docs-only `f489e72e7` commit (M0143-0003c
+  docs), landed BEFORE `fd25f7d13` (M0143-0003e, which is what actually
+  defines `stampExclusionConstraintRows` at `operators_ddl.go:18534`) — i.e.
+  the nightly batch's live working-tree checkout raced a concurrent Ralph
+  commit mid-build and captured a half-applied tree instead of any real
+  commit's contents, exactly the `bak/`-contamination pattern already logged
+  for AI-20260914-235643-013/014 above. **Stale — re-run at HEAD (`0317293db`,
+  which already contains M0143-0003e) is clean**: `go build ./...` exit 0,
+  `stampExclusionConstraintRows` present and referenced consistently
+  (`operators_ddl.go:18519,18534`). testport/build and the two `*/stage`
+  failures are downstream fallout of the same mid-build compile break (a
+  package that failed to compile fails every test in stages that import it),
+  not independent regressions. Closing as stale; re-open if a future nightly
+  reproduces the same undefined-symbol error on a clean, non-racing checkout.
+
 ### Manually discovered (not yet in a nightly `ci/logs/action-items.md` run) — filed 2026-09-15
 - [ ] **parser/TestLockingClauseParity** — deterministic FAIL, found while
   running the M0137-0001 pre-commit gate (`RALPH_PRECOMMIT_SCOPE=units
@@ -7432,9 +7455,64 @@ reported, and the values and unit gates are the bar.
     scripts/ralph-lineage-guard.py` not implicated — M0143-0003f already
     existed as an open `[ ]` task at HEAD (filed by the previous loop), so
     flipping it to `[x]` adds no new descendant under M0143-0003.
-- [ ] **M0143-0004 — `PhysicalTypeIsVarlena` has no `IsArray` arm**
+- [x] **M0143-0004 — `PhysicalTypeIsVarlena` has no `IsArray` arm**
   (`physical_align.go:85-107`) — latent for ordinary user `int4[]` columns, not just
   catalogs.
+  - **Done 2026-09-18.** Added an `if t.IsArray { return true }` short-circuit at
+    the top of `PhysicalTypeIsVarlena` (`internal/catalog/physical_align.go`),
+    mirroring the `IsArray` arm `PhysicalTypeAlign` already had. A user array
+    column carries `Type{Name:<element>, IsArray:true}` (Name = element type,
+    DU-002 slice 62); every element name in the switch's non-default arms
+    (`int4`, `int2`, `int8`, `bool`, `oid`, `float4/8`, `date`, `timestamp[tz]`,
+    `uuid`, `name`, `xid`, …) is fixed-width on its own, so without the arm an
+    `int4[]`/`bool[]`/`date[]`/… column was misclassified as NOT varlena even
+    though every array is a varlena `ArrayType` blob on disk. Since this
+    function is the single source of truth shared by the heap codec, pgoutput's
+    walker, and the catalog statistic paths (comment at `physical_align.go:72-77`),
+    one fix covers all three; `sys_pg_constraint.go:141-163` had already
+    hand-documented this exact gap and worked around it for `pg_constraint`'s
+    `conkey`/`confkey` by declaring them WITHOUT `IsArray` — that workaround
+    comment can stay (still true and still needed: those two columns are still
+    NOT `IsArray`), it just stops being the only mitigation in the tree.
+    **Confirmed live, not just by code reading**: built both the pre-fix and
+    post-fix binaries, started throwaway `init`+`start` clusters on 5533/5534,
+    `CREATE TABLE onlyarr (tags int4[]); INSERT INTO onlyarr VALUES
+    (ARRAY[1,2,3]);`, then parsed the raw heap page bytes — the buggy binary
+    wrote `t_infomask=0x0800` (`HEAP_HASVARWIDTH` UNSET) on a row whose only
+    column is a non-null `int4[]`; the fixed binary correctly writes
+    `0x0802` (SET). This is precisely the `nocachegetattr` fast-path hazard
+    `sys_pg_constraint.go:158-163` and `codec.go:1550-1557` describe: a real
+    PG18 (or any PG-faithful decoder honoring the infomask) walking this row
+    would use the fixed-prefix `attcacheoff` shortcut and either skip past or
+    misread the array, corrupting it and every following column.
+    Also checked (and found harmless by construction, so no code change
+    needed there): `encodeArrayValuePGCtx` (`codec_array.go:104-113`) always
+    writes the 4-byte/long-form varlena header (`total<<2`, low 2 bits always
+    0), so `isShortVarlenaHeader` is always false for arrays regardless of
+    this bug — `packableShortColumn`'s encode-side alignment decision for
+    array columns was already unaffected, and `AttAlignPointer`'s decode-side
+    peek vs. force-align both land on the identical offset whenever the
+    writer always force-aligns (proved by cases: pre-aligned offset — peek
+    and force agree trivially; offset needing padding — the byte the peek
+    inspects IS the real zero pad byte the encoder wrote). Verified this
+    equivalence live too: byte-identical relation file sizes (139264 and
+    344064 bytes respectively) between the two binaries for both an
+    `int4[]`-as-last-column table and a `bool` + `int4[]` table across 2000
+    and 5000 rows. New test: `TestPgRowHasVarWidthDetectsVarlenaCols`
+    (`internal/executor/pg18_user_catalog_rows_test.go`) gained an
+    `{Name:"int4", IsArray:true}` case pinning the exact infomask bug (the
+    pre-existing case there used `{Name:"text[]"}`, a catalog-form Name that
+    was never in the fixed-width switch and so never exercised the missing
+    arm); `TestPhysicalTypeIsVarlenaArray`
+    (`internal/catalog/physical_align_test.go`) pins the helper directly for
+    every fixed-width element name, both array and scalar form. Gates:
+    `go build ./...` clean; `go test ./internal/catalog/...
+    ./internal/executor/... ./internal/access/...` PASS; `RALPH_PRECOMMIT_SCOPE=units
+    scripts/ralph-precommit-test.sh` full green; `scripts/tpcds-sf025-regression.sh
+    sweep` `PASS=96 MISMATCH=0 ERROR=0 TIMEOUT=0`, plan-shapes 99/99 identical;
+    `tpch-spotcheck.sh` SKIP-BLOCKED (exit 3) by the `:65433` P0-E6 evidence
+    hold — ledger: P0-E7 is the re-run owner, same standing exception as
+    M0143-0003b/c/d/e/f.
 - [ ] **M0143-0005 — `ParamRef` LIMIT + DISTINCT returns wrong rows** — R83 fixed the
   `IntegerConst` case and pinned it; the `ParamRef` allowlist was deliberately not
   extended. Fail-closed with zero corpus impact today, which is exactly why it stays

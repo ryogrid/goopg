@@ -439,6 +439,21 @@ func TestPgRowHasVarWidthDetectsVarlenaCols(t *testing.T) {
 	if pgRowHasVarWidth(varCols, nullVarRow) {
 		t.Errorf("pgRowHasVarWidth(varCols, nullVarRow) = true, want false (null varlena does not stamp HEAP_HASVARWIDTH)")
 	}
+	// M0143-0004: a USER array column spells its type {Name:<element>,
+	// IsArray:true} (DU-002 slice 62), not a catalog-form array Name like
+	// "text[]" above. Every one of these element names is fixed-width on its
+	// own, so without PhysicalTypeIsVarlena's IsArray arm this row's only
+	// column is misclassified as non-varlena and HEAP_HASVARWIDTH goes
+	// UNSET on a row that genuinely contains a varlena ArrayType blob —
+	// reproduced live against a real heap page (infomask 0x0800 vs the
+	// correct 0x0802) before the fix landed.
+	userArrCols := []catalog.Column{
+		{Name: "tags", Type: catalog.Type{Name: "int4", IsArray: true}},
+	}
+	userArrRow := Row{NewStringDatum("{1,2,3}")}
+	if !pgRowHasVarWidth(userArrCols, userArrRow) {
+		t.Errorf("pgRowHasVarWidth(userArrCols, userArrRow) = false, want true (int4[] is always varlena on disk)")
+	}
 }
 
 // TestBuildUserPGAttributeRowEncodesTypCollation pins that runtime DDL emits

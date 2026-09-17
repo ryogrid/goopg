@@ -110,3 +110,17 @@ TOAST columns with the reason stated); spill payload (D-10);
   peek-decoder reads nominal data fine.
 - Sibling check: `catalog/codec.go:1693` + `:1520+` stay (different
   seams); note the relation in a comment, do not unify.
+
+## 6. Addendum (M0143-0004, 2026-09-18)
+
+`pgPhysicalTypeIsVarlena` (the kind gate `packableShortColumn` §3 reads)
+had a bug for `IsArray` columns, fixed by the same-named
+`../0100-0149/m0143-0004-physicaltypeisvarlena-isarray-gap.md`. Checked at
+fix time and recorded here for this doc's own gate table: it does NOT change
+D-09's own pack/align behavior for arrays, because `encodeArrayValuePGCtx`
+always emits the long-form (4-byte) varlena header, so the short-header test
+in `packableShortColumn` was already false for every array regardless of
+this bug — confirmed by byte-identical relation file sizes between the
+pre-fix and post-fix binaries. The bug's real consequence was
+`HEAP_HASVARWIDTH` (`pgRowHasVarWidth`, a different consumer of the same
+kind gate), not this mechanism.

@@ -40,3 +40,27 @@ func TestAttAlignPointer(t *testing.T) {
 		})
 	}
 }
+
+// TestPhysicalTypeIsVarlenaArray pins M0143-0004: a user array column carries
+// its ELEMENT type name with IsArray set (DU-002 slice 62), not an
+// array-form Name. Every one of these element names is fixed-width on its
+// own (PhysicalTypeIsVarlena's non-default switch arms), so without the
+// IsArray short-circuit the array column is misclassified as NOT varlena
+// even though it is always a varlena ArrayType blob on disk — the same
+// disagreement PhysicalTypeAlign's own IsArray arm already guards against.
+func TestPhysicalTypeIsVarlenaArray(t *testing.T) {
+	fixedWidthElems := []string{"int4", "int2", "int8", "bool", "oid", "float4", "float8", "date", "timestamp", "timestamptz", "uuid", "name", "xid"}
+	for _, elem := range fixedWidthElems {
+		ty := Type{Name: elem, IsArray: true}
+		if !PhysicalTypeIsVarlena(ty) {
+			t.Errorf("PhysicalTypeIsVarlena(%q[]) = false, want true (arrays are always varlena)", elem)
+		}
+	}
+	// The scalar (non-array) form of the same names must be unaffected.
+	for _, elem := range fixedWidthElems {
+		ty := Type{Name: elem}
+		if PhysicalTypeIsVarlena(ty) {
+			t.Errorf("PhysicalTypeIsVarlena(%q) = true, want false (fixed-width scalar)", elem)
+		}
+	}
+}
