@@ -263,6 +263,9 @@ heuristic stays live.)
     - `numerology` and `limit`: **NOT fixed — unrelated root causes,
       independently sized, filed as their own tasks below** rather than
       folded into this loop (ONE task per loop).
+  - **UPDATE 2026-09-18b**: `limit` **FIXED, this commit** — see the
+    `limit — FETCH BACKWARD sign/row bug` task below for the root cause and
+    fix. Full-suite re-run: 48 PASS / 1 FAIL (`numerology`) / 183 SKIP.
   (Remaining 3 items — PGColdStart AI-…-002, PgStatActivity AI-…-007,
   Syntax_Catalog_PgStatActivity AI-…-009 — already have open tasks above;
   AI-ids appended per the "do not add another" rule. Evidence for all:
@@ -277,7 +280,7 @@ heuristic stays live.)
   the goyacc playbook (`docs/design/not_ralph/06-goyacc-parser-playbook.md`)
   before touching `grammar/*.y`. Repro: `go test -v -run
   '^TestPort_RegressSuite$/^numerology$' ./internal/testport/`.
-- [ ] **limit — FETCH BACKWARD sign/row bug** (filed 2026-09-18, split out of
+- [x] **limit — FETCH BACKWARD sign/row bug** (filed 2026-09-18, split out of
   testport/TestPort_RegressSuite's limit subtest above). Against a cursor
   opened over a query returning a negative `q2`, `FETCH BACKWARD` returns
   the value with its sign dropped (`4567890123456789` instead of
@@ -287,6 +290,53 @@ heuristic stays live.)
   path re-reading the underlying scan rather than replaying its buffered
   row set. Repro: `go test -v -run '^TestPort_RegressSuite$/^limit$'
   ./internal/testport/`.
+  - **Done 2026-09-18.** Not a sign-drop bug at all — the diff line that
+    looked like a dropped sign (`4567890123456789` vs `-4567890123456789`)
+    was actually the WRONG ROW (`int8_tbl`'s second-to-last row happens to
+    share the same first column as the last), an off-by-one in
+    `executeFetch`'s `FETCH BACKWARD` position bookkeeping
+    (`internal/postmaster/dispatch.go`). Root-caused by porting PostgreSQL's
+    real algorithm (`tuplestore_gettuple`'s in-memory backward branch,
+    `postgres/src/backend/utils/sort/tuplestore.c:985-1005`) and replaying
+    it tuple-by-tuple against a disposable `initdb`+`psql` scratch cluster
+    (`/tmp/pgscratch1`, port 5599 — never the shared 55xx/6543x lanes) to
+    get ground truth for edge cases `limit.sql` itself doesn't spell out.
+    M0134-0056's formula (`end := cur.Pos - 1`, unconditionally excluding
+    the row at `cur.Pos-1` as "already returned") was simply wrong: real PG
+    only excludes that row when the cursor reached its current position via
+    a **finite** forward fetch that returned at least one row; when the
+    cursor is genuinely `AtEnd` (PG's `eof_reached` — reached via `FETCH
+    ALL` or a forward fetch that ran off the end), `FETCH BACKWARD`
+    re-returns the *last* row instead of skipping past it — the tuplestore
+    algorithm's "first call after eof_reached jumps `current` to the write
+    position without charging a decrement" behavior, which the old uniform
+    formula had no way to express. The old `FETCH BACKWARD ALL` branch had
+    the identical bug (used `cur.Pos` as an exclusive bound with no
+    `AtEnd`-awareness, so a `BACKWARD ALL` issued right after `AtEnd` was
+    reached would re-include the already-backward-fetched last row). Fixed
+    both by replacing the two closed-form branches with one loop that
+    replays the C algorithm call-by-call (safer than re-deriving another
+    closed form — the sign/wrong-row bug already came from a
+    hand-rolled formula silently drifting from real semantics), including
+    `FETCH BACKWARD ALL` iterating to BOF rather than capping at `total`
+    iterations (capping under-runs by exactly one when entering from
+    `AtEnd`, for the same "first call is free" reason). This also explains
+    the deep-in-the-diff `c5`/`WITH TIES` mystery (`fetch all in c5`
+    returning only 1 of 2 rows) that looked like it might need PG's
+    Limit-node backward-scan quirks: it was the exact same position bug,
+    not a LIMIT/WITH-TIES-specific gap — no executor-level change was
+    needed at all. Verified the full traced sequence for all five cursors
+    (`c1`..`c5`) in `limit.sql` by hand against the ported algorithm before
+    editing. Gates: `go build ./...` clean; `go test -v -run
+    '^TestPort_RegressSuite$/^limit$' ./internal/testport/` PASS; full
+    `TestPort_RegressSuite` re-run: 48 PASS / 1 FAIL (`numerology`, its own
+    unrelated task above) / 183 SKIP (was 47/2/183); `go test
+    ./internal/postmaster/...` PASS; `RALPH_PRECOMMIT_SCOPE=units
+    scripts/ralph-precommit-test.sh` PASS (all packages in scope — the
+    script's own `EXCLUDE` list omits `internal/postmaster`, covered
+    separately above). No TPC-H dependency (cursor/portal fetch path, not
+    planner/executor row-count path) — not affected by the `:65433`
+    catalog-loss hold (G6).
 
 ### Nightly run 20260914-235643 (sha `baf40efcbfbd`, 14 items) — filed 2026-09-15
 - [ ] **units/internal/parser (AI-20260914-235643-001, AI-20260916-035206-001, AI-20260917-004357-002)** — new tonight, units suite
