@@ -6733,30 +6733,68 @@ cross-layer programme that has never been scoped.
   analogous shape, which is the milestone's own binding Q2 answer). Follow-up
   filed as M0142-0016c below for the open PG-forced-plan-comparator
   question.**
-- [ ] **M0142-0016c — does PG qerr-match the M0142-0016b `Q33`/`Q54`/`Q56`
+- [x] **M0142-0016c — does PG qerr-match the M0142-0016b `Q33`/`Q54`/`Q56`
   shape if forced into an analogous parameterized-probe-with-residual plan,
-  and should the resulting cost signal move those queries' plan choice?** —
-  filed by M0142-0016b's own ea-ratchet read. M0142-0016b's 17 new `ea-ratchet`
-  findings (all `UNMATCHED-IN-PG`) were read as "goopg now reproduces a
-  PG-analogous estimation weakness, not a novel defect" on the strength of one
-  traced example (Q54's `my_customers` Nested Loop, `rows=1` vs `actual=121`,
-  traced to a correct independence-assumption product over real `date_dim`
-  stats) — but that reading was never checked against PG's OWN number for the
-  same shape, because PG does not choose this shape for these three queries
-  and so `pg-plan-parity-diff.py`/`ea-ratchet` have no comparator node to read.
-  Resume point: force an analogous plan out of PG for one of the three
-  (`join_collapse_limit`/`enable_hashjoin=off`/similar knobs, or hand-build the
-  equivalent query fragment) and compare its residual-clause row estimate
-  against goopg's — confirms or refutes the "PG would do the same" claim
-  directly instead of by architectural analogy. If confirmed, no further
-  action needed (the milestone's Q2 already licenses this). If refuted (PG's
-  actual formula differs enough to land closer to truth), M0142-0016b's read
-  should be revisited and `clauseSelectivity`'s treatment of a probe's `Cond`
-  may need the same kind of correlation-aware handling PG itself has that
-  goopg does not yet port. Separately, check whether costing this same
-  narrowed row estimate (not just displaying it) would move the DP search away
-  from the NLI shape entirely for `Q33`/`Q54`/`Q56` — unexercised this loop
-  since none of the three queries' plan shape moved.
+  and should the resulting cost signal move those queries' plan choice?**
+  **DONE 2026-09-18, recon closed, no production code changed.** Full writeup:
+  `docs/design/0100-0149/m0142-0016c-pg-forced-plan-comparator.md`. Measured
+  real PG 18.3 (`:65438`, db `tpcds025`) against the exact query text — no
+  forcing needed: **PG's own unforced, cost-optimal default plan already
+  contains the identical shape** for all three queries (Q54: `Index Scan
+  using date_dim_pkey` residual `d_moy=1 AND d_year=1999`; Q33/Q56: `Index
+  Scan using customer_address_pkey[/_1/_2]` residual `ca_gmt_offset = -5`),
+  at cost numbers byte-identical to the already-committed
+  `bench/tpcds/plans-pg/{Q33,Q54,Q56}.txt` captures. **PG's own qerr on that
+  node lands within ~15% of goopg's** (Q33: PG 23.8-27.9 vs goopg 21.4-30.3;
+  Q54 direct clamped-to-1 match). **Answer: yes, confirmed by measurement**
+  (M0142-0016b's "not a blocker" verdict stands on firmer footing); **and no,
+  the cost signal should not move the plan choice** (PG keeps this exact
+  shape as ITS cost-optimal pick too, carrying the identical clamped-to-1
+  estimate — it does not cost it away). **Root-caused the "UNMATCHED-IN-PG"
+  tag itself**: both PG-side captures already contain the matching node —
+  `scripts/estimate-parity/parity.py`'s relset key prefixes goopg's key with
+  a `CTE <label>` scope (goopg's own capture still prints a `CTE
+  ss`/`cs`/`ws`/`my_customers` marker for these single-reference CTEs) with
+  no PG-side counterpart, because PG 18.3 structurally inlines
+  single-reference non-recursive CTEs (`inline_cte`,
+  `postgres/src/backend/optimizer/plan/subselect.c`) while goopg's analogue
+  (`pushQualsThroughSingleRefCTEs`,
+  `internal/optimizer/cte_inline_pushdown.go`) only pushes predicates through
+  the CTE boundary without removing it — a scorer key-mismatch bug, not a
+  missing PG comparator. Follow-up filed as **M0142-0016d** below.
+- [ ] **M0142-0016d — fix `parity.py`'s relset key so a goopg-only
+  single-reference-CTE scope prefix does not block a match against PG's
+  un-scoped key.**
+  Parent: M0142-0016c. Bounded, tooling-only (no planner
+  code), filed by M0142-0016c's root-cause read. `scripts/estimate-parity/parity.py`'s
+  `annotate_relsets`/`MARK`/`base_relation` (`parity.py:65-120,202-238`)
+  build a node's match key from `CTE <label>` marker lines in the **goopg**
+  capture, producing keys like `ss.customer_address` for a single-reference
+  CTE `ss`; PG's own capture never emits a `CTE` marker for a
+  single-reference, non-recursive, non-volatile CTE (PG 12+ `inline_cte`
+  removes the boundary before join-order search), so its key is the bare
+  `customer_address` — the two never match, regardless of whether the
+  underlying node is genuinely comparable (M0142-0016c confirmed it is, for
+  Q33/Q54/Q56). Resume point: when scoring a goopg node whose relset carries
+  a CTE-label scope prefix, additionally try matching against PG's
+  unprefixed relset for the same bare relation names (or normalize both
+  sides' keys to drop CTE-scope prefixes when the CTE is single-reference —
+  cross-check refcount via the same `plannedCTE.refs`-style reasoning
+  `cte_inline_pushdown.go` already uses, so a genuinely-multiply-referenced
+  CTE like TPC-DS Q31's `ws3` — cited in that file's own doc comment — does
+  NOT get de-scoped, since PG does not inline it either and a real semantic
+  difference could still exist there). **Acceptance**: re-run `make
+  ea-ratchet`; expect the 17 `UNMATCHED-IN-PG` findings from M0142-0016b to
+  either disappear (PG's qerr floor now applies and goopg passes it, per
+  M0142-0016c's measured qerr parity) or re-surface as genuinely-scored
+  `NEW` findings with a real `pg_qerr` — either outcome is progress over an
+  unconditional `UNMATCHED-IN-PG`, but the former (gate back to PASS) is
+  expected per M0142-0016c's own numbers. Do not touch
+  `pushQualsThroughSingleRefCTEs` or any other optimizer file — this is a
+  scorer-only fix. If the fix reveals the underlying CTE-inlining-vs-only-
+  qual-pushdown structural gap actually costs goopg a worse join order
+  somewhere in the corpus (M0142-0016c's flagged-but-unscoped bigger
+  question), file that as its own new task rather than folding it in here.
 - [x] **M0142-0016a — scoping recon: measure M0142-0016's blast radius before
   implementing it** — filed by this loop from M0142-0016's own K50 sizing
   instruction (mirrors the M0142-0012a precedent). **DONE 2026-09-15, recon
