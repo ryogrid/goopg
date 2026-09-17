@@ -56,6 +56,11 @@ fi
 #     stamp may be committed, so a loop that could edit it could waive its own
 #     gates (audit hole C);
 #   - .ralph/deferral_ledger.md is append-only and owner rows stay owner rows;
+#   - AGENT.md rule D3 for design docs (size / index / Status:), which was
+#     prose-only until now — the loop let a design doc reach 1501 lines with a
+#     `Status:` still claiming "no production change" after production landed
+#     through it. Enforced on what the commit STAGES only, so the existing
+#     over-length docs never block an unrelated commit;
 #   - fix_plan lineage budget / Parent: / FROZEN rules.
 if [ "${RALPH_LOOP:-}" = "1" ]; then
   cd "$ROOT"
@@ -65,6 +70,10 @@ if [ "${RALPH_LOOP:-}" = "1" ]; then
   fi
   if ! python3 "$ROOT/scripts/ralph_protected_regions.py" check-ledger; then
     echo "pre-commit: REJECTED (RALPH_LOOP=1 deferral-ledger append-only guard)" >&2
+    exit 1
+  fi
+  if ! python3 "$ROOT/scripts/ralph_protected_regions.py" check-designdocs; then
+    echo "pre-commit: REJECTED (RALPH_LOOP=1 design-doc rule D3 guard)" >&2
     exit 1
   fi
   if ! python3 "$ROOT/scripts/ralph-lineage-guard.py" --staged; then

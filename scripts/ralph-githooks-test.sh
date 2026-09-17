@@ -66,6 +66,19 @@ printf 'package executor\n' > internal/executor/scan.go
 printf 'package catalog\n' > internal/catalog/x.go
 printf 'package main\n' > cmd/goopg/main.go
 printf 'd\n' > docs/a.md
+mkdir -p docs/design/0100-0149 docs/design/cost-model docs/design/not_ralph/m3
+gen() { python3 -c 'import sys; n=int(sys.argv[2]); print("Status: recon landed\n" + "\n".join("l%d"%i for i in range(n)))' "$1" "$2" > "$1"; }
+gen docs/design/0100-0149/m0141-s7-readjudicate.md 20
+gen docs/design/cost-model/m0142-0012-costing.md 20
+gen docs/design/top-level-note.md 20
+gen docs/design/not_ralph/m3/ledger.md 2000
+cat > docs/design/README.md <<'EOF'
+# Design index
+| id | doc | status |
+| m0141-s7 | [x](0100-0149/m0141-s7-readjudicate.md) | accepted |
+| m0142-0012 | [x](cost-model/m0142-0012-costing.md) | accepted |
+| top | [x](top-level-note.md) | accepted |
+EOF
 GOOPG_SKIP_PRECOMMIT=0 git add -A && git commit -qm "init" >/dev/null 2>&1 || { echo "setup commit failed"; exit 1; }
 
 expect() { # <want ok|reject> <name> <msg> <env...> -- (files already staged)
@@ -300,6 +313,77 @@ printf '| M0143-0002 | tpcds-sf025 | 9 | 2999-12-31 | self-granted |\n' >> .ralp
 git add .ralph/gate-exceptions.md
 expect ok "pre: gate-exceptions.md edit outside loop" "ralph: x" RALPH_LOOP=0
 git reset -q --hard HEAD >/dev/null 2>&1
+
+# --- pre-commit: design-doc rule D3 (AGENT.md) -------------------------------
+# D3.1 size — the limit applies wherever the doc lives; the numbered bucket
+# directory is not part of the rule.
+big() { python3 -c 'import sys; print("Status: x\n" + "\n".join("l%d"%i for i in range(int(sys.argv[2]))))' "$1" "$2" > "$1"; }
+for d in docs/design/0100-0149/m0141-s7-readjudicate.md docs/design/cost-model/m0142-0012-costing.md docs/design/top-level-note.md; do
+  big "$d" 900; git add "$d"
+  expect reject "pre: D3.1 over-length append ($d)" "docs: x" RALPH_LOOP=1
+done
+big docs/design/0100-0149/m0141-s7-readjudicate.md 900; git add docs/design/0100-0149/m0141-s7-readjudicate.md
+expect ok "pre: D3.1 over-length outside the loop" "docs: x" RALPH_LOOP=0
+big docs/design/0100-0149/m0141-s7-readjudicate.md 700; git add docs/design/0100-0149/m0141-s7-readjudicate.md
+expect ok "pre: D3.1 under the limit" "docs: x" RALPH_LOOP=1
+big docs/design/0100-0149/m0141-s7-readjudicate.md 300; git add docs/design/0100-0149/m0141-s7-readjudicate.md
+expect ok "pre: D3.1 300 lines is fine at the default limit" "docs: x" RALPH_LOOP=1
+big docs/design/0100-0149/m0141-s7-readjudicate.md 300; git add docs/design/0100-0149/m0141-s7-readjudicate.md
+expect reject "pre: D3.1 limit is configurable (RALPH_DESIGN_DOC_MAX=100)" "docs: x" RALPH_LOOP=1 RALPH_DESIGN_DOC_MAX=100
+# an ALREADY over-length doc may shrink (that is the split) or stay put
+big docs/design/0100-0149/m0141-s7-readjudicate.md 900
+GOOPG_SKIP_PRECOMMIT=1 git add docs/design/0100-0149/m0141-s7-readjudicate.md
+git -c core.hooksPath=/dev/null commit -qm "seed: over-length doc" >/dev/null 2>&1
+big docs/design/0100-0149/m0141-s7-readjudicate.md 880; git add docs/design/0100-0149/m0141-s7-readjudicate.md
+expect ok "pre: D3.1 over-length doc may SHRINK" "docs: x" RALPH_LOOP=1
+big docs/design/0100-0149/m0141-s7-readjudicate.md 950; git add docs/design/0100-0149/m0141-s7-readjudicate.md
+expect reject "pre: D3.1 over-length doc may not grow further" "docs: x" RALPH_LOOP=1
+big docs/design/0100-0149/m0141-s7-readjudicate.md 300
+GOOPG_SKIP_PRECOMMIT=1 git add docs/design/0100-0149/m0141-s7-readjudicate.md
+git -c core.hooksPath=/dev/null commit -qm "seed: shrink back" >/dev/null 2>&1
+# not_ralph/ is the METHODOLOGY3 reading corpus (D6), not a D3 design doc
+big docs/design/not_ralph/m3/ledger.md 2500; git add docs/design/not_ralph/m3/ledger.md
+expect ok "pre: D3.1 does not police not_ralph/" "docs: x" RALPH_LOOP=1
+# the index itself is exempt
+big docs/design/README.md 900; git add docs/design/README.md
+expect ok "pre: D3.1 does not police the index itself" "docs: x" RALPH_LOOP=1
+git checkout -q -- docs/design/README.md
+
+# D3.2 index — a new doc must be indexed in the same commit, in any directory
+gen docs/design/0100-0149/m0143-0100-new.md 20; git add docs/design/0100-0149/m0143-0100-new.md
+expect reject "pre: D3.2 new bucket doc not indexed" "docs: x" RALPH_LOOP=1
+gen docs/design/cost-model/m0143-0101-new.md 20; git add docs/design/cost-model/m0143-0101-new.md
+expect reject "pre: D3.2 new topic-dir doc not indexed" "docs: x" RALPH_LOOP=1
+gen docs/design/m0143-0102-new.md 20; git add docs/design/m0143-0102-new.md
+expect reject "pre: D3.2 new root-level doc not indexed" "docs: x" RALPH_LOOP=1
+gen docs/design/0100-0149/m0143-0100-new.md 20
+printf '| m0143-0100 | [x](0100-0149/m0143-0100-new.md) | draft |\n' >> docs/design/README.md
+git add docs/design/0100-0149/m0143-0100-new.md docs/design/README.md
+expect ok "pre: D3.2 new doc indexed in the same commit" "docs: x" RALPH_LOOP=1
+gen docs/design/0100-0149/m0141-s7-readjudicate.md 20; git add docs/design/0100-0149/m0141-s7-readjudicate.md
+expect ok "pre: D3.2 modifying an already-indexed doc" "docs: x" RALPH_LOOP=1
+
+# D3.3 Status: — a task state change requires its doc's Status: to change
+printf -- '- [ ] **M0142-0012 — costing**\n  Parent: none\n' >> .ralph/fix_plan.md
+GOOPG_SKIP_PRECOMMIT=1 git add .ralph/fix_plan.md
+git -c core.hooksPath=/dev/null commit -qm "seed: task" >/dev/null 2>&1
+sed -i 's/- \[ \] \*\*M0142-0012/- [x] **M0142-0012/' .ralph/fix_plan.md; git add .ralph/fix_plan.md
+expect reject "pre: D3.3 task completed without touching its doc Status:" "ralph: x" RALPH_LOOP=1
+sed -i 's/- \[ \] \*\*M0142-0012/- [x] **M0142-0012/' .ralph/fix_plan.md
+sed -i 's/^Status: .*/Status: done, production change landed/' docs/design/cost-model/m0142-0012-costing.md
+git add .ralph/fix_plan.md docs/design/cost-model/m0142-0012-costing.md
+expect ok "pre: D3.3 task completed WITH its doc Status: updated" "ralph: x" RALPH_LOOP=1
+sed -i 's/- \[ \] \*\*M0142-0012/- [x] **M0142-0012/' .ralph/fix_plan.md
+printf 'extra prose\n' >> docs/design/cost-model/m0142-0012-costing.md
+git add .ralph/fix_plan.md docs/design/cost-model/m0142-0012-costing.md
+expect reject "pre: D3.3 doc staged but Status: unchanged" "ralph: x" RALPH_LOOP=1
+printf -- '- [ ] **M0143-0777 — no doc**\n  Parent: none\n' >> .ralph/fix_plan.md
+GOOPG_SKIP_PRECOMMIT=1 git add .ralph/fix_plan.md
+git -c core.hooksPath=/dev/null commit -qm "seed: docless task" >/dev/null 2>&1
+sed -i 's/- \[ \] \*\*M0143-0777/- [x] **M0143-0777/' .ralph/fix_plan.md; git add .ralph/fix_plan.md
+expect ok "pre: D3.3 task with no design doc is unaffected" "ralph: x" RALPH_LOOP=1
+sed -i 's/- \[ \] \*\*M0142-0012/- [x] **M0142-0012/' .ralph/fix_plan.md; git add .ralph/fix_plan.md
+expect ok "pre: D3.3 off outside the loop" "ralph: x" RALPH_LOOP=0
 
 echo "ralph-githooks-test: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]

@@ -30,6 +30,11 @@ Two entry points share the region logic so they cannot drift:
       append-only; appended rows may not carry OWNER DECISION nor re-use the
       task-id of an OWNER DECISION row.
 
+  ralph_protected_regions.py check-designdocs
+      Used by .githooks/pre-commit: mechanises AGENT.md rule D3, which was
+      prose-only (a 1501-line doc with a stale `Status:` reached HEAD). See
+      DESIGN DOC RULES below.
+
 stdlib only.
 """
 
@@ -454,15 +459,197 @@ def check_ledger():
     return 0
 
 
+# --------------------------------------------------------- check-designdocs
+#
+# DESIGN DOC RULES (AGENT.md D3, mechanised). All three fire only for what THIS
+# commit stages, so the 20-odd pre-existing over-length docs never block an
+# unrelated commit:
+#
+#   D3.1 size     a staged design doc may not be over DESIGN_MAX_LINES lines
+#                 AND longer than it was: "a doc over 800 lines is split before
+#                 anything is appended". Shrinking an over-length doc (i.e.
+#                 doing the split) is always allowed.
+#   D3.2 index    a NEWLY ADDED design doc must be referenced from
+#                 docs/design/README.md in the same commit.
+#   D3.3 status   when this commit changes a fix_plan task's checkbox state and
+#                 a design doc for that task id exists, that doc's `Status:`
+#                 line must change in the same commit.
+#
+# PATH SCHEME: the numbered bucket directories (0000-0049, 0100-0149, ...) are
+# a convention that may grow, be renamed, or be absent — docs also live at
+# docs/design/<topic>/<file>.md and docs/design/<file>.md. So a design doc is
+# ANY *.md under docs/design/ at any depth, EXCEPT the index itself and
+# not_ralph/ (the METHODOLOGY3 reading corpus, governed by D6, not D3).
+
+DESIGN_ROOT = "docs/design/"
+DESIGN_INDEX = "docs/design/README.md"
+DESIGN_EXCLUDED_TOPDIRS = ("not_ralph",)
+FIX_PLAN = ".ralph/fix_plan.md"
+
+
+def design_max_lines():
+    try:
+        return int(os.environ.get("RALPH_DESIGN_DOC_MAX", "800"))
+    except ValueError:
+        return 800
+
+
+def is_design_doc(path):
+    norm = path.replace("\\", "/")
+    while norm.startswith("./"):
+        norm = norm[2:]
+    if not norm.startswith(DESIGN_ROOT) or not norm.endswith(".md"):
+        return False
+    if norm == DESIGN_INDEX:
+        return False
+    rest = norm[len(DESIGN_ROOT):]
+    return rest.split("/")[0] not in DESIGN_EXCLUDED_TOPDIRS
+
+
+def _nlines(text):
+    return len(text.splitlines())
+
+
+def _status_lines(text):
+    return [ln.strip() for ln in text.splitlines()
+            if re.match(r"^\s*(\*\*|_|`)?Status\s*:", ln)]
+
+
+TASK_LINE_RE = re.compile(r"^\s*- \[([ xX!])\] \*\*([^\s*]+)")
+
+
+def _task_states(text):
+    out = {}
+    for ln in text.splitlines():
+        m = TASK_LINE_RE.match(ln)
+        if m:
+            out.setdefault(m.group(2).rstrip(".,:;—"), m.group(1).lower())
+    return out
+
+
+def _staged_entries():
+    """[(status, path)] for the commit being made."""
+    r = subprocess.run(["git", "diff", "--cached", "--name-status", "-z"],
+                       capture_output=True, check=True)
+    toks = [t for t in r.stdout.decode("utf-8", "surrogateescape").split("\0") if t]
+    out, i = [], 0
+    while i < len(toks):
+        st = toks[i]
+        if st[0] in ("R", "C"):          # <status>\0<from>\0<to>
+            if i + 2 < len(toks):
+                out.append((st[0], toks[i + 2]))
+            i += 3
+        else:
+            if i + 1 < len(toks):
+                out.append((st[0], toks[i + 1]))
+            i += 2
+    return out
+
+
+def _tracked_design_docs():
+    r = subprocess.run(["git", "ls-files", "--", DESIGN_ROOT], capture_output=True)
+    if r.returncode != 0:
+        return []
+    return [n for n in r.stdout.decode("utf-8", "surrogateescape").splitlines()
+            if is_design_doc(n)]
+
+
+def _docs_for_task(tid, tracked, all_ids=()):
+    """Design docs named after a task id: <task-id>.md or <task-id>-<slug>.md
+    (case-insensitive), whatever directory they sit in — the numbered bucket
+    dirs are not part of the match.
+
+    A doc is assigned to its MOST SPECIFIC task: `m0141-s2a-fix1-<slug>.md`
+    belongs to M0141-S2a-fix1, not to its parent M0141-S2a, whenever that
+    longer id is itself a task in the plan."""
+    key = tid.lower()
+    longer = [i.lower() for i in all_ids
+              if len(i) > len(tid) and i.lower().startswith(key)]
+    out = []
+    for p in tracked:
+        base = p.rsplit("/", 1)[-1][:-3].lower()
+        if not (base == key or base.startswith(key + "-")):
+            continue
+        if any(base == o or base.startswith(o + "-") for o in longer):
+            continue
+        out.append(p)
+    return out
+
+
+def check_designdocs_errors():
+    maxln = design_max_lines()
+    errs = []
+    entries = _staged_entries()
+    staged_docs = [(st, p) for st, p in entries if is_design_doc(p)]
+
+    # D3.1 size / D3.2 index
+    index_text = _git_show(":" + DESIGN_INDEX) or _git_show("HEAD:" + DESIGN_INDEX)
+    for st, p in staged_docs:
+        if st == "D":
+            continue
+        after = _git_show(":" + p)
+        before = _git_show("HEAD:" + p)
+        n_after, n_before = _nlines(after), _nlines(before)
+        if n_after > maxln and n_after > n_before:
+            errs.append(
+                "%s is %d lines (D3 limit %d) and this commit makes it longer (%d -> %d). "
+                "D3: a doc over %d lines is SPLIT before anything is appended — split it by "
+                "task id, link the parts back, and index them in %s in the same commit."
+                % (p, n_after, maxln, n_before, n_after, maxln, DESIGN_INDEX))
+        if st == "A":
+            rel = p[len(DESIGN_ROOT):]
+            base = p.rsplit("/", 1)[-1]
+            if rel not in index_text and base not in index_text:
+                errs.append(
+                    "new design doc %s is not referenced from %s. D3: every design doc is "
+                    "indexed in the same commit that adds it (add its row/link, then commit "
+                    "both together)." % (p, DESIGN_INDEX))
+
+    # D3.3 status — only when this commit moves a fix_plan checkbox.
+    if any(p == FIX_PLAN for _s, p in entries):
+        before_states = _task_states(_git_show("HEAD:" + FIX_PLAN))
+        after_states = _task_states(_git_show(":" + FIX_PLAN))
+        moved = [t for t, s in after_states.items()
+                 if t in before_states and before_states[t] != s]
+        if moved:
+            tracked = _tracked_design_docs()
+            staged_paths = {p for _s, p in entries}
+            for tid in sorted(moved):
+                for doc in _docs_for_task(tid, tracked, after_states.keys()):
+                    if doc in staged_paths and \
+                            _status_lines(_git_show(":" + doc)) != _status_lines(_git_show("HEAD:" + doc)):
+                        continue
+                    errs.append(
+                        "task %s changes state [%s] -> [%s] in %s, but the `Status:` line of its "
+                        "design doc %s does not change in this commit. D3: `Status:` is updated "
+                        "in the commit that changes the task state."
+                        % (tid, before_states[tid], after_states[tid], FIX_PLAN, doc))
+    return errs
+
+
+def check_designdocs():
+    errs = check_designdocs_errors()
+    if errs:
+        sys.stderr.write("pre-commit: RALPH_LOOP=1 design-doc rule (AGENT.md D3) violations:\n")
+        for e in errs:
+            sys.stderr.write("  - " + e + "\n")
+        sys.stderr.write("Set RALPH_DESIGN_DOC_MAX to match AGENT.md if the limit ever moves.\n")
+        return 1
+    return 0
+
+
 def main(argv):
-    modes = ("file-guard", "check-staged", "check-ledger")
+    modes = ("file-guard", "check-staged", "check-ledger", "check-designdocs")
     if len(argv) < 2 or argv[1] not in modes:
-        sys.stderr.write("usage: ralph_protected_regions.py {file-guard|check-staged|check-ledger}\n")
+        sys.stderr.write("usage: ralph_protected_regions.py "
+                         "{file-guard|check-staged|check-ledger|check-designdocs}\n")
         return 2
     if argv[1] == "file-guard":
         return file_guard()
     if argv[1] == "check-ledger":
         return check_ledger()
+    if argv[1] == "check-designdocs":
+        return check_designdocs()
     return check_staged()
 
 
