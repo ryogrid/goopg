@@ -243,10 +243,50 @@ heuristic stays live.)
   FAILed, also failed previous run.
 - [ ] **testport/TestPort_RegressSuite (AI-20260905-011015-008, AI-20260914-235643-011, AI-20260916-035206-012, AI-20260917-004357-016)** — FAILed
   subtests: limit, numerology, also failed previous run; 20260914-235643 adds subtests time, timetz.
+  - **UPDATE 2026-09-18**: re-ran the repro at HEAD (`e121c4e9e`) per the
+    M-NIGHTLY loop rule; all 4 subtests still diverged. Root-caused each
+    independently (`GOOPG_REGRESS_DIFF_DIR=<dir> go test -v -run
+    '^TestPort_RegressSuite$/^\<name\>$' ./internal/testport/` dumps the
+    `_expected.txt`/`_actual.txt`/`_raw.txt` triple per case).
+    - `time`/`timetz`: **FIXED, this commit.** `evalTypedStringLit`'s
+      `"time"`/`"timetz"` arms (`internal/executor/expr.go`) discarded
+      `parseTimeString`/`parseTimeTZString`'s already-correctly-typed
+      `*ExecError` (22008 "date/time field value out of range" for e.g.
+      `'25:00:00'::time`, vs. 22007 "invalid input syntax" for real
+      garbage) and always manufactured a hardcoded 22007 message — the
+      exact fix already applied to the COPY/index-key sibling
+      (`internal/executor/btree_scalar_keys.go:198-224`) but never ported
+      to this typed-literal path (sibling-path drift,
+      `pattern_sibling_paths_must_agree`). Both subtests now PASS; no
+      other regress case regressed (full-suite re-run: 47 PASS / 2 FAIL
+      (limit, numerology) / 183 SKIP, was 45/4/183 before).
+    - `numerology` and `limit`: **NOT fixed — unrelated root causes,
+      independently sized, filed as their own tasks below** rather than
+      folded into this loop (ONE task per loop).
   (Remaining 3 items — PGColdStart AI-…-002, PgStatActivity AI-…-007,
   Syntax_Catalog_PgStatActivity AI-…-009 — already have open tasks above;
   AI-ids appended per the "do not add another" rule. Evidence for all:
   `ci/logs/20260905-011015/`.)
+- [ ] **numerology — binary/octal/hex integer literals unsupported** (filed
+  2026-09-18, split out of testport/TestPort_RegressSuite's numerology
+  subtest above). PG 16 added `0b`/`0o`/`0x` integer literal syntax
+  (`postgres/src/test/regress/sql/numerology.sql` lines 10-38); goopg's
+  lexer/grammar does not recognise it, so every `SELECT 0b100101;`-shaped
+  statement errors instead of returning the decoded integer, dropping the
+  whole expected result block from the diff. Parser/grammar change — read
+  the goyacc playbook (`docs/design/not_ralph/06-goyacc-parser-playbook.md`)
+  before touching `grammar/*.y`. Repro: `go test -v -run
+  '^TestPort_RegressSuite$/^numerology$' ./internal/testport/`.
+- [ ] **limit — FETCH BACKWARD sign/row bug** (filed 2026-09-18, split out of
+  testport/TestPort_RegressSuite's limit subtest above). Against a cursor
+  opened over a query returning a negative `q2`, `FETCH BACKWARD` returns
+  the value with its sign dropped (`4567890123456789` instead of
+  `-4567890123456789`) in two places in the diff, and one boundary fetch
+  (`fetch backward 1 in c5`) returns the wrong row entirely. Not yet
+  localized past the regress diff — likely the cursor/scroll-direction
+  path re-reading the underlying scan rather than replaying its buffered
+  row set. Repro: `go test -v -run '^TestPort_RegressSuite$/^limit$'
+  ./internal/testport/`.
 
 ### Nightly run 20260914-235643 (sha `baf40efcbfbd`, 14 items) — filed 2026-09-15
 - [ ] **units/internal/parser (AI-20260914-235643-001, AI-20260916-035206-001, AI-20260917-004357-002)** — new tonight, units suite

@@ -4945,6 +4945,14 @@ func evalTypedStringLit(x *optimizer.TypedStringLit, ctx *Context) (Datum, error
 		}
 		ts, err := parseTimeString(x.Value)
 		if err != nil {
+			// parseTimeString already distinguishes 22007 (syntax) from 22008
+			// (range, e.g. "25:00:00") — see btree_scalar_keys.go's identical
+			// arm. Reusing its ExecError instead of a hardcoded 22007 keeps
+			// this typed-literal path in sync with that sibling.
+			if ee, ok := err.(*ExecError); ok {
+				ee.Pos = x.Pos()
+				return Datum{}, ee
+			}
 			return Datum{}, &ExecError{Code: "22007", Pos: x.Pos(), Message: fmt.Sprintf("invalid input syntax for type time: %q", x.Value)}
 		}
 		return NewTimeDatum(ts), nil
@@ -4954,6 +4962,10 @@ func evalTypedStringLit(x *optimizer.TypedStringLit, ctx *Context) (Datum, error
 		}
 		ts, offsetSecs, err := parseTimeTZString(x.Value, timeZoneFromCtx(ctx))
 		if err != nil {
+			if ee, ok := err.(*ExecError); ok {
+				ee.Pos = x.Pos()
+				return Datum{}, ee
+			}
 			return Datum{}, &ExecError{Code: "22007", Pos: x.Pos(), Message: fmt.Sprintf("invalid input syntax for type time with time zone: %q", x.Value)}
 		}
 		return NewTimeTZDatum(ts, offsetSecs), nil
