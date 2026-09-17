@@ -343,3 +343,101 @@ this back up next. The executor operator is now the actual blocker for
 `GOOPG_INCREMENTAL_SORT=on` to be safe to measure with at all (today it
 would panic on the first query where the arm wins), so it is the natural
 next step rather than an arbitrary pick.
+
+## Update 2026-09-17d — row 5 ("the executor operator") re-scoped: Finding 3
+## understated its integration surface; split into S7-exec-a/b/c/d
+
+Attempted to start row 5 directly this loop and stopped before writing any
+production code once the actual touch-point count came in far above Finding
+3's "one operator built on an already-published contract" estimate. Finding
+3 correctly sized the *algorithm* (group via `sortPrefixEqual`, full-sort
+each group via `sortOp`'s existing machinery) but not the *plumbing*: a new
+`optimizer.Node` kind is not an isolated leaf in this codebase, it is a case
+arm that a fixed roster of switches over `optimizer.Node` must all handle
+once a real plan can produce one. Direct grep/read count for `*optimizer.Sort`
+(the sibling every one of these needs to mirror):
+
+1. **Two separate execution engines build a Sort node**, not one:
+   `executor.go:179`'s classic `buildNode` recursion (`newSortOp` over an
+   `Operator`-interface child) AND `executor.go:675`'s slab/tree fast path
+   (`tree.buildRec`, wraps the child in `opNodeOperator` then calls the SAME
+   `newSortOp`). Both must gain an arm — this is exactly the
+   `pattern_sibling_paths_must_agree` class this project has been burned by
+   before (fast-path vs. interpreted evaluator), just for plan-node
+   *construction* rather than expression evaluation.
+2. **Five mechanical `case *optimizer.Sort:` tree-walkers** need a mirrored
+   arm once `IncrementalSort` can appear in a real tree: `scan_deform.go:229`
+   (propagate key-expr refs for deform pushdown — an OMITTED arm here is a
+   silent-wrong-answer risk, not a panic: a needed column would fail to
+   deform), `scan_deform.go:327` (child-of-node for deform-bound
+   determination), `subplan.go:202` (rescan-kind classification,
+   `rescanReOpen`→`rescanCloseOpen`), `operators_cte_dml.go:357`
+   (work-table-scan detection for recursive CTEs).
+3. **`operators_explain.go`: 6 call sites**, of varying weight —
+   `childNodeOf`/one `resolveKeySource`-family site (trivial, return
+   `.Child`), three "children of node" walkers (trivial, return
+   `[]Node{p.Child}`), one node-label switch (trivial, `"Sort"`-shaped
+   string), and one **non-trivial** site (`:1195`) that renders the actual
+   `Sort Key:` text — PG's Incremental Sort EXPLAIN output additionally
+   prints a `Presorted Key:` line (`nodeIncrementalSort.c`/`explain.c`) this
+   site does not have a shape for yet.
+4. **Stats plumbing**: `context.go`'s `SortStats`/`SortWorkerStats` are keyed
+   `map[*optimizer.Sort]SortStat` — an Incremental Sort's own per-group stats
+   (PG reports a MIN/MAX/AVG spread across groups, not one number) need
+   either a parallel map keyed by a new node type or a shared keying
+   abstraction; `parallel_worker_ctx.go` mirrors the worker-side half of the
+   same map.
+
+None of this changes Finding 3's algorithmic verdict (the grouping and
+per-group-sort primitives really do already exist and are the easy part).
+What it changes is the sizing: "the executor operator" is not a single
+loop-sized unit once the goal is *end-to-end safe to flip
+`GOOPG_INCREMENTAL_SORT=on` and measure the corpus*, because a real
+Incremental Sort node reaching `scan_deform.go`'s omitted arm would produce
+a **silently wrong answer** (a column that should have deformed doesn't),
+not a loud panic like the `createPlanNode` default arm — this is a
+correctness gate, not a nice-to-have, before any corpus measurement.
+
+**Split into four loop-sized sub-tasks** (filed in `.ralph/fix_plan.md`
+under M0141-S7):
+
+- **M0141-S7-exec-a — `IncrementalSort` optimizer Node type + the executor
+  operator itself**, built and unit-tested standalone (constructed directly
+  in tests, no `createPlanNode`/`Plan()` path), same "zero production
+  callers yet" posture `pathkeysCountContainedIn`/`costIncrementalSort` used.
+  Groups the child's rows via `sortPrefixEqual`
+  (`internal/executor/sort_presorted.go`, E-15's own contract), full-sorts
+  each group, streams groups out in arrival order. Scope explicitly
+  EXCLUDES spill-to-disk, packed-tuple retention, and ctid passthrough —
+  `sortOp`'s harder features — deferred by ledger row (see below); an
+  all-in-memory, full-Row (`[]Row`), no-ctid first cut is enough to prove
+  the algorithm and is what PG's own `nodeIncrementalSort.c` group-batch
+  shape maps to most directly (it re-tuplesorts per group too).
+- **M0141-S7-exec-b — make it structurally and semantically reachable
+  end-to-end**: `createplansimple.go`'s `createPlanNode` arm (replaces the
+  `default` panic for `PathIncrementalSort`), BOTH `executor.go` builder
+  sites (classic + slab), and the four mechanical tree-walkers in
+  §2 above (`scan_deform.go` x2, `subplan.go`, `operators_cte_dml.go`).
+  This is the correctness-gating step: it must land, in full, before
+  `GOOPG_INCREMENTAL_SORT=on` is ever pointed at the corpus, because a
+  missing `scan_deform.go` arm is a silent wrong-answer risk, not a build
+  break.
+- **M0141-S7-exec-c — EXPLAIN rendering**: the five trivial
+  `operators_explain.go` arms plus the one real one (`Sort Key:` shape
+  extended with PG's `Presorted Key:` line, `nodeIncrementalSort.c`/
+  `explain.c` as oracle) and the node-label switch's `"Incremental Sort"`
+  string (already reserved for this purpose in
+  `estimateaudit/parity_test.go:58`'s map key).
+- **M0141-S7-exec-d (deferred, ledger row filed)** — parity with `sortOp`'s
+  harder features once exec-a/b/c land and the corpus measurement runs:
+  spill-to-disk for an oversized group, packed-tuple retention
+  (`GOOPG_SORT_PACKED`), ctid passthrough for `ORDER BY ... FOR UPDATE`
+  over an Incremental Sort, and per-group `SortStat`
+  (`context.go`'s `SortStats`/`SortWorkerStats` keying). None of these are
+  required to prove the plan-parity metric (14 TPC-DS witnesses are plain
+  read queries), so they are explicitly out of scope for the metric-moving
+  path and only need doing if/when a corpus query actually needs one.
+
+Resume point: implement exec-a next (no plumbing dependency, fully
+standalone-testable, same posture as the two already-landed groundwork
+primitives).

@@ -2777,6 +2777,57 @@ spill route is net-negative.
   it, turning the flag on to measure against the corpus would panic on the
   first query where the arm actually wins. `createplansimple.go` wiring and
   EXPLAIN rendering remain after that.
+  **UPDATE 2026-09-17d (scoping recon, no production change)**: attempted
+  row 5 ("the executor operator") directly and stopped before writing
+  production code once the real integration surface came in far above
+  Finding 3's estimate — TWO separate execution engines build a `Sort` node
+  (`executor.go:179` classic `buildNode`, `executor.go:675` slab/tree fast
+  path, `pattern_sibling_paths_must_agree` class), 4 mechanical
+  `case *optimizer.Sort:` tree-walkers whose omission is a SILENT
+  WRONG-ANSWER risk not a panic (`scan_deform.go` x2 — deform pushdown,
+  `subplan.go` — rescan-kind classification, `operators_cte_dml.go` —
+  work-table-scan detection), 6 `operators_explain.go` sites (5 trivial, 1
+  needs a new `Presorted Key:` line, PG oracle `nodeIncrementalSort.c`/
+  `explain.c`), and stats-map plumbing (`context.go`'s
+  `SortStats`/`SortWorkerStats`, `parallel_worker_ctx.go`'s worker mirror).
+  Full writeup: design doc's 2026-09-17d update. **Row 5 split into four
+  loop-sized sub-tasks, filed below**; this task (M0141-S7) itself stays
+  unchecked — implementation, not just scope, is still the resume point.
+  - [ ] **M0141-S7-exec-a — `IncrementalSort` optimizer Node type + the
+    executor operator**, built and unit-tested STANDALONE (constructed
+    directly in tests, zero `createPlanNode`/`Plan()` callers — same
+    posture `pathkeysCountContainedIn`/`costIncrementalSort` used). Groups
+    rows via `sortPrefixEqual` (`internal/executor/sort_presorted.go`,
+    E-15's contract), full-sorts each group, streams groups in arrival
+    order. Explicitly excludes spill-to-disk, packed-tuple retention, ctid
+    passthrough (`sortOp`'s harder features) — deferred to
+    **M0141-S7-exec-d** below; an all-in-memory `[]Row` first cut is
+    enough to prove the algorithm and matches
+    `nodeIncrementalSort.c`'s own per-group re-tuplesort shape. No
+    dependency on exec-b/c — implement first.
+  - [ ] **M0141-S7-exec-b — end-to-end structural + semantic reachability**:
+    `createplansimple.go`'s `createPlanNode` arm (replaces the `default`
+    panic for `PathIncrementalSort`), BOTH `executor.go` builder sites
+    (classic + slab, per the sibling-paths finding above), and the 4
+    mechanical tree-walkers (`scan_deform.go` x2, `subplan.go`,
+    `operators_cte_dml.go`). **This is the correctness gate**: must land in
+    full before `GOOPG_INCREMENTAL_SORT=on` is ever pointed at the corpus —
+    a missing `scan_deform.go` arm silently drops a needed column, it does
+    not panic. Needs exec-a.
+  - [ ] **M0141-S7-exec-c — EXPLAIN rendering**: the 5 trivial
+    `operators_explain.go` arms, the node-label switch's `"Incremental
+    Sort"` string (already reserved, `estimateaudit/parity_test.go:58`),
+    and the one real one — extend the `Sort Key:` rendering site
+    (`:1195`) with PG's `Presorted Key:` line. Needs exec-b (nothing to
+    render before a real node reaches EXPLAIN).
+  - [ ] **M0141-S7-exec-d (deferred, ledger row filed 2026-09-17)** —
+    `sortOp` feature parity once exec-a/b/c land and the corpus is
+    measured: spill-to-disk, packed-tuple retention (`GOOPG_SORT_PACKED`),
+    ctid passthrough (`ORDER BY ... FOR UPDATE` over an Incremental Sort),
+    per-group `SortStat` (`context.go` keying). None of the 14 TPC-DS
+    witnesses are `FOR UPDATE`/huge-group queries, so none of this is
+    required to move the plan-parity metric — only do it if a corpus query
+    actually needs it after exec-b's measurement runs.
 
 ## M0142 — Join-order costing (filed 2026-09-14)
 
