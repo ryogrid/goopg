@@ -6690,16 +6690,47 @@ reported, and the values and unit gates are the bar.
   write site above must move to `catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)`
   (or the resolved `o.ctx.CurrentDatabaseOid` if already normalized at the
   call site — check `NamespaceDBOid`'s 0/`PostgresDBOid` folding, `catalog.go:25196`)
-  in the same commit. **Read-side must also be audited**: the live repro
-  shows a `SELECT ... FROM pg_type`/`pg_attribute` query reads the same
-  shared file regardless of the connection's own database, so whatever
-  resolves those tables' `RelFileNode` for a `SELECT` (not yet located this
-  loop — grep for how `pg_constraint`'s `pgConstraintTableRel`
-  (`sys_pg_constraint.go:133`, routes via `tableCatalogHeapDBOid(ctx)`) differs
-  from pg_type/pg_class/pg_attribute's read-path resolution) needs the
-  identical fix, or the write-side fix alone will make types simply
-  invisible cross-database instead of merged-wrong. **Index entries are
-  already correct** — `insertCanonicalSysBtreeLeaf` (`sys_catalog_index_insert.go:423-428`)
+  in the same commit. **Read-side root cause — LOCATED 2026-09-17 (this loop,
+  investigation-only, no code changed):** `pg_type`/`pg_attribute` are
+  registered exactly ONCE, at server startup, by
+  `loadSystemCatalogsIfPresent` (`internal/initdb/open.go:2931-2972`) — it
+  builds one `catalog.Table{OID: catalog.TypeRelationId/.AttributeRelationId}`
+  literal per relation (no `DBOid` field set, so it defaults to Go's zero
+  value) and calls `cat.RegisterRealTable(t)` with no dbOid argument, which
+  resolves to `DefaultDBOid`'s namespace only (`resolveDBOid`,
+  `catalog.go:4078-4083`) — there is no equivalent call for any other
+  database, ever. Every `SeqScan`/write against pg_type or pg_attribute
+  (from `copy.go`, `operators_bitmap.go`, `operators_ddl.go`, etc. — all
+  route through the one shared `Catalog.RelFileNode(tbl)`, confirmed by
+  grepping every call site) resolves via `catalog.InMemory.RelFileNode`
+  (`catalog.go:22354-22366`): `dbOid := c.dbOid; if table.DBOid != 0 &&
+  table.DBOid != DefaultDBOid { dbOid = table.DBOid }` — since these two
+  `Table` structs' `DBOid` field is always `0`, the condition never fires and
+  every connection, regardless of `ctx.CurrentDatabaseOid`, resolves to the
+  same `c.dbOid` (a single process-wide field stamped once by `SetDBOID` at
+  startup — see the `RelFileNode` doc comment at `catalog.go:22301-22320`).
+  This is the exact mechanism behind the cross-database UNION repro. Contrast
+  confirmed: `pgConstraintTableRel` (`sys_pg_constraint.go:133`) is different
+  in kind, not just routing — it computes `tableCatalogHeapDBOid(ctx)` fresh
+  on every call from `ctx.CurrentDatabaseOid`, whereas pg_type/pg_attribute's
+  `RelFileNode` resolution is baked into a single shared `Table` struct at
+  registration time and never revisited per-connection. **Fix shape implied**
+  (real PG: pg_type/pg_class/pg_attribute are NOT shared catalogs —
+  `relisshared=false` — each database has its own physical copy under its own
+  `base/<dbOid>/`): `loadSystemCatalogsIfPresent`'s registration needs to run
+  once per database (not just DefaultDBOid) with `t.DBOid` set to that
+  database's own oid, AND each database needs its own physical
+  `base/<dbOid>/1247`/`base/<dbOid>/1249` heap file provisioned — most likely
+  at `CREATE DATABASE` time (mirror `syncCopiedTableCatalogHeap`'s per-table
+  pattern in `internal/postmaster/database_ddl.go:1291-1335`, which already
+  does the equivalent per-table dance for ordinary user tables copied from a
+  template) plus a startup-reload pass that registers every already-existing
+  database's copy, not just the default one. This is materially bigger than
+  the write-side hardcode list above — it is genuinely no small tweak, so
+  scope the implementing loop(s) to design-first (a design doc is mandatory
+  here per AGENT.md D3 before code lands) rather than attempting the
+  provisioning + registration + write-side fix all in one pass. **Index
+  entries are already correct** — `insertCanonicalSysBtreeLeaf` (`sys_catalog_index_insert.go:423-428`)
   already routes via `tableCatalogHeapDBOid(ctx)`, so `pg_type_oid_index`/
   `pg_type_typname_nsp_index`/`pg_class_relname_nsp_index`/
   `pg_attribute_relid_attnum_index` inserts do not need to change — only the
