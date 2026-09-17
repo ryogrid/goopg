@@ -827,3 +827,92 @@ gated). The still-open resume points — flip `GOOPG_INCREMENTAL_SORT` on for
 real measurement, build the executor operator, `createplansimple.go`
 wiring, `EXPLAIN` rendering, and re-run S7's 14-query TPC-DS census — belong
 to M0141-S7's own remaining implementation-order steps, not to S2b-2c.
+
+## S2b-3 recon (2026-09-17j) — unblocked by S2b-2c/M0141-S7, but needs its OWN decomposition
+
+**Why this loop ran a recon instead of code**: S2b-3 ("WINDOW loop-fix") was
+filed gated on "S2b-2's actual payoff", later narrowed to "gated on M0141-S2b-2c
+specifically (blocked on M0141-S7)". Both S2b-2c and M0141-S7's executor
+operator (`M0141-S7-exec-a/b/c`) are now landed, so the stated gate is clear —
+but reading `windowsetoppaths.go`'s own header before touching it surfaced
+that its "NEITHER HALF HAS A CHOICE TO OFFER... C-14 Incremental Sort is
+BLOCKED with no executor counterpart" claim is now STALE (superseded by a
+LATER change, R6/plan-parity-fix-take2, which the header was never updated to
+reflect) and that the real remaining gap is two-piece, matching K24/S2b-2's
+own "do not attempt in one sitting" precedent. Recorded here rather than
+starting an under-scoped edit.
+
+**What already exists (R6, `createplansimple.go:294` `createWindowPlan`,
+`operators_window.go` `windowOp.Open`)**: a real `*WindowAgg.Presorted` field
+and a real executor fast-path (`if !o.plan.Presorted && (...) { sort
+internally }`) already let a `*WindowAgg` skip its own internal sort when the
+plan says the input already arrives in `PARTITION BY ++ ORDER BY` order. The
+one caller that sets it today, `createWindowPlan`, only recognizes two child
+shapes via `childDeliversSortKeys` (`createplansimple.go:357`): a `*Sort` node
+it just stacked itself, or a lower `*WindowAgg` chained on the identical keys
+(the "two window specs share one ordering, sort once" case). **A raw
+join/scan `Node` — even one genuinely ordered by an index or a merge join —
+is never recognized**, because `createWindowPaths`
+(`windowsetoppaths.go:91`) never sees more than the single collapsed `input`
+Node; there is no join/scan Pathlist visible at this call site at all. This
+is the literal TPC-DS Q67 gap (`WindowAgg` partitioned on `dw1.i_category`;
+PG's real plan feeds it a `Presorted Key: i_category`-tagged Incremental Sort
+right below the WindowAgg — see `m0141-s7-readjudicate-and-scope-incremental-sort.md`
+line 67).
+
+**Two independent pieces, confirmed by reading (not inferred), same
+"prerequisite is inert alone" shape S2b-2/M0141-S7 already showed once**:
+
+1. **`costWindow` (`windowsetoppaths.go:193`) has NO presorted-aware branch.**
+   It unconditionally adds `costSortRunWithWidth(...)`'s full cost to every
+   window chain regardless of whether the input already satisfies
+   `windowSortKeys` in full or in part. So even after piece 2 below makes a
+   second, already-ordered candidate *visible* to `addWindowPaths`, that
+   candidate would still be costed as if it needed a full fresh sort — it
+   could only win by having a cheaper *input* cost, never by having its sort
+   elided, which is the actual PG behavior Q67 needs. This is the same
+   "seam reached but inert" finding S2b-2's recon made for the base
+   join/scan boundary, transplanted to WINDOW: **piece 2 without piece 1
+   changes nothing measurable.**
+2. **`createWindowPaths`/`addWindowPaths` see exactly one input `Node`, never
+   a Pathlist.** Wiring in `searchedRelOf(input)` and populating
+   `winRel.SearchCandidates`/`SearchCandidateKeys` is the same, already-proven
+   mechanism S2b-2a/2b built (`RelOptInfo.SearchCandidates`,
+   `validatedSearchCandidateKeys`, both reusable verbatim — `SortKey`→`PathKey`
+   conversion is also solved already, `pathkeysForSortKeys`,
+   `pathkeys.go:103`). What is NOT reusable verbatim is
+   `addIncrementalSortPaths` itself (`incrementalsortpaths.go:147`): it adds a
+   bare `PathIncrementalSort` directly onto the target rel's own Pathlist,
+   which is correct for `upper.ordered`/`electOrderedGrouping` (there, the
+   sort's result outranks the aggregate — sort-above-agg is the rel's own
+   final output) but WRONG for WINDOW (the sort must nest BELOW the
+   `*WindowAgg`, which must remain the rel's outer/final node no matter which
+   input candidate wins). `addWindowPaths`'s per-candidate loop needs its
+   own prefix-matching arm — same `pathkeysCountContainedIn` test
+   `addIncrementalSortPaths` already uses, but building `PathWindow{Children:
+   [PathIncrementalSort{Children: [candidate]}]}` (or `Presorted`-style
+   full-match with no sort node at all) instead of a bare
+   `PathIncrementalSort`.
+
+**Decomposition** (mirrors S2b-2a/2b/2c's own split; filed as fix_plan
+sub-tasks, none selected yet):
+
+- **S2b-3a** — teach `costWindow` a presorted/partial-prefix credit, reusing
+  `costIncrementalSort`'s formula (`incrementalsortpaths.go`,
+  `costsize.c:1898-1985`-derived per M0141-S2b-6's own hand-verification) for
+  the shared-prefix case, and skip `sortRun` entirely when the full key list
+  is already covered. Gate: same "inert alone" byte-identical-plan predicted
+  null result S2b-2a/M0139-0007a's own precedent set, since nothing calls it
+  with a presorted input yet.
+- **S2b-3b** — wire `searchedRelOf`/`SearchCandidates`/`SearchCandidateKeys`
+  into `createWindowPaths`, and extend `addWindowPaths`'s per-candidate loop
+  to build a `PathWindow` over `PathIncrementalSort`-over-`candidate` (partial
+  prefix) or a `Presorted=true` `PathWindow` directly over `candidate` (full
+  match) for every search candidate whose pathkeys share a nonzero prefix
+  with `windowSortKeys(top)`, alongside the existing always-full-Sort
+  candidate. Depends on S2b-3a landing first (same ordering S2b-2c depended
+  on M0141-S7's cost function). TPC-DS Q67 is the sole corpus witness and the
+  gate.
+
+No production code changed this loop (recon only, same precedent as
+S2b-0/S2b-2/S2b-6). Ledger row appended (task-id `m0141-s2b-3`).

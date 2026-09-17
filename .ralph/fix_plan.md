@@ -2562,11 +2562,61 @@ spill route is net-negative.
     implementation-order step) is now the concrete blocker for turning
     `GOOPG_INCREMENTAL_SORT` on to measure — a query where the arm wins would
     panic today.
-  - [ ] **M0141-S2b-3** — WINDOW loop-fix. Gated on S2b-2's actual payoff
+  - [x] **M0141-S2b-3** — WINDOW loop-fix. Gated on S2b-2's actual payoff
     (WINDOW has nothing of its own to loop over until the Pathlist
     tournament exists) — per S2b-2's 2026-09-17 recon, that means gated on
     **M0141-S2b-2c specifically** (blocked on M0141-S7), not on S2b-2a/2b's
-    inert plumbing alone.
+    inert plumbing alone. **DONE 2026-09-17j as a scoping recon, no
+    production change** (same K24/S2b-2 precedent: "do not attempt in one
+    sitting"). S2b-2c and M0141-S7's executor operator are both now landed,
+    clearing the stated gate — but reading `windowsetoppaths.go` first found
+    its own header claim ("no presorted variant to build... C-14 blocked
+    with no executor counterpart") is STALE, superseded by a later change
+    (R6/plan-parity-fix-take2) the header was never updated for: a real
+    `*WindowAgg.Presorted` field and executor skip-sort fast path
+    (`operators_window.go` `windowOp.Open`) already exist, just unused
+    outside the chained-WindowAgg self-check (`childDeliversSortKeys`,
+    `createplansimple.go:357`). The real remaining gap is two independent
+    pieces, confirmed by reading, same "prerequisite inert alone" shape
+    S2b-2/M0141-S7 already showed: (1) `costWindow`
+    (`windowsetoppaths.go:193`) has NO presorted/partial-prefix credit —
+    unconditionally charges the full sort cost regardless of input order, so
+    a second candidate would be priced identically to today's and change
+    nothing measurable; (2) `createWindowPaths`/`addWindowPaths`
+    (`windowsetoppaths.go:91,220`) see exactly one collapsed input `Node`,
+    never a Pathlist — wiring `searchedRelOf`/`RelOptInfo.SearchCandidates`/
+    `SearchCandidateKeys` is directly reusable from S2b-2a/2b, but
+    `addIncrementalSortPaths` itself (`incrementalsortpaths.go`) is NOT
+    reusable verbatim: it adds a bare `PathIncrementalSort` as the target
+    rel's own top-level output (correct for `upper.ordered`/
+    `electOrderedGrouping`, where sort-above-agg IS the rel's final shape)
+    but WRONG for WINDOW, where the sort must nest BELOW the `*WindowAgg`,
+    which must remain the rel's outer/final node regardless of which input
+    candidate wins. Full writeup, the `costWindow`/`addWindowPaths` code
+    reads, and the two-piece decomposition rationale in
+    `docs/design/0100-0149/m0141-s2b-scoping-decomposition.md` §"S2b-3
+    recon". Filed **M0141-S2b-3a**/**M0141-S2b-3b** below (neither selected
+    yet). Ledger row appended (task-id `m0141-s2b-3`).
+  - [ ] **M0141-S2b-3a** — teach `costWindow` (`windowsetoppaths.go:193`) a
+    presorted/partial-prefix cost credit, reusing `costIncrementalSort`'s
+    formula (`incrementalsortpaths.go`) for the shared-prefix case and
+    skipping `sortRun` entirely when the full `windowSortKeys` list is
+    already covered. Filed by S2b-3's recon (design doc item 1). Prerequisite
+    for S2b-3b — same ordering S2b-2c depended on M0141-S7's cost function.
+    Gate: predicted byte-identical-plan null result (nothing calls it with a
+    presorted input yet), same S2b-2a/M0139-0007a precedent.
+  - [ ] **M0141-S2b-3b** — wire `searchedRelOf(input)`/
+    `RelOptInfo.SearchCandidates`/`SearchCandidateKeys` into
+    `createWindowPaths`, and extend `addWindowPaths`'s per-candidate loop to
+    build, for every search candidate sharing a nonzero pathkey prefix with
+    `windowSortKeys(top)` (via `pathkeysForSortKeys` +
+    `pathkeysCountContainedIn`, both already exist), either a `PathWindow`
+    over `PathIncrementalSort`-over-`candidate` (partial prefix) or a
+    `Presorted=true` `PathWindow` directly over `candidate` (full match),
+    alongside the existing always-full-Sort candidate. Filed by S2b-3's
+    recon (design doc item 2). Depends on **S2b-3a** landing first. TPC-DS
+    Q67 (`WindowAgg` on `dw1.i_category`) is the sole corpus witness and the
+    gate.
   - [ ] **M0141-S2b-4** — SETOP rel-identity fix. **UPDATE 2026-09-16 (S2b-1's
     own result section)**: DOES now have a witness — TPC-DS Q49's `Unique`
     (S7's mis-mapped "Unique x1"; `select ... union select ... union select
