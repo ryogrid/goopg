@@ -163,3 +163,123 @@ operators_memoize.go`'s `memoizeOp` for the executor-side per-worker cache
 gap). No new task ID needed — M0142-0005 keeps its slot, only its diagnosis
 and resume point change. Deferral ledger row added for the B8 multiplier
 re-measurement, which stays open and unscoped.
+
+## Update 2026-09-18 — corrected again: "no per-worker Memoize" premise is false; the executor already has one for free
+
+Per this task's own reopened scoping instruction ("needs its own
+scoping/floor-measurement pass before implementation, same discipline as
+M0142-0012's `-verify`/`a` split" — `.ralph/fix_plan.md` banner item 6), this
+update re-verified the 2026-09-16 verdict's central claim before sizing an
+implementation, per the same `planner_verify_both_candidates_generated`
+instinct the original recon cites. **The claim does not hold**, and the real
+fix is far smaller than "give the executor a per-worker Memoize" implies.
+Recon only — no `internal/`/`cmd/` file touched (C1); read-only code tracing.
+
+**Finding 4 — every worker already gets its own, fully private operator tree,
+including its own `memoizeOp`/`kvcache.Cache` instance; nothing shared exists to
+partition.** `executor.go:354-371` (the `*optimizer.Gather` build-node arm)
+states this outright, and the statement is load-bearing, not incidental prose:
+
+> "Each worker builds its OWN operator tree over the shared, read-only partial
+> plan — Build is a pure function of the plan node, so N calls give N
+> independent trees."
+
+`gatherOp.Open` (`operators_gather.go:191-260`) launches one goroutine per
+worker via `runWorker`, and `runWorker` (`:325+`) calls
+`o.buildChildForSlot(idx)` → `buildUnderFreshScope(..., o.buildChild)`, which
+invokes the SAME closure `executor.go:369` built —
+`func() (Operator, error) { return buildNode(p.Child, workerBound) }` — once
+per worker. `buildNode` on an `*optimizer.Memoize` node
+(`executor.go`'s own `*optimizer.Memoize` case, alongside `newMemoizeOp`)
+constructs a brand-new `memoizeOp` with a brand-new `kvcache.Cache` on every
+call — there is no global/shared cache map, no `sync.Map`, nothing keyed by
+`parallel_worker_number`, because nothing needs to be: each worker's tree is
+disjoint from every other worker's, the same as its `filterOp`/`projectOp`/
+`sortOp` siblings one level up, none of which get a claim-set either.
+
+This is not a gap relative to PG — it is PG's own model, cross-checked in
+`postgres/src/backend/optimizer/path/joinpath.c`'s `get_memoize_path` /
+`postgres/src/backend/optimizer/util/pathnode.c:1693` and
+`postgres/src/backend/executor/nodeMemoize.c` directly: real PG's `Memoize`
+under a `Gather` has **no DSM-shared cache at all** — `ExecMemoizeEstimate`/
+`ExecMemoizeInitializeDSM`/`ExecMemoizeInitializeWorker`
+(`nodeMemoize.c:1190-1260`) only shuttle the `show_memoize_info`
+instrumentation counters (`sinstrument[ParallelWorkerNumber]`) through shared
+memory; the cache data structure itself (`MemoizeState.hashtable`) is built
+fresh per worker as an ordinary backend-local hash table, exactly goopg's
+`kvcache.Cache` per `memoizeOp`. `cost_memoize_rescan`
+(`costsize.c:2541-2620`) reads `mpath->calls`, sourced from `outer_path->rows`
+at the `get_memoize_path` call site (`joinpath.c:819`) — for a PARTIAL
+candidate this is already the per-worker-divided partial outer path's row
+estimate (PG's own `parallel_divisor` convention), so PG's own cost formula
+already assumes and prices a smaller, per-worker-private cache with a lower
+hit ratio than the serial case — not a shared, larger one. goopg's
+`joinpathsmemoize.go` costs the partial candidate the same way (Finding 2
+above measured `total=16463.24` against PG's own real per-worker
+`16125.21` — a match, not a divergence), so **the cost side is already
+per-worker-faithful too**; only the *admission* side never lets that costed
+candidate through.
+
+**Finding 5 — the real refusal has nothing to do with claim-set
+partitioning; it is two narrow, unrelated type switches that never learned a
+`PathMemoize`/`*memoizeOp` case.**
+
+1. Path level (already cited in Finding 3):
+   `partialPathDrivingKind`'s `PathNestLoop` case,
+   `gatherpaths.go:459` — `if in == nil || in.Kind == PathMemoize { return
+   PathPrebuilt }` fires **before** the branch split (`in.RequiredOuter == 0`
+   vs. the R95 lateral-probe `else`), so it blocks the lateral-probe branch
+   Q34 actually needs even though that branch's own reasoning (":468-479",
+   "the kinds that can only be probes are admitted") never asked for a bare
+   `PathIndexScan` for any principled reason tied to Memoize specifically — it
+   just never had a case for one.
+2. Node level, `lateralProbeIsPartialProbe`
+   (`internal/optimizer/parallel.go:965-985`): a `switch n.(type) { case
+   *IndexScan, *IndexOnlyScan: ...; default: return false }` with a comment
+   bundling Memoize in with "no wrappers — the BuildFast bridge implements
+   `lateralBindable` unconditionally, so a wrapped probe would double-bind".
+   That specific risk **does not apply to Memoize**: `lateralBindable`
+   (`operators_join_agg.go:512`) requires `BindLateralOuter(SlotView)`, and
+   grepping every implementer (`BindLateralOuter` defined only on the
+   FROM-clause-SRF operators and `opNodeOperator`, the BuildFast bridge
+   itself) shows `memoizeOp` is not one of them — it has an unrelated method,
+   `BindOuter(slot SlotView, outerWidth int)`, that only forwards to its
+   child. A Memoize-wrapped bare index probe therefore resolves correlation
+   the same way a bare probe does — through `ctx.OuterRows`
+   (`join_lateral_stream.go:60-65`'s "ALSO pushed onto ctx.OuterRows" path) —
+   not through the double-bind-risking `lateralBindable` path the comment
+   warns about. The comment conflated two different wrapper kinds.
+3. Executor level, `lateralProbeJoinPartial`
+   (`internal/executor/parallel_scan.go:55-78`): the matching twin, same
+   `switch inner.(type) { case *indexScanOp, *indexOnlyScanOp: ...; default:
+   return false }` — no `*memoizeOp` case, so a Memoize-wrapped probe hits
+   `default` regardless of what its own child is.
+
+**`PathMemoize`'s shape is a single, well-typed unwrap, not a search.**
+`getMemoizePath` (`joinpathsmemoize.go:292-303`) always builds `Kind:
+PathMemoize, RequiredOuter: innerPath.RequiredOuter, Children:
+[]*Path{innerPath}` — `Children[0]` is always exactly the wrapped probe path
+(the same `PathIndexScan` the lateral-probe branch already knows how to
+validate), and `newMemoizeOp(p *optimizer.Memoize, child *indexScanOp)`
+(`operators_memoize.go`) is typed to only ever wrap a plain `*indexScanOp` at
+the executor level too — so "unwrap once, then run the existing IndexScan
+check on the unwrapped shape" is exact, not an approximation, at both layers.
+
+**Revised verdict: this is not an executor-shaped slice.** No new cache
+mechanism, no claim-set model, no DSM-analogue is needed — the executor
+already does the right thing by construction. The remaining work is: extend
+three call sites (`gatherpaths.go`'s `partialPathDrivingKind` PathNestLoop
+lateral-probe branch, `parallel.go`'s `lateralProbeIsPartialProbe`,
+`parallel_scan.go`'s `lateralProbeJoinPartial`) to recognize "Memoize wrapping
+a bare, unparameterized-shape-per-Finding-5's-existing-check IndexScan/
+IndexOnlyScan" as an admissible driving kind, each citing the other two per
+`pattern_sibling_paths_must_agree`, then re-run Finding 2's Q34 trace to
+confirm a `producer=gather` DPPATH line now appears and the plan flips to
+`Gather`+`Nested Loop`+`Memoize`+`Index Scan`. Filed as **M0142-0005a** below,
+sized as one loop, gated per the standard TPC-DS SF0.25 sweep +
+`tpch-spotcheck.sh` (the latter is blocked by the `:65433` catalog-loss hold
+per the 2026-09-17 banner — not selectable until P0-E6 clears; this recon
+does not change that).
+
+B8 (`indexProbeCostMultiplier=2.0`) remains open and unscoped, unchanged by
+this update.

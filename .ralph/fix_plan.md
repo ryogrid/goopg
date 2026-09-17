@@ -4185,6 +4185,44 @@ cross-layer programme that has never been scoped.
   the qerr is purely a consequence of being forced into a hash join instead of
   the Gather-blocked NLI+Memoize shape; see
   `docs/design/0100-0149/m0142-0010-join-level-gap-is-memoize-shape-not-cardinality-bug.md`.
+  **RE-SCOPED AGAIN 2026-09-18 (recon, no production diff, C1)** — the
+  "executor has no per-worker Memoize" premise above is **false**: every
+  worker already builds a fully independent operator tree, including its own
+  `memoizeOp`/`kvcache.Cache` (`executor.go:354-371`'s own comment: "Each
+  worker builds its OWN operator tree ... N calls give N independent trees"),
+  matching real PG's own model exactly (`nodeMemoize.c`'s DSM only shuttles
+  instrumentation counters, never cache data). The real refusal is three
+  narrow type switches that never learned a `PathMemoize`/`*memoizeOp` case
+  (`gatherpaths.go:459`'s `partialPathDrivingKind`, `parallel.go:965-985`'s
+  `lateralProbeIsPartialProbe`, `parallel_scan.go:55-78`'s
+  `lateralProbeJoinPartial`), and `PathMemoize`'s shape is a single
+  well-typed unwrap (`Children[0]` is always the wrapped `PathIndexScan`,
+  `getMemoizePath` `joinpathsmemoize.go:292-303`), not a search. Full
+  writeup: design doc's "Update 2026-09-18" section. This task (M0142-0005)
+  stays as the scoping/diagnosis record; the sized implementation is filed
+  as **M0142-0005a** below.
+- [ ] **M0142-0005a — admit a Memoize-wrapped bare index probe as a
+  Gather-driving kind.**
+  Parent: M0142-0005. Extend the three sibling
+  admission checks named in M0142-0005's 2026-09-18 update
+  (`partialPathDrivingKind`'s `PathNestLoop` lateral-probe branch,
+  `lateralProbeIsPartialProbe`, `lateralProbeJoinPartial`) to accept
+  `in.Kind == PathMemoize` / `*memoizeOp` by unwrapping to the wrapped child
+  (`Children[0]` / `memoizeOp.child`) and running the existing bare-IndexScan
+  check on that child instead of refusing outright — `pattern_sibling_paths_must_agree`
+  applies across all three. Expected movement (S5): TPC-DS Q34/Q73 flip from
+  `Hash Join` to `Gather`+`Nested Loop`+`Memoize`+`Index Scan`
+  (`bench/tpcds/plans-pg/Q34.txt`/`Q73.txt` are the PG targets), confirmed by
+  re-running Finding 2's `GOOPG_PGSHAPED_DP_TRACE=1` Q34 trace (a
+  `producer=gather` DPPATH line must now appear for relset
+  `{date_dim+household_demographics+store_sales}`) and the TPC-DS SF0.25
+  `pg-plan-parity-diff.py` category count (`join-order`/`aggregation-strategy`
+  bucket, whichever Q34/Q73 currently sit in — confirm at implementation
+  time). Gates: `scripts/tpcds-sf025-regression.sh sweep` +
+  `go test ./internal/optimizer/... ./internal/executor/...` +
+  `scripts/tpch-spotcheck.sh` (the latter is **blocked** by the `:65433`
+  catalog-loss hold — not selectable until P0-E6 clears; do not attempt a
+  substitute per G1).
 - [x] **M0142-0006 — apply `semiJoinMatchFraction` in `estimateNLIndexJoin`** —
   `estimateNLIndexJoin` (`cardinality.go:239-241`) returns `EstimateRows(j.Outer)` for
   SEMI/ANTI, while its sibling `estimateJoin` (`:608-625`) applies the match
