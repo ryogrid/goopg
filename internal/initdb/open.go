@@ -1698,6 +1698,20 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		return nil, fmt.Errorf("goopg: pg_constraint FK reload: %w", err)
 	}
 
+	// M0143-0003b: table-level CHECK constraint persistence from the same
+	// pg_constraint HEAP (contype='c', conrelid<>0), written by
+	// writeCheckConstraintRow. Before this pass, catalog.Table.
+	// CheckConstraints/NamedChecks was rebuilt by nothing, so every CHECK
+	// constraint on every table silently stopped being ENFORCED — not merely
+	// hidden from pg_constraint — after any restart (copy.go/operators_fk.go/
+	// operators_storage.go all gate enforcement on len(CheckConstraints) > 0).
+	if err := loadCheckConstraintsFromHeap(mgr, cat, clog); err != nil {
+		_ = pool.Close()
+		_ = walWriter.Close()
+		_ = mgr.Close()
+		return nil, fmt.Errorf("goopg: pg_constraint CHECK reload: %w", err)
+	}
+
 	// B5 Slice C: view / materialized-view query persistence from the pg_rewrite
 	// HEAP _RETURN rules (base/<dbOid>/2618) written by writeViewRewriteRow,
 	// replacing the retired RecordKindCreateMatView(102)/RecordKindCreateView(103)

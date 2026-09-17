@@ -34,6 +34,7 @@ package postmaster
 // that (ListDatabases() empty post-restart, no error at either CREATE
 // DATABASE or the restart) before adding it back.
 import (
+	"slices"
 	"testing"
 
 	"github.com/goopg/goopg/internal/access/transam"
@@ -43,6 +44,18 @@ import (
 	"github.com/goopg/goopg/internal/optimizer"
 	"github.com/goopg/goopg/internal/parser"
 )
+
+// conNames extracts and sorts the conname column from a pg_constraint result
+// set, for order-independent comparison — the executor gives no ordering
+// guarantee over a plain SELECT with no ORDER BY.
+func conNames(rows []executor.Row) []string {
+	out := make([]string, len(rows))
+	for i, r := range rows {
+		out[i] = string(r[0].Buf)
+	}
+	slices.Sort(out)
+	return out
+}
 
 // runChainDDLDurable runs a single DDL statement to completion under its own
 // transaction and commits it, against dbName's real catalog-allocated oid
@@ -167,6 +180,12 @@ func TestDatabaseDDLReloadAcrossRestart(t *testing.T) {
 	runChainDDLDurable(t, rt1, s1, "r1", "CREATE TABLE child (id int4, pid int4 REFERENCES parent(id))")
 	runChainDDLDurable(t, rt1, s1, "r2", "CREATE TABLE other (id int4 PRIMARY KEY)")
 	runChainDDLDurable(t, rt1, s1, "r2", "CREATE TABLE otherchild (id int4, pid int4 REFERENCES other(id))")
+	// M0143-0003b: a table-level named CHECK constraint. Before this fix
+	// catalog.Table.CheckConstraints/NamedChecks was never written to any
+	// heap and never reloaded, so this constraint's ENFORCEMENT (not just its
+	// pg_constraint row) silently vanished after every restart.
+	runChainDDLDurable(t, rt1, s1, "r1",
+		"CREATE TABLE gauge (id int4 PRIMARY KEY, level int4 CONSTRAINT gauge_level_check CHECK (level >= 0))")
 
 	if err := rt1.SaveCatalog(); err != nil {
 		t.Fatalf("SaveCatalog: %v", err)
@@ -215,19 +234,20 @@ func TestDatabaseDDLReloadAcrossRestart(t *testing.T) {
 		t.Errorf("db r2 post-restart: pg_constraint FK rows = %v, want exactly [otherchild_pid_fkey]", rowsR2)
 	}
 
-	// M0143-0003a: "parent"/"other" above are both `id int4 PRIMARY KEY` —
-	// their backing unique index survives reload (RegisterIndexDuringRecoveryForDB
-	// restores Primary/Unique from pg_index), but PGConstraintRowsForDBOid's
-	// synthesised pg_constraint row additionally requires idx.IsConstraint,
-	// which recovery never set before this fix — every PK vanished from
-	// pg_constraint (contype='p') post-restart though the index itself, and
-	// its enforcement, kept working.
+	// M0143-0003a: "parent"/"other"/"gauge" above all declare `id int4
+	// PRIMARY KEY` — their backing unique index survives reload
+	// (RegisterIndexDuringRecoveryForDB restores Primary/Unique from
+	// pg_index), but PGConstraintRowsForDBOid's synthesised pg_constraint row
+	// additionally requires idx.IsConstraint, which recovery never set before
+	// this fix — every PK vanished from pg_constraint (contype='p')
+	// post-restart though the index itself, and its enforcement, kept
+	// working.
 	rowsR1PK, err := queryUnderDBReload(t, rt2, s2, "r1", "SELECT conname FROM pg_constraint WHERE contype = 'p'")
 	if err != nil {
 		t.Fatalf("db r1 post-restart: SELECT pg_constraint contype=p: %v", err)
 	}
-	if len(rowsR1PK) != 1 || string(rowsR1PK[0][0].Buf) != "parent_pkey" {
-		t.Errorf("db r1 post-restart: pg_constraint PK rows = %v, want exactly [parent_pkey]", rowsR1PK)
+	if got, want := conNames(rowsR1PK), []string{"gauge_pkey", "parent_pkey"}; !slices.Equal(got, want) {
+		t.Errorf("db r1 post-restart: pg_constraint PK rows = %v, want exactly %v", got, want)
 	}
 
 	rowsR2PK, err := queryUnderDBReload(t, rt2, s2, "r2", "SELECT conname FROM pg_constraint WHERE contype = 'p'")
@@ -236,6 +256,24 @@ func TestDatabaseDDLReloadAcrossRestart(t *testing.T) {
 	}
 	if len(rowsR2PK) != 1 || string(rowsR2PK[0][0].Buf) != "other_pkey" {
 		t.Errorf("db r2 post-restart: pg_constraint PK rows = %v, want exactly [other_pkey]", rowsR2PK)
+	}
+
+	// M0143-0003b: the CHECK row itself, then actual enforcement — a
+	// catalog-only assertion could pass while tbl.CheckConstraints (the field
+	// copy.go/operators_fk.go/operators_storage.go actually gate on) stayed
+	// empty, if the reload only rebuilt NamedChecks.
+	rowsR1Check, err := queryUnderDBReload(t, rt2, s2, "r1", "SELECT conname FROM pg_constraint WHERE contype = 'c'")
+	if err != nil {
+		t.Fatalf("db r1 post-restart: SELECT pg_constraint contype=c: %v", err)
+	}
+	if len(rowsR1Check) != 1 || string(rowsR1Check[0][0].Buf) != "gauge_level_check" {
+		t.Errorf("db r1 post-restart: pg_constraint CHECK rows = %v, want exactly [gauge_level_check]", rowsR1Check)
+	}
+	if _, err := queryUnderDBReload(t, rt2, s2, "r1", "INSERT INTO gauge (id, level) VALUES (1, 5)"); err != nil {
+		t.Errorf("db r1 post-restart: INSERT satisfying gauge_level_check unexpectedly failed: %v", err)
+	}
+	if _, err := queryUnderDBReload(t, rt2, s2, "r1", "INSERT INTO gauge (id, level) VALUES (2, -5)"); err == nil {
+		t.Error("db r1 post-restart: INSERT violating gauge_level_check unexpectedly succeeded — CHECK enforcement did not survive the restart")
 	}
 
 	// Namespace isolation must also survive reload: a table created in one

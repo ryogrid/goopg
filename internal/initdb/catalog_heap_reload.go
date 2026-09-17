@@ -633,6 +633,121 @@ func loadForeignKeysFromHeapForDB(mgr *storage.Manager, cat *catalog.InMemory, c
 	return nil
 }
 
+// loadCheckConstraintsFromHeap restores catalog.Table.CheckConstraints/
+// NamedChecks (contype='c', conrelid<>0) from the pg_constraint HEAP written
+// by writeCheckConstraintRow (M0143-0003b). Mirrors loadForeignKeysFromHeap's
+// shape exactly — a CHECK constraint is edge-free (unlike an FK it names no
+// other table), so the per-DB ordering has no correctness requirement here,
+// but matching the sibling's structure keeps the two easy to read together.
+func loadCheckConstraintsFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *transam.CLog) error {
+	if cat == nil {
+		return nil
+	}
+	if err := loadCheckConstraintsFromHeapForDB(mgr, cat, clog, catalog.DefaultDBOid); err != nil {
+		return err
+	}
+	for _, dbName := range cat.ListDatabases() {
+		dbOid := cat.DatabaseOid(dbName)
+		if dbOid == 0 || dbOid == catalog.DefaultDBOid ||
+			dbOid == catalog.PostgresDBOid || dbOid == cat.DBOID() {
+			continue
+		}
+		if err := loadCheckConstraintsFromHeapForDB(mgr, cat, clog, dbOid); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// loadCheckConstraintsFromHeapForDB is loadCheckConstraintsFromHeap's per-DB
+// body. See pgConstraintTableRel's routing note (sys_pg_constraint.go) for why
+// a non-default-DB table's CHECK rows live ONLY in that database's own heap.
+func loadCheckConstraintsFromHeapForDB(mgr *storage.Manager, cat *catalog.InMemory, clog *transam.CLog, heapDBOid uint32) error {
+	type checkRow struct {
+		oid                   uint32
+		name, expr            string
+		conrelid              uint32
+		isLocal, noInherit    bool
+		inhCount              int
+		notValid, notEnforced bool
+	}
+	rel := storage.RelFileNode{DBOid: heapDBOid, RelOid: 2606, Fork: storage.MainFork}
+	cols := executor.PGConstraintColumnsPG18()
+	rows, err := scanCatalogHeapRows(mgr, rel, clog, "pg_constraint",
+		func(ht storage.HeapTuple, tid storage.ItemPointer) (any, bool, error) {
+			natts := int(ht.Header.Infomask2 & storage.HeapNattsMask)
+			decoded := make(executor.Row, len(cols))
+			if derr := executor.DecodeRowIntoMctxPGTuple(decoded, cols, ht.Data, ht.Bitmap, natts, nil); derr != nil {
+				return nil, false, derr
+			}
+			// Only TABLE-level CHECK rows (conrelid<>0). Domain CHECK rows
+			// (contype='c', conrelid=0, contypid=<domain OID>) share this
+			// heap and are restored by reloadUserDomainsFromHeap.
+			if decoded[3].StringValue() != "c" || decoded[8].Int == 0 {
+				return nil, false, errSkipBuiltinRow
+			}
+			return checkRow{
+				oid:      uint32(decoded[0].Int),
+				name:     decoded[1].StringValue(),
+				conrelid: uint32(decoded[8].Int),
+				// notEnforced comes straight from conenforced. notValid can
+				// only be recovered when the row IS enforced — an unenforced
+				// row always reads convalidated=f regardless of the writer's
+				// original NotValid bit (buildPGConstraintRowForTableCheck's
+				// own `!NotValid && !NotEnforced` formula), and that
+				// collapsed bit is harmless: NotValid is never consulted once
+				// NotEnforced is true (see catalog.NamedCheckConstraint's own
+				// doc comment).
+				notEnforced: !decoded[6].BoolValue(),
+				notValid:    decoded[6].BoolValue() && !decoded[7].BoolValue(),
+				isLocal:     decoded[16].BoolValue(),
+				inhCount:    int(decoded[17].Int),
+				noInherit:   decoded[18].BoolValue(),
+				expr:        decoded[27].StringValue(),
+			}, false, nil
+		})
+	if err != nil {
+		return err
+	}
+
+	byTable := make(map[uint32][]checkRow, len(rows))
+	for _, r := range rows {
+		cr := r.(checkRow)
+		if cr.conrelid == 0 || cr.name == "" {
+			continue
+		}
+		byTable[cr.conrelid] = append(byTable[cr.conrelid], cr)
+	}
+	for conrelid, crs := range byTable {
+		tbl, _, ok := cat.LookupTableByOIDAllDBs(conrelid)
+		if !ok || tbl == nil {
+			continue // table dropped since the rows were written
+		}
+		// Rows are appended by the re-sync funnel, so restore in OID order to
+		// keep declaration order stable across restarts rather than
+		// inheriting physical heap order (mirrors the FK loader).
+		sort.Slice(crs, func(i, j int) bool { return crs[i].oid < crs[j].oid })
+		checks := make([]string, 0, len(crs))
+		named := make([]catalog.NamedCheckConstraint, 0, len(crs))
+		for _, cr := range crs {
+			checks = append(checks, cr.expr)
+			named = append(named, catalog.NamedCheckConstraint{
+				Name: cr.name, Expr: cr.expr, OID: cr.oid,
+				NoInherit: cr.noInherit, IsLocal: cr.isLocal, InhCount: cr.inhCount,
+				NotValid: cr.notValid, NotEnforced: cr.notEnforced,
+			})
+			if cr.oid >= catalog.FirstUserOID {
+				cat.AdvanceNextOIDPast(cr.oid)
+			}
+		}
+		// Assigned UNCONDITIONALLY, same rationale as the FK loader's own
+		// tbl.ForeignKeys assignment above: the heap is the truth.
+		tbl.CheckConstraints = checks
+		tbl.NamedChecks = named
+	}
+	return nil
+}
+
 // rebuildAttrdefExpr turns a stored pg_attrdef.adbin back into a goopg
 // default-expression AST. M0123-S2 (sub-slice 2): adbin now comes in two forms,
 // discriminated by the first byte — a canonical PG18 pg_node_tree always opens

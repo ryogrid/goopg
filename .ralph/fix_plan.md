@@ -7126,7 +7126,7 @@ reported, and the values and unit gates are the bar.
     ./internal/initdb/...` PASS (postmaster 49s, initdb 131s). No TPC-H data
     needed for this unit-scoped fix, consistent with the P0-E6-wait
     selection rule.
-- [ ] **M0143-0003b — CHECK constraint durable persistence (write + reload).**
+- [x] **M0143-0003b — CHECK constraint durable persistence (write + reload).**
   Parent: M0143-0003. **Highest-severity remaining piece — this is an
   enforcement-loss correctness bug, not a display gap.**
   `catalog.Table.CheckConstraints`/`NamedChecks` are never written to any
@@ -7136,19 +7136,62 @@ reported, and the values and unit gates are the bar.
   CHECK enforcement on `len(tbl.CheckConstraints) > 0`, so **every CHECK
   constraint on every table silently stops being enforced after any server
   restart**, with no error at restart or at the first violating write.
-  Full scope (mirrors R126's FK precedent exactly) is written out in the
-  design doc's "M0143-0003b" section: new
-  `buildPGConstraintRowForTableCheck`/`writeCheckConstraintRow` in
-  `internal/executor/sys_pg_constraint.go`; wire via ONE new executor-level
-  wrapper at all 9 in-memory call sites found this loop
-  (`operators_ddl.go:4319,4338,4345,4372,4405,5556,5582,9368,13106`) rather
-  than hand-pairing each (sibling-path-desync risk); stamp `xmax` on DROP
-  CONSTRAINT (`operators_ddl.go:13154-13155`/`:13384-13385`); new
-  `loadCheckConstraintsFromHeapForDB` in `catalog_heap_reload.go` mirroring
-  `loadForeignKeysFromHeapForDB`, wired after `loadForeignKeysFromHeap` in
-  `open.go`. Test: extend `TestDatabaseDDLReloadAcrossRestart` with a
-  CHECK-bearing table, asserting BOTH the `pg_constraint` row AND actual
-  post-restart enforcement (an `INSERT` violating the CHECK must still fail).
+  - **Done 2026-09-17.** Write path: `buildPGConstraintRowForTableCheck`/
+    `writeCheckConstraintRow`/`stampCheckConstraintRows`
+    (`internal/executor/sys_pg_constraint.go`), field-for-field matching the
+    synthesised view's own CHECK projection (`catalog.go`'s
+    `PGConstraintRowsForDBOid`). Rather than hand-wiring a new wrapper at
+    each of the 9 `AddCheck*`/`AddCheckInherited` call sites found this loop
+    (`operators_ddl.go:4319,4338,4345,4372,4405,5556,5582,9368,13106`), wired
+    the write into the existing `syncTableToCatalogHeap`
+    (write-all-current-checks loop, mirroring the FK loop) +
+    `deleteCatalogRowsForOID` (`stampCheckConstraintRows` call, mirroring
+    `stampForeignKeyConstraintRows`) funnel, then made sure every one of the
+    9 sites actually reaches a resync: 5 sites in `execCreateTable` and 2 in
+    `execCreatePartitionChild` fall into the SAME "mutated after the
+    function's one early `syncTableToCatalogHeap` call" trap those
+    functions' own comments already document for NOT NULL (M0134-0005y) —
+    extended `execCreateTable`'s resync condition to
+    `notNullHeapDirty || len(tbl.NamedChecks) > 0` and added an equivalent
+    conditional resync block at the end of `execCreatePartitionChild` (which
+    had none at all before this). The ALTER-ADD site (`:9368`) and the
+    ADD-cascade-to-children site (`:13106`, inside
+    `cascadeCheckToChildrenAt` — both the merge and the fresh-inherited
+    branch) now call `o.syncConstraintCatalogRow` (an ALREADY-EXISTING
+    delete-then-resync helper the DROP-cascade path was calling all along,
+    just with nothing yet to persist). DROP CONSTRAINT: the cascade-to-child
+    path (`:13153-13158`ish) already called `syncConstraintCatalogRow(child)`
+    pre-existing; the TOP-LEVEL table's own truncation
+    (`tbl.CheckConstraints`/`NamedChecks` splice, `:13422`ish) had NO resync
+    at all — added `o.syncConstraintCatalogRow(tbl)` there. Reload:
+    `loadCheckConstraintsFromHeapForDB`/`loadCheckConstraintsFromHeap`
+    (`internal/initdb/catalog_heap_reload.go`) mirroring
+    `loadForeignKeysFromHeapForDB`'s shape, wired in `open.go` right after
+    `loadForeignKeysFromHeap`. Test: `TestDatabaseDDLReloadAcrossRestart`
+    (`internal/postmaster/database_ddl_reload_test.go`) extended with a
+    `gauge` table carrying `CONSTRAINT gauge_level_check CHECK (level >= 0)`;
+    asserts the post-restart `pg_constraint` row AND actual enforcement (a
+    satisfying `INSERT` succeeds, a violating one still fails). Verified
+    live: temporarily no-op'd the `loadCheckConstraintsFromHeap` call and
+    confirmed both new assertions fail with the exact predicted symptom
+    (`pg_constraint CHECK rows = []`, violating INSERT unexpectedly
+    succeeds), restored, re-ran green. Also had to widen the existing PK
+    assertion (`gauge` is itself `id int4 PRIMARY KEY`, so the PK-row-count
+    query now returns 2 rows, not 1) using an order-independent `conNames`
+    helper. Residual found while auditing every `.NamedChecks` mutator for
+    completeness: `VALIDATE CONSTRAINT`/`RENAME CONSTRAINT` (metadata-only,
+    not enforcement) still don't resync — filed as a deferral-ledger row
+    (2026-09-17), not a new fix_plan task (small, single-loop-sized follow-up
+    named directly in the ledger's resume point).
+    Gates: `go build ./...` clean; `go test ./internal/catalog/...
+    ./internal/postmaster/... ./internal/executor/... ./internal/initdb/...`
+    all PASS; `TestDatabaseDDLReloadAcrossRestart` re-verified with
+    `-count=1` (not just cached); `RALPH_PRECOMMIT_SCOPE=units
+    scripts/ralph-precommit-test.sh` full green;
+    `scripts/tpcds-sf025-regression.sh sweep` PASS=96 MISMATCH=0 ERROR=0
+    TIMEOUT=0, plan-shapes 99/99 identical, gate-stamp PASS against the
+    staged tree. No TPC-H data needed, consistent with the P0-E6-wait
+    selection rule.
 - [ ] **M0143-0003c — UNIQUE (non-PRIMARY-KEY) constraint-backed index
   `IsConstraint` durability.**
   Parent: M0143-0003. Depends on: sequence after

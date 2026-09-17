@@ -4731,7 +4731,15 @@ afterExistsCheck:
 	// (namedPKCreated, index lookups, inherited-parent columns) that isn't
 	// available until after the table/columns are fully constructed and the
 	// initial sync has already run. M0134-0005y.
-	if notNullHeapDirty && catalogHeapSyncAvailable(o.ctx) {
+	//
+	// M0143-0003b: the CHECK constraint registration blocks above (column,
+	// table-level, named, LIKE-sourced, INHERITS-merged) sit in the exact
+	// same trap — they all run after the early sync too, so
+	// len(tbl.NamedChecks) > 0 joins the resync trigger alongside
+	// notNullHeapDirty. Harmless when both are false (a table with neither
+	// pays nothing extra) and idempotent when a check exists but nothing
+	// downstream actually changed it.
+	if (notNullHeapDirty || len(tbl.NamedChecks) > 0) && catalogHeapSyncAvailable(o.ctx) {
 		if err := o.ctx.MaterializeWriterXID(); err == nil {
 			xmax := o.ctx.Tx.XID
 			for _, dbOid := range tableCatalogDBOids(o.ctx) {
@@ -5639,6 +5647,23 @@ func (o *ddlOp) execCreatePartitionChild(s *parser.CreateTableStmt) error {
 	if s.OnCommit != "" && s.Temporary {
 		if sess, ok := o.ctx.Session.(*BasicSession); ok {
 			sess.RegisterOnCommitAction(tbl.OID, s.OnCommit)
+		}
+	}
+	// M0143-0003b: the CHECK-inheritance/PARTITION-OF-column-list blocks above
+	// (parent-inherited + explicit poc.CheckConstraints) mutate tbl.NamedChecks
+	// AFTER the single syncTableToCatalogHeap call near the top of this
+	// function — the identical trap CREATE TABLE's own comment documents a few
+	// hundred lines up. Re-sync only when the child actually carries a check,
+	// so the common plain-partition case pays nothing extra.
+	if len(tbl.NamedChecks) > 0 && catalogHeapSyncAvailable(o.ctx) {
+		if err := o.ctx.MaterializeWriterXID(); err == nil {
+			xmax := o.ctx.Tx.XID
+			for _, dbOid := range tableCatalogDBOids(o.ctx) {
+				deleteCatalogRowsForOID(o.ctx, dbOid, tbl.OID, xmax)
+			}
+		}
+		if syncErr := syncTableToCatalogHeap(o.ctx, tbl); syncErr != nil {
+			return fmt.Errorf("DDL catalog sync: %w", syncErr)
 		}
 	}
 	return nil
@@ -9370,6 +9395,11 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 				// AND partitions, transitively) — cascadeCheckToChildren mirrors
 				// the NOT NULL twin cascadeNotNullToChildren. M0134-0005as.
 				if err := o.cascadeCheckToChildren(tbl, conName, act.CheckExpr, act.NotValid, act.CheckNotEnforced, act.NoInherit); err != nil {
+					return err
+				}
+				// M0143-0003b: persist the new CHECK (delete-old-then-rewrite,
+				// same helper the DROP/cascade paths already use below).
+				if err := o.syncConstraintCatalogRow(tbl); err != nil {
 					return err
 				}
 			}
@@ -13105,6 +13135,13 @@ func (o *ddlOp) cascadeCheckToChildrenAt(im *catalog.InMemory, tbl *catalog.Tabl
 		if !merged {
 			child.AddCheckInherited(name, expr, im.AllocOID(), notValid, notEnforced)
 		}
+		// M0143-0003b: both branches above mutate child.NamedChecks (a fresh
+		// inherited row, or IsLocal/InhCount metadata on an existing one) and
+		// must reach the heap — the merge branch is not a no-op for
+		// persistence purposes even though it adds no new entry.
+		if err := o.syncConstraintCatalogRow(child); err != nil {
+			return err
+		}
 
 		if err := o.cascadeCheckToChildrenAt(im, child, name, expr, notValid, notEnforced, visited, depth+1); err != nil {
 			return err
@@ -13394,6 +13431,13 @@ func (o *ddlOp) execAlterTableDropConstraint(tbl *catalog.Table, act parser.Alte
 			if err := o.cascadeCheckDropToChildren(im, tbl, act.ConstraintName, !only, make(map[[2]uint32]bool), 0); err != nil {
 				return err
 			}
+		}
+		// M0143-0003b: tbl's own NamedChecks was truncated above but never
+		// re-synced — the cascade calls above only touch CHILDREN's rows via
+		// their own syncConstraintCatalogRow. Without this the dropped
+		// constraint's row survives in the heap and a restart resurrects it.
+		if err := o.syncConstraintCatalogRow(tbl); err != nil {
+			return err
 		}
 		return nil
 	}
@@ -18402,6 +18446,11 @@ func deleteCatalogRowsForOID(ctx *Context, dbOid uint32, relOID uint32, xmax sto
 	// loadForeignKeysFromHeap. Without this, every re-sync would append a
 	// second copy and the reload would rebuild N identical ForeignKeys entries.
 	stampForeignKeyConstraintRows(ctx, dbOid, relOID, xmax)
+	// M0143-0003b: stamp this relation's table-level CHECK constraint rows too
+	// (contype='c', conrelid=relOID), for the identical reason — a re-sync or
+	// DROP must not leave stale/duplicate rows for loadCheckConstraintsFromHeap
+	// to rebuild.
+	stampCheckConstraintRows(ctx, dbOid, relOID, xmax)
 }
 
 // syncEnumTypeToCatalogHeap writes a single pg_type row for an enum type into
@@ -18938,6 +18987,26 @@ func syncTableToCatalogHeap(ctx *Context, tbl *catalog.Table) error {
 		}
 		if err := writeForeignKeyConstraintRow(ctx, fk, tbl.OID, confrelid, conkey, confkey, setCols); err != nil {
 			return fmt.Errorf("pg_constraint fk %q: %w", fk.Name, err)
+		}
+	}
+
+	// M0143-0003b: table-level CHECK constraint persistence via real
+	// pg_constraint HEAP rows (contype='c'), same funnel and the same
+	// stamp-old-then-rewrite-current contract as the FK loop directly above.
+	// Before this, catalog.Table.CheckConstraints/NamedChecks was the ONLY
+	// store and nothing reloaded it, so every CHECK constraint on every table
+	// silently stopped being ENFORCED (not just displayed) after any restart —
+	// copy.go/operators_fk.go/operators_storage.go all gate CHECK enforcement
+	// on len(tbl.CheckConstraints) > 0.
+	for _, nc := range tbl.NamedChecks {
+		// Matches the synthesised view's own skip rule (catalog.go
+		// PGConstraintRowsForDBOid, table-CHECK block): an anonymous /
+		// pre-tracking CHECK has no catalog-visible row either way.
+		if nc.Name == "" || nc.OID == 0 {
+			continue
+		}
+		if err := writeCheckConstraintRow(ctx, tbl, nc); err != nil {
+			return fmt.Errorf("pg_constraint check %q: %w", nc.Name, err)
 		}
 	}
 

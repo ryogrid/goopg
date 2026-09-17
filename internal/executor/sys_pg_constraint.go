@@ -241,6 +241,80 @@ func buildPGConstraintRowForForeignKey(fk catalog.ForeignKey, conrelid, confreli
 	}, nil
 }
 
+// buildPGConstraintRowForTableCheck builds the contype='c' pg_constraint row
+// for one table-level CHECK constraint (M0143-0003b). Field values mirror the
+// synthesised view's own projection (catalog.go's
+// InMemory.PGConstraintRowsForDBOid, table-CHECK block) exactly, so a restart
+// does not change what the row — and therefore pg_dump — reports.
+//
+// conkey stays NULL, not the referenced columns: real PG's CHECK constraints
+// never populate conkey (only NOT NULL/PK/UNIQUE/FK do), and the synthesised
+// view leaves it unset too — see the comment at int2ArrayDatum above for why
+// getting this wrong would be an infomask hazard, not just a cosmetic gap.
+func buildPGConstraintRowForTableCheck(tbl *catalog.Table, nc catalog.NamedCheckConstraint) Row {
+	// NOT ENFORCED implies not validated (processCASbits), same rule as the
+	// FK builder and the synthesised view's own `nc.NotValid || nc.NotEnforced`.
+	convalidated := !nc.NotValid && !nc.NotEnforced
+	return Row{
+		NewIntDatum(int64(nc.OID)),                     // 1  oid
+		NewStringDatum(nc.Name),                        // 2  conname
+		NewIntDatum(int64(catalog.PublicNamespaceOID)), // 3  connamespace
+		NewStringDatum("c"),                            // 4  contype
+		NewBoolDatum(false),                            // 5  condeferrable
+		NewBoolDatum(false),                            // 6  condeferred
+		NewBoolDatum(!nc.NotEnforced),                  // 7  conenforced
+		NewBoolDatum(convalidated),                     // 8  convalidated
+		NewIntDatum(int64(tbl.OID)),                    // 9  conrelid
+		NewIntDatum(0),                                 // 10 contypid (not a domain constraint)
+		NewIntDatum(0),                                 // 11 conindid
+		NewIntDatum(0),                                 // 12 conparentid
+		NewIntDatum(0),                                 // 13 confrelid
+		NewStringDatum(""),                             // 14 confupdtype (zero char, non-FK)
+		NewStringDatum(""),                             // 15 confdeltype
+		NewStringDatum(""),                             // 16 confmatchtype
+		NewBoolDatum(nc.IsLocal),                        // 17 conislocal
+		NewIntDatum(int64(nc.InhCount)),                 // 18 coninhcount
+		NewBoolDatum(nc.NoInherit),                      // 19 connoinherit
+		NewBoolDatum(false),                             // 20 conperiod
+		NullDatum,                                       // 21 conkey — see note above
+		NullDatum,                                       // 22 confkey
+		NullDatum,                                       // 23 conpfeqop
+		NullDatum,                                       // 24 conppeqop
+		NullDatum,                                       // 25 conffeqop
+		NullDatum,                                       // 26 confdelsetcols
+		NullDatum,                                       // 27 conexclop
+		NewStringDatum(nc.Expr),                         // 28 conbin (raw expr text — adbin convention)
+	}
+}
+
+// writeCheckConstraintRow journals one table-level CHECK constraint as a
+// pg_constraint heap INSERT into the TABLE's database (see
+// pgConstraintTableRel — same per-DB routing writeForeignKeyConstraintRow
+// uses, R126's precedent, M0143-0003b).
+func writeCheckConstraintRow(ctx *Context, tbl *catalog.Table, nc catalog.NamedCheckConstraint) error {
+	_, err := writeHeapRowCanonical(ctx, pgConstraintTableRel(ctx), PGConstraintColumnsPG18(), buildPGConstraintRowForTableCheck(tbl, nc))
+	return err
+}
+
+// stampCheckConstraintRows stamps xmax on every contype='c' TABLE-level row
+// (conrelid=relOID) in the given database's pg_constraint heap. Domain CHECK
+// rows are untouched — they carry conrelid=0, never relOID. Mirrors
+// stampForeignKeyConstraintRows exactly (M0143-0003b); see its comment for
+// why the row must be DECODED via the descriptor rather than matched at a
+// fixed byte offset, and why the predicate needs both contype and conrelid.
+func stampCheckConstraintRows(ctx *Context, dbOid, relOID uint32, xmax storage.TransactionID) {
+	rel := storage.RelFileNode{DBOid: dbOid, RelOid: pgConstraintRelOID, Fork: storage.MainFork}
+	cols := PGConstraintColumnsPG18()
+	stampCatalogRowsTuple(ctx, rel, xmax, func(ht storage.HeapTuple) bool {
+		natts := int(ht.Header.Infomask2 & storage.HeapNattsMask)
+		decoded := make(Row, len(cols))
+		if err := DecodeRowIntoMctxPGTuple(decoded, cols, ht.Data, ht.Bitmap, natts, nil); err != nil {
+			return false
+		}
+		return decoded[3].StringValue() == "c" && uint32(decoded[8].Int) == relOID
+	})
+}
+
 // resolveFKCatalogKeys translates one catalog.ForeignKey from goopg's
 // name-keyed in-memory form into PG's pg_constraint coordinates: the
 // referenced relation's OID and the 1-based attnum arrays.
