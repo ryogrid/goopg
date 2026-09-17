@@ -13445,7 +13445,7 @@ func (o *ddlOp) execAlterTableDropConstraint(tbl *catalog.Table, act parser.Alte
 			if sess, ok := o.ctx.Session.(*BasicSession); ok {
 				sess.RecordDDLDrop(DDLDropUndoEntry{Indexes: []*catalog.Index{uqIdx}, SavepointDepth: sess.SavepointDepth()})
 			}
-			im.DropUniqueConstraint(tbl.OID, act.ConstraintName)
+			im.DropUniqueConstraint(tbl, act.ConstraintName)
 		}
 		return nil
 	}
@@ -13469,7 +13469,7 @@ func (o *ddlOp) execAlterTableDropConstraint(tbl *catalog.Table, act parser.Alte
 			if sess, ok := o.ctx.Session.(*BasicSession); ok {
 				sess.RecordDDLDrop(DDLDropUndoEntry{Indexes: []*catalog.Index{exclIdx}, SavepointDepth: sess.SavepointDepth()})
 			}
-			im.DropExclusionConstraint(tbl.OID, act.ConstraintName)
+			im.DropExclusionConstraint(tbl, act.ConstraintName)
 		}
 		return nil
 	}
@@ -13619,7 +13619,7 @@ func (o *ddlOp) execAlterTableDropConstraint(tbl *catalog.Table, act parser.Alte
 		if sess, ok := o.ctx.Session.(*BasicSession); ok {
 			sess.RecordDDLDrop(DDLDropUndoEntry{Indexes: []*catalog.Index{pkIdx}, SavepointDepth: sess.SavepointDepth()})
 		}
-		im.DropPrimaryKeyConstraint(tbl.OID, act.ConstraintName)
+		im.DropPrimaryKeyConstraint(tbl, act.ConstraintName)
 	}
 	return nil
 }

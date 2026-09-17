@@ -22176,10 +22176,10 @@ func (c *InMemory) ViewsDependingOnConstraint(tableOID uint32, constraintName st
 // DropPrimaryKeyConstraint removes the named primary-key constraint (index)
 // from the table's index registries. Returns true if found and removed.
 // M0097-0036.
-func (c *InMemory) DropPrimaryKeyConstraint(tableOID uint32, constraintName string) bool {
+func (c *InMemory) DropPrimaryKeyConstraint(tbl *Table, constraintName string) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.dropIndexByName(tableOID, constraintName)
+	return c.dropIndexByName(tbl, constraintName)
 }
 
 // DropUniqueConstraint removes the named UNIQUE constraint (index-backed,
@@ -22189,10 +22189,10 @@ func (c *InMemory) DropPrimaryKeyConstraint(tableOID uint32, constraintName stri
 // with IsConstraint set), so the removal logic doesn't need to differ; only
 // the caller-side lookup that finds the index by name distinguishes Primary
 // from plain Unique. DU-002 slice 433 follow-up.
-func (c *InMemory) DropUniqueConstraint(tableOID uint32, constraintName string) bool {
+func (c *InMemory) DropUniqueConstraint(tbl *Table, constraintName string) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.dropIndexByName(tableOID, constraintName)
+	return c.dropIndexByName(tbl, constraintName)
 }
 
 // DropExclusionConstraint removes the named EXCLUDE constraint (index-backed,
@@ -22201,17 +22201,34 @@ func (c *InMemory) DropUniqueConstraint(tableOID uint32, constraintName string) 
 // found and removed. Shares dropIndexByName — an EXCLUDE index is stored the
 // same way as a PK/UNIQUE index; only the caller-side lookup differs. DU-002
 // slice 433 follow-up (2nd pass).
-func (c *InMemory) DropExclusionConstraint(tableOID uint32, constraintName string) bool {
+func (c *InMemory) DropExclusionConstraint(tbl *Table, constraintName string) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.dropIndexByName(tableOID, constraintName)
+	return c.dropIndexByName(tbl, constraintName)
 }
 
 // dropIndexByName removes the named index (backing either a PRIMARY KEY or a
 // UNIQUE constraint) from both the per-table and flat index registries.
 // Caller must hold c.mu for writing.
-func (c *InMemory) dropIndexByName(tableOID uint32, constraintName string) bool {
-	inner, ok := c.ns(DefaultDBOid).byTable[tableOID]
+//
+// Takes the resolved *Table (not a bare OID) and keys the namespace lookup
+// off tbl.DBOid instead of hardcoding DefaultDBOid — M0143-0002b: the old
+// (tableOID, name) signature always read/wrote c.ns(DefaultDBOid).byTable,
+// so a PK/UNIQUE/EXCLUDE-backed constraint on a table living in a
+// non-default database silently failed to drop (same shape as M0143-0002's
+// DropForeignKeyConstraint bug, confirmed live via the same two-database
+// repro pattern). Index registration is genuinely per-DB
+// (c.ns(dbOid).byTable[tbl.OID] at every registration site), so this now
+// matches where the entry actually lives.
+func (c *InMemory) dropIndexByName(tbl *Table, constraintName string) bool {
+	if tbl == nil {
+		return false
+	}
+	dbOid := DefaultDBOid
+	if tbl.DBOid != 0 {
+		dbOid = tbl.DBOid
+	}
+	inner, ok := c.ns(dbOid).byTable[tbl.OID]
 	if !ok {
 		return false
 	}
@@ -22220,9 +22237,9 @@ func (c *InMemory) dropIndexByName(tableOID uint32, constraintName string) bool 
 	}
 	delete(inner, constraintName)
 	// Also remove from the flat indexes map.
-	for k, idx := range c.ns(DefaultDBOid).indexes {
-		if idx.Table != nil && idx.Table.OID == tableOID && idx.Name == constraintName {
-			delete(c.ns(DefaultDBOid).indexes, k)
+	for k, idx := range c.ns(dbOid).indexes {
+		if idx.Table != nil && idx.Table.OID == tbl.OID && idx.Name == constraintName {
+			delete(c.ns(dbOid).indexes, k)
 			break
 		}
 	}
@@ -22257,13 +22274,22 @@ func (c *InMemory) DropForeignKeyConstraint(tbl *Table, constraintName string) b
 }
 
 // HasPrimaryKey reports whether table has a primary-key index.
+//
+// Keys the namespace lookup off table.DBOid instead of hardcoding
+// DefaultDBOid — M0143-0002b: a table living in a non-default database
+// otherwise always reported false here regardless of its actual PK, the
+// same hardcode shape M0143-0002 fixed for DropForeignKeyConstraint.
 func (c *InMemory) HasPrimaryKey(table *Table) bool {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	if table == nil {
 		return false
 	}
-	idxs := c.ns(DefaultDBOid).byTable[table.OID]
+	dbOid := DefaultDBOid
+	if table.DBOid != 0 {
+		dbOid = table.DBOid
+	}
+	idxs := c.ns(dbOid).byTable[table.OID]
 	for _, idx := range idxs {
 		if idx.Primary {
 			return true

@@ -6434,6 +6434,49 @@ reported, and the values and unit gates are the bar.
   exact paths TPC-H rides — have manual psql evidence only. This is *why* two per-DB
   defects were found in two consecutive rounds; closing it makes the rest of this
   milestone findable by the suite. Highest leverage of the six.
+  - **Scoping investigation 2026-09-17 (read-only, no code changed):**
+    `parser.Parse("CREATE DATABASE ...")` genuinely errors 42601 — the
+    parser has zero grammar for it (`internal/postmaster/dispatch_extended.go:634-645`
+    states this explicitly); both wire protocols intercept it by
+    string-prefix match (`classifyDatabaseDDL`, `internal/postmaster/database_ddl.go:412`)
+    *before* parsing, via `(s *Server) tryHandleDatabaseDDL` (`database_ddl.go:1485`),
+    which requires a `*postmaster.Server` — a different package from
+    `internal/executor`'s fast in-process test harness (`newVMFixture`/`newHOTFixture`,
+    `internal/executor/vm_test.go:11`), and `internal/postmaster` cannot be
+    imported from `internal/executor` (import cycle: postmaster already
+    imports executor). So the "manual psql evidence only" claim is only
+    half true: `internal/postmaster/database_ddl_test.go` already has
+    dozens of in-process (no socket, no psql) calls to
+    `tryHandleDatabaseDDL` directly (e.g. line 294, 358, 420, `Server`
+    constructed at :417/:447), and `internal/postmaster/database_oid_wiring_test.go`
+    already in-process-tests the DB-switch mechanism (`executor.Context.CurrentDatabaseOid`,
+    a plain settable field, stamped in the real path by
+    `(s *Server) wireExtensionRows` at `dispatch.go:3231`, called from
+    `dispatch.go:690`/`dispatch_extended.go:229`). The genuinely
+    undemonstrated gap is a single in-process test that *chains* both
+    halves — `tryHandleDatabaseDDL("CREATE DATABASE r", ...)` then running
+    DDL against the new DB's own namespace via the executor (`ectx.CurrentDatabaseOid`
+    set from `im.ResolveDatabaseOid("r")`, then `parser.Parse`/`optimizer.Plan`/
+    `executor.Build` as normal) — belongs in `internal/postmaster` (not
+    `internal/executor`), mirroring `database_ddl_test.go` +
+    `database_oid_wiring_test.go` + `internal/executor/fk_dbid_routing_test.go`'s
+    `ctx.CurrentDatabaseOid`-direct-set pattern. The harder, less-precedented
+    half of this task is exercising the *reload* `ListDatabases` loop
+    (`internal/initdb/catalog_heap_reload.go:252,335,442,730,884`,
+    `internal/initdb/open.go:1564,3577,3873`) and `pgConstraintTableRel`'s
+    per-DB branch (`internal/executor/sys_pg_constraint.go:119-139`) under a
+    genuine multi-database WAL-replay/restart in-process (no server
+    socket/psql, but heavier than a single `Server`+`Context` — needs
+    `internal/initdb`'s open/recovery entry point against a temp data dir
+    directly) — no existing precedent for that half. Separate wrinkle:
+    `internal/testport/database_template_oid_collision_test.go:9-11`'s own
+    comment says the in-process `*postmaster.Server` harness "hangs on
+    multi-DB-write shutdown," a pre-existing harness limitation that may
+    bite the reload-loop half specifically. Resume point: start with the
+    `internal/postmaster`-level chain test (concrete, low-risk, closes the
+    "manual psql evidence" gap for the DDL-execution half); scope the
+    reload-loop half as a likely-separate follow-up once the shutdown-hang
+    wrinkle is understood, rather than attempting both in one sitting.
 - [x] **M0143-0002 — `ALTER TABLE … DROP CONSTRAINT` on an FK reports success and does
   nothing** — `InMemory.DropForeignKeyConstraint` hardcodes `DefaultDBOid`
   (`catalog.go:22241`) and `execAlterTableDropConstraint` discards the result
@@ -6466,7 +6509,7 @@ reported, and the values and unit gates are the bar.
     note in this task's own original text was not investigated this loop
     (scope: this loop fixed the one defect with an in-hand live repro, not
     every same-shape sibling named in the task's prose).
-- [ ] **M0143-0002b — audit `HasPrimaryKey`/`dropIndexByName`'s DefaultDBOid
+- [x] **M0143-0002b — audit `HasPrimaryKey`/`dropIndexByName`'s DefaultDBOid
   hardcode for the same non-default-DB no-op M0143-0002 had.**
   Parent: M0143-0002. Filed 2026-09-17 when M0143-0002's fix confirmed the
   FK-specific instance of this hardcode shape live but left the PK/UNIQUE/
@@ -6490,6 +6533,64 @@ reported, and the values and unit gates are the bar.
   would not be the first time a "same shape" claim needed live confirmation
   first — mirrors this task's own FK finding, which WAS live-confirmed before
   the fix landed).
+  - **Done 2026-09-17.** Confirmed the hypothesis live: `dropIndexByName`
+    (`internal/catalog/catalog.go`, shared by `DropPrimaryKeyConstraint`/
+    `DropUniqueConstraint`/`DropExclusionConstraint`) and `HasPrimaryKey`
+    both hardcoded `c.ns(DefaultDBOid)` the exact M0143-0002 shape. Fixed by
+    changing all three public wrappers plus `dropIndexByName` itself to take
+    the resolved `*Table` (not a bare `tableOID`) and key `c.ns()` off
+    `tbl.DBOid` (falling back to `DefaultDBOid` when zero, the same idiom
+    `TableRealPages`/`relAllVisibleCell` already use); `HasPrimaryKey` got
+    the same `table.DBOid`-keyed fix without a signature change (it already
+    took a `*Table`). Five call sites updated: `operators_ddl.go`'s
+    PK/UNIQUE/EXCLUDE `DROP CONSTRAINT` branches (3) and `catalog_test.go`'s
+    `TestDropPrimaryKeyConstraint`-style unit test (2 calls). New test
+    `internal/testport/m0143_0002b_index_backed_drop_constraint_nondefault_db_test.go`
+    — one sub-test per constraint kind (PK, UNIQUE, EXCLUDE `USING btree (a
+    WITH =)`), each created in database `"r"`, COMMITted (not ROLLBACKed)
+    `DROP CONSTRAINT`, asserting enforcement is actually gone; confirmed
+    genuinely red pre-fix via `git stash` of the three touched source files
+    (`23505`/`23P01` still-enforced errors on all three) and green post-fix.
+    **Not investigated this loop** (task's own text flagged it as a separate
+    open question, not this task's scope): the original M0143-0002 "six
+    `deleteCatalogRowsForOID` sites... never confirmed" note —
+    `deleteCatalogRowsForOID`'s ~15 call sites already take an explicit
+    `dbOid` parameter (grep'd), so whichever six sites the original note
+    meant need their own fresh identification, not an assumption they share
+    this hardcode shape. Design doc:
+    `docs/design/0100-0149/p0-e4-catalog-xmax-loss-repro.md` new
+    "M0143-0002b" section; `docs/design/README.md` p0-e4 row title +
+    description updated. Gates: `go build ./...` clean; `go vet
+    ./internal/testport/... ./internal/catalog/... ./internal/executor/...`
+    clean; `go test ./internal/catalog/... ./internal/executor/...` PASS;
+    `go test -v -run
+    'TestPort_M0143_0002|TestPort_M0143_0002b|TestPort_M0143_0008b|TestPort_P0E4|TestPort_P0E5'
+    ./internal/testport/` PASS 12/12; `RALPH_PRECOMMIT_SCOPE=units
+    scripts/ralph-precommit-test.sh` — same pre-existing 60 `internal/parser`
+    failures (M0143-0006, no parser file touched, same count/shape as prior
+    loops); `scripts/tpcds-sf025-regression.sh sweep` — `PASS=96 MISMATCH=0
+    CKMISMATCH=0 ERROR=0 TIMEOUT=0`, plan-shapes 99/99 identical.
+    `tpch-spotcheck`/`tpch-acceptance-arm` still SKIP-BLOCKED by the
+    `:65433` hold (same accepted G6 exception, P0-E7 remains the re-run
+    owner).
+- [ ] **M0143-0002c — re-identify the "six `deleteCatalogRowsForOID` sites"
+  M0143-0002's original text named.**
+  Parent: M0143-0002b. Filed 2026-09-17
+  when M0143-0002b closed without resolving this forward-reference (it was
+  deferred from M0143-0002 to M0143-0002b, and M0143-0002b's own fix scope
+  was the PK/UNIQUE/EXCLUDE `DefaultDBOid` hardcode only). Both M0143-0002's
+  and M0143-0002b's loops confirmed `deleteCatalogRowsForOID`'s ~15 call
+  sites already take an explicit `dbOid` parameter (grep'd, not exhaustively
+  read), so the original "six sites... filed for the same check and never
+  confirmed" note does not describe this hardcode shape as-is — it needs
+  fresh identification of what it actually meant (a different check,
+  possibly at a different layer) before it can be confirmed or fixed.
+  Resume point: `grep -n "deleteCatalogRowsForOID" internal/executor/operators_ddl.go`,
+  read each call site's surrounding context for a *different* per-DB
+  hardcode shape (not the `c.ns(DefaultDBOid)` one M0143-0002/-0002b already
+  fixed), and check `git log`/blame around the M0143-0002 filing date
+  (2026-09-14, `METHODOLOGY3/04-forward-plan.md` §3) for the original
+  six-sites claim's source context.
 - [ ] **M0143-0003 — `pg_constraint` returns 0 rows of any contype after a restart** —
   including the `'p'`/`'u'` rows synthesised from indexes that demonstrably survive. A
   second, independent reload gap that R126 explicitly did not touch.

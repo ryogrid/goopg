@@ -328,3 +328,54 @@ scripts/ralph-precommit-test.sh` — same pre-existing `internal/parser`
 60-test AST-drift (M0143-0006), no new failures;
 `scripts/tpcds-sf025-regression.sh sweep` — `PASS=96 MISMATCH=0
 CKMISMATCH=0 ERROR=0 TIMEOUT=0`, plan-shapes 99/99 identical.
+
+### M0143-0002b — the index-backed (PK/UNIQUE/EXCLUDE) `DefaultDBOid` sibling (2026-09-17)
+
+Confirmed live: `dropIndexByName` (`internal/catalog/catalog.go`, shared by
+`DropPrimaryKeyConstraint`/`DropUniqueConstraint`/`DropExclusionConstraint`)
+and `HasPrimaryKey` both read/wrote `c.ns(DefaultDBOid).byTable[...]`
+unconditionally, exactly the M0143-0002 hardcode shape — but for these three
+the index-registry entry genuinely lives under `c.ns(tbl.DBOid)` (index
+registration is per-DB, confirmed by reading every registration site), so on
+a non-default-DB table the lookup silently found nothing and the method
+returned `false` without touching the real registry.
+`execAlterTableDropConstraint`'s PK/UNIQUE/EXCLUDE branches
+(`operators_ddl.go`) discard that bool the same way the FK branch did before
+M0143-0002, so a plain COMMITted `DROP CONSTRAINT` on any of the three left
+the constraint permanently enforced on a non-default database.
+
+Fix mirrors M0143-0002 exactly: `dropIndexByName` and its three public
+wrappers now take the resolved `*Table` instead of a bare `tableOID`, and key
+`c.ns()` off `tbl.DBOid` (falling back to `DefaultDBOid` when zero, matching
+`Table.DBOid`'s documented convention — see `TableRealPages`/
+`relAllVisibleCell` for the same idiom elsewhere in this file).
+`HasPrimaryKey` gets the same `table.DBOid`-keyed fix in place (it already
+took a `*Table`, so no signature change). All five call sites
+(`operators_ddl.go`'s PK/UNIQUE/EXCLUDE `DROP CONSTRAINT` branches,
+`catalog_test.go`'s `TestDropPrimaryKeyConstraint`-style unit test) updated.
+
+New regression coverage:
+`internal/testport/m0143_0002b_index_backed_drop_constraint_nondefault_db_test.go`
+— one sub-test per constraint kind (PK, UNIQUE, EXCLUDE `USING btree (a WITH
+=)`), each creating the constraint in database `"r"` and asserting a plain
+COMMITted `DROP CONSTRAINT` actually disables enforcement (a duplicate/
+conflicting INSERT that fails before the drop must succeed after it).
+Confirmed to genuinely fail pre-fix (`git stash` on the three touched source
+files: `23505`/`23P01` "still enforced" errors on all three) and pass
+post-fix.
+
+**Not re-investigated this loop**: the original M0143-0002 task text's "six
+`deleteCatalogRowsForOID` sites... never confirmed" note — `catalog.go`'s
+`deleteCatalogRowsForOID` call sites already take an explicit `dbOid`
+parameter at all ~15 sites (grep'd), so whatever "six sites... same check"
+originally referred to needs its own fresh identification rather than being
+assumed to be this hardcode shape.
+
+**Gates**: `go build ./...` clean; `go test ./internal/executor/...
+./internal/catalog/...` PASS; `go test -v -run
+'TestPort_M0143_0002|TestPort_M0143_0002b|TestPort_M0143_0008b|TestPort_P0E4|TestPort_P0E5'
+./internal/testport/` PASS 12/12; `RALPH_PRECOMMIT_SCOPE=units
+scripts/ralph-precommit-test.sh` — same pre-existing `internal/parser`
+60-test AST-drift (M0143-0006), no new failures;
+`scripts/tpcds-sf025-regression.sh sweep` — `PASS=96 MISMATCH=0
+CKMISMATCH=0 ERROR=0 TIMEOUT=0`, plan-shapes 99/99 identical.
