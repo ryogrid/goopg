@@ -6428,7 +6428,7 @@ item here exists because nothing in the suite crossed the boundary that would
 have caught it. These are not parity tasks: no category movement is expected or
 reported, and the values and unit gates are the bar.
 
-- [ ] **M0143-0001 — an in-process test that crosses a DATABASE boundary** —
+- [x] **M0143-0001 — an in-process test that crosses a DATABASE boundary** —
   `CREATE DATABASE` is a dispatch-layer statement the in-process parser rejects, so
   `pgConstraintTableRel`'s per-DB branch and the reload's `ListDatabases` loop — the
   exact paths TPC-H rides — have manual psql evidence only. This is *why* two per-DB
@@ -6507,12 +6507,48 @@ reported, and the values and unit gates are the bar.
     `go test ./internal/postmaster/... ./internal/catalog/...
     ./internal/executor/...` PASS; `RALPH_PRECOMMIT_SCOPE=units
     scripts/ralph-precommit-test.sh` PASS (units scope excludes
-    `internal/postmaster`, run separately above). **Still open**: the
-    reload-loop half (`internal/initdb`'s multi-database `ListDatabases`
-    loop under a genuine WAL-replay/restart) — no existing in-process
-    precedent, and `database_template_oid_collision_test.go`'s "hangs on
-    multi-DB-write shutdown" harness limitation needs understanding first;
-    resume there next.
+    `internal/postmaster`, run separately above).
+  - **Reload-loop half landed 2026-09-17 — task now fully complete.**
+    Investigated the "hangs on multi-DB-write shutdown" wrinkle first (a
+    research pass, not code): traced it to `Server.Run`'s shutdown path
+    (`internal/postmaster/server.go:582-701`) — no existing in-process
+    `*postmaster.Server`-with-`Run()` test harness sets `shutdownDeadline`,
+    so shutdown always falls to the unbounded `s.connWG.Wait()` branch
+    (`:693`), which blocks forever if any backend goroutine is still alive;
+    no repro/stack trace exists anywhere, the claim traces to a single
+    commit message with no further diagnosis. Sidestepped entirely rather
+    than fixed: `TestDatabaseDDLReloadAcrossRestart`
+    (`internal/postmaster/database_ddl_reload_test.go`) uses
+    `postmaster.Server` purely as a `tryHandleDatabaseDDL`/
+    `wireExtensionRows` method-holder (`Run()` is never called, so there is
+    no listener/accept-loop/`connWG` for the hang to occur in), against a
+    real `internal/initdb.Runtime` (`Open`/`Close`/`Open` on the same data
+    dir), mirroring `internal/initdb/heap_catalog_load_test.go`'s existing
+    restart shape. Drives two non-default databases (`r1`, `r2`), each with
+    its own FK-bearing table pair, through a genuine restart and
+    re-verifies post-reload: `reloadDatabasesFromHeap` repopulated
+    `ListDatabases()` with both; `loadForeignKeysFromHeap`'s per-database
+    scan (`pgConstraintTableRel`'s `tableCatalogHeapDBOid` routing)
+    reconstructs each database's own FK by `conname` identity, not just
+    count; cross-database namespace isolation holds after reload. Two live
+    mutations verified the test is a real tripwire, both reverted before
+    commit: (1) omitting `Config.TxnMgr` reproduces a genuine latent
+    durability gap this test surfaced — `syncPgDatabaseHeapRow`
+    (`internal/postmaster/database_ddl.go:1365-1368`, `runPgDatabaseHeapTxn`)
+    silently no-ops without a `TxnMgr`, so `CREATE DATABASE` would look
+    successful yet vanish after restart with no error anywhere (the
+    already-landed DDL-chain test never caught this because it never
+    restarts); (2) forcing `loadForeignKeysFromHeap`'s per-database loop to
+    always pass `catalog.DefaultDBOid` (simulating a reload-time version of
+    the `M0143-0002`/`-0002b` bug class) makes both FK assertions fail with
+    empty results, confirming the test exercises the reload loop's
+    per-database routing, not just the already-covered query-time routing.
+    Design doc and README index updated in the same commit. Gates: `go
+    build ./...` clean; `go vet ./internal/postmaster/...` clean; `go test
+    ./internal/postmaster/... ./internal/catalog/... ./internal/initdb/...
+    ./internal/executor/...` PASS; `RALPH_PRECOMMIT_SCOPE=units
+    scripts/ralph-precommit-test.sh` PASS. No production code changed —
+    test-only, no deferral-ledger row needed.
 - [x] **M0143-0002 — `ALTER TABLE … DROP CONSTRAINT` on an FK reports success and does
   nothing** — `InMemory.DropForeignKeyConstraint` hardcodes `DefaultDBOid`
   (`catalog.go:22241`) and `execAlterTableDropConstraint` discards the result

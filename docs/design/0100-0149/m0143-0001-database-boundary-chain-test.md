@@ -1,7 +1,8 @@
 # M0143-0001 — an in-process test that crosses a DATABASE boundary
 
-Status: partial — the postmaster-level DDL/DML chain half landed; the
-reload-loop half (multi-database WAL-replay/restart) remains open.
+Status: **complete** — both halves landed: the postmaster-level DDL/DML chain
+(`TestDatabaseDDLChainedExecutorDML`) and the reload-loop restart chain
+(`TestDatabaseDDLReloadAcrossRestart`, added 2026-09-17).
 
 ## Gap this closes
 
@@ -75,28 +76,86 @@ The test's own two databases (`r`, a genuinely distinct oid, vs `postgres`,
 which resolves to `DefaultDBOid`) are still a valid two-database check
 because `r`'s oid is never 0 or 5.
 
-## What's still open — the reload-loop half
+## The reload-loop half (`internal/postmaster/database_ddl_reload_test.go`, landed 2026-09-17)
 
-Exercising the *reload* `ListDatabases` loop
-(`internal/initdb/catalog_heap_reload.go:252,335,442,730,884`,
-`internal/initdb/open.go:1564,3577,3873`) and `pgConstraintTableRel`'s
-per-DB branch under a genuine multi-database WAL-replay/restart in-process
-(no server socket/psql, but heavier than a single `Server`+`Context` —
-needs `internal/initdb`'s open/recovery entry point against a temp data dir
-directly) has no existing precedent and was explicitly scoped out of this
-loop, per the original filing's own resume point ("scope the reload-loop
-half as a likely-separate follow-up... rather than attempting both in one
-sitting"). `internal/testport/database_template_oid_collision_test.go:9-11`
-also flags that the in-process `*postmaster.Server` harness "hangs on
-multi-DB-write shutdown" — a pre-existing harness limitation that may bite
-this half specifically and should be understood before attempting it.
+### Why the `*postmaster.Server`-with-`Run()` harness was avoided
+
+`internal/testport/database_template_oid_collision_test.go:9-11` says the
+in-process `*postmaster.Server` harness "hangs on multi-DB-write shutdown."
+Tracing it: that harness calls `srv.Run(ctx)` (a real loopback listener +
+accept loop), and shutdown is pure `ctx` cancellation — `Server.Run`
+(`internal/postmaster/server.go:582-701`) has no separate `Stop` method. None
+of the existing in-process `Server` test harnesses (`dbidRestartServer` and
+siblings) set `shutdownDeadline`, so after the accept loop returns, shutdown
+always falls to the **unbounded** branch, `s.connWG.Wait()`
+(`server.go:693`) — every accepted connection's handler goroutine must
+`Done()` this WaitGroup by returning, which only happens on client-side
+`Close()`/read error. A backend goroutine still alive for any reason (an
+un-closed pooled `sql.DB`, or a handler stuck inside a per-database write
+path) blocks this forever, with no diagnostic (the goroutine-dump-on-timeout
+at `server.go:686-689` only fires on the *bounded* branch, which nothing here
+uses). No repro or stack trace was ever captured — the claim traces to a
+single commit message (`29a38bb24`) with no further diagnosis.
+
+This test sidesteps the whole mechanism: `postmaster.Server` is constructed
+via `New(Config{...})` and used purely as a **method-holder** for
+`tryHandleDatabaseDDL`/`wireExtensionRows` — `Run()` is never called, so
+there is no listener, no accept loop, no `connWG`, and the hang cannot occur
+by construction. Durability and the actual restart ride
+`internal/initdb.Runtime` directly (`Open`/`Close`/`Open` on the same data
+dir), mirroring `internal/initdb/heap_catalog_load_test.go`'s existing
+restart shape.
+
+### Config.TxnMgr — a durability gap this test would have hidden
+
+`syncPgDatabaseHeapRow` (the write that makes `CREATE DATABASE`'s
+`pg_database` row, `global/1262`, survive a restart) is gated on
+`s.cfg.TxnMgr != nil` inside `runPgDatabaseHeapTxn`
+(`internal/postmaster/database_ddl.go:1365-1368`) and silently no-ops
+otherwise — no error at CREATE DATABASE time. The already-landed DDL-chain
+test never sets `Config.TxnMgr` (it builds its own separate
+`transam.Manager`, since it never restarts), so it never exercised this
+write. Verified live: building this test's `Server` `Config` without
+`TxnMgr` reproduces exactly that — `ListDatabases()` comes back empty after
+restart, with no error anywhere in the chain. Fixed by passing
+`TxnMgr: rt.TxnMgr` in the `Config` (see `runPgDatabaseHeapTxn`'s own
+signature for why: it needs a transaction manager to open the short-lived
+internal write transaction the pg_database sync runs under).
+
+### What `TestDatabaseDDLReloadAcrossRestart` covers
+
+Two non-default databases (`r1`, `r2`), each with its own FK-bearing table
+pair, through `initdb.Init` → `initdb.Open` → DDL (commits, unlike the
+DDL-chain test's intentionally-uncommitted style) → `Close` → `Open` again on
+the same dir:
+
+1. `reloadDatabasesFromHeap` (`internal/initdb/catalog_heap_reload.go:1002`)
+   repopulates `ListDatabases()` with both `r1`/`r2` post-restart — this is
+   the *precondition* every per-database pass in that file depends on.
+2. `loadForeignKeysFromHeap`'s per-database scan
+   (`loadForeignKeysFromHeapForDB`, keyed by `pgConstraintTableRel`'s
+   `tableCatalogHeapDBOid` routing) reconstructs each database's own FK with
+   the right **identity** post-reload, checked by `conname`
+   (`child_pid_fkey` / `otherchild_pid_fkey`), not just row count.
+3. Namespace isolation survives reload: neither database's table is visible
+   under the other's real oid after the restart.
+
+Verified both directions live: (a) omitting `Config.TxnMgr` (above) makes
+the test fail exactly as predicted; (b) temporarily forcing
+`loadForeignKeysFromHeap`'s per-database loop to always pass
+`catalog.DefaultDBOid` instead of the real per-DB `dbOid` (simulating a
+reload-time version of the same "hardcoded default database" bug class
+`M0143-0002`/`-0002b` found elsewhere) makes both FK assertions fail with
+empty results (`[]`, want `[child_pid_fkey]`/`[otherchild_pid_fkey]`) —
+confirming the test genuinely exercises the reload loop's per-database
+routing, not just the already-covered query-time routing. Both mutations
+were reverted before commit; production code carries no diff from this task.
 
 ## Gates
 
-`go build ./...` clean. `go test ./internal/postmaster/... ./internal/catalog/... ./internal/executor/...`
-PASS. `RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh` PASS
-(units scope does not include `internal/postmaster`, run separately above).
-No production code changed — test-only, no deferral-ledger row needed for
-this half (the reload-loop half stays tracked by the still-open task text
-in `.ralph/fix_plan.md`, not a ledger row, since nothing was landed there to
-defer).
+`go build ./...` clean; `go test ./internal/postmaster/... ./internal/catalog/...
+./internal/initdb/... ./internal/executor/...` PASS; `go vet
+./internal/postmaster/...` clean; `RALPH_PRECOMMIT_SCOPE=units
+scripts/ralph-precommit-test.sh` PASS (units scope excludes
+`internal/postmaster`, run separately above). No production code changed —
+test-only, no deferral-ledger row needed.
