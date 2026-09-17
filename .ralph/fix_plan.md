@@ -6968,7 +6968,7 @@ reported, and the values and unit gates are the bar.
     ERROR=0 TIMEOUT=0, plan-shapes 99/99 identical, gate-stamp PASS against
     the staged tree. `tpch-spotcheck` not run — no TPC-H data needed for
     this unit-scoped fix, consistent with the P0-E6-wait selection rule.
-- [ ] **M0143-0002g — the two write-site gaps M0143-0002f's own audit found
+- [x] **M0143-0002g — the two write-site gaps M0143-0002f's own audit found
   but did not fix (out of that task's enumerated scope).**
   Parent: M0143-0002d. Filed 2026-09-17 from M0143-0002f's Done note. (1)
   `pgRangeRel` (`internal/executor/sys_pg_range.go:54-59`, backs
@@ -6989,6 +6989,77 @@ reported, and the values and unit gates are the bar.
   pg_type-only to the `rngsubtype` join it currently avoids. Each needs its
   own regression test (a non-default-DB DROP DOMAIN / GRANT ON TYPE /
   CREATE TYPE AS RANGE case).
+  - **Done 2026-09-17 (item 2 only — item 1 carved out to M0143-0002h).**
+    Movement: yes — a GRANT/REVOKE ON TYPE or DROP DOMAIN issued against a
+    type declared in a non-default database now correctly mutates that
+    database's own `pg_type`/`pg_attribute` heap instead of silently
+    corrupting it (a stray duplicate row on GRANT, a surviving row on DROP);
+    confirmed by two new SQL-observable restart tests, each shown to fail
+    with the exact predicted symptom when the fix is reverted.
+    Landed the one-line `catalog.DefaultDBOid` → `tableCatalogHeapDBOid(ctx)`
+    swap at `execDropDomain`'s two `deleteTypeFromCatalogHeap` calls and at
+    `resyncTypeACLHeapRow`/`resyncAttrACLHeapRow`'s delete+attrRel
+    construction (`operators_ddl.go:23537,23667-23670,26366,26369`). Two new
+    restart regression tests
+    (`internal/postmaster/database_ddl_type_acl_domain_reload_test.go`):
+    `TestDatabaseDDLTypeGrantOnTypeNonDefaultDBReload` and
+    `TestDatabaseDDLTypeDropDomainNonDefaultDBReload`, each verified by
+    temporarily stashing the fix — the GRANT case failed with a duplicate
+    pg_type row (2 rows, want 1: the ACL resync's xmax stamp missed the
+    right heap while the already-fixed insert landed a new row there,
+    leaving both live) and the DROP case failed with a surviving "ghost" row
+    (1 row, want 0: the xmax stamp had nothing to compensate for). **Item 1
+    (pg_range) intentionally NOT fixed this loop**, and pgRangeRel is
+    unchanged from `catalog.DefaultDBOid` — before writing its own test,
+    checked whether `pgRangeRel`'s write-side fix is safe alone the way item
+    2's fixes were (their read side, `loadSystemCatalogsIfPresentForDB`, was
+    already per-database from M0143-0002e/f) and found it is NOT:
+    `reloadUserRangeTypesFromHeap` (`catalog_heap_reload.go:1685`) and
+    `RegisterRangeTypeDuringRecovery` both key exclusively off `cat.DBOID()`
+    with no per-database loop, so a write-only fix would make a non-default
+    database's range type silently lose its pg_range row on the very next
+    restart — trading today's cosmetic wrong-file placement for actual data
+    loss. Filed as **M0143-0002h** below with a `.ralph/deferral_ledger.md`
+    row (dated 2026-09-17) recording the full read-side gap and resume
+    point. Gates: `go build ./...` clean; `go test
+    ./internal/postmaster/... ./internal/executor/... ./internal/initdb/...
+    ./internal/catalog/...` PASS; `RALPH_PRECOMMIT_SCOPE=units
+    scripts/ralph-precommit-test.sh` full green;
+    `scripts/tpcds-sf025-regression.sh sweep` PASS=96 MISMATCH=0 ERROR=0
+    TIMEOUT=0, plan-shapes 99/99 identical. `tpch-spotcheck` not run — no
+    TPC-H data needed, consistent with the P0-E6-wait selection rule.
+- [ ] **M0143-0002h — pg_range needs a paired write+read per-database fix,
+  not the one-line swap M0143-0002g's own text assumed.**
+  Parent: M0143-0002d. Filed 2026-09-17 from M0143-0002g's Done note.
+  `pgRangeRel` (`internal/executor/sys_pg_range.go:54-59`) still hardcodes
+  `catalog.DefaultDBOid`, but unlike the pg_type/pg_class/pg_attribute sites
+  M0143-0002e/f fixed, there is NO existing per-database read-side loop for
+  pg_range to land the write fix against:
+  `reloadUserRangeTypesFromHeap` (`internal/initdb/catalog_heap_reload.go:1685`)
+  scans only `cat.DBOID()`'s pg_range+pg_type heaps in a single unconditional
+  pass (called once from `open.go:2272`, not looped over
+  `cat.ListDatabases()` the way `loadUserTablesFromHeapForDB`/
+  `loadSystemCatalogsIfPresentForDB` are at `open.go:1564,1586`), and
+  `RegisterRangeTypeDuringRecovery` (`catalog_heap_reload.go:1756`)
+  hardcodes `DBOid: cat.DBOID()` on every reloaded `RangeType` regardless of
+  which database's heap the row logically came from. Landing the write-side
+  swap alone would therefore REGRESS restart durability: a range type
+  created in a non-default database would have its pg_range row written to
+  that database's own heap file, but the reload pass would never scan that
+  file, so the row (and hence `rngsubtype`) would silently vanish on the
+  next restart — worse than today's cosmetic-but-durable wrong-file
+  placement. Fix (land together, one commit): (1) give `pgRangeRel` the
+  same `tableCatalogHeapDBOid(ctx)` swap; (2) extend
+  `reloadUserRangeTypesFromHeap` into a per-database loop mirroring
+  `loadSystemCatalogsIfPresentForDB` (`open.go:1586`) — for each
+  distinct-dbOid database in `cat.ListDatabases()`, re-run the scan against
+  that database's own pg_range+pg_type heaps and pass its real dbOid into
+  `RegisterRangeTypeDuringRecovery` instead of `cat.DBOID()`; (3) extend
+  `TestDatabaseDDLTypeCatalogReloadAcrossRestart`'s range assertion from
+  pg_type-only to the `rngsubtype` join it currently avoids (join `pg_range`
+  to confirm `r1`'s samerange resolves subtype `integer` and `r2`'s
+  resolves `bigint` post-restart, isolated per database). Ledger:
+  `M0143-0002g` row dated 2026-09-17.
 - [ ] **M0143-0003 — `pg_constraint` returns 0 rows of any contype after a restart** —
   including the `'p'`/`'u'` rows synthesised from indexes that demonstrably survive. A
   second, independent reload gap that R126 explicitly did not touch.

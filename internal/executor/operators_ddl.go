@@ -23534,7 +23534,7 @@ func (o *ddlOp) resyncTypeACLHeapRow(im *catalog.InMemory, oid uint32, kind user
 	if err := ctx.MaterializeWriterXID(); err != nil {
 		return err
 	}
-	deleteTypeFromCatalogHeap(ctx, catalog.DefaultDBOid, oid, ctx.Tx.XID)
+	deleteTypeFromCatalogHeap(ctx, tableCatalogHeapDBOid(ctx), oid, ctx.Tx.XID)
 	if err := writeTypeHeapRowWithIndexes(ctx, row); err != nil {
 		return err
 	}
@@ -23664,9 +23664,9 @@ func (o *ddlOp) resyncAttrACLHeapRow(im *catalog.InMemory, tbl *catalog.Table, c
 	if err := ctx.MaterializeWriterXID(); err != nil {
 		return err
 	}
-	deleteAttributeFromCatalogHeap(ctx, catalog.DefaultDBOid, tbl.OID, attNum, ctx.Tx.XID)
+	deleteAttributeFromCatalogHeap(ctx, tableCatalogHeapDBOid(ctx), tbl.OID, attNum, ctx.Tx.XID)
 	attrRel := storage.RelFileNode{
-		DBOid:  catalog.DefaultDBOid,
+		DBOid:  tableCatalogHeapDBOid(ctx),
 		RelOid: catalog.AttributeRelationId,
 		Fork:   storage.MainFork,
 	}
@@ -26363,10 +26363,10 @@ func (o *ddlOp) execDropDomain(s *parser.DropDomainStmt) error {
 		// OID while the domain still exists), mirroring execDropType. DU-002 slice 90.
 		if d, ok := cat.LookupDomain(name.Name, o.ctx.CurrentDatabaseOid); ok && catalogHeapSyncAvailable(o.ctx) {
 			if o.ctx.MaterializeWriterXID() == nil {
-				deleteTypeFromCatalogHeap(o.ctx, catalog.DefaultDBOid, d.OID, o.ctx.Tx.XID)
+				deleteTypeFromCatalogHeap(o.ctx, tableCatalogHeapDBOid(o.ctx), d.OID, o.ctx.Tx.XID)
 				// Also stamp the auto-generated array type row. DU-002 slice 251.
 				if d.ArrayOID != 0 {
-					deleteTypeFromCatalogHeap(o.ctx, catalog.DefaultDBOid, d.ArrayOID, o.ctx.Tx.XID)
+					deleteTypeFromCatalogHeap(o.ctx, tableCatalogHeapDBOid(o.ctx), d.ArrayOID, o.ctx.Tx.XID)
 				}
 				// B2.1b: the domain's pg_constraint rows die with it.
 				for _, chk := range d.Checks {

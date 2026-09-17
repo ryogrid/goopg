@@ -1,4 +1,4 @@
-Status: in progress — M0143-0002e (read side) landed 2026-09-17; M0143-0002f (write side) not started
+Status: in progress — M0143-0002e (read side) and M0143-0002f (write side) landed 2026-09-17; M0143-0002g (DROP DOMAIN + GRANT/REVOKE ACL sites) landed 2026-09-17; M0143-0002h (pg_range paired write+read fix) filed, not started
 Date: 2026-09-17
 Supersedes: none
 
@@ -207,6 +207,54 @@ rows they point at were wrong.
     scripts/ralph-precommit-test.sh` full green;
     `scripts/tpcds-sf025-regression.sh sweep` PASS=96 MISMATCH=0 ERROR=0,
     plan-shapes 99/99 identical (gate-stamp PASS against the staged tree).
+- **M0143-0002g** (the two write sites M0143-0002f left out of scope).
+  Parent: M0143-0002d.
+  - **Done 2026-09-17 (item 2 of 2 — DROP DOMAIN + GRANT/REVOKE ACL resync
+    only).** Routed `execDropDomain`'s two `deleteTypeFromCatalogHeap` calls
+    and `resyncTypeACLHeapRow`/`resyncAttrACLHeapRow`'s delete+attrRel
+    construction through `tableCatalogHeapDBOid(ctx)`
+    (`operators_ddl.go:23537,23667-23670,26366,26369`). These sites are safe
+    to fix write-side-only because their read side — the per-database
+    pg_type/pg_attribute reload loop M0143-0002e/f already landed
+    (`loadSystemCatalogsIfPresentForDB`, `internal/initdb/open.go:1586`) —
+    is generic to whichever executor code wrote the row; it doesn't care
+    which function did the writing. New tests
+    (`internal/postmaster/database_ddl_type_acl_domain_reload_test.go`):
+    `TestDatabaseDDLTypeGrantOnTypeNonDefaultDBReload` (caught a duplicate
+    pg_type row pre-fix — the ACL resync's stale-row xmax stamp missed the
+    right heap while the already-fixed insert correctly landed the new row
+    there, so both stayed live) and
+    `TestDatabaseDDLTypeDropDomainNonDefaultDBReload` (caught a surviving
+    "ghost" row pre-fix — the xmax stamp had nothing to compensate for).
+    **`pgRangeRel`'s own `DefaultDBOid` hardcode (item 1) was explicitly NOT
+    fixed** — before assuming it was as safe as item 2, checked whether an
+    equivalent per-database read side exists for `pg_range` and found there
+    isn't one: `reloadUserRangeTypesFromHeap`
+    (`internal/initdb/catalog_heap_reload.go:1685`) runs as a single
+    unconditional pass keyed on `cat.DBOID()` (not looped over
+    `cat.ListDatabases()` the way the pg_type/pg_attribute loop is), and
+    `RegisterRangeTypeDuringRecovery` hardcodes `DBOid: cat.DBOID()` on
+    every reloaded `RangeType`. A write-only `pgRangeRel` fix would
+    therefore make a non-default database's range type silently lose its
+    pg_range row (and `rngsubtype`) on the very next restart — an actual
+    data-loss regression traded for today's merely-cosmetic wrong-file
+    placement. Re-filed as **M0143-0002h** (paired write+read fix, one
+    commit) with a `.ralph/deferral_ledger.md` row dated 2026-09-17
+    (task-id M0143-0002g). Gates: `go build ./...` clean; `go test
+    ./internal/postmaster/... ./internal/executor/... ./internal/initdb/...
+    ./internal/catalog/...` PASS; `RALPH_PRECOMMIT_SCOPE=units
+    scripts/ralph-precommit-test.sh` full green;
+    `scripts/tpcds-sf025-regression.sh sweep` PASS=96 MISMATCH=0 ERROR=0
+    TIMEOUT=0, plan-shapes 99/99 identical.
+- **M0143-0002h** (pg_range paired write+read per-database fix). Parent:
+  M0143-0002d. Filed 2026-09-17, not started. See the `.ralph/fix_plan.md`
+  task text for the full three-part fix shape (write-side `pgRangeRel` swap
+  + a new per-database `reloadUserRangeTypesFromHeap` loop mirroring
+  `loadSystemCatalogsIfPresentForDB` + the `rngsubtype`-join test
+  extension). Both halves land in the same commit — the read-side loop must
+  exist before or alongside the write-side swap, never after, or a restart
+  in between would lose data (the exact trap M0143-0002g's own audit
+  surfaced and declined to walk into).
 
 ## Test
 
