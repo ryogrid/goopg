@@ -266,20 +266,64 @@ heuristic stays live.)
   - **UPDATE 2026-09-18b**: `limit` **FIXED, this commit** — see the
     `limit — FETCH BACKWARD sign/row bug` task below for the root cause and
     fix. Full-suite re-run: 48 PASS / 1 FAIL (`numerology`) / 183 SKIP.
+  - **UPDATE 2026-09-18c**: `numerology` **FIXED, this commit** — see the
+    `numerology — binary/octal/hex integer literals unsupported` task below
+    for the root cause and fix. Full-suite re-run: 50 PASS / 0 FAIL / 183
+    SKIP.
   (Remaining 3 items — PGColdStart AI-…-002, PgStatActivity AI-…-007,
   Syntax_Catalog_PgStatActivity AI-…-009 — already have open tasks above;
   AI-ids appended per the "do not add another" rule. Evidence for all:
   `ci/logs/20260905-011015/`.)
-- [ ] **numerology — binary/octal/hex integer literals unsupported** (filed
+- [x] **numerology — binary/octal/hex integer literals unsupported** (filed
   2026-09-18, split out of testport/TestPort_RegressSuite's numerology
-  subtest above). PG 16 added `0b`/`0o`/`0x` integer literal syntax
-  (`postgres/src/test/regress/sql/numerology.sql` lines 10-38); goopg's
-  lexer/grammar does not recognise it, so every `SELECT 0b100101;`-shaped
-  statement errors instead of returning the decoded integer, dropping the
-  whole expected result block from the diff. Parser/grammar change — read
-  the goyacc playbook (`docs/design/not_ralph/06-goyacc-parser-playbook.md`)
-  before touching `grammar/*.y`. Repro: `go test -v -run
-  '^TestPort_RegressSuite$/^numerology$' ./internal/testport/`.
+  subtest above). **Fixed 2026-09-18 — the filing's premise was wrong, and a
+  second, unrelated bug was hiding behind it.** The lexer already fully
+  tokenized `0b`/`0o`/`0x` literals (M0097-0003, `internal/parser/lexer.go`);
+  no grammar change was needed. The real bug: `internal/parser/select.go`'s
+  hand-written-path helper `parseIntLiteralExpr` knew about the base
+  prefixes, but the goyacc adapter's `mapToken` (`internal/parser/adapter.go`
+  `case TokenIntLit`) — which is what a routed `SELECT` actually goes
+  through — always called `strconv.ParseInt(..., 10, 64)`, ignoring the
+  prefix entirely (a `pattern_sibling_paths_must_agree` instance: legacy
+  hand-written path vs. goyacc-routed path silently diverged). `0b100101`
+  therefore failed base-10 parsing, fell into the FCONST/overflow branch with
+  the RAW prefixed text (`"0b100101"`) as its numeric-literal string, and
+  `internal/executor/numeric.go`'s decimal-only parser rejected it as
+  "invalid numeric literal". Fix: `mapToken` now calls the same
+  `parseIntLiteral` the legacy path uses; a new shared helper
+  `intLiteralOverflowText` (used by both `mapToken` and
+  `parseIntLiteralExpr`) converts an int64-overflowing 0b/0o/0x literal to
+  decimal text via `strconv.ParseUint` before it reaches the FCONST/Numeric
+  path, since that path only understands base 10 — this also fixes the
+  int8-overflow-boundary cases (`0x8000000000000000` etc.) which the old
+  `mapToken` mishandled identically. A second, independent bug surfaced
+  once the first was fixed: `0.a` and `1_000._5` (digit-led token, dot
+  immediately followed by an identifier char) produced `syntax error at or
+  near "."` instead of PG's `trailing junk after numeric literal` — the
+  lexer's dot-commit heuristic assumed a bare digit-led token could be
+  upstream's qualified-name form (`a.b`), which is impossible (qualified
+  names start with an identifier, never a digit; PG's own `scan.l` has no
+  such carve-out for `{decinteger}'.'`). Fixed in the same lexer function:
+  a digit-led token's dot always begins a numeric literal (except `..`
+  range syntax), and the fractional-digit loop no longer swallows a
+  *leading* underscore as if it were a valid fraction digit (PG's
+  `{decinteger}` requires the fraction to START with a digit; underscores
+  are separators only) — so `1_000._5`'s `"_5"` is correctly left for the
+  post-number trailing-junk check instead of being silently accepted as
+  part of the float. Gates: `go build ./...` clean; `go test
+  ./internal/parser/...` PASS (goldens unchanged — no golden diff, so no
+  pinned AST shape moved); live-verified all magnitude tiers (int4-fits,
+  int4-overflow/int8-fits, int8-overflow) plus both dot-junk cases against
+  a throwaway `psql`-driven scratch cluster (ports 5533/5534,
+  `/tmp/numerology-scratch-data`, never the shared/reference clusters) byte-
+  for-byte against `postgres/src/test/regress/expected/numerology.out`;
+  `go test -v -run '^TestPort_RegressSuite$/^numerology$'
+  ./internal/testport/` PASS; full `TestPort_RegressSuite` re-run: 50 PASS
+  / 0 FAIL / 183 SKIP (was 48/1/183 before this loop) — no other case
+  regressed. `RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh`
+  PASS. No TPC-H/sf025 gate needed (lexer/parser-only change, no
+  `internal/executor`/`internal/optimizer` row-count path touched; the
+  `internal/executor` unit package itself was re-run above and is green).
 - [x] **limit — FETCH BACKWARD sign/row bug** (filed 2026-09-18, split out of
   testport/TestPort_RegressSuite's limit subtest above). Against a cursor
   opened over a query returning a negative `q2`, `FETCH BACKWARD` returns

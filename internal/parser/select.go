@@ -5196,26 +5196,38 @@ func parseIntLiteralExpr(t Token) (Expr, error) {
 		return &IntegerConst{pos: t.Pos, Value: v}, nil
 	}
 	// Overflow — emit as NumericConst preserving the original value.
-	// Strip underscores and prefix for display consistency.
-	s := strings.ReplaceAll(t.Value, "_", "")
+	return &NumericConst{pos: t.Pos, Value: intLiteralOverflowText(t.Value)}, nil
+}
+
+// intLiteralOverflowText converts a TokenIntLit value that overflows int64
+// into its decimal digit text, mirroring scan.l's process_integer_literal
+// fallback to FCONST. 0b/0o/0x-prefixed literals must be converted to
+// decimal — the numeric-literal parser downstream only understands base 10 —
+// while plain decimal text is already in the right base and is returned with
+// only its separators stripped. Shared by parseIntLiteralExpr (legacy path)
+// and adapter.go's mapToken (goyacc path, M0097-0003 sibling fix): both must
+// agree on how an out-of-int64-range literal renders as text.
+func intLiteralOverflowText(raw string) string {
+	s := strings.ReplaceAll(raw, "_", "")
 	if len(s) >= 2 && s[0] == '0' {
 		switch s[1] {
 		case 'b', 'B':
-			if u, uerr := strconv.ParseUint(s[2:], 2, 64); uerr == nil {
-				return &NumericConst{pos: t.Pos, Value: strconv.FormatUint(u, 10)}, nil
+			if u, err := strconv.ParseUint(s[2:], 2, 64); err == nil {
+				return strconv.FormatUint(u, 10)
 			}
 		case 'o', 'O':
-			if u, uerr := strconv.ParseUint(s[2:], 8, 64); uerr == nil {
-				return &NumericConst{pos: t.Pos, Value: strconv.FormatUint(u, 10)}, nil
+			if u, err := strconv.ParseUint(s[2:], 8, 64); err == nil {
+				return strconv.FormatUint(u, 10)
 			}
 		case 'x', 'X':
-			if u, uerr := strconv.ParseUint(s[2:], 16, 64); uerr == nil {
-				return &NumericConst{pos: t.Pos, Value: strconv.FormatUint(u, 10)}, nil
+			if u, err := strconv.ParseUint(s[2:], 16, 64); err == nil {
+				return strconv.FormatUint(u, 10)
 			}
 		}
 	}
-	// Decimal overflow — return the string as a numeric literal.
-	return &NumericConst{pos: t.Pos, Value: s}, nil
+	// Decimal overflow (or a non-decimal literal too large even for
+	// uint64) — return the stripped text as-is.
+	return s
 }
 
 // parseRowsFrom handles the ROWS FROM(func1(args), func2(args), ...) [WITH ORDINALITY] syntax.
