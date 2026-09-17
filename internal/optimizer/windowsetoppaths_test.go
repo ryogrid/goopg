@@ -94,7 +94,7 @@ func TestCostWindowIsCostWindowaggTermByTerm(t *testing.T) {
 		cp.cpuOperatorCost*(numPart+numOrd)*rows +
 		cp.cpuTupleCost*rows
 
-	got := costWindow(cp, inputTotal, rows, numPart, numOrd, numFuncs, inNcols, inAvgVarBytes, 64)
+	got := costWindow(cp, inputTotal, rows, numPart, numOrd, numFuncs, inNcols, inAvgVarBytes, 64, 0, 0)
 	if math.Abs(got.Startup-wantStartup) > 1e-9 {
 		t.Fatalf("costWindow startup = %v, want %v", got.Startup, wantStartup)
 	}
@@ -114,10 +114,84 @@ func TestCostWindowIsCostWindowaggTermByTerm(t *testing.T) {
 // the same key count.
 func TestCostWindowSortTermUsesRowWidthNotKeyCount(t *testing.T) {
 	cp := defaultCostParams()
-	narrow := costWindow(cp, 100, 5e6, 1, 1, 1, 2, 0, 16)
-	wide := costWindow(cp, 100, 5e6, 1, 1, 1, 40, 400, 1024)
+	narrow := costWindow(cp, 100, 5e6, 1, 1, 1, 2, 0, 16, 0, 0)
+	wide := costWindow(cp, 100, 5e6, 1, 1, 1, 40, 400, 1024, 0, 0)
 	if !(wide.Total > narrow.Total) {
 		t.Fatalf("wide-row window total %v not above narrow-row %v; costSortRun is being fed the key count, not the row width", wide.Total, narrow.Total)
+	}
+}
+
+// TestCostWindowPresortedCreditIsInertAtZero pins M0141-S2b-3a's contract:
+// `presortedCount=0` (every caller today — `addWindowPaths` always passes it)
+// must reproduce the pre-3a price EXACTLY. This is the "predicted
+// byte-identical" gate the task was filed under: the credit exists but has no
+// caller yet, so a regression here would be silent everywhere else.
+func TestCostWindowPresortedCreditIsInertAtZero(t *testing.T) {
+	cp := defaultCostParams()
+	got := costWindow(cp, 100, 5e6, 2, 3, 2, 4, 32, 64, 0, 0)
+	sortRun := costSortRun(cp, 5e6, 4, 32, -1)
+	wantStartup := 100 + sortRun.Startup
+	wantTotal := wantStartup + (sortRun.Total - sortRun.Startup) +
+		cp.cpuOperatorCost*2*5e6 + cp.cpuOperatorCost*5*5e6 + cp.cpuTupleCost*5e6
+	if math.Abs(got.Startup-wantStartup) > 1e-6 || math.Abs(got.Total-wantTotal) > 1e-6 {
+		t.Fatalf("costWindow(presortedCount=0) = %+v, want {%v %v} (no-credit price unchanged)", got, wantStartup, wantTotal)
+	}
+}
+
+// TestCostWindowFullPresortedMatchChargesNoSort pins the FULL-match credit:
+// when the input already delivers every required sort key
+// (`presortedCount >= numPartCols+numOrderCols`), `createWindowPlan` stacks no
+// Sort node at all (`childDeliversSortKeys`), so the price must drop to
+// exactly the input's own total plus the per-row window overhead — no sort
+// term of any kind.
+func TestCostWindowFullPresortedMatchChargesNoSort(t *testing.T) {
+	cp := defaultCostParams()
+	const (
+		inputTotal      = 100.0
+		rows            = 5e6
+		numPart, numOrd = 2, 3
+		numFuncs        = 2
+	)
+	got := costWindow(cp, inputTotal, rows, numPart, numOrd, numFuncs, 4, 32, 64, numPart+numOrd, rows)
+	wantTotal := inputTotal +
+		cp.cpuOperatorCost*numFuncs*rows +
+		cp.cpuOperatorCost*(numPart+numOrd)*rows +
+		cp.cpuTupleCost*rows
+	if math.Abs(got.Startup-inputTotal) > 1e-6 {
+		t.Fatalf("costWindow(full match) startup = %v, want exactly the input total %v (no sort charged)", got.Startup, inputTotal)
+	}
+	if math.Abs(got.Total-wantTotal) > 1e-6 {
+		t.Fatalf("costWindow(full match) total = %v, want %v", got.Total, wantTotal)
+	}
+	noCredit := costWindow(cp, inputTotal, rows, numPart, numOrd, numFuncs, 4, 32, 64, 0, 0)
+	if !(got.Total < noCredit.Total) {
+		t.Fatalf("full-match price %v not below no-credit price %v", got.Total, noCredit.Total)
+	}
+}
+
+// TestCostWindowPartialPresortedMatchIsCheaperThanFullSort pins the PARTIAL
+// credit's shape: a candidate presorted on a genuine prefix must price
+// strictly below the flat full-sort price, and the saving must GROW as the
+// prefix's group count grows — more groups means a smaller residual sort
+// within each one (`costIncrementalSort`'s own `groupTuples = inputTuples /
+// inputGroups` division), the same direction
+// `TestCostIncrementalSort_NeverExceedsSingleGroupCost` pins for the ORDERED
+// rel's own arm.
+func TestCostWindowPartialPresortedMatchIsCheaperThanFullSort(t *testing.T) {
+	cp := defaultCostParams()
+	const (
+		inputTotal      = 100.0
+		rows            = 5e6
+		numPart, numOrd = 2, 3
+	)
+	noCredit := costWindow(cp, inputTotal, rows, numPart, numOrd, 1, 4, 32, 64, 0, 0)
+	fewGroups := costWindow(cp, inputTotal, rows, numPart, numOrd, 1, 4, 32, 64, 1, 10)
+	manyGroups := costWindow(cp, inputTotal, rows, numPart, numOrd, 1, 4, 32, 64, 1, 1000)
+	if !(fewGroups.Total < noCredit.Total) {
+		t.Fatalf("partial-prefix price %v not below no-credit price %v", fewGroups.Total, noCredit.Total)
+	}
+	if !(manyGroups.Total < fewGroups.Total) {
+		t.Fatalf("more groups (%v) should cost less than fewer groups (%v)", manyGroups.Total, fewGroups.Total)
 	}
 }
 
@@ -137,10 +211,10 @@ func TestAddWindowPathsUsesPreWindowEmittedWidth(t *testing.T) {
 	}
 	want := costWindow(cp, seed.Cost.Total, seed.Rows,
 		len(win.PartitionBy), len(win.OrderBy), len(win.Funcs), len(in.Output()),
-		nodeAvgVarBytes(in.Output()), nodeTupleWidth(in))
+		nodeAvgVarBytes(in.Output()), nodeTupleWidth(in), 0, 0)
 	postWindow := costWindow(cp, seed.Cost.Total, seed.Rows,
 		len(win.PartitionBy), len(win.OrderBy), len(win.Funcs), len(in.Output()),
-		nodeAvgVarBytes(in.Output()), nodeTupleWidth(win))
+		nodeAvgVarBytes(in.Output()), nodeTupleWidth(win), 0, 0)
 	if want == postWindow {
 		t.Fatalf("fixture does not distinguish pre-window width %d from output width %d", nodeTupleWidth(in), nodeTupleWidth(win))
 	}

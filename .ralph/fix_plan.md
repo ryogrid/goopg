@@ -2597,14 +2597,31 @@ spill route is net-negative.
     `docs/design/0100-0149/m0141-s2b-scoping-decomposition.md` §"S2b-3
     recon". Filed **M0141-S2b-3a**/**M0141-S2b-3b** below (neither selected
     yet). Ledger row appended (task-id `m0141-s2b-3`).
-  - [ ] **M0141-S2b-3a** — teach `costWindow` (`windowsetoppaths.go:193`) a
+  - [x] **M0141-S2b-3a** — teach `costWindow` (`windowsetoppaths.go:193`) a
     presorted/partial-prefix cost credit, reusing `costIncrementalSort`'s
     formula (`incrementalsortpaths.go`) for the shared-prefix case and
     skipping `sortRun` entirely when the full `windowSortKeys` list is
     already covered. Filed by S2b-3's recon (design doc item 1). Prerequisite
     for S2b-3b — same ordering S2b-2c depended on M0141-S7's cost function.
-    Gate: predicted byte-identical-plan null result (nothing calls it with a
-    presorted input yet), same S2b-2a/M0139-0007a precedent.
+    **DONE 2026-09-17k.** `costWindow` took two new params
+    (`presortedCount`, `presortedGroups`) and branches: no-credit (unchanged
+    `costSortRunWithWidth` call — the ONLY branch any caller reaches today),
+    full-match (charges nothing — `createWindowPlan` stacks no Sort node in
+    this case), partial-match (`costIncrementalSort` called with a ZEROED
+    input `Cost` — passing the real one would double-count `inputTotal`,
+    which this function adds back on separately for the blocking-node
+    reason its own doc comment states). `addWindowPaths` passes `(0, 0)`
+    unconditionally (input is still one collapsed Node, no Pathlist to
+    check — S2b-3b's job). Gate: predicted byte-identical-plan null result
+    CONFIRMED — 3 new unit tests pin all three branches directly
+    (`TestCostWindowPresortedCreditIsInertAtZero`,
+    `TestCostWindowFullPresortedMatchChargesNoSort`,
+    `TestCostWindowPartialPresortedMatchIsCheaperThanFullSort`); TPC-DS
+    SF0.25 sweep `PASS=96 MISMATCH=0 PLAN-SHAPE changed=0`;
+    `tpch-spotcheck.sh` SKIPPED (pre-existing M0142-0003k data-reload
+    blocker, confirmed unrelated by reproducing the same SKIP with this
+    change's two files `git stash`ed out). Full writeup: design doc's
+    "S2b-3a landed" section. **Next: M0141-S2b-3b**, now unblocked.
   - [ ] **M0141-S2b-3b** — wire `searchedRelOf(input)`/
     `RelOptInfo.SearchCandidates`/`SearchCandidateKeys` into
     `createWindowPaths`, and extend `addWindowPaths`'s per-candidate loop to

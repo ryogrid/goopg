@@ -191,16 +191,47 @@ func seedRowsForNode(n Node) float64 {
 // input's startup. Upstream's `get_windowclause_startup_tuples` proration
 // (costsize.c:3178) has no analogue and is deliberately absent — it exists to
 // reward a streaming WindowAgg that can stop early, and goopg's cannot.
+//
+// M0141-S2b-3a: `presortedCount` is the number of LEADING `windowSortKeys`
+// columns the input already delivers in order (0 when nothing is known about
+// the input's ordering, which is every caller today — `addWindowPaths` still
+// sees one collapsed input Node, not a Pathlist to check; wiring a real value
+// is S2b-3b). Two credits fall out of it, mirroring
+// `addIncrementalSortPaths`'s own full-match/partial-match split
+// (incrementalsortpaths.go):
+//
+//   - a FULL match (`presortedCount >= numPartCols+numOrderCols`, and there is
+//     at least one sort key) charges no sort at all — `createWindowPlan`
+//     (createplansimple.go) stacks no Sort node in this case
+//     (`childDeliversSortKeys`), so there is nothing here to price;
+//   - a PARTIAL match reuses `costIncrementalSort`'s per-group formula, called
+//     with a ZERO input `Cost` rather than this input's real one: unlike
+//     `addIncrementalSortPaths`'s ORDERED-rel caller, where the returned Cost
+//     IS the candidate's whole price, `costWindow` still needs to add the
+//     input's real total on top of the sort afterward for the BLOCKING reason
+//     above, so the call here must return only the sort's OWN marginal
+//     work — exactly the role `costSortRunWithWidth` plays in the no-credit
+//     branch below, and exactly why passing the real input cost through
+//     `costIncrementalSort` here would double-count it.
 func costWindow(cp costParams, inputTotal, inputRows float64,
-	numPartCols, numOrderCols, numFuncs, inNcols int, inAvgVarBytes float64, inWidth int) Cost {
+	numPartCols, numOrderCols, numFuncs, inNcols int, inAvgVarBytes float64, inWidth int,
+	presortedCount int, presortedGroups float64) Cost {
 	tuples := inputRows
 	if tuples < 0 {
 		tuples = 0
 	}
-	sortRun := costSortRunWithWidth(cp, tuples, inNcols, inAvgVarBytes, -1, inWidth, "window")
+	var sortRun Cost
+	switch {
+	case presortedCount <= 0:
+		sortRun = costSortRunWithWidth(cp, tuples, inNcols, inAvgVarBytes, -1, inWidth, "window")
+	case numPartCols+numOrderCols > 0 && presortedCount >= numPartCols+numOrderCols:
+		sortRun = Cost{}
+	default:
+		sortRun = costIncrementalSort(cp, Cost{}, tuples, presortedGroups, inNcols, inAvgVarBytes, -1, inWidth)
+	}
 	// The sort consumes the input in full, so the input's TOTAL is the
-	// blocking node's startup floor; `costSortRun` prices only the sort's own
-	// work, split the same way it splits it for a `PathSort`.
+	// blocking node's startup floor; the sort term above prices only the
+	// sort's own work, split the same way it splits it for a `PathSort`.
 	startup := inputTotal + sortRun.Startup
 	total := startup + (sortRun.Total - sortRun.Startup)
 	total += cp.cpuOperatorCost * float64(numFuncs) * tuples
@@ -217,7 +248,11 @@ func costWindow(cp costParams, inputTotal, inputRows float64,
 //
 // No Sort is stacked between levels (the executor sorts internally, and
 // `costWindow` charges it), and therefore no presorted second candidate exists
-// — see the file header's fact 1.
+// — see the file header's fact 1. `costWindow`'s presorted credit
+// (M0141-S2b-3a) is always called with `presortedCount=0` here: `input` is
+// still the single collapsed Node `createWindowPaths` receives, with no
+// Pathlist to check for a shared ordering prefix — wiring that check is
+// S2b-3b, filed and gated on this landing.
 func addWindowPaths(winRel *RelOptInfo, seed *Path, windows []*WindowAgg, input Node, cp costParams) {
 	if len(windows) == 0 {
 		// No spec group, no candidate. `createWindowPaths` refuses this case
@@ -236,7 +271,8 @@ func addWindowPaths(winRel *RelOptInfo, seed *Path, windows []*WindowAgg, input 
 			DisabledNodes: below.DisabledNodes,
 			Cost: costWindow(cp, below.Cost.Total, below.Rows,
 				len(w.PartitionBy), len(w.OrderBy), len(w.Funcs),
-				len(cols), nodeAvgVarBytes(cols), nodeTupleWidth(belowNode)),
+				len(cols), nodeAvgVarBytes(cols), nodeTupleWidth(belowNode),
+				0, 0),
 			Children: []*Path{below},
 		}
 		below = p

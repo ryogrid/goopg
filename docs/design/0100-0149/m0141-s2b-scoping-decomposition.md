@@ -916,3 +916,62 @@ sub-tasks, none selected yet):
 
 No production code changed this loop (recon only, same precedent as
 S2b-0/S2b-2/S2b-6). Ledger row appended (task-id `m0141-s2b-3`).
+
+## S2b-3a landed (2026-09-17k) — presorted/partial-prefix credit, predicted inert, confirmed inert
+
+`costWindow` (`windowsetoppaths.go:194`) took two new parameters,
+`presortedCount int` and `presortedGroups float64`, and now branches three
+ways instead of unconditionally charging `costSortRunWithWidth`:
+
+- `presortedCount <= 0` — unchanged: the exact `costSortRunWithWidth` call
+  that existed before this landing. This is the ONLY branch any caller can
+  reach today (`addWindowPaths` always passes `(0, 0)` — see below), which is
+  what makes the "predicted byte-identical" gate provable rather than merely
+  hoped for.
+- `presortedCount >= numPartCols+numOrderCols` (full match, at least one sort
+  key) — charges **no sort term at all**. `createWindowPlan`
+  (`createplansimple.go:320`) stacks no `Sort` node in this case
+  (`childDeliversSortKeys`), so pricing one here would charge for a node that
+  will never exist.
+- otherwise (partial match) — reuses `costIncrementalSort`
+  (`incrementalsortpaths.go`), called with a **zero input `Cost`** rather than
+  the real one. This is the one deviation from a verbatim port the recon
+  above flagged: `addIncrementalSortPaths`'s own call site feeds
+  `costIncrementalSort` the real candidate cost because its return value
+  becomes the WHOLE path's price on the ORDERED rel. `costWindow` still adds
+  `inputTotal` on top of whatever the sort term returns (the file's
+  established "blocking node" shape — see the surrounding doc comment), so
+  passing the real input cost through `costIncrementalSort` here would count
+  it twice. Zeroing it isolates exactly the sort-only marginal cost, the same
+  role `costSortRunWithWidth` already plays in the no-credit branch.
+
+**Non-obvious direction check, caught by writing the test rather than assumed
+from the formula's name**: more `presortedGroups` is CHEAPER, not more
+expensive — `costIncrementalSort`'s `groupTuples = inputTuples / inputGroups`
+means more groups shrinks the per-group sort exponentially in the `log2`
+term, and `2*cpuTupleCost*(groups-1)` reset overhead never catches up at
+realistic row counts. A first draft of
+`TestCostWindowPartialPresortedMatchIsCheaperThanFullSort` asserted the
+opposite direction and failed against the real numbers
+(`fewGroups=660889 > manyGroups=494812` at 5e6 rows) — corrected before
+landing, not after.
+
+`addWindowPaths` (`windowsetoppaths.go:221`) passes `(0, 0)` for the two new
+parameters — `input` is still the single collapsed Node `createWindowPaths`
+receives (S2b-3b's job is the Pathlist wiring that would let a real value
+reach here), so this landing is mechanically incapable of moving a plan.
+Three new unit tests pin the three branches directly
+(`TestCostWindowPresortedCreditIsInertAtZero`,
+`TestCostWindowFullPresortedMatchChargesNoSort`,
+`TestCostWindowPartialPresortedMatchIsCheaperThanFullSort`), and the
+predicted null result was also confirmed at the corpus level: TPC-DS SF0.25
+sweep after this change reports `PLAN-SHAPE: queries=99 same=99 changed=0`
+against the pre-change capture, and `tpch-spotcheck.sh` remains SKIPPED
+(pre-existing M0142-0003k data-reload blocker, unrelated to this change —
+confirmed unrelated by reproducing the same SKIP with this change's two files
+stashed out).
+
+**Next**: **S2b-3b** (`searchedRelOf`/`SearchCandidates`/`SearchCandidateKeys`
+wiring into `createWindowPaths`/`addWindowPaths`) is now unblocked — it is the
+piece that gives this credit an actual caller with `presortedCount > 0`, and
+TPC-DS Q67 remains the sole corpus witness and gate for the pair.
