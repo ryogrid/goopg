@@ -3250,6 +3250,15 @@ func describePlanMode(n optimizer.Node, nm *explainNames, verbose bool) string {
 		return "Filter"
 	case *optimizer.Sort:
 		return "Sort"
+	case *optimizer.IncrementalSort:
+		// M0141-S7-exec-a: label only (matches Sort's own arm). The node
+		// has zero createPlanNode/Plan() callers today (M0141-S7-exec-b
+		// wires that), so this arm cannot fire in production yet — it
+		// exists solely to satisfy TestEveryPlanNodeTypeHasAnExplainArm,
+		// which enumerates by Go type regardless of reachability. The
+		// `Presorted Key:` detail line (PG's nodeIncrementalSort.c /
+		// explain.c) is exec-c's own remaining scope, not added here.
+		return "Incremental Sort"
 	case *optimizer.Limit:
 		return "Limit"
 	case *optimizer.Result:
@@ -3804,6 +3813,11 @@ func planChildren(n optimizer.Node) []optimizer.Node {
 	case *optimizer.Filter:
 		return []optimizer.Node{p.Child}
 	case *optimizer.Sort:
+		return []optimizer.Node{p.Child}
+	case *optimizer.IncrementalSort:
+		// M0141-S7-exec-a: mirrors Sort's own arm, added to satisfy
+		// TestEveryPlanNodeWithChildrenIsWalked (unreachable in production
+		// until M0141-S7-exec-b wires createPlanNode).
 		return []optimizer.Node{p.Child}
 	case *optimizer.Limit:
 		return []optimizer.Node{p.Child}

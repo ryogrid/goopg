@@ -2793,7 +2793,7 @@ spill route is net-negative.
   Full writeup: design doc's 2026-09-17d update. **Row 5 split into four
   loop-sized sub-tasks, filed below**; this task (M0141-S7) itself stays
   unchecked — implementation, not just scope, is still the resume point.
-  - [ ] **M0141-S7-exec-a — `IncrementalSort` optimizer Node type + the
+  - [x] **M0141-S7-exec-a — `IncrementalSort` optimizer Node type + the
     executor operator**, built and unit-tested STANDALONE (constructed
     directly in tests, zero `createPlanNode`/`Plan()` callers — same
     posture `pathkeysCountContainedIn`/`costIncrementalSort` used). Groups
@@ -2805,6 +2805,24 @@ spill route is net-negative.
     enough to prove the algorithm and matches
     `nodeIncrementalSort.c`'s own per-group re-tuplesort shape. No
     dependency on exec-b/c — implement first.
+    **LANDED 2026-09-17e**: `internal/optimizer/incrementalsort.go` (Node
+    type, mirrors `Sort` + `PresortedCount`) and
+    `internal/executor/operators_incremental_sort.go` (`incrementalSortOp`,
+    pull-based Open/Next/Close, order-equivalence-tested against `sortOp`
+    as oracle, 5 executor tests + 1 optimizer test). **Unplanned but
+    required**: adding the bare Node type tripped
+    `TestEveryPlanNodeTypeHasAnExplainArm`/`TestEveryPlanNodeWithChildrenIsWalked`
+    (`explain_node_coverage_test.go` — enumerate by type existence, not
+    reachability), fixed by adding 2 of exec-c's 6 planned
+    `operators_explain.go` arms now (`describePlanMode` label,
+    `planChildren` walk — both mirror `Sort`'s own arm exactly); **exec-c's
+    scope below is narrowed accordingly**. Gates: `go build ./...` clean;
+    `go test ./internal/optimizer/... ./internal/executor/...` green;
+    `RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh` — only
+    failure is the pre-existing, tracked `internal/parser` AST-drift issue
+    (untouched by this change); `tpch-spotcheck.sh` SKIPPED (bench schema
+    not loaded, pre-existing, moot — zero production callers so no plan can
+    change). Full writeup: design doc's "Update 2026-09-17e" section.
   - [ ] **M0141-S7-exec-b — end-to-end structural + semantic reachability**:
     `createplansimple.go`'s `createPlanNode` arm (replaces the `default`
     panic for `PathIncrementalSort`), BOTH `executor.go` builder sites
@@ -2813,12 +2831,24 @@ spill route is net-negative.
     `operators_cte_dml.go`). **This is the correctness gate**: must land in
     full before `GOOPG_INCREMENTAL_SORT=on` is ever pointed at the corpus —
     a missing `scan_deform.go` arm silently drops a needed column, it does
-    not panic. Needs exec-a.
-  - [ ] **M0141-S7-exec-c — EXPLAIN rendering**: the 5 trivial
-    `operators_explain.go` arms, the node-label switch's `"Incremental
-    Sort"` string (already reserved, `estimateaudit/parity_test.go:58`),
-    and the one real one — extend the `Sort Key:` rendering site
-    (`:1195`) with PG's `Presorted Key:` line. Needs exec-b (nothing to
+    not panic. Needs exec-a (**landed 2026-09-17e**). **Sizing note found
+    while landing exec-a**: `addIncrementalSortPaths`
+    (`incrementalsortpaths.go`) computes `nCommon` (the presorted-prefix
+    count) locally but does not stash it on the `*Path` it builds —
+    `createPlanNode` will need either a new `Path` field to carry it
+    through, or a re-derivation via `pathkeysCountContainedIn` against the
+    winning candidate's own claimed ordering at `createPlanNode` time;
+    decide which is cheaper before starting.
+  - [ ] **M0141-S7-exec-c — EXPLAIN rendering**. **NARROWED 2026-09-17e**:
+    2 of the original 6 `operators_explain.go` sites (`describePlanMode`'s
+    label, `planChildren`'s walk) already landed as part of exec-a (they
+    were hard-gated by coverage tests regardless of reachability — see
+    exec-a's own update above). Remaining scope: 3 safe-to-decline sites
+    (`resolveKeySource`, `childNodeOf`, `execParamOwnerChildren` — none
+    gated by a test, correct to leave declining until a real node can
+    reach them) and the one real item — extend the `Sort Key:` rendering
+    site (`emitNodeDetailLines`, `:1195`) with PG's `Presorted Key:` line
+    (`nodeIncrementalSort.c`/`explain.c` oracle). Needs exec-b (nothing to
     render before a real node reaches EXPLAIN).
   - [ ] **M0141-S7-exec-d (deferred, ledger row filed 2026-09-17)** —
     `sortOp` feature parity once exec-a/b/c land and the corpus is
