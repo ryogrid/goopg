@@ -29,7 +29,15 @@ PG_PREFIX="${REPO_ROOT}/postgres/local_install"
 export PATH="${PG_PREFIX}/bin:${PATH}"
 export LD_LIBRARY_PATH="${PG_PREFIX}/lib:${LD_LIBRARY_PATH:-}"
 
-# goopg bench binary (shared with the TPC-H bench; rebuilt by server.sh start).
+# goopg TPC-DS bench binary (rebuilt by server.sh start).
+#
+# 2026-09-17: default moved off the shared tmp/goopg-bench-bin to the
+# TPC-DS-private tmp/goopg-tpcds-bin. Rebuilding tmp/goopg-bench-bin under the
+# live :65433 TPC-H reference server left its exe "(deleted)"; :65433 now
+# serves from the pinned bench/tpch/runtime_goopg/goopg-bin, the nightly TPC-DS
+# stage from tmp/goopg-nightly-tpcds-bin, and the sf025 gate from
+# tmp/goopg-sf025-bin. server.sh additionally refuses to rebuild a path that
+# any other live process is executing.
 #
 # Env-overridable for the same reason the results dirs below are (2026-07-30):
 # this ONE path is shared with the nightly CI batch's clone lanes, which both
@@ -37,7 +45,7 @@ export LD_LIBRARY_PATH="${PG_PREFIX}/lib:${LD_LIBRARY_PATH:-}"
 # A loop that needs a binary at its own HEAD while the nightly holds the host
 # must be able to build somewhere private instead of clobbering the nightly's
 # binary mid-run — `GOOPG_BIN=tmp/goopg-sf025-bin scripts/tpcds-sf025-regression.sh …`.
-GOOPG_BIN="${GOOPG_BIN:-${REPO_ROOT}/tmp/goopg-bench-bin}"
+GOOPG_BIN="${GOOPG_BIN:-${REPO_ROOT}/tmp/goopg-tpcds-bin}"
 
 # --- Directories -----------------------------------------------------------
 TPCDS_RUNTIME_DIR="${TPCDS_BENCH_DIR}/runtime_goopg"

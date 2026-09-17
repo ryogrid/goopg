@@ -41,6 +41,25 @@ source "${BATCH_DIR}/lib/common.sh"
 
 want() { [[ ",${NIGHTLY_STAGES}," == *",$1,"* ]]; }
 
+# --- clean build source (METHODLOGY3 04-actions H1(d)) ---------------------------
+# The Go builds used to compile the LIVE checkout, so a concurrent loop's
+# uncommitted WIP leaked into the nightly's binaries. Build from a detached
+# worktree at HEAD instead. Only the Go builds use it (stages read
+# NIGHTLY_SRC_ROOT); scripts, data dirs, ports and logs stay under REPO_ROOT,
+# and ./postgres (a submodule, not populated in a worktree) is never needed by
+# `go build`. go-test stages (units/race/testport) still run in REPO_ROOT.
+NIGHTLY_SRC_ROOT="${REPO_ROOT}/tmp/nightly-src-${RUN_ID}"
+remove_src_worktree() {
+    [[ -d "${NIGHTLY_SRC_ROOT}" ]] || return 0
+    git -C "${REPO_ROOT}" worktree remove --force "${NIGHTLY_SRC_ROOT}" >/dev/null 2>&1 || true
+}
+if ! git -C "${REPO_ROOT}" worktree add --detach "${NIGHTLY_SRC_ROOT}" HEAD \
+        > "${RUN_DIR}/src-worktree.log" 2>&1; then
+    progress "RUN" "ABORT: cannot create clean build worktree ${NIGHTLY_SRC_ROOT} — see src-worktree.log (refusing to build from the live tree)"
+    exit 4
+fi
+export NIGHTLY_SRC_ROOT
+
 # --- meta.json ----------------------------------------------------------------
 sha="$(git -C "${REPO_ROOT}" rev-parse HEAD 2>/dev/null || echo unknown)"
 dirty="$(git -C "${REPO_ROOT}" status --porcelain 2>/dev/null | wc -l | tr -d ' ')"
@@ -93,6 +112,7 @@ kill_tree() {
 
 abort_cleanup() {
     local rc=$?
+    remove_src_worktree
     if [[ ${COMPLETED} -eq 0 ]]; then
         progress "RUN" "ABORTED (rc=${rc}) — killing lanes/stages and stopping nightly scopes"
         # Kill the lane subshells and any in-flight stage FIRST — otherwise a

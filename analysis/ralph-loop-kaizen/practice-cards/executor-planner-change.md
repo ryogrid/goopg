@@ -18,9 +18,9 @@ scripts/tpch-spotcheck.sh
 
 It does the fresh server restart + Q12/Q13 row-count spot-check for you
 (memory-capped start, canonical counts from `bench/tpch/spotcheck_expected.env`,
-exit 1 on mismatch). On machines without the TPC-H data dir it prints
-SKIPPED and exits 0 — in that case fall back to the manual steps below
-where data exists.
+exit 1 on mismatch). With no TPC-H data dir at all it prints SKIPPED and
+exits 0; if the data dir exists but the data is missing it exits 3
+(SKIP-BLOCKED), which is a failed gate, not a pass.
 
 1. **Fresh server restart** — stale state hides regressions.
 2. **Q12 / Q13 row-count spot-check** — these are the canonical silent-regression

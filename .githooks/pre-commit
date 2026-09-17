@@ -28,14 +28,47 @@
 # docs-only machine), never for the development loop.
 set -euo pipefail
 
-if [ "${GOOPG_SKIP_PRECOMMIT:-0}" = "1" ]; then
-  echo "pre-commit: GOOPG_SKIP_PRECOMMIT=1 — skipping pgbench smoke gate" >&2
-  exit 0
-fi
-
 # Resolve the repo root from the hook location so the gate runs regardless of
 # the subdirectory git invoked the hook from.
 ROOT="$(git rev-parse --show-toplevel)"
+
+if [ "${GOOPG_SKIP_PRECOMMIT:-0}" = "1" ]; then
+  # Every skip leaves an audit line (METHODLOGY3 H5): the escape hatch is for
+  # hosts that cannot run the smoke, and its use must be reviewable.
+  mkdir -p "$ROOT/ci/logs"
+  printf '%s %s RALPH_LOOP=%s user=%s\n' \
+    "$(date -Iseconds)" \
+    "$(git rev-parse --verify -q HEAD || echo no-HEAD)" \
+    "${RALPH_LOOP:-}" \
+    "$(git config user.name || echo unknown)" \
+    >>"$ROOT/ci/logs/precommit-skips.log" || true
+  echo "pre-commit: GOOPG_SKIP_PRECOMMIT=1 — skipping pgbench smoke gate (logged to ci/logs/precommit-skips.log)" >&2
+  exit 0
+fi
+
+# Ralph-loop-only guards (RALPH_LOOP=1 is exported by the loop driver; human
+# commits are unaffected). METHODLOGY3 H3/H4:
+#   - no edits to CLAUDE.md, the fix_plan '## Current Priority' banner, or the
+#     AGENT.md PLAN-PARITY-HARNESS section (region text of HEAD vs index),
+#     nor to the harness mechanism files (guards, .githooks, settings.json,
+#     .ralph/PROMPT.md, ref-cluster / gate-stamp plumbing);
+#   - .ralph/deferral_ledger.md is append-only and owner rows stay owner rows;
+#   - fix_plan lineage budget / Parent: / FROZEN rules.
+if [ "${RALPH_LOOP:-}" = "1" ]; then
+  cd "$ROOT"
+  if ! python3 "$ROOT/scripts/ralph_protected_regions.py" check-staged; then
+    echo "pre-commit: REJECTED (RALPH_LOOP=1 protected-region guard)" >&2
+    exit 1
+  fi
+  if ! python3 "$ROOT/scripts/ralph_protected_regions.py" check-ledger; then
+    echo "pre-commit: REJECTED (RALPH_LOOP=1 deferral-ledger append-only guard)" >&2
+    exit 1
+  fi
+  if ! python3 "$ROOT/scripts/ralph-lineage-guard.py" --staged; then
+    echo "pre-commit: REJECTED (RALPH_LOOP=1 fix_plan lineage guard) — see messages above" >&2
+    exit 1
+  fi
+fi
 
 echo "pre-commit: running CI-parity pgbench smoke (RALPH_PRECOMMIT_SCOPE=smoke)..."
 RALPH_PRECOMMIT_SCOPE=smoke "$ROOT/scripts/ralph-precommit-test.sh"

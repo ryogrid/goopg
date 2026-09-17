@@ -52,6 +52,24 @@
 #                                   clone's `cp -a` FALLBACK path only; the default
 #                                   online pg_basebackup path never waits (default 60)
 #   TPCH_CLONE_MODE                 auto|online|copy — scripts/lib/tpch-private-clone.sh
+#   ACCEPT_BASELINE  path to a BASELINE arm file (a previous full -digest run of
+#              this script, e.g. the OFF arm or HEAD~ arm). When set, after the
+#              arm is written it is compared on VALUES with
+#              `tpch-acceptance-runner -diff ACCEPT_BASELINE OUT`; a non-MATCH
+#              fails the arm (exit 1). Without it the arm is written but the
+#              stamp is NO-COMPARE, never PASS.
+#
+# Exit codes: 0 arm written (and, with ACCEPT_BASELINE, value-identical to the
+# baseline); 1 runner failure or baseline compare FAILED; 3 refused/blocked
+# (foreign server on the private port, no loaded source cluster, source under
+# HOLD, nightly running, clone failed); 4 build failed; 5 server not ready;
+# other non-zero = failure. Every exit writes
+# tmp/gate-stamps/tpch-acceptance-arm.json (scripts/lib/gate-stamp.sh):
+#   PASS         only for a FULL run (no QUERIES subset, digest on, no extra
+#                -queries arg) whose runner exited 0 AND whose -diff against
+#                ACCEPT_BASELINE reported VERDICT: PASS;
+#   NO-COMPARE   exit 0 otherwise (subset probe, no baseline, digest off);
+#   SKIP-BLOCKED exit 3; FAIL anything else.
 #
 set -uo pipefail
 
@@ -61,6 +79,24 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 source "${REPO_ROOT}/scripts/lib/bench-engine-id.sh"
 # shellcheck source=lib/tpch-private-clone.sh
 source "${REPO_ROOT}/scripts/lib/tpch-private-clone.sh"
+# shellcheck source=lib/gate-stamp.sh
+source "${REPO_ROOT}/scripts/lib/gate-stamp.sh"
+ARM_CLEANUP_ARMED=0
+ARM_STAMP_BIN=""   # set once the image this arm measures is known
+ARM_COMPARED=0     # 1 only after a full-run -diff vs ACCEPT_BASELINE reported PASS
+ARM_NOCOMPARE_REASON="arm exited before the baseline compare"
+_arm_on_exit() {
+    local rc=$? res
+    if [[ "${ARM_CLEANUP_ARMED}" == "1" ]]; then cleanup; fi
+    res="$(gate_stamp_result_for_rc "${rc}" 3)"
+    if [[ "${res}" == "PASS" && "${ARM_COMPARED}" != "1" ]]; then
+        res="NO-COMPARE"
+        export GATE_STAMP_REASON="${ARM_NOCOMPARE_REASON}"
+    fi
+    gate_stamp_write tpch-acceptance-arm "${res}" "${ARM_STAMP_BIN}"
+    exit "${rc}"
+}
+trap _arm_on_exit EXIT
 
 ARM="${1:?usage: $0 <arm-name> <out-file> [runner-args...]}"
 OUT="${2:?usage: $0 <arm-name> <out-file> [runner-args...]}"
@@ -108,7 +144,13 @@ if pg_isready -h "${PG_HOST}" -p "${PG_PORT}" -q 2>/dev/null; then
     echo "something is already listening on ${PG_HOST}:${PG_PORT} (this arm's private port) — stop it first (${GOOPG_BIN} stop -D ${PGDATA})" >&2
     exit 3
 fi
+tpch_clone_source_held "${SRC_DATA}" && exit 3
+tpch_clone_dst_refused "${PGDATA}" && exit 3
 [[ -s "${SRC_DATA}/PG_VERSION" ]] || { echo "no loaded TPC-H cluster at ${SRC_DATA}" >&2; exit 3; }
+if [[ -n "${ACCEPT_BASELINE:-}" && ! -s "${ACCEPT_BASELINE}" ]]; then
+    echo "ACCEPT_BASELINE=${ACCEPT_BASELINE} is missing or empty" >&2
+    exit 2
+fi
 # The bracket around the first character keeps this pattern from matching the
 # guard's OWN command line — a bare `pgrep -f ci/batch/run-nightly.sh` self-
 # matches and refuses on a quiet host (observed at P5.9 run 2). Same class as
@@ -124,6 +166,7 @@ if [[ "${NO_BUILD:-0}" != "1" ]]; then
     ( cd "${REPO_ROOT}" && go build -o "${GOOPG_BIN}" ./cmd/goopg ) || exit 4
     ( cd "${REPO_ROOT}" && go build -o "${RUNNER_BIN}" ./cmd/tpch-runner ) || exit 4
 fi
+ARM_STAMP_BIN="${GOOPG_BIN}"
 
 # Stop any stale instance left on the PRIVATE clone by a previous crashed
 # run, then snapshot-clone the shared cluster into it (M0137-0007) — the
@@ -150,7 +193,7 @@ cleanup() {
     systemctl --user stop "${CG_UNIT}.scope" >/dev/null 2>&1 || true
     systemctl --user reset-failed "${CG_UNIT}.scope" >/dev/null 2>&1 || true
 }
-trap cleanup EXIT
+ARM_CLEANUP_ARMED=1   # _arm_on_exit (the EXIT trap) runs cleanup
 trap 'cleanup; exit 130' INT TERM
 
 ready=0
@@ -174,6 +217,40 @@ runner_args=(-host "${PG_HOST}" -port "${PG_PORT}" -db tpch -user tpch -password
     echo "# per-query cap ${PER_Q}s, serial, digest=${DIGEST}, queries=${QUERIES:-all}"
     echo "# host: load$(cut -d' ' -f1-3 /proc/loadavg)"
 } >"${OUT}"
-"${RUNNER_BIN}" "${runner_args[@]}" "$@" >>"${OUT}" 2>&1
-echo "# finished $(date -Is)" >>"${OUT}"
-echo "arm ${ARM} written: ${OUT} ($(wc -l <"${OUT}") lines)"
+runner_rc=0
+"${RUNNER_BIN}" "${runner_args[@]}" "$@" >>"${OUT}" 2>&1 || runner_rc=$?
+echo "# finished $(date -Is) runner-rc=${runner_rc}" >>"${OUT}"
+echo "arm ${ARM} written: ${OUT} ($(wc -l <"${OUT}") lines, runner rc=${runner_rc})"
+if (( runner_rc != 0 )); then
+    echo "arm ${ARM}: tpch-runner exited ${runner_rc} — FAIL" >&2
+    exit "${runner_rc}"
+fi
+
+# --- baseline value compare (the only route to a PASS stamp) ----------------
+full_run=1
+[[ -n "${QUERIES}" ]] && { full_run=0; ARM_NOCOMPARE_REASON="subset probe (QUERIES=${QUERIES})"; }
+for a in "$@"; do
+    case "${a}" in -queries|--queries|-queries=*|--queries=*)
+        full_run=0; ARM_NOCOMPARE_REASON="subset probe (-queries in runner args)" ;;
+    esac
+done
+[[ "${DIGEST}" == "1" ]] || { full_run=0; ARM_NOCOMPARE_REASON="DIGEST=${DIGEST}: no values to compare"; }
+if [[ "${full_run}" == "1" && -z "${ACCEPT_BASELINE:-}" ]]; then
+    ARM_NOCOMPARE_REASON="no ACCEPT_BASELINE given"
+fi
+if [[ "${full_run}" == "1" && -n "${ACCEPT_BASELINE:-}" ]]; then
+    diff_out="${OUT}.diff-vs-baseline.txt"
+    diff_rc=0
+    "${RUNNER_BIN}" -diff "${ACCEPT_BASELINE}" "${OUT}" >"${diff_out}" 2>&1 || diff_rc=$?
+    cat "${diff_out}"
+    if (( diff_rc == 0 )) && grep -q '^VERDICT: PASS' "${diff_out}"; then
+        ARM_COMPARED=1
+        echo "arm ${ARM}: values identical to baseline ${ACCEPT_BASELINE} — PASS"
+    else
+        echo "arm ${ARM}: baseline compare FAILED (rc=${diff_rc}) vs ${ACCEPT_BASELINE}; see ${diff_out}" >&2
+        exit 1
+    fi
+else
+    echo "arm ${ARM}: NO-COMPARE — ${ARM_NOCOMPARE_REASON} (stamp will not read PASS)"
+fi
+exit 0

@@ -98,6 +98,10 @@ bench/tpch/runtime_goopg/data/
 bench/tpch/runtime_goopg/*.pid
 bench/tpch/runtime_goopg/*.log
 bench/tpch/runtime_goopg/tmp/
+bench/tpch/runtime_goopg/preloss-clone-*/
+bench/tpch/runtime_goopg/evidence-*/
+bench/tpch/runtime_goopg/*.HOLD
+bench/tpch/runtime_goopg/goopg-bin
 
 # TPC-DS runtime artifacts (bench/tpcds/ — clusters, TSVs, results, logs).
 # The ONE tracked exception is the pinned SF0.5 row-count oracle, which lets

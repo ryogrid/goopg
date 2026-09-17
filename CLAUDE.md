@@ -34,31 +34,18 @@ Setup / start / stop procedures:
   per-DB catalog work, goopg persists `CREATE DATABASE`: the tables live in a
   durable `tpch` database and `tpch@tpch` works across restarts (verified on
   the 2026-07-27 rebuild), so `make plan-gate` works against a restarted
-  server too. **Caveat updated 2026-09-16 (M0142-0003k, narrowed):**
-  M0142-0003j found the live `:65433` cluster's `tpch` database emptied of
-  its entire TPC-H dataset and all constraints (replaced by 12 unrelated
-  scratch tables) across an unclean-shutdown crash-recovery restart.
-  M0142-0003k then reproduced an unclean shutdown three ways on a scoped
-  throwaway cluster — plain `kill -KILL`, `goopg stop -mode immediate`, and
-  (closest to the real incident) `kill -KILL` mid-flight during an
-  uncommitted, long-running `ALTER TABLE ADD CONSTRAINT` scan — and **all
-  three correctly preserved every row and correctly rolled back the
-  incomplete DDL**. Crash recovery itself is therefore no longer a live
-  suspect. The scratch-table names match literal `CREATE TABLE` SQL inside
-  `internal/testport/mergejoin_all_clauses_test.go` and
-  `internal/testport/lockrows_sort_ctid_test.go`, but those tests provably
-  use an isolated per-test cluster (`cluster.New` → `t.TempDir()` + an
-  ephemeral port), not `:65433` — so the leading explanation is that the
-  same SQL was run **manually** against the shared cluster during past
-  debugging of those two test cases, not that the automated test connected
-  here. The exact destructive event is still not pinned. Treat "persists
-  across restarts" as re-confirmed for the storage engine itself; the open
-  risk is process discipline (ad hoc DDL against a shared cluster), not
-  durability. TPC-H bench data still needs a reload before further
-  `-0003i`/`-0003f`/`-0003g`-dependent work — see M0142-0003k in
-  `.ralph/fix_plan.md` for the blocker (dropping the scratch tables and
-  reloading is a shared-resource write the session's auto-mode classifier
-  declined to run unattended; needs a human to run it or grant it). Two
+  server too. **`:65433` is under an EVIDENCE HOLD (2026-09-17).** Its `tpch`
+  dataset and constraints are gone (M0142-0003j); the orphaned heap files are
+  still on disk. Suspected cause: an uncommitted `ALTER TABLE` stamps catalog
+  rows with xmax and the catalog loader skips any row with xmax≠0 without
+  checking commit status, paired with M0143-0008 (ALTER not undone on
+  ROLLBACK) — see `tmp/METHODLOGY3_RALPH_CHECK0917/03-new-problems.md` §2.
+  The earlier "crash recovery is innocent, cause was manual DDL" note was wrong.
+  **Do not start, reload, `--reset`, or DROP tables on it** (marker
+  `bench/tpch/runtime_goopg/data.HOLD`). Recovery is owner-run:
+  `scripts/tpch-ref-recover.sh --i-am-owner --evidence-only` first, then the full
+  run after P0-E5; the only pre-loss copy is
+  `bench/tpch/runtime_goopg/preloss-clone-20260915` (also held). Two
   known quirks of the rebuilt layout: HammerDB's final
   ANALYZE step fails and `ANALYZE <table>` inside db `tpch` errors
   "relation does not exist" (per-DB scoping gap in the ANALYZE path — see
@@ -82,6 +69,11 @@ Row-count anchors are **load-dependent**: `bench/tpch/spotcheck_expected.env`
 load and must be re-pinned after any TPC-H reload; the TPC-DS SF0.25 oracle is
 re-captured only when the dataset or query files change.
 
+**Reference clusters (`:65432`, `:65433`, `:65438`) are read-only for the Ralph
+loop** — no DDL/DML/ANALYZE/stop/reset; writes go to a private `55xx` clone.
+A stopped one is restarted only via `scripts/ref-clusters-ensure.sh`. Rules:
+`AGENT.md` §"Plan-parity harness".
+
 ## Running a server manually
 
 Always through the cgroup memory cap (WSL2 OOM containment):
@@ -104,7 +96,8 @@ orphans, and materialize the victim set before `pg_terminate_backend`
   (unit/component suite). The git hook runs the pgbench smoke on EVERY commit —
   never `git commit --no-verify`.
 - Planner/executor changes additionally: `scripts/tpch-spotcheck.sh` (fresh
-  capped server + canonical Q12/Q13 row counts) and the TPC-DS SF0.25 gate.
+  capped server + canonical Q12/Q13 row counts; exit 3 = SKIP-BLOCKED, a
+  failure) and the TPC-DS SF0.25 gate.
 - **Never pass `-count=1` to a gate's `go test`** — it defeats the test-result
   cache (~5 min warm vs ~40 min cold). `-count=1` is for one-off probes only.
 

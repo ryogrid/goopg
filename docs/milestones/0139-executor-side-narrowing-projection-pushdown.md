@@ -1,15 +1,13 @@
 # Milestone 0139 — Executor-side narrowing (projection pushdown)
 
-**Status:** in-progress — S1/S2/S3 + 0004/0005/0006 complete (2026-09-15);
-**0007 (absorption) is now the milestone's live work**, replacing the rejected
-packed-retention option
+**Status:** in-progress — 9 done, 1 open, 0 blocked/frozen in `.ralph/fix_plan.md` (2026-09-17); order per the fix_plan banner
 **Filed:** 2026-09-14 (user directive answering
 `METHODOLOGY3/04-forward-plan.md` §1.1 Question 1 with **(a) build it**)
 **Priority placement:** third in the plan-parity group. Independent of M0140 —
 per the owner's **(c) = Go**, TPC-DS work proceeds whether or not this milestone
 is in flight. See the `## Current Priority` banner in `.ralph/fix_plan.md`.
 **Reference plan:** `.ralph/fix_plan.md` (M0139 section)
-**Harness:** `AGENT.md` §"Plan-parity harness — applies ONLY to M0137–M0143"
+**Harness:** `AGENT.md` §"Plan-parity harness (M0137–M0143)"
 **Prerequisites:** M0137 (the qual-placement census in M0137-0010 gates every
 slice here — narrowing a scan's output is precisely the class of change that
 silently drops a filter).

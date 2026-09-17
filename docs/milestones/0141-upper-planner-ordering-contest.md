@@ -1,15 +1,11 @@
 # Milestone 0141 — Upper-planner ordering contest
 
-**Status:** planned — **scoping-gated**
+**Status:** in-progress — 21 done, 12 open, 0 blocked/frozen in `.ralph/fix_plan.md` (2026-09-17); order per the fix_plan banner
 **Filed:** 2026-09-14 (user directive, from
 `METHODOLOGY3/04-forward-plan.md` Phase 1 Campaign B)
-**Priority placement:** **S0 has landed (2026-09-15), and the gate below is
-satisfied.** `M0141-S2a-fix` is now joint TOP PRIORITY for the whole group with
-`M0139-0007` — see the `## Current Priority` banner in `.ralph/fix_plan.md`. The
-sentence this line used to carry ("no implementation task exists until S0
-lands") is historical and no longer describes the milestone.
+**Priority placement:** set by the `## Current Priority` banner in `.ralph/fix_plan.md`.
 **Reference plan:** `.ralph/fix_plan.md` (M0141 section)
-**Harness:** `AGENT.md` §"Plan-parity harness — applies ONLY to M0137–M0143"
+**Harness:** `AGENT.md` §"Plan-parity harness (M0137–M0143)"
 **Prerequisites:** M0137; and **M0141-S0**, this milestone's own mandatory
 scoping recon.
 

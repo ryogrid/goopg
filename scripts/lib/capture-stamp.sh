@@ -123,3 +123,81 @@ capture_stamp_block() {
     printf '# engine-binary: %s\n' "$(_capture_stamp_binary_line "${datadir}")"
     printf '# stats-epoch: %s\n' "$(_capture_stamp_stats_epoch "${port}" "${db}" "${user}" "${tagbase}")"
 }
+
+# capture_resolve_engine <port> — which engine a capture targets (H6).
+# CAPTURE_ENGINE=goopg|pg wins when set. Otherwise the fixed CLAUDE.md port map
+# decides for the shared clusters (65432/65438 = PostgreSQL, 65433/65436/65437
+# = goopg); any other port is `unknown` (a private clone — set CAPTURE_ENGINE).
+capture_resolve_engine() {
+    local port="$1"
+    case "${CAPTURE_ENGINE:-}" in
+        goopg|pg) echo "${CAPTURE_ENGINE}"; return 0 ;;
+        "") ;;
+        *) echo "invalid"; return 0 ;;
+    esac
+    case "${port}" in
+        65432|65438) echo pg ;;
+        65433|65436|65437) echo goopg ;;
+        *) echo unknown ;;
+    esac
+}
+
+# capture_verify_serving_binary <script-name> <port> <datadir>
+# — METHODLOGY3 04-actions H6: refuse (return 1, message on stderr) to capture
+# goopg from a server whose identity cannot be verified. For goopg:
+#   * DATADIR is required (the 6th arg);
+#   * <datadir>/postmaster.pid must name a live pid whose listen line matches
+#     <port>;
+#   * /proc/<pid>/exe must not be "(deleted)" — the image was rebuilt under the
+#     running server, so it is no longer the file on disk anyone can name;
+#   * GOOPG_EXPECT_BIN_SHA256 is REQUIRED, and sha256(/proc/<pid>/exe) must
+#     equal it (a live, non-deleted exe can still be the wrong build).
+# PostgreSQL captures are not checked. An `unknown` engine (any non-reference
+# port with CAPTURE_ENGINE unset) is REFUSED: a private clone's engine must be
+# named explicitly (CAPTURE_ENGINE=goopg|pg), never guessed.
+capture_verify_serving_binary() {
+    local me="$1" port="$2" datadir="$3" engine pidfile pid exe sha
+    engine="$(capture_resolve_engine "${port}")"
+    case "${engine}" in
+        pg) return 0 ;;
+        invalid)
+            echo "${me}: CAPTURE_ENGINE='${CAPTURE_ENGINE}' — must be goopg or pg" >&2
+            return 1 ;;
+        unknown)
+            echo "${me}: engine for non-reference port ${port} is unknown — set CAPTURE_ENGINE=goopg|pg explicitly (H6: a goopg capture must verify its serving binary)" >&2
+            return 1 ;;
+    esac
+    if [[ -z "${datadir}" ]]; then
+        echo "${me}: goopg capture requires the server's datadir as the 6th arg (H6: serving-binary verification)" >&2
+        return 1
+    fi
+    pidfile="${datadir}/postmaster.pid"
+    pid="$(head -1 "${pidfile}" 2>/dev/null || true)"
+    if [[ ! "${pid}" =~ ^[0-9]+$ ]] || ! kill -0 "${pid}" 2>/dev/null; then
+        echo "${me}: no live postmaster under ${datadir} (pidfile pid='${pid}')" >&2
+        return 1
+    fi
+    if ! grep -qE "(^|:)${port}\$" "${pidfile}" 2>/dev/null; then
+        echo "${me}: ${pidfile} does not name port ${port} — datadir and port disagree" >&2
+        return 1
+    fi
+    exe="$(readlink "/proc/${pid}/exe" 2>/dev/null || true)"
+    if [[ -z "${exe}" ]]; then
+        echo "${me}: cannot read /proc/${pid}/exe" >&2
+        return 1
+    fi
+    if [[ "${exe}" == *" (deleted)" ]]; then
+        echo "${me}: serving binary of pid ${pid} is '${exe}' — rebuilt under the running server; restart it on a known binary before capturing" >&2
+        return 1
+    fi
+    if [[ -z "${GOOPG_EXPECT_BIN_SHA256:-}" ]]; then
+        echo "${me}: goopg capture requires GOOPG_EXPECT_BIN_SHA256=<sha256 of the binary you mean to measure> (serving pid ${pid}, ${exe})" >&2
+        return 1
+    fi
+    sha="$(sha256sum "/proc/${pid}/exe" 2>/dev/null | awk '{print $1}')"
+    if [[ "${sha}" != "${GOOPG_EXPECT_BIN_SHA256}" ]]; then
+        echo "${me}: serving binary sha256 ${sha:-unreadable} != GOOPG_EXPECT_BIN_SHA256 ${GOOPG_EXPECT_BIN_SHA256} (pid ${pid}, ${exe})" >&2
+        return 1
+    fi
+    return 0
+}

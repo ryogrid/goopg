@@ -90,6 +90,51 @@
 #   TPCH_CLONE_USER            replication-connection role    (PGUSER/postgres)
 #   TPCH_CLONE_BASEBACKUP_OPTS extra pg_basebackup flags               (empty)
 
+# ---------------------------------------------------------------------------
+# HOLD / evidence guards (2026-09-17, :65433 evidence hold)
+# ---------------------------------------------------------------------------
+# tpch_clone_source_held <src-data> — 0 (and a SKIP-BLOCKED message) when
+# <src-data>.HOLD exists. A held source is under evidence preservation: cloning
+# it is pointless (the cluster is known-broken) and the online path is not
+# read-only — every pg_basebackup forces a checkpoint that WRITES into the
+# evidence data dir. Callers map this to exit 3 (SKIP-BLOCKED).
+#
+# Single escape hatch: scripts/tpch-ref-recover.sh step 6 runs the spotcheck
+# against the freshly RESTORED cluster before it releases the HOLD, and sets
+# TPCH_CLONE_ALLOW_HELD_SOURCE=<that exact data dir>. Ignored under RALPH_LOOP=1.
+tpch_clone_source_held() {
+    local src="$1"
+    if [[ -e "${src}.HOLD" && -n "${TPCH_CLONE_ALLOW_HELD_SOURCE:-}" && "${RALPH_LOOP:-}" != "1" \
+          && "$(realpath -m "${TPCH_CLONE_ALLOW_HELD_SOURCE}")" == "$(realpath -m "${src}")" ]]; then
+        echo "tpch-private-clone: NOTE — ${src} is under HOLD but TPCH_CLONE_ALLOW_HELD_SOURCE names it (owner recovery verification); cloning" >&2
+        return 1
+    fi
+    if [[ -e "${src}.HOLD" ]]; then
+        echo "SKIP-BLOCKED: source cluster ${src} is under HOLD (${src}.HOLD: $(tr '\n' ' ' <"${src}.HOLD" 2>/dev/null | cut -c1-300)) — not cloning it (a clone would checkpoint into the evidence)" >&2
+        return 0
+    fi
+    return 1
+}
+
+# tpch_clone_dst_refused <dst-data> — 0 (and a message) when <dst-data> must
+# never be (re)written by a clone: <dst-data>.HOLD exists, or it resolves under
+# bench/tpch/runtime_goopg/preloss-clone-* (the preserved pre-loss clone every
+# clone path would otherwise `rm -rf` first).
+tpch_clone_dst_refused() {
+    local dst="$1" real
+    real="$(realpath -m "${dst}" 2>/dev/null || echo "${dst}")"
+    if [[ -e "${dst}.HOLD" || -e "${real}.HOLD" ]]; then
+        echo "tpch-private-clone: REFUSED — clone destination ${dst} is under HOLD (${real}.HOLD exists)" >&2
+        return 0
+    fi
+    case "${real}" in
+        */bench/tpch/runtime_goopg/preloss-clone-*)
+            echo "tpch-private-clone: REFUSED — clone destination ${real} is a preserved pre-loss clone (bench/tpch/runtime_goopg/preloss-clone-*)" >&2
+            return 0 ;;
+    esac
+    return 1
+}
+
 # tpch_wait_port_free <host> <port> <timeout-s> — poll pg_isready until it
 # reports the port has no answering server, or return 1 after <timeout-s>.
 # Independent re-implementation of ci/batch/lib/common.sh's wait_port_free
@@ -140,6 +185,7 @@ tpch_private_clone_online() {
     local tmo="${TPCH_CLONE_ONLINE_TIMEOUT:-900}"
     local extra="${TPCH_CLONE_BASEBACKUP_OPTS:-}"
 
+    tpch_clone_dst_refused "${dst}" && return 8
     command -v pg_basebackup >/dev/null 2>&1 || {
         echo "tpch-private-clone: pg_basebackup not on PATH — online clone unavailable (source bench/tpch/env_goopg.sh, which puts postgres/local_install/bin on PATH)" >&2
         return 6
@@ -182,6 +228,8 @@ tpch_private_clone_online() {
 tpch_private_clone_copy() {
     local src="$1" dst="$2" host="$3" src_port="$4" wait_timeout="${5:-60}"
     local attempt
+    tpch_clone_dst_refused "${dst}" && return 8
+    tpch_clone_source_held "${src}" && return 3
     for attempt in 1 2 3; do
         if ! tpch_wait_port_free "${host}" "${src_port}" "${wait_timeout}"; then
             echo "tpch-private-clone: ${host}:${src_port} still busy after ${wait_timeout}s — refusing to snapshot mid-write (attempt ${attempt}/3)" >&2
@@ -218,13 +266,17 @@ tpch_private_clone_copy() {
 # On success <dst-data> is a startable data dir with no stale postmaster.pid
 # and returns 0. On failure <dst-data> is left absent (never a half-written
 # copy) and a message goes to stderr:
-#   3 = <src-data> has no initialised cluster (missing PG_VERSION)
+#   3 = <src-data> has no initialised cluster (missing PG_VERSION), or
+#       <src-data>.HOLD exists (SKIP-BLOCKED — see tpch_clone_source_held)
 #   4 = `cp -a` itself failed (disk space?)
 #   5 = could not get an interference-free copy in 3 attempts
 #   6 = TPCH_CLONE_MODE=online but pg_basebackup is unavailable
 #   7 = TPCH_CLONE_MODE=online and pg_basebackup failed
+#   8 = <dst-data> refused (<dst-data>.HOLD, or a preloss-clone-* path)
 tpch_private_clone_snapshot() {
     local src="$1" dst="$2" host="$3" src_port="$4" wait_timeout="${5:-60}"
+    tpch_clone_dst_refused "${dst}" && return 8
+    tpch_clone_source_held "${src}" && return 3
     [[ -s "${src}/PG_VERSION" ]] || {
         echo "tpch-private-clone: no initialised cluster at ${src}" >&2
         return 3

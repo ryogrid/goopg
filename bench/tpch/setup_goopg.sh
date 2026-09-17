@@ -12,6 +12,13 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=env_goopg.sh
 source "${SCRIPT_DIR}/env_goopg.sh"
+# :65433 serves a pinned binary so other lanes rebuilding tmp/goopg-bench-bin
+# cannot turn its executable into "(deleted)" (0917 audit H1c).
+GOOPG_BIN="${TPCH_REF_BIN:-${REPO_ROOT}/bench/tpch/runtime_goopg/goopg-bin}"
+if [[ -e "${PGDATA}.HOLD" ]]; then
+    echo "REFUSED: ${PGDATA}.HOLD exists (evidence hold): $(head -1 "${PGDATA}.HOLD")" >&2
+    exit 3
+fi
 
 reset_data=0
 for arg in "$@"; do
@@ -23,9 +30,13 @@ done
 
 # Build the goopg binary so a clean checkout can run the bench
 # without a prior `go build`. Cached re-builds are cheap.
-echo "Building goopg → ${GOOPG_BIN}"
-mkdir -p "$(dirname "${GOOPG_BIN}")"
-( cd "${REPO_ROOT}" && go build -o "${GOOPG_BIN}" ./cmd/goopg )
+if "${GOOPG_BIN}" status -D "${PGDATA}" >/dev/null 2>&1; then
+    echo "Server running on ${PGDATA}; not rebuilding the binary it serves."
+else
+    echo "Building goopg → ${GOOPG_BIN}"
+    mkdir -p "$(dirname "${GOOPG_BIN}")"
+    ( cd "${REPO_ROOT}" && go build -o "${GOOPG_BIN}.new.$$" ./cmd/goopg && mv -f "${GOOPG_BIN}.new.$$" "${GOOPG_BIN}" )
+fi
 
 # Refuse silently if a goopg cluster is already running here.
 if [[ -f "${PGDATA}/postmaster.pid" ]]; then

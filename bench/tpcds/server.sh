@@ -47,9 +47,30 @@ goopg_stop() {
     systemctl --user reset-failed "${SCOPE}.scope" >/dev/null 2>&1 || true
 }
 
+# refuse_rebuild_of_served_binary <own-datadir> — die when GOOPG_BIN is the
+# pinned TPC-H reference binary, or when any live process OTHER than this
+# target's own postmaster executes it: `go build -o` replaces the file and
+# leaves that server's /proc/<pid>/exe "(deleted)".
+refuse_rebuild_of_served_binary() {
+    local own_data="$1" own_pid="" bin exe p
+    bin="$(realpath -m "${GOOPG_BIN}")"
+    [[ "${bin}" == "$(realpath -m "${REPO_ROOT}/bench/tpch/runtime_goopg/goopg-bin")" ]] \
+        && die "GOOPG_BIN=${GOOPG_BIN} is the pinned :65433 reference binary — never rebuilt here; use the default tmp/goopg-tpcds-bin"
+    own_pid="$(head -1 "${own_data}/postmaster.pid" 2>/dev/null || true)"
+    for p in /proc/[0-9]*; do
+        exe="$(readlink "${p}/exe" 2>/dev/null)" || continue
+        exe="${exe% (deleted)}"
+        [[ "${exe}" == "${bin}" ]] || continue
+        [[ "${p#/proc/}" == "${own_pid}" ]] && continue
+        die "GOOPG_BIN=${GOOPG_BIN} is being executed by pid ${p#/proc/} ($(tr '\0' ' ' <"${p}/cmdline" 2>/dev/null | cut -c1-160)) — rebuilding it would leave that server's exe (deleted); set GOOPG_BIN to a private path"
+    done
+    return 0
+}
+
 goopg_start() {
     goopg_target "$1"
     [[ -d "${DATA}" ]] || die "cluster missing: ${DATA} (see bench/tpcds/README.md for setup)"
+    refuse_rebuild_of_served_binary "${DATA}"
     ( cd "${REPO_ROOT}" && go build -o "${GOOPG_BIN}" ./cmd/goopg )
     # Residency guard (2026-09-06). goopg turns shared_buffers into pool slots
     # as shared_buffers/8 (cmd/goopg/main.go poolSlotsFromGUC), and a

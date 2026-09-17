@@ -34,6 +34,10 @@
 # variance alone.
 #
 # usage: capture-tpcds.sh <port> <db> <user> <outfile> <header> [datadir]
+#   env: CAPTURE_ENGINE=goopg|pg (inferred only for the 6543x reference ports;
+#        REQUIRED on any other port — exit 1 when unset),
+#        GOOPG_EXPECT_BIN_SHA256=<sha256> (REQUIRED for goopg; exit 1 when
+#        missing or on mismatch)
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -44,6 +48,12 @@ export PATH="${PG_BIN}:${PATH}"
 source "${SCRIPT_DIR}/lib/capture-stamp.sh"
 
 PORT="$1"; DB="$2"; USER="$3"; OUT="$4"; HDR="$5"; DATADIR="${6:-}"
+
+# H6 (METHODLOGY3 04-actions): verify the serving goopg binary BEFORE touching
+# $OUT — datadir required for goopg, "(deleted)" exe refused, and
+# GOOPG_EXPECT_BIN_SHA256 required and enforced. Engine from CAPTURE_ENGINE=goopg|pg
+# or the shared-cluster port map; see capture_verify_serving_binary.
+capture_verify_serving_binary "capture-tpcds.sh" "$PORT" "$DATADIR" || exit 1
 
 QDIR="${TPCDS_QUERY_DIR:-${REPO_ROOT}/bench/tpcds/runtime_goopg/tpcds-data/queries}"
 PIN=(-c "SET work_mem='64MB'" -c "SET max_parallel_workers_per_gather=4")

@@ -69,6 +69,11 @@ class CaptureIdempotentTest(unittest.TestCase):
         _write_executable(os.path.join(pg_bin, "psql"), STUB_PSQL)
         env = dict(os.environ)
         env["PG_BIN"] = pg_bin
+        # M12: a non-reference port now REQUIRES an explicit engine. These
+        # tests exercise the K18/stamp path, not serving-binary verification
+        # (CaptureServingBinaryVerifyTest covers that), so name the engine pg.
+        env["CAPTURE_ENGINE"] = "pg"
+        env.pop("GOOPG_EXPECT_BIN_SHA256", None)
         return env
 
     def _run_twice(self, script, extra_env, qdir_env):
@@ -164,6 +169,113 @@ class CaptureIdempotentTest(unittest.TestCase):
             return {"TPCDS_QUERY_DIR": qdir}
         self._run_twice("capture-tpcds.sh", {}, qdir_env)
         self._run_with_datadir("capture-tpcds.sh", {}, qdir_env)
+
+
+class CaptureServingBinaryVerifyTest(unittest.TestCase):
+    """H6 (METHODLOGY3 04-actions): a goopg capture must verify the serving
+    binary before writing anything — datadir required, a "(deleted)" exe is
+    refused, GOOPG_EXPECT_BIN_SHA256 is required and enforced, and a
+    non-reference port without CAPTURE_ENGINE is refused (M12)."""
+
+    PORT = "5599"
+
+    def _env(self, tmp, **extra):
+        pg_bin = os.path.join(tmp, "pg_bin")
+        os.makedirs(pg_bin, exist_ok=True)
+        _write_executable(os.path.join(pg_bin, "psql"), STUB_PSQL)
+        qdir = os.path.join(tmp, "tpcds-queries")
+        os.makedirs(qdir, exist_ok=True)
+        with open(os.path.join(qdir, "query1.sql"), "w") as fh:
+            fh.write("select 1;")
+        env = dict(os.environ)
+        env.pop("GOOPG_EXPECT_BIN_SHA256", None)
+        env.update({"PG_BIN": pg_bin, "TPCDS_QUERY_DIR": qdir,
+                    "CAPTURE_ENGINE": "goopg"})
+        env.update(extra)
+        return env
+
+    def _datadir(self, tmp, pid):
+        d = os.path.join(tmp, "data")
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "postmaster.pid"), "w") as fh:
+            fh.write("%d\n%s\n1\n127.0.0.1:%s\n" % (pid, d, self.PORT))
+        return d
+
+    def _run(self, env, tmp, datadir=None):
+        out = os.path.join(tmp, "out.txt")
+        args = [os.path.join(ROOT, "scripts", "capture-tpcds.sh"),
+                self.PORT, "db", "user", out, "h6-test"]
+        if datadir:
+            args.append(datadir)
+        proc = subprocess.run(args, env=env, capture_output=True, text=True)
+        return proc, out
+
+    def test_goopg_requires_datadir(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            proc, out = self._run(self._env(tmp), tmp)
+            self.assertEqual(proc.returncode, 1, proc.stderr)
+            self.assertIn("requires the server's datadir", proc.stderr)
+            self.assertFalse(os.path.exists(out), "refused capture must not write $OUT")
+
+    def test_goopg_live_binary_passes_and_sha_enforced(self):
+        import hashlib
+        with open("/proc/%d/exe" % os.getpid(), "rb") as fh:
+            good = hashlib.sha256(fh.read()).hexdigest()
+        with tempfile.TemporaryDirectory() as tmp:
+            d = self._datadir(tmp, os.getpid())
+            # M12: GOOPG_EXPECT_BIN_SHA256 is required for a goopg capture.
+            proc, out = self._run(self._env(tmp), tmp, d)
+            self.assertEqual(proc.returncode, 1, proc.stderr)
+            self.assertIn("requires GOOPG_EXPECT_BIN_SHA256", proc.stderr)
+            self.assertFalse(os.path.exists(out), "refused capture must not write $OUT")
+            proc, _ = self._run(self._env(tmp, GOOPG_EXPECT_BIN_SHA256=good), tmp, d)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            proc, _ = self._run(self._env(tmp, GOOPG_EXPECT_BIN_SHA256="0" * 64), tmp, d)
+            self.assertEqual(proc.returncode, 1, proc.stderr)
+            self.assertIn("GOOPG_EXPECT_BIN_SHA256", proc.stderr)
+
+    def test_goopg_port_mismatch_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = self._datadir(tmp, os.getpid())
+            env = self._env(tmp)
+            out = os.path.join(tmp, "out.txt")
+            proc = subprocess.run(
+                [os.path.join(ROOT, "scripts", "capture-tpcds.sh"),
+                 "5598", "db", "user", out, "h6-test", d],
+                env=env, capture_output=True, text=True)
+            self.assertEqual(proc.returncode, 1, proc.stderr)
+            self.assertIn("does not name port", proc.stderr)
+
+    def test_goopg_deleted_exe_refused(self):
+        import shutil
+        with tempfile.TemporaryDirectory() as tmp:
+            binpath = os.path.join(tmp, "fake-goopg")
+            shutil.copy2(shutil.which("sleep"), binpath)
+            child = subprocess.Popen([binpath, "30"])
+            try:
+                os.unlink(binpath)
+                d = self._datadir(tmp, child.pid)
+                proc, _ = self._run(self._env(tmp), tmp, d)
+                self.assertEqual(proc.returncode, 1, proc.stderr)
+                self.assertIn("(deleted)", proc.stderr)
+            finally:
+                child.kill()
+                child.wait()
+
+    def test_unknown_engine_on_private_port_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env = self._env(tmp)
+            env.pop("CAPTURE_ENGINE", None)
+            d = self._datadir(tmp, os.getpid())
+            proc, out = self._run(env, tmp, d)
+            self.assertEqual(proc.returncode, 1, proc.stderr)
+            self.assertIn("set CAPTURE_ENGINE=goopg|pg explicitly", proc.stderr)
+            self.assertFalse(os.path.exists(out), "refused capture must not write $OUT")
+
+    def test_pg_engine_not_checked(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            proc, _ = self._run(self._env(tmp, CAPTURE_ENGINE="pg"), tmp)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
 
 
 if __name__ == "__main__":

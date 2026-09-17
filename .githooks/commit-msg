@@ -1,0 +1,155 @@
+#!/usr/bin/env bash
+#
+# commit-msg — Ralph-loop commit-message gates (METHODLOGY3 audit H5 / H11).
+#
+# Active ONLY when RALPH_LOOP=1 (exported by the loop driver). Human commits are
+# unaffected. Installed with the other hooks by `make install-hooks`.
+#
+# (i)  Gate stamps. A commit whose subject OR body names a task id M0137..M0143
+#      or P0-... and stages a non-test .go file under internal/ (excluding
+#      internal/testport/ and testdata) must carry, for the code being
+#      committed (`code_tree` = sha256 of `git ls-files -s -- internal cmd
+#      go.mod go.sum` over the index):
+#        tmp/gate-stamps/tpch-spotcheck.json  result PASS
+#        tmp/gate-stamps/tpcds-sf025.json     result PASS (PASS implies TIMEOUT=0)
+#          (SKIP-BLOCKED is accepted only with a body line starting `ledger:`)
+#        tmp/gate-stamps/tpch-acceptance-arm.json result PASS (only a full
+#          compare run writes PASS; SKIP-BLOCKED not accepted) — additionally
+#          required when a staged internal/ .go path matches cost|stat|selfuncs
+#          or lies under internal/executor/
+#      and a body line starting `CATEGORIES-EXCL-MATCH:` or `PARITY: N/A — `.
+# (ii) Area label (H11). A commit that stages no non-test file under internal/
+#      or cmd/ uses area docs|analysis|ralph|scripts|ci|bench|test; a commit
+#      that DOES stage one may not use area docs|analysis|ralph. A recon commit
+#      (area/scope contains `recon`, or the summary after `):`/`:` starts with
+#      `recon`) must not stage non-test internal/ or cmd/ files.
+#
+# Code identity: git sets GIT_INDEX_FILE for hooks, so inside commit-msg
+# `git ls-files -s` / `git diff --cached` see exactly the index being committed
+# (including the temporary index of `git commit -a` / `git commit -- <paths>`).
+# A partial-pathspec commit that leaves out a staged internal/ or cmd/ change
+# therefore has a different code_tree from the full index the gate ran on: run
+# the gates with the same code staged that you commit.
+set -euo pipefail
+
+[ "${RALPH_LOOP:-}" = "1" ] || exit 0
+
+MSG_FILE="$1"
+ROOT="$(git rev-parse --show-toplevel)"
+STAMPS="$ROOT/tmp/gate-stamps"
+
+# Message without git comment lines / scissors section.
+msg="$(sed -e '/^# ------------------------ >8 ------------------------$/,$d' -e '/^#/d' "$MSG_FILE")"
+subject="$(printf '%s\n' "$msg" | sed -n '/[^[:space:]]/{p;q;}')"
+body="$(printf '%s\n' "$msg" | awk 'f{print} /[^[:space:]]/ && !f{f=1}')"
+
+mapfile -t files < <(git diff --cached --name-only --diff-filter=ACMRD)
+
+is_test_path() { case "$1" in *_test.go|*/testdata/*) return 0 ;; esac; return 1; }
+
+prod_internal=0     # non-test file under internal/ or cmd/
+gated_go=0          # non-test .go under internal/ (not internal/testport/)
+arm_needed=0        # cost/stats/executor
+for f in "${files[@]}"; do
+  case "$f" in
+    internal/*|cmd/*) is_test_path "$f" || prod_internal=1 ;;
+  esac
+  case "$f" in
+    internal/testport/*) ;;
+    internal/*.go)
+      if ! is_test_path "$f"; then
+        gated_go=1
+        case "$f" in internal/executor/*) arm_needed=1 ;; esac
+      fi ;;
+  esac
+  case "$f" in
+    internal/*.go)
+      if ! is_test_path "$f"; then
+        case "$f" in *cost*|*stat*|*selfuncs*) arm_needed=1 ;; esac
+      fi ;;
+  esac
+done
+
+errors=()
+
+# ---------------------------------------------------------------- (ii) label
+area="${subject%%(*}"
+[ "$area" != "$subject" ] || area="${subject%%:*}"
+area="$(printf '%s' "$area" | tr -d '[:space:]')"
+# area(scope) prefix (up to the first ':') and the summary after it.
+prefix="${subject%%:*}"
+summary="${subject#*:}"
+if [ "$prefix" = "$subject" ]; then prefix=""; summary="$subject"; fi
+summary="${summary#"${summary%%[![:space:]]*}"}"
+is_recon=0
+if grep -qi 'recon' <<<"$prefix" || grep -qi '^recon' <<<"$summary"; then is_recon=1; fi
+if [ "$prod_internal" -eq 0 ] && [ "${#files[@]}" -gt 0 ]; then
+  case "$area" in
+    docs|analysis|ralph|scripts|ci|bench|test) ;;
+    *) errors+=("area label '$area' claims a code change, but no non-test file under internal/ or cmd/ is staged. Use docs(...), analysis(...), ralph(...), scripts(...), ci(...), bench(...) or test(...).") ;;
+  esac
+fi
+if [ "$prod_internal" -eq 1 ]; then
+  case "$area" in
+    docs|analysis|ralph)
+      errors+=("area label '$area' claims a docs/analysis/ralph change, but non-test files under internal/ or cmd/ are staged. Use the code area label, or unstage the production files into their own commit.") ;;
+  esac
+fi
+if [ "$prod_internal" -eq 1 ] && [ "$is_recon" -eq 1 ]; then
+  errors+=("a recon commit must not stage non-test files under internal/ or cmd/ (comments and env-gated traces included). Split the production change into its own task/commit, or drop 'recon' from the subject if this is an implementation.")
+fi
+
+# ---------------------------------------------------------------- (i) stamps
+if [ "$gated_go" -eq 1 ] && grep -Eq '(M01(3[7-9]|4[0-3])|P0-)' <<<"$msg"; then
+  # Must match scripts/lib/gate-stamp.sh's code_tree computation exactly.
+  tree="$(cd "$ROOT" && git ls-files -s -- internal cmd go.mod go.sum | sha256sum | cut -d' ' -f1)"
+  has_ledger=0
+  grep -q '^ledger:' <<<"$body" && has_ledger=1
+
+  stamp_field() { # <file> <key>
+    python3 -c 'import json,sys
+try: print(json.load(open(sys.argv[1])).get(sys.argv[2], ""))
+except Exception: print("")' "$1" "$2"
+  }
+  check_stamp() { # <gate> <allow-skip-blocked 0|1>
+    local gate="$1" allow_sb="$2" f s_tree s_res
+    f="$STAMPS/$gate.json"
+    if [ ! -f "$f" ]; then
+      errors+=("missing gate stamp tmp/gate-stamps/$gate.json. Run the $gate gate on exactly the staged content, then commit.")
+      return
+    fi
+    s_tree="$(stamp_field "$f" code_tree)"
+    s_res="$(stamp_field "$f" result)"
+    if [ "$s_tree" != "$tree" ]; then
+      errors+=("gate stamp $gate.json is for code_tree ${s_tree:-<none>}, but the committed internal/ cmd/ go.mod go.sum index hashes to $tree. Re-run $gate with the staged content (stage first, then run the gate, then commit the same index).")
+      return
+    fi
+    case "$s_res" in
+      PASS) ;;
+      SKIP-BLOCKED)
+        if [ "$allow_sb" -ne 1 ] || [ "$has_ledger" -ne 1 ]; then
+          errors+=("gate $gate result is SKIP-BLOCKED. A blocked gate is a failed gate unless the body carries a 'ledger:' line naming the ledger row for the blocker$([ "$allow_sb" -eq 1 ] || echo ' (not accepted for this gate)').")
+        fi ;;
+      *) errors+=("gate $gate result is '${s_res:-<none>}' for this tree (PASS required). Fix the failure; do not commit around it.") ;;
+    esac
+  }
+  check_stamp tpch-spotcheck 1
+  check_stamp tpcds-sf025 1
+  if [ "$arm_needed" -eq 1 ]; then
+    # SKIP-BLOCKED (+ ledger:) is accepted for the arm only while the owner hold on
+    # :65433 exists (P0-E5 must land before the owner restores the cluster).
+    check_stamp tpch-acceptance-arm "$([ -f "$ROOT/bench/tpch/runtime_goopg/data.HOLD" ] && echo 1 || echo 0)"
+  fi
+  if ! grep -Eq '^(CATEGORIES-EXCL-MATCH:|PARITY: N/A — )' <<<"$body"; then
+    errors+=("body needs a line starting 'CATEGORIES-EXCL-MATCH:' (before -> after parity categories) or 'PARITY: N/A — <reason>'.")
+  fi
+fi
+
+if [ "${#errors[@]}" -gt 0 ]; then
+  echo "commit-msg: REJECTED (RALPH_LOOP=1)" >&2
+  for e in "${errors[@]}"; do
+    echo "  - $e" >&2
+  done
+  exit 1
+fi
+exit 0

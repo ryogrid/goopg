@@ -62,7 +62,7 @@ trap cleanup EXIT
 trap 'exit 130' INT TERM   # route signals through the EXIT trap; never resume mid-flow
 
 rm -rf "${DATADIR}"
-( cd "${REPO_ROOT}" && go build -o bin/goopg ./cmd/goopg ) || { stage_status pgbench "fail(build)"; exit 1; }
+( cd "${NIGHTLY_SRC_ROOT:-${REPO_ROOT}}" && go build -o "${REPO_ROOT}/bin/goopg" ./cmd/goopg ) || { stage_status pgbench "fail(build)"; exit 1; }
 "${REPO_ROOT}/bin/goopg" init -D "${DATADIR}" >> "${SERVER_LOG}" 2>&1 || { stage_status pgbench "fail(init)"; exit 1; }
 
 # 8>&- : the detached server must NOT inherit the orchestrator's run-lock fd

@@ -58,6 +58,10 @@
 #              path never waits (M0137-0007, default 60)
 #   TPCH_CLONE_MODE  auto|online|copy — see scripts/lib/tpch-private-clone.sh
 #
+# Exit codes: 3 refused/blocked (incl. source under HOLD, refused clone dst),
+# 4 build failed, 5 server not ready, 6 the served /proc/<pid>/exe is not the
+# binary this script built (sha256 mismatch / deleted); otherwise the audit's rc.
+#
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -99,6 +103,10 @@ if pg_isready -h "${PG_HOST}" -p "${PG_PORT}" -q 2>/dev/null; then
     echo "something is already listening on ${PG_HOST}:${PG_PORT} (this arm's private port) — stop it first (${GOOPG_BIN} stop -D ${PGDATA})" >&2
     exit 3
 fi
+# Evidence hold: never clone a HOLDed source (SKIP-BLOCKED), never write a
+# HOLDed / preloss-clone-* destination (see scripts/lib/tpch-private-clone.sh).
+tpch_clone_source_held "${SRC_DATA}" && exit 3
+tpch_clone_dst_refused "${PGDATA}" && exit 3
 [[ -s "${SRC_DATA}/PG_VERSION" ]] || { echo "no loaded TPC-H cluster at ${SRC_DATA}" >&2; exit 3; }
 # Bracketed first character: a bare pattern self-matches this very shell.
 if pgrep -f "[c]i/batch/run-nightly.sh" >/dev/null 2>&1; then
@@ -129,6 +137,10 @@ systemctl --user reset-failed "${CG_UNIT}.scope" >/dev/null 2>&1 || true
 tpch_private_clone_snapshot "${SRC_DATA}" "${PGDATA}" "${PG_HOST}" "${SRC_PORT}" "${CLONE_WAIT}" \
     || { echo "could not snapshot the shared TPC-H cluster (see above)" >&2; exit 3; }
 
+# Serving-binary verification (M12): pin the sha of the image we are about to
+# start; after readiness the served /proc/<pid>/exe must hash to it.
+EXPECT_BIN_SHA="$(sha256sum "${GOOPG_BIN}" 2>/dev/null | awk '{print $1}')"
+[[ -n "${EXPECT_BIN_SHA}" ]] || { echo "FATAL: cannot hash ${GOOPG_BIN}" >&2; exit 4; }
 GOOPG_CG_UNIT="${CG_UNIT}" "${REPO_ROOT}/scripts/goopg-test-run.sh" \
     "${GOOPG_BIN}" start -D "${PGDATA}" --listen "${PG_HOST}:${PG_PORT}" \
     --hba "${PGDATA}/pg_hba.conf" >"${SRV_LOG}" 2>&1 &
@@ -150,6 +162,31 @@ for _ in $(seq 1 180); do
     sleep 1
 done
 [[ "${ready}" -eq 1 ]] || { echo "FATAL: audit ${LABEL} server not ready"; tail -20 "${SRV_LOG}"; exit 5; }
+
+# verify_served_binary — the server answering on PG_PORT must be the image we
+# built: postmaster.pid names a live pid listening on PG_PORT, its exe is not
+# "(deleted)", and sha256(/proc/<pid>/exe) == EXPECT_BIN_SHA. Fail otherwise.
+verify_served_binary() {
+    local pidf="${PGDATA}/postmaster.pid" pid exe sha
+    pid="$(head -1 "${pidf}" 2>/dev/null || true)"
+    if [[ ! "${pid}" =~ ^[0-9]+$ ]] || ! kill -0 "${pid}" 2>/dev/null; then
+        echo "FATAL: no live postmaster under ${PGDATA} (pid='${pid}')" >&2; return 1
+    fi
+    if ! grep -qE "(^|:)${PG_PORT}\$" "${pidf}" 2>/dev/null; then
+        echo "FATAL: ${pidf} does not name port ${PG_PORT}" >&2; return 1
+    fi
+    exe="$(readlink "/proc/${pid}/exe" 2>/dev/null || true)"
+    if [[ -z "${exe}" || "${exe}" == *" (deleted)" ]]; then
+        echo "FATAL: serving exe of pid ${pid} is '${exe:-unreadable}'" >&2; return 1
+    fi
+    sha="$(sha256sum "/proc/${pid}/exe" 2>/dev/null | awk '{print $1}')"
+    if [[ "${sha}" != "${EXPECT_BIN_SHA}" ]]; then
+        echo "FATAL: served binary sha256 ${sha:-unreadable} != built ${GOOPG_BIN} sha256 ${EXPECT_BIN_SHA} (pid ${pid}, ${exe})" >&2
+        return 1
+    fi
+    echo "# served binary verified: pid ${pid} ${exe} sha256 ${sha}"
+}
+verify_served_binary || exit 6
 
 audit_args=(-host "${PG_HOST}" -port "${PG_PORT}" --label "${LABEL}" --timeout "${PER_Q}")
 [[ -n "${REFERENCE}" ]] && audit_args+=(--reference "${REFERENCE}")

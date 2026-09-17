@@ -1,6 +1,6 @@
 # Milestone 0137 — Parity measurement harness and instrument repair
 
-**Status:** in-progress (13 of 18 tasks complete, 2026-09-15)
+**Status:** in-progress — 19 done, 2 open, 0 blocked/frozen in `.ralph/fix_plan.md` (2026-09-17); order per the fix_plan banner
 **Filed:** 2026-09-14 (user directive, from
 `docs/design/not_ralph/plan_parity_fix_take2/METHODOLOGY3/04-forward-plan.md`
 Phase 0)
@@ -10,7 +10,7 @@ Phase 0)
 unconditional *filing* obligation but no longer outranks this group for
 *selection*.
 **Reference plan:** `.ralph/fix_plan.md` (M0137 section)
-**Harness:** `AGENT.md` §"Plan-parity harness — applies ONLY to M0137–M0143"
+**Harness:** `AGENT.md` §"Plan-parity harness (M0137–M0143)"
 (binding; read it before selecting any task here)
 **Prerequisites:** none — this milestone is the prerequisite for the other six.
 

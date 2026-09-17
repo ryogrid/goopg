@@ -23,6 +23,9 @@ mkdir -p "${TPCDS_DIR}"
 # shellcheck source=/dev/null
 source "${REPO_ROOT}/bench/tpcds/env_tpcds.sh"
 set +e
+# Lane-private binary: never rebuild a path a reference/bench cluster serves
+# from (env_tpcds.sh's default belongs to bench/tpcds/server.sh's lanes).
+GOOPG_BIN="${NIGHTLY_TPCDS_BIN:-${REPO_ROOT}/tmp/goopg-nightly-tpcds-bin}"
 SRC_DATA="${TPCDS_PGDATA}"      # bench/tpcds/runtime_goopg/data
 SRC_PORT="${TPCDS_PORT}"        # 65436 — the TPC-DS SF=1 bench lane
 RUN_PORT="${NIGHTLY_TPCDS_PORT:-65435}"
@@ -91,7 +94,7 @@ rm -f "${RUN_DATA}/postmaster.pid"
 # --- build server --------------------------------------------------------------
 progress "S2b" "tpcds: building goopg"
 mkdir -p "$(dirname "${GOOPG_BIN}")"
-( cd "${REPO_ROOT}" && go build -o "${GOOPG_BIN}" ./cmd/goopg ) || { stage_status tpcds "fail(build)"; exit 1; }
+( cd "${NIGHTLY_SRC_ROOT:-${REPO_ROOT}}" && go build -o "${GOOPG_BIN}" ./cmd/goopg ) || { stage_status tpcds "fail(build)"; exit 1; }
 
 stop_scope "${CG_UNIT}"
 

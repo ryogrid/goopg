@@ -95,15 +95,34 @@
 #   SF025_NO_BUILD=1         keep the binary already at GOOPG_BIN instead of
 #                           rebuilding from the tree (bisect probes); the report
 #                           says its provenance is unknown — see sf025_ensure_bin
-#   GOOPG_BIN=<path>        build/run a private binary instead of the SHARED
-#                           tmp/goopg-bench-bin (which the nightly also owns)
+#   GOOPG_BIN=<path>        build/run this binary. Default is the lane-private
+#                           tmp/goopg-sf025-bin (METHODLOGY3 04-actions H1(c)):
+#                           the old default was the SHARED tmp/goopg-bench-bin,
+#                           and rebuilding it under the live :65433 server left
+#                           that server's /proc/<pid>/exe "(deleted)".
+#
+# Exit codes / gate stamp (H2/H5): `sweep` exits 0 PASS, 1 FAIL (correctness
+# failure or operational error), 3 SKIP-BLOCKED (the sweep compared ZERO
+# queries — e.g. every query TIMEOUT or SKIP — which is not a pass). A full
+# `sweep` (no QUERIES= subset) writes tmp/gate-stamps/tpcds-sf025.json on
+# every exit; other subcommands and subset probes write no stamp. The stamp
+# reads PASS only when MISMATCH=CKMISMATCH=ERROR=TIMEOUT=0 and the plan pin did
+# not fail; an otherwise-passing sweep with TIMEOUT>0 stamps FAIL-TIMEOUT (the
+# exit code stays 0 — timeouts remain non-fatal for the exit status).
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${REPO_ROOT}"
+# H1(c): lane-private binary by default. Set BEFORE sourcing env_tpcds.sh,
+# whose `${GOOPG_BIN:-tmp/goopg-tpcds-bin}` default then keeps it; an explicit
+# caller GOOPG_BIN still wins. (env_tpcds.sh's own default is now the
+# lane-private tmp/goopg-tpcds-bin; the nightly stage uses its own.)
+GOOPG_BIN="${GOOPG_BIN:-${REPO_ROOT}/tmp/goopg-sf025-bin}"
 # shellcheck source=/dev/null
 source "${REPO_ROOT}/bench/tpcds/env_tpcds.sh"
+# shellcheck source=lib/gate-stamp.sh
+source "${SCRIPT_DIR}/lib/gate-stamp.sh"
 # planner_flags_body — the generated provenance stamp (M0127-P5.9-q); see
 # sf025_planner_flags_line below.
 # shellcheck source=/dev/null
@@ -283,6 +302,9 @@ sf025_bin_sha_at_start=""        # on-disk image the sweep intended to measure
 sf025_report=""                  # cmd_sweep's report path (the restart guard appends)
 sf025_sweep_active=0             # 1 once the sweep loop owns the server
 sf025_plan_pin_failed=0          # 1 when SF025_PLAN_PIN=1 and the plan channel moved
+sf025_counts_final=0             # 1 once cmd_sweep has its final verdict counters
+sf025_final_bad=0                # MISMATCH+CKMISMATCH+ERROR of the finished sweep
+sf025_final_timeouts=0           # TIMEOUT count of the finished sweep
 
 sf025_ensure_bin() {
     local tree_sha dirty built="rebuilt from tree"
@@ -950,12 +972,22 @@ cmd_sweep() {
         sf025_plan_channel "$report"
     fi
     log "sweep report: ${report}"
+    sf025_final_bad=$((mismatch + ckmismatch + gerr))
+    sf025_final_timeouts=${gto}
+    sf025_counts_final=1
     # Gate semantics: correctness failures are fatal; timeouts are reported but
     # non-fatal (perf tracking, not a correctness gate). CKMISMATCH is a
     # correctness failure — the right number of wrong rows. Under
     # SF025_PLAN_PIN=1 a moved plan-shape pin is fatal too (set by
     # sf025_plan_channel); otherwise the plan channel stays informational.
-    [[ $((mismatch + ckmismatch + gerr + sf025_plan_pin_failed)) -eq 0 ]]
+    [[ $((mismatch + ckmismatch + gerr + sf025_plan_pin_failed)) -eq 0 ]] || return 1
+    # H2: a sweep that compared NOTHING (every query TIMEOUT/SKIP) used to
+    # exit 0. Zero comparisons is not a pass — exit 3 SKIP-BLOCKED.
+    if [[ "${pass}" -eq 0 ]]; then
+        echo "SKIP-BLOCKED: sweep compared 0 queries against the oracle (TIMEOUT=${gto} SKIP=${skip}) — NOT a pass" | tee -a "$report"
+        exit 3
+    fi
+    return 0
 }
 
 # cmd_delta [OLD [NEW]] — the status channel on its own, over reports that
@@ -990,7 +1022,27 @@ build-data)  cmd_build_data ;;
 load-pg)     cmd_load_pg ;;
 load-goopg)  cmd_load_goopg ;;
 oracle)      cmd_oracle ;;
-sweep)       cmd_sweep ;;
+sweep)
+    # Stamp only the FULL gate: a QUERIES= subset is a probe, not a gate result.
+    if [[ -z "${QUERIES:-}" ]]; then
+        sf025_stamp_on_exit() {
+            local rc=$? res
+            res="$(gate_stamp_result_for_rc "${rc}" 3)"
+            if [[ "${res}" == "PASS" ]]; then
+                if [[ "${sf025_counts_final}" != "1" ]]; then
+                    res=FAIL; export GATE_STAMP_REASON="sweep exited 0 without final verdict counters"
+                elif (( sf025_final_bad != 0 || sf025_plan_pin_failed != 0 )); then
+                    res=FAIL; export GATE_STAMP_REASON="bad=${sf025_final_bad} plan_pin_failed=${sf025_plan_pin_failed}"
+                elif (( sf025_final_timeouts > 0 )); then
+                    res=FAIL-TIMEOUT; export GATE_STAMP_REASON="TIMEOUT=${sf025_final_timeouts}"
+                fi
+            fi
+            gate_stamp_write tpcds-sf025 "${res}" "${sf025_bin_sha_at_start:+${GOOPG_BIN}}"
+            exit "${rc}"
+        }
+        trap sf025_stamp_on_exit EXIT
+    fi
+    cmd_sweep ;;
 plans)       cmd_plans ;;
 delta)       shift; cmd_delta "${1:-}" "${2:-}" ;;
 all)         cmd_build_data && cmd_load_pg && cmd_oracle && cmd_load_goopg && cmd_sweep ;;

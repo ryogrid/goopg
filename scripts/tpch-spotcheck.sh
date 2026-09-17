@@ -12,8 +12,13 @@
 #   scripts/tpch-spotcheck.sh
 #
 # Behaviour:
-#   - Exits 0 with a loud SKIPPED message when no populated TPC-H data dir
-#     exists (must not hard-block loops on machines without data).
+#   - Exits 0 with a loud SKIPPED message ONLY when this machine has no TPC-H
+#     cluster at all (no PG_VERSION under the source data dir) — must not
+#     hard-block loops on machines without data.
+#   - Exits 3 with `SKIP-BLOCKED: <reason>` when a cluster exists but the gate
+#     could not measure it (data dir too small, lineitem not loaded). That is
+#     NOT a pass: every caller must treat exit 3 as a failed gate
+#     (METHODLOGY3 04-actions H2).
 #   - Otherwise (M0137-0007, online path added in the M0139 follow-up):
 #     takes a snapshot clone of the shared bench cluster
 #     (bench/tpch/runtime_goopg/data, :65433) into a PRIVATE data dir — via
@@ -30,6 +35,9 @@
 #     readiness, runs Q12 + Q13 via cmd/tpch-runner, compares row counts
 #     against bench/tpch/spotcheck_expected.env, stops the server.
 #   - Exits 1 on any row-count mismatch or operational failure, 0 on PASS.
+#   - Every exit writes tmp/gate-stamps/tpch-spotcheck.json
+#     (scripts/lib/gate-stamp.sh): 0 -> PASS (SKIP for the no-cluster skip),
+#     3 -> SKIP-BLOCKED, anything else -> FAIL.
 #
 # Cost reporting (added by M0125-0005, the GOOPG_RELSIZE_FALLBACK default
 # flip): the gate is not only a correctness check — every future commit pays
@@ -100,23 +108,62 @@ QUERY_TIMEOUT="${TPCH_SPOTCHECK_TIMEOUT:-600s}"
 MIN_DATA_MB="${TPCH_SPOTCHECK_MIN_MB:-100}"
 CLONE_WAIT="${TPCH_SPOTCHECK_CLONE_WAIT:-60}"
 
+# Gate stamp (H5). Installed before any exit path. `cleanup` (defined once the
+# server is started) is chained from here rather than owning the EXIT trap, so
+# the stamp is written on every terminal exit, after the server is stopped.
+# shellcheck source=lib/gate-stamp.sh
+source "${SCRIPT_DIR}/lib/gate-stamp.sh"
+SPOT_SKIPPED=0
+SPOT_CLEANUP_ARMED=0
+SPOT_STAMP_BIN=""   # set once this run has built the binary it measures
+_spotcheck_on_exit() {
+    local rc=$?
+    if [[ "${SPOT_CLEANUP_ARMED}" == "1" ]]; then cleanup; fi
+    gate_stamp_write tpch-spotcheck \
+        "$(gate_stamp_result_for_rc "${rc}" 3 "${SPOT_SKIPPED}")" "${SPOT_STAMP_BIN}"
+    exit "${rc}"
+}
+trap _spotcheck_on_exit EXIT
+
+# skip — the ONLY exit-0 skip: this machine has no TPC-H cluster at all.
 skip() {
     echo "=================================================================="
     echo "tpch-spotcheck: SKIPPED (no TPC-H data dir — see bench/tpch/README.md to set up)"
     echo "tpch-spotcheck: reason: $*"
     echo "=================================================================="
+    SPOT_SKIPPED=1
     exit 0
 }
 
+# skip_blocked — a cluster exists but the gate could not measure it. Exit 3;
+# this is a FAILED gate for every rule that consumes it (H2).
+skip_blocked() {
+    echo "=================================================================="
+    echo "SKIP-BLOCKED: $*"
+    echo "tpch-spotcheck: RESULT=SKIP-BLOCKED (exit 3) — this is NOT a pass; do NOT commit on it"
+    echo "=================================================================="
+    exit 3
+}
+
 # ---------------------------------------------------------------------------
-# Prerequisite checks — SKIP (exit 0), never hard-fail, when data is absent.
+# Prerequisite checks — SKIP (exit 0) only when there is no cluster at all;
+# a present-but-unusable cluster is SKIP-BLOCKED (exit 3).
 # Checked against the SOURCE dir: the private clone does not exist yet.
 # ---------------------------------------------------------------------------
+# Evidence hold first: a HOLDed source is known-broken and each online clone
+# checkpoints into it — SKIP-BLOCKED (exit 3), never a clone.
+if tpch_clone_source_held "${SRC_DATA}"; then
+    skip_blocked "source cluster ${SRC_DATA} is under HOLD (${SRC_DATA}.HOLD) — not cloned; see scripts/tpch-ref-recover.sh"
+fi
+if tpch_clone_dst_refused "${PGDATA}"; then
+    echo "tpch-spotcheck: FATAL — private clone destination ${PGDATA} is refused (see above)" >&2
+    exit 1
+fi
 [[ -s "${SRC_DATA}/PG_VERSION" ]] || skip "no initialised cluster at ${SRC_DATA}"
 
 data_mb="$(du -sm "${SRC_DATA}" 2>/dev/null | awk '{print $1}')"
 if [[ -z "${data_mb}" ]] || (( data_mb < MIN_DATA_MB )); then
-    skip "data dir is only ${data_mb:-0} MB (< ${MIN_DATA_MB} MB) — TPC-H tables not loaded; run bench/tpch/setup_goopg.sh + build_schema_goopg.sh"
+    skip_blocked "data dir is only ${data_mb:-0} MB (< ${MIN_DATA_MB} MB) — TPC-H tables not loaded; run bench/tpch/setup_goopg.sh + build_schema_goopg.sh"
 fi
 
 if [[ ! -f "${EXPECTED_FILE}" ]]; then
@@ -135,6 +182,7 @@ echo "tpch-spotcheck: building goopg + tpch-runner"
 mkdir -p "$(dirname "${GOOPG_BIN}")"
 ( cd "${REPO_ROOT}" && go build -o "${GOOPG_BIN}" ./cmd/goopg )
 ( cd "${REPO_ROOT}" && go build -o "${RUNNER_BIN}" ./cmd/tpch-runner )
+SPOT_STAMP_BIN="${GOOPG_BIN}"
 
 # ---------------------------------------------------------------------------
 # Stop any stale instance left on THIS LANE's private clone (a previous
@@ -166,7 +214,12 @@ rm -f "${SPOT_PIDFILE}"
 # there.
 # ---------------------------------------------------------------------------
 echo "tpch-spotcheck: snapshot-cloning ${SRC_DATA} -> ${PGDATA} (${data_mb} MB)"
-if ! tpch_private_clone_snapshot "${SRC_DATA}" "${PGDATA}" "${PG_HOST}" "${SRC_PORT}" "${CLONE_WAIT}"; then
+clone_rc=0
+tpch_private_clone_snapshot "${SRC_DATA}" "${PGDATA}" "${PG_HOST}" "${SRC_PORT}" "${CLONE_WAIT}" || clone_rc=$?
+if (( clone_rc == 3 )) && [[ -e "${SRC_DATA}.HOLD" ]]; then
+    skip_blocked "source cluster ${SRC_DATA} went under HOLD before the clone — not cloned"
+fi
+if (( clone_rc != 0 )); then
     echo "tpch-spotcheck: FATAL — could not snapshot the shared TPC-H cluster (see above); do NOT commit, retry the gate" >&2
     echo "tpch-spotcheck: hint — the clone no longer needs :65433 to be DOWN; if the online pg_basebackup path failed, check that pg_basebackup is on PATH and that :65433 accepts a replication connection" >&2
     exit 1
@@ -210,7 +263,7 @@ cleanup() {
     systemctl --user reset-failed "${CG_UNIT}.scope" >/dev/null 2>&1 || true
     rm -f "${SPOT_PIDFILE}"
 }
-trap cleanup EXIT
+SPOT_CLEANUP_ARMED=1   # _spotcheck_on_exit (the EXIT trap) runs cleanup
 
 ready=0
 for _ in $(seq 1 "${TPCH_SPOTCHECK_READY_TIMEOUT:-120}"); do
@@ -230,7 +283,7 @@ if [[ "${ready}" -ne 1 ]]; then
 fi
 
 # Quick schema probe: a started cluster without the tpch schema is "no data",
-# not a regression — SKIP rather than fail.
+# not a regression — but also not a pass: SKIP-BLOCKED (exit 3).
 #
 # Target resolution (goopg-specific): goopg persists user-created ROLEs and
 # DATABASEs only in memory (internal/server/role_ddl.go; CREATE DATABASE is not
@@ -255,13 +308,13 @@ if ! probe_err="$(probe_lineitem "${GATE_DB}" "${GATE_USER}" "${GATE_PASS}")"; t
         GATE_DB="postgres"; GATE_USER="${PG_SUPERUSER}"; GATE_PASS="${PG_SUPERUSER_PASS}"
         if ! probe_err="$(probe_lineitem "${GATE_DB}" "${GATE_USER}" "${GATE_PASS}")"; then
             if grep -qiE 'does not exist' <<<"${probe_err}"; then
-                skip "cluster is up but lineitem is not loaded in any persistent database (${probe_err})"
+                skip_blocked "cluster is up but lineitem is not loaded in any persistent database (${probe_err})"
             fi
             echo "tpch-spotcheck: FATAL — schema probe failed: ${probe_err}" >&2
             exit 1
         fi
     elif grep -qiE 'does not exist' <<<"${probe_err}"; then
-        skip "cluster is up but the tpch schema is not loaded (${probe_err})"
+        skip_blocked "cluster is up but the tpch schema is not loaded (${probe_err})"
     else
         echo "tpch-spotcheck: FATAL — schema probe failed: ${probe_err}" >&2
         exit 1

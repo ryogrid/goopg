@@ -1,12 +1,12 @@
 # Milestone 0138 — PG-faithful ANALYZE statistics
 
-**Status:** planned
+**Status:** complete — 9 done, 0 open in `.ralph/fix_plan.md` (2026-09-17); order per the fix_plan banner
 **Filed:** 2026-09-14 (user directive answering
 `METHODOLOGY3/04-forward-plan.md` §1.2 Question 2)
 **Priority placement:** second in the plan-parity group, after M0137. See the
 `## Current Priority` banner in `.ralph/fix_plan.md`.
 **Reference plan:** `.ralph/fix_plan.md` (M0138 section)
-**Harness:** `AGENT.md` §"Plan-parity harness — applies ONLY to M0137–M0143"
+**Harness:** `AGENT.md` §"Plan-parity harness (M0137–M0143)"
 **Prerequisites:** M0137 (this milestone moves estimates corpus-wide; without
 stamped captures and a declared stats epoch its A/B is unreadable).
 

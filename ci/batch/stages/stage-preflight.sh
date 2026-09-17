@@ -12,7 +12,8 @@ note() { printf '%s\n' "$*" | tee -a "${CHECKS}"; }
 
 # --- build (the first regression signal) ------------------------------------
 progress "S0" "make build start"
-if ! make -C "${REPO_ROOT}" build > "${RUN_DIR}/preflight/build.log" 2>&1; then
+# Built from the clean HEAD worktree when the orchestrator provides one (H1(d)).
+if ! make -C "${NIGHTLY_SRC_ROOT:-${REPO_ROOT}}" build > "${RUN_DIR}/preflight/build.log" 2>&1; then
     progress "S0" "BUILD FAILED — see preflight/build.log"
     stage_status preflight "fail(build)"
     exit 1

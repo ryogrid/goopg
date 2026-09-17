@@ -33,6 +33,9 @@ source "${REPO_ROOT}/bench/tpch/env_goopg.sh"
 # leaks into this shell — undo the errexit it turned on (this stage
 # deliberately handles failures itself so it can always record a status).
 set +e
+# Lane-private binary: rebuilding the shared tmp/goopg-bench-bin would leave the
+# reference :65433 server running a (deleted) executable (0917 audit H1c).
+GOOPG_BIN="${NIGHTLY_TPCH_BIN:-${REPO_ROOT}/tmp/goopg-nightly-tpch-bin}"
 SRC_DATA="${PGDATA}"            # canonical dir — loop-owned; NEVER stop/start a server on it
 SRC_PORT="${PG_PORT}"           # 65433 — loop's spotcheck lane
 RUN_PORT="${NIGHTLY_TPCH_PORT:-65434}"   # batch-reserved
@@ -58,6 +61,7 @@ skip_stage() {
 
 # --- step 0a: source-data preconditions ---------------------------------------
 [[ -s "${SRC_DATA}/PG_VERSION" ]] || skip_stage no-data "no initialised cluster at ${SRC_DATA}"
+[[ -e "${SRC_DATA}.HOLD" ]] && skip_stage hold "source cluster under evidence HOLD (${SRC_DATA}.HOLD) — not copied"
 data_mb="$(du -sm "${SRC_DATA}" 2>/dev/null | awk '{print $1}')"
 [[ -n "${data_mb}" && "${data_mb}" -ge 100 ]] || skip_stage no-data "data dir only ${data_mb:-0} MB"
 
@@ -98,8 +102,8 @@ rm -f "${RUN_DATA}/postmaster.pid"   # stale pidfile from the copy would block s
 # --- build server + runner ------------------------------------------------------
 progress "S2" "tpch: building goopg + tpch-runner"
 mkdir -p "$(dirname "${GOOPG_BIN}")"
-( cd "${REPO_ROOT}" && go build -o "${GOOPG_BIN}" ./cmd/goopg ) || { stage_status tpch "fail(build)"; exit 1; }
-( cd "${REPO_ROOT}" && go build -o "${RUNNER_BIN}" ./cmd/tpch-runner ) || { stage_status tpch "fail(build)"; exit 1; }
+( cd "${NIGHTLY_SRC_ROOT:-${REPO_ROOT}}" && go build -o "${GOOPG_BIN}" ./cmd/goopg ) || { stage_status tpch "fail(build)"; exit 1; }
+( cd "${NIGHTLY_SRC_ROOT:-${REPO_ROOT}}" && go build -o "${RUNNER_BIN}" ./cmd/tpch-runner ) || { stage_status tpch "fail(build)"; exit 1; }
 
 stop_scope "${CG_UNIT}"   # clear a lingering scope from a crashed previous run
 

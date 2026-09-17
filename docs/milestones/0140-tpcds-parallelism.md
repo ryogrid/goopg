@@ -1,6 +1,6 @@
 # Milestone 0140 — TPC-DS parallelism
 
-**Status:** planned
+**Status:** in-progress — 6 done, 3 open, 0 blocked/frozen in `.ralph/fix_plan.md` (2026-09-17); order per the fix_plan banner
 **Filed:** 2026-09-14 (user directive, from
 `METHODOLOGY3/04-forward-plan.md` Phase 1 Campaign A)
 **Priority placement:** in the plan-parity group alongside M0138/M0139.
@@ -8,7 +8,7 @@
 blockers do not gate on the width programme, so this milestone proceeds
 regardless of M0139's state. See the `## Current Priority` banner.
 **Reference plan:** `.ralph/fix_plan.md` (M0140 section)
-**Harness:** `AGENT.md` §"Plan-parity harness — applies ONLY to M0137–M0143"
+**Harness:** `AGENT.md` §"Plan-parity harness (M0137–M0143)"
 **Prerequisites:** M0137.
 
 ## Why this campaign, and why it leads Phase 1
