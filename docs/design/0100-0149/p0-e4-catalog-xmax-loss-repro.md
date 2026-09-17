@@ -235,3 +235,50 @@ TIMEOUT=0, plan-shapes identical (99/99), status-delta verdict-changes=none.
 `scripts/tpch-spotcheck.sh` is SKIP-BLOCKED by the `:65433` evidence hold
 (the one allowed G6 exception per the P0-E5 fix_plan entry) — P0-E7 is the
 named re-run owner once P0-E6 restores that cluster.
+
+### M0143-0008b — the DROP-direction sibling (CHECK/FOREIGN KEY/NOT NULL)
+
+P0-E5 deliberately left the three `DROP CONSTRAINT` branches above out of
+scope. `M0143-0008b` closes them with `DropConstraintUndoEntry`
+(`internal/executor/session.go`) — the DROP-direction twin of
+`NotNullUndoEntry`: a single wholesale snapshot of a table's
+`CheckConstraints`/`NamedChecks`/`ForeignKeys`/`NotNullConstraints`/
+per-column `NotNull` flags, taken before any of the three mutations, applied
+to the target table plus every cascade-reachable inheritance/partition child
+(reusing `collectNotNullCascadeClosure`'s read-only pre-walk — it is a
+generic `collectInheritanceAndPartitionChildren` tree walk, not actually
+NOT-NULL-specific, so both the CHECK and NOT NULL branches reuse it
+unchanged). `snapshotDropConstraintState` (`operators_ddl.go`) builds the
+snapshot; `RecordDropConstraintUndo`/`TakePendingDropConstraintUndos`
+(`session.go`) queue and drain it; `ProcessRollbackUndos`
+(`operators_tx.go`) writes every field back onto the same live `*catalog.Table`
+pointer on ROLLBACK. The FOREIGN KEY branch snapshots only the target table
+(FKs are not inherited, so there is no cascade to capture).
+
+**Live discovery while testing the FK branch**: the already-filed
+`M0143-0002` bug (`catalog.InMemory.DropForeignKeyConstraint` hardcodes
+`DefaultDBOid`) is real and was reproduced live — on a non-default database
+(the `db "r"` pattern the sibling P0-E5 tests use), a plain **COMMITted**
+`ALTER TABLE ... DROP CONSTRAINT <fk>` (no ROLLBACK involved at all) silently
+no-ops: the FK stays fully enforced. The identical statement against the
+cluster's default database correctly disables enforcement. Because of this,
+`TestPort_M0143_0008b_DropForeignKeyRollbackUndo` runs against the default-db
+cluster handle instead of the per-DB one — against db "r" the DROP itself
+never mutates `tbl.ForeignKeys`, so a ROLLBACK "restoring" it would be a
+false-positive pass regardless of whether this task's fix exists. See the
+deferral ledger row dated 2026-09-17 for task `M0143-0008b`; re-verify the FK
+undo against db "r" once `M0143-0002` is fixed.
+
+Every one of the three new tests
+(`internal/testport/p0e5b_alter_drop_constraint_rollback_undo_test.go`) was
+confirmed to genuinely fail with the fix reverted (`git stash` on the three
+touched files) and pass with it restored — not just a green run against the
+fixed tree.
+
+**Gates**: `go build ./...` clean; `go test ./internal/executor/...
+./internal/catalog/...` PASS; `go test -v -run
+'TestPort_P0E4|TestPort_P0E5|TestPort_M0143_0008b' ./internal/testport/`
+PASS 8/8; `RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh` —
+same pre-existing `internal/parser` AST-drift as P0-E5's own gate run, no new
+failures; `scripts/tpcds-sf025-regression.sh sweep` — `PASS=96 MISMATCH=0
+ERROR=0 TIMEOUT=0`, plan-shapes 99/99 identical.

@@ -103,6 +103,28 @@ type NotNullUndoEntry struct {
 	NotNullConstraints []catalog.NamedNotNullConstraint
 }
 
+// DropConstraintUndoEntry captures one table's pre-mutation CHECK/FOREIGN
+// KEY/NOT NULL constraint state — the CheckConstraints/NamedChecks/
+// ForeignKeys/NotNullConstraints slices and per-column NotNull flags —
+// wholesale, before `ALTER TABLE ... DROP CONSTRAINT` mutates any of them
+// in place (the CHECK, FOREIGN KEY, and NOT NULL branches of
+// execAlterTableDropConstraint), so ROLLBACK can restore the table's
+// constraint state verbatim (M0143-0008b). Unlike DDLDropUndoEntry (the
+// index-backed PK/UNIQUE/EXCLUDE forms P0-E5 already covered — pure
+// map-removal on the name-keyed index registries), these three forms
+// mutate fields/slices directly on a *catalog.Table pointer that stays live
+// and reachable throughout, so they need a wholesale snapshot-and-restore
+// instead — the DROP-direction sibling of NotNullUndoEntry/
+// snapshotNotNullState.
+type DropConstraintUndoEntry struct {
+	Table              *catalog.Table
+	CheckConstraints   []string
+	NamedChecks        []catalog.NamedCheckConstraint
+	ForeignKeys        []catalog.ForeignKey
+	NotNullConstraints []catalog.NamedNotNullConstraint
+	ColNotNull         map[int]bool
+}
+
 // PendingIndexDrop records a non-CONCURRENTLY DROP INDEX issued inside an
 // explicit transaction whose catalog removal is deferred until COMMIT. Until the
 // dropping transaction commits, the index stays in the shared catalog so other
@@ -257,6 +279,7 @@ type BasicSession struct {
 	onCommitActions     []OnCommitAction           // ON COMMIT {DELETE ROWS|DROP} registrations (M0134-0072)
 	pendingAlterIndex   []AlterIndexUndoEntry      // ALTER TABLE ADD CONSTRAINT ... USING INDEX field mutations pending rollback (P0-E5/M0143-0008)
 	pendingNotNullAlter []NotNullUndoEntry         // PRIMARY KEY NOT-NULL synthesis pending rollback (P0-E5/M0143-0008)
+	pendingDropConstAlt []DropConstraintUndoEntry  // ALTER TABLE DROP CONSTRAINT (CHECK/FK/NOT NULL) field mutations pending rollback (M0143-0008b)
 }
 
 // NewBasicSession constructs an explicit-transaction session state
@@ -854,6 +877,20 @@ func (s *BasicSession) RecordNotNullUndo(e NotNullUndoEntry) {
 func (s *BasicSession) TakePendingNotNullUndos() []NotNullUndoEntry {
 	p := append([]NotNullUndoEntry(nil), s.pendingNotNullAlter...)
 	s.pendingNotNullAlter = nil
+	return p
+}
+
+// RecordDropConstraintUndo records one table's pre-mutation CHECK/FOREIGN
+// KEY/NOT NULL constraint snapshot for potential rollback (M0143-0008b).
+func (s *BasicSession) RecordDropConstraintUndo(e DropConstraintUndoEntry) {
+	s.pendingDropConstAlt = append(s.pendingDropConstAlt, e)
+}
+
+// TakePendingDropConstraintUndos drains and returns the pending DROP
+// CONSTRAINT undo list (M0143-0008b).
+func (s *BasicSession) TakePendingDropConstraintUndos() []DropConstraintUndoEntry {
+	p := append([]DropConstraintUndoEntry(nil), s.pendingDropConstAlt...)
+	s.pendingDropConstAlt = nil
 	return p
 }
 

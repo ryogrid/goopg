@@ -6495,7 +6495,7 @@ reported, and the values and unit gates are the bar.
     already gets undone by the existing CREATE-INDEX `DDLUndoEntry` path
     (unaffected/unchanged by this task), but was not itself re-verified with
     a dedicated test this loop.
-- [ ] **M0143-0008b — `ALTER TABLE DROP CONSTRAINT` on CHECK/FOREIGN
+- [x] **M0143-0008b — `ALTER TABLE DROP CONSTRAINT` on CHECK/FOREIGN
   KEY/NOT NULL still has no rollback-undo.**
   Parent: M0143-0008. Filed
   2026-09-17 when P0-E5 landed undo for `ADD CONSTRAINT`/`DROP CONSTRAINT`'s
@@ -6520,6 +6520,31 @@ reported, and the values and unit gates are the bar.
   `operators_ddl.go`, added by P0-E5). Likely overlaps `M0143-0002`'s
   `DROP CONSTRAINT` FK bug (same subsystem) — triage together. Test
   precedent: `internal/testport/p0e5_alter_rollback_undo_test.go` (P0-E5).
+  - **Done 2026-09-17.** `DropConstraintUndoEntry` (session.go) landed
+    exactly as scoped: one wholesale snapshot type + `RecordDropConstraintUndo`/
+    `TakePendingDropConstraintUndos`, a `snapshotDropConstraintState` helper
+    (operators_ddl.go), recording calls at all three
+    `execAlterTableDropConstraint` branches (CHECK and NOT NULL also
+    snapshot `collectNotNullCascadeClosure(im, tbl)`'s children; FOREIGN KEY
+    has no cascade, tbl only), and a restore block in `ProcessRollbackUndos`
+    (operators_tx.go). 3 new testport cases
+    (`internal/testport/p0e5b_alter_drop_constraint_rollback_undo_test.go`),
+    each verified to genuinely fail with the fix reverted (git-stashed) and
+    pass with it applied. **Live discovery while writing the FK sub-test:**
+    confirmed M0143-0002 (`DropForeignKeyConstraint` hardcodes
+    `DefaultDBOid`) live — on a non-default DB a plain COMMITted (not even
+    ROLLBACKed) `DROP CONSTRAINT` on an FK silently no-ops, so the FK
+    sub-test runs against the cluster's default-db handle instead (see
+    ledger row `M0143-0008b`, dated 2026-09-17, for the full evidence and
+    the re-verify-on-db-"r" resume point once M0143-0002 lands). Gates:
+    `go build ./...` clean; `go test ./internal/executor/... ./internal/catalog/...`
+    PASS; `go test -v -run 'TestPort_P0E4|TestPort_P0E5|TestPort_M0143_0008b'
+    ./internal/testport/` PASS 8/8; `RALPH_PRECOMMIT_SCOPE=units
+    scripts/ralph-precommit-test.sh` — all packages PASS except the
+    pre-existing, already-documented `internal/parser` GroupedJoinUnaliased
+    AST-drift (unrelated, no parser file touched); `scripts/tpcds-sf025-regression.sh
+    sweep` — `PASS=96 MISMATCH=0 ERROR=0 TIMEOUT=0`, plan-shapes 99/99
+    identical.
 - [ ] **M0143-0007 — separate the dimension-table `relpages` divergence (K41)** —
   `customer` 1,979 pages vs PG's 2,872, `item` 716 vs 1,284. M0140-0005 filed it
   as out of planner reach and that is correct — **but `relpages` is an input to

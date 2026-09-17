@@ -443,6 +443,20 @@ func ProcessRollbackUndos(ctx *Context, sess *BasicSession) {
 		}
 		e.Table.NotNullConstraints = e.NotNullConstraints
 	}
+	// Restore CHECK/FOREIGN KEY/NOT NULL constraint state ALTER TABLE DROP
+	// CONSTRAINT mutated in place, on the dropped-from table and any
+	// inheritance/partition child the cascade touched (M0143-0008b).
+	for _, e := range sess.TakePendingDropConstraintUndos() {
+		e.Table.CheckConstraints = e.CheckConstraints
+		e.Table.NamedChecks = e.NamedChecks
+		e.Table.ForeignKeys = e.ForeignKeys
+		e.Table.NotNullConstraints = e.NotNullConstraints
+		for i, wasNotNull := range e.ColNotNull {
+			if i >= 0 && i < len(e.Table.Columns) {
+				e.Table.Columns[i].NotNull = wasNotNull
+			}
+		}
+	}
 	// Drop any ALTER TABLE {NO} INHERIT changes deferred to COMMIT — a ROLLBACK
 	// leaves the inheritance state untouched (and clears the catalog pending-change
 	// marks that bypass the plan cache). M0118-0008 (alter-table-4).

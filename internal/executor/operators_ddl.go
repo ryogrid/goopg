@@ -12345,6 +12345,26 @@ func snapshotNotNullState(tbl *catalog.Table) NotNullUndoEntry {
 	}
 }
 
+// snapshotDropConstraintState captures tbl's pre-mutation CHECK/FOREIGN
+// KEY/NOT NULL constraint state wholesale into a DropConstraintUndoEntry,
+// for `ALTER TABLE ... DROP CONSTRAINT`'s CHECK, FOREIGN KEY, and NOT NULL
+// branches (M0143-0008b) — the DROP-direction sibling of
+// snapshotNotNullState.
+func snapshotDropConstraintState(tbl *catalog.Table) DropConstraintUndoEntry {
+	colNotNull := make(map[int]bool, len(tbl.Columns))
+	for i := range tbl.Columns {
+		colNotNull[i] = tbl.Columns[i].NotNull
+	}
+	return DropConstraintUndoEntry{
+		Table:              tbl,
+		CheckConstraints:   append([]string(nil), tbl.CheckConstraints...),
+		NamedChecks:        append([]catalog.NamedCheckConstraint(nil), tbl.NamedChecks...),
+		ForeignKeys:        append([]catalog.ForeignKey(nil), tbl.ForeignKeys...),
+		NotNullConstraints: append([]catalog.NamedNotNullConstraint(nil), tbl.NotNullConstraints...),
+		ColNotNull:         colNotNull,
+	}
+}
+
 // collectNotNullCascadeClosure enumerates every inheritance/partition
 // descendant cascadeNotNullToChildren could reach from tbl — transitively,
 // depth-bounded (maxNotNullCascadeDepth) and OID-deduped like the cascade
@@ -13347,6 +13367,19 @@ func (o *ddlOp) execAlterTableDropConstraint(tbl *catalog.Table, act parser.Alte
 				Message: fmt.Sprintf("cannot drop inherited constraint %q of relation %q", act.ConstraintName, tbl.Name),
 			}
 		}
+		// M0143-0008b: snapshot tbl plus its full cascade-reachable
+		// inheritance/partition-child closure BEFORE the CHECK removal (and
+		// the coninhcount/conislocal bookkeeping cascadeCheckDropToChildren
+		// applies below), so ROLLBACK can restore the whole constraint set
+		// verbatim.
+		if sess, ok := o.ctx.Session.(*BasicSession); ok {
+			sess.RecordDropConstraintUndo(snapshotDropConstraintState(tbl))
+			if isIM {
+				for _, child := range collectNotNullCascadeClosure(im, tbl) {
+					sess.RecordDropConstraintUndo(snapshotDropConstraintState(child))
+				}
+			}
+		}
 		// Drop from this table (keep CheckConstraints and NamedChecks in sync).
 		tbl.CheckConstraints = append(tbl.CheckConstraints[:i], tbl.CheckConstraints[i+1:]...)
 		tbl.NamedChecks = append(tbl.NamedChecks[:i], tbl.NamedChecks[i+1:]...)
@@ -13371,6 +13404,11 @@ func (o *ddlOp) execAlterTableDropConstraint(tbl *catalog.Table, act parser.Alte
 	for _, fk := range tbl.ForeignKeys {
 		if strings.EqualFold(fk.Name, act.ConstraintName) {
 			if isIM {
+				// M0143-0008b: FKs aren't inherited, so no cascade closure
+				// to snapshot — just tbl.ForeignKeys itself.
+				if sess, ok := o.ctx.Session.(*BasicSession); ok {
+					sess.RecordDropConstraintUndo(snapshotDropConstraintState(tbl))
+				}
 				im.DropForeignKeyConstraint(tbl.OID, act.ConstraintName)
 			}
 			// R126: drop the heap row too, or the FK comes BACK at the next
@@ -13505,6 +13543,18 @@ func (o *ddlOp) execAlterTableDropConstraint(tbl *catalog.Table, act parser.Alte
 			}
 		}
 		colName := nc.ColName
+		// M0143-0008b: snapshot tbl plus its full cascade-reachable
+		// inheritance/partition-child closure BEFORE clearNotNullConstraint
+		// (and cascadeNotNullDropToChildren's own bookkeeping below), so
+		// ROLLBACK can restore the whole constraint set verbatim.
+		if sess, ok := o.ctx.Session.(*BasicSession); ok {
+			sess.RecordDropConstraintUndo(snapshotDropConstraintState(tbl))
+			if isIM {
+				for _, child := range collectNotNullCascadeClosure(im, tbl) {
+					sess.RecordDropConstraintUndo(snapshotDropConstraintState(child))
+				}
+			}
+		}
 		if err := o.clearNotNullConstraint(tbl, colName); err != nil {
 			return err
 		}
