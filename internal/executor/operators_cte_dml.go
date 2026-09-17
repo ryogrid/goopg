@@ -357,6 +357,9 @@ func planContainsWorkTableScan(n optimizer.Node) bool {
 	if s, ok := n.(*optimizer.Sort); ok {
 		return planContainsWorkTableScan(s.Child)
 	}
+	if is, ok := n.(*optimizer.IncrementalSort); ok {
+		return planContainsWorkTableScan(is.Child)
+	}
 	if so, ok := n.(*optimizer.SetOp); ok {
 		return planContainsWorkTableScan(so.Left) || planContainsWorkTableScan(so.Right)
 	}

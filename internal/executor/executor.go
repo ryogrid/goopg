@@ -182,6 +182,15 @@ func buildNode(plan optimizer.Node, bound int) (Operator, error) {
 			return nil, err
 		}
 		return maybeInstrument(p, newSortOp(p, child)), nil
+	case *optimizer.IncrementalSort:
+		// M0141-S7-exec-b: PathIncrementalSort's translated node, wired like
+		// *optimizer.Sort just above — same child bound, same instrumentation
+		// wrapper.
+		child, err := buildNode(p.Child, deformBoundBelow(p, bound))
+		if err != nil {
+			return nil, err
+		}
+		return maybeInstrument(p, newIncrementalSortOp(child, p, p.Keys, p.PresortedCount)), nil
 	case *optimizer.Join:
 		// EX1-02: per-side bounds from the merged-space remap
 		// (deformJoinBounds): above-join refs mapped through the output

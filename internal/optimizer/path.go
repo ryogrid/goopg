@@ -253,6 +253,19 @@ type Path struct {
 	// replaces with the two built inputs. nil for every other kind. C-18.
 	SetOp *SetOp
 
+	// PresortedCount is a PathIncrementalSort's presorted-prefix width —
+	// `addIncrementalSortPaths`' own `nCommon` (incrementalsortpaths.go),
+	// stashed here at Path-build time rather than re-derived at
+	// `createPlanNode` time (M0141-S7-exec-b sizing note: stash vs
+	// re-derive via `pathkeysCountContainedIn` against the winning
+	// candidate's ordering — stashing was chosen because the candidate that
+	// wins `setCheapest` is not guaranteed to still expose the SAME
+	// `SearchCandidateKeys` entry this path was built against, while the
+	// value computed here is exact by construction). `createIncrementalSortPlan`
+	// copies it verbatim onto `IncrementalSort.PresortedCount`. Zero for
+	// every other kind.
+	PresortedCount int
+
 	Rel *RelOptInfo
 
 	Cost Cost

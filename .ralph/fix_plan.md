@@ -2823,22 +2823,52 @@ spill route is net-negative.
     (untouched by this change); `tpch-spotcheck.sh` SKIPPED (bench schema
     not loaded, pre-existing, moot — zero production callers so no plan can
     change). Full writeup: design doc's "Update 2026-09-17e" section.
-  - [ ] **M0141-S7-exec-b — end-to-end structural + semantic reachability**:
-    `createplansimple.go`'s `createPlanNode` arm (replaces the `default`
-    panic for `PathIncrementalSort`), BOTH `executor.go` builder sites
-    (classic + slab, per the sibling-paths finding above), and the 4
-    mechanical tree-walkers (`scan_deform.go` x2, `subplan.go`,
-    `operators_cte_dml.go`). **This is the correctness gate**: must land in
-    full before `GOOPG_INCREMENTAL_SORT=on` is ever pointed at the corpus —
-    a missing `scan_deform.go` arm silently drops a needed column, it does
-    not panic. Needs exec-a (**landed 2026-09-17e**). **Sizing note found
-    while landing exec-a**: `addIncrementalSortPaths`
-    (`incrementalsortpaths.go`) computes `nCommon` (the presorted-prefix
-    count) locally but does not stash it on the `*Path` it builds —
-    `createPlanNode` will need either a new `Path` field to carry it
-    through, or a re-derivation via `pathkeysCountContainedIn` against the
-    winning candidate's own claimed ordering at `createPlanNode` time;
-    decide which is cheaper before starting.
+  - [x] **M0141-S7-exec-b — end-to-end structural + semantic reachability**.
+    **LANDED 2026-09-17f**. Sizing decision: `Path.PresortedCount` (new
+    field, `path.go`) is STASHED by `addIncrementalSortPaths`
+    (`incrementalsortpaths.go`) at the point `nCommon` is already computed,
+    not re-derived at `createPlanNode` time — a re-derivation via
+    `pathkeysCountContainedIn` against the winning candidate's
+    `SearchCandidateKeys` slot is not guaranteed exact if the tournament
+    re-orders `Pathlist` between path-build and `setCheapest`. Landed:
+    `createIncrementalSortPlan` (`createplansimple.go`, `createSortPlan`'s
+    structural twin plus the `0 < PresortedCount < len(Pathkeys)` panic
+    check), wired into `createplan.go`'s switch; the classic `buildNode`
+    arm (`executor.go`, mirrors the `*optimizer.Sort` case exactly); **the
+    slab/tree fast path needed no new code** — `IncrementalSort` is not a
+    concrete-dispatch slab kind, so `BuildFast`'s `buildRec` reaches it
+    through the existing `opAdapter` default arm, the same posture
+    `Distinct`/`WindowAgg`/`SetOp` already have (confirmed by grep: none of
+    the three has a bespoke `buildRec` case either) — "both builder sites"
+    is satisfied because both `Build` and `BuildFast` now reach a working
+    operator, not because both needed bespoke code; and all 4 tree-walkers
+    (`scan_deform.go`'s `deformBoundBelow`/`deformSideWidth`, `subplan.go`'s
+    `classifySubPlan` — classified `rescanCloseOpen` like `Sort`, not yet
+    re-Open-safety-audited despite `Open` resetting its own state —
+    `operators_cte_dml.go`'s `planContainsWorkTableScan`, the one
+    correctness-stakes walker: a recursive CTE body with an Incremental
+    Sort over its `WorkTableScan` must still be detected and streamed).
+    New tests: `TestCreateIncrementalSortPlanOverPrebuilt` /
+    `TestCreateIncrementalSortPlanPanics` (`createplansimple_test.go`);
+    `TestIncrementalSortReachesBothBuilders`
+    (`operators_incremental_sort_build_test.go`, new file — swaps a real
+    query's planner-built `Sort` for a hand-built `IncrementalSort` over
+    the identical child/keys, checks byte-identical output against the
+    un-swapped baseline plus `Build`/`BuildFast` agreement via the existing
+    `runBothAndCompare` Phase-C harness); `TestClassifySubPlanKinds` gained
+    a case, new `TestPlanContainsWorkTableScanSeesThroughIncrementalSort`
+    (`subplan_handle_test.go`); `scan_deform_bound_test.go` gained a
+    narrowing subtest plus `*incrementalSortOp` cases in its own operator-
+    tree walkers (needed — the new build test's deform assertions
+    false-failed without them; caught and fixed same loop). Gates:
+    `go build ./...` clean; `go test ./internal/optimizer/...
+    ./internal/executor/...` both green;
+    `RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh` — only
+    failure is the pre-existing tracked `internal/parser`
+    `GroupedJoinUnaliased` AST-drift issue (optimizer/executor packages
+    both `ok`); `scripts/tpch-spotcheck.sh` SKIPPED (bench schema not
+    loaded, pre-existing M0142-0003k blocker, moot — flag stays
+    default-off). Full writeup: design doc's "Update 2026-09-17f" section.
   - [ ] **M0141-S7-exec-c — EXPLAIN rendering**. **NARROWED 2026-09-17e**:
     2 of the original 6 `operators_explain.go` sites (`describePlanMode`'s
     label, `planChildren`'s walk) already landed as part of exec-a (they
@@ -2848,8 +2878,9 @@ spill route is net-negative.
     gated by a test, correct to leave declining until a real node can
     reach them) and the one real item — extend the `Sort Key:` rendering
     site (`emitNodeDetailLines`, `:1195`) with PG's `Presorted Key:` line
-    (`nodeIncrementalSort.c`/`explain.c` oracle). Needs exec-b (nothing to
-    render before a real node reaches EXPLAIN).
+    (`nodeIncrementalSort.c`/`explain.c` oracle). Needs exec-b (**landed
+    2026-09-17f** — a real node can now reach `createPlanNode`/`Build`, so
+    this is unblocked; next task to select in this sub-group).
   - [ ] **M0141-S7-exec-d (deferred, ledger row filed 2026-09-17)** —
     `sortOp` feature parity once exec-a/b/c land and the corpus is
     measured: spill-to-disk, packed-tuple retention (`GOOPG_SORT_PACKED`),

@@ -226,6 +226,7 @@ func TestClassifySubPlanKinds(t *testing.T) {
 		{"bare index scan", idx, rescanReOpen},
 		{"filter over index", &optimizer.Filter{Child: idx}, rescanReOpen},
 		{"sort forces close+open", &optimizer.Sort{Child: idx}, rescanCloseOpen},
+		{"incremental sort forces close+open", &optimizer.IncrementalSort{Child: idx}, rescanCloseOpen},
 		{"lock rows forces close+open", &optimizer.LockRows{Child: idx}, rescanCloseOpen},
 		{"join forces close+open", &optimizer.Join{Left: idx, Right: &optimizer.SeqScan{}}, rescanCloseOpen},
 	}
@@ -238,5 +239,23 @@ func TestClassifySubPlanKinds(t *testing.T) {
 	// LockRows is additionally uncacheable.
 	if _, cacheable := classifySubPlan(&optimizer.LockRows{Child: idx}, nil); cacheable {
 		t.Errorf("LockRows-rooted plan classified cacheable")
+	}
+}
+
+// TestPlanContainsWorkTableScanSeesThroughIncrementalSort:
+// M0141-S7-exec-b — planContainsWorkTableScan (operators_cte_dml.go) must
+// see through an IncrementalSort exactly like it already does through Sort,
+// or a recursive CTE whose body picks up an Incremental Sort over its
+// WorkTableScan would wrongly be materialized instead of streamed (a
+// correctness bug, not a missed optimization: cteScanOp.Open decides
+// streaming vs. caching from this function's answer).
+func TestPlanContainsWorkTableScanSeesThroughIncrementalSort(t *testing.T) {
+	wts := &optimizer.WorkTableScan{}
+	plan := &optimizer.IncrementalSort{Child: wts}
+	if !planContainsWorkTableScan(plan) {
+		t.Fatal("planContainsWorkTableScan missed a WorkTableScan under an IncrementalSort")
+	}
+	if planContainsWorkTableScan(&optimizer.IncrementalSort{Child: &optimizer.SeqScan{}}) {
+		t.Fatal("planContainsWorkTableScan false-positived over an IncrementalSort with no WorkTableScan below it")
 	}
 }

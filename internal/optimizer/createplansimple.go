@@ -453,3 +453,48 @@ func createSortPlan(p *Path) (Node, outputLayout) {
 	}
 	return &Sort{pos: child.Pos(), Child: child, Keys: keys}, childLayout
 }
+
+// createIncrementalSortPlan is the PathIncrementalSort arm (M0141-S7-exec-b):
+// `create_incrementalsort_plan` (createplan.c, over `make_incrementalsort`),
+// at goopg's fidelity. Structurally identical to createSortPlan — same
+// pathkey-to-SortKey translation, same coordinate remap through the child's
+// layout — plus the one field an Incremental Sort adds over a plain Sort:
+// `PresortedCount`, carried on the Path by `addIncrementalSortPaths`
+// (incrementalsortpaths.go) rather than re-derived here (see the Path
+// field's own doc comment, path.go, for why).
+func createIncrementalSortPlan(p *Path) (Node, outputLayout) {
+	if len(p.Children) != 1 {
+		panic(fmt.Sprintf("createPlan: PathIncrementalSort with %d children, want exactly 1", len(p.Children)))
+	}
+	if len(p.Pathkeys) == 0 {
+		panic("createPlan: PathIncrementalSort with no pathkeys; a sort that orders by nothing")
+	}
+	if p.PresortedCount <= 0 || p.PresortedCount >= len(p.Pathkeys) {
+		// IncrementalSort.PresortedCount's own contract (incrementalsort.go):
+		// 0 < PresortedCount < len(Keys). Outside that range the child is
+		// either not presorted at all (a plain Sort should have been chosen)
+		// or fully presorted (nothing to do) — either way a producer bug,
+		// not a case to silently coerce.
+		panic(fmt.Sprintf("createPlan: PathIncrementalSort with PresortedCount %d out of range for %d pathkeys", p.PresortedCount, len(p.Pathkeys)))
+	}
+	child, childLayout := createPlanNode(p.Children[0])
+	if child == nil {
+		panic("createPlan: PathIncrementalSort over a child path that built no node")
+	}
+	var index map[int]int
+	if childLayout != nil {
+		index = childLayout.bindingIndex()
+	}
+	keys := make([]SortKey, len(p.Pathkeys))
+	for i, pk := range p.Pathkeys {
+		if pk.Expr == nil {
+			panic(fmt.Sprintf("createPlan: PathIncrementalSort pathkey %d has no expression", i))
+		}
+		e := pk.Expr
+		if index != nil {
+			e = translateToLayout("sort key", e, childLayout, index)
+		}
+		keys[i] = SortKey{Expr: e, Desc: !pk.SortAsc, NullsFirst: pk.NullsFirst}
+	}
+	return &IncrementalSort{pos: child.Pos(), Child: child, Keys: keys, PresortedCount: p.PresortedCount}, childLayout
+}

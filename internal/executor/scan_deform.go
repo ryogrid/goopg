@@ -228,6 +228,11 @@ func deformBoundBelow(parent optimizer.Node, incoming int) int {
 		return deformFoldRefs(incoming, p.Predicate)
 	case *optimizer.Sort:
 		return deformFoldRefs(incoming, deformSortKeyExprs(p.Keys)...)
+	case *optimizer.IncrementalSort:
+		// M0141-S7-exec-b: same consumer set as Sort — the whole Keys list,
+		// prefix and trailing alike (the prefix keys are still evaluated per
+		// row by sortPrefixEqual's group split).
+		return deformFoldRefs(incoming, deformSortKeyExprs(p.Keys)...)
 	case *optimizer.Limit:
 		bound := deformFoldRefs(incoming, p.Limit, p.Offset)
 		return deformFoldRefs(bound, p.TiesKeys...)
@@ -325,6 +330,8 @@ func deformSideWidth(n optimizer.Node) int {
 		case *optimizer.Filter:
 			n = x.Child
 		case *optimizer.Sort:
+			n = x.Child
+		case *optimizer.IncrementalSort:
 			n = x.Child
 		case *optimizer.Limit:
 			n = x.Child

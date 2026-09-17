@@ -60,6 +60,8 @@ func seqLeafBound(t *testing.T, op Operator) (bound, ncols int) {
 			op = o.child
 		case *sortOp:
 			op = o.child
+		case *incrementalSortOp:
+			op = o.child
 		case *aggregateOp:
 			op = o.child
 		case *distinctOp:
@@ -259,6 +261,12 @@ func TestScanDeformBoundChains(t *testing.T) {
 		op := mustBuildDeform(t, &optimizer.Sort{Child: scan8(), Keys: []optimizer.SortKey{{Expr: deformCol(6)}}})
 		if b, n := seqLeafBound(t, op); b != 7 || n != 8 {
 			t.Fatalf("sort bound=%d ncols=%d, want 7/8", b, n)
+		}
+		// M0141-S7-exec-b: IncrementalSort narrows on its Keys exactly like
+		// Sort — same fold, same set of consumer expressions.
+		op = mustBuildDeform(t, &optimizer.IncrementalSort{Child: scan8(), Keys: []optimizer.SortKey{{Expr: deformCol(6)}}, PresortedCount: 1})
+		if b, n := seqLeafBound(t, op); b != 7 || n != 8 {
+			t.Fatalf("incremental sort bound=%d ncols=%d, want 7/8", b, n)
 		}
 		// A constant LIMIT references nothing: full width.
 		op = mustBuildDeform(t, &optimizer.Limit{Child: scan8(), Limit: deformInt(10)})
@@ -839,6 +847,8 @@ func joinSideBounds(t *testing.T, plan optimizer.Node) (lb, ln, rb, rn int) {
 		case *projectOp:
 			return find(n.child)
 		case *sortOp:
+			return find(n.child)
+		case *incrementalSortOp:
 			return find(n.child)
 		case *limitOp:
 			return find(n.child)

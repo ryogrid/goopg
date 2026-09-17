@@ -93,6 +93,25 @@ func incrementalSortModeLabel(m incrementalSortMode) string {
 	return "off"
 }
 
+// setIncrementalSortPathsModeForTest pins the mode for one test and returns
+// the restore func. The knob is process-global by design, so a test that
+// flips it must put it back.
+func setIncrementalSortPathsModeForTest(m incrementalSortMode) func() {
+	prev := incrementalSortPathsMode
+	incrementalSortPathsMode = m
+	return func() { incrementalSortPathsMode = prev }
+}
+
+// SetIncrementalSortPathsMode is the same hook across the package boundary,
+// taking the label an operator would export (`off` / `on`) and resolving it
+// through the SAME function production resolves the environment variable
+// with — so a caller cannot select a mode the env knob could not. Mirrors
+// `SetPartialSortPathsMode` / `SetPartialAggPathsMode`; process-global, so a
+// caller must run the returned restore.
+func SetIncrementalSortPathsMode(label string) (restore func()) {
+	return setIncrementalSortPathsModeForTest(incrementalSortModeFromEnv(label))
+}
+
 // upperOrderedIncrementalSortProducer is this arm's DPPATH trace string
 // (pathtrace.go), sibling to upperOrderedInputProducer/upperOrderedSortProducer
 // declared in upperordered.go.
@@ -150,10 +169,14 @@ func addIncrementalSortPaths(ordered *RelOptInfo, input *Path, sortPathkeys []Pa
 			Rows:          candidate.Rows,
 			Cost: costIncrementalSort(cp, candidate.Cost, candidate.Rows, float64(groups),
 				pathNCols(candidate), pathAvgVarBytes(candidate), limitTuples, pathWidth(candidate)),
-			Pathkeys:      sortPathkeys,
-			Children:      []*Path{candidate},
-			RequiredOuter: candidate.RequiredOuter,
-			ParallelSafe:  parallelSafeWith(candidate.Rel, candidate),
+			Pathkeys: sortPathkeys,
+			// M0141-S7-exec-b: stashed for `createIncrementalSortPlan` —
+			// see the field's own doc comment (path.go) for why it is
+			// carried here rather than re-derived at createPlanNode time.
+			PresortedCount: nCommon,
+			Children:       []*Path{candidate},
+			RequiredOuter:  candidate.RequiredOuter,
+			ParallelSafe:   parallelSafeWith(candidate.Rel, candidate),
 		}
 		inheritNarrowedWidths(sp, candidate)
 		addPath(ordered, sp, upperOrderedIncrementalSortProducer)

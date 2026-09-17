@@ -78,6 +78,12 @@ func createPlanNodeUnpriced(p *Path) (Node, outputLayout) {
 		// carry Sort children, so this must exist before the join arms do.
 		// createplansimple.go.
 		return createSortPlan(p)
+	case PathIncrementalSort:
+		// M0141-S7-exec-b: PathSort's sibling arm — same pathkey
+		// translation, plus the presorted-prefix width
+		// `addIncrementalSortPaths` (incrementalsortpaths.go) stashed on
+		// the Path. createplansimple.go.
+		return createIncrementalSortPlan(p)
 	case PathHashJoin:
 		// The first join arm (M0127-P5.5-e-i) and the first consumer of the
 		// layout above. createplanjoin.go.
