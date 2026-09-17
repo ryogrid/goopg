@@ -122,6 +122,43 @@ func formatPathLine(list string, rel *RelOptInfo, p *Path, producer, pathkeys st
 		relSetBits(p.OuterRelids), relSetBits(p.InnerRelids), rel.Width, inputTotal)
 }
 
+// traceOrderedCandidatePopulation emits one DPPATH diagnostic line for
+// createOrderedPaths's SearchCandidates population step (upperordered.go).
+//
+// M0141-S7-cd-q64: some ORDER BY witnesses show zero `upper.ordered.*`
+// producer lines beyond the seed Sort, and the trace alone cannot tell apart
+// "searchedRelOf(input) returned nil" (input is not a searched-tree root —
+// e.g. a raw multi-child join or set-op sits at the top, see
+// searchedRelOf's own "not on the boundary chain" case) from "it returned a
+// rel, but every candidate's re-earned Pathkeys came back empty" (every
+// candidate's ordering claim failed validatedSearchCandidateKeys). Both look
+// identical downstream — SearchCandidates is unusable either way — but only
+// the second is a validator bug; the first is a structural gap in which
+// inputs the boundary chain recognises at all.
+func traceOrderedCandidatePopulation(searchedRel bool, candidates int, nonEmptyKeys int) {
+	if !pathTraceEnabled {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "%s candidates producer=upper.ordered.candidates searchedrel=%v candidates=%d nonemptykeys=%d\n",
+		pathTraceTag, searchedRel, candidates, nonEmptyKeys)
+}
+
+// traceIncrementalSortCandidate emits one DPPATH diagnostic line per
+// candidate `addIncrementalSortPaths` (incrementalsortpaths.go) considered
+// and declined or accepted — the finer-grained sibling of
+// traceOrderedCandidatePopulation for the M0141-S7-cd-candidatepool question:
+// which of the `nonempty` candidates traceOrderedCandidatePopulation counted
+// actually reach a genuine partial-prefix offer, and why the rest don't
+// (`kind`=candidate's own Path.Kind, `keys`=len(SearchCandidateKeys[i]),
+// `contained`/`ncommon`=pathkeysCountContainedIn's verdict).
+func traceIncrementalSortCandidate(i int, kind PathKind, keyLen int, contained bool, nCommon int) {
+	if !pathTraceEnabled {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "%s candidate producer=upper.ordered.incrementalsort.candidate index=%d kind=%d keys=%d contained=%v ncommon=%d\n",
+		pathTraceTag, i, int(kind), keyLen, contained, nCommon)
+}
+
 // relSetBits renders a RelSet as a stable, parseable member list. The trace has
 // no access to relation NAMES here (addPath is below the level that knows
 // them), so the bitmask members are the identity — and they are what

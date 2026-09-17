@@ -3293,7 +3293,7 @@ spill route is net-negative.
     then restarted again at its default flag state before this commit (env
     vars unset from the systemd `--user` manager's environment block too, so
     they can't leak into an unrelated later gate in this session).
-  - [ ] **M0141-S7-cd-q64** — root-cause why Q64's ORDER BY offers zero
+  - [x] **M0141-S7-cd-q64** — root-cause why Q64's ORDER BY offers zero
     `upper.ordered.incrementalsort` (and, on the 2026-09-18 trace, zero
     `upper.ordered` producer lines of ANY kind besides the winning seed
     Sort) despite being classified alongside Q4/Q11 as a Nested-Loop-shaped
@@ -3314,6 +3314,65 @@ spill route is net-negative.
     NOT by itself flip Q64's plan shape) — measured by a repeat
     `GOOPG_PGSHAPED_DP_TRACE=1` capture on Q64 showing a nonzero count of
     `upper.ordered.incrementalsort` lines, no TPC-H dependency.
+    - **Done 2026-09-18b, hypothesis REFUTED, real cause found: Q64 was
+      miscategorized, not under-served.** Landed the instrumentation
+      (`traceOrderedCandidatePopulation` + `traceIncrementalSortCandidate`,
+      `internal/optimizer/pathtrace.go`, both gated on the pre-existing
+      `pathTraceEnabled`/`GOOPG_PGSHAPED_DP_TRACE` flag — inert at default,
+      `go build ./...` clean, unit suite unchanged) and traced on a private
+      throwaway cluster (port 5533, own `GOOPG_CG_UNIT`) loaded from the
+      already-sampled SF0.25 TSVs — the RALPH_LOOP guard now blocks
+      restarting `:65437` directly (added since the 2026-09-17h/18 traces in
+      this file that did restart it), so `:65437`/`:65438` were never
+      touched. Trace result: `searchedrel=true candidates=7 nonemptykeys=6`
+      — BOTH prior hypotheses false, `SearchCandidates` is populated
+      correctly. All 6 non-empty-key candidates are `PathMergeJoin` with a
+      3-key claim scoring `ncommon=0` against the outer 5-key sort list —
+      zero shared columns, not a partial-prefix miss. Re-reading
+      `query64.sql` explains why: the outer `ORDER BY` sorts on
+      `cross_sales`'s own aggregate OUTPUT columns
+      (`product_name`/`store_name`/`cnt`/`s1`), which no join-shaped
+      candidate could ever carry a prefix of — PG's own plan satisfies this
+      level with a plain `Sort`, not Incremental Sort. The `Incremental
+      Sort` node PG's plan DOES contain (`Presorted Key: item.i_item_sk`)
+      sits INSIDE the CTE's own `GroupAggregate` build — a sorted-GroupAgg
+      input-sort decision at a completely different call site than
+      `createOrderedPaths`/`addOrderedPaths` (which only ever sees the
+      OUTER statement's `ORDER BY`). Q64 was never an outer-ORDER-BY
+      witness; `nCommon==0` on every candidate is the CORRECT verdict, not
+      a gap — M0141-S7-cd-q64's own premise does not survive contact with
+      the query text. Full writeup: design doc's "Update 2026-09-18b"
+      section. Reclassification (Q64 moves from the "Nested Loop x4" outer
+      bucket to the CTE-internal-GroupAggregate bucket, and whether it is a
+      new 6th member of that family or already covered by
+      M0141-S2b-0/S2b-7) is NOT decided here (out of this recon loop's
+      one-task budget) — filed as **M0141-S7-cd-q64-reclassify** below.
+      `GOOPG_INCREMENTAL_SORT` stays default-off. No ledger row (closes an
+      open question with a definite answer; the follow-up is a normal filed
+      task, not an undocumented gap). Gates: `go build ./...` clean, `go
+      vet ./internal/optimizer/` clean, `go test ./internal/optimizer/...`
+      PASS, `RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh`
+      PASS, no TPC-H dependency.
+  - [ ] **M0141-S7-cd-q64-reclassify** — decide where Q64 actually belongs
+    in the 14-witness corpus tally now that M0141-S7-cd-q64 shows its
+    Incremental Sort node is CTE-internal-GroupAggregate-scoped
+    (`Presorted Key: item.i_item_sk` feeding `cross_sales`'s own
+    `GROUP BY`), not outer-ORDER-BY-scoped like its former "Nested Loop x4"
+    grouping implied.
+    Parent: M0141-S7. Needs: (a) confirm whether
+    `electOrderedGrouping`'s CTE-materialization callers already cover a
+    CTE's OWN internal aggregate-strategy election the same way they cover
+    a top-level statement's (M0141-S2b-0/S2b-7's stated scope was "every
+    `createXPaths -> createOrderedPaths` call site" for the OUTER
+    statement — whether a CTE's inner query goes through the identical
+    machinery, or a separate un-audited path, is not yet checked); (b) if
+    covered, Q64 is just a 6th witness of the already-tracked
+    GroupAggregate family, requiring no new task, just a tally correction
+    in this file's producer-shape table and the "Nested Loop x4" ->
+    "Nested Loop x3 (Q4, Q11, Q35)" edit named in the design doc's Update
+    2026-09-18b; (c) if NOT covered, file the CTE-internal gap as its own
+    M0141-S2b-N-class task. No TPC-H dependency; recon-only until (c)'s
+    outcome is known.
   - [ ] **M0141-S7-cd-candidatepool** — investigate whether
     `addIncrementalSortPaths` (`incrementalsortpaths.go:161-166`) should
     also consider building its `PathIncrementalSort` over the SAME cheap

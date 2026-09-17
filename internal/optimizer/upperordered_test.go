@@ -301,10 +301,16 @@ func TestCreateOrderedPathsHonoursEnableSortAsAPreference(t *testing.T) {
 	}
 }
 
+// dppathLines keeps only tracePath's own record kind ("DPPATH path "/"DPPATH
+// partial ", formatPathLine's `list` field) — NOT the M0141-S7-cd-q64
+// diagnostic records `traceOrderedCandidatePopulation`/
+// `traceIncrementalSortCandidate` also emit under the DPPATH tag
+// (pathtrace.go's "candidates"/"candidate" record kinds), which every
+// existing caller of this helper predates and does not expect to see.
 func dppathLines(lines []string) []string {
 	out := lines[:0]
 	for _, line := range lines {
-		if strings.HasPrefix(line, "DPPATH ") {
+		if strings.HasPrefix(line, "DPPATH path ") || strings.HasPrefix(line, "DPPATH partial ") {
 			out = append(out, line)
 		}
 	}

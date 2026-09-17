@@ -116,6 +116,17 @@ func createOrderedPaths(u *upperRels, input Node, keys []SortKey, pos int, cp co
 		// Pathkeys are just as much a claim made in the search's inner
 		// coordinate space. Still plumbing only: nothing below reads it.
 		ordered.SearchCandidateKeys = validatedSearchCandidateKeys(sr.Pathlist, input.Output())
+		if pathTraceEnabled {
+			nonEmpty := 0
+			for _, ks := range ordered.SearchCandidateKeys {
+				if len(ks) > 0 {
+					nonEmpty++
+				}
+			}
+			traceOrderedCandidatePopulation(true, len(ordered.SearchCandidates), nonEmpty)
+		}
+	} else if pathTraceEnabled {
+		traceOrderedCandidatePopulation(false, 0, 0)
 	}
 
 	addOrderedPaths(ordered, seed, pathkeysForSortKeys(keys), cp, limitTuples)
