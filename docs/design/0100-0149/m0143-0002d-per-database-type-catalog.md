@@ -1,4 +1,4 @@
-Status: in progress — M0143-0002e (read side) and M0143-0002f (write side) landed 2026-09-17; M0143-0002g (DROP DOMAIN + GRANT/REVOKE ACL sites) landed 2026-09-17; M0143-0002h (pg_range paired write+read fix) filed, not started
+Status: done — M0143-0002e (read side), M0143-0002f (write side), M0143-0002g (DROP DOMAIN + GRANT/REVOKE ACL sites), and M0143-0002h (pg_range paired write+read fix) all landed 2026-09-17
 Date: 2026-09-17
 Supersedes: none
 
@@ -247,14 +247,32 @@ rows they point at were wrong.
     `scripts/tpcds-sf025-regression.sh sweep` PASS=96 MISMATCH=0 ERROR=0
     TIMEOUT=0, plan-shapes 99/99 identical.
 - **M0143-0002h** (pg_range paired write+read per-database fix). Parent:
-  M0143-0002d. Filed 2026-09-17, not started. See the `.ralph/fix_plan.md`
-  task text for the full three-part fix shape (write-side `pgRangeRel` swap
-  + a new per-database `reloadUserRangeTypesFromHeap` loop mirroring
-  `loadSystemCatalogsIfPresentForDB` + the `rngsubtype`-join test
-  extension). Both halves land in the same commit — the read-side loop must
-  exist before or alongside the write-side swap, never after, or a restart
-  in between would lose data (the exact trap M0143-0002g's own audit
-  surfaced and declined to walk into).
+  M0143-0002d.
+  - **Done 2026-09-17.** Landed all three parts in one commit as planned:
+    (1) `pgRangeRel` (`internal/executor/sys_pg_range.go`) swapped
+    `catalog.DefaultDBOid` → `tableCatalogHeapDBOid(ctx)`. (2)
+    `reloadUserRangeTypesFromHeap`
+    (`internal/initdb/catalog_heap_reload.go`) took a new `heapDBOid,
+    nsDBOid uint32` parameter pair (the same split
+    `loadSystemCatalogsIfPresentForDB` uses); `catalog.go`'s
+    `rangeKey(dbOid, name)` registry already supported per-DB keys, so
+    `RegisterRangeTypeDuringRecovery` itself needed no change — only its
+    caller now passes the real dbOid instead of always `cat.DBOID()`.
+    `internal/initdb/open.go`'s call site (after `reloadDatabasesFromHeap`,
+    so `cat.ListDatabases()` was already populated — no repeat of
+    M0143-0002f's ordering bug) grew a loop over each distinct-dbOid
+    database, mirroring the `loadSystemCatalogsIfPresentForDB` loop. (3)
+    `TestDatabaseDDLTypeCatalogReloadAcrossRestart` gained a
+    `pg_type`⋈`pg_range` `rngsubtype` assertion, verified to fail with
+    "expected exactly 1 samerange pg_range row, got 0" (silent data loss)
+    when the two production files above were stashed out, confirming the
+    predicted regression class and that the fix closes it. Gates: `go
+    build ./...` clean; `go test ./internal/postmaster/...
+    ./internal/executor/... ./internal/initdb/... ./internal/catalog/...`
+    PASS; `RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh`
+    full green; `scripts/tpcds-sf025-regression.sh sweep` PASS=96
+    MISMATCH=0 ERROR=0 TIMEOUT=0, plan-shapes 99/99 identical, gate-stamp
+    PASS against the staged tree.
 
 ## Test
 

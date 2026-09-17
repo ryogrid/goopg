@@ -135,13 +135,12 @@ func TestDatabaseDDLTypeCatalogReloadAcrossRestart(t *testing.T) {
 		t.Errorf("db r2 post-restart: samedomain base type = %q, want text", bt)
 	}
 
-	// Range: only pg_type isolation is asserted here (not the subtype, which
-	// would require joining pg_range — a separate, still-DefaultDBOid-hardcoded
-	// catalog outside this task's scope, see the M0143-0002g deferral-ledger
-	// row filed alongside this test). writeTypeHeapRowWithIndexes is the same
-	// funnel every CREATE TYPE kind shares, so a single pg_type row per
-	// database (not the cross-database union M0143-0002c found) is still the
-	// right signal that the write-side fix reaches the range branch too.
+	// Range: pg_type isolation (row count) AND pg_range isolation (rngsubtype,
+	// joined by rngtypid) — M0143-0002h paired pgRangeRel's write-side dbOid
+	// swap with a per-database reloadUserRangeTypesFromHeap loop, so this now
+	// also confirms each database's own pg_range row (not just its pg_type
+	// row) survives a restart and resolves the RIGHT subtype, isolated per
+	// database.
 	rangeTypeCountOf := func(t2 *testing.T, dbName, typname string) int {
 		t2.Helper()
 		rows, err := queryUnderDBReload(t2, rt2, s2, dbName,
@@ -156,5 +155,25 @@ func TestDatabaseDDLTypeCatalogReloadAcrossRestart(t *testing.T) {
 	}
 	if n := rangeTypeCountOf(t, "r2", "samerange"); n != 1 {
 		t.Errorf("db r2 post-restart: samerange pg_type rows = %d, want 1", n)
+	}
+
+	rangeSubtypeOf := func(t2 *testing.T, dbName, typname string) string {
+		t2.Helper()
+		rows, err := queryUnderDBReload(t2, rt2, s2, dbName,
+			"SELECT format_type(rng.rngsubtype, NULL) FROM pg_type t "+
+				"JOIN pg_range rng ON rng.rngtypid = t.oid WHERE t.typname = '"+typname+"'")
+		if err != nil {
+			t2.Fatalf("db %s: range pg_range join query: %v", dbName, err)
+		}
+		if len(rows) != 1 {
+			t2.Fatalf("db %s: expected exactly 1 samerange pg_range row, got %d — cross-database duplication or missing row", dbName, len(rows))
+		}
+		return string(rows[0][0].Buf)
+	}
+	if st := rangeSubtypeOf(t, "r1", "samerange"); st != "integer" {
+		t.Errorf("db r1 post-restart: samerange subtype = %q, want integer", st)
+	}
+	if st := rangeSubtypeOf(t, "r2", "samerange"); st != "bigint" {
+		t.Errorf("db r2 post-restart: samerange subtype = %q, want bigint", st)
 	}
 }

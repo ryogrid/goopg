@@ -53,7 +53,7 @@ func buildPGRangeRow(rt *catalog.RangeType) Row {
 
 func pgRangeRel(ctx *Context) storage.RelFileNode {
 	return storage.RelFileNode{
-		DBOid:  catalog.DefaultDBOid,
+		DBOid:  tableCatalogHeapDBOid(ctx),
 		RelOid: pgRangeRelOID,
 		Fork:   storage.MainFork,
 	}

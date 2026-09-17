@@ -1677,12 +1677,24 @@ func reloadUserDomainsFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog
 // linkage (subtype, multirange, opclass, collation); the range and
 // multirange pg_type rows carry names/array peers/owner; the subtype name
 // resolves via pgTypeCanonical.
-func reloadUserRangeTypesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *transam.CLog) error {
+//
+// M0143-0002h: reloadUserRangeTypesFromHeap is parameterized by the same
+// heapDBOid/nsDBOid split as loadSystemCatalogsIfPresentForDB
+// (internal/initdb/open.go) — heapDBOid picks the base/<dbOid>/pg_range|
+// pg_type files the scan reads, nsDBOid is the dbOid stamped onto each
+// RegisterRangeTypeDuringRecovery call (rangeKey(dbOid, name) is the
+// registry's lookup key — catalog.go already supported per-DB range types,
+// only this caller hardcoded cat.DBOID() on both ends). The main call site
+// keeps passing cat.DBOID() for both (the historical single-DB behavior); a
+// distinct-dbOid database's own pg_range/pg_type heap needs a second call
+// with its own oid on both parameters, mirroring the
+// loadSystemCatalogsIfPresentForDB per-database loop.
+func reloadUserRangeTypesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *transam.CLog, heapDBOid, nsDBOid uint32) error {
 	rangeCols := executor.PGRangeColumnsPG18()
 	type rangeRow struct {
 		typid, subtype, multitypid, collation, subopc uint32
 	}
-	rel := storage.RelFileNode{DBOid: cat.DBOID(), RelOid: 3541, Fork: storage.MainFork}
+	rel := storage.RelFileNode{DBOid: heapDBOid, RelOid: 3541, Fork: storage.MainFork}
 	rows, err := scanCatalogHeapRows(mgr, rel, clog, "pg_range",
 		func(ht storage.HeapTuple, tid storage.ItemPointer) (any, bool, error) {
 			natts := int(ht.Header.Infomask2 & storage.HeapNattsMask)
@@ -1714,7 +1726,7 @@ func reloadUserRangeTypesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, c
 		arrayOID  uint32
 		owner     uint32
 	}
-	typeRel := storage.RelFileNode{DBOid: cat.DBOID(), RelOid: catalog.TypeRelationId, Fork: storage.MainFork}
+	typeRel := storage.RelFileNode{DBOid: heapDBOid, RelOid: catalog.TypeRelationId, Fork: storage.MainFork}
 	typeRows, err := scanCatalogHeapRows(mgr, typeRel, clog, "pg_type",
 		func(ht storage.HeapTuple, tid storage.ItemPointer) (any, bool, error) {
 			natts := int(ht.Header.Infomask2 & storage.HeapNattsMask)
@@ -1756,7 +1768,7 @@ func reloadUserRangeTypesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, c
 		cat.RegisterRangeTypeDuringRecovery(&catalog.RangeType{
 			Name:               rangeT.name,
 			OID:                rr.typid,
-			DBOid:              cat.DBOID(),
+			DBOid:              nsDBOid,
 			ArrayOID:           rangeT.arrayOID,
 			SubtypeName:        subtypeName,
 			OpclassOID:         rr.subopc,

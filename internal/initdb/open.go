@@ -2269,11 +2269,31 @@ func Open(opts OpenOptions) (*Runtime, error) {
 			_ = mgr.Close()
 			return nil, fmt.Errorf("goopg: enum heap reload: %w", err)
 		}
-		if err := reloadUserRangeTypesFromHeap(mgr, cat, clog); err != nil {
+		if err := reloadUserRangeTypesFromHeap(mgr, cat, clog, cat.DBOID(), cat.DBOID()); err != nil {
 			_ = pool.Close()
 			_ = walWriter.Close()
 			_ = mgr.Close()
 			return nil, fmt.Errorf("goopg: range type heap reload: %w", err)
+		}
+		// M0143-0002h: repeat the reload for each distinct-dbOid database's
+		// OWN pg_range/pg_type heap (base/<dbOid>/3541|1247, written by
+		// pgRangeRel's tableCatalogHeapDBOid routing), mirroring the
+		// loadSystemCatalogsIfPresentForDB loop above (open.go:1586). Runs
+		// here (after reloadDatabasesFromHeap populated cat.ListDatabases())
+		// rather than being folded into the main pass, since the main pass
+		// runs before that population on some call paths.
+		for _, dbName := range cat.ListDatabases() {
+			dbOid := cat.DatabaseOid(dbName)
+			if dbOid == 0 || dbOid == catalog.DefaultDBOid ||
+				dbOid == catalog.PostgresDBOid || dbOid == cat.DBOID() {
+				continue
+			}
+			if err := reloadUserRangeTypesFromHeap(mgr, cat, clog, dbOid, dbOid); err != nil {
+				_ = pool.Close()
+				_ = walWriter.Close()
+				_ = mgr.Close()
+				return nil, fmt.Errorf("goopg: range type heap reload (db %q oid %d): %w", dbName, dbOid, err)
+			}
 		}
 	}
 

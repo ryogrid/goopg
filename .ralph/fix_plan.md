@@ -7028,7 +7028,7 @@ reported, and the values and unit gates are the bar.
     `scripts/tpcds-sf025-regression.sh sweep` PASS=96 MISMATCH=0 ERROR=0
     TIMEOUT=0, plan-shapes 99/99 identical. `tpch-spotcheck` not run — no
     TPC-H data needed, consistent with the P0-E6-wait selection rule.
-- [ ] **M0143-0002h — pg_range needs a paired write+read per-database fix,
+- [x] **M0143-0002h — pg_range needs a paired write+read per-database fix,
   not the one-line swap M0143-0002g's own text assumed.**
   Parent: M0143-0002d. Filed 2026-09-17 from M0143-0002g's Done note.
   `pgRangeRel` (`internal/executor/sys_pg_range.go:54-59`) still hardcodes
@@ -7060,6 +7060,43 @@ reported, and the values and unit gates are the bar.
   to confirm `r1`'s samerange resolves subtype `integer` and `r2`'s
   resolves `bigint` post-restart, isolated per database). Ledger:
   `M0143-0002g` row dated 2026-09-17.
+  - **Done 2026-09-17.** Landed all three parts in one commit, as required
+    (write-before-read alone would have repeated the exact bug this task
+    exists to fix). (1) `pgRangeRel` (`internal/executor/sys_pg_range.go:54`)
+    swapped `catalog.DefaultDBOid` → `tableCatalogHeapDBOid(ctx)`. (2)
+    `reloadUserRangeTypesFromHeap`
+    (`internal/initdb/catalog_heap_reload.go:1680`) gained a `heapDBOid,
+    nsDBOid uint32` parameter pair (mirroring
+    `loadSystemCatalogsIfPresentForDB`'s split): its pg_range/pg_type
+    `RelFileNode`s now read `heapDBOid` instead of `cat.DBOID()`, and the
+    `RegisterRangeTypeDuringRecovery` call now stamps `nsDBOid` instead of
+    `cat.DBOID()` — `catalog.go`'s `rangeKey(dbOid, name)` registry already
+    supported per-DB keys, so no catalog.go change was needed, only the
+    caller. `internal/initdb/open.go:2272`'s call site keeps the historical
+    `cat.DBOID(), cat.DBOID()` main pass and adds a new loop over
+    `cat.ListDatabases()` (skipping oid 0/DefaultDBOid/PostgresDBOid/
+    `cat.DBOID()`) immediately after it — placed after `reloadDatabasesFromHeap`
+    (line 1546) so, unlike M0143-0002f's own read-side loop, there was no
+    ordering hazard to rediscover. (3) Extended
+    `TestDatabaseDDLTypeCatalogReloadAcrossRestart`
+    (`internal/postmaster/database_ddl_type_reload_test.go`) with a
+    `rangeSubtypeOf` helper joining `pg_type`→`pg_range` on `rngtypid`,
+    asserting `r1`'s samerange resolves `integer` and `r2`'s resolves
+    `bigint` post-restart. Verified pre-fix failure by stashing the two
+    production files (`sys_pg_range.go`, `catalog_heap_reload.go`,
+    `open.go`) and re-running: failed with "expected exactly 1 samerange
+    pg_range row, got 0" for db r1 — the exact predicted silent-loss
+    symptom — then restored the fix and re-ran green. Gates: `go build
+    ./...` clean; `go test ./internal/postmaster/... ./internal/executor/...
+    ./internal/initdb/... ./internal/catalog/...` PASS;
+    `RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh` full
+    green; `scripts/tpcds-sf025-regression.sh sweep` PASS=96 MISMATCH=0
+    ERROR=0 TIMEOUT=0, plan-shapes 99/99 identical, gate-stamp PASS against
+    the staged tree; `python3 scripts/ralph-lineage-guard.py` exit 0.
+    `tpch-spotcheck` not run — no TPC-H data needed for this unit-scoped
+    fix, consistent with the P0-E6-wait selection rule. This closes the
+    M0143-0002 lineage's pg_range gap; the `M0143-0002g` deferral-ledger row
+    stays `-` (status flips are M0119's job, not the filer's).
 - [ ] **M0143-0003 — `pg_constraint` returns 0 rows of any contype after a restart** —
   including the `'p'`/`'u'` rows synthesised from indexes that demonstrably survive. A
   second, independent reload gap that R126 explicitly did not touch.
