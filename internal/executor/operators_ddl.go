@@ -13409,7 +13409,10 @@ func (o *ddlOp) execAlterTableDropConstraint(tbl *catalog.Table, act parser.Alte
 				if sess, ok := o.ctx.Session.(*BasicSession); ok {
 					sess.RecordDropConstraintUndo(snapshotDropConstraintState(tbl))
 				}
-				im.DropForeignKeyConstraint(tbl.OID, act.ConstraintName)
+				// M0143-0002: pass tbl directly (see catalog.go doc comment) —
+				// the old tbl.OID-keyed lookup was scoped to DefaultDBOid and
+				// silently no-opped for a table in any other database.
+				im.DropForeignKeyConstraint(tbl, act.ConstraintName)
 			}
 			// R126: drop the heap row too, or the FK comes BACK at the next
 			// restart — a resurrected constraint being strictly worse than a

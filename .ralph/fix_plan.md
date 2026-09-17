@@ -6434,12 +6434,62 @@ reported, and the values and unit gates are the bar.
   exact paths TPC-H rides — have manual psql evidence only. This is *why* two per-DB
   defects were found in two consecutive rounds; closing it makes the rest of this
   milestone findable by the suite. Highest leverage of the six.
-- [ ] **M0143-0002 — `ALTER TABLE … DROP CONSTRAINT` on an FK reports success and does
+- [x] **M0143-0002 — `ALTER TABLE … DROP CONSTRAINT` on an FK reports success and does
   nothing** — `InMemory.DropForeignKeyConstraint` hardcodes `DefaultDBOid`
   (`catalog.go:22241`) and `execAlterTableDropConstraint` discards the result
   (`operators_ddl.go:13303`). `HasPrimaryKey` (`catalog.go:22261`) has the same shape,
   and six `deleteCatalogRowsForOID` sites were filed for the same check and never
   confirmed. R126 made this worse in effect, because such an FK now survives restarts.
+  - **Done 2026-09-17.** Fixed the confirmed defect this task names: changed
+    `DropForeignKeyConstraint`'s signature from `(tableOID uint32, name string)
+    bool` to `(tbl *Table, name string) bool` (`internal/catalog/catalog.go`)
+    so it mutates the caller's already-resolved live `*Table` pointer directly
+    instead of re-resolving by OID via `tableByOID(tableOID, DefaultDBOid)` —
+    which silently returned `ok=false` (so nothing was removed) for any table
+    outside the default database. Single call site updated
+    (`internal/executor/operators_ddl.go`'s FK branch of
+    `execAlterTableDropConstraint`). New regression test
+    (`internal/testport/m0143_0002_fk_drop_constraint_nondefault_db_test.go`)
+    creates the FK in database `"r"` (non-default) and asserts a COMMITted
+    `DROP CONSTRAINT` actually disables enforcement — confirmed to genuinely
+    fail pre-fix (git-stashed the fix, red) and pass post-fix. Also re-pointed
+    `TestPort_M0143_0008b_DropForeignKeyRollbackUndo`
+    (`p0e5b_alter_drop_constraint_rollback_undo_test.go`) from the default-db
+    workaround it needed pre-fix back onto database `"r"`, per that test's own
+    documented resume point — still green. **Not covered by this fix, filed
+    as M0143-0002b below:** `HasPrimaryKey`/`dropIndexByName` share the exact
+    same `c.ns(DefaultDBOid).byTable[...]` hardcode shape (confirmed by
+    reading, not live-tested this loop — `catalog.go`'s index registries
+    genuinely are stored per-DB via `c.ns(dbOid).byTable`, so this is very
+    likely a live bug for PK/UNIQUE/EXCLUDE constraints on a non-default DB
+    table too); the "six `deleteCatalogRowsForOID` sites... never confirmed"
+    note in this task's own original text was not investigated this loop
+    (scope: this loop fixed the one defect with an in-hand live repro, not
+    every same-shape sibling named in the task's prose).
+- [ ] **M0143-0002b — audit `HasPrimaryKey`/`dropIndexByName`'s DefaultDBOid
+  hardcode for the same non-default-DB no-op M0143-0002 had.**
+  Parent: M0143-0002. Filed 2026-09-17 when M0143-0002's fix confirmed the
+  FK-specific instance of this hardcode shape live but left the PK/UNIQUE/
+  EXCLUDE-backed siblings and the original task's "six
+  `deleteCatalogRowsForOID` sites" note unconfirmed. Both read
+  `c.ns(DefaultDBOid).byTable[tableOID]` (`catalog.go:22214`, `:22261`)
+  unconditionally, but index registration is genuinely per-DB
+  (`c.ns(dbOid).byTable[tbl.OID]`, confirmed by reading the registration
+  sites). If a PK/UNIQUE/EXCLUDE-backed table lives in a non-default
+  database, `HasPrimaryKey` likely always reports `false` for it and
+  `dropIndexByName` (backing `DropUniqueConstraint`/`DropExclusionConstraint`)
+  likely always silently no-ops its DROP — the same failure shape M0143-0002
+  fixed for FKs, unconfirmed live. Also re-check the "six
+  `deleteCatalogRowsForOID` sites... filed for the same check and never
+  confirmed" note from M0143-0002's original text (not re-derived this loop;
+  re-`grep`/re-read the call sites at `operators_ddl.go` before assuming
+  which six were meant). Resume point: write a `HasPrimaryKey`/
+  `DropUniqueConstraint`/`DropExclusionConstraint` non-default-DB repro
+  mirroring `m0143_0002_fk_drop_constraint_nondefault_db_test.go`, confirm
+  which are actually broken before changing any of them (a wrong theory here
+  would not be the first time a "same shape" claim needed live confirmation
+  first — mirrors this task's own FK finding, which WAS live-confirmed before
+  the fix landed).
 - [ ] **M0143-0003 — `pg_constraint` returns 0 rows of any contype after a restart** —
   including the `'p'`/`'u'` rows synthesised from indexes that demonstrably survive. A
   second, independent reload gap that R126 explicitly did not touch.

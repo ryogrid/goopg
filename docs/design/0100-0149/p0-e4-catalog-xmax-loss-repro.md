@@ -282,3 +282,49 @@ PASS 8/8; `RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh` —
 same pre-existing `internal/parser` AST-drift as P0-E5's own gate run, no new
 failures; `scripts/tpcds-sf025-regression.sh sweep` — `PASS=96 MISMATCH=0
 ERROR=0 TIMEOUT=0`, plan-shapes 99/99 identical.
+
+### M0143-0002 — the FK `DropForeignKeyConstraint` DefaultDBOid bug (2026-09-17)
+
+M0143-0008b's discovery above is now fixed. `DropForeignKeyConstraint`
+(`internal/catalog/catalog.go`) took `(tableOID uint32, constraintName
+string)` and re-resolved the table via `tableByOID(tableOID, DefaultDBOid)`
+— hardcoded to the default database's namespace regardless of which database
+the table actually lived in. For a non-default-DB table that lookup returned
+`ok=false`, so the method returned immediately without ever touching the
+real `tbl.ForeignKeys` slice; `execAlterTableDropConstraint`'s FK branch
+discarded the bool return, so the no-op was silent. The fix changes the
+signature to `(tbl *Table, constraintName string) bool`, mutating the
+caller's already-resolved live pointer directly — `execAlterTableDropConstraint`
+already validates the constraint exists on that exact `tbl.ForeignKeys`
+slice before calling in, so no OID/dbOid relookup is needed at all. Single
+call site (`operators_ddl.go`'s FK branch).
+
+New regression coverage:
+`internal/testport/m0143_0002_fk_drop_constraint_nondefault_db_test.go`
+creates the FK in database `"r"` and asserts a plain **COMMITted** `DROP
+CONSTRAINT` (no ROLLBACK) actually disables enforcement — confirmed to
+genuinely fail pre-fix (`git stash` on the two touched files, red with the
+exact `23503` FK-still-enforced error) and pass post-fix.
+`TestPort_M0143_0008b_DropForeignKeyRollbackUndo` is re-pointed from the
+default-db workaround back onto db `"r"`, per its own documented resume
+point — still green, now genuinely exercising the undo mutation instead of
+a no-op.
+
+**Not covered by this fix** (filed as fix_plan `M0143-0002b`):
+`HasPrimaryKey`/`dropIndexByName` (`catalog.go:22214`, `:22261`) read
+`c.ns(DefaultDBOid).byTable[tableOID]` unconditionally — the same hardcode
+shape, and index registration is genuinely per-DB
+(`c.ns(dbOid).byTable[tbl.OID]` at the registration sites), so PK/UNIQUE/
+EXCLUDE constraints on a non-default-DB table are a strong suspect for the
+identical failure — not live-tested this loop. The original M0143-0002
+text's "six `deleteCatalogRowsForOID` sites... never confirmed" note was
+also not re-derived this loop.
+
+**Gates**: `go build ./...` clean; `go test ./internal/executor/...
+./internal/catalog/...` PASS; `go test -v -run
+'TestPort_M0143_0002|TestPort_M0143_0008b|TestPort_P0E4|TestPort_P0E5'
+./internal/testport/` PASS 9/9; `RALPH_PRECOMMIT_SCOPE=units
+scripts/ralph-precommit-test.sh` — same pre-existing `internal/parser`
+60-test AST-drift (M0143-0006), no new failures;
+`scripts/tpcds-sf025-regression.sh sweep` — `PASS=96 MISMATCH=0
+CKMISMATCH=0 ERROR=0 TIMEOUT=0`, plan-shapes 99/99 identical.

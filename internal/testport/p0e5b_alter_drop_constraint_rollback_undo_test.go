@@ -53,31 +53,28 @@ func TestPort_M0143_0008b_DropCheckConstraintRollbackUndo(t *testing.T) {
 // `DROP CONSTRAINT` on a named FOREIGN KEY restores enforcement: an INSERT
 // referencing a non-existent parent row must still fail after the ROLLBACK.
 //
-// Deliberately runs against the cluster's DEFAULT database handle (c, not
-// r): catalog.InMemory.DropForeignKeyConstraint hardcodes DefaultDBOid
-// (catalog.go:22241), a separate, already-filed bug (M0143-0002 —
-// "ALTER TABLE ... DROP CONSTRAINT on an FK reports success and does
-// nothing" on a non-default database) that execAlterTableDropConstraint's
-// FK branch does not check the return value of, so on a non-default DB
-// (r, as p0e5_alter_rollback_undo_test.go's siblings use) the DROP silently
-// no-ops and this test could not tell "undone by ROLLBACK" apart from
-// "never actually dropped" — confirmed live before writing this test
-// (COMMITted, non-ROLLBACKed DROP CONSTRAINT on db "r" left FK enforcement
-// active; the identical statement against the default db correctly
-// disabled it). Once M0143-0002 is fixed this test should be re-verified
-// against db "r" too.
+// Runs against the cluster's non-default database handle (r), matching
+// p0e5_alter_rollback_undo_test.go's siblings. Originally ran against the
+// default database handle (c) instead, because catalog.InMemory.
+// DropForeignKeyConstraint hardcoded DefaultDBOid (catalog.go:22241, fixed by
+// M0143-0002) and so silently no-opped the DROP on db "r" independent of
+// ROLLBACK, making "undone by ROLLBACK" indistinguishable from "never
+// actually dropped" — confirmed live before that fix landed (see
+// m0143_0002_fk_drop_constraint_nondefault_db_test.go for the dedicated
+// non-ROLLBACK regression coverage). Re-verified against db "r" now that
+// M0143-0002 is fixed.
 func TestPort_M0143_0008b_DropForeignKeyRollbackUndo(t *testing.T) {
-	c, _ := startP0E4Cluster(t, "m0143-0008b-fk")
+	_, r := startP0E4Cluster(t, "m0143-0008b-fk")
 	for _, stmt := range []string{
 		"CREATE TABLE fk_parent(id int PRIMARY KEY)",
 		"CREATE TABLE fk_child(id int, pid int, CONSTRAINT child_fk FOREIGN KEY (pid) REFERENCES fk_parent(id))",
 	} {
-		if err := runSQLSimple(t, c, stmt); err != nil {
+		if err := runSQLSimple(t, r, stmt); err != nil {
 			t.Fatalf("setup %q: %v", stmt, err)
 		}
 	}
 
-	res, err := c.PSQL("-c", "BEGIN; ALTER TABLE fk_child DROP CONSTRAINT child_fk; ROLLBACK;")
+	res, err := r.PSQL("-c", "BEGIN; ALTER TABLE fk_child DROP CONSTRAINT child_fk; ROLLBACK;")
 	if err != nil {
 		t.Fatalf("launch psql BEGIN/ALTER/ROLLBACK: %v", err)
 	}
@@ -87,7 +84,7 @@ func TestPort_M0143_0008b_DropForeignKeyRollbackUndo(t *testing.T) {
 
 	// If the FK undo did not fire, child_fk is gone and this INSERT
 	// (referencing a non-existent parent id) succeeds instead of failing 23503.
-	if err := runSQLSimple(t, c, "INSERT INTO fk_child VALUES (1, 999)"); err == nil {
+	if err := runSQLSimple(t, r, "INSERT INTO fk_child VALUES (1, 999)"); err == nil {
 		t.Fatalf("INSERT with a dangling FK reference succeeded after ROLLBACK — " +
 			"the ROLLBACKed ALTER TABLE DROP CONSTRAINT's ForeignKeys mutation " +
 			"was not undone (M0143-0008b)")

@@ -22232,14 +22232,19 @@ func (c *InMemory) dropIndexByName(tableOID uint32, constraintName string) bool 
 // DropForeignKeyConstraint removes the named foreign-key constraint from the
 // table's ForeignKeys slice. Returns true if found and removed. Unlike
 // PK/UNIQUE constraints, a foreign key isn't backed by a separate Index
-// registry entry — it lives only on Table.ForeignKeys — so this looks the
-// table up by OID and mutates that slice directly. DU-002 slice 433
-// follow-up.
-func (c *InMemory) DropForeignKeyConstraint(tableOID uint32, constraintName string) bool {
+// registry entry — it lives only on Table.ForeignKeys — so this mutates the
+// caller-supplied *Table directly instead of re-resolving it by OID.
+// (M0143-0002: the old (tableOID, name) signature re-looked the table up via
+// tableByOID(tableOID, DefaultDBOid), which returned ok=false — and so
+// silently dropped nothing — for any table living in a non-default database;
+// confirmed live via a two-database repro. The caller already holds the
+// correct *Table for the target's own database, so taking it directly
+// removes the mismatch instead of threading dbOid through another lookup.)
+// DU-002 slice 433 follow-up.
+func (c *InMemory) DropForeignKeyConstraint(tbl *Table, constraintName string) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	tbl, ok := c.tableByOID(tableOID, DefaultDBOid)
-	if !ok {
+	if tbl == nil {
 		return false
 	}
 	for i := range tbl.ForeignKeys {
