@@ -1,4 +1,4 @@
-Status: draft — investigation + fix-shape complete, implementation not started
+Status: in progress — M0143-0002e (read side) landed 2026-09-17; M0143-0002f (write side) not started
 Date: 2026-09-17
 Supersedes: none
 
@@ -146,6 +146,23 @@ rows they point at were wrong.
   `RelFileNode` resolution now differs per `ctx.CurrentDatabaseOid`, plus the
   existing regress/unit suite staying green (no behavior moves for the
   DefaultDBOid path, which is every existing test).
+  - **Done 2026-09-17 — implementation note, one deviation from step 1's
+    literal wording:** step 1 above says "new catalog method"; the landed
+    fix instead extended the EXISTING `RegisterRealTable(t *Table, dbOid
+    ...uint32)`, which already carried an unused variadic `dbOid` parameter
+    (dead code nobody had wired up). `RegisterRealTable` now sets `t.DBOid =
+    resolved` whenever the resolved dbOid names a genuine non-default
+    database — a separate method would have duplicated the idempotency/
+    namespace logic already in `RegisterRealTable` for no benefit, and every
+    existing call site (both callers pass no dbOid arg) is unaffected since
+    `resolveDBOid(nil) == DefaultDBOid` short-circuits the new branch. Steps
+    2-3 landed as literally specified: `loadSystemCatalogsIfPresentForDB`
+    (the per-DB body factored out of `loadSystemCatalogsIfPresent`) and the
+    new exported `initdb.RegisterSystemCatalogsForDB` for CREATE DATABASE
+    time. See `.ralph/fix_plan.md`'s M0143-0002e Done note for the full
+    file:line list and the two new tests
+    (`internal/catalog/register_real_table_dbid_test.go`,
+    `internal/initdb/system_catalog_dbid_test.go`).
 - **M0143-0002f** (write side: fix-shape step 4). Depends on M0143-0002e
   `[x]`. Gate: the live two-database repro from M0143-0002c's Done note
   (`.ralph/fix_plan.md` M0143-0002c) now returns each database's own type

@@ -6835,7 +6835,7 @@ reported, and the values and unit gates are the bar.
     ledger row: recon/design only, no production diff; the two child tasks
     below own the actual fix and their own deferral bookkeeping if either
     lands partially.
-- [ ] **M0143-0002e — per-database `catalog.Table` registration for
+- [x] **M0143-0002e — per-database `catalog.Table` registration for
   `pg_type`/`pg_attribute` (read side of M0143-0002d).**
   Parent: M0143-0002d. Filed 2026-09-17 from M0143-0002d's design doc, fix-shape steps 1-3. Add a
   `catalog.InMemory` method that registers a `Table` for a system relation
@@ -6857,6 +6857,52 @@ reported, and the values and unit gates are the bar.
   `ctx.CurrentDatabaseOid` after this lands, plus the full existing
   unit/regress suite staying green (the DefaultDBOid path is every existing
   test and must be byte-identical).
+  - **Done 2026-09-17.** Implemented as an enhancement of the EXISTING
+    `RegisterRealTable(t *Table, dbOid ...uint32)` rather than a brand-new
+    method — it already carried an unused `dbOid ...uint32` param wired
+    nowhere; `internal/catalog/catalog.go:12696` now sets `t.DBOid =
+    resolved` whenever the resolved dbOid is a genuine non-default database
+    (omitting the arg, or passing `DefaultDBOid` explicitly, leaves
+    `t.DBOid` at its zero value — byte-identical to every pre-existing
+    caller/test). `loadSystemCatalogsIfPresent`
+    (`internal/initdb/open.go:2931`) is now a thin wrapper: the original
+    body moved to `loadSystemCatalogsIfPresentForDB(dataDir, cat, heapDBOid,
+    nsDBOid)`, called once for the `DefaultDBOid` pass (unchanged asymmetry:
+    reads `base/<cat.DBOID()>`, registers into `DefaultDBOid`'s namespace)
+    then once per other already-registered database from `cat.ListDatabases()`
+    (heapDBOid==nsDBOid==dbOid), skipping
+    DefaultDBOid/PostgresDBOid/`cat.DBOID()` exactly like the index
+    precedent's loop. New exported `initdb.RegisterSystemCatalogsForDB(dataDir,
+    cat, dbOid)` wraps the same per-DB helper for `CREATE DATABASE` time;
+    wired into `internal/postmaster/database_ddl.go`'s
+    `tryHandleDatabaseDDL` right after `createDatabasePhysicalDirectory`
+    succeeds (new `(*Server).registerSystemCatalogsForNewDB`, unconditional
+    on `tmplTables` since every database gets its own pg_type/pg_attribute
+    files regardless of template content) — a failure there rolls back the
+    same way a scaffolding failure does (`cat.DropDatabase` +
+    `removeDatabasePhysicalDirectory`). Two new unit tests:
+    `internal/catalog/register_real_table_dbid_test.go`
+    (`TestRegisterRealTablePerDatabaseRelFileNode`, the catalog-primitive
+    gate — confirms `RelFileNode` now differs per dbOid and the no-dbOid
+    call path is unchanged) and
+    `internal/initdb/system_catalog_dbid_test.go`
+    (`TestRegisterSystemCatalogsForDBRoutesToOwnNamespace`, the
+    physical-file + wiring gate — real `CreatePerDatabaseScaffolding` +
+    `RegisterSystemCatalogsForDB` round trip, plus a no-scaffolding dbOid
+    no-op case). Gates run: `go build ./...` clean;
+    `RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh` all green
+    including `internal/catalog` and `internal/initdb`
+    (125s, real cost — the initdb package boots a full cluster per test);
+    `go test ./internal/postmaster/...` green separately (both new unit
+    tests plus the full existing suite, confirming the CREATE DATABASE path
+    change is byte-identical for every existing test — none of them create a
+    second database with types, so none observes the new registration).
+    **No SQL-observable behavior change** — confirmed by design: writes
+    still hardcode `DefaultDBOid` until M0143-0002f, so this task's own
+    correctness claim rests entirely on the two new unit tests above, not on
+    any end-to-end SQL assertion (an end-to-end test would show nothing
+    different yet). M0143-0002f (write-side route-through) is next, in
+    order, now unblocked.
 - [ ] **M0143-0002f — route type-catalog heap writes through
   `tableCatalogHeapDBOid(ctx)` (write side of M0143-0002d).**
   Parent: M0143-0002d. Depends on M0143-0002e `[x]`. Filed 2026-09-17 from

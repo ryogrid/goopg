@@ -12693,6 +12693,18 @@ func (c *InMemory) TryRegisterUserTable(tbl *Table, dbOid ...uint32) error {
 // System catalog tables are excluded from Snapshot() so they are
 // never persisted to JSON — they are always re-registered at
 // startup from their heap relfiles.
+//
+// The trailing variadic dbOid registers the table into a distinct
+// database's own catalog namespace (mirrors TryRegisterUserTable /
+// RegisterIndexDuringRecoveryForDB) — M0143-0002e, the read-side half of the
+// per-database pg_type/pg_attribute fix. Omitting it (or passing
+// DefaultDBOid) preserves the original single-namespace behavior exactly:
+// t.DBOid is left at its zero value, which RelFileNode's `table.DBOid != 0`
+// check treats as "route through the process-wide c.dbOid", the pre-existing
+// convention every caller before M0143-0002e relied on. Passing a genuinely
+// distinct dbOid stamps t.DBOid so RelFileNode instead resolves the table's
+// own database's physical file (base/<dbOid>/<OID>), the same fallback rule
+// documented on RelFileNode itself.
 func (c *InMemory) RegisterRealTable(t *Table, dbOid ...uint32) error {
 	if t == nil {
 		return fmt.Errorf("RegisterRealTable: nil table")
@@ -12705,7 +12717,11 @@ func (c *InMemory) RegisterRealTable(t *Table, dbOid ...uint32) error {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	ns := c.getOrCreateNS(resolveDBOid(dbOid))
+	resolved := resolveDBOid(dbOid)
+	if resolved != DefaultDBOid {
+		t.DBOid = resolved
+	}
+	ns := c.getOrCreateNS(resolved)
 	k := key(parser.ObjectName{Schema: t.Schema, Name: t.Name})
 	if existing, ok := ns.tables[k]; ok {
 		if existing.OID == t.OID {

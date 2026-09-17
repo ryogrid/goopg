@@ -2917,7 +2917,8 @@ func registerStatCheckpointerView(cat *catalog.InMemory, cp *xlog.Checkpointer) 
 
 // loadSystemCatalogsIfPresent registers pg_type and pg_attribute as
 // real heap-backed catalog tables when their M0030-0001 relfiles are
-// present under <dataDir>/base/<DefaultDBOid>/.
+// present under <dataDir>/base/<DefaultDBOid>/, then repeats the same
+// registration for every OTHER already-existing database (M0143-0002e).
 //
 // On fresh clusters (after goopg init with Phase 1+2 changes), the
 // relfiles exist and contain seeded rows.  On old clusters that were
@@ -2928,8 +2929,50 @@ func registerStatCheckpointerView(cat *catalog.InMemory, cp *xlog.Checkpointer) 
 // OID-pre-set), so a SeqScan on these tables reads directly from the
 // heap relfile.  The rows are visible to all sessions because they
 // were written with xmin=BootstrapTransactionID (1).
+//
+// M0143-0002e: before this loop pg_type/pg_attribute were registered exactly
+// once, as a single process-wide catalog.Table with DBOid left at its zero
+// value — every connection's SeqScan on them resolved through the one
+// process-wide c.dbOid regardless of ctx.CurrentDatabaseOid, so two
+// databases' user-defined types' pg_type/pg_attribute rows appeared as the
+// UNION of both (docs/design/0100-0149/m0143-0002d-per-database-type-catalog.md).
+// Mirrors the identical fix already applied to indexes
+// (loadUserIndexesFromHeap's cat.ListDatabases() loop, M0127-P5.6-f-pre):
+// the main pass keeps the historical asymmetry (reads base/<cat.DBOID()>,
+// registers into DefaultDBOid's namespace), every other database reads and
+// registers under its own oid. Registration-only — no observable SQL
+// behavior change yet, since the write side (M0143-0002f) still hardcodes
+// DefaultDBOid until that task lands.
 func loadSystemCatalogsIfPresent(dataDir string, cat *catalog.InMemory) error {
-	base := filepath.Join(dataDir, "base", fmt.Sprint(cat.DBOID()))
+	if err := loadSystemCatalogsIfPresentForDB(dataDir, cat, cat.DBOID(), catalog.DefaultDBOid); err != nil {
+		return err
+	}
+	for _, dbName := range cat.ListDatabases() {
+		dbOid := cat.DatabaseOid(dbName)
+		if dbOid == 0 || dbOid == catalog.DefaultDBOid ||
+			dbOid == catalog.PostgresDBOid || dbOid == cat.DBOID() {
+			continue
+		}
+		if err := loadSystemCatalogsIfPresentForDB(dataDir, cat, dbOid, dbOid); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// loadSystemCatalogsIfPresentForDB is loadSystemCatalogsIfPresent restricted
+// to ONE database, with the same two-OID split loadUserIndexesFromHeapForDB
+// uses: heapDBOid picks the base/<dbOid> directory the relfiles are read
+// from, nsDBOid the catalog namespace the Table is registered into. They
+// differ only on the main (DefaultDBOid) pass — see loadSystemCatalogsIfPresent.
+//
+// RegisterSystemCatalogsForDB (exported, called from CREATE DATABASE) is a
+// thin wrapper around this with heapDBOid == nsDBOid == dbOid, since a
+// freshly created database's scaffolding already copied its own
+// base/<dbOid>/1247|1249 files (copyBootstrapCatalogImage) — no reload
+// asymmetry to preserve there.
+func loadSystemCatalogsIfPresentForDB(dataDir string, cat *catalog.InMemory, heapDBOid, nsDBOid uint32) error {
+	base := filepath.Join(dataDir, "base", fmt.Sprint(heapDBOid))
 
 	// heapFilePresent returns true only when the file exists AND has at least
 	// one full block. The storage manager opens files with O_CREATE, so a
@@ -2949,8 +2992,8 @@ func loadSystemCatalogsIfPresent(dataDir string, cat *catalog.InMemory) error {
 			Columns: catalog.PGTypeColumns(),
 			OID:     catalog.TypeRelationId,
 		}
-		if err := cat.RegisterRealTable(t); err != nil {
-			return fmt.Errorf("register pg_type: %w", err)
+		if err := cat.RegisterRealTable(t, nsDBOid); err != nil {
+			return fmt.Errorf("register pg_type (db %d): %w", nsDBOid, err)
 		}
 	}
 
@@ -2963,12 +3006,25 @@ func loadSystemCatalogsIfPresent(dataDir string, cat *catalog.InMemory) error {
 			Columns: catalog.PGAttributeColumns(),
 			OID:     catalog.AttributeRelationId,
 		}
-		if err := cat.RegisterRealTable(t); err != nil {
-			return fmt.Errorf("register pg_attribute: %w", err)
+		if err := cat.RegisterRealTable(t, nsDBOid); err != nil {
+			return fmt.Errorf("register pg_attribute (db %d): %w", nsDBOid, err)
 		}
 	}
 
 	return nil
+}
+
+// RegisterSystemCatalogsForDB registers pg_type/pg_attribute into a single
+// newly created database's own catalog namespace (M0143-0002e step 3,
+// CREATE DATABASE time). Exported for internal/postmaster's
+// tryHandleDatabaseDDL, called right after createDatabasePhysicalDirectory
+// provisions the new database's scaffolding (which already copies its own
+// base/<dbOid>/1247|1249 from template0 — copyBootstrapCatalogImage — so this
+// call is registration-only, no new heap write). A missing relfile (e.g. the
+// three built-in databases, which skip scaffolding) is a silent no-op, same
+// as the startup reload path.
+func RegisterSystemCatalogsForDB(dataDir string, cat *catalog.InMemory, dbOid uint32) error {
+	return loadSystemCatalogsIfPresentForDB(dataDir, cat, dbOid, dbOid)
 }
 
 // appendCatalogRows appends HeapTuples to the last page of a relfile,
