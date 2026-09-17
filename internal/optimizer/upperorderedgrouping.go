@@ -219,11 +219,30 @@ func electOrderedGrouping(u *upperRels, agg *aggregateSurface, node Node, keys [
 	sizeUpperRelFromNode(ordered, agg.node)
 	savedPathlist := append([]*Path(nil), ordered.Pathlist...)
 	savedTotal, savedStartup, savedParam := ordered.CheapestTotal, ordered.CheapestStartup, ordered.CheapestParameterized
+	savedSearchCandidates, savedSearchCandidateKeys := ordered.SearchCandidates, ordered.SearchCandidateKeys
 	restore := func(reason string) (Node, bool) {
 		ordered.Pathlist = savedPathlist
 		ordered.CheapestTotal, ordered.CheapestStartup, ordered.CheapestParameterized = savedTotal, savedStartup, savedParam
+		ordered.SearchCandidates, ordered.SearchCandidateKeys = savedSearchCandidates, savedSearchCandidateKeys
 		return decline(reason)
 	}
+	// M0141-S2b-7: this rel's own candidate set for `addIncrementalSortPaths`
+	// (incrementalsortpaths.go) — the third arm the normal `createOrderedPaths`
+	// call populates from `searchedRelOf(input)`, which does not exist here
+	// (the input is a GROUP_AGG rel's PathAgg, never a searched join/scan
+	// root). `cands` IS the candidate Pathlist at this seam, and `translated`
+	// IS each candidate's validated output-coordinate ordering claim
+	// (nil where `groupingEmissionPathkeys` declined) — the exact two things
+	// `createOrderedPaths` derives via `searchedRelOf`/
+	// `validatedSearchCandidateKeys`, already computed above for a different
+	// purpose (the no-sort/Sort-over election) and reused here rather than
+	// rederived. Restored on every decline path below like the other
+	// mutated `ordered` fields, since a later plain `createOrderedPaths`
+	// call on this SAME rel (same registry, kind, relids, tupleFraction)
+	// would otherwise inherit a stale GROUP_AGG-shaped candidate set when
+	// its own `searchedRelOf(input)` is nil.
+	ordered.SearchCandidates = cands
+	ordered.SearchCandidateKeys = translated
 
 	sortKeys := pathkeysForSortKeys(keys)
 	for i, c := range cands {
@@ -265,6 +284,20 @@ func electOrderedGrouping(u *upperRels, agg *aggregateSurface, node Node, keys [
 		*agg.node = *b
 		if dpTrace {
 			fmt.Fprintf(os.Stderr, "DPGROUP elected shape=bare-Aggregate strategy=%d\n", int(b.Strategy))
+		}
+	case *IncrementalSort:
+		// M0141-S2b-7: the third arm's own winner shape — same
+		// descend-one-level rule as the *Sort case above
+		// (`createIncrementalSortPlan` wraps exactly one child, built from
+		// the `PathAgg` candidate `addIncrementalSortPaths` offered).
+		ba, ok := b.Child.(*Aggregate)
+		if !ok {
+			return restore("incrementalsort-child-not-aggregate")
+		}
+		b.pos = stmtPos
+		*agg.node = *ba
+		if dpTrace {
+			fmt.Fprintf(os.Stderr, "DPGROUP elected shape=IncrementalSort-over-Aggregate strategy=%d\n", int(ba.Strategy))
 		}
 	default:
 		return restore("winner-shape-unexpected")

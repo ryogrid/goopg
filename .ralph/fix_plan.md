@@ -2637,7 +2637,7 @@ spill route is net-negative.
     approach is the wrong instrument for this question regardless of size
     tuning, since the point is to observe PG's own real-data cost
     comparison at genuinely separated cardinalities, not to construct one.
-  - [ ] **M0141-S2b-7** — filed 2026-09-17 by M0141-S7's corpus measurement
+  - [x] **M0141-S2b-7** — filed 2026-09-17 by M0141-S7's corpus measurement
     (design doc's "Update 2026-09-17h"). `electOrderedGrouping`
     (`upperorderedgrouping.go:236`) calls `addOrderedPaths` directly, once
     per surviving `PathAgg` candidate, **without ever running
@@ -2664,6 +2664,35 @@ spill route is net-negative.
     sufficient on its own, since S2b-5/S2b-6's still-open cost-tie question
     (Hashed-vs-Sorted `PathAgg` election) sits upstream of it for the same
     queries.
+    **LANDED 2026-09-17i.** `upperorderedgrouping.go`'s `electOrderedGrouping`
+    now sets `ordered.SearchCandidates = cands` /
+    `ordered.SearchCandidateKeys = translated` right after the
+    `anyTranslated` gate (both added to the existing save/restore-on-decline
+    snapshot — required, since the same `*RelOptInfo` is reused by the
+    `else`-branch `createOrderedPaths` call when the loop declines), and the
+    `createPlanNode(best)` switch gained a `*IncrementalSort` case (mirrors
+    the existing `*Sort` case's descend-to-`*Aggregate` copy-back; previously
+    an Incremental-Sort win would have hit
+    `default: return restore("winner-shape-unexpected")` and been silently
+    discarded). **Proved closed by trace, not inferred**: a
+    `GOOPG_PGSHAPED_DP_TRACE=1` capture on Q3 now shows a real
+    `upper.ordered.incrementalsort` candidate offered
+    (`PresortedCount=1`, matching PG's own `Presorted Key: dt.d_year`) that
+    loses the tournament to the plain Sort by cost (`total=3733.01` vs
+    `3730.89`) — **the bypass is closed; what remains is a cost question**,
+    exactly the "necessary but not sufficient" outcome predicted, folding
+    into **M0141-S2b-6-resume**'s already-filed scope (same
+    Hashed-vs-Sorted `PathAgg` cost-tie, gated on the M0142-0003k TPC-H
+    cluster reload). Corpus re-measurement:
+    `analysis/m0141/m0141-s2b7-full99-incsort-on.txt`, still 0/99
+    Incremental Sort nodes, byte-identical EXPLAIN shapes to the pre-fix
+    capture (`m0141-s7-full99-incsort-on.txt`) aside from header/tmp-path
+    lines. `scripts/pg-plan-parity-diff.py` floor check:
+    `PLAN-PARITY: queries=99 match=2 shapediff=67 unparsed=0 missingnode=27
+    error=3 timeout=0` — M0137-0004 floor (match>=2, Q9+Q41) holds,
+    categories unchanged. Full writeup: design doc's "Update 2026-09-17i".
+    No new ledger row (folds into the existing S2b-6-resume follow-up
+    rather than opening a fresh one).
   Needs M0141-S2 (done, see above) for the concrete TPC-H query list
   motivating S2b-0/S2b-2. Ledger row appended (task-id `m0141-s2b`).
 - [ ] **M0141-S3 — Partial-Sorted row emission** — a second Partial-mode code

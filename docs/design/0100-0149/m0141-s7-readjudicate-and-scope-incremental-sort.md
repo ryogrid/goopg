@@ -873,3 +873,107 @@ set (`ordered.SearchCandidates`/`SearchCandidateKeys` populated from `cands`,
 or a dedicated offer), the same posture S2b-2a/2b already established for
 `createOrderedPaths`'s own call site. Re-run this measurement after it lands
 to see how many of the 7 GroupAgg witnesses move.
+
+**Update 2026-09-17i — M0141-S2b-7 LANDED, corpus re-measured: still 0/99,
+but the bypass is now structurally CLOSED (proven by trace, not inferred).**
+`upperorderedgrouping.go`'s `electOrderedGrouping` now populates
+`ordered.SearchCandidates = cands` and `ordered.SearchCandidateKeys =
+translated` (the same per-candidate slices it already computes for its own
+no-sort/Sort-over election) right after the `anyTranslated` gate, with both
+fields added to the existing save/restore-on-decline snapshot (the function's
+own contract: a decline must leave `ordered` byte-identical to the loop never
+having run, since the SAME `*RelOptInfo` — same registry, kind, relids,
+tupleFraction — is reused by a subsequent plain `createOrderedPaths` call in
+the `else` branch at `planner.go:1955-1965` when the loop declines, and that
+call's own population is conditional on `searchedRelOf(input) != nil`, so a
+leftover mutation would otherwise leak a GROUP_AGG-shaped candidate set into
+an unrelated plain-Node ORDER BY). Also added the `*IncrementalSort` winner
+shape to the function's `createPlanNode(best)` switch (previously only
+`*Sort`/`*Aggregate` were handled; an Incremental-Sort win would have hit
+`default: return restore("winner-shape-unexpected")` and silently thrown the
+win away) — mirrors the existing `*Sort` case's one-level descend-to-`*Aggregate`
+copy-back exactly, since `createIncrementalSortPlan` wraps exactly one child
+built from the offered `PathAgg` candidate.
+
+**Proof the bypass is closed, not just "no longer obviously wrong":** a
+`GOOPG_INCREMENTAL_SORT=on GOOPG_PGSHAPED_DP_TRACE=1` server against Q3 (one
+of the 5 GroupAgg witnesses) now emits, where before it emitted nothing for
+this producer at all —
+
+```
+DPPATH path producer=upper.ordered.sort           relids=- kind=7  ... total=3730.8918 ... verdict=accepted
+DPPATH path producer=upper.ordered.incrementalsort relids=- kind=20 ... total=3733.0068 ... verdict=dominated
+```
+
+— i.e. the third arm is reached and offers a real `PathIncrementalSort`
+candidate (child = the Sorted `PathAgg`, `PresortedCount=1` — matching PG's
+own `Presorted Key: dt.d_year` in `bench/tpcds/plans-pg/Q3.txt`, since the
+GroupAggregate's group-key emission order is `(d_year, i_brand,
+i_brand_id)` while the ORDER BY is `(d_year, sum(...) DESC, i_brand_id)` — only
+the leading `d_year` column is a genuine positional match, `nCommon=1`). It
+loses the tournament to the plain `upper.ordered.sort` candidate
+(3733.0068 > 3730.8918) — **a cost question, not a structural one**, and
+exactly the "necessary but likely not sufficient on its own" outcome this
+task's fix_plan entry predicted (S2b-5/S2b-6's still-open Hashed-vs-Sorted
+`PathAgg` cost-tie sits upstream of the SAME candidates this arm now offers).
+Q3's own goopg plan shape also diverges from PG's well before the ORDER BY
+node — goopg elects a Nested-Loop/Bitmap-Heap-Scan join with no Gather Merge
+at all, where PG parallelizes a Sort under a Gather Merge below its own
+GroupAggregate — so even a won Incremental Sort tournament here would not by
+itself have produced a PG-matching plan; the cost-tie is one of several
+compounding divergences for this query, not the last one.
+
+**Corpus re-measurement**: `scripts/capture-tpcds.sh` against a fresh
+`GOOPG_INCREMENTAL_SORT=on` SF0.25 server (flag state re-verified via
+`/proc/<pid>/environ`, same discipline as the 2026-09-17h measurement) —
+`analysis/m0141/m0141-s2b7-full99-incsort-on.txt`. `grep -c "Incremental
+Sort"` = 0, still. `diff` against the pre-fix capture
+(`analysis/m0141/m0141-s7-full99-incsort-on.txt`), header/tmp-path lines
+aside, is **byte-identical** — the fix changes which candidates are offered
+and priced, but not which one wins, on this corpus. `scripts/pg-plan-parity-diff.py`
+against `bench/tpcds/plans-pg/`: `PLAN-PARITY: queries=99 match=2 shapediff=67
+unparsed=0 missingnode=27 error=3 timeout=0`, `CATEGORIES-EXCL-MATCH:
+join-order=91 join-method=69 scan-type=60 parameterisation=45
+aggregation-strategy=71 sort-strategy=77 parallelism=84 qual-placement=20
+rendering=23` — the M0137-0004 floor (TPC-DS match >= 2, Q9 + Q41) holds,
+category counts unchanged (shape-delta=0 from the diff above already implies
+this, confirmed rather than re-derived).
+
+**What this means for the remaining 4 of the 5 GroupAgg witnesses (Q43,
+Q54, Q60, Q89) and the 9 non-GroupAgg witnesses**: not separately traced this
+loop (budget), but Q3's finding generalizes structurally — the arm is
+reachable for all of them now (the populate-and-restore fix is unconditional,
+not query-specific), so any of them still failing to flip is a cost or
+upstream-shape question, the same category as Q3's, not a repeat of the
+`SearchCandidates`-empty bypass. `M0141-S2b-6-resume` (real SF1 cardinalities
+on the reloaded TPC-H cluster, gated on M0142-0003k) is the filed follow-up
+for the cost-tie side; no new ledger row is needed for "which of the 9 flip
+once the cost-tie resolves" since M0141-S2b-6-resume's own scope already
+covers a Hashed-vs-Sorted `PathAgg` cost comparison that would affect these
+too.
+
+**GOOPG_INCREMENTAL_SORT stays default-off** — unchanged reasoning from the
+2026-09-17h update: turning it on is still provably a no-op for this corpus
+(now proven by trace to be an inert-but-reachable arm rather than an
+unreachable one, which does not change the default-off verdict).
+
+Gates run: `go build ./...` clean. `go test ./internal/optimizer/...
+./internal/executor/...` both green. `scripts/capture-tpcds.sh` (full 99,
+flag-on, flag state verified against the live PID's `/proc/<pid>/environ`).
+`scripts/pg-plan-parity-diff.py` against `bench/tpcds/plans-pg/` (floor
+check, see numbers above). One traced single-query EXPLAIN (Q3) with
+`GOOPG_PGSHAPED_DP_TRACE=1` to read the `DPPATH`/`DPGROUP` lines quoted
+above. `make ralph-state-guard` passed. Pre-commit hook's pgbench smoke:
+PASS. TPC-DS SF0.25 full row-count regression sweep was NOT separately
+re-run: the diff-against-pre-fix-capture already shows byte-identical
+EXPLAIN shapes corpus-wide (0 plan changes), which by construction implies 0
+row-count changes — a sweep could not add evidence beyond what that diff
+already establishes.
+
+Resume point: **M0141-S2b-6-resume** (cost-tie, gated on M0142-0003k) is now
+the direct blocker for moving any of the 14 Incremental-Sort witnesses,
+having subsumed the structural blocker this update closes. A future loop
+with that cluster reloaded should re-run this same corpus measurement to see
+how many of the 5 GroupAgg witnesses (and possibly some of the 9 others,
+which share upstream `PathAgg`/join cost machinery) flip once real
+cardinalities separate the Hashed/Sorted cost tie.
