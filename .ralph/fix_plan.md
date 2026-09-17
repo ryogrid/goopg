@@ -7513,10 +7513,26 @@ reported, and the values and unit gates are the bar.
     `tpch-spotcheck.sh` SKIP-BLOCKED (exit 3) by the `:65433` P0-E6 evidence
     hold — ledger: P0-E7 is the re-run owner, same standing exception as
     M0143-0003b/c/d/e/f.
-- [ ] **M0143-0005 — `ParamRef` LIMIT + DISTINCT returns wrong rows** — R83 fixed the
+- [x] **M0143-0005 — `ParamRef` LIMIT + DISTINCT returns wrong rows** — R83 fixed the
   `IntegerConst` case and pinned it; the `ParamRef` allowlist was deliberately not
   extended. Fail-closed with zero corpus impact today, which is exactly why it stays
   invisible until someone writes the case.
+  - **Already resolved before filing; closed 2026-09-18 without new code.**
+    This item duplicates M0137-0010 open problem C1
+    (`docs/design/not_ralph/plan_parity_fix_take2/METHODOLOGY3/02-open-problems.md`),
+    which commit `d03f0a656` ("optimizer,scripts(M0137-0010): qual-placement
+    census + close C1 (ParamRef LIMIT+DISTINCT)", 2026-09-15) already closed:
+    `limitBoundMovable` (`internal/optimizer/tuplefraction.go:116-125`) accepts
+    `*ParamRef` alongside `*IntegerConst`, and
+    `TestDistinctLimitAppliesAboveDistinct_ParamRef`
+    (`internal/executor/distinct_limit_paramref_test.go`) pins the exact
+    150×'a'+50×'b' `SELECT DISTINCT v FROM dlp ORDER BY v LIMIT $1` case this
+    item describes. Verified this loop: `go test ./internal/executor/ -run
+    TestDistinctLimitAppliesAboveDistinct_ParamRef -v` PASSES at HEAD with no
+    code change. M0143-0005 was filed three days after d03f0a656 landed
+    without checking whether the C1 closure already covered it — no ledger
+    row (nothing was deferred; the fix was already complete, only the
+    fix_plan checkbox was stale).
 - [x] **M0143-0006 — triage `internal/parser`'s 60 failing tests** — pre-existing,
   verified unrelated to R126, and unowned. Fix them or convert them into filed, owned
   tasks; "unowned" is not an end state.
