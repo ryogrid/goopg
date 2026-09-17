@@ -6750,9 +6750,35 @@ reported, and the values and unit gates are the bar.
   `IntegerConst` case and pinned it; the `ParamRef` allowlist was deliberately not
   extended. Fail-closed with zero corpus impact today, which is exactly why it stays
   invisible until someone writes the case.
-- [ ] **M0143-0006 — triage `internal/parser`'s 60 failing tests** — pre-existing,
+- [x] **M0143-0006 — triage `internal/parser`'s 60 failing tests** — pre-existing,
   verified unrelated to R126, and unowned. Fix them or convert them into filed, owned
   tasks; "unowned" is not an end state.
+  - **Done 2026-09-17.** Root cause: `dc91bd6b7` ("fix(planner): preserve
+    grouped USING bindings for lateral", 2026-09-13) added a new field,
+    `RangeVar.GroupedJoinUnaliased` (`internal/parser/ast.go:676`, set by
+    `internal/parser/support.go:169`), which changed every `RangeVar`'s
+    `dumpStmts` text. The checked-in oracle,
+    `internal/parser/testdata/parity_goldens.txt` (1679 pinned statements,
+    `internal/parser/goldens_test.go`), was never regenerated after that
+    commit, so all 454 golden entries containing a `RangeVar` drifted —
+    `TestParityGoldensAreCurrent` plus every `assertParity`-based test whose
+    corpus happened to touch a `FROM` clause (60 test funcs; the other
+    ~1200 golden entries with no `RangeVar` were unaffected, which is why
+    some `_test.go` files in the package still passed). Not a parser
+    regression: verified programmatically (diff every changed golden pair,
+    strip the `GroupedJoinUnaliased=<bool>` token, assert byte-identical)
+    that all 454 changed lines differ **only** by the new field's presence —
+    zero other AST divergence. Fix: `GOOPG_UPDATE_GOLDENS=1 go test
+    ./internal/parser/` to regenerate, reviewed the diff per the above,
+    committed the refreshed `parity_goldens.txt` (no `.go` files changed).
+    Verified: `go test ./internal/parser/...` 0 failures (was 60);
+    `RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh` full green.
+    Coverage gap noted, not blocking: the corpus has zero statements
+    exercising `GroupedJoinUnaliased=true` (`grep -c
+    'GroupedJoinUnaliased=true' parity_goldens.txt` = 0) — the synthetic
+    unaliased parenthesized-JOIN case R104 introduced has no golden pin of
+    its own. Left as a coverage note rather than a new task since it is a
+    missing-test gap, not a divergence.
 
 - [x] **M0143-0008 — `ALTER TABLE` subcommands have no rollback-undo; a
   `ROLLBACK` after e.g. `ADD CONSTRAINT` silently leaves it permanently
