@@ -142,6 +142,40 @@ func queryUnderDBReload(t *testing.T, rt *initdb.Runtime, s *Server, dbName, sql
 	return runChainQuery(t, ctx, sql)
 }
 
+// queryUnderDBReloadDurable is queryUnderDBReload's committing twin (mirrors
+// runChainDDLDurable vs runChainDDL's naming), for a DML statement whose
+// effect a LATER queryUnderDBReload call in the same test must actually
+// observe — queryUnderDBReload always rolls back, so two independent calls
+// never see each other's writes. M0143-0003c's UNIQUE-enforcement check needs
+// exactly this: one committed INSERT for a second, non-committing INSERT to
+// collide with.
+func queryUnderDBReloadDurable(t *testing.T, rt *initdb.Runtime, s *Server, dbName, sql string) {
+	t.Helper()
+	tx, err := rt.TxnMgr.Begin(transam.IsolationReadCommitted)
+	if err != nil {
+		t.Fatalf("Begin: %v", err)
+	}
+	snap, err := rt.TxnMgr.SnapshotFor(tx)
+	if err != nil {
+		_ = rt.TxnMgr.Rollback(tx)
+		t.Fatalf("SnapshotFor: %v", err)
+	}
+	ctx := executor.NewContext()
+	ctx.Pool = rt.Pool
+	ctx.Catalog = rt.Catalog
+	ctx.TxnMgr = rt.TxnMgr
+	ctx.Tx = tx
+	ctx.Snap = snap
+	s.wireExtensionRows(ctx, dbName)
+	if _, err := runChainQuery(t, ctx, sql); err != nil {
+		_ = rt.TxnMgr.Rollback(tx)
+		t.Fatalf("db %s: %q: %v", dbName, sql, err)
+	}
+	if err := rt.TxnMgr.Commit(tx); err != nil {
+		t.Fatalf("db %s: commit(%q): %v", dbName, sql, err)
+	}
+}
+
 // TestDatabaseDDLReloadAcrossRestart drives two non-default databases (r1,
 // r2), each with its own FK-bearing table pair, through a genuine
 // Close+Open restart and re-verifies, post-reload:
@@ -189,8 +223,14 @@ func TestDatabaseDDLReloadAcrossRestart(t *testing.T) {
 	// gap was catalog.Table.NotNullConstraints (the pg_constraint contype='n'
 	// METADATA: conname, conislocal, coninhcount), which was never written to
 	// any heap and never reloaded.
+	// M0143-0003c: a named UNIQUE (non-PRIMARY-KEY) constraint-backed index.
+	// The index's own indisunique survived reload before this fix (like any
+	// bare CREATE UNIQUE INDEX would), but catalog.Index.IsConstraint — the
+	// ONLY thing distinguishing "ADD CONSTRAINT ... UNIQUE" from a bare
+	// unique index — was never persisted or reloaded, so the constraint
+	// silently reverted to looking like a bare index after every restart.
 	runChainDDLDurable(t, rt1, s1, "r1",
-		"CREATE TABLE gauge (id int4 PRIMARY KEY, level int4 CONSTRAINT gauge_level_check CHECK (level >= 0), code text CONSTRAINT gauge_code_not_null NOT NULL)")
+		"CREATE TABLE gauge (id int4 PRIMARY KEY, level int4 CONSTRAINT gauge_level_check CHECK (level >= 0), code text CONSTRAINT gauge_code_not_null NOT NULL, tag text CONSTRAINT gauge_tag_unique UNIQUE)")
 
 	if err := rt1.SaveCatalog(); err != nil {
 		t.Fatalf("SaveCatalog: %v", err)
@@ -299,6 +339,36 @@ func TestDatabaseDDLReloadAcrossRestart(t *testing.T) {
 	}
 	if _, err := queryUnderDBReload(t, rt2, s2, "r1", "INSERT INTO gauge (id, level, code) VALUES (3, 1, NULL)"); err == nil {
 		t.Error("db r1 post-restart: INSERT violating gauge_code_not_null unexpectedly succeeded")
+	}
+
+	// M0143-0003c: the UNIQUE constraint row itself, then a behavior that only
+	// works when catalog.Index.IsConstraint is actually true post-restart —
+	// RENAME CONSTRAINT's `!Primary && Unique && IsConstraint` guard
+	// (operators_ddl.go) — rather than merely checking the row is visible.
+	// Before this fix IsConstraint reverted to false on reload, so this same
+	// RENAME would have failed 42704 "constraint ... does not exist" even
+	// though the backing index (and its uniqueness enforcement) kept working.
+	rowsR1Unique, err := queryUnderDBReload(t, rt2, s2, "r1",
+		"SELECT conname FROM pg_constraint WHERE contype = 'u' AND conrelid = 'gauge'::regclass")
+	if err != nil {
+		t.Fatalf("db r1 post-restart: SELECT pg_constraint contype=u: %v", err)
+	}
+	if len(rowsR1Unique) != 1 || string(rowsR1Unique[0][0].Buf) != "gauge_tag_unique" {
+		t.Errorf("db r1 post-restart: pg_constraint UNIQUE rows = %v, want exactly [gauge_tag_unique]", rowsR1Unique)
+	}
+	// runChainDDLDurable, not queryUnderDBReload: DDL ops signal completion via
+	// a single nil-error/nil-slot Next() rather than EOF, which
+	// queryUnderDBReload's underlying runChainQuery (an unconditional
+	// Next()-then-Materialize() loop meant for SELECT/INSERT/DML) cannot
+	// handle — it would try to Materialize() that nil slot and panic. A
+	// pre-fix failure here would surface as runChainDDLDurable's own
+	// t.Fatalf (42704 "constraint ... does not exist"), not a silent pass.
+	runChainDDLDurable(t, rt2, s2, "r1", "ALTER TABLE gauge RENAME CONSTRAINT gauge_tag_unique TO gauge_tag_uniq2")
+	// The first INSERT must actually COMMIT for the second to have something
+	// to collide with — queryUnderDBReload always rolls back.
+	queryUnderDBReloadDurable(t, rt2, s2, "r1", "INSERT INTO gauge (id, level, code, tag) VALUES (4, 1, 'ok', 'dup')")
+	if _, err := queryUnderDBReload(t, rt2, s2, "r1", "INSERT INTO gauge (id, level, code, tag) VALUES (5, 1, 'ok', 'dup')"); err == nil {
+		t.Error("db r1 post-restart: INSERT violating gauge_tag_uniq2 unexpectedly succeeded — UNIQUE enforcement did not survive the restart")
 	}
 
 	// Namespace isolation must also survive reload: a table created in one

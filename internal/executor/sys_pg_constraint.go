@@ -344,6 +344,122 @@ func buildPGConstraintRowForNotNull(tbl *catalog.Table, nc catalog.NamedNotNullC
 	}, nil
 }
 
+// buildPGConstraintRowForUnique builds the contype='u' pg_constraint row for
+// one UNIQUE (non-PRIMARY-KEY) constraint-backed index (M0143-0003c). Unlike
+// CHECK/NOT NULL, the constraint object here IS the index — there is no
+// separate NamedUniqueConstraint store — so the row's identity fields come
+// straight off catalog.Index: conname=idx.Name (real PG names the index after
+// the constraint by default), condeferrable/condeferred=idx.Deferrable/
+// InitiallyDeferred, and — the field this task exists to persist —
+// conindid=idx.OID. That conindid link is exactly how real PG tells an
+// ADD CONSTRAINT ... UNIQUE index apart from a bare CREATE UNIQUE INDEX on
+// reload (indisunique is identical for both; only the constraint pointing
+// back at the index distinguishes them). Field values otherwise mirror the
+// synthesised view's own projection (catalog.go's InMemory.
+// PGConstraintRowsForDBOid, contype='u'/'p'/'x' block): conenforced/
+// convalidated/conislocal are hardcoded true, coninhcount/connoinherit
+// hardcoded 0/false — the view tracks no inheritance-locality state for
+// index-backed constraints the way NamedCheckConstraint/
+// NamedNotNullConstraint do, so a new heap row must not invent any either.
+//
+// conkey carries every key column's 1-based ordinal (like NOT NULL, unlike
+// CHECK) — real PG always populates it for 'u'/'p'/'x' constraints. It comes
+// back NULL only if a key column can't be resolved to a plain table column
+// (an expression key, which ADD CONSTRAINT ... UNIQUE cannot produce; the
+// guard exists for defensive symmetry with buildPGConstraintRowForNotNull,
+// not a documented PG scenario).
+func buildPGConstraintRowForUnique(tbl *catalog.Table, idx *catalog.Index) (Row, error) {
+	conkeyDatum := NullDatum
+	if len(idx.Columns) > 0 {
+		attnums := make([]int16, 0, len(idx.Columns))
+		resolved := true
+		for _, colName := range idx.Columns {
+			if colName == "" { // expression key column — no attnum to record
+				resolved = false
+				break
+			}
+			ord, found := int16(0), false
+			for i, col := range tbl.Columns {
+				if strings.EqualFold(col.Name, colName) {
+					ord = int16(i + 1)
+					found = true
+					break
+				}
+			}
+			if !found {
+				resolved = false
+				break
+			}
+			attnums = append(attnums, ord)
+		}
+		if resolved {
+			var err error
+			conkeyDatum, err = int2ArrayDatum(attnums)
+			if err != nil {
+				return nil, err
+			}
+		}
+	}
+	return Row{
+		NewIntDatum(int64(idx.OID)),                    // 1  oid
+		NewStringDatum(idx.Name),                       // 2  conname
+		NewIntDatum(int64(catalog.PublicNamespaceOID)), // 3  connamespace
+		NewStringDatum("u"),                            // 4  contype
+		NewBoolDatum(idx.Deferrable),                   // 5  condeferrable
+		NewBoolDatum(idx.InitiallyDeferred),            // 6  condeferred
+		NewBoolDatum(true),                             // 7  conenforced
+		NewBoolDatum(true),                             // 8  convalidated
+		NewIntDatum(int64(tbl.OID)),                    // 9  conrelid
+		NewIntDatum(0),                                 // 10 contypid (not a domain constraint)
+		NewIntDatum(int64(idx.OID)),                    // 11 conindid — the durable UNIQUE-constraint signal
+		NewIntDatum(0),                                 // 12 conparentid
+		NewIntDatum(0),                                 // 13 confrelid
+		NewStringDatum(""),                             // 14 confupdtype (zero char, non-FK)
+		NewStringDatum(""),                             // 15 confdeltype
+		NewStringDatum(""),                             // 16 confmatchtype
+		NewBoolDatum(true),                             // 17 conislocal
+		NewIntDatum(0),                                 // 18 coninhcount
+		NewBoolDatum(false),                            // 19 connoinherit
+		NewBoolDatum(false),                            // 20 conperiod
+		conkeyDatum,                                    // 21 conkey — the constraint's key columns
+		NullDatum,                                      // 22 confkey
+		NullDatum,                                      // 23 conpfeqop
+		NullDatum,                                      // 24 conppeqop
+		NullDatum,                                      // 25 conffeqop
+		NullDatum,                                      // 26 confdelsetcols
+		NullDatum,                                      // 27 conexclop
+		NullDatum,                                      // 28 conbin — no expression for a UNIQUE constraint
+	}, nil
+}
+
+// writeUniqueConstraintRow journals one UNIQUE-constraint-backed index as a
+// pg_constraint heap INSERT into the TABLE's database (same per-DB routing as
+// writeCheckConstraintRow/writeNotNullConstraintRow, M0143-0003c).
+func writeUniqueConstraintRow(ctx *Context, tbl *catalog.Table, idx *catalog.Index) error {
+	row, err := buildPGConstraintRowForUnique(tbl, idx)
+	if err != nil {
+		return err
+	}
+	_, err = writeHeapRowCanonical(ctx, pgConstraintTableRel(ctx), PGConstraintColumnsPG18(), row)
+	return err
+}
+
+// stampUniqueConstraintRows stamps xmax on every contype='u' TABLE-level row
+// (conrelid=relOID) in the given database's pg_constraint heap. Mirrors
+// stampCheckConstraintRows/stampNotNullConstraintRows exactly (M0143-0003c).
+func stampUniqueConstraintRows(ctx *Context, dbOid, relOID uint32, xmax storage.TransactionID) {
+	rel := storage.RelFileNode{DBOid: dbOid, RelOid: pgConstraintRelOID, Fork: storage.MainFork}
+	cols := PGConstraintColumnsPG18()
+	stampCatalogRowsTuple(ctx, rel, xmax, func(ht storage.HeapTuple) bool {
+		natts := int(ht.Header.Infomask2 & storage.HeapNattsMask)
+		decoded := make(Row, len(cols))
+		if err := DecodeRowIntoMctxPGTuple(decoded, cols, ht.Data, ht.Bitmap, natts, nil); err != nil {
+			return false
+		}
+		return decoded[3].StringValue() == "u" && uint32(decoded[8].Int) == relOID
+	})
+}
+
 // writeNotNullConstraintRow journals one named NOT NULL constraint as a
 // pg_constraint heap INSERT into the TABLE's database (same per-DB routing as
 // writeCheckConstraintRow, M0143-0003d).

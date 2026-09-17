@@ -5215,6 +5215,35 @@ func (c *InMemory) LookupIndexByOID(oid uint32, dbOid ...uint32) (*Index, bool) 
 	return nil, false
 }
 
+// LookupIndexByOIDAllDBs is LookupIndexByOID's cross-database twin, mirroring
+// LookupTableByOIDAllDBs: it checks DefaultDBOid first, then every other
+// registered namespace. M0143-0003c's pg_constraint reload uses this (rather
+// than a single-dbOid LookupIndexByOID call) for the same reason the CHECK/
+// NOT NULL/FK loaders resolve conrelid via LookupTableByOIDAllDBs — a
+// heapDBOid-scoped lookup is not guaranteed to match the index's own
+// registration namespace in every routing edge case those loaders were
+// written defensively against.
+func (c *InMemory) LookupIndexByOIDAllDBs(oid uint32) (*Index, uint32, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	for _, idx := range c.ns(DefaultDBOid).indexes {
+		if idx.OID == oid {
+			return idx, DefaultDBOid, true
+		}
+	}
+	for nsOid := range c.namespaces {
+		if nsOid == DefaultDBOid {
+			continue
+		}
+		for _, idx := range c.ns(nsOid).indexes {
+			if idx.OID == oid {
+				return idx, nsOid, true
+			}
+		}
+	}
+	return nil, 0, false
+}
+
 // FindPartitionForValue finds the partition child that matches a given key value
 // string for a LIST-partitioned table. Returns nil if no partition matches.
 // M0096-0007.

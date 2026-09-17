@@ -4739,7 +4739,14 @@ afterExistsCheck:
 	// notNullHeapDirty. Harmless when both are false (a table with neither
 	// pays nothing extra) and idempotent when a check exists but nothing
 	// downstream actually changed it.
-	if (notNullHeapDirty || len(tbl.NamedChecks) > 0) && catalogHeapSyncAvailable(o.ctx) {
+	//
+	// M0143-0003c: the inline/table-level/named UNIQUE constraint blocks above
+	// (:4076/:4176/:4200) are the same story — a constraint-backed UNIQUE
+	// index created by any of them also postdates the early sync, so
+	// tableHasUniqueConstraintIndex joins the same trigger.
+	if (notNullHeapDirty || len(tbl.NamedChecks) > 0 ||
+		tableHasUniqueConstraintIndex(o.ctx, tbl, tableCatalogHeapDBOid(o.ctx))) &&
+		catalogHeapSyncAvailable(o.ctx) {
 		if err := o.ctx.MaterializeWriterXID(); err == nil {
 			xmax := o.ctx.Tx.XID
 			for _, dbOid := range tableCatalogDBOids(o.ctx) {
@@ -5659,7 +5666,14 @@ func (o *ddlOp) execCreatePartitionChild(s *parser.CreateTableStmt) error {
 	// so the length checks stand in for it). Re-sync only when the child
 	// actually carries a check or a named NOT NULL constraint, so the common
 	// plain-partition case pays nothing extra.
-	if (len(tbl.NamedChecks) > 0 || len(tbl.NotNullConstraints) > 0) && catalogHeapSyncAvailable(o.ctx) {
+	//
+	// M0143-0003c: the parent-PK/UNIQUE-index clone loop above also runs
+	// before this same early sync and can produce a constraint-backed UNIQUE
+	// index (IsConstraint forwarded from the parent's own index), so
+	// tableHasUniqueConstraintIndex joins the same trigger.
+	if (len(tbl.NamedChecks) > 0 || len(tbl.NotNullConstraints) > 0 ||
+		tableHasUniqueConstraintIndex(o.ctx, tbl, tableCatalogHeapDBOid(o.ctx))) &&
+		catalogHeapSyncAvailable(o.ctx) {
 		if err := o.ctx.MaterializeWriterXID(); err == nil {
 			xmax := o.ctx.Tx.XID
 			for _, dbOid := range tableCatalogDBOids(o.ctx) {
@@ -12520,6 +12534,15 @@ func (o *ddlOp) adoptExistingIndexAsConstraint(tbl *catalog.Table, act parser.Al
 			return nil, &ExecError{Code: "XX000", Pos: pos, Message: syncErr.Error()}
 		}
 	}
+	// M0143-0003c: a non-PRIMARY adoption (ADD CONSTRAINT ... UNIQUE USING
+	// INDEX) needs a durable pg_constraint row so the new IsConstraint=true
+	// survives a restart — PRIMARY KEY adoption needs none (indisprimary
+	// already carries the signal via M0143-0003a).
+	if !primary {
+		if syncErr := o.syncConstraintCatalogRow(tbl); syncErr != nil {
+			return nil, &ExecError{Code: "XX000", Pos: pos, Message: syncErr.Error()}
+		}
+	}
 	return idx, nil
 }
 
@@ -12808,6 +12831,13 @@ func (o *ddlOp) execAlterTableAddUnique(tbl *catalog.Table, act parser.AlterTabl
 		// pg_constraint re-emit the clause on dump. DU-002.
 		idx.Deferrable = act.Deferrable
 		idx.InitiallyDeferred = act.InitiallyDeferred
+		// M0143-0003c: a durable pg_constraint row so IsConstraint=true (and
+		// Deferrable/InitiallyDeferred) survive a restart — see
+		// adoptExistingIndexAsConstraint's identical call for the USING INDEX
+		// branch above.
+		if err := o.syncConstraintCatalogRow(tbl); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -18458,6 +18488,9 @@ func deleteCatalogRowsForOID(ctx *Context, dbOid uint32, relOID uint32, xmax sto
 	// M0143-0003d: stamp this relation's named NOT NULL constraint rows too
 	// (contype='n', conrelid=relOID), same reason.
 	stampNotNullConstraintRows(ctx, dbOid, relOID, xmax)
+	// M0143-0003c: stamp this relation's UNIQUE-constraint-backed index rows
+	// too (contype='u', conrelid=relOID), same reason.
+	stampUniqueConstraintRows(ctx, dbOid, relOID, xmax)
 }
 
 // syncEnumTypeToCatalogHeap writes a single pg_type row for an enum type into
@@ -18856,6 +18889,22 @@ func CatalogHeapSyncAvailable(ctx *Context) bool {
 	return catalogHeapSyncAvailable(ctx)
 }
 
+// tableHasUniqueConstraintIndex reports whether tbl carries at least one
+// UNIQUE (non-PRIMARY-KEY) constraint-backed index — the same predicate
+// syncTableToCatalogHeap's own write loop uses (M0143-0003c). Unlike
+// NamedChecks/NotNullConstraints, a table has no list field for this; the
+// constraint objects ARE the table's indexes, so the resync-dirty gates in
+// execCreateTable/execCreatePartitionChild scan IndexesOnTable directly
+// instead of checking a length.
+func tableHasUniqueConstraintIndex(ctx *Context, tbl *catalog.Table, dbOid uint32) bool {
+	for _, idx := range ctx.Catalog.IndexesOnTable(tbl, dbOid) {
+		if idx != nil && idx.Unique && !idx.Primary && idx.IsConstraint {
+			return true
+		}
+	}
+	return false
+}
+
 // syncTableToCatalogHeap writes one pg_class row and one pg_attribute row per
 // column for tbl. Called by execCreateTable after in-memory catalog is updated.
 //
@@ -19034,6 +19083,27 @@ func syncTableToCatalogHeap(ctx *Context, tbl *catalog.Table) error {
 		}
 		if err := writeNotNullConstraintRow(ctx, tbl, nc); err != nil {
 			return fmt.Errorf("pg_constraint not-null %q: %w", nc.Name, err)
+		}
+	}
+
+	// M0143-0003c: UNIQUE (non-PRIMARY-KEY) constraint-backed index
+	// persistence via real pg_constraint HEAP rows (contype='u',
+	// conindid=<index OID>), same funnel as CHECK/NOT NULL above. Real PG
+	// distinguishes an ADD CONSTRAINT ... UNIQUE index from a bare
+	// CREATE UNIQUE INDEX via a pg_constraint row whose conindid points back
+	// at the index — indisunique alone is identical for both. Before this,
+	// catalog.Index.IsConstraint was the ONLY signal and nothing reloaded it,
+	// so every UNIQUE constraint (but not a bare unique index) silently
+	// reverted to looking like a bare index after a restart, vanishing from
+	// pg_constraint/pg_dump and failing RENAME CONSTRAINT's
+	// `!Primary && Unique && IsConstraint` guard. PRIMARY KEY needs no new row
+	// here — indisprimary already survives via pg_index (M0143-0003a).
+	for _, idx := range ctx.Catalog.IndexesOnTable(tbl, heapDBOid) {
+		if idx == nil || !idx.Unique || idx.Primary || !idx.IsConstraint || idx.Name == "" || idx.OID == 0 {
+			continue
+		}
+		if err := writeUniqueConstraintRow(ctx, tbl, idx); err != nil {
+			return fmt.Errorf("pg_constraint unique %q: %w", idx.Name, err)
 		}
 	}
 

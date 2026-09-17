@@ -1725,6 +1725,19 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		_ = mgr.Close()
 		return nil, fmt.Errorf("goopg: pg_constraint NOT NULL reload: %w", err)
 	}
+	// M0143-0003c: restore catalog.Index.IsConstraint (and Deferrable/
+	// InitiallyDeferred) for UNIQUE (non-PRIMARY-KEY) constraint-backed
+	// indexes from the pg_constraint HEAP written by writeUniqueConstraintRow.
+	// Before this, an ADD CONSTRAINT ... UNIQUE index was indistinguishable
+	// from a bare CREATE UNIQUE INDEX after a restart — both have
+	// indisunique=true, and only a pg_constraint row whose conindid points
+	// back at the index (real PG's own signal) tells them apart.
+	if err := loadUniqueConstraintsFromHeap(mgr, cat, clog); err != nil {
+		_ = pool.Close()
+		_ = walWriter.Close()
+		_ = mgr.Close()
+		return nil, fmt.Errorf("goopg: pg_constraint UNIQUE reload: %w", err)
+	}
 
 	// B5 Slice C: view / materialized-view query persistence from the pg_rewrite
 	// HEAP _RETURN rules (base/<dbOid>/2618) written by writeViewRewriteRow,

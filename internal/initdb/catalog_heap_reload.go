@@ -861,6 +861,87 @@ func loadNotNullConstraintsFromHeapForDB(mgr *storage.Manager, cat *catalog.InMe
 	return nil
 }
 
+// loadUniqueConstraintsFromHeap restores catalog.Index.IsConstraint (and
+// Deferrable/InitiallyDeferred) for UNIQUE (non-PRIMARY-KEY) constraint-backed
+// indexes from the pg_constraint HEAP written by writeUniqueConstraintRow
+// (M0143-0003c). Mirrors loadCheckConstraintsFromHeap/
+// loadNotNullConstraintsFromHeap's shape, but the constraint object here IS
+// the index (linked via conindid), not a separate Table-owned list — so this
+// loader mutates catalog.Index in place rather than assigning a Table field.
+// PRIMARY KEY needs no such row (indisprimary already survives via pg_index,
+// M0143-0003a), so every row this loader sees is contype='u'.
+func loadUniqueConstraintsFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *transam.CLog) error {
+	if cat == nil {
+		return nil
+	}
+	if err := loadUniqueConstraintsFromHeapForDB(mgr, cat, clog, catalog.DefaultDBOid); err != nil {
+		return err
+	}
+	for _, dbName := range cat.ListDatabases() {
+		dbOid := cat.DatabaseOid(dbName)
+		if dbOid == 0 || dbOid == catalog.DefaultDBOid ||
+			dbOid == catalog.PostgresDBOid || dbOid == cat.DBOID() {
+			continue
+		}
+		if err := loadUniqueConstraintsFromHeapForDB(mgr, cat, clog, dbOid); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// loadUniqueConstraintsFromHeapForDB is loadUniqueConstraintsFromHeap's
+// per-DB body. See pgConstraintTableRel's routing note (sys_pg_constraint.go)
+// for why a non-default-DB table's rows live ONLY in that database's own heap.
+func loadUniqueConstraintsFromHeapForDB(mgr *storage.Manager, cat *catalog.InMemory, clog *transam.CLog, heapDBOid uint32) error {
+	type uniqueRow struct {
+		conindid             uint32
+		deferrable, deferred bool
+	}
+	rel := storage.RelFileNode{DBOid: heapDBOid, RelOid: 2606, Fork: storage.MainFork}
+	cols := executor.PGConstraintColumnsPG18()
+	rows, err := scanCatalogHeapRows(mgr, rel, clog, "pg_constraint",
+		func(ht storage.HeapTuple, tid storage.ItemPointer) (any, bool, error) {
+			natts := int(ht.Header.Infomask2 & storage.HeapNattsMask)
+			decoded := make(executor.Row, len(cols))
+			if derr := executor.DecodeRowIntoMctxPGTuple(decoded, cols, ht.Data, ht.Bitmap, natts, nil); derr != nil {
+				return nil, false, derr
+			}
+			// Only contype='u' rows with a real conindid — the field this
+			// loader exists to restore. writeUniqueConstraintRow always sets
+			// it; a zero would mean a malformed/foreign row.
+			if decoded[3].StringValue() != "u" || decoded[10].Int == 0 {
+				return nil, false, errSkipBuiltinRow
+			}
+			return uniqueRow{
+				conindid:   uint32(decoded[10].Int),
+				deferrable: decoded[4].BoolValue(),
+				deferred:   decoded[5].BoolValue(),
+			}, false, nil
+		})
+	if err != nil {
+		return err
+	}
+	for _, r := range rows {
+		ur := r.(uniqueRow)
+		idx, ok := cat.LookupIndexByOID(ur.conindid, heapDBOid)
+		if !ok || idx == nil {
+			// Fall back to a cross-database scan — same defensive posture as
+			// the CHECK/NOT NULL/FK loaders' LookupTableByOIDAllDBs, for the
+			// same reason: heapDBOid is where the ROW lives, not necessarily
+			// the namespace the index itself ended up registered under.
+			idx, _, ok = cat.LookupIndexByOIDAllDBs(ur.conindid)
+			if !ok || idx == nil {
+				continue // index dropped since the row was written
+			}
+		}
+		idx.IsConstraint = true
+		idx.Deferrable = ur.deferrable
+		idx.InitiallyDeferred = ur.deferred
+	}
+	return nil
+}
+
 // rebuildAttrdefExpr turns a stored pg_attrdef.adbin back into a goopg
 // default-expression AST. M0123-S2 (sub-slice 2): adbin now comes in two forms,
 // discriminated by the first byte — a canonical PG18 pg_node_tree always opens
