@@ -13,17 +13,25 @@ package optimizer
 // that offering the full Pathlist WITHOUT that credit cannot move a single
 // plan — this file is what makes the offer non-trivial.
 //
-// WHY GATED OFF BY DEFAULT. `createPlanNode` (createplan.go) has no arm for
-// `PathIncrementalSort` yet — S7's own implementation-order list sequences the
-// executor operator AFTER this step — so if this arm ever won a tournament in
-// production, `createPlanNode` would panic (deliberately: createplan.go's own
-// header calls that "a bug in the phase that adds it", not a case to guard
-// against). `GOOPG_INCREMENTAL_SORT` keeps that panic unreachable until the
-// executor operator lands, matching the off-by-default convention every other
-// experimental path family in this package already uses
-// (`GOOPG_PARTIAL_SORT_PATHS`, `GOOPG_PARTIAL_AGG_PATHS`, …). With the flag at
-// its default the ORDERED tournament is byte-identical to before this file
-// existed: `addIncrementalSortPaths` returns immediately.
+// WHY GATED OFF BY DEFAULT. `createPlanNode` (createplan.go) and the executor
+// (`incrementalSortOp`) both got their arms in exec-a/b (M0141-S7), so a
+// winning tournament no longer panics. The flag stays off anyway: the
+// 2026-09-17h corpus measurement ran the full TPC-DS SF0.25 corpus (99
+// queries, including all 14 Incremental-Sort witnesses) with
+// `GOOPG_INCREMENTAL_SORT=on` and found ZERO Incremental Sort nodes anywhere
+// — this arm reads `ordered.SearchCandidates`/`SearchCandidateKeys`, and
+// those are populated only inside `createOrderedPaths`
+// (upperordered.go:106-118); `electOrderedGrouping`
+// (upperorderedgrouping.go), the GROUP_AGG upper rel's own ORDER BY election
+// loop, calls `addOrderedPaths` directly without going through
+// `createOrderedPaths` first, so every GroupAgg-shaped witness (5 of the 14)
+// structurally cannot reach this arm regardless of how far S2b-5/S2b-6 take
+// the `anyTranslated` gate. See the design doc's 2026-09-17h update for the
+// full writeup and the follow-up this filed. Matches the off-by-default
+// convention every other experimental path family in this package already
+// uses (`GOOPG_PARTIAL_SORT_PATHS`, `GOOPG_PARTIAL_AGG_PATHS`, …). With the
+// flag at its default the ORDERED tournament is byte-identical to before
+// this file existed: `addIncrementalSortPaths` returns immediately.
 //
 // CHILDREN ARE ALREADY SAFE TO MATERIALIZE. The candidates this arm stacks a
 // PathIncrementalSort over come from `ordered.SearchCandidates` — real

@@ -1,0 +1,730 @@
+# M0141-S7 corpus measurement: 14 Incremental-Sort witnesses, GOOPG_INCREMENTAL_SORT=on
+# EXPLAIN only (no ANALYZE).
+# engine-id: 34f4cc9b601843bdb435a6a3662f655fdc17ba49 131760e55bb8fd879c88e3bedaeda99e5046b0e6  diff=e3b0c44298fc
+# repo-head: c3f10a329 optimizer(M0141-S7-exec-c): render IncrementalSort's Presorted Key: line [DIRTY]
+# planner-flags: GOOPG_RELSIZE_FALLBACK=retired(take2-P1-05) GOOPG_COST_DRIVEN_JOINORDER=retired(M0127-P5.9) GOOPG_MEMOIZE=unset(on) GOOPG_PARALLEL=unset(on) GOOPG_PGSHAPED_DP=unset(on) GOOPG_PGSHAPED_COLLAPSE=retired(take3-C-06) GOOPG_EXISTS_TO_ANY=unset(on) GOOPG_UNNEST_PREDP=unset(on) GOOPG_INDEXKEY_HARVEST=unset(on) GOOPG_NLI_COSTGATE=unset(current) GOOPG_HASH_OUTER_JOIN=unset(off) GOOPG_INDEX_PROBE_MULT=unset(2) GOOPG_MHJ_PACKING_OFF=retired(M0127-P6.2) GOOPG_GS_SHARE_SOURCE=retired(M0125-0048) GOOPG_NARROW_BUILD=unset(on) GOOPG_NARROW_UPPER=unset(on) GOOPG_NARROW_UPPER_SORT=unset(on) GOOPG_NARROW_LEG_HOOK=unset(on) GOOPG_NARROW_COST_INPUTS=unset(on) GOOPG_GATHER_PATHS=unset(all) GOOPG_PARTIAL_AGG_PATHS=unset(on) GOOPG_ONEREL_SEARCH=unset(off) GOOPG_PARTIAL_SORT_PATHS=unset(off) GOOPG_PG_HASH_TUPLE_SPILL_COST=unset(off) GOOPG_PG_SORT_RELATION_BYTES_COST=unset(off) GOOPG_PG_MEMOIZE_ENTRY_BYTES_COST=unset(off) GOOPG_HASHAGG_WIDTH_CURRENCY=retired(M0137-0009) GOOPG_INCREMENTAL_SORT=unset(off)
+# pinned-GUCs: work_mem=64MB max_parallel_workers_per_gather=4
+# engine-binary: pid=754420 pid-alive=yes path=/home/ryo/work/goopg/goopg/tmp/goopg-bench-bin inode=2157505 sha=3f6cfef5944e2407
+# stats-epoch: 5d4dc56356f3d676
+=== Q3
+                                                   QUERY PLAN                                                   
+----------------------------------------------------------------------------------------------------------------
+ Limit  (cost=3730.77..3731.36 rows=47 width=72)
+   ->  Sort  (cost=3730.77..3730.89 rows=47 width=72)
+         Sort Key: dt.d_year, (sum(store_sales.ss_sales_price)) DESC, item.i_brand_id
+         ->  HashAggregate  (cost=3728.41..3728.88 rows=47 width=72)
+               Group Key: dt.d_year, item.i_brand, item.i_brand_id
+               ->  Nested Loop  (cost=8.85..3728.40 rows=47 width=892)
+                     ->  Nested Loop  (cost=8.60..3551.64 rows=600 width=472)
+                           ->  Seq Scan on item  (cost=0.00..941.00 rows=15 width=480)
+                                 Filter: (i_manufact_id = 816)
+                           ->  Bitmap Heap Scan on store_sales  (cost=8.60..173.61 rows=44 width=428)
+                                 Recheck Cond: (ss_item_sk = i_item_sk)
+                                 ->  Bitmap Index Scan on store_sales_pkey  (cost=0.38..8.60 rows=44 width=428)
+                                       Index Cond: (ss_item_sk = item.i_item_sk)
+                     ->  Index Scan using date_dim_pkey on date_dim dt  (cost=0.00..0.01 rows=1 width=420)
+                           Index Cond: (d_date_sk = store_sales.ss_sold_date_sk)
+                           Filter: (d_moy = 11)
+(16 rows)
+
+=== Q4
+                                                                                                                                                                                                                           QUERY PLAN                                                                                                                                                                                                                           
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=7.73..7.75 rows=1 width=768)
+   CTE year_total
+     ->  Append  (cost=185356.77..318907.60 rows=1112988 width=292)
+           ->  GroupAggregate  (cost=185356.77..191922.22 rows=656545 width=260)
+                 Group Key: customer.c_customer_id, customer.c_first_name, customer.c_last_name, customer.c_preferred_cust_flag, customer.c_birth_country, customer.c_login, customer.c_email_address, date_dim.d_year
+                 ->  Gather Merge  (cost=106041.90..183715.41 rows=656545 width=1172)
+                       Workers Planned: 3
+                       ->  Sort  (cost=105041.86..105571.33 rows=211789 width=1172)
+                             Sort Key: customer.c_customer_id, customer.c_first_name, customer.c_last_name, customer.c_preferred_cust_flag, customer.c_birth_country, customer.c_login, customer.c_email_address, date_dim.d_year
+                             ->  Hash Join  (cost=7251.60..46030.32 rows=656545 width=372)
+                                   Hash Cond: (store_sales.ss_sold_date_sk = date_dim.d_date_sk)
+                                   ->  Hash Join  (cost=4229.00..33899.14 rows=687434 width=364)
+                                         Hash Cond: (store_sales.ss_customer_sk = customer.c_customer_sk)
+                                         ->  Parallel Seq Scan on store_sales  (cost=0.00..20132.76 rows=719876 width=428)
+                                         ->  Seq Scan on customer  (cost=0.00..2979.00 rows=100000 width=324)
+                                   ->  Seq Scan on date_dim  (cost=0.00..2109.49 rows=73049 width=420)
+           ->  GroupAggregate  (cost=69481.82..73046.25 rows=356443 width=260)
+                 Group Key: customer.c_customer_id, customer.c_first_name, customer.c_last_name, customer.c_preferred_cust_flag, customer.c_birth_country, customer.c_login, customer.c_email_address, date_dim.d_year
+                 ->  Gather Merge  (cost=26421.21..68590.71 rows=356443 width=1300)
+                       Workers Planned: 3
+                       ->  Sort  (cost=25421.17..25708.62 rows=114982 width=1300)
+                             Sort Key: customer.c_customer_id, customer.c_first_name, customer.c_last_name, customer.c_preferred_cust_flag, customer.c_birth_country, customer.c_login, customer.c_email_address, date_dim.d_year
+                             ->  Hash Join  (cost=7251.60..30051.94 rows=356443 width=372)
+                                   Hash Cond: (cs_bill_customer_sk = customer.c_customer_sk)
+                                   ->  Hash Join  (cost=3022.60..20917.11 rows=358247 width=144)
+                                         Hash Cond: (cs_sold_date_sk = date_dim.d_date_sk)
+                                         ->  Parallel Seq Scan on catalog_sales  (cost=0.00..12962.97 rows=360397 width=556)
+                                         ->  Seq Scan on date_dim_1  (cost=0.00..2109.49 rows=73049 width=420)
+                                   ->  Seq Scan on customer_1  (cost=0.00..2979.00 rows=100000 width=324)
+           ->  HashAggregate  (cost=20549.49..21549.49 rows=100000 width=260)
+                 Group Key: customer.c_customer_id, customer.c_first_name, customer.c_last_name, customer.c_preferred_cust_flag, customer.c_birth_country, customer.c_login, customer.c_email_address, date_dim.d_year
+                 ->  Hash Join  (cost=4229.25..18300.19 rows=179920 width=784)
+                       Hash Cond: (ws_bill_customer_sk = customer.c_customer_sk)
+                       ->  Nested Loop  (cost=0.25..11597.26 rows=179932 width=556)
+                             ->  Seq Scan on web_sales  (cost=0.00..6496.56 rows=179956 width=556)
+                             ->  Memoize  (cost=0.25..0.34 rows=1 width=420)
+                                   Cache Key: ws_sold_date_sk
+                                   ->  Index Scan using date_dim_pkey on date_dim_2  (cost=0.25..0.33 rows=1 width=420)
+                                         Index Cond: (d_date_sk = ws_sold_date_sk)
+                       ->  Seq Scan on customer_2  (cost=0.00..2979.00 rows=100000 width=324)
+   ->  Sort  (cost=7.73..7.74 rows=1 width=1752)
+         Sort Key: customer_id, customer_first_name, customer_last_name, customer_birth_country
+         ->  Nested Loop  (cost=3.61..7.71 rows=1 width=1752)
+               Join Filter: (((((((((customer_id = customer_id) AND (customer_id = customer_id)) AND (customer_id = customer_id)) AND (customer_id = customer_id)) AND (CASE WHEN (year_total > 0) THEN (year_total / year_total) ELSE NULL END > CASE WHEN (year_total > 0) THEN (year_total / year_total) ELSE NULL END)) AND (customer_id = customer_id)) AND (customer_id = customer_id)) AND (customer_id = customer_id)) AND (customer_id = customer_id))
+               ->  Hash Join  (cost=1.20..2.55 rows=1 width=584)
+                     Hash Cond: (customer_id = customer_id)
+                     ->  CTE Scan on year_total t_s_secyear  (cost=0.00..1.27 rows=27 width=292)
+                           Filter: ((sale_type = 's') AND (dyear = 2000))
+                     ->  CTE Scan on year_total t_s_firstyear  (cost=0.00..1.09 rows=9 width=292)
+                           Filter: (((sale_type = 's') AND (dyear = 1999)) AND (year_total > 0))
+               ->  Nested Loop  (cost=2.41..5.13 rows=1 width=1168)
+                     Join Filter: (((((CASE WHEN (year_total > 0) THEN (year_total / year_total) ELSE NULL END > CASE WHEN (year_total > 0) THEN (year_total / year_total) ELSE NULL END) AND (customer_id = customer_id)) AND (customer_id = customer_id)) AND (customer_id = customer_id)) AND (customer_id = customer_id))
+                     ->  Hash Join  (cost=1.20..2.55 rows=1 width=584)
+                           Hash Cond: (customer_id = customer_id)
+                           ->  CTE Scan on year_total t_c_secyear  (cost=0.00..1.27 rows=27 width=292)
+                                 Filter: ((sale_type = 'c') AND (dyear = 2000))
+                           ->  CTE Scan on year_total t_c_firstyear  (cost=0.00..1.09 rows=9 width=292)
+                                 Filter: (((sale_type = 'c') AND (dyear = 1999)) AND (year_total > 0))
+                     ->  Hash Join  (cost=1.20..2.55 rows=1 width=584)
+                           Hash Cond: (customer_id = customer_id)
+                           ->  CTE Scan on year_total t_w_secyear  (cost=0.00..1.27 rows=27 width=292)
+                                 Filter: ((sale_type = 'w') AND (dyear = 2000))
+                           ->  CTE Scan on year_total t_w_firstyear  (cost=0.00..1.09 rows=9 width=292)
+                                 Filter: (((sale_type = 'w') AND (dyear = 1999)) AND (year_total > 0))
+(64 rows)
+
+=== Q11
+                                                                                                                                                      QUERY PLAN                                                                                                                                                      
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=4.79..4.80 rows=1 width=512)
+   CTE year_total
+     ->  Append  (cost=185356.77..228602.61 rows=756545 width=292)
+           ->  GroupAggregate  (cost=185356.77..191922.22 rows=656545 width=260)
+                 Group Key: customer.c_customer_id, customer.c_first_name, customer.c_last_name, customer.c_preferred_cust_flag, customer.c_birth_country, customer.c_login, customer.c_email_address, date_dim.d_year
+                 ->  Gather Merge  (cost=106041.90..183715.41 rows=656545 width=1172)
+                       Workers Planned: 3
+                       ->  Sort  (cost=105041.86..105571.33 rows=211789 width=1172)
+                             Sort Key: customer.c_customer_id, customer.c_first_name, customer.c_last_name, customer.c_preferred_cust_flag, customer.c_birth_country, customer.c_login, customer.c_email_address, date_dim.d_year
+                             ->  Hash Join  (cost=7251.60..46030.32 rows=656545 width=308)
+                                   Hash Cond: (store_sales.ss_sold_date_sk = date_dim.d_date_sk)
+                                   ->  Hash Join  (cost=4229.00..33899.14 rows=687434 width=300)
+                                         Hash Cond: (store_sales.ss_customer_sk = customer.c_customer_sk)
+                                         ->  Parallel Seq Scan on store_sales  (cost=0.00..20132.76 rows=719876 width=428)
+                                         ->  Seq Scan on customer  (cost=0.00..2979.00 rows=100000 width=324)
+                                   ->  Seq Scan on date_dim  (cost=0.00..2109.49 rows=73049 width=420)
+           ->  HashAggregate  (cost=20549.49..21549.49 rows=100000 width=260)
+                 Group Key: customer.c_customer_id, customer.c_first_name, customer.c_last_name, customer.c_preferred_cust_flag, customer.c_birth_country, customer.c_login, customer.c_email_address, date_dim.d_year
+                 ->  Hash Join  (cost=4229.25..18300.19 rows=179920 width=720)
+                       Hash Cond: (ws_bill_customer_sk = customer.c_customer_sk)
+                       ->  Nested Loop  (cost=0.25..11597.26 rows=179932 width=492)
+                             ->  Seq Scan on web_sales  (cost=0.00..6496.56 rows=179956 width=556)
+                             ->  Memoize  (cost=0.25..0.34 rows=1 width=420)
+                                   Cache Key: ws_sold_date_sk
+                                   ->  Index Scan using date_dim_pkey on date_dim_1  (cost=0.25..0.33 rows=1 width=420)
+                                         Index Cond: (d_date_sk = ws_sold_date_sk)
+                       ->  Seq Scan on customer_1  (cost=0.00..2979.00 rows=100000 width=324)
+   ->  Sort  (cost=4.79..4.79 rows=1 width=1168)
+         Sort Key: customer_id, customer_first_name, customer_last_name, customer_email_address
+         ->  Nested Loop  (cost=2.27..4.77 rows=1 width=1168)
+               Join Filter: (((((customer_id = customer_id) AND (customer_id = customer_id)) AND (CASE WHEN (year_total > 0) THEN (year_total / year_total) ELSE 0.0 END > CASE WHEN (year_total > 0) THEN (year_total / year_total) ELSE 0.0 END)) AND (customer_id = customer_id)) AND (customer_id = customer_id))
+               ->  Hash Join  (cost=1.14..2.37 rows=1 width=584)
+                     Hash Cond: (customer_id = customer_id)
+                     ->  CTE Scan on year_total t_s_secyear  (cost=0.00..1.18 rows=18 width=292)
+                           Filter: ((sale_type = 's') AND (dyear = 1999))
+                     ->  CTE Scan on year_total t_s_firstyear  (cost=0.00..1.06 rows=6 width=292)
+                           Filter: (((sale_type = 's') AND (dyear = 1998)) AND (year_total > 0))
+               ->  Hash Join  (cost=1.14..2.37 rows=1 width=584)
+                     Hash Cond: (customer_id = customer_id)
+                     ->  CTE Scan on year_total t_w_secyear  (cost=0.00..1.18 rows=18 width=292)
+                           Filter: ((sale_type = 'w') AND (dyear = 1999))
+                     ->  CTE Scan on year_total t_w_firstyear  (cost=0.00..1.06 rows=6 width=292)
+                           Filter: (((sale_type = 'w') AND (dyear = 1998)) AND (year_total > 0))
+(43 rows)
+
+=== Q35
+                                                                                                                 QUERY PLAN                                                                                                                  
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=226529.94..226530.58 rows=51 width=320)
+   ->  Sort  (cost=226529.94..226530.07 rows=51 width=320)
+         Sort Key: ca.ca_state, customer_demographics.cd_gender, customer_demographics.cd_marital_status, customer_demographics.cd_dep_count, customer_demographics.cd_dep_employed_count, customer_demographics.cd_dep_college_count
+         ->  HashAggregate  (cost=226505.38..226505.89 rows=51 width=320)
+               Group Key: ca.ca_state, customer_demographics.cd_gender, customer_demographics.cd_marital_status, customer_demographics.cd_dep_count, customer_demographics.cd_dep_employed_count, customer_demographics.cd_dep_college_count
+               ->  Hash Semi Join  (cost=3478.13..226469.83 rows=1422 width=860)
+                     Hash Cond: (c.c_customer_sk = ss_customer_sk)
+                     Filter: ((c.c_customer_sk = ANY (SubPlan 1)) OR (c.c_customer_sk = ANY (SubPlan 2)))
+                     SubPlan 1
+                       ->  Hash Join  (cost=2478.13..9454.53 rows=670 width=976)
+                             Hash Cond: (ws_sold_date_sk = d_date_sk)
+                             ->  Seq Scan on web_sales  (cost=0.00..6496.56 rows=179956 width=556)
+                             ->  Seq Scan on date_dim_1  (cost=0.00..2474.73 rows=272 width=420)
+                                   Filter: ((d_year = 1999) AND (d_qoy < 4))
+                     SubPlan 2
+                       ->  Hash Join  (cost=2478.13..16401.99 rows=1334 width=976)
+                             Hash Cond: (cs_sold_date_sk = d_date_sk)
+                             ->  Seq Scan on catalog_sales  (cost=0.00..12962.97 rows=360397 width=556)
+                             ->  Seq Scan on date_dim_2  (cost=0.00..2474.73 rows=272 width=420)
+                                   Filter: ((d_year = 1999) AND (d_qoy < 4))
+                     ->  Nested Loop  (cost=1992.38..206820.83 rows=96460 width=860)
+                           ->  Hash Join  (cost=1992.00..6346.00 rows=100000 width=712)
+                                 Hash Cond: (c.c_current_addr_sk = ca.ca_address_sk)
+                                 ->  Seq Scan on customer c  (cost=0.00..2979.00 rows=100000 width=324)
+                                 ->  Seq Scan on customer_address ca  (cost=0.00..1367.00 rows=50000 width=388)
+                           ->  Memoize  (cost=0.38..2.15 rows=1 width=148)
+                                 Cache Key: c.c_current_cdemo_sk
+                                 ->  Index Scan using customer_demographics_pkey on customer_demographics  (cost=0.38..2.14 rows=1 width=148)
+                                       Index Cond: (cd_demo_sk = c.c_current_cdemo_sk)
+                     ->  Gather  (cost=3478.13..19609.18 rows=2561 width=848)
+                           Workers Planned: 3
+                           ->  Parallel Hash Join  (cost=2478.13..18353.08 rows=826 width=848)
+                                 Hash Cond: (ss_sold_date_sk = date_dim.d_date_sk)
+                                 ->  Parallel Seq Scan on store_sales  (cost=0.00..15256.18 rows=232218 width=428)
+                                 ->  Seq Scan on date_dim  (cost=0.00..2474.73 rows=272 width=420)
+                                       Filter: ((d_year = 1999) AND (d_qoy < 4))
+(36 rows)
+
+=== Q43
+                                                                                                                                                                                                                                                                                                                                                                              QUERY PLAN                                                                                                                                                                                                                                                                                                                                                                               
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=47506.09..47506.19 rows=8 width=288)
+   ->  Sort  (cost=47506.09..47506.11 rows=8 width=288)
+         Sort Key: store.s_store_name, store.s_store_id, (sum(CASE WHEN (date_dim.d_day_name = 'Sunday') THEN store_sales.ss_sales_price ELSE NULL END)), (sum(CASE WHEN (date_dim.d_day_name = 'Monday') THEN store_sales.ss_sales_price ELSE NULL END)), (sum(CASE WHEN (date_dim.d_day_name = 'Tuesday') THEN store_sales.ss_sales_price ELSE NULL END)), (sum(CASE WHEN (date_dim.d_day_name = 'Wednesday') THEN store_sales.ss_sales_price ELSE NULL END)), (sum(CASE WHEN (date_dim.d_day_name = 'Thursday') THEN store_sales.ss_sales_price ELSE NULL END)), (sum(CASE WHEN (date_dim.d_day_name = 'Friday') THEN store_sales.ss_sales_price ELSE NULL END)), (sum(CASE WHEN (date_dim.d_day_name = 'Saturday') THEN store_sales.ss_sales_price ELSE NULL END))
+         ->  HashAggregate  (cost=47492.19..47492.27 rows=8 width=288)
+               Group Key: store.s_store_name, store.s_store_id
+               ->  Nested Loop  (cost=1.55..47398.03 rows=3266 width=560)
+                     ->  Hash Join  (cost=1.30..29678.10 rows=688033 width=140)
+                           Hash Cond: (store_sales.ss_store_sk = store.s_store_sk)
+                           ->  Seq Scan on store_sales  (cost=0.00..20132.76 rows=719876 width=428)
+                           ->  Seq Scan on store  (cost=0.00..1.15 rows=12 width=676)
+                                 Filter: (s_gmt_offset = -5)
+                     ->  Memoize  (cost=0.00..0.02 rows=1 width=420)
+                           Cache Key: store_sales.ss_sold_date_sk
+                           ->  Index Scan using date_dim_pkey on date_dim  (cost=0.00..0.01 rows=1 width=420)
+                                 Index Cond: (d_date_sk = store_sales.ss_sold_date_sk)
+                                 Filter: (d_year = 2000)
+(16 rows)
+
+=== Q49
+                                                                         QUERY PLAN                                                                          
+-------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=14971.40..14971.41 rows=1 width=84)
+   ->  Sort  (cost=14971.40..14971.40 rows=1 width=84)
+         Sort Key: channel, return_rank, currency_rank, item
+         ->  HashSetOp Union  (cost=7127.89..14971.39 rows=1 width=84)
+               ->  HashSetOp Union  (cost=5314.78..7843.44 rows=1 width=84)
+                     ->  WindowAgg  (cost=2528.56..2528.60 rows=1 width=84)
+                           Filter: ((return_rank <= 10) OR (currency_rank <= 10))
+                           ->  Sort  (cost=2528.56..2528.57 rows=1 width=76)
+                                 Sort Key: currency_ratio
+                                 ->  WindowAgg  (cost=2528.54..2528.56 rows=1 width=76)
+                                       ->  Sort  (cost=2528.54..2528.55 rows=1 width=68)
+                                             Sort Key: return_ratio
+                                             ->  HashAggregate  (cost=2528.52..2528.53 rows=1 width=76)
+                                                   Group Key: ws.ws_item_sk
+                                                   ->  Nested Loop  (cost=8.63..2528.50 rows=1 width=1020)
+                                                         ->  Nested Loop  (cost=8.38..2528.04 rows=1 width=600)
+                                                               ->  Seq Scan on web_returns wr  (cost=0.00..556.00 rows=159 width=348)
+                                                                     Filter: (wr_return_amt > 10000)
+                                                               ->  Bitmap Heap Scan on web_sales ws  (cost=0.00..0.01 rows=1 width=556)
+                                                                     Recheck Cond: ((ws_item_sk = wr_item_sk) AND (ws_order_number = wr_order_number))
+                                                                     Filter: (((ws_net_profit > 1) AND (ws_net_paid > 0)) AND (ws_quantity > 0))
+                                                                     ->  Bitmap Index Scan on web_sales_pkey  (cost=0.38..8.38 rows=1 width=556)
+                                                                           Index Cond: (ws_item_sk = wr.wr_item_sk AND ws_order_number = wr.wr_order_number)
+                                                         ->  Index Scan using date_dim_pkey on date_dim  (cost=0.00..0.01 rows=1 width=420)
+                                                               Index Cond: (d_date_sk = ws.ws_sold_date_sk)
+                                                               Filter: ((d_year = 1998) AND (d_moy = 11))
+                     ->  WindowAgg  (cost=5314.78..5314.82 rows=1 width=84)
+                           Filter: ((return_rank <= 10) OR (currency_rank <= 10))
+                           ->  Sort  (cost=5314.78..5314.79 rows=1 width=76)
+                                 Sort Key: currency_ratio
+                                 ->  WindowAgg  (cost=5314.76..5314.78 rows=1 width=76)
+                                       ->  Sort  (cost=5314.76..5314.77 rows=1 width=68)
+                                             Sort Key: return_ratio
+                                             ->  HashAggregate  (cost=5314.74..5314.75 rows=1 width=76)
+                                                   Group Key: cs_item_sk
+                                                   ->  Nested Loop  (cost=8.63..5314.72 rows=1 width=1020)
+                                                         ->  Nested Loop  (cost=8.38..5314.34 rows=1 width=600)
+                                                               ->  Seq Scan on catalog_returns cr  (cost=0.00..1171.83 rows=334 width=360)
+                                                                     Filter: (cr_return_amount > 10000)
+                                                               ->  Bitmap Heap Scan on catalog_sales cs  (cost=0.00..0.01 rows=1 width=556)
+                                                                     Recheck Cond: ((cs_item_sk = cr_item_sk) AND (cs_order_number = cr_order_number))
+                                                                     Filter: (((cs_net_profit > 1) AND (cs_net_paid > 0)) AND (cs_quantity > 0))
+                                                                     ->  Bitmap Index Scan on catalog_sales_pkey  (cost=0.38..8.38 rows=1 width=556)
+                                                                           Index Cond: (cs_item_sk = cr_item_sk AND cs_order_number = cr_order_number)
+                                                         ->  Index Scan using date_dim_pkey on date_dim_1  (cost=0.00..0.01 rows=1 width=420)
+                                                               Index Cond: (d_date_sk = cs_sold_date_sk)
+                                                               Filter: ((d_year = 1998) AND (d_moy = 11))
+               ->  WindowAgg  (cost=7127.89..7127.93 rows=1 width=84)
+                     Filter: ((return_rank <= 10) OR (currency_rank <= 10))
+                     ->  Sort  (cost=7127.89..7127.90 rows=1 width=76)
+                           Sort Key: currency_ratio
+                           ->  WindowAgg  (cost=7127.87..7127.89 rows=1 width=76)
+                                 ->  Sort  (cost=7127.87..7127.88 rows=1 width=68)
+                                       Sort Key: return_ratio
+                                       ->  HashAggregate  (cost=7127.85..7127.86 rows=1 width=76)
+                                             Group Key: ss_item_sk
+                                             ->  Nested Loop  (cost=8.63..7127.83 rows=1 width=892)
+                                                   ->  Nested Loop  (cost=8.38..7127.47 rows=1 width=472)
+                                                         ->  Seq Scan on store_returns sr  (cost=0.00..2091.95 rows=406 width=332)
+                                                               Filter: (sr_return_amt > 10000)
+                                                         ->  Bitmap Heap Scan on store_sales sts  (cost=0.00..0.01 rows=1 width=428)
+                                                               Recheck Cond: ((ss_item_sk = sr_item_sk) AND (ss_ticket_number = sr_ticket_number))
+                                                               Filter: (((ss_net_profit > 1) AND (ss_net_paid > 0)) AND (ss_quantity > 0))
+                                                               ->  Bitmap Index Scan on store_sales_pkey  (cost=0.38..8.38 rows=1 width=428)
+                                                                     Index Cond: (ss_item_sk = sr_item_sk AND ss_ticket_number = sr_ticket_number)
+                                                   ->  Index Scan using date_dim_pkey on date_dim_2  (cost=0.00..0.01 rows=1 width=420)
+                                                         Index Cond: (d_date_sk = ss_sold_date_sk)
+                                                         Filter: ((d_year = 1998) AND (d_moy = 11))
+(68 rows)
+
+=== Q54
+                                                        QUERY PLAN                                                         
+---------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=1.10..1.37 rows=22 width=12)
+   CTE my_customers
+     ->  Unique  (cost=987.08..9036.38 rows=1 width=8)
+           ->  Nested Loop  (cost=987.08..9036.35 rows=1 width=824)
+                 ->  Nested Loop  (cost=986.83..9036.04 rows=1 width=500)
+                       ->  Hash Join  (cost=986.58..8617.90 rows=1381 width=80)
+                             Hash Cond: (item_sk = i_item_sk)
+                             ->  Append  (cost=0.00..16210.59 rows=540353 width=12)
+                                   ->  Seq Scan on catalog_sales  (cost=0.00..3603.97 rows=360397 width=556)
+                                   ->  Seq Scan on web_sales  (cost=0.00..1799.56 rows=179956 width=556)
+                             ->  Seq Scan on item  (cost=0.00..986.00 rows=46 width=480)
+                                   Filter: ((i_category = 'Music') AND (i_class = 'country'))
+                       ->  Index Scan using date_dim_pkey on date_dim  (cost=0.00..0.01 rows=1 width=420)
+                             Index Cond: (d_date_sk = sold_date_sk)
+                             Filter: ((d_moy = 1) AND (d_year = 1999))
+                 ->  Index Scan using customer_pkey on customer  (cost=0.25..0.30 rows=1 width=324)
+                       Index Cond: (c_customer_sk = customer_sk)
+   CTE my_revenue
+     ->  HashAggregate  (cost=22139.13..22139.35 rows=22 width=36)
+           Group Key: c_customer_sk
+           ->  Merge Join  (cost=22136.67..22139.08 rows=22 width=1920)
+                 Merge Cond: ((ca_county = s_county) AND (ca_state = s_state))
+                 Filter: ((date_dim_1.d_month_seq >= (InitPlan 1).col1) AND (date_dim_1.d_month_seq <= (InitPlan 2).col1))
+                 InitPlan 1
+                   ->  Unique  (cost=0.00..731.42 rows=31 width=8)
+                         ->  Seq Scan on date_dim_2  (cost=0.00..730.80 rows=31 width=420)
+                               Filter: ((d_year = 1999) AND (d_moy = 1))
+                 InitPlan 2
+                   ->  Unique  (cost=0.00..731.42 rows=31 width=8)
+                         ->  Seq Scan on date_dim_3  (cost=0.00..730.80 rows=31 width=420)
+                               Filter: ((d_year = 1999) AND (d_moy = 1))
+                 ->  Nested Loop  (cost=9.53..22135.01 rows=16 width=856)
+                       ->  Nested Loop  (cost=1.27..21938.61 rows=16 width=468)
+                             ->  Hash Join  (cost=1.02..21933.64 rows=17 width=48)
+                                   Hash Cond: (store_sales.ss_customer_sk = c_customer_sk)
+                                   ->  Seq Scan on store_sales  (cost=0.00..20132.76 rows=719876 width=428)
+                                   ->  CTE Scan on my_customers  (cost=0.00..0.01 rows=1 width=8)
+                             ->  Index Scan using date_dim_pkey on date_dim_1  (cost=0.25..0.28 rows=1 width=420)
+                                   Index Cond: (d_date_sk = store_sales.ss_sold_date_sk)
+                       ->  Bitmap Heap Scan on customer_address  (cost=8.26..12.27 rows=1 width=388)
+                             Recheck Cond: (ca_address_sk = c_current_addr_sk)
+                             ->  Bitmap Index Scan on customer_address_pkey  (cost=0.25..8.26 rows=1 width=388)
+                                   Index Cond: (ca_address_sk = c_current_addr_sk)
+                 ->  Seq Scan on store  (cost=0.00..1.12 rows=12 width=676)
+   CTE segments
+     ->  CTE Scan on my_revenue  (cost=0.00..0.22 rows=22 width=36)
+   ->  Sort  (cost=1.10..1.15 rows=22 width=12)
+         Sort Key: segment, (count(*))
+         ->  HashAggregate  (cost=0.28..0.49 rows=22 width=12)
+               Group Key: segment
+               ->  CTE Scan on segments  (cost=0.00..0.22 rows=22 width=4)
+(51 rows)
+
+=== Q58
+                                                                                                                                                                                  QUERY PLAN                                                                                                                                                                                  
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=4.53..4.55 rows=1 width=192)
+   CTE ss_items
+     ->  HashAggregate  (cost=20224.10..20224.66 rows=56 width=64)
+           Group Key: item_1.i_item_id
+           ->  Gather  (cost=5143.60..20223.96 rows=56 width=1328)
+                 Workers Planned: 3
+                 ->  Hash Semi Join  (cost=4143.60..50874.81 rows=56 width=1328)
+                       Hash Cond: (date_dim_3.d_date = d_date)
+                       ->  Hash Join  (cost=4143.60..43268.35 rows=687530 width=88)
+                             Hash Cond: (ss_item_sk = item_1.i_item_sk)
+                             ->  Hash Join  (cost=3022.60..32693.81 rows=687530 width=52)
+                                   Hash Cond: (ss_sold_date_sk = date_dim_3.d_date_sk)
+                                   ->  Parallel Seq Scan on store_sales  (cost=0.00..20132.76 rows=719876 width=428)
+                                   ->  Seq Scan on date_dim  (cost=0.00..2109.49 rows=73049 width=420)
+                             ->  Seq Scan on item  (cost=0.00..896.00 rows=18000 width=480)
+                       ->  Seq Scan on date_dim_1  (cost=0.00..730.55 rows=6 width=420)
+                             Filter: (d_week_seq = (InitPlan 1).col1)
+                             InitPlan 1
+                               ->  Seq Scan on date_dim_2  (cost=0.00..730.50 rows=1 width=420)
+                                     Filter: (d_date = '2001-06-16')
+   CTE cs_items
+     ->  HashAggregate  (cost=13899.50..13899.79 rows=29 width=64)
+           Group Key: item_1.i_item_id
+           ->  Gather  (cost=5143.60..13899.42 rows=29 width=1456)
+                 Workers Planned: 3
+                 ->  Hash Semi Join  (cost=4143.60..31277.37 rows=29 width=1456)
+                       Hash Cond: (date_dim_3.d_date = d_date)
+                       ->  Hash Join  (cost=4143.60..26964.01 rows=358247 width=88)
+                             Hash Cond: (catalog_sales.cs_item_sk = item_1.i_item_sk)
+                             ->  Hash Join  (cost=3022.60..20917.11 rows=358247 width=52)
+                                   Hash Cond: (catalog_sales.cs_sold_date_sk = date_dim_3.d_date_sk)
+                                   ->  Parallel Seq Scan on catalog_sales  (cost=0.00..12962.97 rows=360397 width=556)
+                                   ->  Seq Scan on date_dim_3  (cost=0.00..2109.49 rows=73049 width=420)
+                             ->  Seq Scan on item_1  (cost=0.00..896.00 rows=18000 width=480)
+                       ->  Seq Scan on date_dim_4  (cost=0.00..730.55 rows=6 width=420)
+                             Filter: (d_week_seq = (InitPlan 2).col1)
+                             InitPlan 2
+                               ->  Seq Scan on date_dim_5  (cost=0.00..730.50 rows=1 width=420)
+                                     Filter: (d_date = '2001-06-16')
+   CTE ws_items
+     ->  HashAggregate  (cost=17722.81..17722.95 rows=14 width=64)
+           Group Key: item_1.i_item_id
+           ->  Hash Semi Join  (cost=1121.25..17722.63 rows=14 width=1456)
+                 Hash Cond: (date_dim_3.d_date = d_date)
+                 ->  Hash Join  (cost=1121.25..15192.32 rows=179932 width=496)
+                       Hash Cond: (ws_item_sk = item_1.i_item_sk)
+                       ->  Nested Loop  (cost=0.25..11597.26 rows=179932 width=460)
+                             ->  Seq Scan on web_sales  (cost=0.00..6496.56 rows=179956 width=556)
+                             ->  Memoize  (cost=0.25..0.34 rows=1 width=420)
+                                   Cache Key: ws_sold_date_sk
+                                   ->  Index Scan using date_dim_pkey on date_dim_6  (cost=0.25..0.33 rows=1 width=420)
+                                         Index Cond: (d_date_sk = ws_sold_date_sk)
+                       ->  Seq Scan on item_2  (cost=0.00..896.00 rows=18000 width=480)
+                 ->  Seq Scan on date_dim_7  (cost=0.00..730.55 rows=6 width=420)
+                       Filter: (d_week_seq = (InitPlan 3).col1)
+                       InitPlan 3
+                         ->  Seq Scan on date_dim_8  (cost=0.00..730.50 rows=1 width=420)
+                               Filter: (d_date = '2001-06-16')
+   ->  Sort  (cost=4.53..4.54 rows=1 width=192)
+         Sort Key: item_id, ss_item_rev
+         ->  Hash Join  (cost=3.05..4.51 rows=1 width=192)
+               Hash Cond: ((item_id = item_id) AND (item_id = item_id))
+               Join Filter: ((((((((ss_item_rev >= (0.9 * cs_item_rev)) AND (ss_item_rev <= (1.1 * cs_item_rev))) AND (cs_item_rev >= (0.9 * ss_item_rev))) AND (cs_item_rev <= (1.1 * ss_item_rev))) AND (cs_item_rev >= (0.9 * ws_item_rev))) AND (cs_item_rev <= (1.1 * ws_item_rev))) AND (ws_item_rev >= (0.9 * cs_item_rev))) AND (ws_item_rev <= (1.1 * cs_item_rev)))
+               ->  CTE Scan on cs_items  (cost=0.00..0.29 rows=29 width=64)
+               ->  Hash Join  (cost=1.32..3.04 rows=1 width=128)
+                     Hash Cond: (item_id = item_id)
+                     Join Filter: ((((ss_item_rev >= (0.9 * ws_item_rev)) AND (ss_item_rev <= (1.1 * ws_item_rev))) AND (ws_item_rev >= (0.9 * ss_item_rev))) AND (ws_item_rev <= (1.1 * ss_item_rev)))
+                     ->  CTE Scan on ss_items  (cost=0.00..0.56 rows=56 width=64)
+                     ->  CTE Scan on ws_items  (cost=0.00..0.14 rows=14 width=64)
+(69 rows)
+
+=== Q60
+                                                                  QUERY PLAN                                                                  
+----------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=2.95..3.40 rows=36 width=64)
+   CTE ss
+     ->  HashAggregate  (cost=19573.65..19573.86 rows=21 width=64)
+           Group Key: item.i_item_id
+           ->  Hash Semi Join  (cost=3475.62..19573.39 rows=21 width=1716)
+                 Hash Cond: (item.i_item_id = i_item_id)
+                 ->  Gather  (cost=3475.62..19357.33 rows=102 width=924)
+                       Workers Planned: 3
+                       ->  Nested Loop  (cost=2475.62..18347.13 rows=33 width=924)
+                             ->  Nested Loop  (cost=2475.37..18345.78 rows=33 width=444)
+                                   ->  Parallel Hash Join  (cost=2475.12..18341.92 rows=94 width=56)
+                                         Hash Cond: (ss_sold_date_sk = date_dim.d_date_sk)
+                                         ->  Parallel Seq Scan on store_sales  (cost=0.00..15256.18 rows=232218 width=428)
+                                         ->  Seq Scan on date_dim  (cost=0.00..2474.73 rows=31 width=420)
+                                               Filter: ((d_year = 2000) AND (d_moy = 10))
+                                   ->  Index Scan using customer_address_pkey on customer_address  (cost=0.00..0.01 rows=1 width=388)
+                                         Index Cond: (ca_address_sk = ss_addr_sk)
+                                         Filter: (ca_gmt_offset = -5)
+                             ->  Index Scan using item_pkey on item  (cost=0.25..0.27 rows=1 width=480)
+                                   Index Cond: (i_item_sk = ss_item_sk)
+                 ->  Seq Scan on item_1  (cost=0.00..197.39 rows=1739 width=480)
+                       Filter: (i_category = ANY ('Jewelry'))
+   CTE cs
+     ->  Finalize HashAggregate  (cost=7052.50..7052.60 rows=10 width=64)
+           Group Key: item.i_item_id
+           ->  Gather  (cost=7052.28..7052.48 rows=10 width=64)
+                 Workers Planned: 3
+                 ->  Partial HashAggregate  (cost=7052.28..7052.38 rows=10 width=64)
+                       Group Key: item.i_item_id
+                       ->  Hash Semi Join  (cost=2475.62..16663.07 rows=10 width=1844)
+                             Hash Cond: (item.i_item_id = i_item_id)
+                             ->  Nested Loop  (cost=2475.62..16447.64 rows=56 width=924)
+                                   ->  Nested Loop  (cost=2475.37..16431.30 rows=56 width=444)
+                                         ->  Hash Join  (cost=2475.12..16385.83 rows=152 width=56)
+                                               Hash Cond: (cs_sold_date_sk = date_dim.d_date_sk)
+                                               ->  Parallel Seq Scan on catalog_sales  (cost=0.00..12962.97 rows=360397 width=556)
+                                               ->  Seq Scan on date_dim_1  (cost=0.00..2474.73 rows=31 width=420)
+                                                     Filter: ((d_year = 2000) AND (d_moy = 10))
+                                         ->  Index Scan using customer_address_pkey on customer_address_1  (cost=0.00..0.01 rows=1 width=388)
+                                               Index Cond: (ca_address_sk = cs_bill_addr_sk)
+                                               Filter: (ca_gmt_offset = -5)
+                                   ->  Index Scan using item_pkey on item_2  (cost=0.25..0.28 rows=1 width=480)
+                                         Index Cond: (i_item_sk = cs_item_sk)
+                             ->  Seq Scan on item_3  (cost=0.00..197.39 rows=1739 width=480)
+                                   Filter: (i_category = ANY ('Jewelry'))
+   CTE ws
+     ->  HashAggregate  (cost=6483.41..6483.46 rows=5 width=64)
+           Group Key: item.i_item_id
+           ->  Gather  (cost=3475.62..6483.40 rows=5 width=1844)
+                 Workers Planned: 2
+                 ->  Hash Semi Join  (cost=2475.62..9693.04 rows=5 width=1844)
+                       Hash Cond: (item.i_item_id = i_item_id)
+                       ->  Nested Loop  (cost=2475.62..9477.94 rows=28 width=924)
+                             ->  Nested Loop  (cost=2475.37..9469.30 rows=28 width=444)
+                                   ->  Hash Join  (cost=2475.12..9444.91 rows=76 width=56)
+                                         Hash Cond: (ws_sold_date_sk = date_dim.d_date_sk)
+                                         ->  Parallel Seq Scan on web_sales  (cost=0.00..6496.56 rows=179956 width=556)
+                                         ->  Seq Scan on date_dim_2  (cost=0.00..2474.73 rows=31 width=420)
+                                               Filter: ((d_year = 2000) AND (d_moy = 10))
+                                   ->  Index Scan using customer_address_pkey on customer_address_2  (cost=0.00..0.01 rows=1 width=388)
+                                         Index Cond: (ca_address_sk = ws_bill_addr_sk)
+                                         Filter: (ca_gmt_offset = -5)
+                             ->  Index Scan using item_pkey on item_4  (cost=0.25..0.30 rows=1 width=480)
+                                   Index Cond: (i_item_sk = ws_item_sk)
+                       ->  Seq Scan on item_5  (cost=0.00..197.39 rows=1739 width=480)
+                             Filter: (i_category = ANY ('Jewelry'))
+   ->  Sort  (cost=2.95..3.04 rows=36 width=64)
+         Sort Key: item_1.i_item_id, (sum(total_sales))
+         ->  HashAggregate  (cost=1.48..1.84 rows=36 width=64)
+               Group Key: item_1.i_item_id
+               ->  Append  (cost=0.00..1.39 rows=36 width=64)
+                     ->  CTE Scan on ss  (cost=0.00..0.21 rows=21 width=64)
+                     ->  CTE Scan on cs  (cost=0.00..0.10 rows=10 width=64)
+                     ->  CTE Scan on ws  (cost=0.00..0.05 rows=5 width=64)
+(74 rows)
+
+=== Q63
+                                                                                                                                                                                                                                                                      QUERY PLAN                                                                                                                                                                                                                                                                       
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=6041.18..6041.20 rows=1 width=68)
+   ->  Sort  (cost=6041.18..6041.19 rows=1 width=68)
+         Sort Key: item.i_manager_id, avg_monthly_sales, sum_sales
+         ->  WindowAgg  (cost=6041.01..6041.17 rows=1 width=68)
+               Filter: (CASE WHEN (avg_monthly_sales > 0) THEN (abs((sum_sales - avg_monthly_sales)) / avg_monthly_sales) ELSE NULL END > 0.1)
+               ->  Sort  (cost=6041.01..6041.06 rows=5 width=40)
+                     Sort Key: item.i_manager_id
+                     ->  HashAggregate  (cost=6040.90..6040.95 rows=5 width=40)
+                           Group Key: item.i_manager_id, date_dim.d_moy
+                           ->  Merge Join  (cost=6040.77..6040.90 rows=5 width=2004)
+                                 Merge Cond: (store_sales.ss_store_sk = store.s_store_sk)
+                                 ->  Nested Loop  (cost=8.85..6039.37 rows=5 width=1328)
+                                       ->  Nested Loop  (cost=8.60..5709.42 rows=1120 width=908)
+                                             ->  Seq Scan on item  (cost=0.00..941.00 rows=28 width=480)
+                                                   Filter: ((((i_category = ANY ('Books', 'Children', 'Electronics')) AND (i_class = ANY ('personal', 'portable', 'reference', 'self-help'))) AND (i_brand = ANY ('scholaramalgamalg #14', 'scholaramalgamalg #7', 'exportiunivamalg #9', 'scholaramalgamalg #9'))) OR (((i_category = ANY ('Women', 'Music', 'Men')) AND (i_class = ANY ('accessories', 'classical', 'fragrances', 'pants'))) AND (i_brand = ANY ('amalgimporto #1', 'edu packscholar #1', 'exportiimporto #1', 'importoamalg #1'))))
+                                             ->  Bitmap Heap Scan on store_sales  (cost=8.60..169.86 rows=44 width=428)
+                                                   Recheck Cond: (ss_item_sk = i_item_sk)
+                                                   ->  Bitmap Index Scan on store_sales_pkey  (cost=0.38..8.60 rows=44 width=428)
+                                                         Index Cond: (ss_item_sk = item.i_item_sk)
+                                       ->  Index Scan using date_dim_pkey on date_dim  (cost=0.00..0.01 rows=1 width=420)
+                                             Index Cond: (d_date_sk = store_sales.ss_sold_date_sk)
+                                             Filter: (d_month_seq = ANY (1222, 1223, 1224, 1225, 1226, 1227, 1228, 1229, 1230, 1231, 1232, 1233))
+                                 ->  Seq Scan on store  (cost=0.00..1.12 rows=12 width=676)
+(23 rows)
+
+=== Q64
+                                                                                                                                                         QUERY PLAN                                                                                                                                                         
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Sort  (cost=2.05..2.06 rows=1 width=944)
+   Sort Key: product_name, store_name, cnt, s1, s1
+   CTE cs_ui
+     ->  HashAggregate  (cost=7216.74..7217.03 rows=7 width=68)
+           Group Key: cs_item_sk
+           Filter: (sum(cs_ext_list_price) > (2 * sum(((catalog_returns.cr_refunded_cash + catalog_returns.cr_reversed_charge) + catalog_returns.cr_store_credit))))
+           ->  Gather  (cost=3622.65..7216.63 rows=22 width=916)
+                 Workers Planned: 3
+                 ->  Parallel Hash Join  (cost=1622.65..12754.76 rows=7 width=144)
+                       Hash Cond: ((cs_item_sk = catalog_returns.cr_item_sk) AND (cs_order_number = catalog_returns.cr_order_number))
+                       ->  Parallel Seq Scan on catalog_sales  (cost=0.00..10521.57 rows=116257 width=556)
+                       ->  Seq Scan on catalog_returns  (cost=0.00..1081.66 rows=36066 width=360)
+   CTE cross_sales
+     ->  HashAggregate  (cost=130.84..130.85 rows=1 width=472)
+           Group Key: item.i_product_name, item.i_item_sk, store.s_store_name, store.s_zip, ad1.ca_street_number, ad1.ca_street_name, ad1.ca_city, ad1.ca_zip, ad2.ca_street_number, ad2.ca_street_name, ad2.ca_city, ad2.ca_zip, d1.d_year, d2.d_year, d3.d_year
+           ->  Nested Loop  (cost=20.16..130.82 rows=1 width=5228)
+                 ->  Nested Loop  (cost=19.91..130.42 rows=1 width=4808)
+                       Join Filter: (cd1.cd_marital_status <> cd2.cd_marital_status)
+                       ->  Nested Loop  (cost=19.53..128.27 rows=1 width=4660)
+                             ->  Nested Loop  (cost=19.28..127.92 rows=1 width=4272)
+                                   ->  Nested Loop  (cost=19.16..127.76 rows=1 width=4260)
+                                         ->  Nested Loop  (cost=19.03..127.61 rows=1 width=4248)
+                                               ->  Nested Loop  (cost=18.91..127.46 rows=1 width=3572)
+                                                     ->  Nested Loop  (cost=18.66..127.06 rows=1 width=3152)
+                                                           ->  Nested Loop  (cost=18.41..126.78 rows=1 width=3104)
+                                                                 ->  Nested Loop  (cost=18.16..126.48 rows=1 width=2780)
+                                                                       ->  Nested Loop  (cost=17.91..126.20 rows=1 width=2392)
+                                                                             ->  Nested Loop  (cost=17.53..125.55 rows=1 width=2244)
+                                                                                   ->  Nested Loop  (cost=17.28..125.28 rows=1 width=2196)
+                                                                                         ->  Nested Loop  (cost=17.16..125.13 rows=1 width=1728)
+                                                                                               ->  Nested Loop  (cost=16.91..124.84 rows=1 width=1308)
+                                                                                                     Join Filter: ((store_sales.ss_item_sk = item.i_item_sk) AND (store_sales.ss_item_sk = cs_item_sk))
+                                                                                                     ->  Nested Loop  (cost=16.53..114.50 rows=5 width=880)
+                                                                                                           Filter: (item.i_item_sk = sr_item_sk)
+                                                                                                           ->  Nested Loop  (cost=8.26..87.08 rows=1 width=548)
+                                                                                                                 ->  CTE Scan on cs_ui  (cost=0.00..0.07 rows=7 width=68)
+                                                                                                                 ->  Bitmap Heap Scan on item  (cost=0.00..0.01 rows=1 width=480)
+                                                                                                                       Recheck Cond: (i_item_sk = cs_item_sk)
+                                                                                                                       Filter: (((((i_color = ANY ('orange', 'lace', 'lawn', 'misty', 'blush', 'pink')) AND (i_current_price >= 48)) AND (i_current_price <= 58)) AND (i_current_price >= 49)) AND (i_current_price <= 63))
+                                                                                                                       ->  Bitmap Index Scan on item_pkey  (cost=0.25..8.26 rows=1 width=480)
+                                                                                                                             Index Cond: (i_item_sk = cs_item_sk)
+                                                                                                           ->  Bitmap Heap Scan on store_returns  (cost=8.27..27.35 rows=5 width=332)
+                                                                                                                 Recheck Cond: (sr_item_sk = cs_item_sk)
+                                                                                                                 ->  Bitmap Index Scan on store_returns_pkey  (cost=0.25..8.27 rows=5 width=332)
+                                                                                                                       Index Cond: (sr_item_sk = cs_item_sk)
+                                                                                                     ->  Index Scan using store_sales_pkey on store_sales  (cost=0.38..2.05 rows=1 width=428)
+                                                                                                           Index Cond: (ss_item_sk = sr_item_sk AND ss_ticket_number = sr_ticket_number)
+                                                                                               ->  Index Scan using date_dim_pkey on date_dim d1  (cost=0.25..0.28 rows=1 width=420)
+                                                                                                     Index Cond: (d_date_sk = store_sales.ss_sold_date_sk)
+                                                                                         ->  Index Scan using promotion_pkey on promotion  (cost=0.12..0.14 rows=1 width=468)
+                                                                                               Index Cond: (p_promo_sk = store_sales.ss_promo_sk)
+                                                                                   ->  Index Scan using household_demographics_pkey on household_demographics hd1  (cost=0.25..0.27 rows=1 width=48)
+                                                                                         Index Cond: (hd_demo_sk = store_sales.ss_hdemo_sk)
+                                                                             ->  Index Scan using customer_demographics_pkey on customer_demographics cd1  (cost=0.38..0.63 rows=1 width=148)
+                                                                                   Index Cond: (cd_demo_sk = store_sales.ss_cdemo_sk)
+                                                                       ->  Index Scan using customer_address_pkey on customer_address ad1  (cost=0.25..0.28 rows=1 width=388)
+                                                                             Index Cond: (ca_address_sk = store_sales.ss_addr_sk)
+                                                                 ->  Index Scan using customer_pkey on customer  (cost=0.25..0.29 rows=1 width=324)
+                                                                       Index Cond: (c_customer_sk = store_sales.ss_customer_sk)
+                                                           ->  Index Scan using household_demographics_pkey on household_demographics hd2  (cost=0.25..0.27 rows=1 width=48)
+                                                                 Index Cond: (hd_demo_sk = customer.c_current_hdemo_sk)
+                                                     ->  Index Scan using date_dim_pkey on date_dim d3  (cost=0.25..0.39 rows=1 width=420)
+                                                           Index Cond: (d_date_sk = customer.c_first_shipto_date_sk)
+                                               ->  Index Scan using store_pkey on store  (cost=0.12..0.14 rows=1 width=676)
+                                                     Index Cond: (s_store_sk = store_sales.ss_store_sk)
+                                         ->  Index Scan using income_band_pkey on income_band ib1  (cost=0.12..0.14 rows=1 width=12)
+                                               Index Cond: (ib_income_band_sk = hd1.hd_income_band_sk)
+                                   ->  Index Scan using income_band_pkey on income_band ib2  (cost=0.12..0.14 rows=1 width=12)
+                                         Index Cond: (ib_income_band_sk = hd2.hd_income_band_sk)
+                             ->  Index Scan using customer_address_pkey on customer_address ad2  (cost=0.25..0.34 rows=1 width=388)
+                                   Index Cond: (ca_address_sk = customer.c_current_addr_sk)
+                       ->  Index Scan using customer_demographics_pkey on customer_demographics cd2  (cost=0.38..2.14 rows=1 width=148)
+                             Index Cond: (cd_demo_sk = customer.c_current_cdemo_sk)
+                 ->  Index Scan using date_dim_pkey on date_dim d2  (cost=0.25..0.39 rows=1 width=420)
+                       Index Cond: (d_date_sk = customer.c_first_sales_date_sk)
+   ->  Nested Loop  (cost=0.00..2.04 rows=1 width=944)
+         Join Filter: ((((item_sk = item_sk) AND (cnt <= cnt)) AND (store_name = store_name)) AND (store_zip = store_zip))
+         ->  CTE Scan on cross_sales cs1  (cost=0.00..1.01 rows=1 width=472)
+               Filter: (syear = 1999)
+         ->  CTE Scan on cross_sales cs2  (cost=0.00..1.01 rows=1 width=472)
+               Filter: (syear = 2000)
+(81 rows)
+
+=== Q67
+                                                             QUERY PLAN                                                              
+-------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=22033.18..22048.47 rows=100 width=212)
+   ->  Sort  (cost=22033.18..22047.47 rows=5715 width=212)
+         Sort Key: i_category, i_class, i_brand, i_product_name, d_year, d_qoy, d_moy, s_store_id, sumsales, rk
+         ->  WindowAgg  (cost=21243.23..21814.76 rows=5715 width=212)
+               Filter: (rk <= 100)
+               ->  Sort  (cost=21243.23..21414.69 rows=17146 width=204)
+                     Sort Key: i_category, sumsales DESC
+                     ->  HashAggregate (8 keys, 9 grouping sets)  (cost=19694.46..19865.92 rows=17146 width=204)
+                           ->  Gather  (cost=3480.24..19687.29 rows=2869 width=2004)
+                                 Workers Planned: 3
+                                 ->  Nested Loop  (cost=2480.24..18400.49 rows=925 width=2004)
+                                       ->  Parallel Hash Join  (cost=2479.99..18369.35 rows=925 width=1524)
+                                             Hash Cond: (ss_store_sk = store.s_store_sk)
+                                             ->  Parallel Hash Join  (cost=2478.72..18355.24 rows=968 width=848)
+                                                   Hash Cond: (ss_sold_date_sk = date_dim.d_date_sk)
+                                                   ->  Parallel Seq Scan on store_sales  (cost=0.00..15256.18 rows=232218 width=428)
+                                                   ->  Seq Scan on date_dim  (cost=0.00..2474.73 rows=319 width=420)
+                                                         Filter: ((d_month_seq >= 1217) AND (d_month_seq <= 1228))
+                                             ->  Seq Scan on store  (cost=0.00..1.12 rows=12 width=676)
+                                       ->  Index Scan using item_pkey on item  (cost=0.25..0.27 rows=1 width=480)
+                                             Index Cond: (i_item_sk = ss_item_sk)
+(21 rows)
+
+=== Q83
+                                                       QUERY PLAN                                                       
+------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=3.53..3.55 rows=1 width=108)
+   CTE sr_items
+     ->  HashAggregate  (cost=8818.77..8818.96 rows=19 width=36)
+           Group Key: item.i_item_id
+           ->  Hash Semi Join  (cost=1121.25..8818.53 rows=19 width=1232)
+                 Hash Cond: (date_dim.d_date = d_date)
+                 ->  Hash Join  (cost=1121.25..6639.94 rows=69086 width=468)
+                       Hash Cond: (store_returns.sr_item_sk = item.i_item_sk)
+                       ->  Nested Loop  (cost=0.25..4569.01 rows=69086 width=432)
+                             ->  Seq Scan on store_returns  (cost=0.00..1912.76 rows=71676 width=332)
+                             ->  Memoize  (cost=0.25..0.45 rows=1 width=420)
+                                   Cache Key: store_returns.sr_returned_date_sk
+                                   ->  Index Scan using date_dim_pkey on date_dim  (cost=0.25..0.44 rows=1 width=420)
+                                         Index Cond: (d_date_sk = store_returns.sr_returned_date_sk)
+                       ->  Seq Scan on item  (cost=0.00..896.00 rows=18000 width=480)
+                 ->  Hash Semi Join  (cost=0.00..1461.24 rows=20 width=420)
+                       Hash Cond: (d_week_seq = d_week_seq)
+                       ->  Seq Scan on date_dim_1  (cost=0.00..730.49 rows=73049 width=420)
+                       ->  Seq Scan on date_dim_2  (cost=0.00..730.52 rows=3 width=420)
+                             Filter: (d_date = ANY ('2001-07-13', '2001-09-10', '2001-11-16'))
+   CTE cr_items
+     ->  HashAggregate  (cost=6644.52..6644.61 rows=9 width=36)
+           Group Key: item.i_item_id
+           ->  Hash Semi Join  (cost=1121.25..6644.40 rows=9 width=1260)
+                 Hash Cond: (date_dim.d_date = d_date)
+                 ->  Nested Loop  (cost=1121.25..4822.01 rows=36066 width=468)
+                       ->  Hash Join  (cost=1121.00..2698.57 rows=36066 width=48)
+                             Hash Cond: (cr_item_sk = item.i_item_sk)
+                             ->  Seq Scan on catalog_returns  (cost=0.00..1081.66 rows=36066 width=360)
+                             ->  Seq Scan on item_1  (cost=0.00..896.00 rows=18000 width=480)
+                       ->  Memoize  (cost=0.25..0.62 rows=1 width=420)
+                             Cache Key: cr_returned_date_sk
+                             ->  Index Scan using date_dim_pkey on date_dim_3  (cost=0.25..0.61 rows=1 width=420)
+                                   Index Cond: (d_date_sk = cr_returned_date_sk)
+                 ->  Hash Semi Join  (cost=0.00..1461.24 rows=20 width=420)
+                       Hash Cond: (d_week_seq = d_week_seq)
+                       ->  Seq Scan on date_dim_4  (cost=0.00..730.49 rows=73049 width=420)
+                       ->  Seq Scan on date_dim_5  (cost=0.00..730.52 rows=3 width=420)
+                             Filter: (d_date = ANY ('2001-07-13', '2001-09-10', '2001-11-16'))
+   CTE wr_items
+     ->  HashAggregate  (cost=5898.50..5898.54 rows=4 width=36)
+           Group Key: item.i_item_id
+           ->  Hash Semi Join  (cost=1121.25..5898.45 rows=4 width=1248)
+                 Hash Cond: (date_dim.d_date = d_date)
+                 ->  Hash Join  (cost=1121.25..4257.57 rows=17113 width=468)
+                       Hash Cond: (wr_item_sk = item.i_item_sk)
+                       ->  Nested Loop  (cost=0.25..2901.27 rows=17113 width=432)
+                             ->  Seq Scan on web_returns  (cost=0.00..511.20 rows=17920 width=348)
+                             ->  Memoize  (cost=0.25..0.96 rows=1 width=420)
+                                   Cache Key: wr_returned_date_sk
+                                   ->  Index Scan using date_dim_pkey on date_dim_6  (cost=0.25..0.95 rows=1 width=420)
+                                         Index Cond: (d_date_sk = wr_returned_date_sk)
+                       ->  Seq Scan on item_2  (cost=0.00..896.00 rows=18000 width=480)
+                 ->  Hash Semi Join  (cost=0.00..1461.24 rows=20 width=420)
+                       Hash Cond: (d_week_seq = d_week_seq)
+                       ->  Seq Scan on date_dim_7  (cost=0.00..730.49 rows=73049 width=420)
+                       ->  Seq Scan on date_dim_8  (cost=0.00..730.52 rows=3 width=420)
+                             Filter: (d_date = ANY ('2001-07-13', '2001-09-10', '2001-11-16'))
+   ->  Sort  (cost=3.53..3.54 rows=1 width=108)
+         Sort Key: item_id, sr_item_qty
+         ->  Hash Join  (cost=2.23..3.52 rows=1 width=108)
+               Hash Cond: ((item_id = item_id) AND (item_id = item_id))
+               ->  CTE Scan on sr_items  (cost=0.00..0.19 rows=19 width=36)
+               ->  Hash Join  (cost=1.09..2.21 rows=1 width=72)
+                     Hash Cond: (item_id = item_id)
+                     ->  CTE Scan on cr_items  (cost=0.00..0.09 rows=9 width=36)
+                     ->  CTE Scan on wr_items  (cost=0.00..0.04 rows=4 width=36)
+(67 rows)
+
+=== Q89
+                                                                                                                                 QUERY PLAN                                                                                                                                 
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=20459.96..20460.33 rows=30 width=228)
+   ->  Sort  (cost=20459.96..20460.03 rows=30 width=228)
+         Sort Key: ((sum_sales - avg_monthly_sales)), s_store_name
+         ->  WindowAgg  (cost=20456.22..20459.22 rows=30 width=228)
+               Filter: (CASE WHEN (avg_monthly_sales <> 0) THEN (abs((sum_sales - avg_monthly_sales)) / avg_monthly_sales) ELSE NULL END > 0.1)
+               ->  Sort  (cost=20456.22..20457.12 rows=90 width=196)
+                     Sort Key: item.i_category, item.i_brand, store.s_store_name, store.s_company_name
+                     ->  HashAggregate  (cost=20452.40..20453.30 rows=90 width=196)
+                           Group Key: item.i_category, item.i_class, item.i_brand, store.s_store_name, store.s_company_name, date_dim.d_moy
+                           ->  Nested Loop  (cost=3298.17..20451.29 rows=90 width=2004)
+                                 ->  Gather  (cost=3297.92..19517.25 rows=3267 width=1524)
+                                       Workers Planned: 3
+                                       ->  Parallel Hash Join  (cost=2297.92..18190.55 rows=1054 width=1524)
+                                             Hash Cond: (ss_store_sk = store.s_store_sk)
+                                             ->  Parallel Hash Join  (cost=2296.65..18174.66 rows=1102 width=848)
+                                                   Hash Cond: (ss_sold_date_sk = date_dim.d_date_sk)
+                                                   ->  Parallel Seq Scan on store_sales  (cost=0.00..15256.18 rows=232218 width=428)
+                                                   ->  Seq Scan on date_dim  (cost=0.00..2292.11 rows=363 width=420)
+                                                         Filter: (d_year = ANY (2001))
+                                             ->  Seq Scan on store  (cost=0.00..1.12 rows=12 width=676)
+                                 ->  Index Scan using item_pkey on item  (cost=0.00..0.01 rows=1 width=480)
+                                       Index Cond: (i_item_sk = ss_item_sk)
+                                       Filter: (((i_category = ANY ('Books', 'Children', 'Electronics')) AND (i_class = ANY ('history', 'school-uniforms', 'audio'))) OR ((i_category = ANY ('Men', 'Sports', 'Shoes')) AND (i_class = ANY ('pants', 'tennis', 'womens'))))
+(23 rows)
+

@@ -130,15 +130,19 @@ const (
 	// required pathkeys, priced by `costIncrementalSort` (cheaper than a
 	// full `PathSort` because only each prefix-group needs a full in-memory
 	// sort, not the whole input). Produced only by `addIncrementalSortPaths`
-	// (incrementalsortpaths.go), gated off by default
-	// (`GOOPG_INCREMENTAL_SORT`) because `createPlanNode` has no arm for it
-	// yet — no executor node implements Incremental Sort (S7's own
-	// implementation-order list puts the executor operator AFTER this arm).
-	// Reaching `createPlanNode` with this kind therefore panics, by the same
-	// "panic loudly rather than silently mis-build" rule createplan.go's own
-	// header states for every constructed-but-unhandled kind; the flag's
-	// default keeps that panic unreachable in production until the executor
-	// operator lands.
+	// (incrementalsortpaths.go). `createPlanNode` HAS an arm for it
+	// (`createIncrementalSortPlan`, createplansimple.go, exec-b) and the
+	// executor operator exists (`incrementalSortOp`, exec-a) — the flag
+	// (`GOOPG_INCREMENTAL_SORT`) stays off by default not because either is
+	// missing but because the 2026-09-17h corpus measurement (design doc's
+	// own update) found the arm inert on the full TPC-DS corpus at HEAD:
+	// `ordered.SearchCandidates`/`SearchCandidateKeys` are populated only
+	// inside `createOrderedPaths`, and `electOrderedGrouping` — the GROUP_AGG
+	// upper rel's own ORDER BY election loop — calls `addOrderedPaths`
+	// directly, bypassing that population, so every GroupAgg-shaped witness
+	// structurally cannot reach this arm regardless of `anyTranslated`
+	// progress (S2b-5/S2b-6). See
+	// docs/design/0100-0149/m0141-s7-readjudicate-and-scope-incremental-sort.md.
 	PathIncrementalSort
 )
 

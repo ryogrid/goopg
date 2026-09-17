@@ -731,3 +731,145 @@ one of those. exec-a/b/c are now all landed, so that measurement is the
 next open action in this milestone, though it is a measurement task, not
 necessarily the next loop-sized code change — re-check the fix_plan banner
 before selecting.
+
+## Update 2026-09-17h — the corpus measurement, and why it is 0/14 and 0/99
+
+**Ran the measurement this row has been pointing at since 2026-09-17d.**
+Started the goopg TPC-DS SF0.25 cluster (`bench/tpcds/server.sh start
+sf025`) with `GOOPG_INCREMENTAL_SORT=on` exported before the start call, and
+confirmed the *live server process* actually saw it —
+`tr '\0' '\n' < /proc/<pid>/environ | grep GOOPG_INCREMENTAL_SORT` on the
+running goopg binary read back `GOOPG_INCREMENTAL_SORT=on` — not just a
+capture-header label (`scripts/planner-flags.sh`'s `unset(off)` line reflects
+the *capturing shell's* environment, not the server's, and is not proof the
+flag reached the server; the two Bash tool calls that started the server vs.
+ran the capture are separate shells, which is exactly why the direct
+`/proc/<pid>/environ` check mattered here).
+
+**Result: zero.** `scripts/capture-tpcds.sh` against the flag-on server,
+all 99 queries, EXPLAIN only:
+
+```
+grep -c "Incremental Sort" analysis/m0141/m0141-s7-full99-incsort-on.txt
+0
+```
+
+Not just the 14 witnesses — the **entire TPC-DS corpus** produces zero
+Incremental Sort nodes with the arm turned on at HEAD. Since `setCheapest`
+picks a deterministic minimum-cost winner and a losing candidate cannot
+change which path wins, "zero Incremental Sort nodes in the output" is
+equivalent to "byte-identical to flag-off across all 99 queries" — a second,
+paired flag-off capture would only reconfirm what the zero-count already
+proves, so it was not taken.
+
+**Root cause, found by reading the caller graph rather than guessing.**
+`addIncrementalSortPaths` (the third arm, `incrementalsortpaths.go:140`)
+reads `ordered.SearchCandidates` / `ordered.SearchCandidateKeys` — fields on
+the `*RelOptInfo` passed in, **not** anything derived from its own `input`
+argument. Those two fields are populated in exactly one place:
+`createOrderedPaths` (`upperordered.go:106-118`), from `searchedRelOf(input)`
+— i.e. only when `input` is itself the search's own top node.
+
+`electOrderedGrouping` (`upperorderedgrouping.go:178`) — the loop that
+decides every GROUP_AGG-shaped ORDER BY in the corpus (`planner.go:1955-1965`:
+`if selectSrfPending == nil { loopBuilt, loopElected =
+electOrderedGrouping(...) }`; `createOrderedPaths` only runs in the `else`
+branch, i.e. when `electOrderedGrouping` **declines**) calls
+`addOrderedPaths` directly, once per surviving `PathAgg` candidate
+(`upperorderedgrouping.go:236`), **without ever going through
+`createOrderedPaths` first**. `ordered.SearchCandidates` is therefore still
+whatever an unrelated earlier call left it (typically nil, since
+`fetchUpperRel`'s freshly-sized rel starts empty) for every one of
+`electOrderedGrouping`'s own `addOrderedPaths` calls — so
+`addIncrementalSortPaths` iterates zero or stale-and-irrelevant candidates
+and adds nothing, **structurally, regardless of `anyTranslated`'s state**.
+
+This means the S2b-5/S2b-6 line of work (fixing `groupingEmissionPathkeys`'s
+over-restriction so `anyTranslated` stops declining) **cannot by itself**
+connect the 5 GroupAgg-shaped witnesses (Q3, Q43, Q54, Q58, Q60, Q63, Q83 —
+re-tallied below, 7 not 5) to Incremental Sort: fixing `anyTranslated` only
+changes whether `electOrderedGrouping`'s *own* Sort-vs-no-Sort election runs;
+that election has no Incremental Sort awareness of its own, and it never
+reaches the arm that does. A further, distinct wiring step is needed inside
+`electOrderedGrouping` itself — either populate
+`ordered.SearchCandidates`/`SearchCandidateKeys` before its per-candidate
+`addOrderedPaths` calls (mirroring what `createOrderedPaths` does, scoped to
+`cands` instead of a searched join/scan tree), or give `electOrderedGrouping`
+its own incremental-sort-over-PathAgg-candidate offer. **Filed as
+M0141-S2b-7 below** (fix_plan) rather than folded into S2b-5/S2b-6, because
+it is a different call site with a different fix, not a continuation of the
+`anyTranslated` chase.
+
+**Re-verified the 14 witnesses' PG-side child node directly** (read the AST
+node immediately below each `Incremental Sort` in `bench/tpcds/plans-pg/`,
+not just the Sort Key text — Q58's leading sort key is a plain column but its
+actual child is a `Merge Join`, which the Sort Key text alone would have
+mis-classified; this re-confirms the original 2026-09-16 tally rather than
+replacing it):
+
+| producer shape | queries | count |
+|---|---|---|
+| GroupAggregate (incl. one `Finalize GroupAggregate`) | Q3, Q43, Q54, Q60, Q89 | 5 |
+| Merge Join | Q58, Q83 | 2 |
+| Nested Loop | Q4, Q11, Q35, Q64 | 4 |
+| WindowAgg | Q67 | 1 |
+| Unique (SETOP, per the 2026-09-16 S2b-1-result correction) | Q49 | 1 |
+| Subquery Scan | Q63 | 1 |
+
+**The 5 GroupAggregate witnesses are conclusively explained** by the
+`electOrderedGrouping`-bypasses-`SearchCandidates` gap above — that call
+site is the only one any GROUP BY's own ORDER BY can reach, and it never
+populates the fields the third arm reads.
+
+**The other 9 are NOT yet root-caused to the same mechanism, and this
+update does not claim they are.** The 2 `Merge Join` + 4 `Nested Loop`
+witnesses are exactly the shape S2b-2a/2b/2c targeted (a plain join/scan
+search tree feeding a top-level ORDER BY with no aggregation of its own,
+where `createOrderedPaths` — not `electOrderedGrouping` — runs and
+`searchedRelOf(input)` should succeed), so the corpus-wide zero is a genuine
+open question for that bucket: either `searchedRelOf` does not recognize
+these particular inputs as search roots (e.g. a correlated-subquery-heavy
+FROM list like Q58's), or `validatedSearchCandidateKeys` rejects every
+candidate's translated ordering, or no candidate's cost ever beats a full
+Sort even when offered. Distinguishing those needs a live
+`GOOPG_PGSHAPED_DP_TRACE=1` trace on one of these 6 queries, which this
+measurement loop did not have scope left to run. `Q67` (WindowAgg, S2b-3)
+and `Q49` (SETOP, S2b-4) and `Q63` (Subquery Scan) are each their own
+unimplemented call site (no `electOrderedWindow`/SETOP-loop/subquery-scan
+equivalent of `electOrderedGrouping` exists yet to even check for the same
+bypass) and were already known-blocked before this update.
+
+Practical upshot for this milestone: this update conclusively explains 5 of
+14 witnesses and files their fix (M0141-S2b-7); the remaining 9 stay exactly
+as blocked as before this update, with one new open question (the 6
+join/scan witnesses' unexplained zero) added rather than resolved.
+
+**exec-d verdict, definitively answered by this measurement**: still not
+needed. Zero corpus queries reach the executor operator at all — not "reach
+it but degrade for lack of spill/packed-retention/ctid", but never reach it.
+exec-d stays deferred with no change to its ledger row.
+
+**GOOPG_INCREMENTAL_SORT stays default-off.** Turning it on today is
+provably a no-op (byte-identical plans, so also byte-identical row counts —
+no regression risk either way), but a no-op default flip has no benefit to
+justify the churn of a provenance-label change across every future capture.
+Revisit once M0141-S2b-7 lands and the corpus is re-measured.
+
+Gates run: `go build ./internal/optimizer/...` clean after the two comment
+corrections this update made (`path.go`'s `PathIncrementalSort` doc comment,
+`incrementalsortpaths.go`'s file-header "WHY GATED OFF BY DEFAULT" section —
+both previously said `createPlanNode`/the executor lacked an arm, which
+exec-a/b already fixed on 2026-09-17e/f; corrected to cite this update's
+actual reason instead). No production logic changed — this update is
+measurement plus two doc-comment corrections. `scripts/capture-tpcds.sh`
+runs: `analysis/m0141/m0141-s7-witnesses-incsort-on-goopg.txt` (14-query
+targeted capture, provenance-stamped, confirms live-server flag state via
+`/proc/<pid>/environ`) and `analysis/m0141/m0141-s7-full99-incsort-on.txt`
+(full 99-query capture, confirms the 0/14 result generalizes to 0/99).
+
+Resume point: **M0141-S2b-7** (filed below, fix_plan) — wire
+`electOrderedGrouping`'s own `addOrderedPaths` calls to a genuine candidate
+set (`ordered.SearchCandidates`/`SearchCandidateKeys` populated from `cands`,
+or a dedicated offer), the same posture S2b-2a/2b already established for
+`createOrderedPaths`'s own call site. Re-run this measurement after it lands
+to see how many of the 7 GroupAgg witnesses move.

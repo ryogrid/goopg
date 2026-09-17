@@ -2637,6 +2637,33 @@ spill route is net-negative.
     approach is the wrong instrument for this question regardless of size
     tuning, since the point is to observe PG's own real-data cost
     comparison at genuinely separated cardinalities, not to construct one.
+  - [ ] **M0141-S2b-7** — filed 2026-09-17 by M0141-S7's corpus measurement
+    (design doc's "Update 2026-09-17h"). `electOrderedGrouping`
+    (`upperorderedgrouping.go:236`) calls `addOrderedPaths` directly, once
+    per surviving `PathAgg` candidate, **without ever running
+    `createOrderedPaths` first** — and `ordered.SearchCandidates`/
+    `SearchCandidateKeys` (what `addIncrementalSortPaths`, the M0141-S7
+    third arm, actually reads) are populated in exactly one place,
+    `createOrderedPaths` itself (`upperordered.go:106-118`). So every
+    GROUP_AGG-shaped ORDER BY — 5 of the 14 TPC-DS Incremental-Sort
+    witnesses (Q3/Q43/Q54/Q60/Q89, all `GroupAggregate`-family) — structurally
+    cannot reach the third arm no matter how far S2b-5/S2b-6's
+    `anyTranslated` chase goes: fixing `anyTranslated` only changes whether
+    `electOrderedGrouping`'s own Sort-vs-no-Sort election runs, and that
+    election has no Incremental Sort awareness of its own. Fix: give
+    `electOrderedGrouping`'s per-candidate `addOrderedPaths` calls a real
+    candidate set — either populate `ordered.SearchCandidates`/
+    `SearchCandidateKeys` from `cands` before the loop (mirroring
+    `createOrderedPaths`'s own population, scoped to the GROUP_AGG rel's
+    Pathlist instead of a searched join/scan tree), or give
+    `electOrderedGrouping` its own incremental-sort-over-PathAgg-candidate
+    offer. Re-run the corpus measurement
+    (`scripts/capture-tpcds.sh` against a `GOOPG_INCREMENTAL_SORT=on`
+    SF0.25 server, `bench/tpcds/plans-pg/` as reference) after landing to
+    see how many of the 5 move — note this is necessary but very likely not
+    sufficient on its own, since S2b-5/S2b-6's still-open cost-tie question
+    (Hashed-vs-Sorted `PathAgg` election) sits upstream of it for the same
+    queries.
   Needs M0141-S2 (done, see above) for the concrete TPC-H query list
   motivating S2b-0/S2b-2. Ledger row appended (task-id `m0141-s2b`).
 - [ ] **M0141-S3 — Partial-Sorted row emission** — a second Partial-mode code
@@ -2910,6 +2937,31 @@ spill route is net-negative.
     witnesses are `FOR UPDATE`/huge-group queries, so none of this is
     required to move the plan-parity metric — only do it if a corpus query
     actually needs it after exec-b's measurement runs.
+    **UPDATE 2026-09-17h (the corpus measurement ran, verdict definitive):**
+    started the SF0.25 goopg cluster with `GOOPG_INCREMENTAL_SORT=on`
+    (confirmed via `/proc/<pid>/environ` on the live server, not just a
+    capture-header label) and captured all 99 TPC-DS queries
+    (`scripts/capture-tpcds.sh`) plus a targeted 14-witness capture:
+    `grep -c "Incremental Sort" analysis/m0141/m0141-s7-full99-incsort-on.txt`
+    is **0**. Zero corpus queries reach the executor operator at all — not
+    "reach it but need spill/packed/ctid", never reach it — so exec-d's
+    "measure first" gate stays exactly where it was; still deferred, no
+    ledger change. Root-caused 5 of the 14 witnesses (the `GroupAggregate`-
+    family ones) to a *different, newly-found* mechanism gap, filed as
+    **M0141-S2b-7** above: `electOrderedGrouping` never runs
+    `createOrderedPaths`, and only `createOrderedPaths` populates the
+    `ordered.SearchCandidates`/`SearchCandidateKeys` fields the third arm
+    reads. The other 9 witnesses are not explained by this and stay exactly
+    as blocked as before (2 `Merge Join` + 4 `Nested Loop` are an open
+    question — S2b-2a/2b/2c should already cover that shape, so their own
+    zero needs a live `GOOPG_PGSHAPED_DP_TRACE=1` trace to resolve; `WindowAgg`/
+    SETOP/`Subquery Scan` are each still their own unbuilt call site).
+    `GOOPG_INCREMENTAL_SORT` stays default-off (provably inert at HEAD, so
+    no regression risk, but no benefit to justify the flip either). Full
+    writeup, the corrected 5/2/4/1/1/1 producer-shape tally (re-verified
+    against the actual child AST node, not just Sort Key text), and the two
+    stale doc-comment corrections this update made (`path.go`,
+    `incrementalsortpaths.go`): design doc's "Update 2026-09-17h" section.
 
 ## M0142 — Join-order costing (filed 2026-09-14)
 
