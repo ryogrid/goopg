@@ -1712,6 +1712,20 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		return nil, fmt.Errorf("goopg: pg_constraint CHECK reload: %w", err)
 	}
 
+	// M0143-0003d: named NOT NULL constraint metadata persistence from the
+	// same pg_constraint HEAP (contype='n', conrelid<>0), written by
+	// writeNotNullConstraintRow. Column.NotNull itself (actual attnotnull
+	// ENFORCEMENT) already reloads correctly via pg_attribute above — before
+	// this pass, only the pg_constraint 'n' rows (name, conislocal,
+	// coninhcount, connoinherit, convalidated) were rebuilt by nothing and so
+	// vanished from pg_constraint/pg_dump after every restart.
+	if err := loadNotNullConstraintsFromHeap(mgr, cat, clog); err != nil {
+		_ = pool.Close()
+		_ = walWriter.Close()
+		_ = mgr.Close()
+		return nil, fmt.Errorf("goopg: pg_constraint NOT NULL reload: %w", err)
+	}
+
 	// B5 Slice C: view / materialized-view query persistence from the pg_rewrite
 	// HEAP _RETURN rules (base/<dbOid>/2618) written by writeViewRewriteRow,
 	// replacing the retired RecordKindCreateMatView(102)/RecordKindCreateView(103)

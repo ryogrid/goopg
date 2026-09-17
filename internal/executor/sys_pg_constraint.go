@@ -287,6 +287,93 @@ func buildPGConstraintRowForTableCheck(tbl *catalog.Table, nc catalog.NamedCheck
 	}
 }
 
+// buildPGConstraintRowForNotNull builds the contype='n' pg_constraint row for
+// one named NOT NULL constraint (M0143-0003d). Field values mirror the
+// synthesised view's own projection (catalog.go's InMemory.
+// PGConstraintRowsForDBOid, NOT NULL block): conenforced is always true (PG
+// has no NOT ENFORCED spelling for a NOT NULL constraint, so
+// NamedNotNullConstraint carries no NotEnforced field to begin with),
+// convalidated is the inverse of NotValid, and conkey carries the single
+// column ordinal — unlike CHECK, a NOT NULL constraint's conkey is NOT NULL
+// in real PG (ruleutils.c's print_notnull path reads it to find the column).
+func buildPGConstraintRowForNotNull(tbl *catalog.Table, nc catalog.NamedNotNullConstraint) (Row, error) {
+	var colOrd int16
+	for i, col := range tbl.Columns {
+		if strings.EqualFold(col.Name, nc.ColName) {
+			colOrd = int16(i + 1)
+			break
+		}
+	}
+	conkeyDatum := NullDatum
+	if colOrd > 0 {
+		var err error
+		conkeyDatum, err = int2ArrayDatum([]int16{colOrd})
+		if err != nil {
+			return nil, err
+		}
+	}
+	return Row{
+		NewIntDatum(int64(nc.OID)),                     // 1  oid
+		NewStringDatum(nc.Name),                        // 2  conname
+		NewIntDatum(int64(catalog.PublicNamespaceOID)), // 3  connamespace
+		NewStringDatum("n"),                            // 4  contype
+		NewBoolDatum(false),                            // 5  condeferrable
+		NewBoolDatum(false),                            // 6  condeferred
+		NewBoolDatum(true),                              // 7  conenforced — always true (no NOT ENFORCED for NOT NULL)
+		NewBoolDatum(!nc.NotValid),                      // 8  convalidated
+		NewIntDatum(int64(tbl.OID)),                     // 9  conrelid
+		NewIntDatum(0),                                  // 10 contypid (not a domain constraint)
+		NewIntDatum(0),                                  // 11 conindid
+		NewIntDatum(0),                                  // 12 conparentid
+		NewIntDatum(0),                                  // 13 confrelid
+		NewStringDatum(""),                              // 14 confupdtype (zero char, non-FK)
+		NewStringDatum(""),                              // 15 confdeltype
+		NewStringDatum(""),                              // 16 confmatchtype
+		NewBoolDatum(nc.IsLocal),                         // 17 conislocal
+		NewIntDatum(int64(nc.InhCount)),                  // 18 coninhcount
+		NewBoolDatum(nc.NoInherit),                       // 19 connoinherit
+		NewBoolDatum(false),                              // 20 conperiod
+		conkeyDatum,                                      // 21 conkey — the one NOT NULL column
+		NullDatum,                                        // 22 confkey
+		NullDatum,                                        // 23 conpfeqop
+		NullDatum,                                        // 24 conppeqop
+		NullDatum,                                        // 25 conffeqop
+		NullDatum,                                        // 26 confdelsetcols
+		NullDatum,                                        // 27 conexclop
+		NullDatum,                                        // 28 conbin — NOT NULL has no expression
+	}, nil
+}
+
+// writeNotNullConstraintRow journals one named NOT NULL constraint as a
+// pg_constraint heap INSERT into the TABLE's database (same per-DB routing as
+// writeCheckConstraintRow, M0143-0003d).
+func writeNotNullConstraintRow(ctx *Context, tbl *catalog.Table, nc catalog.NamedNotNullConstraint) error {
+	row, err := buildPGConstraintRowForNotNull(tbl, nc)
+	if err != nil {
+		return err
+	}
+	_, err = writeHeapRowCanonical(ctx, pgConstraintTableRel(ctx), PGConstraintColumnsPG18(), row)
+	return err
+}
+
+// stampNotNullConstraintRows stamps xmax on every contype='n' TABLE-level row
+// (conrelid=relOID) in the given database's pg_constraint heap. Mirrors
+// stampCheckConstraintRows exactly (M0143-0003d) — see its comment for why the
+// row must be decoded via the descriptor rather than matched at a fixed byte
+// offset.
+func stampNotNullConstraintRows(ctx *Context, dbOid, relOID uint32, xmax storage.TransactionID) {
+	rel := storage.RelFileNode{DBOid: dbOid, RelOid: pgConstraintRelOID, Fork: storage.MainFork}
+	cols := PGConstraintColumnsPG18()
+	stampCatalogRowsTuple(ctx, rel, xmax, func(ht storage.HeapTuple) bool {
+		natts := int(ht.Header.Infomask2 & storage.HeapNattsMask)
+		decoded := make(Row, len(cols))
+		if err := DecodeRowIntoMctxPGTuple(decoded, cols, ht.Data, ht.Bitmap, natts, nil); err != nil {
+			return false
+		}
+		return decoded[3].StringValue() == "n" && uint32(decoded[8].Int) == relOID
+	})
+}
+
 // writeCheckConstraintRow journals one table-level CHECK constraint as a
 // pg_constraint heap INSERT into the TABLE's database (see
 // pgConstraintTableRel — same per-DB routing writeForeignKeyConstraintRow

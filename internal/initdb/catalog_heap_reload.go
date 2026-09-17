@@ -748,6 +748,119 @@ func loadCheckConstraintsFromHeapForDB(mgr *storage.Manager, cat *catalog.InMemo
 	return nil
 }
 
+// loadNotNullConstraintsFromHeap restores catalog.Table.NotNullConstraints
+// (contype='n', conrelid<>0) from the pg_constraint HEAP written by
+// writeNotNullConstraintRow (M0143-0003d). Mirrors
+// loadCheckConstraintsFromHeap's shape exactly. Column.NotNull itself (the
+// attnotnull ENFORCEMENT bit) already reloads correctly via pg_attribute
+// (loadUserTablesFromHeapForDB) — this pass restores only the named-
+// constraint METADATA that drives pg_constraint's 'n' rows.
+func loadNotNullConstraintsFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *transam.CLog) error {
+	if cat == nil {
+		return nil
+	}
+	if err := loadNotNullConstraintsFromHeapForDB(mgr, cat, clog, catalog.DefaultDBOid); err != nil {
+		return err
+	}
+	for _, dbName := range cat.ListDatabases() {
+		dbOid := cat.DatabaseOid(dbName)
+		if dbOid == 0 || dbOid == catalog.DefaultDBOid ||
+			dbOid == catalog.PostgresDBOid || dbOid == cat.DBOID() {
+			continue
+		}
+		if err := loadNotNullConstraintsFromHeapForDB(mgr, cat, clog, dbOid); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// loadNotNullConstraintsFromHeapForDB is loadNotNullConstraintsFromHeap's
+// per-DB body. See pgConstraintTableRel's routing note (sys_pg_constraint.go)
+// for why a non-default-DB table's rows live ONLY in that database's own heap.
+func loadNotNullConstraintsFromHeapForDB(mgr *storage.Manager, cat *catalog.InMemory, clog *transam.CLog, heapDBOid uint32) error {
+	type notNullRow struct {
+		oid                uint32
+		name               string
+		conrelid           uint32
+		conkey             []int16
+		isLocal, noInherit bool
+		inhCount           int
+		notValid           bool
+	}
+	rel := storage.RelFileNode{DBOid: heapDBOid, RelOid: 2606, Fork: storage.MainFork}
+	cols := executor.PGConstraintColumnsPG18()
+	rows, err := scanCatalogHeapRows(mgr, rel, clog, "pg_constraint",
+		func(ht storage.HeapTuple, tid storage.ItemPointer) (any, bool, error) {
+			natts := int(ht.Header.Infomask2 & storage.HeapNattsMask)
+			decoded := make(executor.Row, len(cols))
+			if derr := executor.DecodeRowIntoMctxPGTuple(decoded, cols, ht.Data, ht.Bitmap, natts, nil); derr != nil {
+				return nil, false, derr
+			}
+			// Only TABLE-level NOT NULL rows (conrelid<>0). contype='n' has no
+			// domain-level equivalent (NOT NULL is not a domain constraint
+			// kind), so this predicate alone is sufficient — unlike the CHECK
+			// loader, which also has to exclude contypid<>0 domain rows sharing
+			// the same heap.
+			if decoded[3].StringValue() != "n" || decoded[8].Int == 0 {
+				return nil, false, errSkipBuiltinRow
+			}
+			return notNullRow{
+				oid:      uint32(decoded[0].Int),
+				name:     decoded[1].StringValue(),
+				conrelid: uint32(decoded[8].Int),
+				notValid: !decoded[7].BoolValue(),
+				isLocal:  decoded[16].BoolValue(),
+				inhCount: int(decoded[17].Int),
+				noInherit: decoded[18].BoolValue(),
+				conkey:    fkAttnumsFromArrayText(decoded[20].StringValue()),
+			}, false, nil
+		})
+	if err != nil {
+		return err
+	}
+
+	byTable := make(map[uint32][]notNullRow, len(rows))
+	for _, r := range rows {
+		nr := r.(notNullRow)
+		if nr.conrelid == 0 || nr.name == "" {
+			continue
+		}
+		byTable[nr.conrelid] = append(byTable[nr.conrelid], nr)
+	}
+	for conrelid, nrs := range byTable {
+		tbl, _, ok := cat.LookupTableByOIDAllDBs(conrelid)
+		if !ok || tbl == nil {
+			continue // table dropped since the rows were written
+		}
+		// Rows are appended by the re-sync funnel, so restore in OID order to
+		// keep declaration order stable across restarts rather than
+		// inheriting physical heap order (mirrors the FK/CHECK loaders).
+		sort.Slice(nrs, func(i, j int) bool { return nrs[i].oid < nrs[j].oid })
+		named := make([]catalog.NamedNotNullConstraint, 0, len(nrs))
+		for _, nr := range nrs {
+			colNames, cok := fkColumnNames(tbl, nr.conkey)
+			if !cok || len(colNames) != 1 {
+				slog.Warn("pg_constraint NOT NULL reload: conkey attnum out of range, constraint dropped",
+					"constraint", nr.name, "table", tbl.Name, "conkey", nr.conkey)
+				continue
+			}
+			named = append(named, catalog.NamedNotNullConstraint{
+				Name: nr.name, ColName: colNames[0], OID: nr.oid,
+				NoInherit: nr.noInherit, NotValid: nr.notValid,
+				IsLocal: nr.isLocal, InhCount: nr.inhCount,
+			})
+			if nr.oid >= catalog.FirstUserOID {
+				cat.AdvanceNextOIDPast(nr.oid)
+			}
+		}
+		// Assigned UNCONDITIONALLY, same rationale as the FK/CHECK loaders'
+		// own assignments above: the heap is the truth.
+		tbl.NotNullConstraints = named
+	}
+	return nil
+}
+
 // rebuildAttrdefExpr turns a stored pg_attrdef.adbin back into a goopg
 // default-expression AST. M0123-S2 (sub-slice 2): adbin now comes in two forms,
 // discriminated by the first byte — a canonical PG18 pg_node_tree always opens

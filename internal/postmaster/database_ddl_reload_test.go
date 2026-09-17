@@ -184,8 +184,13 @@ func TestDatabaseDDLReloadAcrossRestart(t *testing.T) {
 	// catalog.Table.CheckConstraints/NamedChecks was never written to any
 	// heap and never reloaded, so this constraint's ENFORCEMENT (not just its
 	// pg_constraint row) silently vanished after every restart.
+	// M0143-0003d: a named NOT NULL constraint. Column.NotNull (actual
+	// attnotnull ENFORCEMENT) already reloaded correctly before this fix — the
+	// gap was catalog.Table.NotNullConstraints (the pg_constraint contype='n'
+	// METADATA: conname, conislocal, coninhcount), which was never written to
+	// any heap and never reloaded.
 	runChainDDLDurable(t, rt1, s1, "r1",
-		"CREATE TABLE gauge (id int4 PRIMARY KEY, level int4 CONSTRAINT gauge_level_check CHECK (level >= 0))")
+		"CREATE TABLE gauge (id int4 PRIMARY KEY, level int4 CONSTRAINT gauge_level_check CHECK (level >= 0), code text CONSTRAINT gauge_code_not_null NOT NULL)")
 
 	if err := rt1.SaveCatalog(); err != nil {
 		t.Fatalf("SaveCatalog: %v", err)
@@ -269,11 +274,31 @@ func TestDatabaseDDLReloadAcrossRestart(t *testing.T) {
 	if len(rowsR1Check) != 1 || string(rowsR1Check[0][0].Buf) != "gauge_level_check" {
 		t.Errorf("db r1 post-restart: pg_constraint CHECK rows = %v, want exactly [gauge_level_check]", rowsR1Check)
 	}
-	if _, err := queryUnderDBReload(t, rt2, s2, "r1", "INSERT INTO gauge (id, level) VALUES (1, 5)"); err != nil {
+	if _, err := queryUnderDBReload(t, rt2, s2, "r1", "INSERT INTO gauge (id, level, code) VALUES (1, 5, 'ok')"); err != nil {
 		t.Errorf("db r1 post-restart: INSERT satisfying gauge_level_check unexpectedly failed: %v", err)
 	}
-	if _, err := queryUnderDBReload(t, rt2, s2, "r1", "INSERT INTO gauge (id, level) VALUES (2, -5)"); err == nil {
+	if _, err := queryUnderDBReload(t, rt2, s2, "r1", "INSERT INTO gauge (id, level, code) VALUES (2, -5, 'ok')"); err == nil {
 		t.Error("db r1 post-restart: INSERT violating gauge_level_check unexpectedly succeeded — CHECK enforcement did not survive the restart")
+	}
+
+	// M0143-0003d: the NOT NULL constraint row itself, then actual
+	// enforcement — Column.NotNull already survived reload before this fix
+	// (attnotnull is pg_attribute-backed), so an enforcement-only assertion
+	// would pass even with zero code changed; the pg_constraint row is the
+	// part this task adds. Filtered to gauge's own conrelid: PRIMARY KEY
+	// columns (gauge.id, like parent.id/other.id above) turn out to carry
+	// their own named NOT NULL constraint too, so an unfiltered contype='n'
+	// scan of the database would also pick up every other table's PK column.
+	rowsR1NotNull, err := queryUnderDBReload(t, rt2, s2, "r1",
+		"SELECT conname FROM pg_constraint WHERE contype = 'n' AND conrelid = 'gauge'::regclass")
+	if err != nil {
+		t.Fatalf("db r1 post-restart: SELECT pg_constraint contype=n: %v", err)
+	}
+	if got, want := conNames(rowsR1NotNull), []string{"gauge_code_not_null", "gauge_id_not_null"}; !slices.Equal(got, want) {
+		t.Errorf("db r1 post-restart: pg_constraint NOT NULL rows = %v, want exactly %v", got, want)
+	}
+	if _, err := queryUnderDBReload(t, rt2, s2, "r1", "INSERT INTO gauge (id, level, code) VALUES (3, 1, NULL)"); err == nil {
+		t.Error("db r1 post-restart: INSERT violating gauge_code_not_null unexpectedly succeeded")
 	}
 
 	// Namespace isolation must also survive reload: a table created in one

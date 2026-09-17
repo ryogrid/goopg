@@ -7204,7 +7204,7 @@ reported, and the values and unit gates are the bar.
   the design doc's "M0143-0003c" section (extend 0003b's write path to also
   cover `contype='u'`, vs. a new persisted bit directly on the `pg_index`
   heap row, same shape as M0143-0003e).
-- [ ] **M0143-0003d — NOT NULL constraint named-metadata durable
+- [x] **M0143-0003d — NOT NULL constraint named-metadata durable
   persistence.**
   Parent: M0143-0003. Depends on: sequence after M0143-0003b
   (reuses its wrapper pattern). Lower severity than 0003b: `Column.NotNull`
@@ -7213,6 +7213,52 @@ reported, and the values and unit gates are the bar.
   ar.AttNotNull` — confirmed by grep, NOT a repeat of the CHECK gap). Only
   `catalog.Table.NotNullConstraints` (the PG18 named-constraint list used for
   `pg_constraint` `contype='n'` rows) is unreloaded — metadata only.
+  - **Done 2026-09-18.** Write path: `buildPGConstraintRowForNotNull`/
+    `writeNotNullConstraintRow`/`stampNotNullConstraintRows`
+    (`internal/executor/sys_pg_constraint.go`), field-matched against the
+    synthesised view's own NOT NULL projection (`catalog.go`'s
+    `PGConstraintRowsForDBOid`): `conenforced` hardcoded true (PG has no NOT
+    ENFORCED spelling for NOT NULL), `convalidated = !NotValid`, `conkey`
+    carries the single column ordinal (unlike CHECK, real PG's NOT NULL
+    `conkey` is non-null). Wired into the SAME `syncTableToCatalogHeap`
+    write loop / `deleteCatalogRowsForOID` stamp funnel 0003b uses (added
+    right after the CHECK loop/stamp call, same funnel, not a new one).
+    Resync coverage: `execCreateTable` needed NO change — its pre-existing
+    `notNullHeapDirty` flag (predates this task, added for
+    `pg_attribute.attnotnull` sync per M0134-0005y) already fires on every
+    `AddNotNull` and already triggers a full `syncTableToCatalogHeap`
+    re-run, which now emits the NOT NULL rows for free.
+    `execCreatePartitionChild` DID need a change: its 0003b-added resync
+    block gated on `len(tbl.NamedChecks) > 0` only, but that function's own
+    named-NOT-NULL block (parent-inherited + explicit `poc.NotNullColumns`)
+    mutates `tbl.NotNullConstraints` via `AddNotNull` after the same early
+    sync call — widened the condition to `len(tbl.NamedChecks) > 0 ||
+    len(tbl.NotNullConstraints) > 0`. Reload:
+    `loadNotNullConstraintsFromHeap`/`loadNotNullConstraintsFromHeapForDB`
+    (`internal/initdb/catalog_heap_reload.go`), mirroring
+    `loadCheckConstraintsFromHeapForDB`'s shape and reusing the FK loader's
+    `fkAttnumsFromArrayText`/`fkColumnNames` helpers to decode `conkey` back
+    to a column name; wired in `open.go` right after
+    `loadCheckConstraintsFromHeap`. Test:
+    `TestDatabaseDDLReloadAcrossRestart` extended — `gauge` now also
+    carries `code text CONSTRAINT gauge_code_not_null NOT NULL`. Live
+    finding: a `PRIMARY KEY` column (`gauge.id`) turns out to ALSO carry its
+    own auto-named `<table>_<col>_not_null` constraint, so an unfiltered
+    `contype='n'` scan picks up every table's PK column too — the
+    assertion filters on `conrelid = 'gauge'::regclass` and expects both
+    `gauge_code_not_null` and `gauge_id_not_null`. Verified live: temporarily
+    no-op'd the `loadNotNullConstraintsFromHeap` call in `open.go`, re-ran
+    with `-count=1` — failed with the predicted symptom
+    (`pg_constraint NOT NULL rows = []`), restored, re-ran green.
+    Gates: `go build ./...` clean; `go test ./internal/catalog/...
+    ./internal/postmaster/... ./internal/executor/... ./internal/initdb/...`
+    all PASS (one flaky, unrelated `TestSimpleQueryBatchAbortUndoesEarlierCreateType`
+    failure under full-package parallel run, reproduced identically on
+    unmodified HEAD and passed clean on every isolated/solo re-run — not
+    caused by this change); `TestDatabaseDDLReloadAcrossRestart` re-verified
+    with `-count=1` both green and via the temporary-revert probe (red as
+    predicted). No TPC-H data needed, consistent with the P0-E6-wait
+    selection rule.
 - [ ] **M0143-0003e — EXCLUDE constraint `indisexclusion` durability.**
   Parent: M0143-0003. Depends on: do together with M0143-0003c (same new
   `pg_index`-heap-row-bit decision). `indisexclusion` is a declared

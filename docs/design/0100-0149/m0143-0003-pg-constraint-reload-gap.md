@@ -1,6 +1,7 @@
-Status: in-progress — M0143-0003a (PRIMARY KEY `IsConstraint` restoration) and
-M0143-0003b (CHECK constraint write+reload) landed 2026-09-17; M0143-0003c/d/e
-remain as follow-ups, not yet started.
+Status: in-progress — M0143-0003a (PRIMARY KEY `IsConstraint` restoration),
+M0143-0003b (CHECK constraint write+reload), and M0143-0003d (NOT NULL
+named-metadata write+reload) landed 2026-09-17/18; M0143-0003c/e remain as
+follow-ups, not yet started.
 Date: 2026-09-17
 Supersedes: none
 
@@ -22,7 +23,7 @@ separate reload gap; there is no single root cause.
 |---|---|---|
 | `f` (FOREIGN KEY) | `catalog.Table.ForeignKeys` | **fixed** — R126's `loadForeignKeysFromHeapForDB` (`internal/initdb/catalog_heap_reload.go:495`) |
 | `c` (CHECK, table-level) | `catalog.Table.CheckConstraints`/`NamedChecks` | **fixed** — M0143-0003b (`writeCheckConstraintRow` / `loadCheckConstraintsFromHeapForDB`) |
-| `n` (NOT NULL, PG18 named) | `catalog.Table.NotNullConstraints` | **never written to any heap, never reloaded** — M0143-0003d (enforcement itself survives via `pg_attribute.attnotnull`/`Column.NotNull`, which *is* reloaded; only the named-constraint metadata is lost) |
+| `n` (NOT NULL, PG18 named) | `catalog.Table.NotNullConstraints` | **fixed** — M0143-0003d (`writeNotNullConstraintRow` / `loadNotNullConstraintsFromHeapForDB`; enforcement itself always survived via `pg_attribute.attnotnull`/`Column.NotNull` — only the named-constraint metadata was lost) |
 | `p`/`u` (PRIMARY KEY / UNIQUE, index-backed) | `catalog.Index.IsConstraint` (`catalog.go:2060`) | **fixed for `p` only** — M0143-0003a (this loop); `u` needs new durable state — M0143-0003c |
 | `x` (EXCLUDE) | `catalog.Index.IsExclusion` | **never restored** — M0143-0003e |
 
@@ -158,17 +159,58 @@ Either requires a schema/heap-format decision this doc does not make. File as
 its own implementation loop once 0003b's write-path plumbing exists to reuse
 (option (a) is the smaller diff if 0003b lands first).
 
-## M0143-0003d — NOT NULL constraint named-metadata durable persistence
+## M0143-0003d — NOT NULL constraint named-metadata durable persistence (landed 2026-09-18)
 
-**Not started, lower severity than 0003b**: `Column.NotNull` (the actual
-enforcement flag) already reloads correctly from `pg_attribute.attnotnull`
-(`internal/initdb/open.go`'s `loadUserTablesFromHeapForDB`, `NotNull:
-ar.AttNotNull`) — confirmed by grep, this is NOT a repeat of the CHECK gap.
-Only `catalog.Table.NotNullConstraints` (the named-constraint list PG18 uses
-for `pg_constraint` `contype='n'` rows and `pg_get_constraintdef` naming) is
-unreloaded. Same write+reload shape as 0003b, smaller blast radius (metadata
-only, not enforcement) — sequence after 0003b so it can reuse the same
-`addTableCheckAndSync`-style wrapper pattern once proven.
+**Done.** `Column.NotNull` (the actual enforcement flag) already reloaded
+correctly from `pg_attribute.attnotnull` (`internal/initdb/open.go`'s
+`loadUserTablesFromHeapForDB`, `NotNull: ar.AttNotNull`) — confirmed by grep,
+this was never a repeat of the CHECK gap. Only `catalog.Table.
+NotNullConstraints` (the named-constraint list PG18 uses for `pg_constraint`
+`contype='n'` rows and `pg_get_constraintdef` naming) was unreloaded.
+
+Landed as the exact write+reload shape 0003b predicted, reusing its funnel
+directly rather than a new wrapper:
+
+- Write: `buildPGConstraintRowForNotNull`/`writeNotNullConstraintRow`/
+  `stampNotNullConstraintRows` (`internal/executor/sys_pg_constraint.go`),
+  field-matched against the synthesised view's own NOT NULL projection
+  (`catalog.go`'s `PGConstraintRowsForDBOid`, NOT NULL block): `conenforced`
+  is hardcoded `true` (PG has no NOT ENFORCED spelling for a NOT NULL
+  constraint — `NamedNotNullConstraint` carries no `NotEnforced` field to
+  begin with), `convalidated = !NotValid`, and `conkey` carries the single
+  column ordinal (unlike CHECK, a NOT NULL constraint's `conkey` is NOT NULL
+  in real PG — `ruleutils.c`'s `print_notnull` reads it to find the column).
+  Wired into the same `syncTableToCatalogHeap` write loop and
+  `deleteCatalogRowsForOID` stamp funnel CHECK uses (write loop added right
+  after the CHECK loop; stamp call added right after
+  `stampCheckConstraintRows`).
+- Resync coverage: `execCreateTable` needed **no change** — its
+  `notNullHeapDirty` flag already fires on every `tbl.AddNotNull` call (it
+  predates this task, added for the `pg_attribute.attnotnull` sync per
+  M0134-0005y), and that flag already gates a full `syncTableToCatalogHeap`
+  re-run, which now also emits the NOT NULL rows for free.
+  `execCreatePartitionChild` was NOT already covered: its 0003b-added resync
+  block gated on `len(tbl.NamedChecks) > 0` only, but the same function's
+  named-NOT-NULL block (parent-inherited + explicit `poc.NotNullColumns`)
+  mutates `tbl.NotNullConstraints` via `AddNotNull` after the same early
+  `syncTableToCatalogHeap` call CHECK's fix already named — widened the
+  condition to `len(tbl.NamedChecks) > 0 || len(tbl.NotNullConstraints) > 0`.
+- Reload: `loadNotNullConstraintsFromHeap`/`loadNotNullConstraintsFromHeapForDB`
+  (`internal/initdb/catalog_heap_reload.go`), mirroring
+  `loadCheckConstraintsFromHeapForDB`'s shape and reusing the FK loader's
+  `fkAttnumsFromArrayText`/`fkColumnNames` helpers to decode `conkey` back to
+  a column name; wired in `open.go` right after `loadCheckConstraintsFromHeap`.
+- Test: `TestDatabaseDDLReloadAcrossRestart` extended — `gauge` now also
+  carries `code text CONSTRAINT gauge_code_not_null NOT NULL`. Finding made
+  live, not assumed: a `PRIMARY KEY` column (`gauge.id`, `parent.id`) turns
+  out to ALSO carry its own auto-named `<table>_<col>_not_null` constraint —
+  so an unfiltered `contype='n'` scan of the database picks up every table's
+  PK column, and the assertion had to filter on
+  `conrelid = 'gauge'::regclass` and expect both `gauge_code_not_null` AND
+  `gauge_id_not_null`. Verified live: temporarily no-op'd the
+  `loadNotNullConstraintsFromHeap` call in `open.go`, re-ran with `-count=1`
+  — failed with the predicted symptom (`pg_constraint NOT NULL rows = []`),
+  restored, re-ran green.
 
 ## M0143-0003e — EXCLUDE constraint `indisexclusion` durability
 

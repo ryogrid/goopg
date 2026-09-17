@@ -5649,13 +5649,17 @@ func (o *ddlOp) execCreatePartitionChild(s *parser.CreateTableStmt) error {
 			sess.RegisterOnCommitAction(tbl.OID, s.OnCommit)
 		}
 	}
-	// M0143-0003b: the CHECK-inheritance/PARTITION-OF-column-list blocks above
-	// (parent-inherited + explicit poc.CheckConstraints) mutate tbl.NamedChecks
-	// AFTER the single syncTableToCatalogHeap call near the top of this
-	// function — the identical trap CREATE TABLE's own comment documents a few
-	// hundred lines up. Re-sync only when the child actually carries a check,
-	// so the common plain-partition case pays nothing extra.
-	if len(tbl.NamedChecks) > 0 && catalogHeapSyncAvailable(o.ctx) {
+	// M0143-0003b/0003d: the CHECK-inheritance/PARTITION-OF-column-list blocks
+	// above (parent-inherited + explicit poc.CheckConstraints) mutate
+	// tbl.NamedChecks, and the named-NOT-NULL block just above mutates
+	// tbl.NotNullConstraints via AddNotNull — both AFTER the single
+	// syncTableToCatalogHeap call near the top of this function, the identical
+	// trap CREATE TABLE's own comment documents a few hundred lines up (there
+	// tracked by notNullHeapDirty; this function has no such per-mutation flag,
+	// so the length checks stand in for it). Re-sync only when the child
+	// actually carries a check or a named NOT NULL constraint, so the common
+	// plain-partition case pays nothing extra.
+	if (len(tbl.NamedChecks) > 0 || len(tbl.NotNullConstraints) > 0) && catalogHeapSyncAvailable(o.ctx) {
 		if err := o.ctx.MaterializeWriterXID(); err == nil {
 			xmax := o.ctx.Tx.XID
 			for _, dbOid := range tableCatalogDBOids(o.ctx) {
@@ -18451,6 +18455,9 @@ func deleteCatalogRowsForOID(ctx *Context, dbOid uint32, relOID uint32, xmax sto
 	// DROP must not leave stale/duplicate rows for loadCheckConstraintsFromHeap
 	// to rebuild.
 	stampCheckConstraintRows(ctx, dbOid, relOID, xmax)
+	// M0143-0003d: stamp this relation's named NOT NULL constraint rows too
+	// (contype='n', conrelid=relOID), same reason.
+	stampNotNullConstraintRows(ctx, dbOid, relOID, xmax)
 }
 
 // syncEnumTypeToCatalogHeap writes a single pg_type row for an enum type into
@@ -19007,6 +19014,26 @@ func syncTableToCatalogHeap(ctx *Context, tbl *catalog.Table) error {
 		}
 		if err := writeCheckConstraintRow(ctx, tbl, nc); err != nil {
 			return fmt.Errorf("pg_constraint check %q: %w", nc.Name, err)
+		}
+	}
+
+	// M0143-0003d: named NOT NULL constraint persistence via real pg_constraint
+	// HEAP rows (contype='n'), same funnel as the CHECK loop directly above.
+	// Column.NotNull (the actual attnotnull ENFORCEMENT bit) already reloads
+	// correctly via pg_attribute — this loop only restores the named-
+	// constraint METADATA (pg_constraint's 'n' rows: conname, conislocal,
+	// coninhcount, connoinherit, convalidated), which before this pass was
+	// rebuilt by nothing and so vanished from pg_constraint/pg_dump after
+	// every restart even though the NOT NULL enforcement itself survived.
+	for _, nc := range tbl.NotNullConstraints {
+		// Matches the synthesised view's own skip rule (catalog.go
+		// PGConstraintRowsForDBOid, NOT NULL block): an unnamed/pre-tracking
+		// entry has no catalog-visible row either way.
+		if nc.Name == "" || nc.OID == 0 {
+			continue
+		}
+		if err := writeNotNullConstraintRow(ctx, tbl, nc); err != nil {
+			return fmt.Errorf("pg_constraint not-null %q: %w", nc.Name, err)
 		}
 	}
 
