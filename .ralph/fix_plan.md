@@ -254,6 +254,95 @@ heuristic stays live.)
 - [ ] **race/internal/executor (AI-20260905-011015-001, AI-20260914-235643-002, AI-20260916-035206-002, AI-20260917-004357-003)** — race suite failed
   in `internal/executor` (also failed previous run; repro: `go test -race
   -timeout 45m ./internal/executor/`).
+  - **Re-confirmed 2026-09-18, NOT stale.** Re-ran the exact repro at HEAD
+    (`0317293db`): FAILs in 59.9s (well under the 45m timeout) with two
+    `WARNING: DATA RACE` reports — `TestParallelLateralProbeIdentity` and
+    `TestSubquerySemanticsMatrix/M20/...` — full log:
+    `tmp/race-internal-executor-20260918.log` (untracked, regenerate via the
+    repro command; not committed). Both races are the SAME known,
+    already-ledgered defect, not a new one: **do not re-file** — this is the
+    third reproduction of `.ralph/deferral_ledger.md`'s
+    `take3-instrumentscope-datarace` (2026-09-06) and
+    `e18-instrumentscope-global-races-coop-producers` (2026-09-07) rows.
+    Package-global `var instrumentScope *instrumenter`
+    (`internal/executor/instrument.go:313`) is mutated under
+    `instrumentScopeMu` by `buildUnderFreshScope`/`buildUnderNilScope`
+    (gather worker per-slot builds, `operators_gather.go:122-134`) but read
+    with NO lock by `maybeInstrument` (`instrument.go:444`), which fires on
+    every `buildNode` call — including ones reached lazily, mid-`Next()`,
+    from a **different** goroutine entirely (`seqScanOp.evalQual` ->
+    `evalInExpr`/`evalExistsExpr` -> `acquireSubPlanOp` -> the exported
+    `Build(plan)`, `subplan.go:306/325`). Confirmed this is not
+    EXPLAIN-ANALYZE-only: `gatherOp.buildChildForSlot` takes the
+    `instrumentScopeMu`/global round-trip on **every** parallel worker spawn
+    regardless of ANALYZE (nil-scope swap still mutates the shared global),
+    so the race is live on any ordinary parallel query with a concurrently
+    lazily-built SubPlan, not just an ANALYZE edge case.
+  - **Corrected the design doc's now-falsified claim**: `docs/design/executor-ex0-03b-rows/DESIGN.md`
+    section 2's B1 answer states "the package-global handoff is NEVER
+    racy" — false, appended a 2026-09-18 erratum pointing here.
+  - **Why not fixed in this loop**: the ledger's stated resume
+    ("thread the instrument scope through `Context` instead of a package
+    global") cannot be done as a signature change to the exported
+    `Build(plan)`/`BuildWorker(plan)` — grep shows **~200** call sites
+    (almost all `_test.go`) that call `Build(plan)` and only create a
+    `*Context` afterward (`op, err := Build(plan); ...; op.Open(ctx)`), so
+    threading `ctx`/scope through their signatures is not a same-loop
+    change. Traced a narrower, still-fully-correct alternative that stays
+    inside `internal/executor` with **zero external call-site changes**:
+    filed as **M-NIGHTLY-instrumentscope-race-fix** below with the concrete
+    mechanical plan. Explicitly ruled out (per the ledger's own warning,
+    re-confirmed by this loop's own read of the code): just widening
+    `instrumentScopeMu` to guard the reads too (`sync.RWMutex`) would
+    silence `-race` without fixing the semantic hazard the mutex's own doc
+    comment names (a lazily-built producer subtree adopting an unrelated
+    sibling worker's live scope and polluting its stats table) — not
+    attempted.
+  - [ ] **M-NIGHTLY-instrumentscope-race-fix** — eliminate the package-global
+    `instrumentScope` read/write race without touching `Build`/`BuildWorker`'s
+    exported signatures. Parent: race/internal/executor (this task).
+    Mechanical plan traced this loop (not yet implemented):
+    (1) give internal `buildNode(plan, bound)` a third parameter
+    `scope *instrumenter` and thread it through its own ~28 recursive
+    call sites in `executor.go` plus the 5 external ones
+    (`operators_bitmap.go:516/1044/1125`, `parallel_hash_build.go:639/687`);
+    change `maybeInstrument(plan, op)` to `maybeInstrument(plan, op, scope)`
+    reading the parameter, not the global; (2) `Build(plan)`/`BuildWorker(plan)`
+    (kept byte-for-byte compatible for their ~200 external callers) become
+    thin wrappers that always pass `scope=nil` — safe because none of those
+    callers currently rely on ambient instrumentation (the one place that
+    does, `operators_explain.go:72-74`'s `withInstrumentation(...){
+    return Build(o.plan.Child) }`, runs single-goroutine before any Gather
+    worker starts, so it needs the NEW scoped entry point, not the plain
+    one — see (3)); (3) add an unexported `buildScoped(plan, bound, scope)`
+    used only by the handful of scope-aware call sites:
+    `operators_explain.go`'s top-level build, `operators_gather.go`'s and
+    `operators_gather_merge.go`'s two `buildChild` closures
+    (`executor.go:369-379` — change the `buildChild func() (Operator,
+    error)` field on `gatherOp`/`gatherMergeOp` to
+    `func(scope *instrumenter) (Operator, error)` and have
+    `buildUnderFreshScope`/`buildUnderNilScope` pass the scope as an
+    argument instead of mutating a global before calling `fn()`), and
+    `operators_cte_dml.go`'s `buildUnderScope`. **Open question needing a
+    decision before implementing, not yet resolved**: whether a SubPlan/EXISTS
+    tree lazily built mid-`Next()` in a *serial* (non-Gather) ANALYZE query
+    should inherit the ambient scope (real PG's `instrument.c` does
+    instrument SubPlan children) — if yes, `acquireSubPlanOp`
+    (`subplan.go:302`) needs `ctx` to carry the live scope explicitly (it
+    already takes `ctx *Context`, so add a `Context.instrumentScope` field
+    set once by `withInstrumentation`/CTE-DML, read here — no global,
+    no 200-callsite blast radius, since only production non-test call sites
+    of `acquireSubPlanOp` need it); if the current behavior is already
+    "SubPlan children are never instrumented" (M0142-0004a's ledger row
+    suggests this is plausible but unconfirmed), forcing nil there is a
+    pure bug-for-bug-compatible simplification. Resolve by writing a
+    serial (no Gather) `EXPLAIN ANALYZE` + correlated-EXISTS test FIRST and
+    observing today's actual output before choosing. Gate: `go test -race
+    ./internal/executor/` clean (specifically `TestParallelLateralProbeIdentity`
+    and `TestSubquerySemanticsMatrix`), full `RALPH_PRECOMMIT_SCOPE=units`
+    green, plus an `EXPLAIN (ANALYZE)` parallel-shape regression check that
+    worker/leader counters are not double-counted (already-existing
+    `explain_parallel_workers_test.go` coverage per EX0-03b's own gate).
 - [ ] **testport/TestPort_IsolationIntraGrantInplace (AI-20260905-011015-003, AI-20260914-235643-006, AI-20260916-035206-006, AI-20260917-004357-010)** —
   FAILed, also failed previous run (repro: `go test -v -run
   '^TestPort_IsolationIntraGrantInplace$' ./internal/testport/`).

@@ -92,3 +92,24 @@ divergence, not chased); `sharedHashBuild` worker attribution (EX5).
   goopg-vs-goopg `changed=0` re-runs at EX0-06 (first full baseline).
 - `git diff --stat`: `internal/executor/` only (+ test), no new
   dependencies, no timing claim.
+
+## 5. Erratum (2026-09-18) — B1's "never racy" claim is false
+
+Section 2's B1 answer states the package-global `instrumentScope` handoff
+"is NEVER racy" because `instrumentScopeMu` is held across set + Build +
+restore. That is only half true: the mutex protects the *writers*
+(`buildUnderFreshScope`/`buildUnderNilScope`), but `maybeInstrument`
+(`instrument.go:444`) reads the same global with **no lock**, from any
+`buildNode` call — including ones reached lazily, mid-`Next()`, on a
+completely different goroutine (a correlated SubPlan/EXISTS rebuild via
+`acquireSubPlanOp` -> `Build`). `go test -race ./internal/executor/`
+reproduces this live (`TestParallelLateralProbeIdentity`,
+`TestSubquerySemanticsMatrix/M20/...`), first found 2026-09-06
+(`.ralph/deferral_ledger.md` `take3-instrumentscope-datarace`,
+`e18-instrumentscope-global-races-coop-producers`), re-confirmed
+2026-09-18 (`.ralph/fix_plan.md`, M-NIGHTLY `race/internal/executor`). The
+mechanism this section describes is otherwise accurate (fresh table per
+site, disjoint slot indexes, `timing`-only inheritance); only the "never
+racy" sentence is wrong. Fix is filed as
+**M-NIGHTLY-instrumentscope-race-fix** in `.ralph/fix_plan.md`, not yet
+implemented.

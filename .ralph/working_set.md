@@ -1,76 +1,80 @@
-Task: M-NIGHTLY `numerology — binary/octal/hex integer literals unsupported`
-(banner: P0-E6 still `[!]`, items 3-6 and M0143 re-confirmed exhausted this
-loop too — see below — so per the banner's "While P0-E6 waits" ordering,
-dropped through to M-NIGHTLY). DONE + committed (pending this loop's commit).
+Task: M-NIGHTLY `race/internal/executor` (banner: P0-E6 still `[!]`
+owner-run; items 1-7 re-scanned, nothing selectable — M0143-0007b needs an
+owner decision, M0141-S2b-9/-8 explicitly blocked on banner item 4's
+"diagnosis only", M0142-0005a/M0139-0007c are implementation not recon,
+M0142-0003i needs P0-E6 — same fall-through as last 2 loops — to
+M-NIGHTLY). Re-confirmed NOT stale (real race, reproduces every run) and
+root-caused to an already-twice-ledgered defect; NOT fixed this loop (fix
+needs a signature change too big for one loop — scoped it instead).
+Committed.
 
-Files: `internal/parser/adapter.go` (`mapToken`'s `TokenIntLit` case),
-`internal/parser/select.go` (new shared helper `intLiteralOverflowText`,
-`parseIntLiteralExpr` simplified to use it), `internal/parser/lexer.go`
-(digit-led numeric-literal dot-commit logic rewritten), `.ralph/fix_plan.md`
-(task checked off with full root-cause note; parent
-`testport/TestPort_RegressSuite` task annotated — now 50/0/183, ALL 4
-subtests from that FAILed-run item are fixed).
+Files: `.ralph/fix_plan.md` (race/internal/executor entry: re-confirm note
++ new nested sub-task `M-NIGHTLY-instrumentscope-race-fix` with a concrete
+mechanical fix plan), `docs/design/executor-ex0-03b-rows/DESIGN.md`
+(new "5. Erratum" section correcting B1's now-falsified "never racy"
+claim). No production code touched.
 
-Key symbols: `mapToken` (`internal/parser/adapter.go:505`),
-`parseIntLiteral`/`parseIntLiteralExpr`/`intLiteralOverflowText`
-(`internal/parser/select.go:5175-5227`), the digit-branch of `(*lexer).next`
-(`internal/parser/lexer.go:265-388`).
+Key symbols: `instrumentScope`/`instrumentScopeMu`
+(`internal/executor/instrument.go:313`), `maybeInstrument` (`:444`, reads
+the global with NO lock), `buildUnderFreshScope`/`buildUnderNilScope`
+(`:350/:370`, write it WITH the lock), `gatherOp.buildChildForSlot`
+(`operators_gather.go:122`), `acquireSubPlanOp` (`subplan.go:302`, the
+lazy cross-goroutine reader via `Build(plan)`).
 
-Findings: TWO independent bugs were hiding behind one filed task.
-(1) The filed task's premise was wrong — the LEXER already fully tokenized
-`0b`/`0o`/`0x` (M0097-0003). The real gap: `adapter.go`'s `mapToken` (goyacc
-path, what a routed `SELECT` actually uses) always called
-`strconv.ParseInt(..., 10, 64)` on `TokenIntLit` text, ignoring the prefix —
-`select.go`'s `parseIntLiteral` (legacy hand-written path) already knew the
-base. A sibling-path drift (`pattern_sibling_paths_must_agree`): the two
-paths silently diverged and only the unrouted one was correct. Fixed by
-having `mapToken` call `parseIntLiteral` directly, and factoring the
-overflow-to-decimal-text logic (needed because the FCONST/NumericConst path
-only understands base 10) into a shared `intLiteralOverflowText` used by
-both `mapToken` and `parseIntLiteralExpr`.
-(2) Fixing (1) exposed a SECOND bug: `0.a` / `1_000._5` produced `syntax
-error at or near "."` instead of PG's `trailing junk after numeric literal`.
-The lexer's dot-commit heuristic assumed a digit-led token could be
-upstream's qualified-name form (`a.b`) — impossible, since qualified names
-start with an identifier, never a digit, and PG's own `scan.l` has no such
-carve-out for `{decinteger}'.'`. Fixed: a digit-led token's dot always
-starts a numeric literal (except `..` range syntax), and the fractional
-loop no longer swallows a *leading* underscore as a fraction digit (PG's
-`{decinteger}` requires the fraction to START with a digit).
-Both fixes verified byte-for-byte against
-`postgres/src/test/regress/expected/numerology.out` on a throwaway scratch
-cluster (ports 5533/5534, `/tmp/numerology-scratch-data` — deleted before
-finishing, never the shared/reference clusters) across all magnitude tiers
-(int4-fits, int4-overflow/int8-fits, int8-overflow) and both dot-junk cases.
-Banner re-scan (recorded so the next loop doesn't redo it): M0143 still has
-zero selectable non-TPC-H tasks (only `M0143-0007b`, blocked on an owner
-decision re: reversing bpchar trimmed-storage). Items 3-6's recon-only
-candidates are still implementation-only/blocked per the prior loop's scan
-(nothing changed this loop that would unblock them — this loop touched only
-`internal/parser`).
+Findings: race is real, reproduces in ~60s (not a 45m timeout hang), full
+log `tmp/race-internal-executor-20260918.log` (untracked, regenerate via
+`go test -race -timeout 45m ./internal/executor/`). It is the SAME defect
+as `.ralph/deferral_ledger.md`'s `take3-instrumentscope-datarace`
+(2026-09-06) and `e18-instrumentscope-global-races-coop-producers`
+(2026-09-07) — do NOT file a third ledger row, the ledger already has the
+diagnosis; what was missing was a concrete, sized fix_plan task, now
+filed. It is NOT ANALYZE-only: `buildChildForSlot` round-trips the global
+on every parallel worker spawn regardless of ANALYZE, so any ordinary
+parallel query with a concurrent lazily-built SubPlan can hit it. The
+"just widen the mutex to guard reads too" shortcut was considered and
+explicitly rejected again (per the ledger's own prior warning) — it would
+silence `-race` but not fix the real hazard (a lazy producer subtree
+adopting an unrelated sibling worker's live scope). Traced a concrete,
+narrower-than-"thread through Context" mechanical plan that needs ZERO
+changes to `Build`/`BuildWorker`'s ~200 external call sites (see the new
+fix_plan sub-task for the 3-step plan: `buildNode` gets an explicit
+`scope` parameter threaded through its ~33 internal call sites;
+`Build`/`BuildWorker` become nil-scope-only thin wrappers; a new
+unexported `buildScoped` serves the ~4 call sites that actually need
+ambient scope — `operators_explain.go`'s top-level build, the two
+`gatherOp`/`gatherMergeOp` `buildChild` closures, `operators_cte_dml.go`'s
+`buildUnderScope`). One open design question flagged but NOT resolved:
+whether a lazily-built SubPlan/EXISTS tree in a *serial* ANALYZE query
+should inherit the ambient scope (real PG does instrument SubPlan
+children) — needs a probe test before implementing, see the fix_plan
+task's "Open question" paragraph.
 
-Next step: next loop re-reads the banner fresh. P0-E6 still owner-run
-(`bench/tpch/runtime_goopg/data.HOLD` still present). If still `[!]`,
-re-check `ci/logs/action-items.md` for anything new (last checked run
-20260918-010720, already filed+closed as a stale nightly-checkout race —
-see fix_plan), then pick the next open M-NIGHTLY item. With `numerology`
-and `limit` both now fixed, `testport/TestPort_RegressSuite` shows 50/0/183
-— check the fix_plan's "M-NIGHTLY open items" section top-to-bottom for the
-next one (several `testport/TestPort_Isolation*` items are open, e.g.
-`TestPort_IsolationFkContention`/`TestPort_IsolationFkDeadlock`/
-`TestPort_UpdateLockedTuple` from the 20260917-004357 run).
+Next step: next loop re-reads the banner fresh (P0-E6 still owner-run
+expected). If still nothing selectable in items 1-7, either (a) implement
+`M-NIGHTLY-instrumentscope-race-fix` (start with the "Open question" probe
+test — serial EXPLAIN ANALYZE + correlated EXISTS, observe today's actual
+per-node output — before touching `buildNode`'s signature), or (b)
+continue top-to-bottom through the M-NIGHTLY list past this item:
+`testport/TestPort_IsolationIntraGrantInplace`,
+`testport/TestPort_IsolationStats`,
+`testport/TestPort_LockRowsSortOverJoinTakesRowLock`,
+`testport/TestPort_PgDumpConnectionSetup`, `units/internal/parser`
+(likely same root cause as `parser/TestLockingClauseParity` — re-run both
+together first), `race/internal/parser`,
+`testport/TestPort_IsolationEvalPlanQual`, `testport/TestPort_IsolationSuite`
+(subtests specs/detach-partition-concurrently-1/tuplelock-upgrade-no-deadlock),
+`testport/TestPort_IsolationFkContention`, `testport/TestPort_IsolationFkDeadlock`,
+`testport/TestPort_UpdateLockedTuple`. Re-run each repro at HEAD first per
+the loop rule (some may be stale).
 
-Gates run: `go build ./...` clean (twice, before/after the second fix).
-`go test ./internal/parser/...` PASS (goldens unchanged — no golden diff,
-confirming no pinned AST shape moved). `go test -v -run
-'^TestPort_RegressSuite$/^numerology$' ./internal/testport/` PASS. Full
-`TestPort_RegressSuite`: 50 PASS / 0 FAIL / 183 SKIP (was 48/1/183 before
-this loop). `RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh`
-PASS (all in-scope packages, including `internal/executor` explicitly).
-`make ralph-state-guard` PASS (self-repaired a stale completed-marker from
-the prior loop's clean exit, same as last loop — unrelated to this loop's
-work). No TPC-H/sf025 gate needed — pure lexer/parser change, no
-`internal/executor`/`internal/optimizer` row-count path touched (and the
-`internal/executor` unit package itself was re-run green above).
+Gates run: `go build ./...` clean (confirmed before AND after — no code
+changed). `go test -race -timeout 45m ./internal/executor/` FAIL (2 real
+races, expected/documented, not a new regression — this loop did not fix
+it). `make ralph-state-guard`: same benign status/progress mismatch as
+prior loops (previous loop's clean-exit completed-marker), self-repaired,
+consistent after repair. No TPC-H/sf025 gate needed — doc/tracking-only
+change, no `internal/`/`cmd/` file touched. Pre-commit hook's pgbench
+smoke will run automatically on commit (not run standalone, since it's
+mandatory on every commit anyway).
 
 In-flight: none.
