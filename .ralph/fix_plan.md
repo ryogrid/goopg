@@ -204,8 +204,20 @@ uncommitted `ALTER TABLE … ADD CONSTRAINT` transaction on it was stopped with
   match, categories, values) and write the numbers for the owner's freeze
   decision; this A/B is also the evidence csq-R2's reopen condition names.
   Record every gate stamp and plan-file sha256.
-- [ ] **P0-D3 — split the M0141-S7 design doc and fix its `Status:`.**
-  Parent: none. Kind: impl (docs only).
+- [x] **P0-D3 — split the M0141-S7 design doc and fix its `Status:`.**
+  Parent: none. Kind: impl (docs only). Movement: none.
+  **DONE 2026-09-18 by the owner.** The parent went 1501 -> 226 lines and eight
+  docs were split out by task id, each with a `Status:` stating what really
+  landed and a link back to the parent, all indexed in `docs/design/README.md`
+  in the same commit: `m0141-s7-groundwork-and-exec-rescope.md` (248),
+  `m0141-s7-corpus-measurement-and-cost-diagnosis.md` (401),
+  `m0141-s7-exec-a-…` (88), `-exec-b-…` (132), `-exec-c-…` (85),
+  `m0141-s7-cd-q64-root-cause.md` (158),
+  `m0141-s7-cd-q64-reclassify-grouping-paths-gap.md` (80),
+  `m0141-s7-cd-candidatepool-seed-partial-prefix.md` (149). Content was moved
+  verbatim (verified by comparing the concatenation), no file exceeds 800 lines
+  and `scripts/ralph_protected_regions.py check-designdocs` exits 0, so M0141-S7
+  work may resume. Original scope:
   `docs/design/0100-0149/m0141-s7-readjudicate-and-scope-incremental-sort.md` is
   **1501 lines** (D3's limit is 800) and its `Status:` still reads "recon landed
   2026-09-16, no production change" although `073ab2748` and `c7e231ae1` landed
