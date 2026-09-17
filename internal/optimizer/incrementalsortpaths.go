@@ -159,7 +159,7 @@ func addIncrementalSortPaths(ordered *RelOptInfo, input *Path, sortPathkeys []Pa
 		}
 		contained, nCommon := pathkeysCountContainedIn(keys, sortPathkeys)
 		if pathTraceEnabled {
-			traceIncrementalSortCandidate(i, candidate.Kind, len(keys), contained, nCommon)
+			traceIncrementalSortCandidate(i, candidate.Kind, len(keys), contained, nCommon, candidate.Cost.Total)
 		}
 		if contained || nCommon == 0 {
 			continue

@@ -151,12 +151,38 @@ func traceOrderedCandidatePopulation(searchedRel bool, candidates int, nonEmptyK
 // actually reach a genuine partial-prefix offer, and why the rest don't
 // (`kind`=candidate's own Path.Kind, `keys`=len(SearchCandidateKeys[i]),
 // `contained`/`ncommon`=pathkeysCountContainedIn's verdict).
-func traceIncrementalSortCandidate(i int, kind PathKind, keyLen int, contained bool, nCommon int) {
+func traceIncrementalSortCandidate(i int, kind PathKind, keyLen int, contained bool, nCommon int, totalCost float64) {
 	if !pathTraceEnabled {
 		return
 	}
-	fmt.Fprintf(os.Stderr, "%s candidate producer=upper.ordered.incrementalsort.candidate index=%d kind=%d keys=%d contained=%v ncommon=%d\n",
-		pathTraceTag, i, int(kind), keyLen, contained, nCommon)
+	fmt.Fprintf(os.Stderr, "%s candidate producer=upper.ordered.incrementalsort.candidate index=%d kind=%d keys=%d contained=%v ncommon=%d totalcost=%v\n",
+		pathTraceTag, i, int(kind), keyLen, contained, nCommon, totalCost)
+}
+
+// traceOrderedSeedCandidate emits one DPPATH diagnostic line for the seed
+// path itself — the same `input` addOrderedPaths (upperordered.go) receives
+// as its arm-1/2 candidate — scored against sortPathkeys the identical way
+// traceIncrementalSortCandidate scores every OTHER SearchCandidates entry.
+// M0141-S7-cd-candidatepool's question is whether the seed's own ordering
+// claim ever has a genuine partial-prefix match that addIncrementalSortPaths
+// structurally cannot offer (its loop walks ordered.SearchCandidates, which
+// may or may not still contain the exact Path that became the seed) — this
+// line is the seed-side half of that comparison; traceIncrementalSortCandidate
+// is the SearchCandidates-side half. Matching kind/keys/ncommon/totalcost
+// across both for the same query means the seed IS represented in the loop
+// (totalcost disambiguates same-shape-different-candidate coincidences, since
+// every entry in ordered.SearchCandidates shares the same relset and hence
+// the same Rows, but the seed is specifically the CHEAPEST of them by
+// construction — getCheapestFractionalPath's pick — so an exact cost match
+// against one specific SearchCandidates entry is strong identity evidence,
+// not just a shape coincidence); a seed line with no matching candidate line
+// means it structurally is not.
+func traceOrderedSeedCandidate(kind PathKind, keyLen int, contained bool, nCommon int, totalCost float64) {
+	if !pathTraceEnabled {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "%s seed producer=upper.ordered.seed kind=%d keys=%d contained=%v ncommon=%d totalcost=%v\n",
+		pathTraceTag, int(kind), keyLen, contained, nCommon, totalCost)
 }
 
 // relSetBits renders a RelSet as a stable, parseable member list. The trace has

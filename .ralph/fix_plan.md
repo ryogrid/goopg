@@ -3397,32 +3397,80 @@ spill route is net-negative.
       doc's "Update 2026-09-18c". No ledger row (closes an open question
       with a definite answer, files its own follow-up directly). Gates:
       none needed, no code changed.
-  - [ ] **M0141-S7-cd-candidatepool** — investigate whether
+  - [x] **M0141-S7-cd-candidatepool** — investigate whether
     `addIncrementalSortPaths` (`incrementalsortpaths.go:161-166`) should
     also consider building its `PathIncrementalSort` over the SAME cheap
     seed candidate `createOrderedPaths`'s arm 1/2 already uses, when that
     seed's own claimed ordering has a genuine partial (not full, not empty)
-    prefix match — today's loop only walks `ordered.SearchCandidates`,
-    which on this corpus's 6 non-Q4/Q11 witnesses never includes a
-    cheap-AND-partially-ordered option; confirm (a) whether the cheap seed
-    itself always fails the partial-prefix test structurally (e.g. it is
-    hash-shaped so `SearchCandidateKeys` is empty for it, in which case
-    there is nothing to fix here) or (b) whether it has a usable partial
-    key that the current loop is simply never offered because of how
-    `SearchCandidates` is populated.
-    Parent: M0141-S7. Depends on reading
-    `createOrderedPaths`'s / `electOrderedGrouping`'s candidate-population
-    order side by side with which entry becomes the arm-1/2 "seed" `input`
-    parameter `addIncrementalSortPaths` receives — not yet done, this task's
-    own recon step. Expected movement (S5): if (b) holds for any of
-    Q43/Q54/Q58/Q60, a code fix could shrink or close the corresponding
-    input-divergence share in the 2026-09-18 cost table (up to ~199 cost
-    units for Q43) without needing real SF1 cardinalities at all — measured
-    by re-running this update's same per-query DPPATH capture and comparing
-    each witness's Δinput column before/after; full TPC-DS SF0.25 sweep
-    (`shape-delta.sh`, category movement) as the no-regression gate,
-    same `[65437]`-only requirement as the recon that filed this, no TPC-H
-    dependency.
+    prefix match. Parent: M0141-S7.
+    - **Done 2026-09-18d — mixed verdict, one real gap confirmed (Q4),
+      six witnesses cleared.** The corpus splits across two different
+      `addOrderedPaths` callers with different `SearchCandidates`
+      provenance: `createOrderedPaths` (Q4/Q11/Q58/Q83) populates it from
+      `searchedRelOf(input).Pathlist`; `electOrderedGrouping`
+      (Q43/Q54/Q60) populates it directly from its own Hashed/Sorted
+      `PathAgg` `cands` slice (M0141-S2b-7's own documented mechanism).
+      Landed `traceOrderedSeedCandidate` (`internal/optimizer/pathtrace.go`,
+      called from `addOrderedPaths`) plus a `totalcost` field added to the
+      existing `traceIncrementalSortCandidate`, both `pathTraceEnabled`-gated
+      and inert by default — needed to tell a same-shaped seed/candidate
+      pair apart from a coincidence (every `SearchCandidates` entry shares
+      the same relset and `Rows`, so cost is the only discriminator).
+      Traced all 7 witnesses on a private throwaway cluster (port 5533, own
+      `GOOPG_CG_UNIT`, `tmp/m0141s7candpool/`, SF0.25 TSVs — same discipline
+      as M0141-S7-cd-q64, `:65437`/`:65438` untouched). Result: **(a) holds
+      for Q43/Q54/Q60** (exact cost-identity match between the seed and its
+      `SearchCandidates` counterpart on every witness — `electOrderedGrouping`'s
+      engineering already covers this, confirmed not just by shape but by
+      bit-identical cost) **and for Q11/Q58/Q83** (seed's own claim is
+      `keys=0` — genuinely no order to offer, the "hash-shaped" case (a)
+      anticipated). **(b) holds for Q4**: seed carries `keys=1 ncommon=1` (a
+      real, unexploited partial-prefix claim) with NO exact-cost match in
+      `SearchCandidates` (closest is 0.01 cheaper — explained by Q4's own
+      `LIMIT 100` making `getCheapestFractionalPath`'s seed selection
+      startup-weighted, not raw-Total, so the near-match is a genuinely
+      different candidate). The seed itself is structurally never a member
+      of `ordered.SearchCandidates` under this caller, so
+      `addIncrementalSortPaths` can never attach a `PathIncrementalSort` to
+      it even when it qualifies. Full per-witness cost table and mechanism
+      writeup: design doc's "Update 2026-09-18d" section. Follow-up filed as
+      **M0141-S2b-9** below (implementation, not selectable under item 4's
+      "cost diagnosis only" restriction). `GOOPG_INCREMENTAL_SORT` stays
+      default-off; no ledger row (same posture as 18b/18c — a filed
+      follow-up carries the deferral). Gates: `go build ./...` clean, `go
+      vet ./internal/optimizer/` clean, `go test ./internal/optimizer/...`
+      PASS, `RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh`
+      PASS (all packages). No TPC-H dependency.
+  - [ ] **M0141-S2b-9** — teach `addIncrementalSortPaths` (or its
+    `createOrderedPaths` caller) to also score the seed `input` itself
+    against `sortPathkeys` and offer a `PathIncrementalSort` built over the
+    seed when `0 < nCommon < len(sortPathkeys)` — today the loop only walks
+    `ordered.SearchCandidates` (`sr.Pathlist`), which structurally never
+    contains the exact Path `getCheapestFractionalPath` chose to become the
+    seed, so a genuine partial-prefix claim on the seed itself (confirmed
+    live on Q4: `keys=1 ncommon=1`, no exact-cost `SearchCandidates` match)
+    can never be offered an Incremental Sort.
+    Parent: M0141-S7 (filed by
+    M0141-S7-cd-candidatepool; design doc's Update 2026-09-18d). Scope: (1)
+    price the seed-based candidate via the SAME fractional-cost-aware
+    comparison `getCheapestFractionalPath` uses, not raw `Total` — Q4 itself
+    has `LIMIT 100`, which is exactly why its seed was chosen over a
+    marginally-cheaper-on-Total alternative, so a naive Total-cost seed
+    candidate risks picking the wrong thing under a LIMIT; (2) add the
+    seed-vs-`sortPathkeys` offer in `addOrderedPaths`/`addIncrementalSortPaths`
+    without duplicating work when the seed also happens to appear in
+    `SearchCandidates` (electOrderedGrouping's callers already produce that
+    duplicate today, per 18d's cost-identical trace — dedupe or accept the
+    redundant `addPath` call, `setCheapest` already tolerates it); (3)
+    sibling-path audit: confirm `createIncrementalSortPlan` handles a
+    `PathIncrementalSort` whose child is the bare seed (not a join/agg
+    candidate from `SearchCandidates`) the same as any other child shape.
+    This is an implementation task (not recon) — not selectable while
+    M0141's banner item 4 restricts to "cost diagnosis only, no executor
+    work"; wait for the banner to open item 3/4's implementation tasks.
+    Gate: TPC-DS SF0.25 sweep (category movement, no regression) + `go test
+    ./internal/optimizer/...`; re-check Q4's own plan shape specifically
+    (LIMIT-sensitive) once implemented; no TPC-H dependency.
   - [ ] **M0141-S2b-8** — `addGroupingPaths`'s SORTED arm
     (`groupingpaths.go:441-495`) never offers an
     Incremental-Sort-over-partial-prefix-seed candidate for a plain

@@ -150,6 +150,10 @@ func createOrderedPaths(u *upperRels, input Node, keys []SortKey, pos int, cp co
 // from `createOrderedPaths` so the input arm — unreachable from a Node today —
 // is driven by a test with a hand-ordered seed rather than left untested.
 func addOrderedPaths(ordered *RelOptInfo, input *Path, sortPathkeys []PathKey, cp costParams, limitTuples float64) {
+	if pathTraceEnabled {
+		contained, nCommon := pathkeysCountContainedIn(input.Pathkeys, sortPathkeys)
+		traceOrderedSeedCandidate(input.Kind, len(input.Pathkeys), contained, nCommon, input.Cost.Total)
+	}
 	if pathkeysContainedIn(input.Pathkeys, sortPathkeys) {
 		addPath(ordered, input, upperOrderedInputProducer)
 		return
