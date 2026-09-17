@@ -6762,7 +6762,7 @@ cross-layer programme that has never been scoped.
   `internal/optimizer/cte_inline_pushdown.go`) only pushes predicates through
   the CTE boundary without removing it — a scorer key-mismatch bug, not a
   missing PG comparator. Follow-up filed as **M0142-0016d** below.
-- [ ] **M0142-0016d — fix `parity.py`'s relset key so a goopg-only
+- [x] **M0142-0016d — fix `parity.py`'s relset key so a goopg-only
   single-reference-CTE scope prefix does not block a match against PG's
   un-scoped key.**
   Parent: M0142-0016c. Bounded, tooling-only (no planner
@@ -6795,6 +6795,27 @@ cross-layer programme that has never been scoped.
   qual-pushdown structural gap actually costs goopg a worse join order
   somewhere in the corpus (M0142-0016c's flagged-but-unscoped bigger
   question), file that as its own new task rather than folding it in here.
+  **Done 2026-09-18.** `scripts/estimate-parity/parity.py`: new
+  `cte_scan_counts`/`single_ref_cte_labels`/`descope` (mirrors PG 18.3's
+  `inline_cte` "single-reference, non-recursive" threshold via a goopg-side
+  scan refcount), applied to both sides' keys in `collect()`. Re-ran `make
+  ea-ratchet` with a fresh HEAD capture (not the stale 2026-09-16 one): every
+  Q33/Q56 body-internal finding from M0142-0016b's 17 disappeared outright
+  (real PG match found, within bar); Q33/Q54/Q56's `cte:<label>` ancestor-
+  scan-node findings persist UNMATCHED-IN-PG by design (PG's inlining removes
+  that tree position entirely — a structural gap, not a key-naming one, out
+  of this task's scorer-only scope). Same mechanism also resolved 27 more
+  pre-existing findings outside the M0142-0016b population (Q5, Q16, Q58,
+  Q60, Q77, Q80 partial, Q95, Q97) as a side effect of the general fix.
+  3 of Q80's findings persist under their new unscoped names — a real Q80
+  join-order difference inside that CTE body, unrelated to the prefix bug,
+  not filed separately (already inside the M0142 milestone's general cost-
+  model corpus work). Repinned the baseline (`make ea-ratchet-repin`,
+  precedent `c89615911`/`c7e2f9d40`/`a5a1bd492`): 95→70 findings; `make
+  ea-ratchet` now PASSes clean. Full writeup:
+  `docs/design/0100-0149/m0142-0016c-pg-forced-plan-comparator.md` §"Update
+  2026-09-18b". No `internal/...` file touched (tooling-only); `python3 -m
+  py_compile` clean.
 - [x] **M0142-0016a — scoping recon: measure M0142-0016's blast radius before
   implementing it** — filed by this loop from M0142-0016's own K50 sizing
   instruction (mirrors the M0142-0012a precedent). **DONE 2026-09-15, recon

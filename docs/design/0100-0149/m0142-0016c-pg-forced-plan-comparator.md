@@ -166,3 +166,63 @@ task filed for it yet pending the bounded scorer fix's own measurement.
   `scripts/ref-clusters-ensure.sh` and `CLAUDE.md` "Running a server
   manually"); `tmp/m0142-0016c-bin` removed after use; `ps aux` confirmed no
   orphan process on port 65437 or matching the binary path.
+
+## Update 2026-09-18b (M0142-0016d, DONE, LANDED)
+
+Implemented the fix this task's own follow-up read scoped: `parity.py`
+now computes, per query, which `CTE <label>` a query defines that is
+scanned at most once elsewhere in the same plan forest (`cte_scan_counts`,
+`single_ref_cte_labels`) — the same "single reference, non-recursive"
+condition PG 18.3's `inline_cte` (`postgres/src/backend/optimizer/plan/subselect.c`)
+uses to remove a CTE's boundary structurally before join-order search. For
+any such label, `descope()` strips the goopg-only `<label>.` prefix from a
+node's relset before the key is built, so a node strictly inside that CTE's
+body (e.g. `ss.customer_address`) now keys identically to PG's already-
+inlined counterpart (`customer_address`). A CTE referenced more than once
+(TPC-DS Q31's `ws3`, the guard case named in `cte_inline_pushdown.go`'s own
+doc comment) keeps its scope prefix, since PG does not inline it either.
+
+**What this does NOT fix, by design**: the `CTE Scan on <label>` reference
+node itself (key `cte:<label>`) still has no PG counterpart, because PG's
+inlining removes that tree position entirely rather than relabeling it — a
+structural difference, not a key-naming one. These nodes stay
+`UNMATCHED-IN-PG` after the fix, scored only against the loose absolute
+floor. This matches the task's own scope boundary (scorer-only, no attempt
+to model PG's structural removal).
+
+**Measured with a fresh HEAD capture** (`make ea-ratchet` full run, not the
+stale 2026-09-16 capture): of the 17 findings M0142-0016b introduced across
+Q33/Q54/Q56, every Q33/Q56 body-internal finding (`ss.*`/`ws.*` relsets)
+disappeared outright (a real PG match now found, qerr within bar — the
+`Q33`/`Q56` FIXED rows in the ratchet diff). The Q54/Q56/Q33 `cte:*`
+ancestor-node findings persist unmatched, as expected above. The same
+descoping also newly resolved a large population of pre-existing
+`UNMATCHED-IN-PG` findings the fix was not specifically targeting — Q5, Q16,
+Q58, Q60, Q77, Q80 (partially), Q95, Q97 collectively lost 27 more findings
+this loop did not set out to fix, all following the identical CTE-scope-
+prefix mechanism. Net: baseline 95 -> 70 findings PG-relative.
+
+Three of Q80's old `ssr.*`-prefixed findings persist under their new,
+unscoped names (`date_dim+item+promotion[+store][+store_sales]` — still
+`UNMATCHED-IN-PG`, still exceeding the floor): a real Q80 join-order
+difference between goopg and PG inside that CTE body, unrelated to the
+scope-prefix bug this task fixed, out of this task's scope, not filed as a
+new task (already implicitly covered by the general cost-model corpus work
+the M0142 milestone is doing).
+
+The stale 2026-09-15 baseline had never been repinned since M0142-0016b
+landed 2026-09-16 (that task's own note: "95->110 findings (FAIL)... NOT
+treated as a blocker"), so `make ea-ratchet` was continuously red for two
+days independent of this fix. Repinned via `make ea-ratchet-repin` in the
+same commit (precedent: `c89615911`, `c7e2f9d40`, `a5a1bd492` all repin in
+the landing commit for the same reason) — `make ea-ratchet` now PASSes
+(70/70, no new findings) against a capture built from a HEAD binary.
+
+**Verification**: `python3 -m py_compile scripts/estimate-parity/parity.py`
+clean; no Go/`internal/...` files touched, so no build/test/tpch-spotcheck
+gate applies to this change itself. Full `make ea-ratchet` run (not
+`EA_CAPTURE` re-score): private clone `tmp/c20a/data-sf025`, private port
+5534, private binary `tmp/c20a/goopg-ea` rebuilt at HEAD,
+`EA_CG_UNIT=goopg-ea-ratchet` — never touches the standing SF0.25 gate's
+`bench/tpcds/runtime_goopg/data-sf025`/port 65437. Confirmed clean shutdown
+(`ps aux`/`ss -ltnp` show no listener on 5534 after the run).
