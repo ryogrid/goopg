@@ -26,8 +26,8 @@ func TestCostMemoizeRescanPGEntryBytesSwitchOffIsLegacy(t *testing.T) {
 	cp := defaultCostParams()
 	inner := Cost{Startup: 1, Total: 100}
 	for _, width := range []int{0, 8, 700} {
-		rescan, est := costMemoizeRescan(cp, inner, 50, 10000, 200, false, 4, 1, width)
-		want, wantEst := costMemoizeRescan(cp, inner, 50, 10000, 200, false, 4, 1, 0)
+		rescan, est := costMemoizeRescan(cp, inner, 50, 10000, 200, false, 4, 1, width, 0)
+		want, wantEst := costMemoizeRescan(cp, inner, 50, 10000, 200, false, 4, 1, 0, 0)
 		if width == 0 {
 			continue // trivially equal to itself
 		}
@@ -50,8 +50,8 @@ func TestCostMemoizeRescanPGEntryBytesUsesWidthNotNCols(t *testing.T) {
 	cp.workMem = 64 * 1024
 	inner := Cost{Startup: 1, Total: 100}
 
-	narrow, narrowEst := costMemoizeRescan(cp, inner, 200, 10000, 5000, false, 4, 1, 8)
-	wide, wideEst := costMemoizeRescan(cp, inner, 200, 10000, 5000, false, 4, 1, 4096)
+	narrow, narrowEst := costMemoizeRescan(cp, inner, 200, 10000, 5000, false, 4, 1, 8, 0)
+	wide, wideEst := costMemoizeRescan(cp, inner, 200, 10000, 5000, false, 4, 1, 4096, 0)
 	if narrow == wide && narrowEst == wideEst {
 		t.Fatalf("PG-currency arm did not distinguish width=8 from width=4096: %+v/%d vs %+v/%d",
 			narrow, narrowEst, wide, wideEst)
@@ -63,11 +63,44 @@ func TestCostMemoizeRescanPGEntryBytesUsesWidthNotNCols(t *testing.T) {
 	// Off-switch must not see the same divergence from width alone (NCols is
 	// unchanged, and the legacy currency never reads width).
 	restoreOff := setPGMemoizeEntryBytesCostForTest(false)
-	offNarrow, offNarrowEst := costMemoizeRescan(cp, inner, 200, 10000, 5000, false, 4, 1, 8)
-	offWide, offWideEst := costMemoizeRescan(cp, inner, 200, 10000, 5000, false, 4, 1, 4096)
+	offNarrow, offNarrowEst := costMemoizeRescan(cp, inner, 200, 10000, 5000, false, 4, 1, 8, 0)
+	offWide, offWideEst := costMemoizeRescan(cp, inner, 200, 10000, 5000, false, 4, 1, 4096, 0)
 	restoreOff()
 	if offNarrow != offWide || offNarrowEst != offWideEst {
 		t.Fatalf("legacy currency leaked width sensitivity: narrow %+v/%d wide %+v/%d",
+			offNarrow, offNarrowEst, offWide, offWideEst)
+	}
+}
+
+// TestCostMemoizeRescanPGEntryBytesUsesKeyWidth is TestCostMemoizeRescanPGEntryBytesUsesWidthNotNCols's
+// twin for M0139-0007c's ported per-key term: with the PG currency on and
+// everything else (including the pathtarget `width`) held constant, a wider
+// `keyWidth` (the caller's `get_expr_width` sum) must price MORE cache-entry
+// bytes than a narrower one, and the legacy off-currency arm must not see the
+// same divergence — it never reads `keyWidth`.
+func TestCostMemoizeRescanPGEntryBytesUsesKeyWidth(t *testing.T) {
+	restore := setPGMemoizeEntryBytesCostForTest(true)
+	defer restore()
+	cp := defaultCostParams()
+	cp.workMem = 64 * 1024
+	inner := Cost{Startup: 1, Total: 100}
+
+	narrow, narrowEst := costMemoizeRescan(cp, inner, 200, 10000, 5000, false, 4, 1, 8, 8)
+	wide, wideEst := costMemoizeRescan(cp, inner, 200, 10000, 5000, false, 4, 1, 8, 4096)
+	if narrow == wide && narrowEst == wideEst {
+		t.Fatalf("PG-currency arm did not distinguish keyWidth=8 from keyWidth=4096: %+v/%d vs %+v/%d",
+			narrow, narrowEst, wide, wideEst)
+	}
+	if wideEst > narrowEst {
+		t.Fatalf("wider ported per-key width fit MORE cache entries than narrow: wide=%d narrow=%d", wideEst, narrowEst)
+	}
+
+	restoreOff := setPGMemoizeEntryBytesCostForTest(false)
+	offNarrow, offNarrowEst := costMemoizeRescan(cp, inner, 200, 10000, 5000, false, 4, 1, 8, 8)
+	offWide, offWideEst := costMemoizeRescan(cp, inner, 200, 10000, 5000, false, 4, 1, 8, 4096)
+	restoreOff()
+	if offNarrow != offWide || offNarrowEst != offWideEst {
+		t.Fatalf("legacy currency leaked keyWidth sensitivity: narrow %+v/%d wide %+v/%d",
 			offNarrow, offNarrowEst, offWide, offWideEst)
 	}
 }

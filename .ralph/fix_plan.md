@@ -2320,7 +2320,7 @@ that comment names as parity-inert.
   - **With this, all three of M0139-0007's filed pieces (recon, 0007a, 0007b)
     are resolved** — the banner's "M0141-S2a-fix and M0139-0007" line's
     `M0139-0007` half is complete.
-- [ ] **M0139-0007c — port `get_expr_width` for Memoize's cache-key width
+- [x] **M0139-0007c — port `get_expr_width` for Memoize's cache-key width
   Kind: impl
   term.** `costMemoizeRescan`'s per-key contribution
   (`hashsize.EntryBytes(nkeys, 0)`, both currencies) still stands in for PG's
@@ -2333,6 +2333,35 @@ that comment names as parity-inert.
   one) before it can be absorbed rather than approximated. Not currently
   gating the banner's top-priority line — pick up per the milestone's normal
   ordering.
+  - **DONE 2026-09-18.**
+    Parent: M0139-0007b.
+    Kind: impl. Movement: none
+    (the ported term only reaches the price behind the already-default-off
+    `GOOPG_PG_MEMOIZE_ENTRY_BYTES_COST`, unchanged by this task). New
+    `memoizeKeyWidths` (`joinpathsmemoize.go`) mirrors `memoizeKeyNDistinct`'s
+    loop over `innerPath.IndexClauses`, reading each cache key's ANALYZEd
+    `ColumnStats.AvgWidth` via `examineJoinVar` (PG's `attr_widths[]`/
+    `stawidth` analogue) and falling back to `typeWidth` (`get_typavgwidth`)
+    when unanalyzed — the exact fallback order `get_expr_width` uses for a
+    `Var`, and the only Node shape reachable here since every admitted cache
+    key is a bare `*ColumnRef`. `costMemoizeRescan` gained a `keyWidth
+    float64` parameter that only feeds the price when the PG currency is on
+    AND `pgRelationByteSize` itself succeeded — the same gate the tuple-bytes
+    term beside it already uses, so neither term switches currency alone.
+    Two new tests (`TestMemoizeKeyWidthsUsesAnalyzedStatThenTypeWidth`,
+    `TestCostMemoizeRescanPGEntryBytesUsesKeyWidth`); five pre-existing
+    `costMemoizeRescan` call sites updated for the new parameter (`0`,
+    provably inert per the switch-off/currency-separation pins). Design doc:
+    `docs/design/0100-0149/m0139-0007c-memoize-key-width-absorption.md`
+    (indexed). Does NOT reopen M0139-0007b's HOLD decision — `evictRatio`
+    still never activates on either measured corpus, so completing this term
+    does not change which regime they exercise. Resolves ledger row
+    `m0139-0007b`'s deferred scope (left `status: -` for M0119 to flip, per
+    the ledger's own protocol). Gates: `go build ./...` clean, `go vet
+    ./internal/optimizer/...` clean, `go test ./internal/optimizer/...` PASS
+    (full package, no `-count=1`), `scripts/tpch-spotcheck.sh` PASS
+    (Q12=2/Q13=34, unaffected by an off-by-default arm on a never-ANALYZEd
+    fresh server).
 
 ## M0140 — TPC-DS parallelism (filed 2026-09-14)
 
