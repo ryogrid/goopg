@@ -527,6 +527,27 @@ heuristic stays live.)
     green, plus an `EXPLAIN (ANALYZE)` parallel-shape regression check that
     worker/leader counters are not double-counted (already-existing
     `explain_parallel_workers_test.go` coverage per EX0-03b's own gate).
+    - 2026-09-19 — the test-first observation step is DONE and the open
+      question is RESOLVED: new `TestExplainAnalyzeSubPlanScopeObservation`
+      (`internal/executor/explain_subplan_test.go`) shows a serial
+      `EXPLAIN ANALYZE` + correlated EXISTS executing the SubPlan
+      (`SubPlan 1 (calls=2 rebuilds=1 rescans=1 ...)`, counters via
+      `ctx.SubPlanStats` — a separate channel from `nodeStatsTable`) while
+      its subtree renders **estimate-only, no `(actual ...)` bracket** —
+      SubPlan children are NEVER instrumented today. Root cause traced:
+      `withInstrumentation` (`instrument.go:323`) keeps `instrumentScope`
+      live only for the top-level `Build(o.plan.Child)`; `acquireSubPlanOp`
+      (`subplan.go:302`) calls `Build(plan)` from `existsImpl`/
+      `subqueryImpl`/`collectInValues` at row-evaluation time, after the
+      scope is already restored to nil. Consequence for the impl: forcing
+      nil scope at `acquireSubPlanOp`'s Build sites under the planned
+      `Context.instrumentScope` field is the bug-for-bug-compatible
+      simplification — no need to thread ambient scope there. Side
+      confirmation: the m0142-0004a deferral-ledger row's symptom is now
+      source-confirmed (PG's `instrument.c` DOES instrument SubPlan
+      children — `(actual ...)` on the subtree upstream — so this is also
+      a recorded PG-fidelity gap, but fixing it is out of this race-fix's
+      scope: the race fix only needs today-preserving behaviour).
 - [ ] **testport/TestPort_IsolationIntraGrantInplace (AI-20260905-011015-003, AI-20260914-235643-006, AI-20260916-035206-006, AI-20260917-004357-010)** —
   FAILed, also failed previous run (repro: `go test -v -run
   '^TestPort_IsolationIntraGrantInplace$' ./internal/testport/`).
