@@ -2821,9 +2821,36 @@ setting that yields a serial plan.
   extended to that branch kind. Expected movement (S5): TPC-DS Q5/Q76 (and
   Q2/Q14/Q71/Q75) reach `Parallel Append` over non-scan branches if PG's
   own plans use one there — confirm per query against `:65438` before
-  claiming it. Gate: TPC-DS SF0.25 sweep (category movement, no
-  regression) plus `tpch-acceptance-arm` digest; no TPC-H dependency beyond
-  the standard spotcheck.
+   claiming it. Gate: TPC-DS SF0.25 sweep (category movement, no
+   regression) plus `tpch-acceptance-arm` digest; no TPC-H dependency beyond
+   the standard spotcheck.
+   - **In progress 2026-09-18 (partial — task stays unchecked).**
+     Kind: impl. Parent: M0140-0006c. Movement: none (newly-admitted shape
+     wins no corpus plan yet at current costs; sweep PLAN-SHAPE 99/99
+     identical). Landed the hash-join branch: `collectShareableJoins` /
+     `collectBitmapScans` descend into both `*setOp` children,
+     `parallelChildren` gains the `*SetOp` arm (so `HasShareableHashJoin` /
+     `HasBitmapScan` see branch joins/bitmaps; `StripGather` gains the twin
+     two-child arm; `findPartialSubtree` / `rebuildWithGather` still refuse,
+     unsafe/gather walks only grow more conservative), and
+     `setOpBranchDrivingKindIsSupported` admits `PathHashJoin` partial
+     through its probe side (`Children[0]`, same side every twin descends).
+     Tests: hash + nested-hash admission, bad-hash / merge / nestloop /
+     bitmap refusals, gate-descent and strip tests (optimizer), plus
+     `TestGatherOverSetOpHashJoinBranchIdentity` (executor: 40-row forced-hash
+     branch over 90-row scan, identity at 1/2/4 workers AND the build-once
+     sharing witness — each verified to fire on exactly one mutation) and
+     both collector unit tests. Key correction: the collector is build-once
+     sharing, not row identity (mutation-verified — without it workers fall
+     back to full private builds, correct but N+1x). Design doc:
+     `docs/design/0100-0149/m0140-0006c-2-join-branch-partial-setop-admission.md`
+     (indexed). Gates: spotcheck PASS, sweep PASS=96 MISMATCH=0 PLAN-SHAPE
+     99/99 identical, acceptance-arm A/B VERDICT PASS 24/24 MATCH, precommit
+     units no FAIL. Remaining under this task: merge-driven branch (no walk
+     collects through a merge outer today), nested-loop-driven branch
+     (outer-ParallelWorkers / Memoize / lateral-subset guards need their own
+     audit), bitmap-driven branch (needs per-branch pbm publication), each
+     with its own identity test.
 
 ## M0141 — Upper-planner ordering contest (filed 2026-09-14)
 
