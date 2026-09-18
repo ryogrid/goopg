@@ -1,88 +1,69 @@
-Task: M0140-0006b — the partial-Append cost producer for SETOP
-(`.ralph/fix_plan.md:2657`, banner item 5). DONE and committed this loop
-(`36ffb5f07`).
+Task: M0140-0006c — executor claim-set for `setOp` under `Gather`
+(`.ralph/fix_plan.md`, banner item 5). DONE and committed this loop
+(`49d2dd087`).
 
-Banner item 5 reads "M0140-0006a → 0006b → 0006c". 0006a and 0006b are both
-`[x]`. **Two tasks are now open under item 5, either order is safe** (see
-this loop's design doc's ordering note — read it before picking either):
-- **M0140-0006c** (`.ralph/fix_plan.md:2671`) — executor claim-set for
-  `setOp` under `Gather` (correctness prerequisite; also the task that adds
-  `case PathSetOp:` to `partialPathDrivingKind` in `gatherpaths.go`).
-- **M0140-0006b-2** (`.ralph/fix_plan.md`, Parent: M0140-0006b) — wire
-  `generateUsefulGatherPaths` into the Phase-4 upper-rel pipeline generally
-  (WINDOW/ORDERED/GROUP_AGG/SETOP all currently unwired, not just SETOP).
-  Needs its own recon first: no `*searchCtx` reaches any upper-rel producer
-  today, so the shape of the fix (trimmed struct? full `*searchCtx`? a
+Banner item 5 ("M0140-0006a → 0006b → 0006c") now has 0006a/0006b/0006c all
+`[x]`. **Two tasks remain open under item 5, either order safe** (0006c's
+executor half already landed, so 0006b-2's wiring arrives behind a complete
+claim-set; the whitelist arm has no reachable input until then — verified
+by caller audit this loop, see the 0006c design doc):
+- **M0140-0006b-2** (Parent: M0140-0006b) — wire `generateUsefulGatherPaths`
+  into the Phase-4 upper-rel pipeline generally (WINDOW/ORDERED/GROUP_AGG/
+  SETOP all unwired). Needs its own recon first: no `*searchCtx` reaches
+  any upper-rel producer, so the shape (trimmed struct? full `*searchCtx`?
   package knob?) is undecided.
+- **M0140-0006c-2** (Parent: M0140-0006c, filed this loop) — widen the
+  partial-SetOp admission past bare scans: teach `collectShareableJoins`/
+  `collectBitmapScans` (+ both prebuild passes) to descend into `*setOp`
+  children, then widen `setOpBranchDrivingKindIsSupported` branch by
+  branch, each with its own serial-vs-parallel identity test.
 
-**Read before starting either**:
-`docs/design/0100-0149/m0140-0006-decomposition-into-a-b-c.md` (parent) and
-`docs/design/0100-0149/m0140-0006b-partial-append-cost-producer.md` (this
-loop's — has the "why this cannot move a plan today (two independent
-reasons)" section explaining why 0006c and 0006b-2 can land in any order
-EXCEPT: 0006c's own whitelist-opening step (`case PathSetOp:` in
-`partialPathDrivingKind`) must be the LAST of the three to land.
+**Read before starting either**: `docs/design/0100-0149/m0140-0006c-executor-claim-set.md`
+(this loop — has the "why landing the whitelist before 0006b-2 is safe"
+caller audit + the one-level-nesting bound), plus the parent
+`m0140-0006-decomposition-into-a-b-c.md` and
+`m0140-0006b-partial-append-cost-producer.md`.
 
-Files this loop: `internal/optimizer/windowsetoppaths.go` (new
-`addPartialSetOpPath`, called from `createSetOpPaths` right after 0006a's
-branch-rel threading; new `setOpPartialAppendProducer` const,
-`appendCPUCostMultiplier` const), `internal/optimizer/windowsetoppaths_test.go`
-(14 new tests). Design doc:
-`docs/design/0100-0149/m0140-0006b-partial-append-cost-producer.md` (new,
-indexed in `docs/design/README.md`). `.ralph/fix_plan.md` (M0140-0006b
-ticked `[x]`, M0140-0006b-2 filed). `.ralph/deferral_ledger.md` (one row:
-the mixed partial/non-partial Append arm not built + the upper-rel-wide
-Gather-wiring gap).
+Files this loop: `internal/executor/parallel_scan.go` (setOpLeft/
+setOpRight, `newLeafParallelClaimSet`, `unwrapToSetOp`, `attachAll`
+dispatch), `internal/executor/parallel_setop_claimset_test.go` (NEW:
+`TestGatherOverSetOpIdentity`, 260+90-row fixture, 1/2/4 workers —
+adopted from a cut-off loop's untracked file, fixed `intDatumForTest` →
+`NewIntDatum`), `internal/executor/parallel_gather_merge_claimset_test.go`
+(2 claim-kind arms), `internal/optimizer/parallel.go` (`*SetOp` twins in
+stamp/driving/unstamp), `internal/optimizer/parallel_test.go` (4 tests),
+`internal/optimizer/gatherpaths.go` (`case PathSetOp:` +
+`setOpBranchDrivingKindIsSupported`), `internal/optimizer/
+windowsetoppaths_test.go` (5 driving-kind tests). Design doc:
+`docs/design/0100-0149/m0140-0006c-executor-claim-set.md` (new, indexed).
+`.ralph/fix_plan.md` (0006c ticked `[x]`, 0006c-2 filed).
+`.ralph/deferral_ledger.md` (one row: join/bitmap-driven branches).
 
-Key symbols: `addPartialSetOpPath` (`windowsetoppaths.go`, new).
-`generateUsefulGatherPaths` (`gatherpaths.go:156`, method on `*searchCtx` —
-NOT reachable from any upper-rel producer, confirmed this loop by reading
-all three of its call sites). `partialPathDrivingKind`
-(`gatherpaths.go:364`, the fail-closed whitelist with no `PathSetOp` arm —
-0006c's job to add).
+Key symbols: `parallelClaimSet.attachAll` (`parallel_scan.go:586`, shared
+by `gatherOp` + `gatherMergeOp` — no second call site). `drivingScan` /
+`stampParallelScan` (`parallel.go`, general recursion, deliberately wider
+than admission). `partialPathDrivingKind` (`gatherpaths.go`, fail-closed;
+new `PathSetOp` arm). `generateUsefulGatherPaths` (`gatherpaths.go:156`,
+still unreachable from any upper-rel producer — 0006b-2's job).
 
-Finding: the parent decomposition doc's own open question — "does
-`generateUsefulGatherPaths` read `PartialPathlist` for free?" — resolves to
-NO, and the gap is upper-rel-wide (WINDOW/ORDERED/GROUP_AGG too, not just
-SETOP): every call site of `generateUsefulGatherPaths` reads a `*searchCtx`'s
-own `joinrels`/`joinrel`, and every upper-rel producer runs from
-`planner.go`'s SetOp fold / window chain / grouping paths entirely outside
-any `*searchCtx`. This means the producer landed this loop is inert by TWO
-independent, already-existing mechanisms (no reader at all, AND the
-whitelist gap even if it had one) rather than needing a brand-new env flag —
-confirmed live by `tpch-spotcheck`/`tpcds-sf025-regression sweep`/
-`tpch-acceptance-arm` all showing zero plan movement.
+Finding: this loop did NOT re-derive 0006c — it adopted a cut-off loop's
+uncommitted diff (~10 min old, "In-flight: none" in this baton was stale).
+The diff was complete/coherent; the single gap was the untracked identity
+test's bad helper ref. Mutation-verified: dispatch disabled → 700/700/
+1750 rows vs 350 want (exact workers+1 N-copies defect); enabled → 350/350.
 
-Gates run: `go build ./...` clean. `go vet ./internal/optimizer/...` clean.
-`go test ./internal/optimizer/...` PASS (full package, no `-count=1`,
-includes the 14 new tests). `go test ./internal/executor/...` PASS
-(sibling-path audit — no executor change needed, by design: 0006c owns
-that). `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=34) against the staged
-tree. `scripts/tpcds-sf025-regression.sh sweep` PASS=96 MISMATCH=0
-CKMISMATCH=0 ERROR=0 TIMEOUT=0, PLAN-SHAPE queries=99 same=99 changed=0,
-against the staged tree. `RALPH_PRECOMMIT_SCOPE=units
-scripts/ralph-precommit-test.sh` all packages PASS. `scripts/tpch-acceptance-arm.sh`
-PGSHAPED=1 HEAD baseline (`3f80f802a`, via a `git stash push -- <2 files>`/
-build/`git stash pop`/re-`git add` round-trip, private port 5583) vs this
-staged tree: VERDICT PASS, 24/24 labels MATCH — ran cleanly on the FIRST
-attempt this time (PGSHAPED=1 from the start, no Q9-timeout gotcha). All
-gate stamps' `code_tree` verified to match the committed index (the
-commit-msg hook itself caught and rejected the first commit attempt for a
-stale `tpch-acceptance-arm.json` from a prior loop — re-ran the arm against
-this loop's own staged tree and it passed on retry). `python3
-scripts/ralph_protected_regions.py check-designdocs` exit 0. `python3
-scripts/ralph-lineage-guard.py` — caught a real formatting bug in this
-loop's own new task (M0140-0006b-2's `Parent:` line was mid-sentence on a
-body line instead of starting its own line); fixed and re-ran clean. `make
-ralph-state-guard`: same status/progress clean-exit-marker inconsistency the
-last several loops also hit, auto-repaired, then clean. Commit succeeded
-(`36ffb5f07`) including the pre-commit pgbench smoke (PASS, all three
-transaction types).
+Gates run: `go build`/`go vet` clean. Optimizer+executor suites PASS.
+`tpch-spotcheck` PASS (Q12=2/Q13=34). `tpcds-sf025 sweep` PASS=96
+MISMATCH=0 PLAN-SHAPE 99/99 identical. `tpch-acceptance-arm` PGSHAPED=1
+HEAD-baseline (stash round-trip, port 5583, seed pinned) vs staged:
+VERDICT PASS 24/24 MATCH. Precommit units: no FAIL (`internal/parser`
+green at this HEAD — its earlier AST-drift failure is gone). All stamps
+share one `code_tree` matching the staged index. Lineage +
+check-designdocs guards exit 0. Commit includes the pre-commit pgbench
+smoke.
 
-In-flight: none. All three private-arm binaries
+In-flight: none after commit. Private-arm binaries
 (`tmp/goopg-acceptance-{baseline,mine}-bin`, `tmp/tpch-acceptance-runner`)
-and the `/tmp/arm-m0140-0006b-*.txt` digest files deleted after the diff;
-port 5583 verified free (`ss -ltnp`) before finishing. No shared cluster
-(`:65432`/`:65433`/`:65437`/`:65438`) was started, stopped, reset, or
-written beyond the online `pg_basebackup -X fetch` clone source reads the
-private-clone scripts already do.
+and `/tmp/arm-m0140-0006c-*.txt` digests deleted after the diff; port
+5583 verified free. No shared cluster touched (all arms via private clone
+of `:65433`, read-only source).
