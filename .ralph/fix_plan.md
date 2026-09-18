@@ -2864,7 +2864,7 @@ spill route is net-negative.
     (`analysis/m0141/m0141-s2a-fix2-*`). Treat `hashAggEntrySize`'s currency
     as closed for this milestone group absent new evidence — do not
     re-attempt without a different substitution or a different mechanism.
-- [ ] **M0141-S2a-fix2r — re-apply S2a-fix2 (owner Q4: no reverts).**
+- [x] **M0141-S2a-fix2r — re-apply S2a-fix2 (owner Q4: no reverts).**
   Kind: impl
   Parent: none. Depends on P0-E7 `[x]`. S2a-fix2 was implemented, measured and
   discarded before commit for parity reasons only (no wrong rows); its
@@ -2878,6 +2878,36 @@ spill route is net-negative.
   `costsize.c:2801/2824`), default-on, no flag. Run all values gates (values must
   hold — a wrong-rows result stops the task). File every query whose categories
   worsen (Q31, Q18 were seen) as its own task with `Parent: M0141-S2a-fix2r`.
+  - **DONE 2026-09-18.** Re-implemented exactly as scoped (guard + width
+    argument on both `hashAggEntrySize` and the `pages` term), plus the 4
+    accompanying test changes fix2's own doc had scoped. Design doc:
+    `docs/design/0100-0149/m0141-s2a-fix2r-hashaggentrysize-currency-reapply.md`.
+    **Values gate**: `scripts/tpch-acceptance-arm.sh` before/after digest
+    diff (private-worktree baseline binary at HEAD `683663605` vs the
+    working-tree binary with this diff) — VERDICT: PASS, 24/24 labels
+    value-identical, no wrong rows anywhere.
+    `scripts/tpcds-sf025-regression.sh sweep`: `MISMATCH=0 CKMISMATCH=0
+    ERROR=0 TIMEOUT=0`.
+    **Shape/category gate**: `scripts/tpch-estimate-audit-arm.sh
+    PLAN_ONLY=1` + `pg-plan-parity-diff.py` (same-PG-reference control):
+    TPC-H **MATCH 7 -> 8** (Q3 flips `SHAPE-DIFF` -> `MATCH`); Q8 loses its
+    `parameterisation` tag (its bushy spine now matches PG's own bushy
+    choice for Q8); no category rose anywhere;
+    `shape-delta.sh`: `shape-changed=2` (Q3, Q8), confirming no other query
+    moved. TPC-DS SF0.25: `PLAN-SHAPE: queries=99 same=99 changed=0` — zero
+    plan-shape movement across the whole corpus (Q31's 2026-09-15
+    regression does not reproduce on today's baseline; the corpus has moved
+    since via fix1/fix1-sweep). **No query worsened in either corpus, so no
+    `Parent: M0141-S2a-fix2r` follow-up task is filed** — a clean win, not
+    the lateral/net-neutral result fix2's 2026-09-15 measurement found.
+    `go test ./internal/optimizer/...`: PASS (full package). `go build
+    ./...`: clean. `make ea-ratchet`: N/A — a costing change, not an
+    estimate/selectivity change (touches only `Cost{}`, never
+    `EstimateRows`). `tpch-spotcheck.sh`: PASS, Q12=2/Q13=34 canonical,
+    gate-stamp PASS against staged code. **Movement: yes — TPC-H MATCH
+    7->8 (Q3), CATEGORIES-EXCL-MATCH join-order 13->12 /
+    parameterisation 5->4 / aggregation-strategy 9->8 / sort-strategy
+    8->7, zero categories rose.**
 - [x] **M0141-S2a-fix1-sweep — recon: other late/wrong width currencies.**
   Parent: none. fix1 (`ca574113c`, TPC-H match 6→8) is the only change in this
   programme proven to move the metric: width reached costing too late. Find every
