@@ -1,49 +1,36 @@
-Task: M0140-0006b-2 — wire `generateUsefulGatherPaths` into the Phase-4
-upper-rel pipeline (banner item 5). DONE and staged this loop (commit next).
+Task: M0140-0006c-2 — widen partial-SetOp admission past bare scans.
+  Hash-join branch LANDED and committed (2 commits); task stays `[ ]`
+  (merge / nested-loop / bitmap branches remain, each needs its own
+  identity test).
 
-Banner item 5 now has 0006a/0006b/0006c/0006b-2 all `[x]`. **One task
-remains open under item 5** (banner order: items 0–4 exhausted — P0-E7
-closed, fix2r/sweep/6-resume/0007c closed, S7 diagnosis done with impl
-children explicitly non-selectable):
-- **M0140-0006c-2** (Parent: M0140-0006c) — widen the partial-SetOp
-  admission past bare scans: teach `collectShareableJoins`/
-  `collectBitmapScans` (+ both prebuild passes) to descend into `*setOp`
-  children, then widen `setOpBranchDrivingKindIsSupported` branch by
-  branch, each with its own serial-vs-parallel identity test.
+Files (committed): `internal/executor/parallel_hash_build.go`
+  (`collectShareableJoins` `*setOp` arm), `operators_gather.go`
+  (`collectBitmapScans` `*setOp` arm), `parallel_scan.go` (leaf-pbm
+  comment), `parallel_setop_claimset_test.go` (identity + collectors),
+  `internal/optimizer/gatherpaths.go` (`PathHashJoin` admission arm),
+  `parallel.go` (`parallelChildren` + `StripGather` `*SetOp` arms),
+  `parallel_test.go` + `windowsetoppaths_test.go` (admission/gate tests).
+  Design doc: `docs/design/0100-0149/
+  m0140-0006c-2-join-branch-partial-setop-admission.md` (indexed).
 
-**Read before starting it**: `docs/design/0100-0149/
-m0140-0006b-2-upper-rel-gather-wiring.md` (this loop — the reader 0006c-2's
-widened branches will flow through, + the `top`-mode refusal policy),
-plus `m0140-0006c-executor-claim-set.md` and
-`m0140-0006-decomposition-into-a-b-c.md`.
+Key symbols: `setOpBranchDrivingKindIsSupported` (probe-side recursion),
+  `HasShareableHashJoin` / `HasBitmapScan` (now SetOp-descending),
+  `lookupSharedHashBuild` (sharing witness).
 
-Files this loop: `internal/optimizer/gatherpaths.go`
-(`generateUpperRelGatherPaths`, delegates via minimal `&searchCtx{}` —
-no twin body), `upperordered.go` / `upperorderedgrouping.go` /
-`windowsetoppaths.go` (one call each, before `setCheapest`),
-`windowsetoppaths_test.go` (e2e re-pinned: Gather generated but
-dominated), `gatherpaths_upperrel_test.go` (NEW, 6 tests).
-Design doc: `docs/design/0100-0149/m0140-0006b-2-upper-rel-gather-wiring.md`
-(new, indexed). `.ralph/fix_plan.md` (0006b-2 ticked `[x]`).
+Finding: collector is build-once sharing, NOT row identity
+  (mutation-verified: neutered collector still green on rows, fires only
+  the sharing assert; neutered attach dispatch gives 390/650 for 130).
+  TPC-H provably unmoved (0/22 setops); TPC-DS sweep 99/99 identical.
 
-Key symbols: `generateUpperRelGatherPaths` (`gatherpaths.go`, the only
-upper-rel `PartialPathlist` reader). `parallelModeOK(cp)`
-(`considerparallel.go:61`, pure — why no `*searchCtx` is needed).
-`createSetOpPaths` (live site — must run after `addPartialSetOpPath`'s
-`ConsiderParallel` stamp).
+Next step: merge-driven branch — needs admission arm + proof no walk
+  must collect through a merge outer (none does today); then NL
+  (outer-ParallelWorkers/Memoize/lateral audit), then bitmap (per-branch
+  pbm publication). Read this loop's design doc first.
 
-Finding: TPC-H provably unmoved (0/22 queries contain a setop — grepped
-`tmp/c7-tpch-queries/`; other three sites inert by construction +
-unit-pinned), so the match=8 floor holds transitively; TPC-DS 99/99
-shapes identical. Chain now live: bare-scan UNION ALL can elect
-Parallel Append when it wins on cost.
+Gates run: units PASS (44 ok, exit 0); `tpch-spotcheck` PASS (Q12=2/Q13=34);
+  sf025 sweep PASS=96 MISMATCH=0 PLAN-SHAPE 99/99 identical;
+  `tpch-acceptance-arm` A/B VERDICT PASS 24/24 MATCH; `ea-ratchet` N/A;
+  parity transitive N/A. Pre-commit pgbench smoke PASS (hook).
 
-Gates run: `go build`/`go vet` clean. Optimizer+executor suites PASS.
-Precommit units PASS (44 ok, no FAIL). `tpch-spotcheck` PASS
-(Q12=2/Q13=34). sf025 sweep PASS=96 MISMATCH=0 PLAN-SHAPE 99/99
-identical. `ea-ratchet` N/A (no estimate path). Acceptance-arm skipped
-(not a stats/costing/executor change; values covered by sweep +
-no-setop proof). Commit carries `PARITY: N/A` + reason (G2).
-
-In-flight: none. No shared cluster touched (sweep via its own lane;
-`:65433` only read by spotcheck as designed).
+In-flight: none. No shared cluster touched (acceptance arms on private
+  port 5583 via online clone of `:65433`, read-only).
