@@ -34,18 +34,18 @@ Setup / start / stop procedures:
   per-DB catalog work, goopg persists `CREATE DATABASE`: the tables live in a
   durable `tpch` database and `tpch@tpch` works across restarts (verified on
   the 2026-07-27 rebuild), so `make plan-gate` works against a restarted
-  server too. **`:65433` is under an EVIDENCE HOLD (2026-09-17).** Its `tpch`
-  dataset and constraints are gone (M0142-0003j); the orphaned heap files are
-  still on disk. Suspected cause: an uncommitted `ALTER TABLE` stamps catalog
-  rows with xmax and the catalog loader skips any row with xmax≠0 without
-  checking commit status, paired with M0143-0008 (ALTER not undone on
-  ROLLBACK) — see `tmp/METHODLOGY3_RALPH_CHECK0917/03-new-problems.md` §2.
-  The earlier "crash recovery is innocent, cause was manual DDL" note was wrong.
-  **Do not start, reload, `--reset`, or DROP tables on it** (marker
-  `bench/tpch/runtime_goopg/data.HOLD`). Recovery is owner-run:
-  `scripts/tpch-ref-recover.sh --i-am-owner --evidence-only` first, then the full
-  run after P0-E5; the only pre-loss copy is
-  `bench/tpch/runtime_goopg/preloss-clone-20260915` (also held). Two
+  server too. **The `:65433` evidence HOLD was RELEASED 2026-09-19** by an
+  owner-run `scripts/tpch-ref-recover.sh` restore (the second HOLD, caused by
+  the 2026-09-18 host-global OOM — see
+  `~/.ralph/OOM_INCIDENT/2026-09-18-global-oom.md`). The live `data/` dir was
+  restored from `preloss-clone-20260915`, spotcheck passed (Q12=2, Q13=34),
+  and the cluster runs again under `ref-clusters-ensure.sh`. The earlier
+  2026-09-17 incident (uncommitted `ALTER TABLE` stamping catalog rows with
+  xmax that the loader skips, paired with M0143-0008 — see
+  `tmp/METHODLOGY3_RALPH_CHECK0917/03-new-problems.md` §2) is preserved in
+  `tmp/evidence-65433-20260919-unclean/`. **`preloss-clone-20260915` remains
+  under `preloss-clone-20260915.HOLD`** — never start, clone, modify, move
+  or delete it; it is the only pre-loss copy. Two
   known quirks of the rebuilt layout: HammerDB's final
   ANALYZE step fails and `ANALYZE <table>` inside db `tpch` errors
   "relation does not exist" (per-DB scoping gap in the ANALYZE path — see
@@ -72,7 +72,10 @@ re-captured only when the dataset or query files change.
 **Reference clusters (`:65432`, `:65433`, `:65438`) are read-only for the Ralph
 loop** — no DDL/DML/ANALYZE/stop/reset; writes go to a private `55xx` clone.
 A stopped one is restarted only via `scripts/ref-clusters-ensure.sh`. Rules:
-`AGENT.md` §"Plan-parity harness".
+`AGENT.md` §"Plan-parity harness". Any other lifecycle action — stop,
+restart, reload, `--reset`, recovery, fresh bootstrap — is **owner-only**;
+the owner runbook is `maintenance_prompts/cluster-ops-runbook.md` and the
+loop escalates those cases instead of acting.
 
 ## Running a server manually
 
