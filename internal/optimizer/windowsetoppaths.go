@@ -355,6 +355,17 @@ func createSetOpPaths(u *upperRels, setOpNode *SetOp, ps PlannerSettings, tupleF
 	lseed := seedPathForNode(setOpRel, setOpNode.Left)
 	rseed := seedPathForNode(setOpRel, setOpNode.Right)
 
+	// M0140-0006a: thread each branch's own searched RelOptInfo onto the
+	// SETOP rel (see RelOptInfo.LeftBranchRel/RightBranchRel's doc comment)
+	// instead of letting it die inside the branch's own nested
+	// planSelectWithSettings call — the same carry `searchedRelOf` already
+	// does for the ORDERED rel's single input (upperordered.go), applied
+	// here to the SetOp's two inputs. Plumbing only: nothing below reads
+	// these fields yet, so addSetOpPaths still offers the one candidate it
+	// always has and no plan can change.
+	setOpRel.LeftBranchRel = searchedRelOf(setOpNode.Left)
+	setOpRel.RightBranchRel = searchedRelOf(setOpNode.Right)
+
 	addSetOpPaths(setOpRel, lseed, rseed, setOpNode, cp)
 	setCheapest(setOpRel)
 

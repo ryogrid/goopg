@@ -617,6 +617,26 @@ type RelOptInfo struct {
 	// (no ordering claim survives, same truncation rule as the winner's).
 	SearchCandidateKeys [][]PathKey
 
+	// LeftBranchRel / RightBranchRel are the search's own RelOptInfo for a
+	// SETOP rel's two UNION ALL branches (`searchedRelOf(setOpNode.Left)` /
+	// `searchedRelOf(setOpNode.Right)`), carried onto this rel by
+	// `createSetOpPaths` (M0140-0006a, windowsetoppaths.go) so a later
+	// consumer does not need to re-derive `searchedRelOf` itself — the same
+	// rationale as SearchCandidates above, applied to the SetOp's two-input
+	// shape instead of the ORDERED rel's single input.
+	//
+	// Nothing reads this yet, and that is the slice's gate: M0140-0006b's
+	// partial-Append producer seeds PartialPathlist from
+	// LeftBranchRel/RightBranchRel.PartialPathlist, but until that producer
+	// exists these fields are visibility only and cannot move a plan — the
+	// SETOP rel still gets exactly the one candidate `addSetOpPaths` always
+	// offered. nil when the corresponding branch is not a searched-tree
+	// root (e.g. it collapsed to a legacy-built Aggregate/Sort/Values shape
+	// the search never reached, or the branch's own statement had too few
+	// relations for the search to run at all).
+	LeftBranchRel  *RelOptInfo
+	RightBranchRel *RelOptInfo
+
 	// ConsiderParallel is PG's `RelOptInfo.consider_parallel`
 	// (pathnodes.h:911): whether it is worth generating partial paths for
 	// this rel at all — the relation can be read by a worker (not temp, not

@@ -2603,7 +2603,7 @@ setting that yields a serial plan.
     (executor claim-set for `setOp` under `Gather` — correctness prerequisite,
     must land before or with 0006b going live). No production code changed.
     Ledger row appended (task-id `m0140-0006`).
-- [ ] **M0140-0006a — expose SetOp-branch `PartialPathlist`.** Give each UNION
+- [x] **M0140-0006a — expose SetOp-branch `PartialPathlist`.** Give each UNION
   Kind: impl
   ALL branch (`planner.go:1106` `planSegment`, folded via `applySetOp`/
   `foldSetOpRange` at `planner.go:1120-1208`) a route to retain a `RelOptInfo`
@@ -2617,6 +2617,43 @@ setting that yields a serial plan.
   (`shape-delta.sh shape-changed=0`) — nothing should select a partial path
   yet. Read `docs/design/0100-0149/m0140-0006-decomposition-into-a-b-c.md`
   first.
+  - **Done 2026-09-18.** Movement: none (plumbing only). The M0140-0004
+    recon's premise was stale: it claimed "no channel exists" for a branch's
+    partial path to survive its own nested `planSelectWithSettings` call,
+    but never referenced `searchedRelOf`/`searchedTree.searchRel` (R21
+    slice 2a/2b, `6a51087fb`/`6302fb8d6`, landed 2026-09-09 — six days
+    *before* the 2026-09-15 recon) — the exact mechanism
+    `createOrderedPaths` already uses (M0141-S2b-2a, `upperordered.go:113`)
+    to thread a search root's own `RelOptInfo` onto a consumer rel without
+    re-deriving it. A UNION ALL branch is planned by the identical
+    `planSelectWithSettings` recursion every SELECT is, so a branch that is
+    a searched-tree root is reachable through the same accessor — the real
+    gap was narrower: `createSetOpPaths` never called `searchedRelOf` on its
+    two branches at all. Landed: `RelOptInfo.LeftBranchRel`/`RightBranchRel`
+    (`path.go`, mirrors `SearchCandidates`'s doc-comment convention) and two
+    lines in `createSetOpPaths` (`windowsetoppaths.go`) setting them from
+    `searchedRelOf(setOpNode.Left/.Right)` right after building the branch
+    seeds. Two new tests in `windowsetoppaths_test.go`
+    (`TestCreateSetOpPathsThreadsBranchRelsOntoSetOpRel`/
+    `...LeavesBranchRelsNilForNonSearchedBranches`). `addSetOpPaths` is
+    untouched, so nothing reads the new fields and no plan can move. Gates:
+    `go build ./...` clean; `go vet ./internal/optimizer/...` clean; `go
+    test ./internal/optimizer/...` and `./internal/executor/...` both full
+    green; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=34) against the
+    staged tree; `scripts/tpcds-sf025-regression.sh sweep` PASS=96
+    MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0, PLAN-SHAPE queries=99 same=99
+    changed=0; `scripts/tpch-acceptance-arm.sh` PGSHAPED=1 HEAD baseline
+    (`git stash`/build/`stash pop` round-trip of the three touched files,
+    private port 5583) vs this staged tree: VERDICT PASS, 24/24 labels
+    MATCH (the first attempt used the script's own PGSHAPED=0 default and
+    hit an unrelated pre-existing Q9 600s-timeout BOTH-ERROR, identical on
+    both arms — resolved by re-running with PGSHAPED=1 to match
+    tpch-spotcheck's actual default). All three gate stamps' `code_tree`
+    verified to match the staged index hash. Design doc:
+    `docs/design/0100-0149/m0140-0006a-expose-setop-branch-partialpathlist.md`.
+    Next: **M0140-0006b** reads
+    `setOpRel.LeftBranchRel/.RightBranchRel.PartialPathlist` directly — no
+    further plumbing needed.
 - [ ] **M0140-0006b — the partial-Append cost producer.** Depends on
   Kind: impl
   M0140-0006a. The `addPartialHashJoinPath` counterpart

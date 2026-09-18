@@ -525,3 +525,67 @@ func TestUpperRelRegistryHasEveryKindWiredAfterC18(t *testing.T) {
 		t.Fatalf("SETOP rels = %d, want 1", len(u.rels[UpperSetOp]))
 	}
 }
+
+// TestCreateSetOpPathsThreadsBranchRelsOntoSetOpRel is M0140-0006a's gate:
+// each branch's own searched RelOptInfo (`searchedRelOf(setOpNode.Left/
+// .Right)`) becomes reachable off the SETOP rel
+// (`RelOptInfo.LeftBranchRel`/`RightBranchRel`) once that branch is a
+// searched-tree root — and reaching it changes NOTHING about the elected
+// plan yet: `addSetOpPaths` still offers the one candidate it always has, so
+// `rel.Pathlist` stays exactly what a non-searched pair of branches produces
+// (TestAddSetOpPathsSingleCandidate).
+func TestCreateSetOpPathsThreadsBranchRelsOntoSetOpRel(t *testing.T) {
+	u := newUpperRels()
+
+	leftRel := &RelOptInfo{}
+	leftRel.PartialPathlist = []*Path{{Kind: PathSeqScan, Rows: 5, Cost: Cost{Total: 10}}}
+	l := &searchedPricedNode{pricedNode: *upperOrderedInput(1000)}
+	l.markFromJoinSearch()
+	l.setSearchRel(leftRel)
+
+	rightRel := &RelOptInfo{}
+	rightRel.PartialPathlist = []*Path{{Kind: PathSeqScan, Rows: 3, Cost: Cost{Total: 7}}}
+	r := &searchedPricedNode{pricedNode: *upperOrderedInput(400)}
+	r.markFromJoinSearch()
+	r.setSearchRel(rightRel)
+
+	node := setOpTestNode(parser.SetOpUnion, true, l, r)
+	if _, err := createSetOpPaths(u, node, DefaultPlannerSettings(), 0); err != nil {
+		t.Fatalf("createSetOpPaths: %v", err)
+	}
+
+	if len(u.rels[UpperSetOp]) != 1 {
+		t.Fatalf("SETOP rels = %d, want 1", len(u.rels[UpperSetOp]))
+	}
+	rel := u.rels[UpperSetOp][0]
+	if rel.LeftBranchRel != leftRel {
+		t.Fatalf("rel.LeftBranchRel = %p, want the left branch's own search rel %p", rel.LeftBranchRel, leftRel)
+	}
+	if rel.RightBranchRel != rightRel {
+		t.Fatalf("rel.RightBranchRel = %p, want the right branch's own search rel %p", rel.RightBranchRel, rightRel)
+	}
+	// Plumbing only: the tournament still offers exactly the one candidate.
+	if len(rel.Pathlist) != 1 {
+		t.Fatalf("rel.Pathlist = %d entries, want 1 — LeftBranchRel/RightBranchRel must not be offered to the tournament yet", len(rel.Pathlist))
+	}
+}
+
+// TestCreateSetOpPathsLeavesBranchRelsNilForNonSearchedBranches pins the
+// negative case: plain Nodes with no searched-tree tag leave the new fields
+// at their zero value, exactly like today (no field, no behavior).
+func TestCreateSetOpPathsLeavesBranchRelsNilForNonSearchedBranches(t *testing.T) {
+	u := newUpperRels()
+	l := upperOrderedInput(1000)
+	r := upperOrderedInput(400)
+	node := setOpTestNode(parser.SetOpUnion, true, l, r)
+	if _, err := createSetOpPaths(u, node, DefaultPlannerSettings(), 0); err != nil {
+		t.Fatalf("createSetOpPaths: %v", err)
+	}
+	rel := u.rels[UpperSetOp][0]
+	if rel.LeftBranchRel != nil {
+		t.Fatalf("rel.LeftBranchRel = %v, want nil for a non-searched branch", rel.LeftBranchRel)
+	}
+	if rel.RightBranchRel != nil {
+		t.Fatalf("rel.RightBranchRel = %v, want nil for a non-searched branch", rel.RightBranchRel)
+	}
+}
