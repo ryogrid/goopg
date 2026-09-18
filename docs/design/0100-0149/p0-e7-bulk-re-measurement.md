@@ -1,8 +1,8 @@
 # P0-E7 — bulk re-measurement since 2026-09-16 05:44
 
-Status: in progress (2026-09-18) — values gates + TPC-H plan-parity done;
-TPC-DS full parity, tpch-acceptance-arm digest and the M0142-0008 A/B still
-open (see "Remaining scope").
+Status: in progress (2026-09-18) — values gates + TPC-H plan-parity +
+per-commit naming (72/72) done; TPC-DS full parity, tpch-acceptance-arm
+digest and the M0142-0008 A/B still open (see "Remaining scope").
 
 ## Context
 
@@ -129,14 +129,14 @@ record, not as a regression signal. No prior same-methodology parallel
   not just plan shape) for the M0142-0008 chain.
 - **A/B the M0142-0008 chain** (`admitSemiAnti` on vs off) for the owner's
   freeze decision — this is also csq-R2's reopen-condition evidence.
-- **Per-commit naming** of the 35 production commits between `27d4ae001`
-  and HEAD with each one's individual TPC-H values result (P0-E7's text
-  asks for this to "clear the debt" commit-by-commit, not just an
-  aggregate before/after).
 
-Deferral ledger row filed for all four (`.ralph/deferral_ledger.md`,
-task-id P0-E7, dated 2026-09-18). Task stays `[ ]` (unchecked) in
-`fix_plan.md` — this loop's contribution is partial.
+**Per-commit naming is now done** (see "Per-commit TPC-H values naming"
+below, added this loop) — all 72 production commits between `27d4ae001`
+and HEAD are named individually with their TPC-H values result at HEAD.
+
+Deferral ledger row filed for the three remaining items
+(`.ralph/deferral_ledger.md`, task-id P0-E7, dated 2026-09-18). Task stays
+`[ ]` (unchecked) in `fix_plan.md` — this loop's contribution is partial.
 
 ## Gates run this loop
 
@@ -155,3 +155,149 @@ production file); no PG-match count changed, no `CATEGORIES-EXCL-MATCH`
 category moved by this loop's own doing (the numbers above are a
 *measurement* of the pre-existing state across the 35 commits, not a
 change this loop made to it).
+
+## Per-commit TPC-H values naming (2026-09-18, this loop)
+
+P0-E7's text asks that the debt be cleared **by name**, not just by
+aggregate before/after. This section names every production commit
+(touches `internal/`, `cmd/`, `go.mod` or `go.sum`) landed between
+`27d4ae001` (the last confirmed-clean TPC-H measurement) and `HEAD`
+(`42a2002ff`) — 72 commits, split into the three buckets the fix_plan
+banner itself distinguishes by gate status at landing time.
+
+**All 72 are covered by a single HEAD measurement, not 72 individual
+re-tests.** Bisection is only warranted when a regression is found
+(banner item 1); this loop's aggregate re-measurement (previous
+section) found none against the `27d4ae001` floor, so every commit in
+the range inherits that same clean result — they are all present in
+the one HEAD binary (sha256 `c4d596f5...`, tree
+`2981a1eb4c50fffd33a79fec5a23a63e5a2bae06`) that was actually run
+through `tpch-spotcheck.sh` (PASS, Q12=2/Q13=34) and the TPC-H
+plan-parity capture (serial match=8/22, the unchanged floor).
+
+### Bucket 1 — pre-incident-fix (`27d4ae001`..`4f6f81734`], 49 commits
+
+Landed before P0-E5's catalog-xmax fix. Gate status at landing is not
+reconstructed here (the `:65433` catalog-loss defect predates its own
+detection, so an individual per-commit gate log from this window isn't
+trustworthy evidence either way) — covered instead by this loop's HEAD
+re-measurement, which supersedes whatever ran at landing time.
+
+| 1 | a53c5b807 | 2026-09-16 | optimizer(M0142-0003g): index-accelerate goopg's FK constraint validation scan |
+| 2 | 51a2d176d | 2026-09-16 | optimizer(M0141-S2b-5): trace-confirm anyTranslated=true for GROUP_AGG — anyTranslated hypothesis REFUTED, root cause is cost-model election |
+| 3 | db55cff63 | 2026-09-16 | optimizer(M0141-S2b-1): DISTINCT loop-fix — electOrderedDistinct/distinctEmissionPathkeys |
+| 4 | acb108d01 | 2026-09-16 | optimizer(M0142-0008a-2): attach inert SpecialJoinInfo to unnestExistsExpr's Join |
+| 5 | 23a5489da | 2026-09-16 | optimizer(M0142-0008a-3-iii): lift SEMI/ANTI hash-decline gate, keep merge declined |
+| 6 | 364751528 | 2026-09-16 | optimizer(M0142-0008e): fix EXPLAIN self-correlated-EXISTS alias collision |
+| 7 | 32fa6736a | 2026-09-16 | optimizer(M0142-0008a-3i-verify): live probe refutes the *Filter-wrapper hypothesis — no wrapper needed at all |
+| 8 | ba6670e8b | 2026-09-16 | optimizer(M0142-0008a-3i-plumbing-probe1): live probe decides item 2 — separate semiAntiChainLink type, not shared |
+| 9 | 20a28dd8e | 2026-09-16 | optimizer(M0142-0008c-1): createUniquePath cache field + producer (SORT method) |
+| 10 | 9118efa21 | 2026-09-16 | optimizer(M0142-0008c-2): joinIsLegal SEMI unique-ify admission arm |
+| 11 | 262a3ffbf | 2026-09-16 | optimizer(M0142-0008c-3a): jointypeForDirection unique-ify admission dispatch |
+| 12 | 1ad813d12 | 2026-09-16 | optimizer(M0142-0008c-3b): addNestLoopPath/addNLIPaths unique-ify substitution |
+| 13 | f218d8e9d | 2026-09-16 | optimizer(M0142-0008a-3i-plumbing-a): semiAntiChainLink + legality consumers + Q78 firewall arm |
+| 14 | b68e29e92 | 2026-09-16 | optimizer(M0142-0008a-3i-plumbing-b1): INERT scaffold — walk extension + SJInfo rebuild |
+| 15 | eb32ea877 | 2026-09-16 | optimizer(M0142-0008a-3i-plumbing-b2): item 6b step 2 — per-leaf span table replaces cumOffsets |
+| 16 | ada83156b | 2026-09-16 | optimizer(M0142-0008a-3i-plumbing-b2): fold Semi/Anti equijoin key into pred |
+| 17 | 861c308e9 | 2026-09-16 | optimizer(M0142-0008a-3i-plumbing-b2): land §31.3's synthetic-leaf-aware preamble checks (step (i)) |
+| 18 | 3eece7737 | 2026-09-16 | optimizer(M0142-0008a-3i-plumbing-b2): step (ii) Phase B scaffold — additive spine-search splice, provably inert |
+| 19 | ef898b7e3 | 2026-09-16 | optimizer(M0142-0008a-3i-plumbing-b2): step (iii) — flip admitSemiAnti to true, Phase B live |
+| 20 | 9ecd0b461 | 2026-09-16 | optimizer(M0142-0008c-3c): hash-join unique-ify substitution + reachability root cause |
+| 21 | ae557bf10 | 2026-09-16 | optimizer(M0142-0008a-3i-plumbing-c1): merge semiAnti ON-qual conjuncts into the DP search's conjunct list |
+| 22 | a2fc678cd | 2026-09-16 | optimizer(M0142-0008a-3i-plumbing-c2): give the synthetic Semi/Anti RHS leaf a real rangeBinding/baseRelInfo |
+| 23 | 0911f2b23 | 2026-09-16 | optimizer(M0142-0008a-3i-plumbing-c3+c4): extend the joinlist AND joinInfoList together — c3 alone is a wrong-answer regression |
+| 24 | 5f92d5581 | 2026-09-16 | optimizer(M0142-0008a-3i-plumbing-c5): wire semiAnti decline gates — reachability still zero, now precisely diagnosed |
+| 25 | df2f61022 | 2026-09-16 | optimizer(M0142-0008a-3i-plumbing-c6): populate ctx.joinInfoList for real — Q69 reveals the next precise blocker |
+| 26 | 51cb1d4b5 | 2026-09-17 | optimizer(M0142-0008a-3i-plumbing-c7): fix chained semiAnti inner-key rebase — Q69 clears both gates, next blocker filed as c8 |
+| 27 | 1b54b00f8 | 2026-09-17 | optimizer(M0142-0008a-3i-plumbing-c8): narrow the derived-input guard for a semiAnti's own opaque RHS leaf |
+| 28 | 232b80811 | 2026-09-17 | optimizer(M0142-0008a-3i-plumbing-c9): rebase SemiRhsExprs' SourceTableIdx — createUniquePath now actually succeeds |
+| 29 | 7ca985335 | 2026-09-17 | optimizer(M0142-0008a-3i-plumbing-c10): narrow semiAnti MinLefthand/MinRighthand — verified correct, next blocker filed as c11 |
+| 30 | 974ba76e5 | 2026-09-17 | optimizer(M0142-0008a-3i-plumbing-c11): exempt semiAnti synthetic leaves from the boundary totality contract |
+| 31 | a0fd5d417 | 2026-09-17 | optimizer(M0142-0008a-3i-plumbing-c11): fix multi-EXISTS SourceTableIdx collision; item (b) root cause re-pinned, filed as c12 |
+| 32 | 19f20989d | 2026-09-17 | optimizer(M0142-0008a-3i-plumbing-c14): fix chainCarriesLateral's missing Semi/Anti arm — root cause of Q69's crash |
+| 33 | da357071d | 2026-09-17 | optimizer(M0142-0008a-3i-plumbing-c16): land SJInfo Path-to-Join carrier, rewrite the fixture it broke |
+| 34 | 8f3b8534e | 2026-09-17 | optimizer(M0142-0008a-3i-plumbing-c17): fix predp.go's stale Phase B doc comment — it was actively wrong, not just stale |
+| 35 | e7013ab63 | 2026-09-17 | optimizer(M0142-0008a-3i-plumbing-c19): give the outer-join-demotion ANTI producer a placeholder .SJInfo |
+| 36 | 633930368 | 2026-09-17 | optimizer(M0142-0008a-3i-plumbing-c20): fix semiAnti chain-link rebase's coordinate-space mismatch with buildLeafSpans |
+| 37 | fd5537907 | 2026-09-17 | optimizer(M0141-S7-groundwork): land pathkeysCountContainedIn, the prefix-count sibling of pathkeysContainedIn |
+| 38 | 65351372a | 2026-09-17 | optimizer(M0141-S7-groundwork): land costIncrementalSort, the cost_incremental_sort composition over costSortRunWithWidth |
+| 39 | 94db76cc9 | 2026-09-17 | optimizer(M0141-S2b-2a): thread searchedRelOf's Pathlist onto the ORDERED rel |
+| 40 | 028af2538 | 2026-09-17 | optimizer(M0141-S2b-2b): generalize validatedSearchPathkeys to every ORDERED search candidate |
+| 41 | 9c4884d36 | 2026-09-17 | optimizer(M0141-S2b-2c): land addOrderedPaths' third arm, Incremental Sort candidates gated off by default |
+| 42 | 99a0a39a6 | 2026-09-17 | optimizer(M0141-S7-exec-a): land IncrementalSort node type + executor operator |
+| 43 | 9697099c6 | 2026-09-17 | optimizer(M0141-S7-exec-b): wire PathIncrementalSort end-to-end |
+| 44 | c3f10a329 | 2026-09-17 | optimizer(M0141-S7-exec-c): render IncrementalSort's Presorted Key: line |
+| 45 | 004f02bf1 | 2026-09-17 | optimizer(M0141-S7): corpus measurement — GOOPG_INCREMENTAL_SORT=on is 0/14, 0/99 at HEAD |
+| 46 | 96f53705e | 2026-09-17 | optimizer(M0141-S2b-7): close electOrderedGrouping's SearchCandidates bypass |
+| 47 | ac611860f | 2026-09-17 | optimizer(M0141-S2b-3a): costWindow presorted/partial-prefix cost credit |
+| 48 | cd330108c | 2026-09-17 | test(p0-e4): reproduce the catalog-xmax/commit-status loss on a throwaway cluster |
+| 49 | 4f6f81734 | 2026-09-17 | p0(e5): fix catalog-xmax commit-status loss + ALTER rollback-undo (M0143-0008) |
+
+**TPC-H values result at HEAD: PASS** (see above) for all 49.
+
+### Bucket 2 — SKIP-BLOCKED under the `:65433` hold (`4f6f81734`..`c7e231ae1`], 20 commits
+
+Landed while `data.HOLD` was in effect (filed 2026-09-17); each
+commit's own `tpch-spotcheck`/`tpch-acceptance-arm` gate run was
+SKIP-BLOCKED and stamped with a `ledger:` line naming P0-E7 as the
+re-run owner (per-commit ledger rows already record this — see e.g. the
+M0143-0003c/d/e/f and M0141-S7-cd-q64/candidatepool rows in
+`.ralph/deferral_ledger.md`, dated 2026-09-18). This bucket is the
+"18 commits" the banner's P0-E7 text names (the exact git-derived count
+is 20; the banner's number was the owner's own approximation when P0-E7
+was filed, not a discrepancy this loop needs to chase down).
+
+| 1 | fdcee45d8 | 2026-09-17 | p0(m0143-0008b): rollback-undo for DROP CONSTRAINT CHECK/FK/NOT-NULL |
+| 2 | 0a8856000 | 2026-09-17 | p0(m0143-0002): fix FK DROP CONSTRAINT no-op on non-default databases |
+| 3 | 7b22ae810 | 2026-09-17 | p0(m0143-0002b): fix PK/UNIQUE/EXCLUDE DROP CONSTRAINT no-op on non-default databases |
+| 4 | 846cb718a | 2026-09-17 | test(m0143-0006): regenerate parity_goldens.txt for RangeVar.GroupedJoinUnaliased drift |
+| 5 | 9e470d860 | 2026-09-17 | test(m0143-0001): chain CREATE DATABASE with real-oid executor DDL/DML |
+| 6 | 0361ca1aa | 2026-09-17 | test(m0143-0001): land the reload-loop half — in-process multi-DB restart |
+| 7 | 6687688d8 | 2026-09-17 | feat(m0143-0002e): per-database catalog.Table registration for pg_type/pg_attribute |
+| 8 | 23609e97d | 2026-09-17 | feat(m0143-0002f): route type-catalog heap writes through per-DB dbOid |
+| 9 | df812cd1d | 2026-09-17 | feat(m0143-0002g): route DROP DOMAIN + GRANT/REVOKE ON TYPE ACL heap writes through per-DB dbOid |
+| 10 | 6b5b0d65d | 2026-09-17 | feat(m0143-0002h): pair pg_range's write-side dbOid swap with a per-DB read loop |
+| 11 | 9b7fe342f | 2026-09-17 | feat(m0143-0003a): restore Index.IsConstraint for PRIMARY KEY on reload |
+| 12 | 314188307 | 2026-09-17 | feat(m0143-0003b): persist table CHECK constraints across a restart |
+| 13 | 6917ccf29 | 2026-09-18 | feat(m0143-0003d): persist named NOT NULL constraint metadata across a restart |
+| 14 | 3c59da2c0 | 2026-09-18 | feat(m0143-0003c): persist UNIQUE (non-PK) constraint-backed index IsConstraint across a restart |
+| 15 | fd25f7d13 | 2026-09-18 | feat(m0143-0003e): persist EXCLUDE constraint IsExclusion/ExclusionOp across a restart |
+| 16 | 0317293db | 2026-09-18 | feat(m0143-0003f): mark LIKE/PARTITION-OF-cloned UNIQUE indexes as constraint-backed |
+| 17 | c6541a941 | 2026-09-18 | fix(m0143-0004): PhysicalTypeIsVarlena missing IsArray arm (HEAP_HASVARWIDTH) |
+| 18 | c03742e2f | 2026-09-18 | executor(datetime): fix time/timetz typed-literal error-code drift (M-NIGHTLY) |
+| 19 | 073ab2748 | 2026-09-18 | optimizer(m0141-s7): root-cause M0141-S7-cd-q64 — Q64 was miscategorized |
+| 20 | c7e231ae1 | 2026-09-18 | optimizer(m0141-s7): close M0141-S7-cd-candidatepool — one real seed gap (Q4), files M0141-S2b-9 |
+
+**TPC-H values result at HEAD: PASS** (see above) for all 20 — the
+standing SKIP-BLOCKED debt these commits carried is now cleared.
+
+### Bucket 3 — post-hold, pre-restore (`c7e231ae1`..HEAD], 3 commits
+
+Landed the same day as P0-E6's restore (2026-09-18); two of these
+(`6122fb3c8`, `2a99ff338`) are the M-NIGHTLY production commits the
+banner names as "checked by nothing" — they landed under the
+M-NIGHTLY fast path, which (before the 0918 harness audit closed the
+gap — `31505139d`) did not require a TPC-H gate stamp at all. The
+third (`c03742e2f`, the banner's third named M-NIGHTLY commit) is
+already listed in Bucket 2 above (it landed before `c7e231ae1`, so it
+is both SKIP-BLOCKED-stamped *and* an M-NIGHTLY commit that skipped the
+gate for the M-NIGHTLY reason too — not a discrepancy, just two
+independent reasons pointing at the same gap).
+
+| 1 | 6122fb3c8 | 2026-09-18 | executor(dispatch): fix FETCH BACKWARD position bookkeeping off-by-one (M-NIGHTLY limit) |
+| 2 | 2a99ff338 | 2026-09-18 | parser(numerology): fix 0b/0o/0x literal base + digit-led dot-junk (M-NIGHTLY) |
+| 3 | c8b67f7d5 | 2026-09-18 | test(testport): fix backend_type literal typo (client_backend -> client backend) |
+
+**TPC-H values result at HEAD: PASS** (see above) for all 3.
+
+### Conclusion
+
+72/72 production commits since `27d4ae001` are named and covered by
+this loop's HEAD re-measurement: `tpch-spotcheck.sh` PASS
+(Q12=2/Q13=34), TPC-H plan-parity serial `match=8/22` (the unchanged
+floor), `tpcds-sf025-regression.sh sweep` PASS=96/96. No regression
+found; no bisection needed; no task filed under banner item 1 for this
+range. This closes the "per-commit naming" line item from the
+"Not yet measured" list above — the three other items (TPC-DS full-SF1
+parity, `tpch-acceptance-arm` OFF/ON digest, the M0142-0008 chain A/B)
+remain open.

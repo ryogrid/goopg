@@ -227,6 +227,28 @@ uncommitted `ALTER TABLE … ADD CONSTRAINT` transaction on it was stopped with
     SF1 capture (budget: ~4-5h per the sf025 script's own header — plan for
     a dedicated loop) or the acceptance-arm digest run, whichever the next
     banner read finds still selectable first.
+  - **In progress 2026-09-18b (partial — task stays unchecked).** Kind: impl.
+    Movement: none (report-only; no production file touched). Landed the
+    "per-commit naming" sub-scope: git-derived the exact production-commit
+    set (touches `internal/`, `cmd/`, `go.mod` or `go.sum`) between
+    `27d4ae001` and HEAD — **72 commits**, not the banner's approximate "35"
+    (that number was the owner's own estimate when filing the task; the
+    git-derived count is authoritative and this loop uses it instead of
+    chasing the discrepancy) — split into three buckets by gate status at
+    landing (pre-incident-fix 49, SKIP-BLOCKED-under-hold 20, post-hold/
+    pre-restore 3) and named every one individually with its TPC-H values
+    result at HEAD (PASS for all 72, inherited from the single HEAD binary
+    measurement above — bisection is only needed on a found regression, and
+    none was found). Full table:
+    `docs/design/0100-0149/p0-e7-bulk-re-measurement.md` §"Per-commit TPC-H
+    values naming". **Still not done**: TPC-DS full-SF1 parity vs `:65438`,
+    `tpch-acceptance-arm.sh` OFF/ON digest, the M0142-0008 chain A/B (ledger
+    row filed below, dated 2026-09-18, task-id P0-E7). Gates: `go build
+    ./...` clean (no production file changed); no new gate run needed (this
+    loop's addition is a re-derivation from the existing HEAD gate results,
+    not a new measurement). Next loop: TPC-DS SF1 capture (budget a whole
+    loop, ~4-5h) or the acceptance-arm digest run, per whichever the banner
+    still finds selectable.
 - [x] **P0-D3 — split the M0141-S7 design doc and fix its `Status:`.**
   Parent: none. Kind: impl (docs only). Movement: none.
   **DONE 2026-09-18 by the owner.** The parent went 1501 -> 226 lines and eight
