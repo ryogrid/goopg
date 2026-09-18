@@ -101,6 +101,7 @@ bench/tpch/runtime_goopg/*.log
 bench/tpch/runtime_goopg/tmp/
 bench/tpch/runtime_goopg/preloss-clone-*/
 bench/tpch/runtime_goopg/evidence-*/
+bench/tpch/runtime_goopg/tpch-golden-*/
 bench/tpch/runtime_goopg/*.HOLD
 bench/tpch/runtime_goopg/goopg-bin
 

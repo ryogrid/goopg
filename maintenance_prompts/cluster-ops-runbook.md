@@ -218,6 +218,25 @@ scripts/tpch-ref-recover.sh --i-am-owner --dry-run --evidence-dir tmp/evidence-<
 scripts/tpch-ref-recover.sh --i-am-owner --evidence-dir tmp/evidence-<tag>
 ```
 
+### Record-level golden dump (`:65433` TPC-H SF=1)
+
+`bench/tpch/runtime_goopg/tpch-golden-20260919/` holds a CSV+gzip dump of
+every public table in the `tpch` db (one `<table>.csv.gz` each, headers on
+line 1, md5-pinned via `MANIFEST.md5`, provenance/caveats in `MANIFEST.md`).
+It complements the binary `preloss-clone-20260915` golden: greppable,
+diffable, and restorable into a throwaway `55xx` cluster via
+`COPY <table> FROM STDIN (FORMAT csv, HEADER true)`.
+
+Two important notes captured while producing it (details in `MANIFEST.md`):
+
+- **goopg `COPY ... TO` is broken on the `tpch` db** — `COPY t TO STDOUT`
+  and `COPY (SELECT * FROM t) TO STDOUT` both fail "relation does not
+  exist" (same per-DB scoping gap as ANALYZE). The dump used `psql --csv`
+  SELECT output instead. Treat this as a known goopg defect.
+- The PG `:65432` `tpch` dataset is **not** row-identical to goopg's
+  (lineitem: PG 5,998,835 vs goopg 6,001,255 vs canonical dbgen 6,001,215),
+  so a PG-side dump cannot serve as the goopg golden.
+
 ### Inspect the memory budget
 
 ```
