@@ -330,7 +330,7 @@ uncommitted `ALTER TABLE … ADD CONSTRAINT` transaction on it was stopped with
   `joinsearchseam.go:1552`) and the two probe tests if the chain is removed.
   Also bring the `Status:` lines of the design docs for M0142-0003d/e/f/g/j/k
   (none present) up to date.
-- [ ] **P0-H12 — TPC-DS SF1 Q9 shape divergence: new or pre-existing?**
+- [x] **P0-H12 — TPC-DS SF1 Q9 shape divergence: new or pre-existing?**
   Kind: recon.
   Parent: P0-E7. Filed 2026-09-18 (P0-E7's TPC-DS full-SF1
   parity measurement, `docs/design/0100-0149/p0-e7-bulk-re-measurement.md`
@@ -340,16 +340,36 @@ uncommitted `ALTER TABLE … ADD CONSTRAINT` transaction on it was stopped with
   match) — is `SHAPE-DIFF [scan-type]` at SF1. This is the first-ever SF1
   capture under the current harness (`scripts/capture-tpcds.sh` +
   `pg-plan-parity-diff.py` against `:65436`/`:65438` `tpcds`), so there is
-  no prior same-scale baseline to bisect against directly. Expected
-  movement/measurement: capture the identical pair at `27d4ae001` (build
-  that commit, repeat the exact SF1 capture procedure) and diff against
-  this loop's `analysis/m0142/p0e7-tpcds-sf1-{goopg,pg}.plans.txt` — if Q9
-  already diverged there, the SF0.25 floor simply never generalized to SF1
-  (no regression, floor gets an SF1 footnote); if it matched at
-  `27d4ae001`, bisect the 72-commit range per S5/the P0-E7 per-commit table
-  to the introducing commit and file it as its own `impl` task. Not
-  selected this loop (S1: the banner's ordering, not urgency, decides
-  when). — Nightly regression triage (STANDING — ACTIVE since 2026-08-08)
+  no prior same-scale baseline to bisect against directly.
+  - **DONE 2026-09-18.** Movement: none (dating/recon; the two captures
+    compared are numerically identical by design — confirming that was the
+    task). Built a second goopg binary from `27d4ae001` in a separate git
+    worktree (`/tmp/wt-27d4ae001`, sha256
+    `e337d3bbf16f7209eab2438b4a2c2d32ce5143ce7fbf77f1eeed57615f083793`),
+    served it against the existing SF1 data dir on the non-reference
+    `:65436` port (never `bench/tpcds/server.sh start`, which always
+    rebuilds from current HEAD), and repeated P0-E7's exact SF1 capture
+    procedure. **Result: numerically identical to P0-E7's HEAD
+    (`a0e741a68`) capture** — `match=1/99` (Q41 only), same
+    `CATEGORIES`/`CATEGORIES-EXCL-MATCH` counts digit for digit, and Q9's
+    own `=== Q9` plan section byte-identical between the two captures
+    (`diff` exit 0). **Conclusion: Q9's SF1 `scan-type` divergence
+    pre-dates `27d4ae001`** and is unchanged across the entire 72-commit
+    range P0-E7 measured — not a regression from any commit in that range.
+    The `match >= 2 (Q9, Q41)` floor is SF0.25-only and never generalized
+    to SF1; footnote added to
+    `m0137-0004-tpcds-match-reference-reconciliation.md` (the floor's
+    origin doc) rather than `AGENT.md`'s harness section (R2: the loop does
+    not edit that section). Root-causing Q9's actual SF1 scan-type choice
+    is out of scope (the question asked was "new or pre-existing", not
+    "why") — it joins the existing 73-query SF1 SHAPE-DIFF backlog, not a
+    newly-discovered gap, so no deferral-ledger row is needed (D1 applies
+    to newly-discovered unimplemented behaviour; nothing new was found
+    here). No production code touched. Design doc:
+    `docs/design/0100-0149/p0-h12-tpcds-sf1-q9-scan-type-divergence.md`.
+    Gates: `go build ./...` clean (both trees); `python3
+    scripts/ralph_protected_regions.py check-designdocs` exit 0.
+  — Nightly regression triage (STANDING — ACTIVE since 2026-08-08)
 
 Standing milestone: never complete it, never archive it, keep it directly
 under the Current Priority banner. Source of work: ci/logs/action-items.md

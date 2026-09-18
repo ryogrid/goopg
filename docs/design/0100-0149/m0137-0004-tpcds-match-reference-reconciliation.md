@@ -167,3 +167,19 @@ does not reproduce at HEAD.
   non-MATCH on both sides.
 - goopg SF0.25 server stopped after the measurement
   (`bench/tpcds/server.sh stop sf025`); no state left running.
+
+## SF1 footnote (P0-H12, 2026-09-18) — floor is SF0.25-only
+
+This task's `match=2 (Q9, Q41)` floor was measured **at SF0.25** only, never
+claimed to hold at other scale factors. P0-E7's first-ever SF1 capture under
+this harness (2026-09-18) found `match=1/99` (Q41 only) — Q9 is
+`SHAPE-DIFF [scan-type]` at SF1. P0-H12 (recon, this doc's sibling at
+`p0-h12-tpcds-sf1-q9-scan-type-divergence.md`) checked whether that is a
+regression introduced by one of the 72 production commits between
+`27d4ae001` (2026-09-16, this doc's own "last measured" TPC-H reference
+point) and the P0-E7 capture's HEAD (`a0e741a68`, 2026-09-18): it is not.
+Q9's SF1 plan is byte-identical at both commits, and the full 99-query
+`CATEGORIES`/`CATEGORIES-EXCL-MATCH` counts match exactly between the two
+captures. Conclusion: Q9's SF1 divergence pre-dates `27d4ae001`; the SF0.25
+`match >= 2` floor never generalized to SF1 scan-type costing. No regression
+follows from this footnote — see P0-H12 for the full capture pair and diff.
