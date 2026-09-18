@@ -1,7 +1,7 @@
-Task: M0140-0006c-2 slice A (NL branch admission) — LANDED this loop
-  (uncommitted at baton-write; commit follows immediately). Task stays
-  [ ] — merge + bitmap slices remain. Next selectable per banner:
-  item 5 continues (0006c-2 merge slice, then bitmap, then 0006c-3).
+Task: M0140-0006c-2 slice A (NL branch admission) — LANDED + committed
+  this loop: code cbd2ea1de, docs d873bbe83. Task stays [ ] — merge +
+  bitmap slices remain. Next selectable per banner: item 5 continues
+  (0006c-2 merge slice, then bitmap, then 0006c-3).
 
 What landed: `setOpBranchDrivingKindIsSupported`
   (internal/optimizer/gatherpaths.go:~620) gains `case PathNestLoop` —
@@ -12,11 +12,10 @@ What landed: `setOpBranchDrivingKindIsSupported`
   bitmap outers still refuse). NO executor change needed — the three
   attachParallel* walks already carry JoinAlgoNestedLoop.
 Files: gatherpaths.go, windowsetoppaths_test.go (3 acceptance + 11
-  refusals; `nestloop-branch` MOVED OUT of the bad-hash refusal map —
-  Jointype zero value IS parser.JoinInner so it's a valid admission),
-  parallel_setop_claimset_test.go (TestGatherOverSetOpNestLoopBranch-
-  Identity + planTreeHasNestedLoopUnderGather), design doc 0006c-2
-  "Update 2026-09-19", fix_plan ~L2992 bullet.
+  refusals; `nestloop-branch` moved out of bad-hash refusal map —
+  Jointype zero IS parser.JoinInner), parallel_setop_claimset_test.go
+  (NL identity test + planTreeHasNestedLoopUnderGather), design doc
+  0006c-2 "Update 2026-09-19", fix_plan ~L2992 bullet.
 Hypothesis/Findings: corpus unchanged — Q76 still needs M0142-0005a
   (Memoize under probe NL) before it flips; sweep PLAN-SHAPE 99/99
   identical confirms slice A wins nothing at current costs (same as
@@ -33,9 +32,9 @@ Next step: merge branch (slice B — one arm + the probeSideIsLeft-
 Gates run: build clean; go test optimizer 2.7s + executor 13.4s green;
   tpch-spotcheck PASS real run Q12=2/Q13=34 (first since :65433
   recovery); SF0.25 sweep PASS=96 MISMATCH=0 PLAN-SHAPE 99/99; units
-  all ok; mutation check PASS. pgbench smoke runs at commit (hook).
+  all ok; acceptance-arm 24/24 MATCH vs fresh HEAD baseline; mutation
+  check PASS; all 3 gate stamps code_tree=ee38e23b06f6b65e = index.
 In-flight: none.
-WATCH: a concurrent Devin loop commits to this branch — stage
-  explicitly, verify staged diff before committing; foreign mods
-  (ci/logs, .claude, .ralphrc, analysis/, postgres, third-party)
-  never get committed.
+WATCH: concurrent Devin loop commits to this branch — stage
+  explicitly; foreign mods (ci/logs, .claude, .ralphrc, analysis/,
+  postgres, third-party) never get committed.
