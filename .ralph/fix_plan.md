@@ -3956,21 +3956,35 @@ spill route is net-negative.
     resurrection.
     Movement: yes — CATEGORIES-EXCL-MATCH aggregation-strategy 71→44
     (TPC-DS) / 8→3 (TPC-H) and match 7→8.
-  - [ ] **M0141-S2b-14** — recon/triage: the 13 NEW ea-ratchet findings
+  - [x] **M0141-S2b-14** — recon/triage: the 13 NEW ea-ratchet findings
     S2b-13's plan churn surfaced (baseline re-pinned to 76).
     Kind: recon
     Parent: M0141-S2b-13
-    Inline triage in the S2b-13 design
-    doc's Gates section classifies all 13 as relset-key churn, not new
-    mechanisms: Q85 ×4 (reason joined early — same order PG itself
-    uses; the underlying `web_sales⋈web_returns` under-estimate is
-    pre-existing), Q61 ×3 / Q68 ×2 / Q89 / Q7 / Q13 (the known ~40x
-    `date_dim+store_sales`-family under-estimates re-keyed under new
-    join decompositions), Q54 (HashAggregate→GroupAggregate node rename
-    at identical est 22 / act 0). Resume: confirm each against
-    `bench/tpcds/plans-pg/Q*.txt` join orders; if any isolates a real
-    estimator defect (candidate: Q61 `date_dim+store+store_sales` HJ
-    est 23 vs PG 8, act 0), file the estimator fix; else close.
+    DONE — all 13 classified as relset-key churn of PG-faithful
+    estimates; no estimator defect isolated, no fix filed.
+    Design doc:
+    `docs/design/0100-0149/m0141-s2b-14-ea-findings-triage.md`.
+    Verified by reproducing every flagged relset through `EXPLAIN` on
+    BOTH engines (PG `:65438/tpcds025` read-only vs goopg
+    `:65437/postgres`) with the queries' complete predicate sets:
+    Q61 `ss⋈dd` goopg 94 vs PG 97; Q68 213 vs PG 219 (the first-pass
+    15x "divergence" was my own omitted `d_dom BETWEEN 1 AND 2`
+    predicate — with the full set PG also estimates ~219); Q89 1102 vs
+    PG 1107; Q7 1102 vs PG 1107; Q85 `ws⋈wr` 6 vs PG 5. The ~40–120x
+    under-estimates vs actual are shared PG-formula errors — the
+    ratchet flags them only because PG's chosen plan decomposes the
+    join order differently and never materializes the relset.
+    Q85's reason-early join order matches PG's own plan; Q54 is the
+    intended HashAggregate→GroupAggregate rename at identical est/act.
+    The one flagged `pg_est` divergence (Q61
+    `date_dim+store+store_sales` HJ goopg 23 vs PG 8, ~3x) resolved as
+    a **reporting-convention artifact, not a selectivity bug**: goopg
+    stamps TOTAL rows on partial-path nodes while PG stamps per-worker
+    rows (divisor ~3.1 — `cost_seqscan` divides). Minimal repro:
+    `ss⋈store` goopg 688033-total vs PG 222047-per-worker, actual
+    687463 — both engines essentially exact. Scorer caveat folded into
+    S2b-15's scope note below.
+    Movement: none
   - [ ] **M0141-S2b-15** — impl (small): gather row-stamp divergence found
     by S2b-13's C19f trace. `makeGatherPath`/`makeGatherMergePath`
     (`gatherpaths.go:273`) always stamp `Rows = computeGatherRows(sub)`
@@ -3984,7 +3998,16 @@ spill route is net-negative.
     `joinsearchlevel.go`/`geqo.go` sites take `rel.Rows`;
     `generateUpperRelGatherPaths` keeps `computeGatherRows`. Effect is
     small: the off-by-one only reaches `add_path`'s `rows` tie-break
-    inside fuzzy ties and shifts EXPLAIN `rows=`. Gates: units +
+    inside fuzzy ties and shifts EXPLAIN `rows=`. S2b-14 adds a
+    related-but-broader surface to check while in this code: goopg's
+    EXPLAIN stamps TOTAL rows on partial-path nodes (e.g.
+    `Parallel Seq Scan on store_sales rows=719876`) while PG stamps
+    per-worker rows (`rows=232218`, `cost_seqscan` divides by
+    `parallel_divisor`) — same underlying estimates, different `rows=`
+    convention; it made the ea scorer read goopg ~3.1x high vs
+    `pg_est` on matched partial-path relsets (Q61's flagged HJ).
+    Decide there whether the gather stamp fix should also move the
+    partial-path display convention toward PG. Gates: units +
     spotcheck + SF0.25 sweep; expect a few plan churns where a gather
     sits inside a fuzz band.
     Kind: impl
