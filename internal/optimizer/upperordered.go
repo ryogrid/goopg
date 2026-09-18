@@ -157,12 +157,23 @@ func addOrderedPaths(ordered *RelOptInfo, input *Path, sortPathkeys []PathKey, c
 	if pathTraceEnabled {
 		contained, nCommon := pathkeysCountContainedIn(input.Pathkeys, sortPathkeys)
 		traceOrderedSeedCandidate(input.Kind, len(input.Pathkeys), contained, nCommon, input.Cost.Total)
+		if input.Kind == PathAgg {
+			// M0141-S2b-6-resume: the strategy/rows label the generic seed
+			// line above does not carry, so a Hashed candidate's pre-stack
+			// cost and a Sorted candidate's own (input-sort-inclusive)
+			// cost can be told apart on sight.
+			traceOrderedGroupingCandidate(input.AggStrategy, input.Rows)
+		}
 	}
 	if pathkeysContainedIn(input.Pathkeys, sortPathkeys) {
 		addPath(ordered, input, upperOrderedInputProducer)
 		return
 	}
-	addPath(ordered, sortPathForBounded(input, sortPathkeys, cp, limitTuples), upperOrderedSortProducer)
+	sorted := sortPathForBounded(input, sortPathkeys, cp, limitTuples)
+	if pathTraceEnabled && input.Kind == PathAgg {
+		traceOrderedSortedCandidate(input.AggStrategy, input.Rows, sorted.Cost.Startup, sorted.Cost.Total)
+	}
+	addPath(ordered, sorted, upperOrderedSortProducer)
 
 	// M0141-S2b-2c / S7: the third arm — every OTHER surviving search
 	// candidate that already satisfies a genuine partial prefix of

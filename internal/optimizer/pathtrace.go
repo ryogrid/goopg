@@ -185,6 +185,40 @@ func traceOrderedSeedCandidate(kind PathKind, keyLen int, contained bool, nCommo
 		pathTraceTag, int(kind), keyLen, contained, nCommon, totalCost)
 }
 
+// traceOrderedGroupingCandidate emits one DPPATH diagnostic line per PathAgg
+// candidate electOrderedGrouping (upperorderedgrouping.go) offers to
+// addOrderedPaths, BEFORE the contained/sort-stack decision — the seed's own
+// AggStrategy and Rows alongside the cost traceOrderedSeedCandidate already
+// prints for the same call, so a Hashed candidate's pre-stack cost and a
+// Sorted candidate's pre-stack cost (which already has its own input-Sort
+// priced in by whichever grouping-paths producer built it) can be told apart
+// on sight rather than inferred from `contained`. M0141-S2b-6-resume: the
+// question this line exists to answer is a term-by-term Hashed-vs-Sorted
+// diff, which needs the strategy label the generic seed line does not carry.
+func traceOrderedGroupingCandidate(strategy AggStrategy, rows float64) {
+	if !pathTraceEnabled {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "%s groupcand producer=upper.ordered.grouping.candidate strategy=%d rows=%.0f\n",
+		pathTraceTag, int(strategy), rows)
+}
+
+// traceOrderedSortedCandidate emits one DPPATH diagnostic line for the Sort
+// `addOrderedPaths` (upperordered.go) stacks over a non-contained candidate —
+// the AFTER-sort cost that `setCheapest` actually compares, printed beside
+// traceOrderedGroupingCandidate/traceOrderedSeedCandidate's BEFORE-sort
+// numbers for the same candidate. M0141-S2b-6-resume: separating a Hashed
+// PathAgg's OUTPUT-sort term from a Sorted PathAgg's (already-priced-in)
+// INPUT-sort term requires seeing the seed cost and the stacked cost
+// side by side, not just the final winner.
+func traceOrderedSortedCandidate(strategy AggStrategy, rows float64, sortStartup, sortTotal float64) {
+	if !pathTraceEnabled {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "%s sorted producer=upper.ordered.sorted strategy=%d rows=%.0f startup=%g total=%g\n",
+		pathTraceTag, int(strategy), rows, sortStartup, sortTotal)
+}
+
 // relSetBits renders a RelSet as a stable, parseable member list. The trace has
 // no access to relation NAMES here (addPath is below the level that knows
 // them), so the bitmask members are the identity — and they are what
