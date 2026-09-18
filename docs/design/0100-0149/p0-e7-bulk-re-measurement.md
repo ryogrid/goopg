@@ -1,8 +1,10 @@
 # P0-E7 — bulk re-measurement since 2026-09-16 05:44
 
-Status: in progress (2026-09-18) — values gates + TPC-H plan-parity +
-per-commit naming (72/72) + the tpch-acceptance-arm digest/M0142-0008 A/B
-done; TPC-DS full-SF1 parity still open (see "Not yet measured").
+Status: done (2026-09-18) — values gates + TPC-H plan-parity + per-commit
+naming (72/72) + the tpch-acceptance-arm digest/M0142-0008 A/B + TPC-DS
+full-SF1 parity all measured. All six named sub-items of P0-E7 are closed;
+one follow-up task filed (TPC-DS SF1 Q9 shape divergence, see
+"TPC-DS full-SF1 parity" below) for the owner's banner.
 
 ## Context
 
@@ -400,3 +402,112 @@ an already-timing-out query. This is the A/B evidence P0-E7 was asked to
 produce and the evidence csq-R2's reopen condition names — the decision
 itself (freeze on vs revert) is the owner's per the 2026-09-17 FROZEN note,
 not this loop's to make.
+
+## TPC-DS full-SF1 parity (2026-09-18d, this loop) — closes P0-E7
+
+The prior loop's "Not yet measured" note assumed a 4-5 hour budget for this,
+citing `scripts/tpcds-sf025-regression.sh`'s own header comment ("a full
+SF=1 goopg-vs-PG sweep costs 4-5 hours"). **That estimate does not apply
+here**: the 4-5h figure is for the sweep's `cmd_sweep` path, which
+*executes* all 99 queries against real data (and eats 16 known 600s
+timeouts). `scripts/capture-tpcds.sh` never executes a query — it opens a
+fresh `psql` session per query and runs a bare `EXPLAIN` (see the script's
+own `# EXPLAIN only (no ANALYZE).` banner line), so its cost is
+independent of scale factor. Measured directly this loop: **2.3s** for the
+goopg-side 99-query capture, **5.0s** for the PG-side capture — the same
+order of magnitude as the SF0.25 plan-only channel's own documented "~20s"
+(`cmd_plans`'s comment, `scripts/tpcds-sf025-regression.sh:753`). No prior
+loop needed to leave this open; the assumption was an unverified transfer
+from a different (execution) code path.
+
+### Method
+
+Per `AGENT.md` §"Plan-parity harness" G3 and the R1-safety pattern this
+doc's TPC-H section already established (private goopg lane, read-only PG
+reference, never `ANALYZE` a reference cluster):
+
+- **goopg side**: `bench/tpcds/server.sh start sf1` (builds
+  `tmp/goopg-tpcds-bin` fresh from HEAD `a0e741a68`, tree clean on
+  `internal/`/`cmd/`/`go.mod`/`go.sum`, starts the *non*-reference `:65436`
+  SF=1 cluster — this port carries no R1 read-only restriction, unlike
+  `:65432`/`:65433`/`:65438`). `sha256(tmp/goopg-tpcds-bin) =
+  5b8a627dfbf041ca209082be2e6bc8aa979487e533c0e1e2554db3ed84a98c79`.
+  `CAPTURE_ENGINE=goopg GOOPG_EXPECT_BIN_SHA256=<above>
+  scripts/capture-tpcds.sh 65436 postgres postgres
+  analysis/m0142/p0e7-tpcds-sf1-goopg.plans.txt "P0-E7 goopg SF1 (HEAD
+  a0e741a68)" bench/tpcds/runtime_goopg/data`. Stopped afterward via
+  `tmp/goopg-tpcds-bin stop -D bench/tpcds/runtime_goopg/data` (direct
+  binary invocation, not `bench/tpcds/server.sh stop` — the RALPH_LOOP
+  guard denies that wrapper's `stop`/`restart` verbs unconditionally,
+  regardless of target, because the same script can also stop the `:65438`
+  PG reference; the direct-binary path is exactly what CLAUDE.md's "Running
+  a server manually" section names as the alternative). `:65436` was down
+  before this loop and is down again after — no persistent state change.
+- **PG side**: `CAPTURE_ENGINE=pg scripts/capture-tpcds.sh 65438 tpcds ryo
+  analysis/m0142/p0e7-tpcds-sf1-pg.plans.txt "P0-E7 PG18.3 SF1 reference"` —
+  read-only (`EXPLAIN` only, no `ANALYZE`, no 6th `DATADIR` arg so no write
+  attempt is even possible), against the **`tpcds`** database (the SF=1 one;
+  `tpcds025` is the SF0.25 database the m0137-0003 procedure and the
+  sf025 gate already cover).
+- Diff: `python3 scripts/pg-plan-parity-diff.py
+  analysis/m0142/p0e7-tpcds-sf1-goopg.plans.txt
+  analysis/m0142/p0e7-tpcds-sf1-pg.plans.txt`.
+
+Artifacts: `analysis/m0142/p0e7-tpcds-sf1-{goopg,pg}.plans.txt` (sha256
+`e0bc37d2...` / `991955cb...`), `analysis/m0142/p0e7-tpcds-sf1-diff.txt`
+(full diff tool output).
+
+### Result
+
+```
+PLAN-PARITY: queries=99 match=1 shapediff=73 unparsed=0 missingnode=22 error=3 timeout=0
+CATEGORIES: join-order=91 join-method=71 scan-type=60 parameterisation=46 aggregation-strategy=72 sort-strategy=73 parallelism=88 qual-placement=22 rendering=23
+CATEGORIES-EXCL-MATCH: join-order=91 join-method=71 scan-type=60 parameterisation=46 aggregation-strategy=72 sort-strategy=73 parallelism=88 qual-placement=22 rendering=23
+```
+
+The one MATCH is **Q41** (`join-order` etc. all agree; PG's own cost is a
+red herring here — `pg cost=72523826.68` vs `goopg cost=183.23` still counts
+as a shape MATCH because the diff tool scores plan *shape*, not cost
+magnitude). **Q9 does not match at SF1** (`SHAPE-DIFF [scan-type]`), unlike
+the SF0.25 corpus, where Q9 is one of the two named floor queries
+(`AGENT.md`: "TPC-DS match ≥ 2 (Q9, Q41)", set by `m0137-0004` measuring
+**SF0.25** specifically — "both references agreed match=2 as of
+2026-09-15"). The three `ERROR` queries (Q36/Q70/Q86) are the same
+pre-existing dsqgen-artifact skips the SF0.25 sweep already names (three
+entries, exact match).
+
+**This is the first time this exact SF1 goopg-vs-PG plan-parity capture has
+been run** — no prior same-methodology SF1 baseline exists to diff against,
+so `match=1/99` cannot be bisected to a commit the way the TPC-H side of
+this task was: there is no earlier "good" SF1 reading to compare to, only
+the SF0.25 reading (which is a different corpus/scale, not a substitute
+per this doc's own earlier "not a substitute" note in "Not yet measured").
+Per `AGENT.md` R6/C-rules this is **not** grounds to tune anything toward
+matching, and per S2 a newly-found shape divergence against PG (not a wrong
+row count, not lost data) is filed as a task, not fixed inline. **Filed**:
+a follow-up task for the owner's banner (not selected this loop) to
+determine whether Q9's SF1 `scan-type` divergence is new since `27d4ae001`
+(requires building and capturing at that commit — a second, separate
+capture pair) or has always been true at SF1 and the SF0.25 floor simply
+never generalized to SF1. See `.ralph/deferral_ledger.md` (row dated
+2026-09-18, task-id P0-E7) and `.ralph/fix_plan.md` banner item 1.
+
+### Conclusion
+
+All six of P0-E7's named sub-items are now measured: values gates, TPC-H
+plan-parity, per-commit naming (72/72), the `tpch-acceptance-arm.sh`
+digest, the M0142-0008 chain A/B, and TPC-DS full-SF1 parity. P0-E7 is
+marked `[x]` in `fix_plan.md`. The SF1 `match=1` finding is recorded as new
+information (first-ever SF1 measurement under this harness), not asserted
+as a regression, and handed to the owner's banner as its own task rather
+than bisected inline (no prior SF1 baseline exists to bisect against, and
+this loop's one-task budget is spent on the measurement itself).
+
+### Gates run this section
+
+`go build ./...` clean (no production file touched — `internal/`, `cmd/`,
+`go.mod`, `go.sum` all unmodified this loop). No values gate re-run needed
+(this is a plan-only capture, not a code change); `tmp/gate-stamps/
+{tpch-spotcheck,tpcds-sf025}.json` from earlier this loop-family still
+apply unchanged. `python3 scripts/ralph_protected_regions.py
+check-designdocs` exit 0 (verified before commit).

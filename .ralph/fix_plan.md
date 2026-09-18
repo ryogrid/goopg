@@ -188,7 +188,7 @@ uncommitted `ALTER TABLE … ADD CONSTRAINT` transaction on it was stopped with
   (else HammerDB reload) → rebuild `tmp/goopg-bench-bin` at HEAD → start →
   `scripts/tpch-spotcheck.sh` PASS. **The loop does not run it, and does not
   mark this task.**
-- [ ] **P0-E7 — bulk re-measurement since 2026-09-16 05:44.** Parent: none.
+- [x] **P0-E7 — bulk re-measurement since 2026-09-16 05:44.** Parent: none.
   Kind: impl. **Now selectable (P0-E6 done 2026-09-18).** Scope note added by the
   owner: this also clears the debt of the **18 commits between `4f6f81734` and
   `c7e231ae1` that landed on a SKIP-BLOCKED `tpch-spotcheck` stamp** plus the
@@ -278,10 +278,30 @@ uncommitted `ALTER TABLE … ADD CONSTRAINT` transaction on it was stopped with
     literal error-string diff on Q9's two cancel messages, not a values
     regression — explained in the design doc). **Still not done**: TPC-DS
     full-SF1 parity vs `:65438` (ledger row filed, task-id P0-E7, dated
-    2026-09-18) — the one remaining P0-E7 sub-item. Next loop: dedicate a
-    whole loop's timeout to the SF1 TPC-DS capture
-    (`scripts/capture-tpcds.sh` + `pg-plan-parity-diff.py` on a private 55xx
-    clone, ~4-5h budget per the sf025 script's own header).
+    2026-09-18) — the one remaining P0-E7 sub-item.
+  - **DONE 2026-09-18d.** Kind: impl. Movement: none (measurement only; no
+    production file touched). The "~4-5h budget" note above was wrong: that
+    figure is `tpcds-sf025-regression.sh`'s **execution**-sweep cost
+    (`cmd_sweep`, real query runs, 16 known 600s timeouts), not
+    `capture-tpcds.sh`'s plan-only `EXPLAIN` cost, which is scale-independent
+    (measured: 2.3s goopg-side + 5.0s PG-side for the full 99-query SF1
+    corpus). Ran `bench/tpcds/server.sh start sf1` (fresh HEAD binary,
+    `a0e741a68`, tree clean) + `scripts/capture-tpcds.sh` against `:65436`
+    (goopg SF1) and `:65438`/`tpcds` (PG SF1 reference, read-only,
+    EXPLAIN-only) + `pg-plan-parity-diff.py`. **Result: `match=1/99`**
+    (Q41 only; Q9 — one of the two floor queries at SF0.25 — does NOT match
+    at SF1, `SHAPE-DIFF [scan-type]`), below the `match >= 2` floor that
+    `m0137-0004` established **at SF0.25**. This is the first-ever SF1
+    capture under this harness, so there is no prior same-methodology SF1
+    baseline to bisect against — recorded as new information, not asserted
+    as a regression (see design doc §"TPC-DS full-SF1 parity"). Filed
+    banner-item-1 task `P0-H12` below for the owner to decide whether to
+    bisect Q9's SF1 divergence. Design doc:
+    `docs/design/0100-0149/p0-e7-bulk-re-measurement.md`
+    §"TPC-DS full-SF1 parity (2026-09-18d, this loop) — closes P0-E7".
+    Gates: `go build ./...` clean (no production file touched);
+    `python3 scripts/ralph_protected_regions.py check-designdocs` exit 0.
+    **All six named P0-E7 sub-items are now measured — task closed.**
 - [x] **P0-D3 — split the M0141-S7 design doc and fix its `Status:`.**
   Parent: none. Kind: impl (docs only). Movement: none.
   **DONE 2026-09-18 by the owner.** The parent went 1501 -> 226 lines and eight
@@ -310,9 +330,26 @@ uncommitted `ALTER TABLE … ADD CONSTRAINT` transaction on it was stopped with
   `joinsearchseam.go:1552`) and the two probe tests if the chain is removed.
   Also bring the `Status:` lines of the design docs for M0142-0003d/e/f/g/j/k
   (none present) up to date.
-
-
-## M-NIGHTLY — Nightly regression triage (STANDING — ACTIVE since 2026-08-08)
+- [ ] **P0-H12 — TPC-DS SF1 Q9 shape divergence: new or pre-existing?**
+  Kind: recon.
+  Parent: P0-E7. Filed 2026-09-18 (P0-E7's TPC-DS full-SF1
+  parity measurement, `docs/design/0100-0149/p0-e7-bulk-re-measurement.md`
+  §"TPC-DS full-SF1 parity"). At SF1, goopg-vs-PG plan-parity is
+  `match=1/99` (Q41 only); Q9 — one of the two queries the `match >= 2`
+  floor names (`AGENT.md`, set by `m0137-0004` **at SF0.25**, where Q9 DOES
+  match) — is `SHAPE-DIFF [scan-type]` at SF1. This is the first-ever SF1
+  capture under the current harness (`scripts/capture-tpcds.sh` +
+  `pg-plan-parity-diff.py` against `:65436`/`:65438` `tpcds`), so there is
+  no prior same-scale baseline to bisect against directly. Expected
+  movement/measurement: capture the identical pair at `27d4ae001` (build
+  that commit, repeat the exact SF1 capture procedure) and diff against
+  this loop's `analysis/m0142/p0e7-tpcds-sf1-{goopg,pg}.plans.txt` — if Q9
+  already diverged there, the SF0.25 floor simply never generalized to SF1
+  (no regression, floor gets an SF1 footnote); if it matched at
+  `27d4ae001`, bisect the 72-commit range per S5/the P0-E7 per-commit table
+  to the introducing commit and file it as its own `impl` task. Not
+  selected this loop (S1: the banner's ordering, not urgency, decides
+  when). — Nightly regression triage (STANDING — ACTIVE since 2026-08-08)
 
 Standing milestone: never complete it, never archive it, keep it directly
 under the Current Priority banner. Source of work: ci/logs/action-items.md
