@@ -412,6 +412,71 @@ func addGroupingPaths(grouped *RelOptInfo, seed *Path, aggNode *Aggregate, child
 		return
 	}
 
+	// SORTED. Grouping sets stay out (executor cannot run them sorted).
+	// Validity first: a group-keys Sort serves only aggregates that need
+	// no ordered input. With special aggregates the ONLY valid sorted
+	// input is the presorted-keys variant; with usable keys absent (or the
+	// GUC off) there is no sorted candidate at all — hashed alone. This is
+	// principled conservatism, and deliberately narrower than the retired
+	// bridge (which wrapped a group-keys Sort even for unusable ordered
+	// aggs under GUC-off): a group-keys order is not a valid ordered-agg
+	// input, and declining the candidate can only forfeit a price contest,
+	// never correctness. The executor sorts array_agg/string_agg ORDER BY
+	// internally, so the common built-ins stay correct under hashed either
+	// way.
+	//
+	// Emitted BEFORE hashed, mirroring PG's add_paths_to_grouping_rel
+	// (planner.c: the can_sort block at :7128 runs before can_hash at
+	// :7286). This order matters even though neither block's cost formula
+	// changes: addPath's fuzzy-tie-break (STD_FUZZ_FACTOR, path.go) keeps
+	// whichever candidate was inserted FIRST when two paths have identical
+	// pathkeys and a cost margin under ~1%, which is exactly TPC-H Q4/Q12's
+	// situation (M0141-S2b-10). The former hashed-then-sorted order elected
+	// Hashed+explicit-Sort where real PG elects a plain Sort-fed
+	// GroupAggregate; sorted-first restores the PG election.
+	if aggNode.GroupingSets == nil {
+		keys := presortedKeys
+		haveSortedCandidate := true
+		if !presorted {
+			if groupingHasSpecialAgg(aggNode) {
+				haveSortedCandidate = false
+			} else {
+				keys = groupKeysSortKeys(aggNode)
+			}
+		}
+		if haveSortedCandidate {
+			if idxChild, idxSpec, ok := indexOrderedAggInput(aggNode, child, cat); ok {
+				// The index-driven variant: no Sort, narrowed spec. The spec
+				// is the builder's clone (remapped to narrowed positions);
+				// the input price is the index child's own.
+				idxSeed := newPrebuiltPath(grouped, idxChild)
+				idxSeed.Rows = inputRows
+				if pc := legacyDisplayCostOf(idxChild); pc.PlanRows > 0 || pc.TotalCost > 0 {
+					idxSeed.Cost = Cost{Startup: pc.StartupCost, Total: pc.TotalCost}
+				}
+				idxNcols, idxAvgVar := aggInputWidth(idxChild, idxSpec)
+				addPath(grouped, &Path{
+					Kind: PathAgg, AggStrategy: AggStrategySorted, Agg: idxSpec,
+					Rel: grouped, Rows: numGroups,
+					Cost: costAgg(cp, AggStrategySorted, inputRows, idxSeed.Cost.Startup, idxSeed.Cost.Total,
+						len(idxSpec.GroupExprs), numGroups, len(idxSpec.Aggs), idxNcols, idxAvgVar),
+					Pathkeys: pathkeysForSortKeys(keys), Children: []*Path{idxSeed},
+				}, groupAggSortedIdxProducer)
+			} else {
+				sortedInput := sortPathForBounded(seed, pathkeysForSortKeys(keys), cp, -1)
+				// R47 slice 1: per-candidate spec clone (see PLAIN arm).
+				sortSpec := *aggNode
+				addPath(grouped, &Path{
+					Kind: PathAgg, AggStrategy: AggStrategySorted, Agg: &sortSpec,
+					Rel: grouped, Rows: numGroups,
+					Cost: costAgg(cp, AggStrategySorted, inputRows, sortedInput.Cost.Startup, sortedInput.Cost.Total,
+						len(sortSpec.GroupExprs), numGroups, len(sortSpec.Aggs), inNcols, inAvgVar),
+					Pathkeys: sortedInput.Pathkeys, Children: []*Path{sortedInput},
+				}, groupAggSortedProducer)
+			}
+		}
+	}
+
 	// HASHED. Offered whenever hashable; enable_hashagg = off marks it
 	// DisabledNodes (B-17a preference, never skip) instead of deleting it.
 	// Grouping sets always hash (today's fall-through; executor has one
@@ -427,57 +492,6 @@ func addGroupingPaths(grouped *RelOptInfo, seed *Path, aggNode *Aggregate, child
 				len(hashSpec.GroupExprs), numGroups, len(hashSpec.Aggs), inNcols, inAvgVar),
 			Children: []*Path{seed},
 		}, groupAggHashedProducer)
-	}
-
-	// SORTED. Grouping sets stay out (executor cannot run them sorted).
-	// Validity first: a group-keys Sort serves only aggregates that need
-	// no ordered input. With special aggregates the ONLY valid sorted
-	// input is the presorted-keys variant; with usable keys absent (or the
-	// GUC off) there is no sorted candidate at all — hashed alone. This is
-	// principled conservatism, and deliberately narrower than the retired
-	// bridge (which wrapped a group-keys Sort even for unusable ordered
-	// aggs under GUC-off): a group-keys order is not a valid ordered-agg
-	// input, and declining the candidate can only forfeit a price contest,
-	// never correctness. The executor sorts array_agg/string_agg ORDER BY
-	// internally, so the common built-ins stay correct under hashed either
-	// way.
-	if aggNode.GroupingSets == nil {
-		keys := presortedKeys
-		if !presorted {
-			if groupingHasSpecialAgg(aggNode) {
-				return
-			}
-			keys = groupKeysSortKeys(aggNode)
-		}
-		if idxChild, idxSpec, ok := indexOrderedAggInput(aggNode, child, cat); ok {
-			// The index-driven variant: no Sort, narrowed spec. The spec
-			// is the builder's clone (remapped to narrowed positions);
-			// the input price is the index child's own.
-			idxSeed := newPrebuiltPath(grouped, idxChild)
-			idxSeed.Rows = inputRows
-			if pc := legacyDisplayCostOf(idxChild); pc.PlanRows > 0 || pc.TotalCost > 0 {
-				idxSeed.Cost = Cost{Startup: pc.StartupCost, Total: pc.TotalCost}
-			}
-			idxNcols, idxAvgVar := aggInputWidth(idxChild, idxSpec)
-			addPath(grouped, &Path{
-				Kind: PathAgg, AggStrategy: AggStrategySorted, Agg: idxSpec,
-				Rel: grouped, Rows: numGroups,
-				Cost: costAgg(cp, AggStrategySorted, inputRows, idxSeed.Cost.Startup, idxSeed.Cost.Total,
-					len(idxSpec.GroupExprs), numGroups, len(idxSpec.Aggs), idxNcols, idxAvgVar),
-				Pathkeys: pathkeysForSortKeys(keys), Children: []*Path{idxSeed},
-			}, groupAggSortedIdxProducer)
-			return
-		}
-		sortedInput := sortPathForBounded(seed, pathkeysForSortKeys(keys), cp, -1)
-		// R47 slice 1: per-candidate spec clone (see PLAIN arm).
-		sortSpec := *aggNode
-		addPath(grouped, &Path{
-			Kind: PathAgg, AggStrategy: AggStrategySorted, Agg: &sortSpec,
-			Rel: grouped, Rows: numGroups,
-			Cost: costAgg(cp, AggStrategySorted, inputRows, sortedInput.Cost.Startup, sortedInput.Cost.Total,
-				len(sortSpec.GroupExprs), numGroups, len(sortSpec.Aggs), inNcols, inAvgVar),
-			Pathkeys: sortedInput.Pathkeys, Children: []*Path{sortedInput},
-		}, groupAggSortedProducer)
 	}
 }
 
