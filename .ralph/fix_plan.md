@@ -569,6 +569,47 @@ heuristic stays live.)
   Syntax_Catalog_PgStatActivity AI-…-009 — already have open tasks above;
   AI-ids appended per the "do not add another" rule. Evidence for all:
   `ci/logs/20260905-011015/`.)
+- [x] **infra/nightly-live-tree-build-race (AI-20260918-010720-001,
+  AI-20260918-010720-002, AI-20260918-010720-003, AI-20260918-010720-004,
+  AI-20260918-010720-005)** — all five items of run 20260918-010720 are ONE
+  transient artifact: the nightly's live-working-tree build caught
+  `internal/executor/operators_ddl.go` mid-commit (P0-E5's catalog-loss fix
+  window), so `stampExclusionConstraintRows`/`writeExclusionConstraintRow`
+  were briefly undefined and testport/units/race stages all failed to
+  COMPILE (not regressions). Verified at HEAD: both symbols exist
+  (`operators_ddl.go:18534`) and `go build ./...` is clean — nothing to fix
+  in the code. **Fixed 2026-09-19 — completed the NIGHTLY\_SRC\_ROOT
+  migration**: `run-nightly.sh` had already moved `go build` stages into a
+  detached worktree at the recorded HEAD, but the three `go test` stages
+  still compiled the live tree — the exact leak that produced these
+  items. `stage-units.sh`/`stage-race.sh`/`stage-testport.sh` now `cd`
+  `"${NIGHTLY_SRC_ROOT:-${REPO_ROOT}}"`, and `run-nightly.sh` links the
+  read-only `postgres/` submodule into the worktree (empty gitlink dir
+  otherwise; `go list ./...` never follows the symlink, so no stray
+  packages) so testport's `local_install` tools + regress/isolation
+  fixtures resolve. `stage-testport.sh` also self-heals the link for
+  standalone runs. Closes deferral-ledger row `M-NIGHTLY
+  (AI-20260806-011323-002..-015)` "run every stage from a git worktree
+  pinned to meta.json's sha" and the 0914 `bak/`-scratch items below —
+  untracked files cannot enter a detached worktree.
+  - Learnings: the worktree mechanism was a PARTIAL migration — builds
+    moved but go-test stages were left behind, so the phantom class
+    survived on the test lanes. When splitting a fix across compile
+    kinds, grep every `cd "${REPO_ROOT}" && ... go` in the harness, not
+    just `go build`.
+  - Edits to live batch scripts while a nightly is RUNNING are safe via
+    temp-file + `os.replace` (atomic rename): the in-flight bash keeps
+    its open fd on the old inode and finishes on old semantics.
+  - Verified: `bash -n` all five files; fresh worktree + link logic →
+    `postgres/local_install/bin/psql` + `regress/expected` resolve,
+    `go build ./...` clean, `go list` enumerates 0 scratch pkgs;
+    `stage-units.sh` run against the worktree PASS (rc=0);
+    `TestPort_PgControldata001` PASS inside the worktree (tool lookup
+    via `repoRoot()` → symlink); `make -C worktree -n race-gate` clean.
+  - `source_fingerprint` stays, re-scoped to drift EVIDENCE: a stage fp
+    differing from `meta.json`'s `source_fp` now means "the live tree
+    mutated mid-run" for the report, not "the stage ran a different
+    tree" — comments updated in `common.sh` + `run_stage`.
 - [x] **numerology — binary/octal/hex integer literals unsupported** (filed
   2026-09-18, split out of testport/TestPort_RegressSuite's numerology
   subtest above). **Fixed 2026-09-18 — the filing's premise was wrong, and a
@@ -690,7 +731,7 @@ heuristic stays live.)
 - [ ] **testport/TestPort_IsolationEvalPlanQual (AI-20260914-235643-005, AI-20260916-035206-005, AI-20260917-004357-007)** — new
   tonight, FAILed (repro: `go test -v -run '^TestPort_IsolationEvalPlanQual$'
   ./internal/testport/`).
-- [ ] **units/build-broke-mid-stage (AI-20260914-235643-013)** and
+- [x] **units/build-broke-mid-stage (AI-20260914-235643-013)** and
   **race/build-broke-mid-stage (AI-20260914-235643-014)** — `[infra]`, not
   regressions per the nightly bot's own classification: 1 package failed to
   *compile* in each stage, first error
@@ -702,6 +743,10 @@ heuristic stays live.)
   build ./...` is clean as of this filing (2026-09-15); `bak/`'s `_test.go`
   only breaks a `go vet`/`go test` walk, not `go build` itself, which the
   nightly bot's own repro line does not distinguish.
+  **Resolved 2026-09-19 by infra/nightly-live-tree-build-race**: units/race
+  now `go test` inside `NIGHTLY_SRC_ROOT`, a detached worktree at the
+  recorded sha that carries only tracked content — untracked scratch like
+  `bak/` can never enter the compile again.
   (Remaining 8 items of this run — race/internal/executor AI-…-002,
   testport/TestE2E_PGColdStartOnGoopgDataDir AI-…-004,
   testport/TestPort_IsolationIntraGrantInplace AI-…-006,

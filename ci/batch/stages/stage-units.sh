@@ -26,7 +26,10 @@ mkdir -p "${RUN_DIR}/units"
 progress "S1.L" "units start (unit=goopg-nightly-units high=6G max=8G p=${NIGHTLY_GO_P:-4} timeout=${UNITS_TIMEOUT})"
 
 rc=0
-( cd "${REPO_ROOT}" && \
+# Compile+run inside the pinned worktree when the orchestrator provides one —
+# a live-tree `go list`/`go test` would compile whatever a concurrent loop is
+# mid-edit on (the build-broke-mid-stage phantom class).
+( cd "${NIGHTLY_SRC_ROOT:-${REPO_ROOT}}" && \
   PKGS=$(go list ./... | grep -vE "${EXCLUDE}") && \
   GOOPG_CG_UNIT=goopg-nightly-units GOOPG_MEM_HIGH=6G GOOPG_MEM_MAX=8G \
   GOOPG_MEM_SWAP_MAX=0 GOMEMLIMIT=5GiB \

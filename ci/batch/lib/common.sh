@@ -18,16 +18,17 @@ stage_status() {
     printf '%s\n' "$2" > "${RUN_DIR}/stages/$1.status"
 }
 
-# source_fingerprint — a hash of the Go build inputs as they are RIGHT NOW.
+# source_fingerprint — a hash of the LIVE tree's Go build inputs as they are
+# RIGHT NOW.
 #
-# The batch builds from the live working tree, and a Ralph loop edits/commits
-# that tree while the batch runs. Preflight's `make build` therefore proves
-# nothing about the tree a later stage compiles: on 2026-08-06 preflight passed
-# at 01:13 and the testport stage failed to build at ~01:2x because the loop had
-# committed `bf52391e` in between, manufacturing 14 unattributable "regressions"
-# (AI-20260806-011323-002..-015). meta.json recorded `dirty=50` and nothing acted
-# on it. Stamping every stage lets the summarizer say WHICH stages ran on WHICH
-# tree instead of inferring it from a compile error in a log body.
+# All Go compilation now runs inside NIGHTLY_SRC_ROOT, the detached worktree
+# at the recorded HEAD, so a mutating live tree can no longer change what a
+# stage builds or tests. The fingerprint survives as DRIFT EVIDENCE for the
+# report: a stage fp that differs from meta.json's `source_fp` means a
+# concurrent loop edited or committed the live tree mid-run — useful context
+# when a stage's log must be re-derived by hand. (History: before the
+# worktree pin, stages compiled the live tree and mid-run edits manufactured
+# phantom build failures — AI-20260806-011323-002..-015 et seq.)
 #
 # Covers: HEAD (a mid-run commit), the porcelain status (a file appearing or
 # disappearing), and the tracked-file diff content (an in-place edit that leaves
