@@ -2724,7 +2724,7 @@ setting that yields a serial plan.
     (2026-09-18, `M0140-0006b`): the mixed-arm gap plus the
     reachability gap. Next: **M0140-0006c** (below) or **M0140-0006b-2**
     (below), either order — see design doc's ordering note.
-- [ ] **M0140-0006b-2 — wire parallel Gather consideration into the Phase-4
+- [x] **M0140-0006b-2 — wire parallel Gather consideration into the Phase-4
   upper-rel pipeline.**
   Kind: impl
   Parent: M0140-0006b. Filed 2026-09-18 by M0140-0006b's
@@ -2743,6 +2743,28 @@ setting that yields a serial plan.
   `match=8`/TPC-DS `match=2` byte-identical before/after (nothing should
   move — this is reachability plumbing, same posture as 0006a), plus
   `scripts/tpcds-sf025-regression.sh sweep` PLAN-SHAPE changed=0.
+  - **DONE 2026-09-18.** Kind: impl. Parent: M0140-0006b. Movement: none
+    (reachability plumbing; sweep PLAN-SHAPE 99/99 identical, TPC-H
+    identical by construction — 0/22 queries contain a set operation).
+    Landed `generateUpperRelGatherPaths(rel, cp)` (`gatherpaths.go`): a
+    two-argument helper delegating to the one `generateUsefulGatherPaths`
+    body via a minimal `&searchCtx{parallelModeOK: parallelModeOK(cp),
+    cp}` (no twin; `top` mode refuses upper rels fail-closed), called once
+    per rel before `setCheapest` at `createSetOpPaths` (live),
+    `createOrderedPaths`, `electOrderedGrouping`, `createWindowPaths`
+    (provably inert — no partials there). `electOrderedDistinct`/
+    `addGroupingPaths` deliberately unwired (doc records why + the
+    election-shape resume point). 6 new unit tests
+    (`gatherpaths_upperrel_test.go`); `TestCreateSetOpPathsPartialPathDoesNotMoveThePlan`
+    re-pinned (Gather now generated but dominated, winner unchanged).
+    Gates: `go build`/`go vet` clean; optimizer+executor suites PASS;
+    precommit units PASS (44 ok, no FAIL); `tpch-spotcheck` PASS
+    (Q12=2/Q13=34); sf025 sweep PASS=96 MISMATCH=0 PLAN-SHAPE 99/99
+    identical; parity floor transitive (commit carries `PARITY: N/A` +
+    reason); `ea-ratchet` N/A (no estimate path touched). Design doc:
+    `docs/design/0100-0149/m0140-0006b-2-upper-rel-gather-wiring.md`
+    (indexed). No ledger row (no PG behavior deferred). Next: **M0140-0006c-2**
+    is now the last open task under banner item 5.
 - [x] **M0140-0006c — executor claim-set for `setOp` under `Gather`.** A
   Kind: impl
   Parent: M0140-0006
