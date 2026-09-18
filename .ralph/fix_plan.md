@@ -2930,8 +2930,8 @@ spill route is net-negative.
     correct quantity for whole-row dedup, not a currency defect). No code
     changed (recon only, C1) — no unit-gate run needed; pre-commit hook's
     pgbench smoke ran and PASSED.
-- [ ] **M0141-S2a-fix1-sweep-a — narrow the ORDERED upper rel's Sort pricing.**
-  Parent: M0141-S2a-fix1-sweep. `sizeUpperRelFromNode`
+- [x] **M0141-S2a-fix1-sweep-a — narrow the ORDERED upper rel's Sort pricing.**
+  Kind: impl. Parent: M0141-S2a-fix1-sweep. `sizeUpperRelFromNode`
   (`internal/optimizer/upperrel.go:177-187`) sizes `NCols`/`AvgVarBytes` from
   the finished input Node's FULL `child.Output()`; `createOrderedPaths`
   (`internal/optimizer/upperordered.go:64-133`) → `addOrderedPaths` →
@@ -2956,6 +2956,41 @@ spill route is net-negative.
   named its residual `aggregation-strategy`/`sort-strategy` mismatch as a
   fix1-successor candidate) plus a TPC-DS SF0.25 serial-shaped re-capture,
   `shape-delta.sh` diff, category movement (S5) — no category may rise.
+  - **DONE 2026-09-18.** Movement: none. Landed
+    `internal/optimizer/ordered_input_narrow.go` (`finalSelectOutputNames`,
+    `deriveOrderedSortInputKeep`, `narrowOrderedRelWidths`), a new trailing
+    `narrowKeep []int` parameter on `createOrderedPaths` AND its sibling
+    `electOrderedGrouping` (found only after the first measurement pass:
+    Q18 is a GROUP BY query and never reaches `createOrderedPaths` at all —
+    `electOrderedGrouping` has the identical `sizeUpperRelFromNode` call
+    over the identical node, fixed in the same loop per
+    `pattern_sibling_paths_must_agree`), and updated every call site (2
+    production call sites now compute a real keep, 2 pass `nil` because
+    their input is already the minimal final row, ~16 test call sites pass
+    `nil`). **Measured: zero movement in either corpus** — TPC-H
+    `shape-delta.sh`: `queries=22 text-changed=0 shape-changed=0` (zero
+    change of ANY kind, including cost digits, not just plan shape);
+    TPC-DS SF0.25: `PLAN-SHAPE: queries=99 same=99 changed=0`,
+    `MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0`. Root-caused rather than
+    left unexplained: a GROUP BY aggregate's own published row is already
+    the minimal SELECT-list width by construction (goopg's `Aggregate`
+    emits exactly GROUP BY + aggregate-result columns, same as PG's `Agg`),
+    so TPC-H Q18 (the recon's own named witness) and TPC-DS's 99-query
+    corpus both have no hidden extra width for this keep-set to trim in
+    practice — the recon's Q18 speculation was untested at recon time (C1
+    forbade a production diff) and the implementation now shows it does not
+    hold. Values byte-identical: `tpch-acceptance-arm.sh` 24/24 labels
+    MATCH before vs after. Kept as a correct, PG-faithful cost-input fix
+    with a confirmed no-regression measurement (same standard as
+    R121/`relNarrowedWidths`) — **no `Parent: M0141-S2a-fix1-sweep-a`
+    follow-up filed**, nothing worsened, nothing to file. Design doc:
+    `docs/design/0100-0149/m0141-s2a-fix1-sweep-a-ordered-sort-width-currency.md`.
+    Gates: `go build ./...` clean; `go test ./internal/optimizer/...` PASS
+    (full package); `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=34
+    canonical); `scripts/tpch-acceptance-arm.sh` before/after digest diff
+    VERDICT PASS; `scripts/tpcds-sf025-regression.sh sweep` PASS (as
+    above); `make ea-ratchet`: N/A (costing-only, no row-estimate/
+    selectivity path touched, same disposition as fix2r).
 - [ ] **M0141-S2a-fix1-sweep-b — narrow WINDOW's internal sort costing.**
   Parent: M0141-S2a-fix1-sweep. goopg's `windowOp` sorts internally
   (`operators_window.go` `Open`) rather than taking pre-sorted input the way
