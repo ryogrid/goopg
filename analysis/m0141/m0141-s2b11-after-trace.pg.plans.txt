@@ -1,0 +1,24 @@
+=== Q4
+GroupAggregate  (cost=209824.55..209929.38 rows=5 width=24)
+  Group Key: orders.o_orderpriority
+  ->  Sort  (cost=209824.55..209859.47 rows=13971 width=16)
+        Sort Key: orders.o_orderpriority
+        ->  Nested Loop Semi Join  (cost=0.43..208862.63 rows=13971 width=16)
+              ->  Seq Scan on orders  (cost=0.00..50314.00 rows=56697 width=22)
+                    Filter: ((o_orderdate >= '1993-07-01'::date) AND (o_orderdate < '1993-10-01 00:00:00'::timestamp without time zone))
+              ->  Index Scan using idx_lineitem_orderkey_fkidx on lineitem  (cost=0.43..10.80 rows=5 width=6)
+                    Index Cond: (l_orderkey = orders.o_orderkey)
+                    Filter: (l_commitdate < l_receiptdate)
+
+=== Q12
+GroupAggregate  (cost=328101.77..328682.44 rows=7 width=27)
+  Group Key: lineitem.l_shipmode
+  ->  Sort  (cost=328101.77..328174.35 rows=29030 width=27)
+        Sort Key: lineitem.l_shipmode
+        ->  Hash Join  (cost=61564.00..325949.89 rows=29030 width=27)
+              Hash Cond: (lineitem.l_orderkey = orders.o_orderkey)
+              ->  Seq Scan on lineitem  (cost=0.00..264309.68 rows=29030 width=17)
+                    Filter: ((l_shipmode = ANY ('{MAIL,SHIP}'::bpchar[])) AND (l_commitdate < l_receiptdate) AND (l_shipdate < l_commitdate) AND (l_receiptdate >= '1994-01-01'::date) AND (l_receiptdate < '1995-01-01 00:00:00'::timestamp without time zone))
+              ->  Hash  (cost=42814.00..42814.00 rows=1500000 width=22)
+                    ->  Seq Scan on orders  (cost=0.00..42814.00 rows=1500000 width=22)
+

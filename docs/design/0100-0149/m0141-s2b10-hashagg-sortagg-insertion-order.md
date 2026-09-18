@@ -208,6 +208,19 @@ triggers the order-dependence for Q4/Q12 does not arise there).
    effect, not a regression, per this workstream's standing rule that
    matching PG is never a regression however the row-count/timing gates
    move.
+   **Actual result (M0141-S2b-11, landed `1e48aca50`)**: zero queries
+   flipped anywhere — TPC-H plans byte-identical before/after under a
+   pinned stats epoch (shape-delta 0/22), TPC-DS SF0.25 PLAN-SHAPE
+   99/99 identical, acceptance-arm digest 24/24 MATCH, spotcheck
+   Q12=2/Q13=34. Not even Q4/Q12 moved: `comparePathCostsFuzzily`'s
+   M0129-S1 deviation (`path.go:943-956`) breaks fuzz-band ties by exact
+   cost instead of returning `costsEqual`, so the strictly-cheaper hashed
+   candidate (Q4: 0.17%, Q12: 0.64% inside the band) evicts the
+   first-inserted sorted one regardless of order — masking the keep-first
+   semantics this reorder restores on paper. An unpinned-seed arm pair
+   additionally showed a phantom Q3 flip that was pure ANALYZE-sample
+   noise (stats-epoch discipline is required for 1%-margin A/Bs).
+   Follow-up on the real remaining divergence filed as **M0141-S2b-12**.
 
 ## Gates run (this loop — recon only, no production file touched)
 

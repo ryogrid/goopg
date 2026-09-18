@@ -3745,8 +3745,11 @@ spill route is net-negative.
     `Parent: M0141-S2b-10`). No ledger row (recon->impl handoff via the
     task's own `Kind`/`Parent` fields, same precedent as
     `M0141-S2b-6-resume`).
-  - [ ] **M0141-S2b-11** — reorder `addGroupingPaths` to match PG's
+  - [x] **M0141-S2b-11** — reorder `addGroupingPaths` to match PG's
     Kind: impl
+    Movement: none — TPC-H match 7→7 (same-PG control, byte-identical
+    plans before/after under pinned stats epoch), TPC-DS 99/99 identical,
+    no CATEGORIES-EXCL-MATCH category moved.
     Parent: M0141-S2b-10. `internal/optimizer/groupingpaths.go`'s
     `addGroupingPaths` currently emits the HASHED `PathAgg` candidate
     (the `if groupingHashable(...) { addPath(grouped, ...AggStrategyHashed...) }`
@@ -3777,6 +3780,84 @@ spill route is net-negative.
     sweep result once run — do not just report PASS/FAIL, name which
     queries' plan shapes moved and whether each one is now closer to or
     further from PG.
+    **DONE 2026-09-18 (`1e48aca50`).** Reorder landed exactly as scoped —
+    SORTED block (now `groupingpaths.go:437-478`) before HASHED
+    (`:484-495`), the sorted block's two early `return`s replaced by a
+    `haveSortedCandidate` flag so the candidate SET is unchanged
+    (insertion order only). **Measured effect: zero.** Under a pinned
+    stats epoch (`GOOPG_ANALYZE_SEED=20260905`, both arms
+    `253df6b1d97f9f5b`) TPC-H plans are byte-identical before/after
+    (shape-delta 0/22, match 7→7); TPC-DS SF0.25 PLAN-SHAPE 99/99;
+    acceptance-arm digest 24/24 MATCH; spotcheck Q12=2/Q13=34. **The
+    expected Q4/Q12 flip did NOT fire**: `DP_TRACE=1` shows Sorted's
+    `upper.ordered.input` accepted first (507569.94) then Hashed's
+    `upper.ordered.sort` accepted anyway (506697.64, 0.17% inside the
+    `STD_FUZZ_FACTOR` band) and winning — `comparePathCostsFuzzily`'s
+    **M0129-S1 deviation** (`path.go:943-956`) breaks fuzz-band ties by
+    EXACT cost instead of returning `costsEqual`, so a strictly-cheaper
+    second candidate always evicts the first regardless of insertion
+    order. Under true PG `COSTS_EQUAL` semantics the second would be
+    rejected (equal pathkeys, keep-first) → GroupAggregate, matching PG's
+    real Q4/Q12 plans. The deviation also masks the grouped-rel level:
+    PG's pathkeys dim would let the key-carrying Sorted candidate
+    dominate keyless Hashed on a cost tie; exact-cost direction makes
+    them incomparable, keeping Hashed alive for the ordered tournament —
+    the exact effect M0129-S1 was designed for (CTE self-joins). An
+    unpinned-seed arm pair additionally produced a phantom Q3 flip —
+    pure ANALYZE-sample noise; stats-epoch pinning is required for
+    1%-margin A/Bs. Design doc:
+    `docs/design/0100-0149/m0141-s2b-11-addgroupingpaths-sorted-before-hashed.md`;
+    `docs/design/README.md` new index row; artefacts
+    `analysis/m0141/m0141-s2b11-*`. Follow-up filed as **M0141-S2b-12**
+    below (the real remaining divergence). Gates: `go build ./...` clean;
+    `go test ./internal/optimizer/...` PASS; `scripts/tpch-spotcheck.sh`
+    PASS (gate-stamp PASS vs staged code_tree);
+    `scripts/tpcds-sf025-regression.sh sweep` PASS=96 MISMATCH=0
+    CKMISMATCH=0 ERROR=0 TIMEOUT=0, PLAN-SHAPE 99/99;
+    `scripts/tpch-acceptance-arm.sh` before/after digest VERDICT PASS
+    24/24 MATCH; `pg-plan-parity-diff.py` match=7 before AND after
+    (floor held, noise band ±3); `python3
+    scripts/ralph_protected_regions.py check-designdocs` exit 0;
+    `python3 scripts/ralph-lineage-guard.py` exit 0; pre-commit pgbench
+    smoke PASS (hook). Ledger row appended (task-id `M0141-S2b-11`).
+  - [ ] **M0141-S2b-12** — recon: the M0129-S1 exact-cost fuzz tiebreak
+    Kind: recon
+    masks PG's `COSTS_EQUAL` semantics — Q4/Q12 (and every other
+    fuzzily-tied grouping election) can never flip on insertion order.
+    Parent: M0141-S2b-11. Filed 2026-09-18 by S2b-11's measured result:
+    `path.go:943-956` (inside `comparePathCostsFuzzily`) returns
+    `costsBetter1`/`costsBetter2` on the EXACT cost when total and
+    startup are within `STD_FUZZ_FACTOR`, where PG's
+    `compare_path_costs_fuzzily` (`pathnode.c`) returns `COSTS_EQUAL`.
+    The deviation is deliberate (M0129-S1: it keeps a pathkey-less hash
+    path alive against a fuzzily-equal-cost pathkeyed rival — CTE
+    self-join nested-loop-only pathology) but it has two masking effects
+    on the grouping election: (a) at the ordered rel, a strictly-cheaper
+    second candidate always evicts the first-inserted one — PG's
+    keep-first-on-equal-pathkeys tie-break never engages (Q4/Q12 stay
+    Hashed despite S2b-11's PG-order insertion); (b) at the grouped rel,
+    the exact-cost direction makes hashed-vs-sorted incomparable instead
+    of letting the pathkeys dim let Sorted dominate, so keyless Hashed
+    survives where PG discards it. Recon scope: enumerate every call
+    site/election the deviation can affect (grouped rel, ordered rel,
+    join pathlists — anywhere `comparePaths` feeds `addToPathlist`);
+    read the M0129-S1 design doc + its motivating regress/TPC cases;
+    determine whether a narrowing exists that preserves the
+    incomparability-preserving case (non-cost dims differ) while
+    restoring `costsEqual` when all other dims are equal (PG's
+    keep-first) — e.g. splitting the deviation into a
+    `costsWeaklyBetter` that `comparePaths` treats as `dimEqual` only
+    when it would otherwise flip an all-equal-dims result. Also evaluate
+    the sibling `partialaggupper.go` hashed-before-sorted order
+    (`:400`/`:412`/`:474`, same inversion class) once any
+    insertion-order effect can actually fire. Expected movement if
+    unblocked: TPC-H Q4/Q12 flip Hashed+Sort → Sort-fed GroupAggregate
+    matching PG's `EXPLAIN` (both currently `aggregation-strategy` +
+    `sort-strategy` SHAPE-DIFFs; each would lose both tags toward
+    MATCH). Measure with the same pinned-epoch before/after
+    `tpch-estimate-audit-arm.sh` A/B S2b-11 used
+    (`GOOPG_ANALYZE_SEED=20260905`, `PGSHAPED=1`, `--ref-port 65432`),
+    plus the M0129-S1 motivating corpus to prove no resurrection.
   - [x] **M0141-S2b-7** — filed 2026-09-17 by M0141-S7's corpus measurement
     (design doc's "Update 2026-09-17h"). `electOrderedGrouping`
     (`upperorderedgrouping.go:236`) calls `addOrderedPaths` directly, once
