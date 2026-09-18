@@ -72,18 +72,31 @@ func TestGatherPathCostIsCostGather(t *testing.T) {
 	sub := gpPartialSeqPath(rel, 500, 3)
 	sub.DisabledNodes = 2
 
-	g := makeGatherPath(rel, sub, cp)
+	// cost_gather's stamp for a scan/join rel is rel->rows, not
+	// compute_gather_rows — generate_gather_paths' override_rows=false arm
+	// (costsize.c:455-458, allpaths.c:557).
+	g := makeGatherPath(rel, sub, cp, false)
 	if g == nil {
 		t.Fatal("makeGatherPath declined a partial seq scan with workers")
 	}
-	rows := computeGatherRows(sub, cp)
+	rows := rel.Rows
 	wantStartup := sub.Cost.Startup + cp.parallelSetupCost
 	wantTotal := sub.Cost.Total + cp.parallelSetupCost + cp.parallelTupleCost*rows
 	if !gpClose(g.Cost.Startup, wantStartup) || !gpClose(g.Cost.Total, wantTotal) {
 		t.Errorf("gather cost = %+v, want startup %v total %v", g.Cost, wantStartup, wantTotal)
 	}
 	if g.Rows != rows {
-		t.Errorf("gather rows = %v, want compute_gather_rows = %v", g.Rows, rows)
+		t.Errorf("gather rows = %v, want rel->rows = %v", g.Rows, rows)
+	}
+	// The override arm keeps compute_gather_rows — the stamp
+	// generate_useful_gather_paths' override_rows=true call sites take
+	// (planner.c:5022, gather_grouping_paths planner.c:7721).
+	gOver := makeGatherPath(rel, sub, cp, true)
+	if gOver == nil {
+		t.Fatal("makeGatherPath declined the same subpath under override")
+	}
+	if want := computeGatherRows(sub, cp); gOver.Rows != want {
+		t.Errorf("override gather rows = %v, want compute_gather_rows = %v", gOver.Rows, want)
 	}
 	if g.DisabledNodes != sub.DisabledNodes {
 		t.Errorf("gather disabled_nodes = %d, want the subpath's %d (cost_gather has no flag)", g.DisabledNodes, sub.DisabledNodes)
@@ -147,7 +160,7 @@ func TestGatherMergePathCountsEnableGathermerge(t *testing.T) {
 	sub.Pathkeys = []PathKey{{Expr: cpCol(0), SortAsc: true}}
 	sub.DisabledNodes = 1
 
-	on := makeGatherMergePath(rel, sub, cp)
+	on := makeGatherMergePath(rel, sub, cp, false)
 	if on == nil {
 		t.Fatal("makeGatherMergePath declined an ordered partial seq scan")
 	}
@@ -156,7 +169,7 @@ func TestGatherMergePathCountsEnableGathermerge(t *testing.T) {
 	}
 	cpOff := cp
 	cpOff.enableGatherMerge = false
-	off := makeGatherMergePath(rel, sub, cpOff)
+	off := makeGatherMergePath(rel, sub, cpOff, false)
 	if off == nil {
 		t.Fatal("enable_gathermerge = off must still PRODUCE the path (PG counts, it does not skip)")
 	}
@@ -209,10 +222,9 @@ func TestGatherPathWinsExactlyAtTheSetupCostCrossover(t *testing.T) {
 	rel := newRelOptInfo(RelSet(1), 1000, 8)
 	rel.ConsiderParallel = true
 
-	// The Gather's own charge, in the currency of the constants.
-	probe := gpPartialSeqPath(rel, 0, workers)
-	rows := computeGatherRows(probe, cp)
-	gatherCharge := cp.parallelSetupCost + cp.parallelTupleCost*rows
+	// The Gather's own charge, in the currency of the constants — priced over
+	// the rows it now stamps for a scan/join rel (rel->rows).
+	gatherCharge := cp.parallelSetupCost + cp.parallelTupleCost*rel.Rows
 
 	// The serial total is stated as a MULTIPLE of the Gather's own charge, so
 	// both arms land well outside add_path's 1% fuzz band (stdFuzzFactor).
@@ -232,7 +244,7 @@ func TestGatherPathWinsExactlyAtTheSetupCostCrossover(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			serial := &Path{Kind: PathSeqScan, Rel: rel, Rows: 1000, Cost: Cost{Total: serialTotal}}
 			sub := gpPartialSeqPath(rel, serialTotal-tc.saving, workers)
-			g := makeGatherPath(rel, sub, cp)
+			g := makeGatherPath(rel, sub, cp, false)
 			if g == nil {
 				t.Fatal("makeGatherPath declined")
 			}
@@ -263,26 +275,26 @@ func TestGatherPathRefusesUnrunnableSubpaths(t *testing.T) {
 	rel.ConsiderParallel = true
 
 	zero := gpPartialSeqPath(rel, 500, 0)
-	if makeGatherPath(rel, zero, cp) != nil {
+	if makeGatherPath(rel, zero, cp, false) != nil {
 		t.Error("a 0-worker subpath is upstream's single_copy Gather, which goopg's executor does not model")
 	}
 	unsafe := gpPartialSeqPath(rel, 500, 2)
 	unsafe.ParallelSafe = false
-	if makeGatherPath(rel, unsafe, cp) != nil {
+	if makeGatherPath(rel, unsafe, cp, false) != nil {
 		t.Error("a path that is not parallel-safe is not a partial path")
 	}
 	// A prebuilt subtree is opaque: no attach walk models it, so every worker
 	// would read the whole relation.
 	prebuilt := gpPartialSeqPath(rel, 500, 2)
 	prebuilt.Kind = PathPrebuilt
-	if makeGatherPath(rel, prebuilt, cp) != nil {
+	if makeGatherPath(rel, prebuilt, cp, false) != nil {
 		t.Error("a prebuilt subtree has no driving scan the executor can partition")
 	}
 	// A parameterised index path is an NLI probe, not a partial scan.
 	param := gpPartialSeqPath(rel, 500, 2)
 	param.Kind = PathIndexScan
 	param.RequiredOuter = RelSet(2)
-	if makeGatherPath(rel, param, cp) != nil {
+	if makeGatherPath(rel, param, cp, false) != nil {
 		t.Error("a parameterised probe must not be gathered")
 	}
 }
@@ -300,7 +312,7 @@ func TestGatherMergeAdmitsIndexDrivenSubpathsSinceE10(t *testing.T) {
 
 	seq := gpPartialSeqPath(rel, 500, 2)
 	seq.Pathkeys = keys
-	if makeGatherMergePath(rel, seq, cp) == nil {
+	if makeGatherMergePath(rel, seq, cp, false) == nil {
 		t.Fatal("a seq-scan-driven ordered partial path is the shape gatherMergeOp CAN drive")
 	}
 	// The ordered INDEX twin from C-19c. This is the ONLY pathkey-carrying
@@ -320,18 +332,18 @@ func TestGatherMergeAdmitsIndexDrivenSubpathsSinceE10(t *testing.T) {
 	idx := gpPartialSeqPath(rel, 500, 2)
 	idx.Kind = PathIndexScan
 	idx.Pathkeys = keys
-	if makeGatherMergePath(rel, idx, cp) == nil {
+	if makeGatherMergePath(rel, idx, cp, false) == nil {
 		t.Error("gather merge over a partial index path must now be OFFERED: E-10 gave gatherMergeOp the index claim set, and this is the only pathkey-carrying partial path goopg produces")
 	}
 	// A plain Gather over that same index path was always fine: gatherOp
 	// attached all three claim sets even before E-10. Kept as the control that
 	// distinguishes "the merge arm changed" from "admission changed".
-	if makeGatherPath(rel, idx, cp) == nil {
+	if makeGatherPath(rel, idx, cp, false) == nil {
 		t.Error("a plain Gather over a partial index path is runnable and must be offered")
 	}
 	// No ordering ⇒ no merge (upstream asserts pathkeys).
 	unordered := gpPartialSeqPath(rel, 500, 2)
-	if makeGatherMergePath(rel, unordered, cp) != nil {
+	if makeGatherMergePath(rel, unordered, cp, false) != nil {
 		t.Error("a gather merge with nothing to merge by is a plain Gather")
 	}
 }
@@ -355,9 +367,12 @@ func makeGatherWorthwhile(rel *RelOptInfo, sub *Path, cp costParams) {
 	// convenience. Leaving the relation's full row count crossing the Gather
 	// makes parallel_tuple_cost * rows exceed the whole scan's cost on its own
 	// — no reduction in the subpath's price can rescue it — which is why the
-	// row count is shrunk to a selective scan's output first.
+	// row count is shrunk to a selective scan's output first. The stamp is
+	// now rel->rows (cost_gather's override_rows=false arm), so the REL's
+	// count is the one that prices the tuple charge.
+	rel.Rows = 10
 	sub.Rows = 10
-	charge := cp.parallelSetupCost + cp.parallelTupleCost*computeGatherRows(sub, cp)
+	charge := cp.parallelSetupCost + cp.parallelTupleCost*rel.Rows
 	sub.Cost.Total = rel.CheapestTotal.Cost.Total - 10*charge
 	if sub.Cost.Total < 0 {
 		sub.Cost.Total = 0
@@ -431,8 +446,8 @@ func TestGatherPathsModeGovernsAdmission(t *testing.T) {
 			makeGatherWorthwhile(rel, sub, s.cp)
 		}
 		defer setGatherPathsModeForTest(gatherPathsTop)()
-		s.generateUsefulGatherPaths(mid)
-		s.generateUsefulGatherPaths(top)
+		s.generateUsefulGatherPaths(mid, false)
+		s.generateUsefulGatherPaths(top, false)
 		if got := gpCountGathers(mid); got != 0 {
 			t.Errorf("mode top offered %d Gather paths at a NON-final joinrel", got)
 		}
@@ -457,7 +472,7 @@ func TestCreateGatherPlanCarriesWorkersAndStampsTheScan(t *testing.T) {
 		if len(rel.PartialPathlist) == 0 {
 			t.Fatal("fixture produced no partial path")
 		}
-		g := makeGatherPath(rel, rel.PartialPathlist[0], s.cp)
+		g := makeGatherPath(rel, rel.PartialPathlist[0], s.cp, false)
 		if g == nil {
 			t.Fatal("makeGatherPath declined the fixture's partial seq scan")
 		}

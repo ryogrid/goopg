@@ -415,7 +415,7 @@ func mergeClump(s *searchCtx, clumps []*clump, newClump *clump, numGene int, for
 				// GEQO arm's counterpart of the DP arm's per-level call
 				// (joinsearchlevel.go). Same ordering reason: a Gather path
 				// offered after set_cheapest could never be CheapestTotal.
-				s.generateUsefulGatherPaths(joinrel)
+				s.generateUsefulGatherPaths(joinrel, false)
 				setCheapest(joinrel)
 				// Absorb new clump into old.
 				oldClump.joinrel = joinrel

@@ -343,7 +343,7 @@ func (s *searchCtx) joinSearch(clauses *restrictInfoList, b joinRelBuilder) (*Re
 			// would be invisible to the level above. It is a no-op until a
 			// joinrel has partial paths (C-19f) and while GOOPG_GATHER_PATHS
 			// is off.
-			s.generateUsefulGatherPaths(rel)
+			s.generateUsefulGatherPaths(rel, false)
 			setCheapest(rel)
 			// R53 Step-0: one L-number per relset, after the whole level's
 			// pairs have been offered and the cheapest is final. Nil-safe —

@@ -153,7 +153,7 @@ func SetGatherPathsMode(label string) (restore func()) {
 // `standard_join_search` calls it (allpaths.c:3503-3517) and where
 // `merge_clump` calls it in the GEQO arm (geqo_eval.c). A rel with no partial
 // paths returns at the first line, as upstream does.
-func (s *searchCtx) generateUsefulGatherPaths(rel *RelOptInfo) {
+func (s *searchCtx) generateUsefulGatherPaths(rel *RelOptInfo, overrideRows bool) {
 	if s == nil || rel == nil || len(rel.PartialPathlist) == 0 {
 		// R54 Step-0: S4's "never generated" arm. Reachable with s and rel
 		// non-nil (empty partial list); the nil cases have no relset to name.
@@ -197,7 +197,7 @@ func (s *searchCtx) generateUsefulGatherPaths(rel *RelOptInfo) {
 	// partial_pathlist because of the way add_partial_path works."
 	// (allpaths.c:3116-3119; goopg's addToPartialPathlist keeps the same
 	// ascending-total-cost order.)
-	if g := makeGatherPath(rel, rel.PartialPathlist[0], s.cp); g != nil {
+	if g := makeGatherPath(rel, rel.PartialPathlist[0], s.cp, overrideRows); g != nil {
 		addPath(rel, g, "gather")
 	}
 
@@ -207,7 +207,7 @@ func (s *searchCtx) generateUsefulGatherPaths(rel *RelOptInfo) {
 		if len(sub.Pathkeys) == 0 {
 			continue
 		}
-		if gm := makeGatherMergePath(rel, sub, s.cp); gm != nil {
+		if gm := makeGatherMergePath(rel, sub, s.cp, overrideRows); gm != nil {
 			addPath(rel, gm, "gather.merge")
 		}
 	}
@@ -249,7 +249,10 @@ func generateUpperRelGatherPaths(rel *RelOptInfo, cp costParams) {
 		return
 	}
 	s := &searchCtx{parallelModeOK: parallelModeOK(cp), cp: cp}
-	s.generateUsefulGatherPaths(rel)
+	// Upper rels take upstream's override_rows=true arm (planner.c:5022,
+	// gather_grouping_paths planner.c:7721): the stamp stays
+	// computeGatherRows.
+	s.generateUsefulGatherPaths(rel, true)
 }
 
 // makeGatherPath is `create_gather_path` (pathnode.c:1974) + `cost_gather`.
@@ -266,11 +269,24 @@ func generateUpperRelGatherPaths(rel *RelOptInfo, cp costParams) {
 // subpath is `Children[0]`, in scope at every reader. Two fields that can
 // disagree about a worker count is the bug class `Path.Rows`' own comment
 // warns about.
-func makeGatherPath(rel *RelOptInfo, sub *Path, cp costParams) *Path {
+func makeGatherPath(rel *RelOptInfo, sub *Path, cp costParams, overrideRows bool) *Path {
 	if !gatherSubpathIsRunnable(sub) {
 		return nil
 	}
-	rows := computeGatherRows(sub, cp)
+	// cost_gather's row stamp (costsize.c:455-458): `rows` when the caller
+	// overrides, else `param_info->ppi_rows` or `rel->rows`. Upstream's
+	// override is always `compute_gather_rows(subpath)`; every scan/join-rel
+	// call site passes override_rows=false (allpaths.c:557, :3518,
+	// geqo_eval.c:277, planner.c:7880) so the Gather carries the relation's
+	// own total, and only the grouped/partially-grouped and partial-distinct
+	// upper rels pass true (planner.c:5022, gather_grouping_paths
+	// planner.c:7721). The param_info arm has no counterpart: parameterized
+	// subpaths are refused above and goopg's RelOptInfo is per-relid-set, so
+	// rel.Rows is the only estimate a gather rel carries.
+	rows := rel.Rows
+	if overrideRows {
+		rows = computeGatherRows(sub, cp)
+	}
 	g := &Path{
 		Kind:     PathGather,
 		Rel:      rel,
@@ -294,11 +310,17 @@ func makeGatherPath(rel *RelOptInfo, sub *Path, cp costParams) *Path {
 // `cost_gather_merge`. nil when the subpath is not one `gatherMergeOp` can
 // actually drive (see gatherMergeSubpathIsRunnable) or has no ordering to
 // preserve (upstream asserts `pathkeys`).
-func makeGatherMergePath(rel *RelOptInfo, sub *Path, cp costParams) *Path {
+func makeGatherMergePath(rel *RelOptInfo, sub *Path, cp costParams, overrideRows bool) *Path {
 	if !gatherMergeSubpathIsRunnable(sub) || len(sub.Pathkeys) == 0 {
 		return nil
 	}
-	rows := computeGatherRows(sub, cp)
+	// cost_gather_merge stamps rows exactly as cost_gather does
+	// (costsize.c:493-496): the caller's override (always
+	// `compute_gather_rows`) or the rel's own estimate — see makeGatherPath.
+	rows := rel.Rows
+	if overrideRows {
+		rows = computeGatherRows(sub, cp)
+	}
 	gm := &Path{
 		Kind: PathGatherMerge,
 		Rel:  rel,
@@ -618,7 +640,9 @@ func (s *searchCtx) addBaseRelGatherPaths() {
 		if rel == nil || len(rel.PartialPathlist) == 0 {
 			continue
 		}
-		s.generateUsefulGatherPaths(rel)
+		// Scan rels take upstream's override_rows=false arm
+		// (allpaths.c:557): the stamp is the rel's own estimate.
+		s.generateUsefulGatherPaths(rel, false)
 		// Unconditional rather than "only if a path was accepted": setCheapest
 		// is idempotent and a length comparison is not a verdict (addPath can
 		// accept a path that evicts two incumbents, leaving the list SHORTER —

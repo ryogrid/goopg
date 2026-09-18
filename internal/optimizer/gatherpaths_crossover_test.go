@@ -130,7 +130,7 @@ func crossoverArms(t *testing.T, sel float64) (serial, gather *Path) {
 	if serial == nil || len(rel.PartialPathlist) == 0 {
 		t.Fatalf("sel=%v: producers filed serial=%v partial=%d", sel, serial, len(rel.PartialPathlist))
 	}
-	gather = makeGatherPath(rel, rel.PartialPathlist[0], s.cp)
+	gather = makeGatherPath(rel, rel.PartialPathlist[0], s.cp, false)
 	if gather == nil {
 		t.Fatalf("sel=%v: makeGatherPath declined the production partial path", sel)
 	}

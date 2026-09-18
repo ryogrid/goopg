@@ -451,6 +451,13 @@ heuristic stays live.)
 - [ ] **race/internal/executor (AI-20260905-011015-001, AI-20260914-235643-002, AI-20260916-035206-002, AI-20260917-004357-003, AI-20260919-000526-001)** — race suite failed
   in `internal/executor` (also failed previous run; repro: `go test -race
   -timeout 45m ./internal/executor/`).
+  - **AI-20260919-000526-001 (2026-09-19 log check): same signature, do
+    not re-file.** Tonight's `ci/logs/20260919-000526/race/go-test.log`
+    shows the identical pair — `instrument.go:444` unlocked read racing
+    `operators_gather.go:124` gather-worker scope write, failing
+    `TestParallelLateralProbeIdentity` +
+    `TestSubquerySemanticsMatrix/M20/...` (5+ warnings, same defect).
+    Fourth reproduction of the ledgered instrumentscope race.
   - **Re-confirmed 2026-09-18, NOT stale.** Re-ran the exact repro at HEAD
     (`0317293db`): FAILs in 59.9s (well under the 45m timeout) with two
     `WARNING: DATA RACE` reports — `TestParallelLateralProbeIdentity` and
@@ -2943,8 +2950,10 @@ setting that yields a serial plan.
      Append`. Executor attach walks already cover merge/NL under any
      subtree — the only missing machinery is the three admission arms
      plus `prebuildBitmap` per-branch publication. Recommended slice
-     order: NL → merge → bitmap. Impl commits remain HOLD-blocked (no
-     gate stamps while `bench/tpch/runtime_goopg/data.HOLD` stands).
+     order: NL → merge → bitmap. Impl commits were HOLD-blocked until
+     2026-09-19, when the owner recovery of `:65433` released
+     `data.HOLD` (see M0141-S2b-15's UNBLOCKED note) — TPC-H gates
+     run normally again.
 - [ ] **M0140-0006c-3 — mixed partial/non-partial SetOp append (Q5).**
   Kind: impl.
   Parent: M0140-0006c. Filed 2026-09-19 by 0006c-2's recon.
@@ -2979,8 +2988,10 @@ setting that yields a serial plan.
     Shared-hash prebuild under a claimed-whole branch stays correct
     (leader builds, sole claimer probes); `prebuildBitmap` decision is
     the one open question (wasted leader prebuild vs gate exclusion).
-    Impl commits remain HOLD-blocked (`data.HOLD` re-imposed
-    2026-09-18T22:52 — unclean `:65433` shutdown, owner inspect).
+    Impl commits were HOLD-blocked by the `data.HOLD` re-imposed
+    2026-09-18T22:52 (unclean `:65433` shutdown) until the owner
+    recovery released it on 2026-09-19 (see M0141-S2b-15's UNBLOCKED
+    note) — TPC-H gates run normally again.
 
 ## M0141 — Upper-planner ordering contest (filed 2026-09-14)
 
@@ -4115,7 +4126,7 @@ spill route is net-negative.
     687463 — both engines essentially exact. Scorer caveat folded into
     S2b-15's scope note below.
     Movement: none
-  - [!] **M0141-S2b-15** — impl (small): gather row-stamp divergence found
+  - [ ] **M0141-S2b-15** — impl (small): gather row-stamp divergence found
     by S2b-13's C19f trace. `makeGatherPath`/`makeGatherMergePath`
     (`gatherpaths.go:273`) always stamp `Rows = computeGatherRows(sub)`
     (`sub.Rows × parallel divisor`). PG's `cost_gather`/`cost_gather_merge`
@@ -4163,6 +4174,19 @@ spill route is net-negative.
     Movement: yes — CATEGORIES-EXCL-MATCH TPC-DS agg 44→43, sort
     69→67, qual 23→22 at equal match floor (2=2 Q9/Q41); ea-ratchet
     findings net 76→73; TPC-H byte-identical to HEAD (nothing lost).
+    - **UNBLOCKED 2026-09-19 — `:65433` restored, `data.HOLD`
+      released.** The owner ran `scripts/tpch-ref-recover.sh
+      --i-am-owner`: the crashed data dir was preserved at
+      `tmp/evidence-65433-20260919-unclean/` (the original kept
+      aside at
+      `bench/tpch/runtime_goopg/data.pre-restore-20260919-031106`),
+      `data` was restored from `preloss-clone-20260915`, the pinned
+      `goopg-bin` was rebuilt at `4c36912b0`, `:65433` is listening
+      again and `tpch-spotcheck` returned PASS (Q12=2, Q13=34).
+      `tpch-spotcheck`/`tpch-acceptance-arm` are no longer
+      SKIP-BLOCKED, so the staged commit is unblocked. Next: re-run
+      both on the staged tree → triage the 10 ea NEW findings →
+      repin if churn → commit.
   - [ ] **M0141-S2b-16** — impl (small): partial-path `rows=` display
     convention. S2b-15 fixed the path-model Gather stamp
     (`rel->rows`), but the S2b-14-observed divergence — goopg EXPLAIN

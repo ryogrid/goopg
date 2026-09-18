@@ -491,7 +491,7 @@ func TestGatherOverPartialHashJoinStampsTheProbeScanOnly(t *testing.T) {
 		if pp == nil {
 			t.Fatal("no partial hash join path")
 		}
-		g := makeGatherPath(joinrel, pp, s.cp)
+		g := makeGatherPath(joinrel, pp, s.cp, false)
 		if g == nil {
 			t.Fatal("makeGatherPath declined a partial hash join; the shape walk and the producer disagree")
 		}
