@@ -1,8 +1,8 @@
 # P0-E7 — bulk re-measurement since 2026-09-16 05:44
 
 Status: in progress (2026-09-18) — values gates + TPC-H plan-parity +
-per-commit naming (72/72) done; TPC-DS full parity, tpch-acceptance-arm
-digest and the M0142-0008 A/B still open (see "Remaining scope").
+per-commit naming (72/72) + the tpch-acceptance-arm digest/M0142-0008 A/B
+done; TPC-DS full-SF1 parity still open (see "Not yet measured").
 
 ## Context
 
@@ -134,9 +134,17 @@ record, not as a regression signal. No prior same-methodology parallel
 below, added this loop) — all 72 production commits between `27d4ae001`
 and HEAD are named individually with their TPC-H values result at HEAD.
 
-Deferral ledger row filed for the three remaining items
-(`.ralph/deferral_ledger.md`, task-id P0-E7, dated 2026-09-18). Task stays
-`[ ]` (unchecked) in `fix_plan.md` — this loop's contribution is partial.
+**The `tpch-acceptance-arm.sh` OFF/ON digest and the M0142-0008 chain A/B
+are now also done** (see "`tpch-acceptance-arm.sh` OFF/ON digest +
+M0142-0008 chain A/B (2026-09-18c, this loop)" below) — 23/24 values match
+byte-for-byte, the sole divergence is a benign Q9 timeout-race unrelated to
+the flag. Only TPC-DS full-SF1 parity remains open.
+
+Deferral ledger row filed for the three items open as of 2026-09-18b, two
+of which (`tpch-acceptance-arm` digest, M0142-0008 A/B) are closed by a
+2026-09-18c ledger row (`.ralph/deferral_ledger.md`, task-id P0-E7). Task
+stays `[ ]` (unchecked) in `fix_plan.md` — TPC-DS full-SF1 parity is the
+one remaining sub-item.
 
 ## Gates run this loop
 
@@ -298,6 +306,97 @@ this loop's HEAD re-measurement: `tpch-spotcheck.sh` PASS
 floor), `tpcds-sf025-regression.sh sweep` PASS=96/96. No regression
 found; no bisection needed; no task filed under banner item 1 for this
 range. This closes the "per-commit naming" line item from the
-"Not yet measured" list above — the three other items (TPC-DS full-SF1
-parity, `tpch-acceptance-arm` OFF/ON digest, the M0142-0008 chain A/B)
-remain open.
+"Not yet measured" list above — TPC-DS full-SF1 parity remains open
+(see the acceptance-arm/M0142-0008 section below for the other two).
+
+## `tpch-acceptance-arm.sh` OFF/ON digest + M0142-0008 chain A/B (2026-09-18c, this loop)
+
+Closes two of the three remaining "Not yet measured" line items at once —
+they are the same experiment: the M0142-0008 chain's only live production
+effect is the `admitSemiAnti` literal at `joinsearchseam.go:313`
+(`extractSearchLeaves(chain, true)`, the only production call site per the
+surrounding comment — `joinsearchseam.go:1552`'s "stays false" comment is
+now stale, exactly what P0-H11 is filed to clean up once the owner records
+a decision), so an OFF/ON digest of that one literal **is** the chain A/B.
+
+### Method
+
+Two `./cmd/goopg` binaries from the same tree (HEAD `1ab649518`, clean —
+`git status --short` empty on `internal/`/`cmd/` before and after):
+
+- **ON** = HEAD as-is. `admitSemiAnti` is already unconditionally `true` in
+  production (landed at M0142-0008a-3i-plumbing-b2 step (iii),
+  `ef898b7e3`, bucket 1 of the per-commit table above) — no patch needed.
+  `tmp/goopg-p0e7-abtest-on`, sha256 `e8a6f0602853...`.
+- **OFF** = HEAD with one line changed
+  (`extractSearchLeaves(chain, true)` -> `extractSearchLeaves(chain, false)`
+  at `joinsearchseam.go:313`), built, then the file was `git checkout`'d
+  back to HEAD **before either arm ran** — the patch never reached a commit
+  and the working tree was verified clean again
+  (`git status --short internal/optimizer/joinsearchseam.go` empty) before
+  the OFF binary was used. `tmp/goopg-p0e7-abtest-off`, sha256
+  `8825111d1938...`.
+
+One shared `tmp/goopg-p0e7-abtest-runner` (`cmd/tpch-runner`, unaffected by
+the flag) ran both arms via `scripts/tpch-acceptance-arm.sh` with
+`NO_BUILD=1` (both binaries pre-built and pinned by path/sha256, never
+rebuilt mid-arm). Both arms: `PGSHAPED=0` explicit (per the script's own
+"set explicitly on both arms" rule), `GOOPG_ANALYZE_SEED=20260905` (the
+script's pinned default — see `m0138-0008-category-shift-bisect.md` for why
+an unpinned seed makes this class of A/B unusable), `DIGEST=1`, full
+22-query corpus, `PER_Q=600` (script default, unmodified), private clone
+port 5583, fresh `pg_basebackup -X fetch` snapshot of the live `:65433`
+before each arm (the arm's only touchpoint with the shared cluster — a
+read-only clone, never a write, per R1). OFF ran first as the baseline file;
+ON ran second with `ACCEPT_BASELINE` pointing at OFF's output, so the
+script's own `tpch-acceptance-runner -diff` did the comparison.
+
+Artifacts: `analysis/m0142/p0e7-admitsemianti-{off,on}.txt` (raw digest
+output, `#`-prefixed header lines carry engine-binary sha256 and host load)
+and `analysis/m0142/p0e7-admitsemianti-on.txt.diff-vs-baseline.txt` (the
+runner's own diff). Gate stamp: `tmp/gate-stamps/tpch-acceptance-arm.json`.
+
+### Result
+
+```
+SUMMARY: 1 ERROR-DIFF, 23 MATCH
+VERDICT: FAIL
+```
+
+**23 of 24 digest lines are byte-identical** (22 queries plus Q15's two
+extra sub-lines, `Q15a-VIEWBODY`/`Q15b-MAIN`) — every row count and digest
+value goopg produces is unaffected by `admitSemiAnti`. The lone
+`ERROR-DIFF` is Q9, and it is not a value or plan divergence: **both arms
+time out at the same 600 s per-query cap**, differing only in which of two
+simultaneous cancellation paths won the race —
+
+```
+off: Q9: ERROR after 600.00s — pq: canceling statement due to statement timeout (57014)
+on:  Q9: ERROR after 600.10s — pq: canceling statement due to user request (57014)
+```
+
+("statement timeout" = the server's own `statement_timeout` GUC fired;
+"user request" = the runner's own `-per-query-timeout` context deadline won
+the race and sent a cancel request first — a ~0.1 s scheduling jitter
+between two identical 600 s deadlines, not a semantic difference.) Q9's
+pre-existing timeout under the cost-driven join order is a separately
+closed no-go (`q9_costdriven_mhj_cannot_be_cost_forced` memory,
+`.ralph/deferral_ledger.md`); `admitSemiAnti` neither causes nor fixes it —
+it times out identically with the flag on or off.
+
+The runner's own `-diff` verdict reads `FAIL` because it treats any two
+non-identical error strings as a mismatch, which is the textually correct
+behavior for a generic digest-diff tool; it is not evidence of an
+`admitSemiAnti` effect once the two error strings are read (both name the
+same 600 s deadline). `tmp/gate-stamps/tpch-acceptance-arm.json` is
+therefore stamped `FAIL` for this literal reason — this is the expected,
+understood outcome of this specific A/B, not a blocking gate failure for
+the loop (Movement section below).
+
+**Conclusion for the owner's freeze decision:** turning `admitSemiAnti` off
+changes zero TPC-H SF1 row counts/digests versus leaving it on (current
+production state); the only observed difference is a benign timing race on
+an already-timing-out query. This is the A/B evidence P0-E7 was asked to
+produce and the evidence csq-R2's reopen condition names — the decision
+itself (freeze on vs revert) is the owner's per the 2026-09-17 FROZEN note,
+not this loop's to make.

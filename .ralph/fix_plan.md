@@ -249,6 +249,39 @@ uncommitted `ALTER TABLE … ADD CONSTRAINT` transaction on it was stopped with
     not a new measurement). Next loop: TPC-DS SF1 capture (budget a whole
     loop, ~4-5h) or the acceptance-arm digest run, per whichever the banner
     still finds selectable.
+  - **In progress 2026-09-18c (partial — task stays unchecked).** Kind: impl.
+    Movement: none (measurement only; `admitSemiAnti` is unchanged at HEAD,
+    still `true`; the local one-line flip used to build the OFF binary was
+    reverted before the arms ran and never reached a commit). Landed the
+    `tpch-acceptance-arm.sh` OFF/ON digest comparison and the M0142-0008
+    chain A/B in one measurement: ON binary = HEAD as-is (`admitSemiAnti`
+    already unconditionally `true` in production); OFF binary = HEAD with
+    `joinsearchseam.go:313`'s `extractSearchLeaves(chain, true)` temporarily
+    changed to `..., false)` (the chain's only production call site), built,
+    then the file was `git checkout`'d back to HEAD (verified clean) before
+    either arm ran. Ran both via `scripts/tpch-acceptance-arm.sh`
+    (`NO_BUILD=1`, pre-built pinned binaries, `PGSHAPED=0` and
+    `GOOPG_ANALYZE_SEED=20260905` explicit on both arms, `-digest`, full
+    22-query TPC-H SF1 corpus, private clone port 5583). **Result: 23/24
+    digest lines byte-identical**; the sole divergence is Q9, which times
+    out at the 600s cap in BOTH arms via two different cancellation code
+    paths (server `statement_timeout` vs the runner's own client cancel
+    request) — a scheduling race on an already-known-slow query
+    (`q9_costdriven_mhj_cannot_be_cost_forced` memory), not an
+    `admitSemiAnti` effect. This is the A/B evidence the owner's freeze
+    decision (and csq-R2's reopen condition) needs; the decision itself is
+    the owner's, not made here. Design doc:
+    `docs/design/0100-0149/p0-e7-bulk-re-measurement.md`
+    §"`tpch-acceptance-arm.sh` OFF/ON digest + M0142-0008 chain A/B". Gates:
+    `go build ./...` clean before/after the local revert;
+    `tmp/gate-stamps/tpch-acceptance-arm.json` stamped `FAIL` (the runner's
+    literal error-string diff on Q9's two cancel messages, not a values
+    regression — explained in the design doc). **Still not done**: TPC-DS
+    full-SF1 parity vs `:65438` (ledger row filed, task-id P0-E7, dated
+    2026-09-18) — the one remaining P0-E7 sub-item. Next loop: dedicate a
+    whole loop's timeout to the SF1 TPC-DS capture
+    (`scripts/capture-tpcds.sh` + `pg-plan-parity-diff.py` on a private 55xx
+    clone, ~4-5h budget per the sf025 script's own header).
 - [x] **P0-D3 — split the M0141-S7 design doc and fix its `Status:`.**
   Parent: none. Kind: impl (docs only). Movement: none.
   **DONE 2026-09-18 by the owner.** The parent went 1501 -> 226 lines and eight
