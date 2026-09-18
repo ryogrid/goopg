@@ -1,38 +1,34 @@
-Task: infra/nightly-live-tree-build-race — DONE + committed (021dd66dd).
+Task: M0140-0006c-2 recon — remaining partial-SetOp branches scoped +
+  committed (8ab5816fd); filed M0140-0006c-3 (mixed pa_subpaths arm, Q5).
   Carried-over blocker: M0141-S2b-15 impl remains [!] gated on
   bench/tpch/runtime_goopg/data.HOLD (owner-only recovery).
 
-Files: ci/batch/run-nightly.sh (postgres symlink into worktree),
-  stages/stage-{units,race,testport}.sh (cd NIGHTLY_SRC_ROOT),
-  lib/common.sh + ci/design/04 (fp comments), .ralph/fix_plan.md — committed.
+Files: docs/design/0100-0149/m0140-0006c-2-join-branch-partial-setop-
+  admission.md (new "Remaining-branch scoping" section), .ralph/fix_plan.md
+  (recon bullet on 0006c-2 + new 0006c-3 entry at ~line 2914) — committed.
 
-Key symbols: NIGHTLY_SRC_ROOT, source_fingerprint, clientToolBin/repoRoot
-  (testport fixture resolution via postgres/ symlink).
+Key symbols: setOpBranchDrivingKindIsSupported (gatherpaths.go:594),
+  partialPathDrivingKind (:425 — top-level arms for all three kinds exist),
+  parallelClaimSet.setOpLeft/Right + newLeafParallelClaimSet +
+  attachAll/prebuildBitmap (parallel_scan.go:495-656),
+  collectShareableJoins (parallel_hash_build.go:273), collectBitmapScans
+  (operators_gather.go:150), parallelChildren (parallel.go:1352).
 
-Hypothesis/Findings:
-  - Phantom "build broke mid-stage" class closed: builds were already in
-    the worktree; go-test stages were the leftover leak. Now ALL Go
-    compilation runs on the detached HEAD worktree; untracked scratch
-    (bak/, tmp/) can never enter `go list`/`go test`.
-  - commit-msg hook enforces TPC-H gates against the INDEX, not the
-    pathspec: with internal/ staged it demands fresh gate stamps. Used:
-    unstage internal/ → commit scripts/docs → re-stage. S2b-15's six
-    optimizer files are STAGED again (same blob hashes).
-  - Nightly 20260919-000526 was RUNNING during the loop; edits applied via
-    temp-file + os.replace (running bash keeps old inode). Its race FAIL
-    is the KNOWN instrumentscope race (open task), not contamination.
-  - source_fingerprint is now drift EVIDENCE only; comments updated.
+Hypothesis/Findings: only the NL branch has a corpus witness (Q76, which
+  also needs M0142-0005a's Memoize admission — both must land to flip it);
+  merge/bitmap branches have ZERO Parallel Append heads in plans-pg.
+  Q5 needs the mixed arm (0006c-3); Q2/Q14/Q71 ride landed arms; Q75 has
+  no Parallel Append. Executor attach walks already cover merge/NL — the
+  only missing machinery is the 3 admission arms + prebuildBitmap's
+  per-branch pbm publication. Slice order: NL -> merge -> bitmap.
 
-Next step: S2b-15 blocked until owner lifts data.HOLD
-  (scripts/tpch-ref-recover.sh --i-am-owner) or adds a gate-exceptions
-  row; then re-run tpch-spotcheck + tpch-acceptance-arm on the staged
-  tree, triage the 10 ea NEW findings (pg_est=None churn), repin, commit
-  internal/. Otherwise next banner item is M0140-0006c-2 partial Append.
+Next step: per banner, 0006c-2 impl slices stay HOLD-blocked; next
+  selectable is the same banner walk (M0142 chain / M0143 / M-NIGHTLY —
+  all impl, all HOLD-blocked) or owner recovery.
 
-Gates run: bash -n ×5; worktree `go build ./...` clean; stage-units.sh
-  PASS in worktree; TestPort_PgControldata001 PASS in worktree;
-  race-gate dry-run clean; pgbench smoke PASS; ralph-state-guard PASS.
+Gates run: pgbench smoke PASS (pre-commit hook), lineage guard PASS.
 
-In-flight: nightly 20260919-000526 still running (stage-testport, PID
-  2870459, 120m cap from 00:05); remaining stages run new stage scripts
-  harmlessly (units/race already done); run-nightly keeps old inode.
+In-flight: nightly 20260919-000526 may still be running stage-testport
+  (started 00:05); race stage already FAIL = known instrumentscope race
+  (M-NIGHTLY-instrumentscope-race-fix). When it finishes, file new
+  action-items per the mandatory triage.
