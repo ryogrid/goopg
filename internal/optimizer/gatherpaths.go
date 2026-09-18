@@ -456,16 +456,15 @@ func partialPathDrivingKind(p *Path) PathKind {
 		// arms make.
 		//
 		// Narrowed to a bare scan on each side, plus a hash-join-driven
-		// branch partial through its probe side and a nested-loop-driven
+		// branch partial through its probe side, a merge-join-driven
+		// branch partial through its outer side, and a nested-loop-driven
 		// branch partial through its outer side (M0140-0006c-2) — NOT the
 		// general recursion through a bitmap scan the other arms use. A
 		// bitmap-driven branch would need prebuildBitmap to publish into
 		// the branch's own leaf claim set (whose pbm is nil by
 		// construction); the collectors now descend into a SetOp, but the
 		// publication still targets only the top-level claim set, so
-		// bitmap stays refused (fail closed → serial). A merge-driven
-		// branch stays refused too: its prebuild story is unverified (no
-		// walk collects through a merge outer today). Ledger row filed
+		// bitmap stays refused (fail closed → serial). Ledger row filed
 		// (M0140-0006c): the remainder is owned by M0140-0006c-2's
 		// still-open scope.
 		if len(p.Children) != 2 || !setOpBranchDrivingKindIsSupported(p.Children[0]) ||
@@ -588,11 +587,12 @@ func partialPathDrivingKind(p *Path) PathKind {
 
 // setOpBranchDrivingKindIsSupported is the PathSetOp arm's own, narrower
 // admission test for one branch — a bare seq or (unparameterised) index
-// scan, a hash join partial through its probe side, or a nested loop
-// partial through its outer side (M0140-0006c-2, slices hash + A). See
+// scan, a hash join partial through its probe side, a merge join partial
+// through its outer side, or a nested loop partial through its outer side
+// (M0140-0006c-2, slices hash + A + B). See
 // partialPathDrivingKind's PathSetOp case for why this does NOT delegate to
 // partialPathDrivingKind's general recursion (which would also admit bitmap
-// and merge shapes whose executor story is unverified).
+// shapes whose executor story is unverified).
 func setOpBranchDrivingKindIsSupported(p *Path) bool {
 	if p == nil {
 		return false
@@ -613,8 +613,34 @@ func setOpBranchDrivingKindIsSupported(p *Path) bool {
 		// PathHashJoin arm; the jointype trust is the producer's
 		// (addPartialHashJoinPath files only partial-capable jointypes),
 		// re-checked at runtime by hashJoinIsPartialCapable on the node
-		// twin. A merge join on the spine stays refused: no walk collects
-		// through a merge outer today and the branch would run un-prebuilt.
+		// twin. A merge join on the spine is admitted (slice B) but a
+		// hash below a merge outer is never COLLECTED for prebuild — the
+		// branch's workers each private-build its inner, correct and Nx
+		// the memory, the same E-20 deferral the top level already carries.
+		if p.RequiredOuter != 0 || len(p.Children) != 2 {
+			return false
+		}
+		return setOpBranchDrivingKindIsSupported(p.Children[0])
+	case PathMergeJoin:
+		// M0140-0006c-2 (slice B). Mirrors partialPathDrivingKind's own
+		// PathMergeJoin arm guard-for-guard (E-20 Cut 3): a merge join is
+		// partial through its OUTER side only — each worker merge-joins
+		// its partition of the outer against the WHOLE inner, which it
+		// sorts and reads itself. No shared build exists for merge, so
+		// unlike the hash arm nothing here needs a collector: a hash
+		// below this merge's outer is simply built privately by every
+		// worker (correct, Nx the memory — the same E-20 deferral the
+		// top-level arm already carries). Children[0] is the outer by
+		// this package's child convention — the same side
+		// createMergeJoinPlan leaves as Join.Left and the three
+		// executor attach walks descend (each now names
+		// JoinAlgoMerge -> left literally rather than answering from
+		// BuildLeft, which a merge join leaves false by construction).
+		// Recursion stays through THIS test so a bitmap-driven outer
+		// still refuses. The jointype trust is the producer's — the
+		// same stance the top-level arm takes — re-checked at runtime
+		// by mergeJoinIsPartialCapable on the node twin (INNER/SEMI/
+		// ANTI/LEFT; FULL/RIGHT refuse).
 		if p.RequiredOuter != 0 || len(p.Children) != 2 {
 			return false
 		}
@@ -623,7 +649,8 @@ func setOpBranchDrivingKindIsSupported(p *Path) bool {
 		// M0140-0006c-2 (slice A). Mirrors partialPathDrivingKind's
 		// PathNestLoop arm guard-for-guard (R94's ordinary whole-inner,
 		// R95's lateral index-probe inner), recursing through THIS test so
-		// a merge- or bitmap-driven outer still refuses. The executor side
+		// a bitmap-driven outer still refuses (hash-, merge-, and
+		// NL-driven outers admit through their own arms). The executor side
 		// needed nothing new: attachAll's *setOp arm hands each branch its
 		// own leaf claim set, and attachParallelScan/
 		// attachParallelBitmapScan/attachParallelIndexScan each already

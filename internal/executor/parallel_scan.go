@@ -306,6 +306,17 @@ func attachParallelBitmapScan(op Operator, st *parallelBitmapState) bool {
 			}
 			return attachParallelBitmapScan(x.left, st)
 		}
+		// E-20 Cut 3 (M0140-0006c-2 slice B): a merge join is likewise
+		// partial through its OUTER (left) side — each worker merge-joins
+		// its partition of the outer against the whole inner, which it
+		// sorts and reads itself; the inner takes no claim. Literal left
+		// like the NL arm above and attachParallelScan's own merge arm —
+		// never probeSideIsLeft, which would answer "left" only because
+		// BuildLeft stays false by construction (createMergeJoinPlan):
+		// the right answer for the wrong reason.
+		if x.plan != nil && x.plan.Algo == optimizer.JoinAlgoMerge {
+			return attachParallelBitmapScan(x.left, st)
+		}
 		// R95: nil plan refuses rather than panicking in
 		// probeSideIsLeft below — the walk is the last line of defence
 		// and its failure mode must be serial, never a throw.
@@ -455,6 +466,17 @@ func attachParallelIndexScan(op Operator, st *parallelIndexScanState) bool {
 			if optimizer.HasBitmapScan(x.plan.Right) {
 				return false
 			}
+			return attachParallelIndexScan(x.left, st)
+		}
+		// E-20 Cut 3 (M0140-0006c-2 slice B): a merge join is likewise
+		// partial through its OUTER (left) side — each worker merge-joins
+		// its partition of the outer against the whole inner; the inner
+		// takes no index claim. Literal left like the NL arm and the
+		// sequential sibling's merge arm — never probeSideIsLeft, which
+		// would answer "left" only because BuildLeft stays false by
+		// construction (createMergeJoinPlan): the right answer for the
+		// wrong reason.
+		if x.plan != nil && x.plan.Algo == optimizer.JoinAlgoMerge {
 			return attachParallelIndexScan(x.left, st)
 		}
 		// R95: same nil-plan refusal as the bitmap sibling above.

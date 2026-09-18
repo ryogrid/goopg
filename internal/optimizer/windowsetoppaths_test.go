@@ -927,10 +927,10 @@ func TestPartialPathDrivingKindAcceptsSetOpWithNestedHashJoinBranch(t *testing.T
 
 // TestPartialPathDrivingKindRefusesSetOpWithBadHashJoinBranch pins the
 // fail-closed edges of the hash arm: a parameterised or malformed hash
-// join, a hash whose probe is itself refused (bitmap), and non-hash join
-// kinds (merge, nested loop) stay serial — their prebuild story is
-// unverified (no walk collects through a merge outer today; leaf claim
-// sets carry no pbm).
+// join, and a hash whose probe is itself refused (bitmap). Join-driven
+// branches that ARE admitted (merge since slice B, nested loop since
+// slice A) live in their own acceptance/refusal pairs below — the only
+// join kind still refused here outright is one no arm claims.
 func TestPartialPathDrivingKindRefusesSetOpWithBadHashJoinBranch(t *testing.T) {
 	scan := func() *Path { return &Path{Kind: PathSeqScan, ParallelSafe: true, ParallelWorkers: 2} }
 	cases := map[string]*Path{
@@ -946,14 +946,13 @@ func TestPartialPathDrivingKindRefusesSetOpWithBadHashJoinBranch(t *testing.T) {
 			Kind: PathHashJoin, ParallelSafe: true, ParallelWorkers: 2,
 			Children: []*Path{{Kind: PathBitmapHeapScan}, scan()},
 		},
-		"merge-branch": {
-			Kind: PathMergeJoin, ParallelSafe: true, ParallelWorkers: 2,
-			Children: []*Path{scan(), scan()},
-		},
-		// No plain "nestloop-branch" case here: a whole-inner NL over two
-		// bare scans is ADMITTED by M0140-0006c-2 slice A (Jointype's zero
-		// value is parser.JoinInner) — see the acceptance/refusal pair
-		// below. Only its guard-violating shapes still refuse.
+		// No plain "merge-branch" case: a merge over two bare scans is
+		// ADMITTED by M0140-0006c-2 slice B (Jointype's zero value is
+		// parser.JoinInner, a partial-capable merge jointype) — see the
+		// acceptance/refusal pair below. Only guard-violating merge
+		// shapes still refuse.
+		// No plain "nestloop-branch" case either, for the same reason
+		// (slice A).
 	}
 	for name, branch := range cases {
 		setOp := &Path{Kind: PathSetOp, Children: []*Path{scan(), branch}}
@@ -1073,14 +1072,12 @@ func TestPartialPathDrivingKindRefusesSetOpWithBadNestLoopBranch(t *testing.T) {
 			&Path{Kind: PathSeqScan, RequiredOuter: 1}),
 		"clauseless-probe": nl(scan(),
 			&Path{Kind: PathIndexScan, RequiredOuter: 1}),
-		// The narrowed outer recursion: a merge- or bitmap-driven outer
-		// still refuses even when the NL's own guards all pass.
+		// The narrowed outer recursion: a bitmap-driven outer still
+		// refuses even when the NL's own guards all pass (a merge-driven
+		// outer ADMITS since slice B — the cross-arm spine case is in the
+		// merge acceptance test below).
 		"bitmap-outer": nl(
 			&Path{Kind: PathBitmapHeapScan, ParallelSafe: true, ParallelWorkers: 2},
-			&Path{Kind: PathSeqScan}),
-		"merge-outer": nl(
-			&Path{Kind: PathMergeJoin, ParallelSafe: true, ParallelWorkers: 2,
-				Children: []*Path{scan(), scan()}},
 			&Path{Kind: PathSeqScan}),
 	}
 	for name, branch := range cases {
@@ -1107,6 +1104,85 @@ func TestPartialPathDrivingKindRefusesSetOpWithBadNestLoopBranch(t *testing.T) {
 		},
 	} {
 		setOp := &Path{Kind: PathSetOp, Children: []*Path{scan(), build()}}
+		if got := partialPathDrivingKind(setOp); got != PathPrebuilt {
+			t.Errorf("%s: partialPathDrivingKind = %v, want PathPrebuilt (refused)", name, got)
+		}
+	}
+}
+
+// TestPartialPathDrivingKindAcceptsSetOpWithMergeJoinBranch is M0140-0006c-2
+// slice B's base case: a merge-join-driven branch is admitted when the merge
+// carries the same guards partialPathDrivingKind's own PathMergeJoin arm
+// requires (unparameterized, exactly two children) — partial through the
+// OUTER side, so the recursion descends Children[0] only.
+func TestPartialPathDrivingKindAcceptsSetOpWithMergeJoinBranch(t *testing.T) {
+	scan := func() *Path { return &Path{Kind: PathSeqScan, ParallelSafe: true, ParallelWorkers: 2} }
+	merge := &Path{
+		Kind: PathMergeJoin, ParallelSafe: true, ParallelWorkers: 2,
+		Children: []*Path{scan(), scan()},
+	}
+	setOp := &Path{Kind: PathSetOp, Children: []*Path{scan(), merge}}
+	if got := partialPathDrivingKind(setOp); got != PathSetOp {
+		t.Fatalf("partialPathDrivingKind = %v, want PathSetOp (merge branch admitted)", got)
+	}
+}
+
+// TestPartialPathDrivingKindAcceptsSetOpWithNestedMergeJoinBranch proves the
+// recursion stays branch-local end to end: a merge whose outer is itself a
+// merge (a merge-of-merge spine) is admitted, and a nested loop whose outer
+// is a merge rides slice B's arm through slice A's — the spine admits
+// through whichever arm claims each link, exactly like
+// partialPathDrivingKind's general recursion does at top level.
+func TestPartialPathDrivingKindAcceptsSetOpWithNestedMergeJoinBranch(t *testing.T) {
+	scan := func() *Path { return &Path{Kind: PathSeqScan, ParallelSafe: true, ParallelWorkers: 2} }
+	merge := func(children ...*Path) *Path {
+		return &Path{Kind: PathMergeJoin, ParallelSafe: true, ParallelWorkers: 2, Children: children}
+	}
+	innerMerge := merge(scan(), scan())
+	outerMerge := merge(innerMerge, scan())
+	setOp := &Path{Kind: PathSetOp, Children: []*Path{scan(), outerMerge}}
+	if got := partialPathDrivingKind(setOp); got != PathSetOp {
+		t.Fatalf("partialPathDrivingKind = %v, want PathSetOp (merge-of-merge spine admitted)", got)
+	}
+
+	// Cross-arm spine: an NL whose outer is a merge admits through slice
+	// A's arm recursing into slice B's (the case the bad-NL refusal map
+	// carried before B landed — the spine is now valid end to end).
+	nlOverMerge := &Path{
+		Kind: PathNestLoop, Jointype: parser.JoinInner,
+		ParallelSafe: true, ParallelWorkers: 2,
+		Children: []*Path{merge(scan(), scan()), {Kind: PathSeqScan}},
+	}
+	setOp = &Path{Kind: PathSetOp, Children: []*Path{scan(), nlOverMerge}}
+	if got := partialPathDrivingKind(setOp); got != PathSetOp {
+		t.Fatalf("partialPathDrivingKind = %v, want PathSetOp (NL-over-merge spine admitted)", got)
+	}
+}
+
+// TestPartialPathDrivingKindRefusesSetOpWithBadMergeJoinBranch pins the
+// fail-closed edges of the merge arm: a parameterised or malformed merge
+// refuses outright, and the narrowed outer recursion still refuses a
+// bitmap-driven outer (leaf claim sets carry no pbm — slice C's scope).
+func TestPartialPathDrivingKindRefusesSetOpWithBadMergeJoinBranch(t *testing.T) {
+	scan := func() *Path { return &Path{Kind: PathSeqScan, ParallelSafe: true, ParallelWorkers: 2} }
+	merge := func(children ...*Path) *Path {
+		return &Path{Kind: PathMergeJoin, ParallelSafe: true, ParallelWorkers: 2, Children: children}
+	}
+	cases := map[string]*Path{
+		"parameterised-merge": {
+			Kind: PathMergeJoin, ParallelSafe: true, ParallelWorkers: 2, RequiredOuter: 1,
+			Children: []*Path{scan(), scan()},
+		},
+		"one-child-merge":    merge(scan()),
+		"zero-child-merge":   merge(),
+		"bitmap-outer-merge": merge(&Path{Kind: PathBitmapHeapScan}, scan()),
+		// The recursion propagates a refusal UP the spine: a merge whose
+		// outer is a merge whose own outer is a bitmap still refuses.
+		"nested-bitmap-outer": merge(merge(&Path{Kind: PathBitmapHeapScan}, scan()), scan()),
+		"nil-outer":           merge(nil, scan()),
+	}
+	for name, branch := range cases {
+		setOp := &Path{Kind: PathSetOp, Children: []*Path{scan(), branch}}
 		if got := partialPathDrivingKind(setOp); got != PathPrebuilt {
 			t.Errorf("%s: partialPathDrivingKind = %v, want PathPrebuilt (refused)", name, got)
 		}

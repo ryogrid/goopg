@@ -223,8 +223,16 @@ func TestCheckpointerDoDWritePacing(t *testing.T) {
 	if !pf2.flushAllCalled {
 		t.Error("IMMEDIATE checkpoint did not take FlushAll fallback path")
 	}
-	if immediateElapsed > 20*time.Millisecond {
-		t.Errorf("IMMEDIATE checkpoint took %v; want < 20ms (no pacing)", immediateElapsed)
+	// The old absolute bound (want < 20ms) flaked under gate concurrency
+	// (24ms on a loaded host, 2026-09-19): pacing delay can only enter via
+	// the pacer callback, which buildPacer does not even build for
+	// spread=false — so the empty pf2.progresses + flushAllCalled checks
+	// above already prove the bypass deterministically. Keep a load-robust
+	// relative bound instead of an absolute one: the immediate run must beat
+	// the paced run just measured, which always carries ~90ms of pacing
+	// sleeps on top of identical flush work.
+	if immediateElapsed >= elapsed {
+		t.Errorf("IMMEDIATE checkpoint took %v; want < the paced run's %v (no pacing)", immediateElapsed, elapsed)
 	}
 }
 

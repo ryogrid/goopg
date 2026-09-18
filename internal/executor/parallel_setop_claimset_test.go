@@ -468,3 +468,84 @@ func TestCollectBitmapScansDescendsSetOp(t *testing.T) {
 		t.Fatalf("collected %d bitmap scans under a scan-only SetOp, want 0", len(out))
 	}
 }
+
+// TestGatherOverSetOpMergeJoinBranchIdentity is M0140-0006c-2 slice B's
+// gate: the left UNION ALL branch is a merge join (outer = pq_setop_a,
+// inner = pq_setop_c — 40 matching keys, so the branch yields a
+// deterministic 40 rows), the right a bare scan over pq_setop_b (90 rows).
+//
+// Serial-vs-parallel identity at 1/2/4 workers is the witness: each
+// participant claims a disjoint partition of the merge join's OUTER through
+// the branch's own leaf claim set and sorts/reads the whole inner itself —
+// no shared build exists for merge, so there is nothing to prebuild (the
+// asymmetry that makes this slice's executor story smaller than the hash
+// slice's). A worker replaying the whole branch (the N-copies defect)
+// returns MORE rows; a claim that never attaches silently multiplies every
+// branch row by the participant count.
+func TestGatherOverSetOpMergeJoinBranchIdentity(t *testing.T) {
+	ctx, cleanup := parallelSetOpFixture(t)
+	defer cleanup()
+
+	ctx.MaxParallelWorkers = 8
+	ctx.ParallelLeaderParticipation = true
+
+	for _, workers := range []int{1, 2, 4} {
+		t.Run(fmt.Sprintf("workers=%d", workers), func(t *testing.T) {
+			// The comma/WHERE form is required here: the JOIN..ON syntax
+			// plans through the non-search fast path, which ignores the
+			// enable_* flips and never emits a Merge Join (probe-verified
+			// 2026-09-19). The search shapes this as merge under the
+			// flips — 40 matching keys, a deterministic 40 rows.
+			mergeBranch := planMergeForced(t, ctx, "SELECT a.id FROM pq_setop_a a, pq_setop_c c WHERE a.id = c.aid")
+			advanceStmtCounter(ctx)
+			right := planForTest(t, ctx, "SELECT id FROM pq_setop_b")
+			so := &optimizer.SetOp{Left: mergeBranch, Right: right, Op: parser.SetOpUnion, All: true}
+
+			advanceStmtCounter(ctx)
+			want := drainPlan(t, ctx, so)
+			if len(want) != 40+90 {
+				t.Fatalf("serial baseline = %d rows, want 130 (40 join + 90 scan); the fixture planner shape moved", len(want))
+			}
+
+			gathered := optimizer.NewGather(0, so, workers)
+			if !planTreeHasMergeUnderGather(gathered) {
+				t.Fatal("no Merge Join under the Gather; the identity comparison would not exercise the merge branch")
+			}
+			advanceStmtCounter(ctx)
+			op, err := Build(gathered)
+			if err != nil {
+				t.Fatalf("build: %v", err)
+			}
+			if err := op.Open(ctx); err != nil {
+				t.Fatalf("open: %v", err)
+			}
+			var got []string
+			for {
+				slot, err := op.Next()
+				if err == EOF {
+					break
+				}
+				if err != nil {
+					op.Close()
+					t.Fatalf("next: %v", err)
+				}
+				got = append(got, renderRows([]Row{slot.Row()})...)
+			}
+			if err := op.Close(); err != nil {
+				t.Fatalf("close: %v", err)
+			}
+
+			sort.Strings(want)
+			sort.Strings(got)
+			if len(got) != len(want) {
+				t.Fatalf("got %d rows, want %d — more means a worker replayed a whole branch instead of its partition (the N-copies defect)",
+					len(got), len(want))
+			}
+			for i := range want {
+				if got[i] != want[i] {
+					t.Fatalf("row %d differs: got %q want %q — a worker dropped or duplicated a branch row", i, got[i], want[i])
+				}
+			}
+		})
+	}
+}
