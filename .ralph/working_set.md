@@ -1,39 +1,41 @@
-Task: testport/TestE2E_PGColdStartOnGoopgDataDir — DONE (commit
-  69b2f7b7b): was the predicted FAIL-WHEN-FIXED flip; re-pinned
-  `wantChunks` + comment + ledger row; entry now [x].
+Task: testport/TestPort_IsolationIntraGrantInplace — root-cause DONE
+  (commit 268710050): perm-10 divergence explained + ledgered; impl
+  fix now UNBLOCKED (HOLD lifted mid-loop by concurrent commit
+  caf858301 at 03:21 — :65433 restored, gates run again).
 
-Files: internal/testport/e2e_pg_coldstart_on_goopgdata_test.go
-  (wantChunks ~L1360-1380); .ralph/fix_plan.md (~L424 [x]);
-  .ralph/deferral_ledger.md (new tail row — NOTE: append-only under
-  RALPH_LOOP; flipping an existing row's status trips the commit
-  guard, record resolutions as new rows).
+Root cause (full bullets on fix_plan ~L574): perm `b1 drop1 b3 sfu3
+  revoke4 c1 r3` — goopg's `lockRowsOp.Open` waits on the deferred
+  pg_class drop via `maybeRecordPgClassRowMark`→`waitTablePendingDrop`
+  (operators_lockrows.go:853/910, operators_ddl.go:12688) BEFORE any
+  child row iteration; post-unblock `drainAndStamp` (:1031) re-evals
+  the `oid='x'::regclass` filter → `regclassin` misses
+  (reg_identifier.go:286-331) → 42P01 where PG emits `0 rows`.
+  PG resolves the cast once before the LockTuple wait. Fix sketch:
+  after waitTablePendingDrop unblocks + drop committed, short-circuit
+  drainAndStamp to EOF. Also explains r3-before-revoke4 tail ordering.
 
-Key facts: `c11ff797a` (2026-09-01, NB-17) ported upstream's pglz
-  hash-chain match search + good_match/good_drop bounds into
-  `internal/access/common/pglz` → goopg's pg_toast_2618 now matches
-  upstream's own chunk counts (all 17) + stored bytes (≤18 B, 8/17
-  exact). Old pin held pre-NB-17 brute-force output (3-4% smaller);
-  identical `got` in every nightly since 20260902 → one stale pin,
-  six duplicate AIs. Residual deltas are content-level, ledgered.
+Also this loop: AI-20260919-000526-001 verified = the ledgered
+  instrumentscope race, 4th repro (instrument.go:444 vs
+  operators_gather.go:124) — noted ~L454, do not re-file.
 
-Hypothesis/Findings: CONFIRMED not a regression. race/internal/
-  executor (next open M-NIGHTLY ~L438) already re-confirmed 09-18
-  as the known instrumentscope race — new AI-20260919-000526-001
-  presumably same signature (check
-  ci/logs/20260919-000526/race/go-test.log first).
+Environment — CHANGED THIS LOOP: `data.HOLD` REMOVED (only
+  preloss-clone-20260915.HOLD remains); concurrent Devin loop commit
+  `caf858301` (03:21) lifted HOLD + committed the six staged S2b-15
+  optimizer files + folded my race note. Impl tasks are UNBLOCKED —
+  tpch-spotcheck should run again (verify :65433 answers first).
+  ci/logs/*, .claude/settings.json, .ralphrc, analysis/, postgres,
+  third-party/ carry unstaged foreign mods — never commit those.
+  WATCH: another live loop commits to this branch — expect its
+  commits mid-flight; stage explicitly, verify before committing.
 
-Environment: `data.HOLD` stands — all internal/ impl blocked; six
-  staged S2b-15 optimizer files preserved. Nightly 20260919-000526
-  done (fail, 2 AIs — both filed onto existing entries); scheduler
-  still running. ci/logs/* auto-staged by nightly — unstage before
-  commits; .claude/settings.json, .ralphrc, analysis/, postgres,
-  third-party/ have pre-existing unstaged mods — never commit.
-
-Gates run: `go test -v -run '^TestE2E_PGColdStartOnGoopgDataDir$'
-  ./internal/testport/` PASS 3.17s (cgroup-capped); vet clean;
-  gofmt clean on edit (pre-existing divergence ~L1077, go1.25
-  baseline rule — do not fix); pgbench smoke PASS (hook).
+Gates run: repro `go test -v -run
+  '^TestPort_IsolationIntraGrantInplace$' ./internal/testport/` FAIL
+  4.86s (expected — diagnosis only); pgbench smoke PASS (hook).
 In-flight: none.
-Next step: item-8 M-NIGHTLY — verify race/internal/executor AI-001
-  signature, then isolation items; impl HOLD-blocked; legal =
-  recon/test-only or milestones M0119→M0122→M0134→M0095/M0110.
+Next step: item-8 topmost unblocked impl =
+  M-NIGHTLY-instrumentscope-race-fix (~L505, design resolved loop 9:
+  force nil scope at acquireSubPlanOp Build sites under
+  Context.instrumentScope — bug-for-bug OK). Then
+  IsolationIntraGrantInplace's sketched fix (executor, needs
+  units+race+tpch-spotcheck), then IsolationStats/LockRowsSort/
+  PgDumpConnectionSetup/RegressSuite entries.
