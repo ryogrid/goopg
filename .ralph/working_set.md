@@ -1,82 +1,84 @@
-Task: M0141-S2a-fix1-sweep-b — narrow WINDOW's internal sort cost inputs
-(costWindow/addWindowPaths/sizeWindowRelFromNode). DONE and committed this
-loop (`cd7767b8b` code, `0ead98e6f` docs/fix_plan). M0141-S2a-fix1-sweep's
-own two filed children (sweep-a, sweep-b) are BOTH now closed. **NEXT LOOP
-should re-read the banner first** (S1 precedence) — if it still names item
-3's order as "fix1-sweep's own filed children (done), then
-M0141-S2b-6-resume, then M0139-0007c", select **M0141-S2b-6-resume** next
-(fix_plan.md ~line 3350, gated on the M0142-0003k TPC-H cluster reload —
-verify that gate is actually satisfied at `:65433` post-P0-E6/E7 restore
-before assuming it's still blocked); otherwise follow whatever the banner
-says.
+Task: M0141-S2b-6-resume — repeat S2b-6's Hashed-vs-Sorted `PathAgg`
+term-by-term cost diff against the real HammerDB SF1-loaded `:65433`
+cluster (gate cleared by P0-E6/P0-E7). DONE and committed this loop.
+**NEXT LOOP should re-read the banner first** (S1 precedence) — banner
+item 3's own ordering is: fix1-sweep's filed children (done),
+M0141-S2b-6-resume (done this loop), then **M0139-0007c**. Select
+M0139-0007c next unless the banner has changed. A new follow-up,
+**M0141-S2b-10** (`Kind: recon`, root-cause `costAgg`'s Hashed-vs-Sorted
+formula gap for TPC-H Q4/Q12), was also filed under the same M0141-S2b
+lineage but is NOT itself the banner's next pick — it only becomes
+selectable once/if the banner's own ordering reaches it.
 
-Files: new `internal/optimizer/window_sort_narrow.go`
-(`deriveWindowChainNarrowKeeps`, `deriveWindowRelNarrowKeep`,
-`narrowWindowRelWidth`). `internal/optimizer/windowsetoppaths.go`
-(`createWindowPaths` gained trailing `chainKeep [][]int`/`relKeep []int`
-params; `addWindowPaths` gained trailing `chainKeep [][]int` + new
-`narrowedWindowCols` helper). `internal/optimizer/planner.go`
-(`buildWindowStage` gained a `starPS *ProjectSet` param; computes both
-keep-sets once, right after its per-group loop and before
-`createWindowPaths`, via a throwaway `windowSurface` byte-identical to its
-own later return value; its own call site at ~planner.go:1880 now passes
-`ps`). 4 test call sites in `windowsetoppaths_test.go` updated to the new
-params. Design doc:
-`docs/design/0100-0149/m0141-s2a-fix1-sweep-b-window-sort-width-currency.md`
-(new). `docs/design/README.md` (new index row). `.ralph/fix_plan.md` (task
-ticked `[x]` with DONE sub-bullet).
+Files: `internal/optimizer/pathtrace.go` (new
+`traceOrderedGroupingCandidate`/`traceOrderedSortedCandidate`, both
+`pathTraceEnabled`-gated). `internal/optimizer/upperordered.go`
+(`addOrderedPaths` calls both, gated `input.Kind == PathAgg`). Design doc:
+`docs/design/0100-0149/m0141-s2b-6-resume-hashed-vs-sorted-real-sf1.md`
+(new — the parent `m0141-s2b-scoping-decomposition.md` is frozen at 977
+lines under D3.1, so this is a fresh file, NOT an appended section;
+do not append to the parent doc without splitting it first).
+`docs/design/README.md` (new index row). `.ralph/fix_plan.md`
+(M0141-S2b-6-resume ticked `[x]`; new task M0141-S2b-10 filed).
 
-Key symbols: `windowWindowInputNames`/`stampWindowInputTarget`
-(`window_input_target.go` — the pre-existing B-01c compute-only stamp this
-task's own recon-time premise wrongly said didn't exist; it existed but was
-never consumed for costing, which is exactly what this task did),
-`finalSelectOutputNames` (`ordered_input_narrow.go`, sweep-a's helper,
-reused verbatim), `costWindow`/`addWindowPaths`/`sizeWindowRelFromNode`
-(`windowsetoppaths.go`).
+Key symbols: `electOrderedGrouping`/`addOrderedPaths`
+(`upperorderedgrouping.go`/`upperordered.go`) — the Hashed-vs-Sorted
+`PathAgg` election site. `traceOrderedGroupingCandidate`/
+`traceOrderedSortedCandidate` (new, `pathtrace.go`) — DPPATH lines keyed
+by `AggStrategy` instead of inferred from `contained`. `costAgg`
+(`cost_funcs.go`) — NOT yet term-by-term diffed against PG's `cost_agg`;
+that is M0141-S2b-10's job.
 
-Finding: **measured provably inert today, not just corpus-inert** — unlike
-sweep-a's ORDERED rel (which at least carries a `PlanCost` `EXPLAIN` could
-show under a future 2nd candidate), the WINDOW rel's own design doc states
-NO second candidate ever competes at this rel (`addWindowPaths` always
-offers exactly one `PathWindow` chain) AND `*WindowAgg` carries no
-`PlanCost` at all — so this narrowing literally cannot move any observable
-output under today's single-candidate WINDOW design, confirmed rather than
-assumed (TPC-DS SF0.25's 99-query corpus, the one with real window-function
-density, shows `PLAN-SHAPE changed=0`). Methodology trap hit and resolved
-this loop: the first TPC-H acceptance-arm attempt used `PGSHAPED=0`
-(copied from an unrelated P0-E7 A/B note in a stale mental model) and got
-`VERDICT: FAIL` — Q9 timing out identically in both arms at exactly the
-`PER_Q` cutoff (900.0xs both times, twice, at two different `PER_Q`
-values) is a symptom of the WRONG planner shape (`GOOPG_PGSHAPED_DP` is
-`unset(on)`, i.e. DP-shaped, by default; `PGSHAPED=0` forces the retired
-non-DP path). Re-running with `PGSHAPED=1` (sweep-a's own precedent, the
-actual default) got a clean `VERDICT: PASS, 24/24 MATCH` on the first try
-— **always pass `PGSHAPED=1` for a values-comparison arm unless the task is
-specifically an on/off A/B**, the `PGSHAPED=0` figure in older working-set
-notes was for a *different*, unrelated experiment, not a general default.
+Finding: S2b-6's synthetic-dataset tie does NOT survive real SF1 data —
+all four of Q4/Q5/Q12/Q21 are real, non-tied margins. Q5/Q21 reconfirm
+"no cost bug" (their ORDER BY never matches GROUP BY). Q4/Q12 are a
+**confirmed real cost-model divergence from PG**: goopg elects
+Hashed+Sort (899.76/2181.96-unit margins), a **fresh** live `EXPLAIN` on
+the read-only `:65432` PG reference elects the mirror-image Sorted shape
+for both. Tested and ruled out the R113 `GOOPG_PG_SORT_RELATION_BYTES_COST`
+Sort-byte-size-currency GUC as the cause (env-toggle-only experiment,
+`currency=pg` confirmed active, election and margin both unchanged) — the
+real cause is unconfirmed, most likely `costAgg`'s `AggStrategyHashed`
+formula, filed as M0141-S2b-10 for a future loop.
 
-Gates run: `go build ./...` clean. `go test ./internal/optimizer/...` PASS
-(full package). `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=34), staged-tree
-stamp `code_tree=7cdbef9e...` PASS. `scripts/tpcds-sf025-regression.sh
-sweep`: PASS=96 MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0, plan-shapes
-99/99 identical, staged-tree stamp PASS. `scripts/tpch-acceptance-arm.sh`
-before/after digest diff (`PGSHAPED=1`, private port 5583,
-`GOOPG_ANALYZE_SEED=20260905`, `NO_BUILD=1` two pinned binaries): VERDICT
-PASS, 24/24 labels MATCH, staged-tree stamp PASS. `python3
-scripts/ralph_protected_regions.py check-designdocs` exit 0. Pre-commit
-hook's pgbench smoke: PASS x2 (one per commit). `make ralph-state-guard`:
-clean, no repair needed this time (prior loop's own repair from last time
-held).
+Naming trap hit and fixed this loop: filed the follow-up as
+`M0141-S2b-8` initially without checking for collisions — `M0141-S2b-8`
+and `-9` were ALREADY taken by an unrelated TPC-DS Incremental-Sort
+candidate-pool line of work (`M0141-S7-cd-q64-reclassify`/
+`M0141-S7-cd-candidatepool`, both landed 2026-09-18 same day). Caught via
+`grep -oE "M0141-S2b-[0-9a-z]+" .ralph/fix_plan.md | sort -u` before
+committing; renamed to `M0141-S2b-10` in all three touched files
+(fix_plan.md, README.md, the new design doc). **Always run that grep
+before naming a new sub-task under a deeply-forked lineage id** — two
+sibling investigations under the same parent milestone can independently
+reach for the "next" number on the same day.
 
-In-flight: none. Two detached worktrees this loop created
-(`/tmp/wt-sweepb-baseline`, replaced by `/tmp/wt-sweepb-baseline2` after a
-methodology correction — both built the pre-change baseline binary at HEAD
-`9852fda5f`) were removed via `git worktree remove --force`, confirmed via
-`git worktree list`. All private-port servers (5583 across 4 separate arm
-invocations this loop, two of them the `PGSHAPED=0` false-start) were
-stopped by their own scripts' EXIT traps; verified only the legitimate
-shared `:65433` reference server remains running (`systemctl --user
-list-units 'goopg-*'`). All temp binaries/output files under `/tmp/`
-removed after use. No shared cluster (`:65432`/`:65433`/`:65437`/`:65438`)
-was started, stopped, reset, or written beyond read-only
-`pg_basebackup`/`SELECT`/`EXPLAIN`.
+Gates run: `go build ./...` clean. `go test ./internal/optimizer/...`
+PASS (full package, no `-count=1`). `scripts/tpch-estimate-audit-arm.sh`
+x2 (baseline PGSHAPED=1 arm + GOOPG_PG_SORT_RELATION_BYTES_COST=1 arm),
+both rc=0, served-binary sha256 verified, private port 5582, online
+`pg_basebackup -X fetch` clone off live `:65433` (never stopped).
+`scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=34), staged-tree gate stamp
+PASS. `scripts/tpcds-sf025-regression.sh sweep` PASS=96 MISMATCH=0
+CKMISMATCH=0 ERROR=0 TIMEOUT=0, `PLAN-SHAPE: queries=99 same=99
+changed=0` (confirms zero plan movement — trace-only change), staged-tree
+gate stamp PASS. `python3 scripts/ralph_protected_regions.py
+check-designdocs` exit 0. `python3 scripts/ralph-lineage-guard.py` clean
+(after the Movement:none fix and the S2b-10 rename above).
+`make ralph-state-guard`: found status="running"/progress="completed"
+inconsistency (prior loop's clean-exit marker), auto-repaired to
+`in_progress`, then clean.
+
+In-flight: none. Both private-lane arm servers (port 5582) stopped by
+the script's own EXIT trap; verified via `pgrep -af "goopg.*5582"` (no
+match). Scratch output files (`analysis/leftdeep-joins/m0141-s2b6-resume-
+2026-09-18{,b}.{txt,plans.txt}`) deleted after their content was folded
+into the design doc — same precedent as S2b-5/S2b-6's own scratch
+probes. `tmp/goopg-audit-arm-tpch-data` (the private clone, ~2GB) left in
+place under `tmp/` (gitignored) for reuse by a future arm run, matching
+the private-clone lane's own reuse convention. Verified only the
+legitimate shared `goopg-ref-tpch.scope` (`:65433`) remains running;
+`lineitem` row count re-checked unchanged (6001255) after both arms.
+No shared cluster (`:65432`/`:65433`/`:65437`/`:65438`) was started,
+stopped, reset, or written beyond `pg_basebackup -X fetch` (source, never
+its destination) and read-only `SELECT`/`EXPLAIN`.
