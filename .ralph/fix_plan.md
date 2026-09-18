@@ -2929,6 +2929,24 @@ setting that yields a serial plan.
   claim set. Needs its own scoping pass first (exclusive-claim
   semantics for a non-partial branch under the same Gather; how the
   leaf claim sets and `attachAll` express a whole-claimed branch).
+  - 2026-09-19 — scoping pass committed:
+    `docs/design/0100-0149/m0140-0006c-3-mixed-partial-setop-append.md`.
+    PG mechanics pinned end-to-end (per-child pick `allpaths.c:1412-1453`,
+    mixed arm `:1594-1627`, `first_partial_path` ordering
+    `pathnode.c:1343-1365`, `cost_append` mixed arm + LPT
+    `append_nonpartial_cost` `costsize.c:2168-2243,2342-2403`, executor
+    `pa_finished` exclusive claim `nodeAppend.c`). Per-file gap map:
+    `addPartialSetOpPath` per-branch pick + `SetOpPartialMask`-style
+    marker; `*SetOp` node partialness flags; `stampParallelScan`/`drivingScan`
+    marker-aware (claimed-whole branch unstamped); leaf claim set gains
+    `claimedWhole atomic.Bool` wired by `attachAll`; `*setOp.nextStreaming`
+    CAS-claims before draining. Rows override: when the pure arm also
+    fires, the mixed path takes its `Rows` (`pathnode.c:1417-1419`).
+    Shared-hash prebuild under a claimed-whole branch stays correct
+    (leader builds, sole claimer probes); `prebuildBitmap` decision is
+    the one open question (wasted leader prebuild vs gate exclusion).
+    Impl commits remain HOLD-blocked (`data.HOLD` re-imposed
+    2026-09-18T22:52 — unclean `:65433` shutdown, owner inspect).
 
 ## M0141 — Upper-planner ordering contest (filed 2026-09-14)
 
