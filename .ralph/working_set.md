@@ -1,80 +1,98 @@
-Task: M0141-S2a-fix2r — re-apply the PG-faithful `hashAggEntrySize` currency
-correction (owner Q4: no reverts). DONE and committed this loop
-(`ef5f26a46` code, `65ffbd20f` docs/fix_plan). Banner item 2 is now
-exhausted — **NEXT LOOP should re-read the banner and move to item 3**:
-"Roll out fix1's success": select **M0141-S2a-fix1-sweep-a** first (the
-ORDERED-upper-rel Sort narrowing site fix1-sweep filed, `Parent:
-M0141-S2a-fix1-sweep`, named witness TPC-H Q18's 1.5M-row Sort), or
-**M0141-S2a-fix1-sweep-b** (WINDOW's internal sort costing) — both are
-`[ ]` and selectable; the banner text says fix1-sweep's own filed children,
-then M0141-S2b-6-resume, then M0139-0007c. Confirm by re-reading
-`.ralph/fix_plan.md`'s `## Current Priority` banner first (S1 precedence)
-and re-check whether a concurrent loop already filed/took one of the two
-sweep-children.
+Task: M0141-S2a-fix1-sweep-a — narrow the ORDERED upper rel's Sort cost
+inputs (NCols/AvgVarBytes). DONE and committed this loop (`46102b5d6` code,
+`c63ed6eb2` docs/fix_plan). Banner item 3 ("Roll out fix1's success") still
+has **M0141-S2a-fix1-sweep-b** open (`[ ]`, selectable) — WINDOW's internal
+sort costing, same shape as sweep-a but for `windowsetoppaths.go`'s
+`costWindow`/`addWindowPaths`/`sizeWindowRelFromNode`. **NEXT LOOP should
+re-read the banner first** (S1 precedence) — if it still names item 3's
+order as "fix1-sweep's own filed children, then M0141-S2b-6-resume, then
+M0139-0007c", select sweep-b next; otherwise follow whatever the banner
+says.
 
-Files: `internal/optimizer/cost_funcs.go` (`costAgg`'s spill-arm guard
-`inAvgVarBytes > 0` -> `inNcols > 0 || inAvgVarBytes > 0`, width argument
-bare `inAvgVarBytes` -> `hashsize.EntryBytes(inNcols, inAvgVarBytes)` on
-both `hashAggEntrySize` and the `pages` term, comments rewritten),
-`internal/optimizer/cost_funcs_test.go` (2 blind sentinels `(ncols,0)` ->
-`(0,0)`), `internal/optimizer/groupingpaths_test.go`
-(`TestCostAggHashedNeverChargesSpill` renamed+inverted to
-`TestCostAggHashedFixedWidthChargesSpill`, new
-`TestCostAggHashedUnknownWidthNeverChargesSpill`),
-`internal/optimizer/partialaggpaths_test.go` (row range 10M->3M).
-Design doc: `docs/design/0100-0149/m0141-s2a-fix2r-hashaggentrysize-currency-reapply.md`
-(new). `docs/design/README.md` (new index row + fix2's row annotated
-"superseded"). `.ralph/fix_plan.md` (task ticked `[x]`).
-`analysis/m0141/m0141-s2a-fix2r-{before,after}.{txt,plans.txt,pg.plans.txt}`
-(6 new committed artefacts).
+Files: new `internal/optimizer/ordered_input_narrow.go`
+(`finalSelectOutputNames`, `deriveOrderedSortInputKeep`,
+`narrowOrderedRelWidths`). `internal/optimizer/planner.go` (new
+`orderedNarrowKeep` computation right after ORDER BY keys resolve, guarded
+`selectSrfPending == nil`; threaded into both `createOrderedPaths` and
+`electOrderedGrouping` calls; the other 2 `createOrderedPaths` call sites —
+`wrapSetOpSortLimit`, `wrapMinMaxOrderByDistinct` — pass `nil`).
+`internal/optimizer/upperordered.go` (`createOrderedPaths` gained trailing
+`narrowKeep []int` param, calls `narrowOrderedRelWidths` after
+`sizeUpperRelFromNode`). `internal/optimizer/upperorderedgrouping.go`
+(`electOrderedGrouping` gained the same param, same call — sibling site,
+found only after measurement showed TPC-H Q18 never reaches
+`createOrderedPaths` at all). ~16 test call sites across
+`upperordered_test.go`/`cost_sort_bound_test.go`/
+`incrementalsortpaths_test.go`/`sort_pgrelationbytes_test.go`/
+`upperordereddistinct_test.go` updated to pass `nil`. Design doc:
+`docs/design/0100-0149/m0141-s2a-fix1-sweep-a-ordered-sort-width-currency.md`
+(new, full root-cause writeup). `docs/design/README.md` (new index row).
+`.ralph/fix_plan.md` (task ticked `[x]` with DONE sub-bullet).
+`analysis/leftdeep-joins/m0141-s2a-fix1-sweep-a-{before,after}.{txt,
+plans.txt,pg.plans.txt}` (6 new committed artefacts).
 
-Key symbols: `costAgg` (cost_funcs.go:507), `hashAggEntrySize`,
-`hashsize.EntryBytes`. Tools:
-`scripts/tpch-acceptance-arm.sh`/`scripts/tpch-estimate-audit-arm.sh`
-(private-worktree-baseline-binary-vs-working-tree-binary A/B, the same
-method P0-H12 used last loop), `scripts/pg-plan-parity-diff.py`,
+Key symbols: `sizeUpperRelFromNode` (`upperrel.go:178`), `createOrderedPaths`
+(`upperordered.go:64`), `electOrderedGrouping` (`upperorderedgrouping.go:178`,
+its own `sizeUpperRelFromNode(ordered, agg.node)` call at line ~219 is the
+sibling this loop also fixed). Tools used:
+`scripts/tpch-acceptance-arm.sh` (values A/B, `ACCEPT_BASELINE=`),
+`scripts/tpch-estimate-audit-arm.sh PLAN_ONLY=1 --ref-port 65432
+REFERENCE=` (shape capture — note the committed default REFERENCE file
+`analysis/leftdeep-joins/2026-08-05-p56giii-parity.pg.plans.txt` no longer
+exists; always pass `REFERENCE=` with `--ref-port` or the script exits rc=2),
 `docs/design/not_ralph/plan_parity_fix_take2/methodology/shape-delta.sh`,
-`scripts/tpcds-sf025-regression.sh sweep`.
+`scripts/pg-plan-parity-diff.py`, `scripts/tpcds-sf025-regression.sh sweep`.
 
-Finding: this is the SAME diff M0141-S2a-fix2 measured net-neutral-to-
-regressing on 2026-09-15 and reverted — but re-measured on TODAY's baseline
-(fix1 + fix1-sweep + other M0141 work has landed on top of the guard since)
-it is a CLEAN WIN: TPC-H MATCH 7->8 (Q3 flips to MATCH), Q8 loses a tag
-(its bushy spine now matches PG's own bushy choice for Q8), no category
-rose anywhere. TPC-DS SF0.25: zero plan-shape change across all 99 queries
-(Q31's old regression does not reproduce today). No query worsened in
-either corpus, so per the task's own instruction ("file every query whose
-categories worsen") **no `Parent: M0141-S2a-fix2r` follow-up was filed** —
-there was nothing to file. Values confirmed byte-identical via
-`tpch-acceptance-arm.sh`'s before/after digest diff (24/24 labels PASS).
-Lesson for future re-applies of a previously-reverted change: always
-re-measure on the CURRENT baseline before assuming the historical
-measurement still holds — corpus drift can flip a net-neutral result into a
-clean win (or the reverse) with zero code difference from the original
-attempt.
+Finding: **confirmed zero-movement result, root-caused not just measured.**
+TPC-H `shape-delta.sh`: `queries=22 text-changed=0 shape-changed=0` — this
+held BEFORE discovering the `electOrderedGrouping` sibling gap too, meaning
+the mechanism is genuinely inert for this corpus, not merely declining
+silently (values gate proves the narrowing logic itself fires correctly —
+if `finalSelectOutputNames`/`deriveOrderedSortInputKeep` had a bug that
+always declined, that would ALSO show zero movement, so the root-cause
+step mattered). Root cause: a GROUP BY aggregate's own published row
+(goopg's `Aggregate` node, mirroring PG's `Agg`) already equals the
+minimal SELECT-list width by construction — there is no hidden extra width
+for this keep-set (sort keys ∪ final SELECT list) to trim away in either
+TPC-H's or TPC-DS SF0.25's actual `ORDER BY` shapes. TPC-H Q18 (recon's
+named witness) is itself exactly this shape. A REAL currency gap for this
+site would need a plain (non-aggregate) `ORDER BY` over a join/scan tree
+wider than the SELECT list — neither corpus happens to hit that shape at a
+cost-visible scale. Lesson for a future site-narrowing task: check whether
+the motivating witness query is a GROUP BY shape BEFORE assuming
+`createOrderedPaths` (not `electOrderedGrouping`) is the only site to fix —
+this task's own recon missed the sibling because M0141-S2b's
+`electOrderedGrouping` loop was filed and landed AFTER the fix1-sweep recon
+that named Site A.
 
 Gates run: `go build ./...` clean. `go test ./internal/optimizer/...` PASS
-(full package). `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=34 canonical,
-gate-stamp PASS against staged code). `scripts/tpch-acceptance-arm.sh`
-before/after digest diff: VERDICT PASS. `scripts/tpcds-sf025-regression.sh
+(full package). `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=34, gate-stamp
+PASS against staged code — required TWO runs: the first stamp was for the
+pre-stage tree hash and the commit-msg hook rejected it, so gates must be
+re-run AFTER `git add`, not before). `scripts/tpch-acceptance-arm.sh`
+before/after digest diff: VERDICT PASS, 24/24 labels (also required a
+staged-tree re-run for the commit-hook's PASS-required check — a
+`NO-COMPARE` stamp, from running the script without `ACCEPT_BASELINE`,
+does NOT satisfy the hook; it needs `ACCEPT_BASELINE=<HEAD-binary-arm-output>`
+against the current tree's own build). `scripts/tpcds-sf025-regression.sh
 sweep`: PASS (MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0, plan-shape
-changed=0). `pg-plan-parity-diff.py` (TPC-H, same-PG-reference control):
-MATCH 7->8, documented above. `make ea-ratchet`: N/A — reasoned in the
-design doc (costing change, no row-estimate/selectivity path touched).
-Pre-commit hook's pgbench smoke: PASS x2 (one per commit). `make
-ralph-state-guard`: same self-repairing status/progress mismatch pattern as
-the prior three loops (prior loop's clean-exit "completed" marker read as
-stale by this loop's start); self-repaired to "in_progress", clean on
-re-check.
+changed=0), re-run once against staged tree. `pg-plan-parity-diff.py`
+(TPC-H, same-PG-reference control): `match=7` identical before/after,
+`CATEGORIES-EXCL-MATCH` identical digit-for-digit. Pre-commit hook's
+pgbench smoke: PASS x2 (one per commit). `make ralph-state-guard`: same
+self-repairing status/progress mismatch pattern as prior loops (prior
+loop's clean-exit "completed" marker read as stale); self-repaired to
+"in_progress", clean on re-check.
 
-In-flight: none. Detached worktree `/tmp/wt-fix2r-baseline` (built the
-pre-change baseline binary at HEAD `683663605`) was created and removed
-this loop (`git worktree remove --force`, confirmed via `git worktree
-list`). All private-port servers (5582, 5583 — TPC-H estimate-audit and
-acceptance arms) were stopped by their own scripts' EXIT traps; verified
-only the legitimate shared `:65433` reference server remains running
-(`systemctl --user list-units 'goopg-*'`). All temp binaries/output files
-under `/tmp/` (baseline/after goopg binaries, estimate-audit binary, arm
-digest files) removed after use. No shared cluster
-(`:65432`/`:65433`/`:65437`/`:65438`) was started, stopped, reset, or
-written beyond read-only `pg_basebackup`/`SELECT`/`EXPLAIN`.
+In-flight: none. Two detached worktrees this loop created
+(`/tmp/wt-sweepa-baseline` for the initial A/B measurement,
+`/tmp/wt-sweepa-gate` for the post-stage gate-stamp re-run — both built the
+pre-change baseline binary at HEAD `6f7acae46`) were removed via `git
+worktree remove --force`, confirmed via `git worktree list`. All
+private-port servers (5582/5583 across 5 separate arm invocations this
+loop) were stopped by their own scripts' EXIT traps; verified only the
+legitimate shared `:65433` reference server remains running (`systemctl
+--user list-units 'goopg-*'`). All temp binaries/output files under `/tmp/`
+removed after use. No shared cluster (`:65432`/`:65433`/`:65437`/`:65438`)
+was started, stopped, reset, or written beyond read-only
+`pg_basebackup`/`SELECT`/`EXPLAIN`.
