@@ -1,84 +1,83 @@
-Task: M0141-S2b-6-resume — repeat S2b-6's Hashed-vs-Sorted `PathAgg`
-term-by-term cost diff against the real HammerDB SF1-loaded `:65433`
-cluster (gate cleared by P0-E6/P0-E7). DONE and committed this loop.
-**NEXT LOOP should re-read the banner first** (S1 precedence) — banner
-item 3's own ordering is: fix1-sweep's filed children (done),
-M0141-S2b-6-resume (done this loop), then **M0139-0007c**. Select
-M0139-0007c next unless the banner has changed. A new follow-up,
-**M0141-S2b-10** (`Kind: recon`, root-cause `costAgg`'s Hashed-vs-Sorted
-formula gap for TPC-H Q4/Q12), was also filed under the same M0141-S2b
-lineage but is NOT itself the banner's next pick — it only becomes
-selectable once/if the banner's own ordering reaches it.
+Task: M0139-0007c — port `get_expr_width` for Memoize's cache-key width term
+(the deferral M0139-0007b filed). DONE and committed this loop
+(`6faa73776`). Banner item 3's whole chain (fix1-sweep → sweep-a → sweep-b →
+M0141-S2b-6-resume → M0139-0007c) is now fully closed.
 
-Files: `internal/optimizer/pathtrace.go` (new
-`traceOrderedGroupingCandidate`/`traceOrderedSortedCandidate`, both
-`pathTraceEnabled`-gated). `internal/optimizer/upperordered.go`
-(`addOrderedPaths` calls both, gated `input.Kind == PathAgg`). Design doc:
-`docs/design/0100-0149/m0141-s2b-6-resume-hashed-vs-sorted-real-sf1.md`
-(new — the parent `m0141-s2b-scoping-decomposition.md` is frozen at 977
-lines under D3.1, so this is a fresh file, NOT an appended section;
-do not append to the parent doc without splitting it first).
-`docs/design/README.md` (new index row). `.ralph/fix_plan.md`
-(M0141-S2b-6-resume ticked `[x]`; new task M0141-S2b-10 filed).
+**NEXT LOOP should re-read the banner first** (S1 precedence). Banner items
+0 (P0, P0-E7 closed 2026-09-18d), 1 (no new selectable regression — P0-H11
+is `[!]`-equivalent blocked on the owner, P0-H12 done), 2
+(M0141-S2a-fix2r, done) and 3 (this loop) are all exhausted. **Item 4,
+M0141-S7 ("cost diagnosis only"), is next** — `.ralph/fix_plan.md:3587`
+`M0141-S7 — re-adjudicate and implement Incremental Sort` is `[ ]` and
+selectable. Read that item's banner text carefully before starting: it caps
+scope hard — "No production-code change under this item — not even a trace
+inside an existing trace guard. If instrumentation is genuinely needed, file
+a separate `Kind: impl` task, run the values gates and report the parity
+numbers (this is what `073ab2748`/`c7e231ae1` got wrong)." Also read
+`docs/design/0100-0149/m0141-s7-*.md` (the eight split-out docs from P0-D3)
+before touching it — do not re-read the frozen 226-line parent wholesale.
 
-Key symbols: `electOrderedGrouping`/`addOrderedPaths`
-(`upperorderedgrouping.go`/`upperordered.go`) — the Hashed-vs-Sorted
-`PathAgg` election site. `traceOrderedGroupingCandidate`/
-`traceOrderedSortedCandidate` (new, `pathtrace.go`) — DPPATH lines keyed
-by `AggStrategy` instead of inferred from `contained`. `costAgg`
-(`cost_funcs.go`) — NOT yet term-by-term diffed against PG's `cost_agg`;
-that is M0141-S2b-10's job.
+Files this loop: `internal/optimizer/joinpathsmemoize.go` (new
+`memoizeKeyWidths`, `costMemoizeRescan` gained a `keyWidth float64` param).
+`internal/optimizer/joinpathsmemoize_test.go`,
+`memoize_pgentrybytes_test.go` (two new tests, five pre-existing
+`costMemoizeRescan` call sites updated). Design doc:
+`docs/design/0100-0149/m0139-0007c-memoize-key-width-absorption.md` (new,
+indexed in `docs/design/README.md`). `.ralph/fix_plan.md` (M0139-0007c
+ticked `[x]`).
 
-Finding: S2b-6's synthetic-dataset tie does NOT survive real SF1 data —
-all four of Q4/Q5/Q12/Q21 are real, non-tied margins. Q5/Q21 reconfirm
-"no cost bug" (their ORDER BY never matches GROUP BY). Q4/Q12 are a
-**confirmed real cost-model divergence from PG**: goopg elects
-Hashed+Sort (899.76/2181.96-unit margins), a **fresh** live `EXPLAIN` on
-the read-only `:65432` PG reference elects the mirror-image Sorted shape
-for both. Tested and ruled out the R113 `GOOPG_PG_SORT_RELATION_BYTES_COST`
-Sort-byte-size-currency GUC as the cause (env-toggle-only experiment,
-`currency=pg` confirmed active, election and margin both unchanged) — the
-real cause is unconfirmed, most likely `costAgg`'s `AggStrategyHashed`
-formula, filed as M0141-S2b-10 for a future loop.
+Key symbols: `memoizeKeyWidths` (new, mirrors `memoizeKeyNDistinct`'s loop
+over `innerPath.IndexClauses`) — reads `ColumnStats.AvgWidth` via
+`examineJoinVar`, falls back to `typeWidth(cr.Type)`. `costMemoizeRescan`'s
+`perKeyBytes` selection (only uses the ported `keyWidth` when
+`pgMemoizeEntryBytesCostEnabled()` AND `pgRelationByteSize` succeeded — same
+gate as the tuple-bytes term beside it).
 
-Naming trap hit and fixed this loop: filed the follow-up as
-`M0141-S2b-8` initially without checking for collisions — `M0141-S2b-8`
-and `-9` were ALREADY taken by an unrelated TPC-DS Incremental-Sort
-candidate-pool line of work (`M0141-S7-cd-q64-reclassify`/
-`M0141-S7-cd-candidatepool`, both landed 2026-09-18 same day). Caught via
-`grep -oE "M0141-S2b-[0-9a-z]+" .ralph/fix_plan.md | sort -u` before
-committing; renamed to `M0141-S2b-10` in all three touched files
-(fix_plan.md, README.md, the new design doc). **Always run that grep
-before naming a new sub-task under a deeply-forked lineage id** — two
-sibling investigations under the same parent milestone can independently
-reach for the "next" number on the same day.
+Finding: the port is real (cited PG `get_expr_width`, `costsize.c:6404`) but
+inert by construction — `GOOPG_PG_MEMOIZE_ENTRY_BYTES_COST` stays
+default-off (M0139-0007b's HOLD, unchanged), so no plan can move from this
+commit. Confirmed via `TestCostMemoizeRescanPGEntryBytesSwitchOffIsLegacy`
+(unmodified, still passes) and the acceptance-arm/sf025 gates below (both
+byte-identical to HEAD). Does NOT reopen 0007b's HOLD decision.
 
-Gates run: `go build ./...` clean. `go test ./internal/optimizer/...`
-PASS (full package, no `-count=1`). `scripts/tpch-estimate-audit-arm.sh`
-x2 (baseline PGSHAPED=1 arm + GOOPG_PG_SORT_RELATION_BYTES_COST=1 arm),
-both rc=0, served-binary sha256 verified, private port 5582, online
-`pg_basebackup -X fetch` clone off live `:65433` (never stopped).
-`scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=34), staged-tree gate stamp
-PASS. `scripts/tpcds-sf025-regression.sh sweep` PASS=96 MISMATCH=0
-CKMISMATCH=0 ERROR=0 TIMEOUT=0, `PLAN-SHAPE: queries=99 same=99
-changed=0` (confirms zero plan movement — trace-only change), staged-tree
-gate stamp PASS. `python3 scripts/ralph_protected_regions.py
-check-designdocs` exit 0. `python3 scripts/ralph-lineage-guard.py` clean
-(after the Movement:none fix and the S2b-10 rename above).
-`make ralph-state-guard`: found status="running"/progress="completed"
-inconsistency (prior loop's clean-exit marker), auto-repaired to
-`in_progress`, then clean.
+Gates run: `go build ./...` clean. `go vet ./internal/optimizer/...` clean.
+`go test ./internal/optimizer/...` PASS (full package, no `-count=1`;
+includes the two new tests). `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=34)
+against the staged tree. `scripts/tpcds-sf025-regression.sh sweep` PASS=96
+MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0, PLAN-SHAPE queries=99 same=99
+changed=0, against the staged tree. `scripts/tpch-acceptance-arm.sh`
+PGSHAPED=1 baseline (HEAD `459e4e30d`, built via a `git stash`/`stash pop`
+round-trip of just the three touched `.go` files, private port 5583) vs
+this staged tree: VERDICT PASS, 24/24 labels MATCH. All three gate stamps
+(`tmp/gate-stamps/{tpch-spotcheck,tpcds-sf025,tpch-acceptance-arm}.json`)
+verified `code_tree` == `sha256(git ls-files -s -- internal cmd go.mod
+go.sum)` of the committed index (`a0ede9c4f8…`) before committing — this is
+now a hard `commit-msg` hook requirement (G2) for any `internal/optimizer/`
+change, not optional; the commit body carries the required
+`CATEGORIES-EXCL-MATCH:`/`PARITY: N/A —` lines. `python3
+scripts/ralph_protected_regions.py check-designdocs` exit 0. `python3
+scripts/ralph-lineage-guard.py` clean (after moving a mid-sentence
+`Parent:` field onto its own line — the guard rejects a field buried inside
+a prose line even when `Kind:`/`Parent:` both appear, per S3). `make
+ralph-state-guard`: found the same status="running"/progress="completed"
+inconsistency the last two loops also hit (prior loop's clean-exit marker),
+auto-repaired to `in_progress`, then clean.
 
-In-flight: none. Both private-lane arm servers (port 5582) stopped by
-the script's own EXIT trap; verified via `pgrep -af "goopg.*5582"` (no
-match). Scratch output files (`analysis/leftdeep-joins/m0141-s2b6-resume-
-2026-09-18{,b}.{txt,plans.txt}`) deleted after their content was folded
-into the design doc — same precedent as S2b-5/S2b-6's own scratch
-probes. `tmp/goopg-audit-arm-tpch-data` (the private clone, ~2GB) left in
-place under `tmp/` (gitignored) for reuse by a future arm run, matching
-the private-clone lane's own reuse convention. Verified only the
-legitimate shared `goopg-ref-tpch.scope` (`:65433`) remains running;
-`lineitem` row count re-checked unchanged (6001255) after both arms.
-No shared cluster (`:65432`/`:65433`/`:65437`/`:65438`) was started,
-stopped, reset, or written beyond `pg_basebackup -X fetch` (source, never
-its destination) and read-only `SELECT`/`EXPLAIN`.
+Learning for next loop: **any commit touching `internal/optimizer/`,
+`internal/executor/`, `internal/planner/`, or a `*cost*/*stat*/*selfuncs*`
+path now requires a FRESH `tpch-acceptance-arm` PASS stamp matching the
+staged tree**, not just `tpch-spotcheck` + `tpcds-sf025` — budget ~15-20 min
+of wall clock for the two-arm baseline/mine acceptance-arm round-trip
+(build + 22-query digest run twice) in addition to the sf025 sweep (~5 min)
+and spotcheck (~1 min). The `git stash push -- <the changed .go files>` /
+build baseline / `git stash pop` / re-`git add` / build+diff-mine pattern
+used this loop is the clean way to get a same-binary-family A/B without a
+worktree.
+
+In-flight: none. Both private-lane arm binaries/runners (port 5583,
+`tmp/goopg-acceptance-{baseline,mine}-bin` and their runner counterparts)
+and the two `/tmp/arm-m0139-0007c-*.txt` digest files deleted after the
+diff; port 5583 verified free (`ss -ltnp`) before finishing. No shared
+cluster (`:65432`/`:65433`/`:65437`/`:65438`) was started, stopped, reset,
+or written beyond the online `pg_basebackup -X fetch` clone source reads the
+private-clone scripts already do.
