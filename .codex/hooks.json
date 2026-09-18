@@ -1,0 +1,28 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "ROOT=$(git rev-parse --show-toplevel 2>/dev/null || pwd); \"$ROOT/scripts/ralph-bash-guard.sh\"",
+            "timeout": 10,
+            "statusMessage": "Running Ralph bash guard"
+          }
+        ]
+      },
+      {
+        "matcher": "apply_patch",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "ROOT=$(git rev-parse --show-toplevel 2>/dev/null || pwd); \"$ROOT/scripts/ralph-file-guard.sh\"",
+            "timeout": 10,
+            "statusMessage": "Running Ralph file guard"
+          }
+        ]
+      }
+    ]
+  }
+}

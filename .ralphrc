@@ -69,3 +69,22 @@ CLAUDE_AUTO_UPDATE=true
 # .ralph/PROMPT.md and analysis/ralph-loop-kaizen/practice-cards/bg_task_guard.py.
 export BASH_DEFAULT_TIMEOUT_MS=900000    # 15 min default per Bash call
 export BASH_MAX_TIMEOUT_MS=3600000       # 60 min ceiling (race-gate + spotcheck)
+
+# Agent backend for the Ralph loop: claude (default), opencode, or codex.
+# Non-default backends reuse the core loop via adapters in ralph_loop.sh
+# (build_agent_command + normalize_agent_output). Environment variable
+# AGENT_BACKEND overrides this file.
+AGENT_BACKEND="claude"
+
+# OpenCode backend settings (used only when AGENT_BACKEND=opencode).
+# Model in provider/model format; empty = CLI default.
+#OPENCODE_MODEL=""
+# Auto-approve permissions not explicitly denied (required for unattended
+# loops; dangerous - keep the permission policy in opencode.json tight).
+#OPENCODE_AUTO=true
+
+# Codex backend settings (used only when AGENT_BACKEND=codex).
+# Model override; empty = CLI default.
+#CODEX_MODEL=""
+# Sandbox mode: read-only | workspace-write | danger-full-access.
+#CODEX_SANDBOX="workspace-write"

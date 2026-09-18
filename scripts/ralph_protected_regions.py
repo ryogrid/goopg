@@ -65,6 +65,8 @@ HARNESS_SUFFIXES = (
     "scripts/ralph_protected_regions.py",
     "scripts/ralph-githooks-test.sh",
     ".claude/settings.json",
+    ".codex/hooks.json",
+    ".codex/config.toml",
     ".ralph/PROMPT.md",
     ".ralph/gate-exceptions.md",
     "scripts/ref-clusters-ensure.sh",

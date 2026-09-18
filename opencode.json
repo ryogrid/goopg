@@ -1,7 +1,8 @@
 {
   "$schema": "https://opencode.ai/config.json",
   "plugin": [
-    "./.opencode/plugins/no-background-shell.ts"
+    "./.opencode/plugins/no-background-shell.ts",
+    "./.opencode/plugins/ralph-guards.ts"
   ],
   "provider": {
     "bai": {
