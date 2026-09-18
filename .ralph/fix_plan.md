@@ -3679,7 +3679,7 @@ spill route is net-negative.
     scripts/ralph-lineage-guard.py` clean. No shared cluster write
     (`pg_basebackup` clone + read-only
     `EXPLAIN` only).
-  - [ ] **M0141-S2b-10** — root-cause `costAgg`'s Hashed-vs-Sorted formula
+  - [x] **M0141-S2b-10** — root-cause `costAgg`'s Hashed-vs-Sorted formula
     Kind: recon
     Parent: M0141-S2b-6-resume. Filed 2026-09-18 by M0141-S2b-6-resume's
     result: for TPC-H Q4/Q12 (GROUP BY key == ORDER BY key, low output
@@ -3706,6 +3706,77 @@ spill route is net-negative.
     not land a formula change without a term-by-term match against
     `costsize.c`, consistent with every other M0141-S2a fix in this
     lineage.
+    **DONE 2026-09-18.** Movement: none (recon only; no production file
+    touched). `costAgg`/`costSortRunWithWidth` are NOT the bug: verified
+    term-by-term against `cost_agg`/`cost_sort` (`costsize.c`), and proved
+    live by forcing PG's own discarded `HashAggregate` alternative into the
+    open (`SET enable_sort = off`, a per-session GUC toggle, not DDL/DML,
+    against the read-only `:65432` reference) — PG's OWN formula ALSO
+    prices Hashed cheaper for both Q4 (190077.61 vs 190990.46, -0.48%) and
+    Q12 (326458.53 vs 328634.21, -0.66%). goopg's Hashed-wins arithmetic
+    agrees with PG's; there is no formula to fix. **Real cause**: both
+    margins sit inside PG's `STD_FUZZ_FACTOR` (1.01) — a mechanism goopg
+    already ports faithfully (`path.go:27`'s `stdFuzzFactor`, feeding
+    `addPath`'s dominance/tie-break, matching `add_path`'s documented
+    "keep the first of two indistinguishable paths" rule). Live trace
+    confirms the mechanism: Sorted's `upper.ordered.input` entry is
+    `verdict=dominated` after Hashed's `upper.ordered.sort` was already
+    `accepted` — both end up with IDENTICAL pathkeys (both satisfy the
+    query's ORDER BY) and fuzzily-tied cost (0.17% apart), so `addPath`'s
+    tie-break falls to pure insertion order. `internal/optimizer/
+    groupingpaths.go`'s `addGroupingPaths` — despite its own doc comment
+    claiming fidelity to `add_paths_to_grouping_rel` (`planner.c:7113`) —
+    adds the HASHED candidate (`groupingpaths.go:406`) BEFORE the SORTED
+    candidate (`:463`/`:475`), the exact opposite of real PG's
+    `can_sort`-before-`can_hash` order (`planner.c:7128` vs `:7286`, read
+    directly and confirmed). This single order inversion, combined with
+    both engines' identical fuzzy-tie-break-by-insertion-order rule, is
+    sufficient on its own to flip the election whenever the two candidates
+    are within 1% of each other — exactly Q4/Q12's situation. Q5/Q21 are
+    unaffected (`contained=false` for their Sorted candidate too, so the
+    pathkeys-equal coincidence never arises). Measured via the same
+    private-clone `tpch-estimate-audit-arm.sh` methodology (online
+    `pg_basebackup -X fetch` off live `:65433`, never stopped) plus
+    read-only `EXPLAIN`/session-GUC against `:65432`. Design doc:
+    `docs/design/0100-0149/m0141-s2b10-hashagg-sortagg-insertion-order.md`
+    (new; `docs/design/README.md` new index row). No `go build`/`go test`
+    gate needed (no `.go` file touched this loop). Follow-up implementation
+    task filed as **M0141-S2b-11** below (`Kind: impl`,
+    `Parent: M0141-S2b-10`). No ledger row (recon->impl handoff via the
+    task's own `Kind`/`Parent` fields, same precedent as
+    `M0141-S2b-6-resume`).
+  - [ ] **M0141-S2b-11** — reorder `addGroupingPaths` to match PG's
+    Kind: impl
+    Parent: M0141-S2b-10. `internal/optimizer/groupingpaths.go`'s
+    `addGroupingPaths` currently emits the HASHED `PathAgg` candidate
+    (the `if groupingHashable(...) { addPath(grouped, ...AggStrategyHashed...) }`
+    block, `groupingpaths.go:406-431`) before the SORTED candidate (the
+    `if aggNode.GroupingSets == nil { ... }` block, `:441-495`, covering
+    both the index-ordered and explicit-`sortPathForBounded` variants).
+    Real PG's `add_paths_to_grouping_rel` (`postgres/src/backend/
+    optimizer/plan/planner.c:7113`) emits its `can_sort` block
+    (Sorted/Plain, lines 7128-7264) BEFORE its `can_hash` block (Hashed,
+    lines 7286-7315). Since `addPath`'s tie-break on a fuzzy-cost/
+    equal-pathkeys collision keeps whichever candidate was inserted FIRST
+    (both engines share this rule, `M0141-S2b-10`'s design doc "Result 3"),
+    reorder `addGroupingPaths` to emit the SORTED block first and the
+    HASHED block second, mirroring PG exactly. This is a pure block
+    reorder — no cost arithmetic changes. **Required gates (this is a
+    planner-election change, not cost-neutral by construction — expect
+    TPC-H Q4/Q12 to flip to Sorted, matching PG)**: `scripts/
+    tpch-spotcheck.sh` (Q12=2/Q13=34 canonical, per the executor/planner
+    practice card), `scripts/tpcds-sf025-regression.sh sweep` (row counts
+    AND plan-shape diff — any OTHER query flipping besides Q4/Q12 must be
+    individually cross-checked against a fresh PG `EXPLAIN`, same method
+    as the parent recon's Result 2, not assumed correct just because it
+    changed), `scripts/tpch-acceptance-arm.sh` before/after digest (any
+    non-MATCH label besides the known Q9 timeout needs its own row-count
+    check), `go test ./internal/optimizer/...` (no `-count=1`),
+    `python3 scripts/ralph_protected_regions.py check-designdocs`. Update
+    this design doc's own "Conclusion" §4 risk note with the actual
+    sweep result once run — do not just report PASS/FAIL, name which
+    queries' plan shapes moved and whether each one is now closer to or
+    further from PG.
   - [x] **M0141-S2b-7** — filed 2026-09-17 by M0141-S7's corpus measurement
     (design doc's "Update 2026-09-17h"). `electOrderedGrouping`
     (`upperorderedgrouping.go:236`) calls `addOrderedPaths` directly, once
