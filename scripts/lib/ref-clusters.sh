@@ -110,9 +110,19 @@ ref_cluster_start() {
         [[ -f "${RC_DATA}/pg_hba.conf" ]] && hba=(--hba "${RC_DATA}/pg_hba.conf")
         (
             # Runtime env the lifecycle env files export (bench/tpch/env_goopg.sh,
-            # bench/tpcds/env_tpcds.sh — identical defaults).
-            export GOMEMLIMIT="${GOMEMLIMIT:-12GiB}" GOGC="${GOGC:-off}"
+            # bench/tpcds/env_tpcds.sh) — same GOMEMLIMIT/ANALYZE_SEED defaults.
+            # GOGC defaults to 100 here (the env files use `off`): ref lanes are
+            # long-lived and mostly idle, so GC must be allowed to shrink the
+            # heap between queries instead of pinning it at the all-time peak —
+            # the standing ~10 GiB GOGC=off footprint of :65433 was a major
+            # contributor to the 2026-09-18 global OOM. Bench lanes keep
+            # GOGC=off for GC-CPU-free query timing; override per start via env.
+            export GOMEMLIMIT="${GOMEMLIMIT:-12GiB}" GOGC="${GOGC:-100}"
             export GOOPG_ANALYZE_SEED="${GOOPG_ANALYZE_SEED:-20260905}"
+            # Keep ref lanes OOM-neutral so that inside the shared
+            # goopg-workloads.slice the kernel prefers killing throwaway
+            # workloads (goopg-test-run.sh defaults them to +400) first.
+            export GOOPG_OOM_SCORE_ADJ="${GOOPG_OOM_SCORE_ADJ:-0}"
             export GOOPG_CG_UNIT="${RC_SCOPE}"
             systemctl --user reset-failed "${RC_SCOPE}.scope" >/dev/null 2>&1 || true
             setsid "${REF_REPO_ROOT}/scripts/goopg-test-run.sh" \
