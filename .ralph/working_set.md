@@ -1,80 +1,62 @@
-Task: M-NIGHTLY `race/internal/executor` (banner: P0-E6 still `[!]`
-owner-run; items 1-7 re-scanned, nothing selectable — M0143-0007b needs an
-owner decision, M0141-S2b-9/-8 explicitly blocked on banner item 4's
-"diagnosis only", M0142-0005a/M0139-0007c are implementation not recon,
-M0142-0003i needs P0-E6 — same fall-through as last 2 loops — to
-M-NIGHTLY). Re-confirmed NOT stale (real race, reproduces every run) and
-root-caused to an already-twice-ledgered defect; NOT fixed this loop (fix
-needs a signature change too big for one loop — scoped it instead).
-Committed.
+Task: P0-E7 — bulk re-measurement since 2026-09-16 05:44 (banner item 0,
+now selectable: P0-E4/E5/E6 all `[x]` as of 2026-09-18). PARTIAL this loop
+(task stays unchecked in fix_plan.md). Committed: 1cc61bb54.
 
-Files: `.ralph/fix_plan.md` (race/internal/executor entry: re-confirm note
-+ new nested sub-task `M-NIGHTLY-instrumentscope-race-fix` with a concrete
-mechanical fix plan), `docs/design/executor-ex0-03b-rows/DESIGN.md`
-(new "5. Erratum" section correcting B1's now-falsified "never racy"
-claim). No production code touched.
+Files: `.ralph/fix_plan.md` (P0-E7 progress note), `.ralph/deferral_ledger.md`
+(new row, task-id P0-E7), `docs/design/README.md` (new p0-e7 index row),
+`docs/design/0100-0149/p0-e7-bulk-re-measurement.md` (new — full writeup +
+the R1-safety correction to m0137-0003's baseline-capture doc),
+`analysis/m0137/p0e7-{goopg,pg}-{serial,parallel}.{txt,plans.txt}` (new
+capture artifacts). No production code touched.
 
-Key symbols: `instrumentScope`/`instrumentScopeMu`
-(`internal/executor/instrument.go:313`), `maybeInstrument` (`:444`, reads
-the global with NO lock), `buildUnderFreshScope`/`buildUnderNilScope`
-(`:350/:370`, write it WITH the lock), `gatherOp.buildChildForSlot`
-(`operators_gather.go:122`), `acquireSubPlanOp` (`subplan.go:302`, the
-lazy cross-goroutine reader via `Build(plan)`).
+Key symbols/tools: `cmd/estimate-audit/main.go` (`session.ensure` runs bare
+`ANALYZE <table>` on EVERY connection incl. the `-ref-port` one — this is
+why the old m0137-0003 direct-`:65432` recipe is now R1-unsafe),
+`scripts/lib/tpch-private-clone.sh` (`tpch_private_clone_snapshot`),
+`scripts/pg-plan-parity-diff.py`, `scripts/tpch-spotcheck.sh`,
+`scripts/tpcds-sf025-regression.sh`.
 
-Findings: race is real, reproduces in ~60s (not a 45m timeout hang), full
-log `tmp/race-internal-executor-20260918.log` (untracked, regenerate via
-`go test -race -timeout 45m ./internal/executor/`). It is the SAME defect
-as `.ralph/deferral_ledger.md`'s `take3-instrumentscope-datarace`
-(2026-09-06) and `e18-instrumentscope-global-races-coop-producers`
-(2026-09-07) — do NOT file a third ledger row, the ledger already has the
-diagnosis; what was missing was a concrete, sized fix_plan task, now
-filed. It is NOT ANALYZE-only: `buildChildForSlot` round-trips the global
-on every parallel worker spawn regardless of ANALYZE, so any ordinary
-parallel query with a concurrent lazily-built SubPlan can hit it. The
-"just widen the mutex to guard reads too" shortcut was considered and
-explicitly rejected again (per the ledger's own prior warning) — it would
-silence `-race` but not fix the real hazard (a lazy producer subtree
-adopting an unrelated sibling worker's live scope). Traced a concrete,
-narrower-than-"thread through Context" mechanical plan that needs ZERO
-changes to `Build`/`BuildWorker`'s ~200 external call sites (see the new
-fix_plan sub-task for the 3-step plan: `buildNode` gets an explicit
-`scope` parameter threaded through its ~33 internal call sites;
-`Build`/`BuildWorker` become nil-scope-only thin wrappers; a new
-unexported `buildScoped` serves the ~4 call sites that actually need
-ambient scope — `operators_explain.go`'s top-level build, the two
-`gatherOp`/`gatherMergeOp` `buildChild` closures, `operators_cte_dml.go`'s
-`buildUnderScope`). One open design question flagged but NOT resolved:
-whether a lazily-built SubPlan/EXISTS tree in a *serial* ANALYZE query
-should inherit the ambient scope (real PG does instrument SubPlan
-children) — needs a probe test before implementing, see the fix_plan
-task's "Open question" paragraph.
+Findings: values gates clean at HEAD (42a2002ff, same as owner's P0-E6
+validation commit 080323cbd — confirmed zero internal/cmd/go.mod/go.sum
+diff between them, so this loop's binary is behaviourally identical to the
+one P0-E6 already validated). `tpch-spotcheck` PASS Q12=2/Q13=34.
+`tpcds-sf025-regression sweep` PASS=96 MISMATCH=0 CKMISMATCH=0 ERROR=0
+TIMEOUT=0, plan-shapes 99/99 identical to prior sweep (e5046bc31). TPC-H
+plan-parity (estimate-audit -plan-only, private lane both sides — goopg via
+a private 55xx clone, PG via a SECOND invocation pointed straight at
+:65432 with -warm-stats=false so no ANALYZE ever runs against it) holds
+serial match=8/22, exactly the current floor and unchanged from 27d4ae001
+— **no regression found** across the 35 production commits landed since.
+Parallel arm match=3/22, recorded but not floor-comparable (tool's own
+documented caveat, still valid).
 
-Next step: next loop re-reads the banner fresh (P0-E6 still owner-run
-expected). If still nothing selectable in items 1-7, either (a) implement
-`M-NIGHTLY-instrumentscope-race-fix` (start with the "Open question" probe
-test — serial EXPLAIN ANALYZE + correlated EXISTS, observe today's actual
-per-node output — before touching `buildNode`'s signature), or (b)
-continue top-to-bottom through the M-NIGHTLY list past this item:
-`testport/TestPort_IsolationIntraGrantInplace`,
-`testport/TestPort_IsolationStats`,
-`testport/TestPort_LockRowsSortOverJoinTakesRowLock`,
-`testport/TestPort_PgDumpConnectionSetup`, `units/internal/parser`
-(likely same root cause as `parser/TestLockingClauseParity` — re-run both
-together first), `race/internal/parser`,
-`testport/TestPort_IsolationEvalPlanQual`, `testport/TestPort_IsolationSuite`
-(subtests specs/detach-partition-concurrently-1/tuplelock-upgrade-no-deadlock),
-`testport/TestPort_IsolationFkContention`, `testport/TestPort_IsolationFkDeadlock`,
-`testport/TestPort_UpdateLockedTuple`. Re-run each repro at HEAD first per
-the loop rule (some may be stale).
+Next step: pick up P0-E7's still-open sub-scope, in whichever order the
+banner still finds selectable:
+  (a) TPC-DS full-SF1 parity vs `:65438` (`match >= 2` floor) via
+      `scripts/capture-tpcds.sh` + `pg-plan-parity-diff.py` on a private
+      55xx clone of the SF1 data — budget ~4-5h per the sf025 script's own
+      header, so dedicate a whole loop's timeout to it rather than
+      starting it with little budget left.
+  (b) `scripts/tpch-acceptance-arm.sh` OFF/ON digest comparison + the
+      M0142-0008 chain A/B (`admitSemiAnti` on vs off) — this is also
+      csq-R2's reopen-condition evidence the owner is waiting on.
+  (c) Name each of the 35 production commits between 27d4ae001 and HEAD
+      with its own individual TPC-H values result (P0-E7's text asks for
+      per-commit naming, not just an aggregate before/after) — likely the
+      cheapest remaining piece, do this first if budget is short.
+  Re-read the banner first: if a genuine regression or higher-priority
+  item appears, follow the banner, not this list.
 
-Gates run: `go build ./...` clean (confirmed before AND after — no code
-changed). `go test -race -timeout 45m ./internal/executor/` FAIL (2 real
-races, expected/documented, not a new regression — this loop did not fix
-it). `make ralph-state-guard`: same benign status/progress mismatch as
-prior loops (previous loop's clean-exit completed-marker), self-repaired,
-consistent after repair. No TPC-H/sf025 gate needed — doc/tracking-only
-change, no `internal/`/`cmd/` file touched. Pre-commit hook's pgbench
-smoke will run automatically on commit (not run standalone, since it's
-mandatory on every commit anyway).
+Gates run: `go build ./...` clean (no production file touched).
+`tpch-spotcheck.sh` PASS. `tpcds-sf025-regression.sh sweep` PASS.
+`pg-plan-parity-diff.py` (report-only) on both TPC-H arms. `make
+ralph-state-guard` clean. Pre-commit hook's pgbench smoke: PASS (ran
+automatically on the commit above).
 
-In-flight: none.
+In-flight: none. All private-lane servers/cgroup scopes for this loop's
+captures were stopped and reaped before commit (verified via `ps aux` +
+`systemctl --user list-units` — clean). Scratch driver
+`tmp/p0e7-tpch-parity-capture.sh` and its binary/data dir were removed
+after use (not committed — `tmp/` is gitignored); its logic is fully
+documented in the design doc's "R1-safety correction" section if it needs
+to be reconstructed for the TPC-DS half.
