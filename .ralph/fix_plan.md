@@ -571,6 +571,41 @@ heuristic stays live.)
 - [ ] **testport/TestPort_IsolationIntraGrantInplace (AI-20260905-011015-003, AI-20260914-235643-006, AI-20260916-035206-006, AI-20260917-004357-010)** —
   FAILed, also failed previous run (repro: `go test -v -run
   '^TestPort_IsolationIntraGrantInplace$' ./internal/testport/`).
+  - **ROOT-CAUSED 2026-09-19** (repro re-run at HEAD, 4.86s FAIL — same
+    signature as every nightly since 20260905; the earlier 0827 failure was
+    the pre-M0118 `FOR NO KEY UPDATE` syntax gap). Only the LAST
+    permutation (`b1 drop1 b3 sfu3 revoke4 c1 r3`, perm 10) diverges —
+    all nine earlier perms match. goopg's actual tail:
+    `sfu3 <waiting ...>`, `revoke4 <waiting ...>`, `c1 COMMIT`,
+    `sfu3 <... completed>` → **`ERROR: relation "intra_grant_inplace"
+    does not exist`** where PG emits `relhasindex`/`(0 rows)`; then
+    `r3 ROLLBACK` precedes `revoke4`'s completion (PG has it last).
+    - Mechanism: `lockRowsOp.Open` → `maybeRecordPgClassRowMark`
+      (`internal/executor/operators_lockrows.go:853/871`) evaluates the
+      `oid = 'x'::regclass` filter const via `pgClassFilterOID` →
+      `evalExpr` — resolving the OID while drop1 is still uncommitted
+      (correct) — then blocks in `waitTablePendingDrop` (`:910`,
+      `operators_ddl.go:12688`) until `c1`'s `ApplyPendingTableDrops`
+      removes the table. Post-unblock, `drainAndStamp` (`:1031`) drives
+      the child scan, whose `oid = 'x'::regclass` filter **re-evaluates
+      `regclassin`** (`reg_identifier.go:286-331`) — now a
+      `LookupTable` miss → 42P01 instead of `0 rows`.
+    - PG contract (`regproc.c:882` `regclassin`, `provolatile='s'` — not
+      plan-folded either, but resolved ONCE into the scan key /
+      evaluated before the LockTuple wait inside the scan iteration):
+      post-commit the scan simply finds the pg_class tuple deleted →
+      `0 rows`. goopg waits at `Open()` *before* any child row
+      iteration, so its entire filter evaluation lands post-drop.
+    - Candidate fix (executor, HOLD-gated — tpch-spotcheck is
+      SKIP-BLOCKED while `:65433` is down): after
+      `waitTablePendingDrop` unblocks, when the pending drop committed
+      (table gone / `TablePendingDropXID` cleared-and-applied),
+      short-circuit `drainAndStamp` to EOF — PG's `LockTuple → deleted
+      → skip → 0 rows` outcome. Also explains the `r3`-before-`revoke4`
+      ordering tail (revoke4's poll-release only frees after the
+      rowmark retracts on empty).
+    - Ledgered (`.ralph/deferral_ledger.md` tail row
+      `testport/TestPort_IsolationIntraGrantInplace`).
 - [ ] **testport/TestPort_IsolationStats (AI-20260905-011015-004, AI-20260914-235643-007, AI-20260916-035206-007, AI-20260917-004357-011)** — FAILed,
   also failed previous run (same testport repro pattern).
 - [ ] **testport/TestPort_LockRowsSortOverJoinTakesRowLock (AI-20260905-011015-005, AI-20260914-235643-008, AI-20260916-035206-009, AI-20260917-004357-013)** —
