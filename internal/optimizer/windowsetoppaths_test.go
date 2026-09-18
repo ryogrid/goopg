@@ -589,3 +589,262 @@ func TestCreateSetOpPathsLeavesBranchRelsNilForNonSearchedBranches(t *testing.T)
 		t.Fatalf("rel.RightBranchRel = %v, want nil for a non-searched branch", rel.RightBranchRel)
 	}
 }
+
+
+// TestAddPartialSetOpPathPricesLikeCostAppendParallelArm is M0140-0006b's
+// cost pin: cost_append's parallel-aware arm (costsize.c:2330-2394),
+// specialised to goopg's fixed two-child SetOp shape. Both branches offer a
+// partial path with DIFFERENT worker counts, so the rescale term
+// (subpath_parallel_divisor / parallel_divisor) is exercised, not just the
+// same-worker-count degenerate case.
+func TestAddPartialSetOpPathPricesLikeCostAppendParallelArm(t *testing.T) {
+	cp := defaultCostParams()
+	setOpRel := &RelOptInfo{}
+	left := &RelOptInfo{ConsiderParallel: true, PartialPathlist: []*Path{{
+		Kind: PathSeqScan, Rows: 500, Cost: Cost{Startup: 1, Total: 50},
+		ParallelSafe: true, ParallelWorkers: 2,
+	}}}
+	right := &RelOptInfo{ConsiderParallel: true, PartialPathlist: []*Path{{
+		Kind: PathSeqScan, Rows: 200, Cost: Cost{Startup: 2, Total: 20},
+		ParallelSafe: true, ParallelWorkers: 3,
+	}}}
+	setOpRel.LeftBranchRel = left
+	setOpRel.RightBranchRel = right
+	node := setOpTestNode(parser.SetOpUnion, true, upperOrderedInput(1000), upperOrderedInput(400))
+
+	addPartialSetOpPath(setOpRel, node, cp)
+
+	if !setOpRel.ConsiderParallel {
+		t.Fatal("setOpRel.ConsiderParallel = false, want true (both branches consider parallel)")
+	}
+	if len(setOpRel.PartialPathlist) != 1 {
+		t.Fatalf("PartialPathlist = %d entries, want 1", len(setOpRel.PartialPathlist))
+	}
+	p := setOpRel.PartialPathlist[0]
+	if p.Kind != PathSetOp || p.SetOp != node {
+		t.Fatal("partial path is not the node's own PathSetOp")
+	}
+	const wantWorkers = 3 // max(2,3), already >= the fixed two-child floor
+	if p.ParallelWorkers != wantWorkers {
+		t.Fatalf("ParallelWorkers = %d, want %d", p.ParallelWorkers, wantWorkers)
+	}
+	if p.Cost.Startup != 1 {
+		t.Fatalf("Startup = %v, want 1 (min of the two branches' startup)", p.Cost.Startup)
+	}
+	divisor := getParallelDivisor(wantWorkers, cp.parallelLeaderParticipation)
+	lDivisor := getParallelDivisor(2, cp.parallelLeaderParticipation)
+	rDivisor := getParallelDivisor(3, cp.parallelLeaderParticipation)
+	wantRows := clampRowEst(500*(lDivisor/divisor) + 200*(rDivisor/divisor))
+	if math.Abs(p.Rows-wantRows) > 1e-9 {
+		t.Fatalf("Rows = %v, want %v", p.Rows, wantRows)
+	}
+	wantTotal := 50 + 20 + cp.cpuTupleCost*appendCPUCostMultiplier*wantRows
+	if math.Abs(p.Cost.Total-wantTotal) > 1e-9 {
+		t.Fatalf("Total = %v, want %v", p.Cost.Total, wantTotal)
+	}
+	if !p.ParallelSafe {
+		t.Fatal("ParallelSafe = false, want true")
+	}
+	if len(p.Children) != 2 || p.Children[0] != left.PartialPathlist[0] || p.Children[1] != right.PartialPathlist[0] {
+		t.Fatal("children are not [left partial, right partial] in that order")
+	}
+}
+
+// TestAddPartialSetOpPathAtLeastTwoWorkersForTwoChildren pins PG's
+// enable_parallel_append floor (allpaths.c:1560-1566,
+// `pg_leftmost_one_pos32(numChildren=2)+1 == 2`), applied unconditionally
+// since goopg has no enable_parallel_append GUC to gate the bump behind
+// (matches costSetOp's single-candidate posture).
+func TestAddPartialSetOpPathAtLeastTwoWorkersForTwoChildren(t *testing.T) {
+	cp := defaultCostParams()
+	setOpRel := &RelOptInfo{}
+	mk := func(rows float64) *RelOptInfo {
+		return &RelOptInfo{ConsiderParallel: true, PartialPathlist: []*Path{{
+			Kind: PathSeqScan, Rows: rows, Cost: Cost{Total: rows},
+			ParallelSafe: true, ParallelWorkers: 1,
+		}}}
+	}
+	setOpRel.LeftBranchRel = mk(100)
+	setOpRel.RightBranchRel = mk(50)
+	node := setOpTestNode(parser.SetOpUnion, true, upperOrderedInput(100), upperOrderedInput(50))
+
+	addPartialSetOpPath(setOpRel, node, cp)
+
+	if len(setOpRel.PartialPathlist) != 1 {
+		t.Fatalf("PartialPathlist = %d entries, want 1", len(setOpRel.PartialPathlist))
+	}
+	if got := setOpRel.PartialPathlist[0].ParallelWorkers; got != 2 {
+		t.Fatalf("ParallelWorkers = %d, want 2 (both branches request 1, floor is 2)", got)
+	}
+}
+
+// TestAddPartialSetOpPathCapsAtMaxParallelWorkersPerGather.
+func TestAddPartialSetOpPathCapsAtMaxParallelWorkersPerGather(t *testing.T) {
+	cp := defaultCostParams()
+	cp.maxParallelWorkersPerGather = 1
+	setOpRel := &RelOptInfo{}
+	mk := func(rows float64, workers int) *RelOptInfo {
+		return &RelOptInfo{ConsiderParallel: true, PartialPathlist: []*Path{{
+			Kind: PathSeqScan, Rows: rows, Cost: Cost{Total: rows},
+			ParallelSafe: true, ParallelWorkers: workers,
+		}}}
+	}
+	setOpRel.LeftBranchRel = mk(100, 3)
+	setOpRel.RightBranchRel = mk(50, 2)
+	node := setOpTestNode(parser.SetOpUnion, true, upperOrderedInput(100), upperOrderedInput(50))
+
+	addPartialSetOpPath(setOpRel, node, cp)
+
+	if len(setOpRel.PartialPathlist) != 1 {
+		t.Fatalf("PartialPathlist = %d entries, want 1", len(setOpRel.PartialPathlist))
+	}
+	if got := setOpRel.PartialPathlist[0].ParallelWorkers; got != 1 {
+		t.Fatalf("ParallelWorkers = %d, want 1 (capped by maxParallelWorkersPerGather)", got)
+	}
+}
+
+// TestAddPartialSetOpPathRefusesNonStreaming: only UNION ALL is Append-shaped
+// (setOpStreams); every other set-op form is the buffered/hashed arm, which
+// has no partial-safe executor shape and gets no partial path regardless of
+// what the branches offer.
+func TestAddPartialSetOpPathRefusesNonStreaming(t *testing.T) {
+	cp := defaultCostParams()
+	mk := func() *RelOptInfo {
+		return &RelOptInfo{ConsiderParallel: true, PartialPathlist: []*Path{{
+			Kind: PathSeqScan, Rows: 100, Cost: Cost{Total: 100},
+			ParallelSafe: true, ParallelWorkers: 2,
+		}}}
+	}
+	for _, c := range []struct {
+		name string
+		op   parser.SetOpType
+		all  bool
+	}{
+		{"union distinct", parser.SetOpUnion, false},
+		{"intersect all", parser.SetOpIntersect, true},
+		{"except all", parser.SetOpExcept, true},
+	} {
+		setOpRel := &RelOptInfo{}
+		setOpRel.LeftBranchRel = mk()
+		setOpRel.RightBranchRel = mk()
+		node := setOpTestNode(c.op, c.all, upperOrderedInput(100), upperOrderedInput(100))
+
+		addPartialSetOpPath(setOpRel, node, cp)
+
+		if len(setOpRel.PartialPathlist) != 0 {
+			t.Fatalf("%s: PartialPathlist = %d entries, want 0 (not a streaming UNION ALL)", c.name, len(setOpRel.PartialPathlist))
+		}
+	}
+}
+
+// TestAddPartialSetOpPathRefusesUnderGatherPathsOff.
+func TestAddPartialSetOpPathRefusesUnderGatherPathsOff(t *testing.T) {
+	restore := setGatherPathsModeForTest(gatherPathsOff)
+	defer restore()
+	cp := defaultCostParams()
+	setOpRel := &RelOptInfo{}
+	mk := func() *RelOptInfo {
+		return &RelOptInfo{ConsiderParallel: true, PartialPathlist: []*Path{{
+			Kind: PathSeqScan, Rows: 100, Cost: Cost{Total: 100},
+			ParallelSafe: true, ParallelWorkers: 2,
+		}}}
+	}
+	setOpRel.LeftBranchRel = mk()
+	setOpRel.RightBranchRel = mk()
+	node := setOpTestNode(parser.SetOpUnion, true, upperOrderedInput(100), upperOrderedInput(100))
+
+	addPartialSetOpPath(setOpRel, node, cp)
+
+	if len(setOpRel.PartialPathlist) != 0 {
+		t.Fatalf("PartialPathlist = %d entries, want 0 under GOOPG_GATHER_PATHS=off", len(setOpRel.PartialPathlist))
+	}
+}
+
+// TestAddPartialSetOpPathRefusesWhenABranchDoesNotConsiderParallel mirrors
+// the join-rel rule (build_join_rel, relnode.c:842): the conjunction of both
+// inputs, not just one.
+func TestAddPartialSetOpPathRefusesWhenABranchDoesNotConsiderParallel(t *testing.T) {
+	cp := defaultCostParams()
+	setOpRel := &RelOptInfo{}
+	setOpRel.LeftBranchRel = &RelOptInfo{ConsiderParallel: false, PartialPathlist: []*Path{{
+		Kind: PathSeqScan, Rows: 100, Cost: Cost{Total: 100}, ParallelSafe: true, ParallelWorkers: 2,
+	}}}
+	setOpRel.RightBranchRel = &RelOptInfo{ConsiderParallel: true, PartialPathlist: []*Path{{
+		Kind: PathSeqScan, Rows: 100, Cost: Cost{Total: 100}, ParallelSafe: true, ParallelWorkers: 2,
+	}}}
+	node := setOpTestNode(parser.SetOpUnion, true, upperOrderedInput(100), upperOrderedInput(100))
+
+	addPartialSetOpPath(setOpRel, node, cp)
+
+	if setOpRel.ConsiderParallel {
+		t.Fatal("setOpRel.ConsiderParallel = true, want false (left branch refuses)")
+	}
+	if len(setOpRel.PartialPathlist) != 0 {
+		t.Fatalf("PartialPathlist = %d entries, want 0", len(setOpRel.PartialPathlist))
+	}
+}
+
+// TestAddPartialSetOpPathRefusesWhenABranchHasNoPartialPath: a branch can
+// consider parallel yet still offer no partial path at all (e.g. its own
+// search never built one) — the pure-partial arm this function builds needs
+// BOTH branches to have one.
+func TestAddPartialSetOpPathRefusesWhenABranchHasNoPartialPath(t *testing.T) {
+	cp := defaultCostParams()
+	setOpRel := &RelOptInfo{}
+	setOpRel.LeftBranchRel = &RelOptInfo{ConsiderParallel: true}
+	setOpRel.RightBranchRel = &RelOptInfo{ConsiderParallel: true, PartialPathlist: []*Path{{
+		Kind: PathSeqScan, Rows: 100, Cost: Cost{Total: 100}, ParallelSafe: true, ParallelWorkers: 2,
+	}}}
+	node := setOpTestNode(parser.SetOpUnion, true, upperOrderedInput(100), upperOrderedInput(100))
+
+	addPartialSetOpPath(setOpRel, node, cp)
+
+	if !setOpRel.ConsiderParallel {
+		t.Fatal("setOpRel.ConsiderParallel = false, want true (both branches consider parallel, regardless of partial paths)")
+	}
+	if len(setOpRel.PartialPathlist) != 0 {
+		t.Fatalf("PartialPathlist = %d entries, want 0 (left branch has no partial path)", len(setOpRel.PartialPathlist))
+	}
+}
+
+// TestCreateSetOpPathsPartialPathDoesNotMoveThePlan is the end-to-end
+// acceptance createSetOpPaths itself must satisfy: even with both branches
+// offering a cheap partial path, the emitted node and the serial tournament
+// are byte-identical to before this producer existed — nothing reads
+// PartialPathlist yet (see addPartialSetOpPath's own header).
+func TestCreateSetOpPathsPartialPathDoesNotMoveThePlan(t *testing.T) {
+	u := newUpperRels()
+
+	leftRel := &RelOptInfo{ConsiderParallel: true}
+	leftRel.PartialPathlist = []*Path{{Kind: PathSeqScan, Rows: 5, Cost: Cost{Total: 10}, ParallelSafe: true, ParallelWorkers: 2}}
+	l := &searchedPricedNode{pricedNode: *upperOrderedInput(1000)}
+	l.markFromJoinSearch()
+	l.setSearchRel(leftRel)
+
+	rightRel := &RelOptInfo{ConsiderParallel: true}
+	rightRel.PartialPathlist = []*Path{{Kind: PathSeqScan, Rows: 3, Cost: Cost{Total: 7}, ParallelSafe: true, ParallelWorkers: 2}}
+	r := &searchedPricedNode{pricedNode: *upperOrderedInput(400)}
+	r.markFromJoinSearch()
+	r.setSearchRel(rightRel)
+
+	node := setOpTestNode(parser.SetOpUnion, true, l, r)
+	got, err := createSetOpPaths(u, node, DefaultPlannerSettings(), 0)
+	if err != nil {
+		t.Fatalf("createSetOpPaths: %v", err)
+	}
+
+	rel := u.rels[UpperSetOp][0]
+	if len(rel.PartialPathlist) != 1 {
+		t.Fatalf("rel.PartialPathlist = %d entries, want 1 (the producer under test)", len(rel.PartialPathlist))
+	}
+	if len(rel.Pathlist) != 1 {
+		t.Fatalf("rel.Pathlist = %d entries, want 1 — a partial path must not be offered to the serial tournament", len(rel.Pathlist))
+	}
+	out, ok := got.(*SetOp)
+	if !ok || out.Op != parser.SetOpUnion || !out.All {
+		t.Fatalf("emitted node changed shape: %#v", got)
+	}
+	if out.Left != Node(l) || out.Right != Node(r) {
+		t.Fatal("emitted branches are not the pre-producer nodes; the partial candidate must not have won")
+	}
+}

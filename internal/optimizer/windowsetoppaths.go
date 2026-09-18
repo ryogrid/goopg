@@ -57,10 +57,15 @@ import (
 // the lines read `producer=upper.window.* relids=-`, the convention C-12
 // established.
 const (
-	windowProducer      = "upper.window.sorted"
-	setOpAppendProducer = "upper.setop.append"
-	setOpHashedProducer = "upper.setop.hashed"
+	windowProducer             = "upper.window.sorted"
+	setOpAppendProducer        = "upper.setop.append"
+	setOpHashedProducer        = "upper.setop.hashed"
+	setOpPartialAppendProducer = "upper.setop.append.partial"
 )
+
+// appendCPUCostMultiplier is APPEND_CPU_COST_MULTIPLIER (costsize.c:120):
+// "Although Append does not do any selection or projection, it's not free."
+const appendCPUCostMultiplier = 0.5
 
 // createWindowPaths is `create_window_paths` (planner.c:4533) plus
 // `create_one_window_path` (planner.c:4620) for the chain
@@ -366,6 +371,11 @@ func createSetOpPaths(u *upperRels, setOpNode *SetOp, ps PlannerSettings, tupleF
 	setOpRel.LeftBranchRel = searchedRelOf(setOpNode.Left)
 	setOpRel.RightBranchRel = searchedRelOf(setOpNode.Right)
 
+	// M0140-0006b: seed setOpRel.PartialPathlist from the two branches' own
+	// partial paths, when the branches and the op shape allow it. See
+	// addPartialSetOpPath's own header for why this cannot move a plan yet.
+	addPartialSetOpPath(setOpRel, setOpNode, cp)
+
 	addSetOpPaths(setOpRel, lseed, rseed, setOpNode, cp)
 	setCheapest(setOpRel)
 
@@ -472,4 +482,129 @@ func addSetOpPaths(setOpRel *RelOptInfo, lseed, rseed *Path, setOpNode *SetOp, c
 			setOpRel.Rows, setOpRel.NCols),
 		Children: []*Path{lseed, rseed},
 	}, producer)
+}
+
+
+// addPartialSetOpPath is M0140-0006b: the streaming-UNION-ALL counterpart of
+// addPartialHashJoinPath (joinpathsparallel.go), giving the SETOP rel its own
+// entry in PartialPathlist when both branches offer one. PG's cost_append
+// (costsize.c:2250-2403) parallel-aware arm, specialised to goopg's fixed
+// two-child shape (`Left`/`Right`) and restricted to the case where BOTH
+// children are already partial — PG's own "mix of partial and non-partial
+// subpaths" arm (allpaths.c:1592-1622) needs `append_nonpartial_cost`'s
+// worker-rotation arithmetic over an arbitrary-length subpath list, out of
+// this task's bound; a branch with no partial path at all simply gets no
+// partial SetOp path (a resume point, not a silently dropped case — see the
+// deferral ledger).
+//
+// NOT WIRED TO ANYTHING THAT CAN SELECT IT, and that is by construction, not
+// by an added flag. `generateUsefulGatherPaths` — the only reader of
+// PartialPathlist (gatherpaths.go's own file header) — is never called for
+// ANY upper rel (WINDOW/ORDERED/GROUP_AGG/SETOP alike): its three call sites
+// (gatherpaths.go's addBaseRelGatherPaths, joinsearchlevel.go, geqo.go) all
+// walk a *searchCtx's own joinrels, and createSetOpPaths (this file) runs
+// from the SetOp fold in planner.go, entirely outside any *searchCtx — there
+// is no `s` to call it with. This answers the open question M0140-0006's
+// decomposition doc left for this task ("verify generateUsefulGatherPaths
+// reads it for free... unverified"): the answer is NO, and the gap is
+// upper-rel-wide, not SetOp-specific — filed as M0140-0006b-2
+// (.ralph/fix_plan.md). Until that lands AND M0140-0006c's executor
+// claim-set fix lands, a partial SetOp path cannot be chosen by any gate:
+// the field this function writes has no reader.
+func addPartialSetOpPath(setOpRel *RelOptInfo, setOpNode *SetOp, cp costParams) {
+	if setOpRel == nil || setOpNode == nil || !setOpStreams(setOpNode) {
+		// Only Op=UNION ALL streams (setOpStreams); goopg's buffered/hashed
+		// arm drains both inputs fully before emitting anything
+		// (operators_setop.go's computeBuffered) and has no partial-safe
+		// executor shape — PG's SetOp HASHED strategy is not an Append
+		// either, so cost_append never applies to it upstream.
+		return
+	}
+	if gatherPathsMode == gatherPathsOff {
+		// The only reader is (eventually) generateUsefulGatherPaths, gated
+		// by the same mode — producing under `off` buys nothing, same
+		// reasoning as addPartialHashJoinPath's identical guard.
+		return
+	}
+	left, right := setOpRel.LeftBranchRel, setOpRel.RightBranchRel
+	// C-19a's join-rel rule (build_join_rel, relnode.c:842), applied to the
+	// SetOp's two inputs instead of a join's two sides: both must consider
+	// parallel. nil (branch never reached by the search) reads as false —
+	// short-circuits before either field is dereferenced.
+	setOpRel.ConsiderParallel = left != nil && right != nil &&
+		left.ConsiderParallel && right.ConsiderParallel
+	if !setOpRel.ConsiderParallel {
+		return
+	}
+	if len(left.PartialPathlist) == 0 || len(right.PartialPathlist) == 0 {
+		// The pure-partial arm only (allpaths.c:1538-1577's
+		// `partial_subpaths_valid` case). A branch with no partial path
+		// needs the mixed arm this function does not build.
+		return
+	}
+	lp, rp := left.PartialPathlist[0], right.PartialPathlist[0]
+	if lp == nil || rp == nil || lp.ParallelWorkers <= 0 || rp.ParallelWorkers <= 0 ||
+		!lp.ParallelSafe || !rp.ParallelSafe {
+		return
+	}
+
+	// parallel_workers: Max over the two subpaths' own worker counts
+	// (allpaths.c:1544-1550), then at least `pg_leftmost_one_pos32(2)+1 ==
+	// 2` — PG's `enable_parallel_append` arm (allpaths.c:1560-1566) bumps
+	// to at least log2(numChildren)+1; goopg has no such GUC to gate on
+	// (matches costSetOp's "single candidate" posture: there is no
+	// serial-vs-parallel-aware Append choice to make), so the bump always
+	// applies, fixed at 2 because a goopg SetOp always has exactly two
+	// children, unlike PG's N-way Append.
+	workers := lp.ParallelWorkers
+	if rp.ParallelWorkers > workers {
+		workers = rp.ParallelWorkers
+	}
+	if workers < 2 {
+		workers = 2
+	}
+	if workers > cp.maxParallelWorkersPerGather {
+		workers = cp.maxParallelWorkersPerGather
+	}
+	if workers <= 0 {
+		return
+	}
+
+	// Startup: "Append will start returning tuples when the child node
+	// having lowest startup cost is done setting up" (costsize.c:2350-2352).
+	// `first_partial_path == 0` here (no non-partial subpaths), so both
+	// children are eligible and the rule is min(left, right), not just the
+	// first child's.
+	startup := lp.Cost.Startup
+	if rp.Cost.Startup < startup {
+		startup = rp.Cost.Startup
+	}
+
+	// Rows and total cost: `first_partial_path == 0`, so every subpath
+	// takes the `else` branch (costsize.c:2372-2381) — rescale each
+	// child's per-worker row count from ITS OWN divisor to the Append's
+	// chosen worker count, and add each child's total cost undivided.
+	divisor := getParallelDivisor(workers, cp.parallelLeaderParticipation)
+	lDivisor := getParallelDivisor(lp.ParallelWorkers, cp.parallelLeaderParticipation)
+	rDivisor := getParallelDivisor(rp.ParallelWorkers, cp.parallelLeaderParticipation)
+	rows := clampRowEst(lp.Rows*(lDivisor/divisor) + rp.Rows*(rDivisor/divisor))
+	total := lp.Cost.Total + rp.Cost.Total
+	// "Although Append does not do any selection or projection, it's not
+	// free; add a small per-tuple overhead" (costsize.c:2400-2403).
+	total += cp.cpuTupleCost * appendCPUCostMultiplier * rows
+
+	addPartialPath(setOpRel, &Path{
+		Kind:            PathSetOp,
+		SetOp:           setOpNode,
+		Rel:             setOpRel,
+		Rows:            rows,
+		Cost:            Cost{Startup: startup, Total: total},
+		DisabledNodes:   lp.DisabledNodes + rp.DisabledNodes,
+		Children:        []*Path{lp, rp},
+		Pathkeys:        nil,
+		RequiredOuter:   0,
+		ParallelSafe:    parallelSafeWith(setOpRel, lp, rp),
+		ParallelWorkers: workers,
+		ParallelAware:   true,
+	}, setOpPartialAppendProducer)
 }

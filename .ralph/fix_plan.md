@@ -2654,7 +2654,7 @@ setting that yields a serial plan.
     Next: **M0140-0006b** reads
     `setOpRel.LeftBranchRel/.RightBranchRel.PartialPathlist` directly — no
     further plumbing needed.
-- [ ] **M0140-0006b — the partial-Append cost producer.** Depends on
+- [x] **M0140-0006b — the partial-Append cost producer.** Depends on
   Kind: impl
   M0140-0006a. The `addPartialHashJoinPath` counterpart
   (`joinpathsparallel.go:82`'s shape): seed `setOpRel.PartialPathlist` from
@@ -2668,6 +2668,81 @@ setting that yields a serial plan.
   exercised by any gate that could select it, until M0140-0006c lands** — see
   0006c for why. Re-measure Q5/Q76 (and Q2/Q14/Q71/Q75 per the six-query
   denominator note above) via `scripts/tpcds-sf025-regression.sh`.
+  - **Done 2026-09-18.** Movement: none (the producer is inert by
+    construction — see below). Landed `addPartialSetOpPath`
+    (`internal/optimizer/windowsetoppaths.go`), called from
+    `createSetOpPaths` right after 0006a's branch-rel threading: only the
+    streaming UNION ALL form qualifies (`setOpStreams`), gated behind
+    `gatherPathsMode` (`off` refuses, matching `addPartialHashJoinPath`),
+    `setOpRel.ConsiderParallel` set to the conjunction of both branches'
+    `ConsiderParallel` (the join-rel rule, `relnode.c:842`, applied to the
+    two SetOp inputs), requires BOTH branches to already carry a partial
+    path (PG's `partial_subpaths_valid` pure-partial arm only — the mixed
+    partial/non-partial `append_nonpartial_cost` arm is not built, ledger
+    row filed), worker count `Max` of the two branches' own counts bumped
+    to the fixed two-child floor of 2 (`pg_leftmost_one_pos32(2)+1`,
+    applied unconditionally since goopg has no `enable_parallel_append`
+    GUC) and capped at `maxParallelWorkersPerGather`, rows/cost rescale
+    each child's per-worker figures to the chosen worker count and sum
+    plus the small per-tuple `APPEND_CPU_COST_MULTIPLIER` overhead. 14 new
+    unit tests in `windowsetoppaths_test.go` (golden two-different-divisors
+    cost case verified against an independently-computed formula, the
+    two-child worker floor, the `maxParallelWorkersPerGather` cap, refusal
+    for every non-streaming form/`gatherPathsMode=off`/either branch not
+    considering parallel/either branch lacking a partial path, and an
+    end-to-end `createSetOpPaths` byte-identical-plan acceptance pin).
+    **This task's own acceptance question — "does
+    `generateUsefulGatherPaths` read this for free?" — answers NO**: none
+    of its three call sites (`gatherpaths.go`/`joinsearchlevel.go`/
+    `geqo.go`) reach any upper-rel producer, all three read a
+    `*searchCtx`'s own `joinrels`, and `createSetOpPaths` runs from the
+    SetOp fold in `planner.go` entirely outside any `*searchCtx` — **no
+    upper rel in the Phase-4 pipeline (WINDOW/ORDERED/GROUP_AGG/SETOP) has
+    ever been wired for parallel Gather consideration**, a bigger,
+    upper-rel-wide gap than the original recon assumed. Filed as
+    **M0140-0006b-2** below. The producer is therefore confirmed inert by
+    TWO independent mechanisms, not one — (1) that reachability gap, and
+    (2) `partialPathDrivingKind`'s fail-closed whitelist (`gatherpaths.go`)
+    has no `case PathSetOp:` arm, so even a wired `generateUsefulGatherPaths`
+    call would still refuse it (opening that case is explicitly 0006c's
+    job) — so this lands safely regardless of which of 0006b-2/0006c the
+    next loop picks up first, AS LONG AS 0006c's own whitelist opening is
+    the last of the three to land (recorded in the design doc so this
+    doesn't need re-deriving). Design doc:
+    `docs/design/0100-0149/m0140-0006b-partial-append-cost-producer.md`.
+    Gates: `go build ./...` clean; `go vet ./internal/optimizer/...`
+    clean; `go test ./internal/optimizer/...` and `./internal/executor/...`
+    full green (14 new tests); `scripts/tpch-spotcheck.sh` PASS
+    (Q12=2/Q13=34) against the staged tree; `scripts/tpcds-sf025-regression.sh
+    sweep` PASS=96 MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0, PLAN-SHAPE
+    queries=99 same=99 changed=0 (Q5/Q76/Q2/Q14/Q71/Q75 all unchanged,
+    confirming the producer moved nothing); `RALPH_PRECOMMIT_SCOPE=units
+    scripts/ralph-precommit-test.sh` full green; `scripts/tpch-acceptance-arm.sh`
+    `PGSHAPED=1` HEAD-baseline (`git stash`/build/`stash pop` round-trip of
+    the two touched files, private port 5583) vs this staged tree: VERDICT
+    PASS, 24/24 labels MATCH. Ledger row filed
+    (2026-09-18, `M0140-0006b`): the mixed-arm gap plus the
+    reachability gap. Next: **M0140-0006c** (below) or **M0140-0006b-2**
+    (below), either order — see design doc's ordering note.
+- [ ] **M0140-0006b-2 — wire parallel Gather consideration into the Phase-4
+  upper-rel pipeline.**
+  Kind: impl
+  Parent: M0140-0006b. Filed 2026-09-18 by M0140-0006b's
+  own acceptance check. `generateUsefulGatherPaths` (`considerparallel.go`)
+  is never called for any upper rel (WINDOW/ORDERED/GROUP_AGG/SETOP) — its
+  three call sites (`gatherpaths.go`'s `addBaseRelGatherPaths`,
+  `joinsearchlevel.go`, `geqo.go`) all read a `*searchCtx`'s own
+  `joinrels`/`joinrel`, and every upper-rel producer (`createWindowPaths`,
+  `createOrderedPaths`, `electOrderedGrouping`, `createSetOpPaths`, …) runs
+  from `planner.go` entirely outside any `*searchCtx`. Scope: thread the
+  subset `generateUsefulGatherPaths` actually reads (`parallelModeOK`, `cp`,
+  `trace`) to the upper-rel call sites — sizing/shape (a trimmed struct? the
+  full `*searchCtx`? a package-level knob?) is this task's own recon, not
+  pre-judged here. Needed before ANY upper rel's `PartialPathlist` — not
+  just SETOP's M0140-0006b — can ever be read by anything. Gate: TPC-H
+  `match=8`/TPC-DS `match=2` byte-identical before/after (nothing should
+  move — this is reachability plumbing, same posture as 0006a), plus
+  `scripts/tpcds-sf025-regression.sh sweep` PLAN-SHAPE changed=0.
 - [ ] **M0140-0006c — executor claim-set for `setOp` under `Gather`.** A
   Kind: impl
   correctness prerequisite, not an optimization, and independent of
