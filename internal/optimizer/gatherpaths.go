@@ -213,6 +213,45 @@ func (s *searchCtx) generateUsefulGatherPaths(rel *RelOptInfo) {
 	}
 }
 
+// generateUpperRelGatherPaths is M0140-0006b-2's upper-rel entry point for
+// generateUsefulGatherPaths (allpaths.c:3236's upper-rel callers —
+// `create_grouping_paths`, `create_window_paths`, `create_setop_paths` —
+// each call `generate_gather_paths` on their own rel; goopg's Phase-4
+// producers never did, so no upper rel's PartialPathlist ever had a reader).
+//
+// The method needs a *searchCtx, but everything it actually reads off the
+// context is available without one: `parallelModeOK(cp)` is a pure function
+// of the cost currency (considerparallel.go:61), `cp` is already in scope at
+// every upper-rel producer, `trace` is nil-safe (nothing traces an upper-rel
+// Gather decision today), and `nrels` only feeds the `top`-mode final-rel
+// check. So this builds the minimal context and delegates to the one body —
+// no twin to keep in step (Hard-won Rule #2) — rather than re-stating the
+// gates.
+//
+// The one policy this states rather than delegates is `top`: that mode
+// admits only the search's FINAL rel ("the node the post-pass targets
+// today"), and an upper rel is never a member of any search level, so it is
+// refused here, fail-closed. `all` (the default since M0140-0003) admits
+// every rel with partial paths, upper rels included; `off` is refused inside
+// the delegated call, same as for a search rel.
+//
+// Only the SETOP rel can have partial paths today (addPartialSetOpPath,
+// M0140-0006b is the sole upper-rel partial producer); every other upper rel
+// returns at the first line, so wiring this into WINDOW/ORDERED/GROUP_AGG is
+// provably inert until a producer files there. Callers run this after all
+// other candidates are offered and before setCheapest, mirroring
+// addBaseRelGatherPaths' own placement.
+func generateUpperRelGatherPaths(rel *RelOptInfo, cp costParams) {
+	if rel == nil || len(rel.PartialPathlist) == 0 {
+		return
+	}
+	if gatherPathsMode == gatherPathsTop {
+		return
+	}
+	s := &searchCtx{parallelModeOK: parallelModeOK(cp), cp: cp}
+	s.generateUsefulGatherPaths(rel)
+}
+
 // makeGatherPath is `create_gather_path` (pathnode.c:1974) + `cost_gather`.
 // nil when the subpath is not one this executor can run under a Gather.
 //

@@ -120,6 +120,10 @@ func createWindowPaths(u *upperRels, windows []*WindowAgg, input Node, ps Planne
 
 	seed := seedPathForNode(winRel, input)
 	addWindowPaths(winRel, seed, windows, input, cp, chainKeep)
+	// M0140-0006b-2: the upper-rel Gather reader. No-op today (no producer
+	// files partial paths on the WINDOW rel), wired so a future one does
+	// not repeat 0006b's "producer with no reader" trap.
+	generateUpperRelGatherPaths(winRel, cp)
 	setCheapest(winRel)
 
 	best := getCheapestFractionalPath(winRel, tupleFraction)
@@ -377,6 +381,13 @@ func createSetOpPaths(u *upperRels, setOpNode *SetOp, ps PlannerSettings, tupleF
 	addPartialSetOpPath(setOpRel, setOpNode, cp)
 
 	addSetOpPaths(setOpRel, lseed, rseed, setOpNode, cp)
+	// M0140-0006b-2: the upper-rel Gather reader — the live site. Reads the
+	// PartialPathlist addPartialSetOpPath files above (which also stamps
+	// ConsiderParallel, the flag the reader gates on, so this must run
+	// after it). The executor whitelist for the resulting Gather already
+	// landed (M0140-0006c), so a partial SetOp over bare-scan branches can
+	// now be offered to the serial tournament and win on cost.
+	generateUpperRelGatherPaths(setOpRel, cp)
 	setCheapest(setOpRel)
 
 	best := getCheapestFractionalPath(setOpRel, tupleFraction)

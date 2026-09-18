@@ -810,8 +810,13 @@ func TestAddPartialSetOpPathRefusesWhenABranchHasNoPartialPath(t *testing.T) {
 // TestCreateSetOpPathsPartialPathDoesNotMoveThePlan is the end-to-end
 // acceptance createSetOpPaths itself must satisfy: even with both branches
 // offering a cheap partial path, the emitted node and the serial tournament
-// are byte-identical to before this producer existed — nothing reads
-// PartialPathlist yet (see addPartialSetOpPath's own header).
+// winner are byte-identical. Since M0140-0006b-2 the PartialPathlist HAS a
+// reader (generateUpperRelGatherPaths, called below addSetOpPaths), so a
+// Gather IS now generated over the partial SetOp — but the serial seed costs
+// (100+100) dominate the Gather price (partial ~17 + parallel_setup_cost),
+// so add_path prunes it and the winner is unchanged. If this Pathlist count
+// ever rises to 2, a Gather survived pruning: check values (the M0140-0006c
+// claim-set) and categories before celebrating, per R3.
 func TestCreateSetOpPathsPartialPathDoesNotMoveThePlan(t *testing.T) {
 	u := newUpperRels()
 

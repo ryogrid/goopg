@@ -264,6 +264,10 @@ func electOrderedGrouping(u *upperRels, agg *aggregateSurface, node Node, keys [
 		offer.Pathkeys = translated[i]
 		addOrderedPaths(ordered, &offer, sortKeys, cp, limitTuples)
 	}
+	// M0140-0006b-2: the upper-rel Gather reader (same funnel as
+	// createOrderedPaths above). No-op today; on decline the restore below
+	// resets Pathlist, so a filed Gather cannot leak past a decline.
+	generateUpperRelGatherPaths(ordered, cp)
 	setCheapest(ordered)
 
 	best := getCheapestFractionalPath(ordered, tupleFraction)

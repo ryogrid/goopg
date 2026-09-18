@@ -134,6 +134,10 @@ func createOrderedPaths(u *upperRels, input Node, keys []SortKey, pos int, cp co
 	}
 
 	addOrderedPaths(ordered, seed, pathkeysForSortKeys(keys), cp, limitTuples)
+	// M0140-0006b-2: the upper-rel Gather reader. No-op today (no producer
+	// files partial paths on the ORDERED rel), wired so a future one does
+	// not repeat 0006b's "producer with no reader" trap.
+	generateUpperRelGatherPaths(ordered, cp)
 	setCheapest(ordered)
 
 	best := getCheapestFractionalPath(ordered, tupleFraction)
