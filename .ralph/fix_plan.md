@@ -3383,7 +3383,7 @@ spill route is net-negative.
     (same precedent as S2b-0/S2b-5). Ledger row appended (task-id
     `m0141-s2b-6`). Follow-up filed as **M0141-S2b-6-resume** below, gated
     on the M0142-0003k TPC-H cluster reload (same blocker, not a new one).
-  - [ ] **M0141-S2b-6-resume** — repeat S2b-6's Hashed-vs-Sorted `PathAgg`
+  - [x] **M0141-S2b-6-resume** — repeat S2b-6's Hashed-vs-Sorted `PathAgg`
     Kind: impl
     term-by-term cost diff for Q4/Q5/Q12/Q21 against the real HammerDB
     SF1-loaded `:65433` cluster once reloaded (no synthetic fixture — real
@@ -3396,6 +3396,80 @@ spill route is net-negative.
     approach is the wrong instrument for this question regardless of size
     tuning, since the point is to observe PG's own real-data cost
     comparison at genuinely separated cardinalities, not to construct one.
+    **DONE 2026-09-18.** Movement: none (2 new gated DPPATH trace lines,
+    `traceOrderedGroupingCandidate`/`traceOrderedSortedCandidate` in
+    `pathtrace.go`, wired from `addOrderedPaths` in `upperordered.go` on
+    `input.Kind == PathAgg` — diagnostic-only, no cost formula touched, no
+    plan-shape change; confirmed by the unchanged `tpcds-sf025` plan-shape
+    count below).
+    Gate cleared: `:65433`'s `tpch` database verified non-empty
+    (`select count(*) from lineitem` = 6001255, SF1) before starting.
+    Measured via a private-clone `tpch-estimate-audit-arm.sh` arm
+    (`PLAN_ONLY=1 DP_TRACE=1 PGSHAPED=1 --queries 4,5,12,21`, online
+    `pg_basebackup -X fetch` clone off live `:65433`, never stopped).
+    **Result: all four queries are real, non-tied margins** — S2b-6's
+    clamped-float tie does not survive real cardinalities. Q5/Q21
+    reconfirm "no cost bug" (ORDER BY never matches GROUP BY, both
+    candidates pay a comparable Sort). Q4/Q12 are the real case (Sorted's
+    presort already satisfies ORDER BY): goopg elects Hashed+Sort by
+    899.76/2181.96 units. Cross-checked against a **fresh** `EXPLAIN` on
+    the read-only PG 18.3 reference (`:65432`), which elects the
+    mirror-image Sorted shape for both — a confirmed real cost-model
+    divergence from PG, not a tie artifact. Tested and ruled out one
+    hypothesis: flipping the pre-existing `GOOPG_PG_SORT_RELATION_BYTES_COST`
+    GUC (R113) changes the DPPGSORT currency label but not the election or
+    the margin, so the Sort byte-size currency is not the root cause.
+    Design doc:
+    `docs/design/0100-0149/m0141-s2b-6-resume-hashed-vs-sorted-real-sf1.md`
+    (new; the parent `m0141-s2b-scoping-decomposition.md` is frozen at 977
+    lines under D3.1, so this landed as a fresh file rather than an
+    appended section). `docs/design/README.md` new index row. Follow-up
+    filed as **M0141-S2b-10** below (M0141-S2b-8/-9 are already taken by
+    the unrelated TPC-DS Incremental-Sort candidate-pool line of work —
+    checked `grep -oE "M0141-S2b-[0-9a-z]+" .ralph/fix_plan.md | sort -u`
+    before naming this one). Gates: `go build ./...` clean;
+    `go test ./internal/optimizer/...` PASS (no `-count=1`); both
+    `tpch-estimate-audit-arm.sh` arms rc=0, served-binary sha256 verified;
+    `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=34), staged-tree gate stamp
+    PASS; `scripts/tpcds-sf025-regression.sh sweep` PASS=96 MISMATCH=0
+    CKMISMATCH=0 ERROR=0 TIMEOUT=0, `PLAN-SHAPE: queries=99 same=99
+    changed=0` (confirms the `Movement: none` claim above), staged-tree
+    gate stamp PASS; `scripts/tpch-acceptance-arm.sh` before/after digest
+    (`PGSHAPED=1`, private port 5583, `GOOPG_ANALYZE_SEED=20260905`,
+    baseline built from a `/tmp` worktree at pre-change HEAD `a449e6826`,
+    "on" built from the staged tree): `VERDICT: PASS`, 24/24 labels MATCH
+    including Q9, staged-tree gate stamp PASS; `python3
+    scripts/ralph_protected_regions.py check-designdocs` exit 0; `python3
+    scripts/ralph-lineage-guard.py` clean. No shared cluster write
+    (`pg_basebackup` clone + read-only
+    `EXPLAIN` only).
+  - [ ] **M0141-S2b-10** — root-cause `costAgg`'s Hashed-vs-Sorted formula
+    Kind: recon
+    Parent: M0141-S2b-6-resume. Filed 2026-09-18 by M0141-S2b-6-resume's
+    result: for TPC-H Q4/Q12 (GROUP BY key == ORDER BY key, low output
+    cardinality, large join-output input row count) goopg's cost model
+    elects Hashed+explicit-Sort while real PG 18.3 elects Sorted
+    (`GroupAggregate` fed by a `Sort` below it), by a real, non-tied
+    margin (899.76/2181.96 cost units at SF1) confirmed against a fresh
+    live PG `EXPLAIN`, not a stale capture. The nearest existing suspect —
+    the R113 `GOOPG_PG_SORT_RELATION_BYTES_COST` Sort byte-size currency
+    swap — was tested (env-toggle only, no code change) and does NOT
+    change the election or close the margin, so it is not the cause.
+    Compare `costAgg`'s `AggStrategyHashed` term-by-term against PG's
+    `cost_agg` hashed-strategy formula (`postgres/src/backend/optimizer/path/costsize.c`,
+    `cost_agg`) for these two queries' actual input rows/groups/width —
+    the likely direction is goopg underpricing the Hashed build+probe
+    relative to PG, or a difference in what each side charges the
+    join/scan input feeding the two candidates, but this is unconfirmed;
+    that is exactly what this recon must establish before any fix. Use
+    the same private-clone `tpch-estimate-audit-arm.sh` methodology
+    M0141-S2b-6-resume established (`DP_TRACE=1 PLAN_ONLY=1`); do not
+    re-attempt a synthetic-fixture probe (S2b-6's own lesson: the terms
+    only separate at real cardinalities). Per the cost-model design bundle
+    (`docs/design/cost-model/`, the "0077 line") — read it first, and do
+    not land a formula change without a term-by-term match against
+    `costsize.c`, consistent with every other M0141-S2a fix in this
+    lineage.
   - [x] **M0141-S2b-7** — filed 2026-09-17 by M0141-S7's corpus measurement
     (design doc's "Update 2026-09-17h"). `electOrderedGrouping`
     (`upperorderedgrouping.go:236`) calls `addOrderedPaths` directly, once
