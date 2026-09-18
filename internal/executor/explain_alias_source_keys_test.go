@@ -122,8 +122,9 @@ func TestExplainTransitiveGroupKeyRendersInnerCall(t *testing.T) {
 
 	// Q13-key2 miniature: the outer group key names the inner agg's
 	// output positionally (`c` vs inner `count`) and renders the inner
-	// call — bare in Group Key (HashAggregate over Project, S18), wrapped
-	// in Sort Key.
+	// call — parenthesised in Group Key since M0141-S2b-13's sorted-first
+	// grouping order elects a GroupAggregate here (was: bare under the
+	// deviation-era HashAggregate over Project, S18), wrapped in Sort Key.
 	rows := runExplainRows(t, ctx,
 		"EXPLAIN (COSTS OFF) SELECT c, count(*) FROM (SELECT g, count(x) AS c FROM r66t GROUP BY g) GROUP BY c ORDER BY c DESC")
 	var sortLine, groupLine string
@@ -139,8 +140,8 @@ func TestExplainTransitiveGroupKeyRendersInnerCall(t *testing.T) {
 	if sortLine != "Sort Key: (count(x)) DESC" {
 		t.Errorf("expected transitive `Sort Key: (count(x)) DESC`; got:\n%s", strings.Join(rows, "\n"))
 	}
-	if groupLine != "Group Key: count(x)" {
-		t.Errorf("expected transitive `Group Key: count(x)`; got:\n%s", strings.Join(rows, "\n"))
+	if groupLine != "Group Key: (count(x))" {
+		t.Errorf("expected transitive `Group Key: (count(x))`; got:\n%s", strings.Join(rows, "\n"))
 	}
 	assertNoOpaqueExpr(t, strings.Join(rows, "\n"))
 }

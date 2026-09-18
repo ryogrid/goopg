@@ -154,17 +154,17 @@ func groupingTestSeed(t *testing.T, agg *Aggregate) (*RelOptInfo, *Path) {
 	return grouped, seed
 }
 
-// TestAddGroupingPathsSingleCandidatePerShape pins the §5 negative: one
-// hashed + one sorted candidate, never two of a kind, on a plain grouped
-// aggregate with the GUC on.
+// TestAddGroupingPathsSingleCandidatePerShape pins the §5 negative: never two
+// candidates of a kind, on a plain grouped aggregate with the GUC on. Under
+// PG's COSTS_EQUAL semantics (M0141-S2b-13) a fuzzily-tied hashed candidate
+// is REJECTED at the grouped rel — the keyful sorted path dominates the
+// keyless one (pathnode.c:532-540) — so the surviving set is the single
+// sorted candidate, not one of each. The per-kind invariant still holds.
 func TestAddGroupingPathsSingleCandidatePerShape(t *testing.T) {
 	cp := defaultCostParams()
 	agg := groupingTestAgg(upperOrderedInput(1000))
 	grouped, seed := groupingTestSeed(t, agg)
 	addGroupingPaths(grouped, seed, agg, agg.Child, nil, cp, DefaultPlannerSettings())
-	if len(grouped.Pathlist) != 2 {
-		t.Fatalf("pathlist holds %d paths, want exactly 2 (one hashed, one sorted)", len(grouped.Pathlist))
-	}
 	seen := map[AggStrategy]int{}
 	for _, p := range grouped.Pathlist {
 		if p.Kind != PathAgg {
@@ -172,8 +172,13 @@ func TestAddGroupingPathsSingleCandidatePerShape(t *testing.T) {
 		}
 		seen[p.AggStrategy]++
 	}
-	if seen[AggStrategyHashed] != 1 || seen[AggStrategySorted] != 1 {
-		t.Fatalf("strategies %v, want exactly one hashed and one sorted", seen)
+	if seen[AggStrategyHashed] > 1 || seen[AggStrategySorted] > 1 {
+		t.Fatalf("duplicate candidate of a kind: %v", seen)
+	}
+	// The fixture's pair is fuzzily tied: PG's pathkeys dominance rejects
+	// the keyless hashed candidate, leaving the sorted one.
+	if len(grouped.Pathlist) != 1 || seen[AggStrategySorted] != 1 {
+		t.Fatalf("pathlist = %d paths %v; want the lone sorted candidate (PG rejects tied hashed)", len(grouped.Pathlist), seen)
 	}
 }
 

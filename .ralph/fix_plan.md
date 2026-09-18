@@ -3891,7 +3891,7 @@ spill route is net-negative.
     makes insertion order matter. Instruments: `pg-plan-parity-diff.py`
     TPC-H + TPC-DS roll-ups above; shape census 75/99. Impl filed as
     M0141-S2b-13.
-  - [ ] **M0141-S2b-13** — impl: restore PG `COSTS_EQUAL` semantics in
+  - [x] **M0141-S2b-13** — impl: restore PG `COSTS_EQUAL` semantics in
     Kind: impl
     Parent: M0141-S2b-12
     `comparePathCostsFuzzily` (delete the M0129-S1 exact-cost fallback
@@ -3922,6 +3922,73 @@ spill route is net-negative.
     scale (M0129-S1's original gate was Q74 99s→14s at SF0.5; SF0.25
     recon showed no NL resurrection). If the sweep shows ANY new
     row-count or checksum delta, STOP — do not land.
+    **DONE 2026-09-18, landed. Full writeup:
+    `docs/design/0100-0149/m0141-s2b-13-costs-equal-restore.md`.**
+    The impl grew past (a)+(b)+(c): the minimal `costsEqual` restore
+    immediately surfaced that the dimension-fold comparator couldn't
+    express PG's pairwise table (the `partialSortVerdict` test caught
+    the missing `1.0000000001` tight-fuzz at all-equal dims), so
+    `comparePaths` was rewritten as a direct port of `add_path`'s
+    pairwise adjudication (pathnode.c:475-610): COSTS_DIFFERENT keeps
+    both; parameterised paths pretend NIL pathkeys; COSTS_BETTER* gated
+    on outer-rel/rows/parallel-safe; COSTS_EQUAL prefers better
+    pathkeys then equal-keys falls through parallel_safe → rows →
+    tight-fuzz → keep-old. `addToPartialPathlist` untouched. Tests
+    re-asserted to PG outcomes (param index-scan eviction under the
+    NIL pretense, 1-candidate grouped rel → fixture rebuilt on a real
+    `COSTS_DIFFERENT` trade-off, C19f fixture recalibrated to win by a
+    real margin since PG doesn't divide disk cost, EXPLAIN test now
+    expects the GroupAggregate render). Gates: units PASS;
+    tpch-spotcheck PASS (Q12=2/Q13=34); tpch-acceptance-arm 24/24 vs
+    HEAD; tpcds-sf025 sweep PASS=96/0/0/0 SKIP=3, 64 plans changed,
+    154s→149s; TPC-H parity match 7→8 (same-epoch HEAD also 8, verdict
+    sets identical — nothing lost); TPC-DS parity match 2=2 (Q9/Q41).
+    CATEGORIES-EXCL-MATCH TPC-H: agg-strategy 8→3, parameterisation
+    5→4, qual-placement 4→3; join-order +2, join-method +1, scan-type
+    +1 adverse (inside the ±3 band). TPC-DS: agg-strategy 71→44,
+    sort-strategy 77→69, join-method −3, scan-type −3, join-order −1;
+    qual-placement +3, parameterisation +1, rendering +1 adverse.
+    `make ea-ratchet` 70→76 (+13 NEW all relset-key churn — estimator
+    untouched; Q85's reason-early order matches PG itself; Q54 a node
+    rename), baseline re-pinned to 76 per M0142-0012 precedent; NEW
+    findings filed as **M0141-S2b-14**. Q74 sanity SF0.25 (largest
+    loaded scale): 1.8s, fewer NLs than PG's own plan — no NL
+    resurrection.
+    Movement: yes — CATEGORIES-EXCL-MATCH aggregation-strategy 71→44
+    (TPC-DS) / 8→3 (TPC-H) and match 7→8.
+  - [ ] **M0141-S2b-14** — recon/triage: the 13 NEW ea-ratchet findings
+    S2b-13's plan churn surfaced (baseline re-pinned to 76).
+    Kind: recon
+    Parent: M0141-S2b-13
+    Inline triage in the S2b-13 design
+    doc's Gates section classifies all 13 as relset-key churn, not new
+    mechanisms: Q85 ×4 (reason joined early — same order PG itself
+    uses; the underlying `web_sales⋈web_returns` under-estimate is
+    pre-existing), Q61 ×3 / Q68 ×2 / Q89 / Q7 / Q13 (the known ~40x
+    `date_dim+store_sales`-family under-estimates re-keyed under new
+    join decompositions), Q54 (HashAggregate→GroupAggregate node rename
+    at identical est 22 / act 0). Resume: confirm each against
+    `bench/tpcds/plans-pg/Q*.txt` join orders; if any isolates a real
+    estimator defect (candidate: Q61 `date_dim+store+store_sales` HJ
+    est 23 vs PG 8, act 0), file the estimator fix; else close.
+  - [ ] **M0141-S2b-15** — impl (small): gather row-stamp divergence found
+    by S2b-13's C19f trace. `makeGatherPath`/`makeGatherMergePath`
+    (`gatherpaths.go:273`) always stamp `Rows = computeGatherRows(sub)`
+    (`sub.Rows × parallel divisor`). PG's `cost_gather`/`cost_gather_merge`
+    stamp `rel->rows` unless the caller overrides —
+    `generate_gather_paths` passes `override_rows=false` for scan AND
+    join rels (allpaths.c:3091-3112, :557, :3518), so a scan/join Gather
+    carries the relation's own total (e.g. 186), not the
+    divide-then-multiply round-trip (e.g. 187). Fix: pass the
+    override-flag equivalent per call site — `addBaseRelGatherPaths` +
+    `joinsearchlevel.go`/`geqo.go` sites take `rel.Rows`;
+    `generateUpperRelGatherPaths` keeps `computeGatherRows`. Effect is
+    small: the off-by-one only reaches `add_path`'s `rows` tie-break
+    inside fuzzy ties and shifts EXPLAIN `rows=`. Gates: units +
+    spotcheck + SF0.25 sweep; expect a few plan churns where a gather
+    sits inside a fuzz band.
+    Kind: impl
+    Parent: M0141-S2b-13
   - [x] **M0141-S2b-7** — filed 2026-09-17 by M0141-S7's corpus measurement
     (design doc's "Update 2026-09-17h"). `electOrderedGrouping`
     (`upperorderedgrouping.go:236`) calls `addOrderedPaths` directly, once

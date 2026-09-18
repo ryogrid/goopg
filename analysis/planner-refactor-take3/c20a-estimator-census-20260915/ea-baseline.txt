@@ -1,10 +1,10 @@
 # EA parity ratchet baseline — one line per finding.
 # tol=2.0 floor=10.0
+Q13:customer_address+customer_demographics+date_dim+store_sales
 Q14:catalog_sales+date_dim
 Q14:catalog_sales+date_dim+item
 Q14:date_dim+item+web_sales
 Q14:date_dim+web_sales
-Q19:customer+date_dim+store_sales
 Q23:catalog_sales+cte:frequent_ss_items+customer+date_dim
 Q23:catalog_sales+customer+date_dim
 Q23:cte:frequent_ss_items+customer+date_dim+web_sales
@@ -42,18 +42,20 @@ Q60:cte:cs
 Q60:cte:cs+cte:ss+cte:ws
 Q60:cte:ss
 Q60:cte:ws
-Q61:customer+customer_address+date_dim+item+promotion+store_sales
-Q61:customer+customer_address+date_dim+promotion+store_sales
-Q61:customer+customer_address+date_dim+store_sales
+Q61:customer+date_dim+promotion+store+store_sales
+Q61:customer+date_dim+promotion+store_sales
+Q61:date_dim+store+store_sales
+Q61:date_dim+store_sales
 Q63:date_dim+item+store_sales
-Q68:customer_address+date_dim+store+store_sales
-Q68:customer_address+date_dim+store_sales
+Q68:date_dim+store+store_sales
+Q68:date_dim+store_sales
 Q73:date_dim+store+store_sales
 Q73:date_dim+store_sales
 Q78:cte:cs
 Q78:cte:ss
 Q78:cte:ss+cte:ws
 Q78:cte:ws
+Q7:customer_demographics+date_dim+item+store_sales
 Q80:cte:csr
 Q80:cte:csr+cte:ssr+cte:wsr
 Q80:date_dim+item+promotion+store+store_sales
@@ -63,7 +65,11 @@ Q83:cte:cr_items
 Q83:cte:sr_items
 Q83:cte:wr_items
 Q84:customer+customer_address+customer_demographics+household_demographics+income_band+store_returns
-Q89:date_dim+store+store_sales
+Q85:customer_demographics+date_dim+reason+web_page+web_returns+web_sales
+Q85:date_dim+reason+web_page+web_returns+web_sales
+Q85:date_dim+reason+web_returns+web_sales
+Q85:reason+web_returns+web_sales
+Q89:date_dim+store_sales
 Q8:customer+customer_address+store
 Q92:date_dim+web_sales
 Q95:cte:ws_wh+customer_address+date_dim+web_returns+web_site+ws1

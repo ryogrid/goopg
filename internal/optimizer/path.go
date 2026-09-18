@@ -929,30 +929,19 @@ func comparePathCostsFuzzily(p1, p2 *Path, fuzz float64) pathCostComparison {
 	if p2.Cost.Startup > p1.Cost.Startup*fuzz {
 		return costsBetter1
 	}
-	// Both total and startup are fuzzily equal. Use the actual (non-fuzzy)
-	// cost to pick a direction rather than returning costsEqual. Returning
-	// costsEqual would let a non-cost dimension (typically pathkeys) decide
-	// dominance alone — a hash path with no pathkeys then loses to a
-	// near-identically-costed merge path with pathkeys. For CTE self-joins
-	// with low row-count estimates, both paths land inside the 1% fuzz band
-	// and the hash path is silently rejected, leaving only nested-loop
-	// plans. A weak actual-cost directional signal preserves the tie-breaking
-	// cost comparison that makes the paths incomparable (hash cheaper, merge
-	// has pathkeys), so both survive and setCheapest can pick the cheaper
-	// one. M0129-S1.
-	if p1.Cost.Total < p2.Cost.Total {
-		return costsBetter1
-	}
-	if p2.Cost.Total < p1.Cost.Total {
-		return costsBetter2
-	}
-	// Truly equal on total; use startup as the final tie-break.
-	if p1.Cost.Startup < p2.Cost.Startup {
-		return costsBetter1
-	}
-	if p2.Cost.Startup < p1.Cost.Startup {
-		return costsBetter2
-	}
+	// Fuzzily the same on both costs -> costsEqual (pathnode.c:237). PG
+	// deliberately does NOT break this tie on exact cost: at the standard
+	// fuzz level the paths are declared equal so the non-cost dimensions
+	// (pathkeys, parallel safety, required outer rels) and insertion order
+	// decide in add_path, which is the semantics that keeps the first
+	// candidate on an all-equal contest and lets a pathkeyed path dominate
+	// a keyless one. M0129-S1 once kept an exact-cost fallback here to
+	// stop a keyless hash path losing a fuzzy tie to a pathkeyed merge
+	// rival in CTE self-joins (TPC-DS Q74); M0141-S2b-12's recon showed the
+	// nested-loop pathology was actually removed by the same commit's
+	// initialRelRows row-estimate fallback, while this deviation masked
+	// PG's tie-break semantics at every serial pathlist — removed by
+	// M0141-S2b-13.
 	return costsEqual
 }
 
@@ -967,32 +956,6 @@ const (
 	dimBetter2
 	dimIncomparable
 )
-
-func costDim(c pathCostComparison) dimensionCmp {
-	switch c {
-	case costsBetter1:
-		return dimBetter1
-	case costsBetter2:
-		return dimBetter2
-	case costsDifferent:
-		return dimIncomparable
-	default:
-		return dimEqual
-	}
-}
-
-// boolDim compares two eligibility booleans where true is "better" (e.g.
-// parallel_safe): true dominates false.
-func boolDim(a, b bool) dimensionCmp {
-	switch {
-	case a == b:
-		return dimEqual
-	case a && !b:
-		return dimBetter1
-	default:
-		return dimBetter2
-	}
-}
 
 // outerDim compares required-outer relid sets: a path requiring FEWER outer
 // relations (a subset) is less constrained and therefore better; unrelated sets
@@ -1025,37 +988,107 @@ const (
 	relBDominates
 )
 
-// comparePaths reduces the per-dimension comparisons to a single relationship. A
-// dominates B iff A is no worse than B on every dimension and strictly better on
-// at least one; if A is better on one axis and B on another they are
-// incomparable and both survive.
+// comparePaths reproduces add_path's pairwise dominance decision
+// (pathnode.c:480-618). a is the newcomer, b the incumbent: relADominates is
+// PG's remove_old, relBDominates/relEqual are PG's accept_new=false (relEqual
+// keeps the keep-first tie named), and relIncomparable keeps both. The
+// decision is a conditional table, not a dimension-agnostic fold: at
+// COSTS_EQUAL better pathkeys only dominate when outer rels, row count and
+// parallel safety also permit, and the all-equal contest is re-decided by
+// rows and a much tighter fuzz factor (1.0000000001 — an exact comparison
+// produced platform-specific plan variation through cost roundoff).
 func comparePaths(a, b *Path) pathRel {
-	dims := []dimensionCmp{
-		costDim(comparePathCostsFuzzily(a, b, stdFuzzFactor)),
-		comparePathkeysDim(a.Pathkeys, b.Pathkeys),
-		boolDim(a.ParallelSafe, b.ParallelSafe),
-		outerDim(a.RequiredOuter, b.RequiredOuter),
+	costcmp := comparePathCostsFuzzily(a, b, stdFuzzFactor)
+	if costcmp == costsDifferent {
+		// A real startup/total trade-off: PG keeps both without consulting
+		// the other dimensions (pathnode.c:502-510).
+		return relIncomparable
 	}
-	hasA, hasB := false, false
-	for _, d := range dims {
-		switch d {
-		case dimIncomparable:
-			return relIncomparable
-		case dimBetter1:
-			hasA = true
-		case dimBetter2:
-			hasB = true
+	// Parameterized paths pretend to have no pathkeys (pathnode.c:475).
+	var aKeys, bKeys []PathKey
+	if a.RequiredOuter == 0 {
+		aKeys = a.Pathkeys
+	}
+	if b.RequiredOuter == 0 {
+		bKeys = b.Pathkeys
+	}
+	keyscmp := comparePathkeysDim(aKeys, bKeys)
+	if keyscmp == dimIncomparable {
+		// PATHKEYS_DIFFERENT: PG skips the dominance table entirely and
+		// keeps both (pathnode.c:512).
+		return relIncomparable
+	}
+	outercmp := outerDim(a.RequiredOuter, b.RequiredOuter)
+	switch costcmp {
+	case costsBetter1:
+		// COSTS_BETTER1: a dominates b iff a's pathkeys are not worse and a
+		// is no more parameterized, produces no more rows, and is no less
+		// parallel-safe (pathnode.c:586-596).
+		if keyscmp != dimBetter2 && outercmp != dimBetter2 && outercmp != dimIncomparable &&
+			a.Rows <= b.Rows && (!b.ParallelSafe || a.ParallelSafe) {
+			return relADominates
 		}
+		return relIncomparable
+	case costsBetter2:
+		// COSTS_BETTER2: the mirror image (pathnode.c:597-608).
+		if keyscmp != dimBetter1 && outercmp != dimBetter1 && outercmp != dimIncomparable &&
+			a.Rows >= b.Rows && (!a.ParallelSafe || b.ParallelSafe) {
+			return relBDominates
+		}
+		return relIncomparable
 	}
-	switch {
-	case hasA && hasB:
-		return relIncomparable // a trade-off across axes
-	case hasA:
-		return relADominates
-	case hasB:
-		return relBDominates
+	// COSTS_EQUAL (pathnode.c:524-585).
+	switch keyscmp {
+	case dimBetter1:
+		// PATHKEYS_BETTER1: a's keys dominate only when a is no more
+		// parameterized, no heavier, and no less parallel-safe.
+		if (outercmp == dimEqual || outercmp == dimBetter1) &&
+			a.Rows <= b.Rows && (!b.ParallelSafe || a.ParallelSafe) {
+			return relADominates
+		}
+		return relIncomparable
+	case dimBetter2:
+		// PATHKEYS_BETTER2: mirror image — b's keys dominate under the
+		// symmetric conditions.
+		if (outercmp == dimEqual || outercmp == dimBetter2) &&
+			a.Rows >= b.Rows && (!a.ParallelSafe || b.ParallelSafe) {
+			return relBDominates
+		}
+		return relIncomparable
+	}
+	// PATHKEYS_EQUAL (pathnode.c:544-575): same keys and fuzzily-equal cost,
+	// so keep just one. Outer rels decide first; on equal outers the chain
+	// is parallel-safety, then rows, then the tight-fuzz cost comparison —
+	// "If things are still tied, arbitrarily keep only the old path."
+	switch outercmp {
+	case dimEqual:
+		switch {
+		case a.ParallelSafe && !b.ParallelSafe:
+			return relADominates
+		case !a.ParallelSafe && b.ParallelSafe:
+			return relBDominates
+		case a.Rows < b.Rows:
+			return relADominates
+		case a.Rows > b.Rows:
+			return relBDominates
+		case comparePathCostsFuzzily(a, b, 1.0000000001) == costsBetter1:
+			return relADominates
+		default:
+			return relEqual
+		}
+	case dimBetter1:
+		if a.Rows <= b.Rows && (!b.ParallelSafe || a.ParallelSafe) {
+			return relADominates
+		}
+		return relIncomparable
+	case dimBetter2:
+		if a.Rows >= b.Rows && (!a.ParallelSafe || b.ParallelSafe) {
+			return relBDominates
+		}
+		return relIncomparable
 	default:
-		return relEqual
+		// Different parameterizations: keep both.
+		return relIncomparable
 	}
 }
 

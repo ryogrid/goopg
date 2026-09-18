@@ -715,21 +715,32 @@ func TestElectOrderedGroupingDeclinesPristine(t *testing.T) {
 	}
 }
 
-// TestElectOrderedGroupingElectsNoSortAtQ4Numbers: with Q4's live costs the
+// TestElectOrderedGroupingElectsNoSortAtQ4Numbers: on a Q4-shaped rel the
 // loop elects the no-sort sorted candidate (the slice-1 pin's election,
 // end to end through build + copy-back): elected, bare *Aggregate winner,
-// winner spec (sorted strategy) copied back onto agg.node.
+// winner spec (sorted strategy) copied back onto agg.node. The fixture's
+// pair is a genuine startup/total TRADE-OFF — under COSTS_EQUAL
+// (M0141-S2b-13) Q4's literal fuzzy tie now rejects the hashed candidate
+// upstream at the grouped rel (that is the tested behaviour in
+// groupingpaths_test.go); a surviving 2-candidate election needs a
+// COSTS_DIFFERENT pair, which is what a LIMIT-context rel (ConsiderStartup)
+// legitimately keeps.
 func TestElectOrderedGroupingElectsNoSortAtQ4Numbers(t *testing.T) {
 	aggNode, groupCol, outSchema := r47slice2GroupFixture()
 	u := newUpperRels()
 	grouped := fetchUpperRel(u, UpperGroupAgg, 0, 0)
+	// Startup matters on this rel so the cheaper-startup/dearer-total
+	// hashed candidate is genuinely incomparable to the sorted one
+	// (costsDifferent) instead of dominated — both survive to the
+	// election, as they do under upstream add_path.
+	grouped.ConsiderStartup = true
 	mkSpec := func() *Aggregate {
 		return &Aggregate{Child: aggNode.Child, GroupExprs: []Expr{groupCol}, schema: outSchema}
 	}
 	sorted := r47slice2SortedCand(mkSpec(), []PathKey{{Expr: groupCol, SortAsc: true}}, Cost{Startup: 69094, Total: 70122})
 	sorted.Rel = grouped
 	hashed := &Path{Kind: PathAgg, AggStrategy: AggStrategyHashed, Agg: mkSpec(),
-		Rows: 5, Cost: Cost{Startup: 68909, Total: 69911}, Rel: grouped,
+		Rows: 5, Cost: Cost{Startup: 50000, Total: 71000}, Rel: grouped,
 		Children: []*Path{newPrebuiltPath(grouped, aggNode.Child)}}
 	addPath(grouped, sorted, "test")
 	addPath(grouped, hashed, "test")

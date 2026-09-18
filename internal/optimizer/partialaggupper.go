@@ -397,18 +397,12 @@ func addPartialAggSplitPath(u *upperRels, grouped *RelOptInfo, seed *Path, aggNo
 		traceUpperGate("agg-upper", upperSplitVerdict(split), upperSplitDetail(workers, d))
 		return split
 	}
-	if groupingHashable(aggNode, false) || aggNode.GroupingSets != nil {
-		// R47 slice 1: per-candidate spec clone (see groupingpaths.go).
-		hashSpec := *aggNode
-		addPath(grouped, &Path{
-			Kind: PathAgg, AggStrategy: AggStrategyHashed, Agg: &hashSpec,
-			Rel: grouped, Rows: finalGroups,
-			DisabledNodes: disabledNodesFor(!ps.EnableHashAgg, nsGather),
-			Cost: costAgg(cp, AggStrategyHashed, inputRows, nsGatherCost.Startup, nsGatherCost.Total,
-				nGroupCols, finalGroups, nAggs, inNcols, inAvgVar),
-			Children: []*Path{nsGather},
-		}, partialAggNoSplitProducer)
-	}
+	// Candidate order mirrors add_paths_to_grouping_rel's
+	// can_sort-before-can_hash (planner.c): the whole SORTED family is
+	// filed before the HASHED arm. With COSTS_EQUAL restored
+	// (comparePathCostsFuzzily, M0141-S2b-13) insertion order decides
+	// fuzzy ties, so the order is load-bearing, not cosmetic — same
+	// change S2b-11 made in groupingpaths.go for the serial arm.
 	if aggNode.GroupingSets == nil && !groupingHasSpecialAgg(aggNode) {
 		sortedInput := sortPathForBounded(nsGather, pathkeysForSortKeys(groupKeysSortKeys(aggNode)), cp, -1)
 		// R47 slice 1: per-candidate spec clone (see groupingpaths.go).
@@ -478,6 +472,18 @@ func addPartialAggSplitPath(u *upperRels, grouped *RelOptInfo, seed *Path, aggNo
 				nGroupCols, finalGroups, nAggs, inNcols, inAvgVar),
 			Pathkeys: workerGM.Pathkeys, Children: []*Path{workerGM},
 		}, partialAggGatherMergeProducer)
+	}
+	if groupingHashable(aggNode, false) || aggNode.GroupingSets != nil {
+		// R47 slice 1: per-candidate spec clone (see groupingpaths.go).
+		hashSpec := *aggNode
+		addPath(grouped, &Path{
+			Kind: PathAgg, AggStrategy: AggStrategyHashed, Agg: &hashSpec,
+			Rel: grouped, Rows: finalGroups,
+			DisabledNodes: disabledNodesFor(!ps.EnableHashAgg, nsGather),
+			Cost: costAgg(cp, AggStrategyHashed, inputRows, nsGatherCost.Startup, nsGatherCost.Total,
+				nGroupCols, finalGroups, nAggs, inNcols, inAvgVar),
+			Children: []*Path{nsGather},
+		}, partialAggNoSplitProducer)
 	}
 	// R54 Step-0: same admission record as the PLAIN arm above — both exits
 	// filed candidates, so both are admissions of the upper-rel round.
