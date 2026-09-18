@@ -136,6 +136,15 @@ check deny  'mv scripts/ralph_protected_regions.py /tmp/x.py'
 check deny  'chmod -x scripts/ralph-file-guard.sh'
 check deny  'cp /tmp/s.json .claude/settings.json'
 check deny  'cp /tmp/s.json .codex/hooks.json'
+check deny  'cp /tmp/s.json .devin/hooks.v1.json'
+check deny  'printf x > .devin/config.local.json'
+check deny  'rm .devin/config.json'
+check deny  'printf x > .claude/settings.local.json'
+check allow 'cat .devin/hooks.v1.json'
+check deny  'rm -rf .devin'
+check deny  'mv .devin /tmp/x'
+check deny  'rm -rf .codex'
+check deny  'printf x > .devin/mcp_config.json'
 check deny  'printf x >> .ralph/PROMPT.md'
 check deny  'perl -pi -e "s/a/b/" scripts/lib/gate-stamp.sh'
 check deny  'truncate -s0 scripts/ref-clusters-ensure.sh'
@@ -305,14 +314,19 @@ fcheck allow "$(ej Write "$TD/AGENT.md" "$(sed 's/status note: old/status note: 
 fcheck deny  "$(ej Edit "$TD/.ralph/fix_plan.md" '1. do the important thing' '1. do my thing')"
 fcheck allow "$(ej Edit "$TD/.ralph/fix_plan.md" '- [ ] **M0142-0001' '- [x] **M0142-0001')"
 fcheck allow "$(ej Edit "$TD/other.md" a b)"
-mkdir -p "$TD/scripts/lib" "$TD/.githooks" "$TD/.claude" "$TD/.codex"
-for f in scripts/ralph-bash-guard.sh scripts/lib/gate-stamp.sh .githooks/pre-commit .claude/settings.json .codex/hooks.json .ralph/PROMPT.md .ralph/gate-exceptions.md scripts/other.sh; do
+mkdir -p "$TD/scripts/lib" "$TD/.githooks" "$TD/.claude" "$TD/.codex" "$TD/.devin"
+for f in scripts/ralph-bash-guard.sh scripts/lib/gate-stamp.sh .githooks/pre-commit .claude/settings.json .codex/hooks.json .devin/hooks.v1.json .devin/config.local.json .claude/settings.local.json scripts/ralph-devin-guard-adapter.py .ralph/PROMPT.md .ralph/gate-exceptions.md scripts/other.sh; do
   printf 'x\n' > "$TD/$f"
 done
 fcheck deny  "$(ej Edit "$TD/scripts/ralph-bash-guard.sh" x y)"
 fcheck deny  "$(ej Write "$TD/.githooks/pre-commit" 'exit 0' '')"
 fcheck deny  "$(ej MultiEdit "$TD/.claude/settings.json" x y)"
 fcheck deny  "$(ej MultiEdit "$TD/.codex/hooks.json" x y)"
+fcheck deny  "$(ej Edit "$TD/.devin/hooks.v1.json" x y)"
+fcheck deny  "$(ej Write "$TD/.devin/config.local.json" x '')"
+fcheck deny  "$(ej Edit "$TD/.claude/settings.local.json" x y)"
+fcheck deny  "$(ej Edit "$TD/scripts/ralph-devin-guard-adapter.py" x y)"
+fcheck deny  "$(ej Write "$TD/.devin/mcp_config.json" x '')"
 fcheck deny  "$(ej Edit "$TD/.ralph/PROMPT.md" x y)"
 fcheck deny  "$(ej Edit "$TD/scripts/lib/gate-stamp.sh" x y)"
 fcheck deny  "$(ej Edit "$TD/.ralph/gate-exceptions.md" x y)"

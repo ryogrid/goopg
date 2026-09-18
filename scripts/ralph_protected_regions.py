@@ -67,6 +67,7 @@ HARNESS_SUFFIXES = (
     ".claude/settings.json",
     ".codex/hooks.json",
     ".codex/config.toml",
+    ".claude/settings.local.json",
     ".ralph/PROMPT.md",
     ".ralph/gate-exceptions.md",
     "scripts/ref-clusters-ensure.sh",
@@ -115,6 +116,9 @@ def kind_of(path):
     if len(parts) >= 2 and parts[-2] == "scripts" and base.startswith("ralph-") and "guard" in base:
         return "harness"
     if ".githooks" in parts[:-1] or "/.git/hooks/" in "/" + norm:
+        return "harness"
+    # Codex / Devin hook wiring and config: the whole directory is harness.
+    if ".codex" in parts[:-1] or ".devin" in parts[:-1]:
         return "harness"
     if any(_ends(norm, s) for s in HARNESS_SUFFIXES):
         return "harness"

@@ -6,6 +6,7 @@
 .ralph/.ralph_session
 .ralph/.ralph_session_history
 .ralph/.claude_session_id
+.ralph/.devin_session_id
 .ralph/.response_analysis
 .ralph/.circuit_breaker_state
 .ralph/.circuit_breaker_history
