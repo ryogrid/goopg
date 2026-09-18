@@ -1,64 +1,60 @@
-Task: P0-E7 — bulk re-measurement since 2026-09-16 05:44 (banner item 0,
-still the only selectable item). PARTIAL this loop (task stays unchecked
-in fix_plan.md). Committed: c6d5747f8.
+Task: P0-E7 — bulk re-measurement since 2026-09-16 05:44 (banner item 0).
+**DONE and committed this loop** (`1969b9ead`). All six named P0-E7
+sub-items are now measured; task is `[x]` in fix_plan.md. Banner item 0 is
+therefore satisfied and item 1 ("Regressions found by P0-E7") is now the
+selection target for the NEXT loop — re-read the banner first, since S1
+says the banner (not this file) is the ordering authority.
 
-Files: `docs/design/0100-0149/p0-e7-bulk-re-measurement.md` (new
-"tpch-acceptance-arm.sh OFF/ON digest + M0142-0008 chain A/B" section,
-Status line update, "Not yet measured" note), `.ralph/fix_plan.md`
-(P0-E7 progress note, third sub-entry, 2026-09-18c), `.ralph/deferral_ledger.md`
-(new row, task-id P0-E7, closes the acceptance-arm/M0142-0008 items),
-`docs/design/README.md` (p0-e7 index row updated). Two throwaway
-binaries built+deleted (`tmp/goopg-p0e7-abtest-{on,off}` +
-`-runner`, tmp/ is gitignored). New tracked artifacts:
-`analysis/m0142/p0e7-admitsemianti-{off,on}.txt` +
-`.diff-vs-baseline.txt`. No production code touched (the OFF-arm
-patch to `internal/optimizer/joinsearchseam.go:313` was local, built,
-then `git checkout`'d back to HEAD before either arm ran — verified
-clean before commit).
+Files: `docs/design/0100-0149/p0-e7-bulk-re-measurement.md` (new "TPC-DS
+full-SF1 parity" section, `Status:` -> done), `.ralph/fix_plan.md` (P0-E7
+ticked `[x]`, new closing sub-entry, new task **P0-H12** filed under the
+P0 section for banner item 1), `.ralph/deferral_ledger.md` (closing P0-E7
+row), `docs/design/README.md` (p0-e7 index row updated to "done"). New
+tracked artifacts: `analysis/m0142/p0e7-tpcds-sf1-{goopg,pg}.plans.txt` +
+`-diff.txt`. No production code touched (`internal/`, `cmd/`, `go.mod`,
+`go.sum` all clean before and after).
 
-Key symbols/tools: `scripts/tpch-acceptance-arm.sh` (NO_BUILD=1,
-pre-built pinned binaries via GOOPG_BIN/RUNNER_BIN), the ONE production
-call site `extractSearchLeaves(chain, true)` at
-`internal/optimizer/joinsearchseam.go:313` (the M0142-0008 chain's only
-live effect).
+Key finding: the prior two loops' "~4-5h budget" for the TPC-DS SF1 capture
+was WRONG — that figure is `tpcds-sf025-regression.sh`'s **execution**-sweep
+cost (`cmd_sweep`, real query runs + 16 known 600s timeouts), not
+`scripts/capture-tpcds.sh`'s plan-only `EXPLAIN` cost (scale-independent —
+measured 2.3s goopg-side + 5.0s PG-side for the full 99-query SF1 corpus).
+Always check which of a script's two code paths (execute vs EXPLAIN-only) a
+budget note actually describes before inheriting it into a new task.
 
-Findings: ON (HEAD, admitSemiAnti=true) vs OFF (local-patch,
-admitSemiAnti=false) TPC-H SF1 22-query `-digest` sweep: **23/24 digest
-lines byte-identical**. Sole divergence Q9 — times out at the 600s cap
-in BOTH arms, differing only in which of two simultaneous cancellation
-paths won ("statement timeout" server-side vs "user request" runner
-client-side, ~0.1s apart) — a scheduling race on an already-known-slow
-query (`q9_costdriven_mhj_cannot_be_cost_forced` memory), not a value
-or plan effect of the flag. Runner's own `-diff` reads VERDICT: FAIL
-only because it treats the two different error strings as a mismatch;
-this is documented in the design doc as the expected, understood
-outcome, not a blocking regression. This is the A/B evidence P0-E7 /
-csq-R2's reopen condition needed for the owner's freeze decision on the
-M0142-0008 chain (still FROZEN either way per the 2026-09-17 owner
-note — this loop only supplies the evidence, not the decision).
+Result: goopg `:65436` (fresh HEAD binary `a0e741a68`) vs PG
+`:65438`/`tpcds` (SF1, read-only) via `pg-plan-parity-diff.py`:
+`match=1/99` (Q41 only). Q9 — one of the two `match >= 2` floor queries,
+set by `m0137-0004` **at SF0.25** where Q9 does match — is
+`SHAPE-DIFF [scan-type]` at SF1. First-ever SF1 capture under this harness,
+no same-methodology baseline exists to bisect against directly, so this is
+recorded as new information (not asserted as a regression) and handed to
+the owner's banner as **P0-H12** (Kind: recon, Parent: P0-E7) rather than
+bisected inline — bisection needs a second capture pair built at
+`27d4ae001`, an independently-sized task.
 
-Next step: P0-E7's ONE remaining sub-item is TPC-DS full-SF1 parity vs
-`:65438` (`match >= 2` floor) via `scripts/capture-tpcds.sh` +
-`pg-plan-parity-diff.py` on a private 55xx clone of the SF1 data —
-budget ~4-5h per the sf025 script's own header, dedicate a whole loop's
-timeout to it. Once it lands, P0-E7 can be ticked `[x]` in fix_plan.md
-and banner item 1 (regressions found by P0-E7, if any) becomes
-selectable — re-read the banner first in case it changed. Also: once
-the owner records the M0142-0008 freeze decision in the banner, P0-H11
-(stale-comment cleanup, currently blocked) becomes selectable.
+Next step: re-read the `## Current Priority` banner in `.ralph/fix_plan.md`
+at the start of the next loop. If it still reads "P0-E7 is `[x]` as of
+2026-09-18 → item 1 selectable", pick the topmost selectable task under
+"1. Regressions found by P0-E7" — currently that section has no items
+besides the just-filed P0-H12 (a recon, immediately selectable — its own
+`Kind: recon` means it stays a measurement/investigation task, not a
+production-code change). P0-H11 remains blocked (owner decision pending).
+If the owner has since recorded a banner change, follow it instead (S1/the
+Working Set Carry precedence rule).
 
-Gates run: `go build ./...` clean (before/after the local patch and
-after the revert). `python3 scripts/ralph_protected_regions.py
-check-designdocs` exit 0. Pre-commit hook's pgbench smoke: PASS (ran
-automatically on the commit above). `tpch-acceptance-arm.sh` ran twice
-live (the actual measurement, not a gate in the pass/fail sense —
-stamped FAIL for the documented Q9-race reason, see design doc).
-`make ralph-state-guard`: found status/progress inconsistency from the
-prior loop's clean-exit "completed" marker, self-repaired to
-"in_progress", clean on re-check (same self-repairing pattern as the
-prior loop).
+Gates run: `go build ./...` clean (no production file touched).
+`python3 scripts/ralph_protected_regions.py check-designdocs` exit 0.
+Pre-commit hook's pgbench smoke: PASS (ran automatically on the commit
+above). `make ralph-state-guard`: found the same status/progress
+inconsistency pattern as the prior two loops (prior loop's clean-exit
+"completed" marker), self-repaired to "in_progress", clean on re-check.
 
-In-flight: none. No servers/scopes left running (verified via pgrep
-after both arms completed; `systemctl --user list-units
-'goopg-tpch-acceptance-*'` empty). Both throwaway abtest binaries
-deleted.
+In-flight: none. The goopg TPC-DS SF1 server (`:65436`) was started this
+loop (fresh HEAD binary) and stopped again via direct binary invocation
+(`tmp/goopg-tpcds-bin stop -D bench/tpcds/runtime_goopg/data` — NOT
+`bench/tpcds/server.sh stop`, which the RALPH_LOOP guard denies
+unconditionally for `stop`/`restart` regardless of target since the same
+wrapper can also stop the `:65438` PG reference); verified `down` again via
+`bench/tpcds/server.sh status` before this loop ended. No other
+servers/scopes left running.
