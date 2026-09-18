@@ -3022,6 +3022,44 @@ setting that yields a serial plan.
      probeSideIsLeft-coincidence flag), bitmap branch (per-branch
      `pbm` publication + its identity test needs a partial-bitmap
      producer first — flag the dependency).
+  - **Landed 2026-09-19 (slice B — merge branch; task stays
+    unchecked, bitmap slice remains).** Two production pieces:
+    `setOpBranchDrivingKindIsSupported` (`gatherpaths.go`) gains
+    `case PathMergeJoin` mirroring `partialPathDrivingKind`'s own
+    merge arm guard-for-guard (E-20 Cut 3: `RequiredOuter==0`,
+    two children, partial through `Children[0]` — the outer side;
+    no jointype guard, producer's trust re-checked at runtime by
+    `mergeJoinIsPartialCapable`), recursion stays branch-local so
+    bitmap-driven outers still refuse. Plus the coincidence
+    alignment: `attachParallelBitmapScan` /
+    `attachParallelIndexScan` (`parallel_scan.go`) gain explicit
+    `JoinAlgoMerge` arms descending the literal left — replaces
+    the `probeSideIsLeft(BuildLeft=false)` accident. No collector
+    work (hash below a merge outer is never collected — same
+    E-20 deferral the top level carries). Tests: 2 acceptance
+    (base + merge-of-merge / NL-over-merge spines), 6 refusals
+    (`...RefusesSetOpWithBadMergeJoinBranch`: parameterised/
+    malformed merge, bitmap outer, nested bitmap spine, nil
+    outer), `TestGatherOverSetOpMergeJoinBranchIdentity`
+    (forced-merge branch 40 rows + 90-row scan, serial-vs-parallel
+    at 1/2/4 workers — branch query must use comma/WHERE form;
+    `JOIN..ON` plans the non-search fast path and ignores
+    `enable_*` flips). Mutation-verified: neutered arm → exactly
+    the 2 acceptance tests fail. Completeness-only: zero Merge
+    Join `Parallel Append` heads in the corpus, sweep PLAN-SHAPE
+    99/99 identical. Gates: spotcheck PASS (Q12=2/Q13=34),
+    acceptance-arm A/B at `PGSHAPED=1` VERDICT PASS 24/24 MATCH
+    (earlier `PGSHAPED=0` attempt hit the known 600s Q9 plan +
+    mem_guard killed the `GOGC=off` baseline at 75% RAM — reran
+    bounded `GOGC=100`/`GOMEMLIMIT=8GiB`), sweep PASS=96
+    MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0, units all `ok`.
+    Same commit folds in an unrelated red-suite fix:
+    `TestCheckpointerDoDWritePacing`'s 20ms absolute bound →
+    relative bound vs the paced run (structural `progresses==0`
+    + `FlushAll` already prove the bypass; `buildPacer` is nil
+    for `spread=false`). Commit `0a5885bf6`. Remaining: bitmap
+    branch only (per-branch `pbm` publication + a partial-bitmap
+    producer needed for an end-to-end identity test).
 - [ ] **M0140-0006c-3 — mixed partial/non-partial SetOp append (Q5).**
   Kind: impl.
   Parent: M0140-0006c. Filed 2026-09-19 by 0006c-2's recon.

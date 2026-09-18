@@ -1,6 +1,6 @@
 # M0140-0006c-2 — widen the partial-SetOp admission past bare scans (hash-join branch)
 
-**Status:** accepted (partial — hash-join and nested-loop branches landed; merge/bitmap branches remain open under this same task)
+**Status:** accepted (partial — hash-join, nested-loop, and merge branches landed; the bitmap branch remains open under this same task)
 **Milestone:** M0140 (TPC-DS parallelism), plan-parity group
 **Harness:** `AGENT.md` §"Plan-parity harness (M0137–M0143)"
 **Task:** `.ralph/fix_plan.md` M0140-0006c-2
@@ -24,7 +24,7 @@ The first cut of the identity test claimed two opposite silent failure modes (N-
 
 ## Still open under this task (not deferred — the owning task stays `[ ]`)
 
-- **Merge-driven branch**: needs its own admission arm plus proof no walk must collect through a merge outer (no walk does today — a hash below a merge outer is un-prebuilt even at top level, E-20's territory, not this task's).
+- ~~**Merge-driven branch**~~ — **landed 2026-09-19 (slice B), see below.**
 - ~~**Nested-loop-driven branch**~~ — **landed 2026-09-19 (slice A), see below.**
 - **Bitmap-driven branch**: collectors and gates now descend, but `prebuildBitmap` publishes only to the top-level claim set while a branch attaches through its own leaf (whose `pbm` is nil by construction) — needs per-branch publication, then its own identity test.
 
@@ -82,6 +82,82 @@ Gates: `go build ./...` clean; `go test ./internal/optimizer/...`
 PASS real run (Q12=2/Q13=34, ~10.5s — first non-SKIPPED run since the
 `:65433` recovery); SF0.25 sweep PASS=96 MISMATCH=0 CKMISMATCH=0 ERROR=0
 TIMEOUT=0, PLAN-SHAPE 99/99 identical; units precommit all `ok`.
+
+## Update 2026-09-19b — slice B (merge branch) landed
+
+The recon's second slice — completeness-only (zero `Merge Join` heads
+under any `Parallel Append` in `bench/tpcds/plans-pg/`). Two production
+pieces, matching the scoping's "one arm + the coincidence-alignment flag":
+
+1. **Admission arm** — `setOpBranchDrivingKindIsSupported`
+   (`internal/optimizer/gatherpaths.go`) gains `case PathMergeJoin`,
+   mirroring `partialPathDrivingKind`'s own merge arm guard-for-guard
+   (E-20 Cut 3): `RequiredOuter == 0`, exactly two children, recurse
+   `Children[0]` — the OUTER side, since each worker merge-joins its
+   outer partition against the whole inner it sorts and reads itself.
+   No jointype guard (same stance as the top-level arm — the producer's
+   trust, re-checked at runtime by `mergeJoinIsPartialCapable`:
+   INNER/SEMI/ANTI/LEFT admit, FULL/RIGHT refuse). Recursion stays
+   branch-local, so a bitmap-driven outer still refuses while
+   hash/NL-driven outers admit through their own arms.
+2. **Coincidence alignment** — `attachParallelBitmapScan` and
+   `attachParallelIndexScan` (`internal/executor/parallel_scan.go`) each
+   gain an explicit `JoinAlgoMerge` arm descending the literal left,
+   replacing the `probeSideIsLeft(BuildLeft=false)` answer that was
+   correct only by construction (`createMergeJoinPlan` leaves `BuildLeft`
+   false). `attachParallelScan` already carried its own explicit merge
+   arm. No collector work: a hash below a merge outer is never collected
+   (`collectShareableJoins` refuses non-hash joins outright), so branch
+   workers private-build it — the same E-20 deferral the top level
+   carries, not new debt.
+
+Tests (2 acceptance + 6 refusals + 1 executor identity):
+
+- `TestPartialPathDrivingKindAcceptsSetOpWithMergeJoinBranch` — base
+  admission over two bare scans.
+- `TestPartialPathDrivingKindAcceptsSetOpWithNestedMergeJoinBranch` —
+  merge-of-merge spine recursion, plus the cross-arm NL-over-merge
+  spine (the case the bad-NL refusal map carried before B landed).
+- `TestPartialPathDrivingKindRefusesSetOpWithBadMergeJoinBranch` —
+  parameterised merge, one/zero-child merge, bitmap outer, nested
+  bitmap-outer spine, nil outer.
+- `TestGatherOverSetOpMergeJoinBranchIdentity` — forced-merge branch
+  (`pq_setop_a.id = pq_setop_c.aid`, 40 rows) over a bare `pq_setop_b`
+  scan; serial-vs-parallel multiset identity at 1/2/4 workers via
+  `planMergeForced` + `planTreeHasMergeUnderGather`. Note the branch
+  query must use comma/WHERE form: `JOIN..ON` plans through the
+  non-search fast path and ignores the `enable_*` flips (probe-verified).
+- `TestPartialPathDrivingKindRefusesSetOpWithBadHashJoinBranch` lost its
+  `merge-branch` case (now a valid admission — `Jointype`'s zero value
+  is `parser.JoinInner`), and the bad-NL map lost `merge-outer` for the
+  same reason.
+
+Mutation-verified: neutering the arm flips exactly the two acceptance
+tests to `PathPrebuilt`; refusals and every other slice's tests stay
+green. Corpus unchanged (completeness-only slice — no witness exists):
+sweep PLAN-SHAPE 99/99 identical.
+
+Gates: `go build ./...` clean; optimizer + executor package tests green;
+mutation check PASS; `tpch-spotcheck.sh` PASS (Q12=2/Q13=34);
+`tpch-acceptance-arm.sh` A/B — baseline binary built from
+`/tmp/goopg-wt-0006c2b` (pre-change code, binary sha `e27ea687…`,
+bit-identical rebuild) vs the staged binary, both arms at
+`GOOPG_PGSHAPED_DP=1` + `GOOPG_ANALYZE_SEED=20260905` on private clone
+port 5583 — VERDICT: PASS, 24/24 labels MATCH including Q9 (completes
+in ~5s under PGSHAPED=1; the earlier `PGSHAPED=0` attempt hit the known
+600s Q9 pathological plan, and its baseline arm was killed mid-sweep by
+the mem_guard at 75% RAM — rerun both arms with `GOGC=100` +
+`GOMEMLIMIT=8GiB`, which holds the sweep server near 8 GiB instead of
+the `GOGC=off` unbounded growth); SF0.25 sweep PASS=96 MISMATCH=0
+CKMISMATCH=0 ERROR=0 TIMEOUT=0, PLAN-SHAPE 99/99 identical; units
+precommit all `ok`.
+
+Same commit also folds in an unrelated red-suite fix (mandatory rule):
+`TestCheckpointerDoDWritePacing`'s IMMEDIATE-arm absolute 20ms bound
+flaked under gate concurrency; replaced with a relative bound vs the
+paced run's own elapsed — the `progresses==0` + `flushAllCalled`
+structural checks already prove the bypass deterministically
+(`buildPacer` returns nil for `spread=false`).
 
 ## Remaining-branch scoping — recon 2026-09-19 (analysis only, no production change)
 
