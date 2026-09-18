@@ -796,8 +796,12 @@ func wrapSetOpSortLimit(s *parser.SelectStmt, node Node, cat catalog.Catalog, ps
 		// non-set-op ORDER BY site derives (`limitTuplesForOrderedSort`,
 		// resolved against `ctx` — the set-op output context built above, the
 		// one the LIMIT clause's own resolution uses a few lines below).
+		// M0141-S2a-fix1-sweep-a: `out` above is already the set-op's own
+		// finished output row — nothing wider sits between it and the Sort
+		// to narrow away — so this arm passes no keep (full-width, same as
+		// before the sweep).
 		node = createOrderedPaths(upper, node, keys, s.Pos(), ps.costParams(),
-			tupleFraction, limitTuplesForOrderedSort(s, ctx))
+			tupleFraction, limitTuplesForOrderedSort(s, ctx), nil)
 	}
 
 	if s.Limit != nil || s.Offset != nil || s.WithTies {
@@ -1939,6 +1943,20 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 			}
 			keys = append(keys, SortKey{Expr: e, Desc: sb.Desc, NullsFirst: sortByNullsFirst(sb)})
 		}
+		// M0141-S2a-fix1-sweep-a: derive the ORDERED rel's narrow cost-input
+		// keep-set (sort keys ∪ the statement's own final SELECT-list
+		// output columns) before costing, the plain top-level ORDER BY arm
+		// only (ordered_input_narrow.go). Declines to nil (today's
+		// full-width sizing) whenever a ProjectSet of either kind is
+		// pending — its expanded schema is not this function's to name.
+		var orderedNarrowKeep []int
+		if selectSrfPending == nil {
+			if aboveNames, ok := finalSelectOutputNames(s, ctx, agg, win, ps, false); ok {
+				if keep, ok2 := deriveOrderedSortInputKeep(keys, aboveNames, ok, node); ok2 {
+					orderedNarrowKeep = keep
+				}
+			}
+		}
 		// C-12 (P4-03): the ORDER BY Sort is the ORDERED upper rel's path
 		// now — `create_ordered_paths` over the finished child, priced by
 		// `cost_sort` through `addPath` (upperordered.go) — and no longer
@@ -1957,12 +1975,12 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 		var loopBuilt Node
 		loopElected := false
 		if selectSrfPending == nil {
-			loopBuilt, loopElected = electOrderedGrouping(upper, agg, node, keys, s.Pos(), plannerSet.costParams(), orderTupleFraction, orderLimitTuples)
+			loopBuilt, loopElected = electOrderedGrouping(upper, agg, node, keys, s.Pos(), plannerSet.costParams(), orderTupleFraction, orderLimitTuples, orderedNarrowKeep)
 		}
 		if loopElected {
 			node = loopBuilt
 		} else {
-			node = createOrderedPaths(upper, node, keys, s.Pos(), plannerSet.costParams(), orderTupleFraction, orderLimitTuples)
+			node = createOrderedPaths(upper, node, keys, s.Pos(), plannerSet.costParams(), orderTupleFraction, orderLimitTuples, orderedNarrowKeep)
 		}
 		if srt, ok := node.(*Sort); ok {
 			// B-01c Slice 1: keys-only construction stamp (above not yet
@@ -2020,7 +2038,11 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 			// planner.c:1856) — the Sort sits above the ProjectSet
 			// expansion, so the pre-expansion count is not a bound on its
 			// input; the fraction itself is the statement's, captured above.
-			node = createOrderedPaths(upper, node, keys, s.Pos(), plannerSet.costParams(), orderTupleFraction, -1)
+			// M0141-S2a-fix1-sweep-a: the SRF post-sort Sort already runs
+			// directly over the ProjectSet's own output — nothing wider
+			// sits between them to narrow away — so this arm passes no
+			// keep (full-width, unchanged by the sweep).
+			node = createOrderedPaths(upper, node, keys, s.Pos(), plannerSet.costParams(), orderTupleFraction, -1, nil)
 			if srt, ok := node.(*Sort); ok {
 				// B-01c Slice 1: SRF post-sort arm — same keys-only stamp as the normal arm.
 				orderSort = srt
@@ -11033,7 +11055,9 @@ func wrapMinMaxOrderByDistinct(s *parser.SelectStmt, rewritten Node, cat catalog
 		// it. `limitTuples` is -1: this arm re-attaches ORDER BY / DISTINCT
 		// only, and the statement's LIMIT (if any) is applied above it by the
 		// caller, exactly as on the un-rewritten Aggregate path.
-		out = createOrderedPaths(upper, out, keys, s.Pos(), ps.costParams(), tupleFraction, -1)
+		// M0141-S2a-fix1-sweep-a: outSchema above is already the min/max
+		// rewrite's own single-column final row — nothing to narrow.
+		out = createOrderedPaths(upper, out, keys, s.Pos(), ps.costParams(), tupleFraction, -1, nil)
 	}
 	if s.Distinct {
 		// C-16: same DISTINCT upper-rel producer as the normal arm.

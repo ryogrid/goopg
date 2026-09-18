@@ -114,7 +114,7 @@ func TestOrderedSortUsesItsActualInputWidth(t *testing.T) {
 	defer restore()
 	cp := defaultCostParams()
 	in := upperOrderedInput(10)
-	sort := createOrderedPaths(newUpperRels(), in, upperOrderedKeys(), 0, cp, 0, -1).(*Sort)
+	sort := createOrderedPaths(newUpperRels(), in, upperOrderedKeys(), 0, cp, 0, -1, nil).(*Sort)
 	pc, ok := sort.PlanCostInfo()
 	if !ok {
 		t.Fatal("ordered Sort has no cost")

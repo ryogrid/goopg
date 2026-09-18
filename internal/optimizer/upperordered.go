@@ -61,7 +61,7 @@ const (
 // `limitTuples` is `cost_tuplesort`'s `limit_tuples` (C-13b): the absolute
 // count+offset bound, or <= 0 for none (the SRF post-sort arm always passes
 // -1 — `have_postponed_srfs`, planner.c:1856).
-func createOrderedPaths(u *upperRels, input Node, keys []SortKey, pos int, cp costParams, tupleFraction float64, limitTuples float64) Node {
+func createOrderedPaths(u *upperRels, input Node, keys []SortKey, pos int, cp costParams, tupleFraction float64, limitTuples float64, narrowKeep []int) Node {
 	if input == nil || len(keys) == 0 {
 		return input
 	}
@@ -76,6 +76,10 @@ func createOrderedPaths(u *upperRels, input Node, keys []SortKey, pos int, cp co
 	// The load-bearing step DESIGN §4.3 names: a fresh rel has NCols == 0,
 	// which `costSortRun` reads as "width unknown, charge no I/O".
 	sizeUpperRelFromNode(ordered, input)
+	// M0141-S2a-fix1-sweep-a: refine NCols/AvgVarBytes to the caller's
+	// narrow keep-set, when it derived one (ordered_input_narrow.go). A nil
+	// keep leaves the full-width sizing above untouched.
+	narrowOrderedRelWidths(ordered, input, narrowKeep)
 
 	// The input path. `newPrebuiltPath` leaves the cost zero (the C0 bridge
 	// never needed one); here the cost is the child's own — the search's

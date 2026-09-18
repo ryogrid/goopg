@@ -175,7 +175,7 @@ func groupingEmissionPathkeys(aggNode *Aggregate, cand *Path) []PathKey {
 // grouping rel would have lost to Finalize under parallel knobs);
 // at least one candidate translates (a Sort-only loop could only
 // re-price, never change the election versus the normal call).
-func electOrderedGrouping(u *upperRels, agg *aggregateSurface, node Node, keys []SortKey, stmtPos int, cp costParams, tupleFraction, limitTuples float64) (Node, bool) {
+func electOrderedGrouping(u *upperRels, agg *aggregateSurface, node Node, keys []SortKey, stmtPos int, cp costParams, tupleFraction, limitTuples float64, narrowKeep []int) (Node, bool) {
 	decline := func(reason string) (Node, bool) {
 		if dpTrace {
 			fmt.Fprintf(os.Stderr, "DPGROUP loop-decline reason=%s\n", reason)
@@ -217,6 +217,11 @@ func electOrderedGrouping(u *upperRels, agg *aggregateSurface, node Node, keys [
 	// Same input the normal call would size from (the finished aggregate
 	// node), so elected and declined paths size identically.
 	sizeUpperRelFromNode(ordered, agg.node)
+	// M0141-S2a-fix1-sweep-a: agg.node IS node (the gate above requires
+	// pointer equality), so the SAME keep-set the normal `createOrderedPaths`
+	// arm would narrow with applies unchanged here — sibling paths, same
+	// currency (pattern_sibling_paths_must_agree).
+	narrowOrderedRelWidths(ordered, agg.node, narrowKeep)
 	savedPathlist := append([]*Path(nil), ordered.Pathlist...)
 	savedTotal, savedStartup, savedParam := ordered.CheapestTotal, ordered.CheapestStartup, ordered.CheapestParameterized
 	savedSearchCandidates, savedSearchCandidateKeys := ordered.SearchCandidates, ordered.SearchCandidateKeys

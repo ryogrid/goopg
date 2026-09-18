@@ -84,7 +84,7 @@ func TestElectOrderedDistinctIgnoresStalePreDistinctOrderedEntry(t *testing.T) {
 	// stale entry compete cannot go unnoticed by accident.
 	preDistinct := upperOrderedInput(1000)
 	preDistinct.setPlanCost(PlanCost{StartupCost: 1, TotalCost: 1, PlanRows: 1000, PlanWidth: 1})
-	stalePos := createOrderedPaths(u, preDistinct, keys, 0, DefaultPlannerSettings().costParams(), 0, -1)
+	stalePos := createOrderedPaths(u, preDistinct, keys, 0, DefaultPlannerSettings().costParams(), 0, -1, nil)
 	if _, ok := stalePos.(*Sort); !ok {
 		t.Fatalf("setup: pre-distinct createOrderedPaths returned %T, want *Sort (unsorted seed)", stalePos)
 	}

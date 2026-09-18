@@ -61,7 +61,7 @@ func TestCreateOrderedPathsEmitsTheRewritesSortWithCostSortsPrice(t *testing.T) 
 	keys := upperOrderedKeys()
 	u := newUpperRels()
 
-	got := createOrderedPaths(u, in, keys, 77, cp, 0, -1)
+	got := createOrderedPaths(u, in, keys, 77, cp, 0, -1, nil)
 
 	srt, ok := got.(*Sort)
 	if !ok {
@@ -126,7 +126,7 @@ func TestCreateOrderedPathsChargesTheSpillOfALargeSort(t *testing.T) {
 	rows := sortRowsFillingBudget(cp.workMem, probe.NCols, 3.0)
 	in := upperOrderedInput(rows)
 
-	srt := createOrderedPaths(u, in, upperOrderedKeys(), 0, cp, 0, -1).(*Sort)
+	srt := createOrderedPaths(u, in, upperOrderedKeys(), 0, cp, 0, -1, nil).(*Sort)
 	pc, _ := srt.PlanCostInfo()
 
 	unsized := costSortRun(cp, rows, 0, 0, -1)
@@ -162,7 +162,7 @@ func TestCreateOrderedPathsThreadsSearchCandidatesOntoOrderedRel(t *testing.T) {
 	in.markFromJoinSearch()
 	in.setSearchRel(searchRel)
 
-	got := createOrderedPaths(u, in, keys, 0, cp, 0, -1)
+	got := createOrderedPaths(u, in, keys, 0, cp, 0, -1, nil)
 	if _, ok := got.(*Sort); !ok {
 		t.Fatalf("got %T, want *Sort (the searched tag alone, with no searchPathkeys claimed, must still stack the Sort)", got)
 	}
@@ -182,7 +182,7 @@ func TestCreateOrderedPathsThreadsSearchCandidatesOntoOrderedRel(t *testing.T) {
 // at its zero value, exactly like today (no field, no behavior).
 func TestCreateOrderedPathsLeavesSearchCandidatesNilForANonSearchedInput(t *testing.T) {
 	u := newUpperRels()
-	createOrderedPaths(u, upperOrderedInput(10), upperOrderedKeys(), 0, defaultCostParams(), 0, -1)
+	createOrderedPaths(u, upperOrderedInput(10), upperOrderedKeys(), 0, defaultCostParams(), 0, -1, nil)
 	ordered := fetchUpperRel(u, UpperOrdered, 0, 0)
 	if ordered.SearchCandidates != nil {
 		t.Fatalf("ordered.SearchCandidates = %v, want nil for a non-searched input", ordered.SearchCandidates)
@@ -224,7 +224,7 @@ func TestCreateOrderedPathsValidatesSearchCandidatePathkeys(t *testing.T) {
 	in.markFromJoinSearch()
 	in.setSearchRel(searchRel)
 
-	createOrderedPaths(u, in, keys, 0, cp, 0, -1)
+	createOrderedPaths(u, in, keys, 0, cp, 0, -1, nil)
 
 	ordered := fetchUpperRel(u, UpperOrdered, 0, 0)
 	if len(ordered.SearchCandidateKeys) != 3 {
@@ -291,7 +291,7 @@ func TestCreateOrderedPathsHonoursEnableSortAsAPreference(t *testing.T) {
 	cp.enableSort = false
 	u := newUpperRels()
 	lines := captureTrace(t, func() {
-		if _, ok := createOrderedPaths(u, upperOrderedInput(10), upperOrderedKeys(), 0, cp, 0, -1).(*Sort); !ok {
+		if _, ok := createOrderedPaths(u, upperOrderedInput(10), upperOrderedKeys(), 0, cp, 0, -1, nil).(*Sort); !ok {
 			t.Errorf("enable_sort=off must still emit the Sort")
 		}
 	})
@@ -323,10 +323,10 @@ func dppathLines(lines []string) []string {
 func TestCreateOrderedPathsNeverDropsTheSort(t *testing.T) {
 	cp := defaultCostParams()
 	in := upperOrderedInput(10)
-	if got := createOrderedPaths(newUpperRels(), in, nil, 0, cp, 0, -1); got != Node(in) {
+	if got := createOrderedPaths(newUpperRels(), in, nil, 0, cp, 0, -1, nil); got != Node(in) {
 		t.Fatalf("no keys: got %T, want the input back", got)
 	}
-	if _, ok := createOrderedPaths(nil, in, upperOrderedKeys(), 0, cp, 0, -1).(*Sort); !ok {
+	if _, ok := createOrderedPaths(nil, in, upperOrderedKeys(), 0, cp, 0, -1, nil).(*Sort); !ok {
 		t.Fatalf("no registry: the Sort was dropped")
 	}
 }
@@ -344,7 +344,7 @@ func TestC10cPreservedSideQualMovesThroughOrderedSortArm(t *testing.T) {
 	resid := &Filter{Child: j, Predicate: srcGt(0, "id", 1, 7)}
 	keys := []SortKey{{Expr: &ColumnRef{Index: 1, Name: "name", Type: catalog.Type{Name: "int4"}, SourceTableIdx: 1}}}
 
-	srt, ok := createOrderedPaths(newUpperRels(), resid, keys, 0, defaultCostParams(), 0, -1).(*Sort)
+	srt, ok := createOrderedPaths(newUpperRels(), resid, keys, 0, defaultCostParams(), 0, -1, nil).(*Sort)
 	if !ok {
 		t.Fatalf("the ORDERED rel did not emit a *Sort")
 	}
@@ -397,12 +397,12 @@ func TestCreateOrderedPathsInputArmIsReachableFromANode(t *testing.T) {
 	cp := defaultCostParams()
 	keys := upperOrderedKeys()
 
-	sorted, ok := createOrderedPaths(newUpperRels(), upperOrderedInput(10), keys, 0, cp, 0, -1).(*Sort)
+	sorted, ok := createOrderedPaths(newUpperRels(), upperOrderedInput(10), keys, 0, cp, 0, -1, nil).(*Sort)
 	if !ok {
 		t.Fatal("the first call must emit a Sort (it is the unordered arm)")
 	}
 	// `sorted` delivers `keys` by construction. Hand it back as the CHILD.
-	again := createOrderedPaths(newUpperRels(), sorted, keys, 0, cp, 0, -1)
+	again := createOrderedPaths(newUpperRels(), sorted, keys, 0, cp, 0, -1, nil)
 	if _, isSort := again.(*Sort); isSort && again != Node(sorted) {
 		t.Fatal("a second Sort was stacked over a child that already delivers the keys: " +
 			"the seam stopped carrying Pathkeys (upperorderedinput.go inputNodePathkeys)")
@@ -705,7 +705,7 @@ func TestElectOrderedGroupingDeclinesPristine(t *testing.T) {
 	keys := []SortKey{{Expr: &ColumnRef{Index: 0, Name: "o_orderpriority", Type: catalog.Type{Name: "bpchar"}}}}
 	ordered := fetchUpperRel(u, UpperOrdered, 0, 0)
 	beforeLen := len(ordered.Pathlist)
-	if got, ok := electOrderedGrouping(u, agg, aggNode, keys, 0, DefaultPlannerSettings().costParams(), 0, -1); ok || got != nil {
+	if got, ok := electOrderedGrouping(u, agg, aggNode, keys, 0, DefaultPlannerSettings().costParams(), 0, -1, nil); ok || got != nil {
 		t.Fatalf("index+hashed rel elected (ok=%v); want decline", ok)
 	}
 	after := fetchUpperRel(u, UpperOrdered, 0, 0)
@@ -736,7 +736,7 @@ func TestElectOrderedGroupingElectsNoSortAtQ4Numbers(t *testing.T) {
 	setCheapest(grouped)
 	agg := &aggregateSurface{node: aggNode}
 	keys := []SortKey{{Expr: &ColumnRef{Index: 0, Name: "o_orderpriority", Type: catalog.Type{Name: "bpchar"}}}}
-	got, ok := electOrderedGrouping(u, agg, aggNode, keys, 0, DefaultPlannerSettings().costParams(), 0, -1)
+	got, ok := electOrderedGrouping(u, agg, aggNode, keys, 0, DefaultPlannerSettings().costParams(), 0, -1, nil)
 	if !ok || got == nil {
 		t.Fatal("Q4-shaped rel declined; want the no-sort election")
 	}

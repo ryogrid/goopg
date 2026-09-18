@@ -59,7 +59,7 @@ func TestAddIncrementalSortPathsOffByDefaultIsInert(t *testing.T) {
 	cp := defaultCostParams()
 	u, in, _, _ := incrementalSortFixture()
 
-	createOrderedPaths(u, in, upperOrderedKeys(), 0, cp, 0, -1)
+	createOrderedPaths(u, in, upperOrderedKeys(), 0, cp, 0, -1, nil)
 
 	ordered := fetchUpperRel(u, UpperOrdered, 0, 0)
 	if len(ordered.Pathlist) != 1 {

@@ -200,7 +200,7 @@ func TestCreateOrderedPathsCarriesBoundToSort(t *testing.T) {
 	in := upperOrderedInput(100000)
 	keys := upperOrderedKeys()
 
-	bounded := createOrderedPaths(u, in, keys, 0, cp, 0, 100).(*Sort)
+	bounded := createOrderedPaths(u, in, keys, 0, cp, 0, 100, nil).(*Sort)
 	bpc, _ := bounded.PlanCostInfo()
 	rel := fetchUpperRel(u, UpperOrdered, 0, 0)
 	want := costSortRun(cp, 100000, relNCols(rel), relAvgVarBytes(rel), 100)
@@ -209,7 +209,7 @@ func TestCreateOrderedPathsCarriesBoundToSort(t *testing.T) {
 			bpc.StartupCost, bpc.TotalCost, 100+want.Startup, 100+want.Total)
 	}
 
-	plain := createOrderedPaths(newUpperRels(), upperOrderedInput(100000), keys, 0, cp, 0, -1).(*Sort)
+	plain := createOrderedPaths(newUpperRels(), upperOrderedInput(100000), keys, 0, cp, 0, -1, nil).(*Sort)
 	ppc, _ := plain.PlanCostInfo()
 	unbounded := costSortRun(cp, 100000, relNCols(rel), relAvgVarBytes(rel), -1)
 	if !approx(ppc.StartupCost, 100+unbounded.Startup) {
