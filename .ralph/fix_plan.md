@@ -3985,7 +3985,7 @@ spill route is net-negative.
     687463 — both engines essentially exact. Scorer caveat folded into
     S2b-15's scope note below.
     Movement: none
-  - [ ] **M0141-S2b-15** — impl (small): gather row-stamp divergence found
+  - [!] **M0141-S2b-15** — impl (small): gather row-stamp divergence found
     by S2b-13's C19f trace. `makeGatherPath`/`makeGatherMergePath`
     (`gatherpaths.go:273`) always stamp `Rows = computeGatherRows(sub)`
     (`sub.Rows × parallel divisor`). PG's `cost_gather`/`cost_gather_merge`
@@ -4012,6 +4012,46 @@ spill route is net-negative.
     sits inside a fuzz band.
     Kind: impl
     Parent: M0141-S2b-13
+    ESCALATION 2026-09-19 — implementation complete and staged
+    uncommitted; the commit is hard-blocked because
+    `bench/tpch/runtime_goopg/data.HOLD` (unclean-shutdown evidence
+    hold stamped 2026-09-18T22:52, owner-only recovery via
+    `scripts/tpch-ref-recover.sh --i-am-owner`) makes
+    `tpch-spotcheck` and `tpch-acceptance-arm` SKIP-BLOCKED, and
+    `.ralph/gate-exceptions.md` has no active row for this task.
+    Gate evidence already collected on the staged tree: units PASS;
+    `tpcds-sf025` sweep PASS=96 MISMATCH=0 + stamp; TPC-DS parity
+    match=2 (Q9/Q41, floor holds); TPC-H patched-vs-HEAD plans
+    byte-identical on a private preloss-clone copy (match=7 both,
+    floor holds); manual Q12=2/Q13=34 canonical; `make ea-ratchet`
+    10 NEW / 13 FIXED — all NEW `pg_est=None` relset-key churn
+    (triage + repin on resume). Resume: owner lifts the HOLD (or
+    grants an exception row) → re-run `tpch-spotcheck` +
+    `tpch-acceptance-arm` on the staged tree → triage ea findings →
+    commit. Design doc:
+    `docs/design/0100-0149/m0141-s2b-15-gather-rows-stamp.md`.
+    Movement: yes — CATEGORIES-EXCL-MATCH TPC-DS agg 44→43, sort
+    69→67, qual 23→22 at equal match floor (2=2 Q9/Q41); ea-ratchet
+    findings net 76→73; TPC-H byte-identical to HEAD (nothing lost).
+  - [ ] **M0141-S2b-16** — impl (small): partial-path `rows=` display
+    convention. S2b-15 fixed the path-model Gather stamp
+    (`rel->rows`), but the S2b-14-observed divergence — goopg EXPLAIN
+    shows TOTAL rows on partial nodes (`Parallel Seq Scan
+    rows=719876`) where PG shows per-worker rows (`rows=232218`) —
+    lives in the **post-pass** `rebuildWithGather`/`splitAggregate`
+    path (`internal/executor/` + `internal/optimizer/parallel.go`
+    region): serial-plan nodes keep their serial estimates under a
+    `Parallel` label. Stored partial-path `Path.Rows` is already
+    per-worker (`costParallelSeqscan` divides by the divisor, as
+    `cost_seqscan` does) — the post-pass never adopts it. Fix
+    direction: stamp the per-worker estimate on partial nodes when
+    the post-pass wraps a serial subtree, or re-derive at render;
+    scope carefully so Gather/leader-row accounting stays exact.
+    Ledger row: `s2b15-partial-path-display` (deferred from
+    M0141-S2b-15). Gates: units + spotcheck + SF0.25 sweep +
+    ea-ratchet (rows= keys will churn again).
+    Kind: impl
+    Parent: M0141-S2b-15
   - [x] **M0141-S2b-7** — filed 2026-09-17 by M0141-S7's corpus measurement
     (design doc's "Update 2026-09-17h"). `electOrderedGrouping`
     (`upperorderedgrouping.go:236`) calls `addOrderedPaths` directly, once
