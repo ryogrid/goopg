@@ -1,60 +1,64 @@
-Task: P0-E7 — bulk re-measurement since 2026-09-16 05:44 (banner item 0).
-**DONE and committed this loop** (`1969b9ead`). All six named P0-E7
-sub-items are now measured; task is `[x]` in fix_plan.md. Banner item 0 is
-therefore satisfied and item 1 ("Regressions found by P0-E7") is now the
-selection target for the NEXT loop — re-read the banner first, since S1
-says the banner (not this file) is the ordering authority.
+Task: P0-H12 — TPC-DS SF1 Q9 shape divergence: new or pre-existing? DONE and
+committed this loop (`641d561f7`). Finding: pre-existing, not a regression.
+Banner item 1 ("Regressions found by P0-E7") had exactly two children —
+P0-H11 (Parent: P0-E7, still `[!]`-equivalent: not selectable, owner decision
+on M0142-0008 pending) and P0-H12 (now `[x]`) — so item 1 is now exhausted
+with nothing selectable. **NEXT LOOP should re-read the banner and move to
+item 2: M0141-S2a-fix2r** (re-apply the PG-faithful `hashAggEntrySize`
+change that was discarded for parity reasons — owner Q4: no reverts;
+degradations it causes are filed as their own tasks, not reverted). Confirm
+by re-reading `.ralph/fix_plan.md`'s `## Current Priority` banner first
+(S1/Working Set Carry precedence — the banner, not this file, is the
+ordering authority) and re-grep `Parent: P0-E7` in case a concurrent loop
+filed a new child.
 
-Files: `docs/design/0100-0149/p0-e7-bulk-re-measurement.md` (new "TPC-DS
-full-SF1 parity" section, `Status:` -> done), `.ralph/fix_plan.md` (P0-E7
-ticked `[x]`, new closing sub-entry, new task **P0-H12** filed under the
-P0 section for banner item 1), `.ralph/deferral_ledger.md` (closing P0-E7
-row), `docs/design/README.md` (p0-e7 index row updated to "done"). New
-tracked artifacts: `analysis/m0142/p0e7-tpcds-sf1-{goopg,pg}.plans.txt` +
-`-diff.txt`. No production code touched (`internal/`, `cmd/`, `go.mod`,
-`go.sum` all clean before and after).
+Files: `docs/design/0100-0149/p0-h12-tpcds-sf1-q9-scan-type-divergence.md`
+(new), `docs/design/0100-0149/m0137-0004-tpcds-match-reference-reconciliation.md`
+(new "SF1 footnote" section), `docs/design/README.md` (new p0-h12 index
+row), `.ralph/fix_plan.md` (P0-H12 ticked `[x]` with findings).
+`analysis/m0142/p0h12-tpcds-sf1-{goopg-27d4ae001,pg}.plans.txt` +
+`-diff.txt` (new tracked artifacts). No production code touched
+(`internal/`, `cmd/`, `go.mod`, `go.sum` all clean before and after).
 
-Key finding: the prior two loops' "~4-5h budget" for the TPC-DS SF1 capture
-was WRONG — that figure is `tpcds-sf025-regression.sh`'s **execution**-sweep
-cost (`cmd_sweep`, real query runs + 16 known 600s timeouts), not
-`scripts/capture-tpcds.sh`'s plan-only `EXPLAIN` cost (scale-independent —
-measured 2.3s goopg-side + 5.0s PG-side for the full 99-query SF1 corpus).
-Always check which of a script's two code paths (execute vs EXPLAIN-only) a
-budget note actually describes before inheriting it into a new task.
+Key symbols/tools: `scripts/capture-tpcds.sh`, `scripts/pg-plan-parity-diff.py`,
+`git worktree add --detach`, `scripts/goopg-test-run.sh` (direct binary
+invocation, bypassing `bench/tpcds/server.sh`'s always-rebuild-from-HEAD
+behavior).
 
-Result: goopg `:65436` (fresh HEAD binary `a0e741a68`) vs PG
-`:65438`/`tpcds` (SF1, read-only) via `pg-plan-parity-diff.py`:
-`match=1/99` (Q41 only). Q9 — one of the two `match >= 2` floor queries,
-set by `m0137-0004` **at SF0.25** where Q9 does match — is
-`SHAPE-DIFF [scan-type]` at SF1. First-ever SF1 capture under this harness,
-no same-methodology baseline exists to bisect against directly, so this is
-recorded as new information (not asserted as a regression) and handed to
-the owner's banner as **P0-H12** (Kind: recon, Parent: P0-E7) rather than
-bisected inline — bisection needs a second capture pair built at
-`27d4ae001`, an independently-sized task.
+Method used (reusable pattern for any future "is this pre-existing"
+question): `git worktree add --detach /tmp/wt-<sha> <sha>`, build a binary
+there, serve it against the *existing* data dir on the shared non-reference
+port (`:65436` for TPC-DS SF1; never touch `:65432`/`:65433`/`:65438`),
+capture with `GOOPG_EXPECT_BIN_SHA256` pinned to the old binary's hash,
+diff against the already-saved HEAD capture. Worktree removed
+(`git worktree remove --force`) and temp binary/logs deleted after use.
 
-Next step: re-read the `## Current Priority` banner in `.ralph/fix_plan.md`
-at the start of the next loop. If it still reads "P0-E7 is `[x]` as of
-2026-09-18 → item 1 selectable", pick the topmost selectable task under
-"1. Regressions found by P0-E7" — currently that section has no items
-besides the just-filed P0-H12 (a recon, immediately selectable — its own
-`Kind: recon` means it stays a measurement/investigation task, not a
-production-code change). P0-H11 remains blocked (owner decision pending).
-If the owner has since recorded a banner change, follow it instead (S1/the
-Working Set Carry precedence rule).
+Finding: goopg's SF1 capture at `27d4ae001` is **numerically identical**
+(same `match=1/99`, same `CATEGORIES`/`CATEGORIES-EXCL-MATCH` counts digit
+for digit, Q9's own plan section byte-identical) to P0-E7's HEAD
+(`a0e741a68`) capture. Q9's SF1 `scan-type` divergence pre-dates
+`27d4ae001` — the `match >= 2 (Q9, Q41)` floor `m0137-0004` set is
+**SF0.25-only** and never generalized to SF1. Not a regression from any of
+the 72 commits in P0-E7's range. Root-causing *why* Q9 diverges at SF1 was
+explicitly out of scope (question was "new or pre-existing", not "why") and
+joins the pre-existing 73-query SF1 SHAPE-DIFF backlog rather than getting
+its own new task — no deferral ledger row filed (D1 is for newly-discovered
+gaps; nothing new was found).
 
-Gates run: `go build ./...` clean (no production file touched).
-`python3 scripts/ralph_protected_regions.py check-designdocs` exit 0.
-Pre-commit hook's pgbench smoke: PASS (ran automatically on the commit
-above). `make ralph-state-guard`: found the same status/progress
-inconsistency pattern as the prior two loops (prior loop's clean-exit
-"completed" marker), self-repaired to "in_progress", clean on re-check.
+Gates run: `go build ./...` clean (no production file touched, verified in
+both the main tree and the `/tmp/wt-27d4ae001` worktree). `python3
+scripts/ralph_protected_regions.py check-designdocs` exit 0. Pre-commit
+hook's pgbench smoke: PASS (ran twice — once on the initial commit, once on
+the amend that added the missing `Co-Authored-By` trailer I forgot the
+first time; both PASS, no behavior difference). `make ralph-state-guard`:
+same self-repairing status/progress mismatch pattern as the prior two loops
+(prior loop's clean-exit "completed" marker read as stale by this loop's
+start); self-repaired to "in_progress", clean on re-check.
 
-In-flight: none. The goopg TPC-DS SF1 server (`:65436`) was started this
-loop (fresh HEAD binary) and stopped again via direct binary invocation
-(`tmp/goopg-tpcds-bin stop -D bench/tpcds/runtime_goopg/data` — NOT
-`bench/tpcds/server.sh stop`, which the RALPH_LOOP guard denies
-unconditionally for `stop`/`restart` regardless of target since the same
-wrapper can also stop the `:65438` PG reference); verified `down` again via
-`bench/tpcds/server.sh status` before this loop ended. No other
-servers/scopes left running.
+In-flight: none. The historic-binary goopg TPC-DS SF1 server (`:65436`,
+scope `goopg-p0h12-27d4ae001`) was started and stopped this loop via direct
+binary invocation (never `bench/tpcds/server.sh`, which would have rebuilt
+from current HEAD instead of `27d4ae001`); verified `down` again via
+`bench/tpcds/server.sh status` before this loop ended. The `/tmp/wt-27d4ae001`
+worktree and `/tmp/goopg-p0h12-27d4ae001-bin` binary were both removed. No
+other servers/scopes/worktrees left running.
