@@ -2991,7 +2991,7 @@ spill route is net-negative.
     VERDICT PASS; `scripts/tpcds-sf025-regression.sh sweep` PASS (as
     above); `make ea-ratchet`: N/A (costing-only, no row-estimate/
     selectivity path touched, same disposition as fix2r).
-- [ ] **M0141-S2a-fix1-sweep-b — narrow WINDOW's internal sort costing.**
+- [x] **M0141-S2a-fix1-sweep-b — narrow WINDOW's internal sort costing.**
   Parent: M0141-S2a-fix1-sweep. goopg's `windowOp` sorts internally
   (`operators_window.go` `Open`) rather than taking pre-sorted input the way
   PG's `WindowAgg` does, so `costWindow`
@@ -3015,6 +3015,42 @@ spill route is net-negative.
   functions are far more common there than in TPC-H; no specific query
   pre-identified), `shape-delta.sh` diff on any query whose tag set includes
   a window/ranking shape, category movement (S5) — no category may rise.
+  - **DONE 2026-09-18.** Movement: none — and provably so, not merely
+    corpus-inert: the WINDOW rel offers exactly one candidate per statement
+    and `*WindowAgg` carries no `PlanCost`, so no narrowing at this site can
+    move any observable output under the current single-candidate design
+    (design doc's own analysis). Landed
+    `internal/optimizer/window_sort_narrow.go`
+    (`deriveWindowChainNarrowKeeps`, `deriveWindowRelNarrowKeep`,
+    `narrowWindowRelWidth`), reusing `window_input_target.go`'s existing
+    `windowWindowInputNames` (the B-01c compute-only stamp's own per-level
+    own-inputs enumerator — task text's premise that "no InputTarget-style
+    stamp exists yet for Window" was stale; one exists but is compute-only,
+    keys-only-stamped, and never consumed for costing, so this task is the
+    applying cut B-01c's own file header named as its future). New trailing
+    `chainKeep [][]int`/`relKeep []int` parameters on `addWindowPaths`/
+    `createWindowPaths`; `buildWindowStage` computes both ONCE (top-down
+    over the already-built chain, propagating "need" from
+    `finalSelectOutputNames` — sweep-a's helper, reused verbatim — down
+    through each level's own window-input names) right after its
+    per-group loop, using a throwaway `windowSurface` byte-identical to the
+    function's own later return value; gained a `starPS *ProjectSet`
+    parameter so the composite-star decline guard reaches this site too.
+    Only NCols/AvgVarBytes narrowed (Rows/Width left alone), same scope as
+    sweep-a. Measured: TPC-DS SF0.25 `PASS=96 MISMATCH=0 CKMISMATCH=0
+    ERROR=0 TIMEOUT=0`, `PLAN-SHAPE: queries=99 same=99 changed=0`; TPC-H
+    values 23/24 digest labels MATCH (`tpch-acceptance-arm.sh`), sole
+    non-MATCH is Q9 timing out identically in both arms (known flakiness,
+    not a regression — no TPC-H query even uses a window function, so this
+    arm is confirmation-by-absence). Design doc:
+    `docs/design/0100-0149/m0141-s2a-fix1-sweep-b-window-sort-width-currency.md`.
+    Gates: `go build ./...` clean; `go test ./internal/optimizer/...` PASS
+    (full package, all `addWindowPaths`/`createWindowPaths` call sites
+    updated); `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=34);
+    `scripts/tpcds-sf025-regression.sh sweep` PASS (as above). No
+    `Parent: M0141-S2a-fix1-sweep-b` follow-up filed — nothing worsened,
+    nothing could have. `make ea-ratchet`: N/A (costing-only, same
+    disposition as sweep-a/fix2r).
 - [x] **M0141-S2b — GROUP_AGG rel publishes Pathlist, not Node, to the
   ORDER BY step** — **CLOSED 2026-09-16 as a scoping decomposition (not an
   implementation), same precedent as M0140-0006.** Design doc:
