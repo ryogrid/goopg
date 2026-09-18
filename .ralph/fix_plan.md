@@ -2896,6 +2896,39 @@ setting that yields a serial plan.
      (outer-ParallelWorkers / Memoize / lateral-subset guards need their own
      audit), bitmap-driven branch (needs per-branch pbm publication), each
      with its own identity test.
+   - **Recon 2026-09-19 (analysis only — no production change).** Scoped
+     all three remaining branches end-to-end against the oracle and the
+     corpus; per-slice specs in the design doc's "Remaining-branch
+     scoping" section. Findings: only the NL branch has a corpus witness
+     (Q76 — whose hash branch additionally needs M0142-0005a's Memoize
+     admission under its probe, so Q76 unlocks only when BOTH land);
+     merge and bitmap branches have ZERO `Parallel Append` heads in
+     `bench/tpcds/plans-pg/` (completeness-only); Q5 needs the unbuilt
+     mixed `pa_subpaths` arm — filed M0140-0006c-3; Q2 never needed this
+     task, Q14/Q71 ride the landed hash arm, Q75 has no `Parallel
+     Append`. Executor attach walks already cover merge/NL under any
+     subtree — the only missing machinery is the three admission arms
+     plus `prebuildBitmap` per-branch publication. Recommended slice
+     order: NL → merge → bitmap. Impl commits remain HOLD-blocked (no
+     gate stamps while `bench/tpch/runtime_goopg/data.HOLD` stands).
+- [ ] **M0140-0006c-3 — mixed partial/non-partial SetOp append (Q5).**
+  Kind: impl.
+  Parent: M0140-0006c. Filed 2026-09-19 by 0006c-2's recon.
+  `addPartialSetOpPath` (`windowsetoppaths.go:525`) files only the
+  pure-partial arm — it returns when either branch's `PartialPathlist`
+  is empty. PG's `add_paths_to_append_rel` builds a second, mixed arm
+  (`pa_partial_subpaths`/`pa_nonpartial_subpaths`, `allpaths.c:1408-1452`):
+  per child, the cheaper of its cheapest partial path vs its cheapest
+  parallel-safe total path. Corpus evidence (`bench/tpcds/plans-pg/`):
+  Q5's third `Parallel Append` mixes a NON-partial `Subquery Scan`→
+  `Hash Right Join` branch with a `Parallel Seq Scan` branch — the only
+  corpus witness for the mixed arm. Executor side already models the
+  split (`nodeAppend.c:68-80,704-832` — non-partial plans claimed
+  exclusively via `pa_finished` on selection); goopg's claim-set model
+  would need a per-branch "claimed whole" marker rather than a leaf
+  claim set. Needs its own scoping pass first (exclusive-claim
+  semantics for a non-partial branch under the same Gather; how the
+  leaf claim sets and `attachAll` express a whole-claimed branch).
 
 ## M0141 — Upper-planner ordering contest (filed 2026-09-14)
 
