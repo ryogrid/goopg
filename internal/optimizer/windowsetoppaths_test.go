@@ -205,7 +205,7 @@ func TestAddWindowPathsUsesPreWindowEmittedWidth(t *testing.T) {
 	winRel := &RelOptInfo{}
 	sizeWindowRelFromNode(winRel, win, in)
 	seed := &Path{Rel: winRel, Rows: winRel.Rows, Cost: Cost{Total: 100}}
-	addWindowPaths(winRel, seed, []*WindowAgg{win}, in, cp)
+	addWindowPaths(winRel, seed, []*WindowAgg{win}, in, cp, nil)
 	if len(winRel.Pathlist) != 1 {
 		t.Fatalf("window paths = %d, want one", len(winRel.Pathlist))
 	}
@@ -236,7 +236,7 @@ func TestAddWindowPathsAddsOnePathPerChain(t *testing.T) {
 	rel := fetchUpperRel(u, UpperWindow, 0, 0)
 	sizeWindowRelFromNode(rel, w2, in)
 	seed := seedPathForNode(rel, in)
-	addWindowPaths(rel, seed, []*WindowAgg{w1, w2}, in, cp)
+	addWindowPaths(rel, seed, []*WindowAgg{w1, w2}, in, cp, nil)
 
 	if len(rel.Pathlist) != 1 {
 		t.Fatalf("WINDOW pathlist holds %d paths, want exactly 1 (the topmost of the chain)", len(rel.Pathlist))
@@ -266,7 +266,7 @@ func TestCreateWindowPathsEmitsTheSameChainOverTheSameInput(t *testing.T) {
 	in := upperOrderedInput(1000)
 	w1 := windowTestNode(in, 1)
 	w2 := windowTestNode(w1, 2)
-	got, err := createWindowPaths(newUpperRels(), []*WindowAgg{w1, w2}, in, DefaultPlannerSettings(), 0)
+	got, err := createWindowPaths(newUpperRels(), []*WindowAgg{w1, w2}, in, DefaultPlannerSettings(), 0, nil, nil)
 	if err != nil {
 		t.Fatalf("createWindowPaths: %v", err)
 	}
@@ -512,7 +512,7 @@ func TestUpperRelRegistryHasEveryKindWiredAfterC18(t *testing.T) {
 	u := newUpperRels()
 	in := upperOrderedInput(100)
 	ps := DefaultPlannerSettings()
-	if _, err := createWindowPaths(u, []*WindowAgg{windowTestNode(in, 1)}, in, ps, 0); err != nil {
+	if _, err := createWindowPaths(u, []*WindowAgg{windowTestNode(in, 1)}, in, ps, 0, nil, nil); err != nil {
 		t.Fatalf("window: %v", err)
 	}
 	if _, err := createSetOpPaths(u, setOpTestNode(parser.SetOpUnion, true, in, in), ps, 0); err != nil {

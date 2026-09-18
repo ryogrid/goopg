@@ -1877,7 +1877,7 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 	var win *windowSurface
 	if needsWindowStage(s) {
 		var err error
-		node, ctx, win, err = buildWindowStage(s, node, ctx, agg, upper, plannerSet, orderTupleFraction)
+		node, ctx, win, err = buildWindowStage(s, node, ctx, agg, upper, plannerSet, orderTupleFraction, ps)
 		if err != nil {
 			return nil, err
 		}
@@ -7136,7 +7136,12 @@ func needsWindowStage(s *parser.SelectStmt) bool {
 // and `tupleFraction` its `root->tuple_fraction` — all three threaded from
 // `planSelectWithSettings`, because `inputCtx` is replaced per group and a
 // fraction read off a derived context would be zero (the C-12 lesson).
-func buildWindowStage(s *parser.SelectStmt, child Node, inputCtx *resolveContext, agg *aggregateSurface, upper *upperRels, ps PlannerSettings, tupleFraction float64) (Node, *resolveContext, *windowSurface, error) {
+// `starPS`, when non-nil, is the composite-star ProjectSet the caller built
+// ahead of this stage (`(expr).*` lowering) — M0141-S2a-fix1-sweep-b reads
+// it only to decline the narrow-keep derivation below, the same guard
+// `finalSelectOutputNames` (ordered_input_narrow.go) already applies to the
+// ORDER BY Sort site.
+func buildWindowStage(s *parser.SelectStmt, child Node, inputCtx *resolveContext, agg *aggregateSurface, upper *upperRels, ps PlannerSettings, tupleFraction float64, starPS *ProjectSet) (Node, *resolveContext, *windowSurface, error) {
 	calls, err := collectWindowCalls(s)
 	if err != nil {
 		return nil, nil, nil, err
@@ -7253,7 +7258,25 @@ func buildWindowStage(s *parser.SelectStmt, child Node, inputCtx *resolveContext
 	// contexts and column bindings, both derived from schemas the copies
 	// share, so it needs no rebuild.
 	if len(windowChain) > 0 {
-		built, werr := createWindowPaths(upper, windowChain, child, ps, tupleFraction)
+		// M0141-S2a-fix1-sweep-b: derive the WINDOW chain's narrow cost-input
+		// keep-sets (window_sort_narrow.go) before costing — `combinedByKey`
+		// and `currentCtx` are already exactly what `surface` below will
+		// hold, so this throwaway windowSurface is a byte-for-byte preview,
+		// not a second resolution. Declines to nil (today's full-width
+		// sizing) whenever a composite-star ProjectSet is pending, the same
+		// guard the ORDER BY site applies.
+		aboveNames, aboveKnown := finalSelectOutputNames(s, inputCtx, agg,
+			&windowSurface{input: inputCtx, agg: agg, output: currentCtx, windowByKey: combinedByKey},
+			starPS, false)
+		chainKeep, chainKnown := deriveWindowChainNarrowKeeps(windowChain, aboveNames, aboveKnown)
+		if !chainKnown {
+			chainKeep = nil
+		}
+		relKeep, relKnown := deriveWindowRelNarrowKeep(windowChain[len(windowChain)-1], aboveNames, aboveKnown)
+		if !relKnown {
+			relKeep = nil
+		}
+		built, werr := createWindowPaths(upper, windowChain, child, ps, tupleFraction, chainKeep, relKeep)
 		if werr != nil {
 			return nil, nil, nil, werr
 		}

@@ -88,7 +88,13 @@ const (
 // input — the caller adopts the returned top. An empty path list yields PG's
 // "could not implement window function" refusal; unreachable (one candidate is
 // always offered), defensive as C-15/C-16.
-func createWindowPaths(u *upperRels, windows []*WindowAgg, input Node, ps PlannerSettings, tupleFraction float64) (Node, error) {
+//
+// `chainKeep`/`relKeep` are M0141-S2a-fix1-sweep-b's narrow cost-input
+// keep-sets (window_sort_narrow.go), derived by the caller before this
+// runs — `chainKeep` aligned index-for-index with `windows`, `relKeep`
+// positions into the top window's own Output(). Either may be nil (decline:
+// today's full-width sizing).
+func createWindowPaths(u *upperRels, windows []*WindowAgg, input Node, ps PlannerSettings, tupleFraction float64, chainKeep [][]int, relKeep []int) (Node, error) {
 	if len(windows) == 0 {
 		return nil, &PlanError{Code: "XX000", Message: "createWindowPaths: no window nodes"}
 	}
@@ -102,9 +108,13 @@ func createWindowPaths(u *upperRels, windows []*WindowAgg, input Node, ps Planne
 	cp := ps.costParams()
 	winRel := fetchUpperRel(u, UpperWindow, 0, tupleFraction)
 	sizeWindowRelFromNode(winRel, top, input)
+	// M0141-S2a-fix1-sweep-b: refine the rel's own NCols/AvgVarBytes to the
+	// caller's narrow keep-set, when it derived one. A nil relKeep leaves
+	// the full-width sizing above untouched.
+	narrowWindowRelWidth(winRel, top, relKeep)
 
 	seed := seedPathForNode(winRel, input)
-	addWindowPaths(winRel, seed, windows, input, cp)
+	addWindowPaths(winRel, seed, windows, input, cp, chainKeep)
 	setCheapest(winRel)
 
 	best := getCheapestFractionalPath(winRel, tupleFraction)
@@ -253,7 +263,14 @@ func costWindow(cp costParams, inputTotal, inputRows float64,
 // still the single collapsed Node `createWindowPaths` receives, with no
 // Pathlist to check for a shared ordering prefix — wiring that check is
 // S2b-3b, filed and gated on this landing.
-func addWindowPaths(winRel *RelOptInfo, seed *Path, windows []*WindowAgg, input Node, cp costParams) {
+//
+// `chainKeep`, when non-nil, is M0141-S2a-fix1-sweep-b's per-level narrow
+// cost-input keep-set (window_sort_narrow.go), index-aligned with `windows`:
+// `chainKeep[i]` holds ascending positions into that level's `belowNode.Output()`
+// to price `costWindow`'s `inNcols`/`inAvgVarBytes` from, in place of the
+// full row. A nil entry (or a nil `chainKeep` altogether) leaves that level's
+// full-width sizing untouched — the always-safe decline.
+func addWindowPaths(winRel *RelOptInfo, seed *Path, windows []*WindowAgg, input Node, cp costParams, chainKeep [][]int) {
 	if len(windows) == 0 {
 		// No spec group, no candidate. `createWindowPaths` refuses this case
 		// before calling here; the guard keeps a direct caller (a test) from
@@ -263,8 +280,13 @@ func addWindowPaths(winRel *RelOptInfo, seed *Path, windows []*WindowAgg, input 
 	below := seed
 	belowNode := input
 	var top *Path
-	for _, w := range windows {
+	for i, w := range windows {
 		cols := belowNode.Output()
+		if i < len(chainKeep) {
+			if narrowed := narrowedWindowCols(cols, chainKeep[i]); narrowed != nil {
+				cols = narrowed
+			}
+		}
 		p := &Path{
 			Kind: PathWindow, Window: w,
 			Rel: winRel, Rows: winRel.Rows,
@@ -280,6 +302,27 @@ func addWindowPaths(winRel *RelOptInfo, seed *Path, windows []*WindowAgg, input 
 		top = p
 	}
 	addPath(winRel, top, windowProducer)
+}
+
+// narrowedWindowCols returns the columns of cols at the positions named by
+// keep, or nil when keep is empty (the caller's "leave cols alone" signal).
+// Positions are trusted (produced by deriveWindowChainNarrowKeeps against
+// this exact column slice's coordinate space) but bounds-checked defensively
+// the same way narrowOrderedRelWidths' equivalent loop does.
+func narrowedWindowCols(cols []SchemaColumn, keep []int) []SchemaColumn {
+	if len(keep) == 0 {
+		return nil
+	}
+	narrowed := make([]SchemaColumn, 0, len(keep))
+	for _, i := range keep {
+		if i >= 0 && i < len(cols) {
+			narrowed = append(narrowed, cols[i])
+		}
+	}
+	if len(narrowed) == 0 {
+		return nil
+	}
+	return narrowed
 }
 
 // createSetOpPaths is the set-operation half of `plan_set_operations`
