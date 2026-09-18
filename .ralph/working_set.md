@@ -1,41 +1,41 @@
-Task: testport/TestPort_IsolationIntraGrantInplace — root-cause DONE
-  (commit 268710050): perm-10 divergence explained + ledgered; impl
-  fix now UNBLOCKED (HOLD lifted mid-loop by concurrent commit
-  caf858301 at 03:21 — :65433 restored, gates run again).
+Task: M0140-0006c-2 slice A (NL branch admission) — LANDED this loop
+  (uncommitted at baton-write; commit follows immediately). Task stays
+  [ ] — merge + bitmap slices remain. Next selectable per banner:
+  item 5 continues (0006c-2 merge slice, then bitmap, then 0006c-3).
 
-Root cause (full bullets on fix_plan ~L574): perm `b1 drop1 b3 sfu3
-  revoke4 c1 r3` — goopg's `lockRowsOp.Open` waits on the deferred
-  pg_class drop via `maybeRecordPgClassRowMark`→`waitTablePendingDrop`
-  (operators_lockrows.go:853/910, operators_ddl.go:12688) BEFORE any
-  child row iteration; post-unblock `drainAndStamp` (:1031) re-evals
-  the `oid='x'::regclass` filter → `regclassin` misses
-  (reg_identifier.go:286-331) → 42P01 where PG emits `0 rows`.
-  PG resolves the cast once before the LockTuple wait. Fix sketch:
-  after waitTablePendingDrop unblocks + drop committed, short-circuit
-  drainAndStamp to EOF. Also explains r3-before-revoke4 tail ordering.
-
-Also this loop: AI-20260919-000526-001 verified = the ledgered
-  instrumentscope race, 4th repro (instrument.go:444 vs
-  operators_gather.go:124) — noted ~L454, do not re-file.
-
-Environment — CHANGED THIS LOOP: `data.HOLD` REMOVED (only
-  preloss-clone-20260915.HOLD remains); concurrent Devin loop commit
-  `caf858301` (03:21) lifted HOLD + committed the six staged S2b-15
-  optimizer files + folded my race note. Impl tasks are UNBLOCKED —
-  tpch-spotcheck should run again (verify :65433 answers first).
-  ci/logs/*, .claude/settings.json, .ralphrc, analysis/, postgres,
-  third-party/ carry unstaged foreign mods — never commit those.
-  WATCH: another live loop commits to this branch — expect its
-  commits mid-flight; stage explicitly, verify before committing.
-
-Gates run: repro `go test -v -run
-  '^TestPort_IsolationIntraGrantInplace$' ./internal/testport/` FAIL
-  4.86s (expected — diagnosis only); pgbench smoke PASS (hook).
+What landed: `setOpBranchDrivingKindIsSupported`
+  (internal/optimizer/gatherpaths.go:~620) gains `case PathNestLoop` —
+  mirrors partialPathDrivingKind's NL arm guard-for-guard (JoinInner,
+  RequiredOuter==0, 2 children, V5 outer, no PathMemoize inner;
+  whole-inner→recurse outer, R95 probe inner→IndexClauses+relids+
+  calcNestloopRequiredOuter==0). Recursion stays branch-local (merge/
+  bitmap outers still refuse). NO executor change needed — the three
+  attachParallel* walks already carry JoinAlgoNestedLoop.
+Files: gatherpaths.go, windowsetoppaths_test.go (3 acceptance + 11
+  refusals; `nestloop-branch` MOVED OUT of the bad-hash refusal map —
+  Jointype zero value IS parser.JoinInner so it's a valid admission),
+  parallel_setop_claimset_test.go (TestGatherOverSetOpNestLoopBranch-
+  Identity + planTreeHasNestedLoopUnderGather), design doc 0006c-2
+  "Update 2026-09-19", fix_plan ~L2992 bullet.
+Hypothesis/Findings: corpus unchanged — Q76 still needs M0142-0005a
+  (Memoize under probe NL) before it flips; sweep PLAN-SHAPE 99/99
+  identical confirms slice A wins nothing at current costs (same as
+  hash slice). Mutation-verified: neutered arm → exactly the 3
+  acceptance tests fail to PathPrebuilt.
+Key symbols: setOpBranchDrivingKindIsSupported, partialPathDrivingKind,
+  calcNestloopRequiredOuter, nlClassifyFixture/Path (test helpers),
+  latClassifyFixture/Path + latParamInner (R95 probe helpers),
+  ordinaryInnerNestedLoopPartial/lateralProbeJoinPartial (exec twins).
+Next step: merge branch (slice B — one arm + the probeSideIsLeft-
+  coincidence flag in attachParallelIndexScan/BitmapScan), then bitmap
+  (needs per-branch pbm publication AND a partial-bitmap producer —
+  untestable end-to-end until one exists, flag honestly), then 0006c-3.
+Gates run: build clean; go test optimizer 2.7s + executor 13.4s green;
+  tpch-spotcheck PASS real run Q12=2/Q13=34 (first since :65433
+  recovery); SF0.25 sweep PASS=96 MISMATCH=0 PLAN-SHAPE 99/99; units
+  all ok; mutation check PASS. pgbench smoke runs at commit (hook).
 In-flight: none.
-Next step: item-8 topmost unblocked impl =
-  M-NIGHTLY-instrumentscope-race-fix (~L505, design resolved loop 9:
-  force nil scope at acquireSubPlanOp Build sites under
-  Context.instrumentScope — bug-for-bug OK). Then
-  IsolationIntraGrantInplace's sketched fix (executor, needs
-  units+race+tpch-spotcheck), then IsolationStats/LockRowsSort/
-  PgDumpConnectionSetup/RegressSuite entries.
+WATCH: a concurrent Devin loop commits to this branch — stage
+  explicitly, verify staged diff before committing; foreign mods
+  (ci/logs, .claude, .ralphrc, analysis/, postgres, third-party)
+  never get committed.

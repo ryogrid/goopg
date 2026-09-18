@@ -2989,6 +2989,39 @@ setting that yields a serial plan.
      2026-09-19, when the owner recovery of `:65433` released
      `data.HOLD` (see M0141-S2b-15's UNBLOCKED note) — TPC-H gates
      run normally again.
+   - **Landed 2026-09-19 (slice A — NL branch; task stays unchecked,
+     merge + bitmap slices remain).** One production change:
+     `setOpBranchDrivingKindIsSupported` (`gatherpaths.go`) gains
+     `case PathNestLoop` mirroring `partialPathDrivingKind`'s own NL
+     arm guard-for-guard (JoinInner, `RequiredOuter==0`, two children,
+     V5 outer, no `PathMemoize` inner; unparameterized whole-inner →
+     recurse outer, or R95 probe inner: `PathIndexScan` + `IndexClauses`
+     + `OuterRelids`/`InnerRelids` non-zero +
+     `calcNestloopRequiredOuter==0`). Recursion stays branch-local so
+     merge/bitmap outers still refuse; the general arm's duplicate
+     Jointype re-check folds into the one top guard. NO executor
+     change — all three `attachParallel*` walks already carry
+     `JoinAlgoNestedLoop` (recon's "nothing to add" held). Tests: 3
+     acceptance (whole-inner via `nlClassifyFixture`, NL-of-NL spine,
+     R95 probe via `latClassifyFixture`), 11 refusals
+     (`TestPartialPathDrivingKindRefusesSetOpWithBadNestLoopBranch` —
+     incl. bitmap/merge outer narrowing + unpartitioned/unsatisfiable
+     probes), `TestGatherOverSetOpNestLoopBranchIdentity` (forced-NL
+     branch 120 rows + 90-row scan, serial-vs-parallel at 1/2/4
+     workers). The `nestloop-branch` case moved OUT of the bad-hash
+     refusal map — it is now a valid admission (`Jointype` zero value
+     is `parser.JoinInner`). Mutation-verified: neutered arm → exactly
+     the 3 acceptance tests fail to `PathPrebuilt`. Corpus unchanged:
+     Q76 still needs M0142-0005a (Memoize under the probe NL) — slice
+     A alone flips nothing, sweep PLAN-SHAPE 99/99 identical. Gates:
+     build clean, optimizer 2.7s + executor 13.4s green,
+     tpch-spotcheck PASS real run (Q12=2/Q13=34 — first non-SKIPPED
+     since `:65433` recovery), sweep PASS=96 MISMATCH=0, units all
+     `ok`. Design doc: `m0140-0006c-2-join-branch-partial-setop-admission.md`
+     "Update 2026-09-19". Remaining: merge branch (one arm + the
+     probeSideIsLeft-coincidence flag), bitmap branch (per-branch
+     `pbm` publication + its identity test needs a partial-bitmap
+     producer first — flag the dependency).
 - [ ] **M0140-0006c-3 — mixed partial/non-partial SetOp append (Q5).**
   Kind: impl.
   Parent: M0140-0006c. Filed 2026-09-19 by 0006c-2's recon.

@@ -1,6 +1,6 @@
 # M0140-0006c-2 — widen the partial-SetOp admission past bare scans (hash-join branch)
 
-**Status:** accepted (partial — hash-join branch landed; merge/nested-loop/bitmap branches remain open under this same task)
+**Status:** accepted (partial — hash-join and nested-loop branches landed; merge/bitmap branches remain open under this same task)
 **Milestone:** M0140 (TPC-DS parallelism), plan-parity group
 **Harness:** `AGENT.md` §"Plan-parity harness (M0137–M0143)"
 **Task:** `.ralph/fix_plan.md` M0140-0006c-2
@@ -25,8 +25,63 @@ The first cut of the identity test claimed two opposite silent failure modes (N-
 ## Still open under this task (not deferred — the owning task stays `[ ]`)
 
 - **Merge-driven branch**: needs its own admission arm plus proof no walk must collect through a merge outer (no walk does today — a hash below a merge outer is un-prebuilt even at top level, E-20's territory, not this task's).
-- **Nested-loop-driven branch**: needs the `PathNestLoop` arm's extra guards re-audited for branch paths (outer `ParallelWorkers`, Memoize, lateral subset).
+- ~~**Nested-loop-driven branch**~~ — **landed 2026-09-19 (slice A), see below.**
 - **Bitmap-driven branch**: collectors and gates now descend, but `prebuildBitmap` publishes only to the top-level claim set while a branch attaches through its own leaf (whose `pbm` is nil by construction) — needs per-branch publication, then its own identity test.
+
+## Update 2026-09-19 — slice A (nested-loop branch) landed
+
+The recon's recommended first slice. Exactly one production change, as the
+scoping predicted: `setOpBranchDrivingKindIsSupported`
+(`internal/optimizer/gatherpaths.go`) gains `case PathNestLoop`, mirroring
+`partialPathDrivingKind`'s own PathNestLoop arm guard-for-guard —
+`JoinInner` only, `RequiredOuter == 0`, exactly two children, the V5 outer
+(`ParallelWorkers > 0 && ParallelSafe && RequiredOuter == 0`), no
+`PathMemoize` inner, unparameterized whole-inner → recurse outer, or the
+R95 parameterized-probe inner (`PathIndexScan` + `IndexClauses` +
+non-zero `OuterRelids`/`InnerRelids` + `calcNestloopRequiredOuter == 0`).
+The recursion goes through *this* test, not the general classifier, so a
+merge- or bitmap-driven NL outer still refuses — nested-NL spines (Q76's
+shape minus its Memoize) admit via the same recursion. One deliberate
+simplification: the general arm's second identical `Jointype` re-check is
+folded into the single top guard (the field is immutable within the call).
+No executor change: `attachAll`'s `*setOp` arm hands each branch its own
+leaf claim set and all three `attachParallel*` walks already carry the
+`JoinAlgoNestedLoop` arm — the recon's "nothing to add" held exactly.
+
+Corpus position unchanged: **Q76 still needs M0142-0005a** (its hash
+branch's probe NL wraps `Memoize`→`Index Scan`, which the Memoize guard
+still refuses) — slice A flips no corpus query alone, same posture the
+hash slice landed in. Sweep confirms: PLAN-SHAPE 99/99 identical.
+
+Tests (11 admission + 1 executor identity):
+
+- `TestPartialPathDrivingKindAcceptsSetOpWithNestLoopBranch` — whole-inner
+  NL branch via `nlClassifyFixture`/`nlClassifyPath` (R60's filed shape).
+- `TestPartialPathDrivingKindAcceptsSetOpWithNestedNestLoopBranch` —
+  NL-of-NL spine recursion.
+- `TestPartialPathDrivingKindAcceptsSetOpWithNestLoopIndexProbeBranch` —
+  R95 probe inner via `latClassifyFixture`/`latClassifyPath`/`latParamInner`.
+- `TestPartialPathDrivingKindRefusesSetOpWithBadNestLoopBranch` — 11
+  refusals: left-join, parameterized NL, one-child, zero-worker/unsafe/
+  parameterized outer, Memoize inner, parameterized seq inner, clauseless
+  probe, bitmap/merge outer (the narrowed recursion), unpartitioned and
+  unsatisfiable-req probes.
+- `TestGatherOverSetOpNestLoopBranchIdentity` — SetOp over a forced-NL
+  branch (cross join `pq_setop_a.id < 3` × `pq_setop_c` = 120 rows) + a
+  bare `pq_setop_b` scan; serial-vs-parallel multiset identity at 1/2/4
+  workers; `planTreeHasNestedLoopUnderGather` vacuity guard.
+- `TestPartialPathDrivingKindRefusesSetOpWithBadHashJoinBranch` lost its
+  `nestloop-branch` case — it is now a *valid* admission (Jointype's zero
+  value is `parser.JoinInner`), moved to the acceptance test.
+
+Mutation-verified: neutering the arm flips exactly the three acceptance
+tests to `PathPrebuilt` (serial), refusals stay green.
+
+Gates: `go build ./...` clean; `go test ./internal/optimizer/...`
+(2.7s) and `./internal/executor/` (13.4s) green; `tpch-spotcheck.sh`
+PASS real run (Q12=2/Q13=34, ~10.5s — first non-SKIPPED run since the
+`:65433` recovery); SF0.25 sweep PASS=96 MISMATCH=0 CKMISMATCH=0 ERROR=0
+TIMEOUT=0, PLAN-SHAPE 99/99 identical; units precommit all `ok`.
 
 ## Remaining-branch scoping — recon 2026-09-19 (analysis only, no production change)
 
