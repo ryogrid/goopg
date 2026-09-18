@@ -434,6 +434,83 @@ func TestStampParallelScanNoEligibleScanReturnsSamePointer(t *testing.T) {
 	}
 }
 
+// TestDrivingScanAdmitsSetOpWithTwoScanBranches pins M0140-0006c's node-side
+// twin of TestPartialPathDrivingKindAcceptsSetOpWithTwoScanBranches: a SetOp
+// whose two branches both resolve returns the SetOp itself (non-nil), the
+// sentinel gatherChildPlan checks for.
+func TestDrivingScanAdmitsSetOpWithTwoScanBranches(t *testing.T) {
+	so := setOpTestNode(parser.SetOpUnion, true, seqScanOver(bigTable(t, "a")), seqScanOver(bigTable(t, "b")))
+	if got := drivingScan(so); got != Node(so) {
+		t.Fatalf("drivingScan = %v, want the SetOp itself", got)
+	}
+}
+
+// TestDrivingScanRefusesSetOpWithOneBranchUnmodeled pins the "both sides
+// must resolve" half — unlike a join (partial through one side only), a
+// single unmodeled branch must refuse the whole SetOp.
+func TestDrivingScanRefusesSetOpWithOneBranchUnmodeled(t *testing.T) {
+	so := setOpTestNode(parser.SetOpUnion, true, seqScanOver(bigTable(t, "a")), &Aggregate{})
+	if got := drivingScan(so); got != nil {
+		t.Fatalf("drivingScan = %v, want nil (right branch is unmodeled)", got)
+	}
+	// And the mirror: left unmodeled, right a scan.
+	so2 := setOpTestNode(parser.SetOpUnion, true, &Aggregate{}, seqScanOver(bigTable(t, "b")))
+	if got := drivingScan(so2); got != nil {
+		t.Fatalf("drivingScan = %v, want nil (left branch is unmodeled)", got)
+	}
+}
+
+// TestStampParallelScanStampsBothSetOpBranches is the SetOp counterpart of
+// TestStampParallelScanIsNonMutating: BOTH branches must be stamped, not
+// just one side (a partial SetOp streams both, unlike a join), and the
+// original tree must be untouched (copy-on-write — the process-wide plan
+// cache may be handing the same pointer to another session concurrently).
+func TestStampParallelScanStampsBothSetOpBranches(t *testing.T) {
+	leftScan := seqScanOver(bigTable(t, "a"))
+	rightScan := seqScanOver(bigTable(t, "b"))
+	so := setOpTestNode(parser.SetOpUnion, true, leftScan, rightScan)
+
+	out := stampParallelScan(so)
+
+	if leftScan.Parallel || rightScan.Parallel {
+		t.Fatal("stampParallelScan mutated the original branches' Parallel flag")
+	}
+	outSetOp, ok := out.(*SetOp)
+	if !ok || outSetOp == so {
+		t.Fatalf("expected a COPY of the SetOp, got %T (same pointer: %v)", out, outSetOp == so)
+	}
+	outLeft, ok := outSetOp.Left.(*SeqScan)
+	if !ok || !outLeft.Parallel {
+		t.Fatalf("left branch not stamped: %#v", outSetOp.Left)
+	}
+	outRight, ok := outSetOp.Right.(*SeqScan)
+	if !ok || !outRight.Parallel {
+		t.Fatalf("right branch not stamped: %#v", outSetOp.Right)
+	}
+}
+
+// TestUnstampParallelScanReversesSetOpBranches is stampParallelScan's own
+// inverse, mirroring the *Join case's existing coverage.
+func TestUnstampParallelScanReversesSetOpBranches(t *testing.T) {
+	leftScan := seqScanOver(bigTable(t, "a"))
+	rightScan := seqScanOver(bigTable(t, "b"))
+	so := setOpTestNode(parser.SetOpUnion, true, leftScan, rightScan)
+	stamped := stampParallelScan(so).(*SetOp)
+
+	out := unstampParallelScan(stamped)
+
+	if stamped.Left.(*SeqScan).Parallel != true || stamped.Right.(*SeqScan).Parallel != true {
+		t.Fatal("unstampParallelScan mutated the stamped tree in place")
+	}
+	outSetOp, ok := out.(*SetOp)
+	if !ok || outSetOp == stamped {
+		t.Fatalf("expected a COPY, got %T (same pointer: %v)", out, outSetOp == stamped)
+	}
+	if outSetOp.Left.(*SeqScan).Parallel || outSetOp.Right.(*SeqScan).Parallel {
+		t.Fatal("unstampParallelScan left a branch stamped Parallel")
+	}
+}
+
 // planHasGather reports whether any node in the tree is a Gather.
 func planHasGather(n Node) bool {
 	if n == nil {

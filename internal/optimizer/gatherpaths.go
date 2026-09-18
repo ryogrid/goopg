@@ -385,6 +385,28 @@ func partialPathDrivingKind(p *Path) PathKind {
 		// offers a partial bitmap path yet; the arm is here so that when one
 		// does, it is admitted by a decision rather than by a default.
 		return PathBitmapHeapScan
+	case PathSetOp:
+		// M0140-0006c. Unlike a join (partial through ONE side, the other
+		// prebuilt/shared once), a partial SetOp streams BOTH branches
+		// (addPartialSetOpPath, M0140-0006b) — each needs its OWN driving
+		// scan the executor's *setOp arm of attachAll can claim
+		// independently (parallel_scan.go), so this recurses into BOTH
+		// children rather than the single Children[0]/[1] pick the join
+		// arms make.
+		//
+		// Narrowed to a bare scan on each side — NOT the general recursion
+		// through a join or bitmap scan the other arms use. A join-driven
+		// branch would need its build side prebuilt the same way
+		// prebuildHashJoins does for a top-level partial join, and a
+		// bitmap-driven branch would need prebuildBitmap to find it — both
+		// walk the PLAN via collectShareableJoins/collectBitmapScans, and
+		// neither descends into a SetOp today. Ledger row filed
+		// (M0140-0006c): join/bitmap-driven SetOp branches.
+		if len(p.Children) != 2 || !setOpBranchDrivingKindIsSupported(p.Children[0]) ||
+			!setOpBranchDrivingKindIsSupported(p.Children[1]) {
+			return PathPrebuilt
+		}
+		return PathSetOp
 	case PathHashJoin:
 		// C-19f. A hash join is partial through its PROBE side only: the build
 		// is drained ONCE by the leader before fan-out
@@ -495,6 +517,24 @@ func partialPathDrivingKind(p *Path) PathKind {
 		// PathPrebuilt, joins, Sort, Memoize, Agg: not modelled by any attach
 		// walk at this slice's scope. Refuse.
 		return PathPrebuilt
+	}
+}
+
+// setOpBranchDrivingKindIsSupported is the PathSetOp arm's own, narrower
+// admission test for one branch — a bare seq or (unparameterised) index
+// scan only. See partialPathDrivingKind's PathSetOp case for why this does
+// NOT delegate to partialPathDrivingKind's general recursion.
+func setOpBranchDrivingKindIsSupported(p *Path) bool {
+	if p == nil {
+		return false
+	}
+	switch p.Kind {
+	case PathSeqScan:
+		return true
+	case PathIndexScan:
+		return p.RequiredOuter == 0
+	default:
+		return false
 	}
 }
 

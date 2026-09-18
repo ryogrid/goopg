@@ -502,15 +502,74 @@ type parallelClaimSet struct {
 	// pidx is the shared leaf-block claim set for a parallel index or
 	// index-only scan (M0134-0189, C-19c).
 	pidx *parallelIndexScanState
+
+	// setOpLeft / setOpRight (M0140-0006c) are the INDEPENDENT claim state
+	// for a partial SetOp's two branches (operators_setop.go's *setOp,
+	// built from a PathSetOp addPartialSetOpPath produced). A SetOp streams
+	// BOTH branches, unlike a join which is partial through one side only,
+	// so its two driving scans cannot share one pscan/pidx: parallelScanState
+	// publishes its block-count boundary from whichever scan opens FIRST
+	// (initOnce) and every later scan on that same state reuses it — correct
+	// when both scans are on the SAME relation, silently wrong when a SetOp's
+	// two branches are on different ones. Built once, eagerly, by
+	// newParallelClaimSet (never lazily: attachAll runs from every worker
+	// goroutine concurrently, so a lazy first-attach race would need its own
+	// locking the eager build avoids). Bounded to one level — see
+	// newLeafParallelClaimSet.
+	setOpLeft  *parallelClaimSet
+	setOpRight *parallelClaimSet
 }
 
 // newParallelClaimSet builds the claim state that needs no pre-pass. pbm is
 // filled in later by prebuildBitmap, when the plan contains a bitmap scan.
 func newParallelClaimSet() *parallelClaimSet {
 	return &parallelClaimSet{
+		pscan:      newParallelScanState(0),
+		pidx:       newParallelIndexScanState(),
+		setOpLeft:  newLeafParallelClaimSet(),
+		setOpRight: newLeafParallelClaimSet(),
+	}
+}
+
+// newLeafParallelClaimSet is newParallelClaimSet without its own nested
+// setOpLeft/setOpRight — a SetOp branch is never itself another partial
+// SetOp: M0140-0006a's RelOptInfo.LeftBranchRel/RightBranchRel is populated
+// via searchedRelOf, which recognises a planSelectWithSettings search root
+// and does NOT recognise createSetOpPaths's own output (a nested UNION ALL
+// chain's inner node) as one — so addPartialSetOpPath can never see a
+// partial path on a branch that is itself a SetOp, and these two never need
+// branches of their own. pbm is intentionally left nil forever: a
+// bitmap-driven SetOp branch is refused at the planner (partialPathDrivingKind's
+// PathSetOp arm, gatherpaths.go) because prebuildBitmap's plan-side scan
+// collector does not descend into a SetOp either — ledger row filed,
+// M0140-0006c.
+func newLeafParallelClaimSet() *parallelClaimSet {
+	return &parallelClaimSet{
 		pscan: newParallelScanState(0),
 		pidx:  newParallelIndexScanState(),
 	}
+}
+
+// unwrapToSetOp walks the SAME wrapper kinds attachParallelScan's own
+// recursion sees (Filter/Project/instrumentedOp/Sort/Aggregate) looking for
+// a *setOp, so attachAll finds one wrapped by EXPLAIN instrumentation or a
+// residual predicate/projection the same way a bare one is found.
+func unwrapToSetOp(op Operator) (*setOp, bool) {
+	switch x := op.(type) {
+	case *setOp:
+		return x, true
+	case *filterOp:
+		return unwrapToSetOp(x.child)
+	case *projectOp:
+		return unwrapToSetOp(x.child)
+	case *instrumentedOp:
+		return unwrapToSetOp(x.inner)
+	case *sortOp:
+		return unwrapToSetOp(x.child)
+	case *aggregateOp:
+		return unwrapToSetOp(x.child)
+	}
+	return nil, false
 }
 
 // attachAll wires every claim kind into op's driving scan. It reports whether
@@ -527,6 +586,16 @@ func newParallelClaimSet() *parallelClaimSet {
 func (cs *parallelClaimSet) attachAll(op Operator) bool {
 	if cs == nil {
 		return false
+	}
+	// M0140-0006c: a SetOp streams two branches, each needing its OWN claim
+	// state (see the type's setOpLeft/setOpRight comment) — dispatched
+	// before the flat single-state walk below, which has no *setOp arm of
+	// its own by design (one recursion here instead of three, one per
+	// attachParallel* function).
+	if so, ok := unwrapToSetOp(op); ok {
+		left := cs.setOpLeft.attachAll(so.left)
+		right := cs.setOpRight.attachAll(so.right)
+		return left || right
 	}
 	attached := attachParallelScan(op, cs.pscan)
 	attached = attachParallelBitmapScan(op, cs.pbm) || attached

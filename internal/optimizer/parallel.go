@@ -642,6 +642,17 @@ func stampParallelScan(n Node) Node {
 		c := *x
 		c.Right = right
 		return &c
+	case *SetOp:
+		// M0140-0006c: mirror of the drivingScan *SetOp arm — BOTH branches
+		// are stamped, not just one side, since a partial SetOp streams
+		// both.
+		left, right := stampParallelScan(x.Left), stampParallelScan(x.Right)
+		if left == x.Left && right == x.Right {
+			return x
+		}
+		c := *x
+		c.Left, c.Right = left, right
+		return &c
 	}
 	return n
 }
@@ -729,6 +740,20 @@ func drivingScan(n Node) Node {
 			return drivingScan(x.Left)
 		}
 		return drivingScan(x.Right)
+	case *SetOp:
+		// M0140-0006c. A partial SetOp streams BOTH branches (unlike a
+		// join, which is partial through one side only), so BOTH must
+		// resolve to a driving scan the executor's *setOp arm of attachAll
+		// can claim independently (parallel_scan.go) — a single side is
+		// not enough. The planner's own admission gate is narrower than
+		// this recursion (partialPathDrivingKind's PathSetOp arm accepts a
+		// bare scan only), so in practice x.Left/x.Right are already a
+		// bare *SeqScan/*IndexScan here; this stays the general recursive
+		// form anyway, matching every other arm's sibling-agreement shape.
+		if drivingScan(x.Left) == nil || drivingScan(x.Right) == nil {
+			return nil
+		}
+		return x
 	}
 	return nil
 }
@@ -1518,6 +1543,15 @@ func unstampParallelScan(n Node) Node {
 		c.Child = child
 		return &c
 	case *Join:
+		left, right := unstampParallelScan(x.Left), unstampParallelScan(x.Right)
+		if left == x.Left && right == x.Right {
+			return n
+		}
+		c := *x
+		c.Left, c.Right = left, right
+		return &c
+	case *SetOp:
+		// M0140-0006c: the inverse of stampParallelScan's *SetOp arm.
 		left, right := unstampParallelScan(x.Left), unstampParallelScan(x.Right)
 		if left == x.Left && right == x.Right {
 			return n

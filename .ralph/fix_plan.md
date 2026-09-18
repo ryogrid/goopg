@@ -2743,8 +2743,9 @@ setting that yields a serial plan.
   `match=8`/TPC-DS `match=2` byte-identical before/after (nothing should
   move — this is reachability plumbing, same posture as 0006a), plus
   `scripts/tpcds-sf025-regression.sh sweep` PLAN-SHAPE changed=0.
-- [ ] **M0140-0006c — executor claim-set for `setOp` under `Gather`.** A
+- [x] **M0140-0006c — executor claim-set for `setOp` under `Gather`.** A
   Kind: impl
+  Parent: M0140-0006
   correctness prerequisite, not an optimization, and independent of
   0006a/0006b's path-search work. `gatherOp` (`internal/executor/
   operators_gather.go`) has each worker build its own full copy of the child
@@ -2756,6 +2757,51 @@ setting that yields a serial plan.
   worker replay both entire UNION ALL branches once `gatherPathsMode` picks the
   new partial-Append candidate — silent row duplication, a wrong-answer defect
   (Hard-won Rule #1). **Must land before or with 0006b's flag going live.**
+  - **Done 2026-09-18.** Adopted an uncommitted in-flight diff from a
+    cut-off previous loop (6 modified files plus one untracked test file;
+    only gap was a reference to a non-existent `intDatumForTest`, fixed to
+    the existing `NewIntDatum`) rather than re-deriving. Landed:
+    `parallelClaimSet.setOpLeft/setOpRight` plus `unwrapToSetOp` and the
+    `attachAll` dispatch (`internal/executor/parallel_scan.go`, shared by
+    `gatherOp` and `gatherMergeOp`); `*SetOp` twins in `stampParallelScan`/
+    `drivingScan`/`unstampParallelScan` (`internal/optimizer/parallel.go`);
+    `case PathSetOp:` in `partialPathDrivingKind` plus
+    `setOpBranchDrivingKindIsSupported` (`internal/optimizer/gatherpaths.go`,
+    narrowed to bare seq/unparameterised-index branches).
+  Movement: none (correctness prerequisite; no plan can select a partial
+  SetOp until M0140-0006b-2 lands — audited all three production
+  `generateUsefulGatherPaths` call sites, none reachable from any upper-rel
+  producer, so the whitelist arm has no input yet).
+  `TestGatherOverSetOpIdentity` (new file, 260+90-row fixture, 1/2/4
+  workers) is mutation-verified (2x/5x rows with the dispatch disabled).
+  Gates: `go build`/`go vet` clean; optimizer+executor suites PASS;
+  `tpch-spotcheck` PASS (Q12=2/Q13=34); `tpcds-sf025-regression sweep`
+  PASS=96 MISMATCH=0 PLAN-SHAPE 99/99 identical; `tpch-acceptance-arm`
+  PGSHAPED=1 HEAD-baseline A/B VERDICT PASS 24/24 MATCH (all three stamps
+  share one `code_tree` matching the staged index); precommit units no
+  FAIL. Design doc:
+  `docs/design/0100-0149/m0140-0006c-executor-claim-set.md`. Ledger row
+  filed (2026-09-18, `M0140-0006c`): join/bitmap-driven branches, owned by
+  **M0140-0006c-2** below.
+- [ ] **M0140-0006c-2 — widen the partial-SetOp admission past bare scans.**
+  Kind: impl
+  Parent: M0140-0006c. Filed 2026-09-18 by M0140-0006c's own narrowing.
+  `setOpBranchDrivingKindIsSupported` (`internal/optimizer/gatherpaths.go`)
+  accepts only a bare `PathSeqScan` or unparameterised `PathIndexScan` per
+  branch: a join-driven branch would need its build side prebuilt the way
+  `prebuildHashJoins` does for a top-level partial join, and a
+  bitmap-driven branch would need `prebuildBitmap` to find it — but
+  `collectShareableJoins`/`collectBitmapScans` do not descend into a
+  `*setOp`'s children today, so both fail closed to serial. Scope: teach
+  both collectors (and both prebuild passes) to descend into SetOp
+  children, then widen the admission test branch by branch, each with a
+  serial-vs-parallel identity test of `TestGatherOverSetOpIdentity`'s shape
+  extended to that branch kind. Expected movement (S5): TPC-DS Q5/Q76 (and
+  Q2/Q14/Q71/Q75) reach `Parallel Append` over non-scan branches if PG's
+  own plans use one there — confirm per query against `:65438` before
+  claiming it. Gate: TPC-DS SF0.25 sweep (category movement, no
+  regression) plus `tpch-acceptance-arm` digest; no TPC-H dependency beyond
+  the standard spotcheck.
 
 ## M0141 — Upper-planner ordering contest (filed 2026-09-14)
 

@@ -848,3 +848,70 @@ func TestCreateSetOpPathsPartialPathDoesNotMoveThePlan(t *testing.T) {
 		t.Fatal("emitted branches are not the pre-producer nodes; the partial candidate must not have won")
 	}
 }
+
+// TestPartialPathDrivingKindAcceptsSetOpWithTwoScanBranches pins M0140-0006c's
+// admission test: a PathSetOp whose two branches are both bare scans is
+// gatherable, and the two branches' Path pointers are exactly Children[0]/[1]
+// (addPartialSetOpPath's own shape), not re-derived.
+func TestPartialPathDrivingKindAcceptsSetOpWithTwoScanBranches(t *testing.T) {
+	left := &Path{Kind: PathSeqScan, ParallelSafe: true, ParallelWorkers: 2}
+	right := &Path{Kind: PathIndexScan, ParallelSafe: true, ParallelWorkers: 2}
+	setOp := &Path{Kind: PathSetOp, Children: []*Path{left, right}}
+	if got := partialPathDrivingKind(setOp); got != PathSetOp {
+		t.Fatalf("partialPathDrivingKind = %v, want PathSetOp", got)
+	}
+	if !partialPathShapeIsGatherable(setOp) {
+		t.Error("a two-scan-branch partial SetOp is not gatherable; makeGatherPath can never place a Gather over it")
+	}
+}
+
+// TestPartialPathDrivingKindRefusesSetOpWithBitmapBranch pins the narrowed
+// scope's bitmap refusal: prebuildBitmap's plan-side scan collector
+// (collectBitmapScans) does not descend into a *setOp, so a bitmap-driven
+// branch must never reach the executor with no claim state to attach.
+func TestPartialPathDrivingKindRefusesSetOpWithBitmapBranch(t *testing.T) {
+	left := &Path{Kind: PathSeqScan, ParallelSafe: true, ParallelWorkers: 2}
+	right := &Path{Kind: PathBitmapHeapScan, ParallelSafe: true, ParallelWorkers: 2}
+	setOp := &Path{Kind: PathSetOp, Children: []*Path{left, right}}
+	if got := partialPathDrivingKind(setOp); got != PathPrebuilt {
+		t.Fatalf("partialPathDrivingKind = %v, want PathPrebuilt (bitmap branch refused)", got)
+	}
+}
+
+// TestPartialPathDrivingKindRefusesSetOpWithJoinBranch pins the narrowed
+// scope's join refusal: a join-driven branch would need its build side
+// prebuilt the same way prebuildHashJoins does for a top-level partial join,
+// and collectShareableJoins does not walk into a *setOp's children today.
+func TestPartialPathDrivingKindRefusesSetOpWithJoinBranch(t *testing.T) {
+	left := &Path{Kind: PathSeqScan, ParallelSafe: true, ParallelWorkers: 2}
+	right := &Path{
+		Kind: PathHashJoin, ParallelSafe: true, ParallelWorkers: 2,
+		Children: []*Path{{Kind: PathSeqScan, ParallelSafe: true, ParallelWorkers: 2}, {Kind: PathSeqScan}},
+	}
+	setOp := &Path{Kind: PathSetOp, Children: []*Path{left, right}}
+	if got := partialPathDrivingKind(setOp); got != PathPrebuilt {
+		t.Fatalf("partialPathDrivingKind = %v, want PathPrebuilt (join branch refused, narrower than the general recursion)", got)
+	}
+}
+
+// TestPartialPathDrivingKindRefusesSetOpWithParameterizedIndexBranch mirrors
+// the top-level PathIndexScan arm's own RequiredOuter guard for a SetOp
+// branch: no worker can supply an outer parameter.
+func TestPartialPathDrivingKindRefusesSetOpWithParameterizedIndexBranch(t *testing.T) {
+	left := &Path{Kind: PathSeqScan, ParallelSafe: true, ParallelWorkers: 2}
+	right := &Path{Kind: PathIndexScan, ParallelSafe: true, ParallelWorkers: 2, RequiredOuter: 1}
+	setOp := &Path{Kind: PathSetOp, Children: []*Path{left, right}}
+	if got := partialPathDrivingKind(setOp); got != PathPrebuilt {
+		t.Fatalf("partialPathDrivingKind = %v, want PathPrebuilt (parameterized index branch refused)", got)
+	}
+}
+
+// TestPartialPathDrivingKindRefusesSetOpWithoutTwoChildren guards the
+// Children-length assumption addPartialSetOpPath's own shape guarantees —
+// a malformed PathSetOp must fail closed, not index out of range.
+func TestPartialPathDrivingKindRefusesSetOpWithoutTwoChildren(t *testing.T) {
+	setOp := &Path{Kind: PathSetOp, Children: []*Path{{Kind: PathSeqScan, ParallelSafe: true, ParallelWorkers: 2}}}
+	if got := partialPathDrivingKind(setOp); got != PathPrebuilt {
+		t.Fatalf("partialPathDrivingKind = %v, want PathPrebuilt (only 1 child)", got)
+	}
+}

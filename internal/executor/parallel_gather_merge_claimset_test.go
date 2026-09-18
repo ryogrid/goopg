@@ -193,6 +193,15 @@ func TestParallelClaimSetAttachesEveryKind(t *testing.T) {
 		{"pidx", &indexOnlyScanOp{}, func(op Operator, cs *parallelClaimSet) bool {
 			return op.(*indexOnlyScanOp).pidx == cs.pidx
 		}},
+		// M0140-0006c: a *setOp's two branches take INDEPENDENT claim state
+		// (setOpLeft/setOpRight), not the flat pscan/pbm/pidx a bare scan
+		// gets — see parallel_scan.go's attachAll *setOp arm.
+		{"setOpLeft", &setOp{left: &seqScanOp{}, right: &seqScanOp{}}, func(op Operator, cs *parallelClaimSet) bool {
+			return op.(*setOp).left.(*seqScanOp).pscan == cs.setOpLeft.pscan
+		}},
+		{"setOpRight", &setOp{left: &seqScanOp{}, right: &seqScanOp{}}, func(op Operator, cs *parallelClaimSet) bool {
+			return op.(*setOp).right.(*seqScanOp).pscan == cs.setOpRight.pscan
+		}},
 	}
 
 	covered := map[string]bool{}
