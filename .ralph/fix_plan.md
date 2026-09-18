@@ -204,6 +204,29 @@ uncommitted `ALTER TABLE … ADD CONSTRAINT` transaction on it was stopped with
   match, categories, values) and write the numbers for the owner's freeze
   decision; this A/B is also the evidence csq-R2's reopen condition names.
   Record every gate stamp and plan-file sha256.
+  - **In progress 2026-09-18 (partial — task stays unchecked).** Kind: impl.
+    Movement: none (measurement of pre-existing state, not a change this
+    loop made). Values gates re-run clean at HEAD (`42a2002ff`) on a private
+    lane: `tpch-spotcheck.sh` PASS (Q12=2/Q13=34); `tpcds-sf025-regression.sh
+    sweep` PASS=96 MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0, plan-shapes
+    99/99 identical to the prior sweep (`e5046bc31`). TPC-H plan-parity vs PG
+    18.3 (`estimate-audit -plan-only`, both sides on a private lane —
+    correcting the now-R1-unsafe M0137-0003 doc, see the design doc below):
+    serial `match=8/22`, exactly the current floor and unchanged from
+    `27d4ae001`, no regression across the 35 production commits landed
+    since; parallel `match=3/22` (not floor-comparable, tool's own caveat).
+    Design doc: `docs/design/0100-0149/p0-e7-bulk-re-measurement.md` (indexed
+    in `docs/design/README.md`). **Not yet done** (this loop's budget cutoff,
+    ledger row filed below): TPC-DS full-SF1 parity vs `:65438` (`match >= 2`
+    floor), `tpch-acceptance-arm.sh` OFF/ON digest comparison, the
+    M0142-0008 chain A/B, and per-commit TPC-H values for each of the 35
+    commits. Gates: `go build ./...` clean (no production file touched this
+    loop); gate stamps at `tmp/gate-stamps/{tpch-spotcheck,tpcds-sf025}.json`
+    (tree `2981a1eb4c50fffd33a79fec5a23a63e5a2bae06`, binary sha256
+    `c4d596f5…`, `dirty_code: false`). Next loop resumes with the TPC-DS
+    SF1 capture (budget: ~4-5h per the sf025 script's own header — plan for
+    a dedicated loop) or the acceptance-arm digest run, whichever the next
+    banner read finds still selectable first.
 - [x] **P0-D3 — split the M0141-S7 design doc and fix its `Status:`.**
   Parent: none. Kind: impl (docs only). Movement: none.
   **DONE 2026-09-18 by the owner.** The parent went 1501 -> 226 lines and eight
