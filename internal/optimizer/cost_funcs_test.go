@@ -375,9 +375,10 @@ func TestCostAggHashSpillInertBelowThreshold(t *testing.T) {
 	cp := defaultCostParams()
 	// 1000 groups of ~100 bytes is ~100KB against a multi-MB work_mem.
 	fits := costAgg(cp, AggStrategyHashed, 1e6, 0, 1000, 2, 1000, 1, 8, 100)
-	// The same call with the width the arm keys on removed must agree: with
-	// no width there is nothing to size an entry with, and the arm declines.
-	blind := costAgg(cp, AggStrategyHashed, 1e6, 0, 1000, 2, 1000, 1, 8, 0)
+	// The same call with BOTH width inputs the arm keys on removed must
+	// agree: with no ncols and no payload there is nothing to size an entry
+	// with, and the arm declines (the `addDistinctPaths` opt-out).
+	blind := costAgg(cp, AggStrategyHashed, 1e6, 0, 1000, 2, 1000, 1, 0, 0)
 	if !approxCost(fits.Total, blind.Total) || !approxCost(fits.Startup, blind.Startup) {
 		t.Fatalf("in-memory grouping was charged for spill: %+v vs unpriced %+v", fits, blind)
 	}
@@ -391,7 +392,7 @@ func TestCostAggHashSpillChargedAboveThreshold(t *testing.T) {
 	cp := defaultCostParams()
 	// 200M groups x ~120B/entry vastly exceeds any work_mem: guaranteed spill.
 	spilled := costAgg(cp, AggStrategyHashed, 4e8, 0, 1e6, 2, 2e8, 1, 8, 100)
-	blind := costAgg(cp, AggStrategyHashed, 4e8, 0, 1e6, 2, 2e8, 1, 8, 0)
+	blind := costAgg(cp, AggStrategyHashed, 4e8, 0, 1e6, 2, 2e8, 1, 0, 0)
 	if spilled.Total <= blind.Total {
 		t.Fatalf("spilling grouping not charged: %v <= %v", spilled.Total, blind.Total)
 	}

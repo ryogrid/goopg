@@ -360,9 +360,11 @@ func TestPartialAggModeLabelRoundTrips(t *testing.T) {
 // R. PG's own cost model is not scale-free for this reason, so demanding that
 // goopg's be would mean diverging from the oracle.
 //
-// The row range below therefore stops before the threshold (at
-// `c19gParams`'s 1 GB hash budget and this fixture's ~136-byte entry, about
-// 7.9M groups fit; the old 100M-row case spilled and flipped, correctly).
+// The row range below therefore stops before the threshold. M0141-S2a-fix2r
+// widened the spill arm's guard to fire on ncols alone (`hashsize.EntryBytes`
+// full-row currency, not the payload-only figure), which LOWERS this
+// all-int4 fixture's threshold from "never crossed in this range" to about
+// 4.6M groups — the old top row (10M) crossed it, so it is narrowed to 3M.
 // TestPartialAggVerdictCrossesTheSpillThreshold pins the other side.
 //
 // KNOWN LIMITATION, recorded rather than erased: the blind arm's licence is
@@ -375,7 +377,7 @@ func TestPartialAggVerdictIsScaleFree(t *testing.T) {
 	for _, ratio := range []float64{1e-6, 1e-4, 1e-2, 0.2, 0.5, 0.9, 1.0} {
 		for _, workers := range []int{1, 2, 4, 8} {
 			var want bool
-			for i, rows := range []int64{100_000, 1_000_000, 10_000_000} {
+			for i, rows := range []int64{100_000, 1_000_000, 3_000_000} {
 				nd := ratio * float64(rows)
 				if nd < 1 {
 					nd = 1

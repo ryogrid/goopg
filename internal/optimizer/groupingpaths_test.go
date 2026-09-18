@@ -71,15 +71,18 @@ func TestCostAggSortedHashedShareTotalCpu(t *testing.T) {
 	}
 }
 
-// TestCostAggHashedNeverChargesSpill pins the executor-faithful omission:
-// `aggregateOp` performs grouped aggregation IN MEMORY with no spill path,
-// so even a group count overflowing memory prices exactly the in-memory
-// terms — trans + grouping comparisons on startup over the input total,
-// final + emit per group on total. A spill charge here would be I/O that
-// never happens; measured, it flipped Q3/Q10/Q13/Q18 to sorted (Q13
-// 5.67 s → 8.71 s), all four away from PG's hash. Resume WITH executor
-// spill support (cost_funcs.go names the terms).
-func TestCostAggHashedNeverChargesSpill(t *testing.T) {
+// TestCostAggHashedFixedWidthChargesSpill pins M0141-S2a-fix2r's reinstated
+// "Arm C": a FIXED-width aggregate input (avgVarBytes == 0, ncols known and
+// > 0) has a real 48*ncols+24 footprint in PG's currency
+// (`hashsize.EntryBytes`), so a group count overflowing memory now prices a
+// real spill charge even though the payload-only figure alone is zero.
+// `aggregateOp` still aggregates in memory with no spill path — the charge
+// prices "this hash table does not fit", not goopg I/O that happens (see the
+// arm's own comment in cost_funcs.go). Formerly this fixture priced no spill
+// at all (`TestCostAggHashedNeverChargesSpill`, pre-fix2r); the sibling
+// `TestCostAggHashedUnknownWidthNeverChargesSpill` below pins the opt-out
+// that survives for callers with neither ncols nor payload.
+func TestCostAggHashedFixedWidthChargesSpill(t *testing.T) {
 	cp := defaultCostParams()
 	const ncols = 16
 	// Group footprint 4x over budget: WOULD spill if the arm existed.
@@ -91,6 +94,31 @@ func TestCostAggHashedNeverChargesSpill(t *testing.T) {
 	got := costAgg(cp, AggStrategyHashed, rows, 100, 500, ncols, groups, 1, ncols, 0)
 	trans := cp.cpuOperatorCost * rows
 	cmp := cp.cpuOperatorCost * ncols * rows
+	fin := cp.cpuOperatorCost * groups
+	emit := cp.cpuTupleCost * groups
+	inMemoryStartup := 500 + trans + cmp
+	inMemoryTotal := inMemoryStartup + fin + emit
+	if !(got.Startup > inMemoryStartup) {
+		t.Fatalf("startup = %v, want strictly above in-memory %v (fixed-width spill charge missing)", got.Startup, inMemoryStartup)
+	}
+	if !(got.Total > inMemoryTotal) {
+		t.Fatalf("total = %v, want strictly above in-memory %v (fixed-width spill charge missing)", got.Total, inMemoryTotal)
+	}
+}
+
+// TestCostAggHashedUnknownWidthNeverChargesSpill pins the ONE surviving
+// opt-out from M0141-S2a-fix2r's guard widening: with NEITHER a column count
+// nor a payload estimate (`addDistinctPaths`'s call shape — DISTINCT has no
+// per-column width wired to this call), there is no PG-faithful width to
+// substitute, so the arm must decline exactly as before, however far the
+// group count overflows memory.
+func TestCostAggHashedUnknownWidthNeverChargesSpill(t *testing.T) {
+	cp := defaultCostParams()
+	const groups = 200_000_000.0 // vastly overflows any work_mem, if the arm looked.
+	rows := groups * 10
+	got := costAgg(cp, AggStrategyHashed, rows, 100, 500, 1, groups, 1, 0, 0)
+	trans := cp.cpuOperatorCost * rows
+	cmp := cp.cpuOperatorCost * 1 * rows
 	fin := cp.cpuOperatorCost * groups
 	emit := cp.cpuTupleCost * groups
 	if want := 500 + trans + cmp; !approx(got.Startup, want) {
