@@ -511,6 +511,57 @@ func TestUnstampParallelScanReversesSetOpBranches(t *testing.T) {
 	}
 }
 
+// TestHasShareableHashJoinDescendsSetOp pins M0140-0006c-2's plan-side
+// prebuild gate: a hash join driving a SetOp branch must be visible to
+// HasShareableHashJoin, or the leader never prebuilds its build side and
+// every worker hashes only its own partition (silently dropped matches).
+func TestHasShareableHashJoinDescendsSetOp(t *testing.T) {
+	hashBranch := &Join{
+		Type: JoinTypeInner, Algo: JoinAlgoHash,
+		Left: seqScanOver(bigTable(t, "a")), Right: seqScanOver(bigTable(t, "b")),
+	}
+	so := setOpTestNode(parser.SetOpUnion, true, hashBranch, seqScanOver(bigTable(t, "c")))
+	if !HasShareableHashJoin(so) {
+		t.Fatal("HasShareableHashJoin missed a hash join driving a SetOp branch")
+	}
+	// And the negative: bare scans on both branches need no prebuild.
+	plain := setOpTestNode(parser.SetOpUnion, true, seqScanOver(bigTable(t, "a")), seqScanOver(bigTable(t, "b")))
+	if HasShareableHashJoin(plain) {
+		t.Fatal("HasShareableHashJoin fires on a scan-only SetOp; prebuild would run for nothing")
+	}
+}
+
+// TestHasBitmapScanDescendsSetOp is the bitmap twin: the gate and the
+// executor collector (collectBitmapScans) must agree on what sits under a
+// SetOp, even though a bitmap-DRIVEN branch is still refused at admission.
+func TestHasBitmapScanDescendsSetOp(t *testing.T) {
+	so := setOpTestNode(parser.SetOpUnion, true, seqScanOver(bigTable(t, "a")), &BitmapHeapScan{})
+	if !HasBitmapScan(so) {
+		t.Fatal("HasBitmapScan missed a bitmap scan under a SetOp branch")
+	}
+}
+
+// TestStripGatherStripsUnderSetOp pins the StripGather twin of the new
+// parallelChildren arm: a Gather below a SetOp branch must come back off,
+// copy-on-write, or the plan cache keeps a parallel plan for a session
+// that cannot run it.
+func TestStripGatherStripsUnderSetOp(t *testing.T) {
+	inner := NewGather(0, seqScanOver(bigTable(t, "a")), 2)
+	so := setOpTestNode(parser.SetOpUnion, true, inner, seqScanOver(bigTable(t, "b")))
+
+	out := StripGather(so)
+
+	if _, ok := out.(*SetOp); !ok {
+		t.Fatalf("StripGather changed the root shape: %T", out)
+	}
+	if planHasGather(out) {
+		t.Fatal("StripGather left a Gather under a SetOp branch")
+	}
+	if _, ok := so.Left.(*Gather); !ok {
+		t.Fatal("StripGather mutated the original tree in place")
+	}
+}
+
 // planHasGather reports whether any node in the tree is a Gather.
 func planHasGather(n Node) bool {
 	if n == nil {

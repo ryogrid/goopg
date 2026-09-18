@@ -1388,6 +1388,14 @@ func parallelChildren(n Node) []Node {
 	case *BitmapHeapScan:
 		// S5.6: the Outer bitmap-producing subtree is the child.
 		return []Node{x.Outer}
+	case *SetOp:
+		// M0140-0006c-2: both branches. This lets the prebuild gates
+		// (HasShareableHashJoin, HasBitmapScan) see joins and bitmaps
+		// driving a SetOp branch. findPartialSubtree and rebuildWithGather
+		// still refuse (they bail on len(kids) != 1, and terminatesPartial
+		// fires first anyway); subtreeHasUnsafeNode and subtreeHasGather
+		// only grow more conservative, which is the safe direction.
+		return []Node{x.Left, x.Right}
 	}
 	return nil
 }
@@ -1462,11 +1470,24 @@ func StripGather(n Node) Node {
 		}
 		return replaceSingleChild(n, child)
 	}
-	// Two-child shapes: a Join is the only one `parallelChildren` reports, and
-	// it is the only one a Gather can sit under.
+	// Two-child shapes: Join and SetOp are the only ones `parallelChildren`
+	// reports, and the Join is the only one a Gather can sit under via the
+	// generic post-pass (a SetOp terminates the partial walk, so a Gather
+	// below one of its branches can only arrive via the upper-rel path —
+	// stripped here all the same, so the walk and the planner agree).
 	j, ok := n.(*Join)
 	if !ok {
-		return n
+		s, ok := n.(*SetOp)
+		if !ok {
+			return n
+		}
+		left, right := StripGather(s.Left), StripGather(s.Right)
+		if left == s.Left && right == s.Right {
+			return n
+		}
+		c := *s
+		c.Left, c.Right = left, right
+		return &c
 	}
 	left, right := StripGather(j.Left), StripGather(j.Right)
 	if left == j.Left && right == j.Right {

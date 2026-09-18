@@ -871,9 +871,10 @@ func TestPartialPathDrivingKindAcceptsSetOpWithTwoScanBranches(t *testing.T) {
 }
 
 // TestPartialPathDrivingKindRefusesSetOpWithBitmapBranch pins the narrowed
-// scope's bitmap refusal: prebuildBitmap's plan-side scan collector
-// (collectBitmapScans) does not descend into a *setOp, so a bitmap-driven
-// branch must never reach the executor with no claim state to attach.
+// scope's bitmap refusal: prebuildBitmap publishes only to the top-level
+// claim set, not to a SetOp branch's own leaf claim set (whose pbm is nil
+// by construction), so a bitmap-driven branch must never reach the executor
+// with no claim state to attach.
 func TestPartialPathDrivingKindRefusesSetOpWithBitmapBranch(t *testing.T) {
 	left := &Path{Kind: PathSeqScan, ParallelSafe: true, ParallelWorkers: 2}
 	right := &Path{Kind: PathBitmapHeapScan, ParallelSafe: true, ParallelWorkers: 2}
@@ -883,19 +884,82 @@ func TestPartialPathDrivingKindRefusesSetOpWithBitmapBranch(t *testing.T) {
 	}
 }
 
-// TestPartialPathDrivingKindRefusesSetOpWithJoinBranch pins the narrowed
-// scope's join refusal: a join-driven branch would need its build side
-// prebuilt the same way prebuildHashJoins does for a top-level partial join,
-// and collectShareableJoins does not walk into a *setOp's children today.
-func TestPartialPathDrivingKindRefusesSetOpWithJoinBranch(t *testing.T) {
+// TestPartialPathDrivingKindAcceptsSetOpWithHashJoinBranch pins M0140-0006c-2's
+// widening: a hash-join-driven branch is admitted when its probe side is
+// itself admittable. The build side needs no admission of its own — the
+// leader drains it once via prebuildSharedHashJoins, which now sees through
+// a *setOp (collectShareableJoins + HasShareableHashJoin both descend).
+func TestPartialPathDrivingKindAcceptsSetOpWithHashJoinBranch(t *testing.T) {
+	scanProbe := &Path{Kind: PathSeqScan, ParallelSafe: true, ParallelWorkers: 2}
 	left := &Path{Kind: PathSeqScan, ParallelSafe: true, ParallelWorkers: 2}
 	right := &Path{
 		Kind: PathHashJoin, ParallelSafe: true, ParallelWorkers: 2,
-		Children: []*Path{{Kind: PathSeqScan, ParallelSafe: true, ParallelWorkers: 2}, {Kind: PathSeqScan}},
+		Children: []*Path{scanProbe, {Kind: PathSeqScan}},
 	}
 	setOp := &Path{Kind: PathSetOp, Children: []*Path{left, right}}
-	if got := partialPathDrivingKind(setOp); got != PathPrebuilt {
-		t.Fatalf("partialPathDrivingKind = %v, want PathPrebuilt (join branch refused, narrower than the general recursion)", got)
+	if got := partialPathDrivingKind(setOp); got != PathSetOp {
+		t.Fatalf("partialPathDrivingKind = %v, want PathSetOp (hash branch over scan probe admitted)", got)
+	}
+	if !partialPathShapeIsGatherable(setOp) {
+		t.Error("a hash-branch partial SetOp is not gatherable; makeGatherPath can never place a Gather over it")
+	}
+}
+
+// TestPartialPathDrivingKindAcceptsSetOpWithNestedHashJoinBranch pins the
+// recursion: a hash join whose probe side is itself a hash join over scans
+// is admitted — the prebuild collects every hash on the probe spine, and a
+// hash on a build side is drained serially as part of that build.
+func TestPartialPathDrivingKindAcceptsSetOpWithNestedHashJoinBranch(t *testing.T) {
+	inner := &Path{
+		Kind: PathHashJoin, ParallelSafe: true, ParallelWorkers: 2,
+		Children: []*Path{{Kind: PathSeqScan}, {Kind: PathSeqScan}},
+	}
+	left := &Path{Kind: PathSeqScan, ParallelSafe: true, ParallelWorkers: 2}
+	right := &Path{
+		Kind: PathHashJoin, ParallelSafe: true, ParallelWorkers: 2,
+		Children: []*Path{inner, {Kind: PathSeqScan}},
+	}
+	setOp := &Path{Kind: PathSetOp, Children: []*Path{left, right}}
+	if got := partialPathDrivingKind(setOp); got != PathSetOp {
+		t.Fatalf("partialPathDrivingKind = %v, want PathSetOp (nested hash probe admitted)", got)
+	}
+}
+
+// TestPartialPathDrivingKindRefusesSetOpWithBadHashJoinBranch pins the
+// fail-closed edges of the hash arm: a parameterised or malformed hash
+// join, a hash whose probe is itself refused (bitmap), and non-hash join
+// kinds (merge, nested loop) stay serial — their prebuild story is
+// unverified (no walk collects through a merge outer today; leaf claim
+// sets carry no pbm).
+func TestPartialPathDrivingKindRefusesSetOpWithBadHashJoinBranch(t *testing.T) {
+	scan := func() *Path { return &Path{Kind: PathSeqScan, ParallelSafe: true, ParallelWorkers: 2} }
+	cases := map[string]*Path{
+		"parameterised-hash": {
+			Kind: PathHashJoin, ParallelSafe: true, ParallelWorkers: 2, RequiredOuter: 1,
+			Children: []*Path{scan(), scan()},
+		},
+		"one-child-hash": {
+			Kind: PathHashJoin, ParallelSafe: true, ParallelWorkers: 2,
+			Children: []*Path{scan()},
+		},
+		"bitmap-probe-hash": {
+			Kind: PathHashJoin, ParallelSafe: true, ParallelWorkers: 2,
+			Children: []*Path{{Kind: PathBitmapHeapScan}, scan()},
+		},
+		"merge-branch": {
+			Kind: PathMergeJoin, ParallelSafe: true, ParallelWorkers: 2,
+			Children: []*Path{scan(), scan()},
+		},
+		"nestloop-branch": {
+			Kind: PathNestLoop, ParallelSafe: true, ParallelWorkers: 2,
+			Children: []*Path{scan(), scan()},
+		},
+	}
+	for name, branch := range cases {
+		setOp := &Path{Kind: PathSetOp, Children: []*Path{scan(), branch}}
+		if got := partialPathDrivingKind(setOp); got != PathPrebuilt {
+			t.Errorf("%s: partialPathDrivingKind = %v, want PathPrebuilt (refused)", name, got)
+		}
 	}
 }
 

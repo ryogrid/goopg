@@ -307,6 +307,14 @@ func collectShareableJoins(op Operator, out *[]*joinOp) {
 		collectShareableJoins(x.child, out)
 	case *instrumentedOp:
 		collectShareableJoins(x.inner, out)
+	case *setOp:
+		// M0140-0006c-2: a partial SetOp streams BOTH branches to
+		// completion, so a hash join driving either branch needs its
+		// build side leader-prebuilt exactly like a top-level partial
+		// join does. Descend both sides — unlike the join arm's
+		// probe-side-only rule, a SetOp has no build side to exclude.
+		collectShareableJoins(x.left, out)
+		collectShareableJoins(x.right, out)
 	}
 }
 

@@ -433,14 +433,18 @@ func partialPathDrivingKind(p *Path) PathKind {
 		// children rather than the single Children[0]/[1] pick the join
 		// arms make.
 		//
-		// Narrowed to a bare scan on each side — NOT the general recursion
-		// through a join or bitmap scan the other arms use. A join-driven
-		// branch would need its build side prebuilt the same way
-		// prebuildHashJoins does for a top-level partial join, and a
-		// bitmap-driven branch would need prebuildBitmap to find it — both
-		// walk the PLAN via collectShareableJoins/collectBitmapScans, and
-		// neither descends into a SetOp today. Ledger row filed
-		// (M0140-0006c): join/bitmap-driven SetOp branches.
+		// Narrowed to a bare scan on each side, plus a hash-join-driven
+		// branch partial through its probe side (M0140-0006c-2) — NOT the
+		// general recursion through a bitmap scan the other arms use. A
+		// bitmap-driven branch would need prebuildBitmap to publish into
+		// the branch's own leaf claim set (whose pbm is nil by
+		// construction); the collectors now descend into a SetOp, but the
+		// publication still targets only the top-level claim set, so
+		// bitmap stays refused (fail closed → serial). Merge- and
+		// nested-loop-driven branches stay refused too: their prebuild
+		// story is unverified (no walk collects through a merge outer
+		// today). Ledger row filed (M0140-0006c): the remainder is owned
+		// by M0140-0006c-2's still-open scope.
 		if len(p.Children) != 2 || !setOpBranchDrivingKindIsSupported(p.Children[0]) ||
 			!setOpBranchDrivingKindIsSupported(p.Children[1]) {
 			return PathPrebuilt
@@ -561,8 +565,10 @@ func partialPathDrivingKind(p *Path) PathKind {
 
 // setOpBranchDrivingKindIsSupported is the PathSetOp arm's own, narrower
 // admission test for one branch — a bare seq or (unparameterised) index
-// scan only. See partialPathDrivingKind's PathSetOp case for why this does
-// NOT delegate to partialPathDrivingKind's general recursion.
+// scan, or a hash join partial through its probe side (M0140-0006c-2). See
+// partialPathDrivingKind's PathSetOp case for why this does NOT delegate to
+// partialPathDrivingKind's general recursion (which would also admit bitmap,
+// merge and nested-loop shapes whose executor story is unverified).
 func setOpBranchDrivingKindIsSupported(p *Path) bool {
 	if p == nil {
 		return false
@@ -572,6 +578,24 @@ func setOpBranchDrivingKindIsSupported(p *Path) bool {
 		return true
 	case PathIndexScan:
 		return p.RequiredOuter == 0
+	case PathHashJoin:
+		// M0140-0006c-2. Partial through the PROBE side only: Children[0]
+		// by this package's child convention (pathgen.go), the same side
+		// partialPathDrivingKind's PathHashJoin arm, stampParallelScan and
+		// the executor's attach walk all descend. The build side is drained
+		// once by the leader via prebuildSharedHashJoins, which now sees
+		// through a *setOp (collectShareableJoins and HasShareableHashJoin
+		// both descend). The RequiredOuter/len guards mirror the
+		// PathHashJoin arm; the jointype trust is the producer's
+		// (addPartialHashJoinPath files only partial-capable jointypes),
+		// re-checked at runtime by hashJoinIsPartialCapable on the node
+		// twin. Only Hash recurses here: a merge or nested-loop join on
+		// the spine stays refused, since no walk collects through a merge
+		// outer today and the branch would run un-prebuilt.
+		if p.RequiredOuter != 0 || len(p.Children) != 2 {
+			return false
+		}
+		return setOpBranchDrivingKindIsSupported(p.Children[0])
 	default:
 		return false
 	}

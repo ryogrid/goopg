@@ -161,6 +161,15 @@ func collectBitmapScans(op Operator, dst *[]*bitmapHeapScanOp) {
 		collectBitmapScans(x.child, dst)
 	case *instrumentedOp:
 		collectBitmapScans(x.inner, dst)
+	case *setOp:
+		// M0140-0006c-2: descend both branches so this collection and the
+		// plan-side gate (HasBitmapScan, via parallelChildren) agree on
+		// what sits under a SetOp. A bitmap-DRIVEN SetOp branch is still
+		// refused at the planner (setOpBranchDrivingKindIsSupported) until
+		// the leaf claim sets grow their own pbm state — this arm only
+		// keeps the walks in step for bitmaps nested elsewhere under one.
+		collectBitmapScans(x.left, dst)
+		collectBitmapScans(x.right, dst)
 	case *joinOp:
 		if probeSideIsLeft(x.plan) {
 			collectBitmapScans(x.left, dst)

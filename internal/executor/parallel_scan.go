@@ -539,10 +539,11 @@ func newParallelClaimSet() *parallelClaimSet {
 // chain's inner node) as one — so addPartialSetOpPath can never see a
 // partial path on a branch that is itself a SetOp, and these two never need
 // branches of their own. pbm is intentionally left nil forever: a
-// bitmap-driven SetOp branch is refused at the planner (partialPathDrivingKind's
-// PathSetOp arm, gatherpaths.go) because prebuildBitmap's plan-side scan
-// collector does not descend into a SetOp either — ledger row filed,
-// M0140-0006c.
+// bitmap-driven SetOp branch is refused at the planner
+// (partialPathDrivingKind's PathSetOp arm, gatherpaths.go) because
+// prebuildBitmap publishes only to the top-level claim set, not to the
+// branch's own leaf — M0140-0006c-2's remaining scope (the collectors
+// themselves now descend).
 func newLeafParallelClaimSet() *parallelClaimSet {
 	return &parallelClaimSet{
 		pscan: newParallelScanState(0),
