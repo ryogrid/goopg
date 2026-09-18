@@ -456,17 +456,18 @@ func partialPathDrivingKind(p *Path) PathKind {
 		// arms make.
 		//
 		// Narrowed to a bare scan on each side, plus a hash-join-driven
-		// branch partial through its probe side (M0140-0006c-2) — NOT the
+		// branch partial through its probe side and a nested-loop-driven
+		// branch partial through its outer side (M0140-0006c-2) — NOT the
 		// general recursion through a bitmap scan the other arms use. A
 		// bitmap-driven branch would need prebuildBitmap to publish into
 		// the branch's own leaf claim set (whose pbm is nil by
 		// construction); the collectors now descend into a SetOp, but the
 		// publication still targets only the top-level claim set, so
-		// bitmap stays refused (fail closed → serial). Merge- and
-		// nested-loop-driven branches stay refused too: their prebuild
-		// story is unverified (no walk collects through a merge outer
-		// today). Ledger row filed (M0140-0006c): the remainder is owned
-		// by M0140-0006c-2's still-open scope.
+		// bitmap stays refused (fail closed → serial). A merge-driven
+		// branch stays refused too: its prebuild story is unverified (no
+		// walk collects through a merge outer today). Ledger row filed
+		// (M0140-0006c): the remainder is owned by M0140-0006c-2's
+		// still-open scope.
 		if len(p.Children) != 2 || !setOpBranchDrivingKindIsSupported(p.Children[0]) ||
 			!setOpBranchDrivingKindIsSupported(p.Children[1]) {
 			return PathPrebuilt
@@ -587,10 +588,11 @@ func partialPathDrivingKind(p *Path) PathKind {
 
 // setOpBranchDrivingKindIsSupported is the PathSetOp arm's own, narrower
 // admission test for one branch — a bare seq or (unparameterised) index
-// scan, or a hash join partial through its probe side (M0140-0006c-2). See
+// scan, a hash join partial through its probe side, or a nested loop
+// partial through its outer side (M0140-0006c-2, slices hash + A). See
 // partialPathDrivingKind's PathSetOp case for why this does NOT delegate to
-// partialPathDrivingKind's general recursion (which would also admit bitmap,
-// merge and nested-loop shapes whose executor story is unverified).
+// partialPathDrivingKind's general recursion (which would also admit bitmap
+// and merge shapes whose executor story is unverified).
 func setOpBranchDrivingKindIsSupported(p *Path) bool {
 	if p == nil {
 		return false
@@ -611,13 +613,50 @@ func setOpBranchDrivingKindIsSupported(p *Path) bool {
 		// PathHashJoin arm; the jointype trust is the producer's
 		// (addPartialHashJoinPath files only partial-capable jointypes),
 		// re-checked at runtime by hashJoinIsPartialCapable on the node
-		// twin. Only Hash recurses here: a merge or nested-loop join on
-		// the spine stays refused, since no walk collects through a merge
-		// outer today and the branch would run un-prebuilt.
+		// twin. A merge join on the spine stays refused: no walk collects
+		// through a merge outer today and the branch would run un-prebuilt.
 		if p.RequiredOuter != 0 || len(p.Children) != 2 {
 			return false
 		}
 		return setOpBranchDrivingKindIsSupported(p.Children[0])
+	case PathNestLoop:
+		// M0140-0006c-2 (slice A). Mirrors partialPathDrivingKind's
+		// PathNestLoop arm guard-for-guard (R94's ordinary whole-inner,
+		// R95's lateral index-probe inner), recursing through THIS test so
+		// a merge- or bitmap-driven outer still refuses. The executor side
+		// needed nothing new: attachAll's *setOp arm hands each branch its
+		// own leaf claim set, and attachParallelScan/
+		// attachParallelBitmapScan/attachParallelIndexScan each already
+		// carry the JoinAlgoNestedLoop arm (parallel_scan.go) — the inner
+		// takes no claim in either shape (whole-inners are materialised
+		// per worker, parameterized probes re-open per worker-local outer
+		// row). The Jointype guard subsumes the general arm's second
+		// identical re-check: the field cannot change between the two.
+		if p.Jointype != parser.JoinInner || p.RequiredOuter != 0 || len(p.Children) != 2 {
+			return false
+		}
+		o, in := p.Children[0], p.Children[1]
+		if o == nil || o.ParallelWorkers <= 0 || !o.ParallelSafe || o.RequiredOuter != 0 {
+			return false
+		}
+		if in == nil || in.Kind == PathMemoize {
+			return false
+		}
+		if in.RequiredOuter != 0 {
+			// R95 probe shape: a parameterized inner must be a bare index
+			// probe whose requirement THIS outer can satisfy — re-checked
+			// here rather than trusted from the filing site.
+			if in.Kind != PathIndexScan || len(in.IndexClauses) == 0 {
+				return false
+			}
+			if p.OuterRelids == 0 || p.InnerRelids == 0 {
+				return false
+			}
+			if calcNestloopRequiredOuter(p.OuterRelids, o.RequiredOuter, p.InnerRelids, in.RequiredOuter) != 0 {
+				return false
+			}
+		}
+		return setOpBranchDrivingKindIsSupported(o)
 	default:
 		return false
 	}

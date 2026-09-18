@@ -950,10 +950,10 @@ func TestPartialPathDrivingKindRefusesSetOpWithBadHashJoinBranch(t *testing.T) {
 			Kind: PathMergeJoin, ParallelSafe: true, ParallelWorkers: 2,
 			Children: []*Path{scan(), scan()},
 		},
-		"nestloop-branch": {
-			Kind: PathNestLoop, ParallelSafe: true, ParallelWorkers: 2,
-			Children: []*Path{scan(), scan()},
-		},
+		// No plain "nestloop-branch" case here: a whole-inner NL over two
+		// bare scans is ADMITTED by M0140-0006c-2 slice A (Jointype's zero
+		// value is parser.JoinInner) — see the acceptance/refusal pair
+		// below. Only its guard-violating shapes still refuse.
 	}
 	for name, branch := range cases {
 		setOp := &Path{Kind: PathSetOp, Children: []*Path{scan(), branch}}
@@ -982,5 +982,133 @@ func TestPartialPathDrivingKindRefusesSetOpWithoutTwoChildren(t *testing.T) {
 	setOp := &Path{Kind: PathSetOp, Children: []*Path{{Kind: PathSeqScan, ParallelSafe: true, ParallelWorkers: 2}}}
 	if got := partialPathDrivingKind(setOp); got != PathPrebuilt {
 		t.Fatalf("partialPathDrivingKind = %v, want PathPrebuilt (only 1 child)", got)
+	}
+}
+
+// TestPartialPathDrivingKindAcceptsSetOpWithNestLoopBranch is M0140-0006c-2
+// slice A's whole-inner case: a nested-loop-driven branch is admitted when
+// the NL carries the same guards partialPathDrivingKind's own PathNestLoop
+// arm requires (JoinInner, unparameterized, a V5 outer, and a whole or
+// probe inner). nlClassifyFixture/nlClassifyPath build exactly R60's filed
+// shape, so this exercises the arm on a producer-realistic path rather than
+// a hand-minimal one.
+func TestPartialPathDrivingKindAcceptsSetOpWithNestLoopBranch(t *testing.T) {
+	joinrel, outer, inner := nlClassifyFixture()
+	nlBranch := nlClassifyPath(joinrel, outer, inner, parser.JoinInner)
+	left := &Path{Kind: PathSeqScan, ParallelSafe: true, ParallelWorkers: 2}
+	setOp := &Path{Kind: PathSetOp, Children: []*Path{left, nlBranch}}
+	if got := partialPathDrivingKind(setOp); got != PathSetOp {
+		t.Fatalf("partialPathDrivingKind = %v, want PathSetOp (whole-inner NL branch admitted)", got)
+	}
+	if !partialPathShapeIsGatherable(setOp) {
+		t.Error("an NL-branch partial SetOp is not gatherable; makeGatherPath can never place a Gather over it")
+	}
+}
+
+// TestPartialPathDrivingKindAcceptsSetOpWithNestedNestLoopBranch pins the
+// recursion: an NL branch whose OUTER is itself an admitted NL is partial
+// through the whole spine — Q76's nested-NL shape (minus its Memoize
+// inner, which is M0142-0005a's separate gate).
+func TestPartialPathDrivingKindAcceptsSetOpWithNestedNestLoopBranch(t *testing.T) {
+	joinrel, outer, inner := nlClassifyFixture()
+	innerNL := nlClassifyPath(joinrel, outer, inner, parser.JoinInner)
+	nlBranch := &Path{
+		Kind: PathNestLoop, Jointype: parser.JoinInner,
+		ParallelSafe: true, ParallelWorkers: 2,
+		Children: []*Path{innerNL, {Kind: PathSeqScan}},
+	}
+	left := &Path{Kind: PathSeqScan, ParallelSafe: true, ParallelWorkers: 2}
+	setOp := &Path{Kind: PathSetOp, Children: []*Path{left, nlBranch}}
+	if got := partialPathDrivingKind(setOp); got != PathSetOp {
+		t.Fatalf("partialPathDrivingKind = %v, want PathSetOp (nested-NL spine admitted)", got)
+	}
+}
+
+// TestPartialPathDrivingKindAcceptsSetOpWithNestLoopIndexProbeBranch is the
+// R95 inner shape on a branch: a lateral index probe re-opened per
+// worker-local outer row takes no claim of its own, so the branch admits it
+// under the same satisfiable-subset re-check the general arm runs.
+func TestPartialPathDrivingKindAcceptsSetOpWithNestLoopIndexProbeBranch(t *testing.T) {
+	joinrel, outer, inner, a, _ := latClassifyFixture()
+	nlBranch := latClassifyPath(joinrel, outer, inner, parser.JoinInner, latParamInner(inner, a))
+	left := &Path{Kind: PathSeqScan, ParallelSafe: true, ParallelWorkers: 2}
+	setOp := &Path{Kind: PathSetOp, Children: []*Path{left, nlBranch}}
+	if got := partialPathDrivingKind(setOp); got != PathSetOp {
+		t.Fatalf("partialPathDrivingKind = %v, want PathSetOp (index-probe NL branch admitted)", got)
+	}
+}
+
+// TestPartialPathDrivingKindRefusesSetOpWithBadNestLoopBranch pins every
+// guard the new PathNestLoop arm inherits from the general one — the
+// fail-closed direction on a branch is serial, same as everywhere else.
+func TestPartialPathDrivingKindRefusesSetOpWithBadNestLoopBranch(t *testing.T) {
+	scan := func() *Path { return &Path{Kind: PathSeqScan, ParallelSafe: true, ParallelWorkers: 2} }
+	nl := func(children ...*Path) *Path {
+		return &Path{
+			Kind: PathNestLoop, Jointype: parser.JoinInner,
+			ParallelSafe: true, ParallelWorkers: 2, Children: children,
+		}
+	}
+	cases := map[string]*Path{
+		"left-join": {
+			Kind: PathNestLoop, Jointype: parser.JoinLeft,
+			ParallelSafe: true, ParallelWorkers: 2,
+			Children: []*Path{scan(), {Kind: PathSeqScan}},
+		},
+		"parameterised-nl": {
+			Kind: PathNestLoop, Jointype: parser.JoinInner,
+			ParallelSafe: true, ParallelWorkers: 2, RequiredOuter: 1,
+			Children: []*Path{scan(), {Kind: PathSeqScan}},
+		},
+		"one-child": nl(scan()),
+		"zero-worker-outer": nl(
+			&Path{Kind: PathSeqScan, ParallelSafe: true}, &Path{Kind: PathSeqScan}),
+		"unsafe-outer": nl(
+			&Path{Kind: PathSeqScan, ParallelWorkers: 2}, &Path{Kind: PathSeqScan}),
+		"parameterised-outer": nl(
+			&Path{Kind: PathSeqScan, ParallelSafe: true, ParallelWorkers: 2, RequiredOuter: 1},
+			&Path{Kind: PathSeqScan}),
+		"memoize-inner": nl(scan(), &Path{Kind: PathMemoize}),
+		"parameterised-seq-inner": nl(scan(),
+			&Path{Kind: PathSeqScan, RequiredOuter: 1}),
+		"clauseless-probe": nl(scan(),
+			&Path{Kind: PathIndexScan, RequiredOuter: 1}),
+		// The narrowed outer recursion: a merge- or bitmap-driven outer
+		// still refuses even when the NL's own guards all pass.
+		"bitmap-outer": nl(
+			&Path{Kind: PathBitmapHeapScan, ParallelSafe: true, ParallelWorkers: 2},
+			&Path{Kind: PathSeqScan}),
+		"merge-outer": nl(
+			&Path{Kind: PathMergeJoin, ParallelSafe: true, ParallelWorkers: 2,
+				Children: []*Path{scan(), scan()}},
+			&Path{Kind: PathSeqScan}),
+	}
+	for name, branch := range cases {
+		setOp := &Path{Kind: PathSetOp, Children: []*Path{scan(), branch}}
+		if got := partialPathDrivingKind(setOp); got != PathPrebuilt {
+			t.Errorf("%s: partialPathDrivingKind = %v, want PathPrebuilt (refused)", name, got)
+		}
+	}
+
+	// The R95 probe-subset refusals need the filed-shape fixture (an index
+	// probe path carrying IndexClauses plus the join's relid sets): a probe
+	// whose requirement no outer rel supplies, and a join whose relid sets
+	// are unrecorded, both refuse.
+	for name, build := range map[string]func() *Path{
+		"unpartitioned": func() *Path {
+			jr, o, i, a, _ := latClassifyFixture()
+			p := latClassifyPath(jr, o, i, parser.JoinInner, latParamInner(i, a))
+			p.OuterRelids = 0
+			return p
+		},
+		"unsatisfiable-probe-req": func() *Path {
+			jr, o, i, _, _ := latClassifyFixture()
+			return latClassifyPath(jr, o, i, parser.JoinInner, latParamInner(i, relsetOf(2)))
+		},
+	} {
+		setOp := &Path{Kind: PathSetOp, Children: []*Path{scan(), build()}}
+		if got := partialPathDrivingKind(setOp); got != PathPrebuilt {
+			t.Errorf("%s: partialPathDrivingKind = %v, want PathPrebuilt (refused)", name, got)
+		}
 	}
 }

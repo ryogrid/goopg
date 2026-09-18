@@ -317,6 +317,114 @@ func TestGatherOverSetOpHashJoinBranchIdentity(t *testing.T) {
 	}
 }
 
+// planTreeHasNestedLoopUnderGather is the Nested Loop twin of
+// planTreeHasHashJoinUnderGather: the identity comparison is only
+// meaningful if an NL Join node actually sits inside the Gather subtree —
+// through the SetOp if needed (ParallelChildrenForTest descends into SetOp
+// branches since M0140-0006c-2).
+func planTreeHasNestedLoopUnderGather(n optimizer.Node) bool {
+	found := false
+	var walk func(optimizer.Node, bool)
+	walk = func(cur optimizer.Node, underGather bool) {
+		if cur == nil || found {
+			return
+		}
+		switch cur.(type) {
+		case *optimizer.Gather, *optimizer.GatherMerge:
+			underGather = true
+		}
+		if j, ok := cur.(*optimizer.Join); ok && j.Algo == optimizer.JoinAlgoNestedLoop && underGather {
+			found = true
+			return
+		}
+		for _, c := range optimizer.ParallelChildrenForTest(cur) {
+			walk(c, underGather)
+		}
+	}
+	walk(n, false)
+	return found
+}
+
+// TestGatherOverSetOpNestLoopBranchIdentity is M0140-0006c-2 slice A's gate:
+// the left UNION ALL branch is a nested loop (outer = a 3-row filtered
+// scan of pq_setop_a, whole inner = pq_setop_c — a deterministic 120 rows),
+// the right a bare scan over pq_setop_b (90 rows).
+//
+// Serial-vs-parallel identity at 1/2/4 workers is the witness: each
+// participant claims a disjoint partition of the NL's OUTER through the
+// branch's own leaf claim set and materialises the whole inner itself
+// (attachParallelScan's JoinAlgoNestedLoop arm — unchanged by this slice,
+// already correct under any subtree). A worker replaying the whole branch
+// (the N-copies defect) returns MORE rows; a claim that never attaches
+// silently multiplies every branch row by the participant count.
+func TestGatherOverSetOpNestLoopBranchIdentity(t *testing.T) {
+	ctx, cleanup := parallelSetOpFixture(t)
+	defer cleanup()
+
+	ctx.MaxParallelWorkers = 8
+	ctx.ParallelLeaderParticipation = true
+
+	for _, workers := range []int{1, 2, 4} {
+		t.Run(fmt.Sprintf("workers=%d", workers), func(t *testing.T) {
+			advanceStmtCounter(ctx)
+			// Cross join guarantees the NL shape — no equi key exists for
+			// a hash/merge arm to fire on (parallel_nl_join_test.go's own
+			// corpus uses comma joins for the same reason). a.id < 3 keeps
+			// the branch small and deterministic: 3 outer x 40 inner.
+			nlBranch := nlPlanForTest(t, ctx, "SELECT a.id FROM pq_setop_a a, pq_setop_c c WHERE a.id < 3")
+			advanceStmtCounter(ctx)
+			right := planForTest(t, ctx, "SELECT id FROM pq_setop_b")
+			so := &optimizer.SetOp{Left: nlBranch, Right: right, Op: parser.SetOpUnion, All: true}
+
+			advanceStmtCounter(ctx)
+			want := drainPlan(t, ctx, so)
+			if len(want) != 120+90 {
+				t.Fatalf("serial baseline = %d rows, want 210 (120 join + 90 scan); the fixture planner shape moved", len(want))
+			}
+
+			gathered := optimizer.NewGather(0, so, workers)
+			if !planTreeHasNestedLoopUnderGather(gathered) {
+				t.Fatal("no Nested Loop under the Gather; the identity comparison would not exercise the join branch")
+			}
+			advanceStmtCounter(ctx)
+			op, err := Build(gathered)
+			if err != nil {
+				t.Fatalf("build: %v", err)
+			}
+			if err := op.Open(ctx); err != nil {
+				t.Fatalf("open: %v", err)
+			}
+			var got []string
+			for {
+				slot, err := op.Next()
+				if err == EOF {
+					break
+				}
+				if err != nil {
+					op.Close()
+					t.Fatalf("next: %v", err)
+				}
+				got = append(got, renderRows([]Row{slot.Row()})...)
+			}
+			if err := op.Close(); err != nil {
+				t.Fatalf("close: %v", err)
+			}
+
+			sort.Strings(want)
+			sort.Strings(got)
+			if len(got) != len(want) {
+				t.Fatalf("got %d rows, want %d — more means a worker replayed a whole branch instead of its partition (the N-copies defect)",
+					len(got), len(want))
+			}
+			for i := range want {
+				if got[i] != want[i] {
+					t.Fatalf("row %d differs: got %q want %q — a worker dropped or duplicated a branch row", i, got[i], want[i])
+				}
+			}
+		})
+	}
+}
+
 // TestCollectShareableJoinsDescendsSetOp pins the prebuild agreement for the
 // widened branch: a hash join on either SetOp branch is collected for the
 // leader prebuild; a scan-only SetOp collects nothing.
