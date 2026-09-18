@@ -3820,7 +3820,7 @@ spill route is net-negative.
     scripts/ralph_protected_regions.py check-designdocs` exit 0;
     `python3 scripts/ralph-lineage-guard.py` exit 0; pre-commit pgbench
     smoke PASS (hook). Ledger row appended (task-id `M0141-S2b-11`).
-  - [ ] **M0141-S2b-12** — recon: the M0129-S1 exact-cost fuzz tiebreak
+  - [x] **M0141-S2b-12** — recon: the M0129-S1 exact-cost fuzz tiebreak
     Kind: recon
     masks PG's `COSTS_EQUAL` semantics — Q4/Q12 (and every other
     fuzzily-tied grouping election) can never flip on insertion order.
@@ -3858,6 +3858,70 @@ spill route is net-negative.
     `tpch-estimate-audit-arm.sh` A/B S2b-11 used
     (`GOOPG_ANALYZE_SEED=20260905`, `PGSHAPED=1`, `--ref-port 65432`),
     plus the M0129-S1 motivating corpus to prove no resurrection.
+    **DONE 2026-09-19.** Movement: none (recon only; no production file
+    changed — the measured deltas below come from a throwaway worktree
+    patch, `/tmp/s2b12-wt`, never committed). Design doc:
+    `docs/design/0100-0149/m0141-s2b-12-m0129-s1-exact-cost-fuzz-tiebreak.md`.
+    Findings: (1) the deviation sits at the single serial-pathlist
+    funnel — `comparePathCostsFuzzily` → `comparePaths` →
+    `addToPathlist` → `addPath` covers every `RelOptInfo.Pathlist`
+    insertion; `addToPartialPathlist` is a separate already-PG-faithful
+    comparator. (2) No narrowing can separate the cases: the grouped-rel
+    signature the flip needs (keyless-cheaper vs keyful-dearer in-band)
+    is IDENTICAL to the join-rel signature M0129-S1 protected in Q74 —
+    demoting the weak cost direction only when it is the sole
+    directional dim leaves the pathkeys dim directional → still
+    incomparable → hashed survives. The only PG-faithful resolution is
+    full `COSTS_EQUAL` restore. (3) Measured restore: TPC-H 8/22 plans
+    changed, `CATEGORIES-EXCL-MATCH` agg-strategy 9→4,
+    parameterisation 5→3 (join-order 13→15, join-method 9→10,
+    scan-type 8→9 adverse), match 7→7, Q4/Q12 flip
+    HashAggregate→GroupAggregate; TPC-DS SF0.25 75/99 plans changed,
+    agg-strategy 71→44, sort-strategy 77→71 (parallelism 84→86,
+    qual-placement 20→22 adverse), match 2→2; **Q74 healthy** — hash
+    joins throughout the CTE chain. (4) Why safe: `ea1b2fbec`'s
+    companion `initialRelRows` CTE estimate fallback is what killed the
+    NL pathology (0.005^4 collapse → 1 row made NL look free); the
+    comparator deviation was belt-and-suspenders. Caveat: original
+    measurement was SF0.5, clone was SF0.25 — residual risk is a
+    sane-but-slower merge-over-hash election at other scales, not the
+    NL bug. (5) Sibling: `partialaggupper.go` no-split arm inserts
+    HASHED before SORTED (~:399 vs ~:410) — same inversion class S2b-11
+    fixed in `groupingpaths.go`, only meaningful once `COSTS_EQUAL`
+    makes insertion order matter. Instruments: `pg-plan-parity-diff.py`
+    TPC-H + TPC-DS roll-ups above; shape census 75/99. Impl filed as
+    M0141-S2b-13.
+  - [ ] **M0141-S2b-13** — impl: restore PG `COSTS_EQUAL` semantics in
+    Kind: impl
+    Parent: M0141-S2b-12
+    `comparePathCostsFuzzily` (delete the M0129-S1 exact-cost fallback
+    at `path.go:943-956`; double-fuzz → `costsEqual`), plus the
+    `partialaggupper.go` no-split-arm sibling reorder (insert SORTED
+    before HASHED, matching `add_paths_to_grouping_rel`'s
+    can_sort-before-can_hash). S2b-12's design doc holds the full
+    measured justification. Scope: (a) comparator
+    restore; (b) `path_test.go` update —
+    `TestComparePathCostsFuzzily_WithinFuzzIsEqual` pins the deviation
+    and must be re-asserted to PG semantics (audit neighbors);
+    (c) partialaggupper sibling swap. Consider also restoring PG's
+    missing `rows` dim + `parallel_safe` asymmetry inside the
+    `COSTS_EQUAL`-tie adjudication (`pathnode.c:541-560`: better
+    pathkeys dominate only when `new->rows <= old->rows` etc.) —
+    S2b-12's doc records it as a residual simplification; include only
+    if measurement shows a case needing it. Expected movement per
+    S2b-12 measurement: TPC-H `CATEGORIES-EXCL-MATCH` agg-strategy
+    9→4, Q4/Q12 (and Q5/Q8/Q21/Q22) flip HashAggregate→GroupAggregate;
+    TPC-DS agg-strategy 71→44, sort-strategy 77→71 — with known adverse
+    drift (TPC-H join-order +2/join-method +1/scan-type +1; TPC-DS
+    parallelism +2, qual-placement +2, TPC-H Q9 away-from-PG) and 75/99
+    TPC-DS plan churn, so land behind the FULL gate set:
+    `tpch-spotcheck.sh`, `tpch-acceptance-arm.sh` 24/24, the FULL
+    `tpcds-sf025-regression.sh sweep` (row counts + checksums, not just
+    plan shapes), pinned-epoch floor capture + `pg-plan-parity-diff.py`,
+    `make ea-ratchet`, and a Q74 timing sanity at the largest available
+    scale (M0129-S1's original gate was Q74 99s→14s at SF0.5; SF0.25
+    recon showed no NL resurrection). If the sweep shows ANY new
+    row-count or checksum delta, STOP — do not land.
   - [x] **M0141-S2b-7** — filed 2026-09-17 by M0141-S7's corpus measurement
     (design doc's "Update 2026-09-17h"). `electOrderedGrouping`
     (`upperorderedgrouping.go:236`) calls `addOrderedPaths` directly, once
