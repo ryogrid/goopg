@@ -421,10 +421,23 @@ heuristic stays live.)
   affected by the `:65433` P0-E6 evidence hold.
 
 ### Nightly run 20260902-005256 (sha `c11e55d253ff`, 8 items) — filed 2026-09-02
-- [ ] **testport/TestE2E_PGColdStartOnGoopgDataDir (AI-20260902-005256-001, AI-20260905-011015-002, AI-20260914-235643-004, AI-20260916-035206-004, AI-20260917-004357-006)**. New
+- [x] **testport/TestE2E_PGColdStartOnGoopgDataDir (AI-20260902-005256-001, AI-20260905-011015-002, AI-20260914-235643-004, AI-20260916-035206-004, AI-20260917-004357-006, AI-20260919-000526-002)**. New
   tonight; possibly the M0131-S4 "FAIL-WHEN-FIXED" assertion flipping red
   because a Theme F fix landed rather than a real regression — re-run repro
   and check the M0131 Theme F findings list before treating as a bug.
+  - **DONE 2026-09-19.** Confirmed: it WAS the FAIL-WHEN-FIXED flip, not a
+    regression. `c11ff797a` (2026-09-01, review/260831 NB-17) replaced the
+    pglz compressor's brute-force match search with upstream's hash chain +
+    `good_match`/`good_drop` bounds, so goopg's `pg_toast_2618` chunk counts
+    and stored bytes now match upstream's own (all 17 chunk counts equal,
+    bytes within 18 B, 8/17 exact) — the `wantChunks` pin still held the
+    pre-NB-17 brute-force output (3-4% smaller). Identical `got` string in
+    every nightly log since 20260902 → single stale pin, six duplicate AIs.
+    Re-pinned `wantChunks` to the new values, rewrote the stale comment,
+    flipped ledger row M0131-S20.2b F24 (`deferral_ledger.md` ~L1259) to
+    resolved. Repro `go test -v -run
+    '^TestE2E_PGColdStartOnGoopgDataDir$' ./internal/testport/` PASSES
+    (3.17s, cgroup-capped). Test-only — no production code touched.
   (`testport/TestPort_IsolationIntraGrantInplace`,
   `testport/TestPort_IsolationStats`,
   `testport/TestPort_LockRowsSortOverJoinTakesRowLock`,
@@ -435,7 +448,7 @@ heuristic stays live.)
   line filed for those per the "do not add another" rule.)
 
 ### Nightly run 20260905-011015 (sha `2e3deb52ba73`, 9 items) — filed 2026-09-11
-- [ ] **race/internal/executor (AI-20260905-011015-001, AI-20260914-235643-002, AI-20260916-035206-002, AI-20260917-004357-003)** — race suite failed
+- [ ] **race/internal/executor (AI-20260905-011015-001, AI-20260914-235643-002, AI-20260916-035206-002, AI-20260917-004357-003, AI-20260919-000526-001)** — race suite failed
   in `internal/executor` (also failed previous run; repro: `go test -race
   -timeout 45m ./internal/executor/`).
   - **Re-confirmed 2026-09-18, NOT stale.** Re-ran the exact repro at HEAD
