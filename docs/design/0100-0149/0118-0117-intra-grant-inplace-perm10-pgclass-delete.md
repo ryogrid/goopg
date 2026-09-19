@@ -124,3 +124,41 @@ after a concurrent committed delete and raising `cache lookup failed for relatio
 `relhasindex` update take no heavyweight lock on the object; their lock IS the
 `pg_class` tuple xmax (`src/backend/catalog/aclchk.c`,
 `heap_inplace_update_scan`).
+
+## Update 2026-09-19 (M-NIGHTLY AI-…-003/-006/-010/-013): perm-10 regression repair — `pgClassRelDropped`
+
+The doc's step 4 claim ("`sfu3` wakes, the tuple is gone → 0 rows") had a hole:
+`drainAndStamp`'s post-wait scan **re-evaluated** `'intra_grant_inplace'::regclass`
+lazily, and `regclassin`'s `LookupTable` now misses — the query died with
+`42P01 relation "intra_grant_inplace" does not exist` instead of yielding 0
+rows. Because `sfu3` then never produced an empty result, the rowmark was only
+cleared by `r3`'s transaction abort, so `revoke4` completed *after* `r3` instead
+of before it — the exact tail the nightly runs flagged since 2026-09-05
+(deterministic, perm 10 only; perms 1–9 stayed byte-identical).
+
+PG resolves the `regclass` constant **once** — into the scan key at executor
+start, before the `LockTuple` wait (`regproc.c:882` `regclassin`,
+`provolatile='s'`). Post-commit its scan finds the pg_class tuple deleted →
+`0 rows`; the constant is never re-resolved. goopg's fix mirrors that binding
+discipline at the LockRows layer rather than inside `regclassin` (a blanket
+"miss → false" would wrongly silence genuine `42P01`s):
+
+- `maybeRecordPgClassRowMark` (`operators_lockrows.go`): after
+  `waitTablePendingDrop` releases, probe `im.LookupTableByOIDAllDBs(relOID)`.
+  A miss means the deferred drop committed — set `o.pgClassRelDropped`. A hit
+  means it aborted — drain normally and the row is found. The check runs
+  unconditionally so it also covers a drop committed between filter-eval and
+  the wait, and the `tablePendingDropXID` marker is deliberately NOT the signal
+  (it is cleared only on the commit path, never on abort — a stale marker after
+  rollback would read identically to a live one).
+- `drainAndStamp`: `for !o.pgClassRelDropped` skips the child drain entirely —
+  `pending` stays empty so the existing empty-pending arm retracts the rowmark
+  (`ClearPgClassRowMark`), releasing `revoke4` before `r3` exactly as PG does.
+- The flag is sticky by design: a committed drop cannot un-happen (OIDs are
+  never recycled), matching PG's bound scan key surviving `ExecReScan`.
+
+Verified: `TestPort_IsolationIntraGrantInplace` PASS (10/10 perms
+byte-identical); siblings `IntraGrantInplaceDb`, `LockCommittedUpdate`,
+`LockCommittedKeyupdate`, `DropIndexConcurrently1`, `SequenceDdl`,
+`TruncateConflict` all PASS; `go test ./internal/executor/` PASS;
+`go test -race ./internal/executor/` clean.

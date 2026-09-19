@@ -612,9 +612,26 @@ heuristic stays live.)
       children — `(actual ...)` on the subtree upstream — so this is also
       a recorded PG-fidelity gap, but fixing it is out of this race-fix's
       scope: the race fix only needs today-preserving behaviour).
-- [ ] **testport/TestPort_IsolationIntraGrantInplace (AI-20260905-011015-003, AI-20260914-235643-006, AI-20260916-035206-006, AI-20260917-004357-010)** —
+- [x] **testport/TestPort_IsolationIntraGrantInplace (AI-20260905-011015-003, AI-20260914-235643-006, AI-20260916-035206-006, AI-20260917-004357-010)** —
   FAILed, also failed previous run (repro: `go test -v -run
   '^TestPort_IsolationIntraGrantInplace$' ./internal/testport/`).
+  - **DONE 2026-09-19.** Kind: impl. Movement: none (correctness fix —
+    restores the pass-required spec the CSV already claims; no parity
+    instrument moved). Landed the root-cause note's candidate fix:
+    `maybeRecordPgClassRowMark` now probes
+    `im.LookupTableByOIDAllDBs(relOID)` after `waitTablePendingDrop`
+    releases — a miss means the deferred drop committed, so
+    `o.pgClassRelDropped` makes `drainAndStamp` skip the child drain
+    (PG: `regclassin` binds once into the scan key before the LockTuple
+    wait; post-commit the scan finds the tuple deleted → `0 rows`, never
+    re-resolves). Empty `pending` → existing arm retracts the rowmark →
+    `revoke4` releases before `r3` — all 10 perms byte-identical.
+    Design doc: `docs/design/0100-0149/0118-0117-intra-grant-inplace-perm10-pgclass-delete.md`
+    Update 2026-09-19. Gates: repro PASS (5.55s); siblings
+    IntraGrantInplaceDb/LockCommittedUpdate/LockCommittedKeyupdate/
+    DropIndexConcurrently1/SequenceDdl/TruncateConflict PASS;
+    `go test ./internal/executor/` PASS; `-race` clean 61.6s.
+    Ledger resolution record appended (owner flips the row).
   - **ROOT-CAUSED 2026-09-19** (repro re-run at HEAD, 4.86s FAIL — same
     signature as every nightly since 20260905; the earlier 0827 failure was
     the pre-M0118 `FOR NO KEY UPDATE` syntax gap). Only the LAST

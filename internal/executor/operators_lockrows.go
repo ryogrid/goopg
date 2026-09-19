@@ -146,6 +146,15 @@ type lockRowsOp struct {
 	// for our transaction to end. Design 0118-0117 (intra-grant-inplace perm 10).
 	pgClassRowMarkOID uint32
 	pgClassRowMarkXID uint32
+	// pgClassRelDropped is set in Open when the pending-DROP wait released into
+	// a committed drop — the pg_class tuple this rowmark locked is gone. PG
+	// resolves 'rel'::regclass once into the scan key before the LockTuple
+	// wait, so its scan just finds the tuple deleted and yields 0 rows; the
+	// child scan's lazy re-evaluation would instead raise 42P01. drainAndStamp
+	// skips the drain; the empty-pending arm retracts the mark. Sticky on
+	// purpose: the OID cannot come back, matching PG's bound scan key across
+	// rescans. Design 0118-0117 (intra-grant-inplace perm 10).
+	pgClassRelDropped bool
 }
 
 type pendingLockedRow struct {
@@ -907,7 +916,17 @@ func (o *lockRowsOp) maybeRecordPgClassRowMark() *ExecError {
 	// lock waits on the pg_class delete xmax, then finds the tuple gone once the
 	// DROP commits. intra-grant-inplace perm 10 (sfu3 waits behind drop1). Design
 	// 0118-0117.
-	return waitTablePendingDrop(o.ctx, relOID)
+	if ee := waitTablePendingDrop(o.ctx, relOID); ee != nil {
+		return ee
+	}
+	// The wait released: if the DROP committed, the pg_class tuple this rowmark
+	// targets is gone and the drain below must yield 0 rows, not re-resolve
+	// 'rel'::regclass to a catalog miss (42P01). A surviving entry means the
+	// drop aborted — drain normally and the row is found. Design 0118-0117.
+	if _, _, found := im.LookupTableByOIDAllDBs(relOID); !found {
+		o.pgClassRelDropped = true
+	}
+	return nil
 }
 
 // pgClassFilterOID extracts the relation OID from a `oid = <const>` equality in
@@ -1031,7 +1050,12 @@ func (o *lockRowsOp) Next() (TupleSlot, error) {
 func (o *lockRowsOp) drainAndStamp() error {
 	o.drained = true
 	successCount := 0
-	for {
+	// pgClassRelDropped (set in Open when the pending DROP this rowmark waited
+	// on committed): the child scan's 'rel'::regclass constant would re-resolve
+	// to a catalog miss — 42P01 — where PG's already-bound scan key just finds
+	// the pg_class tuple deleted and yields 0 rows. Skip the drain; the
+	// empty-pending rowmark retract below still runs. Design 0118-0117.
+	for !o.pgClassRelDropped {
 		// Stop once we have acquired enough successfully locked rows.
 		if o.maxDrain > 0 && successCount >= o.maxDrain {
 			_ = o.child.Close()
