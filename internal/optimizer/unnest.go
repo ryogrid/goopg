@@ -3455,6 +3455,34 @@ func unnestInExpr(in *InExpr, outer Node) (Node, error) {
 		joinType = JoinTypeAnti
 	}
 	_ = innerWidth
+	// M0142-0008-producer: carry the SJInfo the seam walk needs to expose
+	// this pinned semi/anti join's RHS as a DP-search participant — the
+	// same producer existsUnnestSJInfo is for the EXISTS path. The RHS
+	// operands of the join's equality conjuncts are the params' inner
+	// columns (the IN testexpr itself is params[0] when correlated), or
+	// the inner plan's output column for the operand-keyed (params==0)
+	// shape. The IN path does not remapSourceTableIdx, so no offset.
+	var semiRhs []Expr
+	for _, prm := range params {
+		semiRhs = append(semiRhs, &ColumnRef{
+			pos:            prm.SubCol.Pos(),
+			Index:          prm.SubCol.Index,
+			Name:           prm.SubCol.Name,
+			Type:           prm.SubCol.Type,
+			SourceTableIdx: prm.SubCol.SourceTableIdx,
+		})
+	}
+	if len(semiRhs) == 0 {
+		if out := innerPlan.Output(); len(out) > 0 {
+			semiRhs = append(semiRhs, &ColumnRef{
+				pos:            innerPos,
+				Index:          0,
+				Name:           out[0].Name,
+				Type:           out[0].Type,
+				SourceTableIdx: out[0].SourceTableIdx,
+			})
+		}
+	}
 	join := &Join{
 		pos:       in.Pos(),
 		Type:      joinType,
@@ -3464,6 +3492,7 @@ func unnestInExpr(in *InExpr, outer Node) (Node, error) {
 		Predicate: semiPred,
 		LeftKey:   outerKeyExpr,
 		RightKey:  innerKey,
+		SJInfo:    inUnnestSJInfo(joinType, semiRhs, true),
 		schema:    append(Schema(nil), outerChild.Output()...),
 	}
 	filter.Child = join
@@ -3589,6 +3618,20 @@ func unnestNonCorrelatedInExpr(in *InExpr, outer Node) (Node, error) {
 	if effNegated {
 		joinType = JoinTypeAnti
 	}
+	// M0142-0008-producer: same SJInfo producer as unnestInExpr (see its
+	// comment). The single equality conjunct's RHS is the inner plan's one
+	// output column — innerOut[0], not innerKey (innerKey's SourceTableIdx
+	// is deliberately 0 and would trip createUniquePath's schema-drift
+	// guard). strict=false for the NullAware (NOT IN) anti shape: a
+	// null-aware clause is not a plain strict equality and LhsStrict feeds
+	// joinIsLegal's commute checks.
+	semiRhs := []Expr{&ColumnRef{
+		pos:            in.Pos(),
+		Index:          0,
+		Name:           innerOut[0].Name,
+		Type:           innerOut[0].Type,
+		SourceTableIdx: innerOut[0].SourceTableIdx,
+	}}
 	join := &Join{
 		pos:       in.Pos(),
 		Type:      joinType,
@@ -3599,6 +3642,7 @@ func unnestNonCorrelatedInExpr(in *InExpr, outer Node) (Node, error) {
 		LeftKey:   outerKey,
 		RightKey:  innerKey,
 		NullAware: effNegated,
+		SJInfo:    inUnnestSJInfo(joinType, semiRhs, !effNegated),
 		schema:    append(Schema(nil), outerChild.Output()...),
 	}
 	filter.Child = join
@@ -4469,6 +4513,52 @@ func existsUnnestSJInfo(jt JoinType, params []unnestParam, residuals []Expr, src
 		}
 	}
 
+	return sj
+}
+
+// inUnnestSJInfo builds the SpecialJoinInfo for a Join produced by the
+// IN/NOT-IN unnesting paths (unnestInExpr, unnestNonCorrelatedInExpr) —
+// the same shape existsUnnestSJInfo produces for the EXISTS pull-up (PG:
+// compute_semijoin_info, initsplan.c). Without it the seam walk's
+// semiAntiLinksHaveSJInfos gate (joinsearchseam.go) decline-gates every
+// IN-derived link, so no parser.JoinSemi SJInfo ever reaches
+// ctx.joinInfoList and jointypeForDirection's SEMI/ANTI arm stays
+// unreachable (M0142-0008-producer).
+//
+// Both IN paths always build an equi-keyed join (semiPred is always
+// `outerKey = innerKey`, a strict `=`), so MinLefthand/MinRighthand cover
+// both synthetic sides and LhsStrict follows the caller's `strict` flag
+// rather than a param count: the operand-keyed (params==0) shape is still
+// equi-keyed. `strict=false` is reserved for the NullAware (NOT IN) ANTI
+// case — a null-aware clause is not a plain strict equality, and
+// LhsStrict feeds joinIsLegal's commute checks where over-claiming could
+// admit a reordering PG would refuse.
+//
+// rhsExprs are the RHS operands of the join's equality conjuncts,
+// expressed in the inner plan's own column identity (PG collects the
+// righthand-side expressions of the semijoin's clauses; createUniquePath's
+// schema-drift guard compares their SourceTableIdx against the RHS
+// child's Output()). The synthetic {1}/{2} relsets are placeholders — the
+// seam walk renumbers them in place to real leaf bits
+// (joinsearchseam.go:1445-1447).
+func inUnnestSJInfo(jt JoinType, rhsExprs []Expr, strict bool) *SpecialJoinInfo {
+	const synL, synR RelSet = 1, 2
+	pjt := parser.JoinSemi
+	if jt == JoinTypeAnti {
+		pjt = parser.JoinAnti
+	}
+	sj := &SpecialJoinInfo{
+		SynLefthand:  synL,
+		SynRighthand: synR,
+		MinLefthand:  synL,
+		MinRighthand: synR,
+		Jointype:     pjt,
+		LhsStrict:    strict,
+	}
+	if pjt == parser.JoinSemi && len(rhsExprs) > 0 {
+		sj.SemiCanBtree, sj.SemiCanHash = true, true
+		sj.SemiRhsExprs = rhsExprs
+	}
 	return sj
 }
 
