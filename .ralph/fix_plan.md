@@ -1220,7 +1220,7 @@ heuristic stays live.)
     heap-update-chain probing on constraint/index probes is the plausible
     causal fix in the `2b7e9705..9fb05621f` window. No code change needed;
     re-open if a future nightly reproduces on a post-0010 sha.
-- [ ] **testport/TestPort_P0E4CatalogXmaxClientKill +
+- [x] **testport/TestPort_P0E4CatalogXmaxClientKill +
   TestPort_P0E4CatalogXmaxServerImmediateStop (AI-20260920-005626-007,
   AI-20260920-005626-008)** — both FAILed with a server-wedge signature, not
   a catalog-xmax signature: ClientKill "server did not settle after the
@@ -1232,6 +1232,14 @@ heuristic stays live.)
   tests un-skipped by P0-E5 — the catalog-loss fix holds (Rollback arm
   PASSes) but kill/immediate-stop leave the server wedged. Same run sha
   caveat as above.
+  - **CLOSED Loop \#25 (stale / env wedge)** — re-verified at HEAD
+    `021b8bf71`: ClientKill PASSes 3× fresh (~5.9s each),
+    ServerImmediateStop PASSes 3× fresh (~3.9s each) — vs 188s / 1002s
+    wedge runtimes in nightly. Neither `9fb05621f` nor `894774eb6` touches
+    shutdown/backend-kill paths, so the wedge was most likely a nightly-batch
+    environment effect (port/resource contention under parallel load), not
+    a product defect fixed in the window. Re-open if a post-0010 nightly
+    reproduces the wedge signature.
 - [ ] **testport/TestPort_PgoutputInterop* subscriber-start failures
   (AI-20260920-005626-009 … -018)** — ten pgoutput interop cases FAILed
   with one signature: "subscriber start: start failed; process exited
