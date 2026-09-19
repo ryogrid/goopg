@@ -10817,11 +10817,31 @@ verification is prioritised because several landed fixes never moved a plan —
 goopg's processing route diverged from PG's upstream of the fix).
 **Prerequisites:** none. Order: `.ralph/fix_plan.md` banner item 2.
 
-- [ ] **M0144-0001 — canonicalise parallel-mode TPC-H parity** (owner decision
-  2026-09-20). Flip `estimate-audit -serial`'s default to `false`
-  (`cmd/estimate-audit/main.go:293`) so the canonical tool measures the target
-  protocol by default; fix any test pinning the old default; keep
-  `-serial=true` working as the diagnostic mode. **Caller audit first**:
+- [x] **M0144-0001 — canonicalise parallel-mode TPC-H parity** (owner decision
+  2026-09-20). **DONE 2026-09-20** (code `2a2ebc3f0`). Design doc:
+  `docs/design/0100-0149/m0144-0001-parallel-tpch-parity-canonical.md`.
+  `-serial` now defaults `false` (`cmd/estimate-audit/main.go`); caller audit
+  found `tpch-estimate-audit-arm.sh` was the only binary invocation site and
+  already pinned `-serial=true`; no test pinned the old default. Fresh
+  canonical parallel capture on a private lane (G3, HEAD binary, served-sha
+  verified): **TPC-H parallel `match=1/22` (Q6)**, artefacts
+  `analysis/m0144/m0144-0001-{goopg,pg}-parallel.*` — measured on the
+  post-2026-09-20-8-FK-reload stats epoch (both sides' epochs differ from
+  P0-E7's pair), so the drop from P0-E7's provisional 3 is a new-baseline
+  reading, not a same-data regression: Q13/Q11's PG plans are unchanged in
+  shape while goopg's flipped on the new stats, and no production commit in
+  between touches aggregation/join-order costing. The measured number is
+  reported for the owner to write into `AGENT.md` §Goal (harness section is
+  owner-edited). Also corrected `m0137-0003` §2's stale `-ref-port 65432`
+  recipe (R1: it ANALYZEs the reference) to the two-invocation form.
+  Movement: none
+  Kind: impl
+  Parent: none
+  Original scope (kept for the record): flip `estimate-audit -serial`'s
+  default to `false` (`cmd/estimate-audit/main.go:293`) so the canonical
+  tool measures the target protocol by default; fix any test pinning the
+  old default; keep `-serial=true` working as the diagnostic mode.
+  **Caller audit first**:
   `scripts/tpch-estimate-audit-arm.sh` relied on the serial default — already
   pinned `-serial=true` in the same owner change that filed this task; sweep
   for any other invocation site that omits the flag before flipping. The
@@ -10835,8 +10855,6 @@ goopg's processing route diverged from PG's upstream of the fix).
   `m0137-0003-baseline-capture-procedure.md` §2 if the flag flip lands after
   the doc update. The capture artefacts land in
   `analysis/m0144/` with a `docs(…)`/`analysis(…)` commit.
-  Kind: impl
-  Parent: none
 - [ ] **M0144-0002 — first-divergence census** (03-forward-plan §1). Build a
   sibling of `scripts/pg-plan-parity-diff.py` (e.g.
   `scripts/pg-plan-first-divergence.py`, scripts-only — no `internal/`/`cmd/`

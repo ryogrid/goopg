@@ -1,6 +1,6 @@
 # Milestone 0144 — Measurement-first parity: censuses, instrumented PG, route-order alignment
 
-**Status:** planned — 0 done, 11 open, 0 blocked/frozen in `.ralph/fix_plan.md` (2026-09-20); order per the fix_plan banner item 2
+**Status:** in progress — 1 done (M0144-0001, canonical parallel TPC-H `match=1/22` measured on the post-reload epoch — reported for the §Goal floor re-pin), 10 open, 0 blocked/frozen in `.ralph/fix_plan.md` (2026-09-20); order per the fix_plan banner item 2
 **Filed:** 2026-09-20 (owner directive)
 **Source:** `../design/not_ralph/plan_parity_fix_take2/METHODOLOGY4/03-forward-plan.md` — adopted wholesale, with the two owner overrides below
 **Harness:** `AGENT.md` §"Plan-parity harness (M0137–M0144)"

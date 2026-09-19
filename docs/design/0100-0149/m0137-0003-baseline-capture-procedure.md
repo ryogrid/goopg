@@ -89,19 +89,37 @@ AGENT.md's "Server traps").
 
 ```bash
 go build -o /tmp/estimate-audit ./cmd/estimate-audit
+# goopg side: PRIVATE clone on a 55xx port (R1; see the two-invocation note
+# below — e.g. PLAN_ONLY=1 scripts/tpch-estimate-audit-arm.sh <label>
+# -serial=false -out analysis/m0144)
 PGPASSWORD=tpch /tmp/estimate-audit -plan-only -serial=false \
   -label <descriptive-label> -out analysis/m0137 \
-  -port 65433 -db tpch -user tpch -password tpch \
-  -ref-port 65432 -ref-db tpch -ref-user postgres -ref-password postgres
+  -port <55xx-private-clone> -db tpch -user tpch -password tpch
+# PG side: SECOND invocation, -port (not -ref-port), no warm-stats
+/tmp/estimate-audit -plan-only -serial=false -warm-stats=false \
+  -label <label>.pg -out analysis/m0137 \
+  -port 65432 -db tpch -user postgres -password postgres
 ```
 
+**R1 correction (recorded in `p0-e7-bulk-re-measurement.md`, applied here
+2026-09-20):** the one-invocation `-ref-port 65432` form this section
+originally documented issues `ANALYZE <table>` against the read-only PG
+reference on every run (`session.ensure`'s warm-stats loop runs on the
+reference connection too) — forbidden since R1's 2026-09-17 hardening. Use
+two invocations as shown: the goopg half warm-stats against a **private
+clone** (never the shared `:65433`), the PG half with `-warm-stats=false`
+(PG stats are global/persistent; `-plan-only` keeps the reference session
+to bare `EXPLAIN`s).
+
 - **Canonical mode is `-serial=false` (parallel) since 2026-09-20** (owner
-  decision; `AGENT.md` §Goal floor is the parallel-mode match count).
-  `-serial` still defaults `true` today (`cmd/estimate-audit/main.go:293`;
-  M0144-0001 flips it) and sets `max_parallel_workers_per_gather = 0` on
-  **both** engines (`session.ensure`, same file) — serial captures remain a
-  diagnostic variant. Until the flag default flips, every canonical capture
-  MUST pass `-serial=false` explicitly. Historical note: serial-mode captures
+  decision; `AGENT.md` §Goal floor is the parallel-mode match count), and
+  `-serial` has defaulted `false` since M0144-0001 landed the flip
+  (`cmd/estimate-audit/main.go`) — passing `-serial=false` explicitly is
+  still harmless and keeps a command line self-describing. `-serial=true`
+  sets `max_parallel_workers_per_gather = 0` on **both** engines
+  (`session.ensure`, same file) — serial captures remain a diagnostic
+  variant, and it is what the executed §5 estimate-audit arm
+  (`tpch-estimate-audit-arm.sh`) pins. Historical note: serial-mode captures
   are why TPC-H `parallelism` read 0 in pre-2026-09-20 category tables — the
   category was measured **out** of the corpus, not solved.
 - **`-plan-only` still warms stats.** `session.ensure`'s `ANALYZE <table>`
