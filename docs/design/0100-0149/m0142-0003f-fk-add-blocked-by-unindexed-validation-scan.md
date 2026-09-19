@@ -1,5 +1,8 @@
 # M0142-0003f — adding the TPC-H FK set: 11/16 landed, the remaining 5 are blocked by an unindexed, uncancellable validation scan
 
+Status: implemented (2026-09-16 — partial at close, 11/16 FK constraints;
+the remaining 5 landed under M0142-0003i's 8-FK canonical-set reload).
+
 ## Task
 
 Filed by M0142-0003e: add the canonical 8-constraint TPC-H FK set to goopg's

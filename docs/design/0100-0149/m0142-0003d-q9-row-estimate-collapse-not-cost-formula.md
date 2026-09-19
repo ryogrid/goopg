@@ -1,6 +1,9 @@
 # M0142-0003d — Q9's real divergence is a 2500x row-estimate collapse at
 # `lineitem ⋈ partsupp`, not a cost-formula term (recon, 2026-09-16)
 
+Status: closed (recon complete 2026-09-16 — premise refuted: the divergence
+is a row-estimate collapse, not a cost-formula term).
+
 *Filed by -0003c's Finding 2/3 as "which cost term underprices goopg's
 index-driven NLI over `lineitem` vs a hash-join-with-full-scan". This recon
 refutes that framing: the decisive divergence is upstream of costing

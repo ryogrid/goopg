@@ -1,5 +1,8 @@
 # M0142-0003k — crash-recovery hypothesis A refuted; scratch-table provenance narrowed to manual DDL
 
+Status: closed (recon complete 2026-09-16 — hypothesis A refuted; the open
+(c)/(d) items were resolved by P0-E4/E5/E6).
+
 ## Task
 
 Resume point filed by M0142-0003j: pin the root cause of the shared `:65433`

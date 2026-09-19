@@ -1,5 +1,8 @@
 # M0142-0003j — the shared TPC-H bench cluster lost its entire `tpch` database contents across a crash-recovery restart
 
+Status: closed (recon complete 2026-09-16 — evidence chain complete; the
+recovery itself was resolved by P0-E4/E5/E6).
+
 ## Task
 
 Filed against -0003i's own first sub-step: before adding the remaining 5 FK

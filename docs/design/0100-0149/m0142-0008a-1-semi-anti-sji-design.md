@@ -1,7 +1,7 @@
 # M0142-0008a-1 — SEMI/ANTI decorrelation as a DP search participant: PG legality read + concrete goopg design
 
-Status: design-only, no production diff. Filed by M0142-0008a's scoping recon
-(`docs/design/0100-0149/m0142-0008a-scoping-recon-semi-anti-decorrelation-census.md`).
+Status: living design record for the unfrozen chain (owner unfreeze 2026-09-20); filed
+by M0142-0008a's scoping recon as design-only — its increments have since landed.
 This doc is the K24-mandated "further scoping pass" for -2/-3: a full read of
 PG's `join_is_legal`/`SpecialJoinInfo` construction machinery, followed by a
 concrete mapping onto goopg's *current* code — not the code as M0142-0008a's

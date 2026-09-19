@@ -1,5 +1,8 @@
 # M0142-0003e — the superkey/FK no-fan-out mechanism is not the problem; the bench cluster's schema is
 
+Status: closed (recon complete 2026-09-16 — root cause identified: the bench
+cluster's schema was missing the FK constraint set).
+
 ## Task
 
 Filed by M0142-0003d's Finding 1/2: goopg's DP search estimates the bare

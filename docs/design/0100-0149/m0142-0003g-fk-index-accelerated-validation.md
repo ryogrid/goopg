@@ -1,5 +1,8 @@
 # M0142-0003g — index-accelerating goopg's FK constraint validation scan
 
+Status: implemented (2026-09-16 — FK parent-existence checks now probe the
+parent's unique index instead of scanning the whole heap).
+
 ## Task
 
 Filed by M0142-0003f's root-cause trace: goopg's FK parent-existence check

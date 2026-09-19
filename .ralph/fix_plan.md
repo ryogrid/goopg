@@ -323,13 +323,35 @@ uncommitted `ALTER TABLE … ADD CONSTRAINT` transaction on it was stopped with
   linking back), correct every `Status:` line, and index the new docs in
   `docs/design/README.md` in the same commit. Do this before appending anything
   else to that doc.
-- [ ] **P0-H11 — stale-comment cleanup after the owner's M0142-0008 decision.**
+- [x] **P0-H11 — stale-comment cleanup after the owner's M0142-0008 decision.**
   Kind: impl
-  Parent: P0-E7. Not selectable until the owner records the decision in the
-  banner. Remove "admitSemiAnti stays false" comments (e.g.
-  `joinsearchseam.go:1552`) and the two probe tests if the chain is removed.
-  Also bring the `Status:` lines of the design docs for M0142-0003d/e/f/g/j/k
+  Parent: P0-E7. **Selectable as of 2026-09-20** — the owner recorded the
+  decision in the banner: the chain is UNFROZEN (not removed), so the
+  "remove `admitSemiAnti stays false` comments if the chain is removed"
+  branch does not fire; instead audit stale FROZEN/deferred phrasing in
+  code comments and docs against the new unfrozen state. Still valid: bring
+  the `Status:` lines of the design docs for M0142-0003d/e/f/g/j/k
   (none present) up to date.
+  - **DONE 2026-09-20 (Loop \#32). Movement: none** (comment/doc-text only,
+    zero behavior delta). Corrected 11 stale sites: `predp.go`'s file
+    header ("S5b deferred by user decision (2026-07-21)" — lifted
+    2026-09-20), `predp.go`/`predp_test.go`'s "unreachable while
+    `admitSemiAnti` stays `false`" claims (true since b2; the corpus
+    unreachability reason is now the leaf-count gate), six
+    `joinsearchseam.go` sites (`extractSearchLeaves` header, the semiAnti
+    arm's "INERT until", the c17 "IN paths never set `.SJInfo`" claim —
+    stale since M0142-0008-producer, `buildLeafSpans`/`pgShapedOffsetChecksOK`
+    inertness claims, `cumulativeFromSpans`'s invariant), and
+    `semiantichain_test.go`×3 (incl. renaming
+    `..._AdmitSemiAntiFalse_UnchangedFromProduction` → `..._SemiIsOpaqueLeaf`,
+    the name itself asserted the stale claim). `Status:` lines added to all
+    six `m0142-0003d/e/f/g/j/k` docs + README column synced;
+    `m0142-0008a-1`'s "design-only, no production diff" Status updated to
+    reflect the landed increments. Surfaced one latent correctness item —
+    `cumulativeFromSpans`'s span round-trip cannot carry out-of-band
+    synthetic ranges (unreachable today, gated by leaf-count); filed as a
+    bullet under `M0142-0008a-3` above. Design doc:
+    `docs/design/0100-0149/p0-h11-stale-frozen-comment-cleanup.md`.
 - [x] **P0-H12 — TPC-DS SF1 Q9 shape divergence: new or pre-existing?**
   Kind: recon.
   Parent: P0-E7. Filed 2026-09-18 (P0-E7's TPC-DS full-SF1
@@ -6786,6 +6808,16 @@ cross-layer programme that has never been scoped.
     to decline -2/-3. Also incidentally found an EXPLAIN alias-mislabeling
     cosmetic bug on Q16/Q94 (execution-verified correct, display-only) —
     filed as **M0142-0008d** (below).
+    - **P0-H11 audit finding (2026-09-20, Loop \#32):** the leaf-admission
+      increment must also fix `cumulativeFromSpans`'s span round-trip
+      (`joinsearchseam.go` `cumulativeFromSpans` → `joinlistProblem.cumOffsets`
+      → `spansFromCumulative` at the consumer). `buildLeafSpans` deliberately
+      appends synthetic Semi/Anti RHS ranges out-of-band (after the real
+      total); flattening them into a plain `[]int` and re-spanning
+      contiguously misattributes the hole to the last real leaf. Unreachable
+      today (every semiAnti-carrying chain still declines at `leaf-count`
+      upstream) — a latent correctness gate for whichever task first lets a
+      link through. Details: `p0-h11-stale-frozen-comment-cleanup.md` §3.
     - [x] **M0142-0008a-3(iii) — lift the hash-decline gate — LANDED
       2026-09-16 (design doc §8).** `joinpaths.go`'s single `nestloopOnly`
       boolean (gated BOTH the hash arms AND the merge arms as one block) is
