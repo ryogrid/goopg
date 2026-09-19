@@ -10876,24 +10876,91 @@ goopg's processing route diverged from PG's upstream of the fix).
   Movement: none
   Kind: recon
   Parent: none
-- [ ] **M0144-0003 — route-order verification** (owner directive 2026-09-20:
+- [x] **M0144-0003 — route-order verification** (owner directive 2026-09-20:
   "fixes landed but plans didn't move because the processing order differs
-  from PG" — verify, then align). For each landed-but-inert item, state the
-  goopg route position and cite PG's ordering (`./postgres/<file>:<line>`):
-  (a) `M0142-0008-producer`'s `.SJInfo` now produced but every IN statement
-      declines at `leaf-count` (`joinsearchseam.go:325`, before
-      `semiAntiLinksHaveSJInfos` at :631) — the `Filter(Semi(...))` wrapper as
-      opaque leaf;
-  (b) Parallel Append admitted 0/99 corpus-wide (M0140);
-  (c) Incremental Sort reaches the executor 0 times (M0141-S7);
-  (d) `applyUpperNarrowing` runs after costing (post-cost narrowing inert);
-  (e) EXISTS/IN pinned pre-DP vs PG's `join_is_legal` route.
-  Output: a per-item route-diff table in the design doc + `analysis/m0144/`,
-  and one `Kind: impl` task filed per confirmed ordering divergence (each
-  naming expected movement per S5). If an item turns out NOT to be an ordering
-  divergence, say so with the citation — do not force the hypothesis.
+  from PG" — verify, then align).
+  **DONE 2026-09-20.** Route-diff table:
+  `analysis/m0144/m0144-0003-route-order-verification.md`; design doc
+  `docs/design/0100-0149/m0144-0003-route-order-verification.md`.
+  Verdicts: **(a) confirmed** — the `Filter{sunk}` inside `Semi.Left`
+  (`pushConjunctsBelowSemiAnti`, unnest.go:372) is one opaque leaf to
+  `extractSearchLeaves` (joinsearchseam.go:1456) → `leaf-count` decline at
+  :325 before `semiAntiLinksHaveSJInfos`; PG's `pull_up_sublinks`
+  (prepjointree.c:468, planner.c:737) is jointree-level so no Filter node
+  exists. **(b) confirmed** — `addPartialSetOpPath`
+  (windowsetoppaths.go:551) produces at the `*SetOp` plan-node level while
+  PG flattens UNION ALL-in-FROM to an appendrel (`pull_up_simple_union_all`
+  prepjointree.c:1617 via planner.c:754) and files partial paths per-rel
+  (`add_paths_to_append_rel` allpaths.c:1321) — appendrel is a join-input
+  citizen; goopg SF0.25 has 0 Parallel Append vs PG's 9 sites.
+  **(c) REFUTED as ordering** — producer sits at PG's position
+  (upperordered.go:186 ≈ planner.c:5374); inert via
+  `GOOPG_INCREMENTAL_SORT` default-off (incrementalsortpaths.go:81) plus
+  S7's measured cost loss — costing question, banner item 5's scope.
+  **(d) confirmed** — `applyUpperNarrowing` at planner.go:190 runs after
+  the tournament; PG prices narrowed width into candidates via
+  `set_pathtarget_cost_width` (costsize.c:6367) from
+  `make_*_input_target`s built in `grouping_planner` (planner.c:1676-1744).
+  **(e) confirmed, same root as (a)** — the pin is load-bearing only
+  because Phase B declines; PG admits semi/anti pairs inside DP via
+  `join_is_legal` (joinrels.c:350/:713). Impl tasks filed: M0144-0003a/b/c.
+  Movement: none
   Kind: recon
   Parent: none
+- [ ] **M0144-0003a — Phase-B leaf admission through the sunk-conjunct
+  Filter** (filed by M0144-0003 item (a)+(e), same root). Phase B's chain
+  `spineJoins[0]` is the outermost pinned Semi/Anti join whose `Left`
+  carries `Filter{sunk}(origChain)` (predp.go:49-55's documented shape);
+  `extractSearchLeaves` counts that Filter as one opaque leaf
+  (joinsearchseam.go:1456-1461) so `leaf-count` (:325) fires for every
+  corpus IN/EXISTS statement (measured `leaf-count×62`, `nrels=4 nleaves=2`
+  on Q56) before `semiAntiLinksHaveSJInfos` (:1889) runs. Fix shape: make
+  the walk descend a `*Filter` whose conjuncts re-base into the chain's
+  WHERE/qual space (the conjuncts are already in the outer chain's column
+  space — `pushConjunctsBelowSemiAnti` only moved them down, never
+  re-based), so the sunk Filter contributes its leaves plus its conjuncts
+  rather than collapsing to one opaque leaf. Alternative (bigger,
+  PG-faithful): move unnesting to jointree level — the durable direction
+  per the route-diff pattern. Constraint: Q78's `outer-over-derived`
+  firewall must not weaken. Expected movement per S5: IN/EXISTS-derived
+  semi/anti links reach the searched pair space → census semi/anti
+  first-divergence records move (SF1 Q16 `NL Left Semi vs HJ Left Anti`
+  class; the ~62 leaf-count declines re-attributed).
+  Kind: impl
+  Parent: M0144-0003
+- [ ] **M0144-0003b — jointree-level UNION ALL flattening**
+  (`pull_up_simple_union_all` analog; filed by M0144-0003 item (b)). PG
+  flattens UNION ALL-in-FROM into an appendrel during jointree
+  preprocessing (prepjointree.c:1617 via pull_up_subqueries planner.c:754)
+  so `add_paths_to_append_rel` (allpaths.c:1321) files partial paths
+  per-rel and the append is a join-input citizen. goopg has no flattening —
+  `addPartialSetOpPath` produces at the `*SetOp` plan-node level and admits
+  0/99 corpus-wide (SF0.25: 0 Parallel Append vs PG's 9 sites). Scope: an
+  appendrel representation in the searched problem + partial-path filing at
+  the appendrel level (reusing the landed pure/mixed arms' cost math where
+  they fit); must not let a flattened appendrel bypass the Q78 firewall or
+  the outer-join ordering rules. Expected movement per S5: the TPC-DS
+  Parallel Append sites (Q5×3, Q2, Q14, Q71, Q76 and census `parallelism`
+  records) become reachable.
+  Kind: impl
+  Parent: M0144-0003
+- [ ] **M0144-0003c — pre-cost upper narrowing** (filed by M0144-0003 item
+  (d)). `applyUpperNarrowing` (planner.go:190) narrows Aggregate/Sort input
+  width on the finished tree — post-tournament, so it can never move a plan
+  choice. PG narrows the input target BEFORE costing: `grouping_planner`
+  builds `make_*_input_target`s (planner.c:1676-1744) finalized by
+  `set_pathtarget_cost_width` (costsize.c:6367); `cost_sort`
+  (costsize.c:2328) and hash/agg sizing (:3709/:3722/:3765) price the
+  narrow row into every candidate. Scope: carry the derived keep-set into
+  the ordered/grouping rel's path sizing so `costSort`/agg candidates are
+  priced on the narrowed width (the keep-list derivation already exists —
+  `group_input_target.go` name-level union consumed by the post-pass);
+  delete nothing, re-point the costing inputs. Expected movement per S5:
+  width-dependent cost branches — sort memory feasibility and hash-table
+  sizing inside the sort-strategy (43 SF0.25) / aggregation-strategy census
+  clusters.
+  Kind: impl
+  Parent: M0144-0003
 - [ ] **M0144-0004 — instrumented PG 18.3, instrument 1: `OPTIMIZER_DEBUG`
   build** (03-forward-plan §3). Build PG 18.3 from a **scratch checkout**
   (`./postgres/` stays read-only) with `OPTIMIZER_DEBUG` defined; serve a
