@@ -81,7 +81,7 @@ func evalBtIndexCheck(x *optimizer.FuncCall, slot SlotView, ctx *Context, parent
 		// NULL regclass → void (upstream PG_RETURN_NULL on a NULL argument).
 		return NullDatum, nil
 	}
-	idx, ok := btIndexResolve(argVal, im)
+	idx, ok := btIndexResolve(argVal, im, ctx.CurrentDatabaseOid)
 	if !ok {
 		if argVal.Kind == KindInt {
 			if _, isToast := im.ToastParentTable(uint32(argVal.Int)); isToast {
@@ -502,12 +502,18 @@ func btIndexLeftmostByLevel(src amcheck.PageSource, root storage.BlockNumber, ke
 
 // btIndexResolve converts a KindInt OID or KindString name Datum to the index
 // relation it names (mirrors verifyHeapamResolveTable on the heap side).
-func btIndexResolve(d Datum, im *catalog.InMemory) (*catalog.Index, bool) {
+// dbOid is the calling connection's database OID, normalized through
+// catalog.NamespaceDBOid the same way verifyHeapamResolveTable does — an
+// unscoped lookup silently resolves DefaultDBOid and reports every index in
+// a genuinely non-default database "does not exist" (the mirror image of the
+// M0119-0006bo/bq verify_heapam bug). M0119-0006bq.
+func btIndexResolve(d Datum, im *catalog.InMemory, dbOid uint32) (*catalog.Index, bool) {
+	dbOid = catalog.NamespaceDBOid(dbOid)
 	switch d.Kind {
 	case KindInt:
-		return im.LookupIndexByOID(uint32(d.Int))
+		return im.LookupIndexByOID(uint32(d.Int), dbOid)
 	case KindString:
-		return im.LookupIndex(parser.ObjectName{Name: d.StringValue()})
+		return im.LookupIndex(parser.ObjectName{Name: d.StringValue()}, dbOid)
 	default:
 		return nil, false
 	}

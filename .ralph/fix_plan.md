@@ -1273,6 +1273,29 @@ the whole file's active task between 2026-09-01 and 2026-09-14; **since
 2026-09-14 the banner ranks M0137–M0143 above it.**
 
 - [ ] **M0119-0006 — pg_amcheck server tier**.
+  - 2026-09-19 (bq): repaired two regressions that had every ported
+    `TestPort_PgAmcheck*` skipping on an unclean healthy baseline.
+    - `verify_heapam`/`pg_get_sequence_data`/`pg_sequence_parameters` reported
+      42P01 for every relation in the `postgres` database: slice bo threaded the
+      RAW `ctx.CurrentDatabaseOid`, but `postgres` (OID 16384) registers its
+      tables under `DefaultDBOid` via `catalog.NamespaceDBOid` aliasing — the
+      resolver now normalizes through `NamespaceDBOid` like every DDL path.
+      `btIndexResolve` (never scoped) gained the same normalization, fixing the
+      mirror-image gap for non-default databases.
+    - `bt_index_check`/`bt_index_parent_check`/`checkunique` flagged every
+      multi-page healthy index: the S11.4 B2-c flip (`fea5e8dd4`) made `it.key`
+      the whole `IndexTupleData`, but the three amcheck tiers' nil-`KeyComparator`
+      default was still bytewise `nbtree.CompareKeys` — ordering by the tuple
+      header/heap-TID before key bytes. Nil defaults now resolve the index's own
+      comparator: `VerifyBtreeItemOrderCmp`/`VerifyBtreeParentDownlinks` → new
+      exported `IndexFormat.Compare`; `VerifyBtreeUnique` → `CompareKeyAttrs`
+      (bytewise equality over whole tuples could never fire — checkunique was
+      silently disabled). Two tests that pinned the broken default were updated
+      to exercise it via an explicit `nbtree.CompareKeys` argument instead.
+    - Result: all 9 ported pg_amcheck tests PASS (003×4, 004, 005, all-tables,
+      btree) incl. the corruption-injection arms; live repro verified on both
+      `postgres` and a `CREATE DATABASE`d database. Design:
+      `docs/design/0100-0149/0119-0006-amcheck-postgres-db-scope-and-tuple-cmp.md`.
 > This task list is **seeded, not exhaustive.** M0119-0001 triage plus every future
 > deferral-ledger entry (any new `status = -` row) feed additional M0119 tasks over
 > time; the milestone's living nature means it need not be complete at filing.

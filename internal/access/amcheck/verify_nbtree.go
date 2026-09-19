@@ -248,7 +248,13 @@ type KeyComparator func(a, b []byte) int
 // every key comparison amcheck performs on the index.
 func VerifyBtreeItemOrderCmp(p storage.Page, blkno storage.BlockNumber, indexName string, keyFmt nbtree.IndexFormat, cmpKeys KeyComparator) []BtreeReport {
 	if cmpKeys == nil {
-		cmpKeys = nbtree.CompareKeys
+		// The index's own ordering, not a bytewise one: under the tuple key
+		// format it.key is the whole IndexTupleData, so nbtree.CompareKeys
+		// would order by the header's heap TID before any key byte and flag
+		// every healthy multi-page index. keyFmt.Compare is CompareKeys under
+		// the blob format (unchanged) and ComparePGIndexTuples — the
+		// _bt_compare analog — under the tuple format. M0119-0006bq.
+		cmpKeys = keyFmt.Compare
 	}
 	// The metapage has no data items; deleted pages hold none either (their
 	// level field is type-punned and the page carries no live tuples).
@@ -474,7 +480,11 @@ func VerifyBtreeLevelSiblingLinks(src PageSource, leftmost storage.BlockNumber, 
 // structure and key order are run separately and composed by the SQL surface.
 func VerifyBtreeParentDownlinks(src PageSource, parentBlk storage.BlockNumber, indexName string, keyFmt nbtree.IndexFormat, cmpKeys KeyComparator) []BtreeReport {
 	if cmpKeys == nil {
-		cmpKeys = nbtree.CompareKeys
+		// Same default as VerifyBtreeItemOrderCmp: the format's own ordering
+		// comparator, so a tuple-format separator (a possibly-truncated pivot
+		// tuple, not bare key bytes) is compared by its key attributes rather
+		// than by its IndexTupleData header. M0119-0006bq.
+		cmpKeys = keyFmt.Compare
 	}
 	if parentBlk == nbtree.MetaBlock {
 		return nil

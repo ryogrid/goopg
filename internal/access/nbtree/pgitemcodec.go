@@ -126,6 +126,17 @@ func (fm IndexFormat) KeyDesc() *PGIndexKeyDesc { return fm.f.desc }
 // M0130-S11.4 slice 3b-2c-ii-B2-c.
 func (fm IndexFormat) CompareKeyAttrs(a, b []byte) int { return fm.f.compareKeyAttrs(a, b) }
 
+// Compare is the out-of-package spelling of `indexFormat.compare`: the index's
+// full ordering comparator — key attributes plus the heap-TID tiebreak under
+// the tuple format, plain `CompareKeys` under the blob format. It is the
+// `_bt_compare` analog: upstream amcheck routes EVERY key comparison through
+// the index's support function 1, so a structural checker that byte-compared
+// whole tuples would order by the IndexTupleData header (heap TID first)
+// before ever reaching a key byte — which is exactly the false-positive
+// `high key invariant violated` class this accessor exists to prevent.
+// M0119-0006bq.
+func (fm IndexFormat) Compare(a, b []byte) int { return fm.f.compare(a, b) }
+
 // PGBTPostingRaw is the exported face of `marshalPosting`: the ONE encoder for a
 // deduplicated (posting-list) leaf item in this format, the sibling of
 // PGBTItemRaw for plain items. `tids` must hold at least two entries and be
