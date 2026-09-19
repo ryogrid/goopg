@@ -5,12 +5,9 @@ Task: `.ralph/fix_plan.md` **M0140-0006c-3**. Parent chain: M0140-0006 →
 doc)**. Sibling doc: `m0140-0006c-2-join-branch-partial-setop-admission.md`
 (§"Remaining-branch scoping" covers the partial-branch kinds).
 
-Status: **scoping recon committed; implementation HOLD-blocked**
-(`bench/tpch/runtime_goopg/data.HOLD` re-imposed 2026-09-18T22:52 —
-unclean `:65433` shutdown, owner inspect). This doc is the "its own scoping
-pass first" the task filing called for: it pins the PG oracle semantics, the
-corpus witness, and the per-file goopg gap list so the implementation slice
-can be done mechanically once gates unblock.
+Status: **implemented** — see §"Implementation record" at the bottom for
+what landed, including two places the implementation deliberately diverged
+from this scoping plan (`nppath` source; boundary-wrapper handling).
 
 ## PG oracle mechanics
 
@@ -225,3 +222,167 @@ This doc discharges the recon resume point recorded in
 all simply gets no partial SetOp path — a resume point") and the
 corresponding deferral-ledger row. The implementation commit itself is
 separate and still requires the TPC-H gates (HOLD-blocked at write time).
+
+## Implementation record (2026-09-19)
+
+The arm landed per this map, with two deliberate divergences discovered
+during implementation.
+
+### What landed
+
+- `addPartialSetOpPath` (`internal/optimizer/windowsetoppaths.go`) now
+  files BOTH arms: the pure arm first (remembering its `Rows` for the
+  `partial_rows` override, `pathnode.c:1417-1419`), then the mixed arm —
+  per branch `setOpBranchPick` compares `branch.PartialPathlist[0]`
+  against the non-partial candidate with PG's strict `<` (ties land the
+  branch claimed-whole), refuses the arm when a branch offers neither
+  (`pa_subpaths_valid = false`), and requires ≥1 claimed-whole pick
+  (`pa_nonpartial_subpaths != NIL`). `parallel_workers` = max over the
+  chosen PARTIAL subpaths floored at `log2(2)+1 = 2` (the all-claimed
+  corner gets exactly 2); total cost = Σ partial totals +
+  `appendNonPartialCost` (LPT makespan over min(workers,n) buckets —
+  `costsize.c:2168-2243`) + append CPU overhead. Markers:
+  `Path.SetOpLeftNonPartial`/`SetOpRightNonPartial`, copied by
+  `createSetOpPlan` onto the emitted `*SetOp` node as
+  `LeftNonPartial`/`RightNonPartial`.
+- Plan-tree walks (`internal/optimizer/parallel.go`): `stampParallelScan`
+  skips a marked branch (its scan stays `.Parallel = false` — PG shows
+  the non-partial child as an ordinary serial subtree); `drivingScan`'s
+  `*SetOp` arm treats the marker itself as satisfying that side (the
+  `gatherChildPlan` panic guard is answered by the claim flag, not by a
+  stamped scan). `partialPathDrivingKind` (`gatherpaths.go`) admits a
+  claimed-whole child on `ParallelSafe` alone — no driving-kind check,
+  matching PG putting `nppath` in regardless of shape.
+- Executor: `parallelClaimSet` gained `claimedWhole atomic.Bool` on the
+  per-branch leaf sets (`parallel_scan.go`); `attachAll`'s `*setOp` arm
+  wires `so.claimLeft`/`so.claimRight` to the shared leaf flag for a
+  marked branch and attaches no scan state there; `nextStreaming`
+  (`operators_setop.go`) CAS-claims at first touch — the winner drains
+  its private copy serially, losers close theirs and mark the branch
+  done. Claim-on-first-touch matches nodeAppend's claim-on-select: a
+  participant still draining the other branch must not hold this one's
+  claim. `bitmapPrebuildTargets` skips marked branches (their leaf `pbm`
+  stays nil → the claiming worker builds a private serial bitmap, item
+  14's "exclude" decision). Shared-hash prebuild unchanged per item 13
+  (leader builds once, the sole claimer probes — correct and beneficial).
+
+### Divergence 1 — `nppath` is the branch's own serial plan, not a
+`branch.Pathlist` member
+
+The scoping plan proposed `bnp = cheapest ParallelSafe member of
+branch.Pathlist`. Implementation found that wrong on two axes:
+
+- **Schema/rows**: a rel pathlist member emits the rel's INTERNAL schema
+  (the searched subtree — e.g. `Join(cols=2)`), not the branch's
+  boundary-projected output (`Project(cols=1)` over it). PG's
+  `get_cheapest_parallel_safe_total_inner` returns a path of the child
+  the Append will actually run — the whole child plan. goopg's exact
+  analog is a fresh `PathPrebuilt` seed over the branch's finished node
+  (`seedPathForNode`), row- and wrapper-exact by construction, priced
+  with the wrappers' cost like PG's `nppath->total_cost`, and built back
+  to that node pointer-identically by `createPlanNode` (no splice).
+- **Gather tops**: a branch whose serial winner carried a `*Gather` must
+  still offer a claimed-whole plan — PG stamps `parallel_safe = false`
+  on gather paths (`create_gather_path`), so its scan of the pathlist
+  lands on the child's non-gather serial alternative. goopg's analog is
+  `StripGather(branchNode)` before seeding; `statementIsParallelSafe`
+  on the stripped node is PG's `parallel_safe` on the child plan.
+
+### Divergence 2 — boundary wrappers gate the PARTIAL pick too
+(pre-existing hazard, fixed here)
+
+Substituting a searched-rel path for a branch node must preserve the
+wrapper chain between the branch root and the searched emission —
+dropping it emits wrong arity/rows. Two mechanisms:
+
+- `setOpBranchPartialChainOK`: a branch offers its searched rel's
+  partial path only when every wrapper on the chain is either
+  per-worker-safe and stamp-descendable (`*Project`, `*Filter`, `*Sort`)
+  or a drop-with-no-row-effect (`*Gather`/`*GatherMerge`). Anything else
+  (`*Limit`, `*Distinct`, `*Aggregate`, `*WindowAgg`, `*LockRows`,
+  `*Memoize`, a nested `*SetOp`, an unsearched branch) yields no partial
+  pick — PG's `partial_pathlist` never carries such paths either, so the
+  verdict matches. The branch can still be claimed whole.
+- `spliceBranchEmission` (`createplansimple.go`): when a searched
+  emission IS substituted (either arm's partial pick), the wrapper chain
+  is rebuilt over it — the first non-wrapper node is the emission point
+  and is replaced; `*Gather`/`*GatherMerge` are descended and dropped
+  (a partial subtree cannot carry the serial winner's gather — nested
+  parallelism); `*Memoize` cannot be descended (typed `*IndexScan`
+  child) so it is itself the emission point. `PathPrebuilt` children
+  skip the splice entirely. This fixes a latent wrong-arity/wrong-rows
+  defect in the pure arm too — the end-to-end witness is the permanent
+  `TestGatherOverSetOpPlannerWinnerIdentity`.
+
+### Adjacent fix — `createSetOpPaths` accepts Gather winners
+
+Once a partial SetOp can actually win, the upper-rel `PathGather` filed
+over it (`generateUpperRelGatherPaths`) is the winning path — its
+`createPlanNode` returns `*Gather`/`*GatherMerge`, not `*SetOp`. The
+tail check was widened to return `Node` and accept all three; first
+reached by this arm's corpus probe (a comma-join `UNION ALL` producing
+`Gather > SetOp` with spliced `Project > Join` children).
+
+### Placement correction — the mixed arm is nested-scope only
+(late parity fix, caught by the TPC-DS sweep's plan-diff channel)
+
+The first cut filed the mixed arm wherever `addPartialSetOpPath` ran —
+and TPC-DS Q66 immediately regressed: its top-level `UNION ALL` picked
+up an all-claimed `Gather > Append` shape that PG's own Q66 plan does
+not contain (serial `Append`, each branch carrying its own
+`Finalize GroupAggregate > Gather Merge`). The oracle resolves why:
+
+- `generate_union_paths` (prepunion.c — the path builder for a
+  statement-level set operation) files **only the pure arm**: its
+  `partial_paths_valid` is "every child has a partial path", and a
+  `Gather` over the `Append` is added iff that holds. There is no
+  `pa_subpaths` arm in prepunion.c.
+- The mixed arm lives solely in `add_paths_to_append_rel`
+  (allpaths.c:1321) — reached for **appendrels**: UNION ALLs flattened
+  out of FROM-clause/CTE subqueries by `prepjointree`, and
+  inheritance/partition fan-outs. Never for a top-level
+  `a UNION ALL b`. TPC-DS Q5's three `Parallel Append` witnesses are
+  all inside CTEs/subqueries — consistent.
+
+goopg does not flatten union-all subqueries (no `pull_up_union_all`
+analog), so `addPartialSetOpPath` serves both structures. The available
+top-level-vs-nested marker is `ps.ParallelStatementOK`: set only for
+the statement's top-level plain SELECT, cleared for every nested scope
+(`planSelectWithParent`). It is now passed in as `topLevel`, and the
+mixed arm files only when `!topLevel` — the SetOp then stands where PG
+would have built an appendrel. The pure arm still files at both levels
+(`generate_union_paths` does so upstream).
+
+Measured: with the gate, the SF0.25 sweep's plan-diff channel went from
+"Q66 changed" back to `same=99 changed=0` — the all-claimed
+`Gather > Append` disappeared from the top-level setop exactly as PG's
+pipeline dictates.
+
+Residual divergence (documented, not fixed): a union-all inside a FROM
+subquery PG would NOT flatten (e.g. `LIMIT` in the subquery) still gets
+the arm here — the marker sees nesting, not flattenability. Fixing that
+needs a real flattenability check; none of the corpus queries hit it.
+
+New tests:
+`TestAddPartialSetOpPathMixedArmSuppressedAtTopLevel` (same shape that
+files mixed nested files nothing at top level) and
+`TestAddPartialSetOpPathPureArmStillFilesAtTopLevel` (the pure arm is
+not collateral).
+
+### Test evidence
+
+- Optimizer (`windowsetoppaths_test.go`): pure-arm cost/worker floor
+  pinned with searched-marked fixtures; mixed-arm pricing; strict
+  tie-to-nonpartial; all-claimed worker floor = 2; branch-with-neither
+  rejection; boundary-chain admissibility (safe set admits, Limit/Agg/
+  Memoize refuse); mixed `Rows` inheriting the pure arm's estimate;
+  `RefusesWhenABranchHasNoPartialPath` updated — that shape is now the
+  mixed arm's canonical input.
+- Executor (`parallel_setop_claimset_test.go`): claimed-whole and
+  all-claimed identity at workers 1/2/4 — exact multiset, no replay, no
+  drop. Anti-drift `claimedWhole` case in
+  `parallel_gather_merge_claimset_test.go`.
+- End-to-end (`parallel_setop_gather_test.go`):
+  `TestGatherOverSetOpPlannerWinnerIdentity` — a real planner-produced
+  `Gather > SetOp` over comma-join branches, serial-vs-parallel row
+  identity, one-column output intact (the splice witness).

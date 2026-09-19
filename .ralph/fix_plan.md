@@ -3101,8 +3101,9 @@ setting that yields a serial plan.
     M0142-0005a, Q5 needs 0006c-3; planner-side partial-bitmap
     producer is a separate gap (ledger
     `e10-gathermerge-bitmap-untested-e2e`).
-- [ ] **M0140-0006c-3 — mixed partial/non-partial SetOp append (Q5).**
-  Kind: impl.
+- [x] **M0140-0006c-3 — mixed partial/non-partial SetOp append (Q5).** — DONE
+  2026-09-19 (impl + docs + late placement correction in one commit; gates
+  below). Kind: impl.
   Parent: M0140-0006c. Filed 2026-09-19 by 0006c-2's recon.
   `addPartialSetOpPath` (`windowsetoppaths.go:525`) files only the
   pure-partial arm — it returns when either branch's `PartialPathlist`
@@ -3139,6 +3140,37 @@ setting that yields a serial plan.
     2026-09-18T22:52 (unclean `:65433` shutdown) until the owner
     recovery released it on 2026-09-19 (see M0141-S2b-15's UNBLOCKED
     note) — TPC-H gates run normally again.
+  - 2026-09-19 — impl landed. Mixed arm per the scoping map plus three
+    findings the recon didn't size: (1) `createSetOpPaths` had to accept
+    `*Gather`/`*GatherMerge` winners (a partial SetOp's winning path is
+    the upper-rel `PathGather`, first reachable once the arm files);
+    (2) searched-rel path substitution drops boundary wrappers → wrong
+    arity/rows — `spliceBranchEmission` rebuilds the wrapper chain over
+    the emission (fixes a latent pure-arm defect too), and the
+    non-partial pick is the branch's own serial plan as a `PathPrebuilt`
+    seed over `StripGather(branchNode)` (PG's `parallel_safe=false` on
+    gather paths), so claimed-whole children are row-exact and need no
+    splice; (3) PLACEMENT: PG's mixed arm lives only in
+    `add_paths_to_append_rel` (appendrels), never in
+    `generate_union_paths` — the first cut filing it unconditionally
+    regressed TPC-DS Q66's top-level UNION ALL into an all-claimed
+    `Gather > Append` PG cannot produce. Gate: `ps.ParallelStatementOK`
+    (top-level marker) passed in as `topLevel`; mixed arm files only in
+    nested scopes. Executor: `claimedWhole atomic.Bool` per branch leaf
+    claim set, `attachAll` wires the shared flag, `nextStreaming`
+    CAS-claims before draining (winner drains serially, losers close and
+    skip); claimed-whole branches skipped from scan stamping, driving-
+    scan requirement, and bitmap prebuild publication. Gates: units ok;
+    optimizer+executor pkg tests ok; `go test -race` on executor
+    SetOp/Gather ok; tpch-spotcheck PASS (Q12=2/Q13=34); SF0.25 sweep
+    PASS=96 MISMATCH=0 PLAN-SHAPE 99/99 identical (Q66 reverted);
+    acceptance-arm VERDICT PASS 24/24 MATCH; plan-gate 14/22 diverged =
+    baseline drift (zero SetOp/UNION/Append lines in diff; baseline
+    m0137-0005-rebaseline-20260915 predates ~100 internal commits).
+    Residual documented in the design doc: nested union-alls PG would
+    not flatten (LIMIT in subquery) still get the arm — marker sees
+    nesting, not flattenability. Design doc:
+    `docs/design/0100-0149/m0140-0006c-3-mixed-partial-setop-append.md`.
 
 ## M0141 — Upper-planner ordering contest (filed 2026-09-14)
 
