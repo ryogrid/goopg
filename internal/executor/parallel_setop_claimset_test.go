@@ -22,6 +22,7 @@ import (
 	"sort"
 	"testing"
 
+	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/optimizer"
 	"github.com/goopg/goopg/internal/parser"
 )
@@ -452,8 +453,9 @@ func TestCollectShareableJoinsDescendsSetOp(t *testing.T) {
 }
 
 // TestCollectBitmapScansDescendsSetOp is the bitmap twin: the collection and
-// the plan-side gate (HasBitmapScan) must agree on what sits under a SetOp,
-// even though a bitmap-DRIVEN branch is still refused at admission.
+// the plan-side gate (HasBitmapScan) must agree on what sits under a SetOp.
+// Slice C admits bitmap-DRIVEN branches, and bitmapPrebuildTargets uses
+// this same walk per branch to attribute each bitmap to its leaf claim set.
 func TestCollectBitmapScansDescendsSetOp(t *testing.T) {
 	so := &setOp{left: &seqScanOp{}, right: &bitmapHeapScanOp{}}
 	var out []*bitmapHeapScanOp
@@ -539,6 +541,316 @@ func TestGatherOverSetOpMergeJoinBranchIdentity(t *testing.T) {
 			sort.Strings(got)
 			if len(got) != len(want) {
 				t.Fatalf("got %d rows, want %d — more means a worker replayed a whole branch instead of its partition (the N-copies defect)",
+					len(got), len(want))
+			}
+			for i := range want {
+				if got[i] != want[i] {
+					t.Fatalf("row %d differs: got %q want %q — a worker dropped or duplicated a branch row", i, got[i], want[i])
+				}
+			}
+		})
+	}
+}
+
+// planTreeHasBitmapUnderGather is the Bitmap Heap Scan twin of
+// planTreeHasHashJoinUnderGather (M0140-0006c-2 slice C): the identity
+// comparison is only meaningful if a Bitmap Heap Scan actually sits inside
+// the Gather subtree — through the SetOp if needed.
+func planTreeHasBitmapUnderGather(n optimizer.Node) bool {
+	found := false
+	var walk func(optimizer.Node, bool)
+	walk = func(cur optimizer.Node, underGather bool) {
+		if cur == nil || found {
+			return
+		}
+		switch cur.(type) {
+		case *optimizer.Gather, *optimizer.GatherMerge:
+			underGather = true
+		}
+		if _, ok := cur.(*optimizer.BitmapHeapScan); ok && underGather {
+			found = true
+			return
+		}
+		for _, c := range optimizer.ParallelChildrenForTest(cur) {
+			walk(c, underGather)
+		}
+	}
+	walk(n, false)
+	return found
+}
+
+// planTreeHasBitmapHeapScan is the flat twin used by planBitmapForced: a
+// Bitmap Heap Scan anywhere in the tree.
+func planTreeHasBitmapHeapScan(n optimizer.Node) bool {
+	found := false
+	var walk func(optimizer.Node)
+	walk = func(cur optimizer.Node) {
+		if cur == nil || found {
+			return
+		}
+		if _, ok := cur.(*optimizer.BitmapHeapScan); ok {
+			found = true
+			return
+		}
+		for _, c := range optimizer.ParallelChildrenForTest(cur) {
+			walk(c)
+		}
+	}
+	walk(n)
+	return found
+}
+
+// planBitmapForced plans sql through the join search with seq scans, plain
+// index scans, hash joins and merge joins all disabled: the only remaining
+// scan that can satisfy a selective equality predicate on an indexed column
+// is a Bitmap Heap Scan, and the only remaining join is an ordinary nested
+// loop — so the bitmap lands as the NL's driving outer, the shape
+// M0140-0006c-2 slice C's admission arm covers. The comma/WHERE form is
+// required (same constraint planMergeForced documents): the non-search fast
+// path ignores the enable_* flips entirely, and the bitmap path producer
+// (addBaseRelBitmapPaths, pathbitmap.go) only runs inside the search.
+func planBitmapForced(t *testing.T, ctx *Context, sql string) optimizer.Node {
+	t.Helper()
+	advanceStmtCounter(ctx)
+	stmts, err := parser.Parse(sql)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	ps := optimizer.DefaultPlannerSettings()
+	ps.EnableSeqScan = false
+	ps.EnableIndexScan = false
+	ps.EnableHashJoin = false
+	ps.EnableMergeJoin = false
+	node, err := optimizer.PlanWithSettings(stmts[0], ctx.Catalog, ps)
+	if err != nil {
+		t.Fatalf("plan: %v", err)
+	}
+	if !planTreeHasBitmapHeapScan(node) {
+		t.Fatalf("forced plan for %q contains no Bitmap Heap Scan; the identity comparison would not exercise the bitmap arm", sql)
+	}
+	return node
+}
+
+// TestBitmapPrebuildTargetsPerBranch is the unit half of M0140-0006c-2
+// slice C's executor machinery: bitmapPrebuildTargets must attribute each
+// SetOp branch's bitmap to that branch's OWN leaf claim set — never the
+// top-level pbm, which attachAll's *setOp dispatch never consults. A
+// wrong attribution is the load-bearing failure (attachAll's return is
+// ignored, so an unattached bitmap scans whole per worker — the N-copies
+// defect), and it must fail closed when plan and tree disagree.
+func TestBitmapPrebuildTargetsPerBranch(t *testing.T) {
+	bmPlan := func() *optimizer.BitmapHeapScan { return &optimizer.BitmapHeapScan{} }
+	seqPlan := func() *optimizer.SeqScan { return &optimizer.SeqScan{} }
+	setOpPlan := func(l, r optimizer.Node) *optimizer.SetOp {
+		return &optimizer.SetOp{Left: l, Right: r, Op: parser.SetOpUnion, All: true}
+	}
+	bmOp := func() *bitmapHeapScanOp { return &bitmapHeapScanOp{} }
+
+	type wantTarget struct {
+		leaf bool // true → a leaf claim set, false → the top-level cs
+	}
+	cases := []struct {
+		name string
+		tree Operator
+		want []wantTarget
+	}{
+		{
+			name: "bitmap-right",
+			tree: &setOp{plan: setOpPlan(seqPlan(), bmPlan()), left: &seqScanOp{}, right: bmOp()},
+			want: []wantTarget{{leaf: true}},
+		},
+		{
+			name: "bitmap-left",
+			tree: &setOp{plan: setOpPlan(bmPlan(), seqPlan()), left: bmOp(), right: &seqScanOp{}},
+			want: []wantTarget{{leaf: true}},
+		},
+		{
+			name: "bitmap-both",
+			tree: &setOp{plan: setOpPlan(bmPlan(), bmPlan()), left: bmOp(), right: bmOp()},
+			want: []wantTarget{{leaf: true}, {leaf: true}},
+		},
+		{
+			name: "scans-only",
+			tree: &setOp{plan: setOpPlan(seqPlan(), seqPlan()), left: &seqScanOp{}, right: &seqScanOp{}},
+			want: nil,
+		},
+		{
+			// Plan says seq, tree carries a bitmap: the plan/tree
+			// disagreement must fail closed — publish nothing rather than
+			// attribute a scan the plan does not know about.
+			name: "plan-tree-mismatch",
+			tree: &setOp{plan: setOpPlan(seqPlan(), seqPlan()), left: &seqScanOp{}, right: bmOp()},
+			want: nil,
+		},
+		{
+			// A planless *setOp (synthetic only — the builder always sets
+			// plan) publishes nothing rather than guessing.
+			name: "nil-plan-setop",
+			tree: &setOp{left: bmOp(), right: bmOp()},
+			want: nil,
+		},
+		{
+			name: "flat-single",
+			tree: bmOp(),
+			want: []wantTarget{{leaf: false}},
+		},
+		{
+			// Two bitmap scans under one branch (via a join probe spine)
+			// is the same ambiguity the flat path refuses.
+			name: "two-in-one-branch",
+			tree: &setOp{
+				plan:  setOpPlan(&optimizer.Join{Algo: optimizer.JoinAlgoHash}, seqPlan()),
+				left:  &joinOp{plan: &optimizer.Join{Algo: optimizer.JoinAlgoHash}, left: bmOp(), right: bmOp()},
+				right: &seqScanOp{},
+			},
+			want: nil,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cs := newParallelClaimSet()
+			targets := cs.bitmapPrebuildTargets(tc.tree)
+			if len(targets) != len(tc.want) {
+				t.Fatalf("got %d targets, want %d", len(targets), len(tc.want))
+			}
+			for i, tgt := range targets {
+				if tc.want[i].leaf {
+					if tgt.cs != cs.setOpLeft && tgt.cs != cs.setOpRight {
+						t.Errorf("target %d: published to the top-level claim set; a SetOp branch bitmap must publish to its leaf", i)
+					}
+				} else if tgt.cs != cs {
+					t.Errorf("target %d: published to a leaf claim set; a non-SetOp child must publish to the top-level cs", i)
+				}
+			}
+			// Branch attribution: bitmap-right must hit setOpRight, and a
+			// both-bitmap SetOp must cover both leaves in left-then-right
+			// order.
+			switch tc.name {
+			case "bitmap-right":
+				if targets[0].cs != cs.setOpRight || targets[0].bm != tc.tree.(*setOp).right {
+					t.Errorf("bitmap-right attributed to the wrong leaf/scan")
+				}
+			case "bitmap-left":
+				if targets[0].cs != cs.setOpLeft || targets[0].bm != tc.tree.(*setOp).left {
+					t.Errorf("bitmap-left attributed to the wrong leaf/scan")
+				}
+			case "bitmap-both":
+				if targets[0].cs != cs.setOpLeft || targets[1].cs != cs.setOpRight {
+					t.Errorf("bitmap-both did not cover both leaves in order")
+				}
+			}
+		})
+	}
+}
+
+// TestGatherOverSetOpBitmapBranchIdentity is M0140-0006c-2 slice C's gate:
+// the left UNION ALL branch is an ordinary nested loop whose OUTER is a
+// Bitmap Heap Scan over pq_setop_d (grp = 3, forced by the search with
+// seq/index scans and hash/merge joins disabled), the right a bare scan
+// over pq_setop_b. This is the ONLY slice whose leader prebuild publishes
+// state into the branch leaf claim sets (cs.setOpLeft.pbm) — a hash
+// branch shares a leader-built table, but a bitmap branch shares the
+// leader-built TIDBitmap itself.
+//
+// Serial-vs-parallel identity at 1/2/4 workers is the witness: without
+// per-branch publication the branch's bitmap op attaches nothing
+// (attachAll's return is ignored), so every participant builds and scans
+// its own whole bitmap — the branch's rows come back N times (the
+// N-copies defect), exactly what this comparison catches.
+//
+// Fixture constraints (probe-verified 2026-09-19): the bitmap path
+// producer lives in the join search (comma/WHERE form required — the
+// fast path ignores enable_* flips and never emits BitmapHeapScan);
+// matchBitmapIndexQuals only descends EQUALITY conjuncts into the index
+// (pathbitmap.go), so the predicate is grp = 3 on a 10-ndistinct column,
+// not a range; and the producer needs TableStats for selectivity.
+func TestGatherOverSetOpBitmapBranchIdentity(t *testing.T) {
+	ctx, cleanup := parallelSetOpFixture(t)
+	defer cleanup()
+
+	// d: 1500 rows, grp = id % 10 — an equality on grp hits 150 rows
+	// (10% selectivity, the bitmap sweet spot). e: 40 probe keys that all
+	// land inside grp = 3's id set, so the join yields a deterministic
+	// 40 rows.
+	if err := runDDL(t, ctx, "CREATE TABLE pq_setop_d (id int, grp int)"); err != nil {
+		t.Fatalf("create d: %v", err)
+	}
+	if err := runDDL(t, ctx, "CREATE INDEX pq_setop_d_grp ON pq_setop_d (grp)"); err != nil {
+		t.Fatalf("index d: %v", err)
+	}
+	for i := 0; i < 1500; i++ {
+		if err := runDDL(t, ctx, fmt.Sprintf("INSERT INTO pq_setop_d VALUES (%d, %d)", 200000+i, i%10)); err != nil {
+			t.Fatalf("insert d %d: %v", i, err)
+		}
+	}
+	if err := runDDL(t, ctx, "CREATE TABLE pq_setop_e (e_key int)"); err != nil {
+		t.Fatalf("create e: %v", err)
+	}
+	for i := 0; i < 40; i++ {
+		if err := runDDL(t, ctx, fmt.Sprintf("INSERT INTO pq_setop_e VALUES (%d)", 200003+i*10)); err != nil {
+			t.Fatalf("insert e %d: %v", i, err)
+		}
+	}
+	if tbl, ok := ctx.Catalog.LookupTable(parser.ObjectName{Name: "pq_setop_d"}); ok {
+		tbl.Stats = &catalog.TableStats{RowCount: 1500, Columns: []catalog.ColumnStats{
+			{NDistinct: 1500}, {NDistinct: 10},
+		}}
+	}
+	if tbl, ok := ctx.Catalog.LookupTable(parser.ObjectName{Name: "pq_setop_e"}); ok {
+		tbl.Stats = &catalog.TableStats{RowCount: 40, Columns: []catalog.ColumnStats{
+			{NDistinct: 40},
+		}}
+	}
+
+	ctx.MaxParallelWorkers = 8
+	ctx.ParallelLeaderParticipation = true
+
+	for _, workers := range []int{1, 2, 4} {
+		t.Run(fmt.Sprintf("workers=%d", workers), func(t *testing.T) {
+			bitmapBranch := planBitmapForced(t, ctx, "SELECT d.id FROM pq_setop_d d, pq_setop_e e WHERE e.e_key = d.id AND d.grp = 3")
+			advanceStmtCounter(ctx)
+			right := planForTest(t, ctx, "SELECT id FROM pq_setop_b")
+			so := &optimizer.SetOp{Left: bitmapBranch, Right: right, Op: parser.SetOpUnion, All: true}
+
+			advanceStmtCounter(ctx)
+			want := drainPlan(t, ctx, so)
+			if len(want) != 40+90 {
+				t.Fatalf("serial baseline = %d rows, want 130 (40 join + 90 scan); the fixture planner shape moved", len(want))
+			}
+
+			gathered := optimizer.NewGather(0, so, workers)
+			if !planTreeHasBitmapUnderGather(gathered) {
+				t.Fatal("no Bitmap Heap Scan under the Gather; the identity comparison would not exercise the bitmap branch")
+			}
+			advanceStmtCounter(ctx)
+			op, err := Build(gathered)
+			if err != nil {
+				t.Fatalf("build: %v", err)
+			}
+			if err := op.Open(ctx); err != nil {
+				t.Fatalf("open: %v", err)
+			}
+			var got []string
+			for {
+				slot, err := op.Next()
+				if err == EOF {
+					break
+				}
+				if err != nil {
+					op.Close()
+					t.Fatalf("next: %v", err)
+				}
+				got = append(got, renderRows([]Row{slot.Row()})...)
+			}
+			if err := op.Close(); err != nil {
+				t.Fatalf("close: %v", err)
+			}
+
+			sort.Strings(want)
+			sort.Strings(got)
+			if len(got) != len(want) {
+				t.Fatalf("got %d rows, want %d — more means a worker replayed a whole branch instead of its partition (the N-copies defect: an unattached bitmap scans its own whole bitmap per worker)",
 					len(got), len(want))
 			}
 			for i := range want {

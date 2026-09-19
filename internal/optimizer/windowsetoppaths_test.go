@@ -590,7 +590,6 @@ func TestCreateSetOpPathsLeavesBranchRelsNilForNonSearchedBranches(t *testing.T)
 	}
 }
 
-
 // TestAddPartialSetOpPathPricesLikeCostAppendParallelArm is M0140-0006b's
 // cost pin: cost_append's parallel-aware arm (costsize.c:2330-2394),
 // specialised to goopg's fixed two-child SetOp shape. Both branches offer a
@@ -870,17 +869,61 @@ func TestPartialPathDrivingKindAcceptsSetOpWithTwoScanBranches(t *testing.T) {
 	}
 }
 
-// TestPartialPathDrivingKindRefusesSetOpWithBitmapBranch pins the narrowed
-// scope's bitmap refusal: prebuildBitmap publishes only to the top-level
-// claim set, not to a SetOp branch's own leaf claim set (whose pbm is nil
-// by construction), so a bitmap-driven branch must never reach the executor
-// with no claim state to attach.
-func TestPartialPathDrivingKindRefusesSetOpWithBitmapBranch(t *testing.T) {
+// TestPartialPathDrivingKindAcceptsSetOpWithBitmapBranch is M0140-0006c-2
+// slice C's base case: a bitmap-driven branch is admitted, mirroring the
+// top-level arm's unconditional admit — the branch's bitmap op attaches
+// through its own leaf claim set, which prebuildBitmap now publishes per
+// branch (cs.setOpLeft/setOpRight.pbm). Dormant until a producer files a
+// partial bitmap path — none does today, same as the top-level arm.
+func TestPartialPathDrivingKindAcceptsSetOpWithBitmapBranch(t *testing.T) {
 	left := &Path{Kind: PathSeqScan, ParallelSafe: true, ParallelWorkers: 2}
 	right := &Path{Kind: PathBitmapHeapScan, ParallelSafe: true, ParallelWorkers: 2}
 	setOp := &Path{Kind: PathSetOp, Children: []*Path{left, right}}
-	if got := partialPathDrivingKind(setOp); got != PathPrebuilt {
-		t.Fatalf("partialPathDrivingKind = %v, want PathPrebuilt (bitmap branch refused)", got)
+	if got := partialPathDrivingKind(setOp); got != PathSetOp {
+		t.Fatalf("partialPathDrivingKind = %v, want PathSetOp (bitmap branch admitted)", got)
+	}
+	if !partialPathShapeIsGatherable(setOp) {
+		t.Error("a bitmap-branch partial SetOp is not gatherable; makeGatherPath can never place a Gather over it")
+	}
+}
+
+// TestPartialPathDrivingKindAcceptsSetOpWithBitmapSpine covers the bitmap
+// cases the join arms' refusal maps carried before slice C: a bitmap
+// probe under a hash join, and a bitmap outer under a merge join and a
+// nested loop — each spine admits through whichever arm claims each link.
+func TestPartialPathDrivingKindAcceptsSetOpWithBitmapSpine(t *testing.T) {
+	scan := func() *Path { return &Path{Kind: PathSeqScan, ParallelSafe: true, ParallelWorkers: 2} }
+	bm := func() *Path { return &Path{Kind: PathBitmapHeapScan, ParallelSafe: true, ParallelWorkers: 2} }
+	branches := map[string]*Path{
+		"hash-probe": {
+			Kind: PathHashJoin, ParallelSafe: true, ParallelWorkers: 2,
+			Children: []*Path{bm(), scan()},
+		},
+		"merge-outer": {
+			Kind: PathMergeJoin, ParallelSafe: true, ParallelWorkers: 2,
+			Children: []*Path{bm(), scan()},
+		},
+		"nl-outer": {
+			Kind: PathNestLoop, Jointype: parser.JoinInner,
+			ParallelSafe: true, ParallelWorkers: 2,
+			Children: []*Path{bm(), {Kind: PathSeqScan}},
+		},
+		// The recursion propagates admission UP the spine: a merge whose
+		// outer is a merge whose own outer is a bitmap admits end to end.
+		"nested-merge-outer": {
+			Kind: PathMergeJoin, ParallelSafe: true, ParallelWorkers: 2,
+			Children: []*Path{
+				{Kind: PathMergeJoin, ParallelSafe: true, ParallelWorkers: 2,
+					Children: []*Path{bm(), scan()}},
+				scan(),
+			},
+		},
+	}
+	for name, branch := range branches {
+		setOp := &Path{Kind: PathSetOp, Children: []*Path{scan(), branch}}
+		if got := partialPathDrivingKind(setOp); got != PathSetOp {
+			t.Errorf("%s: partialPathDrivingKind = %v, want PathSetOp (bitmap spine admitted)", name, got)
+		}
 	}
 }
 
@@ -927,10 +970,10 @@ func TestPartialPathDrivingKindAcceptsSetOpWithNestedHashJoinBranch(t *testing.T
 
 // TestPartialPathDrivingKindRefusesSetOpWithBadHashJoinBranch pins the
 // fail-closed edges of the hash arm: a parameterised or malformed hash
-// join, and a hash whose probe is itself refused (bitmap). Join-driven
-// branches that ARE admitted (merge since slice B, nested loop since
-// slice A) live in their own acceptance/refusal pairs below — the only
-// join kind still refused here outright is one no arm claims.
+// join. Join-driven branches that ARE admitted (merge since slice B,
+// nested loop since slice A, bitmap-driven probes since slice C) live in
+// their own acceptance/refusal pairs — the only join kind still refused
+// here outright is one no arm claims.
 func TestPartialPathDrivingKindRefusesSetOpWithBadHashJoinBranch(t *testing.T) {
 	scan := func() *Path { return &Path{Kind: PathSeqScan, ParallelSafe: true, ParallelWorkers: 2} }
 	cases := map[string]*Path{
@@ -942,10 +985,8 @@ func TestPartialPathDrivingKindRefusesSetOpWithBadHashJoinBranch(t *testing.T) {
 			Kind: PathHashJoin, ParallelSafe: true, ParallelWorkers: 2,
 			Children: []*Path{scan()},
 		},
-		"bitmap-probe-hash": {
-			Kind: PathHashJoin, ParallelSafe: true, ParallelWorkers: 2,
-			Children: []*Path{{Kind: PathBitmapHeapScan}, scan()},
-		},
+		// No "bitmap-probe-hash" case: a bitmap-driven probe is ADMITTED by
+		// M0140-0006c-2 slice C — see the bitmap spine acceptance test.
 		// No plain "merge-branch" case: a merge over two bare scans is
 		// ADMITTED by M0140-0006c-2 slice B (Jointype's zero value is
 		// parser.JoinInner, a partial-capable merge jointype) — see the
@@ -1072,13 +1113,9 @@ func TestPartialPathDrivingKindRefusesSetOpWithBadNestLoopBranch(t *testing.T) {
 			&Path{Kind: PathSeqScan, RequiredOuter: 1}),
 		"clauseless-probe": nl(scan(),
 			&Path{Kind: PathIndexScan, RequiredOuter: 1}),
-		// The narrowed outer recursion: a bitmap-driven outer still
-		// refuses even when the NL's own guards all pass (a merge-driven
-		// outer ADMITS since slice B — the cross-arm spine case is in the
-		// merge acceptance test below).
-		"bitmap-outer": nl(
-			&Path{Kind: PathBitmapHeapScan, ParallelSafe: true, ParallelWorkers: 2},
-			&Path{Kind: PathSeqScan}),
+		// No "bitmap-outer" case: a bitmap-driven outer is ADMITTED by
+		// M0140-0006c-2 slice C — see the bitmap spine acceptance test.
+		// (Merge-driven outers likewise admit since slice B.)
 	}
 	for name, branch := range cases {
 		setOp := &Path{Kind: PathSetOp, Children: []*Path{scan(), branch}}
@@ -1161,8 +1198,10 @@ func TestPartialPathDrivingKindAcceptsSetOpWithNestedMergeJoinBranch(t *testing.
 
 // TestPartialPathDrivingKindRefusesSetOpWithBadMergeJoinBranch pins the
 // fail-closed edges of the merge arm: a parameterised or malformed merge
-// refuses outright, and the narrowed outer recursion still refuses a
-// bitmap-driven outer (leaf claim sets carry no pbm — slice C's scope).
+// refuses outright, and a nil outer propagates the refusal up the spine.
+// (A bitmap-driven outer is ADMITTED since slice C — leaf claim sets now
+// carry their own pbm via per-branch prebuildBitmap publication; the
+// spine cases live in the bitmap acceptance test.)
 func TestPartialPathDrivingKindRefusesSetOpWithBadMergeJoinBranch(t *testing.T) {
 	scan := func() *Path { return &Path{Kind: PathSeqScan, ParallelSafe: true, ParallelWorkers: 2} }
 	merge := func(children ...*Path) *Path {
@@ -1173,13 +1212,9 @@ func TestPartialPathDrivingKindRefusesSetOpWithBadMergeJoinBranch(t *testing.T) 
 			Kind: PathMergeJoin, ParallelSafe: true, ParallelWorkers: 2, RequiredOuter: 1,
 			Children: []*Path{scan(), scan()},
 		},
-		"one-child-merge":    merge(scan()),
-		"zero-child-merge":   merge(),
-		"bitmap-outer-merge": merge(&Path{Kind: PathBitmapHeapScan}, scan()),
-		// The recursion propagates a refusal UP the spine: a merge whose
-		// outer is a merge whose own outer is a bitmap still refuses.
-		"nested-bitmap-outer": merge(merge(&Path{Kind: PathBitmapHeapScan}, scan()), scan()),
-		"nil-outer":           merge(nil, scan()),
+		"one-child-merge":  merge(scan()),
+		"zero-child-merge": merge(),
+		"nil-outer":        merge(nil, scan()),
 	}
 	for name, branch := range cases {
 		setOp := &Path{Kind: PathSetOp, Children: []*Path{scan(), branch}}

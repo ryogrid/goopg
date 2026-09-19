@@ -560,12 +560,10 @@ func newParallelClaimSet() *parallelClaimSet {
 // and does NOT recognise createSetOpPaths's own output (a nested UNION ALL
 // chain's inner node) as one — so addPartialSetOpPath can never see a
 // partial path on a branch that is itself a SetOp, and these two never need
-// branches of their own. pbm is intentionally left nil forever: a
-// bitmap-driven SetOp branch is refused at the planner
-// (partialPathDrivingKind's PathSetOp arm, gatherpaths.go) because
-// prebuildBitmap publishes only to the top-level claim set, not to the
-// branch's own leaf — M0140-0006c-2's remaining scope (the collectors
-// themselves now descend).
+// branches of their own. pbm starts nil exactly like the top-level claim
+// set's: prebuildBitmap fills it when the branch's own plan carries a
+// bitmap scan (M0140-0006c-2 slice C's per-branch publication in
+// bitmapPrebuildTargets).
 func newLeafParallelClaimSet() *parallelClaimSet {
 	return &parallelClaimSet{
 		pscan: newParallelScanState(0),
@@ -646,33 +644,85 @@ func (cs *parallelClaimSet) prebuildBitmap(ctx *Context, planChild optimizer.Nod
 	if err != nil {
 		return err
 	}
+	for _, tgt := range cs.bitmapPrebuildTargets(tree) {
+		bm := tgt.bm
+		if err := bm.Open(ctx); err != nil {
+			return err
+		}
+		// Build the bitmap.
+		tbm, err := bm.outerBitmap.buildBitmap(ctx)
+		if err != nil {
+			bm.Close()
+			return err
+		}
+		bm.tbm = tbm
+		bm.iter = tbmBeginIterate(tbm)
+		bm.ownBitmap = true
+
+		// Publish the sorted block list for workers.
+		tgt.cs.pbm = newParallelBitmapState()
+		tgt.cs.pbm.init(tbm)
+	}
+	return nil
+}
+
+// bitmapPrebuildTarget pairs a claim set with the throwaway-tree bitmap
+// scan whose prebuilt bitmap it must publish (M0140-0006c-2 slice C).
+type bitmapPrebuildTarget struct {
+	cs *parallelClaimSet
+	bm *bitmapHeapScanOp
+}
+
+// bitmapPrebuildTargets decides which (claim set, bitmap scan) pairs the
+// prebuild must publish. A partial SetOp child streams TWO branches —
+// each branch's driving bitmap is claimed through its own leaf claim set
+// (cs.setOpLeft/setOpRight, the state attachAll's *setOp arm hands the
+// branch's attach walk), so the prebuilt bitmap must publish per branch.
+// Publishing only to the top-level cs.pbm would leave every worker's
+// branch bitmap unattached — and attachAll's return is ignored by design,
+// so a miss means each worker scans its own whole bitmap: the N-copies
+// defect the claim sets exist to prevent.
+func (cs *parallelClaimSet) bitmapPrebuildTargets(tree Operator) []bitmapPrebuildTarget {
+	if so, ok := unwrapToSetOp(tree); ok {
+		// The per-branch gate reads the op's own plan, not planChild —
+		// robust to a plan wrapper above the SetOp. A planless *setOp
+		// (synthetic trees only — the builder always sets plan) publishes
+		// nothing rather than guessing.
+		if so.plan == nil {
+			return nil
+		}
+		var out []bitmapPrebuildTarget
+		out = cs.setOpLeft.appendBitmapPrebuildTarget(out, so.plan.Left, so.left)
+		out = cs.setOpRight.appendBitmapPrebuildTarget(out, so.plan.Right, so.right)
+		return out
+	}
 	var bmOps []*bitmapHeapScanOp
 	collectBitmapScans(tree, &bmOps)
-	if len(bmOps) == 0 {
-		return nil
-	}
 	// A partial subtree should have exactly one driving scan. If multiple
-	// bitmap scans appear (unexpected), fall back rather than guessing which
-	// one to share.
-	if len(bmOps) > 1 {
+	// bitmap scans appear (unexpected), fall back rather than guessing
+	// which one to share.
+	if len(bmOps) != 1 {
 		return nil
 	}
-	bm := bmOps[0]
-	if err := bm.Open(ctx); err != nil {
-		return err
-	}
-	// Build the bitmap.
-	tbm, err := bm.outerBitmap.buildBitmap(ctx)
-	if err != nil {
-		bm.Close()
-		return err
-	}
-	bm.tbm = tbm
-	bm.iter = tbmBeginIterate(tbm)
-	bm.ownBitmap = true
+	return []bitmapPrebuildTarget{{cs: cs, bm: bmOps[0]}}
+}
 
-	// Publish the sorted block list for workers.
-	cs.pbm = newParallelBitmapState()
-	cs.pbm.init(tbm)
-	return nil
+// appendBitmapPrebuildTarget applies the flat rule to one SetOp branch:
+// decide from the branch's PLAN (the same agreement rule the caller's
+// HasBitmapScan gate applies at top level), then collect from the
+// branch's own subtree. Zero collected means the bitmap the plan reported
+// sits somewhere the collection walk does not reach (e.g. under a join
+// build side, where no claim is needed — it is read whole); more than one
+// is the same ambiguity the flat path refuses. Either way the branch
+// publishes nothing and its attach fails closed.
+func (cs *parallelClaimSet) appendBitmapPrebuildTarget(dst []bitmapPrebuildTarget, planBranch optimizer.Node, branch Operator) []bitmapPrebuildTarget {
+	if !optimizer.HasBitmapScan(planBranch) {
+		return dst
+	}
+	var bmOps []*bitmapHeapScanOp
+	collectBitmapScans(branch, &bmOps)
+	if len(bmOps) != 1 {
+		return dst
+	}
+	return append(dst, bitmapPrebuildTarget{cs: cs, bm: bmOps[0]})
 }
