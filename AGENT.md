@@ -445,7 +445,7 @@ If Go symbol operations fail:
   dependency forces another order. The banner wins over topmost placement, and
   it also outranks `.ralph/working_set.md`'s "NEXT LOOP" note, which carries
   state, not priority.
-- **Priority comes from the banner.** Tasks in M0137–M0143 and `P0-` tasks
+- **Priority comes from the banner.** Tasks in M0137–M0144 and `P0-` tasks
   follow §"Plan-parity harness" below — read it before selecting one.
   **M-NIGHTLY filing is unconditional:** every loop reads
   `ci/logs/action-items.md` and files each new `## AI-` subject, but M-NIGHTLY
@@ -455,16 +455,16 @@ If Go symbol operations fail:
   the upstream source over guessing.
 - Land a design doc alongside or just before any non-trivial subsystem. This
   is a hard requirement, not optional documentation. **Overridden for
-  M0137–M0143 only** — see §"Plan-parity harness" below, where the design doc is
+  M0137–M0144 only** — see §"Plan-parity harness" below, where the design doc is
   written when the task is *selected*.
 - For any non-trivial subsystem item, create/update the corresponding
   `docs/design/<milestone-or-spec-id>-NNNN-*.md` file and update
   `docs/design/README.md`
   in the same loop and commit. (This same-loop indexing requirement is **not**
-  relaxed for M0137–M0143.)
+  relaxed for M0137–M0144.)
 - Do not keep bare `NNNN-*` placeholders in active tasks. Replace them with
   concrete `<id>-NNNN-*` filenames before implementation begins. **Overridden
-  for M0137–M0143 only**: the filename is reserved at task selection, not at
+  for M0137–M0144 only**: the filename is reserved at task selection, not at
   milestone filing.
 - Tests are valuable, but per `PROMPT.md` they should not exceed ~20% of a
   loop's effort. Implementation > documentation > tests when prioritising.
@@ -489,10 +489,10 @@ If Go symbol operations fail:
   done.
 
 <!-- PLAN-PARITY-HARNESS:BEGIN -->
-## Plan-parity harness (M0137–M0143) — binding
+## Plan-parity harness (M0137–M0144) — binding
 
 Sections R and G7 apply to **every** Ralph loop task. The rest applies to
-tasks in M0137–M0143 and `P0-` tasks. Where this section disagrees with other
+tasks in M0137–M0144 and `P0-` tasks. Where this section disagrees with other
 sections of this file, it wins for those tasks (including over
 `docs/milestones/README.md` step 2 and "reserve a design-doc filename before
 coding"). Rationale and history: `docs/design/0100-0149/plan-parity-harness-background.md`
@@ -509,9 +509,15 @@ form "match count rises"; progress is category movement.
 
 Score = `scripts/pg-plan-parity-diff.py` output: `MATCH` count plus the
 `CATEGORIES:` and `CATEGORIES-EXCL-MATCH:` lines. **Noise band: ±3 per corpus**
-(PG-side capture variance on a byte-identical goopg capture). Floor: TPC-H
-match ≥ 8 (last measured `27d4ae001`), TPC-DS match ≥ 2 (Q9, Q41). Losing a
-current match is a regression.
+(PG-side capture variance on a byte-identical goopg capture). **TPC-H parity is
+measured in parallel mode** (owner decision 2026-09-20): both engines with
+`max_parallel_workers_per_gather` enabled — `estimate-audit -plan-only
+-serial=false`. Floor: TPC-H parallel match ≥ 3 (last measured P0-E7,
+2026-09-18; re-pinned by M0144-0001's capture), TPC-DS SF0.25 match ≥ 2 (Q9,
+Q41 — the floor is SF0.25 only; at SF1 the corpus reads 1/99, see P0-H12).
+TPC-DS captures already pin `max_parallel_workers_per_gather=4`, unchanged.
+Serial-mode TPC-H (match 8/22 at `27d4ae001`) stays a diagnostic capture, not
+the floor. Losing a current match is a regression.
 
 ### R — Hard prohibitions (no exceptions, no "dry run")
 - **R1 Shared clusters.** Reference clusters `:65432` (PG TPC-H), `:65433`
@@ -635,15 +641,16 @@ Run on the change, in the task that changes production code:
   and never generalises one task's exception into a standing one; without a row,
   a blocked gate means: mark the task `[!]`, escalate, select elsewhere.
 - **G2** Gate scripts write `tmp/gate-stamps/<gate>.json` (tree hash, binary
-  sha256, result). `.githooks/commit-msg` rejects an M0137–M0143 planner/executor
+  sha256, result). `.githooks/commit-msg` rejects an M0137–M0144 planner/executor
   commit without matching PASS stamps and a `CATEGORIES-EXCL-MATCH:` line (or
   `PARITY: N/A — <reason>`).
 - **G3 Captures**: private clone + binary built from HEAD, never a shared
   server. Pass `DATADIR`, `CAPTURE_ENGINE` and `GOOPG_EXPECT_BIN_SHA256` (the
   scripts refuse otherwise). TPC-DS: clone the SF0.25 data to a `55xx` port
   like `scripts/tpcds-sf025-regression.sh` does; PG side is `:65438` (read-only). TPC-H via
-  `estimate-audit -plan-only` (not `capture-tpch.sh`: empty stats), serial and
-  parallel. Procedure: `docs/design/0100-0149/m0137-0003-baseline-capture-procedure.md`.
+  `estimate-audit -plan-only` (not `capture-tpch.sh`: empty stats), **canonical
+  mode `-serial=false` (parallel)** since 2026-09-20 — serial is a diagnostic
+  variant only. Procedure: `docs/design/0100-0149/m0137-0003-baseline-capture-procedure.md`.
   `psql`/`pg_ctl` exist only in `./postgres/local_install/bin/`.
   Report the goopg plan file's sha256; if it equals the previous capture's,
   prove you did not measure the same binary.

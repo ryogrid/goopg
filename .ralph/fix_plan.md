@@ -18,29 +18,43 @@ the order written inside the item. `[!]` tasks are not selectable.
    P0-E5 (fix it together with M0143-0008) → P0-E6 (owner restores `:65433`;
    `[!]` until the owner marks it done — do not work around it) →
    P0-E7 (bulk re-measurement of everything landed since 2026-09-16 05:44).
-   **P0-E4, P0-E5 and P0-E6 are `[x]` as of 2026-09-18** — TPC-H on `:65433` is
-   restored, `data.HOLD` is released and `tpch-spotcheck` PASSes, so **P0-E7 is
-   the next task and the TPC-H gates run normally again**. There is no standing
+   **P0-E4 through P0-E7 are all `[x]` as of 2026-09-18** — TPC-H on `:65433` is
+   restored, `data.HOLD` is released and `tpch-spotcheck` PASSes, so the P0
+   gating is satisfied and the TPC-H gates run normally. There is no standing
    SKIP-BLOCKED exception any more: `.ralph/gate-exceptions.md` is empty, so a
    blocked TPC-H gate is a failed gate (AGENT.md G1).
 1. **Regressions found by P0-E7**, one task each, in the order P0-E7 lists them.
-2. **M0141-S2a-fix2r** — re-apply the PG-faithful `hashAggEntrySize` change that
+2. **M0144 Phase-A instruments** (measurement-first programme, owner decision
+   2026-09-20 — the census output re-ranks the items below; the owner
+   re-orders on its result): **M0144-0001** (parallel canonicalisation + floor
+   re-pin — TPC-H parity is now measured in parallel mode, `AGENT.md` §Goal) →
+   **M0144-0002** (first-divergence census) → **M0144-0003** (route-order
+   verification — owner-prioritised: several landed fixes never moved a plan
+   because goopg's processing route diverges from PG's upstream of the fix) →
+   **M0144-0004/0005/0006** (instrumented PG 18.3: OPTIMIZER_DEBUG build /
+   trace-GUC patch / call-graph build) → **M0144-0007** (cost-margin census) →
+   **M0144-0008/0009/0010** (hygiene: SF1 cadence, plan-gate reframing, ledger
+   bulk-triage) → **M0144-0011** (first vertical-slice campaign — gated on
+   0002+0007 output). M0137-0019's parallel triage is subsumed in part by
+   M0144-0002 (the census is the triage instrument); it stays filed for its
+   per-query write-up.
+3. **M0141-S2a-fix2r** — re-apply the PG-faithful `hashAggEntrySize` change that
    was discarded for parity reasons (owner Q4: no reverts). Degradations it
    causes are filed as their own tasks, not reverted.
-3. **Roll out fix1's success**: the recon **M0141-S2a-fix1-sweep** (other places
+4. **Roll out fix1's success**: the recon **M0141-S2a-fix1-sweep** (other places
    where width/currency reaches costing late or wrong), then
    M0141-S2b-6-resume, then M0139-0007c.
-4. **M0141-S7 — cost diagnosis only.** The Incremental Sort candidate exists
+5. **M0141-S7 — cost diagnosis only.** The Incremental Sort candidate exists
    but loses on cost (S2b-7: 3733.01 vs 3730.89). Compare the cost breakdown
    with PG for the 14 queries. **No production-code change under this item** —
    not even a trace inside an existing trace guard. If instrumentation is
    genuinely needed, file a separate `Kind: impl` task, run the values gates and
    report the parity numbers (this is what `073ab2748`/`c7e231ae1` got wrong).
-5. **M0140-0006a → 0006b → 0006c** (partial-Append).
-6. **M0142-0005**, then **M0142-0016c**, then **M0142-0003i** (0003i only after
+6. **M0140-0006a → 0006b → 0006c** (partial-Append).
+7. **M0142-0005**, then **M0142-0016c**, then **M0142-0003i** (0003i only after
    P0-E5 and P0-E6 are `[x]`).
-7. **M0143 remaining tasks**, top to bottom (includes the parser failures).
-8. M-NIGHTLY open items, then the pre-existing milestones
+8. **M0143 remaining tasks**, top to bottom (includes the parser failures).
+9. M-NIGHTLY open items, then the pre-existing milestones
    (M0119 → M0122 → M0131 → M0134 → M0135/M0136 → M0095/M0110).
 
 **New task fields (2026-09-18).** Every task filed from now on carries, each at
@@ -50,13 +64,22 @@ trace-only change to `internal/` or `cmd/` is `Kind: impl`, never a recon
 (AGENT.md C1). Production commits now need their gate stamps **whatever
 milestone they name**, M-NIGHTLY included.
 
-FROZEN-PREFIXES: M0142-0008a-3 M0142-0008c-1a M0142-0008c-3d M0142-0008c-4
+FROZEN-PREFIXES:
+(the M0142-0008 chain was UNFROZEN by owner decision 2026-09-20; see below —
+the empty prefix list is what makes them selectable again)
 
-**FROZEN (owner decision 2026-09-17) — not selectable, no children:** the
-M0142-0008 chain (`M0142-0008a-3`, `M0142-0008c-1a`, `M0142-0008c-3d`,
-`M0142-0008c-4`). Keep-or-remove is decided by the owner from P0-E7's A/B.
-**csq-R2** stays deferred; its owner-written reopen condition is in
-`.ralph/deferral_ledger.md` (row dated 2026-09-17).
+**UNFROZEN (owner decision 2026-09-20) — selectable again:** the M0142-0008
+chain (`M0142-0008a-3`, `M0142-0008c-1a`, `M0142-0008c-3d`,
+`M0142-0008c-4`) is unfrozen by direct owner instruction. P0-E7's private-lane
+A/B already landed the evidence csq-R2's reopen condition named (23/24 digest
+lines identical; sole divergence = Q9's 600s timeout in BOTH arms). **Hard
+owner constraint:** do NOT lift Q78's `outer-over-derived` firewall — or take
+any equivalent shortcut — to obtain reachability. The sanctioned route is the
+previously-unfiled producer, now filed as **M0142-0008-producer** below: teach
+an IN-unnesting (or EXISTS-variant) path to set `.SJInfo` on a
+DP-search-visible `JoinSemi` link, the way c19 did for ANTI. csq-R2's
+ledger row is updated with this decision (`.ralph/deferral_ledger.md`,
+row dated 2026-09-20).
 
 **M-NIGHTLY filing is unconditional**: every loop reads
 `ci/logs/action-items.md` and files each new `## AI-` subject under M-NIGHTLY.
@@ -69,7 +92,7 @@ first, fix with normal gates, cite the AI-id, tick it.
 - This is the authoritative TODO list for Ralph. ONE item per loop; decompose an
   item larger than one agent invocation (new tasks carry `Parent:`).
 - Design docs: non-trivial subsystems land with `docs/design/<id>-NNNN-*.md`
-  and a `docs/design/README.md` entry in the same commit. For M0137–M0143 and
+  and a `docs/design/README.md` entry in the same commit. For M0137–M0144 and
   `P0-` tasks follow `AGENT.md` §"Plan-parity harness" D3.
 - Deferrals: never close a task with a forward reference. A deferral needs
   **both** a `.ralph/deferral_ledger.md` row (`date | task-id | landed |
@@ -1842,7 +1865,7 @@ wants to unblock the shared type-kernel gap properly.
 ## M0137 — Parity measurement harness and instrument repair (filed 2026-09-14)
 
 **Milestone doc:** `docs/milestones/0137-parity-measurement-harness-and-instrument-repair.md`
-**Harness (binding, read before selecting):** `AGENT.md` §"Plan-parity harness (M0137–M0143)"
+**Harness (binding, read before selecting):** `AGENT.md` §"Plan-parity harness (M0137–M0144)"
 **Source:** `docs/design/not_ralph/plan_parity_fix_take2/METHODOLOGY3/04-forward-plan.md` Phase 0 (M2/M3/M5/M6)
 
 **First in the plan-parity group, and a prerequisite for the other six.** Every
@@ -2231,7 +2254,12 @@ before/after proving the defect it closes.
   Ledger row `m0137-0018-ea-ratchet-stale-baseline` (resolved). No production
   planner/executor/catalog code touched.
 - [ ] **M0137-0019 — triage the 16 parallel-mode `parallelism`-category
-  divergences M0137-0017 surfaced** — that task built the first-ever
+  divergences M0137-0017 surfaced** — **UPDATE 2026-09-20 (owner decision):
+  parallel mode is now the canonical TPC-H parity corpus** (AGENT.md §Goal),
+  so this triage is headline work, not a side reading. Subsumed in part by
+  **M0144-0002**'s first-divergence census (the higher-resolution instrument);
+  this task keeps the per-query write-up responsibility. Original text: that
+  task built the first-ever
   parallel-mode PG baseline and measured `parallelism=16/22`,
   `match=2/22` at `-serial=false` (committed:
   `analysis/m0137/m0137-0017-parallel.*`, diffed by
@@ -2306,18 +2334,22 @@ before/after proving the defect it closes.
   (`docs/design/0100-0149/m0137-0005-plan-gate-rebaseline.md`): census the 14
   divergences and attribute them to landed mechanism classes, `tpch-spotcheck`
   PASS before pinning, then `make plan-snapshot-capture LABEL=<name>` plus a
-  design doc. NOTE: the live `:65433` binary was built 2026-09-19 03:11 and
-  lags HEAD by commits that can move TPC-H plans (e.g. `9a2b9d47b` fused
-  NLI+Memoize Gather admission) — a pin taken now covers the *live binary's*
-  plans and may re-drift on the next server rebuild; pinning HEAD's plans
-  needs an owner-run rebuild+restart of `:65433`
+  design doc. NOTE: the live `:65433` binary was rebuilt at `2b8afa538`
+  during the 2026-09-20 owner 8-FK reload — it still lags HEAD (a handful of
+  commits since, e.g. `1f76d83d9`), so a pin taken now covers the *live
+  binary's* plans and may re-drift on the next server rebuild; pinning exact
+  HEAD plans needs an owner-run rebuild+restart of `:65433`
   (`maintenance_prompts/cluster-ops-runbook.md`). Escalate per the
   reference-cluster rule if an owner rebuild is wanted before pinning.
+  Also note the capture is **parallel-mode by construction** —
+  `cmd/plan-snapshot` sets no serial GUC and `:65433` serves
+  `max_parallel_workers_per_gather=4` — consistent with the 2026-09-20
+  parallel-canonical headline.
 
 ## M0138 — PG-faithful ANALYZE statistics (filed 2026-09-14)
 
 **Milestone doc:** `docs/milestones/0138-pg-faithful-analyze-statistics.md`
-**Harness (binding, read before selecting):** `AGENT.md` §"Plan-parity harness (M0137–M0143)"
+**Harness (binding, read before selecting):** `AGENT.md` §"Plan-parity harness (M0137–M0144)"
 **Source:** the owner's answer of 2026-09-14 to `METHODOLOGY3/04-forward-plan.md` §1.2 Question 2
 **Prerequisite:** M0137.
 
@@ -2610,7 +2642,7 @@ unmeasured one does not.
 ## M0139 — Executor-side narrowing / projection pushdown (filed 2026-09-14)
 
 **Milestone doc:** `docs/milestones/0139-executor-side-narrowing-projection-pushdown.md`
-**Harness (binding, read before selecting):** `AGENT.md` §"Plan-parity harness (M0137–M0143)"
+**Harness (binding, read before selecting):** `AGENT.md` §"Plan-parity harness (M0137–M0144)"
 **Source:** the owner's answer of 2026-09-14 to `METHODOLOGY3/04-forward-plan.md` §1.1 Question 1 — **(a) build it**
 **Prerequisite:** M0137 (M0137-0010's qual-placement census gates every slice here).
 
@@ -2998,7 +3030,7 @@ that comment names as parity-inert.
 ## M0140 — TPC-DS parallelism (filed 2026-09-14)
 
 **Milestone doc:** `docs/milestones/0140-tpcds-parallelism.md`
-**Harness (binding, read before selecting):** `AGENT.md` §"Plan-parity harness (M0137–M0143)"
+**Harness (binding, read before selecting):** `AGENT.md` §"Plan-parity harness (M0137–M0144)"
 **Source:** `METHODOLOGY3/04-forward-plan.md` Phase 1 Campaign A
 **Prerequisite:** M0137. **Independent of M0139** per the owner's "(c) split the goal = Go".
 
@@ -3686,7 +3718,7 @@ setting that yields a serial plan.
 ## M0141 — Upper-planner ordering contest (filed 2026-09-14)
 
 **Milestone doc:** `docs/milestones/0141-upper-planner-ordering-contest.md`
-**Harness (binding, read before selecting):** `AGENT.md` §"Plan-parity harness (M0137–M0143)"
+**Harness (binding, read before selecting):** `AGENT.md` §"Plan-parity harness (M0137–M0144)"
 **Source:** `METHODOLOGY3/04-forward-plan.md` Phase 1 Campaign B
 **Prerequisites:** M0137, **and this milestone's own S0.**
 
@@ -5576,7 +5608,7 @@ spill route is net-negative.
 ## M0142 — Join-order costing (filed 2026-09-14)
 
 **Milestone doc:** `docs/milestones/0142-join-order-costing.md`
-**Harness (binding, read before selecting):** `AGENT.md` §"Plan-parity harness (M0137–M0143)"
+**Harness (binding, read before selecting):** `AGENT.md` §"Plan-parity harness (M0137–M0144)"
 **Source:** `METHODOLOGY3/04-forward-plan.md` Phase 3, unblocked by the Question 2 answer
 **Prerequisites:** **M0138** (landed and measured) and M0137.
 
@@ -6765,7 +6797,7 @@ cross-layer programme that has never been scoped.
     `exists_unnest_sjinfo_test.go` (hash-keyed Semi, hash-keyed Anti,
     keyless nested-loop Semi) pin the computed values from real
     `unnestExistsExpr` fixtures.
-  - [!] **M0142-0008a-3** — **FROZEN (owner Q2, 2026-09-17; see banner)** — RE-SCOPED by -1 into three separately-landable
+  - [ ] **M0142-0008a-3** — **UNFROZEN (owner decision 2026-09-20; firewall stays — see banner)** — RE-SCOPED by -1 into three separately-landable
     increments (see design doc §4.2): (i) make the decorrelated RHS a
     real DP-search participant (extend `runJoinSearchBelowPinned` to walk
     the pinned join's RIGHT child too, give its base rel(s) `RelSet` bits
@@ -8577,7 +8609,7 @@ cross-layer programme that has never been scoped.
   `PASS=96 MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0 SKIP=3`, Q10/Q35 plan
   shape unchanged (expected — neither -0008c-1 nor -2 alone can move a plan).
   `go build ./...` clean; `go test ./internal/optimizer/...` full pass.
-- [!] **M0142-0008c-1a — FROZEN (owner Q2, 2026-09-17; see banner) — HASH method for `createUniquePath`** — filed by
+- [ ] **M0142-0008c-1a — UNFROZEN (owner decision 2026-09-20; firewall stays — see banner) — HASH method for `createUniquePath`** — filed by
   M0142-0008c-1 (design doc §17 item 2). PG's `UNIQUE_PATH_HASH`
   (`pathnode.c:2026-2043`) groups by `uniq_exprs` while passing every OTHER
   needed target-list column through UNGROUPED (`createplan.c:1796-1811`),
@@ -8687,7 +8719,7 @@ cross-layer programme that has never been scoped.
   production code, so no real Semi/Anti `SpecialJoinInfo` ever reaches
   `addPathsToJoinrel`. Actual next blocker filed as
   **M0142-0008a-3i-plumbing-c** (under the M0142-0008a milestone section).
-- [!] **M0142-0008c-3d — FROZEN (owner Q2, 2026-09-17; see banner) — merge + partial-nestloop unique-ify substitution**
+- [ ] **M0142-0008c-3d — UNFROZEN (owner decision 2026-09-20; firewall stays — see banner) — merge + partial-nestloop unique-ify substitution**
   — filed by M0142-0008c-3's recon (design doc §19.4 item 3d). Depends on
   M0142-0008c-3a. **RECHECKED 2026-09-17 (design doc §58), still deferred,
   updated reason**: `M0142-0008a-3i-plumbing-c`'s whole chain (c1-c21) is
@@ -8716,7 +8748,7 @@ cross-layer programme that has never been scoped.
   `joinpath.c:1403-1441` (read live this loop, §19.2). Before enabling merge
   here, check whether `mergeDeclined`'s existing SEMI/ANTI decline (§8)
   should also cover the demoted-INNER case.
-- [!] **M0142-0008c-4 — FROZEN (owner Q2, 2026-09-17; see banner) — `innerrel_is_unique`/unique-index NOOP fast path** —
+- [ ] **M0142-0008c-4 — UNFROZEN (owner decision 2026-09-20; firewall stays — see banner) — `innerrel_is_unique`/unique-index NOOP fast path** —
   filed by M0142-0008c (design doc §16.3 item 4). Depends on
   M0142-0008c-1. Not needed for correctness (the expensive Sort+Unique/
   HashAggregate path still produces the right rows) but needed for
@@ -9340,9 +9372,9 @@ cross-layer programme that has never been scoped.
 ## M0143 — Engine correctness carry-overs from the parity programme (filed 2026-09-14)
 
 **Milestone doc:** `docs/milestones/0143-engine-correctness-carry-overs.md`
-**Harness (binding, read before selecting):** `AGENT.md` §"Plan-parity harness (M0137–M0143)"
+**Harness (binding, read before selecting):** `AGENT.md` §"Plan-parity harness (M0137–M0144)"
 **Source:** `METHODOLOGY3/04-forward-plan.md` §3 "Continuous — engine correctness, not gated on anything"
-**Prerequisites:** none. Order: `.ralph/fix_plan.md` banner (item 7; M0143-0008 is handled with P0-E5).
+**Prerequisites:** none. Order: `.ralph/fix_plan.md` banner (item 8; M0143-0008 is handled with P0-E5).
 
 Real engine defects the parity programme discovered as a side effect. The case
 for treating them as a milestone rather than footnotes: **two genuine wrong-rows
@@ -10621,9 +10653,9 @@ reported, and the values and unit gates are the bar.
   `internal/access/nbtree` key comparators, `pgoutput` WAL encoding,
   TOAST thresholds/index-key/WAL record sizes), each slice gated by its
   own regress run plus the sf025 sweep. Context: the owner also reloaded
-  `:65433` today with the canonical 8-FK schema on a HEAD binary
-  (`09bde885a` anchor re-pin) — FK-driven plan comparisons now run
-  against the FK-bearing cluster.
+  `:65433` today with the canonical 8-FK schema on a binary rebuilt at
+  `2b8afa538` (HEAD at reload time; `09bde885a` re-pinned the anchors) —
+  FK-driven plan comparisons now run against the FK-bearing cluster.
 - [x] **M0143-0009 — `SELECT … FOR UPDATE` over a join drops every row when a
   locked leaf is not the rightmost scan (resjunk-ctid ColumnRef shift).**
   RESOLVED Loop #21 — `rebaseRowMarkPlan` post-order walk rebases every
@@ -10773,3 +10805,141 @@ reported, and the values and unit gates are the bar.
     `TestFKInsertAfterParentHotUpdate` (new, red-then-green verified via
     stash); executor package suite; the FK/upsert/unique isolation
     siblings; tpch-spotcheck; tpcds-sf025; tpch-acceptance-arm.
+
+## M0144 — Measurement-first parity: censuses, instrumented PG, route-order alignment (filed 2026-09-20)
+
+**Milestone doc:** `docs/milestones/0144-measurement-first-parity.md`
+**Harness (binding, read before selecting):** `AGENT.md` §"Plan-parity harness (M0137–M0144)"
+**Source:** `docs/design/not_ralph/plan_parity_fix_take2/METHODOLOGY4/03-forward-plan.md`
+(adopted by owner decision 2026-09-20, with two owner overrides recorded in the
+milestone doc: parallel-mode TPC-H parity is now canonical, and route-order
+verification is prioritised because several landed fixes never moved a plan —
+goopg's processing route diverged from PG's upstream of the fix).
+**Prerequisites:** none. Order: `.ralph/fix_plan.md` banner item 2.
+
+- [ ] **M0144-0001 — canonicalise parallel-mode TPC-H parity** (owner decision
+  2026-09-20). Flip `estimate-audit -serial`'s default to `false`
+  (`cmd/estimate-audit/main.go:293`) so the canonical tool measures the target
+  protocol by default; fix any test pinning the old default; keep
+  `-serial=true` working as the diagnostic mode. **Caller audit first**:
+  `scripts/tpch-estimate-audit-arm.sh` relied on the serial default — already
+  pinned `-serial=true` in the same owner change that filed this task; sweep
+  for any other invocation site that omits the flag before flipping. The
+  `cmd/` commit needs the `tmp/gate-stamps/{tpch-spotcheck,tpcds-sf025}.json`
+  PASS stamps for the staged tree plus a `PARITY: N/A — measurement-tool flag
+  default` body line (G2). Then capture a fresh
+  parallel-mode TPC-H pair on a private lane per G3 (`-plan-only -serial=false`,
+  HEAD binary, `GOOPG_EXPECT_BIN_SHA256` set) and record the resulting MATCH
+  count — that number re-pins the `AGENT.md` §Goal floor (provisionally ≥3
+  from P0-E7's 2026-09-18 measure; report the actual). Update
+  `m0137-0003-baseline-capture-procedure.md` §2 if the flag flip lands after
+  the doc update. The capture artefacts land in
+  `analysis/m0144/` with a `docs(…)`/`analysis(…)` commit.
+  Kind: impl
+  Parent: none
+- [ ] **M0144-0002 — first-divergence census** (03-forward-plan §1). Build a
+  sibling of `scripts/pg-plan-parity-diff.py` (e.g.
+  `scripts/pg-plan-first-divergence.py`, scripts-only — no `internal/`/`cmd/`
+  touch) that aligns the two normalised plan trees node-by-node in PG's
+  plan-order and emits ONE mutually-exclusive record per divergent query:
+  `(parent kind, PG child kind, goopg child kind, plan depth)`. Run it over the
+  committed captures — TPC-H parallel (`analysis/m0137/m0137-0017-parallel.*`;
+  re-capture at HEAD only if 0001's fresh pair lands first), TPC-DS SF0.25
+  latest sweep, TPC-DS SF1 (P0-E7's) — and commit the ranked frequency table
+  under `analysis/m0144/` cited from the design doc. This table replaces the
+  nine-category counts for targeting (M0137-0019 keeps the per-query write-up).
+  Kind: recon
+  Parent: none
+- [ ] **M0144-0003 — route-order verification** (owner directive 2026-09-20:
+  "fixes landed but plans didn't move because the processing order differs
+  from PG" — verify, then align). For each landed-but-inert item, state the
+  goopg route position and cite PG's ordering (`./postgres/<file>:<line>`):
+  (a) `M0142-0008-producer`'s `.SJInfo` now produced but every IN statement
+      declines at `leaf-count` (`joinsearchseam.go:325`, before
+      `semiAntiLinksHaveSJInfos` at :631) — the `Filter(Semi(...))` wrapper as
+      opaque leaf;
+  (b) Parallel Append admitted 0/99 corpus-wide (M0140);
+  (c) Incremental Sort reaches the executor 0 times (M0141-S7);
+  (d) `applyUpperNarrowing` runs after costing (post-cost narrowing inert);
+  (e) EXISTS/IN pinned pre-DP vs PG's `join_is_legal` route.
+  Output: a per-item route-diff table in the design doc + `analysis/m0144/`,
+  and one `Kind: impl` task filed per confirmed ordering divergence (each
+  naming expected movement per S5). If an item turns out NOT to be an ordering
+  divergence, say so with the citation — do not force the hypothesis.
+  Kind: recon
+  Parent: none
+- [ ] **M0144-0004 — instrumented PG 18.3, instrument 1: `OPTIMIZER_DEBUG`
+  build** (03-forward-plan §3). Build PG 18.3 from a **scratch checkout**
+  (`./postgres/` stays read-only) with `OPTIMIZER_DEBUG` defined; serve a
+  private clone of the corpus on a `55xx` port (never `:65432`/`:65438` — R1
+  applies to the instrumented build's data sources). Document the build recipe
+  and capture the per-rel survivor pathlists for the top first-divergence
+  queries from 0002. Known limit (record it): survivors-only — `add_path`
+  prints nothing, rejected candidates are already evicted.
+  Kind: impl
+  Parent: none
+- [ ] **M0144-0005 — instrumented PG, instrument 2: `debug_plan_candidates`
+  trace GUC** (03-forward-plan §3). Same scratch-checkout build plus a small
+  patch adding a GUC that emits, per `RelOptInfo`: every pathlist entry at
+  `add_path` time (node type, startup/total cost, rows, pathkeys, param_info,
+  required-outer rels), the rejection verdict (which comparator won), and the
+  `set_cheapest` winner. This is the per-candidate artefact goopg's
+  `GOOPG_PGSHAPED_DP_TRACE` gets diffed against — separating candidate gap /
+  costing gap / tie-break gap, which today all read as "join-order".
+  Kind: impl
+  Parent: none
+- [ ] **M0144-0006 — instrumented PG, instrument 3: `-finstrument-functions`
+  call-graph build** (03-forward-plan §3). Same private setup; the trace
+  answers "which route through the planner did this query take"
+  (`make_one_rel` DP search / `join_search_one_level` ordering /
+  `create_unique_path` / degenerate path) for each divergent query — the
+  PG-side input to M0144-0003's route-diff table and the audit-scope namer
+  for vertical slices.
+  Kind: impl
+  Parent: none
+- [ ] **M0144-0007 — cost-margin census** (03-forward-plan §2). For each
+  first-divergence node from 0002, force PG's shape in goopg (the
+  M0142-0016c forced-plan comparator pattern plus the `GOOPG_*` admission
+  arms) and record the margin class: <1% (election/tie-break), 1–20% (input
+  divergence — attribute rows/width/cost-term first), >20% or unexpressible
+  (structural gap). Output: margin column appended to 0002's table in
+  `analysis/m0144/`. Depends on 0002.
+  Kind: recon
+  Parent: M0144-0002
+- [ ] **M0144-0008 — TPC-DS SF1 cadence capture** (03-forward-plan §5). The
+  corpus's goal is SF1 and exactly one SF1 capture exists (P0-E7, match=1/99).
+  Take a second SF1 capture on a private lane per G3 and record the
+  per-milestone-boundary SF1 convention in the design doc.
+  Kind: recon
+  Parent: none
+- [ ] **M0144-0009 — `plan-gate` reframing evaluation** (03-forward-plan §5).
+  The gate diffs live `:65433` (binary lags HEAD) vs the newest committed
+  snapshot — it can never see staged-code regressions. Evaluate: keep
+  re-pinning on a schedule (M0137-0022) vs diff a fresh private-clone HEAD
+  build. Decide, then either close or amend M0137-0022's scope in place.
+  Also pin the golden-record rule while here (03-forward-plan §5's fourth
+  bullet): `bench/tpch/runtime_goopg/tpch-golden-20260919/` is the
+  record-level reference for `:65433`; if the cluster is ever reloaded,
+  re-dump it first — add the rule to `maintenance_prompts/cluster-ops-runbook.md`
+  if absent.
+  Kind: recon
+  Parent: none
+- [ ] **M0144-0010 — ledger bulk-triage tooling** (03-forward-plan §6). ~2,100
+  open `.ralph/deferral_ledger.md` rows. Build tooling that (1) flags rows
+  whose referenced code/tests no longer exist (`git log -S` checks), (2)
+  folds same-mechanism rows into cluster rows, (3) emits only the survivors
+  for per-task triage. This is the M0119-successor cadence mechanism.
+  Kind: impl
+  Parent: none
+- [ ] **M0144-0011 — first vertical-slice campaign** (03-forward-plan §4).
+  **Not selectable until M0144-0002 and M0144-0007 have landed.** Take the top
+  first-divergence cluster, ONE representative query, and drive it to MATCH
+  end-to-end — this task is a recon: it *files* each surfaced layer
+  (admission → candidate → cost input → election → executor existence) as a
+  `Kind: impl` child (`Parent: M0144-0011`) naming expected movement per S5;
+  production changes happen in those children, not here. Ends when the query
+  matches or the residue is a named, measured, unfunded capability. Only then
+  generalise to the cluster — the depth-first inversion of the era's
+  breadth-first mechanism builds.
+  Kind: recon
+  Parent: M0144-0002

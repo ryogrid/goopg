@@ -152,7 +152,7 @@ internal/sqlparser/yacc_stderr.txt
 # Mermaid validator
 tools/mermaid-validator/node_modules/
 
-# Plan-parity harness (M0137–M0143): scratch must not live at the repo root.
+# Plan-parity harness (M0137–M0144): scratch must not live at the repo root.
 # `bak/` once held a `package executor` test file at the root and broke
 # `go vet ./...` for 10 hours while five tasks accepted the red as
 # "pre-existing". Scratch belongs in analysis/m01NN/ — see AGENT.md

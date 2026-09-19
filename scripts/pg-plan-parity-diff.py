@@ -1176,7 +1176,7 @@ def print_report(results, verbose=False):
     # difference is the common case), so the raw CATEGORIES roll-up counts
     # queries that are in fact already matching PG and overstates how many
     # queries a category actually blocks. AGENT.md's plan-parity harness asks
-    # every M0137-M0143 report for `blocked-excluding-matches`; this is the
+    # every M0137-M0144 report for `blocked-excluding-matches`; this is the
     # line that supplies it.
     #
     # Tags on MISSING-NODE / UNPARSED / ERROR / TIMEOUT queries are kept on

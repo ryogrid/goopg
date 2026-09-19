@@ -10,7 +10,7 @@ when the candidate:
       with a `Parent:` field are descendants, so legacy tasks never count).
       Remedy: write an escalation block into the root, mark the root [!],
       select a task elsewhere.
-  Rule B (lineage required): adds a task whose id matches M0137..M0143 or P0-
+  Rule B (lineage required): adds a task whose id matches M0137..M0144 or P0-
       without a `Parent:` line.
   Rule D (field hygiene — audit hole D): a NEWLY ADDED line may not
       (1) be a task's ONLY `Parent:` / `Movement: yes` declaration while
@@ -68,7 +68,7 @@ PARENT_RE = re.compile(r"^\s*Parent:\s*`?([^\s`]+)`?")
 MOVE_RE = re.compile(r"^\s*Movement:\s*(\S+)")
 PARENT_INLINE_RE = re.compile(r"(?:^|\s)Parent:\s*`?([^\s`]+)`?")
 MOVE_INLINE_RE = re.compile(r"(?:^|\s)Movement:\s*(\S+)")
-NEWID_RE = re.compile(r"^(M01(3[7-9]|4[0-3])|P0-)")
+NEWID_RE = re.compile(r"^(M01(3[7-9]|4[0-4])|P0-)")
 # Rule D: `Movement: yes` must cite an instrument with a number on the SAME
 # line — a `match` count (this also covers CATEGORIES-EXCL-MATCH) or
 # `ea-ratchet`.
@@ -229,7 +229,7 @@ def check(baseline, candidate):
         if NEWID_RE.match(t.id) and not t.has_parent:
             errs.append(
                 f"[B] new task {t.id} (line {t.line}) has no `Parent:` line. Every new "
-                f"M0137-M0143 / P0- task names the task that filed it (`Parent: <TASK-ID>`, "
+                f"M0137-M0144 / P0- task names the task that filed it (`Parent: <TASK-ID>`, "
                 f"or `Parent: none` for owner-filed tasks).")
 
     # Rule A

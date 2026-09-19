@@ -285,11 +285,11 @@ fi
 tree="$(cd "$ROOT" && git ls-files -s -- internal cmd go.mod go.sum | sha256sum | cut -d' ' -f1)"
 has_ledger=0
 grep -q '^ledger:' <<<"$body" && has_ledger=1
-# Plan-parity task ids (M0137..M0143 / P0-) no longer decide WHETHER the gates
+# Plan-parity task ids (M0137..M0144 / P0-) no longer decide WHETHER the gates
 # are required (that is keyed on the staged files above); the regex is kept for
 # plan-parity-specific extras only. There are none at present.
 plan_parity_task=0
-grep -Eq '(M01(3[7-9]|4[0-3])|P0-)' <<<"$msg" && plan_parity_task=1
+grep -Eq '(M01(3[7-9]|4[0-4])|P0-)' <<<"$msg" && plan_parity_task=1
 
 pending_usage=()    # "<gate> <task-id>" appended to the usage log on success
 

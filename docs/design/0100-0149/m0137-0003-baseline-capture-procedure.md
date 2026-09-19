@@ -89,19 +89,21 @@ AGENT.md's "Server traps").
 
 ```bash
 go build -o /tmp/estimate-audit ./cmd/estimate-audit
-PGPASSWORD=tpch /tmp/estimate-audit -plan-only \
+PGPASSWORD=tpch /tmp/estimate-audit -plan-only -serial=false \
   -label <descriptive-label> -out analysis/m0137 \
   -port 65433 -db tpch -user tpch -password tpch \
   -ref-port 65432 -ref-db tpch -ref-user postgres -ref-password postgres
 ```
 
-- **`-serial` defaults `true`** (`cmd/estimate-audit/main.go:285`) and sets
-  `max_parallel_workers_per_gather = 0` on **both** engines
-  (`session.ensure`, same file). This is why TPC-H `parallelism` reads 0 in
-  every quoted category table — the category is measured **out** of the
-  corpus, not solved. Do not report a TPC-H parallelism win or regression
-  from a `-plan-only` run; the last real (non-serial) reading was `18→16`
-  under the gather-paths flip (`METHODOLOGY2.md` §5).
+- **Canonical mode is `-serial=false` (parallel) since 2026-09-20** (owner
+  decision; `AGENT.md` §Goal floor is the parallel-mode match count).
+  `-serial` still defaults `true` today (`cmd/estimate-audit/main.go:293`;
+  M0144-0001 flips it) and sets `max_parallel_workers_per_gather = 0` on
+  **both** engines (`session.ensure`, same file) — serial captures remain a
+  diagnostic variant. Until the flag default flips, every canonical capture
+  MUST pass `-serial=false` explicitly. Historical note: serial-mode captures
+  are why TPC-H `parallelism` read 0 in pre-2026-09-20 category tables — the
+  category was measured **out** of the corpus, not solved.
 - **`-plan-only` still warms stats.** `session.ensure`'s `ANALYZE <table>`
   loop over `tpch.Tables()` runs regardless of `-plan-only` (only
   `EXPLAIN ANALYZE` vs plain `EXPLAIN` and the §5/§4 report sections are

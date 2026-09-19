@@ -27,7 +27,7 @@ When the agent begins work on a milestone, it must update the status field at th
 
 1. Read the milestone document and the relevant upstream sources under `./postgres/`.
 2. Write the design docs listed under "Required Design Docs" first, with status `draft`.
-   (**Overridden for M0137–M0143** — in that group the design doc is written when
+   (**Overridden for M0137–M0144** — in that group the design doc is written when
    the task is *selected*; see `AGENT.md` §"Plan-parity harness". No up-front
    Required-Design-Docs list is kept for those milestones.)
 3. Implement against those design docs. Update them to `accepted` when stable.
@@ -167,3 +167,4 @@ When the agent begins work on a milestone, it must update the status field at th
 | 0141 | Upper-planner ordering contest (filed 2026-09-14; the named lever for `aggregation-strategy` and `sort-strategy`, and the largest single item in the workstream per K24 — but **scoping-gated**: S0 is a mandatory measurement-only recon that must size PG's `AGGSPLIT_INITIAL_SERIAL`/`FINAL_DESERIAL` executor programme and file its own slices before any implementation task exists) | planned | `0141-upper-planner-ordering-contest.md` |
 | 0142 | Join-order costing (filed 2026-09-14; `join-order` is the largest category on both corpora, TPC-H 14 / TPC-DS 89. Unblocked by the Question 2 answer. The candidate half is **already open at HEAD** — K26 §9.3 is a pre-R51 snapshot — so only the costing half remains; opens with an entry recon because every prior pricing round terminated blocked. Gated on M0138) | planned | `0142-join-order-costing.md` |
 | 0143 | Engine correctness carry-overs from the parity programme (filed 2026-09-14; real engine defects the parity work discovered as a side effect and that no parity decision should hold up — the missing in-process DATABASE-boundary test, FK `DROP CONSTRAINT` silently doing nothing, `pg_constraint` empty after restart, `PhysicalTypeIsVarlena` missing its array arm, `ParamRef` LIMIT+DISTINCT returning wrong rows, and `internal/parser`'s 60 unowned failing tests) | planned | `0143-engine-correctness-carry-overs.md` |
+| 0144 | Measurement-first parity: censuses, instrumented PG, route-order alignment (filed 2026-09-20; adopts `METHODOLOGY4/03-forward-plan.md` wholesale with two owner overrides — **TPC-H parity is canonical in parallel mode** and **route-order verification is prioritised** since landed fixes keep losing to upstream route divergence, e.g. the `.SJInfo` producer's `leaf-count` decline. Phase-A instruments only: first-divergence census, cost-margin census, three instrumented-PG builds, vertical-slice campaign gated on the census) | planned | `0144-measurement-first-parity.md` |

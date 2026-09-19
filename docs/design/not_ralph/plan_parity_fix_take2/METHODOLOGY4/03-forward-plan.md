@@ -6,6 +6,20 @@ cost-input timing; it also proved that building PG-spec mechanisms one at a
 time does not convert categories into matches. This plan changes what gets
 measured next, then what gets built.*
 
+> **Adoption note (2026-09-20).** This plan is adopted as milestone **M0144**
+> (`.ralph/fix_plan.md` §M0144, banner item 2; milestone doc
+> `docs/milestones/0144-measurement-first-parity.md`), with two owner
+> overrides: §5's TPC-H protocol question is **settled — parallel mode is the
+> canonical parity corpus** (`AGENT.md` §Goal floor is the parallel match),
+> and route-order verification is prioritised as **M0144-0003** (the owner
+> observed that landed fixes kept losing to upstream route divergence — e.g.
+> `M0142-0008-producer`'s `.SJInfo` landed yet corpus reachability stayed
+> zero at the `leaf-count` decline). §7's owner decisions are all resolved:
+> `:65433` reloaded with the canonical 8-FK schema and rebuilt at `2b8afa538`
+> (HEAD at reload time; anchors re-pinned in `09bde885a`), the semi/anti
+> chain unfrozen (`M0142-0008-producer` landed, firewall intact), and
+> M0143-0007b bpchar approved.
+
 ---
 
 ## Part A — Summary

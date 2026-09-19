@@ -421,8 +421,8 @@ Priority` banner** — the banner is the sole ordering authority, not your own
 judgment about impact. Use judgment only to choose among tasks the banner leaves
 equally ranked, or when the topmost task is blocked.
 
-Before selecting an M0137–M0143 or `P0-` task, read `AGENT.md`
-§"Plan-parity harness (M0137–M0143)". It is binding and overrides this file for
+Before selecting an M0137–M0144 or `P0-` task, read `AGENT.md`
+§"Plan-parity harness (M0137–M0144)". It is binding and overrides this file for
 those tasks. The loop never edits `CLAUDE.md`, the banner, or that section, never
 reverts, and never writes to the reference clusters; hooks enforce this when
 `RALPH_LOOP=1`.
