@@ -703,8 +703,40 @@ heuristic stays live.)
     `restore_truncdrop_counters`); the trigger store accumulates
     `upd + del` at DML time and is cleared by an aborted truncate —
     commit math on a non-transactional counter.
-- [ ] **testport/TestPort_LockRowsSortOverJoinTakesRowLock (AI-20260905-011015-005, AI-20260914-235643-008, AI-20260916-035206-009, AI-20260917-004357-013)** —
+- [x] **testport/TestPort_LockRowsSortOverJoinTakesRowLock (AI-20260905-011015-005, AI-20260914-235643-008, AI-20260916-035206-009, AI-20260917-004357-013)** —
   FAILed subtests: join_no_sort, also failed previous run.
+  - **DONE 2026-09-19 (Loop \#9, ROOT-CAUSED)** — both subtests PASS (4.80s);
+    join\_no\_sort now blocks on the writer's xmax and EPQ-returns 1050.
+  - Root cause: the test comment was stale — the "control" query plans
+    `LockRows -> <join> -> Bitmap Heap Scan` (the `a.accountid = 'checking'`
+    point qual picks the pkey bitmap path), and `bitmapHeapScanOp` was
+    invisible to every rowmark TID route: no resjunk-ctid wire
+    (`wireRowMarkCtidColumns` covered only SeqScan/IndexScan), no `hasCTID`
+    slot stamp, no `currentTIDProvider`, no walker arm.
+  - Implementation (design updates: `0128-0001-bitmap-heap-scan`,
+    `0129-0003-resjunk-ctid-column-path`):
+    - planner: `tagScan` closure + `*BitmapHeapScan` arm wires the trailing
+      `ctid<N>` resjunk column into bitmap leaves (incl. NLI inners).
+    - executor: `emitRow` appends the ctid datum + stamps slot hasCTID;
+      `currentTID()` (ok=false once pin released at EOF — build-side hash
+      scans fall through to the slot stamp); walker arms in
+      `findScanLeaf`/`findScanLeafForRel`/`markJoinPreserveCTID`;
+      `BindOuter` width check relaxed to `innerW < len(tbl.Columns)`.
+    - executor: bitmap page RLock rescoped per tuple fetch
+      (M0100-0005e convention) — the scan previously held `pinned.RLock()`
+      across yields, so `stampLock`'s same-page write lock self-deadlocked
+      (`lockwithvalues` perm of eval-plan-qual hung the whole spec under
+      the first attempt at this fix). `fetchExact` collapsed to
+      `fetchOneTuple`+`o.Next()` recursion (bodies were duplicates).
+  - Bonus: `TestPort_IsolationEvalPlanQual` went from recorded-fail to
+    byte-identical PASS (23.4s) — the `partiallock` (MergeJoin+bitmap) and
+    `lockwithvalues` (NL+bitmap-inner) perms are covered by the resjunk
+    column path without merge-join walker arms.
+  - Gates: repro test PASS; sibling FOR UPDATE/bitmap isolation specs
+    13/14 PASS (UpdateLockedTuple remains pre-existing FAIL,
+    AI-20260917-004357-012); executor+optimizer units PASS; executor race
+    clean 62s; units gate green; tpch-spotcheck PASS (Q12=2/Q13=34);
+    tpcds-sf025 PASS=96/0/0/0, plans 99/99; plan-gate 14/22 baseline.
 - [ ] **testport/TestPort_PgDumpConnectionSetup (AI-20260905-011015-006, AI-20260914-235643-009, AI-20260916-035206-010, AI-20260917-004357-014)** —
   FAILed, also failed previous run.
 - [ ] **testport/TestPort_RegressSuite (AI-20260905-011015-008, AI-20260914-235643-011, AI-20260916-035206-012, AI-20260917-004357-016)** — FAILed
@@ -899,9 +931,17 @@ heuristic stays live.)
 - [ ] **race/internal/parser (AI-20260914-235643-003, AI-20260916-035206-003, AI-20260917-004357-005)** — new tonight, race suite
   failed in `internal/parser` (repro: `go test -race -timeout 45m
   ./internal/parser/`). Same likely-shared root cause note as the item above.
-- [ ] **testport/TestPort_IsolationEvalPlanQual (AI-20260914-235643-005, AI-20260916-035206-005, AI-20260917-004357-007)** — new
+- [x] **testport/TestPort_IsolationEvalPlanQual (AI-20260914-235643-005, AI-20260916-035206-005, AI-20260917-004357-007)** — new
   tonight, FAILed (repro: `go test -v -run '^TestPort_IsolationEvalPlanQual$'
   ./internal/testport/`).
+  - **DONE 2026-09-19 (Loop \#9)** — spec now byte-identical PASS (23.4s),
+    fixed by the same change as
+    `TestPort_LockRowsSortOverJoinTakesRowLock` above: the `partiallock`
+    (`LockRows -> Merge Join -> Bitmap Heap Scan` both sides) and
+    `lockwithvalues` (`LockRows -> NL(Values, Bitmap Heap Scan inner)`)
+    perms needed the bitmap leaf's resjunk-ctid wire + TID stamps, and
+    `lockwithvalues` additionally needed the bitmap page RLock rescoped
+    per tuple (it self-deadlocked `stampLock` on the held read lock).
 - [x] **units/build-broke-mid-stage (AI-20260914-235643-013)** and
   **race/build-broke-mid-stage (AI-20260914-235643-014)** — `[infra]`, not
   regressions per the nightly bot's own classification: 1 package failed to

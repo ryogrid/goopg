@@ -405,7 +405,11 @@ func (o *bitmapHeapScanOp) BindOuter(slot SlotView, outerWidth int) {
 		// ordinals 1:1 and scanRow (length len(tbl.Columns)) is
 		// dimension-compatible. A projection pushdown between table and heap
 		// Output would silently break this — fail named, not wrong.
-		if o.tbl != nil && innerW != len(o.tbl.Columns) {
+		// innerW may exceed the table width when wireRowMarkCtidColumns
+		// appended resjunk ctid columns (M0128-P6.1): they trail the table
+		// columns, so merged-coord refs still alias table ordinals 1:1 and
+		// innerMS (refreshed with table-width scanRow) stays valid.
+		if o.tbl != nil && innerW < len(o.tbl.Columns) {
 			o.recheckErr = &ExecError{Code: "XX000", Pos: o.plan.Pos(),
 				Message: fmt.Sprintf("BitmapHeapScan NLI recheck: inner Output width %d != table %q width %d; merged-coord BitmapQual refs would mis-resolve",
 					innerW, o.tbl.Name, len(o.tbl.Columns))}
@@ -556,10 +560,11 @@ func (o *bitmapHeapScanOp) Close() error {
 	return nil
 }
 
-// releasePinned unpins the current page if any.
+// releasePinned unpins the current page if any. The page RLock is scoped
+// per tuple fetch (see fetchOneTuple), never held across a yield — the
+// same convention seqScanOp adopted in M0100-0005e — so this only Unpins.
 func (o *bitmapHeapScanOp) releasePinned() {
 	if o.pinned != nil {
-		o.pinned.RUnlock()
 		o.ctx.Pool.Unpin(o.pinned)
 		o.pinned = nil
 		o.pageBuf = nil
@@ -642,7 +647,10 @@ func (o *bitmapHeapScanOp) nextSerial() (TupleSlot, error) {
 					return nil, err
 				}
 			}
-			slot.RLock()
+			// Pin only — the page RLock is scoped per tuple fetch
+			// (fetchOneTuple). Holding it across a yield deadlocks
+			// lockRowsOp.stampLock, which write-locks the same page
+			// mid-drain (M0100-0005e sibling convention).
 			o.pinned = slot
 			o.pageBuf = slot.Page()
 			o.pageBlock = block
@@ -729,13 +737,13 @@ func (o *bitmapHeapScanOp) nextParallel() (TupleSlot, error) {
 			return nil, EOF
 		}
 
-		// Pin the page.
+		// Pin the page. Pin only — the page RLock is scoped per tuple
+		// fetch (fetchOneTuple), never held across a yield.
 		o.releasePinned()
 		slot, err := o.ctx.Pool.Pin(storage.BufferTag{Rel: o.rel, Block: block})
 		if err != nil {
 			return nil, err
 		}
-		slot.RLock()
 		o.pinned = slot
 		o.pageBuf = slot.Page()
 		o.pageBlock = block
@@ -796,7 +804,14 @@ func (o *bitmapHeapScanOp) nextParallel() (TupleSlot, error) {
 // fetchOneTuple fetches and decodes a single tuple at (block, offset).
 // Returns (nil, nil) when the tuple is invisible or reclaimed — the caller
 // advances to the next offset. Does NOT recursively call Next().
-func (o *bitmapHeapScanOp) fetchOneTuple(_ storage.BlockNumber, offset uint16, recheck bool) (TupleSlot, error) {
+//
+// The page RLock is scoped to this call (M0100-0005e convention): the scan
+// holds only the pin across yields, so a consumer — lockRowsOp.stampLock
+// write-locking the same page mid-drain, or a concurrent writer — is never
+// stalled by a lock parked between Next() calls.
+func (o *bitmapHeapScanOp) fetchOneTuple(block storage.BlockNumber, offset uint16, recheck bool) (TupleSlot, error) {
+	o.pinned.RLock()
+	defer o.pinned.RUnlock()
 	id, err := storage.PageGetItemID(o.pageBuf, offset)
 	if err != nil {
 		return nil, nil // entry reclaimed, skip
@@ -846,69 +861,63 @@ func (o *bitmapHeapScanOp) fetchOneTuple(_ storage.BlockNumber, offset uint16, r
 		}
 	}
 
-	// Clone arena-backed data.
-	row := cloneRowOwned(o.scanRow)
-	o.slot = MaterializedSlot{schema: o.plan.Output(), row: row}
-	return &o.slot, nil
+	return o.emitRow(block, offset), nil
 }
 
-// fetchExact fetches a specific tuple at the given offset.
-func (o *bitmapHeapScanOp) fetchExact(block storage.BlockNumber, offset uint16, recheck bool) (TupleSlot, error) {
-	// Check that the line pointer is still valid.
-	id, err := storage.PageGetItemID(o.pageBuf, offset)
-	if err != nil {
-		return o.Next() // entry reclaimed, skip
-	}
-	if id.Flags == storage.ItemIDUnused || id.Flags == storage.ItemIDDead {
-		return o.Next() // entry reclaimed, skip
-	}
-
-	// Follow HOT chain + MVCC visibility.
-	tuple, _, found := followHOTChainNoCopy(o.pageBuf, offset, o.ctx.Snap, o.ctx.Tx.XID, o.ctx.MultiXact, o.ctx.CmdID, o.ctx.comboStore())
-	if !found {
-		return o.Next() // tuple invisible, skip
-	}
-
-	// Lazily allocate scanRow.
-	if o.scanRow == nil || len(o.scanRow) != len(o.tbl.Columns) {
-		o.scanRow = acquireRow(len(o.tbl.Columns))
-	}
-
-	storedNatts := int(tuple.Header.Infomask2 & 0x07FF)
-	if err := o.decodeScanRow(tuple.Data, tuple.Bitmap, storedNatts); err != nil {
-		return o.Next() // decode failure, skip
-	}
-
-	// If recheck is required (lossy page or index AM said recheck),
-	// evaluate the original index qual (BitmapQual).
-	if recheck && len(o.plan.BitmapQual) > 0 {
-		passed, evalErr := o.evalBitmapQual()
-		if evalErr != nil {
-			return nil, evalErr
-		}
-		if !passed {
-			return o.Next() // recheck failed, skip
-		}
-	}
-
-	// PG's `Filter:` on a Bitmap Heap Scan: the relation's local quals,
-	// evaluated on EVERY tuple — unlike BitmapQual above, which is the recheck
-	// list and fires only on a lossy entry. Set only on an NLI inner, where the
-	// quals cannot live in a *Filter above (plan.go, BitmapHeapScan.Cond).
-	if o.plan.Cond != nil {
-		d, cerr := evalExpr(o.plan.Cond, o.scanRow, o.ctx)
-		if cerr != nil {
-			return nil, cerr
-		}
-		if d.IsNull() || d.Kind != KindBool || !d.BoolValue() {
-			return o.Next() // filtered out; fetchExact skips by recursing, not by nil
-		}
-	}
-
-	// Clone arena-backed data.
+// emitRow builds the output slot for a fetched tuple at (block, offset).
+// Two stampings make the op a full sibling of seqScanOp/indexScanOp for
+// rowmark (FOR UPDATE) TID surfacing:
+//
+//  1. resjunk ctid (M0128-P6.1): when wireRowMarkCtidColumns extended the
+//     scan's schema past the table's own columns, the trailing slots carry
+//     this tuple's TID as a "(block,offset)" string datum so it rides the
+//     row through the plan tree to lockRowsOp's CtidResno read.
+//  2. slot side-channel: hasCTID/ctidBlock/ctidOff on the emitted slot —
+//     the same stamp seqScanOp applies (M0097-0038), consumed by
+//     drainAndStamp's ms.hasCTID fallback for shapes the column path
+//     cannot cover (self-joins skip injection).
+func (o *bitmapHeapScanOp) emitRow(block storage.BlockNumber, offset uint16) TupleSlot {
 	row := cloneRowOwned(o.scanRow)
+	for i := len(o.cols); i < len(o.plan.Output()); i++ {
+		row = append(row, NewStringDatum(fmt.Sprintf("(%d,%d)", block, offset)))
+	}
 	o.slot = MaterializedSlot{schema: o.plan.Output(), row: row}
-	return &o.slot, nil
+	o.slot.hasCTID = true
+	o.slot.ctidBlock = uint32(block)
+	o.slot.ctidOff = offset
+	return &o.slot
+}
+
+// currentTID implements currentTIDProvider (M0021 step 2): the (rel,
+// ItemPointer) of the most recently emitted row, ok=false once the scan
+// is exhausted or closed — the same contract as seqScanOp (the page pin is
+// released at EOF/Close), so a build-side scan drained at hash-join Open
+// reports false and lockRowsOp falls through to the slot's hasCTID stamp.
+func (o *bitmapHeapScanOp) currentTID() (storage.RelFileNode, storage.ItemPointer, bool) {
+	if o.pinned == nil || !o.slot.hasCTID {
+		return storage.RelFileNode{}, storage.ItemPointer{}, false
+	}
+	return o.rel, storage.ItemPointer{
+		Block:  storage.BlockNumber(o.slot.ctidBlock),
+		Offset: o.slot.ctidOff,
+	}, true
+}
+
+// fetchExact fetches a specific tuple at the given offset. On a skip
+// (reclaimed line pointer, invisible tuple, failed recheck/Cond) it
+// recurses through o.Next() to advance the TBM iterator — the same
+// sequence fetchOneTuple performs, differing only in skip handling.
+// The recursion happens after fetchOneTuple has released its per-tuple
+// page RLock, so no nested RLock is ever taken on this goroutine.
+func (o *bitmapHeapScanOp) fetchExact(block storage.BlockNumber, offset uint16, recheck bool) (TupleSlot, error) {
+	slot, err := o.fetchOneTuple(block, offset, recheck)
+	if err != nil {
+		return nil, err
+	}
+	if slot == nil {
+		return o.Next()
+	}
+	return slot, nil
 }
 
 // nextParallelTuple returns the next surviving tuple from the current exact
@@ -957,7 +966,10 @@ func (o *bitmapHeapScanOp) nextLossyTuple(block storage.BlockNumber) (TupleSlot,
 		if o.lossyOff == 0 || o.lossyOff > uint16(MaxOffsetNumber) {
 			return nil, nil
 		}
-		if _, err := storage.PageGetItemID(o.pageBuf, o.lossyOff); err != nil {
+		o.pinned.RLock()
+		_, err := storage.PageGetItemID(o.pageBuf, o.lossyOff)
+		o.pinned.RUnlock()
+		if err != nil {
 			return nil, nil // past the last line pointer: page exhausted
 		}
 		slot, err := o.fetchOneTuple(block, o.lossyOff, true)

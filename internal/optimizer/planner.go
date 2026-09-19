@@ -2696,6 +2696,26 @@ func wireRowMarkCtidColumns(root Node, locks []LockedRel) int {
 			}
 		}
 	}
+	// tagScan appends a ctid column to a TID-providing leaf scan's schema
+	// when its table is rowmarked (SeqScan, IndexScan, BitmapHeapScan — the
+	// three leaves the executor can surface a heap TID from).
+	tagScan := func(tbl *catalog.Table, schema *Schema) {
+		if li, ok := nextLockIdx[tbl.OID]; ok {
+			idx := len(*schema)
+			*schema = append(*schema, SchemaColumn{Name: fmt.Sprintf("ctid%d", locks[li].RowMarkId), Type: ctidType, SourceTableIdx: -1})
+			tagged = append(tagged, taggedScan{lockIdx: li, schemaIdx: idx})
+			// Advance to the next LockedRel for this OID, if any.
+			li++
+			for li < len(locks) && (locks[li].Table == nil || locks[li].Table.OID != tbl.OID) {
+				li++
+			}
+			if li < len(locks) {
+				nextLockIdx[tbl.OID] = li
+			} else {
+				delete(nextLockIdx, tbl.OID)
+			}
+		}
+	}
 	var walk func(n Node)
 	walk = func(n Node) {
 		if n == nil {
@@ -2703,36 +2723,11 @@ func wireRowMarkCtidColumns(root Node, locks []LockedRel) int {
 		}
 		switch s := n.(type) {
 		case *SeqScan:
-			if li, ok := nextLockIdx[s.Table.OID]; ok {
-				idx := len(s.schema)
-				s.schema = append(s.schema, SchemaColumn{Name: fmt.Sprintf("ctid%d", locks[li].RowMarkId), Type: ctidType, SourceTableIdx: -1})
-				tagged = append(tagged, taggedScan{lockIdx: li, schemaIdx: idx})
-				// Advance to the next LockedRel for this OID, if any.
-				li++
-				for li < len(locks) && (locks[li].Table == nil || locks[li].Table.OID != s.Table.OID) {
-					li++
-				}
-				if li < len(locks) {
-					nextLockIdx[s.Table.OID] = li
-				} else {
-					delete(nextLockIdx, s.Table.OID)
-				}
-			}
+			tagScan(s.Table, &s.schema)
 		case *IndexScan:
-			if li, ok := nextLockIdx[s.Table.OID]; ok {
-				idx := len(s.schema)
-				s.schema = append(s.schema, SchemaColumn{Name: fmt.Sprintf("ctid%d", locks[li].RowMarkId), Type: ctidType, SourceTableIdx: -1})
-				tagged = append(tagged, taggedScan{lockIdx: li, schemaIdx: idx})
-				li++
-				for li < len(locks) && (locks[li].Table == nil || locks[li].Table.OID != s.Table.OID) {
-					li++
-				}
-				if li < len(locks) {
-					nextLockIdx[s.Table.OID] = li
-				} else {
-					delete(nextLockIdx, s.Table.OID)
-				}
-			}
+			tagScan(s.Table, &s.schema)
+		case *BitmapHeapScan:
+			tagScan(s.Table, &s.schema)
 		case *Project:
 			walk(s.Child)
 		case *Filter:

@@ -331,6 +331,8 @@ func findScanLeaf(op Operator) (currentTIDProvider, error) {
 			return v, nil
 		case *indexScanOp:
 			return v, nil
+		case *bitmapHeapScanOp:
+			return v, nil
 		// Pass-through operators — recurse through the single child.
 		case *projectOp:
 			op = v.child
@@ -375,6 +377,9 @@ func findScanLeaf(op Operator) (currentTIDProvider, error) {
 			}
 			if outer != nil {
 				return outer, nil
+			}
+			if bs, ok := v.inner.(*bitmapHeapScanOp); ok {
+				return bs, nil
 			}
 			return nliInnerIndexScan(v.inner), nil
 		// Known non-TID terminals — legitimate, no error.
@@ -446,6 +451,11 @@ func findScanLeafForRel(op Operator, targetRel storage.RelFileNode, ctx *Context
 				return v, nil
 			}
 			return nil, nil
+		case *bitmapHeapScanOp:
+			if v.rel == targetRel || (v.tbl != nil && ctx != nil && ctx.Catalog.RelFileNode(v.tbl) == targetRel) {
+				return v, nil
+			}
+			return nil, nil
 		// Pass-through operators — recurse through the single child.
 		case *projectOp:
 			op = v.child
@@ -494,6 +504,10 @@ func findScanLeafForRel(op Operator, targetRel storage.RelFileNode, ctx *Context
 			if is := nliInnerIndexScan(v.inner); is != nil && is.ctx != nil &&
 				is.ctx.Catalog.RelFileNode(is.plan.Table) == targetRel {
 				return is, nil
+			}
+			if bs, ok := v.inner.(*bitmapHeapScanOp); ok &&
+				(bs.rel == targetRel || (bs.tbl != nil && ctx != nil && ctx.Catalog.RelFileNode(bs.tbl) == targetRel)) {
+				return bs, nil
 			}
 			return nil, nil
 		// Known non-TID terminals — legitimate, no error.
@@ -597,11 +611,12 @@ func markJoinPreserveCTID(op Operator, targetRel storage.RelFileNode) error {
 		}
 		return markJoinPreserveCTID(v.right, targetRel)
 	case *nestedLoopIndexJoinOp:
-		// Inner is always *indexScanOp or *memoizeOp (nliInner), neither
-		// of which can contain a joinOp — recurse outer only.
+		// Inner is an nliInner probe (*indexScanOp, *memoizeOp or
+		// *bitmapHeapScanOp), none of which can contain a joinOp —
+		// recurse outer only.
 		return markJoinPreserveCTID(v.outer, targetRel)
 	// Known terminals — no children, harmless no-op.
-	case *seqScanOp, *indexScanOp, *setOp,
+	case *seqScanOp, *indexScanOp, *bitmapHeapScanOp, *setOp,
 		*valuesOp, *cteScanOp, *workTableScanOp, *materializedCTEScanOp,
 		*indexOnlyScanOp, *scalarFuncScanOp, *fromUnnestOp, *generateSeriesOp,
 		*generateSubscriptsOp, *userSrfScanOp, *rowsFromOp, *fromRegexpMatchesOp,

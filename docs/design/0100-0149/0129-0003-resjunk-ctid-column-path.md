@@ -240,3 +240,44 @@ per locked row on the hot path.
   S3 reduces to verifying the spill shape carries the column and closing the
   root-0038 ledger row.
 - **S2 (deleteWithUsing EPQ):** orthogonal — uses EPQ recheck, not row marking.
+
+## Update 2026-09-19 (M-NIGHTLY AI-20260917-004357-013): BitmapHeapScan leaf joins the column path
+
+`wireRowMarkCtidColumns` tagged only `SeqScan`/`IndexScan`; `BitmapHeapScan`
+was invisible to every rowmark TID route — no resjunk wire, no
+`hasCTID` slot stamp, no `currentTIDProvider`, no walker arm — so
+`LockRows -> <join> -> Bitmap Heap Scan` silently skipped the row lock
+(`join_no_sort` in `TestPort_LockRowsSortOverJoinTakesRowLock`, and the
+`partiallock`/`lockwithvalues` perms of `eval-plan-qual.spec`, the exact
+cases §3.1 names as the column path's acceptance test).
+
+What landed:
+
+- `wireRowMarkCtidColumns`: the per-leaf tag logic was extracted into a
+  `tagScan` closure and a `*BitmapHeapScan` arm added, so a bitmap leaf's
+  schema gains the same trailing `ctid<N>` resjunk column.
+- `bitmapHeapScanOp.emitRow`: appends the `(block,offset)` ctid datum for
+  every schema slot past `len(o.cols)` (same convention as seqScanOp) and
+  stamps `hasCTID`/`ctidBlock`/`ctidOff` on the emitted slot, so the
+  side-channel fallback covers shapes the column path cannot (self-joins
+  skip injection).
+- `bitmapHeapScanOp.currentTID()`: `currentTIDProvider` for the drained-
+  build-side contract — `ok=false` once the pin is released at EOF/Close.
+- `findScanLeaf`/`findScanLeafForRel`/`markJoinPreserveCTID`: bitmap-leaf
+  arms, including as a `nestedLoopIndexJoinOp` inner (`NLI ... -> Bitmap
+  Heap Scan` per `nli_bitmap_probe_test.go`).
+- `BindOuter` width check relaxed to `innerW < len(tbl.Columns)`: a
+  ctid-tagged inner is wider than the table but merged-coord refs still
+  alias table ordinals 1:1.
+- `fetchOneTuple`'s page RLock rescoped per tuple (see the
+  `0128-0001-bitmap-heap-scan` update): without it the lockwithvalues
+  shape — `LockRows -> NL(Values, BitmapHeapScan inner)` — deadlocked
+  `stampLock`'s write lock against the RLock the scan held across yields.
+
+`eval-plan-qual.spec` went from recorded-fail to byte-identical PASS with
+this change; `TestPort_LockRowsSortOverJoinTakesRowLock` passes both
+subtests.
+
+Residual: the walk still does not descend `Append`/`Gather`/
+`GatherMerge`/`SubqueryScan`/`Materialize` wrappers — true of all three
+scan leaf types, pre-existing; recorded in the deferral ledger.
