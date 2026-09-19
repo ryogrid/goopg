@@ -6145,25 +6145,41 @@ cross-layer programme that has never been scoped.
     on private clones (`:5534` TPC-H, `:5533` TPC-DS SF0.25).
     Movement: none (recon — produced the attribution + four child tasks;
     no parity metric moved).
-- [ ] **M0142-0005d — ANALYZE correlation: contiguous non-null positions +
-  clamp to `[-1,1]` (corr>1 on nullable columns).**
+- [x] **M0142-0005d — ANALYZE correlation: contiguous non-null positions +
+  clamp to `[-1,1]` (corr>1 on nullable columns).** DONE 2026-09-19.
   Parent: M0142-0005c. Kind: impl.
   `corrPairs` records `pos` as the raw index into the reservoir `sample`
-  (`internal/executor/operators_analyze.go:1294`), which is SPARSE when the
+  (`internal/executor/operators_analyze.go`), which is SPARSE when the
   column has nulls — the skipped null positions leave gaps in x — while the
   closed-form Pearson (`n·Σxy − Σx²)/(n·Σx² − Σx²`) is only valid when both
   axes are permutations of `0..nonNull−1`. PG assigns `values[values_cnt]
   .tupno = values_cnt` — a contiguous non-null index — at
   `postgres/src/backend/commands/analyze.c:2495`. Observed:
   `catalog_sales.cs_catalog_page_sk` correlation = **1.0019597** on the
-  TPC-DS SF0.25 clone (mathematically impossible). Fix: number correlation
-  positions by a contiguous non-null counter, and clamp the result to
-  `[-1,1]` as belt-and-braces (PG relies on the closed form being exact;
-  goopg keeps the comment citing why). Expected movement: TPC-DS
-  correlation statistics bounded to `[-1,1]` — measure via a pg_stats
-  correlation census on the SF0.25 clone before/after plus
-  `scripts/tpcds-sf025-regression.sh sweep` (plan-shape delta unknown; the
-  fix is correct regardless of movement).
+  TPC-DS SF0.25 clone (mathematically impossible).
+  - Landed: `pos = nonNull − 1` (PG's `tupno` — contiguous non-null index,
+    assigned after the null `continue`); stable-sort tie-break preserved
+    (non-null order is monotone in scan order); result clamped to
+    `[-1,1]` as numerical hygiene (PG relies on the closed form being
+    exact for permutations — documented in-code). Design doc:
+    `docs/design/0100-0149/m0142-0005d-analyze-correlation-contiguous-tupno.md`.
+  - Pre-fix census was far worse than the single reported anomaly: **28**
+    SF0.25 columns stored `correlation > 1.0` (worst
+    `item.i_rec_end_date = 3.6665926`). Post-fix re-ANALYZE on a private
+    `:5533` clone: **0** out of range; `cs_catalog_page_sk`
+    `1.0019597 → 0.9799`, `i_rec_end_date` `3.6666 → 0.3335`.
+  - New regression test `TestAnalyzeCorrelationNullGappedPositions`
+    (asc/desc null-interleaved → ±1; null-gapped mixed → −0.1 hand-derived;
+    old sparse numbering yields 5.0/1.8 on the same shapes).
+  - Gates: `go test ./internal/executor/` PASS; units precommit PASS;
+    tpch-spotcheck Q12=2/Q13=34 PASS; SF0.25 sweep PASS=96 MISMATCH=0,
+    plan shapes 99/99 identical (gate cluster still carries pre-fix stored
+    stats until its next ANALYZE — no shape movement expected).
+  - Movement: pg_stats correlation census out-of-range count **28 → 0** on
+    SF0.25. No plan-parity category movement expected — stored stats on the
+    benchmark clusters update only on their next ANALYZE/reload; this is a
+    correctness fix that makes nullable-column correlations honest inputs
+    to `index_pages_fetched`, not a tuning event.
 - [ ] **M0142-0005e — stamp the real path cost on the fused-NLI inner
   `IndexScan` (EXPLAIN prints `DeriveLegacyDisplayCost`).**
   Parent: M0142-0005c. Kind: impl.

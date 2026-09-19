@@ -609,6 +609,68 @@ func TestAnalyzeCorrelationTieBreakMatchesPGTupnoOrder(t *testing.T) {
 	}
 }
 
+// TestAnalyzeCorrelationNullGappedPositions pins M0142-0005d: PG assigns
+// `tupno = values_cnt` — a contiguous position among NON-NULL sample rows —
+// only after the null `continue` (analyze.c:2495). goopg previously recorded
+// the raw sample index, which is SPARSE when nulls are present; the closed
+// form is valid only when the physical axis is a permutation of 0..n-1, so
+// the gaps broke the sum(x)/sum(x²) identities and could return |corr| > 1 —
+// observed live as correlation=1.0019597 on TPC-DS
+// `catalog_sales.cs_catalog_page_sk` (M0142-0005c census finding).
+//
+//   - ascending non-nulls alternating with nulls → corr == 1 (the sparse
+//     positions [1,3,5,7] would have yielded 5.0 under the old numbering);
+//   - the same shape descending → corr == -1;
+//   - a null-gapped duplicate/mixed sample → hand-derived value from the
+//     contiguous positions, and |corr| ≤ 1 in every case.
+func TestAnalyzeCorrelationNullGappedPositions(t *testing.T) {
+	int4Type := catalog.Type{Name: "int4"}
+
+	// Ascending non-nulls [1,2,3,4] separated by nulls: contiguous non-null
+	// positions [0,1,2,3] are already in sorted order → corr == 1.
+	asc := []Row{
+		{NullDatum}, {NewIntDatum(1)},
+		{NullDatum}, {NewIntDatum(2)},
+		{NullDatum}, {NewIntDatum(3)},
+		{NullDatum}, {NewIntDatum(4)},
+	}
+	stats := computeColumnStats(asc, 0, 100, 8, int4Type, nil)
+	if stats.Correlation != 1 {
+		t.Errorf("ascending null-gapped Correlation=%v want 1", stats.Correlation)
+	}
+
+	// Descending non-nulls [4,3,2,1] separated by nulls → corr == -1.
+	desc := []Row{
+		{NullDatum}, {NewIntDatum(4)},
+		{NullDatum}, {NewIntDatum(3)},
+		{NullDatum}, {NewIntDatum(2)},
+		{NullDatum}, {NewIntDatum(1)},
+	}
+	stats = computeColumnStats(desc, 0, 100, 8, int4Type, nil)
+	if stats.Correlation != -1 {
+		t.Errorf("descending null-gapped Correlation=%v want -1", stats.Correlation)
+	}
+
+	// Mixed: non-nulls [5,1,3,2,4] at contiguous positions [0,1,2,3,4];
+	// sorted order maps sortedPos → pos as [1,3,2,4,0], giving
+	// corr = (5*19 - 100) / 50 = -0.1. (Under the old raw positions
+	// [0,2,4,6,8] the same formula yields 1.8 — the bug.)
+	mixed := []Row{
+		{NewIntDatum(5)}, {NullDatum},
+		{NewIntDatum(1)}, {NullDatum},
+		{NewIntDatum(3)}, {NullDatum},
+		{NewIntDatum(2)}, {NullDatum},
+		{NewIntDatum(4)},
+	}
+	stats = computeColumnStats(mixed, 0, 100, 9, int4Type, nil)
+	if math.Abs(stats.Correlation-(-0.1)) > 1e-9 {
+		t.Errorf("mixed null-gapped Correlation=%v want -0.1", stats.Correlation)
+	}
+	if stats.Correlation < -1 || stats.Correlation > 1 {
+		t.Errorf("Correlation=%v outside [-1,1]", stats.Correlation)
+	}
+}
+
 // TestAnalyzeReservoirSeedCausesCorrelationVarianceOnPeriodicFK is M0138-0009's
 // sampling-variance confirmation. `TestPort_M0138CorrelationSyntheticGoopgVsPG`
 // (internal/testport) proved goopg and PG compute BYTE-IDENTICAL correlation

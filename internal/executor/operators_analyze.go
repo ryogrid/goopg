@@ -1264,13 +1264,23 @@ func computeColumnStats(sample []Row, colIdx int, statsTarget int, totalRows int
 	// logical (sorted) column order. We collect (value, original_position)
 	// pairs here during the first pass so the correlation can be computed
 	// after sorting by value. Non-orderable kinds skip this.
+	//
+	// `pos` is the position among NON-NULL values only — PG's `tupno`, which
+	// is assigned `values[values_cnt].tupno = values_cnt` (analyze.c:2495)
+	// AFTER the null `continue`, so it counts 0,1,…,nonnull−1 contiguously.
+	// The closed form below is only valid when the physical axis is a
+	// permutation of 0..n−1; the raw sample index is SPARSE when nulls are
+	// present (gaps where nulls were skipped), which silently breaks the
+	// sum(x)=sum(x²) assumptions and can return |corr| > 1 — observed live
+	// as correlation=1.0019597 on TPC-DS `catalog_sales.cs_catalog_page_sk`
+	// (M0142-0005c).
 	type valuePosition struct {
 		d   Datum
 		pos int
 	}
 	var corrPairs []valuePosition
 
-	for pos, row := range sample {
+	for _, row := range sample {
 		if colIdx >= len(row) {
 			// Defensive: mismatched schema shouldn't happen given
 			// DecodeRow honours tbl.Columns, but stay sane.
@@ -1291,7 +1301,9 @@ func computeColumnStats(sample []Row, colIdx int, statsTarget int, totalRows int
 		}
 
 		// Collect for correlation: track original position alongside value.
-		corrPairs = append(corrPairs, valuePosition{d: d, pos: pos})
+		// `nonNull-1` is the contiguous non-null index (PG's `tupno`), not
+		// the raw sample offset — see the comment above.
+		corrPairs = append(corrPairs, valuePosition{d: d, pos: nonNull - 1})
 	}
 
 	stats.NullFrac = float64(nullCount) / float64(len(sample))
@@ -1327,8 +1339,9 @@ func computeColumnStats(sample []Row, colIdx int, statsTarget int, totalRows int
 	}
 
 	// --- correlation (STATISTIC_KIND_CORRELATION) ---
-	// Pearson correlation between physical row order (original sample
-	// position) and logical column order (position after sorting by value).
+	// Pearson correlation between physical row order (original NON-NULL
+	// sample position — PG's `tupno`) and logical column order (position
+	// after sorting by value).
 	// PG's compute_scalar_stats (analyze.c:2853-2890): since both x and y
 	// sets are {0,1,...,n-1}, sum(x)=sum(y)=n*(n-1)/2 and
 	// sum(x^2)=sum(y^2)=n*(n-1)*(2n-1)/6, so the coefficient reduces to
@@ -1367,7 +1380,14 @@ func computeColumnStats(sample []Row, colIdx int, statsTarget int, totalRows int
 			corrX2Sum := (n - 1.0) * n * (2.0*n - 1.0) / 6.0
 			denom := n*corrX2Sum - corrXSum*corrXSum
 			if denom != 0 {
-				stats.Correlation = (n*corrXYSum - corrXSum*corrXSum) / denom
+				// PG stores the raw quotient — for genuine permutations it
+				// is exact — and does not clamp (analyze.c:2881-2885). The
+				// clamp below guards only float noise on the closed form;
+				// a result materially outside [-1,1] would mean the
+				// permutation assumption was violated, which is the bug
+				// M0142-0005d removes, not a state to propagate.
+				corr := (n*corrXYSum - corrXSum*corrXSum) / denom
+				stats.Correlation = math.Min(1, math.Max(-1, corr))
 			}
 		}
 	}
