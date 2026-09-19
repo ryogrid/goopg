@@ -4743,7 +4743,7 @@ spill route is net-negative.
     687463 — both engines essentially exact. Scorer caveat folded into
     S2b-15's scope note below.
     Movement: none
-  - [ ] **M0141-S2b-15** — impl (small): gather row-stamp divergence found
+  - [x] **M0141-S2b-15** — impl (small): gather row-stamp divergence found
     by S2b-13's C19f trace. `makeGatherPath`/`makeGatherMergePath`
     (`gatherpaths.go:273`) always stamp `Rows = computeGatherRows(sub)`
     (`sub.Rows × parallel divisor`). PG's `cost_gather`/`cost_gather_merge`
@@ -4804,6 +4804,43 @@ spill route is net-negative.
       SKIP-BLOCKED, so the staged commit is unblocked. Next: re-run
       both on the staged tree → triage the 10 ea NEW findings →
       repin if churn → commit.
+    - **DONE 2026-09-20 (Loop \#28) — residual bookkeeping closed.** The
+      code had already landed inside `caf858301` (`overrideRows` call-site
+      split); what remained was the promised ea-ratchet triage + repin.
+      Fresh `make ea-ratchet` on HEAD `07ab54281` (new capture, 99
+      queries): **8 NEW / 30 FIXED** — FIXED list is the baseline's stale
+      keys. Triage (S2b-14 method — relset re-verified against PG
+      `:65438/tpcds025` and `bench/tpcds/plans-pg/`):
+      - 5 `pg_est=None` findings are **churn/shared-PG-error**, none
+        S2b-15-caused: Q85×3 is the recorded key churn verbatim
+        (`reason` drops out of the relset key — 4 old `+reason+` keys
+        went FIXED, new keys without it went NEW); Q40 Gather
+        `catalog_sales+date_dim+item+warehouse` goopg **17** vs PG's own
+        Gather **19** on the identical relset (actual 444 — shared
+        ~25x formula under-estimate; `pg_est=None` is a scorer
+        key-matching miss, PG does plan a Gather there); Q71 Gather
+        `catalog_sales+date_dim+web_sales` goopg **229** vs PG's
+        per-branch sum **~181** on the same UNION-branch join
+        (actual 18205 — shared ~80x under-estimate).
+      - 3 `pg_est` findings are **post-S2b-15 shape-admission
+        exposures, filed as M0141-S2b-17**: Q62/Q99 `Finalize
+        HashAggregate`/`Partial`/`Gather` all stamp `rows=1` — a
+        PlanCost display-stamp gap in the C-19g post-pass
+        (`splitAggregate`'s `final := *a` copies an unstamped spec;
+        `NewGather` never sets PlanCost — `partialaggupper.go`'s path
+        model carries `finalGroups` correctly; PG's `Finalize
+        GroupAggregate` shows 120/72). Shapes admitted by
+        `9a2b9d47b` (NLI+Memoize Gather-driver — Q62/Q99's inner is
+        exactly NL+Memoize-over-pkey-scan) after the staged
+        measurement. Q94 `Hash Semi Join` goopg **90** vs PG **1**
+        (actual 4) — genuine semi-join selectivity divergence on the
+        new `Gather→NL→Parallel HJ` inner.
+      - Baseline re-pinned 76→54 (`make ea-ratchet-repin`; re-score
+        PASS 54/54, zero NEW). `tpch-spotcheck`/`tpch-acceptance-arm`
+        ran clean at Loop \#27's commit on this tree.
+      Movement: none added this loop — the impl's movement was already
+      recorded (CATEGORIES-EXCL-MATCH agg 44→43, sort 69→67, qual
+      23→22 at equal match floor).
   - [ ] **M0141-S2b-16** — impl (small): partial-path `rows=` display
     convention. S2b-15 fixed the path-model Gather stamp
     (`rel->rows`), but the S2b-14-observed divergence — goopg EXPLAIN
@@ -4823,6 +4860,29 @@ spill route is net-negative.
     ea-ratchet (rows= keys will churn again).
     Kind: impl
     Parent: M0141-S2b-15
+  - [ ] **M0141-S2b-17** — recon+impl (small): the two divergences
+    S2b-15's repin triage isolated on the post-`9a2b9d47b`
+    parallel shapes.
+    Kind: recon
+    Parent: M0141-S2b-15. Filed 2026-09-20 (Loop \#28). Two arms:
+    (a) **split-agg PlanCost stamp gap** — `Finalize
+    HashAggregate`/`Partial HashAggregate`/their `Gather` all render
+    `rows=1` (TPC-DS Q62/Q99) while `PathFinalizeAgg.Rows` =
+    `finalGroups` is correct (`partialaggupper.go:571`); the C-19g
+    post-pass `splitAggregate` (`parallel.go:1399`, `final := *a`)
+    and `NewGather` (`plan.go:2811`) never propagate PlanCost onto
+    the built nodes. PG stamps the group estimate (`Finalize
+    GroupAggregate` 120 on Q62, 72 on Q99). Sibling of S2b-16's
+    `rebuildWithGather` display gap — check whether the fix is
+    shared or a second site; may fold into S2b-16's landing.
+    (b) **semi-join selectivity divergence** — Q94 `Hash Semi Join`
+    goopg est **90** vs PG **1** (actual 4, qerr 22.5 vs 4.0) on
+    `customer_address+date_dim+web_sales+web_site` over the newly
+    admitted `Gather→NL→Parallel Hash Join` inner. Determine whether
+    the semi-join clause selectivity or the inner input estimate
+    moved; compare `cost_semijoin`/semi-join clause selectivity
+    against the oracle before touching anything. Gates: ea-ratchet
+    re-score (findings go FIXED) + units + spotcheck + SF0.25 sweep.
   - [x] **M0141-S2b-7** — filed 2026-09-17 by M0141-S7's corpus measurement
     (design doc's "Update 2026-09-17h"). `electOrderedGrouping`
     (`upperorderedgrouping.go:236`) calls `addOrderedPaths` directly, once

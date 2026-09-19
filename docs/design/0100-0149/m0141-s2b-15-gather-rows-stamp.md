@@ -2,11 +2,12 @@
 
 `Kind: impl` · `Parent: M0141-S2b-13`
 
-Status: blocked on gates — code complete and unit-green, staged uncommitted;
-commit requires `tpch-spotcheck` + `tpch-acceptance-arm`, both SKIP-BLOCKED
-while `bench/tpch/runtime_goopg/data.HOLD` stands (unclean-shutdown evidence
-hold, owner-only recovery via `scripts/tpch-ref-recover.sh`). Task marked `[!]`
-with an escalation block per `.ralph/gate-exceptions.md`.
+Status: landed. The `overrideRows` call-site split committed inside
+`caf858301` (2026-09-19, once the owner released the `data.HOLD`); the
+deferred ea-ratchet triage + repin closed 2026-09-20 (Loop #28) — 8 NEW
+classified (5 relset-key churn / shared PG-formula error verified against
+`:65438/tpcds025`, 3 post-`9a2b9d47b` shape-admission exposures filed as
+M0141-S2b-17), baseline re-pinned 76→54, re-score PASS.
 
 ## Task
 
