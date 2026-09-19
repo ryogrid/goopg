@@ -1203,7 +1203,7 @@ heuristic stays live.)
   reproduces the same undefined-symbol error on a clean, non-racing checkout.
 
 ### Nightly run 20260920-005626 (sha `2b7e970534ea`, 18 items) — filed 2026-09-20
-- [ ] **testport/TestPort_IsolationTuplelockUpgradeNoDeadlock
+- [x] **testport/TestPort_IsolationTuplelockUpgradeNoDeadlock
   (AI-20260920-005626-004)** — FAILed (94.52s) with a schedule diff in the
   `s1_share s2_update s3_update …_rollback` permutation (expected `(1 row)`
   vs got `""` at L163, then a `<waiting ...>` mismatch at L165).
@@ -1214,6 +1214,12 @@ heuristic stays live.)
   failure, so it gets its own task. Failure observed at sha `2b7e9705`,
   which predates `9fb05621f` (M0143-0010 heap-update-chain probes) — needs
   re-verification at HEAD before diagnosing.
+  - **CLOSED Loop \#24 (stale / resolved by `9fb05621f`)** — re-verified at
+    HEAD `894774eb6`: PASSes 4× fresh (`-count=1`, ~12.6s each), no flake.
+    The failing permutation is update-heavy; `9fb05621f`'s
+    heap-update-chain probing on constraint/index probes is the plausible
+    causal fix in the `2b7e9705..9fb05621f` window. No code change needed;
+    re-open if a future nightly reproduces on a post-0010 sha.
 - [ ] **testport/TestPort_P0E4CatalogXmaxClientKill +
   TestPort_P0E4CatalogXmaxServerImmediateStop (AI-20260920-005626-007,
   AI-20260920-005626-008)** — both FAILed with a server-wedge signature, not
