@@ -65,6 +65,17 @@ type insertPosTracker struct {
 	// false when the gap was only zero-filled (too small for a well-formed
 	// record — M0131-S30.6). Only a real pad record advances `prev`.
 	onCrossSegment func(start, boundary, prev uint64) (padded bool)
+	// windowEndFn, when non-nil, returns the exclusive upper LSN bound a
+	// reservation's emitted bytes must fit within — the bytes-side ring's
+	// writeReserved window end (walBuf.head + cap). reserveEmittedAndPublish
+	// consults it INSIDE posMu before committing curr, so a reservation can
+	// never outrun the physical ring window regardless of how the callers'
+	// capacity-claim accounting transiently reads (a publish capped by a
+	// slower active stripe can leave curr - tail > reservedBytes — the
+	// TestPort_IsolationSuite writeReserved cascade, 2026-09-19). head is
+	// monotonic, so a reservation admitted under the check can never fail
+	// writeReserved's range check at write time. Nil = unbounded (tests).
+	windowEndFn func() int64
 }
 
 // newInsertPosTracker initialises a tracker. startCurr is the LSN

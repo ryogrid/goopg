@@ -157,9 +157,22 @@ func newStripeWriterCore(segSize, startCurr, startPrev uint64, walBuf *walBuffer
 		}
 		return padded
 	}
+	posTracker := newInsertPosTracker(startCurr, startPrev, segSize, onCross)
+	if walBuf != nil {
+		// Hard ring-window bound checked inside posMu at reservation time:
+		// a reservation whose emitted bytes would exceed [head, head+cap)
+		// is refused before curr commits, so writeReserved can never
+		// overshoot the window even when the callers' capacity-claim
+		// accounting transiently under-counts (publish capped by a slower
+		// active stripe leaves curr - tail > reservedBytes). head is
+		// monotonic, so admission under the check stays valid at write time.
+		posTracker.windowEndFn = func() int64 {
+			return walBuf.head.Load() + walBuf.cap
+		}
+	}
 	return &stripeWriterCore{
 		locks:      &appendLockSet{},
-		posTracker: newInsertPosTracker(startCurr, startPrev, segSize, onCross),
+		posTracker: posTracker,
 		inserting:  newInsertionTracker(),
 		publisher:  newTailPublisher(),
 		walBuf:     walBuf,

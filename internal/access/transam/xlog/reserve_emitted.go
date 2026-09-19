@@ -116,7 +116,7 @@ const xlogMinimumRecordSize = SizeOfXLogRecord // 24 bytes
 
 func (t *insertPosTracker) reserveEmittedAndPublish(
 	recordLen int, stripe int, tracker *insertionTracker,
-) (start, prev uint64, total, leading int) {
+) (start, prev uint64, total, leading int, ok bool) {
 	if recordLen <= 0 {
 		panic("wal: insertPosTracker.reserveEmittedAndPublish: recordLen must be > 0")
 	}
@@ -140,6 +140,17 @@ func (t *insertPosTracker) reserveEmittedAndPublish(
 	}
 
 	if startCandidate+uint64(total) > boundary {
+		// Re-predict at the boundary first: the caller's ring-window check
+		// (windowEndFn) must cover BOTH the gap the pad will fill AND the
+		// re-landed record, and it must run before the pad is emitted so a
+		// refused reservation leaves nothing behind.
+		total, leading = predictEmittedSize(recordLen, int64(boundary), int64(segSize))
+		if uint64(total) > segSize {
+			panic("wal: insertPosTracker.reserveEmittedAndPublish: emitted size exceeds segSize at boundary")
+		}
+		if t.windowEndFn != nil && int64(boundary)+int64(total) > t.windowEndFn() {
+			return 0, 0, 0, 0, false // ring window overflow: caller drains and retries
+		}
 		gapLen := boundary - startCandidate
 		gapPrev := t.prev
 		// Cross-segment slow path: hand the gap [startCandidate, boundary) to
@@ -172,10 +183,8 @@ func (t *insertPosTracker) reserveEmittedAndPublish(
 			t.prev = startCandidate
 		}
 		startCandidate = boundary
-		total, leading = predictEmittedSize(recordLen, int64(startCandidate), int64(segSize))
-		if uint64(total) > segSize {
-			panic("wal: insertPosTracker.reserveEmittedAndPublish: emitted size exceeds segSize at boundary")
-		}
+	} else if t.windowEndFn != nil && int64(startCandidate)+int64(total) > t.windowEndFn() {
+		return 0, 0, 0, 0, false // ring window overflow: caller drains and retries
 	}
 
 	start = startCandidate
@@ -185,5 +194,5 @@ func (t *insertPosTracker) reserveEmittedAndPublish(
 
 	tracker.setInsertingAt(stripe, int64(start))
 
-	return start, prev, total, leading
+	return start, prev, total, leading, true
 }

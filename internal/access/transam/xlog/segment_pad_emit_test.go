@@ -232,15 +232,20 @@ func TestEmitSegmentPadPropagatesWalBufOutOfWindow(t *testing.T) {
 	}
 }
 
-// TestEmitSegmentPadPropagatesMemRingOutOfWindow pins the symmetric
-// case for the MemRing.
-func TestEmitSegmentPadPropagatesMemRingOutOfWindow(t *testing.T) {
+// TestEmitSegmentPadSkipsMemRingOutOfWindow pins that a MemRing
+// mirror-write failure is NOT propagated: the memRing is a walsender
+// read cache whose misses fall back to the segment file, and a peer
+// stripe's AdvanceWindow can legitimately slide head past gapStart —
+// surfacing errMemRingReservedOutOfRange to the onCrossSegment closure
+// turned a harmless cache miss into a backend panic and an uncounted
+// LSN hole (TestPort_IsolationSuite writeReserved cascade, 2026-09-19).
+func TestEmitSegmentPadSkipsMemRingOutOfWindow(t *testing.T) {
 	t.Parallel()
 	memRing := NewMemRing(64)
 	memRing.PublishUpTo(2000) // advances head + tail past the gap.
 	err := emitSegmentPadErr(nil, memRing, 100, 132, 0, padLayout{})
-	if !errors.Is(err, errMemRingReservedOutOfRange) {
-		t.Fatalf("err=%v, want errMemRingReservedOutOfRange", err)
+	if err != nil {
+		t.Fatalf("err=%v, want nil (memRing cache miss must be skipped)", err)
 	}
 }
 

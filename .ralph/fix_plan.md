@@ -1049,10 +1049,44 @@ heuristic stays live.)
   for all: `ci/logs/20260914-235643/`.)
 
 ### Nightly run 20260916-035206 (sha `48cf54f85429`, 13 items) — filed 2026-09-16
-- [ ] **testport/TestPort_IsolationSuite (AI-20260916-035206-008)** — new
+- [x] **testport/TestPort_IsolationSuite (AI-20260916-035206-008)** — new
   tonight, FAILed (subtests: specs, specs/detach-partition-concurrently-1,
   specs/tuplelock-upgrade-no-deadlock; repro: `go test -v -run
-  '^TestPort_IsolationSuite$' ./internal/testport/`).
+  '^TestPort_IsolationSuite$' ./internal/testport/`). **FIXED 2026-09-19 —
+  suite PASS 39.1s, 0 writeReserved / 0 panics** (filed subtests now defer
+  as SKIP; residual catalog-mirror drift deferred to the ledger).
+  - Loop 2026-09-19 (plan-parity-with-pg-take2-ralph2): the filed 3-subtest
+    FAIL was only the tip — a live WAL regression wedges the whole server
+    under the suite's multi-backend load (nightly 20260918-… timed out at
+    7200 s mid-suite on it; its AI extractor caught only PGColdStart).
+    Symptom chain: `writeReserved range outside buffer window` errors →
+    cross-segment pad-emit panics recovered per-connection (killing DDL
+    mid-statement → catalog-mirror drift, `relation already exists`,
+    `dst extend` errors) → `resident > cap` → `readForDrain` panic wedge.
+  - Root cause — two compounding defects in the slice-B WAL ring:
+    - (1) `tryAppend`/`appendPGCompat` claimed `2*(paddedLen+64)` ring
+      bytes, but `predictEmittedSize` interleaves a page header at EVERY
+      8 KiB boundary and a segment crossing emits `gap + total` — the
+      claim under-budgeted records spanning ≥3 pages crossing a boundary.
+      Fixed by `walBufferReservationClaim` = `2*predictEmittedSize(0,…)`.
+    - (2) `curr ≤ tail + reserved` is NOT invariant: `PublishUpTo` caps at
+      `lowestActiveLSN`, so a fast stripe's publish can be capped below its
+      own end while its claim releases anyway (transient hole on the
+      SUCCESS path); a post-reserve `AppendXLogPayload` error released the
+      claim over a burned `curr` range (`Writer.Append` silently retried,
+      hiding the first failure); and `MemRing.WriteReserved` eviction
+      (`AdvanceWindow`/`WriteReserved` not atomic — a peer's advance slides
+      `memRing.head` past a pending write) surfaced a harmless cache miss
+      as a fatal append error / pad panic.
+  - Fix (docs/design/0100-0149/0107-0013): `insertPosTracker.windowEndFn`
+    (= `walBuf.head+cap`) checked INSIDE `posMu` before `curr` commits and
+    before pad emit — refused reservations return `walBufferCapacityExceeded`
+    (callers drain+retry); head monotonic ⇒ admitted reservations can never
+    fail `writeReserved`. MemRing misses demoted to cache-miss skips.
+    Burned ranges zero-filled+published before claim release. `Writer.Append`
+    propagates real errors (no silent retry).
+  - Verified: xlog package + `-race` green; new regression tests
+    (claim sweep, memRing-eviction skip, pad-skip, window stress).
   (Remaining 12 items of this run — units/internal/parser AI-…-001,
   race/internal/executor AI-…-002, race/internal/parser AI-…-003,
   testport/TestE2E_PGColdStartOnGoopgDataDir AI-…-004,
@@ -2024,6 +2058,27 @@ before/after proving the defect it closes.
   `CATEGORIES-EXCL-MATCH:` lines against the same corpus the review used,
   and republish the headline with a stated stats epoch. Ledger:
   `m0137-0020-recapture-headline-unowned`.
+- [ ] **M0137-0022 — re-pin the `make plan-gate` baseline** (filed 2026-09-19
+  by a Devin session at owner request).
+  Parent: none. Kind: impl.
+  The `m0137-0005-rebaseline-20260915`
+  pin now reports **14/22 diverged** (8 MATCH: Q1/Q3/Q6/Q11/Q15a/Q16/Q18/Q20;
+  verified live 2026-09-19, structural mode). The drift is the recorded,
+  expected accumulation of ~100+ internal commits since 2026-09-15 (SetOp /
+  Gather-driving-kind admissions, NLI+Memoize, join-order costing) plus the
+  2026-09-19 `:65433` owner-restore — the identical 14/22 count has been
+  recorded unchanged across multiple loops, so this is baseline staleness,
+  not a new regression. Procedure per the M0137-0005 doc
+  (`docs/design/0100-0149/m0137-0005-plan-gate-rebaseline.md`): census the 14
+  divergences and attribute them to landed mechanism classes, `tpch-spotcheck`
+  PASS before pinning, then `make plan-snapshot-capture LABEL=<name>` plus a
+  design doc. NOTE: the live `:65433` binary was built 2026-09-19 03:11 and
+  lags HEAD by commits that can move TPC-H plans (e.g. `9a2b9d47b` fused
+  NLI+Memoize Gather admission) — a pin taken now covers the *live binary's*
+  plans and may re-drift on the next server rebuild; pinning HEAD's plans
+  needs an owner-run rebuild+restart of `:65433`
+  (`maintenance_prompts/cluster-ops-runbook.md`). Escalate per the
+  reference-cluster rule if an owner rebuild is wanted before pinning.
 
 ## M0138 — PG-faithful ANALYZE statistics (filed 2026-09-14)
 

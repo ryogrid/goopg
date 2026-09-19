@@ -2,6 +2,7 @@ package xlog
 
 import (
 	"errors"
+	"fmt"
 	"sync/atomic"
 )
 
@@ -137,6 +138,40 @@ func (b *walBuffer) releaseReservation(n int64) {
 	b.reservedBytes.Add(-n)
 }
 
+// walBufferReservationClaim returns the ring-space claim an appender
+// must win from tryReserve before reserving a PG-compat record of
+// `recordLen` encoded bytes. The claim must cover the WORST-CASE LSN
+// footprint of the reservation, which is not the record's emitted size
+// alone: when the reservation would straddle a segment boundary,
+// reserveEmittedAndPublish re-lands the record at the boundary after
+// emitting an XLOG_NOOP pad over the gap [curr, boundary), so the
+// footprint is gap + total < 2·total. `total` is itself bounded by
+// predictEmittedSize evaluated at a segment-aligned start — the
+// position with the maximal header schedule (a 40-byte long PHD up
+// front, then a 24-byte short PHD at every 8 KiB page boundary the
+// emission crosses).
+//
+// The earlier claim 2*(recordLen+64) silently assumed
+// total ≤ recordLen+64 — true only for records spanning ≤2 pages.
+// For a record spanning ≥3 page boundaries the emitted headers exceed
+// 64 bytes, and a crossing could then reserve LSN space the claim
+// never covered: curr ran ahead of head+cap, writeReserved returned
+// errWALBufferReservedOutOfRange, the orphaned-but-published range let
+// PublishUpTo push tail past head+cap, and the next drain's
+// readForDrain panicked on resident > cap — wedging the server so
+// every subsequent WAL append panicked (TestPort_IsolationSuite
+// backend-panic storm, 2026-09-19).
+func walBufferReservationClaim(recordLen int, segSize int64) int {
+	total, _ := predictEmittedSize(recordLen, 0, segSize)
+	if total <= 0 {
+		// Degenerate inputs (recordLen ≤ 0 or segSize ≤ 0 cannot reach
+		// here in production — both are validated upstream — but the
+		// guard keeps a nil-config unit fixture from claiming zero).
+		total = recordLen + 64
+	}
+	return 2 * total
+}
+
 // append copies `record` into the buffer at position `tail` and
 // advances tail. The caller must guarantee free() ≥ len(record)
 // (i.e. drained any overflow first). Wraparound is handled
@@ -236,10 +271,13 @@ var errWALBufferNil = errors.New("wal: writeReserved on nil buffer")
 
 // errWALBufferReservedOutOfRange is returned by writeReserved when
 // the requested LSN range [lsn, lsn+len(record)) falls outside the
-// ring's currently-mapped LSN window [base, base+cap). The caller's
-// LSN reserve (insert_pos.go's insertPosTracker.reserve) is supposed
-// to keep reservations inside the window — this error catches a
-// contract violation rather than handling overflow gracefully.
+// ring's currently-mapped LSN window [head, head+cap) — the drain
+// watermark, not base, bounds the writable range (base can lag head
+// by up to cap between cap-aligned slides). The caller's LSN
+// reservation claim (walBufferReservationClaim, won via tryReserve)
+// is supposed to keep reservations inside the window — this error
+// catches a contract violation rather than handling overflow
+// gracefully.
 var errWALBufferReservedOutOfRange = errors.New("wal: writeReserved range outside buffer window")
 
 // writeReserved copies `record` into the ring at the offset
@@ -294,7 +332,9 @@ func (b *walBuffer) writeReserved(lsn int64, record []byte) error {
 	// (those ring slots have been freed by advanceHead).
 	head := b.head.Load()
 	if lsn < head || lsn+n > head+b.cap {
-		return errWALBufferReservedOutOfRange
+		return fmt.Errorf("%w (lsn=%d n=%d head=%d tail=%d base=%d cap=%d reserved=%d side=%s)",
+			errWALBufferReservedOutOfRange, lsn, n, head, b.tail.Load(), b.base.Load(), b.cap, b.reservedBytes.Load(),
+			map[bool]string{true: "below-head", false: "over-window"}[lsn < head])
 	}
 	// Ring offset still uses base: the physical layout is (lsn - base) % cap.
 	// lsn >= head >= base (head is always in [base, base+cap] by advanceHead).

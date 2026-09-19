@@ -885,12 +885,17 @@ func (w *Writer) Append(payload []byte) (uint64, uint64, error) {
 	// appendMu, sending an opAppend to the state loop only when
 	// the buffer overflows.
 	if st := w.stateRef; st != nil && st.walBuf != nil {
-		if start, end, ok, err := st.tryAppend(payload); ok {
-			if err == nil {
-				w.walRecords.Add(1)
-				w.walBytes.Add(int64(len(payload)))
-			}
-			return start, end, err
+		start, end, ok, err := st.tryAppend(payload)
+		if err != nil {
+			// A burned-reservation error is not a retryable overflow —
+			// falling through to the slow path would re-append the record at
+			// a new LSN and hide the failure from the caller entirely.
+			return 0, 0, err
+		}
+		if ok {
+			w.walRecords.Add(1)
+			w.walBytes.Add(int64(len(payload)))
+			return start, end, nil
 		}
 	}
 
@@ -1691,20 +1696,17 @@ func (s *state) appendPGCompat(payload []byte) (uint64, uint64, error) {
 	s.writeMu.lock()
 	defer s.writeMu.release()
 
-	// Conservative emitted size: paddedLen + max page-header overhead
-	// (40-byte long PHD at a segment boundary + 24-byte contrecord header).
+	// Worst-case WAL-buffer footprint of this append: pad + record for a
+	// segment-boundary crossing is bounded by 2× the maximal emitted size
+	// (gap < total; total ≤ predictEmittedSize at a segment-aligned start).
+	// The earlier 2*(paddedLen+64) bound assumed a single page header and
+	// under-claimed for records spanning ≥3 pages — see
+	// walBufferReservationClaim. Path B below goes through
+	// AppendXLogPayload too, so it must keep that headroom — otherwise a
+	// crossing while the buffer is near-full returns
+	// errWALBufferReservedOutOfRange. See tryAppend.
 	_, paddedLen := predictXLogRecordLen(payload)
-	conservativeSize := paddedLen + 64
-	// Worst-case WAL-buffer footprint including a possible segment-boundary
-	// pad. A record whose stripe reservation straddles a segment boundary is
-	// re-landed at the boundary by reserveEmittedAndPublish, which first emits
-	// an XLOG_NOOP pad over the gap via emitSegmentPad → writeReserved; pad +
-	// record together occupy strictly less than 2*conservativeSize ring bytes
-	// (the gap is < the record's emitted size by the crossing predicate). The
-	// Path B buffered append below also goes through AppendXLogPayload, so it
-	// must keep that much headroom too — otherwise a crossing while the buffer
-	// is near-full returns errWALBufferReservedOutOfRange. See tryAppend.
-	reserveSize := 2 * conservativeSize
+	reserveSize := walBufferReservationClaim(paddedLen, s.cfg.SegmentSize)
 
 	// Path A: walBuf disabled, record physically won't fit in ring, OR the
 	// buffer needs draining. The drain case falls here (rather than Path B)
@@ -1864,6 +1866,10 @@ func (s *state) appendPGCompat(payload []byte) (uint64, uint64, error) {
 	// stay within cap proceed. Loop because a lost CAS or a concurrent
 	// fast-path reservation can require another drain pass before there is
 	// room to claim.
+	procNum := s.stripeNum()
+	var start0 uint64
+	var total, leading int
+	var err error
 	for {
 		reserved := s.walBuf.reservedBytes.Load()
 		need := int64(reserveSize) - (s.walBuf.free() - reserved)
@@ -1875,21 +1881,47 @@ func (s *state) appendPGCompat(payload []byte) (uint64, uint64, error) {
 				return 0, 0, err
 			}
 		}
-		if rerr := s.walBuf.tryReserve(int64(reserveSize)); rerr == nil {
-			break
+		if rerr := s.walBuf.tryReserve(int64(reserveSize)); rerr != nil {
+			// Lost the race to a concurrent reservation (fast-path tryAppend
+			// or another retry of this same loop elsewhere is impossible —
+			// this is the single state-loop goroutine — but tryAppend callers
+			// can claim the space we just drained before our tryReserve
+			// runs). Yield so a racing holder's imminent releaseReservation
+			// can make progress instead of busy-spinning when there is
+			// nothing left to drain.
+			runtime.Gosched()
+			continue
 		}
-		// Lost the race to a concurrent reservation (fast-path tryAppend or
-		// another retry of this same loop elsewhere is impossible — this is
-		// the single state-loop goroutine — but tryAppend callers can claim
-		// the space we just drained before our tryReserve runs). Yield so a
-		// racing holder's imminent releaseReservation can make progress
-		// instead of busy-spinning when there is nothing left to drain.
-		runtime.Gosched()
+		start0, _, total, leading, err = s.core.AppendXLogPayload(procNum, payload, s.cfg.SegmentSize, s.sysID, s.tli)
+		if errors.Is(err, walBufferCapacityExceeded) {
+			// The posMu-level ring-window check refused the reservation
+			// before curr committed — nothing was burned, but the physical
+			// window is genuinely full past what the claim accounting saw.
+			// Release the claim, publish+drain everything outstanding, and
+			// retry the loop.
+			s.walBuf.releaseReservation(int64(reserveSize))
+			curr, _ := s.core.Load()
+			s.core.PublishUpTo(int64(curr))
+			if derr := s.drainBufferBytes(s.walBuf.resident(), drainReasonOverflow); derr != nil {
+				return 0, 0, derr
+			}
+			// Publish may be capped by a slower active stripe — yield so it
+			// can finish rather than busy-spinning on a stuck watermark.
+			runtime.Gosched()
+			continue
+		}
+		break
 	}
-
-	procNum := s.stripeNum()
-	start0, _, total, leading, err := s.core.AppendXLogPayload(procNum, payload, s.cfg.SegmentSize, s.sysID, s.tli)
 	if err != nil {
+		// Same burned-reservation contract as tryAppend: curr already
+		// advanced past [start0, start0+total), so zero-fill + publish the
+		// range before releasing the claim — otherwise curr - tail exceeds
+		// reservedBytes and later writeReserved calls overshoot the ring
+		// window (TestPort_IsolationSuite cascade, 2026-09-19).
+		if total > 0 {
+			_ = s.walBuf.writeReserved(int64(start0), make([]byte, total))
+			s.core.PublishUpTo(int64(start0) + int64(total))
+		}
 		s.walBuf.releaseReservation(int64(reserveSize))
 		return 0, 0, err
 	}
@@ -2005,26 +2037,31 @@ func (s *state) appendRaw(stream []byte) (uint64, uint64, error) {
 func (s *state) tryAppend(payload []byte) (start, end uint64, ok bool, err error) {
 	// PG-compat path: use stripe B.
 	if s.pageHeaders {
-		// Conservative emitted-size check before acquiring appendMu or the
-		// stripe lock — avoids the lock round-trip when walBuf has no room.
-		_, paddedLen := predictXLogRecordLen(payload)
-		conservativeSize := paddedLen + 64 // max PHD + contrecord overhead
 		// Worst-case WAL-buffer footprint of this one append. When a
 		// reservation would straddle a segment boundary, reserveEmittedAndPublish
 		// re-lands the record at the boundary AFTER first emitting an XLOG_NOOP
 		// pad over the gap [curr, boundary) via emitSegmentPad → writeReserved.
 		// The pad and the re-landed record are TWO separate writeReserved calls
-		// into the ring, so the reservation must cover BOTH. The crossing
-		// predicate (curr+total > boundary) means the gap is strictly smaller
-		// than the record's emitted size, and the re-landed record's emitted
-		// size is ≤ conservativeSize, so pad+record together occupy strictly
-		// less than 2*conservativeSize ring bytes. Reserving that worst case
+		// into the ring, so the claim must cover BOTH: footprint = gap + total,
+		// where the crossing predicate (curr+total > boundary) makes the gap
+		// strictly smaller than the record's emitted size — i.e. strictly less
+		// than 2× the emitted size. The emitted size is bounded by
+		// predictEmittedSize at a segment-aligned start (one 40-byte long PHD
+		// plus a 24-byte short PHD at every 8 KiB page boundary the record
+		// crosses); the earlier 2*(paddedLen+64) bound assumed a single page
+		// header and under-claimed for records spanning ≥3 pages — such a
+		// record crossing a boundary could reserve LSN space outside the ring
+		// window: writeReserved failed with errWALBufferReservedOutOfRange and
+		// the orphaned published range let tail overrun head+cap until the next
+		// drain's readForDrain panicked (TestPort_IsolationSuite, 2026-09-19).
+		// See walBufferReservationClaim. Reserving the worst case
 		// unconditionally keeps writeReserved inside the ring window regardless
 		// of where the (concurrently-advancing) LSN cursor actually lands —
 		// without it, a crossing while the buffer is near-full returns
 		// errWALBufferReservedOutOfRange (M0118-0001: tripped ~50% of the
 		// multiple-row-versions 1,000,000-row bulk-insert setup).
-		reserveSize := 2 * conservativeSize
+		_, paddedLen := predictXLogRecordLen(payload)
+		reserveSize := walBufferReservationClaim(paddedLen, s.cfg.SegmentSize)
 		if s.walBuf == nil || !s.walBuf.canHold(reserveSize) {
 			return 0, 0, false, nil // Path A territory; let slow path handle I/O
 		}
@@ -2051,9 +2088,29 @@ func (s *state) tryAppend(payload []byte) (start, end uint64, ok bool, err error
 		var start0 uint64
 		var total, leading int
 		start0, _, total, leading, err = s.core.AppendXLogPayload(procNum, payload, s.cfg.SegmentSize, s.sysID, s.tli)
+		if errors.Is(err, walBufferCapacityExceeded) {
+			// The posMu-level ring-window check refused the reservation
+			// before curr committed — nothing was burned. Release the claim
+			// and fall to the slow path, which drains then retries.
+			s.walBuf.releaseReservation(int64(reserveSize))
+			return 0, 0, false, nil
+		}
 		if err != nil {
-			// LSN reservation failed or encoding error; release the buffer
-			// reservation so capacity is not permanently consumed.
+			// The LSN reservation is burned: reserveEmittedAndPublish already
+			// advanced curr past [start0, start0+total), and peer stripes may
+			// have reserved above it — the range cannot be unwound. Releasing
+			// the capacity claim without publishing leaves an uncounted hole
+			// (curr - tail > reservedBytes), after which tryReserve grants
+			// space curr has already consumed — the cascade that wedged the
+			// server in TestPort_IsolationSuite (2026-09-19). Zero-fill the
+			// range so a subsequent drain writes durable zeros (a clean
+			// end-of-WAL for replay, never stale ring bytes that might decode
+			// as a record), then publish over it so tail covers the burn and
+			// the claim can be released without breaking the invariant.
+			if total > 0 {
+				_ = s.walBuf.writeReserved(int64(start0), make([]byte, total))
+				s.core.PublishUpTo(int64(start0) + int64(total))
+			}
 			s.walBuf.releaseReservation(int64(reserveSize))
 			return 0, 0, false, err
 		}
