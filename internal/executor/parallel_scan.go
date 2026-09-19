@@ -705,7 +705,7 @@ func (cs *parallelClaimSet) attachAll(op Operator) bool {
 // This mirrors the pattern of prebuildSharedHashJoins: the leader builds the bitmap
 // eagerly, publishes the sorted block list in a shared atomic allocator, and
 // workers claim disjoint pages from it.
-func (cs *parallelClaimSet) prebuildBitmap(ctx *Context, planChild optimizer.Node, buildChild func() (Operator, error)) error {
+func (cs *parallelClaimSet) prebuildBitmap(ctx *Context, planChild optimizer.Node, buildChild func(scope *instrumenter) (Operator, error)) error {
 	// Decide from the PLAN, before building anything.
 	if !optimizer.HasBitmapScan(planChild) {
 		return nil
@@ -714,7 +714,7 @@ func (cs *parallelClaimSet) prebuildBitmap(ctx *Context, planChild optimizer.Nod
 	// (uninstrumented, exactly today's behavior). Its drains would
 	// double-count the same plan keys into a worker/leader table, and
 	// the bitmap tree is never even closed, so its loops would leak.
-	tree, err := buildUnderNilScope(buildChild)
+	tree, err := buildChild(nil)
 	if err != nil {
 		return err
 	}

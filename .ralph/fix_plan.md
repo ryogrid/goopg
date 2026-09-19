@@ -448,9 +448,19 @@ heuristic stays live.)
   line filed for those per the "do not add another" rule.)
 
 ### Nightly run 20260905-011015 (sha `2e3deb52ba73`, 9 items) — filed 2026-09-11
-- [ ] **race/internal/executor (AI-20260905-011015-001, AI-20260914-235643-002, AI-20260916-035206-002, AI-20260917-004357-003, AI-20260919-000526-001)** — race suite failed
+- [x] **race/internal/executor (AI-20260905-011015-001, AI-20260914-235643-002, AI-20260916-035206-002, AI-20260917-004357-003, AI-20260919-000526-001)** — race suite failed
   in `internal/executor` (also failed previous run; repro: `go test -race
   -timeout 45m ./internal/executor/`).
+  - **RESOLVED 2026-09-19** by M-NIGHTLY-instrumentscope-race-fix (below):
+    the package-global `instrumentScope` + `instrumentScopeMu` +
+    `buildUnderFreshScope`/`buildUnderNilScope` are deleted; the scope is
+    now an explicit `*instrumenter` parameter threaded through
+    `buildNode`/`maybeInstrument`. `go test -race -timeout 45m
+    ./internal/executor/` clean (61.3s) incl. both historically racing
+    tests. Design doc `docs/design/root/root-0042-instrumentscope-explicit-parameter.md`;
+    deferral-ledger resolution record appended (append-only guard — the
+    owner flips `take3-instrumentscope-datarace` +
+    `e18-instrumentscope-global-races-coop-producers` to `resolved`).
   - **AI-20260919-000526-001 (2026-09-19 log check): same signature, do
     not re-file.** Tonight's `ci/logs/20260919-000526/race/go-test.log`
     shows the identical pair — `instrument.go:444` unlocked read racing
@@ -502,9 +512,43 @@ heuristic stays live.)
     comment names (a lazily-built producer subtree adopting an unrelated
     sibling worker's live scope and polluting its stats table) — not
     attempted.
-  - [ ] **M-NIGHTLY-instrumentscope-race-fix** — eliminate the package-global
+  - [x] **M-NIGHTLY-instrumentscope-race-fix** — eliminate the package-global
     `instrumentScope` read/write race without touching `Build`/`BuildWorker`'s
     exported signatures. Parent: race/internal/executor (this task).
+    **DONE 2026-09-19**, design doc
+    `docs/design/root/root-0042-instrumentscope-explicit-parameter.md`.
+    Implemented exactly the mechanical plan below, with one simplification:
+    `buildNode` itself gained the `scope *instrumenter` parameter (no
+    separate `buildScoped` wrapper — `Build`/`BuildWorker` are thin
+    `nil`-scope wrappers, `buildNode` is the scoped entry).
+    - `instrumenter{timing, table}` unchanged as a type; the global
+      `instrumentScope`, `instrumentScopeMu`, `buildUnderFreshScope` and
+      `buildUnderNilScope` are deleted. `withInstrumentation(timing,
+      func(scope *instrumenter) (Operator, error))` passes the fresh
+      scope into its callback.
+    - `maybeInstrument(plan, op, scope)`: nil → returns `op` unchanged;
+      non-nil → allocates stats in `scope.table`, stamps
+      `instrumentScopeCarrier` ops. ~78 call sites in `executor.go`
+      rewritten uniformly.
+    - `gatherOp`/`gatherMergeOp`: `buildChild` field type →
+      `func(scope *instrumenter) (Operator, error)`;
+      `buildChildForSlot(slot)` → `buildChild(nil)` unarmed, else fresh
+      `instrumenter` + `workerTables[slot]` (n+1 pre-sized, leader slot
+      n), folded post-`group.Wait()` in `Close`.
+    - `cteDMLPrefixOp.buildUnderScope` → `buildNode(n, deformBoundNone,
+      o.scope)` — stamped scope passed as argument, same semantics.
+    - `prebuildSharedHashJoins`/`prebuildBitmap` call `buildChild(nil)`
+      explicitly; `opTreeSlab.buildRec` fallback passes `nil` (op-tree
+      path never instrumented); `acquireSubPlanOp`/`expr.go` lazy builds
+      stay on `Build` ⇒ `nil` (SubPlan children never instrumented —
+      bug-compatible, pinned by `TestExplainAnalyzeSubPlanScopeObservation`).
+    - Gates: `go test -race -timeout 45m ./internal/executor/` **clean**
+      (61.3s; `TestParallelLateralProbeIdentity` +
+      `TestSubquerySemanticsMatrix` pass); `go test
+      ./internal/executor/` pass; `RALPH_PRECOMMIT_SCOPE=units` green;
+      `tpch-spotcheck` PASS (Q12=2, Q13=34 — gate-stamp FAIL is the
+      dirty-tree guard); `make plan-gate` 14/22 = recorded baseline
+      drift, identical to prior loops.
     Mechanical plan traced this loop (not yet implemented):
     (1) give internal `buildNode(plan, bound)` a third parameter
     `scope *instrumenter` and thread it through its own ~28 recursive

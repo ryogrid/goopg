@@ -110,6 +110,8 @@ reproduces this live (`TestParallelLateralProbeIdentity`,
 2026-09-18 (`.ralph/fix_plan.md`, M-NIGHTLY `race/internal/executor`). The
 mechanism this section describes is otherwise accurate (fresh table per
 site, disjoint slot indexes, `timing`-only inheritance); only the "never
-racy" sentence is wrong. Fix is filed as
-**M-NIGHTLY-instrumentscope-race-fix** in `.ralph/fix_plan.md`, not yet
-implemented.
+racy" sentence is wrong. **RESOLVED 2026-09-19**:
+M-NIGHTLY-instrumentscope-race-fix deleted the global, the mutex, and
+both swap helpers — the scope is now an explicit `*instrumenter`
+parameter threaded through `buildNode`/`maybeInstrument`, per-site fresh
+tables unchanged. See `docs/design/root/root-0042-instrumentscope-explicit-parameter.md`.

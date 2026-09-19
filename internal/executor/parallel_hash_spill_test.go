@@ -226,7 +226,7 @@ func spillParticipants(t *testing.T, plan *optimizer.Join, probeRows, buildRows 
 	tree := newJoinOp(plan,
 		&rowsOp{rows: probeRows, schema: batchSchema("l", lw)},
 		&rowsOp{rows: buildRows, schema: batchSchema("r", rw)})
-	builds, err := prebuildSharedHashJoins(ctx, plan, func() (Operator, error) { return tree, nil })
+	builds, err := prebuildSharedHashJoins(ctx, plan, func(*instrumenter) (Operator, error) { return tree, nil })
 	if err != nil {
 		t.Fatalf("prebuild: %v", err)
 	}
@@ -410,7 +410,7 @@ func TestSharedSpillingBuildFilesAreSettled(t *testing.T) {
 	tree := newJoinOp(plan,
 		&rowsOp{rows: probeRows, schema: batchSchema("l", lw)},
 		&rowsOp{rows: buildRows, schema: batchSchema("r", rw)})
-	builds, err := prebuildSharedHashJoins(ctx, plan, func() (Operator, error) { return tree, nil })
+	builds, err := prebuildSharedHashJoins(ctx, plan, func(*instrumenter) (Operator, error) { return tree, nil })
 	if err != nil {
 		t.Fatalf("prebuild: %v", err)
 	}
@@ -1242,7 +1242,7 @@ func sharedSpillDesc(t *testing.T, workMem int64) (*Context, *optimizer.Join, *s
 	tree := newJoinOp(plan,
 		&rowsOp{rows: probeRows, schema: batchSchema("l", lw)},
 		&rowsOp{rows: buildRows, schema: batchSchema("r", rw)})
-	builds, err := prebuildSharedHashJoins(ctx, plan, func() (Operator, error) { return tree, nil })
+	builds, err := prebuildSharedHashJoins(ctx, plan, func(*instrumenter) (Operator, error) { return tree, nil })
 	if err != nil {
 		t.Fatalf("prebuild: %v", err)
 	}

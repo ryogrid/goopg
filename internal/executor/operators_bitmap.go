@@ -513,7 +513,7 @@ func (o *bitmapHeapScanOp) openPrep(ctx *Context) error {
 	o.pf = newHeapPrefetchWindow(ctx.Pool, o.rel, heapPrefetchDepth())
 
 	// Build the outer operator (a BitmapIndexScan or BitmapAnd/BitmapOr tree).
-	outerOp, err := buildNode(o.plan.Outer, deformBoundFull)
+	outerOp, err := buildNode(o.plan.Outer, deformBoundFull, nil)
 	if err != nil {
 		return err
 	}
@@ -1041,7 +1041,7 @@ func (o *bitmapAndOp) Open(ctx *Context) error {
 	o.inputs = make([]Operator, len(o.plan.Inputs))
 	o.inputBitmaps = make([]bitmapProducer, len(o.plan.Inputs))
 	for i, input := range o.plan.Inputs {
-		op, err := buildNode(input, deformBoundFull)
+		op, err := buildNode(input, deformBoundFull, nil)
 		if err != nil {
 			return err
 		}
@@ -1122,7 +1122,7 @@ func (o *bitmapOrOp) Open(ctx *Context) error {
 	o.inputs = make([]Operator, len(o.plan.Inputs))
 	o.inputBitmaps = make([]bitmapProducer, len(o.plan.Inputs))
 	for i, input := range o.plan.Inputs {
-		op, err := buildNode(input, deformBoundFull)
+		op, err := buildNode(input, deformBoundFull, nil)
 		if err != nil {
 			return err
 		}

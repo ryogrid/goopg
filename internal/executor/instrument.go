@@ -7,7 +7,6 @@ package executor
 // See docs/design/0018-0003-explain-analyze-instrumentation.md.
 
 import (
-	"sync"
 	"time"
 
 	"github.com/goopg/goopg/internal/utils/mmgr"
@@ -230,17 +229,16 @@ func (o *instrumentedOp) RowsAffected() int64 {
 }
 
 // instrumentScopeCarrier is implemented by operators whose child-plan
-// Build() calls happen lazily, inside their own Open(), rather than
+// buildNode calls happen lazily, inside their own Open(), rather than
 // during the original Build() dispatch that constructed them (e.g.
 // cteDMLPrefixOp — see operators_cte_dml.go). By the time such an
-// Open() runs, withInstrumentation's deferred restore has already put
-// the package-global instrumentScope back to its outer value (often
-// nil, once the top-level EXPLAIN ANALYZE Build() call has returned),
-// so a nested Build() call from inside Open() would see no active
+// Open() runs, the scope that was live during the top-level
+// EXPLAIN ANALYZE Build() call is no longer in any caller's hand,
+// so a nested buildNode call from inside Open() would see no active
 // scope and skip wrapping entirely — the nested nodes would report
 // plan-only estimates with no actual rows/time. maybeInstrument hands
 // such operators the instrumenter active on their OWN Build() call so
-// they can reinstate it (save/restore) around their nested Build()s.
+// they can pass it down into their nested builds explicitly.
 type instrumentScopeCarrier interface {
 	setInstrumentScope(*instrumenter)
 }
@@ -299,81 +297,36 @@ func (c *Context) recordGatherLaunched(n optimizer.Node, launched int) {
 	c.GatherLaunched[n] = launched
 }
 
-// instrumentScope wires the package-local instrumentation state
-// the Build dispatch consults. When non-nil, every successful
-// Build returns an *instrumentedOp wrapping its result so child-
-// site Build calls inside the dispatch arms get their wraps too
-// (the wrap propagates recursively through the natural Build
-// tree). nil disables instrumentation — every existing caller
-// path is byte-for-byte unchanged.
+// instrumenter is the instrumentation scope buildNode threads through
+// its dispatch as an explicit parameter. When non-nil, every successful
+// buildNode arm returns an *instrumentedOp wrapping its result so child-
+// site buildNode calls inside the dispatch arms get their wraps too
+// (the wrap propagates recursively through the natural build tree).
+// nil disables instrumentation — every existing caller path is
+// byte-for-byte unchanged.
 //
-// This package global mirrors the existing planParent / outerScope
-// pattern. Save/restore happens in withInstrumentation so an
-// EXPLAIN ANALYZE call doesn't leak state across queries.
-var instrumentScope *instrumenter
-
+// M-NIGHTLY-instrumentscope-race-fix: this used to be a package global
+// swapped under a mutex by every scope-handoff site. Gather workers
+// build concurrently, and a lazily-built SubPlan subtree reached
+// mid-Next() from another goroutine read the global with no lock —
+// a real data race (take3-instrumentscope-datarace,
+// e18-instrumentscope-global-races-coop-producers). The scope is now a
+// plain function argument: there is no shared mutable state left to
+// race on, and no mutex.
 type instrumenter struct {
 	timing bool
 	table  nodeStatsTable
 }
 
 // withInstrumentation runs fn under a fresh instrumenter. Returns
-// the populated stats table. Save/restore is defer-driven so a
-// panic in fn doesn't leak the global.
-func withInstrumentation(timing bool, fn func() (Operator, error)) (Operator, nodeStatsTable, error) {
-	prev := instrumentScope
+// the populated stats table.
+func withInstrumentation(timing bool, fn func(scope *instrumenter) (Operator, error)) (Operator, nodeStatsTable, error) {
 	cur := &instrumenter{timing: timing, table: make(nodeStatsTable)}
-	instrumentScope = cur
-	defer func() { instrumentScope = prev }()
-	op, err := fn()
+	op, err := fn(cur)
 	if err != nil {
 		return nil, nil, err
 	}
 	return op, cur.table, nil
-}
-
-// EX0-03b (new): instrumentScopeMu serializes every tree-construction
-// handoff through the package-global instrumentScope. The CTE precedent's
-// unguarded save/restore is safe only because the CTE path is serial —
-// Gather workers build concurrently (leader build vs worker builds, worker
-// vs worker), so an unguarded global would leak one site's fresh table into
-// another's tree. The mutex covers set + Build + restore only (fast, no
-// I/O); execution stays parallel.
-var instrumentScopeMu sync.Mutex
-
-// EX0-03b (new): buildUnderFreshScope runs fn (a Gather child-tree build)
-// with the package-global instrumentScope pointed at a FRESH instrumenter
-// that inherits only the stored scope's timing flag. Same plan keys across
-// tables cannot collide (different maps); the mutex keeps the global from
-// leaking across goroutines. Returns the built tree and its table; the
-// caller files the table into its indexed slot.
-func buildUnderFreshScope(timing bool, fn func() (Operator, error)) (Operator, nodeStatsTable, error) {
-	instrumentScopeMu.Lock()
-	defer instrumentScopeMu.Unlock()
-	prev := instrumentScope
-	fresh := &instrumenter{timing: timing, table: make(nodeStatsTable)}
-	instrumentScope = fresh
-	defer func() { instrumentScope = prev }()
-	op, err := fn()
-	if err != nil {
-		return nil, nil, err
-	}
-	return op, fresh.table, nil
-}
-
-// EX0-03b (new): buildUnderNilScope runs fn (a prebuild/coop throwaway-tree
-// build) with the package-global instrumentScope explicitly NIL —
-// uninstrumented, exactly today's behavior. The mutex is still required:
-// without it a concurrent instrumented build's fresh scope would leak into
-// this tree (double-counting the same plan keys into a worker/leader table,
-// or instrumenting a bitmap tree that is never closed so its loops leak).
-func buildUnderNilScope(fn func() (Operator, error)) (Operator, error) {
-	instrumentScopeMu.Lock()
-	defer instrumentScopeMu.Unlock()
-	prev := instrumentScope
-	instrumentScope = nil
-	defer func() { instrumentScope = prev }()
-	return fn()
 }
 
 // EX0-03b (new): workerNodeStat is one worker's (or the leader's) folded
@@ -436,16 +389,16 @@ func foldGatherWorkerStats(ctx *Context, tables []nodeStatsTable) {
 	}
 }
 
-// maybeInstrument is called by Build right before each switch arm
-// returns. When instrumentScope is non-nil it allocates a stats
+// maybeInstrument is called by buildNode right before each switch arm
+// returns. When scope is non-nil it allocates a stats
 // record keyed on plan and wraps op; when nil it returns op
 // unchanged (keeping every existing path unchanged byte-for-byte).
-func maybeInstrument(plan optimizer.Node, op Operator) Operator {
-	if instrumentScope == nil || op == nil {
+func maybeInstrument(plan optimizer.Node, op Operator, scope *instrumenter) Operator {
+	if scope == nil || op == nil {
 		return op
 	}
-	stats := &nodeStats{timing: instrumentScope.timing}
-	instrumentScope.table[plan] = stats
+	stats := &nodeStats{timing: scope.timing}
+	scope.table[plan] = stats
 	// Hand an IndexOnlyScan (or any heap-fetch-counting operator) a pointer
 	// to its stats.heapFetches so it can tally heap fetches during Open;
 	// the EXPLAIN ANALYZE renderer reads them back via the table. (0118-0102)
@@ -459,7 +412,7 @@ func maybeInstrument(plan optimizer.Node, op Operator) Operator {
 		jf.setJoinFilterRemoveCounter(&stats.joinFilterRejected)
 	}
 	if sc, ok := op.(instrumentScopeCarrier); ok {
-		sc.setInstrumentScope(instrumentScope)
+		sc.setInstrumentScope(scope)
 	}
 	return &instrumentedOp{inner: op, plan: plan, stats: stats}
 }

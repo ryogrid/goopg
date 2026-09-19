@@ -202,7 +202,7 @@ func probeSideIsLeft(p *optimizer.Join) bool {
 //
 // Returns nil when the subtree has no shareable hash join, which is the common
 // case and costs nothing — the check is on the plan, not on a built tree.
-func prebuildSharedHashJoins(ctx *Context, plan optimizer.Node, buildChild func() (Operator, error)) (map[*optimizer.Join]*sharedHashBuild, error) {
+func prebuildSharedHashJoins(ctx *Context, plan optimizer.Node, buildChild func(scope *instrumenter) (Operator, error)) (map[*optimizer.Join]*sharedHashBuild, error) {
 	// Decide from the PLAN, before building anything. An earlier cut built the
 	// tree unconditionally and then looked for joins in it, which called the
 	// Gather's child-builder one extra time — harmless for the production
@@ -215,7 +215,7 @@ func prebuildSharedHashJoins(ctx *Context, plan optimizer.Node, buildChild func(
 	// (uninstrumented, exactly today's behavior; covers both Gather and
 	// GatherMerge prebuild call sites). Its drains would double-count the
 	// same plan keys into a worker/leader table.
-	tree, err := buildUnderNilScope(buildChild)
+	tree, err := buildChild(nil)
 	if err != nil {
 		return nil, err
 	}
@@ -653,8 +653,8 @@ func (o *joinOp) parallelBuildLazyHashTable(ctx *Context, buildLeft bool) (bool,
 	// SharedHashBuilds map may already be published to a surrounding Gather's
 	// participants, and mutating it here would be a write to a map those
 	// goroutines are reading.
-	nested, err := prebuildSharedHashJoins(ctx, buildPlan, func() (Operator, error) {
-		return buildNode(buildPlan, buildBound)
+	nested, err := prebuildSharedHashJoins(ctx, buildPlan, func(scope *instrumenter) (Operator, error) {
+		return buildNode(buildPlan, buildBound, scope)
 	})
 	if err != nil {
 		return false, err
@@ -698,12 +698,9 @@ func (o *joinOp) parallelBuildLazyHashTable(ctx *Context, buildLeft bool) (bool,
 		group.Go(func(workerCtx context.Context) error {
 			// EX0-03b: coop throwaway tree — scope explicitly NIL
 			// (uninstrumented, exactly today's behavior). Producer
-			// goroutines build concurrently, so the mutex-serialized
-			// NIL handoff also keeps a concurrent Gather site's fresh
-			// table out of this tree.
-			tree, err := buildUnderNilScope(func() (Operator, error) {
-				return buildNode(buildPlan, buildBound)
-			})
+			// goroutines build concurrently; the scope now travels as an
+			// argument, so nothing shared can leak into this tree.
+			tree, err := buildNode(buildPlan, buildBound, nil)
 			if err != nil {
 				return err
 			}

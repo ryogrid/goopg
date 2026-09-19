@@ -74,7 +74,7 @@ func seqLeafBound(t *testing.T, op Operator) (bound, ncols int) {
 			}
 			op = o.child
 		case *gatherOp:
-			wc, err := o.buildChild()
+			wc, err := o.buildChild(nil)
 			if err != nil {
 				t.Fatalf("gather buildChild: %v", err)
 			}

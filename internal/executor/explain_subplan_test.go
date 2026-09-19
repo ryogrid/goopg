@@ -306,11 +306,11 @@ func TestJoinLabelPinsPGLabels(t *testing.T) {
 // TestExplainAnalyzeSubPlanScopeObservation is the test-first probe
 // M-NIGHTLY-instrumentscope-race-fix prescribes for its open question:
 // does a SubPlan/EXISTS tree lazily built mid-Next() during a serial
-// (no Gather) EXPLAIN ANALYZE inherit the ambient instrumentScope and
-// get instrumented? `withInstrumentation` (instrument.go:323) sets the
-// package global for the duration of the top-level `Build` ONLY — the
-// inner plan's Open/Next run after it returns — and acquireSubPlanOp
-// (subplan.go:302) calls `Build(plan)` from expression evaluators
+// (no Gather) EXPLAIN ANALYZE inherit the ambient instrumentation scope
+// and get instrumented? `withInstrumentation` sets the scope for the
+// duration of the top-level build ONLY — the inner plan's Open/Next run
+// after it returns — and acquireSubPlanOp (subplan.go) calls `Build`
+// (scope nil) from expression evaluators
 // (existsImpl/subqueryImpl/collectInValues) at row-evaluation time, so
 // the expectation is that SubPlan children are NOT instrumented today.
 // This test observes the real rendered output and pins it.
@@ -380,7 +380,7 @@ func TestExplainAnalyzeSubPlanScopeObservation(t *testing.T) {
 		}
 		sawSubtree = true
 		if strings.Contains(l, "(actual") {
-			t.Errorf("SubPlan child unexpectedly instrumented (instrumentScope was live at build?):\n%s", plan)
+			t.Errorf("SubPlan child unexpectedly instrumented (a non-nil scope leaked into its lazy build?):\n%s", plan)
 		}
 	}
 	if !sawSubtree {

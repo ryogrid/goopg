@@ -69,8 +69,8 @@ func (o *explainOp) Open(ctx *Context) error {
 		planStart := time.Now()
 		var inner Operator
 		var err error
-		inner, stats, err = withInstrumentation(timing, func() (Operator, error) {
-			return Build(o.plan.Child)
+		inner, stats, err = withInstrumentation(timing, func(scope *instrumenter) (Operator, error) {
+			return buildNode(o.plan.Child, deformBoundNone, scope)
 		})
 		if err != nil {
 			return err

@@ -117,7 +117,7 @@ func gatherTestCtx(t *testing.T) *Context {
 	return ctx
 }
 
-func newTestGather(nWorkers int, mk func() (Operator, error)) (*gatherOp, *optimizer.Gather) {
+func newTestGather(nWorkers int, mk func(*instrumenter) (Operator, error)) (*gatherOp, *optimizer.Gather) {
 	schema := optimizer.Schema{{Name: "n"}}
 	child := &scriptedOp{schema: schema}
 	p := optimizer.NewGather(0, &stubPlanNode{schema: schema}, nWorkers)
@@ -142,7 +142,7 @@ func TestGatherCollectsEveryWorkersRows(t *testing.T) {
 	var mu sync.Mutex
 	assigned := 0
 
-	g, _ := newTestGather(workers, func() (Operator, error) {
+	g, _ := newTestGather(workers, func(*instrumenter) (Operator, error) {
 		mu.Lock()
 		id := assigned
 		assigned++
@@ -190,7 +190,7 @@ func TestGatherCollectsEveryWorkersRows(t *testing.T) {
 // that matters: whatever the leader receives must not reference a worker's
 // arena.
 func TestGatherRowsAreTransferable(t *testing.T) {
-	g, _ := newTestGather(2, func() (Operator, error) {
+	g, _ := newTestGather(2, func(*instrumenter) (Operator, error) {
 		return &scriptedOp{
 			schema: optimizer.Schema{{Name: "n"}},
 			rows:   []Row{{NewStringDatum("abc")}, {NewStringDatum("def")}},
@@ -220,7 +220,7 @@ func TestGatherRowsAreTransferable(t *testing.T) {
 func TestGatherWorkerErrorSurfaces(t *testing.T) {
 	sentinel := &ExecError{Code: "XX000", Message: "worker exploded"}
 	var once sync.Once
-	g, _ := newTestGather(3, func() (Operator, error) {
+	g, _ := newTestGather(3, func(*instrumenter) (Operator, error) {
 		op := &scriptedOp{schema: optimizer.Schema{{Name: "n"}}, rows: intRows(0, 100)}
 		once.Do(func() {
 			op.onNext = func() error { return sentinel }
@@ -252,7 +252,7 @@ func TestGatherWorkerErrorSurfaces(t *testing.T) {
 // goroutine the server did not start would otherwise kill the process.
 func TestGatherWorkerPanicBecomesError(t *testing.T) {
 	var once sync.Once
-	g, _ := newTestGather(2, func() (Operator, error) {
+	g, _ := newTestGather(2, func(*instrumenter) (Operator, error) {
 		op := &scriptedOp{schema: optimizer.Schema{{Name: "n"}}, rows: intRows(0, 50)}
 		once.Do(func() {
 			op.onNext = func() error { panic("worker boom") }
@@ -289,7 +289,7 @@ func TestGatherWorkerPanicBecomesError(t *testing.T) {
 // classic Go shutdown deadlock, and it is the specific bug this ordering
 // exists to prevent.
 func TestGatherEarlyCloseDoesNotDeadlock(t *testing.T) {
-	g, _ := newTestGather(4, func() (Operator, error) {
+	g, _ := newTestGather(4, func(*instrumenter) (Operator, error) {
 		return &scriptedOp{schema: optimizer.Schema{{Name: "n"}}, rows: intRows(0, 20000)}, nil
 	})
 	ctx := gatherTestCtx(t)
@@ -318,7 +318,7 @@ func TestGatherEarlyCloseDoesNotDeadlock(t *testing.T) {
 // TestGatherCancellationStopsWorkers pins that the statement's cancellation —
 // timeout, client EOF, explicit cancel — reaches the workers.
 func TestGatherCancellationStopsWorkers(t *testing.T) {
-	g, _ := newTestGather(4, func() (Operator, error) {
+	g, _ := newTestGather(4, func(*instrumenter) (Operator, error) {
 		return &scriptedOp{schema: optimizer.Schema{{Name: "n"}}, rows: intRows(0, 100000)}, nil
 	})
 	ctx := gatherTestCtx(t)
@@ -356,7 +356,7 @@ func TestGatherCancellationStopsWorkers(t *testing.T) {
 func TestGatherLeaksNoGoroutines(t *testing.T) {
 	before := runtime.NumGoroutine()
 	for i := 0; i < 5; i++ {
-		g, _ := newTestGather(4, func() (Operator, error) {
+		g, _ := newTestGather(4, func(*instrumenter) (Operator, error) {
 			return &scriptedOp{schema: optimizer.Schema{{Name: "n"}}, rows: intRows(0, 2000)}, nil
 		})
 		ctx := gatherTestCtx(t)
@@ -391,7 +391,7 @@ func TestGatherLeaksNoGoroutines(t *testing.T) {
 // cap", which an earlier version of Open got backwards and which would have
 // made `SET max_parallel_workers = 0` silently ineffective.
 func TestGatherZeroWorkersRunsSerially(t *testing.T) {
-	g, _ := newTestGather(4, func() (Operator, error) {
+	g, _ := newTestGather(4, func(*instrumenter) (Operator, error) {
 		return &scriptedOp{schema: optimizer.Schema{{Name: "n"}}, rows: intRows(0, 10)}, nil
 	})
 	ctx := gatherTestCtx(t)
@@ -448,16 +448,16 @@ func TestGatherCloseTerminatesAfterOpenError(t *testing.T) {
 	cases := []struct {
 		name    string
 		workers int
-		mk      func() (Operator, error)
+		mk      func(*instrumenter) (Operator, error)
 	}{
 		// Zero workers forces leader participation, so the leader's own
 		// buildChild call is the one that fails — deterministically.
-		{"zero workers, builder fails", 0, func() (Operator, error) { return nil, buildErr }},
+		{"zero workers, builder fails", 0, func(*instrumenter) (Operator, error) { return nil, buildErr }},
 		// With workers launched the same builder fails in every goroutine too,
 		// so the group carries an error AND Open returns one.
-		{"workers launched, builder fails", 2, func() (Operator, error) { return nil, buildErr }},
+		{"workers launched, builder fails", 2, func(*instrumenter) (Operator, error) { return nil, buildErr }},
 		// The second error return in Open: the child builds but refuses Open.
-		{"child Open fails", 0, func() (Operator, error) {
+		{"child Open fails", 0, func(*instrumenter) (Operator, error) {
 			return &scriptedOp{schema: optimizer.Schema{{Name: "n"}}, openErr: buildErr}, nil
 		}},
 	}

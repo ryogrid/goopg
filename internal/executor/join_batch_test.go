@@ -467,7 +467,7 @@ func TestSharedHashBuildPublishesWhenItSpills(t *testing.T) {
 		t.Cleanup(func() { _ = tree.Close() })
 		ctx := &Context{WorkMem: workMem, tempFiles: newTempFileRegistry()}
 		t.Cleanup(func() { releaseSharedHashBuilds(ctx); ctx.ReleaseSpillFiles() })
-		out, err := prebuildSharedHashJoins(ctx, plan, func() (Operator, error) { return tree, nil })
+		out, err := prebuildSharedHashJoins(ctx, plan, func(*instrumenter) (Operator, error) { return tree, nil })
 		if err != nil {
 			t.Fatalf("prebuild: %v", err)
 		}
