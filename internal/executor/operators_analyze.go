@@ -137,6 +137,9 @@ func (o *analyzeOp) Next() (TupleSlot, error) {
 			_ = werr
 		}
 		relStats.resetAnalyzeTriggers(tbl.OID)
+		// The shared stats entry gets the same report (pgstat_report_analyze):
+		// mod_since_analyze resets to zero.
+		relStats.reportAnalyze(tbl.OID)
 	}
 	// Inheritance-tree statistics for partitioned parents read every leaf
 	// partition under a blocking AccessShareLock (SKIP_LOCKED does not cover
@@ -171,6 +174,7 @@ func (o *analyzeOp) Next() (TupleSlot, error) {
 		parent.Stats = &catalog.TableStats{RowCount: rows, Pages: pages, Analyzed: true}
 		o.ctx.Catalog.SetTableStats(parent, parent.Stats)
 		relStats.resetAnalyzeTriggers(parent.OID)
+		relStats.reportAnalyze(parent.OID)
 	}
 	return nil, EOF
 }

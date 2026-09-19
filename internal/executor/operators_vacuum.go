@@ -283,6 +283,11 @@ func (o *vacuumOp) Next() (TupleSlot, error) {
 			// Successful VACUUM resets n_dead_tup / n_ins_since_vacuum
 			// (pgstat_relation_vacuum_rel). OID 0 (not yet nailed) skips.
 			relStats.resetVacuumTriggers(tbl.OID)
+			// The shared stats entry gets the same report (pgstat_report_vacuum):
+			// live/dead overwritten with the pass's measured values,
+			// ins_since_vacuum zeroed, vacuum_count++. A successful reclaim
+			// pass leaves ~0 dead tuples behind.
+			relStats.reportVacuum(tbl.OID, int64(stats.Live), 0)
 		}
 		// relfrozenxid skip-guard (vacuumlazy.c skippedallvis): a
 		// non-aggressive pass that SKIPPED all-visible-but-not-all-frozen

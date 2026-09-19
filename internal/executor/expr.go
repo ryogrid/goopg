@@ -17674,28 +17674,25 @@ case "pg_char_to_encoding":
 			if v < 0 {
 				v = 0 // PG clamps live-tuple estimate to non-negative
 			}
-		case "pg_stat_get_dead_tuples",
-			"pg_stat_get_ins_since_vacuum",
-			"pg_stat_get_mod_since_analyze":
-			// Read from the shared trigger store, NOT the tiered counters:
-			// these three feed autovacuum decisions and must reflect DML
-			// immediately (pending only reaches shared on an explicit
-			// flush), and VACUUM/ANALYZE reset them in place.
-			d, i, m := relStats.triggerSnapshot(oid)
-			switch name {
-			case "pg_stat_get_dead_tuples":
-				v = d
-			case "pg_stat_get_ins_since_vacuum":
-				v = i
-			default:
-				v = m
-			}
+		case "pg_stat_get_dead_tuples":
+			// Read the flushed shared entry (PgStat_StatTabEntry.dead_tuples),
+			// fed by the transactional fold — an aborted xact's inserted+updated
+			// tuples land here as dead — NOT the non-transactional
+			// autovacuum-trigger store, which is launcher-facing only.
+			v = c.deltaDead
 			if v < 0 {
-				v = 0
+				v = 0 // PG clamps dead-tuple estimate to non-negative at flush
 			}
+		case "pg_stat_get_ins_since_vacuum":
+			// Flushed attempted inserts since the last VACUUM (aborted inserts
+			// count — pgstat_relation_flush_cb adds tuples_inserted).
+			v = c.insSinceVacuum
+		case "pg_stat_get_mod_since_analyze":
+			// Flushed committed change events since the last ANALYZE
+			// (tabentry->mod_since_analyze += counts.changed_tuples).
+			v = c.changedTuples
 		case "pg_stat_get_vacuum_count":
-			// No VACUUM-driven relation stats yet; PG reads 0 until first vacuum.
-			v = 0
+			v = c.vacuumCount
 		}
 		return NewIntDatum(v), nil
 	// pg_stat_get_xact_tuples_inserted(oid) → bigint: rows inserted into the

@@ -50,6 +50,16 @@ type relStatCounters struct {
 	tuplesDeleted  int64
 	deltaLive      int64 // accumulated live-tuple delta (inserted - deleted)
 	deltaDead      int64 // accumulated dead-tuple delta (updated + deleted)
+	// changedTuples accumulates insert+update+delete events on commit only
+	// (PgStat_Counter changed_tuples); the shared tier carries it as
+	// mod_since_analyze. An aborted transaction generates no change events.
+	changedTuples int64
+	// insSinceVacuum / vacuumCount are meaningful only on a shared entry:
+	// ins_since_vacuum is fed at flush by the pending entry's attempted
+	// tuples_inserted and reset by a committed truncdrop or VACUUM;
+	// vacuum_count is bumped by pgstat_report_vacuum (reportVacuum).
+	insSinceVacuum int64
+	vacuumCount    int64
 	// truncDropped is meaningful only on a pending entry: a committed TRUNCATE /
 	// in-transaction DROP folded into this entry forgets all prior live/dead
 	// counts. It is consumed (and reset) when the pending entry is flushed into
@@ -119,9 +129,12 @@ var relStats = newRelationStatsManager()
 // dependency-free.
 func init() {
 	catalog.UserTableTriggerStatsFunc = func(oid uint32) (dead, mod, ins string) {
-		// triggerSnapshot returns (dead, ins, mod) — mind the order swap.
-		d, i, m := relStats.triggerSnapshot(oid)
-		return strconv.FormatInt(d, 10), strconv.FormatInt(m, 10), strconv.FormatInt(i, 10)
+		// The view's n_dead_tup / n_mod_since_analyze / n_ins_since_vacuum read
+		// the same flushed shared entry as the pg_stat_get_* function getters
+		// (one PgStat_StatTabEntry upstream), not the non-transactional
+		// autovacuum-trigger store.
+		c, _ := relStats.get(oid)
+		return strconv.FormatInt(c.deltaDead, 10), strconv.FormatInt(c.changedTuples, 10), strconv.FormatInt(c.insSinceVacuum, 10)
 	}
 }
 
@@ -358,6 +371,9 @@ func applyXactToPending(c *relStatCounters, x *relXactCounters, isCommit bool) {
 		// create a dead tuple.
 		c.deltaLive += x.tuplesInserted - x.tuplesDeleted
 		c.deltaDead += x.tuplesUpdated + x.tuplesDeleted
+		// insert, update, delete each count as one change event (feeds
+		// mod_since_analyze at flush); an aborted xact generates none.
+		c.changedTuples += x.tuplesInserted + x.tuplesUpdated + x.tuplesDeleted
 	} else {
 		// Inserted (and updated) tuples are dead; deleted tuples are unaffected
 		// (the delete never happened).
@@ -453,9 +469,15 @@ func (m *relationStatsManager) flush(sessionID uint64) {
 		if c.truncDropped {
 			s.deltaLive = 0
 			s.deltaDead = 0
+			s.insSinceVacuum = 0
 		}
 		s.deltaLive += c.deltaLive
 		s.deltaDead += c.deltaDead
+		// mod_since_analyze accumulates committed change events; ins_since_vacuum
+		// accumulates attempted inserts (aborted ones count too — PG notes the
+		// extra autovacuum triggers are not worth a separate field).
+		s.changedTuples += c.changedTuples
+		s.insSinceVacuum += c.tuplesInserted
 	}
 	delete(m.pending, sessionID)
 }
@@ -511,6 +533,46 @@ func (m *relationStatsManager) resetAll() {
 	for _, c := range m.shared {
 		*c = relStatCounters{}
 	}
+}
+
+// reportVacuum mirrors pgstat_report_vacuum: a successful VACUUM overwrites the
+// shared entry's live/dead tuple estimates with the pass's measured survivors
+// and remaining dead, zeroes ins_since_vacuum, and bumps vacuum_count. It
+// writes the shared entry directly — the pending/staging tiers are for
+// transactional tuple deltas, which a vacuum report is not.
+func (m *relationStatsManager) reportVacuum(oid uint32, live, dead int64) {
+	if oid == 0 {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	s := m.shared[oid]
+	if s == nil {
+		s = &relStatCounters{}
+		m.shared[oid] = s
+	}
+	s.deltaLive = live
+	s.deltaDead = dead
+	s.insSinceVacuum = 0
+	s.vacuumCount++
+}
+
+// reportAnalyze mirrors the mod_since_analyze half of pgstat_report_analyze:
+// ANALYZE resets the modifications-since-analyze counter. (Upstream's report
+// also overwrites live/dead with the analyze scan's measured values; goopg's
+// analyze does not measure dead tuples, so the accumulated deltas stand.)
+func (m *relationStatsManager) reportAnalyze(oid uint32) {
+	if oid == 0 {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	s := m.shared[oid]
+	if s == nil {
+		s = &relStatCounters{}
+		m.shared[oid] = s
+	}
+	s.changedTuples = 0
 }
 
 // shouldTrackCounts reports whether the calling session's track_counts GUC

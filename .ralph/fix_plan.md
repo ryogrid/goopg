@@ -667,8 +667,42 @@ heuristic stays live.)
       rowmark retracts on empty).
     - Ledgered (`.ralph/deferral_ledger.md` tail row
       `testport/TestPort_IsolationIntraGrantInplace`).
-- [ ] **testport/TestPort_IsolationStats (AI-20260905-011015-004, AI-20260914-235643-007, AI-20260916-035206-007, AI-20260917-004357-011)** — FAILed,
+- [x] **testport/TestPort_IsolationStats (AI-20260905-011015-004, AI-20260914-235643-007, AI-20260916-035206-007, AI-20260917-004357-011)** — FAILed,
   also failed previous run (same testport repro pattern).
+  - **DONE 2026-09-19.** Kind: impl. Movement: none (correctness fix —
+    restores the pass-required spec the CSV already claims; no parity
+    instrument moved). Only `n_dead_tup` diverged, in the four
+    2PC-abort permutations (expected 8/8/2/2, got 6/6/1/1). Root cause was
+    NOT the fold math — `applyXactToPending`'s abort arm (`deltaDead +=
+    restored ins + upd`, `pgstat_twophase_postabort`) already computed 8/2
+    and was unit-pinned — but the `expr.go` getter arm, which read the
+    non-transactional `triggerSnapshot` store (bumps dead per upd/del at
+    DML time, no abort reconciliation, no truncdrop restore → upd+del = 6,
+    post-truncate upd = 1). Repointed `pg_stat_get_dead_tuples` to
+    `c.deltaDead` (the same tabentry source `pg_stat_get_live_tuples`
+    uses) and moved the whole arm to the tiered entry: new shared fields
+    `insSinceVacuum` (flush: `+= attempted tuples_inserted`, reset by
+    committed truncdrop / `reportVacuum`), `changedTuples` (commit fold:
+    `ins+upd+del`, abort adds none → `mod_since_analyze`), `vacuumCount`;
+    `reportVacuum`/`reportAnalyze` mirror `pgstat_report_{vacuum,analyze}`
+    (wired beside `resetVacuumTriggers`/`resetAnalyzeTriggers`);
+    `UserTableTriggerStatsFunc` repointed so view and function getters
+    share one source. Design doc: `0118-0128` Update 2026-09-19. Gates:
+    repro PASS (3.30s, all perms byte-identical); siblings
+    prepared-transactions{,-cic}/vacuum-{skip-locked,concurrent-drop,
+    conflict,no-cleanup-lock}/TwoPhaseCommitSameBackend PASS;
+    `go test ./internal/executor/` PASS; `-race` clean 61.4s. Ledger row
+    appended for the remaining gaps (autovacuum trigger store still
+    non-transactional; analyze live/dead measured-overwrite deferred).
+  - **ROOT-CAUSED 2026-09-19** (repro re-run at HEAD, 2.43s FAIL):
+    `pg_stat_get_dead_tuples` diverges only in the four
+    `…_rollback_prepared_a` perms — the plain ones (expected
+    `…|8|0`, got `…|6|0`) and the truncate ones (expected `…|2|0`,
+    got `…|1|0`). PG's abort formula is `delta_dead += restored_ins +
+    restored_upd` (`pgstat_twophase_postabort`, after
+    `restore_truncdrop_counters`); the trigger store accumulates
+    `upd + del` at DML time and is cleared by an aborted truncate —
+    commit math on a non-transactional counter.
 - [ ] **testport/TestPort_LockRowsSortOverJoinTakesRowLock (AI-20260905-011015-005, AI-20260914-235643-008, AI-20260916-035206-009, AI-20260917-004357-013)** —
   FAILed subtests: join_no_sort, also failed previous run.
 - [ ] **testport/TestPort_PgDumpConnectionSetup (AI-20260905-011015-006, AI-20260914-235643-009, AI-20260916-035206-010, AI-20260917-004357-014)** —
