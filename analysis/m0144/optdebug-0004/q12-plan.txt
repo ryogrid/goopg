@@ -1,0 +1,27 @@
+                                                                                            QUERY PLAN                                                                                            
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=8774.73..8774.79 rows=22 width=291)
+   ->  Sort  (cost=8774.73..8774.79 rows=22 width=291)
+         Sort Key: item.i_category, item.i_class, item.i_item_id, item.i_item_desc, ((((sum(web_sales.ws_ext_sales_price)) * '100'::numeric) / sum((sum(web_sales.ws_ext_sales_price))) OVER w1))
+         ->  WindowAgg  (cost=8773.75..8774.24 rows=22 width=291)
+               Window: w1 AS (PARTITION BY item.i_class)
+               ->  Sort  (cost=8773.75..8773.80 rows=22 width=259)
+                     Sort Key: item.i_class
+                     ->  GroupAggregate  (cost=8770.09..8773.26 rows=22 width=259)
+                           Group Key: item.i_category, item.i_class, item.i_item_id, item.i_item_desc, item.i_current_price
+                           ->  Gather Merge  (cost=8770.09..8772.65 rows=22 width=233)
+                                 Workers Planned: 2
+                                 ->  Sort  (cost=7770.07..7770.09 rows=9 width=233)
+                                       Sort Key: item.i_category, item.i_class, item.i_item_id, item.i_item_desc, item.i_current_price
+                                       ->  Nested Loop  (cost=2069.06..7769.92 rows=9 width=233)
+                                             ->  Parallel Hash Join  (cost=2068.78..7759.43 rows=31 width=10)
+                                                   Hash Cond: (web_sales.ws_sold_date_sk = date_dim.d_date_sk)
+                                                   ->  Parallel Seq Scan on web_sales  (cost=0.00..5493.82 rows=74982 width=14)
+                                                   ->  Parallel Hash  (cost=2068.55..2068.55 rows=18 width=4)
+                                                         ->  Parallel Seq Scan on date_dim  (cost=0.00..2068.55 rows=18 width=4)
+                                                               Filter: ((d_date >= '2001-06-15'::date) AND (d_date <= '2001-07-15 00:00:00'::timestamp without time zone))
+                                             ->  Index Scan using item_pkey on item  (cost=0.29..0.34 rows=1 width=231)
+                                                   Index Cond: (i_item_sk = web_sales.ws_item_sk)
+                                                   Filter: (i_category = ANY ('{Men,Books,Electronics}'::bpchar[]))
+(23 rows)
+

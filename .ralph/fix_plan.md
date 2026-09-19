@@ -10961,7 +10961,7 @@ goopg's processing route diverged from PG's upstream of the fix).
   clusters.
   Kind: impl
   Parent: M0144-0003
-- [ ] **M0144-0004 — instrumented PG 18.3, instrument 1: `OPTIMIZER_DEBUG`
+- [x] **M0144-0004 — instrumented PG 18.3, instrument 1: `OPTIMIZER_DEBUG`
   build** (03-forward-plan §3). Build PG 18.3 from a **scratch checkout**
   (`./postgres/` stays read-only) with `OPTIMIZER_DEBUG` defined; serve a
   private clone of the corpus on a `55xx` port (never `:65432`/`:65438` — R1
@@ -10969,6 +10969,19 @@ goopg's processing route diverged from PG's upstream of the fix).
   and capture the per-rel survivor pathlists for the top first-divergence
   queries from 0002. Known limit (record it): survivors-only — `add_path`
   prints nothing, rejected candidates are already evicted.
+  Done: scratch clone of `62d6c7d3df6` under `tmp/pg18-optdebug/`,
+  `CPPFLAGS="-DOPTIMIZER_DEBUG"` (Makefile.global / `CONFIGURE_ARGS`), private
+  `tpcds025` clone on `:5560` loaded from the harness's own TSVs + `tpcds.sql`
+  + `ANALYZE` (zero reference-cluster access; `max_parallel_workers_per_gather=4`
+  mirrored). 12-query capture set covering every census category n≥2; all 12
+  plans shape-match the :65438 reference (ANALYZE re-sample drift only).
+  Distiller `scripts/pg-optdebug-survivors.py` → per-rel survivor tables in
+  `analysis/m0144/optdebug-0004/` (211 MB raw nodeToString stays in `tmp/`,
+  reproducible). Gotchas: nodeToString namespaces path fields
+  (`path.`/`jpath.path.`/bare); `cheapest_total_path` is a node-valued field
+  at list-less depth; TPC-DS Q23 is two-statement — EXPLAIN each.
+  `docs/design/0100-0149/m0144-0004-optdebug-instrumented-pg.md`;
+  `analysis/m0144/m0144-0004-optdebug-build.md`.
   Kind: impl
   Parent: none
 - [ ] **M0144-0005 — instrumented PG, instrument 2: `debug_plan_candidates`
