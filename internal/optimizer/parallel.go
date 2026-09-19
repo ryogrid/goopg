@@ -646,7 +646,21 @@ func stampParallelScan(n Node) Node {
 		// M0140-0006c: mirror of the drivingScan *SetOp arm — BOTH branches
 		// are stamped, not just one side, since a partial SetOp streams
 		// both.
-		left, right := stampParallelScan(x.Left), stampParallelScan(x.Right)
+		//
+		// M0140-0006c-3: a branch stamped claimed-whole
+		// (x.LeftNonPartial/x.RightNonPartial) is NOT descended — its
+		// driving scan is drained serially by the one participant that
+		// CAS-wins the branch claim, so stamping it would mark a scan no
+		// claim set will ever serve (and mislabel it "Parallel" in
+		// EXPLAIN, where PG shows the non-partial branch's ordinary serial
+		// subtree).
+		left, right := x.Left, x.Right
+		if !x.LeftNonPartial {
+			left = stampParallelScan(x.Left)
+		}
+		if !x.RightNonPartial {
+			right = stampParallelScan(x.Right)
+		}
 		if left == x.Left && right == x.Right {
 			return x
 		}
@@ -750,7 +764,18 @@ func drivingScan(n Node) Node {
 		// bare scan only), so in practice x.Left/x.Right are already a
 		// bare *SeqScan/*IndexScan here; this stays the general recursive
 		// form anyway, matching every other arm's sibling-agreement shape.
-		if drivingScan(x.Left) == nil || drivingScan(x.Right) == nil {
+		//
+		// M0140-0006c-3: a branch stamped claimed-whole
+		// (x.LeftNonPartial/x.RightNonPartial — PG's pa_nonpartial_subpaths)
+		// is drained serially by its single CAS-winning participant, so it
+		// needs no driving scan and its side of the check is satisfied by
+		// the marker alone. An all-claimed SetOp therefore returns x with
+		// nothing below it scanned — correct: workers divide BRANCHES, not
+		// rows, and gatherChildPlan's panic guard is answered by the two
+		// claim flags, not by a stamped scan.
+		leftOK := x.LeftNonPartial || drivingScan(x.Left) != nil
+		rightOK := x.RightNonPartial || drivingScan(x.Right) != nil
+		if !leftOK || !rightOK {
 			return nil
 		}
 		return x

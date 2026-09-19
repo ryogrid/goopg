@@ -540,6 +540,21 @@ type parallelClaimSet struct {
 	// newLeafParallelClaimSet.
 	setOpLeft  *parallelClaimSet
 	setOpRight *parallelClaimSet
+
+	// claimedWhole (M0140-0006c-3) is PG's `pa_finished` on a non-partial
+	// Append subplan (nodeAppend.c:68-80,704-832): a SetOp branch the
+	// planner marked claimed-whole (SetOp.LeftNonPartial/RightNonPartial —
+	// its pa_nonpartial_subpaths member) is not split by block at all.
+	// Instead every participant CASes this flag once; the winner drains
+	// its own private copy of the branch serially, losers treat the
+	// branch as exhausted. It lives on the LEAF claim set
+	// (setOpLeft/setOpRight) because the claim is per-branch, and attachAll
+	// wires it into the *setOp op's claimLeft/claimRight rather than
+	// attaching any scan state — the branch's scans stay unclaimed by
+	// design (the claiming worker runs them serially). Unused on a claim
+	// set whose SetOp branch is partial — the zero value is the
+	// "unclaimed" state CAS expects, so no constructor work is needed.
+	claimedWhole atomic.Bool
 }
 
 // newParallelClaimSet builds the claim state that needs no pre-pass. pbm is
@@ -614,8 +629,28 @@ func (cs *parallelClaimSet) attachAll(op Operator) bool {
 	// its own by design (one recursion here instead of three, one per
 	// attachParallel* function).
 	if so, ok := unwrapToSetOp(op); ok {
-		left := cs.setOpLeft.attachAll(so.left)
-		right := cs.setOpRight.attachAll(so.right)
+		// M0140-0006c-3: a branch the plan stamped claimed-whole
+		// (SetOp.LeftNonPartial/RightNonPartial — PG's
+		// pa_nonpartial_subpaths) gets NO scan attach at all. Instead the
+		// leaf's claimedWhole flag is wired into the op so every
+		// participant CAS-claims the branch before draining it
+		// (nextStreaming); the winner runs its private copy serially, the
+		// losers skip it. Wiring counts as attached — the flag IS the
+		// claim state for that branch. A planless *setOp (synthetic
+		// trees) takes the partial path on both sides, as before.
+		left, right := false, false
+		if so.plan != nil && so.plan.LeftNonPartial {
+			so.claimLeft = &cs.setOpLeft.claimedWhole
+			left = true
+		} else {
+			left = cs.setOpLeft.attachAll(so.left)
+		}
+		if so.plan != nil && so.plan.RightNonPartial {
+			so.claimRight = &cs.setOpRight.claimedWhole
+			right = true
+		} else {
+			right = cs.setOpRight.attachAll(so.right)
+		}
 		return left || right
 	}
 	attached := attachParallelScan(op, cs.pscan)
@@ -691,9 +726,20 @@ func (cs *parallelClaimSet) bitmapPrebuildTargets(tree Operator) []bitmapPrebuil
 		if so.plan == nil {
 			return nil
 		}
+		// M0140-0006c-3: a branch stamped claimed-whole
+		// (LeftNonPartial/RightNonPartial) is skipped — it gets no claim
+		// attach (attachAll wires only the claimedWhole CAS flag), so its
+		// leaf pbm must stay nil and the claiming worker's bitmap op builds
+		// a private serial bitmap, exactly like a bitmap in any serial
+		// subtree. Publishing a shared bitmap nobody attaches would be
+		// wasted leader work at best.
 		var out []bitmapPrebuildTarget
-		out = cs.setOpLeft.appendBitmapPrebuildTarget(out, so.plan.Left, so.left)
-		out = cs.setOpRight.appendBitmapPrebuildTarget(out, so.plan.Right, so.right)
+		if !so.plan.LeftNonPartial {
+			out = cs.setOpLeft.appendBitmapPrebuildTarget(out, so.plan.Left, so.left)
+		}
+		if !so.plan.RightNonPartial {
+			out = cs.setOpRight.appendBitmapPrebuildTarget(out, so.plan.Right, so.right)
+		}
 		return out
 	}
 	var bmOps []*bitmapHeapScanOp

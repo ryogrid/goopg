@@ -151,6 +151,142 @@ func TestGatherOverSetOpIdentity(t *testing.T) {
 	}
 }
 
+// TestGatherOverSetOpMixedClaimedWholeIdentity is M0140-0006c-3's gate:
+// the mixed arm's executor half. The right UNION ALL branch is stamped
+// claimed-whole (SetOp.RightNonPartial — PG's pa_nonpartial_subpaths
+// member), so it is NOT split by block: every participant opens it, the
+// first to touch it CAS-wins the shared claimedWhole flag and drains its
+// private copy serially, and every loser treats it as exhausted. The left
+// branch stays partial — its rows are still partitioned through the
+// ordinary per-block claim set.
+//
+// The identity check is the only verdict that counts: at workers=4 the
+// whole branch must still come back exactly once. A missing claim wire
+// returns it 4 times (the N-copies defect in branch form); a claim that
+// wires but never fires drops all 90 right-branch rows.
+func TestGatherOverSetOpMixedClaimedWholeIdentity(t *testing.T) {
+	ctx, cleanup := parallelSetOpFixture(t)
+	defer cleanup()
+
+	const wantTotal = 260 + 90
+
+	for _, workers := range []int{1, 2, 4} {
+		t.Run(fmt.Sprintf("workers=%d", workers), func(t *testing.T) {
+			advanceStmtCounter(ctx)
+			so := planSetOpTestNode(t, ctx)
+			so.RightNonPartial = true
+			gathered := optimizer.NewGather(0, so, workers)
+
+			ctx.MaxParallelWorkers = 8
+			ctx.ParallelLeaderParticipation = true
+			op, err := Build(gathered)
+			if err != nil {
+				t.Fatalf("build: %v", err)
+			}
+			if err := op.Open(ctx); err != nil {
+				t.Fatalf("open: %v", err)
+			}
+			seen := map[string]int{}
+			n := 0
+			for {
+				slot, err := op.Next()
+				if err == EOF {
+					break
+				}
+				if err != nil {
+					t.Fatalf("next: %v", err)
+				}
+				seen[datumTestString(slot.Row()[0])]++
+				n++
+			}
+			if err := op.Close(); err != nil {
+				t.Fatalf("close: %v", err)
+			}
+
+			if n != wantTotal {
+				t.Fatalf("got %d rows, want %d — more means every worker replayed the "+
+					"claimed-whole branch instead of CAS-claiming it (pa_finished); fewer "+
+					"means the claim wired but never fired", n, wantTotal)
+			}
+			for v, c := range seen {
+				if c != 1 {
+					t.Fatalf("row %s returned %d times; the claimed-whole branch must "+
+						"drain exactly once and the partial branch's claim set must "+
+						"partition the rest", v, c)
+				}
+			}
+			if _, ok := seen[datumTestString(NewIntDatum(5))]; !ok {
+				t.Errorf("missing a row from pq_setop_a (id=5); the partial left branch was not partitioned")
+			}
+			if _, ok := seen[datumTestString(NewIntDatum(100005))]; !ok {
+				t.Errorf("missing a row from pq_setop_b (id=100005); the claimed-whole right branch was never drained")
+			}
+		})
+	}
+}
+
+// TestGatherOverSetOpAllClaimedWholeIdentity is the all-claimed corner of
+// the mixed arm: BOTH branches stamped claimed-whole. No scan is stamped
+// and no claim set attaches — workers divide BRANCHES, not rows: each
+// participant CAS-claims whichever branch is still unclaimed at first
+// touch, drains it serially, and a worker that loses both claims emits
+// nothing. The multiset must still come back exactly once at every worker
+// count — including workers=4 against only two branches, where at least
+// two participants necessarily emit zero rows.
+func TestGatherOverSetOpAllClaimedWholeIdentity(t *testing.T) {
+	ctx, cleanup := parallelSetOpFixture(t)
+	defer cleanup()
+
+	const wantTotal = 260 + 90
+
+	for _, workers := range []int{1, 2, 4} {
+		t.Run(fmt.Sprintf("workers=%d", workers), func(t *testing.T) {
+			advanceStmtCounter(ctx)
+			so := planSetOpTestNode(t, ctx)
+			so.LeftNonPartial = true
+			so.RightNonPartial = true
+			gathered := optimizer.NewGather(0, so, workers)
+
+			ctx.MaxParallelWorkers = 8
+			ctx.ParallelLeaderParticipation = true
+			op, err := Build(gathered)
+			if err != nil {
+				t.Fatalf("build: %v", err)
+			}
+			if err := op.Open(ctx); err != nil {
+				t.Fatalf("open: %v", err)
+			}
+			seen := map[string]int{}
+			n := 0
+			for {
+				slot, err := op.Next()
+				if err == EOF {
+					break
+				}
+				if err != nil {
+					t.Fatalf("next: %v", err)
+				}
+				seen[datumTestString(slot.Row()[0])]++
+				n++
+			}
+			if err := op.Close(); err != nil {
+				t.Fatalf("close: %v", err)
+			}
+
+			if n != wantTotal {
+				t.Fatalf("got %d rows, want %d — every branch must drain exactly once "+
+					"across all participants", n, wantTotal)
+			}
+			for v, c := range seen {
+				if c != 1 {
+					t.Fatalf("row %s returned %d times; each claimed-whole branch is "+
+						"one participant's serial drain, not per-worker output", v, c)
+				}
+			}
+		})
+	}
+}
+
 // planHashForced plans sql with merge and nested-loop joins disabled, so the
 // planner must shape equi-joins as hash joins — the mirror of planMergeForced
 // (parallel_merge_join_identity_test.go). DefaultPlannerSettings plus two

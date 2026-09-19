@@ -1,6 +1,8 @@
 package executor
 
 import (
+	"sync/atomic"
+
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/optimizer"
 	"github.com/goopg/goopg/internal/storage"
@@ -23,6 +25,27 @@ type setOp struct {
 	leftDone  bool
 	rightDone bool
 	opened    bool
+
+	// claimLeft / claimRight (M0140-0006c-3) are PG's `pa_finished` on a
+	// non-partial Append subplan (nodeAppend.c): wired by attachAll's
+	// *setOp arm to the shared claimedWhole flag on the branch's leaf
+	// claim set when — and only when — the plan marks that branch
+	// claimed-whole (SetOp.LeftNonPartial/RightNonPartial). Every
+	// participant's private *setOp points at the SAME shared flag, so the
+	// CAS in nextStreaming decides which single participant drains its
+	// private copy of the branch whole; losers treat it as exhausted.
+	// nil for a partial branch (the ordinary per-block claim sets on
+	// setOpLeft/setOpRight drive those) and everywhere outside a Gather.
+	claimLeft  *atomic.Bool
+	claimRight *atomic.Bool
+	// leftClaimed / rightClaimed remember a won CAS so later Next calls
+	// drain without re-claiming — CAS(true→true) would lose against
+	// itself. They are NOT reset by Open: a worker that won keeps its
+	// claim across a re-open (the shared flag stays true either way, and
+	// only the winner may re-emit the branch), while a loser that
+	// re-opens simply loses the CAS again.
+	leftClaimed  bool
+	rightClaimed bool
 
 	// buffered output (non-streaming variants) produced at Open.
 	rows []Row
@@ -100,6 +123,24 @@ func (o *setOp) Next() (TupleSlot, error) {
 // (UNION ALL).
 func (o *setOp) nextStreaming() (TupleSlot, error) {
 	if !o.leftDone {
+		// M0140-0006c-3: a claimed-whole branch is drained by exactly ONE
+		// participant. The first Next on the branch CASes the shared
+		// pa_finished-style flag — the winner drains its private copy
+		// serially, every loser marks the branch done and moves on,
+		// closing its (opened but never-to-be-read) copy exactly as the
+		// EOF path does. The claim is demand-driven at first touch, not at
+		// Open: a participant still draining the other branch must not
+		// hold this one's claim, matching nodeAppend's claim-on-select.
+		if o.claimLeft != nil && !o.leftClaimed {
+			if o.claimLeft.CompareAndSwap(false, true) {
+				o.leftClaimed = true
+			} else {
+				o.leftDone = true
+				o.left.Close()
+			}
+		}
+	}
+	if !o.leftDone {
 		slot, err := o.left.Next()
 		if err == EOF {
 			o.leftDone = true
@@ -108,6 +149,16 @@ func (o *setOp) nextStreaming() (TupleSlot, error) {
 			return nil, err
 		} else {
 			return slot, nil
+		}
+	}
+	if !o.rightDone {
+		if o.claimRight != nil && !o.rightClaimed {
+			if o.claimRight.CompareAndSwap(false, true) {
+				o.rightClaimed = true
+			} else {
+				o.rightDone = true
+				o.right.Close()
+			}
 		}
 	}
 	if !o.rightDone {

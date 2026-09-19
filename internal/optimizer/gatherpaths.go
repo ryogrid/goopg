@@ -465,9 +465,29 @@ func partialPathDrivingKind(p *Path) PathKind {
 		// instead of only to the top-level claim set. The bitmap arm is
 		// dormant for the same reason the top-level one is: no producer
 		// files a partial bitmap path today.
-		if len(p.Children) != 2 || !setOpBranchDrivingKindIsSupported(p.Children[0]) ||
-			!setOpBranchDrivingKindIsSupported(p.Children[1]) {
+		//
+		// M0140-0006c-3: a branch marked claimed-whole
+		// (SetOpLeftNonPartial/SetOpRightNonPartial — PG's
+		// pa_nonpartial_subpaths) needs NO driving-kind check at all: one
+		// participant CAS-claims and drains it serially, so any
+		// parallel-safe serial plan qualifies, matching PG which puts
+		// `nppath` in regardless of its driving shape. The ParallelSafe
+		// re-check below is this file's standing posture — re-verify the
+		// producer's pick rather than trust it.
+		if len(p.Children) != 2 {
 			return PathPrebuilt
+		}
+		nonPartial := [2]bool{p.SetOpLeftNonPartial, p.SetOpRightNonPartial}
+		for i, c := range p.Children {
+			if nonPartial[i] {
+				if c == nil || !c.ParallelSafe {
+					return PathPrebuilt
+				}
+				continue
+			}
+			if !setOpBranchDrivingKindIsSupported(c) {
+				return PathPrebuilt
+			}
 		}
 		return PathSetOp
 	case PathHashJoin:

@@ -2717,6 +2717,18 @@ type SetOp struct {
 	// without an explicit Op assignment.
 	Op  parser.SetOpType
 	All bool
+	// LeftNonPartial / RightNonPartial mark a branch as CLAIMED-WHOLE
+	// under a parallel-aware SetOp (PG's pa_nonpartial_subpaths,
+	// M0140-0006c-3): the branch is not split by block claim — one
+	// participant wins a CAS and drains it serially. Stamped by
+	// createSetOpPlan from the Path's SetOpLeftNonPartial/
+	// SetOpRightNonPartial; false everywhere else, including the
+	// serial path and the pure-partial path, both of which attach
+	// ordinary per-branch claim state. The plan-tree walks
+	// (stampParallelScan, drivingScan) skip a marked branch — its
+	// driving scan is never claimed and stays .Parallel = false.
+	LeftNonPartial  bool
+	RightNonPartial bool
 }
 
 func (n *SetOp) Pos() int       { return n.pos }

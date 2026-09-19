@@ -257,6 +257,27 @@ type Path struct {
 	// replaces with the two built inputs. nil for every other kind. C-18.
 	SetOp *SetOp
 
+	// SetOpLeftNonPartial / SetOpRightNonPartial mark which of a
+	// PathSetOp's two children is a CLAIMED-WHOLE (non-partial) branch —
+	// PG's `pa_nonpartial_subpaths` member (allpaths.c:1588-1627,
+	// M0140-0006c-3). The mixed partial Append picks, per branch, the
+	// cheaper of the branch's cheapest partial path and its cheapest
+	// parallel-safe total path; a branch whose pick is the non-partial one
+	// is claimed and run whole by ONE participant rather than split by
+	// block. Positional: the flags apply to Children[0] (left) and
+	// Children[1] (right) respectively.
+	//
+	// The zero value (both false) is the status-quo reading — "no branch
+	// is claimed-whole" — so the serial SetOp path (addSetOpPaths) and the
+	// pure-partial path (both branches partial) need no stamp, and every
+	// pre-existing reader keeps its meaning. `createSetOpPlan` copies the
+	// pair onto the emitted `*SetOp` node, where the plan-tree walks
+	// (stampParallelScan / drivingScan) and the executor's claim wiring
+	// (attachAll's *setOp arm) read them. Only the mixed arm's producer
+	// sets them.
+	SetOpLeftNonPartial  bool
+	SetOpRightNonPartial bool
+
 	// PresortedCount is a PathIncrementalSort's presorted-prefix width —
 	// `addIncrementalSortPaths`' own `nCommon` (incrementalsortpaths.go),
 	// stashed here at Path-build time rather than re-derived at

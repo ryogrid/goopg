@@ -609,9 +609,17 @@ func TestAddPartialSetOpPathPricesLikeCostAppendParallelArm(t *testing.T) {
 	}}}
 	setOpRel.LeftBranchRel = left
 	setOpRel.RightBranchRel = right
-	node := setOpTestNode(parser.SetOpUnion, true, upperOrderedInput(1000), upperOrderedInput(400))
+	// Searched marks make each branch's boundary chain admissible to a
+	// partial pick (setOpBranchPartialChainOK); with both partials cheaper
+	// than the seed's TotalCost=100 the mixed arm's pick is partial on both
+	// sides, so only the pure arm files — the arm this test prices.
+	l := &searchedPricedNode{pricedNode: *upperOrderedInput(1000)}
+	l.markFromJoinSearch()
+	r := &searchedPricedNode{pricedNode: *upperOrderedInput(400)}
+	r.markFromJoinSearch()
+	node := setOpTestNode(parser.SetOpUnion, true, l, r)
 
-	addPartialSetOpPath(setOpRel, node, cp)
+	addPartialSetOpPath(setOpRel, node, cp, false)
 
 	if !setOpRel.ConsiderParallel {
 		t.Fatal("setOpRel.ConsiderParallel = false, want true (both branches consider parallel)")
@@ -659,15 +667,21 @@ func TestAddPartialSetOpPathAtLeastTwoWorkersForTwoChildren(t *testing.T) {
 	setOpRel := &RelOptInfo{}
 	mk := func(rows float64) *RelOptInfo {
 		return &RelOptInfo{ConsiderParallel: true, PartialPathlist: []*Path{{
-			Kind: PathSeqScan, Rows: rows, Cost: Cost{Total: rows},
+			Kind: PathSeqScan, Rows: rows, Cost: Cost{Total: rows / 4},
 			ParallelSafe: true, ParallelWorkers: 1,
 		}}}
 	}
 	setOpRel.LeftBranchRel = mk(100)
 	setOpRel.RightBranchRel = mk(50)
-	node := setOpTestNode(parser.SetOpUnion, true, upperOrderedInput(100), upperOrderedInput(50))
+	// Searched marks admit each branch's partial pick; Total=rows/4<100 keeps
+	// both picks partial so the floor is exercised on the pure arm itself.
+	l := &searchedPricedNode{pricedNode: *upperOrderedInput(100)}
+	l.markFromJoinSearch()
+	r := &searchedPricedNode{pricedNode: *upperOrderedInput(50)}
+	r.markFromJoinSearch()
+	node := setOpTestNode(parser.SetOpUnion, true, l, r)
 
-	addPartialSetOpPath(setOpRel, node, cp)
+	addPartialSetOpPath(setOpRel, node, cp, false)
 
 	if len(setOpRel.PartialPathlist) != 1 {
 		t.Fatalf("PartialPathlist = %d entries, want 1", len(setOpRel.PartialPathlist))
@@ -684,15 +698,20 @@ func TestAddPartialSetOpPathCapsAtMaxParallelWorkersPerGather(t *testing.T) {
 	setOpRel := &RelOptInfo{}
 	mk := func(rows float64, workers int) *RelOptInfo {
 		return &RelOptInfo{ConsiderParallel: true, PartialPathlist: []*Path{{
-			Kind: PathSeqScan, Rows: rows, Cost: Cost{Total: rows},
+			Kind: PathSeqScan, Rows: rows, Cost: Cost{Total: rows / 4},
 			ParallelSafe: true, ParallelWorkers: workers,
 		}}}
 	}
 	setOpRel.LeftBranchRel = mk(100, 3)
 	setOpRel.RightBranchRel = mk(50, 2)
-	node := setOpTestNode(parser.SetOpUnion, true, upperOrderedInput(100), upperOrderedInput(50))
+	// Searched marks + strictly-cheaper partials keep both picks partial.
+	l := &searchedPricedNode{pricedNode: *upperOrderedInput(100)}
+	l.markFromJoinSearch()
+	r := &searchedPricedNode{pricedNode: *upperOrderedInput(50)}
+	r.markFromJoinSearch()
+	node := setOpTestNode(parser.SetOpUnion, true, l, r)
 
-	addPartialSetOpPath(setOpRel, node, cp)
+	addPartialSetOpPath(setOpRel, node, cp, false)
 
 	if len(setOpRel.PartialPathlist) != 1 {
 		t.Fatalf("PartialPathlist = %d entries, want 1", len(setOpRel.PartialPathlist))
@@ -728,7 +747,7 @@ func TestAddPartialSetOpPathRefusesNonStreaming(t *testing.T) {
 		setOpRel.RightBranchRel = mk()
 		node := setOpTestNode(c.op, c.all, upperOrderedInput(100), upperOrderedInput(100))
 
-		addPartialSetOpPath(setOpRel, node, cp)
+		addPartialSetOpPath(setOpRel, node, cp, false)
 
 		if len(setOpRel.PartialPathlist) != 0 {
 			t.Fatalf("%s: PartialPathlist = %d entries, want 0 (not a streaming UNION ALL)", c.name, len(setOpRel.PartialPathlist))
@@ -752,7 +771,7 @@ func TestAddPartialSetOpPathRefusesUnderGatherPathsOff(t *testing.T) {
 	setOpRel.RightBranchRel = mk()
 	node := setOpTestNode(parser.SetOpUnion, true, upperOrderedInput(100), upperOrderedInput(100))
 
-	addPartialSetOpPath(setOpRel, node, cp)
+	addPartialSetOpPath(setOpRel, node, cp, false)
 
 	if len(setOpRel.PartialPathlist) != 0 {
 		t.Fatalf("PartialPathlist = %d entries, want 0 under GOOPG_GATHER_PATHS=off", len(setOpRel.PartialPathlist))
@@ -773,7 +792,7 @@ func TestAddPartialSetOpPathRefusesWhenABranchDoesNotConsiderParallel(t *testing
 	}}}
 	node := setOpTestNode(parser.SetOpUnion, true, upperOrderedInput(100), upperOrderedInput(100))
 
-	addPartialSetOpPath(setOpRel, node, cp)
+	addPartialSetOpPath(setOpRel, node, cp, false)
 
 	if setOpRel.ConsiderParallel {
 		t.Fatal("setOpRel.ConsiderParallel = true, want false (left branch refuses)")
@@ -785,24 +804,382 @@ func TestAddPartialSetOpPathRefusesWhenABranchDoesNotConsiderParallel(t *testing
 
 // TestAddPartialSetOpPathRefusesWhenABranchHasNoPartialPath: a branch can
 // consider parallel yet still offer no partial path at all (e.g. its own
-// search never built one) — the pure-partial arm this function builds needs
-// BOTH branches to have one.
+// search never built one). The PURE arm still refuses that shape — it needs
+// BOTH branches to have one — but since M0140-0006c-3 the MIXED arm accepts
+// it: the partial-less branch is claimed whole by one participant (PG's
+// pa_nonpartial_subpaths), exactly the shape this arm exists for. The
+// branches carry searched marks so the right branch's cheaper partial is a
+// real pick, not a chain refusal.
 func TestAddPartialSetOpPathRefusesWhenABranchHasNoPartialPath(t *testing.T) {
 	cp := defaultCostParams()
 	setOpRel := &RelOptInfo{}
 	setOpRel.LeftBranchRel = &RelOptInfo{ConsiderParallel: true}
-	setOpRel.RightBranchRel = &RelOptInfo{ConsiderParallel: true, PartialPathlist: []*Path{{
-		Kind: PathSeqScan, Rows: 100, Cost: Cost{Total: 100}, ParallelSafe: true, ParallelWorkers: 2,
+	right := &RelOptInfo{ConsiderParallel: true, PartialPathlist: []*Path{{
+		Kind: PathSeqScan, Rows: 100, Cost: Cost{Total: 50}, ParallelSafe: true, ParallelWorkers: 2,
 	}}}
-	node := setOpTestNode(parser.SetOpUnion, true, upperOrderedInput(100), upperOrderedInput(100))
+	setOpRel.RightBranchRel = right
+	l := &searchedPricedNode{pricedNode: *upperOrderedInput(100)}
+	l.markFromJoinSearch()
+	r := &searchedPricedNode{pricedNode: *upperOrderedInput(100)}
+	r.markFromJoinSearch()
+	node := setOpTestNode(parser.SetOpUnion, true, l, r)
 
-	addPartialSetOpPath(setOpRel, node, cp)
+	addPartialSetOpPath(setOpRel, node, cp, false)
 
 	if !setOpRel.ConsiderParallel {
 		t.Fatal("setOpRel.ConsiderParallel = false, want true (both branches consider parallel, regardless of partial paths)")
 	}
+	if len(setOpRel.PartialPathlist) != 1 {
+		t.Fatalf("PartialPathlist = %d entries, want 1 (the mixed arm: left claimed whole, right partial)", len(setOpRel.PartialPathlist))
+	}
+	p := setOpRel.PartialPathlist[0]
+	if !p.SetOpLeftNonPartial || p.SetOpRightNonPartial {
+		t.Fatalf("markers = (L=%v, R=%v), want (true, false): the partial-less left branch is claimed whole", p.SetOpLeftNonPartial, p.SetOpRightNonPartial)
+	}
+	if len(p.Children) != 2 || p.Children[1] != right.PartialPathlist[0] {
+		t.Fatal("right child is not the branch's partial path")
+	}
+	if p.Children[0].Kind != PathPrebuilt {
+		t.Fatalf("left child kind = %v, want PathPrebuilt (the claimed-whole seed over the branch's serial plan)", p.Children[0].Kind)
+	}
+}
+
+// TestAddPartialSetOpPathMixedArmSuppressedAtTopLevel pins the placement
+// rule (prepunion.c vs allpaths.c): `generate_union_paths` — the path
+// builder for a statement-level set operation — files ONLY the pure arm;
+// the mixed `pa_subpaths` arm is `add_paths_to_append_rel`'s alone,
+// reached for appendrels (flattened FROM-clause/CTE union-alls), never a
+// top-level `a UNION ALL b`. goopg's proxy is ps.ParallelStatementOK: the
+// SAME shape that files the mixed arm in a nested scope (topLevel=false,
+// the test above) must file NOTHING at top level — otherwise a top-level
+// setop could emit `Gather > Append` PG's setop pipeline cannot produce
+// (the TPC-DS Q66 regression: an all-claimed Parallel Append where PG
+// plans a serial Append).
+func TestAddPartialSetOpPathMixedArmSuppressedAtTopLevel(t *testing.T) {
+	cp := defaultCostParams()
+	setOpRel := &RelOptInfo{}
+	setOpRel.LeftBranchRel = &RelOptInfo{ConsiderParallel: true}
+	right := &RelOptInfo{ConsiderParallel: true, PartialPathlist: []*Path{{
+		Kind: PathSeqScan, Rows: 100, Cost: Cost{Total: 50}, ParallelSafe: true, ParallelWorkers: 2,
+	}}}
+	setOpRel.RightBranchRel = right
+	l := searchedSetOpBranch(100)
+	r := searchedSetOpBranch(100)
+	node := setOpTestNode(parser.SetOpUnion, true, l, r)
+
+	addPartialSetOpPath(setOpRel, node, cp, true)
+
+	if !setOpRel.ConsiderParallel {
+		t.Fatal("setOpRel.ConsiderParallel = false, want true — the flag stamps independently of the arms")
+	}
 	if len(setOpRel.PartialPathlist) != 0 {
-		t.Fatalf("PartialPathlist = %d entries, want 0 (left branch has no partial path)", len(setOpRel.PartialPathlist))
+		p := setOpRel.PartialPathlist[0]
+		t.Fatalf("PartialPathlist = %d entries at topLevel, want 0 — got markers (L=%v, R=%v); "+
+			"the mixed arm must not file for a statement-level set operation "+
+			"(generate_union_paths has no pa_subpaths arm)", len(setOpRel.PartialPathlist),
+			p.SetOpLeftNonPartial, p.SetOpRightNonPartial)
+	}
+}
+
+// TestAddPartialSetOpPathPureArmStillFilesAtTopLevel is the other half of
+// the placement rule: generate_union_paths DOES file the pure arm at top
+// level — a statement-level `a UNION ALL b` where every child has a
+// partial path legitimately earns `Gather > Append` in PG. topLevel=true
+// must therefore suppress only the mixed arm, never the pure one.
+func TestAddPartialSetOpPathPureArmStillFilesAtTopLevel(t *testing.T) {
+	cp := defaultCostParams()
+	setOpRel := &RelOptInfo{}
+	pp := func() *Path {
+		return &Path{Kind: PathSeqScan, Rows: 50, Cost: Cost{Total: 50}, ParallelSafe: true, ParallelWorkers: 2}
+	}
+	setOpRel.LeftBranchRel = &RelOptInfo{ConsiderParallel: true, PartialPathlist: []*Path{pp()}}
+	setOpRel.RightBranchRel = &RelOptInfo{ConsiderParallel: true, PartialPathlist: []*Path{pp()}}
+	l := searchedSetOpBranch(100)
+	r := searchedSetOpBranch(100)
+	node := setOpTestNode(parser.SetOpUnion, true, l, r)
+
+	addPartialSetOpPath(setOpRel, node, cp, true)
+
+	if len(setOpRel.PartialPathlist) != 1 {
+		t.Fatalf("PartialPathlist = %d entries at topLevel with both branches partial, want 1 (the pure arm)", len(setOpRel.PartialPathlist))
+	}
+	p := setOpRel.PartialPathlist[0]
+	if p.SetOpLeftNonPartial || p.SetOpRightNonPartial {
+		t.Fatalf("markers = (L=%v, R=%v), want (false, false): a top-level pure-arm path claims no branch whole", p.SetOpLeftNonPartial, p.SetOpRightNonPartial)
+	}
+}
+
+// searchedSetOpBranch is a searched-marked test branch: the boundary chain
+// is empty (the node IS the searched root), so setOpBranchPartialChainOK
+// admits its rel's partial path as a pick.
+func searchedSetOpBranch(rows float64) *searchedPricedNode {
+	n := &searchedPricedNode{pricedNode: *upperOrderedInput(rows)}
+	n.markFromJoinSearch()
+	return n
+}
+
+// TestSetOpBranchPartialChainOK pins the partial-pick admissibility walk:
+// a searched rel's partial path can stand in for the branch's own partial
+// subpath only when every boundary wrapper above the emission is either
+// per-worker-safe and stamp-descendable (*Project, *Filter, *Sort) or
+// dropped by the splice with no row effect (*Gather, *GatherMerge).
+// Everything else — row-capping *Limit, row-transforming *Distinct/
+// *Aggregate, typed-child *Memoize, unsearched nodes — leaves the branch
+// with no partial to offer, exactly PG's NULL pick for a wrapped child.
+func TestSetOpBranchPartialChainOK(t *testing.T) {
+	sr := func() *searchedPricedNode { return searchedSetOpBranch(100) }
+	plain := func() Node { return upperOrderedInput(100) }
+	cases := []struct {
+		name string
+		node Node
+		want bool
+	}{
+		{"bare-searched-root", sr(), true},
+		{"project-over-searched", &Project{Child: sr()}, true},
+		{"filter-over-searched", &Filter{Child: sr()}, true},
+		{"sort-over-searched", &Sort{Child: sr()}, true},
+		{"gather-over-searched", &Gather{Child: sr()}, true},
+		{"gathermerge-over-searched", &GatherMerge{Child: sr()}, true},
+		{"nested-wrappers", &Project{Child: &Filter{Child: &Gather{Child: &Sort{Child: sr()}}}}, true},
+		{"limit-over-searched", &Limit{Child: sr()}, false},
+		{"distinct-over-searched", &Distinct{Child: sr()}, false},
+		{"aggregate-over-searched", &Aggregate{Child: sr()}, false},
+		{"lockrows-over-searched", &LockRows{Child: sr()}, false},
+		{"project-over-limit", &Project{Child: &Limit{Child: sr()}}, false},
+		{"memoize-over-searched", &Memoize{Child: &IndexScan{}}, false},
+		{"unsearched-leaf", plain(), false},
+		{"project-over-unsearched", &Project{Child: plain()}, false},
+		{"nil", nil, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := setOpBranchPartialChainOK(tc.node); got != tc.want {
+				t.Errorf("setOpBranchPartialChainOK = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestAddPartialSetOpPathMixedArmPricesLikeCostAppend is the mixed arm's
+// cost pin: one branch offers a partial path (strictly cheaper than its
+// serial seed), the other offers none and is claimed WHOLE. Cost terms
+// from cost_append's parallel-aware arm specialised to this shape
+// (costsize.c:2330-2403): partial totals undivided, claimed-whole totals
+// through append_nonpartial_cost's makespan, rows = partial-rescaled +
+// whole/divisor, workers = max over PARTIAL children's counts floored at 2.
+func TestAddPartialSetOpPathMixedArmPricesLikeCostAppend(t *testing.T) {
+	cp := defaultCostParams()
+	setOpRel := &RelOptInfo{}
+	left := &RelOptInfo{ConsiderParallel: true, PartialPathlist: []*Path{{
+		Kind: PathSeqScan, Rows: 600, Cost: Cost{Startup: 1, Total: 60},
+		ParallelSafe: true, ParallelWorkers: 4,
+	}}}
+	setOpRel.LeftBranchRel = left
+	setOpRel.RightBranchRel = &RelOptInfo{ConsiderParallel: true} // no partial path
+	node := setOpTestNode(parser.SetOpUnion, true, searchedSetOpBranch(600), searchedSetOpBranch(300))
+
+	addPartialSetOpPath(setOpRel, node, cp, false)
+
+	if len(setOpRel.PartialPathlist) != 1 {
+		t.Fatalf("PartialPathlist = %d entries, want 1 (pure arm cannot file — right has no partial)", len(setOpRel.PartialPathlist))
+	}
+	p := setOpRel.PartialPathlist[0]
+	if p.Kind != PathSetOp || p.SetOp != node {
+		t.Fatal("filed path is not the node's own PathSetOp")
+	}
+	if p.SetOpLeftNonPartial || !p.SetOpRightNonPartial {
+		t.Fatalf("markers = (L=%v, R=%v), want (false, true)", p.SetOpLeftNonPartial, p.SetOpRightNonPartial)
+	}
+	const wantWorkers = 4 // max over PARTIAL children (4); claimed-whole contributes nothing
+	if p.ParallelWorkers != wantWorkers {
+		t.Fatalf("ParallelWorkers = %d, want %d", p.ParallelWorkers, wantWorkers)
+	}
+	if len(p.Children) != 2 || p.Children[0] != left.PartialPathlist[0] {
+		t.Fatal("left child is not the branch's partial path")
+	}
+	if p.Children[1].Kind != PathPrebuilt {
+		t.Fatalf("right child kind = %v, want PathPrebuilt (claimed-whole seed)", p.Children[1].Kind)
+	}
+	// Startup: min over the first parallel_workers subpaths = both.
+	if p.Cost.Startup != 1 {
+		t.Fatalf("Startup = %v, want 1 (min of partial's 1 and seed's 10)", p.Cost.Startup)
+	}
+	divisor := getParallelDivisor(wantWorkers, cp.parallelLeaderParticipation)
+	lDivisor := getParallelDivisor(4, cp.parallelLeaderParticipation)
+	// left rescales from its own divisor; right's whole-branch rows divide
+	// by the Append divisor (one participant emits it all).
+	wantRows := clampRowEst(600*(lDivisor/divisor) + 300/divisor)
+	if math.Abs(p.Rows-wantRows) > 1e-9 {
+		t.Fatalf("Rows = %v, want %v", p.Rows, wantRows)
+	}
+	// Total: partial's 60 + makespan over {seed's 100} + per-tuple overhead.
+	wantTotal := 60 + 100 + cp.cpuTupleCost*appendCPUCostMultiplier*wantRows
+	if math.Abs(p.Cost.Total-wantTotal) > 1e-9 {
+		t.Fatalf("Total = %v, want %v", p.Cost.Total, wantTotal)
+	}
+	if !p.ParallelSafe {
+		t.Fatal("ParallelSafe = false, want true")
+	}
+}
+
+// TestAddPartialSetOpPathMixedArmTieLandsInNonPartial pins PG's strict `<`:
+// a partial path whose total TIES the branch's serial plan does NOT win —
+// the branch joins pa_nonpartial_subpaths (allpaths.c:1424-1426 compares
+// `partial->total_cost < nppath->total_cost`, strictly).
+func TestAddPartialSetOpPathMixedArmTieLandsInNonPartial(t *testing.T) {
+	cp := defaultCostParams()
+	setOpRel := &RelOptInfo{}
+	// upperOrderedInput seeds carry TotalCost=100, so a partial at exactly
+	// 100 ties the claimed-whole candidate.
+	setOpRel.LeftBranchRel = &RelOptInfo{ConsiderParallel: true, PartialPathlist: []*Path{{
+		Kind: PathSeqScan, Rows: 100, Cost: Cost{Total: 100}, ParallelSafe: true, ParallelWorkers: 2,
+	}}}
+	setOpRel.RightBranchRel = &RelOptInfo{ConsiderParallel: true}
+	node := setOpTestNode(parser.SetOpUnion, true, searchedSetOpBranch(100), searchedSetOpBranch(100))
+
+	addPartialSetOpPath(setOpRel, node, cp, false)
+
+	if len(setOpRel.PartialPathlist) != 1 {
+		t.Fatalf("PartialPathlist = %d entries, want 1", len(setOpRel.PartialPathlist))
+	}
+	p := setOpRel.PartialPathlist[0]
+	if !p.SetOpLeftNonPartial || !p.SetOpRightNonPartial {
+		t.Fatalf("markers = (L=%v, R=%v), want (true, true): a tied partial loses to the serial plan", p.SetOpLeftNonPartial, p.SetOpRightNonPartial)
+	}
+	if p.Children[0].Kind != PathPrebuilt || p.Children[1].Kind != PathPrebuilt {
+		t.Fatal("both children should be claimed-whole seeds on a tie")
+	}
+}
+
+// TestAddPartialSetOpPathMixedArmAllClaimedWorkersFloor: an all-claimed
+// two-child Append still plans 2 workers — the log2(numChildren)+1 bump
+// exists precisely for non-partial children (allpaths.c:1596-1603: workers
+// come only from partial subpaths, then the two-child floor lifts 0 to 2).
+func TestAddPartialSetOpPathMixedArmAllClaimedWorkersFloor(t *testing.T) {
+	cp := defaultCostParams()
+	setOpRel := &RelOptInfo{}
+	setOpRel.LeftBranchRel = &RelOptInfo{ConsiderParallel: true}
+	setOpRel.RightBranchRel = &RelOptInfo{ConsiderParallel: true}
+	node := setOpTestNode(parser.SetOpUnion, true, searchedSetOpBranch(100), searchedSetOpBranch(100))
+
+	addPartialSetOpPath(setOpRel, node, cp, false)
+
+	if len(setOpRel.PartialPathlist) != 1 {
+		t.Fatalf("PartialPathlist = %d entries, want 1", len(setOpRel.PartialPathlist))
+	}
+	p := setOpRel.PartialPathlist[0]
+	if got := p.ParallelWorkers; got != 2 {
+		t.Fatalf("ParallelWorkers = %d, want 2 (no partial children; the two-child floor)", got)
+	}
+	// Cost: makespan over two equal seeds (workers >= children) = max, and
+	// rows divide both by the append divisor.
+	divisor := getParallelDivisor(2, cp.parallelLeaderParticipation)
+	wantRows := clampRowEst(100/divisor + 100/divisor)
+	if math.Abs(p.Rows-wantRows) > 1e-9 {
+		t.Fatalf("Rows = %v, want %v", p.Rows, wantRows)
+	}
+	wantTotal := 100.0 + cp.cpuTupleCost*appendCPUCostMultiplier*wantRows // max(100,100)
+	if math.Abs(p.Cost.Total-wantTotal) > 1e-9 {
+		t.Fatalf("Total = %v, want %v", p.Cost.Total, wantTotal)
+	}
+}
+
+// TestAddPartialSetOpPathMixedArmKillsWhenBranchOffersNeither mirrors PG's
+// `pa_subpaths_valid = false`: a branch whose serial plan is not
+// parallel-safe (LockRows — workers may not stamp row marks) and which has
+// no partial path offers neither pick, so the whole arm dies.
+func TestAddPartialSetOpPathMixedArmKillsWhenBranchOffersNeither(t *testing.T) {
+	cp := defaultCostParams()
+	setOpRel := &RelOptInfo{}
+	setOpRel.LeftBranchRel = &RelOptInfo{ConsiderParallel: true, PartialPathlist: []*Path{{
+		Kind: PathSeqScan, Rows: 100, Cost: Cost{Total: 50}, ParallelSafe: true, ParallelWorkers: 2,
+	}}}
+	setOpRel.RightBranchRel = &RelOptInfo{ConsiderParallel: true}
+	node := setOpTestNode(parser.SetOpUnion, true,
+		searchedSetOpBranch(100), &LockRows{Child: searchedSetOpBranch(100)})
+
+	addPartialSetOpPath(setOpRel, node, cp, false)
+
+	if len(setOpRel.PartialPathlist) != 0 {
+		t.Fatalf("PartialPathlist = %d entries, want 0 (right branch offers neither pick)", len(setOpRel.PartialPathlist))
+	}
+}
+
+// TestAddPartialSetOpPathMixedArmInheritsPureRows pins the `partial_rows`
+// override (allpaths.c:1594-1627 → pathnode.c:1417-1419): when the pure arm
+// also filed, the mixed path takes ITS row estimate — the Append emits the
+// same multiset either way.
+func TestAddPartialSetOpPathMixedArmInheritsPureRows(t *testing.T) {
+	cp := defaultCostParams()
+	setOpRel := &RelOptInfo{}
+	left := &RelOptInfo{ConsiderParallel: true, PartialPathlist: []*Path{{
+		Kind: PathSeqScan, Rows: 500, Cost: Cost{Total: 50}, ParallelSafe: true, ParallelWorkers: 2,
+	}}}
+	// Right's partial is DEARER than its serial seed (200 > 100): the pure
+	// arm files on it, but the mixed arm's pick lands claimed-whole.
+	right := &RelOptInfo{ConsiderParallel: true, PartialPathlist: []*Path{{
+		Kind: PathSeqScan, Rows: 300, Cost: Cost{Total: 200}, ParallelSafe: true, ParallelWorkers: 2,
+	}}}
+	setOpRel.LeftBranchRel = left
+	setOpRel.RightBranchRel = right
+	node := setOpTestNode(parser.SetOpUnion, true, searchedSetOpBranch(500), searchedSetOpBranch(300))
+
+	addPartialSetOpPath(setOpRel, node, cp, false)
+
+	// The mixed path is cheaper than the pure one (50+makespan vs 50+200),
+	// so pruning leaves exactly the mixed entry — carrying the pure arm's
+	// rows as its own estimate.
+	if len(setOpRel.PartialPathlist) != 1 {
+		t.Fatalf("PartialPathlist = %d entries, want 1 (mixed pruned the dearer pure arm)", len(setOpRel.PartialPathlist))
+	}
+	p := setOpRel.PartialPathlist[0]
+	if p.SetOpLeftNonPartial || !p.SetOpRightNonPartial {
+		t.Fatalf("markers = (L=%v, R=%v), want (false, true)", p.SetOpLeftNonPartial, p.SetOpRightNonPartial)
+	}
+	pureRows := clampRowEst(500 + 300) // same workers both sides: rescale is identity
+	if math.Abs(p.Rows-pureRows) > 1e-9 {
+		t.Fatalf("Rows = %v, want the pure arm's %v (partial_rows override)", p.Rows, pureRows)
+	}
+}
+
+// TestAddPartialSetOpPathMixedArmStripsGatherFromClaimedBranch pins the
+// nppath rule PG encodes in `get_cheapest_parallel_safe_total_inner` +
+// `create_gather_path` (`parallel_safe = false`): a branch whose serial
+// winner is a Gather still offers a claimed-whole plan — its serial form,
+// with the gather stripped — never the Gather itself.
+func TestAddPartialSetOpPathMixedArmStripsGatherFromClaimedBranch(t *testing.T) {
+	cp := defaultCostParams()
+	setOpRel := &RelOptInfo{}
+	setOpRel.LeftBranchRel = &RelOptInfo{ConsiderParallel: true, PartialPathlist: []*Path{{
+		Kind: PathSeqScan, Rows: 100, Cost: Cost{Total: 50}, ParallelSafe: true, ParallelWorkers: 2,
+	}}}
+	setOpRel.RightBranchRel = &RelOptInfo{ConsiderParallel: true}
+	// Right's serial plan won an inner Gather: the searched root still sits
+	// under it, so the branch's own partial path remains admissible — but
+	// with no partial on the rel, the pick must be the gather-free serial
+	// seed, not a claimed-whole copy of the Gather itself.
+	gathered := &Gather{Child: searchedSetOpBranch(100)}
+	node := setOpTestNode(parser.SetOpUnion, true, searchedSetOpBranch(100), gathered)
+
+	addPartialSetOpPath(setOpRel, node, cp, false)
+
+	if len(setOpRel.PartialPathlist) != 1 {
+		t.Fatalf("PartialPathlist = %d entries, want 1", len(setOpRel.PartialPathlist))
+	}
+	p := setOpRel.PartialPathlist[0]
+	if p.SetOpLeftNonPartial || !p.SetOpRightNonPartial {
+		t.Fatalf("markers = (L=%v, R=%v), want (false, true)", p.SetOpLeftNonPartial, p.SetOpRightNonPartial)
+	}
+	seed := p.Children[1]
+	if seed.Kind != PathPrebuilt {
+		t.Fatalf("right child kind = %v, want PathPrebuilt", seed.Kind)
+	}
+	built, _ := createPlanNode(seed)
+	if _, isGather := built.(*Gather); isGather {
+		t.Fatal("claimed-whole child built the Gather itself — a worker cannot run a nested gather")
+	}
+	if built != Node(gathered.Child) {
+		t.Fatal("claimed-whole child is not the branch's gather-free serial subtree")
 	}
 }
 

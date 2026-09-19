@@ -202,6 +202,18 @@ func TestParallelClaimSetAttachesEveryKind(t *testing.T) {
 		{"setOpRight", &setOp{left: &seqScanOp{}, right: &seqScanOp{}}, func(op Operator, cs *parallelClaimSet) bool {
 			return op.(*setOp).right.(*seqScanOp).pscan == cs.setOpRight.pscan
 		}},
+		// M0140-0006c-3: a branch stamped claimed-whole
+		// (SetOp.LeftNonPartial) attaches NO scan state — attachAll wires
+		// the leaf's claimedWhole flag into the op's claim pointer instead
+		// (PG's pa_finished on a non-partial Append subplan). The wiring
+		// counts as attached: the flag IS that branch's claim state.
+		{"claimedWhole", &setOp{
+			plan:  &optimizer.SetOp{Op: parser.SetOpUnion, All: true, LeftNonPartial: true},
+			left:  &seqScanOp{},
+			right: &seqScanOp{},
+		}, func(op Operator, cs *parallelClaimSet) bool {
+			return op.(*setOp).claimLeft == &cs.setOpLeft.claimedWhole
+		}},
 	}
 
 	covered := map[string]bool{}

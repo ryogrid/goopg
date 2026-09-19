@@ -33,7 +33,7 @@ func upperRelSetOpWithPartials(t *testing.T, cp costParams) *RelOptInfo {
 	setOpRel.LeftBranchRel = upperRelPartialBranch(100)
 	setOpRel.RightBranchRel = upperRelPartialBranch(50)
 	node := setOpTestNode(parser.SetOpUnion, true, upperOrderedInput(100), upperOrderedInput(50))
-	addPartialSetOpPath(setOpRel, node, cp)
+	addPartialSetOpPath(setOpRel, node, cp, false)
 	if len(setOpRel.PartialPathlist) != 1 {
 		t.Fatalf("setup: PartialPathlist = %d entries, want the producer's 1", len(setOpRel.PartialPathlist))
 	}

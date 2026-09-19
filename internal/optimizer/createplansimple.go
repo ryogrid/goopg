@@ -407,6 +407,24 @@ func windowSortKeys(w *WindowAgg) []SortKey {
 // The returned layout is nil for the same reason the other upper arms return
 // nil: a set operation has two children and therefore no single child layout
 // to pass through, and no caller above the seam reads one.
+//
+// M0140-0006c-3: a child that is a searched-path pick (either arm's
+// `PartialPathlist[0]` — anything that is not the branch's own
+// `PathPrebuilt` seed) emits the branch REL's subtree, which is what
+// `createPlanNode` produces — the searched emission, WITHOUT the boundary
+// wrappers (boundary `*Project`s, `Sort`, `Limit`, `Distinct`,
+// `Aggregate`, …) that sit between the branch node and that emission. A
+// wholesale `out.Left = built` would therefore emit the searched rel's
+// internal schema where the union declared the branch's — a wrong-arity,
+// wrong-rows plan whenever the projection is not an identity (`SELECT a`
+// over a two-column branch emits (a,b); a dropped `Limit`/`Filter` emits
+// rows the branch never produced). `spliceBranchEmission` rebuilds the
+// branch's wrapper chain over the substituted emission instead, so the
+// union branch keeps its declared output exactly as PG's Append child does.
+// The mixed arm's claimed-whole pick never needs the splice: it is a
+// `PathPrebuilt` seed over the branch node itself, which builds back to
+// that node pointer-identically — the `out.Left != p.SetOp.Left` check
+// below skips it.
 func createSetOpPlan(p *Path) (Node, outputLayout) {
 	if p.SetOp == nil {
 		panic("createPlan: PathSetOp with no set-op spec")
@@ -422,7 +440,95 @@ func createSetOpPlan(p *Path) (Node, outputLayout) {
 	out := *p.SetOp
 	out.Left = left
 	out.Right = right
+	// The splice fires only on searched-emission picks — either arm's
+	// `PartialPathlist[0]`, which builds the branch REL's subtree and drops
+	// the boundary wrappers above it. A `PathPrebuilt` child is the
+	// claimed-whole seed: it IS a whole-branch plan (the branch node itself,
+	// or its StripGather serial form), never an emission to re-wrap.
+	if p.Children[0].Kind != PathPrebuilt && out.Left != p.SetOp.Left {
+		out.Left = spliceBranchEmission(p.SetOp.Left, left)
+	}
+	if p.Children[1].Kind != PathPrebuilt && out.Right != p.SetOp.Right {
+		out.Right = spliceBranchEmission(p.SetOp.Right, right)
+	}
+	// M0140-0006c-3: the claimed-whole branch markers travel on the PATH,
+	// not the shared *SetOp spec — the serial path and the partial paths
+	// all carry the same spec, so stamping it there would leak the mixed
+	// arm's marks into plans that never made the pick.
+	out.LeftNonPartial = p.SetOpLeftNonPartial
+	out.RightNonPartial = p.SetOpRightNonPartial
 	return &out, nil
+}
+
+// spliceBranchEmission rebuilds `branch` with the searched emission swapped
+// for `built`. It descends the single-child pass-through kinds
+// `boundaryWalkChildren` enumerates — the wrappers that can sit between a
+// statement's root and a spliced searched subtree — copying each, and swaps
+// the FIRST node that is not one: that node is what the branch rel's winning
+// path emitted, and `built` (a different path of the same rel) emits the
+// same schema, so the wrappers re-apply unchanged. Multi-child kinds
+// (`*Join`, `*SetOp`, `*NestedLoopIndexJoin`), leaf scans, and nodes the
+// walk cannot enumerate are all emission points — they are replaced whole.
+//
+// `*Gather`/`*GatherMerge` are descended rather than copied: a swapped-in
+// partial subtree cannot carry the serial winner's gather (a Gather inside
+// a worker is nested parallelism the executor does not model), but the
+// wrappers BELOW it — including a searched-root `*Project` — still delimit
+// the emission, so the substitution continues underneath while the gather
+// itself is dropped. A `*Memoize` cannot be descended at all — its Child is
+// typed `*IndexScan` (plan.go), not `Node` — so it is an emission point too:
+// replaced whole, losing a cache hint, never rows.
+func spliceBranchEmission(branch, built Node) Node {
+	switch x := branch.(type) {
+	case *Project:
+		c := *x
+		c.Child = spliceBranchEmission(x.Child, built)
+		return &c
+	case *Filter:
+		c := *x
+		c.Child = spliceBranchEmission(x.Child, built)
+		return &c
+	case *Sort:
+		c := *x
+		c.Child = spliceBranchEmission(x.Child, built)
+		return &c
+	case *Limit:
+		c := *x
+		c.Child = spliceBranchEmission(x.Child, built)
+		return &c
+	case *Distinct:
+		c := *x
+		c.Child = spliceBranchEmission(x.Child, built)
+		return &c
+	case *DistinctOn:
+		c := *x
+		c.Child = spliceBranchEmission(x.Child, built)
+		return &c
+	case *OrdinalityWrap:
+		c := *x
+		c.Child = spliceBranchEmission(x.Child, built)
+		return &c
+	case *LockRows:
+		c := *x
+		c.Child = spliceBranchEmission(x.Child, built)
+		return &c
+	case *Aggregate:
+		c := *x
+		c.Child = spliceBranchEmission(x.Child, built)
+		return &c
+	case *WindowAgg:
+		c := *x
+		c.Child = spliceBranchEmission(x.Child, built)
+		return &c
+	case *Gather:
+		// Descended, not copied: the substitution must reach the emission
+		// below the serial winner's gather while the gather itself is
+		// dropped — a partial subtree cannot carry one.
+		return spliceBranchEmission(x.Child, built)
+	case *GatherMerge:
+		return spliceBranchEmission(x.Child, built)
+	}
+	return built
 }
 
 func createSortPlan(p *Path) (Node, outputLayout) {
