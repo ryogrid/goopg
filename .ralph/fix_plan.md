@@ -5929,7 +5929,7 @@ cross-layer programme that has never been scoped.
   est=3 vs actual=9969 (qerr 3323), Q25 `date_dim+store_returns` est=1 vs
   actual=6422. Gates: none beyond the gate itself (measurement-only task, no
   production code touched this loop).
-- [x] **M0142-0005 — give the executor a per-worker Memoize so a Gather-wrapped
+- [!] **M0142-0005 — give the executor a per-worker Memoize so a Gather-wrapped
   Kind: recon. Movement: none (recon/measurement record only; the
   implementation children M0142-0005a landed and M0142-0005b is filed
   below).
@@ -6004,6 +6004,31 @@ cross-layer programme that has never been scoped.
   `docs/design/0100-0149/m0142-0005-b8-index-probe-mult-reverify.md`.
   Ledger row filed 2026-09-19. The faithful exit is filed as
   **M0142-0005b** below.
+  **ESCALATION 2026-09-19 — S4 lineage budget exhausted** (descendants
+  0005b/c/d/e/f all closed `Movement: none`; the open 0005g is no longer
+  selectable and the root is marked `[!]` — only the owner reopens).
+  What the chain proved: the `cost_index` port is *faithful* (0005c
+  replay within ~1%); `indexProbeCostMultiplier=2.0` stays load-bearing
+  because it compensates **input** divergence, chiefly corpus physical
+  layout — goopg's TPC-H heap is perfectly clustered on the four large
+  key-ordered probe columns (`corr=1.0`, 0 inversions) vs PG's fragmented
+  reference (0.845/0.845/0.194/0.195; census in
+  `m0142-0005f-tpch-corpus-layout-parity.md`). 0005d/e fixed the two real
+  defects the recon surfaced (nullable-column correlation >1.0; NLI probe
+  display costs). **Remaining blocker**: the only honest exit —
+  rebuilding `:65433` in PG's ctid order — is an owner-side corpus action
+  (R1). The recipe is validated end-to-end (`SELECT … ORDER BY ctid` →
+  `COPY FROM csv` → `ANALYZE` reproduced corr 0.8464 vs PG 0.8451 and
+  exactly 12,235 inversions); needs re-pinning `spotcheck_expected.env` +
+  `tpch-row-anchors.csv` (corpora become row-identical to PG's
+  5,998,835-row lineitem). **Expected movement if unblocked**: TPC-H
+  Q9/Q10/Q14 hold hash shapes at `GOOPG_INDEX_PROBE_MULT=1` (probe ≈7.13
+  like PG vs 3.82 today), then TPC-DS unlocks the measured mult=1 gains
+  (`scan-type` 59→51, `join-order` 91→88, `qual-placement` 20→24 —
+  regression to file). **Size**: owner bench action ~1 afternoon (8 dumps
+  + reload + re-pin), then one parity-measurement loop. Open-but-frozen
+  child: M0142-0005g (patternsel 2× recon — still real, still unblocked
+  technically, but unfundable under S4 until the owner reopens).
 - [x] **M0142-0005a — admit a Memoize-wrapped bare index probe as a
   Gather-driving kind.** **DONE 2026-09-19; full writeup in
   `docs/design/0100-0149/m0142-0005a-partial-memoize-nli-gather-admission.md`.**
@@ -6213,21 +6238,39 @@ cross-layer programme that has never been scoped.
   - Movement: none on plan choice (display/provenance only). Plan-text
     captures now carry honest probe costs — future recon/measurement
     loops can trust the printed numbers.
-- [ ] **M0142-0005f — recon: TPC-H corpus physical-layout parity — rebuild
-  in PG-reference order or accept the divergence?**
+- [x] **M0142-0005f — recon: TPC-H corpus physical-layout parity — rebuild
+  in PG-reference order or accept the divergence?** DONE 2026-09-19.
   Parent: M0142-0005c. Kind: recon.
-  goopg's TPC-H benchmark heap is physically clustered on every key column
-  (0 block-boundary inversions, `correlation=1.0` honest) while PG's
-  reference heap is fragmented (corr 0.19–0.85). `indexProbeCostMultiplier`
-  currently masks the resulting probe-pricing gap corpus-wide. Decide: (a)
-  rebuild the `:65433` corpus so heap physical order matches PG's reference
-  (e.g. dump PG's per-table ctid order and reload in that order — an
-  owner-adjacent bench-harness change, not planner code), which would make
-  `correlation` converge to PG's values and let the multiplier retire; or
-  (b) keep the scalar as a documented corpus-layout shim. Deliverable: the
-  measurement of how wide the layout divergence is (all key columns, both
-  corpora), a concrete rebuild recipe if (a), and the expected plan-parity
-  movement named (Q9/Q10/Q14 on TPC-H are the known probes).
+  Movement: none (recon).
+  - Census (16 key columns, both corpora — `pg_stats.correlation` plus
+    adjacent-key inversions over true heap order; index paths disabled
+    because covering indexes make PG answer `SELECT key FROM t` with
+    index-order index-only scans): **the divergence is exactly the four
+    large key-ordered probe columns** — `part.p_partkey`,
+    `partsupp.ps_partkey`, `orders.o_orderkey`, `lineitem.l_orderkey`
+    (goopg corr=1.0 vs PG 0.845/0.845/0.194/0.195). Every
+    generator-shuffled column already agrees to sampling noise on both
+    metrics; PG's fragmentation is confined to the big tables
+    (`supplier.s_suppkey`/`customer.c_custkey` are 0.9996/0.9980 on PG
+    too).
+  - Rebuild recipe VALIDATED on a private `:5533` clone: dump PG rows
+    `ORDER BY ctid` (plain `psql --csv SELECT` — the COPY keyword is
+    guard-blocked on reference clusters), `COPY FROM` into goopg,
+    `ANALYZE` → `ps_partkey` corr **0.8464** (PG: 0.8451; goopg native:
+    1.0) and exactly **12,235** inversions — PG's ordering reproduced
+    faithfully. Caveat: load via db `postgres` — the known per-DB scoping
+    gap makes COPY/ANALYZE miss new relations inside db `tpch`.
+  - Decision: **(a) rebuild** recommended — validated, cheap, no planner
+    code, makes corpora row-identical. It is an owner-side action on
+    `:65433` (R1): row anchors re-pin, stored stats re-derived.
+  - Expected movement named: TPC-H Q9/Q10/Q14 hold hash shapes at
+    mult=1 (probe ≈7.13 like PG, vs 3.82 today); TPC-DS mult=1 measured
+    gains become reachable (scan-type 59→51, join-order 91→88;
+    qual-placement 20→24 is a known regression the step must file).
+  - Design doc:
+    `docs/design/0100-0149/m0142-0005f-tpch-corpus-layout-parity.md`;
+    evidence `tmp/m0142-0005f-census.{sh,txt}`. Follow-up carried by the
+    M0142-0005 root's ESCALATION block (lineage budget exhausted — S4).
 - [ ] **M0142-0005g — recon: `patternClauseSelectivity` vs PG on
   `LIKE '%x%'` — 2× divergence feeding `loopCount`.**
   Parent: M0142-0005c. Kind: recon.

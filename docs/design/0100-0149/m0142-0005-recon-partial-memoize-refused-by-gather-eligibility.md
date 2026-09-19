@@ -1,6 +1,6 @@
 # M0142-0005 — recon: the real blocker is Gather-eligibility refusing a Memoize-wrapped partial inner, not "no Memoize on the NL probe path"
 
-Status: accepted (recon closed 2026-09-16, no code change; task closed 2026-09-19 after the B8 re-measurement — see `m0142-0005-b8-index-probe-mult-reverify.md`, which filed `M0142-0005b` for the streamed-probe executor fix that retires `indexProbeCostMultiplier`)
+Status: accepted (recon closed 2026-09-16, no code change; task closed 2026-09-19 after the B8 re-measurement — see `m0142-0005-b8-index-probe-mult-reverify.md`, which filed `M0142-0005b` for the streamed-probe executor fix that retires `indexProbeCostMultiplier`). Root task `[!]` since 2026-09-19 — S4 lineage budget exhausted; see the M0142-0005 ESCALATION block in `.ralph/fix_plan.md`.
 
 ## Task
 

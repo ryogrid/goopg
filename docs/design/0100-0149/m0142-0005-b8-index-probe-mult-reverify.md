@@ -6,7 +6,10 @@ scoping recon itself); this doc discharges its residual B8 question —
 post-dates Memoize's landing and is unverified against the current binary;
 measure before touching it".
 
-Status: **recon complete, no production change.** Verdict: the knob is
+Status: **recon complete, no production change.** Root task `[!]` since
+2026-09-19 — S4 lineage budget exhausted (descendants 0005b–f all closed
+`Movement: none`); escalation block in `.ralph/fix_plan.md` M0142-0005
+carries the owner-side corpus-rebuild follow-up. Verdict: the knob is
 still load-bearing, and it now sits in a corpus-dependent tension —
 removing it regresses TPC-H plan parity, keeping it suppresses TPC-DS
 scan-type parity. The faithful exit is the NL-probe executor gap the knob
