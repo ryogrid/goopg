@@ -979,15 +979,36 @@ heuristic stays live.)
     catalog-loss hold (G6).
 
 ### Nightly run 20260914-235643 (sha `baf40efcbfbd`, 14 items) — filed 2026-09-15
-- [ ] **units/internal/parser (AI-20260914-235643-001, AI-20260916-035206-001, AI-20260917-004357-002)** — new tonight, units suite
+- [x] **units/internal/parser (AI-20260914-235643-001, AI-20260916-035206-001, AI-20260917-004357-002)** — new tonight, units suite
   failed to build/run `internal/parser` (repro: `go test -timeout 10m
   ./internal/parser/`). Likely the same root cause as this file's own
   "Manually discovered" `parser/TestLockingClauseParity` entry below (filed the
   same day from an interactive gate run) — re-run both repros together before
   treating as two separate bugs.
-- [ ] **race/internal/parser (AI-20260914-235643-003, AI-20260916-035206-003, AI-20260917-004357-005)** — new tonight, race suite
+  - **CLOSED 2026-09-19 — stale, verified green at HEAD `fd6fe3f98`** (Loop
+    \#12). Repro `go test -timeout 10m ./internal/parser/` PASS; all six
+    tests the blast-radius note named pass individually
+    (`TestLockingClauseParity`, `TestValuesTable`, `TestCopyStatement`,
+    `TestAggregateOrderByParity`, `TestVariadicCallParity`,
+    `TestParityGoldensAreCurrent`). The named mechanism — `dc91bd6b7`'s
+    `RangeVar.GroupedJoinUnaliased` changing `dumpStmts` text without a
+    goldens regen — was fixed by `846cb718a` (2026-09-17, regenerated
+    `parity_goldens.txt`); the filing's "every `FROM`-clause RangeVar"
+    premise was broader than reality — the field is set only by
+    `groupedJoinRangeVar` (`internal/parser/support.go:169`) for synthetic
+    unaliased parenthesized JOINs. Tonight's nightly (`20260919-000526`)
+    independently agrees: `units` stage PASS (167s). The `bak/` compile
+    half of the 2026-09-15 report was untracked-scratch contamination,
+    already closed under `infra/nightly-live-tree-build-race`.
+- [x] **race/internal/parser (AI-20260914-235643-003, AI-20260916-035206-003, AI-20260917-004357-005)** — new tonight, race suite
   failed in `internal/parser` (repro: `go test -race -timeout 45m
   ./internal/parser/`). Same likely-shared root cause note as the item above.
+  - **CLOSED 2026-09-19 — same defect cluster as the units item above,
+    verified green at HEAD `fd6fe3f98`** (Loop \#12). Repro `go test -race
+    -timeout 45m ./internal/parser/` PASS (2.9s, no race warnings).
+    Tonight's nightly race stage agrees — its only filed regression was
+    `race/internal/executor` (the pre-fix instrumentscope signature); no
+    parser item was raised.
 - [x] **testport/TestPort_IsolationEvalPlanQual (AI-20260914-235643-005, AI-20260916-035206-005, AI-20260917-004357-007)** — new
   tonight, FAILed (repro: `go test -v -run '^TestPort_IsolationEvalPlanQual$'
   ./internal/testport/`).
@@ -1111,7 +1132,7 @@ heuristic stays live.)
   reproduces the same undefined-symbol error on a clean, non-racing checkout.
 
 ### Manually discovered (not yet in a nightly `ci/logs/action-items.md` run) — filed 2026-09-15
-- [ ] **parser/TestLockingClauseParity** — deterministic FAIL, found while
+- [x] **parser/TestLockingClauseParity** — deterministic FAIL, found while
   running the M0137-0001 pre-commit gate (`RALPH_PRECOMMIT_SCOPE=units
   scripts/ralph-precommit-test.sh`; unrelated to that task's scripts/docs-only
   diff). `internal/parser/ast.go`'s `RangeVar.GroupedJoinUnaliased` field
@@ -1137,6 +1158,15 @@ heuristic stays live.)
     just the locking-clause cases. Still unrelated to M0138-0004's
     executor-only diff (`internal/executor/operators_analyze*.go`); `go
     test ./internal/executor/... ./internal/optimizer/...` is fully green.
+  - **CLOSED 2026-09-19 (Loop \#12)** — repro `go test ./internal/parser/
+    -run TestLockingClauseParity -v` PASSes at HEAD `fd6fe3f98`, along with
+    the full package (`go test -timeout 10m` and `-race -timeout 45m` both
+    green). Same verification as the `units/internal/parser` closure above:
+    `846cb718a` regenerated `parity_goldens.txt` for the
+    `GroupedJoinUnaliased` `dumpStmts` drift on 2026-09-17, and the field's
+    emit is narrower than this filing estimated — `groupedJoinRangeVar`
+    (`support.go:169`) only, i.e. synthetic unaliased parenthesized JOINs,
+    not every `FROM`-clause RangeVar.
 
 ## Archived — complete (see `completed_milestones/completed_fix_plan_012.md`)
 
