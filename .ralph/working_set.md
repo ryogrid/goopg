@@ -1,46 +1,26 @@
-Task: M0143-0010 — index probes must resolve the heap update chain (raw
-  PageGetHeapTuple on the index ItemPointer reads a dead HOT-chain root).
-  Filed + fixed + documented this loop; pending gates/commit at time of
-  writing.
+# Working Set (Loop #27)
+
+Task: M0119-0006 (br) — wire amcheck `heapallindexed` tier: HeapEntryFormer adapter
 Files:
-  internal/executor/operators_index.go — new eachHeapChainMember iterator
-    (redirect stubs, ItemIDNormal members in chain order, IsHotUpdated/CTID
-    links, MaxHeapTuplesPerPage bound).
-  internal/executor/operators_fk.go — scanIndexForFKMatch walks the chain
-    with TupleVisibleSubxact per member (was raw ptr read — the
-    a53c5b807/M0142-0003g regression behind the 3 nightly spec failures).
-  internal/executor/operators_storage.go — uniqueCheckWithWait.scanOnce +
-    exclusionCheckOnce walk the chain (scanOnce kept its in-flight-xmin
-    wait + isLiveForUniqueCheck arms; conflictPtr now = member slot).
-  internal/executor/operators_upsert.go — findInProgressConflictKey +
-    probeSpeculativeConflict walk the chain (Case1/2/3 and self-skip +
-    isLiveForUniqueCheck per member; decode errors still propagate via
-    memberErr closure).
-  internal/executor/deferred_exclusion.go — recheckDeferredExclusionEq
-    counts a chain ONCE if any member is live (per-member counting
-    double-counts an in-flight update → false 23P01).
-  internal/executor/operators_fk_test.go — TestFKInsertAfterParentHotUpdate.
-  internal/executor/insert_unique_constraint_test.go —
-    TestUniqueInsertAfterHotUpdate (duplicate PK after HOT update → 23505;
-    was a live-verified bypass on scratch :5533 before the fix).
-  .ralph/fix_plan.md — M0143-0010 filed/[x] (Movement: none); the three
-    M-NIGHTLY items AI-20260917-004357-008/-009/-012 ticked RESOLVED.
-  docs/design/0100-0149/m0143-0010-index-probe-hot-chain-resolution.md +
-    docs/design/README.md index row.
-Key symbols: eachHeapChainMember, scanIndexForFKMatch, uniqueCheckWithWait,
-  findInProgressConflictKey, probeSpeculativeConflict, exclusionCheckOnce,
-  recheckDeferredExclusionEq; precedents followHOTChainNoCopy /
-  resolveDeferredUniqueChainTail.
-Hypothesis/Findings: CONFIRMED — every index-driven heap probe that judged
-  "is there a live row at this key" by reading the index ptr's slot
-  verbatim was broken after any committed HOT update; FK was the newest
-  instance (regression), uniqueCheckWithWait the worst (dup PK possible,
-  demonstrated live). Exact-ctid refetches (EPQ/rowmark/catalog oldTID)
-  deliberately do NOT walk — audited and left alone.
-Next step: gates (units + tpch-spotcheck + tpcds-sf025 + acceptance-arm)
-  on the staged index, then commit + push.
-Gates run: executor pkg suite PASS (13.6s); TestFKInsertAfterParentHotUpdate
-  + TestUniqueInsertAfterHotUpdate PASS (both verified red pre-fix);
-  upsert/exclusion/deferred set 24/24 PASS; isolation specs
-  fk-contention/fk-deadlock/update-locked-tuple all PASS.
-In-flight: none (scratch fk-repro.scope on :5533 stopped).
+- internal/executor/operators_bt_index_check.go — new btIndexHeapAllIndexed +
+  heapChainRootOffset; wired into evalBtIndexCheck after unique tier; import sort
+- internal/executor/operators_bt_index_check_test.go — 6 HeapAllIndexed tests
+- docs/design/0100-0149/0119-0006br-heapallindexed-former-wiring.md + README row
+- .ralph/fix_plan.md — progress bullets under M0119-0006
+Key symbols: btIndexHeapAllIndexed, heapChainRootOffset, eachHeapChainMember,
+  indexBuildEntryKey, TupleVisibleSubxact, amcheck.CollectHeapIndexEntries /
+  VerifyBtreeHeapAllIndexedRelation
+Hypothesis/Findings: heapallindexed was the last accepted-but-never-ran arg.
+  Former mirrors collectBTreeEntries recipe; HOT members emit chain-ROOT tid
+  (index entry lives there); snapshot = ctx.Snap via TupleVisibleSubxact (NOT
+  isLiveForUniqueCheck — that probes in-flight xmin, a false-positive window).
+  Heap pages retained per-block in PageSource wrapper so root lookup reads the
+  same bytes the engine scanned.
+Next step: none for this slice — task done; next loop picks next banner item
+  (M0119 milestone remains open — rootdescend tier, 003/004 remaining arms are
+  feature-blocked: non-btree AMs, TOAST layout, per-db catalogs).
+Gates run: executor pkg + amcheck pkg + all TestPort_PgAmcheck* PASS; 6 new
+  tests PASS; units PASS; tpch-spotcheck PASS (Q12=2 Q13=34); live
+  pg_amcheck --heapallindexed[+--rootdescend] exit 0 (5000 rows, 3000 HOT
+  members, partial+expr idx). sf025 sweep runs post-commit for clean stamp.
+In-flight: none

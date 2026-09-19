@@ -29,25 +29,29 @@ package executor
 //   - VerifyBtreeUnique over the leaf level (btIndexCheckUnique below), the
 //     heap-visibility-aware duplicate-key tier. M0119-0006.
 //
-// The heapallindexed and rootdescend arguments are still accepted for call-shape
-// compatibility with pg_amcheck without running their tiers: heapallindexed needs
-// MVCC-aware heap-tuple → index-key extraction (the engine seam
-// VerifyBtreeHeapAllIndexedRelation exists, but forming the heap entry set is the
-// missing piece), and the default pg_amcheck B-tree probe passes
-// `heapallindexed := false`. This deferral mirrors S3's nil-XidStatusFunc
-// clog-tier deferral. M0110-0003.
+// plus, when the call passes `heapallindexed := true`,
+//   - VerifyBtreeHeapAllIndexedRelation over the whole relation pair
+//     (btIndexHeapAllIndexed below): every snapshot-visible heap tuple's
+//     would-be index entry is probed against the leaf-level fingerprint set —
+//     upstream's table_index_build_scan + bt_tuple_present_callback
+//     (verify_nbtree.c:543-589, 2782-2839). M0119-0006.
+//
+// The rootdescend argument is still accepted for call-shape compatibility with
+// pg_amcheck without running its tier (upstream gates it to heapkeyspace v4
+// indexes). M0110-0003.
 
 import (
 	"fmt"
 	"strings"
 
-	"github.com/goopg/goopg/internal/access/nbtree"
 	"github.com/goopg/goopg/internal/access/amcheck"
-	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/access/nbtree"
 	"github.com/goopg/goopg/internal/access/transam"
-	"github.com/goopg/goopg/internal/parser"
+	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/optimizer"
+	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/storage"
+	"github.com/goopg/goopg/internal/utils/mmgr"
 )
 
 // evalBtIndexCheck implements bt_index_check (parentCheck=false) and
@@ -151,6 +155,14 @@ func evalBtIndexCheck(x *optimizer.FuncCall, slot SlotView, ctx *Context, parent
 		var ureports []amcheck.BtreeReport
 		ureports, err = btIndexCheckUnique(x, slot, ctx, idx, src, parentCheck, cmpKeys, keyFmt)
 		reports = append(reports, ureports...)
+	}
+	if err == nil && len(reports) == 0 {
+		// heapallindexed runs last: upstream performs the heap probe scan at
+		// the end of bt_check_every_level, after the level walk, and any
+		// earlier ereport(ERROR) aborts before it starts (verify_nbtree.c:543).
+		var hreports []amcheck.BtreeReport
+		hreports, err = btIndexHeapAllIndexed(x, slot, ctx, idx, src, keyFmt, im, x.Pos())
+		reports = append(reports, hreports...)
 	}
 	if err != nil {
 		// A genuine read error (not a corruption finding) maps to internal error.
@@ -289,6 +301,221 @@ func btIndexCheckUnique(x *optimizer.FuncCall, slot SlotView, ctx *Context, idx 
 			ctx.comboStore(), ctx.MultiXact)
 	}
 	return amcheck.VerifyBtreeUnique(src, idx.Name, keyFmt, cmpKeys, visible)
+}
+
+// btIndexHeapAllIndexed runs amcheck's `heapallindexed` tier when the call
+// requested it: every heap tuple a fresh CREATE INDEX would index is re-formed
+// into its would-be leaf entry and probed against the index's actual leaf entry
+// set, reporting upstream's verbatim "heap tuple (b,o) from table %q lacks
+// matching index tuple within index %q" (bt_tuple_present_callback,
+// verify_nbtree.c:2782-2839).
+//
+// The argument is positional arg 1 in BOTH call shapes
+// (verify_nbtree.c:263,295 — PG_GETARG_BOOL(1)):
+// bt_index_check(index, heapallindexed, checkunique) and
+// bt_index_parent_check(index, heapallindexed, rootdescend, checkunique).
+// pg_amcheck passes `heapallindexed := true` when run with --heapallindexed.
+//
+// The per-tuple former mirrors collectBTreeEntries (operators_ddl.go) — the
+// CREATE INDEX bulk-build recipe — because upstream's probe set is exactly
+// "the tuples table_index_build_scan yields to index_form_tuple": an MVCC
+// snapshot scan (HeapTupleSatisfiesVisibility — in-flight-xmin tuples are
+// never yielded, so there is no probe-before-index-write race), HOT members
+// yielded once under their chain-root line pointer's TID with the live
+// member's values (heapam_handler.c:1662-1700), partial-index predicate and
+// NULL-key exclusions as the build applies them. Key bytes come from
+// indexBuildEntryKey so the probe is byte-identical to what the build
+// stores under either on-page format (blob or IndexTupleData).
+//
+// Same snapshot gate as btIndexCheckUnique: without a seeded snapshot there
+// is nothing to judge visibility against, so the tier skips. M0119-0006.
+func btIndexHeapAllIndexed(x *optimizer.FuncCall, slot SlotView, ctx *Context, idx *catalog.Index,
+	src amcheck.PageSource, keyFmt nbtree.IndexFormat, im *catalog.InMemory, pos int,
+) ([]amcheck.BtreeReport, error) {
+	if len(x.Args) <= 1 {
+		return nil, nil
+	}
+	d, err := evalExprSlot(x.Args[1], slot, ctx)
+	if err != nil {
+		return nil, err
+	}
+	if d.IsNull() || !d.BoolValue() || idx.Table == nil || ctx.Snap.Xmax == 0 {
+		return nil, nil
+	}
+	tbl := idx.Table
+	heapRel := ctx.Catalog.RelFileNode(tbl)
+	nblocks, err := ctx.Pool.NBlocks(heapRel)
+	if err != nil {
+		return nil, err
+	}
+
+	// heapSrc fills the engine's PageSource AND retains each page's copy: the
+	// former below resolves HOT chain roots against exactly the bytes the
+	// engine scanned, so a concurrent prune/update cannot make a heap-only
+	// member's chain look different between the two reads.
+	heapPages := make(map[storage.BlockNumber]storage.Page)
+	heapSrc := func(blk storage.BlockNumber) (storage.Page, error) {
+		s, perr := ctx.Pool.Pin(storage.BufferTag{Rel: heapRel, Block: blk})
+		if perr != nil {
+			return nil, perr
+		}
+		page := make(storage.Page, len(s.Page()))
+		copy(page, s.Page())
+		ctx.Pool.Unpin(s)
+		heapPages[blk] = page
+		return page, nil
+	}
+
+	// Key-column list parallel to idx.Columns, nil for expression columns —
+	// the same shape the build path hands indexBuildEntryKey.
+	cols := make([]*catalog.Column, len(idx.Columns))
+	for i, name := range idx.Columns {
+		if name == "" {
+			continue
+		}
+		col, ok := ctx.Catalog.LookupColumn(tbl, name)
+		if !ok {
+			return nil, fmt.Errorf("amcheck: index %q key column %q not found on table %q",
+				idx.Name, name, tbl.Name)
+		}
+		cols[i] = col
+	}
+	keyExprs := resolveIndexKeyExprs(tbl, idx)
+	var predExpr optimizer.Expr
+	if idx.HasPredicate && idx.Predicate != nil {
+		predExpr, _ = optimizer.ResolveIndexPredicate(idx.Predicate, tbl)
+	}
+
+	sctx := mmgr.Acquire(ctx.Mctx, mmgr.KindExpr)
+	defer sctx.Release()
+	row := make(Row, len(tbl.Columns))
+	form := func(tid storage.ItemPointer, raw []byte) (nbtree.LeafEntry, bool, error) {
+		t, perr := storage.ParseHeapTuple(raw)
+		if perr != nil {
+			return nbtree.LeafEntry{}, false, perr
+		}
+		// Snapshot visibility (upstream HeapTupleSatisfiesVisibility under the
+		// registered MVCC snapshot). TupleVisibleSubxact is the seqscan-grade
+		// predicate: TupleVisible plus own-transaction subxid resolution; a
+		// nil resolver degrades to plain TupleVisible.
+		if !transam.TupleVisibleSubxact(t.Header, ctx.Snap, ctx.Tx.XID,
+			ctx.TxnMgr, ctx.CmdID, ctx.comboStore(), ctx.MultiXact) {
+			return nbtree.LeafEntry{}, false, nil
+		}
+		sctx.Reset()
+		if derr := DecodeHeapTupleRowInto(row, tbl.Columns, t, sctx); derr != nil {
+			// A truncated probe set manufactures spurious findings — surface.
+			return nbtree.LeafEntry{}, false, fmt.Errorf("decoding heap tuple: %w", derr)
+		}
+		// Enum labels decode as KindString; convert to KindEnum (sort order) so
+		// the key encoder produces the bytes the build wrote. M0097-0022.
+		for _, c := range cols {
+			if c == nil {
+				continue
+			}
+			et, isEnum := im.LookupEnum(c.Type.Name)
+			if !isEnum || c.Ordinal < 0 || c.Ordinal >= len(row) {
+				continue
+			}
+			if row[c.Ordinal].Kind == KindString {
+				label := row[c.Ordinal].StringValue()
+				for _, ev := range et.Values {
+					if ev.Label == label {
+						row[c.Ordinal] = NewEnumDatum(ev.SortOrder, label)
+						break
+					}
+				}
+			}
+		}
+		// Partial index: rows outside the predicate legitimately have no entry.
+		if predExpr != nil {
+			pv, pErr := evalExpr(predExpr, row, ctx)
+			if pErr != nil || pv.IsNull() || pv.Kind != KindBool || !pv.BoolValue() {
+				return nbtree.LeafEntry{}, false, nil
+			}
+		}
+		etid := tid
+		if t.Header.IsHeapOnly() {
+			// A HOT member shares the root's index entry: heap-only updates are
+			// eligible only when no indexed column changed (hotUpdateEligible),
+			// so the member's key equals the root's, and the entry's stored TID
+			// is the root's offset — the original insertion slot, today an
+			// LP_REDIRECT stub or the dead root tuple's line pointer.
+			page := heapPages[tid.Block]
+			if page == nil {
+				return nbtree.LeafEntry{}, false, fmt.Errorf(
+					"amcheck: no scanned page for heap tuple at block %d", tid.Block)
+			}
+			root, found := heapChainRootOffset(page, tid.Offset)
+			if !found {
+				return nbtree.LeafEntry{}, false, fmt.Errorf(
+					"amcheck: heap-only tuple at block %d offset %d has no reachable chain root",
+					tid.Block, tid.Offset)
+			}
+			etid = storage.ItemPointer{Block: tid.Block, Offset: root}
+		}
+		key, hasNullKey, kerr := ctx.indexBuildEntryKey(idx, cols, keyExprs, row, etid, pos)
+		if kerr != nil {
+			return nbtree.LeafEntry{}, false, kerr
+		}
+		// hasNullKey: goopg stores no NULL-keyed entries (the build skips them).
+		// key == nil: an all-expression index whose eval produced nothing — the
+		// build skips those rows too; probing an empty key would false-positive.
+		if hasNullKey || key == nil {
+			return nbtree.LeafEntry{}, false, nil
+		}
+		return nbtree.LeafEntry{Key: key, TID: etid}, true, nil
+	}
+	heapEntries, err := amcheck.CollectHeapIndexEntries(heapSrc, nblocks, form)
+	if err != nil {
+		return nil, err
+	}
+	// Fixed Bloom seed: upstream draws pg_prng_uint64 per run as an
+	// anti-adversarial measure; the fingerprint here is internal, and a
+	// constant keeps the check deterministic.
+	const heapAllIndexedSeed uint64 = 0x6D63396E96D529B5
+	return amcheck.VerifyBtreeHeapAllIndexedRelation(src, keyFmt, heapEntries,
+		idx.Name, tbl.Name, heapAllIndexedSeed)
+}
+
+// heapChainRootOffset finds the chain-root line pointer that leads to the
+// heap-only member at memberOff on page. Candidate roots are the page's
+// LP_REDIRECT stubs and its non-heap-only LP_NORMAL tuples — the same set
+// upstream's heap_get_root_tuples gathers (pruneheap.c:1785-1838); each is
+// walked forward via eachHeapChainMember until one reaches memberOff. Runs on
+// the caller's private page copy, so no content lock is needed.
+func heapChainRootOffset(page storage.Page, memberOff uint16) (uint16, bool) {
+	maxoff, err := storage.PageLinePointerCount(page)
+	if err != nil {
+		return 0, false
+	}
+	for off := uint16(1); off <= uint16(maxoff); off++ {
+		item, err := storage.PageGetItemID(page, off)
+		if err != nil {
+			continue
+		}
+		isRoot := item.Flags == storage.ItemIDRedirect
+		if item.Flags == storage.ItemIDNormal {
+			if t, terr := storage.PageGetHeapTuple(page, off); terr == nil && !t.Header.IsHeapOnly() {
+				isRoot = true
+			}
+		}
+		if !isRoot {
+			continue
+		}
+		found := false
+		eachHeapChainMember(page, off, func(_ storage.HeapTuple, slot uint16) bool {
+			if slot == memberOff {
+				found = true
+				return false
+			}
+			return true
+		})
+		if found {
+			return off, true
+		}
+	}
+	return 0, false
 }
 
 // btIndexOpClassComparator returns the operator-class key comparator to verify

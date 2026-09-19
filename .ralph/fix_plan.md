@@ -1398,6 +1398,42 @@ the whole file's active task between 2026-09-01 and 2026-09-14; **since
       btree) incl. the corruption-injection arms; live repro verified on both
       `postgres` and a `CREATE DATABASE`d database. Design:
       `docs/design/0100-0149/0119-0006-amcheck-postgres-db-scope-and-tuple-cmp.md`.
+  - 2026-09-20 (br): wired the `heapallindexed` tier — the last argument of
+    `bt_index_check`/`bt_index_parent_check` that was accepted but never ran.
+    - New `btIndexHeapAllIndexed` (`internal/executor/operators_bt_index_check.go`)
+      supplies the catalog-/MVCC-coupled `HeapEntryFormer` the engine seam
+      (`amcheck.CollectHeapIndexEntries` → `VerifyBtreeHeapAllIndexedRelation`)
+      was built for. The former mirrors `collectBTreeEntries`'s per-tuple
+      recipe (upstream `table_index_build_scan` semantics):
+      `TupleVisibleSubxact` snapshot visibility, `DecodeHeapTupleRowInto`,
+      the enum KindString→KindEnum fixup, partial-index predicate and
+      NULL-key/`key==nil` exclusions, then `indexBuildEntryKey` so probe bytes
+      are byte-identical to what the build stores under either key format.
+    - HOT members are emitted under the chain-ROOT line pointer (the index
+      entry's stored TID — HOT writes no entry). `heapChainRootOffset` walks
+      each candidate root (LP_REDIRECT stubs + non-heap-only LP_NORMAL items —
+      upstream `heap_get_root_tuples`' set) via `eachHeapChainMember` on the
+      page COPY the PageSource captured, so concurrent prune/update cannot
+      desynchronize the chain view between scan and root lookup.
+    - Agent review caught the draft's `isLiveForUniqueCheck` choice — it
+      reports in-flight-xmin tuples live where upstream's MVCC snapshot never
+      probes them (spurious-finding window under concurrent inserts); the
+      predicate is `TupleVisibleSubxact`, matching `btIndexCheckUnique`'s
+      visibility source.
+    - Tier ordering: runs after the structural and checkunique tiers return
+      zero findings — upstream runs the heap probe at the end of
+      `bt_check_every_level`, and an earlier ereport aborts first.
+    - Bloom seed is a fixed constant (upstream's per-run `pg_prng_uint64` is
+      anti-adversarial only; determinism preferred).
+    - Verified: 6 new tests (`TestBtIndexCheck_HeapAllIndexed*` — clean,
+      phantom-tuple detection with XX002 "lacks matching index tuple", HOT
+      member, partial index, expression index, NULL key — the detection and
+      HOT arms carry non-vacuity guards); all 10 `TestPort_PgAmcheck*` PASS;
+      live `pg_amcheck --heapallindexed` (real PG binary) exit 0 on a 5000-row
+      table with 3000 HOT members + partial + expression indexes, and
+      `--heapallindexed --rootdescend` exit 0 (rootdescend still a
+      call-shape-accepted no-op — upstream gates it to heapkeyspace v4).
+    - Design: `docs/design/0100-0149/0119-0006br-heapallindexed-former-wiring.md`.
 > This task list is **seeded, not exhaustive.** M0119-0001 triage plus every future
 > deferral-ledger entry (any new `status = -` row) feed additional M0119 tasks over
 > time; the milestone's living nature means it need not be complete at filing.
