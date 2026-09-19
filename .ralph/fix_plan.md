@@ -8700,6 +8700,62 @@ cross-layer programme that has never been scoped.
   unreachable in production the moment it lands too, for the same
   structural reason (no `parser.JoinSemi` producer reaches the search yet),
   independent of Q78's firewall. Do not pick up ahead of that unblock.
+- [x] **M0142-0008-producer — teach an unnesting path to set `.SJInfo` on a
+  DP-search-visible `JoinSemi` link (THE unblock for the whole chain)** —
+  filed 2026-09-20 on the owner's unfreeze decision. Recon has converged on
+  this being the one missing producer: the EXISTS/IN family is pinned pre-DP
+  and never reaches `jointypeForDirection`'s SEMI/ANTI arm (c21 §57),
+  IN-unnesting never sets `.SJInfo` (c6 §41), and the only DP-reachable
+  producer (`reduce_outer_joins`'s ANTI demotion, c19) is unconditionally
+  ANTI — so the chain's SEMI reachability is 0 corpus-wide even with
+  `admitSemiAnti` live. Scope: make an IN-unnesting (or EXISTS-variant)
+  path emit a `parser.JoinSemi` `*SpecialJoinInfo` that reaches the searched
+  arm — the same shape c19 produced for ANTI — so the DP search sees a real
+  semi/anti candidate for the TPC-DS EXISTS/IN family ({Q10, Q16, Q35, Q69,
+  Q94}). **Hard constraint (owner): do NOT lift Q78's `outer-over-derived`
+  firewall, or take any equivalent shortcut, to obtain reachability.**
+  Evidence this is the right seam: design doc §58's live
+  `GOOPG_C22DEBUG=1` corpus trace (zero `jointype=semi`/`anti` DPPATH lines
+  with all plumbing landed). Gates: units + sf025 sweep; expected movement
+  is semi/anti-adjacent categories on the named family — measure with the
+  sweep's `CATEGORIES-EXCL-MATCH:` line, and the P0-E7 A/B baseline
+  (23/24 identical) is the comparison point.
+  Kind: impl
+  Parent: M0142-0008
+  Movement: expected yes — the unblock is itself the movement precondition;
+  declare actuals from the sweep after landing.
+  - **DONE 2026-09-20 (Loop #31)** — `inUnnestSJInfo` (unnest.go) now ports
+    `existsUnnestSJInfo`'s construction onto both IN sites: `unnestInExpr`
+    (SemiRhsExprs = the params' `SubCol`s; `innerPlan.Output()[0]` fallback
+    for the operand-keyed params==0 shape) and `unnestNonCorrelatedInExpr`
+    (SemiRhsExprs = `innerOut[0]`, carrying the real `SourceTableIdx` so
+    `createUniquePath`'s schema-drift guard is satisfied). SEMI gets
+    `LhsStrict`/`SemiCanBtree`/`SemiCanHash`=true; the NullAware (`NOT IN`)
+    ANTI keeps `LhsStrict=false` and no Semi-only fields (fail-closed).
+    Design doc: `docs/design/0100-0149/m0142-0008-producer-in-unnest-sjinfo.md`.
+    - **Measured movement: NONE — corpus reachability is still zero, and
+      the reason is upstream of this gate.** Traced SF0.25 sweep
+      (`GOOPG_PGSHAPED_DP_TRACE=1`, 99 queries): 0 `semianti-*` declines,
+      0 `jointype=semi|anti` DPPATH — identical to the pre-change census.
+      Per-query attribution (TPC-DS Q56): every IN statement declines at
+      `leaf-count` (`joinsearchseam.go:325`, nrels=4 nleaves=2) BEFORE
+      `semiAntiLinksHaveSJInfos` (:628) runs — the walked chain flattened
+      to real leaves only; the `Filter(Semi(...))` wrapper the IN paths
+      leave above the pinned join is the suspected flattening blocker
+      (the walk treats non-Join nodes as opaque leaves). The chain's real
+      unblock is therefore the leaf-admission/chain-shape work, not this
+      producer alone — resume point: design doc §6.
+    - Producer verified at unit level: `in_unnest_sjinfo_test.go` pins all
+      four shapes + a real `extractSearchLeaves` pass-the-gate proof.
+    - Gates (staged tree a6a2609b): units PASS; tpch-spotcheck PASS
+      (Q12=2/Q13=33); tpcds-sf025 PASS=96/0/0/0 plans same=99;
+      tpch-acceptance-arm PASS 24/24 MATCH at PGSHAPED=1/PER_Q=900/seed
+      20260905 vs a **freshly re-captured baseline**.
+    - `bench/tpch/baseline-digests.txt` re-captured this loop (the
+      2026-09-08 file predated the owner's 8-FK reload: 9 ROWS-DIFF +
+      14 VALUE-DIFF of pure load drift; Q6 colsig also drifted —
+      a column-naming change between 8dc298e92 and HEAD). The standing
+      "re-capture before the next executor commit" flag is discharged.
 - [x] **M0142-0008d — EXPLAIN mislabels the outer relation's alias in a
   self-correlated EXISTS where inner and outer share a table name** — filed
   by M0142-0008a-3(iii)'s §4.3 gate re-run (design doc §6). **DONE 2026-09-16
