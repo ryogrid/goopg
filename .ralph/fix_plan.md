@@ -737,8 +737,50 @@ heuristic stays live.)
     AI-20260917-004357-012); executor+optimizer units PASS; executor race
     clean 62s; units gate green; tpch-spotcheck PASS (Q12=2/Q13=34);
     tpcds-sf025 PASS=96/0/0/0, plans 99/99; plan-gate 14/22 baseline.
-- [ ] **testport/TestPort_PgDumpConnectionSetup (AI-20260905-011015-006, AI-20260914-235643-009, AI-20260916-035206-010, AI-20260917-004357-014)** —
-  FAILed, also failed previous run.
+- [x] **testport/TestPort_PgDumpConnectionSetup (AI-20260905-011015-006, AI-20260914-235643-009, AI-20260916-035206-010, AI-20260917-004357-014)** —
+  **FIXED 2026-09-19**: three stacked regressions from the late-Aug
+  parser/cast work, each masking the next; test now PASSes (3.3s) at the
+  same tolerated DU-002 frontier it held pre-regression
+  (`PREPARE getDomainConstraints(pg_catalog.oid)` — `type "pg_catalog.oid"
+  does not exist`, the standing next-blocker note, still tracked under
+  M0119-0004).
+  - `CREATE CAST (bytea AS text) WITHOUT FUNCTION` false-rejected "source
+    data type and target data type are the same" (42P17): `98e7cc90b`
+    (M0134-0110) added `castUserBinaryCoercible` checking BOTH directions
+    and wired it into `castTypeOIDMatch`, which `validateCreateCast`'s
+    same-type check also used — so the earlier-registered `text→bytea`
+    binary cast made `bytea→text` compare equal. PG: the same-type check
+    is strict `sourcetypeid == targettypeid` (functioncmds.c CreateCast)
+    and `IsBinaryCoercibleWithCast` is DIRECTIONAL
+    (`CASTSOURCETARGET(srctype,targettype)` only). Fix: new strict
+    `castSameTypeOID` for the same-type check; `castUserBinaryCoercible`
+    reduced to the forward `a→b` lookup (`operators_ddl.go`). 5 new
+    live-registry cases in `create_cast_validate_test.go` cover
+    directionality both ways + the reverse-cast same-type repro.
+  - `CREATE DEFAULT CONVERSION public.isoconv FOR 'LATIN1' TO 'UTF8'`
+    rejected 42710 "default conversion … already exists": correct PG
+    behaviour (`ConversionCreate`, pg_conversion.c:77) that `8c374fa82`
+    (M0134-0106) ported AFTER the fixture line was written — `myconv`
+    already owned the LATIN1→UTF8 default, so the fixture itself was
+    invalid (real PG 18.3 rejects it identically). Fixture fix: `isoconv`
+    drops DEFAULT (its purpose is the builtin-function fallback, not the
+    DEFAULT keyword already covered by `myconv`); assertion + comment
+    updated.
+  - `CREATE TABLE public.dom (… lbl label …)` hard-42601 at `label`:
+    `label` scans as the LABEL token (SECURITY LABEL keyword), and
+    `cast_ident`'s deliberately-narrow whitelist
+    (`grammar/pg_grammar.y`, sized to legacy-parser acceptances) had no
+    LABEL alternative. `label` is UNRESERVED in PG (kwlist.h:251) — a
+    legal type name everywhere — so `| LABEL` added to `cast_ident`.
+    `make gen-parser`: conflicts unchanged at the pinned 60, goldens
+    unchanged.
+  - Gates: `TestPort_PgDumpConnectionSetup` PASS; `TestValidateCreateCast`
+    21/21; `go test ./internal/parser` + `./internal/executor` PASS; units
+    gate green; tpch-spotcheck PASS (Q12=2/Q13=34); tpcds-sf025
+    PASS=96/0/0/0, plans 99/99; tpch-acceptance-arm PASS 24/24;
+    plan-gate 14/22 baseline. Design doc updated:
+    `0100-0149/m0134-0110-create-cast-user-type-resolution.md` §Fix (the
+    "in either direction" claim corrected).
 - [ ] **testport/TestPort_RegressSuite (AI-20260905-011015-008, AI-20260914-235643-011, AI-20260916-035206-012, AI-20260917-004357-016)** — FAILed
   subtests: limit, numerology, also failed previous run; 20260914-235643 adds subtests time, timetz.
   - **UPDATE 2026-09-18**: re-ran the repro at HEAD (`e121c4e9e`) per the

@@ -21868,18 +21868,20 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 	return nil
 }
 
-// castTypeOIDMatch compares two type names for CREATE CAST's argument/return
-// and same-type checks. im is the live catalog (nil in unit tests exercising
-// only builtin types); it is consulted first via resolveUserTypeOID so a
-// user-defined type (CREATE TYPE, including the base/"shell" form) resolves
-// to its own OID instead of falling through catalog.TypeNameToOID's "unknown
-// name" default (OIDText), which previously made every user type falsely
-// compare equal to `text`. M0134-0110. Beyond OID identity, this also accepts
-// an existing WITHOUT FUNCTION/WITH INOUT user cast between a and b as a
-// match — mirroring PG's IsBinaryCoercibleWithCast (cast.c), which lets a
-// WITH FUNCTION cast's argument/return type be merely binary-coercible to
-// (not identical to) the declared source/target, closing the slice-398
-// deferral ledger row's binary-coercibility gap.
+// castTypeOIDMatch reports whether b is binary-coercible FROM a for CREATE
+// CAST's argument/return checks — mirroring PG's IsBinaryCoercibleWithCast
+// (parse_coerce.c), which lets a WITH FUNCTION cast's argument/return type be
+// merely binary-coercible to (not identical to) the declared source/target,
+// closing the slice-398 deferral ledger row's binary-coercibility gap.
+// Callers pass a and b in PG's operand order: (source, argtype) for the arg
+// check and (rettype, target) for the return check — the test is DIRECTIONAL
+// because pg_cast entries aren't symmetric (parse_coerce.c: "the order of the
+// operands is now significant"). im is the live catalog (nil in unit tests
+// exercising only builtin types); it is consulted first via
+// resolveUserTypeOID so a user-defined type (CREATE TYPE, including the
+// base/"shell" form) resolves to its own OID instead of falling through
+// catalog.TypeNameToOID's "unknown name" default (OIDText), which previously
+// made every user type falsely compare equal to `text`. M0134-0110.
 func castTypeOIDMatch(im *catalog.InMemory, a, b string) bool {
 	oa, ob := castResolveTypeOID(im, a), castResolveTypeOID(im, b)
 	if oa != 0 && ob != 0 {
@@ -21892,25 +21894,35 @@ func castTypeOIDMatch(im *catalog.InMemory, a, b string) bool {
 	return castUserBinaryCoercible(im, a, b)
 }
 
+// castSameTypeOID reports whether a and b name the same type for CREATE
+// CAST's same-type check — mirroring PG's `sourcetypeid == targettypeid`
+// (functioncmds.c CreateCast), which is strict OID identity only and does NOT
+// consult pg_cast (a registered binary cast between distinct types must not
+// satisfy it). Unresolvable names fall back to spelling equality, matching
+// castTypeOIDMatch's unknown-name convention. M0134-0110.
+func castSameTypeOID(im *catalog.InMemory, a, b string) bool {
+	oa, ob := castResolveTypeOID(im, a), castResolveTypeOID(im, b)
+	if oa != 0 && ob != 0 {
+		return oa == ob
+	}
+	return strings.EqualFold(strings.TrimSpace(a), strings.TrimSpace(b))
+}
+
 // castUserBinaryCoercible reports whether a registered user CREATE CAST …
-// WITHOUT FUNCTION (pg_cast.castmethod 'b') links a and b in either
-// direction — mirroring PG's IsBinaryCoercible, which only a real binary
-// cast satisfies (a WITH INOUT cast still runs the type's own I/O functions,
-// so it is not binary-coercible). PG additionally special-cases domains and
-// a handful of hard-wired pairs (anyarray, etc.); those are out of scope
-// here — only the explicit-cast-registry form CREATE CAST test cases
-// exercise.
+// WITHOUT FUNCTION (pg_cast.castmethod 'b') casts a to b — directional, since
+// pg_cast entries aren't symmetric (PG's IsBinaryCoercibleWithCast looks up
+// CASTSOURCETARGET(srctype, targettype) only; "the order of the operands is
+// now significant"). Only a real binary cast satisfies this (a WITH INOUT
+// cast still runs the type's own I/O functions, so it is not
+// binary-coercible). PG additionally special-cases domains and a handful of
+// hard-wired pairs (anyarray, etc.); those are out of scope here — only the
+// explicit-cast-registry form CREATE CAST test cases exercise.
 func castUserBinaryCoercible(im *catalog.InMemory, a, b string) bool {
 	if im == nil {
 		return false
 	}
-	if cs := im.CastByTypes(a, b); cs != nil && cs.Method == "b" {
-		return true
-	}
-	if cs := im.CastByTypes(b, a); cs != nil && cs.Method == "b" {
-		return true
-	}
-	return false
+	cs := im.CastByTypes(a, b)
+	return cs != nil && cs.Method == "b"
 }
 
 // castResolveTypeOID resolves a CREATE CAST source/target/argument type name
@@ -22094,7 +22106,10 @@ func validateCreateCast(s *parser.CompatNoopStmt, routine *catalog.Routine, im *
 	}
 	// Allow source and target types to be the same only for length-coercion
 	// functions; PG assumes a multi-arg (>= 2) function does length coercion.
-	if castTypeOIDMatch(im, source, target) && nargs < 2 {
+	// The comparison is strict OID identity (sourcetypeid == targettypeid) —
+	// not binary-coercibility — so a registered binary cast between two
+	// distinct types does not trip it.
+	if castSameTypeOID(im, source, target) && nargs < 2 {
 		return &ExecError{Code: "42P17", Pos: s.Pos(), Message: "source data type and target data type are the same"}
 	}
 	return nil

@@ -3721,6 +3721,14 @@ cast_ident:
 	| JSON          { $$ = "json" }
 	| XML_P         { $$ = "xml" }
 	| PATH          { $$ = "path" }
+	/* label is an UNRESERVED keyword (kwlist.h:251) — PG accepts it as a type
+	   name in every position (a user DOMAIN may legitimately be named label;
+	   the pg_dump DU-002 fixture's `dom` table exercises exactly that). It
+	   scans as the LABEL token for SECURITY LABEL, never as IDENT, so without
+	   this alternative `x label` / `x::label` hard-42601. Unlike TRIGGER (kept
+	   out below, `x::trigger` must stay rejected), LABEL carries no special
+	   cast-position semantics. */
+	| LABEL         { $$ = "label" }
 
 
 /* values_rows — gram.y :13035 values_clause LIST subset: rows are '(' expr_list ')'

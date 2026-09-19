@@ -93,6 +93,22 @@ it as a genuine mismatch — a regression relative to the pre-fix accidental
   'b'`, in either direction) as an alternate match condition — mirroring
   `IsBinaryCoercibleWithCast`. `validateCreateCast` threads `im` through from
   its one call site in the `"cast"` DDL-dispatch case.
+
+  **Correction (2026-09-19, M-NIGHTLY TestPort_PgDumpConnectionSetup):** the
+  "in either direction" reading above was wrong twice over and has been
+  fixed. (a) `IsBinaryCoercibleWithCast` is DIRECTIONAL — it probes
+  `CASTSOURCETARGET(srctype, targettype)` only (parse_coerce.c: "the order
+  of the operands is now significant"), so `castUserBinaryCoercible` now
+  looks up `a → b` alone, not `b → a`. (b) the same-type check at the end
+  of `CreateCast` is strict `sourcetypeid == targettypeid` (functioncmds.c)
+  and never consults pg_cast, so it now calls a separate `castSameTypeOID`
+  helper (OID identity + unknown-name EqualFold fallback) instead of
+  `castTypeOIDMatch`. The regression surfaced in the pg_dump fixture:
+  after `CREATE CAST (text AS bytea) WITHOUT FUNCTION` registered, the
+  follow-on `CREATE CAST (bytea AS text)` false-rejected as
+  "source data type and target data type are the same" because the
+  bidirectional binary-coercible fallback made the distinct types compare
+  equal.
 - The DROP CAST handler now calls `isKnownUserType(im, name)` (same
   `resolveUserTypeOID` check) before raising "type does not exist" for a name
   `dropCompatCanonicalType` doesn't recognize.

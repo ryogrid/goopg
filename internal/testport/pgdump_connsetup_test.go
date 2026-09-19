@@ -5474,9 +5474,12 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	// (search_path-relative) regproc output for a pg_catalog function exactly.
 	// Before this loop resolveConversionFunc had no built-in fallback, so this
 	// CREATE CONVERSION failed outright with 42883 "function ...
-	// iso8859_1_to_utf8(...) does not exist".
-	if err := runSQLSimple(t, c, "CREATE DEFAULT CONVERSION public.isoconv FOR 'LATIN1' TO 'UTF8' FROM iso8859_1_to_utf8"); err != nil {
-		t.Fatalf("create default conversion from builtin function: %v", err)
+	// iso8859_1_to_utf8(...) does not exist". The upstream fixture is DEFAULT,
+	// but here myconv already owns the LATIN1→UTF8 default and PG's
+	// ConversionCreate (pg_conversion.c:77) rejects a second default for the
+	// same encoding pair — so the goopg adaptation uses the non-default form.
+	if err := runSQLSimple(t, c, "CREATE CONVERSION public.isoconv FOR 'LATIN1' TO 'UTF8' FROM iso8859_1_to_utf8"); err != nil {
+		t.Fatalf("create conversion from builtin function: %v", err)
 	}
 	// Slice 404 (connsetup): CREATE TRANSFORM FOR int LANGUAGE sql, exercising
 	// resolveTransformFunc's builtin fallback (catalog.LookupBuiltinProc) added
@@ -8404,7 +8407,7 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		// a pg_catalog function. Byte-identical to real pg_dump 18.3's rendering
 		// of the upstream 002_pg_dump.pl 'CREATE CONVERSION dump_test.test_conversion'
 		// fixture (adapted to the public schema like every other fixture here).
-		if want := "CREATE DEFAULT CONVERSION public.isoconv FOR 'LATIN1' TO 'UTF8' FROM iso8859_1_to_utf8;"; !strings.Contains(res.Stdout, want) {
+		if want := "CREATE CONVERSION public.isoconv FOR 'LATIN1' TO 'UTF8' FROM iso8859_1_to_utf8;"; !strings.Contains(res.Stdout, want) {
 			t.Errorf("pg_dump missing built-in CONVERSION %q\n  full stdout=%q", want, res.Stdout)
 		}
 		// **Slice 404 (asserted):** CREATE TRANSFORM FOR int must round-trip via
