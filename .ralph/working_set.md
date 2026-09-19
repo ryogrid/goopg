@@ -1,64 +1,46 @@
-# Working Set — Loop #21 end state
-
-Task: M0143-0009 — `SELECT … FOR UPDATE` over a join dropped every row when a
-locked leaf was not the rightmost scan (resjunk-ctid ColumnRef shift). DONE —
-implemented, all 8 arms of `TestLockRowsJoinCtidShift` green, verified
-end-to-end on a scratch cluster (:5533) including hash-join shapes.
-
-Also done this loop (same commit):
-- M0142-0005g recon recorded under its (still owner-frozen `[ ]`) entry:
-  `patternsel.go` is a faithful `patternsel_common` port; the 2×
-  `LIKE '%green%'` estimate divergence is corpus data + independent
-  30k-row reservoir sampling, not planner logic (goopg 6/99 interior
-  bounds vs PG 3/99; logical corpus counts differ too).
-- M0143-0009 was filed this loop after the live wrong-results repro.
-- AI-007 ledger row: RESOLUTION RECORD appended (status flip is owner-only).
-
-Files changed:
-- internal/optimizer/plan.go — `SchemaColumn.Resjunk` (PG resjunk analogue),
-  `LockedRel.ColPos` (per-column EPQ-merge positions, -1 when the projection
-  doesn't carry the column), `LockRows.Output()` strips resjunk positions
-  anywhere in the row (trailing-`NumCtidCols` kept only as hand-built-plan
-  fallback).
-- internal/optimizer/planner.go — `wireRowMarkCtidColumns` now snapshots
-  `oldW[n]` per node before tagging and matches leaves by (OID, effective
-  alias); `rebaseRowMarkPlan` post-order walk rebases every expression via
-  per-node old→new position remaps — `concatRemap` (merged =
-  `leftRemap ++ (newLeftW + rightRemap[j])`), join Predicate/keys/UsingCols
-  in MERGED coords (executor proves it via mergedKeySlot/keySlot.rebind),
-  NLI probe keys outer-scoped, unary ancestors over childRemap, cached
-  schemas rebuilt for Distinct/DistinctOn/Gather/GatherMerge/OrdinalityWrap/
-  ProjectSet; walk-wide `seen` dedupes shared *ColumnRef objects
-  (HashKeys[0] aliases LeftKey/RightKey by pointer). `resolveRowMarkCtidResnos`
-  resolves ctid positions for non-Project roots, fixes `ColOffset` past
-  earlier insertions, populates `ColPos`. `hasSelfJoinLockedTable` and the
-  name-keyed `fixColumnRefIndices`/`fixColumnRefsInExpr`/`recomputeIntermediateSchemas`
-  path retired.
-- internal/executor/operators_lockrows.go — `junkPos` resjunk-position set
-  replaces the trailing-N row trim; EPQ refetch-merge prefers `ColPos`.
-- internal/executor/operators_distinct.go + operators_recursive_cte.go —
-  `rowKeyExcluding` skips resjunk positions in whole-row dedup.
-- internal/executor/operators_lockrows_test.go — `TestLockRowsJoinCtidShift`
-  (8 arms: left/right/bare, swapped-FROM, `SELECT *` join-rooted, ORDER BY
-  above join, DISTINCT, self-join); helper clones slot rows.
-- internal/optimizer/locking_test.go — self-join pins updated for the
-  retired AI-007 guard (2 ctid cols, distinct resnos).
-- docs/design/0100-0149/m0143-0009-rowmark-ctid-global-expr-rebase.md +
-  README row.
-
-Key lesson: `HashKeys[0]` aliases `{LeftKey, RightKey}` BY POINTER and
-`cloneKeyExpr` clones only bare ColumnRefs — in-place ref rebasing without a
-dedupe set double-applies to shared objects (M0097-0060's class).
-
-Gates run: `TestLockRowsJoinCtidShift` 8/8 PASS; `TestPlanCtidRowMark*`
-3/3 PASS; executor + optimizer package suites PASS; scratch-cluster live
-check PASS (NL+IndexScan, SeqScan+HashJoin, self-join, DISTINCT, `SELECT *`).
-
-In-flight: scratch goopg server on :5533 (tmp/m0119-br/data, cgroup
-rowmark-m143) still running — stop with `systemctl --user stop
-rowmark-m143.scope` or reuse. emp143/dept143/big143a/big143b test tables left
-in its postgres DB.
-
-Next step: banner item 8 continues — M0119-0006 remains the living
-ledger-drain milestone; next selectables per banner order: M0122-0008..0015,
-then M0131.
+Task: M0143-0010 — index probes must resolve the heap update chain (raw
+  PageGetHeapTuple on the index ItemPointer reads a dead HOT-chain root).
+  Filed + fixed + documented this loop; pending gates/commit at time of
+  writing.
+Files:
+  internal/executor/operators_index.go — new eachHeapChainMember iterator
+    (redirect stubs, ItemIDNormal members in chain order, IsHotUpdated/CTID
+    links, MaxHeapTuplesPerPage bound).
+  internal/executor/operators_fk.go — scanIndexForFKMatch walks the chain
+    with TupleVisibleSubxact per member (was raw ptr read — the
+    a53c5b807/M0142-0003g regression behind the 3 nightly spec failures).
+  internal/executor/operators_storage.go — uniqueCheckWithWait.scanOnce +
+    exclusionCheckOnce walk the chain (scanOnce kept its in-flight-xmin
+    wait + isLiveForUniqueCheck arms; conflictPtr now = member slot).
+  internal/executor/operators_upsert.go — findInProgressConflictKey +
+    probeSpeculativeConflict walk the chain (Case1/2/3 and self-skip +
+    isLiveForUniqueCheck per member; decode errors still propagate via
+    memberErr closure).
+  internal/executor/deferred_exclusion.go — recheckDeferredExclusionEq
+    counts a chain ONCE if any member is live (per-member counting
+    double-counts an in-flight update → false 23P01).
+  internal/executor/operators_fk_test.go — TestFKInsertAfterParentHotUpdate.
+  internal/executor/insert_unique_constraint_test.go —
+    TestUniqueInsertAfterHotUpdate (duplicate PK after HOT update → 23505;
+    was a live-verified bypass on scratch :5533 before the fix).
+  .ralph/fix_plan.md — M0143-0010 filed/[x] (Movement: none); the three
+    M-NIGHTLY items AI-20260917-004357-008/-009/-012 ticked RESOLVED.
+  docs/design/0100-0149/m0143-0010-index-probe-hot-chain-resolution.md +
+    docs/design/README.md index row.
+Key symbols: eachHeapChainMember, scanIndexForFKMatch, uniqueCheckWithWait,
+  findInProgressConflictKey, probeSpeculativeConflict, exclusionCheckOnce,
+  recheckDeferredExclusionEq; precedents followHOTChainNoCopy /
+  resolveDeferredUniqueChainTail.
+Hypothesis/Findings: CONFIRMED — every index-driven heap probe that judged
+  "is there a live row at this key" by reading the index ptr's slot
+  verbatim was broken after any committed HOT update; FK was the newest
+  instance (regression), uniqueCheckWithWait the worst (dup PK possible,
+  demonstrated live). Exact-ctid refetches (EPQ/rowmark/catalog oldTID)
+  deliberately do NOT walk — audited and left alone.
+Next step: gates (units + tpch-spotcheck + tpcds-sf025 + acceptance-arm)
+  on the staged index, then commit + push.
+Gates run: executor pkg suite PASS (13.6s); TestFKInsertAfterParentHotUpdate
+  + TestUniqueInsertAfterHotUpdate PASS (both verified red pre-fix);
+  upsert/exclusion/deferred set 24/24 PASS; isolation specs
+  fk-contention/fk-deadlock/update-locked-tuple all PASS.
+In-flight: none (scratch fk-repro.scope on :5533 stopped).

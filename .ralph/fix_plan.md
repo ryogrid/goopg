@@ -1119,15 +1119,24 @@ heuristic stays live.)
   suite FAILed in `internal/optimizer`. Same root cause as the units item
   directly above (identical `GOOPG_C9DEBUG` provenance-table failure signature
   in the log); closing stale for the same reason.
-- [ ] **testport/TestPort_IsolationFkContention (AI-20260917-004357-008)** — new
+- [x] **testport/TestPort_IsolationFkContention (AI-20260917-004357-008)** — new
   tonight, FAILed (repro: `go test -v -run '^TestPort_IsolationFkContention$'
   ./internal/testport/`).
-- [ ] **testport/TestPort_IsolationFkDeadlock (AI-20260917-004357-009)** — new
+  RESOLVED Loop \#22 by M0143-0010 — `a53c5b807`'s index-accelerated FK
+  existence probe (`scanIndexForFKMatch`) read the raw index ItemPointer,
+  which references the HOT-chain ROOT; a committed non-key parent UPDATE
+  leaves that member dead and the probe reported a false no-match (23503).
+  Now walks the chain via `eachHeapChainMember` with the seq-scan twin's
+  `TupleVisibleSubxact`. Spec PASSes at the fix commit.
+- [x] **testport/TestPort_IsolationFkDeadlock (AI-20260917-004357-009)** — new
   tonight, FAILed (repro: `go test -v -run '^TestPort_IsolationFkDeadlock$'
   ./internal/testport/`).
-- [ ] **testport/TestPort_UpdateLockedTuple (AI-20260917-004357-012)** — new
+  RESOLVED Loop \#22 by M0143-0010 — same `scanIndexForFKMatch` chain-root
+  blind spot; spec PASSes.
+- [x] **testport/TestPort_UpdateLockedTuple (AI-20260917-004357-012)** — new
   tonight, FAILed (repro: `go test -v -run '^TestPort_IsolationUpdateLockedTuple$'
   ./internal/testport/`).
+  RESOLVED Loop \#22 by M0143-0010 — same root cause; spec PASSes.
   (Remaining 12 items of this run — units/internal/parser AI-…-002,
   race/internal/executor AI-…-003, race/internal/parser AI-…-005,
   testport/TestE2E_PGColdStartOnGoopgDataDir AI-…-006,
@@ -10351,3 +10360,78 @@ reported, and the values and unit gates are the bar.
     Executor/planner gates per the practice card. Resolving this task
     resolves the `AI-007` ledger row's residual
     (`.ralph/deferral_ledger.md`, row dated 2026-08-09).
+- [x] **M0143-0010 — index probes must resolve the heap update chain; raw
+  `PageGetHeapTuple` on the index ItemPointer reads a dead chain root.**
+  RESOLVED Loop \#22 — new `eachHeapChainMember` iterator
+  (`internal/executor/operators_index.go`, the
+  `followHOTChainNoCopy`/`resolveDeferredUniqueChainTail` traversal shape:
+  redirect stubs → target, `ItemIDNormal` members in chain order via
+  `IsHotUpdated`/`CTID` links, `MaxHeapTuplesPerPage` bound) now backs every
+  index-driven heap probe that must judge the live row version:
+  `scanIndexForFKMatch` (snapshot `TupleVisibleSubxact` per member),
+  `uniqueCheckWithWait.scanOnce` (in-flight-xmin wait +
+  `isLiveForUniqueCheck` per member, `conflictPtr` = member slot),
+  `findInProgressConflictKey` + `probeSpeculativeConflict`
+  (upsert arbiter), `exclusionCheckOnce`, and
+  `recheckDeferredExclusionEq` (chain = one logical row — counts once if
+  ANY member is live, never per member). Already-correct siblings
+  unchanged: `followHOTChain` probes (index/index-only/update scans,
+  arbiter :673), `resolveDeferredUniqueChainTail`, EPQ/rowmark exact-ctid
+  refetches. Design:
+  `docs/design/0100-0149/m0143-0010-index-probe-hot-chain-resolution.md`.
+  Tests: `TestFKInsertAfterParentHotUpdate`,
+  `TestUniqueInsertAfterHotUpdate` (both verified red→green); the three
+  isolation specs PASS.
+  Kind: impl.
+  Parent: none.
+  Movement: none — executor correctness fix (false 23503/duplicate-key
+  bypass); no planner, costing, or plan-shape surface touched.
+  Filed 2026-09-20 (Loop \#22) — discovered while root-causing M-NIGHTLY
+  items `testport/TestPort_IsolationFkContention`
+  (AI-20260917-004357-008), `TestPort_IsolationFkDeadlock`
+  (AI-20260917-004357-009) and `TestPort_UpdateLockedTuple`
+  (AI-20260917-004357-012): all three are `pass`-required specs that
+  regressed between nightly `20260916-035206` (sha `48cf54f8`, all PASS)
+  and `20260917-004357` (sha `1b54b00f`, all FAIL with spurious 23503
+  where PG expects a clean match or a wait).
+  - Mechanism: a non-key UPDATE is HOT — the b-tree entry keeps pointing
+    at the chain ROOT line pointer, whose tuple is dead once the updater
+    commits (the live successor sits deeper in the same-page t_ctid
+    chain). Any index probe that fetches `ptr.Offset` verbatim and tests
+    only that tuple reports a false no-match for a live row. The
+    regression window's culprit is `a53c5b807` (M0142-0003g), whose new
+    `scanIndexForFKMatch` index-probe twin of `scanRelForFKMatchSeq`
+    (FK INSERT `assertParentExists` / `scanTableForMatchFKWait`) reads
+    the raw pointer — so `INSERT INTO child` fails 23503 after any
+    committed non-key parent UPDATE. Verified live on a scratch cluster
+    (`:5533`): `UPDATE foo SET b='y'; INSERT INTO bar VALUES (42)` →
+    `ERROR: ... violates foreign key constraint "bar_a_fkey"`.
+  - Same blind spot, **older, worse**: `uniqueCheckWithWait`'s
+    `scanOnce` (`internal/executor/operators_storage.go:8998`) — the
+    plain `INSERT`/`UPDATE` unique-enforcement probe — has never walked
+    the chain either. Verified live: `CREATE TABLE uq(a int PRIMARY
+    KEY, b text); INSERT INTO uq VALUES (7,'x'); UPDATE uq SET b='y';
+    INSERT INTO uq VALUES (7,'dup')` **succeeds — duplicate PRIMARY KEY
+    rows**. Also raw-pointer and unchained: upsert arbiter probes
+    `findInProgressConflictKey` (`operators_upsert.go:869`) and the
+    speculative-recheck probe (`:1402`). The :673 arbiter arm already
+    follows the chain via `followHOTChain` (M0100-0005 Bug A), and
+    `recheckDeferredUniqueKey` resolves via
+    `resolveDeferredUniqueChainTail` (M0134-0005e) — the pattern exists,
+    the newer/older probes just never got it.
+  - Fix direction: a shared per-member chain iterator (redirect stubs →
+    target, `ItemIDNormal` members yielded in chain order via
+    `IsHotUpdated`/`CTID` links, `MaxHeapTuplesPerPage` bound — the
+    `followHOTChainNoCopy`/`resolveDeferredUniqueChainTail` traversal
+    shape) so each probe keeps its own predicate
+    (`TupleVisibleSubxact`+`fkPendingOutcome` for FK;
+    `isLiveForUniqueCheck`+in-flight-xmin for the unique/upsert probes)
+    but can never again see only the dead root. Per-member evaluation in
+    chain order preserves the abort-rescan case (root's aborted xmax is
+    live under `isLiveForUniqueCheck`) that a tail-only resolution would
+    lose.
+  - Gates: the three failing isolation specs PASS at HEAD after the fix
+    (verified red at `ad778446e` first);
+    `TestFKInsertAfterParentHotUpdate` (new, red-then-green verified via
+    stash); executor package suite; the FK/upsert/unique isolation
+    siblings; tpch-spotcheck; tpcds-sf025; tpch-acceptance-arm.

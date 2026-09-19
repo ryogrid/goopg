@@ -116,6 +116,56 @@ func followHOTChainNoCopy(page storage.Page, startSlot uint16, snap transam.Snap
 	return storage.HeapTuple{}, 0, false
 }
 
+// eachHeapChainMember iterates the same-page update chain rooted at
+// startSlot on an already content-RLocked page: ItemIDRedirect stubs are
+// followed transparently and every ItemIDNormal member is yielded to fn in
+// chain order. A false return from fn ends the walk; a true return
+// continues to the member's HOT successor (IsHotUpdated → CTID.Offset) when
+// one exists, and ends it otherwise. A missing slot, a non-normal
+// non-redirect line pointer, a self-referencing link, or
+// MaxHeapTuplesPerPage hops also end it (same bound as followHOTChain —
+// M0131-S32).
+//
+// Index entries reference the chain ROOT; probes that must judge the live
+// row version iterate members and apply their own predicate instead of
+// fetching ptr.Offset verbatim — after a committed HOT update the root is
+// dead and a raw read reports a false no-match (M0143-0010).
+func eachHeapChainMember(page storage.Page, startSlot uint16, fn func(t storage.HeapTuple, slot uint16) bool) {
+	cur := startSlot
+	for i := 0; i < storage.MaxHeapTuplesPerPage; i++ {
+		item, err := storage.PageGetItemID(page, cur)
+		if err != nil {
+			return
+		}
+		if item.Flags == storage.ItemIDRedirect {
+			next := item.Offset
+			if next == cur {
+				return
+			}
+			cur = next
+			continue
+		}
+		if item.Flags != storage.ItemIDNormal {
+			return
+		}
+		t, err := storage.PageGetHeapTuple(page, cur)
+		if err != nil {
+			return
+		}
+		if !fn(t, cur) {
+			return
+		}
+		if !t.Header.IsHotUpdated() {
+			return
+		}
+		next := t.Header.CTID.Offset
+		if next == cur {
+			return
+		}
+		cur = next
+	}
+}
+
 // heapChainDeadToAll walks the HOT chain from startSlot testing every
 // member against storage.TupleDeadToAll (C3-S2: the executor's analog of
 // PG heap_hot_search_buffer's all_dead outcome). It returns true only when

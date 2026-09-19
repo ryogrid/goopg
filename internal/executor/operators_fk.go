@@ -1473,16 +1473,29 @@ func scanIndexForFKMatch(ctx *Context, rel storage.RelFileNode, tree *nbtree.BTr
 			return true, nil
 		}
 		s.RLock()
-		tuple, terr := storage.PageGetHeapTuple(s.Page(), ptr.Offset)
+		// The index entry references the chain ROOT line pointer. After a
+		// HOT update the root member is dead and the live version sits
+		// deeper in the same-page chain, so visibility must be evaluated
+		// per member — reading only the root reports a false no-match for
+		// a perfectly live parent (the fk-contention regression, M0143-0010).
+		// The visibility test is the seq-scan twin's TupleVisibleSubxact so
+		// the two paths cannot diverge.
+		var tuple storage.HeapTuple
+		var slot uint16
+		visible := false
+		eachHeapChainMember(s.Page(), ptr.Offset, func(t storage.HeapTuple, mslot uint16) bool {
+			if !transam.TupleVisibleSubxact(t.Header, ctx.Snap, ctx.Tx.XID, ctx.TxnMgr, ctx.CmdID, ctx.comboStore(), ctx.MultiXact) {
+				return true // invisible member — try its HOT successor
+			}
+			tuple, slot, visible = t, mslot, true
+			return false
+		})
 		s.RUnlock()
 		ctx.Pool.Unpin(s)
-		if terr != nil {
+		if !visible {
 			return true, nil
 		}
-		if !transam.TupleVisibleSubxact(tuple.Header, ctx.Snap, ctx.Tx.XID, ctx.TxnMgr, ctx.CmdID, ctx.comboStore(), ctx.MultiXact) {
-			return true, nil
-		}
-		if clean, pend := fkPendingOutcome(ctx, tuple, rel, ptr.Block, ptr.Offset); clean {
+		if clean, pend := fkPendingOutcome(ctx, tuple, rel, ptr.Block, slot); clean {
 			found = true
 			return false, nil
 		} else if pending == nil {

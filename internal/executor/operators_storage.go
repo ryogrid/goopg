@@ -8943,17 +8943,22 @@ func exclusionCheckOnce(ctx *Context, rel storage.RelFileNode, tree *nbtree.BTre
 			return true, nil
 		}
 		slot.RLock()
-		tuple, terr := storage.PageGetHeapTuple(slot.Page(), ptr.Offset)
+		// The index entry references the update-chain ROOT — a committed
+		// HOT update leaves the live member deeper in the chain, so the
+		// liveness check runs per member (M0143-0010, same defect class as
+		// uniqueCheckWithWait).
+		stop := false
+		eachHeapChainMember(slot.Page(), ptr.Offset, func(tuple storage.HeapTuple, _ uint16) bool {
+			if isLiveForUniqueCheck(ctx, tuple.Header.Xmin, tuple.Header.Xmax) {
+				liveConflict = true
+				stop = true
+				return false
+			}
+			return true // dead member — try the HOT successor
+		})
 		slot.RUnlock()
 		ctx.Pool.Unpin(slot)
-		if terr != nil {
-			return true, nil
-		}
-		if isLiveForUniqueCheck(ctx, tuple.Header.Xmin, tuple.Header.Xmax) {
-			liveConflict = true
-			return false, nil
-		}
-		return true, nil
+		return !stop, nil
 	})
 	if liveConflict {
 		return &ExecError{
@@ -9011,29 +9016,36 @@ func uniqueCheckWithWait(ctx *Context, rel storage.RelFileNode, tree *nbtree.BTr
 				return true, nil
 			}
 			slot.RLock()
-			tuple, terr := storage.PageGetHeapTuple(slot.Page(), ptr.Offset)
+			// The index entry references the update-chain ROOT: after a
+			// committed HOT update that member is dead while the live row
+			// sits deeper in the same-page chain. Reading only the root let
+			// a duplicate INSERT bypass UNIQUE entirely (M0143-0010), so
+			// each member is checked in chain order.
+			stop := false
+			eachHeapChainMember(slot.Page(), ptr.Offset, func(tuple storage.HeapTuple, mslot uint16) bool {
+				xmin := tuple.Header.Xmin
+				// In-flight other-xact insert: must wait. A sub-XID of our own
+				// transaction tree must never enter this branch (the row is live and
+				// the caller raises 23505 instead), or the wait blocks forever on
+				// goopg's own subtransaction. M0134-0077.
+				if ctx.TxnMgr != nil && xmin != storage.InvalidTransactionID &&
+					!xidIsSelf(ctx, xmin) &&
+					ctx.TxnMgr.IsXIDActive(xmin) {
+					inflightXmin = xmin
+					stop = true
+					return false
+				}
+				if isLiveForUniqueCheck(ctx, xmin, tuple.Header.Xmax) {
+					liveConflict = true
+					conflictPtr = storage.ItemPointer{Block: ptr.Block, Offset: mslot}
+					stop = true
+					return false
+				}
+				return true // dead member — try the HOT successor
+			})
 			slot.RUnlock()
 			ctx.Pool.Unpin(slot)
-			if terr != nil {
-				return true, nil
-			}
-			xmin := tuple.Header.Xmin
-			// In-flight other-xact insert: must wait. A sub-XID of our own
-			// transaction tree must never enter this branch (the row is live and
-			// the caller raises 23505 instead), or the wait blocks forever on
-			// goopg's own subtransaction. M0134-0077.
-			if ctx.TxnMgr != nil && xmin != storage.InvalidTransactionID &&
-				!xidIsSelf(ctx, xmin) &&
-				ctx.TxnMgr.IsXIDActive(xmin) {
-				inflightXmin = xmin
-				return false, nil
-			}
-			if isLiveForUniqueCheck(ctx, xmin, tuple.Header.Xmax) {
-				liveConflict = true
-				conflictPtr = ptr
-				return false, nil
-			}
-			return true, nil
+			return !stop, nil
 		})
 	}
 
