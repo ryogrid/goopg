@@ -41,6 +41,13 @@ type SchemaColumn struct {
 	Name           string
 	Type           catalog.Type
 	SourceTableIdx int16
+	// Resjunk marks a column that rides the row for an enclosing operator's
+	// use but is not part of the user-visible output — PostgreSQL's resjunk
+	// targetlist mark. Today only the rowmark ctid columns injected by
+	// wireRowMarkCtidColumns carry it; LockRows strips resjunk positions from
+	// its output and whole-row dedup (distinctOp) excludes them from the
+	// dedup key. M0143-0009.
+	Resjunk bool
 }
 
 // Expr is implemented by every planner expression. The planner
@@ -2340,6 +2347,13 @@ type LockedRel struct {
 	// when not yet wired (the executor falls back to the walker path).
 	// M0128-P6.1 resjunk-ctid rowmark.
 	CtidResno int
+	// ColPos, when non-nil, is the exact position of each of this relation's
+	// columns in the LockRows child's output row — resolved by
+	// (Name, SourceTableIdx) identity after ctid injection. ColOffset+i only
+	// coincides with it when the child row is the FROM-order merged row; a
+	// top Project may subset or reorder. nil → executor uses ColOffset+i.
+	// M0143-0009.
+	ColPos []int
 }
 
 // LockRows is the upstream-shape wrapper that adds row-lock
@@ -2377,14 +2391,33 @@ type LockRows struct {
 
 func (n *LockRows) Pos() int { return n.pos }
 
-// Output returns the user-visible schema (child schema with trailing ctid
-// junk columns stripped). When no ctid columns are wired, this is identical
-// to Child.Output(). M0128-P6.1 resjunk-ctid rowmark.
+// Output returns the user-visible schema (child schema with resjunk ctid
+// columns stripped at their real positions — a ctid injected into a
+// non-rightmost leaf sits mid-row, not at the tail; M0143-0009). When no
+// ctid columns are wired this is identical to Child.Output(). The trailing
+// NumCtidCols convention remains as a fallback for hand-built plans whose
+// schema carries no Resjunk marks. M0128-P6.1 resjunk-ctid rowmark.
 func (n *LockRows) Output() Schema {
-	if n.NumCtidCols == 0 {
-		return n.Child.Output()
-	}
 	child := n.Child.Output()
+	hasJunk := false
+	for _, c := range child {
+		if c.Resjunk {
+			hasJunk = true
+			break
+		}
+	}
+	if hasJunk {
+		out := make(Schema, 0, len(child))
+		for _, c := range child {
+			if !c.Resjunk {
+				out = append(out, c)
+			}
+		}
+		return out
+	}
+	if n.NumCtidCols == 0 {
+		return child
+	}
 	if n.NumCtidCols >= len(child) {
 		return Schema{}
 	}

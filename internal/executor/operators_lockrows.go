@@ -120,6 +120,13 @@ type lockRowsOp struct {
 	// instead of scanning the full inner table. M0100-0005.
 	maxDrain int
 
+	// junkPos is the set of resjunk (rowmark ctid) column positions in the
+	// child row — stripped before a row leaves the operator. Positions are
+	// read from the child schema's Resjunk marks; a ctid injected into a
+	// non-rightmost leaf sits mid-row, so the trailing-NumCtidCols trim is
+	// only a fallback for hand-built plans without marks. M0143-0009.
+	junkPos map[int]bool
+
 	// filterPred / filterCols: extracted from the child chain at Open time.
 	// When stampLock follows a committed-update CTID chain to a live successor
 	// (EPQ for SELECT FOR UPDATE), the filter predicate is re-evaluated against
@@ -174,7 +181,49 @@ type pendingLockedRow struct {
 }
 
 func newLockRowsOp(p *optimizer.LockRows, child Operator) *lockRowsOp {
-	return &lockRowsOp{plan: p, child: child}
+	return &lockRowsOp{plan: p, child: child, junkPos: resjunkPositions(p)}
+}
+
+// resjunkPositions computes the set of column positions in the LockRows
+// child's output that carry resjunk (rowmark ctid) datums — the positions to
+// strip before a row leaves the operator. The Resjunk schema mark handles
+// ctids anywhere in the row; when no marks are present the trailing
+// NumCtidCols positions are used (hand-built plans). M0143-0009.
+func resjunkPositions(p *optimizer.LockRows) map[int]bool {
+	schema := p.Child.Output()
+	var pos map[int]bool
+	for i, c := range schema {
+		if c.Resjunk {
+			if pos == nil {
+				pos = map[int]bool{}
+			}
+			pos[i] = true
+		}
+	}
+	if pos == nil && p.NumCtidCols > 0 {
+		pos = map[int]bool{}
+		for i := len(schema) - p.NumCtidCols; i < len(schema); i++ {
+			if i >= 0 {
+				pos[i] = true
+			}
+		}
+	}
+	return pos
+}
+
+// stripJunkCols returns row without the resjunk positions. len(junk)==0 is
+// the common path and returns the row unchanged.
+func stripJunkCols(row Row, junk map[int]bool) Row {
+	if len(junk) == 0 {
+		return row
+	}
+	out := make(Row, 0, len(row)-len(junk))
+	for i := range row {
+		if !junk[i] {
+			out = append(out, row[i])
+		}
+	}
+	return out
 }
 
 // findFilterPred walks the child chain past Project wrappers and returns the
@@ -1013,7 +1062,10 @@ func (o *lockRowsOp) Next() (TupleSlot, error) {
 				}
 				for i, v := range newLockedCols {
 					pos := lk.ColOffset + i
-					if pos < len(merged) {
+					if len(lk.ColPos) > i {
+						pos = lk.ColPos[i] // M0143-0009: resolved post-injection position
+					}
+					if pos >= 0 && pos < len(merged) {
 						merged[pos] = v
 					}
 				}
@@ -1028,10 +1080,10 @@ func (o *lockRowsOp) Next() (TupleSlot, error) {
 					}
 				}
 			}
-			// M0128-P6.1: trim ctid columns — the schema returned by
-			// o.Schema() (i.e. o.plan.Output()) already strips them,
-			// so the row must match.
-			merged = merged[:len(o.Schema())]
+			// M0128-P6.1 / M0143-0009: trim resjunk ctid columns at their
+			// real positions — the schema returned by o.Schema() (i.e.
+			// o.plan.Output()) already strips them, so the row must match.
+			merged = stripJunkCols(merged, o.junkPos)
 			ms := SlotFromRow(o.Schema(), merged)
 			ms.hasCTID = true
 			ms.ctidBlock = uint32(entry.newPtr.Block)
@@ -1039,13 +1091,10 @@ func (o *lockRowsOp) Next() (TupleSlot, error) {
 			return ms, nil
 		}
 	}
-	// M0128-P6.1: trim ctid columns from the pending row so it matches
-	// the stripped schema (NumCtidCols is 0 when no ctid was wired, so
-	// this is a no-op for the pre-M0128 path).
-	row := entry.row
-	if n := o.plan.NumCtidCols; n > 0 && len(row) > n {
-		row = row[:len(row)-n]
-	}
+	// M0128-P6.1 / M0143-0009: trim resjunk ctid columns at their real
+	// positions so the pending row matches the stripped schema (no-op when
+	// no ctid was wired).
+	row := stripJunkCols(entry.row, o.junkPos)
 	ms := SlotFromRow(o.Schema(), row)
 	if entry.haveTID {
 		ms.hasCTID = true

@@ -6306,6 +6306,38 @@ cross-layer programme that has never been scoped.
   estimate feeds `get_loop_count` on every parameterized probe under a
   LIKE-filtered outer (Q9's `part ⋈ partsupp` flip site is the canonical
   one).
+  - **Loop \#21 recon findings (recorded while frozen — task stays `[ ]`
+    per the M0142-0005 ESCALATION, owner reopens/closes):** the estimator is
+    a faithful port — `internal/optimizer/patternsel.go`'s
+    `patternSelectivity` mirrors `patternsel_common` line-for-line
+    (`histogram_selectivity` n_skip=1 interior-bounds fraction, MCV
+    exact-match merge, `1-nullfrac-sumcommon` scaling, 0.0001/0.9999
+    clamps). Verified numerically on the live clusters: both `pg_stats`
+    histograms are 101 bounds, no MCVs, null_frac=0 on both sides; goopg
+    has **6** interior bounds matching `%green%` → 6/99 = 0.0606 → 12121
+    exactly, PG has **3** → 3/99 = 0.0303 → 6061 exactly. **No sub-term
+    diverges** — not a missing histogram lookup (hist_size=101 ≥ 100 →
+    pure-histogram path both sides; the small-histogram heuristic blend is
+    never reached), not prefix weighting (`%green%` has no fixed prefix →
+    `prefixsel=1.0` arm, also unreached), not matcher semantics (substring
+    match identical). The gap is **histogram content**: (a) the corpora
+    are not row-identical — `count(*) FILTER (p_name LIKE '%green%')` is
+    10686 on :65433 vs 10619 on :65432, `count(DISTINCT p_name)` 200000
+    vs 199999 — the HammerDB client-side generator is not dbgen-identical
+    (extends M0142-0005f's physical-layout finding to *logical* content);
+    (b) reservoir-sample realization noise — each side draws its own
+    30000-row sample (goopg's ANALYZE ports the two-stage block-S +
+    Vitter-Z sampler), and bound-match count is ~Binomial(99, ≈0.053):
+    σ≈2.2, so 3 (−1σ) and 6 (+0.3σ) are both unremarkable draws. On its
+    own data goopg errs +13% (12121 vs 10686) while PG errs −43% on its
+    (6061 vs 10619) — goopg's estimate is the *closer* one; there is no
+    logic defect to fix. The Q9 flip site is real but input-driven: PG
+    plans `NL(part→partsupp idx)` at 6061 while goopg builds a hash join
+    at 12121 — closing it needs the same owner-side corpus rebuild
+    M0142-0005f escalated, not an estimator change. **Expected movement:
+    none achievable via `patternsel` changes** — any task to align the
+    number must operate on the corpus, which is the M0142-0005
+    escalation's existing ask.
 - [x] **M0142-0006 — apply `semiJoinMatchFraction` in `estimateNLIndexJoin`** —
   `estimateNLIndexJoin` (`cardinality.go:239-241`) returns `EstimateRows(j.Outer)` for
   SEMI/ANTI, while its sibling `estimateJoin` (`:608-625`) applies the match
@@ -10245,3 +10277,77 @@ reported, and the values and unit gates are the bar.
   audit this project's practice card requires, each slice gated by its own
   regress run plus the sf025 sweep. Ledger:
   `.ralph/deferral_ledger.md`, row dated 2026-09-18 (task M0143-0007).
+- [x] **M0143-0009 — `SELECT … FOR UPDATE` over a join drops every row when a
+  locked leaf is not the rightmost scan (resjunk-ctid ColumnRef shift).**
+  RESOLVED Loop #21 — `rebaseRowMarkPlan` post-order walk rebases every
+  expression after ctid injection (per-node old→new position remaps; join
+  preds/keys/`UsingCols` in merged coords — the executor's
+  `mergedKeySlot`/`keySlot.rebind` prove keys are merged-space, not
+  side-local; NLI probe keys outer-scoped), `SchemaColumn.Resjunk` marks
+  injected cols, `LockRows.Output()`/`lockRowsOp` strip by resjunk-position
+  set (not trailing-N), `distinctOp` dedups excluding resjunk positions,
+  `CtidResno` resolves for non-Project roots, `LockedRel.ColPos` fixes EPQ
+  merge on projected outputs, AI-007 self-join guard retired (alias-aware
+  `tagScan`). Walk-wide `seen` dedupes shared `*ColumnRef` objects
+  (HashKeys[0] aliases LeftKey/RightKey by pointer). Design:
+  `docs/design/0100-0149/m0143-0009-rowmark-ctid-global-expr-rebase.md`.
+  Test: `TestLockRowsJoinCtidShift` (8 arms) + updated `locking_test.go`
+  self-join pins; verified end-to-end on scratch cluster incl. hash join.
+  Kind: impl.
+  Parent: none.
+  Filed 2026-09-19 (Loop \#21) — live wrong-results defect found while probing
+  rowmark ordering during task selection; verified at HEAD `2b7e97053` on a
+  scratch cluster (:5533). Broadens the deferral-ledger `AI-007 self-join
+  lock` row (2026-08-09, `status: -`): the blast radius recorded there
+  ("self-joins") is under-scoped — ordinary two-table joins are corrupted
+  the same way.
+  - Repro (tables `a(i int, t text)`, `b(i int, t text)`, 200k rows each,
+    one `i=31` row per side):
+    `SELECT a.i FROM a JOIN b ON a.i=b.i WHERE a.i=31` → 1 row;
+    `… FOR UPDATE` → 0 rows (WRONG); `… FOR UPDATE OF a` → 0 rows (WRONG);
+    `… FOR UPDATE OF b` → 1 row; `SELECT b.i FROM b JOIN a … FOR UPDATE OF a`
+    (a rightmost) → 1 row. `EXPLAIN (ANALYZE)` shows `Rows Removed by Join
+    Filter: 1` inside the Nested Loop under LockRows — the join emits
+    nothing, so LockRows never sees a row. Reproduces identically under
+    Hash Join (`SELECT *` variant).
+  - Mechanism: `wireRowMarkCtidColumns` (`internal/optimizer/planner.go:2663`)
+    appends a `ctid<N>` resjunk column to each rowmarked leaf's schema;
+    `recomputeIntermediateSchemas` (:2813) rebuilds Join/NLI schemas as
+    left++right but rebases `ColumnRef.Index` ONLY for `*Project` targets
+    (`fixColumnRefIndices`, :2882). `Join.Predicate` ColumnRefs are absolute
+    merged-row positions (`joinPredicateMatch` → `evalExpr` over the merged
+    row), so a ctid injected into any non-rightmost leaf shifts every later
+    sibling's refs — the `b.i` operand reads the ctid datum, the join filter
+    misfires, every row is removed. Locking only the rightmost leaf appends
+    at the merged row's end → no shift → works; that is why `OF b` and
+    right-leaf cases pass and why the ported rowmark tests did not catch it.
+  - Same hazard class, un-rebased: hash/merge key expressions and the
+    residual re-eval (`execResidual` defaults to the full `Predicate`,
+    `internal/executor/operators_join_agg.go` ~line 353 — what kills the
+    Hash Join variant), `Filter` predicates above the join, Sort/Aggregate/
+    Distinct keys.
+  - `hasSelfJoinLockedTable` (:2639) only skips injection when the same
+    table OID appears twice (the AI-007 workaround); the general case is
+    unguarded.
+  - Secondary wrinkle: `CtidResno` is set only when the plan root is
+    `*Project` (:2796); Join-rooted plans inject ctid columns that nothing
+    reads — pure harm (shift refs, then the executor falls back to
+    `currentTID`).
+  - Fix direction (PG-faithful): PostgreSQL never shifts positions —
+    resjunk ctids are built into the scan targetlist at path time and
+    `postgres/src/backend/optimizer/plan/setrefs.c`
+    (`set_plan_refs`/`set_join_references`) remaps every Var through the
+    constructed targetlists. goopg's post-hoc injection needs the same
+    global rebase: after `recomputeIntermediateSchemas`, walk the whole
+    plan tree and rebase every expression holding absolute ColumnRefs
+    (join Predicate + hash/merge keys, Filter.Predicate, Sort keys,
+    Aggregate keys, …) via the existing (name, SourceTableIdx)→position
+    map. `hasSelfJoinLockedTable` removal stays out of scope until the
+    rebase exists (its guard currently masks self-joins only).
+  - Required per M0143 discipline: a failing regression test first —
+    `FOR UPDATE` over a two-table join must return the join's rows
+    (locked vs unlocked results identical), covering left-leaf and
+    right-leaf `OF` arms plus bare `FOR UPDATE`, under NL and hash plans.
+    Executor/planner gates per the practice card. Resolving this task
+    resolves the `AI-007` ledger row's residual
+    (`.ralph/deferral_ledger.md`, row dated 2026-08-09).

@@ -222,9 +222,21 @@ func (o *recursiveUnionOp) Next() (TupleSlot, error) {
 // KindNumeric "0.0" and KindInt "0" compare equal across cross-type UNIONs
 // (e.g. FLOAT8_TBL UNION INT4_TBL). M0097-0042.
 func rowKey(row Row) string {
+	return rowKeyExcluding(row, nil)
+}
+
+// rowKeyExcluding is rowKey over only the non-skipped positions. Used for
+// whole-row dedup under rowmark ctid injection: a resjunk column rides the
+// row (PG's resjunk tlist mark — it must survive to LockRows) but is not
+// part of the dedup key, exactly as PG dedups on the distinct clause
+// columns rather than the physical tuple. M0143-0009.
+func rowKeyExcluding(row Row, skip map[int]bool) string {
 	var sb strings.Builder
 	for i, d := range row {
-		if i > 0 {
+		if skip[i] {
+			continue
+		}
+		if sb.Len() > 0 {
 			sb.WriteByte('|')
 		}
 		if d.IsNull() {

@@ -2,6 +2,9 @@ package executor
 
 import (
 	"context"
+	"fmt"
+	"sort"
+	"strings"
 	"testing"
 	"time"
 
@@ -47,7 +50,9 @@ func runForUpdate(t *testing.T, ctx *Context, sql string) ([]Row, error) {
 		if err != nil {
 			return nil, err
 		}
-		rows = append(rows, slot.Row())
+		// Clone: the slot's backing array is reused across Next() calls, so
+		// collected rows would otherwise all alias the last row.
+		rows = append(rows, cloneRow(slot.Row()))
 	}
 	return rows, nil
 }
@@ -1734,6 +1739,123 @@ func TestLockRowsOutputStripsCtidColumns(t *testing.T) {
 			t.Errorf("Output().len = %d, want 0 (NumCtidCols exceeds child schema)", len(out))
 		}
 	})
+}
+
+// TestLockRowsJoinCtidShift — M0143-0009 regression: appending a resjunk
+// ctid column to a rowmarked leaf shifts every later sibling's
+// ColumnRef.Index in the join's merged row. Before the global rebase, a
+// `FOR UPDATE` on any join where the locked leaf was not the rightmost
+// scan dropped every row (join predicate read the ctid datum), and a
+// left-leaf ctid stranded mid-row was stripped as if trailing.
+func TestLockRowsJoinCtidShift(t *testing.T) {
+	ctx, cat, cleanup := newStorageFixture(t)
+	defer cleanup()
+	ctx.LockMgr = lmgr.New()
+	ctx.BackendID = 1
+	tbl, _ := cat.LookupTable(parser.ObjectName{Name: "items"})
+	seedItems(t, ctx, tbl) // (1,alpha),(2,beta),(3,gamma)
+	if _, err := cat.CreateTable(parser.ObjectName{Name: "items2"}, []catalog.Column{
+		{Name: "id", Type: catalog.Type{Name: "int4"}, NotNull: true},
+		{Name: "label", Type: catalog.Type{Name: "text"}},
+	}); err != nil {
+		t.Fatalf("CreateTable items2: %v", err)
+	}
+	tbl2, _ := cat.LookupTable(parser.ObjectName{Name: "items2"})
+	advanceStmtCounter(ctx)
+	// (1,'one'),(1,'uno'),(2,'two')×2,(3,'three'): the a.id=2 arm emits two
+	// identical merged rows so the DISTINCT arm exercises whole-row dedup
+	// with a resjunk ctid riding mid-row.
+	in := &optimizer.Insert{
+		Table: tbl2,
+		Source: &optimizer.Values{Rows: [][]optimizer.Expr{
+			{&optimizer.IntegerConst{Value: 1}, &optimizer.StringConst{Value: "one"}},
+			{&optimizer.IntegerConst{Value: 1}, &optimizer.StringConst{Value: "uno"}},
+			{&optimizer.IntegerConst{Value: 2}, &optimizer.StringConst{Value: "two"}},
+			{&optimizer.IntegerConst{Value: 2}, &optimizer.StringConst{Value: "two"}},
+			{&optimizer.IntegerConst{Value: 3}, &optimizer.StringConst{Value: "three"}},
+		}},
+		ColumnIndex: []int{0, 1},
+	}
+	seedOp, err := Build(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := seedOp.Open(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := seedOp.Next(); err != EOF {
+		t.Fatalf("seed items2: %v", err)
+	}
+	_ = seedOp.Close()
+
+	rowStrings := func(rows []Row) []string {
+		out := make([]string, 0, len(rows))
+		for _, r := range rows {
+			var b strings.Builder
+			for i, d := range r {
+				if i > 0 {
+					b.WriteByte('|')
+				}
+				if d.IsNull() {
+					b.WriteString("NULL")
+				} else if d.Kind == KindInt {
+					fmt.Fprintf(&b, "%d", d.Int)
+				} else {
+					b.WriteString(d.StringValue())
+				}
+			}
+			out = append(out, b.String())
+		}
+		sort.Strings(out)
+		return out
+	}
+	arms := []struct{ name, locked, unlocked string }{
+		{"of_left_leaf",
+			"SELECT a.id, b.label FROM items a JOIN items2 b ON a.id=b.id FOR UPDATE OF a",
+			"SELECT a.id, b.label FROM items a JOIN items2 b ON a.id=b.id"},
+		{"bare_for_update",
+			"SELECT a.id, b.label FROM items a JOIN items2 b ON a.id=b.id FOR UPDATE",
+			"SELECT a.id, b.label FROM items a JOIN items2 b ON a.id=b.id"},
+		{"of_right_leaf",
+			"SELECT a.id, b.label FROM items a JOIN items2 b ON a.id=b.id FOR UPDATE OF b",
+			"SELECT a.id, b.label FROM items a JOIN items2 b ON a.id=b.id"},
+		{"of_left_swapped_from",
+			"SELECT b.id, a.label FROM items2 b JOIN items a ON a.id=b.id FOR UPDATE OF a",
+			"SELECT b.id, a.label FROM items2 b JOIN items a ON a.id=b.id"},
+		{"star_join_rooted",
+			"SELECT * FROM items a JOIN items2 b ON a.id=b.id FOR UPDATE OF a",
+			"SELECT * FROM items a JOIN items2 b ON a.id=b.id"},
+		{"order_by_above_join",
+			"SELECT a.id, b.label FROM items a JOIN items2 b ON a.id=b.id ORDER BY a.id FOR UPDATE OF a",
+			"SELECT a.id, b.label FROM items a JOIN items2 b ON a.id=b.id ORDER BY a.id"},
+		{"distinct_star",
+			"SELECT DISTINCT * FROM items a JOIN items2 b ON a.id=b.id FOR UPDATE OF a",
+			"SELECT DISTINCT * FROM items a JOIN items2 b ON a.id=b.id"},
+		{"self_join_bare",
+			"SELECT a.id FROM items a JOIN items b ON a.id=b.id FOR UPDATE",
+			"SELECT a.id FROM items a JOIN items b ON a.id=b.id"},
+	}
+	for _, arm := range arms {
+		t.Run(arm.name, func(t *testing.T) {
+			want, err := runForUpdate(t, ctx, arm.unlocked)
+			if err != nil {
+				t.Fatalf("unlocked baseline: %v", err)
+			}
+			got, err := runForUpdate(t, ctx, arm.locked)
+			if err != nil {
+				t.Fatalf("locked query: %v", err)
+			}
+			ws, gs := rowStrings(want), rowStrings(got)
+			if len(gs) != len(ws) {
+				t.Fatalf("locked query returned %d rows %v, want %d rows %v", len(gs), gs, len(ws), ws)
+			}
+			for i := range ws {
+				if gs[i] != ws[i] {
+					t.Fatalf("locked row %d = %q, want %q (all rows %v)", i, gs[i], ws[i], gs)
+				}
+			}
+		})
+	}
 }
 
 // mockSchemaNode implements planner.Node with just a schema for testing.

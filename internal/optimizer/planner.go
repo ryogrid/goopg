@@ -3,6 +3,7 @@ package optimizer
 import (
 	"reflect"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -2224,26 +2225,20 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 			return nil, lerr
 		}
 		// M0129-S6 resjunk-ctid column-path re-enable: wire ctid columns
-		// into leaf scan schemas, then recompute intermediate-node schemas
-		// (Join, NestedLoopIndexJoin) so the ctid columns propagate through
-		// the join tree. recomputeIntermediateSchemas also fixes the
-		// ColumnRef indices in the top Project from scan-local to absolute
-		// positions. The slot side-channel (MaterializedSlot.hasCTID) remains
-		// as belt-and-braces for plan shapes the column path cannot cover
-		// (CTE scans, VALUES). M0129-0003 §2.
-		// M-NIGHTLY AI-007: ctid column injection breaks the hash join for
-		// self-joins because recomputeIntermediateSchemas rebuilds the join
-		// schema but the hash key expressions still use pre-injection indices.
-		// Skip injection when a locked table appears in multiple FROM items
-		// (same OID referenced more than once). The scan fallback path
-		// (findScanLeafForRel → o.scan.currentTID()) handles TID correctly
-		// in these cases.
-		numCtid := 0
-		if !hasSelfJoinLockedTable(locks, s) {
-			numCtid = wireRowMarkCtidColumns(out, locks)
-		}
+		// into leaf scan schemas, then rebase the whole plan's expression
+		// coordinates (rebaseRowMarkPlan — the goopg analogue of PG's
+		// setrefs.c Var remap — covers join predicates, hash/merge keys,
+		// filter/sort/agg keys, etc., not just the top Project). The slot
+		// side-channel (MaterializedSlot.hasCTID) remains as belt-and-braces
+		// for plan shapes the column path cannot cover (CTE scans, VALUES).
+		// M0129-0003 §2.
+		// M0143-0009: the AI-007 self-join guard is retired — the rebase
+		// repairs every expression coordinate after injection, so
+		// self-joins take the real ctid path like any other shape.
+		numCtid, oldW := wireRowMarkCtidColumns(out, locks)
 		if numCtid > 0 {
-			recomputeIntermediateSchemas(out)
+			rebaseRowMarkPlan(out, oldW)
+			resolveRowMarkCtidResnos(out, locks)
 		}
 		// SKIP LOCKED with a LIMIT must lock rows in the LIMIT's order and stop
 		// after the LIMIT count of *successfully-locked* rows (PG plans
@@ -2629,105 +2624,84 @@ func findBindingByName(bindings []rangeBinding, name string) (rangeBinding, bool
 	return rangeBinding{}, false
 }
 
-
-// hasSelfJoinLockedTable reports whether ctid injection should be skipped
-// because a locked table appears in a self-join (same table name in multiple
-// FROM items). Ctid column injection breaks the hash join schema when a table
-// appears on both sides, because recomputeIntermediateSchemas does not update
-// hash key expressions. The scan fallback path (findScanLeafForRel →
-// o.scan.currentTID()) handles TID correctly. M-NIGHTLY AI-007.
-func hasSelfJoinLockedTable(locks []LockedRel, sel *parser.SelectStmt) bool {
-	for _, lk := range locks {
-		if lk.Table == nil {
-			continue
-		}
-		seen := 0
-		for _, f := range sel.From {
-			if f.Name != "" && f.Name == lk.Table.Name && f.Schema == lk.Table.Schema {
-				seen++
-			}
-		}
-		if seen > 1 {
-			return true
-		}
-	}
-	return false
-}
-
-// wireRowMarkCtidColumns adds resjunk ctid columns to the schema of every
-// SeqScan or IndexScan whose relation is rowmarked, and extends the top-level
-// Project to carry those columns through to the LockRows. Returns the number of
-// ctid columns wired (also reflected in locks[i].CtidResno, set by this call).
-// When no scan can be wired (e.g. a CTE scan), CtidResno stays -1 and the
-// executor falls back to the walker/side-channel path. M0128-P6.1 resjunk-ctid rowmark.
-func wireRowMarkCtidColumns(root Node, locks []LockedRel) int {
+// wireRowMarkCtidColumns appends a resjunk ctid column (Resjunk-marked,
+// M0143-0009) to the schema of every rowmarked leaf scan — SeqScan,
+// IndexScan, BitmapHeapScan, the three leaves the executor can surface a
+// heap TID from — and returns the number wired plus oldW, the pre-injection
+// output width of every visited node (the caller's rebase walk needs
+// pre-shift widths to build position remaps). Wired locks get the
+// CtidResno=-2 "wired, resno pending" sentinel; resolveRowMarkCtidResnos
+// assigns real resnos after the rebase. Locks whose scan cannot be wired
+// (e.g. a CTE scan) keep -1 and the executor falls back to the
+// walker/side-channel path. M0128-P6.1 resjunk-ctid rowmark.
+func wireRowMarkCtidColumns(root Node, locks []LockedRel) (int, map[Node]int) {
 	if len(locks) == 0 {
-		return 0
+		return 0, nil
 	}
-	// Build a set of locked relation OIDs.
-	lockedOID := map[uint32]int{} // OID → index into locks
+	lockedOID := map[uint32]bool{}
 	for i := range locks {
 		if locks[i].Table != nil {
-			lockedOID[locks[i].Table.OID] = i
+			lockedOID[locks[i].Table.OID] = true
 		}
 	}
 	if len(lockedOID) == 0 {
-		return 0
+		return 0, nil
 	}
-	// Walk the plan tree and append a ctid column to every matching scan's
-	// schema. Use the same node-enumeration pattern as boundaryWalkChildren.
-	// For self-joins each scan gets its own ctid column; scans are matched to
-	// LockedRel entries by OID, assigning to the first LockedRel for that OID
-	// that hasn't been wired yet.
 	ctidType := catalog.Type{Name: "tid"}
-	type taggedScan struct {
-		lockIdx   int // index into locks
-		schemaIdx int // ctid column index in this scan's output
-	}
-	tagged := []taggedScan{} // in scan-tree walk order
-	// nextLockIdx[oid] is the index into locks of the next LockedRel for this
-	// OID that should be wired when a matching scan is found. Starts at the
-	// first LockedRel for each OID, increments on each match.
-	nextLockIdx := map[uint32]int{}
-	for i := range locks {
-		if locks[i].Table != nil {
-			if _, exists := nextLockIdx[locks[i].Table.OID]; !exists {
-				nextLockIdx[locks[i].Table.OID] = i
+	numCtid := 0
+	// tagScan appends a ctid column to the leaf's schema when its table is
+	// rowmarked. The match is by (OID, effective alias): self-joins bind the
+	// same OID under distinct aliases and each range-table entry gets its own
+	// LockedRel/RowMarkId, so a scan must only claim the lock for ITS binding
+	// (M0143-0009 — this replaces the AI-007 self-join injection skip).
+	tagScan := func(tbl *catalog.Table, alias string, schema *Schema) {
+		if !lockedOID[tbl.OID] {
+			return
+		}
+		eff := alias
+		if eff == "" {
+			eff = tbl.Name
+		}
+		for i := range locks {
+			lk := &locks[i]
+			if lk.Table == nil || lk.Table.OID != tbl.OID || lk.CtidResno != -1 {
+				continue
 			}
+			leff := lk.Alias
+			if leff == "" {
+				leff = lk.Table.Name
+			}
+			if leff != eff {
+				continue
+			}
+			*schema = append(*schema, SchemaColumn{
+				Name:           fmt.Sprintf("ctid%d", lk.RowMarkId),
+				Type:           ctidType,
+				SourceTableIdx: -1,
+				Resjunk:        true,
+			})
+			lk.CtidResno = -2 // wired; real resno resolved post-rebase
+			numCtid++
+			return
 		}
 	}
-	// tagScan appends a ctid column to a TID-providing leaf scan's schema
-	// when its table is rowmarked (SeqScan, IndexScan, BitmapHeapScan — the
-	// three leaves the executor can surface a heap TID from).
-	tagScan := func(tbl *catalog.Table, schema *Schema) {
-		if li, ok := nextLockIdx[tbl.OID]; ok {
-			idx := len(*schema)
-			*schema = append(*schema, SchemaColumn{Name: fmt.Sprintf("ctid%d", locks[li].RowMarkId), Type: ctidType, SourceTableIdx: -1})
-			tagged = append(tagged, taggedScan{lockIdx: li, schemaIdx: idx})
-			// Advance to the next LockedRel for this OID, if any.
-			li++
-			for li < len(locks) && (locks[li].Table == nil || locks[li].Table.OID != tbl.OID) {
-				li++
-			}
-			if li < len(locks) {
-				nextLockIdx[tbl.OID] = li
-			} else {
-				delete(nextLockIdx, tbl.OID)
-			}
-		}
-	}
+	oldW := map[Node]int{}
 	var walk func(n Node)
 	walk = func(n Node) {
 		if n == nil {
 			return
 		}
+		// Snapshot BEFORE descending: pass-through Output()s read their
+		// (still untouched) child schemas, so every entry records the
+		// pre-injection width.
+		oldW[n] = len(n.Output())
 		switch s := n.(type) {
 		case *SeqScan:
-			tagScan(s.Table, &s.schema)
+			tagScan(s.Table, s.Alias, &s.schema)
 		case *IndexScan:
-			tagScan(s.Table, &s.schema)
+			tagScan(s.Table, s.Alias, &s.schema)
 		case *BitmapHeapScan:
-			tagScan(s.Table, &s.schema)
+			tagScan(s.Table, s.Alias, &s.schema)
 		case *Project:
 			walk(s.Child)
 		case *Filter:
@@ -2771,144 +2745,541 @@ func wireRowMarkCtidColumns(root Node, locks []LockedRel) int {
 		}
 	}
 	walk(root)
-	if len(tagged) == 0 {
-		return 0
+	if numCtid == 0 {
+		return 0, nil
 	}
-	// Extend the top-level Project with ColumnRef entries for the ctid columns
-	// so they survive the projection. The ctid resno that the executor reads is
-	// the column's index in the Project's output (i.e. the final user-visible
-	// schema + trailing ctid). Set it on the LockedRel.
-	if proj, ok := root.(*Project); ok {
-		for _, ts := range tagged {
-			li := ts.lockIdx
-			proj.Targets = append(proj.Targets, &ColumnRef{
-				pos:            proj.pos,
-				Index:          ts.schemaIdx,
-				Name:           fmt.Sprintf("ctid%d", locks[li].RowMarkId),
-				Type:           ctidType,
-				SourceTableIdx: -1,
-			})
-			proj.schema = append(proj.schema, SchemaColumn{
-				Name:           fmt.Sprintf("ctid%d", locks[li].RowMarkId),
-				Type:           ctidType,
-				SourceTableIdx: -1,
-			})
-			locks[li].CtidResno = len(proj.schema) - 1
-		}
-	}
-	return len(tagged)
+	return numCtid, oldW
 }
 
-// recomputeIntermediateSchemas rebuilds intermediate-node schemas after
-// ctid columns are injected into leaf scans by wireRowMarkCtidColumns.
-// Only Join and NestedLoopIndexJoin store their own schema and need
-// explicit recomputation; all other intermediate types delegate Output()
-// to their child and auto-correct when the child's schema changes.
+// rebaseRowMarkPlan is the goopg analogue of PostgreSQL's setrefs.c Var
+// remap, run after wireRowMarkCtidColumns appended resjunk ctid columns to
+// leaf scan schemas. Injection only ever appends at a leaf's tail, so a
+// column's position shifts only through concat nodes (joins): left-side
+// positions keep their indices while every right-side position moves right
+// by the left child's growth. Before this walk existed
+// (recomputeIntermediateSchemas rebased only *Project targets), any
+// rowmarked leaf that wasn't the rightmost scan corrupted every merged-row
+// expression — the join predicate read the ctid datum and `FOR UPDATE` over
+// a join returned zero rows. M0143-0009.
 //
-// It also fixes ALL ColumnRef indices in the top Project: when a ctid
-// column is injected into a left-side scan, intermediate schema
-// recomputation shifts right-side column positions. Every ColumnRef
-// (user columns and ctid columns alike) is updated to its absolute
-// position in the Project's child output by (name, SourceTableIdx) lookup.
-func recomputeIntermediateSchemas(root Node) {
-	var walk func(n Node)
-	walk = func(n Node) {
+// The walk is post-order and returns for each node a remap []int of length
+// oldW[n] (the node's output width before injection) mapping old output
+// position → new output position. Positions ≥ len(remap) — the appended
+// ctids — are never referenced by pre-injection expressions and need no
+// entry.
+func rebaseRowMarkPlan(root Node, oldW map[Node]int) {
+	// seen dedupes *ColumnRef objects across the whole walk: plan fields
+	// alias each other (HashKeys[0] is LeftKey/RightKey by pointer; cloned
+	// key exprs share inner refs with Predicate — see fillOneJoinHashKeys
+	// and the M0097-0060 comment in planner.go), and a pushed-down conjunct
+	// can share refs between a join predicate and an ancestor filter. Each
+	// map is a pure old→new position function, so a ref remapped once must
+	// never be remapped again.
+	seen := map[*ColumnRef]bool{}
+	var walk func(n Node) []int
+	walk = func(n Node) []int {
 		if n == nil {
-			return
+			return nil
+		}
+		oldLen, snap := oldW[n]
+		if !snap {
+			oldLen = len(n.Output()) // untouched subtree — identity width
 		}
 		switch v := n.(type) {
 		case *Join:
-			walk(v.Left)
-			walk(v.Right)
+			lm := walk(v.Left)
+			rm := walk(v.Right)
+			newLW := len(v.Left.Output())
 			if v.Type != JoinTypeSemi && v.Type != JoinTypeAnti {
 				v.schema = appendSchema(v.Left.Output(), v.Right.Output())
 			}
+			merged := concatRemap(lm, rm, newLW)
+			// All join-side exprs are MERGED-coords (the executor evaluates
+			// keys through mergedKeySlot/VirtualSlot views over the
+			// [left ++ right] row — operators_join_agg.go mergedKeySlot,
+			// join_merge_stream.go keySlot.rebind).
+			rebaseExprRefsSeen(v.Predicate, merged, seen)
+			rebaseExprRefsSeen(v.LeftKey, merged, seen)
+			rebaseExprRefsSeen(v.RightKey, merged, seen)
+			for _, kp := range v.HashKeys {
+				rebaseExprRefsSeen(kp.Left, merged, seen)
+				rebaseExprRefsSeen(kp.Right, merged, seen)
+			}
+			remapIntPositions(v.UsingLeftCols, merged)
+			remapIntPositions(v.UsingRightCols, merged)
+			if v.Type == JoinTypeSemi || v.Type == JoinTypeAnti {
+				return lm
+			}
+			return merged
 		case *NestedLoopIndexJoin:
-			walk(v.Outer)
-			walk(v.Inner)
+			om := walk(v.Outer)
+			im := walk(v.Inner)
 			v.schema = appendSchema(v.Outer.Output(), v.Inner.Output())
+			merged := concatRemap(om, im, len(v.Outer.Output()))
+			rebaseExprRefsSeen(v.Predicate, merged, seen)
+			// Probe keys on the inner scan are OUTER-scoped (nl_index_join.go
+			// binds them by name against the outer node's output): rebase
+			// them against the outer map, not the inner's.
+			rebaseNLIProbeKeys(v.Inner, om, seen)
+			return merged
 		case *SetOp:
 			walk(v.Left)
 			walk(v.Right)
+			return identityRemap(oldLen)
 		case *Project:
-			walk(v.Child)
-			fixColumnRefIndices(v)
+			cm := walk(v.Child)
+			for _, t := range v.Targets {
+				rebaseExprRefsSeen(t, cm, seen)
+			}
+			return identityRemap(oldLen)
 		case *Filter:
-			walk(v.Child)
+			cm := walk(v.Child)
+			rebaseExprRefsSeen(v.Predicate, cm, seen)
+			for i := range v.PushedBelow {
+				rebaseExprRefsSeen(v.PushedBelow[i], cm, seen)
+			}
+			return cm
 		case *Sort:
-			walk(v.Child)
+			cm := walk(v.Child)
+			for i := range v.Keys {
+				rebaseExprRefsSeen(v.Keys[i].Expr, cm, seen)
+			}
+			remapIntPositions(v.InputTarget, cm)
+			return cm
 		case *Limit:
-			walk(v.Child)
+			cm := walk(v.Child)
+			rebaseExprRefsSeen(v.Limit, cm, seen)
+			rebaseExprRefsSeen(v.Offset, cm, seen)
+			for i := range v.TiesKeys {
+				rebaseExprRefsSeen(v.TiesKeys[i], cm, seen)
+			}
+			return cm
 		case *Distinct:
-			walk(v.Child)
+			cm := walk(v.Child)
+			v.schema = v.Child.Output()
+			return cm
 		case *DistinctOn:
-			walk(v.Child)
+			cm := walk(v.Child)
+			remapIntPositions(v.KeyCols, cm)
+			v.schema = v.Child.Output()
+			return cm
 		case *OrdinalityWrap:
-			walk(v.Child)
+			cm := walk(v.Child)
+			newChild := v.Child.Output()
+			v.schema = append(appendSchema(nil, newChild), v.schema[len(cm):]...)
+			out := append([]int{}, cm...)
+			for i := len(cm); i < oldLen; i++ {
+				out = append(out, len(newChild)+i-len(cm))
+			}
+			return out
+		case *ProjectSet:
+			cm := walk(v.Child)
+			for i := range v.SrfArgs {
+				rebaseExprRefsSeen(v.SrfArgs[i], cm, seen)
+			}
+			for i := range v.OtherExprs {
+				rebaseExprRefsSeen(v.OtherExprs[i], cm, seen)
+			}
+			newChild := v.Child.Output()
+			v.schema = append(appendSchema(nil, newChild), v.schema[len(cm):]...)
+			v.ChildWidth += len(newChild) - len(cm)
+			v.EvalRowWidth += len(newChild) - len(cm)
+			out := append([]int{}, cm...)
+			for i := len(cm); i < oldLen; i++ {
+				out = append(out, len(newChild)+i-len(cm))
+			}
+			return out
 		case *Aggregate:
-			walk(v.Child)
+			cm := walk(v.Child)
+			for _, e := range v.GroupExprs {
+				rebaseExprRefsSeen(e, cm, seen)
+			}
+			for _, e := range v.Passthrough {
+				rebaseExprRefsSeen(e, cm, seen)
+			}
+			for i := range v.Aggs {
+				a := &v.Aggs[i]
+				rebaseExprRefsSeen(a.Arg, cm, seen)
+				rebaseExprRefsSeen(a.Arg2, cm, seen)
+				for _, e := range a.ExtraArgs {
+					rebaseExprRefsSeen(e, cm, seen)
+				}
+				rebaseExprRefsSeen(a.Filter, cm, seen)
+				for _, sk := range a.OrderBy {
+					rebaseExprRefsSeen(sk.Expr, cm, seen)
+				}
+				for _, sk := range a.WithinGroupOrderBy {
+					rebaseExprRefsSeen(sk.Expr, cm, seen)
+				}
+			}
+			remapIntPositions(v.InputTarget, cm)
+			return identityRemap(oldLen)
 		case *WindowAgg:
-			walk(v.Child)
+			cm := walk(v.Child)
+			for _, e := range v.PartitionBy {
+				rebaseExprRefsSeen(e, cm, seen)
+			}
+			for _, sk := range v.OrderBy {
+				rebaseExprRefsSeen(sk.Expr, cm, seen)
+			}
+			for i := range v.Funcs {
+				for _, e := range v.Funcs[i].Args {
+					rebaseExprRefsSeen(e, cm, seen)
+				}
+				rebaseExprRefsSeen(v.Funcs[i].Filter, cm, seen)
+			}
+			if v.Frame != nil {
+				rebaseExprRefsSeen(v.Frame.StartOffset, cm, seen)
+				rebaseExprRefsSeen(v.Frame.EndOffset, cm, seen)
+			}
+			remapIntPositions(v.InputTarget, cm)
+			return identityRemap(oldLen)
 		case *Memoize:
-			walk(v.Child)
+			cm := walk(v.Child)
+			for _, e := range v.KeyExprs {
+				rebaseExprRefsSeen(e, cm, seen)
+			}
+			return cm
 		case *LockRows:
-			walk(v.Child)
+			cm := walk(v.Child)
+			rebaseExprRefsSeen(v.LimitCount, cm, seen)
+			rebaseExprRefsSeen(v.OffsetCount, cm, seen)
+			return identityRemap(oldLen)
+		case *Result:
+			var cm []int
+			if v.Child != nil {
+				cm = walk(v.Child)
+				for _, t := range v.Targets {
+					rebaseExprRefsSeen(t, cm, seen)
+				}
+			}
+			return identityRemap(oldLen)
+		case *Gather:
+			cm := walk(v.Child)
+			v.schema = v.Child.Output()
+			return cm
+		case *GatherMerge:
+			cm := walk(v.Child)
+			for i := range v.Keys {
+				rebaseExprRefsSeen(v.Keys[i].Expr, cm, seen)
+			}
+			v.schema = v.Child.Output()
+			return cm
+		case *RecursiveUnion:
+			walk(v.Anchor)
+			walk(v.Recursive)
+			return identityRemap(oldLen)
+		case *CTEDMLPrefix:
+			for _, d := range v.DMls {
+				walk(d)
+			}
+			walk(v.Body)
+			return identityRemap(oldLen)
+		// DML wrappers: unreachable under a rowmark (FOR UPDATE is a SELECT
+		// clause), but kept symmetric with the tagging walk so a future
+		// injection point cannot silently corrupt their expressions.
+		case *Update:
+			cm := walk(v.Child)
+			for _, e := range v.Set {
+				rebaseExprRefsSeen(e, cm, seen)
+			}
+			for _, e := range v.Returning {
+				rebaseExprRefsSeen(e, cm, seen)
+			}
+			rebaseExprRefsSeen(v.FromPred, cm, seen)
+			rebaseExprRefsSeen(v.ViewCheckQual, cm, seen)
+			return identityRemap(oldLen)
+		case *Delete:
+			cm := walk(v.Child)
+			for _, e := range v.Returning {
+				rebaseExprRefsSeen(e, cm, seen)
+			}
+			rebaseExprRefsSeen(v.UsingPred, cm, seen)
+			return identityRemap(oldLen)
 		case *Insert:
 			if v.Source != nil {
 				walk(v.Source)
 			}
-		case *Update:
-			walk(v.Child)
-		case *Delete:
-			walk(v.Child)
+			return identityRemap(oldLen)
+		default:
+			// Leaves (SeqScan, IndexScan, BitmapHeapScan, Values, SRF scans,
+			// …): appends grow only the tail, so old positions are unchanged.
+			// Leaf-local exprs (IndexScan.Cond, BitmapHeapScan.BitmapQual)
+			// keep their coordinates; NLI outer-scoped probe keys are
+			// handled by the NestedLoopIndexJoin arm above.
+			return identityRemap(oldLen)
 		}
 	}
 	walk(root)
 }
 
-// columnKey disambiguates columns by name and source-table index so the
-// (name, SourceTableIdx) pair uniquely identifies a column in the child
-// output even in self-joins where both sides have identically named columns.
-type columnKey struct {
-	name   string
-	srcIdx int16
+// resolveRowMarkCtidResnos runs after rebaseRowMarkPlan. When the plan root
+// is a *Project it appends the resjunk ctid ColumnRef targets so the values
+// survive projection (the Index is resolved by name against the child
+// schema — the ctid<N> names are unique by construction), then resolves
+// every wired lock's CtidResno to its column's position in the root's
+// output — previously this ran only for Project roots, leaving join-rooted
+// plans (SELECT *) with ctid columns nothing could find. It also shifts
+// each LockedRel.ColOffset (the binding's column position in the merged
+// row) past any ctid insertions before it, keeping the EPQ refetch-merge
+// writes pointed at the right cells. Locks that could not be wired keep
+// CtidResno=-1 (executor falls back to the side-channel path). M0143-0009.
+func resolveRowMarkCtidResnos(root Node, locks []LockedRel) {
+	ctidType := catalog.Type{Name: "tid"}
+	if proj, ok := root.(*Project); ok {
+		pos := map[string]int{}
+		for i, c := range proj.Child.Output() {
+			pos[c.Name] = i
+		}
+		for i := range locks {
+			if locks[i].CtidResno != -2 {
+				continue
+			}
+			name := fmt.Sprintf("ctid%d", locks[i].RowMarkId)
+			p, ok := pos[name]
+			if !ok {
+				continue
+			}
+			proj.Targets = append(proj.Targets, &ColumnRef{
+				pos:            proj.pos,
+				Index:          p,
+				Name:           name,
+				Type:           ctidType,
+				SourceTableIdx: -1,
+			})
+			proj.schema = append(proj.schema, SchemaColumn{
+				Name:           name,
+				Type:           ctidType,
+				SourceTableIdx: -1,
+				Resjunk:        true,
+			})
+		}
+	}
+	var ctidPositions []int
+	outSchema := root.Output()
+	for i := range locks {
+		if locks[i].CtidResno != -2 {
+			continue
+		}
+		name := fmt.Sprintf("ctid%d", locks[i].RowMarkId)
+		locks[i].CtidResno = -1
+		for j, c := range outSchema {
+			if c.Name == name && c.Resjunk {
+				locks[i].CtidResno = j
+				ctidPositions = append(ctidPositions, j)
+				break
+			}
+		}
+	}
+	// ColOffset names the binding's first column in the ORIGINAL merged row;
+	// a ctid inserted at the end of an earlier leaf segment shifts every
+	// binding that starts at or after it. A ctid whose final position is f
+	// was inserted at old-coordinate position f minus the number of earlier
+	// insertions, so sorting the final positions recovers the insertion
+	// points exactly.
+	sort.Ints(ctidPositions)
+	for i := range locks {
+		if locks[i].Table == nil {
+			continue
+		}
+		for k, f := range ctidPositions {
+			if f-k <= locks[i].ColOffset {
+				locks[i].ColOffset++
+			}
+		}
+	}
+	// ColPos: the exact position of each of the locked relation's columns in
+	// the LockRows child's output row. ColOffset+i only coincides with that
+	// when the child's layout is the FROM-order merged row; a top Project may
+	// subset or reorder columns, so the EPQ refetch-merge needs the resolved
+	// positions. Each leaf column is found in the root output by its
+	// (Name, SourceTableIdx) identity. nil when the leaf or a column can't be
+	// located — the executor then falls back to ColOffset+i.
+	for i := range locks {
+		if locks[i].CtidResno < 0 {
+			continue
+		}
+		leaf := findCtidLeafSchema(root, fmt.Sprintf("ctid%d", locks[i].RowMarkId))
+		if leaf == nil {
+			continue
+		}
+		// A projected output may not carry every locked-rel column; those
+		// keep pos=-1 (nothing to merge into) rather than voiding the map.
+		pos := make([]int, 0, len(leaf))
+		for _, lc := range leaf {
+			if lc.Resjunk {
+				continue
+			}
+			p := -1
+			for j, c := range outSchema {
+				if c.Name == lc.Name && c.SourceTableIdx == lc.SourceTableIdx {
+					p = j
+					break
+				}
+			}
+			pos = append(pos, p)
+		}
+		locks[i].ColPos = pos
+	}
 }
 
-// fixColumnRefIndices updates every ColumnRef.Index in the Project (both user
-// columns and ctid columns) to absolute positions in the Project's child output.
-// This is necessary because recomputeIntermediateSchemas rebuilds intermediate
-// join schemas after ctid injection, which shifts right-side column positions.
-// The (name, SourceTableIdx) pair disambiguates columns in self-joins.
-func fixColumnRefIndices(proj *Project) {
-	childSchema := proj.Child.Output()
-	// Build position map from child output.
-	posMap := make(map[columnKey]int, len(childSchema))
-	for i, col := range childSchema {
-		posMap[columnKey{name: col.Name, srcIdx: col.SourceTableIdx}] = i
+// findCtidLeafSchema returns the schema of the leaf scan carrying the ctid
+// column named ctidName, or nil when no leaf carries it.
+func findCtidLeafSchema(n Node, ctidName string) Schema {
+	if n == nil {
+		return nil
 	}
-	// Fix all ColumnRefs in Project targets (including inside sub-expressions).
-	for _, t := range proj.Targets {
-		fixColumnRefsInExpr(t, posMap)
+	switch s := n.(type) {
+	case *SeqScan:
+		if schemaHasCtidCol(s.schema, ctidName) {
+			return s.schema
+		}
+	case *IndexScan:
+		if schemaHasCtidCol(s.schema, ctidName) {
+			return s.schema
+		}
+	case *BitmapHeapScan:
+		if schemaHasCtidCol(s.schema, ctidName) {
+			return s.schema
+		}
+	}
+	for _, c := range boundaryWalkChildren(n) {
+		if r := findCtidLeafSchema(c, ctidName); r != nil {
+			return r
+		}
+	}
+	return nil
+}
+
+func schemaHasCtidCol(schema Schema, ctidName string) bool {
+	for _, c := range schema {
+		if c.Name == ctidName && c.Resjunk {
+			return true
+		}
+	}
+	return false
+}
+
+// identityRemap returns the position-preserving old→new map of length n.
+func identityRemap(n int) []int {
+	m := make([]int, n)
+	for i := range m {
+		m[i] = i
+	}
+	return m
+}
+
+// concatRemap merges a left-child and right-child output remap into the
+// join's merged-row remap. The merged row is [new left output] ++ [new
+// right output], so an old right-side position j (stored at merged index
+// len(left)+j) lands at newLeftW + right[j].
+func concatRemap(left, right []int, newLeftW int) []int {
+	out := make([]int, 0, len(left)+len(right))
+	out = append(out, left...)
+	for _, p := range right {
+		out = append(out, newLeftW+p)
+	}
+	return out
+}
+
+// remapIntPositions rebases a list of absolute child-row positions
+// (UsingCols, DistinctOn.KeyCols, InputTarget keep-lists) through remap.
+// Out-of-range entries pass through unchanged (defensive — no legitimate
+// position exceeds the old width).
+func remapIntPositions(cols []int, remap []int) {
+	for i, p := range cols {
+		if p >= 0 && p < len(remap) {
+			cols[i] = remap[p]
+		}
 	}
 }
 
-// fixColumnRefsInExpr recursively walks an expression tree via the standard
-// exprChildSlots walker and updates ColumnRef.Index using posMap (child-schema
-// position lookup). Non-ColumnRef leaves and scope-opening nodes are skipped.
-func fixColumnRefsInExpr(e Expr, posMap map[columnKey]int) {
-	if e == nil {
+// rebaseExprRefs rewrites every same-scope ColumnRef.Index in e through
+// remap. Sub-expressions that open a new evaluation scope (subqueries) are
+// skipped via exprChildSlots slot kinds, matching the old name-keyed
+// fixColumnRefsInExpr walk.
+func rebaseExprRefs(e Expr, remap []int) {
+	rebaseExprRefsSeen(e, remap, nil)
+}
+
+// rebaseExprRefsSeen is rebaseExprRefs with a caller-supplied dedupe set:
+// plan fields can share *ColumnRef objects (HashKeys[0] aliases
+// LeftKey/RightKey BY POINTER, and non-ColumnRef key exprs share their
+// inner refs with Predicate — join_hash_keys.go fillOneJoinHashKeys), so
+// rebasing each field independently would apply the remap twice to a
+// shared ref. Pass one seen-set per (node, remap) pair.
+func rebaseExprRefsSeen(e Expr, remap []int, seen map[*ColumnRef]bool) {
+	if e == nil || len(remap) == 0 {
 		return
 	}
 	if cr, ok := e.(*ColumnRef); ok {
-		if newIdx, found := posMap[columnKey{name: cr.Name, srcIdx: cr.SourceTableIdx}]; found {
-			cr.Index = newIdx
+		if seen != nil {
+			if seen[cr] {
+				return
+			}
+			seen[cr] = true
+		}
+		if cr.Index >= 0 && cr.Index < len(remap) {
+			cr.Index = remap[cr.Index]
 		}
 		return
 	}
 	slots, _ := exprChildSlots(e)
 	for _, s := range slots {
 		if s.kind == slotSameScope && s.expr != nil {
-			fixColumnRefsInExpr(*s.expr, posMap)
+			rebaseExprRefsSeen(*s.expr, remap, seen)
+		}
+	}
+}
+
+// rebaseNLIProbeKeys rebases a NestedLoopIndexJoin inner probe's key
+// expressions, which are bound against the OUTER node's output row
+// (nl_index_join.go re-binds them by name), through the outer remap.
+// Leaf-local residuals (IndexScan.Cond, BitmapHeapScan.BitmapQual/Cond) are
+// deliberately untouched — leaf appends never move a leaf's own positions.
+func rebaseNLIProbeKeys(inner Node, outerMap []int, seen map[*ColumnRef]bool) {
+	switch in := inner.(type) {
+	case *IndexScan:
+		rebaseExprRefsSeen(in.Key, outerMap, seen)
+		for _, e := range in.Keys {
+			rebaseExprRefsSeen(e, outerMap, seen)
+		}
+		for _, e := range in.SAOPKeys {
+			rebaseExprRefsSeen(e, outerMap, seen)
+		}
+		rebaseExprRefsSeen(in.LowKey, outerMap, seen)
+		rebaseExprRefsSeen(in.HighKey, outerMap, seen)
+	case *IndexOnlyScan:
+		rebaseExprRefsSeen(in.Key, outerMap, seen)
+		for _, e := range in.Keys {
+			rebaseExprRefsSeen(e, outerMap, seen)
+		}
+		rebaseExprRefsSeen(in.LowKey, outerMap, seen)
+		rebaseExprRefsSeen(in.HighKey, outerMap, seen)
+	case *BitmapHeapScan:
+		rebaseBitmapProbeKeys(in.Outer, outerMap, seen)
+	}
+}
+
+// rebaseBitmapProbeKeys rebases the outer-scoped key expressions inside a
+// parameterized BitmapHeapScan's bitmap subtree.
+func rebaseBitmapProbeKeys(n Node, outerMap []int, seen map[*ColumnRef]bool) {
+	switch b := n.(type) {
+	case *BitmapIndexScan:
+		rebaseExprRefsSeen(b.Key, outerMap, seen)
+		for _, e := range b.Keys {
+			rebaseExprRefsSeen(e, outerMap, seen)
+		}
+		for _, e := range b.Pred {
+			rebaseExprRefsSeen(e, outerMap, seen)
+		}
+	case *BitmapAnd:
+		for _, c := range b.Inputs {
+			rebaseBitmapProbeKeys(c, outerMap, seen)
+		}
+	case *BitmapOr:
+		for _, c := range b.Inputs {
+			rebaseBitmapProbeKeys(c, outerMap, seen)
 		}
 	}
 }

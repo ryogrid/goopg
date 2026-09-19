@@ -248,17 +248,14 @@ func TestPlanCtidRowMarkMultiTable(t *testing.T) {
 			t.Errorf("duplicate RowMarkId %d", lk.RowMarkId)
 		}
 		ids[lk.RowMarkId] = true
-			// Column path: for self-joins (AI-007), CtidResno stays -1 because
-		// ctid injection breaks hash join schemas. The scan fallback handles TID.
+		// M0143-0009: the AI-007 self-join guard is retired — every lock
+		// takes the real ctid column path now.
 		if lk.CtidResno < 0 {
-			t.Logf("CtidResno = %d for %s (scan fallback path)", lk.CtidResno, lk.Alias)
-		} else {
-			t.Logf("CtidResno = %d for %s (column path)", lk.CtidResno, lk.Alias)
+			t.Errorf("CtidResno = %d for %s, want >= 0 (column path)", lk.CtidResno, lk.Alias)
 		}
 	}
-	// Self-join: ctid injection disabled (AI-007), NumCtidCols == 0.
-	if lr.NumCtidCols != 0 {
-		t.Logf("NumCtidCols = %d", lr.NumCtidCols)
+	if lr.NumCtidCols != 2 {
+		t.Errorf("NumCtidCols = %d, want 2 (one ctid per locked binding)", lr.NumCtidCols)
 	}
 	// Output schema has both ctid columns stripped.
 	childOutput := lr.Child.Output()
@@ -288,18 +285,19 @@ func TestPlanCtidRowMarkSelfJoin(t *testing.T) {
 	if len(lr.Locks) < 2 {
 		t.Fatalf("len(Locks) = %d, want >= 2", len(lr.Locks))
 	}
-	// Self-join: ctid injection disabled (AI-007). Verify each LockedRel
-	// correctly reports -1 (scan fallback path).
+	// M0143-0009: the AI-007 injection skip is retired — each LockedRel gets
+	// a real ctid column (distinct resnos), and the global rebase keeps the
+	// join's expression coordinates correct.
 	for _, lk := range lr.Locks {
-		if lk.CtidResno >= 0 {
-			t.Errorf("CtidResno = %d for %s, want -1 (column path disabled for self-joins)", lk.CtidResno, lk.Alias)
+		if lk.CtidResno < 0 {
+			t.Errorf("CtidResno = %d for %s, want >= 0 (column path)", lk.CtidResno, lk.Alias)
 		}
 		if lk.RowMarkId < 1 {
 			t.Errorf("RowMarkId = %d for %s, want >= 1", lk.RowMarkId, lk.Alias)
 		}
 	}
-	if lr.NumCtidCols != 0 {
-		t.Errorf("NumCtidCols = %d, want 0 (column path disabled for self-joins)", lr.NumCtidCols)
+	if lr.NumCtidCols != 2 {
+		t.Errorf("NumCtidCols = %d, want 2 (one ctid per locked binding)", lr.NumCtidCols)
 	}
 	// The Project must contain two distinct ctid columns.
 	proj, ok := lr.Child.(*Project)
@@ -312,11 +310,12 @@ func TestPlanCtidRowMarkSelfJoin(t *testing.T) {
 			ctidCols[col.Name] = i
 		}
 	}
-	if len(ctidCols) != 0 {
-		t.Fatalf("Project schema has %d ctid columns, want 0 (column path disabled for self-joins)", len(ctidCols))
+	if len(ctidCols) != 2 {
+		t.Fatalf("Project schema has %d ctid columns, want 2 (one per locked binding)", len(ctidCols))
 	}
-	// The two ctid ColumnRefs must have different indices (pointing to different
-	// positions in the join output).
+	// The two ctid ColumnRefs must have different indices (pointing to
+	// different positions in the join output — a's ctid sits mid-row after
+	// a's columns, b's at the end).
 	ctidIndices := map[int]bool{}
 	for _, target := range proj.Targets {
 		cr, ok := target.(*ColumnRef)
@@ -328,7 +327,7 @@ func TestPlanCtidRowMarkSelfJoin(t *testing.T) {
 		}
 		ctidIndices[cr.Index] = true
 	}
-	if len(ctidIndices) != 0 {
-		t.Errorf("found %d distinct ctid ColumnRef indices, want 0 (column path disabled for self-joins)", len(ctidIndices))
+	if len(ctidIndices) != 2 {
+		t.Errorf("found %d distinct ctid ColumnRef indices, want 2", len(ctidIndices))
 	}
 }
