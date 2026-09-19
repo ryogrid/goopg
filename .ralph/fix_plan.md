@@ -1240,7 +1240,7 @@ heuristic stays live.)
     environment effect (port/resource contention under parallel load), not
     a product defect fixed in the window. Re-open if a post-0010 nightly
     reproduces the wedge signature.
-- [ ] **testport/TestPort_PgoutputInterop* subscriber-start failures
+- [x] **testport/TestPort_PgoutputInterop* subscriber-start failures
   (AI-20260920-005626-009 … -018)** — ten pgoutput interop cases FAILed
   with one signature: "subscriber start: start failed; process exited
   early" (~2.5s each, per-test scratch cluster under
@@ -1253,6 +1253,19 @@ heuristic stays live.)
   fixture/state trigger or a flaky start race. Repro: `go test -v -run
   '^TestPort_PgoutputInteropPGToGoopgFullDML$' ./internal/testport/`;
   evidence same log; each FAIL line names its cluster.log.
+  - **CLOSED Loop \#26 (stale / env pressure)** — re-verified at HEAD
+    `b913ab8f3`: all 10 cases PASS ×2 full fresh sweeps (`-count=1`,
+    ~29s per sweep) plus FullDML once singly. The nightly worktree
+    `tmp/nightly-src-20260920-005626/` was already cleaned, so the named
+    cluster.logs are gone; but `~/.ralph/logs/mem_guard.log` shows two
+    PRESSURE kills inside the nightly window (01:10:02
+    `goopg-tpcds-sf025.scope` @ 11.9 GB, 01:24:29
+    `goopg-tpch-acceptance-on.scope` @ 11.2 GB — 75%+ RAM). A subscriber
+    goopg exiting inside its ~2.5s start window under that host pressure
+    fits the signature exactly, and no `2b7e9705..b913ab8f3` commit
+    plausibly fixed ten replication cases at once. Re-open if a future
+    nightly reproduces "process exited early" on a post-0010 sha without
+    concurrent mem_guard kills.
 
 ### Manually discovered (not yet in a nightly `ci/logs/action-items.md` run) — filed 2026-09-15
 - [x] **parser/TestLockingClauseParity** — deterministic FAIL, found while
