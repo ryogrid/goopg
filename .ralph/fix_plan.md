@@ -6031,9 +6031,9 @@ cross-layer programme that has never been scoped.
   reproduced at base commit — separate task); plan-gate 14/22 = baseline
   drift (live `:65433` binary 09-19 03:11 predates the staged work, same
   count as prior loop).
-- [ ] **M0142-0005b — streamed NL index-probe executor, then retire
+- [x] **M0142-0005b — streamed NL index-probe executor, then retire
   `indexProbeCostMultiplier` (the B8 exit).**
-  Parent: M0142-0005. Kind: impl.
+  Parent: M0142-0005. Kind: impl. **DONE 2026-09-19.**
   The B8 re-measurement
   (`docs/design/0100-0149/m0142-0005-b8-index-probe-mult-reverify.md`)
   proved the `2.0` probe-cost multiplier is neither dead weight nor
@@ -6056,6 +6056,60 @@ cross-layer programme that has never been scoped.
   silently keep the knob. Expected movement: TPC-DS `scan-type` −8 at
   SF0.25 with TPC-H match held. Gates: units, tpch-spotcheck, TPC-DS
   SF0.25 sweep, both-corpora parity captures under the cgroup wrapper.
+  - Landed 2026-09-19: `nbtree.ScanCursor` — a resumable leaf-grain range
+    scan (`NewScanCursor` descends once; `Next(fn)` delivers one admitted
+    leaf's in-range entries per call, no pin held across calls; the
+    per-leaf item loop is extracted unchanged into shared
+    `scanLeafItems`). `indexScanOp` rewired: `tids`/`poss` are per-leaf
+    batches refilled by `nextLeafBatch` from `Next`; SAOP is now a lazy
+    chain of per-element cursors (bounds + hash-bucket SIREADs still
+    eager, descents + leaf reads lazy — `saopBounds`/`saopIdx`/`saopSeen`).
+  - The SSI gap-lock decision moved to `finalizeIndexScanSSI` — once per
+    scan at exhaustion / next Rescan / Close, keyed on `sawTID` instead of
+    the eager `len(tids)>0` (unknowable at Rescan end under laziness);
+    `ssiDone` starts true so the first Rescan's finalize is a no-op.
+  - New tests `internal/access/nbtree/scan_cursor_test.go`: cursor-vs-eager
+    stream equality over multi-leaf ranges (keys + TIDs + ScanPos),
+    early-stop exhaustion, exclusive bounds, empty scans, leaf-filter
+    partitioning (the Gather claim mechanism).
+  - Re-measurement (binary sha `d26896dbef17`, B8 protocol, private
+    clones :5533/:5534, env verified via `/proc/<pid>/environ`): post-change
+    captures are BYTE-IDENTICAL to B8's on TPC-H (0 diff lines) and differ
+    only in capture headers on TPC-DS — executor laziness cannot change
+    plan choice. TPC-DS mult=1 keeps scan-type 51 / join-order 88 /
+    qual-placement 24; mult=2 = 59/91/20. TPC-H at mult=1 still picks
+    NL+`Index Scan` on Q9/Q10/Q14 where PG hashes. → branch (3): knob
+    stays at 2.0, comment corrected to name the cost-model residual,
+    recon filed as M0142-0005c. Movement: none (TPC-DS scan-type −8
+    materialises only at mult=1, which TPC-H still forbids).
+  - Gates: units PASS; `go test -race ./internal/executor/` PASS;
+    tpch-spotcheck PASS (Q12=2/Q13=34, stamped); tpcds-sf025 sweep
+    PASS=96 MISMATCH=0 plan-shapes 99/99 (stamped); tpch-acceptance-arm
+    PASS 24/24 value-MATCH (stamped). Design doc:
+    `docs/design/0100-0149/m0142-0005b-streamed-index-probe-cursor.md`;
+    captures `analysis/m0142/m0142-0005b-{tpcds,tpch}-mult{1,2}.txt`.
+- [ ] **M0142-0005c — recon: why does `indexProbeCostMultiplier=2` stay
+  load-bearing after the streamed probe? (probe-vs-hash relative pricing).**
+  Parent: M0142-0005. Kind: recon.
+  M0142-0005b removed the executor gap the multiplier's comment blamed
+  (eager per-probe TID materialisation) and the B8-protocol re-measure
+  came back byte-identical: at `GOOPG_INDEX_PROBE_MULT=1` TPC-H
+  Q9/Q10/Q14 still pick NL+`Index Scan` where PG 18.3 hashes, and TPC-DS
+  keeps its mult=1 scan-type gains. The residual is therefore inside the
+  cost model itself — `indexProbeCost` (`cost_funcs.go`) prices a probe as
+  `2*random_page_cost + cpu_index_tuple + cpu_tuple + cpu_operator`,
+  while PG's `cost_index`/`amcostestimate` (`costsize.c`) additionally
+  charges B-tree descent pages, per-page index qualification eval, and
+  the correlation-derived heap-fetch model (`index_pages_fetched`,
+  Mackert-Lohman); conversely the hash-join alternative may be priced
+  differently relative to PG's `final_cost_hashjoin`. Work: dump PG's
+  per-path cost breakdown for Q9/Q10/Q14 (`debug_print`/`costsize`
+  instrumentation or a gdb-free estimate-audit on both sides), identify
+  which term goopg's formula omits or mis-weights, and port the missing
+  PG arithmetic rather than keeping the scalar. Resume point:
+  `internal/optimizer/cost_funcs.go` `indexProbeCost` vs
+  `postgres/src/backend/optimizer/path/costsize.c` `cost_index`; the
+  B8/0005b capture pairs in `analysis/m0142/` are the reproduction.
 - [x] **M0142-0006 — apply `semiJoinMatchFraction` in `estimateNLIndexJoin`** —
   `estimateNLIndexJoin` (`cardinality.go:239-241`) returns `EstimateRows(j.Outer)` for
   SEMI/ANTI, while its sibling `estimateJoin` (`:608-625`) applies the match

@@ -1106,13 +1106,17 @@ func indexProbeCost(cp costParams) float64 {
 }
 
 // indexProbeCostMultiplier scales indexProbeCost. PG's constants (multiplier 1)
-// under-cost goopg's NL-index probe — goopg materialises the whole TID list
-// eagerly per probe (ch. 06 §5), so an NL-probe of a large relation runs far
-// slower than PG's random_page_cost model predicts, and the cost-driven DP would
-// pick ruinous PG-shaped NL plans (measured: Q5/Q9 20-200x). This multiplier
-// recalibrates the probe cost toward goopg's in-memory reality so the DP prefers
-// a hash join over NL-probing a large outer. Overridable via
-// GOOPG_INDEX_PROBE_MULT for measurement.
+// under-cost goopg's NL-index probe. The original justification — that goopg
+// materialised the whole TID list eagerly per probe — was RETIRED by
+// M0142-0005b: the executor now streams leaf-grain batches through
+// nbtree.ScanCursor (index_getnext_tid's model), and the post-change two-arm
+// A/B reproduced B8 byte-for-byte (TPC-DS SF0.25 mult=1: scan-type 59→51,
+// join-order 91→88, qual-placement 20→24; TPC-H mult=1 still slides Q9/Q10/Q14
+// to NL+index probes where PG hashes). The residual is therefore a
+// cost-model gap — this scalar masks a real relative-pricing divergence
+// between goopg's per-probe formula and the hash-join alternative PG's
+// cost_index/cost_seqscan arithmetic produces — not executor speed. Filed as
+// M0142-0005c (recon). Overridable via GOOPG_INDEX_PROBE_MULT for measurement.
 //
 // **Calibrated to 2.0 on 2026-09-05** (C-20d). The knob had shipped at 1.0 —
 // exactly the value this comment says under-costs goopg's probes — because
@@ -1131,8 +1135,8 @@ func indexProbeCost(cp costParams) float64 {
 // smaller departure from PG's constants that still buys the whole win —
 // raising it further is unjustified without evidence. Every other query moved
 // within the noise band. The multiplier stays a knob rather than becoming a
-// hard-coded 2 so the next recalibration (after the NL-probe execution work
-// this comment describes) can be measured the same way.
+// hard-coded 2 so the M0142-0005c cost-model recon can re-measure it the same
+// way — retirement to PG's 1.0 stays the goal once the residual is understood.
 var indexProbeCostMultiplier = indexProbeMultFromEnv(os.Getenv("GOOPG_INDEX_PROBE_MULT"))
 
 // indexProbeMultFromEnv resolves GOOPG_INDEX_PROBE_MULT's raw value to the

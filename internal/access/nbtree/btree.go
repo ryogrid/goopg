@@ -4142,119 +4142,8 @@ func (bt *BTree) rangeScanPosLeaf(lo, hi []byte, loExclusive, hiExclusive bool, 
 		// allocations in the select-only pprof. All current
 		// callers are CAT-1 (see contract above); none retain
 		// key beyond fn, none re-enter the btree.
-		count, countErr := PGDataItemCount(slot.Page())
-		pageLSN := storage.MustHeader(slot.Page()).LSN()
 		nextBlk := op.Next
-		stop := false
-		var fnErr error
-		if countErr == nil {
-		slotLoop:
-			for s := uint16(1); s <= uint16(count); s++ {
-				// M0091-0002: NoCopy aliases the still-pinned
-				// page; we never retain it past `fn`'s return,
-				// and the pin is held across this whole loop.
-				r, rawErr := pgGetItemRawNoCopy(slot.Page(), s)
-				if rawErr != nil {
-					// Includes ItemIDDead slots (ErrUnsupportedItem):
-					// C3-S1 — dead entries are invisible to scans.
-					continue
-				}
-				if isPostingRaw(r) {
-					// Posting items still allocate inside
-					// parsePostingRaw (TID slice + key copy).
-					// Out-of-scope for M0091; pgbench pkey is
-					// non-posting so this branch doesn't fire
-					// in the target workload.
-					key, tids, perr := bt.format().parsePostingRaw(r)
-					if perr != nil {
-						continue
-					}
-					if lo != nil {
-						// Exclusive lower bound: skip the whole equal-key group,
-						// so compare attribute-only (compareHigh) — the zero-TID
-						// probe bound is PLUS infinity among its duplicates under
-						// `compare`, which would keep the boundary group. The
-						// inclusive form keeps `compare`: it starts at the first
-						// duplicate. M0134-0001 S4.
-						if loExclusive {
-							if bt.format().compareHigh(key, lo) <= 0 {
-								continue
-							}
-						} else if bt.format().compare(key, lo) < 0 {
-							continue
-						}
-					}
-					// compareHigh, not compare: a bound naming only a prefix of
-					// the key attributes is PLUS infinity beyond them (see
-					// pgkeycmp.go, slice 3b-2c-ii-B2-c-i). Identical to compare
-					// for the blob format. An EXCLUSIVE upper bound stops at the
-					// boundary key itself (>= 0). M0134-0001 S4.
-					if hi != nil {
-						if hiExclusive {
-							if bt.format().compareHigh(key, hi) >= 0 {
-								stop = true
-								break slotLoop
-							}
-						} else if bt.format().compareHigh(key, hi) > 0 {
-							stop = true
-							break slotLoop
-						}
-					}
-					for _, tid := range tids {
-						ok, ferr := fn(key, tid, ScanPos{Blk: cur, Slot: s, PageLSN: pageLSN})
-						if ferr != nil {
-							fnErr = ferr
-							stop = true
-							break slotLoop
-						}
-						if !ok {
-							stop = true
-							break slotLoop
-						}
-					}
-				} else {
-					// M0091-0002: parseItemNoCopy aliases the
-					// page; key MUST NOT be retained by fn.
-					it, perr := bt.format().parseNoCopy(r)
-					if perr != nil {
-						continue
-					}
-					if lo != nil {
-						// Exclusive lower bound: see the posting branch above.
-						if loExclusive {
-							if bt.format().compareHigh(it.key, lo) <= 0 {
-								continue
-							}
-						} else if bt.format().compare(it.key, lo) < 0 {
-							continue
-						}
-					}
-					// compareHigh: see the posting branch above. An EXCLUSIVE
-					// upper bound stops at the boundary key itself.
-					if hi != nil {
-						if hiExclusive {
-							if bt.format().compareHigh(it.key, hi) >= 0 {
-								stop = true
-								break slotLoop
-							}
-						} else if bt.format().compareHigh(it.key, hi) > 0 {
-							stop = true
-							break slotLoop
-						}
-					}
-					ok, ferr := fn(it.key, it.ptr, ScanPos{Blk: cur, Slot: s, PageLSN: pageLSN})
-					if ferr != nil {
-						fnErr = ferr
-						stop = true
-						break slotLoop
-					}
-					if !ok {
-						stop = true
-						break slotLoop
-					}
-				}
-			}
-		}
+		stop, fnErr := bt.scanLeafItems(slot, cur, lo, hi, loExclusive, hiExclusive, fn)
 		bt.unpinR(slot)
 		if fnErr != nil {
 			return fnErr
@@ -4265,4 +4154,213 @@ func (bt *BTree) rangeScanPosLeaf(lo, hi []byte, loExclusive, hiExclusive bool, 
 		cur = nextBlk
 	}
 	return nil
+}
+
+// scanLeafItems invokes fn for every in-range entry on the already-pinned
+// leaf `slot` (physical block `cur`), in leaf order, applying the lo/hi
+// bounds with the rules the range scans document above. Shared by the
+// eager rangeScanPosLeaf walk and the resumable ScanCursor (M0142-0005b)
+// so both apply byte-identical bound semantics. The fn contract is the
+// RangeScan one: `key` aliases the still-pinned page and must not be
+// retained, fn must not re-enter this btree.
+//
+// Returns stop=true when the scan must not continue rightward: the hi
+// bound was reached, fn declined, or fn errored (the error is returned
+// alongside stop).
+func (bt *BTree) scanLeafItems(slot *storage.Slot, cur storage.BlockNumber, lo, hi []byte, loExclusive, hiExclusive bool, fn func(key []byte, ptr storage.ItemPointer, pos ScanPos) (bool, error)) (stop bool, err error) {
+	count, countErr := PGDataItemCount(slot.Page())
+	if countErr != nil {
+		return false, nil
+	}
+	pageLSN := storage.MustHeader(slot.Page()).LSN()
+	for s := uint16(1); s <= uint16(count); s++ {
+		// M0091-0002: NoCopy aliases the still-pinned
+		// page; we never retain it past `fn`'s return,
+		// and the pin is held across this whole loop.
+		r, rawErr := pgGetItemRawNoCopy(slot.Page(), s)
+		if rawErr != nil {
+			// Includes ItemIDDead slots (ErrUnsupportedItem):
+			// C3-S1 — dead entries are invisible to scans.
+			continue
+		}
+		if isPostingRaw(r) {
+			// Posting items still allocate inside
+			// parsePostingRaw (TID slice + key copy).
+			// Out-of-scope for M0091; pgbench pkey is
+			// non-posting so this branch doesn't fire
+			// in the target workload.
+			key, tids, perr := bt.format().parsePostingRaw(r)
+			if perr != nil {
+				continue
+			}
+			if lo != nil {
+				// Exclusive lower bound: skip the whole equal-key group,
+				// so compare attribute-only (compareHigh) — the zero-TID
+				// probe bound is PLUS infinity among its duplicates under
+				// `compare`, which would keep the boundary group. The
+				// inclusive form keeps `compare`: it starts at the first
+				// duplicate. M0134-0001 S4.
+				if loExclusive {
+					if bt.format().compareHigh(key, lo) <= 0 {
+						continue
+					}
+				} else if bt.format().compare(key, lo) < 0 {
+					continue
+				}
+			}
+			// compareHigh, not compare: a bound naming only a prefix of
+			// the key attributes is PLUS infinity beyond them (see
+			// pgkeycmp.go, slice 3b-2c-ii-B2-c-i). Identical to compare
+			// for the blob format. An EXCLUSIVE upper bound stops at the
+			// boundary key itself (>= 0). M0134-0001 S4.
+			if hi != nil {
+				if hiExclusive {
+					if bt.format().compareHigh(key, hi) >= 0 {
+						return true, nil
+					}
+				} else if bt.format().compareHigh(key, hi) > 0 {
+					return true, nil
+				}
+			}
+			for _, tid := range tids {
+				ok, ferr := fn(key, tid, ScanPos{Blk: cur, Slot: s, PageLSN: pageLSN})
+				if ferr != nil {
+					return true, ferr
+				}
+				if !ok {
+					return true, nil
+				}
+			}
+		} else {
+			// M0091-0002: parseItemNoCopy aliases the
+			// page; key MUST NOT be retained by fn.
+			it, perr := bt.format().parseNoCopy(r)
+			if perr != nil {
+				continue
+			}
+			if lo != nil {
+				// Exclusive lower bound: see the posting branch above.
+				if loExclusive {
+					if bt.format().compareHigh(it.key, lo) <= 0 {
+						continue
+					}
+				} else if bt.format().compare(it.key, lo) < 0 {
+					continue
+				}
+			}
+			// compareHigh: see the posting branch above. An EXCLUSIVE
+			// upper bound stops at the boundary key itself.
+			if hi != nil {
+				if hiExclusive {
+					if bt.format().compareHigh(it.key, hi) >= 0 {
+						return true, nil
+					}
+				} else if bt.format().compareHigh(it.key, hi) > 0 {
+					return true, nil
+				}
+			}
+			ok, ferr := fn(it.key, it.ptr, ScanPos{Blk: cur, Slot: s, PageLSN: pageLSN})
+			if ferr != nil {
+				return true, ferr
+			}
+			if !ok {
+				return true, nil
+			}
+		}
+	}
+	return false, nil
+}
+
+// ScanCursor is a resumable, leaf-grain range scan (M0142-0005b): where
+// RangeScanWithPosLeafFilter walks the entire matching leaf chain inside
+// one call, a cursor delivers one leaf page's in-range entries per Next
+// call, so a consumer that stops early never pays to walk leaves it never
+// needed — the laziness PG's index_getnext_tid gives nodeIndexscan.c
+// (nbtree's _bt_next/_bt_steppage). The descent happens once at
+// construction; no pin or latch is held across calls, so the unpin→pin
+// leaf-boundary window — and its split exposure — is identical to the
+// eager scan's: only the next block number is remembered, read fresh from
+// op.Next each call, so a split that inserted a new right sibling is
+// discovered exactly as the eager walk discovers it.
+type ScanCursor struct {
+	bt *BTree
+	// lo/hi are the same encoded bounds the eager scans take; both are
+	// retained (not copied — callers pass scan-key bytes that outlive the
+	// scan) for the per-item bound checks on every leaf.
+	lo, hi                   []byte
+	loExclusive, hiExclusive bool
+	leafFilter               func(storage.BlockNumber) bool
+	next                     storage.BlockNumber // InvalidBlockNumber once exhausted
+}
+
+// NewScanCursor descends once to the leaf that could contain lo — the
+// same descent rangeScanPosLeaf performs — and returns a cursor ready to
+// walk rightward from it. A nil lo means "scan from the leftmost leaf",
+// matching the eager scans.
+func (bt *BTree) NewScanCursor(lo, hi []byte, loExclusive, hiExclusive bool, leafFilter func(storage.BlockNumber) bool) (*ScanCursor, error) {
+	cur, _, err := bt.descendToLeaf(lo)
+	if err != nil {
+		return nil, err
+	}
+	return &ScanCursor{
+		bt:          bt,
+		lo:          lo,
+		hi:          hi,
+		loExclusive: loExclusive,
+		hiExclusive: hiExclusive,
+		leafFilter:  leafFilter,
+		next:        cur,
+	}, nil
+}
+
+// Next reads exactly one admitted leaf page: every in-range entry on it
+// is delivered to fn in leaf order under the same bound rules and the
+// same fn contract as RangeScanWithPos (the key argument aliases the
+// pinned page; do not retain it). Leaves declined by leafFilter — and the
+// descendToLeaf high-key recovery skips — are walked internally, so one
+// call can legitimately run fn zero times.
+//
+// Next returns ok=true when it processed a leaf (entries delivered or
+// not) and ok=false once the leaf chain is exhausted. If fn returns
+// false or an error, or the hi bound is hit mid-leaf, the scan ends: the
+// cursor is left exhausted. Mid-leaf resumption is deliberately absent —
+// leaf grain is what keeps the split/correctness envelope identical to
+// the eager walk's.
+func (c *ScanCursor) Next(fn func(key []byte, ptr storage.ItemPointer, pos ScanPos) (bool, error)) (bool, error) {
+	for c.next != storage.InvalidBlockNumber {
+		cur := c.next
+		slot, err := c.bt.pinR(cur)
+		if err != nil {
+			c.next = storage.InvalidBlockNumber
+			return false, err
+		}
+		op := readOpaque(slot.Page())
+		// Same high-key recovery skip as the eager walk (applies
+		// meaningfully to the first leaf descendToLeaf returned; harmless
+		// on later leaves, whose key ranges all exceed lo).
+		if c.lo != nil && keyExceedsHighKey(c.bt.format(), slot.Page(), c.lo) {
+			c.next = op.Next
+			c.bt.unpinR(slot)
+			continue
+		}
+		if c.leafFilter != nil && !c.leafFilter(cur) {
+			c.next = op.Next
+			c.bt.unpinR(slot)
+			continue
+		}
+		nextBlk := op.Next
+		stop, ferr := c.bt.scanLeafItems(slot, cur, c.lo, c.hi, c.loExclusive, c.hiExclusive, fn)
+		c.bt.unpinR(slot)
+		if ferr != nil {
+			c.next = storage.InvalidBlockNumber
+			return false, ferr
+		}
+		if stop {
+			c.next = storage.InvalidBlockNumber
+		} else {
+			c.next = nextBlk
+		}
+		return true, nil
+	}
+	return false, nil
 }
