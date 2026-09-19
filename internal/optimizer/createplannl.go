@@ -350,6 +350,15 @@ func createNestLoopIndexJoinPlan(p *Path, innerPath *Path) (Node, outputLayout) 
 	} else {
 		is.Keys = keys
 	}
+	// M0142-0005e: re-stamp the probe's own path cost onto the unwrapped
+	// *IndexScan. `createPlanNode(innerPath)` did stamp, but onto the
+	// OUTERMOST emitted node — the leaf-local *Filter the absorbableLeafCond
+	// unwrap above just absorbed into `is.Cond` — leaving `is` carrier-unset
+	// and EXPLAIN printing DeriveLegacyDisplayCost (0.00..0.18 on TPC-H Q10)
+	// while the path that won the search was costed at 4.59. When no Filter
+	// wrapped the leaf, `is` is already stamped with this same path and the
+	// re-stamp is a no-op.
+	stampPlanCost(is, innerPath)
 
 	// R25 (plan-parity-fix-take2): the fused `NestedLoopIndexJoin` is
 	// gone — PG has no such node. The decomposed shape is a lateral
@@ -416,6 +425,11 @@ func createNestLoopIndexJoinPlanFused(p *Path, innerPath *Path, memoPath *Path, 
 	} else {
 		is.Keys = keys
 	}
+	// M0142-0005e: stamp the probe's own path cost onto the unwrapped
+	// *IndexScan (the funnel's stamp landed on the absorbed leaf-local
+	// *Filter, not on `is`), and the memoized path's cost onto the Memoize —
+	// the two numbers PG's EXPLAIN prints on the same two nodes.
+	stampPlanCost(is, innerPath)
 	nli := &NestedLoopIndexJoin{
 		pos:       in.outer.Pos(),
 		Type:      jtNLI,
@@ -425,6 +439,7 @@ func createNestLoopIndexJoinPlanFused(p *Path, innerPath *Path, memoPath *Path, 
 		schema:    in.publishedSchema(jtNLI),
 	}
 	nli.InnerMemo = memoizeNodeFor(memoPath, is, keys)
+	stampPlanCost(nli.InnerMemo, memoPath)
 	return nli, in.publishedLayout(jtNLI)
 }
 
@@ -528,6 +543,14 @@ func createNestLoopBitmapJoinPlan(p *Path, innerPath *Path) (Node, outputLayout)
 		bhs.BitmapQual = append(bhs.BitmapQual,
 			&BinaryOp{pos: kp.Right.Pos(), Op: parser.OpEq, Left: kp.Right, Right: kp.Left})
 	}
+	// M0142-0005e: same stamp-loss as the index arm — the funnel stamped the
+	// outermost emitted node (a leaf-local *Filter when the leaf carried
+	// quals), and the absorbableLeafCond unwrap leaves the bare heap scan
+	// carrier-unset; the BitmapIndexScan child is built inside the arm and
+	// was never stamped at all. Stamp each with its own path's cost, the
+	// numbers PG prints on the same two nodes.
+	stampPlanCost(bhs, innerPath)
+	stampPlanCost(bis, idxPath)
 	return &NestedLoopIndexJoin{
 		pos: in.outer.Pos(), Type: jt, Outer: in.outer, Inner: bhs,
 		// Residual-only: the probe clauses moved onto the probe above (MOVE,

@@ -6180,21 +6180,39 @@ cross-layer programme that has never been scoped.
     benchmark clusters update only on their next ANALYZE/reload; this is a
     correctness fix that makes nullable-column correlations honest inputs
     to `index_pages_fetched`, not a tuning event.
-- [ ] **M0142-0005e — stamp the real path cost on the fused-NLI inner
-  `IndexScan` (EXPLAIN prints `DeriveLegacyDisplayCost`).**
+- [x] **M0142-0005e — stamp the real path cost on the fused-NLI inner
+  `IndexScan` (EXPLAIN prints `DeriveLegacyDisplayCost`).** DONE 2026-09-19.
   Parent: M0142-0005c. Kind: impl.
-  The fused `NestedLoopIndexJoin` inner `*IndexScan` node built at
-  `internal/optimizer/nl_index_join.go:666` is not a search-produced node
-  and never receives `stampPlanCost`, so `EXPLAIN` prints the legacy
-  derived cost (`cost=0.00..0.18` on TPC-H Q10) while the path that won
-  the search was costed at 4.59 (`index.parameterised` DPPATH line).
-  Readers of plan captures — including parity-diff tooling and past loops —
-  attribute wrong costs to the probe. Fix: carry the winning
-  `PathIndexScan`'s `PlanCost` through to the fused inner node (the path is
-  already on the join path's `Children[1]` when `createNestLoopIndexJoinPlan`
-  unwraps it), or stamp it in `createplannl.go`'s NLI arm. Expected
-  movement: none on plan choice (display fidelity only); measure by
-  `EXPLAIN` diff on TPC-H Q9/Q10 before/after showing real probe costs.
+  Root cause found was subtler than the filing: `createPlanNode(innerPath)`
+  DOES stamp, but onto the OUTERMOST emitted node — a leaf-local
+  `*Filter{*IndexScan}` when the leaf carries quals — and
+  `absorbableLeafCond` then absorbs the predicate into `IndexScan.Cond`
+  and keeps the bare `*IndexScan`, discarding the stamped wrapper.
+  - Landed: `stampPlanCost(is, innerPath)` after the unwrap in all three
+    `createplannl.go` arms (decomposed `Join`, fused `NestedLoopIndexJoin`,
+    bitmap), plus `stampPlanCost(nli.InnerMemo, memoPath)` on the fused
+    Memoize and `stampPlanCost(bhs/bis, innerPath/idxPath)` on the bitmap
+    pair; `priceSemiProbe` (`nlipricesplice.go`) now stamps `x.Inner` with
+    the fabricated `probePath` beside the existing `stampPlanCost(x, p)`.
+    Design doc:
+    `docs/design/0100-0149/m0142-0005e-nli-probe-plan-cost-stamp.md`.
+  - Regression tests `TestNLIInnerScanCarriesProbePathCost` +
+    `TestNLIFusedInnerAndMemoizeCarryPathCosts` pin the probe carrying the
+    `PathIndexScan`'s `{startup,total,rows}` and `InnerMemo` carrying the
+    `PathMemoize`'s cost through the leaf-local-Filter unwrap.
+  - Live verify on private `:5533` TPC-H clone: Q10 probe
+    `cost=0.00..0.18 rows=18` → `cost=0.38..8.49 rows=5` (startup includes
+    the index descent; rows = per-probe path estimate — the quantities PG
+    prints). SF0.25 sweep plan capture: every `Memoize 0.00..0.02` /
+    `Index Scan 0.00..0.01` pair now prints real path costs.
+  - Gates: optimizer + executor `go test` PASS; units PASS;
+    tpch-spotcheck Q12=2/Q13=34 PASS; SF0.25 sweep PASS=96 MISMATCH=0
+    (shape channel: 81 plan-text diffs = the cost-string change itself,
+    zero verdict changes); acceptance-arm 24/24 value-MATCH vs baseline.
+    All stamped on the staged index.
+  - Movement: none on plan choice (display/provenance only). Plan-text
+    captures now carry honest probe costs — future recon/measurement
+    loops can trust the printed numbers.
 - [ ] **M0142-0005f — recon: TPC-H corpus physical-layout parity — rebuild
   in PG-reference order or accept the divergence?**
   Parent: M0142-0005c. Kind: recon.

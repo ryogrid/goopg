@@ -408,3 +408,95 @@ func TestCreateNestLoopPlanPanics(t *testing.T) {
 		})
 	}
 }
+
+// TestNLIInnerScanCarriesProbePathCost pins M0142-0005e: the funnel's
+// stampPlanCost lands on the OUTERMOST node `createPlanNode(innerPath)`
+// emitted — a leaf-local *Filter when the leaf carries quals — and
+// `absorbableLeafCond` then unwraps it, leaving the bare *IndexScan
+// carrier-unset so EXPLAIN printed DeriveLegacyDisplayCost (0.00..0.18 on
+// TPC-H Q10) while the winning path was costed at its real probe cost. The
+// arm now re-stamps the unwrapped probe with `innerPath`'s own cost, the
+// number PG prints on the same node.
+func TestNLIInnerScanCarriesProbePathCost(t *testing.T) {
+	a, b := cpjTwoRel()
+	// Wrap a's leaf in a leaf-local Filter so the emitted inner is
+	// *Filter{*IndexScan}: the stamp would land on the wrapper and be lost
+	// to the unwrap without the M0142-0005e re-stamp.
+	leaf := a.baseLeaf
+	a.baseLeaf = &Filter{
+		Child:     leaf,
+		Predicate: cpnEq(col(0), col(0)),
+		LeafLocal: true,
+	}
+	idx := cpiIndex("a0")
+	inner := cpnParamIndexPath(a, idx, b.Relids, 3)
+	inner.Rows = 5
+	inner.Cost = Cost{Startup: 0.375, Total: 4.59}
+	p := cpnNestLoopPath(cpjLeafPath(b), inner, nil)
+
+	n, _ := createPlanNode(p)
+	j, ok := n.(*Join)
+	if !ok {
+		t.Fatalf("createPlan(parameterised PathNestLoop) = %T, want *Join (R25 decomposed)", n)
+	}
+	is, ok := j.Right.(*IndexScan)
+	if !ok {
+		t.Fatalf("decomposed Right = %T, want *IndexScan probe", j.Right)
+	}
+	pc, set := is.PlanCostInfo()
+	if !set {
+		t.Fatal("probe *IndexScan carries no PlanCost — the stamp was lost to the leaf-local Filter unwrap")
+	}
+	if pc.StartupCost != 0.375 || pc.TotalCost != 4.59 || pc.PlanRows != 5 {
+		t.Fatalf("probe PlanCost = %+v, want the inner path's own cost {0.375, 4.59, rows 5}", pc)
+	}
+	if is.Cond == nil {
+		t.Fatal("the leaf-local qual must be absorbed into IndexScan.Cond, not dropped")
+	}
+}
+
+// TestNLIFusedInnerAndMemoizeCarryPathCosts is the same pin for the fused
+// arm: the unwrapped probe carries the PathIndexScan's cost and the Memoize
+// node carries the PathMemoize's cost — the two numbers PG prints on the
+// same two nodes.
+func TestNLIFusedInnerAndMemoizeCarryPathCosts(t *testing.T) {
+	a, b := cpjTwoRel()
+	leaf := a.baseLeaf
+	a.baseLeaf = &Filter{
+		Child:     leaf,
+		Predicate: cpnEq(col(0), col(0)),
+		LeafLocal: true,
+	}
+	probe := cpnParamIndexPath(a, cpiIndex("a0"), b.Relids, 3)
+	probe.Rows = 5
+	probe.Cost = Cost{Startup: 0.375, Total: 4.59}
+	memo := &Path{
+		Kind:          PathMemoize,
+		Rel:           probe.Rel,
+		Rows:          probe.Rows,
+		Cost:          Cost{Startup: 0.5, Total: 7.25},
+		RequiredOuter: probe.RequiredOuter,
+		Children:      []*Path{probe},
+		MemoizeInfo:   &memoizePathInfo{estEntries: 128, rescan: Cost{Total: 1}},
+	}
+
+	n, _ := createPlanNode(cpnNestLoopPath(cpjLeafPath(b), memo, nil))
+	nli, ok := n.(*NestedLoopIndexJoin)
+	if !ok {
+		t.Fatalf("createPlan emitted %T, want *NestedLoopIndexJoin", n)
+	}
+	pc, set := nliIn(nli.Inner).PlanCostInfo()
+	if !set {
+		t.Fatal("fused-NLI inner *IndexScan carries no PlanCost")
+	}
+	if pc.StartupCost != 0.375 || pc.TotalCost != 4.59 || pc.PlanRows != 5 {
+		t.Fatalf("inner probe PlanCost = %+v, want the probe path's own cost {0.375, 4.59, rows 5}", pc)
+	}
+	mc, set := nli.InnerMemo.PlanCostInfo()
+	if !set {
+		t.Fatal("InnerMemo carries no PlanCost — the memoized path's cost was dropped")
+	}
+	if mc.StartupCost != 0.5 || mc.TotalCost != 7.25 {
+		t.Fatalf("InnerMemo PlanCost = %+v, want the PathMemoize's own cost {0.5, 7.25}", mc)
+	}
+}

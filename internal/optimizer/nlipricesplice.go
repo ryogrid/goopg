@@ -152,10 +152,11 @@ func priceSemiProbe(x *NestedLoopIndexJoin, cat catalog.Catalog, cp costParams) 
 		numQualOps:              float64(len(bound) - len(clauses)),
 	})
 	innerRel.Rows = probeRows
-	addPath(innerRel, &Path{
+	probePath := &Path{
 		Kind: PathIndexScan, Rel: innerRel, Rows: probeRows, Cost: probeCost,
 		IndexInfo: idx, IndexClauses: clauses, RequiredOuter: outerSet,
-	}, "semi-splice")
+	}
+	addPath(innerRel, probePath, "semi-splice")
 	setCheapest(innerRel)
 	outerRel := newRelOptInfo(outerSet, outerRows, 32)
 	outerPC := legacyDisplayCostOf(outerNode)
@@ -184,6 +185,11 @@ func priceSemiProbe(x *NestedLoopIndexJoin, cat catalog.Catalog, cp costParams) 
 			continue
 		}
 		stampPlanCost(x, p)
+		// M0142-0005e: stamp the probe node too — `x.Inner` is the
+		// rewrite-built `*IndexScan`/`*IndexOnlyScan`, which no search funnel
+		// ever priced, so EXPLAIN printed DeriveLegacyDisplayCost on it.
+		// `probePath` is the arm-priced probe the splice already fabricated.
+		stampPlanCost(x.Inner, probePath)
 		return
 	}
 }
