@@ -10,9 +10,14 @@ package optimizer
 // pull_up_sublinks before join planning (subquery_planner →
 // pull_up_sublinks, postgres/src/backend/optimizer/prep/prepjointree.c);
 // this file moves goopg the same way while keeping the decorrelated
-// semi/anti joins PINNED at their post-unnest positions — DP
-// participation for semi/anti (S5b) is deferred by user decision
-// (2026-07-21), so DP runs only on the subtree BELOW the pinned spine.
+// semi/anti joins PINNED at their post-unnest positions. The S5b
+// DP-participation deferral (user decision 2026-07-21) was lifted by
+// owner decision 2026-09-20: the admission machinery has since landed
+// (extractSearchLeaves's admitSemiAnti arm is unconditionally on, and
+// unnest.go's EXISTS/IN paths all populate Join.SJInfo), but every
+// corpus chain still declines upstream at the leaf-count gate, so in
+// practice DP still runs only on the subtree BELOW the pinned spine
+// pending the remaining M0142-0008 leaf-admission work.
 //
 // Engagement is deliberately narrowed (documented scope for S5a): the
 // pre-DP position engages only when the WHERE predicate's sublinks are
@@ -263,8 +268,10 @@ descend:
 // argument rather than calling the search itself, so the success path can be
 // unit-tested DIRECTLY with a hand-built "search succeeded" tree — per
 // dead_code_is_not_a_reference_impl, that path is unreachable from any live
-// fixture while `admitSemiAnti` stays `false` in production
-// (joinsearchseam.go:309, design doc §32.1/§32.4), so it needs its own
+// fixture today — `admitSemiAnti` is `true` in production
+// (joinsearchseam.go:313), but every corpus chain carrying a Semi/Anti
+// link still declines earlier at the leaf-count gate, so the search never
+// returns a success to splice — it needs its own
 // verification independent of ever actually being called with a real search
 // result today.
 func spliceSearchedSpine(oldSpineSchema Schema, searched Node, spineRootPut func(Node), spineFilters []*Filter) {

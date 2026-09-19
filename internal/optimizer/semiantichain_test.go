@@ -411,7 +411,7 @@ func TestExtractSearchLeaves_AdmitSemiAnti_NarrowsMinLefthandToCorrelatedRelatio
 // semiAntiChainLink.pred would be nil (semiAntiOnQualsOK declines a nil pred,
 // per TestSemiAntiOnQualsOK_DeclinesNilPredicate) — a future plan-build arm
 // consuming `pred` alone would silently build an unconditional (Cartesian-
-// like) Semi/Anti the moment admitSemiAnti is ever wired live.
+// like) Semi/Anti now that admitSemiAnti is wired live.
 func TestExtractSearchLeaves_AdmitSemiAnti_FoldsKeyEquijoinIntoPred(t *testing.T) {
 	cat := analyzedThreeTablesCatalog(t)
 	sql := "SELECT x FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.z = t1.x)"
@@ -528,13 +528,14 @@ func TestExtractSearchLeaves_AdmitSemiAnti_ChainedLinksRebaseInnerKeyCorrectly(t
 	}
 }
 
-// TestExtractSearchLeaves_AdmitSemiAntiFalse_UnchangedFromProduction proves
-// the scaffold is inert exactly as design doc §22.4 requires: with
-// `admitSemiAnti=false` (the literal value the ONE production call site
-// passes, joinsearchseam.go's tryPGShapedJoinSearch), the Semi join is
+// TestExtractSearchLeaves_AdmitSemiAntiFalse_SemiIsOpaqueLeaf proves
+// the off arm's contract exactly as design doc §22.4 requires: with
+// `admitSemiAnti=false` — no longer the production literal (the one call
+// site has passed `true` since b2; this test deliberately exercises the
+// flag's off arm) — the Semi join is
 // treated as an ordinary opaque leaf — byte-identical to
 // pre-M0142-0008a-3i-plumbing-b1 behavior — and its SJInfo is left untouched.
-func TestExtractSearchLeaves_AdmitSemiAntiFalse_UnchangedFromProduction(t *testing.T) {
+func TestExtractSearchLeaves_AdmitSemiAntiFalse_SemiIsOpaqueLeaf(t *testing.T) {
 	cat := analyzedThreeTablesCatalog(t)
 	sql := "SELECT x FROM t1 WHERE EXISTS (" +
 		"SELECT 1 FROM t2, t3 WHERE t2.z = t1.x AND t2.y = t3.a)"
@@ -694,9 +695,9 @@ func TestRemapWalkOrderFlatToSpans_RealLeafAfterSyntheticRHS(t *testing.T) {
 }
 
 // TestPgShapedOffsetChecksOK_ReducesToPlainChecksWhenNoSemiAnti pins design
-// doc §31.3's inertness claim: with `semiAnti` empty (today's only
-// production shape, since `tryPGShapedJoinSearch`'s one call site always
-// passes `admitSemiAnti=false` to `extractSearchLeaves`),
+// doc §31.3's inertness claim: with `semiAnti` empty — still the only
+// production shape today, because every corpus chain carrying a link
+// declines at the leaf-count gate before reaching this check —
 // `pgShapedOffsetChecksOK` must behave exactly like the plain per-index
 // comparison it replaced — both accepting a well-formed two-leaf-plus-spine
 // shape and declining a mismatched one.

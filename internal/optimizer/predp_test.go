@@ -274,9 +274,11 @@ func spliceTestSchema(names ...string) Schema {
 
 // TestSpliceSearchedSpine_PlacesResultAndSkipsReresolution is Phase B's
 // (design doc §32.3) mandatory direct unit test: the success path is
-// unreachable via any live fixture while `admitSemiAnti` stays `false` in
-// production (§32.1), so `dead_code_is_not_a_reference_impl` requires it be
-// proved correct against a hand-built "search succeeded" result instead.
+// unreachable via any live fixture today — `admitSemiAnti` is `true` in
+// production, but every corpus chain still declines at the leaf-count gate
+// before a search can succeed — so `dead_code_is_not_a_reference_impl`
+// requires it be proved correct against a hand-built "search succeeded"
+// result instead.
 //
 // This asserts the placement half: spineRootPut receives exactly the
 // searched replacement, and — since spliceSearchedSpine never calls

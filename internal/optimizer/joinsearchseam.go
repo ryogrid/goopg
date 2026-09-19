@@ -614,12 +614,15 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 		// desynchronise from. `joinInfoListHas` (relfromjoinlist.go:408, by
 		// pointer identity) guards against a duplicate append if this seam
 		// ever runs more than once against the same `ctx` for one statement.
-		// A link whose source `*Join` never carried an SJInfo (the IN/NOT-IN
-		// unnesting paths — unnest.go:3453/3588/4726 — never set `.SJInfo`)
-		// contributes nothing here and so still correctly fails the gate
-		// below, exactly as it did before this loop: this is real production
-		// population, not the rejected "check against a list built from
-		// itself" pattern §40.3 already ruled out.
+		// A link whose source `*Join` never carried an SJInfo contributes
+		// nothing here and so still correctly fails the gate below — the
+		// EXISTS and both IN/NOT-IN unnesting paths all set `.SJInfo` now
+		// (existsUnnestSJInfo; M0142-0008-producer's inUnnestSJInfo on
+		// unnestInExpr/unnestNonCorrelatedInExpr), so the only joins left
+		// without one are `JoinTypeInner` splices that never enter the
+		// semiAnti arm anyway: this is real production population, not the
+		// rejected "check against a list built from itself" pattern §40.3
+		// already ruled out.
 		for _, lk := range semiAnti {
 			if lk.sjinfo != nil && !joinInfoListHas(ctx.joinInfoList, lk.sjinfo) {
 				ctx.joinInfoList = append(ctx.joinInfoList, lk.sjinfo)
@@ -1267,14 +1270,13 @@ func searchConsumes(c Expr, spans []leafSpan) bool {
 // in FROM order (03 §6.1's leaf-numbering guarantee), and this walk visits Left
 // before Right at every level.
 // admitSemiAnti gates M0142-0008a-3i-plumbing-b1's Semi/Anti-admission arm
-// (design doc §22.4). It is a plain parameter, not a package-level flag,
-// specifically so the ONE production call site (this function's caller in
-// tryPGShapedJoinSearch) can pass a literal `false` and every reader can see,
-// without tracing further, that the arm is provably inert in production
-// until M0142-0008a-3i-plumbing-b2 (item 6: giving the Semi/Anti RHS a
-// ctx.bindings/joinlist representation) lands — mirroring the
-// "callable but never called" shape `-3i-plumbing-a` already used for
-// `semiAntiChainLink`'s two consumers.
+// (design doc §22.4). It is a plain parameter, not a package-level flag:
+// the ONE production call site (this function's caller in
+// tryPGShapedJoinSearch) has passed a literal `true` since
+// M0142-0008a-3i-plumbing-b2 step (iii) landed — the parameter stays so the
+// off arm remains directly unit-testable
+// (TestExtractSearchLeaves_AdmitSemiAntiFalse_*) and so the admission
+// decision is visible at the call site rather than implicit.
 func extractSearchLeaves(node Node, admitSemiAnti bool) (scans []Node, widths []int, onQuals []chainOnQual, outer []outerChainLink, semiAnti []semiAntiChainLink, ok bool) {
 	width := 0
 	// `preserved` marks a subtree NO admitted outer link null-extends, and it
@@ -1316,15 +1318,15 @@ func extractSearchLeaves(node Node, admitSemiAnti bool) (scans []Node, widths []
 		j, isJoin := n.(*Join)
 		if isJoin && admitSemiAnti && (j.Type == JoinTypeSemi || j.Type == JoinTypeAnti) {
 			// M0142-0008a-3i-plumbing-b1 (design doc §22.2's settled
-			// semantics, INERT until admitSemiAnti is true): SEMI/ANTI
-			// null-extends neither side, so it is declined exactly like an
-			// outer link when it sits on a subtree an admitted outer link
-			// above it already null-extends (mirrors the Left/Right
+			// semantics; live since b2 made admitSemiAnti unconditional):
+			// SEMI/ANTI null-extends neither side, so it is declined exactly
+			// like an outer link when it sits on a subtree an admitted outer
+			// link above it already null-extends (mirrors the Left/Right
 			// `!preserved` decline immediately below), but unlike an outer
 			// link its RHS stays ONE opaque leaf rather than being split
 			// into preserved/nullable leaf ranges — making the RHS itself a
-			// real DP-reorderable participant is the separate, still
-			// out-of-scope S5b mechanism (§11-§13, §22.2).
+			// real DP-reorderable participant is the separate S5b mechanism
+			// (§11-§13, §22.2), in flight under the unfrozen M0142-0008 chain.
 			if !preserved {
 				return 0, false
 			}
@@ -1549,8 +1551,9 @@ func extractSearchLeaves(node Node, admitSemiAnti bool) (scans []Node, widths []
 // (Semi/Anti RHS) leaf's range is instead appended AFTER the total real
 // width, in walk order among themselves. `semiAnti[*].rhs` marks which walk
 // positions are synthetic; every other leaf is real. With no semiAnti links
-// (today's only production shape — admitSemiAnti stays false at the one
-// production call site) this reduces to the old plain cumulative sum.
+// — still the only production shape today, since every corpus chain that
+// could carry one declines earlier at the leaf-count gate — this reduces to
+// the old plain cumulative sum.
 func buildLeafSpans(widths []int, semiAnti []semiAntiChainLink) []leafSpan {
 	var synthetic RelSet
 	for _, lk := range semiAnti {
@@ -1649,13 +1652,13 @@ func remapWalkOrderFlatToSpans(e Expr, widths []int, cumOffsets []leafSpan) (Exp
 // width, computed here by summing `widths` while skipping synthetic
 // indices, not at `cumOffsets`'s raw last entry.
 //
-// With `semiAnti` empty — today's only production shape, since
-// `extractSearchLeaves`'s one production call site (`tryPGShapedJoinSearch`,
-// this file) always passes `admitSemiAnti=false` — `synthetic` is the zero
-// RelSet and every branch below reduces exactly to the pre-existing plain
-// checks: this function is fully inert in production. Only a direct
-// unit-test call exercises the numSynthetic>0 arithmetic until
-// M0142-0008a-3i-plumbing-b2 flips admitSemiAnti to true at that call site.
+// With `semiAnti` empty — still the only production shape today: the call
+// site has passed `admitSemiAnti=true` since b2, but every corpus chain that
+// could produce a link declines earlier at the leaf-count gate — `synthetic`
+// is the zero RelSet and every branch below reduces exactly to the
+// pre-existing plain checks. Direct unit-test calls exercise the
+// numSynthetic>0 arithmetic until the pending leaf-admission work lets a
+// link through.
 func pgShapedOffsetChecksOK(cumOffsets []leafSpan, semiAnti []semiAntiChainLink, widths []int, bindingOffsets []int, hasSpine bool, spineOffset int) (declineReason string, ok bool) {
 	var synthetic RelSet
 	for _, lk := range semiAnti {
@@ -1688,9 +1691,14 @@ func pgShapedOffsetChecksOK(cumOffsets []leafSpan, semiAnti []semiAntiChainLink,
 // per-leaf span table, for the one caller (`joinlistProblem.cumOffsets`, the
 // bushy/joinlist layer's own coordinate space — §26.1's "flavor 2") that
 // still speaks that shape. Valid only when `spans` is contiguous and
-// monotonic (no out-of-band synthetic range) — true today because this
-// function's only caller is reached with admitSemiAnti=false (§26.3: the fix
-// is confined to the chain layer and does not reach the bushy layer).
+// monotonic (no out-of-band synthetic range) — still guaranteed today, but
+// only because no corpus chain carrying a semiAnti link survives the
+// leaf-count gate upstream, so `buildLeafSpans` never emits an out-of-band
+// range into this path. Once the pending leaf-admission work lets a link
+// through, a synthetic span's out-of-band `lo` would be flattened away here
+// and `spansFromCumulative` at the consumer (relfromjoinlist.go) would
+// misattribute the hole to the last real leaf — tracked under
+// M0142-0008a-3's remaining increment (P0-H11 design doc §3).
 func cumulativeFromSpans(spans []leafSpan) []int {
 	cum := make([]int, len(spans)+1)
 	for i, sp := range spans {
