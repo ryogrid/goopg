@@ -2926,7 +2926,7 @@ setting that yields a serial plan.
   `docs/design/0100-0149/m0140-0006c-executor-claim-set.md`. Ledger row
   filed (2026-09-18, `M0140-0006c`): join/bitmap-driven branches, owned by
   **M0140-0006c-2** below.
-- [ ] **M0140-0006c-2 — widen the partial-SetOp admission past bare scans.**
+- [x] **M0140-0006c-2 — widen the partial-SetOp admission past bare scans.**
   Kind: impl
   Parent: M0140-0006c. Filed 2026-09-18 by M0140-0006c's own narrowing.
   `setOpBranchDrivingKindIsSupported` (`internal/optimizer/gatherpaths.go`)
@@ -3060,6 +3060,47 @@ setting that yields a serial plan.
     for `spread=false`). Commit `0a5885bf6`. Remaining: bitmap
     branch only (per-branch `pbm` publication + a partial-bitmap
     producer needed for an end-to-end identity test).
+  - **Landed 2026-09-19 (slice C — bitmap branch; task COMPLETE).**
+    Kind: impl. Parent: M0140-0006c. Movement: none (zero Bitmap Heap
+    Scan `Parallel Append` heads in `bench/tpcds/plans-pg/` — the arm
+    is dormant pending a partial-bitmap producer, same posture as the
+    top-level bitmap arm; sweep PLAN-SHAPE 99/99 identical). Two
+    production pieces: `setOpBranchDrivingKindIsSupported`
+    (`gatherpaths.go`) gains `case PathBitmapHeapScan` (unconditional
+    admit, mirroring the top-level arm — admitted by a decision, not
+    a default), and `prebuildBitmap` (`parallel_scan.go`) is
+    restructured around `bitmapPrebuildTargets` /
+    `appendBitmapPrebuildTarget`: a `*setOp` tree publishes each
+    branch's collected bitmap to that branch's OWN leaf claim set
+    (`cs.setOpLeft.pbm` / `cs.setOpRight.pbm`, keyed off
+    `so.plan.Left`/`Right` via `HasBitmapScan`) instead of only the
+    top-level `cs.pbm` — without it every worker's branch bitmap
+    attaches nothing and scans its own whole bitmap (the N-copies
+    defect; `attachAll`'s return is ignored by design). Flat path
+    keeps the exactly-one rule; nil plan / plan-tree mismatch / 0-or->1
+    collected all publish nothing (fail closed). A parameterized NLI
+    probe bitmap is unreachable (`collectBitmapScans` has no
+    `*nestedLoopIndexJoinOp` arm). Tests: 2 optimizer acceptance
+    (bare bitmap branch + bitmap spines under hash/merge/NL —
+    the cases the refusal maps carried), 8-case
+    `TestBitmapPrebuildTargetsPerBranch` attribution unit, and
+    `TestGatherOverSetOpBitmapBranchIdentity` — the recon predicted no
+    end-to-end test, but the JOIN SEARCH emits a real
+    `NestedLoop(BitmapHeapScan outer)` for an equality qual on a
+    low-ndistinct indexed column (comma form required — fast path
+    ignores `enable_*`; `matchBitmapIndexQuals` is equality-only;
+    `TableStats` required) — serial-vs-parallel identity at 1/2/4
+    workers exercises the real machinery. Mutation-verified: neutered
+    arm → exactly the 2 acceptance tests (5 assertions) fail to
+    `PathPrebuilt`. Gates: build clean, optimizer + executor packages
+    green, spotcheck PASS (Q12=2/Q13=34), acceptance-arm A/B at
+    `PGSHAPED=1` bounded `GOGC=100`/`GOMEMLIMIT=8GiB` VERDICT PASS
+    24/24 MATCH (`PGSHAPED=0` hits the known 600s Q9 pathological
+    plan), sweep PASS=96 MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0,
+    units all `ok`. Remaining corpus work is elsewhere: Q76 needs
+    M0142-0005a, Q5 needs 0006c-3; planner-side partial-bitmap
+    producer is a separate gap (ledger
+    `e10-gathermerge-bitmap-untested-e2e`).
 - [ ] **M0140-0006c-3 — mixed partial/non-partial SetOp append (Q5).**
   Kind: impl.
   Parent: M0140-0006c. Filed 2026-09-19 by 0006c-2's recon.

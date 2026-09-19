@@ -1,6 +1,6 @@
 # M0140-0006c-2 — widen the partial-SetOp admission past bare scans (hash-join branch)
 
-**Status:** accepted (partial — hash-join, nested-loop, and merge branches landed; the bitmap branch remains open under this same task)
+**Status:** accepted (all four branch kinds landed — hash-join, nested-loop, merge, and bitmap; the bitmap arm is dormant pending a partial-bitmap producer, same posture as the top-level bitmap arm)
 **Milestone:** M0140 (TPC-DS parallelism), plan-parity group
 **Harness:** `AGENT.md` §"Plan-parity harness (M0137–M0143)"
 **Task:** `.ralph/fix_plan.md` M0140-0006c-2
@@ -22,11 +22,11 @@ Four pieces, all in this loop's diff:
 
 The first cut of the identity test claimed two opposite silent failure modes (N-copies vs dropped matches). Neutering the new `collectShareableJoins` arm leaves the test GREEN: with no shared build published, each worker falls back to a full private build of the (unclaimed, unstamped) build side — correct rows, N+1x the build work and memory. The dropped-matches hazard (`TestC19f…` line 231) needs a claim on the BUILD side, which no walk in this shape places. So the collector's gate is a second witness in the same test: `lookupSharedHashBuild(ctx, branchJoin) != nil` after `Open` (retracted at `Close`, so asserted between). Neutered collector → no publication → the assert fires (verified); neutered `attachAll` SetOp dispatch → 390/650 rows for 130 (verified) — each witness fires on exactly one mutation.
 
-## Still open under this task (not deferred — the owning task stays `[ ]`)
+## Branch-by-branch status (all landed — task complete)
 
 - ~~**Merge-driven branch**~~ — **landed 2026-09-19 (slice B), see below.**
 - ~~**Nested-loop-driven branch**~~ — **landed 2026-09-19 (slice A), see below.**
-- **Bitmap-driven branch**: collectors and gates now descend, but `prebuildBitmap` publishes only to the top-level claim set while a branch attaches through its own leaf (whose `pbm` is nil by construction) — needs per-branch publication, then its own identity test.
+- ~~**Bitmap-driven branch**~~ — **landed 2026-09-19 (slice C), see below.**
 
 ## Update 2026-09-19 — slice A (nested-loop branch) landed
 
@@ -158,6 +158,100 @@ flaked under gate concurrency; replaced with a relative bound vs the
 paced run's own elapsed — the `progresses==0` + `flushAllCalled`
 structural checks already prove the bypass deterministically
 (`buildPacer` returns nil for `spread=false`).
+
+## Update 2026-09-19c — slice C (bitmap branch) landed, task complete
+
+The recon's last slice — the only one carrying genuinely new executor
+machinery. Two production pieces:
+
+1. **Admission arm** — `setOpBranchDrivingKindIsSupported`
+   (`internal/optimizer/gatherpaths.go`) gains `case PathBitmapHeapScan`
+   — an unconditional `true`, mirroring the top-level arm's own admit
+   (`partialPathDrivingKind`). Dormant for the same reason the top-level
+   arm is: no producer files a partial bitmap path today; when one
+   does, it is admitted by a decision rather than by a default.
+2. **Per-branch bitmap publication** — `prebuildBitmap`
+   (`internal/executor/parallel_scan.go`) is restructured around a new
+   `bitmapPrebuildTargets`/`appendBitmapPrebuildTarget` pair. For a
+   `*setOp` tree it reads the op's own plan (`so.plan.Left`/`Right`,
+   robust to a plan wrapper above the SetOp): each branch whose plan
+   reports `HasBitmapScan` gets its collected bitmap published to that
+   branch's OWN leaf claim set (`cs.setOpLeft.pbm` /
+   `cs.setOpRight.pbm`) — the state `attachAll`'s `*setOp` dispatch
+   hands the branch's attach walk. Publishing only to the top-level
+   `cs.pbm` left every worker's branch bitmap unattached — and
+   `attachAll`'s return is ignored by design, so a miss means each
+   worker scans its own whole bitmap: the N-copies defect. The flat
+   (non-SetOp) path keeps its exactly-one rule. Fail-closed holds on
+   every ambiguity: nil `setOp.plan`, plan/tree disagreement, zero or
+   >1 collected scans in a branch all publish nothing. No
+   `newLeafParallelClaimSet` field was needed — `pbm` already exists
+   and is nil-until-prebuild on every claim set, top-level or leaf;
+   the stale "nil forever / refused at the planner" comment and the
+   matching one on `collectBitmapScans`' `*setOp` arm were corrected.
+   A parameterized bitmap probe (NLI inner) can never be collected —
+   `collectBitmapScans` has no `*nestedLoopIndexJoinOp` arm — so the
+   prebuild only ever sees non-parameterized driving scans, which is
+   what the shared claim model requires.
+
+Tests (2 acceptance + refusal-map updates + 8-case unit + 1 executor
+identity):
+
+- `TestPartialPathDrivingKindAcceptsSetOpWithBitmapBranch` — bare
+  bitmap branch admission.
+- `TestPartialPathDrivingKindAcceptsSetOpWithBitmapSpine` —
+  bitmap-driven outers under hash-probe / merge-outer / NL-outer /
+  nested-merge spines (the cases the three refusal maps carried before
+  slice C).
+- `TestBitmapPrebuildTargetsPerBranch` — left/right/both-leaf
+  attribution, scans-only, plan-tree mismatch, nil-plan SetOp, flat
+  single, two-in-one-branch ambiguity (8 subtests, all fail-closed
+  edges verified).
+- `TestGatherOverSetOpBitmapBranchIdentity` — the recon predicted
+  this test could not exist ("needs a partial-bitmap producer first").
+  It exists, because the JOIN SEARCH emits a real
+  `NestedLoop(BitmapHeapScan outer, SeqScan inner)` — a
+  non-parameterized bitmap as the branch's driving scan — for an
+  equality predicate on a low-ndistinct indexed column. Fixture
+  constraints, all probe-verified: the bitmap path producer
+  (`addBaseRelBitmapPaths`, `pathbitmap.go`) only runs inside the join
+  search (comma/WHERE form — the non-search fast path ignores
+  `enable_*` flips entirely); `matchBitmapIndexQuals` descends only
+  EQUALITY conjuncts into the index (range quals keep selectivity 1.0
+  and always lose on cost), so the predicate is `grp = 3` on a
+  10-ndistinct column; and `TableStats` must be installed for
+  selectivity. Disabling seq/index scans and hash/merge joins leaves
+  NL + bitmap as the only viable shape. Serial-vs-parallel multiset
+  identity at 1/2/4 workers: without per-branch publication the branch
+  rows come back N+1 times. This is executor-level end-to-end coverage
+  of the real machinery — what remains untestable is only a
+  PLANNER-produced partial bitmap path reaching admission on its own
+  (no producer exists; the GatherMerge twin gap is ledgered as
+  `e10-gathermerge-bitmap-untested-e2e`).
+
+Mutation-verified: neutering the arm flips exactly the two bitmap
+acceptance tests (5 assertions) to `PathPrebuilt`; every other slice's
+tests stay green. Completeness-only: zero `Bitmap Heap Scan`
+`Parallel Append` heads in the corpus — sweep PLAN-SHAPE 99/99
+identical.
+
+Gates: `go build ./...` clean; optimizer + executor package tests
+green; mutation check PASS; `tpch-spotcheck.sh` PASS (Q12=2/Q13=34);
+`tpch-acceptance-arm.sh` A/B at `PGSHAPED=1` (the documented arm
+envelope — `PGSHAPED=0` hits the known 600s Q9 pathological plan, and
+`PER_Q=900` merely delays it) bounded `GOGC=100`/`GOMEMLIMIT=8GiB` —
+VERDICT: PASS, 24/24 labels MATCH; SF0.25 sweep PASS=96 MISMATCH=0
+CKMISMATCH=0 ERROR=0 TIMEOUT=0, PLAN-SHAPE 99/99 identical; units
+precommit all `ok`.
+
+With slice C the task's stated scope is fully discharged: both
+collectors and both prebuild passes descend SetOp children, the
+admission test is widened branch by branch (hash, NL, merge, bitmap),
+and each branch kind carries its own serial-vs-parallel identity test.
+The remaining corpus work is elsewhere: Q76 needs M0142-0005a (Memoize
+under the probe NL), Q5 needs M0140-0006c-3 (the mixed `pa_subpaths`
+arm), and a planner-side partial-bitmap producer remains a separate
+gap (ledger `e10-gathermerge-bitmap-untested-e2e`).
 
 ## Remaining-branch scoping — recon 2026-09-19 (analysis only, no production change)
 
