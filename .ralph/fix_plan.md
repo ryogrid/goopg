@@ -781,8 +781,23 @@ heuristic stays live.)
     plan-gate 14/22 baseline. Design doc updated:
     `0100-0149/m0134-0110-create-cast-user-type-resolution.md` §Fix (the
     "in either direction" claim corrected).
-- [ ] **testport/TestPort_RegressSuite (AI-20260905-011015-008, AI-20260914-235643-011, AI-20260916-035206-012, AI-20260917-004357-016)** — FAILed
+- [x] **testport/TestPort_RegressSuite (AI-20260905-011015-008, AI-20260914-235643-011, AI-20260916-035206-012, AI-20260917-004357-016)** — FAILed
   subtests: limit, numerology, also failed previous run; 20260914-235643 adds subtests time, timetz.
+  - **CLOSED 2026-09-19** — all four failing subtests were fixed by their
+    own tasks on 2026-09-18 (`time`/`timetz`: `evalTypedStringLit` error-code
+    drift; `limit`: FETCH BACKWARD position bug; `numerology`: `mapToken`
+    base-prefix + trailing-junk), and the entry was never flipped.
+    Re-verified at HEAD `3973bf819` — which includes Loop 10's `LABEL`
+    `cast_ident` alternative, the one recent change that could move a
+    regress expected-error case — full suite:
+    `GOOPG_REGRESS_DIFF_DIR=tmp/regress-diffs-loop11 scripts/goopg-test-run.sh
+    go test -v -run '^TestPort_RegressSuite$' ./internal/testport/` →
+    **50 PASS / 0 FAIL / 183 SKIP** (223s), identical to the 2026-09-18c
+    tally. Tonight's nightly (`20260919-000526`, sha `485eef904966`)
+    independently agrees: testport stage ran 7368s and its only reported
+    failure was `TestE2E_PGColdStartOnGoopgDataDir` (the already-fixed
+    stale `wantChunks` pin) — RegressSuite absent from regressions.
+    Test-only verification; no production code touched.
   - **UPDATE 2026-09-18**: re-ran the repro at HEAD (`e121c4e9e`) per the
     M-NIGHTLY loop rule; all 4 subtests still diverged. Root-caused each
     independently (`GOOPG_REGRESS_DIFF_DIR=<dir> go test -v -run
