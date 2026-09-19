@@ -6088,28 +6088,124 @@ cross-layer programme that has never been scoped.
     PASS 24/24 value-MATCH (stamped). Design doc:
     `docs/design/0100-0149/m0142-0005b-streamed-index-probe-cursor.md`;
     captures `analysis/m0142/m0142-0005b-{tpcds,tpch}-mult{1,2}.txt`.
-- [ ] **M0142-0005c — recon: why does `indexProbeCostMultiplier=2` stay
+- [x] **M0142-0005c — recon: why does `indexProbeCostMultiplier=2` stay
   load-bearing after the streamed probe? (probe-vs-hash relative pricing).**
-  Parent: M0142-0005. Kind: recon.
-  M0142-0005b removed the executor gap the multiplier's comment blamed
-  (eager per-probe TID materialisation) and the B8-protocol re-measure
-  came back byte-identical: at `GOOPG_INDEX_PROBE_MULT=1` TPC-H
-  Q9/Q10/Q14 still pick NL+`Index Scan` where PG 18.3 hashes, and TPC-DS
-  keeps its mult=1 scan-type gains. The residual is therefore inside the
-  cost model itself — `indexProbeCost` (`cost_funcs.go`) prices a probe as
-  `2*random_page_cost + cpu_index_tuple + cpu_tuple + cpu_operator`,
-  while PG's `cost_index`/`amcostestimate` (`costsize.c`) additionally
-  charges B-tree descent pages, per-page index qualification eval, and
-  the correlation-derived heap-fetch model (`index_pages_fetched`,
-  Mackert-Lohman); conversely the hash-join alternative may be priced
-  differently relative to PG's `final_cost_hashjoin`. Work: dump PG's
-  per-path cost breakdown for Q9/Q10/Q14 (`debug_print`/`costsize`
-  instrumentation or a gdb-free estimate-audit on both sides), identify
-  which term goopg's formula omits or mis-weights, and port the missing
-  PG arithmetic rather than keeping the scalar. Resume point:
-  `internal/optimizer/cost_funcs.go` `indexProbeCost` vs
-  `postgres/src/backend/optimizer/path/costsize.c` `cost_index`; the
-  B8/0005b capture pairs in `analysis/m0142/` are the reproduction.
+  Parent: M0142-0005. Kind: recon. **DONE 2026-09-19, no production change.**
+  Full writeup:
+  `docs/design/0100-0149/m0142-0005c-index-probe-mult-input-divergence.md`,
+  numerics `analysis/m0142/m0142-0005c-probe-cost-attribution.md`.
+  - **The formula is faithful** — a Python replay of `costIndexScanCore`
+    (`costindex.go:233-303`) reproduces both engines' probe costs within ~1%
+    when fed each engine's own inputs: goopg-sim 3.8248 vs DPPATH-measured
+    3.8249 (Q9 `partsupp` probe, `index.parameterised relids={3}
+    reqouter={0}`); PG-input sim 7.07 vs PG forced-NL measured 7.13. Nothing
+    is omitted: descent, both Mackert-Lohman arms, the corr² blend
+    (`costsize.c:795-797`), qpqual and `get_loop_count`
+    (`indxpath.c:2328` — `loopCountFor` ports it verbatim) are all present.
+  - **The divergence is inputs** (swap ladder, per-input Δ on the 3.82→7.13
+    gap): correlation `1.0→0.845` +0.92; loopCount `12121→6061` +0.78;
+    index relpages `1092→2198` +0.37; relPages −0.04; interaction +1.24.
+  - **Dominant input: physical heap correlation of the corpus.** goopg's
+    TPC-H heap is genuinely perfectly clustered on every probe key — 0
+    block-boundary key inversions on `partsupp.ps_partkey`, so `corr=1.0`
+    is a FAITHFUL measurement (verified by re-ANALYZE on the clone + a
+    corrected ctid inversion check; the earlier "367K inversions" reading
+    was a mis-parsed query, retracted). PG's reference heap is fragmented
+    (~12K inversions → 0.845; `l_orderkey` 0.195, `o_orderkey` 0.194,
+    `p_partkey` 0.846). With corr=1.0 the blend pins at `min_IO_cost`, so
+    the probe is ≈ linear in the multiplier — which is why the scalar is
+    load-bearing on TPC-H and why it double-charges TPC-DS, where
+    correlations measure honest fractions (0.01–0.66) and mult=1 measured
+    better (scan-type 59→51 etc.).
+  - **loopCount inherits a selectivity divergence**: `part WHERE p_name
+    LIKE '%green%'` estimates 12121 (goopg) vs 6061 (PG), actual ≈10650 —
+    `patternClauseSelectivity` lands 2× PG's on the other side of truth.
+    Filed as M0142-0005g.
+  - **Q10 `{orders,lineitem}` contest at mult=1** (DPPATH): partial-NL
+    95,348 beats partial-hash 351,384; the real parameterized probe path
+    cost is 4.59 (`startup=0.375` — the descent charge is present).
+  - **EXPLAIN misleads on fused NLI**: the printed `cost=0.00..0.18` on the
+    inner `Index Scan` is `DeriveLegacyDisplayCost` — the `*IndexScan` node
+    built at `nl_index_join.go:666` never passes `stampPlanCost`. The 0.18
+    is display-only; the path search used 4.59. Filed as M0142-0005e.
+  - **New analyzer bug found**: correlation can exceed 1.0 on nullable
+    columns — `catalog_sales.cs_catalog_page_sk` = 1.0019597 on TPC-DS
+    SF0.25. `corrPairs` uses the raw (null-sparse) sample `pos`
+    (`operators_analyze.go:1294`) while the closed form requires contiguous
+    `0..nonNull−1` positions — PG uses `tupno = values_cnt`
+    (`analyze.c:2495`). Filed as M0142-0005d.
+  - **Verdict**: the scalar masks input parity (corpus layout +
+    selectivity), not a formula gap. No better scalar exists; retirement
+    path is the corpus-layout decision (M0142-0005f) plus the child fixes.
+    The flat `indexProbeCost()` (`cost_funcs.go:1104`) is test-only —
+    production probes all flow through `costIndexScanCore`, where the
+    multiplier scales every `random_page_cost` term.
+  - Gates: recon-only — no production diff, so no stamped gates required;
+    all evidence gathered read-only (PG `:65432` EXPLAIN/catalog reads) or
+    on private clones (`:5534` TPC-H, `:5533` TPC-DS SF0.25).
+    Movement: none (recon — produced the attribution + four child tasks;
+    no parity metric moved).
+- [ ] **M0142-0005d — ANALYZE correlation: contiguous non-null positions +
+  clamp to `[-1,1]` (corr>1 on nullable columns).**
+  Parent: M0142-0005c. Kind: impl.
+  `corrPairs` records `pos` as the raw index into the reservoir `sample`
+  (`internal/executor/operators_analyze.go:1294`), which is SPARSE when the
+  column has nulls — the skipped null positions leave gaps in x — while the
+  closed-form Pearson (`n·Σxy − Σx²)/(n·Σx² − Σx²`) is only valid when both
+  axes are permutations of `0..nonNull−1`. PG assigns `values[values_cnt]
+  .tupno = values_cnt` — a contiguous non-null index — at
+  `postgres/src/backend/commands/analyze.c:2495`. Observed:
+  `catalog_sales.cs_catalog_page_sk` correlation = **1.0019597** on the
+  TPC-DS SF0.25 clone (mathematically impossible). Fix: number correlation
+  positions by a contiguous non-null counter, and clamp the result to
+  `[-1,1]` as belt-and-braces (PG relies on the closed form being exact;
+  goopg keeps the comment citing why). Expected movement: TPC-DS
+  correlation statistics bounded to `[-1,1]` — measure via a pg_stats
+  correlation census on the SF0.25 clone before/after plus
+  `scripts/tpcds-sf025-regression.sh sweep` (plan-shape delta unknown; the
+  fix is correct regardless of movement).
+- [ ] **M0142-0005e — stamp the real path cost on the fused-NLI inner
+  `IndexScan` (EXPLAIN prints `DeriveLegacyDisplayCost`).**
+  Parent: M0142-0005c. Kind: impl.
+  The fused `NestedLoopIndexJoin` inner `*IndexScan` node built at
+  `internal/optimizer/nl_index_join.go:666` is not a search-produced node
+  and never receives `stampPlanCost`, so `EXPLAIN` prints the legacy
+  derived cost (`cost=0.00..0.18` on TPC-H Q10) while the path that won
+  the search was costed at 4.59 (`index.parameterised` DPPATH line).
+  Readers of plan captures — including parity-diff tooling and past loops —
+  attribute wrong costs to the probe. Fix: carry the winning
+  `PathIndexScan`'s `PlanCost` through to the fused inner node (the path is
+  already on the join path's `Children[1]` when `createNestLoopIndexJoinPlan`
+  unwraps it), or stamp it in `createplannl.go`'s NLI arm. Expected
+  movement: none on plan choice (display fidelity only); measure by
+  `EXPLAIN` diff on TPC-H Q9/Q10 before/after showing real probe costs.
+- [ ] **M0142-0005f — recon: TPC-H corpus physical-layout parity — rebuild
+  in PG-reference order or accept the divergence?**
+  Parent: M0142-0005c. Kind: recon.
+  goopg's TPC-H benchmark heap is physically clustered on every key column
+  (0 block-boundary inversions, `correlation=1.0` honest) while PG's
+  reference heap is fragmented (corr 0.19–0.85). `indexProbeCostMultiplier`
+  currently masks the resulting probe-pricing gap corpus-wide. Decide: (a)
+  rebuild the `:65433` corpus so heap physical order matches PG's reference
+  (e.g. dump PG's per-table ctid order and reload in that order — an
+  owner-adjacent bench-harness change, not planner code), which would make
+  `correlation` converge to PG's values and let the multiplier retire; or
+  (b) keep the scalar as a documented corpus-layout shim. Deliverable: the
+  measurement of how wide the layout divergence is (all key columns, both
+  corpora), a concrete rebuild recipe if (a), and the expected plan-parity
+  movement named (Q9/Q10/Q14 on TPC-H are the known probes).
+- [ ] **M0142-0005g — recon: `patternClauseSelectivity` vs PG on
+  `LIKE '%x%'` — 2× divergence feeding `loopCount`.**
+  Parent: M0142-0005c. Kind: recon.
+  `part WHERE p_name LIKE '%green%'` (TPC-H Q9): goopg estimates 12121, PG
+  6061, actual ≈10650. PG's `patternsel`/`like_selectivity`
+  (`like_support.c`) reads histogram/MCV for the fixed prefix plus the
+  matcher heuristic; goopg's `internal/optimizer/patternsel.go` lands 2×
+  high. Attribute which sub-term diverges (histogram lookup absent? fixed
+  vs variable part weighting?), and name the expected movement — the
+  estimate feeds `get_loop_count` on every parameterized probe under a
+  LIKE-filtered outer (Q9's `part ⋈ partsupp` flip site is the canonical
+  one).
 - [x] **M0142-0006 — apply `semiJoinMatchFraction` in `estimateNLIndexJoin`** —
   `estimateNLIndexJoin` (`cardinality.go:239-241`) returns `EstimateRows(j.Outer)` for
   SEMI/ANTI, while its sibling `estimateJoin` (`:608-625`) applies the match
