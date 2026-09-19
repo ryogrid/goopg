@@ -1473,18 +1473,18 @@ the whole file's active task between 2026-09-01 and 2026-09-14; **since
       cloned into future `CREATE DATABASE`s; a template1 install re-attributes
       to "postgres" on restart (shared bootstrap namespace); user-db-local
       `extnamespace` falls back to "public" at reload.
-    - ⚠️ COMMIT-BLOCKED (2026-09-20): the bs slice is complete, staged and
-      green (units PASS; tpcds-sf025 sweep PASS=96/0 mismatch/0 shape
-      changes; live scratch verified) but cannot commit — the owner placed
-      `bench/tpch/runtime_goopg/data.HOLD` (OWNER-PLANNED-RELOAD,
-      M0142-0003i canonical 8-FK rebuild) at 05:48 today and the HammerDB
-      reload was still running at loop end. tpch-spotcheck and
-      tpch-acceptance-arm stamp SKIP-BLOCKED and `.ralph/gate-exceptions.md`
-      has NO row for this task — commit-msg rejects any `internal/` commit
-      until the owner lifts the HOLD or adds an exception row. Resume:
-      commit the staged index (files listed in `.ralph/working_set.md`) once
-      the HOLD lifts — re-run the two TPC-H gates first, and the body needs
-      a `PARITY: N/A` line (catalog/DDL-registry change, no plan paths).
+    - **LANDED 2026-09-20 via `09bde885a`** — the bs slice sat staged while
+      the owner's `data.HOLD` (M0142-0003i 8-FK reload) kept the TPC-H gates
+      SKIP-BLOCKED; when the owner committed their anchor re-pin the staged
+      index rode along, so all 13 files + design doc + ledger rows are at
+      HEAD and pushed. Gates green on exactly this code: units PASS;
+      tpcds-sf025 PASS=96/0-mismatch/0-shape-change; tpch-spotcheck PASS on
+      the reloaded cluster (Q12=2/Q13=33 vs re-pinned anchors). NOTE:
+      `tpch-acceptance-arm` was NOT run — its baseline
+      (`bench/tpch/baseline-digests.txt`, pinned 2026-09-08) predates the
+      8-FK reload and is load-dependent; an arm-vs-stale-baseline FAIL would
+      be data drift, not regression. Re-capture the baseline (or the owner
+      does) before the next executor commit needs the arm stamp.
 > This task list is **seeded, not exhaustive.** M0119-0001 triage plus every future
 > deferral-ledger entry (any new `status = -` row) feed additional M0119 tasks over
 > time; the milestone's living nature means it need not be complete at filing.
@@ -10526,6 +10526,16 @@ reported, and the values and unit gates are the bar.
   audit this project's practice card requires, each slice gated by its own
   regress run plus the sf025 sweep. Ledger:
   `.ralph/deferral_ledger.md`, row dated 2026-09-18 (task M0143-0007).
+- **OWNER DECISION 2026-09-20 — APPROVED.** The owner approves reversing
+  the trimmed-`bpchar`-storage convention: implement R23 padded
+  `character(N)` storage. Proceed per the task text — design doc first,
+  then land per-boundary with the sibling-path audit (heap comparisons,
+  `internal/access/nbtree` key comparators, `pgoutput` WAL encoding,
+  TOAST thresholds/index-key/WAL record sizes), each slice gated by its
+  own regress run plus the sf025 sweep. Context: the owner also reloaded
+  `:65433` today with the canonical 8-FK schema on a HEAD binary
+  (`09bde885a` anchor re-pin) — FK-driven plan comparisons now run
+  against the FK-bearing cluster.
 - [x] **M0143-0009 — `SELECT … FOR UPDATE` over a join drops every row when a
   locked leaf is not the rightmost scan (resjunk-ctid ColumnRef shift).**
   RESOLVED Loop #21 — `rebaseRowMarkPlan` post-order walk rebases every
