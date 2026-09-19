@@ -188,3 +188,48 @@ all arms returning the full match set), `SELECT *` join-rooted,
   rowmarks on set-op children); left as-is.
 - A `FOR UPDATE` leaf under `Gather` is unreachable (`StripGather` post-pass
   already removes search-chosen Gathers under LockRows).
+
+## Update 2026-09-20 — surface ctids through schema-pinning ancestors (AI-20260920-005626-006)
+
+**Defect.** `resolveRowMarkCtidResnos` resolved each wired ctid's resno by
+name lookup in `proj.Child.Output()` — correct only while the node below the
+top Project derives its schema live from the leaves. The planner also emits a
+column-reordering Project between the top Project and the join (restrip to
+binding order) — e.g. `SELECT a.accountid, a.balance FROM lrs_acct a,
+lrs_side s WHERE a.accountid = s.k FOR UPDATE OF a` when the hash outer is
+`s`. That intermediate Project pins its own schema (`Project.Output()`
+returns `p.schema`, not `Child.Output()`), so the leaf-injected ctid never
+appeared in the resno lookup: `CtidResno` stayed -1, yet `NumCtidCols`
+still counted the leaf injection, and `LockRows.Output()`'s trailing-strip
+fallback then dropped a real user column per lock (`balance`; both output
+columns for a bare two-table `FOR UPDATE`).
+
+**Fix.** New `surfaceRowMarkCtid` walks the tree post-order and threads each
+wired ctid up through schema-pinning ancestors before the resno is read:
+
+- `*Project`: append a pass-through `ColumnRef` + `Resjunk`-marked schema
+  entry when the child output carries the ctid but the Project's schema
+  does not (idempotent on re-entry).
+- `*Join` / `*NestedLoopIndexJoin`: rebuild `schema` via `appendSchema`
+  after children are threaded (skipped for Semi/Anti — left output only).
+- `*Distinct` / `*DistinctOn`: `schema = Child.Output()`.
+- `*Aggregate` / `*WindowAgg` / `*OrdinalityWrap` / `*ProjectSet` /
+  `*SetOp`: NOT recursed — their pinned schemas interleave or synthesize
+  columns (or combine two branches), so threading a ctid underneath would
+  corrupt their layout, and PG cannot take rowmarks across these
+  boundaries anyway. A ctid buried there stays unresolved → `CtidResno=-1`
+  → executor falls back to the walker/side-channel paths.
+- Filter/Sort/Limit/Memoize derive `Output()` from the child live, so no
+  rebuild is needed.
+
+`NumCtidCols` is then recounted at the call site to only the locks whose
+`CtidResno` resolved — the trailing-strip fallback can no longer fire for a
+ctid that never reached the LockRows child row.
+
+**Regression coverage.** `TestPlanCtidRowMarkDoubleProject`
+(`internal/optimizer/locking_test.go`) constructs the
+LockRows→Project→Project→Join shape by hand and pins `CtidResno ≥ 0`, the
+mid-Project's threaded ctid, and the 2-column `LockRows.Output()`. The
+original witness, `TestPort_LockRowsSortOverJoinTakesRowLock`, passes at
+the fix (5.39s) — and now exercises the resjunk-column path end to end
+(the lock blocks, wakes on writer commit, EPQ returns the updated row).

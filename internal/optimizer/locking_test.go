@@ -3,6 +3,9 @@ package optimizer
 import (
 	"strings"
 	"testing"
+
+	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/parser"
 )
 
 // TestPlanSelectForUpdateWrapsLockRows — the headline case: a
@@ -329,5 +332,103 @@ func TestPlanCtidRowMarkSelfJoin(t *testing.T) {
 	}
 	if len(ctidIndices) != 2 {
 		t.Errorf("found %d distinct ctid ColumnRef indices, want 2", len(ctidIndices))
+	}
+}
+
+// TestPlanCtidRowMarkDoubleProject — AI-20260920-005626-006 regression.
+// The planner can emit a column-reordering Project between the top Project
+// and the join (the shape `SELECT a.accountid, a.balance FROM lrs_acct a,
+// lrs_side s WHERE a.accountid = s.k FOR UPDATE OF a` produced live: the
+// hash join emits s's columns first, a restrip Project reorders to binding
+// order, and the statement Project applies the select list). A resjunk ctid
+// injected into a leaf does not propagate through an intermediate Project's
+// own target list, so resno resolution used to fail there: CtidResno stayed
+// -1 while NumCtidCols still counted the leaf injection, and LockRows'
+// trailing-strip fallback then dropped a real user column (the wire result
+// lost `balance`). The fix threads the ctid up through every pinned-schema
+// ancestor (surfaceRowMarkCtid) and counts NumCtidCols by surfaced columns.
+func TestPlanCtidRowMarkDoubleProject(t *testing.T) {
+	c := catalog.NewInMemory()
+	acct, err := c.CreateTable(parser.ObjectName{Name: "lrs_acct"}, []catalog.Column{
+		{Name: "accountid", Type: catalog.Type{Name: "text"}},
+		{Name: "balance", Type: catalog.Type{Name: "int4"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	side, err := c.CreateTable(parser.ObjectName{Name: "lrs_side"}, []catalog.Column{
+		{Name: "k", Type: catalog.Type{Name: "text"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	textT := catalog.Type{Name: "text"}
+	intT := catalog.Type{Name: "int4"}
+	// Join emits s's columns first (s is the hash outer), a's second —
+	// merged order [k, accountid, balance].
+	aScan := &SeqScan{Table: acct, Alias: "a", schema: Schema{
+		{Name: "accountid", Type: textT, SourceTableIdx: 1},
+		{Name: "balance", Type: intT, SourceTableIdx: 1},
+	}}
+	sScan := &SeqScan{Table: side, Alias: "s", schema: Schema{
+		{Name: "k", Type: textT, SourceTableIdx: 2},
+	}}
+	join := &Join{Type: JoinTypeInner, Left: sScan, Right: aScan}
+	join.schema = appendSchema(sScan.Output(), aScan.Output())
+	// Restrip Project reorders merged output to binding order [acct, bal, k].
+	mid := &Project{Child: join, schema: Schema{
+		{Name: "accountid", Type: textT, SourceTableIdx: 1},
+		{Name: "balance", Type: intT, SourceTableIdx: 1},
+		{Name: "k", Type: textT, SourceTableIdx: 2},
+	}, Targets: []Expr{
+		&ColumnRef{Index: 1, Name: "accountid", Type: textT, SourceTableIdx: 1},
+		&ColumnRef{Index: 2, Name: "balance", Type: intT, SourceTableIdx: 1},
+		&ColumnRef{Index: 0, Name: "k", Type: textT, SourceTableIdx: 2},
+	}}
+	// Statement Project applies the select list [acct, bal].
+	top := &Project{Child: mid, schema: Schema{
+		{Name: "accountid", Type: textT, SourceTableIdx: 1},
+		{Name: "balance", Type: intT, SourceTableIdx: 1},
+	}, Targets: []Expr{
+		&ColumnRef{Index: 0, Name: "accountid", Type: textT, SourceTableIdx: 1},
+		&ColumnRef{Index: 1, Name: "balance", Type: intT, SourceTableIdx: 1},
+	}}
+	locks := []LockedRel{{Table: acct, Alias: "a", RowMarkId: 1, CtidResno: -1}}
+
+	numCtid, oldW := wireRowMarkCtidColumns(top, locks)
+	if numCtid != 1 {
+		t.Fatalf("wired ctids = %d, want 1", numCtid)
+	}
+	rebaseRowMarkPlan(top, oldW)
+	resolveRowMarkCtidResnos(top, locks)
+	// The call-site invariant: NumCtidCols counts only ctids that surfaced.
+	surfaced := 0
+	for i := range locks {
+		if locks[i].CtidResno >= 0 {
+			surfaced++
+		}
+	}
+	lr := &LockRows{Child: top, Locks: locks, NumCtidCols: surfaced}
+
+	if locks[0].CtidResno < 0 {
+		t.Fatalf("CtidResno = %d — ctid did not surface through the mid Project", locks[0].CtidResno)
+	}
+	// Mid Project must carry the ctid as a pass-through target.
+	midHasCtid := false
+	for _, c := range mid.schema {
+		if c.Name == "ctid1" && c.Resjunk {
+			midHasCtid = true
+		}
+	}
+	if !midHasCtid {
+		t.Error("mid Project schema missing the threaded ctid column")
+	}
+	out := lr.Output()
+	if len(out) != 2 || out[0].Name != "accountid" || out[1].Name != "balance" {
+		names := make([]string, len(out))
+		for i, c := range out {
+			names[i] = c.Name
+		}
+		t.Fatalf("LockRows.Output() = %v, want [accountid balance] (pre-fix dropped the trailing user column)", names)
 	}
 }

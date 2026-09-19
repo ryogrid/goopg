@@ -667,8 +667,11 @@ heuristic stays live.)
       rowmark retracts on empty).
     - Ledgered (`.ralph/deferral_ledger.md` tail row
       `testport/TestPort_IsolationIntraGrantInplace`).
-- [x] **testport/TestPort_IsolationStats (AI-20260905-011015-004, AI-20260914-235643-007, AI-20260916-035206-007, AI-20260917-004357-011)** — FAILed,
-  also failed previous run (same testport repro pattern).
+- [x] **testport/TestPort_IsolationStats (AI-20260905-011015-004, AI-20260914-235643-007, AI-20260916-035206-007, AI-20260917-004357-011, AI-20260920-005626-003)** — FAILed,
+  also failed previous run (same testport repro pattern). AI-…-003 re-flag
+  from run 20260920-005626 was a different signature — cluster
+  "start timeout after 20s" (env wedge, not the stats logic) — and the spec
+  PASSes at HEAD (2.25s). Stale/env repeat; no new task.
   - **DONE 2026-09-19.** Kind: impl. Movement: none (correctness fix —
     restores the pass-required spec the CSV already claims; no parity
     instrument moved). Only `n_dead_tup` diverged, in the four
@@ -703,8 +706,26 @@ heuristic stays live.)
     `restore_truncdrop_counters`); the trigger store accumulates
     `upd + del` at DML time and is cleared by an aborted truncate —
     commit math on a non-transactional counter.
-- [x] **testport/TestPort_LockRowsSortOverJoinTakesRowLock (AI-20260905-011015-005, AI-20260914-235643-008, AI-20260916-035206-009, AI-20260917-004357-013)** —
+- [x] **testport/TestPort_LockRowsSortOverJoinTakesRowLock (AI-20260905-011015-005, AI-20260914-235643-008, AI-20260916-035206-009, AI-20260917-004357-013, AI-20260920-005626-006)** —
   FAILed subtests: join_no_sort, also failed previous run.
+  - **RE-FIXED Loop \#23 (M-NIGHTLY, AI-20260920-005626-006)** — the run
+    flagged `sort_over_join` FAILing at sha `2b7e9705` (pre-dates both
+    M0143-0009/-0010); at HEAD it FAILED differently — the query returned
+    **one column** instead of two. Root cause: an M0143-0009 regression —
+    `resolveRowMarkCtidResnos` resolved the ctid's resno only against
+    `proj.Child.Output()`, but this plan carries a column-reordering
+    Project BETWEEN the top Project and the join, whose pinned schema
+    hides the leaf-injected ctid; `CtidResno` stayed -1 while
+    `NumCtidCols`=1 still fired `LockRows.Output()`'s trailing-strip,
+    dropping `balance` (and, for `FOR UPDATE` of both rels, BOTH columns).
+    Fix: new `surfaceRowMarkCtid` threads each wired ctid up through
+    schema-pinning ancestors (pass-through target appended to each
+    intermediate Project; Join/NLI/Distinct schemas rebuilt) so the resno
+    resolves, and the call site now counts `NumCtidCols` by SURFACED ctids
+    only. Both subtests PASS at the fix (5.39s — the lock now blocks and
+    wakes via the column path, EPQ returns 1050). Regression test:
+    `TestPlanCtidRowMarkDoubleProject` (optimizer). Kind: impl.
+    Movement: none.
   - **DONE 2026-09-19 (Loop \#9, ROOT-CAUSED)** — both subtests PASS (4.80s);
     join\_no\_sort now blocks on the writer's xmax and EPQ-returns 1050.
   - Root cause: the test comment was stale — the "control" query plans
@@ -1119,7 +1140,8 @@ heuristic stays live.)
   suite FAILed in `internal/optimizer`. Same root cause as the units item
   directly above (identical `GOOPG_C9DEBUG` provenance-table failure signature
   in the log); closing stale for the same reason.
-- [x] **testport/TestPort_IsolationFkContention (AI-20260917-004357-008)** — new
+- [x] **testport/TestPort_IsolationFkContention (AI-20260917-004357-008,
+  AI-20260920-005626-001)** — new
   tonight, FAILed (repro: `go test -v -run '^TestPort_IsolationFkContention$'
   ./internal/testport/`).
   RESOLVED Loop \#22 by M0143-0010 — `a53c5b807`'s index-accelerated FK
@@ -1128,15 +1150,21 @@ heuristic stays live.)
   leaves that member dead and the probe reported a false no-match (23503).
   Now walks the chain via `eachHeapChainMember` with the seq-scan twin's
   `TupleVisibleSubxact`. Spec PASSes at the fix commit.
-- [x] **testport/TestPort_IsolationFkDeadlock (AI-20260917-004357-009)** — new
+  (AI-…-001 re-flagged by run 20260920-005626 — that run's sha `2b7e9705`
+  predates the fix commit `9fb05621f`; stale repeat, no new task.)
+- [x] **testport/TestPort_IsolationFkDeadlock (AI-20260917-004357-009,
+  AI-20260920-005626-002)** — new
   tonight, FAILed (repro: `go test -v -run '^TestPort_IsolationFkDeadlock$'
   ./internal/testport/`).
   RESOLVED Loop \#22 by M0143-0010 — same `scanIndexForFKMatch` chain-root
-  blind spot; spec PASSes.
-- [x] **testport/TestPort_UpdateLockedTuple (AI-20260917-004357-012)** — new
+  blind spot; spec PASSes. (AI-…-002 re-flag: run sha `2b7e9705` predates
+  the fix; stale repeat.)
+- [x] **testport/TestPort_UpdateLockedTuple (AI-20260917-004357-012,
+  AI-20260920-005626-005)** — new
   tonight, FAILed (repro: `go test -v -run '^TestPort_IsolationUpdateLockedTuple$'
   ./internal/testport/`).
   RESOLVED Loop \#22 by M0143-0010 — same root cause; spec PASSes.
+  (AI-…-005 re-flag: run sha `2b7e9705` predates the fix; stale repeat.)
   (Remaining 12 items of this run — units/internal/parser AI-…-002,
   race/internal/executor AI-…-003, race/internal/parser AI-…-005,
   testport/TestE2E_PGColdStartOnGoopgDataDir AI-…-006,
@@ -1173,6 +1201,44 @@ heuristic stays live.)
   package that failed to compile fails every test in stages that import it),
   not independent regressions. Closing as stale; re-open if a future nightly
   reproduces the same undefined-symbol error on a clean, non-racing checkout.
+
+### Nightly run 20260920-005626 (sha `2b7e970534ea`, 18 items) — filed 2026-09-20
+- [ ] **testport/TestPort_IsolationTuplelockUpgradeNoDeadlock
+  (AI-20260920-005626-004)** — FAILed (94.52s) with a schedule diff in the
+  `s1_share s2_update s3_update …_rollback` permutation (expected `(1 row)`
+  vs got `""` at L163, then a `<waiting ...>` mismatch at L165).
+  Repro: `go test -v -run '^TestPort_IsolationTuplelockUpgradeNoDeadlock$'
+  ./internal/testport/`; evidence `ci/logs/20260920-005626/testport/go-test.log`.
+  The spec was previously filed only as a subtest of the closed
+  IsolationSuite task (nightly 20260916); this is the standalone runner's
+  failure, so it gets its own task. Failure observed at sha `2b7e9705`,
+  which predates `9fb05621f` (M0143-0010 heap-update-chain probes) — needs
+  re-verification at HEAD before diagnosing.
+- [ ] **testport/TestPort_P0E4CatalogXmaxClientKill +
+  TestPort_P0E4CatalogXmaxServerImmediateStop (AI-20260920-005626-007,
+  AI-20260920-005626-008)** — both FAILed with a server-wedge signature, not
+  a catalog-xmax signature: ClientKill "server did not settle after the
+  client was killed: context deadline exceeded" (188s) and
+  ServerImmediateStop "goopg stop: server did not exit within 20s" then a
+  1002s total runtime. Repro: `go test -v -run
+  '^TestPort_P0E4CatalogXmax(ClientKill|ServerImmediateStop)$'
+  ./internal/testport/`; evidence same log. These are the P0-E4 regression
+  tests un-skipped by P0-E5 — the catalog-loss fix holds (Rollback arm
+  PASSes) but kill/immediate-stop leave the server wedged. Same run sha
+  caveat as above.
+- [ ] **testport/TestPort_PgoutputInterop* subscriber-start failures
+  (AI-20260920-005626-009 … -018)** — ten pgoutput interop cases FAILed
+  with one signature: "subscriber start: start failed; process exited
+  early" (~2.5s each, per-test scratch cluster under
+  `tmp/nightly-src-20260920-005626/tmp/pg2g-*`): GoopgToPG, FullDML,
+  BatchDML, ReplicaIdentityFull, Truncate, ColumnOrderMismatch,
+  SubscriberExtraColumn, SubscriberExtraDefault, PgbenchInsert,
+  PgbenchTpcb. Sibling cases interleaved PASS (UnchangedToast,
+  MultiDMLXact, SavepointXact, MultiTable, ReplicaIdentityUsingIndex,
+  KillAndReconnect), so it is not a global env outage — likely a per-case
+  fixture/state trigger or a flaky start race. Repro: `go test -v -run
+  '^TestPort_PgoutputInteropPGToGoopgFullDML$' ./internal/testport/`;
+  evidence same log; each FAIL line names its cluster.log.
 
 ### Manually discovered (not yet in a nightly `ci/logs/action-items.md` run) — filed 2026-09-15
 - [x] **parser/TestLockingClauseParity** — deterministic FAIL, found while

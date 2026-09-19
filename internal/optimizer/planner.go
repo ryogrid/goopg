@@ -2239,6 +2239,18 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 		if numCtid > 0 {
 			rebaseRowMarkPlan(out, oldW)
 			resolveRowMarkCtidResnos(out, locks)
+			// NumCtidCols must count only ctids that actually surfaced into
+			// the LockRows child's output row — a leaf injection that could
+			// not thread up (schema-pinning ancestor it can't cross) occupies
+			// no position there, and counting it would make the Output()
+			// trailing-strip fallback drop a real user column.
+			// AI-20260920-005626-006.
+			numCtid = 0
+			for i := range locks {
+				if locks[i].CtidResno >= 0 {
+					numCtid++
+				}
+			}
 		}
 		// SKIP LOCKED with a LIMIT must lock rows in the LIMIT's order and stop
 		// after the LIMIT count of *successfully-locked* rows (PG plans
@@ -3026,51 +3038,25 @@ func rebaseRowMarkPlan(root Node, oldW map[Node]int) {
 // CtidResno=-1 (executor falls back to the side-channel path). M0143-0009.
 func resolveRowMarkCtidResnos(root Node, locks []LockedRel) {
 	ctidType := catalog.Type{Name: "tid"}
-	if proj, ok := root.(*Project); ok {
-		pos := map[string]int{}
-		for i, c := range proj.Child.Output() {
-			pos[c.Name] = i
-		}
-		for i := range locks {
-			if locks[i].CtidResno != -2 {
-				continue
-			}
-			name := fmt.Sprintf("ctid%d", locks[i].RowMarkId)
-			p, ok := pos[name]
-			if !ok {
-				continue
-			}
-			proj.Targets = append(proj.Targets, &ColumnRef{
-				pos:            proj.pos,
-				Index:          p,
-				Name:           name,
-				Type:           ctidType,
-				SourceTableIdx: -1,
-			})
-			proj.schema = append(proj.schema, SchemaColumn{
-				Name:           name,
-				Type:           ctidType,
-				SourceTableIdx: -1,
-				Resjunk:        true,
-			})
-		}
-	}
 	var ctidPositions []int
-	outSchema := root.Output()
 	for i := range locks {
 		if locks[i].CtidResno != -2 {
 			continue
 		}
 		name := fmt.Sprintf("ctid%d", locks[i].RowMarkId)
 		locks[i].CtidResno = -1
-		for j, c := range outSchema {
-			if c.Name == name && c.Resjunk {
-				locks[i].CtidResno = j
-				ctidPositions = append(ctidPositions, j)
-				break
-			}
+		// Thread the ctid up through schema-pinning ancestors before resolving:
+		// an intermediate Project pins its own schema, so a leaf-injected ctid
+		// never reaches the LockRows child row on its own — the lookup that
+		// used to run here against proj.Child.Output() then failed, leaving
+		// NumCtidCols > 0 with no resjunk column to strip, which dropped a real
+		// user column from the result (AI-20260920-005626-006).
+		if p := surfaceRowMarkCtid(root, name, ctidType); p >= 0 {
+			locks[i].CtidResno = p
+			ctidPositions = append(ctidPositions, p)
 		}
 	}
+	outSchema := root.Output()
 	// ColOffset names the binding's first column in the ORIGINAL merged row;
 	// a ctid inserted at the end of an earlier leaf segment shifts every
 	// binding that starts at or after it. A ctid whose final position is f
@@ -3121,6 +3107,88 @@ func resolveRowMarkCtidResnos(root Node, locks []LockedRel) {
 		}
 		locks[i].ColPos = pos
 	}
+}
+
+// surfaceRowMarkCtid returns ctidName's position in n.Output(), threading the
+// column up through schema-pinning ancestors first. A leaf-injected resjunk
+// column only propagates through nodes whose Output() derives live from the
+// child; a Project pins its own schema and needs an explicit pass-through
+// target. Returns -1 when the column cannot surface (e.g. below an
+// Aggregate/WindowAgg/OrdinalityWrap/ProjectSet, whose pinned schemas are not
+// rebuilt here) — the lock then keeps CtidResno=-1 and the executor uses the
+// walker/side-channel paths. M0143-0009 follow-up (AI-20260920-005626-006):
+// multi-Project plans buried the ctid below the top Project, so resno
+// resolution failed while NumCtidCols still counted the leaf injection and
+// LockRows' trailing-strip ate a user column.
+func surfaceRowMarkCtid(n Node, ctidName string, ctidType catalog.Type) int {
+	if n == nil {
+		return -1
+	}
+	// Nodes whose pinned schema interleaves or synthesizes columns (or, for
+	// SetOp, combines rows from two branches only one of which could carry
+	// the mark): a leaf ctid cannot be threaded through them without
+	// invalidating their own layout, and PG cannot lock rows across these
+	// boundaries anyway. Do not recurse — leave the subtree untouched.
+	switch n.(type) {
+	case *Aggregate, *WindowAgg, *OrdinalityWrap, *ProjectSet, *SetOp:
+		return -1
+	}
+	// Children first: a pinned schema rebuilt or extended below must already
+	// carry the column before this node's Output() can expose it.
+	for _, ch := range boundaryWalkChildren(n) {
+		surfaceRowMarkCtid(ch, ctidName, ctidType)
+	}
+	if p, ok := n.(*Project); ok {
+		for i, c := range p.schema {
+			if c.Name == ctidName && c.Resjunk {
+				return i
+			}
+		}
+		cp := -1
+		for i, c := range p.Child.Output() {
+			if c.Name == ctidName && c.Resjunk {
+				cp = i
+				break
+			}
+		}
+		if cp < 0 {
+			return -1
+		}
+		p.Targets = append(p.Targets, &ColumnRef{
+			pos:            p.pos,
+			Index:          cp,
+			Name:           ctidName,
+			Type:           ctidType,
+			SourceTableIdx: -1,
+		})
+		p.schema = append(p.schema, SchemaColumn{
+			Name:           ctidName,
+			Type:           ctidType,
+			SourceTableIdx: -1,
+			Resjunk:        true,
+		})
+		return len(p.schema) - 1
+	}
+	// Rebuild the pinned schemas that concat or mirror child output so a
+	// freshly-threaded column appears in this node's Output().
+	switch v := n.(type) {
+	case *Join:
+		if v.Type != JoinTypeSemi && v.Type != JoinTypeAnti {
+			v.schema = appendSchema(v.Left.Output(), v.Right.Output())
+		}
+	case *NestedLoopIndexJoin:
+		v.schema = appendSchema(v.Outer.Output(), v.Inner.Output())
+	case *Distinct:
+		v.schema = v.Child.Output()
+	case *DistinctOn:
+		v.schema = v.Child.Output()
+	}
+	for i, c := range n.Output() {
+		if c.Name == ctidName && c.Resjunk {
+			return i
+		}
+	}
+	return -1
 }
 
 // findCtidLeafSchema returns the schema of the leaf scan carrying the ctid
