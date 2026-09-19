@@ -10855,17 +10855,25 @@ goopg's processing route diverged from PG's upstream of the fix).
   `m0137-0003-baseline-capture-procedure.md` §2 if the flag flip lands after
   the doc update. The capture artefacts land in
   `analysis/m0144/` with a `docs(…)`/`analysis(…)` commit.
-- [ ] **M0144-0002 — first-divergence census** (03-forward-plan §1). Build a
-  sibling of `scripts/pg-plan-parity-diff.py` (e.g.
-  `scripts/pg-plan-first-divergence.py`, scripts-only — no `internal/`/`cmd/`
-  touch) that aligns the two normalised plan trees node-by-node in PG's
-  plan-order and emits ONE mutually-exclusive record per divergent query:
-  `(parent kind, PG child kind, goopg child kind, plan depth)`. Run it over the
-  committed captures — TPC-H parallel (`analysis/m0137/m0137-0017-parallel.*`;
-  re-capture at HEAD only if 0001's fresh pair lands first), TPC-DS SF0.25
-  latest sweep, TPC-DS SF1 (P0-E7's) — and commit the ranked frequency table
-  under `analysis/m0144/` cited from the design doc. This table replaces the
-  nine-category counts for targeting (M0137-0019 keeps the per-query write-up).
+- [x] **M0144-0002 — first-divergence census** (03-forward-plan §1).
+  **DONE 2026-09-20.** `scripts/pg-plan-first-divergence.py` built as the
+  sibling instrument (imports the differ's parser + N1–N7 normalisation +
+  category vocabulary; accepts both `=== Qn` and `===== Qn =====` section
+  styles; stop-at-first PG-order aligner, one mutually-exclusive record per
+  divergent query). Ran over all three committed corpora — TPC-H parallel
+  on the fresh M0144-0001 pair, TPC-DS SF0.25 latest sweep vs the
+  m0142-0012verify PG reference, TPC-DS SF1 on P0-E7's pair. Census MATCH
+  sets reproduce the differ's floors exactly (TPC-H Q6 1/22; SF0.25 Q9+Q41
+  2/99; SF1 Q41 1/99). Ranked tables:
+  `analysis/m0144/m0144-0002-first-divergence-census.md` (+3 raw `.txt`).
+  Headline: TPC-DS's dominant first-divergence is ordered aggregation under
+  `LIMIT` (`Limit → PG GroupAggregate/Incremental Sort vs goopg Sort`,
+  ~25 records SF0.25 / ~20 SF1 — the M0141-S7 family, now with a measured
+  blast radius); TPC-H leads with aggregation-strategy at the root/Sort
+  boundary (7/21 — the phased-agg decision the serial corpus hid).
+  Design doc:
+  `docs/design/0100-0149/m0144-0002-first-divergence-census.md`.
+  Movement: none
   Kind: recon
   Parent: none
 - [ ] **M0144-0003 — route-order verification** (owner directive 2026-09-20:
