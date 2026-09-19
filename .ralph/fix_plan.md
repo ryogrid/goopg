@@ -5929,8 +5929,10 @@ cross-layer programme that has never been scoped.
   est=3 vs actual=9969 (qerr 3323), Q25 `date_dim+store_returns` est=1 vs
   actual=6422. Gates: none beyond the gate itself (measurement-only task, no
   production code touched this loop).
-- [ ] **M0142-0005 — give the executor a per-worker Memoize so a Gather-wrapped
-  Kind: recon
+- [x] **M0142-0005 — give the executor a per-worker Memoize so a Gather-wrapped
+  Kind: recon. Movement: none (recon/measurement record only; the
+  implementation children M0142-0005a landed and M0142-0005b is filed
+  below).
   partial NLI+Memoize candidate can compete (RE-SCOPED 2026-09-16)** — the
   2026-09-16 recon (`docs/design/0100-0149/m0142-0005-recon-partial-memoize-refused-by-gather-eligibility.md`)
   found the original B6/B8 framing below is **stale**: Memoize already exists
@@ -5985,6 +5987,23 @@ cross-layer programme that has never been scoped.
   writeup: design doc's "Update 2026-09-18" section. This task (M0142-0005)
   stays as the scoping/diagnosis record; the sized implementation is filed
   as **M0142-0005a** below.
+  **B8 MEASURED 2026-09-19 (recon only, C1 — no production change)** —
+  two-arm A/B at HEAD `94c1fb6f0`, private clones, env verified via
+  `/proc/<pid>/environ` (`analysis/m0142/m0142-0005-b8-*`): the knob is
+  **still load-bearing and now corpus-tensed**. 20/99 TPC-DS SF0.25 +
+  3/22 TPC-H queries change shape between `GOOPG_INDEX_PROBE_MULT=1` and
+  `=2`. At PG's constant (1): TPC-DS `scan-type` blockers drop 59→51 and
+  `join-order` 91→88 (PG picks plain NL+`Index Scan` probes — Q73/Q34
+  `customer_pkey` — which mult=2 prices into `Bitmap Heap Scan`), but TPC-H
+  Q9/Q10/Q14 slide to NL+index probes where PG hashes — the exact class
+  `c61781d6` calibrated against. Verdict: neither dead weight nor
+  removable — the multiplier compensates an EXECUTOR gap (eager per-probe
+  TID-list materialisation vs PG's per-tuple `index_getnext_tid` +
+  `heap_fetch`), not a costing error, so no single scalar is PG-faithful
+  on both corpora. Design doc:
+  `docs/design/0100-0149/m0142-0005-b8-index-probe-mult-reverify.md`.
+  Ledger row filed 2026-09-19. The faithful exit is filed as
+  **M0142-0005b** below.
 - [x] **M0142-0005a — admit a Memoize-wrapped bare index probe as a
   Gather-driving kind.** **DONE 2026-09-19; full writeup in
   `docs/design/0100-0149/m0142-0005a-partial-memoize-nli-gather-admission.md`.**
@@ -6012,6 +6031,31 @@ cross-layer programme that has never been scoped.
   reproduced at base commit — separate task); plan-gate 14/22 = baseline
   drift (live `:65433` binary 09-19 03:11 predates the staged work, same
   count as prior loop).
+- [ ] **M0142-0005b — streamed NL index-probe executor, then retire
+  `indexProbeCostMultiplier` (the B8 exit).**
+  Parent: M0142-0005. Kind: impl.
+  The B8 re-measurement
+  (`docs/design/0100-0149/m0142-0005-b8-index-probe-mult-reverify.md`)
+  proved the `2.0` probe-cost multiplier is neither dead weight nor
+  removable: it suppresses PG-matching NL+`Index Scan` probes on TPC-DS
+  (Q73/Q34 flip to `Bitmap Heap Scan`, `scan-type` blockers 51→59) while
+  protecting TPC-H parity (mult=1 slides Q9/Q10/Q14 to NL+index where PG
+  hashes). The knob compensates an **executor** gap, not a costing error:
+  PG's `nodeIndexscan.c`/`index_getnext_tid` streams one tuple per probe
+  (`heap_fetch` per TID), while goopg materialises the full TID list per
+  probe eagerly, so the real per-probe cost is genuinely higher than PG's
+  formula predicts — the multiplier is a scalar patch over that
+  divergence. Work: (1) convert the index-probe executor to PG's
+  per-tuple streaming model (`index_getnext_tid` → `heap_fetch` → return,
+  no eager TID-list array); (2) re-measure both corpora with
+  `GOOPG_INDEX_PROBE_MULT=1` — if TPC-H Q9/Q10/Q14 keep PG's hash joins
+  AND TPC-DS keeps the mult=1 scan-type gains, retire the knob to PG's
+  1.0 (delete the flag + `c61781d6` calibration); (3) if the TPC-H
+  regression persists even with a streamed probe, the residual is a real
+  cost-model gap — file it as its own recon with the measurement, do not
+  silently keep the knob. Expected movement: TPC-DS `scan-type` −8 at
+  SF0.25 with TPC-H match held. Gates: units, tpch-spotcheck, TPC-DS
+  SF0.25 sweep, both-corpora parity captures under the cgroup wrapper.
 - [x] **M0142-0006 — apply `semiJoinMatchFraction` in `estimateNLIndexJoin`** —
   `estimateNLIndexJoin` (`cardinality.go:239-241`) returns `EstimateRows(j.Outer)` for
   SEMI/ANTI, while its sibling `estimateJoin` (`:608-625`) applies the match
