@@ -91,21 +91,40 @@ func writeExtensionCatalogRow(ctx *Context, extOID, namespaceOID uint32, name, v
 	return nil
 }
 
+// extensionScopeHeapDBOid maps an extension registry row's database scope
+// (a database NAME, "" for legacy unscoped rows) to the dbOid of the
+// pg_extension heap that holds it — the same NamespaceDBOid routing
+// writeExtensionCatalogRow used on the way in (Hard-won Rule #2: the
+// xmax stamp must land on the heap the row was written to, or the drop
+// reappears as a live row after restart). M0119-0006bs.
+func extensionScopeHeapDBOid(cat *catalog.InMemory, scopeDB string) uint32 {
+	if scopeDB != "" {
+		if oid, ok := cat.ResolveDatabaseOid(scopeDB); ok {
+			return catalog.NamespaceDBOid(oid)
+		}
+	}
+	return catalog.DefaultDBOid
+}
+
 // deleteExtensionCatalogRow stamps xmax on the extension's pg_extension row
-// (DROP EXTENSION).
-func deleteExtensionCatalogRow(ctx *Context, extOID uint32) {
+// (DROP EXTENSION) in the heap identified by heapDBOid — the scope's own
+// per-database catalog heap.
+func deleteExtensionCatalogRow(ctx *Context, extOID, heapDBOid uint32) {
 	if !catalogHeapSyncAvailable(ctx) {
 		return
 	}
 	if err := ctx.MaterializeWriterXID(); err != nil {
 		return
 	}
-	stampCatalogRows(ctx, pgExtensionRel(ctx), ctx.Tx.XID, func(data []byte) bool {
+	rel := storage.RelFileNode{DBOid: heapDBOid, RelOid: pgExtensionRelOID, Fork: storage.MainFork}
+	stampCatalogRows(ctx, rel, ctx.Tx.XID, func(data []byte) bool {
 		if len(data) < 4 {
 			return false
 		}
 		return binary.LittleEndian.Uint32(data[0:4]) == extOID
 	})
+	// Re-mirror so the base/5 copy the reload reads picks up the xmax stamp
+	// (same pattern as deleteForeignRowByOID → mirrorForeignCatalogFiles).
 	mirrorExtensionCatalogFiles(ctx)
 }
 

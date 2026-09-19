@@ -2265,11 +2265,14 @@ type Catalog interface {
 	// CreateExtension records a CREATE EXTENSION install in the runtime
 	// pg_extension registry. schema is the install namespace name (defaulted by
 	// the caller), version the extension version string. When the extension
-	// already exists it returns nil if ifNotExists is set, else an error.
-	// database scopes the install to the connecting database (pg_extension is
-	// per-database in PostgreSQL); empty means visible everywhere.
-	// M0110-0003 (amcheck SQL surface).
-	CreateExtension(name, schema, version, database string, ifNotExists bool) error
+	// already exists in the same database scope it returns (false, nil) if
+	// ifNotExists is set, else an error; created reports whether a row was
+	// actually installed so the caller can skip the heap journal + emit the
+	// "already exists, skipping" NOTICE on the no-op path. database scopes the
+	// install to the connecting database (pg_extension is per-database in
+	// PostgreSQL); empty means visible everywhere.
+	// M0110-0003 (amcheck SQL surface); per-db + created flag M0119-0006bs.
+	CreateExtension(name, schema, version, database string, ifNotExists bool) (bool, error)
 	// CreateTablespace records a CREATE TABLESPACE in the runtime tablespace
 	// registry and returns the freshly allocated OID (used by the executor to
 	// create the in-place pg_tblspc/<oid> directory). An existing name returns a
@@ -3139,8 +3142,13 @@ type InMemory struct {
 	statisticsObjs map[string]*StatisticsObject
 
 	// extensions tracks CREATE EXTENSION installs (e.g. amcheck), keyed by
-	// lowercase extension name. Backs the pg_extension virtual catalog read by
-	// pg_amcheck's "is amcheck installed?" probe. M0110-0003.
+	// database scope + "\x00" + lowercase extension name — pg_extension is a
+	// per-database catalog, so the same extname installed in two databases
+	// holds two rows (upstream: pg_extension_name_index constrains within one
+	// database only). The empty database scope ("") marks legacy/direct-call
+	// inserts visible in every database. Backs the pg_extension virtual
+	// catalog read by pg_amcheck's "is amcheck installed?" probe.
+	// M0110-0003; per-db keying M0119-0006bs.
 	extensions map[string]*extensionRow
 
 	// tablespaces tracks CREATE TABLESPACE in-place tablespaces, keyed by
@@ -5539,6 +5547,14 @@ func (c *InMemory) DropDatabase(name string) error {
 	delete(c.databaseEncoding, name)
 	delete(c.databaseOwner, name)
 	delete(c.databaseOid, name)
+	// Purge extension rows scoped to the dropped database — otherwise a
+	// recreated same-name database inherits phantom installs (pg_extension
+	// shows them and CREATE EXTENSION conflicts 42710). M0119-0006bs.
+	for k, e := range c.extensions {
+		if e.database == name {
+			delete(c.extensions, k)
+		}
+	}
 	return nil
 }
 
@@ -5574,6 +5590,15 @@ func (c *InMemory) RenameDatabase(oldName, newName string) bool {
 	if v, ok := c.databaseOid[oldName]; ok {
 		delete(c.databaseOid, oldName)
 		c.databaseOid[newName] = v
+	}
+	// Re-key extension rows scoped to the renamed database so the installs
+	// follow the database (pg_extension is per-database). M0119-0006bs.
+	for k, e := range c.extensions {
+		if e.database == oldName {
+			delete(c.extensions, k)
+			e.database = newName
+			c.extensions[extensionRegistryKey(newName, strings.ToLower(e.name))] = e
+		}
 	}
 	return true
 }
@@ -13828,37 +13853,86 @@ func (c *InMemory) DropCastDuringRecovery(source, target string) {
 // pg_extension registry. Called from the executor's execCreateExtension after
 // it has validated the extension name and resolved the default version/schema.
 // M0110-0003.
-func (c *InMemory) CreateExtension(name, schema, version, database string, ifNotExists bool) error {
+func (c *InMemory) CreateExtension(name, schema, version, database string, ifNotExists bool) (bool, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	lc := strings.ToLower(name)
-	if _, ok := c.extensions[lc]; ok {
-		if ifNotExists {
-			return nil
+	// Per-database uniqueness (pg_extension_name_index constrains within one
+	// database): a same-named row conflicts iff its scope overlaps the
+	// install scope — an unscoped row is visible in every database, and an
+	// unscoped install would collide with every database's row.
+	for _, e := range c.extensions {
+		if strings.ToLower(e.name) == lc && (e.database == "" || database == "" || e.database == database) {
+			if ifNotExists {
+				return false, nil
+			}
+			return false, fmt.Errorf("extension %q already exists", name)
 		}
-		return fmt.Errorf("extension %q already exists", name)
 	}
 	if schema == "" {
 		schema = "public"
 	}
 	c.nextOID++
-	c.extensions[lc] = &extensionRow{
+	c.extensions[extensionRegistryKey(database, lc)] = &extensionRow{
 		oid:      c.nextOID,
 		name:     name,
 		schema:   schema,
 		version:  version,
 		database: database,
 	}
+	return true, nil
+}
+
+// extensionRegistryKey builds the c.extensions map key for (database, lcname).
+// M0119-0006bs.
+func extensionRegistryKey(database, lcname string) string {
+	return database + "\x00" + lcname
+}
+
+// extensionForDBLocked resolves the registry row for name visible in database
+// scope `database`: the exact-scope row, else the unscoped row, else — when
+// database == "" — the first same-named row (matching extensionRowsLocked's
+// "empty filter shows all" convention for embedded/test callers). Must hold
+// c.mu (R or W). M0119-0006bs.
+func (c *InMemory) extensionForDBLocked(name, database string) *extensionRow {
+	lc := strings.ToLower(name)
+	if e, ok := c.extensions[extensionRegistryKey(database, lc)]; ok {
+		return e
+	}
+	if e, ok := c.extensions[extensionRegistryKey("", lc)]; ok {
+		return e
+	}
+	if database == "" {
+		for _, e := range c.extensions {
+			if strings.ToLower(e.name) == lc {
+				return e
+			}
+		}
+	}
 	return nil
 }
 
-// DropExtension removes a runtime pg_extension entry (DROP EXTENSION).
-// The caller (execDropCompat) has already validated the extension exists and
-// captured its OID for heap cleanup.
-func (c *InMemory) DropExtension(name string) {
+// DropExtension removes a runtime pg_extension entry (DROP EXTENSION),
+// scoped to database — upstream drops only the current database's
+// pg_extension row. An unscoped row (database == "") visible in `database`
+// is removed as well. Returns the removed row's OID and scope so the caller
+// can stamp xmax on the heap that holds it. The caller (execDropCompat) has
+// already validated the extension exists in this database.
+// M0119-0006bs: per-database scoping.
+func (c *InMemory) DropExtension(name, database string) (uint32, string, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	delete(c.extensions, strings.ToLower(name))
+	lc := strings.ToLower(name)
+	key := extensionRegistryKey(database, lc)
+	if _, ok := c.extensions[key]; !ok {
+		key = extensionRegistryKey("", lc)
+		if _, ok := c.extensions[key]; !ok {
+			return 0, "", false
+		}
+	}
+	e := c.extensions[key]
+	delete(c.extensions, key)
+	return e.oid, e.database, true
 }
 
 // CreateExtensionDuringRecovery re-registers an extension at startup from the
@@ -13869,26 +13943,32 @@ func (c *InMemory) CreateExtensionDuringRecovery(name, schema, version, database
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	lc := strings.ToLower(name)
-	if _, ok := c.extensions[lc]; ok {
-		return // already registered
+	key := extensionRegistryKey(database, lc)
+	if _, ok := c.extensions[key]; ok {
+		return // already registered for this database scope
 	}
-	c.extensions[lc] = &extensionRow{
+	c.extensions[key] = &extensionRow{
 		oid:      oid,
 		name:     name,
 		schema:   schema,
 		version:  version,
 		database: database,
 	}
+	if oid >= c.nextOID {
+		c.nextOID = oid + 1
+	}
 }
 
-// ExtensionOID returns the runtime pg_extension OID for the named extension, or
-// 0 if no extension by that name is installed. Used by COMMENT ON EXTENSION to
-// key the pg_description row on the extension's catalog OID (classoid 3079) so
-// pg_dump's dumpExtension can re-emit the comment. DU-002 slice 388.
-func (c *InMemory) ExtensionOID(name string) uint32 {
+// ExtensionOID returns the runtime pg_extension OID for the named extension
+// installed in database scope `database`, or 0 if no extension by that name is
+// installed there. Used by COMMENT ON EXTENSION to key the pg_description row
+// on the extension's catalog OID (classoid 3079) so pg_dump's dumpExtension
+// can re-emit the comment. DU-002 slice 388. M0119-0006bs: database scopes the
+// lookup (pg_extension is per-database); "" resolves any same-named row.
+func (c *InMemory) ExtensionOID(name, database string) uint32 {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	if e, ok := c.extensions[strings.ToLower(name)]; ok {
+	if e := c.extensionForDBLocked(name, database); e != nil {
 		return e.oid
 	}
 	return 0

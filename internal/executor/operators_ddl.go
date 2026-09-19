@@ -266,14 +266,24 @@ func (o *ddlOp) execCreateExtension(s *parser.CreateExtensionStmt) error {
 	if schema == "" {
 		schema = "public"
 	}
-	if err := o.ctx.Catalog.CreateExtension(s.Name, schema, version, o.ctx.CurrentDatabase, s.IfNotExists); err != nil {
+	created, err := o.ctx.Catalog.CreateExtension(s.Name, schema, version, o.ctx.CurrentDatabase, s.IfNotExists)
+	if err != nil {
 		// Only failure mode is a duplicate without IF NOT EXISTS.
 		return &ExecError{Code: "42710", Pos: s.Pos(), Message: err.Error()}
+	}
+	if !created {
+		// IF NOT EXISTS on an installed extension: upstream CreateExtension
+		// (commands/extension.c) returns before any catalog insert after
+		// ereport(NOTICE, "extension \"%s\" already exists, skipping").
+		// Skipping also keeps a duplicate row out of the pg_extension heap.
+		// M0119-0006bs.
+		o.ctx.AddNotice(fmt.Sprintf("extension %q already exists, skipping", s.Name))
+		return nil
 	}
 	// M0130-S3: journal the extension as a real pg_extension heap row
 	// so it survives restart and is visible on a PG standby.
 	if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
-		extOID := im.ExtensionOID(s.Name)
+		extOID := im.ExtensionOID(s.Name, o.ctx.CurrentDatabase)
 		nsOID := im.SchemaOID(schema)
 		if err := writeExtensionCatalogRow(o.ctx, extOID, nsOID, s.Name, version); err != nil {
 			return fmt.Errorf("pg_extension journal: %w", err)
@@ -21731,7 +21741,7 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 			// heap row so the drop survives restart.
 			if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
 				name := s.Names[0].String()
-				extOID := im.ExtensionOID(name)
+				extOID := im.ExtensionOID(name, o.ctx.CurrentDatabase)
 				if extOID == 0 {
 					if s.IfExists {
 						o.ctx.AddNotice(fmt.Sprintf("extension %q does not exist, skipping", name))
@@ -21739,9 +21749,11 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 					}
 					return &ExecError{Code: "42704", Pos: s.Pos(), Message: fmt.Sprintf("extension %q does not exist", name)}
 				}
-				im.DropExtension(name)
+				// The row's recorded scope names the heap that holds it
+				// (pg_extension is per-database; M0119-0006bs).
+				_, scopeDB, _ := im.DropExtension(name, o.ctx.CurrentDatabase)
 				if catalogHeapSyncAvailable(o.ctx) {
-					deleteExtensionCatalogRow(o.ctx, extOID)
+					deleteExtensionCatalogRow(o.ctx, extOID, extensionScopeHeapDBOid(im, scopeDB))
 				}
 				return nil
 			}
@@ -24090,7 +24102,7 @@ func (o *ddlOp) execCommentOn(s *parser.CommentOnStmt) error {
 		// keys the comment lookup on the extension's catalogId
 		// (tableoid=pg_extension=3079) and objsubid 0, then re-emits
 		// `COMMENT ON EXTENSION <name> IS '...'`. DU-002 slice 388.
-		oid := im.ExtensionOID(s.ObjName.Name)
+		oid := im.ExtensionOID(s.ObjName.Name, o.ctx.CurrentDatabase)
 		if oid == 0 {
 			return &ExecError{Code: "42704", Pos: s.Pos(),
 				Message: fmt.Sprintf("extension %q does not exist", s.ObjName.Name)}

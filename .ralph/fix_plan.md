@@ -1434,6 +1434,57 @@ the whole file's active task between 2026-09-01 and 2026-09-14; **since
       `--heapallindexed --rootdescend` exit 0 (rootdescend still a
       call-shape-accepted no-op — upstream gates it to heapkeyspace v4).
     - Design: `docs/design/0100-0149/0119-0006br-heapallindexed-former-wiring.md`.
+  - 2026-09-20 (bs): resolved the 2026-09-02 ledger row — whole-database
+    `pg_amcheck -d <CREATE DATABASE'd db>` now exits 0 clean.
+    - The row's recorded root cause (system catalogs registered only under
+      `DefaultDBOid`, so `verify_heapam(1259)` failed `LookupTableByOID`) was
+      already fixed at HEAD by 0119-0006bp (`tableByOID` pg_catalog fallback)
+      + M0122-0007 4e (name-based fallback). The live blocker sat EARLIER in
+      the chain: `pg_extension` reads were per-db scoped (M0110-0003) but the
+      registry write side was global — `c.extensions` keyed by lowercase name
+      only, so `CREATE EXTENSION amcheck` failed 42710 in any second database
+      and pg_amcheck's per-db install probe (`pg_amcheck.c:174`) correctly
+      reported "not installed".
+    - Landed: registry re-keyed `(database, name)` with scope-overlap conflict
+      (unscoped legacy rows stay globally visible); `DropExtension`/
+      `ExtensionOID` take the connecting database; `DropDatabase` purges and
+      `RenameDatabase` re-keys scoped rows; `CreateExtension` returns a
+      `created` flag so `IF NOT EXISTS` emits upstream's "already exists,
+      skipping" NOTICE and skips the heap journal (previously journaled a
+      duplicate row); `deleteExtensionCatalogRow` stamps the row's own
+      scope heap + re-mirrors (sibling-path parity with the write route).
+    - Review surfaced a worse pre-existing bug: `reloadUserExtensionsFromHeap`
+      was dead code — its only call site was nested inside the pg_collation
+      reload's error branch after the pool had been closed, so NO extension
+      survived restart in ANY database. The call is hoisted to the success
+      path and now scans each registered database's `base/<oid>/3079`,
+      attributing rows to the owning db name.
+    - Verified live on a private scratch cluster (:5533): whole-database
+      `pg_amcheck` exit 0 on two `CREATE DATABASE`'d databases including
+      `--heapallindexed`; per-db `pg_extension` scoping survives a restart;
+      `DROP EXTENSION` removes only the current db's row (second drop 42704).
+    - Gates: 4 new/extended per-db registry tests in
+      `internal/catalog/extension_perdb_test.go`; `go test` catalog + initdb +
+      executor + testport (`TestPort_PgAmcheck004`/`001`/`AmcheckCreateExtension`)
+      PASS; `RALPH_PRECOMMIT_SCOPE=units` PASS.
+    - Design: `docs/design/0100-0149/0119-0006bs-per-database-extension-registry.md`.
+    - Recorded-not-fixed (in the doc's deferral list): template0 is
+      connectable so a `CREATE EXTENSION` there writes base/4 and would be
+      cloned into future `CREATE DATABASE`s; a template1 install re-attributes
+      to "postgres" on restart (shared bootstrap namespace); user-db-local
+      `extnamespace` falls back to "public" at reload.
+    - ⚠️ COMMIT-BLOCKED (2026-09-20): the bs slice is complete, staged and
+      green (units PASS; tpcds-sf025 sweep PASS=96/0 mismatch/0 shape
+      changes; live scratch verified) but cannot commit — the owner placed
+      `bench/tpch/runtime_goopg/data.HOLD` (OWNER-PLANNED-RELOAD,
+      M0142-0003i canonical 8-FK rebuild) at 05:48 today and the HammerDB
+      reload was still running at loop end. tpch-spotcheck and
+      tpch-acceptance-arm stamp SKIP-BLOCKED and `.ralph/gate-exceptions.md`
+      has NO row for this task — commit-msg rejects any `internal/` commit
+      until the owner lifts the HOLD or adds an exception row. Resume:
+      commit the staged index (files listed in `.ralph/working_set.md`) once
+      the HOLD lifts — re-run the two TPC-H gates first, and the body needs
+      a `PARITY: N/A` line (catalog/DDL-registry change, no plan paths).
 > This task list is **seeded, not exhaustive.** M0119-0001 triage plus every future
 > deferral-ledger entry (any new `status = -` row) feed additional M0119 tasks over
 > time; the milestone's living nature means it need not be complete at filing.

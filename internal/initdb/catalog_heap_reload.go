@@ -3346,17 +3346,45 @@ func reloadUserAccessMethodsFromHeap(mgr *storage.Manager, cat *catalog.InMemory
 }
 
 // reloadUserExtensionsFromHeap (M0130-S3) is the pg_extension reload —
-// reads base/*/3079 to reconstruct the in-memory runtime extension registry
-// after a restart. Each row maps onto the catalog extensionRow.
+// reconstructs the in-memory runtime extension registry after a restart.
+// pg_extension is per-database, so this scans base/<DBOID()>/3079 (the
+// bootstrap postgres/template1 shared scope, attributed "postgres") plus
+// base/<oid>/3079 of every registered user database (M0119-0006bs) —
+// installs made while connected to a CREATE DATABASE'd database journal
+// into that database's own heap dir and would otherwise vanish on
+// restart. Runs after reloadDatabasesFromHeap so cat.ListDatabases() is
+// populated. Each row maps onto the catalog extensionRow.
 func reloadUserExtensionsFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *transam.CLog) error {
+	if cat == nil {
+		return nil
+	}
+	if err := reloadUserExtensionsFromHeapForDB(mgr, cat, clog, cat.DBOID(), "postgres"); err != nil {
+		return err
+	}
+	for _, dbName := range cat.ListDatabases() {
+		dbOid := cat.DatabaseOid(dbName)
+		if dbOid == 0 || dbOid == catalog.DefaultDBOid ||
+			dbOid == catalog.PostgresDBOid || dbOid == cat.DBOID() {
+			continue
+		}
+		if err := reloadUserExtensionsFromHeapForDB(mgr, cat, clog, dbOid, dbName); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// reloadUserExtensionsFromHeapForDB scans base/<heapDBOid>/3079 and
+// re-registers each live row scoped to dbName. A missing/empty heap is a
+// no-op.
+func reloadUserExtensionsFromHeapForDB(mgr *storage.Manager, cat *catalog.InMemory, clog *transam.CLog, heapDBOid uint32, dbName string) error {
 	extCols := executor.PGExtensionColumnsPG18()
-	rel := storage.RelFileNode{DBOid: cat.DBOID(), RelOid: 3079, Fork: storage.MainFork}
+	rel := storage.RelFileNode{DBOid: heapDBOid, RelOid: 3079, Fork: storage.MainFork}
 	type extRec struct {
 		oid     uint32
 		name    string
 		schema  string
 		version string
-		dbName  string
 	}
 	rows, err := scanCatalogHeapRows(mgr, rel, clog, "pg_extension",
 		func(ht storage.HeapTuple, tid storage.ItemPointer) (any, bool, error) {
@@ -3375,7 +3403,6 @@ func reloadUserExtensionsFromHeap(mgr *storage.Manager, cat *catalog.InMemory, c
 				name:    decoded[1].StringValue(),
 				schema:  schema,
 				version: decoded[5].StringValue(),
-				dbName:  "", // database is per-catalog reload scope
 			}, false, nil
 		})
 	if err != nil {
@@ -3383,7 +3410,7 @@ func reloadUserExtensionsFromHeap(mgr *storage.Manager, cat *catalog.InMemory, c
 	}
 	for _, raw := range rows {
 		r := raw.(extRec)
-		cat.CreateExtensionDuringRecovery(r.name, r.schema, r.version, "", r.oid)
+		cat.CreateExtensionDuringRecovery(r.name, r.schema, r.version, dbName, r.oid)
 	}
 	return nil
 }

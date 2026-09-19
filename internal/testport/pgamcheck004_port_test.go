@@ -220,12 +220,9 @@ func TestPort_PgAmcheck004VerifyHeapam(t *testing.T) {
 	if err := c.Start(); err != nil {
 		t.Fatalf("restart cluster after corruption: %v", err)
 	}
-	// CREATE EXTENSION amcheck records its install in runtime-only state
-	// (per-database pg_extension scoping, gap #7c), which does not survive a
-	// server restart; re-install it so pg_amcheck's per-database probe finds it.
-	if err := runSQLSimple(t, c, "CREATE EXTENSION amcheck"); err != nil {
-		t.Fatalf("re-CREATE EXTENSION amcheck after restart: %v", err)
-	}
+	// The CREATE EXTENSION install survives the restart (M0119-0006bs:
+	// pg_extension heap reload now runs on the success path, per-database),
+	// so pg_amcheck's per-database probe finds it without a re-install.
 
 	// Post-corruption run: pg_amcheck must report the page-structural corruption
 	// on stdout and exit 2 (pg_amcheck's "corruption found" exit status).

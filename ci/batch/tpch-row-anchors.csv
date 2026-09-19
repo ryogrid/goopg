@@ -4,10 +4,10 @@ Q5,5,structural,any,GROUP BY n_name over ASIA region = 5 nations
 Q9,175,structural,any,nation x year groups (25 x 7)
 Q12,2,structural,any,GROUP BY l_shipmode IN (MAIL;SHIP) = 2 rows (spotcheck invariant)
 Q22,7,structural,any,7 country-code groups
-Q13,34,pinned,20260826,bench/tpch/spotcheck_expected.env (re-pinned 2026-08-26 reload; load-dependent — re-pin after every reload)
-Q3,11521,load-dependent,20260727,tmp/tpch-runner anchor pass on the 2026-07-27 HammerDB reload (build_goopg_20260727-192854.log; tables live in PERSISTENT db tpch)
-Q10,20501,load-dependent,20260727,tmp/tpch-runner anchor pass 2026-07-27
-Q11,819,load-dependent,20260727,tmp/tpch-runner anchor pass 2026-07-27
-Q16,18213,load-dependent,20260727,tmp/tpch-runner anchor pass 2026-07-27
-Q18,10,load-dependent,20260727,tmp/tpch-runner anchor pass 2026-07-27
-Q21,405,load-dependent,20260727,tmp/tpch-runner anchor pass 2026-07-27; NOTE: at S-cold (per-DB ANALYZE gap - see ledger bench-reorg ANALYZE-scope) Q21 needs GC enabled: with GOGC=off-style growth under GOMEMLIMIT=18GiB it reached 19.8G RSS and drew a host-level OOM kill; at GOGC=100 + GOMEMLIMIT=12GiB it completes in ~231s
+Q13,33,pinned,20260920,bench/tpch/spotcheck_expected.env (re-pinned 2026-09-20 reload — first canonical-8-FK load; load-dependent — re-pin after every reload)
+Q3,11354,load-dependent,20260920,tpch-runner anchor pass on the 2026-09-20 HammerDB reload (canonical 8-FK schema; lineitem=6,001,726)
+Q10,20421,load-dependent,20260920,tpch-runner anchor pass 2026-09-20 (8-FK reload)
+Q11,755,load-dependent,20260920,tpch-runner anchor pass 2026-09-20 (8-FK reload)
+Q16,18215,load-dependent,20260920,tpch-runner anchor pass 2026-09-20 (8-FK reload)
+Q18,11,load-dependent,20260920,tpch-runner anchor pass 2026-09-20 (8-FK reload)
+Q21,412,load-dependent,20260920,tpch-runner anchor pass 2026-09-20 (8-FK reload); NOTE: Q21 completed in ~2.6s on the FK-bearing cluster — the earlier ~231s figure was the FK-less cluster's plan; GC caveat retained: at GOGC=off-style growth under GOMEMLIMIT=18GiB Q21 reached 19.8G RSS and drew a host-level OOM kill; GOGC=100 + GOMEMLIMIT=12GiB is the proven-safe envelope
