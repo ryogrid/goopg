@@ -31,9 +31,12 @@
 //     `ExecParallelRetrieveInstrumentation` and merges it into the leader's).
 //     TPC-H Q9 — the chain 09 §5 states its acceptance criterion on — plans
 //     entirely below a Gather, so it is unmeasurable in a parallel plan.
-//     --serial (default) therefore sets `max_parallel_workers_per_gather = 0`
+//     -serial=true therefore sets `max_parallel_workers_per_gather = 0`
 //     on the audit session. The audited join TREE is the same one the
-//     parallel plan builds; only the Gather disappears.
+//     parallel plan builds; only the Gather disappears. Parallel is the
+//     default since M0144-0001 (owner decision 2026-09-20: TPC-H parity is
+//     measured in parallel mode); -serial=true remains for the EXECUTED
+//     estimate audit, whose actual-rows instrumentation needs it.
 //   - goopg's ANALYZE statistics are PER-CONNECTION, and a bare `ANALYZE;`
 //     is a no-op: without an explicit `ANALYZE <table>` for each table in the
 //     SAME session, the planner estimates blind and the audit measures the
@@ -290,7 +293,7 @@ func parseFlags(args []string) *flags {
 	fs.Float64Var(&f.finalMax, "final-max", estimateaudit.DefaultFinalJoinMax, "tighter bar on Q9's final joinrel (09 §5)")
 	fs.BoolVar(&f.failOn, "fail-on-violation", true, "exit 1 when a joinrel is over threshold")
 	fs.BoolVar(&f.keepPlan, "keep-plans", true, "also write the raw EXPLAIN ANALYZE text next to the report")
-	fs.BoolVar(&f.serial, "serial", true, "disable parallel workers (nodes under a Gather report no actual rows)")
+	fs.BoolVar(&f.serial, "serial", false, "disable parallel workers (executed-audit mode: nodes under a Gather report no actual rows)")
 	fs.BoolVar(&f.analyze, "warm-stats", true, "ANALYZE each TPC-H table on the audit session first (goopg stats are per-connection)")
 	fs.StringVar(&f.fromPlans, "from-plans", "", "replay a committed <label>.plans.txt instead of connecting to goopg")
 	fs.StringVar(&f.refPlans, "reference", "", "PG 18.3 reference plans file for the 09 §4 parity gate")

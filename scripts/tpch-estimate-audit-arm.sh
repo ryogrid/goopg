@@ -190,7 +190,7 @@ verify_served_binary || exit 6
 
 # Pin serial mode explicitly: this arm's contract (header comment ~line 40)
 # is an EXECUTED serial run with max_parallel_workers_per_gather=0, and
-# `estimate-audit`'s -serial default is slated to flip to false (M0144-0001).
+# `estimate-audit`'s -serial default flipped to false in M0144-0001.
 # A caller may still override via trailing args.
 audit_args=(-host "${PG_HOST}" -port "${PG_PORT}" --label "${LABEL}" --timeout "${PER_Q}" -serial=true)
 [[ -n "${REFERENCE}" ]] && audit_args+=(--reference "${REFERENCE}")
