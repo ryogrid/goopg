@@ -5697,28 +5697,33 @@ cross-layer programme that has never been scoped.
   writeup: design doc's "Update 2026-09-18" section. This task (M0142-0005)
   stays as the scoping/diagnosis record; the sized implementation is filed
   as **M0142-0005a** below.
-- [ ] **M0142-0005a — admit a Memoize-wrapped bare index probe as a
-  Gather-driving kind.**
-  Parent: M0142-0005. Extend the three sibling
-  admission checks named in M0142-0005's 2026-09-18 update
-  (`partialPathDrivingKind`'s `PathNestLoop` lateral-probe branch,
-  `lateralProbeIsPartialProbe`, `lateralProbeJoinPartial`) to accept
-  `in.Kind == PathMemoize` / `*memoizeOp` by unwrapping to the wrapped child
-  (`Children[0]` / `memoizeOp.child`) and running the existing bare-IndexScan
-  check on that child instead of refusing outright — `pattern_sibling_paths_must_agree`
-  applies across all three. Expected movement (S5): TPC-DS Q34/Q73 flip from
-  `Hash Join` to `Gather`+`Nested Loop`+`Memoize`+`Index Scan`
-  (`bench/tpcds/plans-pg/Q34.txt`/`Q73.txt` are the PG targets), confirmed by
-  re-running Finding 2's `GOOPG_PGSHAPED_DP_TRACE=1` Q34 trace (a
-  `producer=gather` DPPATH line must now appear for relset
-  `{date_dim+household_demographics+store_sales}`) and the TPC-DS SF0.25
-  `pg-plan-parity-diff.py` category count (`join-order`/`aggregation-strategy`
-  bucket, whichever Q34/Q73 currently sit in — confirm at implementation
-  time). Gates: `scripts/tpcds-sf025-regression.sh sweep` +
-  `go test ./internal/optimizer/... ./internal/executor/...` +
-  `scripts/tpch-spotcheck.sh` (the latter is **blocked** by the `:65433`
-  catalog-loss hold — not selectable until P0-E6 clears; do not attempt a
-  substitute per G1).
+- [x] **M0142-0005a — admit a Memoize-wrapped bare index probe as a
+  Gather-driving kind.** **DONE 2026-09-19; full writeup in
+  `docs/design/0100-0149/m0142-0005a-partial-memoize-nli-gather-admission.md`.**
+  One correction to the spec above: the memoized NLI is the FUSED
+  `*NestedLoopIndexJoin{InnerMemo}` node, not `Join{Right:*Memoize}` —
+  `createPlan` panics on a free-standing `PathMemoize`, so
+  `lateralProbeIsPartialProbe`/`lateralProbeJoinPartial` `*Memoize`/`*memoizeOp`
+  cases would be dead code (attempted, verified unreachable, reverted). What
+  landed: `partialPathDrivingKind`'s `PathNestLoop` arm unwraps one
+  `PathMemoize` layer and re-runs the bare-probe check (SetOp-branch arm
+  mirrors it); new exported `NestedLoopIndexJoinIsPartialCapable` is the
+  single verdict re-run by the new `*NestedLoopIndexJoin`/
+  `*nestedLoopIndexJoinOp` arms in `drivingScan`/`stampParallelScan`/
+  `unstampParallelScan`/`HasShareableHashJoin`/`drivingScanCrossesSort` and
+  `attachParallelScan`/`attachParallelBitmapScan`/`attachParallelIndexScan`/
+  `collectShareableJoins`/`collectBitmapScans` — outer-only claim descent,
+  per-worker memoizeOp/kvcache (PG parity: `nodeMemoize.c` DSM carries only
+  instrumentation). Verified: Q34 `GOOPG_PGSHAPED_DP_TRACE` accepted
+  `producer=gather` lines (`{0,1,2,3}` rows=136 = the emitted Gather);
+  SF0.25 sweep PASS=96 MISMATCH=0 (stamped) with **Q34/Q73 flipped to the
+  exact PG reference shapes**; acceptance-arm PASS 24/24 vs
+  `/tmp/arm-0006c3-staged.txt` (stamped); tpch-spotcheck PASS Q12=2/Q13=34
+  (stamped); units green; new-test `-race` green. `make race-gate` red at
+  HEAD = pre-existing instrumentScope race (`M-NIGHTLY-instrumentscope-race-fix`,
+  reproduced at base commit — separate task); plan-gate 14/22 = baseline
+  drift (live `:65433` binary 09-19 03:11 predates the staged work, same
+  count as prior loop).
 - [x] **M0142-0006 — apply `semiJoinMatchFraction` in `estimateNLIndexJoin`** —
   `estimateNLIndexJoin` (`cardinality.go:239-241`) returns `EstimateRows(j.Outer)` for
   SEMI/ANTI, while its sibling `estimateJoin` (`:608-625`) applies the match

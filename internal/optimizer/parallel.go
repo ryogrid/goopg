@@ -642,6 +642,20 @@ func stampParallelScan(n Node) Node {
 		c := *x
 		c.Right = right
 		return &c
+	case *NestedLoopIndexJoin:
+		// M0142-0005a: mirror of the drivingScan arm — partial through the
+		// OUTER side only; the inner probe takes no stamp (it re-opens per
+		// worker-local outer row and is not a partitioned scan).
+		if !NestedLoopIndexJoinIsPartialCapable(x) {
+			return n
+		}
+		outer := stampParallelScan(x.Outer)
+		if outer == x.Outer {
+			return x
+		}
+		c := *x
+		c.Outer = outer
+		return &c
 	case *SetOp:
 		// M0140-0006c: mirror of the drivingScan *SetOp arm — BOTH branches
 		// are stamped, not just one side, since a partial SetOp streams
@@ -754,6 +768,21 @@ func drivingScan(n Node) Node {
 			return drivingScan(x.Left)
 		}
 		return drivingScan(x.Right)
+	case *NestedLoopIndexJoin:
+		// M0142-0005a: the fused NLI (the memoized probe shape — InnerMemo
+		// is a field on this node, not a child) is partial through its
+		// OUTER side only — the same side the lateral-probe *Join arm
+		// descends. The inner probe re-opens per worker-local outer row
+		// (BindOuter/Rescan) and takes no claim; each worker's
+		// memoizeOp/kvcache is private by construction, so the cache is
+		// not a shared-state problem here. PG files exactly this shape:
+		// try_partial_nestloop_path over the get_memoize_path inner
+		// (joinpath.c:2194-2199) is TPC-DS Q34/Q73's
+		// `Gather > Nested Loop > Memoize > Index Scan`.
+		if !NestedLoopIndexJoinIsPartialCapable(x) {
+			return nil
+		}
+		return drivingScan(x.Outer)
 	case *SetOp:
 		// M0140-0006c. A partial SetOp streams BOTH branches (unlike a
 		// join, which is partial through one side only), so BOTH must
@@ -815,6 +844,17 @@ func drivingScanCrossesSort(n Node) bool {
 			return drivingScanCrossesSort(x.Left)
 		}
 		return drivingScanCrossesSort(x.Right)
+	case *NestedLoopIndexJoin:
+		// M0142-0005a: drivingScan descends the capable NLI's outer, so
+		// the Sort check must follow the same path — a Sort between the
+		// join and its driving scan means per-worker sorts under a plain
+		// Gather. (Unreachable from findPartialSubtree today —
+		// terminatesPartial fires first — kept guard-for-guard with
+		// drivingScan so the two can never disagree.)
+		if !NestedLoopIndexJoinIsPartialCapable(x) {
+			return false
+		}
+		return drivingScanCrossesSort(x.Outer)
 	}
 	return false
 }
@@ -882,6 +922,16 @@ func HasShareableHashJoin(n Node) bool {
 			return false
 		}
 		return true
+	}
+	if x, ok := n.(*NestedLoopIndexJoin); ok {
+		// M0142-0005a: hashes below an approved fused NLI outer are
+		// leader-prebuilt — descend the outer literally, exactly like the
+		// *Join arm above. A non-capable NLI reports "nothing shareable":
+		// drivingScan refuses it anyway, so no partial path can carry it.
+		if NestedLoopIndexJoinIsPartialCapable(x) {
+			return HasShareableHashJoin(x.Outer)
+		}
+		return false
 	}
 	for _, c := range parallelChildren(n) {
 		if HasShareableHashJoin(c) {
@@ -1012,6 +1062,11 @@ func mergeJoinIsPartialCapable(p *Join) bool {
 // site (operators_index.go); range bounds are refused as
 // scope-minimization (Q96's probe is equality). An IndexOnlyScan has no
 // SAOP shape (promotion declines it), so only the range half applies.
+//
+// The same probe-shape check guards the fused NLI's Inner
+// (NestedLoopIndexJoinIsPartialCapable, M0142-0005a): a *NestedLoopIndexJoin
+// never carries the cache as a child — InnerMemo is a field on the join —
+// so the check sees the bare probe below it, exactly as here.
 func lateralProbeIsPartialProbe(n Node) bool {
 	switch x := n.(type) {
 	case *IndexScan:
@@ -1050,10 +1105,12 @@ func lateralProbeIsPartialProbe(n Node) bool {
 // CROSS/SEMI/ANTI/LEFT/RIGHT/FULL refused as scope-minimization), the
 // bare probe above (no wrappers — the BuildFast bridge implements
 // `lateralBindable` unconditionally, so a wrapped probe would double-bind;
-// no Memoize — covers R60's `getMemoizePath` loop output; no bitmap),
-// non-nil children. General lateral subtrees (aggregates, SRFs,
-// CTE-dependent inners) are refused: those are separate node shapes with
-// unmodelled per-worker semantics.
+// no Memoize — R60's `getMemoizePath` loop output never reaches this node
+// type: it emits the fused `*NestedLoopIndexJoin` instead, whose own
+// sibling check is NestedLoopIndexJoinIsPartialCapable (M0142-0005a);
+// no bitmap), non-nil children. General lateral subtrees (aggregates,
+// SRFs, CTE-dependent inners) are refused: those are separate node
+// shapes with unmodelled per-worker semantics.
 func lateralProbeJoinIsPartialCapable(p *Join) bool {
 	if p == nil || p.Algo != JoinAlgoNestedLoop || !p.Lateral {
 		return false
@@ -1065,6 +1122,44 @@ func lateralProbeJoinIsPartialCapable(p *Join) bool {
 		return false
 	}
 	return lateralProbeIsPartialProbe(p.Right)
+}
+
+// NestedLoopIndexJoinIsPartialCapable states which fused NLI shapes may run
+// with a partial OUTER side (M0142-0005a): the join PG's
+// `try_partial_nestloop_path` builds when its inner is the cheapest
+// parameterized path — INCLUDING the `get_memoize_path`-wrapped variant
+// (joinpath.c:2194-2199, the mpath call pair — TPC-DS Q34/Q73's
+// `Gather > Nested Loop > Memoize > Index Scan`).
+//
+// The fused `*NestedLoopIndexJoin` node carries the cache as the InnerMemo
+// FIELD, never as a child node, so the capability check sees the bare probe
+// directly — no unwrap step exists at this layer (the unwrap lives one
+// layer down: partialPathDrivingKind's PathNestLoop arm unwraps the PATH's
+// PathMemoize, and executor.go's buildNode arm unwraps it again into
+// nestedLoopIndexJoinOp.inner).
+//
+// Admitted narrowly, same scope as the lateral-probe twin
+// (lateralProbeJoinIsPartialCapable): INNER only (LEFT/SEMI/ANTI/RIGHT/
+// FULL/CROSS refused as scope-minimization), non-nil children, and the
+// inner is exactly the bare parameterized equality probe
+// lateralProbeIsPartialProbe admits — an *IndexScan/*IndexOnlyScan with
+// Key/Keys, no SAOP, no range bounds. A bitmap inner
+// (createNestLoopBitmapJoinPlan's shape) is refused by that check's
+// default arm — a re-probed bitmap has no claim-set story (the *joinOp
+// arm's HasBitmapScan refusal, same reason). InnerMemo's presence is
+// irrelevant to the verdict: every worker builds its own memoizeOp and
+// kvcache over the shared read-only plan (executor.go: "each worker
+// builds its OWN operator tree"), matching real PG's Memoize whose DSM
+// shuttles only instrumentation counters — the cache data is per-worker
+// by construction (nodeMemoize.c:1190-1260).
+func NestedLoopIndexJoinIsPartialCapable(p *NestedLoopIndexJoin) bool {
+	if p == nil || p.Outer == nil || p.Inner == nil {
+		return false
+	}
+	if p.Type != JoinTypeInner {
+		return false
+	}
+	return lateralProbeIsPartialProbe(p.Inner)
 }
 
 // nestedLoopJoinIsPartialCapable states which ordinary nested loops may run
@@ -1595,6 +1690,19 @@ func unstampParallelScan(n Node) Node {
 		}
 		c := *x
 		c.Left, c.Right = left, right
+		return &c
+	case *NestedLoopIndexJoin:
+		// M0142-0005a: the inverse of stampParallelScan's NLI arm — the
+		// stamp only ever reaches Outer, but unstamp walks both sides
+		// unconditionally (StripGather's enforcement inverse is not
+		// capability-aware; an inner that could never be stamped
+		// un-stamps to itself).
+		outer, inner := unstampParallelScan(x.Outer), unstampParallelScan(x.Inner)
+		if outer == x.Outer && inner == x.Inner {
+			return n
+		}
+		c := *x
+		c.Outer, c.Inner = outer, inner
 		return &c
 	case *SetOp:
 		// M0140-0006c: the inverse of stampParallelScan's *SetOp arm.

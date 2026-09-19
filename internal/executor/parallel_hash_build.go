@@ -307,6 +307,16 @@ func collectShareableJoins(op Operator, out *[]*joinOp) {
 		collectShareableJoins(x.child, out)
 	case *instrumentedOp:
 		collectShareableJoins(x.inner, out)
+	case *nestedLoopIndexJoinOp:
+		// M0142-0005a: mirror of HasShareableHashJoin's fused-NLI arm —
+		// hashes under the outer of an approved NLI are leader-prebuilt.
+		// The probe inner is never descended (re-opened per outer row,
+		// not prebuilt); a non-approved shape collects nothing, matching
+		// the plan-side promise of false.
+		if optimizer.NestedLoopIndexJoinIsPartialCapable(x.plan) {
+			collectShareableJoins(x.outer, out)
+		}
+		return
 	case *setOp:
 		// M0140-0006c-2: a partial SetOp streams BOTH branches to
 		// completion, so a hash join driving either branch needs its

@@ -561,13 +561,18 @@ func partialPathDrivingKind(p *Path) PathKind {
 		if o == nil || o.ParallelWorkers <= 0 || !o.ParallelSafe || o.RequiredOuter != 0 {
 			return PathPrebuilt
 		}
-		if in == nil || in.Kind == PathMemoize {
+		if in == nil {
 			return PathPrebuilt
 		}
 		if in.RequiredOuter == 0 {
 			// The inner is read WHOLE by every worker: it must be complete
-			// (unparameterised) and must not be a Memoize cache (per-probe
-			// semantics no worker can supply).
+			// (unparameterised) and must not be a Memoize cache — the
+			// probe's parameter is what justifies caching (getMemoizePath
+			// only wraps a probe carrying RequiredOuter), so a
+			// whole-inner PathMemoize here means a producer changed.
+			if in.Kind == PathMemoize {
+				return PathPrebuilt
+			}
 			return partialPathDrivingKind(o)
 		}
 		// R95 (plan-parity-fix-take2): the lateral-probe inner. A
@@ -579,13 +584,29 @@ func partialPathDrivingKind(p *Path) PathKind {
 		// a hole). The probe shape itself (bare index equality probe) is
 		// proven at the node twin; here the kinds that can only be probes
 		// are admitted — a parameterized PathIndexScan from R60's
-		// producer (its Memoize loop output is PathMemoize, refused
-		// above) carrying index clauses. Anything else parameterized is
-		// refused: no worker can supply its parameter.
+		// producer carrying index clauses, or (M0142-0005a) that probe's
+		// Memoize-wrapped twin: every worker already builds a private
+		// memoizeOp/kvcache over the shared read-only plan (executor.go's
+		// "each worker builds its OWN operator tree"), matching PG's
+		// per-worker MemoizeState whose DSM shuttles only
+		// instrumentation counters (nodeMemoize.c:1190-1260) — the
+		// wrapper adds no claim and no shared state, so it unwraps once
+		// (Children[0] is always the wrapped probe, getMemoizePath
+		// joinpathsmemoize.go:292-303) and the bare-probe check runs on
+		// the child. RequiredOuter propagates, so in.RequiredOuter below
+		// reads the same value the child carries. Anything else
+		// parameterized is refused: no worker can supply its parameter.
 		if p.Jointype != parser.JoinInner {
 			return PathPrebuilt
 		}
-		if in.Kind != PathIndexScan || len(in.IndexClauses) == 0 {
+		probe := in
+		if in.Kind == PathMemoize {
+			if len(in.Children) != 1 {
+				return PathPrebuilt
+			}
+			probe = in.Children[0]
+		}
+		if probe == nil || probe.Kind != PathIndexScan || len(probe.IndexClauses) == 0 {
 			return PathPrebuilt
 		}
 		if p.OuterRelids == 0 || p.InnerRelids == 0 {
@@ -697,14 +718,35 @@ func setOpBranchDrivingKindIsSupported(p *Path) bool {
 		if o == nil || o.ParallelWorkers <= 0 || !o.ParallelSafe || o.RequiredOuter != 0 {
 			return false
 		}
-		if in == nil || in.Kind == PathMemoize {
+		if in == nil {
 			return false
 		}
-		if in.RequiredOuter != 0 {
+		if in.RequiredOuter == 0 {
+			// Whole-inner PathMemoize is refused for the same reason the
+			// general arm states: the probe's parameter is what justifies
+			// caching, so a parameterless memoize means a producer
+			// changed.
+			if in.Kind == PathMemoize {
+				return false
+			}
+		} else {
 			// R95 probe shape: a parameterized inner must be a bare index
 			// probe whose requirement THIS outer can satisfy — re-checked
 			// here rather than trusted from the filing site.
-			if in.Kind != PathIndexScan || len(in.IndexClauses) == 0 {
+			// M0142-0005a: the probe's Memoize-wrapped twin is admitted by
+			// the same unwrap the general arm performs — the cache is
+			// per-worker-local under a branch exactly as under a top-level
+			// Gather (attachAll hands the branch op tree to the same
+			// attachParallel* walks, whose nestedLoopIndexJoinOp arm
+			// descends the outer and never touches the probe).
+			probe := in
+			if in.Kind == PathMemoize {
+				if len(in.Children) != 1 {
+					return false
+				}
+				probe = in.Children[0]
+			}
+			if probe == nil || probe.Kind != PathIndexScan || len(probe.IndexClauses) == 0 {
 				return false
 			}
 			if p.OuterRelids == 0 || p.InnerRelids == 0 {

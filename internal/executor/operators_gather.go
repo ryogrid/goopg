@@ -175,6 +175,15 @@ func collectBitmapScans(op Operator, dst *[]*bitmapHeapScanOp) {
 		} else {
 			collectBitmapScans(x.right, dst)
 		}
+	case *nestedLoopIndexJoinOp:
+		// M0142-0005a: descend the partial OUTER only — the bitmap a
+		// driving scan under it needs is leader-prebuilt and page-claimed;
+		// the re-probed inner takes no claim. A non-capable shape
+		// contributes nothing: the claim walks refuse it, so it never
+		// reaches workers.
+		if optimizer.NestedLoopIndexJoinIsPartialCapable(x.plan) {
+			collectBitmapScans(x.outer, dst)
+		}
 	}
 }
 

@@ -51,7 +51,10 @@ func ordinaryInnerNestedLoopPartial(p *optimizer.Join) bool {
 // does, so per-worker re-opening is transparent.
 //
 // `right` is the join's built right operator. instrumentedOp wrappers are
-// transparent (they forward Next/Open, not bindings).
+// transparent (they forward Next/Open, not bindings). A memoizeOp never
+// reaches this walk: the cache exists only as nestedLoopIndexJoinOp.inner
+// (executor.go's *NestedLoopIndexJoin arm), whose own sibling check is
+// the *nestedLoopIndexJoinOp case below (M0142-0005a).
 func lateralProbeJoinPartial(p *optimizer.Join, right Operator) bool {
 	if p == nil || p.Algo != optimizer.JoinAlgoNestedLoop || !p.Lateral {
 		return false
@@ -266,6 +269,27 @@ func attachParallelScan(op Operator, st *parallelScanState) bool {
 		// that shape — see findPartialSubtree, which returns a Sort as the
 		// partial root only together with the GatherMerge it requires.
 		return attachParallelScan(x.child, st)
+	case *nestedLoopIndexJoinOp:
+		// M0142-0005a: the fused NLI is partial through its OUTER only —
+		// each worker joins its outer partition and re-opens the inner
+		// probe per outer row (nliInner's BindOuter/Rescan), exactly like
+		// R95's lateral probe and PG's try_partial_nestloop_path. The
+		// inner takes NO claim: it is a parameterized probe, not a
+		// partitioned scan — and a memoizeOp inner needs no shared state
+		// either, since every worker already built its own
+		// memoizeOp/kvcache over the read-only plan (executor.go's "each
+		// worker builds its OWN operator tree"), matching real PG's
+		// per-worker MemoizeState.
+		//
+		// Re-runs the planner's own verdict (parallel.go's
+		// NestedLoopIndexJoinIsPartialCapable — literal agreement, no
+		// twin to drift): INNER only, bare keyed probe, no bitmap inner
+		// (a re-probed bitmap has no claim-set story — the same refusal
+		// the *joinOp arm states for x.plan.Right).
+		if !optimizer.NestedLoopIndexJoinIsPartialCapable(x.plan) {
+			return false
+		}
+		return attachParallelScan(x.outer, st)
 	}
 	return false
 }
@@ -334,6 +358,14 @@ func attachParallelBitmapScan(op Operator, st *parallelBitmapState) bool {
 	case *sortOp:
 		// P7: per-worker Sort under Gather Merge.
 		return attachParallelBitmapScan(x.child, st)
+	case *nestedLoopIndexJoinOp:
+		// M0142-0005a: mirror of the sequential arm above — the fused
+		// NLI is partial through its OUTER only, so a driving bitmap
+		// scan there must be reachable through it. Same guard.
+		if !optimizer.NestedLoopIndexJoinIsPartialCapable(x.plan) {
+			return false
+		}
+		return attachParallelBitmapScan(x.outer, st)
 	}
 	return false
 }
@@ -492,6 +524,13 @@ func attachParallelIndexScan(op Operator, st *parallelIndexScanState) bool {
 		return attachParallelIndexScan(x.child, st)
 	case *sortOp:
 		return attachParallelIndexScan(x.child, st)
+	case *nestedLoopIndexJoinOp:
+		// M0142-0005a: same literal-outer rule as the two siblings
+		// above; the probe inner never takes index claim state.
+		if !optimizer.NestedLoopIndexJoinIsPartialCapable(x.plan) {
+			return false
+		}
+		return attachParallelIndexScan(x.outer, st)
 	}
 	return false
 }
