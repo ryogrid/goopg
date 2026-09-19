@@ -1,85 +1,23 @@
-Task: M0142-0005a (fused NLI+Memoize as a Gather-driving kind, TPC-DS
-  Q34/Q73) — LANDED, task now [x] complete. Next selectable per banner:
-  item 6 continues — **M0142-0016c**, then **M0142-0003i** (0003i only
-  after its own prereqs). Open adjacent: M-NIGHTLY-instrumentscope-race-fix
-  (pre-existing HEAD race, reproduced at base — see Blocked below);
-  Q76's hash branch wants this Memoize arm (fix_plan :2979, :3015).
+# Working Set — M0142-0003i (committing)
 
-What landed: `partialPathDrivingKind`'s PathNestLoop lateral-probe arm
-  (gatherpaths.go) unwraps ONE PathMemoize layer — Children[0] is always
-  the wrapped probe (getMemoizePath, joinpathsmemoize.go:292-303) — and
-  re-runs the bare-probe check on the child: PathIndexScan + IndexClauses,
-  JoinInner only, calcNestloopRequiredOuter relid re-check. Whole-inner
-  PathMemoize stays refused (a parameterless memoize means a producer
-  changed — fail closed). setOpBranchDrivingKindIsSupported's PathNestLoop
-  arm mirrors it guard-for-guard (its header claimed the mirror; the
-  general arm's widening would otherwise falsify it).
+Task: **M0142-0003i** — canonical TPC-H FK set into `bench/tpch/build_schema_goopg.sh` (owner amendment: never DDL on `:65433`; script + private 55xx clone verify). `[x]` in fix_plan.
 
-Site-list correction vs the recon's sizing: the memoized NLI is the FUSED
-  *NestedLoopIndexJoin{Outer, Inner: *IndexScan, InnerMemo: *Memoize}
-  node — a *Memoize can NEVER sit under Join.Right and a *memoizeOp never
-  under joinOp.right (createPlan panics on free-standing PathMemoize; the
-  decomposed Join{Lateral} shape is bare-probe-only per R25). So the
-  recon's named node/executor twins (lateralProbeIsPartialProbe /
-  lateralProbeJoinPartial) would have been dead code — attempted,
-  verified unreachable, reverted. The real work was a NEW sibling set:
-  NestedLoopIndexJoinIsPartialCapable (parallel.go, exported — the single
-  verdict every executor walk re-runs: INNER only, non-nil children,
-  Inner = bare keyed probe per lateralProbeIsPartialProbe, no SAOP/range/
-  bitmap; InnerMemo is irrelevant to the verdict). Arms added, all
-  descending Outer literally: drivingScan, stampParallelScan,
-  unstampParallelScan (both sides, its enforcement-inverse convention),
-  HasShareableHashJoin, drivingScanCrossesSort (guard-for-guard;
-  unreachable via findPartialSubtree today — NLI is terminatesPartial).
-  Executor: attachParallelScan / attachParallelBitmapScan /
-  attachParallelIndexScan (parallel_scan.go), collectShareableJoins
-  (parallel_hash_build.go), collectBitmapScans (operators_gather.go) —
-  each `if !optimizer.NestedLoopIndexJoinIsPartialCapable(x.plan) return
-  false; return <walk>(x.outer, …)`. Claim state never crosses to the
-  re-probed inner; each worker's memoizeOp/kvcache is private by
-  construction (PG parity: nodeMemoize.c:1190-1260's DSM shuttles only
-  instrumentation counters).
+Files:
+- `bench/tpch/build_schema_goopg.sh` — post-HammerDB block adds all 8 FKs (PG-`:65432`-identical, `DEFERRABLE` on `lineitem_order_fk`, composite `(l_partkey, l_suppkey)`), then `fk_check` fails the build on a partial landing.
+- `docs/design/0100-0149/m0142-0003i-tpch-canonical-fk-set-in-build-script.md` — new, `Status: implemented`.
+- `docs/design/README.md` — index row added after m0142-0003k.
+- `.ralph/fix_plan.md` — `[x]` + DONE summary; stale BLOCKED tail rewritten as resolved.
 
-Tests: internal/optimizer/partial_nli_memoize_test.go +
-  internal/executor/parallel_nli_memoize_test.go — bare+memoized
-  admission, refusal matrix (non-INNER jointypes, bitmap/SAOP/unkeyed/
-  ranged inner, nil plan/state), outer-only claim on all three walks,
-  shared-hash + bitmap collection through the outer. Race-clean.
+Findings (private clone `:5533`, `pg_basebackup -X fetch` of `:65433`, now deleted):
+- Restored `:65433` has all 8 PKs but **zero** FKs — script lands the full 8-FK set, not 5.
+- All 8 validated index-accelerated, ~6m49s total (lineitem dominates, ~57µs/probe).
+- `pg_constraint` PK/FK rows identical to PG `:65432`; only delta = PG `contype='n'` NOT-NULL rows (separate catalog gap).
+- `pg_get_constraintdef` returns empty for ALL constraint types — cosmetic renderer gap, unrelated.
+- **Q9 collapse resolved**: `lineitem ⋈ partsupp` est 117313 vs PG 75650 (was 2406); plan now walks FK-informed NL-index chain (Gather > NL+Memoize probes). Q9 = 175 rows both engines; value deltas = known HammerDB-vs-dbgen data divergence.
+- Live `:65433` still has no FKs — owner applies at next reload per amendment.
 
-Key symbols: NestedLoopIndexJoinIsPartialCapable (parallel.go — executor
-  calls it directly, no twin to drift), PathMemoize unwrap in
-  partialPathDrivingKind + setOpBranchDrivingKindIsSupported
-  (gatherpaths.go), NestedLoopIndexJoin.InnerMemo field (plan.go;
-  createplannl.go:196-209 — memoized stays fused, bare decomposes).
+Gates run: units gate PASS (44 ok, 0 FAIL). No Go code changed → tpch-spotcheck/SF0.25 not required; pgbench smoke runs in the commit hook. race-gate still red at HEAD = pre-existing `M-NIGHTLY-instrumentscope-race-fix` (not this loop's).
 
-Gates run: build+vet clean; optimizer+executor pkg tests green; new-test
-  `go test -race` green; units gate all ok; tpch-spotcheck PASS
-  Q12=2/Q13=34 (stamped); SF0.25 sweep PASS=96 MISMATCH=0 CKMISMATCH=0
-  TIMEOUT=0 (stamped) — **Q34 + Q73 both flipped to the exact PG reference
-  shapes** (Gather > NL > … > Memoize > Index Scan; 60/99 plans changed
-  total, all row-correct; Q66 kept its Gather > Append pure-arm shape);
-  acceptance-arm VERDICT PASS 24/24 MATCH vs /tmp/arm-0006c3-staged.txt
-  (PGSHAPED=1 + GOGC=100 + GOMEMLIMIT=8GiB, stamped);
-  GOOPG_PGSHAPED_DP_TRACE=1 Q34 on private :5533 clone — accepted
-  producer=gather DPPATH lines incl. relids={0,1,2,3} rows=136
-  total=17477.699… matching the emitted Gather cost=1182.47..17477.70.
-  plan-gate 14/22 diverged = baseline drift, NOT this change — the live
-  :65433 binary (built 09-19 03:11) predates the staged work, so the diff
-  measured HEAD-vs-m0137-0005-rebaseline-20260915, same 14/22 the prior
-  loop recorded; spot-verified Q12's divergent NL shape is exactly PG
-  18.3's own plan (bare-probe flips ride the pre-existing decomposed
-  Join{Lateral} path this change does not touch).
-
-Blocked (recorded, separate task): `make race-gate` red at HEAD —
-  pre-existing instrumentScope data race (worker exec-time lazy SubPlan
-  Build → maybeInstrument reads the package-global scope vs
-  buildUnderNilScope/buildUnderFreshScope writes under instrumentScopeMu;
-  witness TestParallelLateralProbeIdentity). Reproduced at the base commit
-  with this change stashed — unrelated. Already filed as
-  M-NIGHTLY-instrumentscope-race-fix with
-  TestExplainAnalyzeSubPlanScopeObservation as its prescribed probe.
+Next step: commit (script + doc + README + fix_plan + baton), run `make ralph-state-guard`, emit status.
 
 In-flight: none.
-WATCH: concurrent Devin loop commits to this branch — stage
-  explicitly; foreign mods (ci/logs, .claude, .ralphrc, analysis/,
-  postgres, third-party, .ralph/progress.json) never get committed.

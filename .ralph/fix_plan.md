@@ -5314,9 +5314,21 @@ cross-layer programme that has never been scoped.
   artifact of that one interrupted run. Follow-up filed as **M0143-0008**
   (below, under the engine-correctness-carryover milestone — unrelated to
   join-order costing, so not filed as another M0142 item).
-- [ ] **M0142-0003i — resume -0003f now that -0003g's index-accelerated FK
+- [x] **M0142-0003i — resume -0003f now that -0003g's index-accelerated FK
   Kind: impl
-  validation has landed** — **OWNER AMENDMENT 2026-09-17 (overrides the text
+  validation has landed** — **DONE 2026-09-21**, design doc
+  `docs/design/0100-0149/m0142-0003i-tpch-canonical-fk-set-in-build-script.md`.
+  Executed under the owner amendment: `bench/tpch/build_schema_goopg.sh` now
+  adds the full canonical 8-FK set (PG-`:65432`-identical incl. `DEFERRABLE`
+  on `lineitem_order_fk`) after the HammerDB build, gated by a `fk_check`
+  that fails the script on a partial landing. Verified on a `pg_basebackup`
+  clone at `:5533` (never `:65433`): all 8 validated index-accelerated
+  (~6m49s), `pg_constraint` PK/FK rows identical to PG, and **Q9's 2500x
+  estimate collapse resolved** — `lineitem ⋈ partsupp` now estimates 117313
+  vs PG's 75650 (was 2406); Q9's plan walks the FK-informed NL-index chain;
+  175 result rows on both engines. Live `:65433` still has no FKs — the owner
+  applies them at the next reload. Original (pre-amendment) text below kept
+  for provenance — **OWNER AMENDMENT 2026-09-17 (overrides the text
   below): depends on P0-E5 and P0-E6 `[x]`. Never run DDL on the shared `:65433`
   (AGENT.md R1): add the FKs in `bench/tpch/build_schema_goopg.sh` (or a
   post-load step) and verify on a private `55xx` clone; the owner applies it to
@@ -5342,13 +5354,12 @@ cross-layer programme that has never been scoped.
   index-accelerated instead of hanging again. Also worth a quick
   corpus-wide `pg_constraint` diff between the two clusters once all 16 FKs
   are present, per -0003g's note.
-  **BLOCKED as of 2026-09-16: see M0142-0003j below** — the PID 81 backend
-  was terminated and the cluster restarted onto the -0003g-fixed binary per
-  this task's own instructions, but the restart's crash recovery revealed
-  the shared `:65433` cluster's `tpch` database has lost ALL of its TPC-H
-  tables (including the 11 FKs/PKs -0003f/-0003g landed) — a full data-loss
-  event, not just the stuck backend. -0003i cannot proceed (there is nothing
-  to add the remaining 5 FKs to) until -0003j's reload lands.
+  **Formerly BLOCKED as of 2026-09-16 (see M0142-0003j/-0003k below) — the
+  block resolved**: the owner-run `scripts/tpch-ref-recover.sh` restore
+  brought `:65433` back from `preloss-clone-20260915` (8 PKs, zero FKs), and
+  the owner amendment re-scoped this task to the build script + private
+  clone, which is what was implemented above. The PID-81/data-loss chain
+  this note described is preserved in -0003j/-0003k for provenance.
 - [x] **M0142-0003j — CRITICAL recon: the shared TPC-H bench cluster
   (`:65433`, `bench/tpch/runtime_goopg/data`) lost its entire `tpch`
   database contents via a crash-recovery event** — found while executing
