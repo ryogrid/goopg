@@ -432,11 +432,18 @@ func buildInitialRels(bindings []rangeBinding, scans []Node, relInfos []baseRelI
 			return nil, err
 		}
 		p := newPrebuiltPath(rel, leaf)
-		// The scan-cost currency of 04 §1, on `cost_seqscan`'s OWN inputs:
-		// `baserel->pages` and `baserel->tuples`, not the post-restriction
-		// row count. See baseSeqScanCostInputs.
-		scanPages, scanTuples, scanQualOps := baseSeqScanCostInputs(ri, leaf, rows, width)
-		p.Cost = costSeqscan(cp, scanPages, scanTuples, scanQualOps)
+		if isSubplanLeaf(leaf) {
+			// M0144-0011b-1: a leaf that wraps a finished SUB-PLAN is not a
+			// relation and must not be priced as a scan of one — see
+			// costSubplanLeaf.
+			p.Cost = costSubplanLeaf(cp, leaf, rows)
+		} else {
+			// The scan-cost currency of 04 §1, on `cost_seqscan`'s OWN inputs:
+			// `baserel->pages` and `baserel->tuples`, not the post-restriction
+			// row count. See baseSeqScanCostInputs.
+			scanPages, scanTuples, scanQualOps := baseSeqScanCostInputs(ri, leaf, rows, width)
+			p.Cost = costSeqscan(cp, scanPages, scanTuples, scanQualOps)
+		}
 		addPath(rel, p, "joinsearch.prebuilt")
 		setCheapest(rel)
 	}
@@ -543,6 +550,80 @@ func leafBaseScan(n Node) Node {
 			return n
 		}
 		n = f.Child
+	}
+}
+
+// isSubplanLeaf reports whether a join-search leaf wraps a finished SUB-PLAN
+// rather than an access path to a base relation: a set-op, CTE, subquery,
+// VALUES, function scan, or an already-built join/aggregate subtree.
+//
+// The four node kinds it excludes are the base-table accesses. `*SeqScan` is
+// the ordinary case `baseSeqScanCostInputs` was written for; `*IndexScan`,
+// `*IndexOnlyScan` and `*BitmapHeapScan` are the rule-based planner's own
+// choice standing in for the relation. Those three are deliberately LEFT on
+// today's pricing by M0144-0011b-1 even though it is also wrong for them
+// (they are charged a fabricated sequential scan): repricing them is a
+// different question with a different PG function (`cost_index`), and folding
+// it into the same commit would make any category movement unattributable.
+// Ledger row `m0144-0011b-1-index-leaf-still-priced-as-seqscan`.
+func isSubplanLeaf(leaf Node) bool {
+	if leaf == nil {
+		return false
+	}
+	switch leafBaseScan(leaf).(type) {
+	case *SeqScan, *IndexScan, *IndexOnlyScan, *BitmapHeapScan:
+		return false
+	default:
+		return true
+	}
+}
+
+// costSubplanLeaf is `cost_subqueryscan`'s shape for a sub-plan leaf entering
+// the join search (M0144-0011b-1).
+//
+// PG never re-derives a sub-plan's work from a page count. It starts from the
+// subpath and adds overhead:
+//
+//	/* postgres/src/backend/optimizer/path/costsize.c:1491-1493 */
+//	path->path.startup_cost = path->subpath->startup_cost;
+//	path->path.total_cost = path->subpath->total_cost;
+//
+// then charges `cpu_tuple_cost` per row for selection and projection
+// (costsize.c:1516-1525). `cost_ctescan` and `cost_functionscan` have the same
+// shape. Before this function, goopg priced such a leaf with `costSeqscan`
+// over a page count INVENTED from the row count, so the whole subtree was
+// free: TPC-DS SF0.25 Q8 entered its `HashSetOp Intersect` — a subtree
+// estimated at 7360.42 — into the search at 8.35, and the hash join above it
+// printed a total of 11.28, 650x cheaper than its own child.
+//
+// The qual term PG adds alongside `cpu_tuple_cost` is deliberately NOT added
+// here. PG is pricing a scan node over a bare RTE with a `baserestrictinfo`
+// list still to be applied; goopg's leaf is a FINISHED tree whose local filter
+// is already inside the node being priced, so charging it again would
+// double-count.
+//
+// SCOPE, STATED PLAINLY: `legacyDisplayCostOf` prefers the leaf's carried
+// `PlanCost` and falls back to `DeriveLegacyDisplayCost`, whose own header
+// bars planning against it. For a leaf class that carries a real cost the base
+// here IS real. For `SetOp` and the other classes with no `PlanCost` field the
+// base is that function's pass-through arm — children's own (largely real)
+// costs plus a per-tuple charge, which is `cost_subqueryscan`'s shape again,
+// but which does NOT model the set-op's own hashing work. It is therefore a
+// FLOOR, not PG's number, and the full-fidelity answer is a real upper-rel
+// path per sub-plan class. Ledger row
+// `m0144-0011b-1-subplan-leaf-base-is-legacy-estimate`; design doc
+// docs/design/0100-0149/m0144-0011b-1-subplan-leaf-cost.md §4.
+//
+// Pricing the subtree at a floor is strictly better than pricing it at ZERO,
+// which is what the seq-scan fabrication amounted to.
+func costSubplanLeaf(cp costParams, leaf Node, rows float64) Cost {
+	sub := legacyDisplayCostOf(leaf)
+	if rows < 0 {
+		rows = 0
+	}
+	return Cost{
+		Startup: sub.StartupCost,
+		Total:   sub.TotalCost + cp.cpuTupleCost*rows,
 	}
 }
 
