@@ -1,0 +1,28 @@
+# TPC-DS SF0.25 goopg sweep — 2026-09-20T01:08:00+09:00
+# goopg: 2b7e97053 executor(amcheck): unbreak pg_amcheck server tier — postgres-db scope + tuple-format comparator (M0119-0006bq)
+# engine-id: 8188f52da23a56d6d482b4b0edc09af8bd5f2e1e 131760e55bb8fd879c88e3bedaeda99e5046b0e6  diff=e7aa40c6e3be
+# build: rebuilt from tree [tree DIRTY in Go sources — the binary is not this commit alone]
+# engine-binary: running=b16af172c7dbb25c on-disk=b16af172c7dbb25c (/home/ryo/work/goopg/goopg/tmp/goopg-sf025-bin)
+# oracle: /home/ryo/work/goopg/goopg/bench/tpcds/runtime_goopg/tpcds-results-sf025/oracle.txt (PG 18.3 plain-run row counts + value checksums)
+# timeout: 300s
+# planner-flags: GOOPG_RELSIZE_FALLBACK=retired(take2-P1-05) GOOPG_COST_DRIVEN_JOINORDER=retired(M0127-P5.9) GOOPG_MEMOIZE=unset(on) GOOPG_PARALLEL=unset(on) GOOPG_PGSHAPED_DP=unset(on) GOOPG_PGSHAPED_COLLAPSE=retired(take3-C-06) GOOPG_EXISTS_TO_ANY=unset(on) GOOPG_UNNEST_PREDP=unset(on) GOOPG_INDEXKEY_HARVEST=unset(on) GOOPG_NLI_COSTGATE=unset(current) GOOPG_HASH_OUTER_JOIN=unset(off) GOOPG_INDEX_PROBE_MULT=unset(2) GOOPG_MHJ_PACKING_OFF=retired(M0127-P6.2) GOOPG_GS_SHARE_SOURCE=retired(M0125-0048) GOOPG_NARROW_BUILD=unset(on) GOOPG_NARROW_UPPER=unset(on) GOOPG_NARROW_UPPER_SORT=unset(on) GOOPG_NARROW_LEG_HOOK=unset(on) GOOPG_NARROW_COST_INPUTS=unset(on) GOOPG_GATHER_PATHS=unset(all) GOOPG_PARTIAL_AGG_PATHS=unset(on) GOOPG_ONEREL_SEARCH=unset(off) GOOPG_PARTIAL_SORT_PATHS=unset(off) GOOPG_PG_HASH_TUPLE_SPILL_COST=unset(off) GOOPG_PG_SORT_RELATION_BYTES_COST=unset(off) GOOPG_PG_MEMOIZE_ENTRY_BYTES_COST=unset(off) GOOPG_HASHAGG_WIDTH_CURRENCY=retired(M0137-0009) GOOPG_INCREMENTAL_SORT=unset(off)
+# FORCE=1 — a foreign bench/nightly harness was running: ROW COUNTS AND CHECKSUMS ARE VALID, PER-QUERY SECONDS ARE NOT
+Q1   PASS        0s (450ms)      100 rows  ck=n/a
+Q2   PASS        3s (2920ms)     2513 rows  ck=c372ff12ff0235d9
+Q3   PASS        0s (29ms)       30 rows  ck=3bb31a49b1b21bf7
+Q4   PASS        7s (6621ms)        0 rows  ck=1f18d650d205d71d
+Q5   PASS        3s (3057ms)      100 rows  ck=n/a
+Q6   PASS        2s (2380ms)       27 rows  ck=87ec5bd032d11623
+Q7   PASS        1s (756ms)      100 rows  ck=n/a
+Q8   PASS        2s (1958ms)        0 rows  ck=1f18d650d205d71d
+Q9   PASS        2s (1703ms)        1 rows  ck=a70e24a9b0f43963
+Q10  PASS        0s (639ms)        0 rows  ck=1f18d650d205d71d
+Q11  PASS        3s (3403ms)        0 rows  ck=1f18d650d205d71d
+Q12  PASS        0s (148ms)      100 rows  ck=n/a
+Q13  PASS        1s (629ms)        1 rows  ck=4d550faf1f8a3c40
+Q14  PASS       14s (14493ms)      200 rows  ck=n/a
+Q15  PASS        1s (305ms)       88 rows  ck=accf3f52f5757e39
+Q16  PASS        1s (753ms)        1 rows  ck=6e6311159ff5d714
+Q17  PASS        1s (1852ms)        0 rows  ck=1f18d650d205d71d
+Q18  PASS        0s (895ms)      100 rows  ck=n/a
+Q19  ERROR      79s (78605ms) psql:/home/ryo/work/goopg/goopg/bench/tpcds/runtime_goopg/tpcds-data/queries/query19.sql:2
