@@ -944,7 +944,24 @@ func setOpBindsTighter(inner, outer parser.SetOpType) bool {
 	return inner == parser.SetOpIntersect && outer != parser.SetOpIntersect
 }
 
+// planSelectWithSettings is the M0145-0002 dual-pipeline dispatch point
+// (AGENT.md §"Plan-parity harness" G8): GOOPG_JOINTREE_PIPELINE=1 selects
+// the jointree-first pipeline, anything else the legacy one. The knob is
+// the only pipeline-selection mechanism and is retired by M0145-0008's
+// cutover. Every planning scope re-enters here — subqueries, CTE bodies,
+// set-op branches — matching the way PG's subquery_planner recurses per
+// Query.
 func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSet PlannerSettings, scope *rtableScope) (Node, error) {
+	if jointreePipeline {
+		return planSelectJointreePipeline(s, cat, plannerSet, scope)
+	}
+	return planSelectLegacyPipeline(s, cat, plannerSet, scope)
+}
+
+// planSelectLegacyPipeline is the pre-M0145 node-tree pipeline, kept whole
+// behind the dispatch above until M0145-0008 deletes it. The name dates
+// from M0145-0002; the body is the former planSelectWithSettings verbatim.
+func planSelectLegacyPipeline(s *parser.SelectStmt, cat catalog.Catalog, plannerSet PlannerSettings, scope *rtableScope) (Node, error) {
 	// M0103-0008: indirection-star rewrite runs at Plan() entry
 	// before the analyzer; nested-SELECT planning paths (subqueries,
 	// UNION branches) reach planSelectWithSettings directly without

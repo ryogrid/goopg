@@ -178,6 +178,11 @@ var flagResolvedState = map[string]func(string) string{
 	"GOOPG_INCREMENTAL_SORT": func(v string) string {
 		return incrementalSortModeLabel(incrementalSortModeFromEnv(v))
 	},
+	// M0145-0002 (AGENT.md §"Plan-parity harness" G8): selects the
+	// jointree-first pipeline at planSelectWithSettings. Default `off` —
+	// the legacy pipeline stays the value-gated arm through the whole
+	// transition; the knob is retired by M0145-0008's cutover.
+	"GOOPG_JOINTREE_PIPELINE": func(v string) string { return onOff(jointreePipelineFromEnv(v)) },
 }
 
 // flagProvenanceOrder is the order the flags are stamped in. The first six are
@@ -256,6 +261,11 @@ var flagProvenanceOrder = []string{
 	// (incrementalsortpaths.go). Default `off` — createPlanNode has no arm
 	// for PathIncrementalSort until the executor operator lands.
 	"GOOPG_INCREMENTAL_SORT",
+	// Joined at M0145-0002: selects the jointree-first pipeline
+	// (AGENT.md §"Plan-parity harness" G8). Default `off`; a knob-arm
+	// capture that does not name the flag cannot say which pipeline it
+	// measured, and the stamp is what keeps the dual-pipeline A/B honest.
+	"GOOPG_JOINTREE_PIPELINE",
 }
 
 // flagProvenanceRetired names variables no code reads any more, and the

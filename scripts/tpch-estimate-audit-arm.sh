@@ -32,6 +32,13 @@
 #              enumeration-provenance section (M0127-P5.9-l-ii). Only
 #              meaningful with PGSHAPED=1: the trace is written by the
 #              PG-shaped search, so a PGSHAPED=0 arm produces an empty one.
+#   JOINTREE   GOOPG_JOINTREE_PIPELINE for this arm (default 0) — the
+#              M0145-0002 dual-pipeline knob (AGENT.md G8). Set EXPLICITLY
+#              for the same reason as PGSHAPED: an unset flag stops being a
+#              well-defined arm the day the default flips, and the knob IS
+#              scheduled to flip at M0145-0008's cutover. Knob-on arms are
+#              EXPLAIN-only evidence (PLAN_ONLY=1); value gates always run
+#              the default pipeline.
 #   REFERENCE  PG 18.3 reference plans file for the §4 parity gate. Default is
 #              the committed capture, so the ratchet stays comparable to the
 #              baseline §4.1 pinned; pass empty to skip the parity column, or
@@ -98,6 +105,7 @@ export GOOPG_MEM_HIGH="${GOOPG_MEM_HIGH:-20G}" GOOPG_MEM_MAX="${GOOPG_MEM_MAX:-2
 export GOOPG_MEM_SWAP_MAX="${GOOPG_MEM_SWAP_MAX:-0}"
 export GOOPG_PGSHAPED_DP="${PGSHAPED:-0}"
 export GOOPG_PGSHAPED_DP_TRACE="${DP_TRACE:-0}"
+export GOOPG_JOINTREE_PIPELINE="${JOINTREE:-0}"
 
 if pg_isready -h "${PG_HOST}" -p "${PG_PORT}" -q 2>/dev/null; then
     echo "something is already listening on ${PG_HOST}:${PG_PORT} (this arm's private port) — stop it first (${GOOPG_BIN} stop -D ${PGDATA})" >&2
