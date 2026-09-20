@@ -78,6 +78,8 @@ case("B: new M0142 task without Parent -> violation", base, base + task("M0142-0
 case("B: new P0- task without Parent -> violation", base, base + task("P0-E4"), "B")
 case("B: new M0143 task with Parent: none -> ok", base, base + task("M0143-0009", parent="none"), None)
 case("B: new M0136 (out of range) without Parent -> ok", base, base + task("M0136-0100"), None)
+case("B: new M0145 task without Parent -> violation", base, base + task("M0145-0009"), "B")
+case("B: new M0146 (out of range) without Parent -> ok", base, base + task("M0146-0001"), None)
 case("B: new nested M0141 subtask without Parent -> violation", base,
      base + task("M0141-S2b-8", indent="  "), "B")
 case("B: legacy task edited (not new) without Parent -> ok",

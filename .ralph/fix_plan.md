@@ -37,24 +37,41 @@ the order written inside the item. `[!]` tasks are not selectable.
    bulk-triage) → **M0144-0011** (first vertical-slice campaign — gated on
    0002+0007 output). M0137-0019's parallel triage is subsumed in part by
    M0144-0002 (the census is the triage instrument); it stays filed for its
-   per-query write-up.
-3. **M0141-S2a-fix2r** — re-apply the PG-faithful `hashAggEntrySize` change that
+   per-query write-up. **Children 0003a and 0003b stay `[!]`** — their wall
+   is the resolver-time lowering, fixed inside item 3's M0145-0003/0004.
+3. **M0145 jointree-first planner** (flow unification, owner decision
+   2026-09-20 — fix the medium-level route divergence documented in
+   `METHODOLOGY4/plan-flow-medium-abstraction.md` at the boundary, not per
+   plan: a jointree-level IR built before lowering, sublinks pulled up into
+   it, one DP pass over it, one Path→Node lowering at the end; the new
+   pipeline is selectable behind `GOOPG_JOINTREE_PIPELINE=1` and the legacy
+   pipeline stays the default until the M0145-0008 cutover deletes it).
+   Order: **M0145-0001** (IR recon/design) →
+   **M0145-0002** (dual-pipeline harness) → **M0145-0003** (sublink
+   pull-up — the pilot is already in flight as M0142-0008a-3i-route-a
+   step 2) → **M0145-0004** (appendrel) → **M0145-0005** (single-pass DP;
+   retires Phase A/B + pinned spine) → **M0145-0006** (upper-rel
+   pathlists; absorbs the M0144-0011a residual gates) → **M0145-0007**
+   (unified lowering) → **M0145-0008** (cutover). The Q78
+   `outer-over-derived` firewall is a hard constraint on every
+   pull-up/flattening task.
+4. **M0141-S2a-fix2r** — re-apply the PG-faithful `hashAggEntrySize` change that
    was discarded for parity reasons (owner Q4: no reverts). Degradations it
    causes are filed as their own tasks, not reverted.
-4. **Roll out fix1's success**: the recon **M0141-S2a-fix1-sweep** (other places
+5. **Roll out fix1's success**: the recon **M0141-S2a-fix1-sweep** (other places
    where width/currency reaches costing late or wrong), then
    M0141-S2b-6-resume, then M0139-0007c.
-5. **M0141-S7 — cost diagnosis only.** The Incremental Sort candidate exists
+6. **M0141-S7 — cost diagnosis only.** The Incremental Sort candidate exists
    but loses on cost (S2b-7: 3733.01 vs 3730.89). Compare the cost breakdown
    with PG for the 14 queries. **No production-code change under this item** —
    not even a trace inside an existing trace guard. If instrumentation is
    genuinely needed, file a separate `Kind: impl` task, run the values gates and
    report the parity numbers (this is what `073ab2748`/`c7e231ae1` got wrong).
-6. **M0140-0006a → 0006b → 0006c** (partial-Append).
-7. **M0142-0005**, then **M0142-0016c**, then **M0142-0003i** (0003i only after
+7. **M0140-0006a → 0006b → 0006c** (partial-Append).
+8. **M0142-0005**, then **M0142-0016c**, then **M0142-0003i** (0003i only after
    P0-E5 and P0-E6 are `[x]`).
-8. **M0143 remaining tasks**, top to bottom (includes the parser failures).
-9. M-NIGHTLY open items, then the pre-existing milestones
+9. **M0143 remaining tasks**, top to bottom (includes the parser failures).
+10. M-NIGHTLY open items, then the pre-existing milestones
    (M0119 → M0122 → M0131 → M0134 → M0135/M0136 → M0095/M0110).
 
 **New task fields (2026-09-18).** Every task filed from now on carries, each at
@@ -92,7 +109,7 @@ first, fix with normal gates, cite the AI-id, tick it.
 - This is the authoritative TODO list for Ralph. ONE item per loop; decompose an
   item larger than one agent invocation (new tasks carry `Parent:`).
 - Design docs: non-trivial subsystems land with `docs/design/<id>-NNNN-*.md`
-  and a `docs/design/README.md` entry in the same commit. For M0137–M0144 and
+  and a `docs/design/README.md` entry in the same commit. For M0137–M0145 and
   `P0-` tasks follow `AGENT.md` §"Plan-parity harness" D3.
 - Deferrals: never close a task with a forward reference. A deferral needs
   **both** a `.ralph/deferral_ledger.md` row (`date | task-id | landed |
@@ -1865,7 +1882,7 @@ wants to unblock the shared type-kernel gap properly.
 ## M0137 — Parity measurement harness and instrument repair (filed 2026-09-14)
 
 **Milestone doc:** `docs/milestones/0137-parity-measurement-harness-and-instrument-repair.md`
-**Harness (binding, read before selecting):** `AGENT.md` §"Plan-parity harness (M0137–M0144)"
+**Harness (binding, read before selecting):** `AGENT.md` §"Plan-parity harness (M0137–M0145)"
 **Source:** `docs/design/not_ralph/plan_parity_fix_take2/METHODOLOGY3/04-forward-plan.md` Phase 0 (M2/M3/M5/M6)
 
 **First in the plan-parity group, and a prerequisite for the other six.** Every
@@ -2526,7 +2543,7 @@ before/after proving the defect it closes.
 ## M0138 — PG-faithful ANALYZE statistics (filed 2026-09-14)
 
 **Milestone doc:** `docs/milestones/0138-pg-faithful-analyze-statistics.md`
-**Harness (binding, read before selecting):** `AGENT.md` §"Plan-parity harness (M0137–M0144)"
+**Harness (binding, read before selecting):** `AGENT.md` §"Plan-parity harness (M0137–M0145)"
 **Source:** the owner's answer of 2026-09-14 to `METHODOLOGY3/04-forward-plan.md` §1.2 Question 2
 **Prerequisite:** M0137.
 
@@ -2819,7 +2836,7 @@ unmeasured one does not.
 ## M0139 — Executor-side narrowing / projection pushdown (filed 2026-09-14)
 
 **Milestone doc:** `docs/milestones/0139-executor-side-narrowing-projection-pushdown.md`
-**Harness (binding, read before selecting):** `AGENT.md` §"Plan-parity harness (M0137–M0144)"
+**Harness (binding, read before selecting):** `AGENT.md` §"Plan-parity harness (M0137–M0145)"
 **Source:** the owner's answer of 2026-09-14 to `METHODOLOGY3/04-forward-plan.md` §1.1 Question 1 — **(a) build it**
 **Prerequisite:** M0137 (M0137-0010's qual-placement census gates every slice here).
 
@@ -3137,7 +3154,7 @@ that comment names as parity-inert.
     M0139-0007's three filed pieces (recon, 0007a, 0007b) only 0007b is still
     open. The next loop should take M0139-0007b next (still inside the
     top-priority group) unless its own recon surfaces a reason to defer it,
-    in which case the banner's item 2 (M0137's re-opened 0014–0017) is next.
+    in which case the banner's item 1 (M0137's re-opened 0014–0017) is next.
 - [x] **M0139-0007b — port PG's Memoize entry-byte currency** (DONE
   2026-09-15). Gave `joinpathsmemoize.go`'s `costMemoizeRescan` a new
   default-off arm, `GOOPG_PG_MEMOIZE_ENTRY_BYTES_COST` (R108/R113-shaped):
@@ -3207,7 +3224,7 @@ that comment names as parity-inert.
 ## M0140 — TPC-DS parallelism (filed 2026-09-14)
 
 **Milestone doc:** `docs/milestones/0140-tpcds-parallelism.md`
-**Harness (binding, read before selecting):** `AGENT.md` §"Plan-parity harness (M0137–M0144)"
+**Harness (binding, read before selecting):** `AGENT.md` §"Plan-parity harness (M0137–M0145)"
 **Source:** `METHODOLOGY3/04-forward-plan.md` Phase 1 Campaign A
 **Prerequisite:** M0137. **Independent of M0139** per the owner's "(c) split the goal = Go".
 
@@ -3605,7 +3622,7 @@ setting that yields a serial plan.
     reason); `ea-ratchet` N/A (no estimate path touched). Design doc:
     `docs/design/0100-0149/m0140-0006b-2-upper-rel-gather-wiring.md`
     (indexed). No ledger row (no PG behavior deferred). Next: **M0140-0006c-2**
-    is now the last open task under banner item 5.
+    is now the last open task under banner item 7.
 - [x] **M0140-0006c — executor claim-set for `setOp` under `Gather`.** A
   Kind: impl
   Parent: M0140-0006
@@ -3895,7 +3912,7 @@ setting that yields a serial plan.
 ## M0141 — Upper-planner ordering contest (filed 2026-09-14)
 
 **Milestone doc:** `docs/milestones/0141-upper-planner-ordering-contest.md`
-**Harness (binding, read before selecting):** `AGENT.md` §"Plan-parity harness (M0137–M0144)"
+**Harness (binding, read before selecting):** `AGENT.md` §"Plan-parity harness (M0137–M0145)"
 **Source:** `METHODOLOGY3/04-forward-plan.md` Phase 1 Campaign B
 **Prerequisites:** M0137, **and this milestone's own S0.**
 
@@ -5521,7 +5538,7 @@ spill route is net-negative.
     against the actual child AST node, not just Sort Key text), and the two
     stale doc-comment corrections this update made (`path.go`,
     `incrementalsortpaths.go`): design doc's "Update 2026-09-17h" section.
-  - **UPDATE 2026-09-18 (banner item 4's "compare the cost breakdown with PG
+  - **UPDATE 2026-09-18 (banner item 6's "compare the cost breakdown with PG
     for the 14 queries," DONE, no production change).** Traced the remaining
     13 witnesses (only Q3 had been traced before) on `:65437` with
     `GOOPG_INCREMENTAL_SORT=on GOOPG_PGSHAPED_DP_TRACE=1`. 7 of 13
@@ -5708,7 +5725,7 @@ spill route is net-negative.
       `addIncrementalSortPaths` can never attach a `PathIncrementalSort` to
       it even when it qualifies. Full per-witness cost table and mechanism
       writeup: design doc's "Update 2026-09-18d" section. Follow-up filed as
-      **M0141-S2b-9** below (implementation, not selectable under item 4's
+      **M0141-S2b-9** below (implementation, not selectable under item 6's
       "cost diagnosis only" restriction). `GOOPG_INCREMENTAL_SORT` stays
       default-off; no ledger row (same posture as 18b/18c — a filed
       follow-up carries the deferral). Gates: `go build ./...` clean, `go
@@ -5740,7 +5757,7 @@ spill route is net-negative.
     `PathIncrementalSort` whose child is the bare seed (not a join/agg
     candidate from `SearchCandidates`) the same as any other child shape.
     This is an implementation task (not recon) — not selectable while
-    M0141's banner item 4 restricts to "cost diagnosis only, no executor
+    M0141's banner item 6 restricts to "cost diagnosis only, no executor
     work"; wait for the banner to open item 3/4's implementation tasks.
     Gate: TPC-DS SF0.25 sweep (category movement, no regression) + `go test
     ./internal/optimizer/...`; re-check Q4's own plan shape specifically
@@ -5774,7 +5791,7 @@ spill route is net-negative.
     ORDER BY case per M0141-S7-exec-a/b/c — confirm the same operator
     works unchanged as a GROUP_AGG child, or file a further gap). This is
     an implementation task (not recon) — not selectable while M0141's
-    banner item 4 restricts to "cost diagnosis only, no executor work";
+    banner item 6 restricts to "cost diagnosis only, no executor work";
     wait for the banner to open item 3/4's implementation tasks, or select
     per whatever priority governs M0141-S2b-* implementation work at that
     time. Gate: TPC-DS SF0.25 sweep (category movement, no regression) +
@@ -5785,7 +5802,7 @@ spill route is net-negative.
 ## M0142 — Join-order costing (filed 2026-09-14)
 
 **Milestone doc:** `docs/milestones/0142-join-order-costing.md`
-**Harness (binding, read before selecting):** `AGENT.md` §"Plan-parity harness (M0137–M0144)"
+**Harness (binding, read before selecting):** `AGENT.md` §"Plan-parity harness (M0137–M0145)"
 **Source:** `METHODOLOGY3/04-forward-plan.md` Phase 3, unblocked by the Question 2 answer
 **Prerequisites:** **M0138** (landed and measured) and M0137.
 
@@ -7017,6 +7034,16 @@ cross-layer programme that has never been scoped.
     to decline -2/-3. Also incidentally found an EXPLAIN alias-mislabeling
     cosmetic bug on Q16/Q94 (execution-verified correct, display-only) —
     filed as **M0142-0008d** (below).
+    **Handoff note (owner decision 2026-09-20, M0145 filed):** this task's
+    increments are the pinned-spine-architecture route to semi/anti DP
+    participation; M0145-0003 is the jointree-native route to the same end
+    state (searched citizens via legality, not spine participants). The
+    chain's own measurements already spent the increments: (iii) is `[x]`
+    landed, and `-3i-leafcount`/`-3i-lateral-route`'s recon concluded (i)
+    is not implementable at Phase B for ANY of the five witnesses — the
+    wall is the resolver lowering sublink bodies before either phase.
+    Remaining work on this line is route-a step 2 (below), which M0145-0003
+    generalises; do not re-derive increments (i)/(ii) against the spine.
     - **REACHABILITY VERIFIED AT HEAD 2026-09-20 (loop \#53) —
       `M0142-0008a-3i-reach-verify`.** Design doc:
       `docs/design/0100-0149/m0142-0008a-3i-reach-verify.md`; evidence:
@@ -7244,6 +7271,11 @@ cross-layer programme that has never been scoped.
         are `OuterColumnRef{Level:1}` and must be re-based into the outer
         chain's column space at splice time; PG gets this free because its
         reference is a `Var` over a range-table index.
+      - **Handoff note (owner decision 2026-09-20, M0145 filed):** step 2
+        is the pilot instance of **M0145-0003**'s jointree pull-up. If
+        M0145-0001's IR design lands while this task is open, implement the
+        splice against the IR instead of the node-tree chain — do not build
+        the mechanism twice.
       - **STEP 1 LANDED 2026-09-20 — inert by construction.** Design doc:
         `docs/design/0100-0149/m0142-0008a-3i-route-a-retain-sublink-parse-tree.md`.
         Movement: none (zero production readers, so none was available).
@@ -9811,9 +9843,9 @@ cross-layer programme that has never been scoped.
 ## M0143 — Engine correctness carry-overs from the parity programme (filed 2026-09-14)
 
 **Milestone doc:** `docs/milestones/0143-engine-correctness-carry-overs.md`
-**Harness (binding, read before selecting):** `AGENT.md` §"Plan-parity harness (M0137–M0144)"
+**Harness (binding, read before selecting):** `AGENT.md` §"Plan-parity harness (M0137–M0145)"
 **Source:** `METHODOLOGY3/04-forward-plan.md` §3 "Continuous — engine correctness, not gated on anything"
-**Prerequisites:** none. Order: `.ralph/fix_plan.md` banner (item 8; M0143-0008 is handled with P0-E5).
+**Prerequisites:** none. Order: `.ralph/fix_plan.md` banner (item 9; M0143-0008 is handled with P0-E5).
 
 Real engine defects the parity programme discovered as a side effect. The case
 for treating them as a milestone rather than footnotes: **two genuine wrong-rows
@@ -11248,7 +11280,7 @@ reported, and the values and unit gates are the bar.
 ## M0144 — Measurement-first parity: censuses, instrumented PG, route-order alignment (filed 2026-09-20)
 
 **Milestone doc:** `docs/milestones/0144-measurement-first-parity.md`
-**Harness (binding, read before selecting):** `AGENT.md` §"Plan-parity harness (M0137–M0144)"
+**Harness (binding, read before selecting):** `AGENT.md` §"Plan-parity harness (M0137–M0145)"
 **Source:** `docs/design/not_ralph/plan_parity_fix_take2/METHODOLOGY4/03-forward-plan.md`
 (adopted by owner decision 2026-09-20, with two owner overrides recorded in the
 milestone doc: parallel-mode TPC-H parity is now canonical, and route-order
@@ -11335,7 +11367,7 @@ goopg's processing route diverged from PG's upstream of the fix).
   **(c) REFUTED as ordering** — producer sits at PG's position
   (upperordered.go:186 ≈ planner.c:5374); inert via
   `GOOPG_INCREMENTAL_SORT` default-off (incrementalsortpaths.go:81) plus
-  S7's measured cost loss — costing question, banner item 5's scope.
+  S7's measured cost loss — costing question, banner item 6's scope.
   **(d) confirmed** — `applyUpperNarrowing` at planner.go:190 runs after
   the tournament; PG prices narrowed width into candidates via
   `set_pathtarget_cost_width` (costsize.c:6367) from
@@ -11435,6 +11467,11 @@ goopg's processing route diverged from PG's upstream of the fix).
       **`M0142-0008a-3i-lateral-route`** — Phase B must search before Phase
       A lowers anything. That is a FOURTH independent confirmation of
       M0144-0003's own thesis.
+    - **Superseded by M0145-0003 (owner decision 2026-09-20):** the recon
+      then showed the lowering is one stage earlier still — the resolver
+      plans sublink bodies before either phase — and the real fix is the
+      jointree-level pull-up, not this leaf admission. Stays `[!]`; the
+      wall is M0145-0003.
     - Method lesson recorded in the doc §4: **a census of node KINDS does
       not license an assumption about those nodes' SHAPE.** The previous
       loop censused the type and inferred the shape; probe the predicate
@@ -11484,7 +11521,10 @@ goopg's processing route diverged from PG's upstream of the fix).
   can reach it — this is the same two-phase wall that blocks M0144-0003a
   and the three M0142-0008a-3 items, and it belongs behind the same gate.
   Do not re-scope as "build an appendrel representation" until the route
-  order is fixed.
+  order is fixed. **Superseded by M0145-0004 (owner decision 2026-09-20):**
+  the appendrel lives at jointree level in the new flow — flattening
+  happens there, before lowering. Stays `[!]`; the wall is M0145-0001's
+  IR plus 0003/0004.
   Kind: impl
   Parent: M0144-0003
 - [x] **M0144-0003c — pre-cost upper narrowing** (filed by M0144-0003 item
@@ -11509,7 +11549,7 @@ goopg's processing route diverged from PG's upstream of the fix).
     `docs/design/0100-0149/m0144-0003c-pre-cost-sort-width.md` (its §3
     decision and §4 limit were both written before any parity number).
     - **The filed premise is half wrong.** goopg ALREADY narrows pre-cost at
-      three sites, all from banner item 4's M0141-S2a-fix1 family: the
+      three sites, all from banner item 5's M0141-S2a-fix1 family: the
       ORDERED rel's Sort (`narrowOrderedRelWidths`, upperordered.go:82,
       sweep-a), WINDOW's internal sort (`window_sort_narrow.go`, sweep-b),
       and the aggregate's own entry sizing (`aggInputWidth`,
@@ -11832,6 +11872,14 @@ goopg's processing route diverged from PG's upstream of the fix).
   `pg-plan-parity-diff.py` category delta + `pg-plan-first-divergence.py`
   census diff vs the m0144-0002 table; match-count movement possible but
   not required.
+  **Residual handoff (owner decision 2026-09-20):** the gates this task's
+  chain could not remove at node level — `inputNodePathkeys`'s remaining
+  `default: nil` tops (`*MergeJoin`/`*GatherMerge`/`*IncrementalSort`/
+  `*WindowAgg`), `electOrderedGrouping`'s `gate-precondition` skip when
+  `node != agg.node`, `electOrderedDistinct`'s `cands<2`
+  (upperordereddistinct.go:140) — are owned by **M0145-0006** (upper-rel
+  pathlists), where election happens over candidate sets rather than
+  node-top walks.
   - **LANDED 2026-09-20 (loop \#44).** `inputNodePathkeys`' walk gained an
     `*Aggregate` arm — `aggregateEmissionPathkeys`
     (`internal/optimizer/upperorderedinput.go`), the node-level twin of
@@ -12176,7 +12224,7 @@ goopg's processing route diverged from PG's upstream of the fix).
       this lineage with a claim outside ±3.
     - `Incremental Sort` (14 records) is NOT a missing node — goopg has
       `*IncrementalSort` and `addIncrementalSortPaths`, gated off because
-      the candidate loses on cost. That is banner item 5.
+      the candidate loses on cost. That is banner item 6.
     - **Trap the implementer must not miss:** goopg materializes EVERY NL
       inner; PG materializes only the ones its admission rule admits
       (`postgres/src/backend/optimizer/path/joinpath.c:1890-1901` +
@@ -12192,3 +12240,148 @@ goopg's processing route diverged from PG's upstream of the fix).
       switches. Four slices are proposed in the design doc §4 and repeated
       in the root's escalation block.
     - Gates: none — recon, no production code changed (AGENT.md C1/D5).
+
+## M0145 — Jointree-first planner flow (filed 2026-09-20, owner decision)
+
+**Milestone doc:** `docs/milestones/0145-jointree-first-planner-flow.md`.
+**Harness (binding, read before selecting):** `AGENT.md` §"Plan-parity
+harness (M0137–M0145)" — note G8's dual-pipeline rule, new for this
+milestone. **Source:** the plan-flow comparison
+(`docs/design/not_ralph/plan_parity_fix_take2/METHODOLOGY4/plan-flow-medium-abstraction.md`)
++ the feasibility note (`tmp/planner-rewrite-possibility260920.md`).
+**Prerequisites:** none at entry; the in-task `Parent:` edges and the
+banner's written order give the sequence. Order: `.ralph/fix_plan.md`
+banner **item 3**.
+
+Unifies goopg's planning *route* with PG 18.3's, per the medium-abstraction
+comparison in
+`docs/design/not_ralph/plan_parity_fix_take2/METHODOLOGY4/plan-flow-medium-abstraction.md`
+and the rewrite-feasibility note `tmp/planner-rewrite-possibility260920.md`.
+The strategy is **grow the seam, never rewrite in place**: the existing
+`tryPGShapedJoinSearch` lattice (RelOptInfo/pathlist/partial-pathlist/DPPATH)
+is reused; what changes is its INPUT (a jointree-level IR instead of a
+lowered node subtree) and its SPAN (whole statement instead of the FROM
+chain). The new pipeline is selectable behind `GOOPG_JOINTREE_PIPELINE=1`
+(default off) until M0145-0008's cutover deletes the legacy one — corpus
+gates keep running on the default pipeline the whole time.
+
+**Hard constraint on every task:** Q78's `outer-over-derived` firewall must
+not weaken (owner constraint, carried from M0142-0008a-3i-route-a).
+
+**Absorbed walls** (do not work them separately): the resolver lowers every
+EXISTS/IN body via `planSelectWithParent` before unnest/search ever run
+(`planner.go:1499`→`planExistsExpr`; recon:
+`docs/design/0100-0149/m0142-0008a-3i-lateral-route-recon.md`), so
+M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
+`-3i-lateral-route` all block on this milestone's 0003.
+
+- [ ] **M0145-0001 — recon: the jointree-level IR and the lowering
+  contract** (design the representation the whole milestone builds on).
+  Inputs: the plan-flow doc (D1/D2/D4/D6), the lateral-route recon (the
+  wall is the resolver, not the phases), route-a step 1's landed
+  `ExistsExpr.Subquery`/`InExpr.Subquery` retention and
+  `sublinkBodyIsSimple` (`sublinkpullup.go`, port of `is_simple_subquery`
+  prepjointree.c:1807). Deliverables in the design doc: (i) IR entry kinds
+  — base-rel, semi/anti (SJInfo-equivalent: min lefthand/righthand relsets
+  + join quals), appendrel (child list for UNION ALL flattening), with
+  OuterColumnRef re-basing semantics spelled out; (ii) where the IR is
+  built — it must precede `resolveExpr`'s sublink planning
+  (planner.go:1499), so define whether resolution runs on the IR or the
+  IR derives from resolved-but-unplanned subtrees; (iii) the Path→Node
+  lowering contract — enumerate every piece of state the node-tree stages
+  currently establish incrementally (neededCols, outputCols, OuterColumnRef
+  remaps, rowmarks, CTE cache semantics, `rewriteJoinsToNLI`,
+  `stampSemiProbePrices`, SRF/ProjectSet, set-op handling) and assign each
+  a lowering-site owner; (iv) the retirement list — which seam guards
+  (leaf-count, lateral, pinned-spine, Phase A/B, `admitSemiAnti`,
+  `runJoinSearchBelowPinned`) become dead at which task.
+  Kind: recon
+  Parent: none
+- [ ] **M0145-0002 — dual-pipeline measurement harness** (the transition
+  must be measurable while the default pipeline stays the value-gated one).
+  `GOOPG_JOINTREE_PIPELINE=1` selects the new pipeline on private lanes;
+  value gates (`tpcds-sf025 sweep`, `tpch-spotcheck`, acceptance arms)
+  always run the default; plan-parity captures are EXPLAIN-only so a plan
+  the executor cannot yet run is still comparable evidence. Build: the env
+  knob at the planSelectWithSettings dispatch, a
+  `pg-plan-parity-diff.py`-compatible capture recipe for the knob arm, and
+  a per-stage divergence report (which of the six divergences the record
+  belongs to) so progress is visible per-slice, per AGENT.md G8.
+  Kind: impl
+  Parent: none
+- [ ] **M0145-0003 — sublink pull-up into the jointree** (goopg's
+  `pull_up_sublinks`/`pull_up_subqueries` analogue; the milestone's core).
+  Using route-a step 1's retained `.Subquery` parse trees, flatten bodies
+  passing `sublinkBodyIsSimple` into the IR as semi/anti entries (quals
+  merged into outer predicates, correlation `OuterColumnRef{Level:1}`
+  re-based into the outer column space at splice — PG gets this free via
+  `Var`/range-table indices); bodies that fail the simple test become
+  semi/anti entries carrying their planned Node as the non-flattenable
+  inner, so the search still sees them as citizens. Route-a step 2 is the
+  pilot subset — if it lands first on the node-tree chain, port it onto
+  the IR here rather than duplicating the mechanism. Must close the
+  P0-H11 `cumulativeFromSpans` span round-trip in the same change
+  (M0142-0008a-3i-reach-verify). Expected movement: the seam's
+  `leaf-count` decline class (26 across 11 queries) and the five census
+  witnesses (Q10/Q16/Q35/Q69/Q94 `join-method` records); re-derive leaf
+  arithmetic, do not carry today's shortfall over.
+  Kind: impl
+  Parent: M0145-0001
+- [ ] **M0145-0004 — UNION ALL flattening to an appendrel jointree entry**
+  (`pull_up_simple_union_all` analogue, prepjointree.c:1617). Absorbs
+  M0144-0003b's residual: the branches whose subtree never reached the
+  search at all (Q5's `*Project:nil-rel` on both sides, Q2/Q33/Q56/Q60)
+  become reachable once flattening happens at IR level before lowering.
+  `setOpBranchRel`/`addPartialSetOpPath` (0003b-1) already carry the rel
+  out of a SetOp node — the IR version makes the appendrel a real join
+  input so `add_paths_to_append_rel` semantics apply. Expected movement:
+  the TPC-DS Parallel Append sites (Q5×3, Q2, Q14, Q71, Q76) and census
+  `parallelism` records.
+  Kind: impl
+  Parent: M0145-0001
+- [ ] **M0145-0005 — single-pass DP over the jointree** (the search
+  consumes the IR directly; semi/anti entries are legal searched partners
+  via a `join_is_legal` port over the SJInfo-equivalent, joinrels.c:350).
+  Retires the Phase A/B split, `runJoinSearchBelowPinned`, the pinned
+  spine, splice-time re-resolution and the `admitSemiAnti` call-site
+  restriction — each retirement lands only when its deletion is exercised
+  by the corpus under `GOOPG_JOINTREE_PIPELINE=1`. Executor-capability
+  gates stay in path generation (parallel_hash refusal, partial nestloop
+  jointype whitelist) until the D3 substrate tasks land — flow parity
+  must not silently generate unexecutable shapes. Depends on M0145-0004
+  too: appendrel entries must exist in the IR before the single pass can
+  be complete for UNION ALL chains (a query whose chain still contains a
+  `*SetOp` falls back to the legacy pipeline, not to a partial search).
+  Kind: impl
+  Parent: M0145-0003
+- [ ] **M0145-0006 — upper-rel pathlists** (extend the lattice through
+  `create_grouping_paths`/`create_ordered_paths` analogues so ordering and
+  grouping are elected over candidate sets, not by stage-builder
+  producers). Absorbs D4's residual gates: `inputNodePathkeys`'s
+  `default: nil` tops (`*MergeJoin`/`*GatherMerge`/`*IncrementalSort`/
+  `*WindowAgg`), `electOrderedGrouping`'s `gate-precondition` skip when
+  `node != agg.node`, and `electOrderedDistinct`'s surviving `cands<2`
+  gate (upperordereddistinct.go:140).
+  Kind: impl
+  Parent: M0145-0005
+- [ ] **M0145-0007 — single Path→Node lowering** (the `create_plan`
+  analogue): consolidate every post-election resolution step the stage
+  builders currently interleave — per 0001's lowering-contract inventory —
+  into one pass that runs once on the elected path tree. During
+  transition the legacy stages must still fire on the old pipeline only;
+  a lowering bug must never silently reach the default pipeline.
+  Kind: impl
+  Parent: M0145-0005
+- [ ] **M0145-0008 — cutover**: flip `GOOPG_JOINTREE_PIPELINE` default,
+  re-run the full corpus gates on the new pipeline (sf025 sweep,
+  tpch-spotcheck, acceptance arm, plan-parity capture), then delete the
+  legacy pipeline and the retired seam guards from 0001's list. Requires
+  the executor-substrate tracking note: parallel-hash-build and
+  row-emitting PartialAgg (plan-flow doc D3; M0144-0011c's Materialize
+  sizing) are parity-enablers that stay OUT of this milestone — the
+  cutover records which census records remain `unexpressible` for that
+  reason so the executor milestone inherits an exact list. Requires
+  M0145-0006 as well as 0007: the cutover must not retire the stage
+  builders while upper-rel elections still live in them.
+  Kind: impl
+  Parent: M0145-0007

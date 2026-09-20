@@ -1,9 +1,9 @@
 # Milestone 0144 — Measurement-first parity: censuses, instrumented PG, route-order alignment
 
-**Status:** in progress — 4 done (M0144-0001, canonical parallel TPC-H `match=1/22` measured on the post-reload epoch — reported for the §Goal floor re-pin; M0144-0002, first-divergence census instrument + ranked tables under `analysis/m0144/`; M0144-0003, route-order verification — 4 confirmed divergences (a/b/d/e; a and e share one root), 1 refuted (c), impl tasks M0144-0003a/b/c filed; M0144-0004, `OPTIMIZER_DEBUG` instrumented PG 18.3 on scratch checkout + private `tpcds025` clone `:5560`, 12-query survivor-pathlist captures under `analysis/m0144/optdebug-0004/` — all plans shape-match the reference), 8 open +3 filed, 0 blocked/frozen in `.ralph/fix_plan.md` (2026-09-20); order per the fix_plan banner item 2
+**Status:** measurement phase complete — all instruments landed (0001–0010, 0003b-1, 0003c, 0011a/a-2/a-3, 0011b/b-1, 0011c recon). 3 items `[!]`-blocked: 0003a and 0003b superseded by M0145-0003/0004 (the wall is resolver-time lowering, not leaf admission); 0011 escalated to the owner under S4 (five consecutive `Movement: none` descendants). Successor milestone: M0145 (jointree-first planner flow) carries the route-level fixes (2026-09-20); order per the fix_plan banner item 2
 **Filed:** 2026-09-20 (owner directive)
 **Source:** `../design/not_ralph/plan_parity_fix_take2/METHODOLOGY4/03-forward-plan.md` — adopted wholesale, with the two owner overrides below
-**Harness:** `AGENT.md` §"Plan-parity harness (M0137–M0144)"
+**Harness:** `AGENT.md` §"Plan-parity harness (M0137–M0145)"
 **Prerequisites:** none.
 
 ## Why this milestone exists

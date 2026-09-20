@@ -445,7 +445,7 @@ If Go symbol operations fail:
   dependency forces another order. The banner wins over topmost placement, and
   it also outranks `.ralph/working_set.md`'s "NEXT LOOP" note, which carries
   state, not priority.
-- **Priority comes from the banner.** Tasks in M0137–M0144 and `P0-` tasks
+- **Priority comes from the banner.** Tasks in M0137–M0145 and `P0-` tasks
   follow §"Plan-parity harness" below — read it before selecting one.
   **M-NIGHTLY filing is unconditional:** every loop reads
   `ci/logs/action-items.md` and files each new `## AI-` subject, but M-NIGHTLY
@@ -455,16 +455,16 @@ If Go symbol operations fail:
   the upstream source over guessing.
 - Land a design doc alongside or just before any non-trivial subsystem. This
   is a hard requirement, not optional documentation. **Overridden for
-  M0137–M0144 only** — see §"Plan-parity harness" below, where the design doc is
+  M0137–M0145 only** — see §"Plan-parity harness" below, where the design doc is
   written when the task is *selected*.
 - For any non-trivial subsystem item, create/update the corresponding
   `docs/design/<milestone-or-spec-id>-NNNN-*.md` file and update
   `docs/design/README.md`
   in the same loop and commit. (This same-loop indexing requirement is **not**
-  relaxed for M0137–M0144.)
+  relaxed for M0137–M0145.)
 - Do not keep bare `NNNN-*` placeholders in active tasks. Replace them with
   concrete `<id>-NNNN-*` filenames before implementation begins. **Overridden
-  for M0137–M0144 only**: the filename is reserved at task selection, not at
+  for M0137–M0145 only**: the filename is reserved at task selection, not at
   milestone filing.
 - Tests are valuable, but per `PROMPT.md` they should not exceed ~20% of a
   loop's effort. Implementation > documentation > tests when prioritising.
@@ -489,10 +489,10 @@ If Go symbol operations fail:
   done.
 
 <!-- PLAN-PARITY-HARNESS:BEGIN -->
-## Plan-parity harness (M0137–M0144) — binding
+## Plan-parity harness (M0137–M0145) — binding
 
 Sections R and G7 apply to **every** Ralph loop task. The rest applies to
-tasks in M0137–M0144 and `P0-` tasks. Where this section disagrees with other
+tasks in M0137–M0145 and `P0-` tasks. Where this section disagrees with other
 sections of this file, it wins for those tasks (including over
 `docs/milestones/README.md` step 2 and "reserve a design-doc filename before
 coding"). Rationale and history: `docs/design/0100-0149/plan-parity-harness-background.md`
@@ -641,7 +641,7 @@ Run on the change, in the task that changes production code:
   and never generalises one task's exception into a standing one; without a row,
   a blocked gate means: mark the task `[!]`, escalate, select elsewhere.
 - **G2** Gate scripts write `tmp/gate-stamps/<gate>.json` (tree hash, binary
-  sha256, result). `.githooks/commit-msg` rejects an M0137–M0144 planner/executor
+  sha256, result). `.githooks/commit-msg` rejects an M0137–M0145 planner/executor
   commit without matching PASS stamps and a `CATEGORIES-EXCL-MATCH:` line (or
   `PARITY: N/A — <reason>`).
 - **G3 Captures**: private clone + binary built from HEAD, never a shared
@@ -669,6 +669,20 @@ Run on the change, in the task that changes production code:
 - **G7** A red gate is "pre-existing" only with proof: run it at HEAD with your
   change stashed and paste the output. Known: two `lostcancel` vet findings in
   `cmd/goopg/main.go`.
+- **G8 Dual-pipeline transition (M0145).** `GOOPG_JOINTREE_PIPELINE=1`
+  selects the jointree-first pipeline; the env knob is the sanctioned
+  migration mechanism (precedent: `GOOPG_PGSHAPED_DP`, `unnestPreDP`).
+  - Value gates (`tpcds-sf025 sweep`, `tpch-spotcheck`, acceptance arms)
+    always run the **default** pipeline — a PASS under the knob never
+    discharges them.
+  - Plan-parity captures under the knob are **EXPLAIN-only** on private
+    lanes: a plan the executor cannot yet run is recorded as evidence
+    (its own divergence class), never silently suppressed or gated on.
+  - A change that only affects the knob-on path still runs the default
+    pipeline's gates — the knob-off pipeline must stay green the whole
+    transition.
+  - The knob is retired by M0145-0008's cutover; nothing else may add a
+    second pipeline-selection mechanism.
 
 ### D — Done, deferral, reporting
 - **D1** Deferring any part needs **both** a `.ralph/deferral_ledger.md` row with

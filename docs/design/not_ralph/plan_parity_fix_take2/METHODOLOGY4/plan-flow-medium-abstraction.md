@@ -235,7 +235,8 @@ pre-cost at three sites, and its one real gap landed inert.
   and `M0142-0008a-3i-lateral` on one blocker: Phase B must search
   **before** Phase A lowers anything — a fourth confirmation of the
   route-order thesis. `M0144-0003b` (jointree UNION ALL flattening) is
-  the pending flow-level alignment; `M0144-0003c` landed `[x]` —
+  `[!]`-superseded — its residual lives in M0145-0004's jointree-level
+  appendrel (filed 2026-09-20); `M0144-0003c` landed `[x]` —
   correcting its own premise in the process (D5 above).
 - **M0144-0011 vertical slices** must pick representatives whose first
   divergence is NOT floored by D3's executor model; the margin census's
