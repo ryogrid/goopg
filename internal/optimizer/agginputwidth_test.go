@@ -99,3 +99,79 @@ func TestAggInputWidthNarrowsWhenTargetKnown(t *testing.T) {
 			gotNcols, gotAvgVar, fullNcols, fullAvgVar)
 	}
 }
+
+// TestSortSeedNarrowsWithTheAggregate is M0144-0003c: the Sort beneath a
+// grouping candidate must be priced on the SAME narrowed row `costAgg` is
+// charged on, not on the input rel's full row.
+//
+// PG never splits the two — `make_group_input_target` narrows once
+// (postgres/src/backend/optimizer/plan/planner.c:1676-1744),
+// `set_pathtarget_cost_width` finalises the width (costsize.c:6367), and
+// `cost_sort` reads that same `pathtarget->width` (costsize.c:2328). goopg
+// priced the aggregate through `aggInputWidth` and the Sort through the input
+// rel, so one input had two widths.
+//
+// The test drives `sortPathForBounded` directly with the full-width seed and
+// with the narrowed copy `addGroupingPaths` now builds, and asserts the
+// narrowed one is STRICTLY CHEAPER. Asserting the direction rather than an
+// exact figure keeps it a pin on the wiring, not on `costSortRunWithWidth`'s
+// arithmetic — which has its own tests and may legitimately be re-tuned.
+func TestSortSeedNarrowsWithTheAggregate(t *testing.T) {
+	cp := defaultCostParams()
+	child := awChild()
+	agg := awAgg(child)
+	// The keep-set stampAggregateInputTarget would derive: group key + agg
+	// arg, dropping the two unreferenced text columns.
+	agg.InputTarget, agg.InputTargetKnown = []int{0, 1}, true
+
+	inNcols, inAvgVar := aggInputWidth(child, agg)
+	if inNcols != 2 {
+		t.Fatalf("fixture: aggInputWidth kept %d cols, want 2", inNcols)
+	}
+
+	// The width term only reaches the PRICE through the spill branch
+	// (`nruns := inputBytes / work_mem`, cost_funcs.go) — an in-memory sort
+	// costs the same at any width, correctly. So the fixture must be large
+	// enough that the FULL row spills, which is exactly the case the
+	// narrowing is supposed to change.
+	const rows = 5_000_000
+	rel := newRelOptInfo(relsetOf(0), rows, 64)
+	rel.NCols = len(child.Output())
+	rel.AvgVarBytes = nodeAvgVarBytes(child.Output())
+	seed := &Path{Kind: PathPrebuilt, Rel: rel, Rows: rows, Cost: Cost{Total: 1000}}
+
+	narrowed := *seed
+	narrowed.NCols, narrowed.AvgVarBytes = inNcols, inAvgVar
+
+	keys := []PathKey{{Expr: &ColumnRef{Index: 0, Name: "g"}, SortAsc: true}}
+	full := sortPathForBounded(seed, keys, cp, -1)
+	narrow := sortPathForBounded(&narrowed, keys, cp, -1)
+
+	if pathNCols(seed) != len(child.Output()) {
+		t.Fatalf("fixture: full seed reads %d cols, want the un-narrowed %d",
+			pathNCols(seed), len(child.Output()))
+	}
+	if pathNCols(&narrowed) != inNcols {
+		t.Fatalf("narrowed seed reads %d cols, want the aggregate's %d",
+			pathNCols(&narrowed), inNcols)
+	}
+	if !(narrow.Cost.Total < full.Cost.Total) {
+		t.Fatalf("narrowed sort priced %v, not below the full-width %v — the "+
+			"per-path NCols override is not reaching sortPathForBounded",
+			narrow.Cost.Total, full.Cost.Total)
+	}
+}
+
+// TestSortSeedKeepsFullWidthWhenNoNarrowingIsDerivable: with no keep-set
+// stamped, `addGroupingPaths` must hand the seed through unchanged. The
+// override is an absorption of a derived quantity, not a licence to invent a
+// narrower row when none was derived.
+func TestSortSeedKeepsFullWidthWhenNoNarrowingIsDerivable(t *testing.T) {
+	child := awChild()
+	agg := awAgg(child) // InputTargetKnown stays false
+	inNcols, _ := aggInputWidth(child, agg)
+	if inNcols != len(child.Output()) {
+		t.Fatalf("with no keep-set derived, aggInputWidth must read the full row: got %d want %d",
+			inNcols, len(child.Output()))
+	}
+}

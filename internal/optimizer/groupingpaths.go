@@ -381,6 +381,37 @@ func addGroupingPaths(grouped *RelOptInfo, seed *Path, aggNode *Aggregate, child
 	inputStartup, inputTotal := seed.Cost.Startup, seed.Cost.Total
 	numGroups := grouped.Rows
 	inNcols, inAvgVar := aggInputWidth(child, aggNode)
+	// M0144-0003c: the Sort beneath a grouping candidate must be priced on the
+	// SAME narrowed row the aggregate above it is priced on.
+	//
+	// `sortPathForBounded` sizes through `pathNCols`/`pathAvgVarBytes`
+	// (joinpathsmerge.go), which fall through to the INPUT rel's full-row
+	// `NCols`/`AvgVarBytes`. So without this the two consumers of one input
+	// disagree: a full-width sort feeding a narrow-width aggregate.
+	//
+	// PG never splits them. `grouping_planner` builds the narrowed input
+	// target once (`make_group_input_target`,
+	// postgres/src/backend/optimizer/plan/planner.c:1676-1744),
+	// `set_pathtarget_cost_width` finalises its width (costsize.c:6367), and
+	// `cost_sort` reads that same `pathtarget->width` (costsize.c:2328) —
+	// one narrowing, every candidate priced from it.
+	//
+	// The quantity is `aggInputWidth` above: already derived, already the
+	// number `costAgg` is charged on, and already justified as M0141-S2a-fix1's
+	// B2 absorption of `pathtarget->width`. No new constant (R6), no newly
+	// chosen quantity (C3) — this only stops the two readers disagreeing.
+	//
+	// A shallow COPY, not a mutation: the hashed and index-driven arms read
+	// the seed's cost rather than its width, so narrowing in place would be
+	// invisible to them but would silently re-point anything else holding the
+	// pointer. `pathNCols`/`pathAvgVarBytes` prefer the per-path override
+	// (path.go:819-842), which is exactly what this copy sets.
+	sortSeed := seed
+	if seed != nil && inNcols > 0 {
+		narrowed := *seed
+		narrowed.NCols, narrowed.AvgVarBytes = inNcols, inAvgVar
+		sortSeed = &narrowed
+	}
 
 	groupedOut := len(aggNode.GroupExprs) > 0 || aggNode.GroupingSets != nil
 	presortedKeys, presorted := presortedAggKeysOrAbsent(aggNode, ps)
@@ -394,7 +425,9 @@ func addGroupingPaths(grouped *RelOptInfo, seed *Path, aggNode *Aggregate, child
 		input := seed
 		producer := groupAggPlainProducer
 		if presorted {
-			input = sortPathForBounded(seed, pathkeysForSortKeys(presortedKeys), cp, -1)
+			// M0144-0003c: narrowed seed — both sort sites change together
+			// (Hard-won Rule #2, the PLAIN and SORTED arms are one twin pair).
+			input = sortPathForBounded(sortSeed, pathkeysForSortKeys(presortedKeys), cp, -1)
 			producer = groupAggSortedProducer
 		}
 		// R47 slice 1: per-candidate spec clone. All arms below used
@@ -463,7 +496,8 @@ func addGroupingPaths(grouped *RelOptInfo, seed *Path, aggNode *Aggregate, child
 					Pathkeys: pathkeysForSortKeys(keys), Children: []*Path{idxSeed},
 				}, groupAggSortedIdxProducer)
 			} else {
-				sortedInput := sortPathForBounded(seed, pathkeysForSortKeys(keys), cp, -1)
+				// M0144-0003c: narrowed seed — see sortSeed above.
+				sortedInput := sortPathForBounded(sortSeed, pathkeysForSortKeys(keys), cp, -1)
 				// R47 slice 1: per-candidate spec clone (see PLAIN arm).
 				sortSpec := *aggNode
 				addPath(grouped, &Path{
