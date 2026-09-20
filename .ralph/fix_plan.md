@@ -12314,8 +12314,27 @@ EXISTS/IN body via `planSelectWithParent` before unnest/search ever run
 M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
 `-3i-lateral-route` all block on this milestone's 0003.
 
-- [ ] **M0145-0001 — recon: the jointree-level IR and the lowering
+- [x] **M0145-0001 — recon: the jointree-level IR and the lowering
   contract** (design the representation the whole milestone builds on).
+  **DONE 2026-09-21.** Design doc
+  `docs/design/0100-0149/m0145-0001-jointree-ir-and-lowering-contract.md`
+  (indexed). Decisions: (i) IR = `jtLeafRef`/`jtFromExpr`/`jtJoinExpr`/
+  `jtAppendRel` over a per-statement leaf table (`jtScope`), flat
+  `ColumnRef.Index` space kept with spans assigned at construction
+  (append-only); `SpecialJoinInfo` carried as-is; `OuterColumnRef` re-base
+  = Level decrement on splice, `Level:1`→`ColumnRef`, fail-closed when
+  `(Index,SourceTableIdx)` doesn't resolve to an emitting leaf in the
+  destination scope (Q78 firewall preserved). (ii) Resolution runs ON the
+  IR — leaf identity precedes binding (PG: rtable precedes `Var`);
+  `resolveExpr` loses its sublink-planning arms, bodies get bound-but-
+  unplanned provisional scopes, an `SS_process_sublinks` analogue plans
+  survivors post-pull-up. (iii) Lowering contract inventories ~40
+  incrementally-established state items, each assigned an
+  IR-CON/BIND/PULL/SEARCH/UPPER/LOWER/TAIL owner; `createPlanNode` stays
+  the single funnel. (iv) Per-task retirement matrix 0002–0008 in the
+  doc. Movement: none (recon; no production file touched).
+  Kind: recon
+  Parent: none
   Inputs: the plan-flow doc (D1/D2/D4/D6), the lateral-route recon (the
   wall is the resolver, not the phases), route-a step 1's landed
   `ExistsExpr.Subquery`/`InExpr.Subquery` retention and
