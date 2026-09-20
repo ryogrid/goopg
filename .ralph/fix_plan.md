@@ -11173,7 +11173,7 @@ goopg's processing route diverged from PG's upstream of the fix).
     NL-vs-HJ join election under the agg and `Materialize` existence are
     the deeper layers. Children 0011a/b/c filed below. Design doc:
     `docs/design/0100-0149/m0144-0011-q8-vertical-slice.md`.
-- [ ] **M0144-0011a — ordering-claim propagation at the ORDERED-step
+- [x] **M0144-0011a — ordering-claim propagation at the ORDERED-step
   boundary** (filed by M0144-0011). `inputNodePathkeys`
   (`internal/optimizer/upperorderedinput.go:176`) returns nil for every
   ordered-emitting node top that is not `*Sort`/searched-root — add the
@@ -11195,6 +11195,72 @@ goopg's processing route diverged from PG's upstream of the fix).
   `pg-plan-parity-diff.py` category delta + `pg-plan-first-divergence.py`
   census diff vs the m0144-0002 table; match-count movement possible but
   not required.
+  - **LANDED 2026-09-20 (loop \#44).** `inputNodePathkeys`' walk gained an
+    `*Aggregate` arm — `aggregateEmissionPathkeys`
+    (`internal/optimizer/upperorderedinput.go`), the node-level twin of
+    `groupingEmissionPathkeys` — which derives a sorted aggregate's
+    group-key emission order in OUTPUT coordinates, verified per key
+    against the group-prefix layout rather than assumed. PG citations:
+    `postgres/src/backend/optimizer/util/pathnode.c:3412-3416`
+    (`AGG_SORTED` copies the subpath's pathkeys) and
+    `postgres/src/backend/optimizer/plan/planner.c:5337`, `:5344-5348`
+    (`create_ordered_paths` reads them per input path). Design doc:
+    `docs/design/0100-0149/m0144-0011a-ordered-step-ordering-claim.md`.
+    Measured on TPC-DS SF0.25 with `pg-plan-parity-diff.py`: the
+    `CATEGORIES-EXCL-MATCH` `sort-strategy` count fell 67 → 60 (−7) while
+    match held at 2 → 2 and `missingnode` held at 25.
+    - Clean same-epoch A/B (both arms `GOOPG_ANALYZE_SEED=20260905`,
+      stats epoch `e4a554b2a4cfb710`, distinct binaries
+      `bdb4d6bade614b25` vs `163ba219e018a91a`). The first, unpinned
+      attempt read TPC-H `match 1 → 2` — that was the sampling epoch, not
+      the code; the pinned pair reads `match 2 → 2` with every TPC-H
+      category inside ±3.
+    - Plan-shape channel: 16/99 SF0.25 plans moved (Q7 Q8 Q10 Q15 Q17 Q25
+      Q26 Q29 Q35 Q37 Q40 Q45 Q50 Q66 Q69 Q82) — seven of the nine named
+      queries. Q21, Q62 and Q99 did NOT move and are not explained by this
+      slice.
+    - Q8 now plans `Limit → GroupAggregate → Sort → Hash Join …`, PG's own
+      depth-1/-2 shape; the redundant `Sort` over `GroupAggregate` is gone.
+    - Collateral: `TestExplainIndentDeepNesting` and its ANALYZE twin used
+      an ASCENDING `ORDER BY 2` fixture whose 4-level shape WAS the
+      redundant Sort. Repaired to `ORDER BY 2 DESC` — a genuine
+      re-ordering — so the indent assertions are unchanged and the root
+      `Sort Key: b DESC` doubles as evidence the new arm carries direction.
+    - Gates: units PASS, `tpch-spotcheck` PASS (Q12=2 Q13=33),
+      `tpcds-sf025 sweep` PASS (`MISMATCH=0 CKMISMATCH=0 ERROR=0
+      TIMEOUT=0`), `tpch-acceptance-arm` PASS (24/24 VALUES vs the HEAD
+      baseline). `make ea-ratchet`: `N/A — no estimate/selectivity/stats
+      code touched`.
+    Kind: impl
+    Parent: M0144-0011
+    Movement: yes — TPC-DS SF0.25 CATEGORIES-EXCL-MATCH sort-strategy 67 → 60 (−7)
+- [ ] **M0144-0011a-2 — the remaining `default: nil` ordering tops, and
+  `electOrderedGrouping`'s `cands<2` gate** (filed by M0144-0011a). Two
+  divergences M0144-0011a reviewed and deliberately did not bundle:
+  - `electOrderedGrouping` (`internal/optimizer/upperorderedgrouping.go`)
+    declines at `len(cands) < 2`; PG's `create_ordered_paths` iterates
+    `input_rel->pathlist` with NO minimum
+    (`postgres/src/backend/optimizer/plan/planner.c:5337`), so a lone
+    translatable `PathAgg` must still be offered. With M0144-0011a landed
+    the single-candidate ordering claim already reaches the ORDERED step
+    through the normal `createOrderedPaths` route, so relaxing the gate is
+    expected to be near-inert on today's corpus while widening the loop's
+    blast radius across every single-candidate grouping query — it needs
+    its own measurement, not a free ride on 0011a's.
+  - the walk's other `default: nil` TOPS: `*MergeJoin`, `*GatherMerge` and
+    `*IncrementalSort` as the input node's top (0011a handles
+    `*GatherMerge` only as an aggregate's CHILD). Each needs its own
+    output-coordinate soundness argument; bundling them makes a category
+    move unattributable.
+  Kind: impl
+  Parent: M0144-0011a
+  Expected movement: SF0.25 `sort-strategy` beyond its post-0011a value of
+  60, on the residue of the `Limit→{GroupAggregate|Finalize}` family that
+  0011a did NOT move (named: Q21, Q62, Q99 — the three named queries still
+  unmoved after 0011a). Measured: `pg-plan-parity-diff.py`
+  `CATEGORIES-EXCL-MATCH` on a private-lane SF0.25 capture against
+  `analysis/m0142/m0142-0012verify-tpcds-pg.txt`, plus a DPGROUP
+  loop-decline trace count showing the `cands<2(1)` declines that stop.
 - [ ] **M0144-0011b — join election under Q8's aggregate input**
   (filed by M0144-0011). At rel `{0,1,2,3}` ({dd⋈ss} ⋈ {store,ca-view}):
   goopg elected `join.hash total=19455.50`; the PG-chosen
