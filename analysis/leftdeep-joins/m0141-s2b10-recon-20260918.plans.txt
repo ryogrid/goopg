@@ -1,0 +1,23 @@
+=== Q4
+Sort  (cost=500932.69..500932.70 rows=5 width=72)
+  Sort Key: o_orderpriority
+  ->  HashAggregate  (cost=500902.21..500902.26 rows=5 width=72)
+        Group Key: o_orderpriority
+        ->  Nested Loop Semi Join  (cost=0.38..500750.45 rows=12141 width=448)
+              ->  Seq Scan on orders  (cost=0.00..15557.30 rows=55730 width=448)
+                    Filter: ((o_orderdate >= '1993-07-01'::date) AND (o_orderdate < '1993-10-01 00:00:00'::timestamp))
+              ->  Index Scan using idx_lineitem_orderkey_fkidx on lineitem  (cost=0.00..0.18 rows=18 width=550)
+                    Index Cond: (l_orderkey = o_orderkey)
+                    Filter: (l_commitdate < l_receiptdate)
+
+=== Q12
+Sort  (cost=353512.87..353512.89 rows=7 width=60)
+  Sort Key: lineitem.l_shipmode
+  ->  HashAggregate  (cost=353440.37..353440.44 rows=7 width=60)
+        Group Key: lineitem.l_shipmode
+        ->  Hash Join  (cost=271782.42..353006.60 rows=28918 width=172)
+              Hash Cond: (orders.o_orderkey = lineitem.l_orderkey)
+              ->  Seq Scan on orders  (cost=0.00..43435.00 rows=1500000 width=448)
+              ->  Seq Scan on lineitem  (cost=0.00..271420.95 rows=28918 width=550)
+                    Filter: (((((l_shipmode = ANY ('MAIL', 'SHIP')) AND (l_commitdate < l_receiptdate)) AND (l_shipdate < l_commitdate)) AND (l_receiptdate >= '1994-01-01'::date)) AND (l_receiptdate < '1995-01-01 00:00:00'::timestamp))
+
