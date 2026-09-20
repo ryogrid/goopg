@@ -237,6 +237,15 @@ Two important notes captured while producing it (details in `MANIFEST.md`):
   (lineitem: PG 5,998,835 vs goopg 6,001,255 vs canonical dbgen 6,001,215),
   so a PG-side dump cannot serve as the goopg golden.
 
+**Re-dump rule (pinned 2026-09-20, M0144-0009):** the golden is the
+record-level reference *for `:65433`'s current load*. If the cluster is
+ever reloaded (FK-set changes, fresh `build_schema_goopg.sh`, recovery to
+a different dataset), re-dump the golden — new dated dir
+`tpch-golden-YYYYMMDD/` + `MANIFEST.md` + `MANIFEST.md5` — before any
+record-level comparison against it is trusted. Do not overwrite a dated
+golden in place: earlier dumps are the provenance chain for evidence
+produced against that load.
+
 ### Inspect the memory budget
 
 ```

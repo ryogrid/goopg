@@ -2320,8 +2320,9 @@ before/after proving the defect it closes.
   `CATEGORIES-EXCL-MATCH:` lines against the same corpus the review used,
   and republish the headline with a stated stats epoch. Ledger:
   `m0137-0020-recapture-headline-unowned`.
-- [ ] **M0137-0022 — re-pin the `make plan-gate` baseline** (filed 2026-09-19
-  by a Devin session at owner request).
+- [ ] **M0137-0022 — re-pin the `make plan-gate` baseline via the
+  private-lane reframed path** (filed 2026-09-19 by a Devin session at
+  owner request; **scope amended 2026-09-20 by M0144-0009**).
   Parent: none. Kind: impl.
   The `m0137-0005-rebaseline-20260915`
   pin now reports **14/22 diverged** (8 MATCH: Q1/Q3/Q6/Q11/Q15a/Q16/Q18/Q20;
@@ -2333,16 +2334,24 @@ before/after proving the defect it closes.
   not a new regression. Procedure per the M0137-0005 doc
   (`docs/design/0100-0149/m0137-0005-plan-gate-rebaseline.md`): census the 14
   divergences and attribute them to landed mechanism classes, `tpch-spotcheck`
-  PASS before pinning, then `make plan-snapshot-capture LABEL=<name>` plus a
-  design doc. NOTE: the live `:65433` binary was rebuilt at `2b8afa538`
-  during the 2026-09-20 owner 8-FK reload — it still lags HEAD (a handful of
-  commits since, e.g. `1f76d83d9`), so a pin taken now covers the *live
-  binary's* plans and may re-drift on the next server rebuild; pinning exact
-  HEAD plans needs an owner-run rebuild+restart of `:65433`
-  (`maintenance_prompts/cluster-ops-runbook.md`). Escalate per the
-  reference-cluster rule if an owner rebuild is wanted before pinning.
+  PASS before pinning, then capture plus a design doc.
+  **Amended scope (M0144-0009 decision, doc
+  `docs/design/0100-0149/m0144-0009-plan-gate-reframing.md`):** the gate is
+  reframed to diff a fresh private-clone HEAD build — `make plan-gate` /
+  `plan-snapshot-capture` as designed compares live-`:65433` vs the pin with
+  the staged code in neither side, so it can never see staged-code
+  regressions. This task therefore ALSO lands the reframed path: build the
+  staged tree → `scripts/lib/tpch-private-clone.sh`'s
+  `tpch_private_clone_snapshot` (pg_basebackup online clone of `:65433`, no
+  stop/wait) → boot the staged binary on a `55xx` lane under
+  `scripts/goopg-test-run.sh` → `plan-snapshot diff|capture` with
+  `--port <55xx>` → stop + drop the clone; wire it as the `plan-gate` /
+  `plan-snapshot-capture` path (Makefile target or a thin script the target
+  calls). The re-pin is then taken through that path, which removes the old
+  "needs an owner rebuild of `:65433`" blocker by construction — the pin is
+  the staged tree's plans, not the live binary's.
   Also note the capture is **parallel-mode by construction** —
-  `cmd/plan-snapshot` sets no serial GUC and `:65433` serves
+  `cmd/plan-snapshot` sets no serial GUC and the clone inherits
   `max_parallel_workers_per_gather=4` — consistent with the 2026-09-20
   parallel-canonical headline.
 
@@ -11082,7 +11091,7 @@ goopg's processing route diverged from PG's upstream of the fix).
     stocktake (~7 s EXPLAIN-only, private lane). Design doc:
     `docs/design/0100-0149/m0144-0008-tpcds-sf1-cadence.md`; record +
     artifacts `analysis/m0144/m0144-0008-*`. Lane stopped after capture.
-- [ ] **M0144-0009 — `plan-gate` reframing evaluation** (03-forward-plan §5).
+- [x] **M0144-0009 — `plan-gate` reframing evaluation** (03-forward-plan §5).
   The gate diffs live `:65433` (binary lags HEAD) vs the newest committed
   snapshot — it can never see staged-code regressions. Evaluate: keep
   re-pinning on a schedule (M0137-0022) vs diff a fresh private-clone HEAD
@@ -11094,6 +11103,25 @@ goopg's processing route diverged from PG's upstream of the fix).
   if absent.
   Kind: recon
   Parent: none
+  - **DONE 2026-09-20 (loop \#41).** Movement: none — harness-hygiene
+    decision, no plan movement claimed. **Decision: REFRAME.** Verified
+    the structural blindness: `plan-gate` diffs live-`:65433` (binary
+    `goopg-bin` sha `736aaa57…`, rebuilt `2b8afa538`, 4 `internal/`/`cmd/`
+    commits behind HEAD) vs the `m0137-0005-rebaseline-20260915` pin —
+    staged code is in neither side, so it detects only server/data drift,
+    never code regressions. The reframed path needs no new mechanism:
+    `tpch_private_clone_snapshot` (pg_basebackup online clone, R1-allowed)
+    + `55xx` lane + `plan-snapshot diff --port` — same pattern M0144-0008
+    used for TPC-DS SF1. **M0137-0022 amended in place**: it now lands
+    the private-lane capture/diff path AND takes the re-pin through it —
+    the "needs owner rebuild of `:65433`" blocker is removed by
+    construction. Re-pinning is re-scoped, not eliminated: trigger becomes
+    each landed plan-moving change, not a calendar schedule.
+    **Golden-record rule added** to
+    `maintenance_prompts/cluster-ops-runbook.md` §"Record-level golden
+    dump" (was absent): reload ⇒ re-dump a new dated golden dir before
+    record-level comparisons are trusted. Design doc:
+    `docs/design/0100-0149/m0144-0009-plan-gate-reframing.md`.
 - [ ] **M0144-0010 — ledger bulk-triage tooling** (03-forward-plan §6). ~2,100
   open `.ralph/deferral_ledger.md` rows. Build tooling that (1) flags rows
   whose referenced code/tests no longer exist (`git log -S` checks), (2)
