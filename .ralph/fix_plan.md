@@ -11234,7 +11234,7 @@ goopg's processing route diverged from PG's upstream of the fix).
     Kind: impl
     Parent: M0144-0011
     Movement: yes — TPC-DS SF0.25 CATEGORIES-EXCL-MATCH sort-strategy 67 → 60 (−7)
-- [ ] **M0144-0011a-2 — the remaining `default: nil` ordering tops, and
+- [x] **M0144-0011a-2 — the remaining `default: nil` ordering tops, and
   `electOrderedGrouping`'s `cands<2` gate** (filed by M0144-0011a). Two
   divergences M0144-0011a reviewed and deliberately did not bundle:
   - `electOrderedGrouping` (`internal/optimizer/upperorderedgrouping.go`)
@@ -11268,12 +11268,65 @@ goopg's processing route diverged from PG's upstream of the fix).
     - The two bullets above therefore remain genuinely UNMEASURED: they
       have no named query left from the 0011a residue, and the first job
       of whoever selects this task is to find one (or to retire the task).
-  Expected movement: **withdrawn pending a named query** — the original
-  claim (SF0.25 `sort-strategy` beyond 60 via Q21/Q62/Q99) is refuted by
-  the probe above. Re-state it, with a query the trace shows declining at
-  `cands<2(1)` or stopping at a `*MergeJoin`/`*GatherMerge`/
-  `*IncrementalSort` top, before doing any production work here
-  (AGENT.md S5).
+  Expected movement: **was withdrawn pending a named query**; the census
+  below supplied the answer and it is `Movement: none` — see the
+  RESOLVED block.
+  - **RESOLVED 2026-09-20 (loop \#46) — census first, then one bullet
+    implemented and one retired.** Design doc:
+    `docs/design/0100-0149/m0144-0011a-2-ordered-seam-candidate-minimum.md`;
+    census: `analysis/m0144/m0144-0011a-2-ordered-seam-census.md`.
+    Kind: impl
+    Parent: M0144-0011a
+    Movement: none
+    - The 99-query ORDERED-seam census (private `:5595` lane,
+      `GOOPG_PGSHAPED_DP_TRACE=1`, per-query byte-offset log reads) splits
+      the corpus by `electOrderedGrouping` verdict: `gate-precondition`
+      44, `cands<2(1)` 37, `parallel-finalize-agg-present` 4, elected 14.
+    - Of the 37 `cands<2(1)` declines, 27 ALREADY recover their ordering
+      claim at the ORDERED step via `inputNodePathkeys` (17 with
+      `contained=true`, i.e. no Sort stacked at all; 10 with a partial
+      claim). Only 11 arrive with `keys=0`.
+    - Those 11 (`Q5 Q14 Q16 Q18 Q22 Q27 Q77 Q80 Q92 Q94 Q95`) are EXACTLY
+      the 11 that decline `anyTranslated=false` in the relaxed arm, and
+      every per-candidate decline in the corpus reads
+      `strategy-or-mode strategy=0` — a HASHED lone candidate, which emits
+      no order. They belong to the `aggregation-strategy` lineage, not to
+      ordering-claim propagation.
+      - Bonus: that identity is a corpus-wide measurement of the
+        sibling-agreement invariant — `groupingEmissionPathkeys` (Path
+        twin) and `aggregateEmissionPathkeys` (Node twin) decline on the
+        same query set, query for query.
+    - **Bullet 2 RETIRED by measurement**: the `*MergeJoin`/`*GatherMerge`/
+      `*IncrementalSort` walk tops have NO query on this corpus. Ledger row
+      keeps the divergence from being lost.
+    - **Bullet 1 LANDED**: `len(cands) < 2` → `len(cands) < 1`. PG has no
+      minimum — `create_ordered_paths` iterates the whole pathlist
+      (`postgres/src/backend/optimizer/plan/planner.c:5337`). Pinned by
+      `TestElectOrderedGroupingOffersALoneCandidate` and
+      `TestElectOrderedGroupingStillDeclinesAnEmptyRel`.
+    - Result: SHAPE-inert on both corpora — cost-stripped plan diff is 0
+      lines for all 99 SF0.25 and all 22 TPC-H queries, parity match 2 → 2
+      and every `CATEGORIES-EXCL-MATCH` count identical. 14 queries (10
+      SF0.25 + 4 TPC-H) reprice their ORDER BY `Sort` through
+      `addOrderedPaths` instead of the prebuilt seed's
+      `DeriveLegacyDisplayCost`, which is the direction the ORDERED rel was
+      built for.
+    - **METHODOLOGY CORRECTION, recorded deliberately**: the private
+      `:5595` lane reported ZERO plan changes; the gate-owned `:65437`
+      cluster reported ten. The lane is a stale clone with its own
+      statistics — sound for MECHANISM traces, unsound for OUTCOME claims.
+      An earlier draft comment asserting "byte-identical either way" on
+      lane evidence was corrected before landing.
+    - Gates: units PASS; `tpch-spotcheck` PASS (Q12=2 Q13=33);
+      `tpcds-sf025 sweep` PASS (`MISMATCH=0 CKMISMATCH=0 ERROR=0
+      TIMEOUT=0`); `tpch-acceptance-arm` PASS (24/24 VALUES);
+      `make ea-ratchet` `N/A`. All re-run after a late comment-only edit,
+      since the stamp hashes the staged `internal/` tree.
+    - Left open, deliberately NOT filed as children here (neither is an
+      ordering-claim problem — filing them here would repeat this task's
+      own predecessor's mistake): `gate-precondition` is now the largest
+      decline class (44/99) and is entirely unexamined; the 11 hashed-lone-
+      candidate queries are an aggregation-strategy election question.
 - [x] **M0144-0011a-3 — crossing a positional-identity `Project` at the
   ORDERED seam** (filed by M0144-0011a-2's probe). `inputNodePathkeys`
   (`internal/optimizer/upperorderedinput.go`) stopped at every `*Project`,
