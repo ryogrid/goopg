@@ -1,0 +1,372 @@
+time=2026-09-20T16:01:46.014+09:00 level=INFO msg="connection established" remote=127.0.0.1:42274 pid=1 user=postgres application_name=psql
+DPPATH path producer=joinsearch.prebuilt relids={0} kind=0 reqouter=- rows=50000 startup=0 total=1367 disabled=0 pathkeys=0 verdict=accepted jointype=inner outer=- inner=- width=388 inputtotal=-1
+DPPATH path producer=joinsearch.prebuilt relids={1} kind=0 reqouter=- rows=47106 startup=0 total=3229 disabled=0 pathkeys=0 verdict=accepted jointype=inner outer=- inner=- width=324 inputtotal=-1
+DPPATH partial producer=scan.seq.partial relids={1} kind=1 reqouter=- rows=27709 startup=0 total=2714.294117647059 disabled=0 pathkeys=0 verdict=accepted jointype=inner outer=- inner=- width=324 inputtotal=-1
+DPPATH path producer=index.parameterised relids={0} kind=2 reqouter={1} rows=1 startup=0.25 total=0.4307538317836369 disabled=0 pathkeys=1 verdict=accepted jointype=inner outer=- inner=- width=388 inputtotal=-1
+DPPATH path producer=index.ordered relids={0} kind=2 reqouter=- rows=50000 startup=0.25 total=2496.25 disabled=0 pathkeys=1 verdict=accepted jointype=inner outer=- inner=- width=388 inputtotal=-1
+DPPATH path producer=bitmap.or relids={0} kind=15 reqouter={1} rows=1 startup=8.25525 total=12.26525 disabled=0 pathkeys=0 verdict=dominated jointype=inner outer=- inner=- width=388 inputtotal=8.25525
+DPPATH path producer=gather relids={1} kind=11 reqouter=- rows=47106 startup=1000 total=8424.89411764706 disabled=0 pathkeys=0 verdict=dominated jointype=inner outer=- inner=- width=324 inputtotal=2714.294117647059
+DPPGSORT caller=sortpath inputrows=50000 tuples=50000 output=50000 limit=-1 width=36 goopginput=6.45e+06 goopgoutput=6.45e+06 pginput=3.2e+06 pgoutput=3.2e+06 goopgbranch=memory pgbranch=memory currency=goopg
+DPPGSORT caller=sortpath inputrows=47106 tuples=47106 output=47106 limit=-1 width=36 goopginput=5.88825e+06 goopgoutput=5.88825e+06 pginput=3.01478e+06 pgoutput=3.01478e+06 goopgbranch=memory pgbranch=memory currency=goopg
+DPPATH path producer=mergejoin relids={0,1} kind=4 reqouter=- rows=47106 startup=12154.689093375995 total=13111.274276811577 disabled=0 pathkeys=1 verdict=accepted jointype=inner outer={0} inner={1} width=712 inputtotal=5394.410118609203
+DPPGSORT caller=sortpath inputrows=47106 tuples=47106 output=47106 limit=-1 width=36 goopginput=5.88825e+06 goopgoutput=5.88825e+06 pginput=3.01478e+06 pgoutput=3.01478e+06 goopgbranch=memory pgbranch=memory currency=goopg
+DPPATH path producer=mergejoin relids={0,1} kind=4 reqouter=- rows=47106 startup=6885.528974766792 total=10213.114158202374 disabled=0 pathkeys=1 verdict=accepted jointype=inner outer={0} inner={1} width=712 inputtotal=2496.25
+DPPGHASH outer={0} inner={1} mapentry=125.00 mapbuckets=65536 mapbatches=1 mapspill=false pgouterwidth=36 pginnerwidth=36 pgtuplebytes=72 pgbuckets=65536 pgbatches=1 pgouterpages=- pginnerpages=- pgspill=false currency=map
+DPPATH path producer=join.hash relids={0,1} kind=3 reqouter=- rows=47106 startup=3817.825 total=7030.885 disabled=0 pathkeys=0 verdict=accepted jointype=inner outer={0} inner={1} width=712 inputtotal=1367
+DPPATH path producer=join.nestloop relids={0,1} kind=5 reqouter=- rows=47106 startup=0 total=3.5334213765e+07 disabled=0 pathkeys=0 verdict=dominated jointype=inner outer={0} inner={1} width=712 inputtotal=1367
+DPPGSORT caller=sortpath inputrows=47106 tuples=47106 output=47106 limit=-1 width=36 goopginput=5.88825e+06 goopgoutput=5.88825e+06 pginput=3.01478e+06 pgoutput=3.01478e+06 goopgbranch=memory pgbranch=memory currency=goopg
+DPPGSORT caller=sortpath inputrows=50000 tuples=50000 output=50000 limit=-1 width=36 goopginput=6.45e+06 goopgoutput=6.45e+06 pginput=3.2e+06 pgoutput=3.2e+06 goopgbranch=memory pgbranch=memory currency=goopg
+DPPATH path producer=mergejoin relids={0,1} kind=4 reqouter=- rows=47106 startup=12154.689093375995 total=13111.274276811577 disabled=0 pathkeys=1 verdict=accepted jointype=inner outer={1} inner={0} width=712 inputtotal=7003.0439747667915
+DPPGHASH outer={1} inner={0} mapentry=129.00 mapbuckets=65536 mapbatches=1 mapspill=false pgouterwidth=36 pginnerwidth=36 pgtuplebytes=72 pgbuckets=65536 pgbatches=1 pgouterpages=- pginnerpages=- pgspill=false currency=map
+DPPATH path producer=join.hash relids={0,1} kind=3 reqouter=- rows=47106 startup=1992 total=5868.7075 disabled=0 pathkeys=0 verdict=accepted jointype=inner outer={1} inner={0} width=712 inputtotal=3229
+DPPGHASH outer={1} inner={0} mapentry=129.00 mapbuckets=65536 mapbatches=1 mapspill=false pgouterwidth=36 pginnerwidth=36 pgtuplebytes=72 pgbuckets=65536 pgbatches=1 pgouterpages=- pginnerpages=- pgspill=false currency=map
+DPPATH partial producer=join.hash.partial relids={0,1} kind=3 reqouter=- rows=27709 startup=1992 total=5087.292867647059 disabled=0 pathkeys=0 verdict=accepted jointype=inner outer={1} inner={0} width=712 inputtotal=2714.294117647059
+DPPATH path producer=join.nestloop relids={0,1} kind=5 reqouter=- rows=47106 startup=0 total=3.5334221e+07 disabled=0 pathkeys=0 verdict=dominated jointype=inner outer={1} inner={0} width=712 inputtotal=3229
+DPPATH path producer=nestloop.index relids={0,1} kind=5 reqouter=- rows=47106 startup=0.25 total=23991.15 disabled=0 pathkeys=0 verdict=dominated jointype=inner outer={1} inner={0} width=712 inputtotal=3229
+DPPATH path producer=nestloop.index relids={0,1} kind=5 reqouter=- rows=47106 startup=0.25 total=20133.985036658767 disabled=0 pathkeys=0 verdict=dominated jointype=inner outer={1} inner={0} width=712 inputtotal=3229
+DPPATH partial producer=join.nestloop.partial relids={0,1} kind=5 reqouter=- rows=27709 startup=0 total=2.0785956294117644e+07 disabled=0 pathkeys=0 verdict=dominated jointype=inner outer={1} inner={0} width=712 inputtotal=2714.294117647059
+DPPATH partial producer=join.nestloop.partial relids={0,1} kind=5 reqouter=- rows=27709 startup=0.25 total=8000.142042539854 disabled=0 pathkeys=0 verdict=dominated jointype=inner outer={1} inner={0} width=712 inputtotal=2714.294117647059
+DPPATH partial producer=join.nestloop.partial relids={0,1} kind=5 reqouter=- rows=27709 startup=0.25 total=7012.217762461066 disabled=0 pathkeys=0 verdict=dominated jointype=inner outer={1} inner={0} width=712 inputtotal=2714.294117647059
+DPPATH path producer=gather relids={0,1} kind=11 reqouter=- rows=47106 startup=2992 total=10797.89286764706 disabled=0 pathkeys=0 verdict=dominated jointype=inner outer=- inner=- width=712 inputtotal=5087.292867647059
+DPTRACE problem nrels=2 rels=customer_address,customer
+DPTRACE pair phase=1 lev=2 created=1 pair={customer_address} | {customer} outer={customer_address} inner={customer}
+DPTRACE cost lev=2 rel={customer+customer_address} rows=47106 npaths=3 cheapest=hash reqouter={} total=5868.7075 second=merge secondtotal=10213.114158202374
+DPTRACE cpadmit src=base rel={customer_address} cp=1 leaf=seq
+DPTRACE cpadmit src=base rel={customer} cp=1 leaf=seq
+DPTRACE cpadmit src=join rel={customer+customer_address} cp=1 in1=1 in2=1 nclauses=1 failidx=-1 failkind=none
+DPTRACE cpgather rel={customer} partials=1 verdict=admitted
+DPTRACE cpgather rel={customer+customer_address} partials=1 verdict=admitted
+DPTRACE pveto site=base rel={customer_address} dir=- veto=B4 detail=leaf=seq workers=0
+DPTRACE pveto site=base rel={customer} dir=- veto=admitted detail=leaf=seq workers=1
+DPTRACE pveto site=merge rel={customer+customer_address} dir={customer_address}+{customer} veto=M3 detail=jt=INNER
+DPTRACE pveto site=mergeu rel={customer+customer_address} dir={customer_address}+{customer} veto=M3u detail=cands=0 jt=INNER
+DPTRACE pveto site=hash rel={customer+customer_address} dir={customer_address}+{customer} veto=V4 detail=jt=INNER
+DPTRACE pveto site=nestloop rel={customer+customer_address} dir={customer_address}+{customer} veto=V4 detail=jt=INNER
+DPTRACE pveto site=merge rel={customer+customer_address} dir={customer}+{customer_address} veto=M7 detail=osort=1 jt=INNER
+DPTRACE pveto site=mergeu rel={customer+customer_address} dir={customer}+{customer_address} veto=M7 detail=cand=0 jt=INNER keys=0
+DPTRACE pveto site=hash rel={customer+customer_address} dir={customer}+{customer_address} veto=V9 detail=jt=INNER workers=1
+DPTRACE end top={customer+customer_address} pairs=1 declined=0 costs=1 status=ok
+DPPGSORT caller=sortpath inputrows=47106 tuples=47106 output=47106 limit=-1 width=40 goopginput=7.16011e+06 goopgoutput=7.16011e+06 pginput=3.01478e+06 pgoutput=3.01478e+06 goopgbranch=memory pgbranch=memory currency=goopg
+DPPATH path producer=upper.groupagg.sort relids=- kind=6 reqouter=- rows=3212 startup=9996.046474766792 total=10389.491474766794 disabled=0 pathkeys=1 verdict=accepted jointype=inner outer=- inner=- width=40 inputtotal=10113.811474766793
+DPPATH path producer=upper.groupagg.hashed relids=- kind=6 reqouter=- rows=3212 startup=6575.2975000000015 total=6615.447500000001 disabled=0 pathkeys=0 verdict=accepted jointype=inner outer=- inner=- width=40 inputtotal=6339.767500000001
+DPTRACE upper gate=agg-upper verdict=refused gate=statement
+DPPATH path producer=upper.setop.hashed relids={0} kind=10 reqouter=- rows=535 startup=7399.4125 total=7400.75 disabled=0 pathkeys=0 verdict=accepted jointype=inner outer=- inner=- width=32 inputtotal=833.3199999999999
+DPPATH path producer=joinsearch.prebuilt relids={0} kind=0 reqouter=- rows=719876 startup=0 total=20132.760000000002 disabled=0 pathkeys=0 verdict=accepted jointype=inner outer=- inner=- width=428 inputtotal=-1
+DPPATH path producer=joinsearch.prebuilt relids={1} kind=0 reqouter=- rows=91 startup=0 total=2474.7349999999997 disabled=0 pathkeys=0 verdict=accepted jointype=inner outer=- inner=- width=420 inputtotal=-1
+DPPATH path producer=joinsearch.prebuilt relids={2} kind=0 reqouter=- rows=12 startup=0 total=1.12 disabled=0 pathkeys=0 verdict=accepted jointype=inner outer=- inner=- width=676 inputtotal=-1
+DPPATH path producer=joinsearch.prebuilt relids={3} kind=0 reqouter=- rows=535 startup=0 total=8.350000000000001 disabled=0 pathkeys=0 verdict=accepted jointype=inner outer=- inner=- width=32 inputtotal=-1
+DPPATH partial producer=scan.seq.partial relids={0} kind=1 reqouter=- rows=232218 startup=0 total=15256.18064516129 disabled=0 pathkeys=0 verdict=accepted jointype=inner outer=- inner=- width=428 inputtotal=-1
+DPPATH partial producer=scan.seq.partial relids={1} kind=1 reqouter=- rows=54 startup=0 total=2023.55 disabled=0 pathkeys=0 verdict=accepted jointype=inner outer=- inner=- width=420 inputtotal=-1
+DPPATH path producer=index.parameterised relids={1} kind=2 reqouter={0} rows=1 startup=0.25 total=0.28710294550728177 disabled=0 pathkeys=1 verdict=accepted jointype=inner outer=- inner=- width=420 inputtotal=-1
+DPPATH path producer=index.parameterised relids={2} kind=2 reqouter={0} rows=1 startup=0.125 total=0.14002222605004194 disabled=0 pathkeys=1 verdict=accepted jointype=inner outer=- inner=- width=676 inputtotal=-1
+DPPATH path producer=index.ordered relids={1} kind=2 reqouter=- rows=91 startup=0.25 total=4127.23 disabled=0 pathkeys=1 verdict=accepted jointype=inner outer=- inner=- width=420 inputtotal=-1
+DPPATH partial producer=index.ordered.partial relids={1} kind=2 reqouter=- rows=54 startup=0.25 total=3676.045 disabled=0 pathkeys=1 verdict=accepted jointype=inner outer=- inner=- width=420 inputtotal=-1
+DPPATH path producer=index.ordered relids={2} kind=2 reqouter=- rows=12 startup=0.125 total=16.305000000000003 disabled=0 pathkeys=1 verdict=accepted jointype=inner outer=- inner=- width=676 inputtotal=-1
+DPPATH path producer=bitmap.or relids={1} kind=15 reqouter={0} rows=1 startup=8.25525 total=12.27025 disabled=0 pathkeys=0 verdict=dominated jointype=inner outer=- inner=- width=420 inputtotal=8.25525
+DPPATH path producer=bitmap.or relids={2} kind=15 reqouter={0} rows=1 startup=8.13025 total=12.14025 disabled=0 pathkeys=0 verdict=dominated jointype=inner outer=- inner=- width=676 inputtotal=8.13025
+DPPATH path producer=gather relids={0} kind=11 reqouter=- rows=719876 startup=1000 total=88243.7806451613 disabled=0 pathkeys=0 verdict=dominated jointype=inner outer=- inner=- width=428 inputtotal=15256.18064516129
+DPPATH path producer=gather relids={1} kind=11 reqouter=- rows=91 startup=1000 total=3032.65 disabled=0 pathkeys=0 verdict=dominated jointype=inner outer=- inner=- width=420 inputtotal=2023.55
+DPPATH path producer=gather.merge relids={1} kind=12 reqouter=- rows=91 startup=1000.26 total=4686.2925 disabled=0 pathkeys=1 verdict=dominated jointype=inner outer=- inner=- width=420 inputtotal=3676.045
+DPPGSORT caller=sortpath inputrows=719876 tuples=719876 output=719876 limit=-1 width=40 goopginput=1.31737e+08 goopgoutput=1.31737e+08 pginput=4.60721e+07 pgoutput=4.60721e+07 goopgbranch=memory pgbranch=memory currency=goopg
+DPPGSORT caller=sortpath inputrows=91 tuples=91 output=91 limit=-1 width=12 goopginput=16380 goopgoutput=16380 pginput=3640 pgoutput=3640 goopgbranch=memory pgbranch=memory currency=goopg
+DPPATH path producer=mergejoin relids={0,1} kind=4 reqouter=- rows=856 startup=92644.99248905838 total=96253.16455092278 disabled=0 pathkeys=1 verdict=accepted jointype=inner outer={0} inner={1} width=848 inputtotal=91966.98644249709
+DPPGHASH outer={0} inner={1} mapentry=180.00 mapbuckets=1024 mapbatches=1 mapspill=false pgouterwidth=40 pginnerwidth=12 pgtuplebytes=48 pgbuckets=1024 pgbatches=1 pgouterpages=- pginnerpages=- pgspill=false currency=map
+DPPATH path producer=join.hash relids={0,1} kind=3 reqouter=- rows=856 startup=2475.8724999999995 total=24507.83 disabled=0 pathkeys=0 verdict=accepted jointype=inner outer={0} inner={1} width=848 inputtotal=20132.760000000002
+DPPGHASH outer={0} inner={1} mapentry=180.00 mapbuckets=1024 mapbatches=1 mapspill=false pgouterwidth=40 pginnerwidth=12 pgtuplebytes=48 pgbuckets=1024 pgbatches=1 pgouterpages=- pginnerpages=- pgspill=false currency=map
+DPPATH partial producer=join.hash.partial relids={0,1} kind=3 reqouter=- rows=276 startup=2475.8724999999995 total=18344.69589516129 disabled=0 pathkeys=0 verdict=accepted jointype=inner outer={0} inner={1} width=848 inputtotal=15256.18064516129
+DPPATH path producer=join.nestloop relids={0,1} kind=5 reqouter=- rows=856 startup=0 total=1.0052384625e+06 disabled=0 pathkeys=0 verdict=accepted jointype=inner outer={0} inner={1} width=848 inputtotal=20132.760000000002
+DPPATH path producer=nestloop.index relids={0,1} kind=5 reqouter=- rows=856 startup=0.25 total=234010.03999999998 disabled=0 pathkeys=0 verdict=accepted jointype=inner outer={0} inner={1} width=848 inputtotal=20132.760000000002
+DPPATH path producer=nestloop.index relids={0,1} kind=5 reqouter=- rows=856 startup=0.25 total=38653.32004555136 disabled=0 pathkeys=0 verdict=accepted jointype=inner outer={0} inner={1} width=848 inputtotal=20132.760000000002
+DPPATH partial producer=join.nestloop.partial relids={0,1} kind=5 reqouter=- rows=276 startup=0 total=334708.7131451613 disabled=0 pathkeys=0 verdict=dominated jointype=inner outer={0} inner={1} width=848 inputtotal=15256.18064516129
+DPPATH partial producer=join.nestloop.partial relids={0,1} kind=5 reqouter=- rows=276 startup=0.25 total=26194.582444971245 disabled=0 pathkeys=0 verdict=dominated jointype=inner outer={0} inner={1} width=848 inputtotal=15256.18064516129
+DPPATH partial producer=join.nestloop.partial relids={0,1} kind=5 reqouter=- rows=276 startup=0.25 total=18761.55157378286 disabled=0 pathkeys=0 verdict=dominated jointype=inner outer={0} inner={1} width=848 inputtotal=15256.18064516129
+DPPGSORT caller=sortpath inputrows=91 tuples=91 output=91 limit=-1 width=12 goopginput=16380 goopgoutput=16380 pginput=3640 pgoutput=3640 goopgbranch=memory pgbranch=memory currency=goopg
+DPPGSORT caller=sortpath inputrows=719876 tuples=719876 output=719876 limit=-1 width=40 goopginput=1.31737e+08 goopgoutput=1.31737e+08 pginput=4.60721e+07 pgoutput=4.60721e+07 goopgbranch=memory pgbranch=memory currency=goopg
+DPPATH path producer=mergejoin relids={0,1} kind=4 reqouter=- rows=856 startup=92644.99248905838 total=96253.16455092278 disabled=0 pathkeys=1 verdict=accepted jointype=inner outer={1} inner={0} width=848 inputtotal=2477.92354656129
+DPPGSORT caller=sortpath inputrows=719876 tuples=719876 output=719876 limit=-1 width=40 goopginput=1.31737e+08 goopgoutput=1.31737e+08 pginput=4.60721e+07 pgoutput=4.60721e+07 goopgbranch=memory pgbranch=memory currency=goopg
+DPPATH path producer=mergejoin relids={0,1} kind=4 reqouter=- rows=856 startup=90167.54644249709 total=95880.4698869886 disabled=0 pathkeys=1 verdict=accepted jointype=inner outer={1} inner={0} width=848 inputtotal=4127.23
+DPPGHASH outer={1} inner={0} mapentry=183.00 mapbuckets=1048576 mapbatches=2 mapspill=true pgouterwidth=12 pginnerwidth=40 pgtuplebytes=72 pgbuckets=1048576 pgbatches=1 pgouterpages=- pginnerpages=- pgspill=false currency=map
+DPPATH path producer=join.hash relids={0,1} kind=3 reqouter=- rows=856 startup=45213.21000000001 total=63931.29000000001 disabled=0 pathkeys=0 verdict=dominated jointype=inner outer={1} inner={0} width=848 inputtotal=2474.7349999999997
+DPPGHASH outer={1} inner={0} mapentry=183.00 mapbuckets=1048576 mapbatches=2 mapspill=true pgouterwidth=12 pginnerwidth=40 pgtuplebytes=72 pgbuckets=1048576 pgbatches=1 pgouterpages=- pginnerpages=- pgspill=false currency=map
+DPPATH partial producer=join.hash.partial relids={0,1} kind=3 reqouter=- rows=504 startup=45213.21000000001 total=63416.09000000001 disabled=0 pathkeys=0 verdict=dominated jointype=inner outer={1} inner={0} width=848 inputtotal=2023.55
+DPPATH path producer=join.nestloop relids={0,1} kind=5 reqouter=- rows=856 startup=0 total=1.007037925e+06 disabled=0 pathkeys=0 verdict=dominated jointype=inner outer={1} inner={0} width=848 inputtotal=2474.7349999999997
+DPPATH partial producer=join.nestloop.partial relids={0,1} kind=5 reqouter=- rows=504 startup=0 total=607055.5599999999 disabled=0 pathkeys=0 verdict=dominated jointype=inner outer={1} inner={0} width=848 inputtotal=2023.55
+DPPATH partial producer=join.nestloop.partial relids={0,1} kind=5 reqouter=- rows=504 startup=0.25 total=608708.0549999999 disabled=0 pathkeys=0 verdict=dominated jointype=inner outer={1} inner={0} width=848 inputtotal=3676.045
+DPPGSORT caller=sortpath inputrows=719876 tuples=719876 output=719876 limit=-1 width=40 goopginput=1.31737e+08 goopgoutput=1.31737e+08 pginput=4.60721e+07 pgoutput=4.60721e+07 goopgbranch=memory pgbranch=memory currency=goopg
+DPPGSORT caller=sortpath inputrows=12 tuples=12 output=12 limit=-1 width=68 goopginput=2172 goopgoutput=2172 pginput=1152 pgoutput=1152 goopgbranch=memory pgbranch=memory currency=goopg
+DPPATH path producer=mergejoin relids={0,2} kind=4 reqouter=- rows=688033 startup=90168.63154024712 total=100648.40154024713 disabled=0 pathkeys=1 verdict=accepted jointype=inner outer={0} inner={2} width=1104 inputtotal=91966.98644249709
+DPPGHASH outer={0} inner={2} mapentry=181.00 mapbuckets=1024 mapbatches=1 mapspill=false pgouterwidth=40 pginnerwidth=68 pgtuplebytes=104 pgbuckets=1024 pgbatches=1 pgouterpages=- pginnerpages=- pgspill=false currency=map
+DPPATH path producer=join.hash relids={0,2} kind=3 reqouter=- rows=688033 startup=1.27 total=29678.071624999997 disabled=0 pathkeys=0 verdict=accepted jointype=inner outer={0} inner={2} width=1104 inputtotal=20132.760000000002
+DPPGHASH outer={0} inner={2} mapentry=181.00 mapbuckets=1024 mapbatches=1 mapspill=false pgouterwidth=40 pginnerwidth=68 pgtuplebytes=104 pgbuckets=1024 pgbatches=1 pgouterpages=- pginnerpages=- pgspill=false currency=map
+DPPATH partial producer=join.hash.partial relids={0,2} kind=3 reqouter=- rows=221946 startup=1.27 total=18336.17214516129 disabled=0 pathkeys=0 verdict=accepted jointype=inner outer={0} inner={2} width=1104 inputtotal=15256.18064516129
+DPPATH path producer=join.nestloop relids={0,2} kind=5 reqouter=- rows=688033 startup=0 total=149711.59 disabled=0 pathkeys=0 verdict=accepted jointype=inner outer={0} inner={2} width=1104 inputtotal=20132.760000000002
+DPPATH path producer=nestloop.index relids={0,2} kind=5 reqouter=- rows=688033 startup=0.125 total=128130.15999999999 disabled=0 pathkeys=0 verdict=accepted jointype=inner outer={0} inner={2} width=1104 inputtotal=20132.760000000002
+DPPATH path producer=nestloop.index relids={0,2} kind=5 reqouter=- rows=688033 startup=0.125 total=38130.625154415306 disabled=0 pathkeys=0 verdict=accepted jointype=inner outer={0} inner={2} width=1104 inputtotal=20132.760000000002
+DPPATH partial producer=join.nestloop.partial relids={0,2} kind=5 reqouter=- rows=221946 startup=0 total=57056.57064516129 disabled=0 pathkeys=0 verdict=dominated jointype=inner outer={0} inner={2} width=1104 inputtotal=15256.18064516129
+DPPATH partial producer=join.nestloop.partial relids={0,2} kind=5 reqouter=- rows=221946 startup=0.125 total=21066.91693404993 disabled=0 pathkeys=0 verdict=dominated jointype=inner outer={0} inner={2} width=1104 inputtotal=15256.18064516129
+DPPATH partial producer=join.nestloop.partial relids={0,2} kind=5 reqouter=- rows=221946 startup=0.125 total=18739.61474253028 disabled=0 pathkeys=0 verdict=dominated jointype=inner outer={0} inner={2} width=1104 inputtotal=15256.18064516129
+DPPGSORT caller=sortpath inputrows=12 tuples=12 output=12 limit=-1 width=68 goopginput=2172 goopgoutput=2172 pginput=1152 pgoutput=1152 goopgbranch=memory pgbranch=memory currency=goopg
+DPPGSORT caller=sortpath inputrows=719876 tuples=719876 output=719876 limit=-1 width=40 goopginput=1.31737e+08 goopgoutput=1.31737e+08 pginput=4.60721e+07 pgoutput=4.60721e+07 goopgbranch=memory pgbranch=memory currency=goopg
+DPPATH path producer=mergejoin relids={0,2} kind=4 reqouter=- rows=688033 startup=90168.63154024712 total=100648.40154024713 disabled=0 pathkeys=1 verdict=accepted jointype=inner outer={2} inner={0} width=1104 inputtotal=1.3650977500432695
+DPPGSORT caller=sortpath inputrows=719876 tuples=719876 output=719876 limit=-1 width=40 goopginput=1.31737e+08 goopgoutput=1.31737e+08 pginput=4.60721e+07 pgoutput=4.60721e+07 goopgbranch=memory pgbranch=memory currency=goopg
+DPPATH path producer=mergejoin relids={0,2} kind=4 reqouter=- rows=688033 startup=90167.42144249709 total=100663.34144249708 disabled=0 pathkeys=1 verdict=dominated jointype=inner outer={2} inner={0} width=1104 inputtotal=16.305000000000003
+DPPGHASH outer={2} inner={0} mapentry=183.00 mapbuckets=1048576 mapbatches=2 mapspill=true pgouterwidth=68 pginnerwidth=40 pgtuplebytes=72 pgbuckets=1048576 pgbatches=1 pgouterpages=- pginnerpages=- pgspill=false currency=map
+DPPATH path producer=join.hash relids={0,2} kind=3 reqouter=- rows=688033 startup=45213.21000000001 total=70024.77 disabled=0 pathkeys=0 verdict=dominated jointype=inner outer={2} inner={0} width=1104 inputtotal=1.12
+DPPATH path producer=join.nestloop relids={0,2} kind=5 reqouter=- rows=688033 startup=0 total=151511.25 disabled=0 pathkeys=0 verdict=dominated jointype=inner outer={2} inner={0} width=1104 inputtotal=1.12
+DPPGSORT caller=sortpath inputrows=12 tuples=12 output=12 limit=-1 width=68 goopginput=2172 goopgoutput=2172 pginput=1152 pgoutput=1152 goopgbranch=memory pgbranch=memory currency=goopg
+DPPGSORT caller=sortpath inputrows=535 tuples=535 output=535 limit=-1 width=32 goopginput=38520 goopgoutput=38520 pginput=29960 pgoutput=29960 goopgbranch=memory pgbranch=memory currency=goopg
+DPPATH path producer=mergejoin relids={2,3} kind=4 reqouter=- rows=32 startup=33.92967959249004 total=36.98467959249003 disabled=0 pathkeys=1 verdict=accepted jointype=inner outer={2} inner={3} width=708 inputtotal=1.3650977500432695
+DPPGHASH outer={2} inner={3} mapentry=72.00 mapbuckets=1024 mapbatches=1 mapspill=false pgouterwidth=68 pginnerwidth=32 pgtuplebytes=64 pgbuckets=1024 pgbatches=1 pgouterpages=- pginnerpages=- pgspill=false currency=map
+DPPATH path producer=join.hash relids={2,3} kind=3 reqouter=- rows=32 startup=15.037500000000001 total=16.5075 disabled=0 pathkeys=0 verdict=accepted jointype=inner outer={2} inner={3} width=708 inputtotal=1.12
+DPPATH path producer=join.nestloop relids={2,3} kind=5 reqouter=- rows=32 startup=0 total=107.1075 disabled=0 pathkeys=0 verdict=accepted jointype=inner outer={2} inner={3} width=708 inputtotal=1.12
+DPPGSORT caller=sortpath inputrows=535 tuples=535 output=535 limit=-1 width=32 goopginput=38520 goopgoutput=38520 pginput=29960 pgoutput=29960 goopgbranch=memory pgbranch=memory currency=goopg
+DPPGSORT caller=sortpath inputrows=12 tuples=12 output=12 limit=-1 width=68 goopginput=2172 goopgoutput=2172 pginput=1152 pgoutput=1152 goopgbranch=memory pgbranch=memory currency=goopg
+DPPATH path producer=mergejoin relids={2,3} kind=4 reqouter=- rows=32 startup=33.92967959249004 total=36.98467959249003 disabled=0 pathkeys=1 verdict=accepted jointype=inner outer={3} inner={2} width=708 inputtotal=33.93208184244676
+DPPGHASH outer={3} inner={2} mapentry=181.00 mapbuckets=1024 mapbatches=1 mapspill=false pgouterwidth=32 pginnerwidth=68 pgtuplebytes=104 pgbuckets=1024 pgbatches=1 pgouterpages=- pginnerpages=- pgspill=false currency=map
+DPPATH path producer=join.hash relids={2,3} kind=3 reqouter=- rows=32 startup=1.27 total=11.277500000000002 disabled=0 pathkeys=0 verdict=accepted jointype=inner outer={3} inner={2} width=708 inputtotal=8.350000000000001
+DPPATH path producer=join.nestloop relids={2,3} kind=5 reqouter=- rows=32 startup=0 total=105.8 disabled=0 pathkeys=0 verdict=accepted jointype=inner outer={3} inner={2} width=708 inputtotal=8.350000000000001
+DPPATH path producer=gather relids={0,1} kind=11 reqouter=- rows=856 startup=3475.8724999999995 total=19430.29589516129 disabled=0 pathkeys=0 verdict=accepted jointype=inner outer=- inner=- width=848 inputtotal=18344.69589516129
+DPPATH path producer=gather relids={0,2} kind=11 reqouter=- rows=688033 startup=1001.27 total=88139.4721451613 disabled=0 pathkeys=0 verdict=dominated jointype=inner outer=- inner=- width=1104 inputtotal=18336.17214516129
+DPPGSORT caller=sortpath inputrows=856 tuples=856 output=856 limit=-1 width=52 goopginput=290184 goopgoutput=290184 pginput=68480 pgoutput=68480 goopgbranch=memory pgbranch=memory currency=goopg
+DPPGSORT caller=sortpath inputrows=12 tuples=12 output=12 limit=-1 width=68 goopginput=2172 goopgoutput=2172 pginput=1152 pgoutput=1152 goopgbranch=memory pgbranch=memory currency=goopg
+DPPATH path producer=mergejoin relids={0,1,2} kind=4 reqouter=- rows=818 startup=19473.32447161313 total=19485.84447161313 disabled=0 pathkeys=1 verdict=accepted jointype=inner outer={0,1} inner={2} width=1524 inputtotal=19474.129373863085
+DPPGHASH outer={0,1} inner={2} mapentry=181.00 mapbuckets=1024 mapbatches=1 mapspill=false pgouterwidth=52 pginnerwidth=68 pgtuplebytes=104 pgbuckets=1024 pgbatches=1 pgouterpages=- pginnerpages=- pgspill=false currency=map
+DPPATH path producer=join.hash relids={0,1,2} kind=3 reqouter=- rows=818 startup=3477.1424999999995 total=19442.91314516129 disabled=0 pathkeys=0 verdict=accepted jointype=inner outer={0,1} inner={2} width=1524 inputtotal=19430.29589516129
+DPPGHASH outer={0,1} inner={2} mapentry=181.00 mapbuckets=1024 mapbatches=1 mapspill=false pgouterwidth=52 pginnerwidth=68 pgtuplebytes=104 pgbuckets=1024 pgbatches=1 pgouterpages=- pginnerpages=- pgspill=false currency=map
+DPPATH partial producer=join.hash.partial relids={0,1,2} kind=3 reqouter=- rows=264 startup=2477.1424999999995 total=18349.62739516129 disabled=0 pathkeys=0 verdict=accepted jointype=inner outer={0,1} inner={2} width=1524 inputtotal=18344.69589516129
+DPPATH path producer=join.nestloop relids={0,1,2} kind=5 reqouter=- rows=818 startup=3475.8724999999995 total=19585.52589516129 disabled=0 pathkeys=0 verdict=dominated jointype=inner outer={0,1} inner={2} width=1524 inputtotal=19430.29589516129
+DPPATH path producer=nestloop.index relids={0,1,2} kind=5 reqouter=- rows=818 startup=3475.9974999999995 total=19558.714920660124 disabled=0 pathkeys=0 verdict=dominated jointype=inner outer={0,1} inner={2} width=1524 inputtotal=19430.29589516129
+DPPATH path producer=nestloop.index relids={0,1,2} kind=5 reqouter=- rows=818 startup=3475.9974999999995 total=19452.660069279438 disabled=0 pathkeys=0 verdict=dominated jointype=inner outer={0,1} inner={2} width=1524 inputtotal=19430.29589516129
+DPPATH partial producer=join.nestloop.partial relids={0,1,2} kind=5 reqouter=- rows=264 startup=2475.8724999999995 total=18395.525895161292 disabled=0 pathkeys=0 verdict=dominated jointype=inner outer={0,1} inner={2} width=1524 inputtotal=18344.69589516129
+DPPATH partial producer=join.nestloop.partial relids={0,1,2} kind=5 reqouter=- rows=264 startup=2475.9974999999995 total=18351.727029551104 disabled=0 pathkeys=0 verdict=dominated jointype=inner outer={0,1} inner={2} width=1524 inputtotal=18344.69589516129
+DPPATH partial producer=join.nestloop.partial relids={0,1,2} kind=5 reqouter=- rows=264 startup=2475.9974999999995 total=18348.999873781013 disabled=0 pathkeys=0 verdict=accepted jointype=inner outer={0,1} inner={2} width=1524 inputtotal=18344.69589516129
+DPPGSORT caller=sortpath inputrows=12 tuples=12 output=12 limit=-1 width=68 goopginput=2172 goopgoutput=2172 pginput=1152 pgoutput=1152 goopgbranch=memory pgbranch=memory currency=goopg
+DPPGSORT caller=sortpath inputrows=856 tuples=856 output=856 limit=-1 width=52 goopginput=290184 goopgoutput=290184 pginput=68480 pgoutput=68480 goopgbranch=memory pgbranch=memory currency=goopg
+DPPATH path producer=mergejoin relids={0,1,2} kind=4 reqouter=- rows=818 startup=19473.32447161313 total=19485.84447161313 disabled=0 pathkeys=1 verdict=accepted jointype=inner outer={2} inner={0,1} width=1524 inputtotal=1.3650977500432695
+DPPGSORT caller=sortpath inputrows=856 tuples=856 output=856 limit=-1 width=52 goopginput=290184 goopgoutput=290184 pginput=68480 pgoutput=68480 goopgbranch=memory pgbranch=memory currency=goopg
+DPPATH path producer=mergejoin relids={0,1,2} kind=4 reqouter=- rows=818 startup=19472.114373863085 total=19500.784373863084 disabled=0 pathkeys=1 verdict=dominated jointype=inner outer={2} inner={0,1} width=1524 inputtotal=16.305000000000003
+DPPGHASH outer={2} inner={0,1} mapentry=339.00 mapbuckets=1024 mapbatches=1 mapspill=false pgouterwidth=68 pginnerwidth=52 pgtuplebytes=88 pgbuckets=1024 pgbatches=1 pgouterpages=- pginnerpages=- pgspill=false currency=map
+DPPATH path producer=join.hash relids={0,1,2} kind=3 reqouter=- rows=818 startup=19440.99589516129 total=19452.51589516129 disabled=0 pathkeys=0 verdict=dominated jointype=inner outer={2} inner={0,1} width=1524 inputtotal=1.12
+DPPATH path producer=join.nestloop relids={0,1,2} kind=5 reqouter=- rows=818 startup=3475.8724999999995 total=19587.63589516129 disabled=0 pathkeys=0 verdict=dominated jointype=inner outer={2} inner={0,1} width=1524 inputtotal=1.12
+DPPGSORT caller=sortpath inputrows=688033 tuples=688033 output=688033 limit=-1 width=108 goopginput=2.33931e+08 goopgoutput=2.33931e+08 pginput=9.35725e+07 pgoutput=9.35725e+07 goopgbranch=disk pgbranch=memory currency=goopg
+DPPGSORT caller=sortpath inputrows=91 tuples=91 output=91 limit=-1 width=12 goopginput=16380 goopgoutput=16380 pginput=3640 pgoutput=3640 goopgbranch=memory pgbranch=memory currency=goopg
+DPPATH path producer=mergejoin relids={0,1,2} kind=4 reqouter=- rows=818 startup=198817.35410545615 total=202265.93116732058 disabled=0 pathkeys=1 verdict=accepted jointype=inner outer={0,2} inner={1} width=1524 inputtotal=198059.74055889487
+DPPGHASH outer={0,2} inner={1} mapentry=180.00 mapbuckets=1024 mapbatches=1 mapspill=false pgouterwidth=108 pginnerwidth=12 pgtuplebytes=48 pgbuckets=1024 pgbatches=1 pgouterpages=- pginnerpages=- pgspill=false currency=map
+DPPATH path producer=join.hash relids={0,1,2} kind=3 reqouter=- rows=818 startup=2477.1424999999995 total=33969.130999999994 disabled=0 pathkeys=0 verdict=accepted jointype=inner outer={0,2} inner={1} width=1524 inputtotal=29678.071624999997
+DPPGHASH outer={0,2} inner={1} mapentry=180.00 mapbuckets=1024 mapbatches=1 mapspill=false pgouterwidth=108 pginnerwidth=12 pgtuplebytes=48 pgbuckets=1024 pgbatches=1 pgouterpages=- pginnerpages=- pgspill=false currency=map
+DPPATH partial producer=join.hash.partial relids={0,1,2} kind=3 reqouter=- rows=264 startup=2477.1424999999995 total=21397.58989516129 disabled=0 pathkeys=0 verdict=dominated jointype=inner outer={0,2} inner={1} width=1524 inputtotal=18336.17214516129
+DPPATH path producer=join.nestloop relids={0,1,2} kind=5 reqouter=- rows=818 startup=1.27 total=971318.0791249999 disabled=0 pathkeys=0 verdict=accepted jointype=inner outer={0,2} inner={1} width=1524 inputtotal=29678.071624999997
+DPPATH path producer=nestloop.index relids={0,1,2} kind=5 reqouter=- rows=818 startup=1.52 total=234094.70253121157 disabled=0 pathkeys=0 verdict=accepted jointype=inner outer={0,2} inner={1} width=1524 inputtotal=29678.071624999997
+DPPATH path producer=nestloop.index relids={0,1,2} kind=5 reqouter=- rows=818 startup=1.52 total=47402.556636902416 disabled=0 pathkeys=0 verdict=accepted jointype=inner outer={0,2} inner={1} width=1524 inputtotal=29678.071624999997
+DPPATH partial producer=join.nestloop.partial relids={0,1,2} kind=5 reqouter=- rows=264 startup=1.27 total=323767.4246451614 disabled=0 pathkeys=0 verdict=dominated jointype=inner outer={0,2} inner={1} width=1524 inputtotal=18336.17214516129
+DPPATH partial producer=join.nestloop.partial relids={0,1,2} kind=5 reqouter=- rows=264 startup=1.52 total=28790.73248872045 disabled=0 pathkeys=0 verdict=dominated jointype=inner outer={0,2} inner={1} width=1524 inputtotal=18336.17214516129
+DPPATH partial producer=join.nestloop.partial relids={0,1,2} kind=5 reqouter=- rows=264 startup=1.52 total=21687.463062811377 disabled=0 pathkeys=0 verdict=dominated jointype=inner outer={0,2} inner={1} width=1524 inputtotal=18336.17214516129
+DPPGSORT caller=sortpath inputrows=91 tuples=91 output=91 limit=-1 width=12 goopginput=16380 goopgoutput=16380 pginput=3640 pgoutput=3640 goopgbranch=memory pgbranch=memory currency=goopg
+DPPGSORT caller=sortpath inputrows=688033 tuples=688033 output=688033 limit=-1 width=108 goopginput=2.33931e+08 goopgoutput=2.33931e+08 pginput=9.35725e+07 pgoutput=9.35725e+07 goopgbranch=disk pgbranch=memory currency=goopg
+DPPATH path producer=mergejoin relids={0,1,2} kind=4 reqouter=- rows=818 startup=198817.35410545615 total=202265.93116732058 disabled=0 pathkeys=1 verdict=accepted jointype=inner outer={1} inner={0,2} width=1524 inputtotal=2477.92354656129
+DPPGSORT caller=sortpath inputrows=688033 tuples=688033 output=688033 limit=-1 width=108 goopginput=2.33931e+08 goopgoutput=2.33931e+08 pginput=9.35725e+07 pgoutput=9.35725e+07 goopgbranch=disk pgbranch=memory currency=goopg
+DPPATH path producer=mergejoin relids={0,1,2} kind=4 reqouter=- rows=818 startup=196339.90805889486 total=201893.2365033864 disabled=0 pathkeys=1 verdict=accepted jointype=inner outer={1} inner={0,2} width=1524 inputtotal=4127.23
+DPPGHASH outer={1} inner={0,2} mapentry=340.00 mapbuckets=524288 mapbatches=4 mapspill=true pgouterwidth=12 pginnerwidth=108 pgtuplebytes=144 pgbuckets=1048576 pgbatches=1 pgouterpages=- pginnerpages=- pgspill=false currency=map
+DPPATH path producer=join.hash relids={0,1,2} kind=3 reqouter=- rows=818 startup=66835.48412499999 total=98021.70037499999 disabled=0 pathkeys=0 verdict=dominated jointype=inner outer={1} inner={0,2} width=1524 inputtotal=2474.7349999999997
+DPPGHASH outer={1} inner={0,2} mapentry=340.00 mapbuckets=524288 mapbatches=4 mapspill=true pgouterwidth=12 pginnerwidth=108 pgtuplebytes=144 pgbuckets=1048576 pgbatches=1 pgouterpages=- pginnerpages=- pgspill=false currency=map
+DPPATH partial producer=join.hash.partial relids={0,1,2} kind=3 reqouter=- rows=481 startup=66835.48412499999 total=97509.28662499998 disabled=0 pathkeys=0 verdict=dominated jointype=inner outer={1} inner={0,2} width=1524 inputtotal=2023.55
+DPPATH path producer=join.nestloop relids={0,1,2} kind=5 reqouter=- rows=818 startup=1.27 total=973037.9341250001 disabled=0 pathkeys=0 verdict=dominated jointype=inner outer={1} inner={0,2} width=1524 inputtotal=2474.7349999999997
+DPPATH partial producer=join.nestloop.partial relids={0,1,2} kind=5 reqouter=- rows=481 startup=1.27 total=590728.434125 disabled=0 pathkeys=0 verdict=dominated jointype=inner outer={1} inner={0,2} width=1524 inputtotal=2023.55
+DPPATH partial producer=join.nestloop.partial relids={0,1,2} kind=5 reqouter=- rows=481 startup=1.52 total=592380.929125 disabled=0 pathkeys=0 verdict=dominated jointype=inner outer={1} inner={0,2} width=1524 inputtotal=3676.045
+DPPGSORT caller=sortpath inputrows=688033 tuples=688033 output=688033 limit=-1 width=108 goopginput=2.33931e+08 goopgoutput=2.33931e+08 pginput=9.35725e+07 pgoutput=9.35725e+07 goopgbranch=disk pgbranch=memory currency=goopg
+DPPGSORT caller=sortpath inputrows=535 tuples=535 output=535 limit=-1 width=32 goopginput=38520 goopgoutput=38520 pginput=29960 pgoutput=29960 goopgbranch=memory pgbranch=memory currency=goopg
+DPPATH path producer=mergejoin relids={0,2,3} kind=4 reqouter=- rows=688033 startup=196372.2526407373 total=206695.42264073732 disabled=0 pathkeys=1 verdict=accepted jointype=inner outer={0,2} inner={3} width=1136 inputtotal=198059.74055889487
+DPPGHASH outer={0,2} inner={3} mapentry=72.00 mapbuckets=1024 mapbatches=1 mapspill=false pgouterwidth=108 pginnerwidth=32 pgtuplebytes=64 pgbuckets=1024 pgbatches=1 pgouterpages=- pginnerpages=- pgspill=false currency=map
+DPPATH path producer=join.hash relids={0,2,3} kind=3 reqouter=- rows=688033 startup=16.3075 total=38293.521625 disabled=0 pathkeys=0 verdict=accepted jointype=inner outer={0,2} inner={3} width=1136 inputtotal=29678.071624999997
+DPPATH path producer=join.nestloop relids={0,2,3} kind=5 reqouter=- rows=688033 startup=1.27 total=5.551152584125e+06 disabled=0 pathkeys=0 verdict=accepted jointype=inner outer={0,2} inner={3} width=1136 inputtotal=29678.071624999997
+DPPGSORT caller=sortpath inputrows=535 tuples=535 output=535 limit=-1 width=32 goopginput=38520 goopgoutput=38520 pginput=29960 pgoutput=29960 goopgbranch=memory pgbranch=memory currency=goopg
+DPPGSORT caller=sortpath inputrows=688033 tuples=688033 output=688033 limit=-1 width=108 goopginput=2.33931e+08 goopgoutput=2.33931e+08 pginput=9.35725e+07 pgoutput=9.35725e+07 goopgbranch=disk pgbranch=memory currency=goopg
+DPPATH path producer=mergejoin relids={0,2,3} kind=4 reqouter=- rows=688033 startup=196372.2526407373 total=206695.42264073732 disabled=0 pathkeys=1 verdict=accepted jointype=inner outer={3} inner={0,2} width=1136 inputtotal=33.93208184244676
+DPPGHASH outer={3} inner={0,2} mapentry=340.00 mapbuckets=524288 mapbatches=4 mapspill=true pgouterwidth=32 pginnerwidth=108 pgtuplebytes=144 pgbuckets=1048576 pgbatches=1 pgouterpages=- pginnerpages=- pgspill=false currency=map
+DPPATH path producer=join.hash relids={0,2,3} kind=3 reqouter=- rows=688033 startup=66835.48412499999 total=102292.50162499999 disabled=0 pathkeys=0 verdict=dominated jointype=inner outer={3} inner={0,2} width=1136 inputtotal=8.350000000000001
+DPPATH path producer=join.nestloop relids={0,2,3} kind=5 reqouter=- rows=688033 startup=1.27 total=5.552871329125e+06 disabled=0 pathkeys=0 verdict=dominated jointype=inner outer={3} inner={0,2} width=1136 inputtotal=8.350000000000001
+DPPGSORT caller=sortpath inputrows=32 tuples=32 output=32 limit=-1 width=100 goopginput=7328 goopgoutput=7328 pginput=4096 pgoutput=4096 goopgbranch=memory pgbranch=memory currency=goopg
+DPPGSORT caller=sortpath inputrows=719876 tuples=719876 output=719876 limit=-1 width=40 goopginput=1.31737e+08 goopgoutput=1.31737e+08 pginput=4.60721e+07 pgoutput=4.60721e+07 goopgbranch=memory pgbranch=memory currency=goopg
+DPPATH path producer=mergejoin relids={0,2,3} kind=4 reqouter=- rows=688033 startup=90179.37394249708 total=100659.2439424971 disabled=0 pathkeys=1 verdict=accepted jointype=inner outer={2,3} inner={0} width=1136 inputtotal=12.157500000000002
+DPPGHASH outer={2,3} inner={0} mapentry=183.00 mapbuckets=1048576 mapbatches=2 mapspill=true pgouterwidth=100 pginnerwidth=40 pgtuplebytes=72 pgbuckets=1048576 pgbatches=1 pgouterpages=- pginnerpages=- pgspill=false currency=map
+DPPATH path producer=join.hash relids={0,2,3} kind=3 reqouter=- rows=688033 startup=45214.48 total=73111.7775 disabled=0 pathkeys=0 verdict=dominated jointype=inner outer={2,3} inner={0} width=1136 inputtotal=11.277500000000002
+DPPATH path producer=join.nestloop relids={0,2,3} kind=5 reqouter=- rows=688033 startup=1.27 total=367484.2075000001 disabled=0 pathkeys=0 verdict=accepted jointype=inner outer={2,3} inner={0} width=1136 inputtotal=11.277500000000002
+DPPGSORT caller=sortpath inputrows=719876 tuples=719876 output=719876 limit=-1 width=40 goopginput=1.31737e+08 goopgoutput=1.31737e+08 pginput=4.60721e+07 pgoutput=4.60721e+07 goopgbranch=memory pgbranch=memory currency=goopg
+DPPGSORT caller=sortpath inputrows=32 tuples=32 output=32 limit=-1 width=100 goopginput=7328 goopgoutput=7328 pginput=4096 pgoutput=4096 goopgbranch=memory pgbranch=memory currency=goopg
+DPPATH path producer=mergejoin relids={0,2,3} kind=4 reqouter=- rows=688033 startup=90179.37394249708 total=100659.2439424971 disabled=0 pathkeys=1 verdict=accepted jointype=inner outer={0} inner={2,3} width=1136 inputtotal=91966.98644249709
+DPPGHASH outer={0} inner={2,3} mapentry=229.00 mapbuckets=1024 mapbatches=1 mapspill=false pgouterwidth=40 pginnerwidth=100 pgtuplebytes=136 pgbuckets=1024 pgbatches=1 pgouterpages=- pginnerpages=- pgspill=false currency=map
+DPPATH path producer=join.hash relids={0,2,3} kind=3 reqouter=- rows=688033 startup=11.677500000000002 total=31523.9925 disabled=0 pathkeys=0 verdict=accepted jointype=inner outer={0} inner={2,3} width=1136 inputtotal=20132.760000000002
+DPPATH path producer=join.nestloop relids={0,2,3} kind=5 reqouter=- rows=688033 startup=1.27 total=365684.59750000003 disabled=0 pathkeys=0 verdict=accepted jointype=inner outer={0} inner={2,3} width=1136 inputtotal=20132.760000000002
+DPPATH path producer=gather relids={0,1,2} kind=11 reqouter=- rows=818 startup=3475.9974999999995 total=19430.799873781012 disabled=0 pathkeys=0 verdict=accepted jointype=inner outer=- inner=- width=1524 inputtotal=18348.999873781013
+DPPGSORT caller=sortpath inputrows=818 tuples=818 output=818 limit=-1 width=120 goopginput=405728 goopgoutput=405728 pginput=117792 pgoutput=117792 goopgbranch=memory pgbranch=memory currency=goopg
+DPPGSORT caller=sortpath inputrows=535 tuples=535 output=535 limit=-1 width=32 goopginput=38520 goopgoutput=38520 pginput=29960 pgoutput=29960 goopgbranch=memory pgbranch=memory currency=goopg
+DPPATH path producer=mergejoin relids={0,1,2,3} kind=4 reqouter=- rows=818 startup=19502.969119888192 total=19517.91411988819 disabled=0 pathkeys=1 verdict=accepted jointype=inner outer={0,1,2} inner={3} width=1556 inputtotal=19472.419538045742
+DPPGHASH outer={0,1,2} inner={3} mapentry=72.00 mapbuckets=1024 mapbatches=1 mapspill=false pgouterwidth=120 pginnerwidth=32 pgtuplebytes=64 pgbuckets=1024 pgbatches=1 pgouterpages=- pginnerpages=- pgspill=false currency=map
+DPPATH path producer=join.hash relids={0,1,2,3} kind=3 reqouter=- rows=818 startup=3491.0349999999994 total=19456.062373781013 disabled=0 pathkeys=0 verdict=accepted jointype=inner outer={0,1,2} inner={3} width=1556 inputtotal=19430.799873781012
+DPPATH path producer=join.nestloop relids={0,1,2,3} kind=5 reqouter=- rows=818 startup=3475.9974999999995 total=26004.93737378101 disabled=0 pathkeys=0 verdict=dominated jointype=inner outer={0,1,2} inner={3} width=1556 inputtotal=19430.799873781012
+DPPGSORT caller=sortpath inputrows=535 tuples=535 output=535 limit=-1 width=32 goopginput=38520 goopgoutput=38520 pginput=29960 pgoutput=29960 goopgbranch=memory pgbranch=memory currency=goopg
+DPPGSORT caller=sortpath inputrows=818 tuples=818 output=818 limit=-1 width=120 goopginput=405728 goopgoutput=405728 pginput=117792 pgoutput=117792 goopgbranch=memory pgbranch=memory currency=goopg
+DPPATH path producer=mergejoin relids={0,1,2,3} kind=4 reqouter=- rows=818 startup=19502.969119888192 total=19517.91411988819 disabled=0 pathkeys=1 verdict=accepted jointype=inner outer={3} inner={0,1,2} width=1556 inputtotal=33.93208184244676
+DPPGHASH outer={3} inner={0,1,2} mapentry=496.00 mapbuckets=1024 mapbatches=1 mapspill=false pgouterwidth=32 pginnerwidth=120 pgtuplebytes=152 pgbuckets=1024 pgbatches=1 pgouterpages=- pginnerpages=- pgspill=false currency=map
+DPPATH path producer=join.hash relids={0,1,2,3} kind=3 reqouter=- rows=818 startup=19441.02487378101 total=19458.89237378101 disabled=0 pathkeys=0 verdict=dominated jointype=inner outer={3} inner={0,1,2} width=1556 inputtotal=8.350000000000001
+DPPATH path producer=join.nestloop relids={0,1,2,3} kind=5 reqouter=- rows=818 startup=3475.9974999999995 total=26005.644873781013 disabled=0 pathkeys=0 verdict=dominated jointype=inner outer={3} inner={0,1,2} width=1556 inputtotal=8.350000000000001
+DPPGSORT caller=sortpath inputrows=688033 tuples=688033 output=688033 limit=-1 width=140 goopginput=2.66957e+08 goopgoutput=2.66957e+08 pginput=1.1559e+08 pgoutput=1.1559e+08 goopgbranch=disk pgbranch=memory currency=goopg
+DPPGSORT caller=sortpath inputrows=91 tuples=91 output=91 limit=-1 width=12 goopginput=16380 goopgoutput=16380 pginput=3640 pgoutput=3640 goopgbranch=memory pgbranch=memory currency=goopg
+DPPATH path producer=mergejoin relids={0,1,2,3} kind=4 reqouter=- rows=818 startup=214771.77498045616 total=218220.35204232056 disabled=0 pathkeys=1 verdict=accepted jointype=inner outer={0,2,3} inner={1} width=1556 inputtotal=214014.16143389486
+DPPGHASH outer={0,2,3} inner={1} mapentry=180.00 mapbuckets=1024 mapbatches=1 mapspill=false pgouterwidth=140 pginnerwidth=12 pgtuplebytes=48 pgbuckets=1024 pgbatches=1 pgouterpages=- pginnerpages=- pgspill=false currency=map
+DPPATH path producer=join.hash relids={0,1,2,3} kind=3 reqouter=- rows=818 startup=2487.5499999999993 total=35815.051875000005 disabled=0 pathkeys=0 verdict=accepted jointype=inner outer={0,2,3} inner={1} width=1556 inputtotal=31523.9925
+DPPATH path producer=join.nestloop relids={0,1,2,3} kind=5 reqouter=- rows=818 startup=11.677500000000002 total=973164 disabled=0 pathkeys=0 verdict=accepted jointype=inner outer={0,2,3} inner={1} width=1556 inputtotal=31523.9925
+DPPATH path producer=nestloop.index relids={0,1,2,3} kind=5 reqouter=- rows=818 startup=11.927500000000002 total=235940.6234062116 disabled=0 pathkeys=0 verdict=accepted jointype=inner outer={0,2,3} inner={1} width=1556 inputtotal=31523.9925
+DPPATH path producer=nestloop.index relids={0,1,2,3} kind=5 reqouter=- rows=818 startup=11.927500000000002 total=49248.47751190242 disabled=0 pathkeys=0 verdict=accepted jointype=inner outer={0,2,3} inner={1} width=1556 inputtotal=31523.9925
+DPPGSORT caller=sortpath inputrows=91 tuples=91 output=91 limit=-1 width=12 goopginput=16380 goopgoutput=16380 pginput=3640 pgoutput=3640 goopgbranch=memory pgbranch=memory currency=goopg
+DPPGSORT caller=sortpath inputrows=688033 tuples=688033 output=688033 limit=-1 width=140 goopginput=2.66957e+08 goopgoutput=2.66957e+08 pginput=1.1559e+08 pgoutput=1.1559e+08 goopgbranch=disk pgbranch=memory currency=goopg
+DPPATH path producer=mergejoin relids={0,1,2,3} kind=4 reqouter=- rows=818 startup=214771.77498045616 total=218220.35204232056 disabled=0 pathkeys=1 verdict=accepted jointype=inner outer={1} inner={0,2,3} width=1556 inputtotal=2477.92354656129
+DPPGSORT caller=sortpath inputrows=688033 tuples=688033 output=688033 limit=-1 width=140 goopginput=2.66957e+08 goopgoutput=2.66957e+08 pginput=1.1559e+08 pgoutput=1.1559e+08 goopgbranch=disk pgbranch=memory currency=goopg
+DPPATH path producer=mergejoin relids={0,1,2,3} kind=4 reqouter=- rows=818 startup=212294.32893389487 total=217847.6573783864 disabled=0 pathkeys=1 verdict=accepted jointype=inner outer={1} inner={0,2,3} width=1556 inputtotal=4127.23
+DPPGHASH outer={1} inner={0,2,3} mapentry=388.00 mapbuckets=524288 mapbatches=4 mapspill=true pgouterwidth=12 pginnerwidth=140 pgtuplebytes=176 pgbuckets=1048576 pgbatches=1 pgouterpages=- pginnerpages=- pgspill=false currency=map
+DPPATH path producer=join.hash relids={0,1,2,3} kind=3 reqouter=- rows=818 startup=72712.405 total=107929.62125 disabled=0 pathkeys=0 verdict=dominated jointype=inner outer={1} inner={0,2,3} width=1556 inputtotal=2474.7349999999997
+DPPATH path producer=join.nestloop relids={0,1,2,3} kind=5 reqouter=- rows=818 startup=11.677500000000002 total=974883.8550000002 disabled=0 pathkeys=0 verdict=dominated jointype=inner outer={1} inner={0,2,3} width=1556 inputtotal=2474.7349999999997
+DPPGSORT caller=sortpath inputrows=856 tuples=856 output=856 limit=-1 width=52 goopginput=290184 goopgoutput=290184 pginput=68480 pgoutput=68480 goopgbranch=memory pgbranch=memory currency=goopg
+DPPGSORT caller=sortpath inputrows=32 tuples=32 output=32 limit=-1 width=100 goopginput=7328 goopgoutput=7328 pginput=4096 pgoutput=4096 goopgbranch=memory pgbranch=memory currency=goopg
+DPPATH path producer=mergejoin relids={0,1,2,3} kind=4 reqouter=- rows=818 startup=19484.066873863085 total=19496.686873863084 disabled=0 pathkeys=1 verdict=accepted jointype=inner outer={0,1} inner={2,3} width=1556 inputtotal=19474.129373863085
+DPPGHASH outer={0,1} inner={2,3} mapentry=229.00 mapbuckets=1024 mapbatches=1 mapspill=false pgouterwidth=52 pginnerwidth=100 pgtuplebytes=136 pgbuckets=1024 pgbatches=1 pgouterpages=- pginnerpages=- pgspill=false currency=map
+DPPATH path producer=join.hash relids={0,1,2,3} kind=3 reqouter=- rows=818 startup=3487.5499999999993 total=19455.503395161286 disabled=0 pathkeys=0 verdict=accepted jointype=inner outer={0,1} inner={2,3} width=1556 inputtotal=19430.29589516129
+DPPATH path producer=join.nestloop relids={0,1,2,3} kind=5 reqouter=- rows=818 startup=3477.1424999999995 total=19852.53339516129 disabled=0 pathkeys=0 verdict=dominated jointype=inner outer={0,1} inner={2,3} width=1556 inputtotal=19430.29589516129
+DPPGSORT caller=sortpath inputrows=32 tuples=32 output=32 limit=-1 width=100 goopginput=7328 goopgoutput=7328 pginput=4096 pgoutput=4096 goopgbranch=memory pgbranch=memory currency=goopg
+DPPGSORT caller=sortpath inputrows=856 tuples=856 output=856 limit=-1 width=52 goopginput=290184 goopgoutput=290184 pginput=68480 pgoutput=68480 goopgbranch=memory pgbranch=memory currency=goopg
+DPPATH path producer=mergejoin relids={0,1,2,3} kind=4 reqouter=- rows=818 startup=19484.066873863085 total=19496.686873863084 disabled=0 pathkeys=1 verdict=accepted jointype=inner outer={2,3} inner={0,1} width=1556 inputtotal=12.157500000000002
+DPPGHASH outer={2,3} inner={0,1} mapentry=339.00 mapbuckets=1024 mapbatches=1 mapspill=false pgouterwidth=100 pginnerwidth=52 pgtuplebytes=88 pgbuckets=1024 pgbatches=1 pgouterpages=- pginnerpages=- pgspill=false currency=map
+DPPATH path producer=join.hash relids={0,1,2,3} kind=3 reqouter=- rows=818 startup=19442.26589516129 total=19466.37339516129 disabled=0 pathkeys=0 verdict=dominated jointype=inner outer={2,3} inner={0,1} width=1556 inputtotal=11.277500000000002
+DPPATH path producer=join.nestloop relids={0,1,2,3} kind=5 reqouter=- rows=818 startup=3477.1424999999995 total=19854.593395161286 disabled=0 pathkeys=0 verdict=dominated jointype=inner outer={2,3} inner={0,1} width=1556 inputtotal=11.277500000000002
+DPTRACE problem nrels=4 rels=store_sales,date_dim,store,v1
+DPTRACE pair phase=1 lev=2 created=1 pair={date_dim} | {store_sales} outer={store_sales} inner={date_dim}
+DPTRACE pair phase=1 lev=2 created=1 pair={store_sales} | {store} outer={store_sales} inner={store}
+DPTRACE pair phase=1 lev=2 created=1 pair={store} | {v1} outer={store} inner={v1}
+DPTRACE pair phase=1 lev=3 created=1 pair={date_dim+store_sales} | {store} outer={date_dim+store_sales} inner={store}
+DPTRACE pair phase=1 lev=3 created=0 pair={date_dim} | {store+store_sales} outer={store+store_sales} inner={date_dim}
+DPTRACE pair phase=1 lev=3 created=1 pair={store+store_sales} | {v1} outer={store+store_sales} inner={v1}
+DPTRACE pair phase=1 lev=3 created=0 pair={store+v1} | {store_sales} outer={store+v1} inner={store_sales}
+DPTRACE pair phase=1 lev=4 created=1 pair={date_dim+store+store_sales} | {v1} outer={date_dim+store+store_sales} inner={v1}
+DPTRACE pair phase=1 lev=4 created=0 pair={date_dim} | {store+store_sales+v1} outer={store+store_sales+v1} inner={date_dim}
+DPTRACE pair phase=2 lev=4 created=0 pair={date_dim+store_sales} | {store+v1} outer={date_dim+store_sales} inner={store+v1}
+DPTRACE decline phase=1 lev=2 reason=no-join-clause pair={store_sales} | {v1}
+DPTRACE decline phase=1 lev=2 reason=no-join-clause pair={date_dim} | {store}
+DPTRACE decline phase=1 lev=2 reason=no-join-clause pair={date_dim} | {v1}
+DPTRACE decline phase=1 lev=3 reason=no-join-clause pair={date_dim+store_sales} | {v1}
+DPTRACE decline phase=1 lev=3 reason=no-join-clause pair={date_dim} | {store+v1}
+DPTRACE cost lev=2 rel={date_dim+store_sales} rows=856 npaths=6 cheapest=gather reqouter={} total=19430.29589516129 second=hash secondtotal=24507.83
+DPTRACE cost lev=2 rel={store+store_sales} rows=688033 npaths=5 cheapest=hash reqouter={} total=29678.071624999997 second=nli secondtotal=38130.625154415306
+DPTRACE cost lev=2 rel={store+v1} rows=32 npaths=4 cheapest=hash reqouter={} total=11.277500000000002 second=merge secondtotal=36.98467959249003
+DPTRACE cost lev=3 rel={date_dim+store+store_sales} rows=818 npaths=8 cheapest=gather reqouter={} total=19430.799873781012 second=merge secondtotal=19485.84447161313
+DPTRACE cost lev=3 rel={store+store_sales+v1} rows=688033 npaths=6 cheapest=hash reqouter={} total=31523.9925 second=merge secondtotal=100659.2439424971
+DPTRACE cost lev=4 rel={date_dim+store+store_sales+v1} rows=818 npaths=10 cheapest=hash reqouter={} total=19455.503395161286 second=merge secondtotal=19496.686873863084
+DPTRACE cpadmit src=base rel={store_sales} cp=1 leaf=seq
+DPTRACE cpadmit src=base rel={date_dim} cp=1 leaf=seq
+DPTRACE cpadmit src=base rel={store} cp=1 leaf=seq
+DPTRACE cpadmit src=base rel={v1} cp=0 leaf=other
+DPTRACE cpadmit src=join rel={date_dim+store_sales} cp=1 in1=1 in2=1 nclauses=1 failidx=-1 failkind=none
+DPTRACE cpadmit src=join rel={store+store_sales} cp=1 in1=1 in2=1 nclauses=1 failidx=-1 failkind=none
+DPTRACE cpadmit src=join rel={store+v1} cp=0 in1=1 in2=0 nclauses=1 failidx=-1 failkind=none
+DPTRACE cpadmit src=join rel={date_dim+store+store_sales} cp=1 in1=1 in2=1 nclauses=1 failidx=-1 failkind=none
+DPTRACE cpadmit src=join rel={store+store_sales+v1} cp=0 in1=1 in2=0 nclauses=1 failidx=-1 failkind=none
+DPTRACE cpadmit src=join rel={date_dim+store+store_sales+v1} cp=0 in1=1 in2=0 nclauses=1 failidx=-1 failkind=none
+DPTRACE cpgather rel={store_sales} partials=1 verdict=admitted
+DPTRACE cpgather rel={date_dim} partials=2 verdict=admitted
+DPTRACE cpgather rel={date_dim+store_sales} partials=1 verdict=admitted
+DPTRACE cpgather rel={store+store_sales} partials=1 verdict=admitted
+DPTRACE cpgather rel={store+v1} partials=0 verdict=no-partials
+DPTRACE cpgather rel={date_dim+store+store_sales} partials=1 verdict=admitted
+DPTRACE cpgather rel={store+store_sales+v1} partials=0 verdict=no-partials
+DPTRACE cpgather rel={date_dim+store+store_sales+v1} partials=0 verdict=no-partials
+DPTRACE pveto site=base rel={store_sales} dir=- veto=admitted detail=leaf=seq workers=3
+DPTRACE pveto site=base rel={date_dim} dir=- veto=admitted detail=leaf=seq workers=1
+DPTRACE pveto site=base rel={store} dir=- veto=B4 detail=leaf=seq workers=0
+DPTRACE pveto site=base rel={v1} dir=- veto=B2 detail=sub=cp leaf=other
+DPTRACE pveto site=merge rel={date_dim+store_sales} dir={store_sales}+{date_dim} veto=M7 detail=osort=1 jt=INNER
+DPTRACE pveto site=mergeu rel={date_dim+store_sales} dir={store_sales}+{date_dim} veto=M7 detail=cand=0 jt=INNER keys=0
+DPTRACE pveto site=hash rel={date_dim+store_sales} dir={store_sales}+{date_dim} veto=V9 detail=jt=INNER workers=3
+DPTRACE pveto site=merge rel={date_dim+store_sales} dir={date_dim}+{store_sales} veto=M7 detail=osort=1 jt=INNER
+DPTRACE pveto site=mergeu rel={date_dim+store_sales} dir={date_dim}+{store_sales} veto=M7 detail=cand=0 jt=INNER keys=0
+DPTRACE pveto site=mergeu rel={date_dim+store_sales} dir={date_dim}+{store_sales} veto=M8 detail=isort=1 jt=INNER
+DPTRACE pveto site=hash rel={date_dim+store_sales} dir={date_dim}+{store_sales} veto=V9 detail=jt=INNER workers=1
+DPTRACE pveto site=merge rel={store+store_sales} dir={store_sales}+{store} veto=M7 detail=osort=1 jt=INNER
+DPTRACE pveto site=mergeu rel={store+store_sales} dir={store_sales}+{store} veto=M7 detail=cand=0 jt=INNER keys=0
+DPTRACE pveto site=hash rel={store+store_sales} dir={store_sales}+{store} veto=V9 detail=jt=INNER workers=3
+DPTRACE pveto site=merge rel={store+store_sales} dir={store}+{store_sales} veto=M3 detail=jt=INNER
+DPTRACE pveto site=mergeu rel={store+store_sales} dir={store}+{store_sales} veto=M3u detail=cands=0 jt=INNER
+DPTRACE pveto site=hash rel={store+store_sales} dir={store}+{store_sales} veto=V4 detail=jt=INNER
+DPTRACE pveto site=nestloop rel={store+store_sales} dir={store}+{store_sales} veto=V4 detail=jt=INNER
+DPTRACE pveto site=merge rel={store+v1} dir={store}+{v1} veto=M1 detail=sub=cp jt=INNER
+DPTRACE pveto site=mergeu rel={store+v1} dir={store}+{v1} veto=M3u detail=cands=0 jt=INNER
+DPTRACE pveto site=hash rel={store+v1} dir={store}+{v1} veto=V2 detail=sub=cp jt=INNER
+DPTRACE pveto site=nestloop rel={store+v1} dir={store}+{v1} veto=V2 detail=sub=cp jt=INNER
+DPTRACE pveto site=merge rel={store+v1} dir={v1}+{store} veto=M1 detail=sub=cp jt=INNER
+DPTRACE pveto site=mergeu rel={store+v1} dir={v1}+{store} veto=M3u detail=cands=0 jt=INNER
+DPTRACE pveto site=hash rel={store+v1} dir={v1}+{store} veto=V2 detail=sub=cp jt=INNER
+DPTRACE pveto site=nestloop rel={store+v1} dir={v1}+{store} veto=V2 detail=sub=cp jt=INNER
+DPTRACE pveto site=merge rel={date_dim+store+store_sales} dir={date_dim+store_sales}+{store} veto=M7 detail=osort=1 jt=INNER
+DPTRACE pveto site=mergeu rel={date_dim+store+store_sales} dir={date_dim+store_sales}+{store} veto=M7 detail=cand=0 jt=INNER keys=0
+DPTRACE pveto site=hash rel={date_dim+store+store_sales} dir={date_dim+store_sales}+{store} veto=V9 detail=jt=INNER workers=3
+DPTRACE pveto site=merge rel={date_dim+store+store_sales} dir={store}+{date_dim+store_sales} veto=M3 detail=jt=INNER
+DPTRACE pveto site=mergeu rel={date_dim+store+store_sales} dir={store}+{date_dim+store_sales} veto=M3u detail=cands=0 jt=INNER
+DPTRACE pveto site=hash rel={date_dim+store+store_sales} dir={store}+{date_dim+store_sales} veto=V4 detail=jt=INNER
+DPTRACE pveto site=nestloop rel={date_dim+store+store_sales} dir={store}+{date_dim+store_sales} veto=V4 detail=jt=INNER
+DPTRACE pveto site=merge rel={date_dim+store+store_sales} dir={store+store_sales}+{date_dim} veto=M7 detail=osort=1 jt=INNER
+DPTRACE pveto site=mergeu rel={date_dim+store+store_sales} dir={store+store_sales}+{date_dim} veto=M7 detail=cand=0 jt=INNER keys=0
+DPTRACE pveto site=hash rel={date_dim+store+store_sales} dir={store+store_sales}+{date_dim} veto=V9 detail=jt=INNER workers=3
+DPTRACE pveto site=merge rel={date_dim+store+store_sales} dir={date_dim}+{store+store_sales} veto=M7 detail=osort=1 jt=INNER
+DPTRACE pveto site=mergeu rel={date_dim+store+store_sales} dir={date_dim}+{store+store_sales} veto=M7 detail=cand=0 jt=INNER keys=0
+DPTRACE pveto site=mergeu rel={date_dim+store+store_sales} dir={date_dim}+{store+store_sales} veto=M8 detail=isort=1 jt=INNER
+DPTRACE pveto site=hash rel={date_dim+store+store_sales} dir={date_dim}+{store+store_sales} veto=V9 detail=jt=INNER workers=1
+DPTRACE pveto site=merge rel={store+store_sales+v1} dir={store+store_sales}+{v1} veto=M1 detail=sub=cp jt=INNER
+DPTRACE pveto site=mergeu rel={store+store_sales+v1} dir={store+store_sales}+{v1} veto=M7 detail=cand=0 jt=INNER keys=0
+DPTRACE pveto site=hash rel={store+store_sales+v1} dir={store+store_sales}+{v1} veto=V2 detail=sub=cp jt=INNER
+DPTRACE pveto site=nestloop rel={store+store_sales+v1} dir={store+store_sales}+{v1} veto=V2 detail=sub=cp jt=INNER
+DPTRACE pveto site=merge rel={store+store_sales+v1} dir={v1}+{store+store_sales} veto=M1 detail=sub=cp jt=INNER
+DPTRACE pveto site=mergeu rel={store+store_sales+v1} dir={v1}+{store+store_sales} veto=M3u detail=cands=0 jt=INNER
+DPTRACE pveto site=hash rel={store+store_sales+v1} dir={v1}+{store+store_sales} veto=V2 detail=sub=cp jt=INNER
+DPTRACE pveto site=nestloop rel={store+store_sales+v1} dir={v1}+{store+store_sales} veto=V2 detail=sub=cp jt=INNER
+DPTRACE pveto site=merge rel={store+store_sales+v1} dir={store+v1}+{store_sales} veto=M1 detail=sub=cp jt=INNER
+DPTRACE pveto site=mergeu rel={store+store_sales+v1} dir={store+v1}+{store_sales} veto=M3u detail=cands=0 jt=INNER
+DPTRACE pveto site=hash rel={store+store_sales+v1} dir={store+v1}+{store_sales} veto=V2 detail=sub=cp jt=INNER
+DPTRACE pveto site=nestloop rel={store+store_sales+v1} dir={store+v1}+{store_sales} veto=V2 detail=sub=cp jt=INNER
+DPTRACE pveto site=merge rel={store+store_sales+v1} dir={store_sales}+{store+v1} veto=M1 detail=sub=cp jt=INNER
+DPTRACE pveto site=mergeu rel={store+store_sales+v1} dir={store_sales}+{store+v1} veto=M7 detail=cand=0 jt=INNER keys=0
+DPTRACE pveto site=hash rel={store+store_sales+v1} dir={store_sales}+{store+v1} veto=V2 detail=sub=cp jt=INNER
+DPTRACE pveto site=nestloop rel={store+store_sales+v1} dir={store_sales}+{store+v1} veto=V2 detail=sub=cp jt=INNER
+DPTRACE pveto site=merge rel={date_dim+store+store_sales+v1} dir={date_dim+store+store_sales}+{v1} veto=M1 detail=sub=cp jt=INNER
+DPTRACE pveto site=mergeu rel={date_dim+store+store_sales+v1} dir={date_dim+store+store_sales}+{v1} veto=M7 detail=cand=0 jt=INNER keys=0
+DPTRACE pveto site=hash rel={date_dim+store+store_sales+v1} dir={date_dim+store+store_sales}+{v1} veto=V2 detail=sub=cp jt=INNER
+DPTRACE pveto site=nestloop rel={date_dim+store+store_sales+v1} dir={date_dim+store+store_sales}+{v1} veto=V2 detail=sub=cp jt=INNER
+DPTRACE pveto site=merge rel={date_dim+store+store_sales+v1} dir={v1}+{date_dim+store+store_sales} veto=M1 detail=sub=cp jt=INNER
+DPTRACE pveto site=mergeu rel={date_dim+store+store_sales+v1} dir={v1}+{date_dim+store+store_sales} veto=M3u detail=cands=0 jt=INNER
+DPTRACE pveto site=hash rel={date_dim+store+store_sales+v1} dir={v1}+{date_dim+store+store_sales} veto=V2 detail=sub=cp jt=INNER
+DPTRACE pveto site=nestloop rel={date_dim+store+store_sales+v1} dir={v1}+{date_dim+store+store_sales} veto=V2 detail=sub=cp jt=INNER
+DPTRACE pveto site=merge rel={date_dim+store+store_sales+v1} dir={store+store_sales+v1}+{date_dim} veto=M1 detail=sub=cp jt=INNER
+DPTRACE pveto site=mergeu rel={date_dim+store+store_sales+v1} dir={store+store_sales+v1}+{date_dim} veto=M3u detail=cands=0 jt=INNER
+DPTRACE pveto site=hash rel={date_dim+store+store_sales+v1} dir={store+store_sales+v1}+{date_dim} veto=V2 detail=sub=cp jt=INNER
+DPTRACE pveto site=nestloop rel={date_dim+store+store_sales+v1} dir={store+store_sales+v1}+{date_dim} veto=V2 detail=sub=cp jt=INNER
+DPTRACE pveto site=merge rel={date_dim+store+store_sales+v1} dir={date_dim}+{store+store_sales+v1} veto=M1 detail=sub=cp jt=INNER
+DPTRACE pveto site=mergeu rel={date_dim+store+store_sales+v1} dir={date_dim}+{store+store_sales+v1} veto=M7 detail=cand=0 jt=INNER keys=0
+DPTRACE pveto site=mergeu rel={date_dim+store+store_sales+v1} dir={date_dim}+{store+store_sales+v1} veto=M5 detail=cand=1 jt=INNER
+DPTRACE pveto site=hash rel={date_dim+store+store_sales+v1} dir={date_dim}+{store+store_sales+v1} veto=V2 detail=sub=cp jt=INNER
+DPTRACE pveto site=nestloop rel={date_dim+store+store_sales+v1} dir={date_dim}+{store+store_sales+v1} veto=V2 detail=sub=cp jt=INNER
+DPTRACE pveto site=merge rel={date_dim+store+store_sales+v1} dir={date_dim+store_sales}+{store+v1} veto=M1 detail=sub=cp jt=INNER
+DPTRACE pveto site=mergeu rel={date_dim+store+store_sales+v1} dir={date_dim+store_sales}+{store+v1} veto=M7 detail=cand=0 jt=INNER keys=0
+DPTRACE pveto site=hash rel={date_dim+store+store_sales+v1} dir={date_dim+store_sales}+{store+v1} veto=V2 detail=sub=cp jt=INNER
+DPTRACE pveto site=nestloop rel={date_dim+store+store_sales+v1} dir={date_dim+store_sales}+{store+v1} veto=V2 detail=sub=cp jt=INNER
+DPTRACE pveto site=merge rel={date_dim+store+store_sales+v1} dir={store+v1}+{date_dim+store_sales} veto=M1 detail=sub=cp jt=INNER
+DPTRACE pveto site=mergeu rel={date_dim+store+store_sales+v1} dir={store+v1}+{date_dim+store_sales} veto=M3u detail=cands=0 jt=INNER
+DPTRACE pveto site=hash rel={date_dim+store+store_sales+v1} dir={store+v1}+{date_dim+store_sales} veto=V2 detail=sub=cp jt=INNER
+DPTRACE pveto site=nestloop rel={date_dim+store+store_sales+v1} dir={store+v1}+{date_dim+store_sales} veto=V2 detail=sub=cp jt=INNER
+DPTRACE end top={date_dim+store+store_sales+v1} pairs=10 declined=5 costs=6 status=ok
+DPPGSORT caller=sortpath inputrows=818 tuples=818 output=818 limit=-1 width=64 goopginput=150512 goopgoutput=150512 pginput=71984 pgoutput=71984 goopgbranch=memory pgbranch=memory currency=goopg
+DPPATH path producer=upper.groupagg.sort relids=- kind=6 reqouter=- rows=8 startup=19516.88805942602 total=19523.123059426016 disabled=0 pathkeys=1 verdict=accepted jointype=inner outer=- inner=- width=64 inputtotal=19518.933059426017
+DPPATH path producer=upper.groupagg.hashed relids=- kind=6 reqouter=- rows=8 startup=19481.403395161284 total=19481.503395161286 disabled=0 pathkeys=0 verdict=dominated jointype=inner outer=- inner=- width=64 inputtotal=19477.313395161287
+DPTRACE upper gate=agg-upper verdict=refused gate=subtree subtree=gathered
+DPGROUP translated ok keys=1 strategy=1
+DPPATH seed producer=upper.ordered.seed kind=6 keys=1 contained=true ncommon=1 totalcost=19523.123059426016
+DPPATH groupcand producer=upper.ordered.grouping.candidate strategy=1 rows=8
+DPPATH path producer=upper.ordered.input relids=- kind=6 reqouter=- rows=8 startup=19516.88805942602 total=19523.123059426016 disabled=0 pathkeys=1 verdict=accepted jointype=inner outer=- inner=- width=64 inputtotal=19518.933059426017
+DPGROUP elected shape=bare-Aggregate strategy=1
+time=2026-09-20T16:01:46.019+09:00 level=INFO msg="connection closed" remote=127.0.0.1:42274 pid=1 user=postgres application_name=psql

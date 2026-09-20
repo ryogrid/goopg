@@ -11383,12 +11383,80 @@ goopg's processing route diverged from PG's upstream of the fix).
   Materialize). Scope: reprice the parameterised NL inner PG-faithfully
   and verify the stats inputs (818 vs 812 rows). If the residual needs
   Materialize, it feeds 0011c rather than a workaround.
-  Kind: impl
+  Kind: recon
   Parent: M0144-0011
   Expected movement: `join-method`, `scan-type`, `join-order` categories
-  on Q8 (SF0.25). Measured: DPPATH candidate margins at rel {0,1,2,3}
-  (nestloop vs join.hash totals vs PG's own pricing from the optdebug
-  lane) + `pg-plan-parity-diff.py` on a private-lane capture.
+  on Q8 (SF0.25) — carried by the impl child M0144-0011b-1 below.
+  Measured: DPPATH candidate margins at rel {0,1,2,3} (nestloop vs
+  join.hash totals vs PG's own pricing) + `pg-plan-parity-diff.py` on a
+  private-lane capture.
+  - **RECON COMPLETE 2026-09-20 (loop \#47); PREMISE CORRECTED; this task
+    is now BLOCKED on M0144-0011b-1.** Design doc:
+    `docs/design/0100-0149/m0144-0011b-nontable-leaf-pricing.md`; evidence:
+    `analysis/m0144/m0144-0011b-q8-dppath-head.txt`,
+    `m0144-0011b-q8-plan-head.txt`.
+    Movement: none
+    - The filed premise ("goopg prices the NL too dear") is FALSE. At HEAD
+      `97eceacfc`, goopg's `join.nestloop` at rel {0,1,2,3} is 19852.53 and
+      its `join.hash` 19455.50 — while **PG's own NL for the same join is
+      28502.37**. goopg prices the nested loop far too CHEAP, not too dear.
+      Repricing it upward as filed would have been tuning on a false
+      premise (AGENT.md R6).
+    - The real divergence is one layer down and is visible in the EXPLAIN
+      output: a `Hash Join (cost=1.27..11.28 rows=32)` sits directly above
+      a `HashSetOp Intersect (cost=6457.53..7360.42 rows=535)` — the
+      parent is 650x cheaper than its own child. PG's corresponding inner
+      costs 9327.62.
+    - Root cause: `internal/optimizer/joinsearch.go:437` prices EVERY
+      join-search leaf with `costSeqscan`, and `baseSeqScanCostInputs`'
+      non-table branch INVENTS a page count from the row count. A set-op /
+      CTE / subquery / VALUES / function-scan leaf therefore enters the
+      search with its whole subtree free:
+      `joinsearch.prebuilt relids={3} rows=535 total=8.35`.
+    - PG starts from the subpath's cost instead —
+      `postgres/src/backend/optimizer/path/costsize.c:1491-1493`
+      (`cost_subqueryscan`), with `cost_ctescan` / `cost_functionscan` the
+      same shape.
+    - `Materialize` (M0144-0011c) is NOT what decides this election: PG's
+      Materialize wrapper adds ~65 over its 9327.62 child, while the
+      missing leaf cost is ~7350.
+    - Blast radius: 32/99 SF0.25 queries join over a non-table leaf (Q1 Q2
+      Q4 Q5 Q8 Q11 Q14 Q23 Q24 Q30 Q31 Q33 Q38 Q39 Q47 Q51 Q54 Q56 Q57 Q58
+      Q59 Q60 Q64 Q74 Q75 Q77 Q78 Q80 Q83 Q87 Q95 Q97).
+    - NOT landed this loop on purpose: most goopg sub-plan nodes (`SetOp`
+      among them) carry no real `Path` cost, only
+      `DeriveLegacyDisplayCost`, whose header states "this is NOT a cost
+      model and nothing may plan against it". Choosing how to price them
+      is a design decision with a 32-query blast radius; see the child.
+- [ ] **M0144-0011b-1 — price a non-table join-search leaf from its own
+  subtree, not as a sequential scan** (filed by M0144-0011b's recon).
+  `internal/optimizer/joinsearch.go:437` + its partial twin
+  (`addBaseRelPartialPaths`): when `leafBaseScan(leaf)` is not a base heap
+  scan, the leaf's cost must derive from the sub-plan it wraps, the way
+  `cost_subqueryscan` derives from `subpath`
+  (`postgres/src/backend/optimizer/path/costsize.c:1491-1493`), instead of
+  `costSeqscan` over a page count invented from the row count.
+  Kind: impl
+  Parent: M0144-0011b
+  Expected movement: `join-method`, `join-order` and `scan-type` on the 32
+  SF0.25 queries that join over a non-table leaf, Q8 first (its inner is
+  priced 11.28 against PG's 9327.62). Measured: `pg-plan-parity-diff.py`
+  `CATEGORIES-EXCL-MATCH` + match count on a gate-cluster SF0.25 capture,
+  and the DPPATH margin at Q8's rel {0,1,2,3} (`join.nestloop` 19852.53 vs
+  `join.hash` 19455.50 today) against PG's 28502.37.
+  - **Design decision required before coding** — three options, stated in
+    the recon doc §6, NOT interchangeable:
+    - (1) use the leaf's carried `PlanCost` where it has one (a searched
+      subtree does) and fall back otherwise — correct where it applies,
+      but leaves `SetOp`/CTE leaves, i.e. Q8, on the legacy number;
+    - (2) give the sub-plan classes real upper-rel paths (`cost_subqueryscan`
+      / `cost_ctescan` ports with genuine inputs) — the PG-faithful answer
+      and the larger piece of work;
+    - (3) plan against `DeriveLegacyDisplayCost` for these leaves —
+      fastest, and it directly contradicts that function's stated scope
+      rule (`internal/optimizer/plancost.go:116`).
+  - Whichever is chosen, the choice and its PG citation go in the design
+    doc BEFORE any parity number is taken (AGENT.md C3).
 - [ ] **M0144-0011c — `Materialize` node existence** (filed by
   M0144-0011). Q8 is `MISSING-NODE: PG-only kinds: Materialize` — goopg
   has no Materialize plan node (`MaterializedCTEScan` is a different
