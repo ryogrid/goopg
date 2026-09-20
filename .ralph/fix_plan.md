@@ -2253,7 +2253,7 @@ before/after proving the defect it closes.
   third table (distinct from values-gates and plan-parity capture/score).
   Ledger row `m0137-0018-ea-ratchet-stale-baseline` (resolved). No production
   planner/executor/catalog code touched.
-- [ ] **M0137-0019 — triage the 16 parallel-mode `parallelism`-category
+- [x] **M0137-0019 — triage the 16 parallel-mode `parallelism`-category
   divergences M0137-0017 surfaced** — **UPDATE 2026-09-20 (owner decision):
   parallel mode is now the canonical TPC-H parity corpus** (AGENT.md §Goal),
   so this triage is headline work, not a side reading. Subsumed in part by
@@ -2275,6 +2275,89 @@ before/after proving the defect it closes.
   cause most cleanly. Do not re-run the capture; the artefacts are already
   committed and stats-epoch-pinned. Ledger:
   `m0137-0017-parallel-mode-divergence`.
+  - **TRIAGE COMPLETE 2026-09-20 (loop \#50).** Design doc:
+    `docs/design/0100-0149/m0137-0019-parallel-divergence-triage.md`.
+    Kind: recon
+    Parent: none
+    Movement: none
+    - The instrument reproduces the filed claim exactly: `parallelism=16`
+      at `-serial=false` vs `parallelism=0` at `-serial=true`, and exactly
+      four parallel-only regressions — Q1, Q10, Q14, Q15a-VIEWBODY.
+    - **`parallelism=16/22` is not 16 plan-selection defects.** The 16
+      collapse into four families, two of which dominate:
+    - **Family A — 7 queries (Q3 Q9 Q10 Q14 Q16 Q18 Q21): a DESIGNED
+      capability divergence, not a defect.** goopg emits ZERO
+      `Parallel Hash` nodes corpus-wide, and the producer says why:
+      "`parallel_hash = true` is REFUSED: no goopg executor builds a hash
+      table from a partial inner"
+      (`internal/optimizer/joinpathsparallel.go:59-61`). PG has two
+      parallel hash joins (`joinpath.c:1290-1297`); goopg implements
+      neither literally and instead builds ONE shared table in the leader
+      that every goroutine worker adopts by pointer. Closing these needs an
+      EXECUTOR capability, not a planner or costing change — ledger row,
+      not a task.
+      - Q14 is the clean witness: `parallelism` is its ONLY category and
+        the plans are otherwise identical, PG's build side being
+        `Parallel Hash → Parallel Seq Scan on part` against goopg's plain
+        `Seq Scan on part`.
+    - **Family B — 8 queries (Q1 Q4 Q5 Q8 Q12 Q16 Q22 Q15a; 5 of them also
+      flip PG's sorted finalize to goopg's hashed one): ONE mispriced
+      arm.** The R56 `upper.groupagg.gathermerge` candidate is NOT missing
+      and NOT un-offered — a `DP_TRACE=1` plan-only probe at HEAD shows it
+      **generated and ACCEPTED 9 times out of 9**. It loses on cost, and
+      not narrowly: Q1's upper rel prices
+      `upper.groupagg.gathermerge total=1510695.91` against the winning
+      `upper.groupagg.split total=67840.37` — about **7.5x PG's price for
+      Q1's ENTIRE plan (200900.77)**.
+      - **Family B′ (Q3, Q18) is the same arm with the opposite sign** —
+        goopg takes the GatherMerge where PG does not. A term that is wrong
+        in both directions is mispriced, not uniformly too high.
+      - Territory: M0140's parallel-path costing, NOT M0139/M0141/M0142
+        plan selection.
+    - **Family C — 6 queries (Q4 Q9 Q10 Q16 Q19 Q22): worker-count
+      divergence, mostly downstream.** Counts differ in both directions and
+      four of the six also carry family A or B, so the count follows the
+      subtree shape rather than causing it. Q19 is the only member whose
+      divergence is worker count ALONE.
+    - **Q4 additionally loses parallelism entirely** — goopg plans it fully
+      SERIAL in parallel mode (`HashAggregate → Nested Loop Semi Join →
+      Seq Scan on orders`) where PG parallelises the semi-join's outer. No
+      partial path is filed beneath a `Nested Loop Semi Join`.
+    - **Q7** carries the category with no structural delta: both plans are
+      `Gather Merge → Sort → Hash Join` and only the parallel-aware LABEL
+      differs (goopg marks the join, PG marks the scan). That is family A's
+      design difference surfacing, not a fifth mechanism.
+    - Method: the capture was NOT re-run, as the task requires; the one
+      live fact needed (is the GatherMerge candidate generated?) came from
+      a `DP_TRACE=1` plan-only probe, a different instrument that produces
+      no timing.
+- [ ] **M0137-0019a — reprice the `GatherMerge` + worker-sort arm** (filed
+  by M0137-0019's triage). The candidate is generated and accepted; it
+  loses because goopg prices it absurdly — Q1's
+  `upper.groupagg.gathermerge` totals 1510695.91 where PG's whole Q1 plan
+  costs 200900.77. Port `cost_gather_merge`
+  (`postgres/src/backend/optimizer/path/costsize.c`) and the worker-sort
+  term against `partialaggupper.go`'s R56 arm, and check the mirror cases
+  (Q3, Q18) do not simply flip the other way.
+  Kind: impl
+  Parent: M0137-0019
+  Expected movement: the `parallelism` category on TPC-H parallel, families
+  B and B′ — 8 to 10 of 22 queries (Q1 Q4 Q5 Q8 Q12 Q16 Q22 Q15a, plus the
+  mirrors Q3 Q18). Measured: `pg-plan-parity-diff.py` `CATEGORIES:` /
+  `CATEGORIES-EXCL-MATCH:` `parallelism` count on a pinned-epoch
+  `estimate-audit -plan-only -serial=false` capture, against the current 16.
+- [ ] **M0137-0019b — file a partial path beneath `Nested Loop Semi Join`**
+  (filed by M0137-0019's triage). TPC-H Q4 is the corpus's only fully
+  SERIAL plan in parallel mode: goopg plans
+  `HashAggregate → Nested Loop Semi Join → Seq Scan on orders` where PG
+  plans `Finalize GroupAggregate → Gather Merge → Partial GroupAggregate →
+  Sort → Nested Loop Semi Join → Parallel Seq Scan on orders`.
+  Kind: impl
+  Parent: M0137-0019
+  Expected movement: Q4's `parallelism` category record on TPC-H parallel,
+  and its `D:goopg-fully-serial` classification retires. Measured:
+  `pg-plan-parity-diff.py` per-query line for Q4 plus the presence of a
+  `Gather`/`Gather Merge` in its goopg plan.
 - [x] **M0137-0020 — pin `GOOPG_ANALYZE_SEED` in the TPC-DS capture harness**
   (filed by M0138-0008, 2026-09-15) — **DONE 2026-09-15.** The fix does NOT
   land inside `scripts/capture-tpcds.sh` as the task title/deliverable
