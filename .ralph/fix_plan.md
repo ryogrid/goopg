@@ -12582,6 +12582,37 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
   `*SetOp` falls back to the legacy pipeline, not to a partial search).
   Kind: impl
   Parent: M0145-0003
+  - Loop 2026-09-21: design doc
+    `docs/design/0100-0149/m0145-0005-single-pass-dp-over-jointree.md`
+    + slice 1 landed.
+    - Recon: the DP substrate the task text calls for is already complete —
+      `joinIsLegal` is the joinrels.c:350 port in full (SEMI/ANTI match,
+      `reversed`, LEFT/FULL association), `buildJoinRelRestrictList`
+      implements outer-join clause distribution incl. nullable-side
+      filters, `addPaths(..., sjinfo)` → `Path.Jointype` →
+      `planJoinTypeFor` → executor types; `makeRelFromJoinlist` already
+      recurses pinned sub-joinlists. The remainder is construction-side
+      retirement, not capability.
+    - Key correction to the task's mental model: `joinPinned` pins ONLY
+      FULL since C-04a/b (LEFT/RIGHT deconstruct flat + SJInfos — a flat
+      `a LEFT b LEFT c` was already a single searched problem on BOTH
+      arms); the only pinned tops left are FULL and outer-over-FULL,
+      which `spineLinkSearchable` never certifies — a certified non-empty
+      spine was unreachable, so `splitOuterSpine`/splice/`prefixNullable`
+      were already dead on reachable inputs.
+    - Slice 1 (landed): knob arm skips `splitOuterSpine` entirely in
+      `tryPGShapedJoinSearch` — `node` + `ctx.joinlist` feed the
+      machinery directly; pinned tops decline one gate later
+      (`extractSearchLeaves` leaf-count / `pinnedUnsearchable`) with the
+      same `used=false` syntactic fall-back. No reachable plan change on
+      either arm — pure retirement.
+    - Remaining slices per the doc: semi/anti as real leaf items (retires
+      `semiAntiChainLink` synthetic leaves + remap family), IR-direct
+      leaf materialisation (retires `extractSearchLeaves` node-walk +
+      spans/offset validation), one-rel floor (`isSimpleSingle`/
+      `GOOPG_ONEREL_SEARCH`), Phase A/B + `admitSemiAnti` retirement.
+    - Tests: `internal/optimizer/joinsearch_m0145_test.go` — searched
+      flat LEFT spine pin, both-arms parity pin, FULL fail-closed pin.
 - [ ] **M0145-0006 — upper-rel pathlists** (extend the lattice through
   `create_grouping_paths`/`create_ordered_paths` analogues so ordering and
   grouping are elected over candidate sets, not by stage-builder

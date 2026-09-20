@@ -260,7 +260,30 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 	// below it. With no outer link this is the identity — `chain == node`,
 	// `spine` empty, `jl == ctx.joinlist` — so the shapes P5.9-r already searched
 	// take exactly the path they took before.
-	chain, spine, jl, ok := splitOuterSpine(node, ctx.joinlist)
+	// M0145-0005 slice 1 (m0145-0005 design doc §"Slice 1"): the jointree
+	// arm does not peel at all — the search consumes the whole node tree
+	// and the unpeeled joinlist in one pass. Since C-04a/b relaxed LEFT and
+	// RIGHT to collapse-dependent, `joinPinned` pins only FULL (plus a
+	// LEFT/RIGHT stacked over a FULL pin), and `spineLinkSearchable` never
+	// certifies FULL — so a certified non-empty spine is unreachable today:
+	// every reachable statement either has no pinned items (the flat
+	// LEFT/RIGHT case, already searched whole through `outerChainLink`s and
+	// `joinIsLegal`) or carries a pin the search cannot build, which
+	// declines at `extractSearchLeaves`' leaf-count check or at
+	// `makeRelFromJoinlist`'s `pinnedUnsearchable` arm instead of here —
+	// the same `used=false` fall-back to the syntactic tree, one gate
+	// earlier in the machinery the arm is retiring. `splitOuterSpine`,
+	// `spineLinkSearchable`, `prefixNullable` and the splice below stay for
+	// the legacy arm until the M0145-0008 cutover.
+	var chain Node
+	var spine []*Join
+	var jl joinlist
+	var ok bool
+	if jointreePipeline {
+		chain, spine, jl, ok = node, nil, ctx.joinlist, true
+	} else {
+		chain, spine, jl, ok = splitOuterSpine(node, ctx.joinlist)
+	}
 	if !ok {
 		traceSeamDecline("outer-spine", nrels, len(spine))
 		return node, pred, false
