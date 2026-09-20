@@ -792,7 +792,16 @@ func (o *joinOp) parallelBuildLazyHashTable(ctx *Context, buildLeft bool) (bool,
 	group.Cancel()
 	for range ch {
 	}
-	group.Wait()
+	// A producer that fails mid-stream must fail the build, not truncate
+	// it: the channelSource sees a closed channel either way, so without
+	// this the hash table is built from a partial row set and the join
+	// silently drops matches — the exact wrong-results signature TPC-H Q20
+	// showed (85-99 of 101 suppliers, plan stable, worker-count dependent).
+	// On the loopErr path a producer error is a CONSEQUENCE of the build's
+	// own failure (Cancel unblocks senders), so the first error wins.
+	if werr := group.Wait(); werr != nil && loopErr == nil {
+		loopErr = werr
+	}
 
 	// Merge per-worker notices/warnings and release arenas.
 	for i := range maxProducers {

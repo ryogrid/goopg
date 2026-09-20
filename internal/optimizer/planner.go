@@ -1325,6 +1325,13 @@ func planSelectImpl(s *parser.SelectStmt, cat catalog.Catalog, plannerSet Planne
 	appendrelMember := plannerSet.appendrelMember
 	plannerSet.appendrelMember = false
 
+	// M0145-0005 slice 4 (m0145-0005 design doc §"Slice 4"): on the
+	// jointree arm the one-relation scope is a searched problem like any
+	// other — `make_one_rel` runs `set_base_rel_pathlists`
+	// (allpaths.c:221) unconditionally before looking at the joinlist, so
+	// a single-FROM-item statement routes through planFromClause and the
+	// join search rather than the rule-based bypass below. The legacy arm
+	// keeps the bypass byte for byte; `jointree` is the arm flag.
 	var node Node
 	var ctx *resolveContext
 	// fromOnly tracks whether the single-table FROM clause used `FROM ONLY`
@@ -1349,7 +1356,7 @@ func planSelectImpl(s *parser.SelectStmt, cat catalog.Catalog, plannerSet Planne
 			Rows:   [][]Expr{{}},
 			schema: nil,
 		}
-	} else if isSimpleSingle && !oneRelSearchEnabled() && !appendrelMember {
+	} else if isSimpleSingle && !oneRelSearchEnabled() && !appendrelMember && !jointree {
 		rv := s.From[0]
 		fromOnly = rv.Only
 		// Delegate the simple-single-table case to
@@ -1501,7 +1508,13 @@ func planSelectImpl(s *parser.SelectStmt, cat catalog.Catalog, plannerSet Planne
 		// is a missed optimisation in the ON arm, never a wrong answer:
 		// both are value-preserving rewrites. Default OFF: the condition
 		// below is the historical branch, byte for byte.
-		if isSimpleSingle && !oneRelSearchEnabled() && !appendrelMember {
+		// M0145-0005 slice 4: `!jointree` lifts the same chooser on the
+		// jointree arm — every single-table+WHERE scope plans through the
+		// generic arm (Filter → pull-up → tryJoinSearch) so its base rel
+		// carries a real pathlist, and a flat EXISTS/NOT EXISTS over one
+		// table now reaches `pullUpSublinksIntoJointree` instead of the
+		// post-hoc unnest below.
+		if isSimpleSingle && !oneRelSearchEnabled() && !appendrelMember && !jointree {
 			// M0051-0004: inject synthetic range predicates alongside any
 			// LIKE conjuncts so tryRangeIndexScan can activate a B-tree.
 			whereForIndex := injectLikeRangePredicates(whereQual)
@@ -1678,7 +1691,15 @@ func planSelectImpl(s *parser.SelectStmt, cat catalog.Catalog, plannerSet Planne
 			// See pushOuterQualsIntoLaterals in pushdown.go.
 			node = pushOuterQualsIntoLaterals(node)
 		}
-	} else if joinTreeHasOuterLink(node) || appendrelMember {
+	} else if joinTreeHasOuterLink(node) || appendrelMember || jointree {
+		// M0145-0005 slice 4: `|| jointree` — on the jointree arm every
+		// filterless scope reaches the seam, not only outer-linked and
+		// member trees. A WHERE-less single-table statement (`SELECT …
+		// FROM t`) is the one-relation search the floor now admits, and a
+		// filterless inner join is searched whole — the "gated round" the
+		// comment below defers on the legacy arm is what the pipeline
+		// knob itself gates here. A declined seam still returns the tree
+		// untouched.
 		// M0145-0004: `|| appendrelMember` — a UNION ALL appendrel's
 		// member scope plans through the join search even when the
 		// member has no WHERE and no outer link (a bare `SELECT … FROM t`

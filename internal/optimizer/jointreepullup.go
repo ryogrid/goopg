@@ -201,9 +201,19 @@ func pullUpExistsBody(ex *ExistsExpr, negated bool, parent *resolveContext, cat 
 			return nil, false
 		}
 	}
-	where, err := resolveExpr(sub.Where, bodyCtx)
-	if err != nil {
-		return nil, false
+	// A WHERE-less body (an uncorrelated `EXISTS (SELECT … FROM t)`)
+	// contributes no conjuncts at all — resolveExpr must not be called on
+	// the nil Where (M0145-0005 slice 4 exposed the crash: single-table
+	// statements only reach this machinery once the isSimpleSingle bypass
+	// lifts). The empty conjunct set then declines at the correlation
+	// check below, exactly as an outer-local-only WHERE does.
+	var where Expr
+	if sub.Where != nil {
+		var err error
+		where, err = resolveExpr(sub.Where, bodyCtx)
+		if err != nil {
+			return nil, false
+		}
 	}
 	if exprHasSublinkPlan(where) || exprListHasSublinkPlan(onQuals) {
 		return nil, false

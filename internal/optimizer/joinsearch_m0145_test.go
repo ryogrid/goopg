@@ -126,3 +126,115 @@ func TestJointreeDeclinesAFullSpine(t *testing.T) {
 		t.Fatal("the knob arm searched a FULL-topped spine — fail-closed is broken")
 	}
 }
+
+// M0145-0005 slice 4 — one-relation and degenerate scopes through the
+// same entry. On the jointree arm the `isSimpleSingle` bypass, the
+// `GOOPG_ONEREL_SEARCH` floor and the filterless-statement gate are all
+// lifted: `make_one_rel` runs `set_base_rel_pathlists` (allpaths.c:221)
+// for every base rel before `make_rel_from_joinlist` counts items, so a
+// one-item joinlist is a searched problem and a WHERE-less scope still
+// reaches the seam. The legacy arm keeps every gate byte for byte.
+
+// The pins read `treeHasSearched` (onerelreroute_test.go) — the
+// provenance marker that separates "the search built this" from "the
+// syntactic path produced the same shape".
+
+// TestJointreeSearchesOneRelationScope is slice 4's headline pin: on the
+// jointree arm a single-table+WHERE statement plans through the generic
+// arm — Filter, then tryJoinSearch — so the plan carries the
+// searched-subtree tag the rule-chooser path never stamps. The legacy
+// arm keeps the isSimpleSingle bypass: no tag.
+func TestJointreeSearchesOneRelationScope(t *testing.T) {
+	cat := jtpCatalog(t)
+	jointreePlan := planOnPipeline(t, `SELECT k FROM jtp_o WHERE k > 5`, cat, true)
+	if !treeHasSearched(jointreePlan) {
+		t.Fatalf("jointree arm planned a single-table statement without the search; tree: %s", describePlanTree(jointreePlan))
+	}
+	legacyPlan := planOnPipeline(t, `SELECT k FROM jtp_o WHERE k > 5`, cat, false)
+	if treeHasSearched(legacyPlan) {
+		t.Fatalf("legacy arm searched a one-relation statement — the bypass is gone; tree: %s", describePlanTree(legacyPlan))
+	}
+}
+
+// TestJointreeSearchesAFilterlessScope pins the degenerate arm: no WHERE
+// at all still reaches the seam on the jointree arm — a bare scan for
+// the one-item statement, a searched join for a filterless comma inner
+// join — while the legacy arm leaves both shapes untouched (the
+// joinTreeHasOuterLink gate sees no outer link and there is no Filter
+// arm without a WHERE).
+func TestJointreeSearchesAFilterlessScope(t *testing.T) {
+	cat := jtpCatalog(t)
+	for _, sql := range []string{
+		`SELECT k FROM jtp_o`,
+		`SELECT * FROM jtp_o, jtp_i`,
+	} {
+		if !treeHasSearched(planOnPipeline(t, sql, cat, true)) {
+			t.Fatalf("jointree arm left a filterless scope unsearched: %s", sql)
+		}
+		if treeHasSearched(planOnPipeline(t, sql, cat, false)) {
+			t.Fatalf("legacy arm searched a filterless scope: %s", sql)
+		}
+	}
+}
+
+// TestJointreePullsExistsOverSingleTable is the semantic witness the
+// floor lift unlocks: `FROM t WHERE EXISTS (…)` is a single-FROM-item
+// statement, so before slice 4 the EXISTS rode the isSimpleSingle bypass
+// and decorrelated only in the post-hoc unnest below — a Semi join the
+// search never saw. On the jointree arm it now pulls up into the one
+// searched problem: a searched SEMI join with no residual ExistsExpr.
+func TestJointreePullsExistsOverSingleTable(t *testing.T) {
+	cat := jtpCatalog(t)
+	node := planOnPipeline(t,
+		`SELECT k FROM jtp_o WHERE EXISTS (SELECT 1 FROM jtp_i WHERE jtp_i.j = jtp_o.k)`, cat, true)
+	j := findSemiOrAntiJoin(node)
+	if j == nil || j.Type != JoinTypeSemi {
+		t.Fatalf("single-table EXISTS did not become a searched SEMI join; tree: %s", describePlanTree(node))
+	}
+	if !treeHasSearched(node) {
+		t.Fatalf("the SEMI join is not a search product — pull-up ran but the scope stayed unsearched; tree: %s", describePlanTree(node))
+	}
+	if planHasExistsExpr(node) {
+		t.Fatalf("EXISTS leaked into a residual; tree: %s", describePlanTree(node))
+	}
+}
+
+// TestJointreeAdmitsAOneRelProblem pins the floor itself at the seam:
+// nprefix=1 on the jointree arm is a searched problem even with
+// GOOPG_ONEREL_SEARCH off — the env knob now governs the legacy arm
+// alone.
+func TestJointreeAdmitsAOneRelProblem(t *testing.T) {
+	withPGShapedDP(t)
+	defer func(v bool) { jointreePipeline = v }(jointreePipeline)
+	jointreePipeline = true
+	defer setOneRelSearchForTest(false)()
+
+	names := []string{"a"}
+	node, ctx := seamFixture(names, []int64{100_000})
+	out, residual, used := tryPGShapedJoinSearch(node, seamLocal(names, 0), ctx, nil)
+	if !used {
+		t.Fatal("the seam declined a one-relation problem on the jointree arm")
+	}
+	if out == nil {
+		t.Fatal("the seam consumed a one-relation problem but returned a nil tree")
+	}
+	if residual != nil {
+		t.Fatalf("residual = %v, want nil — a leaf-local restriction distributes", residual)
+	}
+}
+
+// TestLegacyArmDeclinesAOneRelProblem is the arm-scoping pin: with the
+// pipeline knob off and GOOPG_ONEREL_SEARCH unset the floor stays 2 —
+// slice 4 must not leak the lift onto the arm the env knob still owns.
+func TestLegacyArmDeclinesAOneRelProblem(t *testing.T) {
+	withPGShapedDP(t)
+	defer func(v bool) { jointreePipeline = v }(jointreePipeline)
+	jointreePipeline = false
+	defer setOneRelSearchForTest(false)()
+
+	names := []string{"a"}
+	node, ctx := seamFixture(names, []int64{100_000})
+	if _, _, used := tryPGShapedJoinSearch(node, seamLocal(names, 0), ctx, nil); used {
+		t.Fatal("the legacy arm searched a one-relation problem with both knobs off — the floor is gone")
+	}
+}

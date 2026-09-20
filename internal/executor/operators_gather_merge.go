@@ -465,7 +465,15 @@ func (o *gatherMergeOp) Close() error {
 	}
 
 	// Same ordering as gatherOp.Close, and for the same reason: cancel, then
-	// DRAIN so a worker blocked mid-send can observe it, then join.
+	// DRAIN so a worker blocked mid-send can observe it, then join. The
+	// group==nil guard is gatherOp.Close's: a Merge that was never Opened
+	// (e.g. a child of a shared hash build's build side, Closed but never
+	// Opened by a cooperative producer) launched nothing, and cancelling a
+	// nil group is a nil-pointer panic that then cancels sibling producers
+	// mid-scan — silently dropping rows.
+	if o.group == nil {
+		return nil
+	}
 	o.selfCancelled = true
 	o.group.Cancel()
 	for _, ch := range o.chans {

@@ -7,12 +7,13 @@ package optimizer
 //  1. the resolver is fail-closed — only the literal "1" arms the new
 //     pipeline, so an unset/misspelled environment can never silently
 //     route planning off the value-gated path;
-//  2. while the jointree entry is a delegating stub (until M0145-0003
-//     lands the IR), the knob arm is byte-for-byte the legacy plan — the
-//     property the A/A knob-arm capture measures end-to-end.
+//  2. the dispatch reaches the arm it names: on a scope the arms plan
+//     differently (a single-table statement, since M0145-0005 slice 4
+//     lifted the isSimpleSingle bypass on the jointree arm), the
+//     knob-on plan carries the searched-subtree tag and the knob-off
+//     plan does not.
 
 import (
-	"reflect"
 	"testing"
 
 	"github.com/goopg/goopg/internal/parser"
@@ -54,7 +55,15 @@ func TestJointreePipelineDispatchDelegates(t *testing.T) {
 	if err != nil {
 		t.Fatalf("knob-on plan: %v", err)
 	}
-	if !reflect.DeepEqual(off, on) {
-		t.Errorf("delegating stub: knob-on plan differs from knob-off plan")
+	// M0145-0005 slice 4: the arms legitimately diverge on this
+	// single-table statement — the jointree arm lifts the isSimpleSingle
+	// bypass so the scope is searched, the legacy arm keeps the
+	// rule-chooser path. The delegation pin is therefore the routing
+	// itself: knob-on carries the searched-subtree tag, knob-off does not.
+	if !treeHasSearched(on) {
+		t.Errorf("knob-on plan is not a search product — the dispatch did not reach the jointree arm")
+	}
+	if treeHasSearched(off) {
+		t.Errorf("knob-off plan carries the search tag — the lift leaked onto the legacy arm")
 	}
 }

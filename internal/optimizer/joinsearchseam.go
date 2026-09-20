@@ -248,8 +248,16 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 	// same way GOOPG_ONEREL_SEARCH does globally; the flag is set only
 	// inside planSelectImpl for a scope that arrived as a marked union's
 	// member, so this is the jointree arm alone.
+	//
+	// M0145-0005 slice 4: the jointree arm takes the PG-faithful value
+	// unconditionally — `make_one_rel` calls `set_base_rel_pathlists`
+	// (allpaths.c:221) for every base rel before `make_rel_from_joinlist`
+	// ever counts items, so a one-item joinlist is not a reason to skip
+	// base-rel path generation. GOOPG_ONEREL_SEARCH keeps governing the
+	// legacy arm alone; on this arm the floor is 1 whether or not the
+	// knob is exported.
 	floor := minSearchRels()
-	if ctx.appendrelMember && floor > 1 {
+	if (jointreePipeline || ctx.appendrelMember) && floor > 1 {
 		floor = 1
 	}
 	if nrels < floor || nrels > maxSearchRels || len(ctx.joinlist) == 0 {

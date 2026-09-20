@@ -9,11 +9,12 @@ package optimizer
 //     scan(s), and no ExistsExpr survives anywhere in the plan
 //     (the conjunct was consumed, not duplicated into a residual);
 //  2. every decline gate keeps the statement exactly where the legacy
-//     pipeline finds it — knob-on and knob-off plans are identical
-//     for bodies the pull-up refuses.
+//     pipeline finds it — knob-on and knob-off plans are the same
+//     shape with the same decorrelation outcome for bodies the pull-up
+//     refuses (searched provenance aside — M0145-0005 slice 4 searches
+//     the single-FROM-item outer itself on the knob arm).
 
 import (
-	"reflect"
 	"testing"
 
 	"github.com/goopg/goopg/internal/catalog"
@@ -321,8 +322,14 @@ func TestJointreePullupIntegratesAntiLink(t *testing.T) {
 }
 
 // TestJointreePullupDeclineParity is the fail-closed pin: every body
-// shape the pull-up refuses must leave the knob-on plan byte-identical
-// to the legacy one — the pull-up's marks are inert outside the seam.
+// shape the pull-up refuses must leave the knob-on plan the SAME plan
+// the legacy arm builds — same node-kind shape, same decorrelation
+// outcome, same semi/anti type. Since M0145-0005 slice 4 the check is
+// no longer reflect.DeepEqual: the jointree arm searches the
+// single-FROM-item outer itself (the isSimpleSingle bypass is lifted),
+// so the knob-on plan legitimately carries searchedTree provenance the
+// byte-compare reads as a difference. What must stay identical is the
+// semantics — the three assertions below.
 func TestJointreePullupDeclineParity(t *testing.T) {
 	cases := map[string]string{
 		// No correlation at all — contain_vars_of_level(whereClause,1)
@@ -362,8 +369,22 @@ func TestJointreePullupDeclineParity(t *testing.T) {
 			cat := jtpCatalog(t)
 			off := planOnPipeline(t, sql, cat, false)
 			on := planOnPipeline(t, sql, cat, true)
-			if !reflect.DeepEqual(off, on) {
-				t.Errorf("declined pull-up changed the plan\nknob-off: %s\nknob-on:  %s", describePlanTree(off), describePlanTree(on))
+			if dOff, dOn := describePlanTree(off), describePlanTree(on); dOff != dOn {
+				t.Errorf("declined pull-up changed the plan shape\nknob-off: %s\nknob-on:  %s", dOff, dOn)
+			}
+			if planHasExistsExpr(off) != planHasExistsExpr(on) {
+				t.Errorf("declined pull-up changed the decorrelation outcome (off hasExists=%v, on hasExists=%v)",
+					planHasExistsExpr(off), planHasExistsExpr(on))
+			}
+			var offType, onType JoinType
+			if j := findSemiOrAntiJoin(off); j != nil {
+				offType = j.Type
+			}
+			if j := findSemiOrAntiJoin(on); j != nil {
+				onType = j.Type
+			}
+			if offType != onType {
+				t.Errorf("declined pull-up changed the join type: off=%v on=%v", offType, onType)
 			}
 		})
 	}
@@ -404,13 +425,22 @@ func TestJointreePullupSiblingConjunctPreserved(t *testing.T) {
 }
 
 // TestJointreePullupNoExistsKeepsLegacyIdentical pins the trivial case:
-// a WHERE clause with no sublink at all plans identically on both arms.
+// a WHERE clause with no sublink at all plans the same shape on both
+// arms. Since M0145-0005 slice 4 the knob arm legitimately SEARCHES the
+// single-FROM-item scope — same plan, searched provenance — so the pin
+// is shape equality plus the routing marker, not byte equality.
 func TestJointreePullupNoExistsKeepsLegacyIdentical(t *testing.T) {
 	cat := jtpCatalog(t)
 	sql := `select tag from jtp_o where k > 3`
 	off := planOnPipeline(t, sql, cat, false)
 	on := planOnPipeline(t, sql, cat, true)
-	if !reflect.DeepEqual(off, on) {
-		t.Errorf("sublink-free statement diverged\nknob-off: %s\nknob-on:  %s", describePlanTree(off), describePlanTree(on))
+	if dOff, dOn := describePlanTree(off), describePlanTree(on); dOff != dOn {
+		t.Errorf("sublink-free statement diverged\nknob-off: %s\nknob-on:  %s", dOff, dOn)
+	}
+	if !treeHasSearched(on) {
+		t.Errorf("knob-on plan is not a search product — the single-table scope stayed unsearched")
+	}
+	if treeHasSearched(off) {
+		t.Errorf("knob-off plan carries the search tag — the lift leaked onto the legacy arm")
 	}
 }

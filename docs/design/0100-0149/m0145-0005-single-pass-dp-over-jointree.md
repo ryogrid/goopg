@@ -1,6 +1,7 @@
 # M0145-0005 — single-pass DP over the jointree
 
-Status: slice 1 landed (certified outer spines searched on the knob arm) /
+Status: slice 1 landed (knob-arm `splitOuterSpine` retired) and slice 4
+landed (one-relation + degenerate scopes through the same entry) /
 remainder sliced below. Task: `.ralph/fix_plan.md` M0145-0005. Parent:
 M0145-0001 (IR contract + retirement matrix), M0145-0003 (semi/anti leaf
 entries), M0145-0004 (appendrel leaves). Kind: impl.
@@ -104,13 +105,83 @@ acceptance arm. White-box pins in `joinsearch_m0145_test.go` cover the
 searched-spine invariant, the both-arms parity, and the FULL fail-closed
 path.
 
+## Slice 4 — one-relation and degenerate scopes through the same entry (landed)
+
+`make_one_rel` runs `set_base_rel_pathlists` (allpaths.c:221) for every
+base rel unconditionally, before `make_rel_from_joinlist` ever counts
+items — so the jointree arm's correct semantics is "every scope reaches
+the seam; the seam's own gates decide". Slice 4 lifts the three places
+the knob arm still routed scopes around the search:
+
+- `planSelectImpl`'s `isSimpleSingle` node-building bypass and the
+  WHERE-arm rule-chooser guard each gain `&& !jointree` — a
+  single-FROM-item statement now plans through `planFromClause` and the
+  generic WHERE arm (Filter → pull-up → `tryJoinSearch`), so a flat
+  correlated `EXISTS`/`NOT EXISTS` over one table reaches
+  `pullUpSublinksIntoJointree` for the first time instead of the
+  post-hoc unnest.
+- The filterless arm's `joinTreeHasOuterLink(node) || appendrelMember`
+  gains `|| jointree` — every WHERE-less scope reaches the seam on the
+  knob arm: a bare `SELECT … FROM t` (the one-relation problem) and a
+  filterless inner join alike. The "gated round" the legacy arm's
+  comment defers is what the pipeline knob itself gates.
+- The seam floor takes the PG-faithful value unconditionally on the arm:
+  `(jointreePipeline || ctx.appendrelMember) && floor > 1` — nprefix=1
+  is a searched problem. `GOOPG_ONEREL_SEARCH` keeps governing the
+  legacy arm alone; `minSearchRels`'s other readers were already inside
+  the lifted guards, so the env knob's whole remaining meaning is the
+  legacy floor.
+
+The one-relation protocol itself (`makeRelFromJoinlist`'s
+`jl.nrels()==1` arm) is unchanged and stays gated on `scanLeafFor`
+rebuildability + `r.info.table != nil`: a real-table leaf gets base-rel
+path generation and the searched-subtree tag; a non-table single leaf
+(CTE scan, subquery, function, VALUES) declines inside and keeps the
+syntactic leaf — value-identical fail-closed, same as the member-scope
+protocol M0145-0004 already exercises end-to-end.
+
+What the lift intentionally changes: the rule-chooser's rewrites —
+`injectLikeRangePredicates`, `reduceNotNullQuals` (including the
+always-false → childless `Result{OneTimeFilter: false}` shape),
+`planIndexScanFromWhere` — are skipped on the knob arm, exactly the
+trade E-21 documented for `GOOPG_ONEREL_SEARCH`: value-preserving
+missed optimisations, never wrong answers (PG performs the reduction
+inside `distribute_qual_to_rels`; the generic arm does not implement it
+for any arm — ledgered).
+
+A latent crash the lift exposed and fixed in the same commit:
+`pullUpExistsBody` called `resolveExpr(sub.Where, bodyCtx)` unguarded —
+a WHERE-less EXISTS body (`EXISTS (SELECT 1 FROM t)`) is a nil Expr and
+the resolve walked it. Reachable before this slice through multi-table
+outers on the knob arm, newly reachable through the far more common
+single-table shape; the body now contributes an empty conjunct set and
+declines at the correlation check, the outcome upstream's
+`contain_vars_of_level(whereClause, 1)` prescribes.
+
+Two test premises were also retired, not weakened: the dual-pipeline
+"delegating stub" byte-equality pin
+(`TestJointreePipelineDispatchDelegates`) and the pull-up
+decline-parity byte-equality pin both predated any searched
+single-table scope; they now assert the real contract — same plan
+shape, same decorrelation outcome, same join type — plus the
+routing marker (`treeHasSearched` on knob-on, absent knob-off).
+
+### Corpus witnesses
+
+- TPC-H Q1 / Q4 / Q6 — single-FROM-item statements; under the knob they
+  now produce searched plans (Q4's `EXISTS` becomes a searched SEMI
+  join through the pull-up, matching PG's
+  `pull_up_sublinks`-before-join-planning order).
+- Every single-table subquery/CTE member in the corpus — same routing.
+- Filterless inner joins under the knob — searched for the first time;
+  the SF0.25 capture's moved-plan names are the measurement.
+
 ## Remaining slices (ledgered)
 
 | slice | scope | retires |
 |---|---|---|
 | 2 | semi/anti as real leaf items in the jointree problem — leaf entries numbered in-binding-order (M0145-0003's `pulled` entries already carry spans/SJInfos) instead of synthetic appended slots | `semiAntiChainLink` synthetic-leaf splice, `remapWalkOrderFlatToSpans`, `semiAntiOnQualsOK`, `admitSemiAnti` flag, the `searchJl` leafItem-append workaround |
 | 3 | IR-direct leaf materialisation: `jtScope` (or the resolveContext's already-built binding table) supplies bindings/spans/neededCols/outputCols without walking the node chain; clause distribution by coordinate ownership | `extractSearchLeaves`, `buildLeafSpans` as node-walk mechanism, `spans`/`offset-disagreement`/`residual-hits-pad` validation family, `localizeExprToLeaf`, `rebaseChainQual`/`rebaseSemiAntiChainQual` |
-| 4 | one-relation and degenerate scopes through the same entry | `isSimpleSingle` bypass, `GOOPG_ONEREL_SEARCH` floor, `tryJoinSearch`/`tryPGShapedJoinSearch` split |
 | 5 | misc decline-family retirement as corpus admits | `outer-on-qual`, `inner-on-qual-*`, `outer-over-derived` (post-B-06), `pushPredicatesIntoCrossJoins`/`pushSingleSideQualsIntoInnerJoinInputs`/`rewriteScanInputsWithSingleTablePredicates`/`pushOuterQualsIntoLaterals` |
 
 The executor-capability refusals (FULL hash, partial shapes the executor

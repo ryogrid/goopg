@@ -12613,6 +12613,53 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
       `GOOPG_ONEREL_SEARCH`), Phase A/B + `admitSemiAnti` retirement.
     - Tests: `internal/optimizer/joinsearch_m0145_test.go` — searched
       flat LEFT spine pin, both-arms parity pin, FULL fail-closed pin.
+    - Slice 4 (landed, loop 2026-09-21 #7): one-relation and degenerate
+      scopes through the same entry on the knob arm —
+      `isSimpleSingle` bypass + WHERE-arm rule-chooser guard gained
+      `&& !jointree`, the filterless arm gained `|| jointree`, and the
+      seam floor is `1` whenever `jointreePipeline`
+      (`GOOPG_ONEREL_SEARCH` now governs the legacy arm alone — its only
+      readers were inside the lifted guards).
+    - Behaviour the lift unlocks: single-table statements on the knob arm
+      are searched (base-rel pathlist on cost, `set_base_rel_pathlists`
+      analogue); a flat correlated EXISTS/NOT EXISTS over one table now
+      reaches `pullUpSublinksIntoJointree` — previously the
+      `isSimpleSingle` bypass kept every pull-up test on the post-hoc
+      unnest path without exercising pull-up at all.
+    - Latent crash fixed in the same commit: `pullUpExistsBody` called
+      `resolveExpr(sub.Where)` unguarded — WHERE-less EXISTS bodies
+      (`EXISTS (SELECT 1 FROM t)`) SIGSEGV'd; reachable before via
+      multi-table outers, now declined at the correlation check.
+    - Executor gaps the lift exposed (fixed in the same commit):
+      - `Join{Lateral, Semi/Anti}` (searched parameterised NL anti/semi,
+        e.g. Q22's `NOT EXISTS` under a derived table) had no emit-once
+        arm in `lateralJoinStream` — the generic semi/anti `Open` check
+        refused predicate-less keyed joins before the lateral arm ran.
+        Taught the stream SEMI/ANTI emit-once mirroring the fused
+        `nestedLoopIndexJoinOp` semantics, reordered `Open` so `Lateral`
+        routes first, and kept a fail-closed refusal for null-aware
+        lateral shapes.
+      - Cooperative parallel hash build + nested Gather: a producer's
+        rebuilt build subtree is Closed wholesale after probing the
+        leader-published shared table, and `gatherOp.Close`/
+        `gatherMergeOp.Close` dereferenced `o.group` unconditionally —
+        nil for a never-Opened Gather. The panic, converted by
+        `ParallelGroup.Go`, cancelled SIBLING producers mid-scan, and
+        `group.Wait()`'s error was discarded in the build's cleanup —
+        silent partial builds (TPC-H Q20: 85-99 of 101 suppliers across
+        identical runs, plan stable, gone at 1 worker or
+        `GOOPG_COOP_JOIN_BUILD=off`). Both Closes are now no-ops when
+        never Opened, and the build propagates the producer-group error
+        instead of swallowing it (fail-closed: a producer failure fails
+        the query rather than returning partial results).
+    - Test premise updates (retired, not weakened):
+      `TestJointreePipelineDispatchDelegates` +
+      `TestJointreePullupDeclineParity`/`NoExistsKeepsLegacyIdentical`
+      byte-equality → shape + decorrelation + join-type equality plus the
+      `treeHasSearched` routing marker.
+    - Skipped on the knob arm by design (value-preserving missed opts,
+      ledgered): `injectLikeRangePredicates`, `reduceNotNullQuals`
+      incl. always-false → childless `Result`, `planIndexScanFromWhere`.
 - [ ] **M0145-0006 — upper-rel pathlists** (extend the lattice through
   `create_grouping_paths`/`create_ordered_paths` analogues so ordering and
   grouping are elected over candidate sets, not by stage-builder

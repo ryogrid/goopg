@@ -486,3 +486,52 @@ func TestGatherCloseTerminatesAfterOpenError(t *testing.T) {
 		})
 	}
 }
+
+// TestGatherCloseWithoutOpenIsNoop pins the unopened-Gather Close contract —
+// the TPC-H Q20 silent row-loss regression (M0145-0005 slice 4).
+//
+// Mechanism. A cooperative parallel hash build (parallelBuildLazyHashTable)
+// whose build side is a JOIN TREE prebuilds the nested shareable hash joins
+// once in the leader and publishes the tables to its producers. Each producer
+// then rebuilds the WHOLE build subtree, applies the shared build, and opens
+// only the probe side — but its deferred tree.Close() still walks the whole
+// tree, including the unopened Gather under the shared join's build side.
+// gatherOp.Close dereferenced o.group unconditionally, and the nil group of a
+// never-Opened Gather panicked — a panic ParallelGroup.Go converts to an
+// error that CANCELS THE SIBLING producers mid-scan. The group.Wait() error
+// was then discarded in the build's cleanup, so the consumer built the hash
+// table from a partial row set: silent wrong results (Q20 measured 85-99 of
+// 101 suppliers, plan stable, gone at 1 worker or GOOPG_COOP_JOIN_BUILD=off).
+//
+// The contract: Close on an operator that was never Opened is a no-op. This
+// test fails (panic) without the guard.
+func TestGatherCloseWithoutOpenIsNoop(t *testing.T) {
+	g, _ := newTestGather(2, func(*instrumenter) (Operator, error) {
+		return &scriptedOp{schema: optimizer.Schema{{Name: "n"}}}, nil
+	})
+	if err := g.Close(); err != nil {
+		t.Fatalf("Close on never-Opened Gather: %v", err)
+	}
+	// Idempotent: a second Close is still a no-op.
+	if err := g.Close(); err != nil {
+		t.Fatalf("second Close: %v", err)
+	}
+}
+
+// TestGatherMergeCloseWithoutOpenIsNoop is TestGatherCloseWithoutOpenIsNoop's
+// GatherMerge twin — same unopened-Close panic, same sibling-cancellation
+// blast radius inside a cooperative producer's tree.
+func TestGatherMergeCloseWithoutOpenIsNoop(t *testing.T) {
+	schema := optimizer.Schema{{Name: "n"}}
+	gm := newGatherMergeOp(
+		optimizer.NewGatherMerge(0, &stubPlanNode{schema: schema}, 2, nil),
+		func(*instrumenter) (Operator, error) {
+			return &scriptedOp{schema: schema}, nil
+		})
+	if err := gm.Close(); err != nil {
+		t.Fatalf("Close on never-Opened GatherMerge: %v", err)
+	}
+	if err := gm.Close(); err != nil {
+		t.Fatalf("second Close: %v", err)
+	}
+}

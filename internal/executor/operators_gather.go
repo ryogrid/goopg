@@ -463,6 +463,18 @@ func (o *gatherOp) Close() error {
 	}
 	o.closed = true
 
+	// A Gather that was never Opened launched nothing: no group, no
+	// channel, no workers. That shape is real — a cooperative parallel
+	// hash build's producers rebuild the whole build subtree and Close
+	// it after probing the leader-published shared table, so the Gather
+	// under the shared join's build side is Closed without ever being
+	// Opened. Cancelling a nil group is a nil-pointer panic, and the
+	// panic then cancels the SIBLING producers mid-scan — silently
+	// dropping rows (TPC-H Q20 measured 85-99 of 101 suppliers).
+	if o.group == nil {
+		return nil
+	}
+
 	if o.leaderChild != nil {
 		_ = o.leaderChild.Close()
 		o.leaderChild = nil

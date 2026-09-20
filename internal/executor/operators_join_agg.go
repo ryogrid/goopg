@@ -379,6 +379,21 @@ func (o *joinOp) Open(ctx *Context) error {
 	// Any other algo (Merge, or an unset zero value that is NOT the
 	// planner's explicit NestedLoop choice with a predicate) stays
 	// an internal error.
+	// Lateral joins must always use the per-row driver path so the right-side
+	// plan can evaluate OuterColumnRef nodes against the current left row.
+	// Check Lateral BEFORE the join-type and Algo switches: even when the
+	// planner chose hash-join for the equi-predicate, the equality predicate
+	// just means JOIN ON col=col, not that the right side is independent of
+	// the outer row (M0097-0106). A `Join{Lateral, Semi/Anti}` — the searched
+	// NLI over a parameterised probe R25 emits, first exercised by
+	// M0145-0005's pulled-sublink scopes — is a lateral join first: the
+	// lateral stream carries its emit-once semantics, while the semi/anti
+	// switch below would either refuse it outright (a clause the probe
+	// enforces leaves Predicate nil) or route it to the materialise-once
+	// nested loop, which cannot re-bind the probe's parameter per outer row.
+	if o.plan.Lateral {
+		return o.openLateral(ctx)
+	}
 	if o.plan.Type == optimizer.JoinTypeSemi || o.plan.Type == optimizer.JoinTypeAnti {
 		switch o.plan.Algo {
 		case optimizer.JoinAlgoHash:
@@ -398,14 +413,6 @@ func (o *joinOp) Open(ctx *Context) error {
 		default:
 			return fmt.Errorf("internal error: semi/anti join requires hash or nested-loop algorithm, got %d", o.plan.Algo)
 		}
-	}
-	// Lateral joins must always use the per-row driver path so the right-side
-	// plan can evaluate OuterColumnRef nodes against the current left row.
-	// Check Lateral BEFORE Algo: even when the planner chose hash-join for the
-	// equi-predicate, the equality predicate just means JOIN ON col=col, not
-	// that the right side is independent of the outer row. M0097-0106.
-	if o.plan.Lateral {
-		return o.openLateral(ctx)
 	}
 	if o.plan.Algo == optimizer.JoinAlgoHash {
 		return o.openLazyHashJoin(ctx)

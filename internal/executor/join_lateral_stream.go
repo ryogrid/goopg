@@ -72,6 +72,17 @@ type lateralJoinStream struct {
 
 	fillOuter bool // LEFT lateral: null-extend an outer tuple nothing matched
 
+	// emitOuter / antiEmit carry the SEMI/ANTI emit-once contract PG's
+	// nodeNestloop implements natively (R25's decomposed Join{Lateral}
+	// over a parameterised probe reaches here for a searched semi/anti
+	// NLI — the shape M0145-0005's pulled-sublink scopes first handed the
+	// executor). A semi/anti join publishes the OUTER row alone, so the
+	// emitted row is m.outerRow, never the concatenated pair: SEMI emits
+	// it on the first qualifying inner tuple, ANTI emits it iff no inner
+	// tuple qualified at all.
+	emitOuter bool // SEMI or ANTI: emit the outer row alone
+	antiEmit  bool // ANTI: emit iff no inner tuple qualified
+
 	phase        int
 	outerRow     Row
 	outerMatched bool
@@ -94,9 +105,22 @@ type lateralJoinStream struct {
 // header for why the correlation binding is per-call rather than per-iteration.
 //
 // LEFT lateral joins emit a null-padded row when no right tuple satisfied the
-// join predicate; CROSS / INNER drop the outer row.
+// join predicate; CROSS / INNER drop the outer row. SEMI / ANTI lateral joins
+// (a searched NLI whose parameterised probe is this join's right child) emit
+// the outer row alone — on the first qualifying inner tuple for SEMI, iff no
+// inner tuple qualified for ANTI.
 func (o *joinOp) openLateral(ctx *Context) error {
 	o.closeLateralStream()
+	if o.plan.NullAware && (o.plan.Type == optimizer.JoinTypeSemi || o.plan.Type == optimizer.JoinTypeAnti) {
+		// Fail-closed: a null-aware anti join's "no inner NULL key anywhere"
+		// rule is a property of the whole inner stream, not of one outer
+		// tuple's re-scan — the emit-once loop below cannot evaluate it. No
+		// producer builds this shape today (NullAware is set only on the
+		// keyed NOT-IN hash arm, which is never lateral); refuse loudly if
+		// one learns to.
+		return &ExecError{Code: "XX000", Pos: o.plan.Pos(),
+			Message: "internal error: lateral semi/anti join is not supported for null-aware semantics"}
+	}
 	if err := o.left.Open(ctx); err != nil {
 		return err
 	}
@@ -104,6 +128,8 @@ func (o *joinOp) openLateral(ctx *Context) error {
 		o:         o,
 		rw:        len(o.right.Schema()),
 		fillOuter: o.plan.Type == optimizer.JoinTypeLeft,
+		emitOuter: o.plan.Type == optimizer.JoinTypeSemi || o.plan.Type == optimizer.JoinTypeAnti,
+		antiEmit:  o.plan.Type == optimizer.JoinTypeAnti,
 	}
 	if bindable, ok := o.right.(lateralBindable); ok {
 		m.bindable = bindable
@@ -249,11 +275,27 @@ func (m *lateralJoinStream) stepInner() (Row, bool, error) {
 		return nil, false, nil
 	}
 	m.outerMatched = true
+	if m.emitOuter {
+		// Emit-once: a qualifying inner tuple ends this outer row's scan
+		// either way — SEMI emits the outer row, ANTI drops it. The
+		// emitted row is the outer tuple ALONE: a semi/anti join
+		// publishes the left schema, so the concatenated pair would be a
+		// wrong-width row (the fused nestedLoopIndexJoinOp's outerOnly
+		// slot is the same contract).
+		m.closeRight()
+		m.phase = latPhaseOuter
+		if m.antiEmit {
+			return nil, false, nil
+		}
+		return cloneRow(m.outerRow), true, nil
+	}
 	return cloneRow(m.pair), true, nil
 }
 
-// finishOuter closes the right subtree for the current outer tuple and, for a
-// LEFT lateral join, null-extends an outer tuple nothing matched.
+// finishOuter closes the right subtree for the current outer tuple and emits
+// the preserved-row fallback each join type defines: a LEFT lateral join
+// null-extends an outer tuple nothing matched; an ANTI lateral join emits the
+// outer tuple alone exactly then.
 func (m *lateralJoinStream) finishOuter() (Row, bool, error) {
 	m.closeRight()
 	m.phase = latPhaseOuter
@@ -262,6 +304,9 @@ func (m *lateralJoinStream) finishOuter() (Row, bool, error) {
 			m.nullRight = nullRow(m.rw)
 		}
 		return concatRows(m.outerRow, m.nullRight), true, nil
+	}
+	if !m.outerMatched && m.antiEmit {
+		return cloneRow(m.outerRow), true, nil
 	}
 	return nil, false, nil
 }
