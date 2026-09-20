@@ -91,12 +91,14 @@ func TestInputNodePathkeysStaysInTheInputsOwnCoordinates(t *testing.T) {
 	if got := inputNodePathkeys(&Limit{Child: &Filter{Child: srt}}); len(got) != len(keys) {
 		t.Fatalf("the walk must descend through Filter and Limit: got %d keys", len(got))
 	}
-	// A Project is where coordinates are re-assigned. Even one that happens to
-	// publish an agreeing schema is refused: admitting it would put the walk
-	// back in the translation business the file header rules out.
+	// A Project is where coordinates are re-assigned. One that publishes an
+	// agreeing schema but states no targets is still refused: M0144-0011a-2
+	// admits a Project only on POSITIVE evidence that it re-assigns nothing
+	// (`projectIsPositionalIdentity`), never on the absence of evidence that
+	// it does.
 	proj := &Project{Child: srt, schema: srt.Output()}
 	if got := inputNodePathkeys(proj); got != nil {
-		t.Fatalf("a Project must stop the walk, got %d keys", len(got))
+		t.Fatalf("a Project with no stated targets must stop the walk, got %d keys", len(got))
 	}
 	if got := inputNodePathkeys(upperOrderedInput(10)); got != nil {
 		t.Fatalf("a node that claims no order must claim none, got %d keys", len(got))
@@ -389,5 +391,121 @@ func TestAggregateEmissionPathkeysReadsAGatherMergeChild(t *testing.T) {
 
 	if got := inputNodePathkeys(agg); len(got) != 1 {
 		t.Fatalf("a Gather Merge child delivers its merged order: got %d keys, want 1", len(got))
+	}
+}
+
+// identityProject builds the shape M0144-0011a-2 admits: target `j` is the
+// child's column `j` for every `j`, so the projection can only RENAME. `names`
+// is the published output vocabulary, which is what makes the case
+// interesting — it deliberately differs from the child's.
+func identityProject(child Node, names ...string) *Project {
+	childOut := child.Output()
+	targets := make([]Expr, len(childOut))
+	sch := make(Schema, len(childOut))
+	for j, c := range childOut {
+		targets[j] = &ColumnRef{Index: j, Name: c.Name, Type: c.Type}
+		sch[j] = SchemaColumn{Name: names[j], Type: c.Type}
+	}
+	return &Project{Child: child, Targets: targets, schema: sch}
+}
+
+// TestInputNodePathkeysCrossesAPositionalIdentityProject is M0144-0011a-2, and
+// it is the shape TPC-DS SF0.25 Q21 actually reaches the ORDERED step with:
+// `Project{Aggregate}` whose only job is to rename the two aggregate outputs
+// (`sum` -> `inv_before`/`inv_after`). Before this cut the walk stopped at the
+// Project, the `*Aggregate` arm was never consulted, and a redundant Sort
+// survived M0144-0011a.
+//
+// PG needs no special case (`create_projection_path` copies `subpath->pathkeys`
+// for ANY projection — pathnode.c:2936-2937) because a PG pathkey names an
+// EquivalenceClass; goopg's names a position, so only the identity case ports.
+// The delivered claim must come back in the PROJECT's vocabulary, at the same
+// index.
+func TestInputNodePathkeysCrossesAPositionalIdentityProject(t *testing.T) {
+	agg := upperOrderedSortedAgg()
+	proj := identityProject(agg, "renamed_k", "n")
+
+	got := inputNodePathkeys(proj)
+	if len(got) != 1 {
+		t.Fatalf("a pure rename must not destroy the claim below it: got %d keys, want 1", len(got))
+	}
+	cr, ok := got[0].Expr.(*ColumnRef)
+	if !ok || cr.Index != 0 {
+		t.Fatalf("the index must not move across a rename, got %#v", got[0].Expr)
+	}
+	if cr.Name != "renamed_k" {
+		t.Fatalf("the claim must be spelled in the published vocabulary, got %q want %q", cr.Name, "renamed_k")
+	}
+	if got[0].SortAsc || !got[0].NullsFirst {
+		t.Fatalf("direction must survive the rename, got %+v", got[0])
+	}
+
+	// The same relabelling applies to the *Sort top and to a searched root,
+	// and the walk still reaches them below the order-preserving wrappers.
+	srt := &Sort{Child: upperOrderedInput(10), Keys: upperOrderedKeys()}
+	overSort := identityProject(srt, "kk", "vv", "ww")
+	if got := inputNodePathkeys(&Filter{Child: overSort}); len(got) != 2 {
+		t.Fatalf("a Sort's keys must survive a rename below a Filter, got %d keys", len(got))
+	}
+}
+
+// TestProjectIsPositionalIdentityRefusesEverythingElse pins the arm's
+// admission rule: a Project is crossed on POSITIVE evidence that it
+// re-assigns no position, never because nothing proves it does. Each case is a
+// Project that can move, drop, compute or re-index a column.
+func TestProjectIsPositionalIdentityRefusesEverythingElse(t *testing.T) {
+	agg := upperOrderedSortedAgg()
+
+	cases := []struct {
+		name   string
+		mutate func(*Project)
+	}{
+		{"a permutation needs a position map", func(p *Project) {
+			p.Targets[0] = &ColumnRef{Index: 1, Name: "count"}
+			p.Targets[1] = &ColumnRef{Index: 0, Name: "k"}
+		}},
+		{"a computed column is a new value", func(p *Project) {
+			p.Targets[0] = &BinaryOp{}
+		}},
+		{"an isolated scope indexes its targets in another space", func(p *Project) {
+			p.IsolatedScope = true
+		}},
+		{"a narrowing projection is not yet expressible", func(p *Project) {
+			p.Targets = p.Targets[:1]
+			p.schema = p.schema[:1]
+		}},
+		{"no stated targets is no evidence", func(p *Project) { p.Targets = nil }},
+	}
+	for _, c := range cases {
+		p := identityProject(agg, "renamed_k", "n")
+		c.mutate(p)
+		if projectIsPositionalIdentity(p) {
+			t.Fatalf("%s: admitted, want refused", c.name)
+		}
+		if got := inputNodePathkeys(p); got != nil {
+			t.Fatalf("%s: the walk must stop, got %d keys", c.name, len(got))
+		}
+	}
+}
+
+// TestRelabelPathkeysToTruncatesRatherThanGuessing: the relabel obeys the same
+// rule validatedSearchPathkeys does — an unusable key ends the list instead of
+// being skipped, because an ordering by (a, b, c) whose b is unusable delivers
+// (a), never (a, c).
+func TestRelabelPathkeysToTruncatesRatherThanGuessing(t *testing.T) {
+	out := Schema{{Name: "x"}, {Name: ""}}
+	keys := []PathKey{
+		{Expr: &ColumnRef{Index: 0, Name: "a"}, SortAsc: true},
+		{Expr: &ColumnRef{Index: 1, Name: "b"}, SortAsc: true},
+	}
+	got := relabelPathkeysTo(keys, out)
+	if len(got) != 1 || got[0].Expr.(*ColumnRef).Name != "x" {
+		t.Fatalf("an unnameable column must truncate the claim, got %v", got)
+	}
+	if got := relabelPathkeysTo([]PathKey{{Expr: &ColumnRef{Index: 9, Name: "a"}}}, out); got != nil {
+		t.Fatal("an out-of-range index must claim nothing")
+	}
+	if got := relabelPathkeysTo(nil, out); got != nil {
+		t.Fatal("no claim must stay no claim")
 	}
 }

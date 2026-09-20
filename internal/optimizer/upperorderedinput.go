@@ -170,10 +170,33 @@ func schemaCoordinatesAgree(a, b Schema) bool {
 //
 // The walk descends through `*Filter` and `*Limit`, which are order-preserving
 // (a filter removes rows, a limit truncates a prefix — neither reorders the
-// rows it keeps) and schema-preserving. `*Project` is deliberately NOT in the
-// list even when its output happens to agree column-for-column: a Project is
-// where coordinates are re-assigned, and admitting it would put this walk back
-// in the business of translation that the file header rules out.
+// rows it keeps) and schema-preserving.
+//
+// M0144-0011a-2 adds a THIRD, narrower descent: a `*Project` that is a
+// positional identity (`projectIsPositionalIdentity`). PG states the general
+// rule outright — "Projection does not change the sort order",
+// `postgres/src/backend/optimizer/util/pathnode.c:2936-2937`, where
+// `create_projection_path` copies `subpath->pathkeys` unchanged — and it can
+// state it in that generality because a PG pathkey names an
+// EquivalenceClass, not an output position. goopg's pathkeys name POSITIONS,
+// so the general rule does not transfer: a Project is exactly where positions
+// are re-assigned, and the previous comment here refused every Project for
+// that reason.
+//
+// The identity case is the part that does transfer without any translation.
+// When target `j` is `ColumnRef{Index: j}` for every `j` and the column counts
+// agree, the projection re-assigns nothing — it can only RENAME. A rename does
+// not move a row and does not move a column, so the claim below it is already
+// expressed in the right coordinates; only its labels belong to the child's
+// vocabulary. `relabelPathkeysTo` restamps those labels from `out` at the SAME
+// index, which is a relabel and not a mapping (and is cosmetic in any case:
+// `exprEqual` compares a `*ColumnRef` on `Index` alone, exprwalk.go:668). Any
+// other Project still stops the walk.
+//
+// This is the residue M0144-0011a measured and could not reach: TPC-DS SF0.25
+// Q21 reaches the ORDERED step as `Project{Aggregate}` — a pure rename of the
+// two aggregate outputs to `inv_before`/`inv_after` — so the `*Aggregate` arm
+// below was never consulted and a redundant Sort survived 0011a.
 func inputNodePathkeys(input Node) []PathKey {
 	if input == nil {
 		return nil
@@ -182,37 +205,60 @@ func inputNodePathkeys(input Node) []PathKey {
 	if len(out) == 0 {
 		return nil
 	}
+	// Set once a positional-identity `*Project` has been crossed. From that
+	// point the published schema's LABELS may differ from the node's own,
+	// while its POSITIONS provably do not — so the per-step agreement check
+	// weakens to the column count and the delivered claim is relabelled.
+	renamed := false
+	agrees := func(s Schema) bool {
+		if renamed {
+			return len(s) > 0 && len(s) == len(out)
+		}
+		return schemaCoordinatesAgree(out, s)
+	}
+	deliver := func(keys []PathKey) []PathKey {
+		if !renamed {
+			return keys
+		}
+		return relabelPathkeysTo(keys, out)
+	}
 	for n := input; n != nil; {
 		// The searched-root claim is checked first: a `*Sort` or `*Filter`
 		// can BE a search root, and the search's own claim is the stronger
 		// statement (it survived validation against this exact schema).
 		if keys := searchedTreePathkeys(n); len(keys) > 0 {
-			if schemaCoordinatesAgree(out, n.Output()) {
-				return keys
+			if agrees(n.Output()) {
+				return deliver(keys)
 			}
 			return nil
 		}
 		switch t := n.(type) {
 		case *Sort:
-			if !schemaCoordinatesAgree(out, t.Output()) {
+			if !agrees(t.Output()) {
 				return nil
 			}
-			return pathkeysForSortKeys(t.Keys)
+			return deliver(pathkeysForSortKeys(t.Keys))
 		case *Filter:
-			if t.Child == nil || !schemaCoordinatesAgree(out, t.Child.Output()) {
+			if t.Child == nil || !agrees(t.Child.Output()) {
 				return nil
 			}
 			n = t.Child
 		case *Limit:
-			if t.Child == nil || !schemaCoordinatesAgree(out, t.Child.Output()) {
+			if t.Child == nil || !agrees(t.Child.Output()) {
 				return nil
 			}
 			n = t.Child
 		case *Aggregate:
-			if !schemaCoordinatesAgree(out, t.Output()) {
+			if !agrees(t.Output()) {
 				return nil
 			}
-			return aggregateEmissionPathkeys(t)
+			return deliver(aggregateEmissionPathkeys(t))
+		case *Project:
+			if !projectIsPositionalIdentity(t) {
+				return nil
+			}
+			renamed = true
+			n = t.Child
 		default:
 			return nil
 		}
@@ -334,4 +380,96 @@ func aggregateEmissionPathkeys(agg *Aggregate) []PathKey {
 		}
 	}
 	return emitted
+}
+
+// projectIsPositionalIdentity reports whether `p` re-assigns no output
+// position — target `j` is the child's column `j`, for every `j`, over an
+// equally wide child. Such a Project can only RENAME (and re-type-label) its
+// columns; it cannot move, drop, duplicate or compute one.
+//
+// This is the whole soundness argument for the walk's `*Project` arm. PG needs
+// none of it — `create_projection_path` copies `subpath->pathkeys` for ANY
+// projection (`postgres/src/backend/optimizer/util/pathnode.c:2936-2937`),
+// because a PG pathkey names an EquivalenceClass and is therefore immune to
+// output-position changes. goopg's pathkeys name positions, so the general
+// rule cannot be ported; the identity special case can, because under it
+// "PG's position" and "goopg's position" coincide by construction.
+//
+// Deliberately refused, each with its own reason:
+//
+//   - `IsolatedScope`: its `Targets`' `ColumnRef`s are inner-indexed then
+//     outer-relabelled (see the field's doc comment on `*Project`), so an
+//     `Index == j` test is not reading the coordinate it appears to read.
+//   - a narrowing projection (`len(out) < len(child)`): positions 0..len(out)-1
+//     would still be an identity and a claim on them would still be sound, but
+//     the walk's per-step agreement check is a column-count test and would have
+//     to grow a second mode to express "prefix". Filed rather than guessed —
+//     see the M0144-0011a-2 ledger row.
+//   - a permutation (`Index != j`): sound only with a position MAP, which is
+//     precisely the translation this file's header rules out.
+//   - any non-`*ColumnRef` target: a computed column is a new value, and an
+//     ordering claim on the input value says nothing about it.
+func projectIsPositionalIdentity(p *Project) bool {
+	if p == nil || p.Child == nil || p.IsolatedScope {
+		return false
+	}
+	out := p.Output()
+	child := p.Child.Output()
+	if len(out) == 0 || len(out) != len(child) || len(p.Targets) != len(out) {
+		return false
+	}
+	for j, t := range p.Targets {
+		cr, ok := t.(*ColumnRef)
+		if !ok || cr.Index != j {
+			return false
+		}
+	}
+	return true
+}
+
+// relabelPathkeysTo restamps a claim's column labels from `out` at the SAME
+// index — the only adjustment a positional-identity `*Project` can require.
+//
+// It is NOT a translation: no index changes hands. It exists so the claim the
+// seam publishes is spelled in the vocabulary of the schema the seam actually
+// publishes (Q21's `inv_before`, not the aggregate's `sum`), which keeps the
+// DPPATH trace and any future name-sensitive consumer honest. Today it is
+// cosmetic — `exprEqual` compares a `*ColumnRef` on `Index` alone
+// (exprwalk.go:668), so `pathkeysContainedIn` would agree either way.
+//
+// A key that cannot be restamped TRUNCATES the list, for
+// `validatedSearchPathkeys`' reason: an ordering by (a, b, c) whose `b` is
+// unusable delivers (a), never (a, c).
+func relabelPathkeysTo(keys []PathKey, out Schema) []PathKey {
+	if len(keys) == 0 || len(out) == 0 {
+		return nil
+	}
+	kept := make([]PathKey, 0, len(keys))
+	for _, pk := range keys {
+		cr, ok := pk.Expr.(*ColumnRef)
+		if !ok {
+			break
+		}
+		if cr.Index < 0 || cr.Index >= len(out) {
+			break
+		}
+		col := out[cr.Index]
+		if col.Name == "" {
+			break
+		}
+		kept = append(kept, PathKey{
+			Expr: &ColumnRef{
+				Index:          cr.Index,
+				Name:           col.Name,
+				Type:           col.Type,
+				SourceTableIdx: col.SourceTableIdx,
+			},
+			SortAsc:    pk.SortAsc,
+			NullsFirst: pk.NullsFirst,
+		})
+	}
+	if len(kept) == 0 {
+		return nil
+	}
+	return kept
 }
