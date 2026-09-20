@@ -1,9 +1,25 @@
 # M0144-0011 — first vertical-slice campaign: TPC-DS SF0.25 Q8
 
-Status: recon trace landed 2026-09-20 (loop #43); campaign OPEN — three
-`Kind: impl` children filed (`Parent: M0144-0011`). Ends when Q8 matches
-or the residue is a named, measured, unfunded capability (03-forward-plan
-§4).
+Status: ESCALATED 2026-09-20 (loop #49) under AGENT.md S4 — five
+consecutive completed descendants reported `Movement: none`, so the root is
+`[!]` and only the owner reopens it. The campaign did NOT reach "Q8
+matches"; it reached the second of 03-forward-plan §4's two endings — the
+residue is a named, measured, unfunded capability: `Materialize`, worth
+`missingnode` 25 → 14 (−11), sized in four slices in
+`m0144-0011c-materialize-sizing.md` §4.
+
+Children, and what each proved: **0011a** `Movement: yes` (SF0.25
+`sort-strategy` 67 → 60, the lineage's one movement — a redundant Sort over
+an already-ordered `GroupAggregate` removed corpus-wide); **0011a-3** the
+walk crosses a positional-identity `*Project`, Q21's depth-1 node kind now
+matches PG; **0011a-2** a 99-query ORDERED-seam census, candidate minimum
+2 → 1 to match `planner.c:5337`; **0011b** refuted its own premise (goopg's
+Q8 NL is CHEAPER than PG's, not dearer) and found the real defect a layer
+down; **0011b-1** fixed it — a sub-plan leaf is priced from its own subtree,
+Q8's 650x cost-monotonicity violation is gone and its top join now elects
+PG's Nested Loop; **0011c** sized `Materialize`. The full escalation block,
+with the blocker and the expected movement, is in `.ralph/fix_plan.md`
+under this task.
 
 ## Pick
 

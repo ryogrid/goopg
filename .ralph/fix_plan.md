@@ -11148,7 +11148,60 @@ goopg's processing route diverged from PG's upstream of the fix).
     rows survive by default (`stale-candidate` is high-precision, not
     exhaustive). Report: `analysis/m0144/m0144-0010-ledger-triage.md`;
     design: `docs/design/0100-0149/m0144-0010-ledger-bulk-triage.md`.
-- [ ] **M0144-0011 — first vertical-slice campaign** (03-forward-plan §4).
+- [!] **M0144-0011 — first vertical-slice campaign** (03-forward-plan §4).
+  **ESCALATED 2026-09-20 (loop \#49) under AGENT.md S4 — five consecutive
+  completed descendants reporting `Movement: none`. No further descendant
+  is selected or filed; only the owner reopens this root.**
+  - What was tried, and what each step proved:
+    - **M0144-0011a** — `inputNodePathkeys` gained an `*Aggregate` arm, so a
+      sorted `GroupAggregate` that already emits the ORDER BY order is taken
+      as-is. **`Movement: yes` — SF0.25 `sort-strategy` 67 → 60 (−7)**, 16
+      plans moved. This is the lineage's one movement.
+    - **M0144-0011a-3** — the walk crosses a positional-identity `*Project`
+      (PG `pathnode.c:2936-2937`). Q21's first divergence advanced
+      `depth=1 sort-strategy` → `depth=1 qual-placement` with the depth-1
+      node kind now MATCHING PG. `Movement: none` — the category line counts
+      every category a query diverges in anywhere, so Q21 kept its tally.
+    - **M0144-0011a-2** — a 99-query ORDERED-seam census; the candidate
+      minimum dropped 2 → 1 to match PG's minimum-free pathlist iteration
+      (`planner.c:5337`). Proved the gate was SHAPE-inert and that the
+      `keys=0` residue is entirely hashed lone candidates — an
+      aggregation-strategy question, not an ordering one. `Movement: none`.
+    - **M0144-0011b** (recon) — refuted its own filed premise: goopg's Q8
+      nested loop (19852.53) is far CHEAPER than PG's (28502.37), not
+      dearer. Found the real defect a layer down. `Movement: none`.
+    - **M0144-0011b-1** — fixed it: a sub-plan join-search leaf is priced
+      from its own subtree (`cost_subqueryscan`'s shape,
+      `costsize.c:1491-1493`) instead of a fabricated seq scan. Q8's
+      `Hash Join (1.27..11.28)` over a `HashSetOp (…7360.42)` became
+      `Hash Join (6458.80..7374.05)`, and **Q8's top join now elects PG's
+      Nested Loop** (27215 vs PG's 28502, was a Hash Join at 19455). 30/99
+      plans changed, `MISMATCH=0`. `Movement: none` — SF0.25 `join-method`
+      70 → 68, inside ±3.
+    - **M0144-0011c** (recon) — sized `Materialize`. `Movement: none`.
+  - The blocker: every remaining mechanism in this lineage is either
+    already correct or too small to clear the ±3 band on its own. The
+    lineage is not unproductive in substance — it removed a redundant Sort
+    corpus-wide, repaired two false premises by measurement, and fixed a
+    650x cost-monotonicity violation that flipped Q8's join method to PG's
+    — but it has not moved a category past ±3 since 0011a.
+  - **Expected movement if unblocked, with the size:** `Materialize` is the
+    one hypothesis left with a claim outside the band — **`missingnode`
+    25 → 14 (−11)** on Q1 Q8 Q10 Q16 Q47 Q57 Q59 Q65 Q77 Q78 Q91 (Q35 and
+    Q58 also cite `Incremental Sort` and would stay). Size: four slices,
+    detailed in `docs/design/0100-0149/m0144-0011c-materialize-sizing.md`
+    §4 — (1) plan node + EXPLAIN + `createPlan`, inert; (2) `cost_material`
+    + `cost_rescan`'s Material arm as tested pure functions, inert;
+    (3) the NL admission rule files the matpath candidate AND
+    `join_nl_stream.go` stops wrapping unconditionally — the slice that
+    moves plans; (4) re-time the Q54-class `nlInnerWorkMemEnabled` cliff,
+    which becomes priceable once (2) lands.
+  - Also still open under this root, complete in substance but NOT closed
+    because S4 forbids completing another descendant: **M0144-0011b**, whose
+    stated completion condition ("the leaf is priced and Q8's rel {0,1,2,3}
+    election is re-measured") is already satisfied by M0144-0011b-1's
+    committed evidence. Its residue is Q8's remaining `depth=3` join-ORDER
+    divergence.
   **Not selectable until M0144-0002 and M0144-0007 have landed.** Take the top
   first-divergence cluster, ONE representative query, and drive it to MATCH
   end-to-end — this task is a recon: it *files* each surfaced layer
@@ -11504,7 +11557,7 @@ goopg's processing route diverged from PG's upstream of the fix).
       base cost is still `DeriveLegacyDisplayCost` — a FLOOR built from the
       children's own largely-real costs, not PG's number. Full option (2),
       a real upper-rel path per sub-plan class, owns that.
-- [ ] **M0144-0011c — `Materialize` node existence** (filed by
+- [x] **M0144-0011c — `Materialize` node existence** (filed by
   M0144-0011). Q8 is `MISSING-NODE: PG-only kinds: Materialize` — goopg
   has no Materialize plan node (`MaterializedCTEScan` is a different
   thing); PG buffers NL inners via `create_material_path`
@@ -11518,3 +11571,40 @@ goopg's processing route diverged from PG's upstream of the fix).
   PG materializes NL inners (Q8 + siblings per parity diff), and it
   unblocks 0011b's honest NL pricing. Measured: `pg-plan-parity-diff.py`
   `PG-only node kinds` line on a private-lane capture.
+  - **RECON COMPLETE 2026-09-20 (loop \#49) — SIZED, NOT BUILT.** Design
+    doc: `docs/design/0100-0149/m0144-0011c-materialize-sizing.md`.
+    Kind: recon
+    Parent: M0144-0011
+    Movement: none
+    - **The executor half already exists and already runs.**
+      `internal/executor/operators_material.go` (308 lines) is a faithful
+      `nodeMaterial.c` analogue, and
+      `internal/executor/join_nl_stream.go:108` wraps EVERY streaming
+      nested-loop inner in it — unbounded by default
+      (`nlInnerWorkMemEnabled` off). goopg does not lack materialization.
+    - Missing are exactly three things: the plan node EXPLAIN prints, the
+      cost (`cost_material` + `cost_rescan`'s Material arm), and PG's
+      admission rule.
+    - **Sized: `missingnode` 25 → 14 (−11).** 13 of the 25 records cite
+      `Materialize` (Q1 Q8 Q10 Q16 Q35 Q47 Q57 Q58 Q59 Q65 Q77 Q78 Q91);
+      Q35 and Q58 also cite `Incremental Sort`, so they stay
+      `MISSING-NODE` regardless. That is the only remaining hypothesis in
+      this lineage with a claim outside ±3.
+    - `Incremental Sort` (14 records) is NOT a missing node — goopg has
+      `*IncrementalSort` and `addIncrementalSortPaths`, gated off because
+      the candidate loses on cost. That is banner item 5.
+    - **Trap the implementer must not miss:** goopg materializes EVERY NL
+      inner; PG materializes only the ones its admission rule admits
+      (`postgres/src/backend/optimizer/path/joinpath.c:1890-1901` +
+      `ExecMaterializesOutput`, `execAmi.c:640-647`). Emitting the node
+      wherever the executor materializes would create goopg-ONLY
+      `Materialize` nodes and trade 11 `missingnode` records for a new
+      mismatch class. Placement must follow PG's rule and the executor's
+      unconditional wrap must become conditional in the same slice.
+    - Not built this loop because it is a multi-slice build with no honest
+      partial landing: a new optimizer node type must be threaded through
+      `createPlan`, EXPLAIN, a new `PathKind`, the cost model, the NL
+      producer and its partial twin, and several exhaustive node-kind
+      switches. Four slices are proposed in the design doc §4 and repeated
+      in the root's escalation block.
+    - Gates: none — recon, no production code changed (AGENT.md C1/D5).
