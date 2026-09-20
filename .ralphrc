@@ -74,14 +74,15 @@ export BASH_MAX_TIMEOUT_MS=3600000       # 60 min ceiling (race-gate + spotcheck
 # Non-default backends reuse the core loop via adapters in ralph_loop.sh
 # (build_agent_command + normalize_agent_output). Environment variable
 # AGENT_BACKEND overrides this file.
-AGENT_BACKEND="claude"
-
+#AGENT_BACKEND="claude"
+#AGENT_BACKEND="opencode"
+AGENT_BACKEND="devin"
 # OpenCode backend settings (used only when AGENT_BACKEND=opencode).
 # Model in provider/model format; empty = CLI default.
 #OPENCODE_MODEL=""
 # Auto-approve permissions not explicitly denied (required for unattended
 # loops; dangerous - keep the permission policy in opencode.json tight).
-#OPENCODE_AUTO=true
+OPENCODE_AUTO=true
 
 # Codex backend settings (used only when AGENT_BACKEND=codex).
 # Model override; empty = CLI default.
@@ -93,7 +94,7 @@ AGENT_BACKEND="claude"
 # Devin always runs with --permission-mode dangerous and without the exec
 # sandbox; the project guards are wired in .devin/hooks.v1.json.
 # Model override (e.g. claude-opus-5-high, sonnet, swe-2); empty = CLI default.
-#DEVIN_MODEL=""
+DEVIN_MODEL="swe-2"
 # Skip the workspace trust check. Keep false: this repository is already a
 # trusted Devin workspace.
 #DEVIN_SKIP_TRUST=false

@@ -26,29 +26,12 @@
       {
         "matcher": "Bash",
         "hooks": [
-          {
-            "type": "command",
-            "if": "Bash(git *)",
-            "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/push-continue.sh",
-            "timeout": 10
-          },
-          {
-            "type": "command",
-            "if": "Bash(rtk git *)",
-            "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/push-continue.sh",
-            "timeout": 10
-          }
         ]
       }
     ],
     "Stop": [
       {
         "hooks": [
-          {
-            "type": "command",
-            "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/continue-on-stop.sh",
-            "timeout": 10
-          }
         ]
       }
     ]
