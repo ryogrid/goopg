@@ -12355,7 +12355,7 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
   `runJoinSearchBelowPinned`) become dead at which task.
   Kind: recon
   Parent: none
-- [ ] **M0145-0002 — dual-pipeline measurement harness** (the transition
+- [x] **M0145-0002 — dual-pipeline measurement harness** (the transition
   must be measurable while the default pipeline stays the value-gated one).
   `GOOPG_JOINTREE_PIPELINE=1` selects the new pipeline on private lanes;
   value gates (`tpcds-sf025 sweep`, `tpch-spotcheck`, acceptance arms)
@@ -12365,8 +12365,21 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
   `pg-plan-parity-diff.py`-compatible capture recipe for the knob arm, and
   a per-stage divergence report (which of the six divergences the record
   belongs to) so progress is visible per-slice, per AGENT.md G8.
+  Landed: fail-closed knob (`jointreePipelineFromEnv` — only literal `1`
+  arms) + dispatch at `planSelectWithSettings` → `planSelectJointreePipeline`
+  (delegating stub until 0003; the renamed body is `planSelectLegacyPipeline`);
+  flag registered in the provenance table so every capture stamps its arm;
+  `scripts/jointree-parity-capture.sh` (tpch via estimate-audit arm,
+  tpcds via `cp -a` private clone, PG arm read-only);
+  `scripts/pg-plan-divergence-class.py` (D1–D6 + jointree-search + verdict,
+  diverging-pair matching). A/A evidence: SF0.25 plan bodies byte-identical,
+  TPC-H shape-identical. Floors held: TPC-DS match=2 (Q9/Q41), TPC-H
+  match=1 (Q6). Gates: units, tpch-spotcheck, sf025 sweep (FORCE=1, nightly
+  live — values valid). Design doc:
+  `docs/design/0100-0149/m0145-0002-dual-pipeline-harness.md` (indexed).
   Kind: impl
   Parent: none
+  Movement: none
 - [ ] **M0145-0003 — sublink pull-up into the jointree** (goopg's
   `pull_up_sublinks`/`pull_up_subqueries` analogue; the milestone's core).
   Using route-a step 1's retained `.Subquery` parse trees, flatten bodies
