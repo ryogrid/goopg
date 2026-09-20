@@ -11036,13 +11036,28 @@ goopg's processing route diverged from PG's upstream of the fix).
   `analysis/m0144/m0144-0006-callgraph-build.md`.
   Kind: impl
   Parent: none
-- [ ] **M0144-0007 — cost-margin census** (03-forward-plan §2). For each
+- [x] **M0144-0007 — cost-margin census** (03-forward-plan §2). For each
   first-divergence node from 0002, force PG's shape in goopg (the
   M0142-0016c forced-plan comparator pattern plus the `GOOPG_*` admission
   arms) and record the margin class: <1% (election/tie-break), 1–20% (input
   divergence — attribute rows/width/cost-term first), >20% or unexpressible
   (structural gap). Output: margin column appended to 0002's table in
   `analysis/m0144/`. Depends on 0002.
+  Done: `scripts/goopg-margin-census.py` — session `enable_*` /
+  parallel-cost arms with forced-plan re-census via `census_query`, plus
+  per-query DPPATH candidate margins and `upper.ordered.seed` presorted-
+  input evidence on trace-enabled private lanes (:5590/:5591/:5592).
+  210 records across the three corpora: ~72% structural
+  (unexpressible[/no-arm] 50%, dominated-noncost 9%, priced-structural
+  13%), ~28% election-class (election 22%, forced-cheaper 5%, input 1).
+  The dominant `Limit → {GroupAggregate|Incremental Sort} | Sort` family
+  is a pathkey-propagation generation gap (`nonemptykeys=0` even under
+  `GOOPG_INCREMENTAL_SORT=1 GOOPG_PARTIAL_SORT_PATHS=1`), not a cost
+  loss. `docs/design/0100-0149/m0144-0007-margin-census.md`;
+  `analysis/m0144/m0144-0007-margin-census.md` +
+  `m0144-0007-margin-*.txt` raw rows.
+  Movement: none — recon produced the margin census (measurement only;
+  no plan movement expected or claimed).
   Kind: recon
   Parent: M0144-0002
 - [ ] **M0144-0008 — TPC-DS SF1 cadence capture** (03-forward-plan §5). The
