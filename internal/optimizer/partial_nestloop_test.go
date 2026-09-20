@@ -1,11 +1,17 @@
 package optimizer
 
-// R94 (plan-parity-fix-take2): ordinary INNER nested-loop outer partition.
+// R94 (plan-parity-fix-take2): ordinary INNER nested-loop outer partition,
+// widened to SEMI by M0137-0019b.
 //
 // Pins the three-way agreement the slice turns on — path classifier
 // (partialPathDrivingKind), node predicate (nestedLoopJoinIsPartialCapable)
 // plus its four walks, and the R60 producer filing — together, so no arm
-// admits a shape another refuses.
+// admits a shape another refuses. The boundary these tests defend is now
+// `{INNER, SEMI}` admitted and everything else refused: SEMI's verdict is
+// per-outer-row and worker-local, while LEFT and ANTI are held out by SCOPE
+// (M0137-0019b widened only its named consumer's shape, TPC-H Q4) and
+// RIGHT/FULL by correctness — they need the inner-matched bitmap reduced
+// across workers.
 
 import (
 	"testing"
@@ -26,17 +32,27 @@ func TestNestedLoopJoinIsPartialCapable(t *testing.T) {
 	if !nestedLoopJoinIsPartialCapable(approved) {
 		t.Fatal("ordinary INNER nested loop must be partial-capable")
 	}
+	// M0137-0019b: SEMI joins the admitted set. One qualifying inner tuple
+	// decides the outer tuple and the scan breaks (`finishOuter`,
+	// join_nl_stream.go); the inner-matched bitmap RIGHT/FULL would need
+	// reduced across workers is never touched, so a partitioned outer is
+	// transparent. PG admits it at the same gate (joinpath.c:2022-2031).
+	if !nestedLoopJoinIsPartialCapable(nlTestJoin(JoinAlgoNestedLoop, JoinTypeSemi, false)) {
+		t.Fatal("SEMI nested loop must be partial-capable (M0137-0019b)")
+	}
 	refusals := map[string]*Join{
-		"nil":        nil,
-		"hash-inner": {Algo: JoinAlgoHash, Type: JoinTypeInner, Left: &SeqScan{}, Right: &SeqScan{}},
+		"nil":         nil,
+		"hash-inner":  {Algo: JoinAlgoHash, Type: JoinTypeInner, Left: &SeqScan{}, Right: &SeqScan{}},
 		"merge-inner": {Algo: JoinAlgoMerge, Type: JoinTypeInner, Left: &SeqScan{}, Right: &SeqScan{}},
-		"nl-left":    nlTestJoin(JoinAlgoNestedLoop, JoinTypeLeft, false),
-		"nl-right":   nlTestJoin(JoinAlgoNestedLoop, JoinTypeRight, false),
-		"nl-full":    nlTestJoin(JoinAlgoNestedLoop, JoinTypeFull, false),
-		"nl-semi":    nlTestJoin(JoinAlgoNestedLoop, JoinTypeSemi, false),
-		"nl-anti":    nlTestJoin(JoinAlgoNestedLoop, JoinTypeAnti, false),
-		"nl-lateral": nlTestJoin(JoinAlgoNestedLoop, JoinTypeInner, true),
-		"nl-nil-left": {Algo: JoinAlgoNestedLoop, Type: JoinTypeInner, Right: &SeqScan{}},
+		"nl-left":     nlTestJoin(JoinAlgoNestedLoop, JoinTypeLeft, false),
+		"nl-right":    nlTestJoin(JoinAlgoNestedLoop, JoinTypeRight, false),
+		"nl-full":     nlTestJoin(JoinAlgoNestedLoop, JoinTypeFull, false),
+		// LEFT and ANTI are worker-local too, but M0137-0019b held them
+		// out by scope so its parity movement stays attributable; RIGHT
+		// and FULL are refused on correctness.
+		"nl-anti":      nlTestJoin(JoinAlgoNestedLoop, JoinTypeAnti, false),
+		"nl-lateral":   nlTestJoin(JoinAlgoNestedLoop, JoinTypeInner, true),
+		"nl-nil-left":  {Algo: JoinAlgoNestedLoop, Type: JoinTypeInner, Right: &SeqScan{}},
 		"nl-nil-right": {Algo: JoinAlgoNestedLoop, Type: JoinTypeInner, Left: &SeqScan{}},
 	}
 	for name, j := range refusals {
@@ -102,10 +118,24 @@ func TestPartialNLWalkAgreement(t *testing.T) {
 
 	// Every refusal pins all four walks at once. (Hash INNER is NOT a
 	// refusal — the hash twin admits it; hash RIGHT is the refused one.)
+	// M0137-0019b: the same four walks must now ADMIT a SEMI tree, or the
+	// path the producer files would be costed and then refused at the
+	// Gather — the exact "filed but not runnable" trap the narrowed filing
+	// exists to prevent.
+	semiOuter := &SeqScan{schema: Schema{{Name: "a"}}}
+	semi := &Join{Algo: JoinAlgoNestedLoop, Type: JoinTypeSemi,
+		Left: semiOuter, Right: &SeqScan{schema: Schema{{Name: "b"}}}}
+	if got := drivingScan(semi); got != Node(semiOuter) {
+		t.Fatalf("SEMI: drivingScan must reach the OUTER scan, got %T", got)
+	}
+	if drivingScanCrossesSort(semi) {
+		t.Fatal("SEMI: no Sort on the spine, crossesSort must be false")
+	}
+
 	for name, j := range map[string]*Join{
-		"right": nlTestJoin(JoinAlgoNestedLoop, JoinTypeRight, false),
-		"semi":  nlTestJoin(JoinAlgoNestedLoop, JoinTypeSemi, false),
-		"lateral": nlTestJoin(JoinAlgoNestedLoop, JoinTypeInner, true),
+		"right":      nlTestJoin(JoinAlgoNestedLoop, JoinTypeRight, false),
+		"anti":       nlTestJoin(JoinAlgoNestedLoop, JoinTypeAnti, false),
+		"lateral":    nlTestJoin(JoinAlgoNestedLoop, JoinTypeInner, true),
 		"hash-right": {Algo: JoinAlgoHash, Type: JoinTypeRight, Left: outer, Right: inner},
 	} {
 		if drivingScan(j) != nil {
@@ -125,9 +155,9 @@ func nlPartialOuter(relids RelSet) *RelOptInfo {
 	rel := scanRel(relids, 10000, 100)
 	rel.PartialPathlist = []*Path{{
 		Kind: PathSeqScan, Rel: rel, Rows: 5000,
-		Cost:               Cost{Total: 100},
-		ParallelSafe:       true,
-		ParallelWorkers:    2,
+		Cost:            Cost{Total: 100},
+		ParallelSafe:    true,
+		ParallelWorkers: 2,
 	}}
 	return rel
 }
@@ -146,10 +176,10 @@ func nlClassifyPath(joinrel, outer, inner *RelOptInfo, jt parser.JoinType) *Path
 	return &Path{
 		Kind: PathNestLoop, Jointype: jt, Rel: joinrel,
 		Rows: 2500, Cost: Cost{Total: 300},
-		Children:          []*Path{outer.PartialPathlist[0], inner.CheapestTotal},
-		RequiredOuter:     0,
-		ParallelSafe:      true,
-		ParallelWorkers:   2,
+		Children:        []*Path{outer.PartialPathlist[0], inner.CheapestTotal},
+		RequiredOuter:   0,
+		ParallelSafe:    true,
+		ParallelWorkers: 2,
 	}
 }
 
@@ -162,15 +192,15 @@ func TestPartialPathDrivingKindNestLoop(t *testing.T) {
 
 	// Refusal matrix: each mutation flips exactly one predicate.
 	cases := map[string]func(p *Path){
-		"semi-jointype":  func(p *Path) { p.Jointype = parser.JoinSemi },
-		"left-jointype":  func(p *Path) { p.Jointype = parser.JoinLeft },
-		"root-param":     func(p *Path) { p.RequiredOuter = relsetOf(0) },
-		"one-child":      func(p *Path) { p.Children = p.Children[:1] },
-		"zero-workers":   func(p *Path) { p.Children[0].ParallelWorkers = 0 },
-		"unsafe-outer":   func(p *Path) { p.Children[0].ParallelSafe = false },
-		"param-outer":    func(p *Path) { p.Children[0].RequiredOuter = relsetOf(1) },
-		"param-inner":    func(p *Path) { p.Children[1].RequiredOuter = relsetOf(0) },
-		"memoize-inner":  func(p *Path) { p.Children[1].Kind = PathMemoize },
+		"anti-jointype": func(p *Path) { p.Jointype = parser.JoinAnti },
+		"left-jointype": func(p *Path) { p.Jointype = parser.JoinLeft },
+		"root-param":    func(p *Path) { p.RequiredOuter = relsetOf(0) },
+		"one-child":     func(p *Path) { p.Children = p.Children[:1] },
+		"zero-workers":  func(p *Path) { p.Children[0].ParallelWorkers = 0 },
+		"unsafe-outer":  func(p *Path) { p.Children[0].ParallelSafe = false },
+		"param-outer":   func(p *Path) { p.Children[0].RequiredOuter = relsetOf(1) },
+		"param-inner":   func(p *Path) { p.Children[1].RequiredOuter = relsetOf(0) },
+		"memoize-inner": func(p *Path) { p.Children[1].Kind = PathMemoize },
 	}
 	for name, mutate := range cases {
 		jr, o, i := nlClassifyFixture()
@@ -183,11 +213,21 @@ func TestPartialPathDrivingKindNestLoop(t *testing.T) {
 	if partialPathDrivingKind(nil) != PathPrebuilt {
 		t.Error("nil path must refuse")
 	}
+	// M0137-0019b: the classifier must ADMIT a SEMI path, and must resolve
+	// it to the outer's own driving kind rather than to some default.
+	{
+		jr, o, i := nlClassifyFixture()
+		p := nlClassifyPath(jr, o, i, parser.JoinSemi)
+		if got := partialPathDrivingKind(p); got != PathSeqScan {
+			t.Errorf("SEMI partial NL must classify to its outer's driving kind, got %v", got)
+		}
+	}
 }
 
-// TestPartialNLFilingInnerOnly pins R60's narrowed V1 gate: only INNER is
-// filed, so a refused head can never starve admittable siblings (the
-// gather-path reader takes PartialPathlist[0] only).
+// TestPartialNLFilingInnerOnly pins R60's narrowed V1 gate, as widened by
+// M0137-0019b: only INNER and SEMI are filed, so a refused head can never
+// starve admittable siblings (the gather-path reader takes
+// PartialPathlist[0] only). LEFT and ANTI stay unfiled by scope.
 func TestPartialNLFilingInnerOnly(t *testing.T) {
 	withParallelOn(t, func() {
 		defer setGatherPathsModeForTest(gatherPathsAll)()
@@ -208,14 +248,14 @@ func TestPartialNLFilingInnerOnly(t *testing.T) {
 			s := &searchCtx{parallelModeOK: true}
 			clauses := []*restrictInfo{equiClause(a, b)}
 			addPartialNestLoopPaths(s, joinrel, outer, inner, cp, jt, clauses)
-			if jt == parser.JoinInner {
+			if jt == parser.JoinInner || jt == parser.JoinSemi {
 				if len(joinrel.PartialPathlist) == 0 {
-					t.Error("INNER partial NL must be filed")
+					t.Errorf("%v partial NL must be filed", jt)
 				}
 				continue
 			}
 			if len(joinrel.PartialPathlist) != 0 {
-				t.Errorf("%v: non-INNER partial NL must not be filed", jt)
+				t.Errorf("%v: partial NL outside {INNER, SEMI} must not be filed", jt)
 			}
 		}
 	})

@@ -1152,11 +1152,19 @@ func lateralProbeJoinIsPartialCapable(p *Join) bool {
 // builds its OWN operator tree"), matching real PG's Memoize whose DSM
 // shuttles only instrumentation counters — the cache data is per-worker
 // by construction (nodeMemoize.c:1190-1260).
+// M0137-0019b widens the jointype set to {INNER, SEMI} for the same reason
+// and with the same argument as `nestedLoopJoinIsPartialCapable`: a SEMI
+// verdict is per-outer-row and worker-local — one qualifying probe row
+// decides the outer row, the joined row is never emitted, and the
+// inner-matched bitmap RIGHT/FULL would need reduced across workers is never
+// touched. TPC-H Q4's semi join is this FUSED shape (its inner is a
+// parameterised index probe), not the ordinary one, which is why widening
+// the ordinary twin alone left Q4 serial. LEFT and ANTI stay out by scope.
 func NestedLoopIndexJoinIsPartialCapable(p *NestedLoopIndexJoin) bool {
 	if p == nil || p.Outer == nil || p.Inner == nil {
 		return false
 	}
-	if p.Type != JoinTypeInner {
+	if p.Type != JoinTypeInner && p.Type != JoinTypeSemi {
 		return false
 	}
 	return lateralProbeIsPartialProbe(p.Inner)
@@ -1173,10 +1181,21 @@ func NestedLoopIndexJoinIsPartialCapable(p *NestedLoopIndexJoin) bool {
 // so there is nothing for a prebuild step to adopt.
 //
 //   - INNER decides each outer row against the inner alone, so partitioning
-//     the outer is transparent. Only INNER is admitted: LEFT/SEMI/ANTI are
-//     worker-local on the same rationale as the twins, but Q96 (the only
-//     consumer) is INNER and the refusal is deliberate scope-minimization,
-//     not a correctness boundary — do not widen it without a separate scope.
+//     the outer is transparent.
+//   - SEMI is admitted since M0137-0019b, whose named consumer is TPC-H Q4 —
+//     the corpus's only fully SERIAL plan in parallel mode. Its verdict is
+//     per-outer-row and worker-local: one qualifying inner tuple decides the
+//     outer tuple and the inner scan breaks (`finishOuter`,
+//     join_nl_stream.go), the joined row is never emitted (the join's schema
+//     is outer-only), and `markInner`/`fillInner` — the inner-matched bitmap
+//     RIGHT and FULL would need reduced across workers — is never touched on
+//     this path. PG admits {INNER, LEFT, SEMI, ANTI} at the same dispatch
+//     gate (joinpath.c:2022-2031).
+//   - LEFT and ANTI remain refused. They are worker-local on the same
+//     rationale, but M0137-0019b widened only its named consumer's shape so
+//     that its parity movement stays attributable; the refusal is still
+//     deliberate scope-minimization, not a correctness boundary. Ledger row
+//     `m0137-0019b-partial-nl-left-anti-still-refused`.
 //   - FULL and RIGHT would require knowing which INNER rows went unmatched
 //     across ALL workers — the same cross-worker reduction the twins
 //     refuse. Refused rather than approximated.
@@ -1191,7 +1210,7 @@ func nestedLoopJoinIsPartialCapable(p *Join) bool {
 	if p.Left == nil || p.Right == nil {
 		return false
 	}
-	return p.Type == JoinTypeInner
+	return p.Type == JoinTypeInner || p.Type == JoinTypeSemi
 }
 
 // scanTable extracts the *catalog.Table from a scan node (SeqScan,

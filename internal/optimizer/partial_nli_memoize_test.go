@@ -55,10 +55,29 @@ func TestNestedLoopIndexJoinIsPartialCapable(t *testing.T) {
 	if !NestedLoopIndexJoinIsPartialCapable(nliTestJoin(JoinTypeInner, ios, false)) {
 		t.Fatal("index-only probe INNER NLI must be partial-capable")
 	}
+	// M0137-0019b: SEMI joins the admitted set. TPC-H Q4's semi join is this
+	// FUSED shape — its inner is a parameterised index probe — so widening
+	// the ordinary-NL twin alone left Q4 planned fully serially. The
+	// argument is the ordinary twin's: one qualifying probe row decides the
+	// outer row, the joined row is never emitted, and the inner-matched
+	// bitmap RIGHT/FULL would need reduced across workers is never touched.
+	if !NestedLoopIndexJoinIsPartialCapable(nliTestJoin(JoinTypeSemi, latProbeNode(nil), false)) {
+		t.Fatal("bare-probe SEMI NLI must be partial-capable (M0137-0019b)")
+	}
+	if !NestedLoopIndexJoinIsPartialCapable(nliTestJoin(JoinTypeSemi, latProbeNode(nil), true)) {
+		t.Fatal("memoized SEMI NLI must be partial-capable (M0137-0019b)")
+	}
+	// The probe-shape refusals must still bite on SEMI — the jointype
+	// widening must not become a bypass of lateralProbeIsPartialProbe.
+	if NestedLoopIndexJoinIsPartialCapable(nliTestJoin(JoinTypeSemi, &BitmapHeapScan{}, false)) {
+		t.Fatal("SEMI NLI with a bitmap inner must still be refused")
+	}
 	refusals := map[string]*NestedLoopIndexJoin{
-		"nil":          nil,
-		"cross":        nliTestJoin(JoinTypeCross, latProbeNode(nil), false),
-		"semi":         nliTestJoin(JoinTypeSemi, latProbeNode(nil), false),
+		"nil":   nil,
+		"cross": nliTestJoin(JoinTypeCross, latProbeNode(nil), false),
+		// SEMI is admitted since M0137-0019b (asserted above). ANTI and
+		// LEFT are worker-local too but were held out by scope so that
+		// task's parity movement stayed attributable.
 		"anti":         nliTestJoin(JoinTypeAnti, latProbeNode(nil), false),
 		"left":         nliTestJoin(JoinTypeLeft, latProbeNode(nil), false),
 		"right":        nliTestJoin(JoinTypeRight, latProbeNode(nil), false),
@@ -119,9 +138,15 @@ func TestPartialNLIWalkAgreement(t *testing.T) {
 		}
 	}
 
+	// M0137-0019b: the walks must ADMIT a SEMI NLI over an admitted probe.
+	semi := nliTestJoin(JoinTypeSemi, latProbeNode(nil), false)
+	if drivingScan(semi) == nil {
+		t.Error("semi: drivingScan must reach the outer scan (M0137-0019b)")
+	}
+
 	// Refusals pin all walks at once.
 	for name, nli := range map[string]*NestedLoopIndexJoin{
-		"semi":         nliTestJoin(JoinTypeSemi, latProbeNode(nil), false),
+		"anti":         nliTestJoin(JoinTypeAnti, latProbeNode(nil), false),
 		"cross":        nliTestJoin(JoinTypeCross, latProbeNode(nil), false),
 		"seq-inner":    nliTestJoin(JoinTypeInner, &SeqScan{}, false),
 		"bitmap-inner": nliTestJoin(JoinTypeInner, &BitmapHeapScan{}, false),

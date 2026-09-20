@@ -110,10 +110,12 @@ func TestParallelNLIWalkerRefusals(t *testing.T) {
 		LowKey: &optimizer.NumericConst{Value: "1"}}
 
 	refusals := map[string]*optimizer.NestedLoopIndexJoin{
-		"left":    nliPlan(optimizer.JoinTypeLeft, nliProbePlan(), false),
-		"right":   nliPlan(optimizer.JoinTypeRight, nliProbePlan(), false),
-		"full":    nliPlan(optimizer.JoinTypeFull, nliProbePlan(), false),
-		"semi":    nliPlan(optimizer.JoinTypeSemi, nliProbePlan(), false),
+		"left":  nliPlan(optimizer.JoinTypeLeft, nliProbePlan(), false),
+		"right": nliPlan(optimizer.JoinTypeRight, nliProbePlan(), false),
+		"full":  nliPlan(optimizer.JoinTypeFull, nliProbePlan(), false),
+		// SEMI is ADMITTED since M0137-0019b (asserted below); ANTI and
+		// LEFT are worker-local too but were held out by that task's
+		// scope so its parity movement stayed attributable.
 		"anti":    nliPlan(optimizer.JoinTypeAnti, nliProbePlan(), false),
 		"cross":   nliPlan(optimizer.JoinTypeCross, nliProbePlan(), false),
 		"bitmap":  nliPlan(optimizer.JoinTypeInner, bitmapInner, false),
@@ -135,6 +137,20 @@ func TestParallelNLIWalkerRefusals(t *testing.T) {
 			t.Errorf("%s: index walk must refuse", name)
 		}
 	}
+	// M0137-0019b: a SEMI NLI over an admitted probe must be ACCEPTED by
+	// every walk, or the partial path its producer files would be costed
+	// and then refused at the Gather. TPC-H Q4 is the consumer.
+	semiPlan := nliPlan(optimizer.JoinTypeSemi, nliProbePlan(), false)
+	if !attachParallelScan(&nestedLoopIndexJoinOp{plan: semiPlan, outer: &seqScanOp{}}, newParallelScanState(0)) {
+		t.Error("semi: sequential walk must accept (M0137-0019b)")
+	}
+	if !attachParallelBitmapScan(&nestedLoopIndexJoinOp{plan: semiPlan, outer: &bitmapHeapScanOp{}}, newParallelBitmapState()) {
+		t.Error("semi: bitmap walk must accept (M0137-0019b)")
+	}
+	if !attachParallelIndexScan(&nestedLoopIndexJoinOp{plan: semiPlan, outer: &indexOnlyScanOp{}}, newParallelIndexScanState()) {
+		t.Error("semi: index walk must accept (M0137-0019b)")
+	}
+
 	// Nil plan fails closed on every walk.
 	nilOp := &nestedLoopIndexJoinOp{outer: &seqScanOp{}}
 	if attachParallelScan(nilOp, newParallelScanState(0)) {
@@ -198,8 +214,10 @@ func TestCollectBitmapScansDescendsNLI(t *testing.T) {
 		t.Fatalf("approved NLI: collected %d bitmaps, want the outer one", len(got))
 	}
 
+	// ANTI, not SEMI: M0137-0019b admitted SEMI, so the refusal case has to
+	// be a jointype that is still out of the set.
 	refused := &nestedLoopIndexJoinOp{
-		plan:  nliPlan(optimizer.JoinTypeSemi, nliProbePlan(), false),
+		plan:  nliPlan(optimizer.JoinTypeAnti, nliProbePlan(), false),
 		outer: bm,
 	}
 	got = got[:0]

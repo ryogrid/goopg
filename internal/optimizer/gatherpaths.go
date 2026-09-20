@@ -543,13 +543,21 @@ func partialPathDrivingKind(p *Path) PathKind {
 		// below is re-checked rather than trusted.
 		//
 		// Only a path R60's producer built can appear here, and R60 files
-		// INNER only (its V1 gate refuses every other jointype for this
-		// arm, since a refused head would starve admittable siblings —
-		// makeGatherPath reads PartialPathlist[0] only). The jointype
-		// test below re-asserts it rather than trusting the caller, for
-		// the reason createPartialGroupingPaths states: a producer that
-		// trusts a caller's gate is one refactor away from a hole.
-		if p.Jointype != parser.JoinInner {
+		// INNER and (since M0137-0019b) SEMI only — its V1 gate refuses
+		// every other jointype for this arm, since a refused head would
+		// starve admittable siblings (makeGatherPath reads
+		// PartialPathlist[0] only). The jointype test below re-asserts it
+		// rather than trusting the caller, for the reason
+		// createPartialGroupingPaths states: a producer that trusts a
+		// caller's gate is one refactor away from a hole.
+		//
+		// SEMI joins the set for M0137-0019b: its per-outer-row verdict is
+		// worker-local (`finishOuter`, join_nl_stream.go — one qualifying
+		// inner tuple decides the outer tuple, the joined row is never
+		// emitted, and the inner-matched bitmap RIGHT/FULL would need is
+		// never touched), so a partitioned outer is transparent. LEFT and
+		// ANTI stay out by scope, not by correctness; see the producer.
+		if p.Jointype != parser.JoinInner && p.Jointype != parser.JoinSemi {
 			return PathPrebuilt
 		}
 		if p.RequiredOuter != 0 || len(p.Children) != 2 {

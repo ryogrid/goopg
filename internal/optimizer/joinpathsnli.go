@@ -423,16 +423,28 @@ func addPartialNestLoopPaths(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp
 		tracePVetoCtx(s, "nestloop", traceRelids(joinrel), traceRelids(outer), traceRelids(inner), "V1", "jt="+traceJoinTypeName(jt))
 		return
 	}
-	// R94 (plan-parity-fix-take2): file only the evidenced ordinary INNER
-	// shape. LEFT/SEMI/ANTI have no admitted consumer — the path
-	// classifier (partialPathDrivingKind) and the node twin
-	// (nestedLoopJoinIsPartialCapable) both refuse them — and a refused
-	// path filed at PartialPathlist[0] would starve admittable hash/merge
-	// siblings, since makeGatherPath reads the head only. Filing them
-	// would be costed-but-never-runnable noise at best. Narrowing the
-	// filing (rather than the classifier) keeps every filed partial NL
-	// runnable end to end.
-	if jt != parser.JoinInner {
+	// R94 (plan-parity-fix-take2), widened to SEMI by M0137-0019b: file only
+	// the shapes with an admitted consumer end to end. A filed path whose
+	// classifier or node twin refuses it would be costed-but-never-runnable
+	// noise, and one filed at PartialPathlist[0] would starve admittable
+	// hash/merge siblings since makeGatherPath reads the head only — so the
+	// FILING is narrowed rather than the classifier, and the three gates
+	// (here, partialPathDrivingKind, nestedLoopJoinIsPartialCapable) are
+	// widened together or not at all.
+	//
+	// SEMI is admitted because its verdict is per-outer-row and worker-local:
+	// one qualifying inner tuple decides the outer tuple and the inner scan
+	// breaks (`finishOuter`, join_nl_stream.go), the joined row is never
+	// emitted, and the inner-matched bitmap RIGHT/FULL would need is not
+	// touched. Partitioning the outer is therefore transparent. PG admits
+	// {INNER, LEFT, SEMI, ANTI} at the same dispatch gate
+	// (joinpath.c:2022-2031).
+	//
+	// LEFT and ANTI stay refused — worker-local by the same argument, but
+	// M0137-0019b's named consumer (TPC-H Q4) is SEMI, and widening them in
+	// the same change would make its parity movement unattributable. Ledger
+	// row `m0137-0019b-partial-nl-left-anti-still-refused`.
+	if jt != parser.JoinInner && jt != parser.JoinSemi {
 		tracePVetoCtx(s, "nestloop", traceRelids(joinrel), traceRelids(outer), traceRelids(inner), "V1-nl-inner", "jt="+traceJoinTypeName(jt))
 		return
 	}
