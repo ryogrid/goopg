@@ -2741,6 +2741,11 @@ func (n *Copy) Output() Schema { return n.schema }
 // all other variants buffer and apply multiset semantics in the executor
 // (operators_setop.go). M0097-0024.
 type SetOp struct {
+	// setOpBranchTag: M0144-0003b-1 — set when this node is what
+	// `createSetOpPaths` returned for a set operation, so the next link of a
+	// left-deep UNION ALL chain can reach that link's SETOP rel
+	// (setopbranchrel.go).
+	setOpBranchTag
 	pos   int
 	Left  Node
 	Right Node
@@ -2792,6 +2797,11 @@ type Gather struct {
 	// cannot carry the tag — an untagged searched subtree would be walked
 	// again by the legacy posmap family and permuted twice.
 	searchedTree
+	// setOpBranchTag: M0144-0003b-1 — set when this node is what
+	// `createSetOpPaths` returned for a set operation, so the next link of a
+	// left-deep UNION ALL chain can reach that link's SETOP rel
+	// (setopbranchrel.go).
+	setOpBranchTag
 	pos   int
 	Child Node
 	// WorkersPlanned is the worker count chosen at plan time. EXPLAIN renders
@@ -2825,6 +2835,11 @@ type GatherMerge struct {
 	PlanCost
 	// searchedTree: see *Gather. C-19e/C-19f make this reachable too.
 	searchedTree
+	// setOpBranchTag: M0144-0003b-1 — set when this node is what
+	// `createSetOpPaths` returned for a set operation, so the next link of a
+	// left-deep UNION ALL chain can reach that link's SETOP rel
+	// (setopbranchrel.go).
+	setOpBranchTag
 	pos            int
 	Child          Node
 	WorkersPlanned int

@@ -373,8 +373,18 @@ func createSetOpPaths(u *upperRels, setOpNode *SetOp, ps PlannerSettings, tupleF
 	// here to the SetOp's two inputs. Plumbing only: nothing below reads
 	// these fields yet, so addSetOpPaths still offers the one candidate it
 	// always has and no plan can change.
-	setOpRel.LeftBranchRel = searchedRelOf(setOpNode.Left)
-	setOpRel.RightBranchRel = searchedRelOf(setOpNode.Right)
+	//
+	// M0144-0003b-1 widens the accessor by one terminus so a branch that is
+	// itself a finished set operation answers with ITS SETOP rel — the link
+	// below's, carried out on the node it returned. Without that, the outer
+	// link of every chain of three or more UNION ALL branches read nil on
+	// the side holding the rest of the chain (a `*SetOp` has two boundary
+	// children, so `searchedRelOf` stops at it), `ConsiderParallel` went
+	// false, and `addPartialSetOpPath` returned before either arm ran. PG
+	// never meets the case: `pull_up_simple_union_all` flattens the whole
+	// union into one appendrel. See setopbranchrel.go.
+	setOpRel.LeftBranchRel = setOpBranchRelOf(setOpNode.Left)
+	setOpRel.RightBranchRel = setOpBranchRelOf(setOpNode.Right)
 
 	// M0140-0006b: seed setOpRel.PartialPathlist from the two branches' own
 	// partial paths, when the branches and the op shape allow it. See
@@ -400,6 +410,11 @@ func createSetOpPaths(u *upperRels, setOpNode *SetOp, ps PlannerSettings, tupleF
 			Message: "could not implement set operation"}
 	}
 	node, _ := createPlanNode(best)
+	// M0144-0003b-1: carry this link's SETOP rel out on the node the link
+	// publishes, so the next link up can read it (setopbranchrel.go). Both
+	// returnable kinds below carry the tag; anything else stays opaque, as
+	// it was.
+	node = stampSetOpBranchRel(node, setOpRel)
 	switch node.(type) {
 	case *SetOp:
 		return node, nil
@@ -822,6 +837,19 @@ func addPartialSetOpPath(setOpRel *RelOptInfo, setOpNode *SetOp, cp costParams, 
 // paths upstream either.
 func setOpBranchPartialChainOK(n Node) bool {
 	for depth := 0; n != nil && depth < 32; depth++ {
+		// M0144-0003b-1: a finished set operation carrying its own SETOP rel
+		// is a terminus, exactly like a searched root. What that rel's
+		// PartialPathlist holds is a partial SetOp path — a plan whose
+		// branches are block-claimed across participants, so the link emits
+		// each of its rows exactly once across the whole worker set, which
+		// is precisely the contract a partial subpath owes its parent. The
+		// carrier check precedes the descent for the reason given on
+		// `setOpBranchRelOf`: a *Gather over a partial *SetOp is both a
+		// carrier and a boundary wrapper, and the outermost carrier is the
+		// one whose rel matches the node the parent actually holds.
+		if c, ok := n.(setOpBranchRelNode); ok && c.setOpBranchRel() != nil {
+			return true
+		}
 		if s, ok := n.(searchRootNode); ok && s.isFromJoinSearch() {
 			return true
 		}

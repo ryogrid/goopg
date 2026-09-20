@@ -11339,7 +11339,28 @@ goopg's processing route diverged from PG's upstream of the fix).
       not license an assumption about those nodes' SHAPE.** The previous
       loop censused the type and inferred the shape; probe the predicate
       you intend to gate on, not just the type switch.
-- [ ] **M0144-0003b — jointree-level UNION ALL flattening**
+- [x] **M0144-0003b-1 — carry each set operation's SETOP rel to the link
+  above** (the enabling slice of M0144-0003b; LANDED, inert). Refutes the
+  parent's factual premise: `addPartialSetOpPath` does NOT admit 0/99 — the
+  INNERMOST link of every UNION ALL chain already files a partial path
+  (Q14/Q71/Q76 measured), and on Q14/Q71 the `Gather` over it wins the
+  link's tournament outright. What failed is COMPOSITION: goopg builds a
+  left-deep `*SetOp` chain where PG flattens the union into one appendrel
+  (`pull_up_simple_union_all`, prepjointree.c:1617), and `searchedRelOf`
+  stops at any node without exactly one boundary child
+  (searchedtree.go:184) — a `*SetOp` has two — so every OUTER link read
+  `nil-rel` on the side holding the rest of the chain and returned before
+  either arm ran. Fix: carry the SETOP rel out on the node
+  `createSetOpPaths` returns (`setopbranchrel.go`, the mechanism
+  `searchedTree` already uses) and widen the branch accessor by exactly that
+  one terminus. Absorption: 3 outer links across SF0.25 newly file a partial
+  path, none removed; no cost change. Inert — SF0.25 `same=99 changed=0`,
+  verdict-changes=none; TPC-H structurally cannot exercise it (zero
+  `Append`/`SetOp` nodes in all 22 plans). Movement: none.
+  Design: docs/design/0100-0149/m0144-0003b-1-setop-chain-branch-rel.md
+  Kind: impl
+  Parent: M0144-0003b
+- [!] **M0144-0003b — jointree-level UNION ALL flattening**
   (`pull_up_simple_union_all` analog; filed by M0144-0003 item (b)). PG
   flattens UNION ALL-in-FROM into an appendrel during jointree
   preprocessing (prepjointree.c:1617 via pull_up_subqueries planner.c:754)
@@ -11353,6 +11374,17 @@ goopg's processing route diverged from PG's upstream of the fix).
   the outer-join ordering rules. Expected movement per S5: the TPC-DS
   Parallel Append sites (Q5×3, Q2, Q14, Q71, Q76 and census `parallelism`
   records) become reachable.
+  **BLOCKED on M0142-0008a-3i-lateral-route, and the filed premise is
+  half-refuted.** M0144-0003b-1 (above) measured the producer and found it
+  already admits at the innermost link of every chain; the chain-composition
+  half is now landed. The RESIDUAL is branches whose subtree never reached
+  the search at all (Q5's `*Project:nil-rel` on BOTH sides, Q2/Q33/Q56/Q60
+  likewise): there is no rel to carry, because Phase A of the pre-DP unnest
+  spliced a BUILT plan before Phase B's search ran. No accessor widening
+  can reach it — this is the same two-phase wall that blocks M0144-0003a
+  and the three M0142-0008a-3 items, and it belongs behind the same gate.
+  Do not re-scope as "build an appendrel representation" until the route
+  order is fixed.
   Kind: impl
   Parent: M0144-0003
 - [x] **M0144-0003c — pre-cost upper narrowing** (filed by M0144-0003 item

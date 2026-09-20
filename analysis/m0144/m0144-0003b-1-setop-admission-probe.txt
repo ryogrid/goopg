@@ -1,0 +1,39 @@
+# M0144-0003b-1 — createSetOpPaths branch-admission probe
+# Lane: private clone tmp/c20a/data-sf025 on 127.0.0.1:5595 (db `postgres`),
+#       GOOPG_ANALYZE_SEED=20260905, GOOPG_PGSHAPED_DP_TRACE=1.
+# Probe was a THROWAWAY fmt.Fprintf in createSetOpPaths, reverted before commit.
+# The lane is a stale clone (see the loop's standing note) — it is cited for
+# MECHANISM only. The outcome claim comes from the SF0.25 gate cluster.
+
+=== BASELINE (HEAD, before the carry) =========================================
+# fields: branch node type : branch rel (pp = len(PartialPathlist))
+#         chain = setOpBranchPartialChainOK, filed = len(setOpRel.PartialPathlist)
+
+Q14  left=*Project:rel(pp=1 cp=true) right=*Project:rel(pp=1 cp=true) chain=t/t streams=true  filed=1  -> won, cand kind=11 (Gather)
+Q14  left=*Gather:nil-rel            right=*Project:rel(pp=1 cp=true) chain=f/t streams=true  filed=0
+Q71  left=*Project:rel(pp=1 cp=true) right=*Project:rel(pp=1 cp=true) chain=t/t streams=true  filed=1  -> won, cand kind=11 (Gather)
+Q71  left=*Gather:nil-rel            right=*Project:rel(pp=1 cp=true) chain=f/t streams=true  filed=0
+Q76  left=*Project:rel(pp=1 cp=true) right=*Project:rel(pp=1 cp=true) chain=t/t streams=true  filed=1  -> lost on cost (kind=10)
+Q76  left=*SetOp:nil-rel             right=*Project:rel(pp=1 cp=true) chain=f/t streams=true  filed=0
+Q5   left=*Project:nil-rel           right=*Project:nil-rel           chain=f/f streams=true  filed=0   (x4)
+Q5   left=*SetOp:nil-rel             right=*Project:nil-rel           chain=f/f streams=true  filed=0
+Q2/Q33/Q56/Q60 — same shape as Q5: both branches nil-rel.
+
+# Reading: the producer ALREADY admits. The filed premise "admits 0/99
+# corpus-wide" is false. Two distinct failures remain, and they are not the
+# same failure:
+#   (A) OUTER links of a chain — the branch HAS a rel, but *SetOp/*Gather is
+#       opaque to searchedRelOf. This is what M0144-0003b-1 fixes.
+#   (B) nil-rel on BOTH sides (Q5, Q2, Q33, Q56, Q60) — the branch subtree
+#       never reached the search, so there is no rel to carry. Pre-DP unnest
+#       wall; blocked behind M0142-0008a-3i-lateral-route.
+
+=== AFTER THE CARRY ===========================================================
+Q14  left=*Gather[pp=1 cp=true,chain=true]  filed=1   (was nil-rel, chain=false, filed=0)
+Q14  left=*Gather[pp=1 cp=true,chain=true]  filed=1   (second occurrence)
+Q76  left=*SetOp [pp=1 cp=true,chain=true]  filed=1   (was nil-rel, chain=false, filed=0)
+Q14  left=*SetOp [pp=0 cp=false,chain=true] filed=0   streams=false — UNION DISTINCT, correctly still 0
+Q5   left=*Project[nil,chain=false]         filed=0   unchanged: case (B)
+
+# Absorption: +3 filed partial paths, -0. No cost function changed.
+# Outcome: none of the three wins; SF0.25 gate same=99 changed=0. Movement: none.
