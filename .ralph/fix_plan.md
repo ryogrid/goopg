@@ -11060,12 +11060,28 @@ goopg's processing route diverged from PG's upstream of the fix).
   no plan movement expected or claimed).
   Kind: recon
   Parent: M0144-0002
-- [ ] **M0144-0008 — TPC-DS SF1 cadence capture** (03-forward-plan §5). The
+- [x] **M0144-0008 — TPC-DS SF1 cadence capture** (03-forward-plan §5). The
   corpus's goal is SF1 and exactly one SF1 capture exists (P0-E7, match=1/99).
   Take a second SF1 capture on a private lane per G3 and record the
   per-milestone-boundary SF1 convention in the design doc.
   Kind: recon
   Parent: none
+  - **DONE 2026-09-20 (loop \#40).** Movement: none — second capture is
+    measurement only; no plan movement claimed. G3 lane: `cp -r` clone of
+    `bench/tpcds/runtime_goopg/data` (source down, no postmaster.pid) →
+    `tmp/m0144-0008-data-sf1` on `:5593` under cgroup `m0144-0008-sf1`,
+    HEAD `5fa3c98c9` binary sha256 `6a76d290…`; PG arm `:65438`/`tpcds`
+    read-only. **Result `match=1/99` (Q41), headline counts identical to
+    P0-E7** — but real category movement: `aggregation-strategy` 72→45
+    (−27, consistent with M0141-S2b-11/S2b-13 grouping-order work in the
+    38 production commits between `a0e741a68..5fa3c98c9`),
+    `sort-strategy` −5, `join-method`/`qual-placement` −4,
+    `parameterisation` +6 newly-exposed; 55/99 queries changed category
+    sets. Diff-tool drift ruled out (only a comment changed, `44b17d459`).
+    Convention pinned: SF1 capture at every milestone boundary + before any
+    stocktake (~7 s EXPLAIN-only, private lane). Design doc:
+    `docs/design/0100-0149/m0144-0008-tpcds-sf1-cadence.md`; record +
+    artifacts `analysis/m0144/m0144-0008-*`. Lane stopped after capture.
 - [ ] **M0144-0009 — `plan-gate` reframing evaluation** (03-forward-plan §5).
   The gate diffs live `:65433` (binary lags HEAD) vs the newest committed
   snapshot — it can never see staged-code regressions. Evaluate: keep
