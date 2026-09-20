@@ -11254,13 +11254,72 @@ goopg's processing route diverged from PG's upstream of the fix).
     move unattributable.
   Kind: impl
   Parent: M0144-0011a
-  Expected movement: SF0.25 `sort-strategy` beyond its post-0011a value of
-  60, on the residue of the `Limit→{GroupAggregate|Finalize}` family that
-  0011a did NOT move (named: Q21, Q62, Q99 — the three named queries still
-  unmoved after 0011a). Measured: `pg-plan-parity-diff.py`
-  `CATEGORIES-EXCL-MATCH` on a private-lane SF0.25 capture against
-  `analysis/m0142/m0142-0012verify-tpcds-pg.txt`, plus a DPGROUP
-  loop-decline trace count showing the `cands<2(1)` declines that stop.
+  - **PREMISE CORRECTED 2026-09-20 (loop \#45), by probe.** A
+    `GOOPG_PGSHAPED_DP_TRACE=1` run on a private `:5595` SF0.25 lane
+    showed that NONE of the three queries this task was filed for is
+    blocked by either bullet above:
+    - Q21 declines with `reason=gate-precondition`, not `cands<2(1)`, and
+      its walk then stops at a renaming `*Project` over the aggregate
+      (`DPWALK stop-at=*optimizer.Project`). That mechanism is filed and
+      LANDED as **M0144-0011a-3** below; Q21 is spent.
+    - Q62 and Q99 plan a `Finalize HashAggregate`. A hashed aggregate
+      emits no order, so no ordering-claim work can move them — their
+      divergence is `aggregation-strategy` and belongs to that lineage.
+    - The two bullets above therefore remain genuinely UNMEASURED: they
+      have no named query left from the 0011a residue, and the first job
+      of whoever selects this task is to find one (or to retire the task).
+  Expected movement: **withdrawn pending a named query** — the original
+  claim (SF0.25 `sort-strategy` beyond 60 via Q21/Q62/Q99) is refuted by
+  the probe above. Re-state it, with a query the trace shows declining at
+  `cands<2(1)` or stopping at a `*MergeJoin`/`*GatherMerge`/
+  `*IncrementalSort` top, before doing any production work here
+  (AGENT.md S5).
+- [x] **M0144-0011a-3 — crossing a positional-identity `Project` at the
+  ORDERED seam** (filed by M0144-0011a-2's probe). `inputNodePathkeys`
+  (`internal/optimizer/upperorderedinput.go`) stopped at every `*Project`,
+  so TPC-DS SF0.25 Q21 — whose ordered input is `Project{Aggregate}` doing
+  nothing but renaming the two aggregate outputs to `inv_before`/
+  `inv_after` — never reached the `*Aggregate` arm M0144-0011a added.
+  Landed: the walk now descends through a Project that is a POSITIONAL
+  IDENTITY (`projectIsPositionalIdentity`: target `j` is
+  `ColumnRef{Index: j}` for every `j`, equal widths, not `IsolatedScope`)
+  and restamps the claim's labels at the SAME index
+  (`relabelPathkeysTo`). PG citation:
+  `postgres/src/backend/optimizer/util/pathnode.c:2936-2937` — "Projection
+  does not change the sort order", `create_projection_path` copies
+  `subpath->pathkeys` — which PG may say for ANY projection only because a
+  PG pathkey names an EquivalenceClass; goopg's names a POSITION, so only
+  the identity case ports and everything else still stops the walk. Design
+  doc: `docs/design/0100-0149/m0144-0011a-3-identity-project-descent.md`.
+  Kind: impl
+  Parent: M0144-0011a
+  Movement: none
+  - Result the first-divergence census DOES see: Q21 advances
+    `depth=1 [sort-strategy] under Limit: PG GroupAggregate | goopg Sort`
+    → `depth=1 [qual-placement] under Limit: PG GroupAggregate | goopg
+    GroupAggregate`. The depth-1 node kind now MATCHES PG and the residue
+    is the HAVING qual's placement.
+  - Why it is still `Movement: none`: S3's three instruments are the match
+    count, `CATEGORIES-EXCL-MATCH` beyond ±3, and `ea-ratchet`. SF0.25
+    reads match 2 → 2 and `sort-strategy` 60 → 60 — because that line
+    counts every category a query diverges in ANYWHERE, and Q21's inner
+    `Sort` still differs in strategy, so Q21 keeps its tally while also
+    gaining `qual-placement` (24 → 25). Calling the census advance
+    "movement" would be instrument-shopping.
+  - Blast radius: 1/99 SF0.25 plans changed (Q21 only). TPC-H parallel is
+    byte-identical to the 0011a capture
+    (`sha256 1727126e8ed71456`) from a DIFFERENT binary
+    (`7372bbf60b170386` vs `163ba219e018a91a`) — G3's proof that the
+    equality is inertness on that corpus, not a re-measured binary.
+  - Deferred inside the same mechanism: a NARROWING identity Project
+    (`len(out) < len(child)`) is sound in principle — positions
+    `0..len(out)-1` are still an identity — and is refused only because
+    the walk's per-step agreement check is a column-count test with no
+    "prefix" mode. Ledger row filed.
+  - Gates: units PASS; `tpch-spotcheck` PASS (Q12=2 Q13=33);
+    `tpcds-sf025 sweep` PASS (`MISMATCH=0 CKMISMATCH=0 ERROR=0
+    TIMEOUT=0`); `tpch-acceptance-arm` PASS (24/24 VALUES);
+    `make ea-ratchet` `N/A — no estimate/selectivity/stats code touched`.
 - [ ] **M0144-0011b — join election under Q8's aggregate input**
   (filed by M0144-0011). At rel `{0,1,2,3}` ({dd⋈ss} ⋈ {store,ca-view}):
   goopg elected `join.hash total=19455.50`; the PG-chosen
