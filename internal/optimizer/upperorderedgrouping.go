@@ -172,12 +172,43 @@ func groupingEmissionPathkeys(aggNode *Aggregate, cand *Path) []PathKey {
 //
 // Gates (all pre-mutation): the ordered input node IS `agg.node`
 // (pointer equality — a HAVING filter, window stage, min-max wrap or
-// ProjectSet re-wrap declines); the grouping rel holds ≥2 PathAgg
+// ProjectSet re-wrap declines); the grouping rel holds ≥1 PathAgg
 // with 0 PathFinalizeAgg (a parallel split declines: the loop's
 // serial-only ORDERED rel could otherwise elect a serial plan the
 // grouping rel would have lost to Finalize under parallel knobs);
 // at least one candidate translates (a Sort-only loop could only
 // re-price, never change the election versus the normal call).
+//
+// M0144-0011a-2 lowered that candidate minimum from 2 to 1. PG has no
+// minimum at all — `create_ordered_paths` iterates the whole input
+// pathlist, `foreach(lc, input_rel->pathlist)`
+// (`postgres/src/backend/optimizer/plan/planner.c:5337`), so a LONE
+// `AggPath` is offered on the ORDERED rel exactly like one of many. The
+// `< 2` form was the remaining divergence from that loop, and it was
+// removed for PG-faithfulness, not for a number.
+//
+// What the corpus census measured
+// (`analysis/m0144/m0144-0011a-2-ordered-seam-census.md`): on TPC-DS
+// SF0.25 the relaxation turns 37 `cands<2(1)` declines into 26
+// elections plus 11 `anyTranslated=false`, and it is SHAPE-INERT —
+// all 99 plan shapes are byte-identical with costs stripped, and
+// `pg-plan-parity-diff.py` reports the same match (2), the same
+// `missingnode` (25) and the same nine `CATEGORIES-EXCL-MATCH` counts.
+// That shape result is the expected one: with the `*Aggregate` arm
+// (M0144-0011a) and the identity-`Project` descent (M0144-0011a-3) in
+// place, `inputNodePathkeys` derives from the FINISHED node the same
+// claim this loop derives from the unbuilt `*Path`, so the two routes
+// elect the same plan.
+//
+// It is NOT cost-inert: ten queries (Q3, Q19, Q42, Q52, Q55, Q71, Q72,
+// Q85, Q91, Q93 — the ones whose seed carried a PARTIAL ordering claim,
+// `keys>0 contained=false`) print a different cost on their ORDER BY
+// `Sort`, because that Sort is now priced by `addOrderedPaths` over the
+// `PathAgg` candidate instead of by the prebuilt seed's
+// `DeriveLegacyDisplayCost`. Repricing an upper-rel Sort through
+// `cost_sort` rather than the legacy display estimate is what the
+// ORDERED rel was built for in the first place (upperordered.go's file
+// header), so this is the intended direction, not a side effect.
 func electOrderedGrouping(u *upperRels, agg *aggregateSurface, node Node, keys []SortKey, stmtPos int, cp costParams, tupleFraction, limitTuples float64, narrowKeep []int) (Node, bool) {
 	decline := func(reason string) (Node, bool) {
 		if dpTrace {
@@ -201,8 +232,10 @@ func electOrderedGrouping(u *upperRels, agg *aggregateSurface, node Node, keys [
 			cands = append(cands, p)
 		}
 	}
-	if len(cands) < 2 {
-		return decline(fmt.Sprintf("cands<2(%d)", len(cands)))
+	// PG's minimum is one path, not two (planner.c:5337 — see the doc
+	// comment above). A lone translatable candidate must still be offered.
+	if len(cands) < 1 {
+		return decline(fmt.Sprintf("cands<1(%d)", len(cands)))
 	}
 	translated := make([][]PathKey, len(cands))
 	anyTranslated := false

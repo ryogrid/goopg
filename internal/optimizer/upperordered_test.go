@@ -797,3 +797,73 @@ func TestGroupingEmissionTranslatesGatherMergeChild(t *testing.T) {
 		t.Fatalf("gathermerge on other keys translated %d keys, want nil", len(got))
 	}
 }
+
+// TestElectOrderedGroupingOffersALoneCandidate is M0144-0011a-2: the loop's
+// candidate minimum is ONE, the way PG's is. `create_ordered_paths` iterates
+// `input_rel->pathlist` with no minimum at all
+// (`postgres/src/backend/optimizer/plan/planner.c:5337`), so a grouping rel
+// holding a single translatable `PathAgg` must still be offered on the ORDERED
+// rel — the `len(cands) < 2` form declined it.
+//
+// The fixture is the Q4-shaped rel with the hashed sibling REMOVED, so exactly
+// one candidate survives to the loop. The expected outcome is the no-sort
+// election: the lone sorted candidate already emits the ORDER BY order.
+//
+// Landing this removed a real divergence from PG, not a number — the corpus
+// census (`analysis/m0144/m0144-0011a-2-ordered-seam-census.md`) measured it
+// as SHAPE-inert on TPC-DS SF0.25 (37 `cands<2(1)` declines become 26
+// elections; 99/99 plan shapes byte-identical with costs stripped; parity
+// match, `missingnode` and all nine categories unchanged), because
+// `inputNodePathkeys` already derives the same claim from the finished node.
+// Ten queries do print a different ORDER BY `Sort` cost, now taken from
+// `addOrderedPaths` rather than the prebuilt seed's legacy display estimate.
+// This test is what keeps the gate from silently drifting back to a minimum
+// PG does not have.
+func TestElectOrderedGroupingOffersALoneCandidate(t *testing.T) {
+	aggNode, groupCol, outSchema := r47slice2GroupFixture()
+	u := newUpperRels()
+	grouped := fetchUpperRel(u, UpperGroupAgg, 0, 0)
+	sorted := r47slice2SortedCand(
+		&Aggregate{Child: aggNode.Child, GroupExprs: []Expr{groupCol}, schema: outSchema},
+		[]PathKey{{Expr: groupCol, SortAsc: true}},
+		Cost{Startup: 69094, Total: 70122},
+	)
+	sorted.Rel = grouped
+	addPath(grouped, sorted, "test")
+	setCheapest(grouped)
+	if len(grouped.Pathlist) != 1 {
+		t.Fatalf("fixture must hold exactly one candidate, got %d", len(grouped.Pathlist))
+	}
+
+	agg := &aggregateSurface{node: aggNode}
+	keys := []SortKey{{Expr: &ColumnRef{Index: 0, Name: "o_orderpriority", Type: catalog.Type{Name: "bpchar"}}}}
+	got, ok := electOrderedGrouping(u, agg, aggNode, keys, 0, DefaultPlannerSettings().costParams(), 0, -1, nil)
+	if !ok || got == nil {
+		t.Fatal("a lone translatable candidate declined; PG offers it (planner.c:5337)")
+	}
+	if _, isAgg := got.(*Aggregate); !isAgg {
+		t.Fatalf("winner is %T; want the bare *Aggregate no-sort election", got)
+	}
+	if agg.node.Strategy != AggStrategySorted {
+		t.Fatalf("copy-back strategy = %v; want sorted", agg.node.Strategy)
+	}
+}
+
+// TestElectOrderedGroupingStillDeclinesAnEmptyRel: lowering the minimum to one
+// is not lowering it to zero. A grouping rel with no `PathAgg` at all has
+// nothing to offer, and the decline must stay pre-mutation.
+func TestElectOrderedGroupingStillDeclinesAnEmptyRel(t *testing.T) {
+	aggNode, _, _ := r47slice2GroupFixture()
+	u := newUpperRels()
+	fetchUpperRel(u, UpperGroupAgg, 0, 0)
+	agg := &aggregateSurface{node: aggNode}
+	keys := []SortKey{{Expr: &ColumnRef{Index: 0, Name: "o_orderpriority", Type: catalog.Type{Name: "bpchar"}}}}
+	ordered := fetchUpperRel(u, UpperOrdered, 0, 0)
+	beforeLen := len(ordered.Pathlist)
+	if got, ok := electOrderedGrouping(u, agg, aggNode, keys, 0, DefaultPlannerSettings().costParams(), 0, -1, nil); ok || got != nil {
+		t.Fatalf("an empty grouping rel elected (ok=%v); want decline", ok)
+	}
+	if after := fetchUpperRel(u, UpperOrdered, 0, 0); len(after.Pathlist) != beforeLen {
+		t.Fatalf("decline mutated the ORDERED rel: paths %d->%d", beforeLen, len(after.Pathlist))
+	}
+}
