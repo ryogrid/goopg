@@ -1,0 +1,5 @@
+DPTRACE seam-decline reason=lateral nrels=3 nleaves=6
+DPTRACE seam-decline reason=leaf-count nrels=4 nleaves=3
+DPTRACE seam-decline reason=leaf-count nrels=4 nleaves=3
+DPTRACE seam-decline reason=lateral nrels=3 nleaves=4
+DPTRACE seam-decline reason=leaf-count nrels=3 nleaves=2

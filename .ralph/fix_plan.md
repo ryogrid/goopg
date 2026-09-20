@@ -7017,6 +7017,62 @@ cross-layer programme that has never been scoped.
     to decline -2/-3. Also incidentally found an EXPLAIN alias-mislabeling
     cosmetic bug on Q16/Q94 (execution-verified correct, display-only) —
     filed as **M0142-0008d** (below).
+    - **REACHABILITY VERIFIED AT HEAD 2026-09-20 (loop \#53) —
+      `M0142-0008a-3i-reach-verify`.** Design doc:
+      `docs/design/0100-0149/m0142-0008a-3i-reach-verify.md`; evidence:
+      `analysis/m0142/m0142-0008a-3i-reach-verify-trace.txt`.
+      Kind: recon
+      Parent: M0142-0008a-3
+      Movement: none
+      - Ran after `M0142-0008-producer` landed (`1f76d83d9`) and with every
+        `M0142-0008a-3i-plumbing` sub-task `[x]`, to establish two things
+        reading cannot answer.
+      - **No semiAnti chain link reaches the search.** All five named
+        witnesses decline, one seam call each, at HEAD `6909ec616` on the
+        private `:5595` lane with `GOOPG_PGSHAPED_DP_TRACE=1`:
+        `Q69 lateral(nrels=3 nleaves=6)`, `Q16 leaf-count(4/3)`,
+        `Q94 leaf-count(4/3)`, `Q10 lateral(3/4)`, `Q35 leaf-count(3/2)`.
+      - **The P0-H11 `cumulativeFromSpans` finding is therefore still
+        LATENT — there is no live correctness bug at HEAD.** It stays
+        exactly what the audit called it: a gate the first task to let a
+        link through must close first.
+      - **Q69 does NOT stop at `leaf-count`.** The seam's checks run in
+        source order — `chain-not-flattenable` (`joinsearchseam.go:315`)
+        → `leaf-count` (`:326`) → `lateral` (`:330`), each returning — so
+        reaching `lateral` PROVES `leaf-count` passed. Q69 and Q10 pass it;
+        Q16, Q94 and Q35 do not.
+      - Neither Q69 nor Q10 contains `LATERAL` in its SQL. The Lateral join
+        is goopg's own: `chainCarriesLateral`'s Semi/Anti arm — added
+        deliberately by `M0142-0008a-3i-plumbing-c14` — catches "a Lateral
+        join nested inside a Semi/Anti's `Left`, the exact shape a
+        pre-DP-unnest join-order search (predp.go's Phase A) splices in
+        when its own winning tree contains a parameterized index probe".
+        **The chain's last landed increment closed a correctness hole and,
+        in doing so, moved its own named witness's blocker.**
+      - Consequence for increment (i): leaf admission is the right work for
+        **Q16, Q94, Q35** and will **NOT** move **Q69** — the witness
+        `-3i-recon2` chose specifically for the RHS-as-participant shape.
+        Anyone implementing (i) against Q69 expecting `leaf-count` to be
+        the gate will measure no movement and wrongly conclude the
+        increment failed.
+    - [ ] **M0142-0008a-3i-lateral — decide whether a chain whose Lateral
+      join is goopg's OWN predp Phase-A splice may be searched** (filed by
+      `M0142-0008a-3i-reach-verify`). `chainCarriesLateral` declines Q69 and
+      Q10 over a `Lateral` join that no user wrote: predp.go's Phase A
+      splices it in when its winning tree contains a parameterized index
+      probe, and `-plumbing-c14`'s Semi/Anti arm now correctly sees it. A
+      user `LATERAL` must not reorder across its dependency; a Phase-A
+      splice may or may not be the same thing, and that is the decision.
+      Establish it BEFORE widening the gate: if it may be searched, the
+      parameterized probe's dependency still has to be preserved across the
+      reorder, which is a different problem from leaf admission.
+      Kind: recon
+      Parent: M0142-0008a-3
+      Expected movement: none by itself (it is a decision + design note). It
+      unblocks Q69's `join-method` record on TPC-DS SF0.25 — the census's
+      named Semi/Anti-algorithm divergence — which the implementing task
+      measures with `pg-plan-parity-diff.py` per-query on a private-lane
+      capture.
     - **P0-H11 audit finding (2026-09-20, Loop \#32):** the leaf-admission
       increment must also fix `cumulativeFromSpans`'s span round-trip
       (`joinsearchseam.go` `cumulativeFromSpans` → `joinlistProblem.cumOffsets`
