@@ -11308,6 +11308,37 @@ goopg's processing route diverged from PG's upstream of the fix).
         SAME change — it is latent only because nothing gets through today;
       - **Q35 is out of scope** (`Gather` + `NestedLoopIndexJoin` leaves,
         the `M0142-0008a-3i-leafcount` finding), so expect 10 of 11.
+  - **THAT DECISION IS REFUTED 2026-09-20 (loop \#57), by probe, before any
+    production code was written.** Design doc:
+    `docs/design/0100-0149/m0144-0003a-project-descent-refuted.md`;
+    evidence: `analysis/m0144/m0144-0003a-project-descent-refuted.txt`.
+    Movement: none (probe reverted, no production code changed).
+    - Instrumented every opaque leaf at the decline with
+      `projectIsPositionalIdentity` plus a count of the leaves its child
+      would expose, across all 11 declining SF0.25 queries.
+    - **Not one `*Project` is a positional identity** — every one prints
+      `P-NONident`. Several are not even width-preserving: Q14's is 73
+      targets over a 29-column child, Q33's 97 over 67. They are wide
+      re-projections, not the identity renames the decision assumed.
+    - **`would == scans` in EVERY case.** Descending every identity Project
+      exposes ZERO additional leaves; the gap (want 4-6, have 2-3) does not
+      narrow by one. The arm would have been completely inert.
+    - Why: the Project children are `*Gather`, `*CTEScan`, `*Filter`,
+      `*Join`, `*NestedLoopIndexJoin` — **already-planned composites**, the
+      same finding as `M0142-0008a-3i-leafcount`. A `*Gather` under a
+      106-target Project is a finished plan fragment with a chosen worker
+      count; no leaf-level admission predicate can turn it back into base
+      relations.
+    - **So M0144-0003a is NOT implementable as a leaf-admission change.**
+      It joins M0142-0008a-3's increments (i) and (ii) and
+      M0142-0008a-3i-lateral on ONE blocker:
+      **`M0142-0008a-3i-lateral-route`** — Phase B must search before Phase
+      A lowers anything. That is a FOURTH independent confirmation of
+      M0144-0003's own thesis.
+    - Method lesson recorded in the doc §4: **a census of node KINDS does
+      not license an assumption about those nodes' SHAPE.** The previous
+      loop censused the type and inferred the shape; probe the predicate
+      you intend to gate on, not just the type switch.
 - [ ] **M0144-0003b — jointree-level UNION ALL flattening**
   (`pull_up_simple_union_all` analog; filed by M0144-0003 item (b)). PG
   flattens UNION ALL-in-FROM into an appendrel during jointree
