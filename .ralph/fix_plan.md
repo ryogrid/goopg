@@ -11122,13 +11122,32 @@ goopg's processing route diverged from PG's upstream of the fix).
     dump" (was absent): reload ⇒ re-dump a new dated golden dir before
     record-level comparisons are trusted. Design doc:
     `docs/design/0100-0149/m0144-0009-plan-gate-reframing.md`.
-- [ ] **M0144-0010 — ledger bulk-triage tooling** (03-forward-plan §6). ~2,100
+- [x] **M0144-0010 — ledger bulk-triage tooling** (03-forward-plan §6). ~2,100
   open `.ralph/deferral_ledger.md` rows. Build tooling that (1) flags rows
   whose referenced code/tests no longer exist (`git log -S` checks), (2)
   folds same-mechanism rows into cluster rows, (3) emits only the survivors
   for per-task triage. This is the M0119-successor cadence mechanism.
   Kind: impl
   Parent: none
+  - **DONE 2026-09-20 (loop \#42).** Movement: none — harness tooling; no
+    plan movement claimed. Landed `scripts/ledger-triage.py` +
+    `make ledger-triage` (`LEDGER_TRIAGE_FAST=1` ~3 s vs ~2.5 min
+    attributed; `LEDGER_TRIAGE_OUT`, `LEDGER_TRIAGE_FULL`). Read-only:
+    ledger is append-only, so the tool emits a report, never edits rows.
+    Pipeline: parse 7-col table (2,296 rows, 2,129 open) → extract
+    file/`Test*`/backtick-symbol refs (PG-oracle `.c`/`.h` refs annotated
+    but never vote for staleness) → basename→paths existence index +
+    `git log -S` attribution for gone refs → classify
+    `stale-candidate`/`partial-stale`/`live`/`unverifiable` → cluster by
+    most-referenced code file (task-id family fallback; union-find
+    rejected — hub files chained 425-row mega-clusters). First report at
+    HEAD `f2782479e`: 28 stale-candidates (e.g. `cast_ddl_recovery.go`
+    retired by the catalog heap-journaling conversions,
+    `scripts/tpcds-sf05-regression.sh` by `e2a50de40`, `join_agg.go` never
+    existed), 58 partial-stale, 593 live, 1,450 unverifiable prose-only
+    rows survive by default (`stale-candidate` is high-precision, not
+    exhaustive). Report: `analysis/m0144/m0144-0010-ledger-triage.md`;
+    design: `docs/design/0100-0149/m0144-0010-ledger-bulk-triage.md`.
 - [ ] **M0144-0011 — first vertical-slice campaign** (03-forward-plan §4).
   **Not selectable until M0144-0002 and M0144-0007 have landed.** Take the top
   first-divergence cluster, ONE representative query, and drive it to MATCH

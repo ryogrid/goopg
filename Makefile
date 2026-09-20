@@ -43,7 +43,7 @@ PSQL_USER     ?= postgres
 # Wrap shell invocations with the in-tree PostgreSQL paths.
 ENV_PREFIX = PATH="$(PG_BIN_DIR):$$PATH" LD_LIBRARY_PATH="$(PG_LIB_DIR):$$LD_LIBRARY_PATH"
 
-.PHONY: help build init start goopg-test-server stop restart psql status clean clean-data print-env install-hooks ralph-state-check ralph-state-repair ralph-state-guard ralph-metrics check-testport-inventory regen-testport bench-build bench-build-optimized pgo-profile pgbench-compare pgbench-compare-matrix pgbench-compare-report plan-snapshot-build plan-snapshot-capture plan-diff plan-gate runtimeshim-matrix race-gate parity-dashboard nightly-batch ea-ratchet ea-ratchet-repin
+.PHONY: help build init start goopg-test-server stop restart psql status clean clean-data print-env install-hooks ralph-state-check ralph-state-repair ralph-state-guard ralph-metrics check-testport-inventory regen-testport bench-build bench-build-optimized pgo-profile pgbench-compare pgbench-compare-matrix pgbench-compare-report plan-snapshot-build plan-snapshot-capture plan-diff plan-gate runtimeshim-matrix race-gate parity-dashboard nightly-batch ea-ratchet ea-ratchet-repin ledger-triage
 
 help:
 	@echo "goopg lifecycle targets:"
@@ -621,3 +621,19 @@ ea-ratchet:
 
 ea-ratchet-repin:
 	@EA_REPIN=1 bash "$(REPO_ROOT)/scripts/estimate-parity-gate.sh"
+
+# ---------------------------------------------------------------
+# ledger-triage: bulk-triage report over .ralph/deferral_ledger.md
+# (M0144-0010, the M0119-successor cadence). Flags rows whose cited
+# code/tests no longer exist, folds same-mechanism rows into clusters,
+# emits only the survivors. Read-only — the ledger is append-only.
+#   make ledger-triage                     # report to stdout (~3min with
+#                                        # git-log attribution)
+#   LEDGER_TRIAGE_OUT=<file> make ledger-triage   # write to file
+#   LEDGER_TRIAGE_FAST=1 ...               # skip attribution (~3s)
+# ---------------------------------------------------------------
+ledger-triage:
+	@python3 "$(REPO_ROOT)/scripts/ledger-triage.py" \
+		$(if $(LEDGER_TRIAGE_FAST),--no-attribution,) \
+		$(if $(LEDGER_TRIAGE_FULL),--full,) \
+		$(if $(LEDGER_TRIAGE_OUT),--out "$(LEDGER_TRIAGE_OUT)",)
