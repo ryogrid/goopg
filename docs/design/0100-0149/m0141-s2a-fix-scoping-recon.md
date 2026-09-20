@@ -1,6 +1,8 @@
 # M0141-S2a-fix — scoping recon: which half is cheaper, and what PG quantity to substitute
 
-Status: accepted (landed 2026-09-15)
+Status: accepted (landed 2026-09-15); parent task M0141-S2a-fix CLOSED
+2026-09-20 — both halves delivered (half 1 by M0141-S2a-fix1, half 2 by
+M0141-S2a-fix2 / M0141-S2a-fix2r), so the parent row carried a stale `[ ]`.
 
 ## Task
 

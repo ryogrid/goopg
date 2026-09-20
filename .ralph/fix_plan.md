@@ -4035,7 +4035,7 @@ spill route is net-negative.
   attempting the fix here (two coupled changes: move/preview narrowing
   before cost time, and correct the width currency — R124 already falsified
   "currency alone").
-- [ ] **M0141-S2a-fix — make `costAgg`'s width currency see the
+- [x] **M0141-S2a-fix — make `costAgg`'s width currency see the
   post-narrowing input** — `aggInputWidth` (`groupingpaths.go:327`) must read
   a width reflecting what `applyUpperNarrowing`/`narrowJoinLeg` would produce
   for the aggregate's input, evaluated *before or during*
@@ -7152,7 +7152,7 @@ cross-layer programme that has never been scoped.
         still declines on 5/5 witnesses is code with no consumer, which is
         what this repo's own "an unwinnable path is an untested path"
         lesson warns against.
-    - [ ] **M0142-0008a-3i-lateral-route — let Phase B search before Phase A
+    - [x] **M0142-0008a-3i-lateral-route — let Phase B search before Phase A
       lowers anything** (filed by `M0142-0008a-3i-lateral`; scope WIDENED by
       `M0142-0008a-3i-leafcount` from "the probe dependency" to "relations as
       well as dependencies").
@@ -7179,6 +7179,71 @@ cross-layer programme that has never been scoped.
         check that task's findings first rather than re-deriving them, and
         do NOT attempt this as a `chainCarriesLateral` widening — that was
         measured and refuted by `M0142-0008a-3i-lateral`.
+      - **RECON COMPLETE 2026-09-20 — THE FILED FRAMING IS INSUFFICIENT.**
+        Design doc:
+        `docs/design/0100-0149/m0142-0008a-3i-lateral-route-recon.md`.
+        Movement: none (no production file touched).
+        - **Reordering Phase A and Phase B cannot fix anything.** The
+          lowering happens one stage before EITHER phase runs:
+          `planner.go:1499`'s `resolveExpr(whereQual, ctx)` reaches
+          `planExistsExpr` (`:15320-15333`) which calls
+          `planSelectWithParent` — a full recursive planner run — on every
+          EXISTS/IN body and stores only the finished `Node`. Unnest
+          (`:1539`) and both searches (`:1540`) all run after it.
+        - `ExistsExpr` and `InExpr` carry `Plan Node` and **do not retain
+          the parser subquery**, so the parse tree is unreachable from
+          every later stage.
+        - This is the single object all four prior probes hit from
+          different angles (`-lateral`, `-leafcount`, M0144-0003a's census
+          and its refutation). `M0142-0008a-3i-verify` had already named
+          the provenance correctly; the route task was filed against the
+          phases rather than against the resolver.
+        - PG inverts the order: `pull_up_sublinks` (`planner.c:737`) and
+          `pull_up_subqueries` (`:759`) run while the body is still an
+          unplanned `Query`; `SS_process_sublinks` (`:1328`) plans only
+          what pull-up refused; `query_planner` (`:1654`) then searches one
+          flattened range table.
+        - **All five witnesses are flattenable.** Q16/Q94's bodies are a
+          single `catalog_sales cs2`; Q35/Q10/Q69's are `store_sales,
+          date_dim` (and `web_sales`/`catalog_sales` siblings) — plain
+          SELECTs, no aggregate/HAVING/window/setop/DISTINCT/LIMIT/ORDER
+          BY. Every one satisfies `is_simple_subquery`
+          (`prepjointree.c:1807`) in full, so the flattenable subset covers
+          100% of the named witnesses.
+        - Route filed as **M0142-0008a-3i-route-a** below.
+    - [ ] **M0142-0008a-3i-route-a — retain the parser subquery on
+      `ExistsExpr`/`InExpr`, then flatten a simple body before planning it**
+      (filed by `M0142-0008a-3i-lateral-route`'s recon; goopg's
+      `pull_up_subqueries` analogue).
+      Kind: impl
+      Parent: M0142-0008a-3
+      Two steps, the first purely additive: (1) carry the parser subquery
+      alongside `Plan` on `ExistsExpr`/`InExpr` — all 52 `.Plan` readers in
+      `unnest.go` are unaffected and the 7 `planSelectWithParent` call sites
+      (`planner.go:5232, 5251, 13192, 15200, 15217, 15300, 15329`) each
+      already hold the parser node they pass in; (2) in
+      `unnestSubqueriesInPlan`, test the retained query against a goopg
+      `is_simple_subquery` analogue and, when it passes, splice the body's
+      FROM items into the outer join list as REAL relations with its quals
+      merged into the outer predicate, discarding `.Plan` for that sublink —
+      so the search that follows sees base relations, not a finished plan.
+      Expected movement per S5: the seam's `leaf-count` decline class
+      shrinks from its current 26-across-11-queries count, and the five
+      census witnesses' `join-method` records move — measured by a
+      `GOOPG_PGSHAPED_DP_TRACE=1` seam census plus `pg-plan-parity-diff.py`
+      per-query on a private-lane capture.
+      - The leaf arithmetic must be **re-derived, not carried over**:
+        flattening changes both sides of `len(scans) != nprefix+len(semiAnti)`
+        (`joinsearchseam.go:326`), so today's `Q16 nrels=4 nprefix=4 scans=3`
+        shortfall is not the post-fix target.
+      - Must close the P0-H11 `cumulativeFromSpans` span round-trip in the
+        SAME change (`M0142-0008a-3i-reach-verify`).
+      - Q78's `outer-over-derived` firewall must not weaken (hard owner
+        constraint).
+      - A flattened body's correlation references (`cs1.cs_order_number`)
+        are `OuterColumnRef{Level:1}` and must be re-based into the outer
+        chain's column space at splice time; PG gets this free because its
+        reference is a `Var` over a range-table index.
     - **P0-H11 audit finding (2026-09-20, Loop \#32):** the leaf-admission
       increment must also fix `cumulativeFromSpans`'s span round-trip
       (`joinsearchseam.go` `cumulativeFromSpans` → `joinlistProblem.cumOffsets`
@@ -11246,7 +11311,7 @@ goopg's processing route diverged from PG's upstream of the fix).
   Movement: none
   Kind: recon
   Parent: none
-- [ ] **M0144-0003a — Phase-B leaf admission through the sunk-conjunct
+- [!] **M0144-0003a — Phase-B leaf admission through the sunk-conjunct
   Filter** (filed by M0144-0003 item (a)+(e), same root). Phase B's chain
   `spineJoins[0]` is the outermost pinned Semi/Anti join whose `Left`
   carries `Filter{sunk}(origChain)` (predp.go:49-55's documented shape);
@@ -11910,7 +11975,7 @@ goopg's processing route diverged from PG's upstream of the fix).
     `tpcds-sf025 sweep` PASS (`MISMATCH=0 CKMISMATCH=0 ERROR=0
     TIMEOUT=0`); `tpch-acceptance-arm` PASS (24/24 VALUES);
     `make ea-ratchet` `N/A — no estimate/selectivity/stats code touched`.
-- [ ] **M0144-0011b — join election under Q8's aggregate input**
+- [x] **M0144-0011b — join election under Q8's aggregate input**
   (filed by M0144-0011). At rel `{0,1,2,3}` ({dd⋈ss} ⋈ {store,ca-view}):
   goopg elected `join.hash total=19455.50`; the PG-chosen
   `join.nestloop total=19852.53` was generated and dominated — a

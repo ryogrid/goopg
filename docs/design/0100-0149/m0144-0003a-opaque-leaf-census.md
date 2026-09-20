@@ -1,6 +1,10 @@
 # M0144-0003a — the opaque leaf is a `*Project`, not a `*Filter`
 
-Status: FIX SHAPE CORRECTED 2026-09-20 by corpus census; implementation is
+Status: SUPERSEDED — task M0144-0003a marked BLOCKED 2026-09-20 (see
+m0144-0003a-project-descent-refuted.md and
+m0142-0008a-3i-lateral-route-recon.md; the leaf is an already-planned
+subtree, so no leaf-admission change reaches it).
+Originally: FIX SHAPE CORRECTED 2026-09-20 by corpus census; implementation is
 the next step and its admission predicate is chosen
 Kind: recon
 Parent: M0144-0003

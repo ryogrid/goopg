@@ -1,6 +1,8 @@
 # M0144-0011b (recon) — Q8's join election, and the leaf-pricing defect underneath it
 
-Status: RECON COMPLETE 2026-09-20 — impl filed as M0144-0011b-1
+Status: RECON COMPLETE 2026-09-20 — impl filed as M0144-0011b-1, which has
+since landed; the task row was ticked 2026-09-20 (it had carried a stale
+`[ ]` after the recon finished).
 Kind: recon
 Parent: M0144-0011
 Milestone: M0144 (plan-parity harness, measurement-first era)

@@ -1,6 +1,9 @@
 # M0144-0003a — the Project descent is refuted too; leaf admission cannot close this gap
 
-Status: REFUTED 2026-09-20 — the decision recorded one loop earlier is wrong,
+Status: task M0144-0003a marked BLOCKED 2026-09-20 behind
+M0142-0008a-3i-route-a (see m0142-0008a-3i-lateral-route-recon.md, which
+names the cause one stage earlier than either search phase).
+Originally: REFUTED 2026-09-20 — the decision recorded one loop earlier is wrong,
 and the measurement that shows it is here. `M0144-0003a` is not implementable
 as a leaf-admission change; it joins the route-order blocker.
 Kind: recon
