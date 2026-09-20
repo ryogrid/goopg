@@ -11355,7 +11355,7 @@ goopg's processing route diverged from PG's upstream of the fix).
   records) become reachable.
   Kind: impl
   Parent: M0144-0003
-- [ ] **M0144-0003c — pre-cost upper narrowing** (filed by M0144-0003 item
+- [x] **M0144-0003c — pre-cost upper narrowing** (filed by M0144-0003 item
   (d)). `applyUpperNarrowing` (planner.go:190) narrows Aggregate/Sort input
   width on the finished tree — post-tournament, so it can never move a plan
   choice. PG narrows the input target BEFORE costing: `grouping_planner`
@@ -11372,6 +11372,56 @@ goopg's processing route diverged from PG's upstream of the fix).
   clusters.
   Kind: impl
   Parent: M0144-0003
+  Movement: none
+  - **LANDED 2026-09-20 (loop \#58).** Design doc:
+    `docs/design/0100-0149/m0144-0003c-pre-cost-sort-width.md` (its §3
+    decision and §4 limit were both written before any parity number).
+    - **The filed premise is half wrong.** goopg ALREADY narrows pre-cost at
+      three sites, all from banner item 4's M0141-S2a-fix1 family: the
+      ORDERED rel's Sort (`narrowOrderedRelWidths`, upperordered.go:82,
+      sweep-a), WINDOW's internal sort (`window_sort_narrow.go`, sweep-b),
+      and the aggregate's own entry sizing (`aggInputWidth`,
+      groupingpaths.go:363, fix1). `applyUpperNarrowing` (planner.go:190) is
+      the COMMIT step that inserts the narrowing Project — item (d) read it
+      and concluded the COSTING was post-tournament. `aggInputWidth`'s own
+      comment already says the two are deliberately separate.
+    - **What WAS genuinely un-narrowed**: inside `addGroupingPaths` the
+      aggregate is priced through `aggInputWidth` (narrow) while the Sort
+      beneath it went through `sortPathForBounded` → `pathNCols`/
+      `pathAvgVarBytes` → the INPUT rel (full row). One input, two widths.
+    - Fixed by handing both sort sites a narrowed shallow COPY of the seed
+      carrying `NCols`/`AvgVarBytes` from `aggInputWidth` — the per-path
+      override `pathNCols` already prefers (path.go:819-842). No new
+      constant (R6), no newly chosen quantity (C3). Both sort sites changed
+      together (Hard-won Rule #2 — the PLAIN presorted sort and the SORTED
+      group-key sort are one twin pair).
+    - PG citation: `make_group_input_target`
+      (`postgres/src/backend/optimizer/plan/planner.c:1676-1744`) narrows
+      once, `set_pathtarget_cost_width` (`costsize.c:6367`) finalises the
+      width, `cost_sort` (`costsize.c:2328`) reads that same width.
+    - **Result: INERT on both corpora, and the doc predicted why.** TPC-H
+      plans capture BYTE-IDENTICAL to HEAD (`sha256 75599dae4efbf31c`) from
+      a DIFFERENT binary (`08d905fa9ed819d4` vs `2326ec51aef8b431`) — G3's
+      inertness proof; TPC-DS SF0.25 `same=99 changed=0`. Parity identical
+      on both.
+      - The reason, recorded in §4 BEFORE measuring: `costSortRunWithWidth`
+        lets the width reach the price ONLY through the spill branch
+        (`nruns := inputBytes / work_mem`). An in-memory sort costs the same
+        at any width, correctly. No corpus grouping sort spills at a width
+        where narrowing changes the run count.
+      - The first unit test used a 100k-row fixture, priced both widths
+        identically and read as a wiring failure — it was not; the fixture
+        never reached the branch. It now runs at 5M rows where the branch is
+        live, and a separate assertion pins that the override does reach
+        `pathNCols`.
+    - Lands anyway: two readers of one input no longer disagree about its
+      width, R3 forbids discarding a PG-faithful change for lack of number
+      movement, and it is a prerequisite for anything that later makes the
+      spill branch bite (larger SF, lower `work_mem`, or promoting
+      `GOOPG_PG_SORT_RELATION_BYTES_COST`).
+    - Gates: units PASS; `tpch-spotcheck` PASS (Q12=2 Q13=33);
+      `tpcds-sf025 sweep` PASS; `tpch-acceptance-arm` PASS (24/24 VALUES);
+      `make ea-ratchet` `N/A`.
 - [x] **M0144-0004 — instrumented PG 18.3, instrument 1: `OPTIMIZER_DEBUG`
   build** (03-forward-plan §3). Build PG 18.3 from a **scratch checkout**
   (`./postgres/` stays read-only) with `OPTIMIZER_DEBUG` defined; serve a
