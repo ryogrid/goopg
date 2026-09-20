@@ -467,6 +467,15 @@ type resolveContext struct {
 	// deconstructJointree and consumed by join_is_legal (P1.2+). M0128-P1.1.
 	joinInfoList []*SpecialJoinInfo
 
+	// jtPullup is the jointree pipeline's sublink pull-up record
+	// (M0145-0003, jointreepullup.go): WHERE-clause EXISTS/NOT-EXISTS
+	// bodies bound against a provisional scope and converted to
+	// semi/anti leaf entries for the one join-search problem. nil on
+	// the legacy pipeline and on every scope the pull-up pass declined
+	// — the seam reads it inside tryPGShapedJoinSearch, where the
+	// emitting prefix's real leaf count is known.
+	jtPullup *jtPullup
+
 	// antiForcedNullCols: the "table\x00column" keys whose IS NULL conjunct
 	// forced a LEFT->ANTI conversion demotedForPlan (reduce_outer_joins.go)
 	// transplanted in this statement (R40/K69). Those conjuncts must not
@@ -962,6 +971,17 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 // behind the dispatch above until M0145-0008 deletes it. The name dates
 // from M0145-0002; the body is the former planSelectWithSettings verbatim.
 func planSelectLegacyPipeline(s *parser.SelectStmt, cat catalog.Catalog, plannerSet PlannerSettings, scope *rtableScope) (Node, error) {
+	return planSelectImpl(s, cat, plannerSet, scope, false)
+}
+
+// planSelectImpl is the shared statement body both pipeline arms run.
+// `jointree` selects the M0145 divergence points: today that is the
+// WHERE-arm sublink pull-up (M0145-0003, jointreepullup.go) alone;
+// each later milestone adds its own guarded site. Everything else is
+// identical between the arms, which is what keeps the transition
+// reviewable — the retirement path is `jointree` becoming constant
+// true site by site (M0145-0008).
+func planSelectImpl(s *parser.SelectStmt, cat catalog.Catalog, plannerSet PlannerSettings, scope *rtableScope, jointree bool) (Node, error) {
 	// M0103-0008: indirection-star rewrite runs at Plan() entry
 	// before the analyzer; nested-SELECT planning paths (subqueries,
 	// UNION branches) reach planSelectWithSettings directly without
@@ -1543,7 +1563,23 @@ func planSelectLegacyPipeline(s *parser.SelectStmt, cat catalog.Catalog, planner
 			// this guard that assertion would panic. Before R40 this could
 			// not happen: `whereQual` was only nil when `s.Where` itself was,
 			// and this whole block is already gated on `s.Where != nil`.
-			if unnestPreDPEnabled() && whereQual != nil && whereEligibleForPreDPUnnest(pred) {
+			//
+			// M0145-0003: on the jointree pipeline the WHERE-clause sublinks
+			// are pulled up HERE — PG's pull_up_sublinks position, before
+			// join-order search — into leaf entries + SpecialJoinInfo on
+			// ctx.jtPullup, which tryJoinSearch folds into the one search
+			// problem (jointreepullup.go). The predicate itself is NOT
+			// rewritten: a pulled sublink keeps its planned body, so a
+			// declined search falls back to the exact legacy shape below.
+			// When the pull-up engaged, the S5a pre-DP arm is skipped —
+			// its pinned-spine route is the legacy answer to the same
+			// problem this replaces.
+			if jointree {
+				if f, okf := node.(*Filter); okf {
+					ctx.jtPullup = pullUpSublinksIntoJointree(f.Predicate, ctx, cat, plannerSet)
+				}
+			}
+			if unnestPreDPEnabled() && ctx.jtPullup == nil && whereQual != nil && whereEligibleForPreDPUnnest(pred) {
 				// S5a (D3.1): pull up sublinks BEFORE join-order
 				// search — matching upstream's pull_up_sublinks-
 				// before-join-planning order — then run the join

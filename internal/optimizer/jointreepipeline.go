@@ -31,14 +31,15 @@ func jointreePipelineFromEnv(v string) bool { return v == "1" }
 // CTE body and set-op branch re-enters here, the way PG's subquery_planner
 // recurses per Query.
 //
-// M0145-0002 is the measurement harness only. Until M0145-0003 lands the
-// jointree IR and pull-up (docs/design/0100-0149/
-// m0145-0001-jointree-ir-and-lowering-contract.md), the entry delegates to
-// the legacy pipeline, so a GOOPG_JOINTREE_PIPELINE=1 capture is a
-// byte-for-byte A/A baseline proving the harness itself measures no
-// movement. Stages land in order: 0003 sublink pull-up, 0004 appendrel,
+// The pipeline shares planSelectImpl's statement body with the legacy
+// arm and diverges only at the M0145 stage sites. M0145-0003 landed the
+// first: the WHERE arm runs pullUpSublinksIntoJointree
+// (jointreepullup.go) — PG's pull_up_sublinks — so EXISTS/NOT-EXISTS
+// bodies with flat jointrees enter the join-order problem as leaf
+// entries + SpecialJoinInfo instead of the chain-splice's synthetic
+// links. Stages land in order: 0003 sublink pull-up, 0004 appendrel,
 // 0005 single-pass DP, 0006 upper-rel pathlists, 0007 unified lowering;
 // the knob retires at 0008.
 func planSelectJointreePipeline(s *parser.SelectStmt, cat catalog.Catalog, plannerSet PlannerSettings, scope *rtableScope) (Node, error) {
-	return planSelectLegacyPipeline(s, cat, plannerSet, scope)
+	return planSelectImpl(s, cat, plannerSet, scope, true)
 }

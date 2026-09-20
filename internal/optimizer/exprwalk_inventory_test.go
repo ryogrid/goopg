@@ -151,6 +151,20 @@ var exprSwitchInventory = map[string]walkerRole{
 	// function. Same demoted shape as commits 1, 2, 5 and 6's producer half.
 	// RC-1a class 45 -> 44.
 	"joinlayout.go:visitColumnRefsByName": nonRecursiveClassifier, // moved from bushy.go at M0127-P6.3 (rename only)
+	// Added by M0145-0003. Both are built on the exprwalk drivers —
+	// rebasePulledQual's dispatch lives inside the cloneExprRefs
+	// Rewrite closure (rebase *ColumnRef / convert or veto
+	// *OuterColumnRef; an unenumerated type aborts the clone, so it is
+	// fail-closed), exprListHasLocalAndLevel1Ref's inside the
+	// walkExprRefs Visit closure (collect *ColumnRef presence and
+	// Level-1 *OuterColumnRef presence; OnUnknown aborts the walk and
+	// the conjunct reads as not spanning-capable — a decline, never a
+	// wrong pull-up). The census attributes both closures' switches to
+	// their enclosing functions — the same demoted shape as
+	// upper_narrow_gate.go:remapExprIndices and
+	// local_filters.go:conjunctIsLocalEligible.
+	"jointreepullup.go:rebasePulledQual":             nonRecursiveClassifier,
+	"jointreepullup.go:exprListHasLocalAndLevel1Ref": nonRecursiveClassifier,
 	// Added by M0127-P5.5-e-i. Built on cloneExprRefs (which carries both the
 	// recursion and the exhaustiveness); what the census sees is the
 	// three-arm dispatch inside the Rewrite closure — renumber *ColumnRef,

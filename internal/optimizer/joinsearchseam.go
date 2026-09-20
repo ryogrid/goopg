@@ -315,6 +315,20 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 		traceSeamDecline("chain-not-flattenable", nrels, len(scans))
 		return node, pred, false
 	}
+	// M0145-0003: the jointree pipeline's pulled sublink bodies enter the
+	// problem HERE — appended after every walk-derived leaf, as semi/anti
+	// links built from the retained `.Subquery` parse trees rather than
+	// decomposed from a chain (jointreepullup.go). The append is before
+	// the synthetic-leaf accounting below so the pulled leaves take part
+	// in the same tail-order, offset-agreement and leaf-count checks the
+	// walk-derived leaves do. On the legacy pipeline ctx.jtPullup is
+	// always nil and this is a no-op.
+	if ctx.jtPullup != nil {
+		if !integratePulledSublinks(ctx.jtPullup, nprefix, ctx, &scans, &widths, &semiAnti) {
+			traceSeamDecline("pullup-integrate", nrels, len(scans))
+			return node, pred, false
+		}
+	}
 	// §31.3 item 1 (design doc §31): with synthetic (Semi/Anti RHS) leaves
 	// mixed into `scans`, the leaf count is real-FROM-items-plus-synthetic,
 	// not just real-FROM-items — `nprefix` itself stays unchanged, since a
@@ -495,18 +509,24 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 	// `p` and evaluate it BELOW `t LEFT JOIN p`, keeping rows that must be
 	// dropped. That is the finding-1 shape and it is load-bearing, not a
 	// follow-up.
+	// M0145-0003: pulled sublink conjuncts never reach this pool — their
+	// semantics live in the semi/anti links `integratePulledSublinks`
+	// appended above, so feeding them to the partition would evaluate
+	// the sublink a second time beside the join. On the legacy pipeline
+	// `predConjuncts` is exactly `splitAnd(pred)`.
+	predConjuncts := splitAndExcludingPulled(pred, ctx.jtPullup)
 	var conjuncts, heldAbovePrefix []Expr
 	switch {
 	case prefixNullable(spine):
-		heldAbovePrefix = splitAnd(pred)
+		heldAbovePrefix = predConjuncts
 	case len(outerLinks) == 0:
-		conjuncts = splitAnd(pred)
+		conjuncts = predConjuncts
 	default:
 		var nullable RelSet
 		for _, lk := range outerLinks {
 			nullable |= lk.nullable
 		}
-		for _, c := range splitAnd(pred) {
+		for _, c := range predConjuncts {
 			rs, attributable := relidsOfExpr(c, spans)
 			// Unattributable is DELAYED, not distributed: a conjunct whose
 			// relids the seam cannot see exactly is one it cannot prove does
@@ -724,6 +744,14 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 		// `distribute_qual_to_rels` does inside PG's pulled-up RHS.
 		conjuncts = append(conjuncts, lk.bodyQuals...)
 	}
+	// M0145-0003: hoisted outer-local quals from pulled bodies join the
+	// pool here — the partition lands them on the emitting leaves they
+	// read, exactly like a WHERE conjunct of the parent itself. Already
+	// in problem space (buildPulledSemiAntiLink rebased them), so no
+	// remap. Only ever populated under a SEMI link.
+	if ctx.jtPullup != nil {
+		conjuncts = append(conjuncts, ctx.jtPullup.outerQuals...)
+	}
 	searchConjuncts, locals := partitionConjunctsForJoinPlanning(conjuncts, spans)
 	// M0142-0008a-3i-plumbing-c2 (design doc §36, gaps 2-3): `leaves`/
 	// `relInfos`/the bindings handed to the search all grow from `nprefix` to
@@ -921,7 +949,13 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 		outputColsKnown: ctx.outputColsKnown,
 		spineAbove:      len(spine) > 0,
 		pinAbove:        ctx.pinAbove,
-		corrAbove:       exprHasOuterRef(pred) || exprHasOuterRefList(chainOnQualPreds(onQuals)),
+		// M0145-0003: the correlation check reads the POOLED conjuncts,
+		// not `pred` — on the jointree arm the pulled sublinks' rebased
+		// quals (which may still carry outer refs above this scope)
+		// live in `conjuncts`/`heldAbovePrefix`, while the consumed
+		// sublink exprs themselves stay in `pred` and must not count.
+		corrAbove: exprHasOuterRefList(append(append([]Expr{}, conjuncts...), heldAbovePrefix...)) ||
+			exprHasOuterRefList(chainOnQualPreds(onQuals)),
 		// joinInfoList is root->join_info_list from jointree deconstruction,
 		// consumed by join_is_legal/joinOrderRestricted/hasJoinRestriction
 		// inside the search (M0128-P1.2).

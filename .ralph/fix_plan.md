@@ -1329,6 +1329,66 @@ heuristic stays live.)
     nightly reproduces "process exited early" on a post-0010 sha without
     concurrent mem_guard kills.
 
+### Nightly run 20260921-000212 (sha `cafc521a3151`, 17 items) — filed 2026-09-21
+- [ ] **units/internal/utils/activity/stats
+  TestCounter_PerShardWriteDistribution (AI-20260921-000212-001)** —
+  units suite FAIL: "only 1 shards received Adds; per-P sharding looks
+  broken" (counter_test.go:105, 0.00s). First-seen tonight; could be a
+  scheduling-sensitive flake (per-P shard distribution depends on
+  goroutine-to-P mapping) or a real stats-counter regression. Repro:
+  `go test -timeout 10m ./internal/utils/activity/stats/`; evidence
+  `ci/logs/20260921-000212/units/go-test.log`.
+  Kind: test-fix
+  Parent: none
+- [ ] **testport/TestPort_Isolation* output diffs (AI-20260921-000212-002,
+  -003)** — two isolation TAP cases FAILed on expected-output drift:
+  EvalPlanQual L1059 expected `1|newTableAValue|(1,tableBValue)` got
+  `1|tableAValue|(1,tableBValue)` (24.56s — a real value-content diff,
+  not a line-count drift; EvalPlanQual was previously CLOSED Loop \#23
+  on an older signature, so this is a re-regression with a different
+  defect shape); ReceiptReport "expected 4215 lines, got 4216" (6.99s).
+  Repro: `go test -v -run '^TestPort_Isolation(EvalPlanQual|ReceiptReport)$'
+  ./internal/testport/`; evidence `ci/logs/20260921-000212/testport/go-test.log`.
+  Kind: test-fix
+  Parent: none
+- [ ] **testport/TestPort_PgAmcheck003* re-CREATE EXTENSION after restart
+  (AI-20260921-000212-004 … -007)** — four pg_amcheck cases FAILed on the
+  same signature at ~1.0-1.4s each: `re-CREATE EXTENSION amcheck after
+  restart: pq: extension "amcheck" already exists (42710)`
+  (CombinedCorruption, MissingHeapFile, MissingIndexFork, SchemaScoped).
+  The corruption is applied, the server restarts, and the test's plain
+  `CREATE EXTENSION amcheck` now hits 42710 — i.e. the extension row
+  survives the restart (per-DB catalog persistence landed since the
+  tests were written) and the test setup was written against a
+  non-persistent extension. Likely fix: `CREATE EXTENSION IF NOT EXISTS`
+  or a DROP in the fixture. Repro: `go test -v -run
+  '^TestPort_PgAmcheck003CombinedCorruption$' ./internal/testport/`;
+  evidence `ci/logs/20260921-000212/testport/go-test.log`.
+  Kind: test-fix
+  Parent: none
+- [ ] **testport/TestPort_PgoutputInterop* subscriber/publisher-start
+  failures, second sighting (AI-20260921-000212-008 … -017)** — the same
+  ten pgoutput interop cases as the CLOSED Loop \#26 task FAILed again
+  with the same signature: "publisher/subscriber start: start failed;
+  process exited early" at ~2.1-2.7s each (GoopgToPG, FullDML, BatchDML,
+  ReplicaIdentityFull, Truncate, ColumnOrderMismatch,
+  SubscriberExtraColumn, SubscriberExtraDefault, PgbenchInsert,
+  PgbenchTpcb). **The closed task's re-open condition is met**: sha
+  `cafc521a3` is post-005626, the testport stage ran 00:02:31-00:21:54
+  and `~/.ralph/logs/mem_guard.log` shows NO PRESSURE kills inside that
+  window (last kills 2026-09-20 23:12/23:14, ~50 min earlier), and no
+  concurrent Ralph gate ran during the stage. Two consecutive nights of
+  the identical 10-case signature now argues for a real start-path
+  defect (fixture race or a cafc521a3-family regression — the M0142
+  route-a optimizer commits landed between the two sightings) rather
+  than env pressure. Repro: `go test -v -run
+  '^TestPort_PgoutputInteropPGToGoopgFullDML$' ./internal/testport/`;
+  evidence `ci/logs/20260921-000212/testport/go-test.log` (each FAIL
+  names its `tmp/nightly-src-20260921-000212/tmp/pg2g-*/cluster.log` —
+  read those BEFORE the worktree is cleaned).
+  Kind: test-fix
+  Parent: none
+
 ### Manually discovered (not yet in a nightly `ci/logs/action-items.md` run) — filed 2026-09-15
 - [x] **parser/TestLockingClauseParity** — deterministic FAIL, found while
   running the M0137-0001 pre-commit gate (`RALPH_PRECOMMIT_SCOPE=units
@@ -12398,6 +12458,47 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
   arithmetic, do not carry today's shortfall over.
   Kind: impl
   Parent: M0145-0001
+  - **Flat-body arm landed this loop** (design:
+    `docs/design/0100-0149/m0145-0003-sublink-pullup-into-jointree.md`).
+    `jointreepullup.go` ports `convert_EXISTS_sublink_to_join`'s gates
+    and binds the body via a provisional `planFromClause` +
+    `resolveExpr` on the retained `.Subquery`; `integratePulledSublinks`
+    inside `tryPGShapedJoinSearch` appends the body leaves at problem
+    tail positions and emits `semiAntiChainLink`+`SpecialJoinInfo`, so
+    the whole problem tail runs unchanged. `pulled` marks are
+    pointer-keyed and inert outside the seam — every decline returns
+    the exact legacy shape. `NOT EXISTS`'s `UnaryOp(OpNot,…)` spelling
+    flips to ANTI per the unnest.go:4516 convention.
+  - Learnings:
+    - `NOT EXISTS` binds as `UnaryOp(OpNot, ExistsExpr{Negated:false})`,
+      not `Negated:true` — the parser's canonical spelling; the
+      pull-up must recognise both conjunct shapes.
+    - `exprListHasLocalAndLevel1Ref` (a conjunct reading a body-local
+      column AND a level-1 parent ref) is the pull-up-time proxy for
+      "a spanning conjunct exists" — without it `pulled` would mark
+      bodies the seam declines anyway and wrongly suppress the pre-DP
+      arm for sibling sublinks.
+    - Outer-local quals hoist under SEMI (they filter the same rows
+      the semijoin keeps) but have no legal slot under ANTI — the link
+      has no join-clause-only qual channel, so they decline (ledgered).
+    - P0-H11's span round-trip is closed by construction: pulled leaf
+      walk-order-flat and out-of-band bases coincide
+      (`sum(widths[:pos])`), and `allSpans` uses `buildLeafSpans`'s
+      own cumulative rule — attribution is pinned against
+      `buildLeafSpans` output in the white-box test.
+  - Evidence (knob arm, `tmp/jtcap-m3/`): SF0.25 A/B 91/99 identical;
+    the only 5 shape diffs are Q10/Q16/Q35/Q69/Q94 — the named
+    witnesses; vs-PG `D1-sublink` 8→6 (D3 +2 as those queries advance
+    to their next divergence stage); TPC-H `match=22 shapediff=0`
+    (fully inert — legacy already produced the semijoin). Gates:
+    units + exprwalk census PASS, tpch-spotcheck PASS (Q12=2 Q13=33),
+    SF0.25 sweep PASS (`MISMATCH=0`, plans `same=99`), acceptance arm
+    24/24 value-MATCH.
+  - Still open (ledgered): the **opaque-body arm** (non-flat bodies as
+    semi/anti citizens carrying their planned Node — needs param-exec
+    machinery inside the problem); `IN`/`NOT IN` pull-up
+    (`convert_ANY_sublink_to_join` — hashed-subplan mechanism);
+    outer-local-only correlation; ANTI outer-local quals.
 - [ ] **M0145-0004 — UNION ALL flattening to an appendrel jointree entry**
   (`pull_up_simple_union_all` analogue, prepjointree.c:1617). Absorbs
   M0144-0003b's residual: the branches whose subtree never reached the
