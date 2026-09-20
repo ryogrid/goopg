@@ -11011,13 +11011,29 @@ goopg's processing route diverged from PG's upstream of the fix).
   `analysis/m0144/m0144-0005-debug-plan-candidates.md`.
   Kind: impl
   Parent: none
-- [ ] **M0144-0006 — instrumented PG, instrument 3: `-finstrument-functions`
+- [x] **M0144-0006 — instrumented PG, instrument 3: `-finstrument-functions`
   call-graph build** (03-forward-plan §3). Same private setup; the trace
   answers "which route through the planner did this query take"
   (`make_one_rel` DP search / `join_search_one_level` ordering /
   `create_unique_path` / degenerate path) for each divergent query — the
   PG-side input to M0144-0003's route-diff table and the audit-scope namer
   for vertical slices.
+  Done: `-finstrument-functions` via `CFLAGS +=` in the five
+  `src/backend/optimizer/` subdir Makefiles; hooks +
+  `debug_plan_callgraph` GUC in new `optimizer/util/calltrace.c`
+  (`no_instrument_function`, no-alloc, buffered stdout — same channel as
+  pprint/PLANCAND). `CGT e/x` raw this_fn addrs resolved offline via `nm`
+  (`CGT base` PIE anchor on `&standard_planner`); `CGT tag` arg markers at
+  `make_rel_from_joinlist` (levels + degenerate/hook/geqo/standard route),
+  `join_search_one_level` (level + lower relids), `make_join_rel`
+  (joinrel/outer/inner relids + jt + illegal). Verified: off emits zero;
+  Q7 shape preserved; all 13 slices e/x-balanced. 12-query captures →
+  `analysis/m0144/optdebug-0006/` via `scripts/pg-calltrace-distill.py`.
+  Gotchas recorded: `.SECONDARY:` means deleted .o never rebuild as
+  prereqs (name .o targets explicitly); Makefile `CFLAGS +=` does not
+  retrigger compiles; GCC clones extern leaf fns into instrumented TUs.
+  `docs/design/0100-0149/m0144-0006-callgraph-build.md`;
+  `analysis/m0144/m0144-0006-callgraph-build.md`.
   Kind: impl
   Parent: none
 - [ ] **M0144-0007 — cost-margin census** (03-forward-plan §2). For each
