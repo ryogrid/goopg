@@ -1,53 +1,70 @@
-Task: M0142-0008a-3i-route-a — STEP 1 LANDED (inert). Step 2 (the flattening
-  splice) is the remaining work; the task stays open.
-Files: internal/optimizer/plan.go (ExistsExpr.Subquery, InExpr.Subquery),
-  planner.go (:15306 IN, :15338 EXISTS assignments; :16834/:17072 copy sites),
-  foldconst.go:69 (rebuild site — was the bug), exists_to_any.go:384
-  (deliberately nil), sublinkpullup.go (NEW), sublinkpullup_test.go (NEW),
-  docs/design/0100-0149/m0142-0008a-3i-route-a-retain-sublink-parse-tree.md
-Key symbols: sublinkBodyIsSimple, selectListOrQualHasAggOrWindow,
-  isAggregateFuncName (planner.go:9662), walkExpr (:9597),
-  planExistsExpr/planInExpr, unnestSubqueriesInPlan (step 2's site),
-  FoldConstants.
+Task: M0142-0008a-3i-route-a — BOTH STEPS LANDED 2026-09-20. Step 2 (the
+  flattening splice) landed in plan-level form: `Join.FlattenedRHS` +
+  seam-side decomposition of a simple planned body into real-costed
+  synthetic leaves. Task marked [x]; residuals deferred (below).
+Files: internal/optimizer/plan.go (ExistsExpr.Subquery, InExpr.Subquery,
+  Join.FlattenedRHS), planner.go (:15306 IN, :15338 EXISTS assignments;
+  :16834/:17072 copy sites), foldconst.go:69, exists_to_any.go:384
+  (deliberately nil), sublinkpullup.go (sublinkBodyIsSimple,
+  decomposeFlatBodyTree, flatBodyScopeProject, schemaIsLeafConcat,
+  exprHasSublinkPlan via ExprSubplans), unnest.go (three flatten arms +
+  IsolatedScope identity re-wrap), joinsearchseam.go (admitSemiAnti walk,
+  bodyQuals, multi-bit rhs, realWidth, leafSpans, semianti-not-tail gate),
+  relfromjoinlist.go (joinlistProblem.leafSpans, leafSpanWindow),
+  joinrestrict.go (comment), flattened_rhs_test.go (NEW),
+  sublinkpullup_test.go, relfromjoinlist_test.go, considerparallel_test.go,
+  gatherpaths_test.go, narrowcostinputs_test.go (leafSpans consumers),
+  docs/design/0100-0149/m0142-0008a-3i-route-a-retain-sublink-parse-tree.md,
+  analysis/m0142/m0142-0008a-3i-route-a-step2-census.txt
+Key symbols: sublinkBodyIsSimple, decomposeFlatBodyTree, Join.FlattenedRHS,
+  extractSearchLeaves(admitSemiAnti), semiAntiChainLink.bodyQuals/flattened,
+  leafSpan, leafSpanWindow, flatBodyScopeProject, projectIsPositionalIdentity,
+  ExprSubplans, leafRangeRelSet.
 Hypothesis/Findings:
-  - Step 1 lands the two prerequisites the route needed and NOTHING else:
-    the parse tree is retained (it was consumed by planSelectWithParent and
-    dropped, so there was nothing to flatten), and `sublinkBodyIsSimple`
-    ports `is_simple_subquery` (prepjointree.c:1807) refusal-for-refusal.
-  - **The retention test caught a real sibling-drift bug.** `FoldConstants`
-    (foldconst.go:69) REBUILDS an `InExpr` field by field and silently
-    dropped the new field — EXISTS passed while IN failed. Three copy sites
-    now carry it; `exists_to_any.go:384` deliberately does not (it REWRITES
-    rather than copies, so nil is the fail-closed answer). Write the test to
-    compare POINTERS: a shape comparison would have passed a re-parse.
-  - Verified the retention test FAILS with the two resolver assignments
-    removed, before claiming it pins anything.
-  - **Port gap recorded, not hidden**: `hasTargetSRFs` is NOT implemented —
-    classifying a function as set-returning needs the catalog this predicate
-    does not take, so an SRF-in-target-list body is currently ACCEPTED.
-    Step 2 must take a catalog argument or refuse unclassifiable FuncCalls;
-    it must NOT inherit today's answer. `security_barrier`/`lateral` arms
-    are safe-by-construction for qual sublinks, not merely unported.
-  - Inert by construction: zero production readers. Gates run anyway —
-    "provably inert" is a claim to be checked, not a reason to skip.
-  - TRAP (again): gate stamps hash the STAGED tree. The acceptance arm needs
-    a fresh BASE arm built from the unmodified tree — copy the changed files
-    aside, `git checkout HEAD --` them, run the base arm, restore, re-`git
-    add`, then run with ACCEPT_BASELINE. `git checkout HEAD --` clobbers the
-    INDEX too, so re-staging is mandatory or the stamp reads FAIL.
-Next step: **step 2 — the flattening splice.** In `unnestSubqueriesInPlan`,
-  test a retained body with `sublinkBodyIsSimple` and, when accepted, splice
-  its FROM items into the outer join list as REAL relations with its quals
-  merged into the outer predicate, discarding `.Plan`. Obligations already on
-  the task: give the predicate a catalog (SRF arm) FIRST; re-derive the leaf
-  arithmetic rather than carrying today's `Q16 nrels=4 nprefix=4 scans=3`;
-  close the P0-H11 `cumulativeFromSpans` round-trip in the SAME change; keep
-  Q78's `outer-over-derived` firewall intact; re-base `OuterColumnRef{Level:1}`
-  correlation refs into the outer chain's column space.
+  - The filed "splice FROM items before planning" framing is unreachable
+    without the M0145 IR: goopg plans bodies eagerly at expression
+    resolution. What landed is the plan-level equivalent — the SEAM
+    decomposes a marked simple body back into base-relation leaves, so
+    the search sees real relations instead of one opaque synthetic leaf.
+  - decomposeFlatBodyTree accepts SeqScan/Filter/Inner|Cross/identity
+    Project; LeafLocal filters only directly over a bare *SeqScan (there
+    leaf-local == subtree concat space, so the same +base shift lifts).
+    Output must equal leaf-concat exactly or coordinates can't be trusted.
+  - IN arms re-wrap the stripped body in a positional-identity
+    IsolatedScope Project — restores M0063/M0071 NLI/pushdown protection
+    STRUCTURALLY (pickInnerSide needs a bare *SeqScan). EXISTS bodies
+    keep bare-body NLI eligibility (M0063-0004) — do NOT gate NLI on
+    FlattenedRHS.
+  - P0-H11 closed: cumOffsets []int could not carry out-of-band synthetic
+    spans; leafSpans []leafSpan does. leafSpanWindow admits a boundary
+    only over a contiguous span union.
+  - NEW DECLINE semianti-not-tail: c2's construction needs every synthetic
+    leaf in a TAIL slot; a mid-chain demoted ANTI (Q78: web_sales ANTI
+    web_returns JOIN date_dim) walks [real,synthetic,real] and panicked
+    translateToLayout (binding col 75 vs 7-col layout). Now an explicit
+    decline → fallback marker join; Q78 green (15 rows, oracle ck). Unit
+    regression: TestSeamDeclinesRealLeafAfterSyntheticLeaf.
+  - exprHasSublinkPlan must flag ANY planned sublink (OuterColumnRef coords
+    die under flattening); implemented on ExprSubplans/exprChildSlots so
+    plain IN (a,b,c) lists stay flattenable.
+  - Movement measured NONE on SF0.25: leaf-count still 26 (remaining
+    declines all have a SECOND undecomposable member — *Project
+    composites/NLI/Gather/CTEScan, the M0144-0003a census set);
+    semianti-not-tail×3 is a new conversion class on Q78's chain; plan
+    diffs on Q33/Q56/Q60/Q83 are qualifier-only (item_1.i_manufact_id).
+  - TRAP (again): gate stamps hash the STAGED tree. bench/tpcds/server.sh
+    stop is guard-blocked; stop the private sf025 goopg with
+    `goopg stop -D bench/tpcds/runtime_goopg/data-sf025`.
+Next step: none for this task. Deferred: arbitrary synthetic-leaf
+  placement (real leaf after synthetic — needs leaf reorder + relset
+  remap + create-plan coordinate translation); hasTargetSRFs narrowing
+  (shared built-in SRF registry with isNestedSRFName). Both in the
+  deferral ledger. M0145-0003 jointree-first is the residual's real shape.
   Do NOT touch M0144-0011 ([!]), M0137-0019a ([!]), M0142-0005 ([!]).
-Gates run: units PASS (exit 0, 0 FAIL); tpch-spotcheck PASS (Q12=2 Q13=33);
-  tpcds-sf025 sweep PASS (PASS=96 MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0
-  SKIP=3; plan channel same=99 changed=0; verdict-changes=none);
-  tpch-acceptance-arm PASS (24/24 on VALUES vs a fresh same-loop base arm);
-  go vet clean; pgbench smoke via the commit hook.
+Gates run: units PASS (exit 0, 0 FAIL); internal/optimizer PASS;
+  tpch-spotcheck PASS (Q12=2 Q13=33); tpcds-sf025 sweep PASS (PASS=96
+  MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0 SKIP=3; Q78 15 rows
+  ck=c06cf981a7819a37 oracle-verified; plan channel vs baseline
+  changed=4 qualifier-only); DP_TRACE census captured (evidence file
+  above); go vet clean; pgbench smoke via the commit hook.
 In-flight: none.

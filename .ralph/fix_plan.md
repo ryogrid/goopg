@@ -7238,7 +7238,7 @@ cross-layer programme that has never been scoped.
           (`prepjointree.c:1807`) in full, so the flattenable subset covers
           100% of the named witnesses.
         - Route filed as **M0142-0008a-3i-route-a** below.
-    - [ ] **M0142-0008a-3i-route-a — retain the parser subquery on
+    - [x] **M0142-0008a-3i-route-a — retain the parser subquery on
       `ExistsExpr`/`InExpr`, then flatten a simple body before planning it**
       (filed by `M0142-0008a-3i-lateral-route`'s recon; goopg's
       `pull_up_subqueries` analogue).
@@ -7309,8 +7309,47 @@ cross-layer programme that has never been scoped.
           `same=99 changed=0`; verdict-changes=none); tpch-acceptance-arm
           PASS (24/24 on VALUES vs a fresh same-loop baseline arm built from
           the unmodified tree).
-        - **Step 2 (the flattening splice) is the remaining work** and the
-          task stays open for it.
+        - **STEP 2 LANDED 2026-09-20 — the flattening splice, plan-level
+          form.** The filed "splice FROM items before planning" framing is
+          unreachable without the M0145 IR (bodies are planned eagerly at
+          expression resolution); what landed is the equivalent at the
+          seam — `Join.FlattenedRHS` marks a Semi/Anti join whose retained
+          body passed `sublinkBodyIsSimple` AND whose planned RHS passed
+          `decomposeFlatBodyTree`, and `extractSearchLeaves` decomposes it
+          into one REAL-costed synthetic leaf per body relation (multi-bit
+          `rhs`, pooled `bodyQuals`, `SpecialJoinInfo` preserved,
+          out-of-band `leafSpans`). IN arms re-wrap the stripped body in a
+          positional-identity `IsolatedScope` `Project`, restoring the
+          M0063/M0071 NLI protection structurally; EXISTS keeps its
+          bare-body NLI eligibility. P0-H11 closed in the same change:
+          `joinlistProblem.cumOffsets` → `leafSpans`, `cumulativeFromSpans`
+          deleted, `leafSpanWindow` gates boundary windows on real
+          contiguity.
+        - **Newly exposed + fixed: `semianti-not-tail`.** Admitting
+          flattened RHS leaves surfaced a latent c2 assumption — every
+          synthetic leaf must occupy a TAIL slot — that Q78's mid-chain
+          demoted ANTI (`web_sales ANTI web_returns JOIN date_dim`,
+          walking `[real, synthetic, real]`) violated into a
+          `translateToLayout` panic (`binding column 75 ... not among the
+          7 output columns`). Now an explicit decline; Q78 back to PASS
+          15 rows ck=c06cf981a7819a37. Arbitrary synthetic-leaf placement
+          is deferred to the ledger — real work (leaf reorder + relset
+          remap), not a guard to relax.
+        - **Movement: measured NONE on the SF0.25 corpus** (evidence:
+          `analysis/m0142/m0142-0008a-3i-route-a-step2-census.txt`).
+          `leaf-count` is unchanged at 26 — flattening is active
+          (`nleaves>nrels` records) but every still-declining chain has a
+          SECOND undecomposable member (`*Project` composites, NLI,
+          `*Gather`, `*CTEScan` — M0144-0003a's own census finding), so no
+          `problem rels=` line carries a flattened RHS leaf. Plan channel
+          vs baseline `changed=4` (Q33/Q56/Q60/Q83) — qualifier-only
+          diffs (`item_1.i_manufact_id`), same shapes and costs.
+          `semianti-not-tail`×3 is a new conversion class on Q78's chain.
+          The residual is M0145-shaped: the remaining declines are not
+          sublink bodies and only jointree-first planning reaches them.
+        - Gates: units PASS; tpch-spotcheck PASS (Q12=2 Q13=33);
+          tpcds-sf025 sweep PASS (`PASS=96 MISMATCH=0 CKMISMATCH=0
+          ERROR=0 TIMEOUT=0 SKIP=3`; Q78 oracle-verified); vet clean.
     - **P0-H11 audit finding (2026-09-20, Loop \#32):** the leaf-admission
       increment must also fix `cumulativeFromSpans`'s span round-trip
       (`joinsearchseam.go` `cumulativeFromSpans` → `joinlistProblem.cumOffsets`

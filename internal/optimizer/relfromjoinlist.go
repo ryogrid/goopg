@@ -46,7 +46,7 @@ package optimizer
 // # Which clauses each problem sees
 //
 // Each problem builds its own clause list from the statement's conjuncts with
-// its OWN `cumOffsets` — one entry per joinlist ITEM, not per FROM item
+// its OWN `itemSpans` — one entry per joinlist ITEM, not per FROM item
 // (`searchOneProblem`). That single substitution does all the placement work,
 // because `relidsOfExpr` (joinrestrict.go:334) already answers "which items does
 // this expression touch" and declines the expression outright when a column
@@ -93,10 +93,13 @@ type joinlistProblem struct {
 	// coordinates. Every problem filters it for itself; see the file header.
 	conjuncts []Expr
 
-	// cumOffsets[i] is FROM item i's first binding coordinate, with a
-	// terminating entry for the total width — the coordinate space
-	// `relidsOfExpr` and `baseOffset` are both written in.
-	cumOffsets []int
+	// leafSpans[i] is FROM item i's [lo,hi) binding-coordinate window —
+	// the coordinate space `relidsOfExpr` and `baseOffset` are both
+	// written in. One entry per FROM item: the leaf's own span, not an
+	// inference from the next leaf's lo, so a NON-CONTIGUOUS span space
+	// — buildLeafSpans's out-of-band synthetic (Semi/Anti RHS) leaves —
+	// keeps each leaf's true window (P0-H11).
+	leafSpans []leafSpan
 
 	cp  costParams
 	cat catalog.Catalog
@@ -255,14 +258,14 @@ func validateJoinlistProblem(jl joinlist, prob *joinlistProblem) error {
 		return fmt.Errorf("join search: %d bindings but %d scans and %d rel infos",
 			n, len(prob.scans), len(prob.relInfos))
 	}
-	if len(prob.cumOffsets) != n+1 {
-		return fmt.Errorf("join search: %d FROM items need %d cumulative offsets, got %d",
-			n, n+1, len(prob.cumOffsets))
+	if len(prob.leafSpans) != n {
+		return fmt.Errorf("join search: %d FROM items need %d leaf spans, got %d",
+			n, n, len(prob.leafSpans))
 	}
-	for i := 1; i < len(prob.cumOffsets); i++ {
-		if prob.cumOffsets[i] <= prob.cumOffsets[i-1] {
-			return fmt.Errorf("join search: cumulative offsets are not ascending at item %d (%d after %d)",
-				i, prob.cumOffsets[i], prob.cumOffsets[i-1])
+	for i, sp := range prob.leafSpans {
+		if sp.lo < 0 || sp.hi <= sp.lo {
+			return fmt.Errorf("join search: leaf %d has invalid binding-coordinate span [%d,%d)",
+				i, sp.lo, sp.hi)
 		}
 	}
 	// The joinlist must be a partition of the FROM items into contiguous runs,
@@ -615,26 +618,74 @@ func problemPairsOuterWithDerived(sjis []*SpecialJoinInfo, items []joinlistRel, 
 	return false
 }
 
+// leafSpanWindow returns the single [lo,hi) binding-coordinate window the
+// leaf range [lo,hi) covers, and whether that coverage is a contiguous
+// TILING — every member span disjoint and the union gap-free. The second
+// return is what keeps a mixed real+synthetic range from being misread as
+// one window: buildLeafSpans places synthetic (Semi/Anti RHS) leaves
+// out-of-band after the total real width, so a range that contains a
+// synthetic leaf and omits a real one has a HOLE no single window
+// expresses (P0-H11). Callers decline rather than publish a window that
+// would swallow a non-member leaf's columns.
+func leafSpanWindow(spans []leafSpan, lo, hi int) (leafSpan, bool) {
+	if lo < 0 || hi > len(spans) || lo >= hi {
+		return leafSpan{}, false
+	}
+	base := spans[lo].lo
+	end := spans[lo].hi
+	for i := lo + 1; i < hi; i++ {
+		sp := spans[i]
+		if sp.lo < base {
+			base = sp.lo
+		}
+		if sp.hi > end {
+			end = sp.hi
+		}
+	}
+	covered := 0
+	for i := lo; i < hi; i++ {
+		covered += spans[i].hi - spans[i].lo
+	}
+	if covered != end-base {
+		return leafSpan{}, false
+	}
+	return leafSpan{lo: base, hi: end}, true
+}
+
 // before `joinSearch` compares anything.
 func (prob *joinlistProblem) searchOneProblem(items []joinlistRel, tupleFraction float64) (joinlistRel, error) {
 	lo, hi := items[0].lo, items[len(items)-1].hi
-	base := prob.cumOffsets[lo]
-	width := prob.cumOffsets[hi] - base
-
+	// One entry per ITEM: the coordinate space this problem's clause list is
+	// resolved in (file header). A column outside every item's span resolves
+	// to no item and its clause is declined here — which is how a clause
+	// reaching out of a sub-problem ends up placed by the enclosing one.
+	// Each item's window is the tiling of ITS leaves' spans — contiguous for
+	// every shape reachable today (a sub-joinlist range covers only real
+	// leaves, whose spans are in-band and contiguous; a synthetic Semi/Anti
+	// RHS leaf is always a single-leaf item). A mixed real+synthetic
+	// multi-leaf item would not tile a single window and declines instead
+	// of silently swallowing a neighbour leaf's columns (P0-H11).
+	window, okWindow := leafSpanWindow(prob.leafSpans, lo, hi)
+	if !okWindow {
+		return joinlistRel{}, fmt.Errorf(
+			"join search: FROM items [%d,%d) do not tile a contiguous binding-coordinate window",
+			lo, hi)
+	}
+	base, width := window.lo, window.hi-window.lo
 	bindings := make([]rangeBinding, len(items))
 	scans := make([]Node, len(items))
 	infos := make([]baseRelInfo, len(items))
-	// One entry per ITEM: the coordinate space this problem's clause list is
-	// resolved in (file header). The terminating entry is the problem's own end,
-	// so a column outside `[base, base+width)` resolves to no item and its
-	// clause is declined here — which is how a clause reaching out of a
-	// sub-problem ends up placed by the enclosing one.
-	cum := make([]int, len(items)+1)
+	itemSpans := make([]leafSpan, len(items))
 	for i, it := range items {
 		bindings[i], scans[i], infos[i] = it.binding, it.node, it.info
-		cum[i] = prob.cumOffsets[it.lo]
+		sp, okSp := leafSpanWindow(prob.leafSpans, it.lo, it.hi)
+		if !okSp {
+			return joinlistRel{}, fmt.Errorf(
+				"join search: item covering FROM items [%d,%d) does not tile a contiguous binding-coordinate window",
+				it.lo, it.hi)
+		}
+		itemSpans[i] = sp
 	}
-	cum[len(items)] = prob.cumOffsets[hi]
 
 	// C-04a fix (Q72): `root->join_info_list` is written in STATEMENT-LEAF
 	// coordinates, and this problem searches in ITEM coordinates. They are the
@@ -687,7 +738,7 @@ func (prob *joinlistProblem) searchOneProblem(items []joinlistRel, tupleFraction
 	// `addParameterizedIndexPaths` reads `s.clauses`, and `joinSearch` sets it
 	// — so the list is published here, before the producers that consume it,
 	// and handed to `joinSearch` as well rather than left implicit.
-	s.clauses = buildRestrictInfos(prob.conjuncts, 0, spansFromCumulative(cum))
+	s.clauses = buildRestrictInfos(prob.conjuncts, 0, itemSpans)
 	// C-07: `root->query_pathkeys`, published beside the clause list because
 	// `hasUsefulPathkeys` reads both.
 	s.queryPathkeys = prob.queryPathkeys
@@ -785,11 +836,12 @@ func (prob *joinlistProblem) searchOneProblem(items []joinlistRel, tupleFraction
 		// producer bugs (M0134-0187, DESIGN §21).
 		node: createPlanAtSearchRootRange(p, base, width, func(coord int) (SchemaColumn, bool) {
 			for i := range items {
-				if coord < cum[i] || coord >= cum[i+1] {
+				sp := itemSpans[i]
+				if coord < sp.lo || coord >= sp.hi {
 					continue
 				}
 				leafSchema := scans[i].Output()
-				pos := coord - cum[i]
+				pos := coord - sp.lo
 				if pos < 0 || pos >= len(leafSchema) {
 					return SchemaColumn{}, false
 				}

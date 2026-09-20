@@ -588,7 +588,7 @@ func TestNarrowJoinWidthsNarrowsANonTopJoinInALiveSearch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	sc.clauses = buildRestrictInfos(prob.conjuncts, 0, spansFromCumulative(prob.cumOffsets))
+	sc.clauses = buildRestrictInfos(prob.conjuncts, 0, prob.leafSpans)
 	sc.neededCols, sc.neededColsKnown = prob.neededCols, prob.neededColsKnown
 	sc.stampNeededColsOnRels()
 	sc.setBaseRelConsiderParallel(prob.cat)

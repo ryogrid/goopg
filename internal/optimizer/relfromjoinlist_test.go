@@ -41,12 +41,12 @@ const rfjWidth = 2
 func rfjProblem(names []string, rows []int64, conjuncts []Expr) *joinlistProblem {
 	n := len(names)
 	prob := &joinlistProblem{
-		bindings:   make([]rangeBinding, n),
-		scans:      make([]Node, n),
-		relInfos:   make([]baseRelInfo, n),
-		conjuncts:  conjuncts,
-		cumOffsets: make([]int, n+1),
-		cp:         defaultCostParams(),
+		bindings:  make([]rangeBinding, n),
+		scans:     make([]Node, n),
+		relInfos:  make([]baseRelInfo, n),
+		conjuncts: conjuncts,
+		leafSpans: make([]leafSpan, n),
+		cp:        defaultCostParams(),
 	}
 	for i, name := range names {
 		schema := cpjSchema(name, rfjWidth)
@@ -64,9 +64,8 @@ func rfjProblem(names []string, rows []int64, conjuncts []Expr) *joinlistProblem
 			baseRows:     rows[i],
 			filteredRows: rows[i],
 		}
-		prob.cumOffsets[i] = i * rfjWidth
+		prob.leafSpans[i] = leafSpan{lo: i * rfjWidth, hi: (i + 1) * rfjWidth}
 	}
-	prob.cumOffsets[n] = n * rfjWidth
 	return prob
 }
 
@@ -367,8 +366,8 @@ func TestPlanJoinlistSearchRejectsMalformedInput(t *testing.T) {
 		{"joinlist repeats a FROM item", joinlist{leafItem(0), leafItem(0)}, func(*joinlistProblem) {}},
 		{"leaves out of order", joinlist{leafItem(1), leafItem(0)}, func(*joinlistProblem) {}},
 		{"slices disagree", flat, func(p *joinlistProblem) { p.scans = p.scans[:1] }},
-		{"offsets not ascending", flat, func(p *joinlistProblem) { p.cumOffsets = []int{0, 0, 4} }},
-		{"missing terminating offset", flat, func(p *joinlistProblem) { p.cumOffsets = []int{0, 2} }},
+		{"invalid leaf span", flat, func(p *joinlistProblem) { p.leafSpans = []leafSpan{{0, 0}, {0, 4}} }},
+		{"leaf span count mismatch", flat, func(p *joinlistProblem) { p.leafSpans = []leafSpan{{0, 2}} }},
 		{"leaf without a node", flat, func(p *joinlistProblem) { p.scans[1] = nil }},
 	}
 	for _, tc := range cases {

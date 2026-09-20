@@ -1,7 +1,8 @@
 # M0142-0008a-3i-route-a step 1 — retain the sublink parse tree, and be able to classify it
 
-Status: STEP 1 LANDED 2026-09-20 (inert by construction — zero production
-readers). Step 2 (the flattening splice) not started.
+Status: LANDED 2026-09-20 — both steps. Step 1 inert by construction
+(zero production readers); step 2 is the flattening splice, movement
+measured NONE on the SF0.25 corpus (see §6).
 Kind: impl
 Parent: M0142-0008a-3
 Movement: none
@@ -115,13 +116,108 @@ how the claim is checked, not a reason to skip them.
 
 **Movement: none**, and none was available: nothing reads what was added.
 
-## 5. Step 2, unchanged
+## 5. Step 2 — what landed (2026-09-20)
 
-Teach `unnestSubqueriesInPlan` to test a retained body with
-`sublinkBodyIsSimple` and, when it passes, splice the body's FROM items into
-the outer join list as REAL relations with its quals merged into the outer
-predicate — discarding `.Plan` for that sublink — so the search that follows
-sees base relations. The obligations already on the task stand: re-derive the
-leaf arithmetic rather than carrying today's numbers, close the P0-H11
-`cumulativeFromSpans` span round-trip in the same change, keep Q78's
-`outer-over-derived` firewall intact, and re-base the correlation references.
+The splice took a different shape than the task's filed framing —
+"splice the body's FROM items into the outer join list as REAL
+relations ... discarding `.Plan`" — and the difference is load-bearing:
+goopg plans sublink bodies EAGERLY at expression-resolution time, so
+there is no unplanned body left to splice before planning; pulling
+planning itself earlier is the M0145 IR's job. What step 2 does instead
+is the plan-level equivalent — decompose the already-planned simple body
+back into base-relation leaves at the SEAM, so the join search sees real
+relations where it used to see one opaque synthetic leaf. Same
+observational content for the search; no second planning pass, and `.Plan`
+is discarded for the search's purposes only (execution still uses it).
+
+### 5.1 The mechanism
+
+- `Join.FlattenedRHS` (`plan.go`) marks a Semi/Anti join whose retained
+  parser body passed `sublinkBodyIsSimple` AND whose planned RHS passed
+  `decomposeFlatBodyTree` (`sublinkpullup.go`). Set at the three unnest
+  sites (`unnestExistsExpr`, `unnestInExpr`, `unnestNonCorrelatedInExpr`).
+- `decomposeFlatBodyTree` walks the planned RHS (SeqScan / Filter /
+  Inner|Cross Join / positional-identity Project) into `leaves`, pooled
+  `quals`, and an optional IN comparison `target`. `LeafLocal` filters
+  are accepted only directly above a bare `*SeqScan` — there the
+  leaf-local coordinate space IS the one-leaf subtree space, so the same
+  `+base` shift lifts them. Output must equal the concatenated leaf
+  schemas exactly, or the correlation/inner reference coordinates cannot
+  be trusted and the body stays opaque.
+- `extractSearchLeaves` (`joinsearchseam.go`, `admitSemiAnti` arm)
+  decomposes a marked RHS into one synthetic leaf per body relation:
+  multi-bit `rhs` relsets, `bodyQuals` pooled alongside the link pred,
+  `SpecialJoinInfo` preserved, and each leaf costed by the REAL
+  base-relInfo path (`estimateBaseRelInfo` + catalog stats) rather than
+  the synthetic-leaf fallback.
+- IN arms re-wrap the stripped body in a positional-identity
+  `IsolatedScope` `Project` — the exact convention the body's original
+  root project carried — so the M0063/M0071 NLI/pushdown protection is
+  restored STRUCTURALLY (`pickInnerSide` needs a bare `*SeqScan` right
+  side) without a marker check in the NLI gate. EXISTS bodies keep
+  their pre-existing bare-body NLI eligibility (M0063-0004).
+- P0-H11 closed in the same change: `joinlistProblem.cumOffsets []int`
+  → `leafSpans []leafSpan` (`relfromjoinlist.go`), so synthetic
+  out-of-band ranges survive into the problem instead of being
+  re-spanned contiguously. `leafSpanWindow` admits a group as one
+  boundary only when its spans are contiguous; `cumulativeFromSpans`
+  is deleted, `spansFromCumulative` survives as a test helper.
+
+### 5.2 The new decline: `semianti-not-tail`
+
+Flattening newly ADMITTED a chain class the on-qual gates used to refuse
+first, and that admission exposed a latent construction assumption: c2's
+problem builder requires every synthetic leaf to occupy a TAIL slot
+(`scans[nprefix:]`), but a demoted mid-chain ANTI — Q78's
+`web_sales LEFT JOIN web_returns ... IS NULL JOIN date_dim` — walks as
+`[real, synthetic, real]`. Construction then binds the trailing real
+leaf as synthetic and vice versa, and a clause referencing the
+synthetic RHS column reached `translateToLayout` on a real-only layout:
+`join clause references binding column 75 (wr_order_number) ... not among
+the 7 output columns` — reproduced in a unit fixture and in production
+on Q78. Fix is the explicit tail check (`syntheticBits ==
+leafRangeRelSet(nprefix, len(scans))`), declining `semianti-not-tail` so
+the chain falls back to the marker-join plan it always produced.
+Arbitrary synthetic-leaf placement (leaf reorder + relset remap) is
+deferred to the ledger — it is real work, not a guard to relax.
+Unnest-produced Semi/Anti links are always chain-TOP, so the splice's
+own output is never declined by this gate.
+
+### 5.3 Gates
+
+| gate | result |
+|---|---|
+| `RALPH_PRECOMMIT_SCOPE=units` | PASS (exit 0) |
+| `internal/optimizer` suite | PASS — incl. new `flattened_rhs_test.go` (decompose shapes/declines, scope-project round-trip, schemaIsLeafConcat, leafSpanWindow, EXISTS single+multi, IN, NOT IN, pruned-body decline, `TestSeamDeclinesRealLeafAfterSyntheticLeaf`) |
+| `scripts/tpch-spotcheck.sh` | PASS — Q12=2, Q13=33 |
+| `scripts/tpcds-sf025-regression.sh sweep` | PASS — `PASS=96 MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0 SKIP=3`; Q78 back to PASS 15 rows ck=c06cf981a7819a37 (oracle-verified) |
+| `go vet` | clean |
+
+## 6. Step-2 movement, measured
+
+Expected per the task: the `leaf-count` decline class shrinks from 26
+across 11 queries and the five census witnesses' join-method records
+move. Measured on a fresh `GOOPG_PGSHAPED_DP_TRACE=1` SF0.25 EXPLAIN
+capture (`analysis/m0142/m0142-0008a-3i-route-a-step2-census.txt`):
+
+- `leaf-count` is **unchanged at 26**. The flattening IS active —
+  decline records carry `nleaves>nrels` (a multi-leaf decomposed RHS
+  inside `nrels=3 nleaves=6` lateral and `nrels=2 nleaves=3` leaf-count
+  records) — but no `problem rels=` line contains a flattened semi RHS
+  member: every still-declining chain has a SECOND undecomposable member
+  (`*Project` over composites, NLI, `*Gather`, `*CTEScan` — the
+  M0144-0003a census's own finding) or hits another gate first.
+- `semianti-not-tail`×3 is a NEW class — Q78's mid-chain demoted-ANTI
+  chain, declined by §5.2's check; it converts rather than removes.
+- Plan channel vs the pre-change baseline: `changed=4` (Q33/Q56/Q60/
+  Q83), every diff a column-QUALIFIER only (`i_manufact_id` →
+  `item_1.i_manufact_id`) — the flattened body's scan now names its
+  real table in the hash-cond text. Same shapes, same costs.
+
+So the honest record is: mechanism landed and exercised end-to-end in
+unit fixtures (single+multi-table EXISTS, IN, NOT IN — real leaves,
+multi-bit rhs, pooled bodyQuals, out-of-band spans), corpus-visible
+movement zero. The remaining leaf-count declines are not sublink bodies
+at all — they are the same already-planned composites M0144-0003a's
+census measured, which only the M0145 jointree-first pipeline (plan the
+FROM jointree before lowering any member) can reach.

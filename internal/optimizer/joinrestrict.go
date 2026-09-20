@@ -473,12 +473,13 @@ type leafSpan struct {
 	lo, hi int
 }
 
-// spansFromCumulative adapts a plain monotonic prefix-sum array (the shape
-// `joinlistProblem.cumOffsets` — the bushy/joinlist layer's OWN, unrelated
-// coordinate space, §26.1's "flavor 2" — has always used and keeps using) into
-// the `[]leafSpan` shape `relidsOfExpr`/`tableForCol` now share across both
-// layers. Flavor 2 has no synthetic leaves today (§26.1), so this is a pure
-// reshape with no behavior change for its callers.
+// spansFromCumulative adapts a plain monotonic prefix-sum array into the
+// `[]leafSpan` shape `relidsOfExpr`/`tableForCol` now share across both
+// layers. Its last production caller went away when P0-H11 made
+// `joinlistProblem` carry `[]leafSpan` directly (the bushy/joinlist layer's
+// own "flavor 2" coordinate space, §26.1, which has no synthetic leaves and
+// so was always contiguous); it survives as the test-fixture convenience the
+// per-leaf span tests build their contiguous tables with.
 func spansFromCumulative(cum []int) []leafSpan {
 	if len(cum) < 2 {
 		return nil

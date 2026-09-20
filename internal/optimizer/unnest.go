@@ -3420,9 +3420,54 @@ func unnestInExpr(in *InExpr, outer Node) (Node, error) {
 		SourceTableIdx: 0, // inner output column; no outer source identity
 	}
 
+	// M0142-0008a-3i-route-a step 2: when the retained parser body is
+	// simple AND the inner plan decomposes into scan leaves + body quals
+	// with a recoverable single target, the RHS flattens. The probe's
+	// right operand then is the body's TARGET expression re-based into
+	// merged (outer ++ inner) coordinates — not the positional
+	// `outerWidth + 0` column, which only names the projected output of
+	// the opaque inner plan. liftResidualConjunctsWithOffset gives the
+	// same rebase the residual quals get (inner col → outerWidth + idx,
+	// OuterColumnRef → outer column).
+	//
+	// The decompose's `body` return replaces innerPlan itself: the target
+	// Project comes off and an IsolatedScope positional-identity re-wrap
+	// (flatBodyScopeProject) goes on, so the right row the executor pads
+	// and the leaves the seam splices are the SAME leaf-concat shape —
+	// making the lifted target operand valid for the executor's RightKey
+	// AND for the seam's folded equality in one convention — while the
+	// wrapper keeps the NLI/pushdown protections the original project
+	// carried. remapSourceTableIdx then applies the EXISTS path's
+	// collision rule (M0142-0008e) to the spliced leaves; srcTableOffset
+	// stays 0 whenever flattening fails, so the residual lift below is
+	// unchanged for the opaque path.
+	var rightOperand Expr = innerKey
+	flattenedRHS := false
+	var srcTableOffset int16
+	var flatTarget Expr
+	if in.Subquery != nil && sublinkBodyIsSimple(in.Subquery) {
+		if _, _, tgt, flatBody, okFlat := decomposeFlatBodyTree(innerPlan, true); okFlat && tgt != nil {
+			off := int16(1)
+			if m := maxSourceTableIdxDeep(outerChild); m >= off {
+				off = m + 1
+			}
+			if remapped, errR := remapSourceTableIdx(flatBody, off); errR == nil {
+				if shifted := liftResidualConjunctsWithOffset([]Expr{tgt}, nil, outerChild.Output(), outerWidth, off); shifted != nil {
+					flattenedRHS = true
+					rightOperand = shifted
+					flatTarget = tgt
+					innerPlan = flatBodyScopeProject(remapped)
+					srcTableOffset = off
+				}
+			}
+		}
+	}
+
 	// Mark the root Project of the inner plan as IsolatedScope so the NLI
 	// rewriter does not convert the SemiJoin into an NLI (mirrors the
-	// non-correlated path; M0071-0002).
+	// non-correlated path; M0071-0002). The flattened arm's
+	// flatBodyScopeProject wrapper is already IsolatedScope — re-marking
+	// it is a no-op; the guard exists for the opaque path.
 	if proj, ok := innerPlan.(*Project); ok {
 		proj.IsolatedScope = true
 	}
@@ -3444,10 +3489,14 @@ func unnestInExpr(in *InExpr, outer Node) (Node, error) {
 		filter.Predicate = combineAnd(newConjuncts)
 	}
 
-	var semiPred Expr = &BinaryOp{pos: in.Pos(), Op: parser.OpEq, Left: outerKeyExpr, Right: innerKey}
+	var semiPred Expr = &BinaryOp{pos: in.Pos(), Op: parser.OpEq, Left: outerKeyExpr, Right: rightOperand}
 	// S4a (D3.2): AND the lifted residual conjuncts onto the join
 	// predicate, exactly the EXISTS mechanism (shared rewriter).
-	if resid := liftResidualConjuncts(eup.Residuals, nil, outerChild.Output(), outerWidth); resid != nil {
+	// srcTableOffset is 0 for the opaque path (identical to
+	// liftResidualConjuncts); when the RHS flattened, the inner refs in
+	// the residuals must carry the same shifted SourceTableIdx the
+	// remapped leaves do (M0142-0008e).
+	if resid := liftResidualConjunctsWithOffset(eup.Residuals, nil, outerChild.Output(), outerWidth, srcTableOffset); resid != nil {
 		semiPred = &BinaryOp{pos: in.Pos(), Op: parser.OpAnd, Left: semiPred, Right: resid}
 	}
 	joinType := JoinTypeSemi
@@ -3461,16 +3510,30 @@ func unnestInExpr(in *InExpr, outer Node) (Node, error) {
 	// operands of the join's equality conjuncts are the params' inner
 	// columns (the IN testexpr itself is params[0] when correlated), or
 	// the inner plan's output column for the operand-keyed (params==0)
-	// shape. The IN path does not remapSourceTableIdx, so no offset.
+	// shape. The IN path does not remapSourceTableIdx for the opaque
+	// shape, so srcTableOffset is 0 there; a flattened RHS is remapped
+	// and its entries carry the offset.
 	var semiRhs []Expr
-	for _, prm := range params {
-		semiRhs = append(semiRhs, &ColumnRef{
-			pos:            prm.SubCol.Pos(),
-			Index:          prm.SubCol.Index,
-			Name:           prm.SubCol.Name,
-			Type:           prm.SubCol.Type,
-			SourceTableIdx: prm.SubCol.SourceTableIdx,
-		})
+	if flattenedRHS && flatTarget != nil {
+		// Step 2: for a flattened RHS the uniqueification target is the
+		// body's own comparison expression in leaf-concat coordinates
+		// (innerShift 0) carrying the leaves' shifted SourceTableIdx — the
+		// same operand the folded equality uses, in the RHS's own space,
+		// and the ONLY entry: uniqueifying on the correlation columns too
+		// would deduplicate more aggressively than PG's semijoin RHS.
+		if tgtShifted := liftResidualConjunctsWithOffset([]Expr{flatTarget}, nil, nil, 0, srcTableOffset); tgtShifted != nil {
+			semiRhs = []Expr{tgtShifted}
+		}
+	} else {
+		for _, prm := range params {
+			semiRhs = append(semiRhs, &ColumnRef{
+				pos:            prm.SubCol.Pos(),
+				Index:          prm.SubCol.Index,
+				Name:           prm.SubCol.Name,
+				Type:           prm.SubCol.Type,
+				SourceTableIdx: prm.SubCol.SourceTableIdx + srcTableOffset,
+			})
+		}
 	}
 	if len(semiRhs) == 0 {
 		if out := innerPlan.Output(); len(out) > 0 {
@@ -3484,16 +3547,17 @@ func unnestInExpr(in *InExpr, outer Node) (Node, error) {
 		}
 	}
 	join := &Join{
-		pos:       in.Pos(),
-		Type:      joinType,
-		Algo:      JoinAlgoHash,
-		Left:      outerChild,
-		Right:     innerPlan,
-		Predicate: semiPred,
-		LeftKey:   outerKeyExpr,
-		RightKey:  innerKey,
-		SJInfo:    inUnnestSJInfo(joinType, semiRhs, true),
-		schema:    append(Schema(nil), outerChild.Output()...),
+		pos:          in.Pos(),
+		Type:         joinType,
+		Algo:         JoinAlgoHash,
+		Left:         outerChild,
+		Right:        innerPlan,
+		Predicate:    semiPred,
+		LeftKey:      outerKeyExpr,
+		RightKey:     rightOperand,
+		SJInfo:       inUnnestSJInfo(joinType, semiRhs, true),
+		schema:       append(Schema(nil), outerChild.Output()...),
+		FlattenedRHS: flattenedRHS,
 	}
 	filter.Child = join
 	return outer, nil
@@ -3569,6 +3633,37 @@ func unnestNonCorrelatedInExpr(in *InExpr, outer Node) (Node, error) {
 	// Re-index inner key into the merged (outer ++ inner) coord.
 	innerKey.Index = outerWidth
 
+	// M0142-0008a-3i-route-a step 2: same flattening arm as the
+	// correlated path — a simple body whose plan decomposes into scan
+	// leaves with a recoverable single target flattens, the target
+	// Project is stripped and an IsolatedScope positional-identity
+	// re-wrap (flatBodyScopeProject) replaces it so the executor's right
+	// row and the seam's spliced leaves share the leaf-concat convention
+	// without losing the project's NLI/pushdown protections, and the
+	// probe's right operand becomes the target expression re-based into
+	// merged (outer ++ inner) coordinates.
+	var rightOperand Expr = innerKey
+	flattenedRHS := false
+	var srcTableOffset int16
+	var flatTarget Expr
+	if in.Subquery != nil && sublinkBodyIsSimple(in.Subquery) {
+		if _, _, tgt, flatBody, okFlat := decomposeFlatBodyTree(innerPlan, true); okFlat && tgt != nil {
+			off := int16(1)
+			if m := maxSourceTableIdxDeep(outerChild); m >= off {
+				off = m + 1
+			}
+			if remapped, errR := remapSourceTableIdx(flatBody, off); errR == nil {
+				if shifted := liftResidualConjunctsWithOffset([]Expr{tgt}, nil, outerChild.Output(), outerWidth, off); shifted != nil {
+					flattenedRHS = true
+					rightOperand = shifted
+					flatTarget = tgt
+					innerPlan = flatBodyScopeProject(remapped)
+					srcTableOffset = off
+				}
+			}
+		}
+	}
+
 	// The outer key is the IN's left operand itself, already
 	// resolved against outerChild's coord by planInExpr — no
 	// ColumnRef reconstruction needed since LeftKey/RightKey accept
@@ -3612,7 +3707,7 @@ func unnestNonCorrelatedInExpr(in *InExpr, outer Node) (Node, error) {
 	// output, or in x itself, generally excludes the row — see the
 	// NullAware doc comment on the Join struct) rather than the
 	// plain NOT-EXISTS-shaped Anti join.
-	semiPred := &BinaryOp{pos: in.Pos(), Op: parser.OpEq, Left: outerKey, Right: innerKey}
+	semiPred := &BinaryOp{pos: in.Pos(), Op: parser.OpEq, Left: outerKey, Right: rightOperand}
 	_ = innerWidth
 	joinType := JoinTypeSemi
 	if effNegated {
@@ -3625,6 +3720,10 @@ func unnestNonCorrelatedInExpr(in *InExpr, outer Node) (Node, error) {
 	// guard). strict=false for the NullAware (NOT IN) anti shape: a
 	// null-aware clause is not a plain strict equality and LhsStrict feeds
 	// joinIsLegal's commute checks.
+	//
+	// Step 2: a flattened RHS uniqueifies on the body's own target
+	// expression in leaf-concat coordinates with the remapped
+	// SourceTableIdx — the same operand the folded equality uses.
 	semiRhs := []Expr{&ColumnRef{
 		pos:            in.Pos(),
 		Index:          0,
@@ -3632,18 +3731,24 @@ func unnestNonCorrelatedInExpr(in *InExpr, outer Node) (Node, error) {
 		Type:           innerOut[0].Type,
 		SourceTableIdx: innerOut[0].SourceTableIdx,
 	}}
+	if flattenedRHS && flatTarget != nil {
+		if tgtShifted := liftResidualConjunctsWithOffset([]Expr{flatTarget}, nil, nil, 0, srcTableOffset); tgtShifted != nil {
+			semiRhs = []Expr{tgtShifted}
+		}
+	}
 	join := &Join{
-		pos:       in.Pos(),
-		Type:      joinType,
-		Algo:      JoinAlgoHash,
-		Left:      outerChild,
-		Right:     innerPlan,
-		Predicate: semiPred,
-		LeftKey:   outerKey,
-		RightKey:  innerKey,
-		NullAware: effNegated,
-		SJInfo:    inUnnestSJInfo(joinType, semiRhs, !effNegated),
-		schema:    append(Schema(nil), outerChild.Output()...),
+		pos:          in.Pos(),
+		Type:         joinType,
+		Algo:         JoinAlgoHash,
+		Left:         outerChild,
+		Right:        innerPlan,
+		Predicate:    semiPred,
+		LeftKey:      outerKey,
+		RightKey:     rightOperand,
+		NullAware:    effNegated,
+		SJInfo:       inUnnestSJInfo(joinType, semiRhs, !effNegated),
+		schema:       append(Schema(nil), outerChild.Output()...),
+		FlattenedRHS: flattenedRHS,
 	}
 	filter.Child = join
 	return outer, nil
@@ -4916,15 +5021,28 @@ func unnestExistsExpr(ex *ExistsExpr, outer Node) (Node, error) {
 		// tree mutation), so joinPredicate is non-nil.
 		algo = JoinAlgoNestedLoop
 	}
+	// M0142-0008a-3i-route-a step 2: when the retained parser body is
+	// simple AND the already-built inner plan decomposes cleanly into
+	// scan leaves + body quals, mark the join so the seam splices the
+	// body's relations into the outer join list instead of treating the
+	// RHS as one opaque leaf. The plan itself is unchanged — the flag
+	// only widens what the search may do with it.
+	flattenedRHS := false
+	if ex.Subquery != nil && sublinkBodyIsSimple(ex.Subquery) {
+		if _, _, _, _, okFlat := decomposeFlatBodyTree(innerPlan, false); okFlat {
+			flattenedRHS = true
+		}
+	}
 	join := &Join{
-		pos:       ex.Pos(),
-		Type:      joinType,
-		Algo:      algo,
-		Left:      outerChild,
-		Right:     innerPlan,
-		Predicate: joinPredicate,
-		schema:    append(Schema(nil), outerChild.Output()...),
-		SJInfo:    existsUnnestSJInfo(joinType, params, eup.Residuals, srcTableOffset),
+		pos:          ex.Pos(),
+		Type:         joinType,
+		Algo:         algo,
+		Left:         outerChild,
+		Right:        innerPlan,
+		Predicate:    joinPredicate,
+		schema:       append(Schema(nil), outerChild.Output()...),
+		SJInfo:       existsUnnestSJInfo(joinType, params, eup.Residuals, srcTableOffset),
+		FlattenedRHS: flattenedRHS,
 	}
 	if outerKey != nil {
 		join.LeftKey = outerKey

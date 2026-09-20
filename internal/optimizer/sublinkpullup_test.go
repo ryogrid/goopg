@@ -101,6 +101,10 @@ func TestSublinkBodyIsSimpleRefusals(t *testing.T) {
 			`select a from t1 where sum(b) > 0`},
 		{"window-function", "subquery->hasWindowFuncs",
 			`select row_number() over (order by a) from t1`},
+		{"set-returning-in-target", "subquery->hasTargetSRFs",
+			`select generate_series(1, 3) from t1`},
+		{"any-target-call-is-refused", "(goopg) conservative hasTargetSRFs",
+			`select upper(a) from t1`},
 		{"values", "(goopg) no FROM items to splice",
 			`values (1), (2)`},
 		{"no-from", "(goopg) no FROM items to splice",
@@ -112,6 +116,20 @@ func TestSublinkBodyIsSimpleRefusals(t *testing.T) {
 				t.Fatalf("sublinkBodyIsSimple = true, want false (upstream refuses on %s)", tc.upstream)
 			}
 		})
+	}
+}
+
+// TestSublinkBodyIsSimpleWhereClauseCallsAreAllowed pins the asymmetry the
+// conservative SRF arm introduces: the blunt "any call disqualifies" rule
+// applies to the TARGET LIST only. A set-returning call in a qual is an error
+// in PG, so an ordinary scalar function in WHERE must not cost a body its
+// pull-up — without this, the five corpus witnesses (whose bodies carry
+// ordinary comparisons) would be one refactor away from being refused for the
+// wrong reason.
+func TestSublinkBodyIsSimpleWhereClauseCallsAreAllowed(t *testing.T) {
+	sel := parseSelectForPullup(t, `select * from t1 where upper(a) = 'X'`)
+	if !sublinkBodyIsSimple(sel) {
+		t.Fatal("sublinkBodyIsSimple = false, want true (a scalar call in WHERE is not an SRF risk)")
 	}
 }
 

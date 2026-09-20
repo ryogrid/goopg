@@ -1256,7 +1256,18 @@ type Join struct {
 	// reconstructing it, not to change today's plan shape. See
 	// docs/design/0100-0149/m0142-0008a-1-semi-anti-sji-design.md §4.1.
 	SJInfo *SpecialJoinInfo
-	schema Schema
+	// FlattenedRHS marks a Semi/Anti join whose Right side is a flattened
+	// sublink body — real scan leaves and body quals spliced in place of the
+	// opaque planned subtree (M0142-0008a-3i-route-a step 2). It is set by
+	// the unnest only when the retained parser body passes
+	// `sublinkBodyIsSimple` AND `decomposeFlatBodyTree` decomposes the plan
+	// cleanly; `extractSearchLeaves` then emits one leaf per body relation
+	// instead of the single opaque RHS leaf. False everywhere else — an
+	// unmarked Semi/Anti keeps its whole RHS as one synthetic leaf, the
+	// pre-step-2 shape. The flag changes nothing outside the seam walk:
+	// whether or not the search runs, the join executes the same rows.
+	FlattenedRHS bool
+	schema       Schema
 }
 
 func (n *Join) Pos() int { return n.pos }
