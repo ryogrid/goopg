@@ -11160,3 +11160,68 @@ goopg's processing route diverged from PG's upstream of the fix).
   breadth-first mechanism builds.
   Kind: recon
   Parent: M0144-0002
+  - **IN PROGRESS 2026-09-20 (loop \#43): slice picked + five-layer trace
+    landed.** Representative: **TPC-DS SF0.25 Q8** — top cluster
+    (`Limit→{GroupAgg|IncrSort|Sort+CTE}` vs `Sort`, ~25 SF0.25 / ~20 SF1
+    records), `dominated-noncost` candm −46.8% (m0144-0007). Trace on a
+    private `:5595` lane at HEAD `30e8ea711`
+    (`analysis/m0144/m0144-0011-q8-slice-trace.md`): admission OK;
+    candidate-generation gap is the first-divergence cause —
+    `inputNodePathkeys` returns nil for `*Aggregate` (seed `keys=0` →
+    redundant Sort) and `electOrderedGrouping` declines `cands<2(1)`
+    while PG iterates the whole input pathlist (`planner.c:5337`); the
+    NL-vs-HJ join election under the agg and `Materialize` existence are
+    the deeper layers. Children 0011a/b/c filed below. Design doc:
+    `docs/design/0100-0149/m0144-0011-q8-vertical-slice.md`.
+- [ ] **M0144-0011a — ordering-claim propagation at the ORDERED-step
+  boundary** (filed by M0144-0011). `inputNodePathkeys`
+  (`internal/optimizer/upperorderedinput.go:176`) returns nil for every
+  ordered-emitting node top that is not `*Sort`/searched-root — add the
+  `*Aggregate` emission case first (winning PathAgg's group-key ordering,
+  translated to output coordinates; `groupingEmissionPathkeys` already
+  computes this for candidate offers), then survey MergeJoin/GatherMerge/
+  IncrementalSort tops for the same `default: nil` blind spot. Also review
+  `electOrderedGrouping`'s `cands<2` gate: PG's `create_ordered_paths`
+  (`postgres/src/backend/optimizer/plan/planner.c:5337`) iterates
+  `input_rel->pathlist` with no minimum — a lone AggPath must still be
+  offered (PG citations: `planner.c:5344-5348`, `pathnode.c:3412-3416`).
+  Kind: impl
+  Parent: M0144-0011
+  Expected movement: SF0.25 `sort-strategy` category on the
+  `Limit→{GroupAggregate|Finalize}` first-divergence family — ≤18 records
+  (named dominated-noncost: Q8, Q21, Q26, Q45, Q50, Q62, Q99;
+  election-0%: Q17, Q25, Q29) advance past depth-1 where the seed
+  ordering was the sole blocker. Measured: private-lane SF0.25 capture →
+  `pg-plan-parity-diff.py` category delta + `pg-plan-first-divergence.py`
+  census diff vs the m0144-0002 table; match-count movement possible but
+  not required.
+- [ ] **M0144-0011b — join election under Q8's aggregate input**
+  (filed by M0144-0011). At rel `{0,1,2,3}` ({dd⋈ss} ⋈ {store,ca-view}):
+  goopg elected `join.hash total=19455.50`; the PG-chosen
+  `join.nestloop total=19852.53` was generated and dominated — a
+  cost-input/election divergence, not generation. PG's inner is
+  `Materialize(NL(store Index Scan ⋈ ca-view-subquery))` rescanned per
+  outer row; goopg prices a different inner shape (Seq Scan store, no
+  Materialize). Scope: reprice the parameterised NL inner PG-faithfully
+  and verify the stats inputs (818 vs 812 rows). If the residual needs
+  Materialize, it feeds 0011c rather than a workaround.
+  Kind: impl
+  Parent: M0144-0011
+  Expected movement: `join-method`, `scan-type`, `join-order` categories
+  on Q8 (SF0.25). Measured: DPPATH candidate margins at rel {0,1,2,3}
+  (nestloop vs join.hash totals vs PG's own pricing from the optdebug
+  lane) + `pg-plan-parity-diff.py` on a private-lane capture.
+- [ ] **M0144-0011c — `Materialize` node existence** (filed by
+  M0144-0011). Q8 is `MISSING-NODE: PG-only kinds: Materialize` — goopg
+  has no Materialize plan node (`MaterializedCTEScan` is a different
+  thing); PG buffers NL inners via `create_material_path`
+  (`postgres/src/backend/optimizer/util/pathnode.c:1637`). Scope: the
+  path producer (materialize_inner admission for rescan-heavy NL
+  inners), the executor node, and EXPLAIN rendering. If it turns out
+  unfundable, record it as the slice's named measured residue.
+  Kind: impl
+  Parent: M0144-0011
+  Expected movement: `missingnode` count on the Q8-family records where
+  PG materializes NL inners (Q8 + siblings per parity diff), and it
+  unblocks 0011b's honest NL pricing. Measured: `pg-plan-parity-diff.py`
+  `PG-only node kinds` line on a private-lane capture.
