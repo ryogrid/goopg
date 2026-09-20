@@ -1,6 +1,7 @@
 # M0137-0019 — per-query triage of the 16 parallel-mode `parallelism` divergences
 
-Status: TRIAGE COMPLETE 2026-09-20
+Status: TRIAGE COMPLETE 2026-09-20; §3.2's family-B verdict CORRECTED
+2026-09-20 by M0137-0019a (executor-model divergence, not a costing gap)
 Kind: recon
 Parent: none
 Milestone: M0137 (plan-parity harness), headline work since the owner's
@@ -92,11 +93,24 @@ Q1's entire plan (200 900.77)**. This is a cost-model divergence in the
 `cost_gather_merge` + worker-sort arm, not an election-policy or
 candidate-generation problem.
 
-Territory: **M0140's parallel-path costing**, not M0139/M0141/M0142 plan
-selection. Family **B′** (Q3, Q18) is the same arm with the opposite sign —
-goopg takes the GatherMerge where PG does not — which is what a mispriced arm
-looks like from the other side and is evidence that the term is wrong rather
-than uniformly too high.
+**CORRECTED 2026-09-20 by M0137-0019a's probe — read
+`m0137-0019a-gathermerge-arm-refuted.md` before acting on this section.** The
+verdict below ("M0140's parallel-path costing") is WRONG. The candidate goopg
+generates is the **no-split** arm: it sorts the RAW INPUT per worker
+(~1.48 M rows for Q1), not the partial group-states PG sorts (6 per worker),
+so 1 510 695.91 is the CORRECT price of a genuinely expensive plan rather than
+a mispricing. PG's shape (`gather_grouping_paths`, `planner.c:7704-7724`) has
+no producer in goopg, and cannot get one: goopg's Partial Aggregate emits ZERO
+rows and publishes into a shared mutex-guarded accumulator
+(`operators_join_agg.go:2351-2356`), so a worker-side Sort would sort nothing
+and a Gather Merge would merge nothing. Family B is a **designed
+executor-model divergence**, the same class as family A — not a costing gap.
+
+Superseded text, kept for the record: *"Territory: M0140's parallel-path
+costing, not M0139/M0141/M0142 plan selection. Family B′ (Q3, Q18) is the same
+arm with the opposite sign — goopg takes the GatherMerge where PG does not —
+which is what a mispriced arm looks like from the other side and is evidence
+that the term is wrong rather than uniformly too high."*
 
 ### 3.3 Family C (6 queries) — mostly downstream, not its own cause.
 
@@ -139,9 +153,10 @@ only one of them is a costing bug a planner task can fix.
 
 ## 5. Follow-ups filed
 
-- **M0137-0019a** — reprice the `GatherMerge` + worker-sort arm against
-  `cost_gather_merge`. Expected movement: the `parallelism` category on
-  families B and B′ (8-10 of 22 TPC-H queries).
+- **M0137-0019a** — filed to reprice the `GatherMerge` + worker-sort arm.
+  **REFUTED and `[!]` blocked 2026-09-20**: the arm is priced correctly and
+  PG's shape is not expressible in goopg's execution model. See
+  `m0137-0019a-gathermerge-arm-refuted.md`.
 - **M0137-0019b** — a partial path beneath `Nested Loop Semi Join` (Q4).
 
 Family A gets a deferral-ledger row rather than a task: it is an executor

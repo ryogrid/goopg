@@ -2331,21 +2331,48 @@ before/after proving the defect it closes.
       live fact needed (is the GatherMerge candidate generated?) came from
       a `DP_TRACE=1` plan-only probe, a different instrument that produces
       no timing.
-- [ ] **M0137-0019a — reprice the `GatherMerge` + worker-sort arm** (filed
-  by M0137-0019's triage). The candidate is generated and accepted; it
-  loses because goopg prices it absurdly — Q1's
-  `upper.groupagg.gathermerge` totals 1510695.91 where PG's whole Q1 plan
-  costs 200900.77. Port `cost_gather_merge`
-  (`postgres/src/backend/optimizer/path/costsize.c`) and the worker-sort
-  term against `partialaggupper.go`'s R56 arm, and check the mirror cases
-  (Q3, Q18) do not simply flip the other way.
-  Kind: impl
+- [!] **M0137-0019a — reprice the `GatherMerge` + worker-sort arm** (filed
+  by M0137-0019's triage). **PREMISE REFUTED 2026-09-20 (loop \#51);
+  BLOCKED on an executor capability, not on a decision the loop may take.**
+  Design doc:
+  `docs/design/0100-0149/m0137-0019a-gathermerge-arm-refuted.md`.
+  Kind: recon
   Parent: M0137-0019
-  Expected movement: the `parallelism` category on TPC-H parallel, families
-  B and B′ — 8 to 10 of 22 queries (Q1 Q4 Q5 Q8 Q12 Q16 Q22 Q15a, plus the
-  mirrors Q3 Q18). Measured: `pg-plan-parity-diff.py` `CATEGORIES:` /
-  `CATEGORIES-EXCL-MATCH:` `parallelism` count on a pinned-epoch
-  `estimate-audit -plan-only -serial=false` capture, against the current 16.
+  Movement: none
+  - The arm is **NOT mispriced.** The candidate goopg generates is the
+    **no-split** arm (`partialaggupper.go:418-476` says so in its own first
+    line): it sorts the RAW INPUT per worker — ~1.48 M rows for Q1 — not the
+    partial group-states PG sorts (6 per worker). So `1510695.91` is the
+    CORRECT price of a genuinely expensive plan, and the `split` arm that
+    wins at `67840.37` is the right call on the candidates goopg has.
+  - PG's shape is `Finalize GroupAggregate → Gather Merge → Sort → Partial
+    HashAggregate`, built by `gather_grouping_paths`
+    (`postgres/src/backend/optimizer/plan/planner.c:7704-7724`), which
+    stacks `create_sort_path` on the partially-grouped rel's partial paths
+    and wraps them in `create_gather_merge_path`. goopg has no such
+    producer.
+  - **It cannot get one.** goopg's Partial Aggregate emits ZERO rows — it
+    publishes each group into a shared mutex-guarded accumulator and the
+    Finalize node reads the accumulator, not a tuple stream
+    (`internal/executor/operators_join_agg.go:2351-2356`, and
+    `partialaggupper.go:553-556` which explains why the split arm charges
+    anything at the boundary at all). A worker-side `Sort` over a node that
+    emits nothing sorts nothing; a `Gather Merge` over it merges nothing.
+    PG's shape is not expressible in goopg's execution model.
+  - **Therefore M0137-0019 §3.2's verdict is CORRECTED**: family B is a
+    DESIGNED executor-model divergence, the same class as family A — not a
+    costing gap in M0140's territory. The triage doc carries the correction
+    in place, with the superseded text kept for the record.
+  - **Owner-level consequence:** with families A (7 queries) and B (8-10)
+    both executor-model divergences, `parallelism=16/22` on the canonical
+    TPC-H parity corpus is essentially FLOORED by two executor design
+    decisions. No planner or costing task can move it. The only remaining
+    planner-side member is Q4 (M0137-0019b), one query.
+  - Expected movement if the executor capability ever lands: the
+    `parallelism` category on families B and B′ — 8 to 10 of 22 queries
+    (Q1 Q4 Q5 Q8 Q12 Q16 Q22 Q15a, plus the mirrors Q3 Q18), measured by
+    `pg-plan-parity-diff.py` `CATEGORIES:` on a pinned-epoch
+    `estimate-audit -plan-only -serial=false` capture against the current 16.
 - [ ] **M0137-0019b — file a partial path beneath `Nested Loop Semi Join`**
   (filed by M0137-0019's triage). TPC-H Q4 is the corpus's only fully
   SERIAL plan in parallel mode: goopg plans
