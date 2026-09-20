@@ -2373,7 +2373,7 @@ before/after proving the defect it closes.
     (Q1 Q4 Q5 Q8 Q12 Q16 Q22 Q15a, plus the mirrors Q3 Q18), measured by
     `pg-plan-parity-diff.py` `CATEGORIES:` on a pinned-epoch
     `estimate-audit -plan-only -serial=false` capture against the current 16.
-- [ ] **M0137-0019b — file a partial path beneath `Nested Loop Semi Join`**
+- [x] **M0137-0019b — file a partial path beneath `Nested Loop Semi Join`**
   (filed by M0137-0019's triage). TPC-H Q4 is the corpus's only fully
   SERIAL plan in parallel mode: goopg plans
   `HashAggregate → Nested Loop Semi Join → Seq Scan on orders` where PG
@@ -2385,6 +2385,64 @@ before/after proving the defect it closes.
   and its `D:goopg-fully-serial` classification retires. Measured:
   `pg-plan-parity-diff.py` per-query line for Q4 plus the presence of a
   `Gather`/`Gather Merge` in its goopg plan.
+  - **LANDED 2026-09-20 (loop \#52).** Design doc:
+    `docs/design/0100-0149/m0137-0019b-partial-nestloop-semi.md` (its §4
+    decision was written before any parity number was taken).
+    Kind: impl
+    Parent: M0137-0019
+    Movement: none
+    - **FOUR coupled gates**, not three, refused a partial NL outside
+      INNER: the producer (`joinpathsnli.go`), the path classifier
+      (`gatherpaths.go`), the ordinary-NL node twin and the FUSED
+      `*NestedLoopIndexJoin` twin (both `parallel.go`). All four said in
+      their own comments that the refusal was deliberate
+      scope-minimization, NOT a correctness boundary — this task is the
+      "separate scope" `nestedLoopJoinIsPartialCapable`'s doc asks for.
+    - Widened to `{INNER, SEMI}`. SEMI's verdict is per-outer-row and
+      worker-local: one qualifying inner tuple decides the outer row and
+      the scan breaks (`finishOuter`, join_nl_stream.go), the joined row
+      is never emitted, and the inner-matched bitmap RIGHT/FULL would need
+      reduced across workers is never touched. PG admits
+      `{INNER, LEFT, SEMI, ANTI}` at the same dispatch gate
+      (`postgres/src/backend/optimizer/path/joinpath.c:2022-2031`).
+    - **The fourth gate was found by MEASUREMENT, not by reading.** With
+      the first three widened, Q4 was STILL planned fully serially: its
+      semi join is the fused index-probe shape (`Index Cond: l_orderkey =
+      o_orderkey`), governed by `NestedLoopIndexJoinIsPartialCapable`, not
+      by the ordinary twin — whose own doc says a parameterised shape
+      "never reaches this predicate". Recorded rather than folded in: the
+      first three edits alone would have been a correct-but-inert change.
+    - **Result — Q4 is parallel.** `Sort → HashAggregate → NL Semi Join →
+      Seq Scan` (507361.63) becomes `Sort → Finalize HashAggregate →
+      Gather (Workers Planned: 3) → Partial HashAggregate → NL Semi Join →
+      Parallel Seq Scan` (162106.07). Family `D:goopg-fully-serial`
+      retires with its only member.
+    - Q4's per-query record sheds two of four categories:
+      `[join-order,aggregation-strategy,sort-strategy,parallelism]` →
+      `[sort-strategy,parallelism]`.
+    - **It keeps `parallelism`, and that is the honest reading**: Q4 moved
+      OUT of family D and INTO family B — PG uses `Gather Merge` +
+      `Finalize GroupAggregate`, goopg now uses `Gather` + `Finalize
+      HashAggregate`, which M0137-0019a proved is executor-floored. The
+      record that remains is the one this task could not remove.
+    - TPC-H parallel: match 2 → 2, `join-order` 16 → 15,
+      `aggregation-strategy` 7 → 6 (both from Q4 alone), `parallelism`
+      15 → 15. All inside ±3, hence `Movement: none`.
+    - TPC-DS SF0.25: INERT — `queries=99 same=99 changed=0`, values
+      `MISMATCH=0 CKMISMATCH=0`. No SF0.25 query pairs a semi nested loop
+      with a partial-capable outer.
+    - Seven assertions across three test files pinned the old INNER-only
+      boundary; each moved to the admitted set for SEMI AND gained a
+      positive assertion in its place, plus a new case pinning that the
+      jointype widening did not become a bypass of
+      `lateralProbeIsPartialProbe` (a SEMI NLI with a bitmap inner is
+      still refused).
+    - Gates: units PASS; `tpch-spotcheck` PASS (Q12=2 Q13=33);
+      `tpcds-sf025 sweep` PASS; `tpch-acceptance-arm` PASS (24/24 VALUES);
+      `make ea-ratchet` `N/A`.
+    - Still open (ledgered): LEFT and ANTI stay refused in all four gates
+      by scope; Q4's residual `parallelism` record needs the row-emitting
+      partial aggregation M0137-0019a is blocked on.
 - [x] **M0137-0020 — pin `GOOPG_ANALYZE_SEED` in the TPC-DS capture harness**
   (filed by M0138-0008, 2026-09-15) — **DONE 2026-09-15.** The fix does NOT
   land inside `scripts/capture-tpcds.sh` as the task title/deliverable
