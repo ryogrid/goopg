@@ -7114,8 +7114,48 @@ cross-layer programme that has never been scoped.
           retain a path-level `RequiredOuter`. Filed below rather than
           attempted — it changes when plans are built relative to when they
           are searched, a planner-architecture decision, not a gate edit.
-    - [ ] **M0142-0008a-3i-lateral-route — let Phase B search before the
-      probe dependency is lowered** (filed by `M0142-0008a-3i-lateral`).
+    - [x] **M0142-0008a-3i-leafcount — is increment (i) implementable at
+      Phase B for Q16/Q94/Q35?** (filed and worked 2026-09-20, loop \#55).
+      **NO — same root cause as the Lateral case, generalised.** Design doc:
+      `docs/design/0100-0149/m0142-0008a-3i-leafcount.md`; evidence:
+      `analysis/m0142/m0142-0008a-3i-leafcount-probe.txt`.
+      Kind: recon
+      Parent: M0142-0008a-3
+      Movement: none
+      - Measured with a throwaway instrumented build (probe REVERTED, not
+        committed) on the private `:5595` lane, `EXPLAIN` only. The check is
+        `len(scans) != nprefix+len(semiAnti)` (`joinsearchseam.go:325`):
+        - `Q16 nrels=4 nprefix=4 scans=3 semiAnti=2` (wants 6, has 3)
+        - `Q94` identical to Q16
+        - `Q35 nrels=3 nprefix=3 scans=2 semiAnti=1` (wants 4, has 2)
+      - **The gap runs the WRONG WAY and is large.** Increment (i) was
+        scoped to add the one missing synthetic RHS leaf; the shortfall is
+        3 leaves (Q16/Q94) and 2 (Q35). Adding the RHS participant would
+        take Q16 from 3 to 5 against a required 6 — still a decline.
+      - **The "leaves" are already-planned composite subtrees**, not base
+        scans: `scan[0]=*optimizer.Project` for Q16/Q94;
+        `*optimizer.NestedLoopIndexJoin` and **`*optimizer.Gather`** for
+        Q35. A Gather only exists AFTER planning, worker count already
+        chosen — a join search cannot treat it as a base relation.
+      - **Unifying root cause**: Phase B searches a tree Phase A has
+        already PLANNED. In the Lateral case a DEPENDENCY had been lowered
+        out of searchable form; here the RELATIONS have. `leaf-count` and
+        `lateral` are two symptoms of one thing, and `leaf-count` is not
+        the milder one — a `*Gather` leaf is further from a base rel than a
+        Lateral marker is from a `RequiredOuter`.
+      - **Consequence: `M0142-0008a-3` has no selectable increment left.**
+        (i) is not implementable at Phase B for ANY of the five witnesses —
+        Q69/Q10 by the lowered dependency, Q16/Q94/Q35 by the lowered
+        relations — and (ii) is downstream of (i). Both now depend on
+        `M0142-0008a-3i-lateral-route` below, whose scope this widens.
+      - Deliberately NOT done: a partial that adds the RHS participant and
+        still declines on 5/5 witnesses is code with no consumer, which is
+        what this repo's own "an unwinnable path is an untested path"
+        lesson warns against.
+    - [ ] **M0142-0008a-3i-lateral-route — let Phase B search before Phase A
+      lowers anything** (filed by `M0142-0008a-3i-lateral`; scope WIDENED by
+      `M0142-0008a-3i-leafcount` from "the probe dependency" to "relations as
+      well as dependencies").
       Either Phase B sees the chain BEFORE `createNestLoopIndexJoinPlan`
       lowers a parameterised probe to `Join{Lateral:true}` +
       `OuterColumnRef{Level:1}`, or Phase A's spliced result retains a
@@ -7124,12 +7164,17 @@ cross-layer programme that has never been scoped.
       `planner.c:441`).
       Kind: recon
       Parent: M0142-0008a-3
-      Expected movement: unblocks Q69 and Q10's seam admission, whose
-      `join-method` records are the census's named Semi/Anti-algorithm
-      divergence on TPC-DS SF0.25. Measured by the implementing task with
-      `pg-plan-parity-diff.py` per-query on a private-lane capture, plus a
-      `GOOPG_PGSHAPED_DP_TRACE=1` seam census showing the `lateral` decline
-      class shrink from its current 2.
+      Expected movement: unblocks the seam admission of **all five**
+      census witnesses — Q69 and Q10 (`lateral`) and Q16, Q94 and Q35
+      (`leaf-count`) — whose `join-method` records are the census's named
+      Semi/Anti-algorithm divergence on TPC-DS SF0.25. Measured by the
+      implementing task with `pg-plan-parity-diff.py` per-query on a
+      private-lane capture, plus a `GOOPG_PGSHAPED_DP_TRACE=1` seam census
+      showing BOTH decline classes shrink from their current 2 and 3.
+      - Whoever first lets a link through must ALSO close the P0-H11
+        `cumulativeFromSpans` span round-trip in the same change — it is
+        latent only because nothing gets through today
+        (`M0142-0008a-3i-reach-verify`).
       - Overlaps M0144-0003 (route-order verification) by construction;
         check that task's findings first rather than re-deriving them, and
         do NOT attempt this as a `chainCarriesLateral` widening — that was

@@ -1,0 +1,11 @@
+LCPROBE leaf-count nrels=4 nprefix=4 scans=3 semiAnti=2 outerLinks=0 widths=3
+LCPROBE   scan[0]=*optimizer.Project
+LCPROBE   scan[1]=*optimizer.SeqScan
+LCPROBE   scan[2]=*optimizer.SeqScan
+LCPROBE leaf-count nrels=4 nprefix=4 scans=3 semiAnti=2 outerLinks=0 widths=3
+LCPROBE   scan[0]=*optimizer.Project
+LCPROBE   scan[1]=*optimizer.SeqScan
+LCPROBE   scan[2]=*optimizer.SeqScan
+LCPROBE leaf-count nrels=3 nprefix=3 scans=2 semiAnti=1 outerLinks=0 widths=2
+LCPROBE   scan[0]=*optimizer.NestedLoopIndexJoin
+LCPROBE   scan[1]=*optimizer.Gather
