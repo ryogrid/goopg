@@ -13,8 +13,11 @@ import (
 //
 // Two pieces: `groupingEmissionPathkeys` translates a sorted
 // candidate's input-coordinate emission order into output-coordinate
-// pathkeys (the coordinate boundary `inputNodePathkeys` cannot cross —
-// it returns nil through `*Aggregate`, upperorderedinput.go:184-186),
+// pathkeys (the coordinate boundary the walk cannot cross by DESCENDING
+// — M0144-0011a gave `inputNodePathkeys` its own node-level twin,
+// `aggregateEmissionPathkeys`, which performs the same positional
+// translation for a finished `*Aggregate`; the two must decline on the
+// same shapes),
 // and `electOrderedGrouping` runs the ordered-level loop at the
 // planSelect normal ORDER BY arm through the existing `addOrderedPaths`
 // + `setCheapest`/`getCheapestFractionalPath` tournament.

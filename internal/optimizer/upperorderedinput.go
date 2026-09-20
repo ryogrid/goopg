@@ -208,9 +208,130 @@ func inputNodePathkeys(input Node) []PathKey {
 				return nil
 			}
 			n = t.Child
+		case *Aggregate:
+			if !schemaCoordinatesAgree(out, t.Output()) {
+				return nil
+			}
+			return aggregateEmissionPathkeys(t)
 		default:
 			return nil
 		}
 	}
 	return nil
+}
+
+// aggregateEmissionPathkeys is M0144-0011a: the `*Aggregate` arm of
+// `inputNodePathkeys`' walk — the third source of an ordering claim at this
+// seam, alongside the `*Sort` top and the searched-subtree root.
+//
+// # Why the arm has to exist
+//
+// PG never loses a grouping path's ordering on the way to
+// `create_ordered_paths`: an `AggPath` with `aggstrategy == AGG_SORTED`
+// carries its subpath's pathkeys (`create_agg_path`,
+// `postgres/src/backend/optimizer/util/pathnode.c:3412-3416` sets
+// `pathnode->path.pathkeys = subpath->pathkeys`), and
+// `create_ordered_paths` then reads exactly that field for every member of
+// `input_rel->pathlist` (`postgres/src/backend/optimizer/plan/planner.c:5337`,
+// `:5344-5348`). A GroupAggregate that already emits in ORDER BY order is
+// therefore taken as-is and no Sort is stacked over it.
+//
+// goopg's seam publishes a finished Node, and until this arm the walk's
+// `default: nil` swallowed `*Aggregate` — so the ORDERED step re-seeded with
+// `keys=0` and `addOrderedPaths` could only take its `create_sort_path` arm.
+// That is the redundant `Sort` over `GroupAggregate` the M0144-0011 Q8 trace
+// measured as the slice's layer-2 first divergence
+// (`analysis/m0144/m0144-0011-q8-slice-trace.md`).
+//
+// # Why it is a derivation and not a copy
+//
+// The node's own `GroupExprs` and its child Sort's `Keys` are written in the
+// aggregate's INPUT coordinates; `createOrderedPaths`' `keys` are resolved
+// against the aggregate's OUTPUT schema. This is the one coordinate boundary
+// the file header's rule 2 does not let the walk step over by descending, so
+// the arm translates positionally instead — and only where the translation is
+// a tautology rather than a mapping: the aggregate's group-prefix output
+// layout (`[groups|aggs|grouping|passthrough]`, plan.go:1310-1359) puts group
+// key `j` at output position `j`, which is VERIFIED per key
+// (`out[j].Name == groupExprName(groups[j])`), never assumed.
+//
+// It is the node-level twin of `groupingEmissionPathkeys`
+// (upperorderedgrouping.go), which does the same job for an unbuilt `*Path`
+// candidate inside `electOrderedGrouping`'s loop; the two must decline on the
+// same shapes (pattern: sibling paths must agree). Every decline below mirrors
+// one of that function's, for the reason stated there:
+//
+//   - non-sorted strategy: a hashed aggregate emits in no order at all.
+//   - non-simple mode / grouping sets / no group keys: mirrors the executor's
+//     sorted-agg guard (operators_join_agg.go), which runs sorted aggregation
+//     only for Simple-mode, set-free, grouped aggregation.
+//   - `GroupKeyOrder != nil`: the EXPLAIN-only index-remapped permutation —
+//     its group-key positions are not the written ones this translation reads.
+//   - child neither `*Sort` nor `*GatherMerge`: nothing else at this position
+//     delivers a stated order (a Gather Merge emits the merged order of its
+//     sorted inputs — the same delivery contract a Sort gives, and the one PG
+//     relies on when it feeds Gather Merge paths into `create_ordered_paths`).
+//   - the child's leading sort keys are not the group keys positionally, or a
+//     group expression is not a bare `*ColumnRef`, or the output column at
+//     that position does not carry the group key's name: the emission order
+//     cannot be named in output coordinates, so nothing is claimed.
+//
+// A sorted aggregate emits groups in the order they complete, which is the
+// lexicographic order of its sorted input restricted to distinct group values.
+// Trailing child sort keys beyond the group list cannot change that order, so
+// they are allowed and simply not claimed.
+//
+// Returns nil ("no claim") on every decline — the pre-M0144-0011a answer
+// exactly, which stacks the Sort as before.
+func aggregateEmissionPathkeys(agg *Aggregate) []PathKey {
+	if agg == nil {
+		return nil
+	}
+	if agg.Strategy != AggStrategySorted || agg.Mode != AggModeSimple ||
+		agg.GroupingSets != nil || len(agg.GroupExprs) == 0 ||
+		agg.GroupKeyOrder != nil {
+		return nil
+	}
+	var childKeys []SortKey
+	switch c := agg.Child.(type) {
+	case *Sort:
+		childKeys = c.Keys
+	case *GatherMerge:
+		childKeys = c.Keys
+	default:
+		return nil
+	}
+	groups := agg.GroupExprs
+	if len(childKeys) < len(groups) {
+		return nil
+	}
+	out := agg.Output()
+	if len(out) < len(groups) {
+		return nil
+	}
+	for j, g := range groups {
+		// Bare group keys only: the output side names positions, and only a
+		// column has a name. Both sides are input-coordinate here, so
+		// `exprEqual`'s positional `Index` equality is the match.
+		if _, ok := g.(*ColumnRef); !ok {
+			return nil
+		}
+		if !exprEqual(childKeys[j].Expr, g) {
+			return nil
+		}
+		// An empty name is a column nobody can address by name, so the claim
+		// cannot be confirmed and stops there.
+		if out[j].Name == "" || out[j].Name != groupExprName(g) {
+			return nil
+		}
+	}
+	emitted := make([]PathKey, len(groups))
+	for j := range groups {
+		emitted[j] = PathKey{
+			Expr:       &ColumnRef{Index: j, Name: out[j].Name, Type: out[j].Type},
+			SortAsc:    !childKeys[j].Desc,
+			NullsFirst: childKeys[j].NullsFirst,
+		}
+	}
+	return emitted
 }
