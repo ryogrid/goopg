@@ -10984,7 +10984,7 @@ goopg's processing route diverged from PG's upstream of the fix).
   `analysis/m0144/m0144-0004-optdebug-build.md`.
   Kind: impl
   Parent: none
-- [ ] **M0144-0005 — instrumented PG, instrument 2: `debug_plan_candidates`
+- [x] **M0144-0005 — instrumented PG, instrument 2: `debug_plan_candidates`
   trace GUC** (03-forward-plan §3). Same scratch-checkout build plus a small
   patch adding a GUC that emits, per `RelOptInfo`: every pathlist entry at
   `add_path` time (node type, startup/total cost, rows, pathkeys, param_info,
@@ -10992,6 +10992,23 @@ goopg's processing route diverged from PG's upstream of the fix).
   `set_cheapest` winner. This is the per-candidate artefact goopg's
   `GOOPG_PGSHAPED_DP_TRACE` gets diffed against — separating candidate gap /
   costing gap / tie-break gap, which today all read as "join-order".
+  Done: `debug_plan_candidates` (PGC_USERSET/DEVELOPER_OPTIONS, default off)
+  patched into the same `tmp/pg18-optdebug/src` scratch tree
+  (`pathnode.c` emitters + `guc_tables.c` registration + `pathnode.h`
+  extern; patch lives in the scratch checkout only, oracle untouched).
+  `PLANCAND` records to backend stdout (same channel as pprint):
+  add/padd candidate, ok/pok+removed-count, rej/prej+first-dominator+
+  comparator vector (via=cost/keys/tie/rows/outer/psafe), preskip/ppreskip
+  precheck kills, win set_cheapest total/startup/parameterized. Verified
+  non-invasive: off emits zero lines; Q7 Limit→GroupAggregate→Gather Merge
+  and Q5 Parallel Append shapes unchanged. 12-query captures (same set as
+  0004) distilled by `scripts/pg-plancand-distill.py` →
+  `analysis/m0144/optdebug-0005/` (raw slices in `tmp/pg18-optdebug/plancand/`).
+  First reads: precheck kills ≈ half of all rejections; via=cost dominates
+  post-build (zero rows/outer/psafe/dis rejections corpus-wide); emit
+  verdict BEFORE pfree (first draft had a use-after-free).
+  `docs/design/0100-0149/m0144-0005-debug-plan-candidates.md`;
+  `analysis/m0144/m0144-0005-debug-plan-candidates.md`.
   Kind: impl
   Parent: none
 - [ ] **M0144-0006 — instrumented PG, instrument 3: `-finstrument-functions`
