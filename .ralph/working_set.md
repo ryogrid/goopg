@@ -1,46 +1,53 @@
-Task: M0142-0008a-3i-lateral-route — recon COMPLETE. The filed framing was
-  insufficient; the route defect is one stage EARLIER than any phase.
-Files: docs/design/0100-0149/m0142-0008a-3i-lateral-route-recon.md (NEW),
-  docs/design/README.md, .ralph/fix_plan.md, .ralph/deferral_ledger.md.
-  NO production file touched (recon).
-Key symbols: planner.go:1499 `resolveExpr(whereQual, ctx)` → planExistsExpr
-  (:15320-15333) → planSelectWithParent (:15661); planner.go:1539
-  `unnestSubqueriesInPlan`; :1540 `runJoinSearchBelowPinned` (predp.go:78,
-  Phase A tryJoinSearch :152, Phase B tryPGShapedJoinSearch :195);
-  ExistsExpr/InExpr structs (plan.go) — `Plan Node`, NO parser subquery.
+Task: M0142-0008a-3i-route-a — STEP 1 LANDED (inert). Step 2 (the flattening
+  splice) is the remaining work; the task stays open.
+Files: internal/optimizer/plan.go (ExistsExpr.Subquery, InExpr.Subquery),
+  planner.go (:15306 IN, :15338 EXISTS assignments; :16834/:17072 copy sites),
+  foldconst.go:69 (rebuild site — was the bug), exists_to_any.go:384
+  (deliberately nil), sublinkpullup.go (NEW), sublinkpullup_test.go (NEW),
+  docs/design/0100-0149/m0142-0008a-3i-route-a-retain-sublink-parse-tree.md
+Key symbols: sublinkBodyIsSimple, selectListOrQualHasAggOrWindow,
+  isAggregateFuncName (planner.go:9662), walkExpr (:9597),
+  planExistsExpr/planInExpr, unnestSubqueriesInPlan (step 2's site),
+  FoldConstants.
 Hypothesis/Findings:
-  - **Reordering Phase A and Phase B cannot fix anything.** The lowering
-    happens before EITHER phase: `resolveExpr` on the WHERE clause runs a
-    FULL recursive planner run on every EXISTS/IN body and keeps only the
-    finished Node. The parse tree is dropped and unreachable afterwards.
-  - This is the one object all four prior probes hit from different angles
-    (`-lateral`, `-leafcount`, M0144-0003a's census, its refutation). Each
-    attributed it to the phase it happened to be inspecting.
-  - PG inverts the order: `pull_up_sublinks` (planner.c:737) and
-    `pull_up_subqueries` (:759) run while the body is still an unplanned
-    `Query`; `SS_process_sublinks` (:1328) plans ONLY what pull-up refused;
-    `query_planner` (:1654) searches one flattened range table.
-  - **All five witnesses are flattenable**: Q16/Q94 = one `catalog_sales`;
-    Q35/Q10/Q69 = `store_sales,date_dim` (+ web/catalog siblings). Plain
-    SELECTs, no agg/HAVING/window/setop/DISTINCT/LIMIT/ORDER BY — all
-    satisfy `is_simple_subquery` (prepjointree.c:1807) in full.
-  - Route filed as **M0142-0008a-3i-route-a** (impl): (1) retain the parser
-    subquery on ExistsExpr/InExpr — additive, 7 call sites, 52 `.Plan`
-    readers unaffected; (2) flatten a simple body into the outer join list
-    before planning it. Changes WHEN a body is planned = planner-pipeline
-    work, not seam/admission work.
-  - Tracker corrections made this loop (stale checkboxes, no work implied):
-    M0144-0003a `[ ]`→`[!]` (its own notes say unimplementable),
-    M0144-0011b `[ ]`→`[x]` (recon complete since loop #47),
-    M0141-S2a-fix `[ ]`→`[x]` (fix1 `[x]`, fix2/fix2r `[x]` — both halves).
-Next step: **M0142-0008a-3i-route-a** is the implementable successor and is
-  the one task that unblocks all five. SIZE STEP 1 ALONE FIRST — carrying
-  the parser subquery is additive and measurable on its own (it must be
-  provably inert), and only then attempt the flattening splice. Do NOT
-  re-attempt a seam widening: `chainCarriesLateral`, the `*Project`
-  descent, and the synthetic RHS participant are each measured and refuted.
+  - Step 1 lands the two prerequisites the route needed and NOTHING else:
+    the parse tree is retained (it was consumed by planSelectWithParent and
+    dropped, so there was nothing to flatten), and `sublinkBodyIsSimple`
+    ports `is_simple_subquery` (prepjointree.c:1807) refusal-for-refusal.
+  - **The retention test caught a real sibling-drift bug.** `FoldConstants`
+    (foldconst.go:69) REBUILDS an `InExpr` field by field and silently
+    dropped the new field — EXISTS passed while IN failed. Three copy sites
+    now carry it; `exists_to_any.go:384` deliberately does not (it REWRITES
+    rather than copies, so nil is the fail-closed answer). Write the test to
+    compare POINTERS: a shape comparison would have passed a re-parse.
+  - Verified the retention test FAILS with the two resolver assignments
+    removed, before claiming it pins anything.
+  - **Port gap recorded, not hidden**: `hasTargetSRFs` is NOT implemented —
+    classifying a function as set-returning needs the catalog this predicate
+    does not take, so an SRF-in-target-list body is currently ACCEPTED.
+    Step 2 must take a catalog argument or refuse unclassifiable FuncCalls;
+    it must NOT inherit today's answer. `security_barrier`/`lateral` arms
+    are safe-by-construction for qual sublinks, not merely unported.
+  - Inert by construction: zero production readers. Gates run anyway —
+    "provably inert" is a claim to be checked, not a reason to skip.
+  - TRAP (again): gate stamps hash the STAGED tree. The acceptance arm needs
+    a fresh BASE arm built from the unmodified tree — copy the changed files
+    aside, `git checkout HEAD --` them, run the base arm, restore, re-`git
+    add`, then run with ACCEPT_BASELINE. `git checkout HEAD --` clobbers the
+    INDEX too, so re-staging is mandatory or the stamp reads FAIL.
+Next step: **step 2 — the flattening splice.** In `unnestSubqueriesInPlan`,
+  test a retained body with `sublinkBodyIsSimple` and, when accepted, splice
+  its FROM items into the outer join list as REAL relations with its quals
+  merged into the outer predicate, discarding `.Plan`. Obligations already on
+  the task: give the predicate a catalog (SRF arm) FIRST; re-derive the leaf
+  arithmetic rather than carrying today's `Q16 nrels=4 nprefix=4 scans=3`;
+  close the P0-H11 `cumulativeFromSpans` round-trip in the SAME change; keep
+  Q78's `outer-over-derived` firewall intact; re-base `OuterColumnRef{Level:1}`
+  correlation refs into the outer chain's column space.
   Do NOT touch M0144-0011 ([!]), M0137-0019a ([!]), M0142-0005 ([!]).
-Gates run: units PASS (exit 0, 0 FAIL); pgbench smoke via the commit hook.
-  No values/plan gate applies — zero internal/ or cmd/ files changed, so no
-  plan can move (the recon's whole output is documents).
+Gates run: units PASS (exit 0, 0 FAIL); tpch-spotcheck PASS (Q12=2 Q13=33);
+  tpcds-sf025 sweep PASS (PASS=96 MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0
+  SKIP=3; plan channel same=99 changed=0; verdict-changes=none);
+  tpch-acceptance-arm PASS (24/24 on VALUES vs a fresh same-loop base arm);
+  go vet clean; pgbench smoke via the commit hook.
 In-flight: none.

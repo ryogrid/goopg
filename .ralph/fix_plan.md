@@ -7244,6 +7244,41 @@ cross-layer programme that has never been scoped.
         are `OuterColumnRef{Level:1}` and must be re-based into the outer
         chain's column space at splice time; PG gets this free because its
         reference is a `Var` over a range-table index.
+      - **STEP 1 LANDED 2026-09-20 — inert by construction.** Design doc:
+        `docs/design/0100-0149/m0142-0008a-3i-route-a-retain-sublink-parse-tree.md`.
+        Movement: none (zero production readers, so none was available).
+        - `ExistsExpr.Subquery` / `InExpr.Subquery` retain the UNPLANNED
+          parser body (`plan.go`), assigned at the two resolver sites
+          (`planner.go:15306`, `:15338`).
+        - `sublinkBodyIsSimple` (`internal/optimizer/sublinkpullup.go`)
+          ports `is_simple_subquery` (`prepjointree.c:1807`)
+          refusal-for-refusal, deriving `hasAggs`/`hasWindowFuncs` from the
+          parse tree via the existing `walkExpr`/`isAggregateFuncName`
+          rather than copying the aggregate-name table.
+        - **The retention test caught a real sibling-drift bug**:
+          `FoldConstants` (`foldconst.go:69`) REBUILDS an `InExpr` field by
+          field and silently dropped the new field — EXISTS passed while IN
+          failed. Three copy sites now carry it (`foldconst.go:69`,
+          `planner.go:16834`, `:17072`); `exists_to_any.go:384` deliberately
+          does NOT, because it rewrites rather than copies and nil is the
+          fail-closed answer. The test compares POINTERS and was verified to
+          fail with the resolver assignments removed.
+        - **Port gaps stated, not hidden** (ledger row filed): upstream's
+          `hasTargetSRFs` is NOT implemented — classifying an arbitrary
+          function as set-returning needs the catalog this predicate does not
+          take, so an SRF-in-target-list body is currently ACCEPTED, and step
+          2 must either take a catalog argument or refuse any target-list
+          `FuncCall` it cannot classify. The `security_barrier` and `lateral`
+          arms are safe-by-construction for qual sublinks (upstream's own
+          `convert_EXISTS_sublink_to_join` synthesises the RTE) rather than
+          merely unimplemented.
+        - Gates: units PASS; tpch-spotcheck PASS (Q12=2 Q13=33); tpcds-sf025
+          sweep PASS (MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0; plan channel
+          `same=99 changed=0`; verdict-changes=none); tpch-acceptance-arm
+          PASS (24/24 on VALUES vs a fresh same-loop baseline arm built from
+          the unmodified tree).
+        - **Step 2 (the flattening splice) is the remaining work** and the
+          task stays open for it.
     - **P0-H11 audit finding (2026-09-20, Loop \#32):** the leaf-admission
       increment must also fix `cumulativeFromSpans`'s span round-trip
       (`joinsearchseam.go` `cumulativeFromSpans` → `joinlistProblem.cumOffsets`

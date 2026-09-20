@@ -15302,6 +15302,8 @@ func planInExpr(x *parser.InExpr, ctx *resolveContext) (Expr, error) {
 			return nil, err
 		}
 		out.Plan = inner
+		// Subquery: see ExistsExpr.Subquery (M0142-0008a-3i-route-a step 1).
+		out.Subquery = x.Subquery
 		out.IsNonCorrelated = !planHasOuterRef(inner)
 	} else {
 		out.List = make([]Expr, len(x.List))
@@ -15330,7 +15332,10 @@ func planExistsExpr(x *parser.ExistsExpr, parent *resolveContext) (Expr, error) 
 	if err != nil {
 		return nil, err
 	}
-	return &ExistsExpr{pos: x.Pos(), Negated: x.Negated, Plan: inner, IsNonCorrelated: !planHasOuterRef(inner)}, nil
+	// Subquery: retain the unplanned body alongside the plan built from it
+	// (M0142-0008a-3i-route-a step 1) — see ExistsExpr.Subquery.
+	return &ExistsExpr{pos: x.Pos(), Negated: x.Negated, Plan: inner,
+		Subquery: x.Subquery, IsNonCorrelated: !planHasOuterRef(inner)}, nil
 }
 
 // planHasOuterRef reports whether any expression anywhere in the
@@ -16834,6 +16839,9 @@ func remapColumnRefsToSchema(e Expr, oldSchema Schema, newIndex map[string]int) 
 			AnyOp:           x.AnyOp,
 			AllOp:           x.AllOp,
 			Plan:            x.Plan,
+			// Subquery: a remap copies the SAME sublink, so the retained
+			// body still describes its Plan (M0142-0008a-3i-route-a).
+			Subquery:        x.Subquery,
 			List:            list,
 			IsNonCorrelated: x.IsNonCorrelated,
 		}
@@ -17072,6 +17080,9 @@ func shiftColumnRefsBy(e Expr, delta int) Expr {
 			AnyOp:           x.AnyOp,
 			AllOp:           x.AllOp,
 			Plan:            x.Plan,
+			// Subquery: a remap copies the SAME sublink, so the retained
+			// body still describes its Plan (M0142-0008a-3i-route-a).
+			Subquery:        x.Subquery,
 			List:            list,
 			IsNonCorrelated: x.IsNonCorrelated,
 		}

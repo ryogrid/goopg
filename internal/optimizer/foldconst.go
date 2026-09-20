@@ -66,7 +66,10 @@ func FoldConstants(e Expr) Expr {
 		for i, item := range x.List {
 			folded[i] = FoldConstants(item)
 		}
-		return &InExpr{pos: x.pos, Operand: FoldConstants(x.Operand), Negated: x.Negated, NotEqualAny: x.NotEqualAny, AnyOp: x.AnyOp, AllOp: x.AllOp, Plan: x.Plan, List: folded, IsNonCorrelated: x.IsNonCorrelated}
+		// Subquery rides alongside Plan: this arm REBUILDS the node, so a
+		// field it forgets is a field the rest of the planner never sees
+		// (M0142-0008a-3i-route-a — the retention test caught exactly this).
+		return &InExpr{pos: x.pos, Operand: FoldConstants(x.Operand), Negated: x.Negated, NotEqualAny: x.NotEqualAny, AnyOp: x.AnyOp, AllOp: x.AllOp, Plan: x.Plan, Subquery: x.Subquery, List: folded, IsNonCorrelated: x.IsNonCorrelated}
 
 	case *FuncCall:
 		foldedArgs := make([]Expr, len(x.Args))

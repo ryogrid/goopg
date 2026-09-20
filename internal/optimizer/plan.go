@@ -251,7 +251,11 @@ type InExpr struct {
 	// AllOp selects ALL (AND) instead of ANY/SOME (OR) semantics when AnyOp
 	// is set. M0122-0004.
 	AllOp           bool
-	Plan            Node // populated when the source is a subquery
+	Plan Node // populated when the source is a subquery
+	// Subquery is the UNPLANNED parser body `Plan` was built from, when the
+	// source is a subquery — see ExistsExpr.Subquery for why it is retained
+	// and why nothing reads it yet (M0142-0008a-3i-route-a step 1).
+	Subquery        *parser.SelectStmt
 	List            []Expr
 	IsNonCorrelated bool
 	// ParParam/Args: PARAM_EXEC lowering (D4.1, subplan_lower.go).
@@ -273,9 +277,35 @@ func (*InExpr) exprNode()  {}
 // IsNonCorrelated is true when Plan contains zero
 // OuterColumnRef nodes — see InExpr for the cache implication.
 type ExistsExpr struct {
-	pos             int
-	Negated         bool
-	Plan            Node
+	pos     int
+	Negated bool
+	Plan    Node
+	// Subquery is the UNPLANNED parser body this ExistsExpr's `Plan` was
+	// built from (M0142-0008a-3i-route-a step 1).
+	//
+	// `Plan` is produced eagerly, at expression-resolution time, by
+	// `planExistsExpr` -> `planSelectWithParent` — a full recursive planner
+	// run that happens BEFORE `unnestSubqueriesInPlan` and before either
+	// join search (planner.go:1499 vs :1539/:1540). That ordering is the
+	// route defect `m0142-0008a-3i-lateral-route-recon.md` names: by the
+	// time the unnest turns this sublink into a pinned Semi/Anti join, its
+	// RHS is a finished plan carrying its own output `*Project` and
+	// sometimes a `*Gather` with a worker count already chosen, so the
+	// search downstream sees one opaque leaf where PG sees base relations.
+	//
+	// PG never plans a body it is about to pull up: `pull_up_sublinks`
+	// (prepjointree.c:468) and `pull_up_subqueries` (:1083) run while the
+	// body is still an unplanned `Query`, and `SS_process_sublinks`
+	// (subselect.c:2026, reached at planner.c:1328) plans only what pull-up
+	// refused. Retaining the parse tree here is what makes goopg's
+	// equivalent possible at all — the field is the prerequisite, not the
+	// fix.
+	//
+	// Nothing reads it yet: step 1 is deliberately inert (the same posture
+	// `pathkeysCountContainedIn` and `costIncrementalSort` landed under).
+	// Step 2 discards `Plan` for a body `sublinkBodyIsSimple` accepts and
+	// splices its FROM items into the outer join list instead.
+	Subquery        *parser.SelectStmt
 	IsNonCorrelated bool
 	// ParParam/Args: see InExpr — PARAM_EXEC lowering (D4.1).
 	ParParam []int
