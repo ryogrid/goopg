@@ -1,0 +1,26 @@
+Q14 LCCENSUS nrels=3 nprefix=3 scans=2 semiAnti=1 kinds=*optimizer.Project *optimizer.Project 
+Q14 LCCENSUS nrels=3 nprefix=3 scans=2 semiAnti=1 kinds=*optimizer.Project *optimizer.Project 
+Q14 LCCENSUS nrels=3 nprefix=3 scans=2 semiAnti=1 kinds=*optimizer.Project *optimizer.Project 
+Q16 LCCENSUS nrels=4 nprefix=4 scans=3 semiAnti=2 kinds=*optimizer.Project *optimizer.SeqScan *optimizer.SeqScan 
+Q23 LCCENSUS nrels=2 nprefix=2 scans=3 semiAnti=2 kinds=*optimizer.Project *optimizer.Project *optimizer.Project 
+Q23 LCCENSUS nrels=2 nprefix=2 scans=3 semiAnti=2 kinds=*optimizer.Project *optimizer.Project *optimizer.Project 
+Q23 LCCENSUS nrels=3 nprefix=3 scans=3 semiAnti=2 kinds=*optimizer.Project *optimizer.Project *optimizer.Project 
+Q23 LCCENSUS nrels=3 nprefix=3 scans=3 semiAnti=2 kinds=*optimizer.Project *optimizer.Project *optimizer.Project 
+Q33 LCCENSUS nrels=4 nprefix=4 scans=2 semiAnti=1 kinds=*optimizer.Project *optimizer.Project 
+Q33 LCCENSUS nrels=4 nprefix=4 scans=2 semiAnti=1 kinds=*optimizer.Project *optimizer.Project 
+Q33 LCCENSUS nrels=4 nprefix=4 scans=2 semiAnti=1 kinds=*optimizer.Project *optimizer.Project 
+Q35 LCCENSUS nrels=3 nprefix=3 scans=2 semiAnti=1 kinds=*optimizer.NestedLoopIndexJoin *optimizer.Gather 
+Q56 LCCENSUS nrels=4 nprefix=4 scans=2 semiAnti=1 kinds=*optimizer.Project *optimizer.Project 
+Q56 LCCENSUS nrels=4 nprefix=4 scans=2 semiAnti=1 kinds=*optimizer.Project *optimizer.Project 
+Q56 LCCENSUS nrels=4 nprefix=4 scans=2 semiAnti=1 kinds=*optimizer.Project *optimizer.Project 
+Q58 LCCENSUS nrels=3 nprefix=3 scans=2 semiAnti=1 kinds=*optimizer.Project *optimizer.Project 
+Q58 LCCENSUS nrels=3 nprefix=3 scans=2 semiAnti=1 kinds=*optimizer.Project *optimizer.Project 
+Q58 LCCENSUS nrels=3 nprefix=3 scans=2 semiAnti=1 kinds=*optimizer.Project *optimizer.Project 
+Q60 LCCENSUS nrels=4 nprefix=4 scans=2 semiAnti=1 kinds=*optimizer.Project *optimizer.Project 
+Q60 LCCENSUS nrels=4 nprefix=4 scans=2 semiAnti=1 kinds=*optimizer.Project *optimizer.Project 
+Q60 LCCENSUS nrels=4 nprefix=4 scans=2 semiAnti=1 kinds=*optimizer.Project *optimizer.Project 
+Q83 LCCENSUS nrels=3 nprefix=3 scans=2 semiAnti=1 kinds=*optimizer.Project *optimizer.Project 
+Q83 LCCENSUS nrels=3 nprefix=3 scans=2 semiAnti=1 kinds=*optimizer.Project *optimizer.Project 
+Q83 LCCENSUS nrels=3 nprefix=3 scans=2 semiAnti=1 kinds=*optimizer.Project *optimizer.Project 
+Q94 LCCENSUS nrels=4 nprefix=4 scans=3 semiAnti=2 kinds=*optimizer.Project *optimizer.SeqScan *optimizer.SeqScan 
+Q95 LCCENSUS nrels=4 nprefix=4 scans=3 semiAnti=2 kinds=*optimizer.Project *optimizer.Project *optimizer.Project 

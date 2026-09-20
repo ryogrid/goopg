@@ -11267,6 +11267,47 @@ goopg's processing route diverged from PG's upstream of the fix).
   class; the ~62 leaf-count declines re-attributed).
   Kind: impl
   Parent: M0144-0003
+  - **FIX SHAPE CORRECTED 2026-09-20 (loop \#56) by corpus census —
+    the opaque leaf is a `*Project`, NOT a `*Filter`.** Design doc:
+    `docs/design/0100-0149/m0144-0003a-opaque-leaf-census.md`; evidence:
+    `analysis/m0144/m0144-0003a-opaque-leaf-census.txt`. Movement: none
+    (census + decision; probe reverted, no production code changed).
+    - Every opaque leaf at the `leaf-count` decline, all 99 SF0.25 queries:
+      `Project` 53 occurrences, `SeqScan` 4, `NestedLoopIndexJoin` 1,
+      `Gather` 1. **Zero `*Filter` leaves.** `Project` is the only kind in
+      23 of the 26 declines and appears in 10 of the 11 declining queries.
+    - The decline count is **26 across 11 queries** (Q14 Q16 Q23 Q33 Q35
+      Q56 Q58 Q60 Q83 Q94 Q95), not the filed `leaf-count×62` — consistent
+      with `M0142-0008-producer` and the `-plumbing` chain landing between
+      the two censuses.
+    - Provenance of the Projects was already established by
+      `M0142-0008a-3i-verify`: `unnestExistsExpr` clones the EXISTS body's
+      already-planned subquery tree, and every planned `SELECT` carries its
+      own top-level output-list `*Project`.
+    - **This is EASIER than the filed fix**, not harder: a Project carries
+      no conjuncts, so the whole "re-base into the chain's WHERE/qual
+      space" half of the filed fix shape disappears. What remains is
+      structural — descend, and let the walk flatten the body's own join
+      tree into real leaves.
+    - **Decision (recorded before implementation, AGENT.md C3): descend a
+      `*Project` that satisfies `projectIsPositionalIdentity`** — the
+      predicate `M0144-0011a-3` already landed and tested
+      (`internal/optimizer/upperorderedinput.go`; target `j` is
+      `ColumnRef{Index: j}` for every `j`, equal widths, not
+      `IsolatedScope`). Under it a Project re-assigns nothing, so the
+      seam's position-based coordinate machinery
+      (`buildLeafSpans`/`remapWalkOrderFlatToSpans`/
+      `pgShapedOffsetChecksOK`) sees the same positions before and after.
+      The `*Filter` arm is NOT to be implemented — it has no witness.
+    - The implementing loop must still establish three things this census
+      did not (it wrote no code):
+      - do the body's exposed leaves line up with `ctx.bindings`?
+        `nprefix`=4 while `scans`=3 on Q16, so the arithmetic only works if
+        the body's relations are among the `nprefix` FROM items;
+      - the P0-H11 `cumulativeFromSpans` span round-trip must close in the
+        SAME change — it is latent only because nothing gets through today;
+      - **Q35 is out of scope** (`Gather` + `NestedLoopIndexJoin` leaves,
+        the `M0142-0008a-3i-leafcount` finding), so expect 10 of 11.
 - [ ] **M0144-0003b — jointree-level UNION ALL flattening**
   (`pull_up_simple_union_all` analog; filed by M0144-0003 item (b)). PG
   flattens UNION ALL-in-FROM into an appendrel during jointree
