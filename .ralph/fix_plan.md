@@ -11428,7 +11428,7 @@ goopg's processing route diverged from PG's upstream of the fix).
       `DeriveLegacyDisplayCost`, whose header states "this is NOT a cost
       model and nothing may plan against it". Choosing how to price them
       is a design decision with a 32-query blast radius; see the child.
-- [ ] **M0144-0011b-1 — price a non-table join-search leaf from its own
+- [x] **M0144-0011b-1 — price a non-table join-search leaf from its own
   subtree, not as a sequential scan** (filed by M0144-0011b's recon).
   `internal/optimizer/joinsearch.go:437` + its partial twin
   (`addBaseRelPartialPaths`): when `leafBaseScan(leaf)` is not a base heap
@@ -11457,6 +11457,53 @@ goopg's processing route diverged from PG's upstream of the fix).
       rule (`internal/optimizer/plancost.go:116`).
   - Whichever is chosen, the choice and its PG citation go in the design
     doc BEFORE any parity number is taken (AGENT.md C3).
+  - **LANDED 2026-09-20 (loop \#48).** Design doc:
+    `docs/design/0100-0149/m0144-0011b-1-subplan-leaf-cost.md` (its §3
+    decision was written before any parity number was taken).
+    Movement: none
+    - **Decision taken: a narrowed option (2)** — port `cost_subqueryscan`'s
+      SHAPE (`postgres/src/backend/optimizer/path/costsize.c:1491-1493`) for
+      sub-plan leaves ONLY: `startup = subtree.startup`,
+      `total = subtree.total + cpu_tuple_cost*rows`
+      (`costSubplanLeaf`/`isSubplanLeaf`, internal/optimizer/joinsearch.go).
+      The qual term PG adds is deliberately NOT charged — goopg's leaf is a
+      finished tree whose local filter is already inside the node priced, so
+      charging it again would double-count.
+    - Index and bitmap leaves are LEFT on today's pricing on purpose, so any
+      category movement is attributable to sub-plan leaves alone. Ledger row
+      filed; they are mispriced too, by a different mechanism
+      (`cost_index`).
+    - The defect is closed: Q8's `Hash Join (cost=1.27..11.28)` over a
+      `HashSetOp Intersect (cost=6457.53..7360.42)` is now
+      `Hash Join (cost=6458.80..7374.05)` — parent above child again.
+    - **Q8's top join now elects PG's method**: `Nested Loop
+      (9934.68..27215.31)` where it had a `Hash Join (3487.55..19455.50)`,
+      against PG's own `Nested Loop (12329.66..28502.37)`. First divergence
+      advances `depth=3 [join-method] PG Nested Loop | goopg Hash Join` →
+      `depth=3 [join-order] PG Nested Loop | goopg Nested Loop`.
+    - SF0.25: match 2 → 2, `join-method` 70 → 68 (the named category, right
+      direction), `qual-placement` 25 → 26, `missingnode` 25 unchanged.
+      30/99 plans changed — the expected size, since 32 queries join over a
+      sub-plan leaf. All deltas inside ±3, hence `Movement: none`.
+    - TPC-H parallel: parity lines and the plans capture BYTE-IDENTICAL to
+      HEAD (`sha256 0bf7e4d1540cf0e4`) from a different binary
+      (`e1bb094f5aeae53f` vs `42dfcd6069014ad2`) — G3's proof of inertness
+      rather than a re-measured binary. No TPC-H query joins over a
+      sub-plan leaf.
+    - Three queries whose plans changed got slower (Q11 3s→7s, Q58 2s→5s,
+      Q95 3s→6s); Q28's 3s→6s is host noise — its plan did not change.
+      Ledger row filed. Per AGENT.md §Goal a slower plan that matches is
+      not a regression here.
+    - Gates: units PASS; `tpch-spotcheck` PASS (Q12=2 Q13=33);
+      `tpcds-sf025 sweep` PASS (`MISMATCH=0 CKMISMATCH=0 ERROR=0
+      TIMEOUT=0`) — the load-bearing gate here, since 30 plans changed and
+      every one still returns the same rows and checksums;
+      `tpch-acceptance-arm` PASS (24/24 VALUES); `make ea-ratchet` `N/A`.
+    - Still open (both ledgered): index/bitmap leaf pricing, and the fact
+      that for a class with no `PlanCost` field (`SetOp` among them) the
+      base cost is still `DeriveLegacyDisplayCost` — a FLOOR built from the
+      children's own largely-real costs, not PG's number. Full option (2),
+      a real upper-rel path per sub-plan class, owns that.
 - [ ] **M0144-0011c — `Materialize` node existence** (filed by
   M0144-0011). Q8 is `MISSING-NODE: PG-only kinds: Materialize` — goopg
   has no Materialize plan node (`MaterializedCTEScan` is a different
