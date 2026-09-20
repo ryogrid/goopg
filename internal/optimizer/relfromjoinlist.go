@@ -768,6 +768,11 @@ func (prob *joinlistProblem) searchOneProblem(items []joinlistRel, tupleFraction
 	// Target is computed from NeededCols, like the serial scans' (P4-01).
 	s.setBaseRelConsiderParallel(prob.cat)
 	s.addBaseRelPartialPaths()
+	// M0145-0004: `add_paths_to_append_rel`'s partial arm — hoist the
+	// Parallel Append candidate a marked UNION ALL leaf's nested scope
+	// already filed onto the leaf rel (jointreeappendrel.go). Inert on
+	// the legacy arm, which never sets the mark.
+	s.addAppendRelPartialPaths()
 	s.addBaseRelIndexPaths(prob.cat)
 	// R121 Slice A(i): narrow the COST width triple on every base-rel scan
 	// path, in ONE sweep after all of them exist.

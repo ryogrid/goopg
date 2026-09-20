@@ -81,6 +81,22 @@ func (s *searchCtx) setBaseRelConsiderParallel(cat catalog.Catalog) {
 		rel.ConsiderParallel = false
 		if s.parallelModeOK && i < len(s.relInfos) {
 			rel.ConsiderParallel = relConsiderParallel(rel.baseLeaf, s.relInfos[i].table, cat)
+			// M0145-0004: an appendrel leaf's rtekind arm is opaque to
+			// relConsiderParallel — a *SetOp leaf reads as `other` and
+			// fails closed. PG computes the appendrel's safety by walking
+			// the member rels (is_parallel_safe over the subquery's
+			// jointree); the SETOP rel createSetOpPaths stamped on the
+			// leaf node already carries exactly that result — the AND of
+			// the member rels' ConsiderParallel — so the leaf inherits
+			// it. The mark is only ever set on the jointree arm for a
+			// simple-UNION-ALL-admissible subquery.
+			if s.relInfos[i].appendrel {
+				if carrier, ok := rel.baseLeaf.(setOpBranchRelNode); ok {
+					if setOpRel := carrier.setOpBranchRel(); setOpRel != nil {
+						rel.ConsiderParallel = setOpRel.ConsiderParallel
+					}
+				}
+			}
 		}
 		// R54 Step-0: the S1 leaf record. Same searchCtx that owns the
 		// trace (relfromjoinlist.go), so the line lands in the problem's

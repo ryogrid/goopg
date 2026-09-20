@@ -404,9 +404,14 @@ func windowSortKeys(w *WindowAgg) []SortKey {
 // the order the semantics depend on (EXCEPT is not commutative, and
 // `SetOp.Output()` reads the left branch's schema).
 //
-// The returned layout is nil for the same reason the other upper arms return
-// nil: a set operation has two children and therefore no single child layout
-// to pass through, and no caller above the seam reads one.
+// The returned layout is `baseRelLayout(p.Rel, out)` — nil for every
+// pre-M0145-0004 caller for the same reason the other upper arms return
+// nil: a set operation has two children and therefore no single child
+// layout to pass through, and an upper rel has no baseLeaf. The
+// appendrel hoist CHANGED that: a PathSetOp re-targeted onto a leaf rel
+// can sit as a join's input, where `joinInputsFor` panics on a nil child
+// layout — the emitted node is the leaf's own SetOp (same schema as
+// `rel.baseLeaf`), so the contiguous leaf layout is exact.
 //
 // M0140-0006c-3: a child that is a searched-path pick (either arm's
 // `PartialPathlist[0]` — anything that is not the branch's own
@@ -457,7 +462,7 @@ func createSetOpPlan(p *Path) (Node, outputLayout) {
 	// arm's marks into plans that never made the pick.
 	out.LeftNonPartial = p.SetOpLeftNonPartial
 	out.RightNonPartial = p.SetOpRightNonPartial
-	return &out, nil
+	return &out, baseRelLayout(p.Rel, &out)
 }
 
 // spliceBranchEmission rebuilds `branch` with the searched emission swapped

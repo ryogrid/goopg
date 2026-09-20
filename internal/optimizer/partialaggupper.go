@@ -618,7 +618,29 @@ func parallelSeedCost(serial Cost, d float64) Cost {
 // (`create_index_paths` passes `index->pages`). Measured on TPC-H q13/q16
 // (M0134-0189) and repeated here so the two sizings cannot disagree.
 func upperSplitWorkers(child Node, cp costParams, ps PlannerSettings) int {
-	scan := drivingScan(child)
+	// M0145-0004: size over EVERY driving scan — a `*SetOp` driving node
+	// stands for all of its streamed member branches (drivingScans), and
+	// the split's worker count is the max across them, the same rule
+	// PG's create_append_path applies to child subpaths. An unsafe or
+	// unsizable branch contributes zero and does not raise the max; the
+	// pre-pass subtree gate (`gate=subtree`) has already refused unsafe
+	// members outright.
+	best := 0
+	for _, scan := range drivingScans(child) {
+		if w := upperSplitWorkersForScan(scan, cp); w > best {
+			best = w
+		}
+	}
+	if best > ps.MaxParallelWorkersPerGather {
+		best = ps.MaxParallelWorkersPerGather
+	}
+	return best
+}
+
+// upperSplitWorkersForScan is the single-scan body of upperSplitWorkers,
+// split out so a SetOp driving node can size each member branch
+// independently.
+func upperSplitWorkersForScan(scan Node, cp costParams) int {
 	tbl := scanTable(scan)
 	if tbl == nil {
 		return 0
@@ -648,9 +670,5 @@ func upperSplitWorkers(child Node, cp costParams, ps PlannerSettings) int {
 			pages = ipages
 		}
 	}
-	workers := computeParallelWorkerForRel(cp, pages, tableParallelWorkersReloption(tbl))
-	if workers > ps.MaxParallelWorkersPerGather {
-		workers = ps.MaxParallelWorkersPerGather
-	}
-	return workers
+	return computeParallelWorkerForRel(cp, pages, tableParallelWorkersReloption(tbl))
 }

@@ -714,6 +714,11 @@ type baseRelInfo struct {
 	// `leafIsDerivedInput` must not treat its `table == nil` as the same
 	// "no statistics" signal a genuine derived input's nil table is.
 	isSemiAntiSyntheticLeaf bool
+	// appendrel mirrors `rangeBinding.appendrel` (M0145-0004): this leaf
+	// is a UNION ALL subquery the jointree pipeline marked at
+	// planSubqueryRangeVar. `addAppendRelPartialPaths` reads it to hoist
+	// the leaf's Parallel Append candidate onto the search leaf rel.
+	appendrel bool
 }
 
 // estimateBaseRelInfo computes a `baseRelInfo` for one FROM
@@ -734,6 +739,7 @@ func estimateBaseRelInfo(binding rangeBinding, scan Node, local Expr) baseRelInf
 		table:          binding.table,
 		localFilter:    local,
 		hasLocalFilter: local != nil,
+		appendrel:      binding.appendrel,
 	}
 	// M0125-0043: the small-dimension answer lives on the leaf scan now.
 	// `smallDimensionSide` keeps the catalog-hint reading for the bindings

@@ -997,3 +997,113 @@ func TestGatherOverSetOpBitmapBranchIdentity(t *testing.T) {
 		})
 	}
 }
+
+// TestGatherOverJoinProbeSetOpIdentity is M0145-0004's executor gate: the
+// appendrel hoist lets a partial PathSetOp sit as a hash join's PROBE input
+// (`Gather → HashJoin → probe SetOp`), where M0140-0006c only ever placed a
+// setOp at or near the partial subtree's root. Before unwrapToSetOp gained
+// its *joinOp arm, attachAll could not reach that setOp: the flat attach
+// walks have no *setOp case, so the member scans stayed unclaimed and every
+// worker replayed the WHOLE union — (workers+1) copies of every probe row.
+//
+// The fixture's union is {0..259} ∪ {100000..100089}; the join against
+// pq_setop_c (aid 0..39) yields exactly the 40 left-branch matches. The
+// identity check counts rows: an unattached member scan returns each match
+// once per participant (160 rows at workers=4), a claim that starves a
+// branch returns fewer than 40.
+func TestGatherOverJoinProbeSetOpIdentity(t *testing.T) {
+	ctx, cleanup := parallelSetOpFixture(t)
+	defer cleanup()
+
+	ctx.MaxParallelWorkers = 8
+	ctx.ParallelLeaderParticipation = true
+
+	const sql = "SELECT u.id FROM (SELECT id FROM pq_setop_a UNION ALL SELECT id FROM pq_setop_b) u, " +
+		"pq_setop_c c WHERE u.id = c.aid"
+
+	for _, workers := range []int{1, 2, 4} {
+		t.Run(fmt.Sprintf("workers=%d", workers), func(t *testing.T) {
+			join := planHashForced(t, ctx, sql)
+
+			// The setOp must sit on the probe side or the test exercises
+			// nothing: a build-side union is drained once by the leader and
+			// needs no claim set at all.
+			hj := findHashJoin(join)
+			if hj == nil {
+				t.Fatal("no Hash Join in the forced plan; the fixture moved")
+			}
+			probe := hj.Left
+			if hj.BuildLeft {
+				probe = hj.Right
+			}
+			if !planTreeHasSetOp(probe) {
+				t.Fatalf("probe side (%T chain) contains no *SetOp; the join orientation moved and this test no longer exercises the join-descent arm", probe)
+			}
+
+			// Serial baseline: drain the join node itself.
+			advanceStmtCounter(ctx)
+			want := drainPlan(t, ctx, join)
+			if len(want) != 40 {
+				t.Fatalf("serial baseline = %d rows, want 40 (c.aid 0..39 match union ids 0..39 only); the fixture moved", len(want))
+			}
+
+			advanceStmtCounter(ctx)
+			gathered := optimizer.NewGather(0, join, workers)
+			op, err := Build(gathered)
+			if err != nil {
+				t.Fatalf("build: %v", err)
+			}
+			if err := op.Open(ctx); err != nil {
+				t.Fatalf("open: %v", err)
+			}
+			var got []string
+			for {
+				slot, err := op.Next()
+				if err == EOF {
+					break
+				}
+				if err != nil {
+					op.Close()
+					t.Fatalf("next: %v", err)
+				}
+				got = append(got, renderRows([]Row{slot.Row()})...)
+			}
+			if err := op.Close(); err != nil {
+				t.Fatalf("close: %v", err)
+			}
+
+			sort.Strings(want)
+			sort.Strings(got)
+			if len(got) != len(want) {
+				t.Fatalf("got %d rows, want %d — more means each worker replayed the whole union probe (the pre-arm N-copies defect: attachAll could not reach a setOp under joinOp)",
+					len(got), len(want))
+			}
+			for i := range want {
+				if got[i] != want[i] {
+					t.Fatalf("row %d differs: got %q want %q — a worker dropped or duplicated a probe row", i, got[i], want[i])
+				}
+			}
+		})
+	}
+}
+
+// planTreeHasSetOp reports whether any *optimizer.SetOp sits anywhere in n,
+// descending the same multi-child kinds the claim walk does.
+func planTreeHasSetOp(n optimizer.Node) bool {
+	found := false
+	var walk func(optimizer.Node)
+	walk = func(cur optimizer.Node) {
+		if cur == nil || found {
+			return
+		}
+		if _, ok := cur.(*optimizer.SetOp); ok {
+			found = true
+			return
+		}
+		for _, c := range optimizer.ParallelChildrenForTest(cur) {
+			walk(c)
+		}
+	}
+	walk(n)
+	return found
+}

@@ -240,7 +240,19 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 	//
 	// Past `maxSearchRels` the RelSet cannot address the problem at all, and
 	// the joinlist's own leaf indices would exceed the clause list's bit width.
-	if nrels < minSearchRels() || nrels > maxSearchRels || len(ctx.joinlist) == 0 {
+	//
+	// M0145-0004: a UNION ALL appendrel's member scope carries
+	// ctx.appendrelMember — the member needs its searched rel's
+	// PartialPathlist for the parent SETOP rel's partial arms, exactly
+	// the hole E-21 names below. Lower the one-relation floor for it the
+	// same way GOOPG_ONEREL_SEARCH does globally; the flag is set only
+	// inside planSelectImpl for a scope that arrived as a marked union's
+	// member, so this is the jointree arm alone.
+	floor := minSearchRels()
+	if ctx.appendrelMember && floor > 1 {
+		floor = 1
+	}
+	if nrels < floor || nrels > maxSearchRels || len(ctx.joinlist) == 0 {
 		traceSeamDecline("size-or-no-joinlist", nrels, len(ctx.joinlist))
 		return node, pred, false
 	}
@@ -278,7 +290,7 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 		traceSeamDecline("prefix-exceeds-bindings", nrels, nprefix)
 		return node, pred, false
 	}
-	if nprefix < minSearchRels() && len(spine) == 0 {
+	if nprefix < floor && len(spine) == 0 {
 		// UNDER a spine a one-relation prefix is already planned
 		// (M0134-0188): there is no order to choose, but there IS an access
 		// method — base-rel path generation runs, `add_path` picks among
@@ -294,6 +306,12 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 		// (`set_base_rel_pathlists`, allpaths.c:221, called unconditionally
 		// from `make_one_rel` before the joinlist is looked at). With the
 		// knob off this is the historical decline, unchanged.
+		//
+		// M0145-0004 lowers the same floor for an appendrel member scope
+		// (`ctx.appendrelMember` set by planSelectImpl): the member's
+		// searched rel is the PartialPathlist carrier the parent SETOP
+		// rel's partial arms read, so a single-leaf member needs base-rel
+		// path generation exactly as `GOOPG_ONEREL_SEARCH` argues.
 		traceSeamDecline("prefix-size", nrels, nprefix)
 		return node, pred, false
 	}

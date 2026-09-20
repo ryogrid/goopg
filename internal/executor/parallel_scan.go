@@ -629,6 +629,17 @@ func newLeafParallelClaimSet() *parallelClaimSet {
 // recursion sees (Filter/Project/instrumentedOp/Sort/Aggregate) looking for
 // a *setOp, so attachAll finds one wrapped by EXPLAIN instrumentation or a
 // residual predicate/projection the same way a bare one is found.
+//
+// M0145-0004: also descends the PARTIAL side of a join — the one
+// multi-child kind a partial spine may contain. The appendrel hoist lets
+// a PathSetOp sit as a join's probe input (`Gather → HashJoin → probe
+// SetOp`), where before M0140-0006c a setOp could only sit at/near the
+// subtree root. Without this arm attachAll fell through to the flat
+// walk, which has no *setOp arm: the member scans stayed unclaimed and
+// every worker returned the whole union — N+1 copies of every row.
+// The side rules mirror attachParallelScan's *joinOp arm exactly
+// (nested loop / merge / lateral → literal left, hash → probeSideIsLeft);
+// a shape the planner refused partial-capability for is not descended.
 func unwrapToSetOp(op Operator) (*setOp, bool) {
 	switch x := op.(type) {
 	case *setOp:
@@ -643,6 +654,30 @@ func unwrapToSetOp(op Operator) (*setOp, bool) {
 		return unwrapToSetOp(x.child)
 	case *aggregateOp:
 		return unwrapToSetOp(x.child)
+	case *joinOp:
+		if x.plan == nil {
+			return nil, false
+		}
+		switch x.plan.Algo {
+		case optimizer.JoinAlgoNestedLoop:
+			if !ordinaryInnerNestedLoopPartial(x.plan) && !lateralProbeJoinPartial(x.plan, x.right) {
+				return nil, false
+			}
+			return unwrapToSetOp(x.left)
+		case optimizer.JoinAlgoMerge:
+			return unwrapToSetOp(x.left)
+		case optimizer.JoinAlgoHash:
+			if probeSideIsLeft(x.plan) {
+				return unwrapToSetOp(x.left)
+			}
+			return unwrapToSetOp(x.right)
+		}
+		return nil, false
+	case *nestedLoopIndexJoinOp:
+		if !optimizer.NestedLoopIndexJoinIsPartialCapable(x.plan) {
+			return nil, false
+		}
+		return unwrapToSetOp(x.outer)
 	}
 	return nil, false
 }

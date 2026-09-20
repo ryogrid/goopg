@@ -476,6 +476,18 @@ type resolveContext struct {
 	// emitting prefix's real leaf count is known.
 	jtPullup *jtPullup
 
+	// appendrelMember marks this resolveContext as a UNION ALL
+	// appendrel's MEMBER scope (M0145-0004): the member plans through
+	// the join search even for a single-leaf FROM, so its searched rel
+	// carries the PartialPathlist the parent's SETOP rel picks from
+	// (allpaths.c:1412-1453's per-child choice). The seam reads it to
+	// lower the one-relation floor `minSearchRels()` imposes —
+	// upstream has no such floor at all (set_base_rel_pathlists runs
+	// for every base rel). Set only inside planSelectImpl for a scope
+	// that arrived carrying plannerSet.appendrelMember; cleared for
+	// deeper scopes by the same one-level bound.
+	appendrelMember bool
+
 	// antiForcedNullCols: the "table\x00column" keys whose IS NULL conjunct
 	// forced a LEFT->ANTI conversion demotedForPlan (reduce_outer_joins.go)
 	// transplanted in this statement (R40/K69). Those conjuncts must not
@@ -622,6 +634,14 @@ type rangeBinding struct {
 	// `tableoid` reference instead — correct for non-partitioned
 	// base relations. M0100-0005y.
 	tableOidColIdx int
+	// appendrel marks a binding whose subquery passed the
+	// is_simple_union_all port (jointreeappendrel.go): a non-LATERAL
+	// FROM-clause `(... UNION ALL ...) alias` on the jointree pipeline.
+	// `addAppendRelPartialPaths` reads it — via baseRelInfo.appendrel —
+	// to hoist the leaf's Parallel Append candidate onto the search
+	// leaf rel (M0145-0004). Never set on the legacy pipeline, so the
+	// flag is the arm gate as well as the admissibility record.
+	appendrel bool
 }
 
 func tableSchema(t *catalog.Table) Schema {
@@ -1293,6 +1313,18 @@ func planSelectImpl(s *parser.SelectStmt, cat catalog.Catalog, plannerSet Planne
 
 	isSimpleSingle := len(s.From) == 1 && (len(s.FromExprs) == 0 || (len(s.FromExprs) == 1 && len(s.FromExprs[0].Joins) == 0))
 
+	// M0145-0004: a UNION ALL appendrel's member scope carries
+	// `plannerSet.appendrelMember` — it lifts the isSimpleSingle bypass
+	// here so the member plans through the join search and its searched
+	// rel carries a PartialPathlist the SETOP rel's partial arms can pick
+	// from (jointreeappendrel.go). Read once, then cleared: the lift is
+	// bounded to THIS scope — the member's own nested subqueries plan
+	// under a cleared flag, exactly as they did before. The setop fold
+	// above returns before this point for the union scope itself, so the
+	// flag reaches member scopes intact.
+	appendrelMember := plannerSet.appendrelMember
+	plannerSet.appendrelMember = false
+
 	var node Node
 	var ctx *resolveContext
 	// fromOnly tracks whether the single-table FROM clause used `FROM ONLY`
@@ -1317,7 +1349,7 @@ func planSelectImpl(s *parser.SelectStmt, cat catalog.Catalog, plannerSet Planne
 			Rows:   [][]Expr{{}},
 			schema: nil,
 		}
-	} else if isSimpleSingle && !oneRelSearchEnabled() {
+	} else if isSimpleSingle && !oneRelSearchEnabled() && !appendrelMember {
 		rv := s.From[0]
 		fromOnly = rv.Only
 		// Delegate the simple-single-table case to
@@ -1362,6 +1394,16 @@ func planSelectImpl(s *parser.SelectStmt, cat catalog.Catalog, plannerSet Planne
 		node, ctx, err = planFromClause(s, cat, plannerSet, scope)
 		if err != nil {
 			return nil, err
+		}
+		// M0145-0004: an appendrel member's ctx carries the flag to the
+		// seam, where it lowers the one-relation floor so a single-leaf
+		// member (`SELECT … FROM t`) still gets a searched rel — the
+		// PartialPathlist carrier the parent's SETOP rel picks from.
+		// Bounded to this scope: plannerSet.appendrelMember was already
+		// cleared above, so the member's own nested subqueries do not
+		// inherit it.
+		if appendrelMember && ctx != nil {
+			ctx.appendrelMember = true
 		}
 	}
 	// Make the catalog reachable from every resolveExpr call in
@@ -1459,7 +1501,7 @@ func planSelectImpl(s *parser.SelectStmt, cat catalog.Catalog, plannerSet Planne
 		// is a missed optimisation in the ON arm, never a wrong answer:
 		// both are value-preserving rewrites. Default OFF: the condition
 		// below is the historical branch, byte for byte.
-		if isSimpleSingle && !oneRelSearchEnabled() {
+		if isSimpleSingle && !oneRelSearchEnabled() && !appendrelMember {
 			// M0051-0004: inject synthetic range predicates alongside any
 			// LIKE conjuncts so tryRangeIndexScan can activate a B-tree.
 			whereForIndex := injectLikeRangePredicates(whereQual)
@@ -1636,7 +1678,16 @@ func planSelectImpl(s *parser.SelectStmt, cat catalog.Catalog, plannerSet Planne
 			// See pushOuterQualsIntoLaterals in pushdown.go.
 			node = pushOuterQualsIntoLaterals(node)
 		}
-	} else if joinTreeHasOuterLink(node) {
+	} else if joinTreeHasOuterLink(node) || appendrelMember {
+		// M0145-0004: `|| appendrelMember` — a UNION ALL appendrel's
+		// member scope plans through the join search even when the
+		// member has no WHERE and no outer link (a bare `SELECT … FROM t`
+		// member, the benchmark corpus's dominant shape). PG gives every
+		// appendrel member its own rel with a full pathlist — the
+		// partial_pathlist the parent's add_paths_to_append_rel picks
+		// from; the searchedTree stamp is what carries that rel out to
+		// setOpBranchRelOf.
+		//
 		// M0134-0188: a FROM tree with no WHERE at all. No *Filter wrapper
 		// exists, so the seam chain above — which lives entirely inside the
 		// `s.Where != nil` branch — never ran for such a statement, and its
@@ -5253,6 +5304,13 @@ func planSubqueryRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int
 	// cat set so the analyzer outer-scope chain is built correctly.
 	var inner Node
 	var err error
+	// M0145-0004: `is_simple_union_all` (prepjointree.c:2214) on the
+	// subquery's chain — jointree arm and non-LATERAL only, matching the
+	// binding mark and the member-search flag below. A LATERAL union's
+	// members may cross-reference earlier FROM items; PG propagates
+	// rte->lateral to them, which this slice does not express.
+	appendrelSubquery := jointreePipeline && lateralCtx == nil &&
+		subqueryChainIsSimpleUnionAll(rv.Subquery)
 	if lateralCtx != nil {
 		latCtxWithCat := *lateralCtx
 		latCtxWithCat.cat = cat
@@ -5301,6 +5359,15 @@ func planSubqueryRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int
 		// collide with the outer level's.
 		// B-12d: and this statement's settings (ps), so the inner
 		// join search prices under the session's GUCs.
+		//
+		// M0145-0004: an admissible UNION ALL subquery's member scopes
+		// plan through the join search — the appendrel's members need
+		// searched rels (and their PartialPathlists) for the leaf's
+		// Parallel Append candidate to exist at all. Set only on the
+		// jointree arm and only for a simple UNION ALL chain; the flag
+		// is consumed and cleared inside each member scope, so nothing
+		// deeper inherits it (plannersettings.go).
+		ps.appendrelMember = appendrelSubquery
 		inner, err = planSelectWithParent(rv.Subquery, cat, nil, ps, scope)
 	}
 	if err != nil {
@@ -5375,6 +5442,13 @@ func planSubqueryRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int
 	}
 	tbl := &catalog.Table{Name: rv.Alias, Columns: cols}
 	b := rangeBinding{table: tbl, alias: rv.Alias, offset: 0, sourceIdx: sourceIdx}
+	// M0145-0004: mark the appendrel candidate — the admissibility
+	// computed above (jointree arm, non-LATERAL, simple UNION ALL
+	// chain). addAppendRelPartialPaths reads it via
+	// baseRelInfo.appendrel to hoist the leaf's Parallel Append
+	// candidate onto the search leaf rel; the flag is unset on the
+	// legacy arm, so off-knob behaviour is unchanged by construction.
+	b.appendrel = appendrelSubquery
 	return inner, b, nil
 }
 

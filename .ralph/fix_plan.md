@@ -12511,6 +12511,62 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
   `parallelism` records.
   Kind: impl
   Parent: M0145-0001
+  - **Leaf-hoist arm landed this loop** (design:
+    `docs/design/0100-0149/m0145-0004-union-all-appendrel-leaf.md`).
+    `jointreeappendrel.go` ports `is_simple_union_all` (chain head
+    refuses ORDER BY/LIMIT/OFFSET/locking/WITH; every link UNION ALL;
+    member-local trailing FOR UPDATE refused; `SetOpOperand`
+    groupings declined) and `addAppendRelPartialPaths` hoists the
+    nested SETOP rel's Parallel Append candidate onto the leaf rel.
+    `plannerSet.appendrelMember`/`ctx.appendrelMember` force each
+    member scope through the join search (one-relation floor → 1 for
+    exactly one scope level — upstream runs
+    `set_base_rel_pathlists` unconditionally); the leaf's
+    `ConsiderParallel` inherits the SETOP rel's member-AND. All marks
+    are jointree-arm-only — legacy is inert by construction.
+  - Two shared latent gaps closed (both arms benefit):
+    - Worker sizing through `*SetOp`: `drivingScans` expands a SetOp
+      driving node to its streamed member scans (claimed-whole
+      branches skipped); `computeParallelWorkers`/`upperSplitWorkers`
+      take max-over-branches (PG's create_append_path max rule).
+      Previously `scanTable(*SetOp)`=nil → 0 workers → every
+      `Aggregate → SetOp` / gather-over-union plan refused.
+    - Executor claims through a join probe: `unwrapToSetOp` gained
+      `*joinOp` (probe side per algo, mirroring
+      `attachParallelScan`'s gates) + `*nestedLoopIndexJoinOp` arms —
+      without it a `PathSetOp` under a partial hash join stayed
+      unclaimed and every worker replayed the whole union
+      (reproduced: 80/120/200 rows at workers=1/2/4 for a 40-row
+      join; `TestGatherOverJoinProbeSetOpIdentity` pins 40).
+  - Third gap, knob-arm-only, found by the parity capture: a hoisted
+    `PathSetOp` is a legal join input for the first time, and
+    `createSetOpPlan` returned a nil `outputLayout` for every caller —
+    `joinInputsFor` panicked re-basing quals (`EXPLAIN Q5` crashed the
+    backend). Fixed: leaf-owned SetOp paths return
+    `baseRelLayout(p.Rel, out)` (upper-rel paths stay nil);
+    `TestCreateSetOpPlanLeafLayout` pins the contiguous leaf layout.
+  - Evidence: SF0.25 sweep 96 PASS / MISMATCH=0 on BOTH arms
+    (knob-arm sweep `tmp/m0145-0004-sweep-on/`, post-fix capture
+    `tmp/m0145-0004-capture/jt-on-fix.*` — unparsed 0, verdict 3);
+    plan-diff shows the witness move — Q5's three unions now plan
+    `Gather → Hash Join → Append{Parallel Seq Scan ×2}` on the
+    default arm (post-pass gather made selectable by the sizing
+    fix), and the knob arm elects a search-level
+    `Gather → Nested Loop → Parallel Hash Join → Append{parallel}`
+    (PG's `Parallel Hash Join → Parallel Append` shape); Q5 rows
+    identical off/on. tpch-spotcheck PASS (Q12=2, Q13=33). New
+    white-box tests: admissibility matrix, member-scope search A/B,
+    hoist gates + Rel re-targeting, CP inheritance,
+    partial-agg-over-union leaf, leaf-owned SetOp layout.
+  - Still open (ledgered): member-level rtable entries +
+    parent-qual distribution into members (`distribute_qual_to_rels` —
+    M0145-0005's IR work); `tlist_same_datatypes` (needs bound member
+    tlists pre-cast); LATERAL union propagation; CTE-wrapped union
+    leaves (`CTEScan` hides the carrier — Q2/Q14/Q71/Q76's shapes);
+    serial-side member-path competition (leaf serial path stays
+    prebuilt-over-nested-winner); `is_safe_append_member`'s pull-up
+    half is inapplicable in this model (members are not promoted —
+    member WHERE quals ride `spliceBranchEmission` per worker).
 - [ ] **M0145-0005 — single-pass DP over the jointree** (the search
   consumes the IR directly; semi/anti entries are legal searched partners
   via a `join_is_legal` port over the SJInfo-equivalent, joinrels.c:350).

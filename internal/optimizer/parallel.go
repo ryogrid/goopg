@@ -812,6 +812,43 @@ func drivingScan(n Node) Node {
 	return nil
 }
 
+// drivingScans returns every terminal scan `drivingScan` selects — plural
+// because a `*SetOp` driving node stands for ALL of its streamed branches:
+// each worker partitions every member's claim set (the *setOp arm of
+// attachAll), so the worker-count sizing must see each branch's scan and
+// take the max, the same way PG's create_append_path takes
+// `parallel_workers` as the max over child subpaths.
+//
+// A branch stamped claimed-whole (x.LeftNonPartial/x.RightNonPartial) is
+// skipped: it is drained serially by its single CAS-winning participant,
+// contributes no partitioned scan, and must not raise the worker count —
+// matching drivingScan's own arm, which treats the marker as satisfying
+// that side without descending. All-claimed is unreachable here in
+// practice (a SetOp only becomes a driving node when drivingScan's arm
+// resolved every branch), but an empty result is still handled by the
+// callers as "no driving scan" — refuse, same as today.
+//
+// Recursion covers the left-deep chain: `drivingScan`'s SetOp arm returns
+// the OUTER SetOp node when both sides resolve, so a nested
+// `SetOp{SetOp{m1,m2},m3}` expands to [m1, m2, m3] one level at a time.
+func drivingScans(n Node) []Node {
+	scan := drivingScan(n)
+	if scan == nil {
+		return nil
+	}
+	if so, ok := scan.(*SetOp); ok {
+		var out []Node
+		if !so.LeftNonPartial {
+			out = append(out, drivingScans(so.Left)...)
+		}
+		if !so.RightNonPartial {
+			out = append(out, drivingScans(so.Right)...)
+		}
+		return out
+	}
+	return []Node{scan}
+}
+
 // drivingScanCrossesSort reports whether `drivingScan`'s descent from n to
 // its scan passes through a Sort.
 //
@@ -855,6 +892,21 @@ func drivingScanCrossesSort(n Node) bool {
 			return false
 		}
 		return drivingScanCrossesSort(x.Outer)
+	case *SetOp:
+		// M0145-0004: mirror of drivingScan's *SetOp arm — the descent
+		// covers BOTH streamed branches, so a Sort on either puts a
+		// per-worker sort under a plain Gather. Claimed-whole branches
+		// (x.LeftNonPartial/x.RightNonPartial) are skipped exactly as
+		// drivingScan skips them: a claimed branch is a complete serial
+		// subplan drained by its one participant and may sort inside
+		// itself freely.
+		if !x.LeftNonPartial && drivingScanCrossesSort(x.Left) {
+			return true
+		}
+		if !x.RightNonPartial && drivingScanCrossesSort(x.Right) {
+			return true
+		}
+		return false
 	}
 	return false
 }
@@ -1244,7 +1296,29 @@ func scanTable(n Node) *catalog.Table {
 // comparison — which is exactly why it is reproducible here despite goopg
 // having no absolute node costs to add parallel_setup_cost to.
 func computeParallelWorkers(subtree Node, s ParallelSettings) int {
-	scan := drivingScan(subtree)
+	// M0145-0004: size over EVERY driving scan, not the first — when
+	// drivingScan resolves a `*SetOp` driving node it stands for all of
+	// its streamed branches, and each branch's member table is claimed
+	// per-worker (attachAll's *setOp arm). The gather's worker count is
+	// the max over branches, matching PG's create_append_path, which
+	// takes `parallel_workers` as the max over child subpaths. A branch
+	// that earns zero (unsafe table, unsized, below threshold) simply
+	// does not raise the max; a subtree with no driving scan at all
+	// still returns 0.
+	best := 0
+	for _, scan := range drivingScans(subtree) {
+		if w := computeParallelWorkersForScan(scan, s); w > best {
+			best = w
+		}
+	}
+	return best
+}
+
+// computeParallelWorkersForScan is the single-scan body of
+// computeParallelWorkers — split out so the SetOp arm can size each
+// member branch independently. The subtree-level forced flag applies
+// identically to every branch.
+func computeParallelWorkersForScan(scan Node, s ParallelSettings) int {
 	tbl := scanTable(scan)
 	if tbl == nil {
 		return 0
