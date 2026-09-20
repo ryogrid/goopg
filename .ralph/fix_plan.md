@@ -12660,6 +12660,36 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
     - Skipped on the knob arm by design (value-preserving missed opts,
       ledgered): `injectLikeRangePredicates`, `reduceNotNullQuals`
       incl. always-false → childless `Result`, `planIndexScanFromWhere`.
+    - Slice 2 (landed, loop 2026-09-21 #8): pulled semi/anti bodies are
+      REAL numbered leaf items — `pullUpSublinksIntoJointree` appends
+      one `leafItem` per pulled leaf to `ctx.joinlist` (`pu.base` /
+      `pu.nLeaves`), `splicePulledLeaves` inserts the scans at
+      `[nReal, nprefix)` and shifts extracted leaf indexes
+      (`shiftRelSetAbove` over link hands, SJInfo fields, outer-link
+      sides, `belowNullable`), `classifyPulledQuals` rebases+classifies
+      quals straight into the conjunct pool and appends each body's
+      SJInfo to `joinInfoList`. No `semiAntiChainLink` is produced for
+      a pulled body.
+    - Retired this slice: `integratePulledSublinks`,
+      `buildPulledSemiAntiLink`, the pulled share of the synthetic-leaf
+      splice + `searchJl` leafItem-append, and the `admitSemiAnti`
+      flag itself (one call site, literal `true` since b2 — dead
+      flexibility). `remapWalkOrderFlatToSpans` survives for the chain
+      arm with a pulledBase/pulledLeaves index translation;
+      `semiAntiOnQualsOK` + the `searchJl` append survive for
+      chain-extracted leaves only. `pgShapedOffsetChecksOK` now takes
+      the non-emitting RelSet directly (`[nReal, len(scans))`).
+    - White-box pins: `TestJointreePullupRealLeafItems`/`…Anti`
+      (joinlist leaf item, splice position, cumulative span, pooled
+      conjunct relids, SJInfo on `joinInfoList`, `len(semiAnti)==0`);
+      DPTRACE probe: `rels=jtp_o,a,b` enumerate + SEMI pair priced.
+    - Gates: optimizer suite PASS; tpch-spotcheck Q12=2/Q13=33; SF0.25
+      96/96 with 99/99 plan shapes identical; acceptance arm 24/24
+      under JOINTREE+PGSHAPED; units PASS. plan-gate 16/22 vs the
+      recorded 14/22 stale-baseline drift — the +2 (Q3/Q18) is the
+      Sep-20 `:65433` rebuild (slice-1/4 era), not this change: the
+      gate diffs the live old binary and Q3/Q18 cannot reach the
+      pulled path (Q3 has no sublink; Q18's IN body has GROUP BY).
 - [ ] **M0145-0006 — upper-rel pathlists** (extend the lattice through
   `create_grouping_paths`/`create_ordered_paths` analogues so ordering and
   grouping are elected over candidate sets, not by stage-builder

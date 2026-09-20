@@ -302,8 +302,21 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 	// touching one is declined by the clause producer and survives in the
 	// residual `Filter` above the spine.
 	nprefix := jl.nrels()
+	// M0145-0005 slice 2: when the WHERE-clause pull-up ran, `jl`'s
+	// trailing leaf items are the pulled bodies' own relations —
+	// numbered into the joinlist by pullUpSublinksIntoJointree in
+	// binding order, not walk-derived. `nReal` counts the EMITTING
+	// (ctx.bindings-backed) leaf items; the pulled leaves occupy
+	// [nReal, nprefix) — real searched items with no bindings entry —
+	// and chain-extracted synthetic leaves still land at-or-above
+	// nprefix in the tail. `nPulled` is that trailing count.
+	nReal := nprefix
+	if pu := ctx.jtPullup; pu != nil {
+		nReal -= pu.nLeaves
+	}
+	nPulled := nprefix - nReal
 	// R41/K75: fail closed when the joinlist claims MORE relations than the
-	// statement has bindings. `ctx.bindings[:nprefix]` below would be an
+	// statement has bindings. `ctx.bindings[:nReal]` below would be an
 	// index-out-of-range PANIC, and until R41 the `leaf-count` check was the
 	// only thing that happened to prevent it (measured on TPC-DS Q78:
 	// len(bindings)=2, nprefix=3).
@@ -316,8 +329,10 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 	//
 	// NOT an equality check: a peeled outer spine legitimately leaves the
 	// prefix narrower than the full binding list, which is the normal
-	// admitted case.
-	if nprefix > nrels {
+	// admitted case. Pulled leaf items likewise sit past the binding
+	// count — they emit no columns — so the comparison runs on `nReal`,
+	// the bindings-backed count, not `nprefix`.
+	if nReal < 0 || nReal > nrels {
 		traceSeamDecline("prefix-exceeds-bindings", nrels, nprefix)
 		return node, pred, false
 	}
@@ -350,31 +365,40 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 		traceSeamDecline("prefix-not-a-prefix", nrels, nprefix)
 		return node, pred, false
 	}
-	// admitSemiAnti=true (M0142-0008a-3i-plumbing-b2 step (iii), design doc
-	// §33.4/§34): safe unconditionally at this ONE call site (§32.1's
-	// finding) since the other 3 `tryJoinSearch` callers' chains are always
-	// captured pre-unnest and can never contain a Semi/Anti node — only
-	// Phase B's second call (`predp.go`, `chain == spineJoins[0]`, reached
-	// post-unnest) can ever hand this a tree that actually has one. Phase
-	// A's own call (`chain == origChain`, captured before
-	// `unnestSubqueriesInPlan` runs) stays structurally unable to contain a
-	// Semi/Anti node regardless of this flag, per §28.3's finding.
-	scans, widths, onQuals, outerLinks, semiAnti, ok := extractSearchLeaves(chain, true)
+	// Semi/Anti chain admission is unconditional (M0142-0008a-3i-plumbing-b2
+	// step (iii), design doc §33.4/§34; M0145-0005 slice 2 retired the
+	// `admitSemiAnti` flag — safe unconditionally at this ONE call site
+	// (§32.1's finding) since the other 3 `tryJoinSearch` callers' chains
+	// are always captured pre-unnest and can never contain a Semi/Anti
+	// node — only Phase B's second call (`predp.go`, `chain ==
+	// spineJoins[0]`, reached post-unnest) can ever hand this a tree that
+	// actually has one. Phase A's own call (`chain == origChain`, captured
+	// before `unnestSubqueriesInPlan` runs) stays structurally unable to
+	// contain one, per §28.3's finding.
+	scans, widths, onQuals, outerLinks, semiAnti, ok := extractSearchLeaves(chain)
 	if !ok {
 		traceSeamDecline("chain-not-flattenable", nrels, len(scans))
 		return node, pred, false
 	}
-	// M0145-0003: the jointree pipeline's pulled sublink bodies enter the
-	// problem HERE — appended after every walk-derived leaf, as semi/anti
-	// links built from the retained `.Subquery` parse trees rather than
-	// decomposed from a chain (jointreepullup.go). The append is before
-	// the synthetic-leaf accounting below so the pulled leaves take part
-	// in the same tail-order, offset-agreement and leaf-count checks the
-	// walk-derived leaves do. On the legacy pipeline ctx.jtPullup is
-	// always nil and this is a no-op.
-	if ctx.jtPullup != nil {
-		if !integratePulledSublinks(ctx.jtPullup, nprefix, ctx, &scans, &widths, &semiAnti) {
-			traceSeamDecline("pullup-integrate", nrels, len(scans))
+	// walkWidths is the walk-order leaf-width table BEFORE the pulled
+	// splice — the coordinate space the walk rebased the extracted links'
+	// preds and body quals into. `widths` below gains the pulled leaves
+	// spliced in at [nReal, nprefix), so the chain-qual remap further down
+	// must read this pre-splice table and translate leaf indexes across
+	// the insertion (`remapWalkOrderFlatToSpans`'s nReal/nPulled args).
+	walkWidths := append([]int(nil), widths...)
+	// M0145-0005 slice 2: the jointree pipeline's pulled sublink bodies
+	// are REAL leaf items — numbered into `jl` by
+	// pullUpSublinksIntoJointree, occupying [nReal, nprefix) — so their
+	// scans splice into the same positions here, ahead of the
+	// chain-extracted synthetic tail, and every extracted leaf index
+	// shifts up by nPulled. No semiAntiChainLink is built for them: the
+	// joinlist carries the items, classifyPulledQuals threads the quals
+	// and SJInfos once `spans` exists. On the legacy pipeline
+	// ctx.jtPullup is always nil and this is a no-op.
+	if ctx.jtPullup != nil && ctx.jtPullup.nLeaves > 0 {
+		if !splicePulledLeaves(ctx.jtPullup, nReal, ctx, &scans, &widths, &semiAnti, &outerLinks, &onQuals) {
+			traceSeamDecline("pullup-splice", nrels, len(scans))
 			return node, pred, false
 		}
 	}
@@ -472,7 +496,7 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 	// task's own trace: `rs` for the folded eq conjunct came back spanning
 	// leaves {0,2} instead of {0,1}).
 	for i := range semiAnti {
-		remapped, okRemap := remapWalkOrderFlatToSpans(semiAnti[i].pred, widths, spans)
+		remapped, okRemap := remapWalkOrderFlatToSpans(semiAnti[i].pred, walkWidths, spans, nReal, nPulled)
 		if !okRemap {
 			traceSeamDecline("semianti-pred-remap", nrels, len(scans))
 			return node, pred, false
@@ -483,7 +507,7 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 		// the link's own RHS leaves, which are exactly the positions the
 		// remap relocates out-of-band.
 		for k, q := range semiAnti[i].bodyQuals {
-			rq, okQ := remapWalkOrderFlatToSpans(q, widths, spans)
+			rq, okQ := remapWalkOrderFlatToSpans(q, walkWidths, spans, nReal, nPulled)
 			if !okQ {
 				traceSeamDecline("semianti-bodyqual-remap", nrels, len(scans))
 				return node, pred, false
@@ -491,21 +515,27 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 			semiAnti[i].bodyQuals[k] = rq
 		}
 	}
-	bindingOffsets := make([]int, nprefix)
-	for i := range nprefix {
+	// The offset oracle covers the EMITTING leaves only — pulled leaf
+	// items have no ctx.bindings entry, so `pgShapedOffsetChecksOK` skips
+	// everything at-or-above nReal (its `nonEmitting` argument covers
+	// both pulled leaves and the extracted synthetic tail).
+	bindingOffsets := make([]int, nReal)
+	for i := range nReal {
 		bindingOffsets[i] = ctx.bindings[i].offset
 	}
 	// The spine's first relation must begin exactly where the prefix ends. That
 	// is what makes "beyond the prefix window" and "on the spine" the same
 	// statement, which every conjunct decision below relies on: a spine column
 	// that landed INSIDE the window would be attributed to a prefix leaf and
-	// pushed under the outer join.
-	hasSpine := nprefix < nrels
+	// pushed under the outer join. `nReal` is the bindings-backed edge —
+	// pulled leaves emit nothing, so a spine begins only where the REAL
+	// items run out.
+	hasSpine := nReal < nrels
 	spineOffset := 0
 	if hasSpine {
-		spineOffset = ctx.bindings[nprefix].offset
+		spineOffset = ctx.bindings[nReal].offset
 	}
-	if reason, checksOK := pgShapedOffsetChecksOK(spans, semiAnti, widths, bindingOffsets, hasSpine, spineOffset); !checksOK {
+	if reason, checksOK := pgShapedOffsetChecksOK(spans, leafRangeRelSet(nReal, len(scans)), widths, bindingOffsets, hasSpine, spineOffset); !checksOK {
 		if reason == "offset-disagreement" {
 			traceSeamDecline(reason, nrels, len(scans))
 		} else {
@@ -559,10 +589,11 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 	// dropped. That is the finding-1 shape and it is load-bearing, not a
 	// follow-up.
 	// M0145-0003: pulled sublink conjuncts never reach this pool — their
-	// semantics live in the semi/anti links `integratePulledSublinks`
-	// appended above, so feeding them to the partition would evaluate
-	// the sublink a second time beside the join. On the legacy pipeline
-	// `predConjuncts` is exactly `splitAnd(pred)`.
+	// semantics live in the semi/anti SJInfos and pooled quals
+	// `classifyPulledQuals` emits below, so feeding them to the
+	// partition would evaluate the sublink a second time beside the
+	// join. On the legacy pipeline `predConjuncts` is exactly
+	// `splitAnd(pred)`.
 	predConjuncts := splitAndExcludingPulled(pred, ctx.jtPullup)
 	var conjuncts, heldAbovePrefix []Expr
 	switch {
@@ -793,13 +824,24 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 		// `distribute_qual_to_rels` does inside PG's pulled-up RHS.
 		conjuncts = append(conjuncts, lk.bodyQuals...)
 	}
-	// M0145-0003: hoisted outer-local quals from pulled bodies join the
-	// pool here — the partition lands them on the emitting leaves they
-	// read, exactly like a WHERE conjunct of the parent itself. Already
-	// in problem space (buildPulledSemiAntiLink rebased them), so no
-	// remap. Only ever populated under a SEMI link.
-	if ctx.jtPullup != nil {
-		conjuncts = append(conjuncts, ctx.jtPullup.outerQuals...)
+	// M0145-0005 slice 2: the pulled bodies' quals join the pool here —
+	// the same point the extracted links' predicates did above.
+	// classifyPulledQuals rebases each pulled body's bound quals into
+	// problem space and classifies them exactly distribute_qual_to_rels
+	// would: spanning correlation conjuncts and body-local conjuncts
+	// into `conjuncts` itself, SEMI-only outer-local hoists into
+	// `pu.outerQuals` (appended below — the partition lands them on the
+	// emitting leaves they read, exactly like a WHERE conjunct of the
+	// parent itself). It also appends each body's SpecialJoinInfo to
+	// `ctx.joinInfoList` — the pulled leaves are real joinlist members
+	// constrained by a real hand, so no link record survives. Already
+	// in problem space, so no remap.
+	if pu := ctx.jtPullup; pu != nil && pu.nLeaves > 0 {
+		if !classifyPulledQuals(pu, nReal, spans, ctx, &conjuncts) {
+			traceSeamDecline("pullup-classify", nrels, len(scans))
+			return node, pred, false
+		}
+		conjuncts = append(conjuncts, pu.outerQuals...)
 	}
 	searchConjuncts, locals := partitionConjunctsForJoinPlanning(conjuncts, spans)
 	// M0142-0008a-3i-plumbing-c2 (design doc §36, gaps 2-3): `leaves`/
@@ -816,8 +858,8 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 	leaves := make([]Node, nleaves)
 	relInfos := make([]baseRelInfo, nleaves)
 	bindings := make([]rangeBinding, nleaves)
-	copy(bindings, ctx.bindings[:nprefix])
-	for i, b := range ctx.bindings[:nprefix] {
+	copy(bindings, ctx.bindings[:nReal])
+	for i, b := range ctx.bindings[:nReal] {
 		leaves[i] = scans[i]
 		var local Expr
 		if preds := locals.byBinding[i]; len(preds) > 0 {
@@ -840,6 +882,47 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 		// "scaling a fallback invents precision" concern is enforced by the
 		// gate rather than by refusing to scale. See `applyRelSizeFallback`.
 		applyRelSizeFallback(&relInfos[i], b, scans[i], local, cat)
+	}
+	// M0145-0005 slice 2: the pulled leaves at [nReal, nprefix) are REAL
+	// joinlist items — numbered in binding order by the pull-up — but
+	// emit no columns, so they get span-offset bindings like a flattened
+	// chain leaf and the same `estimateBaseRelInfo` +
+	// `applyRelSizeFallback` catalog-stats path (flattenPulledBodyTree
+	// guarantees each one is a bare `*SeqScan`, so this is a verify, not
+	// a discovery — anything else means the body's own planning rewrote
+	// it after the marker ran, which is a desync to decline on, not a
+	// shape to price).
+	for i := nReal; i < nprefix; i++ {
+		b := rangeBinding{offset: spans[i].lo}
+		scan := scans[i]
+		ss, isScan := scan.(*SeqScan)
+		if !isScan {
+			traceSeamDecline("pulled-leaf-not-scan", nrels, len(scans))
+			return node, pred, false
+		}
+		b.table = ss.Table
+		b.alias = ss.Alias
+		bindings[i] = b
+		var local Expr
+		if preds := locals.byBinding[i]; len(preds) > 0 {
+			local = combineAnd(preds)
+			localized := make([]Expr, 0, len(preds))
+			for _, p := range preds {
+				localized = append(localized, localizeExprToLeaf(p, b))
+			}
+			leaves[i] = &Filter{Child: scan, Predicate: combineAnd(localized), LeafLocal: true}
+		} else {
+			leaves[i] = scan
+		}
+		relInfos[i] = estimateBaseRelInfo(b, scan, local)
+		relInfos[i].bindingIdx = i
+		// The leaf's own coordinates are non-emitting (a SEMI/ANTI join
+		// never projects its RHS), so the boundary filler must mark them
+		// fillable exactly like the extracted leaves' — while
+		// `leafIsDerivedInput` still answers not-derived through the real
+		// `table` above, which is the distinction c8 added the flag for.
+		relInfos[i].isSemiAntiSyntheticLeaf = true
+		applyRelSizeFallback(&relInfos[i], b, scan, local, cat)
 	}
 	// A synthetic leaf has no `*catalog.Table` — it is an opaque, already-
 	// planned subtree (the Semi/Anti join's RHS), not a base relation — so
@@ -943,6 +1026,10 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 	// (c3, cont.) M0142-0008a-3i-route-a step 2: a flattened link's `rhs`
 	// spans MULTIPLE consecutive leaf slots, so the leaf items are appended
 	// per synthetic LEAF (`nprefix` through `nleaves`), not per LINK.
+	// M0145-0005 slice 2: pulled leaves need no append — they are real
+	// `jl` members already (the pull-up numbered them into the joinlist
+	// itself), so this workaround survives only for chain-extracted
+	// synthetic leaves.
 	searchJl := jl
 	if len(semiAnti) > 0 {
 		searchJl = make(joinlist, 0, len(jl)+(nleaves-nprefix))
@@ -1487,15 +1574,12 @@ func searchConsumes(c Expr, spans []leafSpan) bool {
 // numbers a chain's bindings left to right and `planFromClause` appends items
 // in FROM order (03 §6.1's leaf-numbering guarantee), and this walk visits Left
 // before Right at every level.
-// admitSemiAnti gates M0142-0008a-3i-plumbing-b1's Semi/Anti-admission arm
-// (design doc §22.4). It is a plain parameter, not a package-level flag:
-// the ONE production call site (this function's caller in
-// tryPGShapedJoinSearch) has passed a literal `true` since
-// M0142-0008a-3i-plumbing-b2 step (iii) landed — the parameter stays so the
-// off arm remains directly unit-testable
-// (TestExtractSearchLeaves_AdmitSemiAntiFalse_*) and so the admission
-// decision is visible at the call site rather than implicit.
-func extractSearchLeaves(node Node, admitSemiAnti bool) (scans []Node, widths []int, onQuals []chainOnQual, outer []outerChainLink, semiAnti []semiAntiChainLink, ok bool) {
+// The Semi/Anti-admission arm (M0142-0008a-3i-plumbing-b1's
+// `admitSemiAnti`, design doc §22.4) is unconditional — the ONE
+// production call site passed literal `true` since b2 step (iii)
+// landed, and M0145-0005 slice 2 retired the parameter: the off arm
+// was dead flexibility, not a tested path.
+func extractSearchLeaves(node Node) (scans []Node, widths []int, onQuals []chainOnQual, outer []outerChainLink, semiAnti []semiAntiChainLink, ok bool) {
 	width := 0
 	// realWidth counts only NON-synthetic leaf widths — the running
 	// "span space" origin `buildLeafSpans` later reproduces (real leaves
@@ -1546,9 +1630,10 @@ func extractSearchLeaves(node Node, admitSemiAnti bool) (scans []Node, widths []
 			return 0, false
 		}
 		j, isJoin := n.(*Join)
-		if isJoin && admitSemiAnti && (j.Type == JoinTypeSemi || j.Type == JoinTypeAnti) {
+		if isJoin && (j.Type == JoinTypeSemi || j.Type == JoinTypeAnti) {
 			// M0142-0008a-3i-plumbing-b1 (design doc §22.2's settled
-			// semantics; live since b2 made admitSemiAnti unconditional):
+			// semantics; unconditional since b2 — M0145-0005 slice 2 retired
+			// the `admitSemiAnti` flag that used to gate this branch):
 			// SEMI/ANTI null-extends neither side, so it is declined exactly
 			// like an outer link when it sits on a subtree an admitted outer
 			// link above it already null-extends (mirrors the Left/Right
@@ -1871,13 +1956,24 @@ func buildLeafSpans(widths []int, semiAnti []semiAntiChainLink) []leafSpan {
 // LATER leaf's width was knowable — must therefore be re-targeted here, once
 // `widths` is complete and `spans` exists, before `relidsOfExpr`
 // (which reads `spans`, not walk order) ever sees it.
-func remapWalkOrderFlatToSpans(e Expr, widths []int, spans []leafSpan) (Expr, bool) {
+func remapWalkOrderFlatToSpans(e Expr, widths []int, spans []leafSpan, pulledBase, pulledLeaves int) (Expr, bool) {
 	if e == nil {
 		return nil, true
 	}
 	prefix := make([]int, len(widths)+1)
 	for i, w := range widths {
 		prefix[i+1] = prefix[i] + w
+	}
+	// `widths` is the PRE-SPLICE walk table; `spans` is the problem's own
+	// (post-splice) table. The pulled leaves were inserted at walk
+	// position `pulledBase`, so a walk leaf at-or-above it lands at
+	// problem index `+ pulledLeaves`. With `pulledLeaves` == 0 this is
+	// the identity — the pre-slice-2 shape.
+	problemIndex := func(walkLeaf int) int {
+		if walkLeaf >= pulledBase {
+			return walkLeaf + pulledLeaves
+		}
+		return walkLeaf
 	}
 	leafOf := func(walkOrderFlat int) (int, bool) {
 		for i := range widths {
@@ -1895,11 +1991,12 @@ func remapWalkOrderFlatToSpans(e Expr, widths []int, spans []leafSpan) (Expr, bo
 				return x
 			}
 			leaf, found := leafOf(cr.Index)
-			if !found {
+			if !found || problemIndex(leaf) >= len(spans) {
 				failed = true
 				return x
 			}
-			cr.Index = spans[leaf].lo + (cr.Index - prefix[leaf])
+			pi := problemIndex(leaf)
+			cr.Index = spans[pi].lo + (cr.Index - prefix[leaf])
 			return x
 		},
 	})
@@ -1911,40 +2008,39 @@ func remapWalkOrderFlatToSpans(e Expr, widths []int, spans []leafSpan) (Expr, bo
 
 // pgShapedOffsetChecksOK implements design doc §31.3 items 2 and 3:
 // `tryPGShapedJoinSearch`'s per-leaf offset-agreement check and its
-// spine-offset-disagreement check, both widened to admit synthetic
-// (Semi/Anti RHS) leaves interleaved into `spans` at arbitrary walk
-// positions.
+// spine-offset-disagreement check, both widened to skip the
+// NON-EMITTING leaves — M0145-0005 slice 2 widened the set a second
+// time: where it used to cover only synthetic (Semi/Anti RHS) leaves,
+// it now covers every leaf at-or-above `nReal`: the pulled bodies'
+// real leaf items (no ctx.bindings entry — nothing to check against)
+// and the extracted synthetic tail alike. The caller passes the set
+// directly (`leafRangeRelSet(nReal, len(scans))` — the tail invariant
+// makes that exactly pulled ∪ extracted) rather than a link list.
 //
 // Item 2: a plain index-for-index comparison of `spans[i]` against
 // `bindingOffsets[i]` (real, FROM-clause-derived offsets, one per real
-// leaf) breaks the moment a synthetic leaf precedes a real one — every real
-// leaf at-or-after it shifts by however many synthetic leaves came first.
-// This walks `spans` with `i` and `bindingOffsets` with a SEPARATE
-// counter that only advances past real leaves (there is no real-FROM oracle
-// to check a synthetic leaf against, so it is simply skipped).
+// leaf) breaks the moment a non-emitting leaf precedes a real one —
+// every real leaf at-or-after it shifts by however many non-emitting
+// leaves came first. This walks `spans` with `i` and `bindingOffsets`
+// with a SEPARATE counter that only advances past emitting leaves
+// (there is no real-FROM oracle to check a non-emitting leaf against,
+// so it is simply skipped).
 //
-// Item 3: `buildLeafSpans` places every synthetic leaf's span OUT-OF-BAND,
-// after the total REAL width — so whenever the LAST leaf in walk order is
-// synthetic, `spans`'s raw last entry overshoots the real total by
-// that leaf's own width. The spine (if any) must begin at the REAL total
-// width, computed here by summing `widths` while skipping synthetic
-// indices, not at `spans`'s raw last entry.
+// Item 3: `buildLeafSpans` places every synthetic leaf's span
+// OUT-OF-BAND, after the total emitting width — so whenever the LAST
+// leaf in walk order is non-emitting, `spans`'s raw last entry
+// overshoots the real total by that leaf's own width. The spine (if
+// any) must begin at the EMITTING total width, computed here by
+// summing `widths` while skipping non-emitting indices, not at
+// `spans`'s raw last entry.
 //
-// With `semiAnti` empty — still the only production shape today: the call
-// site has passed `admitSemiAnti=true` since b2, but every corpus chain that
-// could produce a link declines earlier at the leaf-count gate — `synthetic`
-// is the zero RelSet and every branch below reduces exactly to the
+// With `nonEmitting` zero every branch below reduces exactly to the
 // pre-existing plain checks. Direct unit-test calls exercise the
-// numSynthetic>0 arithmetic until the pending leaf-admission work lets a
-// link through.
-func pgShapedOffsetChecksOK(spans []leafSpan, semiAnti []semiAntiChainLink, widths []int, bindingOffsets []int, hasSpine bool, spineOffset int) (declineReason string, ok bool) {
-	var synthetic RelSet
-	for _, lk := range semiAnti {
-		synthetic |= lk.rhs
-	}
+// non-empty arithmetic.
+func pgShapedOffsetChecksOK(spans []leafSpan, nonEmitting RelSet, widths []int, bindingOffsets []int, hasSpine bool, spineOffset int) (declineReason string, ok bool) {
 	j := 0
 	for i := range spans {
-		if synthetic&leafRangeRelSet(i, i+1) != 0 {
+		if nonEmitting&leafRangeRelSet(i, i+1) != 0 {
 			continue
 		}
 		if j >= len(bindingOffsets) || bindingOffsets[j] != spans[i].lo {
@@ -1954,7 +2050,7 @@ func pgShapedOffsetChecksOK(spans []leafSpan, semiAnti []semiAntiChainLink, widt
 	}
 	realTotalWidth := 0
 	for i, w := range widths {
-		if synthetic&leafRangeRelSet(i, i+1) != 0 {
+		if nonEmitting&leafRangeRelSet(i, i+1) != 0 {
 			continue
 		}
 		realTotalWidth += w

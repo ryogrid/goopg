@@ -302,7 +302,7 @@ func TestFlattenedRHSExistsSingleTable(t *testing.T) {
 	if !j.FlattenedRHS {
 		t.Fatalf("FlattenedRHS not set: %s", planString(node))
 	}
-	scans, widths, _, _, links, ok := extractSearchLeaves(j, true)
+	scans, widths, _, _, links, ok := extractSearchLeaves(j)
 	if !ok || len(scans) != 2 || len(links) != 1 {
 		t.Fatalf("ok=%v scans=%d links=%d", ok, len(scans), len(links))
 	}
@@ -338,7 +338,7 @@ func TestFlattenedRHSExistsMultiTableBody(t *testing.T) {
 	if j == nil || !j.FlattenedRHS {
 		t.Fatalf("no flattened semi join: %s", planString(node))
 	}
-	scans, widths, _, _, links, ok := extractSearchLeaves(j, true)
+	scans, widths, _, _, links, ok := extractSearchLeaves(j)
 	if !ok || len(scans) != 3 || len(links) != 1 {
 		t.Fatalf("ok=%v scans=%d links=%d", ok, len(scans), len(links))
 	}
@@ -384,7 +384,7 @@ func TestFlattenedRHSInExpr(t *testing.T) {
 		t.Fatalf("j.Right=%T iso/identity=%v — flattened IN body lost its scope wrapper", j.Right, isProj)
 	}
 	// The seam still decomposes through the wrapper into real leaves.
-	scans, _, _, _, links, ok := extractSearchLeaves(j, true)
+	scans, _, _, _, links, ok := extractSearchLeaves(j)
 	if !ok || len(scans) != 2 || len(links) != 1 || !links[0].flattened {
 		t.Fatalf("ok=%v scans=%d links=%d", ok, len(scans), len(links))
 	}
@@ -426,7 +426,7 @@ func TestFlattenedRHSDeclinesPrunedBody(t *testing.T) {
 		t.Fatalf("pruned body flattened anyway: %s", planString(node))
 	}
 	// The opaque RHS still extracts as one synthetic leaf.
-	scans, _, _, _, links, ok := extractSearchLeaves(j, true)
+	scans, _, _, _, links, ok := extractSearchLeaves(j)
 	if !ok || len(scans) != 2 || len(links) != 1 || links[0].flattened {
 		t.Fatalf("ok=%v scans=%d links=%v", ok, len(scans), links)
 	}

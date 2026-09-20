@@ -212,14 +212,16 @@ func TestJointreePullupMultiRelBody(t *testing.T) {
 	}
 }
 
-// TestJointreePullupIntegratesLink is the white-box pin the plan-shape
+// TestJointreePullupRealLeafItems is the white-box pin the plan-shape
 // tests cannot provide: the semijoin they find could equally be the
 // legacy post-search unnest's output, since both routes produce
 // Semi(outer, inner) trees. Driving pullUpSublinksIntoJointree +
-// integratePulledSublinks directly proves the pulled body became a
-// leaf + link inside the search problem — the property the milestone
-// exists for.
-func TestJointreePullupIntegratesLink(t *testing.T) {
+// splicePulledLeaves + classifyPulledQuals directly proves the pulled
+// body became a REAL leaf item in the search problem — numbered into
+// the joinlist at pull-up, spliced into the leaf table at its own
+// position, SJInfo on joinInfoList — the M0145-0005 slice-2 property
+// the milestone exists for. No semiAntiChainLink is produced at all.
+func TestJointreePullupRealLeafItems(t *testing.T) {
 	cat := jtpCatalog(t)
 	sel, ok := parseOne(t, `select tag from jtp_o where exists (select 1 from jtp_i where j = k)`).(*parser.SelectStmt)
 	if !ok {
@@ -249,47 +251,76 @@ func TestJointreePullupIntegratesLink(t *testing.T) {
 	if len(pu.pulled) != 1 {
 		t.Fatalf("pulled marks = %d, want 1", len(pu.pulled))
 	}
+	// M0145-0005 slice 2: the pull-up numbered the body's leaf into the
+	// joinlist itself — one real leaf item at position pu.base == 1,
+	// right after the emitting item.
+	if pu.base != 1 || pu.nLeaves != 1 {
+		t.Fatalf("pu.{base,nLeaves} = {%d,%d}, want {1,1}", pu.base, pu.nLeaves)
+	}
+	if n := ctx.joinlist.nrels(); n != 2 {
+		t.Fatalf("joinlist nrels = %d, want 2 (emitting item + pulled leaf item)", n)
+	}
+	if it := ctx.joinlist[1]; !it.isLeaf() || it.rel != 1 {
+		t.Fatalf("joinlist[1] = %+v, want leaf item rel=1", it)
+	}
 	// Feed the seam the same leaf tables extractSearchLeaves would
 	// have produced for `FROM jtp_o`: one emitting leaf.
 	scans := []Node{node}
 	widths := []int{len(node.Output())}
 	var semiAnti []semiAntiChainLink
-	if !integratePulledSublinks(pu, 1, ctx, &scans, &widths, &semiAnti) {
-		t.Fatalf("integratePulledSublinks declined the pulled body")
+	var outer []outerChainLink
+	var onQuals []chainOnQual
+	if !splicePulledLeaves(pu, 1, ctx, &scans, &widths, &semiAnti, &outer, &onQuals) {
+		t.Fatalf("splicePulledLeaves declined the pulled body")
 	}
 	if len(scans) != 2 || len(widths) != 2 {
 		t.Fatalf("leaf table = %d scans / %d widths, want 2/2", len(scans), len(widths))
 	}
-	if len(semiAnti) != 1 {
-		t.Fatalf("links = %d, want 1", len(semiAnti))
+	if scans[1] != pu.bodies[0].leafScans[0] {
+		t.Fatalf("scans[1] is not the pulled body's leaf scan — splice landed it at the wrong position")
 	}
-	lk := semiAnti[0]
-	if lk.jointype != parser.JoinSemi {
-		t.Fatalf("link jointype = %v, want JoinSemi", lk.jointype)
+	// No link record: the pulled leaf is a joinlist member, the
+	// synthetic-leaf splice is retired.
+	if len(semiAnti) != 0 {
+		t.Fatalf("links = %d, want 0 — pulled bodies produce no semiAntiChainLink", len(semiAnti))
 	}
-	if lk.lhs != leafRangeRelSet(0, 1) || lk.rhs != leafRangeRelSet(1, 2) {
-		t.Fatalf("link hands = lhs %08b rhs %08b, want lhs 01 rhs 10", lk.lhs, lk.rhs)
-	}
-	if lk.pred == nil {
-		t.Fatalf("link pred is nil — the correlation conjunct did not become the link predicate")
-	}
-	if lk.sjinfo == nil {
-		t.Fatalf("link carries no SpecialJoinInfo — joinIsLegal would treat the pulled leaf as INNER-joinable")
-	}
-	// The rebased predicate must span emitting leaf 0 and pulled leaf
-	// 1 — attribute it against the problem's own span layout.
+	// The pulled leaf is NOT synthetic in the span layout — it takes a
+	// cumulative span like any real leaf.
 	spans := buildLeafSpans(widths, semiAnti)
-	for _, c := range splitAnd(lk.pred) {
-		rs, attributable := relidsOfExpr(c, spans)
-		if !attributable || rs != leafRangeRelSet(0, 2) {
-			t.Fatalf("link pred conjunct attributed to %08b (ok=%v), want relids 11", rs, attributable)
-		}
+	if spans[1].lo != spans[0].hi {
+		t.Fatalf("pulled span = %v, want cumulative after emitting span %v", spans[1], spans[0])
+	}
+	var searchQuals []Expr
+	if !classifyPulledQuals(pu, 1, spans, ctx, &searchQuals) {
+		t.Fatalf("classifyPulledQuals declined the pulled body")
+	}
+	// The correlation conjunct joins the conjunct pool directly — the
+	// partition lands it on the semijoin's join clause, exactly as
+	// distribute_qual_to_rels places a spanning qual.
+	if len(searchQuals) != 1 {
+		t.Fatalf("searchQuals = %d, want 1 (the correlation conjunct)", len(searchQuals))
+	}
+	rs, attributable := relidsOfExpr(searchQuals[0], spans)
+	if !attributable || rs != leafRangeRelSet(0, 2) {
+		t.Fatalf("pulled conjunct attributed to %08b (ok=%v), want relids 11", rs, attributable)
+	}
+	// The body's SpecialJoinInfo is on ctx.joinInfoList with real leaf
+	// hands — joinIsLegal sees it exactly like a deconstructed one.
+	if len(ctx.joinInfoList) != 1 {
+		t.Fatalf("joinInfoList = %d, want 1 (the pulled body's SJInfo)", len(ctx.joinInfoList))
+	}
+	sj := ctx.joinInfoList[0]
+	if sj.Jointype != parser.JoinSemi {
+		t.Fatalf("SJInfo jointype = %v, want JoinSemi", sj.Jointype)
+	}
+	if sj.SynLefthand != leafRangeRelSet(0, 1) || sj.SynRighthand != leafRangeRelSet(1, 2) {
+		t.Fatalf("SJInfo hands = lhs %08b rhs %08b, want lhs 01 rhs 10", sj.SynLefthand, sj.SynRighthand)
 	}
 }
 
-// TestJointreePullupIntegratesAntiLink pins the NOT EXISTS arm at the
-// same white-box level: JoinAnti link, same hand layout.
-func TestJointreePullupIntegratesAntiLink(t *testing.T) {
+// TestJointreePullupRealLeafItemsAnti pins the NOT EXISTS arm at the
+// same white-box level: JoinAnti SJInfo, same leaf-item layout.
+func TestJointreePullupRealLeafItemsAnti(t *testing.T) {
 	cat := jtpCatalog(t)
 	sel, ok := parseOne(t, `select tag from jtp_o where not exists (select 1 from jtp_i where j = k)`).(*parser.SelectStmt)
 	if !ok {
@@ -313,11 +344,21 @@ func TestJointreePullupIntegratesAntiLink(t *testing.T) {
 	scans := []Node{node}
 	widths := []int{len(node.Output())}
 	var semiAnti []semiAntiChainLink
-	if !integratePulledSublinks(pu, 1, ctx, &scans, &widths, &semiAnti) {
-		t.Fatalf("integratePulledSublinks declined the pulled body")
+	var outer []outerChainLink
+	var onQuals []chainOnQual
+	if !splicePulledLeaves(pu, 1, ctx, &scans, &widths, &semiAnti, &outer, &onQuals) {
+		t.Fatalf("splicePulledLeaves declined the pulled body")
 	}
-	if len(semiAnti) != 1 || semiAnti[0].jointype != parser.JoinAnti {
-		t.Fatalf("expected one JoinAnti link, got %+v", semiAnti)
+	spans := buildLeafSpans(widths, semiAnti)
+	var searchQuals []Expr
+	if !classifyPulledQuals(pu, 1, spans, ctx, &searchQuals) {
+		t.Fatalf("classifyPulledQuals declined the pulled body")
+	}
+	if len(ctx.joinInfoList) != 1 || ctx.joinInfoList[0].Jointype != parser.JoinAnti {
+		t.Fatalf("expected one JoinAnti SJInfo on joinInfoList, got %+v", ctx.joinInfoList)
+	}
+	if len(semiAnti) != 0 {
+		t.Fatalf("links = %d, want 0 — pulled bodies produce no semiAntiChainLink", len(semiAnti))
 	}
 }
 

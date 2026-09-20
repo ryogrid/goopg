@@ -205,9 +205,9 @@ func TestExtractSearchLeaves_InUnnestLinkPassesSJInfoGate(t *testing.T) {
 	if j.Predicate == nil && j.LeftKey != nil && j.RightKey != nil {
 		j.Predicate = &BinaryOp{Op: parser.OpEq, Left: j.LeftKey, Right: j.RightKey}
 	}
-	scans, _, _, _, semiAnti, ok := extractSearchLeaves(j, true)
+	scans, _, _, _, semiAnti, ok := extractSearchLeaves(j)
 	if !ok {
-		t.Fatalf("extractSearchLeaves(j, true) ok=false: %s", planString(node))
+		t.Fatalf("extractSearchLeaves(j) ok=false: %s", planString(node))
 	}
 	if len(semiAnti) != 1 {
 		t.Fatalf("semiAnti = %d links, want 1", len(semiAnti))

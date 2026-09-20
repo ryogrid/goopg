@@ -55,7 +55,9 @@ What remains is therefore construction-side, not capability-side:
   walking the NODE chain rather than reading the IR — the source of the
   spans/offset/remap validation family;
 - semi/anti members arrive as `semiAntiChainLink` synthetic appended
-  leaves instead of numbered jointree entries;
+  leaves instead of numbered jointree entries — slice 2 retired this
+  for pulled bodies (real `joinlist` leaf items now); only
+  chain-extracted Semi/Anti still arrive that way;
 - Phase A/B (`runJoinSearchBelowPinned`) still searches twice around the
   pinned semi/anti spine;
 - the `prefix-size`/`isSimpleSingle`/`GOOPG_ONEREL_SEARCH` floor still
@@ -176,11 +178,80 @@ routing marker (`treeHasSearched` on knob-on, absent knob-off).
 - Filterless inner joins under the knob — searched for the first time;
   the SF0.25 capture's moved-plan names are the measurement.
 
+## Slice 2 — pulled semi/anti as real leaf items (landed)
+
+M0145-0003's pulled bodies already carried everything a real leaf entry
+needs (scans, widths, body-local bindings, bound quals, and enough
+material to build the SpecialJoinInfo). What kept them synthetic was a
+numbering accident: `ctx.joinlist` is built in `planFromClause`, before
+WHERE resolution discovers the pullable sublinks — so the pulled leaves
+had no joinlist positions and the seam appended them as synthetic slots
+behind `semiAntiChainLink` records, with a walk-order→spans remap to
+paper over the coordinate split. Slice 2 numbers them instead:
+
+- **`pullUpSublinksIntoJointree` appends one `leafItem` per pulled leaf
+  to `ctx.joinlist`** — `pu.base` = the joinlist's relation count at
+  pull-up time, `pu.nLeaves` = the total pulled count — exactly as
+  `pull_up_subqueries` appends the subquery's RTEs to the parent's
+  range table. `ctx.joinlist`'s only consumer is the seam, so the
+  append cannot desync another reader; the pulled items are real
+  searched members the moment the record exists.
+- **`splicePulledLeaves`** (replacing `integratePulledSublinks`)
+  inserts the pulled scans/widths at `[nReal, nprefix)` — their
+  joinlist positions — ahead of the chain-extracted synthetic tail, and
+  shifts every extracted leaf index at-or-above `nReal` up by
+  `nPulled` (link hands, extracted SJInfo fields, outer-link sides,
+  inner-ON `belowNullable`). The tail invariant — non-emitting leaves
+  occupy `[nReal, nleaves)` — is preserved, so the leaf-count,
+  tail-order and offset-agreement checks run unchanged; they just now
+  treat pulled leaves as non-emitting rather than synthetic.
+- **`classifyPulledQuals`** (replacing `buildPulledSemiAntiLink`)
+  rebases each body's quals directly into problem space and classifies
+  them `distribute_qual_to_rels`-style — spanning correlation and
+  body-local conjuncts into the conjunct pool (the partition lands
+  them on the semijoin's join clause / inside the RHS), SEMI-only
+  outer-local hoists into `pu.outerQuals` — and appends each body's
+  `SpecialJoinInfo` to `ctx.joinInfoList`. No link record survives.
+- **A pulled-leaf construction arm** between the emitting loop and the
+  synthetic loop gives each pulled leaf a span-offset binding with the
+  real `table`/`alias` off its `*SeqScan` (flattenPulledBodyTree's
+  guarantee — anything else is a desync decline) and the same
+  `estimateBaseRelInfo` + `applyRelSizeFallback` stats path the
+  flattened-chain arm uses, marked `isSemiAntiSyntheticLeaf` so the
+  boundary filler treats its coordinates as non-emitting.
+
+Retired on this slice: `integratePulledSublinks`,
+`buildPulledSemiAntiLink`, the pulled half of the synthetic-leaf splice
+(pulled bodies produce no `semiAntiChainLink` at all — the white-box
+tests pin `len(semiAnti)==0` after integration), the `admitSemiAnti`
+flag itself (the one production call site had passed literal `true`
+since b2 — dead flexibility), and the pulled share of the `searchJl`
+leafItem-append workaround (it survives only for chain-extracted
+leaves). `remapWalkOrderFlatToSpans` stays — the chain arm still needs
+it — with a `pulledBase`/`pulledLeaves` argument translating walk
+indexes across the insertion; `semiAntiOnQualsOK` stays for the same
+reason. `pgShapedOffsetChecksOK` now takes the non-emitting RelSet
+directly (`leafRangeRelSet(nReal, len(scans))`), which collapses the
+pulled and synthetic cases into one skip-set.
+
+### Evidence
+
+White-box: `TestJointreePullupRealLeafItems`/`…Anti` drive pull-up →
+splice → classify directly and pin the leaf item in `ctx.joinlist`
+(`pu.base==1`, `it.rel==1`), the spliced scan position, the cumulative
+(non-synthetic) span, the pooled correlation conjunct's `{0,1}` relids,
+the `JoinSemi`/`JoinAnti` SJInfo on `joinInfoList` — and
+`len(semiAnti)==0`, the retirement itself. A DPTRACE probe confirmed
+the search enumerates the pulled leaves as real problem rels
+(`rels=jtp_o,a,b`) and prices the SEMI pair. Gates: optimizer suite,
+tpch-spotcheck (Q12=2/Q13=33), TPC-DS SF0.25 96/96 with 99/99 plan
+shapes identical, TPC-H acceptance arm 24/24 under
+`JOINTREE_PIPELINE=1`+`PGSHAPED=1`.
+
 ## Remaining slices (ledgered)
 
 | slice | scope | retires |
 |---|---|---|
-| 2 | semi/anti as real leaf items in the jointree problem — leaf entries numbered in-binding-order (M0145-0003's `pulled` entries already carry spans/SJInfos) instead of synthetic appended slots | `semiAntiChainLink` synthetic-leaf splice, `remapWalkOrderFlatToSpans`, `semiAntiOnQualsOK`, `admitSemiAnti` flag, the `searchJl` leafItem-append workaround |
 | 3 | IR-direct leaf materialisation: `jtScope` (or the resolveContext's already-built binding table) supplies bindings/spans/neededCols/outputCols without walking the node chain; clause distribution by coordinate ownership | `extractSearchLeaves`, `buildLeafSpans` as node-walk mechanism, `spans`/`offset-disagreement`/`residual-hits-pad` validation family, `localizeExprToLeaf`, `rebaseChainQual`/`rebaseSemiAntiChainQual` |
 | 5 | misc decline-family retirement as corpus admits | `outer-on-qual`, `inner-on-qual-*`, `outer-over-derived` (post-B-06), `pushPredicatesIntoCrossJoins`/`pushSingleSideQualsIntoInnerJoinInputs`/`rewriteScanInputsWithSingleTablePredicates`/`pushOuterQualsIntoLaterals` |
 

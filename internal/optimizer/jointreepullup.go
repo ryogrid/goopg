@@ -28,11 +28,14 @@ import (
 //
 // What this file produces is coordinate-agnostic bound material
 // (`jtPullup`): body leaf scans, body-local bound quals, and the
-// sublink's join type. `integratePulledSublinks` — called inside
-// tryPGShapedJoinSearch once the emitting prefix's real leaf count is
-// known — assigns positions, rebases the quals into the problem's
-// column space, and emits `semiAntiChainLink` entries: the same
-// record the chain walk produces, so the entire problem tail (qual
+// sublink's join type, plus the leaf items the pull-up itself numbers
+// into ctx.joinlist (M0145-0005 slice 2 — the pulled leaves are real
+// joinlist members, not synthetic appended slots). Inside
+// tryPGShapedJoinSearch, `splicePulledLeaves` splices the scans into
+// the leaf table at those positions and `classifyPulledQuals` rebases
+// the quals into the problem's column space, classifies them into the
+// conjunct pools, and appends each body's SpecialJoinInfo to
+// ctx.joinInfoList — so the entire problem tail (qual
 // pooling, nullable-side delay proofs, leaf-local filter attachment,
 // relInfo estimation, `planJoinlistSearch`) runs unchanged.
 //
@@ -56,7 +59,7 @@ type jtPullup struct {
 	// either way), so they join the parent's own conjunct stream at
 	// the same point the link predicates do. Under ANTI they cannot
 	// be hoisted — `NOT EXISTS(... WHERE outer.x = 5)` must keep the
-	// outer.x != 5 rows — so buildPulledSemiAntiLink declines instead
+	// outer.x != 5 rows — so classifyPulledQuals declines instead
 	// of ever populating this for one.
 	outerQuals []Expr
 	// pulled marks the bound WHERE conjuncts the pull-up consumed —
@@ -68,6 +71,16 @@ type jtPullup struct {
 	// conjuncts stay in the predicate and the legacy tail handles
 	// them exactly as before.
 	pulled map[Expr]bool
+	// base is the leaf-item index of the first pulled leaf — the
+	// joinlist's relation count at pull-up time, when the bodies'
+	// leaf items were appended to ctx.joinlist (M0145-0005 slice 2).
+	// The seam's own nReal must agree with it; a mismatch is a
+	// numbering desync, not a shape to plan around.
+	base int
+	// nLeaves is the total number of pulled leaf items appended —
+	// sum of len(bodies[i].leafScans). Pulled leaves occupy the
+	// problem positions [base, base+nLeaves), in body order.
+	nLeaves int
 }
 
 // jtPulledBody is one pulled sublink's bound material in BODY-LOCAL
@@ -76,8 +89,9 @@ type jtPullup struct {
 // identity — and the quals are the body's bound conjuncts, in which a
 // `*ColumnRef` indexes the body's own leaf-concat space and an
 // `*OuterColumnRef{Level:1}` indexes the PARENT statement's emitting
-// space. integratePulledSublinks performs the coordinate rebase;
-// until then nothing in this record names a parent-space position.
+// space. rebasePulledQual performs the coordinate rebase inside
+// classifyPulledQuals; until then nothing in this record names a
+// parent-space position.
 type jtPulledBody struct {
 	// expr is the bound *ExistsExpr the pull-up consumed — the key in
 	// jtPullup.pulled.
@@ -137,6 +151,28 @@ func pullUpSublinksIntoJointree(pred Expr, ctx *resolveContext, cat catalog.Cata
 		pu.bodies = append(pu.bodies, body)
 		pu.pulled[c] = true
 	}
+	if pu == nil {
+		return nil
+	}
+	// M0145-0005 slice 2: the pulled bodies' leaves are REAL joinlist
+	// members — leaf items numbered in binding order, appended after
+	// the emitting items exactly as pull_up_subqueries appends the
+	// subquery's RTEs to the parent's range table
+	// (initsplan.c: convert_EXISTS_sublink_to_join's list_concat).
+	// The seam then sees one uniform leaf table — every pulled leaf a
+	// searched item with a real binding — instead of real items plus
+	// synthetic appended slots. Non-emitting, so they are never bound
+	// for name resolution: ctx.bindings is untouched, and the problem
+	// bindings are built from each body's own scope at the seam.
+	pu.base = ctx.joinlist.nrels()
+	pos := pu.base
+	for _, pb := range pu.bodies {
+		for range pb.leafScans {
+			ctx.joinlist = append(ctx.joinlist, leafItem(pos))
+			pos++
+		}
+	}
+	pu.nLeaves = pos - pu.base
 	return pu
 }
 
@@ -314,148 +350,181 @@ func flattenPulledBodyTree(node Node, wantLeaves int) ([]Node, []Expr, bool) {
 	return leaves, quals, true
 }
 
-// integratePulledSublinks assigns the pulled bodies their leaf
-// positions inside the search problem — directly after the real
-// prefix leaves and any synthetic leaves the chain walk extracted —
-// rebases their bound quals into the problem's column space, and
-// appends the resulting semi/anti links and leaf entries to the
-// tables tryPGShapedJoinSearch is about to consume.
+// splicePulledLeaves inserts the pulled bodies' leaf scans at their
+// leaf-item positions — [pu.base, pu.base+pu.nLeaves), the slots the
+// pull-up already numbered into ctx.joinlist — directly after the
+// real (emitting) leaves and BEFORE any synthetic leaves the chain
+// walk extracted, and shifts every extracted leaf index at-or-above
+// pu.base up by pu.nLeaves so the extracted set keeps the problem
+// tail.
 //
 // It is called after `extractSearchLeaves`, before the synthetic-leaf
-// accounting, so the pulled leaves participate in every check the
+// accounting, so the spliced leaves participate in every check the
 // walk-derived leaves do (tail ordering, offset agreement, leaf-count
 // arithmetic) under exactly the same rules.
 //
-// Coordinate recap: for a pulled leaf at problem position p, both its
-// walk-order-flat base and its out-of-band span base are
-// `sum(widths[0:p])` — the two spaces coincide at the tail because no
-// real leaf follows a synthetic one. The quals are therefore produced
-// directly in the final space; the seam's own walk-order→spans remap
-// treats them as already-correct.
-//
-// emittingTotal is the width of the emitting (real-prefix) space —
-// len(ctx.schema) — the boundary an OuterColumnRef{Level:1} must not
-// cross.
-func integratePulledSublinks(pu *jtPullup, nprefix int, ctx *resolveContext, scans *[]Node, widths *[]int, semiAnti *[]semiAntiChainLink) bool {
-	if pu == nil || len(pu.bodies) == 0 {
+// It performs no qual work: the pulled leaves are real leaf items
+// now, so there is no link record to build — classifyPulledQuals runs
+// once the problem spans exist.
+func splicePulledLeaves(pu *jtPullup, nReal int, ctx *resolveContext, scans *[]Node, widths *[]int, semiAnti *[]semiAntiChainLink, outer *[]outerChainLink, onQuals *[]chainOnQual) bool {
+	if pu == nil || pu.nLeaves == 0 {
 		return true
 	}
-	emittingTotal := len(ctx.schema)
-	nExtracted := 0
-	for _, lk := range *semiAnti {
-		for r := lk.rhs; r != 0; r >>= 1 {
-			nExtracted += int(r & 1)
-		}
+	if pu.base != nReal {
+		// The pull-up numbered the pulled leaf items against the
+		// joinlist's relation count at pull-up time; the seam's own
+		// real-leaf count must agree — a mismatch is a numbering
+		// desync, not a shape to plan around.
+		return false
 	}
 	// realTotal is the walk-order base of the first non-real leaf:
-	// every position before it is a real prefix leaf. On the pulled
-	// arm those bindings are cumulative over the emitting space, so
-	// realTotal must equal emittingTotal — a real leaf that does not
-	// emit (a demoted-ANTI right side is the production shape) would
-	// leave a hole in the flat space the pulled refs could land in.
+	// every position before it is a real prefix leaf. The pulled
+	// arm's qual rebase assumes the emitting space is exactly
+	// [0, len(ctx.schema)) — a real leaf that does not emit (a
+	// demoted-ANTI right side mid-chain is the production shape)
+	// would leave a hole the pulled refs could land in.
 	realTotal := 0
-	for i := 0; i < nprefix && i < len(*widths); i++ {
+	for i := 0; i < nReal && i < len(*widths); i++ {
 		realTotal += (*widths)[i]
 	}
-	if realTotal != emittingTotal {
+	if realTotal != len(ctx.schema) {
 		return false
-	}
-	// Build the spans array relidsOfExpr attributes against: emitting
-	// leaves at their binding offsets, extracted-synthetic positions
-	// left zero-width (pulled quals can never reference them — a ref
-	// that somehow does fails attribution and declines), pulled
-	// leaves at their problem positions.
-	totalPulled := 0
-	for _, pb := range pu.bodies {
-		totalPulled += len(pb.leafScans)
 	}
 	// A pulled leaf at index >= maxSearchRels has no RelSet bit — the
-	// seam's own overflow check would catch it one step later anyway,
-	// but declining here keeps every link built below well-formed.
-	if nprefix+nExtracted+totalPulled > maxSearchRels {
+	// seam's own overflow check catches it one step later anyway, but
+	// declining here keeps every shift below well-formed.
+	if len(*scans)+pu.nLeaves > maxSearchRels {
 		return false
 	}
-	allSpans := make([]leafSpan, nprefix+nExtracted+totalPulled)
-	// Emitting leaves take cumulative-width spans — the same
-	// construction buildLeafSpans performs on the real positions — so
-	// the relid attribution below reads exactly the space the problem
-	// tail will use.
-	lo := 0
-	for i := 0; i < nprefix && i < len(*widths); i++ {
-		allSpans[i] = leafSpan{lo: lo, hi: lo + (*widths)[i]}
-		lo += (*widths)[i]
-	}
-	emittingBits := leafRangeRelSet(0, nprefix)
-	pos := nprefix + nExtracted
-	walkBase := realTotal
-	for i := nprefix; i < nprefix+nExtracted && i < len(*widths); i++ {
-		walkBase += (*widths)[i]
-	}
+	var pulledScans []Node
+	var pulledWidths []int
 	for _, pb := range pu.bodies {
-		n := len(pb.leafScans)
-		for i, w := range pb.leafWidths {
-			allSpans[pos+i] = leafSpan{lo: walkBase, hi: walkBase + w}
-			walkBase += w
+		pulledScans = append(pulledScans, pb.leafScans...)
+		pulledWidths = append(pulledWidths, pb.leafWidths...)
+	}
+	merged := make([]Node, 0, len(*scans)+pu.nLeaves)
+	merged = append(merged, (*scans)[:nReal]...)
+	merged = append(merged, pulledScans...)
+	merged = append(merged, (*scans)[nReal:]...)
+	*scans = merged
+	mw := make([]int, 0, len(*widths)+pu.nLeaves)
+	mw = append(mw, (*widths)[:nReal]...)
+	mw = append(mw, pulledWidths...)
+	mw = append(mw, (*widths)[nReal:]...)
+	*widths = mw
+	// Every chain-extracted leaf index at-or-above nReal moves up by
+	// nLeaves: the extracted links' hands, their SpecialJoinInfo
+	// fields (renumbered to real leaf bits during the walk), the
+	// outer links' sides, and the inner ON quals' belowNullable.
+	shift := func(rs RelSet) RelSet { return shiftRelSetAbove(rs, nReal, pu.nLeaves) }
+	for i := range *semiAnti {
+		lk := &(*semiAnti)[i]
+		lk.lhs, lk.rhs = shift(lk.lhs), shift(lk.rhs)
+		if lk.sjinfo != nil {
+			lk.sjinfo.SynLefthand = shift(lk.sjinfo.SynLefthand)
+			lk.sjinfo.SynRighthand = shift(lk.sjinfo.SynRighthand)
+			lk.sjinfo.MinLefthand = shift(lk.sjinfo.MinLefthand)
+			lk.sjinfo.MinRighthand = shift(lk.sjinfo.MinRighthand)
 		}
-		rhs := leafRangeRelSet(pos, pos+n)
-		link, outerQuals, ok := buildPulledSemiAntiLink(pb, rhs, emittingBits, pos, allSpans, ctx)
-		if !ok {
-			return false
-		}
-		pu.outerQuals = append(pu.outerQuals, outerQuals...)
-		*semiAnti = append(*semiAnti, link)
-		*scans = append(*scans, pb.leafScans...)
-		*widths = append(*widths, pb.leafWidths...)
-		pos += n
+	}
+	for i := range *outer {
+		(*outer)[i].preserved = shift((*outer)[i].preserved)
+		(*outer)[i].nullable = shift((*outer)[i].nullable)
+	}
+	for i := range *onQuals {
+		(*onQuals)[i].belowNullable = shift((*onQuals)[i].belowNullable)
 	}
 	return true
 }
 
-// buildPulledSemiAntiLink rebases one pulled body's bound quals into
-// problem space and emits its semiAntiChainLink: correlation
-// (cross-side) conjuncts become the link predicate, body-local
-// conjuncts the pooled bodyQuals, and outer-local conjuncts — for a
-// SEMI join only — join the pooled list as well, where the conjunct
-// partition lands them on the emitting leaves they read. An
-// outer-local restriction under an ANTI join cannot be hoisted:
+// shiftRelSetAbove moves every leaf-index bit at-or-above base up by
+// delta, leaving lower bits in place — the pulled leaves splice in
+// ahead of the extracted (synthetic) ones, so an extracted leaf index
+// ≥ base lands at base+delta.
+func shiftRelSetAbove(rs RelSet, base, delta int) RelSet {
+	if rs == 0 || delta == 0 {
+		return rs
+	}
+	below := rs & leafRangeRelSet(0, base)
+	above := rs &^ leafRangeRelSet(0, base)
+	return below | (above << uint(delta))
+}
+
+// classifyPulledQuals rebases each pulled body's bound quals into
+// problem space and classifies them — the work that used to
+// build a link record, now feeding the plain conjunct pools
+// directly since the pulled leaves are real searched items:
+// correlation (cross-side) conjuncts and body-local conjuncts both
+// join the caller's `searchQuals` pool — the partition lands the
+// former on the semijoin's join clause and the latter inside the RHS,
+// exactly distribute_qual_to_rels's placement — and outer-local
+// conjuncts (SEMI only) hoist to pu.outerQuals. An outer-local
+// restriction under an ANTI join cannot be hoisted:
 // `NOT EXISTS(... WHERE outer.x = 5)` must keep the rows where
-// outer.x != 5, so it declines the pull-up instead.
-func buildPulledSemiAntiLink(pb *jtPulledBody, rhs, emittingBits RelSet, pos int, allSpans []leafSpan, ctx *resolveContext) (semiAntiChainLink, []Expr, bool) {
-	pullSpans := allSpans[pos : pos+len(pb.leafScans)]
-	var spanning, pooled, outerLocal []Expr
-	for _, q := range pb.quals {
-		rebased, ok := rebasePulledQual(q, pb, pullSpans, len(ctx.schema), ctx)
-		if !ok {
-			return semiAntiChainLink{}, nil, false
-		}
-		rs, attributable := relidsOfExpr(rebased, allSpans)
-		if !attributable || rs == 0 {
-			return semiAntiChainLink{}, nil, false
-		}
-		switch {
-		case relsOverlap(rs, emittingBits) && relsOverlap(rs, rhs):
-			spanning = append(spanning, rebased)
-		case relsSubset(rs, rhs):
-			pooled = append(pooled, rebased)
-		case relsSubset(rs, emittingBits):
-			if pb.jointype == parser.JoinAnti {
-				return semiAntiChainLink{}, nil, false
+// outer.x != 5, so it declines instead. Each body's SpecialJoinInfo
+// is appended to ctx.joinInfoList — the leaf items it constrains are
+// real joinlist members, so no link record survives.
+//
+// spans is the problem's own leaf-span table — pulled leaves sit at
+// [pu.base, pu.base+nLeaves) in it, the positions splicePulledLeaves
+// assigned and the joinlist items name.
+func classifyPulledQuals(pu *jtPullup, nReal int, spans []leafSpan, ctx *resolveContext, searchQuals *[]Expr) bool {
+	if pu == nil || pu.nLeaves == 0 {
+		return true
+	}
+	emittingBits := leafRangeRelSet(0, nReal)
+	emittingTotal := len(ctx.schema)
+	pos := nReal
+	for _, pb := range pu.bodies {
+		n := len(pb.leafScans)
+		rhs := leafRangeRelSet(pos, pos+n)
+		pullSpans := spans[pos : pos+n]
+		var spanning []Expr
+		for _, q := range pb.quals {
+			rebased, ok := rebasePulledQual(q, pb, pullSpans, emittingTotal, ctx)
+			if !ok {
+				return false
 			}
-			outerLocal = append(outerLocal, rebased)
-		default:
-			return semiAntiChainLink{}, nil, false
+			rs, attributable := relidsOfExpr(rebased, spans)
+			if !attributable || rs == 0 {
+				return false
+			}
+			switch {
+			case relsOverlap(rs, emittingBits) && relsOverlap(rs, rhs):
+				spanning = append(spanning, rebased)
+			case relsSubset(rs, rhs):
+				if !searchConsumes(rebased, spans) {
+					return false
+				}
+				*searchQuals = append(*searchQuals, rebased)
+			case relsSubset(rs, emittingBits):
+				if pb.jointype == parser.JoinAnti {
+					return false
+				}
+				pu.outerQuals = append(pu.outerQuals, rebased)
+			default:
+				return false
+			}
 		}
+		// A pulled body with no correlation clause left is the
+		// link-pred-nil decline the semiAntiChainLink arm enforced —
+		// uncorrelated bodies never reach here by the pull-up's own
+		// Level-1 gate, so this is defensive, not a new class.
+		if len(spanning) == 0 {
+			return false
+		}
+		for _, c := range spanning {
+			if !searchConsumes(c, spans) {
+				return false
+			}
+		}
+		*searchQuals = append(*searchQuals, spanning...)
+		if sj := pulledSemiJoinInfo(pb.jointype, rhs, emittingBits, spanning, spans); sj != nil && !joinInfoListHas(ctx.joinInfoList, sj) {
+			ctx.joinInfoList = append(ctx.joinInfoList, sj)
+		}
+		pos += n
 	}
-	link := semiAntiChainLink{
-		jointype:  pb.jointype,
-		lhs:       emittingBits,
-		rhs:       rhs,
-		pred:      combineAnd(spanning),
-		flattened: true,
-		bodyQuals: pooled,
-	}
-	link.sjinfo = pulledSemiJoinInfo(pb.jointype, rhs, emittingBits, spanning, allSpans)
-	return link, outerLocal, true
+	return true
 }
 
 // pulledSemiJoinInfo builds the SpecialJoinInfo for a pulled semi/anti
@@ -585,7 +654,7 @@ func bodyLeafOf(pb *jtPulledBody, idx int) (leaf int, local int, found bool) {
 // emittingBindingAt returns the parent binding covering flat emitting
 // position idx, reading widths off the contiguous binding offsets
 // (the pulled arm is only reachable when the emitting space is
-// contiguous — integratePulledSublinks checks realTotal ==
+// contiguous — splicePulledLeaves checks realTotal ==
 // emittingTotal first).
 func emittingBindingAt(ctx *resolveContext, idx int) (rangeBinding, bool) {
 	for i, b := range ctx.bindings {

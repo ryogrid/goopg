@@ -237,9 +237,9 @@ func TestExtractSearchLeaves_AdmitSemiAnti_BuildsLinkAndRebuildsSJInfo(t *testin
 		t.Fatalf("no correlation predicate on the Semi join: %#v", j)
 	}
 
-	scans, widths, onQuals, outer, semiAnti, ok := extractSearchLeaves(j, true)
+	scans, widths, onQuals, outer, semiAnti, ok := extractSearchLeaves(j)
 	if !ok {
-		t.Fatalf("extractSearchLeaves(j, true) ok=false, want true: %s", planString(node))
+		t.Fatalf("extractSearchLeaves(j) ok=false, want true: %s", planString(node))
 	}
 	if len(scans) != 2 {
 		t.Fatalf("scans = %d leaves (%v), want 2 (t1, and the RHS *Project as one opaque leaf) — widths=%v", len(scans), scans, widths)
@@ -355,9 +355,9 @@ func TestExtractSearchLeaves_AdmitSemiAnti_NarrowsMinLefthandToCorrelatedRelatio
 		SJInfo:   &SpecialJoinInfo{Jointype: parser.JoinSemi},
 	}
 
-	scans, widths, _, _, semiAnti, ok := extractSearchLeaves(j, true)
+	scans, widths, _, _, semiAnti, ok := extractSearchLeaves(j)
 	if !ok {
-		t.Fatalf("extractSearchLeaves(j, true) ok=false, want true")
+		t.Fatalf("extractSearchLeaves(j) ok=false, want true")
 	}
 	if len(scans) != 3 {
 		t.Fatalf("scans = %d leaves, want 3 (t1+t3 flattened, plus the RHS opaque leaf): %v widths=%v", len(scans), scans, widths)
@@ -430,9 +430,9 @@ func TestExtractSearchLeaves_AdmitSemiAnti_FoldsKeyEquijoinIntoPred(t *testing.T
 		t.Fatalf("j.{LeftKey,RightKey} = {%v,%v}, want both set — this fixture must produce a hash-keyed Semi join", j.LeftKey, j.RightKey)
 	}
 
-	_, widths, _, _, semiAnti, ok := extractSearchLeaves(j, true)
+	_, widths, _, _, semiAnti, ok := extractSearchLeaves(j)
 	if !ok {
-		t.Fatalf("extractSearchLeaves(j, true) ok=false, want true: %s", planString(node))
+		t.Fatalf("extractSearchLeaves(j) ok=false, want true: %s", planString(node))
 	}
 	if len(semiAnti) != 1 {
 		t.Fatalf("semiAnti = %d links, want exactly 1: %+v", len(semiAnti), semiAnti)
@@ -489,9 +489,9 @@ func TestExtractSearchLeaves_AdmitSemiAnti_ChainedLinksRebaseInnerKeyCorrectly(t
 		t.Fatalf("j.Left = %T, want a chained *Join{Type:Semi} (the FIRST EXISTS's link) — fixture shape drifted from the expected chained tree: %s", j.Left, planString(node))
 	}
 
-	scans, widths, _, _, semiAnti, ok := extractSearchLeaves(j, true)
+	scans, widths, _, _, semiAnti, ok := extractSearchLeaves(j)
 	if !ok {
-		t.Fatalf("extractSearchLeaves(j, true) ok=false, want true: %s", planString(node))
+		t.Fatalf("extractSearchLeaves(j) ok=false, want true: %s", planString(node))
 	}
 	if len(scans) != 3 {
 		t.Fatalf("scans = %d leaves, want 3 (t1, RHS1, RHS2): widths=%v", len(scans), widths)
@@ -528,14 +528,14 @@ func TestExtractSearchLeaves_AdmitSemiAnti_ChainedLinksRebaseInnerKeyCorrectly(t
 	}
 }
 
-// TestExtractSearchLeaves_AdmitSemiAntiFalse_SemiIsOpaqueLeaf proves
-// the off arm's contract exactly as design doc §22.4 requires: with
-// `admitSemiAnti=false` — no longer the production literal (the one call
-// site has passed `true` since b2; this test deliberately exercises the
-// flag's off arm) — the Semi join is
-// treated as an ordinary opaque leaf — byte-identical to
-// pre-M0142-0008a-3i-plumbing-b1 behavior — and its SJInfo is left untouched.
-func TestExtractSearchLeaves_AdmitSemiAntiFalse_SemiIsOpaqueLeaf(t *testing.T) {
+// TestExtractSearchLeaves_SemiJoinIsAdmitted proves the only remaining
+// arm's contract: with `admitSemiAnti` retired (M0145-0005 slice 2 —
+// the one production call site had passed `true` since b2, so the off
+// arm was dead flexibility) a Semi join is ALWAYS decomposed — its
+// left side walks to real leaves, its right side becomes one opaque
+// synthetic leaf (no FlattenedRHS marker here), and the walk renumbers
+// its placeholder SJInfo to the real leaf-index bits.
+func TestExtractSearchLeaves_SemiJoinIsAdmitted(t *testing.T) {
 	cat := analyzedThreeTablesCatalog(t)
 	sql := "SELECT x FROM t1 WHERE EXISTS (" +
 		"SELECT 1 FROM t2, t3 WHERE t2.z = t1.x AND t2.y = t3.a)"
@@ -548,18 +548,21 @@ func TestExtractSearchLeaves_AdmitSemiAntiFalse_SemiIsOpaqueLeaf(t *testing.T) {
 		t.Fatalf("no JoinTypeSemi found: %s", planString(node))
 	}
 
-	scans, _, onQuals, outer, semiAnti, ok := extractSearchLeaves(j, false)
+	scans, _, onQuals, outer, semiAnti, ok := extractSearchLeaves(j)
 	if !ok {
-		t.Fatalf("extractSearchLeaves(j, false) ok=false, want true (a Semi *Join must still be a valid opaque leaf)")
+		t.Fatalf("extractSearchLeaves(j) ok=false, want true")
 	}
-	if len(scans) != 1 || scans[0] != Node(j) {
-		t.Errorf("scans = %v, want exactly [j] (admitSemiAnti=false: the Semi join itself is one opaque leaf, no descent)", scans)
+	if len(scans) != 2 || scans[0] != j.Left || scans[1] != j.Right {
+		t.Errorf("scans = %v, want [j.Left, j.Right] — the left side descends to its leaf, the right side is one opaque leaf", scans)
 	}
-	if len(onQuals) != 0 || len(outer) != 0 || len(semiAnti) != 0 {
-		t.Errorf("onQuals=%v outer=%v semiAnti=%v, want all empty with admitSemiAnti=false", onQuals, outer, semiAnti)
+	if len(onQuals) != 0 || len(outer) != 0 || len(semiAnti) != 1 {
+		t.Errorf("onQuals=%v outer=%v semiAnti=%v, want [0,0,1] — one admitted Semi link", onQuals, outer, semiAnti)
+	}
+	if len(semiAnti) == 1 && (semiAnti[0].lhs != leafRangeRelSet(0, 1) || semiAnti[0].rhs != leafRangeRelSet(1, 2)) {
+		t.Errorf("semiAnti[0].{lhs,rhs} = {%#x,%#x}, want {01,10}", semiAnti[0].lhs, semiAnti[0].rhs)
 	}
 	if j.SJInfo != nil && (j.SJInfo.SynLefthand != 1 || j.SJInfo.SynRighthand != 2) {
-		t.Errorf("j.SJInfo.{SynLefthand,SynRighthand} = {%#x,%#x}, want the untouched {1,2} placeholder — admitSemiAnti=false must not rebuild it", j.SJInfo.SynLefthand, j.SJInfo.SynRighthand)
+		t.Errorf("j.SJInfo.{SynLefthand,SynRighthand} = {%#x,%#x}, want {01,10} — renumbered to the real leaf-index bits", j.SJInfo.SynLefthand, j.SJInfo.SynRighthand)
 	}
 }
 
@@ -657,7 +660,7 @@ func TestRemapWalkOrderFlatToSpans_RealLeafAfterSyntheticRHS(t *testing.T) {
 		Right: &ColumnRef{Index: wA},
 	}
 
-	remapped, ok := remapWalkOrderFlatToSpans(pred, widths, cumOffsets)
+	remapped, ok := remapWalkOrderFlatToSpans(pred, widths, cumOffsets, 0, 0)
 	if !ok {
 		t.Fatalf("remapWalkOrderFlatToSpans(...) ok=false, want true")
 	}
@@ -706,15 +709,15 @@ func TestPgShapedOffsetChecksOK_ReducesToPlainChecksWhenNoSemiAnti(t *testing.T)
 	cumOffsets := buildLeafSpans(widths, nil)
 	bindingOffsets := []int{0, 2} // matches cumOffsets exactly
 
-	if reason, ok := pgShapedOffsetChecksOK(cumOffsets, nil, widths, bindingOffsets, true, 5); !ok {
+	if reason, ok := pgShapedOffsetChecksOK(cumOffsets, 0, widths, bindingOffsets, true, 5); !ok {
 		t.Errorf("pgShapedOffsetChecksOK(...) declined (%q), want accepted — matches the old plain checks on a well-formed shape", reason)
 	}
-	if reason, ok := pgShapedOffsetChecksOK(cumOffsets, nil, widths, []int{0, 99}, true, 5); ok {
+	if reason, ok := pgShapedOffsetChecksOK(cumOffsets, 0, widths, []int{0, 99}, true, 5); ok {
 		t.Errorf("pgShapedOffsetChecksOK(...) = accepted, want declined (offset-disagreement) — bindingOffsets[1] deliberately mismatches cumOffsets[1].lo")
 	} else if reason != "offset-disagreement" {
 		t.Errorf("declineReason = %q, want %q", reason, "offset-disagreement")
 	}
-	if reason, ok := pgShapedOffsetChecksOK(cumOffsets, nil, widths, bindingOffsets, true, 99); ok {
+	if reason, ok := pgShapedOffsetChecksOK(cumOffsets, 0, widths, bindingOffsets, true, 99); ok {
 		t.Errorf("pgShapedOffsetChecksOK(...) = accepted, want declined (spine-offset-disagreement) — spineOffset deliberately mismatches the real total width")
 	} else if reason != "spine-offset-disagreement" {
 		t.Errorf("declineReason = %q, want %q", reason, "spine-offset-disagreement")
@@ -742,11 +745,11 @@ func TestPgShapedOffsetChecksOK_RealLeafAfterSynthetic(t *testing.T) {
 	// wA (B was never a FROM item and has no entry).
 	bindingOffsets := []int{0, wA}
 
-	if reason, ok := pgShapedOffsetChecksOK(cumOffsets, semiAnti, widths, bindingOffsets, false, 0); !ok {
+	if reason, ok := pgShapedOffsetChecksOK(cumOffsets, semiAnti[0].rhs, widths, bindingOffsets, false, 0); !ok {
 		t.Errorf("pgShapedOffsetChecksOK(...) declined (%q), want accepted — A and C both agree with their real ctx.bindings offsets once B is skipped", reason)
 	}
 	// A deliberate mismatch on C's binding offset must still be caught.
-	if reason, ok := pgShapedOffsetChecksOK(cumOffsets, semiAnti, widths, []int{0, wA + 1}, false, 0); ok {
+	if reason, ok := pgShapedOffsetChecksOK(cumOffsets, semiAnti[0].rhs, widths, []int{0, wA + 1}, false, 0); ok {
 		t.Errorf("pgShapedOffsetChecksOK(...) = accepted, want declined (offset-disagreement) — C's binding offset deliberately mismatches")
 	} else if reason != "offset-disagreement" {
 		t.Errorf("declineReason = %q, want %q", reason, "offset-disagreement")
@@ -774,13 +777,13 @@ func TestPgShapedOffsetChecksOK_SyntheticLastInWalkOrder(t *testing.T) {
 	// The spine begins right after A's real width (wA) — NOT after
 	// cumOffsets's raw last entry, which would be wA+wB (B's out-of-band
 	// span's `hi`) and would false-decline this well-formed shape.
-	if reason, ok := pgShapedOffsetChecksOK(cumOffsets, semiAnti, widths, bindingOffsets, true, wA); !ok {
+	if reason, ok := pgShapedOffsetChecksOK(cumOffsets, semiAnti[0].rhs, widths, bindingOffsets, true, wA); !ok {
 		t.Errorf("pgShapedOffsetChecksOK(...) declined (%q), want accepted — spine offset %d correctly matches the REAL total width (%d), not cumOffsets' raw last entry (%d)", reason, wA, wA, cumOffsets[len(cumOffsets)-1].hi)
 	}
 	// The old (buggy) comparison target, `cumOffsets[len-1].hi` = wA+wB, must
 	// NOT be what this function accepts — passing it as spineOffset proves
 	// the fix is live, not accidentally still comparing against the old value.
-	if reason, ok := pgShapedOffsetChecksOK(cumOffsets, semiAnti, widths, bindingOffsets, true, wA+wB); ok {
+	if reason, ok := pgShapedOffsetChecksOK(cumOffsets, semiAnti[0].rhs, widths, bindingOffsets, true, wA+wB); ok {
 		t.Errorf("pgShapedOffsetChecksOK(...) = accepted for spineOffset=%d (the OLD buggy target, cumOffsets' raw last .hi), want declined — this would mean the fix regressed back to comparing against the synthetic leaf's out-of-band span", wA+wB)
 	} else if reason != "spine-offset-disagreement" {
 		t.Errorf("declineReason = %q, want %q", reason, "spine-offset-disagreement")
