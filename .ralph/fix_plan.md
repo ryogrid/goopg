@@ -7055,7 +7055,7 @@ cross-layer programme that has never been scoped.
         Anyone implementing (i) against Q69 expecting `leaf-count` to be
         the gate will measure no movement and wrongly conclude the
         increment failed.
-    - [ ] **M0142-0008a-3i-lateral — decide whether a chain whose Lateral
+    - [x] **M0142-0008a-3i-lateral — decide whether a chain whose Lateral
       join is goopg's OWN predp Phase-A splice may be searched** (filed by
       `M0142-0008a-3i-reach-verify`). `chainCarriesLateral` declines Q69 and
       Q10 over a `Lateral` join that no user wrote: predp.go's Phase A
@@ -7073,6 +7073,67 @@ cross-layer programme that has never been scoped.
       named Semi/Anti-algorithm divergence — which the implementing task
       measures with `pg-plan-parity-diff.py` per-query on a private-lane
       capture.
+      - **DECIDED 2026-09-20 (loop \#54): NO — and the refusal is
+        CORRECTNESS, not scope.** Design doc:
+        `docs/design/0100-0149/m0142-0008a-3i-lateral.md`.
+        Movement: none
+        - `predp.go` runs TWO searches: **Phase A** searches the Semi/Anti
+          join's inner chain and splices its **built plan** in
+          (`predp.go:153-162`); **Phase B** then searches from the pinned
+          Semi/Anti join and, by its own comment, "sees the … searched
+          `origChain` already in place" (`:164-167`). Phase B's call is the
+          one that declines.
+        - When Phase A's winner held a parameterised index probe,
+          `createNestLoopIndexJoinPlan` (`createplannl.go:364-383`) has
+          already LOWERED the dependency to `OuterColumnRef{Level: 1}` on
+          the probe's keys plus the `BindLateralOuter` execution contract —
+          a positional, immediate-parent binding. Reordering across it
+          silently breaks the binding; the construction site's own comment
+          says what dropping the marker does ("returning every row for the
+          first outer tuple's key").
+        - Nothing at Phase B's layer can re-lift it: the searchable form —
+          a path's `RequiredOuter` — was consumed when Phase A built its
+          plan. Same class as `reresolveJoinByName`'s post-search-splice
+          problem `-3i-recon2` flagged as unresolved.
+        - So `-plumbing-c14` did NOT add a conservative guard; it closed a
+          real hole. Contrast with M0137-0019b, where all four gates said
+          in their own comments that the refusal was scope and the executor
+          was independently shown worker-local — here the refusal protects
+          a binding the chain genuinely depends on.
+        - **PG never has this problem**: one search over the flattened join
+          list, dependencies in `param_info`
+          (`postgres/src/backend/optimizer/util/pathnode.c:188, 293`) which
+          `add_path` and the join-order search read directly, and plan
+          construction AFTER the search —
+          `top_plan = create_plan(root, best_path)`,
+          `postgres/src/backend/optimizer/plan/planner.c:441`. goopg's
+          two-phase pre-DP unnest is the divergence.
+        - Route for Q69/Q10 is therefore **route-order**, the subject the
+          owner already prioritised as M0144-0003: Phase B must see the
+          chain before the dependency is lowered, or Phase A's result must
+          retain a path-level `RequiredOuter`. Filed below rather than
+          attempted — it changes when plans are built relative to when they
+          are searched, a planner-architecture decision, not a gate edit.
+    - [ ] **M0142-0008a-3i-lateral-route — let Phase B search before the
+      probe dependency is lowered** (filed by `M0142-0008a-3i-lateral`).
+      Either Phase B sees the chain BEFORE `createNestLoopIndexJoinPlan`
+      lowers a parameterised probe to `Join{Lateral:true}` +
+      `OuterColumnRef{Level:1}`, or Phase A's spliced result retains a
+      path-level `RequiredOuter` Phase B's search can read — PG's own
+      arrangement (`param_info` + `create_plan` after the search,
+      `planner.c:441`).
+      Kind: recon
+      Parent: M0142-0008a-3
+      Expected movement: unblocks Q69 and Q10's seam admission, whose
+      `join-method` records are the census's named Semi/Anti-algorithm
+      divergence on TPC-DS SF0.25. Measured by the implementing task with
+      `pg-plan-parity-diff.py` per-query on a private-lane capture, plus a
+      `GOOPG_PGSHAPED_DP_TRACE=1` seam census showing the `lateral` decline
+      class shrink from its current 2.
+      - Overlaps M0144-0003 (route-order verification) by construction;
+        check that task's findings first rather than re-deriving them, and
+        do NOT attempt this as a `chainCarriesLateral` widening — that was
+        measured and refuted by `M0142-0008a-3i-lateral`.
     - **P0-H11 audit finding (2026-09-20, Loop \#32):** the leaf-admission
       increment must also fix `cumulativeFromSpans`'s span round-trip
       (`joinsearchseam.go` `cumulativeFromSpans` → `joinlistProblem.cumOffsets`
