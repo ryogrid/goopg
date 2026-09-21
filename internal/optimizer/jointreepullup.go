@@ -139,12 +139,20 @@ func pullUpSublinksIntoJointree(pred Expr, ctx *resolveContext, cat catalog.Cata
 	for _, c := range splitAnd(pred) {
 		ex, negated, ok := existsPullupConjunct(c)
 		if !ok || ex.Subquery == nil {
+			// M0145-0003 census: a conjunct this arm does not even
+			// recognise. Only sublink-bearing conjuncts are reported —
+			// an ordinary `a = 1` is not a missed pull-up.
+			if kind := sublinkConjunctKind(c); kind != "" {
+				notePullupDecline(kind)
+			}
 			continue
 		}
-		body, ok := pullUpExistsBody(ex, negated, ctx, cat, ps)
+		body, reason, ok := pullUpExistsBody(ex, negated, ctx, cat, ps)
 		if !ok {
+			notePullupDecline(reason)
 			continue
 		}
+		notePullupDecline("")
 		if pu == nil {
 			pu = &jtPullup{pulled: make(map[Expr]bool)}
 		}
@@ -220,21 +228,26 @@ func existsPullupConjunct(c Expr) (*ExistsExpr, bool, bool) {
 //     once spliced, a qual's evaluation count is the search's, not the
 //     subplan's once-per-outer-row — a volatile qual would produce
 //     different answers under the two shapes.
-func pullUpExistsBody(ex *ExistsExpr, negated bool, parent *resolveContext, cat catalog.Catalog, ps PlannerSettings) (*jtPulledBody, bool) {
+//
+// The middle return value is the DECLINE REASON, for M0145-0003's pull-up
+// census (nlicensus.go): every `return nil, …, false` names the gate it fell
+// at, so a corpus run says which arm to build next instead of which arm looks
+// biggest. It is "" on success.
+func pullUpExistsBody(ex *ExistsExpr, negated bool, parent *resolveContext, cat catalog.Catalog, ps PlannerSettings) (*jtPulledBody, string, bool) {
 	sub := ex.Subquery
 	if !sublinkBodyIsSimple(sub) {
-		return nil, false
+		return nil, "body-not-simple", false
 	}
 	bodyCtx, leafScans, leafWidths, onQuals, ok := bindPulledBodyScope(sub, parent, cat, ps)
 	if !ok {
-		return nil, false
+		return nil, "body-scope-not-bindable", false
 	}
 	for _, q := range onQuals {
 		// The rest of the subselect must not refer to the parent
 		// (subselect.c:1502). Level >= 2 is fine — it refers above the
 		// parent and decrements into place at integration.
 		if exprHasOuterRefAtLevel(q, 1) {
-			return nil, false
+			return nil, "on-qual-parent-ref", false
 		}
 	}
 	// A WHERE-less body (an uncorrelated `EXISTS (SELECT … FROM t)`)
@@ -248,20 +261,20 @@ func pullUpExistsBody(ex *ExistsExpr, negated bool, parent *resolveContext, cat 
 		var err error
 		where, err = resolveExpr(sub.Where, bodyCtx)
 		if err != nil {
-			return nil, false
+			return nil, "where-not-resolvable", false
 		}
 	}
 	if exprHasSublinkPlan(where) || exprListHasSublinkPlan(onQuals) {
-		return nil, false
+		return nil, "nested-sublink", false
 	}
 	if exprListHasVolatileBuiltin(append(splitAnd(where), onQuals...), cat) {
-		return nil, false
+		return nil, "volatile-qual", false
 	}
 	quals := append(splitAnd(where), onQuals...)
 	// `contain_vars_of_level(whereClause, 1)` — the correlation must
 	// live in the WHERE, and it must exist (subselect.c:1509).
 	if !exprListHasOuterRefAtLevel(quals, 1) {
-		return nil, false
+		return nil, "no-level1-correlation", false
 	}
 	// The WHERE must also carry a conjunct that can actually become
 	// the link predicate — one reading a body-local column AND a
@@ -271,7 +284,7 @@ func pullUpExistsBody(ex *ExistsExpr, negated bool, parent *resolveContext, cat 
 	// other sublink in this WHERE; declining here instead leaves the
 	// statement exactly where the legacy pipeline would find it.
 	if !exprListHasLocalAndLevel1Ref(splitAnd(where)) {
-		return nil, false
+		return nil, "no-spanning-conjunct", false
 	}
 	jointype := parser.JoinSemi
 	if negated {
@@ -284,7 +297,7 @@ func pullUpExistsBody(ex *ExistsExpr, negated bool, parent *resolveContext, cat 
 		leafWidths:   leafWidths,
 		bodyBindings: bodyCtx.bindings,
 		quals:        quals,
-	}, true
+	}, "", true
 }
 
 // bindPulledBodyScope builds the provisional resolve scope for a pulled

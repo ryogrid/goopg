@@ -1,6 +1,42 @@
 # M0145-0003 — sublink pull-up into the jointree
 
 Status: landed (EXISTS/NOT EXISTS flat-body arm) / gates in §"Measurement".
+
+## Which arm next — the pull-up decline census (2026-09-21)
+
+The M0145-0007 sublink-route census measured this pull-up's coverage at under
+2% of sublink-planning events (knob arm: 294 pinned-spine vs 5
+jointree-pullup). That makes "which deferred arm to build next" a question
+about the SHAPE of the other 98%, and the task's deferred list ranks the arms
+by how big they sound rather than by how often they fire. So they were counted.
+
+`notePullupDecline` (nlicensus.go, `GOOPG_NLI_CENSUS=1`) reports one line per
+WHERE conjunct the pull-up sees: the gate it fell at, or `(pulled)`. Conjuncts
+with no sublink in them are not reported — an ordinary `a = 1` is not a missed
+pull-up. The classifier names the sublink by its Go type via `ExprSubplans`
+rather than a hand-written switch, so a sublink type nobody taught it still
+appears (the exprwalk RC-1a rule applies to measurement too: the arm nobody
+built would otherwise be the arm that never shows up).
+
+TPC-DS SF0.25, knob arm, plans channel:
+
+| bucket | count | reading |
+|---|---|---|
+| `InExpr` | **34** | `IN` / `NOT IN` / `= ANY` — PG pulls these up (`ANY_SUBLINK`, prepjointree.c:665). **The gap.** |
+| `SubqueryExpr` | 15 | scalar sublinks — PG does NOT pull these up either; they stay SubPlans. Not a gap. |
+| `(pulled)` | 9 | the flat EXISTS arm's successes |
+| `ExistsExpr` | 2 | EXISTS not at conjunct top level (under OR, etc.) — PG handles some of these in its OR arm (prepjointree.c:797), so a small real gap |
+
+No `pullUpExistsBody` gate (`body-not-simple`, `no-level1-correlation`,
+`no-spanning-conjunct`, …) fired at all: every recognised EXISTS conjunct was
+pulled. The EXISTS arm's gates are NOT the limiter — the limiter is that most
+corpus sublinks are `IN`/`ANY`.
+
+**Next arm: `convert_ANY_sublink_to_join`** (subselect.c:1333). It is 34 of the
+45 unpulled sublink conjuncts, and the two arms PG implements are exactly ANY
+and EXISTS, so finishing ANY completes goopg's `pull_up_sublinks` scope rather
+than extending past it. The opaque-body arm and outer-local-only correlation
+stay deferred with no corpus witness ranking them above it.
 Task: `.ralph/fix_plan.md` M0145-0003. Parent: M0145-0001 (the IR
 contract this implements one slice of) / M0145-0002 (the harness that
 measures it). Kind: impl.

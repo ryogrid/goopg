@@ -12494,6 +12494,30 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
     units + exprwalk census PASS, tpch-spotcheck PASS (Q12=2 Q13=33),
     SF0.25 sweep PASS (`MISMATCH=0`, plans `same=99`), acceptance arm
     24/24 value-MATCH.
+  - **Decline census (loop 2026-09-21 \#19)** — which arm to build next,
+    measured instead of ranked by size. `notePullupDecline`
+    (`internal/optimizer/nlicensus.go`, `GOOPG_NLI_CENSUS=1`) reports one
+    line per WHERE conjunct the pull-up sees. TPC-DS SF0.25, knob arm:
+    - `InExpr` **34** — `IN`/`NOT IN`/`= ANY`. PG pulls these up
+      (`ANY_SUBLINK`, prepjointree.c:665). **This is the gap.**
+    - `SubqueryExpr` 15 — scalar sublinks, which PG does NOT pull up
+      either (they stay SubPlans). Not a gap; do not build for it.
+    - `(pulled)` 9 — the flat EXISTS arm's successes.
+    - `ExistsExpr` 2 — EXISTS not at conjunct top level (under OR); PG
+      handles some of those in its OR arm (prepjointree.c:797), so a
+      small real gap.
+    - NO `pullUpExistsBody` gate fired at all (`body-not-simple`,
+      `no-level1-correlation`, `no-spanning-conjunct`, …): every
+      recognised EXISTS conjunct was pulled. The EXISTS arm's gates are
+      not the limiter — the corpus is mostly `IN`/`ANY`.
+    - The classifier names sublinks by Go type via `ExprSubplans`, not a
+      hand-written switch: `TestExprSwitchInventoryIsPinned` rejected the
+      switch version, and it was right — a census that must be taught
+      each Expr type reports the untaught one as "nothing here", so the
+      arm nobody built would be the arm that never appears.
+    - **Next arm: `convert_ANY_sublink_to_join`** (subselect.c:1333) — 34
+      of the 45 unpulled sublink conjuncts, and ANY+EXISTS is exactly
+      PG's own `pull_up_sublinks` scope.
   - Still open (ledgered): the **opaque-body arm** (non-flat bodies as
     semi/anti citizens carrying their planned Node — needs param-exec
     machinery inside the problem); `IN`/`NOT IN` pull-up

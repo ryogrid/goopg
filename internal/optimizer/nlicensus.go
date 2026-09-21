@@ -37,6 +37,7 @@ package optimizer
 import (
 	"fmt"
 	"os"
+	"strings"
 )
 
 // nliCensusEnabled gates the whole instrument. Read once, like `dpTrace`.
@@ -84,6 +85,49 @@ func noteSublinkRoute(route string) {
 		return
 	}
 	fmt.Fprintf(os.Stderr, "SUBLINKCENSUS route=%s\n", route)
+}
+
+// notePullupDecline records one WHERE conjunct's fate at the jointree
+// sublink pull-up (M0145-0003). An empty reason means the conjunct WAS pulled
+// up; anything else is the gate it fell at.
+//
+// The pull-up's coverage is what the M0145-0007 sublink-route census measured
+// as under 2% of sublink-planning events, and "which arm to build next" is a
+// question about the SHAPE of the other 98%. Guessing it from the task's
+// deferred list ranks the arms by how big they sound; this ranks them by how
+// often they actually fire.
+func notePullupDecline(reason string) {
+	if !nliCensusEnabled {
+		return
+	}
+	if reason == "" {
+		reason = "(pulled)"
+	}
+	fmt.Fprintf(os.Stderr, "PULLUPCENSUS decline=%s\n", reason)
+}
+
+// sublinkConjunctKind classifies a WHERE conjunct the EXISTS arm did not even
+// recognise, by the Go type of the first sublink-bearing expression in it.
+// Conjuncts with no sublink are not reported at all — an ordinary `a = 1` is
+// not a missed pull-up — so the census counts only what a wider pull-up could
+// in principle take.
+//
+// It deliberately does NOT enumerate the sublink Expr types in a switch. A
+// census whose classifier has to be taught each new type reports the one it
+// was never taught as "nothing here", which is the RC-1a defect class
+// (exprwalk.go) wearing a measurement hat: the arm nobody built would be the
+// arm that never appears. `ExprSubplans` is the shared "does this expression
+// carry an inner plan" primitive, and `%T` names whatever it finds, so a new
+// sublink type shows up in the census the day it is added.
+func sublinkConjunctKind(c Expr) string {
+	kind := ""
+	walkExprTree(c, func(x Expr) {
+		if kind != "" || len(ExprSubplans(x)) == 0 {
+			return
+		}
+		kind = strings.TrimPrefix(fmt.Sprintf("%T", x), "*optimizer.")
+	})
+	return kind
 }
 
 // nliCensusJoinTypeName names the join type for the census line. It is
