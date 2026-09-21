@@ -12974,6 +12974,32 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
       SEMI/ANTI index-probe join. The cutover depends on `addNLIPaths`
       electing SEMI/ANTI NLI paths first (it files INNER/LEFT today) —
       a pathgen task, not a lowering one. Ledgered.
+    - Slice 3 (landed, loop 2026-09-21 \#18): the sublink-route census,
+      and it lands the same verdict as slice 2 — this task's remaining
+      items are CUTOVER-blocked, not lowering refactors.
+    - Caller tracing first: `spliceSearchedSpine` and
+      `remapSublinkOuterRefs` have NO callers outside `predp.go`, and
+      every live `layoutPosMap`/`remapByPosMap` call is in `predp.go`
+      too. The splice/re-resolution family is not the lowering walk's
+      leftovers — it is ONE route's machinery, the post-search
+      re-resolution of the pinned semi/anti spine.
+    - Census (`SUBLINKCENSUS` lines, same env gate; counts exceed the
+      query count because subplans and CTEs plan recursively):
+      default arm TPC-DS 207 pinned-spine / 0 jointree-pullup; default
+      arm TPC-H 16 / 0; **knob arm TPC-DS 294 / 5**.
+    - So even with `GOOPG_JOINTREE_PIPELINE=1` the pull-up handles under
+      2% of sublink-planning events — exactly what M0145-0003 landed and
+      ledgered (flat EXISTS/NOT EXISTS only; IN/NOT IN, non-flat bodies
+      and outer-local-only correlation deferred). Everything else falls
+      back to the pinned spine on BOTH arms.
+    - Therefore slice 4 is blocked on **M0145-0003**, not on M0145-0005's
+      clause distribution as the recon first assumed.
+    - TRAP, recorded in the design doc: a plans capture taken under
+      `GOOPG_JOINTREE_PIPELINE=1` lands in the same results directory the
+      next DEFAULT sweep diffs against. The sweep after this census
+      reported `same=74 changed=25` purely because its baseline was the
+      knob-arm capture; diffing the two default-arm captures directly
+      showed them byte-identical.
     - Attribution of the single TPC-DS INNER fire is still open:
       `cmd_plans` captures all 99 queries regardless of `QUERIES`, so a
       bisect through that channel measures the same full run each time.

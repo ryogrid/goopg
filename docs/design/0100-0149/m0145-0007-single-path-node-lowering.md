@@ -1,7 +1,9 @@
 # Single Path→Node lowering (M0145-0007)
 
-Status: recon complete; slices 1 (lowering-locality guard) and 2 (the NLI
-route census) landed. Task: `.ralph/fix_plan.md`
+Status: recon complete; slices 1 (lowering-locality guard), 2 (the NLI route
+census) and 3 (the sublink-route census) landed. Both censuses reach the same
+conclusion: this task's remaining items are CUTOVER-blocked, not lowering
+refactors. Task: `.ralph/fix_plan.md`
 M0145-0007. Parent: M0145-0005 (the DP that produces the path tree),
 M0145-0006 (the upper rels that extend it). Kind: impl.
 
@@ -58,14 +60,18 @@ all. They serve the population the search never built, so they retire when that
 population does. Whether that retirement is SAFE was the open question, and
 slice 2 measured it — see below. The answer is no, not yet.
 
-### 4. The splice / re-resolution family is the real work
+### 4. The splice / re-resolution family is live — and has ONE caller
 
 All of it is live (non-test reference counts, this recon):
 `reresolveJoinByName` 28, `remapByPosMap` 16, `applyJoinTreePosMap` 10,
 `remapWithBindings` 9, `layoutPosMap` 7, `remapPosMapAfterRewrite` 5,
 `remapSublinkOuterRefs` 4, `spliceSearchedSpine` 3, `remapExprRefsToMHJ` 2.
-Nothing here is dead; each is a second establishment of coordinates the
-lowering walk could have established once.
+
+Slice 3 then measured WHERE from. Tracing the callers: `spliceSearchedSpine`
+and `remapSublinkOuterRefs` have zero callers outside `predp.go`, and every
+live call of `layoutPosMap`/`remapByPosMap` is inside `predp.go` too — the
+post-search re-resolution of the pinned semi/anti spine. The family is not
+"the lowering walk's leftovers"; it is one route's machinery.
 
 ## Slice 2 — the NLI route census (landed): the rewrite is NOT dead
 
@@ -114,14 +120,60 @@ bisect measures the same full run every time. Attribution needs either the
 `sweep` channel (which does honour `QUERIES`) or an outer-relation field added
 to the census line.
 
+## Slice 3 — the sublink-route census (landed): the family is cutover-blocked
+
+`runJoinSearchBelowPinned` (predp.go) is the LEGACY answer to pre-DP
+unnesting: unnest the WHERE sublinks, run the join search on the subtree BELOW
+the pinned semi/anti spine, then splice the spine back and re-resolve the
+coordinates the splice moved. That splice is the family's only live caller. The
+jointree pipeline replaces the route entirely — sublinks are pulled into the IR
+before the search (M0145-0003), so nothing is spliced afterwards and nothing
+needs re-resolving.
+
+So the question is not how to fold the family into lowering. It is how much of
+the corpus still takes the route that needs it. The census (same env gate as
+the NLI one, `SUBLINKCENSUS` lines, one per sublink-planning event — subplans
+and CTEs plan recursively, so the counts exceed the query count):
+
+| arm | corpus | pinned-spine | jointree-pullup |
+|---|---|---|---|
+| default | TPC-DS SF0.25 plans | **207** | 0 |
+| default | TPC-H SF1 acceptance arm | **16** | 0 |
+| `GOOPG_JOINTREE_PIPELINE=1` | TPC-DS SF0.25 plans (EXPLAIN-only, G8) | **294** | **5** |
+
+The knob-arm row is the actionable one: even with the jointree pipeline
+selected, the pull-up handles 5 of ~299 sublink-planning events — under 2%.
+That is exactly what M0145-0003 landed and ledgered: the flat
+`EXISTS`/`NOT EXISTS` arm only, with `IN`/`NOT IN`, non-flat bodies and
+outer-local-only correlation deferred. Every other statement falls back to the
+pinned spine on BOTH arms.
+
+**Conclusion.** The splice/re-resolution family cannot retire at M0145-0007. It
+retires when M0145-0003's pull-up covers the remaining sublink shapes and the
+M0145-0008 cutover deletes the legacy route — the same shape of answer slice 2
+reached for `rewriteJoinsToNLI`. Attempting the fold now would mean
+re-implementing the legacy route's coordinate repair inside the lowering walk,
+for a route the milestone is deleting.
+
+### An operational trap this census walked into
+
+Running the plans channel under `GOOPG_JOINTREE_PIPELINE=1` writes a capture
+into the same results directory the next DEFAULT sweep diffs against. The
+sweep after this census duly reported `same=74 changed=25` — 25 shapes
+"changed" because its baseline was the knob-arm capture, not because anything
+in the tree moved. Diffing the two default-arm captures directly showed them
+byte-identical. Any knob-arm capture must be taken on a private lane, or the
+next default capture's plan channel must be read against the last DEFAULT
+capture by hand.
+
 ## Slice plan
 
 | slice | scope | why this order |
 |---|---|---|
 | 1 | Retire item 1 by absence: pin that `translateToLayout` is lowering-local (a guard test that fails if a call site appears outside `createplan*.go`), and record the measurement. | Cheap, and it converts a retirement-list line into an enforced invariant instead of a claim. |
 | 2 | **Landed.** The NLI route census (above). Result: the search has a coverage hole — SEMI/ANTI — that must be closed before 0008 may delete the rewrite. |
-| 3 | `OuterColumnRef` → outer-layout mapping (`remapOuterRefsInSubplan`) into lowering: each lowered node publishes its binding-space→`outputLayout` map, subplan OCRs translate once. | The narrowest member of the re-resolution family with a self-contained contract. |
-| 4 | The rest of the splice/re-resolution family, once the DP's clause distribution (0005) has removed the passes that mutate `Predicate`. | Everything here depends on nothing else re-writing the tree afterwards. |
+| 3 | **Landed as a census, not a fold.** The family's only live caller is the legacy pinned-spine route, which still plans 207 TPC-DS and 16 TPC-H sublink events on the default arm (294 vs 5 on the knob arm). Folding it into lowering would re-implement a route the milestone deletes. |
+| 4 | The rest of the splice/re-resolution family — now understood to be **blocked on M0145-0003**, not on 0005: it retires with the pinned-spine route once the jointree pull-up covers `IN`/`NOT IN`, non-flat bodies and outer-local-only correlation. | The census puts the pull-up's current coverage under 2% of sublink-planning events. |
 | 5 | `fillJoinHashKeys` folded into the join arm. | LAST, per item 2 — its lateness is a defence, and the defence is only unnecessary once slices 3-4 have removed the mutators. |
 
 ## Gates

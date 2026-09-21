@@ -64,6 +64,28 @@ func noteNLIBuilt(route string, jt JoinType, probe string) {
 		route, nliCensusJoinTypeName(jt), probe)
 }
 
+// Sublink-planning routes, reported under the same env gate. The pinned-spine
+// route (`runJoinSearchBelowPinned`, predp.go) is the LEGACY answer to
+// pre-DP unnesting, and it is the only live caller of the splice/re-resolution
+// family — `spliceSearchedSpine`, `layoutPosMap`, `remapByPosMap`,
+// `remapOuterRefsInSubplan`, `remapSublinkOuterRefs`. M0145-0001 assigned that
+// family to M0145-0007 ("single lowering translates once"), so how often the
+// route fires is the same kind of question the NLI census answered: a family
+// with no live route retires at the cutover, one that still plans corpus
+// statements does not.
+const (
+	spineRouteLegacy   = "pinned-spine"    // runJoinSearchBelowPinned + post-search splice
+	spineRouteJointree = "jointree-pullup" // sublinks pulled into the IR before the search
+)
+
+// noteSublinkRoute records which route planned one statement's WHERE sublinks.
+func noteSublinkRoute(route string) {
+	if !nliCensusEnabled {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "SUBLINKCENSUS route=%s\n", route)
+}
+
 // nliCensusJoinTypeName names the join type for the census line. It is
 // deliberately separate from `traceJoinTypeName` (which speaks the parser
 // enum) so the census stays readable without a conversion at every call.

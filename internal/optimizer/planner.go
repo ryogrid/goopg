@@ -1642,6 +1642,10 @@ func planSelectImpl(s *parser.SelectStmt, cat catalog.Catalog, plannerSet Planne
 			if jointree {
 				if f, okf := node.(*Filter); okf {
 					ctx.jtPullup = pullUpSublinksIntoJointree(f.Predicate, ctx, cat, plannerSet)
+					if ctx.jtPullup != nil {
+						// M0145-0007 slice 3 census (nlicensus.go).
+						noteSublinkRoute(spineRouteJointree)
+					}
 				}
 			}
 			if unnestPreDPEnabled() && ctx.jtPullup == nil && whereQual != nil && whereEligibleForPreDPUnnest(pred) {
@@ -1654,6 +1658,10 @@ func planSelectImpl(s *parser.SelectStmt, cat catalog.Catalog, plannerSet Planne
 				// and the post-search spine re-resolution.
 				f := node.(*Filter)
 				origChain := f.Child
+				// M0145-0007 slice 3 census (nlicensus.go): this is the
+				// legacy pinned-spine route, the only live caller of the
+				// splice/re-resolution family.
+				noteSublinkRoute(spineRouteLegacy)
 				node = unnestSubqueriesInPlan(node)
 				node = runJoinSearchBelowPinned(node, origChain, ctx, cat)
 				preDPUnnested = true
