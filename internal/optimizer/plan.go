@@ -2790,6 +2790,22 @@ type SetOp struct {
 	pos   int
 	Left  Node
 	Right Node
+	// TlistTypesDiffer records that this link's two branches did NOT have
+	// identical output types BEFORE setOpUnifyBranches coerced them —
+	// upstream's `tlist_same_datatypes` (tlist.c:257) answered false, which
+	// makes `is_simple_union_all_recurse` (prepjointree.c:2258) refuse to
+	// flatten the union into an appendrel. It is recorded here because the
+	// pre-cast types exist only at the moment of unification: afterwards
+	// every branch schema agrees by construction, so a post-cast check is a
+	// tautology.
+	//
+	// The polarity is deliberate. The zero value means "no known
+	// difference", so the construction sites that do not set it — the
+	// partition/inheritance fan-outs, which build *SetOp{All: true} as PG
+	// APPENDRELS rather than set operations — keep their behaviour exactly.
+	// Only the genuine set-operation site sets it, and only when the types
+	// really differ. M0145-0004.
+	TlistTypesDiffer bool
 	// Op is the set-operation kind (UNION / INTERSECT / EXCEPT).
 	// The zero value (parser.SetOpUnion) keeps the implicit
 	// partition/inheritance UNION ALL construction sites working

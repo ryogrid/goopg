@@ -139,6 +139,21 @@ func (s *searchCtx) addAppendRelPartialPaths() {
 		if !ok {
 			continue
 		}
+		// tlist_same_datatypes, the half of is_simple_union_all_recurse
+		// (prepjointree.c:2258) that subqueryChainIsSimpleUnionAll cannot
+		// answer: at MARK time the parser AST carries no resolved types,
+		// and by the time a schema exists setOpUnifyBranches has already
+		// coerced every branch, so the comparison there is a tautology.
+		// The verdict is therefore taken where the pre-cast types live —
+		// stamped on the node as SetOp.TlistTypesDiffer (planner.go) — and
+		// consulted here, the last gate before the leaf inherits an
+		// appendrel's partial path. Upstream refuses the flattening
+		// outright; refusing the hoist is that refusal expressed at the
+		// granularity this seam has, and it leaves the exact legacy leaf.
+		// M0145-0004.
+		if so := carrierSetOpNode(rel.baseLeaf); so != nil && so.TlistTypesDiffer {
+			continue
+		}
 		setOpRel := carrier.setOpBranchRel()
 		if setOpRel == nil || len(setOpRel.PartialPathlist) == 0 {
 			continue
@@ -158,4 +173,27 @@ func (s *searchCtx) addAppendRelPartialPaths() {
 			addPartialPath(rel, &hoisted, appendRelPartialProducer)
 		}
 	}
+}
+
+// carrierSetOpNode finds the `*SetOp` under an admitted appendrel carrier.
+//
+// The carrier is a bare `*SetOp` or the union's own `*Gather`/`*GatherMerge`
+// top (see the root check above), so the node the type verdict is stamped on
+// is not always the carrier itself. The walk descends single-child boundary
+// nodes with the same depth cap `setOpBranchRelOf` uses, and answers nil for
+// any shape that is not one of those — which leaves the gate open, i.e. the
+// pre-M0145-0004-tlist behaviour, rather than refusing a shape it cannot
+// read.
+func carrierSetOpNode(n Node) *SetOp {
+	for depth := 0; n != nil && depth < 32; depth++ {
+		if so, ok := n.(*SetOp); ok {
+			return so
+		}
+		kids := boundaryWalkChildren(n)
+		if len(kids) != 1 {
+			return nil
+		}
+		n = kids[0]
+	}
+	return nil
 }

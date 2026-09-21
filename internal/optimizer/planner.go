@@ -1013,6 +1013,66 @@ func setOpUnifyBranches(pos int, left, right Node) (Node, Node) {
 	return left, right
 }
 
+// setOpBranchTypesDiffer is `!tlist_same_datatypes(member_tlist, colTypes)`
+// (`postgres/src/backend/optimizer/util/tlist.c:257`) for one link of the
+// chain, asked at the only moment it is still answerable: before
+// setOpUnifyBranches coerces both branches to their common type.
+//
+// Upstream compares each member's output types against the TOP-LEVEL
+// colTypes. Comparing the two branches of every link is equivalent for a
+// chain: colTypes is the first member's types, and if every adjacent pair
+// agrees then all members agree with the first — while a single
+// disagreeing pair is a member that differs from colTypes.
+//
+// A nested link that already answered false stays false, which is
+// is_simple_union_all_recurse's `&&` over larg and rarg.
+//
+// Differing column COUNTS also answer false (upstream's "tlist longer than
+// colTypes" / "tlist shorter" arms), though the caller rejects that case
+// earlier with 42601. Typmods and collations are deliberately NOT compared:
+// upstream's own comment is "currently no callers care about comparing
+// typmods".
+func setOpBranchTypesDiffer(left, right Node) bool {
+	if l, ok := left.(*SetOp); ok && l.TlistTypesDiffer {
+		return true
+	}
+	if r, ok := right.(*SetOp); ok && r.TlistTypesDiffer {
+		return true
+	}
+	ls, rs := left.Output(), right.Output()
+	if len(ls) != len(rs) {
+		return true
+	}
+	for i := range ls {
+		if !sameSetOpTypeName(ls[i].Type.Name, rs[i].Type.Name) {
+			return true
+		}
+	}
+	return false
+}
+
+// sameSetOpTypeName decides whether two type SPELLINGS denote the same type.
+//
+// Upstream compares `exprType()` — OIDs — where `decimal` and `numeric` are
+// one type (1700), as are `int` and `int4`. goopg carries the spelling the
+// statement used, so a raw name comparison reports a difference that does not
+// exist: measured on TPC-DS Q5, whose union mixes a table column with
+// `cast(0 as decimal(7,2))`, a name comparison refused a union PostgreSQL
+// flattens, and removed the Parallel Append shape M0145-0004 had landed.
+//
+// `catalog.ArgTypeDisplayAlias` is the existing single alias table (its own
+// doc argues for exactly one, "no second alias source to drift"): every
+// spelling of a base type folds to its SQL display name, so two names denote
+// the same type iff they fold alike. It is a DISPLAY mapping being used for
+// identity, which is sound in this direction — distinct types never share a
+// display name — but it is not an OID, so a genuinely OID-level question
+// (domains over the same base type) is outside what it can answer. That is a
+// conservative direction here: it can only report "same", i.e. keep a union
+// flattenable, never refuse one PG would allow.
+func sameSetOpTypeName(a, b string) bool {
+	return strings.EqualFold(catalog.ArgTypeDisplayAlias(a), catalog.ArgTypeDisplayAlias(b))
+}
+
 // setOpCastBranchTo projects one set-operation branch, casting each column whose
 // resolved common type differs from the branch's own. An empty entry in
 // `common` means the column was declined by setOpCommonTypeName and is passed
@@ -1341,6 +1401,14 @@ func planSelectImpl(s *parser.SelectStmt, cat catalog.Catalog, plannerSet Planne
 			// across both branches and coerce BOTH to it, so the resolved type
 			// is what `SetOp.Output()` reports. Columns this declines fall
 			// through to the generic-string validation below, unchanged.
+			// tlist_same_datatypes (tlist.c:257), captured BEFORE the
+			// coercion below: upstream's is_simple_union_all_recurse
+			// (prepjointree.c:2258) compares each member's output types
+			// against the top-level colTypes and refuses to flatten when
+			// they differ. Once setOpUnifyBranches has run every branch
+			// agrees by construction, so this is the only point the
+			// question can still be asked. M0145-0004.
+			typesDiffer := setOpBranchTypesDiffer(acc, right)
 			acc, right = setOpUnifyBranches(seg.opPos, acc, right)
 			right = wrapSetOpBranchWithCasts(seg.opPos, acc.Output(), right)
 			// C-18 (P4-09): the SETOP upper rel's path for this node —
@@ -1355,7 +1423,8 @@ func planSelectImpl(s *parser.SelectStmt, cat catalog.Catalog, plannerSet Planne
 			// partition/inheritance fan-outs also build `*SetOp{All: true}`,
 			// but those are PG APPENDRELS below the upper-rel pipeline, not
 			// set operations — see windowsetoppaths.go's header.
-			return createSetOpPaths(upper, &SetOp{pos: s.Pos(), Left: acc, Right: right, Op: seg.opType, All: seg.opAll}, plannerSet, setOpTupleFraction)
+			return createSetOpPaths(upper, &SetOp{pos: s.Pos(), Left: acc, Right: right, Op: seg.opType, All: seg.opAll,
+				TlistTypesDiffer: typesDiffer}, plannerSet, setOpTupleFraction)
 		}
 		// foldSetOpRange folds segments[lo:hi) onto acc, honouring PostgreSQL's
 		// set-operator precedence: INTERSECT binds tighter than UNION/EXCEPT

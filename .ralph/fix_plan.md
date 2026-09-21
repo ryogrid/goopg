@@ -13834,10 +13834,47 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
     `select_common_type`'s — filed separately under "Manually
     discovered" rather than folded in here, because it is a parser/type
     defect that both pipelines share.
+  - **`tlist_same_datatypes` LANDED 2026-09-22 (loop \#83)** — the last
+    gate of `is_simple_union_all`. Movement: none — default arm
+    `CATEGORIES-EXCL-MATCH` identical, plan channel `same=99 changed=0`.
+    - **Where the question can be asked**: not at MARK time (the parser
+      AST has no resolved types) and not after planning (`setOpUnifyBranches`
+      has coerced both branches, so the comparison is a tautology). The one
+      moment both are false is inside the fold, immediately before the
+      coercion — `SetOp.TlistTypesDiffer` records the verdict there and
+      `addAppendRelPartialPaths` consults it.
+    - Comparing each link's two branches is equivalent to upstream's
+      member-vs-`colTypes` comparison for a chain, and a nested link that
+      already answered false propagates (`is_simple_union_all_recurse`'s
+      `&&` over `larg`/`rarg`). Zero value = "no known difference", so the
+      partition/inheritance fan-outs keep their behaviour exactly.
+    - **An over-refusal the measurement caught before it shipped.** The
+      first version compared `Type.Name` directly — but upstream compares
+      OIDs, where `decimal` IS `numeric` (1700) and `int` is `int4`.
+      TPC-DS Q5's union mixes a table column with `cast(0 as decimal(7,2))`,
+      so it refused a union PG flattens and **removed the `Parallel Append`
+      shape this very task had landed**. The knob-arm capture named Q5 as
+      the one query that moved; folding both spellings through
+      `catalog.ArgTypeDisplayAlias` first leaves only Q36/Q70/Q86, which are
+      the capture's three pre-existing parse errors whose text embeds the
+      temp FILENAME (the loop \#82 trap, hit again).
+    - Using a DISPLAY mapping for identity is sound in this direction —
+      distinct types never share a display name — but it is not an OID, so
+      an OID-level question (domains over one base type) is outside it. That
+      error direction is the safe one: it can only answer "same", never
+      refuse a union PG would allow.
+    - Three test levels, each non-vacuity checked: the predicate (alias and
+      typmod pins), the gate (its matched-types control is load-bearing —
+      without it the change is indistinguishable from "never hoist"), and
+      the WIRING, which exists because neutralising the capture site left
+      the other two green.
+    - Gates: units; tpch-spotcheck Q12=2/Q13=33; tpcds-sf025
+      `PASS=96 MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0`; acceptance arm
+      24 MATCH; both default-arm floor captures (TPC-DS `match=2` Q9+Q41,
+      TPC-H `match=1` Q6) held exactly; pgbench smoke.
   - Still open (ledgered): member-level rtable entries +
     parent-qual distribution into members (`distribute_qual_to_rels` —
-    M0145-0005's IR work); `tlist_same_datatypes` (needs bound member
-    tlists pre-cast); LATERAL union propagation; CTE-wrapped union
+    M0145-0005's IR work); LATERAL union propagation; CTE-wrapped union
     leaves (`CTEScan` hides the carrier — Q2/Q14/Q71/Q76's shapes);
     serial-side member-path competition (leaf serial path stays
     prebuilt-over-nested-winner); `is_safe_append_member`'s pull-up

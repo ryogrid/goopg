@@ -1,6 +1,8 @@
 # M0145-0004 — UNION ALL subqueries as appendrel leaves
 
 Status: landed (partial-path hoist arm) / gates in §"Measurement".
+**`tlist_same_datatypes` landed 2026-09-22** — see the final section; it also
+records an over-refusal the measurement caught before it shipped.
 Task: `.ralph/fix_plan.md` M0145-0004. Parent: M0145-0001 (IR contract),
 M0145-0002 (harness), M0144-0003b-1 (the `setOpBranchTag` carry this
 slice consumes). Kind: impl.
@@ -273,3 +275,89 @@ decline this slice; Q5's derived-table form is the landing witness).
   parent entries) IS deferred: LATERAL propagation; CTE-wrapped union
   leaves (`CTEScan` boundary); serial-side member-path competition
   (the leaf's serial path stays prebuilt-over-nested-winner).
+
+
+---
+
+# `tlist_same_datatypes`: the last gate of `is_simple_union_all` (2026-09-22)
+
+The deferral list said this half was "NOT ported: goopg's parser AST carries no
+resolved types at the point this runs and the produced node's member schemas
+are post-cast". Both halves of that are true, and together they name where the
+answer has to be taken.
+
+## Upstream
+
+`is_simple_union_all_recurse` (`prepjointree.c:2258`) ends each leaf with
+`tlist_same_datatypes(subquery->targetList, colTypes, true)`
+(`tlist.c:257`): every member's output types must equal the top-level
+`colTypes`, position for position. Differing column counts are false too.
+Typmods and collations are deliberately not compared — upstream's own note is
+*"currently no callers care about comparing typmods"*.
+
+## Where goopg can ask it
+
+Not at MARK time: `subqueryChainIsSimpleUnionAll` runs on the parser AST,
+which carries no resolved types. Not after planning either: `setOpUnifyBranches`
+(M0145-0004's sibling work on `select_common_type`) coerces both branches, so
+by the time a schema exists every branch agrees **by construction** and the
+comparison is a tautology.
+
+The one moment both facts are false is inside the fold, immediately before the
+coercion. `SetOp.TlistTypesDiffer` records the verdict there and
+`addAppendRelPartialPaths` consults it — upstream refuses the flattening
+outright; refusing the hoist is that refusal at the granularity this seam has,
+and it leaves the exact legacy leaf.
+
+Comparing each link's two branches is equivalent to upstream's
+member-vs-`colTypes` comparison for a chain: `colTypes` is the first member's
+types, so if every adjacent pair agrees all members agree with the first, and
+a single disagreeing pair is a member that differs. A nested link that already
+answered false propagates, which is the recursion's `&&` over `larg`/`rarg`.
+
+The field's polarity is deliberate: the zero value means *no known
+difference*, so the partition/inheritance fan-outs — which build
+`*SetOp{All: true}` as PG APPENDRELS rather than set operations and never set
+it — keep their behaviour exactly.
+
+## The over-refusal the measurement caught
+
+The first version compared `Type.Name` directly. That is not what upstream
+compares: `exprType()` returns OIDs, where `decimal` **is** `numeric` (1700)
+and `int` is `int4`. goopg keeps the spelling the statement used.
+
+TPC-DS Q5's union mixes a table column with `cast(0 as decimal(7,2))`, so the
+name comparison reported a difference that does not exist and refused a union
+PostgreSQL flattens — **removing the `Parallel Append` shape this very task had
+landed.** The knob-arm capture named it precisely: with the naive comparison,
+Q5 was the one query that moved; with `ArgTypeDisplayAlias` folding both
+spellings first, the only remaining differences are Q36/Q70/Q86, which are the
+capture's three pre-existing parse errors whose text embeds the temp filename.
+
+`catalog.ArgTypeDisplayAlias` is the repository's single alias table (its own
+doc argues for exactly one, "no second alias source to drift"). Using a
+DISPLAY mapping for identity is sound in this direction — distinct types never
+share a display name — but it is not an OID, so an OID-level question (domains
+over the same base type) is outside it. That error direction is the safe one:
+it can only answer "same", i.e. keep a union flattenable, never refuse one PG
+would allow.
+
+## Verification
+
+- Three levels, each with its own non-vacuity check: the predicate
+  (`TestSetOpBranchTypesDifferMatchesUpstreamComparison`, including the alias
+  and typmod pins), the gate (`TestAppendRelHoistRefusesTypeMismatchedUnion`,
+  whose matched-types control is load-bearing — without it the change would be
+  indistinguishable from "never hoist"), and the WIRING
+  (`TestPlannedSetOpCarriesTlistVerdict`, which plans real SQL). The wiring
+  test exists because neutralising the capture site left the other two green:
+  each end was pinned, the connection between them was not.
+- Default arm unchanged, as the design's "legacy is inert by construction"
+  requires: SF0.25 sweep `PASS=96 MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0`,
+  plan channel `same=99 changed=0`; floors held exactly (TPC-DS SF0.25
+  `match=2` Q9+Q41, TPC-H parallel `match=1` Q6) with `CATEGORIES-EXCL-MATCH`
+  identical to the previous default-arm capture.
+- tpch-spotcheck Q12=2/Q13=33; TPC-H acceptance arm 24 MATCH; pgbench smoke.
+
+Artefacts: `tmp/m0145-0004-tlist/` (knob arm at HEAD, knob arm with the naive
+comparison, knob arm with the alias fix, and both default-arm floor captures).

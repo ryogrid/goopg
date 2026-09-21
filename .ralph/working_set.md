@@ -1,57 +1,56 @@
 (idle — nothing in flight)
 
-# Loop #82 — M0145-0018's FRESH E1 re-run: blocker GONE, one criterion still fails
+# Loop #83 — M0145-0004: `tlist_same_datatypes` landed (task stays `[ ]`)
 
-Banner: the GO says 0018's fresh E1 re-runs once 0019 lands. 0019/0019a landed,
-so this is that re-run. **Measurement only — `problemPairsOuterWithDerived`
-untouched, zero production diff (C1).**
-Design: `docs/design/0100-0149/m0145-0018-firewall-relaxation-no-go.md`
-§"Fresh E1 re-verification (2026-09-22)".
+Banner: 0018 is owner-blocked, so the flow chain resumes at **M0145-0004**
+(still `[ ]` — this loop landed ONE of its residuals, not the task).
+Design: `docs/design/0100-0149/m0145-0004-union-all-appendrel-leaf.md`,
+final section. Movement: none (default arm identical).
 
-## Fire set RE-DERIVED (the task insists it drifts)
-SF0.25 knob-arm census: `outer-over-derived` **3**; with the firewall off the
-class vanishes (`declines` 17→14). Affected queries: **Q77, Q78** — unchanged.
-**PLAN-DIFF TRAP**: a naive A/B diff reports FIVE changed queries
-(Q36, Q70, Q77, Q78, Q86). Q36/Q70/Q86 are the capture's pre-existing parse
-`error=3` queries whose only difference is the temp FILENAME in the psql error
-text. Do not chase them.
+## The change
+`SetOp.TlistTypesDiffer` captures upstream's `tlist_same_datatypes`
+(`tlist.c:257`, driven from `prepjointree.c:2258`) inside the fold,
+**immediately before `setOpUnifyBranches` coerces the branches** — the only
+moment it is answerable: the parser AST has no types at mark time, and after
+coercion every branch agrees by construction. `addAppendRelPartialPaths`
+consults it and refuses the hoist. Zero value = "no known difference", so the
+partition/inheritance fan-outs are untouched.
 
-## The 2026-09-21 no-go is GONE — M0145-0019a fixed it
-Q78 SF1 firewall-off was `Nested Loop Left Join (cost=5494.86..1147565.07)`,
->1800 s. Now: `Hash Left Join (cost=16457.31..37717.11)`.
+## ⚠ THE TRAP THIS LOOP HIT — read before touching type comparisons
+The first version compared `Type.Name` directly. **Upstream compares OIDs**,
+where `decimal` IS `numeric` (1700) and `int` is `int4`. TPC-DS Q5's union
+mixes a table column with `cast(0 as decimal(7,2))`, so it refused a union PG
+flattens and **removed the Parallel Append shape M0145-0004 itself landed**.
+Fold both spellings through `catalog.ArgTypeDisplayAlias` first.
+Knob-arm capture named it exactly: naive → Q5 moved; alias-folded → only
+Q36/Q70/Q86, which are the capture's three pre-existing parse ERRORS whose
+text embeds the temp FILENAME (the loop #82 trap, hit again — do not chase).
 
-## SF1 execution A/B (private clone, fresh server per arm)
-| query | firewall ON | OFF | checksum |
-|---|---|---|---|
-| Q77 | 5492 ms, 44 rows | **6373 ms**, 44 rows | `e2f12e6ef310f604` both |
-| Q78 | 29608 ms, 100 rows | 29140 ms, 100 rows | `5e12c7e6baa093e8` both |
-Values byte-identical; Q78 holds its ~29 s class; no timeout; no C-04a class.
+## Tests — three levels, each non-vacuity checked
+predicate (alias + typmod pins) / gate (matched-types control is load-bearing)
+/ **WIRING** — the last was added because neutralising the capture site left
+the other two green: both ends pinned, connection not.
 
-## WHY NOT EXECUTED — criterion 1 fails on Q77
-"no NL-epsilon election": with the firewall off, at BOTH scales, a `rows=1`
-`Append` branch goes `Hash Left Join (cost=0.00..0.03)` →
-`Nested Loop Left Join (cost=0.00..0.06)`, degenerate `s_store_sk = s_store_sk`
-demoted to a `Join Filter`; top cost rises (SF0.25 `Limit` 10.65→11.58);
-+881 ms / +16% at SF1. Benign, but literally what the criterion names.
-Executing DELETES production code (R3 non-reversible) under a GO conditioned
-on passing, and 0018's option choice is ALREADY awaiting a re-take (loop #79).
+## Gates — ALL PASS
+units; tpch-spotcheck Q12=2/Q13=33; tpcds-sf025 `PASS=96 MISMATCH=0
+CKMISMATCH=0 ERROR=0 TIMEOUT=0`, plan channel `same=99 changed=0`; acceptance
+arm 24 MATCH; both default-arm floor captures held EXACTLY (TPC-DS `match=2`
+Q9+Q41, TPC-H `match=1` Q6 — M0144-0001's re-pin, not AGENT.md's `>=3`);
+pgbench smoke; state guard.
 
-## OWNER DECISION NEEDED (this is the loop's deliverable)
-Waive criterion 1 for the Q77 shape and execute the relaxation — or keep the
-firewall and close 0018 as its own option 1 (permanent cost-model backstop).
-Evidence: `tmp/m0145-0018-e1/` (both SF0.25 captures + four SF1 plans).
-
-## Gates
-Measurement only, zero production diff → no value gates (C1). state guard OK;
-pgbench smoke via the commit hook. SF1 clone removed, port 5563 free.
+## Ledgered residual
+The comparison is by DISPLAY NAME, not type OID — domains over one base type
+would read as the same. Errs toward ALLOWING (never refuses what PG allows).
+Resume: `sameSetOpTypeName` once a Schema column can answer its own pg_type
+OID; catalog has no exported Type→OID primitive today.
 
 ## Next loop
-0018 is owner-blocked. Per the banner the flow chain **0004 → 0005 → 0007 →
-0008** resumes "after that, still under the firewall constraint until 0018
-executes it" — so **M0145-0004** (UNION ALL → appendrel jointree entry) is the
-next selectable item. Harness 0021/0022/0023 may run any time.
+M0145-0004's remaining residuals, in its "Still open" list: member-level
+rtable + qual distribution (deferred to **M0145-0005**), LATERAL union
+propagation, CTE-wrapped union leaves (Q2/Q14/Q71/Q76), serial-side member
+path competition. Or move to **M0145-0005** per the banner chain.
 
 ## Owner escalations — four open
 partition_aggregate inventory row; template1 collision (A vs B); M0145-0018
-(option re-take AND now the criterion-1 waive); M0145-0012 re-sequencing
-behind M0145-0020a.
+(option re-take AND the criterion-1 waive, loop #82 evidence); M0145-0012
+re-sequencing behind M0145-0020a.
