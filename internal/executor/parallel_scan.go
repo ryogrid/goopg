@@ -27,9 +27,38 @@ import (
 // planner-side twin `nestedLoopJoinIsPartialCapable` (optimizer/parallel.go)
 // and the path classifier (`partialPathDrivingKind`'s PathNestLoop arm) —
 // a shape admitted here but refused there (or vice versa) either runs
-// unmodelled or never runs. Ordinary INNER only, non-nil children, never
+// unmodelled or never runs. Ordinary INNER and SEMI, non-nil children, never
 // lateral, never parameterized (an NLI is a different plan node,
 // *NestedLoopIndexJoin, and never reaches a joinOp).
+//
+// SEMI was added 2026-09-21 to repair a LIVE WRONG-ANSWER divergence, not to
+// widen anything. M0137-0019b admitted SEMI on the planner side — both
+// `nestedLoopJoinIsPartialCapable` (the node twin) and
+// `partialPathDrivingKind`'s PathNestLoop arm — and this executor twin was
+// left at INNER. The consequence is not a safe decline: this walk returning
+// false leaves the driving scan UNATTACHED, and `attachAll`'s result is
+// ignored by `gatherOp` (ledger `e10-attachall-precondition-unenforced`), so
+// every worker scanned the WHOLE outer and the node emitted N copies.
+//
+// Measured at HEAD on the SF1 clone, `SELECT count(*) FROM customer c WHERE
+// EXISTS (SELECT 1 FROM region r WHERE r.r_name > c.c_mktsegment)` — a plain
+// `Nested Loop Semi Join` with a non-parameterized inner under a Gather:
+// parallel returned 450000 against a serial and ground-truth 150000, exactly
+// 3x with 3 workers. A semijoin can emit at most one row per outer row.
+//
+// Admitting SEMI is the correct direction because the planner's rationale
+// already holds for the executor: each worker joins ITS partition of the
+// outer against the whole inner it materialises itself, one qualifying inner
+// tuple decides the outer tuple and the scan breaks (`finishOuter`,
+// join_nl_stream.go), the joined row is never emitted (the join's schema is
+// outer-only), and `markInner`/`fillInner` — the cross-worker reduction RIGHT
+// and FULL would need — is never touched. The union over workers is therefore
+// each outer row at most once, which is the semijoin's own contract.
+//
+// LEFT and ANTI stay refused here, matching both planner gates: their refusal
+// is deliberate scope-minimisation (ledger
+// `m0137-0019b-partial-nl-left-anti-still-refused`), and widening this side
+// alone would recreate exactly the divergence this comment documents.
 func ordinaryInnerNestedLoopPartial(p *optimizer.Join) bool {
 	if p == nil || p.Algo != optimizer.JoinAlgoNestedLoop || p.Lateral {
 		return false
@@ -37,7 +66,7 @@ func ordinaryInnerNestedLoopPartial(p *optimizer.Join) bool {
 	if p.Left == nil || p.Right == nil {
 		return false
 	}
-	return p.Type == optimizer.JoinTypeInner
+	return p.Type == optimizer.JoinTypeInner || p.Type == optimizer.JoinTypeSemi
 }
 
 // lateralProbeJoinPartial is the executor-side half of R95's admission rule:

@@ -13632,6 +13632,33 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
     cover that arm.
   Kind: impl
   Parent: none
+  - **Scope (d) done FIRST (loop 2026-09-21 \#31) and it found a LIVE
+    WRONG-ANSWER DEFECT at HEAD — fixed.**
+    - M0137-0019b admitted SEMI on BOTH planner gates and left the
+      executor twin `ordinaryInnerNestedLoopPartial` at INNER. Its own
+      comment states the invariant that was broken.
+    - Not a safe decline: the unattached driving scan means every worker
+      scans the WHOLE outer, because `attachAll`'s result is ignored by
+      `gatherOp` (`e10-attachall-precondition-unenforced`).
+    - Measured: `count(*)` over a plain `Nested Loop Semi Join`
+      returned **450000 parallel vs 150000 serial / 150000 ground
+      truth** — exactly 3x with 3 workers.
+    - **Invisible to every existing gate**: the acceptance arm runs
+      SERIAL; no corpus query makes the shape (it needs a non-equality
+      correlation over an UNINDEXED inner, else a hash semi join or a
+      `*NestedLoopIndexJoin` is elected — TPC-H Q4, M0137-0019b's own
+      named consumer, is the indexed shape and proves nothing here);
+      and the PLAN was correct, so the plan channel had nothing to flag.
+    - Fixed by widening the executor to `{INNER, SEMI}` (narrowing the
+      planner would revert a deliberate widening). Pinned end-to-end by
+      `TestParallelSemiNestedLoopIdentity`, verified red before the fix.
+    - Design: `docs/design/parallel-query/09-verification-and-measurement.md`.
+    - **Still open**: LEFT/ANTI diverge from PG on both sides (PG admits
+      `{INNER, LEFT, SEMI, ANTI}`, `joinpath.c:1842-1846`); and the
+      `gatherpaths.go:722` spine mirror tests `!= JoinInner` although its
+      comment claims it mirrors an arm that now admits SEMI — a refusal,
+      so safe, but a documented-invariant mismatch. Both ledgered.
+    - Scopes (a)-(c) remain untouched.
   - **On completion — reconsider the blocked work (evaluate, do not
     auto-do):** the `lateral` decline family (Q30/Q68 witnesses) on the
     then-default arm; the partial-NLI whitelist's LEFT/ANTI entries

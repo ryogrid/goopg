@@ -248,3 +248,78 @@ so the reason is known rather than guessed.
   PostgreSQL; it is the strongest available oracle for the identity gate.
 - **pgbench smoke** (the pre-commit hook): must be unaffected. Nothing in this
   bundle touches the write path, so a change there is a signal, not noise.
+
+## The SEMI partial-nested-loop divergence (found and fixed 2026-09-21)
+
+A live wrong-answer defect at HEAD, found while doing M0145-0010's scope (d)
+("executor-capability check FIRST for every newly admitted shape"). It is
+recorded here rather than in the milestone because it is a verification lesson
+first and a planner story second.
+
+### The defect
+
+M0137-0019b admitted SEMI to the partial nested-loop set on the PLANNER side —
+both `nestedLoopJoinIsPartialCapable` (the node gate) and
+`partialPathDrivingKind`'s `PathNestLoop` arm — with a documented rationale
+(the verdict is per-outer-row and worker-local; `markInner`/`fillInner` is
+never touched; PG admits `{INNER, LEFT, SEMI, ANTI}` at the same dispatch
+gate). The EXECUTOR twin `ordinaryInnerNestedLoopPartial` was left at INNER.
+
+Its own comment states the invariant that was broken: the three gates "must
+agree… a shape admitted here but refused there (or vice versa) either runs
+unmodelled or never runs".
+
+The consequence is not a safe decline. The attach walk returning false leaves
+the driving scan UNATTACHED, and `attachAll`'s result is **ignored** by
+`gatherOp` (ledger `e10-attachall-precondition-unenforced`), so every worker
+scans the WHOLE outer.
+
+### The measurement
+
+On the SF1 clone, a plain `Nested Loop Semi Join` with a non-parameterized
+inner under a Gather:
+
+```sql
+SELECT count(*) FROM customer c
+ WHERE EXISTS (SELECT 1 FROM region r WHERE r.r_name > c.c_mktsegment);
+
+parallel : 450000
+serial   : 150000
+customers: 150000        -- a semijoin emits at most one row per outer row
+```
+
+Exactly 3x with 3 workers. After the fix all three agree at 150000.
+
+Note what the shape needs, because it is why no gate caught it: a NON-equality
+correlation (else a hash semi join is elected) over an UNINDEXED inner column
+(else the plan is a `*NestedLoopIndexJoin`, a different node that never reaches
+this walk). TPC-H Q4's semijoin is the indexed shape, so Q4 — M0137-0019b's own
+named consumer — executes correctly and proves nothing about this path.
+
+### Why no existing gate saw it
+
+- the TPC-H acceptance arm runs SERIAL;
+- the TPC-DS SF0.25 sweep runs the corpus, and no corpus query produces the
+  unindexed non-equality semijoin shape;
+- the plan channel would not have flagged it anyway: the PLAN is correct, only
+  its execution duplicates rows.
+
+This is the same failure mode `parallel_identity_test.go`'s header records from
+the feature's first days ("the Gather returned N copies of every row"), one
+gate later — which is the argument for the pin being an IDENTITY test rather
+than a predicate test: it catches the divergence whichever of the four gates
+drifts.
+
+### Pins
+
+- `TestParallelSemiNestedLoopIdentity` (end-to-end, workers 1/2/4, asserts the
+  plain SEMI nested loop is actually present so the comparison cannot go
+  vacuous, and FAILS rather than skips if the planner stops electing it);
+- `TestParallelNLWalkerAdmitsSemi` (structural, all three walks);
+- `semi` removed from `TestParallelNLWalkerRefusals`' matrix, deliberately.
+
+### Still refused, on BOTH sides
+
+LEFT and ANTI. Their refusal is scope-minimisation rather than correctness
+(ledger `m0137-0019b-partial-nl-left-anti-still-refused`), and the lesson of
+this defect is that they must move on both sides together or not at all.

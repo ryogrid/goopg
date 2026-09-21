@@ -218,6 +218,14 @@ func TestParallelNLInnerTakesNoClaim(t *testing.T) {
 // TestParallelNLWalkerRefusals pins the refusal matrix on all three walks:
 // jointype, lateral, nil plan, inner bitmap, and the literal-left rule (a
 // claimable right side alone attaches nothing).
+//
+// SEMI left this matrix on 2026-09-21 and is now an ADMISSION
+// (TestParallelNLWalkerAdmitsSemi below). It was never a correctness refusal:
+// the planner admitted SEMI at M0137-0019b and this executor side was left
+// behind, which produced N copies rather than a safe decline. LEFT and ANTI
+// stay here, matching both planner gates — their refusal is scope, not
+// correctness (ledger `m0137-0019b-partial-nl-left-anti-still-refused`), and
+// they must move on BOTH sides together or not at all.
 func TestParallelNLWalkerRefusals(t *testing.T) {
 	mkPlan := func(typ optimizer.JoinType, lateral bool, right optimizer.Node) *optimizer.Join {
 		return &optimizer.Join{
@@ -229,7 +237,6 @@ func TestParallelNLWalkerRefusals(t *testing.T) {
 		"right":   mkPlan(optimizer.JoinTypeRight, false, &optimizer.SeqScan{}),
 		"full":    mkPlan(optimizer.JoinTypeFull, false, &optimizer.SeqScan{}),
 		"left":    mkPlan(optimizer.JoinTypeLeft, false, &optimizer.SeqScan{}),
-		"semi":    mkPlan(optimizer.JoinTypeSemi, false, &optimizer.SeqScan{}),
 		"anti":    mkPlan(optimizer.JoinTypeAnti, false, &optimizer.SeqScan{}),
 		"lateral": mkPlan(optimizer.JoinTypeInner, true, &optimizer.SeqScan{}),
 		// Bitmap anywhere in the inner: prebuildBitmap shares nothing, so
@@ -255,5 +262,39 @@ func TestParallelNLWalkerRefusals(t *testing.T) {
 	}
 	if attachParallelScan(&joinOp{plan: mkPlan(optimizer.JoinTypeInner, false, &optimizer.SeqScan{}), left: &seqScanOp{}, right: &seqScanOp{}}, nil) {
 		t.Error("nil state: sequential walk must refuse")
+	}
+}
+
+// TestParallelNLWalkerAdmitsSemi is the structural half of the 2026-09-21
+// wrong-answer fix. A plain SEMI nested loop must ATTACH its driving scan, on
+// every walk, exactly as INNER does.
+//
+// Before the fix this returned false and the driving scan went unattached —
+// and because `attachAll`'s result is ignored by `gatherOp` (ledger
+// `e10-attachall-precondition-unenforced`) that is not a decline but N copies
+// of the outer. The end-to-end proof is
+// TestParallelSemiNestedLoopIdentity; this pins the predicate itself so a
+// future narrowing fails here first, with a clearer message than a row count.
+func TestParallelNLWalkerAdmitsSemi(t *testing.T) {
+	mk := func() *optimizer.Join {
+		return &optimizer.Join{
+			Algo: optimizer.JoinAlgoNestedLoop, Type: optimizer.JoinTypeSemi,
+			Left: &optimizer.SeqScan{}, Right: &optimizer.SeqScan{},
+		}
+	}
+	left := &seqScanOp{}
+	op := &joinOp{plan: mk(), left: left, right: &seqScanOp{}}
+	if !attachParallelScan(op, newParallelScanState(0)) {
+		t.Fatal("sequential walk must admit a plain SEMI nested loop — the planner files it as partial-capable")
+	}
+	if left.pscan == nil {
+		t.Error("the SEMI join's OUTER scan must take the claim; unattached means every worker scans the whole outer")
+	}
+	// The other two walks share the same predicate and must agree.
+	if !attachParallelBitmapScan(&joinOp{plan: mk(), left: &bitmapHeapScanOp{}, right: &seqScanOp{}}, newParallelBitmapState()) {
+		t.Error("bitmap walk must admit a plain SEMI nested loop")
+	}
+	if !attachParallelIndexScan(&joinOp{plan: mk(), left: &indexScanOp{}, right: &seqScanOp{}}, newParallelIndexScanState()) {
+		t.Error("index walk must admit a plain SEMI nested loop")
 	}
 }
