@@ -98,3 +98,78 @@ must be an identity test per witness shape, not a predicate test.**
 
 No production change. The premise check above is the deliverable; the
 measurement in step 1 is the next loop's.
+
+## The measurement (2026-09-21): all 7 witnesses are SeqScan-rooted — and 3 of them still will not match
+
+Step 1 of the slicing plan, done. Two findings, and the second is the one that
+would have cost an implementation loop.
+
+### Finding 1 — the existing builder can reach every witness
+
+goopg's own hash-join build side, read off the fresh parallel-mode TPC-H
+capture, for all seven family-A queries:
+
+| query | goopg build side |
+|---|---|
+| Q3 | `Seq Scan on orders` |
+| Q9 | `Seq Scan on partsupp`, `Seq Scan on lineitem` |
+| Q10 | `Seq Scan on nation`, `Seq Scan on orders` |
+| Q14 | `Seq Scan on part` |
+| Q16 | `Seq Scan on part` |
+| Q18 | `Seq Scan on orders` |
+| Q21 | `Seq Scan on nation`, `Seq Scan on orders`, `Seq Scan on lineitem l1` |
+
+Every one is a bare `Seq Scan`, so `coopDrivingScan` reaches all of them.
+**There is no bucket (ii) on this corpus**: the real worker-inserted build +
+barrier port is not required for family-A parity, and the existing cooperative
+builder could drive every witness.
+
+That keeps the caveat from the recon above, now applying to the whole family:
+doing it this way produces PG's plan SHAPE with a different EXECUTION model
+(leader-inserted, not worker-inserted). It must be labelled as that.
+
+### Finding 2 — for Q9, Q21 and half of Q10, the node is not the only difference
+
+PG's `Parallel Hash` build sides on the same queries:
+
+| query | PG build side |
+|---|---|
+| Q3 | `Parallel Seq Scan on customer` |
+| Q14 | `Parallel Seq Scan on part` |
+| Q16 | `Parallel Seq Scan on part` |
+| Q18 | `Parallel Seq Scan on customer` |
+| Q10 | `Parallel Seq Scan on orders` AND `Parallel Hash Join` |
+| **Q9** | **`Nested Loop`** |
+| **Q21** | **`Hash Join`** |
+
+For Q9, Q21 and one of Q10's two hash joins, PG builds its hash table over a
+JOIN, while goopg builds over a scan. Those queries therefore differ from PG in
+**join order / build-side choice as well as in the parallel-hash node**, and
+adding `parallel_hash = true` alone will not make them match. Q3/Q14/Q16/Q18
+build over the same relation as PG and are the genuinely reachable subset —
+though note even there goopg and PG pick different tables in Q3 and Q18
+(`orders` vs `customer`), so "same shape" needs checking per query before any
+parity claim is made.
+
+### Revised recommendation
+
+1. **Scope any first implementation to Q14 and Q16**, the two witnesses where
+   goopg and PG build over the SAME relation (`part`) and the build side is a
+   bare scan on both sides. They are the honest clean witnesses; Q14 was
+   already named as such by the task.
+2. Q3 and Q18 need their build-side relation checked against PG's before being
+   claimed as parity wins — goopg builds over `orders`, PG over `customer`.
+3. Q9, Q21 and half of Q10 are NOT parallel-hash problems alone and should not
+   be counted as family-A wins by this task; their join-order divergence is
+   prior and belongs to whichever task owns join-order parity.
+4. The worker-inserted build + barrier port stays unbuilt and unneeded for this
+   corpus. It should be filed as its own task only when a witness appears that
+   `coopDrivingScan` cannot reach.
+
+### Method note
+
+Both tables are read from the SAME fresh capture pair
+(`tmp/q17-attrib/jt-off.plans.txt` goopg, `tmp/q17-attrib/jt-on-pg.plans.txt`
+PG 18.3), taken in parallel mode against the same SF1 data. The checked-in
+`bench/tpch/plans-pg/` fixtures were NOT used — they are stale and serial
+(ledger `parity-reference-fixtures-are-invalid`).

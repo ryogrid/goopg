@@ -4076,6 +4076,29 @@ setting that yields a serial plan.
       class as the 2026-09-21 parallel SEMI wrong answer, where values
       stayed plausible and only a parallel-vs-serial identity comparison
       saw it. The pin must be an IDENTITY test per witness shape.
+  - **Step 1 MEASURED (loop 2026-09-21 \#37), no production change.**
+    - **Finding 1 — no bucket (ii) exists on this corpus.** goopg's hash
+      build side is a bare `Seq Scan` on ALL SEVEN witnesses, so
+      `coopDrivingScan` reaches every one. The worker-inserted shared
+      build + barrier port is **not required** for family-A parity.
+    - **Finding 2 — three witnesses are not parallel-hash problems
+      alone.** PG builds its `Parallel Hash` over a **Nested Loop**
+      (Q9), a **Hash Join** (Q21) and a **Parallel Hash Join** (half of
+      Q10) where goopg builds over a scan. Those differ from PG in join
+      order / build-side choice too, so `parallel_hash = true` alone
+      will not make them match — they must NOT be counted as family-A
+      wins by this task.
+    - **Revised scope for a first implementation: Q14 and Q16 ONLY** —
+      the two witnesses where goopg and PG build over the SAME relation
+      (`part`) with a bare scan on both sides.
+    - Q3 and Q18 need their build-side relation checked against PG's
+      first (goopg builds over `orders`, PG over `customer`).
+    - Known, quantified deferral: driving the existing builder gives
+      PG's plan SHAPE with a **leader-inserted** build, not PG's
+      worker-inserted one. Label it as such; do not call it the port.
+    - Method: both sides read from ONE fresh parallel-mode SF1 capture
+      pair; the checked-in `bench/tpch/plans-pg/` fixtures were NOT used
+      (stale + serial, ledger `parity-reference-fixtures-are-invalid`).
   - **On completion — reconsider the blocked work (evaluate, do not
     auto-do):** re-run the family-A witnesses (Q3 Q9 Q10 Q14 Q16 Q18
     Q21) under the canonical parallel capture; M0137-0019a's family-A
@@ -13797,3 +13820,69 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
     (ledgered "by scope" refusals — admit only where legality says so
     and the executor check passes); re-run the pull-up/seam decline
     census afterwards so the buckets reflect the new state.
+- [ ] **M0145-0011 — measured re-evaluation of the derived-input
+  blockers (proposal 案A)** (filed 2026-09-21 by owner directive;
+  rationale `tmp/blocker-re-think-260912/01-proposal.md` — local,
+  gitignored). M0145-0009's census proved the 648 unresolvable
+  column asks are all columns PG itself would not resolve — but the
+  residuals' named unblock conditions are ROW-estimate conditions, and
+  row-level CTE estimates already sit at PG-equivalent granularity
+  (`EstimateRows(*CTEScan)` recurses the body ≈
+  `set_cte_size_estimates`'s `plan_rows` propagation; the M0129-S1
+  fallback is strictly more conservative than PG, which keeps the
+  collapsed estimate via `clamp_row_est`). Whether DP still misprices
+  catastrophically under today's estimates is a MEASUREMENT question,
+  not an argument. This task gathers the evidence:
+  - (a) add a diagnostic env flag (e.g. `GOOPG_DERIVED_FIREWALL=off`)
+    that bypasses `problemPairsOuterWithDerived` — EXPLAIN/probe use
+    only, default arm unchanged, same precedent as the census flags.
+  - (b) E1: on the KNOB arm with the flag, capture plans + timings +
+    values for Q78 and the `outer-over-derived` corpus fires (~12).
+    Pass criteria: no NL-epsilon shape, Q78 holds ~19 s, values
+    identical.
+  - (c) E2 (downstream of (a)): relax `flattenPulledBodyTree`'s
+    bare-`*SeqScan` rule for `*CTEScan` leaves on the knob arm —
+    REQUIRED pairing with (a)'s flag because pulled ANY/EXISTS bodies
+    become JoinSemi/JoinAnti SJIs and the firewall's jointype switch
+    (`relfromjoinlist.go:604`) covers Semi/Anti, so without the flag
+    the problems still decline. Re-run the pull-up/seam decline census
+    afterwards.
+  - (d) adjudicate and REPORT to the owner: clean evidence → the
+    unblock conditions can be redefined as "PG-equivalent row
+    estimates + measured safety" and relaxation can be filed as its
+    own task; dirty → the residual is the cost model or the search
+    shape, not statistics — then options are the structural narrowing
+    (veto NL paths with a derived inner, `inner.Relids ∩ derived`,
+    or preserved-side-only decline) or documented permanence. The
+    loop does not pick.
+  Hard constraints: the Q78 `outer-over-derived` firewall and the
+  `rows<=1` guard stay UNTOUCHED on the default arm; knob-arm captures
+  are EXPLAIN-only private evidence (G8); no relaxation is landed by
+  this task.
+  Kind: recon
+  Parent: none
+- [ ] **M0145-0012 — retire the `rows<=1` CTE fallback guard
+  (`initialRelRows`, `joinsearch.go:520-526`)** (filed 2026-09-21 by
+  owner directive; same proposal). The M0129-S1 arm — when a
+  filter-wrapped `*CTEScan` leaf's estimate collapses to <=1, substitute
+  the body's UNFILTERED row count — has NO PostgreSQL counterpart:
+  `set_cte_size_estimates` keeps the collapsed estimate
+  (`clamp_row_est` floors at 1, `costsize.c:5356-5363`); only the
+  `rows<1→1` floor itself is faithful. So the fallback is a goopg-only
+  divergence and must eventually go. Per the ledger criterion
+  (`derived >= guard effect`), either
+  - demonstrate by measurement that removing the arm reproduces no
+    collapse-class plan change (the corpus fires where the arm
+    currently engages, incl. the `year_total` shapes) — i.e. derived
+    estimates without the arm are already >= the guard's effect; OR
+  - wire a mechanism that makes that true without the arm (e.g.
+    qual-aware estimation through eligible single-ref CTE bodies —
+    the `pushQualsThroughSingleRefCTEs` inline path already gives
+    real selectivity for refs==1) and then demonstrate it;
+  then remove the arm and update the M0129-S1 comment. Gates: the same
+  measurement discipline as M0145-0011 — knob-arm private evidence
+  first, full gate set before any default-arm removal; a removal that
+  reproduces the C-04a class is an automatic no-go. Sequenced AFTER
+  M0145-0011 so its evidence base is reused.
+  Kind: impl
+  Parent: none
