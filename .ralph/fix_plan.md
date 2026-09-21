@@ -13682,10 +13682,33 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
     - **No corpus movement** (plans 99/99 identical, acceptance arm
       24/24): a capability and faithfulness change, not a performance
       one. Do not describe it as a win.
-    - Still out, ledgered: the FUSED NLI family
-      (`NestedLoopIndexJoinIsPartialCapable`) stays `{INNER, SEMI}`, so
-      goopg still diverges from PG there; RIGHT/FULL need a
-      cross-worker inner-match reduction that does not exist.
+    - Still out: RIGHT/FULL need a cross-worker inner-match reduction
+      that does not exist.
+  - **Scope (c) fused half landed (loop 2026-09-21 \#33).** The FUSED
+    NLI family now admits `{INNER, LEFT, SEMI, ANTI}` too, so BOTH
+    families match PG's dispatch set minus RIGHT/FULL.
+    - **Capability measured BEFORE admission** per scope (d): the fused
+      ANTI returned 700 vs a serial 350 and LEFT 800 vs 400 under a
+      forced Gather BEFORE the widening; all three agree after.
+    - **Design lesson recorded**: this family has NO executor twin to
+      drift — its attach arm calls the planner predicate directly — so
+      the same-day SEMI wrong answer could not have happened here. A
+      shared predicate is structurally stronger than two predicates
+      plus a comment saying they must agree; the ordinary family should
+      eventually follow.
+    - Both families now share one jointype set per type domain
+      (`partialNestLoopJoinType` / `partialNestLoopJointype`).
+    - Five more refusal pins updated deliberately, including two
+      descent tests that had used LEFT/ANTI merely AS a refused
+      jointype and now use CROSS.
+    - **No corpus movement** (plans 99/99 identical, acceptance arm
+      24/24). Capability and faithfulness, not performance.
+    - **HONEST SCOPE NOTE**: widening whitelists is NOT this task's
+      objective. Scopes (a) and (b) — rel-level
+      `required_outer`/`param_info` and a `reparameterize_path`
+      analogue — remain untouched, and until they land goopg reaches
+      PG's ANSWER by an enumerated set while PG derives it from
+      parameterization. That is the substance, and it is next.
   - **On completion — reconsider the blocked work (evaluate, do not
     auto-do):** the `lateral` decline family (Q30/Q68 witnesses) on the
     then-default arm; the partial-NLI whitelist's LEFT/ANTI entries

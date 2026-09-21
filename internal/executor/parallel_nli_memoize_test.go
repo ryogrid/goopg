@@ -110,13 +110,12 @@ func TestParallelNLIWalkerRefusals(t *testing.T) {
 		LowKey: &optimizer.NumericConst{Value: "1"}}
 
 	refusals := map[string]*optimizer.NestedLoopIndexJoin{
-		"left":  nliPlan(optimizer.JoinTypeLeft, nliProbePlan(), false),
 		"right": nliPlan(optimizer.JoinTypeRight, nliProbePlan(), false),
 		"full":  nliPlan(optimizer.JoinTypeFull, nliProbePlan(), false),
 		// SEMI is ADMITTED since M0137-0019b (asserted below); ANTI and
-		// LEFT are worker-local too but were held out by that task's
-		// scope so its parity movement stayed attributable.
-		"anti":    nliPlan(optimizer.JoinTypeAnti, nliProbePlan(), false),
+		// LEFT joined it for M0145-0010 after their capability was verified
+		// by TestParallelNLIJointypeIdentity. What remains refused is the
+		// set with no worker-local per-outer-row verdict.
 		"cross":   nliPlan(optimizer.JoinTypeCross, nliProbePlan(), false),
 		"bitmap":  nliPlan(optimizer.JoinTypeInner, bitmapInner, false),
 		"saop":    nliPlan(optimizer.JoinTypeInner, saopInner, false),
@@ -189,7 +188,7 @@ func TestCollectShareableJoinsDescendsNLI(t *testing.T) {
 	}
 
 	refused := &nestedLoopIndexJoinOp{
-		plan:  nliPlan(optimizer.JoinTypeLeft, nliProbePlan(), false),
+		plan:  nliPlan(optimizer.JoinTypeCross, nliProbePlan(), false),
 		outer: hash,
 	}
 	got = got[:0]
@@ -217,7 +216,7 @@ func TestCollectBitmapScansDescendsNLI(t *testing.T) {
 	// ANTI, not SEMI: M0137-0019b admitted SEMI, so the refusal case has to
 	// be a jointype that is still out of the set.
 	refused := &nestedLoopIndexJoinOp{
-		plan:  nliPlan(optimizer.JoinTypeAnti, nliProbePlan(), false),
+		plan:  nliPlan(optimizer.JoinTypeCross, nliProbePlan(), false),
 		outer: bm,
 	}
 	got = got[:0]

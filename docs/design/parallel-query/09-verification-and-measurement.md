@@ -383,3 +383,57 @@ RIGHT and FULL, on correctness. And the FUSED NLI family
 (`NestedLoopIndexJoinIsPartialCapable`, a different node type with its own
 gate) remains `{INNER, SEMI}` — deliberately untouched here so this change
 stays attributable; ledgered.
+
+## The FUSED NLI family joins the set (2026-09-21)
+
+The parameterized-probe twin of the previous section:
+`*NestedLoopIndexJoin`, driven by `nestedLoopIndexJoinOp`, partial through its
+OUTER while the inner probe re-opens per outer row. It now admits the same
+`{INNER, LEFT, SEMI, ANTI}`.
+
+### This family is built better, and that is the point
+
+It has **no executor twin to drift**. The attach arm calls the planner's
+exported predicate directly (`optimizer.NestedLoopIndexJoinIsPartialCapable`,
+parallel_scan.go — "literal agreement, no twin to drift"), so widening the one
+predicate widens both sides at once. **The SEMI wrong answer of this same day
+could not have happened here.** That is worth recording as the design lesson
+the ordinary family should eventually follow: a shared predicate is structurally
+stronger than two predicates plus a comment saying they must agree.
+
+Both families now also share their jointype set per type domain:
+`partialNestLoopJoinType` (`optimizer.JoinType`, read by the ordinary node gate
+and the fused gate) and `partialNestLoopJointype` (`parser.JoinType`, read by
+the path arm and its spine mirror). Two helpers only because `Path` carries
+`parser.JoinType` while plan nodes carry `optimizer.JoinType`.
+
+### Capability measured before admission
+
+What a shared predicate cannot tell you is whether the OPERATOR can drive a
+newly admitted jointype per worker, so that was measured:
+`TestParallelNLIJointypeIdentity` forces a Gather over the fused SEMI, ANTI and
+LEFT shapes. Before the widening, SEMI passed (already admitted) while ANTI
+returned 700 against a serial 350 and LEFT 800 against 400 — the N-copy
+signature. After, all three agree at every worker count.
+
+The structural reason: `nestedLoopIndexJoinOp` decides LEFT and ANTI from its
+per-outer-row `outerMatched` flag (`operators_nljoin.go`), not from shared
+inner state, so each worker's verdict for its own outer rows is complete.
+
+### Movement
+
+None on the corpus: plans 99/99 identical, acceptance arm 24/24, spotcheck
+Q12=2 Q13=33. Capability and PG faithfulness, not performance.
+
+### Fixture note
+
+The LEFT case needs the same commutation-avoidance clause the ordinary family's
+does (`AND o.id > 0`); without it the planner elects a hash join and the
+fixture silently stops exercising this family. The test asserts the planned
+node is a fused NLI of the expected jointype so it cannot go vacuous.
+
+### Still out
+
+RIGHT, FULL and CROSS, on correctness: RIGHT/FULL need the cross-worker
+inner-match reduction, and CROSS has no per-outer-row verdict to be worker-local
+about.

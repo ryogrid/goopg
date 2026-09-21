@@ -1211,15 +1211,50 @@ func lateralProbeJoinIsPartialCapable(p *Join) bool {
 // inner-matched bitmap RIGHT/FULL would need reduced across workers is never
 // touched. TPC-H Q4's semi join is this FUSED shape (its inner is a
 // parameterised index probe), not the ordinary one, which is why widening
-// the ordinary twin alone left Q4 serial. LEFT and ANTI stay out by scope.
+// the ordinary twin alone left Q4 serial.
+//
+// M0145-0010 widens the set to PG's full nestloop dispatch set minus RIGHT and
+// FULL, via the shared `partialNestLoopJoinType`. LEFT and ANTI are driven by
+// `nestedLoopIndexJoinOp`'s per-outer-row `outerMatched` flag
+// (`operators_nljoin.go`) — no shared inner state, so each worker's verdict for
+// its own outer rows is complete. Verified by measurement BEFORE admission, per
+// scope (d): `TestParallelNLIJointypeIdentity` showed the N-copy signature for
+// both shapes before this widening and agreement with serial after.
+//
+// This family needs no executor twin — the attach arm calls THIS predicate
+// directly ("literal agreement, no twin to drift", parallel_scan.go), which is
+// why the 2026-09-21 SEMI wrong answer could not happen here.
 func NestedLoopIndexJoinIsPartialCapable(p *NestedLoopIndexJoin) bool {
 	if p == nil || p.Outer == nil || p.Inner == nil {
 		return false
 	}
-	if p.Type != JoinTypeInner && p.Type != JoinTypeSemi {
+	if !partialNestLoopJoinType(p.Type) {
 		return false
 	}
 	return lateralProbeIsPartialProbe(p.Inner)
+}
+
+// partialNestLoopJoinType is the ONE jointype set the partial nested-loop
+// families admit, in the `optimizer.JoinType` domain: the ordinary node gate
+// `nestedLoopJoinIsPartialCapable` and the FUSED gate
+// `NestedLoopIndexJoinIsPartialCapable` both read it, so the two cannot
+// disagree about which jointypes are worker-local.
+//
+// `partialNestLoopJointype` (gatherpaths.go) is the same set in the
+// `parser.JoinType` domain, read by the path arm and its spine mirror. The two
+// helpers exist only because Path carries `parser.JoinType` while the plan
+// nodes carry `optimizer.JoinType`; they must always name the same set.
+//
+// The set is PG's nestloop dispatch set
+// (`postgres/src/backend/optimizer/path/joinpath.c:1842-1846`) minus RIGHT and
+// FULL, which need to know which INNER rows went unmatched across ALL workers
+// — a cross-worker reduction no gate in either family models.
+func partialNestLoopJoinType(t JoinType) bool {
+	switch t {
+	case JoinTypeInner, JoinTypeLeft, JoinTypeSemi, JoinTypeAnti:
+		return true
+	}
+	return false
 }
 
 // nestedLoopJoinIsPartialCapable states which ordinary nested loops may run
@@ -1266,11 +1301,7 @@ func nestedLoopJoinIsPartialCapable(p *Join) bool {
 	if p.Left == nil || p.Right == nil {
 		return false
 	}
-	switch p.Type {
-	case JoinTypeInner, JoinTypeLeft, JoinTypeSemi, JoinTypeAnti:
-		return true
-	}
-	return false
+	return partialNestLoopJoinType(p.Type)
 }
 
 // scanTable extracts the *catalog.Table from a scan node (SeqScan,

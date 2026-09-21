@@ -78,8 +78,12 @@ func TestNestedLoopIndexJoinIsPartialCapable(t *testing.T) {
 		// SEMI is admitted since M0137-0019b (asserted above). ANTI and
 		// LEFT are worker-local too but were held out by scope so that
 		// task's parity movement stayed attributable.
-		"anti":         nliTestJoin(JoinTypeAnti, latProbeNode(nil), false),
-		"left":         nliTestJoin(JoinTypeLeft, latProbeNode(nil), false),
+		// ANTI and LEFT are ADMITTED since M0145-0010 (capability verified
+		// first by TestParallelNLIJointypeIdentity in internal/executor).
+		// CROSS stays: it has no per-outer-row verdict to be worker-local
+		// about.
+		"cross-jt":     nliTestJoin(JoinTypeCross, latProbeNode(nil), false),
+		"right-jt":     nliTestJoin(JoinTypeRight, latProbeNode(nil), false),
 		"right":        nliTestJoin(JoinTypeRight, latProbeNode(nil), false),
 		"full":         nliTestJoin(JoinTypeFull, latProbeNode(nil), false),
 		"seq-inner":    nliTestJoin(JoinTypeInner, &SeqScan{}, false),
@@ -144,9 +148,11 @@ func TestPartialNLIWalkAgreement(t *testing.T) {
 		t.Error("semi: drivingScan must reach the outer scan (M0137-0019b)")
 	}
 
-	// Refusals pin all walks at once.
+	// Refusals pin all walks at once. ANTI left this set for M0145-0010;
+	// CROSS and RIGHT remain — neither has a worker-local per-outer-row
+	// verdict this family can model.
 	for name, nli := range map[string]*NestedLoopIndexJoin{
-		"anti":         nliTestJoin(JoinTypeAnti, latProbeNode(nil), false),
+		"right":        nliTestJoin(JoinTypeRight, latProbeNode(nil), false),
 		"cross":        nliTestJoin(JoinTypeCross, latProbeNode(nil), false),
 		"seq-inner":    nliTestJoin(JoinTypeInner, &SeqScan{}, false),
 		"bitmap-inner": nliTestJoin(JoinTypeInner, &BitmapHeapScan{}, false),
