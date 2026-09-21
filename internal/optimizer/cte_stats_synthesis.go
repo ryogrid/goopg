@@ -238,3 +238,82 @@ func peelCTEBody(n Node) Node {
 		}
 	}
 }
+
+// --- consumers (M0145-0009 slice 1) ------------------------------------
+//
+// G1 in the B-06 design: `resolveBaseColumn` recurses through a `*CTEScan`
+// into the body and finds no `*Aggregate`/`*SetOp` arm, so an aggregate or
+// set-op CTE output resolves to nothing, yields nil stats, and every
+// consumer falls to `defaultNumDistinct`. The synthesis above already
+// derives the right number for exactly those shapes; this is the path that
+// lets a consumer see it.
+//
+// Scope of THIS slice: the ndistinct channel only
+// (`columnNDistinctForChild`). The group-combo registry (G2) and the
+// agg-output FD bound (G3) are separate consumers and stay unwired — they
+// are slice 2, and wiring them blind would move default-arm plans on a
+// mechanism this slice has not measured.
+
+// cteSynthNDistinct resolves `idx` through the index-preserving wrappers
+// down to a `*CTEScan` and returns that output column's synthesized
+// ndistinct.
+//
+// The wrapper set is deliberately the same one `resolvesToGroupUniqueColumn`
+// walks, and for the same reason: these are the nodes that do not change a
+// column's identity, so an index may cross them unchanged. `*Project` is the
+// one that remaps, and only a bare `*ColumnRef` target is followed — a
+// computed target is a new value whose distinctness the synthesis says
+// nothing about.
+//
+// Fail-closed at every step, per the task's standing rule: an unrecognised
+// wrapper, an out-of-range index, an unpopulated entry, or a column the
+// synthesis left `unknown` (ndistinct < 0) all return false, which leaves
+// the caller on today's defaults. This function can only ever REPLACE a
+// default with a derived number; it can never invent one where the
+// synthesis declined.
+func cteSynthNDistinct(idx int, child Node) (int64, bool) {
+	switch x := child.(type) {
+	case *Filter:
+		return cteSynthNDistinct(idx, x.Child)
+	case *Sort:
+		return cteSynthNDistinct(idx, x.Child)
+	case *Limit:
+		return cteSynthNDistinct(idx, x.Child)
+	case *LockRows:
+		return cteSynthNDistinct(idx, x.Child)
+	case *Gather:
+		return cteSynthNDistinct(idx, x.Child)
+	case *GatherMerge:
+		return cteSynthNDistinct(idx, x.Child)
+	case *Project:
+		if idx >= 0 && idx < len(x.Targets) {
+			if cr, ok := x.Targets[idx].(*ColumnRef); ok {
+				return cteSynthNDistinct(cr.Index, x.Child)
+			}
+		}
+	case *CTEScan:
+		st := x.cte.outputStats()
+		if st == nil || idx < 0 || idx >= len(st.cols) {
+			return 0, false
+		}
+		col := st.cols[idx]
+		if col.ndistinct < 0 {
+			return 0, false
+		}
+		// Clamp to the body's own row estimate: a CTE cannot emit more
+		// distinct values of a column than it emits rows. This is the
+		// "clamped by output rows" half of the task's step-2 wording, and
+		// it matters most for the group-key columns, whose combo-derived
+		// ndistinct is an upper bound taken from the inputs rather than
+		// from the grouped output.
+		nd := col.ndistinct
+		if st.rows > 0 && nd > st.rows {
+			nd = st.rows
+		}
+		if nd < 1 {
+			return 0, false
+		}
+		return saturateRowEst(nd), true
+	}
+	return 0, false
+}

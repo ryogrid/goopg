@@ -13417,6 +13417,38 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
   `cteColUnknown` and today's defaults, never a guess.
   Kind: impl
   Parent: none
+  - **Step 2 slice 1 landed (loop 2026-09-21 \#26): the ndistinct
+    consumer.** Design updated:
+    `docs/design/planner-b06-cte-stats/DESIGN.md` (now indexed in
+    `docs/design/README.md`, which it was not before).
+    - Identity/lifetime needed no registry: `CTEScan.cte` already points
+      at the `*plannedCTE` that `synthesizeCTEStats` consumes, so the
+      synthesis is memoized on the entry (`plannedCTE.outputStats()`).
+      The entry pointer is a strictly stronger identity than the
+      design's `DeclKey()` map key with exactly the lifetime it asks
+      for. Recorded as a deliberate, documented divergence.
+    - `cteSynthNDistinct` is wired as the LAST arm of
+      `columnNDistinctForChild`, so a catalog resolution always wins,
+      and is fail-closed at every step — it can only REPLACE a default,
+      never invent a number.
+    - **It is measurably INERT on the corpus, and the instrumentation
+      says why.** DEFAULT arm TPC-DS SF0.25: plans 99/99 IDENTICAL. The
+      consumer is reached **852 times** per run and declines every one:
+      **648** asks are body shapes the synthesis does not classify,
+      **204** are group keys it classifies but does not number, and the
+      two kinds it CAN number (agg outputs, union literals) are asked
+      for **ZERO** times.
+    - So gap G3's agg-output FD bound has no consumer in this channel at
+      all, and gap G2's group-combo rule is the only thing that can
+      number the 204 live asks. **None of the three residuals this task
+      exists to unblock can move until G2 lands.**
+    - Slice 2, in order: (1) census which body shapes produce the 648
+      `unknown` asks before widening the synthesis; (2) land the
+      group-combo rule (G2 / synthesis step 3); (3) EA ratchet on the
+      `year_total` shapes + SF0.25 + acceptance arm on the DEFAULT arm,
+      reporting plan movement explicitly.
+    - Step 4 respected: the `rows<=1` guard and the Q78 firewall were
+      NOT touched.
   - **On completion — reconsider the blocked work (evaluate, do not
     auto-do):**
     - `flattenPulledBodyTree`'s bare-`*SeqScan` rule (M0145-0003 ANY

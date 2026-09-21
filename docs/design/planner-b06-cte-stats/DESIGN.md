@@ -142,3 +142,71 @@ Review only (this file). Implementation gates (steps 2–4, for the
 record): unit (synthesis rules incl. miss→nil; identity collisions);
 EA ratchet on year_total shapes; TPC-DS sweep `CKMISMATCH=0`; guard
 removal with before/after on Q74.
+
+
+## Step 2 slice 1 — the ndistinct consumer, and what it measured (2026-09-21)
+
+Step 1's synthesis landed inert. This slice gives it a consumer, and the
+measurement it produced re-scopes the rest of step 2.
+
+### What landed
+
+- **Identity and lifetime, realised without a map.** The design specifies a
+  registry keyed by `DeclKey()` (`declPos:name`) on the planning context. In
+  the tree, `CTEScan.cte` already points at the `*plannedCTE`, and
+  `synthesizeCTEStats` takes exactly that. The entry POINTER is a strictly
+  stronger identity than the key, with precisely the lifetime the design asks
+  for — per-`Plan()` call, dangling never, because the body is planned inside
+  the same call. So the synthesis is memoized on the entry
+  (`plannedCTE.outputStats()`) and no registry is needed: the thing the key
+  would look up is already in hand. The design's constraints are kept —
+  one synthesis per CTE, so both references of a multi-reference CTE agree by
+  construction, and a miss yields today's defaults rather than a guess.
+  (Recorded as a deliberate, documented divergence, not a silent one.)
+- **The consumer**: `cteSynthNDistinct` walks the index-preserving wrappers
+  down to a `*CTEScan` and returns that output column's synthesized ndistinct,
+  clamped to the body's row estimate. It is wired as the LAST arm of
+  `columnNDistinctForChild`, after `resolveBaseColumn` and
+  `groupUniqueNDistinct`, so a real catalog resolution always wins. Every step
+  is fail-closed: unrecognised wrapper, out-of-range index, unpopulated entry,
+  computed `Project` target, or an `unknown` column all decline. The path can
+  only ever REPLACE a default with a derived number; it can never invent one.
+
+### What it measured — the slice is INERT on the corpus, and why
+
+TPC-DS SF0.25, default arm: **99/99 plans identical**, `MISMATCH=0`. That is
+not "safe and therefore fine" — it needed explaining, so the consumer was
+instrumented:
+
+| observation | count per corpus run |
+|---|---|
+| `outputStats()` computed | 23 |
+| consumer reached a `*CTEScan` and asked for a column | **852** |
+| … the column was **unknown** (body shape unclassified) | **648** |
+| … the column was a **group key** (classified, not numbered) | **204** |
+| … the column was an **agg output** | **0** |
+| … the column was a **union literal** | **0** |
+
+So the consumer is live and exercised 852 times, and declines every time for a
+correct reason. The decisive finding is the last two rows: **the two column
+kinds the landed synthesis can actually number are never requested.** The
+agg-output FD bound (gap G3) — which is what step 1 delivers — has no consumer
+at all in the ndistinct channel on this corpus.
+
+### Consequence for the rest of step 2
+
+The value is entirely in the columns consumers do ask about:
+
+1. **Group keys — 204 asks, classified but unnumbered.** These need the
+   group-combo rule: per-column ndistinct from the group combo clamped by
+   output rows (gap G2, and the synthesis's own step 3). This is the next
+   slice and it is where any plan movement on the `year_total` shapes will
+   come from.
+2. **Unknown — 648 asks.** The synthesis does not classify these body shapes
+   at all. Before widening it, census WHICH shapes they are; 648 is large
+   enough that guessing would be expensive.
+
+Neither was attempted here. Wiring the group-combo rule blind — without the
+consumer path proven and without knowing which kinds are actually requested —
+is how a statistics change moves default-arm plans on an unmeasured mechanism.
+That path is now proven, and the target is now named.

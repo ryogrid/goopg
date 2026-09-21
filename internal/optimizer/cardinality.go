@@ -1909,6 +1909,15 @@ func columnNDistinctForChild(idx int, child Node) int64 {
 	if nd, ok := groupUniqueNDistinct(idx, child); ok {
 		return nd
 	}
+	// M0145-0009 slice 1 (B-06 gap G1): a CTE-output column whose body is an
+	// Aggregate or a UNION of literals resolves to nothing above, so without
+	// this arm every such column falls to `defaultNumDistinct`. The synthesis
+	// declines any shape it does not recognise, so this can only replace a
+	// default with a derived number — never invent one. Ordered LAST so a real
+	// catalog resolution always wins.
+	if nd, ok := cteSynthNDistinct(idx, child); ok {
+		return nd
+	}
 	return 0
 }
 
