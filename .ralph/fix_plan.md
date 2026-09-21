@@ -12797,6 +12797,23 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
       change these plans.
     - The LIKE-range pair stays ledgered: index selection, not a PG
       shape rule, so no cutover risk.
+    - **LIKE-range measured (loop 2026-09-21 \#24), and its resume point
+      CORRECTED.** Corpus witnesses: zero. TPC-H has no `LIKE` predicate
+      at all; TPC-DS has exactly two (`hd_buy_potential LIKE 'Unknown%'`)
+      and that column is unindexed in the benchmark schema, so no index
+      path exists to elect on either arm.
+    - The earlier resume point ("teach the search's base-rel pathgen
+      about the synthetic range conjuncts") is HAZARDOUS taken
+      literally: adding `col >= 'foo' AND col < 'fop'` to the rel's
+      restriction clauses double-counts the LIKE's selectivity, and no
+      corpus query would show it.
+    - PG's actual mechanism (`like_support.c` header): the derived
+      clauses are approximate INDEX-SCAN quals with the original
+      operator re-applied as a qpqual — "using a regular index as if it
+      were a lossy index" — so the estimate still comes from the LIKE
+      alone. The chooser arm already separates the two lists
+      (`whereForIndex` vs `whereQual`); the port must reproduce that
+      separation at PATH level rather than merging them.
     - Slice 2 (landed, loop 2026-09-21 #8): pulled semi/anti bodies are
       REAL numbered leaf items — `pullUpSublinksIntoJointree` appends
       one `leafItem` per pulled leaf to `ctx.joinlist` (`pu.base` /

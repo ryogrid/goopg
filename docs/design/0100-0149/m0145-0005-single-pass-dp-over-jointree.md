@@ -429,6 +429,47 @@ The LIKE-range pair (`injectLikeRangePredicates` + `planIndexScanFromWhere`)
 is still skipped on the knob arm and stays ledgered — it is an index-selection
 optimisation, not a PG-shape rule, so it does not carry the same cutover risk.
 
+## The LIKE-range pair: measured, and the ledgered resume point corrected (2026-09-21)
+
+The third of slice 4's skipped optimisations is `injectLikeRangePredicates` +
+`planIndexScanFromWhere`. Two measurements decided not to port it, and the
+second one corrects what the ledger previously said to do.
+
+### Corpus witnesses: zero
+
+TPC-H's query set carries no `LIKE` predicate at all. TPC-DS carries exactly
+two, both `hd_buy_potential LIKE 'Unknown%'` — a prefix pattern that could use
+an index — but `household_demographics.hd_buy_potential` has no index in the
+benchmark schema, so there is no index path to elect on either arm. The gap is
+real for user queries and invisible to both gates.
+
+### The previously-ledgered resume point is HAZARDOUS as written
+
+It read: "teach the search's base-rel pathgen about the synthetic range
+conjuncts, so `tryRangeIndexScan` can elect the index through the search". Done
+literally — feeding the synthetic `col >= 'foo' AND col < 'fop'` into the rel's
+restriction clauses — that DOUBLE-COUNTS the LIKE's selectivity: the same
+restriction is estimated twice, once as the LIKE and once as the range, and the
+rel's row estimate collapses. That is the silent cost-model damage class this
+project has been bitten by before, and it would be invisible to every gate
+because no corpus query exercises it.
+
+PG does not do that. `like_support.c`'s header states the mechanism exactly:
+the derived clauses are *approximate INDEX-SCAN quals* — "any tuples that pass
+the operator clause itself must also satisfy the simpler indexscan condition"
+— and the original operator is re-applied as a qpqual, "in essence, we're using
+a regular index as if it were a lossy index". The derived bounds never become
+restriction clauses, so the estimate keeps coming from the LIKE alone.
+
+The chooser arm's existing `injectLikeRangePredicates` is closer to this than
+it looks: it injects into a SEPARATE copy (`whereForIndex`) handed only to
+`planIndexScanFromWhere`, while the Filter keeps the original `whereQual`. The
+port therefore has to reproduce that separation at path level — derived bounds
+as the index condition, original LIKE as the recheck and as the selectivity
+source — not merge the two lists.
+
+Corrected resume point recorded in `.ralph/deferral_ledger.md`.
+
 ## Remaining slices (ledgered)
 
 | slice | scope | retires |
