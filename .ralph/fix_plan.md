@@ -13892,12 +13892,42 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
     - **The appendrel machinery is not what decides it**: default arm vs
       knob arm in the same capture run, **Q71 and Q76 are byte-identical**
       in Append/Gather structure and Q2 differs only in cost.
-    - Next step, and do NOT skip it: instrument which of
-      `addBaseRelGatherPaths` / `upperSplitWorkers` / the member scope's own
-      search root commits the gather BEFORE the Append is built. Guessing
-      the mechanism is the failure mode the last several loops kept
-      catching. Expected movement once known: the `parallelism` category on
-      SF0.25, which reads 84-85 in both arms today.
+    - **NARROWED 2026-09-22 (loop \#85) — all three candidates above are
+      REFUTED and the shape is more specific.**
+      - The hoist FIRES and its paths WIN: SF0.25 knob-arm DP trace shows
+        `baserel.appendrel.partial` 4 paths, **every one `verdict=accepted`**,
+        alongside `upper.setop.append.partial` 11 and `.mixed` 3. Nothing is
+        failing to fire, so none of `addBaseRelGatherPaths` /
+        `upperSplitWorkers` / the member search root is the culprit.
+      - **The chain stays NESTED.** Q71's union has THREE members and goopg
+        produces `Append{ Gather{Append{ws, cs}}, Gather{store_sales} }` —
+        the INNER link of the right-leaning `SetOp(A, SetOp(B,C))` gets the
+        parallel Append and the hoist, the OUTER link does not, so its two
+        inputs are gathered separately and appended serially. PG has no such
+        split: `is_simple_union_all_recurse` walks `larg` AND `rarg` and
+        flattens the whole chain into ONE appendrel, over which
+        `add_paths_to_append_rel` builds a single partial Append.
+      - So **the divergence is chain-flattening DEPTH**; the gather placement
+        is its symptom.
+      - **A stale comment would have misdirected the fix**:
+        `addPartialSetOpPath`'s prose lists "a nested `*SetOp`" among the
+        disqualifying wrappers, but `setOpBranchPartialChainOK` ADMITS a
+        nested set operation through its carrier check — M0144-0003b-1 added
+        exactly that. The comment predates the code and is wrong.
+      - **The one measurement still missing**: why the OUTER link produces no
+        winning partial path. `addPartialSetOpPath` returns early unless
+        `setOpRel.LeftBranchRel` and `.RightBranchRel` are both non-nil and
+        both `ConsiderParallel`; for the outer link the right input is the
+        inner link's SETOP rel, so instrument whether that field is populated
+        for a nested-`*SetOp` input BEFORE changing anything.
+      - **Risk to carry into the fix**: admitting a nested streaming Append
+        under one Gather means two levels of block claim cooperating across
+        workers, and this task has already been bitten there once (an
+        unclaimed `PathSetOp` under a partial hash join made every worker
+        replay the whole union — 80/120/200 rows at workers=1/2/4 for a
+        40-row join). The same per-worker row-identity pin is required.
+      - Expected movement once fixed: the `parallelism` category on SF0.25,
+        which reads 84-85 in both arms today.
     - **LINEAGE NOTE — why this is not a separate task, and an ESCALATION.**
       Filing it as `M0145-0004a` was REFUSED by
       `scripts/ralph-lineage-guard.py`: root M0145-0001's last five

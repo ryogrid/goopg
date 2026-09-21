@@ -423,3 +423,71 @@ single-reference CTE case.
 
 No production file was touched: the correct next step depends on which
 mechanism holds the Gather down, and this measurement does not yet say.
+
+
+## Narrowing it further (2026-09-22, loop #85)
+
+The previous section named three candidates for what holds the Gather down —
+`addBaseRelGatherPaths`, `upperSplitWorkers`, the member scope's own search
+root. **All three are refuted**, and the actual shape is more specific.
+
+### The hoist fires, and its paths are accepted
+
+`GOOPG_PGSHAPED_DP_TRACE=1` over the SF0.25 corpus, knob arm:
+
+```
+baserel.appendrel.partial   4 paths, every one verdict=accepted
+upper.setop.append.partial  11
+upper.setop.append.mixed     3
+```
+
+So the mark works, partial SetOp paths exist, and the hoist re-targets them
+onto leaf rels successfully. Nothing here is failing to fire.
+
+### Q71's plan says what is actually wrong: the chain stays NESTED
+
+Q71's union has THREE members. goopg produces
+
+```
+Append                                              <- outer link, SERIAL
+  ├─ Gather { Append { ws member, cs member } }     <- inner link: parallel, hoisted
+  └─ Gather { Parallel Hash Join (store_sales) }    <- third member, gathered alone
+```
+
+against PG's single `Gather { Parallel Append { …3 members… } }`.
+
+The inner link of the right-leaning chain — `SetOp(A, SetOp(B, C))`'s inner
+`SetOp(B, C)` — gets the parallel Append and the hoist. The OUTER link does
+not, so its two inputs are each gathered and then appended serially. PG has no
+such split because `is_simple_union_all_recurse` walks `larg` **and** `rarg`
+and flattens the whole chain into ONE appendrel, where
+`add_paths_to_append_rel` builds one partial Append over all three members.
+
+**The divergence is chain flattening depth, not gather placement.** The gather
+placement is a symptom of the nesting.
+
+### A stale comment that would have misdirected the fix
+
+`addPartialSetOpPath`'s comment lists *"a nested `*SetOp`"* among the wrappers
+that disqualify a branch from offering its partial path. The code below it does
+not agree: `setOpBranchPartialChainOK` admits a nested set operation through
+its carrier check (`setOpBranchRelNode` with a non-nil rel), which M0144-0003b-1
+added precisely so a chain link could reach the previous link's SETOP rel. The
+prose predates that and is wrong; a fix guided by it would have gone to the
+wrong place.
+
+### The one measurement that is still missing
+
+Why the OUTER link produces no winning partial path. `addPartialSetOpPath`
+returns early unless `setOpRel.LeftBranchRel` and `.RightBranchRel` are both
+non-nil and both `ConsiderParallel`; for the outer link the right input is the
+inner link's SETOP rel, so the question is whether that field is populated for
+a nested-`*SetOp` input. Instrument those two fields at the outer link before
+changing anything — do not infer it from the shape.
+
+Risk to carry into that fix: admitting a nested streaming Append under one
+Gather means two levels of block claim cooperating across workers. This task
+has already been bitten there once — an unclaimed `PathSetOp` under a partial
+hash join made every worker replay the whole union (80/120/200 rows at
+workers=1/2/4 for a 40-row join). Any change here needs the same per-worker
+row-identity pin.
