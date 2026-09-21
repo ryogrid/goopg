@@ -13734,6 +13734,35 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
     - **ESCALATION for the owner**: the task was filed with an 8-fire
       lateral consumer that is now 2. Whether that still justifies a
       rel-level refactor is a scoping decision the loop does not take.
+  - **Scope (b) MEASURED (loop 2026-09-21 \#35) — the second premise is
+    wrong too. This task cannot be built as written.**
+    - Widened the `NLIGATE` census from SEMI/ANTI to every jointype (it
+      had been scoped to semijoins for M0145-0007, so it reported
+      NOTHING about the general population). TPC-DS SF0.25:
+      `no-parameterised-inner` **15 014**, `filed` 10 814,
+      `inner-rejected` 1 625, `jointype-right` 77.
+    - **The 15 014 are NOT scope (b)'s population.**
+      `reparameterize_path` does not CREATE parameterized paths — it
+      re-prices an EXISTING path under a LARGER `required_outer` and
+      refuses a non-superset outright (`pathnode.c:4249`). The paths
+      that populate the list come from `create_index_paths`' join half,
+      **which goopg already ports** (`pathparamindex.go`). Those 15 014
+      are rels with no usable index clause, where PG finds nothing
+      either.
+    - **The task text's call site is factually wrong.**
+      `reparameterize_path` is not "invoked FROM joinpath.c"; its
+      callers are `get_cheapest_parameterized_child_path`
+      (`allpaths.c:2096`) for appendrel CHILD paths — **partitionwise
+      joins** — and its own Append/Material/Memoize recursion.
+      **goopg has no partitionwise joins**, as `pathparam.go`'s own
+      comment records. Scope (b)'s primary consumer does not exist here.
+    - **OWNER DECISION REQUIRED — re-scope or close.** Three options in
+      the design doc: narrow to the lateral admission alone (2 fires);
+      defer behind partitionwise joins; or close, recording that scope
+      (c)'s structural intent was largely met by the shared jointype
+      predicates the two widening loops introduced.
+    - The loop does not choose. Building as filed would implement
+      machinery for consumers measurement says are absent.
   - **On completion — reconsider the blocked work (evaluate, do not
     auto-do):** the `lateral` decline family (Q30/Q68 witnesses) on the
     then-default arm; the partial-NLI whitelist's LEFT/ANTI entries

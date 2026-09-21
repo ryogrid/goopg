@@ -150,11 +150,19 @@ func noteNLIPathGate(jt parser.JoinType, reason string) {
 	if !nliCensusEnabled {
 		return
 	}
-	if jt != parser.JoinSemi && jt != parser.JoinAnti {
-		return
-	}
-	name := "semi"
-	if jt == parser.JoinAnti {
+	name := "other"
+	switch jt {
+	case parser.JoinInner:
+		name = "inner"
+	case parser.JoinLeft:
+		name = "left"
+	case parser.JoinRight:
+		name = "right"
+	case parser.JoinFull:
+		name = "full"
+	case parser.JoinSemi:
+		name = "semi"
+	case parser.JoinAnti:
 		name = "anti"
 	}
 	fmt.Fprintf(os.Stderr, "NLIGATE jointype=%s gate=%s\n", name, reason)

@@ -1,8 +1,9 @@
 # Parameterized-path legality: `required_outer` at rel level (M0145-0010)
 
-Status: recon + design, 2026-09-21. Scopes (a)/(b)/(c) unimplemented; scope (c)'s
-jointype half was landed separately (see "What already landed") and scope (d) is
-a standing rule, not a deliverable.
+Status: recon + design, 2026-09-21, REVISED the same day. Scopes (a)/(b)/(c)
+unimplemented. **Both premises the task was filed on turned out to be wrong** —
+see "Scope (b) has no consumer in goopg" below. The task needs owner re-scoping
+before any of it is built.
 
 Task: `.ralph/fix_plan.md` M0145-0010. Parent: none. Kind: impl (this document
 is its recon).
@@ -141,3 +142,87 @@ The task was filed with an 8-fire lateral consumer that is now 2. Whether that
 still justifies a rel-level refactor is a scoping decision for the banner's
 owner, not for the loop. Step 1 above is the cheap measurement that would inform
 it, and is what the next loop should do rather than starting the refactor blind.
+
+
+## Scope (b) has no consumer in goopg (measured 2026-09-21)
+
+The previous section recommended measuring scope (b)'s population before
+building it, on the grounds that it is "not a lateral feature" and might carry
+the justification scope (a) lacks. That measurement is done, and it says the
+opposite of what was hoped — twice over.
+
+### The raw surface is large
+
+Widening the `NLIGATE` census from SEMI/ANTI to every jointype (it had been
+scoped to semijoins for M0145-0007 and so reported nothing about the general
+population — a blind spot of exactly the kind this milestone keeps finding),
+TPC-DS SF0.25 gives:
+
+| gate | fires |
+|---|---|
+| `no-parameterised-inner` | **15 014** |
+| `filed` | 10 814 |
+| `inner-rejected` | 1 625 |
+| `jointype-right` | 77 |
+
+15 014 decision points where the inner rel offered no parameterized path at
+all. At first reading that is scope (b)'s population and it is enormous.
+
+### But that is the wrong attribution
+
+`reparameterize_path` does not create parameterized paths for a relation. It
+RE-PRICES an existing path under a LARGER `required_outer`, and refuses outright
+if the request is not a superset
+(`pathnode.c:4249`: `if (!bms_is_subset(PATH_REQ_OUTER(path), required_outer)) return NULL`).
+
+The paths that populate `cheapest_parameterized_paths` in the first place come
+from `create_index_paths`' join half (`indxpath.c:446-544`) — **which goopg
+already ports**, in `pathparamindex.go`. So the 15 014 are cases where no
+parameterized path EXISTS for the inner rel, i.e. no usable index clause. PG
+would find nothing there either, and `reparameterize_path` would not be called.
+
+### And its real callers are a feature goopg does not have
+
+The task text says `reparameterize_path` is "invoked FROM `joinpath.c`". It is
+not. Its callers upstream are:
+
+- `get_cheapest_parameterized_child_path` (`allpaths.c:2096`) — **appendrel
+  CHILD paths, i.e. partitionwise joins**;
+- its own recursion for `Append`/`Material`/`Memoize` subpaths
+  (`pathnode.c:4328,4352,4364`).
+
+goopg has no partitionwise joins at all — `pathparam.go`'s own comment already
+records it: "goopg's search has no partitionwise counterpart — every relid in a
+RelSet is a top-level base relation". So scope (b)'s primary upstream consumer
+does not exist here, and porting it would be building machinery for a feature
+the planner does not implement.
+
+## Conclusion: both premises were wrong
+
+| premise as filed | measured |
+|---|---|
+| scope (a): "8 corpus fires" for the `lateral` family | **2** |
+| scope (b): `reparameterize_path` "invoked FROM joinpath.c" | invoked from `allpaths.c` for **partitionwise children**, which goopg lacks |
+
+What survives is scope (c)'s structural argument, which needs neither: replacing
+four hand-synced jointype whitelists with a derived test is worth doing because
+hand-synced gates drift, and the 2026-09-21 wrong answer is the standing
+evidence. But that argument does not require the rel-level parameterization
+refactor scopes (a) and (b) describe, and it is largely satisfied already by the
+shared predicates the two widening loops introduced.
+
+## Recommendation (owner decision, not the loop's)
+
+Re-scope or close M0145-0010. Concretely, one of:
+
+1. **Narrow it to the lateral admission alone** — 2 fires, honestly priced, and
+   judged on whether Q30/Q68 matter enough on their own;
+2. **Defer it behind partitionwise joins**, since that is what makes
+   `reparameterize_path` meaningful upstream;
+3. **Close it**, recording that scope (c)'s structural intent was met by the
+   shared jointype predicates and that the remaining scopes have no measured
+   consumer.
+
+The loop does not choose among these. What it can say is that starting the
+refactor as filed would be building for consumers that measurement says are not
+there.
