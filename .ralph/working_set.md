@@ -1,60 +1,64 @@
 (idle — nothing in flight)
 
-# Loop #72 result — template1 namespace bug ROOT-CAUSED (not yet fixed)
+# Loop #73 result — template1 namespace collision fully MAPPED, escalated `[!]`
 
 Banner: nightly run id UNCHANGED (20260922-004850) → PgoutputInterop stays
-non-selectable. M0119 first; took the template1-namespace task filed last
-loop.
+non-selectable. Continued the template1 task. No production change.
 
-## ROOT CAUSE — an OID collision by construction
-`const DefaultDBOid uint32 = 1` (`internal/catalog/catalog.go:4018`) is
-goopg's internal "default namespace" key, and **1 is also template1's real
-PostgreSQL bootstrap OID** — the constant's own neighbouring comment cites
-`Template1ObjectId=1, PostgresObjectId=5`.
-`ResolveDatabaseOid("template1")` returns 1 EXPLICITLY, while
-`NamespaceDBOid` maps postgres (`PostgresDBOid = 5`) onto `DefaultDBOid = 1`.
-Two databases therefore key the same `tableNamespace`.
+## What was missing, and why two loops guessed wrong
+**goopg has THREE database-oid spaces that do not agree.** Nobody had written
+this down:
 
-**Last loop's suspicion was WRONG and is recorded as such**: template1 does
-NOT resolve to 0 and fall through `NamespaceDBOid`'s zero case. Do not
-re-investigate that.
+| space | postgres | template1 | CREATE DATABASEd |
+|---|---|---|---|
+| displayed (`pg_database.oid`) | 16384 | 1 | own |
+| catalog namespace | `DefaultDBOid=1` | **1** | own |
+| storage (`base/<DBOid>`) | `PostgresDBOid=5` | **5** | own |
 
-## The dangerous dependency was MEASURED and does not exist
-`CREATE DATABASE ... TEMPLATE` physically copies the template's relations
-from `base/<dbOid>`, so the worry was that a database created from template1
-would inherit postgres' user tables. With a `secret` table in postgres, BOTH
-plain `CREATE DATABASE fresh` and explicit
-`CREATE DATABASE fromt1 TEMPLATE template1` produce a database where
-`secret` does not exist. The CREATE DATABASE path is unaffected; a fix need
-not preserve any copying that depends on the collision.
+MEASURED: `base/` after initdb holds 1, 4, 5. A table created on the
+**postgres** connection and one created on the **template1** connection BOTH
+landed in `base/5`; a table in a `CREATE DATABASE`d `isolated` landed in a
+fresh `base/16408`. So per-database isolation WORKS; template1 alone misses
+it — at BOTH the namespace and storage layers, not just the catalog one I
+reported last loop.
 
-## Landed this loop
-Only a regression repair I caused in loop #70: the
-`DatabaseAllowsConnections` doc comment had been inserted BETWEEN
-`DatabaseConnLimit`'s doc comment and its declaration, orphaning it. The
-function is moved below so each doc is adjacent to its own declaration.
+## Merge point
+`ResolveDatabaseOid("template1")` returns 1 explicitly and
+`DefaultDBOid = 1`, so template1's namespace IS the default one;
+`NamespaceDBOid` folds postgres (5) onto it too; storage derives FROM the
+namespace, which is why template1's files follow postgres' into `base/5`
+rather than the `base/1` initdb already laid out. Not a bug in any single
+function — goopg picked `1` as its internal sentinel and `1` is template1's
+real PG bootstrap OID.
 
-## Next step (bounded now, one question left)
-Give template1 a distinct INTERNAL oid while `databaseDisplayOID` keeps
-showing 1 — goopg ALREADY separates displayed from real oids, so this fits
-the design. That leaves template1 an empty namespace, which is what PG has.
-**Check first**: what keys off `base/1` on disk, and what
-`internal/initdb/catalog_heap_reload.go` does when it maps a connection
-(PostgresDBOid=5) back onto DefaultDBOid=1 at startup — a new internal oid
-must not make the reload attribute postgres' heap rows to template1. That
-coupling is why this was not fixed in the same loop: the collision is baked
-into a constant keying physical `base/<oid>` directories.
+## Two candidate blockers MEASURED as absent
+- `CREATE DATABASE ... TEMPLATE` does not leak postgres' tables (both the
+  default and explicit `TEMPLATE template1` paths, with a `secret` table).
+- The startup reload folds `NamespaceDBOid(cat.DBOID())` for the POSTGRES
+  connection specifically, so moving template1 off 1 leaves it correct.
 
-Also verify whether this is the SAME root cause as M0119-0006's remaining bs
-item ("template1 install re-attributes to postgres on restart") — if the
-install genuinely executes in postgres' namespace, the restart reports where
-the row always was, and the two are ONE piece of work.
+## Why `[!]` instead of a fix — the options are not interchangeable
+- **A**: stop `ResolveDatabaseOid` returning `DefaultDBOid` for template1.
+  One loop. Routes AROUND the sentinel → the next database colliding with a
+  bootstrap oid has the same problem.
+- **B**: give postgres namespace 5, one oid per database at every layer.
+  Architecturally right, removes it by construction — and is substantially
+  M0122-0007's epic (slices 4b-4e open).
+Recommendation recorded (A now, B named as the real fix), but accepting a
+narrow fix that knowingly leaves a structural hazard is an owner call about
+debt, not something to settle by picking the smaller diff.
 
-## Gates (all green)
-units; tpch-spotcheck Q12=2/Q13=33; tpcds-sf025 `PLAN-SHAPE same=99
-changed=0`; acceptance arm 24/24; pgbench smoke. (Diff is comment-only, but
-`internal/catalog` is non-test code so the stamps are required.)
+## Gates
+`go build ./...` OK; state guard OK; pgbench smoke via hook. No value gates —
+ZERO production diff (verified over `internal/ cmd/`).
 
-## Owner escalations OPEN — three
-1. M0145-0018 cost-model no-go. 2. M0145-0001 lineage exhausted. 3.
-partition_aggregate's inventory row marks a never-passing case must-pass.
+## Next loop
+Check the nightly run id FIRST. M0119-0006's remaining bs items (template1
+extension re-attribution — likely the SAME root cause as above, so do not
+treat as separate until checked; user-db-local `extnamespace` → "public" at
+reload), then M0122 → M0131 → M0134 → M0135/M0136 → M0095/M0110.
+
+## Owner escalations OPEN — FOUR
+1. M0145-0018 cost-model no-go. 2. M0145-0001 lineage exhausted.
+3. partition_aggregate's inventory row marks a never-passing case must-pass.
+4. **NEW:** template1 namespace collision — Option A vs Option B.
