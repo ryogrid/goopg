@@ -13545,6 +13545,36 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
       unblock conditions that need revisiting, not the statistics. The
       loop is not re-scoping them itself.
     - Step 4 respected: `rows<=1` guard and Q78 firewall UNTOUCHED.
+  - **Step 2 slice 5 (loop 2026-09-21 \#30): census COMPLETE, no rule
+    added — and a RETRACTION.**
+    - **RETRACTION**: slices 2-3 recorded that the design's G1 note was
+      contradicted because `Project(Filter)` bodies reach the consumer
+      158x/run. **That was the loop's own classification error** — the
+      census looked one level below the `Project`. One level further:
+      `Project>Filter>Aggregate` (142), `Project>Filter>Project>
+      Aggregate` (16). Every `Filter` is a **HAVING over an aggregate**,
+      exactly the shape `groupUniqueNDistinct`'s doc describes. **G1's
+      claim STANDS.**
+    - Full classification of the 648 unknown asks:
+      - 158 = group keys of **3-key** (142) and **4-key** (16)
+        aggregates.
+      - 366 = windows over **6-key** (8), **5-key** (7), **2-key** (4)
+        aggregates.
+      - 100 = `UNION ALL` outputs whose branches project DATA columns,
+        not the literal tags `synthUnionLiterals` exists for.
+      - 24 = `DistinctOn`, unexamined (almost certainly the same class).
+    - The first two are ONE class: a group key of a MULTI-key
+      aggregate, where upstream's `isunique` counting argument does not
+      exist. The third has no `pg_statistic` row upstream either.
+      **The entire population is columns PostgreSQL would not resolve.**
+    - **There is no remaining PG-faithful synthesis work on this task.**
+    - **OWNER SCOPING DECISION REQUIRED (escalated, not taken):** this
+      task exists to unblock three residuals, and the statistics they
+      wait for do not exist upstream. Either the residuals' unblock
+      conditions are revisited, or unblocking them means deliberately
+      diverging from PG's estimator — which the loop will not decide.
+    - Step 4 respected throughout: `rows<=1` guard and Q78 firewall
+      UNTOUCHED.
   - **On completion — reconsider the blocked work (evaluate, do not
     auto-do):**
     - `flattenPulledBodyTree`'s bare-`*SeqScan` rule (M0145-0003 ANY

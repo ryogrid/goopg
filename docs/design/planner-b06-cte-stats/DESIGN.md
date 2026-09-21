@@ -431,3 +431,69 @@ either. The task's remaining honest scope is:
 Everything else should be escalated as a scoping question rather than pursued:
 if the residuals need estimates PG cannot produce, the residuals' own
 unblock conditions — not the statistics — are what need revisiting.
+
+
+## Step 2 slice 5 — the census completed, and a retraction
+
+This slice added no rule. It finished the census, and what it found closes the
+task's "add more rules" scope and **retracts a claim two earlier slices
+recorded**.
+
+### RETRACTION: the G1 note is NOT contradicted
+
+Slices 2 and 3 recorded that this document's G1 claim ("plain bodies need no
+synthesis: the existing resolver already recurses into CTE bodies for those
+shapes") was contradicted by measurement, because `Project(Filter)` bodies
+reached the consumer 158 times per run and the consumer is reached only when
+`resolveBaseColumn` FAILS. That reading was **wrong, and the error was mine**:
+the census classified bodies by looking one level below the `Project`, so a
+`Filter` was read as a plain WHERE. Looking one level further:
+
+```
+142  Project>Filter>Aggregate
+ 16  Project>Filter>Project>Aggregate
+```
+
+Every one of those `Filter`s is a **HAVING clause over an aggregate**, which is
+precisely the shape `groupUniqueNDistinct`'s own doc describes ("Q18's inner is
+`lineitem GROUP BY l_orderkey HAVING sum(l_quantity) > 313`, whose HAVING is a
+`*Filter` above the `*Aggregate`"). These are not plain bodies at all. G1's
+claim stands; the ledger rows and task notes asserting otherwise are corrected
+by this section.
+
+### The whole unknown population, finally classified
+
+With the terminal node and grouping arity recorded for each ask:
+
+| population | asks/run | terminal shape | resolvable upstream? |
+|---|---|---|---|
+| `Project(Filter(Aggregate))` | 158 | group keys of **3-key** (142) and **4-key** (16) aggregates | **no** |
+| `Project(WindowAgg(...))` | 366 | windows over **6-key** (8), **5-key** (7), **2-key** (4) aggregates | **no** |
+| `SetOp` / `Project(SetOp)` | 100 | `UNION ALL` whose branches project data columns, not literals | **no** |
+| `DistinctOn` | 24 | — | not examined |
+
+The first two are the same class: a group-key column of a MULTI-key aggregate.
+Upstream's `get_variable_numdistinct` `isunique` branch
+(`postgres/src/backend/utils/adt/selfuncs.c:6338`) applies only when the
+grouping is over a single column, because that is what makes the counting
+argument exact — with two or more keys none is unique on its own. The third is
+a set-op subquery output, for which upstream has no `pg_statistic` row either;
+numbering it would require combining branch statistics, which PG does not do.
+
+**So the entire 648-unknown population is columns PostgreSQL itself would not
+resolve.** The `synthUnionLiterals` decline is likewise correct — those columns
+are data, not the literal tags the rule exists for.
+
+### Conclusion for M0145-0009
+
+There is no remaining synthesis work that is PG-faithful. Five slices have now
+landed (consumer, group-combo rule, WindowAgg synthesis arm, WindowAgg resolver
+arm, this census); the first four are correct, pinned and safe, and inert for
+the reason this census finally states in upstream's terms.
+
+The task's premise — that CTE-output statistics would unblock three M0145
+residuals — does not survive the measurement: the statistics those residuals
+want do not exist upstream either. **That is an owner scoping decision, not a
+loop decision**, and it is escalated in `fix_plan.md`. What the loop can say is
+that continuing to add boundary rules would be inventing estimates PG does not
+make, which is the opposite of this project's goal.
