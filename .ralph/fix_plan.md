@@ -58,7 +58,11 @@ the order written inside the item. `[!]` tasks are not selectable.
    firewall's own resume condition; completing it triggers a
    RE-EVALUATION of those unblocks, not automatic lifts) →
    **M0145-0010** (parameterized-path legality — the `lateral` decline
-   family; likewise a re-evaluation trigger, not an auto-admit). The
+   family; likewise a re-evaluation trigger, not an auto-admit) →
+   **M0145-0011** (measured re-evaluation of the derived-input
+   blockers — knob-arm private evidence only) → **M0145-0012**
+   (retire the goopg-only `rows<=1` CTE fallback once `derived >=
+   guard effect` is demonstrated or made to hold). The
    Q78 `outer-over-derived` firewall is a hard constraint on every
    pull-up/flattening task.
 4. **M0141-S2a-fix2r** — re-apply the PG-faithful `hashAggEntrySize` change that
@@ -4099,6 +4103,31 @@ setting that yields a serial plan.
     - Method: both sides read from ONE fresh parallel-mode SF1 capture
       pair; the checked-in `bench/tpch/plans-pg/` fixtures were NOT used
       (stale + serial, ledger `parity-reference-fixtures-are-invalid`).
+  - **Step 2 STOPPED before implementation (loop 2026-09-21 \#38), no
+    production change — the capability already exists.**
+    - `prebuildSharedHashJoins` -> `buildLazyHashTable` ->
+      `parallelBuildLazyHashTable` already fires: instrumented on the
+      SF1 clone over Q14+Q16, `COOPBUILD entered scanTable=part` — the
+      build relation of BOTH witnesses. **One shared hash table is
+      already built cooperatively by N producer goroutines splitting the
+      build scan.**
+    - So what still differs from PG is only (1) WHERE the build happens
+      (PG inside the Gather from a partial inner behind a barrier; goopg
+      before fan-out over a complete inner, then shared) and (2) the
+      plan LABEL (`Parallel Hash` vs `Hash`). Both divide the inner SCAN
+      across goroutines already.
+    - **The planned implementation was DECLINED.** Filing
+      `parallel_hash = true` with a COMPLETE inner would move the plan
+      text toward PG WITHOUT changing execution — a label asserting a
+      model the engine does not use, strictly worse than the current
+      honest divergence.
+    - **OWNER DECISION REQUIRED**: re-scope as an explicit fidelity item
+      (buys plan text, not throughput, and should sit behind something
+      that needs a partial inner for a real reason), or close —
+      recording that the shared-build capability exists and that Q9/Q21/
+      half-Q10 are join-order divergences this task could never fix.
+    - If re-scoped, the partial-inner port is the real work and must be
+      pinned by a parallel-vs-serial IDENTITY test per shape.
   - **On completion — reconsider the blocked work (evaluate, do not
     auto-do):** re-run the family-A witnesses (Q3 Q9 Q10 Q14 Q16 Q18
     Q21) under the canonical parallel capture; M0137-0019a's family-A
@@ -13314,8 +13343,10 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
         `body-qual-not-consumable` class is gone, independently
         confirming `fef25625d`.
       - The one lever on this ratio is the CTEScan-body class (15),
-        whose blocker is B-06 = **M0145-0009**. Resume there, then
-        re-run this census and re-adjudicate slice 4.
+        whose blocker is B-06 = **M0145-0009** — whose census has since
+        shown the column channel is exhausted upstream; the measured
+        re-evaluation of that class is **M0145-0011** (E2 arm). Resume
+        there, then re-run this census and re-adjudicate slice 4.
       - **Consequence for M0145-0008**: its text requires this task, so
         the cutover is NOT selectable as written — even though BOTH of
         its named TIMING blockers are now discharged (gap 1.06x).
@@ -13624,6 +13655,15 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
       wait for do not exist upstream. Either the residuals' unblock
       conditions are revisited, or unblocking them means deliberately
       diverging from PG's estimator — which the loop will not decide.
+      - **Owner answer (2026-09-21)**: the unblock conditions are
+        revisited as **measurement**, not divergence — filed as
+        **M0145-0011** (knob-arm E1/E2 evidence for the firewall and
+        the CTEScan-leaf rule; the residuals' named conditions are
+        row-estimate conditions, and row-level CTE estimates are
+        already PG-equivalent) and **M0145-0012** (retire the
+        goopg-only `rows<=1` fallback once `derived >= guard effect`
+        is demonstrated). Proposal:
+        `tmp/blocker-re-think-260912/01-proposal.md`.
     - Step 4 respected throughout: `rows<=1` guard and Q78 firewall
       UNTOUCHED.
   - **On completion — reconsider the blocked work (evaluate, do not
@@ -13633,16 +13673,21 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
       `*CTEScan` leaf carries row/width estimates, relax the rule and
       re-run the knob-arm sweep. File as its own task if the work is
       more than the rule relaxation.
-    - `outer-over-derived` firewall (`relfromjoinlist.go`, 12 corpus
-      fires): evaluate whether the named resume condition is genuinely
+    - `outer-over-derived` firewall (`relfromjoinlist.go`; 12 corpus
+      fires at filing, 3 on the loop-#34 re-measure): evaluate whether the named resume condition is genuinely
       met — derived estimates must now out-rank the defaults AND a live
       Q78 run must show the ~19 s shape holds (the C-04a regression
-      class is 15 s -> 327 s). Owner hard constraint: if the evidence is
+      class is 15 s -> 327 s). The measurement vehicle is **M0145-0011**
+      (knob-arm firewall-bypass + CTEScan-leaf admission, private
+      evidence). Owner hard constraint: if the evidence is
       ambiguous, ESCALATE rather than lift; a clean lift is itself a
       separate task.
     - The `rows<=1` guard (`joinsearch.go:520-526`, `initialRelRows`): same criterion —
       removal only after derived estimates demonstrably reach the
-      guard's effect on the year_total shapes (ledger step 4).
+      guard's effect on the year_total shapes (ledger step 4). That
+      removal is filed as **M0145-0012** — the arm has no PG
+      counterpart (`clamp_row_est` keeps the collapse), so it is a
+      goopg-only divergence to retire.
     - Re-run the pull-up/seam decline census afterwards so the residual
       buckets reflect the new state.
 - [ ] **M0145-0010 — parameterized-path legality: port
@@ -13837,9 +13882,11 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
     that bypasses `problemPairsOuterWithDerived` — EXPLAIN/probe use
     only, default arm unchanged, same precedent as the census flags.
   - (b) E1: on the KNOB arm with the flag, capture plans + timings +
-    values for Q78 and the `outer-over-derived` corpus fires (~12).
-    Pass criteria: no NL-epsilon shape, Q78 holds ~19 s, values
-    identical.
+    values for Q78 and the `outer-over-derived` corpus fires (~12
+    pre-slice-3; **3** on the loop-#34 re-measure — re-run the census
+    first to get the current set). Pass criteria: no NL-epsilon shape,
+    Q78 holds ~19 s, values identical; on failure record WHICH query,
+    WHICH election, and by how much it degraded.
   - (c) E2 (downstream of (a)): relax `flattenPulledBodyTree`'s
     bare-`*SeqScan` rule for `*CTEScan` leaves on the knob arm —
     REQUIRED pairing with (a)'s flag because pulled ANY/EXISTS bodies
@@ -13858,8 +13905,11 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
   Hard constraints: the Q78 `outer-over-derived` firewall and the
   `rows<=1` guard stay UNTOUCHED on the default arm; knob-arm captures
   are EXPLAIN-only private evidence (G8); no relaxation is landed by
-  this task.
-  Kind: recon
+  this task. (Kind is `impl`, not `recon`: scope (a) lands a
+  diagnostic flag under `internal/` — C1 counts env-gated additions
+  as production changes even when the rest of the task is
+  measurement.)
+  Kind: impl
   Parent: none
 - [ ] **M0145-0012 — retire the `rows<=1` CTE fallback guard
   (`initialRelRows`, `joinsearch.go:520-526`)** (filed 2026-09-21 by
