@@ -1,79 +1,77 @@
 # Working set — inter-loop baton
 
-Task: **M0145-0014 — PARTIAL**, still `[ ]`. The scalar half landed; the ANY
-recursion is deferred and ledgered with an exact resume point.
+Task: **M0145-0014 — still `[ ]` (partial).** The recursion half was ATTEMPTED
+this loop and **stopped before landing**. Nothing was committed to
+`internal/`; the WIP was discarded. The finding is the deliverable.
 
 ## Banner
 
 Item 3: `… 0013 [x] → 0014 [ ] (partial) → 0015 → 0016 → 0017 → 0018`.
-Re-read it — it grew M0145-0013..0018 under an earlier baton.
+M0145-0014 is still the first selectable `[ ]`, so the banner points here
+again — but see "Next step": the next attempt needs a different first move.
 
-## The finding: the class is TWO shapes, not one
+## What the attempt proved
+
+The blocker the previous ledger row named **was built and does resolve**:
+
+- `jtPulledBody.children`/`parent`;
+- `extractNestedPullups` — PG's `pull_up_sublinks_qual_recurse` re-run on a
+  body's own conjuncts, removing each converted one (`prepjointree.c:682-693`,
+  `:736-747`, NOT arm `:836-845`), depth-guarded at 3;
+- `flattenPulledBodies` — parent-before-child, keeping "body order IS leaf
+  order" true for `splicePulledLeaves` and `classifyPulledQuals`;
+- `rebasePulledQual` walking `r.Level` steps up the parent chain, resolving an
+  ancestor-body reference through that body's leaves and falling through to
+  the emitting scope when the chain runs out;
+- per-body `leftBits` = emitting ∪ every ancestor's leaves, replacing the
+  hard-coded `emittingBits` in the classify switch and the SJI.
+
+## The real blocker — a THIRD thing, with a fast witness
+
+A pulled leaf is **NON-EMITTING**: a SEMI/ANTI join never projects its RHS, so
+a parent body's columns exist only at the parent's own join node. Today's
+spanning link qual is fine because it BECOMES that join's clause; a nested
+body's link qual reads a parent-body column from a DIFFERENT join node and the
+lowering has nowhere to evaluate it.
 
 ```
-query58   d_date IN (SELECT … WHERE d_week_seq =  (SELECT …))   scalar nested
-query83   d_date IN (SELECT … WHERE d_week_seq IN (SELECT …))   ANY nested
+TestJointreePullupDeclineParity/nested-exists   (an EXISTING test)
+panic: createPlan: join clause references binding column 3 (v),
+       which is not among the 3 output columns it is being re-based onto
 ```
 
-Only Q83 needs the recursion. **goopg's gate was over-broad against the
-oracle**: PG converts the OUTER sublink first (`convert_ANY_sublink_to_join`
-gates on correlation + volatility only, `subselect.c:1345-1386`) and recurses
-afterwards, so a nested sublink PG would not convert never blocks the outer
-conversion. goopg refused both via a blanket `exprHasSublinkPlan`.
-
-## What landed
-
-- `bodyQualsAdmitSublinks` splits the refusal at BOTH pull-up arms (sibling
-  pair, identical gate): non-convertible sublink rides along;
-  `nested-sublink-convertible` and `nested-sublink-correlated` decline.
-- **Second wall, found by re-censusing after the first half**:
-  `rebasePulledQual` cloned under `scopeVeto`, which makes `cloneExprRefs`
-  ABORT at the first inner-plan slot — every admitted qual then failed as
-  `rebase-failed`. Now `scopeSignal` + an `OnScope` guard declining a
-  CORRELATED subplan (`planHasOuterRef`).
-- `noteRebaseFail` names which of the four rebase failures fired.
-
-```
-census SF0.25 knob arm:  any-nested-sublink 12 -> 0
-                         any-nested-sublink-convertible 6  (Q83, deferred)
-                         (pulled) 42 -> 48                 no REBASEFAIL
-plans: exactly Q58 moves, cost 20670 -> 13692, Hash Semi Join retained
-```
-
-**Verified against the PG oracle** (Q58 returns 0 rows at SF0.25 — a weak
-witness): the same nested-scalar shape over `store_sales` gives `3654|181827`
-on PG 18.3 and on goopg before AND after, and goopg now produces PG's shape
-with the nested scalar as an `InitPlan` filter on the body leaf.
+Restricting the nested SJI's `syn_lefthand` to ancestor leaves only — PG's
+`j->rarg` + `available_rels = child_rels` ordering — is NECESSARY but **not
+sufficient**. The residual is in the lowering, not the join ordering.
 
 ## Next step
 
-**M0145-0015** (residual census + OR/NOT-position sublinks — PG's actual reach
-only). Read its text first: it is measurement-first and explicitly says to
-check whether goopg already has a hashed-subplan equivalent of
-`convert_EXISTS_to_ANY` before building anything.
+**Answer the lowering question BEFORE rebuilding any of the above.** Either the
+pulled leaves project their columns into the parent's schema for the duration
+of the search, or the nested semijoin is lowered as a subtree of the parent's
+RHS with its clause attached there. The witness runs in seconds and needs no
+cluster, so the next attempt can iterate at unit speed rather than through a
+corpus census.
 
-If instead resuming 0014's deferred half: the blocker is that a link predicate
-across TWO pulled bodies has no coordinate path —
-`outerOperandAsLevel1`/`rebasePulledQual` only handle a Level-1 outer ref
-resolving to an EMITTING binding.
+If the owner would rather move on, M0145-0015 is next in item 3 and is
+measurement-first.
 
 ## Traps carried forward
 
 - **Re-read the banner every loop.**
+- Corpus VALUE gates cannot see a join-ordering fault that still returns the
+  right rows — same blind spot M0145-0012 documented for cardinality. Unit
+  tests are the witness class for this milestone.
 - A new hand-written Expr type switch fails `TestExprSwitchInventoryIsPinned`;
-  pin it in `exprSwitchInventory` AND add a ledger row (the guard says so).
-- Relocating a decline one step is not progress — re-census after each half.
-- A/B against HEAD: `git worktree add --detach`, build with `-o`, then
-  `git worktree remove --force` + `prune`.
-- The RALPH_LOOP write-guard trips on prose that mentions a client tool and a
-  reference port in the same heredoc — split the write in two.
+  pin it AND add a ledger row.
+- The RALPH_LOOP write-guard trips on prose mentioning a client tool and a
+  reference port in one heredoc — split the write in two.
 
 ## Gates run
 
-units PASS (after pinning the new classifier); tpch-spotcheck PASS (Q12=2
-Q13=33); TPC-DS SF0.25 default arm PASS=96 MISMATCH=0 CKMISMATCH=0 ERROR=0
-TIMEOUT=0, plans 99/99 identical, runtime-moves=0; TPC-H acceptance arm
-24 MATCH; the commit hook's smoke runs on commit.
+units PASS (tree is green; the WIP that failed `nested-exists` was discarded,
+so no known-failing test is committed). No production code changed, so the
+planner corpus gates were not re-run. The commit hook's smoke runs on commit.
 
 ## In-flight
 

@@ -1,8 +1,9 @@
 # Nested sublinks in a pulled body's quals (M0145-0014)
 
-Status: PARTIAL, landed 2026-09-21. Half the census population is now pulled up
-and the other half is named and deferred. The task's premise needed splitting
-before any of it could be implemented.
+Status: PARTIAL. The scalar half landed 2026-09-21. The ANY-recursion half was
+ATTEMPTED on 2026-09-21 (loop 45) and **stopped before landing** — the attempt
+found a third blocker that is neither of the two this document previously
+named, and it is recorded below with its witness.
 
 Task: `.ralph/fix_plan.md` M0145-0014. Kind: impl. Parent: M0145-0003.
 
@@ -97,6 +98,59 @@ Hash Semi Join
           ->  Seq Scan on date_dim_1
                 Filter: (d_date = '1999-09-16')
 ```
+
+
+## The recursion attempt, and the blocker it found (2026-09-21, loop 45)
+
+The deferral below said the missing piece was a coordinate path for a link
+predicate spanning two pulled bodies. That was built, and it was not enough.
+
+**What was built and works.** `jtPulledBody` gained `children`/`parent`;
+`extractNestedPullups` re-ran the classifier on a body's own conjuncts and
+removed each converted one from the parent's qual list (PG's
+`prepjointree.c:682-693` / `:736-747` / `:836-845`), depth-guarded;
+`flattenPulledBodies` linearised the tree parent-before-child so every
+downstream consumer's "body order IS leaf order" assumption held;
+`rebasePulledQual` walked `r.Level` steps up the `parent` chain, resolving a
+reference that lands on an ancestor body through that body's leaves and falling
+through to the emitting scope when the chain runs out (which is what Level 1
+always meant for a top-level body); and `classifyPulledQuals` generalised the
+hard-coded `emittingBits` left-hand side into a per-body `leftBits` =
+emitting ∪ every ancestor's leaves. All of it compiles and the coordinate path
+resolves.
+
+**The blocker.** `TestJointreePullupDeclineParity/nested-exists` — an EXISTING
+test, not one written for the attempt — fails with:
+
+```
+panic: createPlan: join clause references binding column 3 (v),
+       which is not among the 3 output columns it is being re-based onto
+```
+
+A pulled leaf is **non-emitting**: a SEMI/ANTI join never projects its RHS, so
+the parent body's columns exist only at the parent's own join node. Today's
+spanning link qual is fine because it BECOMES that join's clause. A nested
+body's link qual is different — it reads a parent-body column from a *different*
+join node, and goopg's lowering has nowhere to evaluate it.
+
+Restricting the nested SJI's `syn_lefthand` to the ancestor leaves alone
+(`leftBits &^ emittingBits`), so the child semijoin is ordered INSIDE the
+parent's right-hand side exactly as PG splices it into `j->rarg` with
+`available_rels = child_rels`, is necessary but **did not** fix it. The
+remaining gap is in the lowering, not in the join ordering.
+
+The attempt was discarded rather than landed: a half-working nested pull-up is
+the wrong-answer class this milestone guards hardest against, and the corpus
+value gates cannot see a join-ordering fault that still returns the right rows
+on the two queries that exercise it.
+
+**Sharpened resume point.** Before rebuilding the coordinate path, answer the
+lowering question first: where can a clause that references a non-emitting
+pulled leaf's column be evaluated? Either the pulled leaves must project their
+columns into the parent's schema for the duration of the search, or the nested
+semijoin must be lowered as a subtree of the parent's RHS with its clause
+attached there. `TestJointreePullupDeclineParity/nested-exists` is the witness
+to re-run — it fails within seconds and needs no cluster.
 
 ## Deferred — the recursion itself
 

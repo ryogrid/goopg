@@ -14175,6 +14175,32 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
       `outerOperandAsLevel1`/`rebasePulledQual` only handle a Level-1 outer
       ref resolving to an EMITTING binding, so a link across two pulled
       bodies has no coordinate path today. Ledgered 2026-09-21.
+    - **RECURSION HALF ATTEMPTED AND STOPPED 2026-09-21 (loop 45). Nothing
+      landed; the finding is the deliverable.**
+      - The coordinate path named just above as the blocker **was built and
+        does resolve**: `children`/`parent` on `jtPulledBody`,
+        `extractNestedPullups` (PG's `pull_up_sublinks_qual_recurse` re-run,
+        depth-guarded), `flattenPulledBodies` (parent-before-child, so
+        "body order IS leaf order" still holds), an ancestor-chain walk in
+        `rebasePulledQual`, and a per-body `leftBits` replacing the
+        hard-coded `emittingBits`.
+      - **The real blocker is a THIRD thing**: a pulled leaf is
+        NON-EMITTING — a SEMI/ANTI join never projects its RHS — so a parent
+        body's columns exist only at the parent's own join node. A nested
+        body's link qual reads a parent-body column from a DIFFERENT join
+        node and the lowering has nowhere to evaluate it.
+      - Witness, and it is an EXISTING test:
+        `TestJointreePullupDeclineParity/nested-exists` panics with
+        `createPlan: join clause references binding column 3 (v), which is
+        not among the 3 output columns it is being re-based onto`.
+      - Restricting the nested SJI's `syn_lefthand` to ancestor leaves only
+        (PG's `j->rarg` + `available_rels = child_rels`) is NECESSARY but
+        not sufficient — the residual is in the lowering, not the ordering.
+      - **Resume: answer the lowering question FIRST.** Either the pulled
+        leaves project their columns into the parent's schema for the
+        duration of the search, or the nested semijoin is lowered as a
+        subtree of the parent's RHS with its clause attached there. The
+        witness runs in seconds and needs no cluster. Ledgered.
   Movement: none — knob arm only; the default arm is unchanged and the gates
   confirm it. The knob-arm pull-up census moved `any-nested-sublink` 12 → 0
   (6 pulled, 6 re-classified as the deferred convertible half), which is this
