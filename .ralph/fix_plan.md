@@ -1765,31 +1765,67 @@ heuristic stays live.)
 
 ### Manually discovered (not yet in a nightly `ci/logs/action-items.md` run) — filed 2026-09-15
 
-- [ ] **setop output type is the FIRST member's, not `select_common_type`'s
-  (found 2026-09-21 by an M0145-0004 discovery probe)** — goopg resolves a
-  `UNION ALL` column's type to the type of the FIRST member; PG resolves it
-  with `select_common_type` over every member
-  (`postgres/src/backend/parser/parse_coerce.c`, driven from
-  `transformSetOperationTree`, `parse_clause.c`). Oracle diffs, goopg vs PG
-  18.3 on `:65432`, both goopg arms (knob off and on — this is NOT a
-  jointree-pipeline defect):
-    - `SELECT a FROM (SELECT 1 AS a UNION ALL SELECT 2.5) t` — goopg reports
-      `bigint`, PG reports `numeric`. The VALUES are right (`1`, `2.5`;
-      `sum` = 6.5), so the rows are correct and only the declared type is
-      wrong.
-    - `SELECT 1::int2 UNION ALL SELECT 2::int8` — goopg `smallint`, PG
-      `bigint`.
-    - It is not only `pg_typeof`: `\gdesc` (a Describe round trip, i.e. the
-      wire RowDescription) reports the same wrong type, so a typed client —
-      JDBC, psycopg — is told `int8` for a column whose rows carry `2.5`.
-      That is a protocol-level mismatch, not a cosmetic one.
-    - Repro: any two-member `UNION ALL` with differing member types; no
-      tables needed.
-    - Fix direction: port `select_common_type` for set operations and coerce
-      each member's target list to the resolved type, which is also the
-      prerequisite the M0145-0004 ledger names for `tlist_same_datatypes`.
+- [x] **setop output type is the FIRST member's, not `select_common_type`'s
+  (found 2026-09-21 by an M0145-0004 discovery probe)** — **FIXED
+  2026-09-22** for PostgreSQL's numeric type category, which covers both
+  reported witnesses. Design doc:
+  `docs/design/0100-0149/setop-common-type-resolution.md`.
   Kind: bug
   Parent: none
+  Movement: none on the parity instruments (TPC-DS SF0.25
+  `PLAN-SHAPE same=98 changed=1`, and that one is cost-only — see below);
+  the defect was a declared-TYPE divergence, which none of S3's three
+  instruments measures.
+  - **Root cause, found by reading rather than guessing**: `SetOp.Output()`
+    (`internal/optimizer/plan.go`) returns `n.Left.Output()`, and
+    `wrapSetOpBranchWithCasts` coerced only the RIGHT branch to the LEFT's
+    schema. Together those two ARE the "first member wins" rule.
+  - **Fix**: `setOpUnifyBranches` resolves each column's common type across
+    both branches and coerces BOTH to it, so `SetOp.Output()` becomes
+    correct with no change to `Output()` itself — coercing the left branch
+    is precisely what the old code omitted.
+  - Verified against a live PG 18.3 on every pair, not derived from the
+    algorithm: `1 UNION ALL 2.5` -> numeric (was bigint);
+    `int2 UNION ALL int8` -> int8 (was smallint); `int4`/`float4` ->
+    float4; `float4`/`float8` -> float8; and the REVERSED pair
+    `float8 UNION ALL int2` -> float8. The reversed case is the one that
+    distinguishes a real resolution from a positional rule, and it is
+    pinned as the paired control: it passes even WITHOUT the fix, which is
+    exactly why it must sit next to a case that does not.
+  - Values are unaffected and were checked: `sum` over the mixed union is
+    still 3.5, and the rows still render `1` and `2.5`.
+  - **Pairwise folding is sound here, and that is a deliberate argument not
+    an accident**: `applySetOp` folds members left-deep, so goopg resolves
+    pairwise where upstream considers every member at once. Within
+    TYPCATEGORY_NUMERIC the implicit-coercion lattice is a TOTAL ORDER
+    (`int2 < int4 < int8 < numeric < float4 < float8`, with float8 the
+    category's preferred type and already its maximum), so the pairwise
+    fold converges on the same answer. That equivalence is what bounds the
+    fix to this category.
+  - **The one plan-shape delta is cost-only.** TPC-DS Q5 moved
+    (`GroupAggregate` 14363.79 -> 14595.00). Its plan is STRUCTURALLY
+    IDENTICAL — 66 lines, zero diff once cost text is stripped, row
+    estimates and widths unchanged — and the sweep reports
+    `MISMATCH=0 CKMISMATCH=0`. The delta is the cost of the coercion
+    Project the fix inserts on a branch whose member types differ, which is
+    the same coercion PostgreSQL itself inserts; it is a move toward PG,
+    not away.
+    - Sub-note on how that was checked: the first cost-stripped diff came
+      back empty because the awk range used `=== Q5` while the capture
+      writes `===== Q5 =====`, so it matched nothing. A vacuous "no diff"
+      is indistinguishable from a real one until the range is confirmed to
+      select lines — re-ran with a line count before trusting it.
+  - Gates: units; FULL upstream regress suite (only the known
+    `partition_aggregate` fails, unchanged); tpch-spotcheck Q12=2/Q13=33;
+    tpcds-sf025 PASS; acceptance arm 24/24 value-MATCH; pgbench smoke.
+    Test verified non-vacuous: neutralising `setOpUnifyBranches` fails
+    exactly the four order-sensitive subtests.
+  - Deferred and ledgered, NOT silently skipped: pairs outside the numeric
+    category are declined and keep the previous behaviour. That includes
+    the CROSS-CATEGORY case, where upstream raises 42804 "types %s and %s
+    cannot be matched" and goopg still accepts the query. Also unmodelled:
+    `unknown`-only members resolving to `text`, and the domain-preserving
+    property of upstream's all-same fast path beyond name equality.
 
 - [x] **parser/TestLockingClauseParity** — deterministic FAIL, found while
   running the M0137-0001 pre-commit gate (`RALPH_PRECOMMIT_SCOPE=units

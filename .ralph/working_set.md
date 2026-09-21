@@ -1,57 +1,60 @@
 (idle — nothing in flight)
 
-# Loop #66 result — PgoutputInterop x10: made SELF-DIAGNOSING, task stays open
+# Loop #67 result — setop common-type FIXED (numeric category)
 
-Banner: items 0-9 unchanged. Last open item-10 group was the ten pgoutput
-interop cases (AI-20260922-004850-006..-015).
+Banner: items 0-9 unchanged. Item 10's PgoutputInterop task is open but NOT
+selectable — its own next step is "wait for the next nightly" and the run id
+is unchanged (still 20260922-004850). So the next selectable was the
+"Manually discovered" subsection's first task (a `###` under M-NIGHTLY).
 
-## It does NOT reproduce at HEAD — tried three ways
-- named single-case repro: PASS (2.7s)
-- all ten together: PASS (62s)
-- **full `./internal/testport/` package** (what the nightly actually runs —
-  a subset run does not recreate that condition): PASS except the
-  already-known `partition_aggregate`.
-Local reproduction has a demonstrated ZERO hit rate. Do not keep re-running.
+## Root cause, found by reading
+`SetOp.Output()` returns `n.Left.Output()` AND `wrapSetOpBranchWithCasts`
+coerced only the RIGHT branch to the LEFT's schema. Those two together ARE
+the first-member-wins rule.
 
-## What the nightly log DOES establish (read from ci/logs/, not guessed)
-- Cases run SEQUENTIALLY -> a concurrent port race between these ten is NOT
-  the mechanism.
-- Failures INTERLEAVE with passes (UnchangedToast, MultiDMLXact,
-  SavepointXact, MultiTable, ReplicaIdentityUsingIndex, KillAndReconnect,
-  PgbenchKillAsync all passed in the same run) -> not a monotonic
-  degradation after some point in the suite.
-- Failures are consistently FASTER (2.60-2.74s) than passes (2.78-2.94s) ->
-  consistent with dying at startup.
+## Fix
+`setOpUnifyBranches` resolves each column's common type across both branches
+and coerces BOTH. `SetOp.Output()` then becomes correct with NO change to
+`Output()` — coercing the left branch is exactly what was omitted.
+`setOpCommonTypeName` is the single decision point for widening later.
 
-## Why neither night's cause is recoverable — and what landed
-The error named a `cluster.log` under `tmp/nightly-src-<run>/`, the
-nightly's THROWAWAY worktree, deleted when the run finishes. Both nights'
-logs are gone; the only evidence was behind a dead path.
-`cluster.Start` now INLINES the last 4 KiB of cluster.log into both
-start-failure errors, so the next occurrence carries its own cause in
-`go-test.log`. Best-effort: an unreadable log degrades to a note and never
-replaces the start failure being reported.
+## Why bounded to the numeric category (stated, not assumed)
+`applySetOp` folds members LEFT-DEEP, so goopg resolves pairwise where
+upstream resolves all-at-once. That is equivalent only where the
+implicit-coercion relation is a TOTAL ORDER — true in TYPCATEGORY_NUMERIC
+(`int2<int4<int8<numeric<float4<float8`, float8 preferred AND maximal).
+A non-total-order category would make the fold order-dependent, i.e. the
+same defect in subtler form.
 
-## Next step (explicitly NOT more local re-running)
-Wait for the next nightly and read the inlined tail. It will distinguish
-the hypotheses still open: ephemeral-port collision (both `freeTCPPort` and
-`cluster.freePort` use the racy bind-0/close/rebind pattern), a leftover
-datadir/socket in a fixed `tmp/` path, or host resource exhaustion in a
-~19-min stage. If the next nightly is GREEN, record that as evidence before
-closing.
+## Measured on live PG 18.3 (not derived)
+1/2.5 -> numeric (was bigint); int2/int8 -> int8 (was smallint);
+int4/float4 -> float4; float4/float8 -> float8; REVERSED float8/int2 ->
+float8. The reversed pair is the PAIRED CONTROL: it distinguishes a real
+resolution from a positional rule and passes even WITHOUT the fix, which is
+why it sits beside cases that do not. Values unaffected (sum still 3.5).
 
 ## Gates (all green)
-units; full testport package (the reproduction attempt doubled as the
-gate); tpch-spotcheck Q12=2/Q13=33; tpcds-sf025 `PLAN-SHAPE same=99
-changed=0`; acceptance arm 24/24; pgbench smoke via hook. Stamps WERE
-required — `internal/testutil/cluster/cluster.go` is non-test code under
-`internal/`. New test verified non-vacuous: reverting to bare-path fails
-all three subtests.
+units; FULL upstream regress suite (only the known `partition_aggregate`);
+tpch-spotcheck Q12=2/Q13=33; tpcds-sf025 PASS; acceptance arm 24/24;
+pgbench smoke. Non-vacuity: neutralising the unification fails exactly the
+four order-sensitive subtests, leaving the two controls green.
+**One plan delta, investigated not waved through**: TPC-DS Q5 cost moved
+(14363.79 -> 14595.00) but is STRUCTURALLY IDENTICAL — 66 lines, zero diff
+once costs are stripped, rows/widths unchanged, MISMATCH=0. It is the cost
+of the coercion Project, the same coercion PG inserts.
+Trap worth carrying: my first cost-stripped diff was EMPTY because the awk
+range used `=== Q5` while the capture writes `===== Q5 =====` — a vacuous
+no-diff looks exactly like a real one until you confirm the range matches.
+
+## Deferred + ledgered
+Cross-category pairs (upstream raises 42804; goopg still accepts),
+all-`unknown` -> text, and domain preservation. Widening needs a type-category
+table the optimizer lacks (only `pgTypeCategoryForOID`, keyed by OID).
 
 ## Next loop
-Item 10 has no other open task. Next in banner order is the "Manually
-discovered" group, first: **setop output type is the FIRST member's, not
-`select_common_type`'s** (found by an M0145-0004 discovery probe).
+Item 10: PgoutputInterop (only if a NEW nightly ran — check the run id).
+Otherwise the pre-existing milestones: M0119 -> M0122 -> M0131 -> M0134 ->
+M0135/M0136 -> M0095/M0110.
 
 ## Owner escalations OPEN — three
 1. M0145-0018 cost-model no-go. 2. M0145-0001 lineage exhausted (blocks all

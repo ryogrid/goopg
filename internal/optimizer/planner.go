@@ -910,6 +910,134 @@ func setOpNeedsCast(lname, rname string) bool {
 	return !isGenericString(lname)
 }
 
+// setOpNumericRank orders PostgreSQL's TYPCATEGORY_NUMERIC ('N') types by the
+// implicit-coercion lattice select_common_type walks: a narrower type coerces
+// implicitly to a wider one but not the reverse, so the wider one wins. Within
+// this category the lattice is a total order, which is what lets goopg resolve
+// a set operation PAIRWISE (see setOpCommonType) and still land on the answer
+// PostgreSQL gets by considering every member at once.
+//
+// float4/float8 sit above the exact types because int/numeric coerce to them
+// implicitly and not back; float8 is additionally the category's PREFERRED
+// type, and since it is already the maximum here the preference rule needs no
+// separate arm.
+//
+// Returns 0 for anything outside the category, including `unknown`.
+func setOpNumericRank(name string) int {
+	switch strings.ToLower(name) {
+	case "int2", "smallint", "smallserial", "serial2":
+		return 1
+	case "int4", "integer", "int", "serial", "serial4":
+		return 2
+	case "int8", "bigint", "bigserial", "serial8":
+		return 3
+	case "numeric", "decimal":
+		return 4
+	case "float4", "real":
+		return 5
+	case "float8", "double precision":
+		return 6
+	}
+	return 0
+}
+
+// setOpCommonTypeName is the subset of PostgreSQL's select_common_type
+// (postgres/src/backend/parser/parse_coerce.c:1342) that goopg models for set
+// operations, returning the resolved type name and whether the pair is modelled
+// at all.
+//
+// goopg used to resolve a set operation's output type to the FIRST member's,
+// and coerce only the RIGHT branch to it. That is not what PostgreSQL does, and
+// the consequence reached the wire: `SELECT 1 UNION ALL SELECT 2.5` was
+// described as `bigint` while carrying a row of 2.5, so a typed client (JDBC,
+// psycopg) was told int8 for a numeric column. The values were right; only the
+// declared type was wrong, which is why no row-count gate could see it.
+//
+// Modelled here: the all-same fast path (upstream's own first loop, and the
+// only way a domain survives unsmashed) and the numeric category. Outside that
+// the pair is declined and the caller keeps its previous behaviour, so this
+// narrows the divergence rather than trading it for a new one. Cross-category
+// pairs, which upstream REJECTS with 42804 "types %s and %s cannot be matched",
+// are among the declined set — goopg still accepts them, and that is recorded
+// in the deferral ledger rather than silently fixed here.
+func setOpCommonTypeName(l, r string) (string, bool) {
+	if strings.EqualFold(l, r) {
+		return l, true
+	}
+	lr, rr := setOpNumericRank(l), setOpNumericRank(r)
+	if lr == 0 || rr == 0 {
+		return "", false
+	}
+	if lr >= rr {
+		return l, true
+	}
+	return r, true
+}
+
+// setOpUnifyBranches coerces BOTH branches of a set operation to the per-column
+// common type, so the accumulated node's schema — which `SetOp.Output()` reads
+// off its LEFT input — reports the resolved type rather than the first member's.
+//
+// Coercing the left branch as well as the right is the whole point: the
+// previous code cast only the right branch to the left's schema, which is what
+// made the first member win. With both sides coerced, `SetOp.Output()` needs no
+// change to become correct.
+//
+// Columns whose pair `setOpCommonTypeName` declines are left exactly as they
+// were, so the existing generic-string validation path (setOpNeedsCast) still
+// runs for them unchanged.
+func setOpUnifyBranches(pos int, left, right Node) (Node, Node) {
+	ls, rs := left.Output(), right.Output()
+	n := min(len(ls), len(rs))
+	common := make([]string, n)
+	anyLeft, anyRight := false, false
+	for i := 0; i < n; i++ {
+		c, ok := setOpCommonTypeName(ls[i].Type.Name, rs[i].Type.Name)
+		if !ok {
+			continue
+		}
+		common[i] = c
+		if !strings.EqualFold(c, ls[i].Type.Name) {
+			anyLeft = true
+		}
+		if !strings.EqualFold(c, rs[i].Type.Name) {
+			anyRight = true
+		}
+	}
+	if anyLeft {
+		left = setOpCastBranchTo(pos, left, common)
+	}
+	if anyRight {
+		right = setOpCastBranchTo(pos, right, common)
+	}
+	return left, right
+}
+
+// setOpCastBranchTo projects one set-operation branch, casting each column whose
+// resolved common type differs from the branch's own. An empty entry in
+// `common` means the column was declined by setOpCommonTypeName and is passed
+// through untouched.
+func setOpCastBranchTo(pos int, branch Node, common []string) Node {
+	sch := branch.Output()
+	targets := make([]Expr, len(sch))
+	out := make(Schema, len(sch))
+	for i := range sch {
+		var e Expr = &ColumnRef{pos: pos, Index: i, Name: sch[i].Name,
+			Type: sch[i].Type, SourceTableIdx: sch[i].SourceTableIdx}
+		out[i] = sch[i]
+		if i < len(common) && common[i] != "" && !strings.EqualFold(common[i], sch[i].Type.Name) {
+			e = &CastExpr{pos: pos, Operand: e,
+				TargetType: common[i], SourceType: sch[i].Type.Name}
+			out[i] = SchemaColumn{Name: sch[i].Name,
+				Type:           catalog.Type{Name: common[i]},
+				SourceTableIdx: sch[i].SourceTableIdx,
+				Resjunk:        sch[i].Resjunk}
+		}
+		targets[i] = e
+	}
+	return &Project{pos: pos, Child: branch, Targets: targets, schema: out}
+}
+
 // wrapSetOpBranchWithCasts wraps the right branch of a UNION/INTERSECT/EXCEPT
 // in a Project node with CastExpr nodes for columns where the right branch has
 // a generic text type but the left branch has a specific typed type. This
@@ -1209,6 +1337,11 @@ func planSelectImpl(s *parser.SelectStmt, cat catalog.Catalog, plannerSet Planne
 			// nodes for columns where the left and right types differ. This ensures
 			// that string values like 'foo' are validated when the left branch
 			// declares a typed column (e.g. numeric). M0097-0056.
+			// select_common_type FIRST: resolve each column's common type
+			// across both branches and coerce BOTH to it, so the resolved type
+			// is what `SetOp.Output()` reports. Columns this declines fall
+			// through to the generic-string validation below, unchanged.
+			acc, right = setOpUnifyBranches(seg.opPos, acc, right)
 			right = wrapSetOpBranchWithCasts(seg.opPos, acc.Output(), right)
 			// C-18 (P4-09): the SETOP upper rel's path for this node —
 			// `createSetOpPaths` (windowsetoppaths.go) prices the two
