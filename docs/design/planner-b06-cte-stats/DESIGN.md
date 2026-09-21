@@ -1,6 +1,9 @@
 # B-06 (P1-27) — CTE-output statistics synthesis
 
-Status: accepted (design only — step 1 of the ledger's 4-step resume).
+Status: **COMPLETE 2026-09-22** — all four ledger steps discharged (design,
+consumers wired across five slices, measured, guard/firewall untouched). The
+closing census is §"Closing census (2026-09-22)" at the end of this document.
+Movement: none.
 Implements TODO_ALL.md B-06 (DEFERRED-OPEN → design stage). Ledger
 `take3-B-06-deferred` (guard load-bearing: removal reverts Q74 to 99s;
 PG has no answer either — single-key uniqueness only, Q74 groups by 4).
@@ -497,3 +500,64 @@ want do not exist upstream either. **That is an owner scoping decision, not a
 loop decision**, and it is escalated in `fix_plan.md`. What the loop can say is
 that continuing to add boundary rules would be inventing estimates PG does not
 make, which is the opposite of this project's goal.
+
+
+---
+
+# Closing census (2026-09-22) — M0145-0009 step "re-run the census afterwards"
+
+M0145-0009's completion step asks for the pull-up/seam decline census to be
+re-run "so the residual buckets reflect the new state" after M0145-0013 landed.
+Run here on the TPC-DS SF0.25 private lane, knob arm
+(`GOOPG_JOINTREE_PIPELINE=1`, `GOOPG_NLI_CENSUS=1`), all 99 queries, via
+`scripts/jointree-parity-capture.sh tpcds-sf025`.
+
+## The result: the `*CTEScan` class is not a residual — it is a default-off arm
+
+| decline class | `GOOPG_PULLUP_CTE_LEAF` off (default) | on |
+|---|---|---|
+| `(pulled)` | 27 | **42** |
+| `any-body-leaf-(*optimizer.CTEScan)` | 15 | **0** |
+| `SubqueryExpr@scalar` | 15 | 15 |
+| `ExistsExpr@or` | 2 | 2 |
+| `InExpr@or` | 1 | 1 |
+
+27 + 15 = 42. The class does not shrink, relocate or partially convert: with
+M0145-0013's admission enabled **every** member becomes a pull-up, and no other
+class moves. So the bucket that three of this milestone's residuals were
+described as waiting on is fully addressed in code already, and what remains is
+the arm's promote-or-delete decision (C5), not more synthesis.
+
+The two `@or` classes and `SubqueryExpr@scalar` are unchanged, as M0145-0015
+predicted: those are declines PostgreSQL makes too
+(`prepjointree.c:877`'s `/* Stop if not an AND */`, and EXPR sublinks never
+being jointree citizens).
+
+## The arm is not free, and that is the decision it needs
+
+Turning it on moved plans — 302 diff lines across the two goopg captures — and
+`CATEGORIES-EXCL-MATCH` `qual-placement` went **28 → 29** while `match` stayed
+at 1. That is inside the ±3 noise band, so it is not a measured regression, but
+it is also not the "no plan change" a free admission would show. Whoever takes
+M0145-0013's promote-or-delete decision should re-measure with a repeat capture
+to separate the +1 from capture variance rather than reading it off this run.
+
+## A measurement caveat worth more than the numbers
+
+M0145-0015's census (2026-09-21, nominally the same recipe) reported
+`(pulled)` 54, `*CTEScan` 30, `SubqueryExpr@scalar` 29, `ExistsExpr@or` 4,
+`InExpr@or` 2 — close to **twice** every figure above, across five independent
+classes at once, with the proportions essentially unchanged.
+
+Five independent halvings are far less likely than one capture-recipe
+difference (for instance an earlier capture planning each query twice). This is
+not resolved here, and the honest consequence is a rule rather than a number:
+**absolute census totals are comparable only within an identical capture
+recipe; the class PROPORTIONS are what carries across captures.** The
+conclusion above rests on a within-capture A/B — both arms from this loop, same
+recipe, same binary sha — which is why it holds regardless of which explanation
+is right. A later loop that needs the absolute figures should first re-run
+M0145-0015's exact command and see which number it reproduces.
+
+Artifacts: `tmp/m0145-0009-census/` (plans, diffs, per-stage class reports) and
+`tmp/m0145-0009-{recensus,cteleaf}-tpcds-sf025.server.log` (the census lines).

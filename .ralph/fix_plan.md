@@ -4816,6 +4816,46 @@ setting that yields a serial plan.
       half-Q10 are join-order divergences this task could never fix.
     - If re-scoped, the partial-inner port is the real work and must be
       pinned by a parallel-vs-serial IDENTITY test per shape.
+  - **CLOSED 2026-09-22 (loop \#78): the completion census is run and the
+    task's four ledger steps are all discharged.**
+    Movement: none — `CATEGORIES-EXCL-MATCH` unchanged on the default arm;
+    a recon, no production file touched.
+    Design: `docs/design/planner-b06-cte-stats/DESIGN.md`
+    §"Closing census (2026-09-22)".
+    - **The census answers the step's question, and the answer is that the
+      `*CTEScan` bucket is NOT a residual.** TPC-DS SF0.25 knob arm,
+      `GOOPG_NLI_CENSUS=1`, all 99 queries, both arms from this loop (same
+      recipe, same binary sha):
+      - `GOOPG_PULLUP_CTE_LEAF` **off** (default): `(pulled)` 27,
+        `any-body-leaf-(*optimizer.CTEScan)` 15, `SubqueryExpr@scalar` 15,
+        `ExistsExpr@or` 2, `InExpr@or` 1.
+      - `GOOPG_PULLUP_CTE_LEAF` **on**: `(pulled)` **42**, `*CTEScan`
+        **0**, the other three unchanged.
+      - 27 + 15 = 42 — the class converts ONE-FOR-ONE, with no partial
+        conversion and no other class moving. M0145-0013's admission
+        already addresses it in code; what is left is that arm's
+        promote-or-delete decision (C5), not more synthesis.
+    - The `@or` classes and `SubqueryExpr@scalar` are unchanged, as
+      M0145-0015 predicted — declines PG makes too
+      (`prepjointree.c:877` `/* Stop if not an AND */`; EXPR sublinks are
+      never jointree citizens).
+    - **The arm is not free**: 302 plan-diff lines between the two goopg
+      captures and `qual-placement` 28 -> 29 with `match` still 1. Inside
+      the ±3 noise band, so not a measured regression — but not "no plan
+      change" either. M0145-0013's decision should re-measure rather than
+      read that +1 off this run.
+    - **Measurement caveat, recorded as a rule**: M0145-0015's census
+      (nominally the same recipe) reported almost exactly DOUBLE every
+      figure across all five classes, proportions unchanged. Five
+      independent halvings are less likely than one capture-recipe
+      difference. Unresolved here; the consequence is that **absolute
+      census totals compare only within an identical capture recipe, and
+      the class PROPORTIONS are what carries across captures**. The
+      conclusion above rests on a within-capture A/B, so it holds either
+      way. Ledgered.
+    - Step 4 respected to the end: the `rows<=1` guard and the Q78
+      firewall were NOT touched by this task in any slice.
+
   - **On completion — reconsider the blocked work (evaluate, do not
     auto-do):** re-run the family-A witnesses (Q3 Q9 Q10 Q14 Q16 Q18
     Q21) under the canonical parallel capture; M0137-0019a's family-A
@@ -14466,7 +14506,7 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
       - **Both named cutover prerequisites are now discharged.** What
         remains before flipping the default is the cutover's own
         corpus-gate re-run, not a known defect.
-- [ ] **M0145-0009 — CTE-output statistics (B-06 resume): wire the landed
+- [x] **M0145-0009 — CTE-output statistics (B-06 resume): wire the landed
   synthesis into the estimator** (filed 2026-09-21 by owner directive;
   carries TODO_ALL B-06 / ledger `take3-B-06-deferred`). Three of this
   milestone's residuals are blocked on derived-input statistics: the ANY
