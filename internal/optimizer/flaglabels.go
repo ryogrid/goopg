@@ -199,6 +199,11 @@ var flagResolvedState = map[string]func(string) string{
 	// exempted. Useless without `GOOPG_DERIVED_FIREWALL=off`; a capture that
 	// names only one of the pair cannot say what it measured.
 	"GOOPG_PULLUP_CTE_LEAF": func(v string) string { return onOff(v == "on") },
+	// M0145-0012 (joinsearch.go): gates the M0129-S1 `rows<=1` CTE fallback.
+	// Default ON = today's behaviour. Plan-SHAPING — the arm changes an
+	// initial rel's cardinality, which the DP then costs on — so it belongs
+	// in the table, not in `flagProvenanceExempt`.
+	"GOOPG_CTE_ROWS_FALLBACK": func(v string) string { return onOff(v != "off") },
 }
 
 // flagProvenanceOrder is the order the flags are stamped in. The first six are
@@ -285,6 +290,10 @@ var flagProvenanceOrder = []string{
 	// pulled-body splice (jointreepullup.go). Default `off`. Plan-SHAPING and
 	// only meaningful paired with GOOPG_DERIVED_FIREWALL=off.
 	"GOOPG_PULLUP_CTE_LEAF",
+	// Joined at M0145-0012: gates the goopg-only `rows<=1` CTE fallback in
+	// `initialRelRows` (joinsearch.go). Default `on`; `off` is the knob-arm
+	// A/B that answers whether the arm can be retired.
+	"GOOPG_CTE_ROWS_FALLBACK",
 	// Joined at M0145-0002: selects the jointree-first pipeline
 	// (AGENT.md §"Plan-parity harness" G8). Default `off`; a knob-arm
 	// capture that does not name the flag cannot say which pipeline it

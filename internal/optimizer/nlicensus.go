@@ -241,3 +241,30 @@ func nliCensusJoinTypeName(jt JoinType) string {
 	}
 	return fmt.Sprintf("unknown(%d)", int(jt))
 }
+
+// cteRowsFallbackEnabled gates the M0129-S1 `rows<=1` CTE fallback in
+// `initialRelRows` (joinsearch.go). M0145-0012 measurement apparatus, default
+// ON so the default arm is today's behaviour; `GOOPG_CTE_ROWS_FALLBACK=off`
+// removes the arm for a knob-arm A/B.
+//
+// The arm it gates is a goopg-only divergence: `set_cte_size_estimates` keeps
+// the collapsed estimate and only floors it at 1 (`clamp_row_est`,
+// postgres/src/backend/optimizer/path/costsize.c), so PostgreSQL has no
+// counterpart to substituting the body's UNFILTERED row count. This flag
+// exists to answer the ledger criterion `derived >= guard effect` by
+// measurement rather than by argument, exactly as M0145-0011 did for the
+// `outer-over-derived` firewall.
+var cteRowsFallbackEnabled = os.Getenv("GOOPG_CTE_ROWS_FALLBACK") != "off"
+
+// traceCTERowsFallback records one engagement of that arm: which CTE, the
+// collapsed estimate it replaced, and the body row count it substituted. It
+// rides the DP trace rather than the NLI census because the question it
+// answers is "where does the guard change a cardinality the search then costs
+// on", which is a search-level question.
+func traceCTERowsFallback(name string, collapsed, bodyRows int64) {
+	if !dpTraceEnabled() {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "CTEROWSFALLBACK cte=%s collapsed=%.0f body=%.0f\n",
+		name, float64(collapsed), float64(bodyRows))
+}

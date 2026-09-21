@@ -14000,7 +14000,7 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
   Movement: none — the default arm is unchanged by construction (both flags
   default to today's behaviour) and the gates confirm it; the knob-arm census
   moved `any-body-leaf-(*optimizer.CTEScan)` 30 -> 0.
-- [ ] **M0145-0012 — retire the `rows<=1` CTE fallback guard
+- [!] **M0145-0012 — retire the `rows<=1` CTE fallback guard
   (`initialRelRows`, `joinsearch.go:520-526`)** (filed 2026-09-21 by
   owner directive; same proposal). The M0129-S1 arm — when a
   filter-wrapped `*CTEScan` leaf's estimate collapses to <=1, substitute
@@ -14025,6 +14025,38 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
   M0145-0011 so its evidence base is reused.
   Kind: impl
   Parent: none
+  - **`[!]` BLOCKED 2026-09-21 by measurement — BOTH filed routes are
+    refuted.** Design doc
+    `docs/design/0100-0149/m0145-0012-cte-rows-fallback-retirement.md`;
+    apparatus `GOOPG_CTE_ROWS_FALLBACK=off` + a `CTEROWSFALLBACK` DP-trace
+    line, both landed. No removal landed.
+    - Corpus census, TPC-DS SF0.25, DEFAULT arm, all 99 queries: the arm
+      engages on exactly THREE queries — Q31 `ws` 1→1846, Q39 `inv` 1→20,
+      Q74 `year_total` 1→8325 — and nowhere else.
+    - **Route 1 is FALSE**: removing the arm moves those same three plans
+      and each moves INTO the collapse class the arm exists for (every
+      equi-condition demoted from a join condition to a `Join Filter` on a
+      Nested Loop). Values byte-identical; **Q74 1509 → 25005 ms, 16.6x**,
+      Q31 +12%, Q39 flat. Scale-dependent per M0145-0011, so SF1 is worse.
+      The task's own text calls this an automatic no-go.
+    - **Route 2 is INAPPLICABLE**: `pushQualsThroughSingleRefCTEs` needs
+      `refs == 1`, and all three fires are MULTI-reference CTEs (`ws` ×3,
+      `inv` ×2, `year_total` ×4).
+    - **The real prerequisite** is a third thing neither route names:
+      `examine_simple_variable`'s non-recursive-CTE arm
+      (`postgres/src/backend/utils/adt/selfuncs.c:5736-5870`) locates the
+      CTE's `subroot` via `cte_plan_ids` and recurses on the target-list
+      `Var`, so PG estimates a qual on `year_total.dyear` from
+      `date_dim.d_year`'s real statistics and never collapses. Porting that
+      lookup is what lets this arm go.
+    - Note the methodological hazard this exposed: the regression is
+      INVISIBLE to every value gate in the repository — values are
+      byte-identical in all three queries. Only the plan shape and the clock
+      move. `TestInitialRelRowsCTEFallbackGate` is the unit-level witness.
+    - **ESCALATION**: the owner decides whether to file the
+      `examine_simple_variable` port as its own task (which would subsume
+      route 2) or to accept the arm as documented permanence. The loop does
+      not pick. Ledgered 2026-09-21.
 - [ ] **M0145-0013 — admit pulled `*CTEScan` leaves at the seam
   (`pulled-leaf-not-scan` / `flat-leaf-not-scan`)** (filed 2026-09-21
   by owner directive; the follow-on task M0145-0011's E2 resume point

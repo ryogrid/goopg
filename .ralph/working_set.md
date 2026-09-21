@@ -1,69 +1,71 @@
 # Working set — inter-loop baton
 
-Task: **M0145-0011 — COMPLETE and `[x]`.** Scope (c)/E2 measured this loop;
-(a)+(b) landed loop 39, (d)'s SF1 confirmation loop 40.
+Task: **M0145-0012 — MEASURED, and it is a NO-GO as filed.** Marked `[!]`.
+No removal landed. This is an ESCALATION, not a completion.
 
 ## Banner
 
-Item 3 now reads `… → M0145-0011 [x] → M0145-0012 [ ]`, so **M0145-0012 is the
-next selectable task** (retire the goopg-only `rows<=1` CTE fallback guard,
-`initialRelRows`, `joinsearch.go:520-526`). Re-read the banner anyway.
+Item 3 now reads `… → M0145-0011 [x] → M0145-0012 [!]`. With item 3 exhausted,
+**the next selectable work is item 4 (`M0141-S2a-fix2r`)** — re-read the banner
+and confirm before selecting; items 0-2 must be checked first as always.
 
-## Scope (c)/E2 — the relaxation is a TWO-SITE invariant
+## What M0145-0012 measured
 
-`GOOPG_PULLUP_CTE_LEAF=on` (default OFF, flag-provenance table, NOT exempt)
-admits `*CTEScan` leaves into `flattenPulledBodyTree`'s splice.
+Apparatus landed: `GOOPG_CTE_ROWS_FALLBACK=off` (default ON, flag-provenance
+table) + a `CTEROWSFALLBACK` DP-trace line + a unit gate.
 
 ```
-pull-up census (TPC-DS SF0.25, knob arm, 99 queries, GOOPG_NLI_CENSUS=1)
-  any-body-leaf-(*optimizer.CTEScan)  30 -> 0      (all from Q14/Q23/Q95)
-  (pulled)                            42 -> 72     every other class unchanged
-  PULLUPCLASSIFY refusal              none, both arms
+census (TPC-DS SF0.25, DEFAULT arm, 99 queries): the arm engages on THREE
+  Q31 ws 1->1846   Q39 inv 1->20   Q74 year_total 1->8325   (nowhere else)
 
-seam census (GOOPG_PGSHAPED_DP_TRACE=1, same three queries)
-  Q14/Q23/Q95  leaf-count x3/x4/x1  ->  pulled-leaf-not-scan x5/x4/x1
+A/B with the arm off: those same three move, each INTO the collapse class
+  every equi-condition demoted from join condition to Join Filter on a NL
+  Q39 3433->3564 ms | Q31 2133->2381 ms | Q74 1509->25005 ms  (16.6x)
+  values BYTE-IDENTICAL in all three
 ```
 
-**The decline RELOCATES; no CTE leaf reaches the DP.** `tryPGShapedJoinSearch`
-re-checks the leaf kind and its comment names `flattenPulledBodyTree` as its
-guarantor — one invariant, two sites. The three plans that move do so via the
-documented `pulled`-suppression side effect (the TPC-H Q4 10x mechanism):
-estimated cost falls 1.4x-2.4x while measured runtime is FLAT to 11% worse
-(13068->14490, 15024->15545, 3004->3230 ms), values byte-identical, semi/anti
-counts preserved 3/3, 4/4, 2/2.
+- **Route 1 ("no collapse-class change") is FALSE** — it reproduces exactly
+  that class, and per M0145-0011 the class is scale-dependent, so SF1 is worse.
+- **Route 2 (`pushQualsThroughSingleRefCTEs`, refs==1) is INAPPLICABLE** — all
+  three fires are MULTI-reference CTEs (ws x3, inv x2, year_total x4).
+- **The real prerequisite is a third thing neither route names**:
+  `examine_simple_variable`'s non-recursive-CTE arm
+  (`postgres/src/backend/utils/adt/selfuncs.c:5736-5870`) finds the CTE's
+  `subroot` via `cte_plan_ids` and RECURSES on the target-list `Var`, so PG
+  estimates `year_total.dyear` from `date_dim.d_year`'s real statistics and
+  never collapses. Port that and the arm can go.
 
-**Resume point if the owner files a follow-on**: the seam's pulled-leaf binding
-loop in `internal/optimizer/joinsearchseam.go` needs a `rangeBinding` for a
-leaf with no `Table`/`Alias` and an `estimateBaseRelInfo`/
-`applyRelSizeFallback` arm for a leaf with no catalog statistics; the adjacent
-`flat-leaf-not-scan` check is the third site to audit. Ledgered.
+**Carry this**: the regression is INVISIBLE to every value gate in the repo —
+values byte-identical, only plan shape and clock move. That is why
+`TestInitialRelRowsCTEFallbackGate` exists.
 
 ## Next step
 
-**M0145-0012** — retire the `rows<=1` CTE fallback. Its criterion (`derived >=
-guard effect`) can now lean on M0145-0011's evidence, but note what that
-evidence does and does NOT say: the firewall is measured inert-to-harmful at
-SF0.25 AND SF1; the `rows<=1` guard was NOT part of either A/B and is still
-untouched. Measure it on its own before removing anything.
+Re-read the banner and select from item 4 onward (item 3 is exhausted:
+0001-0007 `[x]`, 0008 blocked, 0009/0010/0011 done-or-escalated, 0012 `[!]`).
+Item 4 is **M0141-S2a-fix2r** — re-apply the PG-faithful `hashAggEntrySize`
+change discarded for parity reasons; degradations it causes are filed as their
+own tasks, never reverted (owner Q4).
+
+## Open owner escalations
+
+M0145-0012 (this one), M0145-0010 (both premises measured wrong),
+M0140-0007 (capability exists; label-only change declined), M0145-0008
+(cutover blocked on a measured timing regression).
 
 ## Traps carried forward
 
+- Value gates cannot see a cardinality regression; check plan shape + clock.
+- Flags are read once at process START — an A/B needs two server runs.
 - A knob-arm capture in the canonical results dir poisons the next default
-  sweep's baseline — always redirect `SF025_RESULTS_DIR`.
-- Both new flags are read once at process START — an A/B needs two server runs.
-- `GOOPG_PULLUP_CTE_LEAF=on` CHANGES PLANS while achieving nothing; a capture
-  that does not name it reads as a relaxation that works. It is registered in
-  flag provenance for exactly that reason.
+  sweep's baseline — redirect `SF025_RESULTS_DIR`.
 - Gate stamps hash the staged index — re-run a gate if code changed after it.
-- `..._arm_test.go` is silently excluded (`arm` is a GOARCH).
 
 ## Gates run
 
-units PASS; tpch-spotcheck PASS (Q12=2 Q13=33, flag line confirms
-`GOOPG_PULLUP_CTE_LEAF=unset(off)`); TPC-DS SF0.25 default arm PASS=96
-MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0 with plans 99/99 identical and
-verdict-changes=none; TPC-H acceptance arm 24 MATCH vs `tmp/arm-on-20260920.txt`;
-pre-commit pgbench smoke via the hook.
+units PASS; tpch-spotcheck PASS (Q12=2 Q13=33); TPC-DS SF0.25 default arm
+PASS=96 MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0, plans 99/99 identical,
+verdict-changes=none; TPC-H acceptance arm 24 MATCH; pgbench smoke via hook.
 
 ## In-flight
 
