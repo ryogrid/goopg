@@ -314,12 +314,16 @@ func (s *searchCtx) finalRel() (*RelOptInfo, error) {
 //
 // With no LIMIT (`tupleFraction == 0`) this returns `CheapestTotal` exactly,
 // which is what every caller would have got before.
+//
+// M0145-0019a: the fraction is only allowed to SELECT among paths that already
+// deliver `queryPathkeys` — see fractionalCandidatePathkeys for why, and for
+// the upstream rule this reproduces.
 func (s *searchCtx) finalPath() (*Path, error) {
 	rel, err := s.finalRel()
 	if err != nil {
 		return nil, err
 	}
-	p := getCheapestFractionalPath(rel, s.tupleFraction)
+	p := getCheapestFractionalPathOrdered(rel, s.tupleFraction, s.queryPathkeys)
 	if p == nil {
 		// setCheapest leaves every slot nil only for an empty pathlist, which
 		// joinSearch already rejects per level; reaching here means the final

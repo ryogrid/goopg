@@ -390,3 +390,71 @@ func getCheapestFractionalPath(rel *RelOptInfo, tupleFraction float64) *Path {
 	}
 	return best
 }
+
+// getCheapestFractionalPathOrdered is `get_cheapest_fractional_path` applied at
+// the place upstream applies it — after the ordering step — expressed at the
+// one seam goopg has for it.
+//
+// # The divergence this closes (M0145-0019, measured)
+//
+// PostgreSQL resolves the LIMIT fraction ONCE, on the FINAL upper rel:
+// `best_path = get_cheapest_fractional_path(final_rel, tuple_fraction)`
+// (`postgres/src/backend/optimizer/plan/planner.c:439`), where `final_rel` sits
+// above the ordered/grouped rels. By then a Sort, if one is needed, is already
+// a priced path, and its startup cost contains its whole input's total — so a
+// fast-start input has nothing left to win with. The input that gets sorted is
+// not a free choice either: `create_ordered_paths` takes
+// `input_rel->cheapest_total_path` (`planner.c:5314`) and `make_ordered_path`
+// (`planner.c:7646`+) returns NULL for any unsorted path that is not that one.
+// An ALREADY-sorted path needs no Sort, so it stays a candidate on its own
+// merits — that asymmetry is the whole rule.
+//
+// goopg resolved the fraction at the JOIN SEARCH ROOT instead, before any Sort
+// existed. TPC-DS Q78 at SF1 is what that costs: with f = 100/10317, the hash
+// join priced 16457.31..37659.80 scores 16662.82 fractionally and the nested
+// loop priced 5494.86..1147507.76 scores 16564.09, so the nested loop wins by
+// 0.6% — and is then handed to a Sort that must read every one of its rows,
+// turning that 0.6% into 30x. Both paths were generated and both accepted;
+// nothing was mispriced. The fault was only WHERE the question was asked.
+//
+// # What this function does
+//
+// When the statement wants an ordering (`queryPathkeys` non-empty), the
+// fraction may only displace the incumbent with a path that ALREADY satisfies
+// that ordering. A path that would need a Sort cannot win on startup cost,
+// because its startup cost is not what the statement would pay. When no path
+// satisfies the ordering, the answer is `CheapestTotal` — which is exactly the
+// path upstream would have sorted.
+//
+// With no ordering requested this is `getCheapestFractionalPath` unchanged, so
+// every LIMIT-without-ORDER-BY statement keeps the behaviour M0127-P5.7-b
+// landed.
+func getCheapestFractionalPathOrdered(rel *RelOptInfo, tupleFraction float64, queryPathkeys []PathKey) *Path {
+	if len(queryPathkeys) == 0 {
+		return getCheapestFractionalPath(rel, tupleFraction)
+	}
+	best := rel.CheapestTotal
+	if tupleFraction <= 0.0 || best == nil {
+		return best
+	}
+	if tupleFraction >= 1.0 && best.Rows > 0 {
+		tupleFraction /= best.Rows
+	}
+	for _, path := range rel.Pathlist {
+		if path.RequiredOuter != 0 || path == best {
+			continue
+		}
+		// The ordering gate. `best` itself is exempt from it: it is the
+		// incumbent because it is the cheapest-total path, i.e. the one
+		// `create_ordered_paths` would sort, so it represents the rel whether
+		// it is sorted or not.
+		if !pathkeysContainedIn(path.Pathkeys, queryPathkeys) {
+			continue
+		}
+		if compareFractionalPathCosts(best, path, tupleFraction) <= 0 {
+			continue
+		}
+		best = path
+	}
+	return best
+}

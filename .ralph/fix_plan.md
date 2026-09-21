@@ -15565,7 +15565,7 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
     - Deliverable filed below as **M0145-0019a** (S5: it names its expected
       movement and how it is measured).
 
-- [ ] **M0145-0019a — apply the LIMIT fraction at the final upper rel, not at
+- [x] **M0145-0019a — apply the LIMIT fraction at the final upper rel, not at
   the join search root** (the fix M0145-0019's recon names).
   Kind: impl
   Parent: M0145-0019
@@ -15587,6 +15587,50 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
   - On landing, re-run M0145-0018's fresh E1 at SF0.25 AND SF1 against the
     then-current `outer-over-derived` fire set (re-derive per run, do not reuse
     Q77/Q78) — M0145-0018 stays `[!]` until that passes.
+  - **LANDED 2026-09-22 (loop \#80).** Movement: none —
+    SF0.25 `CATEGORIES-EXCL-MATCH parameterisation` 55 -> 54 (one fewer
+    divergence, inside the ±3 band); TPC-H categories byte-identical.
+    Design: `docs/design/0100-0149/m0145-0019a-limit-fraction-ordering-gate.md`.
+    - `getCheapestFractionalPathOrdered` reproduces upstream's asymmetry at
+      goopg's one seam: with an ordering requested, the fraction may only be
+      won by a path that ALREADY satisfies it; when none does the answer is
+      `CheapestTotal`, which is the path `create_ordered_paths` would sort
+      (`planner.c:5314`, `:7646`+, already-sorted arm `:5337`+). With no
+      ordering requested it is the old function unchanged.
+    - `queryPathkeys` was already on `searchCtx` (PG's `root->query_pathkeys`),
+      so the rule needed no new plumbing.
+    - **The literal deliverable ("move the call to the upper-rel lattice") is
+      NOT expressible today** and the doc records why: `createOrderedPaths`
+      takes an already-lowered `Node`, not the join rel's pathlist, so there is
+      no pathlist up there to choose among — that is what **M0145-0007**
+      (single Path→Node lowering) exists to change. Reproducing the RULE at the
+      existing seam reaches the same answer without pre-empting 0007, and the
+      seam disappears with it.
+    - **Expected movement met**: Q78 at SF1 (private `:5562`, knob arm,
+      firewall off) goes `Nested Loop Left Join (cost=5494.86..1147565.07)` ->
+      `Hash Left Join (cost=16457.31..37717.11)`; the `Limit` estimate drops
+      `1147784.10..1147799.43` -> **`37936.15..37951.48`**, and the three
+      equi-conditions demoted to a `Join Filter` are join conditions again.
+    - Non-vacuity checked: neutralising the ordering gate fails exactly the two
+      arms that test it and leaves the control green. The control is
+      load-bearing — `LIMIT` with no `ORDER BY` must STILL pick the fast-start
+      path, or the change would be "ignore the fraction whenever there is an
+      ORDER BY", which is a different and wrong change. A third arm pins that a
+      path sorted the WRONG way does not win, so the gate cannot be reading
+      `len(Pathkeys) > 0`.
+    - **Plans moved, as this task predicted.** SF0.25: 6 shapes changed
+      (Q6, Q8, Q35, Q43, Q44, Q69), values identical
+      (`PASS=96 MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0`,
+      `verdict-changes=none runtime-moves=0 total-delta=+1.6%`). TPC-H: shapes
+      byte-identical, costs slightly lower (Q1 148207.10 -> 147979.67).
+    - **Floors held exactly**, and the figure matters: TPC-H parallel
+      `match=1` (Q6) is the floor **M0144-0001 re-pinned**, not AGENT.md's
+      older `>= 3` P0-E7 number — checking the re-pin is what kept this loop
+      from filing a false floor-breach escalation. TPC-DS SF0.25 `match=2`
+      (Q9, Q41).
+    - Gates: units; tpch-spotcheck Q12=2/Q13=33; tpcds-sf025 sweep; TPC-H
+      acceptance arm 24 MATCH; both parity captures taken with AND without the
+      change (G7 discipline); pgbench smoke.
 
 - [ ] **M0145-0020 — port `examine_simple_variable`'s non-recursive CTE
   arm** (`postgres/src/backend/utils/adt/selfuncs.c:5737-5912`) (owner GO
