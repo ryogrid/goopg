@@ -13242,6 +13242,34 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
       back to the pinned spine on BOTH arms.
     - Therefore slice 4 is blocked on **M0145-0003**, not on M0145-0005's
       clause distribution as the recon first assumed.
+    - **Blocker RE-TESTED (loop 2026-09-21 \#25) — it HOLDS, with a new
+      number.** The block was stated as a measured ratio and two
+      M0145-0003 changes landed after that measurement (the ANY arm and
+      the body-local-qual fix `fef25625d`), so the condition was
+      re-measured rather than carried forward.
+      - Knob arm: 291 pinned-spine / **17** jointree-pullup (was
+        294 / 5) — coverage 1.7% -> **5.5%**, 3.4x more pulled
+        conjuncts. Default arm: 207 / 0, byte-identical to before —
+        the control proving every movement is knob-arm only.
+      - Verdict UNCHANGED: 94.5% of sublink-planning events still take
+        the pinned spine, so the splice/re-resolution family cannot
+        retire here. The blocker no longer cites "under 2%"; it cites
+        5.5%.
+      - Of the 60 conjuncts the pull-up examines (vs 308 total events —
+        248 never reach it): 21 pulled, 15 `CTEScan` bodies, 15 scalar
+        `SubqueryExpr`, 6 nested-sublink, 3 residual. The 15 scalar
+        declines are CORRECT (PG has no `EXPR_SUBLINK` conversion).
+      - `PULLUPCLASSIFY` now fires ZERO refusals — the
+        `body-qual-not-consumable` class is gone, independently
+        confirming `fef25625d`.
+      - The one lever on this ratio is the CTEScan-body class (15),
+        whose blocker is B-06 = **M0145-0009**. Resume there, then
+        re-run this census and re-adjudicate slice 4.
+      - **Consequence for M0145-0008**: its text requires this task, so
+        the cutover is NOT selectable as written — even though BOTH of
+        its named TIMING blockers are now discharged (gap 1.06x).
+        Whether the flip can be split from the legacy-pipeline deletion
+        is a scoping decision for the banner's owner.
     - TRAP, recorded in the design doc: a plans capture taken under
       `GOOPG_JOINTREE_PIPELINE=1` lands in the same results directory the
       next DEFAULT sweep diffs against. The sweep after this census

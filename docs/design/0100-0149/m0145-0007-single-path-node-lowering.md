@@ -244,3 +244,69 @@ TPC-DS SF0.25 sweep + TPC-H acceptance arm, with the sweep's plan channel as
 the movement evidence. A lowering change is exactly the class the row-count
 anchors exist for, so a slice that moves a shape must name the statement and
 check it against the PG oracle, as M0145-0006's Q24 and Q51 moves were.
+
+
+## Slice-4 blocker RE-TESTED (2026-09-21, loop \#25)
+
+The conclusion above rests on a measured ratio, so it is re-testable — and two
+M0145-0003 changes landed after it was taken (the ANY arm, and the body-local-
+qual fix `fef25625d` that stopped `classifyPulledQuals` refusing any body whose
+WHERE carried a single-rel qual). Both increase pull-up coverage, so the
+blocker was re-measured rather than carried forward on trust.
+
+Same method, same corpus, both arms, private lanes (the trap below):
+
+| arm | corpus | pinned-spine | jointree-pullup | previously |
+|---|---|---|---|---|
+| default | TPC-DS SF0.25 plans | 207 | 0 | 207 / 0 — **unchanged** |
+| `GOOPG_JOINTREE_PIPELINE=1` | TPC-DS SF0.25 plans | 291 | **17** | 294 / **5** |
+
+The default-arm row is byte-identical to the earlier one, which is the control:
+every movement is knob-arm only, as the arm flag requires.
+
+The knob-arm row moved: pull-up coverage went from 5 of 299 events (1.7%) to
+17 of 308 (5.5%) — **3.4x more pulled conjuncts**. M0145-0003's landed work is
+real and measurable here.
+
+**The verdict is nevertheless unchanged.** 291 of 308 sublink-planning events
+(94.5%) still take the pinned spine, so `runJoinSearchBelowPinned` and its
+splice/re-resolution family remain live for almost the whole corpus and cannot
+retire at M0145-0007. What changes is the number the blocker cites: it is no
+longer "under 2%", it is 5.5%.
+
+### What the remaining fallbacks actually are
+
+The refined census separates the population the pull-up *examines* from the one
+it never sees. `PULLUPCENSUS` fires 60 times on the knob arm against 308
+`SUBLINKCENSUS` events, so 248 events never present a conjunct to the pull-up at
+all — those are the pinned spine's own domain (subplans and CTEs plan
+recursively) and no pull-up work can reach them.
+
+Of the 60 it does examine:
+
+| outcome | count | reading |
+|---|---|---|
+| `(pulled)` | **21** | succeeded |
+| `any-body-leaf-(*optimizer.CTEScan)` | 15 | the CTE-scan body blocker — B-06, filed as **M0145-0009** |
+| `SubqueryExpr` | 15 | scalar sublink — **correctly** declined; PG does not convert `EXPR_SUBLINK` either |
+| `any-nested-sublink` | 6 | needs subplan-internal rebasing (ledgered) |
+| `ExistsExpr` / `InExpr` | 2 / 1 | residual shapes |
+
+Two things follow. First, `PULLUPCLASSIFY` now fires **zero** refusals — the
+`body-qual-not-consumable` class that dominated before `fef25625d` is gone
+entirely, which is independent confirmation that the fix works. Second, the
+largest genuinely-convertible remainder is the CTEScan-body class (15), whose
+blocker is B-06 CTE-output statistics = **M0145-0009**. That is the lever on
+this ratio, and it is already filed and ordered.
+
+### Consequence for the M0145-0008 cutover
+
+M0145-0008's own text requires M0145-0007 ("the cutover must not retire the
+stage builders while upper-rel elections still live in them"). M0145-0007 stays
+blocked by this measurement, so the cutover **as written** is not selectable —
+even though both of its named TIMING blockers (the semijoin regression and Q17)
+are now discharged and the arm-vs-arm gap is 1.06x.
+
+Whether the cutover's two halves could be split — flip the default now, defer
+deleting the legacy pipeline until the pull-up covers more shapes — is a
+scoping decision for the banner's owner, not one this loop takes.
