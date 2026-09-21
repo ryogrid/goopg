@@ -12838,6 +12838,34 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
       acceptance arm 24/24 — every merge join those 121 statements bring
       to the seam is search-built and already stamped. The unit pins are
       the guarantee; the corpus is the no-regression channel only.
+    - Slice 3-partial (landed, loop 2026-09-21 \#13): the election sees
+      through a rename.
+    - `electOrderedGrouping` required the seam input to BE `agg.node`;
+      it now admits a chain of positional-identity `*Project`s
+      (`identityProjectChainTo`, sharing `projectIsPositionalIdentity`
+      with `inputNodePathkeys`' walk so the two routes agree on which
+      projections are transparent).
+    - The SPLICE is what needed pinning: the elected spec is copied back
+      onto `agg.node` in place, so the chain already carries it, but the
+      winner was BUILT over the bare aggregate — returning that node
+      drops the projection and publishes the aggregate's labels. A sort
+      winner is re-parented over the chain; a bare-aggregate winner
+      returns the chain.
+    - MEASURED FIRST (`dpTrace` probe, three shapes): the plain aliased
+      `GROUP BY … ORDER BY` already elected (its rename Project is added
+      ABOVE the ORDER BY stage), the subquery-rename shape has no
+      grouping surface in that scope at all, and the reachable decliner
+      is `Filter{Aggregate}` — HAVING. So the admitted Project case has
+      no witness among the probed shapes; report it as capability, not
+      movement.
+    - HAVING is NOT admitted with it, deliberately: `addOrderedPaths`
+      prices its sort arm from the input path's Rows/Cost, which for a
+      `PathAgg` are PRE-HAVING, while the normal `createOrderedPaths`
+      call it would replace prices from the finished `Filter` node.
+      Admitting the filter without pricing it swaps an accurate cost for
+      an optimistic one. PG has no gap here — HAVING quals live on the
+      `AggPath` (`create_agg_path`'s `qual`), so its pathlist entries
+      already carry post-HAVING rows. Ledgered with that resume point.
     - Deferred (ledger rows 2026-09-21):
       `electOrderedGrouping`'s `node != agg.node` precondition, and
       `electOrderedDistinct`'s `cands<2` gate (really a

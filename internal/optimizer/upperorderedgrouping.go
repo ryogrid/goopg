@@ -216,7 +216,16 @@ func electOrderedGrouping(u *upperRels, agg *aggregateSurface, node Node, keys [
 		}
 		return nil, false
 	}
-	if u == nil || len(keys) == 0 || agg == nil || agg.node == nil || node != agg.node {
+	if u == nil || len(keys) == 0 || agg == nil || agg.node == nil || node == nil {
+		return decline("gate-precondition")
+	}
+	// M0145-0006 slice 3: the input node no longer has to BE `agg.node` —
+	// it may be a chain of positional-identity `*Project`s over it. Anything
+	// else (a HAVING filter, a window stage, a min-max wrap, a ProjectSet
+	// re-wrap, a non-identity projection) still declines, so the relaxation
+	// is exactly the rename case and nothing wider.
+	wrapped := node != agg.node
+	if wrapped && !identityProjectChainTo(node, agg.node) {
 		return decline("gate-precondition")
 	}
 	grouped := fetchUpperRel(u, UpperGroupAgg, 0, tupleFraction)
@@ -253,10 +262,14 @@ func electOrderedGrouping(u *upperRels, agg *aggregateSurface, node Node, keys [
 	// Same input the normal call would size from (the finished aggregate
 	// node), so elected and declined paths size identically.
 	sizeUpperRelFromNode(ordered, agg.node)
-	// M0141-S2a-fix1-sweep-a: agg.node IS node (the gate above requires
-	// pointer equality), so the SAME keep-set the normal `createOrderedPaths`
-	// arm would narrow with applies unchanged here — sibling paths, same
-	// currency (pattern_sibling_paths_must_agree).
+	// M0141-S2a-fix1-sweep-a: the SAME keep-set the normal
+	// `createOrderedPaths` arm would narrow with applies unchanged here —
+	// sibling paths, same currency (pattern_sibling_paths_must_agree).
+	// M0145-0006 slice 3 keeps that true when `node` is a rename chain over
+	// `agg.node`: a positional-identity `*Project` publishes the same number
+	// of columns at the same positions, and `deriveOrderedSortInputKeep`
+	// (which the caller ran against `node`) names COLUMN POSITIONS, so the
+	// keep-set it produced addresses the same columns of `agg.node`.
 	narrowOrderedRelWidths(ordered, agg.node, narrowKeep)
 	savedPathlist := append([]*Path(nil), ordered.Pathlist...)
 	savedTotal, savedStartup, savedParam := ordered.CheapestTotal, ordered.CheapestStartup, ordered.CheapestParameterized
@@ -352,5 +365,62 @@ func electOrderedGrouping(u *upperRels, agg *aggregateSurface, node Node, keys [
 	// return covers the rest), as the aggregate stage does after
 	// grouping elects.
 	stampAggregateInputTarget(agg.node, nil)
+	if wrapped {
+		// M0145-0006 slice 3: the elected spec was copied back ONTO
+		// `agg.node` in place above, so the rename chain — whose bottom
+		// `*Project` still points at that same node — already carries it.
+		// What must not happen is returning `built`: its top was built over
+		// the BARE aggregate, and handing that to the caller would drop the
+		// projection and publish the aggregate's own column labels instead
+		// of the statement's.
+		//
+		// So the sort top (when the winner has one) is re-parented over the
+		// chain, and a bare-aggregate winner returns the chain itself. The
+		// re-parenting is coordinate-safe for the reason the chain was
+		// admitted at all: an identity projection re-assigns no position, so
+		// the sort keys — resolved by the caller against `node`'s schema and
+		// compared here against claims in `agg.node`'s — address the same
+		// columns on either side of it.
+		switch b := built.(type) {
+		case *Sort:
+			b.Child = node
+		case *IncrementalSort:
+			b.Child = node
+		default:
+			return node, true
+		}
+		return built, true
+	}
 	return built, true
+}
+
+// identityProjectChainTo reports whether `top` reaches `target` through
+// positional-identity `*Project`s only — M0145-0006 slice 3's admission rule
+// for `electOrderedGrouping`.
+//
+// The measured case is a pure RENAME: TPC-DS Q21 reaches the ordered seam as
+// `Project{Aggregate}` relabelling two aggregate outputs, which is why the
+// pointer-equality gate declined it (`inputNodePathkeys` had the same blind
+// spot until M0144-0011a-3 taught its walk the identity-Project descent; this
+// is the election-side twin of that fix).
+//
+// `projectIsPositionalIdentity` is the shared predicate, so the two routes
+// admit exactly the same projections — a wider rule here would let the
+// election see through a projection the walk still stops at, and the two would
+// then disagree about which plan the statement has.
+func identityProjectChainTo(top Node, target *Aggregate) bool {
+	if top == nil || target == nil {
+		return false
+	}
+	for n := top; n != nil; {
+		if a, ok := n.(*Aggregate); ok {
+			return a == target
+		}
+		p, ok := n.(*Project)
+		if !ok || !projectIsPositionalIdentity(p) {
+			return false
+		}
+		n = p.Child
+	}
+	return false
 }

@@ -1,7 +1,8 @@
 # Upper-rel pathlists (M0145-0006)
 
-Status: slices 1 (the order-delivering tops `inputNodePathkeys` swallowed)
-and 2 (the merge-join top) landed; slices 3-4 ledgered below. Task: `.ralph/fix_plan.md` M0145-0006.
+Status: slices 1 (the order-delivering tops `inputNodePathkeys` swallowed),
+2 (the merge-join top) and 3-partial (the election sees through a rename)
+landed; the rest of slice 3 and slice 4 are ledgered below. Task: `.ralph/fix_plan.md` M0145-0006.
 Parent: M0145-0005. Kind: impl.
 
 ## What the task is
@@ -173,6 +174,54 @@ merge on cost, and the census records 104 seam declines that take that route)
 but it is not exercised by a query in either benchmark, which is worth stating
 plainly rather than implying a measurement that did not happen. The unit pins
 are the guarantee here; the corpus is only the no-regression channel.
+
+## Slice 3 (partial) — what the election's pointer gate actually costs
+
+`electOrderedGrouping` declined `gate-precondition` whenever the ordered-seam
+input was not the aggregate node itself. The ledgered plan was to make the
+grouping surface name the REL instead of the node pointer. Measuring first
+changed the shape of the answer.
+
+### What the probe found
+
+A trace probe (`dpTrace`, three statement shapes through `PlanWithSettings`)
+measured which wrapper production actually puts between the aggregate and the
+ORDER BY stage:
+
+| statement | seam input | outcome |
+|---|---|---|
+| `select c as p, count(*) … group by … order by p` | IS `agg.node` (the rename Project is added ABOVE the ORDER BY stage) | already elected before this slice |
+| `select p, c from (select … group by …) t order by p` | no grouping surface in this scope at all | correctly declined — nothing to elect |
+| `… group by … HAVING … order by …` | `Filter{Aggregate}` | **still declines** |
+
+So the identity-`Project` case this slice admits is sound but has NO witness in
+the probed shapes, and the reachable decliner is the HAVING filter — which the
+function's own doc comment named all along.
+
+### What landed
+
+The see-through admission plus the splice it requires. `identityProjectChainTo`
+shares `projectIsPositionalIdentity` with `inputNodePathkeys`' walk, so the
+election and the walk cannot disagree about which projections are transparent.
+The splice is the part that needed pinning: the elected spec is copied back
+onto `agg.node` in place, so the chain already carries it, but the winner was
+BUILT over the bare aggregate — returning that node would drop the projection
+and publish the aggregate's labels instead of the statement's. A sort winner is
+therefore re-parented over the chain, and a bare-aggregate winner returns the
+chain itself.
+
+### Why the HAVING filter is not admitted with it
+
+Admitting it needs the filter PRICED, not merely stepped over.
+`addOrderedPaths` prices its `create_sort_path` arm from the input path's
+`Rows`/`Cost`, which for a `PathAgg` candidate are the aggregate's — pre-HAVING.
+The normal `createOrderedPaths` call this would replace prices from the
+finished `Filter` node, i.e. post-HAVING rows. Admitting the filter without
+modelling it would therefore swap an accurate cost for an optimistic one on
+every `GROUP BY … HAVING … ORDER BY` statement, which is the opposite of what
+the ORDERED rel exists for. PG has no such gap: its HAVING quals live ON the
+`AggPath` (`create_agg_path`'s `qual` argument), so every pathlist entry
+already carries post-HAVING rows. Ledgered with that as the resume point.
 
 ## Remaining slices (ledgered)
 
