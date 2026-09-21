@@ -20,6 +20,7 @@ import (
 	"testing"
 
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/parser"
 )
 
 // renameProjectOver is the measured shape: a pure relabel of every column, at
@@ -113,9 +114,6 @@ func TestElectOrderedGroupingStillDeclinesAWiderWrapper(t *testing.T) {
 	keys := []SortKey{{Expr: &ColumnRef{Index: 0, Name: "aliasa", Type: catalog.Type{Name: "bpchar"}}}}
 
 	cases := map[string]func(*Aggregate) Node{
-		"HAVING filter": func(a *Aggregate) Node {
-			return &Filter{pos: 0, Child: a, Predicate: &ColumnRef{Index: 0}}
-		},
 		"non-identity projection": func(a *Aggregate) Node {
 			p := renameProjectOver(a)
 			// Re-order the targets: positions ARE re-assigned, so a
@@ -142,5 +140,68 @@ func TestElectOrderedGroupingStillDeclinesAWiderWrapper(t *testing.T) {
 				t.Fatalf("the decline mutated the ORDERED rel: %d -> %d paths", before, len(after.Pathlist))
 			}
 		})
+	}
+}
+
+// --- slice 5: the HAVING filter, admitted WITH pricing ---------------------
+
+// TestElectOrderedGroupingElectsThroughAHavingFilter pins the admission and
+// the splice. The HAVING filter publishes its child's schema and removes rows
+// without reordering them, so a positional ordering claim from below survives
+// it — but the rows it removes have to be priced, which is what kept this case
+// out until the candidates carried the qual.
+func TestElectOrderedGroupingElectsThroughAHavingFilter(t *testing.T) {
+	u, agg, _ := q4ShapedGroupedRel(t)
+	having := &Filter{pos: 0, Child: agg.node, Predicate: &BinaryOp{
+		Op:    parser.OpGt,
+		Left:  &ColumnRef{Index: 1, Name: "count", Type: catalog.Type{Name: "int8"}},
+		Right: &IntegerConst{Value: 1},
+	}}
+	keys := []SortKey{{Expr: &ColumnRef{Index: 0, Name: "o_orderpriority", Type: catalog.Type{Name: "bpchar"}}}}
+
+	got, ok := electOrderedGrouping(u, agg, having, keys, 0, DefaultPlannerSettings().costParams(), 0, -1, nil)
+	if !ok || got == nil {
+		t.Fatal("a HAVING filter over the aggregate declined; want the election")
+	}
+	if got != Node(having) {
+		t.Fatalf("winner is %T; want the HAVING Filter itself — dropping it would return rows the statement filters out", got)
+	}
+	if having.Child != Node(agg.node) {
+		t.Fatal("the splice must leave the filter pointing at the updated aggregate")
+	}
+}
+
+// TestApplyHavingQualsToOfferIsCostAggsQualBlock pins the arithmetic itself:
+// the quals cost what they cost to evaluate over the emitted groups, and they
+// reduce the row estimate by their selectivity. Without both halves the
+// candidates would be priced over a row count the plan never produces.
+func TestApplyHavingQualsToOfferIsCostAggsQualBlock(t *testing.T) {
+	aggNode, _, _ := r47slice2GroupFixture()
+	cp := DefaultPlannerSettings().costParams()
+	qual := &BinaryOp{
+		Op:    parser.OpGt,
+		Left:  &ColumnRef{Index: 1, Name: "count", Type: catalog.Type{Name: "int8"}},
+		Right: &IntegerConst{Value: 1},
+	}
+
+	base := Path{Rows: 100, Cost: Cost{Startup: 10, Total: 50}}
+	offer := base
+	applyHavingQualsToOffer(&offer, []Expr{qual}, aggNode, cp)
+	if offer.Cost.Total <= base.Cost.Total {
+		t.Fatalf("total cost %v did not rise; the qual evaluation is not free", offer.Cost.Total)
+	}
+	if offer.Rows >= base.Rows {
+		t.Fatalf("rows %v did not fall; a HAVING qual removes groups", offer.Rows)
+	}
+	if offer.Rows < 1 {
+		t.Fatalf("rows %v below the clamp; clamp_row_est floors at 1", offer.Rows)
+	}
+
+	// No quals is a no-op — the unwrapped call path must be byte-identical.
+	same := base
+	applyHavingQualsToOffer(&same, nil, aggNode, cp)
+	if same.Rows != base.Rows || same.Cost != base.Cost {
+		t.Fatalf("no-qual call mutated the offer: rows %v cost %+v vs rows %v cost %+v",
+			same.Rows, same.Cost, base.Rows, base.Cost)
 	}
 }

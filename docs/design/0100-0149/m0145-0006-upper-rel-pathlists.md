@@ -2,8 +2,9 @@
 
 Status: slices 1 (the order-delivering tops `inputNodePathkeys` swallowed),
 2 (the merge-join top) and 3-partial (the election sees through a rename)
-and 4 (the DISTINCT election's candidate minimum) landed; the rest of
-slice 3 is ledgered below. Task: `.ralph/fix_plan.md` M0145-0006.
+4 (the DISTINCT election's candidate minimum) and 5 (the HAVING filter,
+priced) landed. The task's own residual gates are closed; what remains is
+ledgered below. Task: `.ralph/fix_plan.md` M0145-0006.
 Parent: M0145-0005. Kind: impl.
 
 ## What the task is
@@ -211,7 +212,7 @@ and publish the aggregate's labels instead of the statement's. A sort winner is
 therefore re-parented over the chain, and a bare-aggregate winner returns the
 chain itself.
 
-### Why the HAVING filter is not admitted with it
+### Why the HAVING filter could not be admitted with it (closed by slice 5)
 
 Admitting it needs the filter PRICED, not merely stepped over.
 `addOrderedPaths` prices its `create_sort_path` arm from the input path's
@@ -260,6 +261,54 @@ was redundant. Both corpora stay plan-identical (`same=99 changed=0`,
 acceptance 24/24) because neither benchmark runs a lone-candidate DISTINCT with
 an ORDER BY — the witness is the probe, and it is a real statement shape, not a
 constructed one.
+
+## Slice 5 — the HAVING filter, priced (landed)
+
+Slice 3 left the reachable case refused because admitting it without modelling
+the qual would have replaced an accurate cost with an optimistic one. Slice 5
+models it.
+
+`seeThroughChainTo` (which replaces slice 3's `identityProjectChainTo`) now
+also crosses `*Filter`s and RETURNS the quals it crossed. The filter itself is
+ordering-transparent — it publishes its child's schema and removes rows without
+reordering them, so a positional claim from below survives — but its predicate
+is not free, and `applyHavingQualsToOffer` prices it onto every candidate as
+PG's `cost_agg` does in its `if (quals)` arm:
+
+```
+total_cost   += qual_cost.startup + output_tuples * qual_cost.per_tuple;
+output_tuples = clamp_row_est(output_tuples * clauselist_selectivity(...));
+```
+
+goopg's `qualEvalCost` supplies the first line and the per-clause
+`clauseSelectivity` product the second. The ORDERED rel is now also sized from
+`node` (post-qual) rather than `agg.node`; the two are the same object whenever
+nothing wraps the aggregate, so the unwrapped path is unchanged.
+
+### Measured
+
+An A/B on `GROUP BY … HAVING … ORDER BY` through `PlanWithSettings` shows the
+route change with no shape change on that statement: `gate-precondition`
+decline before, `elected shape=Sort-over-Aggregate` after, same
+`Project -> Sort -> Filter -> Aggregate` plan. That is the grouping twin's
+M0144-0011a-2 result exactly — shape-inert, cost-different, because the Sort is
+now priced by `cost_sort` over a properly qual-priced candidate instead of by
+the fallback's `DeriveLegacyDisplayCost`.
+
+On the corpus it is not inert. TPC-DS SF0.25 moves two shapes, both HAVING
+statements, `PASS=96 MISMATCH=0`:
+
+- **Q24** — the real move, and a PARITY move. Before: `Sort` over
+  `HashAggregate` carrying `Filter: (sum(netpaid) > (InitPlan 1).col1)`. After:
+  `GroupAggregate` with that same Filter over a `Sort` of its input, and NO top
+  Sort — the sorted-aggregate candidate was elected because its emission order
+  already delivers the ORDER BY. PG 18.3 on the same dataset plans
+  `GroupAggregate … Filter: (sum(ssales.netpaid) > (InitPlan 2).col1)` with no
+  top Sort either.
+- **Q6** — cost-only (`35244.72..35244.74` to `35244.96..35244.98`): the
+  repricing, no shape change.
+
+TPC-H acceptance arm 24/24 MATCH, spotcheck Q12=2/Q13=33.
 
 ## Remaining slices (ledgered)
 

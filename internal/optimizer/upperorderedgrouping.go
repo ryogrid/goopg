@@ -219,14 +219,18 @@ func electOrderedGrouping(u *upperRels, agg *aggregateSurface, node Node, keys [
 	if u == nil || len(keys) == 0 || agg == nil || agg.node == nil || node == nil {
 		return decline("gate-precondition")
 	}
-	// M0145-0006 slice 3: the input node no longer has to BE `agg.node` —
-	// it may be a chain of positional-identity `*Project`s over it. Anything
-	// else (a HAVING filter, a window stage, a min-max wrap, a ProjectSet
-	// re-wrap, a non-identity projection) still declines, so the relaxation
-	// is exactly the rename case and nothing wider.
+	// M0145-0006 slices 3+5: the input node no longer has to BE `agg.node`.
+	// It may be a chain of positional-identity `*Project`s (a rename) and
+	// `*Filter`s (the HAVING quals) over it. A window stage, a min-max wrap,
+	// a ProjectSet re-wrap or a non-identity projection still declines.
 	wrapped := node != agg.node
-	if wrapped && !identityProjectChainTo(node, agg.node) {
-		return decline("gate-precondition")
+	var havingQuals []Expr
+	if wrapped {
+		qs, ok := seeThroughChainTo(node, agg.node)
+		if !ok {
+			return decline("gate-precondition")
+		}
+		havingQuals = qs
 	}
 	grouped := fetchUpperRel(u, UpperGroupAgg, 0, tupleFraction)
 	var cands []*Path
@@ -261,7 +265,12 @@ func electOrderedGrouping(u *upperRels, agg *aggregateSurface, node Node, keys [
 	ordered := fetchUpperRel(u, UpperOrdered, 0, tupleFraction)
 	// Same input the normal call would size from (the finished aggregate
 	// node), so elected and declined paths size identically.
-	sizeUpperRelFromNode(ordered, agg.node)
+	// M0145-0006 slice 5: size from the node the ORDER BY sort actually runs
+	// over, which with a HAVING filter in the chain is POST-qual. `node` is
+	// `agg.node` whenever nothing wraps it, so the unwrapped case is
+	// unchanged, and this is the same input the normal `createOrderedPaths`
+	// call would size from either way.
+	sizeUpperRelFromNode(ordered, node)
 	// M0141-S2a-fix1-sweep-a: the SAME keep-set the normal
 	// `createOrderedPaths` arm would narrow with applies unchanged here —
 	// sibling paths, same currency (pattern_sibling_paths_must_agree).
@@ -311,6 +320,7 @@ func electOrderedGrouping(u *upperRels, agg *aggregateSurface, node Node, keys [
 		// call shape blindly.
 		offer := *c
 		offer.Pathkeys = translated[i]
+		applyHavingQualsToOffer(&offer, havingQuals, agg.node, cp)
 		addOrderedPaths(ordered, &offer, sortKeys, cp, limitTuples)
 	}
 	// M0140-0006b-2: the upper-rel Gather reader (same funnel as
@@ -394,33 +404,84 @@ func electOrderedGrouping(u *upperRels, agg *aggregateSurface, node Node, keys [
 	return built, true
 }
 
-// identityProjectChainTo reports whether `top` reaches `target` through
-// positional-identity `*Project`s only — M0145-0006 slice 3's admission rule
-// for `electOrderedGrouping`.
+// seeThroughChainTo reports whether `top` reaches `target` through nodes the
+// ordered-level election may look past, and returns the HAVING quals it
+// crossed on the way — M0145-0006's admission rule for `electOrderedGrouping`.
 //
-// The measured case is a pure RENAME: TPC-DS Q21 reaches the ordered seam as
-// `Project{Aggregate}` relabelling two aggregate outputs, which is why the
-// pointer-equality gate declined it (`inputNodePathkeys` had the same blind
-// spot until M0144-0011a-3 taught its walk the identity-Project descent; this
-// is the election-side twin of that fix).
+// Two kinds are transparent, for two different reasons:
 //
-// `projectIsPositionalIdentity` is the shared predicate, so the two routes
-// admit exactly the same projections — a wider rule here would let the
-// election see through a projection the walk still stops at, and the two would
-// then disagree about which plan the statement has.
-func identityProjectChainTo(top Node, target *Aggregate) bool {
+//   - a positional-identity `*Project` (slice 3). The measured case is a pure
+//     RENAME. `projectIsPositionalIdentity` is shared with
+//     `inputNodePathkeys`' walk, so the election and the walk admit exactly the
+//     same projections — a wider rule here would let the election see through
+//     a projection the walk still stops at, and the two would then disagree
+//     about which plan the statement has.
+//   - a `*Filter` (slice 5), which is where the HAVING quals live. It
+//     publishes its child's schema and removes rows without reordering them,
+//     so a positional ordering claim from below survives it unchanged. Its
+//     predicate is NOT free, though: it is returned so the caller can price
+//     it onto every candidate, the way PG's `cost_agg` prices the `quals` it
+//     is handed.
+//
+// Anything else — a window stage, a min-max wrap, a ProjectSet re-wrap, a
+// projection that re-assigns positions — stops the walk and declines.
+func seeThroughChainTo(top Node, target *Aggregate) ([]Expr, bool) {
 	if top == nil || target == nil {
-		return false
+		return nil, false
 	}
+	var quals []Expr
 	for n := top; n != nil; {
 		if a, ok := n.(*Aggregate); ok {
-			return a == target
+			return quals, a == target
 		}
-		p, ok := n.(*Project)
-		if !ok || !projectIsPositionalIdentity(p) {
-			return false
+		switch t := n.(type) {
+		case *Project:
+			if !projectIsPositionalIdentity(t) {
+				return nil, false
+			}
+			n = t.Child
+		case *Filter:
+			if t.Child == nil {
+				return nil, false
+			}
+			quals = append(quals, splitAnd(t.Predicate)...)
+			n = t.Child
+		default:
+			return nil, false
 		}
-		n = p.Child
 	}
-	return false
+	return nil, false
+}
+
+// applyHavingQualsToOffer is PG's `cost_agg` qual block (costsize.c, the
+// `if (quals)` arm) applied to one candidate: the quals cost what they cost to
+// evaluate over the groups the aggregate emits, and they reduce the row count
+// by their selectivity.
+//
+//	total_cost += qual_cost.startup + output_tuples * qual_cost.per_tuple;
+//	output_tuples = clamp_row_est(output_tuples * clauselist_selectivity(...));
+//
+// Without this the candidates carried PRE-HAVING rows, which is why the HAVING
+// case could not be admitted at all before: `addOrderedPaths` prices its
+// `create_sort_path` arm from the input path's `Rows`/`Cost`, so stepping over
+// the filter without pricing it would have sorted-priced a row count the plan
+// never produces — replacing the accurate estimate the normal
+// `createOrderedPaths` call takes from the finished `*Filter` node with an
+// optimistic one.
+//
+// The selectivity is the per-clause product (`clauseSelectivity` against the
+// aggregate's output, which is the row shape the qual is evaluated on).
+// PG uses `clauselist_selectivity`, which additionally accounts for clause
+// correlation; goopg has no correlation model at this seam, and the product is
+// the approximation every other goopg qual estimate already uses.
+func applyHavingQualsToOffer(offer *Path, quals []Expr, aggNode *Aggregate, cp costParams) {
+	if offer == nil || len(quals) == 0 || aggNode == nil {
+		return
+	}
+	offer.Cost.Total += qualEvalCost(cp, len(quals), offer.Rows)
+	sel := 1.0
+	for _, q := range quals {
+		sel *= clauseSelectivity(q, aggNode)
+	}
+	offer.Rows = clampRowEst(offer.Rows * sel)
 }

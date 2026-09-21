@@ -12886,6 +12886,32 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
     - Both corpora stay plan-identical (SF0.25 `same=99 changed=0`,
       acceptance 24/24): neither benchmark runs a lone-candidate DISTINCT
       with an ORDER BY, so the probe is the witness here.
+    - Slice 5 (landed, loop 2026-09-21 \#15): the HAVING filter,
+      admitted WITH pricing — closing the residue slice 3 ledgered.
+    - `seeThroughChainTo` replaces `identityProjectChainTo`: it also
+      crosses `*Filter`s and RETURNS the quals it crossed. The filter is
+      ordering-transparent (same schema, removes rows without
+      reordering), but its predicate is priced onto every candidate by
+      `applyHavingQualsToOffer`, which is PG's `cost_agg` `if (quals)`
+      arm — `total_cost += qual_cost.startup + output_tuples *
+      qual_cost.per_tuple` then `output_tuples = clamp_row_est(
+      output_tuples * selectivity)`.
+    - The ORDERED rel is now sized from `node` (post-qual) rather than
+      `agg.node`; identical objects when nothing wraps the aggregate, so
+      the unwrapped path is byte-unchanged.
+    - A/B on a `GROUP BY … HAVING … ORDER BY` statement: decline
+      `gate-precondition` before, `elected shape=Sort-over-Aggregate`
+      after, SAME `Project -> Sort -> Filter -> Aggregate` shape — the
+      grouping twin's M0144-0011a-2 result (shape-inert, cost-different)
+      on that statement.
+    - CORPUS MOVEMENT, unlike slices 2-4: TPC-DS SF0.25 moves two
+      shapes, both HAVING statements, with `PASS=96 MISMATCH=0`.
+      **Q24 is a parity move** — `Sort{HashAggregate, Filter: sum(...) >
+      InitPlan}` became `GroupAggregate{Filter, Sort{...}}` with no top
+      Sort, and PG 18.3 on the same dataset plans
+      `GroupAggregate … Filter: (sum(ssales.netpaid) > (InitPlan 2).col1)`
+      with no top Sort either. **Q6** is cost-only
+      (`35244.72..35244.74` -> `35244.96..35244.98`).
     - Deferred (ledger rows 2026-09-21):
       `electOrderedGrouping`'s `node != agg.node` precondition, and
       `electOrderedDistinct`'s `cands<2` gate (really a
