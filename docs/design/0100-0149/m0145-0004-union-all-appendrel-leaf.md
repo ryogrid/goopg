@@ -491,3 +491,69 @@ has already been bitten there once — an unclaimed `PathSetOp` under a partial
 hash join made every worker replay the whole union (80/120/200 rows at
 workers=1/2/4 for a 40-row join). Any change here needs the same per-worker
 row-identity pin.
+
+
+## Pinned to one query, and a self-correction (2026-09-22, loop #86)
+
+The previous section said "the hoist fires and its paths are accepted". That is
+true **corpus-wide** (4 filings, all accepted) and it was wrong to carry it over
+to Q71: a single-query trace shows Q71 is not one of those four.
+
+### Q71 alone, knob arm, `GOOPG_PGSHAPED_DP_TRACE=1`
+
+One EXPLAIN on a private SF0.25 lane, so every DPPATH line belongs to this
+query. Both chain links file a partial path and both are accepted:
+
+```
+upper.setop.append.partial relids={0} rows=74  total=18936.41  accepted   <- inner link
+upper.setop.append         relids={0} rows=229 total=20963.42  accepted
+upper.setop.append.partial relids={1} rows=168 total=37279.17  accepted   <- OUTER link
+upper.setop.append         relids={1} rows=520 total=39336.25  accepted
+```
+
+So the outer link is NOT missing a partial path, and
+`LeftBranchRel`/`RightBranchRel`/`ConsiderParallel` — the fields the previous
+section sent the next loop to instrument — are all fine. **That hypothesis is
+refuted too.**
+
+### What is actually absent
+
+- **No `baserel.appendrel.partial` line appears in Q71's trace at all.** The
+  hoist does not fire for this query; the four corpus filings belong to others.
+- The inner link's partial path IS gathered (`gather relids={0}` rows=229
+  total=19959.31, which is the plan's inner `Gather`). The outer link's partial
+  path (total 37279.17) has **no Gather over it**, so the serial outer Append
+  (39336.25) is what the plan uses — even though gathering the partial would
+  have cost about 38300.
+
+So the chain is not the problem either: the outer link is fully formed and
+merely never reaches a consumer.
+
+### What is NOT the cause (measured, not assumed)
+
+`subqueryChainIsSimpleUnionAll` **accepts** Q71's union — probed directly on the
+parse tree, `from[1]: subquery, SetOp!=nil=true isSimpleUnionAll=true` — so the
+mark predicate is satisfied and `rangeBinding.appendrel` is set.
+
+### The one hypothesis left, to verify before changing anything
+
+`addAppendRelPartialPaths` requires `rel.baseLeaf` to BE the carrier: its own
+comment says any wrapper — `Filter`, `Sort`, `Limit`, `Project`, `LockRows` —
+disqualifies the leaf. Q71's subquery renames every column
+(`ws_ext_sales_price as ext_price`, …), so its root is plausibly a `*Project`
+over the `*SetOp`, which would fail the carrier lookup silently.
+
+That is a hypothesis, not a finding: check what `rel.baseLeaf`'s concrete type
+is for this leaf before touching the root check. Three hypotheses have now been
+refuted in a row on this residual, each by measuring one level deeper, so the
+cost of assuming here is well established.
+
+If it IS a `*Project`, the fix is not simply to admit `*Project`: the comment's
+reasoning (a wrapper "changes or decorates rows the hoisted partial emission
+cannot reproduce") holds for a row-changing Project but not for a pure
+rename/reorder. The distinction to implement is positional-identity vs
+computing — the same one `M0144-0011a-3` already drew for crossing a
+positional-identity `Project`.
+
+Evidence: `tmp/m0145-0004-q71-dppath.log` (the single-query trace) and
+`tmp/m0145-0004-q71-single-trace.plan`.

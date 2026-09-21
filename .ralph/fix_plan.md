@@ -13914,12 +13914,43 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
         disqualifying wrappers, but `setOpBranchPartialChainOK` ADMITS a
         nested set operation through its carrier check — M0144-0003b-1 added
         exactly that. The comment predates the code and is wrong.
-      - **The one measurement still missing**: why the OUTER link produces no
-        winning partial path. `addPartialSetOpPath` returns early unless
-        `setOpRel.LeftBranchRel` and `.RightBranchRel` are both non-nil and
-        both `ConsiderParallel`; for the outer link the right input is the
-        inner link's SETOP rel, so instrument whether that field is populated
-        for a nested-`*SetOp` input BEFORE changing anything.
+      - ~~**The one measurement still missing**: why the OUTER link produces
+        no winning partial path …~~ **TAKEN 2026-09-22 (loop \#86) and
+        REFUTED — the outer link DOES produce one.** Single-query trace
+        (Q71 alone, private SF0.25 lane, so every DPPATH line is this
+        query's):
+        - `upper.setop.append.partial relids={0} rows=74 total=18936.41
+          accepted` (inner link) and `relids={1} rows=168 total=37279.17
+          accepted` (**outer link**). `LeftBranchRel`/`RightBranchRel`/
+          `ConsiderParallel` are all fine.
+        - **SELF-CORRECTION**: loop \#85 wrote "the hoist fires and its
+          paths are accepted". True CORPUS-WIDE (4 filings) and wrong for
+          Q71 — **no `baserel.appendrel.partial` line appears in Q71's
+          trace at all**. A corpus count was generalised to one query; it
+          should not have been.
+        - The inner link's partial IS gathered (`gather relids={0}`
+          rows=229 total=19959.31 — the plan's inner `Gather`); the OUTER
+          link's partial (37279.17) has **no Gather over it**, so the plan
+          takes the serial outer Append (39336.25) although gathering the
+          partial would have cost about 38300.
+        - **NOT the cause** (probed on the parse tree, not assumed):
+          `subqueryChainIsSimpleUnionAll` ACCEPTS Q71's union
+          (`from[1]: SetOp!=nil=true isSimpleUnionAll=true`), so the mark
+          predicate is satisfied.
+      - **The one hypothesis left — verify before changing anything.**
+        `addAppendRelPartialPaths` requires `rel.baseLeaf` to BE the
+        carrier; its comment disqualifies any wrapper (`Filter`, `Sort`,
+        `Limit`, `Project`, `LockRows`). Q71's subquery renames every column
+        (`ws_ext_sales_price as ext_price`, …), so its root is plausibly a
+        `*Project` over the `*SetOp`, which would fail the carrier lookup
+        silently. **Check `rel.baseLeaf`'s concrete type first** — three
+        hypotheses have now been refuted in a row on this residual, each by
+        measuring one level deeper.
+        - If it IS a `*Project`, the fix is NOT simply to admit `*Project`:
+          the comment's reasoning holds for a row-changing Project but not
+          for a pure rename/reorder. The distinction to implement is
+          positional-identity vs computing — the same one **M0144-0011a-3**
+          already drew for crossing a positional-identity `Project`.
       - **Risk to carry into the fix**: admitting a nested streaming Append
         under one Gather means two levels of block claim cooperating across
         workers, and this task has already been bitten there once (an

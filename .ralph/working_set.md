@@ -1,57 +1,52 @@
 (idle — nothing in flight)
 
-# Loop #85 — M0145-0004 residual NARROWED; last loop's 3 candidates all refuted
+# Loop #86 — M0145-0004 residual PINNED to one missing consumer (3rd hypothesis refuted)
 
 Banner unchanged; 0018 owner-blocked → chain stays at **M0145-0004** (`[ ]`).
 Recon: no `internal/`/`cmd/` file touched (C1). Movement: none.
 Design: `docs/design/0100-0149/m0145-0004-union-all-appendrel-leaf.md`,
-final section ("Narrowing it further").
+final section ("Pinned to one query, and a self-correction").
 
-## All three candidates from loop #84 are REFUTED
-SF0.25 knob-arm DP trace: `baserel.appendrel.partial` **4 paths, every one
-`verdict=accepted`**; `upper.setop.append.partial` 11, `.mixed` 3. The mark,
-the partial SetOp paths and the hoist ALL work. So it is not
-`addBaseRelGatherPaths`, not `upperSplitWorkers`, not the member search root.
+## ⚠ SELF-CORRECTION of loop #85
+"The hoist fires and its paths are accepted" is true CORPUS-WIDE (4 filings)
+and **false for Q71** — no `baserel.appendrel.partial` line in Q71's trace at
+all. A corpus count was generalised to one query. Don't do that again.
 
-## The real shape — the CHAIN STAYS NESTED
-Q71's union has THREE members:
+## Single-query trace (Q71 alone, private SF0.25 lane) — the facts
 ```
-goopg: Append{ Gather{Append{ws, cs}},  Gather{store_sales} }
-PG:    Gather{ Parallel Append{ ws, cs, store_sales } }
+upper.setop.append.partial relids={0} rows=74  total=18936.41 accepted  inner
+upper.setop.append.partial relids={1} rows=168 total=37279.17 accepted  OUTER
+gather                     relids={0} rows=229 total=19959.31 accepted  <- inner gathered
+(no gather over relids={1}'s partial; no baserel.appendrel.partial at all)
 ```
-The INNER link of the right-leaning `SetOp(A, SetOp(B,C))` gets the parallel
-Append + hoist; the OUTER link does not, so its inputs are gathered separately
-and appended serially. PG's `is_simple_union_all_recurse` walks `larg` AND
-`rarg` into ONE appendrel → one partial Append over all members.
-**Divergence = chain-flattening DEPTH. Gather placement is the symptom.**
+So loop #85's hypothesis (outer link wins no partial path / branch rels unset)
+is **REFUTED**: the outer link's partial exists and is accepted.
+Plan takes the serial outer Append (39336.25) though gathering the partial
+would have cost ~38300.
 
-## ⚠ A STALE COMMENT that would have misdirected the fix
-`addPartialSetOpPath`'s prose lists "a nested `*SetOp`" as a disqualifying
-wrapper. **The code disagrees**: `setOpBranchPartialChainOK` ADMITS a nested
-set operation via its carrier check (M0144-0003b-1 added exactly that). Prose
-predates code. Do not trust it.
+## Also measured, NOT assumed
+`subqueryChainIsSimpleUnionAll` ACCEPTS Q71's union (probed on the parse tree:
+`from[1]: SetOp!=nil=true isSimpleUnionAll=true`) → the mark predicate is fine.
 
-## THE ONE MEASUREMENT STILL MISSING — take it first
-Why the OUTER link wins no partial path. `addPartialSetOpPath` returns early
-unless `setOpRel.LeftBranchRel` AND `.RightBranchRel` are non-nil and both
-`ConsiderParallel`. For the outer link the right input is the inner link's
-SETOP rel → **instrument whether that field is populated for a nested-`*SetOp`
-input BEFORE changing anything.** Three guessed candidates were already wrong.
-
-## Risk to carry into the fix
-Two levels of block claim cooperating across workers. This task was bitten
-there once: an unclaimed `PathSetOp` under a partial hash join made every
-worker replay the whole union (80/120/200 rows at workers=1/2/4 for a 40-row
-join). Needs the same per-worker row-identity pin.
+## THE ONE HYPOTHESIS LEFT — check the TYPE first, do not code
+`addAppendRelPartialPaths` requires `rel.baseLeaf` to BE the carrier and
+disqualifies any wrapper (Filter/Sort/Limit/Project/LockRows). Q71's subquery
+renames every column, so its root is plausibly a **`*Project` over the
+`*SetOp`** → carrier lookup fails silently.
+**Check `rel.baseLeaf`'s concrete type for this leaf FIRST.** Three hypotheses
+refuted in a row; the cost of assuming a fourth is established.
+If it IS a `*Project`: do NOT blanket-admit `*Project`. The wrapper rule is
+right for a row-CHANGING Project. Implement positional-identity vs computing —
+**M0144-0011a-3 already drew that exact distinction**.
 
 ## Gates
 Recon, zero production diff → no value gates (C1). state guard OK; pgbench
-smoke via the commit hook. Reused existing logs/captures; no new lane.
+smoke via the commit hook. Lane stopped, `/tmp/q71lane` removed, 5565 free.
+Evidence kept: `tmp/m0145-0004-q71-dppath.log`, `…-q71-single-trace.plan`.
 
-## ⚠ LINEAGE BLOCKER STILL OPEN (from loop #84)
-No new task can be filed under root M0145-0001 — guard refuses, and its remedy
-(mark root `[!]`) contradicts the owner's 2026-09-22 re-open. Findings go
-inside existing tasks until the owner re-pins the baseline. Do NOT mark `[!]`.
+## ⚠ LINEAGE BLOCKER STILL OPEN
+No new task can be filed under root M0145-0001. Findings go inside existing
+tasks until the owner re-pins the baseline. Do NOT mark the root `[!]`.
 
 ## Owner escalations — four open, unchanged
 partition_aggregate inventory row; template1 collision (A vs B); M0145-0018
