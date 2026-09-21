@@ -1,7 +1,9 @@
 # Cutover readiness: the arm-vs-arm timing A/B (M0145-0008)
 
 Status: measurement landed 2026-09-21; the semijoin blocker is FIXED the same
-day (see "The fix, measured" below) and the cutover now blocks on Q17 alone.
+day (see "The fix, measured") and Q17 — the last blocker — is ATTRIBUTED to its
+mechanism the same day (see "Q17 ATTRIBUTED"). The cutover now blocks on one
+named, understood defect.
 Task: `.ralph/fix_plan.md` M0145-0008. Parent: M0145-0007 (whose NLI census
 raised the question). Kind: recon.
 
@@ -262,3 +264,87 @@ Two prerequisites, both filed:
 The comparison is only meaningful with the binary and engine-id pinned, as
 above — the arm prints both, and a run whose `engine-binary` differs from its
 counterpart is measuring two trees, not two arms.
+
+
+## Q17 ATTRIBUTED (2026-09-21): the probe-cheap guard is fed an un-optimized body
+
+The previous note recorded Q17's 20x as "a DIFFERENT mechanism … unattributed",
+and the baton's working guess was that the arms should be plan-identical for a
+shape neither sublink route rewrites. **Both were wrong.** The arms diverge,
+and they diverge inside the correlated scalar subquery itself.
+
+### The measurement
+
+One private clone (`tmp/goopg-spotcheck-tpch-data`), one capped server per arm,
+serial (`max_parallel_workers_per_gather = 0`), only `GOOPG_JOINTREE_PIPELINE`
+differing. Both arms return the identical value `310077.312857142857`.
+
+| | default (**1021 ms**) | knob (**11155 ms**) |
+|---|---|---|
+| top shape | `Nested Loop`, `Filter: l_quantity < (SubPlan 1)` | `Hash Join`, `Filter: l_quantity < (0.2 * avg)` |
+| the sublink | correlated `SubPlan 1`, bitmap probe per outer row | **decorrelated** into `HashAggregate` over a full `Seq Scan` of lineitem (6,001,988 rows) |
+| estimated cost | **32301** | **224656** |
+
+Note the costs: the knob arm elects a plan its OWN model prices at 7x the
+default arm's. The cheap correlated plan is therefore not out-costed — it is
+never generated. That is the same failure class as Q4, reached by a different
+road.
+
+### Which arm is right: PG keeps the SubPlan
+
+PG 18.3 on the same data plans Q17 as `Hash Join` with
+`Join Filter: (l_quantity < (SubPlan 1))` and `SubPlan 1` = `Aggregate` over a
+`Bitmap Heap Scan` on `lineitem_part_supp_fkidx`. PG does not convert
+`EXPR_SUBLINK` at all. So the **default arm is PG-faithful and the knob arm
+diverges** — the regression is a fidelity defect as well as a timing one.
+
+### Root cause: the guard is intact, its INPUT is not
+
+`canUnnestSubquery` (`internal/optimizer/unnest.go`) carries the S6/D6.2
+selectivity-aware policy whose own comment cites this very query — "decorrelating
+a scalar whose inner plan is already an index-probe shape is a LOSS … Q17
+58.27 s -> 86.65 s". It enforces that with `innerPlanIsIndexProbeCheap(sub.Plan)`.
+
+Instrumenting the guard (temporary probe, both arms, same statement):
+
+```
+jt=0  shape=Project(Aggregate(BitmapHeapScan(BitmapIndexScan)))  probeCheap=true   -> refuses
+jt=1  shape=Project(Aggregate(Filter(SeqScan)))                  probeCheap=false  -> unnests
+```
+
+The guard is correct and unchanged; the two arms hand it **different plans for
+the same subquery body**. On the jointree arm the body arrives with the
+correlation predicate still sitting in a `Filter` over a `SeqScan` — it has not
+been turned into an index probe — so a shape test that means "is this body
+already cheap to rescan?" answers "no" about a body that is demonstrably cheap
+to rescan (the default arm proves the index probe exists for it).
+
+This is the structural lesson of M0145-0003 repeating in a second place: **a
+decision taken on a provisional body shape is wrong whenever the provisional
+shape is not the final one.** `innerPlanIsIndexProbeCheap` is a shape predicate
+being used as a cost proxy, and it is only sound once index selection has run
+on the body.
+
+### The fix is NOT in this loop, deliberately
+
+`unnest.go` is shared by BOTH arms — it is the default (shipping) pipeline's
+code. Any change to the guard (for instance, deciding probe-cheapness from
+whether the correlation qual is index-supported in the catalog, rather than
+from whether the node is already an `*IndexScan`) changes a predicate the
+default arm consults for every correlated scalar in the corpus. That earns its
+own loop and its own full value gates, not an append to an attribution.
+
+Two candidate directions, in preference order:
+
+1. **Make the knob arm hand the guard the same body the default arm does** —
+   i.e. run the body's index selection before the unnest decision on the
+   jointree route. This leaves the shared guard untouched and is therefore the
+   lower-blast-radius option; it is also the one that makes the arms agree by
+   construction rather than by a second heuristic.
+2. **Make the guard independent of the body's current shape** — ask the catalog
+   whether the correlation column is indexed. Higher fidelity, but it changes
+   default-arm behaviour and needs the full TPC-H/TPC-DS value + timing set.
+
+Direction 1 is recommended: it is the arm-local fix, and the M0145-0003
+precedent is that the placement/selection machinery already exists and the
+divergence is in what reaches it.

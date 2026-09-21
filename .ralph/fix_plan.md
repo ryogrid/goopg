@@ -13297,6 +13297,37 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
       value gate green. Two prerequisites are filed: the semijoin NLI
       cost comparison (log the filed-vs-winning path costs at `addPath`
       for Q4/Q20/Q21) and Q17's mechanism.
+    - **Both prerequisites are now discharged as diagnoses (2026-09-21).**
+      - The semijoin one is FIXED, not merely answered: `fef25625d`
+        (M0145-0003, body-local quals are base restrictions) took Q4
+        12.98s -> 1.02s and Q21 18.94s -> 2.12s, knob-arm total
+        102.46s -> 77.37s, arm-vs-arm gap 1.64x -> 1.24x, values
+        unchanged. The reading that `add_path` out-costs the NLI was
+        itself wrong and is retired in the design doc.
+      - **Q17 is ATTRIBUTED (this loop), and the note above it is
+        wrong**: the arms are NOT plan-identical. Serial A/B on one
+        clone, identical values — default 1021 ms keeps PG's shape
+        (`Filter: l_quantity < (SubPlan 1)`, est. cost 32301); the knob
+        arm decorrelates into a `HashAggregate` over a full
+        6,001,988-row `Seq Scan` (est. cost 224656, i.e. goopg's own
+        model prices the elected plan at 7x the default's, so the cheap
+        candidate is never GENERATED — the Q4 failure class again). PG
+        18.3 keeps the `SubPlan`, so the knob arm is the unfaithful one.
+      - Mechanism, measured by instrumenting `canUnnestSubquery`'s
+        S6/D6.2 guard on both arms: the guard is intact, but the arms
+        hand it different bodies —
+        `Project(Aggregate(BitmapHeapScan(BitmapIndexScan)))`
+        probeCheap=true (refuses) vs
+        `Project(Aggregate(Filter(SeqScan)))` probeCheap=false
+        (unnests). `innerPlanIsIndexProbeCheap` is a SHAPE predicate
+        used as a cost proxy, and it is sound only after index
+        selection has run on the body.
+      - Fix deferred to its own loop ON PURPOSE (ledgered): `unnest.go`
+        is shared with the DEFAULT shipping pipeline, so touching the
+        guard is a default-arm plan-shape change needing the full value
+        + timing gate set. Recommended direction is arm-local — have
+        the jointree route select the body's index path before the
+        unnest decision, so both arms hand the guard the same body.
 - [ ] **M0145-0009 — CTE-output statistics (B-06 resume): wire the landed
   synthesis into the estimator** (filed 2026-09-21 by owner directive;
   carries TODO_ALL B-06 / ledger `take3-B-06-deferred`). Three of this
