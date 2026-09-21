@@ -47,9 +47,14 @@ lowering replaces the interleaved stage-builder resolutions.
 | M0145-0006 | impl | Upper-rel pathlists (grouping/ordered/window/distinct elections over candidate sets); absorbs M0144-0011a's residual gates |
 | M0145-0007 | impl | Single Path→Node lowering pass (create_plan analogue) consolidating all post-election resolution |
 | M0145-0008 | impl | Cutover: default flip, full gate suite on the new pipeline, legacy pipeline + dead guard deletion, executor-substrate handoff list |
+| M0145-0009 | impl | CTE-output statistics (B-06 resume — TODO_ALL B-06 / ledger `take3-B-06-deferred`): wire the landed inert synthesis (`cte_stats_synthesis.go`, design `docs/design/planner-b06-cte-stats/`) into the estimator. On completion the blocked unlifts are RE-EVALUATED, not auto-done: `flattenPulledBodyTree`'s bare-`*SeqScan` rule (0003's ANY-CTE residue), the `outer-over-derived` firewall (its own named resume condition — owner hard constraint, ambiguous evidence escalates), and the `rows<=1` guard |
 
 Dependencies: 0001 → {0003, 0004} → 0005 → {0006, 0007} → 0008.
 0002 is independent and should land early so every later task is measurable.
+0009 is independent of the flow work (it is a statistics task, not a flow
+task); it is sequenced last so its estimates land on the cutover pipeline,
+but nothing in 0003–0008 is gated on it — the three consumers only need it
+before their own unblocks are re-evaluated.
 
 ## Handoffs from M0137–M0144
 

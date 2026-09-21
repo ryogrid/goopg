@@ -52,7 +52,11 @@ the order written inside the item. `[!]` tasks are not selectable.
    step 2) → **M0145-0004** (appendrel) → **M0145-0005** (single-pass DP;
    retires Phase A/B + pinned spine) → **M0145-0006** (upper-rel
    pathlists; absorbs the M0144-0011a residual gates) → **M0145-0007**
-   (unified lowering) → **M0145-0008** (cutover). The Q78
+   (unified lowering) → **M0145-0008** (cutover) → **M0145-0009**
+   (B-06 CTE-output statistics — the blocker named by 0003's ANY-CTE
+   residue, 0005's `outer-over-derived` decline family, and the Q78
+   firewall's own resume condition; completing it triggers a
+   RE-EVALUATION of those unblocks, not automatic lifts). The Q78
    `outer-over-derived` firewall is a hard constraint on every
    pull-up/flattening task.
 4. **M0141-S2a-fix2r** — re-apply the PG-faithful `hashAggEntrySize` change that
@@ -12573,7 +12577,8 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
     - So this bucket is blocked on **B-06 (CTE-output statistics)**, the
       same blocker M0145-0005 slice 5 and M0145-0006 recorded for
       `outer-over-derived`. Building the opaque-body arm would not move
-      it.
+      it. (B-06 is filed as **M0145-0009**; its completion note names the
+      bare-`*SeqScan` relaxation as a sanctioned re-evaluation.)
     - The remaining actionable ANY bucket is `any-nested-sublink` (6):
       PG recurses `pull_up_sublinks` into a pulled body's own quals
       (`pull_up_sublinks_qual_recurse`); goopg does not.
@@ -12893,8 +12898,10 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
       `outer-on-qual`/`inner-on-qual-*` have ZERO corpus witnesses —
       retired by absence, no decline class left to migrate.
       `outer-over-derived` stays (B-06 CTE-output-stats firewall,
-      R42/Q78); `lateral` stays (real deps Q30/Q68 — needs
-      parameterized-path legality, a project of its own).
+      R42/Q78 — B-06 is filed as **M0145-0009**; its completion note
+      carries the firewall's re-evaluation checklist); `lateral` stays
+      (real deps Q30/Q68 — needs parameterized-path legality, a project
+      of its own).
     - `leaf-count` dominant cause identified by joinlist-vs-bindings
       probe: FULL-join folds (opaque leaf covering multiple joinlist
       rels, `a FULL b JOIN c` → nprefix 3, scans 2) — the
@@ -13198,3 +13205,83 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
   builders while upper-rel elections still live in them.
   Kind: impl
   Parent: M0145-0007
+  - **BLOCKED by a measured timing regression (loop 2026-09-21 \#27).**
+    Design doc:
+    `docs/design/0100-0149/m0145-0008-cutover-readiness-timing-ab.md`.
+    - Every gate in this milestone compares VALUES, and the two arms are
+      value-identical (acceptance arm 24/24 on both), so a cost
+      misjudgement is invisible to all of them. Runtime is the only
+      channel that can see one — which is why this A/B exists.
+    - Two acceptance-arm runs, TPC-H SF1, serial, fresh capped server
+      each, **identical engine-id and binary** (`3e61809f585fd51c`), the
+      only difference being `GOOPG_JOINTREE_PIPELINE`.
+    - The pipeline is timing-NEUTRAL on 19 of 24 labels (within ±10%).
+      The entire 1.64x total is four sublink queries:
+      **Q4 35.1x** (0.37s -> 12.98s), **Q20 27.5x** (0.13s -> 3.58s),
+      **Q17 20.0x** (0.38s -> 7.61s), **Q21 7.2x** (2.63s -> 18.94s).
+      **Q22 0.8x** is the control — being a sublink query is not
+      sufficient to regress.
+    - Q4/Q20/Q21 are the semijoins M0145-0007 traced: the search files
+      an NLI path (`gate=filed`) and `add_path` out-costs it, and the
+      plan it prefers instead runs 7-35x slower. That ANSWERS the
+      ledgered cost question — the preference is not merely unvalidated,
+      it is wrong wherever it fires.
+    - Q17 is a correlated SCALAR subquery the pull-up does not touch
+      (PG does not convert `EXPR_SUBLINK` either), so its 20x is a
+      DIFFERENT, unattributed mechanism — do not fold it into the
+      semijoin story.
+    - Flipping the default today would make TPC-H 1.64x slower with every
+      value gate green. Two prerequisites are filed: the semijoin NLI
+      cost comparison (log the filed-vs-winning path costs at `addPath`
+      for Q4/Q20/Q21) and Q17's mechanism.
+- [ ] **M0145-0009 — CTE-output statistics (B-06 resume): wire the landed
+  synthesis into the estimator** (filed 2026-09-21 by owner directive;
+  carries TODO_ALL B-06 / ledger `take3-B-06-deferred`). Three of this
+  milestone's residuals are blocked on derived-input statistics: the ANY
+  arm's `body-leaf-(*optimizer.CTEScan)` residue (15 fires, M0145-0003),
+  the `outer-over-derived` decline family (12 corpus fires, M0145-0005
+  slice 5), and the Q78 firewall's own named resume condition
+  (`relfromjoinlist.go:724-725` — "lift when B-06 wires CTE-output stats").
+  Scope per the ledger's 4-step resume:
+  - (1) Design exists and is reviewed:
+    `docs/design/planner-b06-cte-stats/DESIGN.md`. The synthesis slice is
+    already landed INERT (`internal/optimizer/cte_stats_synthesis.go` —
+    group-key / aggOut-FD / union-literal rules + 16 tests, no consumers
+    wired, so it cannot change a plan today).
+  - (2) Wire consumers: per-column ndistinct from the group combo clamped
+    by output rows; the FD bound for agg outputs; the OID-less registry
+    (DESIGN §G2) so `*CTEScan` leaves actually receive the synthesized
+    stats in `EstimateRows`/selectivity.
+  - (3) Measure before trusting: EA ratchet on the `year_total` shapes
+    (Q74; Q4/Q11 share that CTE — Q78's CTEs are `ws`/`cs`/`ss`), the
+    SF0.25 sweep, and the TPC-H acceptance arm — stats
+    wiring is pipeline-agnostic, so the DEFAULT arm is gated too, not
+    only the knob arm; report `CATEGORIES-EXCL-MATCH` and any plan
+    movement explicitly.
+  - (4) The `rows<=1` guard (`joinsearch.go:520-526`, `initialRelRows`) and the Q78
+    firewall stay UNTOUCHED inside this task — the ledger's criterion is
+    "guard removal only after derived ≥ guard effect", and the firewall
+    is a hard owner constraint.
+  Fail-closed throughout: an unrecognized body shape yields
+  `cteColUnknown` and today's defaults, never a guess.
+  Kind: impl
+  Parent: none
+  - **On completion — reconsider the blocked work (evaluate, do not
+    auto-do):**
+    - `flattenPulledBodyTree`'s bare-`*SeqScan` rule (M0145-0003 ANY
+      residue): the ledger already sanctions this step — once a
+      `*CTEScan` leaf carries row/width estimates, relax the rule and
+      re-run the knob-arm sweep. File as its own task if the work is
+      more than the rule relaxation.
+    - `outer-over-derived` firewall (`relfromjoinlist.go`, 12 corpus
+      fires): evaluate whether the named resume condition is genuinely
+      met — derived estimates must now out-rank the defaults AND a live
+      Q78 run must show the ~19 s shape holds (the C-04a regression
+      class is 15 s -> 327 s). Owner hard constraint: if the evidence is
+      ambiguous, ESCALATE rather than lift; a clean lift is itself a
+      separate task.
+    - The `rows<=1` guard (`joinsearch.go:520-526`, `initialRelRows`): same criterion —
+      removal only after derived estimates demonstrably reach the
+      guard's effect on the year_total shapes (ledger step 4).
+    - Re-run the pull-up/seam decline census afterwards so the residual
+      buckets reflect the new state.

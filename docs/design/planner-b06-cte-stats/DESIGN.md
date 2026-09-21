@@ -14,7 +14,7 @@ statistics, so `filterSelectivity` charges `defaultEqSelectivity`
 (0.005) per conjunct: 4 conjuncts over 2-valued columns →
 `0.005⁴×17977 ≈ 0.000011`, collapsing to 1 row and making nested
 loops look free. The `rows<=1` guard
-(`internal/optimizer/joinsearch.go:470-476`) falls back to the
+(`internal/optimizer/joinsearch.go:520-526`, `initialRelRows`'s `rows<=1` arm) falls back to the
 unfiltered `EstimateRows(cte.Child)` — load-bearing, removal reverts
 the win.
 
