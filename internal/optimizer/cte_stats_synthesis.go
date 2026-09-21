@@ -31,6 +31,12 @@ const (
 	cteColGroupKey
 	cteColAggOut
 	cteColLiteral
+	// cteColPassthrough is an output column a row-preserving body hands
+	// through from its own input unchanged — today only a `*WindowAgg`'s
+	// child columns. It is NOT the same claim as the others: a group key is
+	// a SUBSET of its input's values, whereas a pass-through column is the
+	// input's values exactly, so its ndistinct is an equality, not a bound.
+	cteColPassthrough
 )
 
 // cteOutputColStats is the synthesized per-column record. ndistinct < 0
@@ -65,6 +71,7 @@ func synthesizeCTEStats(entry *plannedCTE) *cteOutputStats {
 		return out
 	}
 	synthAggregateOutputs(out, entry)
+	synthWindowOutputs(out, entry)
 	synthUnionLiterals(out, entry)
 	return out
 }
@@ -158,6 +165,84 @@ func groupKeyNDistinct(groupExpr Expr, child Node, groups float64) float64 {
 		return -1
 	}
 	return nd
+}
+
+// synthWindowOutputs fills pass-through records when the body is a
+// (possibly Project-wrapped) `*WindowAgg`.
+//
+// M0145-0009 slice 3. This is the largest unknown population the slice-1
+// census found: `Project(WindowAgg)` bodies accounted for 366 of the 648
+// unclassified asks per TPC-DS SF0.25 run, 56% of them, with no rule at all.
+//
+// The rule is unusually strong, and the reason is worth stating. A WindowAgg
+// is ROW-PRESERVING — it emits exactly one output row per input row and
+// publishes `child row ++ func outputs` — so a column it hands through is not
+// merely bounded by its input's distinctness, it HAS the input's
+// distinctness. No clamp is needed or correct: clamping to anything would
+// understate a column whose values are literally unchanged.
+//
+// Window-function outputs themselves (positions at or past the child's
+// width) stay unknown: `rank()`, `sum() OVER ...` and friends compute new
+// values whose distinctness this file cannot derive. PG needs no equivalent
+// rule because `examine_simple_variable` (selfuncs.c) resolves a subquery
+// output Var to the underlying relation's statistics regardless of the nodes
+// in between; goopg's resolver stops at the CTE boundary, which is gap G1.
+//
+// Fail-closed like its siblings: a non-bare-ColumnRef Project target, a
+// position past the child's width, or an input whose own ndistinct is
+// unknown all leave the column `unknown` and today's defaults.
+func synthWindowOutputs(out *cteOutputStats, entry *plannedCTE) {
+	win, indexMap, ok := windowOutputMap(peelCTEBody(entry.body))
+	if !ok || win == nil || win.Child == nil {
+		return
+	}
+	childWidth := len(win.Child.Output())
+	for i := range out.cols {
+		// Never overwrite a record an earlier rule already filled.
+		if out.cols[i].kind != cteColUnknown {
+			continue
+		}
+		wpos, ok := indexMap[i]
+		if !ok || wpos < 0 || wpos >= childWidth {
+			continue
+		}
+		nd := columnNDistinctForChild(wpos, win.Child)
+		if nd <= 0 {
+			continue
+		}
+		out.cols[i].kind = cteColPassthrough
+		out.cols[i].ndistinct = float64(nd)
+	}
+}
+
+// windowOutputMap is `aggOutputMap`'s twin for window bodies: it resolves a
+// (possibly Project-wrapped) body to its `*WindowAgg` and the output-position
+// map, result[i] = WindowAgg output position read by CTE output column i.
+func windowOutputMap(body Node) (*WindowAgg, map[int]int, bool) {
+	if win, ok := body.(*WindowAgg); ok && win != nil {
+		m := make(map[int]int, len(win.Output()))
+		for i := range win.Output() {
+			m[i] = i
+		}
+		return win, m, true
+	}
+	proj, ok := body.(*Project)
+	if !ok || proj == nil {
+		return nil, nil, false
+	}
+	win, ok := proj.Child.(*WindowAgg)
+	if !ok || win == nil {
+		return nil, nil, false
+	}
+	m := make(map[int]int, len(proj.Targets))
+	for i, t := range proj.Targets {
+		cr, ok := t.(*ColumnRef)
+		if !ok || cr == nil || cr.Index < 0 {
+			continue
+		}
+		m[i] = cr.Index
+	}
+	return win, m, true
 }
 
 // aggOutputMap resolves a (possibly Project-wrapped) body to its Aggregate

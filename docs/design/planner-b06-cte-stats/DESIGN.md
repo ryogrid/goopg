@@ -292,3 +292,73 @@ A formal EA (estimate-audit) ratchet on the `year_total` shapes was NOT run;
 the evidence above is the plan channel plus the fire census. Since plans are
 byte-identical the *chosen* plans are unchanged, but estimate QUALITY on those
 18 columns did change and is unmeasured by q-error. Ledgered.
+
+
+## Step 2 slice 3 — the WindowAgg arm, and the finding that redirects this task
+
+### The arm
+
+`Project(WindowAgg)` was 366 of the 648 unclassified asks (56%), so it was the
+next slice by size. The rule is stronger than the group-key one: a `WindowAgg`
+is ROW-PRESERVING — one output row per input row, publishing
+`child row ++ func outputs` — so a column it hands through does not merely
+inherit a BOUND from its input, it has the input's distinctness exactly. No
+clamp is correct. Window-function outputs themselves stay unknown.
+
+Landed with three pins (pass-through with reordered targets, fail-closed on a
+computed target and on unanalysed input, and a dispatch-order pin that the
+window arm never overwrites an earlier rule's record). Gates green: TPC-DS
+SF0.25 default arm `PASS=96 MISMATCH=0`, **plans 99/99 identical**, TPC-H
+acceptance arm 24/24, spotcheck Q12=2 Q13=33.
+
+### It fires ZERO times — and the reason redirects the task
+
+Instrumenting the arm across a corpus run:
+
+```
+synthWindowOutputs calls           23
+  declined at the map stage        19   <- 15 Project(non-window), 3 SetOp, 1 DistinctOn
+  entered                           4   <- the real window bodies
+per-column outcome inside those 4:
+  decline=nd (input unresolvable)  19
+  decline=pos (window func output)  4
+  succeeded                         0
+```
+
+The 19 map-stage declines are correct: those bodies are not window bodies at
+all. Only **four** CTE bodies in the corpus are genuinely
+`Project(WindowAgg)`-shaped, and they generate all 366 asks between them.
+
+For those four, every pass-through column declines for one reason: the input
+ndistinct is unresolvable. The `WindowAgg`'s child is always a `*Sort` (R6
+stacks it for presorted input), and beneath that Sort:
+
+```
+15  *optimizer.WindowAgg     <- stacked OVER clauses
+ 4  *optimizer.Aggregate
+```
+
+So `columnNDistinctForChild` cannot cross a `WindowAgg` or an `Aggregate` to
+reach the base statistics — **which is gap G1 itself**, one level below the CTE
+boundary rather than at it.
+
+### What this means for the remaining work
+
+This is the third consecutive slice to land correct, pinned, safe and INERT,
+and the census now explains the pattern. The blocker is NOT a shortage of
+synthesis rules at the CTE boundary. It is that the resolver beneath the
+boundary stops at `Aggregate`/`WindowAgg`, so whatever rule is added at the
+boundary asks for a number that cannot be produced.
+
+Upstream has no equivalent problem: `examine_simple_variable`
+(`postgres/src/backend/utils/adt/selfuncs.c`) resolves a subquery-output Var to
+the underlying relation's `pg_statistic` row regardless of the nodes in
+between, which is why PG needs no per-shape synthesis at all.
+
+**The next slice should therefore be G1 proper** — teach `resolveBaseColumn`
+(`internal/optimizer/joinkeyproof.go`) to cross an `*Aggregate` (a group key
+resolves to its input column; an agg output does not resolve) and a
+`*WindowAgg` (a pass-through column resolves to its input column; a func output
+does not) — not another boundary rule. The boundary rules already landed are
+the consumers that G1 will finally feed; adding a fourth before G1 lands would
+be a fourth inert slice.

@@ -13486,6 +13486,34 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
       18 fired columns is still unmeasured.
     - Step 4 respected again: the `rows<=1` guard and the Q78 firewall
       remain UNTOUCHED.
+  - **Step 2 slice 3 landed (loop 2026-09-21 \#28): the `WindowAgg`
+    arm — and it REDIRECTS this task.**
+    - The rule: a `WindowAgg` is row-preserving, so a pass-through
+      column HAS its input's distinctness exactly (no clamp). Window
+      function outputs stay unknown. 3 pins; gates green (plans 99/99
+      identical, acceptance arm 24/24).
+    - **It fires ZERO times, and the instrumentation names why.** Only
+      FOUR corpus CTE bodies are genuinely `Project(WindowAgg)`-shaped
+      (they generate all 366 asks). For each, the pass-through input is
+      unresolvable: the `WindowAgg`'s child is always a `*Sort`, and
+      beneath it sits another `*WindowAgg` (15 declines) or an
+      `*Aggregate` (4).
+    - **So `resolveBaseColumn` cannot cross `Aggregate`/`WindowAgg` —
+      that is gap G1 itself, one level BELOW the CTE boundary.**
+    - Three consecutive slices have now landed correct, pinned, safe and
+      INERT for this same reason. The blocker is NOT missing synthesis
+      rules at the boundary; it is the resolver stopping beneath it, so
+      any boundary rule asks for a number nothing can produce.
+    - **Next slice must be G1 proper, not a fourth boundary rule**: add
+      `*Aggregate` and `*WindowAgg` arms to `resolveBaseColumn`
+      (`internal/optimizer/joinkeyproof.go`), then re-run the ask
+      census and expect the 366 window asks plus a share of the 204
+      group-key asks to convert. Only then is the EA/q-error ratchet on
+      the `year_total` shapes meaningful.
+    - PG has no such gap: `examine_simple_variable` resolves a
+      subquery-output Var to the base `pg_statistic` row regardless of
+      intervening nodes, which is why upstream needs no synthesis.
+    - Step 4 respected: `rows<=1` guard and Q78 firewall UNTOUCHED.
   - **On completion — reconsider the blocked work (evaluate, do not
     auto-do):**
     - `flattenPulledBodyTree`'s bare-`*SeqScan` rule (M0145-0003 ANY
