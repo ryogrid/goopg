@@ -527,10 +527,12 @@ func classifyPulledQuals(pu *jtPullup, nReal int, spans []leafSpan, ctx *resolve
 		for _, q := range pb.quals {
 			rebased, ok := rebasePulledQual(q, pb, pullSpans, emittingTotal, ctx)
 			if !ok {
+				notePullupClassify("rebase-failed")
 				return false
 			}
 			rs, attributable := relidsOfExpr(rebased, spans)
 			if !attributable || rs == 0 {
+				notePullupClassify("unattributable")
 				return false
 			}
 			switch {
@@ -538,15 +540,18 @@ func classifyPulledQuals(pu *jtPullup, nReal int, spans []leafSpan, ctx *resolve
 				spanning = append(spanning, rebased)
 			case relsSubset(rs, rhs):
 				if !searchConsumes(rebased, spans) {
+					notePullupClassify("body-qual-not-consumable")
 					return false
 				}
 				*searchQuals = append(*searchQuals, rebased)
 			case relsSubset(rs, emittingBits):
 				if pb.jointype == parser.JoinAnti {
+					notePullupClassify("anti-outer-local-qual")
 					return false
 				}
 				pu.outerQuals = append(pu.outerQuals, rebased)
 			default:
+				notePullupClassify("qual-spans-neither")
 				return false
 			}
 		}
@@ -555,6 +560,7 @@ func classifyPulledQuals(pu *jtPullup, nReal int, spans []leafSpan, ctx *resolve
 		// uncorrelated bodies never reach here by the pull-up's own
 		// Level-1 gate, so this is defensive, not a new class.
 		if len(spanning) == 0 {
+			notePullupClassify("no-spanning-qual")
 			return false
 		}
 		for _, c := range spanning {

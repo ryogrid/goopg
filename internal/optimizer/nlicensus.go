@@ -195,6 +195,22 @@ func noteSemiJoinrelPaths(joinrel *RelOptInfo, jt parser.JoinType) {
 	}
 }
 
+// notePullupClassify names WHICH of `classifyPulledQuals`' refusals fired.
+//
+// The seam already reports `seam-decline reason=pullup-classify`, which is
+// where TPC-H Q4 dies on the jointree arm — the EXISTS is pulled up, the seam
+// then refuses the pulled bodies, and because `pulled` has already suppressed
+// the legacy pre-DP route the statement ends with no semijoin from either
+// route and a 10x regression. One reason string for five distinct refusals is
+// not enough to act on: the fix for "a body qual the search cannot consume" is
+// not the fix for "no spanning qual".
+func notePullupClassify(reason string) {
+	if !nliCensusEnabled {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "PULLUPCLASSIFY refusal=%s\n", reason)
+}
+
 // nliCensusJoinTypeName names the join type for the census line. It is
 // deliberately separate from `traceJoinTypeName` (which speaks the parser
 // enum) so the census stays readable without a conversion at every call.

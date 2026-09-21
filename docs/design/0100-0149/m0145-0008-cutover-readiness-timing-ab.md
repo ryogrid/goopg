@@ -125,14 +125,52 @@ pre-DP arm".
 - **The cost comparison** is not involved either: no joinrel is formed, so
   nothing is costed and nothing is out-costed.
 
-### The next probe, precisely
+### ROOT CAUSE (same day): a body-local qual can never be "consumed"
 
-The pull-up marks the conjunct and the seam then declines. Name the decline
-class: run Q4 on the knob arm with the seam's own decline trace and read which
-class fires after `ctx.jtPullup != nil` — `classifyPulledQuals` returning
-false, `splicePulledLeaves` returning false, or a leaf-count/legality gate. The
-fix belongs to M0145-0003 (either the seam accepts what the pull-up marked, or
-the pull-up stops marking what the seam will decline), not to the cutover.
+The seam trace names the class, and a refined census names the refusal inside
+it:
+
+```
+PULLUPCENSUS     decline=(pulled)                      the EXISTS is pulled up
+PULLUPCLASSIFY   refusal=body-qual-not-consumable      classifyPulledQuals refuses
+seam-decline     reason=pullup-classify nrels=1 nleaves=2
+```
+
+Q4's `EXISTS` body is
+`… FROM lineitem WHERE l_orderkey = o_orderkey AND l_commitdate < l_receiptdate`.
+`classifyPulledQuals` sorts each rebased body qual into three buckets:
+spanning (becomes the link predicate), RHS-only, emitting-only. The correlation
+clause is spanning and fine. `l_commitdate < l_receiptdate` is RHS-only, and
+that branch requires `searchConsumes(rebased, spans)` — which asks whether
+`buildRestrictInfos` yields this exact clause.
+
+It never can. `buildRestrictInfos`' `add` closure drops any clause with
+`relLevel(relids) < 2` (joinrestrict.go): the restrictInfo list holds JOIN
+clauses only, by design — base restrictions live elsewhere. So a
+**single-relation body qual fails `searchConsumes` structurally**, and
+`classifyPulledQuals` refuses the whole body.
+
+That is the defect: the RHS-only branch validates a BASE restriction with a
+JOIN-clause test. PG has no such step — `distribute_qual_to_rels` puts a
+single-rel qual on that rel's `baserestrictinfo`
+(`postgres/src/backend/optimizer/plan/initsplan.c`) and the pull-up proceeds.
+
+The consequence is the whole 10x: `pulled` has already suppressed the legacy
+pre-DP route for the scope, so when the seam refuses, **no route produces a
+semijoin at all** and the `EXISTS` runs as a per-row subplan. Any pulled body
+whose WHERE carries a body-local qual — an extremely common shape — is
+affected.
+
+### The fix, and why it is not in this loop
+
+The RHS-only branch must PLACE the qual as a base restriction on the pulled
+leaf instead of demanding it be a join clause. The pulled leaves come from
+`flattenPulledBodyTree` as bare `*SeqScan`s with the body's WHERE held
+separately in `pb.quals`, so placing it means attaching the qual to its leaf
+(or threading a base-restriction list the search consumes) — a change in the
+pulled-leaf construction path, on the knob arm only. It belongs to M0145-0003,
+it is ledgered with that resume point, and it wants its own loop and its own
+knob-arm sweep rather than being appended to a diagnosis.
 
 ## What this means for the cutover
 
