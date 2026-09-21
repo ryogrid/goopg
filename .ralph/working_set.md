@@ -1,51 +1,75 @@
 (idle — nothing in flight)
 
-# Loop #76 result — the template1 extension re-attribution IS the collision
+# Loop #77 result — M0122-0008: cross-database GRANT ON DATABASE
 
-Banner: nightly run id still 20260922-004850 → PgoutputInterop ×10 stay
-blocked (wait for the inlined `cluster.log` tail; do NOT re-run locally).
-Banner item 10 → M0119 before M0122, so took M0119-0006's bs residual — the
-task loop #75 left with one open question. No production change.
+Banner: nightly run id STILL 20260922-004850 → PgoutputInterop ×10 remain
+blocked. M0119's remaining items are `[!]` or owner-gated, so per banner item
+10 moved to **M0122**, bucket 0008 (Auth / roles / multi-DB isolation /
+encoding). Consumed `unimplemented_feat.json` entry "Implement multi-database
+support" → `resolved`.
 
-## The open question is answered
-`mirrorCatalogRelToPostgresDB` (`internal/executor/sys_catalog_postgres_db_mirror.go`)
-copies `DefaultDBOid` → `PostgresDBOid` with the SOURCE HARD-WIRED, on every
-extension write, so the reload's `cat.DBOID()` pass finds the row. Database-
-agnostic, not a template1 special case. That removes the duplicate-row worry
-#75 was blocked on — and refutes its conclusion.
+## The defect (measured vs a PG 18.3 oracle cluster)
+`GRANT CONNECT ON DATABASE otherdb TO r1` from a `postgres` session reported
+GRANT and left datacl NULL. An unknown db name succeeded SILENTLY instead of
+raising 3D000 — the worse half.
 
-## Loop #75's "not subsumed" is CORRECTED — one-line control
-Same `CREATE EXTENSION` from a **postgres** connection, fresh cluster →
-identical signature: `base/1/3079`=1, `base/5/3079`=1, `base/4`(template0
-control)=0. So `base/1` is the SHARED `DefaultDBOid` heap, not template1's
-own; #75's inference had no support. Paired control: an ordinary
-`CREATE DATABASE`d db routes correctly to its own `base/<oid>/3079` — routing
-WORKS; template1 fails only because its oid IS the sentinel.
+## Root cause + fix (SIBLING PAIR, Rule #2)
+A v0 comment justified matching only `ctx.CurrentDatabase`; upstream
+`ExecGrant_Database` (aclchk.c) resolves against the SHARED pg_database and
+never consults MyDatabaseId.
+- writer `execDatabaseACLChange`: resolve every name via `ResolveDatabaseOid`,
+  WHOLE list first (one bad name changes nothing before it errors), 3D000 on
+  unknown; per-db body split into `applyDatabaseACLChange`.
+- reader `pg_database` virtual row builder: render `datacl` for EVERY row, not
+  just `postgres` (was dead code; would have hidden the stored ACLs).
+- **Why the key is safe**: `ResolveDatabaseOid("postgres")` returns `DBOID()`
+  — the key the old code used — so the connected path is unchanged BY
+  CONSTRUCTION, not coincidence.
 
-## Why no reload-side fix exists (stronger than "deferred")
-A `pg_extension` row's database scope lives ONLY in the in-memory registry; on
-disk the sole scope carrier is WHICH `base/<dbOid>` heap holds it. template1's
-row and a postgres row share one heap and are otherwise identical → no reader
-can attribute it to template1. Scanning more directories cannot recover
-information that was never written. Task marked `[!]` behind the collision.
+## Verified
+Live: cross-db GRANT/REVOKE, multi-name list, 3D000, connected-db path all
+match PG 18.3. `global/1262` gains a row version per resync (standby sees it).
+Non-vacuity on BOTH halves (neutralise writer → 3 arms fail; neutralise reader
+→ render test fails, writer tests stay green).
 
-## MEASUREMENT TRAP — cost two false defects
-Heap pages are NOT flushed at `CREATE EXTENSION`. Reading `base/<db>/3079` on
-a RUNNING server showed ZERO rows for writes that had succeeded; both
-"new defects" dissolved after a clean shutdown. Stop the server before any
-on-disk catalog probe.
+## Two residuals FILED + ledgered (do not re-discover)
+1. `pg_database.datacl` does NOT survive restart — PRE-EXISTING, hits the
+   `postgres` row too. Heap write is fine; nothing reloads the ACL store.
+   Blocker: no aclitem-array DECODER exists (only the encoder).
+2. aclitem array ORDER: goopg owner-first, PG world-first. Shared renderer →
+   moves relacl/typacl/paracl/datacl together; own task.
 
 ## Gates
-state guard; pgbench smoke via the hook. No value gates — ZERO production
-diff (docs + .ralph only). Scratch clusters gt1x76/77/78 stopped and removed;
-ports 5543-5545 confirmed free.
+units PASS; executor+catalog PASS; tpch-spotcheck Q12=2/Q13=33 PASS;
+tpcds-sf025 PLAN-SHAPE same=99 changed=0 PASS; pgbench smoke via hook.
+Scratch /tmp/gm22 + PG /tmp/pgm22 stopped and removed.
 
-## Next loop
-M0119-0006's bs residuals are now all closed or `[!]`. Move to the banner's
-next milestone: **M0122** → M0131 → M0134 → M0135/M0136 → M0095/M0110.
-Note M0122-0007 (per-database namespaces) is where Option B would land.
+## ⚠ BANNER CHANGED MID-LOOP — read it first
+The OWNER wrote a new block into the `## Current Priority` banner while this
+loop was running: **OWNER GO 2026-09-22**, answering the M0145-0001 lineage
+escalation and the M0145-0018/0012 escalations — CONTINUE M0145, sequencing
+the measured downstream walls first (**M0145-0009**, then **M0145-0019**
+NL-costing for derived inners = 0018's option (c), then **M0145-0020**
+`examine_simple_variable` CTE arm = 0012's prerequisite), then resuming the
+flow chain 0004 → 0005 → 0007 → 0008. Harness additions M0145-0021/0022/0023
+may run any time. This loop's M0122 selection predates that edit.
+**NEXT LOOP SELECTS PER THE NEW BANNER: M0145-0009.**
+
+## UNCOMMITTED WIP — `.ralph/fix_plan.md` (deliberate, not an accident)
+This loop's M0122-0008 write-up IS on disk in fix_plan.md but is NOT committed.
+The owner's banner edit is uncommitted in the same file, and the RALPH_LOOP
+protected-region guard rejects any commit whose staged fix_plan carries a
+banner delta vs HEAD. Committing a fix_plan WITHOUT the owner's hunk would
+have dropped their edit. Everything else (code, tests, design doc, ledger)
+IS committed. Next loop: once the owner commits the banner, stage
+`.ralph/fix_plan.md` as-is — the write-up needs no rework.
+
+## Also next
+Continue M0122 buckets only if the banner allows. Note entry #59 (SASL channel binding) is UNIMPLEMENTABLE
+as filed: `grep -rl crypto/tls internal/` is EMPTY — goopg has no TLS at all,
+so the real blocker is upstream of SCRAM. Re-file it that way before touching
+`internal/auth/`.
 
 ## Owner escalations OPEN — four (unchanged)
-1. M0145-0018 cost-model no-go. 2. M0145-0001 lineage exhausted.
-3. partition_aggregate's inventory row. 4. template1 namespace collision
-(Option A vs B) — now with TWO dependent tasks: schema scoping and this one.
+M0145-0018; M0145-0001 lineage; partition_aggregate inventory row; template1
+namespace collision (Option A vs B, two dependent tasks).

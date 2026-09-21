@@ -95,9 +95,9 @@
   },
   {
    "feature": "Implement multi-database support so a single server instance can manage multiple independent databases.",
-   "task_id": null,
-   "resume_point": null,
-   "status": "open",
+   "task_id": "M0122-0008",
+   "resume_point": "RESOLVED 2026-09-22. Residual scope tracked by the SEPARATE entry \"Real multi-database and multi-role isolation boundaries\" (schemas registered process-wide; template1 shares the postgres namespace) and by .ralph/fix_plan.md M0119-0006 — those are isolation-boundary gaps, not an absence of multi-database support.",
+   "status": "resolved",
    "evidence": [
     "v0 deliberately defers — multi-database"
    ],
@@ -112,7 +112,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/executor/operators_ddl_database_acl.go:48 single-database only"
+   "code_audit": "RESOLVED 2026-09-22 (M0122-0008): the cited evidence was internal/executor/operators_ddl_database_acl.go single-database only, i.e. GRANT/REVOKE ... ON DATABASE naming any database other than the connected one was a silent no-op. Both halves of that sibling pair are fixed: execDatabaseACLChange now resolves every named database through catalog.ResolveDatabaseOid (and raises upstream 3D000 for an unknown name, matching get_database_oid missing_ok=false), and the pg_database virtual row builder renders datacl for every row instead of only the postgres one. Verified live against PG 18.3: GRANT/REVOKE on a non-connected database, the multi-name list form, and the 3D000 refusal all match. Multi-database support itself was already present and is confirmed by measurement: CREATE DATABASE persists, each database routes to its own base/<oid> catalog heaps, and per-database isolation of tables/extensions works (see docs/design/0100-0149/0122-0008-cross-database-grant-on-database.md)."
   },
   {
    "feature": "ANY/SOME/ALL quantified subqueries",

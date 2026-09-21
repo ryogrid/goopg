@@ -9018,11 +9018,20 @@ func (c *InMemory) registerSystemTables() {
 			// SUBSCRIPTION's subdbid) already depend on for "the" connected
 			// database — changing the displayed oid to match broke pg_dump's
 			// subscription round-trip (subdbid join no longer matched). Only the
-			// live "postgres" row can carry a granted ACL (execDatabaseACLChange's
-			// v0 single-database scope), so every other row is unconditionally NULL.
+			// live "postgres" row could carry a granted ACL, because
+			// execDatabaseACLChange only ever wrote that one.
+			//
+			// EVERY row is looked up now (M0122-0008). ResolveDatabaseOid is the
+			// same key execDatabaseACLChange writes under, and it returns DBOID()
+			// for "postgres", so the live row's rendering is byte-identical to the
+			// previous special case. This is the reader half of a sibling pair
+			// (Hard-won Rule #2): while the writer was single-database, rendering
+			// any other row was dead code -- and leaving the reader pinned to
+			// "postgres" after teaching the writer to reach other databases would
+			// have stored a datacl that pg_database could never show.
 			datacl := VirtualNull
-			if n == "postgres" {
-				if aclText := c.DatabaseACLText(c.DBOID()); aclText != "" {
+			if aclOID, found := c.ResolveDatabaseOid(n); found && aclOID != 0 {
+				if aclText := c.DatabaseACLText(aclOID); aclText != "" {
 					datacl = aclText
 				}
 			}
