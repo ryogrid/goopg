@@ -3336,10 +3336,72 @@ func resolveRowMarkCtidResnos(root Node, locks []LockedRel) {
 					break
 				}
 			}
+			if p < 0 {
+				p = findLockedColByTarget(root, outSchema, lc)
+			}
 			pos = append(pos, p)
 		}
 		locks[i].ColPos = pos
 	}
+}
+
+// findLockedColByTarget resolves a locked relation's leaf column to its
+// position in the root output when the output SCHEMA NAME no longer matches
+// the leaf's — which is what a target-list alias does: `SELECT ta.value AS
+// ta_value` renames the schema column, so the leaf's (Name, SourceTableIdx)
+// identity is absent from outSchema and the name scan above yields -1 for
+// EVERY column. That is indistinguishable, at the merge site, from "this
+// column is genuinely not carried in the output", so the EPQ refetch-merge
+// silently writes nothing and the row keeps its PRE-update values
+// (isolation spec eval-plan-qual, permutation `updateforss readforss c1 c2`,
+// whose step aliases all three targets).
+//
+// A Project's TARGET expression keeps the column's original identity even
+// when its schema entry is aliased — `ColumnRef.Name` is the resolved source
+// column name — so the target list is the reliable coordinate. Upstream has
+// no equivalent ambiguity: ExecLockRows addresses the rowmark's columns by
+// attnum through the relation's tuple descriptor (execMain.c's
+// EvalPlanQualFetchRowMark), never by output name.
+//
+// Returns -1 when no Project target matches, preserving the existing
+// "column not carried in the output" meaning for a genuinely absent column.
+func findLockedColByTarget(root Node, outSchema Schema, lc SchemaColumn) int {
+	proj := findTopProjectForOutput(root, len(outSchema))
+	if proj == nil {
+		return -1
+	}
+	for j, tgt := range proj.Targets {
+		if j >= len(outSchema) {
+			break
+		}
+		cr, ok := tgt.(*ColumnRef)
+		if !ok {
+			continue
+		}
+		if cr.Name == lc.Name && cr.SourceTableIdx == lc.SourceTableIdx {
+			return j
+		}
+	}
+	return -1
+}
+
+// findTopProjectForOutput returns the highest Project at or below n whose
+// output width matches the row the merge addresses, so a target index is a
+// valid position in that row. Width equality is the guard that keeps this
+// from returning a Project under a node that reshapes the row.
+func findTopProjectForOutput(n Node, width int) *Project {
+	if n == nil {
+		return nil
+	}
+	if p, ok := n.(*Project); ok && len(p.Output()) == width {
+		return p
+	}
+	for _, c := range boundaryWalkChildren(n) {
+		if r := findTopProjectForOutput(c, width); r != nil {
+			return r
+		}
+	}
+	return nil
 }
 
 // surfaceRowMarkCtid returns ctidName's position in n.Output(), threading the

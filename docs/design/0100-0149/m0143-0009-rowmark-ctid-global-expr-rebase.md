@@ -143,6 +143,33 @@ The same step maintains two EPQ-merge coordinates on each `LockedRel`:
   projection doesn't carry get `-1` (nothing to merge into). The
   executor's EPQ refetch-merge prefers `ColPos` when populated.
 
+  **CORRECTION (2026-09-22, AI-20260922-004850-001).** The
+  `(Name, SourceTableIdx)` identity above is NOT sufficient on its own,
+  because a target-list ALIAS renames the output schema column:
+  `SELECT ta.value AS ta_value` leaves no `value` entry in the root output,
+  so every locked-rel column resolved to `-1`. At the merge site a `-1` is
+  indistinguishable from "the projection doesn't carry this column", so the
+  re-fetched post-update values were silently discarded and the row kept its
+  PRE-update contents — a wrong-answer surface, not a cosmetic one. It is
+  what made the `eval-plan-qual` permutation `updateforss readforss c1 c2`
+  return `tableAValue` where PostgreSQL returns `newTableAValue`.
+
+  The fix adds a second resolution step, `findLockedColByTarget`
+  (`internal/optimizer/planner.go`): when the name scan yields `-1`, resolve
+  through the Project's TARGET expression instead, whose `ColumnRef.Name`
+  keeps the column's ORIGINAL source name even when its schema entry is
+  aliased. The `-1`-means-absent meaning is preserved — a column genuinely
+  projected away still gets `-1`, which
+  `TestPlanCtidRowMarkAbsentColumnKeepsNegativeColPos` pins alongside
+  `TestPlanCtidRowMarkAliasedTargetsResolveColPos`.
+
+  Upstream has no equivalent ambiguity and that is the deeper lesson here:
+  `ExecLockRows` addresses a rowmark's columns by **attnum** through the
+  relation's tuple descriptor (`EvalPlanQualFetchRowMark`, execMain.c), never
+  by output name. An output NAME is a presentation-level identity and cannot
+  carry a storage-level coordinate; resolving one through the other works
+  only until the user writes `AS`.
+
 ### 4. `hasSelfJoinLockedTable` retired
 
 The AI-007 guard existed solely to avoid the rebase hole. With the global

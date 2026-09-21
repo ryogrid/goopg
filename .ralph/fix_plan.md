@@ -1396,51 +1396,56 @@ heuristic stays live.)
     - No deferral-ledger row: no PostgreSQL behaviour is left unimplemented;
       this is test robustness, not a semantics shortcut.
     - Gates: units PASS.
-- [ ] **testport/TestPort_IsolationEvalPlanQual — EPQ refetch returns the
-  pre-update value when a SubPlan is attached (AI-20260922-004850-001,
-  was AI-20260921-000212-002)** — NARROWED 2026-09-22, not yet fixed.
-  L1059 expects `1|newTableAValue|(1,tableBValue)`, gets
-  `1|tableAValue|(1,tableBValue)`. Reproduced OUTSIDE the TAP harness on a
-  throwaway goopg with two psql sessions, which isolates it from the
-  harness's timing-only `<waiting>` detection (that produces a separate,
-  cosmetic 1-line offset cascade in the same diff — see
-  [[iso_runner_blocking_is_timing_only]]). Minimal pair, identical plan
-  shape (`LockRows -> Index Scan using table_a_pkey`) except for the
-  SubPlan:
-    A. `SELECT id, value FROM table_a WHERE id=1 FOR UPDATE`
-       -> `1|newTableAValue` CORRECT.
-    B. `SELECT ta.id, ta.value, (SELECT ROW(tb.id,tb.value) FROM table_b tb
-        WHERE ta.id=tb.id) FROM table_a ta WHERE ta.id=1 FOR UPDATE OF ta`
-       -> `1|tableAValue|(1,tableBValue)` WRONG.
-  Instrumented `lockRowsOp.Next` (internal/executor/operators_lockrows.go,
-  the `entry.newPtrValid` block ~line 1042). In the FAILING shape the EPQ
-  chain walk is CORRECT and the merge DOES run: `newPtrValid=true
-  ptr={0 9} newPtr={0 10} rowlen=4`, then `applied=true newcols=2` — i.e.
-  `stampLock` followed the committed-update chain to a distinct successor
-  tuple and `refetchRow` returned a non-nil 2-column row, yet the merged
-  row still carries the OLD value:
-  `merged=[1, "tableAValue", "(1,tableBValue)", "(0,5)"]`.
-  Two hypotheses REFUTED by reading the code rather than guessing:
-  (a) NOT snapshot visibility — `refetchRow` (same file, ~line 1797)
-  applies no snapshot at all, it pins the buffer and reads the raw heap
-  tuple at `ptr` directly, which is what PG's EvalPlanQual wants;
-  (b) NOT a chain-walk failure — `newPtr` differs from `ptr`.
+- [x] **testport/TestPort_IsolationEvalPlanQual — EPQ refetch-merge dropped
+  by an aliased target list (AI-20260922-004850-001)** — FIXED 2026-09-22.
+  The spec's `readforss` returned the PRE-update `tableAValue` where PG
+  returns `newTableAValue`.
   Kind: impl
   Parent: none
-  NEXT MEASUREMENT (the one instrument that splits what is left): print the
-  CONTENTS of `newLockedCols`, not just its length, in the merge block.
-    - if it is `[1, "newTableAValue"]` -> `refetchRow` is right and the
-      MERGE POSITIONS are wrong in the SubPlan shape: the row is 4 wide
-      (`[id, value, subplan, ctid]`), so `lk.ColPos` / `lk.ColOffset+i`
-      must be landing the refetched columns somewhere other than 0 and 1.
-      That is a planner-supplied-offset bug, cf.
-      [[goopg_two_column_coordinate_boundaries]].
-    - if it is `[1, "tableAValue"]` -> `refetchRow` decoded the wrong
-      image despite a correct `newPtr`; suspect `natts` from
-      `Infomask2 & 0x07FF` or the `cols` pick, which takes the FIRST
-      `o.plan.Locks` entry matching the relfilenode.
-  Do NOT write a concurrency fix before that print: the two branches have
-  disjoint fix sites and the cheap measurement decides between them.
+  Movement: yes — `ColPos` for `table_a` went `[-1 -1]` -> `[0 1]`, measured
+  from the spawned server's own log during the harness run; the full
+  `TestPort_IsolationEvalPlanQual` spec now matches PG byte-for-byte.
+  - **Root cause.** `resolveRowMarkCtidResnos` (internal/optimizer/planner.go)
+    located each locked-relation column in the root output by its
+    `(Name, SourceTableIdx)` identity. A target-list ALIAS renames the output
+    SCHEMA column, so `SELECT ta.value AS ta_value` leaves no `value` entry to
+    match and EVERY position resolved to `-1`. At the merge site
+    (`lockRowsOp.Next`) a `-1` is indistinguishable from "the projection
+    doesn't carry this column", so the correctly re-fetched post-update values
+    were silently discarded while `applied` was still set `true`, so the
+    fallback never ran either.
+  - **Fix.** New `findLockedColByTarget` + `findTopProjectForOutput`: when the
+    name scan yields `-1`, resolve through the Project's TARGET expression,
+    whose `ColumnRef.Name` keeps the ORIGINAL source column name even when the
+    schema entry is aliased. The `-1`-means-absent meaning is preserved.
+  - **CORRECTION to loop \#58's narrowing, which was wrong.** That loop
+    recorded the discriminator as "a SubPlan attached to the locked scan" and
+    filed a minimal pair to prove it. Re-running that pair at HEAD this loop
+    returned the CORRECT value, refuting it. The real discriminator is the
+    ALIAS; the spec's `readforss` merely happens to have both, and the probe
+    written from it dropped the `AS` clauses while keeping the subquery. What
+    made the difference was measuring inside the harness — snapshotting the
+    spawned server's `cluster.log` (it lives under `t.TempDir()` and is
+    deleted at teardown) instead of trusting a hand-built repro to be
+    faithful to the spec.
+  - Loop \#58's other two refutations still hold and were re-confirmed:
+    `refetchRow` applies no snapshot (it reads the raw heap tuple at the
+    pointer, as PG's EvalPlanQual requires) and the chain walk is correct
+    (`newPtr != ptr`). The instrumentation showed `newLockedCols` really did
+    contain `newTableAValue` — exactly branch 1 of the two disjoint fix sites
+    the previous loop predicted.
+  - **Sibling audit (Hard-won Rule \#2).** Re-ran the whole spec instrumented
+    after the fix and read every `ColPos` it produced. `accounts_ext` resolves
+    `[0 -1 -1 -1 -1]` but at `rowlen=2`, i.e. those four columns genuinely are
+    not in the row — the legitimate `-1`, now pinned by
+    `TestPlanCtidRowMarkAbsentColumnKeepsNegativeColPos`. `accounts`,
+    `jointest` (all three self-join offsets) and `table_a` resolve fully. No
+    latent instance of the same class in this spec.
+  - Follow-up lead, NOT a known divergence so no ledger row: other resolvers
+    that key on `(Name, SourceTableIdx)` — `findColumnIndexByNameAndSource`,
+    `predRebind` — share the identity-by-name pattern. They operate below the
+    top Project, in pre-alias coordinates, so they are not obviously exposed;
+    nobody has audited them against aliasing.
 
 - [x] **testport/TestPort_IsolationReceiptReport (AI-20260921-000212-003)** —
   DOES NOT REPRODUCE at HEAD. Re-ran the filed repro

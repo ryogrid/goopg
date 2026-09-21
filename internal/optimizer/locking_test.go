@@ -432,3 +432,115 @@ func TestPlanCtidRowMarkDoubleProject(t *testing.T) {
 		t.Fatalf("LockRows.Output() = %v, want [accountid balance] (pre-fix dropped the trailing user column)", names)
 	}
 }
+
+// TestPlanCtidRowMarkAliasedTargetsResolveColPos pins the EPQ refetch-merge
+// coordinate against a target-list ALIAS.
+//
+// `resolveRowMarkCtidResnos` locates each locked-relation column in the root
+// output by its (Name, SourceTableIdx) identity. An alias renames the SCHEMA
+// column — `SELECT ta.value AS ta_value` — so that identity is absent from the
+// output and every position resolved to -1. At the merge site
+// (`lockRowsOp.Next`, internal/executor/operators_lockrows.go) a -1 is
+// indistinguishable from "this column is not carried in the output", so the
+// re-fetched post-update values were silently dropped and the row kept its
+// PRE-update contents. That is a wrong-answer surface, not a cosmetic one:
+// it is the defect behind the isolation spec eval-plan-qual permutation
+// `updateforss readforss c1 c2` (AI-20260922-004850-001), whose step aliases
+// all three of its targets and which returned `tableAValue` where PostgreSQL
+// returns `newTableAValue`.
+//
+// The Project TARGET keeps the column's original identity even when its
+// schema entry is renamed, so it is the reliable coordinate. Upstream has no
+// equivalent ambiguity: ExecLockRows addresses a rowmark's columns by attnum
+// through the tuple descriptor, never by output name.
+//
+// A genuinely absent column must still resolve to -1 — that meaning is load
+// bearing, so the test pins both halves.
+func TestPlanCtidRowMarkAliasedTargetsResolveColPos(t *testing.T) {
+	c := catalog.NewInMemory()
+	ta, err := c.CreateTable(parser.ObjectName{Name: "lrs_alias_a"}, []catalog.Column{
+		{Name: "id", Type: catalog.Type{Name: "int4"}},
+		{Name: "value", Type: catalog.Type{Name: "text"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	textT := catalog.Type{Name: "text"}
+	intT := catalog.Type{Name: "int4"}
+	scan := &SeqScan{Table: ta, Alias: "ta", schema: Schema{
+		{Name: "id", Type: intT, SourceTableIdx: 1},
+		{Name: "value", Type: textT, SourceTableIdx: 1},
+	}}
+	// The select list renames BOTH columns, as the spec's `readforss` does.
+	top := &Project{Child: scan, schema: Schema{
+		{Name: "ta_id", Type: intT, SourceTableIdx: 1},
+		{Name: "ta_value", Type: textT, SourceTableIdx: 1},
+	}, Targets: []Expr{
+		&ColumnRef{Index: 0, Name: "id", Type: intT, SourceTableIdx: 1},
+		&ColumnRef{Index: 1, Name: "value", Type: textT, SourceTableIdx: 1},
+	}}
+	locks := []LockedRel{{Table: ta, Alias: "ta", RowMarkId: 1, CtidResno: -1}}
+
+	numCtid, oldW := wireRowMarkCtidColumns(top, locks)
+	if numCtid != 1 {
+		t.Fatalf("wired ctids = %d, want 1", numCtid)
+	}
+	rebaseRowMarkPlan(top, oldW)
+	resolveRowMarkCtidResnos(top, locks)
+
+	if locks[0].CtidResno < 0 {
+		t.Fatalf("CtidResno = %d — ctid did not surface", locks[0].CtidResno)
+	}
+	got := locks[0].ColPos
+	if len(got) != 2 || got[0] != 0 || got[1] != 1 {
+		t.Errorf("ColPos = %v, want [0 1] — an aliased target must still resolve "+
+			"to its output position, or the EPQ refetch-merge silently drops the "+
+			"post-update values", got)
+	}
+}
+
+// TestPlanCtidRowMarkAbsentColumnKeepsNegativeColPos pins the other half of
+// the contract exercised above: a locked-relation column the output does NOT
+// carry must stay -1. The merge site relies on that to avoid writing a
+// re-fetched value into an unrelated slot, so the alias fallback must not
+// manufacture a position for a column that was projected away.
+func TestPlanCtidRowMarkAbsentColumnKeepsNegativeColPos(t *testing.T) {
+	c := catalog.NewInMemory()
+	ta, err := c.CreateTable(parser.ObjectName{Name: "lrs_absent_a"}, []catalog.Column{
+		{Name: "id", Type: catalog.Type{Name: "int4"}},
+		{Name: "value", Type: catalog.Type{Name: "text"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	textT := catalog.Type{Name: "text"}
+	intT := catalog.Type{Name: "int4"}
+	scan := &SeqScan{Table: ta, Alias: "ta", schema: Schema{
+		{Name: "id", Type: intT, SourceTableIdx: 1},
+		{Name: "value", Type: textT, SourceTableIdx: 1},
+	}}
+	// Only `id` is projected; `value` is genuinely absent from the output.
+	top := &Project{Child: scan, schema: Schema{
+		{Name: "ta_id", Type: intT, SourceTableIdx: 1},
+	}, Targets: []Expr{
+		&ColumnRef{Index: 0, Name: "id", Type: intT, SourceTableIdx: 1},
+	}}
+	locks := []LockedRel{{Table: ta, Alias: "ta", RowMarkId: 1, CtidResno: -1}}
+
+	numCtid, oldW := wireRowMarkCtidColumns(top, locks)
+	if numCtid != 1 {
+		t.Fatalf("wired ctids = %d, want 1", numCtid)
+	}
+	rebaseRowMarkPlan(top, oldW)
+	resolveRowMarkCtidResnos(top, locks)
+
+	got := locks[0].ColPos
+	if len(got) != 2 || got[0] != 0 {
+		t.Fatalf("ColPos = %v, want the aliased id at 0", got)
+	}
+	if got[1] != -1 {
+		t.Errorf("ColPos[1] = %d, want -1 — `value` is not in the output and a "+
+			"position for it would merge a re-fetched value into an unrelated slot",
+			got[1])
+	}
+}
