@@ -58,6 +58,46 @@ checksums correct on every executable query with the arm live. Default-arm
 gates stay green and plan-identical (`same=99 changed=0`), TPC-H acceptance arm
 24/24.
 
+## The ANY residue, named (2026-09-21): CTE bodies, not opaque bodies
+
+The ANY arm left two buckets. `bindPulledBodyScope` and `flattenPulledBodyTree`
+now return the sub-reason they failed on, so the larger one could be counted
+instead of read off the ledger's assumption. TPC-DS SF0.25 plans, knob arm:
+
+| bucket | count |
+|---|---|
+| `(pulled)` | 21 |
+| `any-body-leaf-(*optimizer.CTEScan)` | **15 — all of the former `any-body-scope-not-bindable`** |
+| `SubqueryExpr` (not a gap) | 15 |
+| `any-nested-sublink` | 6 |
+| `ExistsExpr` (below conjunct top level) | 2 |
+| `InExpr` (non-plain / NOT IN) | 1 |
+
+Every one of the 15 is the same shape: the ANY body's FROM is a **CTE
+reference** (`WHERE x IN (SELECT … FROM some_cte)`), the TPC-DS idiom. The
+ledger had these filed under the opaque-body arm — bodies whose planned Node
+must ride along as an opaque citizen — and that is not what they are.
+
+### Why admitting them is NOT a one-line relaxation
+
+`flattenPulledBodyTree` requires bare `*SeqScan` leaves. Lifting that to admit
+`*CTEScan` would push a statistics-free leaf into the DP, and
+`itemIsDerived`'s classifier (relfromjoinlist.go:557) treats exactly
+`*CTEScan`/`*WorkTableScan` as DERIVED — the input class the Q78
+`outer-over-derived` firewall exists to keep out of the search (C-04a: Q78 went
+15 s to 327 s TIMEOUT when derived inputs reached join ordering). The project
+banner states the constraint directly: the Q78 firewall is a hard constraint on
+every pull-up/flattening task.
+
+So this bucket is blocked on **B-06 (CTE-output statistics)** — the same
+blocker M0145-0005 slice 5 recorded for the `outer-over-derived` decline
+family, and the same one M0145-0006's `outer-over-derived` row names. It is not
+the opaque-body arm, and building the opaque-body arm would not move it.
+
+The remaining actionable bucket is `any-nested-sublink` (6): PG recurses
+`pull_up_sublinks` into a pulled body's own quals
+(`pull_up_sublinks_qual_recurse`), which goopg does not yet do.
+
 ## Which arm next — the pull-up decline census (2026-09-21)
 
 The M0145-0007 sublink-route census measured this pull-up's coverage at under

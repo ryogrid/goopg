@@ -257,9 +257,9 @@ func pullUpExistsBody(ex *ExistsExpr, negated bool, parent *resolveContext, cat 
 	if !sublinkBodyIsSimple(sub) {
 		return nil, "body-not-simple", false
 	}
-	bodyCtx, leafScans, leafWidths, onQuals, ok := bindPulledBodyScope(sub, parent, cat, ps)
+	bodyCtx, leafScans, leafWidths, onQuals, why, ok := bindPulledBodyScope(sub, parent, cat, ps)
 	if !ok {
-		return nil, "body-scope-not-bindable", false
+		return nil, "exists-" + why, false
 	}
 	for _, q := range onQuals {
 		// The rest of the subselect must not refer to the parent
@@ -325,23 +325,27 @@ func pullUpExistsBody(ex *ExistsExpr, negated bool, parent *resolveContext, cat 
 // `ctx.parent` exactly as it did when the body's plan was built. The
 // body's jointree must come back as a flat inner/cross chain of bare
 // scans — one leaf per binding — or the body is not splicable.
-func bindPulledBodyScope(sub *parser.SelectStmt, parent *resolveContext, cat catalog.Catalog, ps PlannerSettings) (*resolveContext, []Node, []int, []Expr, bool) {
+// The trailing string is the sub-reason the body failed on, for the pull-up
+// census: "which arm next" was answered by counting, and the answer landed
+// here, so the next question ("why does a body fail to bind") has to be
+// countable too rather than re-derived by reading the code.
+func bindPulledBodyScope(sub *parser.SelectStmt, parent *resolveContext, cat catalog.Catalog, ps PlannerSettings) (*resolveContext, []Node, []int, []Expr, string, bool) {
 	node, bodyCtx, err := planFromClause(sub, cat, ps, parent.rtScope)
 	if err != nil || bodyCtx == nil {
-		return nil, nil, nil, nil, false
+		return nil, nil, nil, nil, "from-clause-not-plannable", false
 	}
 	bodyCtx.cat = cat
 	bodyCtx.parent = parent
 	bodyCtx.settings = ps
-	leafScans, onQuals, ok := flattenPulledBodyTree(node, len(bodyCtx.bindings))
+	leafScans, onQuals, why, ok := flattenPulledBodyTree(node, len(bodyCtx.bindings))
 	if !ok {
-		return nil, nil, nil, nil, false
+		return nil, nil, nil, nil, why, false
 	}
 	widths := make([]int, len(leafScans))
 	for i, l := range leafScans {
 		widths[i] = len(l.Output())
 	}
-	return bodyCtx, leafScans, widths, onQuals, true
+	return bodyCtx, leafScans, widths, onQuals, "", true
 }
 
 // flattenPulledBodyTree decomposes the body's provisional jointree into
@@ -350,9 +354,10 @@ func bindPulledBodyScope(sub *parser.SelectStmt, parent *resolveContext, cat cat
 // join, a derived item, an already-rewritten access path), or a leaf
 // count that disagrees with the binding count fails the whole body —
 // the flat splice has no leaf to stand in for any of those.
-func flattenPulledBodyTree(node Node, wantLeaves int) ([]Node, []Expr, bool) {
+func flattenPulledBodyTree(node Node, wantLeaves int) ([]Node, []Expr, string, bool) {
 	var leaves []Node
 	var quals []Expr
+	why := ""
 	var walk func(n Node) bool
 	walk = func(n Node) bool {
 		j, isJoin := n.(*Join)
@@ -361,6 +366,7 @@ func flattenPulledBodyTree(node Node, wantLeaves int) ([]Node, []Expr, bool) {
 			return true
 		}
 		if j.Type != JoinTypeInner && j.Type != JoinTypeCross {
+			why = "body-outer-join"
 			return false
 		}
 		if !walk(j.Left) || !walk(j.Right) {
@@ -371,15 +377,21 @@ func flattenPulledBodyTree(node Node, wantLeaves int) ([]Node, []Expr, bool) {
 		}
 		return true
 	}
-	if !walk(node) || len(leaves) != wantLeaves {
-		return nil, nil, false
+	if !walk(node) {
+		return nil, nil, why, false
+	}
+	if len(leaves) != wantLeaves {
+		return nil, nil, "body-leaf-count-mismatch", false
 	}
 	for _, l := range leaves {
 		if _, isScan := l.(*SeqScan); !isScan {
-			return nil, nil, false
+			// The leaf kind is named because it decides the remedy: a
+			// *Filter over a scan needs unwrapping, a derived item needs
+			// the opaque-body arm, a rewritten access path needs neither.
+			return nil, nil, "body-leaf-" + nliProbeIndexName(l), false
 		}
 	}
-	return leaves, quals, true
+	return leaves, quals, "", true
 }
 
 // splicePulledLeaves inserts the pulled bodies' leaf scans at their
@@ -919,9 +931,9 @@ func pullUpAnyBody(in *InExpr, parent *resolveContext, cat catalog.Catalog, ps P
 	if exprHasSublinkPlan(in.Operand) {
 		return nil, "any-nested-sublink-operand", false
 	}
-	bodyCtx, leafScans, leafWidths, onQuals, ok := bindPulledBodyScope(sub, parent, cat, ps)
+	bodyCtx, leafScans, leafWidths, onQuals, why, ok := bindPulledBodyScope(sub, parent, cat, ps)
 	if !ok {
-		return nil, "any-body-scope-not-bindable", false
+		return nil, "any-" + why, false
 	}
 	for _, q := range onQuals {
 		if exprHasOuterRefAtLevel(q, 1) {

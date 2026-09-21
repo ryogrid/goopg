@@ -12528,6 +12528,28 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
       `outerOperandAsLevel1` in `exprSwitchInventory`; it is built on
       `cloneExprRefs` and fails closed (an unenumerated type aborts the
       clone, which declines the pull-up).
+  - **ANY residue named (loop 2026-09-21 \#21)** —
+    `bindPulledBodyScope`/`flattenPulledBodyTree` now return the
+    sub-reason they failed on, and the larger ANY bucket turned out to
+    be one shape, not the one the ledger assumed.
+    - All 15 former `any-body-scope-not-bindable` fires are
+      `any-body-leaf-(*optimizer.CTEScan)`: the ANY body's FROM is a
+      **CTE reference** (`WHERE x IN (SELECT … FROM some_cte)`), the
+      TPC-DS idiom.
+    - They are NOT the opaque-body arm. Admitting a `*CTEScan` leaf
+      pushes a statistics-free input into the DP, and `itemIsDerived`
+      (relfromjoinlist.go:557) classifies exactly
+      `*CTEScan`/`*WorkTableScan` as derived — the class the Q78
+      `outer-over-derived` firewall keeps out of join ordering (C-04a:
+      Q78 15 s -> 327 s TIMEOUT). The banner makes that firewall a hard
+      constraint on every pull-up/flattening task.
+    - So this bucket is blocked on **B-06 (CTE-output statistics)**, the
+      same blocker M0145-0005 slice 5 and M0145-0006 recorded for
+      `outer-over-derived`. Building the opaque-body arm would not move
+      it.
+    - The remaining actionable ANY bucket is `any-nested-sublink` (6):
+      PG recurses `pull_up_sublinks` into a pulled body's own quals
+      (`pull_up_sublinks_qual_recurse`); goopg does not.
   - **Decline census (loop 2026-09-21 \#19)** — which arm to build next,
     measured instead of ranked by size. `notePullupDecline`
     (`internal/optimizer/nlicensus.go`, `GOOPG_NLI_CENSUS=1`) reports one
