@@ -13872,10 +13872,56 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
       `PASS=96 MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0`; acceptance arm
       24 MATCH; both default-arm floor captures (TPC-DS `match=2` Q9+Q41,
       TPC-H `match=1` Q6) held exactly; pgbench smoke.
+  - **Residual RE-SCOPED 2026-09-22 (loop \#84), measurement in the design
+    doc's final section.** Movement: none; no production file touched.
+    - **Q71 and Q76 have NO CTE at all** — their unions are plain
+      `FROM (… UNION ALL …) alias` items, exactly the shape this task's mark
+      already handles, so "`CTEScan` hides the carrier" cannot be their
+      blocker.
+    - **Q14's union CTEs are referenced 6x each**, so upstream does not
+      inline them and there is no appendrel to make. Q14 leaves the
+      population.
+    - **Q2 is the one genuine case**: its `wscs` union CTE has a single
+      reference, which is exactly PG's inlining criterion.
+    - **The real gap is WHERE THE GATHER SITS**, knob arm vs PG at SF0.25:
+      Q71 goopg `Append{Gather{Append{Parallel Seq Scan}}}` vs PG
+      `Gather{Parallel Append{…}}`; Q76 goopg `Append{Gather{…}, Gather{…}}`
+      vs PG `Gather Merge{Parallel Append{…}}`. goopg gathers INSIDE each
+      member and appends the gathered results; PG keeps the members partial
+      under ONE Gather above a parallel-aware Append.
+    - **The appendrel machinery is not what decides it**: default arm vs
+      knob arm in the same capture run, **Q71 and Q76 are byte-identical**
+      in Append/Gather structure and Q2 differs only in cost.
+    - Next step, and do NOT skip it: instrument which of
+      `addBaseRelGatherPaths` / `upperSplitWorkers` / the member scope's own
+      search root commits the gather BEFORE the Append is built. Guessing
+      the mechanism is the failure mode the last several loops kept
+      catching. Expected movement once known: the `parallelism` category on
+      SF0.25, which reads 84-85 in both arms today.
+    - **LINEAGE NOTE — why this is not a separate task, and an ESCALATION.**
+      Filing it as `M0145-0004a` was REFUSED by
+      `scripts/ralph-lineage-guard.py`: root M0145-0001's last five
+      completed descendants (M0145-0006, -0014, -0015, -0016, -0017) all
+      carry `Movement: none`, so the budget is exhausted and the guard's
+      remedy is to mark the ROOT `[!]` and select elsewhere. **The owner
+      re-opened M0145-0001 on 2026-09-22 and sequenced this very chain
+      (0004 → 0005 → 0007 → 0008) after that escalation was answered**, so
+      marking it `[!]` again would contradict a live owner decision, and the
+      loop does not do that (R4). The guard cannot see the re-open because
+      the five `Movement: none` rows are still the last five. The finding is
+      therefore recorded here, inside an EXISTING task, rather than as a new
+      descendant. **This will recur on every attempt to file work under this
+      root**, which is a standing blocker on the banner's own chain and
+      needs the owner to clear it — by re-pinning the lineage baseline or by
+      exempting the re-opened root.
+
   - Still open (ledgered): member-level rtable entries +
     parent-qual distribution into members (`distribute_qual_to_rels` —
-    M0145-0005's IR work); LATERAL union propagation; CTE-wrapped union
-    leaves (`CTEScan` hides the carrier — Q2/Q14/Q71/Q76's shapes);
+    M0145-0005's IR work); LATERAL union propagation; ~~CTE-wrapped union
+    leaves (`CTEScan` hides the carrier — Q2/Q14/Q71/Q76's shapes)~~
+    **RE-SCOPED 2026-09-22 (loop \#84) — the description is wrong for three
+    of the four; the corrected residual is recorded in the sub-bullets
+    below and NOT filed as a separate task, see the lineage note**;
     serial-side member-path competition (leaf serial path stays
     prebuilt-over-nested-winner); `is_safe_append_member`'s pull-up
     half is inapplicable in this model (members are not promoted —

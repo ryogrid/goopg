@@ -361,3 +361,65 @@ would allow.
 
 Artefacts: `tmp/m0145-0004-tlist/` (knob arm at HEAD, knob arm with the naive
 comparison, knob arm with the alias fix, and both default-arm floor captures).
+
+
+---
+
+# The "CTE-wrapped union leaves (Q2/Q14/Q71/Q76)" residual is mis-described (2026-09-22)
+
+The deferral list records the remaining Parallel Append sites as *"CTE-wrapped
+union leaves (`CTEScan` hides the carrier — Q2/Q14/Q71/Q76's shapes)"*. Measured
+against the corpus, that description does not hold for three of the four, and
+the mechanism it names is not what blocks them.
+
+## What the queries actually are
+
+| query | union sits in | CTE refcount |
+|---|---|---|
+| Q2 | a CTE `wscs` | **1** — single-ref, so PG inlines it and `pull_up_simple_union_all` does apply |
+| Q14 | the main body / `x` subquery; its CTEs `cross_items`, `avg_sales` are referenced **6×** each | 6 — PG does **not** inline them, so there is no appendrel to make |
+| Q71 | a plain `FROM (… UNION ALL … ) tmp` | **no CTE at all** |
+| Q76 | a plain `FROM (… UNION ALL … ) x` | **no CTE at all** |
+
+Q71 and Q76 are exactly the FROM-clause shape this task's mark already
+handles, so "CTEScan hides the carrier" cannot be their blocker.
+
+## What the plans show
+
+goopg knob arm vs PG 18.3, SF0.25:
+
+```
+Q71  goopg:  Append { Gather { Append { Parallel Seq Scan … } }, … }
+     PG:     Gather { Parallel Append { Parallel Hash Join …, … } }
+
+Q76  goopg:  Append { Gather { Parallel Seq Scan … }, Gather { … } }
+     PG:     Gather Merge { Parallel Append { Parallel Hash Join …, … } }
+```
+
+The difference is not a missing Append — goopg builds one. It is **where the
+Gather sits**: goopg gathers inside each member and appends the gathered
+results, where PG keeps the members partial and puts ONE Gather above a
+parallel-aware Append.
+
+## And the appendrel machinery is not what decides it
+
+Default arm vs knob arm, same capture run: **Q71 and Q76 are byte-identical**
+in their Append/Gather structure, and Q2 differs only in cost. So for these
+queries the hoist either does not fire or fires without changing the shape —
+either way the gather-per-member shape is decided somewhere else.
+
+## Consequence
+
+The residual is re-stated in M0145-0004's own task body with the accurate
+description — the gap is gather placement over union members, not CTE carrier
+visibility. It is NOT a separate task: filing one was refused by the lineage
+guard (root M0145-0001's last five completed descendants all read
+`Movement: none`), and the guard's remedy — mark the root `[!]` — would
+contradict the owner's 2026-09-22 re-open of exactly this chain. That conflict
+is escalated in the task body; it blocks filing ANY new work under this root. Q14 is
+removed from the population outright (its union CTEs are 6-referenced, so
+upstream does not flatten them either) and Q2 is kept as the one genuine
+single-reference CTE case.
+
+No production file was touched: the correct next step depends on which
+mechanism holds the Gather down, and this measurement does not yet say.
