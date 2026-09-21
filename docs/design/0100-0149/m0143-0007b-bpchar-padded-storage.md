@@ -1,9 +1,9 @@
 # R23: padded `character(N)` on-disk storage (M0143-0007b)
 
-Status: **SLICES 1-3 LANDED 2026-09-22.** Storage is padded, the padding is
-applied before the TOAST decision, and the functions that upstream defines on
-the TRIMMED value now trim explicitly instead of relying on the old storage
-shape. Slice 4 (re-measure `relpages`) remains. The boundary inventory below was
+Status: **COMPLETE 2026-09-22 - all four slices landed.** Storage is padded,
+the padding is applied before the TOAST decision, the functions upstream
+defines on the TRIMMED value trim explicitly, and slice 4 measured the result:
+**K41's `relpages` gap is closed**, from -31%/-44% to -0.6%/-3.3%. The boundary inventory below was
 measured before coding and two of the boundaries the task names did not need
 changing — but it also MISSED two, each caught by a different gate; see "What
 the inventory missed" and "Slice 2".
@@ -268,8 +268,48 @@ the truth. `internal/catalog/bpchar.go`, `pgoutput.go`, `pgoutput_bpchar_test.go
 and `expr.go`'s `octet_length` note were rewritten, each also recording WHY the
 `PadBpchar` call must stay: pre-flip rows on disk are trimmed.
 
-## Next
+## Slice 4 - K41's gap, re-measured and closed
 
-Slice 4 — reload and re-measure `relpages` on `customer`/`item` against PG.
-That is the only way K41's original gap is shown closed rather than its
-mechanism.
+The mechanism being right is not the same as the number being right, so slice 4
+reloads and measures. `customer` and `item` were built from the upstream TPC-DS
+schema on a private goopg (fresh datadir, current binary) and filled from the
+same SF0.25 TSVs the benchmark cluster used; page counts were read off the
+relfilenode on disk. PG's side is `pg_class.relpages`, read SELECT-only from
+the read-only TPC-DS reference cluster.
+
+```
+table      rows      PG   before    after      gap
+customer 100000    2872     1979     2854    -0.63%
+item      18000    1284      716     1242    -3.27%
+```
+
+Row counts match exactly on both sides (100,000 and 18,000). The `before`
+column is M0143-0007's original K41 measurement, at -31.1% and -44.2%.
+
+**The gap is closed.** What remains - under 1% on `customer`, 3.3% on `item` -
+is goopg packing pages slightly more densely, which M0143-0007 had already
+separated out and measured as its own smaller effect ("goopg packs pages MORE",
+free-space-per-page rather than tuple width). That residual is not this task's
+and is not claimed as closed by it.
+
+Why `customer` and `item` are the right witnesses: between them they carry
+eight `char(N)` columns totalling ~150 characters per row (`c_customer_id` 16,
+`c_salutation` 10, `c_first_name` 20, `c_last_name` 30, `c_login` 13,
+`c_email_address` 50, and so on), so the padding is a large fraction of the
+tuple - which is exactly why K41 surfaced on them and not on the fact tables.
+
+## Summary of the four slices
+
+1. **Storage** - `coerceTextLikeDatum` pads instead of trimming.
+2. **TOAST order** - pad before the toast decision, as `bpchar_input` does;
+   fixed a 50x heap regression slice 1 had introduced on wide columns.
+3. **Consumers** - `length`, `bit_length` and the `char(n) -> text` cast
+   (`rtrim1`) apply upstream's trimming rules explicitly; the pgoutput
+   boundary was verified as already correct.
+4. **Measurement** - K41's gap closed, confirmed against the live reference.
+
+The lesson the task produced, confirmed three times: when a storage convention
+changes, the sites that RE-PAD are safe because they route through one
+idempotent helper, and the dangerous ones are CONSUMERS that read the stored
+image. Each of the three misses was invisible to a different gate - the
+upstream regress suite, a byte-level measurement, and a stored-column witness.

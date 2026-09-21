@@ -11373,7 +11373,7 @@ reported, and the values and unit gates are the bar.
     load-bearing design convention (trimmed bpchar storage,
     `internal/catalog/bpchar.go`) across multiple sibling paths. Ledger:
     `.ralph/deferral_ledger.md`, row dated 2026-09-18.
-- [ ] **M0143-0007b — implement (or owner-decline) R23 `character(N)` on-disk
+- [x] **M0143-0007b — implement (or owner-decline) R23 `character(N)` on-disk
   blank-padding.**
   Parent: M0143-0007. M0143-0007 confirmed PG pads `bpchar`
   storage to its declared width and goopg does not, and that this fully
@@ -11529,6 +11529,37 @@ reported, and the values and unit gates are the bar.
       - **Next: slice 4** — reload and re-measure `relpages` on
         `customer`/`item`, the only way K41's gap is shown closed in number
         rather than mechanism.
+    - **SLICE 4 LANDED 2026-09-22 (loop 56) — M0143-0007b is COMPLETE.**
+      - The mechanism being right is not the number being right, so slice 4
+        reloads and MEASURES. `customer`/`item` built from the upstream
+        TPC-DS schema on a fresh private goopg and filled from the same
+        SF0.25 TSVs; page counts read off the relfilenode on disk; PG's
+        `relpages` read SELECT-only from the read-only reference.
+      - **K41's gap is closed**:
+
+        ```
+        table      rows      PG   before    after      gap
+        customer 100000    2872     1979     2854    -0.63%
+        item      18000    1284      716     1242    -3.27%
+        ```
+
+        against M0143-0007's original **-31.1%** and **-44.2%**. Row counts
+        identical on both sides.
+      - **The residual is NOT claimed closed**: under 1% / 3.3% is goopg
+        packing pages more densely, which M0143-0007 already separated as
+        its own effect (free-space-per-page, not tuple width). It belongs to
+        whichever task owns heap page density.
+      - Why these two tables: between them they carry eight `char(N)`
+        columns totalling ~150 characters per row, so the padding is a large
+        fraction of the tuple — which is why K41 surfaced on the dimension
+        tables and not the fact tables. Measuring the SAME tables the
+        original finding used is what makes "closed" mean the same thing.
+      - Gates: units PASS. No production code changed this slice
+        (measurement only), so the corpus gates were not re-run; slices 1-3
+        each ran the full set.
+      - **Still open, each its own task**: the heap page-density residual,
+        and logical replication of TOASTED values (slice 3's ledger row).
+        Ledgered.
 - **OWNER DECISION 2026-09-20 — APPROVED.** The owner approves reversing
   the trimmed-`bpchar`-storage convention: implement R23 padded
   `character(N)` storage. Proceed per the task text — design doc first,
