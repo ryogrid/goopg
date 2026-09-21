@@ -358,3 +358,32 @@ func noteRebaseFail(reason string) {
 func exprTypeName(e Expr) string {
 	return strings.TrimPrefix(fmt.Sprintf("%T", e), "*optimizer.")
 }
+
+// noteOnQualSublinks records each sublink-bearing conjunct of an explicit
+// join's ON clause, with the join's TYPE — not merely "in an ON clause".
+//
+// The type is the whole point. PG runs the pull-up on ON quals under a
+// legality boundary (`postgres/src/backend/optimizer/prep/prepjointree.c`,
+// the `pull_up_sublinks_jointree_recurse` JoinExpr arm): INNER passes both
+// sides' rels as available, LEFT passes only the RHS, RIGHT only the LHS, and
+// FULL passes NOTHING — a sublink pulled out of a null-preserved side is a
+// wrong-answer class, not a missed optimisation. A census that reported only
+// "an ON clause holds an EXISTS" could not tell a pullable conjunct from one
+// that must stay a SubPlan, so it would answer the wrong question.
+//
+// The site string is M0145-0015's `<kind>@<position>`, reused rather than
+// re-derived: an EXISTS under an OR inside an ON clause is out of reach for
+// the same reason it is out of reach inside a WHERE.
+func noteOnQualSublinks(jt parser.JoinType, onPred Expr) {
+	if !nliCensusEnabled || onPred == nil {
+		return
+	}
+	for _, c := range splitAnd(onPred) {
+		site := sublinkConjunctSite(c)
+		if site == "" {
+			continue
+		}
+		fmt.Fprintf(os.Stderr, "ONSUBLINK jointype=%s site=%s\n",
+			traceJoinTypeName(jt), site)
+	}
+}

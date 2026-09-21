@@ -7347,6 +7347,15 @@ func planJoinPredicate(join parser.JoinExpr, leftCtx, rightCtx, mergedCtx *resol
 		if onErr != nil {
 			return nil, onErr
 		}
+		// M0145-0017 step 1: census sublinks sitting in an explicit join's ON
+		// clause. This is the ONE clause position where upstream's reach
+		// exceeds goopg's — `pull_up_sublinks_jointree_recurse` runs the
+		// pull-up on every jointree level's quals, ON clauses included, while
+		// goopg's `pullUpSublinksIntoJointree` walks the top-level WHERE only.
+		// Every other never-reached position (target list, HAVING, nested
+		// expression contexts) keeps its SubPlan in PG too, so ON is where a
+		// real gap could hide.
+		noteOnQualSublinks(join.Type, onPred)
 		return foldQualConstants(onPred)
 	}
 	if len(join.Using) > 0 {

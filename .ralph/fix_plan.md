@@ -14376,7 +14376,7 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
     selectable work (0003's own named movement, the `leaf-count` class, is
     still open at 19 fires). **If that assumption is wrong, say so and the
     loop will restart at 0003.**
-- [ ] **M0145-0017 — census the never-reached sublink population
+- [x] **M0145-0017 — census the never-reached sublink population
   and pull the PG-pullable subset** (filed 2026-09-21 by owner
   directive). Of 308 knob-arm sublink-planning events, only ~60
   conjuncts ever reach `pullUpSublinksIntoJointree` — the rest
@@ -14404,6 +14404,35 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
   decomposed into "correctly out of reach" vs "newly pulled".
   Kind: impl
   Parent: M0145-0003
+  - **CLOSED measured-no-gap 2026-09-21.** Design doc
+    `docs/design/0100-0149/m0145-0017-never-reach-sublink-census.md`.
+    - **PG's reach bounded from the oracle, not assumed**: `pull_up_sublinks`
+      (`prepjointree.c:468`) begins and ends at `root->parse->jointree` and
+      has exactly one caller (`plan/planner.c:737`). A jointree carries quals
+      in two places — the `FromExpr`'s (the WHERE) and each `JoinExpr`'s (an
+      explicit join's ON). Target list, HAVING, GROUP BY, ORDER BY and nested
+      scalar contexts are **never candidates upstream either**, so goopg
+      keeping them SubPlans is parity. The difference between the two reaches
+      is EXACTLY the ON clauses.
+    - **Step 1 done**: `noteOnQualSublinks` reports
+      `ONSUBLINK jointype=<t> site=<kind>@<position>` at `planJoinPredicate`.
+      The join TYPE is recorded because PG's legality boundary differs by it
+      (INNER both sides, LEFT the RHS only, RIGHT the LHS only, **FULL
+      never** — pulling from a null-preserved side is a wrong-answer class).
+      The site string reuses M0145-0015's vocabulary.
+    - **The measurement**: TPC-DS SF0.25, all 99 queries, BOTH arms —
+      **ONSUBLINK 0**; routes knob 46 jointree-pullup + 567 pinned-spine,
+      default 398 pinned-spine. A textual scan of the query corpus agrees.
+    - **Decomposition the task asked for**: "correctly out of reach"
+      entirely, "newly pulled" empty. Step 2 would be built against zero
+      witnesses, which is this task's own measured-no-gap arm.
+    - **What stays unbuilt, ledgered**: goopg's ON-clause walk itself. A
+      statement that DOES put an EXISTS/ANY in an INNER join's ON clause
+      would be pulled up by PG and not by goopg. The census line is
+      permanent and prints exactly the fields needed to decide, so the
+      resume point needs no new instrument.
+  Movement: none — measured-no-gap. The census line is the whole production
+  change.
 - [ ] **M0145-0018 — relax the `outer-over-derived` firewall
   (owner decision GO, 2026-09-21)**. M0145-0011's E1 measured the
   diagnostic bypass clean at BOTH scales: on SF0.25 AND SF1
