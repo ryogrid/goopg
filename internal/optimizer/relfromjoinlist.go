@@ -70,6 +70,7 @@ package optimizer
 
 import (
 	"fmt"
+	"os"
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/parser"
@@ -560,6 +561,32 @@ func leafIsDerivedInput(scan Node, info baseRelInfo) bool {
 	return info.table == nil
 }
 
+// derivedFirewallEnabled gates the `outer-over-derived` decline above.
+//
+// M0145-0011 scope (a): a DIAGNOSTIC bypass, `GOOPG_DERIVED_FIREWALL=off`,
+// added so the blockers' unblock conditions can be re-evaluated by MEASUREMENT
+// rather than by argument. It follows the census flags' precedent
+// (`GOOPG_NLI_CENSUS`, nlicensus.go): read once at process start, default ON,
+// so the default arm is byte-identical to today and nothing in a normal run
+// consults the environment.
+//
+// It exists because M0145-0009's census established that the 648 unresolvable
+// CTE-output column asks are columns PG itself would not resolve either — so
+// "wait for CTE-output statistics" cannot be the standing answer. The residuals'
+// named unblock conditions are ROW-estimate conditions, and row-level CTE
+// estimates already sit at PG-equivalent granularity (`EstimateRows(*CTEScan)`
+// recurses the body, ≈ `set_cte_size_estimates`' `plan_rows` propagation).
+// Whether the DP still misprices catastrophically under today's estimates is a
+// measurement question.
+//
+// HARD CONSTRAINT, restated because this flag is the thing that could violate
+// it: the firewall stays ON for the default arm, and M0145-0011 lands NO
+// relaxation. Turning it off is for EXPLAIN-only private evidence on the knob
+// arm (G8). The shape it guards against is not hypothetical — C-04a measured a
+// 15 s Hash plan become a 327 s Nested-Loop timeout when an epsilon rows=1
+// estimate on a derived input won the comparison.
+var derivedFirewallEnabled = os.Getenv("GOOPG_DERIVED_FIREWALL") != "off"
+
 // problemPairsOuterWithDerived reports whether any OUTER hand in sjis
 // (already remapped to this problem's item space by sjInfosInItemSpace)
 // touches an item whose STATEMENT leaves include a derived (table-less)
@@ -723,7 +750,7 @@ func (prob *joinlistProblem) searchOneProblem(items []joinlistRel, tupleFraction
 	// inner-only problems over derived inputs are unaffected (their
 	// rows=1 is A4-expected and values-passing). Resume: lift when B-06
 	// wires CTE-output stats (TODO_ALL B-06 step 4).
-	if problemPairsOuterWithDerived(sjis, items, prob) {
+	if derivedFirewallEnabled && problemPairsOuterWithDerived(sjis, items, prob) {
 		traceSeamDecline("outer-over-derived", len(prob.bindings), len(items))
 		return joinlistRel{}, fmt.Errorf("join search: problem pairs an outer join with a derived input, which carries no statistics")
 	}

@@ -183,6 +183,16 @@ var flagResolvedState = map[string]func(string) string{
 	// the legacy pipeline stays the value-gated arm through the whole
 	// transition; the knob is retired by M0145-0008's cutover.
 	"GOOPG_JOINTREE_PIPELINE": func(v string) string { return onOff(jointreePipelineFromEnv(v)) },
+	// M0145-0011 scope (a) (relfromjoinlist.go): bypasses the
+	// `outer-over-derived` firewall. It is NOT diagnostic-only and is
+	// deliberately NOT in `flagProvenanceExempt`: turning it off CHANGES THE
+	// CHOSEN PLAN — that is its entire purpose — so an artefact that does not
+	// name it cannot say whether the firewall was in force. Default ON; the
+	// firewall stays on for the default arm and M0145-0011 lands no
+	// relaxation. The shape it guards is measured, not hypothetical: C-04a saw
+	// a 15 s Hash plan become a 327 s Nested-Loop timeout when an epsilon
+	// rows=1 estimate on a derived input won the comparison.
+	"GOOPG_DERIVED_FIREWALL": func(v string) string { return onOff(v != "off") },
 }
 
 // flagProvenanceOrder is the order the flags are stamped in. The first six are
@@ -261,6 +271,10 @@ var flagProvenanceOrder = []string{
 	// (incrementalsortpaths.go). Default `off` — createPlanNode has no arm
 	// for PathIncrementalSort until the executor operator lands.
 	"GOOPG_INCREMENTAL_SORT",
+	// Joined at M0145-0011: bypasses the `outer-over-derived` firewall
+	// (relfromjoinlist.go). Default `on`. Plan-SHAPING, not diagnostic — a
+	// capture taken with it `off` is knob-arm private evidence and must say so.
+	"GOOPG_DERIVED_FIREWALL",
 	// Joined at M0145-0002: selects the jointree-first pipeline
 	// (AGENT.md §"Plan-parity harness" G8). Default `off`; a knob-arm
 	// capture that does not name the flag cannot say which pipeline it
