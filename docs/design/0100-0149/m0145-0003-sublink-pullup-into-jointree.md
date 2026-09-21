@@ -2,6 +2,62 @@
 
 Status: landed (EXISTS/NOT EXISTS flat-body arm) / gates in §"Measurement".
 
+## The ANY arm — `convert_ANY_sublink_to_join` (landed 2026-09-21)
+
+The census below picked this arm; it is now in. `anyPullupConjunct` recognises
+a plain-equality `*InExpr` over a retained body, and `pullUpAnyBody` produces
+the same `jtPulledBody` the EXISTS arm produces, so the seam, the leaf
+numbering and `classifyPulledQuals` are all unchanged.
+
+### The one genuinely new mechanism: the link predicate is synthesised
+
+An EXISTS body carries its correlation in its own WHERE, so the pull-up hands
+those conjuncts through and the seam finds the spanning one. An ANY body need
+not be correlated at all — `x IN (SELECT y FROM t)` has no cross-scope
+reference anywhere in the body, because the correlation IS the testexpr, and
+the testexpr lives in the OUTER qual. So the arm builds the missing conjunct,
+`outerOperand = bodyTarget`, in the space the EXISTS body quals already use:
+body-local columns as plain `*ColumnRef`, outer columns as
+`*OuterColumnRef{Level: 1}` (`outerOperandAsLevel1`). `rebasePulledQual` then
+rebases both halves and validates every outer index against the emitting
+bindings, `classifyPulledQuals` sees a qual spanning the emitting rels and the
+body's rels, and files it as the link predicate. Nothing downstream learns that
+one of its inputs was synthesised — and a coordinate this arm got wrong fails
+closed in the rebase rather than reading the wrong column.
+
+### `NOT IN` is refused, and that is PG's rule
+
+`NOT IN` is `<> ALL`, an ALL_SUBLink. `pull_up_sublinks_qual_recurse` converts
+ANY and EXISTS only (prepjointree.c:665/731): the three-valued NULL semantics
+of `<> ALL` are not an anti-join's — a single NULL on the inner side makes the
+whole predicate NULL, where an anti-join emits the outer row. goopg's LEGACY
+unnest does convert `NOT IN` to an ANTI join; that divergence is pre-existing
+and is ledgered separately rather than extended onto the new pipeline.
+
+### Measured
+
+Same channel, same arm, before and after (TPC-DS SF0.25 plans, knob on):
+
+| bucket | before | after |
+|---|---|---|
+| `(pulled)` | 9 | **21** |
+| `InExpr` unrecognised | 34 | **1** |
+| `any-body-scope-not-bindable` | — | 15 |
+| `any-nested-sublink` | — | 6 |
+| `SubqueryExpr` (not a gap — PG leaves scalar sublinks as SubPlans) | 15 | 15 |
+| `ExistsExpr` (below conjunct top level) | 2 | 2 |
+
+Of the 34 `IN` conjuncts: 12 now pull up, 15 decline at body-scope binding, 6
+carry a nested sublink, 1 is a non-plain form. The next two gates are named by
+the census itself rather than guessed.
+
+**Correctness evidence.** The default-arm gates cannot exercise this code at
+all, so the knob arm was swept: TPC-DS SF0.25 with `GOOPG_JOINTREE_PIPELINE=1`
+returns `PASS=96 MISMATCH=0 CKMISMATCH=0 ERROR=0` — row counts AND value
+checksums correct on every executable query with the arm live. Default-arm
+gates stay green and plan-identical (`same=99 changed=0`), TPC-H acceptance arm
+24/24.
+
 ## Which arm next — the pull-up decline census (2026-09-21)
 
 The M0145-0007 sublink-route census measured this pull-up's coverage at under

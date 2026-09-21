@@ -12494,6 +12494,40 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
     units + exprwalk census PASS, tpch-spotcheck PASS (Q12=2 Q13=33),
     SF0.25 sweep PASS (`MISMATCH=0`, plans `same=99`), acceptance arm
     24/24 value-MATCH.
+  - **ANY arm landed (loop 2026-09-21 \#20)** —
+    `convert_ANY_sublink_to_join` (subselect.c:1333) at the seam's
+    granularity. `anyPullupConjunct` + `pullUpAnyBody` produce the same
+    `jtPulledBody` the EXISTS arm does, so the seam, leaf numbering and
+    `classifyPulledQuals` are untouched.
+    - The one new mechanism: an ANY body need not be correlated at all
+      (`x IN (SELECT y FROM t)` has no cross-scope reference — the
+      correlation IS the testexpr, which lives in the OUTER qual), so
+      the arm SYNTHESISES the link conjunct `outerOperand = bodyTarget`
+      in the space the EXISTS body quals use — body-local plain
+      `*ColumnRef`, outer as `*OuterColumnRef{Level:1}`
+      (`outerOperandAsLevel1`). `rebasePulledQual` validates every outer
+      index against the emitting bindings, so a wrong coordinate fails
+      closed instead of reading the wrong column.
+    - `NOT IN` is REFUSED, and that is PG's rule, not a shortcut: it is
+      `<> ALL`, an ALL\_SUBLINK, and `pull_up_sublinks_qual_recurse`
+      converts ANY and EXISTS only (prepjointree.c:665/731). goopg's
+      LEGACY unnest does convert `NOT IN` to ANTI — a pre-existing
+      divergence, ledgered separately, not extended onto this pipeline.
+    - Measured on the same channel before/after (TPC-DS SF0.25 plans,
+      knob on): `(pulled)` 9 -> **21**, unrecognised `InExpr` 34 -> **1**,
+      with the residue landing in two NEW named buckets —
+      `any-body-scope-not-bindable` 15 and `any-nested-sublink` 6. The
+      next gates are named by the census rather than guessed.
+    - Correctness evidence had to come from the KNOB arm, because the
+      default-arm gates cannot exercise this code: TPC-DS SF0.25 sweep
+      with `GOOPG_JOINTREE_PIPELINE=1` gives
+      `PASS=96 MISMATCH=0 CKMISMATCH=0 ERROR=0` — row counts and value
+      checksums correct on every executable query. Default gates stay
+      green and plan-identical.
+    - `TestExprSwitchInventoryIsPinned` required registering
+      `outerOperandAsLevel1` in `exprSwitchInventory`; it is built on
+      `cloneExprRefs` and fails closed (an unenumerated type aborts the
+      clone, which declines the pull-up).
   - **Decline census (loop 2026-09-21 \#19)** — which arm to build next,
     measured instead of ranked by size. `notePullupDecline`
     (`internal/optimizer/nlicensus.go`, `GOOPG_NLI_CENSUS=1`) reports one

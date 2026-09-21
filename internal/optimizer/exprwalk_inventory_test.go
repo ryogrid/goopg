@@ -165,6 +165,15 @@ var exprSwitchInventory = map[string]walkerRole{
 	// local_filters.go:conjunctIsLocalEligible.
 	"jointreepullup.go:rebasePulledQual":             nonRecursiveClassifier,
 	"jointreepullup.go:exprListHasLocalAndLevel1Ref": nonRecursiveClassifier,
+	// Added by M0145-0003's ANY arm. Same demoted shape and the same
+	// fail-closed property as rebasePulledQual above: the dispatch lives
+	// inside a cloneExprRefs Rewrite closure (lift *ColumnRef to Level-1
+	// *OuterColumnRef, VETO an existing *OuterColumnRef), and an
+	// unenumerated type aborts the clone, which declines the pull-up. A
+	// missed type can therefore cost a conversion, never produce a wrong
+	// one — and `rebasePulledQual` validates every index this function
+	// produces against the emitting bindings on the way back out.
+	"jointreepullup.go:outerOperandAsLevel1": nonRecursiveClassifier,
 	// Added by M0127-P5.5-e-i. Built on cloneExprRefs (which carries both the
 	// recursion and the exhaustiveness); what the census sees is the
 	// three-arm dispatch inside the Rewrite closure — renumber *ColumnRef,

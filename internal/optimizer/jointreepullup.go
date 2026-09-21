@@ -137,6 +137,25 @@ func pullUpSublinksIntoJointree(pred Expr, ctx *resolveContext, cat catalog.Cata
 	}
 	var pu *jtPullup
 	for _, c := range splitAnd(pred) {
+		// M0145-0003 ANY arm: `x IN (SELECT y FROM …)` is the other half
+		// of PG's pull-up scope (`pull_up_sublinks_qual_recurse` converts
+		// ANY_SUBLINK at prepjointree.c:665 and EXISTS_SUBLINK at :731).
+		// The decline census measured it as 34 of the 45 unpulled sublink
+		// conjuncts on TPC-DS SF0.25 — the dominant miss.
+		if in, okIn := anyPullupConjunct(c); okIn {
+			body, reason, okBody := pullUpAnyBody(in, ctx, cat, ps)
+			if !okBody {
+				notePullupDecline(reason)
+				continue
+			}
+			notePullupDecline("")
+			if pu == nil {
+				pu = &jtPullup{pulled: make(map[Expr]bool)}
+			}
+			pu.bodies = append(pu.bodies, body)
+			pu.pulled[c] = true
+			continue
+		}
 		ex, negated, ok := existsPullupConjunct(c)
 		if !ok || ex.Subquery == nil {
 			// M0145-0003 census: a conjunct this arm does not even
@@ -823,4 +842,158 @@ func splitAndExcludingPulled(pred Expr, pu *jtPullup) []Expr {
 		out = append(out, c)
 	}
 	return out
+}
+
+// anyPullupConjunct recognises the conjunct shape the ANY arm converts: a
+// bare `*InExpr` over a retained subquery body, in its PLAIN EQUALITY form.
+//
+// Two refusals are the point:
+//
+//   - `NOT IN` (`Negated`) is NOT converted, and this is PG's rule, not a
+//     goopg limitation. `NOT IN` is `<> ALL`, an ALL_SUBLink, and
+//     `pull_up_sublinks_qual_recurse` converts ANY and EXISTS only — the
+//     three-valued NULL semantics of `<> ALL` are not those of an anti-join
+//     (a single NULL on the inner side makes the whole predicate NULL, where
+//     an anti-join would emit the row). goopg's LEGACY unnest does convert
+//     `NOT IN`; that divergence is pre-existing and ledgered, and this arm
+//     does not extend it to the new pipeline.
+//   - `= ANY`-with-an-operator (`AnyOp`), `ALL`, and `x <> ANY(...)`
+//     (`NotEqualAny`) are refused by `inExprIsPlainEquality`, the same gate
+//     the legacy unnest uses: the link predicate this arm synthesises is an
+//     equality, so a non-equality ANY would be a different predicate.
+func anyPullupConjunct(c Expr) (*InExpr, bool) {
+	in, ok := c.(*InExpr)
+	if !ok || in.Subquery == nil || in.Operand == nil {
+		return nil, false
+	}
+	if in.Negated || !inExprIsPlainEquality(in) {
+		return nil, false
+	}
+	return in, true
+}
+
+// pullUpAnyBody is `convert_ANY_sublink_to_join` (subselect.c:1333) at
+// goopg's seam granularity: the body becomes semi/anti leaf entries exactly
+// as an EXISTS body does, and the SubLink's testexpr becomes the join clause.
+//
+// # Why the join clause is synthesised rather than lifted
+//
+// An EXISTS body carries its correlation in its own WHERE, so the pull-up
+// hands those conjuncts through unchanged and the seam finds the spanning
+// one. An ANY body need not be correlated at all: `x IN (SELECT y FROM t)`
+// has no cross-scope reference anywhere in the body — the correlation IS the
+// testexpr, which lives in the OUTER qual. So this arm builds the missing
+// conjunct, `outerOperand = bodyTarget`, in the same space the EXISTS body
+// quals use: body-local columns as plain `*ColumnRef`, outer columns as
+// `*OuterColumnRef{Level: 1}`. `rebasePulledQual` then rebases both halves,
+// `classifyPulledQuals` sees a qual spanning the emitting rels and the body's
+// rels, and files it as the link predicate — the same path the EXISTS arm's
+// correlation conjunct takes. Nothing downstream learns that one of its
+// inputs was synthesised.
+//
+// # The gates
+//
+// PG's own list (subselect.c:1345-1386): the sub-select may not reference
+// parent rels outside `available_rels`, the testexpr must reference the
+// parent (else the conversion is pointless), and the testexpr must be
+// non-volatile. goopg's seam adds the body-shape gate every pulled body
+// passes (`sublinkBodyIsSimple`) and one of its own: the body's target list
+// must be a single non-star expression, because the synthesised equality
+// needs exactly one body column to bind to.
+func pullUpAnyBody(in *InExpr, parent *resolveContext, cat catalog.Catalog, ps PlannerSettings) (*jtPulledBody, string, bool) {
+	sub := in.Subquery
+	if !sublinkBodyIsSimple(sub) {
+		return nil, "any-body-not-simple", false
+	}
+	if len(sub.Targets) != 1 || sub.Targets[0].Expr == nil {
+		return nil, "any-target-not-single", false
+	}
+	// `contain_volatile_functions(sublink->testexpr)` (subselect.c:1385):
+	// once the testexpr becomes a join clause its evaluation count is the
+	// join's, not once per outer row.
+	if exprListHasVolatileBuiltin([]Expr{in.Operand}, cat) {
+		return nil, "any-volatile-testexpr", false
+	}
+	// A sublink inside the operand would have to be planned in a scope this
+	// arm is about to move; refuse rather than reason about it.
+	if exprHasSublinkPlan(in.Operand) {
+		return nil, "any-nested-sublink-operand", false
+	}
+	bodyCtx, leafScans, leafWidths, onQuals, ok := bindPulledBodyScope(sub, parent, cat, ps)
+	if !ok {
+		return nil, "any-body-scope-not-bindable", false
+	}
+	for _, q := range onQuals {
+		if exprHasOuterRefAtLevel(q, 1) {
+			return nil, "any-on-qual-parent-ref", false
+		}
+	}
+	var where Expr
+	if sub.Where != nil {
+		var err error
+		where, err = resolveExpr(sub.Where, bodyCtx)
+		if err != nil {
+			return nil, "any-where-not-resolvable", false
+		}
+	}
+	if exprHasSublinkPlan(where) || exprListHasSublinkPlan(onQuals) {
+		return nil, "any-nested-sublink", false
+	}
+	quals := append(splitAnd(where), onQuals...)
+	if exprListHasVolatileBuiltin(quals, cat) {
+		return nil, "any-volatile-qual", false
+	}
+	// The body target, in body-local coordinates.
+	target, err := resolveExpr(sub.Targets[0].Expr, bodyCtx)
+	if err != nil {
+		return nil, "any-target-not-resolvable", false
+	}
+	outer, okOuter := outerOperandAsLevel1(in.Operand)
+	if !okOuter {
+		return nil, "any-operand-not-outer-columns", false
+	}
+	link := &BinaryOp{Op: parser.OpEq, Left: outer, Right: target}
+	return &jtPulledBody{
+		expr:         in,
+		jointype:     parser.JoinSemi,
+		leafScans:    leafScans,
+		leafWidths:   leafWidths,
+		bodyBindings: bodyCtx.bindings,
+		quals:        append([]Expr{link}, quals...),
+	}, "", true
+}
+
+// outerOperandAsLevel1 re-expresses an outer-scope operand in the body's
+// reference space: every `*ColumnRef` becomes `*OuterColumnRef{Level: 1}`,
+// which is what a correlated body WHERE would have contained if the user had
+// written the equality inside the subquery. `rebasePulledQual` validates each
+// one against the emitting bindings and converts it back, so a wrong index
+// fails closed there rather than reading the wrong column here.
+//
+// It refuses an operand that already carries an `*OuterColumnRef`: that is a
+// reference to a scope ABOVE this statement, and shifting its level is a
+// different rebase than the one `rebasePulledQual` performs on the way out.
+func outerOperandAsLevel1(operand Expr) (Expr, bool) {
+	refused := false
+	saw := false
+	out, ok := cloneExprRefs(operand, scopeVeto, exprRewriter{
+		Rewrite: func(x Expr) Expr {
+			switch r := x.(type) {
+			case *ColumnRef:
+				saw = true
+				return &OuterColumnRef{
+					pos: r.pos, Level: 1, Index: r.Index,
+					Name: r.Name, Type: r.Type, SourceTableIdx: r.SourceTableIdx,
+				}
+			case *OuterColumnRef:
+				refused = true
+				return x
+			}
+			return x
+		},
+	})
+	if !ok || refused || !saw {
+		return nil, false
+	}
+	return out, true
 }
