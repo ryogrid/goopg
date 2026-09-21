@@ -15632,7 +15632,7 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
       acceptance arm 24 MATCH; both parity captures taken with AND without the
       change (G7 discipline); pgbench smoke.
 
-- [ ] **M0145-0020 — port `examine_simple_variable`'s non-recursive CTE
+- [x] **M0145-0020 — port `examine_simple_variable`'s non-recursive CTE
   arm** (`postgres/src/backend/utils/adt/selfuncs.c:5737-5912`) (owner GO
   2026-09-22; M0145-0012's named prerequisite). PG resolves a qual on a
   CTE output column to the underlying base column's real statistics by
@@ -15647,6 +15647,69 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
   then M0145-0012 resumes to remove it.
   Kind: impl
   Parent: M0145-0012
+  - **CLOSED measured-no-gap 2026-09-22 (loop \#81) — the premise is
+    REFUTED, twice, and no code was needed to answer it.** Movement: none.
+    Design: `docs/design/0100-0149/m0145-0020-examine-simple-variable-cte-arm.md`.
+    - **(1) Upstream punts on all three named fires before reaching any
+      statistics.** `examine_simple_variable`'s CTE arm has three exits ahead
+      of the recursion and each CTE hits one:
+      - `selfuncs.c:5843` `if (subquery->setOperations || subquery->groupingSets) return;`
+        — **Q74 `year_total`** is a `UNION ALL` of two grouped selects.
+      - `selfuncs.c:5876-5883` `if (subquery->groupClause) { … return; }`,
+        which sets `isunique` ONLY for a single grouping column —
+        **Q31 `ws`** groups by 3 (`ca_county, d_qoy, d_year`).
+      - the same exit one level down — **Q39 `inv`**'s body is
+        `select … from (… group by w_warehouse_name, w_warehouse_sk,
+        i_item_sk, d_moy) foo`, so the recursion lands on the grouped
+        subquery and punts there.
+      So a FAITHFUL port returns no statistics for exactly the columns the
+      task wants them for; the success test is unattainable by this route.
+      Same conclusion M0145-0009's census reached on the ndistinct channel,
+      arrived at independently on the selectivity channel.
+    - goopg already reaches that same answer by a different route:
+      `resolveBaseColumn` (`internal/optimizer/joinkeyproof.go`) has a
+      `*CTEScan` arm that recurses into the body and stops at the same
+      `Aggregate`/set-op boundary. The two engines agree; there is nothing
+      to port.
+    - **(2) The measured cause of Q39's collapse is somewhere else.** PG does
+      NOT collapse this CTE scan. Instrumented SF0.25 cluster vs goopg's own
+      SF0.25 capture:
+      - HashAggregate INPUT: goopg 11703, PG 11606 (agree within 1%);
+      - HashAggregate OUTPUT after the `cov > 1` HAVING: goopg **20**,
+        PG **3869** (PG = `11606 × 0.3333` — every input row its own group,
+        then `DEFAULT_INEQ_SEL`);
+      - `CTE Scan on inv` after `d_moy = 1`: goopg 1, PG **19**.
+      The CTE-output qual gets the SAME default 0.005 in both engines, so the
+      qual's statistics are not the problem: 3869 × 0.005 = 19 survives,
+      20 × 0.005 = 0.1 clamps to 1. **The collapse is the body estimate.**
+    - **ESCALATION — the owner's sequencing assumption does not hold.** The
+      2026-09-22 GO filed this as M0145-0012's prerequisite. It is not one:
+      0012's `rows<=1` fallback is load-bearing because the grouped-output
+      estimate under-shoots ~193x, which is filed below as **M0145-0020a**.
+      The loop is not re-ordering the banner; recording the evidence so the
+      owner can.
+
+- [ ] **M0145-0020a — the grouped-output cardinality under-shoots ~193x**
+  (the real prerequisite M0145-0020's measurement named).
+  Kind: impl
+  Parent: M0145-0020
+  - Q39's `inv` CTE, SF0.25: same input (goopg 11703 / PG 11606), grouped
+    output goopg **20** vs PG **3869** over the 4-key
+    `group by w_warehouse_name, w_warehouse_sk, i_item_sk, d_moy` plus a
+    `CASE … > 1` HAVING.
+  - PG's number decomposes cleanly and is the MORE conservative one:
+    `estimate_num_groups` capped at the input (every row its own group) then
+    `DEFAULT_INEQ_SEL` (0.3333) for the HAVING. Establish which of the two
+    factors goopg gets wrong BEFORE changing either — the 193x could be the
+    group count, the HAVING selectivity, or both, and this loop did not
+    separate them.
+  - **Expected movement, and how it is measured** (S5): Q39's
+    `CTE Scan on inv` estimates ~19 instead of 1 with
+    `GOOPG_CTE_ROWS_FALLBACK=off`, measured by EXPLAIN; then re-run
+    M0145-0012's arm-ON/arm-OFF plan A/B over all 99 queries and report
+    whether Q31/Q39/Q74 still move into the collapse class. Corpus level:
+    `CATEGORIES-EXCL-MATCH` on both corpora.
+  - This is what unblocks **M0145-0012**, not M0145-0020.
 
 - [ ] **M0145-0021 — harness: SF1 fire-set gate for diagnostic-flag /
   estimation / cost-model tasks** (owner GO 2026-09-22; progress-doc
