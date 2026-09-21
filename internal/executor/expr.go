@@ -5585,6 +5585,19 @@ func evalCastTyped(d Datum, targetType, sourceType string, pos int, ctx *Context
 	// PG would use int4 — the known literal-typing divergence documented for
 	// to_hex at planner.go, out of scope here; the fixture spells widths
 	// explicitly via ::intN).
+	// M0143-0007b slice 3: `char(n) -> text` is `rtrim1` upstream — pg_proc.dat
+	// oid 401, "convert char(n) to text", prosrc `rtrim1` — so the blank
+	// padding is STRIPPED by the cast, not carried into the text value.
+	// Measured on PG 18.3 with a stored `char(10)` holding 'ab':
+	// `length(c::text)` is 2 and `bit_length(c)` (which resolves through this
+	// same cast) is 16, while `octet_length(c)` stays 10.
+	//
+	// goopg used to satisfy this by accident, because the stored datum was
+	// already trimmed. Since the storage flip it is padded, so the cast has to
+	// do what upstream's does.
+	if d.Kind == KindString && isBpcharTypeName(sourceType) && isTextTargetTypeName(targetType) {
+		return NewStringDatum(strings.TrimRight(d.StringValue(), " ")), nil
+	}
 	if strings.EqualFold(targetType, "bytea") && d.Kind == KindInt {
 		switch byteaIntSourceWidth(sourceType) {
 		case 2:
@@ -14602,8 +14615,11 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 			}
 			// bpchar: PG's bpcharoctetlen returns the raw datum size, and PG
 			// stores bpchar blank-padded — octet_length('ab'::char(10)) is 10,
-			// not 2. goopg keeps bpchar trimmed in the datum (M0103-0007), so
-			// pad to the declared width first. M0119-0006 (65th slice).
+			// not 2. Since M0143-0007b the datum is padded already, so this is
+			// a no-op on newly written rows — but a row written before that
+			// change is trimmed on disk and still needs the pad. Contrast
+			// `length` above, which STRIPS: bpcharlen and bpcharoctetlen are
+			// deliberately different. M0119-0006 (65th slice).
 			if tm := declaredBpcharTypmod(x.Args[0]); tm > 0 {
 				t := catalog.Type{Name: "char", Args: []int64{tm}}
 				return Datum{Kind: KindInt, Int: int64(len(catalog.PadBpchar(t, s.StringValue())))}, nil
@@ -14613,10 +14629,16 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 	case "bit_length":
 		// PG 18 defines bit_length as a SQL function, octet_length($1) * 8, for
 		// bytea (oid 1810) and text (oid 1811). There is NO bit_length(bpchar):
-		// it resolves through the implicit bpchar→text cast, which trims
-		// trailing spaces, so bit_length('ab'::char(10)) is 16 (2 bytes × 8),
-		// not 80. goopg's bpchar datum is already trimmed (M0103-0007), so the
-		// plain byte length below is the trimmed length. M0119-0006 (65th slice).
+		// it resolves through the implicit bpchar→text cast, and that cast is
+		// `rtrim1` (pg_proc.dat oid 401, "convert char(n) to text"), so the
+		// padding is STRIPPED before the length is taken —
+		// bit_length('ab'::char(10)) is 16 (2 bytes x 8), not 80.
+		//
+		// goopg used to get that for free because the stored datum was already
+		// trimmed. Since M0143-0007b it is padded, so the cast's rule has to be
+		// applied here explicitly, exactly as `length` above does. Measured
+		// against PG 18.3 on a stored char(10) holding 'ab': len 2,
+		// octet_length 10, bit_length 16.
 		if len(x.Args) == 1 {
 			s, err := evalExprSlot(x.Args[0], slot, ctx)
 			if err != nil || s.IsNull() {
@@ -14631,7 +14653,11 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 					Hint:    "No function matches the given name and argument types. You might need to add explicit type casts.",
 					Pos:     x.Pos()}
 			}
-			return Datum{Kind: KindInt, Int: int64(8 * len(s.StringValue()))}, nil
+			bl := s.StringValue()
+			if tm := declaredBpcharTypmod(x.Args[0]); tm > 0 {
+				bl = strings.TrimRight(bl, " ")
+			}
+			return Datum{Kind: KindInt, Int: int64(8 * len(bl))}, nil
 		}
 	case "upper":
 		if len(x.Args) == 1 {
@@ -21243,4 +21269,26 @@ func evalGetDatabaseEncoding(ctx *Context) (Datum, error) {
 		encName = "UTF8"
 	}
 	return NewStringDatum(encName), nil
+}
+
+// isBpcharTypeName reports whether name spells the blank-padded character type.
+// Kept beside the cast that consumes it rather than shared with
+// catalog.PadBpchar's own switch, because that one also requires a length
+// modifier (an unbounded `bpchar` pads to nothing) while the rtrim cast applies
+// to every bpchar regardless of typmod — upstream's rtrim1 takes no typmod.
+func isBpcharTypeName(name string) bool {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "char", "bpchar", "character":
+		return true
+	}
+	return false
+}
+
+// isTextTargetTypeName reports whether name is the text type the bpchar cast
+// strips for. `varchar` is deliberately NOT included: upstream's
+// bpchar->varchar cast is a separate entry and goopg's varchar path has its own
+// length rules, so folding them together here would change two behaviours
+// while testing one.
+func isTextTargetTypeName(name string) bool {
+	return strings.EqualFold(strings.TrimSpace(name), "text")
 }

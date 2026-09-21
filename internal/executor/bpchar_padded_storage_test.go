@@ -74,3 +74,58 @@ func TestBpcharStoredPaddedAndRenderBoundariesStayInert(t *testing.T) {
 		t.Errorf("unbounded bpchar stored %q, want %q verbatim", got, "ab  ")
 	}
 }
+
+// TestBpcharStoredColumnLengthFamilyMatchesPG pins the four length-family
+// answers for a bpchar read back from a STORED column, which is where slices 1
+// and 2 changed the datum under every one of them.
+//
+// The literal-expression forms are already covered by
+// TestOctetBitLengthRespectBpcharDeclaredWidth, and they kept passing
+// throughout — a literal never reaches `coerceTextLikeDatum`, so its datum
+// stayed trimmed and the old accidental agreement held. Only the stored path
+// diverged, and only a stored-column witness could see it.
+//
+// Measured against PostgreSQL 18.3 on `CREATE TABLE b(c char(10));
+// INSERT INTO b VALUES('ab')`:
+//
+//	length(c)         2    bpcharlen strips trailing blanks (bcTruelen)
+//	octet_length(c)  10    bpcharoctetlen reports the padded datum size
+//	bit_length(c)    16    resolves via the implicit bpchar->text cast, which
+//	                       is rtrim1 (pg_proc.dat oid 401) — so 2 bytes x 8
+//	length(c::text)   2    the same rtrim1 cast, written explicitly
+//
+// Three of those four are trimmed answers on a padded datum, which is why the
+// padding flip needed a fix at each of `length`, `bit_length` and the cast
+// rather than one central place: upstream genuinely treats them differently.
+func TestBpcharStoredColumnLengthFamilyMatchesPG(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	for _, ddl := range []string{
+		`create table bpad(c char(10))`,
+		`insert into bpad values ('ab')`,
+	} {
+		if err := runDDL(t, ctx, ddl); err != nil {
+			t.Fatalf("%s: %v", ddl, err)
+		}
+	}
+
+	cases := []struct {
+		sql  string
+		want int64
+	}{
+		{`select length(c) from bpad`, 2},
+		{`select octet_length(c) from bpad`, 10},
+		{`select bit_length(c) from bpad`, 16},
+		{`select length(c::text) from bpad`, 2},
+		{`select octet_length(c::text) from bpad`, 2},
+	}
+	for _, tc := range cases {
+		t.Run(tc.sql, func(t *testing.T) {
+			d, _ := byteaExprResult(t, ctx, tc.sql)
+			if d.Kind != KindInt || d.Int != tc.want {
+				t.Errorf("= %v (kind %d), want %d (PG 18.3)", d.Format(), d.Kind, tc.want)
+			}
+		})
+	}
+}

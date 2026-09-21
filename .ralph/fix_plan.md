@@ -11494,6 +11494,41 @@ reported, and the values and unit gates are the bar.
         identical; TPC-H acceptance arm 24 MATCH.
       - **Next: slice 3** — `pgoutput`'s bpchar rendering is unverified; no
         pgoutput site calls `PadBpchar`. Ledgered.
+    - **SLICE 3 LANDED 2026-09-22 (loop 55).**
+      - **Correction to this task's own design doc**: it claimed no pgoutput
+        site calls `PadBpchar`. It does — `pgoDecodePhysicalValue`
+        (`xlog/pgoutput.go`), already pinned by a test. The wrong claim came
+        from grepping a package path that does not exist (`internal/wal/`).
+      - **Two more consumers assumed trimmed storage.** On a STORED
+        `char(10)` = 'ab', measured against PG 18.3:
+        `bit_length` **80 → should be 16**, `length(c::text)` **10 → should
+        be 2**. Root: **`char(n) → text` is `rtrim1`** (`pg_proc.dat` oid
+        401), and `bit_length` has no bpchar overload so it resolves through
+        that cast. Both now apply the rule explicitly.
+      - The upstream `strings` regress diff shrank **263 → 248** lines.
+      - **The existing test could not catch it**: literal forms
+        (`'ab'::char(10)`) never reach `coerceTextLikeDatum`, so their datum
+        stayed trimmed and the old agreement held.
+        `TestBpcharStoredColumnLengthFamilyMatchesPG` is the stored-column
+        witness.
+      - **Slice 2 widened a pre-existing v0 limitation**:
+        `pgoDecodePhysicalValue` fails loudly on an external TOAST pointer,
+        and wide bpchar values are now toasted. PG has no such limitation.
+        Ledgered as its own feature, not part of R23.
+      - Every comment asserting the old trimmed convention was corrected, each
+        also recording WHY the `PadBpchar` call must stay (pre-flip rows on
+        disk are trimmed).
+      - **The pattern, now confirmed three times**: sites that RE-PAD are safe
+        (one idempotent helper); the dangerous ones are CONSUMERS that read
+        the stored image. Each miss was invisible to a different gate — the
+        regress suite, a byte-level measurement, and a stored-column witness.
+      - Gates: units PASS; regress `char` PASS (172 lines) + `varchar` PASS,
+        `strings` 263 → 248, `text` unchanged at 14 (pre-existing);
+        tpch-spotcheck PASS (Q12=2 Q13=33); TPC-DS SF0.25 PASS=96 MISMATCH=0
+        with plans 99/99 identical; TPC-H acceptance arm 24 MATCH.
+      - **Next: slice 4** — reload and re-measure `relpages` on
+        `customer`/`item`, the only way K41's gap is shown closed in number
+        rather than mechanism.
 - **OWNER DECISION 2026-09-20 — APPROVED.** The owner approves reversing
   the trimmed-`bpchar`-storage convention: implement R23 padded
   `character(N)` storage. Proceed per the task text — design doc first,

@@ -1,8 +1,9 @@
 # R23: padded `character(N)` on-disk storage (M0143-0007b)
 
-Status: **SLICES 1 AND 2 LANDED 2026-09-22.** Storage is padded AND the
-padding is applied before the TOAST decision, so a wide `char(N)` compresses
-exactly as upstream's does. Slices 3-4 remain. The boundary inventory below was
+Status: **SLICES 1-3 LANDED 2026-09-22.** Storage is padded, the padding is
+applied before the TOAST decision, and the functions that upstream defines on
+the TRIMMED value now trim explicitly instead of relying on the old storage
+shape. Slice 4 (re-measure `relpages`) remains. The boundary inventory below was
 measured before coding and two of the boundaries the task names did not need
 changing — but it also MISSED two, each caught by a different gate; see "What
 the inventory missed" and "Slice 2".
@@ -208,8 +209,67 @@ The SF0.25 sweep, the tpch-spotcheck and the TPC-H acceptance arm were **all
 green at 819 KB**, because every VALUE was correct throughout — only the bytes
 on disk were wrong, which is precisely what R23 is about. `TestToastPadsBpcharBeforeDeciding` is the witness, and it is a unit test for that reason.
 
+## Slice 3 — the pgoutput path, and two more consumers
+
+### The design's claim about pgoutput was wrong
+
+This document said "no pgoutput site calls `PadBpchar`". It does:
+`pgoDecodePhysicalValue` (`internal/access/transam/xlog/pgoutput.go`) applies
+it to every varlena payload, and `TestPgoDecodeBpcharCarriesDeclaredWidth`
+already pinned it. The earlier claim came from grepping a package path that
+does not exist (`internal/wal/`) rather than from finding the emitter. The
+boundary is covered and, like the other three, is now a no-op on newly written
+rows while remaining necessary for pre-flip trimmed ones.
+
+### What slice 2 did change at that boundary
+
+`pgoDecodePhysicalValue` **fails loudly** on an external TOAST pointer
+("logical replication of toasted values is not supported"). Slice 2 moved wide
+bpchar values into the toasted population, so a column like `char(3000)` now
+hits that pre-existing v0 limitation where it previously did not. The
+limitation is not new and is explicitly acknowledged in the code; the
+population reaching it is. Ledgered.
+
+### Two more consumers that assumed trimmed storage
+
+Measured on PG 18.3 against a STORED `char(10)` holding `'ab'`:
+
+```
+                  PG 18.3   goopg before   after
+length(c)               2              2       2
+octet_length(c)        10             10      10
+bit_length(c)          16             80      16
+length(c::text)         2             10       2
+```
+
+The root of both misses is one upstream fact: **`char(n) -> text` is `rtrim1`**
+(`pg_proc.dat` oid 401, "convert char(n) to text"), so the cast STRIPS the
+padding. `bit_length` has no bpchar overload and resolves through exactly that
+cast, which is why it reports the trimmed length while `octet_length` reports
+the padded one.
+
+goopg satisfied both by accident while storage was trimmed. The fixes apply
+upstream's rule explicitly: the cast rtrims in `evalCastTyped`, and
+`bit_length` applies the same rule via `declaredBpcharTypmod`, as `length`
+already does after slice 1.
+
+**Why the existing test did not catch it**: the literal forms
+(`'ab'::char(10)`) never reach `coerceTextLikeDatum`, so their datum stayed
+trimmed and the old agreement held. Only a STORED column diverged, and
+`TestBpcharStoredColumnLengthFamilyMatchesPG` is the witness that distinguishes
+them.
+
+The `strings` regress diff shrank 263 -> 248 lines with this fix.
+
+### The comments, corrected
+
+Every comment asserting "goopg stores bpchar trimmed" now said the opposite of
+the truth. `internal/catalog/bpchar.go`, `pgoutput.go`, `pgoutput_bpchar_test.go`
+and `expr.go`'s `octet_length` note were rewritten, each also recording WHY the
+`PadBpchar` call must stay: pre-flip rows on disk are trimmed.
+
 ## Next
 
-Slice 3 — the `pgoutput` path: no pgoutput site calls `PadBpchar`, so whether
-its rendering derives from the stored datum or re-pads independently is still
-unestablished. Then slice 4, re-measuring `relpages` on `customer`/`item`.
+Slice 4 — reload and re-measure `relpages` on `customer`/`item` against PG.
+That is the only way K41's original gap is shown closed rather than its
+mechanism.

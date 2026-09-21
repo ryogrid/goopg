@@ -571,12 +571,13 @@ func pgoDecodePhysicalValue(t catalog.Type, data []byte, regOut func(string, uin
 	if err != nil {
 		return nil, 0, err
 	}
-	// A bpchar column's heap image is trimmed (executor's coerceTextLikeDatum),
-	// where upstream's is blank-padded to the declared width; a real PG
-	// publisher therefore emits all N characters in the change message and this
-	// one emitted only the significant ones. Same catalog.PadBpchar the DataRow
-	// and COPY renderers call, so the four boundaries cannot drift (Hard-won
-	// Rule #2). No-op for every other varlena type. M0119-0006 (57th slice).
+	// A real PG publisher emits all N characters of a bpchar in the change
+	// message. Since M0143-0007b goopg's own heap image is padded too, so this
+	// call is a no-op on newly written rows — but rows written BEFORE that
+	// change are trimmed on disk and still need the padding put back here, so
+	// the call stays. Same catalog.PadBpchar the DataRow and COPY renderers
+	// use, so the four boundaries cannot drift (Hard-won Rule #2). No-op for
+	// every other varlena type. M0119-0006 (57th slice).
 	return []byte(catalog.PadBpchar(t, string(payload))), n, nil
 }
 
