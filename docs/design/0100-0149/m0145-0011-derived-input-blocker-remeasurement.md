@@ -1,7 +1,8 @@
 # Measured re-evaluation of the derived-input blockers (M0145-0011)
 
-Status: scopes (a) and (b) DONE 2026-09-21 — the diagnostic flag is landed and
-E1's evidence is gathered and **clean**. Scope (c) (E2) deferred with a ledger
+Status: scopes (a), (b) and (d) DONE 2026-09-21 — the diagnostic flag is landed,
+E1's evidence is gathered and **clean at both SF0.25 and SF1**, and the
+adjudication is reported. Scope (c) (E2) deferred with a ledger
 row; scope (d)'s adjudication is reported here for the owner.
 
 Task: `.ralph/fix_plan.md` M0145-0011. Kind: recon. Parent: none.
@@ -92,6 +93,63 @@ Recommendation to the owner — the loop does not pick:
    than statistics, and the options are the structural narrowing the task text
    lists (veto NL paths with a derived inner; `inner.Relids ∩ derived`;
    preserved-side-only decline) or documented permanence.
+
+## E1 repeated at SF1 — the scale the catastrophe was measured at (2026-09-21)
+
+Recommendation 1 above is now discharged. The A/B was re-run on a **private
+clone** of the SF=1 TPC-DS datadir (`bench/tpcds/runtime_goopg/data` copied to
+`/tmp/m11sf1`, served on `127.0.0.1:5547` under `GOOPG_CG_UNIT`), knob arm
+(`GOOPG_JOINTREE_PIPELINE=1`), same build both ways, `store_sales` = 2 880 404
+rows. Evidence dir: `tmp/m0145-0011-sf1/` (gitignored, so the numbers are
+transcribed here).
+
+**Plan channel — the same two queries move, and only those two.** All 99
+queries were EXPLAINed in both arms and diffed. Five files differ; three of
+them (Q36, Q70, Q86) differ ONLY in the temp-file name inside a pre-existing
+`syntax error at or near ";"` (the grouping-sets parse gap), so the real
+movers are **Q77 and Q78** — identical to the SF0.25 result.
+
+Q78, the firewall's own witness, stays a **hash join** — no NL-epsilon shape.
+What changes is commutation plus honest estimates:
+
+```
+firewall ON    Hash Left Join   CTE Scan on cs rows=11    CTE Scan on ws rows=7
+firewall OFF   Hash Right Join  CTE Scan on cs rows=2280  CTE Scan on ws rows=1485
+```
+
+Q77 again gains one `Nested Loop Left Join` (rows=1, cost=0.06) inside the
+grouping-sets `Append`, and one `Hash Left Join` becomes `Hash Right Join`.
+
+**Values and timing channel** (fresh server per arm, so server age is held
+constant; row counts and md5 of the result set both captured):
+
+```
+        firewall ON              firewall OFF            values
+Q77     9015 ms   44 rows        5306 ms   44 rows       ck 9bd1900a34ce55c5 both
+Q78    50885 ms  100 rows       48066 ms  100 rows       ck 3331a74f6d9f53e6 both
+```
+
+Every E1 criterion holds at SF1: no catastrophic NL shape, Q78 holds (it is in
+fact ~6% faster), values byte-identical, and Q77 — the one query that gains the
+NL shape the firewall guards against — is **1.7x faster** without the firewall.
+
+**Adjudication at scale.** The SF0.25 finding was explicitly limited because
+C-04a's 15 s → 327 s blowup is scale-dependent. At SF=1 — 4x the data, and the
+scale at which the original catastrophe was measured — the firewall still costs
+Q78 its honest estimates and buys nothing measurable, and the NL shape it would
+have prevented executes faster than the plan it forces. The unblock conditions
+in the residual blockers can therefore be redefined as **"PG-equivalent row
+estimates + measured safety at the scale the catastrophe was measured"**, and
+a relaxation can be filed as its own task.
+
+The limit that remains: SF=1 is still not the identical configuration C-04a was
+measured under, and the shape that mattered there (an epsilon-driven nested
+loop over the full fact table) is not the shape the search now picks in either
+arm. The evidence says the firewall is inert-to-harmful on this corpus at this
+scale; it does not prove the hazard class it was written for cannot recur under
+a different plan shape. That is an argument for narrowing the guard to the
+shape (veto NL paths with a derived inner), not for keeping a decline that
+poisons the estimates of every problem it touches. **The loop does not pick.**
 
 ## Hard constraints honoured
 

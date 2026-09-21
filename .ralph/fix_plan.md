@@ -13911,6 +13911,23 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
   measurement.)
   Kind: impl
   Parent: none
+  - **(a)+(b) DONE 2026-09-21** (`8b91593c7`); **(d) reported 2026-09-21** —
+    design doc `docs/design/0100-0149/m0145-0011-derived-input-blocker-remeasurement.md`.
+    E1 is clean at SF0.25 AND at **SF1** (private clone of the SF=1 datadir on
+    `:5547`, knob arm, same build both ways). Only Q77 and Q78 move in either
+    arm at either scale; Q78 stays a hash join (no NL-epsilon shape) and its
+    CTE estimates go honest (cs 11->2280, ws 7->1485); values byte-identical
+    (Q77 ck 9bd1900a34ce55c5, Q78 ck 3331a74f6d9f53e6); timings IMPROVE with
+    the firewall off (Q77 9015->5306 ms, Q78 50885->48066 ms). Adjudication
+    for the owner: the unblock conditions can be redefined as "PG-equivalent
+    row estimates + measured safety at the scale the catastrophe was
+    measured", and a relaxation is filed as its own task. **No relaxation is
+    landed here**; the firewall and the `rows<=1` guard are untouched on the
+    default arm.
+  - **(c)/E2 is the only scope still open** — relax
+    `flattenPulledBodyTree`'s bare-`*SeqScan` rule for `*CTEScan` leaves on
+    the knob arm, then re-run the pull-up/seam decline census. This task
+    stays `[ ]` until (c) lands.
 - [ ] **M0145-0012 — retire the `rows<=1` CTE fallback guard
   (`initialRelRows`, `joinsearch.go:520-526`)** (filed 2026-09-21 by
   owner directive; same proposal). The M0129-S1 arm — when a
