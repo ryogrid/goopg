@@ -1672,21 +1672,46 @@ heuristic stays live.)
     (`PGCompareBpcharC`), so sending them through would be a second,
     redundant rule on a path that is already correct.
 
-- [ ] **testport/TestPort_PgAmcheck003* re-CREATE EXTENSION after restart
-  (AI-20260921-000212-004 … -007)** — four pg_amcheck cases FAILed on the
-  same signature at ~1.0-1.4s each: `re-CREATE EXTENSION amcheck after
-  restart: pq: extension "amcheck" already exists (42710)`
-  (CombinedCorruption, MissingHeapFile, MissingIndexFork, SchemaScoped).
-  The corruption is applied, the server restarts, and the test's plain
-  `CREATE EXTENSION amcheck` now hits 42710 — i.e. the extension row
-  survives the restart (per-DB catalog persistence landed since the
-  tests were written) and the test setup was written against a
-  non-persistent extension. Likely fix: `CREATE EXTENSION IF NOT EXISTS`
-  or a DROP in the fixture. Repro: `go test -v -run
-  '^TestPort_PgAmcheck003CombinedCorruption$' ./internal/testport/`;
-  evidence `ci/logs/20260921-000212/testport/go-test.log`.
+- [x] **testport/TestPort_PgAmcheck003* re-CREATE EXTENSION after restart
+  (AI-20260922-004850-002 … -005, was AI-20260921-000212-004 … -007)** —
+  **FIXED 2026-09-22.** All four cases (CombinedCorruption, MissingHeapFile,
+  MissingIndexFork, SchemaScoped) now PASS, and they genuinely pass — checked
+  with `-v` that none of them takes one of these files' `t.Skipf` paths.
   Kind: test-fix
   Parent: none
+  Movement: none — a test-fixture fix with ZERO production diff (verified:
+  `git status` over `internal/` shows only `*_test.go`).
+  - **The engine was right and the fixture was stale.** Each of the four
+    unconditionally re-ran `CREATE EXTENSION amcheck` after its
+    stop/corrupt/restart cycle, under the comment "Runtime-only amcheck
+    install does not survive restart (gap \#7c)". That was written against a
+    goopg whose extension install was in-memory only. Catalog DDL durability
+    has since landed, so the `pg_extension` row now SURVIVES the restart —
+    and the unconditional re-create started failing 42710
+    `extension "amcheck" already exists`, which is exactly what PostgreSQL
+    raises for a duplicate `CREATE EXTENSION`. Both halves of the new
+    behaviour are PG-correct; only the workaround was obsolete.
+  - **Fixed as a POSITIVE assertion, not by softening to
+    `CREATE EXTENSION IF NOT EXISTS`.** The obvious minimal edit would have
+    been `IF NOT EXISTS`, but that passes whether the row survived or not,
+    quietly re-admitting the old gap it was written for. Each site now
+    asserts `SELECT count(*) FROM pg_extension WHERE extname='amcheck'` is
+    `1` after the restart, turning a stale workaround into a regression pin
+    on the behaviour that replaced it.
+  - Applied to all FOUR files identically — they carried the same stale step
+    verbatim, so fixing one and leaving three would have left the same defect
+    under three other names.
+  - Non-vacuity checked: flipping the expected count makes the assertion
+    report the value it actually read from the live server (`= 1`), so it is
+    querying rather than trivially succeeding.
+  - No inventory change: the AC-003 row is `defer`/not-pass-required and its
+    stated blockers (unsupported index AMs, `box`/`int4range`/`int4[]`
+    columns, STORAGE EXTERNAL TOAST corruption, multi-database orchestration)
+    are untouched by a fixture fix, so the promotion workflow does not apply.
+  - Gates: whole `TestPort_PgAmcheck*` family PASS (9.7s, catches sibling
+    breakage across the other amcheck ports), units PASS, pgbench smoke via
+    the hook. No spotcheck/sf025/acceptance-arm — zero production diff.
+
 - [ ] **testport/TestPort_PgoutputInterop* subscriber/publisher-start
   failures, second sighting (AI-20260921-000212-008 … -017)** — the same
   ten pgoutput interop cases as the CLOSED Loop \#26 task FAILed again

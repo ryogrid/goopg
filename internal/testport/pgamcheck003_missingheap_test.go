@@ -106,9 +106,24 @@ func TestPort_PgAmcheck003MissingHeapFile(t *testing.T) {
 	if err := c.Start(); err != nil {
 		t.Fatalf("restart cluster after removal: %v", err)
 	}
-	// Runtime-only amcheck install does not survive restart (gap #7c); re-install.
-	if err := runSQLSimple(t, c, "CREATE EXTENSION amcheck"); err != nil {
-		t.Fatalf("re-CREATE EXTENSION amcheck after restart: %v", err)
+	// The extension must SURVIVE the restart, which is what PostgreSQL does —
+	// pg_extension is a catalog, not session state. This step used to
+	// unconditionally re-run `CREATE EXTENSION amcheck` with the comment
+	// "runtime-only amcheck install does not survive restart (gap #7c)"; that
+	// workaround was written against a goopg whose extension install was
+	// in-memory only. Once catalog DDL became durable the row started
+	// surviving, and the unconditional re-create began failing with 42710
+	// "extension amcheck already exists" — which is ALSO what PostgreSQL does
+	// for a duplicate CREATE EXTENSION (AI-20260922-004850-002..-005).
+	//
+	// Asserted as a POSITIVE check rather than softened to
+	// `CREATE EXTENSION IF NOT EXISTS`: the persistence is the PG-correct
+	// behaviour now, so it deserves a pin. IF NOT EXISTS would pass whether
+	// the row survived or not, quietly re-admitting the old gap.
+	if got := queryScalar(t, c,
+		"SELECT count(*)::text FROM pg_extension WHERE extname = 'amcheck'"); got != "1" {
+		t.Fatalf("amcheck extension rows after restart = %s, want 1 — the "+
+			"pg_extension row must survive a restart, as it does in PostgreSQL", got)
 	}
 
 	// Guard against goopg recreating the removed fork during startup/recovery —
