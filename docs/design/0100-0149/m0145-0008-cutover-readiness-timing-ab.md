@@ -88,15 +88,51 @@ against a hash semijoin and losing — it wins its own joinrel uncontested.
 loops recorded (including this document's own first section). The A/B numbers
 stand; the mechanism behind Q4's share of them does not.
 
+### CORRECTION (same day): both routes DO fire — the joinrel never forms
+
+The section above reported that neither sublink route fired for Q4 on the knob
+arm. That was read off a run which also had `GOOPG_PGSHAPED_DP_TRACE=1` set,
+and it was wrong. Re-running Q4 on the knob arm without the trace flag, twice,
+gives:
+
+```
+PULLUPCENSUS decline=(pulled)
+SUBLINKCENSUS route=jointree-pullup
+SUBLINKCENSUS route=pinned-spine
+```
+
+The pull-up fires and the `EXISTS` **is** pulled up. What does not happen is
+anything after that: widening `noteSemiJoinrelPaths` from semi/anti to EVERY
+join type produced **zero** lines for Q4, so `addPathsToJoinrel` is never
+reached at all — the search forms no joinrel of any kind. The DPPATH trace
+agrees: it shows `relids={0}`, a single-relation problem.
+
+So the pulled body's leaves never enter the search, the `EXISTS` stays a
+per-row subplan, and Q4 runs 16.0s against the default arm's 1.5s.
+
+This is the failure mode M0145-0003's own notes predicted: `pulled` marks the
+conjunct, which SUPPRESSES the legacy pre-DP arm for that scope, and if the
+seam then declines the pulled bodies there is no semijoin left from either
+route. The note put it exactly: "without `exprListHasLocalAndLevel1Ref`,
+`pulled` would mark bodies the seam declines anyway and wrongly suppress the
+pre-DP arm".
+
+### What was ruled out
+
+- **The NOT NULL reduction wired into the generic WHERE arm** (M0145-0005, same
+  day) is NOT involved: disabling its block and re-running Q4 on the knob arm
+  gives 17.78s against 16.03s with it — no routing change, no timing change.
+- **The cost comparison** is not involved either: no joinrel is formed, so
+  nothing is costed and nothing is out-costed.
+
 ### The next probe, precisely
 
-Neither route fired, and `SUBLINKCENSUS` sits inside both route gates, so the
-question is why the code never reached them. Both gates test
-`node.(*Filter)` — the jointree pull-up in its `if f, okf := node.(*Filter)`
-arm, the legacy route in `whereEligibleForPreDPUnnest(pred)` plus its own
-unchecked assertion. A scope whose WHERE did not produce a `*Filter`, or whose
-`whereQual` was spent, reaches neither. Instrument that branch point for Q4 on
-the knob arm and read which of the two conditions is false.
+The pull-up marks the conjunct and the seam then declines. Name the decline
+class: run Q4 on the knob arm with the seam's own decline trace and read which
+class fires after `ctx.jtPullup != nil` — `classifyPulledQuals` returning
+false, `splicePulledLeaves` returning false, or a leaf-count/legality gate. The
+fix belongs to M0145-0003 (either the seam accepts what the pull-up marked, or
+the pull-up stops marking what the seam will decline), not to the cutover.
 
 ## What this means for the cutover
 

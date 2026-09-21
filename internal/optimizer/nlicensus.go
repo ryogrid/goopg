@@ -178,13 +178,14 @@ func noteSemiJoinrelPaths(joinrel *RelOptInfo, jt parser.JoinType) {
 	if !nliCensusEnabled || joinrel == nil {
 		return
 	}
-	if jt != parser.JoinSemi && jt != parser.JoinAnti {
-		return
-	}
-	name := "semi"
-	if jt == parser.JoinAnti {
-		name = "anti"
-	}
+	// Every joinrel the search forms is named, not just semi/anti. The Q4
+	// investigation needed exactly this: the pulled-up EXISTS reached the
+	// search (`PULLUPCENSUS decline=(pulled)`) and yet NO semi/anti joinrel
+	// was ever processed, which a semi-only census reports as silence — and
+	// silence is what sent one loop to the wrong conclusion. A census that
+	// prints the jointype it DID see distinguishes "not formed" from "formed
+	// as something else".
+	name := traceJoinTypeName(jt)
 	for _, p := range joinrel.Pathlist {
 		if p == nil {
 			continue
