@@ -1550,6 +1550,19 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		return nil, fmt.Errorf("goopg: pg_database reload: %w", err)
 	}
 
+	// Per-database schemas, as soon as the database list exists. The earlier
+	// reloadUserSchemasFromHeap could only read the connecting catalog's own
+	// pg_namespace heap, because it has to run before the ts_dict/ts_config
+	// passes that resolve schema OIDs — which is before this point. Without
+	// this second pass a CREATE SCHEMA inside a CREATE DATABASEd database
+	// disappears across a restart.
+	if err := ReloadUserDatabaseSchemasFromHeap(mgr, cat, clog); err != nil {
+		_ = pool.Close()
+		_ = walWriter.Close()
+		_ = mgr.Close()
+		return nil, fmt.Errorf("goopg: per-database pg_namespace reload: %w", err)
+	}
+
 	// M0122-0007 4e follow-up 39: load each distinct-dbOid database's user
 	// tables from its OWN per-database pg_class/pg_attribute heap
 	// (base/<dbOid>/1259|1249, written by syncTableToCatalogHeap's

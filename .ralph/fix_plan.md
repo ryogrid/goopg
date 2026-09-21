@@ -2031,8 +2031,69 @@ the whole file's active task between 2026-09-01 and 2026-09-14; **since
       connectable so a `CREATE EXTENSION` there writes base/4 and would be
       cloned into future `CREATE DATABASE`s~~ **FIXED 2026-09-22, see the bu
       slice below**; a template1 install re-attributes to "postgres" on
-      restart (shared bootstrap namespace); user-db-local `extnamespace`
-      falls back to "public" at reload.
+      restart (shared bootstrap namespace); ~~user-db-local `extnamespace`
+      falls back to "public" at reload~~ **FIXED 2026-09-22, see the bw
+      slice below — and the recorded symptom understated it.**
+  - 2026-09-22 (bw): **per-database `pg_namespace` reload**, closing the
+    second of the bs slice's three recorded-not-fixed items.
+    Movement: none — SF0.25 `PLAN-SHAPE same=99 changed=0`; a startup-reload
+    fix, which none of S3's three instruments measures.
+    - **The recorded symptom was the tip of a bigger bug.** The item read
+      "user-db-local `extnamespace` falls back to public at reload". Measuring
+      it showed the extension was the SYMPTOM: the SCHEMA ITSELF vanished. A
+      `CREATE SCHEMA` inside a `CREATE DATABASE`d database did not survive a
+      restart at all, so `reloadUserExtensionsFromHeap` could not resolve its
+      OID and silently fell back to `public`.
+    - **Root cause**: `reloadUserSchemasFromHeap` scanned only
+      `cat.DBOID()` — the connecting catalog's own pg_namespace heap. A user
+      database's rows sat unread in `base/<thatDbOid>/2615`. Tables in the
+      same database reloaded fine (they have their own per-database pass),
+      which is exactly what disguised this as an extension-only problem.
+    - **The first fix attempt was wrong and the live check caught it.**
+      Copying `reloadUserExtensionsFromHeap`'s per-database loop straight
+      into `reloadUserSchemasFromHeap` changed nothing, because that pass
+      runs at `open.go:1397` while `reloadDatabasesFromHeap` is at 1546 —
+      `ListDatabases()` is still EMPTY there. The extension reload only works
+      because it runs at 2401, after the database list exists.
+    - Fixed by SPLITTING rather than moving: the early pass keeps reading the
+      connecting catalog's heap (the ts_dict/ts_config reloads that follow it
+      need the schema OID map populated, and they run before 1546), and a new
+      `ReloadUserDatabaseSchemasFromHeap` runs immediately after the
+      pg_database reload for every other database. Moving the whole pass late
+      would have broken those dependents.
+    - Verified live end to end on a fresh cluster: schema `uext` and
+      `extnamespace` both survive a restart in a `CREATE DATABASE`d database;
+      both were wrong before.
+    - Regression test `TestPort_PerDatabaseSchemaSurvivesRestart` asserts BOTH
+      halves. The extension's namespace alone would pass if the reload merely
+      guessed the right name; the schema's own existence proves the heap was
+      read. Verified non-vacuous — removing the new pass fails both
+      assertions, including the `public` fallback.
+    - **Recorded, NOT fixed** (ledgered): schemas are registered
+      process-wide, so a `CREATE SCHEMA` in one database is visible from
+      another — measured directly, not inferred. This pass deliberately
+      restores the RUNTIME behaviour rather than inventing scoping in the
+      reload: a schema that silently disappears across a restart is closer to
+      data loss than one that is over-visible, and making the two paths agree
+      is the prerequisite for scoping them together later. That scoping is the
+      same M0122-0007 family as the template1 collision escalation.
+
+- [ ] **schemas are registered process-wide, not per database** (measured
+  2026-09-22 while fixing the bw slice).
+  Kind: bug
+  Parent: M0119-0006
+  - Repro: `CREATE SCHEMA scoped_probe` while connected to a
+    `CREATE DATABASE`d database, then
+    `select nspname from pg_namespace where nspname='scoped_probe'` from
+    `postgres` — it is visible. PostgreSQL's `pg_namespace` is per-database.
+  - `catalog.SchemaNameForOID` scans one global `c.schemas` map, and
+    `RegisterSchema`/`RegisterSchemaDuringRecovery` write it, so this is by
+    construction rather than a routing slip.
+  - Same family as the template1 namespace collision (`[!]`, escalated): both
+    are per-database catalog scoping, which is M0122-0007 slices 4b-4e. Do
+    NOT fix this in isolation without reading that escalation first — the
+    owner decision there (route around the `DefaultDBOid` sentinel vs remove
+    it) governs how schema scoping should be keyed.
   - 2026-09-22 (bu): **enforce `pg_database.datallowconn` at connect time**,
     closing the first of the bs slice's three recorded-not-fixed items.
     Movement: none — SF0.25 `PLAN-SHAPE same=99 changed=0`; a connection-path

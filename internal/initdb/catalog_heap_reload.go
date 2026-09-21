@@ -187,13 +187,74 @@ func simpleCatalogReload(relOid uint32, shared bool, name string,
 // need no special handling: their old versions carry xmax and the liveness
 // filter skips them.
 func reloadUserSchemasFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *transam.CLog) error {
+	if cat == nil {
+		return nil
+	}
+	// Only the connecting catalog's own pg_namespace heap, and deliberately so:
+	// this pass runs EARLY (before the pg_database reload), because the
+	// ts_dict/ts_config passes that follow it need the schema OID map already
+	// populated. The database list does not exist yet at this point, so the
+	// per-database heaps are picked up later by
+	// ReloadUserDatabaseSchemasFromHeap.
+	return reloadUserSchemasFromHeapForDB(mgr, cat, clog, cat.DBOID())
+}
+
+// ReloadUserDatabaseSchemasFromHeap scans the pg_namespace heap of every
+// CREATE DATABASEd database and re-registers its user schemas.
+//
+// It exists as a SECOND pass because of an ordering constraint, not for
+// symmetry: reloadUserSchemasFromHeap above must run before the ts_dict and
+// ts_config reloads (they resolve schema OIDs), which is before the
+// pg_database reload that establishes the database list. So the per-database
+// heaps cannot be read in that first pass — there is nothing to iterate yet.
+//
+// Without this, a CREATE SCHEMA issued inside a CREATE DATABASEd database
+// VANISHED on restart: its heap row sat unread in base/<thatDbOid>/2615 and
+// the schema simply ceased to exist. Tables in that database reloaded fine
+// (they have their own per-database pass), which is exactly what disguised the
+// gap as an extension-only problem — reloadUserExtensionsFromHeap could then
+// not resolve the schema OID and fell back to "public".
+//
+// The skip set mirrors reloadUserExtensionsFromHeap's, which reads
+// per-database heaps under the same rules.
+func ReloadUserDatabaseSchemasFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *transam.CLog) error {
+	if cat == nil {
+		return nil
+	}
+	for _, dbName := range cat.ListDatabases() {
+		dbOid := cat.DatabaseOid(dbName)
+		if dbOid == 0 || dbOid == catalog.DefaultDBOid ||
+			dbOid == catalog.PostgresDBOid || dbOid == cat.DBOID() {
+			continue
+		}
+		if err := reloadUserSchemasFromHeapForDB(mgr, cat, clog, dbOid); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// reloadUserSchemasFromHeapForDB scans base/<heapDBOid>/2615 and re-registers
+// each live user schema.
+//
+// NOTE on what this does NOT fix: `RegisterSchemaDuringRecovery` writes the
+// process-wide schema map, so a reloaded schema is visible from every
+// database — exactly as it already is at RUNTIME, where a CREATE SCHEMA in one
+// database is likewise visible from another. That cross-database visibility is
+// a separate, pre-existing divergence from PostgreSQL (pg_namespace is
+// per-database there) and is ledgered. This pass deliberately restores the
+// runtime behaviour rather than inventing scoping here: a schema that silently
+// disappears across a restart is closer to data loss than a schema that is
+// over-visible, and making the two paths agree is the prerequisite for scoping
+// them together later.
+func reloadUserSchemasFromHeapForDB(mgr *storage.Manager, cat *catalog.InMemory, clog *transam.CLog, heapDBOid uint32) error {
 	type nsRow struct {
 		oid   uint32
 		name  string
 		owner uint32
 		tid   storage.ItemPointer
 	}
-	rel := storage.RelFileNode{DBOid: cat.DBOID(), RelOid: 2615, Fork: storage.MainFork}
+	rel := storage.RelFileNode{DBOid: heapDBOid, RelOid: 2615, Fork: storage.MainFork}
 	cols := executor.PGNamespaceColumnsPG18()
 	rows, err := scanCatalogHeapRows(mgr, rel, clog, "pg_namespace",
 		func(ht storage.HeapTuple, tid storage.ItemPointer) (any, bool, error) {
