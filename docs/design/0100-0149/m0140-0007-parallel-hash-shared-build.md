@@ -173,3 +173,68 @@ Both tables are read from the SAME fresh capture pair
 PG 18.3), taken in parallel mode against the same SF1 data. The checked-in
 `bench/tpch/plans-pg/` fixtures were NOT used — they are stale and serial
 (ledger `parity-reference-fixtures-are-invalid`).
+
+## Step 2 STOPPED before implementation (2026-09-21): the cooperative build already runs
+
+The previous section's plan was to implement, scoped to Q14 and Q16. Reading
+the execution path before writing the planner change stopped it, and the reason
+retires the implementation as framed.
+
+### The shared cooperative build is already active
+
+`prebuildSharedHashJoins` calls `joinOp.buildLazyHashTable`, which routes to
+`parallelBuildLazyHashTable` whenever `parallelBuildEligible` holds
+(`operators_join_agg.go:668-673`). That gate is permissive — its composite-key
+decline was retired in E-18 slice 3 — and it excludes only FULL/RIGHT, a
+LEFT-with-build-on-left, and a CTID-preserving `FOR UPDATE` build.
+
+Instrumented and run on the SF1 clone, Q14 and Q16 together:
+
+```
+COOPBUILD entered buildLeft=false scanTable=part
+```
+
+The cooperative build fires, over `part` — the build relation of both
+witnesses. **One shared hash table is already built by N producer goroutines
+splitting the build scan.** The executor capability the task describes as
+absent is, for this corpus, present.
+
+### What is actually still different from PG
+
+Two things, and neither is the capability gap the task's framing implies:
+
+1. **Where the build happens.** PG builds inside the Gather: each participant
+   produces a SLICE of the inner (a partial path) and inserts into the shared
+   table behind a barrier. goopg builds BEFORE fan-out: the leader runs the
+   cooperative build over the COMPLETE inner, then shares the finished table.
+   Both divide the inner SCAN across goroutines; they differ in who inserts and
+   when, not in whether the table is built cooperatively.
+2. **The plan label.** PG renders `Parallel Hash`; goopg renders plain `Hash`.
+
+### Why the planned implementation was NOT done
+
+Filing `parallel_hash = true` while the inner remains a COMPLETE path would
+move goopg's plan text toward PG's without changing execution at all. That is
+a label asserting an execution model the engine does not use — strictly worse
+than the current honest divergence, and precisely the kind of
+"agree with PG's answer while computing it differently" this milestone has
+already been criticised for twice.
+
+Making the inner genuinely partial is the real port, and its benefit on this
+corpus is small: the inner scan is already divided across goroutines by the
+existing builder, so what a partial inner buys is the barrier-based
+per-participant insert, not the parallelism itself.
+
+### Recommendation (owner decision)
+
+The measured state does not justify the task as filed. Either:
+
+1. **Re-scope to the label + model alignment as an explicit fidelity item**,
+   accepting that it buys plan text rather than throughput, and sequencing it
+   behind something that needs the partial inner for a real reason; or
+2. **Close it**, recording that family-A's shared-build capability exists, that
+   the residual divergence is where-the-build-happens plus the node label, and
+   that three of the seven witnesses (Q9, Q21, half of Q10) are join-order
+   divergences this task could never have fixed anyway (Finding 2 above).
+
+The loop does not choose. It declines to ship a label-only change.
