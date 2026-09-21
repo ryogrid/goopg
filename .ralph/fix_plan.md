@@ -15531,6 +15531,62 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
     re-derive per run): the relaxation stays `[!]` until that passes.
   Kind: recon
   Parent: M0145-0018
+  - **DONE 2026-09-22 (loop \#79) — the hypothesis is REFUTED, and the
+    divergence is somewhere else.** Movement: none.
+    Design: `docs/design/0100-0149/m0145-0019-nl-costing-derived-inner.md`.
+    - Reproduced Q78's election at SF1 on a private `:5561` clone, knob arm,
+      `GOOPG_DERIVED_FIREWALL=off`, EXPLAIN-only — identical to 0018's record.
+    - **Both candidates are generated AND accepted** (`GOOPG_PGSHAPED_DP_TRACE`
+      at the final joinrel): `join.hash` startup=16457.31 total=**37659.80**
+      accepted, `join.nestloop` startup=5494.86 total=**1147507.76** accepted.
+      So the NL is NOT mispriced, the hash path is NOT missing, and 0018's
+      "losing to nothing" reading does not hold. `add_path` keeping both is
+      correct — the NL has the lower startup cost.
+    - **The fault is that goopg applies the LIMIT fraction to the WRONG REL.**
+      `searchCtx.finalPath` (`internal/optimizer/joinsearch.go:317`) calls
+      `getCheapestFractionalPath` at the JOIN SEARCH ROOT. With
+      `tupleFraction=100` over 10317 rows (f=0.009693) the fractional costs are
+      hash **16662.82** vs nestloop **16564.09** — the NL wins by 0.6% and is
+      then fed to a `Sort` that must consume every row, turning that 0.6% into
+      30x. That is the SF1 regression.
+    - **PG cannot make this election**: `planner.c:439` runs
+      `get_cheapest_fractional_path` on `final_rel` (the top UPPER rel, after
+      the Sort is priced); `planner.c:5314` `create_ordered_paths` takes
+      `input_rel->cheapest_total_path`; `planner.c:7646`+ `make_ordered_path`
+      returns NULL for any unsorted input that is not cheapest-total. Upstream
+      sorts the cheapest-TOTAL path and asks the fraction afterwards.
+    - `finalPath`'s own doc comment cites `planner.c:437` for this call — the
+      **citation is right and the rel is wrong**.
+    - **This closes both of 0018's remaining options**: (c) has nothing to fix
+      (a change to NL pricing here would be tuning toward a plan, R6), and (b)
+      would suppress the symptom while leaving the rule — any query whose LIMIT
+      fraction is resolved before a mandatory Sort can elect a low-startup path
+      the same way, with no derived input in it at all.
+    - Deliverable filed below as **M0145-0019a** (S5: it names its expected
+      movement and how it is measured).
+
+- [ ] **M0145-0019a — apply the LIMIT fraction at the final upper rel, not at
+  the join search root** (the fix M0145-0019's recon names).
+  Kind: impl
+  Parent: M0145-0019
+  - Move `getCheapestFractionalPath` off `searchCtx.finalPath`
+    (`internal/optimizer/joinsearch.go:317`) to the top of the upper-rel
+    lattice, so it sees the Sort; feed the ordered step from the join rel's
+    cheapest-TOTAL path, as `create_ordered_paths` does
+    (`planner.c:5314`, `planner.c:7646`+, `planner.c:439`).
+  - **Expected movement, and how it is measured** (S5): Q78 at SF1 elects the
+    `Hash Left Join` (total 37659.80) instead of the `Nested Loop Left Join`
+    (total 1147507.76) with `GOOPG_DERIVED_FIREWALL=off`, measured by the
+    EXPLAIN plan plus the `DPPATH` verdict at the final joinrel. Corpus-level:
+    report `CATEGORIES-EXCL-MATCH` on both corpora — the placement has been
+    live since M0127-P5.9 (2026-08-06), so movement in either direction is
+    expected and neither is assumed.
+  - **Blast radius — do NOT treat this as a Q78 fix.** Every `ORDER BY … LIMIT`
+    query over a join whose pathlist holds a low-startup/high-total path can
+    change plan. Full value-gate set plus a plan-parity capture of its own.
+  - On landing, re-run M0145-0018's fresh E1 at SF0.25 AND SF1 against the
+    then-current `outer-over-derived` fire set (re-derive per run, do not reuse
+    Q77/Q78) — M0145-0018 stays `[!]` until that passes.
 
 - [ ] **M0145-0020 — port `examine_simple_variable`'s non-recursive CTE
   arm** (`postgres/src/backend/utils/adt/selfuncs.c:5737-5912`) (owner GO
