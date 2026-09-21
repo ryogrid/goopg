@@ -1,71 +1,71 @@
 # Working set — inter-loop baton
 
-Task: **M0145-0012 — MEASURED, and it is a NO-GO as filed.** Marked `[!]`.
-No removal landed. This is an ESCALATION, not a completion.
+Task: **M0145-0013 — DONE `[x]`** (seam admission for pulled `*CTEScan`
+leaves), knob arm only. Landed with the pricing residual reported, not hidden.
 
-## Banner
+## BANNER MOVED under the previous baton — check it every loop
 
-Item 3 now reads `… → M0145-0011 [x] → M0145-0012 [!]`. With item 3 exhausted,
-**the next selectable work is item 4 (`M0141-S2a-fix2r`)** — re-read the banner
-and confirm before selecting; items 0-2 must be checked first as always.
+Commit `24d45abcd` (owner) extended item 3 with **M0145-0013 … 0018**, so the
+previous baton's "item 3 is exhausted, go to item 4" was stale. Item 3's order
+now ends `… 0012 [!] → 0013 [x] → 0014 → 0015 → 0016 → 0017 → 0018`.
+**Next selectable: M0145-0014** (nested-sublink pull-up recursion,
+`any-nested-sublink`, census 12 fires; PG recurses via
+`pull_up_sublinks_qual_recurse`, `prepjointree.c:682-693`/`:736-747`/`:836-845`).
 
-## What M0145-0012 measured
+## What landed
 
-Apparatus landed: `GOOPG_CTE_ROWS_FALLBACK=off` (default ON, flag-provenance
-table) + a `CTEROWSFALLBACK` DP-trace line + a unit gate.
+Both consumer sites of the bare-`*SeqScan` invariant now route through
+`seamLeafBinding` (admission) + `seamLeafRelInfo` (pricing routed on
+`b.table`), so it is held in ONE place instead of three.
 
 ```
-census (TPC-DS SF0.25, DEFAULT arm, 99 queries): the arm engages on THREE
-  Q31 ws 1->1846   Q39 inv 1->20   Q74 year_total 1->8325   (nowhere else)
+seam census, SF0.25 knob arm, vs a pre-change binary from a worktree at HEAD
+  pulled-leaf-not-scan  19 -> 0      <- the target
+  residual-hits-pad      0 -> 4      <- the NEW wall
+  leaf-count 15/15  semianti-not-tail 6/6  outer-over-derived 6/6
+  pull-up census unchanged
 
-A/B with the arm off: those same three move, each INTO the collapse class
-  every equi-condition demoted from join condition to Join Filter on a NL
-  Q39 3433->3564 ms | Q31 2133->2381 ms | Q74 1509->25005 ms  (16.6x)
-  values BYTE-IDENTICAL in all three
+correctness: exactly Q14/Q23/Q95 move, all three VALUE-IDENTICAL
+inertness:   with GOOPG_PULLUP_CTE_LEAF off, 0/100 plans move
 ```
 
-- **Route 1 ("no collapse-class change") is FALSE** — it reproduces exactly
-  that class, and per M0145-0011 the class is scale-dependent, so SF1 is worse.
-- **Route 2 (`pushQualsThroughSingleRefCTEs`, refs==1) is INAPPLICABLE** — all
-  three fires are MULTI-reference CTEs (ws x3, inv x2, year_total x4).
-- **The real prerequisite is a third thing neither route names**:
-  `examine_simple_variable`'s non-recursive-CTE arm
-  (`postgres/src/backend/utils/adt/selfuncs.c:5736-5870`) finds the CTE's
-  `subroot` via `cte_plan_ids` and RECURSES on the target-list `Var`, so PG
-  estimates `year_total.dyear` from `date_dim.d_year`'s real statistics and
-  never collapses. Port that and the arm can go.
+**`*CTEScan` binds with `table == nil` deliberately** — `leafIsDerivedInput`
+reads it, which is what holds the `outer-over-derived` firewall in force until
+M0145-0018. `TestSeamLeafBindingAdmission` pins it against a future
+"helpful" synthesis of a catalog.Table.
 
-**Carry this**: the regression is INVISIBLE to every value gate in the repo —
-values byte-identical, only plan shape and clock move. That is why
-`TestInitialRelRowsCTEFallbackGate` exists.
+## The residual to carry
+
+The unlocked plans are **mispriced**. Against the honest `leaf-off` knob-arm
+baseline: Q23 −14%, Q14 +25%, **Q95 3.0x slower** (3004 → 9148 ms, estimated
+cost 70693 → 1232685). Values identical, so pricing not correctness. This is
+the first thing M0145-0018's "fresh E1 re-verification keeps the relaxed plans
+clean" precondition will trip on. Ledgered.
+
+Also carried: 4 new `residual-hits-pad` fires (unexamined — a different
+invariant), and the `pulled`-suppression window is unchanged, not discharged.
 
 ## Next step
 
-Re-read the banner and select from item 4 onward (item 3 is exhausted:
-0001-0007 `[x]`, 0008 blocked, 0009/0010/0011 done-or-escalated, 0012 `[!]`).
-Item 4 is **M0141-S2a-fix2r** — re-apply the PG-faithful `hashAggEntrySize`
-change discarded for parity reasons; degradations it causes are filed as their
-own tasks, never reverted (owner Q4).
-
-## Open owner escalations
-
-M0145-0012 (this one), M0145-0010 (both premises measured wrong),
-M0140-0007 (capability exists; label-only change declined), M0145-0008
-(cutover blocked on a measured timing regression).
+**M0145-0014.** Read the task text first: it names PG's recursion sites
+exactly, and the correct-decline rule (a nested SCALAR sublink stays declined).
+Expected movement `any-nested-sublink` 12 → 0 on the pull-up census. Knob arm.
 
 ## Traps carried forward
 
-- Value gates cannot see a cardinality regression; check plan shape + clock.
+- **Re-read the banner every loop** — it grew M0145-0013..0018 under us.
+- A/B against a pre-change binary: `git worktree add --detach /tmp/<x> HEAD`
+  then build with `-o`; remove the worktree afterwards (`git worktree remove
+  --force` + `prune`) — the repo already carries 11 stale ones.
 - Flags are read once at process START — an A/B needs two server runs.
-- A knob-arm capture in the canonical results dir poisons the next default
-  sweep's baseline — redirect `SF025_RESULTS_DIR`.
-- Gate stamps hash the staged index — re-run a gate if code changed after it.
+- Value gates cannot see a cardinality or pricing regression; check plan shape
+  and the clock.
 
 ## Gates run
 
 units PASS; tpch-spotcheck PASS (Q12=2 Q13=33); TPC-DS SF0.25 default arm
 PASS=96 MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0, plans 99/99 identical,
-verdict-changes=none; TPC-H acceptance arm 24 MATCH; pgbench smoke via hook.
+runtime-moves=0; TPC-H acceptance arm 24 MATCH; pgbench smoke via hook.
 
 ## In-flight
 

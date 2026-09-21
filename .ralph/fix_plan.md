@@ -14057,7 +14057,7 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
       `examine_simple_variable` port as its own task (which would subsume
       route 2) or to accept the arm as documented permanence. The loop does
       not pick. Ledgered 2026-09-21.
-- [ ] **M0145-0013 — admit pulled `*CTEScan` leaves at the seam
+- [x] **M0145-0013 — admit pulled `*CTEScan` leaves at the seam
   (`pulled-leaf-not-scan` / `flat-leaf-not-scan`)** (filed 2026-09-21
   by owner directive; the follow-on task M0145-0011's E2 resume point
   named). E2's flag measurement moved `any-body-leaf-(*CTEScan)`
@@ -14095,6 +14095,35 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
   arm byte-identical.
   Kind: impl
   Parent: M0145-0011
+  - **DONE 2026-09-21, knob arm.** Design doc
+    `docs/design/0100-0149/m0145-0013-seam-admission-for-pulled-cte-leaves.md`.
+    Both consumer sites route through `seamLeafBinding` (admission) and
+    `seamLeafRelInfo` (pricing routed on `b.table`), so the invariant is held
+    in ONE place instead of three.
+    - Seam census SF0.25 knob arm, vs a pre-change binary from a worktree at
+      HEAD: **`pulled-leaf-not-scan` 19 → 0**; `leaf-count` 15/15,
+      `semianti-not-tail` 6/6, `outer-over-derived` 6/6,
+      `flat-leaf-not-scan` 0/0; **`residual-hits-pad` 0 → 4** is the new wall.
+      Pull-up census unchanged, as it must be.
+    - Correctness gate PASSED: exactly Q14/Q23/Q95 move and all three are
+      value-identical to M0145-0011's captures. With the CTE-leaf flag off the
+      refactor moves **0/100** plans, so the `*SeqScan` path is inert.
+    - The `*CTEScan` binding keeps `table == nil` DELIBERATELY —
+      `leafIsDerivedInput` reads it, which is what holds the
+      `outer-over-derived` firewall in force until M0145-0018.
+      `TestSeamLeafBindingAdmission` pins it.
+    - **RESIDUAL, reported not hidden**: the unlocked plans are mispriced.
+      Against the honest `leaf-off` knob-arm baseline Q23 −14%, Q14 +25%,
+      **Q95 3.0x slower** (3004 → 9148 ms, estimated cost 70693 → 1232685).
+      Values identical, so this is pricing, not correctness. It is the first
+      thing M0145-0018's re-verification precondition will trip on. Ledgered.
+    - The `pulled`-suppression hard constraint is unchanged, not discharged:
+      0013 reduces how often the seam declines, not what a decline does.
+  Movement: none — the default arm is byte-identical by construction
+  (`GOOPG_PULLUP_CTE_LEAF` defaults off, so no CTE leaf reaches the seam) and
+  the gates confirm it; none of S3's three instruments move. The knob-arm
+  seam census moved `pulled-leaf-not-scan` 19 → 0, which is this task's own
+  expected-movement criterion, not a lineage instrument.
 - [ ] **M0145-0014 — recurse the pull-up into pulled bodies' own
   quals (`any-nested-sublink`)** (filed 2026-09-21 by owner
   directive). Census: 6 conjuncts on TPC-DS SF0.25 decline because

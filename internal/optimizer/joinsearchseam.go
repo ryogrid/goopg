@@ -920,15 +920,12 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 	// statistics for `estimateBaseRelInfo`/`applyRelSizeFallback` below.
 	// Filed as M0145-0013 (owner directive 2026-09-21).
 	for i := nReal; i < nprefix; i++ {
-		b := rangeBinding{offset: spans[i].lo}
-		scan := scans[i]
-		ss, isScan := scan.(*SeqScan)
-		if !isScan {
+		b, ok := seamLeafBinding(scans[i], spans[i].lo, ctx, i-nReal)
+		if !ok {
 			traceSeamDecline("pulled-leaf-not-scan", nrels, len(scans))
 			return node, pred, false
 		}
-		b.table = ss.Table
-		b.alias = ss.Alias
+		scan := scans[i]
 		bindings[i] = b
 		var local Expr
 		if preds := locals.byBinding[i]; len(preds) > 0 {
@@ -941,15 +938,16 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 		} else {
 			leaves[i] = scan
 		}
-		relInfos[i] = estimateBaseRelInfo(b, scan, local)
-		relInfos[i].bindingIdx = i
+		relInfos[i] = seamLeafRelInfo(i, b, scan, local, cat)
 		// The leaf's own coordinates are non-emitting (a SEMI/ANTI join
 		// never projects its RHS), so the boundary filler must mark them
 		// fillable exactly like the extracted leaves' — while
 		// `leafIsDerivedInput` still answers not-derived through the real
 		// `table` above, which is the distinction c8 added the flag for.
+		// A DERIVED pulled leaf has `table == nil` on purpose and must
+		// answer derived there: that is what keeps the `outer-over-derived`
+		// firewall in force over it until M0145-0018 lifts it.
 		relInfos[i].isSemiAntiSyntheticLeaf = true
-		applyRelSizeFallback(&relInfos[i], b, scan, local, cat)
 	}
 	// A synthetic leaf has no `*catalog.Table` — it is an opaque, already-
 	// planned subtree (the Semi/Anti join's RHS), not a base relation — so
@@ -986,13 +984,18 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 			local = combineAnd(preds)
 		}
 		if flatLeaf(i) {
-			ss, isScan := scan.(*SeqScan)
-			if !isScan {
+			// The third site of the same invariant (M0145-0013): a
+			// flattened link's synthetic leaves come from the SAME
+			// `flattenPulledBodyTree` decomposition, so whatever leaf kinds
+			// that function admits have to be priceable here too. `ctx` is
+			// not consulted for the binding: these leaves are numbered in
+			// walk order at [nprefix, nleaves), not in the pull-up's body
+			// order, so there is no `bodyBindings` index to hand through.
+			var ok bool
+			if b, ok = seamLeafBinding(scan, spans[i].lo, nil, 0); !ok {
 				traceSeamDecline("flat-leaf-not-scan", nrels, len(scans))
 				return node, pred, false
 			}
-			b.table = ss.Table
-			b.alias = ss.Alias
 			bindings[i] = b
 			leaves[i] = scan
 			if local != nil {
@@ -1002,8 +1005,7 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 				}
 				leaves[i] = &Filter{Child: scan, Predicate: combineAnd(localized), LeafLocal: true}
 			}
-			relInfos[i] = estimateBaseRelInfo(b, scan, local)
-			relInfos[i].bindingIdx = i
+			relInfos[i] = seamLeafRelInfo(i, b, scan, local, cat)
 			// The leaf's own coordinates are synthetic (a SEMI/ANTI join
 			// never projects its RHS), so the boundary filler must mark
 			// them fillable exactly like the opaque leaf's — while
@@ -1011,7 +1013,6 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 			// real `table` above, which is the distinction c8 added the
 			// flag for.
 			relInfos[i].isSemiAntiSyntheticLeaf = true
-			applyRelSizeFallback(&relInfos[i], b, scan, local, cat)
 			continue
 		}
 		bindings[i] = b
@@ -2717,4 +2718,107 @@ func limitParseConst(p parser.Expr) Expr {
 		return &IntegerConst{Value: ic.Value}
 	}
 	return &ParamRef{}
+}
+
+// seamLeafBinding builds the `rangeBinding` for a seam leaf that the pull-up
+// spliced in, and reports whether the leaf kind is one the search can price at
+// all. It is the single admission point for what used to be two copies of
+// `scan.(*SeqScan)` — the `pulled-leaf-not-scan` and `flat-leaf-not-scan`
+// checks, which M0145-0011's scope (c) measured to be ONE invariant held at
+// two sites (relaxing only `flattenPulledBodyTree`, the producer, merely moved
+// 30 TPC-DS declines from the pull-up census to the seam census).
+//
+// Two leaf kinds are admissible, and the difference between them is the whole
+// point:
+//
+//   - `*SeqScan` — a real base relation. `table`/`alias` come off the scan and
+//     the leaf is priced from catalog statistics.
+//   - `*CTEScan` — a DERIVED input. `table` stays nil deliberately. That is not
+//     an oversight to paper over: `leafIsDerivedInput` reads exactly this to
+//     keep the `outer-over-derived` firewall in force over the leaf, which is
+//     the ordering M0145-0013 requires (admission machinery first, the
+//     firewall relaxation last, in M0145-0018).
+//
+// `pullCtx`/`k` are the body-order hand-through the task asks for: the pull-up
+// already recorded each body's own `rangeBinding` (`jtPulledBody.bodyBindings`,
+// whose comment reserves them for exactly this), so a pulled leaf takes its
+// alias from the body's binding rather than from a re-derived guess. Only the
+// OFFSET is re-stamped, because the problem's span — not the body-local
+// numbering — is the coordinate space the search works in. Pass `nil` when the
+// caller has no body-order index (the flattened-link leaves are numbered in
+// walk order, not body order).
+func seamLeafBinding(scan Node, offset int, pullCtx *resolveContext, k int) (rangeBinding, bool) {
+	b := rangeBinding{offset: offset}
+	if pullCtx != nil {
+		if pb, ok := pulledBodyBinding(pullCtx, k); ok {
+			b = pb
+			b.offset = offset
+		}
+	}
+	switch x := scan.(type) {
+	case *SeqScan:
+		b.table = x.Table
+		if b.alias == "" {
+			b.alias = x.Alias
+		}
+	case *CTEScan:
+		// No catalog table, by construction. `seamLeafRelInfo` routes on
+		// exactly this nil to the statistics-free pricing path.
+		b.table = nil
+		if b.alias == "" {
+			b.alias = x.Alias
+		}
+	default:
+		return rangeBinding{}, false
+	}
+	return b, true
+}
+
+// pulledBodyBinding returns the k-th pulled leaf's body-side binding, counting
+// across bodies in the order `splicePulledLeaves` laid them into the problem.
+func pulledBodyBinding(ctx *resolveContext, k int) (rangeBinding, bool) {
+	pu := ctx.jtPullup
+	if pu == nil || k < 0 {
+		return rangeBinding{}, false
+	}
+	for _, body := range pu.bodies {
+		if k < len(body.bodyBindings) {
+			return body.bodyBindings[k], true
+		}
+		k -= len(body.bodyBindings)
+	}
+	return rangeBinding{}, false
+}
+
+// seamLeafRelInfo prices a spliced seam leaf, routing on whether the binding
+// names a real catalog relation.
+//
+// The derived arm is not new machinery: it is the same pricing the seam
+// already applies to an opaque Semi/Anti RHS leaf a few lines below — read the
+// subtree with `EstimateRows` and apply the local filter's selectivity on top.
+// That is the right tool here for the reason the opaque arm states: both
+// `estimateBaseRelInfo` and `applyRelSizeFallback` read `binding.table`, and
+// with it nil `estimateTableRowsFallback` returns 0 outright, flooring the leaf
+// at a ZERO row estimate instead of a sane one.
+//
+// `EstimateRows(*CTEScan)` recurses the body, which is goopg's equivalent of
+// `set_cte_size_estimates` propagating the subplan's `plan_rows`
+// (postgres/src/backend/optimizer/path/allpaths.c). No per-column statistics
+// are synthesised for the derived leaf, deliberately: M0145-0009's census
+// established that the remaining CTE-output column asks are columns PG itself
+// leaves unknown, so inventing them would be precision the oracle does not have
+// either.
+func seamLeafRelInfo(i int, b rangeBinding, scan Node, local Expr, cat catalog.Catalog) baseRelInfo {
+	if b.table != nil {
+		info := estimateBaseRelInfo(b, scan, local)
+		info.bindingIdx = i
+		applyRelSizeFallback(&info, b, scan, local, cat)
+		return info
+	}
+	baseRows := EstimateRows(scan)
+	return baseRelInfo{
+		bindingIdx:   i,
+		baseRows:     baseRows,
+		filteredRows: applyLocalFilterSelectivity(baseRows, b, scan, local),
+	}
 }
