@@ -210,11 +210,20 @@ func inputNodePathkeys(input Node) []PathKey {
 	// while its POSITIONS provably do not — so the per-step agreement check
 	// weakens to the column count and the delivered claim is relabelled.
 	renamed := false
+	// M0145-0006: how many LEADING columns of `out` the coordinate space the
+	// walk currently stands in is required to agree with. It starts at the
+	// full published width and narrows only when the walk crosses a node that
+	// APPENDS columns to its child's schema (`*WindowAgg`): the child's own
+	// columns keep their positions there, so every index a claim below such a
+	// node can name already addresses the same column of `out`. Narrowing is
+	// therefore sound for the same reason truncation is — it claims less, and
+	// never claims something else.
+	limit := len(out)
 	agrees := func(s Schema) bool {
 		if renamed {
-			return len(s) > 0 && len(s) == len(out)
+			return len(s) > 0 && len(s) == limit
 		}
-		return schemaCoordinatesAgree(out, s)
+		return len(s) == limit && schemaCoordinatesAgree(out[:limit], s)
 	}
 	deliver := func(keys []PathKey) []PathKey {
 		if !renamed {
@@ -253,6 +262,65 @@ func inputNodePathkeys(input Node) []PathKey {
 				return nil
 			}
 			return deliver(aggregateEmissionPathkeys(t))
+		case *IncrementalSort:
+			// An incremental sort delivers the FULL `Keys` ordering — its
+			// `PresortedCount` says only how much of that ordering its child
+			// already had, i.e. how little work the node has to do, never how
+			// little order it emits (`nodeIncrementalSort.c` sorts each
+			// presorted-prefix group by the remaining keys before emitting
+			// it). PG says the same in `create_incremental_sort_path`
+			// (pathnode.c:3191: `pathnode->path.pathkeys = pathkeys`), which
+			// takes the whole list and not the presorted prefix. The node
+			// publishes its child's schema unchanged, exactly like `*Sort`.
+			if !agrees(t.Output()) {
+				return nil
+			}
+			return deliver(pathkeysForSortKeys(t.Keys))
+		case *GatherMerge:
+			// The leader's merge PRESERVES the ordering every worker stream
+			// already carries (`Keys`), which is the whole reason the node
+			// exists rather than a plain `*Gather` — and is why PG's
+			// `create_gather_merge_path` keeps the pathkeys it was built with
+			// (pathnode.c:2128) where `create_gather_path` publishes NIL.
+			// `NewGatherMerge` sets `schema: child.Output()`, so the claim is
+			// already in the walk's coordinates.
+			if !agrees(t.Output()) {
+				return nil
+			}
+			return deliver(pathkeysForSortKeys(t.Keys))
+		case *WindowAgg:
+			// "WindowAgg preserves the input sort order" —
+			// `create_windowagg_path` (pathnode.c:3740-3741) copies
+			// `subpath->pathkeys` verbatim, so the claim to make here is the
+			// CHILD's, not one derived from the window clause.
+			//
+			// That copy is only faithful when the input really was ordered by
+			// the plan. goopg's `*WindowAgg` fails closed: with `Presorted`
+			// false the executor sorts its input privately by
+			// `PartitionBy ++ OrderBy` (plan.go's field note), so the rows it
+			// emits carry THAT order and not the child's, and no claim the
+			// child makes survives. The walk refuses rather than guessing the
+			// private sort's directions, which the node does not record.
+			if !t.Presorted || t.Child == nil {
+				return nil
+			}
+			if !agrees(t.Output()) {
+				return nil
+			}
+			child := t.Child.Output()
+			// The window functions are APPENDED to the child's schema
+			// (`planner.go`'s builder starts `outputSchema` as a copy of the
+			// input schema and appends one column per func), so the child
+			// occupies a prefix of this node's output. Re-check that rather
+			// than trusting the builder.
+			if len(child) == 0 || len(child) > limit {
+				return nil
+			}
+			if !renamed && !schemaCoordinatesAgree(out[:len(child)], child) {
+				return nil
+			}
+			limit = len(child)
+			n = t.Child
 		case *Project:
 			if !projectIsPositionalIdentity(t) {
 				return nil

@@ -12782,6 +12782,41 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
   gate (upperordereddistinct.go:140).
   Kind: impl
   Parent: M0145-0005
+    - Slice 1 (landed, loop 2026-09-21 \#11): the three order-delivering
+      tops `inputNodePathkeys`' walk swallowed in its `default: nil`.
+      Design doc: `docs/design/0100-0149/m0145-0006-upper-rel-pathlists.md`.
+    - `*IncrementalSort` claims the FULL `Keys` list — `PresortedCount`
+      bounds the WORK the node does, never the order it emits
+      (`create_incremental_sort_path`, pathnode.c:3191, takes the whole
+      list too).
+    - `*GatherMerge` claims `Keys`: the leader's merge preserves the
+      worker ordering, which is exactly what distinguishes it from
+      `*Gather` (pathnode.c:2128 vs the nil `create_gather_path` sets).
+    - `*WindowAgg` descends to the CHILD's claim
+      (`create_windowagg_path`, pathnode.c:3740-3741: "WindowAgg
+      preserves the input sort order"), but ONLY when `Presorted` — with
+      the flag false goopg's executor sorts the input privately by
+      `PartitionBy ++ OrderBy` and records no direction for that sort, so
+      the arm fails closed rather than reconstructing one.
+    - New coordinate rule: the walk carries a `limit` (how many LEADING
+      columns of the published output the current space must agree with)
+      and narrows it when crossing a `*WindowAgg`, because the window
+      functions are APPENDED to the child's schema so the child's columns
+      keep their positions. The prefix is re-checked with
+      `schemaCoordinatesAgree(out[:len(child)], child)`, never assumed —
+      a node that PREPENDS still returns nil.
+    - Witness: TPC-DS SF0.25 **Q51** lost its redundant top Sort
+      (`Sort Key: item_sk, d_date` over the WindowAgg), cost
+      `419.08..422.64` -> `277.76..381.02`, rows unchanged at 100. It is a
+      parity move: PG 18.3 on the same dataset plans
+      `Limit -> Subquery Scan -> WindowAgg -> Sort -> Merge Full Join`
+      with no second Sort.
+    - Deferred (ledger rows 2026-09-21): the `*Join{Algo: JoinAlgoMerge}`
+      top (resume by stamping the validated `p.Pathkeys` onto the node at
+      build time, not by translating in the walk),
+      `electOrderedGrouping`'s `node != agg.node` precondition, and
+      `electOrderedDistinct`'s `cands<2` gate (really a
+      `createDistinctPaths` candidate-supply gap).
 - [ ] **M0145-0007 — single Path→Node lowering** (the `create_plan`
   analogue): consolidate every post-election resolution step the stage
   builders currently interleave — per 0001's lowering-contract inventory —
