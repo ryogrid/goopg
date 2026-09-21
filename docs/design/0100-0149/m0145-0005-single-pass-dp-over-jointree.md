@@ -2,8 +2,10 @@
 
 Status: slices 1 (knob-arm `splitOuterSpine` retired), 2 (pulled
 semi/anti as real leaf items), 3 (IR-direct leaf materialisation —
-`jtScopeTable`/`extractScopeLeaves`) and 4 (one-relation + degenerate
-scopes through the same entry) landed; slice 5 ledgered below. Task:
+`jtScopeTable`/`extractScopeLeaves`), 4 (one-relation + degenerate
+scopes through the same entry) and 5-partial (searched-subtree opacity
+for the residual pushdown family) landed; the rest of slice 5 is
+ledgered below. Task:
 `.ralph/fix_plan.md` M0145-0005. Parent:
 M0145-0001 (IR contract + retirement matrix), M0145-0003 (semi/anti leaf
 entries), M0145-0004 (appendrel leaves). Kind: impl.
@@ -328,11 +330,63 @@ optimizer suite, units, tpch-spotcheck (Q12=2/Q13=33), TPC-DS SF0.25
 96/96 with 99/99 plan shapes identical, TPC-H acceptance arm 24/24
 under `JOINTREE_PIPELINE=1`+`PGSHAPED=1`.
 
+## Slice 5 — searched-subtree opacity for the residual pushdown family (landed, partial)
+
+Decline census (`tmp/m0144-0011a2-census.log`, pre-slice-3): 132
+seam-decline fires — `leaf-count` 104, `outer-over-derived` 12,
+`outer-spine` 8 (since retired), `lateral` 8. `outer-on-qual` and
+`inner-on-qual-*` have **zero corpus witnesses** — there is no decline
+class to migrate; those rows are retired by absence rather than by
+code.
+
+- `outer-over-derived` stays: hard firewall on B-06 CTE-output
+  statistics (R42/Q78 class), not planner-flow divergence.
+- `lateral` stays: `chainCarriesLateral` fires on real lateral deps
+  (Q30/Q68); retiring it needs parameterized-path legality — a project
+  of its own.
+- `leaf-count` — dominant family. A joinlist-vs-bindings probe ruled
+  out grouped `j.Right` joins (they are one binding AND one joinlist
+  item — admitted as 2-rel problems). The fires are FULL-join folds
+  (opaque leaf covering multiple joinlist rels, `a FULL JOIN b JOIN c`
+  → nprefix 3, scans 2) — the executor-substrate-blocked class the doc
+  already ledgered as staying at path generation.
+- The pushdown family cannot die wholesale — the four passes are
+  post-search cleanups that declined and legacy-arm statements still
+  need. What it can do is stop crossing the searched boundary; the
+  audit found three of four already opacity-correct via `pushOneConjunct`/`rewriteJoinsToNLI`'s P5.9-b prunes.
+
+Landed: two holes closed, one counter-pin pinned.
+
+- `pushSingleSideQualsIntoInnerJoinInputs` had no `isSearchedTree`
+  awareness anywhere: the walker descended into searched roots, the
+  Filter-level entry (`pushInnerJoinInputQuals`) planted conjuncts onto
+  a searched join's inputs, and the `pushConjunctIntoSubtree` descent
+  could reach searched grandchildren. Fixed: top-level walker prune,
+  searched-child refusal in `pushInnerJoinInputQuals`, and a
+  `pushTrace.noSearched` flag (`pushConjunctIntoSubtreeTracedNoSearched`)
+  on all statement-level descents — including the sibling-seeding in
+  `deriveConstAcrossJoinEquality`.
+- `findUniqueSeqScanByColumn` (`absorbConjunctsIntoSubtree`'s hunt)
+  walked into searched subtrees — a residual `col=const` could find
+  and IndexScan-rewrite the scan the costed search elected, and for a
+  nullable-held conjunct that's the wrong-answer class (pushed below
+  the null-extension it keeps rows the residual drops). Fixed: prune
+  at `isSearchedTree`.
+- Counter-pin: `pushConjunctIntoSubtree` stays permissive. The
+  CTE-inline pass's conjuncts arrive from OUTSIDE the searched body's
+  scope — crossing the boundary is the parse-level qual pushdown PG
+  itself performs (R42's measured witness). A blanket guard there is
+  the regression, not the fix.
+
+Pins (`searched_opacity_test.go`): searched-root and searched-
+grandchild refusal, unsearched-side positive control, CTE-inline
+crossing counter-pin, scan-hunt opacity + unsearched findability.
+
 ## Remaining slices (ledgered)
 
 | slice | scope | retires |
 |---|---|---|
-| 5 | misc decline-family retirement as corpus admits | `outer-on-qual`, `inner-on-qual-*`, `outer-over-derived` (post-B-06), `pushPredicatesIntoCrossJoins`/`pushSingleSideQualsIntoInnerJoinInputs`/`rewriteScanInputsWithSingleTablePredicates`/`pushOuterQualsIntoLaterals` |
+| 5 (partial) | decline families without corpus witness or with hard blockers | `outer-on-qual`, `inner-on-qual-*` (retired — zero corpus fires); `outer-over-derived` (post-B-06), `lateral` (needs parameterized-path legality) remain ledgered |
 
 The executor-capability refusals (FULL hash, partial shapes the executor
 cannot run) stay at path generation until the D3 executor substrate lands —

@@ -443,6 +443,17 @@ func findUniqueSeqScanByColumn(n Node, colName string, topParent *Filter) (*SeqS
 		if node == nil || collide {
 			return
 		}
+		// M0145-0005 slice 5: a searched subtree is opaque to the scan
+		// hunt, on the same contract the outer walk keeps. A SeqScan
+		// inside one was costed by the search itself; rewriting it to an
+		// IndexScan here would override that election with a conjunct
+		// the search deliberately held above — and for a conjunct held
+		// because it reaches a nullable side, planting it below the
+		// null-extension changes which rows survive, not just when the
+		// qual is evaluated.
+		if isSearchedTree(node) {
+			return
+		}
 		switch x := node.(type) {
 		case *SeqScan:
 			for _, c := range x.Output() {

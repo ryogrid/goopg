@@ -12731,6 +12731,47 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
       newer local gofmt had applied to planner.go/joinsearchseam.go
       (repo baseline is go1.25 — `gofmt -w` rewrites unrelated lines;
       re-applied the edits manually).
+    - Slice 5-partial (landed, loop 2026-09-21 #10): searched-subtree
+      opacity for the residual qual-redistribution family.
+    - Census scoping (`tmp/m0144-0011a2-census.log`, pre-slice-3): 132
+      seam declines — `leaf-count` 104, `outer-over-derived` 12,
+      `outer-spine` 8 (retired by slice 1), `lateral` 8.
+      `outer-on-qual`/`inner-on-qual-*` have ZERO corpus witnesses —
+      retired by absence, no decline class left to migrate.
+      `outer-over-derived` stays (B-06 CTE-output-stats firewall,
+      R42/Q78); `lateral` stays (real deps Q30/Q68 — needs
+      parameterized-path legality, a project of its own).
+    - `leaf-count` dominant cause identified by joinlist-vs-bindings
+      probe: FULL-join folds (opaque leaf covering multiple joinlist
+      rels, `a FULL b JOIN c` → nprefix 3, scans 2) — the
+      executor-substrate-blocked class already ledgered as staying.
+      Grouped `j.Right` joins ruled out (one binding AND one joinlist
+      item — admitted as 2-rel problems).
+    - The pushdown family cannot die wholesale (declined + legacy-arm
+      statements still need the post-search cleanups); the correct
+      retirement shape is stopping it at the searched boundary. Audit:
+      `pushOneConjunct`, `rewriteScanInputs` outer walk and
+      `rewriteJoinsToNLI` already pruned (P5.9-b); two holes closed —
+      `pushSingleSideQualsIntoInnerJoinInputs` had no `isSearchedTree`
+      awareness at any level (walker descent, Filter-level
+      `pushInnerJoinInputQuals` into searched join inputs, and the
+      `pushConjunctIntoSubtree` descent to searched grandchildren), and
+      `findUniqueSeqScanByColumn` (`absorbConjunctsIntoSubtree`'s hunt)
+      could IndexScan-rewrite a scan the costed search elected —
+      wrong-answer class for nullable-held conjuncts (pushed below the
+      null-extension keeps rows the residual drops).
+    - Mechanism: `pushTrace.noSearched` flag; all statement-level
+      descents route through `pushConjunctIntoSubtreeTracedNoSearched`
+      (incl. `deriveConstAcrossJoinEquality`'s sibling seeding).
+      `pushConjunctIntoSubtree` stays permissive — CTE-inline conjuncts
+      arrive from OUTSIDE the searched body's scope and crossing the
+      boundary is PG's own parse-level qual pushdown (R42/Q78 witness);
+      a blanket guard there is the regression, not the fix.
+    - Pins (`searched_opacity_test.go`): searched-root + searched-
+      grandchild refusal, unsearched-side positive control, CTE-inline
+      crossing counter-pin, scan-hunt opacity + unsearched
+      findability. `markSearchedTree` usable on `*Join`/`*SeqScan` in
+      tests (embeds `searchedTree`).
 - [ ] **M0145-0006 — upper-rel pathlists** (extend the lattice through
   `create_grouping_paths`/`create_ordered_paths` analogues so ordering and
   grouping are elected over candidate sets, not by stage-builder
