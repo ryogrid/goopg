@@ -171,6 +171,14 @@ var exprSwitchInventory = map[string]walkerRole{
 	// else). It must not be generalised to "any Expr carrying a subplan" —
 	// that is exactly the blanket gate this task removed.
 	"jointreepullup.go:exprHasConvertibleSublink": nonRecursiveClassifier,
+	// M0145-0015. A path-sensitive CLASSIFIER, not a traversal: it walks down
+	// to the first subplan-bearing node and names the outermost non-AND
+	// wrapper it passed through, because that is what decides whether PG
+	// would have converted the sublink (`pull_up_sublinks_qual_recurse`
+	// recurses AND and NOT, stops at everything else). A slot-driven walk
+	// cannot express it — the answer depends on the PATH taken, not on the
+	// node set reached.
+	"nlicensus.go:sublinkConjunctPosition": nonRecursiveClassifier,
 	// Added by M0145-0003's ANY arm. Same demoted shape and the same
 	// fail-closed property as rebasePulledQual above: the dispatch lives
 	// inside a cloneExprRefs Rewrite closure (lift *ColumnRef to Level-1

@@ -14232,7 +14232,7 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
   confirm it. The knob-arm pull-up census moved `any-nested-sublink` 12 → 0
   (6 pulled, 6 re-classified as the deferred convertible half), which is this
   task's own expected-movement criterion, not a lineage instrument.
-- [ ] **M0145-0015 — name the residual pull-up decline class and
+- [x] **M0145-0015 — name the residual pull-up decline class and
   cover the PG-reachable subset under OR/NOT positions** (filed
   2026-09-21 by owner directive). The 60-conjunct census leaves 3
   "residual" conjuncts plus 2 `ExistsExpr` not at conjunct top
@@ -14254,6 +14254,33 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
   conjuncts moved for exactly the subset PG moves.
   Kind: impl
   Parent: M0145-0003
+  - **CLOSED measured-no-gap 2026-09-21.** Design doc
+    `docs/design/0100-0149/m0145-0015-residual-pullup-declines.md`.
+    - **Step 1 done**: the census now reports `<kind>@<position>` —
+      `top`/`not`/`or`/`scalar` — because in PG the POSITION decides
+      reachability, not the kind. `pull_up_sublinks_qual_recurse` recurses
+      AND and a NOT wrapper (`prepjointree.c:789-845`) and then
+      `/* Stop if not an AND */ return node;` at `:877`, so OR args are
+      never recursed.
+    - **Step 2, the measurement** (SF0.25, knob arm, 99 queries):
+      `SubqueryExpr@scalar` 29, `ExistsExpr@or` 4, `InExpr@or` 2, and
+      **NONE at `@top` or `@not`**. Every residual decline is one upstream
+      makes too — EXPR sublinks are never jointree citizens, and OR args are
+      not recursed — so **the pullable subset is ZERO**.
+    - **Step 3**: both fallbacks the task said to check for already exist and
+      are LIVE — `internal/optimizer/exists_to_any.go` (goopg's
+      `convert_EXISTS_to_ANY`, default ON) and
+      `internal/executor/subplan_hash.go` (the hashed ANY probe, default ON,
+      reached from `evalInExpr`). Nothing missing to file.
+    - **No gate was widened**, deliberately: moving an `@or` conjunct would
+      make goopg convert a sublink PG leaves as a SubPlan — a divergence the
+      corpus value gates cannot see, because the rows would still be right.
+    - Adjacent divergence ledgered rather than lost: goopg's hashed subplan
+      degenerates PG's partial-match table to a single NULL bit, sound only
+      while IN test expressions stay single-column.
+  Movement: none — measured-no-gap. The census extension is the whole
+  production change; it is what lets a later loop tell `@top` (a gap) from
+  `@or` (parity) without re-deriving it.
 - [ ] **M0145-0016 — `semianti-not-tail`: admit non-tail synthetic
   leaves (leaf reorder + relset remap)** (filed 2026-09-21 by owner
   directive; ledgered at `joinsearchseam.go`'s construction contract

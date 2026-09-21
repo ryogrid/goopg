@@ -121,6 +121,78 @@ func notePullupDecline(reason string) {
 // arm that never appears. `ExprSubplans` is the shared "does this expression
 // carry an inner plan" primitive, and `%T` names whatever it finds, so a new
 // sublink type shows up in the census the day it is added.
+func sublinkConjunctSite(c Expr) string {
+	kind := sublinkConjunctKind(c)
+	if kind == "" {
+		return ""
+	}
+	return kind + "@" + sublinkConjunctPosition(c)
+}
+
+// sublinkConjunctPosition names WHERE inside the conjunct the first
+// subplan-bearing node sits. M0145-0015 needs it because the remedy is
+// decided by the position, not by the sublink kind: PG's
+// `pull_up_sublinks_qual_recurse` recurses through AND and through a NOT
+// wrapper (`prepjointree.c:789-845`) but **stops at every other clause type**,
+// OR args included (`:877`). So an `ExistsExpr@or` is a correct decline that
+// upstream makes too, while an `ExistsExpr@top` would be a real miss — and a
+// census that reports only "ExistsExpr" cannot tell them apart.
+//
+// The walk is deliberately path-sensitive rather than a plain search: the
+// OUTERMOST non-AND wrapper on the way down is what decides reachability, so
+// an OR seen anywhere above the sublink outranks a NOT seen below it.
+func sublinkConjunctPosition(c Expr) string {
+	var walk func(e Expr, depth int, sawOr, sawNot bool) string
+	walk = func(e Expr, depth int, sawOr, sawNot bool) string {
+		if e == nil {
+			return ""
+		}
+		if len(ExprSubplans(e)) > 0 {
+			switch {
+			case sawOr:
+				return "or"
+			case sawNot:
+				return "not"
+			case depth == 0:
+				return "top"
+			default:
+				return "scalar"
+			}
+		}
+		switch x := e.(type) {
+		case *BinaryOp:
+			nextOr := sawOr || x.Op == parser.OpOr
+			// An AND below the conjunct root is still conjunct position:
+			// splitAnd would have separated it had the caller split deeper.
+			nextDepth := depth + 1
+			if x.Op == parser.OpAnd {
+				nextDepth = depth
+			}
+			if r := walk(x.Left, nextDepth, nextOr, sawNot); r != "" {
+				return r
+			}
+			return walk(x.Right, nextDepth, nextOr, sawNot)
+		case *UnaryOp:
+			if x.Op == parser.OpNot {
+				return walk(x.Operand, depth, sawOr, true)
+			}
+			return walk(x.Operand, depth+1, sawOr, sawNot)
+		}
+		// Any other container: the sublink is buried in a scalar expression.
+		found := ""
+		walkExprTree(e, func(n Expr) {
+			if found == "" && n != e && len(ExprSubplans(n)) > 0 {
+				found = "scalar"
+			}
+		})
+		return found
+	}
+	if r := walk(c, 0, false, false); r != "" {
+		return r
+	}
+	return "unknown"
+}
+
 func sublinkConjunctKind(c Expr) string {
 	kind := ""
 	walkExprTree(c, func(x Expr) {

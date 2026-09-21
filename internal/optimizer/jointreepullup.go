@@ -191,8 +191,13 @@ func pullUpSublinksIntoJointree(pred Expr, ctx *resolveContext, cat catalog.Cata
 			// M0145-0003 census: a conjunct this arm does not even
 			// recognise. Only sublink-bearing conjuncts are reported —
 			// an ordinary `a = 1` is not a missed pull-up.
-			if kind := sublinkConjunctKind(c); kind != "" {
-				notePullupDecline(kind)
+			// M0145-0015: report the sublink kind AND the clause position.
+			// The remedy is decided by the position — PG recurses through
+			// AND and NOT but stops at every other clause type, OR args
+			// included — so `ExistsExpr@or` is a correct decline and
+			// `ExistsExpr@top` would be a real miss.
+			if site := sublinkConjunctSite(c); site != "" {
+				notePullupDecline(site)
 			}
 			continue
 		}
