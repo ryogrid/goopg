@@ -1,10 +1,11 @@
 # Upper-rel pathlists (M0145-0006)
 
-Status: slices 1 (the order-delivering tops `inputNodePathkeys` swallowed),
-2 (the merge-join top) and 3-partial (the election sees through a rename)
-4 (the DISTINCT election's candidate minimum) and 5 (the HAVING filter,
-priced) landed. The task's own residual gates are closed; what remains is
-ledgered below. Task: `.ralph/fix_plan.md` M0145-0006.
+Status: COMPLETE — all five slices landed and the task is `[x]`: 1 (the
+order-delivering tops `inputNodePathkeys` swallowed), 2 (the merge-join top),
+3 (the election sees through a rename), 4 (the DISTINCT election's candidate
+minimum) and 5 (the HAVING filter, priced). All three D4 residual gates the
+task named are closed; the follow-on work noted below is ledgered and owned by
+M0145-0007/0008, not by this task. Task: `.ralph/fix_plan.md` M0145-0006.
 Parent: M0145-0005. Kind: impl.
 
 ## What the task is

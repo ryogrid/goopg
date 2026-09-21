@@ -12772,7 +12772,7 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
       crossing counter-pin, scan-hunt opacity + unsearched
       findability. `markSearchedTree` usable on `*Join`/`*SeqScan` in
       tests (embeds `searchedTree`).
-- [ ] **M0145-0006 — upper-rel pathlists** (extend the lattice through
+- [x] **M0145-0006 — upper-rel pathlists** (extend the lattice through
   `create_grouping_paths`/`create_ordered_paths` analogues so ordering and
   grouping are elected over candidate sets, not by stage-builder
   producers). Absorbs D4's residual gates: `inputNodePathkeys`'s
@@ -12924,6 +12924,38 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
   a lowering bug must never silently reach the default pipeline.
   Kind: impl
   Parent: M0145-0005
+    - Recon complete + slice 1 landed (loop 2026-09-21 \#16). Design doc:
+      `docs/design/0100-0149/m0145-0007-single-path-node-lowering.md`.
+    - The recon RE-ORDERED the four items M0145-0001 assigned here, and
+      two of them turn out not to be refactors at all.
+    - `translateToLayout` is ALREADY lowering-local: every call site
+      sits in a `createplan*.go` file (4 join, 3 nl, 2 simple, 1 gather;
+      none elsewhere). Retired by absence. Slice 1 converts the
+      measurement into an enforced invariant
+      (`TestTranslateToLayoutIsLoweringLocal`), verified to FAIL when the
+      exclusion is lifted, so it is a guard and not a tautology.
+    - `fillJoinHashKeys` must retire LAST, not first. Its lateness is a
+      deliberate defence: `Predicate` is mutated after join construction
+      by predRebind, the bushy sub-remap, constant folding,
+      `lowerSubPlanParams` and the qual-placement passes, and a field
+      filled early is one every mutator must maintain — the one time
+      that was missed, chained NATURAL JOINs probed the wrong column
+      (M0097-0060). It can fold into the join arm only after the
+      mutators are gone.
+    - `rewriteJoinsToNLI` + `stampSemiProbePrices` need no folding:
+      `walkRewriteNLI` already returns at `isSearchedTree` (P5.9-b) and
+      the stamp mirrors its descent exactly, so both serve ONLY the
+      population the PG-shaped search never built. They die with the
+      legacy pipeline at M0145-0008. What 0007 owes is a MEASUREMENT
+      that the search's NLI paths cover that population (slice 2).
+    - The splice/re-resolution family is the real work and is entirely
+      live: `reresolveJoinByName` 28 non-test refs, `remapByPosMap` 16,
+      `applyJoinTreePosMap` 10, `remapWithBindings` 9, `layoutPosMap` 7,
+      `remapPosMapAfterRewrite` 5, `remapSublinkOuterRefs` 4,
+      `spliceSearchedSpine` 3, `remapExprRefsToMHJ` 2.
+    - Five-slice plan in the design doc; slice 2 is the NLI-population
+      census, slice 3 the `OuterColumnRef` outer-layout mapping, slice 4
+      the rest of the re-resolution family, slice 5 the hash keys.
 - [ ] **M0145-0008 — cutover**: flip `GOOPG_JOINTREE_PIPELINE` default,
   re-run the full corpus gates on the new pipeline (sf025 sweep,
   tpch-spotcheck, acceptance arm, plan-parity capture), then delete the
