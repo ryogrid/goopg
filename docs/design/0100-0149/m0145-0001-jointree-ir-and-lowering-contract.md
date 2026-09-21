@@ -1,6 +1,14 @@
 # M0145-0001 — the jointree-level IR and the lowering contract
 
-Status: RECON COMPLETE (2026-09-21). No production file touched.
+Status: ESCALATED [!] 2026-09-22 — recon itself was complete 2026-09-21 (no production file touched), but this ROOT is now blocked pending an owner decision.
+ESCALATED `[!]` 2026-09-22 — the lineage budget for this root is exhausted:
+its last five completed descendants (M0145-0006, M0145-0014, M0145-0015,
+M0145-0016, M0145-0017) all carry `Movement: none`. No further descendant may
+be filed or selected until the owner rules. The full write-up — what was
+attempted, what each step proved, the two remaining walls (B-06 CTE-output
+statistics, and the cost model that M0145-0018 ran into), expected movement if
+unblocked, remaining size, and the deferred scope that could not be filed as
+tasks — is in the M0145-0001 escalation block in `.ralph/fix_plan.md`.
 Kind: recon
 Parent: none
 Movement: none

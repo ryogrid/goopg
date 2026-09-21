@@ -1,47 +1,54 @@
 (idle — nothing in flight)
 
-# Loop #59 result — M-NIGHTLY AI-20260922-004850-001 FIXED and committed
+# Loop #60 result — M0145-0003 CLOSED; M0145-0001 ESCALATED `[!]`
 
-`TestPort_IsolationEvalPlanQual` returned the PRE-update `tableAValue` where
-PG returns `newTableAValue`. Root cause was NOT where loop #58 pointed.
+Banner selection: items 0/1/2 have no open tasks, so item 3's first
+selectable task was **M0145-0003**. That also retires the banner-ordering
+escalation carried since loop 48 — 0009-0018 are done, so 0003 was
+unambiguously first and nothing was out of order.
 
-**Root cause.** `resolveRowMarkCtidResnos` (internal/optimizer/planner.go)
-located each locked-relation column in the root output by `(Name,
-SourceTableIdx)`. A target-list ALIAS renames the output schema column, so
-`SELECT ta.value AS ta_value` leaves no `value` entry and EVERY position
-resolved to `-1`. At the merge site a `-1` means "not carried in the output",
-so the correctly re-fetched post-update values were silently dropped.
+No production code changed this loop. Docs/tracker only.
 
-**Fix.** `findLockedColByTarget` + `findTopProjectForOutput`: on a `-1`,
-resolve through the Project TARGET, whose `ColumnRef.Name` keeps the original
-source name under aliasing. `-1`-means-absent preserved.
+## M0145-0003 closed on a CLASSIFIED census
+Knob-arm TPC-DS SF0.25 capture, both census channels
+(`tmp/jtcap-m3-loop60/`, `tmp/jtcap-m3-l60t/`). Cumulative over the arms
+landed in earlier loops: `(pulled)` 9->27, `InExpr` 34->1, seam
+`leaf-count` 26->10, `D1-sublink` 8->5.
+The reason to close is that all 60 fires are **classified**: 27 pulled /
+15 CTEScan-leaf blocked on B-06 (M0145-0009) / 15 `SubqueryExpr@scalar`
++ 3 OR-position, which are NOT gaps because PG declines those shapes too
+(prepjointree.c:877). `IN`/`NOT IN` is DONE.
 
-**Correction carried forward:** loop #58 named the discriminator as "a SubPlan
-attached to the locked scan". That was WRONG — re-running its minimal pair at
-HEAD gave the correct answer. The spec step has both a subquery and aliases;
-the hand-built probe kept the subquery and dropped the `AS`. The rule worth
-keeping: when a hand-built repro disagrees with the failing test, the REPRO is
-the suspect — instrument the real run instead of refining the imitation. (The
-working instrument: snapshot the spawned server's `cluster.log`, which lives
-under `t.TempDir()` and is deleted at teardown, while the test runs.)
+## The important outcome: lineage budget exhausted
+The lineage check REFUSED the two residue tasks I tried to file, because
+M0145-0001's last five completed descendants (0006, 0014, 0015, 0016,
+0017) all carry `Movement: none`. Per its instruction I:
+- marked **M0145-0001 `[!]`** and wrote a full escalation block into it
+  (what was attempted, what each step proved, the blocker, expected
+  movement if unblocked, remaining size, plus the deferred scope that
+  could not be filed as tasks);
+- withdrew the two tasks and repointed every reference (ledger, design
+  doc, design README, 0003's own note) at the escalation block;
+- corrected M0145-0003's `Movement:` to **none** — this loop changed no
+  code, and the census counters are not one of S3's three instruments.
 
-## Gates (all green)
-- units; `TestPort_IsolationEvalPlanQual` PASS; **entire** `TestPort_Isolation*`
-  suite PASS (417s) — the right risk gate for a rowmark change
-- tpch-spotcheck PASS (Q12=2, Q13=33 canonical), re-run against the STAGED tree
-  so the stamp is valid
-- tpcds-sf025 PASS — 99/99 plan shapes identical, confirming the change is
-  inert outside rowmark plans
-- Both new unit tests verified to FAIL with the fix disabled (not vacuous)
+**The claim the owner needs to rule on:** the jointree/pull-up front end
+is no longer the binding constraint. The walls are (1) B-06 CTE-output
+statistics and (2) the COST MODEL (what M0145-0018's no-go hit). Five
+consecutive descendants improved the mechanism without moving plan parity.
+
+## Gates
+`go build ./...` OK; state guard OK; pgbench smoke via the commit hook.
+No value gates required — zero production diff (verified with
+`git status` over `internal/ cmd/ scripts/`).
 
 ## Next loop
-Re-read the banner and select fresh. M-NIGHTLY still has open items:
-PgAmcheck003 x4 (-002..-005), PgoutputInterop x10 (-006..-015), and
-`TestPort_RegressSuite` (-016, 4 subtests, confirmed still failing at HEAD and
-NOT stale-sha fallout from the bpchar slices; note in fix_plan says to get the
-diff via `scripts/pg-regress-runner.sh`, since that test does not persist one).
+M0145-0001 is `[!]`, so **every M0145 descendant is now non-selectable**
+(0004, 0005, 0007, 0008, 0009, 0010 all descend from it). Banner item 3 is
+therefore blocked pending the owner. Next selectable is item 4
+(**M0141-S2a-fix2r**), then 5, 6, 7, 8, 9, and item 10's M-NIGHTLY items
+(PgAmcheck003 x4, PgoutputInterop x10, TestPort_RegressSuite -016).
 
-## Owner escalations STILL UNANSWERED (carried since loops 48 and ~57)
+## Owner escalations OPEN — now TWO, both on M0145
 1. M0145-0018's cost-model no-go.
-2. Banner ordering: M0145-0003 is strictly the first `[ ]` in item 3, yet
-   loops 39-51 worked 0009 -> 0018.
+2. **NEW:** M0145-0001 lineage budget exhausted (this loop).

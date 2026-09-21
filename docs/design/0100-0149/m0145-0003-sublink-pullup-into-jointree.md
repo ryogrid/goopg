@@ -1,8 +1,13 @@
 # M0145-0003 — sublink pull-up into the jointree
 
-Status: landed (EXISTS/NOT EXISTS flat-body arm + ANY arm) / gates in
-§"Measurement". The body-local-qual refusal that cost TPC-H Q4 and Q21 their
-semijoins was fixed 2026-09-21 — see §"Body-local quals are base restrictions".
+Status: COMPLETE 2026-09-22 (EXISTS/NOT EXISTS flat-body arm + ANY arm) /
+gates in §"Measurement". The body-local-qual refusal that cost TPC-H Q4 and Q21
+their semijoins was fixed 2026-09-21 — see §"Body-local quals are base
+restrictions". Closed on a CLASSIFIED census rather than an empty one — see
+§"Closing measurement (2026-09-22)". The unbuilt scope is recorded in the
+M0145-0001 escalation block (that root is now `[!]` -- its last five completed
+descendants all showed `Movement: none`); it has zero measured demand today and
+must not be started without re-running the census.
 
 ## The ANY arm — `convert_ANY_sublink_to_join` (landed 2026-09-21)
 
@@ -384,3 +389,61 @@ Timings and the sibling-path audit are in
   append; `corrAbove` over pooled conjuncts.
 - `internal/optimizer/exprwalk_inventory_test.go` — two
   `nonRecursiveClassifier` pins.
+
+## Closing measurement (2026-09-22) — why this task ends here
+
+Re-ran the knob-arm TPC-DS SF0.25 capture with both census channels on
+(`GOOPG_NLI_CENSUS=1`, `GOOPG_PGSHAPED_DP_TRACE=1`), captures in
+`tmp/jtcap-m3-loop60/` and `tmp/jtcap-m3-l60t/`.
+
+Movement against the task's own stated targets:
+
+| channel | before | after |
+|---|---|---|
+| `PULLUPCENSUS` `(pulled)` | 9 | **27** |
+| `PULLUPCENSUS` `InExpr` | 34 | **1** |
+| seam `leaf-count` decline | 26 | **10** |
+| vs-PG `D1-sublink` | 8 | **5** |
+
+The reason to stop is not that the numbers improved — it is that **all 60
+census fires are now classified**, and none of them asks for an arm that is
+buildable today:
+
+- `(pulled)` **27** — successes.
+- `any-body-leaf-(*optimizer.CTEScan)` **15** — blocked on B-06
+  (CTE-output statistics, M0145-0009). Admitting these leaves first would
+  push a statistics-free input into the DP, which is what the Q78
+  `outer-over-derived` firewall exists to prevent (C-04a: 15 s → 327 s
+  TIMEOUT).
+- `SubqueryExpr@scalar` **15** — not a gap. PG does not pull scalar
+  sublinks up either; they stay SubPlans.
+- `ExistsExpr@or` **2**, `InExpr@or` **1** — not a gap.
+  `pull_up_sublinks_qual_recurse` returns non-AND clauses unmodified
+  (prepjointree.c:877), so PG does not reach an OR-position sublink either.
+
+A `SUBLINKCENSUS` cross-check shows 285 sublinks routing `pinned-spine`
+against 23 `jointree-pullup` — the never-reached population M0145-0017
+already closed as a measured no-gap.
+
+The `IN`/`NOT IN` work previously listed as still-open is **done**: the ANY
+arm landed it, and the single surviving `InExpr` is an OR-position one PG
+also declines.
+
+### The unbuilt scope, and why it is not built
+
+The opaque-body arm, outer-local-only correlation and ANTI outer-local quals
+remain unimplemented. They are recorded in the M0145-0001 escalation
+block, with a standing instruction not to start without re-running the census
+first, because **both currently have zero measured demand** — no bucket fires
+for them in TPC-DS SF0.25, and TPC-H was already fully inert for this
+mechanism (`match=22 shapediff=0`). Filing them as their own tasks was
+refused: M0145-0001's last five completed descendants all carry
+`Movement: none`, so the root is `[!]` pending an owner decision.
+
+This is the method this task established in its own decline-census loop:
+pick the next arm FROM the census rather than by size. Applied honestly, that
+method says to stop here. The generalisable point is that a census is
+valuable in both directions — it is what told us to build the ANY arm (34 of
+45 unpulled conjuncts), and it is what now says no remaining arm is worth
+building. A residue that is fully *classified* is a finished task; a residue
+that is merely *smaller* is not.

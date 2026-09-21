@@ -12838,9 +12838,70 @@ EXISTS/IN body via `planSelectWithParent` before unnest/search ever run
 M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
 `-3i-lateral-route` all block on this milestone's 0003.
 
-- [x] **M0145-0001 — recon: the jointree-level IR and the lowering
+- [!] **M0145-0001 — recon: the jointree-level IR and the lowering
   contract** (design the representation the whole milestone builds on).
-  **DONE 2026-09-21.** Design doc
+  **DONE 2026-09-21.**
+
+  > ## ESCALATION 2026-09-22 (loop \#60) — lineage budget exhausted, OWNER DECISION NEEDED
+  >
+  > The lineage check refused two newly-filed descendants of this root
+  > because the last five COMPLETED descendants (M0145-0006, M0145-0014,
+  > M0145-0015, M0145-0016, M0145-0017) all carry `Movement: none`. Per its
+  > own instruction this root is marked `[!]` and the loop selects
+  > elsewhere. Only the owner re-opens it. Writing it up honestly:
+  >
+  > **What was attempted.** The jointree-first pipeline behind
+  > `GOOPG_JOINTREE_PIPELINE=1`: an IR built before lowering (0001/0002),
+  > sublink pull-up into it (0003, incl. the EXISTS and ANY arms), then a
+  > run of targeted follow-ups the census named — seam admission for pulled
+  > CTE leaves (0013), nested-sublink recursion (0014), residual declines
+  > (0015), `semianti-not-tail` (0016), never-reach census (0017), firewall
+  > relaxation (0018).
+  >
+  > **What each step proved.** 0003 moved real internal counters
+  > (`(pulled)` 9 -> 27, `InExpr` 34 -> 1, seam `leaf-count` 26 -> 10,
+  > `D1-sublink` 8 -> 5) — the mechanism works. But 0014/0015/0016/0017
+  > each closed either measured-no-gap or with movement that did NOT reach
+  > one of S3's three instruments, and 0018 was a hard NO-GO (SF1 Q78 29 s
+  > -> >1800 s). The pattern across five tasks is consistent: the pull-up
+  > mechanism is correct and reaches more sublinks, yet plan PARITY does
+  > not move.
+  >
+  > **The remaining blocker, stated as a claim the owner can test.** The
+  > binding constraint is no longer the jointree/pull-up front end — it is
+  > downstream of it. Two specific walls, both already measured:
+  >   1. **B-06, CTE-output statistics** (filed as the unchecked
+  >      M0145-0009). 15 of the 60 pull-up census fires are ANY bodies whose
+  >      FROM is a CTE reference; they cannot be admitted without pushing a
+  >      statistics-free input into the DP, which the Q78
+  >      `outer-over-derived` firewall exists to prevent (C-04a: 15 s ->
+  >      327 s TIMEOUT).
+  >   2. **The COST MODEL**, which is what M0145-0018 ran into: relaxing the
+  >      firewall produced legal plans that cost out catastrophically. That
+  >      escalation is also still unanswered.
+  >
+  > **Expected movement if unblocked.** Landing B-06 would make the 15
+  > CTEScan-leaf bodies admissible and is the named re-evaluation trigger
+  > for the `outer-over-derived` decline family. Nobody has demonstrated
+  > that this converts into a `match`-count change, and on this lineage's
+  > record that should be measured before more is invested.
+  >
+  > **Remaining size.** M0145-0004, -0005, -0007, -0008, -0009, -0010 are
+  > still `[ ]` under this root — including the 0008 cutover that deletes
+  > the legacy pipeline. This is a large remaining commitment, which is
+  > exactly why the budget signal is worth honouring now rather than after
+  > another five tasks.
+  >
+  > **Deferred scope that would otherwise have been filed as tasks** (filing
+  > them was refused; recording it here so it is owned, not lost): the
+  > **opaque-body arm** (non-flat bodies as semi/anti citizens carrying
+  > their planned Node; needs param-exec machinery inside the problem) and
+  > **outer-local-only correlation + ANTI outer-local quals** (no legal slot
+  > today — the link carries no join-clause-only qual channel; they hoist
+  > fine under SEMI). Both have **zero measured demand** as of 2026-09-22:
+  > no census bucket fires for them on TPC-DS SF0.25, and TPC-H is fully
+  > inert for this mechanism (`match=22 shapediff=0`). Neither should be
+  > built without re-running the census and naming a firing bucket first. Design doc
   `docs/design/0100-0149/m0145-0001-jointree-ir-and-lowering-contract.md`
   (indexed). Decisions: (i) IR = `jtLeafRef`/`jtFromExpr`/`jtJoinExpr`/
   `jtAppendRel` over a per-statement leaf table (`jtScope`), flat
@@ -12904,7 +12965,7 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
   Kind: impl
   Parent: none
   Movement: none
-- [ ] **M0145-0003 — sublink pull-up into the jointree** (goopg's
+- [x] **M0145-0003 — sublink pull-up into the jointree** (goopg's
   `pull_up_sublinks`/`pull_up_subqueries` analogue; the milestone's core).
   Using route-a step 1's retained `.Subquery` parse trees, flatten bodies
   passing `sublinkBodyIsSimple` into the IR as semi/anti entries (quals
@@ -13049,11 +13110,53 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
     - **Next arm: `convert_ANY_sublink_to_join`** (subselect.c:1333) — 34
       of the 45 unpulled sublink conjuncts, and ANY+EXISTS is exactly
       PG's own `pull_up_sublinks` scope.
-  - Still open (ledgered): the **opaque-body arm** (non-flat bodies as
-    semi/anti citizens carrying their planned Node — needs param-exec
-    machinery inside the problem); `IN`/`NOT IN` pull-up
-    (`convert_ANY_sublink_to_join` — hashed-subplan mechanism);
-    outer-local-only correlation; ANTI outer-local quals.
+  - **CLOSED 2026-09-22 on a re-measurement, loop \#60.** Re-ran the
+    knob-arm TPC-DS SF0.25 capture with both census channels on
+    (`GOOPG_NLI_CENSUS=1`, `GOOPG_PGSHAPED_DP_TRACE=1`;
+    `tmp/jtcap-m3-loop60/`, `tmp/jtcap-m3-l60t/`). Both of the task's own
+    stated expected movements are met, and the residue is fully accounted
+    for rather than merely smaller.
+    Movement: none — this closing loop changed NO production code, so it
+    moved no plan. The census deltas below are CUMULATIVE over the arms
+    landed in earlier loops, and none of them is one of S3's three
+    instruments (`match`, `CATEGORIES-EXCL-MATCH`, `ea-ratchet`); they are
+    reported as the task's own acceptance evidence, not as movement.
+    Cumulative: `PULLUPCENSUS` `(pulled)` 9 -> 27; `InExpr` 34 -> 1; the
+    seam's `leaf-count` decline class 26 -> 10; vs-PG `D1-sublink` 8 -> 5.
+    - **Every one of the 60 census fires is now classified, and none of
+      them wants an arm that is buildable today:**
+      - `(pulled)` **27** — successes.
+      - `any-body-leaf-(*optimizer.CTEScan)` **15** — BLOCKED on B-06
+        (CTE-output statistics), owned by the unchecked **M0145-0009**.
+        Admitting these leaves without it pushes a statistics-free input
+        into the DP, which is exactly what the Q78 `outer-over-derived`
+        firewall exists to prevent (C-04a: 15 s -> 327 s TIMEOUT), and the
+        banner makes that firewall a hard constraint.
+      - `SubqueryExpr@scalar` **15** — NOT a gap. PG does not pull scalar
+        sublinks up either; they stay SubPlans.
+      - `ExistsExpr@or` **2** + `InExpr@or` **1** — NOT a gap.
+        `pull_up_sublinks_qual_recurse` returns non-AND clauses unmodified
+        (prepjointree.c:877), so PG does not reach an OR-position sublink
+        either. Measured and closed under M0145-0015.
+    - `SUBLINKCENSUS` cross-check: 285 sublinks route `pinned-spine`
+      against 23 `jointree-pullup` — the never-reached population
+      M0145-0017 already closed as a measured no-gap (sublinks outside
+      top-level WHERE conjuncts, which PG likewise does not pull up).
+    - **Why this closes rather than continues.** The `IN`/`NOT IN` item
+      previously listed as still-open is DONE — the ANY arm landed it and
+      the single surviving `InExpr` is an OR-position one PG declines too.
+      What is left (the opaque-body arm, outer-local-only correlation,
+      ANTI outer-local quals) has **zero measured demand in either
+      corpus**: no census bucket fires for them in TPC-DS SF0.25, and
+      TPC-H was already fully inert (`match=22 shapediff=0`). This task's
+      own established method is to pick the next arm from the census
+      rather than by size, and the census now names no buildable arm.
+      Building one anyway would be speculative. Filing them as their own
+      tasks was REFUSED (M0145-0001 last five completed descendants all
+      `Movement: none`), so the scope is recorded in the M0145-0001
+      escalation block instead and that root is now `[!]` pending an
+      owner decision — see the escalation for the full write-up.
+
 - [ ] **M0145-0004 — UNION ALL flattening to an appendrel jointree entry**
   (`pull_up_simple_union_all` analogue, prepjointree.c:1617). Absorbs
   M0144-0003b's residual: the branches whose subtree never reached the
