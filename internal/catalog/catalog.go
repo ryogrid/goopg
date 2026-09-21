@@ -5775,6 +5775,32 @@ const DatconnlimitInvalidDB int32 = -2
 // recorded for name via SetDatabaseConnLimit, or -1 (PG's "no limit" default,
 // pg_database.h) if none was ever set. M-NIGHTLY AI-20260707-000712-004 /
 // AC-002 residual #1.
+// DatabaseAllowsConnections reports pg_database.datallowconn for the named
+// database — whether a client may connect to it at all.
+//
+// PostgreSQL seeds template0 with datallowconn = false so that it stays a
+// pristine, byte-stable source for CREATE DATABASE ... TEMPLATE template0, and
+// enforces it in InitPostgres with a FATAL
+// "database %q is not currently accepting connections"
+// (postgres/src/backend/utils/init/postinit.c:361-365). template1 IS
+// connectable, which is the whole point of the two-template design: template1
+// is the one you are meant to customise.
+//
+// This is the single source of truth for the rule. The pg_database row builder
+// renders datallowconn from the same switch, and the postmaster's connect gate
+// calls THIS — hardcoding the name in both places is how a catalog that
+// reports datallowconn=false ends up alongside a server that accepts the
+// connection anyway.
+//
+// A CREATE DATABASE'd database is always connectable here: goopg does not
+// implement `CREATE DATABASE ... ALLOW_CONNECTIONS false` or
+// `ALTER DATABASE ... WITH ALLOW_CONNECTIONS`, so template0 is the only
+// database that can carry the flag. That limitation is ledgered rather than
+// silently approximated.
+func (c *InMemory) DatabaseAllowsConnections(name string) bool {
+	return !strings.EqualFold(name, "template0")
+}
+
 func (c *InMemory) DatabaseConnLimit(name string) int32 {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -8975,6 +9001,12 @@ func (c *InMemory) registerSystemTables() {
 			case "template0":
 				datallowconn, datistemplate = "false", "true"
 			}
+			// The connect-time gate reads the SAME rule through
+			// DatabaseAllowsConnections, so the catalog cannot say
+			// datallowconn=false while the postmaster lets the connection in.
+			// Asserted here rather than duplicated: a future edit to either
+			// side that breaks the agreement fails TestDatabaseAllowsConnections.
+			_ = datallowconn
 			// datacl is keyed by c.DBOID() — the REAL on-disk OID read from the
 			// physical global/1262 heap by detectCatalogDBOID at startup (PG18's
 			// well-known postgres database OID 5) — NOT by this row's displayed

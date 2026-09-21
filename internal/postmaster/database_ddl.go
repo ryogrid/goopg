@@ -1956,6 +1956,14 @@ type databaseConnLimitRegistry interface {
 	DatabaseConnLimit(name string) int32
 }
 
+// databaseAllowConnRegistry is the subset of catalog.Catalog the connect-time
+// datallowconn gate needs. Optional, like every registry interface here, so an
+// embedded or test catalog that does not implement it keeps the prior
+// behaviour rather than failing closed on every connection.
+type databaseAllowConnRegistry interface {
+	DatabaseAllowsConnections(name string) bool
+}
+
 // databaseEncodingRegistry is the subset of catalog.Catalog the CREATE
 // DATABASE ... ENCODING handler needs to persist the encoding choice.
 // catalog.InMemory satisfies this interface. Separate from databaseRegistry

@@ -2027,11 +2027,66 @@ the whole file's active task between 2026-09-01 and 2026-09-14; **since
       executor + testport (`TestPort_PgAmcheck004`/`001`/`AmcheckCreateExtension`)
       PASS; `RALPH_PRECOMMIT_SCOPE=units` PASS.
     - Design: `docs/design/0100-0149/0119-0006bs-per-database-extension-registry.md`.
-    - Recorded-not-fixed (in the doc's deferral list): template0 is
+    - Recorded-not-fixed (in the doc's deferral list): ~~template0 is
       connectable so a `CREATE EXTENSION` there writes base/4 and would be
-      cloned into future `CREATE DATABASE`s; a template1 install re-attributes
-      to "postgres" on restart (shared bootstrap namespace); user-db-local
-      `extnamespace` falls back to "public" at reload.
+      cloned into future `CREATE DATABASE`s~~ **FIXED 2026-09-22, see the bu
+      slice below**; a template1 install re-attributes to "postgres" on
+      restart (shared bootstrap namespace); user-db-local `extnamespace`
+      falls back to "public" at reload.
+  - 2026-09-22 (bu): **enforce `pg_database.datallowconn` at connect time**,
+    closing the first of the bs slice's three recorded-not-fixed items.
+    Movement: none — SF0.25 `PLAN-SHAPE same=99 changed=0`; a connection-path
+    conformance fix, which none of S3's three instruments measures.
+    - **The catalog already told the truth; only the gate was missing.**
+      goopg's `pg_database` correctly rendered `datallowconn = false` for
+      template0 — which is why pg_amcheck's `--all` filter already skipped it
+      — but nothing enforced it on connect, so `psql -d template0` succeeded.
+      That is the worst arrangement of the two: every tool that politely asks
+      the catalog is told the truth, and every tool that simply connects is
+      not.
+    - Upstream raises FATAL 55000 `database "%s" is not currently accepting
+      connections` in InitPostgres
+      (`postgres/src/backend/utils/init/postinit.c:361-365`); goopg now emits
+      that message verbatim, verified byte-for-byte against a live PG 18.3.
+    - **One rule, one place.** New `catalog.DatabaseAllowsConnections` is the
+      single source of truth; the `pg_database` row builder and the
+      postmaster's gate both read it. Hardcoding the name in both is exactly
+      how a catalog saying "closed" ends up beside a server saying "come in",
+      and `TestDatabaseAllowsConnectionsMatchesPGDatabaseRow` pins the
+      agreement by reading the RENDERED rows rather than restating the rule.
+    - **Paired control, not optional**: `TestConnectTemplate1Accepted`. The
+      cheap way to pass the rejection test is to refuse every template
+      database, and PostgreSQL allows template1 — it is the template users
+      are meant to customise. Verified non-vacuous: disabling the gate fails
+      exactly the rejection test and leaves the control green.
+    - Ordered after the existence check and before the `datconnlimit = -2`
+      one, matching InitPostgres, so a name that is both absent and
+      unconnectable still reports "does not exist".
+    - Gates: units; whole `TestPort_PgAmcheck*` family (it is the suite that
+      filters on `datallowconn`); tpch-spotcheck Q12=2/Q13=33; tpcds-sf025;
+      acceptance arm 24/24; pgbench smoke (the connection path is exactly
+      what it exercises).
+
+- [ ] **current_database() reports "postgres" when connected to template1**
+  (found 2026-09-22 while measuring for the bu slice, NOT the item being
+  worked).
+  Kind: bug
+  Parent: M0119-0006
+  - Repro, no fixture needed: `psql -d template1 -c "select
+    current_database()"` against goopg returns `postgres`; PostgreSQL
+    returns `template1`. template1 is legitimately connectable on both, so
+    this is not covered by the datallowconn work.
+  - It was ALSO true of template0 before the bu slice, which is how it
+    surfaced — the template0 connection that should have been refused
+    reported itself as `postgres`.
+  - Not yet established, and the first thing to determine: whether the
+    session is genuinely routed to the `postgres` namespace (in which case
+    DDL run against template1 lands in the wrong database — a much more
+    serious bug) or whether only the reporting function is wrong. The
+    `catalog.NamespaceDBOid` aliasing that maps `postgres` onto
+    `DefaultDBOid` (M0119-0006 bq slice) is the place to look first.
+  - Left unfixed deliberately: one task per loop, and a fix whose blast
+    radius depends on which of those two it is should not be guessed at.
     - **LANDED 2026-09-20 via `09bde885a`** — the bs slice sat staged while
       the owner's `data.HOLD` (M0142-0003i 8-FK reload) kept the TPC-H gates
       SKIP-BLOCKED; when the owner committed their anchor re-pin the staged

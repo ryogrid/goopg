@@ -1032,6 +1032,29 @@ func (s *Server) serveConn(ctx context.Context, raw net.Conn) {
 			return
 		}
 
+		// M0119-0006 (bs residual): reject a connection to a database whose
+		// pg_database.datallowconn is false, mirroring PG's InitPostgres FATAL
+		// 55000 "database %q is not currently accepting connections"
+		// (postinit.c:361-365).
+		//
+		// goopg's catalog already REPORTED datallowconn = false for template0 —
+		// pg_amcheck's `--all` filter reads it and correctly skips the database
+		// — but nothing enforced it at connect time, so `psql -d template0`
+		// succeeded. That is what let a CREATE EXTENSION land in template0,
+		// where it would be copied into every future CREATE DATABASE that uses
+		// it as a template: the pristine-template invariant the flag exists to
+		// protect.
+		//
+		// Ordered AFTER the existence check and BEFORE the datconnlimit one,
+		// matching InitPostgres, so a name that is both absent and unconnectable
+		// still reports "does not exist".
+		if reg, ok := s.cfg.Catalog.(databaseAllowConnRegistry); ok && !reg.DatabaseAllowsConnections(db) {
+			s.writeFatal(w, errcodes.ObjectNotInPrerequisiteState,
+				fmt.Sprintf("database %q is not currently accepting connections", db))
+			logger.Info("connection rejected: database does not accept connections", "database", db)
+			return
+		}
+
 		// M0119-0006 (AC-002 residual #1): reject a connection to a database
 		// marked `datconnlimit = -2` (left partway through DROP DATABASE),
 		// mirroring PG's InitPostgres FATAL 55000 "cannot connect to invalid

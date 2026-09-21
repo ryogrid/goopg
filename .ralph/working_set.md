@@ -1,66 +1,61 @@
 (idle — nothing in flight)
 
-# Loop #69 result — M0119-0006bt-rootdescend LANDED
+# Loop #70 result — M0119-0006 (bu): datallowconn enforced at connect time
 
 Banner: nightly run id UNCHANGED (20260922-004850), so PgoutputInterop stays
-non-selectable. Next selectable was the task I filed last loop.
+non-selectable. M0119 comes first among the pre-existing milestones, and
+M0119-0006's bs slice named three recorded-not-fixed items; this closes the
+first (template0 connectable).
 
-## The "measure first" instruction paid off — it corrected my own recon TWICE
-1. The recon argued goopg is on upstream's run-it side from initdb's
-   `btm_version = 4`. That is the BOOTSTRAP CATALOG metapage, NOT the
-   property the tier needs — which is the heap TID inside the key, a
-   per-INDEX property. `var pgIndexTupleKeys = true`, so ordinary indexes
-   take the TUPLE format while expression-key / explicit-opclass /
-   odd-collation indexes keep BLOB. **Both arms are reachable in
-   production**, which makes the gate a real branch, not a formality.
-   (A comment at the `keyFmt` site claiming "blob for every index today"
-   was stale and is corrected.)
-2. The recon's suggested `(*nbtree.BTree).Search(entry.Key)` would have been
-   the exact misuse `pgindex_btree.go` warns about: a stored ENTRY key
-   carries the real TID, a PROBE key carries zero, and mixing them is "a
-   silent under-read, not a failure". The tier descends over PageSource
-   COPIES instead, mirroring `_bt_search` + `_bt_binsrch_insert` +
-   `_bt_compare == 0`.
+## The catalog already told the truth; only the gate was missing
+goopg rendered `datallowconn = false` for template0 — which is why
+pg_amcheck's `--all` filter already skipped it — but nothing enforced it on
+connect, so `psql -d template0` succeeded. That is the worst arrangement of
+the two: every tool that politely asks the catalog is told the truth, and
+every tool that simply connects is not. It is what let a CREATE EXTENSION
+land in template0, from where it is copied into every future CREATE DATABASE
+using it as a template.
 
-## Live verification caught a defect no unit test could reach
-The 0A000 refusal first surfaced as `XX000: 0A000: cannot verify ...` — the
-right SQLSTATE stringified INTO the message — because `btIndexCheck`
-re-wrapped every tier error as internal. That wrap happens only at the SQL
-boundary, so only running the real thing could see it. `btIndexCheck` now
-returns an `*ExecError` unchanged and wraps only genuine read errors.
+goopg now raises upstream's FATAL 55000 `database "%s" is not currently
+accepting connections` (postinit.c:361-365), verified byte-for-byte live.
 
-## Verified live (both arms + the br expectation)
-- tuple-format `rd_a`, `rootdescend := true` → clean
-- blob-format `rd_expr` on `(a+1)` → `ERROR: 0A000: cannot verify that
-  tuples from index "rd_expr" can each be found by an independent index
-  search`
-- `pg_amcheck --heapallindexed --rootdescend` → exit 0 (br slice's
-  recorded expectation still holds)
+## One rule, one place
+New `catalog.DatabaseAllowsConnections` is the single source of truth; the
+`pg_database` row builder AND the postmaster gate both read it. Hardcoding
+the name twice is exactly how a catalog saying "closed" ends up beside a
+server saying "come in".
+`TestDatabaseAllowsConnectionsMatchesPGDatabaseRow` pins the agreement by
+reading the RENDERED rows rather than restating the rule.
 
-## Detection test meets the bar this task sets
-Two leaf pages swapped THROUGH the PageSource, not by editing item bytes:
-every page stays individually valid (per-page tier finds nothing) and only
-the search-path→holding-page mapping breaks. Non-vacuity verified — stubbing
-the descent to "found" fails exactly that arm. The healthy arm doubles as
-the routing check.
+## Paired control (not optional)
+`TestConnectTemplate1Accepted` — the cheap way to pass the rejection test is
+to refuse every template database, and PG ALLOWS template1. Non-vacuity
+verified: disabling the gate fails exactly the rejection test and leaves the
+control green.
+
+## Second divergence FOUND WHILE MEASURING, filed not fixed
+`select current_database()` connected to **template1** returns `postgres`
+on goopg; PG returns `template1`. template1 is legitimately connectable on
+both, so this is NOT the datallowconn issue. Filed with the decisive first
+question: is the session genuinely ROUTED to the postgres namespace (DDL
+against template1 would land in the wrong database — far more serious) or is
+only the reporting function wrong? `catalog.NamespaceDBOid` aliasing onto
+`DefaultDBOid` (bq slice) is where to look. Left unfixed deliberately — the
+right fix depends on which of those two it is.
 
 ## Gates (all green)
-units; whole `TestPort_PgAmcheck*` family; amcheck + nbtree suites;
-tpch-spotcheck Q12=2/Q13=33; tpcds-sf025 `PLAN-SHAPE same=99 changed=0`;
-acceptance arm 24/24; pgbench smoke.
-
-## Deferred + ledgered
-Per-entry descent is O(entries x height) — cache the root-to-leaf path or
-descend once per leaf boundary; MEASURE before optimising (amcheck is
-operator-invoked, and upstream gates rootdescend behind parent-check for
-exactly this reason). Posting-list handling compares the TID explicitly
-rather than via upstream's `postingoff` test — equivalent, less specific.
+units; whole `TestPort_PgAmcheck*` family (the suite that filters on
+datallowconn); tpch-spotcheck Q12=2/Q13=33; tpcds-sf025 `PLAN-SHAPE same=99
+changed=0`; acceptance arm 24/24; pgbench smoke (the connection path is
+exactly what it exercises).
 
 ## Next loop
-M0119 has only the umbrella M0119-0006 left (living/seeded). Then the
-banner's M0122 → M0131 → M0134 → M0135/M0136 → M0095/M0110. Check the
-nightly run id first — a new one unblocks PgoutputInterop, whose inlined
-cluster.log tail is now the evidence to read.
+Check the nightly run id FIRST — a new one unblocks PgoutputInterop, whose
+inlined cluster.log tail is now the evidence to read. Otherwise M0119-0006's
+remaining two bs items (template1 extension re-attribution on restart;
+user-db-local `extnamespace` → "public" at reload), or the new
+current_database() task, then M0122 → M0131 → M0134 → M0135/M0136 →
+M0095/M0110.
 
 ## Owner escalations OPEN — three
 1. M0145-0018 cost-model no-go. 2. M0145-0001 lineage exhausted. 3.
