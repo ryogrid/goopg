@@ -193,6 +193,12 @@ var flagResolvedState = map[string]func(string) string{
 	// a 15 s Hash plan become a 327 s Nested-Loop timeout when an epsilon
 	// rows=1 estimate on a derived input won the comparison.
 	"GOOPG_DERIVED_FIREWALL": func(v string) string { return onOff(v != "off") },
+	// M0145-0011 scope (c) (jointreepullup.go): admits a `*CTEScan` leaf into
+	// the pulled body's flat splice. Default OFF, and plan-SHAPING for the
+	// same reason the firewall flag is — so it is registered here rather than
+	// exempted. Useless without `GOOPG_DERIVED_FIREWALL=off`; a capture that
+	// names only one of the pair cannot say what it measured.
+	"GOOPG_PULLUP_CTE_LEAF": func(v string) string { return onOff(v == "on") },
 }
 
 // flagProvenanceOrder is the order the flags are stamped in. The first six are
@@ -275,6 +281,10 @@ var flagProvenanceOrder = []string{
 	// (relfromjoinlist.go). Default `on`. Plan-SHAPING, not diagnostic — a
 	// capture taken with it `off` is knob-arm private evidence and must say so.
 	"GOOPG_DERIVED_FIREWALL",
+	// Joined at M0145-0011 scope (c): admits `*CTEScan` leaves into the
+	// pulled-body splice (jointreepullup.go). Default `off`. Plan-SHAPING and
+	// only meaningful paired with GOOPG_DERIVED_FIREWALL=off.
+	"GOOPG_PULLUP_CTE_LEAF",
 	// Joined at M0145-0002: selects the jointree-first pipeline
 	// (AGENT.md §"Plan-parity harness" G8). Default `off`; a knob-arm
 	// capture that does not name the flag cannot say which pipeline it

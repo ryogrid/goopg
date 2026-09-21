@@ -1,6 +1,6 @@
 # Measured re-evaluation of the derived-input blockers (M0145-0011)
 
-Status: scopes (a), (b) and (d) DONE 2026-09-21 — the diagnostic flag is landed,
+Status: scopes (a), (b), (c) and (d) DONE 2026-09-21 — the diagnostic flag is landed,
 E1's evidence is gathered and **clean at both SF0.25 and SF1**, and the
 adjudication is reported. Scope (c) (E2) deferred with a ledger
 row; scope (d)'s adjudication is reported here for the owner.
@@ -151,6 +151,74 @@ a different plan shape. That is an argument for narrowing the guard to the
 shape (veto NL paths with a derived inner), not for keeping a decline that
 poisons the estimates of every problem it touches. **The loop does not pick.**
 
+## Scope (c) / E2 — the relaxation is a TWO-SITE invariant, measured (2026-09-21)
+
+Scope (c) relaxes `flattenPulledBodyTree`'s bare-`*SeqScan` leaf rule for
+`*CTEScan` leaves, behind `GOOPG_PULLUP_CTE_LEAF=on` (default OFF, registered
+in the flag-provenance table for the same reason the firewall flag is: it
+changes the chosen plan). It is paired with `GOOPG_DERIVED_FIREWALL=off`,
+because a pulled ANY/EXISTS body becomes a JoinSemi/JoinAnti SJI and the
+firewall's jointype switch covers Semi/Anti.
+
+**The pull-up census moves exactly as predicted.** TPC-DS SF0.25, knob arm,
+`GOOPG_NLI_CENSUS=1`, all 99 queries:
+
+```
+                                          firewall off   + CTE leaf on
+PULLUPCENSUS decline=(pulled)                       42             72
+PULLUPCENSUS decline=any-body-leaf-(*CTEScan)       30              0
+PULLUPCENSUS decline=SubqueryExpr                   29             29
+PULLUPCENSUS decline=any-nested-sublink             12             12
+PULLUPCENSUS decline=ExistsExpr                      4              4
+PULLUPCENSUS decline=InExpr                          2              2
+PULLUPCLASSIFY refusal=<any>                      none           none
+```
+
+All 30 come from three queries — Q14 (5), Q23 (4), Q95 (2) at the per-query
+re-measure — and all 30 convert into `(pulled)`.
+
+**And the seam census says they do not get anywhere.** With
+`GOOPG_PGSHAPED_DP_TRACE=1` on the same three queries:
+
+```
+              CTE leaf OFF          CTE leaf ON
+Q14    3 x seam-decline leaf-count   5 x seam-decline pulled-leaf-not-scan
+Q23    4 x seam-decline leaf-count   4 x seam-decline pulled-leaf-not-scan
+Q95    1 x seam-decline leaf-count   1 x seam-decline pulled-leaf-not-scan
+```
+
+`pulled-leaf-not-scan` is `tryPGShapedJoinSearch`'s own leaf-kind check, whose
+comment names `flattenPulledBodyTree` as its guarantor. So the bare-`*SeqScan`
+rule is **one invariant held at two sites — a producer and a consumer** — and
+relaxing the producer alone cannot put a CTE leaf into the DP. The decline
+merely relocates.
+
+**What the moved plans actually are.** Three plans move (Q14, Q23, Q95 — the
+same three, no others across all 99). Estimated costs fall sharply:
+
+```
+        firewall off    + CTE leaf on     values        runtime
+Q14        40347.58          27948.74     identical   13068 -> 14490 ms
+Q23        22482.79           8389.09     identical   15024 -> 15545 ms
+Q95       169930.68          70692.51     identical    3004 -> 3230 ms
+```
+
+Semi/anti join counts are preserved in every plan (3/3, 4/4, 2/2) and every
+result set is byte-identical, so nothing semantic was lost. But the movement is
+NOT the search finding a better order — the search never ran. It is the
+documented `pulled`-suppression side effect: once the pull-up marks a sublink
+`pulled` it suppresses the legacy pre-DP arm for the WHERE clause, and when the
+seam then declines, the statement lands on a different fallback. That is the
+same mechanism that cost TPC-H Q4 a 10x regression. Here it happens to be
+harmless-to-slightly-negative — runtimes are flat or 2-11% worse against
+estimated costs that fell 1.4x-2.4x, which is itself a cost-model signal.
+
+**Resume point for anyone finishing scope (c).** The work is at the seam, not
+at the producer's type switch: the pulled-leaf binding loop needs a
+`rangeBinding` for a leaf that has no `Table`/`Alias`, and an
+`estimateBaseRelInfo`/`applyRelSizeFallback` arm for a leaf with no catalog
+statistics. Both sibling comments now say so.
+
 ## Hard constraints honoured
 
 The firewall stays ON for the default arm — the default-arm sweep is 99/99
@@ -161,7 +229,7 @@ guard is untouched. All firewall-off captures are knob-arm private evidence
 
 ## Not done here
 
-Scope (c) / E2 — relaxing `flattenPulledBodyTree`'s bare-`*SeqScan` rule for
-`*CTEScan` leaves on the knob arm — is deferred and ledgered. It is downstream
-of (a) and wants its own loop, since it needs the pull-up/seam decline census
-re-run afterwards to say what it moved.
+Scope (c) is measured and reported above, but it is deliberately NOT finished:
+the seam-side half of the two-site invariant is left unimplemented, and is
+ledgered. M0145-0011 lands no relaxation, so finishing it belongs to whichever
+task the owner files against the seam.

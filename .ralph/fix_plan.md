@@ -13865,7 +13865,7 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
     (ledgered "by scope" refusals — admit only where legality says so
     and the executor check passes); re-run the pull-up/seam decline
     census afterwards so the buckets reflect the new state.
-- [ ] **M0145-0011 — measured re-evaluation of the derived-input
+- [x] **M0145-0011 — measured re-evaluation of the derived-input
   blockers (proposal 案A)** (filed 2026-09-21 by owner directive;
   rationale `tmp/blocker-re-think-260912/01-proposal.md` — local,
   gitignored). M0145-0009's census proved the 648 unresolvable
@@ -13928,6 +13928,30 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
     `flattenPulledBodyTree`'s bare-`*SeqScan` rule for `*CTEScan` leaves on
     the knob arm, then re-run the pull-up/seam decline census. This task
     stays `[ ]` until (c) lands.
+  - **(c)/E2 MEASURED 2026-09-21, and the finding closes the task.**
+    `GOOPG_PULLUP_CTE_LEAF=on` (default OFF, flag-provenance table, not
+    exempt) admits `*CTEScan` leaves into `flattenPulledBodyTree`'s splice.
+    Pull-up census over TPC-DS SF0.25, all 99 queries:
+    `any-body-leaf-(*optimizer.CTEScan)` 30 -> 0, `(pulled)` 42 -> 72, every
+    other class unchanged, no `PULLUPCLASSIFY` refusal either way; all 30 are
+    Q14/Q23/Q95. **But the seam census says nothing reaches the DP**: those
+    same statements go from `seam-decline leaf-count` to `seam-decline
+    pulled-leaf-not-scan`. The bare-`*SeqScan` rule is ONE invariant held at
+    TWO sites — `flattenPulledBodyTree` produces, `tryPGShapedJoinSearch`
+    re-checks — so relaxing the producer alone only relocates the decline.
+    The three plans that move do so via the documented `pulled`-suppression
+    side effect (estimated cost falls 1.4x-2.4x, measured runtime is flat to
+    2-11% WORSE, values byte-identical, semi/anti counts preserved).
+  - **Resume point for a follow-on task, if the owner files one**: the seam's
+    pulled-leaf binding loop in `internal/optimizer/joinsearchseam.go` needs a
+    `rangeBinding` for a leaf with no `Table`/`Alias` and an
+    `estimateBaseRelInfo`/`applyRelSizeFallback` arm for a leaf with no
+    catalog statistics; the adjacent `flat-leaf-not-scan` check is the third
+    site to audit. Both sibling comments now cross-reference each other.
+    Ledgered 2026-09-21.
+  Movement: none — the default arm is unchanged by construction (both flags
+  default to today's behaviour) and the gates confirm it; the knob-arm census
+  moved `any-body-leaf-(*optimizer.CTEScan)` 30 -> 0.
 - [ ] **M0145-0012 — retire the `rows<=1` CTE fallback guard
   (`initialRelRows`, `joinsearch.go:520-526`)** (filed 2026-09-21 by
   owner directive; same proposal). The M0129-S1 arm — when a

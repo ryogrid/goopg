@@ -908,6 +908,14 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 	// a discovery — anything else means the body's own planning rewrote
 	// it after the marker ran, which is a desync to decline on, not a
 	// shape to price).
+	//
+	// M0145-0011 scope (c) measured the OTHER reading of "anything else":
+	// with `GOOPG_PULLUP_CTE_LEAF=on` the producer admits `*CTEScan`
+	// leaves and every one of them dies HERE instead, so the two sites
+	// are one invariant and must be relaxed together. Whoever relaxes the
+	// producer owns this loop too: a derived leaf has no `ss.Table` or
+	// `ss.Alias` to build the `rangeBinding` from, and no catalog
+	// statistics for `estimateBaseRelInfo`/`applyRelSizeFallback` below.
 	for i := nReal; i < nprefix; i++ {
 		b := rangeBinding{offset: spans[i].lo}
 		scan := scans[i]
