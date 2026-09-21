@@ -1514,21 +1514,74 @@ heuristic stays live.)
     (`octet_length` 2, 2, 2 and 3 on a `char(6)` holding 'ab'). Only the
     `lower`/`upper`/`initcap` family was fixed here.
 
-- [ ] **testport/TestPort_RegressSuite/partition_aggregate — partitionwise
-  aggregation (AI-20260922-004850-016, split out)** — the one subtest of the
-  four that is NOT the bpchar class. goopg plans `HashAggregate` over an
-  `Append` of the partitions; PG plans a per-partition `HashAggregate` under
-  the `Append` (`enable_partitionwise_aggregate`). Pure plan-shape
-  divergence — the VALUES are identical, only the EXPLAIN output differs.
-  Repro: `go test -run '^TestPort_RegressSuite$/^partition_aggregate$'
-  ./internal/testport/`; raw diff via `scripts/pg-regress-runner.sh
-  partition_aggregate` (1759 lines, nearly all EXPLAIN).
-  Kind: impl
+- [!] **testport/TestPort_RegressSuite/partition_aggregate — partitionwise
+  aggregation (AI-20260922-004850-016, split out)** — **SCOPING RECON DONE
+  2026-09-22 (loop \#62), no production change. Marked `[!]`: it needs an
+  OWNER DECISION on the inventory row before any code, and the feature
+  itself is milestone-scale, not loop-scale.**
+  Kind: recon
   Parent: none
-  PG oracle: `postgres/src/backend/optimizer/plan/planner.c`'s
-  `create_partitionwise_grouping_paths`. Size this before starting — it is a
-  planner feature, not a rendering fix, and the diff length overstates it
-  (one mechanism repeated across many EXPLAIN blocks).
+  Movement: none — no production change.
+  - **Finding 1: this is NOT a regression, and it never passed.** Built and
+    ran the case in an isolated worktree at `aef4a4257` — the commit BEFORE
+    M0143-0007b slice 1, i.e. before any of the bpchar work the nightly's sha
+    pointed at — and it fails there with the byte-identical message
+    (`output mismatch; normalization rules need extension`). The nightly's
+    `first-seen: 20260922 (new tonight)` label is therefore not a code
+    change; the 20260921 run simply did not report this subject. I could not
+    explain the label itself and am not claiming to — what IS measured is
+    that goopg's behaviour is identical at both commits.
+  - **Finding 2: the case requires TWO unimplemented planner features.** The
+    upstream file sets BOTH `enable_partitionwise_aggregate TO true` (line
+    10) and `enable_partitionwise_join TO true` (line 12) and then runs 115
+    queries under them. goopg declares both GUCs in
+    `internal/catalog/catalog.go:12302-12306` with PG's own `off` default,
+    but **nothing consumes either** — a declared-but-unconsumed GUC.
+  - **Finding 3: the optimizer has no partition awareness at all.**
+    `catalog.Table` carries `PartitionKey`, `PartitionMethod` and
+    `PartitionBounds` (`internal/catalog/catalog.go:649-660`), but every
+    reader of those fields is in `internal/executor`; `internal/optimizer`
+    never reads them. So partition metadata does not reach path generation
+    in any form. This is the real size of the task: it is not "add a
+    grouping variant", it is "make the planner partition-aware first".
+  - **Decomposition** (not filed as tasks yet — see the escalation below;
+    filing them presumes the owner wants the feature built):
+    (a) surface partition metadata into the optimizer's rel representation
+        (PG's `PartitionScheme`/`part_scheme` on `RelOptInfo`);
+    (b) partition-bound matching between two rels (PG's
+        `partition_bounds_equal`) — the prerequisite BOTH features share;
+    (c) partitionwise join (`try_partitionwise_join`, joinrels.c);
+    (d) partitionwise grouping (`create_partitionwise_grouping_paths`,
+        planner.c) — push the grouping below the Append when the group keys
+        include the partition key.
+    PG oracle for (d): `postgres/src/backend/optimizer/plan/planner.c`.
+  - **Separable, much smaller divergence noticed while reading the diff, NOT
+    filed as part of this feature**: goopg's EXPLAIN renders a numeric
+    constant as `Filter: (avg(pagg_tab.d) < 15)` where PG renders
+    `< '15'::numeric`. Fixing it alone would NOT make this case pass (the
+    plan SHAPE still differs), so it is not worth doing under this task —
+    recorded so a later loop does not mistake it for the whole gap.
+  - **ESCALATION — owner decision required on the inventory row, not on the
+    feature.** `docs/test-port/postgres-oracle-target-inventory.csv` line 139
+    marks this case `status=pass, pass_required=yes`, whose vocabulary means
+    "regress/isolation case passing; must stay passing" — while the SAME
+    row's rationale says "output diverges from expected". Finding 1 shows
+    the rationale is the accurate half. The suite's must-pass set is exactly
+    the rows with `status=pass` (`regressMustPass`,
+    `internal/testport/regress_suite_test.go:182`), so this row makes the
+    pass-required gate permanently red on a feature nobody has built.
+    The loop is NOT demoting it: changing a case's must-pass status is a
+    governance decision and the documented promotion workflow only covers
+    promotion. The two options for the owner:
+      (i) correct the row to `status=failed` (the vocabulary's "in-scope
+          case, currently diverging"), which is what the measurement
+          supports and what the other in-scope-but-diverging cases use; or
+      (ii) keep it must-pass and schedule (a)-(d) above as real work.
+    Checked whether this is systematic: 21 rows carry `status=pass` with a
+    stale "output diverges" rationale, but the full regress suite is green
+    on all of them except this one — so for the other 20 the STATUS is right
+    and only the rationale text is stale. This is a single-row defect, not a
+    consolidation-wide one, and no other must-pass case is affected.
 
 - [ ] **bpchar-text-function-class — every text function receiving a bpchar
   must apply the rtrim1 cast** (filed 2026-09-22 out of
