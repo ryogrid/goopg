@@ -2071,34 +2071,63 @@ the whole file's active task between 2026-09-01 and 2026-09-14; **since
       shape to wire it.
     - Filed as **M0119-0006bt-rootdescend** below rather than built here.
 
-- [ ] **M0119-0006bt-rootdescend — implement the `rootdescend` tier**
-  (filed 2026-09-22 by the bt recon).
+- [x] **M0119-0006bt-rootdescend — implement the `rootdescend` tier** —
+  **LANDED 2026-09-22.** Design (recon + implementation + the measurement
+  correction): `docs/design/0100-0149/0119-0006bt-rootdescend-tier-scoping.md`.
   Kind: impl
   Parent: M0119-0006
-  - Design, including the upstream citations and the primitive inventory:
-    `docs/design/0100-0149/0119-0006bt-rootdescend-tier-scoping.md`.
-  - **Format split is mandatory, not optional.** Upstream asserts
-    `key->heapkeyspace && key->scantid != NULL`: the tier REQUIRES a key
-    carrying the heap TID, because that is what makes the search match one
-    specific entry instead of the first of a duplicate group. So:
-    `keyFmt.KeyDesc() != nil` -> run the tier (`Search(entry.Key)` is exact,
-    and `!found` or a TID mismatch is a finding); otherwise raise 0A000 with
-    upstream's message and hint verbatim. Without the split the tier is
-    ACTIVELY WRONG on the blob format — no TID in the key means `Search`
-    returns the first of a duplicate group and a TID comparison manufactures
-    findings on a healthy index.
-  - **Bar to meet**: every tier already landed under M0119-0006 carries a
-    DETECTION test with a non-vacuity guard (`TestBtIndexCheck_HeapAllIndexed*`
-    plants a phantom tuple and asserts XX002; the `003*` ports inject real
-    on-disk corruption). A test that only shows "a healthy index still passes"
-    is below that bar — and for this tier especially, since the defect being
-    fixed IS a check that reports clean without looking.
-  - **Measure this FIRST**: which key format the ported pg_amcheck tests'
-    indexes actually use. `buildPGIndexKeyDesc` accepts any btree index with
-    key columns, which suggests ordinary user indexes take the run-it arm, but
-    that was inferred from the constructor's guards, not observed. It decides
-    whether the br slice's live expectation (`pg_amcheck --heapallindexed
-    --rootdescend` exit 0) still holds or becomes an error.
+  Movement: none — SF0.25 `PLAN-SHAPE same=99 changed=0`; an amcheck
+  verification tier, which none of S3's three instruments measures.
+  - **The measurement the task demanded corrected the recon that filed it.**
+    The recon argued goopg was on upstream's "run it" side because initdb
+    pins `btm_version = 4`. That is true of the BOOTSTRAP CATALOG metapages
+    and is not the property the tier needs. What it needs is the heap TID
+    INSIDE the key, which is a per-index property of goopg's key format:
+    `var pgIndexTupleKeys = true`, so an ordinary index (default opclass and
+    collation, PG-faithful key type) gets the TUPLE format, while the shapes
+    `buildPGIndexKeyDesc` refuses — expression keys, explicit opclasses,
+    non-bytewise collations, types without a comparator — keep BLOB. **Both
+    arms are reachable in production**, which is what makes the gate a real
+    branch. A stale comment at the `keyFmt` site claiming "blob for every
+    index today" is corrected.
+  - **The recon's suggested implementation would have been wrong**, and
+    reading the code rather than following the plan is what caught it. It
+    proposed `(*nbtree.BTree).Search(entry.Key)`. `pgindex_btree.go`
+    documents that a stored ENTRY key carries the row's real TID while a
+    PROBE key carries the zero TID, and that "handing a probe an entry key
+    would start a duplicate scan after some of its own matches — a silent
+    under-read, not a failure". The tier instead descends over PageSource
+    COPIES, mirroring upstream's `_bt_search` + `_bt_binsrch_insert` +
+    `_bt_compare(...) == 0`.
+  - **Live verification caught a defect no unit test could.** The 0A000
+    refusal first surfaced as `XX000: 0A000: cannot verify ...` — the right
+    SQLSTATE stringified INTO the message — because `btIndexCheck`'s error
+    path re-wrapped every tier error as an internal error. The wrap happens
+    only at that boundary, so only running the real thing could see it.
+    `btIndexCheck` now returns an `*ExecError` unchanged and wraps only
+    genuine read errors.
+  - Verified live on a scratch cluster, both arms and the br expectation:
+    tuple-format `rd_a` with `rootdescend := true` → clean; blob-format
+    `rd_expr` on `(a+1)` → `ERROR: 0A000: cannot verify that tuples from
+    index "rd_expr" can each be found by an independent index search`;
+    `pg_amcheck --heapallindexed --rootdescend` → exit 0, so the br slice's
+    recorded expectation still holds.
+  - **Detection test, per the bar this task sets.** Two leaf pages are
+    swapped THROUGH the PageSource rather than by editing item bytes: every
+    page stays individually valid (the per-page tier still finds nothing) and
+    only the mapping between search path and holding page breaks, isolating
+    the property. Verified non-vacuous — stubbing the descent to "found"
+    fails exactly that arm. The healthy arm doubles as the routing check: a
+    child-selection rule disagreeing with the one the tree was built under
+    would report findings on a healthy tree.
+  - Gates: units; whole `TestPort_PgAmcheck*` family PASS; amcheck + nbtree
+    package suites PASS; tpch-spotcheck Q12=2/Q13=33; tpcds-sf025 PASS
+    (`PLAN-SHAPE same=99 changed=0`); acceptance arm 24/24; pgbench smoke.
+  - Deferred, ledgered: the tier is O(entries x height) with a fresh descent
+    per entry, where upstream amortises nothing either but runs only under
+    `bt_index_parent_check`; and `rootdescend` remains accepted-and-ignored
+    on the `bt_index_check` call shape, which is correct — upstream's
+    three-argument form has no rootdescend parameter at all.
 
 > This task list is **seeded, not exhaustive.** M0119-0001 triage plus every future
 > deferral-ledger entry (any new `status = -` row) feed additional M0119 tasks over

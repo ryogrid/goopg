@@ -1,8 +1,9 @@
 # M0119-0006 (bt): the `rootdescend` tier — scoping recon
 
-Status: RECON COMPLETE 2026-09-22. No production file touched. The tier itself
-is filed as `M0119-0006bt-rootdescend` and is NOT built here.
-Kind: recon
+Status: LANDED 2026-09-22 — the tier is implemented. This document keeps the
+recon that sized it, plus a MEASUREMENT CORRECTION and the live-verification
+section at the end.
+Kind: recon -> impl
 Parent: M0119-0006
 Movement: none
 
@@ -97,3 +98,84 @@ this was inferred from the constructor's guards, not observed. It decides
 whether the existing live expectation (`pg_amcheck --heapallindexed
 --rootdescend` exit 0, recorded in the M0119-0006 br slice) still holds or
 becomes an error, so it must be measured before the split is wired.
+
+---
+
+# Implementation (2026-09-22)
+
+## A measurement correction to the recon above
+
+The recon concluded goopg is on the "run it" side of upstream's gate, citing
+`btm_version = 4` in initdb. That is true of the **bootstrap catalog index
+metapages**, but it is not the property the tier needs, and the recon did not
+check the right thing.
+
+What the tier needs is the heap TID *inside the key*, and that is a per-index
+property of goopg's key format. The measurement the filed task demanded found:
+
+- `var pgIndexTupleKeys = true` (`pgindex_btree.go`) — the format flip is ON.
+- So an ordinary index (default operator class and collation, a key type whose
+  stored image is PG-faithful) gets a descriptor → **tuple** format → TID in the
+  key → the tier can run.
+- The shapes `buildPGIndexKeyDesc` refuses — expression keys, explicit operator
+  classes, non-bytewise collations, types without a comparator — keep the
+  **blob** format, which carries no TID in the key at all.
+
+So **both arms are reachable in production**, which is what makes the gate a
+real branch rather than a formality. A comment at the `keyFmt` site still said
+"nil-descriptor / blob for every index today"; it was stale and is corrected.
+
+## Shape
+
+`amcheck.VerifyBtreeRootDescend` mirrors upstream's `_bt_search` +
+`_bt_binsrch_insert` + `_bt_compare(...) == 0`: descend from the root to the
+leaf the entry's key routes to, then confirm the entry is on it.
+
+It descends over PageSource **copies** rather than calling
+`(*nbtree.BTree).Search`. That was the recon's suggestion and it would have been
+wrong: `pgindex_btree.go` documents that a stored *entry* key carries the row's
+real TID while a *probe* key carries the zero TID (minus infinity), and that
+"handing a probe an entry key would start a duplicate scan after some of its own
+matches — a silent under-read, not a failure". Using the search API with an
+entry key is precisely that misuse.
+
+`RootDescendSupported(keyFmt)` is the gate; the executor raises upstream's
+0A000 with its message and hint when it is false.
+
+## Live verification, and the defect it caught
+
+Both arms were exercised against the real `pg_amcheck` binary and at the SQL
+surface on a scratch cluster:
+
+| index | call | result |
+|---|---|---|
+| `rd_a` on `int` (tuple format) | `bt_index_parent_check(..., rootdescend := true)` | clean |
+| `rd_expr` on `(a+1)` (blob format) | same | `ERROR: 0A000: cannot verify that tuples from index "rd_expr" can each be found by an independent index search` |
+| `rd_a` | `pg_amcheck --heapallindexed --rootdescend` | exit 0 |
+
+The last row is the br slice's recorded expectation, and it still holds.
+
+**The live check earned its cost.** The refusal first surfaced as
+`XX000: 0A000: cannot verify ...` — the correct SQLSTATE stringified *into the
+message* — because `btIndexCheck`'s error path re-wrapped every tier error as an
+internal error. No unit test could see it: the wrap happens only at that
+boundary. `btIndexCheck` now returns an `*ExecError` unchanged and only wraps
+genuine read errors.
+
+## Test design
+
+The detection arm is the point, and it is what a "healthy index still passes"
+test cannot supply — the defect being fixed was a check that reported clean
+without looking, so a test that cannot tell those apart would reproduce the
+defect inside the suite.
+
+Two leaf pages are swapped *through the PageSource* rather than by editing item
+bytes. Every page stays individually valid, so the per-page tier still finds
+nothing, and only the mapping between the search path and the page holding the
+entry is broken — which isolates the property under test. Verified non-vacuous:
+stubbing the descent to "found" fails exactly that arm with "the tier is not
+actually searching from the root".
+
+The healthy arm doubles as the routing check: if the descent's child-selection
+rule disagreed with the one the tree was built under, a healthy tree would
+report findings.

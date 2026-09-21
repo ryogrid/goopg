@@ -143,9 +143,17 @@ func evalBtIndexCheck(x *optimizer.FuncCall, slot SlotView, ctx *Context, parent
 	cmpKeys := btIndexOpClassComparator(idx, im, ctx, x.Pos())
 	// The index's on-page key format is a per-index catalog property, resolved
 	// from the same catalog entry as the opclass comparator above (M0130-S11.4
-	// slice 3b-2c-ii-B2-b). It is nil-descriptor / blob for every index today,
-	// but this is where the answer comes from once the writers flip, so the
-	// engine's readers are never handed a format they had to assume.
+	// slice 3b-2c-ii-B2-b).
+	//
+	// CORRECTION 2026-09-22: this used to say "nil-descriptor / blob for every
+	// index today". That is stale — `pgIndexTupleKeys` is true
+	// (pgindex_btree.go), so an ordinary index (default operator class and
+	// collation, a key type whose stored image is PG-faithful) gets a
+	// descriptor and the TUPLE format, while the shapes buildPGIndexKeyDesc
+	// refuses — expression keys, explicit opclasses, non-bytewise collations,
+	// types without a comparator — keep the blob one. BOTH formats are
+	// reachable in practice, which is what makes the rootdescend gate below a
+	// real branch rather than a formality.
 	keyFmt := nbtree.IndexFormatFor(ctx.pgIndexKeyDesc(idx))
 	reports, err := btIndexVerify(src, nblocks, idx.Name, parentCheck, cmpKeys, keyFmt)
 	if err == nil && len(reports) == 0 {
@@ -164,7 +172,23 @@ func evalBtIndexCheck(x *optimizer.FuncCall, slot SlotView, ctx *Context, parent
 		hreports, err = btIndexHeapAllIndexed(x, slot, ctx, idx, src, keyFmt, im, x.Pos())
 		reports = append(reports, hreports...)
 	}
+	if err == nil && len(reports) == 0 {
+		// rootdescend runs last for the same reason heapallindexed does: an
+		// earlier ereport(ERROR) inside bt_target_page_check aborts before the
+		// per-tuple root search is reached (verify_nbtree.c:1382).
+		var rreports []amcheck.BtreeReport
+		rreports, err = btIndexRootDescend(x, slot, ctx, idx, src, parentCheck, keyFmt)
+		reports = append(reports, rreports...)
+	}
 	if err != nil {
+		// A tier that already chose its own SQLSTATE speaks for itself. The
+		// rootdescend gate raises upstream's 0A000 refusal, and re-wrapping it
+		// here reported XX000 with "0A000: ..." stringified into the message —
+		// caught by running the real pg_amcheck against a blob-format index,
+		// not by any unit test, because the wrap only happens at this boundary.
+		if ee, ok := err.(*ExecError); ok {
+			return NullDatum, ee
+		}
 		// A genuine read error (not a corruption finding) maps to internal error.
 		return NullDatum, &ExecError{Code: "XX000", Pos: x.Pos(), Message: err.Error()}
 	}
@@ -301,6 +325,57 @@ func btIndexCheckUnique(x *optimizer.FuncCall, slot SlotView, ctx *Context, idx 
 			ctx.comboStore(), ctx.MultiXact)
 	}
 	return amcheck.VerifyBtreeUnique(src, idx.Name, keyFmt, cmpKeys, visible)
+}
+
+// btIndexRootDescend runs amcheck's `rootdescend` tier when the call requested
+// it: every leaf entry must be reachable by an independent search that starts
+// at the root (bt_rootdescend, verify_nbtree.c:3029+, driven from
+// bt_target_page_check at :1382).
+//
+// The argument exists on ONE call shape only. bt_index_parent_check(index,
+// heapallindexed, rootdescend, checkunique) has it at position 2;
+// bt_index_check(index, heapallindexed, checkunique) has no rootdescend at all
+// — its third argument is checkunique. So a non-parent call never reads it, and
+// pg_amcheck only passes --rootdescend through the parent-check shape.
+//
+// Upstream refuses rather than skips when the index cannot support the tier
+// (verify_nbtree.c:479-485): it asserts `key->heapkeyspace && key->scantid !=
+// NULL` and otherwise raises ERRCODE_FEATURE_NOT_SUPPORTED. That refusal is
+// load-bearing, and reproducing it is the whole point of this tier's gate:
+// answering "clean" for a verification that never ran is indistinguishable from
+// a real pass, which is the worst of the three possible behaviours. goopg's
+// blob key format carries no heap TID in the key, so a search cannot identify
+// ONE entry among duplicates there — exactly the condition upstream's
+// heapkeyspace test excludes.
+func btIndexRootDescend(x *optimizer.FuncCall, slot SlotView, ctx *Context, idx *catalog.Index,
+	src amcheck.PageSource, parentCheck bool, keyFmt nbtree.IndexFormat,
+) ([]amcheck.BtreeReport, error) {
+	if !parentCheck || len(x.Args) <= 2 {
+		return nil, nil
+	}
+	d, err := evalExprSlot(x.Args[2], slot, ctx)
+	if err != nil {
+		return nil, err
+	}
+	if d.IsNull() || !d.BoolValue() {
+		return nil, nil
+	}
+	if !amcheck.RootDescendSupported(keyFmt) {
+		return nil, &ExecError{Code: "0A000", Pos: x.Pos(),
+			Message: fmt.Sprintf("cannot verify that tuples from index \"%s\" can each be found by an independent index search", idx.Name),
+			Hint:    "Only B-Tree version 4 indexes support rootdescend verification."}
+	}
+	metaPage, err := src(0)
+	if err != nil {
+		return nil, err
+	}
+	meta := nbtree.ParseMeta(metaPage)
+	if meta.Root == 0 {
+		// An empty tree has no entries to reach; upstream's level walk finds
+		// nothing to check either.
+		return nil, nil
+	}
+	return amcheck.VerifyBtreeRootDescend(src, meta.Root, idx.Name, keyFmt)
 }
 
 // btIndexHeapAllIndexed runs amcheck's `heapallindexed` tier when the call
