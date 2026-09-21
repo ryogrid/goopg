@@ -11394,6 +11394,35 @@ reported, and the values and unit gates are the bar.
   audit this project's practice card requires, each slice gated by its own
   regress run plus the sf025 sweep. Ledger:
   `.ralph/deferral_ledger.md`, row dated 2026-09-18 (task M0143-0007).
+  - **DESIGN DONE 2026-09-21 (loop 52), no production change.** Design doc
+    `docs/design/0100-0149/m0143-0007b-bpchar-padded-storage.md`, written as
+    the task's own text requires before any code.
+    - **Boundary inventory measured against the tree, and TWO of the
+      boundaries this task names do NOT need changing:**
+      - `PGCompareBpcharC` (`internal/access/nbtree/pgcompare_types.go`)
+        already strips trailing blanks via `bcTruelen` — upstream's own
+        `bpcharcmp` rule — so it is correct under EITHER convention.
+      - `catalog.PadBpchar` pads only a SHORT value, so its four render
+        callers (DataRow, COPY text, COPY binary, `octet_length`) become
+        idempotent no-ops rather than needing removal.
+    - **What genuinely changes**: one storage decision
+      (`coerceTextLikeDatum`, `internal/executor/codec.go`: trim → pad,
+      keeping the unbounded-typmod arm intact) plus the SIZE consequences of
+      physically larger values — index max-key-size and TOAST threshold.
+    - **Compatibility property that makes incremental landing safe**: old
+      trimmed and new padded data both read correctly, because comparison
+      ignores trailing blanks on both sides and rendering re-pads only short
+      values. No migration step is required, and `relpages` parity
+      materialises only for NEWLY WRITTEN data — the honest scope of the fix.
+    - **Four-slice plan**, each gated by its own regress run plus the SF0.25
+      sweep: (1) the storage flip; (2) size consequences (index max-key-size,
+      TOAST threshold), where a previously-accepted value can start erroring;
+      (3) the `pgoutput` path — verify it derives from the stored datum, since
+      no pgoutput site calls `PadBpchar`; (4) re-measure `relpages` on
+      `customer`/`item`, the only way K41's gap can be shown closed.
+    - **Slice 1 is the next unit of work.** Its sibling audit: re-verify the
+      four `PadBpchar` callers as no-ops and do NOT remove them — removing
+      them would break reads of pre-existing trimmed data. Ledgered.
 - **OWNER DECISION 2026-09-20 — APPROVED.** The owner approves reversing
   the trimmed-`bpchar`-storage convention: implement R23 padded
   `character(N)` storage. Proceed per the task text — design doc first,

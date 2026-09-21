@@ -1,74 +1,77 @@
 # Working set — inter-loop baton
 
-Task: **M0145-0018 — `[!]` NO-GO.** The firewall was NOT relaxed. The task's
-own precondition caught a C-04a-class regression the owner's GO predates.
+Task: **M0143-0007b (banner item 9)** — design doc DONE, slice 1 not started.
+Task stays `[ ]`. Owner approval is on record (2026-09-20).
 
-## Banner
+## Why item 9 — the banner walk, recorded so it is not redone
 
-Item 3: `… 0017 [x] → 0018 [!]`. With 0018 blocked, **item 3 has no selectable
-`[ ]` left under the standing assumption**, so the next loop should move to
-**item 4 (`M0141-S2a-fix2r`)** — BUT re-read the banner first, and see the
-escalation below, which now matters more.
-
-## TWO escalations, both needing the owner
-
-1. **M0145-0018 is a no-go and the blocker is the COST MODEL.** Details below.
-2. **The loop-48 ordering question is still unanswered.** By the strict
-   selection rule **M0145-0003 is the first `[ ]` in item 3** (as are 0004,
-   0005, 0007, 0008); loops 39-51 worked 0009 → 0018 on the assumption those
-   are umbrella items. With 0018 now `[!]`, this question decides whether the
-   loop returns to 0003 or moves to item 4. **It is the banner's call.**
-
-## The no-go, measured
+With M0145-0018 now `[!]`, I walked the banner for the first genuinely
+selectable task. Under the standing assumption (see escalation 2):
 
 ```
-current fire set (SF0.25 knob arm): outer-over-derived 3/run — Q77 (2), Q78 (1)
-
-SF0.25  ON vs OFF — CLEAN, reproduces loop 39 exactly
-  only Q77/Q78 move | Q77 788->851 ms | Q78 3869->3931 ms | values identical
-  Q78 join kinds IDENTICAL (3 Hash Anti, 2 Hash, 2 Hash Left) — no NL election
-
-SF1     ON vs OFF — CATASTROPHIC
-  Q77  5680 -> 5760 ms  (unchanged, ck 9bd1900a34ce55c5)
-  Q78  29002 ms -> DID NOT FINISH in 1800 s
-       Nested Loop Left Join (cost=5494.86..1147565.07 rows=5731)
-       all three equi-conditions demoted to a Join Filter,
-       10317-row outer over a cs CTE scan — the C-04a shape verbatim
+item 0  P0            all [x]
+item 1  P0-E7 regressions   P0-E7 is [x], no open children
+item 2  M0144          0001-0010 [x], 0011 [!]
+item 3  M0145          0009-0017 [x], 0018 [!]   (0003-0008 [ ] — contested)
+item 4  M0141-S2a-fix2r     [x]
+item 5  fix1-sweep / S2b-6-resume / M0139-0007c   all [x]
+item 6  M0141-S7      exec-d [ ] but its own "measure first" gate says NO
+                      (0 corpus queries reach the operator); S2b-9 and S2b-8
+                      BOTH self-declare "not selectable while banner item 6
+                      restricts to cost diagnosis only"
+item 7  M0140-0007 [ ] — ends in my loop-38 "OWNER DECISION REQUIRED"
+item 8  M0142-0005 [!], 0016c [x], 0003i [x]
+item 9  M0143-0007b [ ]  <- FIRST ACTIONABLE, owner-APPROVED 2026-09-20
 ```
 
-**Why it differs from loop 40's SF1 evidence** (Q78 stayed a hash join then):
-M0145-0013, -0014 and -0016 all landed in between, each letting more of Q78's
-problem into the DP. The search now has a join-order choice it did not have and
-takes it badly. Re-using the old numbers would have landed a 60x-plus SF1
-regression behind a GREEN SF0.25 gate.
+## Two escalations still unanswered
 
-**The blocker is the cost model**, not statistics and not admission: the
-estimates are already honest (M0145-0011 measured that the DECLINE is what
-manufactured the epsilons), and the search still prefers a nested loop it
-prices at 1.1M. Owner options in the design doc — keep the firewall as a
-documented cost-model backstop; narrow it to the SHAPE (veto an NL path whose
-inner is a derived input, rather than declining the whole problem); or fix NL
-pricing for a derived inner and re-run this verification.
+1. **M0145-0018 NO-GO** (loop 51) — the firewall relaxation is catastrophic at
+   SF1 on the current tree; blocker is the COST MODEL. Owner options are in
+   `docs/design/0100-0149/m0145-0018-firewall-relaxation-no-go.md`.
+2. **The loop-48 ordering question** — by the strict rule M0145-0003 is the
+   first `[ ]` in item 3 (as are 0004, 0005, 0007, 0008). Loops 39-51 worked
+   0009 → 0018 assuming those are umbrella items. **Still the banner's call.**
+
+## What the design step found
+
+The task's boundary list is wider than the tree needs. Measured:
+
+- `PGCompareBpcharC` (nbtree) **already** strips trailing blanks via
+  `bcTruelen` — upstream's `bpcharcmp` rule — so it is correct under EITHER
+  convention. No change.
+- `catalog.PadBpchar` pads only a SHORT value, so its four render callers
+  (DataRow, COPY text, COPY binary, `octet_length`) become idempotent no-ops.
+  No change — and they must NOT be removed, or reads of pre-existing trimmed
+  data break.
+- What genuinely changes: `coerceTextLikeDatum` (`internal/executor/codec.go`)
+  trim → pad, keeping the unbounded-typmod (-1) arm intact; plus the SIZE
+  consequences (index max-key-size, TOAST threshold).
+- **Safe to land incrementally**: old trimmed and new padded data both read
+  correctly, so no migration is needed and `relpages` parity materialises only
+  for newly written data.
 
 ## Next step
 
-Await the owner on both escalations. If work must continue meanwhile, item 4
-(`M0141-S2a-fix2r`) is the next banner entry after item 3.
+**Slice 1 — the storage flip.** `coerceTextLikeDatum` pads a width-carrying
+bpchar instead of trimming. Unit-pin that a `char(10)` datum stores 10 bytes
+and an unbounded `bpchar` round-trips verbatim (PG 18.3: `bpchar` 'ab  ' is
+octet_length 4 vs `char(6)`'s 6). Sibling audit: re-verify the four
+`PadBpchar` callers as no-ops, do not remove them. Gate: own regress run +
+SF0.25 sweep.
 
 ## Traps carried forward
 
-- **Re-verify preconditions on the CURRENT tree.** This loop is the case in
-  point: the same A/B, same scale, opposite verdict, eleven loops apart.
-- `timeout N psql` kills only the client — the server keeps executing. Stop the
-  server and confirm the port is free before moving on.
+- **Re-verify preconditions on the CURRENT tree** (loop 51: same A/B, same
+  scale, opposite verdict, eleven loops apart).
+- `timeout N psql` kills only the client — stop the server, confirm the port.
 - Port 5560 is held by a PEER's server; do not touch it. Use 557x.
 - A seam change is NOT pipeline-scoped — `tryPGShapedJoinSearch` is shared.
 
 ## Gates run
 
-units PASS. No production code changed this loop (the relaxation was not
-landed), so the planner corpus gates were not re-run. The commit hook's smoke
-runs on commit.
+units PASS. No production code changed this loop (design step only), so the
+planner corpus gates were not re-run. The commit hook's smoke runs on commit.
 
 ## In-flight
 
