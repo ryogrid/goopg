@@ -1713,27 +1713,55 @@ heuristic stays live.)
     the hook. No spotcheck/sf025/acceptance-arm — zero production diff.
 
 - [ ] **testport/TestPort_PgoutputInterop* subscriber/publisher-start
-  failures, second sighting (AI-20260921-000212-008 … -017)** — the same
-  ten pgoutput interop cases as the CLOSED Loop \#26 task FAILed again
-  with the same signature: "publisher/subscriber start: start failed;
-  process exited early" at ~2.1-2.7s each (GoopgToPG, FullDML, BatchDML,
-  ReplicaIdentityFull, Truncate, ColumnOrderMismatch,
-  SubscriberExtraColumn, SubscriberExtraDefault, PgbenchInsert,
-  PgbenchTpcb). **The closed task's re-open condition is met**: sha
-  `cafc521a3` is post-005626, the testport stage ran 00:02:31-00:21:54
-  and `~/.ralph/logs/mem_guard.log` shows NO PRESSURE kills inside that
-  window (last kills 2026-09-20 23:12/23:14, ~50 min earlier), and no
-  concurrent Ralph gate ran during the stage. Two consecutive nights of
-  the identical 10-case signature now argues for a real start-path
-  defect (fixture race or a cafc521a3-family regression — the M0142
-  route-a optimizer commits landed between the two sightings) rather
-  than env pressure. Repro: `go test -v -run
-  '^TestPort_PgoutputInteropPGToGoopgFullDML$' ./internal/testport/`;
-  evidence `ci/logs/20260921-000212/testport/go-test.log` (each FAIL
-  names its `tmp/nightly-src-20260921-000212/tmp/pg2g-*/cluster.log` —
-  read those BEFORE the worktree is cleaned).
+  failures (AI-20260922-004850-006 … -015, was AI-20260921-000212-008 …
+  -017)** — **STILL OPEN. Does NOT reproduce at HEAD; this loop fixed the
+  reason nobody can tell why, not the defect itself.**
   Kind: test-fix
   Parent: none
+  Movement: none
+  - **Reproduction attempted faithfully and FAILED to reproduce.** The named
+    repro passes at HEAD (2.7s). All ten cases pass run together (62s). And
+    the full `./internal/testport/` package — which is what the nightly
+    actually runs, the condition a subset run does not recreate — passes
+    with ONE failure, the already-known `partition_aggregate`. So under the
+    nightly's own conditions, on this machine, at HEAD, the defect is absent.
+  - **What the nightly log does establish**, from
+    `ci/logs/20260922-004850/testport/go-test.log`:
+    - The cases run SEQUENTIALLY (`=== RUN` / `--- FAIL` interleaved, no
+      parallel overlap), so a simple concurrent port race between these ten
+      is NOT the mechanism.
+    - Failures INTERLEAVE with passes — `UnchangedToast`, `MultiDMLXact`,
+      `SavepointXact`, `MultiTable`, `ReplicaIdentityUsingIndex`,
+      `KillAndReconnect` and `PgbenchKillAsync` all passed in the same run,
+      between failing cases. Whatever it is, it is not a monotonic
+      degradation of the machine after some point in the suite.
+    - Failures are consistently FASTER (2.60-2.74s) than passes
+      (2.78-2.94s), which is consistent with dying at startup rather than
+      mid-scenario.
+  - **Why the root cause is unrecoverable from either night**: the error
+    names a `cluster.log` under `tmp/nightly-src-<run>/`, the nightly's
+    throwaway worktree, which is deleted when the run finishes. Both nights'
+    logs are already gone. The ONLY evidence of why the process exited was
+    behind a path that no longer exists.
+  - **Landed this loop — make the next occurrence self-diagnosing.**
+    `cluster.Start` now INLINES the tail of `cluster.log` (last 4 KiB) into
+    both start-failure errors instead of only naming the path, so the next
+    nightly carries the bind error / config rejection / panic header in
+    `go-test.log` itself and survives the worktree cleanup. Best-effort by
+    construction: a failure to read the log degrades to a short note and can
+    never replace the start failure being reported.
+  - **Next step for whoever takes this: wait for the next nightly and read
+    the inlined tail.** Do NOT keep re-running the suite locally hoping to
+    catch it — three attempts at HEAD (single case, all ten, full package)
+    were all green, so local re-running has a demonstrated zero hit rate.
+    If the next nightly is green too, that is itself evidence worth
+    recording before closing.
+  - Environment hypotheses NOT yet excluded, and which the inlined tail will
+    distinguish at no extra cost: an ephemeral-port collision (both
+    `freeTCPPort` and `cluster.freePort` use the racy bind-0/close/rebind
+    pattern, and other suite stages start servers too), a leftover datadir
+    or socket in a fixed `tmp/` path, and host resource exhaustion partway
+    through a ~19-minute stage.
 
 ### Manually discovered (not yet in a nightly `ci/logs/action-items.md` run) — filed 2026-09-15
 

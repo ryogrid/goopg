@@ -1,50 +1,57 @@
 (idle — nothing in flight)
 
-# Loop #65 result — PgAmcheck003 x4 FIXED (AI-20260922-004850-002..-005)
+# Loop #66 result — PgoutputInterop x10: made SELF-DIAGNOSING, task stays open
 
-Banner: items 0-9 unchanged (item 3 blocked by M0145-0001 `[!]`;
-`partition_aggregate` `[!]` awaiting an owner ruling). First open item-10
-task in document order was the four pg_amcheck cases.
+Banner: items 0-9 unchanged. Last open item-10 group was the ten pgoutput
+interop cases (AI-20260922-004850-006..-015).
 
-## The engine was right; the fixture was stale
-All four failed on one shared signature — 42710 `extension "amcheck"
-already exists` — from an unconditional `CREATE EXTENSION amcheck` run
-after their stop/corrupt/restart cycle, under the comment "Runtime-only
-amcheck install does not survive restart (gap #7c)". That was written
-against a goopg whose extension install was in-memory only. Catalog DDL
-durability has since landed, so the `pg_extension` row now SURVIVES the
-restart (what PG does — it is a catalog, not session state) and a duplicate
-CREATE EXTENSION then correctly raises 42710 (also what PG does). Both
-halves of the new behaviour are PG-correct; only the workaround was stale.
+## It does NOT reproduce at HEAD — tried three ways
+- named single-case repro: PASS (2.7s)
+- all ten together: PASS (62s)
+- **full `./internal/testport/` package** (what the nightly actually runs —
+  a subset run does not recreate that condition): PASS except the
+  already-known `partition_aggregate`.
+Local reproduction has a demonstrated ZERO hit rate. Do not keep re-running.
 
-## The judgement NOT taken (the transferable bit)
-The obvious minimal edit was `CREATE EXTENSION IF NOT EXISTS` — one line,
-all four green. It would also pass whether or not the row survived,
-quietly re-admitting the gap it was written for. Instead each site now
-ASSERTS `count(*) FROM pg_extension WHERE extname='amcheck'` = 1 after the
-restart: same cost, and it converts a stale workaround into a regression
-pin on the behaviour that replaced it.
-Applied to all FOUR files — the identical stale step appeared verbatim in
-each, so fixing one would have left the same defect under three names.
+## What the nightly log DOES establish (read from ci/logs/, not guessed)
+- Cases run SEQUENTIALLY -> a concurrent port race between these ten is NOT
+  the mechanism.
+- Failures INTERLEAVE with passes (UnchangedToast, MultiDMLXact,
+  SavepointXact, MultiTable, ReplicaIdentityUsingIndex, KillAndReconnect,
+  PgbenchKillAsync all passed in the same run) -> not a monotonic
+  degradation after some point in the suite.
+- Failures are consistently FASTER (2.60-2.74s) than passes (2.78-2.94s) ->
+  consistent with dying at startup.
 
-## Gates
-Whole `TestPort_PgAmcheck*` family PASS (9.7s — catches sibling breakage
-across the other amcheck ports); units PASS; pgbench smoke via hook.
-Checked with `-v` that all four GENUINELY pass rather than taking one of
-these files' own `t.Skipf` paths. Non-vacuity: flipping the expected count
-makes the assertion report the value it actually read from the server.
-No spotcheck/sf025/acceptance-arm — ZERO production diff (verified:
-`git status` over `internal/` shows only `*_test.go`).
+## Why neither night's cause is recoverable — and what landed
+The error named a `cluster.log` under `tmp/nightly-src-<run>/`, the
+nightly's THROWAWAY worktree, deleted when the run finishes. Both nights'
+logs are gone; the only evidence was behind a dead path.
+`cluster.Start` now INLINES the last 4 KiB of cluster.log into both
+start-failure errors, so the next occurrence carries its own cause in
+`go-test.log`. Best-effort: an unreadable log degrades to a note and never
+replaces the start failure being reported.
 
-## No inventory change
-AC-003 is `defer`/not-pass-required and its stated blockers (unsupported
-index AMs, box/int4range/int4[] columns, STORAGE EXTERNAL TOAST corruption,
-multi-DB orchestration) are untouched by a fixture fix, so the promotion
-workflow does not apply.
+## Next step (explicitly NOT more local re-running)
+Wait for the next nightly and read the inlined tail. It will distinguish
+the hypotheses still open: ephemeral-port collision (both `freeTCPPort` and
+`cluster.freePort` use the racy bind-0/close/rebind pattern), a leftover
+datadir/socket in a fixed `tmp/` path, or host resource exhaustion in a
+~19-min stage. If the next nightly is GREEN, record that as evidence before
+closing.
+
+## Gates (all green)
+units; full testport package (the reproduction attempt doubled as the
+gate); tpch-spotcheck Q12=2/Q13=33; tpcds-sf025 `PLAN-SHAPE same=99
+changed=0`; acceptance arm 24/24; pgbench smoke via hook. Stamps WERE
+required — `internal/testutil/cluster/cluster.go` is non-test code under
+`internal/`. New test verified non-vacuous: reverting to bare-path fails
+all three subtests.
 
 ## Next loop
-Item 10's last open group: **PgoutputInterop x10**
-(AI-…-006..-015, publisher/subscriber start failures, "second sighting").
+Item 10 has no other open task. Next in banner order is the "Manually
+discovered" group, first: **setop output type is the FIRST member's, not
+`select_common_type`'s** (found by an M0145-0004 discovery probe).
 
 ## Owner escalations OPEN — three
 1. M0145-0018 cost-model no-go. 2. M0145-0001 lineage exhausted (blocks all
