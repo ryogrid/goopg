@@ -277,21 +277,34 @@ func coerceTextLikeDatum(t catalog.Type, d Datum) (string, error) {
 			n = 1
 		}
 		if n >= 0 {
-			// goopg stores a WIDTH-CARRYING bpchar trimmed (deliberate and
-			// load-bearing — M0103-0007 rung 24; compareDatum's
-			// padding-insensitive equality and the compact heap image rest on
-			// it) and re-pads to Args[0] at every render boundary via
-			// catalog.PadBpchar. An unbounded bpchar has no width to re-pad
-			// FROM, so trimming it would destroy the trailing blanks instead of
-			// deferring them: measured on PG 18.3, `bpchar` holding 'ab  ' is
-			// octet_length 4 where a char(6) holding the same is 6. Both survive
-			// only if the unbounded value is stored verbatim.
+			// M0143-0007b slice 1 (R23): a WIDTH-CARRYING bpchar is stored
+			// BLANK-PADDED to its declared width, as upstream's bpchar_input
+			// does (postgres/src/backend/utils/adt/varchar.c). goopg used to
+			// store it trimmed and re-pad at every render boundary; that kept
+			// the heap image compact and was the whole of the K41 `relpages`
+			// gap on `customer`/`item` (M0143-0007 measured it). Owner
+			// approved reversing the convention 2026-09-20.
+			//
+			// The two steps are upstream's, in upstream's order: excess
+			// TRAILING SPACES are stripped silently, and only a value still
+			// too long after that is an error (22001). Then pad.
+			//
+			// An UNBOUNDED bpchar (typmod -1) has no width to pad TO, so it is
+			// stored verbatim — trailing blanks in it are data, not padding.
+			// Measured on PG 18.3: `bpchar` holding 'ab  ' is octet_length 4
+			// where a char(6) holding the same is 6. Both survive only if the
+			// unbounded value is left alone, which is why this arm is guarded
+			// by `n >= 0` and not widened.
 			stripped := strings.TrimRight(s, " ")
 			if utf8.RuneCountInString(stripped) > n {
 				return "", &ExecError{Code: "22001",
 					Message: fmt.Sprintf("value too long for type character(%d)", n)}
 			}
-			s = stripped
+			// PadBpchar counts RUNES, matching bpchar_input's
+			// pg_mbstrlen_with_len, and is a no-op on an already-full value —
+			// which is what keeps the render-boundary callers correct while
+			// both trimmed (pre-existing) and padded (new) images are on disk.
+			s = catalog.PadBpchar(catalog.Type{Name: "bpchar", Args: []int64{int64(n)}}, stripped)
 		}
 	} else if tname == "bit" {
 		// bit(n): fixed-length, EXACT bit count — no padding/truncation on

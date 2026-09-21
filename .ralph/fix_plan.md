@@ -11423,6 +11423,41 @@ reported, and the values and unit gates are the bar.
     - **Slice 1 is the next unit of work.** Its sibling audit: re-verify the
       four `PadBpchar` callers as no-ops and do NOT remove them — removing
       them would break reads of pre-existing trimmed data. Ledgered.
+    - **SLICE 1 LANDED 2026-09-22 (loop 53).** `coerceTextLikeDatum` pads
+      instead of trimming, keeping upstream's strip-then-error-then-pad order
+      and the unbounded-typmod arm. The K41 `relpages` mechanism is closed
+      for newly written data.
+      - Four tests that pinned the old convention were updated with their
+        rationale rewritten, not their expectations merely flipped;
+        `...RoundTripsToTrimmedStorage` renamed `...ToPaddedStorage`.
+      - New `TestBpcharStoredPaddedAndRenderBoundariesStayInert` pins the
+        contract WITH the sibling audit, including that a PRE-FLIP trimmed
+        image still renders at full width — which is why the four
+        `PadBpchar` callers must stay, not be deleted as redundant.
+      - **The inventory MISSED a boundary and the regress gate caught it.**
+        `length()` rune-counted the stored image directly, so under padded
+        storage `length('x'::char(4096))` returned 4096 where PG's
+        `bpcharlen` strips trailing blanks and gives 1. Fixed via
+        `declaredBpcharTypmod`; the `length` STRIPS / `octet_length` PADS
+        asymmetry is now commented as a sibling pair not to unify.
+      - **No unit test covered it, and the SF0.25 sweep, tpch-spotcheck and
+        TPC-H acceptance arm were ALL green with the bug present.** Only the
+        upstream regress suite saw it — exactly what Hard-won Rule #5 keeps
+        that gate for.
+      - **Lesson for slices 2-4**: auditing the sites that RE-PAD is not
+        sufficient — they all route through `PadBpchar` and are idempotent
+        by construction. The dangerous boundaries are CONSUMERS that read the
+        stored image and assumed it was trimmed.
+      - Gates: units PASS; upstream regress `char` PASS (172 lines) and
+        `varchar` PASS; `text`/`strings` fail on pre-existing unrelated
+        grounds (missing HINT; Unicode-escape and regex parsing) and the
+        `strings` diff shrank 265 → 263 when the `length()` hunk was fixed,
+        with no remaining changed line mentioning bpchar; tpch-spotcheck
+        PASS (Q12=2 Q13=33); TPC-DS SF0.25 PASS=96 MISMATCH=0 with plans
+        99/99 identical; TPC-H acceptance arm 24 MATCH.
+      - **Next: slice 2** — size consequences (index max-key-size, TOAST
+        threshold), where a previously-accepted value can start erroring.
+        Ledgered.
 - **OWNER DECISION 2026-09-20 — APPROVED.** The owner approves reversing
   the trimmed-`bpchar`-storage convention: implement R23 padded
   `character(N)` storage. Proceed per the task text — design doc first,

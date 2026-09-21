@@ -14565,7 +14565,25 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 				// decodes to one RuneError. M0125-0021.
 				return Datum{Kind: KindInt, Int: int64(len(s.BytesValue()))}, nil
 			}
-			return Datum{Kind: KindInt, Int: int64(len([]rune(s.StringValue())))}, nil
+			// bpchar: PG's `length()` is bpcharlen, which counts characters
+			// AFTER stripping trailing blanks (bcTruelen,
+			// postgres/src/backend/utils/adt/varchar.c) — `length('x'::char(4096))`
+			// is 1, not 4096. goopg used to get that answer by accident,
+			// because a width-carrying bpchar was STORED trimmed; M0143-0007b
+			// slice 1 stores it padded, so the rule has to be applied here
+			// explicitly. Caught by the upstream `strings` regress case, which
+			// is exactly what Hard-won Rule #5 keeps that gate for.
+			//
+			// Note the asymmetry with `octet_length` just below: that one PADS
+			// (bpcharoctetlen returns the raw datum size, so
+			// `octet_length('ab'::char(10))` is 10). Same type, opposite
+			// treatment, because upstream defines the two functions
+			// differently — a sibling pair that must not be "unified".
+			str := s.StringValue()
+			if tm := declaredBpcharTypmod(x.Args[0]); tm > 0 {
+				str = strings.TrimRight(str, " ")
+			}
+			return Datum{Kind: KindInt, Int: int64(len([]rune(str)))}, nil
 		}
 	case "octet_length":
 		if len(x.Args) == 1 {

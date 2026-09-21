@@ -1,10 +1,10 @@
 # R23: padded `character(N)` on-disk storage (M0143-0007b)
 
-Status: **DESIGN, 2026-09-21.** The task's own first instruction — "If
-approved: design doc first" — with the owner's approval on record
-(2026-09-20). No production code changed. The boundary inventory below is
-measured against the tree, not assumed from the task text, and two of the
-boundaries the task names turn out not to need changing.
+Status: **SLICE 1 LANDED 2026-09-22.** Storage is padded; the K41 `relpages`
+mechanism is closed for newly written data. Slices 2-4 remain. The boundary
+inventory below was measured before coding and two of the boundaries the task
+names did not need changing — but it also MISSED one, which the regress gate
+caught; see "What the inventory missed".
 
 Task: `.ralph/fix_plan.md` M0143-0007b. Kind: impl. Parent: M0143-0007.
 
@@ -89,6 +89,67 @@ each is gated by its own regress run plus the SF0.25 sweep.
    on `customer`/`item` against PG after a fresh load, which is the only way
    the original K41 gap can be shown closed.
 
-## Not started
+## Slice 1, landed
 
-No production code changed this loop. Slice 1 is the next unit of work.
+`coerceTextLikeDatum` (`internal/executor/codec.go`) now blank-pads a
+width-carrying bpchar instead of trimming it, keeping upstream's two steps in
+upstream's order — excess trailing spaces stripped silently, 22001 only if the
+value is still too long — and leaving the unbounded-typmod arm untouched. The
+pad goes through `catalog.PadBpchar`, so it counts runes exactly as
+`bpchar_input`'s `pg_mbstrlen_with_len` does.
+
+Four existing tests pinned the old convention and were updated with their
+rationale rewritten rather than their expectations merely flipped;
+`TestCopyBinaryBpcharRoundTripsToTrimmedStorage` was renamed to
+`...ToPaddedStorage`, since the invariant it protects — one column, one stored
+width, whatever loaded it — is unchanged and only the width it agrees on moved.
+`TestBpcharStoredPaddedAndRenderBoundariesStayInert` is new and pins slice 1's
+contract together with its sibling audit, including that a PRE-FLIP trimmed
+image still renders at full width.
+
+## What the inventory missed, and how it surfaced
+
+The inventory above lists the render boundaries that PUT padding back — all of
+which go through `catalog.PadBpchar` and are therefore idempotent. It missed a
+CONSUMER that depended on the trimmed convention without going through that
+helper:
+
+**`length()`** (`internal/executor/expr.go`) rune-counted the stored value
+directly. Under trimmed storage that accidentally produced PostgreSQL's answer,
+because PG's `length()` on bpchar is `bpcharlen`, which counts characters AFTER
+stripping trailing blanks (`bcTruelen`, `varchar.c`). Under padded storage it
+returned the declared width: `length('x'::char(4096))` became 4096 where PG
+gives 1.
+
+It was caught by the upstream `strings` regress case, which is exactly what
+Hard-won Rule #5 ("after codec/format changes, re-run the full regress-port
+suite") exists for — no unit test in the tree covered it, and the SF0.25 sweep,
+the spotcheck and the acceptance arm were all green with the bug present.
+
+The fix applies `bpcharlen`'s rule explicitly, gated on the argument's declared
+bpchar type via the same `declaredBpcharTypmod` helper `octet_length` already
+used. Note the asymmetry the code now carries a comment about: `length` STRIPS
+and `octet_length` PADS, same type, opposite treatment, because upstream
+defines the two functions differently. That is a sibling pair that must not be
+"unified" by a later tidy-up.
+
+**Generalised lesson for slices 2-4**: auditing the sites that re-pad is not
+sufficient. Any consumer that reads the stored image and assumed it was trimmed
+is equally a boundary, and those do not announce themselves by calling
+`PadBpchar`.
+
+## Gates run for slice 1
+
+units PASS; upstream regress `char` PASS (172 lines) and `varchar` PASS — the
+two cases that directly exercise this type; `text` and `strings` fail on
+pre-existing, unrelated grounds (a missing HINT line; Unicode-escape and regex
+parsing), and the `strings` diff shrank from 265 to 263 lines when the
+`length()` hunk was fixed, with no remaining changed line mentioning bpchar.
+tpch-spotcheck PASS (Q12=2 Q13=33); TPC-DS SF0.25 PASS=96 MISMATCH=0
+CKMISMATCH=0 ERROR=0 TIMEOUT=0 with plans 99/99 identical; TPC-H acceptance arm
+24 MATCH.
+
+## Next
+
+Slice 2 — the size consequences (index max-key-size, TOAST threshold), where a
+previously-accepted value can start erroring.

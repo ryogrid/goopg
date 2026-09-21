@@ -82,9 +82,15 @@ func TestCopyBinaryBpcharCarriesDeclaredWidth(t *testing.T) {
 // the compact heap image hold), and coerceTextLikeDatum is the single place
 // that convention is applied — including its 22001, whose wording is
 // bpchar_input's own. Adding a padding arm to copyBinaryToDatum would put a
-// padded value into a column an INSERT stores trimmed, i.e. make the same
+// padded value into a column an INSERT stores differently, i.e. make the same
 // column two different widths depending on how it was loaded.
-func TestCopyBinaryBpcharRoundTripsToTrimmedStorage(t *testing.T) {
+//
+// M0143-0007b slice 1 reversed WHICH width that is: both paths now settle on
+// the PADDED image upstream stores, so the round trip is COPY-binary's
+// full-width field in and the same full width out. The invariant the test
+// protects — one column, one stored width, whatever loaded it — is unchanged;
+// only the width it agrees on moved.
+func TestCopyBinaryBpcharRoundTripsToPaddedStorage(t *testing.T) {
 	typ := catalog.Type{Name: "char", Args: []int64{10}}
 	// A field exactly as real PG writes it.
 	wire, err := datumToCopyBinary(typ, NewStringDatum("ab"))
@@ -102,8 +108,8 @@ func TestCopyBinaryBpcharRoundTripsToTrimmedStorage(t *testing.T) {
 	if err != nil {
 		t.Fatalf("coerceTextLikeDatum: %v", err)
 	}
-	if stored != "ab" {
-		t.Errorf("stored %q, want %q (goopg stores bpchar trimmed)", stored, "ab")
+	if stored != "ab        " {
+		t.Errorf("stored %q, want %q (M0143-0007b: bpchar is stored PADDED)", stored, "ab        ")
 	}
 	// And the over-length rule bpchar_input applies at input still fires on a
 	// foreign stream whose extra characters are NOT spaces.
@@ -255,9 +261,15 @@ func TestCoerceTextLikeDatumUnboundedBpchar(t *testing.T) {
 		}
 	}
 
-	// An explicit width still bounds and still trims, whichever name spells it:
-	// the trimmed storage convention is unchanged for width-carrying columns,
-	// which is what compareDatum's padding-insensitive bpchar equality rests on.
+	// An explicit width still bounds, and since M0143-0007b slice 1 it PADS
+	// rather than trims, whichever name spells it. That reverses the old
+	// trimmed-storage convention on owner approval (2026-09-20): upstream's
+	// bpchar_input blank-pads to the declared width, and storing trimmed was
+	// the whole of the K41 `relpages` gap M0143-0007 measured.
+	//
+	// The two steps stay upstream's and in upstream's order — excess trailing
+	// spaces are stripped silently, and only a value still too long after that
+	// is 22001 — so "abcd" is still rejected while "ab " is accepted.
 	for _, name := range []string{"bpchar", "char", "character"} {
 		typ := catalog.Type{Name: name, Args: []int64{3}}
 		if _, err := coerceTextLikeDatum(typ, NewStringDatum("abcd")); err == nil {
@@ -268,11 +280,15 @@ func TestCoerceTextLikeDatumUnboundedBpchar(t *testing.T) {
 			t.Errorf("coerceTextLikeDatum(%s(3), \"ab \"): %v", name, err)
 			continue
 		}
-		if got != "ab" {
-			t.Errorf("coerceTextLikeDatum(%s(3), \"ab \") = %q, want %q (stored trimmed)", name, got, "ab")
+		if got != "ab " {
+			t.Errorf("coerceTextLikeDatum(%s(3), \"ab \") = %q, want %q (stored PADDED)", name, got, "ab ")
 		}
+		// PadBpchar must be a NO-OP on an already-full value. That is what
+		// keeps the four render-boundary callers correct while both trimmed
+		// (pre-existing on disk) and padded (newly written) images coexist —
+		// they must not be removed, only re-verified as inert here.
 		if padded := catalog.PadBpchar(typ, got); padded != "ab " {
-			t.Errorf("PadBpchar(%s(3), %q) = %q, want %q", name, got, padded, "ab ")
+			t.Errorf("PadBpchar(%s(3), %q) = %q, want it unchanged (%q)", name, got, padded, "ab ")
 		}
 	}
 }
@@ -303,9 +319,19 @@ func TestCoerceTextLikeDatumMeasuresCharactersNotBytes(t *testing.T) {
 				tc.typ.Name, tc.typ.Args[0], tc.in, utf8.RuneCountInString(tc.in), len(tc.in), err)
 			continue
 		}
-		if got != tc.in {
-			t.Errorf("coerceTextLikeDatum(%s(%d), %q) = %q, want it unchanged",
-				tc.typ.Name, tc.typ.Args[0], tc.in, got)
+		// The unit under test is the COUNT, not the padding: a bpchar is now
+		// stored blank-padded (M0143-0007b slice 1), and the pad itself is
+		// applied by rune count, so `char(5)` holding 2 runes comes back as
+		// those 2 runes plus 3 spaces. Byte-counting would have rejected these
+		// inputs outright with a spurious 22001, which is what this test
+		// exists to catch.
+		want := tc.in
+		if n := declaredBpcharWidthForTest(tc.typ); n > 0 {
+			want = catalog.PadBpchar(tc.typ, tc.in)
+		}
+		if got != want {
+			t.Errorf("coerceTextLikeDatum(%s(%d), %q) = %q, want %q",
+				tc.typ.Name, tc.typ.Args[0], tc.in, got, want)
 		}
 	}
 
@@ -398,4 +424,20 @@ func TestOctetBitLengthRespectBpcharDeclaredWidth(t *testing.T) {
 			}
 		})
 	}
+}
+
+// declaredBpcharWidthForTest reports the declared width when the type is a
+// width-carrying bpchar spelling, and 0 otherwise. Test-local: the production
+// code makes the same distinction inline, and duplicating it here keeps the
+// expectation above honest about WHICH types pad rather than hard-coding a
+// list that would silently rot.
+func declaredBpcharWidthForTest(t catalog.Type) int {
+	if t.IsArray || len(t.Args) == 0 {
+		return 0
+	}
+	switch strings.ToLower(t.Name) {
+	case "char", "bpchar", "character":
+		return int(t.Args[0])
+	}
+	return 0
 }

@@ -41,7 +41,16 @@ func TestEncodeValuePGCharWithArgs(t *testing.T) {
 		t.Fatalf("expected varlena (≥2 bytes), got %d bytes: %v — this is the bare single-byte bug", len(out), out)
 	}
 	// Verify the payload bytes match by round-tripping through varlenaTextBytes.
-	expected := varlenaTextBytes(text)
+	//
+	// M0143-0007b slice 1: a width-carrying bpchar is stored BLANK-PADDED to
+	// its declared width, as upstream's bpchar_input does, so the varlena
+	// carries 84 characters here rather than the 5 that were written. That
+	// growth is not incidental — it IS the fix: storing trimmed was the whole
+	// of the K41 `relpages` gap M0143-0007 measured on `customer`/`item`.
+	// What this test still pins is the ENCODING (a varlena, not a bare byte),
+	// which is why the expectation is derived from the same padding helper the
+	// production path uses instead of a hand-written byte list.
+	expected := varlenaTextBytes(catalog.PadBpchar(typ, text))
 	if !bytes.Equal(out, expected) {
 		t.Fatalf("encoded bytes = %v, want %v", out, expected)
 	}
