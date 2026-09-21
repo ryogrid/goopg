@@ -1396,17 +1396,95 @@ heuristic stays live.)
     - No deferral-ledger row: no PostgreSQL behaviour is left unimplemented;
       this is test robustness, not a semantics shortcut.
     - Gates: units PASS.
-- [ ] **testport/TestPort_Isolation* output diffs (AI-20260921-000212-002,
-  -003)** — two isolation TAP cases FAILed on expected-output drift:
-  EvalPlanQual L1059 expected `1|newTableAValue|(1,tableBValue)` got
-  `1|tableAValue|(1,tableBValue)` (24.56s — a real value-content diff,
-  not a line-count drift; EvalPlanQual was previously CLOSED Loop \#23
-  on an older signature, so this is a re-regression with a different
-  defect shape); ReceiptReport "expected 4215 lines, got 4216" (6.99s).
-  Repro: `go test -v -run '^TestPort_Isolation(EvalPlanQual|ReceiptReport)$'
-  ./internal/testport/`; evidence `ci/logs/20260921-000212/testport/go-test.log`.
+- [ ] **testport/TestPort_IsolationEvalPlanQual — EPQ refetch returns the
+  pre-update value when a SubPlan is attached (AI-20260922-004850-001,
+  was AI-20260921-000212-002)** — NARROWED 2026-09-22, not yet fixed.
+  L1059 expects `1|newTableAValue|(1,tableBValue)`, gets
+  `1|tableAValue|(1,tableBValue)`. Reproduced OUTSIDE the TAP harness on a
+  throwaway goopg with two psql sessions, which isolates it from the
+  harness's timing-only `<waiting>` detection (that produces a separate,
+  cosmetic 1-line offset cascade in the same diff — see
+  [[iso_runner_blocking_is_timing_only]]). Minimal pair, identical plan
+  shape (`LockRows -> Index Scan using table_a_pkey`) except for the
+  SubPlan:
+    A. `SELECT id, value FROM table_a WHERE id=1 FOR UPDATE`
+       -> `1|newTableAValue` CORRECT.
+    B. `SELECT ta.id, ta.value, (SELECT ROW(tb.id,tb.value) FROM table_b tb
+        WHERE ta.id=tb.id) FROM table_a ta WHERE ta.id=1 FOR UPDATE OF ta`
+       -> `1|tableAValue|(1,tableBValue)` WRONG.
+  Instrumented `lockRowsOp.Next` (internal/executor/operators_lockrows.go,
+  the `entry.newPtrValid` block ~line 1042). In the FAILING shape the EPQ
+  chain walk is CORRECT and the merge DOES run: `newPtrValid=true
+  ptr={0 9} newPtr={0 10} rowlen=4`, then `applied=true newcols=2` — i.e.
+  `stampLock` followed the committed-update chain to a distinct successor
+  tuple and `refetchRow` returned a non-nil 2-column row, yet the merged
+  row still carries the OLD value:
+  `merged=[1, "tableAValue", "(1,tableBValue)", "(0,5)"]`.
+  Two hypotheses REFUTED by reading the code rather than guessing:
+  (a) NOT snapshot visibility — `refetchRow` (same file, ~line 1797)
+  applies no snapshot at all, it pins the buffer and reads the raw heap
+  tuple at `ptr` directly, which is what PG's EvalPlanQual wants;
+  (b) NOT a chain-walk failure — `newPtr` differs from `ptr`.
+  Kind: impl
+  Parent: none
+  NEXT MEASUREMENT (the one instrument that splits what is left): print the
+  CONTENTS of `newLockedCols`, not just its length, in the merge block.
+    - if it is `[1, "newTableAValue"]` -> `refetchRow` is right and the
+      MERGE POSITIONS are wrong in the SubPlan shape: the row is 4 wide
+      (`[id, value, subplan, ctid]`), so `lk.ColPos` / `lk.ColOffset+i`
+      must be landing the refetched columns somewhere other than 0 and 1.
+      That is a planner-supplied-offset bug, cf.
+      [[goopg_two_column_coordinate_boundaries]].
+    - if it is `[1, "tableAValue"]` -> `refetchRow` decoded the wrong
+      image despite a correct `newPtr`; suspect `natts` from
+      `Infomask2 & 0x07FF` or the `cols` pick, which takes the FIRST
+      `o.plan.Locks` entry matching the relfilenode.
+  Do NOT write a concurrency fix before that print: the two branches have
+  disjoint fix sites and the cheap measurement decides between them.
+
+- [x] **testport/TestPort_IsolationReceiptReport (AI-20260921-000212-003)** —
+  DOES NOT REPRODUCE at HEAD. Re-ran the filed repro
+  (`go test -v -run '^TestPort_IsolationReceiptReport$' ./internal/testport/`)
+  and it PASSES in 7.40s; the nightly's "expected 4215 lines, got 4216"
+  is gone, and the item is absent from the newer run 20260922-004850,
+  which independently confirms it. Closed as not-reproducing rather than
+  fixed — no code changed for it.
   Kind: test-fix
   Parent: none
+  Movement: none
+
+- [ ] **testport/TestPort_RegressSuite — 4 subtests FAILed
+  (AI-20260922-004850-016)** — NEW tonight: `partition_aggregate`,
+  `select_having`, `select_implicit`, `union`. Repro:
+  `go test -v -run '^TestPort_RegressSuite$' ./internal/testport/`;
+  single case: `go test -v -run '^TestPort_RegressSuite$/^select_having$'
+  ./internal/testport/`. Evidence
+  `ci/logs/20260922-004850/testport/go-test.log`.
+  Kind: test-fix
+  Parent: none
+  FIRST STEP IS A RE-RUN, NOT A FIX — the run's sha is `c07ebf0112d7`,
+  i.e. M0143-0007b **slice 2**, so this nightly tested a tree that had the
+  bpchar padded-storage flip (slices 1-2) but NOT slice 3, which fixed
+  exactly the class of consumer these cases exercise (`length`,
+  `bit_length`, and the `char(n)->text` `rtrim1` cast) and shrank the
+  upstream `strings` regress diff 263 -> 248 lines. `select_having` and
+  `select_implicit` both read `char`-typed columns. So the live
+  hypothesis was that these are slice-1/2 fallout ALREADY FIXED at HEAD by
+  slice 3/4. **MEASURED AND REFUTED 2026-09-22**: all four still FAIL at
+  HEAD (`partition_aggregate` 1.18s, `select_having` 0.01s,
+  `select_implicit` 0.03s, `union` 0.26s), so slices 3-4 did not fix them
+  and they are not merely a stale-sha artifact. Treat as four independent
+  cases — `union` and `partition_aggregate` have no obvious bpchar
+  surface and may be a different cause sharing a night.
+  NOTE FOR WHOEVER TAKES THIS: `regress_suite_test.go:173` reports only
+  "output mismatch; normalization rules need extension" and does NOT
+  persist the diff, so `-v` on the subtest tells you nothing further. Get
+  the actual divergence from `scripts/pg-regress-runner.sh <case>` against
+  a HEAD-worktree baseline (see [[pg_regress_runner_baseline_diff_technique]]),
+  not from this test. The sub-second failures suggest an early error
+  rather than a subtle row diff — check for an outright statement error
+  before assuming a formatting divergence.
+
 - [ ] **testport/TestPort_PgAmcheck003* re-CREATE EXTENSION after restart
   (AI-20260921-000212-004 … -007)** — four pg_amcheck cases FAILed on the
   same signature at ~1.0-1.4s each: `re-CREATE EXTENSION amcheck after
