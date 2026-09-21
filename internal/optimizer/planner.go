@@ -1757,6 +1757,47 @@ func planSelectImpl(s *parser.SelectStmt, cat catalog.Catalog, plannerSet Planne
 			// is only opened for outer rows that pass the restriction.
 			// See pushOuterQualsIntoLaterals in pushdown.go.
 			node = pushOuterQualsIntoLaterals(node)
+
+			// M0145-0008: restore the one-relation index producer on the
+			// routes that SKIP the rule-based bypass above.
+			//
+			// The bypass at the top of this chain is the ONLY producer of
+			// an index path driven by a correlated (outer-reference)
+			// restriction. `jointree` and `GOOPG_ONEREL_SEARCH` both route
+			// a single-relation scope through this generic arm instead —
+			// PG-faithfully, since `make_one_rel` runs
+			// `set_base_rel_pathlists` unconditionally — but the search's
+			// base-rel pathlist has no such producer, so the scope comes
+			// out as a bare `Filter{SeqScan}`.
+			//
+			// Measured 2026-09-21 on TPC-H Q17's correlated scalar body
+			// (`SELECT 0.2 * avg(l_quantity) FROM lineitem WHERE
+			// l_partkey = p_partkey`): the body was BORN `Filter(SeqScan)`
+			// on both of those routes and `Aggregate(BitmapHeapScan(
+			// BitmapIndexScan))` on the bypass. That is not a cosmetic
+			// difference — `canUnnestSubquery`'s S6/D6.2 guard
+			// (`innerPlanIsIndexProbeCheap`) reads the body's SHAPE to
+			// decide whether decorrelating it is a loss, so a body that
+			// never got its probe reads as "not cheap" and is decorrelated
+			// into a whole-table GROUP BY. Q17 went 1021 ms -> 11155 ms
+			// (jointree) and 1021 ms -> 10625 ms (GOOPG_ONEREL_SEARCH=on
+			// on the DEFAULT arm — the defect is route-borne, not
+			// arm-borne).
+			//
+			// The rule is strictly NARROWER than the bypass it restores:
+			// it fires only when the search elected NO index path at all,
+			// so it can never displace a costed index choice — it only
+			// fills the hole where this route produces none.
+			if isSimpleSingle && (jointree || oneRelSearchEnabled()) &&
+				whereQual != nil && planIsBareSeqScanTree(node) {
+				onlyFrom := len(s.From) == 1 && s.From[0].Only
+				whereForIndex := injectLikeRangePredicates(whereQual)
+				if idxNode, ok, err := planIndexScanFromWhere(whereForIndex, ctx, cat, !onlyFrom); err != nil {
+					return nil, err
+				} else if ok {
+					node = idxNode
+				}
+			}
 		}
 	} else if joinTreeHasOuterLink(node) || appendrelMember || jointree {
 		// M0145-0005 slice 4: `|| jointree` — on the jointree arm every
@@ -10965,6 +11006,28 @@ func seqWinsEqualityProbe(tbl *catalog.Table, idx *catalog.Index, queryClause Ex
 	// this round exists for.
 	return seqCost.Total < idxCost.Total
 }
+// planIsBareSeqScanTree reports whether `n` is a single-relation scan tree
+// that reached no index path at all — a `*SeqScan` under nothing but
+// recognised, index-neutral wrappers.
+//
+// It is deliberately FAIL-CLOSED: any node this function does not recognise
+// makes it return false, so its one caller (the M0145-0008 one-relation index
+// producer above) does nothing rather than overriding a tree it cannot read.
+// The caller's contract is "fill the hole where this route produced no index
+// path", never "replace a path someone else chose", and that contract is only
+// safe if an unrecognised shape counts as "not a hole".
+func planIsBareSeqScanTree(n Node) bool {
+	switch x := n.(type) {
+	case *SeqScan:
+		return true
+	case *Filter:
+		return planIsBareSeqScanTree(x.Child)
+	case *Project:
+		return planIsBareSeqScanTree(x.Child)
+	}
+	return false
+}
+
 // planIndexScanFromWhere is the rule-based WHERE -> index producer; it wraps
 // planIndexScanFromWhereShape so that EVERY shape the inner function can hand
 // back passes the session's scan toggles (review/260831-2 X-8). Filtering the

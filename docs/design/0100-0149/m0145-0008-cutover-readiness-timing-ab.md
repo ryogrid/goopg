@@ -1,9 +1,9 @@
 # Cutover readiness: the arm-vs-arm timing A/B (M0145-0008)
 
-Status: measurement landed 2026-09-21; the semijoin blocker is FIXED the same
-day (see "The fix, measured") and Q17 — the last blocker — is ATTRIBUTED to its
-mechanism the same day (see "Q17 ATTRIBUTED"). The cutover now blocks on one
-named, understood defect.
+Status: measurement landed 2026-09-21; BOTH named blockers are now FIXED the
+same day — the semijoin one (see "The fix, measured") and Q17 (see "Q17 FIXED").
+Q17's attribution was also CORRECTED in the process: the defect is route-borne,
+not arm-borne, and is reachable on the DEFAULT arm.
 Task: `.ralph/fix_plan.md` M0145-0008. Parent: M0145-0007 (whose NLI census
 raised the question). Kind: recon.
 
@@ -348,3 +348,112 @@ Two candidate directions, in preference order:
 Direction 1 is recommended: it is the arm-local fix, and the M0145-0003
 precedent is that the placement/selection machinery already exists and the
 divergence is in what reaches it.
+
+
+## Q17 FIXED (2026-09-21) — and the attribution above was too narrow
+
+The section above attributed Q17 to `canUnnestSubquery`'s guard being fed an
+un-optimized body, and proposed an "arm-local" fix. The first half is right.
+The second half was **wrong about ownership**, and the correction matters more
+than the fix.
+
+### The body is BORN without its probe
+
+Instrumenting two points — where the body is planned (`planSubqueryExpr`, right
+after `planSelectWithParent`) and where the guard reads it — shows no drift
+between them:
+
+```
+jt=0  bodyPlanned Project(Aggregate(BitmapHeapScan(BitmapIndexScan)))
+      atGuard     Project(Aggregate(BitmapHeapScan(BitmapIndexScan)))  probeCheap=true
+jt=1  bodyPlanned Project(Aggregate(Filter(SeqScan)))
+      atGuard     Project(Aggregate(Filter(SeqScan)))                  probeCheap=false
+```
+
+So nothing degrades the body between planning and the guard. The body is *born*
+without its index path on the jointree arm. That relocates the defect from the
+unnest pass to body planning.
+
+### It is NOT the jointree pipeline — it is the one-relation search route
+
+`planSelectImpl` has a rule-based bypass for single-relation scopes, gated on
+
+```go
+isSimpleSingle && !oneRelSearchEnabled() && !appendrelMember && !jointree
+```
+
+and that bypass is the **only** producer of an index path driven by a
+correlated (outer-reference) restriction: it calls `planIndexScanFromWhere`.
+Three routes skip it. `jointree` is only one of them — and the skip is
+deliberate and PG-faithful (`make_one_rel` runs `set_base_rel_pathlists`
+unconditionally, so a single-FROM-item statement should route through the
+search). What is missing is that the search's base-rel pathlist has no
+equivalent producer, so the scope comes out as a bare `Filter{SeqScan}`.
+
+The decisive test: run the **DEFAULT** arm with `GOOPG_ONEREL_SEARCH=on`.
+
+```
+default, bypass            Filter: l_quantity < (SubPlan 1)   1021 ms
+default, ONEREL_SEARCH=on  HashAggregate over full Seq Scan  10625 ms   <- reproduced
+jointree                   HashAggregate over full Seq Scan  11155 ms
+```
+
+The defect is **route-borne, not arm-borne**, and it is reachable today on the
+shipping arm behind a documented flag. Calling it a jointree-pipeline
+regression would have filed it against the wrong component and left the
+default-arm exposure unrecorded.
+
+This is the same family as the ledgered
+`c07-single-rel-never-reaches-ordered-index-producer`: the one-relation search
+route lacks producers the bypass has.
+
+### The fix
+
+At the end of the generic arm, for a single-relation scope that skipped the
+bypass, offer the bypass's producer:
+
+```go
+if isSimpleSingle && (jointree || oneRelSearchEnabled()) &&
+    whereQual != nil && planIsBareSeqScanTree(node) {
+    onlyFrom := len(s.From) == 1 && s.From[0].Only
+    whereForIndex := injectLikeRangePredicates(whereQual)
+    if idxNode, ok, err := planIndexScanFromWhere(whereForIndex, ctx, cat, !onlyFrom); err != nil {
+        return nil, err
+    } else if ok {
+        node = idxNode
+    }
+}
+```
+
+Two properties make this safe to land on a route the default arm can take:
+
+- **Strictly narrower than the bypass it restores.** It fires only when the
+  search elected no index path at all (`planIsBareSeqScanTree`), so it can
+  never displace a costed index choice — it only fills the hole where this
+  route produces none. The bypass, by contrast, runs for every
+  `isSimpleSingle` scope.
+- **`planIsBareSeqScanTree` is fail-closed.** It admits only a `*SeqScan` under
+  recognised, index-neutral wrappers; any shape it does not recognise makes the
+  producer stand down. An unreadable tree counts as "not a hole".
+
+`appendrelMember` — the third route that skips the bypass — is deliberately NOT
+included, and is ledgered. M0145-0004 forces member scopes through the search
+for its own reasons and no witness was measured there; widening the gate on an
+unmeasured route is how a narrow fix becomes an unattributable plan change.
+
+### Result
+
+All three routes now produce PG 18.3's shape (`Filter: l_quantity < (SubPlan 1)`
+over the bitmap probe) with identical values (`310077.312857142857`):
+
+| route | before | after |
+|---|---|---|
+| jointree | 11155 ms | **881 ms** |
+| default + `GOOPG_ONEREL_SEARCH=on` | 10625 ms | **700 ms** |
+| default, bypass (untouched control) | 1021 ms | 700 ms — same plan, run-to-run variance |
+
+Pin: `TestOneRelIndexProducerKeepsCorrelatedScalarProbe` drives all three routes
+over a miniature of Q17's shape and asserts the correlated scalar SURVIVES as a
+subquery expression. It fails on both affected routes without the fix
+(`Project(Filter(Join{algo:Hash}))` — the decorrelated tree) and passes on the
+bypass control either way, so it pins the defect rather than the code.

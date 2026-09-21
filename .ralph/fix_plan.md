@@ -13328,6 +13328,35 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
         + timing gate set. Recommended direction is arm-local — have
         the jointree route select the body's index path before the
         unnest decision, so both arms hand the guard the same body.
+    - **Q17 FIXED (loop 2026-09-21 \#24), and the attribution above was
+      too narrow.** Instrumenting body planning AND the guard shows no
+      drift between them: the body is BORN without its index path, so
+      the defect is in body planning, not the unnest pass.
+      - The rule-based `isSimpleSingle` bypass is the ONLY producer of
+        an index path driven by a correlated restriction
+        (`planIndexScanFromWhere`), and THREE routes skip it —
+        `jointree`, `oneRelSearchEnabled()` and `appendrelMember`.
+      - Decisive test: the **DEFAULT** arm with
+        `GOOPG_ONEREL_SEARCH=on` reproduces the regression exactly
+        (10625 ms vs the bypass's 1021 ms). The defect is
+        **route-borne, not arm-borne**, and is reachable on the
+        shipping arm behind a documented flag — same family as the
+        ledgered `c07-single-rel-never-reaches-ordered-index-producer`.
+      - Fix offers the bypass's producer at the end of the generic arm,
+        gated STRICTLY NARROWER than the bypass it restores: it fires
+        only when the search elected no index path at all
+        (`planIsBareSeqScanTree`, fail-closed), so it can never
+        displace a costed index choice.
+      - Result: all three routes produce PG's shape with identical
+        values — jointree 11155 ms -> 881 ms, ONEREL\_SEARCH 10625 ms ->
+        700 ms, bypass control unchanged. Knob-arm acceptance:
+        **Q17 8.52s -> 0.39s** (default 0.38s), total 77.37s -> 65.97s,
+        arm-vs-arm gap **1.24x -> 1.06x** (1.64x at the original A/B).
+      - `appendrelMember` deliberately excluded and ledgered (no
+        witness measured on that route).
+      - **Both named cutover prerequisites are now discharged.** What
+        remains before flipping the default is the cutover's own
+        corpus-gate re-run, not a known defect.
 - [ ] **M0145-0009 — CTE-output statistics (B-06 resume): wire the landed
   synthesis into the estimator** (filed 2026-09-21 by owner directive;
   carries TODO_ALL B-06 / ledger `take3-B-06-deferred`). Three of this
