@@ -4048,6 +4048,34 @@ setting that yields a serial plan.
   precedent: a producer-group error must propagate, not be swallowed).
   Kind: impl
   Parent: none
+  - **Scoping recon done (loop 2026-09-21 \#36), no production change.**
+    Design doc:
+    `docs/design/0100-0149/m0140-0007-parallel-hash-shared-build.md`
+    (the task's first, indexed).
+    - **The task's premise is understated.** `parallelBuildLazyHashTable`
+      exists, but it is **leader-inserted** (producers only scan+filter
+      and ship batches; the calling goroutine does every hash insert,
+      running the serial build loop) and **scan-driven**
+      (`coopDrivingScan` must find a `*SeqScan` through
+      Filter/Project/hash-Join, else it refuses). It parallelises
+      READING the build side; it does not consume a partial inner's
+      per-worker output, which is what PG's `parallel_hash = true` does.
+    - So "drive it from a partial-inner PATH" is a producer-model
+      difference, not a call-site extension.
+    - **Consequence — the work splits in two**, and which witnesses fall
+      where is UNMEASURED: (i) an inner bottoming out in a `SeqScan`
+      could drive the EXISTING builder to get PG's plan SHAPE with a
+      different execution model — an honest increment if labelled as
+      such; (ii) any other shape needs the real worker-inserted build +
+      barrier.
+    - **Next step is that measurement**, not code: per family-A witness
+      (Q3 Q9 Q10 Q14 Q16 Q18 Q21), does the inner reach a `SeqScan` via
+      `coopDrivingScan`?
+    - **Test design is constrained by the hard constraint**: a partial
+      build that misses inner rows silently drops matches — the same
+      class as the 2026-09-21 parallel SEMI wrong answer, where values
+      stayed plausible and only a parallel-vs-serial identity comparison
+      saw it. The pin must be an IDENTITY test per witness shape.
   - **On completion — reconsider the blocked work (evaluate, do not
     auto-do):** re-run the family-A witnesses (Q3 Q9 Q10 Q14 Q16 Q18
     Q21) under the canonical parallel capture; M0137-0019a's family-A
