@@ -1390,6 +1390,33 @@ heuristic stays live.)
   Parent: none
 
 ### Manually discovered (not yet in a nightly `ci/logs/action-items.md` run) — filed 2026-09-15
+
+- [ ] **setop output type is the FIRST member's, not `select_common_type`'s
+  (found 2026-09-21 by an M0145-0004 discovery probe)** — goopg resolves a
+  `UNION ALL` column's type to the type of the FIRST member; PG resolves it
+  with `select_common_type` over every member
+  (`postgres/src/backend/parser/parse_coerce.c`, driven from
+  `transformSetOperationTree`, `parse_clause.c`). Oracle diffs, goopg vs PG
+  18.3 on `:65432`, both goopg arms (knob off and on — this is NOT a
+  jointree-pipeline defect):
+    - `SELECT a FROM (SELECT 1 AS a UNION ALL SELECT 2.5) t` — goopg reports
+      `bigint`, PG reports `numeric`. The VALUES are right (`1`, `2.5`;
+      `sum` = 6.5), so the rows are correct and only the declared type is
+      wrong.
+    - `SELECT 1::int2 UNION ALL SELECT 2::int8` — goopg `smallint`, PG
+      `bigint`.
+    - It is not only `pg_typeof`: `\gdesc` (a Describe round trip, i.e. the
+      wire RowDescription) reports the same wrong type, so a typed client —
+      JDBC, psycopg — is told `int8` for a column whose rows carry `2.5`.
+      That is a protocol-level mismatch, not a cosmetic one.
+    - Repro: any two-member `UNION ALL` with differing member types; no
+      tables needed.
+    - Fix direction: port `select_common_type` for set operations and coerce
+      each member's target list to the resolved type, which is also the
+      prerequisite the M0145-0004 ledger names for `tlist_same_datatypes`.
+  Kind: bug
+  Parent: none
+
 - [x] **parser/TestLockingClauseParity** — deterministic FAIL, found while
   running the M0137-0001 pre-commit gate (`RALPH_PRECOMMIT_SCOPE=units
   scripts/ralph-precommit-test.sh`; unrelated to that task's scripts/docs-only
@@ -12638,6 +12665,15 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
     white-box tests: admissibility matrix, member-scope search A/B,
     hoist gates + Rel re-targeting, CP inheritance,
     partial-agg-over-union leaf, leaf-owned SetOp layout.
+  - **`tlist_same_datatypes` probed (loop 2026-09-21 \#22)** — the gate
+    is missing, but it is a FIDELITY gate here, not a live wrong-answer:
+    a type-mismatched `UNION ALL` flattens on the knob arm and returns
+    the same correct values as the default arm (`1`, `2.5`, `sum` 6.5).
+    The probe did surface a real, arm-independent defect — the setop's
+    declared output type is the first member's, not
+    `select_common_type`'s — filed separately under "Manually
+    discovered" rather than folded in here, because it is a parser/type
+    defect that both pipelines share.
   - Still open (ledgered): member-level rtable entries +
     parent-qual distribution into members (`distribute_qual_to_rels` —
     M0145-0005's IR work); `tlist_same_datatypes` (needs bound member
