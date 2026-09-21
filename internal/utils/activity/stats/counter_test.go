@@ -5,6 +5,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+
+	"github.com/goopg/goopg/internal/port/runtimeshim"
 )
 
 func TestCounter_SingleGoroutineAddSum(t *testing.T) {
@@ -70,11 +72,28 @@ func TestCounter_ConcurrentAddTotalsExact(t *testing.T) {
 	}
 }
 
-// TestCounter_PerShardWriteDistribution sanity-checks that with
-// GOMAXPROCS > 1 and many goroutines, more than one shard accumulates.
-// On a single-P fallback this skips. The intent is to detect a
-// regression where Add accidentally collapses to a single shard
-// (which would defeat the per-P sharding's purpose).
+// TestCounter_PerShardWriteDistribution detects a regression where Add
+// collapses to a single shard, defeating the per-P sharding's purpose.
+//
+// The property is CONDITIONAL, and stating it precisely is what makes the test
+// stable: whenever the runtime actually hands the workload more than one P,
+// more than one shard must accumulate. It is NOT "more than one shard always
+// accumulates" — that is a claim about the Go scheduler, not about Counter.
+//
+// Guarding on `GOMAXPROCS(0) >= 2` alone was the earlier formulation and it is
+// not sufficient. GOMAXPROCS is the configured P COUNT, not the parallelism the
+// process actually receives: under a CPU quota (a cgroup cap, or simply a
+// loaded machine) a 16-P process can run every goroutine on one P, so the skip
+// does not fire and the assertion fails on a healthy Counter. That is how this
+// test failed in the nightly of 2026-09-21 (AI-20260921-000212-001) while
+// passing on an idle developer machine at GOMAXPROCS 2, 3, 4 and 16 — 20
+// consecutive runs each.
+//
+// So the test now OBSERVES the parallelism it got, rather than assuming it from
+// a setting. Each iteration samples its P id in its own pin window next to the
+// Add; the sample is not guaranteed to be the very P the Add used, but it only
+// ever widens the observed set, which is the conservative direction: a wider
+// set makes the test MORE willing to assert, never less.
 func TestCounter_PerShardWriteDistribution(t *testing.T) {
 	if runtime.GOMAXPROCS(0) < 2 {
 		t.Skip("requires GOMAXPROCS >= 2")
@@ -84,25 +103,48 @@ func TestCounter_PerShardWriteDistribution(t *testing.T) {
 		iterations = 4 << 10
 	)
 	var c Counter
+	var mu sync.Mutex
+	seenP := map[int]struct{}{}
 	var wg sync.WaitGroup
 	for g := 0; g < goroutines; g++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			local := map[int]struct{}{}
 			for i := 0; i < iterations; i++ {
+				pid := runtimeshim.PinP()
+				runtimeshim.UnpinP()
+				local[pid] = struct{}{}
 				c.Add(1)
 			}
+			mu.Lock()
+			for pid := range local {
+				seenP[pid] = struct{}{}
+			}
+			mu.Unlock()
 		}()
 	}
 	wg.Wait()
+
 	nonEmpty := 0
 	for i := range c.shards {
 		if c.shards[i].n.Load() != 0 {
 			nonEmpty++
 		}
 	}
+	// Sum must be exact regardless of how the work was distributed — that part
+	// of the contract holds on one P as well, so it is checked unconditionally.
+	if got, want := c.Sum(), int64(goroutines*iterations); got != want {
+		t.Fatalf("Sum = %d, want %d", got, want)
+	}
+	if len(seenP) < 2 {
+		t.Skipf("runtime ran the whole workload on %d P (GOMAXPROCS=%d): the "+
+			"shard-distribution property is unobservable here, not violated",
+			len(seenP), runtime.GOMAXPROCS(0))
+	}
 	if nonEmpty < 2 {
-		t.Fatalf("only %d shards received Adds; per-P sharding looks broken", nonEmpty)
+		t.Fatalf("workload ran on %d distinct Ps but only %d shard received Adds; "+
+			"per-P sharding has collapsed", len(seenP), nonEmpty)
 	}
 }
 

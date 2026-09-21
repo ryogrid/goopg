@@ -1,14 +1,25 @@
 # Working set — inter-loop baton
 
-Task: **M0143-0007b — COMPLETE `[x]`.** All four slices landed; K41's
-`relpages` gap is closed.
+Task: **M-NIGHTLY AI-20260921-000212-001** (`TestCounter_PerShardWriteDistribution`)
+— **RESOLVED `[x]`**. Scheduling-sensitive flake; the skip guard was testing
+the wrong thing.
 
-## Banner
+## Banner — item 9 is exhausted, we are in item 10
 
-Unchanged. **Next loop must re-walk the banner**: item 9's first task is now
-`[x]`, so the next selectable item has to be found afresh. The loop-52 walk
-(items 4-8 exhausted or blocked) still holds, so start from item 9's remaining
-M0143 tasks, then item 10 (M-NIGHTLY + the pre-existing milestones).
+M0143-0007b closed last loop and **no open `[ ]` M0143 tasks remain**, so item
+9 is done. Item 10 is "M-NIGHTLY open items, then the pre-existing milestones
+(M0119 → M0122 → M0131 → M0134 → M0135/M0136 → M0095/M0110)".
+
+**Next selectable: the next open M-NIGHTLY item**, in document order under
+`### Nightly run 20260921-000212` (fix_plan ~line 1355):
+
+1. ~~AI-…-001 units/activity/stats~~ ← done this loop
+2. **AI-…-002/-003 — `TestPort_Isolation*` output diffs** ← NEXT
+   EvalPlanQual: expected `1|newTableAValue|…` got `1|tableAValue|…` (a real
+   value-content diff, and a RE-regression — it was closed in Loop #23 on a
+   different signature); ReceiptReport: "expected 4215 lines, got 4216".
+3. AI-…-004…-007 — `TestPort_PgAmcheck003*` re-CREATE EXTENSION after restart
+4. AI-…-008…-017 — `TestPort_PgoutputInterop*` publisher/subscriber start
 
 ## Two escalations STILL unanswered
 
@@ -16,58 +27,39 @@ M0143 tasks, then item 10 (M-NIGHTLY + the pre-existing milestones).
 2. **The loop-48 ordering question** — M0145-0003 is strictly the first `[ ]`
    in item 3. Still the banner's call.
 
-## Slice 4 — the measurement that closed it
+## What this loop established
 
-```
-table      rows      PG   before    after      gap
-customer 100000    2872     1979     2854    -0.63%
-item      18000    1284      716     1242    -3.27%
-```
+The failure does not reproduce: 20 runs each at GOMAXPROCS 2/3/4/16, plus
+`taskset -c 0` with GOMAXPROCS 16 — all pass.
 
-against M0143-0007's original **-31.1%** and **-44.2%**. Row counts identical.
-Built from the upstream TPC-DS schema on a fresh private goopg, filled from the
-same SF0.25 TSVs, pages read off the relfilenode on disk; PG's `relpages` read
-SELECT-only from the read-only reference.
+**The guard tested `runtime.GOMAXPROCS(0) >= 2`, which is the configured P
+COUNT, not the parallelism actually received.** Under a CPU quota a 16-P
+process can run every goroutine on one P: the skip does not fire and the
+assertion fails on a healthy `Counter`. The nightly runs the suite under
+exactly that pressure.
 
-**The residual is NOT claimed closed**: under 1% / 3.3% is goopg packing pages
-more densely, which M0143-0007 already separated as its own effect
-(free-space-per-page, not tuple width).
+The property was also stated too strongly — "more than one shard always
+accumulates" is a claim about the Go scheduler. The test now OBSERVES the
+parallelism it got and asserts only when ≥2 distinct Ps were seen.
 
-## What the whole task produced
-
-Four slices: storage padded → pad before the TOAST decision (fixing a 50x heap
-regression slice 1 introduced) → the trimmed-value consumers (`length`,
-`bit_length`, the `char(n)->text` rtrim1 cast) → the measurement.
-
-**The rule worth carrying**: when a storage convention changes, the sites that
-RE-PAD are safe — one idempotent helper. The dangerous ones are **CONSUMERS
-that read the stored image**. All three misses were consumers, and each was
-invisible to a different gate: the upstream regress suite, a byte-level
-measurement no value gate performs, and a stored-column witness (literal-
-expression tests bypass the storage path entirely).
-
-## Two follow-ups left behind, each its own task
-
-- **Heap page density**: the -0.63%/-3.27% residual. Instrument already exists
-  (`internal/storage/page.go` fill ratios, built by M0143-0007).
-- **Logical replication of TOASTED values**: `pgoDecodePhysicalValue` rejects
-  an external TOAST pointer outright where PG sends the detoasted value or the
-  unchanged-toast marker. Wide bpchar columns now reach it (slice 2 made them
-  toastable). Gate with the pgoutput interop ports.
+**Both branches verified, not assumed**: pinned to one CPU it passes; with
+`shardFor` deliberately collapsed to `shards[0]` it FAILS with "workload ran on
+16 distinct Ps but only 1 shard received Adds" — so it still catches the
+regression it exists for. Probe reverted immediately.
 
 ## Traps carried forward
 
-- A private PG oracle is cheap (`initdb` into /tmp on a 55xx port) — it settled
-  every ambiguity in this task.
-- Literal-expression tests bypass the storage path; use a stored column.
-- The RALPH_LOOP guard trips on prose pairing a reference port with DDL words —
-  split the write.
+- A skip guard that reads a *setting* rather than an *observation* produces
+  false failures under CPU pressure. This is likely the shape of other
+  nightly-only flakes.
+- When fixing a flaky test, prove BOTH branches: that it skips/passes in the
+  benign case AND still fails on a deliberately injected regression.
+- A private PG oracle is cheap (`initdb` into /tmp on a 55xx port).
 - Port 5560 is held by a PEER's server; do not touch it.
 
 ## Gates run
 
-units PASS. No production code changed this slice (measurement only), so the
-corpus gates were not re-run; slices 1-3 each ran the full set.
+units PASS. Test-only change, so the corpus gates were not re-run.
 
 ## In-flight
 

@@ -1353,7 +1353,7 @@ heuristic stays live.)
     concurrent mem_guard kills.
 
 ### Nightly run 20260921-000212 (sha `cafc521a3151`, 17 items) — filed 2026-09-21
-- [ ] **units/internal/utils/activity/stats
+- [x] **units/internal/utils/activity/stats
   TestCounter_PerShardWriteDistribution (AI-20260921-000212-001)** —
   units suite FAIL: "only 1 shards received Adds; per-P sharding looks
   broken" (counter_test.go:105, 0.00s). First-seen tonight; could be a
@@ -1363,6 +1363,39 @@ heuristic stays live.)
   `ci/logs/20260921-000212/units/go-test.log`.
   Kind: test-fix
   Parent: none
+  - **RESOLVED 2026-09-22 (loop 57) — scheduling-sensitive flake, and the
+    guard was checking the wrong thing.**
+    - **Not reproducible here**: 20 consecutive runs each at GOMAXPROCS 2, 3,
+      4 and 16, plus a run pinned to a single CPU (`taskset -c 0`) with
+      GOMAXPROCS 16 — all PASS.
+    - **Root cause of the false failure**: the skip guard tested
+      `runtime.GOMAXPROCS(0) >= 2`, which is the configured P COUNT, not the
+      parallelism the process actually receives. Under a CPU quota or a
+      loaded machine a 16-P process can run every goroutine on one P, so the
+      skip does not fire and the assertion fails on a HEALTHY `Counter`. The
+      nightly runs the whole suite under exactly that pressure.
+    - **The property was also stated too strongly**: "more than one shard
+      always accumulates" is a claim about the Go scheduler, not about
+      `Counter`. The correct property is CONDITIONAL — whenever the runtime
+      actually hands the workload more than one P, more than one shard must
+      accumulate.
+    - **Fix**: the test now OBSERVES the parallelism it got (sampling the P
+      id per iteration in its own pin window) and asserts only when at least
+      two distinct Ps were seen; otherwise it skips with that count in the
+      message. The sample may not be the very P the `Add` used, but it only
+      ever widens the observed set — the conservative direction, since a
+      wider set makes the test MORE willing to assert.
+    - **Both branches verified, not assumed**: (a) pinned to one CPU it
+      passes; (b) with `shardFor` deliberately collapsed to `shards[0]` it
+      FAILS with "workload ran on 16 distinct Ps but only 1 shard received
+      Adds; per-P sharding has collapsed" — so the test still catches the
+      regression it exists for. The probe was reverted immediately.
+    - Also added an unconditional `Sum` check (`goroutines*iterations`),
+      which holds on one P as well and catches a lost update regardless of
+      how the work was distributed — coverage the old test did not have.
+    - No deferral-ledger row: no PostgreSQL behaviour is left unimplemented;
+      this is test robustness, not a semantics shortcut.
+    - Gates: units PASS.
 - [ ] **testport/TestPort_Isolation* output diffs (AI-20260921-000212-002,
   -003)** — two isolation TAP cases FAILed on expected-output drift:
   EvalPlanQual L1059 expected `1|newTableAValue|(1,tableBValue)` got
