@@ -12866,6 +12866,26 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
       an optimistic one. PG has no gap here — HAVING quals live on the
       `AggPath` (`create_agg_path`'s `qual`), so its pathlist entries
       already carry post-HAVING rows. Ledgered with that resume point.
+    - Slice 4 (landed, loop 2026-09-21 \#14): `electOrderedDistinct`'s
+      candidate minimum drops from 2 to 1.
+    - The ledgered reading was WRONG a second time: this was never a
+      candidate-SUPPLY gap. `addDistinctPaths` always files both the
+      hashed and the unique-over-sorted candidate; what removes the
+      second one is `add_path` DOMINANCE, downstream of supply. The gate
+      was refusing the election whenever one candidate simply lost.
+    - PG has no minimum — `create_ordered_paths` iterates the whole
+      input pathlist (`planner.c:5337`) — and M0144-0011a-2 already made
+      exactly this change on the grouping twin, so the gate was a
+      sibling-path divergence (`pattern_sibling_paths_must_agree`).
+    - Witness (`dpTrace` A/B, `select distinct c from t order by c` with
+      `enable_hashagg = off` so only one candidate survives): the old
+      gate declined and left a `*Sort` over the DistinctOn; the new one
+      elects the bare `*DistinctOn`. The unique candidate's producer
+      Sort orders every output column ascending, so the ORDER BY key is
+      a prefix of what it already delivers and the Sort was redundant.
+    - Both corpora stay plan-identical (SF0.25 `same=99 changed=0`,
+      acceptance 24/24): neither benchmark runs a lone-candidate DISTINCT
+      with an ORDER BY, so the probe is the witness here.
     - Deferred (ledger rows 2026-09-21):
       `electOrderedGrouping`'s `node != agg.node` precondition, and
       `electOrderedDistinct`'s `cands<2` gate (really a

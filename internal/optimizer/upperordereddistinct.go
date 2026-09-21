@@ -137,8 +137,25 @@ func electOrderedDistinct(u *upperRels, distinctNode *Distinct, keys []SortKey, 
 			cands = append(cands, p)
 		}
 	}
-	if len(cands) < 2 {
-		return decline(fmt.Sprintf("cands<2(%d)", len(cands)))
+	// M0145-0006 slice 4: PG has no minimum — `create_ordered_paths`
+	// iterates the whole input pathlist, `foreach(lc, input_rel->pathlist)`
+	// (`postgres/src/backend/optimizer/plan/planner.c:5337`), so a LONE
+	// `PathDistinct` is offered on the ORDERED rel exactly like one of many.
+	// The `< 2` form was this function's remaining divergence from that
+	// loop, and it is removed for the same reason and by the same argument
+	// M0144-0011a-2 used on the grouping twin — the two are sibling paths
+	// and a gate one of them dropped must not survive in the other
+	// (pattern_sibling_paths_must_agree).
+	//
+	// A lone candidate is the COMMON case here, not a corner one: the
+	// supply side is fine — `addDistinctPaths` always files both the hashed
+	// and the unique-over-sorted candidate — but `add_path` dominance
+	// usually prunes one of them before this function sees the pathlist.
+	// The gate was therefore refusing the election on nearly every DISTINCT
+	// statement, which is why the earlier reading of this gate as a
+	// candidate-SUPPLY gap was wrong.
+	if len(cands) < 1 {
+		return decline(fmt.Sprintf("cands<1(%d)", len(cands)))
 	}
 	translated := make([][]PathKey, len(cands))
 	anyTranslated := false

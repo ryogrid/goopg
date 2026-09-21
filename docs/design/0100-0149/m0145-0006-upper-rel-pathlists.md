@@ -2,7 +2,8 @@
 
 Status: slices 1 (the order-delivering tops `inputNodePathkeys` swallowed),
 2 (the merge-join top) and 3-partial (the election sees through a rename)
-landed; the rest of slice 3 and slice 4 are ledgered below. Task: `.ralph/fix_plan.md` M0145-0006.
+and 4 (the DISTINCT election's candidate minimum) landed; the rest of
+slice 3 is ledgered below. Task: `.ralph/fix_plan.md` M0145-0006.
 Parent: M0145-0005. Kind: impl.
 
 ## What the task is
@@ -223,9 +224,45 @@ the ORDERED rel exists for. PG has no such gap: its HAVING quals live ON the
 `AggPath` (`create_agg_path`'s `qual` argument), so every pathlist entry
 already carries post-HAVING rows. Ledgered with that as the resume point.
 
+## Slice 4 — the DISTINCT election's candidate minimum (landed)
+
+### The ledgered reading was wrong again, and the probe said so
+
+`electOrderedDistinct` declined at `cands<2`, and the ledger read that as a
+candidate-SUPPLY gap: "`createDistinctPaths` must offer both the hashed and the
+sorted candidate". It already does — `addDistinctPaths` files the hashed
+candidate and the unique-over-sorted one unconditionally. What removes the
+second one is `add_path` DOMINANCE, downstream of supply. The gate was
+therefore refusing the election on statements where one candidate simply lost,
+which is the ordinary case rather than a corner one.
+
+PG has no minimum at all: `create_ordered_paths` iterates the whole input
+pathlist, `foreach(lc, input_rel->pathlist)`
+(`postgres/src/backend/optimizer/plan/planner.c:5337`). This is the same
+divergence M0144-0011a-2 removed from the grouping twin, and the two are
+sibling paths — a gate one of them dropped must not survive in the other
+(`pattern_sibling_paths_must_agree`).
+
+### The witness
+
+A `dpTrace` A/B on `select distinct c from t order by c` with
+`enable_hashagg = off` (so only the unique-over-sorted candidate survives
+dominance):
+
+| gate | trace | plan top |
+|---|---|---|
+| `cands < 2` | `loop-decline reason=cands<…(1)` | `*Sort` over the DistinctOn |
+| `cands < 1` | `elected shape=bare-*DistinctOn` | `*DistinctOn` |
+
+The unique candidate's producer Sort orders every output column ascending, so
+the ORDER BY key is a prefix of what it already delivers and the stacked Sort
+was redundant. Both corpora stay plan-identical (`same=99 changed=0`,
+acceptance 24/24) because neither benchmark runs a lone-candidate DISTINCT with
+an ORDER BY — the witness is the probe, and it is a real statement shape, not a
+constructed one.
+
 ## Remaining slices (ledgered)
 
 | 3 | `electOrderedGrouping`'s `node != agg.node` precondition | The elected node and the recorded grouping surface diverge whenever a stage wraps the aggregate (the `Project{Aggregate}` rename is the measured case). Needs the surface to name the rel rather than the node pointer. |
-| 4 | `electOrderedDistinct`'s `cands<2` gate | With one `PathDistinct` candidate the wrapper has nothing to elect between; the real fix is upstream — `createDistinctPaths` must offer both the hashed and the sorted candidate — which is a grouping-paths slice, not an ordered-paths one. |
 
 Each has a `.ralph/deferral_ledger.md` row with the same resume points.

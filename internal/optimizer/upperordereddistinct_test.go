@@ -22,10 +22,13 @@ func distinctFixture() (*upperRels, *Distinct, *RelOptInfo) {
 	return u, spec, rel
 }
 
-// TestElectOrderedDistinctDeclinesFewerThanTwoCandidates: a DISTINCT rel
-// with a single PathDistinct candidate (or none) must decline — mirrors
-// electOrderedGrouping's own cands<2 gate.
-func TestElectOrderedDistinctDeclinesFewerThanTwoCandidates(t *testing.T) {
+// TestElectOrderedDistinctOffersALoneCandidate: M0145-0006 slice 4 lowered
+// the candidate minimum from 2 to 1, the same change M0144-0011a-2 made to
+// the grouping twin and for the same reason — `create_ordered_paths` has no
+// minimum, it iterates the whole input pathlist. A lone candidate whose
+// emission order already delivers the ORDER BY must therefore be elected
+// as-is, not declined into the legacy unconditional-Sort fallback.
+func TestElectOrderedDistinctOffersALoneCandidate(t *testing.T) {
 	u := newUpperRels()
 	in := upperOrderedInput(1000)
 	spec := distinctTestSpec(in)
@@ -34,8 +37,21 @@ func TestElectOrderedDistinctDeclinesFewerThanTwoCandidates(t *testing.T) {
 	addPath(rel, &Path{Kind: PathDistinct, Distinct: spec, Rel: rel, Rows: 5,
 		Cost: Cost{Total: 10}, Children: []*Path{newPrebuiltPath(rel, in)}}, "test")
 	keys := []SortKey{{Expr: &ColumnRef{Index: 0, Name: "k", Type: in.Output()[0].Type}}}
-	if got, ok := electOrderedDistinct(u, spec, keys, 0, DefaultPlannerSettings().costParams(), 0, -1); ok || got != nil {
-		t.Fatalf("single-candidate rel elected (ok=%v); want decline", ok)
+
+	got, ok := electOrderedDistinct(u, spec, keys, 0, DefaultPlannerSettings().costParams(), 0, -1)
+	if !ok || got == nil {
+		t.Fatal("a lone candidate declined; PG offers it like one of many")
+	}
+	if _, isDistinct := got.(*Distinct); !isDistinct {
+		t.Fatalf("winner is %T; want the bare *Distinct — its emission order already delivers the ORDER BY", got)
+	}
+
+	// An EMPTY rel still declines: there is nothing to offer.
+	empty := newUpperRels()
+	emptyRel := fetchUpperRel(empty, UpperDistinct, 0, 0)
+	sizeDistinctRelFromNode(emptyRel, spec)
+	if got, ok := electOrderedDistinct(empty, spec, keys, 0, DefaultPlannerSettings().costParams(), 0, -1); ok || got != nil {
+		t.Fatalf("empty rel elected (ok=%v); want the decline", ok)
 	}
 }
 
