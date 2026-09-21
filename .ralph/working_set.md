@@ -1,60 +1,61 @@
 (idle — nothing in flight)
 
-# Loop #67 result — setop common-type FIXED (numeric category)
+# Loop #68 result — M0119-0006 (bt): rootdescend tier SCOPED, premise corrected
 
-Banner: items 0-9 unchanged. Item 10's PgoutputInterop task is open but NOT
-selectable — its own next step is "wait for the next nightly" and the run id
-is unchanged (still 20260922-004850). So the next selectable was the
-"Manually discovered" subsection's first task (a `###` under M-NIGHTLY).
+Banner: nightly run id UNCHANGED (20260922-004850), so item 10's
+PgoutputInterop stays non-selectable (its next step is "wait for the next
+nightly"). Item 10 has nothing else open, so per the banner's pre-existing
+milestone order (M0119 first, which is NOT document order) the selectable
+task was **M0119-0006**, whose only unbuilt piece is the `rootdescend` tier.
+No production change this loop.
 
-## Root cause, found by reading
-`SetOp.Output()` returns `n.Left.Output()` AND `wrapSetOpBranchWithCasts`
-coerced only the RIGHT branch to the LEFT's schema. Those two together ARE
-the first-member-wins rule.
+## The finding: the task's own premise was wrong
+M0119-0006 recorded rootdescend as "a call-shape-accepted no-op (upstream
+gates it to heapkeyspace v4)". Upstream does NOT no-op on non-v4 —
+`verify_nbtree.c:479-485` raises `ERRCODE_FEATURE_NOT_SUPPORTED` with
+"cannot verify that tuples from index %q can each be found by an
+independent index search" + hint "Only B-Tree version 4 indexes support
+rootdescend verification." Two behaviours only: RUN or ERROR. Accepting the
+argument and checking nothing is neither — and is the WORST of the three,
+because a clean report from a check that never executed is
+indistinguishable from a real pass.
 
-## Fix
-`setOpUnifyBranches` resolves each column's common type across both branches
-and coerces BOTH. `SetOp.Output()` then becomes correct with NO change to
-`Output()` — coercing the left branch is exactly what was omitted.
-`setOpCommonTypeName` is the single decision point for widening later.
+## goopg is on the RUN side, so the target is to implement it
+- `internal/initdb` pins `btm_version = 4` (two tests).
+- The tuple key format carries the heap TID INSIDE the key — the
+  heapkeyspace tiebreaker that `checkunique` already compensates for.
 
-## Why bounded to the numeric category (stated, not assumed)
-`applySetOp` folds members LEFT-DEEP, so goopg resolves pairwise where
-upstream resolves all-at-once. That is equivalent only where the
-implicit-coercion relation is a TOTAL ORDER — true in TYPCATEGORY_NUMERIC
-(`int2<int4<int8<numeric<float4<float8`, float8 preferred AND maximal).
-A non-total-order category would make the fold order-dependent, i.e. the
-same defect in subtler form.
+## Primitives already exist (sized, not guessed)
+`amcheck.CollectBtreeLeafEntries` (probe set, `LeafEntry{Key,TID}`),
+`(*nbtree.BTree).Search` (`descendToLeaf` + right-link recovery = `_bt_search`
+shape; using the REAL search path is faithful, since the property under test
+is "the normal search finds this tuple"), `openIndexBTree`, and the existing
+`btIndexCheckUnique`/`btIndexHeapAllIndexed` tier shape.
 
-## Measured on live PG 18.3 (not derived)
-1/2.5 -> numeric (was bigint); int2/int8 -> int8 (was smallint);
-int4/float4 -> float4; float4/float8 -> float8; REVERSED float8/int2 ->
-float8. The reversed pair is the PAIRED CONTROL: it distinguishes a real
-resolution from a positional rule and passes even WITHOUT the fix, which is
-why it sits beside cases that do not. Values unaffected (sum still 3.5).
+## Why not built this loop
+Every tier landed under M0119-0006 carries a DETECTION test with a
+non-vacuity guard (HeapAllIndexed plants a phantom tuple → XX002; the 003
+ports inject real on-disk corruption). For THIS tier the gap matters most:
+the defect being fixed is a check that reports clean without looking, so a
+test that only shows "a healthy index still passes" would reproduce the
+defect inside the test suite. Tier + format split + a planted unreachable
+entry + the executor gate set is a loop on its own.
 
-## Gates (all green)
-units; FULL upstream regress suite (only the known `partition_aggregate`);
-tpch-spotcheck Q12=2/Q13=33; tpcds-sf025 PASS; acceptance arm 24/24;
-pgbench smoke. Non-vacuity: neutralising the unification fails exactly the
-four order-sensitive subtests, leaving the two controls green.
-**One plan delta, investigated not waved through**: TPC-DS Q5 cost moved
-(14363.79 -> 14595.00) but is STRUCTURALLY IDENTICAL — 66 lines, zero diff
-once costs are stripped, rows/widths unchanged, MISMATCH=0. It is the cost
-of the coercion Project, the same coercion PG inserts.
-Trap worth carrying: my first cost-stripped diff was EMPTY because the awk
-range used `=== Q5` while the capture writes `===== Q5 =====` — a vacuous
-no-diff looks exactly like a real one until you confirm the range matches.
+## Next step — filed as M0119-0006bt-rootdescend
+MANDATORY format split: `keyFmt.KeyDesc() != nil` → run
+(`Search(entry.Key)` is exact); else raise 0A000 verbatim. Without it the
+tier is ACTIVELY WRONG on the blob format — no TID in the key means `Search`
+returns the first of a duplicate group and a TID comparison manufactures
+findings on a healthy index.
+MEASURE FIRST: which key format the ported pg_amcheck tests' indexes use.
+`buildPGIndexKeyDesc` accepts any btree index with key columns, suggesting
+the run-it arm — but that is INFERRED from the constructor's guards, not
+observed, and it decides whether the br slice's live `--rootdescend` exit-0
+expectation still holds.
 
-## Deferred + ledgered
-Cross-category pairs (upstream raises 42804; goopg still accepts),
-all-`unknown` -> text, and domain preservation. Widening needs a type-category
-table the optimizer lacks (only `pgTypeCategoryForOID`, keyed by OID).
-
-## Next loop
-Item 10: PgoutputInterop (only if a NEW nightly ran — check the run id).
-Otherwise the pre-existing milestones: M0119 -> M0122 -> M0131 -> M0134 ->
-M0135/M0136 -> M0095/M0110.
+## Gates
+`go build ./...` OK; state guard OK; pgbench smoke via hook. No value gates —
+zero production diff (verified over `internal/ cmd/`).
 
 ## Owner escalations OPEN — three
 1. M0145-0018 cost-model no-go. 2. M0145-0001 lineage exhausted (blocks all

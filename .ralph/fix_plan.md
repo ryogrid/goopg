@@ -2044,6 +2044,62 @@ the whole file's active task between 2026-09-01 and 2026-09-14; **since
       8-FK reload and is load-dependent; an arm-vs-stale-baseline FAIL would
       be data drift, not regression. Re-capture the baseline (or the owner
       does) before the next executor commit needs the arm stamp.
+  - 2026-09-22 (bt): **scoping recon for the `rootdescend` tier, no production
+    change.** Design:
+    `docs/design/0100-0149/0119-0006bt-rootdescend-tier-scoping.md`.
+    - **This slice's note above was wrong in the way that matters.** It
+      recorded rootdescend as "a call-shape-accepted no-op (upstream gates it
+      to heapkeyspace v4)". Upstream does NOT no-op on non-v4 — it raises
+      `ERRCODE_FEATURE_NOT_SUPPORTED` (verify_nbtree.c:479-485) with
+      "cannot verify that tuples from index %q can each be found by an
+      independent index search" and the hint "Only B-Tree version 4 indexes
+      support rootdescend verification." Upstream has exactly two behaviours,
+      run or error; accepting the argument and checking nothing is neither,
+      and is the worst of the three because a clean report from a check that
+      never executed is indistinguishable from a real pass.
+    - **goopg sits on the RUN side of that gate**, so the fix is to implement
+      the tier, not to add the error: `internal/initdb` pins
+      `btm_version = 4` (two tests), and goopg's tuple key format carries the
+      heap TID inside the key — the heapkeyspace tiebreaker the `checkunique`
+      tier already compensates for with a TID-blind comparator.
+    - **Primitives already exist**: `amcheck.CollectBtreeLeafEntries` for the
+      probe set, `(*nbtree.BTree).Search` for the independent descent
+      (`descendToLeaf` + right-link recovery — `_bt_search`'s shape, and
+      using the REAL search path is faithful because the property under test
+      is "the normal search can find this tuple"), `openIndexBTree` to open
+      it, and the existing `btIndexCheckUnique`/`btIndexHeapAllIndexed` tier
+      shape to wire it.
+    - Filed as **M0119-0006bt-rootdescend** below rather than built here.
+
+- [ ] **M0119-0006bt-rootdescend — implement the `rootdescend` tier**
+  (filed 2026-09-22 by the bt recon).
+  Kind: impl
+  Parent: M0119-0006
+  - Design, including the upstream citations and the primitive inventory:
+    `docs/design/0100-0149/0119-0006bt-rootdescend-tier-scoping.md`.
+  - **Format split is mandatory, not optional.** Upstream asserts
+    `key->heapkeyspace && key->scantid != NULL`: the tier REQUIRES a key
+    carrying the heap TID, because that is what makes the search match one
+    specific entry instead of the first of a duplicate group. So:
+    `keyFmt.KeyDesc() != nil` -> run the tier (`Search(entry.Key)` is exact,
+    and `!found` or a TID mismatch is a finding); otherwise raise 0A000 with
+    upstream's message and hint verbatim. Without the split the tier is
+    ACTIVELY WRONG on the blob format — no TID in the key means `Search`
+    returns the first of a duplicate group and a TID comparison manufactures
+    findings on a healthy index.
+  - **Bar to meet**: every tier already landed under M0119-0006 carries a
+    DETECTION test with a non-vacuity guard (`TestBtIndexCheck_HeapAllIndexed*`
+    plants a phantom tuple and asserts XX002; the `003*` ports inject real
+    on-disk corruption). A test that only shows "a healthy index still passes"
+    is below that bar — and for this tier especially, since the defect being
+    fixed IS a check that reports clean without looking.
+  - **Measure this FIRST**: which key format the ported pg_amcheck tests'
+    indexes actually use. `buildPGIndexKeyDesc` accepts any btree index with
+    key columns, which suggests ordinary user indexes take the run-it arm, but
+    that was inferred from the constructor's guards, not observed. It decides
+    whether the br slice's live expectation (`pg_amcheck --heapallindexed
+    --rootdescend` exit 0) still holds or becomes an error.
+
 > This task list is **seeded, not exhaustive.** M0119-0001 triage plus every future
 > deferral-ledger entry (any new `status = -` row) feed additional M0119 tasks over
 > time; the milestone's living nature means it need not be complete at filing.
