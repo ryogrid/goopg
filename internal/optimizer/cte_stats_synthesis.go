@@ -102,11 +102,62 @@ func synthAggregateOutputs(out *cteOutputStats, entry *plannedCTE) {
 		switch {
 		case apos < len(agg.GroupExprs):
 			out.cols[i].kind = cteColGroupKey
+			out.cols[i].ndistinct = groupKeyNDistinct(agg.GroupExprs[apos], agg.Child, groups)
 		case apos-len(agg.GroupExprs) < len(agg.Aggs):
 			out.cols[i].kind = cteColAggOut
 			out.cols[i].ndistinct = groups
 		}
 	}
+}
+
+// groupKeyNDistinct is the group-combo rule (B-06 design gap G2, and this
+// file's own step 3): the distinctness of ONE grouping column in the
+// aggregate's OUTPUT.
+//
+// The rule is `min(input ndistinct, group count)`, and it applies ONLY when
+// the input ndistinct is known. Grouping never invents values — `GROUP BY g`
+// emits a subset of the values `g` already had — so the input distinctness is
+// an upper bound; and the output has one row per group, so the group count is
+// another. The minimum of the two is the estimate.
+//
+// The group count alone is NOT a usable fallback, and this was measured
+// rather than reasoned. An earlier version of this rule used it when the
+// input was unknown: sound as a BOUND, but wrong as an ESTIMATE for one key
+// of a multi-key grouping, because a low-cardinality column
+// (TPC-DS `d_week_seq`, a few hundred weeks) grouped alongside a
+// high-cardinality one gets priced at the whole group count. On the default
+// arm that inflated the key's ndistinct far above the truth, which deflated
+// the join selectivity that divides by it: TPC-DS Q59 went from 43 estimated
+// rows to 1 and flipped Hash Join -> Nested Loop. Values stayed correct, so
+// only the plan channel caught it.
+//
+// So an unknown input yields `unknown` and today's defaults, matching this
+// file's standing rule — never a guess. A non-`*ColumnRef` grouping
+// expression is a computed value whose input distinctness cannot be read, and
+// is likewise unknown.
+//
+// Re-entrancy: this calls back into `columnNDistinctForChild`, which can
+// reach `cteSynthNDistinct` and therefore another CTE's `outputStats()`. A
+// self-referential body is safe by construction because `outputStats` marks
+// `synthDone` BEFORE computing, so a re-entrant call observes a nil record
+// and the consumer declines — keep that ordering if either side is edited.
+func groupKeyNDistinct(groupExpr Expr, child Node, groups float64) float64 {
+	cr, ok := groupExpr.(*ColumnRef)
+	if !ok {
+		return -1
+	}
+	in := columnNDistinctForChild(cr.Index, child)
+	if in <= 0 {
+		return -1
+	}
+	nd := float64(in)
+	if nd > groups {
+		nd = groups
+	}
+	if nd < 1 {
+		return -1
+	}
+	return nd
 }
 
 // aggOutputMap resolves a (possibly Project-wrapped) body to its Aggregate

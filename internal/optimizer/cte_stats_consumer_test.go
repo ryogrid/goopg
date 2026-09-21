@@ -19,6 +19,7 @@ package optimizer
 import (
 	"testing"
 
+	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/parser"
 )
 
@@ -50,18 +51,97 @@ func TestCTESynthNDistinctReachesConsumer(t *testing.T) {
 	}
 }
 
-// TestCTESynthNDistinctGroupKeyStaysUnknown pins the boundary with slice 2:
-// group-key columns are classified but NOT numbered by the landed synthesis,
-// so the consumer must still report unknown for them rather than inventing a
-// value. If a later slice lands the group-combo rule this test should be
-// updated deliberately, not deleted silently.
-func TestCTESynthNDistinctGroupKeyStaysUnknown(t *testing.T) {
-	entry := synthAggEntry(t)
-	if k := entry.outputStats().cols[0].kind; k != cteColGroupKey {
+// statsBearingAggEntry is the group-key fixture with real column statistics.
+// The no-stats fixture cannot exercise the group-combo rule at all, because
+// the rule requires a KNOWN input ndistinct — `yr` has 5 distinct values, well
+// under any group count, so the input bound decides.
+func statsBearingAggEntry() *plannedCTE {
+	tbl := &catalog.Table{
+		Name: "gk_entry_src",
+		Columns: []catalog.Column{
+			{Name: "yr", Type: catalog.Type{Name: "int4"}},
+			{Name: "v", Type: catalog.Type{Name: "int4"}},
+		},
+		Stats: &catalog.TableStats{
+			RowCount: 100000,
+			Columns:  []catalog.ColumnStats{{NDistinct: 5}, {NDistinct: 1000}},
+		},
+	}
+	scan := &SeqScan{Table: tbl, EstRelRows: 100000, schema: tableSchema(tbl)}
+	agg := &Aggregate{
+		Child:      scan,
+		GroupExprs: []Expr{&ColumnRef{Index: 0, Name: "yr"}},
+		Aggs:       []AggregateCall{{Name: "count"}},
+		schema:     Schema{{Name: "yr"}, {Name: "c"}},
+	}
+	return &plannedCTE{name: "gk", body: agg, schema: agg.Output()}
+}
+
+// TestCTESynthNDistinctGroupKeyIsNumbered is the slice-1 boundary pin,
+// inverted deliberately now that slice 2 landed the group-combo rule. Slice 1
+// asserted group keys stayed unknown and said in so many words that a later
+// slice must update this test rather than delete it; this is that update.
+// Group-key columns are now numbered and reach the consumer.
+func TestCTESynthNDistinctGroupKeyIsNumbered(t *testing.T) {
+	entry := statsBearingAggEntry()
+	st := entry.outputStats()
+	if k := st.cols[0].kind; k != cteColGroupKey {
 		t.Fatalf("col 0 kind = %v, want groupkey", k)
 	}
-	if got := columnNDistinctForChild(0, cteScanOver(entry)); got != 0 {
-		t.Fatalf("group-key ndistinct = %d, want 0 (unknown) — the group-combo rule is slice 2", got)
+	if st.cols[0].ndistinct < 0 {
+		t.Fatal("group key must be numbered by the group-combo rule")
+	}
+	got := columnNDistinctForChild(0, cteScanOver(entry))
+	if got != saturateRowEst(st.cols[0].ndistinct) {
+		t.Fatalf("group-key ndistinct = %d, want %d — the rule is not reaching the consumer",
+			got, saturateRowEst(st.cols[0].ndistinct))
+	}
+}
+
+// TestGroupKeyNDistinctTakesTheTighterBound exercises the half the
+// no-stats fixture cannot: when the input column's own ndistinct is KNOWN and
+// smaller than the group count, that is the bound. This is the half that pays
+// — a low-cardinality key (TPC-DS `d_year`) inside a CTE with many groups
+// would otherwise be priced at the group count.
+func TestGroupKeyNDistinctTakesTheTighterBound(t *testing.T) {
+	tbl := &catalog.Table{
+		Name: "gk_src",
+		Columns: []catalog.Column{
+			{Name: "yr", Type: catalog.Type{Name: "int4"}},
+			{Name: "cust", Type: catalog.Type{Name: "int4"}},
+		},
+		Stats: &catalog.TableStats{
+			RowCount: 100000,
+			Columns:  []catalog.ColumnStats{{NDistinct: 5}, {NDistinct: 50000}},
+		},
+	}
+	scan := &SeqScan{Table: tbl, EstRelRows: 100000, schema: tableSchema(tbl)}
+
+	// Input ndistinct 5 is far below any plausible group count: the input
+	// bound must win.
+	if got := groupKeyNDistinct(&ColumnRef{Index: 0, Name: "yr"}, scan, 40000); got != 5 {
+		t.Errorf("low-cardinality key = %v, want 5 (input bound)", got)
+	}
+	// Input ndistinct 50000 exceeds the group count: grouping cannot emit
+	// more distinct values than it emits rows, so the group count wins.
+	if got := groupKeyNDistinct(&ColumnRef{Index: 1, Name: "cust"}, scan, 40000); got != 40000 {
+		t.Errorf("high-cardinality key = %v, want 40000 (group-count bound)", got)
+	}
+	// A computed grouping expression has no readable input distinctness, so
+	// the rule declines rather than falling back to the group count.
+	computed := &BinaryOp{Op: parser.OpAdd, Left: &ColumnRef{Index: 0}, Right: &IntegerConst{Value: 1}}
+	if got := groupKeyNDistinct(computed, scan, 40000); got != -1 {
+		t.Errorf("computed group expr = %v, want -1 (unknown)", got)
+	}
+	// And an UNKNOWN input ndistinct must also decline. This is the case that
+	// regressed TPC-DS Q59 (43 rows -> 1, Hash Join -> Nested Loop) when an
+	// earlier version of the rule fell back to the group count: sound as a
+	// bound, wrong as an estimate for one key of a multi-key grouping.
+	nostats := &SeqScan{Table: &catalog.Table{Name: "gk_nostats",
+		Columns: []catalog.Column{{Name: "a", Type: catalog.Type{Name: "int4"}}}},
+		EstRelRows: 100000}
+	if got := groupKeyNDistinct(&ColumnRef{Index: 0, Name: "a"}, nostats, 40000); got != -1 {
+		t.Errorf("unknown input ndistinct = %v, want -1 (unknown) — the group count is not a usable fallback", got)
 	}
 }
 

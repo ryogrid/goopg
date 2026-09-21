@@ -210,3 +210,85 @@ Neither was attempted here. Wiring the group-combo rule blind — without the
 consumer path proven and without knowing which kinds are actually requested —
 is how a statistics change moves default-arm plans on an unmeasured mechanism.
 That path is now proven, and the target is now named.
+
+
+## Step 2 slice 2 — the group-combo rule (gap G2), and the census that preceded it
+
+### The 648 `unknown` asks, censused first
+
+Slice 1 left 648 asks per corpus run landing on body shapes the synthesis does
+not classify. The task's own ordering said census before widening, and the
+census changed what "widening" should mean:
+
+| CTE body shape | unknown asks / run |
+|---|---|
+| `Project(WindowAgg)` | **366** |
+| `Project(Filter)` | 158 |
+| `SetOp` (bare) | 59 |
+| `Project(SetOp)` | 41 |
+| `DistinctOn` | 24 |
+
+Two of these are worth recording as findings rather than just counts. Window
+functions are 56% of the unknown population and the synthesis has no
+`WindowAgg` rule at all. And `Project(Filter)` — a plain filtered select —
+appears 158 times, which this document's own G1 note says should not happen
+("plain bodies need no synthesis: the existing resolver already recurses into
+CTE bodies for those shapes"); the consumer is reached only when
+`resolveBaseColumn` FAILS, so for those 158 the resolver is not doing what G1
+assumes. Both are unresolved and ledgered.
+
+### The rule
+
+A grouping column's distinctness in the aggregate's OUTPUT is bounded twice:
+by its INPUT distinctness (grouping emits a subset of values it already had)
+and by the GROUP COUNT (one output row per group). The rule is the minimum —
+**and it applies only when the input ndistinct is known**.
+
+### Why the group count is NOT a usable fallback (measured, not reasoned)
+
+The first version of this rule used the group count when the input was
+unknown. Sound as a *bound*; wrong as an *estimate*. For one key of a
+multi-key grouping, a low-cardinality column gets priced at the whole group
+count — TPC-DS `d_week_seq` (a few hundred weeks) grouped alongside a store
+key is priced in the tens of thousands. That inflates the key's ndistinct,
+which deflates the join selectivity that divides by it.
+
+The default-arm sweep caught it immediately:
+
+```
+Q59  before:  Hash Join   (cost=4460.71..6983.92 rows=43)
+     after:   Nested Loop (cost=1925.94..6878.78 rows=1)   <- estimate collapsed
+```
+
+Values stayed correct (`MISMATCH=0`), so only the PLAN channel could see it —
+a concrete instance of why this task gates the default arm and reports plan
+movement explicitly. Requiring a known input makes the rule strictly a
+tightening of a value the estimator already had.
+
+### Result: correct, exercised, and plan-neutral
+
+Against the TRUE pre-change baseline (not the intermediate buggy capture — the
+baseline-drift trap this document records): **99/99 plans identical**,
+`PASS=96 MISMATCH=0`, TPC-H acceptance arm 24/24.
+
+The rule is not inert in the sense slice 1 was. It **fires 18 times per corpus
+run**, and where it fires the correction is large:
+
+```
+in=4      groups=655237   -> nd=4        (vs defaultNumDistinct 200)
+in=6      groups=356      -> nd=6
+in=39504  groups=3256     -> nd=3256     (group-count bound wins)
+```
+
+So 18 columns now carry a derived ndistinct instead of a default, several of
+them 50x tighter — and no corpus plan at SF0.25 depends on those columns
+today. That is a safe landing, not a valuable one: the value is banked for the
+residuals this task exists to unblock, which can now be re-evaluated against
+derived rather than default estimates.
+
+### Not done here
+
+A formal EA (estimate-audit) ratchet on the `year_total` shapes was NOT run;
+the evidence above is the plan channel plus the fire census. Since plans are
+byte-identical the *chosen* plans are unchanged, but estimate QUALITY on those
+18 columns did change and is unmeasured by q-error. Ledgered.

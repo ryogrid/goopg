@@ -49,8 +49,14 @@ func TestSynthesizeAggregateOutputs(t *testing.T) {
 		t.Errorf("group keys kinds = %v %v, want groupkey groupkey",
 			got.cols[0].kind, got.cols[1].kind)
 	}
+	// Step 3 (the group-combo rule, M0145-0009 slice 2) landed, but it applies
+	// only when the INPUT ndistinct is known: min(input, group count). This
+	// fixture's table carries no stats, so the input is unknown and the rule
+	// declines — the group count alone is not a usable fallback (it regressed
+	// TPC-DS Q59; see groupKeyNDistinct's comment). Unknown here is the rule
+	// working, not the rule missing.
 	if got.cols[0].ndistinct != -1 {
-		t.Errorf("group key ndistinct = %v, want unknown (-1) until step 3 restriction rules",
+		t.Errorf("group key ndistinct = %v, want unknown (-1): this fixture has no column stats",
 			got.cols[0].ndistinct)
 	}
 	if got.cols[2].kind != cteColAggOut {

@@ -13449,6 +13449,43 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
       reporting plan movement explicitly.
     - Step 4 respected: the `rows<=1` guard and the Q78 firewall were
       NOT touched.
+  - **Step 2 slice 2 landed (loop 2026-09-21 \#27): the group-combo rule
+    (gap G2).** A group key's output ndistinct is
+    `min(input ndistinct, group count)`, applied ONLY when the input is
+    known.
+    - **Census first, per this task's own ordering**, and it inverted
+      the expected target. The 648 slice-1 `unknown` asks are:
+      `Project(WindowAgg)` **366** (56%, no rule exists at all),
+      `Project(Filter)` 158, bare `SetOp` 59, `Project(SetOp)` 41,
+      `DistinctOn` 24. Window functions dominate — not set-ops.
+    - **The group count alone is NOT a usable fallback, and the gate
+      proved it.** The first version used it when the input was unknown:
+      sound as a bound, wrong as an estimate for one key of a multi-key
+      grouping. TPC-DS `d_week_seq` got priced at the whole group count,
+      which collapsed Q59 from 43 estimated rows to 1 and flipped
+      Hash Join -> Nested Loop. **Values stayed green — only the PLAN
+      channel saw it**, which is exactly why step 3 gates the default
+      arm and reports plan movement explicitly.
+    - Corrected rule: **99/99 plans identical** against the TRUE
+      pre-change baseline (the intermediate capture was the buggy
+      version — the baseline-drift trap the design doc records),
+      `PASS=96 MISMATCH=0`, acceptance arm 24/24.
+    - It **fires 18 times per corpus run** with large corrections
+      (`in=4 groups=655237` -> nd=4, against `defaultNumDistinct` 200),
+      so it is exercised and safe — but no SF0.25 plan depends on those
+      columns yet. The value is banked for the residuals, not realised.
+    - **A G1 claim in the design is contradicted by measurement**:
+      it says plain bodies need no synthesis because the resolver
+      recurses into them, yet `Project(Filter)` bodies reach the
+      consumer 158×/run — and the consumer is only reached when
+      `resolveBaseColumn` FAILS. Ledgered; one of the two is wrong.
+    - Next (ledgered, in order): the `WindowAgg` arm (366 asks, the
+      largest population), then diagnose why `synthUnionLiterals`
+      declines the 100 live `SetOp` asks, then the EA/q-error ratchet on
+      the `year_total` shapes — NOT run here, so estimate quality on the
+      18 fired columns is still unmeasured.
+    - Step 4 respected again: the `rows<=1` guard and the Q78 firewall
+      remain UNTOUCHED.
   - **On completion — reconsider the blocked work (evaluate, do not
     auto-do):**
     - `flattenPulledBodyTree`'s bare-`*SeqScan` rule (M0145-0003 ANY
