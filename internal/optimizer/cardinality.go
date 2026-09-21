@@ -1860,6 +1860,16 @@ func relFilteredRowsWalk(n, rel Node) (rows float64, found, sealed bool) {
 		return passthrough(x.Child)
 	case *CTEScan:
 		return passthrough(x.Child)
+	// M0145-0009 slice 4: the third member of the resolver-arm family
+	// (`TestResolverFamilyArmListsAgree` enforces that the three walkers carry
+	// the same arms). A `*WindowAgg` is row-preserving — one output row per
+	// input row — so it still describes its child's relation and its own
+	// `EstimateRows` is that relation's filtered count, which is exactly what
+	// `passthrough` returns. Note there is deliberately no `*Aggregate` arm
+	// here for the mirror-image reason: an Aggregate's rows are GROUPS, so it
+	// does NOT describe its child's relation.
+	case *WindowAgg:
+		return passthrough(x.Child)
 	case *Join:
 		return joinSide(x.Left, x.Right)
 	case *NestedLoopIndexJoin:

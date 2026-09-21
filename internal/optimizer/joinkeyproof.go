@@ -285,6 +285,32 @@ func resolveBaseColumn(idx int, child Node) (baseColumnRef, bool) {
 		if cr, ok := x.GroupExprs[idx].(*ColumnRef); ok {
 			return resolveBaseColumn(cr.Index, x.Child)
 		}
+
+	// M0145-0009 slice 4 (B-06 gap G1). A `*WindowAgg` publishes
+	// `child row ++ func outputs` and is ROW-PRESERVING — one output row per
+	// input row, values unchanged — so a coordinate landing in the
+	// pass-through region describes exactly the child's column: same values,
+	// same distinct count, same raw relation beneath it. Everything
+	// `baseColumnRef` carries survives the crossing, which is what makes this
+	// arm sound where the `*Aggregate` arm above is deliberately restricted:
+	// an Aggregate's output rows are GROUPS, so its row set is not its
+	// child's, and M0127-P5.6-g-ii MEASURED the unrestricted version worse.
+	//
+	// Upstream needs no such arm because its resolution happens at the parse
+	// level: `examine_simple_variable` (selfuncs.c) walks into a subquery RTE
+	// and reads the targetlist entry, and a window query's pass-through column
+	// IS a plain `Var` of the underlying relation there — the WindowAgg is a
+	// plan node that never stands between them. goopg resolves over the PLAN
+	// tree, so the node has to be crossed explicitly.
+	//
+	// Fail-closed: a coordinate at or past the child's width is a window
+	// function's own output — `rank()`, `sum() OVER (...)` — a computed value
+	// with no base column, and it resolves to nothing.
+	case *WindowAgg:
+		if x.Child == nil || idx < 0 || idx >= len(x.Child.Output()) {
+			return baseColumnRef{}, false
+		}
+		return resolveBaseColumn(idx, x.Child)
 	}
 	return baseColumnRef{}, false
 }
@@ -381,6 +407,16 @@ func resolvesToGroupUniqueColumn(idx int, child Node) bool {
 	case *GatherMerge:
 		return resolvesToGroupUniqueColumn(idx, x.Child)
 	case *CTEScan:
+		return resolvesToGroupUniqueColumn(idx, x.Child)
+	// The `*WindowAgg` twin of `resolveBaseColumn`'s arm. This function's own
+	// contract says the two walkers must agree about which node a coordinate
+	// lands on, so the arm is added here in the same change — a coordinate
+	// that crosses the window there must cross it here too, or the pair would
+	// be describing different columns.
+	case *WindowAgg:
+		if x.Child == nil || idx < 0 || idx >= len(x.Child.Output()) {
+			return false
+		}
 		return resolvesToGroupUniqueColumn(idx, x.Child)
 	case *Project:
 		if idx >= 0 && idx < len(x.Targets) {

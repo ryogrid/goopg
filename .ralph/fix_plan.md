@@ -13514,6 +13514,37 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
       subquery-output Var to the base `pg_statistic` row regardless of
       intervening nodes, which is why upstream needs no synthesis.
     - Step 4 respected: `rows<=1` guard and Q78 firewall UNTOUCHED.
+  - **Step 2 slice 4 landed (loop 2026-09-21 \#29): G1 proper — and it
+    CLOSES the "add more rules" direction of this task.**
+    - **The plan was half wrong and the code said so.** The
+      `*Aggregate` arm in `resolveBaseColumn` ALREADY exists,
+      restricted to `AggModePartial`, because **M0127-P5.6-g-ii filed
+      exactly that widening and MEASURED it worse — upstream does not
+      have it**. `groupUniqueNDistinct`'s single-grouping-column rule is
+      documented as "upstream's and load-bearing, not conservatism".
+      Only the `*WindowAgg` arm was genuinely missing.
+    - Added it across the whole resolver family;
+      `TestResolverFamilyArmListsAgree` mechanically caught a THIRD
+      member (`relFilteredRowsWalk`) the plan had not accounted for.
+    - **The arm works and still converts ZERO asks**, and the chain
+      terminus explains why: every TPC-DS window CTE is a window over a
+      MULTI-KEY aggregate —
+      `Sort>WindowAgg>Sort>Aggregate[groupExprs=6]` (x8),
+      `[groupExprs=5]` (x7), `Sort>Aggregate[groupExprs=2]` (x4).
+      With 2+ grouping columns none is unique on its own, so upstream's
+      `isunique` counting argument does not exist.
+    - **These are columns PostgreSQL itself would not resolve.** The
+      B-06 gap is far smaller than the 648-unknown figure implied.
+    - Remaining honest scope: (a) the `SetOp` population (100 asks)
+      reaching `synthUnionLiterals` without matching — diagnose before
+      widening; (b) the unexplained `Project(Filter)` contradiction
+      (158 asks/run) — the likeliest place a REAL gap hides. An
+      EA/q-error ratchet is premature.
+    - **ESCALATION for the owner**: if this task's three dependent
+      residuals need estimates PG cannot produce, it is the RESIDUALS'
+      unblock conditions that need revisiting, not the statistics. The
+      loop is not re-scoping them itself.
+    - Step 4 respected: `rows<=1` guard and Q78 firewall UNTOUCHED.
   - **On completion — reconsider the blocked work (evaluate, do not
     auto-do):**
     - `flattenPulledBodyTree`'s bare-`*SeqScan` rule (M0145-0003 ANY

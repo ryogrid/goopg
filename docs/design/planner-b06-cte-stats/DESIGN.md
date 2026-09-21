@@ -362,3 +362,72 @@ resolves to its input column; an agg output does not resolve) and a
 does not) — not another boundary rule. The boundary rules already landed are
 the consumers that G1 will finally feed; adding a fourth before G1 lands would
 be a fourth inert slice.
+
+
+## Step 2 slice 4 — G1 proper, and the conclusion that closes the "add rules" direction
+
+### The baton's plan was half wrong, and the code said so
+
+Slice 3 concluded "add `*Aggregate` and `*WindowAgg` arms to
+`resolveBaseColumn`". Reading the function first showed an **`*Aggregate` arm
+already exists**, deliberately restricted to `AggModePartial`, with the
+rationale immediately below it: M0127-P5.6-g-ii filed exactly that widening,
+**MEASURED it worse, and restricted it because upstream does not have it**.
+The sanctioned path for a grouped-subquery column is `groupUniqueNDistinct`,
+whose doc calls the single-grouping-column restriction "upstream's and
+load-bearing, not conservatism".
+
+So only the `*WindowAgg` arm was genuinely missing, and only that was added.
+
+### The arm, and the third walker
+
+A `*WindowAgg` publishes `child row ++ func outputs` and is ROW-PRESERVING, so
+a pass-through coordinate describes exactly the child's column — everything
+`baseColumnRef` carries survives the crossing. That is precisely what an
+`*Aggregate` cannot claim, its output rows being GROUPS.
+
+`TestResolverFamilyArmListsAgree` then caught a THIRD family member the plan
+had not accounted for: `relFilteredRowsWalk` (cardinality.go). The arm was
+added there too (a row-preserving node still describes its child's relation,
+so `passthrough` is right) — note that walker has no `*Aggregate` arm either,
+for the mirror-image reason.
+
+### The measurement: the arm works, and the remaining unknowns are PG's too
+
+The arm is correct and the chain now gets PAST the window nodes, which it could
+not before. It still converts zero of the 366 asks, and tracing where each
+chain terminates says why:
+
+```
+8  Sort>WindowAgg>Sort>Aggregate>[groupExprs=6]
+7  Sort>WindowAgg>Sort>Aggregate>[groupExprs=5]
+4  Sort>Aggregate>[groupExprs=2]
+```
+
+Every TPC-DS window CTE is a window over a MULTI-KEY aggregate. The resolution
+reaches the Aggregate and stops there — correctly, and for upstream's reason:
+with two or more grouping columns none is unique on its own, so
+`get_variable_numdistinct`'s `isunique` counting argument does not exist.
+
+**These are columns PostgreSQL itself would not resolve.** The conclusion is
+therefore not "add another rule" but that the B-06 gap is far smaller than the
+648-unknown figure suggested: most of that population is unresolvable within
+upstream's own rules, and closing it would mean inventing estimates PG does
+not make.
+
+### What this means for M0145-0009
+
+The three residuals this task exists to unblock cannot be unblocked by more
+CTE-output statistics, because the statistics they want do not exist upstream
+either. The task's remaining honest scope is:
+
+- the `SetOp` population (100 asks) — `synthUnionLiterals` is reached but does
+  not match; diagnose before widening, as it may be a real rule gap;
+- the G1 contradiction (`Project(Filter)` bodies reaching the consumer 158×/run
+  although the design says the resolver handles them) — still unexplained and
+  the most likely place a REAL gap is hiding;
+- an EA/q-error ratchet, which is now clearly premature.
+
+Everything else should be escalated as a scoping question rather than pursued:
+if the residuals need estimates PG cannot produce, the residuals' own
+unblock conditions — not the statistics — are what need revisiting.
