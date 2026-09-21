@@ -13709,6 +13709,31 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
       analogue — remain untouched, and until they land goopg reaches
       PG's ANSWER by an enumerated set while PG derives it from
       parameterization. That is the substance, and it is next.
+  - **Recon + design doc landed (loop 2026-09-21 \#34)**:
+    `docs/design/0100-0149/m0145-0010-parameterized-path-legality.md`
+    (the task's first, now indexed). It names the three gaps precisely
+    and **corrects this task's own census figure**.
+    - **The filed "8 corpus fires" for the `lateral` family is STALE.**
+      Re-measured on TPC-DS SF0.25: `leaf-count` 26,
+      `semianti-not-tail` 3, `outer-over-derived` 3, `outer-spine` 2,
+      **`lateral` 2** — 36 total, where the 8 came from a pre-slice-3
+      census with 132 total declines.
+    - `leaf-count` (26) now DOMINATES and is ledgered as
+      executor-substrate-blocked — out of this task's reach.
+    - Gap detail: `RelOptInfo` has no lateral/param sets at all; PG's
+      `join_is_legal` needs BOTH `lateral_relids` (direction) and
+      `direct_lateral_relids` (rejects indirect refs),
+      `joinrels.c:569-596`. goopg's lateral refusal is a STATEMENT-level
+      veto whose marker lives on a chain node the leaf flattening
+      DISCARDS — deriving per-leaf lateral relids before that is the
+      real work of scope (a), not adding fields.
+    - **Next step is a MEASUREMENT, not the refactor**: instrument where
+      a parameterized path is refused for want of re-pricing and count
+      scope (b)'s corpus fires. Scope (b) is not a lateral feature and
+      its population has never been measured.
+    - **ESCALATION for the owner**: the task was filed with an 8-fire
+      lateral consumer that is now 2. Whether that still justifies a
+      rel-level refactor is a scoping decision the loop does not take.
   - **On completion — reconsider the blocked work (evaluate, do not
     auto-do):** the `lateral` decline family (Q30/Q68 witnesses) on the
     then-default arm; the partial-NLI whitelist's LEFT/ANTI entries
