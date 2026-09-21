@@ -1,6 +1,7 @@
 # Cutover readiness: the arm-vs-arm timing A/B (M0145-0008)
 
-Status: measurement landed 2026-09-21; the cutover is BLOCKED on what it found.
+Status: measurement landed 2026-09-21; the semijoin blocker is FIXED the same
+day (see "The fix, measured" below) and the cutover now blocks on Q17 alone.
 Task: `.ralph/fix_plan.md` M0145-0008. Parent: M0145-0007 (whose NLI census
 raised the question). Kind: recon.
 
@@ -161,7 +162,7 @@ semijoin at all** and the `EXISTS` runs as a per-row subplan. Any pulled body
 whose WHERE carries a body-local qual — an extremely common shape — is
 affected.
 
-### The fix, and why it is not in this loop
+### The fix, and why it was not in the diagnosis loop
 
 The RHS-only branch must PLACE the qual as a base restriction on the pulled
 leaf instead of demanding it be a join clause. The pulled leaves come from
@@ -171,6 +172,75 @@ separately in `pb.quals`, so placing it means attaching the qual to its leaf
 pulled-leaf construction path, on the knob arm only. It belongs to M0145-0003,
 it is ledgered with that resume point, and it wants its own loop and its own
 knob-arm sweep rather than being appended to a diagnosis.
+
+## The fix, measured (2026-09-21)
+
+The refusal is now conditioned on the qual's rel count, which is what decides
+which of the two downstream placement mechanisms owns it:
+
+```go
+if relLevel(rs) >= 2 && !searchConsumes(rebased, spans) {
+        notePullupClassify("body-join-qual-not-consumable")
+        return false
+}
+*searchQuals = append(*searchQuals, rebased)
+```
+
+- **two or more rels** — the qual is a JOIN clause, `buildRestrictInfos` files
+  it as a restrictInfo, and `searchConsumes` is the right test. Unchanged.
+- **exactly one rel** — the qual is a BASE restriction. It rides the conjunct
+  pool into `partitionConjunctsForJoinPlanning`, which runs on this very pool
+  immediately after `classifyPulledQuals` returns (joinsearchseam.go:856 then
+  :862) and routes a single-rel conjunct to `locals.byBinding[leaf]`; the
+  seam's pulled-leaf loop then wraps the leaf in a `LeafLocal *Filter` and
+  prices it through `estimateBaseRelInfo`. Nothing further was needed — the
+  placement machinery already existed and the refusal was the only thing
+  standing in front of it.
+
+So the fix is a one-condition change, not the pulled-leaf-construction change
+the ledger's resume point anticipated: the leaves did not need the qual
+attached to them, because the seam attaches it.
+
+### Result: the semijoin blocker is gone
+
+Full 22-query knob-arm run, same harness, same pinned binary and engine-id as
+the A/B above:
+
+| query | default | knob before | knob after | knob-after vs default |
+|---|---|---|---|---|
+| **Q4** | 0.37s | 12.98s | **1.02s** | 2.8x |
+| **Q21** | 2.63s | 18.94s | **2.12s** | 0.8x |
+| Q20 | 0.13s | 3.58s | within 0.4s of before | — |
+| Q17 | 0.38s | 7.61s | 8.52s | **22.4x (untouched)** |
+| **TOTAL** | 62.43s | 102.46s | **77.37s** | 1.24x |
+
+Q4 is 12.7x faster on the arm and Q21 8.9x; Q21 is now marginally FASTER than
+the default arm. Values are unchanged (rows 5 / 412 / 101 / 7 on Q4/Q21/Q20/Q22).
+
+A caution worth recording for whoever re-measures: an earlier `QUERIES=4,20,21,22`
+subset run read Q20 at 5.59s and Q22 at 1.01s and looked like a regression on
+both. The full run shows neither moves. Per-query timings are not comparable
+across runs of different length — a 4-query run warms the cache far less than a
+22-query one — so the arm must be run whole to be compared.
+
+### What the residual 1.24x is
+
+14.94s of gap remains, and **8.14s of it is Q17 alone** — the correlated
+SCALAR subquery, a different mechanism that the pull-up does not touch and
+which this fix does not address. The other 21 labels account for the rest
+inside run-to-run noise. Q17 is therefore the single remaining named blocker.
+
+### Sibling-path audit
+
+`searchConsumes` has one structural sibling with the same shape: the legacy
+arm's body-qual gate (`joinsearchseam.go:819`), whose own comment says "a
+body-local restriction **or** an intra-RHS join clause" while the code requires
+`searchConsumes` for both. It was **measured, not assumed**: planning
+`EXISTS (SELECT 1 FROM i WHERE j = k AND v < j)`, its `NOT EXISTS` twin, and a
+constant-compare variant on the DEFAULT arm all decorrelate to a semi/anti
+join, so that gate does not refuse this class — the legacy arm reaches its
+semijoin by a route that never presents the body-local qual to :819. No sibling
+fix is owed.
 
 ## What this means for the cutover
 

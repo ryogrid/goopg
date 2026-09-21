@@ -1,6 +1,8 @@
 # M0145-0003 — sublink pull-up into the jointree
 
-Status: landed (EXISTS/NOT EXISTS flat-body arm) / gates in §"Measurement".
+Status: landed (EXISTS/NOT EXISTS flat-body arm + ANY arm) / gates in
+§"Measurement". The body-local-qual refusal that cost TPC-H Q4 and Q21 their
+semijoins was fixed 2026-09-21 — see §"Body-local quals are base restrictions".
 
 ## The ANY arm — `convert_ANY_sublink_to_join` (landed 2026-09-21)
 
@@ -327,6 +329,47 @@ ANTI (no join-clause slot exists for them — see above).
   PASS (24/24 value-MATCH).
 - `internal/optimizer` package — PASS including the exprwalk census
   (two new closures pinned `nonRecursiveClassifier`).
+
+## Body-local quals are base restrictions (fixed 2026-09-21)
+
+`classifyPulledQuals` sorts each rebased body qual into spanning / RHS-only /
+emitting-only. The RHS-only branch used to require `searchConsumes(rebased,
+spans)` unconditionally, which asks whether `buildRestrictInfos` yields the
+clause — and that function's `add` closure drops everything with
+`relLevel(relids) < 2` by design, because the restrictInfo list holds JOIN
+clauses only. A qual confined to ONE body rel therefore failed structurally,
+and since the branch's failure refuses the whole body while `pulled` has
+already suppressed the legacy pre-DP route for the scope, the statement lost
+its semijoin from BOTH routes and kept the sublink as a per-row subplan.
+
+That shape is common, not exotic: TPC-H Q4's body carries
+`l_commitdate < l_receiptdate`, Q21's carries the same family. The cost was
+12.98s vs 0.37s on Q4.
+
+The branch now conditions the test on rel count, because rel count is exactly
+what selects the downstream placement mechanism:
+
+- **≥ 2 rels** — a join clause; `buildRestrictInfos` files it; `searchConsumes`
+  is the correct test (refusal renamed `body-join-qual-not-consumable`).
+- **1 rel** — a base restriction; it rides the conjunct pool into
+  `partitionConjunctsForJoinPlanning`, which routes it to
+  `locals.byBinding[leaf]`, where the seam wraps the pulled leaf in a
+  `LeafLocal *Filter` and prices it through `estimateBaseRelInfo`.
+
+PG's analogue is `distribute_qual_to_rels`
+(`postgres/src/backend/optimizer/plan/initsplan.c`), which places a single-rel
+qual on that rel's `baserestrictinfo` and lets the pull-up proceed; it has no
+consumability precondition at all.
+
+The pin is `TestJointreePullupBodyLocalQual`, which asserts both halves: the
+body is admitted with BOTH conjuncts in the pool (spanning relids 11 and
+body-local relids 10), and the resulting knob-on plan carries a semi join whose
+RHS contains a `LeafLocal` filter — i.e. the qual was not merely admitted but
+actually placed. The test fails on the pre-fix condition (verified by reverting
+it), so it pins the defect rather than the code.
+
+Timings and the sibling-path audit are in
+`m0145-0008-cutover-readiness-timing-ab.md` §"The fix, measured".
 
 ## Files
 

@@ -539,8 +539,34 @@ func classifyPulledQuals(pu *jtPullup, nReal int, spans []leafSpan, ctx *resolve
 			case relsOverlap(rs, emittingBits) && relsOverlap(rs, rhs):
 				spanning = append(spanning, rebased)
 			case relsSubset(rs, rhs):
-				if !searchConsumes(rebased, spans) {
-					notePullupClassify("body-qual-not-consumable")
+				// A qual confined to the pulled body's own rels is placed by
+				// one of TWO mechanisms downstream, and the choice is decided
+				// by how many rels it touches:
+				//
+				//   - two or more: it is a JOIN clause, and
+				//     `buildRestrictInfos` files it as a restrictInfo — which
+				//     is exactly what `searchConsumes` tests for;
+				//   - exactly one: it is a BASE restriction, and
+				//     `partitionConjunctsForJoinPlanning` (which runs on this
+				//     very conjunct pool, right after this function returns)
+				//     routes it to `locals.byBinding[leaf]`, where the seam's
+				//     pulled-leaf loop wraps the leaf in a LeafLocal `*Filter`
+				//     and prices it through `estimateBaseRelInfo`.
+				//
+				// Requiring `searchConsumes` for BOTH was the M0145-0003
+				// defect root-caused on 2026-09-21: `buildRestrictInfos`'
+				// `add` drops every clause with `relLevel < 2` by design, so a
+				// single-rel body qual could never satisfy it and the whole
+				// body was refused. Since `pulled` has already suppressed the
+				// legacy pre-DP route by then, the statement lost its semijoin
+				// from both routes — TPC-H Q4's `l_commitdate < l_receiptdate`
+				// cost it a 10x regression on the jointree arm.
+				//
+				// PG has no equivalent step: `distribute_qual_to_rels`
+				// (initsplan.c) puts a single-rel qual on that rel's
+				// `baserestrictinfo` and the pull-up proceeds.
+				if relLevel(rs) >= 2 && !searchConsumes(rebased, spans) {
+					notePullupClassify("body-join-qual-not-consumable")
 					return false
 				}
 				*searchQuals = append(*searchQuals, rebased)

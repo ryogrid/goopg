@@ -485,3 +485,107 @@ func TestJointreePullupNoExistsKeepsLegacyIdentical(t *testing.T) {
 		t.Errorf("knob-off plan carries the search tag — the lift leaked onto the legacy arm")
 	}
 }
+
+// TestJointreePullupBodyLocalQual is the regression pin for the
+// M0145-0003 root cause found on 2026-09-21: a body-confined qual that
+// touches exactly ONE rel is a BASE restriction, and demanding that it
+// be consumable as a JOIN clause refused the whole body.
+//
+// `v < j` here is the shape of TPC-H Q4's `l_commitdate <
+// l_receiptdate`: both sides come from the body's own leaf, so
+// `buildRestrictInfos` — which drops every clause with relLevel < 2 by
+// design — can never file it, and `searchConsumes` can never be
+// satisfied. The qual must instead ride the conjunct pool into
+// `partitionConjunctsForJoinPlanning`, which routes a single-rel
+// conjunct to its leaf as a LeafLocal filter. Refusing it cost the
+// statement its semijoin from BOTH routes (`pulled` has already
+// suppressed the legacy pre-DP unnest by then) — a 10x regression on
+// the jointree arm.
+func TestJointreePullupBodyLocalQual(t *testing.T) {
+	cat := jtpCatalog(t)
+	const sql = `select tag from jtp_o where exists (select 1 from jtp_i where j = k and v < j)`
+	sel, ok := parseOne(t, sql).(*parser.SelectStmt)
+	if !ok {
+		t.Fatalf("stmt is not *parser.SelectStmt")
+	}
+	ps := DefaultPlannerSettings()
+	node, ctx, err := planFromClause(sel, cat, ps, nil)
+	if err != nil || node == nil || ctx == nil {
+		t.Fatalf("planFromClause: node=%v ctx=%v err=%v", node, ctx, err)
+	}
+	ctx.cat = cat
+	ctx.settings = ps
+	pred, err := resolveExpr(sel.Where, ctx)
+	if err != nil {
+		t.Fatalf("resolveExpr: %v", err)
+	}
+	pu := pullUpSublinksIntoJointree(pred, ctx, cat, ps)
+	if pu == nil {
+		t.Fatalf("pullUpSublinksIntoJointree declined an EXISTS with a body-local qual")
+	}
+	scans := []Node{node}
+	widths := []int{len(node.Output())}
+	var semiAnti []semiAntiChainLink
+	var outer []outerChainLink
+	var onQuals []chainOnQual
+	if !splicePulledLeaves(pu, 1, ctx, &scans, &widths, &semiAnti, &outer, &onQuals) {
+		t.Fatalf("splicePulledLeaves declined the pulled body")
+	}
+	spans := buildLeafSpans(widths, semiAnti)
+	var searchQuals []Expr
+	if !classifyPulledQuals(pu, 1, spans, ctx, &searchQuals) {
+		t.Fatalf("classifyPulledQuals refused a body with a single-rel body-local qual — the M0145-0003 root cause has regressed")
+	}
+	// Both conjuncts reach the pool: the spanning correlation (relids
+	// 11) and the body-local restriction (relids 10). The partition
+	// that runs next is what separates them.
+	if len(searchQuals) != 2 {
+		t.Fatalf("searchQuals = %d, want 2 (correlation + body-local restriction)", len(searchQuals))
+	}
+	var sawSpanning, sawBodyLocal bool
+	for _, q := range searchQuals {
+		rs, attributable := relidsOfExpr(q, spans)
+		if !attributable {
+			t.Fatalf("pulled conjunct %T is not attributable to any leaf", q)
+		}
+		switch rs {
+		case leafRangeRelSet(0, 2):
+			sawSpanning = true
+		case leafRangeRelSet(1, 2):
+			sawBodyLocal = true
+		default:
+			t.Fatalf("pulled conjunct %T attributed to %08b, want 11 or 10", q, rs)
+		}
+	}
+	if !sawSpanning || !sawBodyLocal {
+		t.Fatalf("conjunct fates: spanning=%v bodyLocal=%v, want both", sawSpanning, sawBodyLocal)
+	}
+	// End to end: the knob-on plan carries the semijoin and no residual
+	// ExistsExpr — the body really entered the join-order problem.
+	plan := planOnPipeline(t, sql, cat, true)
+	if planHasExistsExpr(plan) {
+		t.Fatalf("ExistsExpr survived in the knob-on plan; tree: %s", describePlanTree(plan))
+	}
+	j := findSemiOrAntiJoin(plan)
+	if j == nil || j.Type != JoinTypeSemi {
+		t.Fatalf("knob-on plan carries no semi join (j=%v); tree: %s", j, describePlanTree(plan))
+	}
+	// And the body-local restriction really landed on the body leaf as
+	// a LeafLocal filter — the placement mechanism the fix relies on,
+	// not merely "the body was admitted".
+	if !hasLeafLocalFilter(j.Right) {
+		t.Fatalf("no LeafLocal filter under the semi-join RHS — the body-local qual was admitted but never placed; tree: %s", describePlanTree(plan))
+	}
+}
+
+// hasLeafLocalFilter reports whether any *Filter below n is marked
+// LeafLocal — the seam's pulled-leaf wrapper.
+func hasLeafLocalFilter(n Node) bool {
+	found := false
+	walkPlanNodes(n, func(cur Node) {
+		if f, ok := cur.(*Filter); ok && f.LeafLocal {
+			found = true
+		}
+	})
+	return found
+}
