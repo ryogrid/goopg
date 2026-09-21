@@ -1,8 +1,10 @@
 # template1 shares postgres' namespace — the three-oid map
 
-Status: ROOT-CAUSED AND MAPPED 2026-09-22. No production file touched. The fix
-is an OWNER/DESIGN CHOICE between two options with very different blast radii
-— see §5.
+Status: ROOT-CAUSED AND MAPPED 2026-09-22; §7 added 2026-09-22 after a THIRD
+face of the same collision was traced to it (the pg_extension re-attribution),
+which also CORRECTS an earlier claim that that defect was independent. No
+production file touched. The fix is an OWNER/DESIGN CHOICE between two options
+with very different blast radii — see §5.
 Kind: recon
 Parent: M0119-0006
 Movement: none
@@ -97,3 +99,57 @@ document stops here.
 files, but no live connection routes to them. Any fix should decide whether
 template1 adopts `base/1` or gets a fresh directory; adopting it is tidier but
 means reconciling initdb's contents with the runtime's expectations.
+
+## 7. Third face: a template1 extension re-attributes to "postgres" (2026-09-22)
+
+A separate task had recorded this defect as **not** subsumed by the collision,
+on the strength of one measurement: after `CREATE EXTENSION amcheck` in
+template1, `base/1/3079` holds the row, so "the write side is not misrouted —
+it went to template1's own heap". That inference is wrong, and the control that
+refutes it is one line long.
+
+**The control.** Do the same `CREATE EXTENSION` from a **postgres** connection
+on a fresh cluster. It produces the identical on-disk signature:
+
+| heap | template1 install | postgres install | user-db install |
+|---|---|---|---|
+| `base/1/3079` | 1 row | 1 row | 0 |
+| `base/4/3079` (template0 control) | 0 | 0 | 0 |
+| `base/5/3079` | 1 row | 1 row | 0 |
+| `base/<userdb oid>/3079` | — | — | 1 row |
+
+`base/1` is not template1's own heap — it is `DefaultDBOid`, the namespace §3
+shows template1 and postgres SHARE. `base/5` is not a second live copy either:
+`mirrorCatalogRelToPostgresDB` (`internal/executor/sys_catalog_postgres_db_mirror.go`)
+copies `DefaultDBOid` → `PostgresDBOid` unconditionally, src hard-wired, so the
+reload's `cat.DBOID()` pass can find it. That answers the question the task
+stopped on ("why does `base/5/3079` carry a live image?") — a deliberate,
+database-agnostic mirror, not anything template1-specific.
+
+**Why no reload change can fix it.** A pg_extension row's database scope lives
+ONLY in the in-memory registry; on disk the sole carrier of scope is *which*
+`base/<dbOid>` heap holds the row. Measured directly: before a restart the
+registry is right (`template1=1`, `postgres=0`), after it the row is attributed
+to postgres. Since template1's row and a postgres row occupy the same heap and
+are otherwise identical, no reader of that heap has the information needed to
+attribute it to template1. Teaching the reload to scan more directories — the
+shape the earlier task proposed — cannot recover information that was never
+written.
+
+The user-database column above is the paired control that makes this specific:
+per-database routing WORKS (`NamespaceDBOid(oid) == oid` for an ordinary
+database), and template1 fails only because its oid is the sentinel.
+
+So the extension re-attribution is a **consequence** of §1's collision and
+unblocks with it. It is not separately actionable, and it is now marked `[!]`
+behind the same owner decision.
+
+### A measurement trap this cost two false positives
+
+Heap pages are not flushed at `CREATE EXTENSION`. Reading `base/<db>/3079`
+while the server is still running showed **zero** rows for writes that had
+plainly succeeded, which briefly looked like two new defects (a cross-database
+write being skipped, and a user database not getting its own row). Both
+dissolved when the same files were read after a clean shutdown. Any on-disk
+catalog probe in this area must stop the server first, or it is reading the
+past.

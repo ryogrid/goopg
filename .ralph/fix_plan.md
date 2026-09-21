@@ -2031,9 +2031,10 @@ the whole file's active task between 2026-09-01 and 2026-09-14; **since
       connectable so a `CREATE EXTENSION` there writes base/4 and would be
       cloned into future `CREATE DATABASE`s~~ **FIXED 2026-09-22, see the bu
       slice below**; a template1 install re-attributes to "postgres" on
-      restart (shared bootstrap namespace — **ROOT-CAUSED 2026-09-22, and it
-      is NOT the template1 namespace collision; re-filed as its own task
-      below**); ~~user-db-local `extnamespace`
+      restart (shared bootstrap namespace — **ROOT-CAUSED 2026-09-22; a first
+      write-up called it independent of the template1 namespace collision,
+      which a postgres-side control REFUTED the same day: it IS that
+      collision. Re-filed below and marked `[!]` behind it**); ~~user-db-local `extnamespace`
       falls back to "public" at reload~~ **FIXED 2026-09-22, see the bw
       slice below — and the recorded symptom understated it.**
   - 2026-09-22 (bw): **per-database `pg_namespace` reload**, closing the
@@ -2080,44 +2081,54 @@ the whole file's active task between 2026-09-01 and 2026-09-14; **since
       is the prerequisite for scoping them together later. That scoping is the
       same M0122-0007 family as the template1 collision escalation.
 
-- [ ] **a template1 extension re-attributes to "postgres" on restart**
-  (M0119-0006 bs residual; ROOT-CAUSED 2026-09-22, not fixed).
+- [!] **a template1 extension re-attributes to "postgres" on restart**
+  (M0119-0006 bs residual). **BLOCKED 2026-09-22 on the `[!]` template1
+  namespace collision — it is a CONSEQUENCE of that collision, and the
+  2026-09-22 entry claiming otherwise is corrected below.**
   Kind: bug
   Parent: M0119-0006
+  Movement: none
   - Repro: `psql -d template1 -c "CREATE EXTENSION amcheck"`, restart, then
     count `pg_extension` rows per database. Before: template1=1, postgres=0
-    (correct — the per-database registry works at RUNTIME). After:
-    template1=0, postgres=1.
-  - **The baton's expectation was WRONG and is corrected here: this is NOT
-    subsumed by the template1 namespace collision (`[!]`).** The mechanism is
-    separate and narrower:
-    - `CREATE EXTENSION` in template1 writes its row to `base/1/3079` —
-      template1's OWN heap. Verified by grepping the three bootstrap heaps:
-      `base/1/3079` and `base/5/3079` contain `amcheck`, `base/4/3079` (the
-      template0 control) does not. So the WRITE side is not misrouted.
-    - The reload never scans `base/1`. `reloadUserExtensionsFromHeap` reads
-      `base/<cat.DBOID()>` (= `base/5`) and attributes everything found there
-      to `"postgres"`, then iterates `ListDatabases()` — where the bootstrap
-      databases are skipped because they report `DatabaseOid` **0**
-      (`internal/initdb/open.go:1573` states this outright). template1 is
-      therefore excluded from every per-database reload pass.
-    - `base/5/3079` ALSO holds an `amcheck` image, and the postgres pass
-      reads it as live — which is what produces the re-attribution rather
-      than a plain disappearance.
-  - **Same CLASS as the bw slice fixed in loop \#74** (a per-database reload
-    pass that silently misses some databases), so that fix is the template —
-    but NOT the same cause, and the difference matters: bw's databases were
-    absent from `ListDatabases()` at the time it ran, whereas these are
-    present and skipped by an explicit `dbOid == 0` test.
-  - **The one open question before coding**, and the reason this was not
-    fixed in the same loop: why `base/5/3079` carries a live `amcheck` image
-    at all when the row's own scope heap is `base/1`. The bs slice describes
-    `deleteExtensionCatalogRow` as stamping "the row's own scope heap +
-    re-mirrors", so a deliberate mirror into the catalog's own DBOID heap is
-    the likely source. Simply teaching the reload to scan `base/1` would then
-    register the extension TWICE — once correctly under template1 and once
-    under postgres from the mirror. Establish what the mirror is for before
-    changing either side.
+    (the in-memory registry is correct at RUNTIME). After: template1=0,
+    postgres=1. Reproduced again on a fresh cluster this loop.
+  - **CORRECTION to the earlier entry.** It concluded "the write side is not
+    misrouted, `base/1/3079` is template1's OWN heap". The control that
+    refutes it: doing the same `CREATE EXTENSION` from a **postgres**
+    connection on a fresh cluster yields the IDENTICAL on-disk signature —
+    `base/1/3079` = 1 row, `base/5/3079` = 1 row, `base/4/3079` (template0
+    control) = 0. `base/1` is `DefaultDBOid`, the namespace template1 and
+    postgres SHARE; it is not template1-specific, so the measurement could
+    never have supported the inference drawn from it.
+  - **The open question is answered.** `base/5/3079` carries a live image
+    because `mirrorCatalogRelToPostgresDB`
+    (`internal/executor/sys_catalog_postgres_db_mirror.go`) copies
+    `DefaultDBOid` -> `PostgresDBOid` with the source HARD-WIRED, on every
+    extension write, so the reload's `cat.DBOID()` pass finds it. A
+    database-agnostic mirror, not a template1 special case.
+  - **Why no reload-side fix exists.** A `pg_extension` row's database scope
+    is carried ONLY by the in-memory registry; on disk the sole carrier is
+    WHICH `base/<dbOid>` heap holds the row. template1's row and a postgres
+    row share one heap and are otherwise identical, so no reader of that heap
+    can attribute it to template1. Teaching the reload to scan more
+    directories — the shape the earlier entry proposed — cannot recover
+    information that was never written. The `dbOid == 0` skip at
+    `internal/initdb/open.go:1573` is real but second-order: removing it
+    would change nothing while the heap is shared.
+  - **Paired control that makes this specific**: an ordinary
+    `CREATE DATABASE`d database routes correctly to its own
+    `base/<oid>/3079` (`NamespaceDBOid(oid) == oid`). Per-database routing
+    WORKS; template1 fails only because its oid IS the `DefaultDBOid`
+    sentinel.
+  - **Measurement trap, recorded because it produced two false defects**:
+    heap pages are not flushed at `CREATE EXTENSION`, so reading
+    `base/<db>/3079` on a RUNNING server showed zero rows for writes that had
+    succeeded. Both apparent defects dissolved when the files were read after
+    a clean shutdown. Probe on-disk catalogs only with the server stopped.
+  - **Unblocks with the collision**: whichever of Option A / Option B the
+    owner picks (`docs/design/0100-0149/0119-0006bv-template1-namespace-collision.md`
+    §5, §7), template1 gets a heap of its own and this symptom goes with it.
+    Re-test then rather than attempting it separately.
 
 - [ ] **schemas are registered process-wide, not per database** (measured
   2026-09-22 while fixing the bw slice).

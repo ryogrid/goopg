@@ -1,53 +1,51 @@
 (idle — nothing in flight)
 
-# Loop #75 result — template1 extension re-attribution ROOT-CAUSED (not subsumed)
+# Loop #76 result — the template1 extension re-attribution IS the collision
 
-Banner: nightly run id UNCHANGED (20260922-004850) → PgoutputInterop blocked.
-Took the question the baton set: is M0119-0006's last bs item subsumed by the
-`[!]` template1 namespace collision? **No — and correcting that is the
-result.** No production change this loop.
+Banner: nightly run id still 20260922-004850 → PgoutputInterop ×10 stay
+blocked (wait for the inlined `cluster.log` tail; do NOT re-run locally).
+Banner item 10 → M0119 before M0122, so took M0119-0006's bs residual — the
+task loop #75 left with one open question. No production change.
 
-## Reproduced, then measured the write and read sides separately
-- Repro: `CREATE EXTENSION amcheck` in template1 → before restart
-  template1=1 / postgres=0 (the per-database registry works at RUNTIME);
-  after restart template1=0 / **postgres=1**.
-- **Write side is NOT misrouted**: `base/1/3079` (template1's own heap) and
-  `base/5/3079` both contain `amcheck`; the template0 control `base/4/3079`
-  does not. So CREATE EXTENSION did write to template1's heap.
-- **Read side is the bug**: `reloadUserExtensionsFromHeap` reads
-  `base/<cat.DBOID()>` (= base/5) and attributes everything there to
-  `"postgres"`, then iterates `ListDatabases()` — where bootstrap databases
-  are skipped because they report `DatabaseOid` **0**
-  (`internal/initdb/open.go:1573` says so outright). base/1 is never scanned.
-- `base/5/3079` also holds a LIVE `amcheck` image, which is what makes this a
-  re-attribution rather than a disappearance.
+## The open question is answered
+`mirrorCatalogRelToPostgresDB` (`internal/executor/sys_catalog_postgres_db_mirror.go`)
+copies `DefaultDBOid` → `PostgresDBOid` with the SOURCE HARD-WIRED, on every
+extension write, so the reload's `cat.DBOID()` pass finds the row. Database-
+agnostic, not a template1 special case. That removes the duplicate-row worry
+#75 was blocked on — and refutes its conclusion.
 
-## Same CLASS as loop #74's fix, but NOT the same cause
-bw missed databases because `ListDatabases()` was EMPTY when it ran; these
-are present and skipped by an explicit `dbOid == 0` test. bw's fix is the
-template, not the answer.
+## Loop #75's "not subsumed" is CORRECTED — one-line control
+Same `CREATE EXTENSION` from a **postgres** connection, fresh cluster →
+identical signature: `base/1/3079`=1, `base/5/3079`=1, `base/4`(template0
+control)=0. So `base/1` is the SHARED `DefaultDBOid` heap, not template1's
+own; #75's inference had no support. Paired control: an ordinary
+`CREATE DATABASE`d db routes correctly to its own `base/<oid>/3079` — routing
+WORKS; template1 fails only because its oid IS the sentinel.
 
-## The one open question before coding (why it is not fixed yet)
-Why does `base/5/3079` carry a live `amcheck` image when the row's own scope
-heap is `base/1`? The bs slice describes `deleteExtensionCatalogRow` as
-stamping "the row's own scope heap + re-mirrors", so a deliberate mirror is
-the likely source. Teaching the reload to scan base/1 WITHOUT resolving that
-would register the extension TWICE — correctly under template1 and again
-under postgres from the mirror — turning a wrong-attribution bug into a
-duplicate-row bug. Establish what the mirror is for first.
+## Why no reload-side fix exists (stronger than "deferred")
+A `pg_extension` row's database scope lives ONLY in the in-memory registry; on
+disk the sole scope carrier is WHICH `base/<dbOid>` heap holds it. template1's
+row and a postgres row share one heap and are otherwise identical → no reader
+can attribute it to template1. Scanning more directories cannot recover
+information that was never written. Task marked `[!]` behind the collision.
+
+## MEASUREMENT TRAP — cost two false defects
+Heap pages are NOT flushed at `CREATE EXTENSION`. Reading `base/<db>/3079` on
+a RUNNING server showed ZERO rows for writes that had succeeded; both
+"new defects" dissolved after a clean shutdown. Stop the server before any
+on-disk catalog probe.
 
 ## Gates
-`go build ./...` implied by the unchanged tree; state guard OK; pgbench smoke
-via the commit hook. No value gates — ZERO production diff (verified over
-`internal/ cmd/`).
+state guard; pgbench smoke via the hook. No value gates — ZERO production
+diff (docs + .ralph only). Scratch clusters gt1x76/77/78 stopped and removed;
+ports 5543-5545 confirmed free.
 
 ## Next loop
-Check the nightly run id FIRST. M0119-0006's three bs items are now all
-addressed (two fixed, this one root-caused and re-filed), so unless the
-mirror question is taken up, move to the banner's next milestone: **M0122**
-→ M0131 → M0134 → M0135/M0136 → M0095/M0110.
+M0119-0006's bs residuals are now all closed or `[!]`. Move to the banner's
+next milestone: **M0122** → M0131 → M0134 → M0135/M0136 → M0095/M0110.
+Note M0122-0007 (per-database namespaces) is where Option B would land.
 
-## Owner escalations OPEN — four
+## Owner escalations OPEN — four (unchanged)
 1. M0145-0018 cost-model no-go. 2. M0145-0001 lineage exhausted.
 3. partition_aggregate's inventory row. 4. template1 namespace collision
-(Option A vs B) — with the schema-scoping task depending on it.
+(Option A vs B) — now with TWO dependent tasks: schema scoping and this one.
