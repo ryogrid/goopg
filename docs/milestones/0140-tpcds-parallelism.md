@@ -113,14 +113,14 @@ possible fix as a design question, not an edit.
   orphan; the task now exists as **M0140-0006**.)
 - Q14's third category and the non-planner floor each carry a ledger row naming
   the mechanism and what would unblock them — neither is silently dropped.
-  **K92 and K14/K15 are deliberately left without a follow-up task in this
+  **K92 and K14/K15 were originally left without a follow-up task in this
   group**: K92 needs PG's real partial-inner execution model, and the heap-density
-  floor is a storage-density input no planner change can correct. The ledger row's
-  `why` column must say so, and must name where the work belongs instead — which
-  is what the group's completion rule (`AGENT.md`, "Completion rule for this
-  group") requires of any deferral that has no owner here. **K41 is the
-  exception**: its dimension-table `relpages` divergence is an on-disk defect
-  with a concrete probe, so it *does* have an owner — **M0143-0007**, under the
-  engine carry-overs rather than under a planner milestone.
+  floor is a storage-density input no planner change can correct. **K92 got its
+  owner on 2026-09-21**: `parallel_hash = true` (workers cooperatively building
+  one shared table from a partial inner behind a barrier) is filed as
+  **M0140-0007** — it is M0137-0019 family A's floor. K14/K15 stay deferred
+  (storage-density input, no planner remedy). **K41** likewise has an owner —
+  **M0143-0007**, under the engine carry-overs rather than under a planner
+  milestone.
 - TPC-DS values sweep all-zero; the non-regression floor (TPC-DS match >= 2)
   holds.

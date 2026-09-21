@@ -56,8 +56,10 @@ the order written inside the item. `[!]` tasks are not selectable.
    (B-06 CTE-output statistics — the blocker named by 0003's ANY-CTE
    residue, 0005's `outer-over-derived` decline family, and the Q78
    firewall's own resume condition; completing it triggers a
-   RE-EVALUATION of those unblocks, not automatic lifts). The Q78
-   `outer-over-derived` firewall is a hard constraint on every
+   RE-EVALUATION of those unblocks, not automatic lifts) →
+   **M0145-0010** (parameterized-path legality — the `lateral` decline
+   family; likewise a re-evaluation trigger, not an auto-admit). The
+   Q78 `outer-over-derived` firewall is a hard constraint on every
    pull-up/flattening task.
 4. **M0141-S2a-fix2r** — re-apply the PG-faithful `hashAggEntrySize` change that
    was discarded for parity reasons (owner Q4: no reverts). Degradations it
@@ -71,7 +73,9 @@ the order written inside the item. `[!]` tasks are not selectable.
    not even a trace inside an existing trace guard. If instrumentation is
    genuinely needed, file a separate `Kind: impl` task, run the values gates and
    report the parity numbers (this is what `073ab2748`/`c7e231ae1` got wrong).
-7. **M0140-0006a → 0006b → 0006c** (partial-Append).
+7. **M0140-0006a → 0006b → 0006c** (partial-Append), then
+   **M0140-0007** (`Parallel Hash` from a partial inner — M0137-0019
+   family A's floor).
 8. **M0142-0005**, then **M0142-0016c**, then **M0142-0003i** (0003i only after
    P0-E5 and P0-E6 are `[x]`).
 9. **M0143 remaining tasks**, top to bottom (includes the parser failures).
@@ -2481,6 +2485,12 @@ before/after proving the defect it closes.
     (Q1 Q4 Q5 Q8 Q12 Q16 Q22 Q15a, plus the mirrors Q3 Q18), measured by
     `pg-plan-parity-diff.py` `CATEGORIES:` on a pinned-epoch
     `estimate-audit -plan-only -serial=false` capture against the current 16.
+  - **The unblock tasks are filed (2026-09-21 owner directive):**
+    row-emitting PartialAgg + the GatherMerge-fed merge-combine are
+    **M0141-S3 → S4 → S5 → S6**; the `Parallel Hash` build from a
+    partial inner (family A's floor) is **M0140-0007**. When S6 and
+    0007 land, this task's premise is re-evaluated — measured on the
+    canonical capture, not assumed.
 - [x] **M0137-0019b — file a partial path beneath `Nested Loop Semi Join`**
   (filed by M0137-0019's triage). TPC-H Q4 is the corpus's only fully
   SERIAL plan in parallel mode: goopg plans
@@ -3999,6 +4009,51 @@ setting that yields a serial plan.
     not flatten (LIMIT in subquery) still get the arm — marker sees
     nesting, not flattenability. Design doc:
     `docs/design/0100-0149/m0140-0006c-3-mixed-partial-setop-append.md`.
+- [ ] **M0140-0007 — `Parallel Hash` (`parallel_hash = true`): workers
+  cooperatively build ONE shared table from a PARTIAL inner** (filed
+  2026-09-21 by owner directive; carries ledger
+  `m0140-0005-q14-parallel-hash-execution-model`, K92, and plan-flow doc
+  D3(a)). `addPartialHashJoinPath` files only `parallel_hash = false`
+  (partial outer over a COMPLETE inner, leader-prebuilt shared table —
+  the E-09a/b model); PG's second variant (`try_partial_hashjoin_path`
+  with `parallel_hash = true`, `joinpath.c:1290-1297`, dispatched at
+  :2418+) builds the table cooperatively from a partial inner behind a
+  barrier protocol, and it is REFUSED here
+  (`joinpathsparallel.go`'s own header: "no goopg executor builds a hash
+  table from a partial inner" — the file never reads
+  `inner.PartialPathlist`). This floors M0137-0019's **family A** — 7
+  TPC-H queries (Q3 Q9 Q10 Q14 Q16 Q18 Q21; Q14 the clean witness) —
+  and is the same `unexpressible` class the M0144-0007 census counts and
+  M0145-0008's executor-substrate handoff lists.
+  Scope:
+  - (a) executor — a build input that is itself partial (each worker
+    produces its inner slice), a shared build target all participants
+    publish into, and a build-done barrier before any worker probes.
+    The cooperative-build mechanism ALREADY exists:
+    `parallelBuildLazyHashTable` (`parallel_hash_build.go:596`,
+    M0129-S4.1) partitions a build across producer goroutines into one
+    shared table — the gap is driving it from a partial-inner PATH
+    (extending `prebuildSharedHashJoins`' leader-prebuild call sites),
+    not the mechanism itself. Correctness over speed.
+  - (b) planner — the `parallel_hash = true` arm priced the way PG
+    prices it (build cost spread across participants), not the undivided
+    build the `false` arm charges.
+  - (c) measurement — the family-A witnesses under the canonical
+    parallel TPC-H capture; report `CATEGORIES-EXCL-MATCH`.
+  Hard constraint: the refusal exists because a partial build that
+  misses inner rows silently drops matches (`parallel_scan.go`'s own
+  warning). Any implementation MUST prove the barrier — no probe may run
+  before the shared build completes — and a failed build must fail the
+  query loudly, never return partial results (the coop-build panic
+  precedent: a producer-group error must propagate, not be swallowed).
+  Kind: impl
+  Parent: none
+  - **On completion — reconsider the blocked work (evaluate, do not
+    auto-do):** re-run the family-A witnesses (Q3 Q9 Q10 Q14 Q16 Q18
+    Q21) under the canonical parallel capture; M0137-0019a's family-A
+    classification is re-evaluated only if a `Parallel Hash` node
+    actually appears in those plans — if the shape exists and still
+    loses on cost, THAT is the report, not a defect.
 
 ## M0141 — Upper-planner ordering contest (filed 2026-09-14)
 
@@ -9338,10 +9393,11 @@ cross-layer programme that has never been scoped.
   own `sjinfo.Jointype == parser.JoinSemi` gate excludes regardless of
   Q78's `outer-over-derived` firewall. **Do not pick this up by lifting
   Q78's firewall or waiting on B-06** — that would not unblock it. The
-  actual unblock is unfiled: teach an IN-unnesting path (or a future EXISTS
-  variant) to set `.SJInfo` on a DP-search-visible `JoinSemi` link, the
-  same way c19 did for ANTI. Read design doc §58 before re-running this
-  recon again. Still not
+  actual unblock was filed and landed as **M0142-0008-producer** `[x]`
+  (teach an IN-unnesting path — or a future EXISTS variant — to set
+  `.SJInfo` on a DP-search-visible `JoinSemi` link, the same way c19 did
+  for ANTI). Read design doc §58 before re-running this recon again.
+  Still not
   picked up. Deferred for the same reason as 3c
   otherwise: `sortInnerAndOuter`/`matchUnsortedOuterMerge`/
   `matchUnsortedOuterMergePartial` (merge) and `addPartialNestLoopPaths`
@@ -11906,6 +11962,10 @@ goopg's processing route diverged from PG's upstream of the fix).
   **ESCALATED 2026-09-20 (loop \#49) under AGENT.md S4 — five consecutive
   completed descendants reporting `Movement: none`. No further descendant
   is selected or filed; only the owner reopens this root.**
+  (For when it is reopened: the `unexpressible` substrate floors the
+  slices kept hitting now have filed owners — row-emitting PartialAgg is
+  M0141-S3–S6, parallel-inner hash build is M0140-0007, derived-input
+  statistics is M0145-0009, parameterized-path legality is M0145-0010.)
   - What was tried, and what each step proved:
     - **M0144-0011a** — `inputNodePathkeys` gained an `*Aggregate` arm, so a
       sorted `GroupAggregate` that already emits the ORDER BY order is taken
@@ -12900,8 +12960,9 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
       `outer-over-derived` stays (B-06 CTE-output-stats firewall,
       R42/Q78 — B-06 is filed as **M0145-0009**; its completion note
       carries the firewall's re-evaluation checklist); `lateral` stays
-      (real deps Q30/Q68 — needs parameterized-path legality, a project
-      of its own).
+      (real deps Q30/Q68 — parameterized-path legality, filed as
+      **M0145-0010**; its completion note carries this family's
+      re-evaluation).
     - `leaf-count` dominant cause identified by joinlist-vs-bindings
       probe: FULL-join folds (opaque leaf covering multiple joinlist
       rels, `a FULL b JOIN c` → nprefix 3, scans 2) — the
@@ -13200,7 +13261,9 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
   row-emitting PartialAgg (plan-flow doc D3; M0144-0011c's Materialize
   sizing) are parity-enablers that stay OUT of this milestone — the
   cutover records which census records remain `unexpressible` for that
-  reason so the executor milestone inherits an exact list. Requires
+  reason so the executor milestone inherits an exact list (filed homes:
+  **M0140-0007** for the partial-inner hash build, **M0141-S3–S6** for
+  row-emitting PartialAgg). Requires
   M0145-0006 as well as 0007: the cutover must not retire the stage
   builders while upper-rel elections still live in them.
   Kind: impl
@@ -13285,3 +13348,47 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
       guard's effect on the year_total shapes (ledger step 4).
     - Re-run the pull-up/seam decline census afterwards so the residual
       buckets reflect the new state.
+- [ ] **M0145-0010 — parameterized-path legality: port
+  `reparameterize_path` / `required_outer`** (filed 2026-09-21 by owner
+  directive; carries the `lateral` decline family's resume point). The
+  seam declines `lateral` problems — 8 corpus fires, real lateral
+  dependencies in Q30/Q68, the wall `-3i-lateral-route`'s recon named —
+  and partial-NLI admission stays a jointype whitelist `{INNER, SEMI}`
+  where PG's nestloop dispatch admits `{INNER, LEFT, SEMI, ANTI}`
+  (`joinpath.c:1842-1846`), because PG decides legality from
+  parameterization (`param_info`/`required_outer`), not from an
+  enumerated set. goopg's gap is the REL level: `Path.RequiredOuter`
+  and its calculators already exist (`path.go:404`,
+  `calcNestloopRequiredOuter`/`calcNonNestloopRequiredOuter` in
+  `pathparam.go`, `ppi_rows` pricing in `pathparamindex.go`), but there
+  is no rel-level `param_info`/`lateral_relids` and no
+  `reparameterize_path` re-costing an existing path against a larger
+  outer set. Scope:
+  - (a) the RelOptInfo/jointree leaf gains a `required_outer`/`param_info`
+    relid set — on the jointree arm this is an IR field, on the legacy
+    arm it is another coordinate-translation consumer; prefer whichever
+    arm is default when picked up, and sequencing after M0145-0005
+    avoids building the translation twice.
+  - (b) `reparameterize_path`/`get_param_path_clause_serials` analogues:
+    re-price an existing path under additional outer parameterization
+    (PG `postgres/src/backend/optimizer/util/pathnode.c:4242` and
+    `:1910` respectively — invoked FROM `joinpath.c`), extending the
+    existing `RequiredOuter` machinery rather than building from zero.
+  - (c) legality reads parameterization where PG does — `join_is_legal`
+    and the nestloop dispatch — instead of the whitelist.
+  - (d) executor-capability check FIRST for every newly admitted shape:
+    a parameterized path the executor cannot drive is a new
+    `unexpressible` record, not a win — verify driveability before
+    filing the path. Known asymmetry to check: the executor's ordinary
+    (non-fused) `ordinaryInnerNestedLoopPartial` arm is INNER-ONLY while
+    the planner whitelist admits {INNER, SEMI} — a SEMI/LEFT/ANTI
+    partial NL that reaches it would mis-execute, so the check must
+    cover that arm.
+  Kind: impl
+  Parent: none
+  - **On completion — reconsider the blocked work (evaluate, do not
+    auto-do):** the `lateral` decline family (Q30/Q68 witnesses) on the
+    then-default arm; the partial-NLI whitelist's LEFT/ANTI entries
+    (ledgered "by scope" refusals — admit only where legality says so
+    and the executor check passes); re-run the pull-up/seam decline
+    census afterwards so the buckets reflect the new state.
