@@ -1627,28 +1627,50 @@ heuristic stays live.)
     of a bpchar-typed expression, because `octet_length` re-pads and can
     pass over a live bug.
 
-- [ ] **bpchar-concat-operator — `char(n) || text` must strip the padding**
-  (deferred out of `bpchar-text-function-class`, 2026-09-22). The last of
-  the 13 measured divergences: PG gives `length('ab'::char(6) || 'z')` = 3
-  (the operator is text concatenation, so the operand resolves through the
-  bpchar->text cast); goopg gives 7.
+- [x] **bpchar-concat-operator — `char(n)` concatenation must strip the
+  padding** (deferred out of `bpchar-text-function-class`) — **FIXED
+  2026-09-22 on BOTH evaluators.** This closes the 13th and last divergence
+  the bpchar text-function audit measured, so the whole class is now done.
   Kind: impl
   Parent: none
-  **Why it was not fixed with the other 12, and what the next loop must not
-  do**: the other 12 are `FuncCall` cases whose bodies can see their
-  argument EXPRESSION, which is what carries the declared `char(n)` type —
-  a padded datum is indistinguishable from a text value that genuinely ends
-  in spaces, so the datum alone is not enough. `evalBinary`
-  (`internal/executor/expr.go:1767`) receives only Datums. Threading the
-  operand expressions into it means changing a signature with ~40 callers
-  on a hot path.
-  The cheap-looking shortcut is to coerce at the one production call site
-  (`expr.go:1322`, where the `*optimizer.BinaryOp` still has `Left`/`Right`)
-  — but that is a Hard-won Rule \#2 trap: `exprnode.go:436` is the OTHER
-  evaluator's binary-op site and would keep the old behaviour, giving a
-  fast-path/interpreted split on a value question. Fix BOTH sites or
-  neither, and pin each with its own test.
-  Witness: `select length(c || 'z') from <table with char(6) 'ab'>` = 3.
+  Movement: none — SF0.25 `PLAN-SHAPE same=99 changed=0`; a value
+  correctness fix, which none of S3's three instruments measures.
+  - **The sibling problem this task was deferred for, and how it was
+    solved.** goopg has TWO evaluators for a binary operator — interpreted
+    (`evalExprSlot`) and compiled (`evalFastExpr`) — and the rule needs the
+    operand's DECLARED type, because a blank-padded bpchar datum is
+    indistinguishable from a text value that genuinely ends in spaces. The
+    interpreted twin can read the expression. The compiled twin CANNOT: by
+    evaluation time only Datums remain.
+  - Solved by capturing the width at COMPILE time, which is the last point
+    the operand expression still exists: `buildExprCtx`'s `*optimizer.BinaryOp`
+    arm now stores `declaredBpcharTypmod` for each side in the node payload
+    (`payload[8:12]` / `[12:16]`, previously unused; the field is 40 bytes).
+    Both evaluators then call ONE shared helper, `concatOperandsAsText`, so
+    the rule itself cannot drift between them — only the route by which each
+    obtains the width differs.
+  - Rejected alternative, recorded so it is not retried: threading the
+    operand expressions into `evalBinary` itself. That signature has ~40
+    callers on a hot path, and the compiled twin has no expression to pass.
+  - **The test drives BOTH twins explicitly** rather than going through SQL,
+    and that is deliberate: a SQL-level test exercises whichever evaluator
+    the builder happens to pick and can pass with one twin still broken.
+    Verified non-vacuous PER TWIN — zeroing only the compiled payload fails
+    exactly the compiled assertions while the interpreted ones still pass
+    (the precise Rule \#2 split), and neutralising only the interpreted call
+    fails exactly the interpreted ones.
+  - Third case pinned alongside: a genuine `text` operand whose value really
+    does end in spaces must KEEP them (`'xy  ' || 'z'` is 5). That is what
+    makes "strip by declared type, never by inspecting the datum" the only
+    correct rule, and it would catch a future "just TrimRight the operand"
+    shortcut.
+  - End-to-end witness on a scratch server, matching PG 18.3:
+    `select length(c || 'z')` = 3 for a stored `char(6)` holding 'ab',
+    `length('ab'::char(6) || 'z')` = 3, and the text column = 5.
+  - Only OpConcat is routed through the helper. Equality and ordering on
+    bpchar already ignore trailing blanks inside the comparator
+    (`PGCompareBpcharC`), so sending them through would be a second,
+    redundant rule on a path that is already correct.
 
 - [ ] **testport/TestPort_PgAmcheck003* re-CREATE EXTENSION after restart
   (AI-20260921-000212-004 … -007)** — four pg_amcheck cases FAILed on the

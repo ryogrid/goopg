@@ -238,6 +238,17 @@ func (s *exprTreeSlab) buildExprCtx(e optimizer.Expr, ctx *Context) int32 {
 		// It is compiled in at build time rather than read from orig because
 		// only ExprColumnRef keeps orig. M0127-PS6.2 sibling audit.
 		binary.LittleEndian.PutUint32((*s)[idx].payload[4:], uint32(int32(t.Pos())))
+		// payload[8:12] / [12:16] carry each operand's declared bpchar width,
+		// compiled in here because this is the last point at which the operand
+		// EXPRESSION still exists — evalFastExpr only ever sees Datums, and a
+		// blank-padded bpchar datum is indistinguishable from a text value that
+		// genuinely ends in spaces. Only `||` consumes them
+		// (concatOperandsAsText); storing them unconditionally keeps the build
+		// arm free of an op test. Sibling of the interpreted twin's direct
+		// declaredBpcharTypmod call in expr.go's normalBinaryOp arm — the two
+		// MUST agree, which is why they share one helper.
+		binary.LittleEndian.PutUint32((*s)[idx].payload[8:], uint32(declaredBpcharTypmod(t.Left)))
+		binary.LittleEndian.PutUint32((*s)[idx].payload[12:], uint32(declaredBpcharTypmod(t.Right)))
 		return idx
 
 	case *optimizer.UnaryOp:
@@ -433,6 +444,9 @@ func evalFastExpr(exprs exprTreeSlab, idx int32, slot SlotView, ctx *Context) (D
 				return res, nil
 			}
 		}
+		left, right = concatOperandsAsText(op, left, right,
+			int64(binary.LittleEndian.Uint32(n.payload[8:])),
+			int64(binary.LittleEndian.Uint32(n.payload[12:])))
 		result, err := evalBinary(op, left, right, pos, ctx)
 		if err != nil {
 			return Datum{}, err

@@ -432,3 +432,65 @@ The cheap fix is to coerce at the one production call site where the
 old behaviour, producing a fast-path vs interpreted split on a *value*
 question. Fix both or neither. Filed as `bpchar-concat-operator` with the
 witness and both site references.
+
+## The class is closed (2026-09-22): the concatenation operator, on both twins
+
+The audit above left one divergence open — the concatenation operator — and
+deferred it rather than reaching for the obvious fix. This section records
+why, and what the shape of the eventual fix teaches.
+
+PostgreSQL has no bpchar concatenation operator. The bpchar operand resolves
+through the implicit bpchar→text cast (`rtrim1`), so the padding is stripped
+*before* concatenation: on PG 18.3 a `char(6)` holding `'ab'` concatenated
+with `'z'` has length 3, not 7.
+
+### Why it could not be done with the other twelve
+
+The rule needs the operand's **declared type**, never the datum: a
+blank-padded bpchar image is indistinguishable from a text value that
+genuinely ends in spaces. The twelve function cases are `FuncCall`s whose
+bodies still have their argument expression. A binary operator does not —
+and goopg evaluates one through **two** engines:
+
+| evaluator | has the operand expression? |
+|---|---|
+| interpreted (`evalExprSlot`) | yes |
+| compiled (`evalFastExpr`) | **no** — only Datums remain |
+
+Coercing at the interpreted call site alone was the cheap fix, and it was
+the trap: it would have left the compiled twin on the old behaviour, giving
+a fast-path-vs-interpreted split on a **value** question. That is the
+Hard-won Rule #2 failure shape exactly.
+
+### The fix: capture the width where the expression still exists
+
+`buildExprCtx`'s `BinaryOp` arm compiles `declaredBpcharTypmod` for each
+side into the node payload (`payload[8:12]` / `[12:16]`, previously unused
+in a 40-byte field). Compile time is the *last* point at which the operand
+expression exists, so that is where the declared type has to be captured.
+Both evaluators then call one shared helper, `concatOperandsAsText`: the
+route to the width differs per engine, but the rule lives in one place and
+cannot drift.
+
+Rejected, recorded so it is not retried: threading operand expressions into
+`evalBinary`. That signature has ~40 callers on a hot path, and the compiled
+twin has no expression to pass anyway.
+
+### The test design is the transferable part
+
+The test drives **both** twins explicitly instead of going through SQL. A
+SQL-level test exercises whichever evaluator the builder happens to pick,
+and would therefore pass with one twin still broken — it cannot see the
+defect it exists to prevent.
+
+Non-vacuity was verified *per twin*: zeroing only the compiled payload fails
+exactly the compiled assertions while the interpreted ones still pass (the
+Rule #2 split, reproduced deliberately), and neutralising only the
+interpreted call fails exactly the interpreted ones.
+
+A third case pins that a genuine `text` operand whose value really does end
+in spaces **keeps** them. That is what makes "strip by declared type" rather
+than "inspect the datum" the only correct rule, and it would catch a future
+`TrimRight`-the-operand shortcut.
+
+With this, all 13 divergences the audit measured are closed.

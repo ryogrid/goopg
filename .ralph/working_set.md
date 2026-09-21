@@ -1,55 +1,51 @@
 (idle — nothing in flight)
 
-# Loop #63 result — bpchar-text-function-class CLOSED (12 of 13)
+# Loop #64 result — bpchar-concat-operator FIXED; the whole bpchar class is CLOSED
 
-Banner: items 0-9 unchanged (item 3 blocked by M0145-0001 `[!]`; item 10's
-`partition_aggregate` is `[!]` awaiting an owner ruling). First open
-item-10 task in document order was `bpchar-text-function-class`.
+Banner: items 0-9 unchanged (item 3 blocked by M0145-0001 `[!]`;
+`partition_aggregate` is `[!]` awaiting an owner ruling). First open item-10
+task in document order was `bpchar-concat-operator` — the 13th and last
+divergence the loop-63 audit measured.
 
-## Method: audited by MEASUREMENT, not by reading
-One query computing `length(f('ab'::char(6)))` over 22 candidate string
-functions, run against the PG 18.3 reference (SELECT-only) and a private
-goopg scratch on :5533, then diffed. 13 divergences, 9 already correct.
+## The sibling problem, and how it was solved
+The rule needs the operand's DECLARED type (a padded bpchar datum is
+indistinguishable from a text value that genuinely ends in spaces), and
+goopg evaluates a binary operator through TWO engines:
+- interpreted `evalExprSlot` — HAS the operand expression;
+- compiled `evalFastExpr` — does NOT; by eval time only Datums remain.
 
-## The finding that mattered most: the rule is NOT uniform
-`concat`, `concat_ws` and `format`'s `%s` **KEEP** the padding in PG
-(measured 7 / 8 / 6 on a `char(6)` holding 'ab') because they take variadic
-`any` and go through the type's OUTPUT function, not a bpchar->text cast.
-goopg already matched on all three. Applying one rule everywhere — the
-obvious reading of "text functions strip" — would have introduced THREE new
-divergences. They are now pinned as NON-stripping so a later loop cannot
-"fix" them into a consistency upstream does not have.
+Fixed by capturing `declaredBpcharTypmod` for each side at COMPILE time
+(`buildExprCtx`'s BinaryOp arm, into the previously-unused
+`payload[8:12]`/`[12:16]` of a 40-byte field) — compile time is the LAST
+point the operand expression exists. Both twins then call one shared helper
+`concatOperandsAsText`, so the RULE cannot drift; only the route to the
+width differs.
 
-## Sibling miss caught by the enumeration
-`length` was fixed in M0143-0007b slice 1; its aliases
-`char_length`/`character_length` are a SEPARATE case in the same switch and
-were still padded. Nothing in the corpus caught it — only the enumeration.
+REJECTED and recorded: threading operand exprs into `evalBinary` (~40
+callers, hot path, and the compiled twin has no expr to pass).
 
-## Fixed (12)
-repeat, char_length, character_length, ltrim, replace, translate,
-split_part, left, right, reverse, quote_literal, quote_ident,
-regexp_replace — via one `coerceBpcharArgDatum` normalisation per function
-(regexp_replace reads its subject 4x; per-use patching would strip in some
-branches only). Bytea branches untouched.
-
-## Deferred, deliberately: `bpchar-concat-operator` (filed)
-`length('ab'::char(6) || 'z')` is 3 in PG, 7 in goopg. `evalBinary`
-(expr.go:1767) receives only Datums, and the declared type is what decides
-this. The cheap fix — coerce at expr.go:1322 — is a **Rule #2 trap**:
-`exprnode.go:436` is the OTHER evaluator's binary-op site and would keep the
-old behaviour, a fast-path/interpreted split on a VALUE question. Fix BOTH
-or neither. Witness recorded in the task.
+## Test design is the transferable part
+The test drives BOTH twins explicitly instead of going through SQL, because
+a SQL test exercises whichever evaluator the builder happens to pick and can
+pass with one twin still broken. Non-vacuity verified PER TWIN: zeroing only
+the compiled payload fails exactly the compiled assertions while the
+interpreted ones still pass (the Rule #2 split, reproduced on purpose);
+neutralising only the interpreted call fails exactly the interpreted ones.
+A third case pins that a genuine `text` operand whose value really ends in
+spaces KEEPS them — what makes strip-by-declared-type the only correct rule.
 
 ## Gates (all green)
 units; FULL upstream regress suite (Rule #5) unchanged — only the known
 `partition_aggregate`; tpch-spotcheck Q12=2/Q13=33; tpcds-sf025
 `PLAN-SHAPE same=99 changed=0`; acceptance arm 24/24 value-MATCH; pgbench
-smoke via hook. Test non-vacuous: pre-fix `expr.go` fails exactly 13
-subtests. Scratch server on :5533 stopped and removed.
+smoke via hook. End-to-end SQL witness on a scratch server matched PG:
+`length(c || 'z')`=3, `length('ab'::char(6) || 'z')`=3, text column=5.
+Scratch server stopped and removed.
 
 ## Next loop
-Item 10 continues: `bpchar-concat-operator`, then PgAmcheck003 x4
-(-002..-005), PgoutputInterop x10 (-006..-015).
+Item 10 continues: **PgAmcheck003 x4** (AI-…-002..-005, "re-CREATE
+EXTENSION amcheck after restart"), then PgoutputInterop x10 (-006..-015).
+No bpchar work remains — all 13 measured divergences are closed.
 
 ## Owner escalations OPEN — three
 1. M0145-0018 cost-model no-go. 2. M0145-0001 lineage exhausted (blocks all

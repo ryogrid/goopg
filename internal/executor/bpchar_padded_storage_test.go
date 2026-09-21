@@ -4,6 +4,8 @@ import (
 	"testing"
 
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/optimizer"
+	"github.com/goopg/goopg/internal/parser"
 )
 
 // TestBpcharStoredPaddedAndRenderBoundariesStayInert is M0143-0007b slice 1's
@@ -287,6 +289,96 @@ func TestBpcharTextFunctionClassMatchesPG(t *testing.T) {
 			if d.Kind != KindInt || d.Int != tc.want {
 				t.Errorf("%s = %v (kind %d), want %d (measured on PG 18.3)",
 					tc.sql, d.Format(), d.Kind, tc.want)
+			}
+		})
+	}
+}
+
+// TestBpcharConcatOperatorStripsOnBothEvaluators pins the LAST of the 13
+// divergences the bpchar text-function audit measured, and pins it on BOTH
+// evaluators at once.
+//
+// PostgreSQL has no bpchar concatenation operator: `char(n) || text` resolves
+// the bpchar operand through the implicit bpchar->text cast, `rtrim1`
+// (pg_cast.dat, `text(bpchar)`), so the padding is stripped BEFORE the
+// concatenation. Measured on PG 18.3: `length('ab'::char(6) || 'z')` is 3.
+// goopg returned 7 once M0143-0007b's slice 1 made storage blank-padded.
+//
+// Why this test drives the compiled twin explicitly rather than trusting a
+// SQL-level check: goopg has TWO evaluators for a binary operator — the
+// interpreted `evalExprSlot` and the compiled `evalFastExpr` — and they obtain
+// the operand's DECLARED type by different routes. The interpreted one reads
+// it off the expression; the compiled one cannot, because by evaluation time
+// only Datums remain, so the width is compiled into the node payload instead.
+// Fixing one and not the other would produce a fast-path vs interpreted split
+// on a VALUE question, which is exactly the Hard-won Rule #2 failure shape.
+// A SQL-level test would exercise whichever evaluator the builder happened to
+// pick and could pass with one twin still broken.
+func TestBpcharConcatOperatorStripsOnBothEvaluators(t *testing.T) {
+	bpcharCol := &optimizer.ColumnRef{
+		Index: 0,
+		Name:  "c",
+		Type:  catalog.Type{Name: "bpchar", Args: []int64{6}},
+	}
+	// A plain text column at index 1: its trailing spaces are DATA and must
+	// survive, which is what makes "strip by declared type, never by looking
+	// at the datum" the only correct rule.
+	textCol := &optimizer.ColumnRef{
+		Index: 1,
+		Name:  "t",
+		Type:  catalog.Type{Name: "text"},
+	}
+
+	cases := []struct {
+		name string
+		expr optimizer.Expr
+		want string
+	}{
+		{
+			name: "bpchar left operand is stripped",
+			expr: &optimizer.BinaryOp{Op: parser.OpConcat, Left: bpcharCol,
+				Right: &optimizer.StringConst{Value: "z"}},
+			want: "abz",
+		},
+		{
+			name: "bpchar right operand is stripped",
+			expr: &optimizer.BinaryOp{Op: parser.OpConcat,
+				Left: &optimizer.StringConst{Value: "z"}, Right: bpcharCol},
+			want: "zab",
+		},
+		{
+			name: "text operand keeps its trailing spaces",
+			expr: &optimizer.BinaryOp{Op: parser.OpConcat, Left: textCol,
+				Right: &optimizer.StringConst{Value: "z"}},
+			want: "xy  z",
+		},
+	}
+
+	// c = a padded char(6) 'ab'; t = a text value that genuinely ends in spaces.
+	row := Row{NewStringDatum("ab    "), NewStringDatum("xy  ")}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			slot := SlotFromRow(nil, row)
+			got, err := evalExprSlot(c.expr, slot, nil)
+			if err != nil {
+				t.Fatalf("interpreted: %v", err)
+			}
+			if got.StringValue() != c.want {
+				t.Errorf("interpreted = %q, want %q (PG 18.3)", got.StringValue(), c.want)
+			}
+
+			var slab exprTreeSlab
+			idx := slab.buildExpr(c.expr)
+			fast, err := evalFastExpr(slab, idx, slot, nil)
+			if err != nil {
+				t.Fatalf("compiled: %v", err)
+			}
+			if fast.StringValue() != c.want {
+				t.Errorf("compiled = %q, want %q (PG 18.3) — the compiled twin "+
+					"reads the declared width from the node payload; if only "+
+					"this half fails, the width was not compiled in",
+					fast.StringValue(), c.want)
 			}
 		})
 	}

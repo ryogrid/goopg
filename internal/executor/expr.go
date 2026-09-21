@@ -1319,6 +1319,12 @@ func evalExprSlot(e optimizer.Expr, slot SlotView, ctx *Context) (Datum, error) 
 			}
 		}
 	normalBinaryOp:
+		// The interpreted twin reads the declared widths straight off the
+		// operand expressions. Its compiled twin cannot (the expression is
+		// gone by then) and reads them from the node payload instead — see
+		// exprnode.go's ExprBinaryOp arm. Both then apply the same helper.
+		left, right = concatOperandsAsText(x.Op, left, right,
+			declaredBpcharTypmod(x.Left), declaredBpcharTypmod(x.Right))
 		result, err := evalBinary(x.Op, left, right, x.Pos(), ctx)
 		if err != nil {
 			return Datum{}, err
@@ -11539,6 +11545,43 @@ func stringFuncArgTypeName(k DatumKind) string {
 // the same default synthesizeBareCharTypmod applies to casts and the bare-char
 // column type carries. Used by octet_length, whose PG implementation
 // (bpcharoctetlen) returns the blank-PADDED datum size. M0119-0006 (65th slice).
+// concatOperandsAsText applies upstream's bpchar->text coercion to the operands
+// of `||` before they are concatenated.
+//
+// PostgreSQL has no bpchar concatenation operator: `char(n) || text` resolves
+// the bpchar operand through the implicit bpchar->text cast, which is `rtrim1`
+// (pg_cast.dat, `text(bpchar)`), so the blank padding is stripped BEFORE the
+// concatenation. Measured on PG 18.3: `length('ab'::char(6) || 'z')` is 3, not
+// 7. goopg satisfied this by accident until M0143-0007b's slice 1 flipped
+// bpchar storage from trimmed to blank-padded.
+//
+// The DECLARED type decides this, never the datum: a padded image is
+// indistinguishable from a text value that genuinely ends in spaces. lbp/rbp
+// are each side's `declaredBpcharTypmod` (0 when the operand is not a
+// width-carrying bpchar), which is why this helper takes them as parameters —
+// the two evaluators obtain them differently (see the callers) but must apply
+// the identical rule, so the rule itself lives here once.
+//
+// Only OpConcat is affected. Equality and ordering on bpchar already ignore
+// trailing blanks in the comparator (`PGCompareBpcharC`), so they must NOT be
+// routed through here.
+func concatOperandsAsText(op parser.OpCode, left, right Datum, lbp, rbp int64) (Datum, Datum) {
+	if op != parser.OpConcat {
+		return left, right
+	}
+	if lbp > 0 && left.Kind == KindString {
+		if t := strings.TrimRight(left.StringValue(), " "); t != left.StringValue() {
+			left = NewStringDatum(t)
+		}
+	}
+	if rbp > 0 && right.Kind == KindString {
+		if t := strings.TrimRight(right.StringValue(), " "); t != right.StringValue() {
+			right = NewStringDatum(t)
+		}
+	}
+	return left, right
+}
+
 // coerceBpcharArgDatum applies upstream's bpchar->text coercion to a whole
 // Datum, for a TEXT-declared function whose body reads its argument in more
 // than one place. It is the Datum-level twin of bpcharArgAsText: normalising
