@@ -216,3 +216,78 @@ func TestBpcharCastAndTextFunctionsMatchPG(t *testing.T) {
 		})
 	}
 }
+
+// TestBpcharTextFunctionClassMatchesPG closes the class M0143-0007b's storage
+// flip opened: PostgreSQL has no bpchar overload for the text functions, so a
+// `char(n)` argument resolves through the implicit bpchar->text cast, which is
+// `rtrim1` (pg_cast.dat, `text(bpchar)`), and the blank padding is stripped
+// before the function runs. goopg satisfied this by accident while storage was
+// trimmed.
+//
+// Every expectation below was MEASURED on a live PG 18.3 rather than reasoned
+// out, and that mattered: the rule is NOT uniform. `concat`, `concat_ws` and
+// `format`'s %s take variadic "any" and go through the type's OUTPUT function
+// instead of a cast, so they KEEP the padding. Those three are pinned here
+// alongside the stripping ones precisely so a later loop does not "fix" them
+// into consistency — the inconsistency is upstream's.
+//
+// WITNESS DESIGN: the length is taken of the FUNCTION'S RESULT, never with
+// `octet_length` of a bpchar-typed expression. `octet_length` is one of the
+// PadBpchar re-padding render callers and reports the padded width whether or
+// not the value was stripped, so a test written on it can pass over a live
+// bug — which is exactly what happened to the first version of the cast test
+// in this file.
+func TestBpcharTextFunctionClassMatchesPG(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	for _, ddl := range []string{
+		`create table bfn(c char(6))`,
+		`insert into bfn values ('ab')`,
+	} {
+		if err := runDDL(t, ctx, ddl); err != nil {
+			t.Fatalf("%s: %v", ddl, err)
+		}
+	}
+
+	cases := []struct {
+		name string
+		sql  string
+		want int64
+	}{
+		// --- the text-declared family: the cast strips first ---
+		{"repeat", `select length(repeat(c,2)) from bfn`, 4},
+		{"char_length", `select char_length(c) from bfn`, 2},
+		{"character_length", `select character_length(c) from bfn`, 2},
+		{"ltrim", `select length(ltrim(c)) from bfn`, 2},
+		{"replace", `select length(replace(c,'q','y')) from bfn`, 2},
+		{"translate", `select length(translate(c,'q','y')) from bfn`, 2},
+		{"split_part", `select length(split_part(c,'q',1)) from bfn`, 2},
+		{"left", `select length(left(c,3)) from bfn`, 2},
+		{"right", `select length(right(c,3)) from bfn`, 2},
+		{"reverse", `select length(reverse(c)) from bfn`, 2},
+		{"quote_literal", `select length(quote_literal(c)) from bfn`, 4},
+		{"quote_ident", `select length(quote_ident(c)) from bfn`, 2},
+		{"regexp_replace", `select length(regexp_replace(c,'q','y')) from bfn`, 2},
+		// --- the variadic-"any" family: PG KEEPS the padding. Not a bug. ---
+		{"concat keeps padding", `select length(concat(c,'z')) from bfn`, 7},
+		{"concat_ws keeps padding", `select length(concat_ws('-',c,'z')) from bfn`, 8},
+		{"format %s keeps padding", `select length(format('%s',c)) from bfn`, 6},
+		// --- already correct before this change; kept as the control group ---
+		{"btrim", `select length(btrim(c)) from bfn`, 2},
+		{"rtrim", `select length(rtrim(c)) from bfn`, 2},
+		{"lpad", `select length(lpad(c,8,'x')) from bfn`, 8},
+		{"rpad", `select length(rpad(c,8,'x')) from bfn`, 8},
+		{"strpos", `select strpos(c,'b') from bfn`, 2},
+		{"ascii", `select ascii(c) from bfn`, 97},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			d, _ := byteaExprResult(t, ctx, tc.sql)
+			if d.Kind != KindInt || d.Int != tc.want {
+				t.Errorf("%s = %v (kind %d), want %d (measured on PG 18.3)",
+					tc.sql, d.Format(), d.Kind, tc.want)
+			}
+		})
+	}
+}

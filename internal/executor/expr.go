@@ -11539,6 +11539,30 @@ func stringFuncArgTypeName(k DatumKind) string {
 // the same default synthesizeBareCharTypmod applies to casts and the bare-char
 // column type carries. Used by octet_length, whose PG implementation
 // (bpcharoctetlen) returns the blank-PADDED datum size. M0119-0006 (65th slice).
+// coerceBpcharArgDatum applies upstream's bpchar->text coercion to a whole
+// Datum, for a TEXT-declared function whose body reads its argument in more
+// than one place. It is the Datum-level twin of bpcharArgAsText: normalising
+// once, right after the argument is evaluated, is safer than rewriting every
+// s.StringValue() inside a body (regexp_replace alone reads its subject four
+// times, and missing one would strip in some branches but not others).
+//
+// Non-string datums pass through untouched, so the bytea branches of ltrim /
+// reverse / btrim are unaffected.
+//
+// NOTE the asymmetry this does NOT cover, verified on live PG 18.3: `concat`,
+// `concat_ws` and `format`'s %s KEEP the padding, because they take variadic
+// "any" and go through the type's OUTPUT function rather than a bpchar->text
+// cast. goopg already matches PG on all three. Do not "fix" them.
+func coerceBpcharArgDatum(arg optimizer.Expr, d Datum) Datum {
+	if d.Kind != KindString {
+		return d
+	}
+	if t := bpcharArgAsText(arg, d.StringValue()); t != d.StringValue() {
+		return NewStringDatum(t)
+	}
+	return d
+}
+
 // bpcharArgAsText applies upstream's bpchar->text coercion to a value that a
 // TEXT-typed function is about to consume. PostgreSQL has no `lower(bpchar)` /
 // `upper(bpchar)`; those calls resolve through the implicit bpchar->text cast,
@@ -14572,6 +14596,7 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 			if err != nil || s.IsNull() {
 				return NullDatum, nil
 			}
+			s = coerceBpcharArgDatum(x.Args[0], s)
 			n, err := evalExprSlot(x.Args[1], slot, ctx)
 			if err != nil || n.IsNull() {
 				return NullDatum, nil
@@ -14590,6 +14615,7 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 			if err != nil || s.IsNull() {
 				return NullDatum, nil
 			}
+			s = coerceBpcharArgDatum(x.Args[0], s)
 			return Datum{Kind: KindInt, Int: int64(len([]rune(s.StringValue())))}, nil
 		}
 	case "length":
@@ -14767,6 +14793,7 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 			if err != nil || s.IsNull() {
 				return NullDatum, nil
 			}
+			s = coerceBpcharArgDatum(x.Args[0], s)
 			// PG: postgres/src/backend/utils/adt/oracle_compat.c:638-703
 			// (dobyteatrim / bytealtrim) — same byte-set semantics as btrim.
 			if s.Kind == KindBytes {
@@ -14947,6 +14974,7 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 			if e1 != nil || e2 != nil || e3 != nil || s.IsNull() {
 				return NullDatum, nil
 			}
+			s = coerceBpcharArgDatum(x.Args[0], s)
 			return NewStringDatum(strings.ReplaceAll(s.StringValue(), f.StringValue(), t.StringValue())), nil
 		}
 	case "translate":
@@ -14958,6 +14986,7 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 			if e1 != nil || e2 != nil || e3 != nil || s.IsNull() {
 				return NullDatum, nil
 			}
+			s = coerceBpcharArgDatum(x.Args[0], s)
 			return NewStringDatum(translateStr(s.StringValue(), f.StringValue(), t.StringValue())), nil
 		}
 	case "strpos", "position":
@@ -14986,6 +15015,7 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 			if e1 != nil || e2 != nil || e3 != nil || s.IsNull() || d.IsNull() || n.IsNull() {
 				return NullDatum, nil
 			}
+			s = coerceBpcharArgDatum(x.Args[0], s)
 			fldnum := int(n.Int)
 			// field number is 1 based
 			if fldnum == 0 {
@@ -15095,6 +15125,7 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 			if e1 != nil || e2 != nil || s.IsNull() || n.IsNull() {
 				return NullDatum, nil
 			}
+			s = coerceBpcharArgDatum(x.Args[0], s)
 			runes := []rune(s.StringValue())
 			cnt := int(n.Int)
 			if cnt < 0 {
@@ -15111,6 +15142,7 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 			if e1 != nil || e2 != nil || s.IsNull() || n.IsNull() {
 				return NullDatum, nil
 			}
+			s = coerceBpcharArgDatum(x.Args[0], s)
 			runes := []rune(s.StringValue())
 			cnt := int(n.Int)
 			if cnt < 0 {
@@ -15145,6 +15177,7 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 			if err != nil || s.IsNull() {
 				return NullDatum, nil
 			}
+			s = coerceBpcharArgDatum(x.Args[0], s)
 			if s.Kind == KindBytes {
 				// bytea_reverse (postgres/src/backend/utils/adt/varlena.c:3458-3474)
 				// is a plain byte-for-byte reversal, no codepoint awareness.
@@ -15195,6 +15228,7 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 			if err != nil || s.IsNull() {
 				return NewStringDatum("NULL"), nil
 			}
+			s = coerceBpcharArgDatum(x.Args[0], s)
 			return NewStringDatum(pgQuoteLiteral(s.StringValue())), nil
 		}
 	case "quote_ident":
@@ -15203,6 +15237,7 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 			if err != nil || s.IsNull() {
 				return NullDatum, nil
 			}
+			s = coerceBpcharArgDatum(x.Args[0], s)
 			// PG's quote_ident only adds double quotes when the identifier
 			// would not survive a re-parse unquoted (uppercase, special chars,
 			// leading digit, empty); a plain lowercase identifier is returned
@@ -15238,6 +15273,7 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 			if e1 != nil || e2 != nil || e3 != nil || s.IsNull() || pat.IsNull() {
 				return NullDatum, nil
 			}
+			s = coerceBpcharArgDatum(x.Args[0], s)
 			flagsStr := ""
 			start := int64(1)
 			n := int64(1)

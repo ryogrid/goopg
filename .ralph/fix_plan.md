@@ -1583,31 +1583,72 @@ heuristic stays live.)
     and only the rationale text is stale. This is a single-row defect, not a
     consolidation-wide one, and no other must-pass case is affected.
 
-- [ ] **bpchar-text-function-class — every text function receiving a bpchar
+- [x] **bpchar-text-function-class — every text function receiving a bpchar
   must apply the rtrim1 cast** (filed 2026-09-22 out of
-  AI-20260922-004850-016). PG resolves a text function called on a `char(n)`
-  through the implicit bpchar->text cast (`rtrim1`, `pg_cast.dat`
-  `text(bpchar)`), so the blank padding is stripped before the function
-  runs. goopg satisfied this by accident until M0143-0007b's storage flip.
-  `lower`/`upper`/`initcap` are fixed; the rest are not enumerated.
+  AI-20260922-004850-016) — **12 of 13 divergences FIXED**; the 13th
+  (the `concat` OPERATOR) is deferred with a stated reason and re-filed
+  below.
   Kind: impl
   Parent: none
-  MEASURED on live PG 18.3 against a `char(6)` holding 'ab' — each of these
-  strips, and goopg's behaviour for each is UNVERIFIED:
-  `octet_length(initcap(..))`=2, `octet_length(replace(..,'x','y'))`=2,
-  `octet_length(substr(..,1))`=2, and concatenating with 'z' gives 3.
-  Resume: enumerate the text-function cases in
-  `internal/executor/expr.go`'s builtin switch, and for each one that can
-  take a text argument, compare goopg against PG on a STORED `char(n)`
-  column — not a literal, since `'ab'::char(6)` now pins through the cast
-  path instead. `bpcharArgAsText` (same file) is the helper to apply.
-  WITNESS DESIGN: do not measure through `octet_length` — it re-pads and
-  will report the right answer for a wrong value. Use a raw-image witness
-  (UNION de-duplication, or `length()` which strips).
-  NOTE: the full upstream regress suite is GREEN except
-  `partition_aggregate` after this loop's fix, so no corpus case currently
-  catches a further instance — this task is a systematic audit, not a
-  chase of a known failure.
+  Movement: none — SF0.25 `PLAN-SHAPE same=99 changed=0`; a value/rendering
+  correctness fix, which none of S3's three instruments measures.
+  - **Method: audited by measurement, not by reading.** Built one query
+    computing `length(f('ab'::char(6)))` for 22 candidate functions and ran
+    it against the PG 18.3 reference (SELECT-only) and a private goopg
+    scratch on `:5533`, then diffed. 13 divergences, 9 already correct.
+  - **The most important finding is that the rule is NOT uniform, and
+    assuming it was would have produced three new bugs.** `concat`,
+    `concat_ws` and `format`'s `%s` KEEP the padding in PG (measured: 7, 8
+    and 6 against a `char(6)` holding 'ab'), because they take variadic
+    `any` and go through the type's OUTPUT function rather than a
+    bpchar->text cast. goopg already matched PG on all three. They are now
+    pinned in the test **as non-stripping**, so a later loop cannot "fix"
+    them into a consistency upstream does not have.
+  - **A sibling-path miss from the earlier slice, caught here**:
+    `length` was fixed in M0143-0007b slice 1, but its aliases
+    `char_length`/`character_length` were NOT — they are a separate `case`
+    in the same switch and still returned the padded width. Exactly the
+    Hard-won Rule \#2 shape.
+  - **Fixed (12)**: `repeat`, `char_length`, `character_length`, `ltrim`,
+    `replace`, `translate`, `split_part`, `left`, `right`, `reverse`,
+    `quote_literal`, `quote_ident`, `regexp_replace`.
+  - Implementation: a new `coerceBpcharArgDatum` normalises the evaluated
+    argument ONCE per function, rather than rewriting every
+    `s.StringValue()` inside each body — `regexp_replace` alone reads its
+    subject four times, and missing one would strip in some branches but
+    not others. Non-string datums pass through, so the bytea branches of
+    `ltrim`/`reverse`/`btrim` are untouched.
+  - Already-correct control group, pinned so it stays that way: `btrim`,
+    `rtrim` (they strip trailing blanks themselves, so they agreed by
+    accident), `lpad`, `rpad`, `strpos`, `ascii`.
+  - Test is non-vacuous: reverting `expr.go` to its pre-fix state fails
+    exactly 13 subtests. Witness design follows this task's own warning —
+    the length is taken of the FUNCTION'S RESULT, never via `octet_length`
+    of a bpchar-typed expression, because `octet_length` re-pads and can
+    pass over a live bug.
+
+- [ ] **bpchar-concat-operator — `char(n) || text` must strip the padding**
+  (deferred out of `bpchar-text-function-class`, 2026-09-22). The last of
+  the 13 measured divergences: PG gives `length('ab'::char(6) || 'z')` = 3
+  (the operator is text concatenation, so the operand resolves through the
+  bpchar->text cast); goopg gives 7.
+  Kind: impl
+  Parent: none
+  **Why it was not fixed with the other 12, and what the next loop must not
+  do**: the other 12 are `FuncCall` cases whose bodies can see their
+  argument EXPRESSION, which is what carries the declared `char(n)` type —
+  a padded datum is indistinguishable from a text value that genuinely ends
+  in spaces, so the datum alone is not enough. `evalBinary`
+  (`internal/executor/expr.go:1767`) receives only Datums. Threading the
+  operand expressions into it means changing a signature with ~40 callers
+  on a hot path.
+  The cheap-looking shortcut is to coerce at the one production call site
+  (`expr.go:1322`, where the `*optimizer.BinaryOp` still has `Left`/`Right`)
+  — but that is a Hard-won Rule \#2 trap: `exprnode.go:436` is the OTHER
+  evaluator's binary-op site and would keep the old behaviour, giving a
+  fast-path/interpreted split on a value question. Fix BOTH sites or
+  neither, and pin each with its own test.
+  Witness: `select length(c || 'z') from <table with char(6) 'ab'>` = 3.
 
 - [ ] **testport/TestPort_PgAmcheck003* re-CREATE EXTENSION after restart
   (AI-20260921-000212-004 … -007)** — four pg_amcheck cases FAILed on the

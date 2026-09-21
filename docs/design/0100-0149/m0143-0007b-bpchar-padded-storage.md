@@ -376,3 +376,59 @@ string concatenation all strip. Filed as `bpchar-text-function-class` with a
 ledger row. No corpus case currently catches a further instance — the full
 upstream regress suite is green apart from `partition_aggregate`, which is an
 unrelated partitionwise-aggregation gap.
+
+## The class, closed by measurement (2026-09-22)
+
+The follow-on above fixed `lower`/`upper`/`initcap` and left the general
+question open: which other text functions receiving a `char(n)` were still
+reading the padded image? That was answered by measuring, not by reading the
+source — one query computing `length(f('ab'::char(6)))` for 22 candidate
+functions, run against the PG 18.3 reference and a private goopg scratch,
+then diffed. 13 divergences, 9 already correct.
+
+### The rule is not uniform, and assuming it was would have added bugs
+
+| family | behaviour on a `char(n)` arg | why |
+|---|---|---|
+| declared `text` (`repeat`, `ltrim`, `replace`, `left`, `reverse`, …) | **strips** | resolves through the implicit bpchar→text cast, `rtrim1` |
+| variadic `any` (`concat`, `concat_ws`, `format` `%s`) | **keeps the padding** | goes through the type's OUTPUT function, not a cast |
+
+Measured on PG 18.3 against a `char(6)` holding `'ab'`: `concat` → 7,
+`concat_ws` → 8, `format('%s', …)` → 6. goopg already matched upstream on
+all three. They are now pinned in the test **as non-stripping**, so a later
+loop cannot "fix" them into a consistency upstream does not have. Had the
+class been closed by applying one rule everywhere — the obvious reading of
+"text functions strip" — those three would have become new divergences.
+
+### A sibling-path miss the audit caught
+
+`length` was fixed in slice 1. Its aliases `char_length` and
+`character_length` are a **separate `case` in the same switch** and still
+returned the padded width. Nothing in the corpus caught it; only the
+enumeration did. This is the Hard-won Rule #2 shape at its smallest scale —
+two spellings of one upstream function, fixed apart.
+
+### Implementation note
+
+`coerceBpcharArgDatum` normalises the evaluated argument **once** per
+function, instead of rewriting every `s.StringValue()` inside each body.
+`regexp_replace` alone reads its subject four times; patching call-by-call
+would have stripped in some branches and not others. Non-string datums pass
+through untouched, so the bytea branches of `ltrim`/`reverse`/`btrim` are
+unaffected.
+
+### The one still open, and why it was not rushed
+
+The concatenation **operator** remains divergent: PG gives 3 for
+`length('ab'::char(6) || 'z')`, goopg gives 7. The 12 fixed cases are
+`FuncCall`s whose bodies can see their argument *expression* — which is what
+carries the declared `char(n)` type, since a padded datum is
+indistinguishable from a text value that genuinely ends in spaces.
+`evalBinary` receives only Datums.
+
+The cheap fix is to coerce at the one production call site where the
+`BinaryOp` still has its operands (`expr.go:1322`). That is a Rule #2 trap:
+`exprnode.go:436` is the other evaluator's binary-op site and would keep the
+old behaviour, producing a fast-path vs interpreted split on a *value*
+question. Fix both or neither. Filed as `bpchar-concat-operator` with the
+witness and both site references.

@@ -1,60 +1,57 @@
 (idle — nothing in flight)
 
-# Loop #62 result — partition_aggregate SIZED and ESCALATED `[!]`
+# Loop #63 result — bpchar-text-function-class CLOSED (12 of 13)
 
-Banner: items 0-9 unchanged from loop #61 (all done or blocked; item 3 is
-M0145-0001's `[!]`). First open item-10 task in document order was
-`partition_aggregate`, whose own note said "size this before starting".
-No production code changed. Recon + escalation only.
+Banner: items 0-9 unchanged (item 3 blocked by M0145-0001 `[!]`; item 10's
+`partition_aggregate` is `[!]` awaiting an owner ruling). First open
+item-10 task in document order was `bpchar-text-function-class`.
 
-## What the recon established (measured, not read)
-1. **Not a regression; it never passed.** Built and ran the case in an
-   isolated worktree at `aef4a4257` — before M0143-0007b slice 1, i.e.
-   before any bpchar work — and it fails there with the byte-identical
-   message. The nightly's "new tonight" label is NOT a code change; I could
-   not explain the label and did not guess.
-2. **It needs TWO unimplemented features.** The upstream file enables BOTH
-   `enable_partitionwise_aggregate` and `enable_partitionwise_join`, then
-   runs 115 queries. goopg declares both GUCs (catalog.go:12302-12306) with
-   PG's own `off` default and consumes NEITHER.
-3. **The optimizer is not partition-aware at all.** `catalog.Table` carries
-   `PartitionKey`/`PartitionMethod`/`PartitionBounds`
-   (catalog.go:649-660) but every reader is in `internal/executor`;
-   `internal/optimizer` never reads them. goopg's plan is the CORRECT plan
-   for `enable_partitionwise_aggregate = off` — self-consistent, just
-   missing the feature.
+## Method: audited by MEASUREMENT, not by reading
+One query computing `length(f('ab'::char(6)))` over 22 candidate string
+functions, run against the PG 18.3 reference (SELECT-only) and a private
+goopg scratch on :5533, then diffed. 13 divergences, 9 already correct.
 
-## The escalation (governance, not engineering)
-The inventory CSV line 139 marks this case `status=pass,
-pass_required=yes` — "currently passing, must stay passing" — while the
-SAME row's rationale says "output diverges". The measurement shows the
-rationale is the accurate half. The must-pass set is exactly the
-`status=pass` rows (`regressMustPass`, regress_suite_test.go:182), so this
-one row keeps a pass-required gate permanently red on an unbuilt feature.
-**I did NOT demote it.** Demoting is the obvious way to green the gate,
-which is exactly why it is the owner's call; the documented workflow only
-covers promotion. Options recorded: (i) correct to `status=failed`, or
-(ii) keep must-pass and schedule the feature.
-Verified single-row, not systematic: 21 rows carry the same stale
-"diverges" rationale but the suite is green on all of them except this one.
+## The finding that mattered most: the rule is NOT uniform
+`concat`, `concat_ws` and `format`'s `%s` **KEEP** the padding in PG
+(measured 7 / 8 / 6 on a `char(6)` holding 'ab') because they take variadic
+`any` and go through the type's OUTPUT function, not a bpchar->text cast.
+goopg already matched on all three. Applying one rule everywhere — the
+obvious reading of "text functions strip" — would have introduced THREE new
+divergences. They are now pinned as NON-stripping so a later loop cannot
+"fix" them into a consistency upstream does not have.
 
-## Deliberately NOT bundled
-goopg's EXPLAIN renders `< 15` where PG renders `< '15'::numeric`. Real
-divergence, much smaller — but fixing it alone would NOT make the case
-pass, since the plan SHAPE still differs. Recorded so it is neither lost
-nor mistaken for the whole gap.
+## Sibling miss caught by the enumeration
+`length` was fixed in M0143-0007b slice 1; its aliases
+`char_length`/`character_length` are a SEPARATE case in the same switch and
+were still padded. Nothing in the corpus caught it — only the enumeration.
 
-## Gates
-`go build ./...` OK; state guard OK; pgbench smoke via the commit hook. No
-value gates required — zero production diff. Worktree removed.
+## Fixed (12)
+repeat, char_length, character_length, ltrim, replace, translate,
+split_part, left, right, reverse, quote_literal, quote_ident,
+regexp_replace — via one `coerceBpcharArgDatum` normalisation per function
+(regexp_replace reads its subject 4x; per-use patching would strip in some
+branches only). Bytea branches untouched.
+
+## Deferred, deliberately: `bpchar-concat-operator` (filed)
+`length('ab'::char(6) || 'z')` is 3 in PG, 7 in goopg. `evalBinary`
+(expr.go:1767) receives only Datums, and the declared type is what decides
+this. The cheap fix — coerce at expr.go:1322 — is a **Rule #2 trap**:
+`exprnode.go:436` is the OTHER evaluator's binary-op site and would keep the
+old behaviour, a fast-path/interpreted split on a VALUE question. Fix BOTH
+or neither. Witness recorded in the task.
+
+## Gates (all green)
+units; FULL upstream regress suite (Rule #5) unchanged — only the known
+`partition_aggregate`; tpch-spotcheck Q12=2/Q13=33; tpcds-sf025
+`PLAN-SHAPE same=99 changed=0`; acceptance arm 24/24 value-MATCH; pgbench
+smoke via hook. Test non-vacuous: pre-fix `expr.go` fails exactly 13
+subtests. Scratch server on :5533 stopped and removed.
 
 ## Next loop
-Item 10 continues, next in document order: **`bpchar-text-function-class`**
-(bounded; PG measurements already recorded, and it carries a
-witness-design warning: do NOT measure through `octet_length`, it re-pads).
-Then PgAmcheck003 x4 (-002..-005), PgoutputInterop x10 (-006..-015).
+Item 10 continues: `bpchar-concat-operator`, then PgAmcheck003 x4
+(-002..-005), PgoutputInterop x10 (-006..-015).
 
-## Owner escalations OPEN — now THREE
-1. M0145-0018's cost-model no-go.
-2. M0145-0001 lineage budget exhausted (loop #60) — blocks ALL of item 3.
-3. **NEW:** partition_aggregate's inventory row (this loop).
+## Owner escalations OPEN — three
+1. M0145-0018 cost-model no-go. 2. M0145-0001 lineage exhausted (blocks all
+of item 3). 3. partition_aggregate's inventory row marks a never-passing
+case must-pass.
