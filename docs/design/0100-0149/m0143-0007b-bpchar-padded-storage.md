@@ -1,10 +1,11 @@
 # R23: padded `character(N)` on-disk storage (M0143-0007b)
 
-Status: **SLICE 1 LANDED 2026-09-22.** Storage is padded; the K41 `relpages`
-mechanism is closed for newly written data. Slices 2-4 remain. The boundary
-inventory below was measured before coding and two of the boundaries the task
-names did not need changing — but it also MISSED one, which the regress gate
-caught; see "What the inventory missed".
+Status: **SLICES 1 AND 2 LANDED 2026-09-22.** Storage is padded AND the
+padding is applied before the TOAST decision, so a wide `char(N)` compresses
+exactly as upstream's does. Slices 3-4 remain. The boundary inventory below was
+measured before coding and two of the boundaries the task names did not need
+changing — but it also MISSED two, each caught by a different gate; see "What
+the inventory missed" and "Slice 2".
 
 Task: `.ralph/fix_plan.md` M0143-0007b. Kind: impl. Parent: M0143-0007.
 
@@ -149,7 +150,66 @@ tpch-spotcheck PASS (Q12=2 Q13=33); TPC-DS SF0.25 PASS=96 MISMATCH=0
 CKMISMATCH=0 ERROR=0 TIMEOUT=0 with plans 99/99 identical; TPC-H acceptance arm
 24 MATCH.
 
+## Slice 2 — the size consequences, measured against a private PG 18.3
+
+The design guessed slice 2 would be about values that *start erroring* at the
+index max-key-size or TOAST threshold. A private PostgreSQL 18.3 instance
+(`initdb` in `/tmp`, port 5581 — no reference cluster touched) says otherwise,
+and the real finding is bigger.
+
+### What PG actually does
+
+```
+CREATE TABLE t(c char(3000)); INSERT INTO t VALUES('x');
+  octet_length 3000 | length 1 | pg_column_size 45
+CREATE INDEX on char(3000) and char(8000), INSERT 'x' — both SUCCEED
+```
+
+`pg_column_size` 45 for a 3000-byte value: upstream **compresses the padding
+away**. Nothing errors, because pglz reduces a run of blanks to almost nothing,
+so neither the TOAST threshold nor `BTMaxItemSize` is reached in practice. The
+"previously-accepted value starts erroring" case the design anticipated does
+not arise for blank padding.
+
+### What goopg did after slice 1
+
+```
+200 rows of char(3000) holding 'x':
+  PG 18.3        heap    16,384 bytes
+  goopg slice 1  heap   819,200 bytes     (50x)
+```
+
+Root cause, confirmed by reading the call order rather than inferred: goopg
+pads in `coerceTextLikeDatum`, which runs inside `encodeValuePGCtx` — i.e.
+**after** `ToastLargeColumnsIfNeeded` has already decided. The toast check saw
+the 1-character datum, declined, and the encoder then wrote 3000 raw bytes
+inline. Upstream pads at INPUT (`bpchar_input`), so its decision sees the
+padded value.
+
+This was a regression slice 1 introduced: before it, the stored value was 2
+bytes (smaller than PG); after it, 819 KB (much larger). The direction flipped,
+and the magnitude got worse.
+
+### The fix, and it restores upstream's ORDER
+
+`ToastLargeColumnsIfNeeded` now pads a width-carrying bpchar before the
+threshold check, writing the padded datum back into the row so the later encode
+finds it already full width (`PadBpchar` is idempotent). Pad, then decide —
+upstream's sequence.
+
+```
+goopg after slice 2  heap 16,384 bytes — byte-identical to PG 18.3
+values unchanged: count 200, octet_length 3000, length 1
+```
+
+### Why no corpus gate saw it
+
+The SF0.25 sweep, the tpch-spotcheck and the TPC-H acceptance arm were **all
+green at 819 KB**, because every VALUE was correct throughout — only the bytes
+on disk were wrong, which is precisely what R23 is about. `TestToastPadsBpcharBeforeDeciding` is the witness, and it is a unit test for that reason.
+
 ## Next
 
-Slice 2 — the size consequences (index max-key-size, TOAST threshold), where a
-previously-accepted value can start erroring.
+Slice 3 — the `pgoutput` path: no pgoutput site calls `PadBpchar`, so whether
+its rendering derives from the stored datum or re-pads independently is still
+unestablished. Then slice 4, re-measuring `relpages` on `customer`/`item`.

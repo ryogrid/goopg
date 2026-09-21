@@ -11458,6 +11458,42 @@ reported, and the values and unit gates are the bar.
       - **Next: slice 2** — size consequences (index max-key-size, TOAST
         threshold), where a previously-accepted value can start erroring.
         Ledgered.
+    - **SLICE 2 LANDED 2026-09-22 (loop 54) — and the design's guess about
+      it was wrong.** A private PG 18.3 instance (`initdb` in /tmp, port
+      5581; no reference cluster touched) settled it.
+      - **PG compresses the padding**: `char(3000)` holding 'x' gives
+        `octet_length` 3000, `length` 1, **`pg_column_size` 45**, and
+        indexes on `char(3000)`/`char(8000)` both accept the insert. So
+        nothing errors at the TOAST threshold or `BTMaxItemSize`, and the
+        "previously-accepted value starts erroring" case does not arise.
+      - **What goopg actually had was a 50x REGRESSION from slice 1**:
+        200 rows of `char(3000)` took **819,200** heap bytes against PG's
+        **16,384**.
+      - **Root cause, read not inferred**: `coerceTextLikeDatum` pads inside
+        `encodeValuePGCtx` — AFTER `ToastLargeColumnsIfNeeded` has decided.
+        The toast check saw the 1-character datum, declined, and the encoder
+        then wrote 3000 raw bytes inline. Upstream pads at INPUT
+        (`bpchar_input`) and so decides on the padded value.
+      - **Fix restores upstream's ORDER**: pad the width-carrying bpchar
+        before the threshold check, writing it back into the row
+        (copy-on-write preserved; `PadBpchar` is idempotent). goopg's heap is
+        now **16,384 bytes — byte-identical to PG**, values unchanged.
+      - **No corpus gate saw it.** The SF0.25 sweep, tpch-spotcheck and TPC-H
+        acceptance arm were ALL green at 819 KB, because every VALUE was
+        correct and only the bytes on disk were wrong — which is precisely
+        what R23 is about. `TestToastPadsBpcharBeforeDeciding` is the
+        witness, and a unit test is the right kind for a storage-shape
+        defect.
+      - **Second boundary the slice-1 inventory missed** (the first was
+        `length()`, caught by the upstream regress suite). Both were
+        consumers or decision points that READ the stored image, not sites
+        that re-pad it — the lesson already recorded, now confirmed twice.
+      - Gates: units PASS; upstream regress `char` PASS (172 lines) +
+        `varchar` PASS, `strings` unchanged at 263 lines; tpch-spotcheck PASS
+        (Q12=2 Q13=33); TPC-DS SF0.25 PASS=96 MISMATCH=0 with plans 99/99
+        identical; TPC-H acceptance arm 24 MATCH.
+      - **Next: slice 3** — `pgoutput`'s bpchar rendering is unverified; no
+        pgoutput site calls `PadBpchar`. Ledgered.
 - **OWNER DECISION 2026-09-20 — APPROVED.** The owner approves reversing
   the trimmed-`bpchar`-storage convention: implement R23 padded
   `character(N)` storage. Proceed per the task text — design doc first,
