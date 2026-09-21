@@ -14433,7 +14433,7 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
       resume point needs no new instrument.
   Movement: none — measured-no-gap. The census line is the whole production
   change.
-- [ ] **M0145-0018 — relax the `outer-over-derived` firewall
+- [!] **M0145-0018 — relax the `outer-over-derived` firewall
   (owner decision GO, 2026-09-21)**. M0145-0011's E1 measured the
   diagnostic bypass clean at BOTH scales: on SF0.25 AND SF1
   (private `:5547` clone) only Q77/Q78 move, Q78 stays a hash join
@@ -14471,3 +14471,35 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
   M0145-0013 reach DP.
   Kind: impl
   Parent: M0145-0011
+  - **`[!]` NO-GO 2026-09-21 — the firewall was NOT relaxed.** Design doc
+    `docs/design/0100-0149/m0145-0018-firewall-relaxation-no-go.md`.
+    - **Precondition 1 satisfied**: M0145-0013 landed (loop 43).
+    - **Precondition 2 FAILS.** Current fire set: `outer-over-derived` 3 per
+      run — Q77 (2), Q78 (1); `semianti-not-tail` now 0.
+    - **SF0.25 is clean** and reproduces loop 39 exactly: only Q77/Q78 move,
+      Q77 788 → 851 ms, Q78 3869 → 3931 ms, values byte-identical, Q78's
+      join kinds IDENTICAL (3 Hash Anti, 2 Hash, 2 Hash Left — no NL
+      election), Q77 gaining one `Nested Loop Left Join` at rows=1.
+    - **SF1 is CATASTROPHIC.** Private SF=1 clone: Q78 goes **29002 ms → did
+      not finish in 1800 s**, electing
+      `Nested Loop Left Join (cost=5494.86..1147565.07 rows=5731)` with all
+      three equi-conditions demoted to a `Join Filter` over a 10317-row
+      outer and a `cs` CTE-scan inner — the C-04a shape verbatim. Q77 at SF1
+      is unchanged (5680 → 5760 ms).
+    - **Why this differs from loop 40's SF1 evidence** (which found Q78 stayed
+      a hash join): M0145-0013, -0014 and -0016 all landed in between, each
+      letting more of Q78's problem into the DP. The search now has a
+      join-order choice it did not have, and takes it badly. **This is what
+      the precondition existed to catch** — re-using the old numbers would
+      have landed a 60x-plus SF1 regression behind a GREEN SF0.25 gate.
+    - **ESCALATION**: the blocker is the **COST MODEL**, not statistics and
+      not admission. The estimates are already honest (M0145-0011 measured
+      that), and the search still prefers a nested loop it prices at 1.1M.
+      Owner options, none of which the loop picks: (a) keep the firewall
+      permanently, documented as a cost-model backstop; (b) **narrow it to
+      the shape** — veto an NL path whose inner is a derived input rather
+      than declining the whole problem (M0145-0011 scope (d) listed this;
+      the SF1 evidence now argues for it specifically); (c) fix NL pricing
+      for a derived inner and re-run this verification. Ledgered.
+  Movement: none — no-go. `problemPairsOuterWithDerived` is untouched and
+  `GOOPG_DERIVED_FIREWALL` stays default ON.
