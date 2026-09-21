@@ -55,10 +55,21 @@ import (
 // and FULL would need — is never touched. The union over workers is therefore
 // each outer row at most once, which is the semijoin's own contract.
 //
-// LEFT and ANTI stay refused here, matching both planner gates: their refusal
-// is deliberate scope-minimisation (ledger
-// `m0137-0019b-partial-nl-left-anti-still-refused`), and widening this side
-// alone would recreate exactly the divergence this comment documents.
+// LEFT and ANTI joined the set on 2026-09-21, widened on the executor and all
+// three planner gates in ONE change — the discipline this comment's own
+// history argues for. PG admits {INNER, LEFT, SEMI, ANTI} at the same nestloop
+// dispatch gate (`joinpath.c:1842-1846`), and both are worker-local for the
+// same reason SEMI is: `fillInner` — the cross-worker inner-match reduction —
+// is set only for RIGHT/FULL (`join_nl_stream.go`), and `markInner` is called
+// only under it, so LEFT's null-extension and ANTI's no-match verdict are each
+// decided by one outer row against the whole inner that worker materialises
+// itself. Verified by measurement, not only by reading:
+// TestParallelLeftAntiNestedLoopIdentity forced a Gather over both shapes and
+// showed the N-copy signature before this widening, correct counts after.
+//
+// RIGHT and FULL stay refused, here and on every twin: they need to know which
+// INNER rows went unmatched across ALL workers, which is the cross-worker
+// reduction no gate in this family models.
 func ordinaryInnerNestedLoopPartial(p *optimizer.Join) bool {
 	if p == nil || p.Algo != optimizer.JoinAlgoNestedLoop || p.Lateral {
 		return false
@@ -66,7 +77,12 @@ func ordinaryInnerNestedLoopPartial(p *optimizer.Join) bool {
 	if p.Left == nil || p.Right == nil {
 		return false
 	}
-	return p.Type == optimizer.JoinTypeInner || p.Type == optimizer.JoinTypeSemi
+	switch p.Type {
+	case optimizer.JoinTypeInner, optimizer.JoinTypeLeft,
+		optimizer.JoinTypeSemi, optimizer.JoinTypeAnti:
+		return true
+	}
+	return false
 }
 
 // lateralProbeJoinPartial is the executor-side half of R95's admission rule:

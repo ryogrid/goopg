@@ -421,6 +421,32 @@ func partialPathShapeIsGatherable(p *Path) bool {
 //
 // Today's producers only ever offer a bare scan, so the walk is one step; the
 // wrapper arms exist because C-19e/f will add Sort and join shapes and the
+// partialNestLoopJointype is the ONE jointype set the ordinary partial
+// nested-loop family admits, shared by `partialPathDrivingKind`'s PathNestLoop
+// arm and its spine mirror so the two cannot drift.
+//
+// They had drifted: the mirror's comment claimed to follow the arm
+// "guard-for-guard" while testing `!= JoinInner` against the arm's
+// {INNER, SEMI}. That was a refusal, hence harmless, but a documented
+// invariant that is only true in prose is the same shape of defect as the
+// 2026-09-21 SEMI wrong answer — which was a divergence between gates whose
+// comments also said they must agree. Sharing the predicate makes the claim
+// structural.
+//
+// The set is PG's nestloop dispatch set (`joinpath.c:1842-1846`) minus RIGHT
+// and FULL, which need the cross-worker inner-match reduction this family does
+// not model. The executor twin `ordinaryInnerNestedLoopPartial`
+// (internal/executor/parallel_scan.go) and the node gate
+// `nestedLoopJoinIsPartialCapable` carry the same set; all four move together
+// or not at all.
+func partialNestLoopJointype(t parser.JoinType) bool {
+	switch t {
+	case parser.JoinInner, parser.JoinLeft, parser.JoinSemi, parser.JoinAnti:
+		return true
+	}
+	return false
+}
+
 // refusal must be visible where it is decided, not implicit in a missing case.
 func partialPathDrivingKind(p *Path) PathKind {
 	if p == nil {
@@ -555,9 +581,16 @@ func partialPathDrivingKind(p *Path) PathKind {
 		// worker-local (`finishOuter`, join_nl_stream.go — one qualifying
 		// inner tuple decides the outer tuple, the joined row is never
 		// emitted, and the inner-matched bitmap RIGHT/FULL would need is
-		// never touched), so a partitioned outer is transparent. LEFT and
-		// ANTI stay out by scope, not by correctness; see the producer.
-		if p.Jointype != parser.JoinInner && p.Jointype != parser.JoinSemi {
+		// never touched), so a partitioned outer is transparent.
+		//
+		// LEFT and ANTI join it for M0145-0010 scope (c), on the same
+		// rationale the producer already recorded for them, and widened in
+		// ONE change with the producer, the spine mirror below and the
+		// executor twin — the discipline the 2026-09-21 SEMI defect teaches.
+		// PG admits {INNER, LEFT, SEMI, ANTI} at the same dispatch gate
+		// (`joinpath.c:1842-1846`). RIGHT and FULL stay out: they need the
+		// cross-worker inner-match reduction no gate here models.
+		if !partialNestLoopJointype(p.Jointype) {
 			return PathPrebuilt
 		}
 		if p.RequiredOuter != 0 || len(p.Children) != 2 {
@@ -719,7 +752,7 @@ func setOpBranchDrivingKindIsSupported(p *Path) bool {
 		// per worker, parameterized probes re-open per worker-local outer
 		// row). The Jointype guard subsumes the general arm's second
 		// identical re-check: the field cannot change between the two.
-		if p.Jointype != parser.JoinInner || p.RequiredOuter != 0 || len(p.Children) != 2 {
+		if !partialNestLoopJointype(p.Jointype) || p.RequiredOuter != 0 || len(p.Children) != 2 {
 			return false
 		}
 		o, in := p.Children[0], p.Children[1]

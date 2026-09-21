@@ -1467,8 +1467,11 @@ func TestPartialPathDrivingKindRefusesSetOpWithBadNestLoopBranch(t *testing.T) {
 		}
 	}
 	cases := map[string]*Path{
-		"left-join": {
-			Kind: PathNestLoop, Jointype: parser.JoinLeft,
+		// Was "left-join" until M0145-0010 scope (c) admitted LEFT. RIGHT
+		// is the refusal now — a jointype this family cannot model, rather
+		// than one it declines by scope.
+		"right-join": {
+			Kind: PathNestLoop, Jointype: parser.JoinRight,
 			ParallelSafe: true, ParallelWorkers: 2,
 			Children: []*Path{scan(), {Kind: PathSeqScan}},
 		},

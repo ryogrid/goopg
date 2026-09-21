@@ -1243,11 +1243,15 @@ func NestedLoopIndexJoinIsPartialCapable(p *NestedLoopIndexJoin) bool {
 //     RIGHT and FULL would need reduced across workers — is never touched on
 //     this path. PG admits {INNER, LEFT, SEMI, ANTI} at the same dispatch
 //     gate (joinpath.c:2022-2031).
-//   - LEFT and ANTI remain refused. They are worker-local on the same
-//     rationale, but M0137-0019b widened only its named consumer's shape so
-//     that its parity movement stays attributable; the refusal is still
-//     deliberate scope-minimization, not a correctness boundary. Ledger row
-//     `m0137-0019b-partial-nl-left-anti-still-refused`.
+//   - LEFT and ANTI joined the set 2026-09-21 (M0145-0010 scope (c)), on the
+//     rationale this comment already stated for them: worker-local, decided
+//     per outer row, never touching the inner-matched bitmap. They were
+//     widened on this gate, `partialPathDrivingKind`'s PathNestLoop arm, that
+//     arm's spine mirror AND the executor twin in ONE change — the discipline
+//     the SEMI defect of 2026-09-21 exists to teach (planner-only widening
+//     produced N copies, not a safe decline). Executor capability was verified
+//     by measurement first, per M0145-0010 scope (d):
+//     `TestParallelLeftAntiNestedLoopIdentity`.
 //   - FULL and RIGHT would require knowing which INNER rows went unmatched
 //     across ALL workers — the same cross-worker reduction the twins
 //     refuse. Refused rather than approximated.
@@ -1262,7 +1266,11 @@ func nestedLoopJoinIsPartialCapable(p *Join) bool {
 	if p.Left == nil || p.Right == nil {
 		return false
 	}
-	return p.Type == JoinTypeInner || p.Type == JoinTypeSemi
+	switch p.Type {
+	case JoinTypeInner, JoinTypeLeft, JoinTypeSemi, JoinTypeAnti:
+		return true
+	}
+	return false
 }
 
 // scanTable extracts the *catalog.Table from a scan node (SeqScan,

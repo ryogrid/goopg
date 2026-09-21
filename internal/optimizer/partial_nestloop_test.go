@@ -40,17 +40,25 @@ func TestNestedLoopJoinIsPartialCapable(t *testing.T) {
 	if !nestedLoopJoinIsPartialCapable(nlTestJoin(JoinAlgoNestedLoop, JoinTypeSemi, false)) {
 		t.Fatal("SEMI nested loop must be partial-capable (M0137-0019b)")
 	}
+	// M0145-0010 scope (c): LEFT and ANTI joined the admitted set on
+	// 2026-09-21, widened across all four gates in one change after their
+	// executor capability was verified by measurement
+	// (TestParallelLeftAntiNestedLoopIdentity in internal/executor).
+	if !nestedLoopJoinIsPartialCapable(nlTestJoin(JoinAlgoNestedLoop, JoinTypeLeft, false)) {
+		t.Fatal("LEFT nested loop must be partial-capable (M0145-0010)")
+	}
+	if !nestedLoopJoinIsPartialCapable(nlTestJoin(JoinAlgoNestedLoop, JoinTypeAnti, false)) {
+		t.Fatal("ANTI nested loop must be partial-capable (M0145-0010)")
+	}
 	refusals := map[string]*Join{
 		"nil":         nil,
 		"hash-inner":  {Algo: JoinAlgoHash, Type: JoinTypeInner, Left: &SeqScan{}, Right: &SeqScan{}},
 		"merge-inner": {Algo: JoinAlgoMerge, Type: JoinTypeInner, Left: &SeqScan{}, Right: &SeqScan{}},
-		"nl-left":     nlTestJoin(JoinAlgoNestedLoop, JoinTypeLeft, false),
-		"nl-right":    nlTestJoin(JoinAlgoNestedLoop, JoinTypeRight, false),
-		"nl-full":     nlTestJoin(JoinAlgoNestedLoop, JoinTypeFull, false),
-		// LEFT and ANTI are worker-local too, but M0137-0019b held them
-		// out by scope so its parity movement stays attributable; RIGHT
-		// and FULL are refused on correctness.
-		"nl-anti":      nlTestJoin(JoinAlgoNestedLoop, JoinTypeAnti, false),
+		// RIGHT and FULL stay refused on CORRECTNESS, not scope: they need
+		// to know which inner rows went unmatched across ALL workers, the
+		// cross-worker reduction this family does not model.
+		"nl-right":     nlTestJoin(JoinAlgoNestedLoop, JoinTypeRight, false),
+		"nl-full":      nlTestJoin(JoinAlgoNestedLoop, JoinTypeFull, false),
 		"nl-lateral":   nlTestJoin(JoinAlgoNestedLoop, JoinTypeInner, true),
 		"nl-nil-left":  {Algo: JoinAlgoNestedLoop, Type: JoinTypeInner, Right: &SeqScan{}},
 		"nl-nil-right": {Algo: JoinAlgoNestedLoop, Type: JoinTypeInner, Left: &SeqScan{}},
@@ -132,9 +140,11 @@ func TestPartialNLWalkAgreement(t *testing.T) {
 		t.Fatal("SEMI: no Sort on the spine, crossesSort must be false")
 	}
 
+	// ANTI left this set for M0145-0010 scope (c) — it is admitted now, on
+	// all four gates. RIGHT stays: it needs the cross-worker inner-match
+	// reduction, which is a correctness boundary rather than scope.
 	for name, j := range map[string]*Join{
 		"right":      nlTestJoin(JoinAlgoNestedLoop, JoinTypeRight, false),
-		"anti":       nlTestJoin(JoinAlgoNestedLoop, JoinTypeAnti, false),
 		"lateral":    nlTestJoin(JoinAlgoNestedLoop, JoinTypeInner, true),
 		"hash-right": {Algo: JoinAlgoHash, Type: JoinTypeRight, Left: outer, Right: inner},
 	} {
@@ -192,8 +202,10 @@ func TestPartialPathDrivingKindNestLoop(t *testing.T) {
 
 	// Refusal matrix: each mutation flips exactly one predicate.
 	cases := map[string]func(p *Path){
-		"anti-jointype": func(p *Path) { p.Jointype = parser.JoinAnti },
-		"left-jointype": func(p *Path) { p.Jointype = parser.JoinLeft },
+		// ANTI and LEFT are ADMITTED since M0145-0010 scope (c); RIGHT and
+		// FULL remain the jointype refusals, on correctness.
+		"right-jointype": func(p *Path) { p.Jointype = parser.JoinRight },
+		"full-jointype":  func(p *Path) { p.Jointype = parser.JoinFull },
 		"root-param":    func(p *Path) { p.RequiredOuter = relsetOf(0) },
 		"one-child":     func(p *Path) { p.Children = p.Children[:1] },
 		"zero-workers":  func(p *Path) { p.Children[0].ParallelWorkers = 0 },

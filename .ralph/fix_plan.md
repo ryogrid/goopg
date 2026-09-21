@@ -13658,7 +13658,34 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
       `gatherpaths.go:722` spine mirror tests `!= JoinInner` although its
       comment claims it mirrors an arm that now admits SEMI — a refusal,
       so safe, but a documented-invariant mismatch. Both ledgered.
-    - Scopes (a)-(c) remain untouched.
+    - Scopes (a) and (b) remain untouched.
+  - **Scope (c) jointype half landed (loop 2026-09-21 \#32).** The
+    ordinary partial nested-loop family now admits
+    `{INNER, LEFT, SEMI, ANTI}` — PG's nestloop dispatch set minus
+    RIGHT/FULL.
+    - Widened across ALL FOUR gates in one change (executor predicate,
+      planner node gate, path arm, spine mirror), the discipline the
+      SEMI wrong answer teaches.
+    - **Capability verified BEFORE admission**, per scope (d), rather
+      than trusted from the in-tree comments that already called the
+      refusal "scope, not correctness": both shapes showed the N-copy
+      signature under a forced Gather BEFORE the widening and agree
+      with serial after.
+    - Closed a drift: the spine mirror's comment claimed to follow the
+      path arm "guard-for-guard" while testing a narrower set. The two
+      now share one predicate, `partialNestLoopJointype`.
+    - **Fixture trap recorded**: a plain `LEFT JOIN ... ON <non-equi>`
+      COMMUTES to a RIGHT join, so a naive fixture tests the REFUSAL
+      while appearing to test the admission. The test now asserts the
+      planned jointype so it cannot go vacuous.
+    - Four existing refusal pins updated deliberately, not deleted.
+    - **No corpus movement** (plans 99/99 identical, acceptance arm
+      24/24): a capability and faithfulness change, not a performance
+      one. Do not describe it as a win.
+    - Still out, ledgered: the FUSED NLI family
+      (`NestedLoopIndexJoinIsPartialCapable`) stays `{INNER, SEMI}`, so
+      goopg still diverges from PG there; RIGHT/FULL need a
+      cross-worker inner-match reduction that does not exist.
   - **On completion — reconsider the blocked work (evaluate, do not
     auto-do):** the `lateral` decline family (Q30/Q68 witnesses) on the
     then-default arm; the partial-NLI whitelist's LEFT/ANTI entries

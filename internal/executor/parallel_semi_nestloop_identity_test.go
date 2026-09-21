@@ -170,3 +170,128 @@ func TestParallelSemiNestedLoopIdentity(t *testing.T) {
 		})
 	}
 }
+
+// TestParallelLeftAntiNestedLoopIdentity is the executor-capability check
+// M0145-0010 scope (d) demands BEFORE a shape is admitted, for the two
+// jointypes goopg still refuses that PG admits: LEFT and ANTI
+// (`joinpath.c:1842-1846` admits {INNER, LEFT, SEMI, ANTI}).
+//
+// Unlike the SEMI case these are NOT reachable today — all four gates refuse
+// them, so no Gather is ever built over one and there is no live defect. This
+// test forces the Gather directly, which is what lets it answer the question
+// the whitelist cannot: CAN the executor drive them per-worker correctly?
+//
+// The structural argument says yes — `fillInner`, the cross-worker inner-match
+// reduction, is set only for RIGHT/FULL (`join_nl_stream.go`), and `markInner`
+// is called only under it, so LEFT's null-extension and ANTI's no-match
+// verdict are both per-outer-row and worker-local. This test is the
+// measurement behind that argument.
+func TestParallelLeftAntiNestedLoopIdentity(t *testing.T) {
+	ctx, cleanup := semiNLFixture(t)
+	defer cleanup()
+
+	for _, tc := range []struct {
+		name string
+		sql  string
+		want optimizer.JoinType
+	}{
+		{
+			// ANTI: no inner row satisfies `nm < 'AAA'`, so every outer row
+			// survives exactly once.
+			name: "anti",
+			sql:  "SELECT id FROM snl_outer o WHERE NOT EXISTS (SELECT 1 FROM snl_inner i WHERE i.nm < o.seg)",
+			want: optimizer.JoinTypeAnti,
+		},
+		{
+			// LEFT: a non-equality lateral-free left join, one outer row in,
+			// at least one row out, never duplicated across workers.
+			//
+			// The extra `o.id > 0` matters and is not decoration. Without it
+			// the planner COMMUTES this into a RIGHT join (jointype 2, not 1)
+			// — which is correctly refused by every gate, because RIGHT needs
+			// the cross-worker inner-match reduction. A fixture that yields
+			// the commuted shape would test the refusal, not the admission,
+			// and would look like a LEFT failure while the code was right.
+			name: "left",
+			sql:  "SELECT o.id FROM snl_outer o LEFT JOIN snl_inner i ON i.nm < o.seg AND o.id > 0",
+			want: optimizer.JoinTypeLeft,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			serialRows, err := runQueryWithErr(ctx, tc.sql)
+			if err != nil {
+				t.Fatalf("serial: %v", err)
+			}
+			want := len(serialRows)
+			if want == 0 {
+				t.Fatalf("fixture produced no rows; the comparison would be vacuous")
+			}
+			// Pin the jointype actually planned. A commuted shape would make
+			// this test assert the wrong thing silently.
+			stmts0, err := parser.Parse(tc.sql)
+			if err != nil {
+				t.Fatalf("parse: %v", err)
+			}
+			plan0, err := optimizer.Plan(stmts0[0], ctx.Catalog)
+			if err != nil {
+				t.Fatalf("plan: %v", err)
+			}
+			if got := topNestedLoopJointype(plan0); got != tc.want {
+				t.Fatalf("%s: planner produced jointype %v, want %v — the fixture no longer exercises this shape",
+					tc.name, got, tc.want)
+			}
+			for _, workers := range []int{1, 2, 4} {
+				stmts, err := parser.Parse(tc.sql)
+				if err != nil {
+					t.Fatalf("parse: %v", err)
+				}
+				plan, err := optimizer.Plan(stmts[0], ctx.Catalog)
+				if err != nil {
+					t.Fatalf("plan: %v", err)
+				}
+				gathered := optimizer.NewGather(0, plan, workers)
+				ctx.MaxParallelWorkers = 8
+				ctx.ParallelLeaderParticipation = true
+				op, err := Build(gathered)
+				if err != nil {
+					t.Fatalf("build: %v", err)
+				}
+				if err := op.Open(ctx); err != nil {
+					t.Fatalf("open: %v", err)
+				}
+				n := 0
+				for {
+					_, err := op.Next()
+					if err == EOF {
+						break
+					}
+					if err != nil {
+						op.Close()
+						t.Fatalf("next: %v", err)
+					}
+					n++
+				}
+				op.Close()
+				if n != want {
+					t.Fatalf("%s workers=%d: parallel returned %d rows, want %d (serial) — "+
+						"the N-copy signature of an unattached driving scan",
+						tc.name, workers, n, want)
+				}
+			}
+		})
+	}
+}
+
+// topNestedLoopJointype reports the jointype of the first nested-loop join
+// below the root, so a fixture can assert WHICH shape it exercises.
+func topNestedLoopJointype(n optimizer.Node) optimizer.JoinType {
+	switch x := n.(type) {
+	case *optimizer.Join:
+		return x.Type
+	case *optimizer.Project:
+		return topNestedLoopJointype(x.Child)
+	case *optimizer.Filter:
+		return topNestedLoopJointype(x.Child)
+	}
+	return optimizer.JoinTypeCross // a value none of these fixtures expect
+}
