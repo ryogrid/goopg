@@ -57,17 +57,28 @@ lowering replaces the interleaved stage-builder resolutions.
 | M0145-0016 | impl | `semianti-not-tail` (3): leaf reorder + relset remap for non-tail synthetic leaves — check 0005 slice (a) subsumption first |
 | M0145-0017 | impl | Census the never-reached sublink population (~248 of 308 events: sublinks outside top-level WHERE conjuncts) by clause position; extend pull-up to ON-qual reach for the PG-pullable subset only |
 | M0145-0018 | impl | Relax the `outer-over-derived` firewall — owner GO 2026-09-21; LAST: only after 0013 lands and a fresh E1 re-verification (SF0.25 + SF1) keeps relaxed plans clean; then remove `problemPairsOuterWithDerived` + the diagnostic flag, full default-arm gates |
+| M0145-0019 | recon | Nested-loop costing for a derived inner — 0018's NO-GO resolution path (option (c), (b) as interim): cost-diff recon on the instrumented PG naming the divergence; the fix is the follow-on task it files, then 0018's E1 re-runs |
+| M0145-0020 | impl | Port `examine_simple_variable`'s non-recursive CTE arm (`selfuncs.c:5737-5912`) — 0012's named prerequisite; unblocks the `rows<=1` fallback retirement |
+| M0145-0021 | impl | Harness: SF1 fire-set gate template for firewall/estimation/cost-model tasks (0018 showed SF0.25-green can mask a 60x+ SF1 regression) |
+| M0145-0022 | impl | Harness: plan-shape election + wall-clock regression channel on the SF0.25 sweep (values stay identical while shape/clock regress — the invisible class) |
+| M0145-0023 | impl | Harness: flow-convergence instrument — route-ratio + decline-bucket trend log, observability only, not a movement instrument |
 
 Dependencies: 0001 → {0003, 0004} → 0005 → {0006, 0007} → 0008.
 0002 is independent and should land early so every later task is measurable.
-0009 is independent of the flow work (it is a statistics task, not a flow
-task); it is sequenced after the flow chain so its estimates land on the
-cutover pipeline, but nothing in 0003–0008 is gated on it — the three
-consumers only need it before their own unblocks are re-evaluated. 0010 is
-likewise sequenced after the chain: it is planner machinery (not executor
+0010 is sequenced after the chain: it is planner machinery (not executor
 substrate, so it is inside this milestone where 0008's note puts executor
 work outside), but doing it after 0005 avoids building required_outer
 translation on the legacy arm's coordinate machinery that 0005 retires.
+
+**Owner GO 2026-09-22 re-opened the 0001 lineage** (the loop-#60
+escalation is answered CONTINUE): the measured downstream walls sequence
+first — 0009, then 0019 (0018's unblock), then 0020 (0012's unblock) —
+superseding the earlier note that sequenced 0009 after the flow chain.
+When 0019 lands, 0018's fresh E1 re-verification re-runs; 0018 executes
+the relaxation only if it passes at both scales. The flow-completion
+chain 0004 → 0005 → 0007 → 0008 resumes after that, still under the
+firewall constraint until 0018 executes it. 0021/0022/0023 are harness
+work and may run any time.
 0011/0012 are the blocker's re-definition path after 0009's census
 exhausted the column channel — 0011 measures, 0012 retires the divergence
 once the criterion holds. 0013–0017 are the decline-bucket filings from the

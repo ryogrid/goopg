@@ -76,6 +76,22 @@ the order written inside the item. `[!]` tasks are not selectable.
    a fresh E1 re-verification keeps the relaxed plans clean). The
    Q78 `outer-over-derived` firewall remains a hard constraint on
    every pull-up/flattening task UNTIL M0145-0018 executes it.
+   **OWNER GO 2026-09-22** (answer to the M0145-0001 lineage
+   escalation and the M0145-0018/0012 escalations): CONTINUE —
+   sequence the measured downstream walls first (M0145-0009, then
+   **M0145-0019** NL-costing for derived inners — 0018's option
+   (c) — then **M0145-0020** `examine_simple_variable` CTE arm,
+   which is 0012's named prerequisite). When 0019 lands, 0018's
+   fresh E1 re-verification re-runs and 0018 executes the
+   relaxation only if it passes at both scales; the
+   flow-completion chain (0004 → 0005 → 0007 → 0008) resumes
+   after that, still under the firewall constraint until 0018
+   executes it. Harness
+   additions **M0145-0021** (SF1 fire-set gate template),
+   **M0145-0022** (shape/time regression channel) and
+   **M0145-0023** (flow-convergence instrument) may run any time;
+   rationale `tmp/progress-planner-rewrite-260922/01-progress-assessment.md`
+   (local, gitignored).
 4. **M0141-S2a-fix2r** — re-apply the PG-faithful `hashAggEntrySize` change that
    was discarded for parity reasons (owner Q4: no reverts). Degradations it
    causes are filed as their own tasks, not reverted.
@@ -2266,6 +2282,90 @@ the whole file's active task between 2026-09-01 and 2026-09-14; **since
       structural hazard is an owner call, not the loop's.
 
 - [ ] **M0122-0008 — Auth / roles / multi-DB isolation / encoding**.
+  Kind: impl
+  Parent: none
+  - 2026-09-22: **`GRANT … ON DATABASE` now reaches databases other than the
+    connected one**, consuming the `unimplemented_feat.json` entry
+    *"Implement multi-database support so a single server instance can manage
+    multiple independent databases"* (marked `resolved`; its cited evidence
+    was `operators_ddl_database_acl.go` single-database only).
+    Movement: none — SF0.25 `PLAN-SHAPE same=99 changed=0`; a DDL/catalog
+    conformance fix, which none of S3's three instruments measures.
+    Design: `docs/design/0100-0149/0122-0008-cross-database-grant-on-database.md`.
+    - **The defect, measured against a PG 18.3 oracle**:
+      `GRANT CONNECT ON DATABASE otherdb TO r1` from a session connected to
+      `postgres` reported `GRANT` and left `otherdb.datacl` NULL, where PG
+      leaves `{=Tc/postgres,postgres=CTc/postgres,r1=c/postgres}`. An unknown
+      database name succeeded **silently** instead of raising `3D000` — the
+      worse half, since a typo granted nothing and said so in no way a client
+      could detect.
+    - **A v0 assumption that outlived its premise.** The code compared every
+      named database against `ctx.CurrentDatabase`; its own comment justified
+      this with *"goopg v0 has a single logical connected database"*. goopg
+      now creates, persists and routes real per-database catalogs, and
+      upstream's `ExecGrant_Database` (`aclchk.c`) resolves names against the
+      SHARED `pg_database` with no reference to `MyDatabaseId`.
+    - **Fixed as a sibling pair (Hard-won Rule \#2)** — fixing only the writer
+      would have stored an ACL no `SELECT` could show:
+      - writer: every name resolved through `catalog.ResolveDatabaseOid`, the
+        whole list before any is applied, so one bad name changes nothing
+        before it errors; the per-database body moved to
+        `applyDatabaseACLChange` so "only the live database" can no longer be
+        a property of the statement rather than of the loop driving it;
+      - reader: the `pg_database` virtual row builder renders `datacl` for
+        every row instead of only `postgres`.
+    - **Why `ResolveDatabaseOid` is the right key for both halves**: it
+      returns `DBOID()` for `"postgres"` — the key the single-database code
+      already used — so the connected database's behaviour is unchanged BY
+      CONSTRUCTION, not by coincidence. That is what makes it safe to touch
+      the row every connection reads.
+    - Live verification: cross-db GRANT, cross-db REVOKE, the multi-name list
+      form, the `3D000` refusal and the connected-db path all match PG 18.3;
+      `global/1262` gains a row version per resync, so an attached standby
+      sees the ACL too.
+    - Non-vacuity checked on BOTH halves: neutralising the writer fails
+      exactly the three cross-database arms; neutralising the reader fails the
+      render test while the writer's tests stay green.
+    - Gates: units; `internal/executor` + `internal/catalog`; tpch-spotcheck
+      Q12=2/Q13=33; tpcds-sf025 `PLAN-SHAPE same=99 changed=0`; pgbench smoke.
+
+- [ ] **`pg_database.datacl` does not survive a restart** (measured 2026-09-22
+  while landing the cross-database GRANT fix).
+  Kind: bug
+  Parent: M0122-0008
+  - Repro: `GRANT CONNECT ON DATABASE otherdb TO r1`, restart, then
+    `select datname, datacl from pg_database` — every row reads NULL.
+  - **Pre-existing and NOT introduced by that fix**: it affects the
+    `postgres` row exactly as much as the new cross-database ones, which is
+    what identifies the reload path rather than the GRANT path as the gap.
+  - The heap resync writes the `_aclitem` array to the shared `global/1262`
+    correctly (verified: a new row version per resync). Nothing repopulates
+    the in-memory ACL store from it at startup, and the renderer reads that
+    store.
+  - Resume: `internal/initdb/catalog_heap_reload.go` — add a `pg_database`
+    `datacl` pass keyed by the same `ResolveDatabaseOid` key the writer and
+    renderer use. **Blocker**: an aclitem-array DECODER does not exist yet;
+    only the encoder (`encodeAclItemArrayText`) does.
+  - Same shape as the per-database reload gaps closed under M0119-0006
+    (bs/bw slices), so those are the template.
+
+- [ ] **aclitem array order differs from PostgreSQL** (measured 2026-09-22
+  against a live PG 18.3 while capturing the GRANT oracle).
+  Kind: bug
+  Parent: M0122-0008
+  - goopg renders `{postgres=CTc/postgres,=Tc/postgres,r1=c/postgres}`;
+    PG renders `{=Tc/postgres,postgres=CTc/postgres,r1=c/postgres}` — the
+    **world entry first**.
+  - Upstream builds the array from `acldefault()` (`acl.c`), which emits the
+    world_default entry before the owner entry, and `aclitemout` preserves
+    array order — so this is a visible, dumpable property, not formatting.
+  - Not a correctness gap for goopg's own reads; it diverges for a PG
+    consumer comparing arrays element-wise, e.g. a `pg_dump` diff.
+  - Resume: the shared renderer behind `DatabaseACLText` / `TypeACLText` /
+    `relaclTextLockedFor` (its owner branch emits the owner entry first).
+    Fix ONCE there — it moves `relacl`, `typacl`, `paracl` and `datacl`
+    together and re-baselines every pinned ACL string in the suite, which is
+    why it is its own task.
 - [ ] **M0122-0009 — WAL / recovery / crash-consistency infra**.
 - [ ] **M0122-0010 — Concurrency: buffer pool & btree locking**.
 - [ ] **M0122-0012 — Perf infra: vectorization / slot-pipeline / harness**.
@@ -13299,9 +13399,17 @@ EXISTS/IN body via `planSelectWithParent` before unnest/search ever run
 M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
 `-3i-lateral-route` all block on this milestone's 0003.
 
-- [!] **M0145-0001 — recon: the jointree-level IR and the lowering
+- [x] **M0145-0001 — recon: the jointree-level IR and the lowering
   contract** (design the representation the whole milestone builds on).
   **DONE 2026-09-21.**
+
+  > **OWNER ANSWER 2026-09-22: GO — CONTINUE.** Root re-opened by
+  > owner directive. Per the answer the measured downstream walls
+  > sequence first (M0145-0009, then M0145-0019 NL-costing recon→impl,
+  > then M0145-0020 `examine_simple_variable` — 0012's prerequisite),
+  > then the flow-completion chain (0004 → 0005 → 0007 → 0008)
+  > resumes. The deferred-scope note below stays accurate — neither
+  > arm there has a firing census bucket.
 
   > ## ESCALATION 2026-09-22 (loop \#60) — lineage budget exhausted, OWNER DECISION NEEDED
   >
@@ -14903,6 +15011,8 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
       `examine_simple_variable` port as its own task (which would subsume
       route 2) or to accept the arm as documented permanence. The loop does
       not pick. Ledgered 2026-09-21.
+    - **OWNER ANSWER 2026-09-22: GO — the port is filed as M0145-0020.**
+      This task resumes after it lands; the fallback stays until then.
 - [x] **M0145-0013 — admit pulled `*CTEScan` leaves at the seam
   (`pulled-leaf-not-scan` / `flat-leaf-not-scan`)** (filed 2026-09-21
   by owner directive; the follow-on task M0145-0011's E2 resume point
@@ -15347,5 +15457,95 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
       than declining the whole problem (M0145-0011 scope (d) listed this;
       the SF1 evidence now argues for it specifically); (c) fix NL pricing
       for a derived inner and re-run this verification. Ledgered.
+    - **OWNER ANSWER 2026-09-22: GO — pursue (c) via M0145-0019**
+      (cost-diff recon on the instrumented PG first, then the fix or, if
+      the divergence proves structural, (b) as interim). This task stays
+      `[!]` until that lands and the fresh E1 re-verification passes at
+      BOTH scales.
   Movement: none — no-go. `problemPairsOuterWithDerived` is untouched and
   `GOOPG_DERIVED_FIREWALL` stays default ON.
+
+- [ ] **M0145-0019 — nested-loop costing for a derived inner** (owner GO
+  2026-09-22; the resolution path for M0145-0018's NO-GO — its option
+  (c), with (b) as the interim fallback). 0018's fresh E1 proved the
+  blocker is the COST MODEL: with the diagnostic bypass at SF1, Q78
+  elects `Nested Loop Left Join (cost=5494.86..1147565.07 rows=5731)`
+  over a `cs` CTE-scan inner — all three equi-conditions demoted to a
+  Join Filter — and does not finish inside 1800 s, while the estimates
+  are already honest (M0145-0011 measured that the decline itself
+  manufactured the epsilons). The working HYPOTHESIS — to be tested,
+  not assumed — is that PG plans this shape without a categorical
+  guard because its NL pricing rejects the same election on the merits.
+  - Step 1: capture PG's cost breakdown for the same shape on the
+    instrumented tree (the M0144-0004/0005/0006 assets) and diff goopg's
+    NL cost components against it — find WHERE the 1.1M estimate
+    diverges from what PG would charge, or refute the hypothesis.
+  - Deliverable: a design doc naming the divergence and the fix it
+    implies — correct NL pricing for a derived inner (option (c), the
+    faithful route) or, if the divergence is structural, narrowing the
+    firewall to an NL-inner-derived veto (option (b), interim). The
+    implementation is filed as the follow-on task this recon names —
+    it is deliberately NOT bundled here.
+  - On the follow-on's landing, re-run M0145-0018's fresh E1 (SF0.25
+    AND SF1, the current `outer-over-derived` fire set — Q77/Q78 today,
+    re-derive per run): the relaxation stays `[!]` until that passes.
+  Kind: recon
+  Parent: M0145-0018
+
+- [ ] **M0145-0020 — port `examine_simple_variable`'s non-recursive CTE
+  arm** (`postgres/src/backend/utils/adt/selfuncs.c:5737-5912`) (owner GO
+  2026-09-22; M0145-0012's named prerequisite). PG resolves a qual on a
+  CTE output column to the underlying base column's real statistics by
+  locating the CTE's subroot via `cte_plan_ids` and recursing on the
+  target-list `Var`; goopg has no such lookup, so quals on multi-ref CTE
+  outputs (`ws` x3, `inv` x2, `year_total` x4 — the Q31/Q39/Q74 fires)
+  collapse to the default selectivity and only the goopg-only `rows<=1`
+  fallback catches the resulting epsilon-NL elections. Scope: wire the
+  subroot/Var resolution for NON-RECURSIVE CTEs only (the upstream arm
+  punts on shapes it cannot resolve — mirror that). Success test: the
+  three corpus fires estimate >= the fallback's effect WITHOUT the arm —
+  then M0145-0012 resumes to remove it.
+  Kind: impl
+  Parent: M0145-0012
+
+- [ ] **M0145-0021 — harness: SF1 fire-set gate for diagnostic-flag /
+  estimation / cost-model tasks** (owner GO 2026-09-22; progress-doc
+  proposal 5.4). M0145-0018 showed an SF0.25-green result masking a
+  60x-plus SF1 regression — caught only because the task TEXT mandated a
+  fresh E1, not because the harness enforced it. Land a reusable gate
+  template: any task touching the derived-input firewall, row
+  estimation, or the cost model must A/B the current fire set
+  (Q77/Q78 today; re-derive per run from the seam census) at SF0.25 AND
+  SF1, with "no timeout-class increase" as a mechanical pass condition.
+  Extend the SF0.25 regression script or a sibling; do NOT weaken
+  existing gates.
+  Kind: impl
+  Parent: none
+
+- [ ] **M0145-0022 — harness: plan-shape election + wall-clock
+  regression channel on the SF0.25 sweep** (owner GO 2026-09-22;
+  proposal 5.5). M0145-0012/0018 both produced plans whose values were
+  verified byte-identical AT SF0.25 while shape and clock regress
+  (Q74 16.6x there; at SF1 Q78 did not finish, so no value comparison
+  exists at that scale) — a class invisible to every value gate. Extend the sweep's existing plan-shape
+  channel to classify join-method elections (flag any move INTO Nested
+  Loop as a suspect direction — that is how C-04a manifests) and add a
+  wall-clock threshold report (e.g. >2x worse flagged). Report-only vs
+  gate-deciding is an implementer call; start report-only and promote
+  after one clean corpus cycle.
+  Kind: impl
+  Parent: none
+
+- [ ] **M0145-0023 — harness: flow-convergence instrument (secondary
+  metric, NOT a movement instrument)** (owner GO 2026-09-22; proposal
+  5.6). The S3 instruments measure final parity only, so M0145-style
+  multi-task structural migrations record `Movement: none` even when the
+  internal flow measurably converges — five consecutive such records
+  tripped the M0145-0001 lineage guard. Aggregate per sweep: the
+  pinned-spine vs jointree-pullup route ratio (SUBLINKCENSUS) and the
+  seam-decline bucket counts, appended as a trend log so convergence is
+  visible without counting as Movement. Deliberately NOT added to the
+  lineage-guard instruments — the guard's strictness is working; this is
+  observability only.
+  Kind: impl
+  Parent: none
