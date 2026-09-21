@@ -1,8 +1,10 @@
 # M0145-0005 — single-pass DP over the jointree
 
-Status: slice 1 landed (knob-arm `splitOuterSpine` retired) and slice 4
-landed (one-relation + degenerate scopes through the same entry) /
-remainder sliced below. Task: `.ralph/fix_plan.md` M0145-0005. Parent:
+Status: slices 1 (knob-arm `splitOuterSpine` retired), 2 (pulled
+semi/anti as real leaf items), 3 (IR-direct leaf materialisation —
+`jtScopeTable`/`extractScopeLeaves`) and 4 (one-relation + degenerate
+scopes through the same entry) landed; slice 5 ledgered below. Task:
+`.ralph/fix_plan.md` M0145-0005. Parent:
 M0145-0001 (IR contract + retirement matrix), M0145-0003 (semi/anti leaf
 entries), M0145-0004 (appendrel leaves). Kind: impl.
 
@@ -248,11 +250,88 @@ tpch-spotcheck (Q12=2/Q13=33), TPC-DS SF0.25 96/96 with 99/99 plan
 shapes identical, TPC-H acceptance arm 24/24 under
 `JOINTREE_PIPELINE=1`+`PGSHAPED=1`.
 
+## Slice 3 — IR-direct leaf materialisation (landed)
+
+`extractSearchLeaves` re-derived the search problem's leaf scans and
+link quals by walking the built NODE chain — a second traversal of
+structure `planFromItem` had just walked, re-deriving leaf order, leaf
+ranges, link types, and the `width`/`realWidth`/`belowNullable`/
+`preserved` bookkeeping every coordinate decision below the seam reads.
+The walk existed because the information was never recorded. Slice 3
+records it: a **`jtScopeTable`** (jointreescope.go) emitted at
+construction time in exactly the DFS order the walk produces.
+
+- **`planFromItem` emits the table as a fold-machine mirroring the
+  walk's dispatch**: the item's base node is leaf 0; each join adds one
+  link and one right-side leaf — descendable (Inner/Cross/Left/Right)
+  joins record an inner/outer link plus a plain leaf, demoted Semi/Anti
+  (the only Semi/Anti a `planFromClause` chain can carry) record a
+  semi/anti link plus a SYNTHETIC leaf, and any other join type (FULL)
+  folds the accumulated chain into one opaque leaf, discarding the
+  leaves and links inside it — the walk's "not an admitted join type"
+  arm verbatim.
+- **`planFromClause` concatenates the per-item tables** in FROM order
+  (`appendTable` shifts the incoming link ranges by the accumulated
+  leaf count, the same shift it applies to binding offsets across the
+  comma items) and pins the result to the chain root:
+  `rctx.jtScope.root = root`.
+- **`extractScopeLeaves`** (joinsearchseam.go) rebuilds the identical
+  `(scans, widths, onQuals, outerLinks, semiAnti)` tuple from the
+  table. Every quantity is the walk's own arithmetic re-keyed onto leaf
+  ranges: `width`/`realWidth` are prefix sums over the leaf table
+  (synthetic leaves skip `realWidth`); `base`/`rightBase` are the
+  accumulators sampled at `loLeft`/`loRight`; `belowNullable` is a
+  range-containment union over already-processed outer links' subtree
+  ranges; `preserved` is the descendant test — a link is unpreserved
+  exactly when a RIGHT-typed link's range encloses it, since every link
+  sits in its ancestors' LEFT subtree (a right subtree is always one
+  leaf). The rebases, the keyed-pred fold, the FlattenedRHS expansion
+  and the `MinLefthand`/`MinRighthand` narrowing run unchanged on
+  `jn.Predicate` — the table changes WHERE the structure comes from,
+  not what the quals say.
+- **The root-pointer pin** is the fail-closed contract: the seam reads
+  the table only when `jointreePipeline && ctx.jtScope != nil &&
+  ctx.jtScope.root == chain`. A chain the table was not built beside —
+  the S5a post-unnest Phase B chain is the reachable one — falls back
+  to `extractSearchLeaves` unchanged, so a pre-search rewrite that
+  grafts a different root can never be mis-described by stale
+  construction-time metadata.
+
+Retired on the jointree arm: `extractSearchLeaves`'s node walk (the
+function itself stays — the legacy arm and the root-pin fallback still
+use it). What did NOT retire, contra the original ledger line: the
+coordinate-translation family (`rebaseChainQual`,
+`rebaseSemiAntiChainQual`, `remapWalkOrderFlatToSpans`,
+`buildLeafSpans`, `localizeExprToLeaf`, `pgShapedOffsetChecksOK`). The
+slice's ledger framed them as walk machinery, but they are not
+discovery — they translate between two coordinate spaces that both
+still exist (a Join node's Predicate is written in its own concat
+coordinates whatever path reads it, and the problem's span space is a
+deliberate re-keying of leaf order). Removing the walk removes the
+second traversal, not the spaces.
+
+### Evidence
+
+White-box: `TestScopeExtractionMatchesWalk` runs both extraction paths
+over a 20-shape matrix (comma items, inner/outer/RIGHT chains,
+multi-item mixes, the LEFT inner-only `Filter{LeafLocal}` wrap, the
+FULL fold, grouped-join opaque leaves, the `!preserved` decline, and
+leading/non-leading demoted-ANTI synthetic leaves) and pins field-wise
+identity — same scan NODE POINTERS, equal widths, identical rebased
+preds (reflect.DeepEqual), equal preserved/nullable/belowNullable
+relsets, equal semiAnti links including `sjinfo` pointer identity and
+bodyQuals. `TestScopeExtractionDeclinesLikeWalk` pins the fail-closed
+arms (descendable-join leaf, nil leaf). A DPTRACE probe confirmed the
+search enumerates scope-extracted problems end-to-end (pulled EXISTS:
+`rels=a,b`, SEMI pair priced, searched subtree emitted). Gates:
+optimizer suite, units, tpch-spotcheck (Q12=2/Q13=33), TPC-DS SF0.25
+96/96 with 99/99 plan shapes identical, TPC-H acceptance arm 24/24
+under `JOINTREE_PIPELINE=1`+`PGSHAPED=1`.
+
 ## Remaining slices (ledgered)
 
 | slice | scope | retires |
 |---|---|---|
-| 3 | IR-direct leaf materialisation: `jtScope` (or the resolveContext's already-built binding table) supplies bindings/spans/neededCols/outputCols without walking the node chain; clause distribution by coordinate ownership | `extractSearchLeaves`, `buildLeafSpans` as node-walk mechanism, `spans`/`offset-disagreement`/`residual-hits-pad` validation family, `localizeExprToLeaf`, `rebaseChainQual`/`rebaseSemiAntiChainQual` |
 | 5 | misc decline-family retirement as corpus admits | `outer-on-qual`, `inner-on-qual-*`, `outer-over-derived` (post-B-06), `pushPredicatesIntoCrossJoins`/`pushSingleSideQualsIntoInnerJoinInputs`/`rewriteScanInputsWithSingleTablePredicates`/`pushOuterQualsIntoLaterals` |
 
 The executor-capability refusals (FULL hash, partial shapes the executor

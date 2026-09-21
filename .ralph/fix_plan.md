@@ -12690,6 +12690,47 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
       Sep-20 `:65433` rebuild (slice-1/4 era), not this change: the
       gate diffs the live old binary and Q3/Q18 cannot reach the
       pulled path (Q3 has no sublink; Q18's IN body has GROUP BY).
+    - Slice 3 (landed, loop 2026-09-21 #9): IR-direct leaf
+      materialisation — `jtScopeTable` (jointreescope.go) records the
+      leaf/link structure at `planFromItem` construction time in the
+      walk's own DFS order (descendable join = link+leaf; demoted
+      semi/anti = link+synthetic leaf; FULL/other = fold to one opaque
+      leaf, erasing inner links). `planFromClause` concatenates
+      per-item tables and pins `jtScope.root = root`. The seam reads
+      `extractScopeLeaves` only when `jointreePipeline &&
+      ctx.jtScope.root == chain` — the node walk stays for the legacy
+      arm and for post-rewrite chains (S5a Phase B).
+    - `extractScopeLeaves` rebuilds the identical (scans, widths,
+      onQuals, outer, semiAnti) tuple: width/realWidth as prefix sums
+      over the leaf table, base/rightBase sampled at loLeft/loRight,
+      belowNullable as range-containment over processed outer-link
+      subtrees, `preserved` as the RIGHT-ancestor enclosure test
+      (every link sits in its ancestors' left subtree — right subtrees
+      are single leaves). Rebases, keyed-pred fold, FlattenedRHS
+      expansion and Min-side narrowing run unchanged on jn.Predicate.
+    - Did NOT retire (contra the ledger's original line): the
+      coordinate-translation family — `rebaseChainQual`,
+      `rebaseSemiAntiChainQual`, `remapWalkOrderFlatToSpans`,
+      `buildLeafSpans`, `localizeExprToLeaf`, `pgShapedOffsetChecksOK`.
+      They translate between two coordinate spaces that both still
+      exist (a Join's Predicate is in its own concat coords whatever
+      path reads it); the walk's removal removes discovery, not the
+      spaces.
+    - White-box pins: `TestScopeExtractionMatchesWalk` — 20-shape
+      matrix, field-wise identity incl. same scan node pointers,
+      reflect.DeepEqual rebased preds, sjinfo pointer identity;
+      `TestScopeExtractionDeclinesLikeWalk` — fail-closed arms.
+      DPTRACE probe: scope-extracted problems enumerate end-to-end
+      (`rels=a,b` pulled EXISTS, SEMI pair priced, searched subtree).
+    - Gates: optimizer suite PASS; units PASS; tpch-spotcheck
+      Q12=2/Q13=33; SF0.25 96/96 with 99/99 plan shapes identical;
+      acceptance arm 24/24 under JOINTREE+PGSHAPED. plan-gate 16/22
+      unchanged stale-pin drift (diffs the live Sep-20 :65433 binary,
+      which this change cannot affect).
+    - Also fixed this loop: reverted a wholesale `gofmt -w` that the
+      newer local gofmt had applied to planner.go/joinsearchseam.go
+      (repo baseline is go1.25 — `gofmt -w` rewrites unrelated lines;
+      re-applied the edits manually).
 - [ ] **M0145-0006 — upper-rel pathlists** (extend the lattice through
   `create_grouping_paths`/`create_ordered_paths` analogues so ordering and
   grouping are elected over candidate sets, not by stage-builder

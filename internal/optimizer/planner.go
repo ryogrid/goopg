@@ -476,6 +476,16 @@ type resolveContext struct {
 	// emitting prefix's real leaf count is known.
 	jtPullup *jtPullup
 
+	// jtScope is the jointree pipeline's leaf/link record table
+	// (M0145-0005 slice 3, jointreescope.go): what planFromItem
+	// attached and what each join's leaf range is, recorded at
+	// construction time so the seam's extractScopeLeaves builds the
+	// same tuple extractSearchLeaves derives by walking the node
+	// chain. Pinned to the chain it was built beside (root); nil for
+	// contexts that did not come out of planFromClause's FromExprs
+	// arm (planFromRangeVars, DML, subquery scopes).
+	jtScope *jtScopeTable
+
 	// appendrelMember marks this resolveContext as a UNION ALL
 	// appendrel's MEMBER scope (M0145-0004): the member plans through
 	// the join search even for a single-leaf FROM, so its searched rel
@@ -3550,6 +3560,10 @@ func planFromClause(s *parser.SelectStmt, cat catalog.Catalog, ps PlannerSetting
 	}
 	var root Node
 	var bindings []rangeBinding
+	// M0145-0005 slice 3: the accumulated leaf/link table — each item's
+	// planFromItem emits its own local table; concatenating them in FROM
+	// order reproduces the walk's DFS order across the comma items.
+	jtTab := &jtScopeTable{}
 	// antiForcedNullCols (R40/K69): the union, across every FROM item, of
 	// the column keys whose IS NULL conjunct forced a LEFT->ANTI conversion
 	// demotedForPlan transplanted. Stashed on rctx below so the
@@ -3582,10 +3596,11 @@ func planFromClause(s *parser.SelectStmt, cat catalog.Catalog, ps PlannerSetting
 			// a later FROM item resolves its RTIDs from this statement.
 			lateralCtx.rtScope = scope
 		}
-		itemNode, itemBindings, err := planFromItem(item, cat, &nextSourceIdx, lateralCtx, ps, scope)
+		itemNode, itemBindings, itemScope, err := planFromItem(item, cat, &nextSourceIdx, lateralCtx, ps, scope)
 		if err != nil {
 			return nil, nil, err
 		}
+		jtTab.appendTable(itemScope)
 		if root == nil {
 			root = itemNode
 			bindings = itemBindings
@@ -3630,6 +3645,12 @@ func planFromClause(s *parser.SelectStmt, cat catalog.Catalog, ps PlannerSetting
 	// let the search reorder across the outer join. See
 	// `deconstructJointreeScopedSJI`.
 	rctx.joinlist, rctx.joinInfoList = deconstructJointreeScopedSJI(s.FromExprs, defaultCollapseLimits(), newSjiScope(s.FromExprs, cat))
+	// M0145-0005 slice 3: pin the table to the exact chain it was built
+	// beside — the seam consumes it only while `jtScope.root == chain`,
+	// so a pre-search rewrite that grafts a different root (the S5a
+	// post-unnest Phase B chain) falls back to the node walk.
+	jtTab.root = root
+	rctx.jtScope = jtTab
 	return root, rctx, nil
 }
 
@@ -3805,11 +3826,17 @@ func exprContainsColumnRef(e Expr) bool {
 	return found
 }
 
-func planFromItem(item parser.FromExpr, cat catalog.Catalog, nextSourceIdx *int16, lateralCtx *resolveContext, ps PlannerSettings, scope *rtableScope) (Node, []rangeBinding, error) {
+func planFromItem(item parser.FromExpr, cat catalog.Catalog, nextSourceIdx *int16, lateralCtx *resolveContext, ps PlannerSettings, scope *rtableScope) (Node, []rangeBinding, *jtScopeTable, error) {
 	leftNode, leftBinding, err := planScanRangeVar(item.Base, cat, *nextSourceIdx, lateralCtx, ps, scope)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
+	// M0145-0005 slice 3: record the leaf/link table the jointree
+	// pipeline's seam reads instead of re-walking this chain
+	// (jointreescope.go). One leaf per attachment point, one link per
+	// join, in exactly the DFS order extractSearchLeaves visits.
+	tab := &jtScopeTable{}
+	tab.addLeaf(leftNode, false)
 	*nextSourceIdx++
 	leftBindings := []rangeBinding{leftBinding}
 	if item.Base.GroupedJoinUnaliased {
@@ -3838,7 +3865,7 @@ func planFromItem(item parser.FromExpr, cat catalog.Catalog, nextSourceIdx *int1
 		}
 		rightNode, rightBinding, err := planScanRangeVar(j.Right, cat, *nextSourceIdx, joinLateralCtx, ps, scope)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 		*nextSourceIdx++
 		rightBinding.offset = len(leftCtx.schema)
@@ -3874,7 +3901,7 @@ func planFromItem(item parser.FromExpr, cat catalog.Catalog, nextSourceIdx *int1
 
 		pred, err := planJoinPredicate(j, leftCtx, rightCtx, mergedCtx)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 		joinType := mapJoinType(j.Type)
 		// M0063-0005: for LEFT JOIN, partition the ON conjuncts.
@@ -4120,6 +4147,9 @@ func planFromItem(item parser.FromExpr, cat catalog.Catalog, nextSourceIdx *int1
 			}
 		}
 		} // close else from allLeavesAreTableScans guard
+		// M0145-0005 slice 3: record the link + right leaf (or fold the
+		// table to one opaque leaf for a non-descendable join type).
+		tab.addJoin(jn)
 		leftNode = jn
 		// R40 §4d / K69: for Semi/Anti, `jn`'s Output() (plan.go) and its
 		// now-narrowed `.schema` (set above) equal exactly what `leftCtx`
@@ -4132,7 +4162,7 @@ func planFromItem(item parser.FromExpr, cat catalog.Catalog, nextSourceIdx *int1
 			leftCtx = mergedCtx
 		}
 	}
-	return leftNode, leftCtx.bindings, nil
+	return leftNode, leftCtx.bindings, tab, nil
 }
 
 // groupedJoinSourceBindings maps source aliases of an unaliased grouped JOIN
