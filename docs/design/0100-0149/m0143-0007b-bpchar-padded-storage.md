@@ -313,3 +313,66 @@ changes, the sites that RE-PAD are safe because they route through one
 idempotent helper, and the dangerous ones are CONSUMERS that read the stored
 image. Each of the three misses was invisible to a different gate - the
 upstream regress suite, a byte-level measurement, and a stored-column witness.
+
+## Follow-on (2026-09-22): the PRODUCER side, found by the upstream regress suite
+
+M0143-0007b closed with all four slices landed and the `relpages` number
+measured. Two nights later the nightly's `TestPort_RegressSuite` failed on
+four subtests, and three of them (`select_having`, `select_implicit`,
+`union`) traced back to this task — to the half the four slices never
+examined.
+
+Slices 1–3 audited **consumers**: sites that read the stored image and had
+assumed it was trimmed (`length`, the TOAST decision, `bit_length`, the
+`char(n)->text` cast). The gap found now is on the **producer** side: after
+the storage flip, the CAST *to* `char(n)` was the only bpchar producer still
+emitting a trimmed image. So goopg had two representations of the same
+logical value, and everything downstream that compares them broke.
+
+| path | upstream rule | oracle |
+|---|---|---|
+| cast TO `char(n)` | pads | `varchar->bpchar` is `castfunc => '0'` in `pg_cast.dat`, so the typmod coercion `bpchar()` (varchar.c) pads |
+| `bpchar -> varchar` | strips | `pg_cast.dat`: `castfunc => 'text(bpchar)'` — i.e. `rtrim1`, the same function as `bpchar -> text` |
+| `lower`/`upper`/`initcap` on a bpchar | strips | no `lower(bpchar)` exists; the call resolves through that same implicit cast |
+
+The `bpchar -> varchar` exclusion is worth recording as a reasoning error,
+not just a code fix. The rtrim arm added in slice 3 deliberately held varchar
+out, with a comment saying upstream's bpchar->varchar "is a separate entry".
+It IS a separate `pg_cast.dat` entry — but it names the same function. The
+inference "separate entry, therefore separate behaviour" was never checked
+against the catalog, and reading the catalog is what refuted it.
+
+### Which failure was dangerous
+
+`select_having` and `select_implicit` rendered a wrong column WIDTH with
+correct values. `union` was different in kind: `SELECT CAST(f1 AS char(4))
+FROM VARCHAR_TBL UNION SELECT f1 FROM CHAR_TBL` stopped de-duplicating,
+because a padded and an unpadded image of one value compare unequal, so every
+row came back twice. A type whose producers disagree about its physical form
+makes every equality over it unreliable — dedup, hash join, grouping, index
+lookup.
+
+### A test-design rule this produced
+
+`octet_length` is one of the `PadBpchar` RE-PADDING render callers. A
+cast-padding test written on it reports the padded width **whether or not the
+producer padded** — the first version of the new test did exactly that and
+passed with the fix disabled (verified, not suspected). The valid witness has
+to observe the raw image; the pinned test uses UNION de-duplication, which
+compares the cast value against the stored value and yields one row only if
+the two images are byte-identical.
+
+This extends the rule slices 1–3 arrived at — *sites that re-pad are safe,
+consumers that read the stored image are dangerous* — from the code to the
+tests. A re-padding function is exactly as blind inside an assertion as it is
+in production.
+
+### Still open
+
+Every text function receiving a bpchar resolves through the same rtrim1 cast;
+only the `lower`/`upper`/`initcap` family is fixed. Measured on live PG 18.3
+against a `char(6)` holding 'ab', `initcap`, `replace`, `substr` and
+string concatenation all strip. Filed as `bpchar-text-function-class` with a
+ledger row. No corpus case currently catches a further instance — the full
+upstream regress suite is green apart from `partition_aggregate`, which is an
+unrelated partitionwise-aggregation gap.

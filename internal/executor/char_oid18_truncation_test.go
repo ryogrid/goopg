@@ -61,10 +61,26 @@ func TestCastExprCharTypmodDisambiguation(t *testing.T) {
 // explicit `::varchar(n)`/`::bpchar(n)`/`::char(n)` casts must truncate an
 // over-length value to n characters. Verified against real PG 18.3: this is
 // silent truncation (no 22001 error), unlike assignment/INSERT coercion —
-// e.g. `SELECT 'abcdef'::varchar(3)` returns 'abc' with no error. Real PG
-// additionally right-pads bpchar/char short values with spaces; goopg has no
-// distinct padded representation for bpchar (matching the existing
-// coerceTextLikeDatum storage-path convention), so padding stays deferred.
+// e.g. `SELECT 'abcdef'::varchar(3)` returns 'abc' with no error.
+//
+// UPDATED 2026-09-22 (AI-20260922-004850-016): the short-value bpchar cases
+// now expect PADDING. This comment used to say goopg "has no distinct padded
+// representation for bpchar (matching the existing coerceTextLikeDatum
+// storage-path convention), so padding stays deferred" — that convention was
+// REPLACED by M0143-0007b slice 1, which made storage blank-pad, and the cast
+// was then the only bpchar producer still emitting a trimmed image. The
+// expectations below are not flipped to match new code; they are flipped to
+// match PostgreSQL, measured on a live PG 18.3:
+//
+//	select octet_length(''::bpchar(3))   -> 3   (the cast pads)
+//	select quote_literal(''::bpchar(3))  -> ''  (quote_literal takes text, so
+//	                                             the implicit bpchar->text
+//	                                             cast, rtrim1, strips it again)
+//
+// Both readings are of the SAME padded value; which one a caller sees depends
+// on whether it consumes the bpchar directly or through the text cast. varchar
+// is unaffected and its cases below are unchanged, which is the point of
+// keeping them side by side here.
 func TestInlineCastVarcharBpcharTypmodTruncation(t *testing.T) {
 	ctx, _, cleanup := newDDLFixture(t)
 	defer cleanup()
@@ -74,11 +90,12 @@ func TestInlineCastVarcharBpcharTypmodTruncation(t *testing.T) {
 		want  string
 	}{
 		{`SELECT 'abcdef'::varchar(3)`, "abc"},
-		{`SELECT 'abcdef'::char(3)`, "abc"},
-		{`SELECT 'abcdef'::character(3)`, "abc"},
-		{`SELECT 'abc'::varchar(3)`, "abc"},   // exact fit: no truncation
-		{`SELECT 'ab'::varchar(5)`, "ab"},     // shorter than n: unchanged (no padding)
-		{`SELECT ''::bpchar(3)`, ""},          // empty input: unchanged
+		{`SELECT 'abcdef'::char(3)`, "abc"},      // truncated to n, then already n wide
+		{`SELECT 'abcdef'::character(3)`, "abc"}, // same
+		{`SELECT 'abc'::varchar(3)`, "abc"},      // exact fit: no truncation
+		{`SELECT 'ab'::varchar(5)`, "ab"},        // varchar never pads
+		{`SELECT ''::bpchar(3)`, "   "},          // bpchar pads: PG octet_length is 3
+		{`SELECT 'ab'::char(4)`, "ab  "},         // short bpchar pads to n
 	}
 	for _, c := range cases {
 		rows := runQuery(t, ctx, c.query)

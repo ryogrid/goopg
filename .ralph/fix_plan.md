@@ -1458,37 +1458,103 @@ heuristic stays live.)
   Parent: none
   Movement: none
 
-- [ ] **testport/TestPort_RegressSuite — 4 subtests FAILed
-  (AI-20260922-004850-016)** — NEW tonight: `partition_aggregate`,
-  `select_having`, `select_implicit`, `union`. Repro:
-  `go test -v -run '^TestPort_RegressSuite$' ./internal/testport/`;
-  single case: `go test -v -run '^TestPort_RegressSuite$/^select_having$'
-  ./internal/testport/`. Evidence
-  `ci/logs/20260922-004850/testport/go-test.log`.
-  Kind: test-fix
+- [x] **testport/TestPort_RegressSuite — 3 of 4 subtests FIXED
+  (AI-20260922-004850-016)** — `select_having`, `select_implicit` and `union`
+  now PASS; `partition_aggregate` is a different, pre-existing gap and is
+  re-filed below as its own task. Repro was
+  `go test -run '^TestPort_RegressSuite$' ./internal/testport/`.
+  Kind: impl
   Parent: none
-  FIRST STEP IS A RE-RUN, NOT A FIX — the run's sha is `c07ebf0112d7`,
-  i.e. M0143-0007b **slice 2**, so this nightly tested a tree that had the
-  bpchar padded-storage flip (slices 1-2) but NOT slice 3, which fixed
-  exactly the class of consumer these cases exercise (`length`,
-  `bit_length`, and the `char(n)->text` `rtrim1` cast) and shrank the
-  upstream `strings` regress diff 263 -> 248 lines. `select_having` and
-  `select_implicit` both read `char`-typed columns. So the live
-  hypothesis was that these are slice-1/2 fallout ALREADY FIXED at HEAD by
-  slice 3/4. **MEASURED AND REFUTED 2026-09-22**: all four still FAIL at
-  HEAD (`partition_aggregate` 1.18s, `select_having` 0.01s,
-  `select_implicit` 0.03s, `union` 0.26s), so slices 3-4 did not fix them
-  and they are not merely a stale-sha artifact. Treat as four independent
-  cases — `union` and `partition_aggregate` have no obvious bpchar
-  surface and may be a different cause sharing a night.
-  NOTE FOR WHOEVER TAKES THIS: `regress_suite_test.go:173` reports only
-  "output mismatch; normalization rules need extension" and does NOT
-  persist the diff, so `-v` on the subtest tells you nothing further. Get
-  the actual divergence from `scripts/pg-regress-runner.sh <case>` against
-  a HEAD-worktree baseline (see [[pg_regress_runner_baseline_diff_technique]]),
-  not from this test. The sub-second failures suggest an early error
-  rather than a subtle row diff — check for an outright statement error
-  before assuming a formatting divergence.
+  Movement: none — no plan moved (SF0.25 `PLAN-SHAPE same=99 changed=0`);
+  this is a VALUE/rendering correctness fix, and none of S3's three
+  instruments measures it.
+  - **One root cause behind all three: the bpchar padding asymmetry that
+    M0143-0007b's own storage flip introduced.** Slice 1 made stored bpchar
+    blank-padded; three paths were left disagreeing with storage:
+    - `lower()`/`upper()` consumed the PADDED image. PG has no
+      `lower(bpchar)` — the call resolves through the implicit bpchar->text
+      cast, which is `rtrim1` (`pg_cast.dat`, `text(bpchar)`), so the padding
+      is stripped first. Fixed with a new `bpcharArgAsText` helper keyed on
+      the argument's DECLARED type (a padded image is indistinguishable from
+      a text value that genuinely ends in spaces).
+    - the CAST **to** `char(n)` still produced a TRIMMED image, so a cast
+      value and a stored value of the same logical value were different
+      strings. Upstream pads there: `varchar->bpchar` is `castfunc => '0'`
+      in `pg_cast.dat`, so the padding comes from the typmod coercion
+      (`bpchar()`, varchar.c) — which is exactly where goopg applies it now.
+    - `bpchar->varchar` was excluded from the rtrim arm **on a wrong
+      assumption I had written there myself**: the comment said upstream's
+      bpchar->varchar "is a separate entry". It is a separate pg_cast entry
+      naming the SAME function (`text(bpchar)`), so separate-entry did not
+      imply separate-behaviour. Corrected.
+  - **The `union` case was the dangerous one.** `SELECT CAST(f1 AS char(4))
+    FROM VARCHAR_TBL UNION SELECT f1 FROM CHAR_TBL` stopped DE-DUPLICATING,
+    because one representation of a value was padded and the other was not,
+    so equal values compared unequal and every row was emitted twice. The
+    other two only rendered a wrong column WIDTH with correct values — which
+    is why every value-comparing gate stayed green through all of it.
+  - **A test-design trap worth carrying forward**: `octet_length` is one of
+    the `PadBpchar` RE-PADDING render callers, so it reports the padded
+    width whether or not the producer padded. A cast-padding test written on
+    it PASSES with the fix disabled — verified. The valid witness has to
+    observe the raw image; UNION de-duplication does, and that is what the
+    pinned test uses. This is the same "sites that re-pad are safe,
+    consumers are dangerous" rule from slices 1-3, now applying to the TESTS
+    as well as the code.
+  - Sibling audit (Hard-won Rule \#2): `lower`/`upper`/`initcap` are one
+    switch family and all three now state the rule. `initcap` is a guard not
+    a witness — verified by disabling the helper, it passes either way
+    because `initCap`'s own word-splitting already drops trailing blanks.
+    One pre-existing test (`TestInlineCastVarcharBpcharTypmodTruncation`)
+    pinned the OLD unpadded cast; its expectations were re-derived from a
+    live PG 18.3 reading rather than flipped to match the new code.
+  - Broader class NOT closed, ledgered and filed below: every text function
+    that receives a bpchar resolves through the same rtrim1 cast. Measured
+    on live PG 18.3: `initcap`, `replace`, `substr` and the string-concatenation operator all strip
+    (`octet_length` 2, 2, 2 and 3 on a `char(6)` holding 'ab'). Only the
+    `lower`/`upper`/`initcap` family was fixed here.
+
+- [ ] **testport/TestPort_RegressSuite/partition_aggregate — partitionwise
+  aggregation (AI-20260922-004850-016, split out)** — the one subtest of the
+  four that is NOT the bpchar class. goopg plans `HashAggregate` over an
+  `Append` of the partitions; PG plans a per-partition `HashAggregate` under
+  the `Append` (`enable_partitionwise_aggregate`). Pure plan-shape
+  divergence — the VALUES are identical, only the EXPLAIN output differs.
+  Repro: `go test -run '^TestPort_RegressSuite$/^partition_aggregate$'
+  ./internal/testport/`; raw diff via `scripts/pg-regress-runner.sh
+  partition_aggregate` (1759 lines, nearly all EXPLAIN).
+  Kind: impl
+  Parent: none
+  PG oracle: `postgres/src/backend/optimizer/plan/planner.c`'s
+  `create_partitionwise_grouping_paths`. Size this before starting — it is a
+  planner feature, not a rendering fix, and the diff length overstates it
+  (one mechanism repeated across many EXPLAIN blocks).
+
+- [ ] **bpchar-text-function-class — every text function receiving a bpchar
+  must apply the rtrim1 cast** (filed 2026-09-22 out of
+  AI-20260922-004850-016). PG resolves a text function called on a `char(n)`
+  through the implicit bpchar->text cast (`rtrim1`, `pg_cast.dat`
+  `text(bpchar)`), so the blank padding is stripped before the function
+  runs. goopg satisfied this by accident until M0143-0007b's storage flip.
+  `lower`/`upper`/`initcap` are fixed; the rest are not enumerated.
+  Kind: impl
+  Parent: none
+  MEASURED on live PG 18.3 against a `char(6)` holding 'ab' — each of these
+  strips, and goopg's behaviour for each is UNVERIFIED:
+  `octet_length(initcap(..))`=2, `octet_length(replace(..,'x','y'))`=2,
+  `octet_length(substr(..,1))`=2, and concatenating with 'z' gives 3.
+  Resume: enumerate the text-function cases in
+  `internal/executor/expr.go`'s builtin switch, and for each one that can
+  take a text argument, compare goopg against PG on a STORED `char(n)`
+  column — not a literal, since `'ab'::char(6)` now pins through the cast
+  path instead. `bpcharArgAsText` (same file) is the helper to apply.
+  WITNESS DESIGN: do not measure through `octet_length` — it re-pads and
+  will report the right answer for a wrong value. Use a raw-image witness
+  (UNION de-duplication, or `length()` which strips).
+  NOTE: the full upstream regress suite is GREEN except
+  `partition_aggregate` after this loop's fix, so no corpus case currently
+  catches a further instance — this task is a systematic audit, not a
+  chase of a known failure.
 
 - [ ] **testport/TestPort_PgAmcheck003* re-CREATE EXTENSION after restart
   (AI-20260921-000212-004 … -007)** — four pg_amcheck cases FAILed on the

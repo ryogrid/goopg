@@ -129,3 +129,90 @@ func TestBpcharStoredColumnLengthFamilyMatchesPG(t *testing.T) {
 		})
 	}
 }
+
+// TestBpcharCastAndTextFunctionsMatchPG pins the bpchar PRODUCER/CONSUMER
+// symmetry that M0143-0007b's storage flip broke, measured against PG 18.3.
+//
+// Slice 1 made stored bpchar blank-padded, which left two paths disagreeing
+// with storage and therefore with each other:
+//
+//   - the CAST *to* `char(n)` still produced a TRIMMED image, so a cast value
+//     and a stored value of the same logical value were different strings.
+//     Upstream pads there (`bpchar()`, varchar.c) — `varchar->bpchar` is
+//     `castfunc => '0'` in pg_cast.dat, so the padding comes from the typmod
+//     coercion, not a cast function.
+//   - `lower`/`upper` consumed the padded image. PG has no `lower(bpchar)`;
+//     the call resolves through the implicit bpchar->text cast, which is
+//     `rtrim1` (pg_cast.dat, `text(bpchar)`), so the padding is stripped
+//     before the function runs.
+//
+// and one path that was excluded by a WRONG assumption: `bpchar->varchar` was
+// held out of the rtrim arm on the reasoning that it is "a separate pg_cast
+// entry". It is a separate entry naming the SAME function (`text(bpchar)`),
+// so it strips too.
+//
+// These were caught by the upstream regress cases `select_having`,
+// `select_implicit` and `union` (AI-20260922-004850-016), not by any value
+// gate — in two of the three the VALUES were already correct and only the
+// rendered column WIDTH was wrong. The `union` one was the dangerous shape:
+// two representations of one value made `UNION` stop de-duplicating, so rows
+// were silently doubled.
+func TestBpcharCastAndTextFunctionsMatchPG(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	for _, ddl := range []string{
+		`create table bcast(c char(4), v varchar(10))`,
+		`insert into bcast values ('a', 'a')`,
+	} {
+		if err := runDDL(t, ctx, ddl); err != nil {
+			t.Fatalf("%s: %v", ddl, err)
+		}
+	}
+
+	cases := []struct {
+		name string
+		sql  string
+		want int64
+	}{
+		// A cast TO char(4) pads, so it is octet_length 4 — the same image the
+		// stored column holds. Before the fix this was 1, which is what made
+		// the cast value and the stored value compare unequal.
+		// NOTE: octet_length is NOT a valid witness for the cast padding --
+		// it is one of the PadBpchar RE-PADDING render callers, so it reports
+		// 4 whether or not the cast padded, and a test written on it passes
+		// with the fix disabled. The witness has to observe the raw image.
+		// UNION de-duplication does: it compares the cast value against the
+		// STORED value, so it yields one row only if the two images are
+		// byte-identical. This is the shape the upstream `union` regress case
+		// actually failed on.
+		{"cast image equals stored image",
+			`select count(*) from (select v::char(4) as x from bcast union select c as x from bcast) t`, 1},
+		{"stored char(n) is padded", `select octet_length(c) from bcast`, 4},
+		// varchar does NOT pad — the same typmod arm must not over-apply.
+		{"cast to varchar(n) does not pad", `select octet_length(v::varchar(4)) from bcast`, 1},
+		// bpchar -> varchar strips, exactly as bpchar -> text does.
+		{"char(n) to varchar strips", `select octet_length(c::varchar) from bcast`, 1},
+		{"char(n) to text strips", `select octet_length(c::text) from bcast`, 1},
+		// lower/upper resolve through the bpchar->text cast, so they strip.
+		{"lower(char(n)) strips", `select octet_length(lower(c)) from bcast`, 1},
+		{"upper(char(n)) strips", `select octet_length(upper(c)) from bcast`, 1},
+		// initcap is a GUARD, not a witness: verified by disabling
+		// bpcharArgAsText, this case passes either way because initCap's own
+		// word-splitting already drops the trailing blanks. The explicit call
+		// is kept so the three-function family states the rule uniformly
+		// rather than relying on one member's internals.
+		{"initcap(char(n)) strips", `select octet_length(initcap(c)) from bcast`, 1},
+		// A genuine varchar argument is untouched by the bpchar rule.
+		{"lower(varchar) untouched", `select octet_length(lower(v)) from bcast`, 1},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			d, _ := byteaExprResult(t, ctx, tc.sql)
+			if d.Kind != KindInt || d.Int != tc.want {
+				t.Errorf("%s = %v (kind %d), want %d (PG 18.3)",
+					tc.sql, d.Format(), d.Kind, tc.want)
+			}
+		})
+	}
+}

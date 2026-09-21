@@ -1141,13 +1141,28 @@ func evalExprSlot(e optimizer.Expr, slot SlotView, ctx *Context) (Datum, error) 
 		// than raising 22001 (that error is assignment/INSERT-coercion-only,
 		// already enforced separately by codec.go's coerceTextLikeDatum) —
 		// verified against real PG 18.3: `'abcdef'::varchar(3)` → 'abc', no
-		// error. bpchar/char additionally right-pad short values with spaces
-		// in real PG; goopg's Datum has no distinct padded representation for
-		// bpchar (coerceTextLikeDatum stores it trimmed too), so padding is a
-		// separate, broader gap left deferred. castTargetType (not
-		// x.TargetType) is used so the bare-`char`-synthesized-to-"bpchar"
-		// rename above is truncated too, while the quoted OID-18 `"char"`
-		// form (Typmod==0, already handled above) is unaffected. M0122-0005.
+		// error. castTargetType (not x.TargetType) is used so the
+		// bare-`char`-synthesized-to-"bpchar" rename above is truncated too,
+		// while the quoted OID-18 `"char"` form (Typmod==0, already handled
+		// above) is unaffected. M0122-0005.
+		//
+		// bpchar/char then RIGHT-PAD the truncated value to the declared
+		// length, exactly as upstream's `bpchar()` coercion does
+		// (postgres/src/backend/utils/adt/varchar.c) — varchar does not.
+		// This padding used to be skipped, and the comment here used to say
+		// goopg had "no distinct padded representation for bpchar" because
+		// storage trimmed it too. M0143-0007b's slice 1 flipped storage to
+		// blank-pad, which made that reasoning obsolete and left the cast as
+		// the ONLY bpchar producer still emitting a trimmed image. Two
+		// upstream regress cases caught the resulting asymmetry
+		// (AI-20260922-004850-016): `union`, where
+		// `SELECT CAST(f1 AS char(4)) FROM VARCHAR_TBL UNION SELECT f1 FROM
+		// CHAR_TBL` stopped de-duplicating because the cast produced 'a'
+		// while the stored column held 'a   ', so equal values compared
+		// unequal and every row was emitted twice; and the `char` case's own
+		// width assertions. A producer of a padded type must pad, or the
+		// value has two representations and every equality over it is
+		// unreliable.
 		if x.Typmod > 0 && result.Kind == KindString {
 			switch castTargetType {
 			case "varchar", "bpchar", "char", "character":
@@ -1155,6 +1170,11 @@ func evalExprSlot(e optimizer.Expr, slot SlotView, ctx *Context) (Datum, error) 
 				runes := []rune(result.StringValue())
 				if len(runes) > n {
 					result = NewStringDatum(string(runes[:n]))
+				}
+				if castTargetType != "varchar" {
+					result = NewStringDatum(catalog.PadBpchar(
+						catalog.Type{Name: "bpchar", Args: []int64{int64(n)}},
+						result.StringValue()))
 				}
 			}
 		}
@@ -11519,6 +11539,32 @@ func stringFuncArgTypeName(k DatumKind) string {
 // the same default synthesizeBareCharTypmod applies to casts and the bare-char
 // column type carries. Used by octet_length, whose PG implementation
 // (bpcharoctetlen) returns the blank-PADDED datum size. M0119-0006 (65th slice).
+// bpcharArgAsText applies upstream's bpchar->text coercion to a value that a
+// TEXT-typed function is about to consume. PostgreSQL has no `lower(bpchar)` /
+// `upper(bpchar)`; those calls resolve through the implicit bpchar->text cast,
+// which is `rtrim1` (pg_proc.dat oid 401, "convert char(n) to text"), so the
+// blank padding is STRIPPED before the function ever sees the value. Measured
+// on PG 18.3 against a stored `char(8)` holding 'bbbb': `lower(c)` is 'bbbb',
+// four characters, not eight.
+//
+// goopg satisfied this by accident until M0143-0007b's slice 1 flipped bpchar
+// storage from trimmed to blank-padded; since then these functions returned the
+// padded image. The upstream regress cases `select_having` and `select_implicit`
+// caught it (AI-20260922-004850-016) via the rendered column width — the VALUES
+// were right, only their width was wrong, which is why every value-comparing
+// gate stayed green.
+//
+// The argument's DECLARED type is what decides this, not the datum: a padded
+// image is indistinguishable from a text value that genuinely ends in spaces.
+// `declaredBpcharTypmod` returns >0 only for a width-carrying bpchar, so an
+// unbounded `bpchar` and every non-bpchar argument are passed through untouched.
+func bpcharArgAsText(arg optimizer.Expr, s string) string {
+	if declaredBpcharTypmod(arg) > 0 {
+		return strings.TrimRight(s, " ")
+	}
+	return s
+}
+
 func declaredBpcharTypmod(e optimizer.Expr) int64 {
 	var name string
 	var typmod int64
@@ -14665,7 +14711,8 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 			if err != nil || s.IsNull() {
 				return NullDatum, nil
 			}
-			return NewStringDatum(strings.ToUpper(s.StringValue())), nil
+			return NewStringDatum(strings.ToUpper(
+				bpcharArgAsText(x.Args[0], s.StringValue()))), nil
 		}
 	case "lower":
 		if len(x.Args) == 1 {
@@ -14673,7 +14720,8 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 			if err != nil || s.IsNull() {
 				return NullDatum, nil
 			}
-			return NewStringDatum(strings.ToLower(s.StringValue())), nil
+			return NewStringDatum(strings.ToLower(
+				bpcharArgAsText(x.Args[0], s.StringValue()))), nil
 		}
 	case "initcap":
 		if len(x.Args) == 1 {
@@ -14681,7 +14729,8 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 			if err != nil || s.IsNull() {
 				return NullDatum, nil
 			}
-			return NewStringDatum(initCap(s.StringValue())), nil
+			return NewStringDatum(initCap(
+				bpcharArgAsText(x.Args[0], s.StringValue()))), nil
 		}
 	case "btrim":
 		// btrim(text [, chars]) — trim chars from both ends
@@ -21284,11 +21333,30 @@ func isBpcharTypeName(name string) bool {
 	return false
 }
 
-// isTextTargetTypeName reports whether name is the text type the bpchar cast
-// strips for. `varchar` is deliberately NOT included: upstream's
-// bpchar->varchar cast is a separate entry and goopg's varchar path has its own
-// length rules, so folding them together here would change two behaviours
-// while testing one.
+// isTextTargetTypeName reports whether name is a target the bpchar cast strips
+// its blank padding for.
+//
+// CORRECTION 2026-09-22 (AI-20260922-004850-016): this used to exclude
+// `varchar`, on the stated reasoning that "upstream's bpchar->varchar cast is a
+// separate entry". It IS a separate pg_cast entry, but it names the SAME
+// function — `postgres/src/include/catalog/pg_cast.dat` has
+// `{ castsource => 'bpchar', casttarget => 'varchar', castfunc =>
+// 'text(bpchar)' }`, i.e. rtrim1, exactly as the bpchar->text entry does. So
+// separate-entry did not imply separate-behaviour, and excluding varchar made
+// `CAST(f1 AS varchar)` over a `char(4)` keep its padding. The upstream
+// `union` regress case caught it: `SELECT f1 FROM VARCHAR_TBL UNION SELECT
+// CAST(f1 AS varchar) FROM CHAR_TBL` stopped de-duplicating, because 'a' and
+// 'a   ' are the same value on one side of the cast and different strings on
+// the other.
+//
+// The reverse direction is NOT symmetric and must not be folded in here:
+// varchar->bpchar has `castfunc => '0'` (binary-coercible), and its padding
+// comes from the typmod coercion applied at the CastExpr site, which is where
+// this file applies it.
 func isTextTargetTypeName(name string) bool {
-	return strings.EqualFold(strings.TrimSpace(name), "text")
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "text", "varchar", "character varying":
+		return true
+	}
+	return false
 }
