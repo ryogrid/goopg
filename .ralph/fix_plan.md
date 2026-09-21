@@ -62,9 +62,20 @@ the order written inside the item. `[!]` tasks are not selectable.
    **M0145-0011** (measured re-evaluation of the derived-input
    blockers — knob-arm private evidence only) → **M0145-0012**
    (retire the goopg-only `rows<=1` CTE fallback once `derived >=
-   guard effect` is demonstrated or made to hold). The
-   Q78 `outer-over-derived` firewall is a hard constraint on every
-   pull-up/flattening task.
+   guard effect` is demonstrated or made to hold) →
+   **M0145-0013** (seam admission for pulled `*CTEScan` leaves —
+   the `pulled-leaf-not-scan`/`flat-leaf-not-scan` class E2
+   measured, 30 fires) → **M0145-0014** (nested-sublink pull-up
+   recursion — `any-nested-sublink`, 6) → **M0145-0015** (residual
+   census + OR/NOT-position sublinks — PG's actual reach only) →
+   **M0145-0016** (`semianti-not-tail` leaf reorder — verify
+   subsumption by 0005's slice (a) first) → **M0145-0017**
+   (never-reach census — sublinks outside top-level WHERE conjuncts)
+   → **M0145-0018** (`outer-over-derived` firewall relaxation —
+   owner GO 2026-09-21; LAST in the chain: only after 0013 lands and
+   a fresh E1 re-verification keeps the relaxed plans clean). The
+   Q78 `outer-over-derived` firewall remains a hard constraint on
+   every pull-up/flattening task UNTIL M0145-0018 executes it.
 4. **M0141-S2a-fix2r** — re-apply the PG-faithful `hashAggEntrySize` change that
    was discarded for parity reasons (owner Q4: no reverts). Degradations it
    causes are filed as their own tasks, not reverted.
@@ -12721,7 +12732,13 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
       bare-`*SeqScan` relaxation as a sanctioned re-evaluation.)
     - The remaining actionable ANY bucket is `any-nested-sublink` (6):
       PG recurses `pull_up_sublinks` into a pulled body's own quals
-      (`pull_up_sublinks_qual_recurse`); goopg does not.
+      (`pull_up_sublinks_qual_recurse`); goopg does not. Filed as
+      **M0145-0014** (owner directive 2026-09-21). The residual
+      census classes are likewise filed: OR/NOT-position sublinks +
+      the unnamed residual 3 → **M0145-0015**; the never-reached
+      population (sublinks outside top-level WHERE conjuncts) →
+      **M0145-0017**; the `pulled-leaf-not-scan` seam re-check that
+      E2's CTEScan-leaf admission relocated into → **M0145-0013**.
   - **Decline census (loop 2026-09-21 \#19)** — which arm to build next,
     measured instead of ranked by size. `notePullupDecline`
     (`internal/optimizer/nlicensus.go`, `GOOPG_NLI_CENSUS=1`) reports one
@@ -12731,9 +12748,13 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
     - `SubqueryExpr` 15 — scalar sublinks, which PG does NOT pull up
       either (they stay SubPlans). Not a gap; do not build for it.
     - `(pulled)` 9 — the flat EXISTS arm's successes.
-    - `ExistsExpr` 2 — EXISTS not at conjunct top level (under OR); PG
-      handles some of those in its OR arm (prepjointree.c:797), so a
-      small real gap.
+    - `ExistsExpr` 2 — EXISTS not at conjunct top level (under OR).
+      Correction 2026-09-21: PG does NOT recurse into OR args
+      (`pull_up_sublinks_qual_recurse` returns non-AND clauses
+      unmodified, prepjointree.c:877); the earlier ":797" citation
+      pointed at the `is_notclause` (NOT EXISTS → ANTI) arm, not an
+      OR arm. Whether any of the 2 are pullable is a measurement
+      question, filed as **M0145-0015**.
     - NO `pullUpExistsBody` gate fired at all (`body-not-simple`,
       `no-level1-correlation`, `no-spanning-conjunct`, …): every
       recognised EXISTS conjunct was pulled. The EXISTS arm's gates are
@@ -12872,6 +12893,27 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
       leaf materialisation (retires `extractSearchLeaves` node-walk +
       spans/offset validation), one-rel floor (`isSimpleSingle`/
       `GOOPG_ONEREL_SEARCH`), Phase A/B + `admitSemiAnti` retirement.
+    - **Decline-bucket ownership (2026-09-21 audit, owner directive)**:
+      `leaf-count` (26 fires, dominant) is owned by the IR-direct leaf
+      materialisation slice — its members are already-planned composites
+      (`*Project`, `*Gather`, `*NestedLoopIndexJoin`, `*CTEScan`) that no
+      leaf-admission predicate can decompose (M0144-0003a's census
+      measured both candidate predicates as zero-witness); only leaves
+      sourced from the jointree IR make them searchable.
+      `leaf-count-overflow` is NOT automatically covered — it is a
+      `RelSet` bit-width refusal (`len(scans) > maxSearchRels`,
+      joinsearchseam.go:474) that survives any change in WHERE the
+      leaf count comes from; the IR slice must either widen `RelSet`
+      or record the limit as a deliberate divergence. `outer-spine`
+      (2) fires on the
+      legacy arm only — the knob arm bypasses `splitOuterSpine`, so the
+      class dies with the arm at cutover; no separate task. The
+      pull-up-census buckets are filed separately: `pulled-leaf-not-scan`
+      → **M0145-0013**, `any-nested-sublink` → **M0145-0014**,
+      residual/OR-position → **M0145-0015**, `semianti-not-tail` →
+      **M0145-0016** (subsume-check first), never-reached population →
+      **M0145-0017**, `outer-over-derived` relaxation → **M0145-0018**
+      (owner GO).
     - Tests: `internal/optimizer/joinsearch_m0145_test.go` — searched
       flat LEFT spine pin, both-arms parity pin, FULL fail-closed pin.
     - Slice 4 (landed, loop 2026-09-21 #7): one-relation and degenerate
@@ -13345,8 +13387,11 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
       - The one lever on this ratio is the CTEScan-body class (15),
         whose blocker is B-06 = **M0145-0009** — whose census has since
         shown the column channel is exhausted upstream; the measured
-        re-evaluation of that class is **M0145-0011** (E2 arm). Resume
-        there, then re-run this census and re-adjudicate slice 4.
+        re-evaluation of that class is **M0145-0011** (E2 arm —
+        DONE: the pull-up gate now admits the leaves and the class
+        relocated to the seam's `pulled-leaf-not-scan`, filed as
+        **M0145-0013**). Resume there, then re-run this census and
+        re-adjudicate slice 4.
       - **Consequence for M0145-0008**: its text requires this task, so
         the cutover is NOT selectable as written — even though BOTH of
         its named TIMING blockers are now discharged (gap 1.06x).
@@ -13669,19 +13714,16 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
   - **On completion — reconsider the blocked work (evaluate, do not
     auto-do):**
     - `flattenPulledBodyTree`'s bare-`*SeqScan` rule (M0145-0003 ANY
-      residue): the ledger already sanctions this step — once a
-      `*CTEScan` leaf carries row/width estimates, relax the rule and
-      re-run the knob-arm sweep. File as its own task if the work is
-      more than the rule relaxation.
+      residue): RESOLVED into tasks — M0145-0011 E2 measured the rule
+      relaxed (class relocated to the seam's `pulled-leaf-not-scan`),
+      and the seam admission it exposed is filed as **M0145-0013**.
     - `outer-over-derived` firewall (`relfromjoinlist.go`; 12 corpus
-      fires at filing, 3 on the loop-#34 re-measure): evaluate whether the named resume condition is genuinely
-      met — derived estimates must now out-rank the defaults AND a live
-      Q78 run must show the ~19 s shape holds (the C-04a regression
-      class is 15 s -> 327 s). The measurement vehicle is **M0145-0011**
-      (knob-arm firewall-bypass + CTEScan-leaf admission, private
-      evidence). Owner hard constraint: if the evidence is
-      ambiguous, ESCALATE rather than lift; a clean lift is itself a
-      separate task.
+      fires at filing, 3 on the loop-#34 re-measure): M0145-0011 E1
+      measured the bypass clean at SF0.25 AND SF1 (Q77/Q78 only, hash
+      join holds, values identical, timings improve); the owner
+      accepted the redefined condition and the lift is filed as
+      **M0145-0018** — sequenced after M0145-0013 and gated on a
+      fresh E1 re-verification at execution time.
     - The `rows<=1` guard (`joinsearch.go:520-526`, `initialRelRows`): same criterion —
       removal only after derived estimates demonstrably reach the
       guard's effect on the year_total shapes (ledger step 4). That
@@ -13815,7 +13857,9 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
       **`lateral` 2** — 36 total, where the 8 came from a pre-slice-3
       census with 132 total declines.
     - `leaf-count` (26) now DOMINATES and is ledgered as
-      executor-substrate-blocked — out of this task's reach.
+      executor-substrate-blocked — out of this task's reach. Its owner
+      is M0145-0005's IR-direct leaf materialisation slice (named in
+      that task's decline-bucket ownership note, 2026-09-21 audit).
     - Gap detail: `RelOptInfo` has no lateral/param sets at all; PG's
       `join_is_legal` needs BOTH `lateral_relids` (direction) and
       `direct_lateral_relids` (rejects indirect refs),
@@ -13921,7 +13965,8 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
     the firewall off (Q77 9015->5306 ms, Q78 50885->48066 ms). Adjudication
     for the owner: the unblock conditions can be redefined as "PG-equivalent
     row estimates + measured safety at the scale the catastrophe was
-    measured", and a relaxation is filed as its own task. **No relaxation is
+    measured", and a relaxation is filed as its own task (owner accepted:
+    **M0145-0018**, sequenced after M0145-0013). **No relaxation is
     landed here**; the firewall and the `rows<=1` guard are untouched on the
     default arm.
   - **(c)/E2 is the only scope still open** — relax
@@ -13942,12 +13987,15 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
     The three plans that move do so via the documented `pulled`-suppression
     side effect (estimated cost falls 1.4x-2.4x, measured runtime is flat to
     2-11% WORSE, values byte-identical, semi/anti counts preserved).
-  - **Resume point for a follow-on task, if the owner files one**: the seam's
-    pulled-leaf binding loop in `internal/optimizer/joinsearchseam.go` needs a
-    `rangeBinding` for a leaf with no `Table`/`Alias` and an
+  - **Resume point FILED as M0145-0013** (owner directive 2026-09-21):
+    the seam's pulled-leaf binding loop in
+    `internal/optimizer/joinsearchseam.go` needs a `rangeBinding` for a
+    leaf with no `Table`/`Alias` and an
     `estimateBaseRelInfo`/`applyRelSizeFallback` arm for a leaf with no
-    catalog statistics; the adjacent `flat-leaf-not-scan` check is the third
-    site to audit. Both sibling comments now cross-reference each other.
+    catalog statistics; the adjacent `flat-leaf-not-scan` check is the
+    third site to audit. Both sibling comments now cross-reference each
+    other. The firewall relaxation (d) recommended is filed as
+    **M0145-0018** (owner GO 2026-09-21), sequenced after 0013.
     Ledgered 2026-09-21.
   Movement: none — the default arm is unchanged by construction (both flags
   default to today's behaviour) and the gates confirm it; the knob-arm census
@@ -13977,3 +14025,173 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
   M0145-0011 so its evidence base is reused.
   Kind: impl
   Parent: none
+- [ ] **M0145-0013 — admit pulled `*CTEScan` leaves at the seam
+  (`pulled-leaf-not-scan` / `flat-leaf-not-scan`)** (filed 2026-09-21
+  by owner directive; the follow-on task M0145-0011's E2 resume point
+  named). E2's flag measurement moved `any-body-leaf-(*CTEScan)`
+  30 -> 0 at the pull-up census (all Q14/Q23/Q95) — and every one of
+  them then declined at the seam's `pulled-leaf-not-scan` re-check:
+  the bare-`*SeqScan` rule is one invariant held at two sites
+  (`flattenPulledBodyTree` produces, `tryPGShapedJoinSearch`
+  re-checks). Land the admission machinery E2 scoped
+  (`internal/optimizer/joinsearchseam.go`):
+  - a `rangeBinding` for a pulled leaf with no `Table`/`Alias` —
+    the body's own bindings already exist on the `jtPullup` record
+    (`leafScans`/`bodyBindings`); hand them through rather than
+    synthesising opaque ones;
+  - an `estimateBaseRelInfo`/`applyRelSizeFallback` arm for a leaf
+    with no catalog statistics — `EstimateRows(*CTEScan)` recurses
+    the body (≈ `set_cte_size_estimates`' `plan_rows` propagation,
+    `postgres/src/backend/optimizer/path/allpaths.c:2959`); do NOT
+    synthesise column stats (M0145-0009's census proved the
+    remaining asks are columns PG itself leaves unknown);
+  - audit the third site, the `flat-leaf-not-scan` check, the same
+    way.
+  Hard constraint, unchanged: a `pulled` mark must not suppress the
+  statement's legacy subplan route when the seam still declines the
+  problem — either delay marking until admission, or fall back to
+  the post-DP unnest on decline (the Q4 16s regression shape in the
+  M0145-0008 ledger row is this window). Correctness gate: values
+  identical on the moved statements.
+  Expected movement: `pulled-leaf-not-scan` 30 -> 0 on the SF0.25
+  seam census (Q14/Q23/Q95); the admitted problems then reach the
+  `outer-over-derived` check — Semi/Anti SJIs touching the derived
+  leaf still decline there until M0145-0018, which is the correct
+  ordering (admission machinery first, relaxation last). Re-run
+  PULLUPCENSUS + seam-decline census + SUBLINKCENSUS and record the
+  new pinned-spine/jointree-pullup ratio. Knob arm only; default
+  arm byte-identical.
+  Kind: impl
+  Parent: M0145-0011
+- [ ] **M0145-0014 — recurse the pull-up into pulled bodies' own
+  quals (`any-nested-sublink`)** (filed 2026-09-21 by owner
+  directive). Census: 6 conjuncts on TPC-DS SF0.25 decline because
+  the ANY/EXISTS body's own WHERE still contains a sublink. PG
+  recurses — after `convert_ANY_sublink_to_join`/
+  `convert_EXISTS_sublink_to_join` splices the body in,
+  `pull_up_sublinks_qual_recurse` is re-run on the pulled-up quals
+  (`postgres/src/backend/optimizer/prep/prepjointree.c:682-693`,
+  `:736-747`, and the NOT arm at `:836-845`), so
+  `x IN (SELECT … WHERE EXISTS (…))` becomes two semi/anti
+  jointree entries, not one declined conjunct. Port the recursion:
+  when `pullUpAnyBody`/`pullUpExistsBody` binds a body whose quals
+  still carry EXISTS/IN sublinks, run the same classifier on them
+  (depth-guarded; each level re-bases correlation one step further
+  out) and fold the resulting bodies into the same `jtPullup`
+  record. A nested sublink that is scalar stays declined — the same
+  correct-decline rule as the outer level.
+  Expected movement: `any-nested-sublink` 6 -> 0; re-run the
+  pull-up census and record the ratio.
+  Kind: impl
+  Parent: M0145-0003
+- [ ] **M0145-0015 — name the residual pull-up decline class and
+  cover the PG-reachable subset under OR/NOT positions** (filed
+  2026-09-21 by owner directive). The 60-conjunct census leaves 3
+  "residual" conjuncts plus 2 `ExistsExpr` not at conjunct top
+  level (under OR). Measurement first: extend the pull-up census so
+  each unrecognised conjunct reports its sublink `%T` AND the clause
+  position it was found under (OR arg, NOT arg, nested inside a
+  scalar expression). Then implement only what PG actually converts:
+  `pull_up_sublinks_qual_recurse` stops at non-AND clauses
+  (`prepjointree.c:877` — OR args are NOT recursed), while a
+  NOT-wrapped EXISTS does convert (the `is_notclause` arm,
+  `:789-845`); EXISTS buried deeper (OR args, scalar contexts) stays
+  a SubPlan in PG too — upstream's `convert_EXISTS_to_ANY`
+  (`plan/subselect.c:1717`) merely rewrites it as a hashed ANY
+  subplan, not a jointree citizen. So check whether goopg already
+  has an equivalent hashed-subplan path before building anything,
+  and file only the missing PG-equivalent piece. If the pullable
+  subset is zero, record that and close as measured-no-gap.
+  Expected movement: residual 3 named; the OR/NOT-position
+  conjuncts moved for exactly the subset PG moves.
+  Kind: impl
+  Parent: M0145-0003
+- [ ] **M0145-0016 — `semianti-not-tail`: admit non-tail synthetic
+  leaves (leaf reorder + relset remap)** (filed 2026-09-21 by owner
+  directive; ledgered at `joinsearchseam.go`'s construction contract
+  as "real future work, not a guard to relax"). 3 fires on the
+  SF0.25 census — the demoted-ANTI mid-chain shape
+  (`web_sales ANTI web_returns JOIN date_dim`, walking
+  `[real, synthetic, real]`): c2's contract requires every
+  synthetic leaf in a tail slot, so a real leaf after a synthetic
+  one in walk order declines. The work is leaf reorder +
+  relset/span remap so `jl`'s leaf items, `ctx.bindings`, and the
+  synthetic span bindings stay consistent for arbitrary placement —
+  Q78's `translateToLayout` panic was this assumption violated, so
+  every admitted shape needs a values check, not just a green
+  census. NOTE: M0145-0005's remaining slice (a) makes semi/anti
+  real numbered leaf items, which retires the synthetic-slot
+  contract by construction — if that slice lands first, verify this
+  decline is gone on the corpus and close this task as subsumed
+  rather than building the remap.
+  Expected movement: `semianti-not-tail` 3 -> 0 (Q78's chain is the
+  witness — keep it oracle-verified, it is the query that panicked
+  when the assumption broke).
+  Kind: impl
+  Parent: M0145-0005
+- [ ] **M0145-0017 — census the never-reached sublink population
+  and pull the PG-pullable subset** (filed 2026-09-21 by owner
+  directive). Of 308 knob-arm sublink-planning events, only ~60
+  conjuncts ever reach `pullUpSublinksIntoJointree` — the rest
+  carry sublinks outside top-level WHERE conjuncts (SELECT target
+  list, HAVING, ON clauses, nested expression positions). Most are
+  probably correct non-pulls (PG keeps target-list scalar
+  subqueries as SubPlans too), but the population has never been
+  measured by clause position, and PG's reach is wider than WHERE:
+  `pull_up_sublinks_jointree_recurse` runs the pull-up on every
+  jointree level's quals, including join ON clauses — with PG's
+  legality boundary preserved (`prepjointree.c:587-610`): ON quals
+  are processed for INNER (both sides), LEFT (the RHS only) and
+  RIGHT (the LHS only) joins, and NEVER for FULL — a sublink pulled
+  from a null-preserved side is a wrong-answer class, so the census
+  must record join side+type, not just "in an ON clause". Step 1:
+  extend the census so a statement's sublinks are counted by clause
+  position and kind, on both arms, and name which positions hold
+  EXISTS/ANY conjuncts PG would pull. Step 2: extend
+  `pullUpSublinksIntoJointree`'s walk to the ON quals of explicit
+  joins honouring the same side/type restrictions, for the pullable
+  subset only.
+  If the census finds no PG-pullable class outside WHERE, record
+  that and close as measured-no-gap.
+  Expected movement: the 248-event never-reach population
+  decomposed into "correctly out of reach" vs "newly pulled".
+  Kind: impl
+  Parent: M0145-0003
+- [ ] **M0145-0018 — relax the `outer-over-derived` firewall
+  (owner decision GO, 2026-09-21)**. M0145-0011's E1 measured the
+  diagnostic bypass clean at BOTH scales: on SF0.25 AND SF1
+  (private `:5547` clone) only Q77/Q78 move, Q78 stays a hash join
+  with honest CTE estimates (cs 11->2280, ws 7->1485), values
+  byte-identical, timings improve (Q77 9015->5306 ms, Q78
+  50885->48066 ms). Owner has authorised the relaxation; this task
+  lands it at the correct time — NOT now, because the fixes that
+  make the relaxed path actually exercised are still in flight.
+  Preconditions, checked at execution time, not assumed:
+  - **M0145-0013 landed**: the pulled-CTE-body problems that E2
+    admitted past `flattenPulledBodyTree` reach the firewall check
+    only once the seam's leaf admission exists — relaxing earlier
+    would leave the biggest derived-input population untested.
+  - **Fresh E1 re-verification on the current tree**: re-run the
+    SF0.25 seam census for the current `outer-over-derived` set
+    (the population drifts — it was 12, then 3), then re-capture
+    plans + timings + values for Q77/Q78 and the current fire set
+    on the knob arm with `GOOPG_DERIVED_FIREWALL=off`, at SF0.25
+    AND SF1. Pass criteria unchanged: no NL-epsilon election, Q78
+    holds its ~19 s-class shape, values identical. Any C-04a-class
+    regression is an automatic no-go — keep the firewall and
+    escalate the measurement instead.
+  Then, and only then: remove the decline in
+  `problemPairsOuterWithDerived` (`relfromjoinlist.go`) — including
+  its Semi/Anti arms, which is what lets pulled CTE bodies into DP
+  — delete the diagnostic flag and the now-dead comment, and run
+  the full gate set on the DEFAULT arm (units, tpch-spotcheck,
+  SF0.25 sweep values + plan-shape channel, TPC-H acceptance, an
+  SF1 timing spot-check on Q77/Q78). The `rows<=1` guard
+  (M0145-0012) is a separate arm and stays untouched here — E1 was
+  measured WITH it on, so removing the firewall does not depend on
+  retiring it.
+  Expected movement: `outer-over-derived` 3 -> 0 on the seam
+  census; the Q14/Q23/Q95 pulled-CTE problems admitted by
+  M0145-0013 reach DP.
+  Kind: impl
+  Parent: M0145-0011

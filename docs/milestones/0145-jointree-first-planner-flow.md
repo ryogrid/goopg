@@ -51,6 +51,12 @@ lowering replaces the interleaved stage-builder resolutions.
 | M0145-0010 | impl | Parameterized-path legality — rel-level `param_info`/`lateral_relids` + `reparameterize_path` analogue (`pathnode.c`), extending the existing `Path.RequiredOuter` machinery: the `lateral` decline family (8 corpus fires, Q30/Q68) and the partial-NLI whitelist's LEFT/ANTI entries re-evaluated on completion, not auto-admitted; every newly admitted shape passes an executor-capability check first |
 | M0145-0011 | impl | Measured re-evaluation of the derived-input blockers (proposal `tmp/blocker-re-think-260912/01-proposal.md` 案A): diagnostic firewall-bypass flag (production change → `Kind: impl` per C1) + knob-arm E1 (Q78 + `outer-over-derived` fires) and E2 (`*CTEScan` leaf admission — downstream of E1 since pulled bodies become Semi/Anti SJIs). Produces evidence for an owner decision; lands no relaxation |
 | M0145-0012 | impl | Retire the `rows<=1` CTE fallback (`initialRelRows`, `joinsearch.go:520-526`) — a goopg-only divergence (PG's `clamp_row_est` keeps the collapse): demonstrate `derived >= guard effect` on the corpus fires or wire a mechanism that makes it hold, then remove. Sequenced after 0011's evidence |
+| M0145-0013 | impl | Admit pulled `*CTEScan` leaves at the seam (`pulled-leaf-not-scan`/`flat-leaf-not-scan`, 30 fires — Q14/Q23/Q95): Table-less `rangeBinding` + statistics-free `estimateBaseRelInfo` arm + third-site audit. E2's resume point; problems then wait on 0018 at the firewall |
+| M0145-0014 | impl | Recurse the pull-up into pulled bodies' quals (`any-nested-sublink`, 6) — PG's `pull_up_sublinks_qual_recurse` re-runs on pulled-up quals after each splice |
+| M0145-0015 | impl | Name the residual decline class + cover the PG-reachable subset under OR/NOT positions (PG recurses AND, converts `NOT EXISTS`, does NOT recurse OR — buried EXISTS is `convert_EXISTS_to_any`, a different path) |
+| M0145-0016 | impl | `semianti-not-tail` (3): leaf reorder + relset remap for non-tail synthetic leaves — check 0005 slice (a) subsumption first |
+| M0145-0017 | impl | Census the never-reached sublink population (~248 of 308 events: sublinks outside top-level WHERE conjuncts) by clause position; extend pull-up to ON-qual reach for the PG-pullable subset only |
+| M0145-0018 | impl | Relax the `outer-over-derived` firewall — owner GO 2026-09-21; LAST: only after 0013 lands and a fresh E1 re-verification (SF0.25 + SF1) keeps relaxed plans clean; then remove `problemPairsOuterWithDerived` + the diagnostic flag, full default-arm gates |
 
 Dependencies: 0001 → {0003, 0004} → 0005 → {0006, 0007} → 0008.
 0002 is independent and should land early so every later task is measurable.
@@ -64,7 +70,14 @@ work outside), but doing it after 0005 avoids building required_outer
 translation on the legacy arm's coordinate machinery that 0005 retires.
 0011/0012 are the blocker's re-definition path after 0009's census
 exhausted the column channel — 0011 measures, 0012 retires the divergence
-once the criterion holds.
+once the criterion holds. 0013–0017 are the decline-bucket filings from the
+2026-09-21 census audit — each removes one named pull-up/seam decline class
+so the pinned-spine ratio keeps shrinking toward the 0008 cutover; the
+banner sequences them in the listed order, and the only hard dependency is
+0013 → 0018. 0018 is the owner-approved `outer-over-derived` relaxation and
+is deliberately LAST: it must land only after 0013 makes the
+pulled-CTE-body shapes reachable and a fresh E1 re-verification shows the
+relaxed plans stay clean.
 
 ## Handoffs from M0137–M0144
 

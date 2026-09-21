@@ -391,7 +391,8 @@ func bindPulledBodyScope(sub *parser.SelectStmt, parent *resolveContext, cat cat
 // So the resume point for scope (c) is the seam, not this line: the pulled
 // leaf binding at joinsearchseam.go needs a `rangeBinding` for a leaf with no
 // `Table`/`Alias`, plus an `estimateBaseRelInfo`/`applyRelSizeFallback` arm
-// for a statistics-less leaf. That is a real piece of work, not a gate flip.
+// for a statistics-less leaf. That is a real piece of work, not a gate flip —
+// filed as M0145-0013 (owner directive 2026-09-21).
 var pullupCTELeafEnabled = os.Getenv("GOOPG_PULLUP_CTE_LEAF") == "on"
 
 // flattenPulledBodyTree decomposes the body's provisional jointree into

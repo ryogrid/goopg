@@ -584,7 +584,9 @@ func leafIsDerivedInput(scan Node, info baseRelInfo) bool {
 // relaxation. Turning it off is for EXPLAIN-only private evidence on the knob
 // arm (G8). The shape it guards against is not hypothetical — C-04a measured a
 // 15 s Hash plan become a 327 s Nested-Loop timeout when an epsilon rows=1
-// estimate on a derived input won the comparison.
+// estimate on a derived input won the comparison. The owner-approved lift is
+// filed as M0145-0018 (2026-09-21): it removes this check + this flag only
+// after M0145-0013 lands and a fresh E1 re-verification passes.
 var derivedFirewallEnabled = os.Getenv("GOOPG_DERIVED_FIREWALL") != "off"
 
 // problemPairsOuterWithDerived reports whether any OUTER hand in sjis
@@ -748,8 +750,11 @@ func (prob *joinlistProblem) searchOneProblem(items []joinlistRel, tupleFraction
 	// legacy rewrites hash outer joins without a cost comparison — the
 	// pre-C-04a shape. Base-leaf outer problems (Q72) are unaffected;
 	// inner-only problems over derived inputs are unaffected (their
-	// rows=1 is A4-expected and values-passing). Resume: lift when B-06
-	// wires CTE-output stats (TODO_ALL B-06 step 4).
+	// rows=1 is A4-expected and values-passing). Resume: the original
+	// condition ("lift when B-06 wires CTE-output stats") was redefined
+	// to measured safety after M0145-0009's census showed the column
+	// channel exhausted upstream — the owner-approved lift is filed as
+	// M0145-0018 (2026-09-21).
 	if derivedFirewallEnabled && problemPairsOuterWithDerived(sjis, items, prob) {
 		traceSeamDecline("outer-over-derived", len(prob.bindings), len(items))
 		return joinlistRel{}, fmt.Errorf("join search: problem pairs an outer join with a derived input, which carries no statistics")

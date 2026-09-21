@@ -453,7 +453,9 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 	// reaches createPlan on a real-only layout (Q78's panic). The
 	// on-qual gates used to decline such chains before construction;
 	// admitting them is real future work (leaf reorder + relset
-	// remap), not a guard to relax. Unnest-produced Semi/Anti links
+	// remap), not a guard to relax — filed as M0145-0016 (owner
+	// directive 2026-09-21); check M0145-0005 slice (a) subsumption
+	// first. Unnest-produced Semi/Anti links
 	// always sit at the TOP of the FROM chain, so their synthetic
 	// leaves are always the tail — this declines nothing the splice
 	// emits.
@@ -916,6 +918,7 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 	// producer owns this loop too: a derived leaf has no `ss.Table` or
 	// `ss.Alias` to build the `rangeBinding` from, and no catalog
 	// statistics for `estimateBaseRelInfo`/`applyRelSizeFallback` below.
+	// Filed as M0145-0013 (owner directive 2026-09-21).
 	for i := nReal; i < nprefix; i++ {
 		b := rangeBinding{offset: spans[i].lo}
 		scan := scans[i]
