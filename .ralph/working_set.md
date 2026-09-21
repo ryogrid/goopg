@@ -1,48 +1,50 @@
 (idle — nothing in flight)
 
-# Loop #86 — M0145-0004 residual PINNED to one missing consumer (3rd hypothesis refuted)
+# Loop #87 — the declining condition is NAMED: the union leaf's ConsiderParallel=0
 
 Banner unchanged; 0018 owner-blocked → chain stays at **M0145-0004** (`[ ]`).
 Recon: no `internal/`/`cmd/` file touched (C1). Movement: none.
 Design: `docs/design/0100-0149/m0145-0004-union-all-appendrel-leaf.md`,
-final section ("Pinned to one query, and a self-correction").
+final section ("The declining condition, named at last").
 
-## ⚠ SELF-CORRECTION of loop #85
-"The hoist fires and its paths are accepted" is true CORPUS-WIDE (4 filings)
-and **false for Q71** — no `baserel.appendrel.partial` line in Q71's trace at
-all. A corpus count was generalised to one query. Don't do that again.
+## 4th hypothesis REFUTED, then the answer
+- **Refuted**: a union subquery in FROM lowers to a **bare `*SetOp`** as the
+  join input, with or without column renames (white-box probe). No `*Project`
+  wrapper; `rel.baseLeaf` IS a carrier type.
+- **THE ANSWER** — from a trace channel that already existed:
+  ```
+  DPTRACE cpadmit src=base rel={tmp} cp=0 leaf=other     <- Q71's union alias
+  DPTRACE cpadmit src=base rel={item} cp=1 leaf=seq      <- every other leaf
+  ```
+  `considerParallel` emits this under the SAME `GOOPG_PGSHAPED_DP_TRACE=1`
+  gate as DPPATH (`joinsearchtrace.go` `baseCP`). So
+  `addAppendRelPartialPaths`'s `if !rel.ConsiderParallel { continue }`
+  is what declines the hoist.
 
-## Single-query trace (Q71 alone, private SF0.25 lane) — the facts
-```
-upper.setop.append.partial relids={0} rows=74  total=18936.41 accepted  inner
-upper.setop.append.partial relids={1} rows=168 total=37279.17 accepted  OUTER
-gather                     relids={0} rows=229 total=19959.31 accepted  <- inner gathered
-(no gather over relids={1}'s partial; no baserel.appendrel.partial at all)
-```
-So loop #85's hypothesis (outer link wins no partial path / branch rels unset)
-is **REFUTED**: the outer link's partial exists and is accepted.
-Plan takes the serial outer Append (39336.25) though gathering the partial
-would have cost ~38300.
+## NEXT STEP — narrow to ONE of three (each a one-line check)
+`considerparallel.go`'s appendrel arm sets
+`rel.ConsiderParallel = setOpRel.ConsiderParallel` when the mark is set and the
+carrier resolves. `cp=0` means it did not take, so:
+1. `s.relInfos[i].appendrel` false at the search (propagation gap — the binding
+   DOES set `b.appendrel` at planner.go:5864);
+2. **`carrier.setOpBranchRel()` nil** — the node the outer binder gets is not
+   the instance `createSetOpPaths` stamped, since `createSetOpPlan` rebuilds it
+   via `createPlanNode`. ← most likely on the evidence;
+3. `setOpRel.ConsiderParallel` false at that moment (ordering —
+   `addPartialSetOpPath` is what sets it).
+Check, then fix. Four hypotheses already refuted here; do not code against a
+fifth guess.
 
-## Also measured, NOT assumed
-`subqueryChainIsSimpleUnionAll` ACCEPTS Q71's union (probed on the parse tree:
-`from[1]: SetOp!=nil=true isSimpleUnionAll=true`) → the mark predicate is fine.
-
-## THE ONE HYPOTHESIS LEFT — check the TYPE first, do not code
-`addAppendRelPartialPaths` requires `rel.baseLeaf` to BE the carrier and
-disqualifies any wrapper (Filter/Sort/Limit/Project/LockRows). Q71's subquery
-renames every column, so its root is plausibly a **`*Project` over the
-`*SetOp`** → carrier lookup fails silently.
-**Check `rel.baseLeaf`'s concrete type for this leaf FIRST.** Three hypotheses
-refuted in a row; the cost of assuming a fourth is established.
-If it IS a `*Project`: do NOT blanket-admit `*Project`. The wrapper rule is
-right for a row-CHANGING Project. Implement positional-identity vs computing —
-**M0144-0011a-3 already drew that exact distinction**.
+## ⚠ METHOD NOTE — keep this
+`DPTRACE cpadmit` runs under the gate this milestone uses everywhere, and FOUR
+loops asked "which condition declined?" without looking at it. When a silent
+`continue` is the suspect, check whether an existing trace channel already
+covers the predicate before proposing to add one.
 
 ## Gates
 Recon, zero production diff → no value gates (C1). state guard OK; pgbench
-smoke via the commit hook. Lane stopped, `/tmp/q71lane` removed, 5565 free.
-Evidence kept: `tmp/m0145-0004-q71-dppath.log`, `…-q71-single-trace.plan`.
+smoke via the commit hook. Reused loop #86's kept trace
+(`tmp/m0145-0004-q71-dppath.log`) — no lane started this loop.
 
 ## ⚠ LINEAGE BLOCKER STILL OPEN
 No new task can be filed under root M0145-0001. Findings go inside existing

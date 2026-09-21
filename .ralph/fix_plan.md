@@ -13937,15 +13937,38 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
           `subqueryChainIsSimpleUnionAll` ACCEPTS Q71's union
           (`from[1]: SetOp!=nil=true isSimpleUnionAll=true`), so the mark
           predicate is satisfied.
-      - **The one hypothesis left — verify before changing anything.**
-        `addAppendRelPartialPaths` requires `rel.baseLeaf` to BE the
-        carrier; its comment disqualifies any wrapper (`Filter`, `Sort`,
-        `Limit`, `Project`, `LockRows`). Q71's subquery renames every column
-        (`ws_ext_sales_price as ext_price`, …), so its root is plausibly a
-        `*Project` over the `*SetOp`, which would fail the carrier lookup
-        silently. **Check `rel.baseLeaf`'s concrete type first** — three
-        hypotheses have now been refuted in a row on this residual, each by
-        measuring one level deeper.
+      - ~~**The one hypothesis left** … a `*Project` over the `*SetOp` …~~
+        **REFUTED 2026-09-22 (loop \#87)**: a white-box probe shows a union
+        subquery in FROM lowers to a **bare `*SetOp`** as the join input,
+        with or without column renames, so `rel.baseLeaf` IS a carrier type.
+      - **THE DECLINING CONDITION IS NAMED AT LAST — `ConsiderParallel`.**
+        `considerParallel` emits one line per base leaf under the SAME
+        `GOOPG_PGSHAPED_DP_TRACE=1` gate the DPPATH lines use
+        (`joinsearchtrace.go` `baseCP` → `DPTRACE cpadmit`), and Q71's
+        already-captured trace says:
+        `DPTRACE cpadmit src=base rel={tmp} cp=0 leaf=other`
+        (`tmp` is Q71's union alias; every other leaf reads `cp=1`).
+        So `addAppendRelPartialPaths`'s `if !rel.ConsiderParallel { continue }`
+        is what declines the hoist.
+      - `considerparallel.go` has an appendrel arm written for exactly this
+        leaf (`rel.ConsiderParallel = setOpRel.ConsiderParallel` when the
+        mark is set and the carrier resolves). `cp=0` means the override did
+        NOT take, so exactly one of three holds — each a one-line check now
+        that the gate is known:
+        1. `s.relInfos[i].appendrel` is false at the search — a propagation
+           gap into `baseRelInfo`, since the binding does set `b.appendrel`;
+        2. `carrier.setOpBranchRel()` is nil — the node the outer binder
+           receives is not the instance `createSetOpPaths` stamped, because
+           `createSetOpPlan` rebuilds it through `createPlanNode`;
+        3. `setOpRel.ConsiderParallel` is itself false at that moment (an
+           ordering question — `addPartialSetOpPath` is what sets it).
+        (2) is the most likely on the evidence, but it is a hypothesis and
+        this residual's record says to check before coding.
+      - **Method note**: `DPTRACE cpadmit` is emitted by the gate this
+        milestone already uses everywhere. Four loops asked "which condition
+        declined?" and none looked at it. When a silent `continue` is the
+        suspect, check whether an existing trace channel already covers the
+        predicate before proposing to add one.
         - If it IS a `*Project`, the fix is NOT simply to admit `*Project`:
           the comment's reasoning holds for a row-changing Project but not
           for a pure rename/reorder. The distinction to implement is

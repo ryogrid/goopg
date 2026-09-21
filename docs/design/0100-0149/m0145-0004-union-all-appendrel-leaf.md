@@ -557,3 +557,70 @@ positional-identity `Project`.
 
 Evidence: `tmp/m0145-0004-q71-dppath.log` (the single-query trace) and
 `tmp/m0145-0004-q71-single-trace.plan`.
+
+
+## The declining condition, named at last (2026-09-22, loop #87)
+
+Four hypotheses have been refuted here in a row. The fifth attempt stopped
+guessing and read a trace channel that already existed.
+
+### `DPTRACE cpadmit` answers it directly
+
+`considerParallel` emits one line per base leaf under the **same**
+`GOOPG_PGSHAPED_DP_TRACE=1` gate the DPPATH lines use
+(`joinsearchtrace.go`'s `baseCP` → `DPTRACE cpadmit`). Q71's single-query
+trace, already captured, contains:
+
+```
+DPTRACE cpadmit src=base rel={web_sales}   cp=1 leaf=seq
+DPTRACE cpadmit src=base rel={item}        cp=1 leaf=seq
+DPTRACE cpadmit src=base rel={tmp}         cp=0 leaf=other     <- the union leaf
+DPTRACE cpadmit src=base rel={time_dim}    cp=1 leaf=seq
+```
+
+`tmp` is Q71's union alias. **`ConsiderParallel = 0`**, so
+`addAppendRelPartialPaths`'s `if !rel.ConsiderParallel { continue }` is the
+condition that declines the hoist. That is the first time the actual failing
+condition has been named rather than hypothesised.
+
+### What is ruled out by this, and what is left
+
+Ruled out, each measured: the mark predicate (probed — it accepts), the outer
+link's partial path (it exists and is accepted), the branch rels, and a
+`*Project` wrapper — a white-box probe shows a union subquery in FROM lowers to
+a **bare `*SetOp`** as the join input, with or without column renames, so
+`rel.baseLeaf` is a carrier type.
+
+`considerparallel.go` has an appendrel arm written for exactly this leaf:
+
+```go
+if s.relInfos[i].appendrel {
+    if carrier, ok := rel.baseLeaf.(setOpBranchRelNode); ok {
+        if setOpRel := carrier.setOpBranchRel(); setOpRel != nil {
+            rel.ConsiderParallel = setOpRel.ConsiderParallel
+        }
+    }
+}
+```
+
+`cp=0` means that override did not take, so exactly one of three holds, and
+they are one-line checks now that the gate is known:
+
+1. `s.relInfos[i].appendrel` is false at the search (the binding sets
+   `b.appendrel`, so this would be a propagation gap into `baseRelInfo`);
+2. `carrier.setOpBranchRel()` is nil — the node the outer binder receives is
+   not the instance `createSetOpPaths` stamped, since `createSetOpPlan`
+   rebuilds the node through `createPlanNode`;
+3. `setOpRel.ConsiderParallel` is itself false at that moment — an ordering
+   question, since `addPartialSetOpPath` is what sets it.
+
+(2) is the most likely on the evidence — a rebuilt node loses an embedded tag —
+but it is a hypothesis, and the record of this residual says to check before
+coding.
+
+### Method note worth keeping
+
+`DPTRACE cpadmit` is emitted by the gate this milestone already uses everywhere.
+Four loops asked "which condition declined?" and none of them looked at it. When
+a silent `continue` is the suspect, check whether a trace channel already covers
+the predicate before proposing to add one.
