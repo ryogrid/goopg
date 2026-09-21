@@ -38,6 +38,8 @@ import (
 	"fmt"
 	"os"
 	"strings"
+
+	"github.com/goopg/goopg/internal/parser"
 )
 
 // nliCensusEnabled gates the whole instrument. Read once, like `dpTrace`.
@@ -128,6 +130,34 @@ func sublinkConjunctKind(c Expr) string {
 		kind = strings.TrimPrefix(fmt.Sprintf("%T", x), "*optimizer.")
 	})
 	return kind
+}
+
+// noteNLIPathGate records why `addNLIPaths` did or did not FILE a path for a
+// semi/anti joinrel — a different question from `noteNLIBuilt`, which counts
+// nodes the lowering actually built.
+//
+// M0145-0007 slice 2 concluded the cutover waits on `addNLIPaths` admitting
+// SEMI/ANTI. Reading the function disproved that (it declines only
+// `JoinRight`), and the knob-arm census then showed the pull-up already hands
+// three of TPC-H's four semijoins to the search while search-built SEMI/ANTI
+// NLIs stay at zero. That leaves exactly one question — is a path generated
+// and out-costed, or never generated? — and it is answerable only at the
+// decline points, because a path that is never filed leaves no other trace.
+//
+// Restricted to semi/anti on purpose: the inner/left population is large and
+// already understood, and a census that logs it drowns the signal.
+func noteNLIPathGate(jt parser.JoinType, reason string) {
+	if !nliCensusEnabled {
+		return
+	}
+	if jt != parser.JoinSemi && jt != parser.JoinAnti {
+		return
+	}
+	name := "semi"
+	if jt == parser.JoinAnti {
+		name = "anti"
+	}
+	fmt.Fprintf(os.Stderr, "NLIGATE jointype=%s gate=%s\n", name, reason)
 }
 
 // nliCensusJoinTypeName names the join type for the census line. It is

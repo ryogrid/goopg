@@ -13137,7 +13137,19 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
       never generated; the next probe instruments `addNLIPaths`' other
       decline points (`uniq == uniqueSideOuter`, `o.RequiredOuter != 0`,
       the `param_source_rels` test), not its join-type set.
-    - **Hard constraint for M0145-0008**: deleting `rewriteJoinsToNLI`
+    - **ANSWERED 2026-09-21 (loop \#26): the paths ARE filed, and the
+      claimed cutover blocker is REMOVED.** `noteNLIPathGate` reports
+      `addNLIPaths`' outcome per semi/anti joinrel; on the knob arm
+      TPC-H gives `semi gate=filed` and `anti gate=filed` — no gate
+      declines. The search generates the NLI path and `add_path`
+      out-costs it, preferring a hash or merge semijoin. Deleting
+      `rewriteJoinsToNLI` at the cutover therefore removes the legacy
+      route's OVERRIDE, not the capability. Whether the cost preference
+      is right is a separate, live cost-accuracy question
+      (`stampSemiProbePrices` exists because a rewrite-built NLI carries
+      no path price), but it does not gate M0145-0008.
+    - ~~**Hard constraint for M0145-0008**~~ (superseded by the line
+      above): deleting `rewriteJoinsToNLI`
       with the legacy pipeline deletes the ONLY route that builds a
       SEMI/ANTI index-probe join. The cutover depends on `addNLIPaths`
       electing SEMI/ANTI NLI paths first (it files INNER/LEFT today) —

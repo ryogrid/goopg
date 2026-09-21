@@ -193,12 +193,39 @@ real leaf items. But the search did not replace them with SEMI/ANTI NLI paths;
 it elected some other method, so search-built semi/anti NLIs remain zero on
 both arms.
 
-**The open question is narrower and different**: for a pulled-up semi joinrel,
+**The open question was narrower and different**: for a pulled-up semi joinrel,
 is an NLI path generated and out-costed, or never generated? `addNLIPaths` has
 gates beyond the join type — `uniq == uniqueSideOuter`, `o.RequiredOuter != 0`,
 and `try_nestloop_path`'s `param_source_rels` test (joinpath.c:882-889) — any
-of which could decline before a path is filed. The next probe instruments those
-decline points; it does not touch the join-type set, which is already correct.
+of which could decline before a path is filed.
+
+### Answered (2026-09-21): the paths ARE filed
+
+`noteNLIPathGate` (nlicensus.go, same `GOOPG_NLI_CENSUS=1` gate) reports, per
+semi/anti joinrel, which of `addNLIPaths`' outcomes occurred: `jointype-right`,
+`outer-unusable`, `no-parameterised-inner`, `inner-rejected`, or `filed`. It is
+restricted to semi/anti because the inner/left population is large, understood,
+and would drown the signal.
+
+Knob arm, TPC-H SF1:
+
+```
+1 NLIGATE jointype=semi gate=filed
+1 NLIGATE jointype=anti gate=filed
+```
+
+No gate declined. The search generates an NLI path for the pulled-up semi and
+anti joinrels and then **out-costs** it — `add_path` prefers a hash or merge
+semijoin. So the capability is not missing; the cost comparison simply goes the
+other way.
+
+**This removes the claimed cutover blocker.** Deleting `rewriteJoinsToNLI` at
+M0145-0008 does not delete the ability to build a SEMI/ANTI index-probe join;
+it deletes the legacy route's OVERRIDE, which forced an NLI where the cost
+model prefers another method. Whether that preference is right is a
+cost-accuracy question, and a live one — `stampSemiProbePrices` exists
+precisely because a rewrite-built NLI carries no path price while a search-built
+one does — but it is not a capability gap, and it does not gate the cutover.
 
 ## Slice plan
 

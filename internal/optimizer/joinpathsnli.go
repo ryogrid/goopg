@@ -289,6 +289,7 @@ func addNLIPaths(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp costParams,
 	// declines, and addNestLoopPath must keep admitting Right (a complete
 	// inner is sweepable by the generic driver).
 	if jt == parser.JoinRight {
+		noteNLIPathGate(jt, "jointype-right")
 		return
 	}
 	o := outer.CheapestTotal
@@ -296,12 +297,28 @@ func addNLIPaths(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp costParams,
 		o = createUniquePath(outer, outer.CheapestTotal, sjinfo, cp)
 	}
 	if o == nil || o.RequiredOuter != 0 {
+		noteNLIPathGate(jt, "outer-unusable")
 		return
 	}
+	// M0145-0007's reframed question: count whether a parameterised inner
+	// exists at all before counting what happens to it.
+	filed := false
+	sawParamInner := false
+	defer func() {
+		switch {
+		case filed:
+			noteNLIPathGate(jt, "filed")
+		case !sawParamInner:
+			noteNLIPathGate(jt, "no-parameterised-inner")
+		default:
+			noteNLIPathGate(jt, "inner-rejected")
+		}
+	}()
 	for _, i := range inner.CheapestParameterized {
 		if i == nil || i.RequiredOuter == 0 {
 			continue
 		}
+		sawParamInner = true
 		req := calcNestloopRequiredOuter(outer.Relids, o.RequiredOuter, inner.Relids, i.RequiredOuter)
 		// try_nestloop_path's test, verbatim (joinpath.c:882-889),
 		// over this joinrel's param_source_rels (C-08 derivation,
@@ -354,6 +371,7 @@ func addNLIPaths(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp costParams,
 			cost := nestloopCost(cp, o.Cost, in.Cost, o.Rows, in.Rows, rsStart, matRescan+rsStart)
 			cost.Total += matBuild
 			cost.Total += qualEvalCost(cp, len(residual), o.Rows*in.Rows)
+			filed = true
 			addPath(joinrel, &Path{
 				Kind:     PathNestLoop,
 				Jointype: jt, // C-03b; see addHashJoinPath.
