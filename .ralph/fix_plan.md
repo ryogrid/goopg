@@ -2101,29 +2101,59 @@ the whole file's active task between 2026-09-01 and 2026-09-14; **since
     acceptance arm 24/24; pgbench smoke.
 
 - [ ] **template1 shares the `postgres` catalog namespace** (isolated
-  2026-09-22 by the current_database() measurement, which is how it was
-  distinguished from the reporting bug).
+  2026-09-22 by the current_database() measurement; **ROOT-CAUSED
+  2026-09-22, still unfixed**).
   Kind: bug
   Parent: M0119-0006
   - Repro: connect to template1, `CREATE TABLE t1_marker(x int)`, then
-    `SELECT count(*) FROM t1_marker` from `postgres` — it succeeds, so the
-    table landed in postgres' namespace. The control matters: the same
-    sequence against a `CREATE DATABASE`d `newdb` correctly reports
-    "relation does not exist" from both `postgres` and any other database,
-    so per-database isolation WORKS and template1 specifically does not get
-    it. Suspect template1 resolving to `DefaultDBOid` like `postgres`
-    (`catalog.NamespaceDBOid` aliasing, M0119-0006 bq slice).
-  - **This is almost certainly the same root cause as M0119-0006's remaining
-    bs item** "a template1 install re-attributes to \"postgres\" on restart
-    (shared bootstrap namespace)": if CREATE EXTENSION in template1 actually
+    `SELECT count(*) FROM t1_marker` from `postgres` — it succeeds. Control:
+    the same sequence against a `CREATE DATABASE`d `newdb` correctly reports
+    "relation does not exist" from elsewhere, so per-database isolation
+    WORKS and template1 specifically misses it.
+  - **ROOT CAUSE — an OID collision by construction, not the aliasing the
+    previous loop guessed at.** `const DefaultDBOid uint32 = 1`
+    (`internal/catalog/catalog.go:4018`) is goopg's internal "default
+    namespace" key, and **1 is also template1's real PostgreSQL bootstrap
+    OID** — the constant's own neighbouring comment cites
+    `Template1ObjectId=1, PostgresObjectId=5`. So
+    `ResolveDatabaseOid("template1")` returns 1, while
+    `NamespaceDBOid` maps postgres (`PostgresDBOid = 5`) onto
+    `DefaultDBOid = 1`. Two different databases therefore key the same
+    `tableNamespace`. The previous loop's suspicion — that template1
+    resolved to 0 and fell through `NamespaceDBOid`'s zero case — is WRONG
+    and should not be re-investigated: `ResolveDatabaseOid` returns 1
+    explicitly.
+  - **Dependencies MEASURED, and the scary one does not exist.**
+    `CREATE DATABASE ... TEMPLATE` physically copies the template's
+    relations from its `base/<dbOid>` directory, so the obvious worry was
+    that a new database created from template1 would inherit postgres' user
+    tables. Tested both paths on a scratch cluster with a `secret` table in
+    postgres: plain `CREATE DATABASE fresh` and explicit
+    `CREATE DATABASE fromt1 TEMPLATE template1` BOTH produce a database
+    where `secret` does not exist. So the CREATE DATABASE path is NOT
+    affected by the collision, and a fix does not have to preserve any
+    copying behaviour that currently depends on it.
+  - **Suggested route, with the precedent that makes it cheap**: goopg
+    already separates a database's DISPLAYED `pg_database.oid` from its
+    REAL internal oid — `databaseDisplayOID` renders template1 as 1 for
+    client compatibility while `ResolveDatabaseOid` is documented as the
+    "real physical oid" resolver. Giving template1 a distinct INTERNAL oid
+    while `databaseDisplayOID` keeps showing 1 therefore fits the existing
+    design rather than fighting it, and leaves template1 an EMPTY namespace
+    — which is what PostgreSQL has, since template1 carries no user tables
+    until someone puts them there.
+  - **Still to check before coding** (the reason this was not fixed in the
+    same loop as the root-cause work): what keys off `base/1` on disk and
+    what `internal/initdb/catalog_heap_reload.go` does when it "maps a
+    connection (PostgresDBOid = 5) back onto DefaultDBOid = 1" at startup.
+    A new internal oid for template1 must not make the reload path attribute
+    postgres' heap rows to it.
+  - Probably the SAME root cause as M0119-0006's remaining bs item "a
+    template1 install re-attributes to \"postgres\" on restart (shared
+    bootstrap namespace)" — if a CREATE EXTENSION in template1 genuinely
     executes in postgres' namespace, the restart is not re-attributing
-    anything — it is reporting where the row genuinely went. Check that
-    before treating them as two pieces of work.
-  - **Note the interaction with the fix above**: `current_database()` now
-    correctly answers `template1` there, so the reported name and the actual
-    storage namespace now visibly disagree. That is an improvement, not a
-    regression — the previous answer masked the routing bug by being wrong
-    in the same direction. State it plainly when fixing.
+    anything, it is reporting where the row always was. Verify that before
+    treating them as two pieces of work.
   - PG oracle: template1 is an ordinary database with its own catalog; only
     `datistemplate` and `datallowconn` distinguish the templates.
 

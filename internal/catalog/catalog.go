@@ -5775,6 +5775,15 @@ const DatconnlimitInvalidDB int32 = -2
 // recorded for name via SetDatabaseConnLimit, or -1 (PG's "no limit" default,
 // pg_database.h) if none was ever set. M-NIGHTLY AI-20260707-000712-004 /
 // AC-002 residual #1.
+func (c *InMemory) DatabaseConnLimit(name string) int32 {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if limit, ok := c.databaseConnLimit[name]; ok {
+		return limit
+	}
+	return -1
+}
+
 // DatabaseAllowsConnections reports pg_database.datallowconn for the named
 // database — whether a client may connect to it at all.
 //
@@ -5799,15 +5808,6 @@ const DatconnlimitInvalidDB int32 = -2
 // silently approximated.
 func (c *InMemory) DatabaseAllowsConnections(name string) bool {
 	return !strings.EqualFold(name, "template0")
-}
-
-func (c *InMemory) DatabaseConnLimit(name string) int32 {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	if limit, ok := c.databaseConnLimit[name]; ok {
-		return limit
-	}
-	return -1
 }
 
 // SetDatabaseConnLimit records a runtime `datconnlimit` override for an
