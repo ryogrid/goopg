@@ -389,10 +389,12 @@ func TestJointreePullupDeclineParity(t *testing.T) {
 		// Derived-table body — sublinkBodyFromIsFlat rejects non-bare
 		// FROM items.
 		"derived": `select tag from jtp_o where exists (select 1 from (select j from jtp_i) d where d.j = k)`,
-		// Nested sublink in the body WHERE — exprHasSublinkPlan: a
-		// nested sublink's Level-1 refs only bind while the body
-		// evaluates as one unit.
-		"nested-exists": `select tag from jtp_o where exists (select 1 from jtp_i a where a.j = k and exists (select 1 from jtp_i2 b where b.j2 = a.v))`,
+		// NOTE: "nested-exists" used to live here, on the rationale that
+		// "a nested sublink's Level-1 refs only bind while the body
+		// evaluates as one unit". M0145-0014 ported PG's
+		// `pull_up_sublinks_qual_recurse` recursion, so that shape is
+		// PULLED UP now and its parity is asserted by
+		// TestJointreePullupNestedExistsIsPulled instead of here.
 		// Volatile body WHERE — contain_volatile_functions: splicing
 		// changes the qual's evaluation count.
 		"volatile": `select tag from jtp_o where exists (select 1 from jtp_i where j = k and random() < 0.5)`,

@@ -1,67 +1,58 @@
 # Working set — inter-loop baton
 
-Task: **M0145-0014 — still `[ ]` (partial).** The recursion half was ATTEMPTED
-this loop and **stopped before landing**. Nothing was committed to
-`internal/`; the WIP was discarded. The finding is the deliverable.
+Task: **M0145-0014 — COMPLETE `[x]`.** Both halves landed; the recursion half
+landed on the second attempt. `any-nested-sublink` is 0 on the corpus.
 
 ## Banner
 
-Item 3: `… 0013 [x] → 0014 [ ] (partial) → 0015 → 0016 → 0017 → 0018`.
-M0145-0014 is still the first selectable `[ ]`, so the banner points here
-again — but see "Next step": the next attempt needs a different first move.
+Item 3: `… 0013 [x] → 0014 [x] → 0015 → 0016 → 0017 → 0018`.
+**Next selectable: M0145-0015** (residual census + OR/NOT-position sublinks —
+PG's actual reach only). Re-read the banner; it has moved twice under batons.
 
-## What the attempt proved
+## The fix was ONE field, and the first attempt misread the panic
 
-The blocker the previous ledger row named **was built and does resolve**:
+Last loop's panic (`createPlan: join clause references binding column 3 (v)`)
+was read as a lowering gap. It was not. Printing the columns actually available
+at the failing join gave `have=[0 1 4]` — emitting plus the CHILD leaf, the
+PARENT leaf ABSENT. The search had chosen `(emitting SEMI parentLeaf) SEMI
+childLeaf`, and a semijoin does not project its right side.
 
-- `jtPulledBody.children`/`parent`;
-- `extractNestedPullups` — PG's `pull_up_sublinks_qual_recurse` re-run on a
-  body's own conjuncts, removing each converted one (`prepjointree.c:682-693`,
-  `:736-747`, NOT arm `:836-845`), depth-guarded at 3;
-- `flattenPulledBodies` — parent-before-child, keeping "body order IS leaf
-  order" true for `splicePulledLeaves` and `classifyPulledQuals`;
-- `rebasePulledQual` walking `r.Level` steps up the parent chain, resolving an
-  ancestor-body reference through that body's leaves and falling through to
-  the emitting scope when the chain runs out;
-- per-body `leftBits` = emitting ∪ every ancestor's leaves, replacing the
-  hard-coded `emittingBits` in the classify switch and the SJI.
-
-## The real blocker — a THIRD thing, with a fast witness
-
-A pulled leaf is **NON-EMITTING**: a SEMI/ANTI join never projects its RHS, so
-a parent body's columns exist only at the parent's own join node. Today's
-spanning link qual is fine because it BECOMES that join's clause; a nested
-body's link qual reads a parent-body column from a DIFFERENT join node and the
-lowering has nowhere to evaluate it.
+`jtPulledBody.subtreeLeaves` makes a parent's `syn_righthand` cover its whole
+SUBTREE — what PG gets for free by splicing a nested conversion into `j->rarg`,
+whose arm comes back covering `child_rels` (`prepjointree.c:682-693`).
+Restricting `syn_lefthand` was necessary but never sufficient.
 
 ```
-TestJointreePullupDeclineParity/nested-exists   (an EXISTING test)
-panic: createPlan: join clause references binding column 3 (v),
-       which is not among the 3 output columns it is being re-based onto
+census SF0.25 knob arm: any-nested-sublink-convertible 6 -> 0
+                        (pulled) 48 -> 54, no REBASEFAIL, no PULLUPCLASSIFY
+plans: exactly Q83 moves; values identical, 762 -> 553 ms
+oracle: nested EXISTS-in-EXISTS and nested ANY-in-ANY both 3654|181827
+        on PG 18.3 and on goopg
 ```
 
-Restricting the nested SJI's `syn_lefthand` to ancestor leaves only — PG's
-`j->rarg` + `available_rels = child_rels` ordering — is NECESSARY but **not
-sufficient**. The residual is in the lowering, not the join ordering.
+`TestJointreePullupDeclineParity/nested-exists` RETIRED (it pinned the decline
+this task removes); `TestJointreePullupNestedExistsIsPulled` replaces it.
+
+**Deferred**: depth-guarded at `maxPulledSublinkDepth = 3`; PG has no limit.
+The guard exists because every pulled leaf lands in ONE problem capped by
+`maxSearchRels`. Ledgered.
 
 ## Next step
 
-**Answer the lowering question BEFORE rebuilding any of the above.** Either the
-pulled leaves project their columns into the parent's schema for the duration
-of the search, or the nested semijoin is lowered as a subtree of the parent's
-RHS with its clause attached there. The witness runs in seconds and needs no
-cluster, so the next attempt can iterate at unit speed rather than through a
-corpus census.
-
-If the owner would rather move on, M0145-0015 is next in item 3 and is
-measurement-first.
+**M0145-0015.** It is measurement-first: extend the pull-up census so each
+unrecognised conjunct reports its sublink `%T` AND the clause position (OR arg,
+NOT arg, scalar context). Then implement only what PG actually converts —
+`pull_up_sublinks_qual_recurse` does NOT recurse into OR args
+(`prepjointree.c:877`) while a NOT-wrapped EXISTS does convert (`:789-845`).
+The task explicitly says to check whether goopg already has a hashed-subplan
+equivalent of `convert_EXISTS_to_ANY` (`plan/subselect.c:1717`) BEFORE building
+anything.
 
 ## Traps carried forward
 
 - **Re-read the banner every loop.**
-- Corpus VALUE gates cannot see a join-ordering fault that still returns the
-  right rows — same blind spot M0145-0012 documented for cardinality. Unit
-  tests are the witness class for this milestone.
+- When a panic names a mechanism, print the coordinates that WERE available
+  before accepting that mechanism as the culprit. It cost a loop here.
 - A new hand-written Expr type switch fails `TestExprSwitchInventoryIsPinned`;
   pin it AND add a ledger row.
 - The RALPH_LOOP write-guard trips on prose mentioning a client tool and a
@@ -69,9 +60,10 @@ measurement-first.
 
 ## Gates run
 
-units PASS (tree is green; the WIP that failed `nested-exists` was discarded,
-so no known-failing test is committed). No production code changed, so the
-planner corpus gates were not re-run. The commit hook's smoke runs on commit.
+units PASS; tpch-spotcheck PASS (Q12=2 Q13=33); TPC-DS SF0.25 default arm
+PASS=96 MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0, plans 99/99 identical,
+runtime-moves=0; TPC-H acceptance arm 24 MATCH; the commit hook's smoke runs
+on commit.
 
 ## In-flight
 

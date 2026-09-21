@@ -14124,7 +14124,7 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
   the gates confirm it; none of S3's three instruments move. The knob-arm
   seam census moved `pulled-leaf-not-scan` 19 → 0, which is this task's own
   expected-movement criterion, not a lineage instrument.
-- [ ] **M0145-0014 — recurse the pull-up into pulled bodies' own
+- [x] **M0145-0014 — recurse the pull-up into pulled bodies' own
   quals (`any-nested-sublink`)** (filed 2026-09-21 by owner
   directive). Census: 6 conjuncts on TPC-DS SF0.25 decline because
   the ANY/EXISTS body's own WHERE still contains a sublink. PG
@@ -14201,6 +14201,33 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
         duration of the search, or the nested semijoin is lowered as a
         subtree of the parent's RHS with its clause attached there. The
         witness runs in seconds and needs no cluster. Ledgered.
+      - **RESOLVED 2026-09-21 (loop 46). M0145-0014 is `[x]`.** The first
+        attempt's panic looked like a lowering gap and was not.
+        - Printing the columns actually available at the failing join gave
+          `have=[0 1 4]` — emitting plus the CHILD leaf, the PARENT leaf
+          ABSENT. The search had chosen `(emitting SEMI parentLeaf) SEMI
+          childLeaf`, and a semijoin does not project its right side, so the
+          parent body's columns were gone before the nested link qual ran.
+        - **The fix is ONE field**: `jtPulledBody.subtreeLeaves` makes a
+          parent's `syn_righthand` cover its whole SUBTREE — what PG gets for
+          free by splicing the nested conversion into `j->rarg`, whose arm
+          comes back covering `child_rels` (`prepjointree.c:682-693`).
+          Restricting `syn_lefthand` was necessary but never sufficient.
+        - Census SF0.25 knob arm: `any-nested-sublink-convertible` **6 → 0**,
+          `(pulled)` 48 → 54, no `REBASEFAIL`, no `PULLUPCLASSIFY`.
+        - Exactly Q83 moves; values byte-identical and **762 → 553 ms**. Both
+          nested shapes verified against the **PG oracle**: nested
+          EXISTS-in-EXISTS and nested ANY-in-ANY each give `3654|181827` on
+          PG 18.3 and on goopg.
+        - `TestJointreePullupDeclineParity/nested-exists` RETIRED (it pinned
+          the decline this task removes); replaced by
+          `TestJointreePullupNestedExistsIsPulled`.
+        - **Deferred**: the recursion is depth-guarded at 3; PG has no limit.
+          The guard exists because every pulled leaf lands in ONE problem
+          capped by `maxSearchRels`. Ledgered.
+        - Method note worth carrying: the panic pointed at the lowering and
+          the lowering was innocent. Printing the coordinates that WERE
+          available beat reasoning about which mechanism ought to own it.
   Movement: none — knob arm only; the default arm is unchanged and the gates
   confirm it. The knob-arm pull-up census moved `any-nested-sublink` 12 → 0
   (6 pulled, 6 re-classified as the deferred convertible half), which is this

@@ -118,7 +118,36 @@ type jtPulledBody struct {
 	// `contain_vars_of_level(subselect,1)` check on the rest of the
 	// subselect).
 	quals []Expr
+	// children are nested sublinks pulled out of THIS body's own quals —
+	// PG's `pull_up_sublinks_qual_recurse` re-run on the pulled-up quals
+	// (postgres/src/backend/optimizer/prep/prepjointree.c:682-693, :736-747,
+	// NOT arm :836-845). Each child's conjunct has been REMOVED from
+	// `quals`: its semantics now live in the child's own semi/anti link.
+	children []*jtPulledBody
+	// parent is the body this one was pulled out of, nil for a top-level
+	// body. It gives a nested body's Level-1 outer references a coordinate
+	// path: they point at the PARENT BODY's columns, not at the emitting
+	// rels. Set by `flattenPulledBodies`.
+	parent *jtPulledBody
+	// subtreeLeaves is this body's own leaf count PLUS every descendant's.
+	// It is the body's `syn_righthand`, and the distinction matters: PG
+	// splices a nested conversion into the parent's `j->rarg`, so the
+	// parent's right-hand side contains the nested body's rels too
+	// (`j->rarg = pull_up_sublinks_jointree_recurse(...)` returning
+	// `child_rels`, prepjointree.c:682-693). Without that, the search may
+	// complete the parent semijoin FIRST — discarding the parent body's
+	// columns, since a semijoin projects only its left side — and then try
+	// to evaluate the nested link qual above it, which has nowhere to read
+	// the parent column from. `TestJointreePullupDeclineParity/nested-exists`
+	// is the witness for exactly that plan.
+	subtreeLeaves int
 }
+
+// maxPulledSublinkDepth bounds the nested pull-up recursion. PG has no
+// explicit limit, but goopg appends leaves to ONE problem whose relation count
+// is capped (`maxSearchRels`), so an unbounded nest builds a problem the seam
+// then declines wholesale.
+const maxPulledSublinkDepth = 3
 
 // pullUpSublinksIntoJointree implements the EXISTS/NOT-EXISTS arm of
 // pull_up_sublinks for the jointree pipeline. It walks the top-level
@@ -144,7 +173,7 @@ func pullUpSublinksIntoJointree(pred Expr, ctx *resolveContext, cat catalog.Cata
 		// The decline census measured it as 34 of the 45 unpulled sublink
 		// conjuncts on TPC-DS SF0.25 — the dominant miss.
 		if in, okIn := anyPullupConjunct(c); okIn {
-			body, reason, okBody := pullUpAnyBody(in, ctx, cat, ps)
+			body, reason, okBody := pullUpAnyBody(in, ctx, cat, ps, 0)
 			if !okBody {
 				notePullupDecline(reason)
 				continue
@@ -167,7 +196,7 @@ func pullUpSublinksIntoJointree(pred Expr, ctx *resolveContext, cat catalog.Cata
 			}
 			continue
 		}
-		body, reason, ok := pullUpExistsBody(ex, negated, ctx, cat, ps)
+		body, reason, ok := pullUpExistsBody(ex, negated, ctx, cat, ps, 0)
 		if !ok {
 			notePullupDecline(reason)
 			continue
@@ -192,6 +221,10 @@ func pullUpSublinksIntoJointree(pred Expr, ctx *resolveContext, cat catalog.Cata
 	// synthetic appended slots. Non-emitting, so they are never bound
 	// for name resolution: ctx.bindings is untouched, and the problem
 	// bindings are built from each body's own scope at the seam.
+	// M0145-0014: flatten the pull-up TREE into the flat body list the seam
+	// walks. Depth-first, parent immediately before its children, because
+	// every downstream consumer assumes body order IS leaf order.
+	pu.bodies = flattenPulledBodies(pu.bodies, nil)
 	pu.base = ctx.joinlist.nrels()
 	pos := pu.base
 	for _, pb := range pu.bodies {
@@ -202,6 +235,26 @@ func pullUpSublinksIntoJointree(pred Expr, ctx *resolveContext, cat catalog.Cata
 	}
 	pu.nLeaves = pos - pu.base
 	return pu
+}
+
+// flattenPulledBodies linearises the pull-up tree depth-first, stamping each
+// body's `parent` on the way down and clearing `children` so there is exactly
+// ONE representation downstream.
+func flattenPulledBodies(bodies []*jtPulledBody, parent *jtPulledBody) []*jtPulledBody {
+	out := make([]*jtPulledBody, 0, len(bodies))
+	for _, pb := range bodies {
+		pb.parent = parent
+		kids := pb.children
+		pb.children = nil
+		out = append(out, pb)
+		sub := flattenPulledBodies(kids, pb)
+		pb.subtreeLeaves = len(pb.leafScans)
+		for _, k := range sub {
+			pb.subtreeLeaves += len(k.leafScans)
+		}
+		out = append(out, sub...)
+	}
+	return out
 }
 
 // existsPullupConjunct recognises the two conjunct shapes pull_up_sublinks
@@ -253,7 +306,7 @@ func existsPullupConjunct(c Expr) (*ExistsExpr, bool, bool) {
 // census (nlicensus.go): every `return nil, …, false` names the gate it fell
 // at, so a corpus run says which arm to build next instead of which arm looks
 // biggest. It is "" on success.
-func pullUpExistsBody(ex *ExistsExpr, negated bool, parent *resolveContext, cat catalog.Catalog, ps PlannerSettings) (*jtPulledBody, string, bool) {
+func pullUpExistsBody(ex *ExistsExpr, negated bool, parent *resolveContext, cat catalog.Catalog, ps PlannerSettings, depth int) (*jtPulledBody, string, bool) {
 	sub := ex.Subquery
 	if !sublinkBodyIsSimple(sub) {
 		return nil, "body-not-simple", false
@@ -284,13 +337,14 @@ func pullUpExistsBody(ex *ExistsExpr, negated bool, parent *resolveContext, cat 
 			return nil, "where-not-resolvable", false
 		}
 	}
-	if why, ok := bodyQualsAdmitSublinks(where, onQuals); !ok {
+	quals := append(splitAnd(where), onQuals...)
+	quals, children := extractNestedPullups(quals, bodyCtx, cat, ps, depth)
+	if why, ok := bodyQualsAdmitSublinkList(quals); !ok {
 		return nil, why, false
 	}
-	if exprListHasVolatileBuiltin(append(splitAnd(where), onQuals...), cat) {
+	if exprListHasVolatileBuiltin(quals, cat) {
 		return nil, "volatile-qual", false
 	}
-	quals := append(splitAnd(where), onQuals...)
 	// `contain_vars_of_level(whereClause, 1)` — the correlation must
 	// live in the WHERE, and it must exist (subselect.c:1509).
 	if !exprListHasOuterRefAtLevel(quals, 1) {
@@ -317,6 +371,7 @@ func pullUpExistsBody(ex *ExistsExpr, negated bool, parent *resolveContext, cat 
 		leafWidths:   leafWidths,
 		bodyBindings: bodyCtx.bindings,
 		quals:        quals,
+		children:     children,
 	}, "", true
 }
 
@@ -571,14 +626,37 @@ func classifyPulledQuals(pu *jtPullup, nReal int, spans []leafSpan, ctx *resolve
 	}
 	emittingBits := leafRangeRelSet(0, nReal)
 	emittingTotal := len(ctx.schema)
+	// M0145-0014: a NESTED body's left-hand side is the emitting rels PLUS
+	// every ancestor body's leaves, because the link predicate the nested
+	// pull-up synthesised reads a column of its PARENT body. Both maps fill
+	// as the walk goes, which is sound because `flattenPulledBodies` emits a
+	// parent before its children.
+	bodyBase := map[*jtPulledBody]int{}
+	bodyN := map[*jtPulledBody]int{}
+	baseOf := func(b *jtPulledBody) (int, bool) {
+		v, ok := bodyBase[b]
+		return v, ok
+	}
 	pos := nReal
 	for _, pb := range pu.bodies {
 		n := len(pb.leafScans)
 		rhs := leafRangeRelSet(pos, pos+n)
 		pullSpans := spans[pos : pos+n]
+		bodyBase[pb] = pos
+		bodyN[pb] = n
+		leftBits := emittingBits
+		for anc := pb.parent; anc != nil; anc = anc.parent {
+			ab, okA := bodyBase[anc]
+			an, okN := bodyN[anc]
+			if !okA || !okN {
+				notePullupClassify("ancestor-not-numbered")
+				return false
+			}
+			leftBits |= leafRangeRelSet(ab, ab+an)
+		}
 		var spanning []Expr
 		for _, q := range pb.quals {
-			rebased, ok := rebasePulledQual(q, pb, pullSpans, emittingTotal, ctx)
+			rebased, ok := rebasePulledQual(q, pb, pullSpans, emittingTotal, ctx, spans, baseOf)
 			if !ok {
 				notePullupClassify("rebase-failed")
 				return false
@@ -589,7 +667,7 @@ func classifyPulledQuals(pu *jtPullup, nReal int, spans []leafSpan, ctx *resolve
 				return false
 			}
 			switch {
-			case relsOverlap(rs, emittingBits) && relsOverlap(rs, rhs):
+			case relsOverlap(rs, leftBits) && relsOverlap(rs, rhs):
 				spanning = append(spanning, rebased)
 			case relsSubset(rs, rhs):
 				// A qual confined to the pulled body's own rels is placed by
@@ -623,7 +701,7 @@ func classifyPulledQuals(pu *jtPullup, nReal int, spans []leafSpan, ctx *resolve
 					return false
 				}
 				*searchQuals = append(*searchQuals, rebased)
-			case relsSubset(rs, emittingBits):
+			case relsSubset(rs, leftBits):
 				if pb.jointype == parser.JoinAnti {
 					notePullupClassify("anti-outer-local-qual")
 					return false
@@ -648,7 +726,18 @@ func classifyPulledQuals(pu *jtPullup, nReal int, spans []leafSpan, ctx *resolve
 			}
 		}
 		*searchQuals = append(*searchQuals, spanning...)
-		if sj := pulledSemiJoinInfo(pb.jointype, rhs, emittingBits, spanning, spans); sj != nil && !joinInfoListHas(ctx.joinInfoList, sj) {
+		// syn_righthand is the body's whole SUBTREE, not just its own
+		// leaves — see jtPulledBody.subtreeLeaves.
+		sjRhs := leafRangeRelSet(pos, pos+pb.subtreeLeaves)
+		sjLeft := leftBits
+		if pb.parent != nil {
+			// PG splices a nested conversion into the PARENT's `j->rarg` and
+			// recurses the quals with `available_rels = child_rels`
+			// (prepjointree.c:682-693), so the child semijoin is ordered
+			// INSIDE the parent's right-hand side.
+			sjLeft = leftBits &^ emittingBits
+		}
+		if sj := pulledSemiJoinInfo(pb.jointype, sjRhs, sjLeft, spanning, spans); sj != nil && !joinInfoListHas(ctx.joinInfoList, sj) {
 			ctx.joinInfoList = append(ctx.joinInfoList, sj)
 		}
 		pos += n
@@ -730,7 +819,7 @@ func pulledSemiJoinInfo(jointype parser.JoinType, rhs, emittingBits RelSet, span
 // and, when both sides carry a source identity, the parent binding at
 // that position must agree (the self-join disambiguation
 // M0071-0009 introduced).
-func rebasePulledQual(q Expr, pb *jtPulledBody, pullSpans []leafSpan, emittingTotal int, ctx *resolveContext) (Expr, bool) {
+func rebasePulledQual(q Expr, pb *jtPulledBody, pullSpans []leafSpan, emittingTotal int, ctx *resolveContext, allSpans []leafSpan, bodyBase func(*jtPulledBody) (int, bool)) (Expr, bool) {
 	failed := false
 	// scopeSignal, not scopeVeto (M0145-0014): a body qual may legitimately
 	// carry a SubPlan — PG's `pull_up_sublinks_qual_recurse` converts the
@@ -771,6 +860,28 @@ func rebasePulledQual(q Expr, pb *jtPulledBody, pullSpans []leafSpan, emittingTo
 				r.Index = pullSpans[leaf].lo + local
 				return x
 			case *OuterColumnRef:
+				// M0145-0014: walk `r.Level` steps up the pulled-body chain.
+				// Landing on a body means the reference points at a PARENT
+				// BODY's columns; running off the top means it points at the
+				// emitting scope, which is what Level 1 always meant for a
+				// top-level body.
+				anc := pb
+				for i := 0; i < r.Level && anc != nil; i++ {
+					anc = anc.parent
+				}
+				if anc != nil {
+					base, okBase := bodyBase(anc)
+					leaf, local, found := bodyLeafOf(anc, r.Index)
+					if !okBase || !found {
+						noteRebaseFail("ancestor-column-not-in-leaf")
+						failed = true
+						return x
+					}
+					return &ColumnRef{
+						pos: r.pos, Index: allSpans[base+leaf].lo + local,
+						Name: r.Name, Type: r.Type, SourceTableIdx: r.SourceTableIdx,
+					}
+				}
 				if r.Level > 1 {
 					r.Level--
 					return x
@@ -894,7 +1005,12 @@ func exprListHasOuterRefAtLevel(es []Expr, level int) bool {
 // way out is not defined over a subplan's own scope, and guessing there is how
 // a pull-up reads the wrong column.
 func bodyQualsAdmitSublinks(where Expr, onQuals []Expr) (string, bool) {
-	quals := append(splitAnd(where), onQuals...)
+	return bodyQualsAdmitSublinkList(append(splitAnd(where), onQuals...))
+}
+
+// bodyQualsAdmitSublinkList is the split-conjunct form, which is what both
+// arms hold once `extractNestedPullups` has rewritten the list.
+func bodyQualsAdmitSublinkList(quals []Expr) (string, bool) {
 	for _, q := range quals {
 		if !exprHasSublinkPlan(q) {
 			continue
@@ -907,6 +1023,38 @@ func bodyQualsAdmitSublinks(where Expr, onQuals []Expr) (string, bool) {
 		}
 	}
 	return "", true
+}
+
+// extractNestedPullups is `pull_up_sublinks_qual_recurse` re-run on the
+// pulled-up quals: for each of the body's own conjuncts that is itself a
+// convertible ANY/EXISTS sublink, pull its body up too and REMOVE the conjunct
+// from the parent's qual list, because its semantics now live in the child's
+// own semi/anti link. PG does this at prepjointree.c:682-693 (ANY), :736-747
+// (EXISTS) and :836-845 (the NOT arm).
+func extractNestedPullups(quals []Expr, bodyCtx *resolveContext, cat catalog.Catalog, ps PlannerSettings, depth int) ([]Expr, []*jtPulledBody) {
+	if depth+1 >= maxPulledSublinkDepth {
+		return quals, nil
+	}
+	var kept []Expr
+	var children []*jtPulledBody
+	for _, q := range quals {
+		if in, okIn := anyPullupConjunct(q); okIn {
+			if child, _, ok := pullUpAnyBody(in, bodyCtx, cat, ps, depth+1); ok {
+				children = append(children, child)
+				continue
+			}
+			kept = append(kept, q)
+			continue
+		}
+		if ex, negated, okEx := existsPullupConjunct(q); okEx && ex.Subquery != nil {
+			if child, _, ok := pullUpExistsBody(ex, negated, bodyCtx, cat, ps, depth+1); ok {
+				children = append(children, child)
+				continue
+			}
+		}
+		kept = append(kept, q)
+	}
+	return kept, children
 }
 
 // exprHasConvertibleSublink reports whether e carries a sublink of a kind
@@ -1097,7 +1245,7 @@ func anyPullupConjunct(c Expr) (*InExpr, bool) {
 // passes (`sublinkBodyIsSimple`) and one of its own: the body's target list
 // must be a single non-star expression, because the synthesised equality
 // needs exactly one body column to bind to.
-func pullUpAnyBody(in *InExpr, parent *resolveContext, cat catalog.Catalog, ps PlannerSettings) (*jtPulledBody, string, bool) {
+func pullUpAnyBody(in *InExpr, parent *resolveContext, cat catalog.Catalog, ps PlannerSettings, depth int) (*jtPulledBody, string, bool) {
 	sub := in.Subquery
 	if !sublinkBodyIsSimple(sub) {
 		return nil, "any-body-not-simple", false
@@ -1133,10 +1281,11 @@ func pullUpAnyBody(in *InExpr, parent *resolveContext, cat catalog.Catalog, ps P
 			return nil, "any-where-not-resolvable", false
 		}
 	}
-	if why, ok := bodyQualsAdmitSublinks(where, onQuals); !ok {
+	quals := append(splitAnd(where), onQuals...)
+	quals, children := extractNestedPullups(quals, bodyCtx, cat, ps, depth)
+	if why, ok := bodyQualsAdmitSublinkList(quals); !ok {
 		return nil, "any-" + why, false
 	}
-	quals := append(splitAnd(where), onQuals...)
 	if exprListHasVolatileBuiltin(quals, cat) {
 		return nil, "any-volatile-qual", false
 	}
@@ -1157,6 +1306,7 @@ func pullUpAnyBody(in *InExpr, parent *resolveContext, cat catalog.Catalog, ps P
 		leafWidths:   leafWidths,
 		bodyBindings: bodyCtx.bindings,
 		quals:        append([]Expr{link}, quals...),
+		children:     children,
 	}, "", true
 }
 

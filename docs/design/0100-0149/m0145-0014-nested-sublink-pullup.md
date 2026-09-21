@@ -1,9 +1,8 @@
 # Nested sublinks in a pulled body's quals (M0145-0014)
 
-Status: PARTIAL. The scalar half landed 2026-09-21. The ANY-recursion half was
-ATTEMPTED on 2026-09-21 (loop 45) and **stopped before landing** — the attempt
-found a third blocker that is neither of the two this document previously
-named, and it is recorded below with its witness.
+Status: **COMPLETE 2026-09-21.** The scalar half landed first; the recursion
+half landed on the second attempt, once the blocker the first attempt exposed
+was diagnosed. `any-nested-sublink` is 0 on the corpus.
 
 Task: `.ralph/fix_plan.md` M0145-0014. Kind: impl. Parent: M0145-0003.
 
@@ -100,7 +99,7 @@ Hash Semi Join
 ```
 
 
-## The recursion attempt, and the blocker it found (2026-09-21, loop 45)
+## The recursion: one failed attempt, then the diagnosis (2026-09-21)
 
 The deferral below said the missing piece was a coordinate path for a link
 predicate spanning two pulled bodies. That was built, and it was not enough.
@@ -144,22 +143,67 @@ the wrong-answer class this milestone guards hardest against, and the corpus
 value gates cannot see a join-ordering fault that still returns the right rows
 on the two queries that exercise it.
 
-**Sharpened resume point.** Before rebuilding the coordinate path, answer the
-lowering question first: where can a clause that references a non-emitting
-pulled leaf's column be evaluated? Either the pulled leaves must project their
-columns into the parent's schema for the duration of the search, or the nested
-semijoin must be lowered as a subtree of the parent's RHS with its clause
-attached there. `TestJointreePullupDeclineParity/nested-exists` is the witness
-to re-run — it fails within seconds and needs no cluster.
+### The diagnosis, and it was one field
 
-## Deferred — the recursion itself
+The first attempt read the panic as a lowering gap. It was not. Printing the
+columns actually available at the failing join gave `have=[0 1 4]` — the
+emitting rels (0,1) and the CHILD leaf (4), with the PARENT leaf (2,3) absent.
+The search had chosen `(emitting SEMI parentLeaf) SEMI childLeaf`: the parent
+semijoin completed first, and a semijoin does not project its right side, so
+the parent body's columns were gone before the nested link qual was evaluated.
 
-Q83's 6 fires stay declined. Implementing them means, for a nested convertible
-sublink: binding the nested body in the OUTER body's scope, appending its
-leaves after the outer body's in the same `jtPullup`, and synthesising a link
-predicate whose left side refers to the outer body's leaves — not to the
-emitting rels, which is the only case `outerOperandAsLevel1` and
-`rebasePulledQual` currently handle (`*OuterColumnRef{Level: 1}` →
-emitting binding). That re-base across two pulled bodies is the machinery this
-task did not build, and it is why the split was worth making explicit: shipping
-it as "the recursion" would have implied the scalar half needed it too.
+Restricting the nested SJI's `syn_lefthand` to the ancestor leaves is not what
+stops that, because the ordering is legal under the SJIs as written. What stops
+it is the PARENT's `syn_righthand`: PG splices a nested conversion into the
+parent's `j->rarg` and that arm comes back covering `child_rels`
+(`prepjointree.c:682-693`), so the parent's right-hand side **contains the
+nested body's rels**. goopg was giving the parent only its own leaves, which
+made the bad order legal.
+
+`jtPulledBody.subtreeLeaves` — the body's own leaf count plus every
+descendant's — is that field, and `pulledSemiJoinInfo` now takes it as
+`syn_righthand`. With it, the parent semijoin cannot complete before the nested
+one, the columns are in scope where the qual is evaluated, and the panic is
+gone.
+
+The lesson worth keeping: the panic pointed at the lowering, and the lowering
+was innocent. Printing the coordinates that WERE available at the failing node,
+rather than reasoning about which mechanism ought to own the failure, is what
+turned a "this needs a lowering redesign" conclusion into a one-field fix.
+
+## Measurement — the recursion half
+
+Pull-up census, TPC-DS SF0.25, knob arm, all 99 queries:
+
+```
+                                    before   after
+any-nested-sublink-convertible           6        0
+(pulled)                                48       54
+every other class                  unchanged
+REBASEFAIL / PULLUPCLASSIFY           none     none
+```
+
+**Correctness.** Exactly Q83 moves across all 99 plans (knob arm, against a
+pre-change binary from a worktree at HEAD), values byte-identical
+(`ck dfe46eb3e7673921`, 1 row) and faster: 762 ms -> 553 ms. Both nested shapes
+were also probed directly against the **PG oracle**, since Q58/Q83 are thin
+witnesses on their own:
+
+```
+nested EXISTS-in-EXISTS   goopg 3654|181827    PG 18.3 3654|181827
+nested ANY-in-ANY         goopg 3654|181827    PG 18.3 3654|181827
+```
+
+`TestJointreePullupDeclineParity/nested-exists` was RETIRED — it pinned the
+decline this task deliberately removes — and replaced by
+`TestJointreePullupNestedExistsIsPulled`, which asserts both bodies are pulled,
+the parent chain is stamped, and `subtreeLeaves` covers the subtree.
+
+## What is still NOT done
+
+The recursion is depth-guarded at `maxPulledSublinkDepth = 3`. PG has no such
+limit — its recursion is structural over the jointree — but goopg appends every
+pulled leaf to ONE problem whose relation count is capped by `maxSearchRels`,
+so an unbounded nest would build a problem the seam then declines wholesale. No
+TPC-DS shape reaches the limit (the deepest, Q83, is two), so the divergence is
+unobserved rather than harmless; it is ledgered.
