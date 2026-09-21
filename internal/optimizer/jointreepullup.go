@@ -284,8 +284,8 @@ func pullUpExistsBody(ex *ExistsExpr, negated bool, parent *resolveContext, cat 
 			return nil, "where-not-resolvable", false
 		}
 	}
-	if exprHasSublinkPlan(where) || exprListHasSublinkPlan(onQuals) {
-		return nil, "nested-sublink", false
+	if why, ok := bodyQualsAdmitSublinks(where, onQuals); !ok {
+		return nil, why, false
 	}
 	if exprListHasVolatileBuiltin(append(splitAnd(where), onQuals...), cat) {
 		return nil, "volatile-qual", false
@@ -732,12 +732,39 @@ func pulledSemiJoinInfo(jointype parser.JoinType, rhs, emittingBits RelSet, span
 // M0071-0009 introduced).
 func rebasePulledQual(q Expr, pb *jtPulledBody, pullSpans []leafSpan, emittingTotal int, ctx *resolveContext) (Expr, bool) {
 	failed := false
-	out, ok := cloneExprRefs(q, scopeVeto, exprRewriter{
+	// scopeSignal, not scopeVeto (M0145-0014): a body qual may legitimately
+	// carry a SubPlan — PG's `pull_up_sublinks_qual_recurse` converts the
+	// OUTER sublink first and leaves a non-convertible nested one as a
+	// SubPlan inside the pulled-up qual. Under `scopeVeto` `cloneExprRefs`
+	// ABORTS the moment it meets an inner-plan slot, which made every such
+	// qual fail with `rebase-failed` one step after `bodyQualsAdmitSublinks`
+	// let it through — a decline that merely moved.
+	//
+	// `scopeSignal` reports the crossing and does not descend, which is the
+	// correct treatment: the subplan's own refs live in the subplan's scope
+	// and are not the body-local coordinates this rebase re-stamps. The one
+	// case that would be wrong is a subplan CORRELATED to the body, whose
+	// outer refs do point at coordinates moving underneath it — OnScope
+	// declines those rather than guessing.
+	out, ok := cloneExprRefs(q, scopeSignal, exprRewriter{
+		OnScope: func(n Node) {
+			if planHasOuterRef(n) {
+				noteRebaseFail("subplan-correlated")
+				failed = true
+			}
+		},
+		OnUnknown: func(x Expr) {
+			// M0145-0014: name the node the rewrite aborted on. Without it
+			// `rebase-failed` is one string for three different causes and
+			// the next loop re-derives which one fired.
+			noteRebaseFail("unknown-" + exprTypeName(x))
+		},
 		Rewrite: func(x Expr) Expr {
 			switch r := x.(type) {
 			case *ColumnRef:
 				leaf, local, found := bodyLeafOf(pb, r.Index)
 				if !found {
+					noteRebaseFail("body-column-not-in-leaf")
 					failed = true
 					return x
 				}
@@ -749,11 +776,13 @@ func rebasePulledQual(q Expr, pb *jtPulledBody, pullSpans []leafSpan, emittingTo
 					return x
 				}
 				if r.Index < 0 || r.Index >= emittingTotal {
+					noteRebaseFail("outer-index-out-of-range")
 					failed = true
 					return x
 				}
 				if b, okB := emittingBindingAt(ctx, r.Index); !okB ||
 					(b.sourceIdx != 0 && r.SourceTableIdx != 0 && b.sourceIdx != r.SourceTableIdx) {
+					noteRebaseFail("outer-binding-mismatch")
 					failed = true
 					return x
 				}
@@ -763,6 +792,9 @@ func rebasePulledQual(q Expr, pb *jtPulledBody, pullSpans []leafSpan, emittingTo
 		},
 	})
 	if !ok || failed {
+		if !ok && !failed {
+			noteRebaseFail("clone-aborted")
+		}
 		return nil, false
 	}
 	return out, true
@@ -825,6 +857,74 @@ func exprListHasOuterRefAtLevel(es []Expr, level int) bool {
 		}
 	}
 	return false
+}
+
+// bodyQualsAdmitSublinks decides whether a pulled body's own quals may carry a
+// sublink, and names the refusal when they may not.
+//
+// It replaces a blanket `exprHasSublinkPlan` refusal at BOTH pull-up arms —
+// the EXISTS arm and the ANY arm, which held the identical gate. That refusal
+// was over-broad against the oracle. PG converts the OUTER sublink first and
+// only then looks at what the body's quals contain:
+// `pull_up_sublinks_qual_recurse` calls `convert_ANY_sublink_to_join` /
+// `convert_EXISTS_sublink_to_join`, whose gates are about correlation and
+// volatility (`postgres/src/backend/optimizer/plan/subselect.c:1345-1386`) and
+// say nothing about the body's quals, and THEN recurses on the pulled-up quals
+// (`prepjointree.c:682-693`, `:736-747`, NOT arm `:836-845`). A nested sublink
+// that is not itself convertible simply stays a SubPlan inside the pulled-up
+// qual; it never blocks the outer conversion.
+//
+// So the population splits in two, and this function admits only the half that
+// needs no new machinery:
+//
+//   - a NON-convertible sublink (a scalar/EXPR subquery) rides along as an
+//     ordinary body-local qual, exactly as it does in PG. TPC-DS Q58's
+//     `d_date IN (SELECT d_date … WHERE d_week_seq = (SELECT …))` is this
+//     shape: a one-leaf body whose single qual holds an uncorrelated scalar
+//     subplan.
+//   - a CONVERTIBLE nested ANY/EXISTS is still declined, because converting it
+//     is the recursion M0145-0014 is named for and that needs the nested
+//     body's leaves spliced and its link predicate rebased against the OUTER
+//     body's leaves rather than against the emitting rels. TPC-DS Q83's
+//     `d_date IN (SELECT d_date … WHERE d_week_seq IN (SELECT …))` is this
+//     shape.
+//
+// A body qual that carries BOTH a sublink and a Level-1 outer reference is
+// declined too: the correlation rebase that `rebasePulledQual` performs on the
+// way out is not defined over a subplan's own scope, and guessing there is how
+// a pull-up reads the wrong column.
+func bodyQualsAdmitSublinks(where Expr, onQuals []Expr) (string, bool) {
+	quals := append(splitAnd(where), onQuals...)
+	for _, q := range quals {
+		if !exprHasSublinkPlan(q) {
+			continue
+		}
+		if exprHasConvertibleSublink(q) {
+			return "nested-sublink-convertible", false
+		}
+		if exprHasOuterRefAtLevel(q, 1) {
+			return "nested-sublink-correlated", false
+		}
+	}
+	return "", true
+}
+
+// exprHasConvertibleSublink reports whether e carries a sublink of a kind
+// `pull_up_sublinks_qual_recurse` would convert into a jointree entry — an ANY
+// (`*InExpr`) or an EXISTS (`*ExistsExpr`). Every other sublink kind stays a
+// SubPlan in PG as well, which is what makes it safe to carry.
+func exprHasConvertibleSublink(e Expr) bool {
+	found := false
+	walkExprTree(e, func(x Expr) {
+		if found || len(ExprSubplans(x)) == 0 {
+			return
+		}
+		switch x.(type) {
+		case *InExpr, *ExistsExpr:
+			found = true
+		}
+	})
+	return found
 }
 
 // exprListHasSublinkPlan is exprHasSublinkPlan over a slice.
@@ -1033,8 +1133,8 @@ func pullUpAnyBody(in *InExpr, parent *resolveContext, cat catalog.Catalog, ps P
 			return nil, "any-where-not-resolvable", false
 		}
 	}
-	if exprHasSublinkPlan(where) || exprListHasSublinkPlan(onQuals) {
-		return nil, "any-nested-sublink", false
+	if why, ok := bodyQualsAdmitSublinks(where, onQuals); !ok {
+		return nil, "any-" + why, false
 	}
 	quals := append(splitAnd(where), onQuals...)
 	if exprListHasVolatileBuiltin(quals, cat) {

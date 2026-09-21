@@ -1,71 +1,79 @@
 # Working set — inter-loop baton
 
-Task: **M0145-0013 — DONE `[x]`** (seam admission for pulled `*CTEScan`
-leaves), knob arm only. Landed with the pricing residual reported, not hidden.
+Task: **M0145-0014 — PARTIAL**, still `[ ]`. The scalar half landed; the ANY
+recursion is deferred and ledgered with an exact resume point.
 
-## BANNER MOVED under the previous baton — check it every loop
+## Banner
 
-Commit `24d45abcd` (owner) extended item 3 with **M0145-0013 … 0018**, so the
-previous baton's "item 3 is exhausted, go to item 4" was stale. Item 3's order
-now ends `… 0012 [!] → 0013 [x] → 0014 → 0015 → 0016 → 0017 → 0018`.
-**Next selectable: M0145-0014** (nested-sublink pull-up recursion,
-`any-nested-sublink`, census 12 fires; PG recurses via
-`pull_up_sublinks_qual_recurse`, `prepjointree.c:682-693`/`:736-747`/`:836-845`).
+Item 3: `… 0013 [x] → 0014 [ ] (partial) → 0015 → 0016 → 0017 → 0018`.
+Re-read it — it grew M0145-0013..0018 under an earlier baton.
+
+## The finding: the class is TWO shapes, not one
+
+```
+query58   d_date IN (SELECT … WHERE d_week_seq =  (SELECT …))   scalar nested
+query83   d_date IN (SELECT … WHERE d_week_seq IN (SELECT …))   ANY nested
+```
+
+Only Q83 needs the recursion. **goopg's gate was over-broad against the
+oracle**: PG converts the OUTER sublink first (`convert_ANY_sublink_to_join`
+gates on correlation + volatility only, `subselect.c:1345-1386`) and recurses
+afterwards, so a nested sublink PG would not convert never blocks the outer
+conversion. goopg refused both via a blanket `exprHasSublinkPlan`.
 
 ## What landed
 
-Both consumer sites of the bare-`*SeqScan` invariant now route through
-`seamLeafBinding` (admission) + `seamLeafRelInfo` (pricing routed on
-`b.table`), so it is held in ONE place instead of three.
+- `bodyQualsAdmitSublinks` splits the refusal at BOTH pull-up arms (sibling
+  pair, identical gate): non-convertible sublink rides along;
+  `nested-sublink-convertible` and `nested-sublink-correlated` decline.
+- **Second wall, found by re-censusing after the first half**:
+  `rebasePulledQual` cloned under `scopeVeto`, which makes `cloneExprRefs`
+  ABORT at the first inner-plan slot — every admitted qual then failed as
+  `rebase-failed`. Now `scopeSignal` + an `OnScope` guard declining a
+  CORRELATED subplan (`planHasOuterRef`).
+- `noteRebaseFail` names which of the four rebase failures fired.
 
 ```
-seam census, SF0.25 knob arm, vs a pre-change binary from a worktree at HEAD
-  pulled-leaf-not-scan  19 -> 0      <- the target
-  residual-hits-pad      0 -> 4      <- the NEW wall
-  leaf-count 15/15  semianti-not-tail 6/6  outer-over-derived 6/6
-  pull-up census unchanged
-
-correctness: exactly Q14/Q23/Q95 move, all three VALUE-IDENTICAL
-inertness:   with GOOPG_PULLUP_CTE_LEAF off, 0/100 plans move
+census SF0.25 knob arm:  any-nested-sublink 12 -> 0
+                         any-nested-sublink-convertible 6  (Q83, deferred)
+                         (pulled) 42 -> 48                 no REBASEFAIL
+plans: exactly Q58 moves, cost 20670 -> 13692, Hash Semi Join retained
 ```
 
-**`*CTEScan` binds with `table == nil` deliberately** — `leafIsDerivedInput`
-reads it, which is what holds the `outer-over-derived` firewall in force until
-M0145-0018. `TestSeamLeafBindingAdmission` pins it against a future
-"helpful" synthesis of a catalog.Table.
-
-## The residual to carry
-
-The unlocked plans are **mispriced**. Against the honest `leaf-off` knob-arm
-baseline: Q23 −14%, Q14 +25%, **Q95 3.0x slower** (3004 → 9148 ms, estimated
-cost 70693 → 1232685). Values identical, so pricing not correctness. This is
-the first thing M0145-0018's "fresh E1 re-verification keeps the relaxed plans
-clean" precondition will trip on. Ledgered.
-
-Also carried: 4 new `residual-hits-pad` fires (unexamined — a different
-invariant), and the `pulled`-suppression window is unchanged, not discharged.
+**Verified against the PG oracle** (Q58 returns 0 rows at SF0.25 — a weak
+witness): the same nested-scalar shape over `store_sales` gives `3654|181827`
+on PG 18.3 and on goopg before AND after, and goopg now produces PG's shape
+with the nested scalar as an `InitPlan` filter on the body leaf.
 
 ## Next step
 
-**M0145-0014.** Read the task text first: it names PG's recursion sites
-exactly, and the correct-decline rule (a nested SCALAR sublink stays declined).
-Expected movement `any-nested-sublink` 12 → 0 on the pull-up census. Knob arm.
+**M0145-0015** (residual census + OR/NOT-position sublinks — PG's actual reach
+only). Read its text first: it is measurement-first and explicitly says to
+check whether goopg already has a hashed-subplan equivalent of
+`convert_EXISTS_to_ANY` before building anything.
+
+If instead resuming 0014's deferred half: the blocker is that a link predicate
+across TWO pulled bodies has no coordinate path —
+`outerOperandAsLevel1`/`rebasePulledQual` only handle a Level-1 outer ref
+resolving to an EMITTING binding.
 
 ## Traps carried forward
 
-- **Re-read the banner every loop** — it grew M0145-0013..0018 under us.
-- A/B against a pre-change binary: `git worktree add --detach /tmp/<x> HEAD`
-  then build with `-o`; remove the worktree afterwards (`git worktree remove
-  --force` + `prune`) — the repo already carries 11 stale ones.
-- Flags are read once at process START — an A/B needs two server runs.
-- Value gates cannot see a cardinality or pricing regression; check plan shape
-  and the clock.
+- **Re-read the banner every loop.**
+- A new hand-written Expr type switch fails `TestExprSwitchInventoryIsPinned`;
+  pin it in `exprSwitchInventory` AND add a ledger row (the guard says so).
+- Relocating a decline one step is not progress — re-census after each half.
+- A/B against HEAD: `git worktree add --detach`, build with `-o`, then
+  `git worktree remove --force` + `prune`.
+- The RALPH_LOOP write-guard trips on prose that mentions a client tool and a
+  reference port in the same heredoc — split the write in two.
 
 ## Gates run
 
-units PASS; tpch-spotcheck PASS (Q12=2 Q13=33); TPC-DS SF0.25 default arm
-PASS=96 MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0, plans 99/99 identical,
-runtime-moves=0; TPC-H acceptance arm 24 MATCH; pgbench smoke via hook.
+units PASS (after pinning the new classifier); tpch-spotcheck PASS (Q12=2
+Q13=33); TPC-DS SF0.25 default arm PASS=96 MISMATCH=0 CKMISMATCH=0 ERROR=0
+TIMEOUT=0, plans 99/99 identical, runtime-moves=0; TPC-H acceptance arm
+24 MATCH; the commit hook's smoke runs on commit.
 
 ## In-flight
 

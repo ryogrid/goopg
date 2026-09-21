@@ -14145,6 +14145,40 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
   pull-up census and record the ratio.
   Kind: impl
   Parent: M0145-0003
+  - **PARTIAL 2026-09-21 — the population is TWO shapes, not one.** Design
+    doc `docs/design/0100-0149/m0145-0014-nested-sublink-pullup.md`.
+    - Attribution: the class fires on exactly two TPC-DS queries. **Q58**
+      nests a SCALAR sublink (`d_week_seq = (SELECT …)`), **Q83** nests an
+      ANY (`d_week_seq IN (SELECT …)`). Only Q83 needs the recursion.
+    - **The gate was over-broad against the oracle.** PG converts the OUTER
+      sublink first — `convert_ANY_sublink_to_join` gates on correlation and
+      volatility only (`subselect.c:1345-1386`) — and recurses afterwards, so
+      a nested sublink PG would not convert never blocks the outer
+      conversion. goopg refused both via a blanket `exprHasSublinkPlan`.
+    - LANDED: `bodyQualsAdmitSublinks` splits the refusal at BOTH pull-up
+      arms (a sibling pair holding the identical gate), and
+      `rebasePulledQual` now clones under `scopeSignal` rather than
+      `scopeVeto` — the latter ABORTS at the first inner-plan slot, which
+      made every admitted qual fail one step later as `rebase-failed`. A
+      CORRELATED subplan still declines (`planHasOuterRef`).
+    - Census SF0.25 knob arm: `any-nested-sublink` **12 → 0**,
+      `any-nested-sublink-convertible` **6** (Q83, deferred), `(pulled)`
+      42 → 48, no `REBASEFAIL`. Exactly Q58 moves; cost 20670 → 13692 with
+      the `Hash Semi Join` retained.
+    - **Verified against the PG oracle**, because Q58 returns 0 rows at
+      SF0.25 and is a weak witness on its own: the same nested-scalar shape
+      over `store_sales` gives `3654|181827` on PG 18.3 (`:65438`) and on
+      goopg both before and after, and goopg now produces PG's shape with
+      the nested scalar as an `InitPlan` filter on the body leaf.
+    - **DEFERRED — the recursion itself** (Q83's 6). It needs a link
+      predicate referring to the OUTER BODY's leaves, and
+      `outerOperandAsLevel1`/`rebasePulledQual` only handle a Level-1 outer
+      ref resolving to an EMITTING binding, so a link across two pulled
+      bodies has no coordinate path today. Ledgered 2026-09-21.
+  Movement: none — knob arm only; the default arm is unchanged and the gates
+  confirm it. The knob-arm pull-up census moved `any-nested-sublink` 12 → 0
+  (6 pulled, 6 re-classified as the deferred convertible half), which is this
+  task's own expected-movement criterion, not a lineage instrument.
 - [ ] **M0145-0015 — name the residual pull-up decline class and
   cover the PG-reachable subset under OR/NOT positions** (filed
   2026-09-21 by owner directive). The 60-conjunct census leaves 3

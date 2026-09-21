@@ -165,6 +165,12 @@ var exprSwitchInventory = map[string]walkerRole{
 	// local_filters.go:conjunctIsLocalEligible.
 	"jointreepullup.go:rebasePulledQual":             nonRecursiveClassifier,
 	"jointreepullup.go:exprListHasLocalAndLevel1Ref": nonRecursiveClassifier,
+	// M0145-0014. The traversal is `walkExprTree`, not hand-written; the two
+	// arms are a CLASSIFICATION of which sublink kinds
+	// `pull_up_sublinks_qual_recurse` converts (ANY and EXISTS, and nothing
+	// else). It must not be generalised to "any Expr carrying a subplan" —
+	// that is exactly the blanket gate this task removed.
+	"jointreepullup.go:exprHasConvertibleSublink": nonRecursiveClassifier,
 	// Added by M0145-0003's ANY arm. Same demoted shape and the same
 	// fail-closed property as rebasePulledQual above: the dispatch lives
 	// inside a cloneExprRefs Rewrite closure (lift *ColumnRef to Level-1

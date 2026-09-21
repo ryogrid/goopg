@@ -268,3 +268,21 @@ func traceCTERowsFallback(name string, collapsed, bodyRows int64) {
 	fmt.Fprintf(os.Stderr, "CTEROWSFALLBACK cte=%s collapsed=%.0f body=%.0f\n",
 		name, float64(collapsed), float64(bodyRows))
 }
+
+// noteRebaseFail names WHICH failure inside `rebasePulledQual` fired. The seam
+// reports `PULLUPCLASSIFY refusal=rebase-failed` for all of them, and one
+// string for several distinct causes is not enough to act on: "a body column
+// the leaf map does not cover" and "the clone driver hit a node type it does
+// not recognise" have different fixes.
+func noteRebaseFail(reason string) {
+	if !nliCensusEnabled {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "REBASEFAIL cause=%s\n", reason)
+}
+
+// exprTypeName is the census spelling of an expression's Go type, with the
+// package qualifier stripped so the lines stay readable.
+func exprTypeName(e Expr) string {
+	return strings.TrimPrefix(fmt.Sprintf("%T", e), "*optimizer.")
+}
