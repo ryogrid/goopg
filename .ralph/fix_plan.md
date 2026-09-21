@@ -13123,6 +13123,20 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
       and the search builds none of those. Same fact
       `stampSemiProbePrices`' header states from the other side ("the
       search never sees the unnested relset"), now counted.
+    - **CORRECTED 2026-09-21 (loop \#25)**: the cause named below is
+      wrong. `addNLIPaths` (joinpathsnli.go:280) declines only
+      `JoinRight` — its comment states the admitted set as
+      "Inner/Left/Semi/Anti" — so the join TYPE was never the gate. The
+      real mechanism is that the default arm's semijoin is built by the
+      legacy unnest AFTER the search, so no joinrel exists to file a
+      path against. Knob-arm census: TPC-H rewrite-built drops from 4
+      (2 SEMI + 2 ANTI) to **1 SEMI** because the pull-up feeds three of
+      them to the search — which then elects a non-NLI method, leaving
+      search-built SEMI/ANTI NLIs at zero on both arms. The open
+      question is whether an NLI path is generated and out-costed or
+      never generated; the next probe instruments `addNLIPaths`' other
+      decline points (`uniq == uniqueSideOuter`, `o.RequiredOuter != 0`,
+      the `param_source_rels` test), not its join-type set.
     - **Hard constraint for M0145-0008**: deleting `rewriteJoinsToNLI`
       with the legacy pipeline deletes the ONLY route that builds a
       SEMI/ANTI index-probe join. The cutover depends on `addNLIPaths`

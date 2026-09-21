@@ -166,6 +166,40 @@ byte-identical. Any knob-arm capture must be taken on a private lane, or the
 next default capture's plan channel must be read against the last DEFAULT
 capture by hand.
 
+## Correction to slice 2's cutover constraint (2026-09-21)
+
+Slice 2 concluded that `rewriteJoinsToNLI` is the only producer of SEMI/ANTI
+index-probe joins and that the cutover therefore waits on `addNLIPaths`
+learning to file them, "because it files INNER/LEFT today".
+
+**That cause was wrong.** `addNLIPaths` (joinpathsnli.go:280) declines only
+`parser.JoinRight`, and its own comment states the admitted set: "mirrors
+partialHashJoinTypeOK (Inner/Left/Semi/Anti)". The join type was never the
+gate.
+
+The real mechanism is what `stampSemiProbePrices`' header says from the other
+side: on the DEFAULT arm the semijoin is created by the legacy unnest AFTER the
+search, so there is no joinrel to file a path against, whatever `addNLIPaths`
+would admit. That makes the pull-up (M0145-0003), not `addNLIPaths`, the thing
+that changes it. Measured, same corpus, both arms:
+
+| arm | search-built | rewrite-built |
+|---|---|---|
+| default, TPC-H SF1 | 11 INNER | 4 (2 SEMI + 2 ANTI) |
+| **knob, TPC-H SF1** | 10 INNER | **1 SEMI** |
+
+The pull-up removed three of the four — those semijoins now reach the search as
+real leaf items. But the search did not replace them with SEMI/ANTI NLI paths;
+it elected some other method, so search-built semi/anti NLIs remain zero on
+both arms.
+
+**The open question is narrower and different**: for a pulled-up semi joinrel,
+is an NLI path generated and out-costed, or never generated? `addNLIPaths` has
+gates beyond the join type — `uniq == uniqueSideOuter`, `o.RequiredOuter != 0`,
+and `try_nestloop_path`'s `param_source_rels` test (joinpath.c:882-889) — any
+of which could decline before a path is filed. The next probe instruments those
+decline points; it does not touch the join-type set, which is already correct.
+
 ## Slice plan
 
 | slice | scope | why this order |
