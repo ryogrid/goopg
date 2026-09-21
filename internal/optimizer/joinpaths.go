@@ -449,5 +449,9 @@ func addPathsToJoinrel(s *searchCtx, joinrel, outer, inner *RelOptInfo, clauses 
 	// results must be fully unparameterised; there is no star-schema
 	// exception to test).
 	addPartialNestLoopPaths(s, joinrel, outer, inner, cp, jt, clauses)
+	// M0145-0008 follow-up census (nlicensus.go): the full candidate set for a
+	// semi/anti joinrel, after every arm has filed. Off unless
+	// GOOPG_NLI_CENSUS=1.
+	noteSemiJoinrelPaths(joinrel, jt)
 	return nil
 }

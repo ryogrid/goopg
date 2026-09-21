@@ -160,6 +160,40 @@ func noteNLIPathGate(jt parser.JoinType, reason string) {
 	fmt.Fprintf(os.Stderr, "NLIGATE jointype=%s gate=%s\n", name, reason)
 }
 
+// noteSemiJoinrelPaths dumps every path filed for a semi/anti joinrel with its
+// kind and cost — M0145-0008's follow-up question, one level down.
+//
+// The timing A/B measured that the jointree arm runs TPC-H Q4 35x, Q20 27x and
+// Q21 7x slower than the default arm, and M0145-0007 established why the SHAPE
+// differs: the search files an NLI path for the pulled-up semijoin and
+// `add_path` out-costs it. What no census so far shows is BY HOW MUCH and on
+// which term, and that cannot be read off a plan — the losing path leaves no
+// trace in the output.
+//
+// So the whole candidate set is dumped once per semi/anti joinrel, after every
+// arm has filed. The winner is the minimum total, so the comparison the cost
+// model actually made is reconstructible from the line alone, and the NLI's
+// margin of loss is the number the next fix has to move.
+func noteSemiJoinrelPaths(joinrel *RelOptInfo, jt parser.JoinType) {
+	if !nliCensusEnabled || joinrel == nil {
+		return
+	}
+	if jt != parser.JoinSemi && jt != parser.JoinAnti {
+		return
+	}
+	name := "semi"
+	if jt == parser.JoinAnti {
+		name = "anti"
+	}
+	for _, p := range joinrel.Pathlist {
+		if p == nil {
+			continue
+		}
+		fmt.Fprintf(os.Stderr, "SEMICOST jointype=%s relids=%#08x kind=%s startup=%.2f total=%.2f rows=%.0f\n",
+			name, uint32(joinrel.Relids), tracePathKind(p), p.Cost.Startup, p.Cost.Total, p.Rows)
+	}
+}
+
 // nliCensusJoinTypeName names the join type for the census line. It is
 // deliberately separate from `traceJoinTypeName` (which speaks the parser
 // enum) so the census stays readable without a conversion at every call.
