@@ -660,7 +660,7 @@ func TestRemapWalkOrderFlatToSpans_RealLeafAfterSyntheticRHS(t *testing.T) {
 		Right: &ColumnRef{Index: wA},
 	}
 
-	remapped, ok := remapWalkOrderFlatToSpans(pred, widths, cumOffsets, 0, 0)
+	remapped, ok := remapWalkOrderFlatToSpans(pred, widths, cumOffsets, 0, 0, identityLeafPerm(len(widths)))
 	if !ok {
 		t.Fatalf("remapWalkOrderFlatToSpans(...) ok=false, want true")
 	}

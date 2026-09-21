@@ -14281,7 +14281,7 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
   Movement: none — measured-no-gap. The census extension is the whole
   production change; it is what lets a later loop tell `@top` (a gap) from
   `@or` (parity) without re-deriving it.
-- [ ] **M0145-0016 — `semianti-not-tail`: admit non-tail synthetic
+- [x] **M0145-0016 — `semianti-not-tail`: admit non-tail synthetic
   leaves (leaf reorder + relset remap)** (filed 2026-09-21 by owner
   directive; ledgered at `joinsearchseam.go`'s construction contract
   as "real future work, not a guard to relax"). 3 fires on the
@@ -14304,6 +14304,40 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
   when the assumption broke).
   Kind: impl
   Parent: M0145-0005
+    - **BUILT AND LANDED 2026-09-21 (loop 49).** `semianti-not-tail` **6 → 0**
+      on the corpus; every other decline class unchanged; the two new reasons
+      (`semianti-not-tail-with-pulled`, `semianti-perm-desync`) both at 0.
+      - **It was a small change, and the reason is worth carrying**: the
+        walk-to-problem index translation lives in exactly ONE place —
+        `remapWalkOrderFlatToSpans`' `problemIndex` closure, which already
+        encoded the pulled-splice shift — so the permutation composes there
+        rather than being threaded through every consumer.
+      - **Column-neutrality is what makes the composition safe.**
+        `buildLeafSpans` assigns real spans in position order and synthetic
+        spans out-of-band after them, so a STABLE partition preserves both
+        relative orders: every span's `lo` is unchanged and only the index
+        holding it moves. Nothing is renumbered, so quals already rebased
+        into walk-order-flat space survive untouched.
+      - **Acceptance bar met, as the task set it**: exactly Q78 moves, and it
+        is verified against the **PG oracle**, not row-counted — 15 rows,
+        `ck 4a8a89aae2584676` on PG 18.3 and on goopg both before and after,
+        4041 → 3855 ms. The admitted problem elects a parallel `Gather` +
+        `Finalize HashAggregate` for the `ws` CTE.
+      - Cost-model note for whoever owns it: Q78's estimated cost ROSE
+        (Limit 4724 → 8184) while measured time fell — the same
+        estimate/measurement disagreement M0145-0013 recorded.
+      - **Scope bound kept**: partition-AND-pulled-leaves still declines, now
+        as its own named reason. The non-synthetic set would be two
+        populations there and a single stable partition does not preserve the
+        three-way split; ZERO corpus fires, so it is declined rather than
+        guessed at. Ledgered with the resume point.
+  Movement: none on the lineage instruments (plan shape is not one of S3's
+  three). **NOT knob-arm-only — correcting the scoping assumption**: the seam
+  `tryPGShapedJoinSearch` is shared, so the DEFAULT arm moves too. The SF0.25
+  gate reports `same=98 changed=1`, and the one mover is Q78 — the same query,
+  `PASS 15 rows ck=c06cf981a7819a37` against the git-tracked PG oracle, 3501 ms.
+  The knob-arm seam census moved `semianti-not-tail` 6 → 0, which is this
+  task's own expected-movement criterion.
   - **Step 0 done 2026-09-21: NOT subsumed.** Design doc
     `docs/design/0100-0149/m0145-0016-semianti-not-tail.md`.
     - M0145-0005 is still `[ ]` with only slice 1 landed, and the corpus

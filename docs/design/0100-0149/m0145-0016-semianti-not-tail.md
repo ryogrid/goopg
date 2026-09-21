@@ -1,9 +1,8 @@
 # `semianti-not-tail`: the leaf reorder, scoped (M0145-0016)
 
-Status: **VERIFIED NOT SUBSUMED, scoped, not built.** The task's own first
-instruction — check whether M0145-0005's slice (a) already retired the decline —
-is discharged: it has not. The remap is in scope, and this document is the
-inventory the build loop needs so it does not re-derive it.
+Status: **BUILT AND LANDED 2026-09-21.** `semianti-not-tail` is 0 on the
+corpus and Q78 is oracle-verified. The subsumption check (step 0, previous
+loop) had established the remap was genuinely in scope.
 
 Task: `.ralph/fix_plan.md` M0145-0016. Kind: impl. Parent: M0145-0005.
 
@@ -82,9 +81,83 @@ A cheap diagnostic learned in loop 46 and worth reusing here: when
 `translateToLayout` refuses, print the columns that WERE available at that node
 before theorising about which mechanism owns the failure.
 
-## Landed this loop
+## What made it tractable — one translation point
 
-Only `traceSeamNotTail`, the shape line above. The permutation itself is not
-built: it is a coordinate change in the seam's most position-sensitive
-function, composing with an existing translation, and the honest unit of work
-is to start it from this inventory rather than to half-land it.
+The inventory above reads as a large change, and it is not, because the
+walk-to-problem index translation lives in exactly ONE place:
+`remapWalkOrderFlatToSpans`' `problemIndex` closure, which already encoded the
+pulled-splice shift. A permutation is a second translation composed there, not
+a new mechanism threaded everywhere.
+
+The property that makes the composition safe is that the permutation is
+**column-neutral**. `buildLeafSpans` assigns real spans in position order and
+synthetic spans out-of-band after the real total; a STABLE partition preserves
+both relative orders, so every span's `lo` is unchanged and only the index
+holding it moves. Nothing is renumbered — which is why the quals already
+rebased into walk-order-flat space survive untouched.
+
+## What landed
+
+- `stableSyntheticTailPerm` — the stable partition (real leaves keep relative
+  order, synthetic leaves move to the tail). Q78's `[real, synthetic, real]`
+  maps to `[0, 2, 1]`, matching the measured `synthetic=0x0002 want=0x0004`.
+- `permuteRelSet` / `applyLeafPerm` — the remap over the inventory above. The
+  shared `sjinfo` is mutated in place, as its own comment requires.
+- `identityLeafPerm` — every chain whose synthetic leaves are already the tail
+  takes the identity, so the machinery costs those chains nothing.
+- `remapWalkOrderFlatToSpans` gained the `leafPerm` argument.
+
+## Measurement
+
+Seam decline census, TPC-DS SF0.25, knob arm, all 99 queries:
+
+```
+                              before   after
+semianti-not-tail                  6       0
+leaf-count                        19      19
+residual-hits-pad                  6       6
+outer-over-derived                 6       6
+semianti-not-tail-with-pulled      -       0
+semianti-perm-desync               -       0
+```
+
+**Correctness — the task's own acceptance bar, met.** Exactly Q78 moves across
+all 99 plans (knob arm, against a pre-change binary from a worktree at HEAD),
+and Q78 is verified against the **PG oracle**, not merely row-counted:
+
+```
+goopg before  15 rows  ck 4a8a89aae2584676   4041 ms
+goopg after   15 rows  ck 4a8a89aae2584676   3855 ms
+PG 18.3       15 rows  ck 4a8a89aae2584676
+```
+
+The admitted problem reaches the search, and the search elects a parallel shape
+for the `ws` CTE (`Gather` + `Finalize HashAggregate` where a serial
+`Nested Loop` over a `Hash Anti Join` stood). Worth noting for whoever owns
+cost work: the estimated cost ROSE (Limit 4724 -> 8184) while measured time
+fell, which is the same estimate/measurement disagreement M0145-0013 recorded.
+
+## Both arms, not just the knob arm
+
+The scoping assumption carried into this loop was "knob arm only". It is
+wrong, and the gate caught it: `tryPGShapedJoinSearch` is the SEAM, shared by
+both pipelines, so the `semianti-not-tail` decline — and its repair — exist on
+the default arm too. The SF0.25 default-arm gate reports
+`PLAN-SHAPE: same=98 changed=1`, and the sole mover is Q78, the same query, at
+`PASS 15 rows ck=c06cf981a7819a37` against the git-tracked PG oracle with
+`verdict-changes=none` and `runtime-moves=0`.
+
+That is the correct outcome rather than a surprise to paper over: the decline
+was never pipeline-specific, so neither is lifting it. It does mean the change
+is load-bearing on the default arm and its acceptance rests on the oracle
+comparison, which is exactly why the task specified one.
+
+## Scope bound, deliberately kept
+
+A chain that needs the partition AND has pulled leaves spliced in still
+declines, as `semianti-not-tail-with-pulled`. With both present the
+non-synthetic set is itself two populations — emitting FROM items and
+non-emitting pulled bodies — whose relative order `splicePulledLeaves`
+established at `nReal`, and a single stable partition does not preserve that
+three-way split. No corpus shape exercises the combination (the census shows 0),
+so it is declined rather than guessed at. Ledgered.

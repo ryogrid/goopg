@@ -463,14 +463,33 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 	for _, lk := range semiAnti {
 		syntheticBits |= lk.rhs
 	}
+	// M0145-0016: a chain whose synthetic leaves are NOT already the tail is
+	// repaired by a stable partition rather than declined.
+	leafPerm := identityLeafPerm(len(scans))
 	if syntheticBits != leafRangeRelSet(nprefix, len(scans)) {
-		// M0145-0016: report the SHAPE, not just the reason. The remedy is a
-		// stable partition of the leaves, and what it has to move is exactly
-		// "which walk positions are synthetic versus which the tail wants" —
-		// deriving that from a bare decline count costs a census round.
 		traceSeamNotTail(syntheticBits, nprefix, len(scans))
-		traceSeamDecline("semianti-not-tail", nrels, len(scans))
-		return node, pred, false
+		if nPulled != 0 {
+			// Scope bound: with pulled leaves ALSO spliced in, the
+			// non-synthetic set is itself two populations (emitting FROM
+			// items and non-emitting pulled bodies) whose relative order the
+			// splice established at `nReal`. A single stable partition does
+			// not preserve that three-way split, and no corpus shape
+			// exercises the combination, so it stays declined rather than
+			// guessed at.
+			traceSeamDecline("semianti-not-tail-with-pulled", nrels, len(scans))
+			return node, pred, false
+		}
+		leafPerm = stableSyntheticTailPerm(syntheticBits, len(scans))
+		applyLeafPerm(leafPerm, &scans, &widths, semiAnti, outerLinks, onQuals)
+		syntheticBits = permuteRelSet(syntheticBits, leafPerm)
+		if syntheticBits != leafRangeRelSet(nprefix, len(scans)) {
+			// The partition is total by construction; a mismatch here means
+			// the synthetic set and `nprefix` disagree about how many leaves
+			// are real, which is a numbering desync, not a shape to plan
+			// around.
+			traceSeamDecline("semianti-perm-desync", nrels, len(scans))
+			return node, pred, false
+		}
 	}
 	// A flattened body can push the problem past the relset bit width even
 	// when the statement's own FROM list fits — `RelSet` bits are leaf
@@ -519,7 +538,7 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 	// task's own trace: `rs` for the folded eq conjunct came back spanning
 	// leaves {0,2} instead of {0,1}).
 	for i := range semiAnti {
-		remapped, okRemap := remapWalkOrderFlatToSpans(semiAnti[i].pred, walkWidths, spans, nReal, nPulled)
+		remapped, okRemap := remapWalkOrderFlatToSpans(semiAnti[i].pred, walkWidths, spans, nReal, nPulled, leafPerm)
 		if !okRemap {
 			traceSeamDecline("semianti-pred-remap", nrels, len(scans))
 			return node, pred, false
@@ -530,7 +549,7 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 		// the link's own RHS leaves, which are exactly the positions the
 		// remap relocates out-of-band.
 		for k, q := range semiAnti[i].bodyQuals {
-			rq, okQ := remapWalkOrderFlatToSpans(q, walkWidths, spans, nReal, nPulled)
+			rq, okQ := remapWalkOrderFlatToSpans(q, walkWidths, spans, nReal, nPulled, leafPerm)
 			if !okQ {
 				traceSeamDecline("semianti-bodyqual-remap", nrels, len(scans))
 				return node, pred, false
@@ -2260,7 +2279,7 @@ func buildLeafSpans(widths []int, semiAnti []semiAntiChainLink) []leafSpan {
 // LATER leaf's width was knowable — must therefore be re-targeted here, once
 // `widths` is complete and `spans` exists, before `relidsOfExpr`
 // (which reads `spans`, not walk order) ever sees it.
-func remapWalkOrderFlatToSpans(e Expr, widths []int, spans []leafSpan, pulledBase, pulledLeaves int) (Expr, bool) {
+func remapWalkOrderFlatToSpans(e Expr, widths []int, spans []leafSpan, pulledBase, pulledLeaves int, leafPerm []int) (Expr, bool) {
 	if e == nil {
 		return nil, true
 	}
@@ -2273,11 +2292,23 @@ func remapWalkOrderFlatToSpans(e Expr, widths []int, spans []leafSpan, pulledBas
 	// position `pulledBase`, so a walk leaf at-or-above it lands at
 	// problem index `+ pulledLeaves`. With `pulledLeaves` == 0 this is
 	// the identity — the pre-slice-2 shape.
+	// M0145-0016 composes a SECOND translation on top: after the splice, a
+	// chain whose synthetic leaves were not already the tail is stably
+	// partitioned, and `leafPerm` maps the post-splice position to its final
+	// one. The permutation is column-NEUTRAL — `buildLeafSpans` assigns real
+	// spans in position order and synthetic spans out-of-band after them, and
+	// a stable partition preserves both relative orders, so every span's `lo`
+	// is unchanged and only the index holding it moves. That is precisely
+	// what makes composing the two translations safe.
 	problemIndex := func(walkLeaf int) int {
+		spliced := walkLeaf
 		if walkLeaf >= pulledBase {
-			return walkLeaf + pulledLeaves
+			spliced = walkLeaf + pulledLeaves
 		}
-		return walkLeaf
+		if spliced >= 0 && spliced < len(leafPerm) {
+			return leafPerm[spliced]
+		}
+		return spliced
 	}
 	leafOf := func(walkOrderFlat int) (int, bool) {
 		for i := range widths {
@@ -2825,5 +2856,97 @@ func seamLeafRelInfo(i int, b rangeBinding, scan Node, local Expr, cat catalog.C
 		bindingIdx:   i,
 		baseRows:     baseRows,
 		filteredRows: applyLocalFilterSelectivity(baseRows, b, scan, local),
+	}
+}
+
+// identityLeafPerm is the no-op leaf permutation: position i stays at i. It is
+// what every chain whose synthetic leaves already occupy the tail uses, so the
+// permutation machinery costs those chains nothing and cannot change them.
+func identityLeafPerm(n int) []int {
+	perm := make([]int, n)
+	for i := range perm {
+		perm[i] = i
+	}
+	return perm
+}
+
+// stableSyntheticTailPerm builds the permutation that restores the seam's
+// construction contract: every synthetic (Semi/Anti RHS) leaf in a tail slot.
+//
+// It is a STABLE partition, and the stability is load-bearing rather than
+// cosmetic. Real leaves carry the emitting column space: `buildLeafSpans`
+// assigns their spans in position order, so preserving their relative order
+// preserves every column offset exactly. Synthetic leaves are assigned
+// out-of-band after the real total, so preserving THEIR relative order does
+// the same for them. The result is that only position masks move — no column
+// coordinate is renumbered — which is the property `remapWalkOrderFlatToSpans`
+// relies on when it composes this translation with the pulled-splice one.
+//
+// The shape this exists for is the demoted-ANTI mid-chain walk
+// `[real, synthetic, real]` (`web_sales ANTI web_returns JOIN date_dim`,
+// TPC-DS Q78), which maps to [0, 2, 1].
+func stableSyntheticTailPerm(synthetic RelSet, n int) []int {
+	perm := make([]int, n)
+	next := 0
+	for i := 0; i < n; i++ {
+		if synthetic&leafRangeRelSet(i, i+1) == 0 {
+			perm[i] = next
+			next++
+		}
+	}
+	for i := 0; i < n; i++ {
+		if synthetic&leafRangeRelSet(i, i+1) != 0 {
+			perm[i] = next
+			next++
+		}
+	}
+	return perm
+}
+
+// permuteRelSet re-expresses a leaf-index mask under `perm`.
+func permuteRelSet(rs RelSet, perm []int) RelSet {
+	out := RelSet(0)
+	for i := 0; i < len(perm); i++ {
+		if rs&(RelSet(1)<<uint(i)) != 0 {
+			out |= RelSet(1) << uint(perm[i])
+		}
+	}
+	return out
+}
+
+// applyLeafPerm moves every position-indexed piece of seam state onto the
+// permuted numbering. The inventory is exhaustive on purpose — a mask left
+// behind does not fail loudly, it silently names a different leaf, which is
+// the class of fault that produced Q78's historical `translateToLayout` panic.
+//
+// `semiAnti[i].sjinfo` is a SHARED pointer whose own doc comment forbids it
+// from drifting apart from the link's `lhs`/`rhs`, so it is mutated in place
+// rather than rebuilt.
+func applyLeafPerm(perm []int, scans *[]Node, widths *[]int, semiAnti []semiAntiChainLink, outer []outerChainLink, onQuals []chainOnQual) {
+	n := len(perm)
+	newScans := make([]Node, n)
+	newWidths := make([]int, n)
+	for i := 0; i < n && i < len(*scans); i++ {
+		newScans[perm[i]] = (*scans)[i]
+		newWidths[perm[i]] = (*widths)[i]
+	}
+	*scans = newScans
+	*widths = newWidths
+	for i := range semiAnti {
+		semiAnti[i].lhs = permuteRelSet(semiAnti[i].lhs, perm)
+		semiAnti[i].rhs = permuteRelSet(semiAnti[i].rhs, perm)
+		if sj := semiAnti[i].sjinfo; sj != nil {
+			sj.SynLefthand = permuteRelSet(sj.SynLefthand, perm)
+			sj.SynRighthand = permuteRelSet(sj.SynRighthand, perm)
+			sj.MinLefthand = permuteRelSet(sj.MinLefthand, perm)
+			sj.MinRighthand = permuteRelSet(sj.MinRighthand, perm)
+		}
+	}
+	for i := range outer {
+		outer[i].preserved = permuteRelSet(outer[i].preserved, perm)
+		outer[i].nullable = permuteRelSet(outer[i].nullable, perm)
+	}
+	for i := range onQuals {
+		onQuals[i].belowNullable = permuteRelSet(onQuals[i].belowNullable, perm)
 	}
 }
