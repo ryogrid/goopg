@@ -12776,6 +12776,27 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
     - Skipped on the knob arm by design (value-preserving missed opts,
       ledgered): `injectLikeRangePredicates`, `reduceNotNullQuals`
       incl. always-false → childless `Result`, `planIndexScanFromWhere`.
+    - **`reduceNotNullQuals` CLOSED (loop 2026-09-21 \#23)** — it was
+      the one of the three that carries cutover RISK, because it is
+      goopg's port of `restriction_is_always_true`/`_false`
+      (initsplan.c `add_base_clause_to_rel`), i.e. a PG SHAPE rule and
+      not merely an optimisation. Measured before the fix: the knob arm
+      planned `Filter{SeqScan}` for `WHERE not_null_col IS NULL` where
+      the default arm emits PG's childless
+      `Result / One-Time Filter: false`; likewise it kept a redundant
+      Filter for `IS NOT NULL` where the default arm drops the qual.
+    - The reduction now runs in the generic arm, gated to `jointree` and
+      to single-binding scopes (the chooser's own condition). Downstream
+      reads `whereQual != nil` as "there is a Filter to search under"
+      and the pre-DP arm asserts `node.(*Filter)` on it, so a reduced
+      scope marks the clause spent (`whereQual = nil`) — without that an
+      always-false WHERE still carrying an `EXISTS` would have hit an
+      unchecked assertion on a `*Result`.
+    - Pins are ARM-EQUALITY pins (`notnull_reduce_jointree_test.go`):
+      the property M0145-0008 needs is that flipping the knob cannot
+      change these plans.
+    - The LIKE-range pair stays ledgered: index selection, not a PG
+      shape rule, so no cutover risk.
     - Slice 2 (landed, loop 2026-09-21 #8): pulled semi/anti bodies are
       REAL numbered leaf items — `pullUpSublinksIntoJointree` appends
       one `leafItem` per pulled leaf to `ctx.joinlist` (`pu.base` /

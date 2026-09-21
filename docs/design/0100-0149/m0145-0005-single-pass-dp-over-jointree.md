@@ -382,6 +382,53 @@ Pins (`searched_opacity_test.go`): searched-root and searched-
 grandchild refusal, unsearched-side positive control, CTE-inline
 crossing counter-pin, scan-hunt opacity + unsearched findability.
 
+## Slice 4's missed optimisations — the NOT NULL reduction (landed 2026-09-21)
+
+Slice 4 routed the jointree arm's single-table+WHERE scopes through the GENERIC
+arm so their base rels carry a real pathlist. The rule chooser it bypassed was
+doing two things nothing else does, and the doc recorded them as
+"value-preserving missed opts": `injectLikeRangePredicates` +
+`planIndexScanFromWhere`, and `reduceNotNullQuals`.
+
+"Value-preserving" is true and is not the whole story. `reduceNotNullQuals` is
+goopg's port of `restriction_is_always_true`/`restriction_is_always_false`
+(initsplan.c's `add_base_clause_to_rel`), so skipping it does not produce wrong
+rows — it produces a plan PG would never emit, and it becomes a REGRESSION the
+moment M0145-0008 flips the knob. Measured before the fix:
+
+| statement | default arm | knob arm |
+|---|---|---|
+| `WHERE not_null_col IS NULL` | `Result` (childless, One-Time Filter false) | `Filter{SeqScan}` |
+| `WHERE not_null_col IS NOT NULL` | bare `SeqScan` (qual dropped) | `Filter{SeqScan}` |
+| `WHERE nn IS NULL AND k = 5` | `Result` (childless) | `Filter{SeqScan}` |
+
+The reduction now runs in the generic arm too, gated to the jointree arm and to
+single-binding scopes — the same condition the chooser uses. Two details the
+placement forced:
+
+- The always-false arm builds the CHILDLESS `Result` for the reason the chooser
+  states: PG emits no scan under a false One-Time Filter.
+- Downstream, `whereQual != nil` is read as "there is a Filter to search
+  under", and the pre-DP arm asserts `node.(*Filter)` on that basis. A reduced
+  scope has neither, so the clause is marked spent (`whereQual = nil`) and the
+  whole sublink/pull-up/search block is skipped. Without that, an always-false
+  WHERE that still contained an `EXISTS` would have reached an unchecked type
+  assertion on a `*Result`.
+
+Knob-gated deliberately: on the default arm this generic arm is reached by
+MULTI-relation scopes, and a single-binding scope only lands here under
+`GOOPG_ONEREL_SEARCH`. Widening it there is corpus-visible and is ledgered
+rather than smuggled in.
+
+Evidence: arm-equality pins (`notnull_reduce_jointree_test.go`) assert the two
+pipelines agree on all three shapes — the property M0145-0008 depends on.
+Default-arm gates plan-identical (`same=99 changed=0`); knob-arm sweep
+`PASS=96 MISMATCH=0 CKMISMATCH=0 ERROR=0`; acceptance arm 24/24.
+
+The LIKE-range pair (`injectLikeRangePredicates` + `planIndexScanFromWhere`)
+is still skipped on the knob arm and stays ledgered — it is an index-selection
+optimisation, not a PG-shape rule, so it does not carry the same cutover risk.
+
 ## Remaining slices (ledgered)
 
 | slice | scope | retires |

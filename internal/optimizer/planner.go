@@ -1608,7 +1608,56 @@ func planSelectImpl(s *parser.SelectStmt, cat catalog.Catalog, plannerSet Planne
 				if pred, err = foldQualConstants(pred); err != nil {
 					return nil, err
 				}
-				node = &Filter{pos: s.Where.Pos(), Child: node, Predicate: pred}
+				// M0145-0005: the NOT NULL-driven reduction PG applies to
+				// every single-baserel restriction clause
+				// (`restriction_is_always_true` / `restriction_is_always_false`,
+				// initsplan.c's `add_base_clause_to_rel`). Slice 4 routed the
+				// jointree arm's single-table+WHERE scopes through THIS arm
+				// and the reduction stayed behind in the rule chooser, so the
+				// knob arm planned `WHERE not_null_col IS NULL` as a real scan
+				// under a Filter where the default arm already emits PG's
+				// childless `Result / One-Time Filter: false`. That gap is
+				// harmless while the knob is off and a regression the moment
+				// M0145-0008 flips it, which is why it is closed here rather
+				// than at the cutover.
+				//
+				// Knob-gated: on the default arm this arm is reached by
+				// MULTI-relation scopes (the chooser above owns the
+				// single-table ones), and a single-binding scope only lands
+				// here under `GOOPG_ONEREL_SEARCH`. Widening it there is a
+				// separate, corpus-visible change — ledgered, not smuggled in.
+				reduced := false
+				if jointree && len(ctx.bindings) == 1 {
+					rewritten, alwaysFalse := reduceNotNullQuals(pred,
+						ctx.bindings[0].table, int(ctx.bindings[0].sourceIdx))
+					switch {
+					case alwaysFalse:
+						// The childless Result the chooser arm builds, for
+						// the reason stated there: PG emits no scan under a
+						// false One-Time Filter.
+						scanSchema := node.Output()
+						node = &Result{pos: s.Where.Pos(), Targets: identityResultTargets(scanSchema),
+							OneTimeFilter: &BooleanConst{pos: s.Where.Pos(), Value: false},
+							Child:         nil, schema: scanSchema}
+						reduced = true
+					case rewritten == nil:
+						// Every conjunct was always-true: the bare scan, no
+						// Filter node at all.
+						reduced = true
+					default:
+						pred = rewritten
+					}
+				}
+				if reduced {
+					// Downstream reads `whereQual != nil` as "there is a
+					// Filter to search under" — the pre-DP arm asserts
+					// `node.(*Filter)` on that basis. A reduced scope has no
+					// Filter and nothing left to search, so the clause is
+					// spent here.
+					whereQual = nil
+				} else {
+					node = &Filter{pos: s.Where.Pos(), Child: node, Predicate: pred}
+				}
 			}
 			// M0127-P5.9-b's `root->tuple_fraction` assignment lived HERE,
 			// inside the WHERE arm, until C-17 (P4-08) moved it to the
