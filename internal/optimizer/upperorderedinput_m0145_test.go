@@ -183,3 +183,135 @@ func TestWindowAggNarrowingComposesWithTheNewArms(t *testing.T) {
 		t.Fatalf("no ordering below the window node must stay no ordering, got %d keys", len(got))
 	}
 }
+
+// --- slice 2: the merge-join top -------------------------------------------
+
+// mergeJoinSchema is a two-relation layout whose merge key columns share one
+// type: `pairIsHashSafe` requires that, and an unsafe pair is dropped from the
+// executor's key tuple, so a fixture with mismatched key types would be
+// testing the wrong refusal.
+func mergeJoinSchema() Schema {
+	return Schema{
+		{Name: "k", Type: catalog.Type{Name: "int4"}, SourceTableIdx: 1},
+		{Name: "v2", Type: catalog.Type{Name: "int4"}, SourceTableIdx: 1},
+		{Name: "rk", Type: catalog.Type{Name: "int4"}, SourceTableIdx: 2},
+	}
+}
+
+// mergeJoinOver builds the legacy-constructor shape: a `*Join` with no search
+// stamp, merging on the first output column.
+func mergeJoinOver(jt JoinType, algo JoinAlgo) *Join {
+	out := mergeJoinSchema()
+	left := &ColumnRef{Index: 0, Name: "k", SourceTableIdx: 1}
+	right := &ColumnRef{Index: 2, Name: "rk", SourceTableIdx: 2}
+	return &Join{
+		pos:      0,
+		Type:     jt,
+		Algo:     algo,
+		Left:     orderedInputLeaf(out[:2]),
+		Right:    orderedInputLeaf(out[2:]),
+		LeftKey:  left,
+		RightKey: right,
+		HashKeys: []JoinKeyPair{{Left: left, Right: right}},
+		schema:   out,
+	}
+}
+
+// TestInputNodePathkeysReadsALegacyMergeJoinsOrdering pins the arm that serves
+// the trees the PG-shaped search declined: goopg's merge operator sorts both
+// inputs itself and emits ascending / NULLs-last, so the join delivers the
+// merge-key ordering even with no path and no stamp behind it.
+func TestInputNodePathkeysReadsALegacyMergeJoinsOrdering(t *testing.T) {
+	j := mergeJoinOver(JoinTypeInner, JoinAlgoMerge)
+
+	got := inputNodePathkeys(j)
+	if len(got) != 1 {
+		t.Fatalf("got %d pathkeys, want the merge-key ordering (1)", len(got))
+	}
+	if cr := got[0].Expr.(*ColumnRef); cr.Index != 0 || cr.Name != "k" {
+		t.Fatalf("key = %#v, want the outer merge key (column 0, k)", got[0])
+	}
+	if !got[0].SortAsc || got[0].NullsFirst {
+		t.Fatalf("key = %#v, want ascending / NULLs last — the comparator is fixed", got[0])
+	}
+}
+
+// TestInputNodePathkeysRefusesNonMergeJoins is the gate on `Algo`: a hash or
+// nested-loop join emits in probe order and claims nothing.
+func TestInputNodePathkeysRefusesNonMergeJoins(t *testing.T) {
+	for _, algo := range []JoinAlgo{JoinAlgoHash, JoinAlgoNestedLoop} {
+		j := mergeJoinOver(JoinTypeInner, algo)
+		if got := inputNodePathkeys(j); got != nil {
+			t.Fatalf("algo %v must claim no ordering, got %d keys", algo, len(got))
+		}
+	}
+}
+
+// TestInputNodePathkeysDropsFullAndRightMergeOrderings is the wrong-answer
+// guard, on the node side this time: a FULL or RIGHT merge join injects its
+// unmatched rows wherever the merge reaches them, so `build_join_pathkeys`
+// returns NIL and so must this arm. An over-claim here deletes the ORDER BY
+// Sort and returns rows out of order with a correct row count.
+func TestInputNodePathkeysDropsFullAndRightMergeOrderings(t *testing.T) {
+	for _, jt := range []JoinType{JoinTypeFull, JoinTypeRight} {
+		j := mergeJoinOver(jt, JoinAlgoMerge)
+		if got := inputNodePathkeys(j); got != nil {
+			t.Fatalf("jointype %v must claim no ordering, got %d keys", jt, len(got))
+		}
+	}
+}
+
+// TestInputNodePathkeysDefersToAnEmptySearchStamp pins that the arm never
+// overrules the search: a searched join whose stamp is empty was given none on
+// purpose — the winning path's pathkeys were nil or failed validation against
+// this same schema — so re-deriving a claim from the node would be a weaker
+// mechanism silently overriding a stronger one.
+func TestInputNodePathkeysDefersToAnEmptySearchStamp(t *testing.T) {
+	j := mergeJoinOver(JoinTypeInner, JoinAlgoMerge)
+	markSearchedTree(j)
+	if got := inputNodePathkeys(j); got != nil {
+		t.Fatalf("a searched join with an empty stamp must claim nothing, got %d keys", len(got))
+	}
+}
+
+// TestMergeJoinEmissionPathkeysTruncatesRatherThanGuessing pins rule 3: the
+// keys are validated against the node's published schema, and a key that does
+// not address the column it names truncates the list instead of being
+// repaired or skipped.
+func TestMergeJoinEmissionPathkeysTruncatesRatherThanGuessing(t *testing.T) {
+	j := mergeJoinOver(JoinTypeInner, JoinAlgoMerge)
+	good := j.HashKeys[0]
+	// A second pair whose outer key names a column that is not at that index.
+	// Same int4 type on both sides, so the pair IS merge-safe and reaches the
+	// validator; it fails there because index 1 holds `v2`, not `k`.
+	bad := JoinKeyPair{Left: &ColumnRef{Index: 1, Name: "k", SourceTableIdx: 1}, Right: &ColumnRef{Index: 2, Name: "rk", SourceTableIdx: 2}}
+
+	j.HashKeys = []JoinKeyPair{good, bad}
+	if got := mergeJoinEmissionPathkeys(j); len(got) != 1 {
+		t.Fatalf("got %d keys, want the confirmed prefix (1)", len(got))
+	}
+	j.HashKeys = []JoinKeyPair{bad, good}
+	if got := mergeJoinEmissionPathkeys(j); len(got) != 0 {
+		t.Fatalf("a leading unconfirmable key must reduce the claim to nothing, got %d keys", len(got))
+	}
+}
+
+// TestMergeJoinEmissionPathkeysRefusesAnUnsafeLeadKey is the other
+// wrong-ordering guard. `ExecMergeKeyPlan` keeps `Keys[0]` unconditionally,
+// merge-safe or not, so an exotic-typed lead key is sorted by `compareDatum`
+// while the SQL `=` it stands for may disagree (float's -0.0, the cases
+// `pairIsHashSafe` excludes). The emitted order is then not the SQL ascending
+// order, so no claim may be made from it.
+func TestMergeJoinEmissionPathkeysRefusesAnUnsafeLeadKey(t *testing.T) {
+	j := mergeJoinOver(JoinTypeInner, JoinAlgoMerge)
+	out := mergeJoinSchema()
+	out[0].Type = catalog.Type{Name: "float8"}
+	out[2].Type = catalog.Type{Name: "float8"}
+	j.schema = out
+	j.Left = orderedInputLeaf(out[:2])
+	j.Right = orderedInputLeaf(out[2:])
+
+	if got := mergeJoinEmissionPathkeys(j); got != nil {
+		t.Fatalf("an unsafe lead key must claim nothing, got %d keys", len(got))
+	}
+}

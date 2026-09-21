@@ -12811,9 +12811,34 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
       parity move: PG 18.3 on the same dataset plans
       `Limit -> Subquery Scan -> WindowAgg -> Sort -> Merge Full Join`
       with no second Sort.
-    - Deferred (ledger rows 2026-09-21): the `*Join{Algo: JoinAlgoMerge}`
-      top (resume by stamping the validated `p.Pathkeys` onto the node at
-      build time, not by translating in the walk),
+    - Slice 2 (landed, loop 2026-09-21 \#12): the merge-join top.
+    - The ledgered plan (stamp `p.Pathkeys` onto the node) was WRONG about
+      where the gap is: `stampSearchPathkeys` already stamps every merge
+      join the PG-shaped search produces, and the walk reads that stamp
+      before its type switch. What has no stamp is the LEGACY
+      constructor's merge join — `chooseInnerJoinAlgo` (joincost.go:33)
+      elects merge on cost and `chooseOuterFillJoinAlgo` leaves
+      RIGHT/FULL on merge — which is the route every seam-declined
+      statement takes.
+    - Four soundness conditions, each a wrong-ordering guard: the
+      comparator direction is FIXED (ascending / NULLs-last,
+      `mergeSortedSource.less`), the join-type rule routes through
+      `buildJoinPathkeys` (FULL/RIGHT claim nil), the key list is the
+      EXECUTOR's `ExecMergeKeyPlan().Keys` and not `HashKeys` (an
+      unsafe pair is dropped into the residual, so `HashKeys` would
+      claim an ordering the sort never keyed), and the result is run
+      through `validatedSearchPathkeys` against the node's own schema.
+      An unsafe LEAD key refuses outright — `Keys[0]` is kept
+      unconditionally, so it may be ordered by `compareDatum` while SQL
+      `=` disagrees.
+    - A searched join with an EMPTY stamp returns nil rather than
+      re-deriving: the search was given the chance to claim and
+      declined, and a weaker mechanism must not overrule it.
+    - NO corpus witness: SF0.25 shapes `same=99 changed=0` and the
+      acceptance arm 24/24 — every merge join those 121 statements bring
+      to the seam is search-built and already stamped. The unit pins are
+      the guarantee; the corpus is the no-regression channel only.
+    - Deferred (ledger rows 2026-09-21):
       `electOrderedGrouping`'s `node != agg.node` precondition, and
       `electOrderedDistinct`'s `cands<2` gate (really a
       `createDistinctPaths` candidate-supply gap).

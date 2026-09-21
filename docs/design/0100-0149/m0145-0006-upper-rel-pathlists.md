@@ -1,7 +1,7 @@
 # Upper-rel pathlists (M0145-0006)
 
-Status: slice 1 (the order-delivering tops `inputNodePathkeys` swallowed)
-landed; slices 2-4 ledgered below. Task: `.ralph/fix_plan.md` M0145-0006.
+Status: slices 1 (the order-delivering tops `inputNodePathkeys` swallowed)
+and 2 (the merge-join top) landed; slices 3-4 ledgered below. Task: `.ralph/fix_plan.md` M0145-0006.
 Parent: M0145-0005. Kind: impl.
 
 ## What the task is
@@ -106,11 +106,76 @@ move, not merely a saving: PG 18.3 on the same dataset (`:65438`, db
 `tpcds025`) plans `Limit -> Subquery Scan -> WindowAgg -> Sort -> Merge Full
 Join`, with no second Sort either.
 
+## Slice 2 — the merge-join top (landed)
+
+### What was actually missing
+
+The ledgered plan was to stamp the winning path's `Pathkeys` onto the node at
+build time. Recon showed that already happens for every merge join the
+PG-shaped search produces: `createPlanAtSearchRootRange` calls
+`stampSearchPathkeys`, which validates `p.Pathkeys` against the published root
+schema and records them on the `searchedTree` embed — and `inputNodePathkeys`
+reads that stamp BEFORE the type switch. `TestOrderedInputArmFiresEndToEndAndRemovesTheSort`
+has been pinning exactly that since C-07.
+
+What has no stamp is the LEGACY constructor's merge join. `chooseInnerJoinAlgo`
+(joincost.go:33) elects `JoinAlgoMerge` on cost, and `chooseOuterFillJoinAlgo`
+leaves RIGHT/FULL on merge by default, so every statement the seam declines on
+— the census's 104 `leaf-count` fires are the bulk — builds its joins outside
+the search and reached the walk's `default: nil`. That is the gap this slice
+closes, with a node-side derivation rather than a carry.
+
+### The four things that make a node-side claim sound
+
+1. **The direction is fixed, not inferred.** goopg's merge comparator is
+   ascending with NULL-keyed rows last, unconditionally
+   (`mergeSortedSource.less`, `internal/executor/join_merge_stream.go:280`), and
+   the operator sorts BOTH inputs itself. `createMergeJoinPlan` already refuses
+   to build a node whose path claimed any other direction.
+2. **The join-type rule is upstream's.** The arm routes through
+   `buildJoinPathkeys` (PG `pathkeys.c:1295`) rather than restating it: FULL and
+   RIGHT claim NIL, because their unmatched inner rows are injected wherever the
+   merge reaches them instead of where the outer ordering would put them.
+3. **The key list is the EXECUTOR's, not `HashKeys`.** `ExecMergeKeyPlan` drops
+   a pair that is not `pairIsHashSafe` into the residual, and keeps only the
+   lead pair for a NULL-aware join, so the sides are sorted on a possibly
+   shorter tuple. Claiming `HashKeys` would assert an ordering on a column the
+   sort never keyed. The claim additionally stops at the first non-merge-safe
+   pair — including refusing outright when the LEAD key is unsafe, since
+   `Keys[0]` is kept unconditionally and an exotic-typed lead key is ordered by
+   `compareDatum` while the SQL `=` it stands for may disagree.
+4. **Validate, never translate.** The keys are checked against the node's
+   published schema with `validatedSearchPathkeys` — the same validator the
+   search boundary uses — so a coordinate convention this function guessed wrong
+   degrades to "less ordering claimed", never to a wrong claim.
+
+A searched join with an EMPTY stamp returns nil rather than re-deriving: the
+search was given the chance to claim and declined (nil `build_join_pathkeys`,
+or a claim that failed validation against this very schema), and a weaker
+mechanism must not overrule it.
+
+### Pins
+
+`upperorderedinput_m0145_test.go`: the legacy merge join's delivered ordering
+(ascending / NULLs-last); hash and nested-loop refusals; FULL and RIGHT
+refusals (the wrong-answer guard, node side); deference to an empty search
+stamp; validator truncation, leading and trailing; and the unsafe-lead-key
+refusal.
+
+### Evidence
+
+Plan-IDENTICAL on both corpora: TPC-DS SF0.25 `PASS=96 MISMATCH=0 ERROR=0`
+with shapes `same=99 changed=0`, TPC-H acceptance arm 24/24 MATCH. The arm
+therefore has NO corpus witness today — every merge join those 121 statements
+reach the ORDERED seam with is one the search produced and stamped, so the
+stamp answers first. The gap it closes is real (the legacy constructor elects
+merge on cost, and the census records 104 seam declines that take that route)
+but it is not exercised by a query in either benchmark, which is worth stating
+plainly rather than implying a measurement that did not happen. The unit pins
+are the guarantee here; the corpus is only the no-regression channel.
+
 ## Remaining slices (ledgered)
 
-| slice | scope | blocker |
-|---|---|---|
-| 2 | the `*Join{Algo: JoinAlgoMerge}` top | Coordinate boundary. A merge join's result ordering is stated by its merge clauses, but the node's `HashKeys` pairs are expressed per side and the node republishes a JOINED layout (`in.publishedSchema(jt)`), so the claim needs a translation the walk deliberately does not do. The `*Path` twin already carries `p.Pathkeys` (validated ascending/nulls-last by `createMergeJoinPlan`), so the resume point is to stamp that validated claim onto the node at build time — a `searchedTree`-style carry — rather than re-deriving it. |
 | 3 | `electOrderedGrouping`'s `node != agg.node` precondition | The elected node and the recorded grouping surface diverge whenever a stage wraps the aggregate (the `Project{Aggregate}` rename is the measured case). Needs the surface to name the rel rather than the node pointer. |
 | 4 | `electOrderedDistinct`'s `cands<2` gate | With one `PathDistinct` candidate the wrapper has nothing to elect between; the real fix is upstream — `createDistinctPaths` must offer both the hashed and the sorted candidate — which is a grouping-paths slice, not an ordered-paths one. |
 

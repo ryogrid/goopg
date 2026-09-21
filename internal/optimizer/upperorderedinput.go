@@ -321,6 +321,29 @@ func inputNodePathkeys(input Node) []PathKey {
 			}
 			limit = len(child)
 			n = t.Child
+		case *Join:
+			// M0145-0006 slice 2. Only a MERGE join delivers an ordering:
+			// goopg's merge operator sorts both inputs itself and streams
+			// them with a fixed ascending, NULLs-last comparator
+			// (`mergeSortedSource.less`, join_merge_stream.go:280), so its
+			// output is ordered by the merge keys. A hash or nested-loop join
+			// emits in probe order and claims nothing, which is why this arm
+			// is gated on `Algo` and not on the node kind.
+			//
+			// A SEARCHED join never reaches here with a claim to make: the
+			// walk checks `searchedTreePathkeys` first, and a searched root
+			// whose stamp is EMPTY was deliberately given none — the winning
+			// path's `Pathkeys` were either nil (`build_join_pathkeys` for
+			// FULL/RIGHT) or failed validation against this very schema
+			// (`stampSearchPathkeys`). Re-deriving a claim here would overrule
+			// that decision with a weaker one, so the arm defers to it.
+			if isSearchedTree(t) {
+				return nil
+			}
+			if !agrees(t.Output()) {
+				return nil
+			}
+			return deliver(mergeJoinEmissionPathkeys(t))
 		case *Project:
 			if !projectIsPositionalIdentity(t) {
 				return nil
@@ -493,6 +516,85 @@ func projectIsPositionalIdentity(p *Project) bool {
 		}
 	}
 	return true
+}
+
+// mergeJoinEmissionPathkeys is the ordering a `*Join{Algo: JoinAlgoMerge}`
+// emits, in the node's OWN output coordinates — the merge twin of
+// `aggregateEmissionPathkeys`, and the arm that serves the joins the PG-shaped
+// search did not build.
+//
+// # Why a node-side derivation is needed at all
+//
+// A merge join the SEARCH produced already publishes its claim: the winning
+// path's `Pathkeys` are validated against the published schema and stamped on
+// the root by `stampSearchPathkeys`. The legacy join constructor has no path
+// and no stamp, and it reaches `JoinAlgoMerge` on its own — `chooseInnerJoinAlgo`
+// (joincost.go:33) elects merge on cost, and `chooseOuterFillJoinAlgo` leaves
+// RIGHT/FULL on merge by default. Every statement the seam declines on
+// (the census's 104 `leaf-count` fires are the bulk) takes that route, so
+// without this arm those trees lose an ordering PG keeps and the ORDERED step
+// stacks a Sort the rows do not need.
+//
+// # The three things that make the claim sound
+//
+//  1. THE DIRECTION IS FIXED, NOT INFERRED. goopg's merge comparator is
+//     ascending with NULL-keyed rows last, unconditionally
+//     (`mergeSortedSource.less`); `createMergeJoinPlan` already refuses to
+//     build a node whose path claimed anything else. So the emitted keys are
+//     ascending/NULLs-last by construction and nothing here has to guess.
+//  2. THE JOIN TYPE RULE IS UPSTREAM'S. `buildJoinPathkeys` (pathkeys.c:1295)
+//     returns NIL for FULL and RIGHT, because their null-extended inner rows
+//     are injected wherever the merge reaches them rather than at the position
+//     the outer ordering would put them. This arm routes through that same
+//     function rather than restating the rule.
+//  3. VALIDATE, NEVER TRANSLATE. The keys are taken from the node's own
+//     `HashKeys` pairs and then checked against the node's published schema by
+//     `validatedSearchPathkeys` — the identical validator the search boundary
+//     uses. A key that does not address the column it names TRUNCATES the
+//     list, so a coordinate convention this function guessed wrong degrades to
+//     "less ordering claimed", never to a wrong claim.
+func mergeJoinEmissionPathkeys(j *Join) []PathKey {
+	if j == nil || j.Algo != JoinAlgoMerge {
+		return nil
+	}
+	out := j.Output()
+	if len(out) == 0 {
+		return nil
+	}
+	// The executor's key tuple is `ExecMergeKeyPlan().Keys`, NOT `HashKeys`:
+	// that function drops a pair that is not `pairIsHashSafe` into the
+	// residual (and keeps only the lead pair for a NULL-aware join), so the
+	// sides are sorted on the shorter list. Reading `HashKeys` here would
+	// claim an ordering on a column the sort never keyed.
+	plan := j.ExecMergeKeyPlan()
+	keys := make([]PathKey, 0, len(plan.Keys))
+	for i, pair := range plan.Keys {
+		if pair.Left == nil {
+			break
+		}
+		// `Keys[0]` leads UNCONDITIONALLY, merge-safe or not, so an
+		// exotic-typed lead key is sorted with `compareDatum` while the SQL
+		// `=` it stands for may disagree (float's `-0.0`, bpchar's trailing
+		// spaces — the cases `pairIsHashSafe` excludes). Ordering claimed
+		// from such a key would not be the SQL ascending order, so the claim
+		// stops there. Truncation is sound for the usual reason: rows ordered
+		// by (a, b) are ordered by (a).
+		if !j.pairIsHashSafe(pair) {
+			if i == 0 {
+				return nil
+			}
+			break
+		}
+		// The OUTER side's key: `build_join_pathkeys` states the result
+		// ordering as the outer path's ordering, and `Left` is the outer side
+		// by this file's own child convention (`createHashJoinPlan`:
+		// Children[0] is the streaming left side).
+		keys = append(keys, PathKey{Expr: pair.Left, SortAsc: true})
+	}
+	// `planToParserJoinType` bridges the two enums for the one rule that is
+	// stated in the parser domain; it is total over the closed 7-value plan
+	// enum and fails closed on anything else.
+	return validatedSearchPathkeys(buildJoinPathkeys(planToParserJoinType(j.Type), keys), out)
 }
 
 // relabelPathkeysTo restamps a claim's column labels from `out` at the SAME
