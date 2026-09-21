@@ -1,56 +1,57 @@
 (idle — nothing in flight)
 
-# Loop #81 result — M0145-0020 CLOSED measured-no-gap; its premise is refuted
+# Loop #82 — M0145-0018's FRESH E1 re-run: blocker GONE, one criterion still fails
 
-Banner: OWNER GO sequence 0009 [x] → 0019 [x] → 0019a [x] → **0020 [x] this
-loop**. Recon: no `internal/`/`cmd/` file touched (C1).
-Design: `docs/design/0100-0149/m0145-0020-examine-simple-variable-cte-arm.md`.
+Banner: the GO says 0018's fresh E1 re-runs once 0019 lands. 0019/0019a landed,
+so this is that re-run. **Measurement only — `problemPairsOuterWithDerived`
+untouched, zero production diff (C1).**
+Design: `docs/design/0100-0149/m0145-0018-firewall-relaxation-no-go.md`
+§"Fresh E1 re-verification (2026-09-22)".
 
-## Refutation 1 — upstream punts on all three named fires
-`examine_simple_variable`'s CTE arm has three exits AHEAD of the recursion:
-- `selfuncs.c:5843` `setOperations` → **Q74 `year_total`** (UNION ALL of two
-  grouped selects);
-- `selfuncs.c:5876-5883` `groupClause`, `isunique` only for ONE grouping
-  column → **Q31 `ws`** (3 keys) and, one level down, **Q39 `inv`**.
-A FAITHFUL port returns no stats for exactly the columns the task wanted them
-for. goopg's `resolveBaseColumn` `*CTEScan` arm already stops at the same
-boundary — nothing to port.
+## Fire set RE-DERIVED (the task insists it drifts)
+SF0.25 knob-arm census: `outer-over-derived` **3**; with the firewall off the
+class vanishes (`declines` 17→14). Affected queries: **Q77, Q78** — unchanged.
+**PLAN-DIFF TRAP**: a naive A/B diff reports FIVE changed queries
+(Q36, Q70, Q77, Q78, Q86). Q36/Q70/Q86 are the capture's pre-existing parse
+`error=3` queries whose only difference is the temp FILENAME in the psql error
+text. Do not chase them.
 
-## Refutation 2 — the measured cause is the BODY estimate, not the qual
-PG does NOT collapse this CTE scan. Q39 `inv`, SF0.25:
-| | goopg | PG |
-|---|---|---|
-| HashAggregate input | 11703 | 11606 |
-| grouped output (after `cov>1` HAVING) | **20** | **3869** |
-| `CTE Scan on inv` (after `d_moy=1`) | 1 | **19** |
-BOTH engines apply the same default 0.005 to the qual. 3869×0.005=19 survives;
-20×0.005=0.1 clamps to 1. PG's 3869 = `11606 × 0.3333` — every row its own
-group, then `DEFAULT_INEQ_SEL`.
+## The 2026-09-21 no-go is GONE — M0145-0019a fixed it
+Q78 SF1 firewall-off was `Nested Loop Left Join (cost=5494.86..1147565.07)`,
+>1800 s. Now: `Hash Left Join (cost=16457.31..37717.11)`.
 
-## Filed: M0145-0020a — grouped-output cardinality under-shoots ~193x
-**Separate the two factors FIRST** (group count vs HAVING selectivity) — this
-loop did not, and changing the one that is already right would be tuning
-toward a plan (R6).
+## SF1 execution A/B (private clone, fresh server per arm)
+| query | firewall ON | OFF | checksum |
+|---|---|---|---|
+| Q77 | 5492 ms, 44 rows | **6373 ms**, 44 rows | `e2f12e6ef310f604` both |
+| Q78 | 29608 ms, 100 rows | 29140 ms, 100 rows | `5e12c7e6baa093e8` both |
+Values byte-identical; Q78 holds its ~29 s class; no timeout; no C-04a class.
 
-## ESCALATION — the owner's sequencing does not hold
-The GO filed 0020 as **M0145-0012's prerequisite**. It is not one: 0012's
-`rows<=1` fallback is load-bearing because of the body estimate. **0012 resumes
-after M0145-0020a**, not after 0020. Ledgered; the loop did not re-order the
-banner.
+## WHY NOT EXECUTED — criterion 1 fails on Q77
+"no NL-epsilon election": with the firewall off, at BOTH scales, a `rows=1`
+`Append` branch goes `Hash Left Join (cost=0.00..0.03)` →
+`Nested Loop Left Join (cost=0.00..0.06)`, degenerate `s_store_sk = s_store_sk`
+demoted to a `Join Filter`; top cost rises (SF0.25 `Limit` 10.65→11.58);
++881 ms / +16% at SF1. Benign, but literally what the criterion names.
+Executing DELETES production code (R3 non-reversible) under a GO conditioned
+on passing, and 0018's option choice is ALREADY awaiting a re-take (loop #79).
+
+## OWNER DECISION NEEDED (this is the loop's deliverable)
+Waive criterion 1 for the Q77 shape and execute the relaxation — or keep the
+firewall and close 0018 as its own option 1 (permanent cost-model backstop).
+Evidence: `tmp/m0145-0018-e1/` (both SF0.25 captures + four SF1 plans).
 
 ## Gates
-Recon, zero production diff → no value gates (C1). state guard OK; pgbench
-smoke via the commit hook. Used the existing `tmp/pg18-optdebug` cluster
-(`:5560`, `tpcds025`) — already running, left running — and loop #80's
-committed SF0.25 capture. No new lane started.
+Measurement only, zero production diff → no value gates (C1). state guard OK;
+pgbench smoke via the commit hook. SF1 clone removed, port 5563 free.
 
 ## Next loop
-Banner's GO sequence is now exhausted (0009/0019/0019a/0020 all `[x]`). Next
-per the banner: **0018's fresh E1 re-verification re-runs**, then the
-flow-completion chain **0004 → 0005 → 0007 → 0008**. M0145-0021/0022/0023
-(harness) may run any time. NOTE 0018 still needs the owner's option re-take
-from loop #79 before its relaxation can execute.
+0018 is owner-blocked. Per the banner the flow chain **0004 → 0005 → 0007 →
+0008** resumes "after that, still under the firewall constraint until 0018
+executes it" — so **M0145-0004** (UNION ALL → appendrel jointree entry) is the
+next selectable item. Harness 0021/0022/0023 may run any time.
 
-## Owner escalations — three open
-partition_aggregate's inventory row; template1 namespace collision (A vs B);
-M0145-0018's option choice (loop #79 evidence) — and now 0012's re-sequencing.
+## Owner escalations — four open
+partition_aggregate inventory row; template1 collision (A vs B); M0145-0018
+(option re-take AND now the criterion-1 waive); M0145-0012 re-sequencing
+behind M0145-0020a.

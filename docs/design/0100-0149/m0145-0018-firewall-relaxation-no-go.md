@@ -1,10 +1,9 @@
 # The `outer-over-derived` relaxation is a NO-GO on the current tree (M0145-0018)
 
-Status: **NO-GO, 2026-09-21.** The firewall was NOT relaxed. The task's own
-precondition — a fresh E1 re-verification rather than a re-use of the earlier
-measurement — caught a C-04a-class regression at SF1 that did not exist when
-the owner's GO was given. Per the task text, that is an automatic no-go: keep
-the firewall and escalate the measurement.
+Status: **NO-GO 2026-09-21; RE-VERIFIED 2026-09-22 and the 2026-09-21 blocker
+is GONE — but one stated pass criterion is still violated, so the relaxation
+is STILL NOT EXECUTED.** See §"Fresh E1 re-verification (2026-09-22)" at the
+end. The firewall was not relaxed on either date.
 
 Task: `.ralph/fix_plan.md` M0145-0018. Kind: impl. Parent: M0145-0011.
 
@@ -108,3 +107,102 @@ should pick:
 3. **Fix the nested-loop pricing for a derived inner** and re-run this
    verification. The 1.1M estimate losing to nothing suggests the comparison,
    not the estimate, is where the fault sits.
+
+
+---
+
+# Fresh E1 re-verification (2026-09-22, loop #82)
+
+The banner's OWNER GO says 0018's fresh E1 re-runs once 0019 lands. 0019 and
+its fix 0019a landed, so this is that re-run — measured, not re-used.
+
+## The fire set, re-derived (the task insists it drifts)
+
+SF0.25 knob arm, `GOOPG_PGSHAPED_DP_TRACE=1`, all 99 queries:
+
+```
+SEAM-DECLINE-CENSUS: timeout=600 logs=1 classes=3 declines=17
+    10 reason=leaf-count
+     3 reason=outer-over-derived
+     4 reason=residual-hits-pad
+```
+
+With `GOOPG_DERIVED_FIREWALL=off` the class disappears entirely
+(`classes=2 declines=14`), so the census is measuring what it claims to.
+
+Deriving the affected queries from the A/B rather than from trace attribution
+(the server log carries no query markers) gives a **plan-diff trap worth
+recording**: a naive diff reports **five** changed queries — Q36, Q70, Q77,
+Q78, Q86. Three of them are the capture's three pre-existing parse `error=3`
+queries, whose only "difference" is the temp filename embedded in the psql
+error text. The real fire set is **Q77 and Q78**, unchanged.
+
+## The 2026-09-21 blocker is gone
+
+That no-go was Q78 at SF1 electing
+`Nested Loop Left Join (cost=5494.86..1147565.07)` and not finishing inside
+1800 s. With **M0145-0019a** landed it elects the hash join again:
+
+```
+->  Hash Left Join  (cost=16457.31..37717.11 rows=5731 width=240)
+```
+
+## SF1 execution A/B — values identical, Q78 unaffected
+
+Private clone of the SF1 datadir, fresh server per arm (server age held
+constant), knob arm:
+
+| query | firewall ON | firewall OFF | checksum |
+|---|---|---|---|
+| Q77 | 5492 ms, 44 rows | **6373 ms**, 44 rows | `e2f12e6ef310f604` both |
+| Q78 | 29608 ms, 100 rows | 29140 ms, 100 rows | `5e12c7e6baa093e8` both |
+
+Q78 holds its shape and its ~29 s class. Values are byte-identical on both
+queries. No timeout, no C-04a-class regression.
+
+## Why it is STILL not executed
+
+The task's first pass criterion is **"no NL-epsilon election"**, and Q77 has
+one. With the firewall off, at both scales, one `Append` branch turns from
+
+```
+->  Hash Left Join  (cost=0.00..0.03 rows=1 width=136)
+      Hash Cond: (s_store_sk = s_store_sk)
+```
+
+into
+
+```
+->  Nested Loop Left Join  (cost=0.00..0.06 rows=1 width=136)
+      Join Filter: (s_store_sk = s_store_sk)
+```
+
+— a `rows=1` estimate, the equi-condition demoted to a `Join Filter`, and the
+statement's top-level cost rising (SF0.25 `Limit` 10.65 → 11.58). It costs
+**+881 ms, +16%** at SF1.
+
+This is measurably benign and it is nothing like C-04a's 15 s → 327 s. It is
+also, literally, the thing criterion 1 names, on the *degenerate* condition
+`s_store_sk = s_store_sk`. Two readings are available — "a technicality on a
+one-row branch, waive it" and "the criterion exists precisely because this
+shape is how the 1.1M election started" — and choosing between them is the
+owner's call, not the loop's, for three reasons:
+
+1. executing means DELETING production code (`problemPairsOuterWithDerived`
+   including its Semi/Anti arms, plus the diagnostic flag), which is not
+   reversible under R3;
+2. the owner's GO was conditioned on passing, and one criterion does not pass;
+3. **M0145-0018's option choice is already awaiting an owner re-take** from
+   loop #79, which measured options (b) and (c) to be the wrong targets.
+
+So the measurement is delivered and the decision is left where it belongs.
+Nothing in `problemPairsOuterWithDerived` was touched.
+
+## What the owner needs to decide
+
+Waive criterion 1 for the Q77 shape (+16% on a 5 s query, values identical,
+Q78 unaffected) and execute the relaxation — or keep the firewall and close
+0018 as permanently-a-cost-model-backstop, which is option 1 of the three this
+document listed in 2026-09-21.
+
+Artefacts: `tmp/m0145-0018-e1/` (both SF0.25 captures and the four SF1 plans).

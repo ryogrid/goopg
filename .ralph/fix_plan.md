@@ -15466,6 +15466,43 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
   census; the Q14/Q23/Q95 pulled-CTE problems admitted by
   M0145-0013 reach DP.
   Kind: impl
+  - **FRESH E1 RE-VERIFICATION RUN 2026-09-22 (loop \#82) — the
+    2026-09-21 blocker is GONE, but one pass criterion is still
+    violated, so the relaxation was NOT executed.** Movement: none
+    (measurement only; `problemPairsOuterWithDerived` untouched).
+    Design: the design doc's new §"Fresh E1 re-verification (2026-09-22)".
+    - **Fire set re-derived, as the task insists.** SF0.25 knob arm census:
+      `outer-over-derived` **3**, and the class vanishes entirely with the
+      firewall off (`declines` 17 -> 14), so the census measures what it
+      claims. Affected queries: **Q77 and Q78** — unchanged.
+      - **Plan-diff trap worth recording**: a naive A/B plan diff reports
+        FIVE changed queries (Q36, Q70, Q77, Q78, Q86). Three are the
+        capture's pre-existing parse `error=3` queries whose only
+        difference is the temp FILENAME inside the psql error text. A
+        future loop diffing captures will hit this.
+    - **The 2026-09-21 no-go is gone.** That was Q78 at SF1 electing
+      `Nested Loop Left Join (cost=5494.86..1147565.07)` and not finishing
+      in 1800 s. With **M0145-0019a** landed it elects
+      `Hash Left Join (cost=16457.31..37717.11)` again.
+    - **SF1 execution A/B** (private clone, fresh server per arm):
+      - Q77: ON 5492 ms / OFF **6373 ms**, 44 rows, ck `e2f12e6ef310f604` both;
+      - Q78: ON 29608 ms / OFF 29140 ms, 100 rows, ck `5e12c7e6baa093e8` both.
+      Values byte-identical, Q78 holds its ~29 s class, no timeout, no
+      C-04a-class regression.
+    - **Why it is still not executed**: criterion 1 is "no NL-epsilon
+      election" and Q77 has one — at both scales a `rows=1` `Append` branch
+      goes `Hash Left Join (cost=0.00..0.03)` ->
+      `Nested Loop Left Join (cost=0.00..0.06)` with the degenerate
+      condition `s_store_sk = s_store_sk` demoted to a `Join Filter`, and
+      the statement's top cost rises (SF0.25 `Limit` 10.65 -> 11.58). It is
+      measurably benign (+881 ms, +16% on a 5 s query) and nothing like
+      C-04a's 15 s -> 327 s, but it is literally what criterion 1 names.
+    - **OWNER DECISION NEEDED — waive or keep.** Executing DELETES production
+      code (`problemPairsOuterWithDerived` incl. its Semi/Anti arms, plus the
+      diagnostic flag), which R3 makes non-reversible; the GO was conditioned
+      on passing, and one criterion does not; and **0018's option choice is
+      already awaiting a re-take** from loop \#79. The loop delivers the
+      measurement and leaves the call.
   Parent: M0145-0011
   - **`[!]` NO-GO 2026-09-21 — the firewall was NOT relaxed.** Design doc
     `docs/design/0100-0149/m0145-0018-firewall-relaxation-no-go.md`.
