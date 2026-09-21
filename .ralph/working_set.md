@@ -1,57 +1,57 @@
 # Working set — inter-loop baton
 
-Task: **M0145-0015 — CLOSED `[x]` as measured-no-gap.** The census extension is
-the whole production change; no pull-up gate was widened, deliberately.
+Task: **M0145-0016 — step 0 done, remap NOT built.** Task stays `[ ]`.
+The subsumption check the task mandates first is discharged: NOT subsumed.
 
-## Banner
+## Banner — and an ESCALATION about it
 
-Item 3: `… 0014 [x] → 0015 [x] → 0016 → 0017 → 0018`.
-**Next selectable: M0145-0016** (`semianti-not-tail` leaf reorder). Read its
-text FIRST — it says to verify subsumption by M0145-0005's slice (a) before
-building the remap, and to close as subsumed if that slice already landed.
+Item 3: `… 0015 [x] → 0016 [ ] (scoped) → 0017 → 0018`.
 
-## The result
+**Open question filed for the owner in `.ralph/fix_plan.md` under M0145-0016**:
+by the strict selection rule, **M0145-0003 is the first `[ ]` in item 3** (as
+are 0004, 0005, 0007, 0008), yet loops 39-48 worked 0009 → 0016 and the owner
+filed 0011-0018 mid-chain without re-ordering. The loop has assumed 0003-0008
+are umbrella items whose children are the selectable work. If that assumption
+is wrong the loop should restart at 0003. **Do not resolve this by judgement —
+it is the banner's call.**
 
-The census now reports `<kind>@<position>` — `top`/`not`/`or`/`scalar` —
-because in PG the POSITION decides reachability, not the kind:
-`pull_up_sublinks_qual_recurse` recurses AND and a NOT wrapper
-(`prepjointree.c:789-845`) and then `/* Stop if not an AND */ return node;` at
-`:877`, so OR args are never recursed.
+## What step 0 established
 
 ```
-SF0.25 knob arm, 99 queries:
-  SubqueryExpr@scalar  29     ExistsExpr@or  4     InExpr@or  2
-  NONE at @top, NONE at @not   -> the pullable subset is ZERO
+fresh seam census, SF0.25 knob arm, 99 queries, HEAD:
+  leaf-count 19 | semianti-not-tail 6 | residual-hits-pad 6 | outer-over-derived 6
+semianti-not-tail fires on Q78 ONLY, 3 per run — matches the task's count.
+
+new trace line:
+  SEAMNOTTAIL synthetic=0x0002 want=0x0004 nprefix=2 nleaves=3
 ```
 
-Every residual decline is one upstream makes too. Both fallbacks the task said
-to check for already exist and are LIVE:
-`internal/optimizer/exists_to_any.go` (goopg's `convert_EXISTS_to_ANY`,
-default ON) and `internal/executor/subplan_hash.go` (the hashed ANY probe,
-default ON, reached from `evalInExpr`).
+Three leaves, synthetic at walk position 1 where the contract wants 2 — the
+`[real, synthetic, real]` demoted-ANTI walk. The fix is the **stable partition
+`[0, 2, 1]`**; stability is load-bearing because real leaves carry the emitting
+column space, so only POSITION masks may move.
 
-**Why no gate was widened**: moving an `@or` conjunct would make goopg convert
-a sublink PG leaves as a SubPlan — a divergence the corpus value gates cannot
-see, because the rows would still be right.
+## Next step — build the remap, from the inventory
 
-**Ledgered adjacent divergence**: goopg's hashed subplan degenerates PG's
-partial-match table to a single "inner contained a NULL" bit. Sound only while
-IN test expressions stay single-column; revisit when row-valued IN lands.
+`docs/design/0100-0149/m0145-0016-semianti-not-tail.md` lists everything it
+touches. The dangerous item is `walkWidths`: `remapWalkOrderFlatToSpans`
+already encodes ONE leaf-index translation (the pulled-leaf insertion) and a
+permutation is a SECOND that composes with it. Also `semiAntiChainLink.lhs/rhs`
+plus the SHARED `sjinfo`'s four RelSets (mutate in place — its comment forbids
+drift), `outerChainLink.preserved/nullable`, `chainOnQual.belowNullable`, the
+`jl`/`ctx.bindings[:nprefix]` pairing, and `spans` (records move with leaves,
+`lo` never renumbered).
 
-## Next step
-
-**M0145-0016.** Its own text: "M0145-0005's remaining slice (a) makes semi/anti
-real numbered leaf items, which retires the synthetic-slot contract by
-construction — if that slice landed first, verify this decline is gone on the
-corpus and close this task as subsumed rather than building the remap." So the
-first move is a census check for `semianti-not-tail` (it was 6 on the last
-run, not 3 — confirm on a fresh run), not code.
+**Acceptance bar is the task's own**: Q78 oracle-verified on VALUES, not a
+green census. Q78's historical `translateToLayout` panic is this assumption
+violated.
 
 ## Traps carried forward
 
-- **Re-read the banner every loop.**
-- When a panic names a mechanism, print the coordinates that WERE available
-  before accepting that mechanism as the culprit (cost a loop on 0014).
+- **Re-read the banner every loop** (and see the escalation above).
+- When `translateToLayout` refuses, print the columns that WERE available at
+  that node before theorising about which mechanism owns the failure — that
+  diagnostic turned a "lowering redesign" conclusion into a one-field fix.
 - A new hand-written Expr type switch fails `TestExprSwitchInventoryIsPinned`;
   pin it AND add a ledger row.
 - The RALPH_LOOP write-guard trips on prose mentioning a client tool and a

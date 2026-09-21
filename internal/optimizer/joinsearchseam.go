@@ -464,6 +464,11 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 		syntheticBits |= lk.rhs
 	}
 	if syntheticBits != leafRangeRelSet(nprefix, len(scans)) {
+		// M0145-0016: report the SHAPE, not just the reason. The remedy is a
+		// stable partition of the leaves, and what it has to move is exactly
+		// "which walk positions are synthetic versus which the tail wants" —
+		// deriving that from a bare decline count costs a census round.
+		traceSeamNotTail(syntheticBits, nprefix, len(scans))
 		traceSeamDecline("semianti-not-tail", nrels, len(scans))
 		return node, pred, false
 	}

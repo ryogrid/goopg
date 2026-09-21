@@ -14304,6 +14304,44 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
   when the assumption broke).
   Kind: impl
   Parent: M0145-0005
+  - **Step 0 done 2026-09-21: NOT subsumed.** Design doc
+    `docs/design/0100-0149/m0145-0016-semianti-not-tail.md`.
+    - M0145-0005 is still `[ ]` with only slice 1 landed, and the corpus
+      agrees: fresh seam census on HEAD (SF0.25, knob arm, 99 queries) gives
+      `leaf-count` 19, **`semianti-not-tail` 6** (3 per Q78 run, Q78 ONLY),
+      `residual-hits-pad` 6, `outer-over-derived` 6.
+    - **The shape is measured, not inferred.** New `traceSeamNotTail` prints
+      `SEAMNOTTAIL synthetic=0x0002 want=0x0004 nprefix=2 nleaves=3` — three
+      leaves, synthetic at walk position 1 where the contract wants 2: the
+      `[real, synthetic, real]` demoted-ANTI walk the task predicts. The fix
+      is the stable partition `[0, 2, 1]`.
+    - **Stability is load-bearing**: real leaves carry the emitting column
+      space, so a stable partition moves only POSITION masks and leaves every
+      column offset attached to its own leaf.
+    - **Inventory for the build loop** (in the design doc, so it is not
+      re-derived): `scans`/`widths`; `walkWidths`, whose
+      `remapWalkOrderFlatToSpans` ALREADY encodes one leaf-index translation
+      across the pulled-leaf insertion that a permutation composes with;
+      `semiAntiChainLink.lhs`/`.rhs` plus the SHARED `sjinfo`'s four RelSets
+      (mutate in place — its comment forbids drift);
+      `outerChainLink.preserved`/`.nullable`; `chainOnQual.belowNullable`;
+      the `jl`/`ctx.bindings[:nprefix]` pairing; and `spans`, whose records
+      move with their leaves while `lo` is never renumbered.
+    - **Remap NOT built this loop**, deliberately: it is a coordinate change
+      in the seam's most position-sensitive function, composing with an
+      existing translation — the combination whose violation produced Q78's
+      `translateToLayout` panic. A half-landed permutation is a wrong-answer
+      path the corpus value gates cannot see. Ledgered.
+  - **BANNER-ORDER QUESTION for the owner (not an edit, an escalation).**
+    Item 3 lists `0001 → … → 0018` and the selection rule is "the first item
+    that has a selectable (`[ ]`, dependencies met) task, in the order
+    written". By that reading **M0145-0003 is first** — it is `[ ]`, as are
+    0004, 0005, 0007 and 0008 — yet loops 39-48 have worked 0009 → 0016, and
+    the owner filed 0011-0018 mid-chain without re-ordering. The loop has
+    assumed 0003-0008 are umbrella/in-flight items whose children are the
+    selectable work (0003's own named movement, the `leaf-count` class, is
+    still open at 19 fires). **If that assumption is wrong, say so and the
+    loop will restart at 0003.**
 - [ ] **M0145-0017 — census the never-reached sublink population
   and pull the PG-pullable subset** (filed 2026-09-21 by owner
   directive). Of 308 knob-arm sublink-planning events, only ~60

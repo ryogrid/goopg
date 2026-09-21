@@ -671,3 +671,21 @@ func traceSeamSpine(nspine, nrels, nprefix int) {
 	fmt.Fprintf(os.Stderr, "%s seam-spine nspine=%d nrels=%d nprefix=%d\n",
 		traceTag, nspine, nrels, nprefix)
 }
+
+// traceSeamNotTail records the leaf SHAPE behind a `semianti-not-tail`
+// decline: which walk positions carry synthetic (Semi/Anti RHS) leaves, and
+// which range the construction contract requires them to occupy.
+//
+// The decline reason alone says a chain was refused; it does not say what a
+// fix would have to move. M0145-0016's remedy is a stable partition — real
+// leaves keep their relative order (so the column space is untouched) and
+// synthetic leaves move to the tail — and the permutation is determined
+// entirely by these two masks. Printing them turns "re-run the census and read
+// the plan" into "read one line".
+func traceSeamNotTail(synthetic RelSet, nprefix, nleaves int) {
+	if !dpTraceEnabled() {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "SEAMNOTTAIL synthetic=%#04x want=%#04x nprefix=%d nleaves=%d\n",
+		uint32(synthetic), uint32(leafRangeRelSet(nprefix, nleaves)), nprefix, nleaves)
+}
