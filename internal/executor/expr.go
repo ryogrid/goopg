@@ -11755,7 +11755,9 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 		}
 		return d, nil
 	case "current_catalog":
-		return NewStringDatum("postgres"), nil
+		// SQL-standard synonym of current_database(); same value by definition,
+		// so it must resolve through the same helper or the two drift.
+		return NewStringDatum(currentDatabaseName(ctx)), nil
 	case "pg_client_encoding":
 		return evalPgClientEncoding(ctx)
 	case "getdatabaseencoding":
@@ -12168,7 +12170,7 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 		// "0" compares correctly. M0118-0009.
 		return NewStringDatum(strconv.FormatFloat(usage, 'g', -1, 64)), nil
 	case "current_database":
-		return NewStringDatum("postgres"), nil
+		return NewStringDatum(currentDatabaseName(ctx)), nil
 	case "current_schema":
 		return currentSchemaFromSearchPath(ctx)
 	case "current_schemas":
@@ -19805,6 +19807,34 @@ func RegObjectSchemaVisible(ctx *Context, schema string) bool {
 		}
 	}
 	return false
+}
+
+// currentDatabaseName is what `current_database()` and its SQL-standard synonym
+// `current_catalog` both return: the database this connection is actually bound
+// to, taken from the startup packet via Context.CurrentDatabase.
+//
+// Both used to return the literal "postgres" regardless of the connection, so
+// `psql -d newdb -c "select current_database()"` answered "postgres" even
+// though that database is genuinely isolated — a table created in it is not
+// visible from postgres. The value was wrong, not merely imprecise: a client
+// that routes on current_database() (psql's own prompt, pgAdmin's object
+// browser, migration tools that assert which database they are about to alter)
+// was told it was somewhere it was not.
+//
+// The two are a SIBLING PAIR by definition, not by coincidence: the SQL
+// standard's current_catalog and PostgreSQL's current_database() are the same
+// value (postgres/src/backend/utils/adt/misc.c's current_database, exposed
+// under both spellings), so they resolve through this one helper rather than
+// carrying two copies of the rule.
+//
+// The "postgres" fallback is kept for the embedded/test contexts that never set
+// CurrentDatabase — Context.CurrentDatabase's own doc records that it is empty
+// there — so this changes nothing for them.
+func currentDatabaseName(ctx *Context) string {
+	if ctx != nil && ctx.CurrentDatabase != "" {
+		return ctx.CurrentDatabase
+	}
+	return "postgres"
 }
 
 func currentSchemaFromSearchPath(ctx *Context) (Datum, error) {

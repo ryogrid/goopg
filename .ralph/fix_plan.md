@@ -2067,153 +2067,65 @@ the whole file's active task between 2026-09-01 and 2026-09-14; **since
       acceptance arm 24/24; pgbench smoke (the connection path is exactly
       what it exercises).
 
-- [ ] **current_database() reports "postgres" when connected to template1**
-  (found 2026-09-22 while measuring for the bu slice, NOT the item being
-  worked).
+- [x] **current_database() reports "postgres" when connected to template1** —
+  **FIXED 2026-09-22.** The filed question was routing-vs-reporting; the
+  measurement answered BOTH, and separated them.
   Kind: bug
   Parent: M0119-0006
-  - Repro, no fixture needed: `psql -d template1 -c "select
-    current_database()"` against goopg returns `postgres`; PostgreSQL
-    returns `template1`. template1 is legitimately connectable on both, so
-    this is not covered by the datallowconn work.
-  - It was ALSO true of template0 before the bu slice, which is how it
-    surfaced — the template0 connection that should have been refused
-    reported itself as `postgres`.
-  - Not yet established, and the first thing to determine: whether the
-    session is genuinely routed to the `postgres` namespace (in which case
-    DDL run against template1 lands in the wrong database — a much more
-    serious bug) or whether only the reporting function is wrong. The
-    `catalog.NamespaceDBOid` aliasing that maps `postgres` onto
-    `DefaultDBOid` (M0119-0006 bq slice) is the place to look first.
-  - Left unfixed deliberately: one task per loop, and a fix whose blast
-    radius depends on which of those two it is should not be guessed at.
-    - **LANDED 2026-09-20 via `09bde885a`** — the bs slice sat staged while
-      the owner's `data.HOLD` (M0142-0003i 8-FK reload) kept the TPC-H gates
-      SKIP-BLOCKED; when the owner committed their anchor re-pin the staged
-      index rode along, so all 13 files + design doc + ledger rows are at
-      HEAD and pushed. Gates green on exactly this code: units PASS;
-      tpcds-sf025 PASS=96/0-mismatch/0-shape-change; tpch-spotcheck PASS on
-      the reloaded cluster (Q12=2/Q13=33 vs re-pinned anchors). NOTE:
-      `tpch-acceptance-arm` was NOT run — its baseline
-      (`bench/tpch/baseline-digests.txt`, pinned 2026-09-08) predates the
-      8-FK reload and is load-dependent; an arm-vs-stale-baseline FAIL would
-      be data drift, not regression. Re-capture the baseline (or the owner
-      does) before the next executor commit needs the arm stamp.
-  - 2026-09-22 (bt): **scoping recon for the `rootdescend` tier, no production
-    change.** Design:
-    `docs/design/0100-0149/0119-0006bt-rootdescend-tier-scoping.md`.
-    - **This slice's note above was wrong in the way that matters.** It
-      recorded rootdescend as "a call-shape-accepted no-op (upstream gates it
-      to heapkeyspace v4)". Upstream does NOT no-op on non-v4 — it raises
-      `ERRCODE_FEATURE_NOT_SUPPORTED` (verify_nbtree.c:479-485) with
-      "cannot verify that tuples from index %q can each be found by an
-      independent index search" and the hint "Only B-Tree version 4 indexes
-      support rootdescend verification." Upstream has exactly two behaviours,
-      run or error; accepting the argument and checking nothing is neither,
-      and is the worst of the three because a clean report from a check that
-      never executed is indistinguishable from a real pass.
-    - **goopg sits on the RUN side of that gate**, so the fix is to implement
-      the tier, not to add the error: `internal/initdb` pins
-      `btm_version = 4` (two tests), and goopg's tuple key format carries the
-      heap TID inside the key — the heapkeyspace tiebreaker the `checkunique`
-      tier already compensates for with a TID-blind comparator.
-    - **Primitives already exist**: `amcheck.CollectBtreeLeafEntries` for the
-      probe set, `(*nbtree.BTree).Search` for the independent descent
-      (`descendToLeaf` + right-link recovery — `_bt_search`'s shape, and
-      using the REAL search path is faithful because the property under test
-      is "the normal search can find this tuple"), `openIndexBTree` to open
-      it, and the existing `btIndexCheckUnique`/`btIndexHeapAllIndexed` tier
-      shape to wire it.
-    - Filed as **M0119-0006bt-rootdescend** below rather than built here.
+  Movement: none — SF0.25 `PLAN-SHAPE same=99 changed=0`; a session-reporting
+  fix, which none of S3's three instruments measures.
+  - **The measurement, run before touching anything.** Created a table while
+    connected to each database and checked where it landed:
+    - `newdb` (a real `CREATE DATABASE`) is genuinely **ISOLATED** — its
+      table is not visible from `postgres` — yet `current_database()` said
+      `postgres`. So for the ordinary case this was purely a REPORTING bug,
+      and a wrong VALUE rather than an imprecise one.
+    - `template1` is **NOT** isolated: a table created there IS visible from
+      `postgres`. That is a genuine routing defect, and it is SEPARATE from
+      the reporting one — re-filed below.
+  - Fixed both spellings through one helper, `currentDatabaseName`.
+    `current_database()` and `current_catalog` are the same value BY
+    DEFINITION (PostgreSQL exposes one function under both names), so they
+    are a sibling pair; both were hardcoded to the literal `"postgres"` and
+    fixing one would have left a pair that disagrees.
+  - The empty-`CurrentDatabase` fallback to `"postgres"` is kept and pinned:
+    `Context.CurrentDatabase`'s own doc records that embedded/test contexts
+    never set it, so that arm is what makes the change safe for every caller
+    that does not.
+  - Verified live across `postgres`, `newdb` and `template1` — all three now
+    report themselves, and both spellings agree. Non-vacuity: disabling the
+    helper fails exactly 4 assertions (both spellings x the two non-postgres
+    databases) while `postgres` and the fallback still pass.
+  - Gates: units; FULL upstream regress suite (only the known
+    `partition_aggregate`); tpch-spotcheck Q12=2/Q13=33; tpcds-sf025;
+    acceptance arm 24/24; pgbench smoke.
 
-- [x] **M0119-0006bt-rootdescend — implement the `rootdescend` tier** —
-  **LANDED 2026-09-22.** Design (recon + implementation + the measurement
-  correction): `docs/design/0100-0149/0119-0006bt-rootdescend-tier-scoping.md`.
-  Kind: impl
+- [ ] **template1 shares the `postgres` catalog namespace** (isolated
+  2026-09-22 by the current_database() measurement, which is how it was
+  distinguished from the reporting bug).
+  Kind: bug
   Parent: M0119-0006
-  Movement: none — SF0.25 `PLAN-SHAPE same=99 changed=0`; an amcheck
-  verification tier, which none of S3's three instruments measures.
-  - **The measurement the task demanded corrected the recon that filed it.**
-    The recon argued goopg was on upstream's "run it" side because initdb
-    pins `btm_version = 4`. That is true of the BOOTSTRAP CATALOG metapages
-    and is not the property the tier needs. What it needs is the heap TID
-    INSIDE the key, which is a per-index property of goopg's key format:
-    `var pgIndexTupleKeys = true`, so an ordinary index (default opclass and
-    collation, PG-faithful key type) gets the TUPLE format, while the shapes
-    `buildPGIndexKeyDesc` refuses — expression keys, explicit opclasses,
-    non-bytewise collations, types without a comparator — keep BLOB. **Both
-    arms are reachable in production**, which is what makes the gate a real
-    branch. A stale comment at the `keyFmt` site claiming "blob for every
-    index today" is corrected.
-  - **The recon's suggested implementation would have been wrong**, and
-    reading the code rather than following the plan is what caught it. It
-    proposed `(*nbtree.BTree).Search(entry.Key)`. `pgindex_btree.go`
-    documents that a stored ENTRY key carries the row's real TID while a
-    PROBE key carries the zero TID, and that "handing a probe an entry key
-    would start a duplicate scan after some of its own matches — a silent
-    under-read, not a failure". The tier instead descends over PageSource
-    COPIES, mirroring upstream's `_bt_search` + `_bt_binsrch_insert` +
-    `_bt_compare(...) == 0`.
-  - **Live verification caught a defect no unit test could.** The 0A000
-    refusal first surfaced as `XX000: 0A000: cannot verify ...` — the right
-    SQLSTATE stringified INTO the message — because `btIndexCheck`'s error
-    path re-wrapped every tier error as an internal error. The wrap happens
-    only at that boundary, so only running the real thing could see it.
-    `btIndexCheck` now returns an `*ExecError` unchanged and wraps only
-    genuine read errors.
-  - Verified live on a scratch cluster, both arms and the br expectation:
-    tuple-format `rd_a` with `rootdescend := true` → clean; blob-format
-    `rd_expr` on `(a+1)` → `ERROR: 0A000: cannot verify that tuples from
-    index "rd_expr" can each be found by an independent index search`;
-    `pg_amcheck --heapallindexed --rootdescend` → exit 0, so the br slice's
-    recorded expectation still holds.
-  - **Detection test, per the bar this task sets.** Two leaf pages are
-    swapped THROUGH the PageSource rather than by editing item bytes: every
-    page stays individually valid (the per-page tier still finds nothing) and
-    only the mapping between search path and holding page breaks, isolating
-    the property. Verified non-vacuous — stubbing the descent to "found"
-    fails exactly that arm. The healthy arm doubles as the routing check: a
-    child-selection rule disagreeing with the one the tree was built under
-    would report findings on a healthy tree.
-  - Gates: units; whole `TestPort_PgAmcheck*` family PASS; amcheck + nbtree
-    package suites PASS; tpch-spotcheck Q12=2/Q13=33; tpcds-sf025 PASS
-    (`PLAN-SHAPE same=99 changed=0`); acceptance arm 24/24; pgbench smoke.
-  - Deferred, ledgered: the tier is O(entries x height) with a fresh descent
-    per entry, where upstream amortises nothing either but runs only under
-    `bt_index_parent_check`; and `rootdescend` remains accepted-and-ignored
-    on the `bt_index_check` call shape, which is correct — upstream's
-    three-argument form has no rootdescend parameter at all.
-
-> This task list is **seeded, not exhaustive.** M0119-0001 triage plus every future
-> deferral-ledger entry (any new `status = -` row) feed additional M0119 tasks over
-> time; the milestone's living nature means it need not be complete at filing.
-
-## M0122 — Unimplemented-Feature Backlog Consumption (filed 2026-07-04)
-
-Milestone: `docs/milestones/0122-unimplemented-feature-backlog-consumption.md`
-(**living milestone** — tasks are appended over time). Source of truth:
-`unimplemented_feat.json` (repo root; 181 entries generated 2026-07-02 from the
-commit log). Goal: drive every `open` feature entry to closure — implement the
-deferred scope, or verify it already landed and mark the entry `resolved`.
-
-**⚠️ Verify-before-implement (READ FIRST):** `unimplemented_feat.json` is a
-2026-07-02 snapshot and **may list features that are already implemented** — 24
-entries have an `unclear`/absent `code_audit` and 61 have an open matching ledger
-row (7 overlap both). When you pick up ANY M0122 task, FIRST re-verify each
-candidate against current HEAD (grep/read code, probe a live goopg, check
-ledger/fix_plan/git log). If it already exists, set the entry's `status` to
-`resolved` (cite the proof) and DO NOT re-implement. Only build genuinely-missing
-scope.
-
-**Per-task rule (applies to every M0122 implementation task):** before
-implementation begins, the picking agent MUST (1) create a design doc at
-`docs/design/<id>-NNNN-*.md` and index it in `docs/design/README.md`, and (2) have
-that design doc pass an agent review. Implementation starts only after the
-reviewed design doc exists. (The triage task M0122-0001 is doc-only, exempt.)
-Tracking field = a per-entry `status` (`open`/`resolved`) added by M0122-0001,
-mirroring M0119's ledger `status` column.
-
-_(completed `[x]` subtasks archived → `completed_milestones/completed_fix_plan_010.md`)_
+  - Repro: connect to template1, `CREATE TABLE t1_marker(x int)`, then
+    `SELECT count(*) FROM t1_marker` from `postgres` — it succeeds, so the
+    table landed in postgres' namespace. The control matters: the same
+    sequence against a `CREATE DATABASE`d `newdb` correctly reports
+    "relation does not exist" from both `postgres` and any other database,
+    so per-database isolation WORKS and template1 specifically does not get
+    it. Suspect template1 resolving to `DefaultDBOid` like `postgres`
+    (`catalog.NamespaceDBOid` aliasing, M0119-0006 bq slice).
+  - **This is almost certainly the same root cause as M0119-0006's remaining
+    bs item** "a template1 install re-attributes to \"postgres\" on restart
+    (shared bootstrap namespace)": if CREATE EXTENSION in template1 actually
+    executes in postgres' namespace, the restart is not re-attributing
+    anything — it is reporting where the row genuinely went. Check that
+    before treating them as two pieces of work.
+  - **Note the interaction with the fix above**: `current_database()` now
+    correctly answers `template1` there, so the reported name and the actual
+    storage namespace now visibly disagree. That is an improvement, not a
+    regression — the previous answer masked the routing bug by being wrong
+    in the same direction. State it plainly when fixing.
+  - PG oracle: template1 is an ordinary database with its own catalog; only
+    `datistemplate` and `datallowconn` distinguish the templates.
 
 - [ ] **M0122-0008 — Auth / roles / multi-DB isolation / encoding**.
 - [ ] **M0122-0009 — WAL / recovery / crash-consistency infra**.
