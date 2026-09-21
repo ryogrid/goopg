@@ -430,6 +430,8 @@ func createNestLoopIndexJoinPlanFused(p *Path, innerPath *Path, memoPath *Path, 
 	// *Filter, not on `is`), and the memoized path's cost onto the Memoize —
 	// the two numbers PG's EXPLAIN prints on the same two nodes.
 	stampPlanCost(is, innerPath)
+	// M0145-0007 slice 2: the elected-path route (fused index probe).
+	noteNLIBuilt(nliRouteSearch, jtNLI, innerPath.IndexInfo.Name)
 	nli := &NestedLoopIndexJoin{
 		pos:       in.outer.Pos(),
 		Type:      jtNLI,
@@ -551,6 +553,8 @@ func createNestLoopBitmapJoinPlan(p *Path, innerPath *Path) (Node, outputLayout)
 	// numbers PG prints on the same two nodes.
 	stampPlanCost(bhs, innerPath)
 	stampPlanCost(bis, idxPath)
+	// M0145-0007 slice 2: the elected-path route (bitmap probe).
+	noteNLIBuilt(nliRouteSearch, jt, idxPath.IndexInfo.Name)
 	return &NestedLoopIndexJoin{
 		pos: in.outer.Pos(), Type: jt, Outer: in.outer, Inner: bhs,
 		// Residual-only: the probe clauses moved onto the probe above (MOVE,

@@ -823,6 +823,8 @@ func tryBuildNLI(j *Join, cat catalog.Catalog) (*NestedLoopIndexJoin, bool) {
 		Predicate: residualPred,
 		schema:    joinedSchema,
 	}
+	// M0145-0007 slice 2: this is the LEGACY route's only construction site.
+	noteNLIBuilt(nliRouteRewrite, nli.Type, nliProbeIndexName(nli.Inner))
 	return nli, true
 }
 
@@ -1593,4 +1595,18 @@ func indexOnlyNLIInner(inner *IndexScan, residual Expr, outerWidth int) *IndexOn
 		PrivilegeCheckRole:    inner.PrivilegeCheckRole,
 		PrivilegeCheckRoleSet: inner.PrivilegeCheckRoleSet,
 	}
+}
+
+// nliProbeIndexName names the index a rewrite-built NLI probes, for the
+// M0145-0007 census line. The probe is an `*IndexScan` in the ordinary case
+// and an `*IndexOnlyScan` when `indexOnlyNLIInner` promoted it; anything else
+// is reported as-is rather than guessed at.
+func nliProbeIndexName(inner Node) string {
+	switch x := inner.(type) {
+	case *IndexScan:
+		return x.Index.Name
+	case *IndexOnlyScan:
+		return x.Index.Name
+	}
+	return fmt.Sprintf("(%T)", inner)
 }

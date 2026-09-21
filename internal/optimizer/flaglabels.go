@@ -340,6 +340,7 @@ func FlagProvenanceTable() []FlagProvenance {
 var flagProvenanceExempt = map[string]string{
 	"GOOPG_PGSHAPED_DP_TRACE":  "diagnostic only: emits the enumeration trace, never changes a chosen plan",
 	"GOOPG_NLI_COSTGATE_DEBUG": "diagnostic only: logs the NLI cost-gate decision, never changes it",
+	"GOOPG_NLI_CENSUS":         "diagnostic only: counts which route built each NestedLoopIndexJoin, never changes which one is built",
 }
 
 // shellSingleQuote quotes s for POSIX sh. The labels are ASCII today, but a

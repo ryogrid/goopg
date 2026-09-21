@@ -12953,9 +12953,32 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
       `applyJoinTreePosMap` 10, `remapWithBindings` 9, `layoutPosMap` 7,
       `remapPosMapAfterRewrite` 5, `remapSublinkOuterRefs` 4,
       `spliceSearchedSpine` 3, `remapExprRefsToMHJ` 2.
-    - Five-slice plan in the design doc; slice 2 is the NLI-population
-      census, slice 3 the `OuterColumnRef` outer-layout mapping, slice 4
-      the rest of the re-resolution family, slice 5 the hash keys.
+    - Five-slice plan in the design doc; slice 3 is the
+      `OuterColumnRef` outer-layout mapping, slice 4 the rest of the
+      re-resolution family, slice 5 the hash keys.
+    - Slice 2 (landed, loop 2026-09-21 \#17): the NLI route census
+      (`internal/optimizer/nlicensus.go`, `GOOPG_NLI_CENSUS=1`, one
+      stderr line per built node carrying route + join type + probed
+      index; registered in `flagProvenanceExempt` as diagnostic-only).
+    - TPC-DS SF0.25 (99 queries): search 143 nodes, all INNER; rewrite
+      **1** node, INNER, probing `date_dim_pkey`.
+    - TPC-H SF1 (22-query acceptance arm): search 11 nodes, all INNER;
+      rewrite **4** nodes — **2 SEMI + 2 ANTI**.
+    - THE REWRITE IS NOT DEAD CODE, and the shape of its population is
+      the finding: on TPC-H every node it builds is a SEMI or ANTI join
+      and the search builds none of those. Same fact
+      `stampSemiProbePrices`' header states from the other side ("the
+      search never sees the unnested relset"), now counted.
+    - **Hard constraint for M0145-0008**: deleting `rewriteJoinsToNLI`
+      with the legacy pipeline deletes the ONLY route that builds a
+      SEMI/ANTI index-probe join. The cutover depends on `addNLIPaths`
+      electing SEMI/ANTI NLI paths first (it files INNER/LEFT today) —
+      a pathgen task, not a lowering one. Ledgered.
+    - Attribution of the single TPC-DS INNER fire is still open:
+      `cmd_plans` captures all 99 queries regardless of `QUERIES`, so a
+      bisect through that channel measures the same full run each time.
+      Use the `sweep` channel (which does honour `QUERIES`) or add an
+      outer-relation field to the census line.
 - [ ] **M0145-0008 — cutover**: flip `GOOPG_JOINTREE_PIPELINE` default,
   re-run the full corpus gates on the new pipeline (sf025 sweep,
   tpch-spotcheck, acceptance arm, plan-parity capture), then delete the
