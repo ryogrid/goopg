@@ -17695,6 +17695,19 @@ const ownerSequenceACLString = "rwU"
 // publicPseudoRole is the lower-cased name goopg records a GRANT … TO PUBLIC
 // under (PostgreSQL reserves PUBLIC, so no real role can carry this name). It is
 // rendered as the empty grantee in the materialized aclitem[]. DU-002 slice 334.
+// aclWorldDefault reports whether an object class's `acldefault` carries a
+// non-zero world (PUBLIC) default, which is what decides where a PUBLIC
+// aclitem sits in the rendered array. Upstream's switch is
+// `acldefault`, postgres/src/backend/utils/adt/acl.c:804: DATABASE, FUNCTION,
+// LANGUAGE and TYPE have one; TABLE, SEQUENCE, SCHEMA, COLUMN, TABLESPACE,
+// LARGE OBJECT and PARAMETER_ACL do not.
+type aclWorldDefault bool
+
+const (
+	aclHasWorldDefault aclWorldDefault = true
+	aclNoWorldDefault  aclWorldDefault = false
+)
+
 const publicPseudoRole = "public"
 
 // schemaACLPrivOrder lists the schema (namespace) privileges in PostgreSQL's
@@ -17817,7 +17830,7 @@ func (c *InMemory) HasParameterACL(parname string) bool {
 func (c *InMemory) ParameterACLText(paramOID uint32) string {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	return c.relaclTextLockedFor(paramOID, parameterACLPrivOrder, ownerParameterACLString)
+	return c.relaclTextLockedFor(paramOID, parameterACLPrivOrder, ownerParameterACLString, aclNoWorldDefault)
 }
 
 // ParameterACLEntries returns every granted GUC's (oid, parname) pair, sorted
@@ -17878,7 +17891,7 @@ const ownerForeignServerACLString = "U"
 func (c *InMemory) ForeignServerACLText(srvOID uint32) string {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	return c.relaclTextLockedFor(srvOID, foreignServerACLPrivOrder, ownerForeignServerACLString)
+	return c.relaclTextLockedFor(srvOID, foreignServerACLPrivOrder, ownerForeignServerACLString, aclNoWorldDefault)
 }
 
 // foreignDataWrapperACLPrivOrder lists the foreign-data-wrapper
@@ -17912,7 +17925,7 @@ const ownerForeignDataWrapperACLString = "U"
 func (c *InMemory) ForeignDataWrapperACLText(fdwOID uint32) string {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	return c.relaclTextLockedFor(fdwOID, foreignDataWrapperACLPrivOrder, ownerForeignDataWrapperACLString)
+	return c.relaclTextLockedFor(fdwOID, foreignDataWrapperACLPrivOrder, ownerForeignDataWrapperACLString, aclNoWorldDefault)
 }
 
 // databaseACLPrivOrder lists the database (pg_database) privileges in
@@ -17950,7 +17963,7 @@ const ownerDatabaseACLString = "CTc"
 func (c *InMemory) DatabaseACLText(dbOID uint32) string {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	return c.relaclTextLockedFor(dbOID, databaseACLPrivOrder, ownerDatabaseACLString)
+	return c.relaclTextLockedFor(dbOID, databaseACLPrivOrder, ownerDatabaseACLString, aclHasWorldDefault)
 }
 
 // attrACLKey identifies one table column for column-level (pg_attribute.attacl)
@@ -18046,7 +18059,7 @@ func (c *InMemory) PGInitPrivsRowsForDBOid(dbOid uint32) [][]string {
 // server-side aclexplode/aclitemout is involved — so projecting the correct
 // text is sufficient for the round-trip.
 func (c *InMemory) relaclTextLocked(relOID uint32) string {
-	return c.relaclTextLockedFor(relOID, tableACLPrivOrder, ownerTableACLString)
+	return c.relaclTextLockedFor(relOID, tableACLPrivOrder, ownerTableACLString, aclNoWorldDefault)
 }
 
 // RelaclText renders the materialized pg_class.relacl text for the table
@@ -18065,7 +18078,7 @@ func (c *InMemory) RelaclText(relOID uint32) string {
 // sequence owner-default string "rwU", which is what pg_dump diffs against via
 // acldefault('s', owner). DU-002 slice 333. Caller must hold c.mu.
 func (c *InMemory) relaclTextLockedSeq(relOID uint32) string {
-	return c.relaclTextLockedFor(relOID, sequenceACLPrivOrder, ownerSequenceACLString)
+	return c.relaclTextLockedFor(relOID, sequenceACLPrivOrder, ownerSequenceACLString, aclNoWorldDefault)
 }
 
 // NamespaceACLText renders the materialized pg_namespace.nspacl text for the
@@ -18078,7 +18091,7 @@ func (c *InMemory) relaclTextLockedSeq(relOID uint32) string {
 func (c *InMemory) NamespaceACLText(schemaOID uint32) string {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	return c.relaclTextLockedFor(schemaOID, schemaACLPrivOrder, ownerSchemaACLString)
+	return c.relaclTextLockedFor(schemaOID, schemaACLPrivOrder, ownerSchemaACLString, aclNoWorldDefault)
 }
 
 // ProcACLText renders the materialized pg_proc.proacl text for the routine
@@ -18095,7 +18108,7 @@ func (c *InMemory) NamespaceACLText(schemaOID uint32) string {
 func (c *InMemory) ProcACLText(procOID uint32) string {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	return c.relaclTextLockedFor(procOID, functionACLPrivOrder, ownerFunctionACLString)
+	return c.relaclTextLockedFor(procOID, functionACLPrivOrder, ownerFunctionACLString, aclHasWorldDefault)
 }
 
 // TypeACLText renders the materialized pg_type.typacl text for the type/domain
@@ -18114,7 +18127,7 @@ func (c *InMemory) ProcACLText(procOID uint32) string {
 func (c *InMemory) TypeACLText(typeOID uint32) string {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	return c.relaclTextLockedFor(typeOID, typeACLPrivOrder, ownerTypeACLString)
+	return c.relaclTextLockedFor(typeOID, typeACLPrivOrder, ownerTypeACLString, aclHasWorldDefault)
 }
 
 // AttrACLText renders the materialized pg_attribute.attacl text for the column
@@ -18198,7 +18211,8 @@ func (c *InMemory) AttrACLText(relOID uint32, attNum int16) string {
 // relaclTextLockedFor is the object-type-agnostic core of relaclTextLocked: it
 // renders the materialized aclitem[] for relOID using the given privilege order
 // and owner-default privilege-letter string. Caller must hold c.mu.
-func (c *InMemory) relaclTextLockedFor(relOID uint32, privOrder []aclPrivLetter, ownerString string) string {
+func (c *InMemory) relaclTextLockedFor(relOID uint32, privOrder []aclPrivLetter, ownerString string,
+	worldDefault aclWorldDefault) string {
 	byRole := c.tableACLs[relOID]
 	if len(byRole) == 0 {
 		if c.relACLEmptied[relOID] || c.relACLOwnerRevoked[relOID] {
@@ -18226,6 +18240,32 @@ func (c *InMemory) relaclTextLockedFor(relOID uint32, privOrder []aclPrivLetter,
 	// pg_dump diffs that against acldefault to re-emit the owner's `REVOKE ALL …`.
 	// Suppress the leading owner entry in that case. DU-002 slice 344.
 	var items []string
+	// acldefault() writes the world (PUBLIC) aclitem BEFORE the owner's, but
+	// ONLY for the object classes whose world default is non-zero
+	// (`acldefault`, postgres/src/backend/utils/adt/acl.c:804 — DATABASE
+	// CONNECT|TEMP, FUNCTION EXECUTE, LANGUAGE USAGE, TYPE USAGE). For every
+	// other class the world default is ACL_NO_RIGHTS, so a PUBLIC entry can
+	// only come from an explicit GRANT, and `aclupdate` (same file) APPENDS a
+	// new grantee to the end of the array without sorting — PUBLIC is then an
+	// ordinary grantee in grant order.
+	//
+	// Measured against PG 18.3 on a private cluster, same statement order:
+	//   table    {postgres=arwdDxtm/postgres,bob=r/postgres,=r/postgres}
+	//   database {=Tc/postgres,postgres=CTc/postgres,bob=c/postgres}
+	// aclitem[] is visible text that pg_dump compares, so hoisting PUBLIC for
+	// a table would be a new divergence, not a fix.
+	if publicPrivs := byRole[publicPseudoRole]; worldDefault && len(publicPrivs) > 0 {
+		if letters := renderACLLetters(publicPrivs, privOrder); letters != "" {
+			grantor := aclOwnerRole
+			if g, ok := c.tableACLGrantor[relOID][publicPseudoRole]; ok && g != "" {
+				grantor = g
+			}
+			if disp, ok := c.roleACLDisplay[grantor]; ok {
+				grantor = disp
+			}
+			items = append(items, "="+letters+"/"+aclQuoteName(grantor))
+		}
+	}
 	if !c.relACLEmptied[relOID] && !c.relACLOwnerRevoked[relOID] {
 		ownerLetters := ownerString
 		if ownerPrivs, ok := byRole[aclOwnerRole]; ok {
@@ -18245,6 +18285,9 @@ func (c *InMemory) relaclTextLockedFor(relOID uint32, privOrder []aclPrivLetter,
 		if role == aclOwnerRole || seen[role] {
 			continue
 		}
+		if role == publicPseudoRole && worldDefault {
+			continue // already rendered as acldefault's leading world item
+		}
 		if _, ok := byRole[role]; !ok {
 			continue // stale order entry (role fully revoked)
 		}
@@ -18258,6 +18301,9 @@ func (c *InMemory) relaclTextLockedFor(relOID uint32, privOrder []aclPrivLetter,
 	for role := range byRole {
 		if role == aclOwnerRole || seen[role] {
 			continue
+		}
+		if role == publicPseudoRole && worldDefault {
+			continue // already rendered as acldefault's leading world item
 		}
 		missing = append(missing, role)
 	}

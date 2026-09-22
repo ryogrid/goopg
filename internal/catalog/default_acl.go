@@ -218,7 +218,16 @@ func (c *InMemory) DefaultACLText(aclOID uint32, objType byte) string {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	if c.defaultACLGlobal[aclOID] {
-		return c.relaclTextLockedFor(aclOID, privOrder, defaultACLOwnerString(objType))
+		// A global pg_default_acl row's baseline is acldefault(objtype, owner)
+		// (aclchk.c's SetDefaultACL), so the PUBLIC item leads the array for
+		// exactly the classes whose world default is non-zero — FUNCTION
+		// (EXECUTE) and TYPE (USAGE). Relations, sequences, schemas and large
+		// objects have none (acl.c:804).
+		world := aclNoWorldDefault
+		if objType == 'f' || objType == 'T' {
+			world = aclHasWorldDefault
+		}
+		return c.relaclTextLockedFor(aclOID, privOrder, defaultACLOwnerString(objType), world)
 	}
 	return c.defaultACLTextNoOwnerLocked(aclOID, privOrder)
 }

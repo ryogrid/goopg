@@ -40,7 +40,7 @@ func TestExecDatabaseACLChangeReachesNonConnectedDatabase(t *testing.T) {
 		t.Fatalf("execDatabaseACLChange: %v", err)
 	}
 
-	want := "{postgres=CTc/postgres,=Tc/postgres,r1=c/postgres}"
+	want := "{=Tc/postgres,postgres=CTc/postgres,r1=c/postgres}"
 	if got := cat.DatabaseACLText(otherOid); got != want {
 		t.Errorf("otherdb datacl = %q; want %q", got, want)
 	}
@@ -73,7 +73,7 @@ func TestExecDatabaseACLChangeAppliesToEveryNamedDatabase(t *testing.T) {
 	if err := op.execDatabaseACLChange(dc); err != nil {
 		t.Fatalf("execDatabaseACLChange: %v", err)
 	}
-	want := "{postgres=CTc/postgres,=Tc/postgres,r1=c/postgres}"
+	want := "{=Tc/postgres,postgres=CTc/postgres,r1=c/postgres}"
 	if got := cat.DatabaseACLText(aOid); got != want {
 		t.Errorf("dba datacl = %q; want %q", got, want)
 	}
@@ -152,7 +152,7 @@ func TestExecDatabaseACLChangeRevokeReachesNonConnectedDatabase(t *testing.T) {
 	if err := op.execDatabaseACLChange(revoke); err != nil {
 		t.Fatalf("REVOKE: %v", err)
 	}
-	want := "{postgres=CTc/postgres,=Tc/postgres}"
+	want := "{=Tc/postgres,postgres=CTc/postgres}"
 	if got := cat.DatabaseACLText(otherOid); got != want {
 		t.Errorf("otherdb datacl after REVOKE = %q; want %q", got, want)
 	}
