@@ -1,58 +1,47 @@
-# Working set — loop #18 (2026-09-22)
+# Working set — owner reset (2026-09-22, after loop #148)
 
-## BLOCKED on an owner-only harness repair — do not re-litigate, do not retry
+`Task:` none in flight. **The 129-loop BLOCKED state is cleared — the owner
+unblocked it.** Do NOT carry the old "everything is owner-gated" conclusion
+forward; it described a now-fixed harness bug, not the task list.
 
-`Task:` M0122-0015 foreign-table catalog durability — **complete, fully gated,
-STAGED, not committable**.
+`In-flight:` none. Index is clean of the foreign-table deliverable.
 
-`In-flight:` none (no gate abandoned; nothing running).
+## What the owner changed (state deltas the old baton did not know)
 
-## The blocker (unchanged, re-verified loop #18)
+1. **`.githooks/commit-msg` repaired** — the fire-set arm now reads
+   `fireset_rc=0` + `printf … | fireset-scope.sh --stdin || fireset_rc=$?`
+   (the prescribed fix). Verified under `RALPH_LOOP=1`: rc 1 survives, the
+   stamp checks run, and mismatched stamps now REJECT with a proper message
+   instead of a silent exit 1. The rc>=2 fail-closed arm is untouched.
+   `maintenance_prompts/commit-msg-fireset-arm-owner-action.md` is marked
+   RESOLVED.
+2. **M0122-0015 foreign-table durability LANDED** as `e4ffec5e5`
+   (`git commit -F /tmp/ftmsg.txt`, pre-commit pgbench smoke PASS). The
+   `code_tree` stamp drift was bookkeeping only — the staged content was
+   unchanged since the gates ran. The index contamination that made every
+   other gated commit unlandable is gone: gate stamps now work normally for
+   the next task.
+3. **M0122-0015a / 0015b / the parser-arm blockers are cleared** — same hook
+   repair; fix_plan notes updated. They are selectable again, but rank BELOW
+   the planner work.
 
-`.githooks/commit-msg` runs under `set -euo pipefail`; its fire-set arm pipes
-into `scripts/fireset-scope.sh` and then reads `fireset_rc=$?`. The script
-returns **1** for "out of scope" — the common case — so `set -e` ends the hook
-at that line and the commit fails with **exit 1 and no message**. Repair is one
-line (`fireset_rc=0` + `|| fireset_rc=$?`); the `case` arms below it already
-handle rc 0 and rc >= 2 correctly.
+## Next step — resume the planner-parity chain
 
-The loop MUST NOT apply it: the RALPH_LOOP H4 guard names `.githooks/` an
-owner-only harness mechanism file and prescribes escalation. Two attempts were
-refused (correctly). Probing the CI surface further is also refused — stop.
+The `## Current Priority` banner governs. P0 gating is satisfied; items 1-2
+have no open tasks; **item 3 is the M0145 jointree-first chain**, which has
+open `[ ]` tasks and is the owner's stated direction
+(`tmp/planner-rewrite-possibility260920.md`). Select in banner order —
+first selectable: **M0145-0004** (UNION ALL appendrel flattening, partially
+landed — leaf-hoist arm done, continue per its entry), then 0004a, 0005,
+0007, 0008, 0010, and **M0145-0018** (firewall relaxation — owner GO +
+waiver recorded 2026-09-22, execution steps in its entry). Harness tasks
+M0145-0024/0025 may run any time. M0145-0012 stays `[!]` (owner decision:
+keep the `rows<=1` arm; M0145-0024 does its recon).
 
-Blast radius is repo-wide: the arm runs before the `RALPH_LOOP` check, so any
-committer's commit staging a non-test `.go` file outside
-`internal/optimizer|planner` / `*cost*|*stat*|*selfuncs*` is unlandable.
+Still owner-gated (do not touch): **M0119-0006** Option A/B template1 call.
 
-## What is staged (the deliverable — do NOT `git add -A`, stash, or reset)
+## Gates run this session (owner)
 
-`internal/executor/{sys_pg_foreign,pg18_user_catalog_rows,operators_ddl,sys_catalog_btree_split}.go`,
-`internal/initdb/{catalog_heap_reload,open}.go`,
-`internal/testport/pgdump003_with_server_test.go`,
-`docs/design/0100-0149/0122-0015-foreign-table-catalog-durability.md`,
-`docs/design/README.md`, `.ralph/deferral_ledger.md`, `.ralph/fix_plan.md`.
-
-Message: `/tmp/ftmsg.txt`. After the owner repairs the hook:
-`git commit -F /tmp/ftmsg.txt -- <the paths above>` — **do not re-run the
-gates**, every stamp is PASS against exactly this staged tree (initdb/catalog/
-executor units; both 003 ports; full RegressSuite, failing set unchanged;
-tpch-spotcheck Q12=2/Q13=33; sf025 PASS=96, PLAN-SHAPE same=99 changed=0;
-pgbench smoke).
-
-## Why no other task was started
-
-Gate stamps hash the **staged** tree. While this deliverable sits in the index,
-any other task's gates either cover these files or stamp FAIL on a tree/index
-mismatch. Unstaging to work around that risks the only copy of a verified
-loop's work. Waiting is the correct move.
-
-## Next task once this lands
-
-Banner item 10 → M0122-0015 continues with `010_dump_connstr.pl` (309 lines).
-Ledger-open: the four foreign-data catalogs are still pinned to `DefaultDBOid`;
-`CREATE FOREIGN TABLE` still returns the tag `CREATE TABLE`.
-
-## Nightly triage
-
-All 16 `AI-20260922-004850-*` items in `ci/logs/action-items.md` are filed in
-fix_plan. Nothing unfiled (re-checked loop #18).
+pgbench smoke PASS (via the e4ffec5e5 pre-commit hook). No task gates —
+the M0122-0015 stamps were stale-but-honest; next task's commits re-stamp
+normally.

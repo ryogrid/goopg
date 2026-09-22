@@ -73,6 +73,16 @@ wasted turns).
   written by a loop that ran before the banner changed. Select per the banner and
   rewrite the baton to match, instead of following the stale suggestion. (Resuming a
   genuinely `In-flight:` task is unaffected: finish it, then re-read the banner.)
+- **A baton that claims a GLOBAL blocker (e.g. "everything is owner-gated", "do
+  not manufacture work") is a claim, not a fact — re-verify it against CURRENT
+  state before reporting BLOCKED** (added 2026-09-22 after the commit-msg
+  `set -e` incident kept ~130 loops parked on a fixed blocker): check the named
+  blocker file still has the defect, `git log`/`git status` against the baton's
+  recorded HEAD and staged list, and whether the banner holds selectable `[ ]`
+  tasks the baton never mentions. If the blocker is gone or the banner disagrees,
+  discard the baton's conclusion, select per the banner, and rewrite the baton.
+  The baton's HEAD being behind `git rev-parse HEAD` is itself evidence of
+  staleness.
 - When you pass the baton to the next loop, update Design Doc according to knowledge gained from the current loop.
 - At loop END (immediately before the status block), REWRITE it (≤40 lines) with:
   - `Task:` the fix_plan item being worked (id + one line)

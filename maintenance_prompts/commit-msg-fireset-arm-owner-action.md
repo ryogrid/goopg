@@ -1,5 +1,14 @@
 # OWNER ACTION — `commit-msg` fire-set arm aborts under `set -e`
 
+> **RESOLVED 2026-09-22.** The suggested repair was applied verbatim
+> (`fireset_rc=0` + `|| fireset_rc=$?`, rc>=2 fail-closed arm untouched) and
+> verified under `RALPH_LOOP=1` — the arm now survives rc 1 and the stamp
+> checks run. The staged M0122-0015 foreign-table deliverable was landed as
+> `e4ffec5e5` via `git commit -F /tmp/ftmsg.txt` (owner commit, `RALPH_LOOP`
+> unset; gate stamps had drifted from the live index bookkeeping-wise but the
+> staged content was unchanged since the PASS runs). This note is kept as the
+> incident record.
+
 **Filed by the Ralph loop 2026-09-22 (loops #17/#18/#19). Owner-only: the loop
 may not edit `.githooks/`** — the RALPH_LOOP H4 guard names it a harness
 mechanism file and prescribes escalation, so the loop escalates here instead of

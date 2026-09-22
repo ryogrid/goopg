@@ -103,9 +103,15 @@ errors=()
 # failed — fail CLOSED like every other gate (a missing/non-exec script must
 # not silently disable G9).
 fireset_needed=0
+fireset_rc=0
 if [ "$gated_go" -eq 1 ]; then
-  printf '%s\n' "${files[@]}" | "$ROOT/scripts/fireset-scope.sh" --stdin >/dev/null 2>&1
-  fireset_rc=$?
+  # The `|| fireset_rc=$?` form is load-bearing: under `set -e` a bare
+  # `pipeline; rc=$?` aborts on rc 1 ("out of scope", the common case)
+  # before $? is ever read — that bug made the hook exit 1 with no
+  # message for ANY commit staging a non-test .go outside the scope
+  # (loops #17-#148, owner-action note
+  # maintenance_prompts/commit-msg-fireset-arm-owner-action.md).
+  printf '%s\n' "${files[@]}" | "$ROOT/scripts/fireset-scope.sh" --stdin >/dev/null 2>&1 || fireset_rc=$?
   case "$fireset_rc" in
     0) fireset_needed=1 ;;
     1) ;;

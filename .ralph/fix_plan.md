@@ -2964,9 +2964,10 @@ the whole file's active task between 2026-09-01 and 2026-09-14; **since
     - **Rule 6 applies**: read
       `docs/design/not_ralph/06-goyacc-parser-playbook.md` §12 first, build
       with `make gen-parser`, review via the `parity_goldens.txt` diff.
-    - **Blocked from landing** by the `commit-msg` fire\-set `set -e` abort
-      (`grammar/` + `internal/parser/` are outside the fire\-set scope). The
-      inventory row for 005 is `defer` with this task in `deferred_to`.
+    - ~~**Blocked from landing** by the `commit-msg` fire\-set `set -e` abort
+      (`grammar/` + `internal/parser/` are outside the fire\-set scope).~~
+      **Hook repaired 2026\-09\-22 — this can now be committed normally.**
+      The inventory row for 005 is `defer` with this task in `deferred_to`.
   - [ ] **M0122-0015a — `COPY` resolves relations in the DEFAULT database, so
     `pg_dump` of any user-created database has no data**
     Kind: impl
@@ -2991,11 +2992,25 @@ the whole file's active task between 2026-09-01 and 2026-09-14; **since
       identity \(M0134\-0009 R5\). Both were patched field\-by\-field; the
       durable fix is to construct it from the same path the batch dispatch
       uses. Sibling audit belongs in that change, not a fourth patch.
-    - **Blocked from landing** by the `commit-msg` fire\-set `set -e` abort
+    - ~~**Blocked from landing** by the `commit-msg` fire\-set `set -e` abort
       \(`maintenance_prompts/commit-msg-fireset-arm-owner-action.md`\):
       `internal/postmaster/` is outside the fire\-set scope, so the fix cannot
-      be committed until the owner repairs the hook. The port and the ledger
-      rows land now; the fix waits.
+      be committed until the owner repairs the hook.~~ **Hook repaired
+      2026\-09\-22 — this task is committable again.** The port and the ledger
+      rows landed; the fix itself is still open and is the durable\-fix
+      sibling\-audit described above.
+  - [x] **RESOLVED — owner action taken \(2026\-09\-22\)**. The `commit-msg`
+    fire\-set `set -e` abort was repaired exactly as prescribed below
+    \(`fireset_rc=0` + `|| fireset_rc=$?`, fail\-closed rc>=2 arm untouched\),
+    verified under `RALPH_LOOP=1` — the arm now survives rc 1 and the stamp
+    checks run. The staged foreign\-table durability work landed as
+    **`e4ffec5e5`** via `git commit -F /tmp/ftmsg.txt` — the stamps'
+    `code_tree` had drifted from the live index \(bookkeeping only: the
+    staged content was unchanged since the gates ran; `planner.go` had
+    already landed separately in `8deb60881`\), so the owner commit \(which
+    does not run under `RALPH_LOOP=1`\) took the prescribed path rather than
+    re\-running the 3 already\-PASS gates. The pre\-commit pgbench smoke ran
+    and passed. The original BLOCKED note is preserved below for the record:
   - [!] **BLOCKED — OWNER ACTION NEEDED \(2026\-09\-22, loop \#17\)**. The
     foreign\-table durability work below is complete, fully gated and
     **staged**, but `git commit` cannot land it: the `commit-msg` hook exits
