@@ -2763,6 +2763,35 @@ the whole file's active task between 2026-09-01 and 2026-09-14; **since
     - The milestone row stays `[ ]`: this is one slice of "buffer pool & btree
       locking", not the whole item.
 - [ ] **M0122-0012 — Perf infra: vectorization / slot-pipeline / harness**.
+  - **First batch\-filter slice LANDED 2026\-09\-22 \(loop \#11\)** as
+    `d6e42a7f7`, **as infrastructure with NO performance claim**.
+    Movement: none. Design:
+    `docs/design/0100-0149/0122-0012-vector-filter-pipeline-recon.md`.
+    - **Reachability, measured**: a temporary `FILTEROPCENSUS` counter over the
+      whole TPC\-DS SF0.25 sweep recorded **363** `filterOp` opens — 292
+      `BinaryOp` shapes the admission rule declines, 66 `BooleanConst`, and
+      **5** on the batch path \(**1.4%**\). Neither corpus's plan capture holds a
+      standalone `Filter` operator node at all: a `Filter` above a scan is
+      absorbed into `seqScanOp`, so every open sits above a join or another
+      non\-scan child.
+    - **Speed, measured**: A/B on the served shape \(400k\-row join, filter
+      above it, same binary, batch toggled by a temporary env switch\) gives
+      medians **219 ms ON vs 217 ms OFF** — inside the noise. Rule \#4's case
+      exactly; the doc says in as many words not to cite this as a speedup.
+    - **Semantics, measured**: NULL three\-valued filtering agrees three ways —
+      batch ON, batch OFF and PG 18.3 all give `1/30`, `1`, `0` on the same
+      data. That is the sibling\-path check a second evaluator owes.
+    - The slice's worth is the ownership boundary the scan\-resident successor
+      needs \(`TestM0122VectorBatchRetainsReusedSlotBeforeNext` against a child
+      that reuses its output buffer, plus the admission pin\). The performance
+      case belongs to that successor, where the 292 declined opens and the
+      absorbed scan quals live.
+    - Gates: executor units; tpch\-spotcheck Q12=2/Q13=33; tpcds\-sf025
+      `PASS=96 MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0`; acceptance arm
+      24 MATCH; full `TestPort_RegressSuite` with an unchanged failing set;
+      pgbench smoke.
+    - No ledger row: performance infrastructure, not a PostgreSQL semantic
+      omission \(the doc states this\).
 - [ ] **M0122-0013 — Physical/streaming replication & standby**.
 - [ ] **M0122-0014 — Logical replication / decoding / subscription**.
 - [ ] **M0122-0015 — Test-suite porting: amcheck / verify_heapam / pg_dump**.
