@@ -517,71 +517,273 @@ placeholder is a comment, not a checkbox, so the plan-complete exit
 heuristic stays live.)
 
 ### Nightly run 20260922-004850 (sha `c07ebf0112d7`, 16 items) — filed 2026-09-22
-- [ ] **testport/TestPort_IsolationEvalPlanQual** — reopened nightly failure
+- [x] **testport/TestPort_IsolationEvalPlanQual** — stale nightly failure
   (AI-20260922-004850-001; repro: `go test -v -run '^TestPort_IsolationEvalPlanQual$' ./internal/testport/`).
   Kind: impl
   Parent: none
-- [ ] **testport/TestPort_PgAmcheck003CombinedCorruption** — nightly failure
+  - **STALE — re\-run 2026\-09\-22 \(loop \#7\): PASSes at HEAD.** All 15
+    non\-suite items of this run were re\-run together on a CLEAN tree
+    \(unrelated WIP stashed\), which matters: the pgoutput paths these tests
+    exercise have uncommitted work in the tree, so a dirty\-tree PASS would
+    prove nothing about HEAD.
+  - **Why it failed then**: `b7cea12e5` landed **66 seconds after the nightly
+    started** and changes exactly the path these tests exercise
+    \(`pgoDecodePhysicalValue` / `PadBpchar`\). Three of the 15 —
+    `TestPort_IsolationEvalPlanQual`, `TestPort_PgAmcheck003SchemaScoped`,
+    `TestPort_PgoutputInteropGoopgToPG` — were additionally re\-run in a
+    detached worktree at the nightly's own sha `c07ebf011` and **FAIL** there,
+    which is the direct evidence. The other twelve are PASS\-at\-HEAD only and
+    share the same cause by attribution, not by their own bisect.
+- [x] **testport/TestPort_PgAmcheck003CombinedCorruption** — stale nightly failure
   (AI-20260922-004850-002; repro: `go test -v -run '^TestPort_PgAmcheck003CombinedCorruption$' ./internal/testport/`).
   Kind: impl
   Parent: none
-- [ ] **testport/TestPort_PgAmcheck003MissingHeapFile** — nightly failure
+  - **STALE — re\-run 2026\-09\-22 \(loop \#7\): PASSes at HEAD.** All 15
+    non\-suite items of this run were re\-run together on a CLEAN tree
+    \(unrelated WIP stashed\), which matters: the pgoutput paths these tests
+    exercise have uncommitted work in the tree, so a dirty\-tree PASS would
+    prove nothing about HEAD.
+  - **Why it failed then**: `b7cea12e5` landed **66 seconds after the nightly
+    started** and changes exactly the path these tests exercise
+    \(`pgoDecodePhysicalValue` / `PadBpchar`\). Three of the 15 —
+    `TestPort_IsolationEvalPlanQual`, `TestPort_PgAmcheck003SchemaScoped`,
+    `TestPort_PgoutputInteropGoopgToPG` — were additionally re\-run in a
+    detached worktree at the nightly's own sha `c07ebf011` and **FAIL** there,
+    which is the direct evidence. The other twelve are PASS\-at\-HEAD only and
+    share the same cause by attribution, not by their own bisect.
+- [x] **testport/TestPort_PgAmcheck003MissingHeapFile** — stale nightly failure
   (AI-20260922-004850-003; repro: `go test -v -run '^TestPort_PgAmcheck003MissingHeapFile$' ./internal/testport/`).
   Kind: impl
   Parent: none
-- [ ] **testport/TestPort_PgAmcheck003MissingIndexFork** — nightly failure
+  - **STALE — re\-run 2026\-09\-22 \(loop \#7\): PASSes at HEAD.** All 15
+    non\-suite items of this run were re\-run together on a CLEAN tree
+    \(unrelated WIP stashed\), which matters: the pgoutput paths these tests
+    exercise have uncommitted work in the tree, so a dirty\-tree PASS would
+    prove nothing about HEAD.
+  - **Why it failed then**: `b7cea12e5` landed **66 seconds after the nightly
+    started** and changes exactly the path these tests exercise
+    \(`pgoDecodePhysicalValue` / `PadBpchar`\). Three of the 15 —
+    `TestPort_IsolationEvalPlanQual`, `TestPort_PgAmcheck003SchemaScoped`,
+    `TestPort_PgoutputInteropGoopgToPG` — were additionally re\-run in a
+    detached worktree at the nightly's own sha `c07ebf011` and **FAIL** there,
+    which is the direct evidence. The other twelve are PASS\-at\-HEAD only and
+    share the same cause by attribution, not by their own bisect.
+- [x] **testport/TestPort_PgAmcheck003MissingIndexFork** — stale nightly failure
   (AI-20260922-004850-004; repro: `go test -v -run '^TestPort_PgAmcheck003MissingIndexFork$' ./internal/testport/`).
   Kind: impl
   Parent: none
-- [ ] **testport/TestPort_PgAmcheck003SchemaScoped** — nightly failure
+  - **STALE — re\-run 2026\-09\-22 \(loop \#7\): PASSes at HEAD.** All 15
+    non\-suite items of this run were re\-run together on a CLEAN tree
+    \(unrelated WIP stashed\), which matters: the pgoutput paths these tests
+    exercise have uncommitted work in the tree, so a dirty\-tree PASS would
+    prove nothing about HEAD.
+  - **Why it failed then**: `b7cea12e5` landed **66 seconds after the nightly
+    started** and changes exactly the path these tests exercise
+    \(`pgoDecodePhysicalValue` / `PadBpchar`\). Three of the 15 —
+    `TestPort_IsolationEvalPlanQual`, `TestPort_PgAmcheck003SchemaScoped`,
+    `TestPort_PgoutputInteropGoopgToPG` — were additionally re\-run in a
+    detached worktree at the nightly's own sha `c07ebf011` and **FAIL** there,
+    which is the direct evidence. The other twelve are PASS\-at\-HEAD only and
+    share the same cause by attribution, not by their own bisect.
+- [x] **testport/TestPort_PgAmcheck003SchemaScoped** — stale nightly failure
   (AI-20260922-004850-005; repro: `go test -v -run '^TestPort_PgAmcheck003SchemaScoped$' ./internal/testport/`).
   Kind: impl
   Parent: none
-- [ ] **testport/TestPort_PgoutputInteropGoopgToPG** — nightly failure
+  - **STALE — re\-run 2026\-09\-22 \(loop \#7\): PASSes at HEAD.** All 15
+    non\-suite items of this run were re\-run together on a CLEAN tree
+    \(unrelated WIP stashed\), which matters: the pgoutput paths these tests
+    exercise have uncommitted work in the tree, so a dirty\-tree PASS would
+    prove nothing about HEAD.
+  - **Why it failed then**: `b7cea12e5` landed **66 seconds after the nightly
+    started** and changes exactly the path these tests exercise
+    \(`pgoDecodePhysicalValue` / `PadBpchar`\). Three of the 15 —
+    `TestPort_IsolationEvalPlanQual`, `TestPort_PgAmcheck003SchemaScoped`,
+    `TestPort_PgoutputInteropGoopgToPG` — were additionally re\-run in a
+    detached worktree at the nightly's own sha `c07ebf011` and **FAIL** there,
+    which is the direct evidence. The other twelve are PASS\-at\-HEAD only and
+    share the same cause by attribution, not by their own bisect.
+- [x] **testport/TestPort_PgoutputInteropGoopgToPG** — stale nightly failure
   (AI-20260922-004850-006; repro: `go test -v -run '^TestPort_PgoutputInteropGoopgToPG$' ./internal/testport/`).
   Kind: impl
   Parent: none
-- [ ] **testport/TestPort_PgoutputInteropPGToGoopgBatchDML** — nightly failure
+  - **STALE — re\-run 2026\-09\-22 \(loop \#7\): PASSes at HEAD.** All 15
+    non\-suite items of this run were re\-run together on a CLEAN tree
+    \(unrelated WIP stashed\), which matters: the pgoutput paths these tests
+    exercise have uncommitted work in the tree, so a dirty\-tree PASS would
+    prove nothing about HEAD.
+  - **Why it failed then**: `b7cea12e5` landed **66 seconds after the nightly
+    started** and changes exactly the path these tests exercise
+    \(`pgoDecodePhysicalValue` / `PadBpchar`\). Three of the 15 —
+    `TestPort_IsolationEvalPlanQual`, `TestPort_PgAmcheck003SchemaScoped`,
+    `TestPort_PgoutputInteropGoopgToPG` — were additionally re\-run in a
+    detached worktree at the nightly's own sha `c07ebf011` and **FAIL** there,
+    which is the direct evidence. The other twelve are PASS\-at\-HEAD only and
+    share the same cause by attribution, not by their own bisect.
+- [x] **testport/TestPort_PgoutputInteropPGToGoopgBatchDML** — stale nightly failure
   (AI-20260922-004850-007; repro: `go test -v -run '^TestPort_PgoutputInteropPGToGoopgBatchDML$' ./internal/testport/`).
   Kind: impl
   Parent: none
-- [ ] **testport/TestPort_PgoutputInteropPGToGoopgColumnOrderMismatch** — nightly failure
+  - **STALE — re\-run 2026\-09\-22 \(loop \#7\): PASSes at HEAD.** All 15
+    non\-suite items of this run were re\-run together on a CLEAN tree
+    \(unrelated WIP stashed\), which matters: the pgoutput paths these tests
+    exercise have uncommitted work in the tree, so a dirty\-tree PASS would
+    prove nothing about HEAD.
+  - **Why it failed then**: `b7cea12e5` landed **66 seconds after the nightly
+    started** and changes exactly the path these tests exercise
+    \(`pgoDecodePhysicalValue` / `PadBpchar`\). Three of the 15 —
+    `TestPort_IsolationEvalPlanQual`, `TestPort_PgAmcheck003SchemaScoped`,
+    `TestPort_PgoutputInteropGoopgToPG` — were additionally re\-run in a
+    detached worktree at the nightly's own sha `c07ebf011` and **FAIL** there,
+    which is the direct evidence. The other twelve are PASS\-at\-HEAD only and
+    share the same cause by attribution, not by their own bisect.
+- [x] **testport/TestPort_PgoutputInteropPGToGoopgColumnOrderMismatch** — stale nightly failure
   (AI-20260922-004850-008; repro: `go test -v -run '^TestPort_PgoutputInteropPGToGoopgColumnOrderMismatch$' ./internal/testport/`).
   Kind: impl
   Parent: none
-- [ ] **testport/TestPort_PgoutputInteropPGToGoopgFullDML** — nightly failure
+  - **STALE — re\-run 2026\-09\-22 \(loop \#7\): PASSes at HEAD.** All 15
+    non\-suite items of this run were re\-run together on a CLEAN tree
+    \(unrelated WIP stashed\), which matters: the pgoutput paths these tests
+    exercise have uncommitted work in the tree, so a dirty\-tree PASS would
+    prove nothing about HEAD.
+  - **Why it failed then**: `b7cea12e5` landed **66 seconds after the nightly
+    started** and changes exactly the path these tests exercise
+    \(`pgoDecodePhysicalValue` / `PadBpchar`\). Three of the 15 —
+    `TestPort_IsolationEvalPlanQual`, `TestPort_PgAmcheck003SchemaScoped`,
+    `TestPort_PgoutputInteropGoopgToPG` — were additionally re\-run in a
+    detached worktree at the nightly's own sha `c07ebf011` and **FAIL** there,
+    which is the direct evidence. The other twelve are PASS\-at\-HEAD only and
+    share the same cause by attribution, not by their own bisect.
+- [x] **testport/TestPort_PgoutputInteropPGToGoopgFullDML** — stale nightly failure
   (AI-20260922-004850-009; repro: `go test -v -run '^TestPort_PgoutputInteropPGToGoopgFullDML$' ./internal/testport/`).
   Kind: impl
   Parent: none
-- [ ] **testport/TestPort_PgoutputInteropPGToGoopgPgbenchInsert** — nightly failure
+  - **STALE — re\-run 2026\-09\-22 \(loop \#7\): PASSes at HEAD.** All 15
+    non\-suite items of this run were re\-run together on a CLEAN tree
+    \(unrelated WIP stashed\), which matters: the pgoutput paths these tests
+    exercise have uncommitted work in the tree, so a dirty\-tree PASS would
+    prove nothing about HEAD.
+  - **Why it failed then**: `b7cea12e5` landed **66 seconds after the nightly
+    started** and changes exactly the path these tests exercise
+    \(`pgoDecodePhysicalValue` / `PadBpchar`\). Three of the 15 —
+    `TestPort_IsolationEvalPlanQual`, `TestPort_PgAmcheck003SchemaScoped`,
+    `TestPort_PgoutputInteropGoopgToPG` — were additionally re\-run in a
+    detached worktree at the nightly's own sha `c07ebf011` and **FAIL** there,
+    which is the direct evidence. The other twelve are PASS\-at\-HEAD only and
+    share the same cause by attribution, not by their own bisect.
+- [x] **testport/TestPort_PgoutputInteropPGToGoopgPgbenchInsert** — stale nightly failure
   (AI-20260922-004850-010; repro: `go test -v -run '^TestPort_PgoutputInteropPGToGoopgPgbenchInsert$' ./internal/testport/`).
   Kind: impl
   Parent: none
-- [ ] **testport/TestPort_PgoutputInteropPGToGoopgPgbenchTpcb** — nightly failure
+  - **STALE — re\-run 2026\-09\-22 \(loop \#7\): PASSes at HEAD.** All 15
+    non\-suite items of this run were re\-run together on a CLEAN tree
+    \(unrelated WIP stashed\), which matters: the pgoutput paths these tests
+    exercise have uncommitted work in the tree, so a dirty\-tree PASS would
+    prove nothing about HEAD.
+  - **Why it failed then**: `b7cea12e5` landed **66 seconds after the nightly
+    started** and changes exactly the path these tests exercise
+    \(`pgoDecodePhysicalValue` / `PadBpchar`\). Three of the 15 —
+    `TestPort_IsolationEvalPlanQual`, `TestPort_PgAmcheck003SchemaScoped`,
+    `TestPort_PgoutputInteropGoopgToPG` — were additionally re\-run in a
+    detached worktree at the nightly's own sha `c07ebf011` and **FAIL** there,
+    which is the direct evidence. The other twelve are PASS\-at\-HEAD only and
+    share the same cause by attribution, not by their own bisect.
+- [x] **testport/TestPort_PgoutputInteropPGToGoopgPgbenchTpcb** — stale nightly failure
   (AI-20260922-004850-011; repro: `go test -v -run '^TestPort_PgoutputInteropPGToGoopgPgbenchTpcb$' ./internal/testport/`).
   Kind: impl
   Parent: none
-- [ ] **testport/TestPort_PgoutputInteropPGToGoopgReplicaIdentityFull** — nightly failure
+  - **STALE — re\-run 2026\-09\-22 \(loop \#7\): PASSes at HEAD.** All 15
+    non\-suite items of this run were re\-run together on a CLEAN tree
+    \(unrelated WIP stashed\), which matters: the pgoutput paths these tests
+    exercise have uncommitted work in the tree, so a dirty\-tree PASS would
+    prove nothing about HEAD.
+  - **Why it failed then**: `b7cea12e5` landed **66 seconds after the nightly
+    started** and changes exactly the path these tests exercise
+    \(`pgoDecodePhysicalValue` / `PadBpchar`\). Three of the 15 —
+    `TestPort_IsolationEvalPlanQual`, `TestPort_PgAmcheck003SchemaScoped`,
+    `TestPort_PgoutputInteropGoopgToPG` — were additionally re\-run in a
+    detached worktree at the nightly's own sha `c07ebf011` and **FAIL** there,
+    which is the direct evidence. The other twelve are PASS\-at\-HEAD only and
+    share the same cause by attribution, not by their own bisect.
+- [x] **testport/TestPort_PgoutputInteropPGToGoopgReplicaIdentityFull** — stale nightly failure
   (AI-20260922-004850-012; repro: `go test -v -run '^TestPort_PgoutputInteropPGToGoopgReplicaIdentityFull$' ./internal/testport/`).
   Kind: impl
   Parent: none
-- [ ] **testport/TestPort_PgoutputInteropPGToGoopgSubscriberExtraColumn** — nightly failure
+  - **STALE — re\-run 2026\-09\-22 \(loop \#7\): PASSes at HEAD.** All 15
+    non\-suite items of this run were re\-run together on a CLEAN tree
+    \(unrelated WIP stashed\), which matters: the pgoutput paths these tests
+    exercise have uncommitted work in the tree, so a dirty\-tree PASS would
+    prove nothing about HEAD.
+  - **Why it failed then**: `b7cea12e5` landed **66 seconds after the nightly
+    started** and changes exactly the path these tests exercise
+    \(`pgoDecodePhysicalValue` / `PadBpchar`\). Three of the 15 —
+    `TestPort_IsolationEvalPlanQual`, `TestPort_PgAmcheck003SchemaScoped`,
+    `TestPort_PgoutputInteropGoopgToPG` — were additionally re\-run in a
+    detached worktree at the nightly's own sha `c07ebf011` and **FAIL** there,
+    which is the direct evidence. The other twelve are PASS\-at\-HEAD only and
+    share the same cause by attribution, not by their own bisect.
+- [x] **testport/TestPort_PgoutputInteropPGToGoopgSubscriberExtraColumn** — stale nightly failure
   (AI-20260922-004850-013; repro: `go test -v -run '^TestPort_PgoutputInteropPGToGoopgSubscriberExtraColumn$' ./internal/testport/`).
   Kind: impl
   Parent: none
-- [ ] **testport/TestPort_PgoutputInteropPGToGoopgSubscriberExtraDefault** — nightly failure
+  - **STALE — re\-run 2026\-09\-22 \(loop \#7\): PASSes at HEAD.** All 15
+    non\-suite items of this run were re\-run together on a CLEAN tree
+    \(unrelated WIP stashed\), which matters: the pgoutput paths these tests
+    exercise have uncommitted work in the tree, so a dirty\-tree PASS would
+    prove nothing about HEAD.
+  - **Why it failed then**: `b7cea12e5` landed **66 seconds after the nightly
+    started** and changes exactly the path these tests exercise
+    \(`pgoDecodePhysicalValue` / `PadBpchar`\). Three of the 15 —
+    `TestPort_IsolationEvalPlanQual`, `TestPort_PgAmcheck003SchemaScoped`,
+    `TestPort_PgoutputInteropGoopgToPG` — were additionally re\-run in a
+    detached worktree at the nightly's own sha `c07ebf011` and **FAIL** there,
+    which is the direct evidence. The other twelve are PASS\-at\-HEAD only and
+    share the same cause by attribution, not by their own bisect.
+- [x] **testport/TestPort_PgoutputInteropPGToGoopgSubscriberExtraDefault** — stale nightly failure
   (AI-20260922-004850-014; repro: `go test -v -run '^TestPort_PgoutputInteropPGToGoopgSubscriberExtraDefault$' ./internal/testport/`).
   Kind: impl
   Parent: none
-- [ ] **testport/TestPort_PgoutputInteropPGToGoopgTruncate** — nightly failure
+  - **STALE — re\-run 2026\-09\-22 \(loop \#7\): PASSes at HEAD.** All 15
+    non\-suite items of this run were re\-run together on a CLEAN tree
+    \(unrelated WIP stashed\), which matters: the pgoutput paths these tests
+    exercise have uncommitted work in the tree, so a dirty\-tree PASS would
+    prove nothing about HEAD.
+  - **Why it failed then**: `b7cea12e5` landed **66 seconds after the nightly
+    started** and changes exactly the path these tests exercise
+    \(`pgoDecodePhysicalValue` / `PadBpchar`\). Three of the 15 —
+    `TestPort_IsolationEvalPlanQual`, `TestPort_PgAmcheck003SchemaScoped`,
+    `TestPort_PgoutputInteropGoopgToPG` — were additionally re\-run in a
+    detached worktree at the nightly's own sha `c07ebf011` and **FAIL** there,
+    which is the direct evidence. The other twelve are PASS\-at\-HEAD only and
+    share the same cause by attribution, not by their own bisect.
+- [x] **testport/TestPort_PgoutputInteropPGToGoopgTruncate** — stale nightly failure
   (AI-20260922-004850-015; repro: `go test -v -run '^TestPort_PgoutputInteropPGToGoopgTruncate$' ./internal/testport/`).
   Kind: impl
   Parent: none
-- [ ] **testport/TestPort_RegressSuite** — reopened nightly failure in
-  partition_aggregate, select_having, select_implicit, and union
+  - **STALE — re\-run 2026\-09\-22 \(loop \#7\): PASSes at HEAD.** All 15
+    non\-suite items of this run were re\-run together on a CLEAN tree
+    \(unrelated WIP stashed\), which matters: the pgoutput paths these tests
+    exercise have uncommitted work in the tree, so a dirty\-tree PASS would
+    prove nothing about HEAD.
+  - **Why it failed then**: `b7cea12e5` landed **66 seconds after the nightly
+    started** and changes exactly the path these tests exercise
+    \(`pgoDecodePhysicalValue` / `PadBpchar`\). Three of the 15 —
+    `TestPort_IsolationEvalPlanQual`, `TestPort_PgAmcheck003SchemaScoped`,
+    `TestPort_PgoutputInteropGoopgToPG` — were additionally re\-run in a
+    detached worktree at the nightly's own sha `c07ebf011` and **FAIL** there,
+    which is the direct evidence. The other twelve are PASS\-at\-HEAD only and
+    share the same cause by attribution, not by their own bisect.
+- [x] **testport/TestPort_RegressSuite** — aggregate report; its sole failing
+  case is already owned
   (AI-20260922-004850-016; repro: `go test -v -run '^TestPort_RegressSuite$' ./internal/testport/`).
   Kind: impl
   Parent: none
+  - **RE\-RUN 2026\-09\-22 \(loop \#7\) at HEAD on a clean tree**: 231 subtests
+    PASS or SKIP and exactly **one** FAILs —
+    `TestPort_RegressSuite/partition_aggregate`, which already has its own
+    `[!]` row \(partitionwise aggregation\). `select_having`,
+    `select_implicit` and `union`, named when this row was filed, now pass.
+  - The suite therefore stays red until that one row is cleared; this row
+    itself carries no separate work.
 
 ### Nightly run 20260901-010436 (sha `d93fb9edc669`, 7 items) — filed 2026-09-01
 - [x] **testport/TestPort_PgStatActivity (AI-20260901-010436-005, AI-20260905-011015-007, AI-20260914-235643-010, AI-20260916-035206-011, AI-20260917-004357-015)**.
