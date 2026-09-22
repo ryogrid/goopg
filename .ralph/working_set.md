@@ -1,55 +1,41 @@
-# Working set — owner reset (2026-09-22, after loop #148)
+# Working set — 2026-09-23 (loop after M0145-0005 slice 6)
 
-`Task:` M0145-0004a landed 2026-09-23 as this session's HEAD commit
-(whole-chain UNION ALL flattening — `Gather → Parallel Append` over the
-full chain on both arms; Q71 verifies 290 rows = PG). All gate stamps
-PASS (spotcheck, sf025 sweep, acceptance-arm 24 MATCH, tpcds-fireset)
-+ pre-commit pgbench smoke.
-**The 129-loop BLOCKED state is cleared — the owner
-unblocked it.** Do NOT carry the old "everything is owner-gated" conclusion
-forward; it described a now-fixed harness bug, not the task list.
+`Task:` M0145-0005 — single-pass DP over the jointree. **Slice 6 landed
+and committed as `171c110e7`** ("chain-extracted semi/anti as deferred
+real leaf items"): under `jointreePipeline` every SEMI/ANTI link's RHS
+is a real joinlist leaf item in a deferred band `[emitTotal,
+emitTotal+nSemiAnti)` — no more synthetic tail for chain semianti;
+`semiAntiChainLink.realLeaf` marks them; new `chain-leaf-desync`
+fail-closed check. Knob-arm SF0.25 seam census: `semianti-not-tail` gone
+entirely (Q78's class). All 4 gate stamps PASS on the committed index +
+pre-commit pgbench smoke.
 
-`In-flight:` none after 0004a. Next selectable per banner order:
-**M0145-0005** (single-pass DP over the jointree — slices 1-5 partial
-landed; remaining slices per its entry: semi/anti as real leaf items,
-IR-direct leaf materialisation, Phase A/B + `admitSemiAnti` retirement).
+`Files:` internal/optimizer/{collapse,specialjoin,joinsearchseam,jointreepullup}.go,
+{joinsearch_m0145,jointreescope,jointreepullup}_test.go,
+docs/design/0100-0149/m0145-0005-*.md (new "Slice 6" section),
+.ralph/fix_plan.md (nested bullet).
 
-## What the owner changed (state deltas the old baton did not know)
+`Key symbols:` `jointreeItemEmittingRels`, `sjiLeaf.leafIdx`,
+`makeSpecialJoinInfoForSets`, `extractScopeLeaves(tab, sjis)`,
+`splicePulledLeaves(pu, nReal, nprefix, ...)`, `semiAntiChainLink.realLeaf`,
+`pulledBase` in the seam's non-emitting construction band.
 
-1. **`.githooks/commit-msg` repaired** — the fire-set arm now reads
-   `fireset_rc=0` + `printf … | fireset-scope.sh --stdin || fireset_rc=$?`
-   (the prescribed fix). Verified under `RALPH_LOOP=1`: rc 1 survives, the
-   stamp checks run, and mismatched stamps now REJECT with a proper message
-   instead of a silent exit 1. The rc>=2 fail-closed arm is untouched.
-   `maintenance_prompts/commit-msg-fireset-arm-owner-action.md` is marked
-   RESOLVED.
-2. **M0122-0015 foreign-table durability LANDED** as `e4ffec5e5`
-   (`git commit -F /tmp/ftmsg.txt`, pre-commit pgbench smoke PASS). The
-   `code_tree` stamp drift was bookkeeping only — the staged content was
-   unchanged since the gates ran. The index contamination that made every
-   other gated commit unlandable is gone: gate stamps now work normally for
-   the next task.
-3. **M0122-0015a / 0015b / the parser-arm blockers are cleared** — same hook
-   repair; fix_plan notes updated. They are selectable again, but rank BELOW
-   the planner work.
+`Hypothesis/Findings:` problem layout is now emitting [0,emitTotal) |
+deferred-chain [emitTotal,emitTotal+nChain) | pulled tail; nChain =
+nprefix - nPulled - nrels (nrels == emitting bindings count). The
+`searchJl` leafItem-append now appends zero items on the jointree arm.
+Legacy arm unchanged (antiCollapsedJoins path intact).
 
-## Next step — resume the planner-parity chain
+`Next step:` per the fix_plan banner — M0145-0005 remains `[ ]` with
+slice 7 ledgered: Phase A/B split retirement (`runJoinSearchBelowPinned`,
+pinned spine, splice-time re-resolution). Then banner order continues
+(0007, 0008, 0010, M0145-0018 owner-GO firewall relaxation).
 
-The `## Current Priority` banner governs. P0 gating is satisfied; items 1-2
-have no open tasks; **item 3 is the M0145 jointree-first chain**, which has
-open `[ ]` tasks and is the owner's stated direction
-(`tmp/planner-rewrite-possibility260920.md`). Select in banner order —
-first selectable: **M0145-0004** (UNION ALL appendrel flattening, partially
-landed — leaf-hoist arm done, continue per its entry), then 0004a, 0005,
-0007, 0008, 0010, and **M0145-0018** (firewall relaxation — owner GO +
-waiver recorded 2026-09-22, execution steps in its entry). Harness tasks
-M0145-0024/0025 may run any time. M0145-0012 stays `[!]` (owner decision:
-keep the `rows<=1` arm; M0145-0024 does its recon).
+`Gates run:` optimizer suite PASS; RALPH_PRECOMMIT_SCOPE=units PASS;
+tpch-spotcheck PASS (Q12=2, Q13=33); tpcds-sf025 PASS=96 MISMATCH=0
+TIMEOUT=0 plans 99/99; tpch-acceptance-arm PGSHAPED=1 24 MATCH PASS
+(vs tmp/m0122-0015-arm.txt); tpcds-fireset PASS (sf025+sf1,
+introduced=none); pre-commit pgbench smoke PASS.
 
-Still owner-gated (do not touch): **M0119-0006** Option A/B template1 call.
-
-## Gates run this session (owner)
-
-pgbench smoke PASS (via the e4ffec5e5 pre-commit hook). No task gates —
-the M0122-0015 stamps were stale-but-honest; next task's commits re-stamp
-normally.
+`In-flight:` none — all gates consumed, commit pushed pending (see git
+status; push is the last step of this loop).
