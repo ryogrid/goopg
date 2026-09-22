@@ -1793,6 +1793,17 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		return nil, fmt.Errorf("goopg: pg_authid reload: %w", err)
 	}
 
+	// pg_database.datacl stores role OIDs while the virtual pg_database reader
+	// consults the name-keyed ACL registry. Reload it only after pg_authid has
+	// restored every role, or grants to a user role would rehydrate as dangling
+	// numeric grantees. M0122-0008a.
+	if err := reloadDatabaseACLsFromHeap(mgr, cat, clog); err != nil {
+		_ = pool.Close()
+		_ = walWriter.Close()
+		_ = mgr.Close()
+		return nil, fmt.Errorf("goopg: pg_database datacl reload: %w", err)
+	}
+
 	// M0119-0004-ACLHEAP (GRANT/REVOKE ROLE membership): replay GRANT/REVOKE
 	// ROLE WAL records into pg_auth_members. Must run AFTER
 	// LoadRolesFromAuthidHeap/replayRoleDDLRecords immediately above: those

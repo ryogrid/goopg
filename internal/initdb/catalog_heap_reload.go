@@ -1492,8 +1492,78 @@ func reloadDatabasesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *
 		// datconnlimit.
 		cat.SetDatabaseConnLimit(db.name, db.connLimit)
 	}
+	return nil
+}
+
+// reloadDatabaseACLsFromHeap restores the in-memory ACL projection for the
+// shared pg_database.datacl column. The database registry must already exist
+// and roles must already be loaded, because aclitem stores role OIDs while the
+// catalog ACL store is keyed by role name. M0122-0008a.
+func reloadDatabaseACLsFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *transam.CLog) error {
+	if cat == nil {
 		return nil
 	}
+	type aclRow struct {
+		oid uint32
+		acl []byte
+		set bool
+	}
+	rel := storage.RelFileNode{DBOid: 0, RelOid: catalog.PgDatabaseRelationOID, Fork: storage.MainFork}
+	cols := catalog.PgDatabaseColumnsPG18()
+	rows, err := scanCatalogHeapRows(mgr, rel, clog, "pg_database datacl",
+		func(ht storage.HeapTuple, tid storage.ItemPointer) (any, bool, error) {
+			natts := int(ht.Header.Infomask2 & storage.HeapNattsMask)
+			d := make(executor.Row, len(cols))
+			if derr := executor.DecodeRowIntoMctxPGTuple(d, cols, ht.Data, ht.Bitmap, natts, nil); derr != nil {
+				return nil, false, derr
+			}
+			v := d[len(d)-1]
+			if v.IsNull() {
+				return aclRow{oid: uint32(d[0].Int)}, false, nil
+			}
+			return aclRow{oid: uint32(d[0].Int), acl: append([]byte(nil), v.BytesValue()...), set: true}, false, nil
+		})
+	if err != nil {
+		return err
+	}
+	privs := map[byte]string{'C': "CREATE", 'T': "TEMPORARY", 'c': "CONNECT"}
+	for _, raw := range rows {
+		r := raw.(aclRow)
+		if !r.set {
+			continue
+		}
+		entries, derr := executor.DecodeACLItemArray(r.acl, cat.RoleNameForOID)
+		if derr != nil {
+			return fmt.Errorf("pg_database datacl for oid %d: %w", r.oid, derr)
+		}
+		cat.DropTableACL(r.oid)
+		if len(entries) == 0 {
+			cat.MaterializeOwnerACL(r.oid, "postgres", []string{"CREATE", "TEMPORARY", "CONNECT"})
+			for _, privilege := range []string{"CREATE", "TEMPORARY", "CONNECT"} {
+				cat.RevokeTablePrivilege(r.oid, "postgres", privilege)
+			}
+			continue
+		}
+		for _, entry := range entries {
+			grantee := entry.Grantee
+			if grantee == "" {
+				grantee = "PUBLIC"
+			}
+			for i := 0; i < len(entry.Privileges); i++ {
+				privilege, ok := privs[entry.Privileges[i]]
+				if !ok {
+					continue
+				}
+				withGrantOption := i+1 < len(entry.Privileges) && entry.Privileges[i+1] == '*'
+				if withGrantOption {
+					i++
+				}
+				cat.GrantTablePrivilegeAs(r.oid, grantee, privilege, withGrantOption, entry.Grantor)
+			}
+		}
+	}
+	return nil
+}
 
 // reloadRolesFromAuthidHeap is B4.5's pg_authid reload — the generic heap-scan
 // replacement for the retired LoadRolesFromAuthidHeap (raw os.ReadFile) +
