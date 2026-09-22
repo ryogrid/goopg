@@ -1,8 +1,8 @@
 # M0145-0019 — nested-loop costing for a derived inner: the hypothesis is REFUTED
 
-Status: **RECON COMPLETE 2026-09-22. The task's working hypothesis is refuted
-by measurement, and the divergence it was looking for is in a different
-place.** No production file touched. The fix is filed as **M0145-0019a**.
+Status: **COMPLETE 2026-09-22. The task's working hypothesis is refuted by
+measurement, and the divergence it was looking for is in a different place.**
+No production file touched. The fix is filed as **M0145-0019a**.
 Kind: recon
 Parent: M0145-0018
 Movement: none

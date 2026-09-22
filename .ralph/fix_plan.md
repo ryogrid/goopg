@@ -14077,6 +14077,31 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
         40-row join). The same per-worker row-identity pin is required.
       - Expected movement once fixed: the `parallelism` category on SF0.25,
         which reads 84-85 in both arms today.
+      - **Mark-propagation repair 2026-09-22 (loop \#1), in progress.**
+        - New `DPTRACE appendrel` verdicts named Q71's first refusal as
+          `unmarked`, rather than a `ConsiderParallel` failure. The cause was
+          `planSubqueryRangeVar` treating a non-nil resolver context as SQL
+          LATERAL. A later comma-separated FROM item receives that context for
+          table-function name resolution even when its `RangeVar.Lateral` is
+          false.
+        - The mark now keys on `!rv.Lateral`. Q71 reaches `verdict=admitted`
+          and files an accepted `baserel.appendrel.partial` path; the paired
+          test keeps a genuine LATERAL union refused. The final Q71 plan does
+          not move because the new candidate loses cost election. Whole-chain
+          flattening remains the open PG-fidelity gap.
+        - **Acceptance gate coverage loss verified 2026-09-22 (loop \#2).**
+          A clean HEAD baseline/candidate run, taken with this staged change
+          stashed then restored, gives the same 23 MATCH plus Q9 BOTH-ERROR at
+          the 600-second cancellation as the changed-tree run. This proves the
+          timeout predates the mark repair but does not satisfy the required
+          PASS stamp, so the production change remains staged and uncommitted.
+        - **Q9 blocker classified 2026-09-22 (loop \#3).** The timeout is the
+          already-closed `q9_costdriven_mhj_cannot_be_cost_forced` no-go, not
+          an appendrel effect: its safeguards retain hash behaviour because an
+          unsafe NLI alternative can create a match-set explosion. No timeout
+          increase or out-of-scope join-order change is permitted here; the
+          staged implementation cannot be committed without a passing
+          acceptance stamp.
     - **LINEAGE NOTE — why this is not a separate task, and an ESCALATION.**
       Filing it as `M0145-0004a` was REFUSED by
       `scripts/ralph-lineage-guard.py`: root M0145-0001's last five
@@ -15804,7 +15829,7 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
   Movement: none — no-go. `problemPairsOuterWithDerived` is untouched and
   `GOOPG_DERIVED_FIREWALL` stays default ON.
 
-- [ ] **M0145-0019 — nested-loop costing for a derived inner** (owner GO
+- [x] **M0145-0019 — nested-loop costing for a derived inner** (owner GO
   2026-09-22; the resolution path for M0145-0018's NO-GO — its option
   (c), with (b) as the interim fallback). 0018's fresh E1 proved the
   blocker is the COST MODEL: with the diagnostic bypass at SF1, Q78
@@ -15830,6 +15855,7 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
     re-derive per run): the relaxation stays `[!]` until that passes.
   Kind: recon
   Parent: M0145-0018
+  Movement: none — the recon refuted its nested-loop-costing hypothesis and filed M0145-0019a.
   - **DONE 2026-09-22 (loop \#79) — the hypothesis is REFUTED, and the
     divergence is somewhere else.** Movement: none.
     Design: `docs/design/0100-0149/m0145-0019-nl-costing-derived-inner.md`.
