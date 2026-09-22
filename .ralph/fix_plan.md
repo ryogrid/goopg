@@ -16071,8 +16071,8 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
       A/B over all 99 queries that 0012 needs is still unrun, and Q74 still
       moved into the collapse class in the earlier A/B.
 
-- [ ] **M0145-0020c — the 2 NEW ea-ratchet findings the grouped-output repair
-  introduced**.
+- [x] **M0145-0020c — the 2 NEW ea-ratchet findings the grouped-output repair
+  introduced** — REFUTED: it introduced neither.
   Kind: recon
   Parent: M0145-0020a
   - `make ea-ratchet` on the committed change: `baseline findings: 54
@@ -16090,6 +16090,55 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
     `relFilteredRowsWalk`, plus `scripts/estimate-parity-gate.sh --json` for
     the per\-node evidence.
   - Ledger row: `.ralph/deferral_ledger.md`, 2026\-09\-22, M0145\-0020a.
+
+  - **CLOSED measured\-no\-gap 2026\-09\-22 \(loop \#2\).**
+    Movement: none — recon, no production change.
+    Design: `docs/design/0100-0149/m0145-0020c-ea-new-findings-attribution.md`.
+    - **The A/B settles it in one environment**, which every earlier ea number
+      lacked. Reverting exactly the committed two production files and re\-running
+      the gate: WITHOUT the change **56 findings including both NEW ids**; WITH it
+      \(= HEAD\) **53**, same two NEW, plus 3 FIXED \(Q62, Q80, Q99\). The change
+      introduced zero findings and removed three.
+    - **The earlier contradictory totals are explained**: M0145\-0020b's
+      clean\-HEAD run ratcheted against the **20260907** baseline \(178 findings\)
+      while `make ea-ratchet`'s default is the **20260915** one \(54\). "61 NEW"
+      and "17 NEW" were never comparable to each other or to the gate. Both ids
+      do appear in 0020b's clean\-HEAD NEW list, which corroborates the A/B.
+    - **Both findings are `pg_est=null` \(UNMATCHED\-IN\-PG\)** — the scorer found
+      no PG node with that relset key, so each says "goopg formed a relset PG's
+      plan does not contain", not "goopg estimates worse than PG".
+      - Q83 `cte:wr_items`: PG **inlines** the CTE \(no `CTE Scan` in
+        `bench/tpcds/plans-pg/Q83.txt`\) and estimates the same branch at
+        `rows=5` against the same actual 171 — PG is wrong in the same
+        direction. Chasing it would tune toward PG's own wrong number.
+      - Q44 `item+ss1`: PG never forms this relset \(it joins `item` last through
+        two `Nested Loop`s\). The 183x is real but priced on a join order PG does
+        not use, so the divergence is join ORDER, not this estimate.
+    - **Residual, filed as M0145-0020d**: both keys post\-date the 2026\-09\-15
+      baseline, so plan churn made the baseline stale; G4 forbids a repin in a
+      code commit and the loop may not repin on its own judgement, so the gate
+      is red with no sanctioned route back to green.
+
+- [ ] **M0145-0020d — the ea-ratchet baseline is stale for two goopg-only
+  relsets, and nothing may repin it** \(owner decision needed\).
+  Kind: recon
+  Parent: M0145-0020c
+  - `make ea-ratchet` is FAIL for every task from now on with the same two NEW
+    ids \(`Q44:item+ss1`, `Q83:cte:sr_items+cte:wr_items`\), neither of which any
+    current task caused: they entered by plan churn after the 2026\-09\-15
+    baseline capture, and M0145\-0020c showed both are UNMATCHED\-IN\-PG keys
+    rather than estimator regressions.
+  - The rule gap: AGENT.md G4 permits `make ea-ratchet-repin` **only** when the
+    corpus or dataset changes, never in a code commit — so a baseline made
+    stale by goopg's own plan churn has no path back to green, and each later
+    task inherits a red gate it did not cause and may not clear.
+  - Needs an owner call on ONE of: \(a\) repin the baseline now as a standalone
+    non\-code commit; \(b\) widen G4 to allow a repin whose diff is only
+    UNMATCHED\-IN\-PG keys, with the evidence attached; \(c\) leave it red and
+    treat "no NEW id beyond this named set" as the pass condition.
+  - Until then, a task may land on the FAIL as long as its own A/B shows it
+    introduced no finding — the discipline M0145\-0020c established.
+  - Ledger row: `.ralph/deferral_ledger.md`, 2026\-09\-22, M0145\-0020c.
 
 - [x] **M0145-0021 — harness: SF1 fire-set gate for diagnostic-flag /
   estimation / cost-model tasks** (owner GO 2026-09-22; progress-doc
