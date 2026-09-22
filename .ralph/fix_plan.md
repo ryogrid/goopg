@@ -2874,6 +2874,39 @@ the whole file's active task between 2026-09-01 and 2026-09-14; **since
       Q12=2/Q13=33; tpcds\-sf025 `PASS=96 MISMATCH=0 CKMISMATCH=0 ERROR=0
       TIMEOUT=0`; acceptance arm 24 MATCH; pgbench smoke.
 - [ ] **M0122-0015 — Test-suite porting: amcheck / verify_heapam / pg_dump**.
+  - **`003_pg_dump_with_server.pl` is now FULLY ported 2026\-09\-22 \(loop
+    \#16\)**, and the second half needed a production fix first: `8deb60881`.
+    Movement: none — a refusal on a relkind neither corpus contains.
+    - **The divergence**: goopg accepted the FDW/server/foreign\-table DDL and
+      modelled it correctly \(`relkind='f'`, a `pg_foreign_table` row,
+      `fdwhandler=0`\), then let a `SELECT` return **zero rows**. PostgreSQL
+      raises SQLSTATE **55000** `foreign-data wrapper "…" has no handler` from
+      `GetFdwRoutineByServerId` \(`foreign.c:403`\). A user asking `pg_dump`
+      for foreign data from an unusable server got an empty dump and exit 0.
+    - Refused at **plan** time, where upstream refuses: `EXPLAIN` fails on PG
+      and now here too. Fail\-open — only a wrapper positively known to have
+      `fdwhandler = 0` can refuse.
+    - **The lookup key was the real trap.** `CREATE SERVER` registers under
+      `NamespaceDBOid(conn db)` while the catalog's `DBOID()` returns the real
+      database OID — measured `DBOID()=5` against a registry key of
+      `DefaultDBOid`, so the first version of the check silently declined on
+      every default\-database server. It converts through `NamespaceDBOid` now,
+      as the registrar does.
+    - Non\-vacuity checked: neutralising the refusal fails
+      `TestPort_PgDump003ForeignDataNoHandler`'s first assertion with
+      "exited 0" — the exact prior behaviour.
+    - **Two more divergences found and ledgered, not fixed**: foreign\-table
+      metadata is NOT durable \(after a restart `pg_foreign_table` empties and
+      `relkind` degrades `'f'` -> `'r'`, so the refusal cannot fire\), and
+      `CREATE FOREIGN TABLE` returns the command tag `CREATE TABLE`.
+    - Corrected this loop: the previous ledger row named
+      `ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION`; the oracle says **55000
+      ERRCODE\_OBJECT\_NOT\_IN\_PREREQUISITE\_STATE**.
+    - Gates: optimizer + executor units; both 003 ports; tpch\-spotcheck
+      Q12=2/Q13=33; tpcds\-sf025 `PASS=96 … TIMEOUT=0`; acceptance arm
+      24 MATCH; **tpcds\-fireset two\-scale gate PASS** \(the new G9
+      requirement — `introduced=none` at both scales\); full
+      `TestPort_RegressSuite` with an unchanged failing set; pgbench smoke.
   - **`003_pg_dump_with_server.pl` first section PORTED 2026\-09\-22 \(loop
     \#15\)** as `TestPort_PgDump003NewlineInDatabaseName`. Movement: none —
     test porting; TAP coverage 46.2% -> 47.3% \(client\-tools\-tap\), total
