@@ -97,6 +97,80 @@ def label(header, fallback):
     return fallback
 
 
+# M0145-0022: join-method election classification.
+#
+# M0145-0012 and M0145-0018 both produced plans whose VALUES were verified
+# byte-identical at SF0.25 while the shape and the clock regressed — Q74 16.6x
+# there, and at SF1 Q78 did not finish at all, so no value comparison existed
+# at that scale. Every value gate is blind to that class. The shape channel
+# above already reports THAT a plan moved; this reports WHICH WAY, because the
+# direction is what distinguishes a neutral re-shape from the C-04a failure.
+#
+# C-04a's signature is an equi-join demoted to a Join Filter on a nested loop
+# priced off an epsilon row estimate, so a move INTO Nested Loop is the suspect
+# direction and is flagged as such. The reverse and the merge/hash exchanges
+# are reported too, without judgement: a plan is free to elect a nested loop
+# for good reasons, and this channel exists to make a human look, not to decide.
+#
+# Report-only by construction — nothing here touches the exit status, which
+# stays `--strict`'s alone. The task's own instruction is to start report-only
+# and promote after one clean corpus cycle.
+JOIN_METHOD_RES = (
+    # Ordered most-specific first: "Parallel Hash Join" must not be counted as
+    # a bare "Hash Join", and "Nested Loop Left Join" is still a nested loop.
+    ("nestloop", re.compile(r"->\s+(?:Parallel\s+)?Nested Loop\b")),
+    ("hash", re.compile(r"->\s+(?:Parallel\s+)?Hash (?:Left |Right |Full |Semi |Anti )?Join\b")),
+    ("merge", re.compile(r"->\s+(?:Parallel\s+)?Merge (?:Left |Right |Full |Semi |Anti )?Join\b")),
+)
+
+
+def join_methods(body):
+    """Count join nodes by method family in one query's plan body."""
+    counts = {name: 0 for name, _ in JOIN_METHOD_RES}
+    for line in body:
+        for name, rx in JOIN_METHOD_RES:
+            if rx.search(line):
+                counts[name] += 1
+                break
+    return counts
+
+
+def join_method_report(old, new, changed):
+    """Print the per-query election deltas and the summary line.
+
+    Only CHANGED queries are examined: an unchanged plan cannot have moved a
+    join method, so counting it would be noise with a cost.
+    """
+    suspects, moves = [], []
+    for qid in changed:
+        o, n = join_methods(old[qid]), join_methods(new[qid])
+        if o == n:
+            continue
+        delta = {k: n[k] - o[k] for k in n if n[k] != o[k]}
+        rendered = " ".join(
+            "%s%+d" % (k, v) for k, v in sorted(delta.items())
+        )
+        moves.append("Q%d %s" % (qid, rendered))
+        if delta.get("nestloop", 0) > 0:
+            suspects.append(qid)
+    for line in moves:
+        print("# join-method: " + line)
+    print(
+        "=== JOIN-METHOD-ELECTION: moved=%d into-nestloop=%d%s ==="
+        % (
+            len(moves),
+            len(suspects),
+            (" suspects=" + " ".join("Q%d" % q for q in suspects)) if suspects else "",
+        )
+    )
+    if suspects:
+        print(
+            "# a move INTO Nested Loop is the C-04a direction (an equi-join "
+            "demoted to a Join Filter on an epsilon row estimate) — look before "
+            "accepting. Report-only: this line never changes the exit status."
+        )
+
+
 def main():
     ap = argparse.ArgumentParser(add_help=True)
     ap.add_argument("old")
@@ -134,6 +208,8 @@ def main():
     )
     if not changed and not added and not removed:
         print("# plan shapes identical (noise floor is zero — see header)")
+    if changed:
+        join_method_report(old, new, changed)
 
     if args.verbose:
         for qid in changed:

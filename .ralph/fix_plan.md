@@ -15957,7 +15957,7 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
   Kind: impl
   Parent: none
 
-- [ ] **M0145-0022 — harness: plan-shape election + wall-clock
+- [x] **M0145-0022 — harness: plan-shape election + wall-clock
   regression channel on the SF0.25 sweep** (owner GO 2026-09-22;
   proposal 5.5). M0145-0012/0018 both produced plans whose values were
   verified byte-identical AT SF0.25 while shape and clock regress
@@ -15970,6 +15970,44 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
   after one clean corpus cycle.
   Kind: impl
   Parent: none
+  - **LANDED report-only 2026-09-22 (loop \#89).** Movement: none — a
+    harness channel; it reports, it does not plan.
+    Design: `docs/design/0100-0149/m0145-0022-join-method-election-channel.md`.
+    - **Half the task already existed, and checking first is the finding**:
+      the wall-clock threshold report is already in
+      `scripts/tpcds-sweep-diff.py` — `STATUS-DELTA … runtime-moves=N …
+      total-delta=±X%` with a >=2.0x per-query threshold, a 5 s floor and
+      TIMEOUT readings excluded. Only the election classification was
+      missing.
+    - `scripts/tpcds-plan-diff.py` now counts join nodes per family
+      (nestloop / hash / merge) over the queries the shape diff already
+      found changed, prints only the DELTA, and names a move **into**
+      Nested Loop as a suspect — C-04a's signature is an equi-join demoted
+      to a `Join Filter` on a nested loop priced off an epsilon estimate.
+      Moves out of it and merge/hash exchanges are reported without
+      judgement.
+    - **Report-only by construction**: nothing touches the exit status,
+      which stays `--strict`'s alone.
+    - **It retro-validates M0145-0019a.** Over the capture pair bracketing
+      the LIMIT-fraction ordering gate: `moved=4 into-nestloop=0`, with
+      Q6/Q8/Q43/Q44 each `hash+N nestloop-N` — exactly the direction that
+      fix should produce, confirmed independently of the reasoning behind
+      it. Against an 11-day-old baseline the same channel reports
+      `moved=43 into-nestloop=25`, so it is not simply reporting zero.
+    - Tests: `scripts/tpcds-plan-diff-test.py` (7 cases) covers the
+      node-name matching — `Parallel Hash Join` must count once as hash and
+      not also as the `Parallel Hash` build node, `Nested Loop Left Join` is
+      still a nested loop — both directions of the suspect call, and that a
+      cost-only change is not listed. Non-vacuity checked.
+    - **A trap the first draft fell into, recorded because this repo has hit
+      it before**: the fixtures used `=== Q1` where captures write
+      `===== Q1 =====`, so the tool parsed ZERO blocks and three of seven
+      tests passed VACUOUSLY. Same off-by-two as the awk range in the
+      set-op common-type work. The fixture writer now carries a comment.
+    - Gate: the real SF0.25 sweep runs clean with the channel in
+      (`PASS=96 MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0`,
+      `PLAN-SHAPE same=99 changed=0`), and the channel is correctly silent
+      when nothing moved.
 
 - [ ] **M0145-0023 — harness: flow-convergence instrument (secondary
   metric, NOT a movement instrument)** (owner GO 2026-09-22; proposal
