@@ -76,13 +76,28 @@ func noteNLIBuilt(route string, jt JoinType, probe string) {
 // route fires is the same kind of question the NLI census answered: a family
 // with no live route retires at the cutover, one that still plans corpus
 // statements does not.
+//
+// M0145-0005 slice 7 retired the route on the JOINTREE arm — the planner's
+// S5a gate is `!jointree`-guarded, so `pinned-spine` can only fire on the
+// legacy pipeline now. A jointree statement whose pull-up declined every
+// sublink conjunct takes the single-pass Filter arm plus the post-hoc unnest
+// instead, and reports `jointree-posthoc`; the family itself stays until the
+// M0145-0008 cutover deletes the legacy pipeline wholesale.
 const (
-	spineRouteLegacy   = "pinned-spine"    // runJoinSearchBelowPinned + post-search splice
-	spineRouteJointree = "jointree-pullup" // sublinks pulled into the IR before the search
+	spineRouteLegacy   = "pinned-spine"     // runJoinSearchBelowPinned + post-search splice (legacy arm only)
+	spineRouteJointree = "jointree-pullup"  // sublinks pulled into the IR before the search
+	spineRoutePosthoc  = "jointree-posthoc" // pull-up declined; post-search unnest pins the spine
 )
+
+// sublinkRouteCounts is noteSublinkRoute's test-visible twin: bumped on
+// every call, env gate or not, so a unit test can pin which route planned a
+// statement without scraping stderr. This package's tests do not run
+// parallel, so a plain map suffices.
+var sublinkRouteCounts = map[string]int{}
 
 // noteSublinkRoute records which route planned one statement's WHERE sublinks.
 func noteSublinkRoute(route string) {
+	sublinkRouteCounts[route]++
 	if !nliCensusEnabled {
 		return
 	}

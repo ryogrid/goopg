@@ -75,6 +75,15 @@ func whereEligibleForPreDPUnnest(pred Expr) bool {
 // Degenerate case (unnest declined → root IS Filter{pred}(origChain)):
 // the DP block runs on exactly the input it would have received at the
 // legacy position — byte-identical plans for sublink-free statements.
+//
+// M0145-0005 slice 7: this is LEGACY-pipeline machinery only. The
+// planner's S5a gate is `!jointree`-guarded, so the jointree arm never
+// reaches Phase A/B — a declined pull-up takes the single-pass search
+// plus the post-hoc unnest, which pins the same spine above the searched
+// tree without a second search pass or splice-time re-resolution. The
+// helper and its splice family (`spliceSearchedSpine`, `layoutPosMap`,
+// `remapByPosMap`, `remapSublinkOuterRefs`, `remapOuterRefsInSubplan`)
+// stay until the M0145-0008 cutover deletes the legacy pipeline.
 func runJoinSearchBelowPinned(root Node, origChain Node, ctx *resolveContext, cat catalog.Catalog) Node {
 	newRoot := root
 	setResult := func(n Node) { newRoot = n }

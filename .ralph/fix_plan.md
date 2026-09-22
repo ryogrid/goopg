@@ -15329,9 +15329,34 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
         `leaf-count`.
       - Gates: optimizer suite PASS; units PASS; tpch-spotcheck
         Q12=2/Q13=33; SF0.25 sweep below.
-      - Remaining for the task: Phase A/B +
-        `runJoinSearchBelowPinned` + pinned-spine + splice-time
-        re-resolution retirement; slice-5 ledgered families
+    - **Slice 7 (landed, loop 2026-09-23): Phase A/B retirement on the
+      jointree arm** — `runJoinSearchBelowPinned`, the pinned spine and
+      the splice/re-resolution family are unreachable on the jointree
+      pipeline. Design doc §"Slice 7".
+      - The route was still load-bearing: knob-arm census had
+        `pinned-spine=285` vs `jointree-pullup=23` — it caught every
+        statement whose pull-up declined ALL conjuncts. A probe build
+        gating S5a with `!jointree` measured the retirement first:
+        SF0.25 knob-arm EXPLAIN capture vs the pre-gate baseline is
+        `same=99 changed=0` — Phase A searched the same problem the
+        Filter arm does and the post-hoc unnest pins the same spine
+        Phase B's splice produced.
+      - Change: `unnestPreDPEnabled() && !jointree && ...` on the S5a
+        gate (planner.go) — declined pull-ups take the Filter arm's
+        single-pass search, `unnestSubqueriesInPlan` pins the spine
+        afterwards (`preDPUnnested` stays false on this arm).
+      - New census route `jointree-posthoc` (nlicensus.go) for the
+        redirected population; `sublinkRouteCounts` is the test-visible
+        twin of the stderr census.
+      - Machinery stays for the legacy arm until M0145-0008 — doc
+        comments on `runJoinSearchBelowPinned`, `tryJoinSearch`,
+        `splitOuterSpine`, census consts updated to say so.
+      - Pin: `TestJointreeArmBypassesThePinnedSpineRoute` — declined
+        uncorrelated-EXISTS over a 2-table FROM: `pinned-spine=0` +
+        `jointree-posthoc=1` on the knob arm, `pinned-spine=1` on
+        legacy; `TestJointreePullupDeclineParity` still passes all
+        classes.
+      - Remaining for the task: slice-5 ledgered families
         (`outer-over-derived` post-B-06, `lateral`).
 - [x] **M0145-0006 — upper-rel pathlists** (extend the lattice through
   `create_grouping_paths`/`create_ordered_paths` analogues so ordering and

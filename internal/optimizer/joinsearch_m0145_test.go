@@ -265,3 +265,47 @@ func TestJointreeSearchesADemotedAntiLink(t *testing.T) {
 		t.Fatalf("ANTI output width %d, want %d (left only)", got, want)
 	}
 }
+
+// TestJointreeArmBypassesThePinnedSpineRoute is slice 7's pin: a WHERE
+// sublink the pull-up declines (uncorrelated EXISTS — upstream's
+// contain_vars_of_level fails too, so the decline is parity, not a gap)
+// is eligible for the legacy S5a pre-DP route but must never reach
+// runJoinSearchBelowPinned on the jointree arm. The single-pass search
+// plans the FROM scope and the post-hoc unnest pins the spine above the
+// searched tree — no Phase A below a spine, no Phase B above it, no
+// splice-time re-resolution. The same statement on the legacy arm still
+// takes the route: the retirement is arm-scoped until M0145-0008.
+func TestJointreeArmBypassesThePinnedSpineRoute(t *testing.T) {
+	// Multi-relation FROM (the single-relation arm never had the S5a
+	// route) + an uncorrelated EXISTS: pull-up declines it
+	// (contain_vars_of_level fails, as upstream's does) while
+	// whereEligibleForPreDPUnnest accepts it — exactly the population
+	// S5a used to plan.
+	const sql = `SELECT b1_k FROM big1, big2 WHERE b1_j = b2_j ` +
+		`AND EXISTS (SELECT 1 FROM inner_e)`
+
+	delete(sublinkRouteCounts, spineRouteLegacy)
+	delete(sublinkRouteCounts, spineRoutePosthoc)
+	delete(sublinkRouteCounts, spineRouteJointree)
+
+	node := planOnPipeline(t, sql, preDPCatalog(t), true)
+	if n := sublinkRouteCounts[spineRouteLegacy]; n != 0 {
+		t.Fatalf("jointree arm entered runJoinSearchBelowPinned %d times — "+
+			"slice 7 retired the pinned-spine route on this arm", n)
+	}
+	if n := sublinkRouteCounts[spineRoutePosthoc]; n != 1 {
+		t.Fatalf("jointree-posthoc census fired %d times, want 1 — "+
+			"a declined pull-up must route to the post-hoc unnest", n)
+	}
+	if node == nil {
+		t.Fatal("jointree arm returned a nil plan for a declined pull-up")
+	}
+
+	// The legacy arm keeps the route until the M0145-0008 cutover — the
+	// gate must be arm-scoped, not a deletion of the machinery.
+	planOnPipeline(t, sql, preDPCatalog(t), false)
+	if n := sublinkRouteCounts[spineRouteLegacy]; n != 1 {
+		t.Fatalf("legacy arm routed %d statements through the pinned-spine "+
+			"route, want 1 — the slice-7 gate leaked onto the legacy arm", n)
+	}
+}

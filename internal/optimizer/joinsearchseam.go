@@ -180,7 +180,8 @@ import (
 )
 
 // tryJoinSearch is the pipeline's join-order entry point: `planSelect`
-// (planner.go) and `runJoinSearchBelowPinned` (predp.go) call it with the
+// (planner.go) and — on the legacy arm only, since M0145-0005 slice 7 —
+// `runJoinSearchBelowPinned` (predp.go) call it with the
 // pre-search CROSS/INNER chain and the `WHERE` predicate above it, and get back
 // the tree to plan plus whatever predicate is left.
 //
@@ -1364,9 +1365,11 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 // upstream avoids only because its Vars are varno-addressed. The flip is a
 // representation change; what the seam actually needed was the delay rule.
 //
-// Semi/anti spines are declined too, and are not a gap: `runJoinSearchBelowPinned`
-// (predp.go) already descends those before the seam is called, so the `node` the
-// seam receives is the subtree below them.
+// Semi/anti spines are declined too, and are not a gap on the legacy arm:
+// `runJoinSearchBelowPinned` (predp.go) already descends those before the seam
+// is called, so the `node` the seam receives is the subtree below them. On the
+// jointree arm the whole function is bypassed (M0145-0005 slice 1) and
+// semi/anti links arrive as SpecialJoinInfo entries instead.
 func splitOuterSpine(node Node, jl joinlist) (chain Node, spine []*Join, prefix joinlist, ok bool) {
 	prefix, types := jl.innerPrefixBelowOuterSpine()
 	chain = node

@@ -1896,10 +1896,17 @@ func planSelectImpl(s *parser.SelectStmt, cat catalog.Catalog, plannerSet Planne
 					if ctx.jtPullup != nil {
 						// M0145-0007 slice 3 census (nlicensus.go).
 						noteSublinkRoute(spineRouteJointree)
+					} else if countSublinksInExpr(f.Predicate) > 0 {
+						// M0145-0005 slice 7: pull-up declined every
+						// sublink-bearing conjunct, so the statement falls
+						// through to the single-pass search and the
+						// post-hoc unnest builds the pinned spine above
+						// it — the S5a arm below is legacy-only now.
+						noteSublinkRoute(spineRoutePosthoc)
 					}
 				}
 			}
-			if unnestPreDPEnabled() && ctx.jtPullup == nil && whereQual != nil && whereEligibleForPreDPUnnest(pred) {
+			if unnestPreDPEnabled() && !jointree && ctx.jtPullup == nil && whereQual != nil && whereEligibleForPreDPUnnest(pred) {
 				// S5a (D3.1): pull up sublinks BEFORE join-order
 				// search — matching upstream's pull_up_sublinks-
 				// before-join-planning order — then run the join
@@ -1907,6 +1914,14 @@ func planSelectImpl(s *parser.SelectStmt, cat catalog.Catalog, plannerSet Planne
 				// spine. Engaged only for EXISTS/IN-family WHERE
 				// sublinks; see predp.go for the scope rationale
 				// and the post-search spine re-resolution.
+				//
+				// M0145-0005 slice 7: `!jointree` retires this arm on
+				// the jointree pipeline — one DP problem per jointree
+				// scope means no "search below a pinned spine, then
+				// again above it". A declined pull-up takes the Filter
+				// arm instead and `unnestSubqueriesInPlan` pins the
+				// spine AFTER the search (sf025 corpus: 99/99 plan
+				// shapes identical to the retired route).
 				f := node.(*Filter)
 				origChain := f.Child
 				// M0145-0007 slice 3 census (nlicensus.go): this is the

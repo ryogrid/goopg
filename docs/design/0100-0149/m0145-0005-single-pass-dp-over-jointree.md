@@ -4,10 +4,10 @@ Status: slices 1 (knob-arm `splitOuterSpine` retired), 2 (pulled
 semi/anti as real leaf items), 3 (IR-direct leaf materialisation —
 `jtScopeTable`/`extractScopeLeaves`), 4 (one-relation + degenerate
 scopes through the same entry), 5-partial (searched-subtree opacity
-for the residual pushdown family) and 6 (chain-extracted semi/anti as
-deferred real leaf items — slice 2's chain half) landed; the rest of
-slice 5 plus the Phase A/B / pinned-spine retirement are ledgered
-below. Task:
+for the residual pushdown family), 6 (chain-extracted semi/anti as
+deferred real leaf items — slice 2's chain half) and 7 (Phase A/B /
+pinned-spine retirement on the jointree arm) landed; the rest of
+slice 5 is ledgered below. Task:
 `.ralph/fix_plan.md` M0145-0005. Parent:
 M0145-0001 (IR contract + retirement matrix), M0145-0003 (semi/anti leaf
 entries), M0145-0004 (appendrel leaves). Kind: impl.
@@ -548,12 +548,74 @@ ANTI subtree on the jointree arm where the shape previously declined at
 `leaf-count`. Gates: optimizer suite, units, tpch-spotcheck
 (Q12=2/Q13=33), TPC-DS SF0.25 sweep.
 
+## Slice 7 — Phase A/B retirement on the jointree arm (landed)
+
+The last two-pass structure was the WHERE-sublink route: S5a unnested
+EXISTS/IN conjuncts before the DP, `runJoinSearchBelowPinned` (predp.go)
+searched the subtree below the pinned semi/anti spine (Phase A),
+optionally re-searched at the spine top (Phase B), then
+`spliceSearchedSpine` + `layoutPosMap`/`remapByPosMap`/
+`reresolveJoinByName`/`remapSublinkOuterRefs` re-resolved the spine
+against whatever layout the second search produced. On the jointree arm
+that is the "search once below a pinned spine, then again above it"
+architecture the milestone exists to remove — but the route was still
+load-bearing: the knob-arm census measured `pinned-spine=285` against
+`jointree-pullup=23`, because it caught every statement whose pull-up
+declined ALL conjuncts (`jtPullup == nil`).
+
+The retirement is therefore a measurement, not a hope: a probe build
+gated S5a with `!jointree` and the SF0.25 knob-arm EXPLAIN capture came
+back **99/99 plan shapes identical** to the pre-gate capture — for every
+corpus statement the route ever planned, Phase A searched the same
+problem the Filter arm's `tryJoinSearch` does, and the post-hoc
+`unnestSubqueriesInPlan` pins the same spine above the searched tree
+that Phase B's splice produced. The single-pass claim is what makes the
+shapes coincide: with slices 1–6 the jointree arm's search consumes the
+whole scope in one DP, so there is nothing left for a second pass to
+re-decide.
+
+What landed:
+
+- **The S5a gate is `!jointree`-guarded** (planner.go): on the jointree
+  arm a declined pull-up falls through to the Filter arm's single-pass
+  search, and `unnestSubqueriesInPlan` pins the semi/anti spine above
+  the result afterwards — the same fall-back shape PG's own
+  `SubPlan`-retained sublinks produce, built after the search instead
+  of spliced around it. `preDPUnnested` stays false on this arm, so the
+  post-hoc pass always runs.
+- **A third census route**: `jointree-posthoc` (nlicensus.go) counts
+  jointree-arm statements whose WHERE still carried sublinks when the
+  pull-up produced nothing — the population this slice redirects.
+  `noteSublinkRoute` also bumps `sublinkRouteCounts` unconditionally so
+  a unit test pins the routing without scraping stderr.
+- **The machinery itself stays** — `runJoinSearchBelowPinned`, the
+  pinned spine, and the whole splice/re-resolution family are still the
+  legacy arm's answer until the M0145-0008 cutover deletes the pipeline
+  wholesale. Doc comments on `runJoinSearchBelowPinned`,
+  `tryJoinSearch`, `splitOuterSpine` and the census constants now say
+  so.
+
+A pinned FULL top stays a decline on the jointree arm
+(`TestJointreeDeclinesAFullSpine`, slice 1) — untouched: nothing in this
+slice widens what the search admits.
+
+### Evidence
+
+White-box: `TestJointreeArmBypassesThePinnedSpineRoute` plans a
+multi-relation statement with a declined pull-up (uncorrelated EXISTS —
+upstream's `contain_vars_of_level` declines it too) on both arms and
+pins the counters: `pinned-spine=0`/`jointree-posthoc=1` on the knob
+arm, `pinned-spine=1` on the legacy arm. `TestJointreePullupDeclineParity`
+still holds shape parity across every decline class. Probe capture:
+`plansknob-20260923-064120.txt` vs `plans-20260923-065324.txt`,
+`tpcds-plan-diff.py` reports `same=99 changed=0`. Gates: optimizer
+suite, units, tpch-spotcheck, TPC-DS SF0.25 sweep.
+
 ## Remaining slices (ledgered)
 
 | slice | scope | retires |
 |---|---|---|
 | 5 (partial) | decline families without corpus witness or with hard blockers | `outer-on-qual`, `inner-on-qual-*` (retired — zero corpus fires); `outer-over-derived` (post-B-06), `lateral` (needs parameterized-path legality) remain ledgered |
-| 7 | Phase A/B split: `runJoinSearchBelowPinned`, the pinned spine, splice-time re-resolution | the second search pass; a pinned FULL top stays a decline on the jointree arm |
 
 The executor-capability refusals (FULL hash, partial shapes the executor
 cannot run) stay at path generation until the D3 executor substrate lands —
