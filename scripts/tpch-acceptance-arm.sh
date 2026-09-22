@@ -21,9 +21,12 @@
 #   tmp/tpch-acceptance-runner -diff /tmp/arm-off.txt /tmp/arm-on.txt
 #
 # Environment:
-#   PGSHAPED   GOOPG_PGSHAPED_DP for this arm (default 0). Set EXPLICITLY on
-#              both arms — an unset flag means whatever today's default is, and
-#              the arm stops being well-defined the day the default flips
+#   PGSHAPED   GOOPG_PGSHAPED_DP for this arm (default 1 — the shipped
+#              planner configuration; owner call 2026-09-22 after the
+#              M0145-0020a finding that PGSHAPED=0 measured the legacy DP
+#              search, not what ships: Q9 >600 s vs 2.8 s). Set EXPLICITLY on
+#              both arms — an unset flag means whatever today's default is,
+#              and the arm stops being well-defined the day the default flips
 #              (the M0125-0031 lesson, transcribed).
 #              (COLLAPSE was GOOPG_PGSHAPED_COLLAPSE; take3 C-06 retired the
 #              flag and explicit-JOIN flattening is unconditional, so the
@@ -134,7 +137,7 @@ export GOMEMLIMIT="${GOMEMLIMIT:-12GiB}" GOGC="${GOGC:-off}"
 export GOOPG_ANALYZE_SEED="${GOOPG_ANALYZE_SEED:-20260905}"
 export GOOPG_MEM_HIGH="${GOOPG_MEM_HIGH:-20G}" GOOPG_MEM_MAX="${GOOPG_MEM_MAX:-24G}"
 export GOOPG_MEM_SWAP_MAX="${GOOPG_MEM_SWAP_MAX:-0}"
-export GOOPG_PGSHAPED_DP="${PGSHAPED:-0}"
+export GOOPG_PGSHAPED_DP="${PGSHAPED:-1}"
 
 # --- pre-flight ------------------------------------------------------------
 # A foreign server on this arm's PRIVATE port would be measured instead of

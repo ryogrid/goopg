@@ -151,9 +151,11 @@ if [[ "${CORPUS}" == "tpch" ]]; then
     if [[ "${fireset_requested}" == 1 ]]; then
         mkdir -p "$(dirname "${FIRESET_STATUS_OUT}")" || exit 2
         arm_out="${OUTDIR}/${LABEL}-fireset-arm.txt"
-        # PGSHAPED defaults to 1 here, NOT to the arm script's own 0: that
-        # default is not the planner configuration goopg ships, and measuring
-        # a non-shipped planner is how TPC-H Q9 produced a false red gate for
+        # PGSHAPED is pinned to 1 explicitly even though the arm script now
+        # defaults to 1 (owner call 2026-09-22): pinning here keeps the fire
+        # set comparable against captures recorded before that default flip,
+        # and guards against a future arm-script default change. Measuring a
+        # non-shipped planner is how TPC-H Q9 produced a false red gate for
         # three loops (m0145-0020a-grouped-output-cardinality.md).
         #
         # GATE_STAMP_DIR is redirected so this subset run cannot overwrite the

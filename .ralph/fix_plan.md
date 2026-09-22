@@ -16135,6 +16135,9 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
       recorded against M0145\-0004 in the ledger \(2026\-09\-22\) — any loop
       that hits `1 BOTH-ERROR, 23 MATCH` should check the arm's knob state
       before spending a loop proving the gate red at clean HEAD.
+      **Owner call 2026\-09\-22: the arm's default is now `PGSHAPED=1`**
+      \(the shipped configuration\); the explicit\-pin guidance below stands
+      for A/B comparability.
     - **The gates were run on a tree carrying ONLY this change.** ~1,200 lines
       of unrelated WIP were parked in a `git stash` first, so all three stamps
       share one `code_tree` and the commit is what was measured. Before that,
