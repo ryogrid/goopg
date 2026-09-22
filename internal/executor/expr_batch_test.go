@@ -2,10 +2,11 @@ package executor
 
 import (
 	"math/rand"
+	"slices"
 	"testing"
 
-	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/optimizer"
+	"github.com/goopg/goopg/internal/parser"
 )
 
 // TestEvalBinaryBatchEquivalencePerRowEq pins that
@@ -115,6 +116,232 @@ func TestEvalBinaryBatchLengthMismatch(t *testing.T) {
 	out := make([]Datum, 1)
 	if err := evalBinaryBatch(parser.OpEq, left, right, out); err == nil {
 		t.Error("expected length-mismatch error, got nil")
+	}
+}
+
+// TestM0122VectorBatchRetainsReusedSlotBeforeNext pins the ownership boundary
+// a future scan-resident batch path must take. Concrete Slot is deliberately
+// reused by opNext-style producers: keeping the Slot itself over another
+// producer advance aliases both its Cells slice and its row identity.
+//
+// The batch first snapshots each tuple with Materialize, then extracts the
+// predicate column and calls the existing batch kernel. If a future path drops
+// that snapshot, all three operands become the final producer value and this
+// equivalence check fails.
+func TestM0122VectorBatchRetainsReusedSlotBeforeNext(t *testing.T) {
+	producer := &Slot{Cells: make([]Datum, 1), HasRow: true}
+	batch := make([]*MaterializedSlot, 0, 3)
+	for _, value := range []int64{2, 5, 8} {
+		producer.Cells[0] = NewIntDatum(value)
+		batch = append(batch, producer.Materialize())
+	}
+
+	left := make([]Datum, len(batch))
+	right := make([]Datum, len(batch))
+	out := make([]Datum, len(batch))
+	for i, slot := range batch {
+		left[i] = slot.Get(0)
+		right[i] = NewIntDatum(5)
+	}
+	if err := evalBinaryBatch(parser.OpGt, left, right, out); err != nil {
+		t.Fatalf("evalBinaryBatch: %v", err)
+	}
+
+	wantValues := []int64{2, 5, 8}
+	wantKeep := []bool{false, false, true}
+	for i := range batch {
+		if got := batch[i].Get(0).Int; got != wantValues[i] {
+			t.Fatalf("snapshot[%d] = %d, want %d; batch retained reused producer slot", i, got, wantValues[i])
+		}
+		if out[i].Kind != KindBool || out[i].BoolValue() != wantKeep[i] {
+			t.Errorf("predicate[%d] = %v, want %v", i, out[i], wantKeep[i])
+		}
+	}
+}
+
+// reusedBatchInput models an op-node producer: it returns one Slot wrapper
+// and overwrites its cells on each Next call.
+type reusedBatchInput struct {
+	values []int64
+	pos    int
+	slot   Slot
+}
+
+func (o *reusedBatchInput) Open(*Context) error      { o.pos = 0; return nil }
+func (o *reusedBatchInput) Close() error             { return nil }
+func (o *reusedBatchInput) Schema() optimizer.Schema { return nil }
+func (o *reusedBatchInput) Next() (TupleSlot, error) {
+	if o.pos == len(o.values) {
+		return nil, EOF
+	}
+	if cap(o.slot.Cells) == 0 {
+		o.slot.Cells = make([]Datum, 1)
+	}
+	o.slot.Cells = o.slot.Cells[:1]
+	o.slot.Cells[0] = NewIntDatum(o.values[o.pos])
+	o.slot.HasRow = true
+	o.pos++
+	return &o.slot, nil
+}
+
+// TestM0122FilterBatchSnapshotsReusedChild proves the first production batch
+// caller both reaches evalBinaryBatch and snapshots a wrapper-reusing child.
+func TestM0122FilterBatchSnapshotsReusedChild(t *testing.T) {
+	child := &reusedBatchInput{values: []int64{1, 7, 3, 9}}
+	pred := &optimizer.BinaryOp{
+		Op:    parser.OpGt,
+		Left:  &optimizer.ColumnRef{Name: "v", Index: 0},
+		Right: &optimizer.IntegerConst{Value: 5},
+	}
+	o := &filterOp{child: child, pred: pred}
+	removed := int64(0)
+	o.setFilterRemoveCounter(&removed)
+	if err := o.Open(&Context{}); err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer o.Close()
+	if !o.batchEnabled {
+		t.Fatal("simple comparison did not enable the batch path")
+	}
+	var got []int64
+	for {
+		slot, err := o.Next()
+		if err == EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("Next: %v", err)
+		}
+		got = append(got, slot.Get(0).Int)
+	}
+	if want := []int64{7, 9}; !slices.Equal(got, want) {
+		t.Fatalf("survivors = %v, want %v", got, want)
+	}
+	if removed != 2 {
+		t.Errorf("Rows Removed by Filter = %d, want 2", removed)
+	}
+}
+
+// TestM0122FilterBatchReusesDatumBuffers forces a second refill and proves
+// that operand and result vectors are retained. Rows themselves must not be
+// retained this way: those are snapshots of a child-owned slot and have a
+// distinct ownership contract.
+func TestM0122FilterBatchReusesDatumBuffers(t *testing.T) {
+	values := make([]int64, filterBatchSize+1)
+	for i := range values {
+		values[i] = int64(i)
+	}
+	o := &filterOp{
+		child: &reusedBatchInput{values: values},
+		pred: &optimizer.BinaryOp{
+			Op:    parser.OpGe,
+			Left:  &optimizer.ColumnRef{Name: "v", Index: 0},
+			Right: &optimizer.IntegerConst{Value: 0},
+		},
+	}
+	if err := o.Open(&Context{}); err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer o.Close()
+	if _, err := o.Next(); err != nil {
+		t.Fatalf("first Next: %v", err)
+	}
+	left, right, result := &o.batchLeft[0], &o.batchRight[0], &o.batchResults[0]
+	for i := 1; i < filterBatchSize; i++ {
+		if _, err := o.Next(); err != nil {
+			t.Fatalf("Next[%d]: %v", i, err)
+		}
+	}
+	if _, err := o.Next(); err != nil {
+		t.Fatalf("second batch Next: %v", err)
+	}
+	if &o.batchLeft[0] != left || &o.batchRight[0] != right || &o.batchResults[0] != result {
+		t.Fatal("second batch allocated replacement datum buffers")
+	}
+}
+
+// TestM0122SimpleBatchComparisonsRespectScanPrefixBounds pins the hand-off
+// contract for a future scan-resident batch caller. Batch eligibility only
+// describes expression evaluation; PlanScanQual remains the authority for
+// whether the scan has deformed enough of a row to use that evaluator early.
+func TestM0122SimpleBatchComparisonsRespectScanPrefixBounds(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		pred  optimizer.Expr
+		ncols int
+		early bool
+		max   int
+	}{
+		{
+			name:  "prefix column and constant",
+			pred:  &optimizer.BinaryOp{Op: parser.OpGt, Left: &optimizer.ColumnRef{Index: 0}, Right: &optimizer.IntegerConst{Value: 5}},
+			ncols: 2,
+			early: true,
+			max:   1,
+		},
+		{
+			name:  "two prefix columns",
+			pred:  &optimizer.BinaryOp{Op: parser.OpEq, Left: &optimizer.ColumnRef{Index: 0}, Right: &optimizer.ColumnRef{Index: 1}},
+			ncols: 3,
+			early: true,
+			max:   2,
+		},
+		{
+			name:  "whole row remains late",
+			pred:  &optimizer.BinaryOp{Op: parser.OpLe, Left: &optimizer.ColumnRef{Index: 1}, Right: &optimizer.IntegerConst{Value: 9}},
+			ncols: 2,
+			early: false,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if !batchFilterEligible(tc.pred) {
+				t.Fatal("simple comparison did not admit the batch evaluator")
+			}
+			got := optimizer.PlanScanQual(tc.pred, tc.ncols)
+			if got.Early != tc.early || got.MaxCols != tc.max {
+				t.Fatalf("PlanScanQual = %+v, want Early=%v MaxCols=%d", got, tc.early, tc.max)
+			}
+		})
+	}
+}
+
+// TestM0122BatchFilterRequiresRowOperand prevents constant-only filters from
+// entering the vector path. They have no row-dependent work to amortize, while
+// that path must still snapshot every child slot to preserve ownership.
+func TestM0122BatchFilterRequiresRowOperand(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		pred optimizer.Expr
+		want bool
+	}{
+		{
+			name: "integer constants",
+			pred: &optimizer.BinaryOp{Op: parser.OpEq,
+				Left: &optimizer.IntegerConst{Value: 1}, Right: &optimizer.IntegerConst{Value: 1}},
+		},
+		{
+			name: "null and constant",
+			pred: &optimizer.BinaryOp{Op: parser.OpEq,
+				Left: &optimizer.NullConst{}, Right: &optimizer.StringConst{Value: "x"}},
+		},
+		{
+			name: "column and constant",
+			pred: &optimizer.BinaryOp{Op: parser.OpEq,
+				Left: &optimizer.ColumnRef{Index: 0}, Right: &optimizer.IntegerConst{Value: 1}},
+			want: true,
+		},
+		{
+			name: "two columns",
+			pred: &optimizer.BinaryOp{Op: parser.OpEq,
+				Left: &optimizer.ColumnRef{Index: 0}, Right: &optimizer.ColumnRef{Index: 1}},
+			want: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := batchFilterEligible(tc.pred); got != tc.want {
+				t.Fatalf("batchFilterEligible(%T) = %v, want %v", tc.pred, got, tc.want)
+			}
+		})
 	}
 }
 
