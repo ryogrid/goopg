@@ -35,6 +35,20 @@
 #              arm has its own NO_BUILD).
 #   PORT       private-lane port for the TPC-DS lane (default: first free
 #              port in 5590-5599). Never a 6543x port.
+#   FIRESET_QUERIES  optional comma-separated TPC-DS query ids to execute on
+#              the private goopg clone after its EXPLAIN capture. Requires
+#              FIRESET_STATUS_OUT; writes one `Q<n> PASS|TIMEOUT|ERROR`
+#              record per id and keeps each raw result beside the captures.
+#              A timeout restarts only this clone before the next query.
+#   FIRESET_STATUS_OUT  destination for FIRESET_QUERIES status records. The
+#              caller owns truncation so several isolated arms can append.
+#   FIRESET_TIMEOUT  per-query execution timeout in seconds (default 600).
+#   FIRESET_SKIP_CAPTURE  1 = execute FIRESET_QUERIES on a fresh clone without
+#              re-capturing plans. Valid only with FIRESET_QUERIES: the outer
+#              fire-set gate has already captured and derived those ids.
+#   CLONE_LABEL  optional short private-clone directory tag. This is separate
+#              from the human-readable capture label so a long gate label
+#              cannot exceed the Unix control-socket path limit.
 #
 # Arms:
 #   tpch       delegates server bring-up to tpch-estimate-audit-arm.sh
@@ -124,7 +138,8 @@ case "${CORPUS}" in
     tpcds-sf1)   SRC_DATA="${TPCDS_PGDATA}";    PG_DB="${TPCDS_PG_DB}" ;;
 esac
 
-CLONE="${REPO_ROOT}/tmp/${LABEL}-data-${CORPUS}"
+CLONE_LABEL="${CLONE_LABEL:-${LABEL}}"
+CLONE="${REPO_ROOT}/tmp/${CLONE_LABEL}-data-${CORPUS}"
 SRV_LOG="${REPO_ROOT}/tmp/${LABEL}-${CORPUS}.server.log"
 GOOPG_BIN="${CALLER_GOOPG_BIN:-${REPO_ROOT}/tmp/goopg-jointree-bin}"
 CG_UNIT="goopg-jointree-${LABEL##*-}"
@@ -170,33 +185,107 @@ EXPECT_BIN_SHA="$(sha256sum "${GOOPG_BIN}" 2>/dev/null | awk '{print $1}')"
 
 hba_arg=()
 [[ -f "${CLONE}/pg_hba.conf" ]] && hba_arg=(--hba "${CLONE}/pg_hba.conf")
-GOOPG_CG_UNIT="${CG_UNIT}" "${REPO_ROOT}/scripts/goopg-test-run.sh" \
-    "${GOOPG_BIN}" start -D "${CLONE}" --listen "127.0.0.1:${PORT}" \
-    "${hba_arg[@]}" >"${SRV_LOG}" 2>&1 &
-server_pid=$!
+server_pid=""
 
-cleanup() {
+stop_clone_server() {
     timeout 60 "${GOOPG_BIN}" stop -D "${CLONE}" >>"${SRV_LOG}" 2>&1 || true
-    wait "${server_pid}" 2>/dev/null || true
+    if [[ -n "${server_pid}" ]]; then
+        wait "${server_pid}" 2>/dev/null || true
+        server_pid=""
+    fi
     systemctl --user stop "${CG_UNIT}.scope" >/dev/null 2>&1 || true
     systemctl --user reset-failed "${CG_UNIT}.scope" >/dev/null 2>&1 || true
+}
+
+start_clone_server() {
+    local ready=0
+    systemctl --user reset-failed "${CG_UNIT}.scope" >/dev/null 2>&1 || true
+    GOOPG_CG_UNIT="${CG_UNIT}" "${REPO_ROOT}/scripts/goopg-test-run.sh" \
+        "${GOOPG_BIN}" start -D "${CLONE}" --listen "127.0.0.1:${PORT}" \
+        "${hba_arg[@]}" >>"${SRV_LOG}" 2>&1 &
+    server_pid=$!
+    for _ in $(seq 1 120); do
+        kill -0 "${server_pid}" 2>/dev/null || break
+        pg_isready -h 127.0.0.1 -p "${PORT}" -U postgres -q >/dev/null 2>&1 && { ready=1; break; }
+        sleep 1
+    done
+    [[ "${ready}" -eq 1 ]] || {
+        echo "FATAL: clone server not ready (log ${SRV_LOG})" >&2
+        tail -20 "${SRV_LOG}" >&2 || true
+        return 1
+    }
+}
+
+cleanup() {
+    stop_clone_server
 }
 trap cleanup EXIT
 trap 'cleanup; exit 130' INT TERM
 
-ready=0
-for _ in $(seq 1 120); do
-    kill -0 "${server_pid}" 2>/dev/null || break
-    pg_isready -h 127.0.0.1 -p "${PORT}" -U postgres -q >/dev/null 2>&1 && { ready=1; break; }
-    sleep 1
-done
-[[ "${ready}" -eq 1 ]] || { echo "FATAL: clone server not ready (log ${SRV_LOG})"; tail -20 "${SRV_LOG}"; exit 5; }
+start_clone_server || exit 5
 
-# goopg arm — CAPTURE_ENGINE is REQUIRED on a non-6543x port
-# (capture-stamp.sh refuses an unlabelled private lane).
-CAPTURE_ENGINE=goopg GOOPG_EXPECT_BIN_SHA256="${EXPECT_BIN_SHA}" \
-    "${SCRIPT_DIR}/capture-tpcds.sh" "${PORT}" postgres postgres \
-    "${GOOPG_PLANS}" "${LABEL} goopg ${CORPUS} JOINTREE=${JOINTREE}" "${CLONE}" || exit $?
+if [[ "${FIRESET_SKIP_CAPTURE:-0}" == "1" ]]; then
+    [[ -n "${FIRESET_QUERIES:-}" ]] || {
+        echo "FATAL: FIRESET_SKIP_CAPTURE requires FIRESET_QUERIES" >&2
+        exit 2
+    }
+else
+    # goopg arm — CAPTURE_ENGINE is REQUIRED on a non-6543x port
+    # (capture-stamp.sh refuses an unlabelled private lane).
+    CAPTURE_ENGINE=goopg GOOPG_EXPECT_BIN_SHA256="${EXPECT_BIN_SHA}" \
+        "${SCRIPT_DIR}/capture-tpcds.sh" "${PORT}" postgres postgres \
+        "${GOOPG_PLANS}" "${LABEL} goopg ${CORPUS} JOINTREE=${JOINTREE}" "${CLONE}" || exit $?
+fi
+
+# Optional fire-set execution stays inside this already-isolated clone.  A
+# client-side timeout does not guarantee that the server stopped executing the
+# statement, so restart the clone before the next query rather than letting a
+# contaminated heap make a later status look trustworthy.
+if [[ -n "${FIRESET_QUERIES:-}" || -n "${FIRESET_STATUS_OUT:-}" ]]; then
+    [[ -n "${FIRESET_QUERIES:-}" && -n "${FIRESET_STATUS_OUT:-}" ]] || {
+        echo "FATAL: FIRESET_QUERIES and FIRESET_STATUS_OUT must be set together" >&2
+        exit 2
+    }
+    mkdir -p "$(dirname "${FIRESET_STATUS_OUT}")" || exit 2
+    IFS=',' read -r -a fireset_queries <<<"${FIRESET_QUERIES}"
+    declare -A seen_fireset_query=()
+    for query in "${fireset_queries[@]}"; do
+        [[ "${query}" =~ ^[0-9]+$ && "${query}" -gt 0 ]] || {
+            echo "FATAL: invalid FIRESET_QUERIES id: ${query}" >&2
+            exit 2
+        }
+        [[ -z "${seen_fireset_query[${query}]:-}" ]] || {
+            echo "FATAL: duplicate FIRESET_QUERIES id: ${query}" >&2
+            exit 2
+        }
+        seen_fireset_query[${query}]=1
+        query_file="${TPCDS_QUERY_DIR}/query${query}.sql"
+        [[ -f "${query_file}" ]] || { echo "FATAL: missing ${query_file}" >&2; exit 2; }
+        result_file="${OUTDIR}/${LABEL}-q${query}.result.txt"
+        if timeout "${FIRESET_TIMEOUT:-600}" psql -X -v ON_ERROR_STOP=1 \
+            -h 127.0.0.1 -p "${PORT}" -U postgres -d postgres \
+            -f "${query_file}" >"${result_file}" 2>&1; then
+            query_rc=0
+        else
+            query_rc=$?
+        fi
+        case "${query_rc}" in
+            0) status=PASS ;;
+            124) status=TIMEOUT ;;
+            *) status=ERROR ;;
+        esac
+        printf 'Q%s %s\n' "${query}" "${status}" >>"${FIRESET_STATUS_OUT}"
+        echo "# fireset ${LABEL} Q${query} ${status} (result ${result_file})"
+        if [[ "${status}" == TIMEOUT ]]; then
+            stop_clone_server
+            start_clone_server || exit 5
+        fi
+    done
+fi
+
+if [[ "${FIRESET_SKIP_CAPTURE:-0}" == "1" ]]; then
+    exit 0
+fi
 
 # PG arm — the shared :65438 reference is read-only for EXPLAIN (R1).
 CAPTURE_ENGINE=pg "${SCRIPT_DIR}/capture-tpcds.sh" "${TPCDS_PG_PORT}" "${PG_DB}" ryo \

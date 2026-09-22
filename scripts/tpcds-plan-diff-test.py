@@ -21,8 +21,12 @@ import unittest
 TOOL = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tpcds-plan-diff.py")
 
 
-def write_plans(tmp, name, blocks):
-    """blocks: {qid: [plan line, ...]} -> a capture file the tool can parse."""
+def write_plans(tmp, name, blocks, header="===== Q%d ====="):
+    """blocks: {qid: [plan line, ...]} -> a capture file the tool can parse.
+
+    `header` selects which of the harness's TWO capture formats to write —
+    the sweep's `===== Qn =====` or jointree-parity-capture.sh's `=== Qn`.
+    """
     path = os.path.join(tmp, name)
     with open(path, "w", encoding="utf-8") as fh:
         fh.write("# goopg: deadbeef test capture\n")
@@ -32,7 +36,7 @@ def write_plans(tmp, name, blocks):
             # absence then passes VACUOUSLY. This repo has been bitten by that
             # exact off-by-two before (an awk range using `=== Q5`), and the
             # first draft of this file reproduced it.
-            fh.write("===== Q%d =====\n" % qid)
+            fh.write((header % qid) + "\n")
             for line in blocks[qid]:
                 fh.write(line + "\n")
     return path
@@ -112,6 +116,47 @@ class JoinMethodElectionTest(unittest.TestCase):
         out = self.diff(old, new)
         self.assertIn("moved=0", out)
         self.assertNotIn("# join-method: Q1", out)
+
+
+class CaptureFormatTest(unittest.TestCase):
+    """Both capture formats must parse, and neither may fail vacuously.
+
+    Until the tool accepted `=== Qn`, pointing it at a jointree capture
+    printed `queries=0 same=0 changed=0` — a pass indistinguishable from
+    "the plans agree". Two loops hand-rolled their own diff because of it and
+    were then bitten by psql-path noise this tool already normalises.
+    """
+
+    def test_jointree_capture_header_parses(self):
+        blocks = {1: ["  ->  Hash Join  (cost=1..2 rows=3 width=4)"]}
+        with tempfile.TemporaryDirectory() as tmp:
+            o = write_plans(tmp, "old.txt", blocks, header="=== Q%d")
+            n = write_plans(tmp, "new.txt", blocks, header="=== Q%d")
+            out = run(o, n)
+        self.assertIn("queries=1", out)
+        self.assertNotIn("queries=0", out)
+
+    def test_sweep_capture_header_still_parses(self):
+        blocks = {1: ["  ->  Hash Join  (cost=1..2 rows=3 width=4)"]}
+        with tempfile.TemporaryDirectory() as tmp:
+            o = write_plans(tmp, "old.txt", blocks)
+            n = write_plans(tmp, "new.txt", blocks)
+            out = run(o, n)
+        self.assertIn("queries=1", out)
+
+    def test_zero_block_capture_is_fatal_not_a_clean_result(self):
+        # The safety property: a capture the tool cannot parse must never read
+        # as "no differences".
+        with tempfile.TemporaryDirectory() as tmp:
+            good = write_plans(tmp, "good.txt", {1: ["  ->  Hash Join  (cost=1..2 rows=3 width=4)"]})
+            bad = os.path.join(tmp, "bad.txt")
+            with open(bad, "w", encoding="utf-8") as fh:
+                fh.write("# goopg: a capture with no query blocks at all\n")
+            p = subprocess.run([sys.executable, TOOL, good, bad],
+                               capture_output=True, text=True)
+            self.assertEqual(p.returncode, 2, p.stdout)
+            self.assertIn("parsed 0 query blocks", p.stdout)
+            self.assertNotIn("PLAN-SHAPE", p.stdout)
 
 
 if __name__ == "__main__":

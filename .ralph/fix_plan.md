@@ -495,6 +495,73 @@ Loop rule:
 placeholder is a comment, not a checkbox, so the plan-complete exit
 heuristic stays live.)
 
+### Nightly run 20260922-004850 (sha `c07ebf0112d7`, 16 items) — filed 2026-09-22
+- [ ] **testport/TestPort_IsolationEvalPlanQual** — reopened nightly failure
+  (AI-20260922-004850-001; repro: `go test -v -run '^TestPort_IsolationEvalPlanQual$' ./internal/testport/`).
+  Kind: impl
+  Parent: none
+- [ ] **testport/TestPort_PgAmcheck003CombinedCorruption** — nightly failure
+  (AI-20260922-004850-002; repro: `go test -v -run '^TestPort_PgAmcheck003CombinedCorruption$' ./internal/testport/`).
+  Kind: impl
+  Parent: none
+- [ ] **testport/TestPort_PgAmcheck003MissingHeapFile** — nightly failure
+  (AI-20260922-004850-003; repro: `go test -v -run '^TestPort_PgAmcheck003MissingHeapFile$' ./internal/testport/`).
+  Kind: impl
+  Parent: none
+- [ ] **testport/TestPort_PgAmcheck003MissingIndexFork** — nightly failure
+  (AI-20260922-004850-004; repro: `go test -v -run '^TestPort_PgAmcheck003MissingIndexFork$' ./internal/testport/`).
+  Kind: impl
+  Parent: none
+- [ ] **testport/TestPort_PgAmcheck003SchemaScoped** — nightly failure
+  (AI-20260922-004850-005; repro: `go test -v -run '^TestPort_PgAmcheck003SchemaScoped$' ./internal/testport/`).
+  Kind: impl
+  Parent: none
+- [ ] **testport/TestPort_PgoutputInteropGoopgToPG** — nightly failure
+  (AI-20260922-004850-006; repro: `go test -v -run '^TestPort_PgoutputInteropGoopgToPG$' ./internal/testport/`).
+  Kind: impl
+  Parent: none
+- [ ] **testport/TestPort_PgoutputInteropPGToGoopgBatchDML** — nightly failure
+  (AI-20260922-004850-007; repro: `go test -v -run '^TestPort_PgoutputInteropPGToGoopgBatchDML$' ./internal/testport/`).
+  Kind: impl
+  Parent: none
+- [ ] **testport/TestPort_PgoutputInteropPGToGoopgColumnOrderMismatch** — nightly failure
+  (AI-20260922-004850-008; repro: `go test -v -run '^TestPort_PgoutputInteropPGToGoopgColumnOrderMismatch$' ./internal/testport/`).
+  Kind: impl
+  Parent: none
+- [ ] **testport/TestPort_PgoutputInteropPGToGoopgFullDML** — nightly failure
+  (AI-20260922-004850-009; repro: `go test -v -run '^TestPort_PgoutputInteropPGToGoopgFullDML$' ./internal/testport/`).
+  Kind: impl
+  Parent: none
+- [ ] **testport/TestPort_PgoutputInteropPGToGoopgPgbenchInsert** — nightly failure
+  (AI-20260922-004850-010; repro: `go test -v -run '^TestPort_PgoutputInteropPGToGoopgPgbenchInsert$' ./internal/testport/`).
+  Kind: impl
+  Parent: none
+- [ ] **testport/TestPort_PgoutputInteropPGToGoopgPgbenchTpcb** — nightly failure
+  (AI-20260922-004850-011; repro: `go test -v -run '^TestPort_PgoutputInteropPGToGoopgPgbenchTpcb$' ./internal/testport/`).
+  Kind: impl
+  Parent: none
+- [ ] **testport/TestPort_PgoutputInteropPGToGoopgReplicaIdentityFull** — nightly failure
+  (AI-20260922-004850-012; repro: `go test -v -run '^TestPort_PgoutputInteropPGToGoopgReplicaIdentityFull$' ./internal/testport/`).
+  Kind: impl
+  Parent: none
+- [ ] **testport/TestPort_PgoutputInteropPGToGoopgSubscriberExtraColumn** — nightly failure
+  (AI-20260922-004850-013; repro: `go test -v -run '^TestPort_PgoutputInteropPGToGoopgSubscriberExtraColumn$' ./internal/testport/`).
+  Kind: impl
+  Parent: none
+- [ ] **testport/TestPort_PgoutputInteropPGToGoopgSubscriberExtraDefault** — nightly failure
+  (AI-20260922-004850-014; repro: `go test -v -run '^TestPort_PgoutputInteropPGToGoopgSubscriberExtraDefault$' ./internal/testport/`).
+  Kind: impl
+  Parent: none
+- [ ] **testport/TestPort_PgoutputInteropPGToGoopgTruncate** — nightly failure
+  (AI-20260922-004850-015; repro: `go test -v -run '^TestPort_PgoutputInteropPGToGoopgTruncate$' ./internal/testport/`).
+  Kind: impl
+  Parent: none
+- [ ] **testport/TestPort_RegressSuite** — reopened nightly failure in
+  partition_aggregate, select_having, select_implicit, and union
+  (AI-20260922-004850-016; repro: `go test -v -run '^TestPort_RegressSuite$' ./internal/testport/`).
+  Kind: impl
+  Parent: none
+
 ### Nightly run 20260901-010436 (sha `d93fb9edc669`, 7 items) — filed 2026-09-01
 - [x] **testport/TestPort_PgStatActivity (AI-20260901-010436-005, AI-20260905-011015-007, AI-20260914-235643-010, AI-20260916-035206-011, AI-20260917-004357-015)**.
   **Fixed 2026-09-18 — test bug, not an engine bug.** `internal/testport/plpgsql_test.go`'s
@@ -15943,7 +16010,7 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
     `CATEGORIES-EXCL-MATCH` on both corpora.
   - This is what unblocks **M0145-0012**, not M0145-0020.
 
-- [ ] **M0145-0021 — harness: SF1 fire-set gate for diagnostic-flag /
+- [x] **M0145-0021 — harness: SF1 fire-set gate for diagnostic-flag /
   estimation / cost-model tasks** (owner GO 2026-09-22; progress-doc
   proposal 5.4). M0145-0018 showed an SF0.25-green result masking a
   60x-plus SF1 regression — caught only because the task TEXT mandated a
@@ -15956,6 +16023,139 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
   existing gates.
   Kind: impl
   Parent: none
+  - **Slice 1 LANDED 2026-09-22 (loop \#90): the fire-set derivation is now
+    trustworthy.** Movement: none — a harness fix.
+    Design: `docs/design/0100-0149/m0145-0021-fireset-derivation.md`.
+    - **Why this slice first**: the task requires re-deriving the fire set
+      per run. Loop \#82 did it by hand and found the obvious route does not
+      work — the seam census's server log carries NO query markers, so
+      declines cannot be attributed to queries. The derivation that works is
+      a plan A/B, which makes `tpcds-plan-diff.py` the gate's load-bearing
+      component. It had two defects.
+    - **Defect 1 — the harness has TWO capture formats and the tool knew
+      one**: `===== Qn =====` (the SF0.25 sweep) and `=== Qn`
+      (`jointree-parity-capture.sh`, i.e. every firewall/knob A/B). Pointing
+      it at a jointree capture printed
+      `PLAN-SHAPE: queries=0 same=0 changed=0` — a **vacuous pass
+      indistinguishable from "the plans agree"**. That is why loops \#82 and
+      \#84 each hand-rolled a diff and were then bitten by psql-path noise
+      this tool already normalises (both "found" Q36/Q70/Q86 changed when
+      only the temp FILENAME inside their parse errors differed).
+    - **Defect 2 — a capture parsing to zero blocks reported success.** Now
+      fatal: `FATAL — <path> parsed 0 query blocks`, exit **2** (distinct
+      from `--strict`'s 1). A capture with no blocks is a broken capture,
+      never a clean result.
+    - **Measured payoff** — re-run over loop \#82's firewall A/B captures,
+      which the tool previously could not read at all:
+      `changed (2): Q77 Q78` (the three parse-error queries correctly
+      filtered) and `JOIN-METHOD-ELECTION: moved=1 into-nestloop=1
+      suspects=Q77`. Both of that loop's hand-derived findings now fall out
+      automatically, including the criterion-1 violation that stopped the
+      firewall relaxation.
+    - Tests: 3 new cases in `scripts/tpcds-plan-diff-test.py` (both header
+      formats parse; a zero-block capture is fatal). Non-vacuity checked —
+      reverting either change fails exactly the tests that assert it.
+  - **Loop \#91 implementation in progress**: `tpcds-fireset-gate.sh` now
+    derives each corpus fire set from fresh baseline/candidate captures and
+    executes it in separate private clone arms. `jointree-parity-capture.sh`
+    records normalized statuses plus raw results and restarts only its private
+    clone after a timeout, so the comparator cannot accept a contaminated
+    follow-up result. The remaining acceptance evidence is the actual two-scale
+    SF0.25 and SF1 run.
+    - **Loop \#92 smoke evidence**: the capture-skipping execution arm ran Q2
+      on isolated SF0.25 baseline and candidate clones. Both records were PASS;
+      the comparator reported no introduced, unchanged, or missing timeout.
+    - **Loop \#93 resumability evidence**: `FIRESET_RESUME=1` plus
+      `FIRESET_BATCH_SIZE=1` preserved the derived 24-query SF0.25 set and
+      appended Q2 PASS in both arms. The comparator rejected the other 23 as
+      missing, as required. A deterministic short clone tag fixes the Unix
+      control-socket path limit exposed by the long generated execute label.
+    - **Loop \#94 continuation**: Q5 and Q6 each completed PASS in both
+      private arms at the 600-second policy. The comparator still rejected the
+      remaining 21 missing IDs, preserving the no-vacuous-pass contract.
+    - **Loop \#95 continuation**: Q8 completed PASS in both private SF0.25
+      arms (25.8 seconds wall time). The derived set remains 24 IDs; the
+      comparator rejected the remaining 20 missing IDs, so this partial batch
+      cannot be mistaken for an acceptance result.
+    - **Loop \#96 continuation**: Q9 completed PASS in both private SF0.25
+      arms (21.2 seconds wall time). The comparator rejected the remaining 19
+      missing IDs, preserving the no-vacuous-pass contract.
+    - **Loop \#97 continuation**: Q10 completed PASS in both private SF0.25
+      arms (21.2 seconds wall time). The comparator rejected the remaining 18
+      missing IDs, preserving the no-vacuous-pass contract.
+    - **Loop \#98 continuation**: Q14 completed PASS in both private SF0.25
+      arms. The command's first output was a foreground yield while the
+      candidate remained under its 600-second policy; waiting for that same
+      process confirmed the candidate PASS record. The comparator now rejects
+      the remaining 17 missing IDs.
+    - **Loop \#99 continuation**: Q16 completed PASS in both private SF0.25
+      arms (20.1 seconds wall time). The comparator rejected the remaining 16
+      missing IDs, preserving the no-vacuous-pass contract.
+    - Gate: the real SF0.25 sweep still runs clean (`PASS=96 MISMATCH=0
+      CKMISMATCH=0 ERROR=0 TIMEOUT=0`, `PLAN-SHAPE same=99 changed=0`).
+    - **COMPLETE 2026\-09\-22 \(loop \#1\) — the two\-scale acceptance run is
+      green at BOTH scales.** Movement: none — a harness gate.
+      - SF0.25: all 24 derived fires PASS in both private arms;
+        `FIRE\-SET\-TIMEOUTS: introduced=none unchanged=none missing=none`,
+        exit 0. Evidence `tmp/m0145\-0021\-loop91/tpcds\-sf025/`.
+      - SF1: the plan A/B derived the SAME 24 IDs; all 24 PASS in both arms;
+        same verdict, exit 0. Evidence `tmp/m0145\-0021\-sf1/tpcds\-sf1/`.
+      - **The SF1 half was NOT "the bulk of the work"** — that estimate was
+        wrong. The SF1 capture of both arms \(two 3.3 GB offline clones \+ the
+        PG reference arm, 99 EXPLAINs each\) took **89 seconds**; the 24 fires
+        ran in three batches of 1m59s–3m59s. Under 15 minutes total.
+      - **What actually cost eight loops was `FIRESET_BATCH_SIZE=1`.** The
+        execution arm starts its clone server ONCE per invocation and then
+        walks every id in `FIRESET_QUERIES`, so a batch of 8 pays one
+        clone\+start for 8 queries. Loops \#92–\#99 each used batch size 1 and
+        so advanced exactly one id per loop. Bound the batch to whatever the
+        foreground interval allows — never to 1 out of caution.
+      - **SF1 derived the same fire set as SF0.25**, so the two\-scale
+        requirement is about the scale\-sensitive TIMEOUT CLASS, not about a
+        different set per scale.
+      - Non\-vacuity of the pass condition checked directly: baseline PASS \+
+        candidate TIMEOUT → `introduced=Q2`, exit 1; TIMEOUT in both →
+        `unchanged=Q2`, exit 0; an 8\-of\-24 batch → `missing=<16 ids>`,
+        nonzero. `tpcds\-fireset\-status.py \-\-self\-test` 1/1;
+        `tpcds\-plan\-diff\-test.py` 10 cases OK.
+      - SF1 arm parity numbers, recorded because the gate is NOT a parity
+        claim: baseline `match=1 shapediff=73`, candidate `match=0
+        shapediff=74` vs PG 18.3. The gate asserts no timeout\-class increase
+        only.
+      - Usage: `CANDIDATE_ENV_FILE=… scripts/tpcds\-fireset\-gate.sh <id>
+        tmp/<id>` — `CORPORA` already defaults to both corpora, so the
+        default invocation IS the two\-scale gate.
+
+- [ ] **M0145-0021a — make the fire-set gate ENFORCED, not merely
+  available**
+  Kind: impl
+  Parent: M0145-0021
+  M0145-0021 landed the two-scale gate and proved it non-vacuous, but
+  nothing makes a task touching the derived-input firewall, row estimation
+  or the cost model run it. M0145-0018's exposure is therefore reduced to a
+  documented procedure, not a mechanical barrier.
+  - Resume point: the plan-shape PIN's acceptance-line pattern
+    \(`SF025_PLANS_BASELINE`\) is the precedent — require a fire-set verdict
+    file for commits touching the cost/estimation/firewall paths.
+  - **Needs an owner scope call first**: which paths are in scope is a policy
+    decision, and getting it wrong either blocks unrelated commits or trains
+    the loop to stamp its own verdict.
+  - Ledger row: `.ralph/deferral_ledger.md`, 2026-09-22, M0145-0021, gap \(a\).
+
+- [ ] **M0145-0021b — extend the fire-set gate to the TPC-H corpus**.
+  Kind: impl
+  Parent: M0145-0021
+  `scripts/jointree-parity-capture.sh`'s `tpch` branch returns BEFORE the
+  `FIRESET_QUERIES` execution block, so the template covers the TPC-DS
+  corpora only — while the TPC-H floor pin is where M0144-0001 measures
+  parity.
+  - Resume point: move the `FIRESET_QUERIES` block above the corpus branch,
+    or duplicate it into the `tpch` arm using
+    `tpch-estimate-audit-arm.sh`'s private clone; then extend the gate's
+    `CORPORA` validation to accept `tpch`.
+  - Out of M0145-0021's stated scope \(its fire set is re-derived from the
+    TPC-DS seam census\); the TPC-H arm has its own clone lifecycle.
+  - Ledger row: `.ralph/deferral_ledger.md`, 2026-09-22, M0145-0021, gap \(b\).
 
 - [x] **M0145-0022 — harness: plan-shape election + wall-clock
   regression channel on the SF0.25 sweep** (owner GO 2026-09-22;

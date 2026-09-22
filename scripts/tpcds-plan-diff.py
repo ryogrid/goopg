@@ -41,7 +41,20 @@ import difflib
 import re
 import sys
 
-BLOCK_RE = re.compile(r"^=====\s*Q(\d+)\s*=====\s*$")
+# TWO capture formats exist in this harness and both must parse (M0145-0021):
+#
+#   `===== Q1 =====`   the SF0.25 sweep's capture
+#   `=== Q1`           scripts/jointree-parity-capture.sh's capture
+#
+# Until this accepted both, pointing the tool at a jointree capture reported
+# `queries=0 same=0 changed=0` — a VACUOUS pass indistinguishable from "the
+# plans agree". Every loop that needed to diff those captures therefore
+# hand-rolled its own diff, and two of them were bitten by the psql-path noise
+# this file already normalises below (loops 82 and 84 each "found" Q36/Q70/Q86
+# changed when only the temp filename inside their parse errors differed).
+# `no_blocks_is_fatal` below is the other half: a capture that parses to
+# nothing is a broken capture, never a clean result.
+BLOCK_RE = re.compile(r"^={3,5}\s*Q(\d+)\s*(?:={3,5}\s*)?$")
 # psql prints the provenance the harness stamped; keep it out of the comparison
 # so two captures of the same code never differ on their own timestamps.
 PROVENANCE_RE = re.compile(r"^#")
@@ -186,6 +199,21 @@ def main():
     except OSError as exc:
         print(f"# plan-diff: unavailable ({exc})")
         return 0
+
+    # A capture that parses to zero query blocks is broken — a wrong path, a
+    # truncated file, or a header format this tool does not know. Reporting
+    # "changed=0" for it would be a vacuous pass that reads exactly like a
+    # clean run, which is the failure mode this repository keeps paying for.
+    # Exit 2 keeps it distinguishable from --strict's 1.
+    for path, blocks in ((args.old, old), (args.new, new)):
+        if not blocks:
+            print(
+                f"# plan-diff: FATAL — {path} parsed 0 query blocks. "
+                "Expected `===== Qn =====` (sweep) or `=== Qn` (jointree "
+                "capture) block headers; a capture with none is broken, and "
+                "reporting no differences for it would be a vacuous pass."
+            )
+            return 2
 
     changed, same = [], []
     for qid in sorted(set(old) & set(new)):
