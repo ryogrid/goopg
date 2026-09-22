@@ -13969,6 +13969,34 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
         declined?" and none looked at it. When a silent `continue` is the
         suspect, check whether an existing trace channel already covers the
         predicate before proposing to add one.
+      - **2026-09-22 (loop \#88): sub-causes (2) and (3) ELIMINATED, and this
+        residual is now BLOCKED.** White-box probe with `jointreePipeline` on
+        and parallel-sized stats:
+        `*SetOp stampedRel=true  rel.ConsiderParallel=true  partialPaths=1`.
+        - (2) refuted — the `*SetOp` the outer binder receives DOES carry the
+          stamp; `createSetOpPlan`'s rebuild preserves it.
+        - (3) refuted — the stamped rel's `ConsiderParallel` is true and it
+          holds a partial path.
+        - (1) is all that remains, and the source does not support it either:
+          `seamLeafRelInfo` routes a union leaf through `estimateBaseRelInfo`
+          (its `b.table` is non-nil — `planSubqueryRangeVar` builds a
+          synthetic `catalog.Table` for the alias), and that constructor DOES
+          carry `appendrel`. The two constructors that omit the field are the
+          Semi/Anti synthetic-leaf arm and a `bindingIdx: -1` default.
+      - **BLOCKED — five loops, five refuted hypotheses, no fix.**
+        84 CTEScan-hides-carrier / 85 gather placement / 86 outer link has no
+        partial / 87 `*Project` wrapper / 88 lost stamp or stale CP — all
+        refuted by measurement. The one remaining candidate is unsupported by
+        the source, which means the reasoning is wrong somewhere static
+        reading and the existing traces cannot see.
+      - **THE UNBLOCK, and it needs an owner nod because of C1**: add ONE
+        diagnostic line to `addAppendRelPartialPaths` naming which condition
+        declined (mark / ConsiderParallel / carrier / empty PartialPathlist /
+        tlist), under the existing `GOOPG_PGSHAPED_DP_TRACE` gate. The
+        function declines with a bare `continue` and no trace, which is
+        exactly why five loops had to guess. C1 makes a trace an **impl**
+        task needing the full gate set, so the loop did not do it
+        unilaterally — but every guessing route is now exhausted.
         - If it IS a `*Project`, the fix is NOT simply to admit `*Project`:
           the comment's reasoning holds for a row-changing Project but not
           for a pure rename/reorder. The distinction to implement is

@@ -624,3 +624,57 @@ coding.
 Four loops asked "which condition declined?" and none of them looked at it. When
 a silent `continue` is the suspect, check whether a trace channel already covers
 the predicate before proposing to add one.
+
+
+## Two more eliminations, and a BLOCKED call (2026-09-22, loop #88)
+
+The previous section reduced the `cp=0` verdict to three sub-causes. Two are
+now eliminated by a white-box probe (`jointreePipeline` flipped on, tables
+given parallel-sized stats):
+
+```
+depth=3 *SetOp stampedRel=true   rel.ConsiderParallel=true partialPaths=1
+depth=4 *SetOp stampedRel=true   rel.ConsiderParallel=true partialPaths=1
+```
+
+- **(2) is refuted**: the `*SetOp` the outer binder receives DOES carry the
+  stamp — `createSetOpPlan`'s rebuild preserves it, so
+  `carrier.setOpBranchRel()` is not nil.
+- **(3) is refuted**: the stamped rel's `ConsiderParallel` is true and it holds
+  a partial path, so the value the appendrel arm would copy is the right one.
+
+That leaves **(1)**, the appendrel mark not reaching `baseRelInfo` — but
+reading every construction site does not support it either.
+`seamLeafRelInfo` routes a union leaf through `estimateBaseRelInfo` (its
+`b.table` is non-nil: `planSubqueryRangeVar` builds a synthetic
+`catalog.Table` for the alias), and that constructor does carry `appendrel`.
+The two constructors that omit the field are the Semi/Anti synthetic-leaf arm
+and a `bindingIdx: -1` default, neither of which is this leaf.
+
+### Why this is being called BLOCKED rather than continued
+
+Five consecutive loops have worked this residual. Each eliminated a real
+candidate and none landed a fix:
+
+| loop | hypothesis | verdict |
+|---|---|---|
+| 84 | CTEScan hides the carrier | refuted — Q71/Q76 have no CTE |
+| 85 | gather placement (3 named producers) | refuted — hoist fires, paths accepted |
+| 86 | outer link wins no partial path | refuted — it does, and is accepted |
+| 87 | a `*Project` wrapper hides the carrier | refuted — the leaf is a bare `*SetOp` |
+| 88 | lost stamp / stale `ConsiderParallel` | both refuted (above) |
+
+The single remaining candidate is not supported by the source either, which
+means the reasoning is wrong somewhere that static reading and the existing
+traces cannot see. `addAppendRelPartialPaths` declines **silently** — it is a
+bare `continue` with no trace — and that is precisely why five loops have had
+to guess.
+
+### The unblock, stated concretely
+
+Add one diagnostic line to `addAppendRelPartialPaths` naming which condition
+declined (mark / ConsiderParallel / carrier / empty PartialPathlist / tlist),
+under the existing `GOOPG_PGSHAPED_DP_TRACE` gate. Per AGENT.md C1 that makes
+it an **impl** task requiring the full gate set, which is why this loop did not
+do it unilaterally — but it is a one-line change that would have saved four
+loops, and every guessing route is now exhausted.
