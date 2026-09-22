@@ -16,21 +16,18 @@ import (
 	"testing"
 	"time"
 
+	"github.com/goopg/goopg/internal/access/transam/xlog"
 	"github.com/goopg/goopg/internal/testutil/cluster"
 	"github.com/goopg/goopg/internal/testutil/replcluster"
-	"github.com/goopg/goopg/internal/access/transam/xlog"
 )
 
 // TestPort_Recovery001StreamRep ports postgres/src/test/recovery/t/001_stream_rep.pl
 // Upstream: minimal streaming replication smoke test — primary + standby,
 // WAL streaming verified, INSERT on primary confirmed visible on standby.
 //
-// Adaptation: v0 streaming replication has a pre-existing regression where
-// written_lsn on the standby does not advance after primary CHECKPOINT and
-// newly-inserted rows are not yet visible through physical WAL replay.
-// This port verifies the layers that DO work: walreceiver connection,
-// replication slot handshake, and pg_stat_replication walsender presence.
-// Row visibility is skipped pending the WAL replay regression fix.
+// The port verifies the complete physical streaming path: walreceiver
+// connection, replication-slot handshake, walsender presence, and a committed
+// primary insert becoming visible on the hot standby.
 func TestPort_Recovery001StreamRep(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping replication test in short mode")
@@ -99,9 +96,23 @@ func TestPort_Recovery001StreamRep(t *testing.T) {
 			rc.SlotName, rows)
 	}
 
-	// Adaptation note: upstream asserts INSERT visibility on standby,
-	// skipped here due to pre-existing WAL replay regression (written_lsn
-	// does not advance after primary CHECKPOINT in v0).
+	// Upstream's material assertion: a committed primary row must become
+	// visible on the streaming standby. Poll rather than forcing CHECKPOINT so
+	// this covers the receiver/replayer's ordinary live-WAL path.
+	if _, err := rc.Primary.Query(context.Background(),
+		"INSERT INTO repl001 VALUES (1)"); err != nil {
+		t.Fatalf("insert on primary: %v", err)
+	}
+	deadline = time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) {
+		rows, err := rc.Standby.Query(context.Background(),
+			"SELECT count(*) FROM repl001")
+		if err == nil && len(rows) == 1 && len(rows[0]) == 1 && rows[0][0] == "1" {
+			return
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	t.Fatal("committed primary row was not visible on standby within 20s")
 }
 
 // TestPort_Recovery013CrashRestart ports postgres/src/test/recovery/t/013_crash_restart.pl

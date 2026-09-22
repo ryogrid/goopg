@@ -2625,6 +2625,12 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		return nil, fmt.Errorf("goopg: recovery signal: %w", err)
 	}
 
+	// A physical standby may flush replayed pages at a checkpoint boundary,
+	// but it must not append its own checkpoint records to the primary-owned
+	// WAL stream.  Its reconnect LSN is the received WAL tail, so a local
+	// marker would corrupt the stream position after a clean restart.
+	cp.SetRecoveryMode(standby)
+
 	rt := &Runtime{
 		StorageMgr:     mgr,
 		Pool:           pool,

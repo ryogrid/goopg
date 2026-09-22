@@ -21,12 +21,12 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/goopg/goopg/internal/utils/misc"
 	"github.com/goopg/goopg/internal/access/transam/control"
+	"github.com/goopg/goopg/internal/access/transam/xlog"
 	"github.com/goopg/goopg/internal/initdb"
 	"github.com/goopg/goopg/internal/postmaster"
 	"github.com/goopg/goopg/internal/replication"
-	"github.com/goopg/goopg/internal/access/transam/xlog"
+	"github.com/goopg/goopg/internal/utils/misc"
 )
 
 // drainPollInterval is how often Promote checks the replayer's
@@ -339,6 +339,12 @@ func (sc *standbyController) finalizePromotion() error {
 		return fmt.Errorf("promote: remove standby.signal: %w", err)
 	}
 	sc.rt.Standby = false
+	// Recovery-mode checkpoints intentionally avoid creating local WAL. Once
+	// promotion completes this runtime owns its timeline again, so restore the
+	// normal checkpoint path before accepting primary writes.
+	if sc.rt.Checkpointer != nil {
+		sc.rt.Checkpointer.SetRecoveryMode(false)
+	}
 	sc.logger.Info("promote: standby.signal removed; runtime is now primary")
 	return nil
 }

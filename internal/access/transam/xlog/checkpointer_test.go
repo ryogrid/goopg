@@ -812,6 +812,35 @@ func TestCheckpointerShutdownSetsDBShutdowned(t *testing.T) {
 	}
 }
 
+// TestCheckpointerRecoveryModeDoesNotAdvanceWAL pins the physical-standby
+// boundary: a clean standby shutdown may flush replayed pages, but its local
+// checkpointer must not append a checkpoint into the primary-owned WAL stream.
+// Otherwise the next walreceiver reconnect asks the primary to resume after a
+// byte that exists only on the standby.
+func TestCheckpointerRecoveryModeDoesNotAdvanceWAL(t *testing.T) {
+	dir := t.TempDir()
+	w, err := NewWriter(Config{WALDir: filepath.Join(dir, "pg_wal"), SegmentSize: 4096})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+
+	if _, end, err := w.Append([]byte("received-primary-record")); err != nil {
+		t.Fatal(err)
+	} else if err := w.FlushUpTo(end); err != nil {
+		t.Fatal(err)
+	}
+	before := w.WrittenLSN()
+	cp := NewCheckpointer(&fakeFlusher{}, w, CheckpointerConfig{})
+	cp.SetRecoveryMode(true)
+	if err := cp.CheckpointShutdown(); err != nil {
+		t.Fatalf("CheckpointShutdown in recovery mode: %v", err)
+	}
+	if got := w.WrittenLSN(); got != before {
+		t.Fatalf("recovery checkpoint advanced WAL from %d to %d", before, got)
+	}
+}
+
 // TestCheckpointerWritesNextXidIntoPgControl pins the M0106-0010
 // batched-45 invariant: at every checkpoint the checkpointer must call
 // the NextXIDFn hook and write its value into pg_control offset 64
