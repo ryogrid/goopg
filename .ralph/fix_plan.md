@@ -2424,6 +2424,35 @@ the whole file's active task between 2026-09-01 and 2026-09-14; **since
   Kind: bug
   Parent: M0119-0006
   Movement: none
+  - **NEW EVIDENCE 2026\-09\-22 (loop \#23) — the collision is NOT limited to
+    extensions; it breaks cross\-database isolation for ordinary USER TABLES,
+    and it corrupts `pg_dumpall` output.** Recorded here because it bears
+    directly on the pending Option A / Option B owner call below; the loop
+    does not decide it.
+    - Repro, fresh cluster, no extensions involved:
+      `psql -d postgres -c "CREATE TABLE in_postgres(a int)" -c "INSERT …
+      VALUES (111)"`, then `psql -d template1 -c "SELECT * FROM in_postgres"`
+      returns **111**. PostgreSQL 18.3 raises `42P01` — separate databases.
+      A third database (`userdb`) correctly does NOT see it, which isolates
+      the fault to the template1/postgres shared `DefaultDBOid` namespace
+      rather than to database scoping in general.
+    - **`pg_dumpall` emits the table TWICE**: its dump carries
+      `\connect template1` followed by `COPY public.in_postgres … 111`, and
+      then again under `\connect postgres`. Restoring that dump into a real
+      PostgreSQL cluster **plants a user table inside `template1`**, so every
+      database created afterwards inherits it. That is a restore\-time
+      corruption, not only a reporting quirk.
+    - Severity note, stated plainly because it cuts the other way: the
+      related `COPY` failure in non\-default databases (M0122\-0015a) is
+      **loud** — `pg_dumpall` exits 1 with
+      `pg_dump failed on database "userdb", exiting` — so there is no silent
+      data loss there. This template1 finding is the one with a silent
+      failure mode.
+    - Bearing on the choice: Option A fixes this manifestation; Option B
+      removes it by construction. The evidence does not by itself decide
+      between them — it raises the cost of leaving the sentinel in place,
+      since the hazard now has a demonstrated data\-integrity consequence
+      beyond the extension\-attribution symptom the item was filed for.
   - Repro: `psql -d template1 -c "CREATE EXTENSION amcheck"`, restart, then
     count `pg_extension` rows per database. Before: template1=1, postgres=0
     (the in-memory registry is correct at RUNTIME). After: template1=0,
