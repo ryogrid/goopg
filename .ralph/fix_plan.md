@@ -124,6 +124,14 @@ FROZEN-PREFIXES:
 (the M0142-0008 chain was UNFROZEN by owner decision 2026-09-20; see below —
 the empty prefix list is what makes them selectable again)
 
+LINEAGE-BASELINE: M0145-0001 M0145-0003 M0145-0006 M0145-0014 M0145-0015 M0145-0016 M0145-0017
+(owner re-pin 2026-09-22: the six completed M0145-0001 descendants listed
+above are pinned OUT of the S4 last-5 lineage-budget window — the count
+restarts from the re-open point. This is NOT a root exemption: every
+completion that lands from now on still accumulates toward a fresh budget.
+Chosen over exempting the root after M0145-0004's LINEAGE NOTE recorded that
+the guard cannot see the owner re-open.)
+
 **UNFROZEN (owner decision 2026-09-20) — selectable again:** the M0142-0008
 chain (`M0142-0008a-3`, `M0142-0008c-1a`, `M0142-0008c-3d`,
 `M0142-0008c-4`) is unfrozen by direct owner instruction. P0-E7's private-lane
@@ -14341,6 +14349,9 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
       root**, which is a standing blocker on the banner's own chain and
       needs the owner to clear it — by re-pinning the lineage baseline or by
       exempting the re-opened root.
+      **RESOLVED 2026\-09\-22 \(owner\)**: the owner chose the re\-pin —
+      `LINEAGE\-BASELINE:` in the banner pins the six stale completions out
+      of the window, so descendants may again be filed under this root.
 
   - **UNBLOCKED and LANDED 2026\-09\-22 \(loop \#4\)** as `f8349122c`.
     Movement: none — knob\-arm only; default\-arm `CATEGORIES-EXCL-MATCH`

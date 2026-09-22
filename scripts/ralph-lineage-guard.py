@@ -9,7 +9,11 @@ when the candidate:
       `Movement: none` (a missing Movement line counts as none — only tasks
       with a `Parent:` field are descendants, so legacy tasks never count).
       Remedy: write an escalation block into the root, mark the root [!],
-      select a task elsewhere.
+      select a task elsewhere. The owner may re-pin a root's baseline with a
+      `LINEAGE-BASELINE: <root> <task-id> ...` line in the `## Current
+      Priority` banner: the listed completed descendants are pinned OUT of
+      the last-5 window, so the count restarts from the re-open point while
+      still accumulating every completion that lands afterwards.
   Rule B (lineage required): adds a task whose id matches M0137..M0145 or P0-
       without a `Parent:` line.
   Rule D (field hygiene — audit hole D): a NEWLY ADDED line may not
@@ -168,6 +172,7 @@ def _fields(cur, ln, n, inline):
 
 
 FROZEN_PREFIXES_TOKEN = "FROZEN-PREFIXES:"
+LINEAGE_BASELINE_TOKEN = "LINEAGE-BASELINE:"
 BANNER_HEADING = "## Current Priority"
 
 
@@ -196,6 +201,24 @@ def frozen_prefixes(text):
             tok = tok.strip("`*,;.")
             if tok:
                 out.append(tok)
+    return out
+
+
+def lineage_baselines(text):
+    """Root -> set of pinned-out task ids, from the owner-only banner lines
+    `LINEAGE-BASELINE: <root> <task-id> <task-id> ...`. The listed completed
+    descendants are excluded from the Rule A last-5 window, so an owner
+    re-pin restarts the count without exempting the root."""
+    out = {}
+    for ln in banner_lines(text):
+        i = ln.find(LINEAGE_BASELINE_TOKEN)
+        if i < 0:
+            continue
+        toks = [t.strip("`*,;.()") for t in ln[i + len(LINEAGE_BASELINE_TOKEN):].split()]
+        toks = [t for t in toks if t]
+        if len(toks) < 2:
+            continue
+        out.setdefault(toks[0], set()).update(toks[1:])
     return out
 
 
@@ -233,11 +256,12 @@ def check(baseline, candidate):
                 f"or `Parent: none` for owner-filed tasks).")
 
     # Rule A
+    pinned = lineage_baselines(candidate)
     completed_by_root = {}
     for t in corder:
         if t.parent is None or t.parent not in ctasks:
             continue
-        if t.status == "x":
+        if t.status == "x" and t.id not in pinned.get(root_of(ctasks, t), ()):
             completed_by_root.setdefault(root_of(ctasks, t), []).append(t)
     exhausted = {}
     for root, done in completed_by_root.items():

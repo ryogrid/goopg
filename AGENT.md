@@ -583,6 +583,11 @@ obstacle: do not look for another command that achieves the same effect.
   mark the root `[!]`, select elsewhere. Only the owner reopens it.
   Renumbering or re-filing does not reset lineage.
   `scripts/ralph-lineage-guard.py` enforces this at commit.
+  **Owner re-pin:** a `LINEAGE-BASELINE: <root> <task-id> ...` line in the
+  `## Current Priority` banner pins the listed completed descendants OUT of
+  the last-5 window — the count restarts from that point while still
+  accumulating every later completion (it is a baseline reset, not a root
+  exemption). Only the owner writes this line; the loop escalates instead.
 - **S5** A recon may file an implementation task only if the task names its
   expected movement (queries, categories or ea-ratchet findings vs PG) and how
   it will be measured.

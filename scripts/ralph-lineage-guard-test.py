@@ -199,6 +199,29 @@ CONFCHAIN = plan(ROOT, *[
 case("D: 5 conforming Movement: yes keep the budget open", CONFCHAIN,
      CONFCHAIN + task("M0142-0008a-5", " ", parent="M0142-0008a-4"), None)
 
+# --- Rule A: LINEAGE-BASELINE owner re-pin ------------------------------------
+PIN = "# Fix plan\n\n## Current Priority\nLINEAGE-BASELINE: M0142-0008 M0142-0008a-0 M0142-0008a-1 M0142-0008a-2 M0142-0008a-3 M0142-0008a-4\n1. x\n\n## M0142 — stuff\n\n"
+bpin = PIN + "".join([ROOT] + chain(5))
+case("A: LINEAGE-BASELINE pins out all 5 -> new child ok", bpin,
+     bpin + task("M0142-0008a-5", " ", parent="M0142-0008a-4"), None)
+PIN1 = "# Fix plan\n\n## Current Priority\nLINEAGE-BASELINE: M0142-0008 M0142-0008a-0\n1. x\n\n## M0142 — stuff\n\n"
+c6pin = chain(6)
+case("A: pin leaves 5 unlisted none-completions -> still violation",
+     PIN1 + "".join([ROOT] + c6pin),
+     PIN1 + "".join([ROOT] + c6pin) + task("M0142-0008a-6", " ", parent="M0142-0008a-5"), "A")
+PINWRONG = "# Fix plan\n\n## Current Priority\nLINEAGE-BASELINE: M0141-0001 M0142-0008a-0 M0142-0008a-1 M0142-0008a-2 M0142-0008a-3 M0142-0008a-4\n1. x\n\n## M0142 — stuff\n\n"
+case("A: pin under a different root does not help", PINWRONG + "".join([ROOT] + chain(5)),
+     PINWRONG + "".join([ROOT] + chain(5)) + task("M0142-0008a-5", " ", parent="M0142-0008a-4"), "A")
+case("A: pin added in the same candidate as the new child applies",
+     plan(ROOT, *chain(5)),
+     PIN + "".join([ROOT] + chain(5)) + task("M0142-0008a-5", " ", parent="M0142-0008a-4"), None)
+# new completions AFTER the pin still accumulate toward a fresh budget
+bpin_grow = PIN + "".join([ROOT] + chain(5) + [
+    task(f"M0142-0008b-{i}", "x", parent=f"M0142-0008b-{i-1}" if i else "M0142-0008",
+         movement="none") for i in range(5)])
+case("A: post-pin completions rebuild the budget -> violation", bpin_grow,
+     bpin_grow + task("M0142-0008b-5", " ", parent="M0142-0008b-4"), "A")
+
 # --- misc -------------------------------------------------------------------
 case("unchanged -> ok", b, b, None)
 case("heading ends a task body (Parent after heading ignored)",
