@@ -41,6 +41,12 @@ Directly verifiable once M0094-0001 lands.
 - `$standby->poll_query_until(...)` → polling loop with `rc.Standby.Query(...)`
 - No archiving required; skip archive-related assertions.
 
+**2026-09-22 completion update:** The port now issues `INSERT INTO repl001
+VALUES (1)` after the receiver is streaming and polls the hot standby for
+`count(*) = 1`, without forcing a checkpoint. This restores the upstream
+visible-data assertion across primary, receiver, writer, stream replayer, and
+hot-standby visibility.
+
 ### TestPort_Recovery013CrashRestart
 **Upstream:** `postgres/src/test/recovery/t/013_crash_restart.pl`
 **Rationale:** Tests that a server killed with SIGKILL restarts cleanly and WAL

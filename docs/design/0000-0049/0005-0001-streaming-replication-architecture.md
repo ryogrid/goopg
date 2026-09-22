@@ -168,16 +168,79 @@ beyond `CopyBoth`.
                                   +-----------+   last apply LSN)
 ```
 
-**Standby promotion** (deferred to a follow-up loop but designed
-in here for the protocol surface):
+### Standby restart invariant
 
-- Trigger: `goopg promote -D <dir>` over the existing control
-  socket (new `OnPromote` callback in
-  `internal/control/control.go`).
-- Effect: standby's recovery loop drains all received WAL up
-  to the last received LSN, writes an `END_OF_RECOVERY`
-  marker, removes `standby.signal`, and switches to primary
-  mode. Existing connection is closed.
+A physical standby owns neither a WAL timeline nor a writable WAL tail before
+promotion. Its checkpointer therefore flushes replayed data pages and CLOG on
+shutdown without appending a local checkpoint record or rewriting
+`pg_control`. The next walreceiver connection resumes from the durable tail of
+the primary byte stream. Appending a local shutdown checkpoint would advance
+that tail past the received stream and make the next `START_REPLICATION`
+position point into unrelated primary WAL.
+
+`Checkpointer.SetRecoveryMode` selects this flush-only path during
+`initdb.Open` when `standby.signal` is present. This applies to periodic, SQL,
+and shutdown checkpoint requests alike; promotion clears the recovery role
+before any primary checkpoint can write WAL. The end-to-end standby-attach
+restart test verifies that a primary insert after standby Stop plus Start is
+received and visible without a forced checkpoint.
+
+### What this is NOT: a restartpoint \(2026\-09\-22\)
+
+The paragraph above says the standby flushes "without appending a local
+checkpoint record or rewriting `pg_control`". The first half is PostgreSQL's
+rule; **the second half is a goopg gap, not a design choice**, and it is
+recorded here so the next reader does not take it for parity.
+
+PostgreSQL's standby counterpart to a checkpoint is `CreateRestartPoint`
+\(`postgres/src/backend/access/transam/xlog.c`\). It calls `CheckPointGuts` —
+the same durability half goopg's `runRecoveryFlush` performs — and then
+**advances `pg_control`** from the LAST REPLAYED checkpoint record:
+`ControlFile->checkPoint`, `ControlFile->checkPointCopy`, and, in
+`DB_IN_ARCHIVE_RECOVERY`, `minRecoveryPoint`/`minRecoveryPointTLI` up to that
+record's end. It never writes a NEW checkpoint record — it reuses one the
+primary already sent, which is exactly why it is safe.
+
+goopg does the flush and skips the `pg_control` advance. The consequence is
+bounded and not a correctness bug: a restarted standby replays from an older
+position than PostgreSQL would, and its `pg_control` reports a stale checkpoint
+to any reader inspecting the directory \(including PG's own tools\). The resume
+point is in the deferral ledger, 2026\-09\-22, M0122\-0013.
+
+The complementary primary-restart boundary is pinned separately: a running
+standby must survive a primary Stop plus Start, redial the same endpoint, and
+replay a row committed after the primary returns. The reconnect loop retains
+the received WAL tail across the disconnected interval, so this path exercises
+the ordinary walreceiver retry rather than standby bootstrapping.
+
+A crash-time disconnect has an additional catch-up obligation: the primary
+can commit while no receiver is connected, while the physical slot preserves
+the standby's restart position. On standby recovery, the receiver resumes from
+its durable tail and replays the complete outage interval in order.
+`TestE2E_PhysicalReplicationCatchesUpAfterStandbyCrash` kills a caught-up
+standby, commits twelve rows on the live primary, then asserts every row after
+the standby recovers and reconnects.
+
+### Promotion restart invariant
+
+A caught-up standby promoted through `goopg promote -D <dir>` must become a
+durable primary, not merely a writable process until its next restart. The
+promotion controller persists its new timeline in both the timeline file and
+`pg_control`, removes `standby.signal`, and returns its checkpointer to normal
+WAL-producing mode. A subsequent stop plus start must therefore retain the
+replayed history and accept a new primary write.
+
+`TestE2E_PhysicalPromotionPersistsAcrossRestart` pins this sequence: it stops
+the old primary after the standby catches up, promotes the standby, writes a
+row, restarts the promoted node, and writes another row. The final ordered
+result proves both the received and post-promotion histories survived the
+handoff.
+
+The same promotion path is valid after an abrupt primary loss. A caught-up
+standby need not wait for a clean walsender shutdown before ownership changes:
+`TestE2E_PhysicalPromotionAfterPrimaryCrash` kills the old primary, promotes
+the standby, and verifies both its replayed row and its first locally-written
+row on the new primary.
 
 ## Hooks into existing goopg code
 
@@ -311,6 +374,17 @@ The harness lives at `internal/testutil/replcluster/` (mirroring
 the existing `internal/testutil/cluster/`). A new design doc
 `0005-0003-replication-observability.md` will define the
 status-view surface the test queries.
+
+### M0122 lifecycle closure (2026-09-22)
+
+The single-timeline goopg-to-goopg lifecycle boundary is covered by direct
+integration tests: ordinary streamed visibility, a standby restart, a primary
+restart with walreceiver reconnect, standby-outage catch-up from its retained
+slot, and promotion following both orderly shutdown and abrupt primary loss.
+Promotion also has a cold-restart durability test for the new primary. These
+tests intentionally do not claim an in-process WAL timeline switch: `Writer`'s
+timeline is immutable for its process lifetime, and the M0130-S8 owner covers
+that multi-timeline protocol work.
 
 ## Out of scope
 

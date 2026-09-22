@@ -2793,6 +2793,36 @@ the whole file's active task between 2026-09-01 and 2026-09-14; **since
     - No ledger row: performance infrastructure, not a PostgreSQL semantic
       omission \(the doc states this\).
 - [ ] **M0122-0013 — Physical/streaming replication & standby**.
+  - **Standby recovery\-checkpoint mode LANDED 2026\-09\-22 \(loop \#12\)** as
+    `e646499b0`. Movement: none — recovery path; `PLAN-SHAPE same=99 changed=0`.
+    Design: `docs/design/0000-0049/0005-0001-streaming-replication-architecture.md`.
+    - The bug: a physical standby ran the ORDINARY checkpoint path, appending a
+      checkpoint record to WAL and advancing the local tail — the very position
+      the walreceiver resumes `START_REPLICATION` from, and one the primary
+      owns. The next request then pointed past \(or into\) the primary's stream.
+    - The fix: a recovery mode set at startup, cleared at promotion, in which
+      `runRecoveryFlush` does the durability half \(buffers, CLOG, data\-file
+      sync, same ordering\) and writes NO WAL.
+    - **The pin is one test, and it is named**:
+      `TestE2E_PhysicalReplicationCatchesUpAfterStandbyCrash` FAILS with the
+      mode neutralised \(35 s catch\-up timeout\). The other three new E2Es
+      \(primary restart, promotion across restart, promotion after primary
+      crash\) pass either way — coverage, not the pin. All run on
+      `replcluster`'s durable `SyncInit: true` config.
+    - **A logged note became an assertion.**
+      `TestE2E_StandbyAttachRetainsUpstreamRowsAfterRestart` previously only
+      LOGGED whether a restarted standby resumed streaming, on the grounds that
+      "the v0 harness does not re-establish the walreceiver stream after a
+      standby restart". That note WAS this bug; the test now fails if the
+      standby stays stale.
+    - **Ledgered gap**: PG's `CreateRestartPoint` also advances `pg_control`
+      \(`checkPoint`, `checkPointCopy`, `minRecoveryPoint`\) from the last
+      REPLAYED checkpoint record. goopg's recovery flush leaves `pg_control`
+      untouched — safe, but a restarted standby replays from an older position
+      than PG would. Resume point in the ledger row.
+    - Gates: xlog units + `-race`; initdb units; four replication E2Es plus the
+      attach roundtrip; tpch\-spotcheck Q12=2/Q13=33; tpcds\-sf025 `PASS=96
+      MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0`; pgbench smoke.
 - [ ] **M0122-0014 — Logical replication / decoding / subscription**.
 - [ ] **M0122-0015 — Test-suite porting: amcheck / verify_heapam / pg_dump**.
 
