@@ -2453,6 +2453,24 @@ the whole file's active task between 2026-09-01 and 2026-09-14; **since
       between them — it raises the cost of leaving the sentinel in place,
       since the hazard now has a demonstrated data\-integrity consequence
       beyond the extension\-attribution symptom the item was filed for.
+  - **CENSUS 2026\-09\-22 (loop \#24), for the same decision**:
+    `docs/design/0100-0149/0122-0007-per-database-scoping-census.md` measures
+    the whole family across five object types and two databases.
+    - `template1` leaks **every** type tested from `postgres` — tables,
+      sequences, views, functions, indexes. `userdb` is correctly isolated
+      for four of the five, which localises this fault to the shared
+      `DefaultDBOid` sentinel and not to database scoping generally.
+      `pg_class` is correctly scoped.
+    - **The fifth probe is a SECOND, independent defect that Option A would
+      NOT fix**: functions are not database\-scoped. `p_fn()` created in
+      `postgres` is callable from `userdb`; `u_fn()` created in `userdb` is
+      NOT callable from `postgres`; and `pg_proc` in every database lists
+      both. Resolution falls back to the default namespace. In PostgreSQL
+      `pg_proc` is per\-database, so both halves diverge.
+    - So the options are **not** equivalent in coverage: Option A addresses
+      the template1 defect completely and the function defect not at all;
+      Option B addresses both by construction. The census deliberately stops
+      there and does not recommend — that remains the owner's call.
   - Repro: `psql -d template1 -c "CREATE EXTENSION amcheck"`, restart, then
     count `pg_extension` rows per database. Before: template1=1, postgres=0
     (the in-memory registry is correct at RUNTIME). After: template1=0,
