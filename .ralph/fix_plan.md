@@ -2647,7 +2647,7 @@ the whole file's active task between 2026-09-01 and 2026-09-14; **since
   - Same shape as the per-database reload gaps closed under M0119-0006
     (bs/bw slices), so those are the template.
 
-- [ ] **aclitem array order differs from PostgreSQL** (measured 2026-09-22
+- [x] **aclitem array order differs from PostgreSQL** (measured 2026-09-22
   against a live PG 18.3 while capturing the GRANT oracle).
   Kind: bug
   Parent: M0122-0008
@@ -2659,6 +2659,38 @@ the whole file's active task between 2026-09-01 and 2026-09-14; **since
     array order — so this is a visible, dumpable property, not formatting.
   - Not a correctness gap for goopg's own reads; it diverges for a PG
     consumer comparing arrays element-wise, e.g. a `pg_dump` diff.
+  - **LANDED 2026\-09\-22 \(loop \#8\)**, and the row's own framing needed a
+    correction first. Movement: none — catalog text, no plan can move
+    \(`PLAN-SHAPE same=99 changed=0`\).
+    Design: `docs/design/0100-0149/0122-0008-aclitem-world-entry-order.md`.
+    - **"World entry first" is NOT the rule; it is half of it.** `acldefault`
+      \(`acl.c:804`\) writes a world item only for the classes whose
+      `world_default` is non\-zero — DATABASE, FUNCTION, LANGUAGE, TYPE.
+      TABLE, SEQUENCE, SCHEMA, COLUMN, TABLESPACE, LARGE OBJECT,
+      PARAMETER\_ACL, FDW and FOREIGN SERVER have `ACL_NO_RIGHTS`, so a PUBLIC
+      entry there can only come from an explicit GRANT, and `aclupdate`
+      APPENDS it without sorting.
+    - The working tree carried a draft that hoisted PUBLIC for EVERY class.
+      Measured on a private PG 18.3: a table reads
+      `{postgres=arwdDxtm/postgres,bob=r/postgres,=r/postgres}` while a
+      database reads `{=Tc/postgres,postgres=CTc/postgres,bob=c/postgres}` —
+      so the draft would have introduced a divergence while fixing one.
+    - Landed rule: `relaclTextLockedFor` takes the class's world\-default
+      property explicitly; five draft expectations restored to the
+      oracle\-true strings, the type/database/function ones kept.
+      `TestACLPublicItemPositionFollowsAcldefault` pins BOTH arms together
+      \(one arm alone cannot tell "leads" from "trails"\); non\-vacuity
+      checked.
+    - Gates: catalog + executor units; tpch\-spotcheck Q12=2/Q13=33;
+      tpcds\-sf025 `PASS=96 MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0`;
+      full `TestPort_RegressSuite` with an unchanged failing set
+      \(`partition_aggregate` only\); pgbench smoke.
+    - **Attribution warning**: the code first landed inside a mixed commit
+      (subject: the lineage\-baseline re\-pin) because a concurrent
+      owner\-side agent ran a bare `git commit` in this checkout and consumed
+      the staged index; the owner then had it split, and the code now sits
+      in `a65157d9f` under its own subject. Commit with an explicit
+      pathspec here, always.
   - Resume: the shared renderer behind `DatabaseACLText` / `TypeACLText` /
     `relaclTextLockedFor` (its owner branch emits the owner entry first).
     Fix ONCE there — it moves `relacl`, `typacl`, `paracl` and `datacl`
