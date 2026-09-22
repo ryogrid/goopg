@@ -2874,6 +2874,35 @@ the whole file's active task between 2026-09-01 and 2026-09-14; **since
       Q12=2/Q13=33; tpcds\-sf025 `PASS=96 MISMATCH=0 CKMISMATCH=0 ERROR=0
       TIMEOUT=0`; acceptance arm 24 MATCH; pgbench smoke.
 - [ ] **M0122-0015 — Test-suite porting: amcheck / verify_heapam / pg_dump**.
+  - [ ] **M0122-0015a — `COPY` resolves relations in the DEFAULT database, so
+    `pg_dump` of any user-created database has no data**
+    Kind: impl
+    Parent: M0122-0015
+    Discovered 2026\-09\-22 (loop \#21) while porting `010_dump_connstr.pl`.
+    - **Measured**: inside any `CREATE DATABASE`\-created database,
+      `COPY t1 TO stdout` raises `relation "t1" does not exist` while
+      `SELECT count(*) FROM t1` in the SAME session returns rows. Both the
+      unqualified and the `public.`\-qualified spellings fail, so it is not
+      schema resolution. A plainly\-named `plaindb` reproduces it, so it is
+      not the exotic name the port was exercising.
+    - **Consequence**: `pg_dump <userdb>` emits schema and then dies at the
+      first `COPY public.<t> TO stdout`. Every existing pg\_dump port in the
+      package dumps the `postgres` database, which is why nothing caught it.
+    - **Root cause**: `internal/postmaster/copy.go` \(~:150\-195\) builds the
+      standalone `COPY ... TO STDOUT` path's `executor.Context` BY HAND and
+      never assigns `CurrentDatabase`/`CurrentDatabaseOid`; catalog lookups
+      then fall back to the default database. The normal query path sets it at
+      `internal/postmaster/dispatch.go:3238`.
+    - **Third occurrence of the same shape** — the identical hand\-built
+      context was caught missing session GUC hooks \(M0119\-0006\) and session
+      identity \(M0134\-0009 R5\). Both were patched field\-by\-field; the
+      durable fix is to construct it from the same path the batch dispatch
+      uses. Sibling audit belongs in that change, not a fourth patch.
+    - **Blocked from landing** by the `commit-msg` fire\-set `set -e` abort
+      \(`maintenance_prompts/commit-msg-fireset-arm-owner-action.md`\):
+      `internal/postmaster/` is outside the fire\-set scope, so the fix cannot
+      be committed until the owner repairs the hook. The port and the ledger
+      rows land now; the fix waits.
   - [!] **BLOCKED — OWNER ACTION NEEDED \(2026\-09\-22, loop \#17\)**. The
     foreign\-table durability work below is complete, fully gated and
     **staged**, but `git commit` cannot land it: the `commit-msg` hook exits
