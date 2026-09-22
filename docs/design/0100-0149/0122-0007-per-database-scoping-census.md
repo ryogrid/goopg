@@ -1,6 +1,6 @@
 # M0122\-0007 per\-database scoping census
 
-Status: **measurement only, 2026\-09\-22**. No code change. Parent: M0122\-0007
+Status: **measurement only, 2026\-09\-22** (two passes: loops \#24 and \#25). No code change. Parent: M0122\-0007
 (per\-database\-namespace epic, slices 4b\-4e open).
 
 ## Why this exists
@@ -66,6 +66,38 @@ catalog layer is already scoped for relations and is not for procedures.
 
 In PostgreSQL `pg_proc` is a per\-database catalog; both facts are divergences.
 
+## Second pass (2026\-09\-22, loop \#25): is defect 2 a one\-off or a class?
+
+The first pass left that open, and it changes Option B's size, so it was
+measured. Objects created in `postgres` **after** `userdb` already existed (so
+template inheritance cannot explain any result), probed from `userdb`:
+
+| catalog | object created in `postgres` | seen from `userdb` | PG 18.3 |
+|---|---|---|---|
+| `pg_class` | table `p_t` | `0` ✓ | `0` |
+| `pg_type` | domain / enum / composite | `0` ✓ | `0` |
+| `pg_trigger` | trigger `p_trg` | `0` ✓ | `0` |
+| `pg_proc` | function `p_trgfn` | **1 ✗** | `0` |
+| `pg_namespace` | schema `p_schema` | **1 ✗** | `0` |
+
+**Answer: a class of exactly two — `pg_proc` and `pg_namespace`.** Relations,
+types and triggers are correctly scoped, so this is not "catalogs are global";
+it is two specific registries.
+
+The schema case is **worse than the function case**, in two ways:
+
+- It is **usable, not merely visible**: `CREATE TABLE p_schema.inuserdb(a int)`
+  succeeds from `userdb` against a schema created in `postgres`.
+- It is **bidirectional**: a schema created in `userdb` is equally visible from
+  `postgres`. The function defect is asymmetric (only the default namespace
+  leaks outward), which is what made it look like a fallback; this one is a
+  genuinely global registry.
+
+Note for anyone reading the M0119\-0006 history: the 2026\-09\-22 `bw` slice
+landed a **per\-database `pg_namespace` reload**, which fixed restart
+durability of schemas. That is a different axis from live cross\-database
+scoping, which is what this row measures — `bw` is not contradicted by it.
+
 ## What this says about the pending decision
 
 Stated as evidence, not as a recommendation:
@@ -74,6 +106,10 @@ Stated as evidence, not as a recommendation:
   completely and defect 2 **not at all**.
 - Option B (one oid per database at every layer) addresses both by
   construction, and is the larger change.
+- Defect 2 is a class of **two** registries (`pg_proc`, `pg_namespace`), not a
+  one\-off, and not a general catalog failure — three other catalogs are
+  correctly scoped. That bounds Option B's extra surface rather than leaving it
+  open\-ended.
 - The census does not establish that defect 2 is cheap or expensive to fix
   independently; no attempt was made to locate its fix site, because that
   would be scope this measurement does not need.
@@ -95,5 +131,5 @@ actually run this loop:
 
 ## Gates
 
-None — no code changed. The probes are reproducible from the table above
+None — no code changed. Every probe is reproducible from the two tables above
 against a throwaway cluster.

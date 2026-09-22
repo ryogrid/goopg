@@ -2471,6 +2471,22 @@ the whole file's active task between 2026-09-01 and 2026-09-14; **since
       the template1 defect completely and the function defect not at all;
       Option B addresses both by construction. The census deliberately stops
       there and does not recommend — that remains the owner's call.
+  - **CENSUS PASS 2 2026\-09\-22 (loop \#25)** — answers whether that second
+    defect is a one\-off, since that sizes Option B.
+    - **It is a class of exactly TWO registries**: `pg_proc` and
+      `pg_namespace` leak across databases; `pg_class`, `pg_type`
+      (domain/enum/composite) and `pg_trigger` are correctly scoped. So it is
+      NOT a general catalog failure, and Option B's extra surface is bounded
+      rather than open\-ended.
+    - Probe ordering rules out template inheritance: the objects were created
+      in `postgres` **after** `userdb` already existed.
+    - **The schema case is the worse of the two.** It is *usable*, not merely
+      visible — `CREATE TABLE p_schema.inuserdb(a int)` succeeds from `userdb`
+      against a schema created in `postgres` — and it is *bidirectional*,
+      where the function case is an asymmetric default\-namespace fallback.
+    - Not a contradiction of the `bw` slice: that landed a per\-database
+      `pg_namespace` **reload** (restart durability), which is a different
+      axis from live cross\-database scoping, and is not the fix site.
   - Repro: `psql -d template1 -c "CREATE EXTENSION amcheck"`, restart, then
     count `pg_extension` rows per database. Before: template1=1, postgres=0
     (the in-memory registry is correct at RUNTIME). After: template1=0,
