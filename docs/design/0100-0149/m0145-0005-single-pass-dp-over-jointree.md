@@ -480,6 +480,68 @@ The executor-capability refusals (FULL hash, partial shapes the executor
 cannot run) stay at path generation until the D3 executor substrate lands —
 they are not planner-flow divergence.
 
+## The relset ceiling: measured, and recorded as a deliberate divergence (2026-09-22)
+
+The slice audit left one decline class explicitly unowned: `leaf-count-overflow`
+is a `RelSet` bit-width refusal (`len(scans) > maxSearchRels`,
+joinsearchseam.go:498) that survives any change in WHERE the leaf count comes
+from, so the IR-direct slice had to "either widen `RelSet` or record the limit
+as a deliberate divergence". This section records it, with the measurement that
+decides it.
+
+### What PostgreSQL does
+
+PG has no ceiling at all: `Relids` is a `Bitmapset` (bitmapset.c) grown on
+demand, so `join_is_legal`'s masks are unbounded. What bounds PG in practice is
+not representation but search strategy — `from_collapse_limit` /
+`join_collapse_limit` (8) decide how many items are flattened into one problem,
+and above `geqo_threshold` (12) `make_rel_from_joinlist` hands the problem to
+GEQO instead of the exhaustive DP (allpaths.c:3352).
+
+goopg reproduces the strategy half exactly — `relfromjoinlist.go:846` routes to
+`geqoSearch` at `len(items) >= cp.geqoThreshold`, same default 12 — and diverges
+on the representation half: `RelSet` is a `uint32` (path.go:33) and
+`maxSearchRels` is 32, refused at three independent sites (the seam's
+`size-or-no-joinlist` size check, the `leaf-count-overflow` check after leaf
+extraction, and `newSearchCtx`'s own guard).
+
+### What the divergence costs: measured, not argued
+
+Corpus witnesses: **zero**. Neither benchmark corpus reaches 32 leaves, and no
+sweep's seam-decline census has ever recorded a `leaf-count-overflow` fire
+(the current SF0.25 census reads `lateral 1 / leaf-count 27 /
+outer-over-derived 3 / outer-spine 2 / residual-hits-pad 1`).
+
+Beyond the corpus, measured live on a throwaway cluster (33 tables of 3 rows,
+joined on one key):
+
+| relations | plan | result |
+|---|---|---|
+| 32 | searched — 31 `Merge Join`s, `Aggregate cost=35.37` | correct |
+| 33 | fallback — 32 `Hash Join`s in FROM order, `Aggregate cost=1.33` | correct (3 rows, checksum 288) |
+
+So the ceiling is a **missed optimisation, never a wrong answer**: past it the
+seam returns the caller's own tree and residual untouched, the statement plans
+syntactically, every qual is still enforced, and the query executes. That is
+what `TestSeamDeclinesAtTheRelSetWidth` pins, with the 32-relation arm as the
+non-vacuity control — at exactly the width the identical fixture IS searched, so
+the refusal is provably the width and not some other property of a wide FROM
+list.
+
+### Why not widen now
+
+Widening is a two-line change (`type RelSet uint32` -> `uint64`,
+`maxSearchRels` 32 -> 64) and is structurally safe: nothing allocates on `1 <<
+nrels` — `searchCtx.joinrels` is per level and `relMap` is keyed by `RelSet`,
+which is PG's own structure — and GEQO already caps the enumeration above 12
+relations, so a wider ceiling does not hand the exhaustive DP a problem it
+cannot finish. What it costs is 4 bytes on every `RelSet` field of every `Path`
+and `RelOptInfo` in every query, for a population that measures zero. This
+milestone's own rule (R6) is not to change the engine toward a plan nobody
+measured; the change is therefore ledgered with that resume point rather than
+made, and the boundary is pinned so a future widening has a test that must move
+with it.
+
 ## Oracle anchors
 
 | PG | goopg |

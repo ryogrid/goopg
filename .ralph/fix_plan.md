@@ -14406,6 +14406,34 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
       executor-substrate-blocked class already ledgered as staying.
       Grouped `j.Right` joins ruled out (one binding AND one joinlist
       item — admitted as 2-rel problems).
+    - **`leaf-count-overflow` OWNED and CLOSED 2026\-09\-22 \(loop \#5\)** —
+      recorded as a deliberate divergence, with the boundary pinned. Movement:
+      none — test\-only.
+      Design: the design doc's §"The relset ceiling".
+      - PG has NO ceiling: `Relids` is a `Bitmapset` \(bitmapset.c\) grown on
+        demand. What bounds PG is strategy, not representation — the collapse
+        limits \(8\) and `geqo_threshold` \(12\). goopg reproduces the strategy
+        half exactly \(`relfromjoinlist.go:846` routes to `geqoSearch` at the
+        same default 12\) and diverges on the representation half:
+        `RelSet` is `uint32`, `maxSearchRels` 32, refused at three independent
+        sites.
+      - **Measured live**, 33 tables of 3 rows joined on one key: at 32
+        relations the problem is searched \(31 `Merge Join`s\); at 33 it falls
+        back to the syntactic tree \(32 `Hash Join`s in FROM order\) and
+        **returns the correct answer** \(3 rows, checksum 288\). The ceiling is
+        a missed optimisation, never a wrong answer.
+      - Corpus witnesses remain **zero** — no sweep's seam census has recorded
+        a `leaf-count-overflow` fire.
+      - Pinned by `TestSeamDeclinesAtTheRelSetWidth` \(+ the constructor guard
+        pin\). The 32\-relation arm is the non\-vacuity control and is
+        load\-bearing: at exactly the width the identical fixture IS searched,
+        so the refusal is provably the width.
+      - **Not widened, and why**: the change is two lines \(`RelSet` ->
+        `uint64`, `maxSearchRels` -> 64\) and structurally safe \(nothing
+        allocates on `1 << nrels`; GEQO already caps enumeration above 12\), but
+        it costs 4 bytes on every `RelSet` field of every `Path`/`RelOptInfo`
+        in every query for a population that measures zero. Ledgered with that
+        resume point per R6.
     - The pushdown family cannot die wholesale (declined + legacy-arm
       statements still need the post-search cleanups); the correct
       retirement shape is stopping it at the searched boundary. Audit:
