@@ -57,6 +57,36 @@ func TestPgoutputDecoderRoundTripCommit(t *testing.T) {
 	}
 }
 
+// TestPgoutputDecoderRoundTripMessage pins pgoutput protocol-v1's extension
+// message frame. The payload is intentionally binary: MESSAGE is not a text
+// tuple and its bytes must be preserved exactly.
+func TestPgoutputDecoderRoundTripMessage(t *testing.T) {
+	var buf bytes.Buffer
+	po := NewPgOutput(&CatalogSnapshot{}, &buf)
+	wantPayload := []byte{0x00, 0xff, 'o', 'k'}
+	if err := po.Message(true, 0x0123456789abcdef, "acme.example", wantPayload); err != nil {
+		t.Fatal(err)
+	}
+	m, err := DecodeMessage(buf.Bytes())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.Kind != pgoMessage || !m.MessageTransactional {
+		t.Errorf("message kind/transactional = %q/%t, want M/true", m.Kind, m.MessageTransactional)
+	}
+	if m.MessageLSN != 0x0123456789abcdef || m.MessagePrefix != "acme.example" {
+		t.Errorf("message lsn/prefix = %x/%q", m.MessageLSN, m.MessagePrefix)
+	}
+	if !bytes.Equal(m.MessagePayload, wantPayload) {
+		t.Errorf("message payload = %x, want %x", m.MessagePayload, wantPayload)
+	}
+
+	truncated := buf.Bytes()[:len(buf.Bytes())-1]
+	if _, err := DecodeMessage(truncated); err == nil {
+		t.Fatal("truncated MESSAGE accepted")
+	}
+}
+
 // TestPgoutputDecoderRoundTripRelationAndInsert: end-to-end
 // the encoder emits `R` followed by `I`; the decoder splits them
 // and the tuple body round-trips byte-for-byte.

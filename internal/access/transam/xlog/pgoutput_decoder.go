@@ -28,10 +28,10 @@ type DecodedMessage struct {
 	Kind byte
 
 	// Begin / Commit fields.
-	XID         storage.TransactionID
-	CommitLSN   uint64
-	EndLSN      uint64
-	CommitTime  uint64
+	XID        storage.TransactionID
+	CommitLSN  uint64
+	EndLSN     uint64
+	CommitTime uint64
 
 	// Relation field — populated for kind == 'R'.
 	Relation *DecodedRelation
@@ -49,6 +49,15 @@ type DecodedMessage struct {
 	// this to mirror upstream's `apply_handle_truncate` policy.
 	TruncateRels   []uint32
 	TruncateOption byte
+
+	// Message fields — populated for kind == 'M'. MessageTransactional is
+	// bit zero of the protocol flags byte. MessageLSN is independent of a
+	// transaction's commit LSN: non-transactional messages are delivered at
+	// their own WAL position.
+	MessageTransactional bool
+	MessageLSN           uint64
+	MessagePrefix        string
+	MessagePayload       []byte
 }
 
 // DecodedRelation is the parsed `R` message body.
@@ -211,6 +220,35 @@ func DecodeMessage(payload []byte) (*DecodedMessage, error) {
 		out.RelOID = oid
 		out.OldTuple = oldCols
 		out.NewTuple = newCols
+		return out, nil
+	case pgoMessage:
+		// 'M' | flags(1) | lsn(8) | prefix(NUL) | size(4) | payload.
+		// Protocol v1 has no xid field; v2 adds it only while streaming an
+		// in-progress transaction.
+		flags, err := r.u8()
+		if err != nil {
+			return nil, err
+		}
+		lsn, err := r.u64()
+		if err != nil {
+			return nil, err
+		}
+		prefix, err := r.cstring()
+		if err != nil {
+			return nil, err
+		}
+		ln, err := r.u32()
+		if err != nil {
+			return nil, err
+		}
+		payload, err := r.bytes(int(ln))
+		if err != nil {
+			return nil, err
+		}
+		out.MessageTransactional = flags&0x01 != 0
+		out.MessageLSN = lsn
+		out.MessagePrefix = prefix
+		out.MessagePayload = payload
 		return out, nil
 	case pgoTruncate:
 		// 'T' | nrelids(4) | option_bits(1) | relids(4*nrelids)
