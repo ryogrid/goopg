@@ -936,6 +936,11 @@ type BTree struct {
 	// separator, even when both writers see the same OLD
 	// root.)
 	splitMu sync.Mutex
+	// sharedSplitMu is the pool-owned, relation-scoped counterpart of splitMu.
+	// Normal Open/Create handles use it so independent backend handles cannot
+	// interleave structural changes; local splitMu remains a safe fallback for
+	// direct package test literals.
+	sharedSplitMu *sync.Mutex
 
 	// M0055-0001: write-path counters used by the baseline
 	// harness and Phase A/B regression tests. Backed by per-P
@@ -1085,6 +1090,22 @@ type BTree struct {
 	// temporal ordering — e.g. "did any rewrite event on this block happen
 	// after this specific insert". Guarded by insertLogMu.
 	logSeqNext uint64
+}
+
+func (bt *BTree) lockStructural() {
+	if bt.sharedSplitMu != nil {
+		bt.sharedSplitMu.Lock()
+		return
+	}
+	bt.splitMu.Lock()
+}
+
+func (bt *BTree) unlockStructural() {
+	if bt.sharedSplitMu != nil {
+		bt.sharedSplitMu.Unlock()
+		return
+	}
+	bt.splitMu.Unlock()
 }
 
 // btreeInsertLogEvent is one recorded insertItemSorted call (see
@@ -1884,7 +1905,7 @@ func Open(pool *storage.Pool, rel storage.RelFileNode) (*BTree, error) {
 
 // OpenWithOptions is the wired-up Open variant.
 func OpenWithOptions(pool *storage.Pool, rel storage.RelFileNode, opts Options) (*BTree, error) {
-	bt := &BTree{pool: pool, rel: rel, logSplit: opts.LogSplit, keyFmt: indexFormat{desc: opts.KeyDesc}, deadTIDs: opts.DeadTIDs}
+	bt := &BTree{pool: pool, rel: rel, logSplit: opts.LogSplit, keyFmt: indexFormat{desc: opts.KeyDesc}, deadTIDs: opts.DeadTIDs, sharedSplitMu: pool.BTreeStructuralLock(rel)}
 	meta, err := bt.readMeta()
 	if err != nil {
 		return nil, err
@@ -1934,7 +1955,7 @@ func adaptPoolLogSplit(pool *storage.Pool) LogSplitFunc {
 
 // CreateWithOptions is the wired-up Create variant.
 func CreateWithOptions(pool *storage.Pool, rel storage.RelFileNode, opts Options) (*BTree, error) {
-	bt := &BTree{pool: pool, rel: rel, logSplit: opts.LogSplit, keyFmt: indexFormat{desc: opts.KeyDesc}, deadTIDs: opts.DeadTIDs}
+	bt := &BTree{pool: pool, rel: rel, logSplit: opts.LogSplit, keyFmt: indexFormat{desc: opts.KeyDesc}, deadTIDs: opts.DeadTIDs, sharedSplitMu: pool.BTreeStructuralLock(rel)}
 
 	// Ensure the relation file starts at block 0 (see
 	// BulkCreateWithOptions for rationale).
@@ -2602,8 +2623,8 @@ func (bt *BTree) Insert(key []byte, ptr storage.ItemPointer) error {
 	// in this commit handles concurrent root-lifts; the rest
 	// of the structural-update path remains under splitMu.)
 	bt.stats.splits.Add(1) // M0055-0001 — counts insert calls that take the split-path retry.
-	bt.splitMu.Lock()
-	defer bt.splitMu.Unlock()
+	bt.lockStructural()
+	defer bt.unlockStructural()
 
 	leafBlk, path, err := bt.descendToLeaf(key)
 	if err != nil {
@@ -3327,8 +3348,8 @@ func (bt *BTree) finishSplit(blk storage.BlockNumber) error {
 
 	// Walk to the parent and insert the separator. We descend by
 	// the separator key so the parent path is reconstructed.
-	bt.splitMu.Lock()
-	defer bt.splitMu.Unlock()
+	bt.lockStructural()
+	defer bt.unlockStructural()
 	_, path, err := bt.descendToLeaf(sepKey)
 	if err != nil {
 		return err

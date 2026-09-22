@@ -453,8 +453,8 @@ func (bt *BTree) unlinkEmptyLeaf(leaf emptyLeafInfo) error {
 	// applyParentDownlinkRemoval's own doc comment for how that
 	// cross-connection case is closed independently, by re-locating
 	// the downlink by block identity instead of trusting the index.)
-	bt.splitMu.Lock()
-	defer bt.splitMu.Unlock()
+	bt.lockStructural()
+	defer bt.unlockStructural()
 
 	// M-NIGHTLY (AI-20260706-201855-001, loop 9): the caller
 	// (VacuumIndexPages) marks a leaf BTHalfDead|BTDeleted while
