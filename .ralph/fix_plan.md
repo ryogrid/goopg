@@ -2852,6 +2852,37 @@ the whole file's active task between 2026-09-01 and 2026-09-14; **since
       Q12=2/Q13=33; tpcds\-sf025 `PASS=96 MISMATCH=0 CKMISMATCH=0 ERROR=0
       TIMEOUT=0`; acceptance arm 24 MATCH; pgbench smoke.
 - [ ] **M0122-0015 — Test-suite porting: amcheck / verify_heapam / pg_dump**.
+  - **Inventory promotion 2026\-09\-22 \(loop \#14\): three rows were STALE, and
+    the published coverage was understating reality.** Movement: none — no
+    production code; the tests already existed and passed.
+    - `003_check.pl`, `004_verify_heapam.pl` and `005_opclass_damage.pl` were
+      all `status=not-tried, pass_required=no` while six ported tests exercise
+      them and pass \(`TestPort_PgAmcheck003CombinedCorruption`,
+      `…003MissingIndexFork`, `…003MissingHeapFile`, `…003SchemaScoped`,
+      `…004VerifyHeapam`, `…005OpclassDamage`\). Verified by running them
+      before touching the CSV.
+    - Worse than a status typo: the generated coverage docs carried the
+      auto\-default rationale **"Upstream binary pg\_amcheck is outside goopg's
+      current server\-focused scope"** for files that have working ports — a
+      statement the tests refute.
+    - Promoted to `port` / `pass_required=yes` with rationales that name the
+      Go tests AND state the subset boundary, following the convention
+      AC\-001 / BB\-020 / RW\-001 / WD\-001 already use for tiered ports. The
+      remainder \(unsupported index AMs, box/int4range/int4\[\] types, STORAGE
+      EXTERNAL TOAST corruption, multi\-database orchestration, and 004's
+      MVCC/TOAST tiers\) stays deferred under **AC\-003**, this suite's
+      remainder tracker, whose rationale already enumerates it.
+    - `make regen-testport` moves client\-tools\-tap coverage **42.9% ->
+      46.2%** and the total **42.0% -> 42.6%**; TAP port count 47 -> 50.
+      `make check-testport-inventory` passes.
+    - **Scanned for the same defect elsewhere**: of 119 non\-port TAP file
+      rows, only three cite a ported test — and the other two are CORRECT.
+      `002_save_fullpage.pl` and `200_connstr.pl` have ports that currently
+      **SKIP** \(the WAL native\-format work and its documented tag\), and a
+      skipped test cannot be `pass_required=yes`. The third,
+      `pg_dump/t/002_pg_dump.pl`, is only cited for its FIXTURES by
+      `pgdump_connsetup_test.go` — the script itself is genuinely unported, so
+      `not-tried` stands.
 
 ## M0131 — Bidirectional cluster-directory cold-start + real-PG system-view hosting (filed 2026-08-11)
 
