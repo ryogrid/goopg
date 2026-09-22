@@ -1,9 +1,10 @@
 # Working set — owner reset (2026-09-22, after loop #148)
 
-`Task:` M0145-0004a landed 2026-09-23 (whole-chain UNION ALL flattening —
-`Gather → Parallel Append` over the full chain on both arms; Q71 verifies
-290 rows = PG). Commit pending at session end with all gate stamps PASS
-(spotcheck, sf025 sweep, acceptance-arm 24 MATCH, tpcds-fireset).
+`Task:` M0145-0004a landed 2026-09-23 as this session's HEAD commit
+(whole-chain UNION ALL flattening — `Gather → Parallel Append` over the
+full chain on both arms; Q71 verifies 290 rows = PG). All gate stamps
+PASS (spotcheck, sf025 sweep, acceptance-arm 24 MATCH, tpcds-fireset)
++ pre-commit pgbench smoke.
 **The 129-loop BLOCKED state is cleared — the owner
 unblocked it.** Do NOT carry the old "everything is owner-gated" conclusion
 forward; it described a now-fixed harness bug, not the task list.
