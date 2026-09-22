@@ -3146,7 +3146,64 @@ func reloadForeignDataFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog
 	if err := reloadForeignServersFromHeap(mgr, cat, clog); err != nil {
 		return err
 	}
-	return reloadUserMappingsFromHeap(mgr, cat, clog)
+	if err := reloadUserMappingsFromHeap(mgr, cat, clog); err != nil {
+		return err
+	}
+	return reloadForeignTablesFromHeap(mgr, cat, clog)
+}
+
+// reloadForeignTablesFromHeap restores catalog.Table.ForeignServerName /
+// ForeignOptions from the pg_foreign_table heap (M0122-0015). It runs LAST in
+// reloadForeignDataFromHeap for two reasons: ftserver is reversed through the
+// server registry that reloadForeignServersFromHeap just filled, and ftrelid
+// is resolved against the user tables loaded earlier by
+// loadUserTablesFromHeapForDB (Open calls that well before this pass).
+//
+// Restoring the field is what restores the pg_foreign_table VIEW as well —
+// catalog.PGForeignTableRowsForDBOid renders it from ForeignServerName rather
+// than from this heap — and it is what makes the planner's no-handler refusal
+// (foreignTableWithoutHandler) reachable after a restart.
+func reloadForeignTablesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *transam.CLog) error {
+	cols := executor.PGForeignTableColumnsPG18()
+	rel := storage.RelFileNode{DBOid: cat.DBOID(), RelOid: 3118, Fork: storage.MainFork}
+	type ftRow struct {
+		server  string
+		options []string
+		relid   uint32
+	}
+	rows, err := scanCatalogHeapRows(mgr, rel, clog, "pg_foreign_table",
+		func(ht storage.HeapTuple, tid storage.ItemPointer) (any, bool, error) {
+			natts := int(ht.Header.Infomask2 & storage.HeapNattsMask)
+			d := make(executor.Row, len(cols))
+			if derr := executor.DecodeRowIntoMctxPGTuple(d, cols, ht.Data, ht.Bitmap, natts, nil); derr != nil {
+				return nil, false, derr
+			}
+			if uint32(d[0].Int) < catalog.FirstUserOID {
+				return nil, false, errSkipBuiltinRow
+			}
+			server := ""
+			if srv := cat.LookupForeignServerByOID(uint32(d[1].Int)); srv != nil {
+				server = srv.Name
+			}
+			return ftRow{server: server, options: decodeOptions(d[2]), relid: uint32(d[0].Int)}, false, nil
+		})
+	if err != nil {
+		return err
+	}
+	nsDBOid := catalog.NamespaceDBOid(cat.DBOID())
+	for _, raw := range rows {
+		fr := raw.(ftRow)
+		if fr.server == "" {
+			continue // server gone — the table is no longer usable as foreign
+		}
+		tbl, ok := cat.LookupTableByOID(fr.relid, nsDBOid)
+		if !ok || tbl == nil {
+			continue
+		}
+		tbl.ForeignServerName = fr.server
+		tbl.ForeignOptions = fr.options
+	}
+	return nil
 }
 
 func decodeOptions(d executor.Datum) []string {

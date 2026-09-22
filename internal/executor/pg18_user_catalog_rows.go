@@ -503,6 +503,13 @@ func buildUserPGClassRow(cat catalog.Catalog, tbl *catalog.Table) Row {
 		relkind = "m" // materialized view (has physical storage, unlike a plain view)
 	} else if tbl.View != nil {
 		relkind = "v" // plain view (no physical storage — the SELECT substitutes at reference time)
+	} else if tbl.ForeignServerName != "" {
+		// M0122-0015: a foreign table is relkind 'f'. The heap row used to say
+		// 'r', so a restart reloaded it as an ordinary table — the virtual
+		// pg_class renderer in internal/catalog/catalog.go already derived 'f'
+		// from ForeignServerName, and the two renderings of the same relation
+		// must not disagree (the RelkindHasStorage comment below).
+		relkind = "f"
 	}
 	// relfilenode: the relation OID for kinds with storage, 0 otherwise. The
 	// rule is catalog.RelkindHasStorage (upstream RELKIND_HAS_STORAGE), shared

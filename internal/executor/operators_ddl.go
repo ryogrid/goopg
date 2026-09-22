@@ -18542,6 +18542,10 @@ func deleteCatalogRowsForOID(ctx *Context, dbOid uint32, relOID uint32, xmax sto
 	// M0143-0003e: stamp this relation's EXCLUDE-constraint-backed index rows
 	// too (contype='x', conrelid=relOID), same reason.
 	stampExclusionConstraintRows(ctx, dbOid, relOID, xmax)
+	// M0122-0015: and this relation's pg_foreign_table row, for the same
+	// reason — a DROP FOREIGN TABLE or an ALTER re-sync must not leave a stale
+	// ftrelid row behind.
+	stampForeignTableRows(ctx, relOID, xmax)
 }
 
 // syncEnumTypeToCatalogHeap writes a single pg_type row for an enum type into
@@ -19008,6 +19012,13 @@ func syncTableToCatalogHeap(ctx *Context, tbl *catalog.Table) error {
 	classTID, err := writeHeapRowCanonical(ctx, classRel, pgClassColumnsPG18(), buildUserPGClassRow(ctx.Catalog, tbl))
 	if err != nil {
 		return fmt.Errorf("pg_class: %w", err)
+	}
+	// M0122-0015: the pg_foreign_table row for a foreign table. This is the
+	// single funnel every table-persisting DDL path passes through, so the
+	// ALTER paths re-stamp and re-write it alongside pg_class. No-op for an
+	// ordinary relation.
+	if err := writeForeignTableCatalogRow(ctx, tbl); err != nil {
+		return fmt.Errorf("pg_foreign_table: %w", err)
 	}
 	relnamespace := namespaceOIDForSchema(ctx.Catalog, tbl.Schema)
 	// B0.3 (doc 02a §4): index entries route to the SAME database as the

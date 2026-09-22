@@ -3323,7 +3323,11 @@ func loadUserTablesFromHeapForDB(mgr *storage.Manager, cat *catalog.InMemory, cl
 	var userTableRows []recoveredPGClassRow
 	for _, r := range classRows {
 		rec := r.(recoveredPGClassRow)
-		if (rec.row.RelKind == "r" || rec.row.RelKind == "m" || rec.row.RelKind == "v" || rec.row.RelKind == "S") && rec.row.OID >= catalog.FirstUserOID {
+		// 'f' (foreign table) joined this set in M0122-0015: its pg_class row
+		// was previously skipped outright, so a foreign table vanished from the
+		// catalog across a restart. reloadForeignTablesFromHeap re-attaches the
+		// server name and options afterwards, from pg_foreign_table.
+		if (rec.row.RelKind == "r" || rec.row.RelKind == "m" || rec.row.RelKind == "v" || rec.row.RelKind == "S" || rec.row.RelKind == "f") && rec.row.OID >= catalog.FirstUserOID {
 			userTableRows = append(userTableRows, rec)
 		}
 	}

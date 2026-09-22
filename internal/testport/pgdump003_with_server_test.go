@@ -139,6 +139,29 @@ func TestPort_PgDump003ForeignDataNoHandler(t *testing.T) {
 		}
 	}
 
+	// A RESTART sits between the DDL and the dumps (M0122-0015). Upstream has
+	// no restart here, but goopg needed one to be honest: pg_foreign_table is
+	// rendered from catalog.Table.ForeignServerName, and until the
+	// pg_foreign_table heap row existed, that field died with the process —
+	// the reloaded relation came back as an ordinary relkind='r' table, the
+	// view was empty, and the no-handler refusal below could not fire at all.
+	// Without the restart this test would keep passing while the only state a
+	// real cluster ever has (post-recovery state) was broken.
+	if err := c.Stop(cluster.ShutdownFast); err != nil {
+		t.Fatalf("stop cluster: %v", err)
+	}
+	if err := c.Start(); err != nil {
+		t.Fatalf("restart cluster: %v", err)
+	}
+	if got := queryScalar(t, c, "SELECT count(*) FROM pg_foreign_table"); got != "2" {
+		t.Fatalf("post-restart pg_foreign_table count = %q, want 2 "+
+			"(the foreign tables did not survive the restart)", got)
+	}
+	if got := queryScalar(t, c, "SELECT relkind FROM pg_class WHERE relname = 't0'"); got != "f" {
+		t.Fatalf("post-restart pg_class.relkind for t0 = %q, want \"f\" "+
+			"(the foreign table reloaded as an ordinary relation)", got)
+	}
+
 	// Upstream: correctly fails to dump a foreign table from a dummy FDW.
 	res, err := util.RunCommand(util.CommandSpec{
 		Name:    bin,
