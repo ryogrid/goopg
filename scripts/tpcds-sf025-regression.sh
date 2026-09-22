@@ -305,6 +305,8 @@ sf025_plan_pin_failed=0          # 1 when SF025_PLAN_PIN=1 and the plan channel 
 sf025_counts_final=0             # 1 once cmd_sweep has its final verdict counters
 sf025_final_bad=0                # MISMATCH+CKMISMATCH+ERROR of the finished sweep
 sf025_final_timeouts=0           # TIMEOUT count of the finished sweep
+sf025_nli_census="${GOOPG_NLI_CENSUS:-0}"          # preserve an explicit caller trace request
+sf025_dp_trace="${GOOPG_PGSHAPED_DP_TRACE:-0}"     # preserve an explicit caller trace request
 
 sf025_ensure_bin() {
     local tree_sha dirty built="rebuilt from tree"
@@ -369,6 +371,8 @@ sf025_goopg_start() {
     sf025_goopg_stop
     local hba_arg=()
     [[ -f "${SF025_GOOPG_DATA}/pg_hba.conf" ]] && hba_arg=(--hba "${SF025_GOOPG_DATA}/pg_hba.conf")
+    GOOPG_NLI_CENSUS="${sf025_nli_census}" \
+    GOOPG_PGSHAPED_DP_TRACE="${sf025_dp_trace}" \
     GOOPG_CG_UNIT="${CG_UNIT}" "${REPO_ROOT}/scripts/goopg-test-run.sh" \
         "${GOOPG_BIN}" start -D "${SF025_GOOPG_DATA}" \
         --listen "127.0.0.1:${SF025_PORT}" "${hba_arg[@]}" \
@@ -789,15 +793,25 @@ cmd_plans() {
 # explicit SF025_PLANS_BASELINE (unset baseline under the pin is itself a
 # FAIL; =none is the explicit one-run suppression).
 sf025_plan_channel() {
-    local report="$1" baseline plans rc=0 diff_rc=0 pinned=0
+    local report="$1" baseline plans trace trend old_nli old_dp rc=0 diff_rc=0 flow_rc=0 pinned=0 log_lines=0
     [[ "${SF025_PLAN_PIN:-0}" == "1" ]] && pinned=1
     baseline=$(sf025_plan_baseline)
     plans="${report%/*}/plans-${report##*/sweep-}"
+    trace="${plans%.txt}.flow.log"
+    trend="${report%/*}/flow-convergence.tsv"
+    log_lines=$(wc -l < "${SF025_LOG}" 2>/dev/null || echo 0)
+    old_nli="${sf025_nli_census}"
+    old_dp="${sf025_dp_trace}"
+    sf025_nli_census=1
+    sf025_dp_trace=1
     (
         sf025_goopg_start
         sf025_capture_plans "${plans}"
         sf025_goopg_stop
     ) >> "${SF025_LOG}" 2>&1 || rc=$?
+    sf025_nli_census="${old_nli}"
+    sf025_dp_trace="${old_dp}"
+    tail -n +$((log_lines + 1)) "${SF025_LOG}" > "${trace}" 2>/dev/null || true
     {
         echo ""
         if [[ "${rc}" -ne 0 ]]; then
@@ -824,6 +838,13 @@ sf025_plan_channel() {
             fi
         else
             echo "# plan-shape: captured ${plans} (no baseline to diff against yet)"
+        fi
+        if [[ "${rc}" -eq 0 ]]; then
+            python3 "${SCRIPT_DIR}/flow-convergence.py" \
+                --label "${report##*/}" --trend "${trend}" "${trace}" 2>&1 || flow_rc=$?
+            if [[ "${flow_rc}" -ne 0 ]]; then
+                echo "=== FLOW-CONVERGENCE: capture FAILED (rc=${flow_rc}) — see ${trace}; the verdict above is unaffected ==="
+            fi
         fi
         if [[ "${pinned}" == "1" ]]; then
             echo "# The plan channel is BLOCKING under SF025_PLAN_PIN=1: movement above fails this gate."

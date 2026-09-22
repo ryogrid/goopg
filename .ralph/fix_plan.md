@@ -16009,7 +16009,7 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
       `PLAN-SHAPE same=99 changed=0`), and the channel is correctly silent
       when nothing moved.
 
-- [ ] **M0145-0023 — harness: flow-convergence instrument (secondary
+- [x] **M0145-0023 — harness: flow-convergence instrument (secondary
   metric, NOT a movement instrument)** (owner GO 2026-09-22; proposal
   5.6). The S3 instruments measure final parity only, so M0145-style
   multi-task structural migrations record `Movement: none` even when the
@@ -16022,3 +16022,16 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
   observability only.
   Kind: impl
   Parent: none
+  Movement: none — report\-only observability; it is deliberately not a lineage movement instrument.
+  - **LANDED 2026\-09\-22 \(loop \#1\).** Design:
+    `docs/design/0100\-0149/m0145\-0023\-flow\-convergence\-instrument.md`.
+    - The fresh SF0.25 EXPLAIN tail now enables the existing route and seam
+      diagnostics only for its own server instance, extracts its exact new log
+      range, and leaves the value and plan\-pin verdicts unchanged.
+    - `scripts/flow\-convergence.py` requires non\-empty `SUBLINKCENSUS`,
+      reports pinned\-spine versus jointree\-pullup plus every seam\-decline
+      bucket, and appends a tab\-separated row to `flow\-convergence.tsv`.
+      A zero\-event capture is a report failure, never a vacuous zero ratio.
+    - Tests: `flow\-convergence.py \-\-self\-test`; `bash \-n
+      scripts/tpcds\-sf025\-regression.sh`; full SF0.25 sweep follows as the
+      integration gate.
