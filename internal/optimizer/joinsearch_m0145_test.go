@@ -238,3 +238,30 @@ func TestLegacyArmDeclinesAOneRelProblem(t *testing.T) {
 		t.Fatal("the legacy arm searched a one-relation problem with both knobs off — the floor is gone")
 	}
 }
+
+// TestJointreeSearchesADemotedAntiLink is M0145-0005 slice 6's headline
+// pin on the real planner: a mid-chain LEFT→ANTI demotion —
+// `jtp_o ANTI jtp_i ⋈ jtp_i2` — is a searched problem on the jointree
+// arm. The ANTI link's right side is a real deferred leaf item, so the
+// whole statement is one DP instead of a declined synthetic-tail
+// problem, and the demoted join plans to a searched left-only ANTI.
+func TestJointreeSearchesADemotedAntiLink(t *testing.T) {
+	cat := jtpCatalog(t)
+	const sql = `SELECT jtp_o.k FROM jtp_o ` +
+		`LEFT JOIN jtp_i ON jtp_o.k = jtp_i.j ` +
+		`JOIN jtp_i2 ON jtp_o.k = jtp_i2.j2 ` +
+		`WHERE jtp_i.j IS NULL`
+	node := planOnPipeline(t, sql, cat, true)
+	if !treeHasSearched(node) {
+		t.Fatalf("jointree arm left a demoted-ANTI chain unsearched; tree: %s", describePlanTree(node))
+	}
+	j := findSemiOrAntiJoin(node)
+	if j == nil || j.Type != JoinTypeAnti {
+		t.Fatalf("no ANTI join in the searched plan; tree: %s", describePlanTree(node))
+	}
+	// The demoted join still emits the preserved side only — the
+	// searched ANTI must not resurrect jtp_i's columns.
+	if got, want := len(j.Output()), len(j.Left.Output()); got != want {
+		t.Fatalf("ANTI output width %d, want %d (left only)", got, want)
+	}
+}

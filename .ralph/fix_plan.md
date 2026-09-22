@@ -15291,6 +15291,48 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
       crossing counter-pin, scan-hunt opacity + unsearched
       findability. `markSearchedTree` usable on `*Join`/`*SeqScan` in
       tests (embeds `searchedTree`).
+    - **Slice 6 (landed, loop 2026-09-23): chain-extracted semi/anti as
+      DEFERRED real leaf items** — slice 2's chain half, retiring the
+      synthetic tail for `semiAntiChainLink` on the jointree arm. Design
+      doc §"Slice 6".
+      - Two-band numbering (`deconstructJointreeScopedSJI` +
+        `jointreeItemEmittingRels`): emitting leaves `[0, emitTotal)`,
+        every SEMI/ANTI link's RHS a leaf item in
+        `[emitTotal, emitTotal+nSemiAnti)` in link order, then the
+        pulled band continues. `sub_members` counts deferred members so
+        the collapse-limit comparison stays upstream-shaped. The SJI is
+        built via `makeSpecialJoinInfoForSets` (explicit relsets — the
+        deferred right side is not contiguous in the item's local
+        joinlist) with `leftScope` tracking PG's `qualscope`.
+      - `sjiLeaf.leafIdx`: `newSjiScope` stamps each leaf's RelSet bit
+        (position == index under the legacy numbering; diverges for
+        deferred leaves), so `resolveSjiColumn` returns real bits for
+        every name-resolution arm.
+      - `extractScopeLeaves` emits canonically — emitting band then
+        deferred band in joinlist order — and marks semianti links
+        `realLeaf` with `rhs` naming the real item; the link's SJI is
+        matched off `ctx.joinInfoList` by (jointype, SynL, SynR), so the
+        searched constraint carries deconstruction's `lower`-scan
+        narrowing rather than the plan-node placeholder.
+      - Seam: `nChain = nprefix - nPulled - nrels`; deferred leaves at
+        `[nReal, pulledBase)` get the SeqScan-vs-opaque dispatch
+        (catalog stats / `EstimateRows`), `realLeaf` links skip
+        `syntheticBits`, the walk→span remap and the `searchJl` append
+        (nleaves == nprefix there). New `chain-leaf-desync` fail-closed
+        check cross-verifies extraction's deferred band against the
+        joinlist count.
+      - Pins: `TestScopeExtractionSemiAntiDeferred` (joinlist
+        `{a=0,c=1,b=2}` for a demoted ANTI, ANTI SJI `{0}`/`{2}`,
+        realLeaf link bound to that SJI); `TestJointreeSearchesADemotedAntiLink`
+        — `jtp_o ANTI jtp_i ⋈ jtp_i2` plans a searched left-only ANTI on
+        the jointree arm where the shape previously declined at
+        `leaf-count`.
+      - Gates: optimizer suite PASS; units PASS; tpch-spotcheck
+        Q12=2/Q13=33; SF0.25 sweep below.
+      - Remaining for the task: Phase A/B +
+        `runJoinSearchBelowPinned` + pinned-spine + splice-time
+        re-resolution retirement; slice-5 ledgered families
+        (`outer-over-derived` post-B-06, `lateral`).
 - [x] **M0145-0006 — upper-rel pathlists** (extend the lattice through
   `create_grouping_paths`/`create_ordered_paths` analogues so ordering and
   grouping are elected over candidate sets, not by stage-builder

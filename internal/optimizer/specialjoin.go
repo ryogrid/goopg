@@ -166,9 +166,17 @@ func demotedAntiSJInfo(jt JoinType) *SpecialJoinInfo {
 }
 
 func makeSpecialJoinInfoScoped(jointype parser.JoinType, left, right joinlist, joinQual parser.Expr, sc *sjiScope, item int, lower []*SpecialJoinInfo) *SpecialJoinInfo {
+	return makeSpecialJoinInfoForSets(jointype, joinlistRelSet(left), joinlistRelSet(right), joinQual, sc, item, lower)
+}
+
+// makeSpecialJoinInfoForSets is makeSpecialJoinInfoScoped with the syntactic
+// sides given as relsets directly — the deferred-SEMI/ANTI leaf's right
+// side is not a contiguous member of the item's sub-joinlist (it is appended
+// at the whole problem's tail), so its caller computes the set itself.
+func makeSpecialJoinInfoForSets(jointype parser.JoinType, synL, synR RelSet, joinQual parser.Expr, sc *sjiScope, item int, lower []*SpecialJoinInfo) *SpecialJoinInfo {
 	sj := &SpecialJoinInfo{
-		SynLefthand:  joinlistRelSet(left),
-		SynRighthand: joinlistRelSet(right),
+		SynLefthand:  synL,
+		SynRighthand: synR,
 		Jointype:     jointype,
 		// ojrelid stays 0 until goopg grows RT indexes for join RTEs.
 	}
@@ -296,13 +304,22 @@ type sjiLeaf struct {
 	name   string
 	schema string // RangeVar schema, or the catalog table's for base relations
 	table  *catalog.Table // nil for subquery/tablefunc/CTE/shadowed/unknown
+	// leafIdx is the leaf index this name resolves to — a RelSet bit. It
+	// equals the leaf's position in sc.leaves under the legacy numbering;
+	// under the jointree numbering (M0145-0005 slice 6) a SEMI/ANTI right
+	// side is a DEFERRED leaf whose index lies after every emitting leaf,
+	// so position and index diverge and only the index is meaningful.
+	leafIdx int
 }
 
 // sjiScope is the name → leaf map threaded into deconstruction (take3 08
 // §6.1, first route: the smaller one, keeping phase order). leaves holds every
 // comma item's range variables consecutively in the same depth-first order
-// deconstructJointree numbers leaves in (Base, then Joins[0].Right, …), so a
-// scope index IS a leaf/RelSet bit. items bounds each FromExpr's slice.
+// deconstructJointree numbers leaves in (Base, then Joins[0].Right, …); each
+// leaf carries the RelSet bit deconstruction gave it in `leafIdx` (position
+// and index coincide under the legacy numbering and diverge for deferred
+// SEMI/ANTI leaves under the jointree one). items bounds each FromExpr's
+// slice.
 type sjiScope struct {
 	leaves   []sjiLeaf
 	items    [][2]int // per-FromExpr half-open leaf range
@@ -315,16 +332,47 @@ type sjiScope struct {
 // resolve structurally, unqualified ones fall back to syn.
 func newSjiScope(from []parser.FromExpr, cat catalog.Catalog) *sjiScope {
 	sc := &sjiScope{cat: cat, tableMap: make(map[string]*catalog.Table)}
+	if jointreePipeline {
+		// M0145-0005 slice 6: under the jointree numbering every SEMI/ANTI
+		// link's right side IS a leaf — PG's deconstruct_recurse emits it —
+		// but a DEFERRED one: non-emitting, numbered after all emitting
+		// leaves, in link-encounter order. The leaves slice still records
+		// every range variable in DFS order (name resolution needs the
+		// semijoin RHS in scope); only the leaf index it stamps diverges.
+		// This numbering and the joinlist's must stay identical —
+		// deconstructJointreeScopedSJI derives it from the same helpers.
+		emitTotal := 0
+		for i := range from {
+			emitTotal += jointreeItemEmittingRels(from[i])
+		}
+		emitNext, deferred := 0, emitTotal
+		for i := range from {
+			start := len(sc.leaves)
+			sc.addLeaf(from[i].Base, cat, emitNext)
+			emitNext++
+			for _, j := range from[i].Joins {
+				if j.Type == parser.JoinSemi || j.Type == parser.JoinAnti {
+					sc.addLeaf(j.Right, cat, deferred)
+					deferred++
+					continue
+				}
+				sc.addLeaf(j.Right, cat, emitNext)
+				emitNext++
+			}
+			sc.items = append(sc.items, [2]int{start, len(sc.leaves)})
+		}
+		return sc
+	}
 	for i := range from {
 		start := len(sc.leaves)
-		sc.addLeaf(from[i].Base, cat)
+		sc.addLeaf(from[i].Base, cat, len(sc.leaves))
 		// R41/K74: skip exactly the sides `antiCollapsedJoins` (collapse.go)
 		// gives no leaf index to, or every SJI hand to the RIGHT of a
 		// collapsed link would name the wrong relation. This numbering and
 		// the joinlist's must stay identical, which is why both read the same
 		// helper rather than re-deriving the rule.
 		for _, j := range from[i].Joins[antiCollapsedJoins(from[i]):] {
-			sc.addLeaf(j.Right, cat)
+			sc.addLeaf(j.Right, cat, len(sc.leaves))
 		}
 		sc.items = append(sc.items, [2]int{start, len(sc.leaves)})
 	}
@@ -338,8 +386,8 @@ func newSjiScope(from []parser.FromExpr, cat catalog.Catalog) *sjiScope {
 // catalog table, or unqualified attribution could map a CTE column onto the
 // wrong leaf. A missed lookup leaves table nil, which only ever widens toward
 // syn — never narrows.
-func (sc *sjiScope) addLeaf(rv parser.RangeVar, cat catalog.Catalog) {
-	lf := sjiLeaf{alias: rv.Alias, name: rv.Name, schema: rv.Schema}
+func (sc *sjiScope) addLeaf(rv parser.RangeVar, cat catalog.Catalog, leafIdx int) {
+	lf := sjiLeaf{alias: rv.Alias, name: rv.Name, schema: rv.Schema, leafIdx: leafIdx}
 	if rv.Subquery == nil && rv.TableFunc == nil && cat != nil {
 		if rv.Schema == "" && lookupPlannedCTE(rv.Name) != nil {
 			// CTE-owned name: structural (alias) matching only.
@@ -399,7 +447,7 @@ func resolveSjiColumn(ref *parser.ColumnRef, sc *sjiScope, item int) (int, bool)
 		// deconstruction runs), so a uniquely-matched qualifier IS the
 		// production leaf. System columns (tableoid/ctid) and whole-row
 		// refs flow through the same arm — pull_varnos counts the rel.
-		return match, true
+		return sc.leaves[match].leafIdx, true
 	}
 	// Unqualified: mirror the unqualified branch (planner.go:15017-15087) —
 	// column scan first, then the single-candidate tableoid/ctid and
@@ -423,7 +471,7 @@ func resolveSjiColumn(ref *parser.ColumnRef, sc *sjiScope, item int) (int, bool)
 		match = i
 	}
 	if match != -1 {
-		return match, true
+		return sc.leaves[match].leafIdx, true
 	}
 	// Whole-row alias match (planner.go:15088): bare name equals a binding
 	// alias (or the unaliased table name) — a composite row Var on that rel.
@@ -442,7 +490,7 @@ func resolveSjiColumn(ref *parser.ColumnRef, sc *sjiScope, item int) (int, bool)
 	if match == -1 {
 		return 0, false
 	}
-	return match, true
+	return sc.leaves[match].leafIdx, true
 }
 
 // sjiQualRelids is pull_varnos (PG: which base relids the qual mentions) over

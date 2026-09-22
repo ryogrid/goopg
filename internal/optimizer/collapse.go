@@ -380,11 +380,43 @@ func deconstructJointreeScopedSJI(from []parser.FromExpr, lim collapseLimits, sc
 	remaining := len(from)
 	nextRel := 0
 	var lower []*SpecialJoinInfo
+	// M0145-0005 slice 6: under the jointree pipeline a SEMI/ANTI link's
+	// right side is a REAL joinlist leaf item — PG's deconstruct_recurse
+	// emits one (initsplan.c:1400-1410 appends the semijoin RHS RangeTblRef
+	// to the item's joinlist) — but goopg numbers it DEFERRED, after every
+	// emitting leaf, because planFromItem's bindings/schema only carry
+	// emitting relations and the leaf must not consume a column offset.
+	// Emitting leaves keep their DFS numbering; deferred leaves occupy the
+	// band [emitTotal, emitTotal+nSemiAnti) in link-encounter order, which
+	// is also the order pullUpSublinksIntoJointree's own deferred band
+	// then continues. `newSjiScope` derives the same indices for name
+	// resolution — all three sites read the same helpers.
+	var nextDeferred *int
+	var emitCounts []int
+	if jointreePipeline {
+		emitTotal := 0
+		emitCounts = make([]int, len(from))
+		for i := range from {
+			emitCounts[i] = jointreeItemEmittingRels(from[i])
+			emitTotal += emitCounts[i]
+		}
+		d := emitTotal
+		nextDeferred = &d
+	}
+	var deferred joinlist
 	for i := range from {
-		sub, made := deconstructFromItemScoped(from[i], nextRel, lim, sc, i, lower)
+		sub, made, def := deconstructFromItemScoped(from[i], nextRel, lim, sc, i, lower, nextDeferred)
 		lower = append(lower, made...)
-		nextRel += fromItemRels(from[i])
-		subMembers := len(sub)
+		deferred = append(deferred, def...)
+		if jointreePipeline {
+			nextRel += emitCounts[i]
+		} else {
+			nextRel += fromItemRels(from[i])
+		}
+		// PG's sub_members count includes the semijoin RHS leaves (they are
+		// members of the item's joinlist upstream), so the collapse-limit
+		// comparison adds them even though the items land at the tail.
+		subMembers := len(sub) + len(def)
 		remaining--
 		if subMembers <= 1 || len(jl)+subMembers+remaining <= lim.fromCollapseLimit {
 			jl = append(jl, sub...)
@@ -392,6 +424,10 @@ func deconstructJointreeScopedSJI(from []parser.FromExpr, lim collapseLimits, sc
 			jl = append(jl, subItem(sub))
 		}
 	}
+	// Deferred leaf items append at the whole problem's tail, after every
+	// item's emitting members — their indices are all ≥ emitTotal, so the
+	// tail is exactly the deferred band in assignment order.
+	jl = append(jl, deferred...)
 	return jl, lower
 }
 
@@ -462,6 +498,22 @@ func antiCollapsedJoins(item parser.FromExpr) int {
 	return n
 }
 
+// jointreeItemEmittingRels is the jointree numbering's per-item leaf count:
+// the base range variable plus one per non-SEMI/ANTI join. Every SEMI/ANTI
+// link's right side becomes a DEFERRED leaf — a real joinlist item numbered
+// after all emitting leaves — rather than the opaque collapse
+// `antiCollapsedJoins` describes, so under the jointree pipeline emitting and
+// deferred counts are tracked separately.
+func jointreeItemEmittingRels(item parser.FromExpr) int {
+	n := 1
+	for _, j := range item.Joins {
+		if j.Type != parser.JoinSemi && j.Type != parser.JoinAnti {
+			n++
+		}
+	}
+	return n
+}
+
 // deconstructFromItem computes the joinlist of ONE comma-separated FROM item —
 // upstream's `deconstruct_recurse` over that item's `JoinExpr` chain
 // (initsplan.c:1250-1441).
@@ -475,7 +527,7 @@ func antiCollapsedJoins(item parser.FromExpr) int {
 // so a future grammar that nests joins needs no change here beyond the
 // recursion.
 func deconstructFromItem(item parser.FromExpr, firstRel int, lim collapseLimits) joinlist {
-	jl, _ := deconstructFromItemScoped(item, firstRel, lim, nil, 0, nil)
+	jl, _, _ := deconstructFromItemScoped(item, firstRel, lim, nil, 0, nil, nil)
 	return jl
 }
 
@@ -484,19 +536,50 @@ func deconstructFromItem(item parser.FromExpr, firstRel int, lim collapseLimits)
 // in bottom-up order, so the caller can extend the lower list PG's
 // commutativity scan reads. lower holds the SJIs built for earlier joins of
 // this item and earlier comma items.
-func deconstructFromItemScoped(item parser.FromExpr, firstRel int, lim collapseLimits, sc *sjiScope, itemIdx int, lower []*SpecialJoinInfo) (joinlist, []*SpecialJoinInfo) {
+//
+// `nextDeferred` is non-nil only on the jointree numbering (M0145-0005 slice
+// 5): every SEMI/ANTI link then contributes a DEFERRED leaf item — a real
+// joinlist member numbered from the counter — plus a SpecialJoinInfo, and the
+// third return collects those leaf items for the caller to append at the
+// whole problem's tail. With `nextDeferred` nil the leading-collapse rule
+// (R41/K74) applies instead.
+func deconstructFromItemScoped(item parser.FromExpr, firstRel int, lim collapseLimits, sc *sjiScope, itemIdx int, lower []*SpecialJoinInfo, nextDeferred *int) (joinlist, []*SpecialJoinInfo, joinlist) {
 	left := joinlist{leafItem(firstRel)}
 	next := firstRel + 1
 	var made []*SpecialJoinInfo
-	// R41/K74: the leading SEMI/ANTI links contribute no leaf, no joinlist
-	// item and no SpecialJoinInfo — `left` already names the single leaf the
-	// plan tree publishes for the whole opaque node. Dropping the SJI is
-	// required, not incidental: its nullable hand would name a relation that
-	// now has no bit, and the plan side raises no `outerChainLink` for the
-	// link either (the walk returns it as a leaf before reaching that code),
-	// so the two descriptions still agree hand for hand.
-	joins := item.Joins[antiCollapsedJoins(item):]
+	var deferred joinlist
+	// leftScope is the relset of everything under the left subtree —
+	// PG's `left_item->qualscope`, which counts the semijoin RHS rels too
+	// (they are real rels upstream even though the join emits no columns).
+	// The `left` joinlist alone cannot supply those bits: the deferred leaf
+	// items are appended at the problem tail, not folded into `left`.
+	leftScope := RelSet(1) << uint(firstRel)
+	// R41/K74 (legacy numbering): the leading SEMI/ANTI links contribute no
+	// leaf, no joinlist item and no SpecialJoinInfo — `left` already names
+	// the single leaf the plan tree publishes for the whole opaque node.
+	// Under the jointree numbering the collapse is replaced by the deferred
+	// leaf arm below, which fires for EVERY semianti link, leading or not.
+	joins := item.Joins
+	if nextDeferred == nil {
+		joins = item.Joins[antiCollapsedJoins(item):]
+	}
 	for _, j := range joins {
+		if nextDeferred != nil && (j.Type == parser.JoinSemi || j.Type == parser.JoinAnti) {
+			// Deferred leaf: a real searched item, numbered after all
+			// emitting leaves, constrained to join as the semijoin's RHS by
+			// the SpecialJoinInfo — the same shape pulled sublink bodies
+			// took in slice 2. It never pins: join_is_legal carries the
+			// ordering constraint upstream's joinlist member would.
+			idx := *nextDeferred
+			*nextDeferred++
+			deferred = append(deferred, leafItem(idx))
+			rightBit := RelSet(1) << uint(idx)
+			sj := makeSpecialJoinInfoForSets(j.Type, leftScope, rightBit, j.On, sc, itemIdx, lower)
+			lower = append(lower, sj)
+			made = append(made, sj)
+			leftScope |= rightBit
+			continue
+		}
 		right := joinlist{leafItem(next)}
 		next++
 		pinned := joinPinned(j.Type) || pinnedOverAPinnedSide(j.Type, left)
@@ -507,6 +590,7 @@ func deconstructFromItemScoped(item parser.FromExpr, firstRel int, lim collapseL
 		// nothing to recover it from at all.
 		prevLeft := left
 		left = combineJoinlists(j.Type, pinned, left, right, lim.joinCollapseLimit)
+		leftScope |= joinlistRelSet(right)
 		// M0128-P1.1: build SpecialJoinInfo for every outer/semi/anti join.
 		if j.Type == parser.JoinInner || j.Type == parser.JoinCross {
 			continue
@@ -524,7 +608,7 @@ func deconstructFromItemScoped(item parser.FromExpr, firstRel int, lim collapseL
 		lower = append(lower, sj)
 		made = append(made, sj)
 	}
-	return left, made
+	return left, made, deferred
 }
 
 // joinPinned reports whether a JOIN node must force its own order rather than

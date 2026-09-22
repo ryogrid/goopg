@@ -270,7 +270,7 @@ func TestJointreePullupRealLeafItems(t *testing.T) {
 	var semiAnti []semiAntiChainLink
 	var outer []outerChainLink
 	var onQuals []chainOnQual
-	if !splicePulledLeaves(pu, 1, ctx, &scans, &widths, &semiAnti, &outer, &onQuals) {
+	if !splicePulledLeaves(pu, 1, 2, ctx, &scans, &widths, &semiAnti, &outer, &onQuals) {
 		t.Fatalf("splicePulledLeaves declined the pulled body")
 	}
 	if len(scans) != 2 || len(widths) != 2 {
@@ -346,7 +346,7 @@ func TestJointreePullupRealLeafItemsAnti(t *testing.T) {
 	var semiAnti []semiAntiChainLink
 	var outer []outerChainLink
 	var onQuals []chainOnQual
-	if !splicePulledLeaves(pu, 1, ctx, &scans, &widths, &semiAnti, &outer, &onQuals) {
+	if !splicePulledLeaves(pu, 1, 2, ctx, &scans, &widths, &semiAnti, &outer, &onQuals) {
 		t.Fatalf("splicePulledLeaves declined the pulled body")
 	}
 	spans := buildLeafSpans(widths, semiAnti)
@@ -530,7 +530,7 @@ func TestJointreePullupBodyLocalQual(t *testing.T) {
 	var semiAnti []semiAntiChainLink
 	var outer []outerChainLink
 	var onQuals []chainOnQual
-	if !splicePulledLeaves(pu, 1, ctx, &scans, &widths, &semiAnti, &outer, &onQuals) {
+	if !splicePulledLeaves(pu, 1, 2, ctx, &scans, &widths, &semiAnti, &outer, &onQuals) {
 		t.Fatalf("splicePulledLeaves declined the pulled body")
 	}
 	spans := buildLeafSpans(widths, semiAnti)

@@ -110,6 +110,10 @@ func sameTuple(t *testing.T, wScans []Node, wWidths []int, wOn []chainOnQual, wO
 }
 
 func TestScopeExtractionMatchesWalk(t *testing.T) {
+	// The scope extraction only runs on the jointree arm — set the knob
+	// so the joinlist/scope numbering below is the one the seam consumes.
+	defer func(v bool) { jointreePipeline = v }(jointreePipeline)
+	jointreePipeline = true
 	cat := scopeTestCatalog(t)
 	for _, q := range []string{
 		"SELECT * FROM a",
@@ -133,13 +137,6 @@ func TestScopeExtractionMatchesWalk(t *testing.T) {
 		// the !preserved decline: an outer link inside another's
 		// nullable side — both paths must return !ok.
 		"SELECT * FROM a LEFT JOIN b ON a.ax = b.bx RIGHT JOIN c ON TRUE",
-		// demoted ANTI (leading-collapsed): the WHERE conjunct forces
-		// LEFT->ANTI — the chain carries a Join{Anti} and the walk's
-		// semiAnti arm fires.
-		"SELECT * FROM a LEFT JOIN b ON a.ax = b.bx WHERE b.bx IS NULL",
-		// demoted ANTI mid-chain (non-leading): `c`'s link demotes.
-		"SELECT * FROM a JOIN b ON TRUE LEFT JOIN c ON b.bx = c.cx WHERE c.cx IS NULL",
-		"SELECT * FROM a, b LEFT JOIN c ON b.bx = c.cx WHERE c.cx IS NULL",
 	} {
 		t.Run(q, func(t *testing.T) {
 			stmts, err := parser.Parse(q)
@@ -157,11 +154,84 @@ func TestScopeExtractionMatchesWalk(t *testing.T) {
 				t.Fatalf("jtScope.root (%T) != chain root (%T)", rctx.jtScope.root, node)
 			}
 			wScans, wWidths, wOn, wOuter, wSemi, wOK := extractSearchLeaves(node)
-			sScans, sWidths, sOn, sOuter, sSemi, sOK := extractScopeLeaves(rctx.jtScope)
+			sScans, sWidths, sOn, sOuter, sSemi, sOK := extractScopeLeaves(rctx.jtScope, rctx.joinInfoList)
 			sameTuple(t, wScans, wWidths, wOn, wOuter, wSemi, wOK,
 				sScans, sWidths, sOn, sOuter, sSemi, sOK)
 		})
 	}
+}
+
+// TestScopeExtractionSemiAntiDeferred pins the M0145-0005 slice-6
+// representation: a chain-extracted (demoted) SEMI/ANTI link's right
+// side is a REAL joinlist leaf item — the deferred band after every
+// emitting leaf — not a synthetic tail leaf. The scope extraction
+// emits leaves in that canonical order (emitting first, deferred
+// last), marks the link `realLeaf`, and binds it to the
+// SpecialJoinInfo deconstruction published on ctx.joinInfoList —
+// whereas the node-walk extraction still produces the synthetic
+// representation, so the two tuples legitimately differ here.
+func TestScopeExtractionSemiAntiDeferred(t *testing.T) {
+	defer func(v bool) { jointreePipeline = v }(jointreePipeline)
+	jointreePipeline = true
+	cat := scopeTestCatalog(t)
+	// `a ANTI b JOIN c`: the WHERE conjunct demotes the LEFT link —
+	// emitting leaves are a, c; b is the deferred leaf at index 2.
+	stmts, err := parser.Parse("SELECT * FROM a LEFT JOIN b ON a.ax = b.bx JOIN c ON a.ay = c.cy WHERE b.bx IS NULL")
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	node, rctx, err := planFromClause(stmts[0].(*parser.SelectStmt), cat, DefaultPlannerSettings(), nil)
+	if err != nil {
+		t.Fatalf("planFromClause: %v", err)
+	}
+	if rctx.jtScope == nil || rctx.jtScope.root != node {
+		t.Fatal("jtScope missing or root mismatch")
+	}
+	// The joinlist carries three leaf items: a(0), c(1), and the
+	// deferred b(2) — plus one Anti SpecialJoinInfo on the list.
+	if n := rctx.joinlist.nrels(); n != 3 {
+		t.Fatalf("joinlist nrels = %d, want 3 (two emitting + deferred b)", n)
+	}
+	if it := rctx.joinlist[2]; !it.isLeaf() || it.rel != 2 {
+		t.Fatalf("joinlist[2] = %+v, want leaf item rel=2", it)
+	}
+	var sj *SpecialJoinInfo
+	for _, s := range rctx.joinInfoList {
+		if s != nil && s.Jointype == parser.JoinAnti {
+			sj = s
+		}
+	}
+	if sj == nil {
+		t.Fatal("joinInfoList carries no JoinAnti SJI")
+	}
+	if sj.SynLefthand != RelSet(1) || sj.SynRighthand != RelSet(1)<<2 {
+		t.Fatalf("SJI syn hands = %v/%v, want {0}/{2}", sj.SynLefthand, sj.SynRighthand)
+	}
+	scans, widths, _, _, semiAnti, ok := extractScopeLeaves(rctx.jtScope, rctx.joinInfoList)
+	if !ok {
+		t.Fatal("extractScopeLeaves declined")
+	}
+	if len(scans) != 3 {
+		t.Fatalf("scans = %d, want 3", len(scans))
+	}
+	// Canonical order: the deferred leaf (the ANTI link's right side)
+	// is emitted LAST even though it sits mid-chain in the plan tree.
+	if len(semiAnti) != 1 || !semiAnti[0].realLeaf {
+		t.Fatalf("semiAnti = %+v, want one realLeaf link", semiAnti)
+	}
+	lk := semiAnti[0]
+	if lk.jointype != parser.JoinAnti || lk.lhs != RelSet(1) || lk.rhs != RelSet(1)<<2 {
+		t.Fatalf("link = (%v, lhs=%v, rhs=%v), want (Anti, {0}, {2})", lk.jointype, lk.lhs, lk.rhs)
+	}
+	if lk.sjinfo != sj {
+		t.Fatalf("link sjinfo is not the joinInfoList member (%p vs %p)", lk.sjinfo, sj)
+	}
+	// b's deferred leaf is the link's own right subtree — same node the
+	// plan tree holds.
+	if j, isJ := node.(*Join); !isJ || j.Type != JoinTypeInner {
+		t.Fatalf("chain root = %T, want the INNER link above the ANTI", node)
+	}
+	_ = widths
 }
 
 // The scope table must reproduce the walk's DECLINE when a link sits
@@ -172,13 +242,13 @@ func TestScopeExtractionDeclinesLikeWalk(t *testing.T) {
 	// Hand-poisoned table: a leaf that is a descendable Join.
 	bad := &jtScopeTable{}
 	bad.addLeaf(&Join{Type: JoinTypeInner}, false)
-	if _, _, _, _, _, ok := extractScopeLeaves(bad); ok {
+	if _, _, _, _, _, ok := extractScopeLeaves(bad, nil); ok {
 		t.Fatal("extractScopeLeaves accepted a descendable-Join leaf")
 	}
 	// Nil leaf.
 	bad2 := &jtScopeTable{}
 	bad2.addLeaf(nil, false)
-	if _, _, _, _, _, ok := extractScopeLeaves(bad2); ok {
+	if _, _, _, _, _, ok := extractScopeLeaves(bad2, nil); ok {
 		t.Fatal("extractScopeLeaves accepted a nil leaf")
 	}
 }

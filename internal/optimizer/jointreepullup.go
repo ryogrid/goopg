@@ -523,15 +523,20 @@ func flattenPulledBodyTree(node Node, wantLeaves int) ([]Node, []Expr, string, b
 // It performs no qual work: the pulled leaves are real leaf items
 // now, so there is no link record to build — classifyPulledQuals runs
 // once the problem spans exist.
-func splicePulledLeaves(pu *jtPullup, nReal int, ctx *resolveContext, scans *[]Node, widths *[]int, semiAnti *[]semiAntiChainLink, outer *[]outerChainLink, onQuals *[]chainOnQual) bool {
+func splicePulledLeaves(pu *jtPullup, nReal int, nprefix int, ctx *resolveContext, scans *[]Node, widths *[]int, semiAnti *[]semiAntiChainLink, outer *[]outerChainLink, onQuals *[]chainOnQual) bool {
 	if pu == nil || pu.nLeaves == 0 {
 		return true
 	}
-	if pu.base != nReal {
+	if pu.base != nprefix-pu.nLeaves {
 		// The pull-up numbered the pulled leaf items against the
-		// joinlist's relation count at pull-up time; the seam's own
-		// real-leaf count must agree — a mismatch is a numbering
-		// desync, not a shape to plan around.
+		// joinlist's relation count at pull-up time; the pulled band is
+		// always the problem's LAST leaves (deferred chain semi/anti
+		// items sit below it, M0145-0005 slice 6) — a mismatch is a
+		// numbering desync, not a shape to plan around.
+		return false
+	}
+	pos := pu.base
+	if pos < nReal || pos > len(*scans) {
 		return false
 	}
 	// realTotal is the walk-order base of the first non-real leaf:
@@ -560,20 +565,22 @@ func splicePulledLeaves(pu *jtPullup, nReal int, ctx *resolveContext, scans *[]N
 		pulledWidths = append(pulledWidths, pb.leafWidths...)
 	}
 	merged := make([]Node, 0, len(*scans)+pu.nLeaves)
-	merged = append(merged, (*scans)[:nReal]...)
+	merged = append(merged, (*scans)[:pos]...)
 	merged = append(merged, pulledScans...)
-	merged = append(merged, (*scans)[nReal:]...)
+	merged = append(merged, (*scans)[pos:]...)
 	*scans = merged
 	mw := make([]int, 0, len(*widths)+pu.nLeaves)
-	mw = append(mw, (*widths)[:nReal]...)
+	mw = append(mw, (*widths)[:pos]...)
 	mw = append(mw, pulledWidths...)
-	mw = append(mw, (*widths)[nReal:]...)
+	mw = append(mw, (*widths)[pos:]...)
 	*widths = mw
-	// Every chain-extracted leaf index at-or-above nReal moves up by
-	// nLeaves: the extracted links' hands, their SpecialJoinInfo
+	// Every chain-extracted leaf index at-or-above the splice point moves
+	// up by nLeaves: the extracted links' hands, their SpecialJoinInfo
 	// fields (renumbered to real leaf bits during the walk), the
 	// outer links' sides, and the inner ON quals' belowNullable.
-	shift := func(rs RelSet) RelSet { return shiftRelSetAbove(rs, nReal, pu.nLeaves) }
+	// Deferred chain semi/anti items (realLeaf links) sit BELOW pos —
+	// their indices are unaffected.
+	shift := func(rs RelSet) RelSet { return shiftRelSetAbove(rs, pos, pu.nLeaves) }
 	for i := range *semiAnti {
 		lk := &(*semiAnti)[i]
 		lk.lhs, lk.rhs = shift(lk.lhs), shift(lk.rhs)
@@ -642,7 +649,12 @@ func classifyPulledQuals(pu *jtPullup, nReal int, spans []leafSpan, ctx *resolve
 		v, ok := bodyBase[b]
 		return v, ok
 	}
-	pos := nReal
+	// The pulled band starts at pu.base — after the deferred chain
+	// semi/anti items, not at nReal (M0145-0005 slice 6). A pulled qual
+	// whose relids touch that band falls through the switch's default arm
+	// (`qual-spans-neither`) — the band's rels are non-emitting and cannot
+	// be named from a sublink body, so the decline is defensive.
+	pos := pu.base
 	for _, pb := range pu.bodies {
 		n := len(pb.leafScans)
 		rhs := leafRangeRelSet(pos, pos+n)

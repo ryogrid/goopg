@@ -306,15 +306,32 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 	// trailing leaf items are the pulled bodies' own relations —
 	// numbered into the joinlist by pullUpSublinksIntoJointree in
 	// binding order, not walk-derived. `nReal` counts the EMITTING
-	// (ctx.bindings-backed) leaf items; the pulled leaves occupy
-	// [nReal, nprefix) — real searched items with no bindings entry —
-	// and chain-extracted synthetic leaves still land at-or-above
-	// nprefix in the tail. `nPulled` is that trailing count.
+	// (ctx.bindings-backed) leaf items; the pulled leaves occupy the
+	// problem's LAST band [nprefix-nPulled, nprefix) — real searched
+	// items with no bindings entry — and chain-extracted synthetic
+	// leaves still land at-or-above nprefix in the tail. `nPulled` is
+	// that trailing count.
+	//
+	// M0145-0005 slice 6 (jointree arm): the joinlist may ALSO carry
+	// deferred chain semi/anti leaf items — real searched items that
+	// emit no columns — in the band between the emitting items and the
+	// pulled tail. `ctx.bindings` counts emitting leaves only, so the
+	// deferred count is `nprefix - nPulled - nrels` and the
+	// bindings-backed ("real") count is then exactly nrels.
 	nReal := nprefix
 	if pu := ctx.jtPullup; pu != nil {
 		nReal -= pu.nLeaves
 	}
 	nPulled := nprefix - nReal
+	nChain := 0
+	if jointreePipeline {
+		nChain = nprefix - nPulled - nrels
+		if nChain < 0 {
+			traceSeamDecline("prefix-exceeds-bindings", nrels, nprefix)
+			return node, pred, false
+		}
+		nReal = nrels
+	}
 	// R41/K75: fail closed when the joinlist claims MORE relations than the
 	// statement has bindings. `ctx.bindings[:nReal]` below would be an
 	// index-out-of-range PANIC, and until R41 the `leaf-count` check was the
@@ -388,7 +405,7 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 	var outerLinks []outerChainLink
 	var semiAnti []semiAntiChainLink
 	if jointreePipeline && ctx.jtScope != nil && ctx.jtScope.root == chain {
-		scans, widths, onQuals, outerLinks, semiAnti, ok = extractScopeLeaves(ctx.jtScope)
+		scans, widths, onQuals, outerLinks, semiAnti, ok = extractScopeLeaves(ctx.jtScope, ctx.joinInfoList)
 	} else {
 		scans, widths, onQuals, outerLinks, semiAnti, ok = extractSearchLeaves(chain)
 	}
@@ -413,7 +430,7 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 	// and SJInfos once `spans` exists. On the legacy pipeline
 	// ctx.jtPullup is always nil and this is a no-op.
 	if ctx.jtPullup != nil && ctx.jtPullup.nLeaves > 0 {
-		if !splicePulledLeaves(ctx.jtPullup, nReal, ctx, &scans, &widths, &semiAnti, &outerLinks, &onQuals) {
+		if !splicePulledLeaves(ctx.jtPullup, nReal, nprefix, ctx, &scans, &widths, &semiAnti, &outerLinks, &onQuals) {
 			traceSeamDecline("pullup-splice", nrels, len(scans))
 			return node, pred, false
 		}
@@ -430,10 +447,26 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 	// is the popcount of every link's `rhs` — not `len(semiAnti)`, which
 	// counted one per link back when every RHS was one opaque leaf.
 	nSynthetic := 0
+	realLeafBits := RelSet(0)
 	for _, lk := range semiAnti {
+		if lk.realLeaf {
+			// A chain-extracted link whose RHS is a real joinlist leaf
+			// item (jointree arm, M0145-0005 slice 6): `nprefix` already
+			// counts it — it contributes no synthetic tail leaf.
+			realLeafBits |= lk.rhs
+			continue
+		}
 		for r := lk.rhs; r != 0; r >>= 1 {
 			nSynthetic += int(r & 1)
 		}
+	}
+	// The deferred chain leaves the joinlist numbered and the ones the
+	// scope extraction produced must agree leaf for leaf — the two come
+	// from separate passes over the same links (deconstructJointreeScopedSJI
+	// vs extractScopeLeaves), so a mismatch is a desync, never a shape.
+	if realLeafBits != 0 && relLevel(realLeafBits) != nChain {
+		traceSeamDecline("chain-leaf-desync", nrels, len(scans))
+		return node, pred, false
 	}
 	if len(scans) != nprefix+nSynthetic {
 		traceSeamDecline("leaf-count", nrels, len(scans))
@@ -461,6 +494,11 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 	// emits.
 	syntheticBits := RelSet(0)
 	for _, lk := range semiAnti {
+		if lk.realLeaf {
+			// Deferred-band link: `rhs` is a real joinlist leaf index —
+			// already in canonical (non-synthetic) position.
+			continue
+		}
 		syntheticBits |= lk.rhs
 	}
 	// M0145-0016: a chain whose synthetic leaves are NOT already the tail is
@@ -538,6 +576,13 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 	// task's own trace: `rs` for the folded eq conjunct came back spanning
 	// leaves {0,2} instead of {0,1}).
 	for i := range semiAnti {
+		if semiAnti[i].realLeaf {
+			// Scope-extracted links are rebased into leaf-span space
+			// directly — the canonical emission puts every deferred leaf
+			// at its joinlist position, so there is no walk-order flat
+			// space to translate out of.
+			continue
+		}
 		remapped, okRemap := remapWalkOrderFlatToSpans(semiAnti[i].pred, walkWidths, spans, nReal, nPulled, leafPerm)
 		if !okRemap {
 			traceSeamDecline("semianti-pred-remap", nrels, len(scans))
@@ -943,13 +988,69 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 	// `ss.Alias` to build the `rangeBinding` from, and no catalog
 	// statistics for `estimateBaseRelInfo`/`applyRelSizeFallback` below.
 	// Filed as M0145-0013 (owner directive 2026-09-21).
+	//
+	// M0145-0005 slice 6: the non-emitting band is TWO populations —
+	// deferred chain semi/anti leaves at [nReal, pulledBase) and pulled
+	// sublink leaves at [pulledBase, nprefix). The deferred leaves take
+	// the same SeqScan-vs-opaque dispatch the synthetic tail uses: a
+	// base-relation RHS gets catalog stats, a derived RHS (subquery,
+	// tablefunc) gets `EstimateRows` over its plan subtree.
+	pulledBase := nprefix - nPulled
 	for i := nReal; i < nprefix; i++ {
-		b, ok := seamLeafBinding(scans[i], spans[i].lo, ctx, i-nReal)
+		scan := scans[i]
+		if i < pulledBase {
+			// Deferred chain semi/anti leaf — a real joinlist item,
+			// non-emitting. Same dispatch as the synthetic tail arm
+			// below.
+			if _, isScan := scan.(*SeqScan); isScan {
+				b, ok := seamLeafBinding(scan, spans[i].lo, nil, 0)
+				if !ok {
+					traceSeamDecline("chain-leaf-not-scan", nrels, len(scans))
+					return node, pred, false
+				}
+				bindings[i] = b
+				var local Expr
+				if preds := locals.byBinding[i]; len(preds) > 0 {
+					local = combineAnd(preds)
+					localized := make([]Expr, 0, len(preds))
+					for _, p := range preds {
+						localized = append(localized, localizeExprToLeaf(p, b))
+					}
+					leaves[i] = &Filter{Child: scan, Predicate: combineAnd(localized), LeafLocal: true}
+				} else {
+					leaves[i] = scan
+				}
+				relInfos[i] = seamLeafRelInfo(i, b, scan, local, cat)
+				relInfos[i].isSemiAntiSyntheticLeaf = true
+				continue
+			}
+			b := rangeBinding{offset: spans[i].lo}
+			bindings[i] = b
+			var local Expr
+			if preds := locals.byBinding[i]; len(preds) > 0 {
+				local = combineAnd(preds)
+				localized := make([]Expr, 0, len(preds))
+				for _, p := range preds {
+					localized = append(localized, localizeExprToLeaf(p, b))
+				}
+				leaves[i] = &Filter{Child: scan, Predicate: combineAnd(localized), LeafLocal: true}
+			} else {
+				leaves[i] = scan
+			}
+			baseRows := EstimateRows(scan)
+			relInfos[i] = baseRelInfo{
+				bindingIdx:              i,
+				baseRows:                baseRows,
+				filteredRows:            applyLocalFilterSelectivity(baseRows, b, scan, local),
+				isSemiAntiSyntheticLeaf: true,
+			}
+			continue
+		}
+		b, ok := seamLeafBinding(scan, spans[i].lo, ctx, i-pulledBase)
 		if !ok {
 			traceSeamDecline("pulled-leaf-not-scan", nrels, len(scans))
 			return node, pred, false
 		}
-		scan := scans[i]
 		bindings[i] = b
 		var local Expr
 		if preds := locals.byBinding[i]; len(preds) > 0 {
@@ -1987,7 +2088,7 @@ func extractSearchLeaves(node Node) (scans []Node, widths []int, onQuals []chain
 // different root and never reaches this path — the arm is reproduced
 // for parity, not reachability); later leaf indices shift by the
 // expansion, tracked through `leafEff`/`len(scans)`.
-func extractScopeLeaves(tab *jtScopeTable) (scans []Node, widths []int, onQuals []chainOnQual, outer []outerChainLink, semiAnti []semiAntiChainLink, ok bool) {
+func extractScopeLeaves(tab *jtScopeTable, sjis []*SpecialJoinInfo) (scans []Node, widths []int, onQuals []chainOnQual, outer []outerChainLink, semiAnti []semiAntiChainLink, ok bool) {
 	if tab == nil || tab.poisoned || len(tab.leaves) == 0 {
 		return nil, nil, nil, nil, nil, false
 	}
@@ -2005,130 +2106,146 @@ func extractScopeLeaves(tab *jtScopeTable) (scans []Node, widths []int, onQuals 
 			}
 		}
 	}
-	// leafEff maps each table leaf to its emitted index (post-expansion);
-	// widthBefore/realBefore are the walk's two accumulators sampled at
-	// each leaf position — the `base`/`rightBase` a link reads off them.
-	leafEff := make([]int, len(tab.leaves))
-	widthBefore := make([]int, len(tab.leaves))
-	realBefore := make([]int, len(tab.leaves))
-	width, realWidth := 0, 0
-	// outerSubs records each processed outer link's subtree range and
-	// nullable set; a link's `below` is the union over entries contained
-	// in its left subtree — the quantity the walk's nullLeft|nullRight
-	// recursion returns.
+	// M0145-0005 slice 6 — canonical emission. The walk emits leaves in
+	// chain DFS order; this extraction instead emits them in JOINLIST
+	// order: every emitting (non-synthetic) leaf first in table order,
+	// then every deferred (synthetic — a SEMI/ANTI link's right side)
+	// leaf in table order. That is exactly the numbering
+	// deconstructJointreeScopedSJI gives the joinlist's leaf items
+	// (deferred band after the emitting band), so a deferred leaf's
+	// emitted index IS its joinlist item index and `rhs` in the link
+	// record below is a real item index, not a synthetic tail slot —
+	// the `realLeaf` marker carries that distinction to the seam.
+	//
+	// Because the emitting band is contiguous, `emitBase` — the
+	// canonical flat column offset — is also the leaf's problem-space
+	// span.lo, so every rebase below lands directly in span space and
+	// the seam's walk-order→span remap is skipped for these links.
+	canonLo := make([]int, len(tab.leaves))
+	canonHi := make([]int, len(tab.leaves))
+	emitBase := make([]int, len(tab.leaves))
+	emitW := 0
+	for ti := range tab.leaves {
+		lf := tab.leaves[ti]
+		if lf.synthetic {
+			continue
+		}
+		if lf.node == nil {
+			return nil, nil, nil, nil, nil, false
+		}
+		if j, isJ := lf.node.(*Join); isJ && j.Type != JoinTypeFull {
+			return nil, nil, nil, nil, nil, false
+		}
+		canonLo[ti], canonHi[ti] = len(scans), len(scans)+1
+		emitBase[ti] = emitW
+		w := len(lf.node.Output())
+		scans = append(scans, lf.node)
+		widths = append(widths, w)
+		emitW += w
+	}
+	// leafLink maps a synthetic leaf to the semi/anti link that produced
+	// it (the link's loRight) — needed to find FlattenedRHS expansions.
+	leafLink := make([]int, len(tab.leaves))
+	for i := range leafLink {
+		leafLink[i] = -1
+	}
+	for li := range tab.links {
+		lk := &tab.links[li]
+		if lk.kind == jtLinkSemiAnti && lk.loRight >= 0 && lk.loRight < len(tab.leaves) {
+			leafLink[lk.loRight] = li
+		}
+	}
+	// flatBodyQuals carries a flattened link's rebased body quals, keyed
+	// by the table leaf the link's right side occupied. The shape is
+	// unreachable on this path today (only the unnest rewrite builds
+	// FlattenedRHS, and its grafted chain has a different root) — kept
+	// for parity with the walk arm; a real occurrence declines at the
+	// seam's leaf-count gate, since no joinlist items exist for the
+	// expansion's extra leaves.
+	flatBodyQuals := make(map[int][]Expr)
+	for ti := range tab.leaves {
+		lf := tab.leaves[ti]
+		if !lf.synthetic {
+			continue
+		}
+		if lf.node == nil {
+			return nil, nil, nil, nil, nil, false
+		}
+		canonLo[ti] = len(scans)
+		emitBase[ti] = emitW
+		li := leafLink[ti]
+		if li >= 0 && tab.links[li].jn != nil && tab.links[li].jn.FlattenedRHS {
+			flatLeaves, flatQuals, _, _, okFlat := decomposeFlatBodyTree(lf.node, false)
+			if !okFlat {
+				return nil, nil, nil, nil, nil, false
+			}
+			for _, fl := range flatLeaves {
+				w := len(fl.Output())
+				scans = append(scans, fl)
+				widths = append(widths, w)
+				emitW += w
+			}
+			for _, q := range flatQuals {
+				shifted, okShift := rebaseChainQual(q, emitBase[ti])
+				if !okShift {
+					return nil, nil, nil, nil, nil, false
+				}
+				flatBodyQuals[ti] = append(flatBodyQuals[ti], shifted)
+			}
+		} else {
+			w := len(lf.node.Output())
+			scans = append(scans, lf.node)
+			widths = append(widths, w)
+			emitW += w
+		}
+		canonHi[ti] = len(scans)
+	}
+	// members maps a table-leaf range to the relset of canonical leaf
+	// indices it covers — contiguous for ordinary ranges, with the
+	// deferred bits mixed in when the subtree contains a semijoin right.
+	members := func(lo, hi int) RelSet {
+		var m RelSet
+		for t := lo; t < hi; t++ {
+			m |= leafRangeRelSet(canonLo[t], canonHi[t])
+		}
+		return m
+	}
+	// outerSubs records each processed outer link's subtree member set
+	// and nullable set; a link's `below` is the union over entries whose
+	// subtree is contained in this link's left subtree — the quantity
+	// the walk's nullLeft|nullRight recursion returns.
 	type outerSub struct {
-		lo, hi   int
-		nullable RelSet
+		members, nullable RelSet
 	}
 	var outerSubs []outerSub
-	below := func(lo, hi int) RelSet {
+	below := func(leftMembers RelSet) RelSet {
 		var b RelSet
 		for _, os := range outerSubs {
-			if os.lo >= lo && os.hi <= hi {
+			if os.members&^leftMembers == 0 {
 				b |= os.nullable
 			}
 		}
 		return b
 	}
-	// emit appends table leaf ti to scans/widths, sampling the two
-	// accumulators first. The join check mirrors the walk's dispatch: a
-	// leaf that is a descendable (or semi/anti) join means the walk
-	// would have made it a link — the table is inconsistent with the
-	// chain it claims to describe, so the extraction declines rather
-	// than mis-number. A Join{Full} leaf is legitimate — the fold arm
-	// produces exactly that.
-	emit := func(ti int) bool {
-		lf := tab.leaves[ti]
-		if lf.node == nil {
-			return false
-		}
-		if j, isJ := lf.node.(*Join); isJ && j.Type != JoinTypeFull {
-			return false
-		}
-		leafEff[ti] = len(scans)
-		widthBefore[ti] = width
-		realBefore[ti] = realWidth
-		w := len(lf.node.Output())
-		scans = append(scans, lf.node)
-		widths = append(widths, w)
-		width += w
-		if !lf.synthetic {
-			realWidth += w
-		}
-		return true
-	}
-	// emitRaw is the unchecked append for a semi/anti link's right side —
-	// the walk appends j.Right (or the decomposed flat leaves) as opaque
-	// leaves without dispatching on their node type.
-	emitRaw := func(n Node, synthetic bool) {
-		w := len(n.Output())
-		scans = append(scans, n)
-		widths = append(widths, w)
-		width += w
-		if !synthetic {
-			realWidth += w
-		}
-	}
-	ti := 0
 	for li := range tab.links {
 		lk := &tab.links[li]
 		if lk.jn == nil || lk.loLeft < 0 || lk.loLeft >= lk.loRight || lk.loRight >= lk.hiRight || lk.hiRight > len(tab.leaves) {
 			return nil, nil, nil, nil, nil, false
 		}
-		// Free leaves before this link's right range — item bases, fold
-		// products, and the leaves of earlier links' left subtrees.
-		for ti < lk.loRight {
-			if !emit(ti) {
-				return nil, nil, nil, nil, nil, false
-			}
-			ti++
-		}
-		if ti != lk.loRight {
+		// A link's left subtree always starts at a non-synthetic leaf
+		// (the item's base), so emitBase[loLeft] is an emitting-space
+		// offset — the base every qual rebase below reads.
+		if tab.leaves[lk.loLeft].synthetic {
 			return nil, nil, nil, nil, nil, false
 		}
-		effLoLeft := leafEff[lk.loLeft]
-		effLoRight := len(scans)
 		switch lk.kind {
 		case jtLinkSemiAnti:
 			if !preserved[li] {
 				return nil, nil, nil, nil, nil, false
 			}
-			base := widthBefore[lk.loLeft]
-			rightBase := width
+			base := emitBase[lk.loLeft]
+			rightBase := emitBase[lk.loRight]
 			outerWidth := len(lk.jn.Left.Output())
-			var bodyQuals []Expr
-			flattened := false
-			if lk.jn.FlattenedRHS {
-				flatLeaves, flatQuals, _, _, okFlat := decomposeFlatBodyTree(lk.jn.Right, false)
-				if !okFlat {
-					return nil, nil, nil, nil, nil, false
-				}
-				leafEff[ti] = len(scans)
-				widthBefore[ti] = width
-				realBefore[ti] = realWidth
-				ti++
-				for _, lf := range flatLeaves {
-					emitRaw(lf, true)
-				}
-				for _, q := range flatQuals {
-					shifted, okShift := rebaseChainQual(q, rightBase)
-					if !okShift {
-						return nil, nil, nil, nil, nil, false
-					}
-					bodyQuals = append(bodyQuals, shifted)
-				}
-				flattened = true
-			} else {
-				if tab.leaves[ti].node == nil {
-					return nil, nil, nil, nil, nil, false
-				}
-				leafEff[ti] = len(scans)
-				widthBefore[ti] = width
-				realBefore[ti] = realWidth
-				emitRaw(tab.leaves[ti].node, true)
-				ti++
-			}
-			effHiRight := len(scans)
 			pred := lk.jn.Predicate
 			if lk.jn.LeftKey != nil && lk.jn.RightKey != nil {
 				eq := &BinaryOp{pos: lk.jn.LeftKey.Pos(), Op: parser.OpEq, Left: lk.jn.LeftKey, Right: lk.jn.RightKey}
@@ -2149,34 +2266,46 @@ func extractScopeLeaves(tab *jtScopeTable) (scans []Node, widths []int, onQuals 
 			if lk.jn.Type == JoinTypeAnti {
 				pjt = parser.JoinAnti
 			}
-			lhs := leafRangeRelSet(effLoLeft, effLoRight)
-			rhs := leafRangeRelSet(effLoRight, effHiRight)
-			semiAnti = append(semiAnti, semiAntiChainLink{jointype: pjt, lhs: lhs, rhs: rhs, pred: pred, sjinfo: lk.jn.SJInfo, flattened: flattened, bodyQuals: bodyQuals})
-			minL, minR := lhs, rhs
-			if pred != nil {
-				if relids, okRel := relidsOfExpr(pred, buildLeafSpans(widths, nil)); okRel {
-					if nl := relids & lhs; nl != 0 {
-						minL = nl
-					}
-					if nr := relids & rhs; nr != 0 {
-						minR = nr
-					}
+			lhs := members(lk.loLeft, lk.loRight)
+			rhs := members(lk.loRight, lk.hiRight)
+			// The link's SpecialJoinInfo is the one deconstruction
+			// published on ctx.joinInfoList — match it by jointype and
+			// syntactic sides (the same match semiAntiLinksHaveSJInfos
+			// performs), so the search constrains the leaf with the SJI
+			// `lower`-scan narrowing deconstruction computed. Only when
+			// no list entry matches — a numbering desync the leaf-count
+			// gate will also catch — fall back to the plan node's
+			// placeholder, renumbered in place exactly as the walk does.
+			sjinfo := lk.jn.SJInfo
+			matched := false
+			for _, sj := range sjis {
+				if sj != nil && sj.Jointype == pjt && sj.SynLefthand == lhs && sj.SynRighthand == rhs {
+					sjinfo = sj
+					matched = true
+					break
 				}
 			}
-			if lk.jn.SJInfo != nil {
-				lk.jn.SJInfo.SynLefthand, lk.jn.SJInfo.MinLefthand = lhs, minL
-				lk.jn.SJInfo.SynRighthand, lk.jn.SJInfo.MinRighthand = rhs, minR
+			semiAnti = append(semiAnti, semiAntiChainLink{jointype: pjt, lhs: lhs, rhs: rhs, pred: pred, sjinfo: sjinfo, flattened: lk.jn.FlattenedRHS, bodyQuals: flatBodyQuals[lk.loRight], realLeaf: true})
+			if !matched && sjinfo != nil {
+				minL, minR := lhs, rhs
+				if pred != nil {
+					if relids, okRel := relidsOfExpr(pred, buildLeafSpans(widths, nil)); okRel {
+						if nl := relids & lhs; nl != 0 {
+							minL = nl
+						}
+						if nr := relids & rhs; nr != 0 {
+							minR = nr
+						}
+					}
+				}
+				sjinfo.SynLefthand, sjinfo.MinLefthand = lhs, minL
+				sjinfo.SynRighthand, sjinfo.MinRighthand = rhs, minR
 			}
 		case jtLinkOuter:
 			if !preserved[li] || (lk.jn.Type != JoinTypeLeft && lk.jn.Type != JoinTypeRight) {
 				return nil, nil, nil, nil, nil, false
 			}
-			if !emit(ti) {
-				return nil, nil, nil, nil, nil, false
-			}
-			ti++
-			effHiRight := len(scans)
-			base := realBefore[lk.loLeft]
+			base := emitBase[lk.loLeft]
 			pred := lk.jn.Predicate
 			if pred != nil && base != 0 {
 				shifted, okShift := rebaseChainQual(pred, base)
@@ -2187,24 +2316,20 @@ func extractScopeLeaves(tab *jtScopeTable) (scans []Node, widths []int, onQuals 
 			}
 			lk2 := outerChainLink{
 				jointype:  parser.JoinLeft,
-				preserved: leafRangeRelSet(effLoLeft, effLoRight),
-				nullable:  leafRangeRelSet(effLoRight, effHiRight),
+				preserved: members(lk.loLeft, lk.loRight),
+				nullable:  members(lk.loRight, lk.hiRight),
 				pred:      pred,
 			}
 			if lk.jn.Type == JoinTypeRight {
 				lk2.jointype, lk2.preserved, lk2.nullable = reduceRightLink(lk2.preserved, lk2.nullable)
 			}
 			outer = append(outer, lk2)
-			outerSubs = append(outerSubs, outerSub{lo: effLoLeft, hi: effHiRight, nullable: lk2.nullable})
+			outerSubs = append(outerSubs, outerSub{members: members(lk.loLeft, lk.hiRight), nullable: lk2.nullable})
 		case jtLinkInner:
 			if lk.jn.Type != JoinTypeInner || lk.jn.Predicate == nil {
 				return nil, nil, nil, nil, nil, false
 			}
-			if !emit(ti) {
-				return nil, nil, nil, nil, nil, false
-			}
-			ti++
-			base := realBefore[lk.loLeft]
+			base := emitBase[lk.loLeft]
 			pred := lk.jn.Predicate
 			if base != 0 {
 				shifted, okShift := rebaseChainQual(pred, base)
@@ -2213,16 +2338,10 @@ func extractScopeLeaves(tab *jtScopeTable) (scans []Node, widths []int, onQuals 
 				}
 				pred = shifted
 			}
-			onQuals = append(onQuals, chainOnQual{pred: pred, belowNullable: below(effLoLeft, effLoRight)})
+			onQuals = append(onQuals, chainOnQual{pred: pred, belowNullable: below(members(lk.loLeft, lk.loRight))})
 		default:
 			return nil, nil, nil, nil, nil, false
 		}
-	}
-	for ti < len(tab.leaves) {
-		if !emit(ti) {
-			return nil, nil, nil, nil, nil, false
-		}
-		ti++
 	}
 	return scans, widths, onQuals, outer, semiAnti, true
 }
@@ -2582,6 +2701,16 @@ type semiAntiChainLink struct {
 	// `distribute_qual_to_rels`'s shape inside PG's pulled-up RHS. Empty
 	// for opaque links.
 	bodyQuals []Expr
+	// realLeaf is set when `rhs` names REAL joinlist leaf items — the
+	// deferred-band numbering `extractScopeLeaves` emits for a
+	// chain-extracted SEMI/ANTI link under the jointree pipeline
+	// (M0145-0005 slice 6). Such a link's `pred`/`bodyQuals` are already
+	// in leaf-span space (the canonical emission makes the walk-order →
+	// span remap unnecessary) and its `sjinfo` is the deconstruction's own
+	// `*SpecialJoinInfo` from `ctx.joinInfoList`, not a renumbered
+	// placeholder. When false, `rhs` names synthetic tail leaves and the
+	// legacy remap/renumber machinery applies.
+	realLeaf bool
 }
 
 // semiAntiLinksHaveSJInfos is `outerLinksHaveSJInfos`'s SEMI/ANTI analogue:

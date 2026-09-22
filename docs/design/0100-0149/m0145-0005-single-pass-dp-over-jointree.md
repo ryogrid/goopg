@@ -3,9 +3,11 @@
 Status: slices 1 (knob-arm `splitOuterSpine` retired), 2 (pulled
 semi/anti as real leaf items), 3 (IR-direct leaf materialisation —
 `jtScopeTable`/`extractScopeLeaves`), 4 (one-relation + degenerate
-scopes through the same entry) and 5-partial (searched-subtree opacity
-for the residual pushdown family) landed; the rest of slice 5 is
-ledgered below. Task:
+scopes through the same entry), 5-partial (searched-subtree opacity
+for the residual pushdown family) and 6 (chain-extracted semi/anti as
+deferred real leaf items — slice 2's chain half) landed; the rest of
+slice 5 plus the Phase A/B / pinned-spine retirement are ledgered
+below. Task:
 `.ralph/fix_plan.md` M0145-0005. Parent:
 M0145-0001 (IR contract + retirement matrix), M0145-0003 (semi/anti leaf
 entries), M0145-0004 (appendrel leaves). Kind: impl.
@@ -60,8 +62,8 @@ What remains is therefore construction-side, not capability-side:
   spans/offset/remap validation family;
 - semi/anti members arrive as `semiAntiChainLink` synthetic appended
   leaves instead of numbered jointree entries — slice 2 retired this
-  for pulled bodies (real `joinlist` leaf items now); only
-  chain-extracted Semi/Anti still arrive that way;
+  for pulled bodies and slice 6 for chain-extracted Semi/Anti (deferred
+  real leaf items now);
 - Phase A/B (`runJoinSearchBelowPinned`) still searches twice around the
   pinned semi/anti spine;
 - the `prefix-size`/`isSimpleSingle`/`GOOPG_ONEREL_SEARCH` floor still
@@ -470,11 +472,88 @@ source — not merge the two lists.
 
 Corrected resume point recorded in `.ralph/deferral_ledger.md`.
 
+## Slice 6 — chain-extracted semi/anti as deferred real leaf items (landed)
+
+Slice 2's numbering trick is applied to the chain itself. Upstream,
+`deconstruct_recurse` emits the semijoin RHS as an ordinary joinlist
+member (initsplan.c:1400-1410) and `make_outerjoininfo` publishes its
+`SpecialJoinInfo`; goopg's legacy arm instead collapses leading
+SEMI/ANTI links out of the joinlist (`antiCollapsedJoins`, R41/K74) and
+reconstructs every semijoin at the seam as a synthetic tail leaf behind
+a `semiAntiChainLink` — the walk-order→span remap and the
+synthetic-slot contract (M0145-0016's reorder) exist only to paper over
+that absence. On the jointree arm the semijoin RHS is now a real leaf
+item, DEFERRED rather than DFS-in-place so it never consumes a binding
+or schema offset:
+
+- **Two-band joinlist numbering** (`deconstructJointreeScopedSJI` +
+  `jointreeItemEmittingRels`): emitting leaves keep DFS indices
+  `[0, emitTotal)`; every SEMI/ANTI link's right side becomes a leaf
+  item in the deferred band `[emitTotal, emitTotal+nSemiAnti)`, in
+  link-encounter order. `pullUpSublinksIntoJointree`'s pulled band then
+  continues after it — the problem is `emitting | deferred-chain |
+  pulled`, all real items. `sub_members` counts the deferred members so
+  the collapse-limit comparison stays upstream-shaped, and
+  `deconstructFromItemScoped` builds the SJI with
+  `makeSpecialJoinInfoForSets` — explicit relsets, since the deferred
+  right side is not a contiguous member of the item's local joinlist —
+  with `leftScope` tracking PG's `qualscope` (deferred bits included).
+- **`sjiScope` resolves names to leaf indices, not positions**
+  (`sjiLeaf.leafIdx`): the scope records every range variable in DFS
+  order so the semijoin RHS stays in scope, but stamps each leaf with
+  the RelSet bit deconstruction gave it — position and index diverge
+  only for deferred leaves. The legacy path passes position as index,
+  unchanged.
+- **`extractScopeLeaves` emits canonically** — the emitting band first
+  in table order, then the deferred band — so a deferred leaf's emitted
+  index IS its joinlist item index. Semi/anti links record
+  `realLeaf: true` with `rhs` naming the real item, and take their SJI
+  off `ctx.joinInfoList` by `(jointype, SynLefthand, SynRighthand)`
+  match — the same match `semiAntiLinksHaveSJInfos` performs — so the
+  searched constraint is the one deconstruction's `lower`-scan
+  narrowing computed, not the plan node's placeholder.
+- **The seam splits the non-emitting band in two**: deferred chain
+  leaves at `[nReal, pulledBase)` take the synthetic tail's
+  SeqScan-vs-opaque dispatch (catalog stats for a base RHS,
+  `EstimateRows` for a derived one); pulled leaves keep their own arm
+  at `[pulledBase, nprefix)`. `realLeaf` links are skipped by
+  `syntheticBits`, the walk-order→span remap and the synthetic-tail
+  arithmetic — and a new `chain-leaf-desync` check cross-verifies the
+  deferred band the extraction produced against the joinlist's
+  `nprefix - nPulled - nrels`, so a numbering disagreement between the
+  two passes declines rather than plans wrong.
+
+Retired on the jointree arm: the synthetic tail for chain-extracted
+SEMI/ANTI (`semiAntiChainLink.realLeaf == false` cannot arise from
+`extractScopeLeaves`), and M0145-0016's reorder machinery *for these
+links* (the walk arm keeps it — the legacy pipeline still produces
+synthetic leaves). The `searchJl` leafItem-append workaround now
+appends zero items on the jointree arm — `nleaves == nprefix` since
+every semi/anti member is already a `jl` member — and
+`splicePulledLeaves` gained an `nprefix` parameter so the pulled band
+is located after the deferred band instead of assuming the two
+coincide.
+
+### Evidence
+
+White-box: `TestScopeExtractionSemiAntiDeferred` pins the numbering
+end-to-end — `a LEFT b JOIN c WHERE b IS NULL` (demoted ANTI) builds
+joinlist `{a=0, c=1, b=2}` with `b` deferred, the ANTI SJI carries
+`{0}`/`{2}`, and scope extraction returns one `realLeaf` link bound to
+that SJI. `TestScopeExtractionMatchesWalk` still passes under the knob
+(the walk arm is unaffected — it runs the legacy numbering).
+Plan-level: `TestJointreeSearchesADemotedAntiLink` drives the real
+planner — `jtp_o ANTI jtp_i ⋈ jtp_i2` produces a searched left-only
+ANTI subtree on the jointree arm where the shape previously declined at
+`leaf-count`. Gates: optimizer suite, units, tpch-spotcheck
+(Q12=2/Q13=33), TPC-DS SF0.25 sweep.
+
 ## Remaining slices (ledgered)
 
 | slice | scope | retires |
 |---|---|---|
 | 5 (partial) | decline families without corpus witness or with hard blockers | `outer-on-qual`, `inner-on-qual-*` (retired — zero corpus fires); `outer-over-derived` (post-B-06), `lateral` (needs parameterized-path legality) remain ledgered |
+| 7 | Phase A/B split: `runJoinSearchBelowPinned`, the pinned spine, splice-time re-resolution | the second search pass; a pinned FULL top stays a decline on the jointree arm |
 
 The executor-capability refusals (FULL hash, partial shapes the executor
 cannot run) stay at path generation until the D3 executor substrate lands —
