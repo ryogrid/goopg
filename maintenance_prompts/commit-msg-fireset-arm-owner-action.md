@@ -104,8 +104,73 @@ same=99 changed=0`; pgbench smoke). The full state is in
 `.ralph/working_set.md` and in the `[!]` block at the top of the M0122-0015
 entry in `.ralph/fix_plan.md`.
 
-If `/tmp/ftmsg.txt` has been cleared by a reboot, the message text is recorded
-in that same `[!]` block's history; the staged diff is the authority.
+### Copy-paste recovery (does not depend on `/tmp`)
+
+`/tmp/ftmsg.txt` does not survive a reboot, so the message is reproduced here
+verbatim. Write it to a file and commit with the explicit pathspec — never
+`git add -A`, since a concurrent agent's WIP may be present in this checkout:
+
+```
+cat > /tmp/ftmsg.txt <<'MSG'
+catalog(M0122-0015): make a foreign table survive a restart as a foreign table — real pg_foreign_table heap row + reload
+
+CREATE FOREIGN TABLE left nothing durable about the relation's foreign-ness.
+After a clean stop/start pg_foreign_table was empty, pg_class.relkind had
+degraded 'f' -> 'r', and SELECT on the table returned zero rows where PG 18.3
+raises 55000 "foreign-data wrapper ... has no handler" — so the refusal landed
+in 8deb60881 could not fire on any restarted cluster.
+
+Three causes: buildUserPGClassRow had no 'f' arm, so the persisted heap row
+disagreed with the virtual pg_class renderer, which always derived 'f' from
+Table.ForeignServerName; the reload filter in internal/initdb/open.go accepted
+only {r,m,v,S}; and pg_foreign_table was rendered purely virtually from a field
+with no heap representation at all.
+
+writeForeignTableCatalogRow writes a real pg_foreign_table (3118) row
+(ftrelid, ftserver, ftoptions) plus its 3119 index entry, from the single
+syncTableToCatalogHeap funnel; stampForeignTableRows kills it on DROP or an
+ALTER re-sync; reloadForeignTablesFromHeap reverses ftserver through the server
+registry and re-attaches ForeignServerName/ForeignOptions, running last in
+reloadForeignDataFromHeap — after the servers it dereferences and after the
+user tables it attaches to. 3119 is registered in keyMetaForSysBtree, which
+TestEverySysBtreeInsertPathIndexHasSplitKeyMeta caught.
+
+TestPort_PgDump003ForeignDataNoHandler now restarts between the DDL and the
+pg_dump runs. Upstream has no restart there; goopg needs one, because without
+it the test passed while post-recovery state was broken. Non-vacuity checked:
+removing the 'f' reload arm fails exactly that assertion.
+
+Deferred and ledgered: the four foreign-data catalogs are still pinned to
+DefaultDBOid (inherited B3.4 scope), and CREATE FOREIGN TABLE still returns the
+command tag CREATE TABLE.
+
+Gates: initdb + catalog + executor units; both 003 ports; full
+TestPort_RegressSuite with an unchanged failing set (only partition_aggregate,
+which has its own [!] row); tpch-spotcheck PASS (Q12=2, Q13=33); tpcds-sf025
+PASS=96 MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0, PLAN-SHAPE same=99
+changed=0; pgbench smoke.
+
+PARITY: N/A — no optimizer/planner file staged; foreign tables appear in
+neither benchmark corpus.
+CATEGORIES-EXCL-MATCH: catalog-durability
+MSG
+
+git commit -F /tmp/ftmsg.txt -- \
+  internal/executor/sys_pg_foreign.go \
+  internal/executor/pg18_user_catalog_rows.go \
+  internal/executor/operators_ddl.go \
+  internal/executor/sys_catalog_btree_split.go \
+  internal/initdb/catalog_heap_reload.go \
+  internal/initdb/open.go \
+  internal/testport/pgdump003_with_server_test.go \
+  docs/design/0100-0149/0122-0015-foreign-table-catalog-durability.md \
+  docs/design/README.md \
+  .ralph/deferral_ledger.md .ralph/fix_plan.md
+```
+
+If the staged index has been lost as well, the change is fully described by
+`docs/design/0100-0149/0122-0015-foreign-table-catalog-durability.md` (itself
+staged) and is re-implementable from it; the gates would then need re-running.
 
 ## Why the loop did not fix it itself
 
