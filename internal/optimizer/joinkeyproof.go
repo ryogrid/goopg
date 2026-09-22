@@ -194,6 +194,15 @@ func resolveBaseColumn(idx int, child Node) (baseColumnRef, bool) {
 		return resolveBaseColumn(idx, x.Child)
 	case *GatherMerge:
 		return resolveBaseColumn(idx, x.Child)
+	case *Memoize:
+		// Memoize changes neither its child's row shape nor the values in a
+		// cached tuple.  Its typed IndexScan child is still the base-relation
+		// path behind a grouping or selectivity Var; stopping here instead
+		// silently drops the key's distinct contribution (TPC-DS Q39).
+		if x.Child == nil {
+			return baseColumnRef{}, false
+		}
+		return resolveBaseColumn(idx, x.Child)
 	case *CTEScan:
 		// The scan's schema is the body's output schema, position for
 		// position.

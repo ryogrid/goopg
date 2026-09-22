@@ -21,7 +21,9 @@
 package optimizer
 
 import (
+	"fmt"
 	"math"
+	"os"
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/parser"
@@ -1642,15 +1644,20 @@ func estimateNumGroups(groupExprs []Expr, child Node, inputRows int64) int64 {
 		if reldistinct > clamp {
 			reldistinct = clamp
 		}
-		if filtered, ok := relFilteredRows(child, rel); ok && reldistinct > 0 && filtered < tuples {
+		filteredRows := -1.0
+		if filtered, ok := relFilteredRows(child, rel); ok {
+			filteredRows = filtered
+		}
+		if filteredRows >= 0 && reldistinct > 0 && filteredRows < tuples {
 			// Yao/Dell'Era: selecting p of N rows from n uniformly
 			// distributed distinct values is expected to yield
 			// n·(1 - ((N-p)/N)^(N/n)) of them. This is the only term that
 			// knows the relation was FILTERED, and it is why grouping a
 			// heavily restricted relation inside a fan-out join does not
 			// claim the whole table's distinct count.
-			reldistinct *= 1 - math.Pow((tuples-filtered)/tuples, tuples/reldistinct)
+			reldistinct *= 1 - math.Pow((tuples-filteredRows)/tuples, tuples/reldistinct)
 		}
+		traceGroupRelation(rel, vis, tuples, filteredRows, reldistinct)
 		numdistinct *= clampRowEstF(reldistinct)
 	}
 
@@ -1701,24 +1708,59 @@ func examineGroupVar(cr *ColumnRef, child Node) (groupVarKey, groupVarInfo) {
 				oid = ref.table.OID
 				attnum, _ = attnumOfColumn(ref.table, ref.col)
 			}
-			return groupVarKey{rel: ref.scan, col: ref.col},
-				groupVarInfo{
-					rel:       ref.scan,
-					ndistinct: groupVarNDistinct(float64(ref.ndistinct), ref.rawRows),
-					rawRows:   ref.rawRows,
-					tableOID:  oid,
-					attnum:    attnum,
-				}
+			info := groupVarInfo{
+				rel:       ref.scan,
+				ndistinct: groupVarNDistinct(float64(ref.ndistinct), ref.rawRows),
+				rawRows:   ref.rawRows,
+				tableOID:  oid,
+				attnum:    attnum,
+			}
+			traceGroupVar(cr, ref, info, "base")
+			return groupVarKey{rel: ref.scan, col: ref.col}, info
 		}
 		// `get_variable_numdistinct`'s isunique branch: a column that is the
 		// sole grouping key of an intervening grouped node is unique in that
 		// node's output, so its distinct count is that node's row count. No
 		// base relation means no per-relation clamp — see groupVarInfo.rel.
 		if nd, ok := groupUniqueNDistinct(cr.Index, child); ok && nd > 0 {
-			return groupVarKey{idx: cr.Index}, groupVarInfo{ndistinct: float64(nd)}
+			info := groupVarInfo{ndistinct: float64(nd)}
+			traceGroupVar(cr, baseColumnRef{}, info, "group-unique")
+			return groupVarKey{idx: cr.Index}, info
 		}
 	}
-	return groupVarKey{idx: cr.Index}, groupVarInfo{ndistinct: defaultNumDistinct}
+	info := groupVarInfo{ndistinct: defaultNumDistinct}
+	traceGroupVar(cr, baseColumnRef{}, info, "default")
+	return groupVarKey{idx: cr.Index}, info
+}
+
+// traceGroupVar writes the evidence estimateNumGroups consumes for one GROUP
+// BY variable. It shares the opt-in DP trace switch so corpus captures can
+// explain a group-count collapse without adding a default-path cost or a
+// second diagnostic configuration surface.
+func traceGroupVar(cr *ColumnRef, ref baseColumnRef, info groupVarInfo, source string) {
+	if !pathTraceEnabled || cr == nil {
+		return
+	}
+	table := "-"
+	if ref.table != nil {
+		table = ref.table.Name
+	}
+	fmt.Fprintf(os.Stderr,
+		"GROUPTRACE source=%s index=%d name=%s table=%s col=%s ndistinct=%g rawrows=%g\n",
+		source, cr.Index, cr.Name, table, ref.col, info.ndistinct, info.rawRows)
+}
+
+// traceGroupRelation records the per-relation product after its tuple clamp
+// and optional Yao/Dell'Era restriction term. A negative filtered value means
+// the plan walk deliberately declined to treat the relation as filtered.
+func traceGroupRelation(rel Node, vis []groupVarInfo, tuples, filtered, ndistinct float64) {
+	if !pathTraceEnabled || len(vis) == 0 {
+		return
+	}
+	first := vis[0]
+	fmt.Fprintf(os.Stderr,
+		"GROUPTRACE relation=%T tableoid=%d attnum=%d vars=%d tuples=%g filtered=%g ndistinct=%g\n",
+		rel, first.tableOID, first.attnum, len(vis), tuples, filtered, ndistinct)
 }
 
 // groupVarNDistinct is the tail of `get_variable_numdistinct` (selfuncs.c:6341)
@@ -1858,6 +1900,11 @@ func relFilteredRowsWalk(n, rel Node) (rows float64, found, sealed bool) {
 		return passthrough(x.Child)
 	case *GatherMerge:
 		return passthrough(x.Child)
+	case *Memoize:
+		if x.Child == nil {
+			return 0, false, false
+		}
+		return passthrough(x.Child)
 	case *CTEScan:
 		return passthrough(x.Child)
 	// M0145-0009 slice 4: the third member of the resolver-arm family
@@ -1873,6 +1920,18 @@ func relFilteredRowsWalk(n, rel Node) (rows float64, found, sealed bool) {
 	case *Join:
 		return joinSide(x.Left, x.Right)
 	case *NestedLoopIndexJoin:
+		// Every legal NLI Inner is a parameterized probe. Its one-execution
+		// row estimate is consequently not a restriction of the base
+		// relation: the probe is re-executed for every Outer row. The probe
+		// key is commonly a plain ColumnRef in the outer-row coordinate
+		// frame, rather than an OuterColumnRef, so inspecting the key alone
+		// cannot recognize this shape (Q39 / R64). Decline it structurally
+		// before the ordinary join-side walk reaches the leaf.
+		if x.Inner == rel {
+			if _, _, _, ok := nliInnerProbe(x.Inner); ok {
+				return 0, false, false
+			}
+		}
 		if x.Inner != nil {
 			return joinSide(x.Outer, x.Inner)
 		}

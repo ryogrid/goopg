@@ -153,6 +153,35 @@ func TestNumGroupsAccountsForRestrictionOnTheRelation(t *testing.T) {
 	}
 }
 
+// An NLI Inner is a parameterized probe, so its one-probe row count must not
+// be read as a base-relation restriction by the Yao/Dell'Era term. Its key is
+// normally a ColumnRef in the outer-row frame, not an OuterColumnRef, making
+// a key-only correlation test insufficient. Q39 grouped an item key above
+// exactly this shape and collapsed 18,000 values to one before this guard.
+func TestNumGroupsIgnoresParameterizedNLIProbeRows(t *testing.T) {
+	outer := numGroupsScan("outer", 5, 5)
+	innerBase := numGroupsScan("inner", 18000, 18000)
+	inner := &IndexScan{
+		Table:  innerBase.Table,
+		Index:  &catalog.Index{Table: innerBase.Table, Columns: []string{"a"}},
+		Key:    jrCol(0),
+		schema: innerBase.Output(),
+	}
+	nli := mergedNLI(JoinTypeInner, outer, inner)
+	if got := EstimateRows(inner); got != 1 {
+		t.Fatalf("fixture probe rows = %d, want 1", got)
+	}
+	if got, ok := relFilteredRows(nli, inner); ok || got != 0 {
+		t.Fatalf("parameterized NLI probe evidence = (%v, %v), want (0, false)", got, ok)
+	}
+	// The inner's 18,000 values survive; only the aggregate input clamps the
+	// cross-relation product. The pre-fix walk treated the one-row probe as a
+	// local filter and returned five groups instead.
+	if got, want := estimateNumGroups([]Expr{jrCol(0), jrCol(len(outer.Output()))}, nli, 10000), int64(10000); got != want {
+		t.Fatalf("groups above parameterized NLI = %d, want %d", got, want)
+	}
+}
+
 // `f(x)` is treated as `x` (step 2), and the same variable reached twice is
 // counted once ("GROUP BY a, a + b is treated the same as GROUP BY a, b").
 func TestNumGroupsReducesExpressionsToUniqueVars(t *testing.T) {
