@@ -4645,6 +4645,19 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, 
 			Message: fmt.Sprintf("relation %q does not exist", rv.Name),
 		}
 	}
+	// A foreign table whose FDW has NO HANDLER cannot be read. PostgreSQL
+	// refuses at PLAN time — GetFdwRoutineByServerId (foreign.c:403) is reached
+	// from the planner's create_foreignscan_path, which is why `EXPLAIN SELECT
+	// * FROM t` fails there too and not only the execution. Raising here rather
+	// than at scan Open keeps that property. M0122-0015.
+	if fdwName, noHandler := foreignTableWithoutHandler(cat, tbl); noHandler {
+		return nil, rangeBinding{}, &PlanError{
+			Pos:  rv.Pos(),
+			Code: "55000", // ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE
+			Message: fmt.Sprintf("foreign-data wrapper %q has no handler",
+				fdwName),
+		}
+	}
 	// Validate column alias count when provided: AS t(c1, c2, ...).
 	// PostgreSQL raises an error only if MORE aliases are given than there are columns.
 	// Partial alias lists (fewer aliases than columns) are allowed. M0097-0003.
@@ -5072,6 +5085,45 @@ func containsSetOp(n Node) bool {
 // Required because SearchPathCatalog wraps InMemory for search-path resolution
 // but planner internals need the concrete type for partition/inheritance BFS.
 // M0097-0022.
+// foreignTableWithoutHandler reports the FDW name when tbl is a foreign table
+// whose foreign-data wrapper has no handler function, which upstream treats as
+// unreadable: GetFdwRoutineByServerId raises
+//
+//	ERROR:  55000: foreign-data wrapper "%s" has no handler
+//
+// (postgres/src/backend/foreign/foreign.c:403, verified against PG 18.3 —
+// SQLSTATE 55000 is ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE, and the message
+// is byte-for-byte what the server emits).
+//
+// Fail-OPEN by construction: an unresolvable server or wrapper returns false,
+// so this can only refuse a relation whose wrapper is positively known to have
+// fdwhandler = 0. The server registry is keyed by (dbOid, name), so the lookup
+// passes the catalog's current database rather than defaulting to DefaultDBOid
+// — a server created in another database must not decide this one's plans.
+func foreignTableWithoutHandler(cat catalog.Catalog, tbl *catalog.Table) (string, bool) {
+	if tbl == nil || tbl.ForeignServerName == "" {
+		return "", false
+	}
+	im := inMemoryCat(cat)
+	if im == nil {
+		return "", false
+	}
+	// The server registry is keyed by the NAMESPACE dbOid, which is what
+	// CREATE SERVER registers under (operators_ddl.go: NamespaceDBOid of the
+	// connection's database). Looking up with the raw catalog DBOID misses
+	// every server in the default database, where the two differ — measured:
+	// DBOID()=5 while the registry key is DefaultDBOid.
+	srv, ok := im.LookupForeignServer(tbl.ForeignServerName, catalog.NamespaceDBOid(im.DBOID()))
+	if !ok || srv == nil {
+		return "", false
+	}
+	fdw, ok := im.LookupForeignDataWrapper(srv.FdwName)
+	if !ok || fdw == nil || fdw.HandlerOID != 0 {
+		return "", false
+	}
+	return fdw.Name, true
+}
+
 func inMemoryCat(cat catalog.Catalog) *catalog.InMemory {
 	type unwrapper interface {
 		Unwrap() catalog.Catalog
