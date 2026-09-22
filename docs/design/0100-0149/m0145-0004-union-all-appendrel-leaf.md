@@ -1,11 +1,25 @@
 # M0145-0004 — UNION ALL subqueries as appendrel leaves
 
-Status: landed (partial-path hoist arm) / gates in §"Measurement".
+Status: **mark-propagation repair LANDED 2026-09-22**; the Q9 acceptance block
+that held it was a measurement error, not a gate failure (see the final
+section). Whole-chain UNION ALL flattening remains this task's open residual.
 **`tlist_same_datatypes` landed 2026-09-22** — see the final section; it also
 records an over-refusal the measurement caught before it shipped.
 Task: `.ralph/fix_plan.md` M0145-0004. Parent: M0145-0001 (IR contract),
 M0145-0002 (harness), M0144-0003b-1 (the `setOpBranchTag` carry this
 slice consumes). Kind: impl.
+
+## 2026-09-22 gate escalation — staged change must not land
+
+The focused repair admits Q71's appendrel candidate while retaining the
+genuine-LATERAL refusal, but the required TPC-H acceptance arm cannot issue a
+PASS stamp: Q9 reaches the 600-second limit as `BOTH-ERROR`. An A/B run from
+clean HEAD has the same 23 matches plus that Q9 timeout. The failure is thus
+independent of this repair and belongs to the already-closed
+`q9_costdriven_mhj_cannot_be_cost_forced` no-go; it cannot be fixed by forcing
+a join shape here. Per G1, the staged production implementation is preserved
+but uncommittable until an owner resolves the gate or supplies a bounded gate
+exception.
 
 ## What this is
 
@@ -77,7 +91,7 @@ first; member-level entries belong with the fuller IR work (M0145-0005).
 Five pieces, each fail-closed:
 
 1. **Mark** — `planSubqueryRangeVar` sets `rangeBinding.appendrel`
-   when `jointreePipeline && lateralCtx == nil &&
+   when `jointreePipeline && !rv.Lateral &&
    subqueryChainIsSimpleUnionAll(rv.Subquery)`, and sets
    `ps.appendrelMember` on the settings handed to the subquery's
    planning scope. The binding flag rides through `planFromClause`
@@ -210,7 +224,7 @@ improves every SetOp-bearing plan, not just marked leaves:
 | case | gate |
 |---|---|
 | knob off / legacy arm | `jointreePipeline` at mark time — flags never set |
-| LATERAL union subquery | `lateralCtx == nil` requirement |
+| LATERAL union subquery | `!rv.Lateral` requirement |
 | `ORDER BY` / `LIMIT` / `OFFSET` / `FOR UPDATE` / `WITH` on the union | `subqueryChainIsSimpleUnionAll` |
 | `UNION` (dedup) / `INTERSECT` / `EXCEPT` anywhere in the chain | `unionAllChainLinks` (`PartialPathlist` is also only ever populated for streaming UNION ALL — `addPartialSetOpPath`'s `setOpStreams` entry gate — so the node alone would refuse; the AST check makes the intent legible) |
 | grouping-node member (`SetOpOperand`) | decline (conservative) |
@@ -678,3 +692,101 @@ under the existing `GOOPG_PGSHAPED_DP_TRACE` gate. Per AGENT.md C1 that makes
 it an **impl** task requiring the full gate set, which is why this loop did not
 do it unilaterally — but it is a one-line change that would have saved four
 loops, and every guessing route is now exhausted.
+
+
+## The mark was lost at the sibling context boundary (2026-09-22)
+
+The new `DPTRACE appendrel` line names the first refusal in
+`addAppendRelPartialPaths`. On Q71 it reported `verdict=unmarked`, not the
+previously inferred `ConsiderParallel` refusal. The binding was correctly
+marked at construction, but `planSubqueryRangeVar` had used `lateralCtx == nil`
+as the admission condition. `planFromClause` supplies that context to later
+comma-separated FROM items so table-function arguments can resolve earlier
+siblings; its presence does not mean the SQL item is LATERAL.
+
+The mark now tests `!rv.Lateral`, which is the actual SQL property that makes a
+pulled UNION member potentially parameterised. This agrees with PostgreSQL's
+`pull_up_simple_union_all`: it accepts the simple union first and only then
+propagates `rte->lateral` to its member RTEs when the range-table entry itself
+is marked LATERAL (`prepjointree.c:1166-1168`, `1638-1656`). The paired unit
+test pins both cases: a prior ordinary FROM sibling preserves the appendrel
+mark, while a true LATERAL union remains refused.
+
+The fixed Q71 trace records `DPTRACE appendrel rel={tmp} verdict=admitted` and
+an accepted `DPPATH partial producer=baserel.appendrel.partial` for the outer
+union link. The final plan remains unchanged because that candidate loses the
+cost election; this is not a gather-placement or value-semantic regression.
+The remaining gap is whole-chain flattening: goopg still models the nested
+UNION chain as nested SetOps, whereas PostgreSQL recursively collects all
+simple-union leaves before building its append relation.
+
+
+## Acceptance-gate coverage loss (2026-09-22)
+
+The default-pipeline acceptance arm cannot certify this staged planner change.
+The changed-tree baseline/candidate pair and a separate clean-HEAD pair both
+produce 23 value matches plus Q9 `BOTH-ERROR`: the query reaches the configured
+600-second cancellation in both arms. The clean-HEAD evidence is
+`tmp/m0145-0004-head.txt.diff-vs-baseline.txt`; it was taken after stashing the
+staged implementation, then restoring it unchanged.
+
+This establishes that the timeout predates the mark repair, but it does not
+turn the acceptance stamp into PASS. Under the harness contract the staged
+production change remains uncommitted until Q9 is executable inside the gate's
+existing timeout; raising the limit would conceal the lost coverage rather than
+verify the change.
+
+The follow-up diagnosis found no appendrel interaction to repair: the same
+dual-deadline Q9 result is the documented
+`q9_costdriven_mhj_cannot_be_cost_forced` no-go for the cost-driven join
+order. Its existing NLI safeguards deliberately retain hash behaviour because
+an unsafe alternative can explode the match set. That optimizer-performance
+work is outside this appendrel task, so this change stays staged pending an
+acceptance run that completes under the unchanged cap.
+
+### RESOLVED 2026-09-22 — the block was an arm-configuration error
+
+Every paragraph above is measured correctly and concludes wrongly. The arm was
+run bare, and `scripts/tpch-acceptance-arm.sh` defaults `PGSHAPED=0`, i.e.
+`GOOPG_PGSHAPED_DP=0` — **not** the configuration goopg ships, which has the
+PG-shaped DP search on. Q9 cannot finish inside 600 s on the legacy search; on
+the default it takes 2.8 s. Re-run at the shipped configuration against a prior
+full digest arm:
+
+```
+PGSHAPED=1 ACCEPT_BASELINE=tmp/arm-on-20260922-loop77.txt     scripts/tpch-acceptance-arm.sh m0145-0004-on tmp/m0145-0004-on.txt
+# SUMMARY: 24 MATCH / VERDICT: PASS
+```
+
+So there was never a coverage loss to escalate, no owner resolution was needed,
+and the "documented `q9_costdriven_mhj_cannot_be_cost_forced` no-go" was a
+correct fact recruited to explain an artifact it did not cause. Three loops and
+an owner escalation were spent on it, and the same artifact separately held
+M0145-0020a (see `m0145-0020a-grouped-output-cardinality.md`). The lesson is
+recorded in both places: when a gate is red, check the configuration the gate
+measures before concluding anything about the code it measures.
+
+A second correction this loop: the staged `planner.go` carried ~11 unrelated
+reformatting hunks — expanded one-line `if`/`for` bodies, reordered imports,
+removed blank lines — the signature of a newer local `gofmt -w` against a
+go1.25 baseline (`CLAUDE.md` §Git). Only the six-line `appendrelSubquery` hunk
+is this change; the noise was reverted before staging.
+
+### What landed
+
+`planSubqueryRangeVar`'s appendrel mark now keys on `!rv.Lateral` rather than
+`lateralCtx == nil`. A non-LATERAL FROM item still receives a resolver context
+so its table-function arguments can resolve earlier siblings, so the old
+condition refused any union subquery that merely FOLLOWED another FROM item —
+which is why Q71's first refusal traced as `unmarked`. The new `DPTRACE
+appendrel rel=… verdict=…` channel (`unmarked | no-cp | carrier | tlist |
+no-partials | admitted`) is what made that visible: the producer had declined
+with a bare `continue` at five independent gates, which is why five loops had
+to guess. Q71 now reaches `verdict=admitted` and files an accepted
+`baserel.appendrel.partial` path; its final plan does not move, because the new
+candidate loses the cost election.
+
+Non-vacuity: restoring `lateralCtx == nil` fails exactly
+`TestAppendrelMarkSurvivesEarlierFromSibling/plain_later_FROM_subquery_is_marked`
+and leaves the paired `LATERAL_subquery_remains_refused` subtest green, so the
+change cannot be "mark everything".

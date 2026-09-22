@@ -14119,6 +14119,40 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
       needs the owner to clear it — by re-pinning the lineage baseline or by
       exempting the re-opened root.
 
+  - **UNBLOCKED and LANDED 2026\-09\-22 \(loop \#4\)** as `f8349122c`.
+    Movement: none — knob\-arm only; default\-arm `CATEGORIES-EXCL-MATCH`
+    byte\-identical and `PLAN-SHAPE same=99 changed=0`.
+    - **The block was never real.** `scripts/tpch-acceptance-arm.sh` defaults
+      `PGSHAPED=0` \(`GOOPG_PGSHAPED_DP=0`\), which is NOT the shipped planner
+      configuration. Q9 cannot finish in 600 s on the legacy search and takes
+      **2.8 s** on the default. Re\-run as
+      `PGSHAPED=1 ACCEPT_BASELINE=tmp/arm-on-20260922-loop77.txt …`:
+      **`SUMMARY: 24 MATCH / VERDICT: PASS`**. No owner resolution, no gate
+      exception and no Q9 work were needed, and loop \#2's and \#3's
+      conclusions above are withdrawn.
+    - Three loops plus an owner escalation were spent on an artifact, and the
+      same artifact separately held M0145\-0020a. The
+      `q9_costdriven_mhj_cannot_be_cost_forced` no\-go is a true fact that was
+      recruited to explain something it did not cause — a correct citation is
+      not a diagnosis.
+    - **A second correction before staging**: the staged `planner.go` carried
+      ~11 unrelated reformatting hunks \(expanded one\-line bodies, reordered
+      imports, deleted blank lines\) — a newer local `gofmt -w` against the
+      go1.25 baseline \(`CLAUDE.md` §Git\). Only the six\-line
+      `appendrelSubquery` hunk is the change; the noise was reverted.
+    - Non\-vacuity: restoring `lateralCtx == nil` fails exactly
+      `TestAppendrelMarkSurvivesEarlierFromSibling/plain_later_FROM_subquery_is_marked`
+      and leaves the paired LATERAL\-refused subtest green.
+    - Gates: units; tpch\-spotcheck Q12=2/Q13=33; tpcds\-sf025
+      `PASS=96 MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0`; acceptance arm
+      24 MATCH; floors held \(TPC\-DS `match=2`, TPC\-H parallel `match=1`\);
+      pgbench smoke. ea\-ratchet not run — no estimator/selectivity/stats code
+      touched and the default arm's plans are byte\-identical.
+    - **Still `[ ]`, not `[x]`**: the task's headline — whole\-chain UNION ALL
+      flattening \(`is_simple_union_all_recurse` walks `larg` AND `rarg`;
+      goopg flattens only the inner link of a right\-leaning chain\) — is
+      unchanged by this repair and remains its open residual.
+
   - Still open (ledgered): member-level rtable entries +
     parent-qual distribution into members (`distribute_qual_to_rels` —
     M0145-0005's IR work); LATERAL union propagation; ~~CTE-wrapped union
