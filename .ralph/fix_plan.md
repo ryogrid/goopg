@@ -16014,7 +16014,7 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
       The loop is not re-ordering the banner; recording the evidence so the
       owner can.
 
-- [ ] **M0145-0020a — the grouped-output cardinality under-shoots ~193x**
+- [x] **M0145-0020a — the grouped-output cardinality under-shoots ~193x**
   (the real prerequisite M0145-0020's measurement named).
   Kind: impl
   Parent: M0145-0020
@@ -16035,6 +16035,61 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
     whether Q31/Q39/Q74 still move into the collapse class. Corpus level:
     `CATEGORIES-EXCL-MATCH` on both corpora.
   - This is what unblocks **M0145-0012**, not M0145-0020.
+
+  - **LANDED 2026\-09\-22 \(loop \#1\)** as `4c6f7ab8d`.
+    Movement: yes — ea-ratchet 54 -> 53 findings (3 FIXED, 2 NEW).
+    Node level: Q39's
+    `CTE Scan on inv` 1 -> 19 and its aggregate 20 -> 3901 at SF0.25, against
+    PG's 19 / 3869 from the same input, measured by EXPLAIN.
+    Design: `docs/design/0100-0149/m0145-0020a-grouped-output-cardinality.md`.
+    - **The Q9 acceptance failure that blocked this task for three loops was an
+      ARM-CONFIGURATION ARTIFACT, not a pre-existing red gate.**
+      `scripts/tpch-acceptance-arm.sh` defaults `PGSHAPED=0`
+      \(`GOOPG_PGSHAPED_DP=0`\), which is NOT the shipped planner
+      configuration. Q9 cannot finish in 600 s on the legacy search; on the
+      default it takes 2.8 s. Re-run with `PGSHAPED=1` against the loop\-77
+      baseline: `SUMMARY: 24 MATCH / VERDICT: PASS`. The same artifact is
+      recorded against M0145\-0004 in the ledger \(2026\-09\-22\) — any loop
+      that hits `1 BOTH-ERROR, 23 MATCH` should check the arm's knob state
+      before spending a loop proving the gate red at clean HEAD.
+    - **The gates were run on a tree carrying ONLY this change.** ~1,200 lines
+      of unrelated WIP were parked in a `git stash` first, so all three stamps
+      share one `code_tree` and the commit is what was measured. Before that,
+      `tpch-spotcheck` stamped FAIL purely because the built tree was not the
+      index.
+    - Gates: tpch\-spotcheck PASS \(Q12=2 Q13=33\); tpcds\-sf025 sweep
+      `PASS=96 MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0`,
+      `PLAN-SHAPE same=99 changed=0`; tpch\-acceptance\-arm PASS 24 MATCH;
+      floors held \(TPC\-DS SF0.25 `match=2`, TPC\-H parallel `match=1`\);
+      pgbench smoke. `CATEGORIES-EXCL-MATCH: join-order=91 join-method=66
+      scan-type=61 parameterisation=54 aggregation-strategy=44
+      sort-strategy=61 parallelism=85 qual-placement=27 rendering=26`.
+    - `make ea-ratchet` is FAIL and the clean\-tree number is far smaller than
+      the contaminated 61: `baseline findings: 54 current: 53`, 3 FIXED
+      \(Q62, Q80, Q99\) and 2 NEW — filed as **M0145-0020c**.
+    - This does NOT by itself unblock M0145\-0012: the arm\-ON/arm\-OFF plan
+      A/B over all 99 queries that 0012 needs is still unrun, and Q74 still
+      moved into the collapse class in the earlier A/B.
+
+- [ ] **M0145-0020c — the 2 NEW ea-ratchet findings the grouped-output repair
+  introduced**.
+  Kind: recon
+  Parent: M0145-0020a
+  - `make ea-ratchet` on the committed change: `baseline findings: 54
+    current: 53`; FIXED Q62, Q80, Q99; **NEW** `Q44:item+ss1`
+    \(`Hash Join`, est 1831 vs actual 10, qerr 183.1\) and
+    `Q83:cte:sr_items+cte:wr_items` \(`CTE Scan on wr_items`, est 4 vs
+    actual 171, qerr 42.8\).
+  - Both relsets are grouped/CTE\-derived, i.e. exactly the population whose
+    estimate this task moved, so they are attributed to the change rather
+    than claimed pre\-existing. Confirm that attribution per finding against
+    clean HEAD before proposing a fix — a larger grouped\-output estimate is
+    the intended direction, and Q44's 183x over\-shoot may be a second
+    factor \(the group count vs the join selectivity\) rather than this term.
+  - Resume point: `internal/optimizer/cardinality.go` `estimateNumGroups` /
+    `relFilteredRowsWalk`, plus `scripts/estimate-parity-gate.sh --json` for
+    the per\-node evidence.
+  - Ledger row: `.ralph/deferral_ledger.md`, 2026\-09\-22, M0145\-0020a.
 
 - [x] **M0145-0021 — harness: SF1 fire-set gate for diagnostic-flag /
   estimation / cost-model tasks** (owner GO 2026-09-22; progress-doc
