@@ -2852,6 +2852,31 @@ the whole file's active task between 2026-09-01 and 2026-09-14; **since
       Q12=2/Q13=33; tpcds\-sf025 `PASS=96 MISMATCH=0 CKMISMATCH=0 ERROR=0
       TIMEOUT=0`; acceptance arm 24 MATCH; pgbench smoke.
 - [ ] **M0122-0015 — Test-suite porting: amcheck / verify_heapam / pg_dump**.
+  - **`003_pg_dump_with_server.pl` first section PORTED 2026\-09\-22 \(loop
+    \#15\)** as `TestPort_PgDump003NewlineInDatabaseName`. Movement: none —
+    test porting; TAP coverage 46.2% -> 47.3% \(client\-tools\-tap\), total
+    42.6% -> 42.8%.
+    - Upstream's first section is a **security** property: a database name may
+      contain a newline, and `pg_dumpall` interpolates a per\-database
+      connection string into the script it emits. PostgreSQL's guard is
+      `appendShellString` \(`src/fe_utils/string_utils.c`\), which refuses the
+      argument. All three upstream assertions are ported — nonzero exit, the
+      `shell command argument contains a newline` stderr, and **no `^attack`
+      line**, which is the one that would catch a pre\-escaped name that
+      satisfied the guard while still splitting the script.
+    - What it proves about goopg \(the binary is upstream's\): goopg accepts
+      `CREATE DATABASE "regress_<newline>attack"` and reports the name
+      verbatim through `pg_database`, so the real pg_dumpall's protection
+      engages against goopg exactly as against PostgreSQL.
+    - **The second section is NOT ported, and the reason is a measured
+      divergence** rather than an unported fixture. Against identical DDL,
+      PostgreSQL raises `ERROR: foreign-data wrapper "dummy" has no handler`
+      for a `SELECT` on a handler\-less foreign table while goopg returns zero
+      rows, so upstream's `pg_dump --include-foreign-data` FAILURE assertion
+      sees exit 0 here. goopg models the objects correctly \(`relkind='f'`, a
+      `pg_foreign_table` row, `fdwhandler=0`\); the executor\-side handler
+      lookup is what is missing. Ledgered with its resume point, plus the
+      smaller `CREATE FOREIGN TABLE` command\-tag divergence found beside it.
   - **Inventory promotion 2026\-09\-22 \(loop \#14\): three rows were STALE, and
     the published coverage was understating reality.** Movement: none — no
     production code; the tests already existed and passed.
