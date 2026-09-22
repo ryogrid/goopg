@@ -2627,7 +2627,7 @@ the whole file's active task between 2026-09-01 and 2026-09-14; **since
     - Gates: units; `internal/executor` + `internal/catalog`; tpch-spotcheck
       Q12=2/Q13=33; tpcds-sf025 `PLAN-SHAPE same=99 changed=0`; pgbench smoke.
 
-- [ ] **`pg_database.datacl` does not survive a restart** (measured 2026-09-22
+- [x] **`pg_database.datacl` does not survive a restart** (measured 2026-09-22
   while landing the cross-database GRANT fix).
   Kind: bug
   Parent: M0122-0008
@@ -2646,6 +2646,39 @@ the whole file's active task between 2026-09-01 and 2026-09-14; **since
     only the encoder (`encodeAclItemArrayText`) does.
   - Same shape as the per-database reload gaps closed under M0119-0006
     (bs/bw slices), so those are the template.
+  - **LANDED 2026\-09\-22 \(loop \#9\)** as `feff73f01`. Movement: none —
+    catalog projection at startup; `PLAN-SHAPE same=99 changed=0`.
+    Design: `docs/design/0100-0149/0122-0008-database-datacl-restart-reload.md`.
+    - The stated blocker \("an aclitem\-array DECODER does not exist"\) was
+      **already false**: the binary reader existed in
+      `internal/executor/codec_aclitem.go`, just unexported and unconsumed.
+      What was missing is the projection, not the decode.
+    - `Open` scans `global/1262` AFTER the role reload. The order is
+      load\-bearing: aclitem stores role OIDs while the ACL store is
+      name\-keyed, so an earlier scan rehydrates role grants as dangling
+      numeric grantees.
+    - The test's expected string is a **PG 18.3 capture**, not a derivation —
+      `GRANT ALL ON DATABASE d3 TO PUBLIC` gives
+      `{=CTc/postgres,postgres=CTc/postgres}`. Since PUBLIC leads a database's
+      array \(M0122\-0008b\), it pins ORDER as well as the privilege set.
+      Non\-vacuity checked: neutralise the call and the post\-restart read is
+      `""`.
+    - **Two divergences the fixture found, ledgered, not papered over:**
+      - PostgreSQL REJECTS `GRANT … TO PUBLIC WITH GRANT OPTION` \("grant
+        options can only be granted to roles"\) and goopg ACCEPTS it. The
+        test's first draft used exactly that statement, so it pinned a state
+        PG cannot produce.
+      - goopg's initdb leaves `template1.datacl` NULL; PG seeds
+        `{=c/postgres,postgres=CTc/postgres}`. The test uses goopg's NULL as
+        its control, with the divergence named in a comment.
+    - Environmental limit recorded: `CREATE ROLE` lives in the postmaster, not
+      the grammar, so a named\-role grantee is unreachable from an
+      `internal/initdb` test; the grant\-option bit is covered by
+      `TestDecodeACLItemArrayPreservesGrantOption` instead.
+    - Gates: initdb + executor + catalog units; tpch\-spotcheck Q12=2/Q13=33;
+      tpcds\-sf025 `PASS=96 MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0`;
+      acceptance arm 24 MATCH; full `TestPort_RegressSuite` with an unchanged
+      failing set; pgbench smoke.
 
 - [x] **aclitem array order differs from PostgreSQL** (measured 2026-09-22
   against a live PG 18.3 while capturing the GRANT oracle).
