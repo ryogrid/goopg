@@ -2824,6 +2824,33 @@ the whole file's active task between 2026-09-01 and 2026-09-14; **since
       attach roundtrip; tpch\-spotcheck Q12=2/Q13=33; tpcds\-sf025 `PASS=96
       MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0`; pgbench smoke.
 - [ ] **M0122-0014 — Logical replication / decoding / subscription**.
+  - **MESSAGE wire half LANDED 2026\-09\-22 \(loop \#13\)** as `8170a6f29`.
+    Movement: none — replication wire format.
+    Design: `docs/design/0100-0149/0122-0014-pgoutput-message-wire.md`.
+    - The decoder REJECTED pgoutput's `M` kind, so a goopg subscriber could not
+      consume an otherwise valid upstream stream once the publisher enabled
+      messages; the publisher had no frame API at all.
+    - **Verified against the oracle, not just the source.** PG 18.3 on a
+      private `wal_level=logical` cluster emits
+      `4d01000000000206b200676f6f707265666978000000000b68656c6c6f2d676f6f7067`
+      for `pg_logical_emit_message(true,'gooprefix','hello-goopg')` read back
+      through `pg_logical_slot_peek_binary_changes(… 'messages','true')`, and
+      `PgOutput.Message` reproduces that byte string exactly.
+    - The apply worker treats a decoded MESSAGE as a **no\-op**: a plugin
+      channel must not abort the surrounding subscriber transaction.
+    - **Forward\-compat boundary recorded in code**: protocol v2 inserts a
+      4\-byte xid between `M` and the flags byte while streaming. goopg
+      requests `proto_version 1` only, so the v1 layout is right for what it
+      negotiates — but a v2 negotiation must EXTEND the arm, never inherit it.
+    - **Still open \(ledgered\)**: SQL\-level `pg_logical_emit_message`. It
+      needs `RM_LOGICALMSG` records created, classified and delivered in
+      transactional order, whose blocker is `ReorderBuffer.Commit`'s
+      homogeneous `[]Change` queue — draft design
+      `0122-0014-logical-message-producer.md`.
+    - Gates: xlog + executor units; `-race` on xlog; the full
+      `TestPort_PgoutputInterop` suite against real PG; tpch\-spotcheck
+      Q12=2/Q13=33; tpcds\-sf025 `PASS=96 MISMATCH=0 CKMISMATCH=0 ERROR=0
+      TIMEOUT=0`; acceptance arm 24 MATCH; pgbench smoke.
 - [ ] **M0122-0015 — Test-suite porting: amcheck / verify_heapam / pg_dump**.
 
 ## M0131 — Bidirectional cluster-directory cold-start + real-PG system-view hosting (filed 2026-08-11)
