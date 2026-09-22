@@ -660,7 +660,14 @@ Run on the change, in the task that changes production code:
   Report the goopg plan file's sha256; if it equals the previous capture's,
   prove you did not measure the same binary.
 - **G4** `make ea-ratchet-repin` only when the corpus or dataset changes, never
-  in a commit that changes code.
+  in a commit that changes code. **Widened 2026-09-22 (owner, M0145-0020d
+  option b):** a repin is ALSO permitted — still only as a standalone
+  non-code commit — when the baseline went stale through goopg's own plan
+  churn AND the NEW-vs-baseline diff consists solely of keys the scorer
+  marks UNMATCHED-IN-PG (`pg_est=null`), with the attribution A/B attached
+  (a clean-HEAD re-score showing the change under review introduced none
+  of them). Anything else stays forbidden: a NEW key with a PG-side
+  estimate is an estimator regression and must be fixed, not repinned.
 - **G5** A matching plan that times out lands with a ledger row (coverage loss);
   never raise a timeout to hide it. A values mismatch stops the task.
 - **G6** Commit a gated code change only after its gates PASS for exactly the
@@ -688,6 +695,22 @@ Run on the change, in the task that changes production code:
     transition.
   - The knob is retired by M0145-0008's cutover; nothing else may add a
     second pipeline-selection mechanism.
+- **G9 Fire-set gate (owner scope call 2026-09-22, M0145-0021a).** A
+  commit that stages a non-test `.go` under `internal/optimizer/` or
+  `internal/planner/`, or a non-test `.go` under `internal/`/`cmd/`
+  matching `*cost*|*stat*|*selfuncs*`, must carry a
+  `tmp/gate-stamps/tpcds-fireset.json` PASS for the staged code —
+  `scripts/tpcds-fireset-gate.sh <label> <outdir>` runs the two-scale
+  (SF0.25 + SF1) private-clone gate; `tpch` stays opt-in via `CORPORA`.
+  `scripts/fireset-scope.sh` holds the same predicate the commit-msg hook
+  enforces, so a loop can check its staged set before running the gate.
+  SKIP-BLOCKED needs an owner row in `.ralph/gate-exceptions.md` like the
+  other row gates. `internal/executor/` is deliberately out of scope —
+  it cannot move plan election; its timeout class is the sweep's own
+  TIMEOUT counter — and so is `internal/testport/`; both exclusions
+  apply BEFORE the `*cost*|*stat*|*selfuncs*` keyword arm, which is
+  deliberately broad (it also catches `state`/`status`/`statement`
+  filenames — over-inclusion is the safe direction for a gate).
 
 ### D — Done, deferral, reporting
 - **D1** Deferring any part needs **both** a `.ralph/deferral_ledger.md` row with

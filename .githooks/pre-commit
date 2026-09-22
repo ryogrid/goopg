@@ -82,6 +82,36 @@ if [ "${RALPH_LOOP:-}" = "1" ]; then
   fi
 fi
 
+# Non-blocking staged-set visibility (progress 260922-2 §5.7). A concurrent
+# loop's pre-staged WIP once rode into an unrelated commit because nobody saw
+# what was in the index, and a partial staging can commit content the gates
+# never tested. Warn — never block (a legit concurrent stage must keep
+# working): print the commit's file list, flag files that are staged in the
+# real index but outside this commit's pathspec (git commit -- <paths> uses a
+# temporary index), and flag partially staged files (in the commit AND dirty
+# in the working tree).
+{
+  echo "pre-commit: this commit contains:"
+  git -C "$ROOT" diff --cached --name-only | sed 's/^/pre-commit:   /'
+  real_index="${GIT_DIR:-$ROOT/.git}/index"
+  if [ -n "${GIT_INDEX_FILE:-}" ] && [ "${GIT_INDEX_FILE}" != "${real_index}" ]; then
+    # Pathspec commit: the hook's index is a temp index of HEAD + <paths>.
+    # Compare the REAL index's staged-vs-HEAD set with this commit's file
+    # set — that flags staged modifications AND deletions left outside the
+    # pathspec, not just newly-added paths (a bare path-set comparison
+    # would miss both).
+    GIT_INDEX_FILE="${real_index}" git -C "$ROOT" diff --cached --name-only 2>/dev/null | sort > "${TMPDIR:-/tmp}/.goopg-real-idx.$$" || true
+    git -C "$ROOT" diff --cached --name-only | sort > "${TMPDIR:-/tmp}/.goopg-commit-idx.$$"
+    comm -23 "${TMPDIR:-/tmp}/.goopg-real-idx.$$" "${TMPDIR:-/tmp}/.goopg-commit-idx.$$" | \
+      sed 's/^/pre-commit: WARNING staged but OUTSIDE this commit pathspec: /'
+    rm -f "${TMPDIR:-/tmp}/.goopg-real-idx.$$" "${TMPDIR:-/tmp}/.goopg-commit-idx.$$"
+  fi
+  comm -12 \
+    <(git -C "$ROOT" diff --cached --name-only | sort) \
+    <(git -C "$ROOT" diff --name-only | sort) | \
+    sed 's/^/pre-commit: WARNING partially staged (commit content != working tree): /'
+} >&2 || true
+
 echo "pre-commit: running CI-parity pgbench smoke (RALPH_PRECOMMIT_SCOPE=smoke)..."
 RALPH_PRECOMMIT_SCOPE=smoke "$ROOT/scripts/ralph-precommit-test.sh"
 echo "pre-commit: pgbench smoke PASS — commit allowed"

@@ -1,9 +1,16 @@
 # The `outer-over-derived` relaxation is a NO-GO on the current tree (M0145-0018)
 
-Status: **NO-GO 2026-09-21; RE-VERIFIED 2026-09-22 and the 2026-09-21 blocker
-is GONE — but one stated pass criterion is still violated, so the relaxation
-is STILL NOT EXECUTED.** See §"Fresh E1 re-verification (2026-09-22)" at the
-end. The firewall was not relaxed on either date.
+Status: **OWNER GO 2026-09-22 — executable.** NO-GO 2026-09-21; RE-VERIFIED
+2026-09-22 and the 2026-09-21 blocker is GONE. The single remaining criterion-1
+violation (Q77's degenerate `rows=1` Append-branch NL election, +16% on a ~5 s
+query, values byte-identical, no timeout) is WAIVED as measured-benign by the
+owner (progress-report review §3.1, option (a)); the criterion is re-scoped to
+"no NL election on a NON-degenerate join condition and no timeout-class move".
+The task is `[ ]` and executable: remove `problemPairsOuterWithDerived`
+including its Semi/Anti arms, delete `GOOPG_DERIVED_FIREWALL`, then the full
+default-arm gate set plus the now-enforced fire-set gate (M0145-0021a).
+See §"Fresh E1 re-verification (2026-09-22)" at the end. The firewall itself
+was not relaxed on either measurement date.
 
 Task: `.ralph/fix_plan.md` M0145-0018. Kind: impl. Parent: M0145-0011.
 

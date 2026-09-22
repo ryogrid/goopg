@@ -30,7 +30,24 @@ CAPTURE="${ROOT}/scripts/jointree-parity-capture.sh"
 DIFF="${ROOT}/scripts/tpcds-plan-diff.py"
 STATUS="${ROOT}/scripts/tpcds-fireset-status.py"
 
+# Gate stamp (M0145-0021a): the commit-msg hook requires a PASS stamp for
+# commits in the fire-set scope (AGENT.md G9), so every exit writes
+# tmp/gate-stamps/tpcds-fireset.json — 0 → PASS, a capture preflight
+# failure (jointree-parity-capture.sh exits 3 on a missing/HOLD source
+# datadir) → SKIP-BLOCKED, anything else → FAIL. GATE_STAMP_DIR is
+# honoured like the other gates so a sub-invocation can redirect it.
+# shellcheck source=lib/gate-stamp.sh
+source "${ROOT}/scripts/lib/gate-stamp.sh"
+
 [[ $# -eq 2 ]] || { echo "usage: $0 <label> <outdir>" >&2; exit 2; }
+
+# Arm the stamp AFTER arg validation — a usage error must not clobber a
+# fresh PASS stamp (a stray invocation would otherwise force a ~15 min
+# re-run). Every later exit writes tmp/gate-stamps/tpcds-fireset.json:
+# 0 → PASS, capture-preflight rc 3 → SKIP-BLOCKED, else FAIL.
+trap 'rc=$?; \
+  case "${rc}" in 3) GATE_STAMP_REASON="${GATE_STAMP_REASON:-capture preflight failed (missing or HOLD source datadir)}" ;; esac; \
+  gate_stamp_write tpcds-fireset "$(gate_stamp_result_for_rc "${rc}" 3)" ""' EXIT
 LABEL="$1"
 OUTDIR="$2"
 mkdir -p "${OUTDIR}"
@@ -66,7 +83,13 @@ run_arm() {
 
 derive_fires() {
     local baseline_plans="$1" candidate_plans="$2" diff_out="$3"
-    python3 "${DIFF}" "${baseline_plans}" "${candidate_plans}" >"${diff_out}"
+    # The caller reads us through $( ), where `set -e` does NOT propagate:
+    # without `|| return` a tpcds-plan-diff.py failure (incl. its exit-2
+    # unknown/empty-capture guard) would leave ${diff_out} truncated, awk
+    # would still succeed on it, and the caller would read "" as "no fires"
+    # — a vacuous PASS on a broken diff. Fail the function so the gate
+    # exits non-zero (and stamps FAIL).
+    python3 "${DIFF}" "${baseline_plans}" "${candidate_plans}" >"${diff_out}" || return
     awk '/^changed \([0-9]+\):/ { for (i = 3; i <= NF; i++) { sub(/^Q/, "", $i); if ($i !~ /^[0-9]+$/) exit 2; printf "%s%s", sep, $i; sep="," } } END { print "" }' "${diff_out}"
 }
 

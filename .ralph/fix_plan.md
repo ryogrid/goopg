@@ -132,13 +132,35 @@ completion that lands from now on still accumulates toward a fresh budget.
 Chosen over exempting the root after M0145-0004's LINEAGE NOTE recorded that
 the guard cannot see the owner re-open.)
 
+OWNER DECISIONS 2026-09-22 (progress-report review
+`tmp/progress-planner-rewrite-260922-2/01-progress-assessment.md`; details
+in each task's entry):
+- **M0145-0018: EXECUTE — criterion 1 waived as measured-benign.** The
+  task is `[ ]` and executable: remove `problemPairsOuterWithDerived`
+  incl. Semi/Anti arms, delete `GOOPG_DERIVED_FIREWALL`, full default-arm
+  gates + the now-enforced fire-set gate.
+- **M0145-0020d: resolved (b)** — G4 widened for UNMATCHED-IN-PG-only
+  repins; baseline re-pinned to the 20260922 census dir.
+- **M0145-0012 stays `[!]`**; next step is M0145-0024 (Q74 residual
+  recon + arm A/B). Do not remove the `rows<=1` arm on 0020a alone.
+- **M0145-0021a: enforced at commit level** for optimizer/planner +
+  cost/stat/selfuncs paths (see its entry and AGENT.md); `tpch` stays
+  opt-in.
+- New filings: **M0145-0004a** (whole-chain UNION ALL flattening, the
+  lineage-refused residual), **M0145-0024**, **M0145-0025** (TPC-H
+  parity baseline re-take on the pinned-seed lane).
+
 **UNFROZEN (owner decision 2026-09-20) — selectable again:** the M0142-0008
 chain (`M0142-0008a-3`, `M0142-0008c-1a`, `M0142-0008c-3d`,
 `M0142-0008c-4`) is unfrozen by direct owner instruction. P0-E7's private-lane
 A/B already landed the evidence csq-R2's reopen condition named (23/24 digest
 lines identical; sole divergence = Q9's 600s timeout in BOTH arms). **Hard
 owner constraint:** do NOT lift Q78's `outer-over-derived` firewall — or take
-any equivalent shortcut — to obtain reachability. The sanctioned route is the
+any equivalent shortcut — to obtain reachability **for this chain** (the
+firewall's own removal is separately owner-GO'd as M0145-0018 on its own
+evidence track; once 0018 lands, the constraint is moot, but M0142-0008's
+reachability must still be demonstrated by the producer route, not credited
+to the lift). The sanctioned route is the
 previously-unfiled producer, now filed as **M0142-0008-producer** below: teach
 an IN-unnesting (or EXISTS-variant) path to set `.SJInfo` on a
 DP-search-visible `JoinSemi` link, the way c19 did for ANTI. csq-R2's
@@ -14636,6 +14658,28 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
     prebuilt-over-nested-winner); `is_safe_append_member`'s pull-up
     half is inapplicable in this model (members are not promoted —
     member WHERE quals ride `spliceBranchEmission` per worker).
+- [ ] **M0145-0004a — whole-chain UNION ALL flattening**
+  (filed 2026-09-22 under the re-pinned lineage baseline; the residual
+  M0145-0004's LINEAGE NOTE could not file). PostgreSQL's
+  `is_simple_union_all_recurse` (`prepjointree.c:1617`) recurses BOTH
+  `larg` and `rarg`, so an n-way UNION ALL chain collapses into ONE
+  flat appendrel that `add_paths_to_append_rel` plans as a single
+  (Parallel) Append. goopg flattens only the INNER link of a
+  right-leaning chain: `SetOp(A, SetOp(B,C))` produces the nested
+  `Append{Gather{Append{ws,cs}}, Gather{store_sales}}` where PG emits
+  `Gather{Parallel Append{ws,cs,store_sales}}` — which is why Q71's
+  admitted appendrel candidate loses its cost election and no plan
+  moves. Extend `jointreeappendrel.go`'s mark/hoist to walk the whole
+  chain so the full member set joins one appendrel. Carry the
+  recorded risk: admitting a nested streaming Append under one Gather
+  means two levels of block claim cooperating across workers — the
+  per-worker row-identity pin (`TestGatherOverJoinProbeSetOpIdentity`
+  family) is required, this task was already bitten there once.
+  Expected movement: the `parallelism` category on SF0.25 (reads
+  84-85 in both arms today) and Q71's admitted-but-unelected
+  candidate becoming electable.
+  Kind: impl
+  Parent: M0145-0004
 - [ ] **M0145-0005 — single-pass DP over the jointree** (the search
   consumes the IR directly; semi/anti entries are legal searched partners
   via a `join_is_legal` port over the SJInfo-equivalent, joinrels.c:350).
@@ -15236,6 +15280,19 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
   row-emitting PartialAgg). Requires
   M0145-0006 as well as 0007: the cutover must not retire the stage
   builders while upper-rel elections still live in them.
+  **Prerequisite sub-inventory (owner direction 2026-09-22,
+  progress-report §5.6)**: before the flip, the cutover must produce an
+  explicit executor-capability ledger — every shape the jointree arm can
+  elect that the executor cannot run — so no "generatable but
+  unexecutable" plan survives the cutover. Known members: (1) the
+  parallel hash build over a partial inner (M0140-0007); (2)
+  row-emitting PartialAgg (M0141-S3–S6); (3) the partial-NLI executor
+  arm — M0145-0010 scope (d) already measured half of this; (4) the
+  `appendrelMember`-root Q17-class defect, ledgered 2026-09-21 with its
+  witness unmeasured — the inventory must either measure it or carry it
+  forward with a named owner task. NLI rewrite/stamping populations are
+  NOT inventory members: they only exist for shapes the PG-shaped
+  search never builds and retire with the legacy pipeline.
   Kind: impl
   Parent: M0145-0007
   - **BLOCKED by a measured timing regression (loop 2026-09-21 \#27).**
@@ -15874,6 +15931,18 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
       not pick. Ledgered 2026-09-21.
     - **OWNER ANSWER 2026-09-22: GO — the port is filed as M0145-0020.**
       This task resumes after it lands; the fallback stays until then.
+    - **OWNER DIRECTION 2026-09-22 (delegated; progress-report §3.3)**:
+      M0145-0020 closed measured-no-gap — PG punts on all three corpus
+      fires (`setOperations`, single-grouping-column) — and 0020a fixed
+      the true grouped-output factor, but its own record states the arm
+      A/B was never re-run and Q74 still moved into the collapse class
+      on the last A/B. **This task stays `[!]`**; the named next step is
+      filed as **M0145-0024** (Q74 `year_total` residual recon — the
+      estimate_num_groups / set-op-output question "PG punts here too,
+      yet does not collapse" — plus the 99-query arm ON/OFF A/B). The
+      fallback stays until that recon lands AND the A/B shows no
+      collapse-class move; do not remove the arm on the strength of
+      0020a alone.
 - [x] **M0145-0013 — admit pulled `*CTEScan` leaves at the seam
   (`pulled-leaf-not-scan` / `flat-leaf-not-scan`)** (filed 2026-09-21
   by owner directive; the follow-on task M0145-0011's E2 resume point
@@ -16250,7 +16319,7 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
       resume point needs no new instrument.
   Movement: none — measured-no-gap. The census line is the whole production
   change.
-- [!] **M0145-0018 — relax the `outer-over-derived` firewall
+- [ ] **M0145-0018 — relax the `outer-over-derived` firewall
   (owner decision GO, 2026-09-21)**. M0145-0011's E1 measured the
   diagnostic bypass clean at BOTH scales: on SF0.25 AND SF1
   (private `:5547` clone) only Q77/Q78 move, Q78 stays a hash join
@@ -16324,6 +16393,27 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
       on passing, and one criterion does not; and **0018's option choice is
       already awaiting a re-take** from loop \#79. The loop delivers the
       measurement and leaves the call.
+    - **OWNER ANSWER 2026-09-22: EXECUTE — criterion 1 is WAIVED as
+      measured-benign** (progress-report review §3.1, owner selected (a)).
+      The single remaining election — Q77's `rows=1` `Append` branch going
+      `Hash Left Join (0.00..0.03)` -> `Nested Loop Left Join (0.00..0.06)`
+      with the degenerate `s_store_sk = s_store_sk` demoted to a Join
+      Filter — is benign at both scales (+881 ms / +16% on a ~5 s SF0.25
+      query; SF1 measures ON 5492 ms / OFF 6373 ms, i.e. faster with the
+      firewall off), values byte-identical, no timeout, no C-04a-class
+      move. The criterion's PURPOSE — excluding the C-04a regression class
+      — is discharged by the fresh E1 itself. The criterion is re-scoped
+      to "no NL election on a NON-degenerate join condition and no
+      timeout-class move"; both hold. Execution proceeds as written:
+      remove `problemPairsOuterWithDerived` including its Semi/Anti arms,
+      delete `derivedFirewallEnabled`/`GOOPG_DERIVED_FIREWALL` and its
+      `flaglabels.go`/`scripts/planner-flags.env` entries plus the pinned
+      tests (`outer_over_derived_test.go`, the probe's consumer-#3 arm,
+      `semiantichain_test.go`'s decline cases), then the full default-arm
+      gate set — units, tpch-spotcheck, SF0.25 sweep values + plan-shape
+      channel, TPC-H acceptance, SF1 timing spot-check on Q77/Q78 — and
+      the fire-set gate, which M0145-0021a now enforces for this exact
+      path. Expected `outer-over-derived` 3 -> 0 on the seam census.
   Parent: M0145-0011
   - **`[!]` NO-GO 2026-09-21 — the firewall was NOT relaxed.** Design doc
     `docs/design/0100-0149/m0145-0018-firewall-relaxation-no-go.md`.
@@ -16656,10 +16746,23 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
       code commit and the loop may not repin on its own judgement, so the gate
       is red with no sanctioned route back to green.
 
-- [ ] **M0145-0020d — the ea-ratchet baseline is stale for two goopg-only
+- [x] **M0145-0020d — the ea-ratchet baseline is stale for two goopg-only
   relsets, and nothing may repin it** \(owner decision needed\).
   Kind: recon
   Parent: M0145-0020c
+  - **OWNER ANSWER 2026-09-22: (b) — G4 widened.** AGENT.md G4 now permits
+    a repin — still only as a standalone non-code commit — when the
+    baseline went stale through goopg's own plan churn and the
+    NEW-vs-baseline diff consists solely of UNMATCHED-IN-PG keys, with
+    the attribution A/B attached. M0145-0020c's clean-HEAD A/B is exactly
+    that evidence, so the repin runs now under the widened rule: fresh
+    baseline at
+    `analysis/planner-refactor-take3/c20a-estimator-census-20260922/`,
+    `scripts/estimate-parity-gate.sh`'s `EA_BASELINE` default repointed
+    (the baseline default lives there, not in the Makefile), the 20260915
+    baseline left in place for archaeology. The interim "own A/B shows no NEW"
+    landing discipline is retired — the gate is green again by baseline.
+    Movement: none — a baseline/policy record, no production change.
   - `make ea-ratchet` is FAIL for every task from now on with the same two NEW
     ids \(`Q44:item+ss1`, `Q83:cte:sr_items+cte:wr_items`\), neither of which any
     current task caused: they entered by plan churn after the 2026\-09\-15
@@ -16793,7 +16896,7 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
         tmp/<id>` — `CORPORA` already defaults to both corpora, so the
         default invocation IS the two\-scale gate.
 
-- [ ] **M0145-0021a — make the fire-set gate ENFORCED, not merely
+- [x] **M0145-0021a — make the fire-set gate ENFORCED, not merely
   available**
   Kind: impl
   Parent: M0145-0021
@@ -16808,6 +16911,33 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
     decision, and getting it wrong either blocks unrelated commits or trains
     the loop to stamp its own verdict.
   - Ledger row: `.ralph/deferral_ledger.md`, 2026-09-22, M0145-0021, gap \(a\).
+  - **OWNER SCOPE CALL 2026-09-22 (delegated; progress-report §3.5),
+    LANDED.** The stamp-and-exception machinery (G2) is extended rather
+    than a parallel mechanism:
+    - **Scope** — a commit needs a `tmp/gate-stamps/tpcds-fireset.json`
+      PASS when it stages a non-test `.go` under `internal/optimizer/` or
+      `internal/planner/`, or any non-test `.go` under `internal/`/`cmd/`
+      whose path matches `*cost*|*stat*|*selfuncs*`. `internal/executor/`
+      is deliberately OUT: it cannot move plan election, and its timeout
+      class is already covered by the sf025 sweep's own TIMEOUT counter.
+      `scripts/fireset-scope.sh` carries the same predicate for
+      pre-commit checks.
+    - **Level** — commit-msg, not task-template: the task's own resume
+      point imagined the verdict requirement at commit time, the stamp
+      contract (`code_tree` of the index + gate-exceptions escape hatch)
+      already exists, and the gate writes the verdict itself, so there is
+      no self-attestation hole the task-template alternative was meant to
+      avoid.
+    - **Corpora** — `CORPORA` default stays `tpcds-sf025 tpcds-sf1`;
+      `tpch` remains OPT-IN (its fires execute at SF1 through the
+      acceptance arm, and an enforced gate must stay cheap enough that
+      tasks actually run it — the measured two-scale TPC-DS run is
+      ~15 min; revisit once TPC-H fire runs are routine).
+    - Mechanism: `tpcds-fireset-gate.sh` writes the `tpcds-fireset`
+      stamp from its EXIT trap (0 → PASS, capture preflight rc 3 →
+      SKIP-BLOCKED, else FAIL); `commit-msg` requires it for the scope
+      above and `gate-exceptions.md` covers it like the other row gates.
+    Movement: none — a harness/policy change, no production code.
 
 - [x] **M0145-0021b — extend the fire-set gate to the TPC-H corpus**.
   Kind: impl
@@ -16949,3 +17079,54 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
     - Tests: `flow\-convergence.py \-\-self\-test`; `bash \-n
       scripts/tpcds\-sf025\-regression.sh`; full SF0.25 sweep follows as the
       integration gate.
+  - **FOLLOW-UP 2026\-09\-22 (progress-report §5.3, knob-arm lane landed).**
+    The instrument was structurally blind: every TSV row read
+    `jointree-pullup=0` because the sweep only ever ran the default arm —
+    the route ratio that shows convergence exists only on the knob arm.
+    `sf025_plan_channel` now runs a second EXPLAIN-only pass under
+    `GOOPG_JOINTREE_PIPELINE=1` (off-switch `SF025_FLOW_KNOB=0`), feeding
+    `flow-convergence.py` a `*-knob` label into the same TSV. The knob
+    capture is named `plansknob-*` so it can never match the `plans-*.txt`
+    baseline glob; like the rest of the channel it is report-only and
+    never touches the verdict.
+
+- [ ] **M0145-0024 — recon: Q74 `year_total`'s residual collapse and the
+  `rows<=1` arm's remaining coverage** (filed 2026-09-22, delegated owner
+  direction on M0145-0012; progress-report §3.3/§5.2). M0145-0020 ported
+  `examine_simple_variable`'s non-recursive CTE arm and closed
+  measured-no-gap — PG punts on all three corpus fires (`setOperations`
+  for Q74's UNION ALL, single-grouping-column for Q31/Q39) — and
+  M0145-0020a repaired the real grouped-output factor (~193x
+  underestimation; Q39 `CTE Scan on inv` 1 → 19). But 0020a's own record
+  states the 99-query arm-ON/arm-OFF A/B was never re-run, and the last
+  A/B still moved Q74 into the collapse class. This task answers the
+  residual question **before** 0012 can resume: `year_total` is a UNION
+  ALL of grouped selects — a shape where PG also punts — so why does PG
+  not collapse? Candidates to separate by measurement: (a)
+  `estimate_num_groups` over appendrel / set-op output (the 0020a fix
+  covered the grouped SELECT inside one member, not necessarily the
+  union-of-groups output); (b) a set-op-crossing estimate channel PG
+  carries that goopg lacks. Deliverable: the 99-query
+  `GOOPG_CTE_ROWS_FALLBACK` ON/OFF A/B at SF0.25 re-run on the current
+  tree (Q31 `ws` 1→1846, Q39 `inv` 1→20, Q74 `year_total` 1→8325 were
+  the three fires), a named mechanism for whatever still collapses, and
+  — only if the A/B shows no collapse-class move — the removal plan for
+  0012. A collapse-class regression on removal remains an automatic
+  no-go (0012's own criterion).
+  Kind: recon
+  Parent: M0145-0012
+
+- [ ] **M0145-0025 — re-take the TPC-H plan-parity baseline on the
+  pinned-seed lane** (filed 2026-09-22, delegated owner direction;
+  progress-report §5.4). M0145-0021b found `tpch-estimate-audit-arm.sh`
+  had never pinned `GOOPG_ANALYZE_SEED`: the canonical TPC-H parity lane
+  carried A/A noise of `same=1/21 changed=20` (a Q3 shape flip), so every
+  `CATEGORIES-EXCL-MATCH` figure captured before the pin is possibly
+  noise-contaminated and no capture may be diffed across the pin. Re-take
+  the baseline: `JOINTREE=0 scripts/jointree-parity-capture.sh tpch
+  <label> <dir>` per G3 (private clone, HEAD binary, engine-id recorded),
+  bless the result as the lane's comparison base, and record which
+  earlier TPC-H deltas (e.g. the M0144-0001 floor numbers) are thereby
+  superseded. A capture and blessing only — no production code.
+  Kind: recon
+  Parent: M0145-0021b

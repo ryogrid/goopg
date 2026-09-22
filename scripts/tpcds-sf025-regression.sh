@@ -307,6 +307,7 @@ sf025_final_bad=0                # MISMATCH+CKMISMATCH+ERROR of the finished swe
 sf025_final_timeouts=0           # TIMEOUT count of the finished sweep
 sf025_nli_census="${GOOPG_NLI_CENSUS:-0}"          # preserve an explicit caller trace request
 sf025_dp_trace="${GOOPG_PGSHAPED_DP_TRACE:-0}"     # preserve an explicit caller trace request
+sf025_jointree_pipeline="${GOOPG_JOINTREE_PIPELINE:-0}"  # pipeline arm for the next server start (plan channel only)
 
 sf025_ensure_bin() {
     local tree_sha dirty built="rebuilt from tree"
@@ -373,6 +374,7 @@ sf025_goopg_start() {
     [[ -f "${SF025_GOOPG_DATA}/pg_hba.conf" ]] && hba_arg=(--hba "${SF025_GOOPG_DATA}/pg_hba.conf")
     GOOPG_NLI_CENSUS="${sf025_nli_census}" \
     GOOPG_PGSHAPED_DP_TRACE="${sf025_dp_trace}" \
+    GOOPG_JOINTREE_PIPELINE="${sf025_jointree_pipeline}" \
     GOOPG_CG_UNIT="${CG_UNIT}" "${REPO_ROOT}/scripts/goopg-test-run.sh" \
         "${GOOPG_BIN}" start -D "${SF025_GOOPG_DATA}" \
         --listen "127.0.0.1:${SF025_PORT}" "${hba_arg[@]}" \
@@ -793,7 +795,8 @@ cmd_plans() {
 # explicit SF025_PLANS_BASELINE (unset baseline under the pin is itself a
 # FAIL; =none is the explicit one-run suppression).
 sf025_plan_channel() {
-    local report="$1" baseline plans trace trend old_nli old_dp rc=0 diff_rc=0 flow_rc=0 pinned=0 log_lines=0
+    local report="$1" baseline plans trace trend old_nli old_dp old_jt rc=0 diff_rc=0 flow_rc=0 pinned=0 log_lines=0
+    local knob_plans knob_trace knob_rc=0 knob_flow_rc=0 knob_log_lines=0
     [[ "${SF025_PLAN_PIN:-0}" == "1" ]] && pinned=1
     baseline=$(sf025_plan_baseline)
     plans="${report%/*}/plans-${report##*/sweep-}"
@@ -802,6 +805,7 @@ sf025_plan_channel() {
     log_lines=$(wc -l < "${SF025_LOG}" 2>/dev/null || echo 0)
     old_nli="${sf025_nli_census}"
     old_dp="${sf025_dp_trace}"
+    old_jt="${sf025_jointree_pipeline}"
     sf025_nli_census=1
     sf025_dp_trace=1
     (
@@ -809,9 +813,40 @@ sf025_plan_channel() {
         sf025_capture_plans "${plans}"
         sf025_goopg_stop
     ) >> "${SF025_LOG}" 2>&1 || rc=$?
+    # Slice the default-arm log tail BEFORE the knob pass runs — a later tail
+    # would leak knob-arm SUBLINKCENSUS/seam-decline events into the default
+    # lane's flow report.
+    tail -n +$((log_lines + 1)) "${SF025_LOG}" > "${trace}" 2>/dev/null || true
+    # Knob-arm flow lane (M0145-0023 follow-up, progress-report §5.3): the
+    # default-arm capture measures `jointree-pullup` structurally at 0 —
+    # the route ratio that actually shows convergence only exists on the
+    # knob arm. One extra EXPLAIN-only pass under GOOPG_JOINTREE_PIPELINE=1
+    # feeds the same flow-convergence.py into the same trend with a
+    # `-knob` label. The capture file is named `plansknob-*` on purpose:
+    # it must NEVER match the `plans-*.txt` baseline glob (the recorded
+    # trap: a knob-arm capture landing in the baseline slot once made the
+    # next default sweep diff `same=74 changed=25` against itself).
+    # SF025_FLOW_KNOB=0 skips it; like the rest of this channel it is
+    # report-only and never touches the verdict.
+    if [[ "${SF025_FLOW_KNOB:-1}" == "1" && "${rc}" -eq 0 ]]; then
+        knob_plans="${report%/*}/plansknob-${report##*/sweep-}"
+        knob_trace="${knob_plans%.txt}.flow.log"
+        knob_log_lines=$(wc -l < "${SF025_LOG}" 2>/dev/null || echo 0)
+        sf025_jointree_pipeline=1
+        (
+            sf025_goopg_start
+            # The env prefix must sit on the capture call too: the header's
+            # planner-flags line reads the SCRIPT's env, so without it the
+            # knob-arm file would stamp GOOPG_JOINTREE_PIPELINE=unset(off)
+            # on a knob-on capture.
+            GOOPG_JOINTREE_PIPELINE=1 sf025_capture_plans "${knob_plans}"
+            sf025_goopg_stop
+        ) >> "${SF025_LOG}" 2>&1 || knob_rc=$?
+        tail -n +$((knob_log_lines + 1)) "${SF025_LOG}" > "${knob_trace}" 2>/dev/null || true
+        sf025_jointree_pipeline="${old_jt}"
+    fi
     sf025_nli_census="${old_nli}"
     sf025_dp_trace="${old_dp}"
-    tail -n +$((log_lines + 1)) "${SF025_LOG}" > "${trace}" 2>/dev/null || true
     {
         echo ""
         if [[ "${rc}" -ne 0 ]]; then
@@ -844,6 +879,19 @@ sf025_plan_channel() {
                 --label "${report##*/}" --trend "${trend}" "${trace}" 2>&1 || flow_rc=$?
             if [[ "${flow_rc}" -ne 0 ]]; then
                 echo "=== FLOW-CONVERGENCE: capture FAILED (rc=${flow_rc}) — see ${trace}; the verdict above is unaffected ==="
+            fi
+        fi
+        if [[ -n "${knob_plans:-}" ]]; then
+            if [[ "${knob_rc}" -ne 0 ]]; then
+                echo "=== FLOW-CONVERGENCE(knob arm, GOOPG_JOINTREE_PIPELINE=1): capture FAILED (rc=${knob_rc}) — see ${SF025_LOG}; the verdict above is unaffected ==="
+            else
+                python3 "${SCRIPT_DIR}/flow-convergence.py" \
+                    --label "${report##*/}-knob" --trend "${trend}" "${knob_trace}" 2>&1 || knob_flow_rc=$?
+                if [[ "${knob_flow_rc}" -ne 0 ]]; then
+                    echo "=== FLOW-CONVERGENCE(knob arm): capture FAILED (rc=${knob_flow_rc}) — see ${knob_trace}; the verdict above is unaffected ==="
+                else
+                    echo "# knob-arm capture (EXPLAIN-only, JOINTREE_PIPELINE=1): ${knob_plans} — never a plans-* baseline candidate"
+                fi
             fi
         fi
         if [[ "${pinned}" == "1" ]]; then

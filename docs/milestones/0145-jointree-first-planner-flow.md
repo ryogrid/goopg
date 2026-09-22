@@ -43,6 +43,7 @@ lowering replaces the interleaved stage-builder resolutions.
 | M0145-0002 | impl | Dual-pipeline harness: `GOOPG_JOINTREE_PIPELINE` knob, EXPLAIN-only parity capture for the new arm, per-divergence-class reporting |
 | M0145-0003 | impl | Sublink pull-up into the jointree (`pull_up_sublinks`/`pull_up_subqueries` analogue); pilot = route-a step 2; absorbs M0144-0003a + the lateral-route wall |
 | M0145-0004 | impl | UNION ALL → appendrel at jointree level (`pull_up_simple_union_all` analogue); absorbs M0144-0003b's residual |
+| M0145-0004a | impl | Whole-chain UNION ALL flattening — recurse `larg` AND `rarg` like `is_simple_union_all_recurse` so a right-leaning chain becomes one flat appendrel (Q71's admitted candidate currently loses the cost election on the nested shape) |
 | M0145-0005 | impl | Single-pass DP over the jointree; semi/anti as legal searched citizens; retires Phase A/B + pinned spine + splice re-resolution |
 | M0145-0006 | impl | Upper-rel pathlists (grouping/ordered/window/distinct elections over candidate sets); absorbs M0144-0011a's residual gates |
 | M0145-0007 | impl | Single Path→Node lowering pass (create_plan analogue) consolidating all post-election resolution |
@@ -58,10 +59,18 @@ lowering replaces the interleaved stage-builder resolutions.
 | M0145-0017 | impl | Census the never-reached sublink population (~248 of 308 events: sublinks outside top-level WHERE conjuncts) by clause position; extend pull-up to ON-qual reach for the PG-pullable subset only |
 | M0145-0018 | impl | Relax the `outer-over-derived` firewall — owner GO 2026-09-21; LAST: only after 0013 lands and a fresh E1 re-verification (SF0.25 + SF1) keeps relaxed plans clean; then remove `problemPairsOuterWithDerived` + the diagnostic flag, full default-arm gates |
 | M0145-0019 | recon | Nested-loop costing for a derived inner — 0018's NO-GO resolution path (option (c), (b) as interim): cost-diff recon on the instrumented PG naming the divergence; the fix is the follow-on task it files, then 0018's E1 re-runs |
+| M0145-0019a | impl | Ordering-aware LIMIT-fraction selection (`getCheapestFractionalPathOrdered` at `searchCtx.finalPath`) — 0019's recon-named fix; landed, Q78 SF1 back to Hash Left Join |
 | M0145-0020 | impl | Port `examine_simple_variable`'s non-recursive CTE arm (`selfuncs.c:5737-5912`) — 0012's named prerequisite; unblocks the `rows<=1` fallback retirement |
+| M0145-0020a | impl | Grouped-output cardinality repair (Q39: CTE Scan 1→19, Aggregate 20→3901 vs PG 3869) — the real defect 0020's measurement surfaced; landed |
+| M0145-0020c | recon | Attribute the two NEW ea-ratchet findings (Q44 `item+ss1`, Q83 `cte:sr_items+cte:wr_items`) — both proven `UNMATCHED-IN-PG`, not introduced by 0020a |
+| M0145-0020d | recon | EA-baseline staleness policy — owner (b): G4 widened for UNMATCHED-IN-PG-only repins; baseline re-pinned to `c20a-estimator-census-20260922/` |
 | M0145-0021 | impl | Harness: SF1 fire-set gate template for firewall/estimation/cost-model tasks (0018 showed SF0.25-green can mask a 60x+ SF1 regression) |
+| M0145-0021a | impl | Enforce the fire-set gate at commit level — `scripts/fireset-scope.sh` predicate + commit-msg requires a `tpcds-fireset` PASS stamp for optimizer/planner/cost/stat/selfuncs paths (AGENT.md G9); TPC-H opt-in via CORPORA |
+| M0145-0021b | impl | Extend the fire-set lane to TPC-H — pinned `GOOPG_ANALYZE_SEED` + `Q15a-VIEWBODY` parse fix; pinned A/A `same=22 changed=0` |
 | M0145-0022 | impl | Harness: plan-shape election + wall-clock regression channel on the SF0.25 sweep (values stay identical while shape/clock regress — the invisible class) |
-| M0145-0023 | impl | Harness: flow-convergence instrument — route-ratio + decline-bucket trend log, observability only, not a movement instrument |
+| M0145-0023 | impl | Harness: flow-convergence instrument — route-ratio + decline-bucket trend log, observability only, not a movement instrument (knob-arm lane added 2026-09-22: the sweep's plan channel now also captures under `GOOPG_JOINTREE_PIPELINE=1` so the route ratio it trends actually moves) |
+| M0145-0024 | recon | Q74 `year_total` residual collapse + the `rows<=1` fallback arm A/B — the last measurement before M0145-0012's removal can be re-judged |
+| M0145-0025 | recon | Re-take the TPC-H plan-parity baseline on the pinned-seed lane — pre-pin captures are non-comparable (A/A measured `changed=20/21` on sampling noise) |
 
 Dependencies: 0001 → {0003, 0004} → 0005 → {0006, 0007} → 0008.
 0002 is independent and should land early so every later task is measurable.

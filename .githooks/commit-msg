@@ -19,6 +19,12 @@
 #          or lies under internal/executor/, internal/optimizer/ or
 #          internal/planner/ (a costing site such as
 #          internal/optimizer/incrementalsortpaths.go needs the arm)
+#        tmp/gate-stamps/tpcds-fireset.json   result PASS — additionally
+#          required when the staged set is in the fire-set scope
+#          (M0145-0021a, AGENT.md G9: non-test .go under internal/optimizer/
+#          or internal/planner/, or *cost*|*stat*|*selfuncs* under
+#          internal/ or cmd/; internal/executor/ is out — scripts/fireset-scope.sh
+#          is the same predicate for pre-commit checks)
 #      and a body line starting `CATEGORIES-EXCL-MATCH:` or `PARITY: N/A — `.
 #
 #      A SKIP-BLOCKED stamp is NOT a pass. It is accepted only against an
@@ -91,6 +97,22 @@ done
 
 errors=()
 
+# Fire-set scope (M0145-0021a / AGENT.md G9): single predicate lives in
+# scripts/fireset-scope.sh so the loop can pre-check the same rule.
+# rc 0 = in scope, rc 1 = out of scope, anything else = the predicate itself
+# failed — fail CLOSED like every other gate (a missing/non-exec script must
+# not silently disable G9).
+fireset_needed=0
+if [ "$gated_go" -eq 1 ]; then
+  printf '%s\n' "${files[@]}" | "$ROOT/scripts/fireset-scope.sh" --stdin >/dev/null 2>&1
+  fireset_rc=$?
+  case "$fireset_rc" in
+    0) fireset_needed=1 ;;
+    1) ;;
+    *) errors+=("scripts/fireset-scope.sh failed with rc=$fireset_rc — cannot determine the fire-set scope; fix the script or restore its exec bit") ;;
+  esac
+fi
+
 # ------------------------------------------------------------------ helpers
 # One embedded python helper with two subcommands, so the hook stays a single
 # file: `kinds` (fix_plan task -> Kind) and `exc` (gate-exception lookup).
@@ -155,7 +177,8 @@ def cmd_kinds(argv):
     return 0
 
 
-ROW_GATES = ("tpch-spotcheck", "tpch-acceptance-arm", "tpcds-sf025")
+ROW_GATES = ("tpch-spotcheck", "tpch-acceptance-arm", "tpcds-sf025",
+             "tpcds-fireset")
 
 
 def exc_rows(path):
@@ -338,6 +361,9 @@ except Exception: print("")' "$1" "$2"
   check_stamp tpcds-sf025
   if [ "$arm_needed" -eq 1 ]; then
     check_stamp tpch-acceptance-arm
+  fi
+  if [ "$fireset_needed" -eq 1 ]; then
+    check_stamp tpcds-fireset
   fi
   if ! grep -Eq '^(CATEGORIES-EXCL-MATCH:|PARITY: N/A — )' <<<"$body"; then
     errors+=("body needs a line starting 'CATEGORIES-EXCL-MATCH:' (before -> after parity categories) or 'PARITY: N/A — <reason>'.")

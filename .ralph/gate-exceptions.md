@@ -22,11 +22,12 @@ A `SKIP-BLOCKED` stamp is accepted only when **all** of the following hold:
 4. `ci/logs/gate-exception-usage.log` records fewer than `max-commits` prior
    usages for that (`task-id`, `gate`) pair.
 
-`gate` must be exactly one of `tpch-spotcheck`, `tpch-acceptance-arm` or
-`tpcds-sf025` (any other spelling makes the row inert). With **no active rows —
-the current state — every `SKIP-BLOCKED` stamp is a hard commit failure.** A
-blocked gate with no row is an escalation: mark the task `[!]` with an
-escalation block naming the blocker.
+`gate` must be exactly one of `tpch-spotcheck`, `tpch-acceptance-arm`,
+`tpcds-sf025` or `tpcds-fireset` (any other spelling makes the row inert;
+`tpcds-fireset` was added 2026-09-22 under M0145-0021a / AGENT.md G9). With
+**no active rows — the current state — every `SKIP-BLOCKED` stamp is a hard
+commit failure.** A blocked gate with no row is an escalation: mark the task
+`[!]` with an escalation block naming the blocker.
 
 ## If you put a reference cluster back under HOLD
 
@@ -37,7 +38,9 @@ to run `scripts/tpch-estimate-audit-arm.sh`
 gates go SKIP-BLOCKED, which this file no longer waives automatically. The
 consequence is that **no commit touching `internal/optimizer`,
 `internal/planner`, `internal/executor` or a cost/stat path can land at all**
-until a row below grants it. So when you place a HOLD, decide in the same step
+until a row below grants it (the TPC-DS source-datadir HOLD variant now also
+SKIP-BLOCKEDs `tpcds-fireset`, which gates every optimizer/planner/cost-path
+commit under G9). So when you place a HOLD, decide in the same step
 whether the loop should keep working that code, and if so add the row here with
 a small `max-commits` and a near expiry. Before 2026-09-18 this waiver was
 automatic while the HOLD existed, which is how one grant became 18 commits.
