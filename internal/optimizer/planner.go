@@ -5722,7 +5722,12 @@ func planSubqueryRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int
 	// binding mark and the member-search flag below. A LATERAL union's
 	// members may cross-reference earlier FROM items; PG propagates
 	// rte->lateral to them, which this slice does not express.
-	appendrelSubquery := jointreePipeline && lateralCtx == nil &&
+	// lateralCtx is also supplied to a non-LATERAL FROM item merely so its
+	// table-function arguments could resolve earlier siblings. It is not the
+	// SQL LATERAL property: only RangeVar.Lateral makes the UNION member
+	// potentially parameterised and therefore ineligible for this one-shot
+	// appendrel path.
+	appendrelSubquery := jointreePipeline && !rv.Lateral &&
 		subqueryChainIsSimpleUnionAll(rv.Subquery)
 	if lateralCtx != nil {
 		latCtxWithCat := *lateralCtx

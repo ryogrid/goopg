@@ -12,6 +12,7 @@ package optimizer
 // UNION ALL leaf gathers in both arms).
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/goopg/goopg/internal/catalog"
@@ -38,6 +39,36 @@ func appendrelTestCat(t *testing.T) catalog.Catalog {
 	mk("zz_m2", 20_000_000, 200_000)
 	mk("zz_d", 500, 5)
 	return cat
+}
+
+func TestAddAppendRelPartialPathsTraceVerdicts(t *testing.T) {
+	withParallelOn(t, func() {
+		enableDPTrace(t)
+		cp := defaultCostParams()
+		setOpRel := upperRelSetOpWithPartials(t, cp)
+		leaf := setOpTestNode(parser.SetOpUnion, true, upperOrderedInput(100), upperOrderedInput(50))
+		leaf.setSetOpBranchRel(setOpRel)
+		leafRel := &RelOptInfo{Relids: 0b001, ConsiderParallel: true, rangeTblEntry: rangeTblEntry{baseLeaf: leaf}}
+		otherRel := &RelOptInfo{Relids: 0b010, ConsiderParallel: true}
+		s := &searchCtx{
+			parallelModeOK: true,
+			cp:             cp,
+			joinrels:       [][]*RelOptInfo{nil, {leafRel, otherRel}},
+			relInfos:       []baseRelInfo{{appendrel: true}, {}},
+			nrels:          2,
+			trace:          newSearchTrace([]rangeBinding{{alias: "u"}, {alias: "d"}}),
+		}
+		s.addAppendRelPartialPaths()
+		out := s.trace.render()
+		for _, want := range []string{
+			"DPTRACE appendrel rel={u} verdict=admitted",
+			"DPTRACE appendrel rel={d} verdict=unmarked",
+		} {
+			if !strings.Contains(out, want) {
+				t.Errorf("rendered trace missing %q:\n%s", want, out)
+			}
+		}
+	})
 }
 
 // findSetOpLeaf returns the first *SetOp reachable through single-child
@@ -102,6 +133,49 @@ func TestSubqueryChainIsSimpleUnionAll(t *testing.T) {
 		if got := subqueryChainIsSimpleUnionAll(sel); got != c.want {
 			t.Errorf("%s\n  got %v, want %v", c.sql, got, c.want)
 		}
+	}
+}
+
+// TestAppendrelMarkSurvivesEarlierFromSibling pins the Q71 regression: the
+// planner supplies a non-nil resolution context to every later FROM item, not
+// only SQL LATERAL items. The appendrel mark must use RangeVar.Lateral rather
+// than treating that ordinary scope plumbing as a lateral dependency.
+func TestAppendrelMarkSurvivesEarlierFromSibling(t *testing.T) {
+	cat := appendrelTestCat(t)
+	for _, tc := range []struct {
+		name string
+		sql  string
+		want bool
+	}{
+		{
+			name: "plain later FROM subquery is marked",
+			sql:  `SELECT * FROM zz_d d, (SELECT a, v FROM zz_m1 UNION ALL SELECT a, v FROM zz_m2) u`,
+			want: true,
+		},
+		{
+			name: "LATERAL subquery remains refused",
+			sql:  `SELECT * FROM zz_d d, LATERAL (SELECT a, v FROM zz_m1 UNION ALL SELECT a, v FROM zz_m2) u`,
+			want: false,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			defer func(v bool) { jointreePipeline = v }(jointreePipeline)
+			jointreePipeline = true
+			sel, ok := parseOne(t, tc.sql).(*parser.SelectStmt)
+			if !ok {
+				t.Fatal("parsed statement is not a SELECT")
+			}
+			_, ctx, err := planFromClause(sel, cat, DefaultPlannerSettings(), newRtableScope())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(ctx.bindings) != 2 {
+				t.Fatalf("bindings = %d, want 2", len(ctx.bindings))
+			}
+			if got := ctx.bindings[1].appendrel; got != tc.want {
+				t.Errorf("later union binding appendrel = %v, want %v", got, tc.want)
+			}
+		})
 	}
 }
 

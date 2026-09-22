@@ -106,11 +106,11 @@ type traceCost struct {
 // file (R54 Step-1, STEP1.md §2). Stored as relsets and named at render, the
 // way pairs/costs are, so the names cannot drift from the problem's map.
 type tracePVeto struct {
-	site  string // base | hash | merge | mergeu
-	rel   RelSet // the joinrel (join sites) or base rel (base site); 0 when
-	outer RelSet // the orientation tried (join sites); 0 for site=base
-	inner RelSet
-	veto  string // V0..V9 | B1..B4 | M0..M12 | admitted
+	site   string // base | hash | merge | mergeu
+	rel    RelSet // the joinrel (join sites) or base rel (base site); 0 when
+	outer  RelSet // the orientation tried (join sites); 0 for site=base
+	inner  RelSet
+	veto   string // V0..V9 | B1..B4 | M0..M12 | admitted
 	detail string // space-separated key=value, per-veto contract (STEP1 §2)
 }
 
@@ -137,6 +137,7 @@ type searchTrace struct {
 	// after the cost lines in one problem's block.
 	cpAdmits []traceCP
 	gathers  []traceGather
+	appendrs []traceAppendRel
 	// R54 Step-1's veto records (pveto below), rendered after the gather
 	// lines in one problem's block.
 	pvetos []tracePVeto
@@ -373,6 +374,14 @@ type traceGather struct {
 	verdict  string // "no-partials" | "no-parallel-mode" | "no-cp" | "mode" | "admitted"
 }
 
+// traceAppendRel is one appendrel partial-path hoist decision. The producer
+// fails closed at several independent gates; recording the first one makes a
+// missing baserel.appendrel.partial path diagnosable rather than inferential.
+type traceAppendRel struct {
+	rel     RelSet
+	verdict string // unmarked | no-cp | carrier | tlist | no-partials | admitted
+}
+
 // admit records a newly built joinrel's admission verdict. The VERDICT passed
 // in is authoritative — it is the flag `makeJoinRel` just stamped, computed by
 // `joinrelConsiderParallel` itself. Only the S2 explanation (which clause)
@@ -458,6 +467,16 @@ func (t *searchTrace) gather(rel RelSet, partials int, verdict string) {
 		return
 	}
 	t.gathers = append(t.gathers, traceGather{rel: rel, partials: partials, verdict: verdict})
+}
+
+// appendRel records the first appendrel-hoist gate that decided a leaf. The
+// caller supplies the verdict at its production branch, so the trace cannot
+// disagree with the fail-closed path it reports.
+func (t *searchTrace) appendRel(rel RelSet, verdict string) {
+	if t == nil {
+		return
+	}
+	t.appendrs = append(t.appendrs, traceAppendRel{rel: rel, verdict: verdict})
 }
 
 // pveto records one partial-path producer call that did not file — or one
@@ -546,13 +565,14 @@ const (
 	// standalone post-pass line (traceUpperGate). All three are recognised
 	// (not Malformed) by the enumtrace parser; see its cpadmit/cpgather/upper
 	// cases.
-	traceCPAdmitTag = traceTag + " cpadmit"
-	traceGatherTag  = traceTag + " cpgather"
-	traceUpperTag   = traceTag + " upper"
+	traceCPAdmitTag   = traceTag + " cpadmit"
+	traceGatherTag    = traceTag + " cpgather"
+	traceAppendRelTag = traceTag + " appendrel"
+	traceUpperTag     = traceTag + " upper"
 	// R54 Step-1's veto lines (pveto above). Recognised (not Malformed) by
 	// the enumtrace parser; see its pveto case.
 	tracePVetoTag = traceTag + " pveto"
-	traceEnd        = traceTag + " end"
+	traceEnd      = traceTag + " end"
 )
 
 // render formats the whole block. Separated from `emit` so the format is
@@ -591,6 +611,10 @@ func (t *searchTrace) render() string {
 	for _, g := range t.gathers {
 		fmt.Fprintf(&b, "%s rel=%s partials=%d verdict=%s\n",
 			traceGatherTag, t.relsetName(g.rel), g.partials, g.verdict)
+	}
+	for _, a := range t.appendrs {
+		fmt.Fprintf(&b, "%s rel=%s verdict=%s\n",
+			traceAppendRelTag, t.relsetName(a.rel), a.verdict)
 	}
 	for _, v := range t.pvetos {
 		// The base site tries no orientation (`dir=-`, STEP1.md §2); a

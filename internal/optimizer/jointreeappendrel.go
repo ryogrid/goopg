@@ -123,10 +123,15 @@ func (s *searchCtx) addAppendRelPartialPaths() {
 		return
 	}
 	for i, rel := range s.joinrels[1] {
-		if i >= len(s.relInfos) || !s.relInfos[i].appendrel {
+		if i >= len(s.relInfos) {
+			continue
+		}
+		if !s.relInfos[i].appendrel {
+			s.trace.appendRel(rel.Relids, "unmarked")
 			continue
 		}
 		if !rel.ConsiderParallel {
+			s.trace.appendRel(rel.Relids, "no-cp")
 			continue
 		}
 		// The carrier must sit AT the leaf root: any wrapper —
@@ -137,6 +142,7 @@ func (s *searchCtx) addAppendRelPartialPaths() {
 		// emits the partial SetOp BELOW the gather, not the gather.
 		carrier, ok := rel.baseLeaf.(setOpBranchRelNode)
 		if !ok {
+			s.trace.appendRel(rel.Relids, "carrier")
 			continue
 		}
 		// tlist_same_datatypes, the half of is_simple_union_all_recurse
@@ -152,12 +158,15 @@ func (s *searchCtx) addAppendRelPartialPaths() {
 		// granularity this seam has, and it leaves the exact legacy leaf.
 		// M0145-0004.
 		if so := carrierSetOpNode(rel.baseLeaf); so != nil && so.TlistTypesDiffer {
+			s.trace.appendRel(rel.Relids, "tlist")
 			continue
 		}
 		setOpRel := carrier.setOpBranchRel()
 		if setOpRel == nil || len(setOpRel.PartialPathlist) == 0 {
+			s.trace.appendRel(rel.Relids, "no-partials")
 			continue
 		}
+		s.trace.appendRel(rel.Relids, "admitted")
 		for _, pp := range setOpRel.PartialPathlist {
 			if pp == nil {
 				continue

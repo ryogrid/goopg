@@ -390,6 +390,36 @@ func TestTraceBaseCPLeafVerdict(t *testing.T) {
 	}
 }
 
+func TestTraceAppendRelVerdicts(t *testing.T) {
+	enableDPTrace(t)
+	s := traceCtx(t, "u", "d")
+	for _, tc := range []struct {
+		rel     RelSet
+		verdict string
+	}{
+		{0b001, "unmarked"}, {0b010, "no-cp"}, {0b001, "carrier"},
+		{0b001, "tlist"}, {0b001, "no-partials"}, {0b001, "admitted"},
+	} {
+		s.trace.appendRel(tc.rel, tc.verdict)
+	}
+	if got := len(s.trace.appendrs); got != 6 {
+		t.Fatalf("appendrel records = %d, want 6", got)
+	}
+	out := s.trace.render()
+	for _, want := range []string{
+		"DPTRACE appendrel rel={u} verdict=unmarked",
+		"DPTRACE appendrel rel={d} verdict=no-cp",
+		"DPTRACE appendrel rel={u} verdict=carrier",
+		"DPTRACE appendrel rel={u} verdict=tlist",
+		"DPTRACE appendrel rel={u} verdict=no-partials",
+		"DPTRACE appendrel rel={u} verdict=admitted",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("rendered block missing %q:\n%s", want, out)
+		}
+	}
+}
+
 // TestTraceGatherVerdicts: S4's "generated but lost" vs "never generated"
 // separation. The record carries the partial-pathlist length at decision time
 // with the gate that fired; whether a Gather won reads off the `cost` line's
