@@ -2731,6 +2731,37 @@ the whole file's active task between 2026-09-01 and 2026-09-14; **since
     why it is its own task.
 - [ ] **M0122-0009 — WAL / recovery / crash-consistency infra**.
 - [ ] **M0122-0010 — Concurrency: buffer pool & btree locking**.
+  - **Cross\-handle structural gate LANDED 2026\-09\-22 \(loop \#10\)** as
+    `4beed2920`. Movement: none — a concurrency protocol; `PLAN-SHAPE same=99
+    changed=0`. Design: `docs/design/0050-0099/0055-0002-btree-multi-writer-split-protocol.md` §4.1.
+    - The bug: every backend builds its OWN `BTree` handle, so a mutex stored
+      on the handle could not serialise a split against a concurrent split or
+      vacuum unlink through a different handle for the same index.
+    - The lock is now pool\-owned and `RelFileNode`\-keyed; all four production
+      constructors take it, all three structural critical sections use
+      `lockStructural`, and no direct `splitMu.Lock` survives outside that
+      helper \(audited, not assumed\).
+    - **The two tests are NOT equivalent, and the difference is measured.**
+      `TestOpenedHandlesShareStructuralLock` is the pin and fails without the
+      fix. `TestOpenedHandlesConcurrentlyInsertAcrossSplits` still PASSES under
+      `-race -count=3` with the shared mutex removed — its per\-handle keys
+      ascend, so only rightmost\-page splits occur and the buffer\-pool page
+      locks hold that path together. It is now commented as a functional smoke
+      test so no later loop reads it as a race pin.
+    - **No test reproduces the failure this gate prevents.** Writing one
+      \(interior splits, randomised key order, a deferred\-split window\) is
+      open work, ledgered with its resume point; the gate rests on the
+      structural argument meanwhile.
+    - Also ledgered: `Pool.BTreeStructuralLock`'s map is never pruned — one
+      mutex per relation ever opened, for the process lifetime. A naive delete
+      in `InvalidateRel` plus relfilenode reuse would DEFEAT the gate, so the
+      safe design is its own change.
+    - Gates: nbtree + storage units; `-race` on the touched package;
+      tpch\-spotcheck Q12=2/Q13=33; tpcds\-sf025 `PASS=96 MISMATCH=0
+      CKMISMATCH=0 ERROR=0 TIMEOUT=0`; full `TestPort_RegressSuite` with an
+      unchanged failing set; pgbench smoke.
+    - The milestone row stays `[ ]`: this is one slice of "buffer pool & btree
+      locking", not the whole item.
 - [ ] **M0122-0012 — Perf infra: vectorization / slot-pipeline / harness**.
 - [ ] **M0122-0013 — Physical/streaming replication & standby**.
 - [ ] **M0122-0014 — Logical replication / decoding / subscription**.
