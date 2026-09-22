@@ -2874,6 +2874,36 @@ the whole file's active task between 2026-09-01 and 2026-09-14; **since
       Q12=2/Q13=33; tpcds\-sf025 `PASS=96 MISMATCH=0 CKMISMATCH=0 ERROR=0
       TIMEOUT=0`; acceptance arm 24 MATCH; pgbench smoke.
 - [ ] **M0122-0015 — Test-suite porting: amcheck / verify_heapam / pg_dump**.
+  - [ ] **M0122-0015b — `subq_op` omits `OPERATOR(...)` before `ANY/SOME/ALL`,
+    so `pg_dump -t` / `-T` / `--filter` all fail**
+    Kind: impl
+    Parent: M0122-0015
+    Discovered 2026\-09\-22 (loop \#22) while probing
+    `005_pg_dump_filterfile.pl`.
+    - **Measured**: `pg_dump --table=t`, `--exclude-table=t` and `--filter`
+      each die with `syntax error at or near "ANY"`. pg_dump emits
+      `WHERE c.relkind OPERATOR(pg_catalog.=) ANY (array[…])` for all three.
+      `--schema`/`-n` uses a different shape and works.
+    - **Blast radius is larger than the feature that found it**:
+      `pg_dump -t mytable` is an everyday operation, and it does not work
+      against goopg at all — on the DEFAULT database, so this is independent
+      of M0122\-0015a.
+    - **Isolated to ONE production**, by measurement not assumption:
+      `'r' = ANY (array[…])` parses; `'r' OPERATOR(pg_catalog.=) 'r'` parses;
+      `LIKE`/`NOT LIKE`/`ILIKE … ANY` all parse. Only `OPERATOR(...)` before
+      `ANY/SOME/ALL` fails. goopg's `subq_op`
+      (`grammar/pg_grammar.y:3472`) is a documented subset of upstream's
+      `subquery_Op` (`gram.y:16671`) missing the
+      `OPERATOR '(' any_operator ')'` arm (`gram.y:16674`).
+    - **The needed piece already exists**: `qual_op`
+      (`grammar/pg_grammar.y` ~:3486) carries that spelling for the
+      `a_expr qual_op a_expr` rules — wire it into `subq_op`.
+    - **Rule 6 applies**: read
+      `docs/design/not_ralph/06-goyacc-parser-playbook.md` §12 first, build
+      with `make gen-parser`, review via the `parity_goldens.txt` diff.
+    - **Blocked from landing** by the `commit-msg` fire\-set `set -e` abort
+      (`grammar/` + `internal/parser/` are outside the fire\-set scope). The
+      inventory row for 005 is `defer` with this task in `deferred_to`.
   - [ ] **M0122-0015a — `COPY` resolves relations in the DEFAULT database, so
     `pg_dump` of any user-created database has no data**
     Kind: impl
