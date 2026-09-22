@@ -468,15 +468,6 @@ If Go symbol operations fail:
   milestone filing.
 - Tests are valuable, but per `PROMPT.md` they should not exceed ~20% of a
   loop's effort. Implementation > documentation > tests when prioritising.
-- **Codex backend only** (`codex exec` invocations under `ralph_loop.sh`;
-  ignore this bullet under other backends): your process ends the moment you
-  emit the `---RALPH_STATUS---` block, and the loop resumes your thread with
-  a fresh call — so emitting it early does not save anything, it only burns
-  a call. Do NOT end the turn after token work such as re-reading the baton,
-  re-verifying already-green checks, or making a trivial edit. Keep working
-  until the loop's task slice is genuinely complete or hits a real blocker;
-  a status block reporting `FILES_MODIFIED: 0` with no new information is a
-  wasted loop.
 - Update `.ralph/fix_plan.md` at the end of every loop: tick boxes, add
   newly-discovered follow-ups, and note any tasks that turned out to be
   larger than expected.
