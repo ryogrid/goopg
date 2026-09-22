@@ -37,6 +37,10 @@ func appendrelTestCat(t *testing.T) catalog.Catalog {
 	}
 	mk("zz_m1", 20_000_000, 200_000)
 	mk("zz_m2", 20_000_000, 200_000)
+	// M0145-0004a: a third large member, so a three-link chain's members are
+	// all parallel-eligible (zz_d stays small deliberately — the mixed arm's
+	// claimed-whole pick needs one).
+	mk("zz_m3", 20_000_000, 200_000)
 	mk("zz_d", 500, 5)
 	return cat
 }
@@ -454,6 +458,149 @@ func TestPartialAggOverUnionLeafGathers(t *testing.T) {
 					t.Fatalf("arm=%v: want Aggregate→Gather→…→SetOp, gather=%v setop=%v", on, gather != nil, setop != nil)
 				}
 			}()
+		}
+	})
+}
+
+// flattenSetOpMembersTest collects the streaming members of a (possibly
+// nested) *SetOp UNION ALL node — the plan-side twin of the executor's
+// setOpAppendBranches flattening.
+func flattenSetOpMembersTest(n Node) []Node {
+	var out []Node
+	var walk func(Node)
+	walk = func(cur Node) {
+		if so, ok := cur.(*SetOp); ok && so.Op == parser.SetOpUnion && so.All {
+			walk(so.Left)
+			walk(so.Right)
+			return
+		}
+		if cur != nil {
+			out = append(out, cur)
+		}
+	}
+	walk(n)
+	return out
+}
+
+// TestWholeChainPartialPathIsGatherable pins M0145-0004a's admission
+// whitelist: the outer link of a multi-member UNION ALL chain files a
+// PathSetOp whose branch child is the inner link's partial PathSetOp.
+// Before this change setOpBranchDrivingKindIsSupported refused the nested
+// kind outright (its `default: return false`), so makeGatherPath never
+// produced a path and the leaf kept its serial Append-of-Gathers plan —
+// TPC-DS Q71's `Append{Gather→Append{ws,cs}, Gather→ss}` divergence.
+//
+// The test also pins the fail-closed posture: a nested link carrying a
+// branch no claim walk models (Sort) must still refuse.
+func TestWholeChainPartialPathIsGatherable(t *testing.T) {
+	scan := func(rows float64) *Path {
+		return &Path{Kind: PathSeqScan, Rows: rows, Cost: Cost{Total: rows},
+			ParallelSafe: true, ParallelWorkers: 2}
+	}
+	inner := &Path{Kind: PathSetOp, Rows: 150, ParallelSafe: true, ParallelWorkers: 2,
+		Children: []*Path{scan(100), scan(50)}}
+	outer := &Path{Kind: PathSetOp, Rows: 200, ParallelSafe: true, ParallelWorkers: 3,
+		Children: []*Path{inner, scan(80)}}
+	if !gatherSubpathIsRunnable(outer) {
+		t.Fatal("whole-chain PathSetOp is not gatherable — the nested-branch refusal is back")
+	}
+
+	// One level deeper still: a 4-member chain (3 nested links).
+	deepest := &Path{Kind: PathSetOp, Rows: 90, ParallelSafe: true, ParallelWorkers: 2,
+		Children: []*Path{scan(40), scan(50)}}
+	mid := &Path{Kind: PathSetOp, Rows: 140, ParallelSafe: true, ParallelWorkers: 2,
+		Children: []*Path{deepest, scan(50)}}
+	top := &Path{Kind: PathSetOp, Rows: 240, ParallelSafe: true, ParallelWorkers: 3,
+		Children: []*Path{scan(100), mid}}
+	if !gatherSubpathIsRunnable(top) {
+		t.Fatal("3-level PathSetOp chain is not gatherable")
+	}
+
+	// Fail-closed: a nested link whose member is a shape no branch claim
+	// models (Sort has no executor claim twin) must refuse, not default.
+	bad := &Path{Kind: PathSetOp, Rows: 200, ParallelSafe: true, ParallelWorkers: 3,
+		Children: []*Path{
+			{Kind: PathSetOp, Rows: 150, ParallelSafe: true, ParallelWorkers: 2,
+				Children: []*Path{scan(100), {Kind: PathSort, Children: []*Path{scan(50)}}}},
+			scan(80),
+		}}
+	if gatherSubpathIsRunnable(bad) {
+		t.Fatal("nested link with a Sort member was admitted — the whitelist fell open")
+	}
+
+	// Fail-closed: a claimed-whole nested member that is not ParallelSafe
+	// must refuse (the SetOpLeftNonPartial/RightNonPartial guard).
+	badClaimed := &Path{Kind: PathSetOp, Rows: 200, ParallelSafe: true, ParallelWorkers: 3,
+		SetOpRightNonPartial: true,
+		Children: []*Path{
+			inner,
+			{Kind: PathSeqScan, Rows: 80, ParallelSafe: false},
+		}}
+	if gatherSubpathIsRunnable(badClaimed) {
+		t.Fatal("nested link with a non-parallel-safe claimed-whole member was admitted")
+	}
+}
+
+// TestUnionAllChainLeafFilesGatherablePartial is M0145-0004a's planner
+// gate: a three-member UNION ALL leaf's SETOP rel carries ONE partial
+// PathSetOp spanning the whole chain — the inner link's partial nested as
+// a child — and that path is admitted for a Gather by the executor-twin
+// whitelist. Before this task `setOpBranchDrivingKindIsSupported` refused
+// the nested PathSetOp child outright, so the whole-chain candidate the
+// mark+hoist already produced could never be gathered: the leaf kept the
+// serial Append-of-Gathers shape (TPC-DS Q71).
+//
+// The pin is at the PATH level, not the elected plan: on this fixture's
+// equal members the whole-chain Gather legitimately loses add_path's
+// cost-fuzz margin to a serial outer link over member-scope Gathers —
+// election is a cost verdict, and the corpus witness (Q71) elects it on
+// real stats on both arms. What must hold unconditionally is that the
+// candidate is FILED and RUNNABLE.
+func TestUnionAllChainLeafFilesGatherablePartial(t *testing.T) {
+	withParallelOn(t, func() {
+		cat := appendrelTestCat(t)
+		sql := `SELECT * FROM (SELECT a, v FROM zz_m1 UNION ALL SELECT a, v FROM zz_m2 UNION ALL SELECT a, v FROM zz_m3) u, zz_d d WHERE u.a = d.a`
+
+		node := planOnPipeline(t, sql, cat, true)
+		leaf := findSetOpLeaf(node)
+		if leaf == nil {
+			t.Fatal("jointree arm: no *SetOp leaf in the plan")
+		}
+		carrier, ok := Node(leaf).(setOpBranchRelNode)
+		if !ok {
+			t.Fatalf("jointree arm: leaf %T is not a setOpBranchRelNode carrier", leaf)
+		}
+		sr := carrier.setOpBranchRel()
+		if sr == nil {
+			t.Fatal("jointree arm: leaf carrier answers a nil SETOP rel")
+		}
+		var whole *Path
+		for _, p := range sr.PartialPathlist {
+			if p.Kind == PathSetOp {
+				whole = p
+				break
+			}
+		}
+		if whole == nil {
+			t.Fatal("jointree arm: outer link's SETOP rel carries no partial PathSetOp")
+		}
+		// The whole-chain shape: one branch is the inner link's own partial
+		// PathSetOp, the other a member partial. Left-deep fold puts the
+		// chain on the left.
+		var nested *Path
+		for _, c := range whole.Children {
+			if c.Kind == PathSetOp {
+				nested = c
+			}
+		}
+		if nested == nil {
+			t.Fatalf("whole-chain partial has no nested PathSetOp child — "+
+				"children kinds are %v/%v; the chain did not stack",
+				whole.Children[0].Kind, whole.Children[1].Kind)
+		}
+		if !gatherSubpathIsRunnable(whole) {
+			t.Fatal("whole-chain partial PathSetOp is not gatherable — the " +
+				"nested-branch refusal is back")
 		}
 	})
 }

@@ -1087,6 +1087,143 @@ func TestGatherOverJoinProbeSetOpIdentity(t *testing.T) {
 	}
 }
 
+// TestGatherOverNestedSetOpIdentity is M0145-0004a's executor gate: a
+// multi-link UNION ALL chain reaches the executor as a NESTED
+// *setOp{*setOp{...}, member} under ONE Gather (createSetOpPlan keeps the
+// binary node shape — the flat N-member append is a planner-side view).
+// Before this task the leaf claim sets carried no setOpLeft/setOpRight of
+// their own, so attachAll's recursion stopped one level down: the inner
+// link's member scans stayed unclaimed and every participant replayed both
+// members — (workers+1) copies of two of the three members.
+//
+// The chain is built right-leaning (a ∪ (b ∪ c)) — the shape the planner
+// emits for `A UNION ALL B UNION ALL C` — and pq_setop_c is shifted by
+// +200000 so all three member ranges are disjoint: a shared claim boundary
+// or a dropped level shows up as a wrong multiplicity, not a missing row.
+func TestGatherOverNestedSetOpIdentity(t *testing.T) {
+	ctx, cleanup := parallelSetOpFixture(t)
+	defer cleanup()
+
+	ctx.MaxParallelWorkers = 8
+	ctx.ParallelLeaderParticipation = true
+
+	const wantTotal = 260 + 90 + 40
+
+	for _, workers := range []int{1, 2, 4} {
+		t.Run(fmt.Sprintf("workers=%d", workers), func(t *testing.T) {
+			advanceStmtCounter(ctx)
+			a := planForTest(t, ctx, "SELECT id FROM pq_setop_a")
+			b := planForTest(t, ctx, "SELECT id FROM pq_setop_b")
+			c := planForTest(t, ctx, "SELECT aid + 200000 FROM pq_setop_c")
+			inner := &optimizer.SetOp{Left: b, Right: c, Op: parser.SetOpUnion, All: true}
+			so := &optimizer.SetOp{Left: a, Right: inner, Op: parser.SetOpUnion, All: true}
+			gathered := optimizer.NewGather(0, so, workers)
+
+			op, err := Build(gathered)
+			if err != nil {
+				t.Fatalf("build: %v", err)
+			}
+			if err := op.Open(ctx); err != nil {
+				t.Fatalf("open: %v", err)
+			}
+			seen := map[string]int{}
+			n := 0
+			for {
+				slot, err := op.Next()
+				if err == EOF {
+					break
+				}
+				if err != nil {
+					op.Close()
+					t.Fatalf("next: %v", err)
+				}
+				seen[datumTestString(slot.Row()[0])]++
+				n++
+			}
+			if err := op.Close(); err != nil {
+				t.Fatalf("close: %v", err)
+			}
+			if n != wantTotal {
+				t.Fatalf("got %d rows, want %d — a multiple means the inner link's "+
+					"members were replayed per participant (the pre-M0145-0004a "+
+					"missing-nested-claim defect)", n, wantTotal)
+			}
+			for v, cnt := range seen {
+				if cnt != 1 {
+					t.Fatalf("row %s returned %d times; each member's claim set must hand "+
+						"each block to exactly one worker at every nesting level", v, cnt)
+				}
+			}
+			// One row from each member, so a claim tree that silently skipped
+			// a level is caught even when the count coincidentally matched.
+			for _, v := range []int64{5, 100005, 200005} {
+				if _, ok := seen[datumTestString(NewIntDatum(v))]; !ok {
+					t.Errorf("missing row %d; a nested member was never read", v)
+				}
+			}
+		})
+	}
+}
+
+// TestGatherOverNestedSetOpClaimedWholeIdentity is the nested twin of the
+// claimed-whole pin: the INNER link's right member is stamped claimed-whole
+// (SetOp.RightNonPartial — PG's pa_nonpartial_subpaths), so its claim flag
+// must come from the level-2 leaf claim set, not the level-1 one. Before
+// M0145-0004a that field was a nil dereference waiting to happen; now it is
+// lazily grown state that still has to be WIRED — a missed wire means the
+// claiming worker's flag is private and the branch emits once per
+// participant.
+func TestGatherOverNestedSetOpClaimedWholeIdentity(t *testing.T) {
+	ctx, cleanup := parallelSetOpFixture(t)
+	defer cleanup()
+
+	ctx.MaxParallelWorkers = 8
+	ctx.ParallelLeaderParticipation = true
+
+	const wantTotal = 260 + 90 + 40
+
+	for _, workers := range []int{1, 2, 4} {
+		t.Run(fmt.Sprintf("workers=%d", workers), func(t *testing.T) {
+			advanceStmtCounter(ctx)
+			a := planForTest(t, ctx, "SELECT id FROM pq_setop_a")
+			b := planForTest(t, ctx, "SELECT id FROM pq_setop_b")
+			c := planForTest(t, ctx, "SELECT aid + 200000 FROM pq_setop_c")
+			// Inner link, right member claimed-whole: exactly one
+			// participant drains pq_setop_c; the rest skip it via the
+			// level-2 leaf's claimedWhole CAS.
+			inner := &optimizer.SetOp{Left: b, Right: c, Op: parser.SetOpUnion, All: true, RightNonPartial: true}
+			so := &optimizer.SetOp{Left: a, Right: inner, Op: parser.SetOpUnion, All: true}
+			gathered := optimizer.NewGather(0, so, workers)
+
+			op, err := Build(gathered)
+			if err != nil {
+				t.Fatalf("build: %v", err)
+			}
+			if err := op.Open(ctx); err != nil {
+				t.Fatalf("open: %v", err)
+			}
+			n := 0
+			for {
+				if _, err := op.Next(); err == EOF {
+					break
+				} else if err != nil {
+					op.Close()
+					t.Fatalf("next: %v", err)
+				}
+				n++
+			}
+			if err := op.Close(); err != nil {
+				t.Fatalf("close: %v", err)
+			}
+			if n != wantTotal {
+				t.Fatalf("got %d rows, want %d — more means the level-2 claimedWhole "+
+					"flag was not shared (each participant drained c serially), "+
+					"fewer means it was never offered", n, wantTotal)
+			}
+		})
+	}
+}
+
 // planTreeHasSetOp reports whether any *optimizer.SetOp sits anywhere in n,
 // descending the same multi-child kinds the claim walk does.
 func planTreeHasSetOp(n optimizer.Node) bool {

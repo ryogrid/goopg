@@ -17,6 +17,7 @@ package executor
 import (
 	"fmt"
 	"reflect"
+	"sync"
 	"testing"
 
 	"github.com/goopg/goopg/internal/catalog"
@@ -232,7 +233,19 @@ func TestParallelClaimSetAttachesEveryKind(t *testing.T) {
 		}
 	}
 
-	n := reflect.TypeOf(parallelClaimSet{}).NumField()
+	// M0145-0004a: count claim KINDS, not fields — setOpKidsOnce is lazy-
+	// growth bookkeeping for the nested-setOp claim tree (setOpBranch), not
+	// a claim state a subtree attaches to. A field of any other type is a
+	// new claim kind and must be wired into attachAll AND covered above.
+	n := 0
+	cst := reflect.TypeOf(parallelClaimSet{})
+	onceType := reflect.TypeOf(sync.Once{})
+	for i := 0; i < cst.NumField(); i++ {
+		if cst.Field(i).Type == onceType {
+			continue
+		}
+		n++
+	}
 	if len(covered) != n {
 		t.Fatalf("parallelClaimSet has %d claim kinds but this test covers %d (%v) — "+
 			"a new kind must be wired into attachAll AND covered here, or a Gather "+

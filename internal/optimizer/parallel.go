@@ -1838,12 +1838,16 @@ func unstampParallelScan(n Node) Node {
 		return &c
 	case *SetOp:
 		// M0140-0006c: the inverse of stampParallelScan's *SetOp arm.
+		// M0145-0004a: also drop the node's own ParallelAware flag — it is
+		// the "Parallel Append" label, and a SetOp whose Gather was just
+		// stripped must not keep claiming parallel awareness.
 		left, right := unstampParallelScan(x.Left), unstampParallelScan(x.Right)
-		if left == x.Left && right == x.Right {
+		if left == x.Left && right == x.Right && !x.ParallelAware {
 			return n
 		}
 		c := *x
 		c.Left, c.Right = left, right
+		c.ParallelAware = false
 		return &c
 	}
 	return n

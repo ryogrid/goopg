@@ -1,10 +1,17 @@
 # Working set — owner reset (2026-09-22, after loop #148)
 
-`Task:` none in flight. **The 129-loop BLOCKED state is cleared — the owner
+`Task:` M0145-0004a landed 2026-09-23 (whole-chain UNION ALL flattening —
+`Gather → Parallel Append` over the full chain on both arms; Q71 verifies
+290 rows = PG). Commit pending at session end with all gate stamps PASS
+(spotcheck, sf025 sweep, acceptance-arm 24 MATCH, tpcds-fireset).
+**The 129-loop BLOCKED state is cleared — the owner
 unblocked it.** Do NOT carry the old "everything is owner-gated" conclusion
 forward; it described a now-fixed harness bug, not the task list.
 
-`In-flight:` none. Index is clean of the foreign-table deliverable.
+`In-flight:` none after 0004a. Next selectable per banner order:
+**M0145-0005** (single-pass DP over the jointree — slices 1-5 partial
+landed; remaining slices per its entry: semi/anti as real leaf items,
+IR-direct leaf materialisation, Phase A/B + `admitSemiAnti` retirement).
 
 ## What the owner changed (state deltas the old baton did not know)
 

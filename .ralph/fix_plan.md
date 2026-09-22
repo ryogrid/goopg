@@ -14916,7 +14916,7 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
     prebuilt-over-nested-winner); `is_safe_append_member`'s pull-up
     half is inapplicable in this model (members are not promoted —
     member WHERE quals ride `spliceBranchEmission` per worker).
-- [ ] **M0145-0004a — whole-chain UNION ALL flattening**
+- [x] **M0145-0004a — whole-chain UNION ALL flattening**
   (filed 2026-09-22 under the re-pinned lineage baseline; the residual
   M0145-0004's LINEAGE NOTE could not file). PostgreSQL's
   `is_simple_union_all_recurse` (`prepjointree.c:1617`) recurses BOTH
@@ -14938,6 +14938,64 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
   candidate becoming electable.
   Kind: impl
   Parent: M0145-0004
+  - **LANDED 2026-09-23.** Recon corrected the task's mental model: the
+    mark+hoist was already whole-chain — `setOpBranchTag` carries the
+    inner link's SETOP rel out, so the outer link's partial
+    `PathSetOp{PathSetOp{m1,m2}, m3}` IS the flat candidate, and
+    `addAppendRelPartialPaths` already hoisted it. The refusal was one
+    `default: return false` in `setOpBranchDrivingKindIsSupported`: a
+    nested `PathSetOp` branch had no executor twin because leaf claim
+    sets carried no `setOpLeft`/`setOpRight` of their own.
+  - Landed: (i) lazy nested claim sets — `parallelClaimSet.setOpBranch`
+    grows the branch pair under a per-set `sync.Once`, so an N-link
+    chain materialises N−1 levels of branch state and every member scan
+    claims independently (the N+1-copies defect the refusal protected
+    against); (ii) `bitmapPrebuildTargets` descends nested `*setOp`
+    branches so member bitmaps publish into the level workers attach;
+    (iii) the `PathSetOp` admission arm delegates to
+    `partialPathDrivingKind(p) == PathSetOp` — the parent's own
+    contract one level down, still fail-closed on Sort/Memoize/etc.;
+    (iv) `SetOp.ParallelAware` — PG's generic `parallel_aware` label
+    (explain.c:1630) — stamped from `p.ParallelAware` in
+    `createSetOpPlan`, rendered "Parallel Append", cleared by
+    `unstampParallelScan` when a plan loses its Gather post-cache.
+  - Tests: `TestWholeChainPartialPathIsGatherable` (nested + 3-link
+    gatherable; Sort and non-parallel-safe claimed-whole branches still
+    refuse), `TestUnionAllChainLeafFilesGatherablePartial` (e2e
+    path-level pin: the 3-member leaf's SETOP rel carries a runnable
+    nested partial; election deliberately NOT pinned — equal-member
+    fixtures compress the margin below add_path's fuzz, ~0.2%),
+    `TestGatherOverNestedSetOpIdentity` +
+    `TestGatherOverNestedSetOpClaimedWholeIdentity` (390 rows, workers
+    1/2/4, no duplicates), claim-kind anti-drift updated for
+    `setOpKidsOnce`.
+  - Lane verify: Q71 on private SF0.25 clones — BOTH arms emit
+    `Gather → Parallel Append{web_sales, catalog_sales, store_sales}`,
+    290 rows = PG 18.3. The machinery is shared, so the shape change is
+    not knob-gated.
+  - Gates: units PASS; tpch-spotcheck PASS (Q12=2, Q13=33); SF0.25
+    sweep PASS=96 MISMATCH=0 TIMEOUT=0, plan-diff 3 movers (Q14, Q66,
+    Q71 — all gaining the flat `Gather → Parallel Append` /
+    `Parallel Append` label); acceptance arm PGSHAPED=1 24 MATCH PASS;
+    tpcds-fireset PASS (sf025+sf1, no introduced timeouts); plan-gate
+    16/22 = the standing M0137-0022 baseline drift (zero SetOp/UNION/
+    Append lines in the diff; the gate compares live-:65433 vs the
+    2026-09-15 pin — staged code in neither side — and the count moved
+    14→16 on cluster stats drift, not this change).
+  - **Movement: Q14/Q66/Q71 plan shapes converge to PG's
+    single-Gather/Parallel-Append form on the corpus** (sweep
+    plan-diff, both arms — machinery is arm-independent); the vs-PG
+    `parallelism` category count is ~unchanged (candidate 84 vs
+    baseline 85 — the delta is Q10, an arm asymmetry unrelated to this
+    change; Q14/Q66/Q71 keep their records because they still diverge
+    in other categories). Rows: all value-identical.
+  - Deferral (ledgered in the design doc): bare-member legacy-arm
+    fixtures stay serial (the `s.Where == nil` seam gate needs
+    outerLink/appendrelMember/jointree — the same posture M0145-0004
+    recorded); member-scope Gather election compressing the whole-chain
+    margin is a costing question for M0145-0005's member-rel work.
+  - Design doc:
+    `docs/design/0100-0149/m0145-0004a-whole-chain-union-all-flattening.md`.
 - [ ] **M0145-0005 — single-pass DP over the jointree** (the search
   consumes the IR directly; semi/anti entries are legal searched partners
   via a `join_is_legal` port over the SJInfo-equivalent, joinrels.c:350).

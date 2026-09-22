@@ -2824,6 +2824,18 @@ type SetOp struct {
 	// driving scan is never claimed and stays .Parallel = false.
 	LeftNonPartial  bool
 	RightNonPartial bool
+	// ParallelAware is PG's `Plan.parallel_aware` (explain.c:1630's generic
+	// "Parallel " prefix rule), stamped by createSetOpPlan from the PATH's
+	// own flag — true exactly when the node was built from a partial
+	// PathSetOp (addPartialSetOpPath), i.e. when it is the Append under a
+	// Gather whose branches the workers partition. It is render state only:
+	// the executor's claim wiring keys off LeftNonPartial/RightNonPartial
+	// and the claim sets, not this flag. StripGather's inverse walk
+	// (unstampParallelScan) clears it together with the scan labels when a
+	// plan loses its Gather post-cache — a "Parallel Append" with no Gather
+	// above it would claim a parallelism the executor will not run.
+	// M0145-0004a.
+	ParallelAware bool
 }
 
 func (n *SetOp) Pos() int       { return n.pos }

@@ -617,13 +617,27 @@ type parallelClaimSet struct {
 	// publishes its block-count boundary from whichever scan opens FIRST
 	// (initOnce) and every later scan on that same state reuses it — correct
 	// when both scans are on the SAME relation, silently wrong when a SetOp's
-	// two branches are on different ones. Built once, eagerly, by
-	// newParallelClaimSet (never lazily: attachAll runs from every worker
-	// goroutine concurrently, so a lazy first-attach race would need its own
-	// locking the eager build avoids). Bounded to one level — see
-	// newLeafParallelClaimSet.
+	// two branches are on different ones.
+	//
+	// Level one is built eagerly by newParallelClaimSet. M0145-0004a: deeper
+	// levels grow LAZILY through setOpBranch, because a branch can now be a
+	// nested partial SetOp itself (a right-leaning UNION ALL chain's inner
+	// link — the whole-chain appendrel candidate files one PathSetOp whose
+	// child is another PathSetOp). Laziness is what lets the chain be
+	// arbitrary length: claim sets materialise only where attachAll actually
+	// walks, in O(nesting depth) instead of the exponential 2^depth a fixed
+	// eager bound would need. attachAll runs from every worker goroutine
+	// concurrently, so the growth is funnelled through setOpKidsOnce — one
+	// Once per claim set publishes both children, and every caller reads
+	// them only through setOpBranch.
 	setOpLeft  *parallelClaimSet
 	setOpRight *parallelClaimSet
+	// setOpKidsOnce is the growth lock for the pair above — bookkeeping,
+	// NOT a claim kind: it guards setOpLeft/setOpRight creation on sets
+	// whose constructor left them nil (every level below the first).
+	// attachAll's *setOp arm is the only trigger; the Once's
+	// happens-before makes the publish safe across worker goroutines.
+	setOpKidsOnce sync.Once
 
 	// claimedWhole (M0140-0006c-3) is PG's `pa_finished` on a non-partial
 	// Append subplan (nodeAppend.c:68-80,704-832): a SetOp branch the
@@ -653,21 +667,44 @@ func newParallelClaimSet() *parallelClaimSet {
 }
 
 // newLeafParallelClaimSet is newParallelClaimSet without its own nested
-// setOpLeft/setOpRight — a SetOp branch is never itself another partial
-// SetOp: M0140-0006a's RelOptInfo.LeftBranchRel/RightBranchRel is populated
-// via searchedRelOf, which recognises a planSelectWithSettings search root
-// and does NOT recognise createSetOpPaths's own output (a nested UNION ALL
-// chain's inner node) as one — so addPartialSetOpPath can never see a
-// partial path on a branch that is itself a SetOp, and these two never need
-// branches of their own. pbm starts nil exactly like the top-level claim
-// set's: prebuildBitmap fills it when the branch's own plan carries a
-// bitmap scan (M0140-0006c-2 slice C's per-branch publication in
-// bitmapPrebuildTargets).
+// setOpLeft/setOpRight — those grow lazily through setOpBranch
+// (M0145-0004a). A SetOp branch CAN now be another partial SetOp:
+// M0144-0003b-1's setOpBranchTag carries the inner link's SETOP rel out to
+// the next link, so a right-leaning UNION ALL chain's outer partial path
+// has the inner link's partial PathSetOp as a branch child, and that child
+// needs claim sets of its own one level down. pbm starts nil exactly like
+// the top-level claim set's: prebuildBitmap fills it when the branch's own
+// plan carries a bitmap scan (M0140-0006c-2 slice C's per-branch
+// publication in bitmapPrebuildTargets).
 func newLeafParallelClaimSet() *parallelClaimSet {
 	return &parallelClaimSet{
 		pscan: newParallelScanState(0),
 		pidx:  newParallelIndexScanState(),
 	}
+}
+
+// setOpBranch returns this claim set's per-branch set for a partial SetOp
+// attach — setOpLeft for the left branch, setOpRight for the right —
+// growing the pair on first use. The top-level claim set has them built
+// eagerly (newParallelClaimSet); leaf sets create them here under
+// setOpKidsOnce, so an N-deep UNION ALL chain materialises exactly N-1
+// levels of branch state and no more. The Once is what makes the lazy
+// growth safe: attachAll calls this from every worker goroutine
+// concurrently, and the Once's happens-before edge publishes both fields
+// to every caller.
+func (cs *parallelClaimSet) setOpBranch(right bool) *parallelClaimSet {
+	cs.setOpKidsOnce.Do(func() {
+		if cs.setOpLeft == nil {
+			cs.setOpLeft = newLeafParallelClaimSet()
+		}
+		if cs.setOpRight == nil {
+			cs.setOpRight = newLeafParallelClaimSet()
+		}
+	})
+	if right {
+		return cs.setOpRight
+	}
+	return cs.setOpLeft
 }
 
 // unwrapToSetOp walks the SAME wrapper kinds attachParallelScan's own
@@ -758,17 +795,23 @@ func (cs *parallelClaimSet) attachAll(op Operator) bool {
 		// claim state for that branch. A planless *setOp (synthetic
 		// trees) takes the partial path on both sides, as before.
 		left, right := false, false
+		// M0145-0004a: both sides go through setOpBranch — the accessor is
+		// what grows the next claim level when the branch op is itself a
+		// nested partial *setOp (a multi-link UNION ALL chain). Reading the
+		// fields directly would still work at level one but would hand a
+		// nil child set to a deeper link — an unclaimed inner member is the
+		// N-copies defect this type exists to prevent.
 		if so.plan != nil && so.plan.LeftNonPartial {
-			so.claimLeft = &cs.setOpLeft.claimedWhole
+			so.claimLeft = &cs.setOpBranch(false).claimedWhole
 			left = true
 		} else {
-			left = cs.setOpLeft.attachAll(so.left)
+			left = cs.setOpBranch(false).attachAll(so.left)
 		}
 		if so.plan != nil && so.plan.RightNonPartial {
-			so.claimRight = &cs.setOpRight.claimedWhole
+			so.claimRight = &cs.setOpBranch(true).claimedWhole
 			right = true
 		} else {
-			right = cs.setOpRight.attachAll(so.right)
+			right = cs.setOpBranch(true).attachAll(so.right)
 		}
 		return left || right
 	}
@@ -854,10 +897,10 @@ func (cs *parallelClaimSet) bitmapPrebuildTargets(tree Operator) []bitmapPrebuil
 		// wasted leader work at best.
 		var out []bitmapPrebuildTarget
 		if !so.plan.LeftNonPartial {
-			out = cs.setOpLeft.appendBitmapPrebuildTarget(out, so.plan.Left, so.left)
+			out = cs.setOpBranch(false).appendBitmapPrebuildTarget(out, so.plan.Left, so.left)
 		}
 		if !so.plan.RightNonPartial {
-			out = cs.setOpRight.appendBitmapPrebuildTarget(out, so.plan.Right, so.right)
+			out = cs.setOpBranch(true).appendBitmapPrebuildTarget(out, so.plan.Right, so.right)
 		}
 		return out
 	}
@@ -881,6 +924,24 @@ func (cs *parallelClaimSet) bitmapPrebuildTargets(tree Operator) []bitmapPrebuil
 // is the same ambiguity the flat path refuses. Either way the branch
 // publishes nothing and its attach fails closed.
 func (cs *parallelClaimSet) appendBitmapPrebuildTarget(dst []bitmapPrebuildTarget, planBranch optimizer.Node, branch Operator) []bitmapPrebuildTarget {
+	// M0145-0004a: the branch can itself be a partial UNION ALL link — a
+	// nested *setOp whose members claim through THIS leaf set's own branch
+	// sets, one level down. Recurse per side exactly as attachAll does so a
+	// member bitmap publishes into the leaf claim set its workers will
+	// actually attach (a flat collectBitmapScans here would find 2+ scans
+	// and publish nothing, leaving every member bitmap unattached).
+	if inner, ok := unwrapToSetOp(branch); ok {
+		if inner.plan == nil {
+			return dst
+		}
+		if !inner.plan.LeftNonPartial {
+			dst = cs.setOpBranch(false).appendBitmapPrebuildTarget(dst, inner.plan.Left, inner.left)
+		}
+		if !inner.plan.RightNonPartial {
+			dst = cs.setOpBranch(true).appendBitmapPrebuildTarget(dst, inner.plan.Right, inner.right)
+		}
+		return dst
+	}
 	if !optimizer.HasBitmapScan(planBranch) {
 		return dst
 	}

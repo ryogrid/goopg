@@ -668,13 +668,19 @@ func partialPathDrivingKind(p *Path) PathKind {
 // setOpBranchDrivingKindIsSupported is the PathSetOp arm's own, narrower
 // admission test for one branch — a bare seq or (unparameterised) index
 // scan, a bitmap heap scan, a hash join partial through its probe side, a
-// merge join partial through its outer side, or a nested loop partial
-// through its outer side (M0140-0006c-2, slices hash + A + B + C). It still
-// does NOT delegate to partialPathDrivingKind's general recursion: the
-// branch's nested shapes must be ones the SetOp claim-set story models —
-// each join arm re-verifies its own guards rather than trusting a caller's,
-// and no other kind (Sort, Memoize, Aggregate, a nested SetOp) has a
-// branch-local executor twin.
+// merge join partial through its outer side, a nested loop partial through
+// its outer side (M0140-0006c-2, slices hash + A + B + C), or — M0145-0004a
+// — a nested partial SetOp: the inner link of a right-leaning UNION ALL
+// chain, which is exactly the shape the whole-chain appendrel candidate
+// carries. It still does NOT delegate to partialPathDrivingKind's general
+// recursion: the branch's nested shapes must be ones the SetOp claim-set
+// story models — each join arm re-verifies its own guards rather than
+// trusting a caller's, and no other kind (Sort, Memoize, Aggregate) has a
+// branch-local executor twin. The SetOp arm is admitted because the
+// executor's claim tree now nests with it: attachAll hands each branch a
+// lazily grown leaf claim set (parallel_scan.go's setOpBranch), so an
+// N-link chain materialises N-1 levels of branch state and every member
+// scan gets its own independent block claim.
 func setOpBranchDrivingKindIsSupported(p *Path) bool {
 	if p == nil {
 		return false
@@ -798,6 +804,20 @@ func setOpBranchDrivingKindIsSupported(p *Path) bool {
 			}
 		}
 		return setOpBranchDrivingKindIsSupported(o)
+	case PathSetOp:
+		// M0145-0004a: a nested streaming UNION ALL link as a branch. The
+		// admission contract is the parent's own PathSetOp arm applied one
+		// level down — two children, each either claimed-whole
+		// (ParallelSafe, no driving kind needed) or itself a supported
+		// branch — so the check delegates back to partialPathDrivingKind
+		// rather than restating it. The recursion is bounded by the chain
+		// length: each level peels one link off the right-leaning chain.
+		// What makes this safe is the executor twin, not the shape:
+		// parallelClaimSet grows a fresh pair of leaf claim sets per level
+		// (setOpBranch), so a nested link's member scans claim
+		// independently of the outer link's — the N-copies defect the
+		// previous `default: refuse` was protecting against.
+		return partialPathDrivingKind(p) == PathSetOp
 	default:
 		return false
 	}

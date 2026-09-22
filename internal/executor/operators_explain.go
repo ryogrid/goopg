@@ -3735,6 +3735,14 @@ func firstRowsFromFunc(p *optimizer.RowsFrom) optimizer.Node {
 // describePlan case above for the mapping rationale.
 func setOpNodeName(p *optimizer.SetOp) string {
 	if setOpRendersAsAppend(p) {
+		// M0145-0004a: PG's prefix is the generic parallel_aware rule
+		// (explain.c:1630), the same one the *SeqScan and *Join arms
+		// already honour — a partial PathSetOp under a Gather is a
+		// "Parallel Append", and the flag rides the node because the
+		// plan-parity walk parses the label.
+		if p.ParallelAware {
+			return "Parallel Append"
+		}
 		return "Append"
 	}
 	return "HashSetOp " + setOpCommandName(p)

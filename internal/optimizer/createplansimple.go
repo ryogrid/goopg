@@ -462,6 +462,11 @@ func createSetOpPlan(p *Path) (Node, outputLayout) {
 	// arm's marks into plans that never made the pick.
 	out.LeftNonPartial = p.SetOpLeftNonPartial
 	out.RightNonPartial = p.SetOpRightNonPartial
+	// M0145-0004a: the path's parallel_aware bit travels onto the node —
+	// PG's explain.c:1630 prints "Parallel Append" for a parallel-aware
+	// Append, and the label is what the plan-parity walk reads. Only a
+	// partial PathSetOp carries it; the serial path leaves it false.
+	out.ParallelAware = p.ParallelAware
 	return &out, baseRelLayout(p.Rel, &out)
 }
 
