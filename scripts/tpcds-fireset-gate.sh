@@ -10,7 +10,10 @@
 # Usage: scripts/tpcds-fireset-gate.sh <label> <outdir>
 #
 # Defaults cover the task requirement: CORPORA="tpcds-sf025 tpcds-sf1",
-# BASELINE_JOINTREE=0, CANDIDATE_JOINTREE=1. Either arm may source a local
+# BASELINE_JOINTREE=0, CANDIDATE_JOINTREE=1. `tpch` is a supported corpus
+# (M0145-0021b) but deliberately NOT a default — its fires execute at SF1
+# through tpch-acceptance-arm.sh, so it is opt-in:
+# `CORPORA="tpcds-sf025 tpcds-sf1 tpch" scripts/tpcds-fireset-gate.sh …`. Either arm may source a local
 # shell-assignment file through BASELINE_ENV_FILE or CANDIDATE_ENV_FILE before
 # launching its clone; that makes the template usable for firewall, estimation,
 # and cost-model experiments without exporting a candidate-only setting into
@@ -84,7 +87,12 @@ PY
 }
 
 for corpus in ${CORPORA}; do
-    case "${corpus}" in tpcds-sf025|tpcds-sf1) ;; *) echo "FATAL: unsupported corpus: ${corpus}" >&2; exit 2 ;; esac
+    # tpch (M0145-0021b): the derivation half needs nothing new — the TPC-H
+    # capture writes the same `=== Qn` blocks tpcds-plan-diff.py already
+    # parses — and the execution half is routed to the acceptance arm inside
+    # jointree-parity-capture.sh. It is NOT in CORPORA's default: the TPC-H
+    # lane's fires execute at SF1 against the shared load, so it is opt-in.
+    case "${corpus}" in tpcds-sf025|tpcds-sf1|tpch) ;; *) echo "FATAL: unsupported corpus: ${corpus}" >&2; exit 2 ;; esac
     corpus_dir="${OUTDIR}/${corpus}"
     mkdir -p "${corpus_dir}"
     baseline_label="${LABEL}-${corpus}-baseline"

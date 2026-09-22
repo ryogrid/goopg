@@ -54,7 +54,15 @@ import sys
 # changed when only the temp filename inside their parse errors differed).
 # `no_blocks_is_fatal` below is the other half: a capture that parses to
 # nothing is a broken capture, never a clean result.
-BLOCK_RE = re.compile(r"^={3,5}\s*Q(\d+)\s*(?:={3,5}\s*)?$")
+# The TPC-H capture writes SUB-LABELLED blocks — `=== Q15a-VIEWBODY` beside
+# `=== Q15b-MAIN` — and a pattern that stopped at the digits did not match
+# them at all, so their bodies were silently appended to the PRECEDING
+# query's block: measured 2026-09-22 on a TPC-H capture, Q15 vanished and
+# Q14 carried Q15a's plan. Sub-blocks now fold onto their numeric id (the
+# id space the fire-set gate needs), separated by a marker line so a
+# reordering or a renamed sub-block is still a difference. TPC-DS captures
+# have no sub-labels, so nothing there changes.
+BLOCK_RE = re.compile(r"^={3,5}\s*Q(\d+)([A-Za-z][\w-]*)?\s*(?:={3,5}\s*)?$")
 # psql prints the provenance the harness stamped; keep it out of the comparison
 # so two captures of the same code never differ on their own timestamps.
 PROVENANCE_RE = re.compile(r"^#")
@@ -85,7 +93,11 @@ def parse(path):
             m = BLOCK_RE.match(line)
             if m:
                 cur = int(m.group(1))
-                blocks[cur] = []
+                sub = m.group(2)
+                if cur not in blocks:
+                    blocks[cur] = []
+                if sub:
+                    blocks[cur].append("-- block Q%d%s" % (cur, sub))
                 continue
             if cur is None:
                 if PROVENANCE_RE.match(line):

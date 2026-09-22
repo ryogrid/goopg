@@ -106,6 +106,16 @@ export GOOPG_MEM_SWAP_MAX="${GOOPG_MEM_SWAP_MAX:-0}"
 export GOOPG_PGSHAPED_DP="${PGSHAPED:-0}"
 export GOOPG_PGSHAPED_DP_TRACE="${DP_TRACE:-0}"
 export GOOPG_JOINTREE_PIPELINE="${JOINTREE:-0}"
+# M0145-0021b: pin the reservoir sample, same default and same reason as
+# tpch-acceptance-arm.sh. goopg's statistics are per-connection and ANALYZE is
+# sampled, so an UNPINNED arm plans against a different sample every run. This
+# lane is the canonical TPC-H plan-parity capture (M0144-0001), and its A/A
+# noise was measured on 2026-09-22 before this line existed: two back-to-back
+# captures of the SAME binary and SAME arm differed on 20 of 21 queries by
+# cost/rows, and Q3 flipped SHAPE outright (GroupAggregate over Gather Merge ->
+# HashAggregate over Gather). Unpinned, this lane cannot answer "did my change
+# move a plan?" at all, and a fire set derived from its A/B is the whole corpus.
+export GOOPG_ANALYZE_SEED="${GOOPG_ANALYZE_SEED:-20260905}"
 
 if pg_isready -h "${PG_HOST}" -p "${PG_PORT}" -q 2>/dev/null; then
     echo "something is already listening on ${PG_HOST}:${PG_PORT} (this arm's private port) — stop it first (${GOOPG_BIN} stop -D ${PGDATA})" >&2

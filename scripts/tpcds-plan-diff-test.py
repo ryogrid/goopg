@@ -144,6 +144,43 @@ class CaptureFormatTest(unittest.TestCase):
             out = run(o, n)
         self.assertIn("queries=1", out)
 
+    def test_sub_labelled_block_is_its_own_query_not_its_neighbours(self):
+        """M0145-0021b: the TPC-H capture writes `=== Q15a-VIEWBODY` and NO
+        plain `=== Q15` block at all.
+
+        Before the fold that header matched nothing, so `cur` stayed on the
+        PRECEDING query and Q15a's plan was appended to Q14's block — measured
+        on a real capture: 21 ids compared instead of 22, Q15 absent, Q14
+        carrying a plan that is not Q14's. Both assertions are that failure.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            def capture(name, q15a):
+                path = os.path.join(tmp, name)
+                with open(path, "w", encoding="utf-8") as fh:
+                    fh.write("# goopg: deadbeef test capture\n")
+                    fh.write("=== Q14\n  ->  Hash Join  (cost=1..2 rows=3 width=4)\n")
+                    fh.write("=== Q15a-VIEWBODY\n" + q15a + "\n")
+                return path
+            body = "  ->  Seq Scan on lineitem  (cost=1..2 rows=3 width=4)"
+            out = run(capture("old.txt", body), capture("new.txt", body))
+        self.assertIn("queries=2", out)     # Q14 AND Q15, not one merged block
+        self.assertIn("changed=0", out)
+
+    def test_a_sub_block_change_is_attributed_to_its_own_id(self):
+        # Folding must not swallow the sub-block's content, and must not
+        # misattribute it: the change below is Q15's, never Q14's.
+        with tempfile.TemporaryDirectory() as tmp:
+            def capture(name, q15a):
+                path = os.path.join(tmp, name)
+                with open(path, "w", encoding="utf-8") as fh:
+                    fh.write("# goopg: deadbeef test capture\n")
+                    fh.write("=== Q14\n  ->  Hash Join  (cost=1..2 rows=3 width=4)\n")
+                    fh.write("=== Q15a-VIEWBODY\n" + q15a + "\n")
+                return path
+            out = run(capture("old.txt", "  ->  Seq Scan on lineitem  (cost=1..2 rows=3 width=4)"),
+                      capture("new.txt", "  ->  Index Scan on lineitem  (cost=1..2 rows=3 width=4)"))
+        self.assertIn("changed (1): Q15", out)
+
     def test_zero_block_capture_is_fatal_not_a_clean_result(self):
         # The safety property: a capture the tool cannot parse must never read
         # as "no differences".

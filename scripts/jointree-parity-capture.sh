@@ -35,11 +35,20 @@
 #              arm has its own NO_BUILD).
 #   PORT       private-lane port for the TPC-DS lane (default: first free
 #              port in 5590-5599). Never a 6543x port.
-#   FIRESET_QUERIES  optional comma-separated TPC-DS query ids to execute on
-#              the private goopg clone after its EXPLAIN capture. Requires
-#              FIRESET_STATUS_OUT; writes one `Q<n> PASS|TIMEOUT|ERROR`
-#              record per id and keeps each raw result beside the captures.
-#              A timeout restarts only this clone before the next query.
+#   FIRESET_QUERIES  optional comma-separated query ids to execute after the
+#              EXPLAIN capture. Requires FIRESET_STATUS_OUT; writes one
+#              `Q<n> PASS|TIMEOUT|ERROR` record per id and keeps each raw
+#              result beside the captures. On the TPC-DS lanes each id runs as
+#              `query<n>.sql` through psql on the private clone and a timeout
+#              restarts that clone before the next query. On the TPC-H lane
+#              (M0145-0021b) there are no .sql files — the bank lives in
+#              `cmd/tpch-runner` — so the ids run through
+#              `tpch-acceptance-arm.sh QUERIES=…` on ITS private clone and
+#              `tpch-fireset-parse.py` maps the arm's per-query lines onto the
+#              same three-status vocabulary.
+#   TPCH_FIRESET_PGSHAPED  GOOPG_PGSHAPED_DP for the TPC-H fire-set arm
+#              (default 1 — the shipped planner, NOT tpch-acceptance-arm.sh's
+#              own 0 default).
 #   FIRESET_STATUS_OUT  destination for FIRESET_QUERIES status records. The
 #              caller owns truncation so several isolated arms can append.
 #   FIRESET_TIMEOUT  per-query execution timeout in seconds (default 600).
@@ -107,6 +116,19 @@ finish() {
 
 # ---------------------------------------------------------------- tpch ---
 if [[ "${CORPUS}" == "tpch" ]]; then
+    fireset_requested=0
+    if [[ -n "${FIRESET_QUERIES:-}" || -n "${FIRESET_STATUS_OUT:-}" ]]; then
+        [[ -n "${FIRESET_QUERIES:-}" && -n "${FIRESET_STATUS_OUT:-}" ]] || {
+            echo "FATAL: FIRESET_QUERIES and FIRESET_STATUS_OUT must be set together" >&2
+            exit 2
+        }
+        fireset_requested=1
+    fi
+    if [[ "${FIRESET_SKIP_CAPTURE:-0}" == "1" && "${fireset_requested}" != 1 ]]; then
+        echo "FATAL: FIRESET_SKIP_CAPTURE requires FIRESET_QUERIES" >&2
+        exit 2
+    fi
+  if [[ "${FIRESET_SKIP_CAPTURE:-0}" != "1" ]]; then
     # REFERENCE= empty: the §4 ratchet's committed baseline is absent from
     # this checkout and a plan-only run cannot consume it anyway — the
     # recipe captures its own PG arm below instead.
@@ -120,6 +142,40 @@ if [[ "${CORPUS}" == "tpch" ]]; then
     # EXPLAIN reader.
     "${AUDIT_BIN}" -plan-only -serial=false -warm-stats=false \
         -port 65432 --label "${LABEL}-pg" -out "${OUTDIR}" || exit $?
+  fi
+
+    # M0145-0021b: the TPC-H fire set is EXECUTED through the acceptance arm,
+    # not through psql. TPC-H has no query .sql files in the tree — its bank
+    # lives in `cmd/tpch-runner` — and the arm already owns the private clone,
+    # the capped server and the per-query budget this needs.
+    if [[ "${fireset_requested}" == 1 ]]; then
+        mkdir -p "$(dirname "${FIRESET_STATUS_OUT}")" || exit 2
+        arm_out="${OUTDIR}/${LABEL}-fireset-arm.txt"
+        # PGSHAPED defaults to 1 here, NOT to the arm script's own 0: that
+        # default is not the planner configuration goopg ships, and measuring
+        # a non-shipped planner is how TPC-H Q9 produced a false red gate for
+        # three loops (m0145-0020a-grouped-output-cardinality.md).
+        #
+        # GATE_STAMP_DIR is redirected so this subset run cannot overwrite the
+        # real tmp/gate-stamps/tpch-acceptance-arm.json — a QUERIES subset
+        # always stamps NO-COMPARE, and a fire-set execution must never
+        # destroy (or fabricate) a gate verdict.
+        PGSHAPED="${TPCH_FIRESET_PGSHAPED:-1}" \
+        QUERIES="${FIRESET_QUERIES}" \
+        PER_Q="${FIRESET_TIMEOUT:-600}" \
+        GATE_STAMP_DIR="${OUTDIR}/gate-stamps" \
+            "${SCRIPT_DIR}/tpch-acceptance-arm.sh" "${LABEL}-fireset" "${arm_out}" || {
+            echo "FATAL: tpch fire-set arm failed (see ${arm_out})" >&2
+            exit 1
+        }
+        python3 "${SCRIPT_DIR}/tpch-fireset-parse.py" "${arm_out}" "${FIRESET_QUERIES}" \
+            >>"${FIRESET_STATUS_OUT}" || exit 2
+        while read -r qid status; do
+            echo "# fireset ${LABEL} ${qid} ${status} (arm ${arm_out})"
+        done < <(python3 "${SCRIPT_DIR}/tpch-fireset-parse.py" "${arm_out}" "${FIRESET_QUERIES}")
+    fi
+
+    [[ "${FIRESET_SKIP_CAPTURE:-0}" == "1" ]] && exit 0
     finish
     exit $?
 fi

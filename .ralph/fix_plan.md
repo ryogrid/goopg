@@ -155,6 +155,27 @@ first, fix with normal gates, cite the AI-id, tick it.
   deferred | resume point | why`) **and** an unchecked task that owns the
   deferred part; the item stays unchecked. The ledger is the source of truth for
   every "DEFERRED" note below.
+- **DATA LOSS 2026\-09\-22 \(loop \#6\), recorded so the next loop does not
+  trust absent state.** A scripted edit in this loop truncated
+  `.ralph/fix_plan.md` to zero bytes \(the Python `open\(path,'w'\)` ran before
+  the assertion that aborted the edit\). The file was restored from the
+  committed HEAD copy plus that loop's own edits, so **every UNCOMMITTED
+  fix\-plan edit made by loops before it is gone**. What the pre\-truncation
+  copy carried, from this loop's own reading of it:
+  - 16 `testport/TestPort_*` nightly rows flipped `[ ]` -> `[x]` as "stale
+    nightly failure, repro PASSes at HEAD" — regenerate by re\-running each
+    `AI-` id's repro, not by trusting this note.
+  - `testport/TestPort_PgoutputInterop*` \(subscriber/publisher\-start\),
+    `M0119-0006`, "schemas are registered process\-wide" and the template1
+    rows flipped to `[!]` with blocker text.
+  - `M0140-0007` and `M0141-S7` flipped to `[!]` \(their escalations survive
+    in their design docs, which were NOT lost\).
+  - `M0122-0008`/`-0009`/`-0013` and two ACL rows flipped to `[x]` — note that
+    their code is still UNCOMMITTED working\-tree WIP, so those marks were
+    ahead of the tree either way.
+  Nothing committed was lost; the deferral ledger and every design doc are
+  intact. Any fix\-plan edit worth keeping should be committed in the loop that
+  makes it.
 - Completed milestones are archived under `completed_milestones/` (latest:
   `completed_fix_plan_012.md`); reference-only, not actionable.
 
@@ -16334,7 +16355,7 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
     the loop to stamp its own verdict.
   - Ledger row: `.ralph/deferral_ledger.md`, 2026-09-22, M0145-0021, gap \(a\).
 
-- [ ] **M0145-0021b — extend the fire-set gate to the TPC-H corpus**.
+- [x] **M0145-0021b — extend the fire-set gate to the TPC-H corpus**.
   Kind: impl
   Parent: M0145-0021
   `scripts/jointree-parity-capture.sh`'s `tpch` branch returns BEFORE the
@@ -16348,6 +16369,53 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
   - Out of M0145-0021's stated scope \(its fire set is re-derived from the
     TPC-DS seam census\); the TPC-H arm has its own clone lifecycle.
   - Ledger row: `.ralph/deferral_ledger.md`, 2026-09-22, M0145-0021, gap \(b\).
+  - **LANDED 2026\-09\-22 \(loop \#6\).** Movement: none — harness.
+    Design: `docs/design/0100-0149/m0145-0021b-tpch-fireset-lane.md`.
+    - **The corpus extension is the SMALLER half of what this found.** A gate
+      that derives its fire set from a plan A/B needs a zero noise floor, so
+      the A/A was measured first: two back\-to\-back captures, same binary,
+      same arm, nothing changed between them, reported
+      `queries=21 same=1 changed=20`. 20 queries differed in cost/rows only;
+      **Q3 flipped SHAPE** \(`GroupAggregate`/`Gather Merge` ->
+      `HashAggregate`/`Gather`\), and the CATEGORIES counts moved with it
+      \(`aggregation-strategy` 6 vs 5, `sort-strategy` 10 vs 9\).
+    - Cause: `scripts/tpch-estimate-audit-arm.sh` never exported
+      `GOOPG_ANALYZE_SEED`. `tpch-acceptance-arm.sh` pins it and its header
+      states the reason \(per\-connection sampled statistics; measured A/A
+      noise LARGER than most A/B signals\); the TPC\-DS lanes get theirs from
+      `env_tpcds.sh`. Only the TPC\-H **plan\-parity** lane — the canonical
+      M0144\-0001 arm — was unpinned. One export fixes it; the A/A re\-run is
+      `queries=22 same=22 changed=0`.
+    - **Consequence to carry**: every TPC\-H `CATEGORIES-EXCL-MATCH`
+      comparison taken on that lane before this commit carried the noise, so a
+      ±1 category delta there was not necessarily a signal. Captures from
+      before and after the pin are not comparable — re\-take a baseline rather
+      than diffing across it.
+    - Second defect fixed: `tpcds-plan-diff.py`'s block regex stopped at the
+      digits, so the TPC\-H capture's `=== Q15a-VIEWBODY` header matched
+      nothing and its plan was appended to **Q14's** block — Q15 absent from
+      every comparison, Q14 compared against a body that is not Q14's. Sub
+      \-labelled blocks now fold onto their numeric id with a marker line, so
+      a renamed or reordered sub\-block is still a difference
+      \(`queries=21` -> `22`\). TPC\-DS has no sub\-labels: unchanged there.
+    - The extension: TPC\-H has no query `.sql` files \(the bank is
+      `cmd/tpch-runner`\), so the ids execute through
+      `tpch-acceptance-arm.sh QUERIES=…` and `scripts/tpch-fireset-parse.py`
+      maps its per\-query lines onto `PASS|TIMEOUT|ERROR`. SQLSTATE **57014**
+      is the timeout class — calling it `ERROR` would hide exactly what the
+      gate watches for, and calling every ERROR a timeout would invent them.
+    - Two deliberate defaults: `PGSHAPED=1` \(the shipped planner, not the arm
+      script's own `0` — the false\-red trap\), and `GATE_STAMP_DIR` redirected
+      into the run's own directory so a subset run's `NO-COMPARE` can never
+      overwrite the real acceptance\-arm verdict \(verified byte\-identical
+      across a run\).
+    - `tpch` is supported but NOT a `CORPORA` default: its fires execute at
+      SF1, so it is opt\-in.
+    - Tests: `tpch-fireset-parse.py --self-test` 5/5; `tpcds-plan-diff-test.py`
+      12 cases \(2 new\). Non\-vacuity checked — neutralising the sub\-label
+      match fails exactly those two and leaves the other ten green. Real\-run
+      evidence: `Q12 PASS` at `GOOPG_PGSHAPED_DP=1`, and `Q12 TIMEOUT` from a
+      genuine 57014 cancellation at `FIRESET_TIMEOUT=1`.
 
 - [x] **M0145-0022 — harness: plan-shape election + wall-clock
   regression channel on the SF0.25 sweep** (owner GO 2026-09-22;
