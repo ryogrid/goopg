@@ -2874,6 +2874,94 @@ the whole file's active task between 2026-09-01 and 2026-09-14; **since
       Q12=2/Q13=33; tpcds\-sf025 `PASS=96 MISMATCH=0 CKMISMATCH=0 ERROR=0
       TIMEOUT=0`; acceptance arm 24 MATCH; pgbench smoke.
 - [ ] **M0122-0015 — Test-suite porting: amcheck / verify_heapam / pg_dump**.
+  - [!] **BLOCKED — OWNER ACTION NEEDED \(2026\-09\-22, loop \#17\)**. The
+    foreign\-table durability work below is complete, fully gated and
+    **staged**, but `git commit` cannot land it: the `commit-msg` hook exits
+    **1 with no message** for any commit that stages a non\-test `.go` file
+    OUTSIDE the fire\-set scope.
+    - Cause \(traced with `bash -x .githooks/commit-msg`\): the hook runs under
+      `set -euo pipefail`, and its fire\-set arm is
+      `printf … | scripts/fireset-scope.sh --stdin >/dev/null 2>&1` followed by
+      `fireset_rc=$?`. `fireset-scope.sh` returns **1** for "out of scope" —
+      the COMMON case — so `set -e` ends the hook at that line and
+      `fireset_rc` is never read; the `case` arms below it are unreachable for
+      rc 1.
+    - Why it surfaced only now: M0145\-0021a \(`1181baf79`\) added the arm this
+      week, and every commit since has been either docs\-only \(`gated_go=0`\)
+      or under `internal/optimizer` \(rc 0\). This commit —
+      `internal/executor` + `internal/initdb` — is the first to take the rc\-1
+      path.
+    - Suggested one\-line repair, semantics preserved \(the fail\-closed rc>=2
+      arm untouched\): initialise `fireset_rc=0` and append `|| fireset_rc=$?`
+      to the pipeline.
+    - **The loop did not apply it**: `.githooks/` is harness surface and the
+      edit was correctly refused for an agent editing its own gate. Escalated
+      per the "if a gate cannot run, mark `[!]` and escalate" rule. Re\-checked
+      loop \#18 — the arm is still unrepaired, and the guard names the file
+      owner\-only explicitly \(`H4 … harness mechanism file … owner-only`\), so
+      the loop will keep escalating rather than retrying.
+    - Standalone reproduction \(loop \#18, touches no harness file\):
+      `set -euo pipefail` \+ a function returning 1 in place of
+      `fireset-scope.sh`, then `rc=$?` — prints the line BEFORE the pipeline
+      and exits 1 without ever reaching the `rc=$?` read. Confirms the abort
+      is `set -e` on the pipeline, not anything inside `fireset-scope.sh`
+      \(which behaves correctly: rc 1 = out of scope\).
+    - **Blast radius is repo\-wide, not loop\-specific**: the arm runs before
+      the `RALPH_LOOP` gate, so this blocks the OWNER's commits too, for any
+      commit staging a non\-test `.go` file outside
+      `internal/optimizer|planner` and `*cost*|*stat*|*selfuncs*` — i.e. all
+      ordinary `internal/executor`, `internal/initdb`, `internal/catalog`,
+      `internal/storage` work. Only docs\-only, test\-only and fire\-set\-scope
+      commits can land today.
+    - **Second\-order effect worth knowing before the repair lands**: gate
+      stamps hash the STAGED tree, so while this deliverable sits in the
+      index no OTHER task can be gated \(its stamp would cover these files
+      too, or the tree/index mismatch would stamp FAIL\). The loop therefore
+      cannot simply "work something else" without either unstaging this work
+      or riding it into an unrelated commit — both worse than waiting.
+    - State left for the owner: the eleven files are **staged** and the commit
+      message is at `/tmp/ftmsg.txt`; `git commit -F /tmp/ftmsg.txt` lands it
+      once the hook is repaired. Every gate stamp is PASS against exactly this
+      staged tree.
+  - **Foreign\-table catalog durability FIXED 2026\-09\-22 \(loop \#17\)** —
+    the blocker the previous loop ledgered, which made `8deb60881`'s
+    no\-handler refusal unreachable on any restarted cluster. Movement: none
+    \(neither corpus has a foreign table\); design doc
+    `0122-0015-foreign-table-catalog-durability.md`.
+    - **The divergence**: after a clean stop/start, `pg_foreign_table` was
+      empty, `pg_class.relkind` had degraded `'f'` -> `'r'`, and
+      `SELECT * FROM t0` returned **zero rows** where PG 18.3 raises 55000.
+      The servers survived \(B3.4 gave them a heap row\); the table's
+      association with them did not.
+    - Three causes: `buildUserPGClassRow` had no `'f'` arm \(the persisted row
+      disagreed with the VIRTUAL pg\_class renderer, which always derived
+      `'f'` from `ForeignServerName`\); the reload filter accepted only
+      `{r,m,v,S}`; and `pg_foreign_table` was rendered purely virtually from a
+      field with **no heap representation at all**.
+    - Fix: a real `pg_foreign_table` \(3118\) heap row + 3119 index entry
+      written through the single `syncTableToCatalogHeap` funnel, stamped on
+      DROP/re\-sync via `deleteCatalogRowsForOID`, and reloaded LAST in
+      `reloadForeignDataFromHeap` — after the servers whose OID it reverses
+      and after the user tables it re\-attaches to. Both orderings are
+      load\-bearing.
+    - `TestEverySysBtreeInsertPathIndexHasSplitKeyMeta` caught the missing
+      `keyMetaForSysBtree` entry for 3119, which would have worked until the
+      leaf\-root filled and then failed the split. That guard did its job.
+    - `TestPort_PgDump003ForeignDataNoHandler` now RESTARTS between the DDL
+      and the dumps — upstream does not, but without it the test passed while
+      the only state a real cluster ever has was broken. Non\-vacuity checked:
+      removing the `'f'` reload arm fails exactly the new assertion.
+    - **Ledgered, not fixed**: the four foreign\-data catalogs are still
+      pinned to `DefaultDBOid` \(inherited B3.4 scope; `pg_foreign_table` is
+      the first keyed by a per\-database relation OID, so the mismatch is now
+      observable\), and `CREATE FOREIGN TABLE` still returns the tag
+      `CREATE TABLE`.
+    - Gates: initdb + catalog + executor units; both 003 ports; full
+      `TestPort_RegressSuite` with an unchanged failing set \(only
+      `partition_aggregate`\); tpch\-spotcheck Q12=2/Q13=33; tpcds\-sf025
+      `PASS=96 … TIMEOUT=0`, `PLAN-SHAPE same=99 changed=0`; pgbench smoke.
+      No optimizer/planner file staged, so G9 fire\-set and the acceptance arm
+      do not apply.
   - **`003_pg_dump_with_server.pl` is now FULLY ported 2026\-09\-22 \(loop
     \#16\)**, and the second half needed a production fix first: `8deb60881`.
     Movement: none — a refusal on a relkind neither corpus contains.

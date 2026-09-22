@@ -1,23 +1,58 @@
-(idle — nothing in flight)
+# Working set — loop #18 (2026-09-22)
 
-M0145-0021 is COMPLETE and committed: the two-scale fire-set gate template
-is green at SF0.25 and SF1 (same derived 24-id fire set, all PASS in both
-arms, `introduced=none unchanged=none missing=none`, exit 0).
+## BLOCKED on an owner-only harness repair — do not re-litigate, do not retry
 
-Carry-forward for whoever runs this harness next:
-- `FIRESET_BATCH_SIZE=1` is a trap. The execution arm starts its private
-  clone server ONCE per invocation and then walks every id in
-  `FIRESET_QUERIES`, so batch 8 pays one clone+start for eight queries.
-  Loops #92-#99 used batch 1 and advanced one id per loop; batch 8/9
-  finished both remaining halves in minutes.
-- SF1 is cheap: both arms' plan A/B (two 3.3GB offline clones + the PG
-  reference arm, 99 EXPLAINs each) took 89 s; the 24 fires ran in three
-  batches of 1m59s-3m59s.
-- The SF1 source `bench/tpcds/runtime_goopg/data` must be DOWN (no
-  postmaster.pid) or the clone step exits 3.
-- Follow-ups filed: M0145-0021a (enforcement — needs an owner scope call)
-  and M0145-0021b (TPC-H corpus; the tpch branch returns before the
-  FIRESET block).
+`Task:` M0122-0015 foreign-table catalog durability — **complete, fully gated,
+STAGED, not committable**.
 
-Next loop: re-read the `## Current Priority` banner and select from item 3's
-M0145 chain (0009 → 0019 → 0020 sequence per the 2026-09-22 owner GO).
+`In-flight:` none (no gate abandoned; nothing running).
+
+## The blocker (unchanged, re-verified loop #18)
+
+`.githooks/commit-msg` runs under `set -euo pipefail`; its fire-set arm pipes
+into `scripts/fireset-scope.sh` and then reads `fireset_rc=$?`. The script
+returns **1** for "out of scope" — the common case — so `set -e` ends the hook
+at that line and the commit fails with **exit 1 and no message**. Repair is one
+line (`fireset_rc=0` + `|| fireset_rc=$?`); the `case` arms below it already
+handle rc 0 and rc >= 2 correctly.
+
+The loop MUST NOT apply it: the RALPH_LOOP H4 guard names `.githooks/` an
+owner-only harness mechanism file and prescribes escalation. Two attempts were
+refused (correctly). Probing the CI surface further is also refused — stop.
+
+Blast radius is repo-wide: the arm runs before the `RALPH_LOOP` check, so any
+committer's commit staging a non-test `.go` file outside
+`internal/optimizer|planner` / `*cost*|*stat*|*selfuncs*` is unlandable.
+
+## What is staged (the deliverable — do NOT `git add -A`, stash, or reset)
+
+`internal/executor/{sys_pg_foreign,pg18_user_catalog_rows,operators_ddl,sys_catalog_btree_split}.go`,
+`internal/initdb/{catalog_heap_reload,open}.go`,
+`internal/testport/pgdump003_with_server_test.go`,
+`docs/design/0100-0149/0122-0015-foreign-table-catalog-durability.md`,
+`docs/design/README.md`, `.ralph/deferral_ledger.md`, `.ralph/fix_plan.md`.
+
+Message: `/tmp/ftmsg.txt`. After the owner repairs the hook:
+`git commit -F /tmp/ftmsg.txt -- <the paths above>` — **do not re-run the
+gates**, every stamp is PASS against exactly this staged tree (initdb/catalog/
+executor units; both 003 ports; full RegressSuite, failing set unchanged;
+tpch-spotcheck Q12=2/Q13=33; sf025 PASS=96, PLAN-SHAPE same=99 changed=0;
+pgbench smoke).
+
+## Why no other task was started
+
+Gate stamps hash the **staged** tree. While this deliverable sits in the index,
+any other task's gates either cover these files or stamp FAIL on a tree/index
+mismatch. Unstaging to work around that risks the only copy of a verified
+loop's work. Waiting is the correct move.
+
+## Next task once this lands
+
+Banner item 10 → M0122-0015 continues with `010_dump_connstr.pl` (309 lines).
+Ledger-open: the four foreign-data catalogs are still pinned to `DefaultDBOid`;
+`CREATE FOREIGN TABLE` still returns the tag `CREATE TABLE`.
+
+## Nightly triage
+
+All 16 `AI-20260922-004850-*` items in `ci/logs/action-items.md` are filed in
+fix_plan. Nothing unfiled (re-checked loop #18).
