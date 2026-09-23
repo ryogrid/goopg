@@ -1271,6 +1271,13 @@ func boolToPGChar(b bool) string {
 	return "f"
 }
 
+// TableHasToastRelation is tableHasToastRelation for callers outside the
+// package: whether t owns a TOAST relation (and so a TOAST index) — the same
+// set the pg_class and pg_index builders expose.
+func TableHasToastRelation(t *Table) bool {
+	return t != nil && tableHasToastRelation(t)
+}
+
 func tableHasToastRelation(t *Table) bool {
 	if len(t.ToastReloptions) > 0 {
 		return true
