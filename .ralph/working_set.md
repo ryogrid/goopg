@@ -2,30 +2,30 @@ Task: M0145-0030 — group B: adjudicate the behavioural flip-triage tests
 (+ knob-default script audit). Design doc
 docs/design/0100-0149/m0145-0030-group-b-adjudication.md (disposition table).
 
-Done: fix 1 (alias collision) — assignPulledSourceOffsets in
-internal/optimizer/jointreepullup.go; test jointreepullup_srcidx_test.go.
+Done: fix 1 `903780b3e` (alias collision); fix 2 `564dc1c8e`
+(searchRelIndexPathCost — index-ordered grouping priced from the search
+rel's cost_index path); stale pins updated (nested scalar pair,
+RowsRemovedByJoinFilter); script audit listed in the design doc.
 
-Still failing under a local flip (jointreepipeline.go:27 `v == "1"` →
-`v != "0"`, REVERT before commit):
-- optimizer TestCreateGroupingPathsGucOnPkFdStaysHash: Strategy=1 (sorted),
-  want Hashed — check against PG 18.3 which strategy it picks on that shape.
-- optimizer TestPlannerSettingsReachScalarSubqueryJoin/cpu_tuple_cost/nested
-  and TestScalarSubqueryPropagationKeepsDefaultPlan/nested: "2 costed inner
-  plans, want 1" — likely the jointree arm plans the nested scalar subquery
-  differently (PG-faithful or not? check EXPLAIN vs PG).
-- executor TestExplainAnalyzeRowsRemovedByJoinFilter: confirm stale vs PG.
-Script audit: scripts/tpcds-sf025-regression.sh:310,
-scripts/tpch-estimate-audit-arm.sh:108 (knob default 0), sweep :842 → list
-for the flip commit; do not change defaults now.
+CORRECTION: loop #21's "6 of 11 pass" was false. These 5 still FAIL under the
+flip (verified at HEAD and at d9b962326, i.e. not caused by fix 1):
+- executor TestNLISemiResidualExecution / TestNLIAntiResidualExecution:
+  Hash Semi Join elected, test expects NLI semi (nli_semi_residual_exec_test.go:114);
+- executor TestParallelNLIJointypeIdentity/semi;
+- executor TestHashedInProbeActuallyFires (hashed-IN SubPlan not built, nil kvcache);
+- executor TestRunFastJoinConcrete (undiagnosed).
+Reproduce: GOOPG_JOINTREE_PIPELINE=1 go test -count=1 -run '<name>' ./internal/executor/
+(the env var is equivalent to the local code flip; no source edit needed).
+For each: run the same query on PG 18.3 (throwaway PG on 5534:
+tmp/m0145-0030-pgscratch, `pg_ctl -D ... stop` when done) → decide stale pin
+vs real defect.
 
-Disk: the fire-set gate leaves ~14G of tmp/<label>-*-data-* clones per run;
-this loop freed ~150G by deleting loop-owned tmp/m0145-00*-data* clones
-(ENOSPC mid-gate). Delete your own gate clones after each run.
+Next step: TestNLISemiResidualExecution — read the fixture, EXPLAIN the query on
+PG 18.3 (tiny no-stats tables: PG may well pick Hash Semi Join too → stale).
 
-Next step: TestCreateGroupingPathsGucOnPkFdStaysHash — read it, reproduce on
-PG 18.3, decide PG-faithful vs defect.
-
-Gates run: units, tpch-spotcheck (Q12=2 Q13=33), tpcds-sf025 (PASS=96,
-same=99), acceptance arm (identical), tpcds-fireset (25 fires; plans
-identical modulo qualifiers) — PASS.
-In-flight: none.
+Gates run (for 564dc1c8e): units PASS; tpch-spotcheck PASS (Q12=2 Q13=33);
+tpcds-sf025 PASS=96 same=99; acceptance arm PASS (24 MATCH vs
+tmp/arm-on-20260922-loop77.txt, PGSHAPED=1); tpcds-fireset PASS; knob-arm
+sf025 plan shapes unchanged 99/99. Own fireset clones deleted.
+In-flight: none. Throwaway PG 18.3 still running on 127.0.0.1:5534
+(data tmp/m0145-0030-pgscratch) — reuse it or stop it.

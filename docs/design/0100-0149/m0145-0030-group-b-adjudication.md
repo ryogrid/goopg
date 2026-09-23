@@ -16,20 +16,32 @@ No flip happens until each test is dispositioned.
 
 ## Baseline after M0145-0029 (2026-09-23)
 
-6 of the triage's 11 now pass under the flip as a side effect of M0145-0029:
-- `TestNLISemiResidualExecution`, `TestNLIAntiResidualExecution`;
+Loop #21 recorded that 6 of the triage's 11 passed under the flip as a side
+effect of M0145-0029. **That was wrong.** Loop #23 re-ran them under the
+exact local code flip, both at HEAD and in a worktree at `d9b962326`
+(before fix 1). All 5 executor tests fail at both points, so fix 1 did not
+cause this:
+- `TestNLISemiResidualExecution`, `TestNLIAntiResidualExecution`: Hash Semi
+  Join is elected where the test expects the NLI semi path;
 - `TestParallelNLIJointypeIdentity/semi`;
 - `TestHashedInProbeActuallyFires`;
 - `TestRunFastJoinConcrete`.
+
+They are open again (table below). Group I's `TestSAOPWithConjunctMoves` and
+the executor index end-to-end tests also still fail under the flip. They
+belong to M0145-0029's residue, not to this task.
 
 ## Dispositions
 
 | test | finding | disposition |
 |---|---|---|
 | `TestExplainSelfCorrelatedExistsDoesNotAliasCollide` | real defect: `Hash Cond: (t1.a = t1.a)` on the jointree arm | **fixed** `903780b3e` (below) |
-| `TestCreateGroupingPathsGucOnPkFdStaysHash` | sorted instead of hashed | open |
-| `TestPlannerSettingsReachScalarSubqueryJoin/…/nested`, `TestScalarSubqueryPropagationKeepsDefaultPlan/nested` | 2 costed inner plans, want 1 | open |
-| `TestExplainAnalyzeRowsRemovedByJoinFilter` | triage: PG pushes the nullable-side ON qual down too | open (stale expectation to confirm) |
+| `TestCreateGroupingPathsGucOnPkFdStaysHash` | real defect: the index-ordered sorted variant was priced from its rule-era display cost | **fixed** (fix 2, below) |
+| `TestPlannerSettingsReachScalarSubqueryJoin/…/nested`, `TestScalarSubqueryPropagationKeepsDefaultPlan/nested` | PG-faithful: the middle subquery's single-rel scan is now costed (145 = PG's seq-scan cost); the innermost join is unchanged at 171.25..354.75 | **stale pin, updated**: nested arms read the innermost costed plan (`innermostCostedScalarInner`) |
+| `TestExplainAnalyzeRowsRemovedByJoinFilter` | PG-faithful: PG 18.3 puts the one-sided ON qual `b.val <> 'y'` in b's scan Filter | **stale expectation, updated**: the query uses the two-sided residual `a.id + b.id <> 4`, which PG prints as `Join Filter` / `Rows Removed by Join Filter: 1` |
+| `TestNLISemiResidualExecution`, `TestNLIAntiResidualExecution`, `TestParallelNLIJointypeIdentity/semi` | NLI semi/anti not elected (Hash Semi Join instead) | open |
+| `TestHashedInProbeActuallyFires` | the hashed-IN SubPlan is not built (nil kvcache) | open |
+| `TestRunFastJoinConcrete` | not yet diagnosed | open |
 
 ## Fix 1: pulled-up bodies get their own SourceTableIdx range (`903780b3e`)
 
@@ -47,12 +59,49 @@ the ancestor body's offset for a nested body's outer refs. Pinned by
 plans are identical apart from column qualifiers (for example, Q16 now prints
 `cs_order_number = cs2.cs_order_number`).
 
+## Fix 2: the index-ordered grouping variant is priced from the search rel
+
+On the jointree arm a single-table scope goes through the one-rel search.
+For `btg(x, y, z, w)` with `btg_x_y_idx(x, y)`, no stats, and
+`GROUP BY y, x`, the search rel holds a seq path at 1.01 and a full
+ordered index path at 16.14. The GROUP_AGG rel's index-driven sorted
+variant (`upper.groupagg.sortedidx`) did not use that path. It built its
+own IndexOnlyScan through `indexOrderedAggInput` and priced it with
+`legacyDisplayCostOf` at 0.01, so sorted cost 0.03 and beat hashed at 1.03.
+PG 18.3 on the same table elects `HashAggregate` over `Seq Scan`. PG takes
+the sorted input from `input_rel->pathlist` (`add_paths_to_grouping_rel`,
+planner.c:7128), so the input price is `cost_index`'s.
+
+`searchRelIndexPathCost` (groupingpaths.go) reaches the search rel with
+`searchedJoinInputRelOf(child)`. It finds the cheapest unparameterised
+`PathIndexScan` on the same index and prices the variant from it: sorted
+16.16, hashed 1.03, hashed wins. A legacy-arm child is not a join-search
+product, so the helper declines and the legacy arm is byte-identical.
+Pinned by `TestIndexOrderedGroupingPricedFromSearchRelJointree`, which
+fails without the fix. Knob-arm TPC-DS SF0.25 plan shapes are unchanged
+(99/99), so this shape does not fire in that corpus.
+
 ## Script audit (for the flip commit)
 
-Two gate scripts pin the legacy arm and must change together with the
-default:
-- `scripts/tpcds-sf025-regression.sh:310`;
-- `scripts/tpch-estimate-audit-arm.sh:108`.
-
-The sweep's `:842` knob pass must become `=0`. To be completed and listed
-here.
+Every harness site that selects the pipeline arm, as of loop #23. None of
+them may change before the flip. Each must change IN the M0145-0008 flip
+commit, or the pre-flip baselines silently switch arms:
+- `scripts/tpcds-sf025-regression.sh:310`:
+  `sf025_jointree_pipeline="${GOOPG_JOINTREE_PIPELINE:-0}"` → default `1`.
+- `scripts/tpcds-sf025-regression.sh:823-893`: the extra EXPLAIN-only
+  knob-arm pass (`GOOPG_JOINTREE_PIPELINE=1` at `:842`). After the flip it
+  duplicates the main capture. Invert it to `=0`, as a legacy-arm side
+  channel until the legacy code is deleted, or retire it.
+- `scripts/tpch-estimate-audit-arm.sh:35,108`: `JOINTREE` default `0` →
+  `1` (comment and code).
+- `scripts/tpcds-fireset-gate.sh:13,56-57`: `BASELINE_JOINTREE=0`,
+  `CANDIDATE_JOINTREE=1`. This is a same-binary arm comparison, which stops
+  meaning anything once the legacy arm is no longer shipped. The flip
+  commit has to decide what the gate compares afterwards (HEAD vs staged
+  on the new arm). Flagged, not decided here.
+- `scripts/jointree-parity-capture.sh:99`: default `1`, which is already
+  the post-flip arm. No change.
+- `scripts/planner-flags.env:49`: the label `unset(off)` is regenerated in
+  the flip commit (group K's `TestFlagProvenanceEnvIsGenerated`).
+- `scripts/tpch-acceptance-arm.sh`, `scripts/tpch-spotcheck.sh`, `ci/`,
+  `Makefile`: no knob reference, so they follow the default.

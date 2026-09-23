@@ -18459,6 +18459,27 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
     - Housekeeping: the fire\-set gate hit ENOSPC; 91 loop\-owned
       `tmp/m0145\-00\*\-data\*` clones were removed \(≈150G\). The gate
       leaves ~14G of clones per run.
+  - **Loop \#23 \(2026\-09\-23\): fix 2 plus two stale pins; the loop \#21
+    baseline is corrected.** Design doc §Fix 2 and §Script audit.
+    - Fix 2: `TestCreateGroupingPathsGucOnPkFdStaysHash` was a real defect.
+      The index\-ordered sorted variant was priced from its rule\-era display
+      cost \(0.01\), not the search rel\'s `cost_index` path \(16.14\).
+      `searchRelIndexPathCost` fixes the price, hashed wins as in PG 18.3,
+      and the legacy arm is byte\-identical. Pinned by
+      `TestIndexOrderedGroupingPricedFromSearchRelJointree`.
+    - Stale pins, PG\-evidenced and updated: the nested scalar pair \(the
+      middle scan is now costed at PG\'s 145; the innermost join is
+      unchanged\) and `TestExplainAnalyzeRowsRemovedByJoinFilter` \(PG
+      filters the one\-sided qual at the scan; now uses a two\-sided
+      residual\).
+    - **Correction:** loop \#21\'s "6 of 11 pass" was wrong. At HEAD and at
+      `d9b962326` under the exact code flip, `TestNLISemiResidualExecution`,
+      `TestNLIAntiResidualExecution`, `TestParallelNLIJointypeIdentity/semi`,
+      `TestHashedInProbeActuallyFires` and `TestRunFastJoinConcrete` all
+      fail. **Still open: those 5.**
+    - Script audit done: the exact site list for the flip commit is in the
+      design doc. The fire\-set gate\'s legacy\-vs\-knob comparison needs a
+      post\-flip definition, which the flip commit decides.
 
 ## M0146 — Post-cutover plan parity (filed 2026-09-23, owner decision)
 
