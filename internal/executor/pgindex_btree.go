@@ -615,16 +615,19 @@ func bulkCreateIndexBTree(ctx *Context, idx *catalog.Index, idxRel storage.RelFi
 //   - ASC NULLS FIRST files them before every value, so the pivot is the lower
 //     bound: the exclusive low test skips the whole NULL group.
 //
+// The caller works in INDEX order, so a DESC column (whose NULLs come first by
+// default) is handled by the same rule: the NULL group is at the low end when
+// NULLS FIRST, at the high end otherwise.
+//
 // stop=false (no bound to add) for the blob format, which stores no NULL-keyed
-// entries, for a cluster without the capability (nothing to stop at), and for
-// a DESC column, whose range scans are outside this slice (ledgered).
+// entries, and for a cluster without the capability (nothing to stop at).
 func (ctx *Context) nullStopRangeBound(idx *catalog.Index, prefix []indexProbeKeyPart, col *catalog.Column, colIdx int) (key []byte, atHigh, stop bool, err error) {
 	if !catalog.NullKeyedIndexEntries() || idx == nil || col == nil || ctx.pgIndexKeyDesc(idx) == nil {
 		return nil, false, false, nil
 	}
-	if colIdx < len(idx.ColDescending) && idx.ColDescending[colIdx] {
-		return nil, false, false, nil
-	}
+	// NULLS FIRST / LAST is the NULLs' position in INDEX order, whatever the
+	// column's direction (SK_BT_NULLS_FIRST), and the caller already speaks
+	// index order (rangeColumnReversed swaps a DESC column's value bounds).
 	nullsFirst := colIdx < len(idx.ColNullsFirst) && idx.ColNullsFirst[colIdx]
 	parts := make([]indexProbeKeyPart, 0, len(prefix)+1)
 	parts = append(parts, prefix...)
@@ -634,4 +637,16 @@ func (ctx *Context) nullStopRangeBound(idx *catalog.Index, prefix []indexProbeKe
 		return nil, false, false, perr
 	}
 	return k, !nullsFirst, true, nil
+}
+
+// rangeColumnReversed reports whether idx orders its key column colIdx in
+// DESCENDING order in the tree itself, so a range scan's value bounds must
+// swap ends to become index-order bounds: `col > v` is everything before v.
+// Only the tuple format honours DESC (its comparator applies SK_BT_DESC); a
+// blob-format key is an ascending byte encoding whatever the column option.
+func rangeColumnReversed(ctx *Context, idx *catalog.Index, colIdx int) bool {
+	if idx == nil || colIdx >= len(idx.ColDescending) || !idx.ColDescending[colIdx] {
+		return false
+	}
+	return ctx.pgIndexKeyDesc(idx) != nil
 }

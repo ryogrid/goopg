@@ -234,11 +234,11 @@ func (o *indexScanOp) flushKills() {
 }
 
 type indexScanOp struct {
-	// nullStopLo / nullStopHi: lookupRangeBounds replaced an open end of the
-	// range with a NULL pivot (nullStopRangeBound), which must be EXCLUSIVE —
-	// the scan stops at (or skips) the NULL-keyed group whatever the plan's
-	// own bound operators say. Reset on every lookup.
-	nullStopLo, nullStopHi bool
+	// rangeLoExcl / rangeHiExcl: the INDEX-ORDER exclusivity of the bounds
+	// lookupRangeBounds returned — the plan's operators, swapped for a DESC
+	// column, and forced exclusive where an open end became a NULL pivot
+	// (nullStopRangeBound). Rescan hands them to the cursor.
+	rangeLoExcl, rangeHiExcl bool
 
 	plan *optimizer.IndexScan
 	ctx  *Context
@@ -572,6 +572,10 @@ func (o *indexScanOp) Rescan(outerSlot SlotView, outerWidth int) error {
 	}
 
 	var loBytes, hiBytes []byte
+	// Index-order bound exclusivity for the cursor. The plan's operators for
+	// every branch but the range one (whose lookupRangeBounds works it out:
+	// DESC swap, NULL pivots).
+	loExcl, hiExcl := o.plan.LowOp == parser.OpGt, o.plan.HighOp == parser.OpLt
 	if len(o.plan.Keys) > 0 {
 		// Multi-column equality probe (M0054-0006-followup-Q9-
 		// composite). Encode each leading column from
@@ -636,6 +640,7 @@ func (o *indexScanOp) Rescan(outerSlot SlotView, outerWidth int) error {
 		}
 		loBytes = lo
 		hiBytes = hiB
+		loExcl, hiExcl = o.rangeLoExcl, o.rangeHiExcl
 		// M0134-0001 S4: strict bound ops make the scan stop EXCLUSIVE.
 		// Composite padding must follow the bound's strictness: an inclusive hi
 		// needs trailing +infinity to cover every key with the same leading
@@ -667,7 +672,7 @@ func (o *indexScanOp) Rescan(outerSlot SlotView, outerWidth int) error {
 	if o.pidx != nil {
 		leafFilter = o.ownsLeaf
 	}
-	cur, err := o.tree.NewScanCursor(loBytes, hiBytes, o.plan.LowOp == parser.OpGt || o.nullStopLo, o.plan.HighOp == parser.OpLt || o.nullStopHi, leafFilter)
+	cur, err := o.tree.NewScanCursor(loBytes, hiBytes, loExcl, hiExcl, leafFilter)
 	if err != nil {
 		return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: err.Error()}
 	}
@@ -734,6 +739,14 @@ func (o *indexScanOp) rescanSAOP() error {
 	var boundCol *catalog.Column
 	var lowV, highV Datum
 	hasLow, hasHigh := o.plan.LowKey != nil, o.plan.HighKey != nil
+	if (hasLow || hasHigh) && rangeColumnReversed(o.ctx, o.plan.Index, 1) {
+		// A DESC second column orders its values backwards in the tree, so the
+		// ascending [elem, low] .. [elem, high] window would be empty or wrong.
+		// The bounds are a Filter recheck on this probe anyway (they never
+		// carry a `local`), so the descent just covers the element's whole
+		// prefix group and the recheck applies them.
+		hasLow, hasHigh = false, false
+	}
 	if hasLow || hasHigh {
 		if len(o.plan.Index.Columns) < 2 {
 			return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: fmt.Sprintf("SAOP probe on %q carries a bound but the index has no second column", o.plan.Index.Name)}
@@ -1290,7 +1303,6 @@ func (o *indexScanOp) lookupRangeBounds() (loKey []byte, hiKey []byte, ok bool, 
 			Message: fmt.Sprintf("indexScanOp.lookupRangeBounds: range prefix of %d keys leaves no column to bound on index %q", np, o.plan.Index.Name),
 		}
 	}
-	o.nullStopLo, o.nullStopHi = false, false
 	prefix := make([]indexProbeKeyPart, 0, np+1)
 	for i, ke := range o.plan.RangePrefix {
 		pcol, pfound := o.ctx.Catalog.LookupColumn(o.plan.Table, o.plan.Index.Columns[i])
@@ -1324,71 +1336,93 @@ func (o *indexScanOp) lookupRangeBounds() (loKey []byte, hiKey []byte, ok bool, 
 		return append(out, part)
 	}
 
-	if o.plan.LowKey != nil {
-		v, evalErr := evalExprSlot(o.plan.LowKey, o.outerSlot, o.ctx)
+	// The plan's bounds are VALUE bounds: LowKey is `col >(=) v`, HighKey is
+	// `col <(=) v`. The cursor wants INDEX-ORDER bounds. For an ascending
+	// column they coincide; for a DESC column of a tuple-format index the
+	// comparator reverses the order, so the value bounds swap ends — `a > 97`
+	// is everything BEFORE 97 in index order. (A blob-format index ignores
+	// DESC in its byte order, so it never swaps.) Before this the DESC case
+	// used the ascending ends: `a > 97` on (a DESC) returned 2910 of 3000
+	// rows instead of 60, and BETWEEN returned none.
+	valueKey := func(e optimizer.Expr) ([]byte, bool, error) {
+		v, evalErr := evalExprSlot(e, o.outerSlot, o.ctx)
 		if evalErr != nil {
-			return nil, nil, false, evalErr
+			return nil, false, evalErr
 		}
 		if v.IsNull() {
-			// NULL lower bound → skip entire scan (no row can satisfy >= NULL)
+			// A NULL bound: no row can satisfy `col op NULL`.
+			return nil, false, nil
+		}
+		k, encErr := o.ctx.indexProbeKey(o.plan.Index, withBound(indexProbeKeyPart{col: col, val: v, pos: e.Pos()}))
+		if encErr != nil {
+			return nil, false, encErr
+		}
+		return k, true, nil
+	}
+	var vLo, vHi []byte
+	if o.plan.LowKey != nil {
+		k, present, kerr := valueKey(o.plan.LowKey)
+		if kerr != nil {
+			return nil, nil, false, kerr
+		}
+		if !present {
 			return nil, nil, false, nil
 		}
-		k, encErr := o.ctx.indexProbeKey(o.plan.Index, withBound(indexProbeKeyPart{col: col, val: v, pos: o.plan.LowKey.Pos()}))
-		if encErr != nil {
-			return nil, nil, false, encErr
+		vLo = k
+	}
+	if o.plan.HighKey != nil {
+		k, present, kerr := valueKey(o.plan.HighKey)
+		if kerr != nil {
+			return nil, nil, false, kerr
 		}
-		loKey = k
-	} else if np > 0 {
-		// No lower bound on the range column: start at the first entry with
+		if !present {
+			return nil, nil, false, nil
+		}
+		vHi = k
+	}
+	loExcl, hiExcl := o.plan.LowOp == parser.OpGt, o.plan.HighOp == parser.OpLt
+	if rangeColumnReversed(o.ctx, o.plan.Index, np) {
+		vLo, vHi = vHi, vLo
+		loExcl, hiExcl = hiExcl, loExcl
+	}
+	loKey, hiKey = vLo, vHi
+	if loKey == nil && np > 0 {
+		// No bound at the index-order low end: start at the first entry with
 		// the equality prefix — the same inclusive prefix key a Keys probe
 		// starts at.
 		k, encErr := o.ctx.indexProbeKey(o.plan.Index, prefix)
 		if encErr != nil {
 			return nil, nil, false, encErr
 		}
-		loKey = k
+		loKey, loExcl = k, false
 	}
-
-	if o.plan.HighKey != nil {
-		v, evalErr := evalExprSlot(o.plan.HighKey, o.outerSlot, o.ctx)
-		if evalErr != nil {
-			return nil, nil, false, evalErr
-		}
-		if v.IsNull() {
-			// NULL upper bound → skip entire scan (no row can satisfy <= NULL)
-			return nil, nil, false, nil
-		}
-		k, encErr := o.ctx.indexProbeKey(o.plan.Index, withBound(indexProbeKeyPart{col: col, val: v, pos: o.plan.HighKey.Pos()}))
-		if encErr != nil {
-			return nil, nil, false, encErr
-		}
-		hiKey = k
-	} else if np > 0 {
-		// No upper bound on the range column: stop after the last entry with
+	if hiKey == nil && np > 0 {
+		// No bound at the index-order high end: stop after the last entry with
 		// the equality prefix — the padded prefix bound a Keys probe uses.
 		k, encErr := o.ctx.indexProbeKey(o.plan.Index, prefix)
 		if encErr != nil {
 			return nil, nil, false, encErr
 		}
-		hiKey = o.ctx.compositeUpperBound(o.plan.Index, k)
+		hiKey, hiExcl = o.ctx.compositeUpperBound(o.plan.Index, k), false
 	}
 
 	// An open end must not run into the NULL-keyed entries a capable cluster
-	// stores: `a > 5` excludes NULL, but NULLS LAST files every NULL after 5.
-	// Only when the column carries exactly ONE bound: with none this is a
-	// full scan or an equality-prefix probe, and both must keep the NULL
-	// entries (`a = 10` on (a, b) includes (10, NULL)).
-	if (o.plan.LowKey == nil) != (o.plan.HighKey == nil) {
+	// stores: `a > 5` excludes NULL, but the NULL group sits at one end of the
+	// index order. Only when the column carries exactly ONE value bound: with
+	// none this is a full scan or an equality-prefix probe, and both must keep
+	// the NULL entries (`a = 10` on (a, b) includes (10, NULL)).
+	if (vLo == nil) != (vHi == nil) {
 		if k, atHigh, stop, err := o.ctx.nullStopRangeBound(o.plan.Index, prefix, col, np); err != nil {
 			return nil, nil, false, err
 		} else if stop {
-			if atHigh && o.plan.HighKey == nil {
-				hiKey, o.nullStopHi = k, true
-			} else if !atHigh && o.plan.LowKey == nil {
-				loKey, o.nullStopLo = k, true
+			if atHigh && vHi == nil {
+				hiKey, hiExcl = k, true
+			} else if !atHigh && vLo == nil {
+				loKey, loExcl = k, true
 			}
 		}
 	}
+	o.rangeLoExcl, o.rangeHiExcl = loExcl, hiExcl
 
 	// ok = true as long as at least one bound is specified (the scan is valid)
 	return loKey, hiKey, true, nil
