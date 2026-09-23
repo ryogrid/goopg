@@ -2188,6 +2188,14 @@ heuristic stays live.)
   - `ALTER RULE r ON t RENAME TO r2` completes but does not rename: a
     following `DROP RULE r2 ON t` fails `rule "r2" for relation "t" does
     not exist`.
+    - **FIXED 2026\-09\-23 \(ralph2 loop \#10\), `bc75b691f`.** The rename
+      touched only `tbl.Rules` while DROP RULE reads the compat registry
+      key `name@table`; now both move \(and action\-form rules, registry\-
+      only, became renameable\). Same function had a second defect:
+      `DROP RULE IF EXISTS` on an EXISTING rule skipped instead of dropping.
+      A 16\-statement script is byte\-identical to PG 18.3; pinned by
+      `TestAlterRuleRenameThenDrop`. Gates: units, spotcheck, SF0.25,
+      acceptance arm, regress suite.
   - `LOCK TABLE t` outside a transaction block is accepted; PG raises
     25P01 `LOCK TABLE can only be used in transaction blocks`
     \(`./postgres/src/backend/tcop/utility.c` RequireTransactionBlock\).

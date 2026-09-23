@@ -60,3 +60,18 @@ ALTER RULE … RENAME does not rename; LOCK TABLE outside a transaction block is
 accepted (PG: 25P01); REINDEX of an index-less table lacks PG's NOTICE; a
 session's own NOTIFY reports PID 1; `DISCARD ALL` is a syntax error;
 CREATE PUBLICATION lacks the `wal_level` WARNING.
+
+### Follow-up fixed 2026-09-23 (`bc75b691f`): ALTER RULE RENAME / DROP RULE IF EXISTS
+
+A rule's existence is tracked twice: the DO-NOTHING form as a
+`catalog.RuleInfo` on the table (what `pg_rewrite` / `pg_get_ruledef` read) and
+every rule form in the compat-object registry under `name@table` (what DROP
+RULE reads). `execAlterRuleRename` renamed only the first, so DROP RULE lost
+the rule; it now finds the rule in either store, checks collisions in both and
+renames both (`catalog.HasCompatObject` / `RenameCompatObject`), which also makes
+action-form rules renameable as PG's `RenameRewriteRule`
+(`./postgres/src/backend/rewrite/rewriteDefine.c:793`) allows. `execDropRule`
+answered IF EXISTS before looking the rule up, so an existing rule was skipped;
+the IF EXISTS notice now fires only on a miss. A 16-statement script is
+byte-identical to PG 18.3 (`TestAlterRuleRenameThenDrop`).
+
