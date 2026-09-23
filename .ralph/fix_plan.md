@@ -7183,7 +7183,7 @@ spill route is net-negative.
       - Ledgered: serial cost on these scans, intermediate nodes, Q5\'s
         Append rows.
     Movement: none
-  - [ ] **M0141-S2b-17** — recon+impl (small): the two divergences
+  - [x] **M0141-S2b-17** — recon+impl (small): the two divergences
     S2b-15's repin triage isolated on the post-`9a2b9d47b`
     parallel shapes.
     Kind: recon
@@ -7206,6 +7206,41 @@ spill route is net-negative.
     moved; compare `cost_semijoin`/semi-join clause selectivity
     against the oracle before touching anything. Gates: ea-ratchet
     re-score (findings go FIXED) + units + spotcheck + SF0.25 sweep.
+    - **CLOSED 2026\-09\-23 \(ralph2 loop \#30\).** Design doc
+      `docs/design/0100-0149/m0141-s2b-17-unpadded-date-literal-selectivity.md`.
+      - \(a\) Already resolved on the current tree: Q62 120, Q99 72, PG\'s
+        figures.
+      - \(b\) Root cause: the planner\'s date parsers accepted only
+        zero\-padded layouts, so Q94\'s `\'2002\-5\-01\'` range got no
+        histogram estimate and its `date \+ interval` bound was not folded.
+        The fix landed as the impl task M0141\-S2b\-17b \(`padISODateLiteral`\);
+        Q94 now matches PG node for node \(probe 2020 → 10, semi join 90 → 1\).
+      - Gates: units, spotcheck, sf025 \(PASS=96\), acceptance arm, fire\-set
+        — PASS. ea\-ratchet: Q94/Q71 FIXED, 2 NEW \(Q16, Q95; `pg\_est=null`,
+        PG\-equivalent estimates\), ledgered with owning task M0141\-S2b\-17a.
+    Movement: none
+  - [x] **M0141-S2b-17b — parse unpadded ISO date literals in the planner**
+    \(filed 2026\-09\-24 by S2b\-17\(b\)\'s diagnosis\). `padISODateLiteral`
+    in `parseTemporalLiteral` and `numericValue`\'s temporal arms, so
+    `\'2002\-5\-01\'` folds and reads the histogram as PG\'s `date\_in` does.
+    Design doc: `m0141\-s2b\-17\-unpadded\-date\-literal\-selectivity.md`.
+    Kind: impl
+    Parent: M0141-S2b-17
+    - LANDED 2026\-09\-24. Gates: units, spotcheck, sf025, acceptance arm,
+      fire\-set, isolation family — PASS. ea\-ratchet: 2 FIXED, 2 NEW \(owning
+      task S2b\-17a\).
+    Movement: none
+  - [ ] **M0141-S2b-17a — recon: the ea\-ratchet NEW class "PG\-faithful
+    estimate on a PG\-unmatched relset"** \(filed 2026\-09\-23 by S2b\-17\).
+    Q16 and Q95\'s Hash Semi Joins became findings when their estimates
+    moved to PG\'s \(Q95: 1 in both; Q16: 4 vs PG\'s ~5 on the equivalent
+    scope\). PG\'s plans lack those exact relation sets, so the scorer applies
+    the absolute bar. Determine per node whether PG\'s own actual/estimate on
+    the nearest equivalent scope makes it a PG\-shared misestimate \(close as
+    PG\-parity, candidate for G4\'s UNMATCHED\-IN\-PG repin rule\) or a goopg
+    divergence \(file the estimator task\).
+    Kind: recon
+    Parent: M0141-S2b-17
   - [x] **M0141-S2b-7** — filed 2026-09-17 by M0141-S7's corpus measurement
     (design doc's "Update 2026-09-17h"). `electOrderedGrouping`
     (`upperorderedgrouping.go:236`) calls `addOrderedPaths` directly, once
