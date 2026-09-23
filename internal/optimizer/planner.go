@@ -1471,7 +1471,7 @@ func planSelectImpl(s *parser.SelectStmt, cat catalog.Catalog, plannerSet Planne
 				chain = next
 			}
 			out, err := createUnionDistinctPaths(upper, &Distinct{pos: s.Pos(), Child: chain, schema: chain.Output()},
-				plannerSet, setOpTupleFraction)
+				leaves, plannerSet, setOpTupleFraction)
 			if err == nil {
 				unionFolds[out] = unionFoldRec{leaves: leaves, all: false}
 			}

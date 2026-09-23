@@ -333,7 +333,10 @@ func TestSetOpPropagationKeepsDefaultPlan(t *testing.T) {
 	cat := psProbeCatalog(t)
 	const sql = "SELECT pa.v AS a FROM pa, pb WHERE pa.id = pb.id AND pa.v = 3 UNION SELECT pb.v AS a FROM pa, pb WHERE pa.id = pb.id AND pa.v = 3"
 
-	got, ok := topPlanCost(psPlan(t, cat, sql, DefaultPlannerSettings()))
+	// The operand join is found by type: since M0141-S2b-4c the fixture's
+	// UNION elects Unique -> Merge Append, whose branches are cost-stamped
+	// Sorts above the join.
+	got, ok := firstJoinCost(psPlan(t, cat, sql, DefaultPlannerSettings()))
 	if !ok {
 		t.Fatal("set-op plan carries no cost; the operand join did not reach the path search")
 	}
@@ -345,7 +348,7 @@ func TestSetOpPropagationKeepsDefaultPlan(t *testing.T) {
 	// The parenthesised grouping site threads the same default value;
 	// plan-OK plus identical cost guards that call site against breakage.
 	const groupedSQL = "(SELECT pa.v AS a FROM pa, pb WHERE pa.id = pb.id AND pa.v = 3 UNION SELECT pb.v AS a FROM pa, pb WHERE pa.id = pb.id AND pa.v = 3)"
-	grouped, ok := topPlanCost(psPlan(t, cat, groupedSQL, DefaultPlannerSettings()))
+	grouped, ok := firstJoinCost(psPlan(t, cat, groupedSQL, DefaultPlannerSettings()))
 	if !ok {
 		t.Fatal("grouped set-op plan carries no cost")
 	}
@@ -354,6 +357,19 @@ func TestSetOpPropagationKeepsDefaultPlan(t *testing.T) {
 			grouped.StartupCost, grouped.TotalCost, grouped.PlanRows,
 			got.StartupCost, got.TotalCost, got.PlanRows)
 	}
+}
+
+// firstJoinCost returns the cost stamped on the first Join in plan order.
+func firstJoinCost(n Node) (PlanCost, bool) {
+	if j, ok := n.(*Join); ok {
+		return j.PlanCostInfo()
+	}
+	for _, ch := range legacyDisplayChildren(n) {
+		if pc, ok := firstJoinCost(ch); ok {
+			return pc, true
+		}
+	}
+	return PlanCost{}, false
 }
 
 // findSetOp returns the first SetOp node in plan order, if the plan holds one.

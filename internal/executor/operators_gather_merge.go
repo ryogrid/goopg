@@ -370,7 +370,17 @@ func (o *gatherMergeOp) advanceRow(src *gmSource) (bool, error) {
 // advance). Comparison errors are captured rather than returned so the
 // comparator stays a strict weak ordering, matching sortOp's own discipline.
 func (o *gatherMergeOp) lessKeys(a, b []Datum) bool {
-	for i, k := range o.keys {
+	return mergeKeysLess(o.keys, a, b, &o.sortErr)
+}
+
+// mergeKeysLess orders two rows by their PRECOMPUTED sort-key values. It is
+// the one comparator every ordered merge shares — gatherMergeOp's heap and
+// the ordered-merge setOp (Merge Append, M0141-S2b-4c) — and it must agree
+// with sortOp.lessRows, because each merge orders streams those Sorts
+// produced. Comparison errors are recorded in *errp (first one wins) rather
+// than returned, so the comparator stays a strict weak ordering.
+func mergeKeysLess(keys []optimizer.SortKey, a, b []Datum, errp *error) bool {
+	for i, k := range keys {
 		av, bv := a[i], b[i]
 		// NULL placement is `k.NullsFirst`, NOT `k.Desc`. The two coincide
 		// only for PG's DEFAULTS (NULLS LAST for ASC, NULLS FIRST for DESC,
@@ -387,10 +397,6 @@ func (o *gatherMergeOp) lessKeys(a, b []Datum) bool {
 		//   select nullif(l_linenumber,1) from lineitem
 		//     order by 1 asc nulls first
 		//   -> a NULL surfaced at row 1183498, AFTER non-NULLs (PG: correct)
-		//
-		// This comparator and `sortOp.lessRows` are one rule read twice: the
-		// merge orders the streams the worker sorts produced, so any
-		// disagreement between them is unordered output by construction.
 		if av.IsNull() && !bv.IsNull() {
 			return k.NullsFirst
 		}
@@ -402,8 +408,8 @@ func (o *gatherMergeOp) lessKeys(a, b []Datum) bool {
 		}
 		cmp, err := compareDatum(av, bv, 0)
 		if err != nil {
-			if o.sortErr == nil {
-				o.sortErr = err
+			if *errp == nil {
+				*errp = err
 			}
 			return false
 		}

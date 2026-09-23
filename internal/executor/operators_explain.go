@@ -1274,6 +1274,27 @@ func emitNodeDetailLines(n optimizer.Node, indent string, verbose bool, rows *[]
 			full, _ := sortKeyParts(p.Child, p.Keys, reg, qualify)
 			*rows = append(*rows, Row{NewStringDatum(indent + "Sort Key: " + strings.Join(full, ", "))})
 		}
+	case *optimizer.SetOp:
+		// M0141-S2b-4c: PG's Merge Append prints its `Sort Key:` (explain.c
+		// show_merge_append_keys). The keys deparse through the merge's
+		// targetlist, which is its first branch's, so a sorted first branch
+		// renders its own Sort's keys (`tenk1.unique1`, not the union
+		// output's bare `unique1`).
+		if len(p.MergeKeys) > 0 {
+			if branches := setOpAppendBranches(p, nil); len(branches) > 0 {
+				keyNode, keys := branches[0], p.MergeKeys
+				if s, ok := keyNode.(*optimizer.Sort); ok && len(s.Keys) == len(keys) {
+					keyNode, keys = s.Child, s.Keys
+				}
+				full, _ := sortKeyParts(keyNode, keys, reg, qualify)
+				*rows = append(*rows, Row{NewStringDatum(indent + "Sort Key: " + strings.Join(full, ", "))})
+			}
+		}
+		// Keep the default arm's attached-Filter line (a qual goopg leaves
+		// above a set operation must not vanish from the plan text).
+		if attachedFilter != nil {
+			*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + wrapParen(formatExprQual(attachedFilter, reg, qualify)))})
+		}
 	case *optimizer.IncrementalSort:
 		// M0141-S7-exec-c: mirrors the *optimizer.Sort arm above (same
 		// show_sort_group_keys oracle, explain.c:2588-2593 calls it with
@@ -3785,6 +3806,10 @@ func firstRowsFromFunc(p *optimizer.RowsFrom) optimizer.Node {
 // setOpNodeName renders a SetOp's PG-style label — see the
 // describePlan case above for the mapping rationale.
 func setOpNodeName(p *optimizer.SetOp) string {
+	if setOpRendersAsAppend(p) && len(p.MergeKeys) > 0 {
+		// M0141-S2b-4c: an ordered-merge UNION ALL chain is PG's Merge Append.
+		return "Merge Append"
+	}
 	if setOpRendersAsAppend(p) {
 		// M0145-0004a: PG's prefix is the generic parallel_aware rule
 		// (explain.c:1630), the same one the *SeqScan and *Join arms
@@ -3834,9 +3859,14 @@ func setOpCommandName(p *optimizer.SetOp) string {
 // children, and TPC-DS Q5's five-branch union would render five levels
 // deep. Only ALL-union links are absorbed — an INTERSECT or EXCEPT in
 // the chain is a real node and keeps its own line.
+//
+// A Merge Append chain (MergeKeys set, M0141-S2b-4c) absorbs only merge links
+// and a plain Append chain only plain links: an Append beneath a Merge
+// Append, or the reverse, is a separate node in PG and keeps its own line.
 func setOpAppendBranches(p *optimizer.SetOp, out []optimizer.Node) []optimizer.Node {
 	for _, side := range [...]optimizer.Node{p.Left, p.Right} {
-		if inner, ok := side.(*optimizer.SetOp); ok && setOpRendersAsAppend(inner) {
+		if inner, ok := side.(*optimizer.SetOp); ok && setOpRendersAsAppend(inner) &&
+			(len(inner.MergeKeys) > 0) == (len(p.MergeKeys) > 0) {
 			out = setOpAppendBranches(inner, out)
 			continue
 		}

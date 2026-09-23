@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"errors"
 	"sync/atomic"
 
 	"github.com/goopg/goopg/internal/parser"
@@ -50,6 +51,15 @@ type setOp struct {
 	// buffered output (non-streaming variants) produced at Open.
 	rows []Row
 	idx  int
+
+	// M0141-S2b-4c: ordered merge (plan.MergeKeys). Each side's front row
+	// and its evaluated keys, and whether the side is exhausted.
+	mergeCur  [2]Row
+	mergeKeys [2][]Datum
+	mergeLive [2]bool
+	mergeInit bool
+	mergeErr  error
+	ctx       *Context
 }
 
 func newSetOp(p *optimizer.SetOp, left, right Operator) *setOp {
@@ -105,6 +115,9 @@ func (o *setOp) Close() error {
 }
 
 func (o *setOp) Next() (TupleSlot, error) {
+	if o.streaming && len(o.plan.MergeKeys) > 0 {
+		return o.nextMerge()
+	}
 	if o.streaming {
 		return o.nextStreaming()
 	}
@@ -121,6 +134,75 @@ func (o *setOp) Next() (TupleSlot, error) {
 
 // nextStreaming yields the left child to exhaustion, then the right child
 // (UNION ALL).
+// nextMerge is nodeMergeAppend.c's ExecMergeAppend for two inputs, each
+// already sorted on plan.MergeKeys: emit whichever front row sorts first.
+// A left-deep chain of these links is an n-way merge, and it stays sorted
+// because a merge of sorted streams is sorted. The comparator is
+// mergeKeysLess, the rule gatherMergeOp and sortOp share, so the inputs'
+// Sorts and this merge cannot disagree about NULL placement or direction.
+func (o *setOp) nextMerge() (TupleSlot, error) {
+	if !o.mergeInit {
+		o.mergeInit = true
+		for side := 0; side < 2; side++ {
+			if err := o.mergeAdvance(side); err != nil {
+				return nil, err
+			}
+		}
+	}
+	pick := -1
+	switch {
+	case o.mergeLive[0] && o.mergeLive[1]:
+		pick = 0
+		if mergeKeysLess(o.plan.MergeKeys, o.mergeKeys[1], o.mergeKeys[0], &o.mergeErr) {
+			pick = 1
+		}
+		if o.mergeErr != nil {
+			return nil, o.mergeErr
+		}
+	case o.mergeLive[0]:
+		pick = 0
+	case o.mergeLive[1]:
+		pick = 1
+	default:
+		return nil, EOF
+	}
+	row := o.mergeCur[pick]
+	if err := o.mergeAdvance(pick); err != nil {
+		return nil, err
+	}
+	return SlotFromRow(o.plan.Output(), row), nil
+}
+
+// mergeAdvance pulls side's next row, copying it out of the child's reused
+// slot (it must survive until it is emitted, possibly several Next calls
+// later) and evaluating its merge keys once.
+func (o *setOp) mergeAdvance(side int) error {
+	in := o.left
+	if side == 1 {
+		in = o.right
+	}
+	slot, err := in.Next()
+	if errors.Is(err, EOF) {
+		o.mergeLive[side] = false
+		o.mergeCur[side] = nil
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	row := transferRowForQueue(slot)
+	keys := make([]Datum, len(o.plan.MergeKeys))
+	for i, k := range o.plan.MergeKeys {
+		v, kerr := evalSortKeyValue(k.Expr, row, o.ctx)
+		if kerr != nil {
+			return kerr
+		}
+		keys[i] = v
+	}
+	o.mergeCur[side], o.mergeKeys[side], o.mergeLive[side] = row, keys, true
+	return nil
+}
+
 func (o *setOp) nextStreaming() (TupleSlot, error) {
 	if !o.leftDone {
 		// M0140-0006c-3: a claimed-whole branch is drained by exactly ONE

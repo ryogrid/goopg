@@ -50,6 +50,8 @@ package optimizer
 // an appendrel is its own item.
 
 import (
+	"math"
+
 	"github.com/goopg/goopg/internal/parser"
 )
 
@@ -60,6 +62,7 @@ const (
 	windowProducer             = "upper.window.sorted"
 	setOpAppendProducer        = "upper.setop.append"
 	setOpHashedProducer        = "upper.setop.hashed"
+	setOpMergeAppendProducer   = "upper.setop.mergeappend"
 	setOpPartialAppendProducer = "upper.setop.append.partial"
 	setOpMixedAppendProducer   = "upper.setop.append.mixed"
 )
@@ -451,7 +454,7 @@ func createSetOpPaths(u *upperRels, setOpNode *SetOp, ps PlannerSettings, tupleF
 //
 // Not ported (ledgered): the Gather variants over a partial Append (gpath)
 // and the Merge Append arm (try_sorted), the latter being M0141-S2b-4c.
-func createUnionDistinctPaths(u *upperRels, distinctNode *Distinct, ps PlannerSettings, tupleFraction float64) (Node, error) {
+func createUnionDistinctPaths(u *upperRels, distinctNode *Distinct, leaves []Node, ps PlannerSettings, tupleFraction float64) (Node, error) {
 	if distinctNode == nil || distinctNode.Child == nil {
 		return nil, &PlanError{Code: "XX000", Message: "createUnionDistinctPaths: nil union input"}
 	}
@@ -461,12 +464,16 @@ func createUnionDistinctPaths(u *upperRels, distinctNode *Distinct, ps PlannerSe
 	cp := ps.costParams()
 	setOpRel := newUpperRelForNode(u, UpperSetOp, tupleFraction)
 	seed := seedPathForNode(setOpRel, distinctNode.Child)
+	if chain, ok := distinctNode.Child.(*SetOp); ok && chain.UnionDistinctInput && len(leaves) >= 2 {
+		seed.Cost = unionAppendCost(leaves, seed.Rows, cp)
+	}
 	setOpRel.Rows = seed.Rows
 	if setOpRel.Rows < 1 {
 		setOpRel.Rows = 1
 	}
 	setOpRel.Width = nodeTupleWidth(distinctNode)
 	addUnionDistinctPaths(setOpRel, seed, distinctNode, distinctNode.Child, cp, ps)
+	addUnionMergeAppendPath(setOpRel, seed, distinctNode, leaves, cp)
 	setCheapest(setOpRel)
 	best := getCheapestFractionalPath(setOpRel, tupleFraction)
 	if best == nil {
@@ -480,6 +487,91 @@ func createUnionDistinctPaths(u *upperRels, distinctNode *Distinct, ps PlannerSe
 	}
 	return nil, &PlanError{Pos: distinctNode.Pos(), Code: "XX000",
 		Message: "createUnionDistinctPaths: PathDistinct built no distinct node"}
+}
+
+// unionAppendCost prices a serial distinct UNION's input Append the way
+// cost_append (costsize.c) prices an unordered, non-parallel Append: the
+// first child's startup, the sum of the children's totals, plus
+// cpu_tuple_cost * APPEND_CPU_COST_MULTIPLIER per output row. The chain's
+// SetOp links carry no PlanCost, and the legacy display derivation charges a
+// full cpu_tuple_cost per row there; left in place, that tilted the Sort ->
+// Unique candidate against the Merge Append one, which is priced over the
+// same leaves (upstream union.sql's two-row VALUES unions elected the merge
+// where PG sorts).
+func unionAppendCost(leaves []Node, rows float64, cp costParams) Cost {
+	var c Cost
+	for i, leaf := range leaves {
+		pc := legacyDisplayCostOf(leaf)
+		if i == 0 {
+			c.Startup = pc.StartupCost
+		}
+		c.Total += pc.TotalCost
+	}
+	c.Total += cp.cpuTupleCost * appendCPUCostMultiplier * rows
+	return c
+}
+
+// addUnionMergeAppendPath is generate_union_paths' third distinct candidate
+// (prepunion.c, `if (try_sorted && groupList != NIL)`, M0141-S2b-4c): every
+// branch sorted on the union pathkeys, merged by a Merge Append, and made
+// unique by a Unique straight over the merge, with no further sort. PG gets
+// a sorted path for every child from build_setop_child_paths, which sorts
+// the cheapest child path when it is not already sorted, so this candidate
+// is always available for a UNION with columns.
+//
+// The Merge Append is a left-deep chain of ordered-merge UNION ALL SetOps
+// (SetOp.MergeKeys), priced as one node by cost_merge_append (costsize.c):
+// comparison_cost = 2 * cpu_operator_cost, heap build N·log2 N comparisons
+// at startup, log2 N comparisons plus cpu_tuple_cost * 0.5 per tuple at run,
+// over the sum of the children's costs.
+//
+// Not ported (ledgered): PG also offers a child's already-sorted path
+// (a Gather Merge over a partial path, as on TPC-DS Q75) and incremental
+// sorts; here every branch gets an explicit Sort over its finished plan.
+func addUnionMergeAppendPath(rel *RelOptInfo, seed *Path, distinctNode *Distinct, leaves []Node, cp costParams) {
+	if len(leaves) < 2 {
+		return
+	}
+	keys := distinctAllColKeys(distinctNode.Child)
+	if len(keys) == 0 {
+		return // groupList == NIL: PG offers no Merge Append.
+	}
+	pathkeys := pathkeysForSortKeys(keys)
+	var startupSum, totalSum, rows float64
+	disabled := 0
+	sorted := make([]Node, 0, len(leaves))
+	for _, leaf := range leaves {
+		sp := sortPathForBounded(seedPathForNode(rel, leaf), pathkeys, cp, -1)
+		startupSum += sp.Cost.Startup
+		totalSum += sp.Cost.Total
+		rows += sp.Rows
+		disabled += sp.DisabledNodes
+		srt := &Sort{pos: leaf.Pos(), Child: leaf, Keys: distinctAllColKeys(leaf)}
+		srt.setPlanCost(PlanCost{StartupCost: sp.Cost.Startup, TotalCost: sp.Cost.Total, PlanRows: sp.Rows, PlanWidth: TupleWidth(leaf.Output())})
+		sorted = append(sorted, srt)
+	}
+	var chain Node = sorted[0]
+	for _, b := range sorted[1:] {
+		chain = &SetOp{pos: distinctNode.pos, Left: chain, Right: b, Op: parser.SetOpUnion, All: true,
+			UnionDistinctInput: true, MergeKeys: keys}
+	}
+	n := float64(len(leaves))
+	logN := math.Log2(n)
+	comparison := 2.0 * cp.cpuOperatorCost
+	startup := comparison * n * logN
+	run := rows*comparison*logN + cp.cpuTupleCost*appendCPUCostMultiplier*rows
+	merge := newPrebuiltPath(rel, chain)
+	merge.Rows = rows
+	merge.Cost = Cost{Startup: startup + startupSum, Total: startup + run + totalSum}
+	merge.Pathkeys = pathkeys
+	merge.DisabledNodes = disabled
+	addPath(rel, &Path{
+		Kind: PathDistinct, Distinct: distinctNode, Unique: true,
+		Rel: rel, Rows: rel.Rows,
+		DisabledNodes: disabled,
+		Cost:          distinctCost(merge.Cost.Startup, merge.Cost.Total, seed.Rows, rel.Rows, cp),
+		Pathkeys:      pathkeys, Children: []*Path{merge},
+	}, setOpMergeAppendProducer)
 }
 
 // seedPathForNode wraps a finished branch Node as a `PathPrebuilt` carrying

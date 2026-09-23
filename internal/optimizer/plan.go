@@ -2826,6 +2826,14 @@ type SetOp struct {
 	// the union sits in a nested scope where goopg otherwise files the mixed
 	// arm on an appendrel's behalf (addPartialSetOpPath).
 	UnionDistinctInput bool
+	// MergeKeys, when non-empty on a UNION ALL link, makes the link an
+	// ORDER-PRESERVING merge of its two inputs, each already sorted on these
+	// keys (M0141-S2b-4c). A left-deep chain of such links is PG's Merge
+	// Append (create_merge_append_path, pathnode.c; nodeMergeAppend.c): the
+	// merge of sorted streams stays sorted, and EXPLAIN renders the chain as
+	// one `Merge Append` with its `Sort Key:`. Built only serially, never
+	// under a Gather.
+	MergeKeys []SortKey
 	// Op is the set-operation kind (UNION / INTERSECT / EXCEPT).
 	// The zero value (parser.SetOpUnion) keeps the implicit
 	// partition/inheritance UNION ALL construction sites working

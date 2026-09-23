@@ -2,6 +2,7 @@ package executor
 
 import (
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -292,5 +293,52 @@ func TestZeroColumnUnionBothStrategies(t *testing.T) {
 		if len(rows) != 1 {
 			t.Errorf("enable_hashagg=%v: %d rows, want 1", on, len(rows))
 		}
+	}
+}
+
+// TestUnionMergeAppendArm pins M0141-S2b-4c, generate_union_paths' third
+// distinct candidate (prepunion.c): Unique straight over a Merge Append of
+// branches each sorted on the union pathkeys. With hashing disabled PG 18.3
+// plans `Unique -> Merge Append -> Sort, Sort` for a two-branch UNION, and so
+// must goopg. The rows check covers what the merge itself must get right:
+// branch columns with different names (the keys are evaluated against each
+// branch's own row), NULLs (sorted last, then collapsed), and duplicates
+// across and within branches.
+func TestUnionMergeAppendArm(t *testing.T) {
+	ctx := setopFixtureCtx(t)
+	runSQL(t, ctx, "CREATE TABLE eso_m1 (k int, s text)")
+	runSQL(t, ctx, "CREATE TABLE eso_m2 (j int, u text)")
+	runSQL(t, ctx, "INSERT INTO eso_m1 VALUES (3, 'c'), (1, 'a'), (NULL, 'n'), (1, 'a'), (5, NULL)")
+	runSQL(t, ctx, "INSERT INTO eso_m2 VALUES (2, 'b'), (1, 'a'), (NULL, 'n'), (4, 'd'), (5, NULL)")
+	const sql = "SELECT k, s FROM eso_m1 UNION SELECT j, u FROM eso_m2"
+
+	restore := hashAggSeed(false)
+	defer restore()
+	lines := runExplainRows(t, ctx, "EXPLAIN (COSTS OFF) "+sql)
+	joined := strings.Join(lines, "\n")
+	for _, want := range []string{"Unique", "Merge Append", "Sort Key: eso_m1.k, eso_m1.s"} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("plan lacks %q:\n%s", want, joined)
+		}
+	}
+	if got := countLines(lines, "->  Sort"); got != 2 {
+		t.Errorf("per-branch Sorts = %d, want 2:\n%s", got, joined)
+	}
+	if strings.Contains(joined, "->  Append") {
+		t.Errorf("plain Append under the merge arm:\n%s", joined)
+	}
+
+	var got []string
+	for _, r := range runQuery(t, ctx, sql) {
+		got = append(got, fmt.Sprint(r))
+	}
+	restore()
+	var want []string
+	for _, r := range runQuery(t, ctx, sql+" ORDER BY 1, 2") {
+		want = append(want, fmt.Sprint(r))
+	}
+	// {1a,2b,3c,4d,5-NULL,NULL-n}: six distinct rows, in merge order.
+	if len(want) != 6 || strings.Join(got, "|") != strings.Join(want, "|") {
+		t.Errorf("merge-arm rows = %v, want %v", got, want)
 	}
 }
