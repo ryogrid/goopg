@@ -458,18 +458,12 @@ func TestPlannerSettingsReachScalarSubqueryJoin(t *testing.T) {
 	t.Run("cpu_tuple_cost/nested", func(t *testing.T) {
 		ps := DefaultPlannerSettings()
 		ps.CPUTupleCost *= 1000
-		defCosts := costedScalarInners(t, cat, nestedScalarSQL, DefaultPlannerSettings())
-		if len(defCosts) != 1 {
-			t.Fatalf("nested baseline has %d costed inner plans, want 1 (the innermost join)", len(defCosts))
-		}
-		hotCosts := costedScalarInners(t, cat, nestedScalarSQL, ps)
-		if len(hotCosts) != 1 {
-			t.Fatalf("nested hot plan has %d costed inner plans, want 1", len(hotCosts))
-		}
-		if hotCosts[0] == defCosts[0] {
+		def := innermostCostedScalarInner(t, cat, nestedScalarSQL, DefaultPlannerSettings())
+		hot := innermostCostedScalarInner(t, cat, nestedScalarSQL, ps)
+		if hot == def {
 			t.Errorf("nested: innermost join still costed at (%.4f..%.4f) — "+
 				"the settings did not thread through the middle subquery",
-				hotCosts[0].StartupCost, hotCosts[0].TotalCost)
+				hot.StartupCost, hot.TotalCost)
 		}
 	})
 
@@ -523,11 +517,16 @@ func TestScalarSubqueryPropagationKeepsDefaultPlan(t *testing.T) {
 	}
 	for _, sh := range shapes {
 		t.Run(sh.name, func(t *testing.T) {
-			costs := costedScalarInners(t, cat, sh.sql, DefaultPlannerSettings())
-			if len(costs) != 1 {
-				t.Fatalf("%s: default plan has %d costed inner plans, want 1", sh.name, len(costs))
+			var got PlanCost
+			if sh.name == "nested" {
+				got = innermostCostedScalarInner(t, cat, sh.sql, DefaultPlannerSettings())
+			} else {
+				costs := costedScalarInners(t, cat, sh.sql, DefaultPlannerSettings())
+				if len(costs) != 1 {
+					t.Fatalf("%s: default plan has %d costed inner plans, want 1", sh.name, len(costs))
+				}
+				got = costs[0]
 			}
-			got := costs[0]
 			if got.StartupCost != 171.25 || got.TotalCost != 354.75 || got.PlanRows != 100 {
 				t.Errorf("%s: default inner join = (%.4f..%.4f rows=%.0f), want (171.25..354.75 rows=100) — "+
 					"the default path moved", sh.name, got.StartupCost, got.TotalCost, got.PlanRows)
@@ -612,6 +611,21 @@ func costedScalarInners(t *testing.T, cat catalog.Catalog, sql string, ps Planne
 		}
 	}
 	return out
+}
+
+// innermostCostedScalarInner returns the cost of the innermost costed sublink
+// plan of a nested scalar shape — the probe join. The middle subquery's
+// single-rel scan is costed too on the jointree arm, whose one-rel search
+// prices every scan as PG does (M0145-0030), so the count is 1 or 2 and the
+// probe join is always the one discovered last (scalarInnerPlans appends
+// nested plans after their parents).
+func innermostCostedScalarInner(t *testing.T, cat catalog.Catalog, sql string, ps PlannerSettings) PlanCost {
+	t.Helper()
+	costs := costedScalarInners(t, cat, sql, ps)
+	if len(costs) == 0 || len(costs) > 2 {
+		t.Fatalf("nested plan has %d costed inner plans, want 1 or 2 (the probe join, plus the middle scan on the jointree arm)", len(costs))
+	}
+	return costs[len(costs)-1]
 }
 
 // The build-side narrowing lands in `joinInputsFor`, which runs inside

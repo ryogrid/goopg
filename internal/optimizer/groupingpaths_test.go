@@ -235,6 +235,26 @@ func TestCreateGroupingPathsGucOnPkFdStaysHash(t *testing.T) {
 	}
 }
 
+// TestIndexOrderedGroupingPricedFromSearchRelJointree pins M0145-0030 fix 2
+// on the jointree arm, whose one-rel search prices the base rel's seq path
+// at 1.01 and its full ordered index path at 16.14. The index-driven sorted
+// variant used to be priced from its rule-era display cost (0.01) and
+// out-bid the hash; priced from the search rel's own index path, hashed
+// wins, as PG 18.3 elects HashAggregate over Seq Scan on this shape.
+func TestIndexOrderedGroupingPricedFromSearchRelJointree(t *testing.T) {
+	defer func(v bool) { jointreePipeline = v }(jointreePipeline)
+	jointreePipeline = true
+	cat, _, _ := btgIndexOrderCatalog(t)
+	stmt := parseOne(t, "select count(*) from btg group by y, x")
+	node, err := PlanWithSettings(stmt, cat, hashAggSettings(true))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a := indexOrderAggPlan(t, node); a.Strategy != AggStrategyHashed {
+		t.Fatalf("Strategy = %d, want AggStrategyHashed (the index variant must be priced from the search rel's index path)", a.Strategy)
+	}
+}
+
 // TestGroupingPathsC10cReassert is C-10c's per-item re-assert for C-15
 // (DESIGN §7): the Sort the GROUP_AGG rel emits sits below the Aggregate
 // exactly where the rules' Sorts sat, so

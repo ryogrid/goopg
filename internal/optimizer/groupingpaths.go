@@ -487,6 +487,15 @@ func addGroupingPaths(grouped *RelOptInfo, seed *Path, aggNode *Aggregate, child
 				if pc := legacyDisplayCostOf(idxChild); pc.PlanRows > 0 || pc.TotalCost > 0 {
 					idxSeed.Cost = Cost{Startup: pc.StartupCost, Total: pc.TotalCost}
 				}
+				// M0145-0030: a search-built child's rel already holds the
+				// cost_index-priced full scan of this index; price the
+				// variant from it, as PG takes the sorted input from
+				// input_rel->pathlist (add_paths_to_grouping_rel,
+				// planner.c:7128). The legacy display cost above is a
+				// rule-era estimate that undercut the rel's own seq path.
+				if c, ok := searchRelIndexPathCost(child, idxChild); ok {
+					idxSeed.Cost = c
+				}
 				idxNcols, idxAvgVar := aggInputWidth(idxChild, idxSpec)
 				addPath(grouped, &Path{
 					Kind: PathAgg, AggStrategy: AggStrategySorted, Agg: idxSpec,
@@ -543,6 +552,45 @@ func addGroupingPaths(grouped *RelOptInfo, seed *Path, aggNode *Aggregate, child
 // rather than replicating that); no usable index ⇒ absent. The deleted proxy
 // gate (`enable_hashagg = off`) is deliberately NOT re-checked: price
 // competition replaces it, and the GUC-on PK-FD pin (§5 gate) adjudicates.
+// searchRelIndexPathCost returns the cost of the cheapest unparameterised
+// index path on idxChild's index in the pathlist of the search rel child
+// came from. ok is false when child is not a join-search product (the
+// legacy arm) or the rel holds no such path — the caller keeps its own
+// estimate then.
+func searchRelIndexPathCost(child, idxChild Node) (Cost, bool) {
+	rel := searchedJoinInputRelOf(child)
+	if rel == nil {
+		return Cost{}, false
+	}
+	n := idxChild
+	if f, ok := n.(*Filter); ok {
+		n = f.Child
+	}
+	var idx *catalog.Index
+	switch x := n.(type) {
+	case *IndexOnlyScan:
+		idx = x.Index
+	case *IndexScan:
+		idx = x.Index
+	}
+	if idx == nil {
+		return Cost{}, false
+	}
+	var best *Path
+	for _, p := range rel.Pathlist {
+		if p == nil || p.Kind != PathIndexScan || p.IndexInfo != idx || p.RequiredOuter != 0 {
+			continue
+		}
+		if best == nil || p.Cost.Total < best.Cost.Total {
+			best = p
+		}
+	}
+	if best == nil {
+		return Cost{}, false
+	}
+	return best.Cost, true
+}
+
 func indexOrderedAggInput(aggNode *Aggregate, child Node, cat catalog.Catalog) (newChild Node, spec *Aggregate, ok bool) {
 	if aggNode == nil || cat == nil {
 		return nil, nil, false

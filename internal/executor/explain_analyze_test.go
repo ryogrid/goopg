@@ -164,10 +164,13 @@ func TestExplainAnalyzeRowsRemovedByJoinFilter(t *testing.T) {
 		}
 	}
 
-	// Hash join on a.id=b.id with extra residual b.val <> 'y'.
-	// The hash key matches but the residual rejects on id=2 (val='y').
+	// Hash join on a.id=b.id with the two-sided residual a.id + b.id <> 4:
+	// the hash key matches but the residual rejects the id=2 pair. The
+	// residual must reference both sides — a one-sided ON qual such as
+	// b.val <> 'y' is pushed into b's scan as a plain Filter, which is
+	// what PG 18.3 prints (and the jointree arm, M0145-0030).
 	lines := runExplainRows(t, ctx,
-		"EXPLAIN ANALYZE SELECT * FROM a JOIN b ON a.id = b.id AND b.val <> 'y'")
+		"EXPLAIN ANALYZE SELECT * FROM a JOIN b ON a.id = b.id AND a.id + b.id <> 4")
 	joined := strings.Join(lines, "\n")
 	if !strings.Contains(joined, "Rows Removed by Join Filter:") {
 		t.Errorf("missing 'Rows Removed by Join Filter' line:\n%s", joined)
