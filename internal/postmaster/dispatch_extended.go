@@ -124,6 +124,10 @@ func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *misc
 			}
 			return &extendedQueryResult{CommandTag: tag}, nil
 		}
+		// DISCARD ALL's session-layer half, as on the simple path (dispatch.go).
+		if ds, ok := stmt.(*parser.DiscardStmt); ok && ds.Mode == "ALL" {
+			s.discardAllSessionState(connTx, nil)
+		}
 		var perr error
 		node, perr = optimizer.PlanWithSettings(stmt, sessionPlanCatalog(sess, s.cfg.Catalog, connDBOid), sessionPlannerSettings(sess))
 		if perr != nil {

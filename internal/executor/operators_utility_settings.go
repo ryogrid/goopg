@@ -160,6 +160,29 @@ func (o *utilitySettingsOp) Next() (TupleSlot, error) {
 			return nil, EOF
 		}
 		o.done = true
+		// DISCARD ALL (discard.c DiscardAll): PreventInTransactionBlock, then
+		// SET SESSION AUTHORIZATION DEFAULT (which also resets the role),
+		// RESET ALL and the release of every session advisory lock. The
+		// connection-held state (prepared statements, cursors, LISTEN) is
+		// dropped by the postmaster before this runs; sequences and temp
+		// tables follow below, shared with DISCARD SEQUENCES / TEMP.
+		if stmt.Mode == "ALL" {
+			if o.ctx != nil && o.ctx.Session != nil && o.ctx.Session.InExplicitTransaction() {
+				return nil, &ExecError{Code: "25001", Message: "DISCARD ALL cannot run inside a transaction block"}
+			}
+			if o.ctx != nil {
+				if o.ctx.SetSessionAuthorization != nil {
+					o.ctx.SetSessionAuthorization("", false)
+				}
+				if o.ctx.SetRole != nil {
+					o.ctx.SetRole("", false)
+				}
+				if o.ctx.ResetAllSettings != nil {
+					o.ctx.ResetAllSettings()
+				}
+				_, _ = evalAdvisoryUnlockAll(o.ctx)
+			}
+		}
 		// DISCARD SEQUENCES (and DISCARD ALL) clear per-session currval/lastval state.
 		if stmt.Mode == "SEQUENCES" || stmt.Mode == "ALL" {
 			if o.ctx != nil {

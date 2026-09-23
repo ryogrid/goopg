@@ -1049,6 +1049,10 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *libpq.Fr
 			}
 			return s.writeQueryError(w, "34000", fmt.Sprintf("cursor \"%s\" does not exist", fs.CursorName))
 		}
+		// DISCARD ALL's session-layer half (the executor does the rest).
+		if ds, ok := stmt.(*parser.DiscardStmt); ok && ds.Mode == "ALL" {
+			s.discardAllSessionState(connTx, prepStmts)
+		}
 		// CLOSE cursor_name (M0097-0003).
 		if cs, ok := stmt.(*parser.CloseStmt); ok {
 			if connTx != nil {
@@ -4170,6 +4174,11 @@ func utilityTag(stmt parser.Stmt) string {
 	case *parser.ResetStmt:
 		return "RESET"
 	case *parser.DiscardStmt:
+		// cmdtaglist.h tags each target: DISCARD ALL / PLANS / SEQUENCES /
+		// TEMP (TEMPORARY is parsed as TEMP).
+		if v, ok := stmt.(*parser.DiscardStmt); ok && v.Mode != "" {
+			return "DISCARD " + v.Mode
+		}
 		return "DISCARD"
 	}
 	if tag, ok := stmtCommandTag(stmt); ok {

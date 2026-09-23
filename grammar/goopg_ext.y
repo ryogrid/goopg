@@ -2313,7 +2313,7 @@ call_named_arg:
 
    Legacy is the parity target and is NARROWER than gram.y in several places,
    so the grammar is deliberately narrowed to match rather than widened to
-   upstream: DISCARD ALL is REJECTED, a cursor may carry only [NO] SCROLL
+   upstream: a cursor may carry only [NO] SCROLL
    before CURSOR (not BINARY / INSENSITIVE / ASENSITIVE), CLUSTER takes no
    parenthesised option list, and MOVE is parsed-and-discarded as a
    CompatNoopStmt with an empty body.
@@ -2329,10 +2329,13 @@ savepoint_stmt:
 checkpoint_stmt:
 		CHECKPOINT               { $$ = NewCheckpointStmt($<p>1) }
 
-/* DISCARD ALL is a legacy REJECT ("syntax error at or near \"all\""), so ALL
-   is not an alternative here; TEMPORARY normalises to TEMP. */
+/* gram.y DiscardStmt: ALL | TEMP | TEMPORARY | SEQUENCES | PLANS.
+   TEMPORARY normalises to TEMP. DISCARD ALL used to be REJECTED here for
+   parity with the retired legacy parser; PG accepts it (M-NIGHTLY
+   command-tag sweep, 2026-09-24). */
 discard_stmt:
-		DISCARD PLANS            { $$ = NewDiscardStmt($<p>1, "PLANS") }
+		DISCARD ALL              { $$ = NewDiscardStmt($<p>1, "ALL") }
+	| DISCARD PLANS            { $$ = NewDiscardStmt($<p>1, "PLANS") }
 	| DISCARD SEQUENCES          { $$ = NewDiscardStmt($<p>1, "SEQUENCES") }
 	| DISCARD TEMP               { $$ = NewDiscardStmt($<p>1, "TEMP") }
 	| DISCARD TEMPORARY          { $$ = NewDiscardStmt($<p>1, "TEMP") }
