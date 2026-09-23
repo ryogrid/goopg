@@ -16702,7 +16702,7 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
       resume point needs no new instrument.
   Movement: none — measured-no-gap. The census line is the whole production
   change.
-- [ ] **M0145-0018 — relax the `outer-over-derived` firewall
+- [x] **M0145-0018 — relax the `outer-over-derived` firewall
   (owner decision GO, 2026-09-21)**. M0145-0011's E1 measured the
   diagnostic bypass clean at BOTH scales: on SF0.25 AND SF1
   (private `:5547` clone) only Q77/Q78 move, Q78 stays a hash join
@@ -16824,7 +16824,22 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
       `table` now justified by the pricing route, not the firewall),
       `pullup_cte_leaf_test.go`, `in_unnest_sjinfo_test.go`,
       `joinsearchspine_test.go`.
-    - Gates: `go test ./internal/optimizer` PASS; (remaining gates below).
+    - Gates (all PASS): optimizer suite; `units`; tpch-spotcheck Q12=2 /
+      Q13=33; SF0.25 sweep 96/96 with the plan channel moving exactly
+      Q77+Q78; seam census `outer-over-derived` **3 -> 0** on both arms;
+      TPC-H acceptance 24/24 MATCH; SF1 spot-check Q77 5.76 s / Q78 29.01 s
+      values identical; fire-set gate PASS (all fires, both corpora, both
+      arms, `introduced=none`).
+    - **The waived regression did not recur.** With the firewall gone the
+      pulled CTE leaves reach DP carrying `EstimateRows` cardinalities
+      (rows=12/rows=60), not the `rows=1` epsilon — so Q77's degenerate
+      branch elects `Hash Left Join`, not the waived NL. Q78 keeps its
+      ~29 s hash-join class at SF1.
+    - **Infra note**: first fire-set run wedged in
+      `jointree-parity-capture.sh` — an ~11 min clone start (concurrent
+      SF1-server memory pressure) beat the 120 s readiness loop, and
+      cleanup's `wait` blocked forever on the healthy server it never
+      stopped. Re-ran clean. Design doc §"Execution (2026-09-23)" records it.
   Parent: M0145-0011
   - **`[!]` NO-GO 2026-09-21 — the firewall was NOT relaxed.** Design doc
     `docs/design/0100-0149/m0145-0018-firewall-relaxation-no-go.md`.

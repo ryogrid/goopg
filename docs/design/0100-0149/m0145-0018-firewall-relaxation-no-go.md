@@ -1,6 +1,7 @@
-# The `outer-over-derived` relaxation is a NO-GO on the current tree (M0145-0018)
+# The `outer-over-derived` relaxation — executed under owner GO (M0145-0018)
 
-Status: **EXECUTED 2026-09-23.** The owner GO below was executed: the
+Status: **EXECUTED 2026-09-23 — task marked complete; all default-arm
+gates green.** The owner GO below was executed: the
 `outer-over-derived` decline (`problemPairsOuterWithDerived`, including its
 Semi/Anti arms, plus `leafIsDerivedInput`, which had no other reader) is
 removed from `internal/optimizer/relfromjoinlist.go`, and
