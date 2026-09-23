@@ -118,6 +118,11 @@ func consumingIndexClauses(cat catalog.Catalog, tbl *catalog.Table, idx *catalog
 	if len(clauses) == 0 || len(clauses) != len(conjuncts) {
 		return nil
 	}
+	// Same NULL-key rule as the plain restriction producer: entries with a
+	// NULL key column are absent from the byte-key btree.
+	if !indexUnboundKeysNotNull(tbl, idx, len(clauses)) {
+		return nil
+	}
 	// Each clause names a distinct conjunct (one per index column), so equal
 	// counts mean every conjunct is consumed — unless one conjunct bound two
 	// columns, which restrictionEqualityPrefix cannot do (one column per

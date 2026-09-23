@@ -945,6 +945,13 @@ func (o *lockRowsOp) Open(ctx *Context) error {
 					break
 				}
 			}
+			// M0145-0029: a SAOP probe's second-column bounds are folded
+			// by indexScanPredicate too, so they must be row-local as well.
+			for _, b := range []optimizer.Expr{ix.plan.LowKey, ix.plan.HighKey} {
+				if b != nil && exprRefsColumnOrOuter(b) {
+					probeRowLocal = false
+				}
+			}
 		}
 		if probeRowLocal {
 			if idxPred := indexScanPredicate(ix.plan); idxPred != nil &&

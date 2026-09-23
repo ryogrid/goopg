@@ -1625,7 +1625,27 @@ func formatIndexCond(p *optimizer.IndexScan, reg *subPlanReg) string {
 		for _, k := range p.SAOPKeys {
 			parts = append(parts, formatIndexCondKey(k, reg))
 		}
-		return wrapParen(p.Index.Columns[0] + " = ANY (" + strings.Join(parts, ", ") + ")")
+		cond := p.Index.Columns[0] + " = ANY (" + strings.Join(parts, ", ") + ")"
+		// M0145-0029: bounds on the second column (PG
+		// `Index Cond: ((a = ANY (...)) AND (b > 1))`).
+		if (p.LowKey != nil || p.HighKey != nil) && len(p.Index.Columns) > 1 {
+			col := p.Index.Columns[1]
+			if p.LowKey != nil {
+				op := ">="
+				if p.LowOp == parser.OpGt {
+					op = ">"
+				}
+				cond += " AND " + col + " " + op + " " + formatIndexCondKey(p.LowKey, reg)
+			}
+			if p.HighKey != nil {
+				op := "<="
+				if p.HighOp == parser.OpLt {
+					op = "<"
+				}
+				cond += " AND " + col + " " + op + " " + formatIndexCondKey(p.HighKey, reg)
+			}
+		}
+		return wrapParen(cond)
 	}
 	// M0145-0029 slice 2b: an equality prefix followed by bounds on the next
 	// column — PG's `Index Cond: ((a = 7) AND (b > 90))`, rendered in goopg's

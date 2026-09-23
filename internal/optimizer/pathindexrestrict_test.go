@@ -147,10 +147,15 @@ func TestIndexOnlyScanPlanCarriesIndexQuals(t *testing.T) {
 		t.Fatalf("want Keys = [sk key, flag key] in index order, got Key=%v Keys=%v", ios.Key, ios.Keys)
 	}
 
-	// A one-column prefix probe uses Key.
+	// A one-column prefix probe uses Key. The producer declines it here —
+	// i_flag is nullable, and the byte-key btree stores no entry with a NULL
+	// key column — so the lowering is fed the prefix clauses directly.
 	leaf1 := &Filter{Child: &SeqScan{Table: tbl, schema: schema}, Predicate: eqSK, LeafLocal: true}
 	rel.baseLeaf = leaf1
-	p.IndexClauses = consumingIndexClauses(cat, tbl, composite, extractFilterConjuncts(leaf1))
+	if got := consumingIndexClauses(cat, tbl, composite, extractFilterConjuncts(leaf1)); got != nil {
+		t.Fatalf("a probe leaving nullable i_flag unbound must be declined, got %d clauses", len(got))
+	}
+	p.IndexClauses = restrictionEqualityPrefix(cat, tbl, composite, extractFilterConjuncts(leaf1))
 	if ios, ok := createIndexScanPlan(p).(*IndexOnlyScan); !ok || ios.Key == nil || ios.Keys != nil {
 		t.Fatalf("one-column prefix: want Key set and Keys nil, got %#v", createIndexScanPlan(p))
 	}
@@ -256,8 +261,14 @@ func TestRestrictionSAOPIndexScanOnJointreePipeline(t *testing.T) {
 		t.Fatalf("Plan: %v", err)
 	}
 	scan := findIndexScan(node)
-	if scan == nil || len(scan.SAOPKeys) != 2 || scan.Key != nil || len(scan.Keys) != 0 || scan.LowKey != nil || scan.HighKey != nil {
-		t.Fatalf("want a 2-descent SAOP IndexScan and no other probe shape, got %+v", scan)
+	if scan == nil || len(scan.SAOPKeys) != 2 || scan.Key != nil || len(scan.Keys) != 0 || scan.HighKey != nil {
+		t.Fatalf("want a 2-descent SAOP IndexScan, got %+v", scan)
+	}
+	// On the composite (i_item_sk, i_flag) the `i_flag > 1` bound joins the
+	// probe — PG's own choice here, `Index Cond: ((i_item_sk = ANY (...)) AND
+	// (i_flag > 1))`; on the single-column pkey there is no second column.
+	if hasBound := scan.LowKey != nil; hasBound != (scan.Index.Name == "idx_item_sk_flag") {
+		t.Fatalf("%s: a second-column bound belongs exactly to the composite index (LowKey=%v)", scan.Index.Name, scan.LowKey)
 	}
 	f := findFilterOver(node, scan)
 	if f == nil {
@@ -351,4 +362,74 @@ func TestMatchBitmapIndexQualsIsGapless(t *testing.T) {
 	if got, _ := matchBitmapIndexQuals(composite, tbl, []Expr{eqFlag}, &scanIdentity{}); len(got) != 0 {
 		t.Fatalf("i_flag = 7 alone binds no prefix of (i_item_sk, i_flag); got %d clauses", len(got))
 	}
+}
+
+// SAOP + range: `a IN (7, 8) AND b > 90` on (a, b) plans one IndexScan with
+// SAOPKeys on a and the bound on b (PG `Index Cond: ((a = ANY (...)) AND
+// (b > 90))`); the bound stays in the Filter as a recheck, the IN does not.
+func TestRestrictionSAOPPlusRangeOnJointreePipeline(t *testing.T) {
+	prev := jointreePipeline
+	jointreePipeline = true
+	t.Cleanup(func() { jointreePipeline = prev })
+
+	c := prTestCatalog(t, []string{"a", "b"}, true)
+	node, err := Plan(parseOne(t, "SELECT c FROM pr WHERE a IN (7, 8) AND b > 90"), c)
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+	scan := findIndexScan(node)
+	if scan == nil || len(scan.SAOPKeys) != 2 || scan.LowKey == nil || scan.LowOp != parser.OpGt || scan.HighKey != nil {
+		t.Fatalf("want SAOPKeys=[7 8] + LowKey > 90, got %+v", scan)
+	}
+	f := findFilterOver(node, scan)
+	if f == nil {
+		t.Fatal("the bound must stay as a Filter recheck")
+	}
+	if _, isIn := f.Predicate.(*InExpr); isIn {
+		t.Fatal("the IN is applied by the descents; it must not stay in the Filter")
+	}
+}
+
+// The byte-key btree stores no entry with a NULL key column, so a probe that
+// leaves a NULLABLE key column unbound would miss rows: on (a, b, c) with c
+// nullable, `a = 7 AND b > 90` must not use the index; with c NOT NULL it may.
+func TestRestrictionProbeDeclinesUnboundNullableKeyColumn(t *testing.T) {
+	prev := jointreePipeline
+	jointreePipeline = true
+	t.Cleanup(func() { jointreePipeline = prev })
+
+	for _, cNotNull := range []bool{false, true} {
+		c := prTestCatalog(t, []string{"a", "b", "c"}, cNotNull)
+		node, err := Plan(parseOne(t, "SELECT c FROM pr WHERE a = 7 AND b > 90"), c)
+		if err != nil {
+			t.Fatalf("Plan: %v", err)
+		}
+		scan := findIndexScan(node)
+		if !cNotNull && scan != nil {
+			t.Fatalf("c nullable: an index probe binding (a, b) would miss (7, 95, NULL); got IndexScan %s", scan.Index.Name)
+		}
+		if cNotNull && (scan == nil || len(scan.RangePrefix) != 1) {
+			t.Fatalf("c NOT NULL: want the prefix+range probe, got %+v", scan)
+		}
+	}
+}
+
+// prTestCatalog builds pr(a, b, c int4) — c NOT NULL when cNotNull — with one
+// btree index on idxCols and measured 100k-row statistics.
+func prTestCatalog(t *testing.T, idxCols []string, cNotNull bool) *catalog.InMemory {
+	t.Helper()
+	c := catalog.NewInMemory()
+	tbl, err := c.CreateTable(parser.ObjectName{Name: "pr"}, []catalog.Column{
+		{Name: "a", Type: catalog.Type{Name: "int4"}},
+		{Name: "b", Type: catalog.Type{Name: "int4"}},
+		{Name: "c", Type: catalog.Type{Name: "int4"}, NotNull: cNotNull},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.CreateIndex(parser.ObjectName{Name: "pr_idx"}, tbl, idxCols, false, "btree", false); err != nil {
+		t.Fatal(err)
+	}
+	tbl.Stats = &catalog.TableStats{RowCount: 100000, Pages: 10000, Analyzed: true}
+	return c
 }

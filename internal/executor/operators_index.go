@@ -721,6 +721,45 @@ func (o *indexScanOp) rescanSAOP() error {
 	// holds only TIDs actually pulled.
 	o.saopSeen = make(map[storage.ItemPointer]struct{}, len(o.plan.SAOPKeys))
 	hashRecorded := false
+	// M0145-0029: a SAOP probe may carry bounds on the SECOND index column
+	// (PG `Index Cond: ((a = ANY (...)) AND (b > 1))`). Each element's
+	// descent then runs [elem, low] .. [elem, high]; a missing side keeps the
+	// element's own prefix bound. The bounds are evaluated once.
+	var boundCol *catalog.Column
+	var lowV, highV Datum
+	hasLow, hasHigh := o.plan.LowKey != nil, o.plan.HighKey != nil
+	if hasLow || hasHigh {
+		if len(o.plan.Index.Columns) < 2 {
+			return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: fmt.Sprintf("SAOP probe on %q carries a bound but the index has no second column", o.plan.Index.Name)}
+		}
+		c2, ok2 := o.ctx.Catalog.LookupColumn(o.plan.Table, o.plan.Index.Columns[1])
+		if !ok2 {
+			return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: fmt.Sprintf("indexed column %q not found on table %q", o.plan.Index.Columns[1], o.plan.Table.Name)}
+		}
+		boundCol = c2
+		if hasLow {
+			v, err := evalExprSlot(o.plan.LowKey, o.outerSlot, o.ctx)
+			if err != nil {
+				return err
+			}
+			if v.IsNull() {
+				o.finalizeIndexScanSSI()
+				return nil
+			}
+			lowV = v
+		}
+		if hasHigh {
+			v, err := evalExprSlot(o.plan.HighKey, o.outerSlot, o.ctx)
+			if err != nil {
+				return err
+			}
+			if v.IsNull() {
+				o.finalizeIndexScanSSI()
+				return nil
+			}
+			highV = v
+		}
+	}
 	for _, ke := range o.plan.SAOPKeys {
 		v, err := evalExprSlot(ke, o.outerSlot, o.ctx)
 		if err != nil {
@@ -738,6 +777,33 @@ func (o *indexScanOp) rescanSAOP() error {
 		hiBytes := key
 		if len(o.plan.Index.Columns) > 1 {
 			hiBytes = o.ctx.compositeUpperBound(o.plan.Index, key)
+		}
+		if boundCol != nil {
+			// Same padding rules as the range branch in Rescan, one column
+			// further in: an exclusive low skips every entry equal to it, an
+			// inclusive high covers every entry sharing it, when columns
+			// follow the bounded one.
+			more := len(o.plan.Index.Columns) > 2
+			if hasLow {
+				lk, encErr := o.ctx.indexProbeKey(o.plan.Index, []indexProbeKeyPart{parts[0], {col: boundCol, val: lowV, pos: o.plan.LowKey.Pos()}})
+				if encErr != nil {
+					return encErr
+				}
+				if more && o.plan.LowOp == parser.OpGt {
+					lk = o.ctx.compositeUpperBound(o.plan.Index, lk)
+				}
+				key = lk
+			}
+			if hasHigh {
+				hk, encErr := o.ctx.indexProbeKey(o.plan.Index, []indexProbeKeyPart{parts[0], {col: boundCol, val: highV, pos: o.plan.HighKey.Pos()}})
+				if encErr != nil {
+					return encErr
+				}
+				if more && o.plan.HighOp != parser.OpLt {
+					hk = o.ctx.compositeUpperBound(o.plan.Index, hk)
+				}
+				hiBytes = hk
+			}
 		}
 		if o.hashBucketScan && len(o.hashProbeFingerprint) > 0 {
 			ssiRecordHashBucketRead(o.ctx, o.heapRel.DBOid, o.plan.Index.OID, o.hashProbeFingerprint)
@@ -853,7 +919,11 @@ func (o *indexScanOp) nextLeafBatch() (more bool, err error) {
 			}
 			b := o.saopBounds[o.saopIdx]
 			o.saopIdx++
-			cur, cerr := o.tree.NewScanCursor(b[0], b[1], false, false, nil)
+			// Strictness applies only to a bound the plan actually carries;
+			// the element's own prefix bounds are inclusive.
+			loExcl := o.plan.LowKey != nil && o.plan.LowOp == parser.OpGt
+			hiExcl := o.plan.HighKey != nil && o.plan.HighOp == parser.OpLt
+			cur, cerr := o.tree.NewScanCursor(b[0], b[1], loExcl, hiExcl, nil)
 			if cerr != nil {
 				return false, &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: cerr.Error()}
 			}

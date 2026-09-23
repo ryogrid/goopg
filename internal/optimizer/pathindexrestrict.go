@@ -334,6 +334,13 @@ func (s *searchCtx) addOneRestrictionIndexPath(cat catalog.Catalog, rel *RelOptI
 	if len(clauses) == 0 {
 		clauses = restrictionLeadingSAOP(cat, tbl, idx, conjuncts)
 		isSAOP = len(clauses) > 0
+		// A SAOP on the leading column may be followed by bounds on the
+		// second (PG `Index Cond: ((a = ANY (...)) AND (b > 1))`). The bounds
+		// stay in the Filter as a recheck (restrictionRangeOnColumn records no
+		// `local` behind a leading column).
+		if isSAOP && len(idx.Columns) > 1 {
+			clauses = append(clauses, restrictionRangeOnColumn(cat, tbl, idx, 1, conjuncts)...)
+		}
 	}
 	if len(clauses) == 0 {
 		clauses = restrictionLeadingRange(cat, tbl, idx, conjuncts)
@@ -350,6 +357,15 @@ func (s *searchCtx) addOneRestrictionIndexPath(cat catalog.Catalog, rel *RelOptI
 	if s.restrictionPathIsIndexOnly(cat, tbl, idx, conjuncts) {
 		return false
 	}
+	// The byte-key btree stores NO entry whose key has a NULL column
+	// (collectBTreeEntries: "not storable in the byte-key btree"), so a probe
+	// that leaves a nullable key column unbound would silently miss every
+	// matching row with a NULL there (measured: `a IN (7, 8) AND b > 90` on
+	// (a, b, c) lost the (7, 92, NULL) row). Bound columns are safe — a NULL
+	// there fails the qual anyway. PG stores NULL keys and has no such rule.
+	if !indexUnboundKeysNotNull(tbl, idx, boundIndexColumns(clauses)) {
+		return false
+	}
 	var sel float64
 	var unique bool
 	numSAScans := 0.0
@@ -358,6 +374,9 @@ func (s *searchCtx) addOneRestrictionIndexPath(cat catalog.Catalog, rel *RelOptI
 		// scalararraysel over the IN (clauseSelectivity's InExpr arm), and
 		// one descent per element (btcostestimate's num_sa_scans).
 		sel = clampSelectivity(clauseSelectivity(clauses[0].local, rel.baseLeaf))
+		if len(clauses) > 1 {
+			sel = clampSelectivity(sel * rangeIndexSelectivity(rel.baseLeaf, conjuncts, clauses[1:]))
+		}
 		numSAScans = float64(len(clauses[0].saop))
 	case isRange:
 		sel = rangeIndexSelectivity(rel.baseLeaf, conjuncts, clauses)
@@ -422,3 +441,48 @@ func (s *searchCtx) addOneRestrictionIndexPath(cat catalog.Catalog, rel *RelOptI
 	}, "index.restrict")
 	return true
 }
+
+// boundIndexColumns is how many leading index columns the clauses bind: one
+// past the highest bound index column (equality prefix, SAOP, or a range on
+// the column after them).
+func boundIndexColumns(clauses []indexPathClause) int {
+	n := 0
+	for _, c := range clauses {
+		if c.indexCol+1 > n {
+			n = c.indexCol + 1
+		}
+	}
+	return n
+}
+
+// indexUnboundKeysNotNull reports whether every index key column from
+// position `bound` on is declared NOT NULL — the condition under which a
+// probe binding only the first `bound` columns cannot miss rows the byte-key
+// btree never stored (entries with a NULL key column are absent). Expression
+// key columns (no catalog column) are treated as nullable.
+func indexUnboundKeysNotNull(tbl *catalog.Table, idx *catalog.Index, bound int) bool {
+	if tbl == nil || idx == nil {
+		return false
+	}
+	for i := bound; i < len(idx.Columns); i++ {
+		name := idx.Columns[i]
+		if name == "" {
+			return false
+		}
+		found := false
+		for _, c := range tbl.Columns {
+			if c.Name == name {
+				if !c.NotNull {
+					return false
+				}
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
+}
+

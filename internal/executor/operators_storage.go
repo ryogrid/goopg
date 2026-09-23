@@ -3644,7 +3644,29 @@ func indexScanPredicate(ix *optimizer.IndexScan) optimizer.Expr {
 		}
 		keys := make([]optimizer.Expr, 0, len(ix.SAOPKeys))
 		keys = append(keys, ix.SAOPKeys...)
-		return &optimizer.InExpr{Operand: ref, List: keys}
+		var combined optimizer.Expr = &optimizer.InExpr{Operand: ref, List: keys}
+		// M0145-0029: a SAOP probe's bounds sit on the SECOND index column.
+		if (ix.LowKey != nil || ix.HighKey != nil) && len(ix.Index.Columns) > 1 {
+			ref2, ok2 := indexScanColumnRef(ix, ix.Index.Columns[1])
+			if !ok2 {
+				return nil
+			}
+			if ix.LowKey != nil {
+				op := parser.OpGe
+				if ix.LowOp == parser.OpGt {
+					op = parser.OpGt
+				}
+				combined = &optimizer.BinaryOp{Op: parser.OpAnd, Left: combined, Right: &optimizer.BinaryOp{Op: op, Left: ref2, Right: ix.LowKey}}
+			}
+			if ix.HighKey != nil {
+				op := parser.OpLe
+				if ix.HighOp == parser.OpLt {
+					op = parser.OpLt
+				}
+				combined = &optimizer.BinaryOp{Op: parser.OpAnd, Left: combined, Right: &optimizer.BinaryOp{Op: op, Left: ref2, Right: ix.HighKey}}
+			}
+		}
+		return combined
 
 	case ix.LowKey != nil || ix.HighKey != nil:
 		// M0145-0029 slice 2b: a RangePrefix probe is `Columns[i] =

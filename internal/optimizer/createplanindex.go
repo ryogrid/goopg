@@ -412,13 +412,13 @@ func createIndexScanPlan(p *Path) Node {
 	// column (`op` != equality), lowered onto LowKey/HighKey with the
 	// ORIGINAL strictness in LowOp/HighOp — the fields tryRangeIndexScan
 	// fills, which the executor and EXPLAIN already read.
-	if hasRangeClause(p.IndexClauses) {
-		return createRangeIndexScanPlan(p, id, rewrap)
-	}
 	// M0145-0029 slice 4: a ScalarArrayOp path — one clause on the leading
 	// column, lowered onto SAOPKeys (the executor's multi-descent arm).
-	if len(p.IndexClauses) == 1 && len(p.IndexClauses[0].saop) > 0 {
+	if len(p.IndexClauses) >= 1 && len(p.IndexClauses[0].saop) > 0 {
 		return createSAOPIndexScanPlan(p, id, rewrap)
+	}
+	if hasRangeClause(p.IndexClauses) {
+		return createRangeIndexScanPlan(p, id, rewrap)
 	}
 
 	ncols := len(p.IndexInfo.Columns)
@@ -594,6 +594,29 @@ func createSAOPIndexScanPlan(p *Path, id *scanIdentity, rewrap scanLeafRewrap) N
 	if p.IndexOnly || p.RequiredOuter != 0 || c.indexCol != 0 || c.key != nil || c.op != parser.OpUnknown {
 		panic(fmt.Sprintf("createPlan: SAOP PathIndexScan on %s must be one leading-column clause on a plain unparameterised scan", p.IndexInfo.Name))
 	}
+	var low, high Expr
+	var lowOp, highOp parser.OpCode
+	for i, r := range p.IndexClauses[1:] {
+		// Bounds on the second column (restrictionRangeOnColumn(…, 1, …)):
+		// kept in the Filter, so they must carry no `local`.
+		if r.indexCol != 1 || r.key == nil || r.local != nil || len(r.saop) > 0 {
+			panic(fmt.Sprintf("createPlan: SAOP PathIndexScan on %s: clause %d is not a second-column bound", p.IndexInfo.Name, i+1))
+		}
+		switch r.op {
+		case parser.OpGt, parser.OpGe:
+			if low != nil {
+				panic(fmt.Sprintf("createPlan: SAOP PathIndexScan on %s carries two lower bounds", p.IndexInfo.Name))
+			}
+			low, lowOp = r.key, r.op
+		case parser.OpLt, parser.OpLe:
+			if high != nil {
+				panic(fmt.Sprintf("createPlan: SAOP PathIndexScan on %s carries two upper bounds", p.IndexInfo.Name))
+			}
+			high, highOp = r.key, r.op
+		default:
+			panic(fmt.Sprintf("createPlan: SAOP PathIndexScan on %s: clause %d is not a range bound", p.IndexInfo.Name, i+1))
+		}
+	}
 	is := &IndexScan{
 		pos:                   id.pos,
 		Table:                 id.table,
@@ -601,6 +624,10 @@ func createSAOPIndexScanPlan(p *Path, id *scanIdentity, rewrap scanLeafRewrap) N
 		RTID:                  id.rtid,
 		Index:                 p.IndexInfo,
 		SAOPKeys:              append([]Expr(nil), c.saop...),
+		LowKey:                low,
+		LowOp:                 lowOp,
+		HighKey:               high,
+		HighOp:                highOp,
 		schema:                id.schema,
 		SmallDim:              id.smallDim,
 		UniqueKeys:            id.uniqueKeys,
