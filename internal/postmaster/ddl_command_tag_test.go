@@ -57,6 +57,7 @@ func TestDDLCommandTagMatchesPostgres(t *testing.T) {
 		{"do", `DO 'begin null; end'`, "DO"},
 		{"reindex", `REINDEX TABLE t`, "REINDEX"},
 		{"cluster", `CLUSTER t`, "CLUSTER"},
+		{"lock table", `LOCK TABLE t`, "LOCK TABLE"},
 		{"create operator family", `CREATE OPERATOR FAMILY my_opf USING btree`, "CREATE OPERATOR FAMILY"},
 		{"create operator", `CREATE OPERATOR === (LEFTARG = int4, RIGHTARG = int4, FUNCTION = int4eq)`, "CREATE OPERATOR"},
 		{"create conversion", `CREATE CONVERSION my_conv FOR 'UTF8' TO 'LATIN1' FROM my_conv_func`, "CREATE CONVERSION"},

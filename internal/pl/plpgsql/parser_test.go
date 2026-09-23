@@ -436,16 +436,44 @@ func TestParseDeclareEmpty(t *testing.T) {
 	}
 }
 
-// TestParseAssignWithoutColonEqError: bare-identifier statement
-// without `:=` surfaces the Stage-A-4b diagnostic naming the two
-// supported shapes.
+// TestParseAssignWithoutColonEqError: a bare identifier followed by an
+// assignment-shaped token that is not `:=`/`=` still surfaces the
+// Stage-A-4b diagnostic; one followed by anything else is plain SQL
+// (pl_gram.y stmt_execsql T_WORD), which the SQL parser judges later.
 func TestParseAssignWithoutColonEqError(t *testing.T) {
-	_, err := Parse("BEGIN foo bar; END")
+	_, err := Parse("BEGIN foo[1] bar; END")
 	if err == nil {
 		t.Fatal("expected SyntaxError")
 	}
-	if !strings.Contains(err.Error(), ":=") {
-		t.Errorf("err = %v, want a `:=` diagnostic", err)
+	blk, err := Parse("BEGIN foo bar; END")
+	if err != nil {
+		t.Fatalf("`foo bar;` must parse as embedded SQL, got %v", err)
+	}
+	if _, ok := blk.Statements[0].(*SQLStmt); !ok {
+		t.Fatalf("`foo bar;` parsed as %T, want *SQLStmt", blk.Statements[0])
+	}
+}
+
+// TestParseNonDMLSQLCommandsAsEmbeddedSQL: SQL commands with no PL/pgSQL
+// meaning reach the embedded-SQL path whether goopg's lexer makes their
+// leading word an identifier (LOCK, NOTIFY) or a keyword (TRUNCATE, …),
+// as pl_gram.y's stmt_execsql does. Before 2026-09-23 `lock table t;`
+// failed "expected ':=' or '=' after \"lock\"" and TRUNCATE failed
+// "unsupported PL/pgSQL statement".
+func TestParseNonDMLSQLCommandsAsEmbeddedSQL(t *testing.T) {
+	for _, stmt := range []string{
+		"lock table t", "LOCK t IN SHARE MODE", "notify ch", "listen ch",
+		"truncate t", "analyze t", "reindex table t", "cluster t",
+		"with q as (select 1) select * from q", "values (1)", "table t",
+	} {
+		blk, err := Parse("BEGIN " + stmt + "; END")
+		if err != nil {
+			t.Errorf("%q: %v", stmt, err)
+			continue
+		}
+		if _, ok := blk.Statements[0].(*SQLStmt); !ok {
+			t.Errorf("%q parsed as %T, want *SQLStmt", stmt, blk.Statements[0])
+		}
 	}
 }
 

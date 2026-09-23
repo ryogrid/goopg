@@ -4241,6 +4241,8 @@ func stmtCommandTag(stmt parser.Stmt) (string, bool) {
 		return "REINDEX", true
 	case *parser.ClusterStmt:
 		return "CLUSTER", true
+	case *parser.LockTableStmt:
+		return "LOCK TABLE", true
 	}
 	return "", false
 }

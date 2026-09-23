@@ -388,6 +388,25 @@ func routineArgTypesStr(r *catalog.Routine) string {
 // Go's default 1GB max goroutine stack is at risk.
 const maxRoutineCallDepth = 2000
 
+// enterRoutineBody raises ctx.RoutineDepth for the duration of a routine body
+// — a function, a procedure (CALL) or a DO block — and applies the same 54001
+// stack-depth guard as executeStoredRoutine. RoutineDepth > 0 is goopg's
+// `!isTopLevel`: PostgreSQL runs every such body through SPI, so a statement
+// inside it is never top-level (RequireTransactionBlock / PreventInTransaction-
+// Block exempt it). The returned func restores the depth; call it via defer.
+func enterRoutineBody(ctx *Context, pos int) (func(), error) {
+	if ctx == nil {
+		return func() {}, nil
+	}
+	ctx.RoutineDepth++
+	leave := func() { ctx.RoutineDepth-- }
+	if ctx.RoutineDepth > maxRoutineCallDepth {
+		leave()
+		return func() {}, &ExecError{Code: "54001", Pos: pos, Message: "stack depth limit exceeded"}
+	}
+	return leave, nil
+}
+
 func executeStoredRoutine(r *catalog.Routine, args []Datum, ctx *Context, pos int) (Datum, error) {
 	// Procedures cannot be called via SELECT - only via CALL.
 	if r.IsProcedure {

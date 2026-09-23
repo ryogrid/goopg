@@ -1764,6 +1764,13 @@ func (o *ddlOp) execDoBlock(s *parser.DoStmt) error {
 	// Advance the command counter so the DO body sees the caller's writes,
 	// mirroring executePLpgSQLRoutine. M-NIGHTLY AI-20260809-020705-019.
 	routineCommandCounterIncrement(o.ctx, r)
+	// The DO body is not top-level (PG runs it through the inline handler's
+	// SPI connection), so e.g. LOCK TABLE inside it needs no transaction block.
+	leave, derr := enterRoutineBody(o.ctx, s.Pos())
+	if derr != nil {
+		return derr
+	}
+	defer leave()
 	_, flow, execErr := executePLpgSQLStmtList(block.Statements, r, frame, o.ctx)
 	if execErr != nil {
 		return execErr
@@ -27273,6 +27280,17 @@ func (o *ddlOp) execAlterColumnType(tbl *catalog.Table, act parser.AlterTableAct
 // locking a view also locks its underlying tables/views recursively. M0097.
 // The locks are released when the session's transaction ends (execCommit/execRollback).
 func (o *ddlOp) execLockTable(s *parser.LockTableStmt) error {
+	// RequireTransactionBlock(isTopLevel, "LOCK TABLE")
+	// (postgres/src/backend/tcop/utility.c:936) runs before the relations are
+	// even resolved: a top-level LOCK outside a transaction block would release
+	// its lock immediately, so PG presumes user error. Inside a routine (a
+	// PL/pgSQL body, a DO block) the statement is not top-level and is allowed —
+	// goopg's isTopLevel is RoutineDepth == 0. A nil Session is an embedded
+	// context with no transaction-block notion, so it is left alone.
+	if o.ctx.RoutineDepth == 0 && o.ctx.Session != nil && !o.ctx.Session.InExplicitTransaction() {
+		return &ExecError{Code: "25P01", Pos: s.Pos(),
+			Message: "LOCK TABLE can only be used in transaction blocks"}
+	}
 	sess := o.ctx.Session
 	if sess == nil {
 		return nil
