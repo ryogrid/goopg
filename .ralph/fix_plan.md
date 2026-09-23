@@ -18228,7 +18228,7 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
       legacy search\) and the M0145\-0002 TPC\-H captures. The §Goal floor
       re\-pin stays with the owner.
   Movement: none
-- [ ] **M0145-0026 — recon: duplicate hashclause in the path key list**
+- [x] **M0145-0026 — recon: duplicate hashclause in the path key list**
   \(filed 2026-09-23 by M0145-0007 slice 5\). On TPC-DS SF0.25 \(both
   arms\) 5 ANTI hash joins from Q78's `LEFT JOIN … WHERE sr_ticket_number
   IS NULL` arms reach lowering with the path key list
@@ -18245,6 +18245,32 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
   \(`GOOPG_HASHKEY_PROBE=1`, `verdict=DIFFLEN` lines\). Recon only.
   Kind: recon
   Parent: M0145-0007
+  - **CLOSED 2026\-09\-23 \(ralph2 loop \#27\).** Design doc
+    `docs/design/0100-0149/m0145-0026-duplicate-hashclause-recon.md`; probe
+    `m0145-0026-dupkey-probe.patch`.
+    - The duplicates are Q78\'s three LEFT→ANTI \(`FromOuterReduction`\)
+      joins: `t = r` and `r = t`, both explicit and in the same EC.
+    - Entry point: the seam\'s semi/anti fold
+      \(`joinsearchseam.go:1888` / `:2252`\) re\-adds `LeftKey = RightKey`.
+      It assumes the unnest convention, but `planFromItem`
+      \(`planner.go:4467`\) keeps the equality in `Predicate`.
+    - Selectivity: no double count \(`oneClausePerEquivClass`\). Cost:
+      `numHashClauses` 3 instead of 2, one extra `cpu_operator_cost` per
+      build and probe row.
+    - Fix filed as M0145\-0026a.
+  Movement: none
+- [ ] **M0145-0026a — fold a semi/anti link's key equality only when its
+  predicate lacks it** \(filed 2026\-09\-23 by M0145\-0026\). At
+  `extractSearchLeaves` \(`joinsearchseam.go:1888`\) and
+  `extractScopeLeaves` \(`:2252`\), add `LeftKey = RightKey` only when no
+  conjunct of the link\'s `Predicate` is that equality in either
+  orientation, so the restrictlist holds one restrictinfo per clause, as PG
+  does \(`hash_inner_and_outer`, joinpath.c\). Witness: a unit test on the
+  Q78 arm shape through the semi/anti link route asserting `n=2` hash keys;
+  movement = Q78 hash\-anti costs before/after, on both pipelines. Full
+  default\-arm gates plus the fire\-set gate.
+  Kind: impl
+  Parent: M0145-0026
 - [x] **M0145-0027 — knob-arm TPC-H Q20 decorrelates a correlated scalar
   subquery PG keeps as a SubPlan** \(filed 2026-09-23 by the M0145-0008
   executor-capability inventory\). Full 22-query acceptance arm, same
