@@ -2311,6 +2311,14 @@ heuristic stays live.)
     \(NULLS LAST\). Check whether the plain `IndexScan` prefix probe, the
     bitmap probe and the tuple\-format \(`pgIndexKeyDesc` \!= nil\) path share
     it.
+  - **Wider than index\-only \(2026\-09\-23, loop \#15 probe\):** the plain
+    `IndexScan` prefix probe misses the row too — `SELECT a, b, c FROM s2
+    WHERE a = 10` on `\(a, b\)` plans `IndexScan … Key = 10` and returns 3,
+    PG 4 — and so does the SAOP multi\-descent \(`a IN \(10, 11\)` → 6, PG
+    7\). Every composite prefix probe \(`Key`, short `Keys`, `SAOPKeys`\) is
+    affected. This probe ran on the jointree arm; the legacy default
+    reaches the same executor arms \(its index\-only case is verified
+    above\).
 - [x] **setop output type is the FIRST member's, not `select_common_type`'s
   (found 2026-09-21 by an M0145-0004 discovery probe)** — **FIXED
   2026-09-22** for PostgreSQL's numeric type category, which covers both
@@ -18299,6 +18307,21 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
     - Remaining: 2b range on the bitmap producer \+ equality prefix
       followed by a range column \(needs an executor probe shape\); 4 SAOP;
       5 group\-I re\-run.
+  - **Slice 4 LANDED 2026\-09\-23 \(ralph2 loop \#15\), `729027e28`.**
+    ScalarArrayOp \(`col IN \(…\)` / `= ANY`\) on the leading column.
+    - `restrictionLeadingSAOP` with `trySAOPIndexScan`'s gates; lowered onto
+      `IndexScan.SAOPKeys`, IN dropped from the Filter; cost via
+      scalararraysel \+ `numSAScans`.
+    - Knob arm: TPC\-DS Q45 SubPlan 1 now costed by this path — rows
+      18000 → 10 \(PG 10\), same shape; Q45 joins the fire set \(cost\-only\),
+      executes PASS at both scales.
+    - `TestSAOPWithConjunctMoves` under the flip: the SAOP path is generated
+      but the no\-stats fixture \(1 row, 1 page\) elects the seq scan —
+      fixture artefact for slice 5; with 100k measured rows the path wins
+      \(`TestRestrictionSAOPIndexScanOnJointreePipeline`\).
+    - The probe widened the filed trailing\-NULL bug to plain and SAOP
+      composite prefix probes.
+    - Remaining: 2b \(bitmap range; eq\-prefix\+range\), 5 group\-I re\-run.
 - [ ] **M0145-0030 — group B: adjudicate the 11 behavioural flip-triage
   tests before the flip** (same filing). The flip-triage doc lists 11
   behavioural failures: grouping strategy, nested scalar subquery, NLI

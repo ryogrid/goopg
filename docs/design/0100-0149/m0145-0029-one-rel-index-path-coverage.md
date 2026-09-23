@@ -1,6 +1,6 @@
 # M0145-0029 — one-relation index-path coverage before the flip
 
-Status: slices 1, 2a and 3 landed 2026-09-23 (`fe3d1b0aa`, `fc716f1f8`, `6d50210f4`); slices 2b, 4, 5 open. Task:
+Status: slices 1, 2a, 3 and 4 landed 2026-09-23 (`fe3d1b0aa`, `fc716f1f8`, `6d50210f4`, `729027e28`); slices 2b and 5 open. Task:
 `.ralph/fix_plan.md` M0145-0029 (Kind: impl, Parent: M0145-0008). Origin: the
 M0145-0008 flip triage, group I (`m0145-0008-flip-test-triage.md`).
 
@@ -56,7 +56,7 @@ tests build them):
 | 2a | range bounds (`<`, `<=`, `>`, `>=`, BETWEEN) on the index's leading column — plain producer | **landed** `fc716f1f8` |
 | 2b | range on the bitmap producer; equality prefix followed by a range column (needs a new executor probe shape) | open |
 | 3 | index-only scan with index quals (`create_index_path(indexonly=true)` with `index_clauses`), one path per index | **landed** `6d50210f4` |
-| 4 | ScalarArrayOp (`col IN (…)` / `= ANY`) quals — plain and bitmap | open |
+| 4 | ScalarArrayOp (`col IN (…)` / `= ANY`) quals on the leading column — plain producer (bitmap SAOP: ledgered) | **landed** `729027e28` |
 | 5 | re-run group I under a local flip; update stale expectations to the PG-faithful shape with the oracle capture (or pin the executor feature they test with `enable_seqscan`/`enable_bitmapscan` off, as PG's regress does) | open |
 
 ## Slice 1 design (`internal/optimizer/pathindexrestrict.go`)
@@ -152,4 +152,36 @@ return the right counts, with NULLs excluded. The same probe found a
 index skips entries whose trailing column is NULL (`SELECT a FROM r2 WHERE a
 = 10` → 3 rows, PG 4), on the default pipeline too. It is filed as its own
 bug task in `.ralph/fix_plan.md`. No corpus plan moved on either arm.
+
+## Slice 4 design (`pathindexrestrict.go`, `createplanindex.go`)
+
+- `restrictionLeadingSAOP` binds the leading column to the first local
+  `col IN (list)` / `col = ANY (list)` usable as a btree multi-descent. It
+  applies `match_saopclause_to_indexcol`'s gates (`indxpath.c:3136`) as the
+  rule-based `trySAOPIndexScan` reproduces them:
+  - OR of equality only: `NOT IN`, `!= ANY`, `ALL` and other operators are
+    not a union of descents, so they decline;
+  - a bare column operand;
+  - constant elements the key encoder takes (no boolean, no enum string).
+
+  It runs only when no equality prefix binds the index, because `SAOPKeys`
+  excludes every other probe shape in the executor.
+- `indexPathClause.saop` carries the elements. `createSAOPIndexScanPlan`
+  lowers them onto `IndexScan.SAOPKeys` and drops the IN from the reinstated
+  Filter: the descents are exactly the IN, and the executor dedupes rows by
+  TID, so duplicate elements are safe.
+- Cost: `scalararraysel` through `clauseSelectivity`'s InExpr arm, and
+  `numSAScans` = element count (`btcostestimate`'s `num_sa_scans`).
+
+Measured on the new pipeline: TPC-DS Q45's `SubPlan 1` (`item_pkey …
+i_item_sk = ANY (10 constants)`) keeps its shape but is now costed by this
+path. Its row estimate went from 18,000 to 10 (PG: 10), so Q45 joins the fire
+set as a cost-only change and executes correctly at SF0.25 and SF1. The
+default arm is unchanged (sweep same=99). `TestSAOPWithConjunctMoves` under
+the flip generates the SAOP path, but its no-stats fixture (1 row, 1 page)
+elects the seq scan, so that expectation is for slice 5; with 100k measured
+rows the path wins (`TestRestrictionSAOPIndexScanOnJointreePipeline`). The
+execution probe also showed that the trailing-NULL prefix-probe bug affects
+plain and SAOP composite probes, not only index-only ones; the bug task was
+widened.
 
