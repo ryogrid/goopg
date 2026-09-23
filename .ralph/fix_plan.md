@@ -2218,7 +2218,7 @@ heuristic stays live.)
     through a ~19-minute stage.
 
 ### Nightly run 20260924-005446 (1 item) — filed 2026-09-24
-- [ ] **tpcds/stage** — nightly TPC-DS stage failed at startup: server not
+- [x] **tpcds/stage** — nightly TPC-DS stage failed at startup: server not
   ready in 120 s
   (AI-20260924-005446-001; repro: `bash ci/batch/stages/stage-tpcds.sh`,
   evidence `ci/logs/20260924-005446/tpcds/`).
@@ -2238,6 +2238,18 @@ heuristic stays live.)
     - The same run\'s TPC\-H stage was `skip\(port\-busy\)`, most likely a
       collision with the loop\'s own spotcheck/acceptance\-arm servers at the
       same time.
+  - **CLOSED as stale 2026\-09\-24 \(ralph2 loop \#38\).** Re\-ran the real
+    stage on a quiet host \(nightly idle, no loop gates running\):
+    `REPO\_ROOT=$PWD RUN\_DIR=tmp/nightly\-repro\-043033
+    NIGHTLY\_TPCDS\_BIN=tmp/nightly\-repro\-tpcds\-bin
+    NIGHTLY\_TPCDS\_QUERIES=3 bash ci/batch/stages/stage\-tpcds.sh` → rc 0.
+    - The same 3284 MB SF1 copy, build, and fresh server on :65435 were
+      ready in 8 s \(04:30:37 → 04:30:45\), against the 120 s window; the
+      spotchecks Q3=31 and Q98=2531 PASS; Q3 ok.
+    - Confirms the triage: the 01:42 failure was induced by the loop\'s
+      concurrent FORCE=1 gates contending for disk while startup read WAL
+      segments. No code change.
+    Movement: none
 
 ### Manually discovered (not yet in a nightly `ci/logs/action-items.md` run) — filed 2026-09-15
 
