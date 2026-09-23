@@ -4275,20 +4275,31 @@ func nodeReferencesOuter(n Node) bool {
 // executor's CREATE INDEX const-folding of partial-index predicates.
 func ExprContainsColumnRef(e Expr) bool { return exprContainsColumnRef(e) }
 
+// exprContainsColumnRef reports whether e reads a column of the current
+// scope. It walks with the exhaustive exprChildSlots driver (exprwalk.go),
+// not the hand-written walkExprTree, whose missing arms made this answer
+// "no" for a column under an unlisted node — `col IS NOT NULL` once, and
+// `('-H') >= (c2::text) COLLATE "C"` (upstream create_index) until
+// 2026-09-24 — and CREATE INDEX then const-folded a column predicate on a
+// nil slot (XX000 "column ref c2/1 on nil slot"). An unenumerated type
+// fails closed: it counts as containing a column, which only ever costs a
+// missed constant fold. Inner plans are another scope and are not entered.
 func exprContainsColumnRef(e Expr) bool {
 	if e == nil {
 		return false
 	}
 	found := false
-	walkExprTree(e, func(node Expr) {
+	complete := walkExprRefs(e, scopeIgnore, exprVisitor{Visit: func(node Expr) bool {
 		if found {
-			return
+			return false
 		}
 		if _, ok := node.(*ColumnRef); ok {
 			found = true
+			return false
 		}
-	})
-	return found
+		return true
+	}})
+	return found || !complete
 }
 
 func planFromItem(item parser.FromExpr, cat catalog.Catalog, nextSourceIdx *int16, lateralCtx *resolveContext, ps PlannerSettings, scope *rtableScope) (Node, []rangeBinding, *jtScopeTable, error) {

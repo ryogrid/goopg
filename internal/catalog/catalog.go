@@ -25141,6 +25141,15 @@ func formatExprForAttrdef(e parser.Expr) string {
 		}
 		return formatExprForAttrdef(v.Left) + op + formatExprForAttrdef(v.Right)
 	}
+	if v, ok := e.(*parser.CollateExpr); ok {
+		// get_rule_expr T_CollateExpr: `(arg COLLATE name)`, the name quoted
+		// by quote_identifier. Executor twin: defaultExprToSQL.
+		parts := strings.Split(v.CollationName, ".")
+		for i, p := range parts {
+			parts[i] = pgQuoteIdentForTSDict(p)
+		}
+		return "(" + formatExprForAttrdef(v.Operand) + " COLLATE " + strings.Join(parts, ".") + ")"
+	}
 	return fmt.Sprintf("%v", e)
 }
 

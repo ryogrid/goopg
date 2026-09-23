@@ -6172,6 +6172,19 @@ func defaultExprToSQL(e parser.Expr) string {
 			op = " IS NOT "
 		}
 		return defaultExprToSQL(v.Operand) + op + target
+	case *parser.CollateExpr:
+		// get_rule_expr T_CollateExpr (ruleutils.c): `(arg COLLATE name)`, the
+		// name through generate_collation_name → quote_identifier, so "C" and
+		// "POSIX" keep their quotes. Without this arm the node fell to the
+		// %v fallback and pg_get_indexdef printed a Go struct
+		// (`&{105 0xc000… C}`) for upstream create_index's
+		// `WHERE (c1::text > 500000000::text COLLATE "C")`. Keep in sync with
+		// the catalog twin catalog.formatExprForAttrdef.
+		parts := strings.Split(v.CollationName, ".")
+		for i, p := range parts {
+			parts[i] = pgQuoteIdent(p)
+		}
+		return "(" + defaultExprToSQL(v.Operand) + " COLLATE " + strings.Join(parts, ".") + ")"
 	case *parser.IsDistinctFromExpr:
 		// `DEFAULT (1 IS DISTINCT FROM 2)`. Mirror the catalog twin (DU-002 slice 181).
 		// PG's pg_get_expr deparses a DistinctExpr as `<left> IS [NOT] DISTINCT FROM <right>`.
