@@ -61,6 +61,7 @@ func TestUnnestNonCorrelatedIn_NotNullAware(t *testing.T) {
 // are general Expr and the hash-join executor evaluates them with
 // evalExpr, so no ColumnRef reconstruction is needed.
 func TestUnnestNonCorrelatedIn_NonColumnRefOperand(t *testing.T) {
+	pinLegacyPipeline(t)
 	cat := twoTablesCatalog(t)
 	sql := "SELECT x FROM t1 WHERE x + 1 IN (SELECT y FROM t2 WHERE z > 0)"
 	node, err := Plan(parseOne(t, sql), cat)

@@ -58,6 +58,7 @@ func analyzedThreeTablesCatalog(t *testing.T) catalog.Catalog {
 // write-up; only the §12.4(a)/(b)/(c) DP-search plumbing (RelOptInfo/SJInfo
 // registration + reresolveJoinByName's post-search splice) remains open.
 func TestExistsUnnestTwoRelationRHSTopNodeIsProjectNotBareJoin(t *testing.T) {
+	pinLegacyPipeline(t)
 	cat := analyzedThreeTablesCatalog(t)
 	sql := "SELECT x FROM t1 WHERE EXISTS (" +
 		"SELECT 1 FROM t2, t3 WHERE t2.z = t1.x AND t2.y = t3.a)"

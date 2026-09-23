@@ -289,6 +289,7 @@ func TestLeafSpanWindow(t *testing.T) {
 // End-to-end: the unnest arms mark eligible EXISTS/IN/NOT-IN bodies, and the
 // seam decomposes the marked RHS into real leaves + pooled body quals.
 func TestFlattenedRHSExistsSingleTable(t *testing.T) {
+	pinLegacyPipeline(t)
 	cat := analyzedThreeTablesCatalog(t)
 	node, err := Plan(parseOne(t,
 		"SELECT x FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.z = t1.x AND t2.y > 0)"), cat)
@@ -327,6 +328,7 @@ func TestFlattenedRHSExistsSingleTable(t *testing.T) {
 }
 
 func TestFlattenedRHSExistsMultiTableBody(t *testing.T) {
+	pinLegacyPipeline(t)
 	cat := analyzedThreeTablesCatalog(t)
 	node, err := Plan(parseOne(t,
 		"SELECT x FROM t1 WHERE EXISTS (SELECT 1 FROM t2, t3 "+
@@ -365,6 +367,7 @@ func TestFlattenedRHSExistsMultiTableBody(t *testing.T) {
 }
 
 func TestFlattenedRHSInExpr(t *testing.T) {
+	pinLegacyPipeline(t)
 	cat := analyzedThreeTablesCatalog(t)
 	node, err := Plan(parseOne(t,
 		"SELECT x FROM t1 WHERE t1.x IN (SELECT y FROM t2 WHERE z > 0)"), cat)

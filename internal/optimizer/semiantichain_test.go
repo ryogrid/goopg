@@ -21,6 +21,7 @@ import (
 // existsUnnestSJInfo-built SpecialJoinInfo.
 
 func TestSemiAntiOnQualsOK_AcceptsWellFormedLink(t *testing.T) {
+	pinLegacyPipeline(t)
 	cat := analyzedThreeTablesCatalog(t)
 	sql := "SELECT x FROM t1 WHERE EXISTS (" +
 		"SELECT 1 FROM t2, t3 WHERE t2.z = t1.x AND t2.y = t3.a)"
@@ -147,6 +148,7 @@ func TestSemiAntiLinksHaveSJInfos_DeclinesMismatchedSides(t *testing.T) {
 // `SJInfo` (originally `existsUnnestSJInfo`'s throwaway synL=1/synR=2) with
 // the real leaf-index bits.
 func TestExtractSearchLeaves_AdmitSemiAnti_BuildsLinkAndRebuildsSJInfo(t *testing.T) {
+	pinLegacyPipeline(t)
 	cat := analyzedThreeTablesCatalog(t)
 	sql := "SELECT x FROM t1 WHERE EXISTS (" +
 		"SELECT 1 FROM t2, t3 WHERE t2.z = t1.x AND t2.y = t3.a)"
@@ -356,6 +358,7 @@ func TestExtractSearchLeaves_AdmitSemiAnti_NarrowsMinLefthandToCorrelatedRelatio
 // consuming `pred` alone would silently build an unconditional (Cartesian-
 // like) Semi/Anti now that admitSemiAnti is wired live.
 func TestExtractSearchLeaves_AdmitSemiAnti_FoldsKeyEquijoinIntoPred(t *testing.T) {
+	pinLegacyPipeline(t)
 	cat := analyzedThreeTablesCatalog(t)
 	sql := "SELECT x FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.z = t1.x)"
 	node, err := Plan(parseOne(t, sql), cat)

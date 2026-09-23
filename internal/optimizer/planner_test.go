@@ -108,6 +108,7 @@ func TestPlanSelectResolvesTableAlias(t *testing.T) {
 }
 
 func TestPlanSelectJoin(t *testing.T) {
+	pinLegacyPipeline(t)
 	cat := pgbenchCatalog(t)
 	node, err := Plan(parseOne(t, "SELECT a.aid, h.delta FROM pgbench_accounts a JOIN pgbench_history h ON a.aid = h.aid"), cat)
 	if err != nil {
@@ -138,6 +139,7 @@ func TestPlanSelectJoin(t *testing.T) {
 // populates LeftKey/RightKey. Predicates that don't decompose
 // stay on JoinAlgoNestedLoop.
 func TestPlanJoinPicksHashAlgo(t *testing.T) {
+	pinLegacyPipeline(t)
 	cat := pgbenchCatalog(t)
 	cases := []struct {
 		sql      string
@@ -211,6 +213,7 @@ func TestPlanJoinPicksHashAlgo(t *testing.T) {
 // the executor's outer-row emission walks the left side as the
 // probe stream.
 func TestPlanJoinHashBuildSidePicksSmaller(t *testing.T) {
+	pinLegacyPipeline(t)
 	smallStats := &catalog.TableStats{
 		RowCount: 100,
 		Columns:  []catalog.ColumnStats{{NDistinct: 100}, {}, {}, {}},
@@ -577,6 +580,7 @@ func TestPlanSelectGroupByHaving(t *testing.T) {
 }
 
 func TestPlanSelectCommaFromUsesCrossJoin(t *testing.T) {
+	pinLegacyPipeline(t)
 	cat := pgbenchCatalog(t)
 	node, err := Plan(parseOne(t, "SELECT * FROM pgbench_accounts a, pgbench_history h"), cat)
 	if err != nil {

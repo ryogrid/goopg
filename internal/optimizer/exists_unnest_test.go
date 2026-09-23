@@ -8,6 +8,7 @@ import (
 // predicate is rewritten as a JoinTypeSemi hash join.
 // (M0061-0001 acceptance: Q4-shape EXISTS now becomes a Semi Join.)
 func TestUnnestCorrelatedExists(t *testing.T) {
+	pinLegacyPipeline(t)
 	cat := twoTablesCatalog(t)
 	sql := "SELECT x FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE z = t1.x)"
 	node, err := Plan(parseOne(t, sql), cat)
@@ -32,6 +33,7 @@ func TestUnnestCorrelatedExists(t *testing.T) {
 // TestUnnestCorrelatedNotExists verifies NOT EXISTS becomes a
 // JoinTypeAnti hash join. (M0061-0001 acceptance: Q22-shape.)
 func TestUnnestCorrelatedNotExists(t *testing.T) {
+	pinLegacyPipeline(t)
 	cat := twoTablesCatalog(t)
 	sql := "SELECT x FROM t1 WHERE NOT EXISTS (SELECT 1 FROM t2 WHERE z = t1.x)"
 	node, err := Plan(parseOne(t, sql), cat)
@@ -154,6 +156,7 @@ func TestUnnestExistsORConjunctLiftsWhole(t *testing.T) {
 }
 
 func TestUnnestExistsUnliftableResidualStaysSubPlan(t *testing.T) {
+	pinLegacyPipeline(t)
 	// A residual containing an expression kind the index rewriter
 	// does not model (CASE) must veto the lift — passing it through
 	// unrewritten would evaluate stale column indices on the joined

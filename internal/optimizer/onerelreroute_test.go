@@ -99,6 +99,7 @@ func TestOneRelRerouteSearchesSingleTableStatement(t *testing.T) {
 
 // (2) Knob OFF is the historical branch: no search.
 func TestOneRelRerouteIsInertWithTheKnobOff(t *testing.T) {
+	pinLegacyPipeline(t)
 	withPGShapedDP(t)
 	t.Cleanup(setOneRelSearchForTest(false))
 	cat := oneRelRoutedCatalog(t)

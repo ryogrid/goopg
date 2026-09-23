@@ -463,6 +463,7 @@ func TestIndexKeyScalarJoinInnerDecorrelates(t *testing.T) {
 // conjunct sunk BELOW the join (pushConjunctsBelowSemiAnti) so the
 // probe count and the NLI cost gate both see the filtered outer.
 func TestIndexKeyExistsResidualBecomesNLISemi(t *testing.T) {
+	pinLegacyPipeline(t)
 	SetIndexKeyHarvestEnabled(true)
 	t.Cleanup(func() { SetIndexKeyHarvestEnabled(true) }) // restore the ON default
 
@@ -658,6 +659,7 @@ func findSemiOrAntiNLI(n Node) *NestedLoopIndexJoin {
 // LowKey/HighKey, which is NOT an equijoin and must keep the shape a
 // SubPlan (matrix row M14).
 func TestIndexKeyRangeCorrelationStaysSubPlan(t *testing.T) {
+	pinLegacyPipeline(t)
 	// The harvest is ON by default since S6; enabled explicitly here so the
 	// test is self-contained regardless of sibling-test toggles.
 	SetIndexKeyHarvestEnabled(true)

@@ -17,6 +17,7 @@ import (
 // wires a reader, not any observable plan-shape change.
 
 func TestExistsUnnestSJInfoSemiHashKey(t *testing.T) {
+	pinLegacyPipeline(t)
 	cat := twoTablesCatalog(t)
 	sql := "SELECT x FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE z = t1.x)"
 	node, err := Plan(parseOne(t, sql), cat)
@@ -112,6 +113,7 @@ func TestExistsUnnestSJInfoAntiHashKey(t *testing.T) {
 }
 
 func TestExistsUnnestSJInfoKeylessSemi(t *testing.T) {
+	pinLegacyPipeline(t)
 	// Matrix M14 (S4a/D3.2): zero-equijoin EXISTS, decorrelated as a
 	// nested-loop semi join carrying the residual as its predicate — no
 	// hash key exists, so LhsStrict and the Semi* capability flags must

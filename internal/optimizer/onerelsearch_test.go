@@ -37,6 +37,7 @@ func oneRelSeamFixture(rows int64) (Node, *resolveContext) {
 // statement must take exactly the path it took before this cut — the seam
 // declines at `minSearchRels()` and returns its inputs untouched.
 func TestOneRelSearchIsInertWithTheKnobOff(t *testing.T) {
+	pinLegacyPipeline(t)
 	withPGShapedDP(t)
 	t.Cleanup(setOneRelSearchForTest(false))
 

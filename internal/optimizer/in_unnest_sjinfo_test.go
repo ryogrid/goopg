@@ -20,6 +20,7 @@ import (
 // producer's placeholder.
 
 func TestInUnnestSJInfoCorrelatedSemi(t *testing.T) {
+	pinLegacyPipeline(t)
 	cat := twoTablesCatalog(t)
 	sql := "SELECT x FROM t1 WHERE x IN (SELECT y FROM t2 WHERE y = t1.x)"
 	node, err := Plan(parseOne(t, sql), cat)

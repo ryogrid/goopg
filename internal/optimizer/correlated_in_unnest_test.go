@@ -36,6 +36,7 @@ func threeColCorrelationCatalog(t *testing.T) catalog.Catalog {
 // — every surviving row's y equals t1.x by construction, so the plain
 // hash Semi join is correct.
 func TestUnnestCorrelatedIn_SafeSelfReferencing(t *testing.T) {
+	pinLegacyPipeline(t)
 	cat := twoTablesCatalog(t)
 	sql := "SELECT x FROM t1 WHERE x IN (SELECT y FROM t2 WHERE y = t1.x)"
 	node, err := Plan(parseOne(t, sql), cat)
@@ -89,6 +90,7 @@ func TestUnnestCorrelatedNotIn_SafeSelfReferencing(t *testing.T) {
 // This must now refuse to unnest and leave the InExpr in place so the
 // (always-correct) runtime per-row evaluation path handles it.
 func TestUnnestCorrelatedIn_RejectsOperandNotCorrelationColumn(t *testing.T) {
+	pinLegacyPipeline(t)
 	cat := threeColCorrelationCatalog(t)
 	sql := "SELECT x FROM t1 WHERE x IN (SELECT y FROM t2 WHERE z = t1.w)"
 	node, err := Plan(parseOne(t, sql), cat)
@@ -109,6 +111,7 @@ func TestUnnestCorrelatedIn_RejectsOperandNotCorrelationColumn(t *testing.T) {
 // `x = y` alone, wrong whenever a t2 row has y = x but z != x. Must
 // refuse to unnest.
 func TestUnnestCorrelatedIn_RejectsSelectNotCorrelationColumn(t *testing.T) {
+	pinLegacyPipeline(t)
 	cat := threeColCorrelationCatalog(t)
 	sql := "SELECT x FROM t1 WHERE x IN (SELECT y FROM t2 WHERE z = t1.x)"
 	node, err := Plan(parseOne(t, sql), cat)

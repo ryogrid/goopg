@@ -88,6 +88,7 @@ func findSemiOrAntiJoin(n Node) *Join {
 // TestCompositeExistsCarriesSecondPairOnPredicate pins that the second
 // equijoin pair survives onto the semi join rather than being dropped.
 func TestCompositeExistsCarriesSecondPairOnPredicate(t *testing.T) {
+	pinLegacyPipeline(t)
 	cat := newCompositeExistsCatalog(t, false)
 	stmt := parseOne(t, `select tag from ce_outer where exists (select 1 from ce_inner where j1 = k1 and j2 = k2)`)
 	node, err := Plan(stmt, cat)
@@ -131,6 +132,7 @@ func TestCompositeExistsCarriesSecondPairOnPredicate(t *testing.T) {
 // TestCompositeExistsPredicateCoordinateSpaces pins the asymmetry between
 // the predicate's merged coordinates and RightKey's inner-local ones.
 func TestCompositeExistsPredicateCoordinateSpaces(t *testing.T) {
+	pinLegacyPipeline(t)
 	cat := newCompositeExistsCatalog(t, false)
 	stmt := parseOne(t, `select tag from ce_outer where exists (select 1 from ce_inner where j1 = k1 and j2 = k2)`)
 	node, err := Plan(stmt, cat)

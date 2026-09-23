@@ -437,6 +437,7 @@ func outerExtra2() *OuterColumnRef {
 // the hash key (there is no equijoin param), and the residual is
 // AND-ed onto the join predicate — mirroring the EXISTS treatment.
 func TestInResidualLiftUnnests(t *testing.T) {
+	pinLegacyPipeline(t)
 	cat := twoTablesCatalog(t)
 	sql := "SELECT x FROM t1 WHERE x IN (SELECT y FROM t2 WHERE z > t1.x)"
 	node, err := Plan(parseOne(t, sql), cat)

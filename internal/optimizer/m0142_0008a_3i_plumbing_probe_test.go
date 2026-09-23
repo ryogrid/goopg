@@ -143,6 +143,7 @@ func extractSearchLeavesAdmitSemiAnti(node Node) (scans []Node, widths []int, on
 // (ii) whether the existing outerChainLink consumers choke on a link whose
 // `nullable` field is empty.
 func TestM0142_0008a_3iPlumbing_AdmitSemiAnti(t *testing.T) {
+	pinLegacyPipeline(t)
 	cat := analyzedThreeTablesCatalog(t)
 	sql := "SELECT x FROM t1 WHERE EXISTS (" +
 		"SELECT 1 FROM t2, t3 WHERE t2.z = t1.x AND t2.y = t3.a)"

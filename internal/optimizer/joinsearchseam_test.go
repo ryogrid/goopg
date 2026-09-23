@@ -325,6 +325,7 @@ func TestSearchConsumesAsksTheProducer(t *testing.T) {
 // correctness reason rather than a tuning one (see the file header of
 // joinsearchseam.go).
 func TestPGShapedSeamDeclines(t *testing.T) {
+	pinLegacyPipeline(t)
 	withPGShapedDP(t)
 	names := []string{"a", "b", "c"}
 

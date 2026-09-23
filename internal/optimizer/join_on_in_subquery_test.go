@@ -93,6 +93,7 @@ func TestJoinOnInSubquery_CorrelatedToJoinRightSide(t *testing.T) {
 
 // TestJoinOnInSubquery_InnerJoin: acceptance 2c, INNER JOIN variant.
 func TestJoinOnInSubquery_InnerJoin(t *testing.T) {
+	pinLegacyPipeline(t)
 	cat := joinOnInSubqueryCatalog(t)
 	sql := "SELECT * FROM tenk1 a JOIN tenk2 b ON a.hundred IN (SELECT c.hundred FROM tenk2 c)"
 	node, err := Plan(parseOne(t, sql), cat)
