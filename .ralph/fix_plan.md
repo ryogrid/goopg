@@ -2310,6 +2310,15 @@ heuristic stays live.)
       regress suite, isolation family.
   - `REINDEX TABLE t` on a table with no indexes lacks PG's NOTICE `table
     "t" has no indexes to reindex`.
+    - **FIXED 2026\-09\-24 \(ralph2 loop \#40\), `804cfe74b`.** NOTICE when no
+      index and no TOAST relation; CONCURRENTLY wording except on temp
+      tables; silent for partitioned parents and system catalogs; name
+      without schema. A 16\-statement probe is byte\-identical to PG 18.3;
+      pinned by `TestReindexTableNoIndexNotice`. Gates: units, spotcheck,
+      sf025, acceptance arm, regress reindex\_catalog.
+      - Ledgered: goopg\'s TOAST\-able type set is narrower than PG\'s
+        \(tsvector, numeric, inet … have none\), which leaves one extra
+        NOTICE in upstream create\_index.
   - A session's own `LISTEN ch; NOTIFY ch` reports `received from server
     process with PID 1` — the notifying backend's PID is wrong.
     - Also: NOTIFY/LISTEN inside a routine body \(DO, function,
