@@ -392,7 +392,10 @@ func createSetOpPaths(u *upperRels, setOpNode *SetOp, ps PlannerSettings, tupleF
 	// `ps.ParallelStatementOK` doubles as the top-level marker PG's
 	// plan_set_operations vs add_paths_to_append_rel distinction needs —
 	// see the function's header for the mixed arm's placement rule.
-	addPartialSetOpPath(setOpRel, setOpNode, cp, ps.ParallelStatementOK)
+	// M0141-S2b-4b: a distinct UNION's folded input is generate_union_paths'
+	// territory at any nesting depth, so it takes the top-level (pure-arm
+	// only) placement rule.
+	addPartialSetOpPath(setOpRel, setOpNode, cp, ps.ParallelStatementOK || setOpNode.UnionDistinctInput)
 
 	addSetOpPaths(setOpRel, lseed, rseed, setOpNode, cp)
 	// M0140-0006b-2: the upper-rel Gather reader — the live site. Reads the

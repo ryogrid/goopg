@@ -1464,7 +1464,7 @@ func planSelectImpl(s *parser.SelectStmt, cat catalog.Catalog, plannerSet Planne
 			chain := leaves[0]
 			for _, b := range leaves[1:] {
 				next, err := createSetOpPaths(upper, &SetOp{pos: s.Pos(), Left: chain, Right: b, Op: parser.SetOpUnion, All: true,
-					TlistTypesDiffer: typesDiffer}, plannerSet, setOpTupleFraction)
+					TlistTypesDiffer: typesDiffer, UnionDistinctInput: true}, plannerSet, setOpTupleFraction)
 				if err != nil {
 					return nil, err
 				}

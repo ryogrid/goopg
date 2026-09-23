@@ -2819,6 +2819,13 @@ type SetOp struct {
 	// Only the genuine set-operation site sets it, and only when the types
 	// really differ. M0145-0004.
 	TlistTypesDiffer bool
+	// UnionDistinctInput marks a UNION ALL link of the chain a UNION
+	// (distinct) folds its branches into (M0141-S2b-4a/4b). PG plans that
+	// input inside generate_union_paths, never as an appendrel, so only the
+	// PURE parallel Append arm applies to it (every child partial), even when
+	// the union sits in a nested scope where goopg otherwise files the mixed
+	// arm on an appendrel's behalf (addPartialSetOpPath).
+	UnionDistinctInput bool
 	// Op is the set-operation kind (UNION / INTERSECT / EXCEPT).
 	// The zero value (parser.SetOpUnion) keeps the implicit
 	// partition/inheritance UNION ALL construction sites working
