@@ -1,6 +1,6 @@
 # M0145-0029 — one-relation index-path coverage before the flip
 
-Status: slices 1, 2a, 3 and 4 landed 2026-09-23 (`fe3d1b0aa`, `fc716f1f8`, `6d50210f4`, `729027e28`); slices 2b and 5 open. Task:
+Status: slices 1, 2a, 3 and 4 landed 2026-09-23 (`fe3d1b0aa`, `fc716f1f8`, `6d50210f4`, `729027e28`); slice 5 re-run done with its root-cause fix (`9e368ade8`); slice 2b open, and the multiplier-dependent residue is escalated to the owner. Task:
 `.ralph/fix_plan.md` M0145-0029 (Kind: impl, Parent: M0145-0008). Origin: the
 M0145-0008 flip triage, group I (`m0145-0008-flip-test-triage.md`).
 
@@ -37,12 +37,12 @@ the bitmap one. The bypass was the only place goopg built that shape.
 A private PG 18.3 on the same shapes (never-analysed tables, as the executor
 tests build them):
 
-- `TestIndexScanVarcharEndToEnd`'s query (`p_type = '…'` on 3 rows): PG plans
-  **Bitmap Heap Scan** (4.18..12.64); with bitmaps off it prefers the **Seq
-  Scan** (20.12) over an Index Scan. goopg on the jointree arm now elects the
-  same bitmap (16.73 vs seq 20.13; the plain index path costs 40.3, also above
-  seq, as in PG). The test's `IndexScan` expectation is the legacy rule's,
-  not PG's.
+- `TestIndexScanVarcharEndToEnd`'s query (`p_type = '…'` on 3 rows): with
+  the index created on an empty table, PG plans a **Bitmap Heap Scan**
+  (4.18..12.64). **Correction (slice 5):** the test creates the index AFTER
+  its rows, and then PG plans a **Seq Scan** (1.04), because the index build
+  records the heap's size. The test's `IndexScan` expectation is the legacy
+  rule's, not PG's, in both orders.
 - `TestIOS_CompositeInt4Int4`'s query (`a = 1 AND b = 20` on an `(a,b)` index):
   PG plans **Index Only Scan with `Index Cond: ((a = 1) AND (b = 20))`**.
   goopg's index-only producer cannot build an index-only scan WITH quals — a
@@ -57,7 +57,7 @@ tests build them):
 | 2b | range on the bitmap producer; equality prefix followed by a range column (needs a new executor probe shape) | open |
 | 3 | index-only scan with index quals (`create_index_path(indexonly=true)` with `index_clauses`), one path per index | **landed** `6d50210f4` |
 | 4 | ScalarArrayOp (`col IN (…)` / `= ANY`) quals on the leading column — plain producer (bitmap SAOP: ledgered) | **landed** `729027e28` |
-| 5 | re-run group I under a local flip; update stale expectations to the PG-faithful shape with the oracle capture (or pin the executor feature they test with `enable_seqscan`/`enable_bitmapscan` off, as PG's regress does) | open |
+| 5 | re-run group I under a local flip, per-test PG oracle, disposition table below; root-cause fix: index-only `allvisfrac` read the VM under the wrong database | **re-run done** `9e368ade8`; test edits ride the flip commit |
 
 ## Slice 1 design (`internal/optimizer/pathindexrestrict.go`)
 
@@ -184,4 +184,49 @@ rows the path wins (`TestRestrictionSAOPIndexScanOnJointreePipeline`). The
 execution probe also showed that the trailing-NULL prefix-probe bug affects
 plain and SAOP composite probes, not only index-only ones; the bug task was
 widened.
+
+## Slice 5: group-I re-run and dispositions (`9e368ade8`)
+
+Every group-I test, re-run under a local flip, with its fixture replayed on a
+private PG 18.3 in the same statement order (index before or after the rows,
+VACUUM and ANALYZE where the test runs them). The live-server column is a
+flip binary on a throwaway cluster.
+
+| test | PG 18.3 | goopg, new pipeline | disposition |
+|---|---|---|---|
+| `TestIOS_CompositeInt4Int4`, `…Int4Text`, `…3Columns`, `TestArrayIndexOnlyScanAnswersFromKey` (6 subtests) | Index Only Scan (all-visible after VACUUM, 4.30) | **passes** after `9e368ade8` | fixed: the index-only path read `allvisfrac` = 0 (below) |
+| `TestIOS_HeapFallback` | Index Scan (8.29) | Bitmap Heap Scan (12.27; index 16.26) | multiplier-dependent: `indexProbeCostMultiplier` = 2 doubles the index path's page fetches, not the bitmap's heap page |
+| `TestIndexOnlyDeformColdAndVisible` | Index Only Scan (8.17, never analysed) | unit fixture: Seq Scan (1.01, no relation-size hook); live server: Bitmap (12.27) | multiplier-dependent on a live server; the fixture has no `RelNBlocksFunc` |
+| `TestSAOPWithConjunctMoves` | Index Scan on `idx_item_sk_flag`, `Index Cond: ((i_item_sk = ANY …) AND (i_flag > 1))` | Seq Scan | capability gap: a SAOP followed by a range on the next column (slice 2b) |
+| `TestIndexScanVarcharEndToEnd`, `…Char…`, `…Timestamp…` | Seq Scan (index built after the rows records the heap size) | Seq Scan | **stale expectation**: goopg already matches PG; update in the flip commit |
+| `TestIndexDeformRescanPersistsBound` | Seq Scan (1.05), same reason | Bitmap Heap Scan (seq priced at the 10-page floor, 27) | real gap: goopg's CREATE INDEX never records the heap's `reltuples`/`relpages` (PG `index_update_stats`) |
+
+**Root cause fixed (`9e368ade8`).** `relAllVisibleFraction`, PG's
+`baserel->allvisfrac`, called `catalog.RelAllVisible`. That function keys a
+table with no DBOid under `DefaultDBOid` (1), but VACUUM keys the VM bits
+under the session's database (a server catalog is `SetDBOID(5)`), and the
+`pg_class` view reads them there. On a live server `pg_class.relallvisible`
+was 9 while the planner saw 0, so every index-only scan in the `postgres`
+database was priced with all its heap fetches.
+`InMemory.relAllVisibleKey` is now the one resolver for both the view cell and
+`RelAllVisibleBlocks`, which the planner reads. `newVMFixture` installs the
+same `RelAllVisibleFunc` hook `initdb`'s cluster open installs. The benchmark
+tables carry their own DBOid, where both keys agreed, so no corpus plan or
+cost moved. A **suspected sibling** is not yet verified: `TableRealPages` and
+`IndexRealPages` key a DBOid-less relation under `DefaultDBOid` too (ledgered).
+
+**Also observed (ledgered):** goopg renders a composite `Index Cond` as
+`(a = 1 AND b = 20)`, where PG renders `((a = 1) AND (b = 20))`. This is
+pre-existing and shared by the index, index-only and bitmap formatters
+(`formatIndexCondParts`).
+
+**What the flip needs from here.**
+- The four stale expectations change to PG's shape in the flip commit, since
+  they still hold on today's legacy default.
+- Three tests are multiplier-dependent. PG prices the index and bitmap
+  alternatives within 0.01 of each other, and goopg's 2x probe multiplier
+  decides them. This is an owner decision: retire the multiplier, or accept
+  the bitmap shape in these tests.
+- `index_update_stats` and the SAOP-plus-trailing-range probe are real gaps,
+  each with a ledger row.
 

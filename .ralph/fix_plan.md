@@ -18322,6 +18322,27 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
     - The probe widened the filed trailing\-NULL bug to plain and SAOP
       composite prefix probes.
     - Remaining: 2b \(bitmap range; eq\-prefix\+range\), 5 group\-I re\-run.
+  - **Slice 5 re\-run DONE 2026\-09\-23 \(ralph2 loop \#16\), `9e368ade8`.** Per\-test
+    PG 18.3 oracle, fixture replayed in statement order; table in the design
+    doc §Slice 5.
+    - Root cause of the index\-only witnesses FIXED: the planner read the VM
+      under `DefaultDBOid` while VACUUM and `pg_class` use the session
+      database, so `allvisfrac` was 0 on a live server \(pg\_class said 9\).
+      The live flip server now plans PG's `Index Only Scan … Index Cond`.
+      6 subtests pass.
+    - Stale expectations \(goopg already matches PG's Seq Scan\):
+      `TestIndexScan\{Varchar,Char,Timestamp\}EndToEnd` — update in the flip
+      commit \(still valid on today's legacy default\).
+    - Multiplier\-dependent \(PG prices index vs bitmap within 0.01; the 2x
+      `indexProbeCostMultiplier` decides\): `TestIOS_HeapFallback`,
+      `TestIndexOnlyDeformColdAndVisible` — **owner decision needed**
+      \(retire the multiplier, or accept the bitmap shape\).
+    - Real gaps \(ledgered\): CREATE INDEX never records heap
+      `reltuples`/`relpages` \(PG `index_update_stats`\), which breaks
+      `TestIndexDeformRescanPersistsBound`; a SAOP followed by a range on the
+      next column, which breaks `TestSAOPWithConjunctMoves` \(slice 2b\).
+    - Remaining: 2b; the `index_update_stats` port; the owner's multiplier
+      call. Then group I is empty for the flip.
 - [ ] **M0145-0030 — group B: adjudicate the 11 behavioural flip-triage
   tests before the flip** (same filing). The flip-triage doc lists 11
   behavioural failures: grouping strategy, nested scalar subquery, NLI
