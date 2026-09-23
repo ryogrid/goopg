@@ -1022,6 +1022,10 @@ func (n *Memoize) Output() Schema { return n.Child.Output() }
 type IndexOnlyScan struct {
 	// PlanCost carries the search's cost for this node (plancost.go).
 	PlanCost
+	// searchedTree: a one-relation search root is a bare scan, and an
+	// index-only one needs no boundary Project when it covers the whole
+	// output (M0145-0029 slice 3; searchedtree.go).
+	searchedTree
 	pos   int
 	Table *catalog.Table
 	// Alias is the FROM-clause alias; empty when not specified. Mirrors

@@ -16,9 +16,13 @@ package optimizer
 //
 // Two narrowings, stated as refusals:
 //
-//   - Only a BARE leaf. A leaf carrying local quals has a predicate whose
-//     `ColumnRef.Index` values are written against the FULL leaf schema;
-//     narrowing the scan under it would re-point them.
+//   - Only a BARE leaf, or a leaf whose local quals are ALL consumed as index
+//     quals (M0145-0029 slice 3: `restrictionEqualityPrefix`, PG's
+//     `build_index_paths` with `index_clauses` and `indexonly = true`). A
+//     residual local qual has a predicate whose `ColumnRef.Index` values are
+//     written against the FULL leaf schema; narrowing the scan under it would
+//     re-point them, so a leaf that would keep one is still refused (ledgered:
+//     PG keeps such quals as the Index Only Scan's Filter).
 //   - Only when the needed set is KNOWN (`neededColumnNames`): an index-only
 //     scan that drops a column the query reads returns wrong rows.
 
@@ -43,9 +47,18 @@ func (s *searchCtx) addIndexOnlyPaths(cat catalog.Catalog) {
 		if tbl == nil {
 			continue
 		}
-		// A leaf with local quals is refused — see the file header.
-		if !scanLeafIsBare(rel.baseLeaf) {
-			continue
+		// A leaf with local quals is refused unless an index consumes all of
+		// them — see the file header.
+		bare := scanLeafIsBare(rel.baseLeaf)
+		var conjuncts []Expr
+		if !bare {
+			if _, _, ok := scanLeafFor(rel.baseLeaf); !ok {
+				continue
+			}
+			conjuncts = extractFilterConjuncts(rel.baseLeaf)
+			if len(conjuncts) == 0 {
+				continue
+			}
 		}
 		needed := s.neededColumnsOf(tbl)
 		if len(needed) == 0 {
@@ -61,7 +74,14 @@ func (s *searchCtx) addIndexOnlyPaths(cat catalog.Catalog) {
 		relPages := baseRelPages(tbl, relTuples)
 		added := false
 		for _, idx := range cat.IndexesOnTable(tbl) {
-			if s.addOneIndexOnlyPath(rel, tbl, idx, needed, relPages, relTuples, totalPages) {
+			var clauses []indexPathClause
+			if !bare {
+				clauses = consumingIndexClauses(cat, tbl, idx, conjuncts)
+				if clauses == nil {
+					continue
+				}
+			}
+			if s.addOneIndexOnlyPath(rel, tbl, idx, needed, clauses, relPages, relTuples, totalPages) {
 				added = true
 			}
 		}
@@ -87,33 +107,91 @@ func (s *searchCtx) neededColumnsOf(tbl *catalog.Table) []catalog.Column {
 	return out
 }
 
+// consumingIndexClauses returns the equality-prefix index clauses of `idx`
+// when they consume EVERY local conjunct of the leaf, else nil. A partial
+// index declines, as in the plain restriction producer.
+func consumingIndexClauses(cat catalog.Catalog, tbl *catalog.Table, idx *catalog.Index, conjuncts []Expr) []indexPathClause {
+	if idx == nil || idx.HasPredicate {
+		return nil
+	}
+	clauses := restrictionEqualityPrefix(cat, tbl, idx, conjuncts)
+	if len(clauses) == 0 || len(clauses) != len(conjuncts) {
+		return nil
+	}
+	// Each clause names a distinct conjunct (one per index column), so equal
+	// counts mean every conjunct is consumed — unless one conjunct bound two
+	// columns, which restrictionEqualityPrefix cannot do (one column per
+	// `col = const`); checked anyway, since a missed residual is wrong rows.
+	used := make(map[Expr]bool, len(clauses))
+	for _, c := range clauses {
+		used[c.local] = true
+	}
+	for _, conj := range conjuncts {
+		if !used[conj] {
+			return nil
+		}
+	}
+	return clauses
+}
+
+// restrictionPathIsIndexOnly reports whether addIndexOnlyPaths builds the
+// index-only path over `idx` with the equality-prefix clauses of the leaf's
+// `conjuncts` — the same three conditions it applies (enable_indexonlyscan,
+// a covering index, every local qual consumed). The plain restriction
+// producer asks it so that exactly one of the two builds the path, as
+// build_index_paths' single `index_only_scan` flag does.
+func (s *searchCtx) restrictionPathIsIndexOnly(cat catalog.Catalog, tbl *catalog.Table, idx *catalog.Index, conjuncts []Expr) bool {
+	if !s.neededColsKnown || indexOnlyHardDisabled(cat) {
+		return false
+	}
+	needed := s.neededColumnsOf(tbl)
+	if len(needed) == 0 {
+		return false
+	}
+	if _, ok := indexCoversColumns(idx, needed); !ok {
+		return false
+	}
+	return consumingIndexClauses(cat, tbl, idx, conjuncts) != nil
+}
+
 // addOneIndexOnlyPath builds the index-only path for one index, or declines.
+// `clauses` is empty for the full-index-scan shape over a bare leaf, or the
+// index quals that consume all of the leaf's local quals.
 func (s *searchCtx) addOneIndexOnlyPath(rel *RelOptInfo, tbl *catalog.Table, idx *catalog.Index,
-	needed []catalog.Column, relPages int64, relTuples, totalPages float64) bool {
+	needed []catalog.Column, clauses []indexPathClause, relPages int64, relTuples, totalPages float64) bool {
 	covered, ok := indexCoversColumns(idx, needed)
 	if !ok {
 		return false
 	}
+	// A full index scan: no bound quals, so every entry is read. PG's
+	// selectivity for an index path with no indexclauses is 1.0 ("An empty
+	// indexclauses list implies a full index scan", pathnodes.h:1817).
+	sel, unique := 1.0, false
+	if len(clauses) > 0 {
+		sel, unique = restrictionIndexSelectivity(tbl, idx, clauses, relTuples)
+	}
+	qpquals := localQualOpCount(rel.baseLeaf) - float64(len(clauses))
+	if qpquals < 0 {
+		qpquals = 0
+	}
 	indexPages, indexTuples, treeHeight := estimateIndexGeometry(idx, tbl, relTuples)
 	in := indexScanInputs{
-		relPages:    relPages,
-		relTuples:   relTuples,
-		indexPages:  indexPages,
-		indexTuples: indexTuples,
-		treeHeight:  treeHeight,
-		// A full index scan: no bound quals, so every entry is read. PG's
-		// selectivity for an index path with no indexclauses is 1.0 ("An
-		// empty indexclauses list implies a full index scan",
-		// pathnodes.h:1817).
-		selectivity:     1,
-		correlation:     indexCorrelationFor(idx, leadingKeyStats(idx, tbl)),
-		totalTablePages: totalPages,
-		loopCount:       1,
-		indexOnly:       true,
-		allVisFrac:      relAllVisibleFraction(tbl, relPages),
-		// R1 (plan-parity-fix-take2): full index scan, no index quals —
-		// every local conjunct is a qpqual, as the seq rival counts them.
-		numQualOps: localQualOpCount(rel.baseLeaf),
+		relPages:                relPages,
+		relTuples:               relTuples,
+		indexPages:              indexPages,
+		indexTuples:             indexTuples,
+		treeHeight:              treeHeight,
+		selectivity:             sel,
+		uniqueEqualityOnAllKeys: unique,
+		correlation:             indexCorrelationFor(idx, leadingKeyStats(idx, tbl)),
+		totalTablePages:         totalPages,
+		loopCount:               1,
+		indexOnly:               true,
+		allVisFrac:              relAllVisibleFraction(tbl, relPages),
+		// R1 (plan-parity-fix-take2): every local conjunct not consumed as an
+		// index qual is a qpqual, as the seq rival counts them
+		// (costsize.c:806-820).
+		numQualOps: qpquals,
 	}
 	cost := costIndexScan(s.cp, in)
 	// take2 P4-01 Slice 1: the scan Target, computed from NeededCols at
@@ -151,8 +229,10 @@ func (s *searchCtx) addOneIndexOnlyPath(rel *RelOptInfo, tbl *catalog.Table, idx
 		// NCols/AvgVarBytes pair above is unchanged.
 		Target:      tgt,
 		TargetKnown: tgtKnown,
-		// No index clauses: this is the full-index-scan shape, and
-		// `createPlan` reads the empty list as exactly that.
+		// Empty: the full-index-scan shape, and `createPlan` reads the empty
+		// list as exactly that. Non-empty: the probe, whose conjuncts
+		// createPlan drops from the leaf (they were all of them).
+		IndexClauses: clauses,
 	}
 	addPath(rel, serial, "indexonly")
 	// C-19c: the partial twin, `create_index_path(..., index_only_scan,

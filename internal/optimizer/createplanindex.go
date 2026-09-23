@@ -334,17 +334,28 @@ func createIndexScanPlan(p *Path) Node {
 		panic(fmt.Sprintf("createPlan: PathIndexScan with %s; goopg's *IndexScan has no direction to set", p.IndexScanDir))
 	}
 	// M0134-0187: an index-only path emits only the columns its index covers,
-	// so it builds a different node with a NARROWER schema. It carries no
-	// index clauses (a full index scan); `baseRelLayout` re-bases the
-	// narrowed output by name and the search boundary pads what was pruned —
-	// see DESIGN §15/§21.
+	// so it builds a different node with a NARROWER schema. It carries either
+	// no index clauses (a full index scan) or, since M0145-0029 slice 3, an
+	// equality-prefix probe that consumed EVERY local qual of the leaf;
+	// `baseRelLayout` re-bases the narrowed output by name and the search
+	// boundary pads what was pruned — see DESIGN §15/§21.
 	if p.IndexOnly {
 		if len(p.IndexOnlyCovered) == 0 {
 			panic(fmt.Sprintf("createPlan: index-only PathIndexScan on %s covers no columns", p.IndexInfo.Name))
 		}
-		if len(p.IndexClauses) != 0 {
-			panic(fmt.Sprintf("createPlan: index-only PathIndexScan on %s carries %d index clauses; the producer builds a full index scan",
-				p.IndexInfo.Name, len(p.IndexClauses)))
+		ioKeys := make([]Expr, 0, len(p.IndexClauses))
+		ioDrop := map[Expr]bool{}
+		for i, c := range p.IndexClauses {
+			if c.indexCol != i || c.key == nil || c.local == nil {
+				panic(fmt.Sprintf("createPlan: index-only PathIndexScan on %s: clause %d is not a local equality-prefix clause",
+					p.IndexInfo.Name, i))
+			}
+			ioKeys = append(ioKeys, c.key)
+			ioDrop[c.local] = true
+		}
+		if len(p.IndexClauses) > len(p.IndexInfo.Columns) {
+			panic(fmt.Sprintf("createPlan: index-only PathIndexScan on %s binds %d clauses to a %d-column index",
+				p.IndexInfo.Name, len(p.IndexClauses), len(p.IndexInfo.Columns)))
 		}
 		// Schema entries are COPIED from the leaf's own schema rather than
 		// synthesised: `SchemaColumn` carries a `SourceTableIdx` the leaf has
@@ -366,10 +377,7 @@ func createIndexScanPlan(p *Path) Node {
 			}
 			schema = append(schema, id.schema[at])
 		}
-		// `rewrap` would reinstate a leaf-local `*Filter` whose ColumnRefs are
-		// written against the FULL leaf schema; the producer refuses a
-		// non-bare leaf precisely so there is nothing to reinstate.
-		return &IndexOnlyScan{
+		ios := &IndexOnlyScan{
 			pos:                   id.pos,
 			Table:                 id.table,
 			Alias:                 id.alias,
@@ -380,6 +388,24 @@ func createIndexScanPlan(p *Path) Node {
 			PrivilegeCheckRole:    id.privilegeCheckRole,
 			PrivilegeCheckRoleSet: id.privilegeCheckRoleSet,
 		}
+		// Key vs Keys as on the plain scan below; the executor pads a short
+		// prefix (operators_indexonly.go lookupKeys).
+		switch len(ioKeys) {
+		case 0:
+		case 1:
+			ios.Key = ioKeys[0]
+		default:
+			ios.Keys = ioKeys
+		}
+		// `rewrap` would reinstate a leaf-local `*Filter` whose ColumnRefs are
+		// written against the FULL leaf schema; the producer admits a
+		// non-bare leaf only when its index clauses consume every local qual,
+		// so dropping them must leave nothing to reinstate.
+		if out := rewrapLeafDropping(p.Rel.baseLeaf, ios, ioDrop); out != Node(ios) {
+			panic(fmt.Sprintf("createPlan: index-only PathIndexScan on %s would reinstate a leaf qual over the narrowed schema",
+				p.IndexInfo.Name))
+		}
+		return ios
 	}
 
 	ncols := len(p.IndexInfo.Columns)

@@ -137,6 +137,28 @@ func restrictionKeyUsable(cat catalog.Catalog, col catalog.Column, val Expr) boo
 	return true
 }
 
+// restrictionIndexSelectivity is the index quals' selectivity alone
+// (btcostestimate's clauselist_selectivity over indexQuals), with PG's
+// `isunique` short circuit for a unique index bound on every key column.
+// Shared by the plain (addOneRestrictionIndexPath) and index-only
+// (addOneIndexOnlyPath) producers so the two price the same probe alike.
+func restrictionIndexSelectivity(tbl *catalog.Table, idx *catalog.Index, clauses []indexPathClause, relTuples float64) (float64, bool) {
+	rawRows := 0.0
+	if tbl.Stats != nil {
+		rawRows = float64(tbl.Stats.RowCount)
+	}
+	sel := 1.0
+	for _, c := range clauses {
+		stats := columnStatsByName(tbl, idx.Columns[c.indexCol])
+		sel *= eqSelectivityForColumn(stats, c.key, rawRows)
+	}
+	unique := idx.Unique && len(clauses) == len(idx.Columns)
+	if unique && relTuples > 0 {
+		sel = 1.0 / relTuples
+	}
+	return sel, unique
+}
+
 // addOneRestrictionIndexPath builds the equality-prefix path for one index, or
 // declines. Returns whether a path was added.
 func (s *searchCtx) addOneRestrictionIndexPath(cat catalog.Catalog, rel *RelOptInfo, tbl *catalog.Table, idx *catalog.Index,
@@ -153,24 +175,15 @@ func (s *searchCtx) addOneRestrictionIndexPath(cat catalog.Catalog, rel *RelOptI
 	if len(clauses) == 0 {
 		return false
 	}
-	fullyBound := len(clauses) == len(idx.Columns)
-
-	// indexSelectivity: the index quals alone (btcostestimate's
-	// clauselist_selectivity over indexQuals). PG's `isunique` short circuit
-	// for a unique index bound on every key column.
-	rawRows := 0.0
-	if tbl.Stats != nil {
-		rawRows = float64(tbl.Stats.RowCount)
+	// build_index_paths builds ONE path per index and makes it index-only
+	// when check_index_only holds (indxpath.c:1010, `index_only_scan`). When
+	// addIndexOnlyPaths will build that index-only path with these same
+	// clauses, a plain twin here would tie it on cost and — filed first —
+	// win add_path's tie, electing the heap-fetching shape PG never builds.
+	if s.restrictionPathIsIndexOnly(cat, tbl, idx, conjuncts) {
+		return false
 	}
-	sel := 1.0
-	for _, c := range clauses {
-		stats := columnStatsByName(tbl, idx.Columns[c.indexCol])
-		sel *= eqSelectivityForColumn(stats, c.key, rawRows)
-	}
-	unique := idx.Unique && fullyBound
-	if unique && relTuples > 0 {
-		sel = 1.0 / relTuples
-	}
+	sel, unique := restrictionIndexSelectivity(tbl, idx, clauses, relTuples)
 
 	var keys []PathKey
 	dir := ForwardScanDirection
