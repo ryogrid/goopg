@@ -18198,7 +18198,7 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
       escalated under M0145\-0012.
   Movement: none
 
-- [ ] **M0145-0025 — re-take the TPC-H plan-parity baseline on the
+- [x] **M0145-0025 — re-take the TPC-H plan-parity baseline on the
   pinned-seed lane** (filed 2026-09-22, delegated owner direction;
   progress-report §5.4). M0145-0021b found `tpch-estimate-audit-arm.sh`
   had never pinned `GOOPG_ANALYZE_SEED`: the canonical TPC-H parity lane
@@ -18212,6 +18212,22 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
   superseded. A capture and blessing only — no production code.
   Kind: recon
   Parent: M0145-0021b
+  - **CLOSED 2026\-09\-23 \(ralph2 loop \#26\).** Design doc
+    `docs/design/0100-0149/m0145-0025-tpch-parity-baseline-retake.md`.
+    - Shipped configuration \(`PGSHAPED=1`, parallel, seed 20260905\),
+      `318dd9f3d`: **match=2/22 \(Q6, Q11\)**, CATEGORIES\-EXCL\-MATCH
+      join\-order=15 join\-method=10 scan\-type=10 parameterisation=6
+      aggregation\-strategy=7 sort\-strategy=11 parallelism=15
+      qual\-placement=4 rendering=2.
+    - A/A: two captures byte\-identical \(goopg sha `952c4a77…`, PG
+      `548ceee5…`\).
+    - Blessed under `analysis/m0145/m0145\-0025\-tpch\-\*`.
+    - The capture script\'s arm default `PGSHAPED=0` reads match=1/22 with
+      different categories, so future comparisons must name the flag.
+    - Superseded: M0144\-0001\'s floor capture \(pre\-pin, likely the
+      legacy search\) and the M0145\-0002 TPC\-H captures. The §Goal floor
+      re\-pin stays with the owner.
+  Movement: none
 - [ ] **M0145-0026 — recon: duplicate hashclause in the path key list**
   \(filed 2026-09-23 by M0145-0007 slice 5\). On TPC-DS SF0.25 \(both
   arms\) 5 ANTI hash joins from Q78's `LEFT JOIN … WHERE sr_ticket_number
