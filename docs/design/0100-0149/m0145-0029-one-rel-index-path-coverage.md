@@ -1,6 +1,6 @@
 # M0145-0029 — one-relation index-path coverage before the flip
 
-Status: slices 1 and 3 landed 2026-09-23 (`fe3d1b0aa`, `6d50210f4`); slices 2, 4, 5 open. Task:
+Status: slices 1, 2a and 3 landed 2026-09-23 (`fe3d1b0aa`, `fc716f1f8`, `6d50210f4`); slices 2b, 4, 5 open. Task:
 `.ralph/fix_plan.md` M0145-0029 (Kind: impl, Parent: M0145-0008). Origin: the
 M0145-0008 flip triage, group I (`m0145-0008-flip-test-triage.md`).
 
@@ -53,7 +53,8 @@ tests build them):
 | slice | scope | status |
 |---|---|---|
 | 1 | plain restriction IndexScan path, **equality prefix** on constants; lowering drops the consumed conjuncts from the reinstated leaf Filter | **landed** `fe3d1b0aa` |
-| 2 | range bounds (`<`, `<=`, `>`, `>=`, BETWEEN) as index quals — plain AND bitmap producers | open |
+| 2a | range bounds (`<`, `<=`, `>`, `>=`, BETWEEN) on the index's leading column — plain producer | **landed** `fc716f1f8` |
+| 2b | range on the bitmap producer; equality prefix followed by a range column (needs a new executor probe shape) | open |
 | 3 | index-only scan with index quals (`create_index_path(indexonly=true)` with `index_clauses`), one path per index | **landed** `6d50210f4` |
 | 4 | ScalarArrayOp (`col IN (…)` / `= ANY`) quals — plain and bitmap | open |
 | 5 | re-run group I under a local flip; update stale expectations to the PG-faithful shape with the oracle capture (or pin the executor feature they test with `enable_seqscan`/`enable_bitmapscan` off, as PG's regress does) | open |
@@ -121,4 +122,34 @@ heap page. That is a calibration question (`cost_funcs.go`
 dispositions each test. `TestIndexOnlyDeformColdAndVisible` runs on 4
 analysed rows, where the seq scan (1.01) correctly wins, as in PG, so its
 expectation is stale. No corpus plan moved on either arm.
+
+## Slice 2a design (`pathindexrestrict.go`, `createplanindex.go`)
+
+- `restrictionLeadingRange` takes the first lower (`>`/`>=`) and first upper
+  (`<`/`<=`) bound on the index's **leading** column, either operand order,
+  and puts the operator in canonical `col op key` form (`BETWEEN` arrives as
+  the same pair). It runs only when no equality prefix binds the index. The
+  executor's range probe (`LowKey`/`HighKey`) carries no equality prefix, so
+  PG's `a = 1 AND b > 5` shape on `(a, b)` is not expressible yet (2b).
+- `indexPathClause.op` records the operator; its zero value is equality, so
+  every existing clause keeps its meaning. `createRangeIndexScanPlan` lowers
+  the bounds onto `LowKey`/`HighKey`, with the original strictness in
+  `LowOp`/`HighOp`: the fields the rule-based `tryRangeIndexScan` fills and
+  the executor and EXPLAIN already read.
+- Selectivity: `clauselist_selectivity` over the index quals, which is
+  goopg's `conjunctionSelectivity` (a lower and upper bound on one column
+  form one band, `hibound + lobound - 1`).
+- Filter: a single-column index drops the consumed bounds (PG's qpqual). A
+  composite index keeps them as a recheck, the guard `tryRangeIndexScan`
+  keeps: an exclusive lower bound's padded key can admit entries whose
+  trailing columns share the bound value. They still count as index quals
+  for `numQualOps`, as in PG.
+
+Checked under a local flip on 5,002 rows including NULLs: strict and
+inclusive bounds, one or two bounds, the mirrored form and `BETWEEN` all
+return the right counts, with NULLs excluded. The same probe found a
+**pre-existing wrong-results bug**: an index-only prefix probe on a composite
+index skips entries whose trailing column is NULL (`SELECT a FROM r2 WHERE a
+= 10` → 3 rows, PG 4), on the default pipeline too. It is filed as its own
+bug task in `.ralph/fix_plan.md`. No corpus plan moved on either arm.
 

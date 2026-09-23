@@ -2289,6 +2289,28 @@ heuristic stays live.)
     absent\).
   - Take one per loop; each is small and independently testable.
 
+- [ ] **WRONG RESULTS: an index\-only prefix probe on a composite index
+  skips entries whose trailing key column is NULL** \(found 2026\-09\-23 by
+  an M0145\-0029 slice\-2 correctness probe; default pipeline affected\).
+  Kind: bug
+  Parent: none
+  - Repro \(executor fixture, `newVMFixture`\): `CREATE TABLE r2 \(a int, b
+    int\)`; `CREATE INDEX r2_ab ON r2 \(a, b\)`; `INSERT INTO r2 SELECT g / 3,
+    g % 5 FROM generate_series\(1, 5000\) g`; `INSERT INTO r2 VALUES \(10,
+    NULL\)`; `ANALYZE r2`. Then `SELECT a FROM r2 WHERE a = 10` plans a bare
+    `IndexOnlyScan` \(`Key` = 10, a one\-column prefix of `r2_ab`\) and
+    returns **3** rows; PG returns 4. `WHERE a \+ 0 = 10` \(no index\)
+    returns 4.
+  - Legacy default: `WHERE a = 10 AND b IS NULL` also plans an
+    `IndexOnlyScan` and returns **0** rows \(PG: 1\).
+  - Suspect: the prefix probe's upper bound
+    \(`compositeUpperBound` → `appendCompositeUpperPadding`,
+    `internal/executor/pgindex_btree.go:122`, reached from
+    `operators_indexonly.go`'s `Key`/`Keys` arms\) stops before entries whose
+    trailing column is NULL, which a btree sorts after every non\-NULL value
+    \(NULLS LAST\). Check whether the plain `IndexScan` prefix probe, the
+    bitmap probe and the tuple\-format \(`pgIndexKeyDesc` \!= nil\) path share
+    it.
 - [x] **setop output type is the FIRST member's, not `select_common_type`'s
   (found 2026-09-21 by an M0145-0004 discovery probe)** — **FIXED
   2026-09-22** for PostgreSQL's numeric type category, which covers both
@@ -18259,6 +18281,24 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
     - No plan moved: default sweep same=99; knob fire\-set plans unchanged
       at SF0.25 and SF1.
     - Remaining: slice 2 range quals, 4 SAOP, 5 group\-I re\-run.
+  - **Slice 2a LANDED 2026\-09\-23 \(ralph2 loop \#14\), `fc716f1f8`.**
+    Range quals on the index's LEADING column, plain restriction producer.
+    - `restrictionLeadingRange`: first lower \(`>`/`>=`\) and first upper
+      \(`<`/`<=`\) bound, either operand order, canonicalised; BETWEEN is the
+      same pair. Only when no equality prefix binds the index.
+    - `indexPathClause.op` \(zero = equality\); `createRangeIndexScanPlan`
+      lowers onto `LowKey`/`HighKey` \+ `LowOp`/`HighOp`.
+    - Selectivity via `conjunctionSelectivity` \(a lower\+upper pair is one
+      band\). Single\-column index drops the bounds from the Filter;
+      composite keeps them as a recheck \(`tryRangeIndexScan`'s guard\).
+    - Local\-flip probe on 5002 rows with NULLs: every bound form returns
+      the right count, NULLs excluded.
+    - The same probe found a pre\-existing WRONG\-RESULTS bug in composite
+      index\-only prefix probes \(trailing NULL skipped\), on the default
+      pipeline too — filed as its own bug task above.
+    - Remaining: 2b range on the bitmap producer \+ equality prefix
+      followed by a range column \(needs an executor probe shape\); 4 SAOP;
+      5 group\-I re\-run.
 - [ ] **M0145-0030 — group B: adjudicate the 11 behavioural flip-triage
   tests before the flip** (same filing). The flip-triage doc lists 11
   behavioural failures: grouping strategy, nested scalar subquery, NLI
