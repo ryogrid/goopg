@@ -464,6 +464,9 @@ func indexUnboundKeysNullSafe(tbl *catalog.Table, idx *catalog.Index, bound int,
 	if tbl == nil || idx == nil {
 		return false
 	}
+	if catalog.IndexHasNullKeyedEntries(idx) {
+		return true
+	}
 	for i := bound; i < len(idx.Columns); i++ {
 		name := idx.Columns[i]
 		if name == "" {
@@ -529,6 +532,12 @@ func qualsRejectNull(name string, quals Expr) bool {
 func indexUnboundKeysNotNull(tbl *catalog.Table, idx *catalog.Index, bound int) bool {
 	if tbl == nil || idx == nil {
 		return false
+	}
+	// An index that stores NULL-keyed entries (a tuple-format index in a
+	// cluster with null_keyed_index_entries) misses no row, so no key column
+	// needs to be NOT NULL. store-null-keys S3.
+	if catalog.IndexHasNullKeyedEntries(idx) {
+		return true
 	}
 	for i := bound; i < len(idx.Columns); i++ {
 		name := idx.Columns[i]

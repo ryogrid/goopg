@@ -650,3 +650,17 @@ func rangeColumnReversed(ctx *Context, idx *catalog.Index, colIdx int) bool {
 	}
 	return ctx.pgIndexKeyDesc(idx) != nil
 }
+
+// init registers the tuple-format test with catalog, so the optimizer's
+// NULL-key guard can tell which indexes hold NULL-keyed entries
+// (catalog.IndexHasNullKeyedEntries). The same predicate pgIndexKeyDesc uses:
+// buildPGIndexKeyDesc accepts the index and the tuple format is on.
+func init() {
+	catalog.SetIndexFormatStoresNullKeysFunc(func(idx *catalog.Index) bool {
+		if !pgIndexTupleKeys || idx == nil {
+			return false
+		}
+		_, err := buildPGIndexKeyDesc(idx)
+		return err == nil
+	})
+}

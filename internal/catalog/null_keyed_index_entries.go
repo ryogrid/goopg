@@ -25,3 +25,24 @@ func SetNullKeyedIndexEntries(on bool) { nullKeyedIndexEntries.Store(on) }
 // NullKeyedIndexEntries reports whether tuple-format indexes in the open
 // cluster store NULL-keyed entries.
 func NullKeyedIndexEntries() bool { return nullKeyedIndexEntries.Load() }
+
+// indexFormatStoresNullKeys reports whether idx is kept in the tuple format
+// (the only format whose writers file NULL-keyed entries). The test lives in
+// the executor (buildPGIndexKeyDesc needs its type and comparator tables),
+// which registers it here so the optimizer — which cannot import the
+// executor — can ask through catalog. nil (never registered, e.g. an
+// optimizer-only test binary) answers no.
+var indexFormatStoresNullKeys func(*Index) bool
+
+// SetIndexFormatStoresNullKeysFunc registers the tuple-format test. Called
+// once by the executor package at init.
+func SetIndexFormatStoresNullKeysFunc(f func(*Index) bool) { indexFormatStoresNullKeys = f }
+
+// IndexHasNullKeyedEntries reports whether idx holds an entry for every heap
+// row, NULL key columns included: the cluster has the null_keyed_index_entries
+// capability and idx is tuple-format. Such an index is complete for any scan,
+// whatever its key columns' nullability — the planner's NULL-key guard
+// (optimizer indexUnboundKeysNullSafe) only has to protect the others.
+func IndexHasNullKeyedEntries(idx *Index) bool {
+	return idx != nil && NullKeyedIndexEntries() && indexFormatStoresNullKeys != nil && indexFormatStoresNullKeys(idx)
+}

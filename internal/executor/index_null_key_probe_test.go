@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/optimizer"
 	"github.com/goopg/goopg/internal/parser"
 )
@@ -25,7 +26,21 @@ import (
 // the indexed column hidden behind `+ 0`, where it cannot. The answers must be
 // the same multiset of rows.
 func TestIndexProbesKeepNullKeyedRows(t *testing.T) {
+	// Both capability states: off, the planner guard must keep the unsafe
+	// indexes out; on (store-null-keys S3), the entries exist and the guard
+	// lets the indexes back in — the answers must be the same either way.
+	for _, capable := range []bool{false, true} {
+		t.Run(fmt.Sprintf("capable=%v", capable), func(t *testing.T) {
+			catalog.SetNullKeyedIndexEntries(capable)
+			defer catalog.SetNullKeyedIndexEntries(false)
+			indexProbesKeepNullKeyedRows(t)
+		})
+	}
+}
+
+func indexProbesKeepNullKeyedRows(t *testing.T) {
 	ctx, cleanup := newVMFixture(t)
+
 	defer cleanup()
 	runSQL(t, ctx, "CREATE TABLE r2 (a int, b int, c int)")
 	runSQL(t, ctx, "CREATE INDEX r2_ab ON r2 (a, b)")
@@ -37,6 +52,11 @@ func TestIndexProbesKeepNullKeyedRows(t *testing.T) {
 	runSQL(t, ctx, "ANALYZE r2")
 	runSQL(t, ctx, "ANALYZE r2o")
 
+	prefixPlan := strings.Join(runExplainRows(t, ctx, "EXPLAIN SELECT a, b, c FROM r2 WHERE a = 10"), "\n")
+	if usesIdx := strings.Contains(prefixPlan, "r2_ab"); usesIdx != catalog.NullKeyedIndexEntries() {
+		t.Errorf("capable=%v: prefix probe uses r2_ab = %v, want %v (the NULL-key guard):\n%s",
+			catalog.NullKeyedIndexEntries(), usesIdx, catalog.NullKeyedIndexEntries(), prefixPlan)
+	}
 	for _, tc := range []struct{ name, indexed, noIndex string }{
 		{"prefix-eq", "SELECT a, b, c FROM r2 WHERE a = 10", "SELECT a, b, c FROM r2 WHERE a + 0 = 10"},
 		{"prefix-eq-index-only", "SELECT a FROM r2 WHERE a = 10", "SELECT a FROM r2 WHERE a + 0 = 10"},
@@ -83,6 +103,16 @@ func sortedRowStrings(t *testing.T, ctx *Context, sql string) []string {
 // the row. Each case runs under settings that favour the index shape, and is
 // compared with the same statement over a copy with no index.
 func TestIndexFullScansKeepNullKeyedRows(t *testing.T) {
+	for _, capable := range []bool{false, true} {
+		t.Run(fmt.Sprintf("capable=%v", capable), func(t *testing.T) {
+			catalog.SetNullKeyedIndexEntries(capable)
+			defer catalog.SetNullKeyedIndexEntries(false)
+			indexFullScansKeepNullKeyedRows(t)
+		})
+	}
+}
+
+func indexFullScansKeepNullKeyedRows(t *testing.T) {
 	ctx, cleanup := newVMFixture(t)
 	defer cleanup()
 	for _, tbl := range []string{"f1", "f1_noidx"} {
