@@ -2199,10 +2199,23 @@ heuristic stays live.)
   - `LOCK TABLE t` outside a transaction block is accepted; PG raises
     25P01 `LOCK TABLE can only be used in transaction blocks`
     \(`./postgres/src/backend/tcop/utility.c` RequireTransactionBlock\).
+    - **FIXED 2026\-09\-23 \(ralph2 loop \#11\), `40ae756e9`.** 25P01 at top
+      level \(`RoutineDepth == 0`\), tag `LOCK TABLE`. Two prerequisites
+      fixed with it: DO blocks and CALL bodies now raise `RoutineDepth`
+      \(`enterRoutineBody` — PG runs them through SPI, never top\-level\);
+      PL/pgSQL now passes non\-DML SQL through as `stmt_execsql` does
+      \(`lock table t;` used to fail to parse\). Live script identical to
+      PG 18.3 except NOTIFY inside a routine body \(ledgered; see the NOTIFY
+      item below\). Gates: units, spotcheck, SF0.25, acceptance arm,
+      regress suite, isolation family.
   - `REINDEX TABLE t` on a table with no indexes lacks PG's NOTICE `table
     "t" has no indexes to reindex`.
   - A session's own `LISTEN ch; NOTIFY ch` reports `received from server
     process with PID 1` — the notifying backend's PID is wrong.
+    - Also: NOTIFY/LISTEN inside a routine body \(DO, function,
+      procedure\) fails `unsupported statement type *parser.NotifyStmt` —
+      they are handled only by the postmaster; PG allows them anywhere
+      \(ledgered 2026\-09\-23\).
   - `DISCARD ALL` is a syntax error \(PG: `DISCARD ALL`\).
   - `CREATE PUBLICATION` lacks PG's WARNING `"wal_level" is insufficient
     to publish logical changes` when wal\_level is not `logical` \(check

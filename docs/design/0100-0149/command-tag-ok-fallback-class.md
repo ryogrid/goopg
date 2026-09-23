@@ -75,3 +75,25 @@ answered IF EXISTS before looking the rule up, so an existing rule was skipped;
 the IF EXISTS notice now fires only on a miss. A 16-statement script is
 byte-identical to PG 18.3 (`TestAlterRuleRenameThenDrop`).
 
+### Follow-up fixed 2026-09-23 (`40ae756e9`): LOCK TABLE needs a transaction block
+
+`execLockTable` now applies PG's `RequireTransactionBlock(isTopLevel,
+"LOCK TABLE")` (`./postgres/src/backend/tcop/utility.c:936`): 25P01 at top
+level outside a block, before the relation is resolved; the tag is
+`LOCK TABLE`. goopg's `isTopLevel` is `Context.RoutineDepth == 0`, which
+exposed two prerequisites, fixed together:
+
+- DO blocks and procedures (CALL, PL/pgSQL and SQL) ran their bodies at depth 0.
+  `enterRoutineBody` (plpgsql_runtime.go) now raises the depth — with the same
+  54001 stack guard as `executeStoredRoutine` — because PG runs every routine
+  body through SPI, never top-level.
+- PL/pgSQL could not express the statement: `lock table t;` failed "expected
+  ':=' or '='". `pl_gram.y`'s `stmt_execsql` T_WORD arm treats a word not
+  followed by `=`/`:=`/`[`/`.` as plain SQL; goopg's parser now does the same,
+  and routes SQL-command keywords with no PL/pgSQL meaning (TRUNCATE, ANALYZE,
+  VACUUM, REINDEX, CLUSTER, COPY, CHECKPOINT, MERGE, RESET, SHOW, PREPARE,
+  DEALLOCATE, VALUES, WITH, TABLE) to the embedded-SQL path.
+
+A 16-statement live script matches PG 18.3 except NOTIFY inside a DO body,
+which now reaches the executor and fails (NOTIFY is postmaster-only; ledgered).
+
