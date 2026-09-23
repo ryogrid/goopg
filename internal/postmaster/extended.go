@@ -61,6 +61,11 @@ type extendedQueryResult struct {
 	// WARNING needs (severity WARNING + SQLSTATE 25P01), which the plain
 	// Notice string above cannot express. M0132-S2.
 	WarnFields []libpq.ErrorField
+	// NoticeFrames are the executor's queued NOTICE/WARNING messages
+	// (executorNoticeFrames), emitted before CommandComplete as the
+	// simple-query path does. Before they were carried here, every
+	// operator-raised NOTICE or WARNING was dropped on the extended protocol.
+	NoticeFrames [][]libpq.ErrorField
 }
 
 type extendedQueryError struct {
@@ -345,6 +350,11 @@ func (s *Server) handleExecuteFrame(ctx context.Context, state *extendedState, p
 			// what makes both the status byte and the 25P02 gate work.
 			failExplicitBlock(connTx)
 			return &extendedMessageError{Code: qerr.Code, Message: qerr.Message, Detail: qerr.Detail, Hint: qerr.Hint, Position: qerr.Position, Routine: "postmaster.handleExecuteFrame"}, nil
+		}
+		for _, fields := range res.NoticeFrames {
+			if err := w.WriteNoticeResponse(fields); err != nil {
+				return nil, err
+			}
 		}
 		if len(res.WarnFields) > 0 {
 			if err := w.WriteNoticeResponse(res.WarnFields); err != nil {

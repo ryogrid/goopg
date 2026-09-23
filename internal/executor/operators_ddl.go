@@ -1195,6 +1195,14 @@ func (o *ddlOp) execCreatePublication(s *parser.CreatePublicationStmt) error {
 	if err := writePublicationMemberRows(o.ctx, pub); err != nil {
 		return fmt.Errorf("pg_publication_rel journal: %w", err)
 	}
+	// CreatePublication (publicationcmds.c): a publication is created anyway,
+	// but below wal_level = logical nothing can be decoded from it.
+	if o.ctx.GetSetting != nil {
+		if lvl, ok := o.ctx.GetSetting("wal_level"); ok && !strings.EqualFold(lvl, "logical") {
+			o.ctx.AddWarningWithHint("55000", `"wal_level" is insufficient to publish logical changes`,
+				`Set "wal_level" to "logical" before creating subscriptions.`)
+		}
+	}
 	return nil
 }
 

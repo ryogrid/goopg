@@ -579,6 +579,7 @@ func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *misc
 	if err := op.Close(); err != nil {
 		return nil, newExtendedQueryError(err)
 	}
+	res.NoticeFrames = executorNoticeFrames(ectx)
 	// End-of-statement drain for DEFERRABLE (but not currently deferred-to-
 	// COMMIT) UNIQUE/PK checks queued by this Execute, mirroring the
 	// simple-query dispatcher's identical hook (dispatch.go). Extended Execute

@@ -3892,41 +3892,11 @@ func (s *Server) executeOneSimpleStmt(w *libpq.FrameWriter, ctx *executor.Contex
 		return s.writeQueryError(w, execErrCode(err), execErrMsg(err), execErrDetailFields(err)...)
 	}
 
-	// Emit accumulated NOTICE messages before CommandComplete. M0097-0008.
-	for _, msg := range ctx.TakeNotices() {
-		if nerr := w.WriteNoticeResponse([]libpq.ErrorField{
-			{Code: libpq.FieldSeverity, Value: "NOTICE"},
-			{Code: libpq.FieldSeverityNonLocal, Value: "NOTICE"},
-			{Code: libpq.FieldSQLState, Value: "00000"},
-			{Code: libpq.FieldMessage, Value: msg},
-		}); nerr != nil {
-			return nerr
-		}
-	}
-	// Emit NOTICE+DETAIL messages (e.g. DROP CASCADE cascade list). M0097-0020.
-	for _, n := range ctx.TakeNoticesWithDetail() {
-		fields := []libpq.ErrorField{
-			{Code: libpq.FieldSeverity, Value: "NOTICE"},
-			{Code: libpq.FieldSeverityNonLocal, Value: "NOTICE"},
-			{Code: libpq.FieldSQLState, Value: "00000"},
-			{Code: libpq.FieldMessage, Value: n.Message},
-		}
-		if n.Detail != "" {
-			fields = append(fields, libpq.ErrorField{Code: libpq.FieldDetail, Value: n.Detail})
-		}
+	// Emit the statement's queued NOTICE / WARNING messages before
+	// CommandComplete (M0097-0008/0020/0021); executorNoticeFrames is shared
+	// with the extended path.
+	for _, fields := range executorNoticeFrames(ctx) {
 		if nerr := w.WriteNoticeResponse(fields); nerr != nil {
-			return nerr
-		}
-	}
-
-	// Emit accumulated WARNING messages before CommandComplete. M0097-0021.
-	for _, msg := range ctx.TakeWarnings() {
-		if nerr := w.WriteNoticeResponse([]libpq.ErrorField{
-			{Code: libpq.FieldSeverity, Value: "WARNING"},
-			{Code: libpq.FieldSeverityNonLocal, Value: "WARNING"},
-			{Code: libpq.FieldSQLState, Value: "55000"},
-			{Code: libpq.FieldMessage, Value: msg},
-		}); nerr != nil {
 			return nerr
 		}
 	}
@@ -4967,4 +4937,62 @@ func isCurrentOfDML(stmt parser.Stmt) bool {
 		return d.CurrentOf != ""
 	}
 	return false
+}
+
+// executorNoticeFrames drains the executor Context's queued messages into
+// NoticeResponse field sets, in the order both wire paths emit them before
+// CommandComplete: plain NOTICEs, NOTICEs with a DETAIL, plain WARNINGs
+// (55000), then WARNINGs with their own SQLSTATE and a HINT. The simple-query
+// dispatcher and the extended protocol's Execute share it, so a message an
+// operator queues reaches the client whichever protocol ran the statement.
+func executorNoticeFrames(ctx *executor.Context) [][]libpq.ErrorField {
+	if ctx == nil {
+		return nil
+	}
+	var out [][]libpq.ErrorField
+	for _, msg := range ctx.TakeNotices() {
+		out = append(out, []libpq.ErrorField{
+			{Code: libpq.FieldSeverity, Value: "NOTICE"},
+			{Code: libpq.FieldSeverityNonLocal, Value: "NOTICE"},
+			{Code: libpq.FieldSQLState, Value: "00000"},
+			{Code: libpq.FieldMessage, Value: msg},
+		})
+	}
+	for _, n := range ctx.TakeNoticesWithDetail() {
+		fields := []libpq.ErrorField{
+			{Code: libpq.FieldSeverity, Value: "NOTICE"},
+			{Code: libpq.FieldSeverityNonLocal, Value: "NOTICE"},
+			{Code: libpq.FieldSQLState, Value: "00000"},
+			{Code: libpq.FieldMessage, Value: n.Message},
+		}
+		if n.Detail != "" {
+			fields = append(fields, libpq.ErrorField{Code: libpq.FieldDetail, Value: n.Detail})
+		}
+		out = append(out, fields)
+	}
+	for _, msg := range ctx.TakeWarnings() {
+		out = append(out, []libpq.ErrorField{
+			{Code: libpq.FieldSeverity, Value: "WARNING"},
+			{Code: libpq.FieldSeverityNonLocal, Value: "WARNING"},
+			{Code: libpq.FieldSQLState, Value: "55000"},
+			{Code: libpq.FieldMessage, Value: msg},
+		})
+	}
+	for _, wh := range ctx.TakeWarningsWithHint() {
+		code := wh.Code
+		if code == "" {
+			code = "01000"
+		}
+		fields := []libpq.ErrorField{
+			{Code: libpq.FieldSeverity, Value: "WARNING"},
+			{Code: libpq.FieldSeverityNonLocal, Value: "WARNING"},
+			{Code: libpq.FieldSQLState, Value: code},
+			{Code: libpq.FieldMessage, Value: wh.Message},
+		}
+		if wh.Hint != "" {
+			fields = append(fields, libpq.ErrorField{Code: libpq.FieldHint, Value: wh.Hint})
+		}
+		out = append(out, fields)
+	}
+	return out
 }

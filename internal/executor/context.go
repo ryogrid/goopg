@@ -523,6 +523,10 @@ type Context struct {
 	// emits these as NoticeResponse with WARNING severity before CommandComplete.
 	// M0097-0021.
 	Warnings []string
+	// WarningsWithHint are WARNINGs that carry their own SQLSTATE and a HINT
+	// (errcode + errhint in an upstream ereport(WARNING, ...)); Warnings above
+	// always go out as 55000 with no hint.
+	WarningsWithHint []WarningWithHint
 
 	// Sequence session state — maps sequence key → last nextval result
 	// for currval(); LastSeqVal/LastSeqSet track the lastval() return. M0097-0009.
@@ -1236,6 +1240,25 @@ func (c *Context) TakeNoticesWithDetail() []NoticeWithDetail {
 // M0097-0021.
 func (c *Context) AddWarning(msg string) {
 	c.Warnings = append(c.Warnings, msg)
+}
+
+// WarningWithHint is one WARNING with its own SQLSTATE and HINT.
+type WarningWithHint struct {
+	Code    string
+	Message string
+	Hint    string
+}
+
+// AddWarningWithHint queues a WARNING carrying SQLSTATE code and a HINT.
+func (c *Context) AddWarningWithHint(code, msg, hint string) {
+	c.WarningsWithHint = append(c.WarningsWithHint, WarningWithHint{Code: code, Message: msg, Hint: hint})
+}
+
+// TakeWarningsWithHint returns and clears the hint-carrying warnings.
+func (c *Context) TakeWarningsWithHint() []WarningWithHint {
+	w := c.WarningsWithHint
+	c.WarningsWithHint = nil
+	return w
 }
 
 // TakeWarnings returns and clears the accumulated warnings.
