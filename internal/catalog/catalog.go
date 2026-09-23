@@ -130,15 +130,39 @@ func (c *InMemory) relAllVisibleCell(t *Table) string {
 	if c == nil || t == nil {
 		return "0"
 	}
-	dbOid := c.dbOid
+	dbOid, relOID := c.relAllVisibleKey(t)
+	return relAllVisibleFor(dbOid, relOID)
+}
+
+// relAllVisibleKey is the (database, relfilenode) pair a table's VM bits are
+// kept under: the table's own database when it names one, else THIS catalog's
+// database — the one VACUUM ran in and keyed the bits by. Shared by the
+// pg_class cell and RelAllVisibleBlocks so the planner and the view can never
+// read two different counts for one table.
+func (c *InMemory) relAllVisibleKey(t *Table) (dbOid, relOID uint32) {
+	dbOid = c.dbOid
 	if t.DBOid != 0 && t.DBOid != DefaultDBOid {
 		dbOid = t.DBOid
 	}
-	relOID := t.OID
+	relOID = t.OID
 	if t.RelFileNodeOID != 0 {
 		relOID = t.RelFileNodeOID
 	}
-	return relAllVisibleFor(dbOid, relOID)
+	return dbOid, relOID
+}
+
+// RelAllVisibleBlocks is pg_class.relallvisible for t as a number, resolved
+// exactly as the pg_class view resolves it (relAllVisibleKey). The planner's
+// `baserel->allvisfrac` reads this: the package-level RelAllVisible keys a
+// DBOid-less table under DefaultDBOid, while VACUUM keyed its VM bits under the
+// session's database, so on the `postgres` database it read 0 and priced every
+// index-only scan with all its heap fetches (M0145-0029 slice 5).
+func (c *InMemory) RelAllVisibleBlocks(t *Table) int32 {
+	if c == nil || t == nil || RelAllVisibleFunc == nil {
+		return 0
+	}
+	dbOid, relOID := c.relAllVisibleKey(t)
+	return RelAllVisibleFunc(dbOid, relOID)
 }
 
 // RelAllVisible reports the relation's VM-derived all-visible BLOCK COUNT

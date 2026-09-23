@@ -288,7 +288,7 @@ func TestIndexOnlyPathTargetMatchesWidth(t *testing.T) {
 	if len(needed) != 2 {
 		t.Fatalf("neededColumnsOf = %v, want [k v]", needed)
 	}
-	if !s.addOneIndexOnlyPath(rel, tbl, idxs[0], needed, nil, 10000, 100000, 10000) {
+	if !s.addOneIndexOnlyPath(c, rel, tbl, idxs[0], needed, nil, 10000, 100000, 10000) {
 		t.Fatal("addOneIndexOnlyPath declined a covered index; the fixture is wrong")
 	}
 	p := rel.Pathlist[len(rel.Pathlist)-1]

@@ -81,7 +81,7 @@ func (s *searchCtx) addIndexOnlyPaths(cat catalog.Catalog) {
 					continue
 				}
 			}
-			if s.addOneIndexOnlyPath(rel, tbl, idx, needed, clauses, relPages, relTuples, totalPages) {
+			if s.addOneIndexOnlyPath(cat, rel, tbl, idx, needed, clauses, relPages, relTuples, totalPages) {
 				added = true
 			}
 		}
@@ -157,7 +157,7 @@ func (s *searchCtx) restrictionPathIsIndexOnly(cat catalog.Catalog, tbl *catalog
 // addOneIndexOnlyPath builds the index-only path for one index, or declines.
 // `clauses` is empty for the full-index-scan shape over a bare leaf, or the
 // index quals that consume all of the leaf's local quals.
-func (s *searchCtx) addOneIndexOnlyPath(rel *RelOptInfo, tbl *catalog.Table, idx *catalog.Index,
+func (s *searchCtx) addOneIndexOnlyPath(cat catalog.Catalog, rel *RelOptInfo, tbl *catalog.Table, idx *catalog.Index,
 	needed []catalog.Column, clauses []indexPathClause, relPages int64, relTuples, totalPages float64) bool {
 	covered, ok := indexCoversColumns(idx, needed)
 	if !ok {
@@ -187,7 +187,7 @@ func (s *searchCtx) addOneIndexOnlyPath(rel *RelOptInfo, tbl *catalog.Table, idx
 		totalTablePages:         totalPages,
 		loopCount:               1,
 		indexOnly:               true,
-		allVisFrac:              relAllVisibleFraction(tbl, relPages),
+		allVisFrac:              relAllVisibleFraction(cat, tbl, relPages),
 		// R1 (plan-parity-fix-take2): every local conjunct not consumed as an
 		// index qual is a qpqual, as the seq rival counts them
 		// (costsize.c:806-820).
@@ -295,14 +295,22 @@ func indexCoversColumns(idx *catalog.Index, needed []catalog.Column) ([]catalog.
 // relAllVisibleFraction is PG's `baserel->allvisfrac` (`estimate_rel_size`,
 // plancat.c:1050): the fraction of the heap the visibility map marks
 // all-visible — the ONLY thing that makes an index-only scan cheaper than an
-// index scan. goopg's VM is readable through `catalog.RelAllVisible` (wired by
-// initdb), so this is the real figure: a never-vacuumed table returns 0 and
-// the path loses on cost.
-func relAllVisibleFraction(tbl *catalog.Table, relPages int64) float64 {
+// index scan. goopg's VM is readable through the catalog (wired by initdb),
+// so this is the real figure: a never-vacuumed table returns 0 and the path
+// loses on cost. The block count is resolved as the pg_class view resolves it
+// (`InMemory.RelAllVisibleBlocks`) — the package-level `catalog.RelAllVisible`
+// is only the fallback for a catalog that is not an InMemory, since it keys a
+// DBOid-less table under the wrong database.
+func relAllVisibleFraction(cat catalog.Catalog, tbl *catalog.Table, relPages int64) float64 {
 	if tbl == nil || relPages <= 0 {
 		return 0
 	}
-	visible := catalog.RelAllVisible(tbl)
+	var visible int32
+	if im := inMemoryCat(cat); im != nil {
+		visible = im.RelAllVisibleBlocks(tbl)
+	} else {
+		visible = catalog.RelAllVisible(tbl)
+	}
 	if visible <= 0 {
 		return 0
 	}
