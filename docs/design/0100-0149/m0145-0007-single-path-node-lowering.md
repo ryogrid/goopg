@@ -1,11 +1,14 @@
 # Single Path→Node lowering (M0145-0007)
 
-Status: recon complete; slices 1 (lowering-locality guard), 2 (the NLI route
+Status: CLOSED 2026-09-23. Recon complete; slices 1 (lowering-locality guard), 2 (the NLI route
 census) and 3 (the sublink-route census) landed; slice 4 RE-ADJUDICATED
 2026-09-23 — its recorded blocker was discharged by M0145-0005 slice 7 (the
 pinned-spine route fires 0 times on the jointree arm on both corpora), so the
-family has no fold work and retires wholesale at the M0145-0008 cutover. The
-one remaining actionable item is slice 5 (`fillJoinHashKeys`). Task:
+family has no fold work and retires wholesale at the M0145-0008 cutover. Slice
+5 RE-ADJUDICATED 2026-09-23 — lowering already publishes `HashKeys`; the late
+pass agrees structurally on all 670 measured lowering-built joins except a
+path-side duplicate pair (M0145-0026), and survives only for joins built
+outside lowering. **CLOSED.** Task:
 `.ralph/fix_plan.md`
 M0145-0007. Parent: M0145-0005 (the DP that produces the path tree),
 M0145-0006 (the upper rels that extend it). Kind: impl.
@@ -238,7 +241,7 @@ one does — but it is not a capability gap, and it does not gate the cutover.
 | 2 | **Landed.** The NLI route census (above). Result: the search has a coverage hole — SEMI/ANTI — that must be closed before 0008 may delete the rewrite. |
 | 3 | **Landed as a census, not a fold.** The family's only live caller is the legacy pinned-spine route, which still plans 207 TPC-DS and 16 TPC-H sublink events on the default arm (294 vs 5 on the knob arm). Folding it into lowering would re-implement a route the milestone deletes. |
 | 4 | **Adjudicated NO-FOLD 2026-09-23** — the blocker recorded below ("blocked on M0145-0003 coverage") was discharged by M0145-0005 slice 7 retiring the pinned-spine route on the jointree arm (`pinned-spine=0` on both corpora). The family's `predp.go` members are legacy-arm-only and die wholesale at M0145-0008; `reresolveJoinByName`/`remapOuterRefsInSubplan` are shared lowering machinery that also serve the posthoc route, not splice leftovers. | Nothing to fold — the earlier "coverage" gate measured a route that no longer exists on the target arm. |
-| 5 | `fillJoinHashKeys` folded into the join arm. | LAST, per item 2 — its lateness is a defence, and the defence is only unnecessary once slices 3-4 have removed the mutators. |
+| 5 | **Adjudicated 2026-09-23: already folded for the elected tree.** `createHashJoinPlan`/`createMergeJoinPlan` publish `HashKeys` at construction; the late pass recomputes the same list (0 structural drift in 670 joins) except a path-side duplicate (M0145-0026). It stays alive for joins built OUTSIDE lowering (posthoc `unnest.go`, FULL merge, CROSS promotion). | Measured, see the section at the end of this doc. |
 
 ## Gates
 
@@ -367,3 +370,76 @@ them 207/16 times), and the shared joinlayout.go members are already where
 lowering wants them. The recorded dependency on M0145-0003's pull-up coverage
 is obsolete — coverage now changes only WHICH route plans declined conjuncts
 (pullup vs posthoc), never whether the splice family runs.
+
+## Slice 5 RE-ADJUDICATED (2026-09-23, loop #1 of the ralph2 run) — the lowering half is ALREADY folded
+
+Item 2 above says `fillJoinHashKeys` can fold into the join arm "only once the
+mutators are gone". That is a measurable precondition, so it was measured
+instead of carried forward — and the measurement changes the framing.
+
+**What the code already does.** `createHashJoinPlan` / `createMergeJoinPlan`
+(`createplanjoin.go`) publish `HashKeys: pairs` at construction, from the
+path's own key list, with `HashKeys[0]` shared by pointer with
+`LeftKey`/`RightKey`. So for every join the search elected the fold is already
+there; `fillJoinHashKeys` then *recomputes* the same list at `Plan()`'s tail.
+The open question is therefore not "can lowering fill the keys" but "does the
+late recomputation ever produce a different answer than lowering did".
+
+**Method.** A throwaway probe (not in the build; `git apply`-able patch kept at
+`docs/design/0100-0149/m0145-0007-hashkeyprobe.patch`, `GOOPG_HASHKEY_PROBE=1`) recorded each
+lowering-built join's live `HashKeys` slice, then — inside
+`fillOneJoinHashKeys`, before it overwrites — compared that live slice
+(i.e. what the plan would carry if the late pass did not exist) against the
+recomputed list. Comparison is STRUCTURAL (a reflect walk ignoring `pos`), not
+by pointer: the first pointer-based run reported 10 "differences" that were all
+expressions rebuilt copy-on-write by a later pass into structurally equal trees.
+Joins were also classified by origin: lowering-built, a shallow copy of one
+(tracked through the key slice's backing array), a re-visit of an
+already-filled join, or built outside lowering (constructor sites tagged).
+Runs: `scripts/jointree-parity-capture.sh` on private clones, EXPLAIN-only.
+
+| arm | corpus | lowering (+copies) | same | duplicate-pair | built outside lowering | re-visits (all same) |
+|---|---|---|---|---|---|---|
+| `GOOPG_JOINTREE_PIPELINE=1` | TPC-DS SF0.25 | 206 + 122 | 323 | **5** | **33** | 293 |
+| default | TPC-DS SF0.25 | 192 + 121 | 308 | **5** | **51** | 310 |
+| `GOOPG_JOINTREE_PIPELINE=1`, `PGSHAPED=1` | TPC-H SF1 | 12 + 17 | 29 | 0 | **6** | 23 |
+
+Findings:
+
+1. **The mutators are NOT a live hazard for lowering-built keys.** Zero
+   structural drift in 670 lowering-built (or copied) joins across both arms
+   and both corpora. predRebind, FoldConstants, `lowerSubPlanParams`,
+   `applyUpperNarrowing` and the qual-placement passes either do not touch a
+   searched join's key expressions or rebuild them into equal trees. Item 2's
+   precondition holds *for this population*.
+2. **The one real difference is a duplicate pair in the PATH's key list**
+   (5 events, all ANTI hash joins in TPC-DS Q78's `LEFT JOIN … WHERE
+   sr_ticket_number IS NULL` arms): lowering publishes
+   `[ss_ticket_number=sr_ticket_number, ss_ticket_number=sr_ticket_number,
+   ss_item_sk=sr_item_sk]` and the late pass de-duplicates it. Harmless for
+   results, but PG's hashclause list comes from a restrictlist that cannot
+   hold the same RestrictInfo twice, so the path carries a clause PG would not
+   — and if the costing reads that list it double-counts it. Filed as
+   **M0145-0026** (recon: where the duplicate enters, and whether it reaches
+   selectivity/bucket-size costing).
+3. **The late pass's NECESSARY population is joins lowering never builds.**
+   Knob arm SF0.25: 33 — `unnest.go` posthoc builders (the SEMI builder 15,
+   the INNER one 3), `planner.go`'s FULL merge join 2, `pushdown.go`'s
+   CROSS→hash promotion 1, and 12 shallow copies of those. TPC-H knob: 6, all
+   posthoc `unnest.go` joins (4 tagged, 2 copies). None of these set `HashKeys`; the late pass is
+   their only publisher. The posthoc route survives the M0145-0008 cutover
+   (it serves declined sublink conjuncts on the jointree arm too), so
+   `fillJoinHashKeys` cannot be deleted inside 0007 or at 0008 — it retires
+   when the last non-lowering hash/merge builder does.
+4. Re-visits: the pass runs once per nested `Plan()` tail, so an inner scope's
+   joins are filled again by every enclosing scope (≈300 re-visits per
+   corpus). Always idempotent (all `same=true`) — wasted work, not a defect.
+
+**Verdict.** Slice 5 has no fold work: the lowering arm already publishes the
+keys, and the late pass agrees with it structurally everywhere except the
+path-side duplicate (M0145-0026). What keeps `fillJoinHashKeys` alive is not
+the mutators item 2 feared but the non-lowering join builders, which are not
+0007's subject (0007 is the elected path tree's lowering). With slices 1-5 all
+landed or adjudicated, M0145-0007 is CLOSED; the residual — deleting the late
+pass once the posthoc/legacy builders are gone — is recorded in the deferral
+ledger against the builders that keep it alive.

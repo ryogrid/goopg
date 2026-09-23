@@ -15549,7 +15549,7 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
       `electOrderedGrouping`'s `node != agg.node` precondition, and
       `electOrderedDistinct`'s `cands<2` gate (really a
       `createDistinctPaths` candidate-supply gap).
-- [ ] **M0145-0007 — single Path→Node lowering** (the `create_plan`
+- [x] **M0145-0007 — single Path→Node lowering** (the `create_plan`
   analogue): consolidate every post-election resolution step the stage
   builders currently interleave — per 0001's lowering-contract inventory —
   into one pass that runs once on the elected path tree. During
@@ -15738,6 +15738,33 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
       bisect through that channel measures the same full run each time.
       Use the `sweep` channel (which does honour `QUERIES`) or add an
       outer-relation field to the census line.
+    - **Slice 5 RE\-ADJUDICATED 2026\-09\-23 \(ralph2 loop \#1\) — already
+      folded; task CLOSED.** Design doc §"Slice 5 RE\-ADJUDICATED".
+      - `createHashJoinPlan`/`createMergeJoinPlan` already publish
+        `HashKeys` at construction from the path's key list; the late
+        `fillJoinHashKeys` only recomputes it. So the question was whether
+        the recomputation ever differs — measured with a throwaway
+        structural probe \(`GOOPG_HASHKEY_PROBE=1`, not committed; patch
+        `docs/design/0100-0149/m0145-0007-hashkeyprobe.patch`\), `jointree-parity-capture.sh`
+        on private clones.
+      - **0 structural drift on 670 lowering\-built joins** \(SF0.25 knob
+        328, SF0.25 default 313, TPC\-H knob at `PGSHAPED=1` 29\): the
+        mutators item 2 feared do not move searched keys. A first
+        pointer\-identity run reported 10 false diffs — copy\-on\-write
+        rebuilds into equal trees; compare structurally.
+      - One real difference: a DUPLICATE pair in the path key list on 5
+        Q78 ANTI hash joins \(`ss_ticket_number=sr_ticket_number` twice\),
+        de\-duplicated only by the late pass → filed **M0145\-0026**.
+      - The late pass's necessary population is joins built OUTSIDE
+        lowering: SF0.25 knob 33 / default 51, TPC\-H knob 6 — posthoc
+        `unnest.go` builders, `planner.go` FULL merge, `pushdown.go`
+        CROSS→hash promotion, and shallow copies. They survive the 0008
+        cutover, so `fillJoinHashKeys` stays; ledgered.
+      - TRAP: `jointree-parity-capture.sh tpch` inherits
+        `tpch-estimate-audit-arm.sh`'s `PGSHAPED=0` default — the first
+        TPC\-H run measured the legacy DP \(0 lowering\-built joins\).
+        Pass `PGSHAPED=1` for the shipped planner.
+      - Movement: none \(measurement\).
 - [ ] **M0145-0008 — cutover**: flip `GOOPG_JOINTREE_PIPELINE` default,
   re-run the full corpus gates on the new pipeline (sf025 sweep,
   tpch-spotcheck, acceptance arm, plan-parity capture), then delete the
@@ -17644,3 +17671,20 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
   superseded. A capture and blessing only — no production code.
   Kind: recon
   Parent: M0145-0021b
+- [ ] **M0145-0026 — recon: duplicate hashclause in the path key list**
+  \(filed 2026-09-23 by M0145-0007 slice 5\). On TPC-DS SF0.25 \(both
+  arms\) 5 ANTI hash joins from Q78's `LEFT JOIN … WHERE sr_ticket_number
+  IS NULL` arms reach lowering with the path key list
+  `[ss_ticket_number=sr_ticket_number, ss_ticket_number=sr_ticket_number,
+  ss_item_sk=sr_item_sk]` \(web/catalog arms alike\); only the late
+  `fillJoinHashKeys` de-duplicates it, so EXPLAIN hides it. PG builds
+  hashclauses from a restrictlist that cannot hold the same RestrictInfo
+  twice \(`postgres/src/backend/optimizer/path/joinpath.c`
+  `hash_inner_and_outer`\). Find where the duplicate enters \(the
+  reduce-outer-joins anti conversion vs. the equivalence/restrictlist
+  build\) and whether `final_cost_hashjoin`'s analogue or the join
+  selectivity reads the duplicated list \(double-counted clause\).
+  Reproduce with the probe patch `docs/design/0100-0149/m0145-0007-hashkeyprobe.patch`
+  \(`GOOPG_HASHKEY_PROBE=1`, `verdict=DIFFLEN` lines\). Recon only.
+  Kind: recon
+  Parent: M0145-0007
