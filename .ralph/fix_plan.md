@@ -2153,6 +2153,20 @@ heuristic stays live.)
 
 ### Manually discovered (not yet in a nightly `ci/logs/action-items.md` run) — filed 2026-09-15
 
+- [ ] **`CREATE FUNCTION` completes with command tag `OK`, not `CREATE
+  FUNCTION`** \(found 2026\-09\-23 while diffing a GRANT script against a
+  private PG 18.3: psql printed `OK` where PG prints `CREATE FUNCTION`\).
+  Kind: bug
+  Parent: none
+  - Suspects: the postmaster's generic tag fallbacks
+    \(`internal/postmaster/dispatch.go` `return "OK"` at several sites,
+    `dispatch_extended.go:620`\) — a DDL kind with no explicit tag arm.
+    PG sets the tag from the statement's CommandTag
+    \(`./postgres/src/include/tcop/cmdtaglist.h` `CMDTAG_CREATE_FUNCTION`\).
+  - Step 1: reproduce over simple and extended protocol; list every DDL
+    kind that falls back to `OK` \(the TS\-config ALTER case was fixed the
+    same way in M0119\-0004\), fix them as one class.
+
 - [x] **setop output type is the FIRST member's, not `select_common_type`'s
   (found 2026-09-21 by an M0145-0004 discovery probe)** — **FIXED
   2026-09-22** for PostgreSQL's numeric type category, which covers both
@@ -2719,6 +2733,23 @@ the whole file's active task between 2026-09-01 and 2026-09-14; **since
 - [ ] **M0122-0008 — Auth / roles / multi-DB isolation / encoding**.
   Kind: impl
   Parent: none
+  - 2026\-09\-23 \(ralph2 loop \#8\): **`GRANT … TO PUBLIC WITH GRANT
+    OPTION` refused with 0LP01 on every grant path** \(`75140193f`\),
+    closing the divergence the M0122\-0008a fixture ledgered.
+    Movement: none — ACL DDL conformance; SF0.25 `PLAN-SHAPE same=99`.
+    Design: `docs/design/0100-0149/0122-0008-grant-option-to-public.md`.
+    - PG: `merge_acl_with_grant` \(`aclchk.c:208`\), shared by every
+      `ExecGrant_*` and ALTER DEFAULT PRIVILEGES. goopg: one predicate
+      `catalog.GrantOptionToPublic`, checked BEFORE any ACL write \(the
+      store is not transactional\) on the five typed executor paths and
+      the postmaster autocommit fast path.
+    - Verified on a private PG 18.3: nine autocommit forms identical
+      \(SQLSTATE, message, line\); controls \(role grantee, REVOKE GRANT
+      OPTION FOR … FROM PUBLIC\) accepted on both.
+    - Gates: units, tpch\-spotcheck, SF0.25 sweep, acceptance arm,
+      `TestPort_RegressSuite` — all PASS.
+    - Still diverges inside an explicit transaction \(CompatNoop path;
+      the M0134\-0069 ledger gap\) — ledgered.
   - 2026-09-22: **`GRANT … ON DATABASE` now reaches databases other than the
     connected one**, consuming the `unimplemented_feat.json` entry
     *"Implement multi-database support so a single server instance can manage

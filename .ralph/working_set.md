@@ -1,8 +1,9 @@
 (idle — nothing in flight)
 
-Last loop (ralph2 #7): M-NIGHTLY isolation diffs DONE (ffe1d020f):
-batch-filter read-ahead broke LockRows' currentTID on partitioned FOR UPDATE
-(bisected d6e42a7f7); intra-grant-inplace-db now runs in isolation_regression.
-Banner: items 3/6/7 [!] (owner decisions pending: M0145-0001, M0141-S7,
-M0140-0007); next per item 10 = remaining M-NIGHTLY, then M0119 → M0122 →
-M0131 → M0134 → M0135/M0136 → M0095/M0110.
+Last loop (ralph2 #8): M0122-0008 slice — GRANT … TO PUBLIC WITH GRANT OPTION
+now 0LP01 on every grant path (75140193f). Filed: CREATE FUNCTION command tag
+'OK' bug (manual section, near M-NIGHTLY). Banner item 10 order: M0119 has no
+selectable work (owner decisions); M0122 umbrellas open — next candidates
+M0122-0015b (subq_op OPERATOR() before ANY) / M0122-0015a, or the new
+CREATE FUNCTION tag bug (M-NIGHTLY/manual section comes first per item 10).
+Owner decisions pending: M0145-0001, M0141-S7, M0140-0007.
