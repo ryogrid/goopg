@@ -18245,7 +18245,7 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
     acceptance arm, SF0.25 sweep, fire set \(24 fires\) — all PASS.
   - Ledgered: PG orders scan quals by per\-tuple cost
     \(`order_qual_clauses`\); goopg uses the WHERE order.
-- [ ] **M0145-0029 — group I: close the one-relation index-path coverage
+- [x] **M0145-0029 — group I: close the one-relation index-path coverage
   gaps before the flip** (filed 2026-09-23 by the M0145-0001 second
   lineage escalation, owner GO same day). The local flip fails ≥10 tests
   where the one-relation search on the jointree arm misses an index path
@@ -18402,6 +18402,26 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
       shape it wants now exists.
     - Remaining for group I: the owner's multiplier call; fixture
       dispositions in the flip commit.
+  - **CLOSED 2026\-09\-23 \(ralph2 loop \#21\).** Every generation gap the
+    group\-I witnesses exposed is ported and pinned by a unit test
+    \(restriction equality / range / SAOP / prefix\+range / SAOP\+range
+    probes, index\-only with quals, allvisfrac, index\_update\_stats,
+    planner toggles, eqsel isunique\). What is left is not a generation
+    gap, and is handed on:
+    - to the OWNER: `indexProbeCostMultiplier` decides
+      `TestIOS_HeapFallback` and `TestIndexOnlyDeformColdAndVisible` on a
+      live server \(PG prices index vs bitmap within 0.01\); no corpus plan
+      reproduces it, so per this task's rule it is recorded, not escalated
+      as a corpus defect;
+    - to the M0145\-0008 flip commit: the stale expectations
+      \(`TestIndexScan\{Varchar,Char,Timestamp\}EndToEnd`,
+      `TestIndexScanEndToEndConstantKey`,
+      `TestTPCHNumericSingleColumnIndexesAccepted`,
+      `TestIndexDeformRescanPersistsBound` — now under `autovacuum = off`,
+      so re\-check against PG's Bitmap Heap Scan\) and the no\-stats fixture
+      of `TestSAOPWithConjunctMoves`;
+    - to the filed bug: the byte\-key btree's missing NULL\-key entries.
+  Movement: none
 - [ ] **M0145-0030 — group B: adjudicate the 11 behavioural flip-triage
   tests before the flip** (same filing). The flip-triage doc lists 11
   behavioural failures: grouping strategy, nested scalar subquery, NLI
@@ -18419,6 +18439,17 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
   baselines silently switch arms.
   Kind: impl
   Parent: M0145-0008
+  - **Re\-run under the flip 2026\-09\-23 \(ralph2 loop \#21\), after all of
+    M0145\-0029:** 6 of the 11 now pass \(NLI semi/anti residual, parallel
+    NLI jointype, hashed\-IN probe, RunFastJoinConcrete\). Still failing:
+    - `TestCreateGroupingPathsGucOnPkFdStaysHash` — sorted instead of hashed;
+    - `TestPlannerSettingsReachScalarSubqueryJoin/…/nested`,
+      `TestScalarSubqueryPropagationKeepsDefaultPlan/nested` — 2 costed
+      inner plans, want 1;
+    - `TestExplainSelfCorrelatedExistsDoesNotAliasCollide` — a REAL EXPLAIN
+      defect on the jointree arm: `Hash Cond: \(t1.a = t1.a\)` where the
+      inner side is t2;
+    - `TestExplainAnalyzeRowsRemovedByJoinFilter` — already classed stale.
 
 ## M0146 — Post-cutover plan parity (filed 2026-09-23, owner decision)
 

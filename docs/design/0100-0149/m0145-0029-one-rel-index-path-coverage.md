@@ -1,6 +1,6 @@
 # M0145-0029 — one-relation index-path coverage before the flip
 
-Status: slices 1, 2a, 3 and 4 landed 2026-09-23 (`fe3d1b0aa`, `fc716f1f8`, `6d50210f4`, `729027e28`); slice 5 re-run done with its root-cause fix (`9e368ade8`); slice 2b open, and the multiplier-dependent residue is escalated to the owner. Task:
+Status: CLOSED 2026-09-23 — all generation gaps ported (slices 1, 2a, 2b, 3, 4; follow-ups `9e368ade8`, `292b1af2e`, `8a8f1c11f`, `98f68622d`); remaining witnesses handed to the owner (probe multiplier) and the M0145-0008 flip commit (stale expectations). Task:
 `.ralph/fix_plan.md` M0145-0029 (Kind: impl, Parent: M0145-0008). Origin: the
 M0145-0008 flip triage, group I (`m0145-0008-flip-test-triage.md`).
 

@@ -1,31 +1,30 @@
-Task: M0145-0029 — one-relation index-path coverage (flip-triage group I).
-Landed: slices 1, 2a, 2b, 3, 4; slice 5 re-run; index_update_stats; planner
-toggles + eqsel isunique; SAOP + second-column range + NULL-key guard
-(98f68622d). Group I remaining: owner's indexProbeCostMultiplier call, and
-fixture/expectation edits that ride the flip commit (M0145-0008).
+Task: M0145-0030 — group B: adjudicate the behavioural flip-triage tests
+(plus the knob-default script audit). M0145-0029 CLOSED this loop.
 
-Files (this loop): executor operators_index.go rescanSAOP (bounds on column
-1), operators_explain.go SAOP Index Cond, operators_storage.go
-indexScanPredicate SAOP arm, operators_lockrows.go EPQ locality; optimizer
-pathindexrestrict.go (SAOP + restrictionRangeOnColumn(…,1),
-indexUnboundKeysNotNull, boundIndexColumns), pathindexonly.go
-(consumingIndexClauses guard), createplanindex.go createSAOPIndexScanPlan.
+State under a local flip (jointreepipeline.go:27 `v == "1"` → `v != "0"`,
+REVERT before commit), after all of M0145-0029: 5 of the 11 group-B tests
+still fail (NLI semi/anti residual, parallel NLI jointype, hashed-IN probe,
+RunFastJoinConcrete now PASS):
+- optimizer TestCreateGroupingPathsGucOnPkFdStaysHash: Strategy=1 (sorted),
+  want Hashed.
+- optimizer TestPlannerSettingsReachScalarSubqueryJoin/cpu_tuple_cost/nested
+  and TestScalarSubqueryPropagationKeepsDefaultPlan/nested: nested plan has
+  2 costed inner plans, want 1.
+- optimizer TestExplainSelfCorrelatedExistsDoesNotAliasCollide: REAL EXPLAIN
+  BUG on the jointree arm — `Hash Cond: (t1.a = t1.a)`, `Join Filter:
+  (t1.b <> t1.b)`; the inner side must render t2.
+- executor TestExplainAnalyzeRowsRemovedByJoinFilter: triage already classed
+  it stale (PG pushes the nullable-side ON qual down as a scan filter).
+Script audit still to do: scripts/tpcds-sf025-regression.sh:310 and
+scripts/tpch-estimate-audit-arm.sh:108 default the knob to 0; the sweep's
+:842 control pass must become `=0` — list them for the flip commit, do NOT
+change defaults now.
 
-Findings:
-- ROOT CAUSE of the filed trailing-NULL wrong-results bug: the byte-key btree
-  stores NO entry with a NULL key column (collectBTreeEntries). Jointree
-  restriction producers now decline indexes with unbound nullable key
-  columns; rule-based / bitmap / parameterised / ordered producers still
-  exposed (bug entry updated with the root cause; real fix = NULL encoding).
-- isunique for never-analysed tables needs estimated tuples (ledgered).
+Next step: start with the alias-collision EXPLAIN bug (a real defect): trace
+how the semi-join's inner-side ColumnRefs get their alias on the jointree
+arm vs legacy; then the grouping strategy and nested-subquery tests, each
+checked against a private PG 18.3.
 
-Next step: per banner — group I is down to owner-gated and flip-commit items,
-so consider M0145-0029 done-pending-owner and move to M0145-0030 (group B:
-adjudicate 11 behavioural flip-triage tests, plus the knob-default script
-audit). Re-read the banner first.
-
-Gates run: units, tpch-spotcheck (Q12=2 Q13=33), tpcds-sf025 (PASS=96,
-same=99), acceptance arm (identical), tpcds-fireset (knob plans identical),
-TestPort_RegressSuite, TestPort_Isolation (only the known intermittent
-EvalPlanQual) — PASS.
+Gates run: none this loop (docs-only closure commit; the pre-commit pgbench
+smoke runs on commit). The previous loop's gate set on 98f68622d all PASS.
 In-flight: none.
