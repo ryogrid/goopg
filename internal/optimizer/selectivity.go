@@ -604,7 +604,7 @@ func numericValue(s, typeName string) (float64, bool) {
 			"2006-01-02 15:04:05.999999",
 			"2006-01-02 15:04:05",
 		} {
-			if t, err := time.Parse(layout, strings.TrimSpace(s)); err == nil {
+			if t, err := time.Parse(layout, padISODateLiteral(s)); err == nil {
 				// Julian-style day number; only differences matter here.
 				return float64(t.Unix()) / 86400.0, true
 			}
@@ -617,13 +617,49 @@ func numericValue(s, typeName string) (float64, bool) {
 			"2006-01-02 15:04:05",
 			"2006-01-02",
 		} {
-			if t, err := time.Parse(layout, strings.TrimSpace(s)); err == nil {
+			if t, err := time.Parse(layout, padISODateLiteral(s)); err == nil {
 				return float64(t.UnixNano()) / 1e9, true
 			}
 		}
 		return 0, false
 	}
 	return 0, false
+}
+
+// padISODateLiteral zero-pads the month and day of an ISO `YYYY-M-D` date
+// (optionally followed by a space and a time), so the fixed Go layouts above
+// accept the spellings PG's date_in does: TPC-DS Q94 writes `'2002-5-01'`
+// (M0141-S2b-17). Without it that literal failed to parse, the histogram
+// lookup fell to a flat bucket fraction, and the `date + interval` fold
+// (parseTemporalLiteral) declined, leaving the other bound unestimated too.
+//
+// Only the 4-digit-year dash form is normalized, the subset the executor's
+// own parser (nodes.parseDateFields) takes the same way. Any other spelling
+// is returned trimmed and unchanged, so it parses or fails exactly as before.
+func padISODateLiteral(s string) string {
+	s = strings.TrimSpace(s)
+	datePart, rest := s, ""
+	if i := strings.IndexByte(s, ' '); i >= 0 {
+		datePart, rest = s[:i], s[i:]
+	}
+	f := strings.Split(datePart, "-")
+	if len(f) != 3 || len(f[0]) != 4 || len(f[1]) < 1 || len(f[1]) > 2 || len(f[2]) < 1 || len(f[2]) > 2 {
+		return s
+	}
+	for _, part := range f {
+		for _, c := range part {
+			if c < '0' || c > '9' {
+				return s
+			}
+		}
+	}
+	if len(f[1]) == 1 {
+		f[1] = "0" + f[1]
+	}
+	if len(f[2]) == 1 {
+		f[2] = "0" + f[2]
+	}
+	return f[0] + "-" + f[1] + "-" + f[2] + rest
 }
 
 // isStringScalarType reports whether typeName is one of the

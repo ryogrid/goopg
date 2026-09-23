@@ -351,7 +351,7 @@ func tryFoldTemporalBinaryOp(pos int, op parser.OpCode, l, r Expr) Expr {
 // parseTemporalLiteral reads the spellings a `date`/`timestamp` literal can
 // carry, in the same order `numericValue` accepts them.
 func parseTemporalLiteral(s string) (time.Time, bool) {
-	s = strings.TrimSpace(s)
+	s = padISODateLiteral(s)
 	for _, layout := range []string{
 		"2006-01-02 15:04:05.999999",
 		"2006-01-02 15:04:05",
