@@ -2153,7 +2153,7 @@ heuristic stays live.)
 
 ### Manually discovered (not yet in a nightly `ci/logs/action-items.md` run) — filed 2026-09-15
 
-- [ ] **`CREATE FUNCTION` completes with command tag `OK`, not `CREATE
+- [x] **`CREATE FUNCTION` completes with command tag `OK`, not `CREATE
   FUNCTION`** \(found 2026\-09\-23 while diffing a GRANT script against a
   private PG 18.3: psql printed `OK` where PG prints `CREATE FUNCTION`\).
   Kind: bug
@@ -2166,6 +2166,41 @@ heuristic stays live.)
   - Step 1: reproduce over simple and extended protocol; list every DDL
     kind that falls back to `OK` \(the TS\-config ALTER case was fixed the
     same way in M0119\-0004\), fix them as one class.
+  Movement: none
+  - **FIXED 2026\-09\-23 \(ralph2 loop \#9\), `6de0daf09`.** Design doc
+    `docs/design/0100-0149/command-tag-ok-fallback-class.md`.
+    - A live sweep against a private PG 18.3 found **29** kinds falling to
+      `OK` \(functions/procedures/routines, triggers, event triggers,
+      sequences, rules, policies, matviews, publications, subscriptions,
+      access method, ALTER OPERATOR, DO, REINDEX, CLUSTER\). One table,
+      `stmtCommandTag`, is now the fallback of both `ddlTag` and
+      `utilityTag`.
+    - Same class: a populating CTAS / SELECT INTO / CREATE MATERIALIZED
+      VIEW now completes with `SELECT <n>` \(createas.c:349,
+      matview.c:389\) via `executor.DDLProcessedReporter`, forwarded by
+      `OpIterator`; CTAS WITH NO DATA → `CREATE TABLE AS`.
+    - Gates: units, tpch\-spotcheck, SF0.25 sweep, acceptance arm,
+      `TestPort_RegressSuite` — all PASS.
+- [ ] **six divergences found by the 2026\-09\-23 command\-tag sweep**
+  \(each measured live against a private PG 18.3\).
+  Kind: bug
+  Parent: none
+  - `ALTER RULE r ON t RENAME TO r2` completes but does not rename: a
+    following `DROP RULE r2 ON t` fails `rule "r2" for relation "t" does
+    not exist`.
+  - `LOCK TABLE t` outside a transaction block is accepted; PG raises
+    25P01 `LOCK TABLE can only be used in transaction blocks`
+    \(`./postgres/src/backend/tcop/utility.c` RequireTransactionBlock\).
+  - `REINDEX TABLE t` on a table with no indexes lacks PG's NOTICE `table
+    "t" has no indexes to reindex`.
+  - A session's own `LISTEN ch; NOTIFY ch` reports `received from server
+    process with PID 1` — the notifying backend's PID is wrong.
+  - `DISCARD ALL` is a syntax error \(PG: `DISCARD ALL`\).
+  - `CREATE PUBLICATION` lacks PG's WARNING `"wal_level" is insufficient
+    to publish logical changes` when wal\_level is not `logical` \(check
+    goopg's effective wal\_level first — the warning may be correctly
+    absent\).
+  - Take one per loop; each is small and independently testable.
 
 - [x] **setop output type is the FIRST member's, not `select_common_type`'s
   (found 2026-09-21 by an M0145-0004 discovery probe)** — **FIXED
