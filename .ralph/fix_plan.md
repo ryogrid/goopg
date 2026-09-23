@@ -2069,7 +2069,7 @@ heuristic stays live.)
     tpch\-spotcheck, SF0.25 sweep \(plans same=99\), two interop cases.
   - Final confirmation is the next full nightly \(the `20260923` run
     ABORTED at the TPC\-H stage, rc=4, after testport\).
-- [ ] **testport isolation schedule diffs in the aborted nightly
+- [x] **testport isolation schedule diffs in the aborted nightly
   `20260923-001346`** — `TestPort_IsolationEvalPlanQual` \(L1092: `c2:
   COMMIT` printed before `read_a`, 1470 vs 1468 lines\),
   `TestPort_IsolationInsertConflictDoUpdate4` \(L34 missing `c2: COMMIT`,
@@ -2084,6 +2084,29 @@ heuristic stays live.)
   owner infra, escalate rather than touch `:65433`.
   Kind: test-fix
   Parent: none
+  Movement: none
+  - **DONE 2026\-09\-23 \(ralph2 loop \#7\), fix `ffe1d020f`.** Re\-run at
+    HEAD: `EvalPlanQual` PASS \(timing flake\); the other two FAIL — real
+    regressions \(both passed nightlies 09\-20/21/22\).
+  - `insert-conflict-do-update-4`: `SELECT … FOR UPDATE` over a
+    partitioned table → `short read at block`. `git bisect` over the 29
+    commits between the nightly SHAs → `d6e42a7f7` \(M0122\-0012 batch
+    filter\): its 64\-row read\-ahead moved the scan leaf's `currentTID`
+    past the row being emitted, so LockRows locked a row in the OTHER
+    partition. Fix: `disableFilterReadAhead` pins every filterOp under a
+    currentTID consumer \(LockRows, NL\-stream ctid capture, hash\-join
+    preserved ctids\) to the per\-row path. Pin
+    `TestForUpdateOnPartitionedTableThroughBatchFilter` fails with the
+    exact error without the fix.
+  - `intra-grant-inplace-db`: the spec's ACL change on database
+    `isolation_regression` now raises 3D000 \(`6ea8424b8`, PG\-faithful\);
+    the test ran in `postgres`. PG's harness runs every spec in
+    `isolation_regression` \(`isolation_main.c:133`\); the test now
+    creates and uses it.
+  - Gates: units, tpch\-spotcheck, acceptance arm, SF0.25 sweep \(plans
+    same=99\), the whole `TestPort_Isolation*` family \(411 s\) — all PASS.
+  - The nightly abort \(S2 tpch lane waiting on the canonical TPC\-H
+    cluster, rc=4\) is owner infra; recorded, not touched.
   - **Reproduction attempted faithfully and FAILED to reproduce.** The named
     repro passes at HEAD (2.7s). All ten cases pass run together (62s). And
     the full `./internal/testport/` package — which is what the nightly

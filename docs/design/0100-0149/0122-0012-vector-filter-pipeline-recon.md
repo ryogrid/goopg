@@ -1,6 +1,6 @@
 # M0122-0012: vector filter pipeline scope reconciliation
 
-status: accepted
+status: accepted (corrected 2026-09-23 — read-ahead disabled under currentTID consumers, `ffe1d020f`)
 date: 2026-09-22
 supersedes: none
 
@@ -144,3 +144,36 @@ its output buffer, plus an admission boundary pinned by
 `TestM0122BatchFilterRequiresRowOperand`. The performance case has to be made
 by the scan\-resident slice, where the 292 declined opens and the absorbed scan
 quals actually live.
+
+## Correction 2026-09-23 — read-ahead breaks the currentTID side channel
+
+The batch path was admitted on operand shape alone, but it has a second
+precondition the admission rule did not state: **nothing above it may read the
+scan leaf's current position**. It pulls up to `filterBatchSize` (64) child rows
+before emitting the first, while four consumers read
+`currentTIDProvider.currentTID()` immediately after pulling each row and assume
+nothing was pulled since — `lockRowsOp` (row locking), the streaming NL join's
+ctid capture, the hash join's preserved build-side ctids, and `setOp`'s
+delegation to its active branch.
+
+Witness (bisected to `d6e42a7f7`): isolation spec
+`insert-conflict-do-update-4`, `SELECT * FROM upsert WHERE i = 1 FOR UPDATE`
+over a two-partition table — LockRows read the position of a LATER row in the
+other partition and failed with `short read at block`. The pass-required spec
+had passed every nightly before this slice landed.
+
+Fix (`ffe1d020f`): `disableFilterReadAhead` (operators_lockrows.go) mirrors
+`findScanLeaf`'s descent — single-child spine, both `setOp` branches, both join
+sides, the NLI outer — and pins every `filterOp` it reaches to the per-row path
+(`noReadAhead`, sticky across re-Open; `batchEnabled` cleared directly because
+consumers call it after the child's Open). Each consumer calls it before its
+first `Next`. The batch path stays available everywhere else, so this slice's
+measurements (reachability 1.4 %, timing inside noise) are unchanged in kind.
+Pinned by `TestForUpdateOnPartitionedTableThroughBatchFilter` (fails with the
+exact error without the fix) and `TestDisableFilterReadAheadCoversEveryWalkerBranch`.
+
+**Rule for the scan-resident successor:** any operator that buffers ahead of
+its consumer must either carry row identity in the slot all the way to the
+consumer (the resjunk-ctid route) or be switched off under a `currentTID`
+consumer by the same walker. Reading ahead is a semantic change, not only a
+performance one.

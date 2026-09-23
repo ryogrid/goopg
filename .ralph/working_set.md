@@ -1,8 +1,8 @@
 (idle — nothing in flight)
 
-Last loop (ralph2 #6): banner items 3/6/7 blocked ([!]: M0145-0001 lineage,
-M0141-S7 lineage, M0140-0007 owner re-scope); items 4/5/8/9 done. Item 10:
-M-NIGHTLY pgoutput-interop start failures FIXED (0734cab60, control socket
-sun_path fallback). New open M-NIGHTLY task filed: isolation schedule diffs
-from the aborted 20260923 nightly (EvalPlanQual, InsertConflictDoUpdate4,
-IntraGrantInplaceDb) — next loop: re-run each at HEAD first.
+Last loop (ralph2 #7): M-NIGHTLY isolation diffs DONE (ffe1d020f):
+batch-filter read-ahead broke LockRows' currentTID on partitioned FOR UPDATE
+(bisected d6e42a7f7); intra-grant-inplace-db now runs in isolation_regression.
+Banner: items 3/6/7 [!] (owner decisions pending: M0145-0001, M0141-S7,
+M0140-0007); next per item 10 = remaining M-NIGHTLY, then M0119 → M0122 →
+M0131 → M0134 → M0135/M0136 → M0095/M0110.
