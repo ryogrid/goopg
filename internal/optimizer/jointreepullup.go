@@ -124,6 +124,14 @@ type jtPulledBody struct {
 	// NOT arm :836-845). Each child's conjunct has been REMOVED from
 	// `quals`: its semantics now live in the child's own semi/anti link.
 	children []*jtPulledBody
+	// srcOffset is added to every SourceTableIdx the body's leaves and
+	// rebased refs carry (M0145-0030). The body's scope numbers its tables
+	// from 1 like the outer query does, so without it a self-correlated
+	// EXISTS put two SourceTableIdx=1 tables in one plan and EXPLAIN
+	// (explain_names.go, first-wins per SourceTableIdx) printed
+	// `t1.a = t1.a`. The legacy unnest applies the same shift through
+	// remapSourceTableIdx.
+	srcOffset int16
 	// parent is the body this one was pulled out of, nil for a top-level
 	// body. It gives a nested body's Level-1 outer references a coordinate
 	// path: they point at the PARENT BODY's columns, not at the emitting
@@ -230,6 +238,9 @@ func pullUpSublinksIntoJointree(pred Expr, ctx *resolveContext, cat catalog.Cata
 	// walks. Depth-first, parent immediately before its children, because
 	// every downstream consumer assumes body order IS leaf order.
 	pu.bodies = flattenPulledBodies(pu.bodies, nil)
+	if !assignPulledSourceOffsets(pu.bodies, ctx) {
+		return nil
+	}
 	pu.base = ctx.joinlist.nrels()
 	pos := pu.base
 	for _, pb := range pu.bodies {
@@ -240,6 +251,57 @@ func pullUpSublinksIntoJointree(pred Expr, ctx *resolveContext, cat catalog.Cata
 	}
 	pu.nLeaves = pos - pu.base
 	return pu
+}
+
+// assignPulledSourceOffsets gives every pulled body a SourceTableIdx range of
+// its own, past everything the emitting scope and the earlier bodies use, and
+// shifts the body's leaf scans (schemas and embedded refs, via
+// remapSourceTableIdx — the legacy unnest's own tool for this) and binding
+// records into it. rebasePulledQual adds the same offset to the refs it
+// rebases, so a body's scans and the quals naming them keep agreeing. Returns
+// false when a leaf cannot be remapped, which declines the pull-up.
+func assignPulledSourceOffsets(bodies []*jtPulledBody, ctx *resolveContext) bool {
+	next := int16(0)
+	for _, c := range ctx.schema {
+		if c.SourceTableIdx > next {
+			next = c.SourceTableIdx
+		}
+	}
+	for _, b := range ctx.bindings {
+		if b.sourceIdx > next {
+			next = b.sourceIdx
+		}
+	}
+	for _, pb := range bodies {
+		bodyMax := int16(0)
+		for _, b := range pb.bodyBindings {
+			if b.sourceIdx > bodyMax {
+				bodyMax = b.sourceIdx
+			}
+		}
+		for _, leaf := range pb.leafScans {
+			for _, c := range leaf.Output() {
+				if c.SourceTableIdx > bodyMax {
+					bodyMax = c.SourceTableIdx
+				}
+			}
+		}
+		pb.srcOffset = next
+		for i, leaf := range pb.leafScans {
+			shifted, err := remapSourceTableIdx(leaf, next)
+			if err != nil || shifted == nil {
+				return false
+			}
+			pb.leafScans[i] = shifted
+		}
+		for i := range pb.bodyBindings {
+			if pb.bodyBindings[i].sourceIdx != 0 {
+				pb.bodyBindings[i].sourceIdx += next
+			}
+		}
+		next += bodyMax
+	}
+	return true
 }
 
 // flattenPulledBodies linearises the pull-up tree depth-first, stamping each
@@ -874,6 +936,9 @@ func rebasePulledQual(q Expr, pb *jtPulledBody, pullSpans []leafSpan, emittingTo
 					return x
 				}
 				r.Index = pullSpans[leaf].lo + local
+				if r.SourceTableIdx != 0 {
+					r.SourceTableIdx += pb.srcOffset
+				}
 				return x
 			case *OuterColumnRef:
 				// M0145-0014: walk `r.Level` steps up the pulled-body chain.
@@ -893,9 +958,13 @@ func rebasePulledQual(q Expr, pb *jtPulledBody, pullSpans []leafSpan, emittingTo
 						failed = true
 						return x
 					}
+					src := r.SourceTableIdx
+					if src != 0 {
+						src += anc.srcOffset
+					}
 					return &ColumnRef{
 						pos: r.pos, Index: allSpans[base+leaf].lo + local,
-						Name: r.Name, Type: r.Type, SourceTableIdx: r.SourceTableIdx,
+						Name: r.Name, Type: r.Type, SourceTableIdx: src,
 					}
 				}
 				if r.Level > 1 {
