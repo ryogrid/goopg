@@ -54,7 +54,7 @@ tests build them):
 |---|---|---|
 | 1 | plain restriction IndexScan path, **equality prefix** on constants; lowering drops the consumed conjuncts from the reinstated leaf Filter | **landed** `fe3d1b0aa` |
 | 2a | range bounds (`<`, `<=`, `>`, `>=`, BETWEEN) on the index's leading column — plain producer | **landed** `fc716f1f8` |
-| 2b | range on the bitmap producer; equality prefix followed by a range column (needs a new executor probe shape) | open |
+| 2b | equality prefix followed by a range on the next column (new probe shape `IndexScan.RangePrefix`); bitmap range and SAOP-prefix + range still open | **landed** `ea8fb4fce` (eq-prefix + range) |
 | 3 | index-only scan with index quals (`create_index_path(indexonly=true)` with `index_clauses`), one path per index | **landed** `6d50210f4` |
 | 4 | ScalarArrayOp (`col IN (…)` / `= ANY`) quals on the leading column — plain producer (bitmap SAOP: ledgered) | **landed** `729027e28` |
 | 5 | re-run group I under a local flip, per-test PG oracle, disposition table below; root-cause fix: index-only `allvisfrac` read the VM under the wrong database | **re-run done** `9e368ade8`; test edits ride the flip commit |
@@ -271,4 +271,56 @@ the Seq Scan.
 Non-btree builders, REINDEX and the index relation's own `pg_class` size are
 not covered yet (ledgered). No benchmark plan moved on either arm; those
 tables are analysed.
+
+## Slice 2b design: `IndexScan.RangePrefix` (`ea8fb4fce`)
+
+PG's `build_index_paths` binds a range on the column after an equality
+prefix: `a = 7 AND b > 90` on `(a, b)` becomes
+`Index Cond: ((a = 7) AND (b > 90))`. goopg's probe had no such shape, since
+`Keys` meant equality only and `LowKey`/`HighKey` bounded the leading column.
+
+- **Probe shape.** `IndexScan.RangePrefix` holds equality keys for index
+  columns `[0, n)` and moves `LowKey`/`HighKey` onto column `n`. It is set only
+  together with a bound, never with `Key`/`Keys`/`SAOPKeys`.
+- **Executor.** `lookupRangeBounds` builds each bound as the prefix's parts
+  plus the bound's part. An open side uses the bare prefix (low) or its padded
+  upper bound (high), exactly as a `Keys` prefix probe does. With no prefix
+  the output is byte-for-byte unchanged.
+- **Producer.** After an equality prefix that stops short of the last column,
+  `restrictionRangeOnColumn` binds the next column's first lower and upper
+  bound. The prefix equalities are dropped from the Filter; the bounds stay as
+  a recheck, because an open bound runs to the prefix's padded upper bound,
+  past NULLs in the bounded column. Selectivity is the equality prefix times
+  the range band.
+- **Consumers.** A site-by-site audit of every reader of the probe fields
+  decided each one:
+  - taught: EXPLAIN; the UPDATE/DELETE `indexScanPredicate`, which now
+    rebuilds the prefix equalities because the Filter no longer holds them;
+    `clonePlanReplacingOuter` and its SeqScan demotion (which also now keeps
+    `>`/`<` strictness, a pre-existing loss); `walkPlanExprs`, `NodeSubplans`,
+    `lowerTraverseNode`, `graftNodeUncached`, `relConsiderParallel`,
+    `rebaseNLIProbeKeys`, `indexScanRows`, `indexProbeHasOuterRef`;
+  - refusing: `tryPromoteIndexOnlyScan` and `indexOnlyNLIInner`, because
+    `IndexOnlyScan` has no `RangePrefix`. Copying only the bounds re-aimed them
+    at the leading column; a live subquery-wrapped count returned 9,476 rows
+    for PG's 2 before the guard. `indexOnlyNLIInner` now also refuses
+    `SAOPKeys`, which it dropped the same way.
+- **Found by the same probe:** `matchBitmapIndexQuals` did not stop at the
+  first unbound column. On the jointree arm, `WHERE c = 99` on `(a, b, c)` built
+  a gapped clause list and the backend panicked. It now binds a gapless
+  prefix; PG 18 would use a btree skip scan there (ledgered).
+
+Checked on a live flip server against PG 18.3, on 20,000 rows with NULLs in
+the bounded columns: every SELECT/count/sum, a subquery-wrapped count, and
+UPDATE and DELETE through prefix+range predicates are identical to PG.
+`TestRestrictionPrefixRangeIndexScanOnJointreePipeline` and
+`TestMatchBitmapIndexQualsIsGapless` pin the plan shape and the gapless
+prefix. No corpus plan moved on either arm.
+
+Still open:
+- an `IN` list followed by a range (`TestSAOPWithConjunctMoves`, since
+  `SAOPKeys` is an exclusive probe shape);
+- range and SAOP quals on the bitmap producer;
+- keeping the bound out of the Filter (PG has no recheck);
+- index-only scans with a `RangePrefix`.
 

@@ -1,30 +1,30 @@
 Task: M0145-0029 — one-relation index-path coverage (flip-triage group I).
-Slices 1, 2a, 3, 4 LANDED; slice 5 re-run done (9e368ade8); index_update_stats
-heap half ported (292b1af2e). Open: slice 2b; owner call on the multiplier.
+Landed: slices 1, 2a, 2b (ea8fb4fce), 3, 4; slice 5 re-run; index_update_stats.
+Open: SAOP-prefix + range (TestSAOPWithConjunctMoves); owner multiplier call.
 
-Files (this loop): internal/executor/operators_ddl.go (ddlOp.buildHeapTuples,
-indexUpdateHeapStats, autoVacuumingActive), index_update_stats_test.go
-(TestCreateIndexUpdatesHeapStats, withAutovacuumOff helper), and six tiny-table
-executor tests now call withAutovacuumOff. Design doc
-docs/design/0100-0149/m0145-0029-one-rel-index-path-coverage.md (§Follow-up).
+Files (this loop): IndexScan.RangePrefix (plan.go); executor
+operators_index.go lookupRangeBounds; producer pathindexrestrict.go
+restrictionRangeOnColumn; lowering createplanindex.go createRangeIndexScanPlan;
+consumers: operators_explain.go formatIndexCond, operators_storage.go
+indexScanPredicate, unnest.go (walkPlanExprs, clonePlanReplacingOuter),
+walk_export.go, subplan_lower_walk.go, subquery_parallel.go,
+considerparallel.go, cardinality.go, planner.go (rebaseNLIProbeKeys,
+tryPromoteIndexOnlyScan refuses), nl_index_join.go (indexOnlyNLIInner refuses);
+pathbitmap.go matchBitmapIndexQuals gapless.
 
-Findings: PG 18.3 matches exactly (loaded 3/1, empty PK -1, autovacuum_enabled
-false -1). w witness now Seq Scan at PG's 1.05. The six tests pinned to
-autovacuum=off must be re-checked at the flip against PG's Bitmap Heap Scan
-(size unmeasured), not Seq Scan.
+Findings: live flip server vs PG 18.3 — SELECT/count/subquery/UPDATE/DELETE
+through prefix+range all identical. Before the IOS-promotion guard a
+subquery-wrapped count returned 9476 rows for PG's 2. Separate latent
+jointree-arm panic (gapped bitmap clause list) fixed. Session enable_* GUCs
+looked ignored by the one-rel search on the live flip server (disabled=0 on
+every path after SET enable_seqscan/bitmapscan = off) — NOT yet investigated;
+verify and file before the flip.
+Also open: filed wrong-results bug (composite prefix probes skip
+trailing-NULL rows) in fix_plan beside the command-tag sweep bugs.
 
-Group I status for the flip:
-- fixed 6 subtests (IOS allvisfrac), w witness now PG-faithful;
-- multiplier-dependent (OWNER): TestIOS_HeapFallback,
-  TestIndexOnlyDeformColdAndVisible;
-- capability gap: TestSAOPWithConjunctMoves → slice 2b (SAOP + trailing range
-  on the next index column; needs an executor probe shape).
-Also open: filed wrong-results bug (composite prefix probes skip trailing-NULL
-rows) in fix_plan beside the command-tag sweep bugs.
-
-Next step: per banner, M0145-0029 slice 2b — executor probe shape of
-equality/SAOP prefix + trailing range bound, then extend the restriction
-producer; or, if the owner has answered the multiplier question, apply it.
+Next step: verify the enable_* observation (flip binary, SET enable_seqscan
+= off, trace DPPATH disabled counts; compare legacy arm) and file it; then
+SAOP-prefix + range, or the owner's multiplier answer.
 
 Gates run: units, tpch-spotcheck (Q12=2 Q13=33), tpcds-sf025 (PASS=96,
 same=99), acceptance arm (identical), tpcds-fireset (25 fires, knob plans

@@ -18354,6 +18354,21 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
       their flip\-arm check becomes PG's Bitmap Heap Scan, not the Seq Scan.
     - Remaining: 2b; the owner's multiplier call; non\-btree/REINDEX size
       recording \(ledgered\).
+  - **Slice 2b LANDED 2026\-09\-23 \(ralph2 loop \#18\), `ea8fb4fce`.** Equality
+    prefix \+ range on the next column, as the new probe shape
+    `IndexScan.RangePrefix`.
+    - Executor bounds \= prefix parts \+ bound part; producer keeps the bound
+      as a Filter recheck and drops the prefix equalities.
+    - Consumer audit \(site by site\): EXPLAIN, UPDATE/DELETE
+      `indexScanPredicate`, clone/demotion, expression walkers, parallel
+      safety and cardinality taught; IOS promotions REFUSE \(copying bounds
+      without the prefix returned 9476 rows for PG's 2 before the guard\).
+    - Found and fixed: `matchBitmapIndexQuals` built a gapped clause list →
+      backend panic on the jointree arm \(`WHERE c = 99` on `\(a, b, c\)`\).
+    - Live flip server vs PG 18.3: SELECT, subquery count, UPDATE and DELETE
+      through prefix\+range predicates all identical.
+    - Remaining for group I: SAOP\-prefix \+ range
+      \(`TestSAOPWithConjunctMoves`\); the owner's multiplier call.
 - [ ] **M0145-0030 — group B: adjudicate the 11 behavioural flip-triage
   tests before the flip** (same filing). The flip-triage doc lists 11
   behavioural failures: grouping strategy, nested scalar subquery, NLI
