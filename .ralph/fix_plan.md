@@ -6628,12 +6628,48 @@ spill route is net-negative.
     recon (design doc item 2). Depends on **S2b-3a** landing first. TPC-DS
     Q67 (`WindowAgg` on `dw1.i_category`) is the sole corpus witness and the
     gate.
+    - **Re\-checked 2026\-09\-24 \(ralph2 loop \#32\): witness gone.** Q67\'s
+      WindowAgg input is `Sort \(i\_category, sumsales DESC\)` in both goopg\'s
+      and PG\'s plans. Its remaining divergences are the top Incremental Sort
+      \(the parked M0141\-S7 line\) and the grouping\-sets strategy. Kept open
+      because the capability gap is real \(ledger row dated 2026\-09\-17,
+      M0141\-S2b\-3\), but it has no corpus witness to gate on until one
+      appears.
   - [ ] **M0141-S2b-4** — SETOP rel-identity fix. **UPDATE 2026-09-16 (S2b-1's
     own result section)**: DOES now have a witness — TPC-DS Q49's `Unique`
     (S7's mis-mapped "Unique x1"; `select ... union select ... union select
     ...`) is goopg's SETOP upper rel, not `SELECT DISTINCT`, so this is its
     real home. Still not scheduled ahead of 1-3 on that basis alone (single
     witness, same-sized surgery K24 already flagged as risky).
+    - **Design slice 2026\-09\-24 \(ralph2 loop \#32\):**
+      `docs/design/0100-0149/m0141-s2b-4-union-distinct-decomposition.md`.
+      - Witnesses on the current tree: Q49 and Q75, the only two queries
+        with a distinct UNION. goopg plans both as nested binary
+        `HashSetOp Union`s. PG plans Q49 as `Unique → Sort → Append\(3\)` and
+        Q75 as `Unique → Merge Append` over presorted children.
+      - Root: no port of `plan_union_children`\'s flattening, and no sorted or
+        Merge Append distinct candidate \(`generate_union_paths`,
+        prepunion.c:676\).
+      - Sliced into S2b\-4a \(flatten\), 4b \(election\), 4c \(Merge Append\),
+        filed below. This parent closes when all three land.
+  - [ ] **M0141-S2b-4a — flatten same\-kind UNION chains**
+    \(`plan_union_children`\): fold rule \(same op; `all` equal or child ALL;
+    column types and collations equal\) into one distinct step over a
+    left\-deep UNION ALL chain, which EXPLAIN renders as one n\-ary `Append`.
+    Witness Q49. Design doc §Slices.
+    Kind: impl
+    Parent: M0141-S2b-4
+  - [ ] **M0141-S2b-4b — the distinct election over the flattened Append**:
+    hashed \(AGG\_HASHED\) vs sorted \(Sort → Unique\), `dNumGroups` = input
+    rows, plus Gather variants, elected by `addPath`. Witness Q49 \(PG
+    elects Sort → Unique\). Depends on S2b\-4a.
+    Kind: impl
+    Parent: M0141-S2b-4
+  - [ ] **M0141-S2b-4c — Merge Append → Unique when every child is sorted
+    on the union pathkeys.** Check first whether goopg has a Merge Append
+    path/executor. Witness Q75. Depends on S2b\-4b.
+    Kind: impl
+    Parent: M0141-S2b-4
   - [x] **M0141-S2b-5** — resolve `electOrderedGrouping`'s `anyTranslated`
     decline for the GROUP_AGG mechanism-B queries now that `len(cands)<2` is
     refuted. **DONE 2026-09-16 — hypothesis ALSO REFUTED, root cause found
