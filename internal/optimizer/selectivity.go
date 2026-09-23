@@ -237,7 +237,56 @@ func rowCompareSelectivityWithSource(op parser.OpCode, left, right Expr, child N
 // eqOpSelectivity handles `col = const` (or the swapped `const =
 // col`). Returns the MCV frequency on a hit, the non-MCV fallback,
 // or — when stats are missing — the upstream `1/200` constant.
+// uniqueColumnTuples is `vardata->isunique` for a base column: the column is
+// the sole key of a non-partial unique index on its relation
+// (has_unique_index, plancat.c:2244), read from the scan's stamped
+// UniqueKeys. It returns the relation's raw tuple count, the divisor eqsel
+// and var_eq_non_const use (`selec = 1.0 / vardata->rel->tuples`,
+// selfuncs.c:338, 500); ok is false when the column is not such a key or the
+// count is unknown (< 1).
+func uniqueColumnTuples(idx int, child Node) (float64, bool) {
+	ref, ok := resolveBaseColumn(idx, child)
+	if !ok || ref.rawRows < 1 {
+		return 0, false
+	}
+	for _, k := range ref.uniqueKeys {
+		if len(k) == 1 && k[0] == ref.col {
+			return ref.rawRows, true
+		}
+	}
+	return 0, false
+}
+
+// uniqueEqSelectivity applies eqsel's isunique branch — checked BEFORE any
+// statistics, "assume there is exactly one match regardless of anything else"
+// — to whichever operand of an equality is a unique base column.
+//
+// Restricted to `col = <non-column>`: a column-to-column equality is a join
+// clause in PG, priced by eqjoinsel rather than eqsel, and this function must
+// not reach it through clauseSelectivity.
+func uniqueEqSelectivity(left, right Expr, child Node) (float64, bool) {
+	_, lCol := left.(*ColumnRef)
+	_, rCol := right.(*ColumnRef)
+	if lCol == rCol {
+		return 0, false
+	}
+	for _, e := range []Expr{left, right} {
+		if cr, ok := e.(*ColumnRef); ok {
+			if tuples, uok := uniqueColumnTuples(cr.Index, child); uok {
+				return 1.0 / tuples, true
+			}
+		}
+	}
+	return 0, false
+}
+
 func eqOpSelectivity(left, right Expr, child Node) float64 {
+	// M0145-0029 follow-up: without this branch a never-ANALYZEd primary key
+	// fell to 1/200 (5000 rows of 1M), and once CREATE INDEX published the
+	// heap size the planner seq-scanned a point lookup PG index-scans.
+	if sel, ok := uniqueEqSelectivity(left, right, child); ok {
+		return sel
+	}
 	col, val, ok := normalizeColumnConst(left, right)
 	if !ok {
 		// `col = <non-const>`: column-column and column-expression
@@ -954,6 +1003,11 @@ func clauseSelectivityWithSource(expr Expr, child Node) selectivityEstimate {
 // `eqOpSelectivity`. Reliable iff a `column = const` shape is
 // matched AND the column has stats.
 func eqOpSelectivityWithSource(left, right Expr, child Node) selectivityEstimate {
+	// The isunique branch, as in eqOpSelectivity (sibling twins must agree);
+	// catalog-proven, so reliable.
+	if sel, ok := uniqueEqSelectivity(left, right, child); ok {
+		return selectivityEstimate{value: sel, reliable: true}
+	}
 	col, val, ok := normalizeColumnConst(left, right)
 	if !ok {
 		// Same delegation as eqOpSelectivity above; reliable iff the

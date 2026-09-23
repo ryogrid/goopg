@@ -1935,6 +1935,16 @@ func plannerSettingsFrom(get func(string) (string, bool)) optimizer.PlannerSetti
 	readBool("parallel_leader_participation", &ps.ParallelLeaderParticipation)
 	readBool("enable_gathermerge", &ps.EnableGatherMerge)
 
+	// M0145-0029 follow-up: the scan and sort toggles B-17a/B-17d count as
+	// Path.DisabledNodes (costsize.c:295, 560, 1023; enable_sort in
+	// cost_sort) were never read from the session, so `SET enable_seqscan =
+	// off` reached only the rule-based scan choice (catalog DisableSeqScan)
+	// and the cost-based search priced every path as enabled — measured on
+	// both pipelines with GOOPG_PGSHAPED_DP_TRACE: disabled=0 on every path.
+	readBool("enable_seqscan", &ps.EnableSeqScan)
+	readBool("enable_indexscan", &ps.EnableIndexScan)
+	readBool("enable_bitmapscan", &ps.EnableBitmapScan)
+	readBool("enable_sort", &ps.EnableSort)
 	readBool("enable_hashjoin", &ps.EnableHashJoin)
 	readBool("enable_mergejoin", &ps.EnableMergeJoin)
 	readBool("enable_nestloop", &ps.EnableNestLoop)

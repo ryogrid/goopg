@@ -11334,7 +11334,18 @@ func seqWinsEqualityProbe(tbl *catalog.Table, idx *catalog.Index, queryClause Ex
 	// (costindex.go:512 precedent). 1.0 here would be the
 	// ordering-only collapse the inputs struct warns about and
 	// would flip every legacy probe corpus-wide.
-	sel := clauseSelectivity(queryClause, &SeqScan{Table: tbl})
+	//
+	// The synthetic scan carries the probe index's own uniqueness, so
+	// eqsel's isunique branch applies (1/reltuples) exactly as it does on a
+	// real scan whose UniqueKeys the planner stamped. Without it a unique
+	// point probe was priced at 1/200 of the table and lost to the seq scan
+	// once CREATE INDEX published the heap size (M0145-0029 follow-up; the
+	// multiple-row-versions isolation spec).
+	probeScan := &SeqScan{Table: tbl}
+	if idx != nil && idx.Unique && !idx.HasPredicate && len(idx.Columns) > 0 {
+		probeScan.UniqueKeys = [][]string{append([]string(nil), idx.Columns...)}
+	}
+	sel := clauseSelectivity(queryClause, probeScan)
 	if !(sel > 0) {
 		return false
 	}

@@ -447,6 +447,12 @@ func buildInitialRels(bindings []rangeBinding, scans []Node, relInfos []baseRelI
 			// row count. See baseSeqScanCostInputs.
 			scanPages, scanTuples, scanQualOps := baseSeqScanCostInputs(ri, leaf, rows, width)
 			p.Cost = costSeqscan(cp, scanPages, scanTuples, scanQualOps)
+			// The sibling of generateScanPaths' B-17d count: the prebuilt leaf
+			// IS the relation's scan, so `enable_seqscan` / `enable_indexscan`
+			// / `enable_bitmapscan` count onto it by the scan it carries
+			// (costsize.c:295, 560, 1023). It was never counted, so a disabled
+			// method still won on cost (M0145-0029 follow-up).
+			p.DisabledNodes = prebuiltLeafDisabledNodes(cp, leaf)
 		}
 		addPath(rel, p, "joinsearch.prebuilt")
 		setCheapest(rel)
@@ -702,4 +708,28 @@ func (s *searchCtx) stampOutputColsOnRels() {
 			r.OutputCols, r.OutputColsKnown = s.outputCols, s.outputColsKnown
 		}
 	}
+}
+
+// prebuiltLeafDisabledNodes is the scan-method toggle count for a prebuilt
+// base leaf: the scan under its Filter wrappers decides which enable_* flag
+// applies. Anything else (a sub-plan, a function scan, …) carries no scan
+// toggle, as in PG.
+func prebuiltLeafDisabledNodes(cp costParams, leaf Node) int {
+	n := leaf
+	for {
+		f, ok := n.(*Filter)
+		if !ok {
+			break
+		}
+		n = f.Child
+	}
+	switch n.(type) {
+	case *SeqScan:
+		return disabledNodesFor(!cp.enableSeqScan)
+	case *IndexScan, *IndexOnlyScan:
+		return disabledNodesFor(!cp.enableIndexScan)
+	case *BitmapHeapScan:
+		return disabledNodesFor(!cp.enableBitmapScan)
+	}
+	return 0
 }
