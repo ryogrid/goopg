@@ -18343,6 +18343,17 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
       next column, which breaks `TestSAOPWithConjunctMoves` \(slice 2b\).
     - Remaining: 2b; the `index_update_stats` port; the owner's multiplier
       call. Then group I is empty for the flip.
+  - **`index_update_stats` ported 2026\-09\-23 \(ralph2 loop \#17\), `292b1af2e`.**
+    - btree builds publish the heap's `reltuples`/`relpages` with PG's
+      guards \(empty never\-measured heap stays \-1; nothing written unless
+      autovacuum \+ track\_counts are on and `autovacuum_enabled` is not
+      false\); matches PG 18.3 on the same script.
+    - The `w` witness now plans PG's Seq Scan \(1.05\).
+    - Six tiny\-table executor tests now run with `autovacuum = off`
+      \(`withAutovacuumOff`\), under which PG also keeps the size unmeasured;
+      their flip\-arm check becomes PG's Bitmap Heap Scan, not the Seq Scan.
+    - Remaining: 2b; the owner's multiplier call; non\-btree/REINDEX size
+      recording \(ledgered\).
 - [ ] **M0145-0030 — group B: adjudicate the 11 behavioural flip-triage
   tests before the flip** (same filing). The flip-triage doc lists 11
   behavioural failures: grouping strategy, nested scalar subquery, NLI

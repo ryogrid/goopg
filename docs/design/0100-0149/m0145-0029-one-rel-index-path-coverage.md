@@ -230,3 +230,45 @@ pre-existing and shared by the index, index-only and bitmap formatters
 - `index_update_stats` and the SAOP-plus-trailing-range probe are real gaps,
   each with a ledger row.
 
+## Follow-up: CREATE INDEX records the heap size (`292b1af2e`)
+
+The `index_update_stats` gap from the slice-5 table is closed. PG's index
+build writes the HEAP's `reltuples`/`relpages` to `pg_class`
+(`./postgres/src/backend/catalog/index.c:2809`), which ends the never-vacuumed
+10-page floor for a table indexed after loading. goopg's `CREATE INDEX` only
+rewrote `relhasindex`.
+
+- `collectBTreeEntries` counts the build scan's live heap tuples
+  (`ddlOp.buildHeapTuples`), before any predicate or decode skip, because PG's
+  `reltuples` is the heap's count, not the index's.
+  `createBTreeIndex`, the one funnel for CREATE INDEX and for PRIMARY KEY /
+  UNIQUE indexes, then calls `indexUpdateHeapStats`.
+- PG's guards are kept:
+  - an empty, never-measured heap stays unmeasured (`CREATE TABLE … PRIMARY
+    KEY` must not look vacuumed);
+  - nothing is written unless `AutoVacuumingActive` (the `autovacuum` GUC and
+    `track_counts`) holds and the table's `autovacuum_enabled` is not false.
+- The counts are published and persisted as VACUUM does (`UpdateRelStats` +
+  `persistRelSize`). `relallvisible` is read live from the VM.
+
+PG 18.3 on the same script: a 4-row table with one row deleted gives
+`reltuples` 3 and `relpages` 1; the empty PRIMARY KEY table and the
+`autovacuum_enabled = false` table stay at -1. `TestCreateIndexUpdatesHeapStats`
+pins all three. The `w` witness now plans a Seq Scan at PG's exact cost (1.05).
+
+Six executor tests (`TestIndexScanEndToEndConstantKey`,
+`TestIndexScan{Varchar,Char,Timestamp}EndToEnd`,
+`TestTPCHNumericSingleColumnIndexesAccepted`,
+`TestIndexDeformRescanPersistsBound`) build a 3-4-row table, index it after
+loading, and plan it unanalysed. With the size recorded, PG itself plans a Seq
+Scan for them. They exist to exercise the executor's index scan, so they now
+run with `autovacuum = off` (`withAutovacuumOff`), under which PG leaves the
+size unmeasured too. **Their flip-arm disposition changes accordingly:** with
+the size unmeasured, PG plans the Bitmap Heap Scan measured in the oracle
+section above, so at the flip they need re-checking against that shape, not
+the Seq Scan.
+
+Non-btree builders, REINDEX and the index relation's own `pg_class` size are
+not covered yet (ledgered). No benchmark plan moved on either arm; those
+tables are analysed.
+
