@@ -2323,7 +2323,7 @@ heuristic stays live.)
     absent\).
   - Take one per loop; each is small and independently testable.
 
-- [ ] **WRONG RESULTS: an index\-only prefix probe on a composite index
+- [x] **WRONG RESULTS: an index\-only prefix probe on a composite index
   skips entries whose trailing key column is NULL** \(found 2026\-09\-23 by
   an M0145\-0029 slice\-2 correctness probe; default pipeline affected\).
   Kind: bug
@@ -2361,6 +2361,38 @@ heuristic stays live.)
     those rows. The jointree restriction producers now decline such indexes;
     the rule\-based, bitmap, parameterised and ordered producers do not yet.
     Real fix: a NULLS\-LAST NULL encoding so the entries are stored.
+  - **FIXED \(wrong results\) 2026\-09\-24 \(ralph2 loop \#39\), `821eda191`,
+    by the interim guard.** Every remaining index producer now refuses a
+    scan that leaves a nullable key column unbound, unless the query\'s own
+    quals strictly restrict it.
+    - Covered: `findBTreeIndexForColumn` \(quals\-aware\), nested\-loop
+      probes, base and parameterised bitmaps, and the full\-scan producers
+      \(ordered index paths, index\-ordered GROUP BY, seqscan\-off ordered
+      index\-only promotion\).
+    - Found wider than filed: a GROUP BY over index order lost its NULL
+      group, and a merge LEFT JOIN lost NULL\-keyed outer rows.
+    - Tests: `TestIndexProbesKeepNullKeyedRows`,
+      `TestIndexFullScansKeepNullKeyedRows`.
+    - Gates: units, spotcheck, sf025 \(plan\-shape changed=0\), acceptance
+      arm, fire\-set — PASS; regress pass\-required subset status unchanged
+      \(two index plans lost over nullable tenk1 columns\).
+    - Design doc `docs/design/0100-0149/m-nightly-index-null-key-guard.md`.
+      The storage fix is filed below.
+    Movement: none
+- [ ] **store NULL\-keyed index entries \(the real fix behind the NULL\-key
+  guard\)** \(filed 2026\-09\-24\). PostgreSQL stores index tuples with NULL
+  key columns; goopg skips them, so the planner must refuse valid index
+  plans \(upstream `btree\_index`\'s composite SAOP probe, `limit`\'s
+  GroupAggregate over an index\-only scan\).
+  Kind: impl
+  Parent: none
+  - Scope, in the tuple format only: writers keep the entry \(uniqueness
+    still skips NULL keys\); the key\-change fingerprint distinguishes NULL;
+    open\-ended range bounds stop at the first NULL in the bounded column
+    \(`\_bt\_checkkeys`\); index\-only scans decode NULL attributes; amcheck
+    expects them. Then relax the guard for tuple\-format indexes. Indexes
+    built earlier need REINDEX.
+  - Design doc §"The real fix".
 - [x] **setop output type is the FIRST member's, not `select_common_type`'s
   (found 2026-09-21 by an M0145-0004 discovery probe)** — **FIXED
   2026-09-22** for PostgreSQL's numeric type category, which covers both
