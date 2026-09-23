@@ -3,6 +3,8 @@ package postmaster
 import (
 	"testing"
 
+	"github.com/goopg/goopg/internal/executor"
+	"github.com/goopg/goopg/internal/optimizer"
 	"github.com/goopg/goopg/internal/parser"
 )
 
@@ -21,6 +23,40 @@ func TestDDLCommandTagMatchesPostgres(t *testing.T) {
 		want string
 	}{
 		{"create operator class", `CREATE OPERATOR CLASS my_opc FOR TYPE int4 USING btree AS STORAGE int4`, "CREATE OPERATOR CLASS"},
+		// 2026-09-23: kinds that fell through ddlTag/utilityTag to "OK"
+		// (measured live against a private PG 18.3; tags per cmdtaglist.h).
+		{"create function", `CREATE FUNCTION f() RETURNS int LANGUAGE sql AS 'select 1'`, "CREATE FUNCTION"},
+		{"alter function", `ALTER FUNCTION f() STABLE`, "ALTER FUNCTION"},
+		{"alter procedure", `ALTER PROCEDURE p() RENAME TO p2`, "ALTER PROCEDURE"},
+		{"alter routine", `ALTER ROUTINE f() RENAME TO f2`, "ALTER ROUTINE"},
+		{"drop function", `DROP FUNCTION f()`, "DROP FUNCTION"},
+		{"create procedure", `CREATE PROCEDURE p() LANGUAGE sql AS 'select 1'`, "CREATE PROCEDURE"},
+		{"drop procedure", `DROP PROCEDURE p()`, "DROP PROCEDURE"},
+		{"create trigger", `CREATE TRIGGER tg BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION trgf()`, "CREATE TRIGGER"},
+		{"drop trigger", `DROP TRIGGER tg ON t`, "DROP TRIGGER"},
+		{"create event trigger", `CREATE EVENT TRIGGER et ON ddl_command_start EXECUTE FUNCTION f()`, "CREATE EVENT TRIGGER"},
+		{"alter event trigger", `ALTER EVENT TRIGGER et DISABLE`, "ALTER EVENT TRIGGER"},
+		{"create sequence", `CREATE SEQUENCE sq`, "CREATE SEQUENCE"},
+		{"alter sequence", `ALTER SEQUENCE sq INCREMENT 2`, "ALTER SEQUENCE"},
+		{"create rule", `CREATE RULE r AS ON UPDATE TO t DO INSTEAD NOTHING`, "CREATE RULE"},
+		{"alter rule", `ALTER RULE r ON t RENAME TO r2`, "ALTER RULE"},
+		{"drop rule", `DROP RULE r2 ON t`, "DROP RULE"},
+		{"create policy", `CREATE POLICY pol ON t USING (true)`, "CREATE POLICY"},
+		{"drop policy", `DROP POLICY pol ON t`, "DROP POLICY"},
+		{"create matview with no data", `CREATE MATERIALIZED VIEW mv AS SELECT 1 AS x WITH NO DATA`, "CREATE MATERIALIZED VIEW"},
+		{"refresh matview", `REFRESH MATERIALIZED VIEW mv`, "REFRESH MATERIALIZED VIEW"},
+		{"ctas with no data", `CREATE TABLE ct AS SELECT 1 AS x WITH NO DATA`, "CREATE TABLE AS"},
+		{"create publication", `CREATE PUBLICATION pub FOR TABLE t`, "CREATE PUBLICATION"},
+		{"alter publication owner", `ALTER PUBLICATION pub OWNER TO postgres`, "ALTER PUBLICATION"},
+		{"drop publication", `DROP PUBLICATION pub`, "DROP PUBLICATION"},
+		{"create subscription", `CREATE SUBSCRIPTION s CONNECTION 'x' PUBLICATION p`, "CREATE SUBSCRIPTION"},
+		{"alter subscription owner", `ALTER SUBSCRIPTION s OWNER TO postgres`, "ALTER SUBSCRIPTION"},
+		{"drop subscription", `DROP SUBSCRIPTION s`, "DROP SUBSCRIPTION"},
+		{"create access method", `CREATE ACCESS METHOD am2 TYPE TABLE HANDLER heap_tableam_handler`, "CREATE ACCESS METHOD"},
+		{"alter operator set", `ALTER OPERATOR === (int4, int4) SET (RESTRICT = eqsel)`, "ALTER OPERATOR"},
+		{"do", `DO 'begin null; end'`, "DO"},
+		{"reindex", `REINDEX TABLE t`, "REINDEX"},
+		{"cluster", `CLUSTER t`, "CLUSTER"},
 		{"create operator family", `CREATE OPERATOR FAMILY my_opf USING btree`, "CREATE OPERATOR FAMILY"},
 		{"create operator", `CREATE OPERATOR === (LEFTARG = int4, RIGHTARG = int4, FUNCTION = int4eq)`, "CREATE OPERATOR"},
 		{"create conversion", `CREATE CONVERSION my_conv FOR 'UTF8' TO 'LATIN1' FROM my_conv_func`, "CREATE CONVERSION"},
@@ -81,5 +117,31 @@ func TestDDLCommandTagMatchesPostgres(t *testing.T) {
 				t.Errorf("ddlTag(%q) = %q, want %q", tc.sql, got, tc.want)
 			}
 		})
+	}
+}
+
+
+type fakeDDLProcessed struct {
+	executor.Operator
+	n  int64
+	ok bool
+}
+
+func (f fakeDDLProcessed) DDLProcessed() (int64, bool) { return f.n, f.ok }
+
+// A populating CREATE TABLE AS / SELECT INTO / CREATE MATERIALIZED VIEW
+// completes with PostgreSQL's `SELECT <n>` (createas.c:349, matview.c:389);
+// the same statement WITH NO DATA keeps its DDL tag.
+func TestCommandTagForPopulatingDDLIsSelectN(t *testing.T) {
+	stmts, err := parser.Parse(`CREATE TABLE ct AS SELECT 1 AS x`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	node := &optimizer.DDL{Stmt: stmts[0]}
+	if got := commandTagFor(node, fakeDDLProcessed{n: 3, ok: true}, 0); got != "SELECT 3" {
+		t.Fatalf("populating CTAS tag = %q, want SELECT 3", got)
+	}
+	if got := commandTagFor(node, fakeDDLProcessed{ok: false}, 0); got != "CREATE TABLE AS" {
+		t.Fatalf("non-reporting CTAS tag = %q, want CREATE TABLE AS", got)
 	}
 }

@@ -3967,6 +3967,13 @@ func planCacheInvalidatingStmt(node optimizer.Node) bool {
 func commandTagFor(node optimizer.Node, op executor.Operator, rowCount int64) string {
 	switch n := node.(type) {
 	case *optimizer.DDL:
+		// A populating CREATE TABLE AS / SELECT INTO / CREATE MATERIALIZED
+		// VIEW completes with `SELECT <n>` (createas.c:349, matview.c:389).
+		if r, ok := op.(executor.DDLProcessedReporter); ok {
+			if processed, ok := r.DDLProcessed(); ok {
+				return fmt.Sprintf("SELECT %d", processed)
+			}
+		}
 		return ddlTag(n.Stmt)
 	case *optimizer.Insert:
 		return fmt.Sprintf("INSERT 0 %d", rowsAffected(op))
@@ -4014,6 +4021,11 @@ func transactionTag(v optimizer.TransactionVerb) string {
 func ddlTag(stmt parser.Stmt) string {
 	switch v := stmt.(type) {
 	case *parser.CreateTableStmt:
+		// CREATE TABLE AS … WITH NO DATA (the populating form reports
+		// SELECT <n> through DDLProcessed before ddlTag is consulted).
+		if v.SelectSource != nil {
+			return "CREATE TABLE AS"
+		}
 		return "CREATE TABLE"
 	case *parser.CreateIndexStmt:
 		return "CREATE INDEX"
@@ -4091,6 +4103,9 @@ func ddlTag(stmt parser.Stmt) string {
 			return tag
 		}
 	}
+	if tag, ok := stmtCommandTag(stmt); ok {
+		return tag
+	}
 	return "OK"
 }
 
@@ -4147,7 +4162,87 @@ func utilityTag(stmt parser.Stmt) string {
 	case *parser.DiscardStmt:
 		return "DISCARD"
 	}
+	if tag, ok := stmtCommandTag(stmt); ok {
+		return tag
+	}
 	return "OK"
+}
+
+// stmtCommandTag is the CommandComplete tag of statement kinds that reach the
+// generic DDL/utility dispatch without an arm of their own in ddlTag or
+// utilityTag — before it every one of them completed with the placeholder
+// "OK", which no PostgreSQL client ever sees. Tags are
+// ./postgres/src/include/tcop/cmdtaglist.h's.
+func stmtCommandTag(stmt parser.Stmt) (string, bool) {
+	switch v := stmt.(type) {
+	case *parser.CreateFunctionStmt:
+		return "CREATE FUNCTION", true
+	case *parser.CreateProcedureStmt:
+		return "CREATE PROCEDURE", true
+	case *parser.AlterFunctionStmt:
+		switch {
+		case v.IsRoutine:
+			return "ALTER ROUTINE", true
+		case v.IsProcedure:
+			return "ALTER PROCEDURE", true
+		}
+		return "ALTER FUNCTION", true
+	case *parser.DropFunctionStmt:
+		return "DROP FUNCTION", true
+	case *parser.DropProcedureStmt:
+		return "DROP PROCEDURE", true
+	case *parser.CreateTriggerStmt:
+		return "CREATE TRIGGER", true
+	case *parser.DropTriggerStmt:
+		return "DROP TRIGGER", true
+	case *parser.CreateEventTriggerStmt:
+		return "CREATE EVENT TRIGGER", true
+	case *parser.AlterEventTriggerStmt:
+		return "ALTER EVENT TRIGGER", true
+	case *parser.CreateSequenceStmt:
+		return "CREATE SEQUENCE", true
+	case *parser.AlterSequenceStmt:
+		return "ALTER SEQUENCE", true
+	case *parser.CreateRuleStmt:
+		return "CREATE RULE", true
+	case *parser.AlterRuleRenameStmt:
+		return "ALTER RULE", true
+	case *parser.DropRuleStmt:
+		return "DROP RULE", true
+	case *parser.CreatePolicyStmt:
+		return "CREATE POLICY", true
+	case *parser.DropPolicyStmt:
+		return "DROP POLICY", true
+	case *parser.CreateMatViewStmt:
+		// WITH NO DATA; a populating one reports SELECT <n> via
+		// DDLProcessed before ddlTag is consulted.
+		return "CREATE MATERIALIZED VIEW", true
+	case *parser.RefreshMatViewStmt:
+		return "REFRESH MATERIALIZED VIEW", true
+	case *parser.CreatePublicationStmt:
+		return "CREATE PUBLICATION", true
+	case *parser.AlterPublicationOwnerStmt:
+		return "ALTER PUBLICATION", true
+	case *parser.DropPublicationStmt:
+		return "DROP PUBLICATION", true
+	case *parser.CreateSubscriptionStmt:
+		return "CREATE SUBSCRIPTION", true
+	case *parser.AlterSubscriptionOwnerStmt:
+		return "ALTER SUBSCRIPTION", true
+	case *parser.DropSubscriptionStmt:
+		return "DROP SUBSCRIPTION", true
+	case *parser.CreateAccessMethodStmt:
+		return "CREATE ACCESS METHOD", true
+	case *parser.AlterOperatorSetStmt:
+		return "ALTER OPERATOR", true
+	case *parser.DoStmt:
+		return "DO", true
+	case *parser.ReindexStmt:
+		return "REINDEX", true
+	case *parser.ClusterStmt:
+		return "CLUSTER", true
+	}
+	return "", false
 }
 
 func rowsAffected(op executor.Operator) int64 {

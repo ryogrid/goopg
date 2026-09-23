@@ -52,7 +52,25 @@ type ddlOp struct {
 	// can (a) use CreateTableReplacingPendingDrop instead of the guarded
 	// CreateTable, and (b) stash it on the DDLUndoEntry for ROLLBACK restore.
 	pendingDropShadow *catalog.Table
+	// processed counts the rows a populating CREATE TABLE AS / SELECT INTO /
+	// CREATE MATERIALIZED VIEW wrote; reportProcessed says the statement's
+	// CommandComplete tag is PostgreSQL's `SELECT <n>` (createas.c:349,
+	// matview.c:389 — SetQueryCompletion(qc, CMDTAG_SELECT, es_processed)).
+	// REFRESH shares materializeView (so it counts too) but leaves
+	// reportProcessed false: its tag is plain REFRESH MATERIALIZED VIEW.
+	processed       int64
+	reportProcessed bool
 }
+
+// DDLProcessedReporter is implemented by the DDL operator: ok is true when the
+// statement completes with PostgreSQL's `SELECT <n>` tag instead of its DDL
+// tag (a populating CREATE TABLE AS, SELECT INTO or CREATE MATERIALIZED VIEW).
+type DDLProcessedReporter interface {
+	DDLProcessed() (n int64, ok bool)
+}
+
+// DDLProcessed implements DDLProcessedReporter.
+func (o *ddlOp) DDLProcessed() (int64, bool) { return o.processed, o.reportProcessed }
 
 func newDDLOp(p *optimizer.DDL) *ddlOp { return &ddlOp{plan: p} }
 
@@ -5197,10 +5215,12 @@ func (o *ddlOp) execCreateTableAs(s *parser.CreateTableStmt) error {
 			return fmt.Errorf("DDL catalog sync: %w", syncErr)
 		}
 	}
-	// WITH NO DATA: create table structure only, skip row insertion.
+	// WITH NO DATA: create table structure only, skip row insertion. The tag
+	// stays CREATE TABLE AS (createas.c reports SELECT only when it ran).
 	if s.WithNoData {
 		return nil
 	}
+	o.reportProcessed = true
 	// Execute the SELECT and insert all rows.
 	op, buildErr := Build(selectNode)
 	if buildErr != nil {
@@ -5224,6 +5244,7 @@ func (o *ddlOp) execCreateTableAs(s *parser.CreateTableStmt) error {
 		if err := writeHeapRow(o.ctx, rel, tbl.Columns, row); err != nil {
 			return &ExecError{Code: "XX000", Pos: s.Pos(), Message: err.Error()}
 		}
+		o.processed++
 	}
 	return nil
 }
@@ -20539,8 +20560,10 @@ func (o *ddlOp) execCreateMatView(s *parser.CreateMatViewStmt) error {
 			return fmt.Errorf("DDL catalog sync: %w", syncErr)
 		}
 	}
-	// Populate immediately unless WITH NO DATA.
+	// Populate immediately unless WITH NO DATA (whose tag stays
+	// CREATE MATERIALIZED VIEW, matview.c:389's else-arm).
 	if !s.WithNoData {
+		o.reportProcessed = true
 		if err := o.materializeView(tbl, selectPlan); err != nil {
 			return err
 		}
@@ -20577,6 +20600,7 @@ func (o *ddlOp) materializeView(tbl *catalog.Table, selectPlan optimizer.Node) e
 		if werr := writeHeapRow(o.ctx, rel, tbl.Columns, row); werr != nil {
 			return werr
 		}
+		o.processed++
 	}
 	// Rebuild all btree indexes on the matview after population.
 	// This also detects unique constraint violations (duplicate rows). M0097-0025.
