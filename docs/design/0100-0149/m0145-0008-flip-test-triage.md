@@ -1,6 +1,6 @@
 # M0145-0008 flip: unit-suite triage
 
-Status: triage produced 2026-09-23; group L pinned (test-only commit); groups
+Status: task BLOCKED 2026-09-23 on two owner calls (multiplier; executor legacy pin) — see fix_plan M0145-0008 escalation. Earlier: triage produced 2026-09-23; group L pinned (test-only commit); groups
 I and B were held in the M0145-0001 escalation until the owner's 2026-09-23
 answer — **now filed as M0145-0029 (group I) and M0145-0030 (group B)**,
 both sequenced before the flip. The default is NOT flipped yet.

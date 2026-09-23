@@ -106,6 +106,14 @@ sets, whole-row references and non-Var target entries (a constant literal in
 the CTE's target list, such as `year_total.sale_type`, lands in that last case
 and does fall back to the default).
 
+**Correction (M0145-0024, 2026-09-23):** that holds for plain-SELECT CTEs,
+not for set-operation CTEs. `examine_simple_variable` punts when the CTE query
+has `setOperations` (selfuncs.c:5845), and Q74's `year_total` is a UNION ALL.
+PG 18.3 therefore collapses Q74 too, with `rows=1` CTE Scans under three Nested
+Loop Join Filters, which is goopg's arm-OFF plan. After M0145-0020/0020a, Q74
+is the arm's only remaining fire. See
+`m0145-0024-q74-residual-collapse-recon.md`.
+
 **That is the port that retires this arm.** Substituting the unfiltered body
 count is a crude stand-in for statistics lookup through the CTE's target list.
 

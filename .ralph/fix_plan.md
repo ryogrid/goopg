@@ -16142,7 +16142,7 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
         TPC\-H run measured the legacy DP \(0 lowering\-built joins\).
         Pass `PGSHAPED=1` for the shipped planner.
       - Movement: none \(measurement\).
-- [ ] **M0145-0008 — cutover**: flip `GOOPG_JOINTREE_PIPELINE` default,
+- [!] **M0145-0008 — cutover**: flip `GOOPG_JOINTREE_PIPELINE` default,
   re-run the full corpus gates on the new pipeline (sf025 sweep,
   tpch-spotcheck, acceptance arm, plan-parity capture), then delete the
   legacy pipeline and the retired seam guards from 0001's list. Requires
@@ -16318,6 +16318,32 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
     0003 / 0004 / 0010\). Sequence: 0029 → 0030 → flip commit \(with the
     group\-K tests and the two script knob defaults changing in it\) →
     legacy\-deletion slices → this task's gate suite.
+  - **ESCALATION 2026\-09\-23 \(ralph2 loop \#25\): the flip commit is
+    blocked on two owner decisions.** 0029 and 0030 are both `[x]`. A full
+    flip run of the optimizer and executor packages at `324bd3ffb` leaves
+    these tests red; the flip commit cannot land while any stays red:
+    - **\(1\) `indexProbeCostMultiplier` \(owner call handed on by
+      M0145\-0029\):** `TestIOS_HeapFallback` and
+      `TestIndexOnlyDeformColdAndVisible`. PG prices index vs bitmap
+      within 0.01; the 2x multiplier decides. The executor tests cannot
+      set the multiplier \(it is a package var read from
+      `GOOPG_INDEX_PROBE_MULT` at init\). Options: \(a\) retire the
+      multiplier, \(b\) accept the bitmap shape and update the tests,
+      \(c\) sanction a test\-only setter.
+    - **\(2\) executor tests of legacy\-only machinery \(handed on by
+      M0145\-0030\):** `TestParallelNLIJointypeIdentity/semi`, `/anti`,
+      `TestSubqueryUnnestKillSwitch`; plus the non\-PG
+      `TestHashedInMixedKindFallsBack`. `pinLegacyPipeline` is local to
+      the optimizer package's tests. AGENT.md forbids a second
+      pipeline\-selection mechanism, so exporting a pin needs owner
+      sanction. Otherwise the flip commit deletes these arms, and the
+      legacy fused\-NLI semi/anti and unnest\-switch code goes uncovered
+      until the legacy\-deletion slice.
+    - Also in the flip commit, unchanged: the stale group\-I expectations
+      \(M0145\-0029's close list\), group K's two tests, and the script
+      sites in `m0145\-0030\-group\-b\-adjudication.md` §Script audit.
+    - Loop continues with item 3's selectable recons \(M0145\-0024 →
+      0025 → 0026\) until the owner answers.
 - [x] **M0145-0009 — CTE-output statistics (B-06 resume): wire the landed
   synthesis into the estimator** (filed 2026-09-21 by owner directive;
   carries TODO_ALL B-06 / ledger `take3-B-06-deferred`). Three of this
@@ -16934,6 +16960,13 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
       fallback stays until that recon lands AND the A/B shows no
       collapse-class move; do not remove the arm on the strength of
       0020a alone.
+  - **OWNER QUESTION 2026\-09\-23 \(from M0145\-0024\):** on the current tree
+    the arm fires on Q74 alone, and there it makes goopg diverge from PG\'s own
+    plan. PG 18.3 collapses Q74 exactly as goopg does with the arm off.
+    Option \(a\): retire the arm for plan parity \(Q74 2.27 s → 29.61 s; PG
+    takes 53.49 s\). Option \(b\): keep it as a named, owner\-accepted
+    performance divergence and close this task won\'t\-do. The removal steps
+    are in `m0145\-0024\-q74\-residual\-collapse\-recon.md`.
 - [x] **M0145-0013 — admit pulled `*CTEScan` leaves at the seam
   (`pulled-leaf-not-scan` / `flat-leaf-not-scan`)** (filed 2026-09-21
   by owner directive; the follow-on task M0145-0011's E2 resume point
@@ -18124,7 +18157,7 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
     baseline glob; like the rest of the channel it is report-only and
     never touches the verdict.
 
-- [ ] **M0145-0024 — recon: Q74 `year_total`'s residual collapse and the
+- [x] **M0145-0024 — recon: Q74 `year_total`'s residual collapse and the
   `rows<=1` arm's remaining coverage** (filed 2026-09-22, delegated owner
   direction on M0145-0012; progress-report §3.3/§5.2). M0145-0020 ported
   `examine_simple_variable`'s non-recursive CTE arm and closed
@@ -18149,6 +18182,21 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
   no-go (0012's own criterion).
   Kind: recon
   Parent: M0145-0012
+  - **CLOSED 2026\-09\-23 \(ralph2 loop \#25\).** Design doc
+    `docs/design/0100-0149/m0145-0024-q74-residual-collapse-recon.md`.
+    - The arm now fires on Q74 only \(`year_total` ×4\). Q31's `ws` and Q39's
+      `inv` no longer collapse after M0145\-0020a.
+    - 99\-query plan A/B at SF0.25: `same=98 changed=1` \(Q74 Hash Join ×3 →
+      Nested Loop ×3\).
+    - **PG 18.3 elects the arm\-OFF plan**: rows=1 CTE Scans under three NL
+      Join Filters, via the set\-operation punt in `examine_simple_variable`
+      \(selfuncs.c:5845\). M0145\-0012\'s "PG does not collapse" premise is
+      corrected in its design doc.
+    - Q74 timing, values identical: goopg arm ON 2.27 s, arm OFF 29.61 s, PG
+      53.49 s.
+    - The removal plan is written, conditional on an owner call, and is
+      escalated under M0145\-0012.
+  Movement: none
 
 - [ ] **M0145-0025 — re-take the TPC-H plan-parity baseline on the
   pinned-seed lane** (filed 2026-09-22, delegated owner direction;
