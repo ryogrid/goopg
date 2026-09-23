@@ -129,6 +129,11 @@ type indexPathClause struct {
 	// index's leading column (M0145-0029 slice 2, pathindexrestrict.go);
 	// createIndexScanPlan lowers those onto IndexScan.LowKey/HighKey.
 	op parser.OpCode
+	// saop is the element list of a ScalarArrayOp index qual (`indexcol IN
+	// (…)` / `= ANY (…)`, M0145-0029 slice 4) — one btree descent per
+	// element, lowered onto IndexScan.SAOPKeys. `key` is nil and `op` is
+	// equality when set.
+	saop []Expr
 }
 
 // indexPathClauses is `build_index_paths`' `index_clauses` accumulation

@@ -233,3 +233,55 @@ func findFilterOver(n Node, scan Node) *Filter {
 	}
 	return nil
 }
+
+// Slice 4: on the jointree pipeline a leading-column `IN (…)` is planned by
+// the restriction producer as a multi-descent IndexScan (SAOPKeys, one per
+// element), the IN dropped from the reinstated Filter and any other conjunct
+// kept there; the gates trySAOPIndexScan applies (NOT IN, ALL, `!= ANY`, a
+// non-column operand) decline, leaving no SAOP probe.
+func TestRestrictionSAOPIndexScanOnJointreePipeline(t *testing.T) {
+	prev := jointreePipeline
+	jointreePipeline = true
+	t.Cleanup(func() { jointreePipeline = prev })
+
+	c := saopFixture(t)
+	item, ok := c.LookupTable(parser.ObjectName{Name: "item"})
+	if !ok {
+		t.Fatal("item missing")
+	}
+	item.Stats = &catalog.TableStats{RowCount: 100000, Pages: 10000, Analyzed: true}
+
+	node, err := Plan(parseOne(t, "SELECT i_item_id FROM item WHERE i_item_sk IN (2, 3) AND i_flag > 1"), c)
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+	scan := findIndexScan(node)
+	if scan == nil || len(scan.SAOPKeys) != 2 || scan.Key != nil || len(scan.Keys) != 0 || scan.LowKey != nil || scan.HighKey != nil {
+		t.Fatalf("want a 2-descent SAOP IndexScan and no other probe shape, got %+v", scan)
+	}
+	f := findFilterOver(node, scan)
+	if f == nil {
+		t.Fatal("i_flag > 1 is not an index qual; want it kept as a Filter over the scan")
+	}
+	if _, isIn := f.Predicate.(*InExpr); isIn {
+		t.Fatalf("the IN is applied by the descents; want it dropped from the Filter, got %v", f.Predicate)
+	}
+	if bin, ok := f.Predicate.(*BinaryOp); !ok || bin.Op != parser.OpGt {
+		t.Fatalf("want the Filter to be exactly i_flag > 1, got %T", f.Predicate)
+	}
+
+	for _, q := range []string{
+		"SELECT i_item_id FROM item WHERE i_item_sk NOT IN (2, 3)",
+		"SELECT i_item_id FROM item WHERE i_item_sk = ALL (ARRAY[2, 3])",
+		"SELECT i_item_id FROM item WHERE i_item_sk != ANY (ARRAY[2, 3])",
+		"SELECT i_item_id FROM item WHERE i_item_sk + 1 IN (2, 3)",
+	} {
+		node, err := Plan(parseOne(t, q), c)
+		if err != nil {
+			t.Fatalf("%s: Plan: %v", q, err)
+		}
+		if s := findIndexScan(node); s != nil && len(s.SAOPKeys) > 0 {
+			t.Fatalf("%s: must not become a SAOP probe", q)
+		}
+	}
+}

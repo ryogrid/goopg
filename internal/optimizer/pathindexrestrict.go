@@ -22,8 +22,10 @@ package optimizer
 // parameterised arm). Slice 2 adds RANGE bounds (`<`, `<=`, `>`, `>=`) on the
 // index's LEADING column when no equality binds it — the one range shape the
 // executor's probe expresses (LowKey/HighKey carry no equality prefix).
-// An equality prefix followed by a range column, and ScalarArrayOp (`IN (…)`)
-// quals, are not built yet — ledgered.
+// Slice 4 adds a ScalarArrayOp qual (`col IN (…)` / `col = ANY (…)`) on the
+// LEADING column, again only when no equality binds it (IndexScan.SAOPKeys is
+// exclusive of every other probe shape). An equality prefix followed by a
+// range or SAOP column is not built yet — ledgered.
 
 import (
 	"github.com/goopg/goopg/internal/catalog"
@@ -183,6 +185,47 @@ func restrictionLeadingRange(cat catalog.Catalog, tbl *catalog.Table, idx *catal
 	return out
 }
 
+// restrictionLeadingSAOP binds the index's LEADING column to the first local
+// ScalarArrayOp conjunct usable as a btree multi-descent — the gates of
+// `match_saopclause_to_indexcol` (indxpath.c:3136) that trySAOPIndexScan
+// reproduces: a plain `IN (list)` or `= ANY (list)` (OR of equalities; NOT
+// IN, `!= ANY`, ALL and other operators are no union of descents), a bare
+// column operand, and constant elements the key encoder takes
+// (restrictionKeyUsable: no boolean, no enum string). The conjunct is exactly
+// the union of the descents (the executor dedupes by TID), so it is recorded
+// in `local` and dropped from the Filter.
+func restrictionLeadingSAOP(cat catalog.Catalog, tbl *catalog.Table, idx *catalog.Index, conjuncts []Expr) []indexPathClause {
+	if len(idx.Columns) == 0 {
+		return nil
+	}
+	lead := idx.Columns[0]
+	for _, conj := range conjuncts {
+		in, ok := conj.(*InExpr)
+		if !ok || in.Subquery != nil || in.Plan != nil || len(in.List) == 0 {
+			continue
+		}
+		if in.Negated || in.NotEqualAny || in.AllOp || (in.AnyOp != parser.OpUnknown && in.AnyOp != parser.OpEq) {
+			continue
+		}
+		cr, ok := in.Operand.(*ColumnRef)
+		if !ok || cr.Index < 0 || cr.Index >= len(tbl.Columns) || tbl.Columns[cr.Index].Name != lead {
+			continue
+		}
+		usable := true
+		for _, e := range in.List {
+			if !restrictionKeyUsable(cat, tbl.Columns[cr.Index], e) {
+				usable = false
+				break
+			}
+		}
+		if !usable {
+			continue
+		}
+		return []indexPathClause{{indexCol: 0, saop: in.List, local: conj}}
+	}
+	return nil
+}
+
 // rangeIndexSelectivity is the range clauses' selectivity: clauselist_
 // selectivity over the index quals, which pairs a lower and an upper bound on
 // the same column into one band (`hibound + lobound - 1`, clausesel.c) —
@@ -268,6 +311,11 @@ func (s *searchCtx) addOneRestrictionIndexPath(cat catalog.Catalog, rel *RelOptI
 	}
 	clauses := restrictionEqualityPrefix(cat, tbl, idx, conjuncts)
 	isRange := false
+	isSAOP := false
+	if len(clauses) == 0 {
+		clauses = restrictionLeadingSAOP(cat, tbl, idx, conjuncts)
+		isSAOP = len(clauses) > 0
+	}
 	if len(clauses) == 0 {
 		clauses = restrictionLeadingRange(cat, tbl, idx, conjuncts)
 		isRange = true
@@ -285,9 +333,16 @@ func (s *searchCtx) addOneRestrictionIndexPath(cat catalog.Catalog, rel *RelOptI
 	}
 	var sel float64
 	var unique bool
-	if isRange {
+	numSAScans := 0.0
+	switch {
+	case isSAOP:
+		// scalararraysel over the IN (clauseSelectivity's InExpr arm), and
+		// one descent per element (btcostestimate's num_sa_scans).
+		sel = clampSelectivity(clauseSelectivity(clauses[0].local, rel.baseLeaf))
+		numSAScans = float64(len(clauses[0].saop))
+	case isRange:
 		sel = rangeIndexSelectivity(rel.baseLeaf, conjuncts, clauses)
-	} else {
+	default:
 		sel, unique = restrictionIndexSelectivity(tbl, idx, clauses, relTuples)
 	}
 
@@ -315,6 +370,7 @@ func (s *searchCtx) addOneRestrictionIndexPath(cat catalog.Catalog, rel *RelOptI
 		// qpquals = baserestrictinfo minus the index quals (costsize.c:806-820):
 		// the consumed equalities are applied by the probe, not re-checked.
 		numQualOps: qpquals,
+		numSAScans: numSAScans,
 	}
 	cost := costIndexScan(s.cp, in)
 	tgt, tgtKnown := scanPathTarget(rel)

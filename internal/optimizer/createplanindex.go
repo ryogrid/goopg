@@ -415,6 +415,11 @@ func createIndexScanPlan(p *Path) Node {
 	if hasRangeClause(p.IndexClauses) {
 		return createRangeIndexScanPlan(p, id, rewrap)
 	}
+	// M0145-0029 slice 4: a ScalarArrayOp path — one clause on the leading
+	// column, lowered onto SAOPKeys (the executor's multi-descent arm).
+	if len(p.IndexClauses) == 1 && len(p.IndexClauses[0].saop) > 0 {
+		return createSAOPIndexScanPlan(p, id, rewrap)
+	}
 
 	ncols := len(p.IndexInfo.Columns)
 	switch {
@@ -556,6 +561,33 @@ func createRangeIndexScanPlan(p *Path, id *scanIdentity, rewrap scanLeafRewrap) 
 	}
 	if len(drop) > 0 {
 		return rewrapLeafDropping(p.Rel.baseLeaf, is, drop)
+	}
+	return rewrap(is)
+}
+
+// createSAOPIndexScanPlan lowers a leading-column ScalarArrayOp path
+// (restrictionLeadingSAOP) onto IndexScan.SAOPKeys — exclusive of every other
+// probe shape, as the executor requires.
+func createSAOPIndexScanPlan(p *Path, id *scanIdentity, rewrap scanLeafRewrap) Node {
+	c := p.IndexClauses[0]
+	if p.IndexOnly || p.RequiredOuter != 0 || c.indexCol != 0 || c.key != nil || c.op != parser.OpUnknown {
+		panic(fmt.Sprintf("createPlan: SAOP PathIndexScan on %s must be one leading-column clause on a plain unparameterised scan", p.IndexInfo.Name))
+	}
+	is := &IndexScan{
+		pos:                   id.pos,
+		Table:                 id.table,
+		Alias:                 id.alias,
+		RTID:                  id.rtid,
+		Index:                 p.IndexInfo,
+		SAOPKeys:              append([]Expr(nil), c.saop...),
+		schema:                id.schema,
+		SmallDim:              id.smallDim,
+		UniqueKeys:            id.uniqueKeys,
+		PrivilegeCheckRole:    id.privilegeCheckRole,
+		PrivilegeCheckRoleSet: id.privilegeCheckRoleSet,
+	}
+	if c.local != nil {
+		return rewrapLeafDropping(p.Rel.baseLeaf, is, map[Expr]bool{c.local: true})
 	}
 	return rewrap(is)
 }
