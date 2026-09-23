@@ -2359,7 +2359,7 @@ heuristic stays live.)
     Movement: none
   - Take one per loop; each is small and independently testable.
 
-- [ ] **pg\_get\_indexdef prints a Go struct for a COLLATE expression in a
+- [x] **pg\_get\_indexdef prints a Go struct for a COLLATE expression in a
   partial\-index predicate** \(found 2026\-09\-24 in the upstream create\_index
   diff\): `... WHERE (c1::text > &{105 0x2d861162a1e0 C})` where PG prints
   `(c1)::text > 'A'::text COLLATE "C"`. The deparser formats a
@@ -2367,6 +2367,16 @@ heuristic stays live.)
   nondeterministic.
   Kind: bug
   Parent: none
+  - **Closed 2026\-09\-24 `e8277c163`.** Both deparser twins
+    \(`defaultExprToSQL`, `catalog.formatExprForAttrdef`\) gained
+    get\_rule\_expr\'s T\_CollateExpr arm. The same predicate also failed
+    CREATE INDEX \(XX000 "column ref c2/1 on nil slot"\):
+    `exprContainsColumnRef` walked without a CollateExpr arm and const\-folded
+    it. It now uses the exhaustive `walkExprRefs`. Regress create\_index:
+    the nil\-slot error and three Go\-struct rows are gone.
+    Movement: create\_index diff 3338 → 3322 lines
+  - Remaining, ledgered: PG prints casts as `(c1)::text`
+    \(get\_coercion\_expr\); goopg prints `c1::text`.
 
 - [ ] **work\_mem boots at 512MB; PostgreSQL\'s default is 4MB** \(found
   2026\-09\-24 by the DISCARD ALL probe: `RESET ALL` returns each server to
@@ -3828,7 +3838,7 @@ listed `select.sql`, `delete.sql` and `sysviews.sql` already carry CSV status
 - [ ] **M0134-0167a — no SP-GiST access method**.
 - [ ] **M0134-0167b — explicit `ASC` / `NULLS LAST` still accepted on orderless AMs**.
 - [ ] **M0134-0167c — capability gate not applied to the constraint-side index paths**.
-- [ ] **M0134-0167d — `pg_get_indexdef` prints a Go value dump for a COLLATE in a partial-index predicate**.
+- [x] **M0134-0167d — `pg_get_indexdef` prints a Go value dump for a COLLATE in a partial-index predicate**. Fixed 2026-09-24 `e8277c163` (M-NIGHTLY duplicate).
 - [ ] **M0134-0168 — sqljson.sql** — PARKED.
 - [ ] **M0134-0168a — SQL/JSON constructor & predicate family (whole subsystem)**.
 - [ ] **M0134-0168b — `\d` lists a partitioned table's per-partition FK constraints under "Referenced by:"**.
