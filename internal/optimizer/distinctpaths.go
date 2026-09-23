@@ -198,21 +198,47 @@ func distinctCost(inputStartup, inputTotal, inputRows, outputRows float64, cp co
 // for goopg's one input: hashed always, unique-over-sorted always (over
 // the producer-stacked Sort — input order guaranteed by construction).
 // Single candidate per shape by construction.
+//
+// Insertion order is hashed first. PG's create_final_distinct_paths adds the
+// sorted (Unique) paths first, but in PG both survive add_path (the Unique
+// has pathkeys) and the choice is made after the ORDER BY stage has costed
+// its Sort. goopg elects ONE winner here, before ORDER BY, where addPath
+// keeps the first of two fuzzily-tied candidates — so PG's order alone elects
+// Unique on `SELECT DISTINCT a, b … ORDER BY a, b LIMIT 100`, where PG
+// elects HashAggregate + Sort. PG's order belongs with carrying both
+// candidates to the ordered rel (ledgered, M0141-S2b-4d).
 func addDistinctPaths(distinctRel *RelOptInfo, seed *Path, distinctNode *Distinct, child Node, cp costParams, ps PlannerSettings) {
+	hashed, unique := distinctCandidates(distinctRel, seed, distinctNode, child, cp, ps)
+	addPath(distinctRel, hashed, distinctHashedProducer)
+	addPath(distinctRel, unique, distinctUniqueProducer)
+}
+
+// addUnionDistinctPaths is the same pair for a UNION (distinct), in
+// generate_union_paths' order: the hashed aggregate first, then Sort ->
+// Unique (prepunion.c, `if (can_hash)` precedes `if (can_sort)`).
+func addUnionDistinctPaths(rel *RelOptInfo, seed *Path, distinctNode *Distinct, child Node, cp costParams, ps PlannerSettings) {
+	hashed, unique := distinctCandidates(rel, seed, distinctNode, child, cp, ps)
+	addPath(rel, hashed, distinctHashedProducer)
+	addPath(rel, unique, distinctUniqueProducer)
+}
+
+// distinctCandidates builds the hashed and unique-over-sorted PathDistinct
+// candidates shared by addDistinctPaths and addUnionDistinctPaths.
+func distinctCandidates(distinctRel *RelOptInfo, seed *Path, distinctNode *Distinct, child Node, cp costParams, ps PlannerSettings) (hashed, unique *Path) {
 	inputRows := seed.Rows
 	numDistinct := distinctRel.Rows
 
 	// HASHED: the executor hash-dedups the seed as-is (today's behavior).
 	// `enable_hashagg = off` marks it DisabledNodes (B-17a preference,
 	// never skip) instead of deleting it.
-	addPath(distinctRel, &Path{
+	hashed = &Path{
 		Kind: PathDistinct, Distinct: distinctNode,
 		Rel: distinctRel, Rows: numDistinct,
 		DisabledNodes: disabledNodesFor(!ps.EnableHashAgg, seed),
 		Cost: costAgg(cp, AggStrategyHashed, inputRows, seed.Cost.Startup, seed.Cost.Total,
 			len(child.Output()), numDistinct, 0, 0, 0),
 		Children: []*Path{seed},
-	}, distinctHashedProducer)
+	}
 
 	// UNIQUE over the producer-stacked Sort (streaming adjacent dedup).
 	// This is the ONLY Sort-driven candidate: a "sorted Distinct" (hash
@@ -220,13 +246,23 @@ func addDistinctPaths(distinctRel *RelOptInfo, seed *Path, distinctNode *Distinc
 	// and be rejected as a duplicate by add_path — offering both would be
 	// noise, not choice. PG likewise builds Unique, not sorted-Agg, for
 	// the sorted DISTINCT shape.
-	sortInput := sortPathForBounded(seed, pathkeysForSortKeys(distinctAllColKeys(child)), cp, -1)
+	//
+	// With no output columns there is nothing to sort by: a zero-column UNION
+	// (SQL allows `SELECT FROM … UNION SELECT FROM …`; SELECT DISTINCT never
+	// reaches here without targets) takes the Unique straight over its input,
+	// as generate_union_paths does (`if (groupList != NIL) path =
+	// create_sort_path(...)`, prepunion.c) — M0141-S2b-4a.
+	sortInput := seed
+	if keys := distinctAllColKeys(child); len(keys) > 0 {
+		sortInput = sortPathForBounded(seed, pathkeysForSortKeys(keys), cp, -1)
+	}
 	uniqueCost := distinctCost(sortInput.Cost.Startup, sortInput.Cost.Total, inputRows, numDistinct, cp)
-	addPath(distinctRel, &Path{
+	unique = &Path{
 		Kind: PathDistinct, Distinct: distinctNode, Unique: true,
 		Rel: distinctRel, Rows: numDistinct,
 		DisabledNodes: sortInput.DisabledNodes,
 		Cost:          uniqueCost,
 		Pathkeys:      sortInput.Pathkeys, Children: []*Path{sortInput},
-	}, distinctUniqueProducer)
+	}
+	return hashed, unique
 }

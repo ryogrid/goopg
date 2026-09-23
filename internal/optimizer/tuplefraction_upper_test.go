@@ -34,6 +34,7 @@ var upperRelProducers = []string{
 	"createDistinctPaths",
 	"createWindowPaths",
 	"createSetOpPaths",
+	"createUnionDistinctPaths",
 }
 
 // TestUpperRelProducerCensusIsComplete keeps `upperRelProducers` honest: every

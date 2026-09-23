@@ -1383,6 +1383,14 @@ func planSelectImpl(s *parser.SelectStmt, cat catalog.Catalog, plannerSet Planne
 		// necessarily the leftmost branch, so type unification and the
 		// column-count check are re-based on it rather than on a flat index.
 		// M0125-0016.
+		// unionFolds records, for each UNION result this fold built, its
+		// leaf branches and whether it was UNION ALL — the input to
+		// plan_union_children's fold rule below (M0141-S2b-4a).
+		type unionFoldRec struct {
+			leaves []Node
+			all    bool
+		}
+		unionFolds := map[Node]unionFoldRec{}
 		applySetOp := func(acc, right Node, i int) (Node, error) {
 			seg := segments[i]
 			// Each branch must project the same number of columns.
@@ -1423,8 +1431,51 @@ func planSelectImpl(s *parser.SelectStmt, cat catalog.Catalog, plannerSet Planne
 			// partition/inheritance fan-outs also build `*SetOp{All: true}`,
 			// but those are PG APPENDRELS below the upper-rel pipeline, not
 			// set operations — see windowsetoppaths.go's header.
-			return createSetOpPaths(upper, &SetOp{pos: s.Pos(), Left: acc, Right: right, Op: seg.opType, All: seg.opAll,
-				TlistTypesDiffer: typesDiffer}, plannerSet, setOpTupleFraction)
+			if seg.opType != parser.SetOpUnion {
+				return createSetOpPaths(upper, &SetOp{pos: s.Pos(), Left: acc, Right: right, Op: seg.opType, All: seg.opAll,
+					TlistTypesDiffer: typesDiffer}, plannerSet, setOpTupleFraction)
+			}
+			// M0141-S2b-4a: `plan_union_children` (prepunion.c:1269). A child
+			// that is itself a UNION built by this fold is folded into the
+			// parent when its `all` equals the parent's or the child is ALL
+			// (a UNION ALL pulls up into a UNION: the distinct step removes
+			// its duplicates anyway). A branch the type unification above
+			// rewrapped is a new node, absent from the map, so it stays one
+			// leaf — upstream's colTypes-equality condition.
+			leavesOf := func(n Node) []Node {
+				if r, ok := unionFolds[n]; ok && (r.all == seg.opAll || r.all) {
+					return r.leaves
+				}
+				return []Node{n}
+			}
+			leaves := append(append([]Node(nil), leavesOf(acc)...), leavesOf(right)...)
+			if seg.opAll {
+				out, err := createSetOpPaths(upper, &SetOp{pos: s.Pos(), Left: acc, Right: right, Op: seg.opType, All: true,
+					TlistTypesDiffer: typesDiffer}, plannerSet, setOpTupleFraction)
+				if err == nil {
+					unionFolds[out] = unionFoldRec{leaves: leaves, all: true}
+				}
+				return out, err
+			}
+			// UNION (distinct): one distinct step over a left-deep UNION ALL
+			// chain of every folded leaf. The chain renders as one n-ary
+			// Append; createUnionDistinctPaths elects hashed vs Sort -> Unique
+			// over it, as generate_union_paths does.
+			chain := leaves[0]
+			for _, b := range leaves[1:] {
+				next, err := createSetOpPaths(upper, &SetOp{pos: s.Pos(), Left: chain, Right: b, Op: parser.SetOpUnion, All: true,
+					TlistTypesDiffer: typesDiffer}, plannerSet, setOpTupleFraction)
+				if err != nil {
+					return nil, err
+				}
+				chain = next
+			}
+			out, err := createUnionDistinctPaths(upper, &Distinct{pos: s.Pos(), Child: chain, schema: chain.Output()},
+				plannerSet, setOpTupleFraction)
+			if err == nil {
+				unionFolds[out] = unionFoldRec{leaves: leaves, all: false}
+			}
+			return out, err
 		}
 		// foldSetOpRange folds segments[lo:hi) onto acc, honouring PostgreSQL's
 		// set-operator precedence: INTERSECT binds tighter than UNION/EXCEPT

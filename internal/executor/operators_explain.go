@@ -3373,6 +3373,12 @@ func describePlanMode(n optimizer.Node, nm *explainNames, verbose bool) string {
 	case *optimizer.GatherMerge:
 		return "Gather Merge"
 	case *optimizer.Distinct:
+		// KNOWN DIVERGENCE (ledgered, M0141-S2b-4d): goopg's *Distinct is a
+		// HASHED dedup of the whole row, which PG labels `HashAggregate` with
+		// a `Group Key:` line — for SELECT DISTINCT and for a hashed UNION
+		// alike. The honest label is held back until the DISTINCT election
+		// matches PG's: relabelling alone turns TPC-DS Q41's floor match into
+		// a shape-diff, because goopg hashes where PG sorts there.
 		return "Unique"
 	case *optimizer.Aggregate:
 		// P9: PG prefixes a split aggregate's two halves with "Partial " and

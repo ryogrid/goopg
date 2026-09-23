@@ -23,9 +23,10 @@ import (
 //	INTERSECT  -> HashSetOp Intersect (two Seq Scan children, no Append)
 //	EXCEPT ALL -> HashSetOp Except All
 //
-// goopg fuses PG's SetOp+Append into one node, so the UNION-distinct case
-// prints `HashSetOp Union` — see describePlan's comment and the deferral
-// ledger row for why that spelling was chosen.
+// Since M0141-S2b-4a goopg plans UNION (distinct) in PG's shape: one distinct
+// step above an n-ary Append of every same-kind branch, instead of the old
+// fused `HashSetOp Union`. The hashed step still renders `Unique` where PG
+// prints `HashAggregate` (M0141-S2b-4d).
 
 // setopExplainFixture creates two same-shaped tables and returns the
 // EXPLAIN lines for sql.
@@ -103,8 +104,11 @@ func TestExplainIntersectExceptRenderHashSetOp(t *testing.T) {
 		{"SELECT id FROM eso_a INTERSECT ALL SELECT id FROM eso_b", "HashSetOp Intersect All"},
 		{"SELECT id FROM eso_a EXCEPT SELECT id FROM eso_b", "HashSetOp Except"},
 		{"SELECT id FROM eso_a EXCEPT ALL SELECT id FROM eso_b", "HashSetOp Except All"},
-		// goopg-only spelling: PG plans this as HashAggregate over Append.
-		{"SELECT id FROM eso_a UNION SELECT id FROM eso_b", "HashSetOp Union"},
+		// PG plans a hashed UNION as HashAggregate over Append. Since
+		// M0141-S2b-4a goopg plans the same shape (a hashed Distinct over
+		// Append) but still labels the hashed Distinct `Unique` — a known,
+		// ledgered divergence (M0141-S2b-4d).
+		{"SELECT id FROM eso_a UNION SELECT id FROM eso_b", "Unique"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.want, func(t *testing.T) {
@@ -186,5 +190,107 @@ func TestExplainSetOpJSONMatchesUpstreamProperties(t *testing.T) {
 	}
 	if _, present := unionAll["Command"]; present {
 		t.Errorf("Append must not carry a Command property: %v", unionAll)
+	}
+}
+
+// setopFixtureCtx is setopExplainLines' fixture, returned for queries that
+// check rows as well as plans.
+func setopFixtureCtx(t *testing.T) *Context {
+	t.Helper()
+	ctx, _, cleanup := newDDLFixture(t)
+	t.Cleanup(cleanup)
+	runSQL(t, ctx, "CREATE TABLE eso_a (id int, y int)")
+	runSQL(t, ctx, "CREATE TABLE eso_b (id int, y int)")
+	runSQL(t, ctx, "CREATE TABLE eso_c (id int, y int)")
+	runSQL(t, ctx, "INSERT INTO eso_a VALUES (1, 1), (2, 2)")
+	runSQL(t, ctx, "INSERT INTO eso_b VALUES (2, 2), (3, 3)")
+	runSQL(t, ctx, "INSERT INTO eso_c VALUES (4, 4), (1, 1)")
+	return ctx
+}
+
+func countLines(lines []string, sub string) int {
+	n := 0
+	for _, l := range lines {
+		if strings.Contains(l, sub) {
+			n++
+		}
+	}
+	return n
+}
+
+// TestUnionDistinctChainFoldsIntoOneAppend pins M0141-S2b-4a's
+// plan_union_children port (prepunion.c:1269): same-kind UNION children fold
+// into ONE Append under one distinct step — TPC-DS Q49's shape. A UNION ALL
+// child folds into a UNION parent (the distinct step removes its duplicates
+// anyway); a UNION child under a UNION ALL parent does not.
+func TestUnionDistinctChainFoldsIntoOneAppend(t *testing.T) {
+	ctx := setopFixtureCtx(t)
+	cases := []struct {
+		name, sql string
+		appends   int
+		distincts int
+	}{
+		{"union-union", "SELECT id FROM eso_a UNION SELECT id FROM eso_b UNION SELECT id FROM eso_c", 1, 1},
+		{"unionall-union", "SELECT id FROM eso_a UNION ALL SELECT id FROM eso_b UNION SELECT id FROM eso_c", 1, 1},
+		{"union-unionall", "SELECT id FROM eso_a UNION SELECT id FROM eso_b UNION ALL SELECT id FROM eso_c", 2, 1},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			lines := runExplainRows(t, ctx, "EXPLAIN "+tc.sql)
+			joined := strings.Join(lines, "\n")
+			if got := countLines(lines, "Append"); got != tc.appends {
+				t.Errorf("Append lines = %d, want %d:\n%s", got, tc.appends, joined)
+			}
+			if got := countLines(lines, "HashAggregate") + countLines(lines, "Unique"); got != tc.distincts {
+				t.Errorf("distinct steps = %d, want %d:\n%s", got, tc.distincts, joined)
+			}
+			if strings.Contains(joined, "HashSetOp Union") {
+				t.Errorf("old fused spelling still present:\n%s", joined)
+			}
+		})
+	}
+}
+
+// TestUnionDistinctChainRows: the folded plans return PG's answers.
+func TestUnionDistinctChainRows(t *testing.T) {
+	ctx := setopFixtureCtx(t)
+	cases := []struct {
+		sql  string
+		want int
+	}{
+		// {1,2} u {2,3} u {4,1} = {1,2,3,4}
+		{"SELECT id FROM eso_a UNION SELECT id FROM eso_b UNION SELECT id FROM eso_c", 4},
+		// ALL child folded under UNION: still deduplicated
+		{"SELECT id FROM eso_a UNION ALL SELECT id FROM eso_b UNION SELECT id FROM eso_c", 4},
+		// UNION then UNION ALL: {1,2,3} ++ {4,1} = 5 rows
+		{"SELECT id FROM eso_a UNION SELECT id FROM eso_b UNION ALL SELECT id FROM eso_c", 5},
+		// multi-column rows dedup on the whole row
+		{"SELECT id, y FROM eso_a UNION SELECT id, y FROM eso_b UNION SELECT id, y FROM eso_c", 4},
+	}
+	for _, tc := range cases {
+		if got := len(runQuery(t, ctx, tc.sql)); got != tc.want {
+			t.Errorf("%s: %d rows, want %d", tc.sql, got, tc.want)
+		}
+	}
+}
+
+// TestZeroColumnUnionBothStrategies: `SELECT FROM … UNION SELECT FROM …` has
+// no output columns, so the sorted candidate has nothing to sort by. PG's
+// generate_union_paths skips the Sort when groupList is NIL and returns one
+// row; goopg's first cut built a key-less Sort path and crashed the server
+// in upstream's union.sql (M0141-S2b-4a). Both strategies must return PG's
+// single row.
+func TestZeroColumnUnionBothStrategies(t *testing.T) {
+	ctx := setopFixtureCtx(t)
+	for _, on := range []bool{true, false} {
+		restore := hashAggSeed(on)
+		rows, err := runQueryWithErr(ctx, "select from generate_series(1,5) union select from generate_series(1,3)")
+		restore()
+		if err != nil {
+			t.Fatalf("enable_hashagg=%v: %v", on, err)
+		}
+		if len(rows) != 1 {
+			t.Errorf("enable_hashagg=%v: %d rows, want 1", on, len(rows))
+		}
 	}
 }

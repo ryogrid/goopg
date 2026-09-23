@@ -430,6 +430,55 @@ func createSetOpPaths(u *upperRels, setOpNode *SetOp, ps PlannerSettings, tupleF
 		Message: "createSetOpPaths: PathSetOp built no set-op node"}
 }
 
+// createUnionDistinctPaths is `generate_union_paths`' `!op->all` arm
+// (prepunion.c:676) for a UNION (distinct) whose same-kind children the
+// caller has already folded into one UNION ALL chain (`plan_union_children`,
+// prepunion.c:1269) — M0141-S2b-4a. distinctNode.Child is that chain, which
+// EXPLAIN renders as one n-ary Append.
+//
+// The candidates are PG's two serial arms over the Append: a hashed
+// aggregate and Sort -> Unique, built by addUnionDistinctPaths (PG's hash-first
+// order) and elected by
+// addPath. They go on a FRESH SETOP rel (PG's fetch_upper_rel(UPPERREL_SETOP,
+// relids)), never the statement's shared (DISTINCT, 0) rel, so a UNION and a
+// SELECT DISTINCT in one statement cannot pollute each other's election.
+// The group estimate is PG's worst case: `dNumGroups = apath->rows`, the
+// Append's own input rows ("too conservative, but it's not clear how to get a
+// decent estimate", prepunion.c).
+//
+// Not ported (ledgered): the Gather variants over a partial Append (gpath)
+// and the Merge Append arm (try_sorted), the latter being M0141-S2b-4c.
+func createUnionDistinctPaths(u *upperRels, distinctNode *Distinct, ps PlannerSettings, tupleFraction float64) (Node, error) {
+	if distinctNode == nil || distinctNode.Child == nil {
+		return nil, &PlanError{Code: "XX000", Message: "createUnionDistinctPaths: nil union input"}
+	}
+	if u == nil {
+		u = newUpperRels()
+	}
+	cp := ps.costParams()
+	setOpRel := newUpperRelForNode(u, UpperSetOp, tupleFraction)
+	seed := seedPathForNode(setOpRel, distinctNode.Child)
+	setOpRel.Rows = seed.Rows
+	if setOpRel.Rows < 1 {
+		setOpRel.Rows = 1
+	}
+	setOpRel.Width = nodeTupleWidth(distinctNode)
+	addUnionDistinctPaths(setOpRel, seed, distinctNode, distinctNode.Child, cp, ps)
+	setCheapest(setOpRel)
+	best := getCheapestFractionalPath(setOpRel, tupleFraction)
+	if best == nil {
+		return nil, &PlanError{Pos: distinctNode.Pos(), Code: "0A000",
+			Message: "could not implement UNION"}
+	}
+	node, _ := createPlanNode(best)
+	switch node.(type) {
+	case *Distinct, *DistinctOn:
+		return node, nil
+	}
+	return nil, &PlanError{Pos: distinctNode.Pos(), Code: "XX000",
+		Message: "createUnionDistinctPaths: PathDistinct built no distinct node"}
+}
+
 // seedPathForNode wraps a finished branch Node as a `PathPrebuilt` carrying
 // its legacy rows and cost — the C-12 door, once per branch.
 func seedPathForNode(rel *RelOptInfo, n Node) *Path {
