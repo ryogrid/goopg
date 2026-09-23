@@ -18235,6 +18235,30 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
       WITH quals \(gap → slice 3\).
     - Remaining: slice 2 range quals, 3 index\-only with quals, 4 SAOP,
       5 re\-run group I \+ update stale expectations.
+  - **Slice 3 LANDED 2026\-09\-23 \(ralph2 loop \#13\), `6d50210f4`.**
+    Index\-only scan WITH index quals.
+    - `addIndexOnlyPaths` admits a filtered leaf when an index's equality
+      prefix consumes EVERY local qual \(`consumingIndexClauses`\); the
+      lowering sets `IndexOnlyScan.Key`/`Keys`. Residual quals over an
+      index\-only scan stay refused \(ledgered\).
+    - One path per index, as `build_index_paths`: the plain restriction
+      producer declines where the index\-only one builds the same probe
+      \(`restrictionPathIsIndexOnly`\). Before, the cost\-tied plain twin was
+      filed first and won the tie.
+    - `IndexOnlyScan` now embeds `searchedTree`: a covering index\-only scan
+      reached the search root with no boundary Project and panicked in
+      `markSearchedTree`.
+    - Local flip: `TestIOS_\*` \(4\) and `TestArrayIndexOnlyScanAnswersFromKey`
+      elect PG's shape only at `GOOPG_INDEX_PROBE_MULT=1`. At the shipped 2
+      the bitmap wins: PG IOS 8.17 vs bitmap 8.18; goopg 16.27 vs 12.27 —
+      the multiplier doubles the index path's heap fetch but not the
+      bitmap's heap page. Slice 5 must decide per test \(or the owner, on
+      the multiplier\).
+    - `TestIndexOnlyDeformColdAndVisible`: 4 analysed rows, seq 1.01 wins —
+      PG seq\-scans too; stale expectation for slice 5.
+    - No plan moved: default sweep same=99; knob fire\-set plans unchanged
+      at SF0.25 and SF1.
+    - Remaining: slice 2 range quals, 4 SAOP, 5 group\-I re\-run.
 - [ ] **M0145-0030 — group B: adjudicate the 11 behavioural flip-triage
   tests before the flip** (same filing). The flip-triage doc lists 11
   behavioural failures: grouping strategy, nested scalar subquery, NLI
