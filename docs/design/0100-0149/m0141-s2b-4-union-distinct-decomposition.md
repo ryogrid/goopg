@@ -1,7 +1,7 @@
 # M0141-S2b-4 — UNION (distinct) planning: decomposition against PG 18.3
 
-Status: design slice 2026-09-24 (no code). Task: `.ralph/fix_plan.md`
-M0141-S2b-4. The implementation slices below are filed as M0141-S2b-4a..4c.
+Status: S2b-4a landed 2026-09-24 (`ded1b8db3`); S2b-4b (Gather variants),
+4c and 4d open. Task: `.ralph/fix_plan.md` M0141-S2b-4.
 
 ## Witnesses (TPC-DS SF0.25, current tree)
 
@@ -68,3 +68,49 @@ makes never happens.
 Order: 4a before 4b (the election needs the n-ary input), 4c last. Each is
 an impl slice with the full default-arm gate set plus the fire-set gate.
 EXPLAIN-shape movement lands in `CATEGORIES-EXCL-MATCH` on Q49/Q75.
+
+## S2b-4a landed (2026-09-24, `ded1b8db3`)
+
+- `applySetOp` (planner.go) records each UNION result's leaves and folds
+  children by `plan_union_children`'s rule. A branch rewrapped by type
+  unification is a new node, so it stays one leaf (upstream's colTypes
+  condition).
+- A distinct UNION is a `Distinct` over a left-deep UNION ALL chain, which
+  EXPLAIN already renders as one n-ary Append.
+- `createUnionDistinctPaths` (windowsetoppaths.go) elects on a fresh SETOP
+  rel with `dNumGroups` = input rows, hashed candidate first as in
+  `generate_union_paths`. So the hashed vs Sort → Unique election planned
+  for 4b landed with 4a; 4b keeps only the Gather variants.
+- Zero-column UNION: with no columns the Unique takes its input without a
+  Sort (PG's `groupList != NIL` guard). The first cut built a key-less Sort
+  path and crashed the server in upstream `union.sql`; pinned by
+  `TestZeroColumnUnionBothStrategies`.
+
+Result on TPC-DS SF0.25: only Q49 and Q75 change. Q49 is now `Unique →
+Sort → Gather → Parallel Append` over all three branches; PG uses a serial
+Append, a parallel-costing difference left for 4b. The Sort key is PG's
+exact column order. Q75's nested HashSetOps are gone. The default-arm
+floor holds (match 2), and qual-placement moved 27 → 28, inside the ±3
+band.
+
+## What was tried and held back (filed as S2b-4d)
+
+- **Relabelling the hashed `Distinct` as `HashAggregate` + `Group Key`**
+  (PG's spelling for SELECT DISTINCT and hashed UNION alike). Correct on its
+  own, but it turned TPC-DS Q41's floor MATCH into a shape-diff. The match
+  had rested on the old `Unique` label, which equals PG's actual `Unique`
+  over a Sort. goopg's DISTINCT really does elect hashed where PG sorts,
+  and AGENT.md treats losing a floor match as a regression.
+- **PG's candidate order for DISTINCT** (sorted first, as in
+  `create_final_distinct_paths`). In PG both candidates survive `add_path`
+  (the Unique has pathkeys) and the choice happens after the ORDER BY stage
+  costs its Sort. goopg elects one winner at the DISTINCT rel, before ORDER
+  BY, so PG's order alone elected Unique on `SELECT DISTINCT a, b … ORDER BY
+  a, b LIMIT 100`, where PG elects HashAggregate + Sort.
+- **A presorted-input arm** (Unique straight over an already-sorted input).
+  goopg's pipeline puts the ORDER BY Sort below the DISTINCT, a non-PG stage
+  order, so the arm fired where PG hashes.
+
+All three need the same prerequisite: carrying the DISTINCT rel's
+candidates to the ordered rel, as PG's upper-rel pathlists do. With that in
+place, Q41 can match honestly with the correct label.

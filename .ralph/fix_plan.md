@@ -6652,22 +6652,51 @@ spill route is net-negative.
         prepunion.c:676\).
       - Sliced into S2b\-4a \(flatten\), 4b \(election\), 4c \(Merge Append\),
         filed below. This parent closes when all three land.
-  - [ ] **M0141-S2b-4a — flatten same\-kind UNION chains**
+  - [x] **M0141-S2b-4a — flatten same\-kind UNION chains**
     \(`plan_union_children`\): fold rule \(same op; `all` equal or child ALL;
     column types and collations equal\) into one distinct step over a
     left\-deep UNION ALL chain, which EXPLAIN renders as one n\-ary `Append`.
     Witness Q49. Design doc §Slices.
     Kind: impl
     Parent: M0141-S2b-4
+    - **LANDED 2026\-09\-24 \(ralph2 loop \#33\), `ded1b8db3`.** The hashed
+      vs Sort → Unique election landed with it \(`createUnionDistinctPaths`\).
+      - Q49 → `Unique → Sort → Gather → Parallel Append\(3\)`, Q75\'s nested
+        HashSetOps gone; only those two plans change. Floor held \(match 2\).
+      - Zero\-column UNION crash found by upstream `union.sql` and fixed
+        \(`TestZeroColumnUnionBothStrategies`\).
+      - Gates: units, full regress suite, spotcheck, sf025, acceptance arm
+        \(values\-only\), fire\-set — PASS. Nightly CI was running, so the
+        sweep\'s timing channel is void \(FORCE=1\).
+      - Held back to S2b\-4d: the HashAggregate label \(it would cost Q41\'s
+        floor match\), PG\'s DISTINCT candidate order, and a presorted arm.
+    Movement: none
   - [ ] **M0141-S2b-4b — the distinct election over the flattened Append**:
     hashed \(AGG\_HASHED\) vs sorted \(Sort → Unique\), `dNumGroups` = input
     rows, plus Gather variants, elected by `addPath`. Witness Q49 \(PG
     elects Sort → Unique\). Depends on S2b\-4a.
+    - **Narrowed 2026\-09\-24:** the serial election landed with S2b\-4a.
+      Remaining: PG\'s Gather variants \(`gpath`\) and the parallel costing
+      that makes goopg put Q49\'s Append under a Gather where PG keeps it
+      serial.
     Kind: impl
     Parent: M0141-S2b-4
   - [ ] **M0141-S2b-4c — Merge Append → Unique when every child is sorted
     on the union pathkeys.** Check first whether goopg has a Merge Append
     path/executor. Witness Q75. Depends on S2b\-4b.
+    Kind: impl
+    Parent: M0141-S2b-4
+  - [ ] **M0141-S2b-4d — hashed Distinct label and the DISTINCT election**
+    \(filed 2026\-09\-24 by S2b\-4a\). goopg labels a hashed `*Distinct`
+    `Unique`; PG prints `HashAggregate` with a `Group Key` for SELECT DISTINCT
+    and hashed UNION. The relabel is held back because it turns TPC\-DS Q41\'s
+    floor MATCH into a shape\-diff: goopg\'s DISTINCT elects hashed where PG
+    sorts. Prerequisite: carry the DISTINCT rel\'s candidates \(hashed and
+    Unique\) to the ordered rel instead of electing one before ORDER BY, as
+    PG\'s upper\-rel pathlists do. Then apply PG\'s sorted\-first candidate
+    order \(`create\_final\_distinct\_paths`\) and the presorted\-input arm.
+    Q41 must end as an honest MATCH with the correct label. Design doc
+    §"What was tried and held back".
     Kind: impl
     Parent: M0141-S2b-4
   - [x] **M0141-S2b-5** — resolve `electOrderedGrouping`'s `anyTranslated`
