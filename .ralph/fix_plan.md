@@ -18259,7 +18259,7 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
       build and probe row.
     - Fix filed as M0145\-0026a.
   Movement: none
-- [ ] **M0145-0026a — fold a semi/anti link's key equality only when its
+- [x] **M0145-0026a — fold a semi/anti link's key equality only when its
   predicate lacks it** \(filed 2026\-09\-23 by M0145\-0026\). At
   `extractSearchLeaves` \(`joinsearchseam.go:1888`\) and
   `extractScopeLeaves` \(`:2252`\), add `LeftKey = RightKey` only when no
@@ -18271,6 +18271,17 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
   default\-arm gates plus the fire\-set gate.
   Kind: impl
   Parent: M0145-0026
+  - **LANDED 2026\-09\-23 \(ralph2 loop \#28\), `31403fe46`.**
+    `semiAntiPredHasKeyEq` gates both folds; witness
+    `TestExtractSearchLeaves_OuterReductionAntiKeyFoldedOnce` fails without
+    the fix.
+    - Q78\'s three hash anti joins drop exactly one clause\'s charge on the
+      default arm \(web 1256.80..10452.70 → 1212.00..9958.01\); the knob arm
+      moves the same way. No plan shape moved.
+    - Gates: units, tpch\-spotcheck, tpcds\-sf025 \(PASS=96\), acceptance arm
+      \(values identical\), fire\-set \(introduced=none\) — all PASS.
+    - Cost\-only effect \(not an S3 instrument\): Q78 web\-arm hash anti total \-494.69; no match or category change.
+  Movement: none
 - [x] **M0145-0027 — knob-arm TPC-H Q20 decorrelates a correlated scalar
   subquery PG keeps as a SubPlan** \(filed 2026-09-23 by the M0145-0008
   executor-capability inventory\). Full 22-query acceptance arm, same
