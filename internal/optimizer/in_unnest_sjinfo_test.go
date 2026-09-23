@@ -187,7 +187,8 @@ func TestInUnnestSJInfoNonCorrelatedAntiNullAware(t *testing.T) {
 // semiAntiLinksHaveSJInfos — the gate that decline-gated every IN-derived
 // link — accepts it. (The TPC-DS corpus cannot observe this today: every
 // IN-subquery statement declines earlier at `leaf-count` /
-// `outer-over-derived` — measured in the m0142-0008-producer design doc.)
+// `outer-over-derived`, retired at M0145-0018 — measured in the
+// m0142-0008-producer design doc.)
 func TestExtractSearchLeaves_InUnnestLinkPassesSJInfoGate(t *testing.T) {
 	cat := twoTablesCatalog(t)
 	sql := "SELECT x FROM t1 WHERE x IN (SELECT y FROM t2 WHERE z > 0)"

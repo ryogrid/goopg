@@ -36,7 +36,7 @@ func TestFlattenPulledBodyTreeCTELeafGate(t *testing.T) {
 
 	pullupCTELeafEnabled = false
 	if _, _, why, ok := flattenPulledBodyTree(body, 2); ok {
-		t.Fatalf("default arm admitted a *CTEScan leaf; the firewall's pairing constraint says it must decline")
+		t.Fatalf("default arm admitted a *CTEScan leaf; GOOPG_PULLUP_CTE_LEAF defaults off and the gate must decline")
 	} else if why != "body-leaf-(*optimizer.CTEScan)" {
 		t.Fatalf("decline reason = %q, want body-leaf-(*optimizer.CTEScan) — the census counts this string", why)
 	}

@@ -44,10 +44,9 @@ func seamChainFromSQL(t *testing.T, names []string, rows []int64, from string) (
 }
 
 // seamChainFromSQLWrapped is seamChainFromSQL with each leaf passed through
-// `wrap` (nil = identity) before the chain is built over it — C-04b's firewall
-// fixture builds Filter-wrapped CTE leaves this way, over the SAME bindings
-// and joinlist a base-table chain gets, so the only thing that differs is what
-// the leaf classifier sees.
+// `wrap` (nil = identity) before the chain is built over it — C-04b's
+// (now-retired) firewall fixtures built Filter-wrapped CTE leaves this way,
+// over the SAME bindings and joinlist a base-table chain gets.
 func seamChainFromSQLWrapped(t *testing.T, names []string, rows []int64, from string, wrap func(i int, leaf Node) Node) (Node, *resolveContext) {
 	t.Helper()
 	base, ctx := seamFixture(names, rows)

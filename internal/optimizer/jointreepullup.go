@@ -416,13 +416,12 @@ func bindPulledBodyScope(sub *parser.SelectStmt, parent *resolveContext, cat cat
 // Default OFF. It is knob-arm measurement apparatus, not a relaxation:
 // M0145-0011 lands none, and the default arm must stay byte-identical.
 //
-// It is USELESS on its own and must be paired with
-// `GOOPG_DERIVED_FIREWALL=off`. A pulled ANY/EXISTS body becomes a
+// At landing it was useless on its own and had to be paired with
+// `GOOPG_DERIVED_FIREWALL=off`: a pulled ANY/EXISTS body becomes a
 // JoinSemi/JoinAnti SpecialJoinInfo, and the `outer-over-derived` firewall's
-// jointype switch (relfromjoinlist.go) covers Semi/Anti — so a body admitted
-// here still declines one step later at the firewall, and the census would
-// report the relaxation as a no-op for the wrong reason. The pairing is the
-// whole point of sequencing (c) after (a).
+// jointype switch covered Semi/Anti, so a body admitted here declined one
+// step later at the firewall. M0145-0018 removed that firewall, so the
+// pairing requirement is gone and this flag stands alone.
 //
 // Why a CTE leaf is the interesting case: the baseline census over TPC-DS
 // makes `any-body-leaf-(*optimizer.CTEScan)` the largest non-`(pulled)`

@@ -1067,12 +1067,10 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 		relInfos[i] = seamLeafRelInfo(i, b, scan, local, cat)
 		// The leaf's own coordinates are non-emitting (a SEMI/ANTI join
 		// never projects its RHS), so the boundary filler must mark them
-		// fillable exactly like the extracted leaves' — while
-		// `leafIsDerivedInput` still answers not-derived through the real
-		// `table` above, which is the distinction c8 added the flag for.
-		// A DERIVED pulled leaf has `table == nil` on purpose and must
-		// answer derived there: that is what keeps the `outer-over-derived`
-		// firewall in force over it until M0145-0018 lifts it.
+		// fillable exactly like the extracted leaves' — which is what the
+		// flag now carries (c11). Its c8 reader, `leafIsDerivedInput`,
+		// left with the `outer-over-derived` firewall at M0145-0018; a
+		// DERIVED pulled leaf still has `table == nil` on purpose.
 		relInfos[i].isSemiAntiSyntheticLeaf = true
 	}
 	// A synthetic leaf has no `*catalog.Table` — it is an opaque, already-
@@ -1134,10 +1132,9 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 			relInfos[i] = seamLeafRelInfo(i, b, scan, local, cat)
 			// The leaf's own coordinates are synthetic (a SEMI/ANTI join
 			// never projects its RHS), so the boundary filler must mark
-			// them fillable exactly like the opaque leaf's — while
-			// `leafIsDerivedInput` still answers not-derived through the
-			// real `table` above, which is the distinction c8 added the
-			// flag for.
+			// them fillable exactly like the opaque leaf's — which is
+			// what the flag now carries (c11; its c8 reader left with
+			// the firewall at M0145-0018).
 			relInfos[i].isSemiAntiSyntheticLeaf = true
 			continue
 		}
@@ -1158,8 +1155,9 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 			// c8 (design doc §42.4): this leaf's `table == nil` reflects
 			// "not a single base relation," not "no real stats" —
 			// `baseRows` above already came from `EstimateRows` over a
-			// real, already-cost-estimated join subtree. Mark it so
-			// `leafIsDerivedInput` doesn't conflate the two.
+			// real, already-cost-estimated join subtree. The mark is also
+			// what makes the leaf's own (non-emitting) coordinates
+			// fillable at the boundary filler (c11).
 			isSemiAntiSyntheticLeaf: true,
 		}
 	}
@@ -2901,11 +2899,12 @@ func limitParseConst(p parser.Expr) Expr {
 //
 //   - `*SeqScan` — a real base relation. `table`/`alias` come off the scan and
 //     the leaf is priced from catalog statistics.
-//   - `*CTEScan` — a DERIVED input. `table` stays nil deliberately. That is not
-//     an oversight to paper over: `leafIsDerivedInput` reads exactly this to
-//     keep the `outer-over-derived` firewall in force over the leaf, which is
-//     the ordering M0145-0013 requires (admission machinery first, the
-//     firewall relaxation last, in M0145-0018).
+//   - `*CTEScan` — a DERIVED input. `table` stays nil deliberately: a CTE
+//     scan carries no catalog statistics, and a nil `table` is how the leaf
+//     expresses that downstream (the cardinality fallback in
+//     `initialRelRows`, not the catalog-stats path). M0145-0013 admitted the
+//     leaf ahead of M0145-0018's firewall removal — the ordering was
+//     "admission machinery first, relaxation last", and both have landed.
 //
 // `pullCtx`/`k` are the body-order hand-through the task asks for: the pull-up
 // already recorded each body's own `rangeBinding` (`jtPulledBody.bodyBindings`,

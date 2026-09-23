@@ -16797,6 +16797,34 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
       channel, TPC-H acceptance, SF1 timing spot-check on Q77/Q78 — and
       the fire-set gate, which M0145-0021a now enforces for this exact
       path. Expected `outer-over-derived` 3 -> 0 on the seam census.
+  - **EXECUTED 2026-09-23 (loop \#5)** — the owner-GO'd removal landed:
+    - `relfromjoinlist.go`: `problemPairsOuterWithDerived`,
+      `derivedFirewallEnabled`, the `searchOneProblem` decline site
+      (incl. `traceSeamDecline("outer-over-derived", …)`), and
+      `leafIsDerivedInput` (no other reader — the `isSemiAntiSyntheticLeaf`
+      flag's c8 consumer; its live reader is the c11 fillable rule) all
+      deleted; `os`/`parser` imports dropped.
+    - `flaglabels.go`: resolver deleted; `GOOPG_DERIVED_FIREWALL` moved to
+      `flagProvenanceRetired` as `retired(M0145-0018)` per the retirement
+      convention (order entry kept so older artefacts still decode);
+      `scripts/planner-flags.env` regenerated.
+    - Tests: `outer_over_derived_test.go` deleted wholesale (all eight
+      tests pinned the removed function; its helpers had no other users);
+      `semiantichain_test.go`'s three `TestProblemPairsOuterWithDerived*`
+      cases, `joinsearch_c04c_trace_test.go`'s two firewall pins
+      (`TestSeamBelowInnerLeftLinkOverDerivedInputsDeclines`,
+      `TestProblemPairsOuterWithDerivedBelowInnerLink`),
+      `joinsearch_rightlink_test.go`'s
+      `TestSeamRightLinkOverDerivedInputsDeclines`, and the probe's
+      consumer-\#3 arm all removed; admission/SJI/right-link pins kept.
+    - Comments updated where they described the firewall as live:
+      `joinsearchseam.go` (3 sites), `jointreepullup.go` (the
+      PULLUP_CTE_LEAF pairing requirement — now stands alone),
+      `cardinality.go` (field doc), `seam_leaf_admission_test.go` (nil
+      `table` now justified by the pricing route, not the firewall),
+      `pullup_cte_leaf_test.go`, `in_unnest_sjinfo_test.go`,
+      `joinsearchspine_test.go`.
+    - Gates: `go test ./internal/optimizer` PASS; (remaining gates below).
   Parent: M0145-0011
   - **`[!]` NO-GO 2026-09-21 — the firewall was NOT relaxed.** Design doc
     `docs/design/0100-0149/m0145-0018-firewall-relaxation-no-go.md`.

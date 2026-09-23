@@ -712,9 +712,11 @@ type baseRelInfo struct {
 	// single base relation). Unlike a genuine derived input (CTE scan,
 	// worktable scan, or any other leaf with no real per-child stats), this
 	// leaf's `baseRows` comes from `EstimateRows(scan)` over an
-	// already-cost-estimated join subtree (M0142-0008a-3i-plumbing-c8) — so
-	// `leafIsDerivedInput` must not treat its `table == nil` as the same
-	// "no statistics" signal a genuine derived input's nil table is.
+	// already-cost-estimated join subtree (M0142-0008a-3i-plumbing-c8). The
+	// mark's live readers are the boundary filler's coordinate rule (c11 —
+	// a SEMI/ANTI RHS never projects, so its own coordinates are always
+	// fillable); it also kept the retired `outer-over-derived` firewall's
+	// `leafIsDerivedInput` from reading the nil `table` as "no statistics".
 	isSemiAntiSyntheticLeaf bool
 	// appendrel mirrors `rangeBinding.appendrel` (M0145-0004): this leaf
 	// is a UNION ALL subquery the jointree pipeline marked at

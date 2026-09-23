@@ -12,13 +12,13 @@ import (
 // admitted with a DELIBERATELY nil table, and every other leaf kind is
 // refused.
 //
-// The nil table is the load-bearing part, not an omission. `leafIsDerivedInput`
-// reads exactly that to keep the `outer-over-derived` firewall in force over a
-// derived leaf, which is the ordering the milestone requires: admission
-// machinery lands here (0013), the firewall relaxation lands last (0018). A
-// future edit that "helpfully" synthesises a catalog.Table for the CTE leaf
-// would silently lift the firewall a milestone early, and no corpus gate would
-// report it — the census counts declines, not their reasons for existing.
+// The nil table is the load-bearing part, not an omission. It is how a CTE
+// leaf expresses "no catalog statistics" downstream: the seam prices it via
+// `EstimateRows` over the body rather than the catalog path
+// (`TestSeamLeafRelInfoRoutesOnTable` below). Until M0145-0018 it also kept
+// the `outer-over-derived` firewall in force over the leaf — a future edit
+// that "helpfully" synthesises a catalog.Table for the CTE leaf would still
+// silently re-route its pricing, and no corpus gate would report it.
 func TestSeamLeafBindingAdmission(t *testing.T) {
 	cat := catalog.NewInMemory()
 	tbl, err := cat.CreateTable(parser.ObjectName{Name: "sla_t"}, []catalog.Column{
@@ -46,8 +46,8 @@ func TestSeamLeafBindingAdmission(t *testing.T) {
 			t.Fatalf("a *CTEScan leaf must be admitted — M0145-0013's whole point")
 		}
 		if b.table != nil {
-			t.Fatalf("binding.table = %v, want nil: leafIsDerivedInput must still answer DERIVED "+
-				"so the outer-over-derived firewall stays in force until M0145-0018", b.table)
+			t.Fatalf("binding.table = %v, want nil: a CTE leaf carries no catalog "+
+				"statistics, and the pricing path routes on table==nil", b.table)
 		}
 		if b.alias != "c1" || b.offset != 3 {
 			t.Fatalf("binding = {alias:%q offset:%d}, want {c1 3}", b.alias, b.offset)

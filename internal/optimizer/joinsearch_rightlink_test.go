@@ -5,15 +5,14 @@ package optimizer
 // this file holds the pins C-04a taught us to write BEFORE the suite gates
 // run rather than after they fail:
 //
-//   - the outer-over-derived firewall, end to end through the seam, on the
-//     fixture shape that actually escaped in C-04a (Filter-wrapped CTE leaves
-//     with synthesised non-nil tables) — the decline is read off the trace
-//     channel, not inferred from `used == false`;
 //   - the DPPATH evidence that the reduced link is OFFERED and ACCEPTED as
 //     jointype=left, and never as right;
 //   - the inner-ON-under-nullable guard, with its mutation control (the same
 //     conjunct under a LEFT link's preserved side is still admitted);
 //   - the ON-qual destinations and the nested-outer declines, mirrored.
+//
+// (The outer-over-derived firewall pin that used to lead this list left with
+// the firewall itself at M0145-0018.)
 
 import (
 	"strings"
@@ -38,48 +37,6 @@ func seamDeclineReasons(lines []string) []string {
 		}
 	}
 	return out
-}
-
-// TestSeamRightLinkOverDerivedInputsDeclines is the C-04a Q78 lesson applied
-// before the gate can teach it again. Three CTE outputs, each reaching the
-// search as `Filter -> CTEScan` over with.go's synthesised (non-nil) table,
-// joined by an inner link and a RIGHT link. The firewall must decline the
-// problem, and the decline must be the FIREWALL's — `outer-over-derived` on
-// the trace — not some earlier gate that would make the test pass for the
-// wrong reason. Mutation-checked: the same chain over base leaves is searched.
-func TestSeamRightLinkOverDerivedInputsDeclines(t *testing.T) {
-	withPGShapedDP(t)
-	enableDPTrace(t)
-	names := []string{"a", "b", "c"}
-	rows := []int64{1, 1, 1} // rowest A3: every CTE output estimates to one row
-	wrapCTE := func(i int, leaf Node) Node {
-		return &Filter{
-			Child:     &CTEScan{Name: names[i], Alias: names[i], schema: leaf.Output()},
-			Predicate: seamLocal(names, i),
-		}
-	}
-
-	node, ctx := seamChainFromSQLWrapped(t, names, rows, rightChain3, wrapCTE)
-	var used bool
-	lines := captureTrace(t, func() {
-		_, _, used = tryPGShapedJoinSearch(node, nil, ctx, nil)
-	})
-	if used {
-		t.Fatal("the seam searched a RIGHT link over three CTE outputs at rows=1 — the Q78 " +
-			"shape, where an epsilon Nested Loop victory over full CTE outputs cost 20x")
-	}
-	reasons := seamDeclineReasons(lines)
-	if len(reasons) == 0 || reasons[len(reasons)-1] != "outer-over-derived" {
-		t.Fatalf("declined, but not by the firewall: reasons=%v, want the last to be "+
-			"outer-over-derived (a decline elsewhere proves nothing about the classifier)", reasons)
-	}
-
-	// Mutation control: base leaves, same chain, searched.
-	node, ctx = seamChainFromSQL(t, names, rows, rightChain3)
-	if _, _, used = tryPGShapedJoinSearch(node, nil, ctx, nil); !used {
-		t.Fatal("the same RIGHT chain over BASE leaves was declined — the firewall is " +
-			"firing on something other than the derived inputs")
-	}
 }
 
 // TestSeamRightLinkDPPathOfferedAndAccepted is the enum-trace evidence C-04b's

@@ -183,21 +183,12 @@ var flagResolvedState = map[string]func(string) string{
 	// the legacy pipeline stays the value-gated arm through the whole
 	// transition; the knob is retired by M0145-0008's cutover.
 	"GOOPG_JOINTREE_PIPELINE": func(v string) string { return onOff(jointreePipelineFromEnv(v)) },
-	// M0145-0011 scope (a) (relfromjoinlist.go): bypasses the
-	// `outer-over-derived` firewall. It is NOT diagnostic-only and is
-	// deliberately NOT in `flagProvenanceExempt`: turning it off CHANGES THE
-	// CHOSEN PLAN — that is its entire purpose — so an artefact that does not
-	// name it cannot say whether the firewall was in force. Default ON; the
-	// firewall stays on for the default arm and M0145-0011 lands no
-	// relaxation. The shape it guards is measured, not hypothetical: C-04a saw
-	// a 15 s Hash plan become a 327 s Nested-Loop timeout when an epsilon
-	// rows=1 estimate on a derived input won the comparison.
-	"GOOPG_DERIVED_FIREWALL": func(v string) string { return onOff(v != "off") },
 	// M0145-0011 scope (c) (jointreepullup.go): admits a `*CTEScan` leaf into
-	// the pulled body's flat splice. Default OFF, and plan-SHAPING for the
-	// same reason the firewall flag is — so it is registered here rather than
-	// exempted. Useless without `GOOPG_DERIVED_FIREWALL=off`; a capture that
-	// names only one of the pair cannot say what it measured.
+	// the pulled body's flat splice. Default OFF, and plan-SHAPING, so it is
+	// registered here rather than exempted. (It joined paired with
+	// GOOPG_DERIVED_FIREWALL=off — a pulled CTE leaf was otherwise declined
+	// by the `outer-over-derived` firewall. M0145-0018 removed the firewall,
+	// so the flag now stands alone.)
 	"GOOPG_PULLUP_CTE_LEAF": func(v string) string { return onOff(v == "on") },
 	// M0145-0012 (joinsearch.go): gates the M0129-S1 `rows<=1` CTE fallback.
 	// Default ON = today's behaviour. Plan-SHAPING — the arm changes an
@@ -282,13 +273,14 @@ var flagProvenanceOrder = []string{
 	// (incrementalsortpaths.go). Default `off` — createPlanNode has no arm
 	// for PathIncrementalSort until the executor operator lands.
 	"GOOPG_INCREMENTAL_SORT",
-	// Joined at M0145-0011: bypasses the `outer-over-derived` firewall
-	// (relfromjoinlist.go). Default `on`. Plan-SHAPING, not diagnostic — a
-	// capture taken with it `off` is knob-arm private evidence and must say so.
+	// Joined at M0145-0011: bypassed the `outer-over-derived` firewall
+	// (relfromjoinlist.go). Retired at M0145-0018 — see
+	// flagProvenanceRetired below.
 	"GOOPG_DERIVED_FIREWALL",
 	// Joined at M0145-0011 scope (c): admits `*CTEScan` leaves into the
-	// pulled-body splice (jointreepullup.go). Default `off`. Plan-SHAPING and
-	// only meaningful paired with GOOPG_DERIVED_FIREWALL=off.
+	// pulled-body splice (jointreepullup.go). Default `off`. Plan-SHAPING;
+	// it joined paired with GOOPG_DERIVED_FIREWALL=off and stands alone
+	// since M0145-0018 removed the firewall.
 	"GOOPG_PULLUP_CTE_LEAF",
 	// Joined at M0145-0012: gates the goopg-only `rows<=1` CTE fallback in
 	// `initialRelRows` (joinsearch.go). Default `on`; `off` is the knob-arm
@@ -341,6 +333,12 @@ var flagProvenanceRetired = map[string]string{
 	// carry it another round (r124-nontable-leaf-widths/REPORT.md §7).
 	// cost_funcs.go's spill arm is now permanently the flag's former OFF arm.
 	"GOOPG_HASHAGG_WIDTH_CURRENCY": "M0137-0009",
+	// M0145-0011's bypass for the `outer-over-derived` decline in
+	// relfromjoinlist.go. M0145-0018 removed the decline itself — M0145-0019's
+	// derived-inner NL costing fix retired the epsilon-NL shape the firewall
+	// existed to suppress, and the owner-authorised re-verification showed no
+	// non-degenerate NL election remained — so nothing reads the variable.
+	"GOOPG_DERIVED_FIREWALL": "M0145-0018",
 }
 
 // FlagProvenanceTable is the authoritative list of planner env flags that a

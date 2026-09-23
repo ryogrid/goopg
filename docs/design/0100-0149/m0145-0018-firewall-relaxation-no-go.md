@@ -1,16 +1,23 @@
 # The `outer-over-derived` relaxation is a NO-GO on the current tree (M0145-0018)
 
-Status: **OWNER GO 2026-09-22 — executable.** NO-GO 2026-09-21; RE-VERIFIED
-2026-09-22 and the 2026-09-21 blocker is GONE. The single remaining criterion-1
-violation (Q77's degenerate `rows=1` Append-branch NL election, +16% on a ~5 s
-query, values byte-identical, no timeout) is WAIVED as measured-benign by the
-owner (progress-report review §3.1, option (a)); the criterion is re-scoped to
-"no NL election on a NON-degenerate join condition and no timeout-class move".
-The task is `[ ]` and executable: remove `problemPairsOuterWithDerived`
-including its Semi/Anti arms, delete `GOOPG_DERIVED_FIREWALL`, then the full
-default-arm gate set plus the now-enforced fire-set gate (M0145-0021a).
-See §"Fresh E1 re-verification (2026-09-22)" at the end. The firewall itself
-was not relaxed on either measurement date.
+Status: **EXECUTED 2026-09-23.** The owner GO below was executed: the
+`outer-over-derived` decline (`problemPairsOuterWithDerived`, including its
+Semi/Anti arms, plus `leafIsDerivedInput`, which had no other reader) is
+removed from `internal/optimizer/relfromjoinlist.go`, and
+`GOOPG_DERIVED_FIREWALL` is retired through the standard provenance channel
+(resolver deleted; order entry kept so older artefacts still decode; stamp
+`retired(M0145-0018)`). See §"Execution (2026-09-23)" at the end for the
+default-arm gate record.
+
+Status history: OWNER GO 2026-09-22 — executable. NO-GO 2026-09-21;
+RE-VERIFIED 2026-09-22 and the 2026-09-21 blocker is GONE. The single
+remaining criterion-1 violation (Q77's degenerate `rows=1` Append-branch NL
+election, +16% on a ~5 s query, values byte-identical, no timeout) is WAIVED
+as measured-benign by the owner (progress-report review §3.1, option (a));
+the criterion is re-scoped to "no NL election on a NON-degenerate join
+condition and no timeout-class move". See §"Fresh E1 re-verification
+(2026-09-22)" below. The firewall itself was not relaxed on either
+measurement date.
 
 Task: `.ralph/fix_plan.md` M0145-0018. Kind: impl. Parent: M0145-0011.
 
@@ -213,3 +220,71 @@ Q78 unaffected) and execute the relaxation — or keep the firewall and close
 document listed in 2026-09-21.
 
 Artefacts: `tmp/m0145-0018-e1/` (both SF0.25 captures and the four SF1 plans).
+
+---
+
+# Execution (2026-09-23, loop #5)
+
+The owner GO was executed. What changed:
+
+- `internal/optimizer/relfromjoinlist.go`: `problemPairsOuterWithDerived`
+  (LEFT/RIGHT/FULL **and** the Semi/Anti arms), `derivedFirewallEnabled`,
+  the `searchOneProblem` decline site with its
+  `traceSeamDecline("outer-over-derived", …)`, and `leafIsDerivedInput` all
+  deleted. `leafIsDerivedInput` had no other reader — the
+  `isSemiAntiSyntheticLeaf` flag's c8 consumer; the flag's live reader is the
+  c11 fillable-coordinates rule, so the field stays.
+- `internal/optimizer/flaglabels.go`: resolver deleted;
+  `GOOPG_DERIVED_FIREWALL` moved to `flagProvenanceRetired` per the
+  retirement convention — the order entry survives so older artefacts that
+  carry it still decode, and the stamp reads `retired(M0145-0018)`.
+  `scripts/planner-flags.env` regenerated.
+- Tests: `outer_over_derived_test.go` deleted wholesale (every test pinned
+  the removed function); the firewall-only pins in
+  `semiantichain_test.go`, `joinsearch_c04c_trace_test.go`,
+  `joinsearch_rightlink_test.go`, and the M0142 probe's consumer-#3 arm
+  removed; admission, SJI, right-link and CTE-leaf pins kept.
+- Stale comments rewritten where they described the firewall as live
+  (`joinsearchseam.go`, `jointreepullup.go`, `cardinality.go`,
+  `seam_leaf_admission_test.go`, `pullup_cte_leaf_test.go`,
+  `in_unnest_sjinfo_test.go`, `joinsearchspine_test.go`). Notably
+  `GOOPG_PULLUP_CTE_LEAF` now stands alone — its pairing requirement died
+  with the firewall.
+
+## Default-arm gate record
+
+| gate | result |
+|---|---|
+| `go test ./internal/optimizer` | PASS |
+| `RALPH_PRECOMMIT_SCOPE=units` | PASS |
+| `tpch-spotcheck` | PASS (Q12=2, Q13=33; stamp shows `retired(M0145-0018)`) |
+| SF0.25 sweep | PASS 96/96, MISMATCH=0, TIMEOUT=0 |
+| SF0.25 plan channel | changed=2 — exactly Q77 and Q78 |
+| seam census | `outer-over-derived` 3 -> 0 (both arms) |
+| TPC-H acceptance arm | PASS, 24/24 value MATCH vs `tmp/m0122-0015-arm.txt` |
+| SF1 Q77/Q78 spot-check | Q77 5.76 s, Q78 29.01 s, values identical |
+| fire-set gate (M0145-0021a) | PASS — all fires PASS both arms on both corpora, `introduced=none` |
+
+## What the post-removal plan actually did
+
+The waived regression did not even recur. The E1 waiver covered Q77's
+`rows=1` Append branch electing `Nested Loop Left Join (0.00..0.06)` with
+`s_store_sk = s_store_sk` demoted to a Join Filter. On the executed tree the
+same branch plans `Hash Left Join (cost=0.39..0.78 rows=12)`: the pulled
+CTE leaves now reach the DP carrying `EstimateRows`-derived cardinalities
+(rows=12/rows=60) instead of the `rows=1` epsilon, and with honest inputs
+the hash join wins outright — the degenerate NL election the owner waived
+no longer occurs. Q78 at SF1 keeps `Hash Left Join
+(cost=16457.31..37717.11)`, zero `Nested Loop` nodes anywhere in the plan,
+and finishes in its ~29 s class.
+
+## Incident note (gate infrastructure, not product)
+
+The first fire-set run wedged: the sf025 clone took ~11 min to bind its
+listener (memory pressure from a concurrently-starting SF1 server),
+tripping `jointree-parity-capture.sh`'s 120 s readiness loop; cleanup's
+`goopg stop` ran before `postmaster.pid` existed and its `wait` then
+blocked forever on the healthy server. Killed and re-ran with the
+competing server down — clean PASS. Worth knowing: the capture's readiness
+timeout assumes a fast clone start, and its cleanup can wedge on a
+slow-starter.
