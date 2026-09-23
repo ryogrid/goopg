@@ -2217,6 +2217,28 @@ heuristic stays live.)
     or socket in a fixed `tmp/` path, and host resource exhaustion partway
     through a ~19-minute stage.
 
+### Nightly run 20260924-005446 (1 item) — filed 2026-09-24
+- [ ] **tpcds/stage** — nightly TPC-DS stage failed at startup: server not
+  ready in 120 s
+  (AI-20260924-005446-001; repro: `bash ci/batch/stages/stage-tpcds.sh`,
+  evidence `ci/logs/20260924-005446/tpcds/`).
+  Kind: impl
+  Parent: none
+  - Triage 2026\-09\-24 \(ralph2 loop \#34\): the goroutine dump shows
+    startup blocked in WAL initialisation \(`xlog.NewWriter` →
+    `detectWritePos` → `scanLastSegmentEnd` → `os.ReadFile` of a 16 MB
+    segment\), which is I/O\-bound. The window 01:42–01:45 overlaps the
+    loop\'s own `FORCE=1` SF0.25 sweep and fire\-set gate, which copy
+    multi\-GB clones, so host disk contention is the likely cause.
+    - Next: re\-run the repro on a quiet host. If it passes, close as stale
+      \(induced by the concurrent forced gates\). If it still hangs, look at
+      `scanLastSegmentEnd` reading whole segments at startup.
+    - Loop lesson: do not run FORCE=1 disk\-heavy gates while the nightly
+      batch runs; it can fail the nightly\'s own stages.
+    - The same run\'s TPC\-H stage was `skip\(port\-busy\)`, most likely a
+      collision with the loop\'s own spotcheck/acceptance\-arm servers at the
+      same time.
+
 ### Manually discovered (not yet in a nightly `ci/logs/action-items.md` run) — filed 2026-09-15
 
 - [x] **`CREATE FUNCTION` completes with command tag `OK`, not `CREATE
@@ -6671,7 +6693,7 @@ spill route is net-negative.
       - Held back to S2b\-4d: the HashAggregate label \(it would cost Q41\'s
         floor match\), PG\'s DISTINCT candidate order, and a presorted arm.
     Movement: none
-  - [ ] **M0141-S2b-4b — the distinct election over the flattened Append**:
+  - [x] **M0141-S2b-4b — the distinct election over the flattened Append**:
     hashed \(AGG\_HASHED\) vs sorted \(Sort → Unique\), `dNumGroups` = input
     rows, plus Gather variants, elected by `addPath`. Witness Q49 \(PG
     elects Sort → Unique\). Depends on S2b\-4a.
@@ -6679,6 +6701,16 @@ spill route is net-negative.
       Remaining: PG\'s Gather variants \(`gpath`\) and the parallel costing
       that makes goopg put Q49\'s Append under a Gather where PG keeps it
       serial.
+    - **LANDED 2026\-09\-24 \(ralph2 loop \#34\), `f311b4b1a`.** Cause: the
+      folded chain inherited the nested scope\'s mixed parallel\-Append arm
+      \(an appendrel rule\). `SetOp.UnionDistinctInput` gives it the pure\-only
+      rule of `generate_union_paths`. Q49 → `Unique → Sort → Append\(3\)`,
+      PG\'s shape node for node; qual\-placement 28 → 27; floor held.
+      - Gates \(after the nightly finished\): units, regress union \+
+        select\_distinct, spotcheck, sf025, acceptance arm, fire\-set — PASS.
+      - Ledgered: PG elects the distinct candidates over both `apath` and
+        `gpath`; goopg elects the chain\'s input first.
+    Movement: none
     Kind: impl
     Parent: M0141-S2b-4
   - [ ] **M0141-S2b-4c — Merge Append → Unique when every child is sorted

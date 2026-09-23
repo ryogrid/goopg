@@ -1,6 +1,6 @@
 # M0141-S2b-4 — UNION (distinct) planning: decomposition against PG 18.3
 
-Status: S2b-4a landed 2026-09-24 (`ded1b8db3`); S2b-4b (Gather variants),
+Status: S2b-4a (`ded1b8db3`) and S2b-4b (`f311b4b1a`) landed 2026-09-24;
 4c and 4d open. Task: `.ralph/fix_plan.md` M0141-S2b-4.
 
 ## Witnesses (TPC-DS SF0.25, current tree)
@@ -114,3 +114,23 @@ band.
 All three need the same prerequisite: carrying the DISTINCT rel's
 candidates to the ordered rel, as PG's upper-rel pathlists do. With that in
 place, Q41 can match honestly with the correct label.
+
+## S2b-4b landed (2026-09-24, `f311b4b1a`)
+
+Q49's Append ran under a Gather because S2b-4a's folded UNION ALL chain went
+through `createSetOpPaths`, and Q49's union sits in a FROM subquery, where
+`ParallelStatementOK` is false. There `addPartialSetOpPath` files the MIXED
+parallel-Append arm, which it reserves for appendrels, and the Sort-topped,
+non-partial branches were claimed whole. PG plans a distinct UNION's input
+in `generate_union_paths` at any depth, and that files only the PURE arm
+(every child partial).
+
+`SetOp.UnionDistinctInput` marks the chain links, and `addPartialSetOpPath`
+applies the top-level (pure-only) rule to them. Q49 now plans `Unique →
+Sort → Append(3)`, PG's shape node for node. Q75's children are partial,
+so its pure-arm Gather stays; its remaining gap is S2b-4c.
+
+Not ported (ledgered): PG offers each distinct candidate over both the
+serial Append (`apath`) and the Gather (`gpath`) and elects among all four.
+goopg's chain elects serial vs Gather first and builds the distinct
+candidates over that one input.
