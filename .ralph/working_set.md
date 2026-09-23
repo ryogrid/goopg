@@ -1,32 +1,31 @@
 Task: M0145-0029 — one-relation index-path coverage (flip-triage group I).
-Landed: slices 1, 2a, 2b (ea8fb4fce), 3, 4; slice 5 re-run; index_update_stats.
+Landed: slices 1, 2a, 2b, 3, 4; slice 5 re-run; index_update_stats;
+planner toggles + eqsel isunique (8a8f1c11f).
 Open: SAOP-prefix + range (TestSAOPWithConjunctMoves); owner multiplier call.
 
-Files (this loop): IndexScan.RangePrefix (plan.go); executor
-operators_index.go lookupRangeBounds; producer pathindexrestrict.go
-restrictionRangeOnColumn; lowering createplanindex.go createRangeIndexScanPlan;
-consumers: operators_explain.go formatIndexCond, operators_storage.go
-indexScanPredicate, unnest.go (walkPlanExprs, clonePlanReplacingOuter),
-walk_export.go, subplan_lower_walk.go, subquery_parallel.go,
-considerparallel.go, cardinality.go, planner.go (rebaseNLIProbeKeys,
-tryPromoteIndexOnlyScan refuses), nl_index_join.go (indexOnlyNLIInner refuses);
-pathbitmap.go matchBitmapIndexQuals gapless.
+Files (this loop): internal/postmaster/dispatch.go (plannerSettingsFrom reads
+enable_seqscan/indexscan/bitmapscan/sort), internal/optimizer/joinsearch.go
+(prebuiltLeafDisabledNodes), selectivity.go (uniqueColumnTuples,
+uniqueEqSelectivity), planner.go (seqWinsEqualityProbe synthetic scan carries
+index uniqueness); tests unique_eqsel_test.go, plan_cache_cost_gucs_test.go.
 
-Findings: live flip server vs PG 18.3 — SELECT/count/subquery/UPDATE/DELETE
-through prefix+range all identical. Before the IOS-promotion guard a
-subquery-wrapped count returned 9476 rows for PG's 2. Separate latent
-jointree-arm panic (gapped bitmap clause list) fixed. Session enable_* GUCs
-looked ignored by the one-rel search on the live flip server (disabled=0 on
-every path after SET enable_seqscan/bitmapscan = off) — NOT yet investigated;
-verify and file before the flip.
-Also open: filed wrong-results bug (composite prefix probes skip
-trailing-NULL rows) in fix_plan beside the command-tag sweep bugs.
+Findings:
+- The four toggles were never read into PlannerSettings, so the search
+  ignored SET enable_* on both pipelines. Fixed.
+- 292b1af2e (CREATE INDEX size recording) had REGRESSED the pass-required
+  TestPort_IsolationMultipleRowVersions (1M-row PK point UPDATE seq-scanned
+  because the key was priced at 1/200). Fixed via eqsel isunique; bisected.
+  LESSON: run the TestPort_Isolation family for any change that alters
+  table statistics or selectivity, not just the regress suite.
+- TestPort_IsolationEvalPlanQual is intermittent at HEAD too (1/3 passed
+  there) — the nightly item AI-20260922-004850-001.
 
-Next step: verify the enable_* observation (flip binary, SET enable_seqscan
-= off, trace DPPATH disabled counts; compare legacy arm) and file it; then
-SAOP-prefix + range, or the owner's multiplier answer.
+Next step: per banner, M0145-0029 SAOP-prefix + range (an IN list followed by
+a range on the next index column; needs a SAOP probe with a trailing bound in
+the executor); or the owner's multiplier answer if given.
 
 Gates run: units, tpch-spotcheck (Q12=2 Q13=33), tpcds-sf025 (PASS=96,
-same=99), acceptance arm (identical), tpcds-fireset (25 fires, knob plans
-byte-identical), TestPort_RegressSuite — all PASS.
+same=99), acceptance arm (identical), tpcds-fireset (knob plans identical),
+TestPort_RegressSuite, TestPort_Isolation family (only the pre-existing
+EvalPlanQual flake fails) — PASS.
 In-flight: none.

@@ -324,3 +324,40 @@ Still open:
 - keeping the bound out of the Filter (PG has no recheck);
 - index-only scans with a `RangePrefix`.
 
+## Follow-up: planner toggles, eqsel `isunique`, and a regression (`8a8f1c11f`)
+
+**Scan and sort toggles never reached the search.** B-17a/B-17d made the scan
+producers count `enable_seqscan` / `enable_indexscan` / `enable_bitmapscan` /
+`enable_sort` onto `Path.DisabledNodes`, as PG 18 does. But
+`plannerSettingsFrom` (`internal/postmaster/dispatch.go`) never read those four
+GUCs. `SET enable_seqscan = off` reached only the rule-based scan choice
+(through the catalog's `DisableSeqScan`), and every searched path was priced as
+enabled; the trace showed `disabled=0` on every path on both pipelines. They
+are now read; they were already part of the plan-cache fingerprint. The
+search's base-relation entry, the "prebuilt" leaf path, also never counted its
+scan's toggle (the sibling of `generateScanPaths`' count). It now counts it by
+the scan the leaf carries (`prebuiltLeafDisabledNodes`). With
+`enable_seqscan = off`, a two-table join's outer side now switches from Seq
+Scan to `Index Scan using pr_ab`, as in PG. The default pipeline's
+single-table scopes still use the rule-based choice until the flip.
+
+**eqsel `isunique`** (`./postgres/src/backend/utils/adt/selfuncs.c:338`):
+`col = <non-column>` on the sole column of a non-partial unique index is
+`1/reltuples` whatever the statistics. goopg priced a never-ANALYZEd primary
+key at 1/200. Both restriction-selectivity twins now apply it
+(`uniqueEqSelectivity`, from the scan's stamped `UniqueKeys`), and so does the
+legacy probe check (`seqWinsEqualityProbe`'s synthetic scan carries its index's
+uniqueness). Column-to-column equalities are left to the join estimator
+(`eqjoinsel`).
+
+**The regression this fixed.** `292b1af2e` (CREATE INDEX publishing the heap
+size) made `TestPort_IsolationMultipleRowVersions`, which is pass-required,
+fail deterministically. The table's 1M rows were now known while the key was
+still priced at 1/200 (5,000 rows), so `UPDATE t … WHERE id = 1000000`
+seq-scanned in about 240 ms, which the harness reports as `<waiting>`. I
+missed it because the isolation family was not run for that commit. Bisected
+with worktrees: it passes at `292b1af2e~1`, fails at `292b1af2e` and at the
+previous HEAD, and passes with `8a8f1c11f`. `TestUniqueColumnEqualityUsesIsUnique`
+pins it. `TestPort_IsolationEvalPlanQual` fails intermittently at the previous
+HEAD too (1 of 3 runs passed) and is already filed by the nightly.
+

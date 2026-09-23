@@ -18369,6 +18369,19 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
       through prefix\+range predicates all identical.
     - Remaining for group I: SAOP\-prefix \+ range
       \(`TestSAOPWithConjunctMoves`\); the owner's multiplier call.
+  - **Planner toggles \+ eqsel isunique 2026\-09\-23 \(ralph2 loop \#19\),
+    `8a8f1c11f`.**
+    - `enable_seqscan/indexscan/bitmapscan/sort` were never read into
+      PlannerSettings: the search priced every path as enabled on both
+      pipelines. Now read; the prebuilt leaf path counts its scan's toggle.
+    - eqsel `isunique`: `col = const` on a unique key is 1/reltuples
+      \(was 1/200 without stats\).
+    - **Regression fixed:** `292b1af2e` \(CREATE INDEX size recording\)
+      broke the pass\-required `TestPort_IsolationMultipleRowVersions`
+      \(1M\-row PK point UPDATE seq\-scanned\). I had not run the isolation
+      family for that commit. Bisected and fixed here.
+    - `TestPort_IsolationEvalPlanQual` is intermittent at HEAD as well
+      \(already filed by the nightly\).
 - [ ] **M0145-0030 — group B: adjudicate the 11 behavioural flip-triage
   tests before the flip** (same filing). The flip-triage doc lists 11
   behavioural failures: grouping strategy, nested scalar subquery, NLI
