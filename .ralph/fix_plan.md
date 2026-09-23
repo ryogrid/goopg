@@ -2359,6 +2359,15 @@ heuristic stays live.)
     Movement: none
   - Take one per loop; each is small and independently testable.
 
+- [ ] **pg\_get\_indexdef prints a Go struct for a COLLATE expression in a
+  partial\-index predicate** \(found 2026\-09\-24 in the upstream create\_index
+  diff\): `... WHERE (c1::text > &{105 0x2d861162a1e0 C})` where PG prints
+  `(c1)::text > 'A'::text COLLATE "C"`. The deparser formats a
+  collate/constant node with `%v`; the pointer also makes the regress diff
+  nondeterministic.
+  Kind: bug
+  Parent: none
+
 - [ ] **work\_mem boots at 512MB; PostgreSQL\'s default is 4MB** \(found
   2026\-09\-24 by the DISCARD ALL probe: `RESET ALL` returns each server to
   its own default\). `internal/utils/misc/defaults.go` registers work\_mem with
@@ -2471,6 +2480,22 @@ heuristic stays live.)
         stop disabled; regress on a capable cluster identical to HEAD.
       - Gates: units, spotcheck, sf025 \(changed=0\), acceptance arm.
       Movement: none
+  - [x] **WRONG RESULTS: range scans over DESC index columns** \(found and
+    fixed 2026\-09\-24, ralph2 loop \#45, `63d720bd2`, while preparing S3\).
+    The tuple\-format comparator honours DESC, but the range scan used the
+    ascending ends: on \(a DESC\), `a > 97` returned 2910 of 3000 rows \(want
+    60\) and BETWEEN returned none — in every cluster.
+    - Fix: value bounds become index\-order bounds \(`rangeColumnReversed`
+      swaps ends and strictness\) in the index and index\-only range scans;
+      the NULL stop works in index order, so DESC columns get it; a SAOP
+      probe leaves DESC second\-column bounds to its Filter recheck.
+    - `TestDescIndexRangeScans`: 11 shapes vs the no\-index answer, capability
+      off and on; 16 checks fail with the swap disabled.
+    - Resolves the ledger row "DESC key columns get no NULL stop / range
+      producers ignore DESC" \(2026\-09\-24\).
+    Kind: bug
+    Parent: none
+    Movement: none
   - [ ] **store\-null\-keys S3 — relax the planner guard** for tuple\-format
     indexes in flagged clusters \(move the format predicate where the
     optimizer can import it\). Design §Slices 3. After S1 and S2.

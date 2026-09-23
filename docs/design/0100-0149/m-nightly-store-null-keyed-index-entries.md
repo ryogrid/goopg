@@ -122,6 +122,16 @@ As designed, with these specifics:
     the stop disabled.
   - Upstream regress on a capable cluster is identical to HEAD.
 
-Not covered (ledgered): DESC key columns get no NULL stop; a cluster can
-only gain the capability at initdb (no upgrade path); removing the marker
-from a capable cluster would leave its NULL entries unguarded.
+Not covered (ledgered): a cluster can only gain the capability at initdb
+(no upgrade path); removing the marker from a capable cluster would leave
+its NULL entries unguarded.
+
+## DESC columns (2026-09-24, `63d720bd2`)
+
+Preparing S3 surfaced a wrong-results defect independent of NULLs. The
+tuple comparator honours DESC, but range scans used the ascending ends: on
+`(a DESC)`, `a > 97` returned 2910 of 3000 rows. Range bounds are now built
+as value bounds and converted to index-order bounds (`rangeColumnReversed`
+swaps the ends and their strictness). The NULL stop works in index order,
+where NULLS FIRST is DESC's default, so DESC columns get it too. The earlier
+"DESC key columns get no NULL stop" gap is closed.
