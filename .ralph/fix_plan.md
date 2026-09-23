@@ -15882,6 +15882,31 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
       - **Both named cutover prerequisites are now discharged.** What
         remains before flipping the default is the cutover's own
         corpus-gate re-run, not a known defect.
+  - **Executor\-capability sub\-inventory PRODUCED 2026\-09\-23 \(ralph2
+    loop \#2\) — the unexecutable set is EMPTY; one new readiness finding.**
+    Design doc: `docs/design/0100-0149/m0145-0008-executor-capability-inventory.md`.
+    - Named members, classified from code: \(1\) Parallel Hash over a
+      partial inner — never generated \(`joinpathsparallel.go` never reads
+      `inner.PartialPathlist`\); \(2\) row\-emitting Partial aggregate —
+      never generated \(`addPartialAggSplitArm` builds Gather only\);
+      \(3\) partial NLI — generated and executable; \(4\)
+      `appendrelMember` Q17\-class body — timing gap, not capability.
+      \(1\)\-\(2\) are parity floors with their filed homes, not cutover
+      blockers.
+    - Corpus execution on the knob arm: TPC\-DS fire set 25/25 PASS at
+      SF0.25 and at SF1 \(M0145\-0018 run; no `internal/`/`cmd/` change
+      since\); TPC\-H full acceptance arm 24/24 value\-identical to the
+      default baseline \(`tmp/m0145-0008-inv-acceptance-knob.txt`\).
+    - **NEW: Q20 is 29x slower on the knob arm** \(0.13 s → 3.80 s\),
+      hidden inside the 1.06x total that this record carried as "no known
+      defect". The knob arm decorrelates the correlated scalar subquery
+      nested inside the `IN` body into a whole\-lineitem HashAggregate;
+      PG and the default arm keep the SubPlan. Filed **M0145\-0027**;
+      it should land before the flip.
+    - TPC\-H capture reads `match=2/22` on BOTH arms at `PGSHAPED=1`
+      \(floor 3, inside the ±3 band, arm\-independent\) — for
+      M0145\-0025's re\-baseline.
+    - Movement: none \(measurement\).
 - [x] **M0145-0009 — CTE-output statistics (B-06 resume): wire the landed
   synthesis into the estimator** (filed 2026-09-21 by owner directive;
   carries TODO_ALL B-06 / ledger `take3-B-06-deferred`). Three of this
@@ -17688,3 +17713,26 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
   \(`GOOPG_HASHKEY_PROBE=1`, `verdict=DIFFLEN` lines\). Recon only.
   Kind: recon
   Parent: M0145-0007
+- [ ] **M0145-0027 — knob-arm TPC-H Q20 decorrelates a correlated scalar
+  subquery PG keeps as a SubPlan** \(filed 2026-09-23 by the M0145-0008
+  executor-capability inventory\). Full 22-query acceptance arm, same
+  binary: Q20 0.13 s default → **3.80 s** knob \(29x\), values identical.
+  Plan capture: PG 18.3 and the default arm keep `ps_availqty > \(SubPlan
+  1\)` with an index probe on `lineitem_part_supp_fkidx`; the knob arm
+  builds `HashAggregate \(l_partkey, l_suppkey\)` over a full lineitem
+  seq scan joined back to partsupp. PG never converts `EXPR_SUBLINK`
+  \(`./postgres/src/backend/optimizer/prep/prepjointree.c:652`\), so the
+  knob arm is unfaithful. Same outcome class as Q17, but the Q17 fix
+  \(`planner.go` `planIsBareSeqScanTree` gate, M0145-0008\) does not
+  reach it — here the scalar sublink sits inside an `IN` body the knob
+  arm pulls up. Step 1: instrument where the scalar body is planned and
+  what `canUnnestSubquery`'s probe-cheap guard sees on each arm \(Q17's
+  method, design doc `m0145-0008-cutover-readiness-timing-ab.md`\); step
+  2: fix on the knob route only. Expected movement: Q20's knob plan
+  regains PG's SubPlan shape \(scan-type / aggregation-strategy
+  categories for Q20 in the knob-arm TPC-H capture\) and its time
+  returns to the default arm's; measured by
+  `scripts/jointree-parity-capture.sh tpch` at `PGSHAPED=1` plus the
+  full knob acceptance arm. Blocks the M0145-0008 flip.
+  Kind: impl
+  Parent: M0145-0008

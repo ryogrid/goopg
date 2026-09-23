@@ -1,33 +1,29 @@
-# Working Set — ralph2 loop #1 end-state
+# Working Set — ralph2 loop #2 end-state
 
-Task: M0145-0007 slice 5 (`fillJoinHashKeys` fold) → adjudicated by
-measurement; M0145-0007 CLOSED `[x]` (docs/bookkeeping, no product code).
+Task: M0145-0008 (cutover) — prerequisite executor-capability sub-inventory
+PRODUCED (docs/bookkeeping, no product code). 0008 stays `[ ]`.
 
 Files:
-- `docs/design/0100-0149/m0145-0007-single-path-node-lowering.md` — Status
-  CLOSED, slice table row 5, new section "Slice 5 RE-ADJUDICATED".
-- `docs/design/0100-0149/m0145-0007-hashkeyprobe.patch` — the throwaway probe
-  (`git apply`, `GOOPG_HASHKEY_PROBE=1`, HASHKEYPROBE stderr lines).
-- `docs/design/README.md` — m0145-0007 row → CLOSED.
-- `.ralph/fix_plan.md` — 0007 `[x]` + slice-5 bullet; new `[ ]` M0145-0026.
-- `.ralph/deferral_ledger.md` — row: late pass alive for non-lowering joins.
+- `docs/design/0100-0149/m0145-0008-executor-capability-inventory.md` (new).
+- `docs/design/README.md` — new row `m0145-0008-inv`.
+- `.ralph/fix_plan.md` — 0008 inventory bullet; new `[ ]` M0145-0027 (impl).
+- `.ralph/deferral_ledger.md` — Q20 decorrelation row.
 
-Key symbols: `fillJoinHashKeys`/`fillOneJoinHashKeys` (join_hash_keys.go),
-`createHashJoinPlan`/`createMergeJoinPlan` (createplanjoin.go, already set
-HashKeys), non-lowering builders unnest.go (SEMI :3739-ish, INNER :2777-ish),
-planner.go FULL merge (~:4347), pushdown.go CROSS→hash promotion.
+Findings: unexecutable set EMPTY (members 1-2 never generated = parity floors;
+3 executable; 4 timing-only). Knob TPC-H acceptance 24/24 values identical
+(`tmp/m0145-0008-inv-acceptance-knob.txt`); TPC-DS fireset 25/25 both scales
+(`tmp/fireset-m0145-0018/`). NEW: Q20 29x on knob arm (scalar sublink inside
+pulled IN body decorrelated; PG keeps SubPlan) → M0145-0027, blocks flip.
+Captures: `tmp/hkp-out/inv0008d*.plans.txt` (default) vs
+`tmp/hkp-out/hkpk1*.plans.txt` (knob), both PGSHAPED=1, parallel.
+NOTE: the knob acceptance run overwrote `tmp/gate-stamps/tpch-acceptance-arm.json`
+with a KNOB-arm PASS — re-run the default arm before any code commit (G8).
 
-Findings: 0 structural key drift on 670 lowering-built joins; 5 Q78 ANTI
-joins carry a duplicate pair in the PATH key list (→ M0145-0026); late pass
-still needed for 33/51 (SF0.25 knob/default) + 6 (TPC-H) non-lowering joins.
-TRAP: `jointree-parity-capture.sh tpch` defaults PGSHAPED=0 — pass PGSHAPED=1.
+Next step: M0145-0027 — instrument Q20's scalar body planning on both arms
+(which route plans it; body shape seen by `canUnnestSubquery`'s
+`innerPlanIsIndexProbeCheap`), then arm-local fix + full gates.
 
-Next step: re-read the banner. Item-3 chain after 0007 → M0145-0008
-(cutover; check its prerequisite text now that 0007 is `[x]`), then 0010,
-0024, 0025, new 0026 (recon).
-
-Gates run: none needed for product code (probe reverted; `go build
-./internal/optimizer` clean on the reverted tree). Pre-commit pgbench hook
-on commit.
+Gates run: knob-arm acceptance (evidence only), TPC-H parity captures both
+arms; pre-commit pgbench on commit.
 
 In-flight: none.
