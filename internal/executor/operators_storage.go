@@ -8226,6 +8226,18 @@ func encodeIndexKeyFromCols(ctx *Context, idx *catalog.Index, cols []catalog.Col
 // pointers INTO cols, parallel to vals and to the descriptor attributes
 // buildPGIndexKeyDesc derives from the same idx.Columns order.
 func indexRowKeyValues(idx *catalog.Index, cols []catalog.Column, row Row, cat ...catalog.Catalog) ([]*catalog.Column, []Datum, bool) {
+	return indexRowKeyValuesOpt(idx, cols, row, false, cat...)
+}
+
+// indexRowKeyValuesKeepNull is indexRowKeyValues for an index ENTRY in a
+// cluster with null_keyed_index_entries: a NULL key value is kept (the entry
+// is filed with it, as PG's index_form_tuple does) instead of meaning "no
+// entry". Probes must keep using indexRowKeyValues — NULL never matches.
+func indexRowKeyValuesKeepNull(idx *catalog.Index, cols []catalog.Column, row Row, cat ...catalog.Catalog) ([]*catalog.Column, []Datum, bool) {
+	return indexRowKeyValuesOpt(idx, cols, row, true, cat...)
+}
+
+func indexRowKeyValuesOpt(idx *catalog.Index, cols []catalog.Column, row Row, keepNull bool, cat ...catalog.Catalog) ([]*catalog.Column, []Datum, bool) {
 	var im *catalog.InMemory
 	if len(cat) > 0 && cat[0] != nil {
 		im, _ = cat[0].(*catalog.InMemory)
@@ -8247,7 +8259,12 @@ func indexRowKeyValues(idx *catalog.Index, cols []catalog.Column, row Row, cat .
 		}
 		v := row[colOrd]
 		if v.IsNull() {
-			return nil, nil, false // NULLs don't participate in unique constraints
+			if !keepNull {
+				return nil, nil, false // NULLs don't participate in unique constraints
+			}
+			keyCols = append(keyCols, col)
+			vals = append(vals, v)
+			continue
 		}
 		// For enum columns: convert KindString labels to KindEnum (sort order)
 		// so encoding matches the btree probe path. M0097-0022.

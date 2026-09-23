@@ -194,7 +194,35 @@ func SampleFiles() []FileSpec {
 		{Path: "pg_hba.conf", Build: defaultPgHBAConf, Mode: 0o600},
 		{Path: "pg_ident.conf", Build: defaultPgIdentConf, Mode: 0o600},
 		{Path: "global/pg_filenode.map", Build: defaultRelMapFile, Mode: 0o600},
+		{Path: goopgFeaturesFile, Build: defaultGoopgFeatures, Mode: 0o600},
 	}
+}
+
+// goopgFeaturesFile is the goopg-private per-cluster capability marker: one
+// capability name per line, written by the initdb that created the cluster.
+// PostgreSQL ignores unknown files under global/. A cluster created before a
+// capability existed has no line for it, and open leaves the capability off
+// (catalog.NullKeyedIndexEntries is the first one).
+const goopgFeaturesFile = "global/pg_goopg_features"
+
+func defaultGoopgFeatures() []byte {
+	return []byte(catalog.NullKeyedIndexEntriesFeature + "\n")
+}
+
+// readGoopgFeatures returns the capability names in dataDir's marker file,
+// or none when the file is absent (a cluster older than the marker).
+func readGoopgFeatures(dataDir string) map[string]bool {
+	out := map[string]bool{}
+	raw, err := os.ReadFile(filepath.Join(dataDir, goopgFeaturesFile))
+	if err != nil {
+		return out
+	}
+	for _, line := range strings.Split(string(raw), "\n") {
+		if line = strings.TrimSpace(line); line != "" {
+			out[line] = true
+		}
+	}
+	return out
 }
 
 // Options controls goopg init.

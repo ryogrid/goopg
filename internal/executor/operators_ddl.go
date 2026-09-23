@@ -14896,6 +14896,11 @@ func (o *ddlOp) collectBTreeEntries(idx *catalog.Index, tbl *catalog.Table, cols
 	// (NULLs collide). Lazily allocated; nil for every default index so non-NND
 	// builds are byte-for-byte unchanged.
 	var seenNull map[string]struct{}
+	// nullEntries are the NULL-keyed entries of a tuple-format index in a
+	// cluster with null_keyed_index_entries: filed, but kept out of the
+	// duplicate walk below (BulkCreate sorts its input, so they are simply
+	// appended afterwards).
+	var nullEntries []nbtree.BulkEntry
 	var scanRow Row // M0054-0005c: reusable decode buffer (see comment below).
 	// M0074-0004 / M0107-0001: per-page mctx for varchar / char / text payloads.
 	// Reset on page advance; Release on return.
@@ -14990,10 +14995,14 @@ func (o *ddlOp) collectBTreeEntries(idx *catalog.Index, tbl *catalog.Table, cols
 				return nil, encErr
 			}
 			if hasNullKey {
-				// A NULL value key column: not storable in the byte-key btree
-				// (no null bitmap), matching the runtime maintain path. For a
-				// default (NULLS DISTINCT) index multiple NULLs are allowed, so
-				// skip. For a NULLS NOT DISTINCT unique index NULLs collide, so
+				// A NULL value key column. Without an image (blob format, or a
+				// cluster without null_keyed_index_entries) the row has no
+				// entry, matching the runtime maintain path; with one (a
+				// tuple-format index in a capable cluster) it is filed below,
+				// outside the duplicate walk — NULL never equals NULL for
+				// uniqueness, but two NULL images compare equal in index order.
+				// For a default (NULLS DISTINCT) index multiple NULLs are
+				// allowed. For a NULLS NOT DISTINCT unique index NULLs collide, so
 				// dedup null-bearing rows among themselves and raise 23505 on a
 				// duplicate NULL pattern (PG rejects building such an index over
 				// pre-existing duplicate-NULL data). Design 0119-0004 sub (b).
@@ -15017,6 +15026,9 @@ func (o *ddlOp) collectBTreeEntries(idx *catalog.Index, tbl *catalog.Table, cols
 							Detail:  btreeBuildKeyDescription(idx, cols, row, true) + " is duplicated."}
 					}
 					seenNull[string(ndk)] = struct{}{}
+				}
+				if key != nil {
+					nullEntries = append(nullEntries, nbtree.BulkEntry{Key: append([]byte(nil), key...), Ptr: storage.ItemPointer{Block: blk, Offset: i}})
 				}
 				continue
 			}
@@ -15083,7 +15095,7 @@ func (o *ddlOp) collectBTreeEntries(idx *catalog.Index, tbl *catalog.Table, cols
 				Detail:  entries[di].KeyDesc + " is duplicated."}
 		}
 	}
-	return entries, nil
+	return append(entries, nullEntries...), nil
 }
 
 // `sortBulkEntriesByKey` (M0055-0006 Phase E, sort by `string(key)`) and

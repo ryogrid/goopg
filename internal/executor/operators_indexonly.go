@@ -22,6 +22,10 @@ import (
 // For pages not yet marked ALL_VISIBLE it falls back to a full heap fetch
 // so MVCC visibility is always respected.
 type indexOnlyScanOp struct {
+	// nullStopLo / nullStopHi: see indexScanOp — an open range end replaced by
+	// an exclusive NULL pivot. Reset by every lookupRangeBounds.
+	nullStopLo, nullStopHi bool
+
 	plan *optimizer.IndexOnlyScan
 	ctx  *Context
 	rows []Row
@@ -420,7 +424,7 @@ func (o *indexOnlyScanOp) Rescan(outerSlot SlotView, outerWidth int) error {
 	// identical — RangeScan is rangeScanPos with both ends inclusive. The two
 	// bool flags carry the bound strictness (M0134-0001 S4 class 8); they are
 	// false for every producer that leaves LowOp/HighOp at OpUnknown.
-	if err := tree.RangeScanWithPosLeafFilter(loBytes, hiBytes, o.plan.LowOp == parser.OpGt, o.plan.HighOp == parser.OpLt, leafFilter, scanPosFn); err != nil {
+	if err := tree.RangeScanWithPosLeafFilter(loBytes, hiBytes, o.plan.LowOp == parser.OpGt || o.nullStopLo, o.plan.HighOp == parser.OpLt || o.nullStopHi, leafFilter, scanPosFn); err != nil {
 		return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: err.Error()}
 	}
 
@@ -1121,6 +1125,23 @@ func (o *indexOnlyScanOp) lookupRangeBounds() (lo, hi []byte, ok bool, err error
 			return nil, nil, false, encE
 		}
 		hi = k
+	}
+	// Same open-end NULL stop as the index scan (nullStopRangeBound), and
+	// only for a one-sided range: a bound-less index-only scan is a full scan
+	// and keeps every entry.
+	o.nullStopLo, o.nullStopHi = false, false
+	if (o.plan.LowKey == nil) != (o.plan.HighKey == nil) {
+		k, atHigh, stop, nerr := o.ctx.nullStopRangeBound(o.plan.Index, nil, col, 0)
+		if nerr != nil {
+			return nil, nil, false, nerr
+		}
+		if stop {
+			if atHigh && o.plan.HighKey == nil {
+				hi, o.nullStopHi = k, true
+			} else if !atHigh && o.plan.LowKey == nil {
+				lo, o.nullStopLo = k, true
+			}
+		}
 	}
 	return lo, hi, true, nil
 }

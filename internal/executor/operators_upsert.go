@@ -1011,6 +1011,17 @@ func (o *upsertOp) applyInsert(rel storage.RelFileNode, tbl *catalog.Table, cols
 		if xid := o.ctx.Tx.XID; xid != storage.InvalidTransactionID {
 			globalSpecReg.RegisterSpec(xid, o.ctx.backendPID())
 		}
+	} else if o.plan.OnConflict != nil && o.plan.OnConflict.ArbiterIndex != nil &&
+		catalog.NullKeyedIndexEntries() && o.ctx.pgIndexKeyDesc(o.plan.OnConflict.ArbiterIndex) != nil {
+		// No Phase-B key: a NULL conflict-key column, which never conflicts,
+		// so there was nothing to probe. The row still gets its arbiter entry
+		// in a cluster with null_keyed_index_entries, as PG files every heap
+		// row in every index (the maintenance below skips the arbiter).
+		k, err := o.ctx.arbiterEntryKey(o.plan.OnConflict, o.plan.Table, insertedParent, ptr, o.plan.Pos())
+		if err != nil {
+			return storage.ItemPointer{}, err
+		}
+		_ = o.maintainArbiter(k, ptr)
 	}
 	// Maintain all non-arbiter indexes. The arbiter was already handled above;
 	// skipping it here prevents double-insertion and expression re-evaluation.
@@ -1184,8 +1195,9 @@ func (o *upsertOp) onConflictUpdateTouchesKeyColumn() bool {
 }
 
 // maintainArbiter inserts a precomputed (conflict-key → ptr) entry into the
-// arbiter index. NULL keys (any conflict-key column is null) are skipped —
-// upstream's IS NULL doesn't participate in unique-constraint equality.
+// arbiter index. A nil key means no entry: a NULL conflict-key column in the
+// blob format or in a cluster without null_keyed_index_entries (with the
+// capability the entry key carries the NULLs and is filed).
 func (o *upsertOp) maintainArbiter(key []byte, ptr storage.ItemPointer) error {
 	if o.arbiterTree == nil {
 		return nil

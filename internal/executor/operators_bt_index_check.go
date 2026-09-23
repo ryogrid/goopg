@@ -533,10 +533,13 @@ func btIndexHeapAllIndexed(x *optimizer.FuncCall, slot SlotView, ctx *Context, i
 		if kerr != nil {
 			return nbtree.LeafEntry{}, false, kerr
 		}
-		// hasNullKey: goopg stores no NULL-keyed entries (the build skips them).
-		// key == nil: an all-expression index whose eval produced nothing — the
-		// build skips those rows too; probing an empty key would false-positive.
-		if hasNullKey || key == nil {
+		// key == nil: no entry was filed for this row — a NULL-keyed row where
+		// the cluster lacks null_keyed_index_entries (or the blob format), or
+		// an all-expression index whose eval produced nothing; the build skips
+		// both, and probing an empty key would false-positive. With the
+		// capability a NULL-keyed row carries its full image and is expected.
+		_ = hasNullKey
+		if key == nil {
 			return nbtree.LeafEntry{}, false, nil
 		}
 		return nbtree.LeafEntry{Key: key, TID: etid}, true, nil

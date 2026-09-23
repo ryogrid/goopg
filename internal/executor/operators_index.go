@@ -234,6 +234,12 @@ func (o *indexScanOp) flushKills() {
 }
 
 type indexScanOp struct {
+	// nullStopLo / nullStopHi: lookupRangeBounds replaced an open end of the
+	// range with a NULL pivot (nullStopRangeBound), which must be EXCLUSIVE —
+	// the scan stops at (or skips) the NULL-keyed group whatever the plan's
+	// own bound operators say. Reset on every lookup.
+	nullStopLo, nullStopHi bool
+
 	plan *optimizer.IndexScan
 	ctx  *Context
 	// enumTypes[i] is non-nil when Table.Columns[i] is a user-defined enum,
@@ -661,7 +667,7 @@ func (o *indexScanOp) Rescan(outerSlot SlotView, outerWidth int) error {
 	if o.pidx != nil {
 		leafFilter = o.ownsLeaf
 	}
-	cur, err := o.tree.NewScanCursor(loBytes, hiBytes, o.plan.LowOp == parser.OpGt, o.plan.HighOp == parser.OpLt, leafFilter)
+	cur, err := o.tree.NewScanCursor(loBytes, hiBytes, o.plan.LowOp == parser.OpGt || o.nullStopLo, o.plan.HighOp == parser.OpLt || o.nullStopHi, leafFilter)
 	if err != nil {
 		return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: err.Error()}
 	}
@@ -1284,6 +1290,7 @@ func (o *indexScanOp) lookupRangeBounds() (loKey []byte, hiKey []byte, ok bool, 
 			Message: fmt.Sprintf("indexScanOp.lookupRangeBounds: range prefix of %d keys leaves no column to bound on index %q", np, o.plan.Index.Name),
 		}
 	}
+	o.nullStopLo, o.nullStopHi = false, false
 	prefix := make([]indexProbeKeyPart, 0, np+1)
 	for i, ke := range o.plan.RangePrefix {
 		pcol, pfound := o.ctx.Catalog.LookupColumn(o.plan.Table, o.plan.Index.Columns[i])
@@ -1364,6 +1371,23 @@ func (o *indexScanOp) lookupRangeBounds() (loKey []byte, hiKey []byte, ok bool, 
 			return nil, nil, false, encErr
 		}
 		hiKey = o.ctx.compositeUpperBound(o.plan.Index, k)
+	}
+
+	// An open end must not run into the NULL-keyed entries a capable cluster
+	// stores: `a > 5` excludes NULL, but NULLS LAST files every NULL after 5.
+	// Only when the column carries exactly ONE bound: with none this is a
+	// full scan or an equality-prefix probe, and both must keep the NULL
+	// entries (`a = 10` on (a, b) includes (10, NULL)).
+	if (o.plan.LowKey == nil) != (o.plan.HighKey == nil) {
+		if k, atHigh, stop, err := o.ctx.nullStopRangeBound(o.plan.Index, prefix, col, np); err != nil {
+			return nil, nil, false, err
+		} else if stop {
+			if atHigh && o.plan.HighKey == nil {
+				hiKey, o.nullStopHi = k, true
+			} else if !atHigh && o.plan.LowKey == nil {
+				loKey, o.nullStopLo = k, true
+			}
+		}
 	}
 
 	// ok = true as long as at least one bound is specified (the scan is valid)

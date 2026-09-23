@@ -280,6 +280,11 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		return nil, errors.New("goopg: -D <data-directory> is required")
 	}
 	abs, err := filepath.Abs(opts.DataDir)
+	if err == nil {
+		// Cluster capabilities (global/pg_goopg_features): set before any
+		// index is read or written.
+		catalog.SetNullKeyedIndexEntries(readGoopgFeatures(abs)[catalog.NullKeyedIndexEntriesFeature])
+	}
 	if err != nil {
 		return nil, fmt.Errorf("goopg: resolve %q: %w", opts.DataDir, err)
 	}
