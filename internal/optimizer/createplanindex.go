@@ -537,9 +537,30 @@ func createRangeIndexScanPlan(p *Path, id *scanIdentity, rewrap scanLeafRewrap) 
 		PrivilegeCheckRoleSet: id.privilegeCheckRoleSet,
 	}
 	drop := map[Expr]bool{}
-	for i, c := range p.IndexClauses {
-		if c.indexCol != 0 || c.key == nil {
-			panic(fmt.Sprintf("createPlan: range clause %d of %s is not a bound on the leading column", i, p.IndexInfo.Name))
+	// Slice 2b: equality clauses first (index columns 0..n-1, in order) form
+	// RangePrefix; every bound then sits on column n.
+	var prefix []Expr
+	for _, c := range p.IndexClauses {
+		if c.op != parser.OpUnknown {
+			break
+		}
+		if c.indexCol != len(prefix) || c.key == nil || len(c.saop) > 0 {
+			panic(fmt.Sprintf("createPlan: range PathIndexScan on %s has a malformed equality prefix", p.IndexInfo.Name))
+		}
+		prefix = append(prefix, c.key)
+		if c.local != nil {
+			drop[c.local] = true
+		}
+	}
+	if len(prefix) > 0 {
+		is.RangePrefix = prefix
+	}
+	for i, c := range p.IndexClauses[len(prefix):] {
+		if c.indexCol != len(prefix) || c.key == nil {
+			panic(fmt.Sprintf("createPlan: range clause %d of %s does not bound index column %d", i, p.IndexInfo.Name, len(prefix)))
+		}
+		if len(prefix) > 0 && c.local != nil {
+			panic(fmt.Sprintf("createPlan: range clause %d of %s behind an equality prefix must stay a Filter recheck", i, p.IndexInfo.Name))
 		}
 		switch c.op {
 		case parser.OpGt, parser.OpGe:

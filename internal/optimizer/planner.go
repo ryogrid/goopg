@@ -3848,6 +3848,10 @@ func rebaseNLIProbeKeys(inner Node, outerMap []int, seen map[*ColumnRef]bool) {
 		for _, e := range in.SAOPKeys {
 			rebaseExprRefsSeen(e, outerMap, seen)
 		}
+		// M0145-0029 slice 2b: a range probe's equality prefix.
+		for _, e := range in.RangePrefix {
+			rebaseExprRefsSeen(e, outerMap, seen)
+		}
 		rebaseExprRefsSeen(in.LowKey, outerMap, seen)
 		rebaseExprRefsSeen(in.HighKey, outerMap, seen)
 	case *IndexOnlyScan:
@@ -17389,6 +17393,12 @@ func tryPromoteIndexOnlyScan(proj *Project) Node {
 	// a Filter above re-checks, and there is none (the probe consumed the
 	// qual). Declining forgoes the optimisation for this shape, safe.
 	if len(idxScan.SAOPKeys) > 0 {
+		return proj
+	}
+	// M0145-0029 slice 2b: likewise a RangePrefix probe. IndexOnlyScan has no
+	// RangePrefix, so copying LowKey/HighKey would re-aim the bound at the
+	// LEADING column and return wrong rows (measured: 9476 rows for PG's 2).
+	if len(idxScan.RangePrefix) > 0 {
 		return proj
 	}
 	// M0134-0001 S4 (class 8): an EXCLUSIVE bound used to block promotion,

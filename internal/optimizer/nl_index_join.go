@@ -1551,6 +1551,11 @@ func indexOnlyNLIInner(inner *IndexScan, residual Expr, outerWidth int) *IndexOn
 	if inner.LowOp == parser.OpGt || inner.HighOp == parser.OpLt {
 		return nil
 	}
+	// M0145-0029 slice 2b: IndexOnlyScan carries no RangePrefix; copying the
+	// bounds alone would re-aim them at the leading column (wrong rows).
+	if len(inner.RangePrefix) > 0 || len(inner.SAOPKeys) > 0 {
+		return nil
+	}
 	if residual != nil {
 		safe := true
 		walkColumnRefs(residual, func(i int) {

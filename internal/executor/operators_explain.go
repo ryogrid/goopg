@@ -1627,6 +1627,31 @@ func formatIndexCond(p *optimizer.IndexScan, reg *subPlanReg) string {
 		}
 		return wrapParen(p.Index.Columns[0] + " = ANY (" + strings.Join(parts, ", ") + ")")
 	}
+	// M0145-0029 slice 2b: an equality prefix followed by bounds on the next
+	// column — PG's `Index Cond: ((a = 7) AND (b > 90))`, rendered in goopg's
+	// multi-clause style.
+	if np := len(p.RangePrefix); np > 0 && np < len(p.Index.Columns) {
+		parts := make([]string, 0, np+2)
+		for i, k := range p.RangePrefix {
+			parts = append(parts, p.Index.Columns[i]+" = "+formatIndexCondKey(k, reg))
+		}
+		col := p.Index.Columns[np]
+		if p.LowKey != nil {
+			op := ">="
+			if p.LowOp == parser.OpGt {
+				op = ">"
+			}
+			parts = append(parts, col+" "+op+" "+formatIndexCondKey(p.LowKey, reg))
+		}
+		if p.HighKey != nil {
+			op := "<="
+			if p.HighOp == parser.OpLt {
+				op = "<"
+			}
+			parts = append(parts, col+" "+op+" "+formatIndexCondKey(p.HighKey, reg))
+		}
+		return wrapParen(strings.Join(parts, " AND "))
+	}
 	return formatIndexCondParts(p.Index, p.Keys, p.Key, p.LowKey, p.HighKey, p.LowOp, p.HighOp, reg)
 }
 

@@ -1141,6 +1141,10 @@ func walkPlanExprs(node Node, visit func(Expr)) {
 		if n.HighKey != nil {
 			walkExprTree(n.HighKey, visit)
 		}
+		// M0145-0029 slice 2b: the equality prefix of a range probe.
+		for _, k := range n.RangePrefix {
+			walkExprTree(k, visit)
+		}
 		// R33 (K44): the residual filter can host sublinks (a sublink
 		// in an indexqual-adjacent predicate); NodeSubplans already
 		// enumerates it (walk_export.go), and an unvisited Cond hides
@@ -1724,6 +1728,12 @@ func clonePlanReplacingOuter(node Node, replace map[*OuterColumnRef]*ColumnRef) 
 			if n.HighKey != nil {
 				c.HighKey = cloneExprReplacingOuter(n.HighKey, replace)
 			}
+			if len(n.RangePrefix) > 0 {
+				c.RangePrefix = make([]Expr, len(n.RangePrefix))
+				for i, k := range n.RangePrefix {
+					c.RangePrefix[i] = cloneExprReplacingOuter(k, replace)
+				}
+			}
 			return &c, nil
 		}
 		seq := &SeqScan{
@@ -1769,14 +1779,31 @@ func clonePlanReplacingOuter(node Node, replace map[*OuterColumnRef]*ColumnRef) 
 				conds = append(conds, &BinaryOp{pos: n.pos, Op: parser.OpEq, Left: col, Right: cloneExprReplacingOuter(k, replace)})
 			}
 		}
+		// M0145-0029 slice 2b: a RangePrefix probe's equalities, with its
+		// bounds on the column after the prefix; strict bounds keep their
+		// strictness (LowOp/HighOp).
+		for i, k := range n.RangePrefix {
+			if col := indexColRef(i); col != nil {
+				conds = append(conds, &BinaryOp{pos: n.pos, Op: parser.OpEq, Left: col, Right: cloneExprReplacingOuter(k, replace)})
+			}
+		}
+		boundCol := len(n.RangePrefix)
 		if n.LowKey != nil {
-			if col := indexColRef(0); col != nil {
-				conds = append(conds, &BinaryOp{pos: n.pos, Op: parser.OpGe, Left: col, Right: cloneExprReplacingOuter(n.LowKey, replace)})
+			if col := indexColRef(boundCol); col != nil {
+				op := parser.OpGe
+				if n.LowOp == parser.OpGt {
+					op = parser.OpGt
+				}
+				conds = append(conds, &BinaryOp{pos: n.pos, Op: op, Left: col, Right: cloneExprReplacingOuter(n.LowKey, replace)})
 			}
 		}
 		if n.HighKey != nil {
-			if col := indexColRef(0); col != nil {
-				conds = append(conds, &BinaryOp{pos: n.pos, Op: parser.OpLe, Left: col, Right: cloneExprReplacingOuter(n.HighKey, replace)})
+			if col := indexColRef(boundCol); col != nil {
+				op := parser.OpLe
+				if n.HighOp == parser.OpLt {
+					op = parser.OpLt
+				}
+				conds = append(conds, &BinaryOp{pos: n.pos, Op: op, Left: col, Right: cloneExprReplacingOuter(n.HighKey, replace)})
 			}
 		}
 		if len(conds) > 0 {

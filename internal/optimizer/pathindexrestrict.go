@@ -131,10 +131,19 @@ func restrictionEqualityPrefix(cat catalog.Catalog, tbl *catalog.Table, idx *cat
 // so there the conjunct stays in the Filter as a recheck; the clause is still
 // an index qual for costing.
 func restrictionLeadingRange(cat catalog.Catalog, tbl *catalog.Table, idx *catalog.Index, conjuncts []Expr) []indexPathClause {
-	if len(idx.Columns) == 0 {
+	return restrictionRangeOnColumn(cat, tbl, idx, 0, conjuncts)
+}
+
+// restrictionRangeOnColumn is restrictionLeadingRange for index column `pos`:
+// pos 0 is the leading-column range; pos > 0 follows an equality prefix
+// (slice 2b). Behind a prefix the bounds NEVER record `local`: the conjunct
+// stays in the Filter as a recheck, because an open-ended bound runs to the
+// prefix's padded upper bound, past entries whose bounded column is NULL.
+func restrictionRangeOnColumn(cat catalog.Catalog, tbl *catalog.Table, idx *catalog.Index, pos int, conjuncts []Expr) []indexPathClause {
+	if pos < 0 || pos >= len(idx.Columns) {
 		return nil
 	}
-	lead := idx.Columns[0]
+	lead := idx.Columns[pos]
 	var lo, hi *indexPathClause
 	for _, conj := range conjuncts {
 		bin, ok := conj.(*BinaryOp)
@@ -160,8 +169,8 @@ func restrictionLeadingRange(cat catalog.Catalog, tbl *catalog.Table, idx *catal
 		if colOnRight {
 			op = swapInequalityOp(op)
 		}
-		c := &indexPathClause{indexCol: 0, key: val, op: op}
-		if len(idx.Columns) == 1 {
+		c := &indexPathClause{indexCol: pos, key: val, op: op}
+		if pos == 0 && len(idx.Columns) == 1 {
 			c.local = conj
 		}
 		switch op {
@@ -311,6 +320,16 @@ func (s *searchCtx) addOneRestrictionIndexPath(cat catalog.Catalog, rel *RelOptI
 	}
 	clauses := restrictionEqualityPrefix(cat, tbl, idx, conjuncts)
 	isRange := false
+	// Slice 2b: an equality prefix that stops short of the last index column
+	// may be followed by range bounds on the NEXT column (PG binds `b > 5`
+	// behind `a = 1` on `(a, b)`). The eq clauses become IndexScan.RangePrefix.
+	prefixRange := false
+	if n := len(clauses); n > 0 && n < len(idx.Columns) {
+		if rng := restrictionRangeOnColumn(cat, tbl, idx, n, conjuncts); len(rng) > 0 {
+			clauses = append(clauses, rng...)
+			prefixRange = true
+		}
+	}
 	isSAOP := false
 	if len(clauses) == 0 {
 		clauses = restrictionLeadingSAOP(cat, tbl, idx, conjuncts)
@@ -342,6 +361,17 @@ func (s *searchCtx) addOneRestrictionIndexPath(cat catalog.Catalog, rel *RelOptI
 		numSAScans = float64(len(clauses[0].saop))
 	case isRange:
 		sel = rangeIndexSelectivity(rel.baseLeaf, conjuncts, clauses)
+	case prefixRange:
+		var eq, rng []indexPathClause
+		for _, c := range clauses {
+			if c.op == parser.OpUnknown {
+				eq = append(eq, c)
+			} else {
+				rng = append(rng, c)
+			}
+		}
+		sel, _ = restrictionIndexSelectivity(tbl, idx, eq, relTuples)
+		sel = clampSelectivity(sel * rangeIndexSelectivity(rel.baseLeaf, conjuncts, rng))
 	default:
 		sel, unique = restrictionIndexSelectivity(tbl, idx, clauses, relTuples)
 	}

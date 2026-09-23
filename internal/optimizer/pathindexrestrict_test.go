@@ -285,3 +285,70 @@ func TestRestrictionSAOPIndexScanOnJointreePipeline(t *testing.T) {
 		}
 	}
 }
+
+// Slice 2b: behind an equality prefix, range bounds on the NEXT index column
+// become IndexScan.RangePrefix + LowKey/HighKey (PG's
+// `Index Cond: ((i_item_sk = 2) AND (i_flag > 5))`). The prefix equality is
+// dropped from the Filter; the bound stays there as a recheck (an open bound
+// runs to the prefix's padded upper bound, past NULLs in the bounded column).
+func TestRestrictionPrefixRangeIndexScanOnJointreePipeline(t *testing.T) {
+	prev := jointreePipeline
+	jointreePipeline = true
+	t.Cleanup(func() { jointreePipeline = prev })
+
+	c := catalog.NewInMemory()
+	tbl, err := c.CreateTable(parser.ObjectName{Name: "pr"}, []catalog.Column{
+		{Name: "a", Type: catalog.Type{Name: "int4"}},
+		{Name: "b", Type: catalog.Type{Name: "int4"}},
+		{Name: "c", Type: catalog.Type{Name: "int4"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.CreateIndex(parser.ObjectName{Name: "pr_ab"}, tbl, []string{"a", "b"}, false, "btree", false); err != nil {
+		t.Fatal(err)
+	}
+	tbl.Stats = &catalog.TableStats{RowCount: 100000, Pages: 10000, Analyzed: true}
+
+	node, err := Plan(parseOne(t, "SELECT c FROM pr WHERE a = 7 AND b > 90"), c)
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+	scan := findIndexScan(node)
+	if scan == nil {
+		t.Fatal("want an IndexScan on pr_ab")
+	}
+	if len(scan.RangePrefix) != 1 || scan.LowKey == nil || scan.LowOp != parser.OpGt || scan.HighKey != nil ||
+		scan.Key != nil || len(scan.Keys) != 0 {
+		t.Fatalf("want RangePrefix=[7] + LowKey > 90, got prefix=%d lo=%v/%v hi=%v key=%v keys=%d",
+			len(scan.RangePrefix), scan.LowKey, scan.LowOp, scan.HighKey, scan.Key, len(scan.Keys))
+	}
+	f := findFilterOver(node, scan)
+	if f == nil {
+		t.Fatal("the range bound must stay as a Filter recheck")
+	}
+	if bin, ok := f.Predicate.(*BinaryOp); !ok || bin.Op != parser.OpGt {
+		t.Fatalf("want the Filter to be exactly b > 90 (the prefix equality dropped), got %T", f.Predicate)
+	}
+}
+
+// matchBitmapIndexQuals binds a GAPLESS leading prefix only: an equality on
+// the second column with the first unbound is not an index qual (it used to
+// produce a clause list that createBitmapIndexScanPlan panicked on).
+func TestMatchBitmapIndexQualsIsGapless(t *testing.T) {
+	cat := saopFixture(t)
+	tbl, ok := cat.LookupTable(parser.ObjectName{Name: "item"})
+	if !ok {
+		t.Fatal("item missing")
+	}
+	var composite *catalog.Index
+	for _, idx := range cat.IndexesOnTable(tbl) {
+		if idx.Name == "idx_item_sk_flag" {
+			composite = idx
+		}
+	}
+	eqFlag := &BinaryOp{Op: parser.OpEq, Left: &ColumnRef{Index: 2, Name: "i_flag"}, Right: &IntegerConst{Value: 7}}
+	if got, _ := matchBitmapIndexQuals(composite, tbl, []Expr{eqFlag}, &scanIdentity{}); len(got) != 0 {
+		t.Fatalf("i_flag = 7 alone binds no prefix of (i_item_sk, i_flag); got %d clauses", len(got))
+	}
+}

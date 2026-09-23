@@ -842,6 +842,15 @@ type IndexScan struct {
 	SAOPKeys []Expr
 	LowKey  Expr // inclusive lower bound for range scan; nil = no lower bound
 	HighKey Expr // inclusive upper bound for range scan; nil = no upper bound
+	// RangePrefix, when non-empty, is an EQUALITY prefix for index columns
+	// [0, len(RangePrefix)) and moves LowKey/HighKey onto column
+	// len(RangePrefix) — PG's `a = 1 AND b > 5` probe on `(a, b)`
+	// (build_index_paths binds a range behind an equality prefix). Only ever
+	// set together with LowKey and/or HighKey, never with Key/Keys/SAOPKeys;
+	// the one producer (restriction paths, M0145-0029 slice 2b) keeps the
+	// range conjunct as a Filter recheck. A consumer that reinterprets
+	// LowKey/HighKey as leading-column bounds must refuse a node with it set.
+	RangePrefix []Expr
 	// LowOp / HighOp preserve the ORIGINAL comparison operator in its canonical
 	// col-op-key form (see tryRangeIndexScan / flipRangeOp) for the low/high
 	// bound. The zero value (OpUnknown) means INCLUSIVE — the historical

@@ -49,7 +49,15 @@ func EstimateRows(n Node) int64 {
 	case *IndexScan:
 		// Equality probe → 1 row per call site; a bound-less scan reads the
 		// whole relation (M0127-P5.9-h, see indexScanRows).
-		return indexScanRows(x.Table, x.Index, x.Key, x.Keys, x.LowKey, x.HighKey)
+		// A RangePrefix probe (M0145-0029 slice 2b): its prefix is charged as
+		// equalities on the leading columns and its bounds as inequalities —
+		// the same accounting as Keys plus a trailing range. Keys and
+		// RangePrefix never coexist.
+		keys := x.Keys
+		if len(keys) == 0 {
+			keys = x.RangePrefix
+		}
+		return indexScanRows(x.Table, x.Index, x.Key, keys, x.LowKey, x.HighKey)
 	case *IndexOnlyScan:
 		// Same two shapes as *IndexScan, and the full-range one is REACHABLE
 		// without the join search: planner.go's sort-avoidance rewrite builds
@@ -1848,7 +1856,7 @@ func indexProbeHasOuterRef(is *IndexScan) bool {
 	// Sibling `exprHasOuterRef` (narrowoutput.go) — same-scope outer-level
 	// detection, subplans stepped over; unenumerated shapes decline (true),
 	// which here means declining per-probe evidence, the PG-faithful side.
-	return exprHasOuterRef(is.Key) || exprHasOuterRefList(is.Keys)
+	return exprHasOuterRef(is.Key) || exprHasOuterRefList(is.Keys) || exprHasOuterRefList(is.RangePrefix)
 }
 
 func relFilteredRowsWalk(n, rel Node) (rows float64, found, sealed bool) {

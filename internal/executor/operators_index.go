@@ -1203,13 +1203,48 @@ func (o *indexScanOp) lookupKey() ([]byte, bool, error) {
 // evaluates to NULL (the scan should produce no rows). Either loKey
 // or hiKey may be nil for an open-ended range.
 func (o *indexScanOp) lookupRangeBounds() (loKey []byte, hiKey []byte, ok bool, err error) {
-	col, found := o.ctx.Catalog.LookupColumn(o.plan.Table, o.plan.Index.Columns[0])
+	// M0145-0029 slice 2b: an equality prefix (RangePrefix) moves the bounds
+	// onto the column after it; each bound is then the prefix's parts plus the
+	// bound's own part. With no prefix this is the leading-column range scan,
+	// byte for byte as before.
+	np := len(o.plan.RangePrefix)
+	if np >= len(o.plan.Index.Columns) {
+		return nil, nil, false, &ExecError{
+			Code: "XX000", Pos: o.plan.Pos(),
+			Message: fmt.Sprintf("indexScanOp.lookupRangeBounds: range prefix of %d keys leaves no column to bound on index %q", np, o.plan.Index.Name),
+		}
+	}
+	prefix := make([]indexProbeKeyPart, 0, np+1)
+	for i, ke := range o.plan.RangePrefix {
+		pcol, pfound := o.ctx.Catalog.LookupColumn(o.plan.Table, o.plan.Index.Columns[i])
+		if !pfound {
+			return nil, nil, false, &ExecError{
+				Code: "XX000", Pos: o.plan.Pos(),
+				Message: fmt.Sprintf("indexed column %q not found on table %q", o.plan.Index.Columns[i], o.plan.Table.Name),
+			}
+		}
+		v, evalErr := evalExprSlot(ke, o.outerSlot, o.ctx)
+		if evalErr != nil {
+			return nil, nil, false, evalErr
+		}
+		if v.IsNull() {
+			// `col = NULL` matches nothing.
+			return nil, nil, false, nil
+		}
+		prefix = append(prefix, indexProbeKeyPart{col: pcol, val: v, pos: ke.Pos()})
+	}
+	col, found := o.ctx.Catalog.LookupColumn(o.plan.Table, o.plan.Index.Columns[np])
 	if !found {
 		return nil, nil, false, &ExecError{
 			Code:    "XX000",
 			Pos:     o.plan.Pos(),
-			Message: fmt.Sprintf("indexed column %q not found on table %q", o.plan.Index.Columns[0], o.plan.Table.Name),
+			Message: fmt.Sprintf("indexed column %q not found on table %q", o.plan.Index.Columns[np], o.plan.Table.Name),
 		}
+	}
+	withBound := func(part indexProbeKeyPart) []indexProbeKeyPart {
+		out := make([]indexProbeKeyPart, 0, np+1)
+		out = append(out, prefix...)
+		return append(out, part)
 	}
 
 	if o.plan.LowKey != nil {
@@ -1221,7 +1256,16 @@ func (o *indexScanOp) lookupRangeBounds() (loKey []byte, hiKey []byte, ok bool, 
 			// NULL lower bound → skip entire scan (no row can satisfy >= NULL)
 			return nil, nil, false, nil
 		}
-		k, encErr := o.ctx.indexProbeKey(o.plan.Index, []indexProbeKeyPart{{col: col, val: v, pos: o.plan.LowKey.Pos()}})
+		k, encErr := o.ctx.indexProbeKey(o.plan.Index, withBound(indexProbeKeyPart{col: col, val: v, pos: o.plan.LowKey.Pos()}))
+		if encErr != nil {
+			return nil, nil, false, encErr
+		}
+		loKey = k
+	} else if np > 0 {
+		// No lower bound on the range column: start at the first entry with
+		// the equality prefix — the same inclusive prefix key a Keys probe
+		// starts at.
+		k, encErr := o.ctx.indexProbeKey(o.plan.Index, prefix)
 		if encErr != nil {
 			return nil, nil, false, encErr
 		}
@@ -1237,11 +1281,19 @@ func (o *indexScanOp) lookupRangeBounds() (loKey []byte, hiKey []byte, ok bool, 
 			// NULL upper bound → skip entire scan (no row can satisfy <= NULL)
 			return nil, nil, false, nil
 		}
-		k, encErr := o.ctx.indexProbeKey(o.plan.Index, []indexProbeKeyPart{{col: col, val: v, pos: o.plan.HighKey.Pos()}})
+		k, encErr := o.ctx.indexProbeKey(o.plan.Index, withBound(indexProbeKeyPart{col: col, val: v, pos: o.plan.HighKey.Pos()}))
 		if encErr != nil {
 			return nil, nil, false, encErr
 		}
 		hiKey = k
+	} else if np > 0 {
+		// No upper bound on the range column: stop after the last entry with
+		// the equality prefix — the padded prefix bound a Keys probe uses.
+		k, encErr := o.ctx.indexProbeKey(o.plan.Index, prefix)
+		if encErr != nil {
+			return nil, nil, false, encErr
+		}
+		hiKey = o.ctx.compositeUpperBound(o.plan.Index, k)
 	}
 
 	// ok = true as long as at least one bound is specified (the scan is valid)

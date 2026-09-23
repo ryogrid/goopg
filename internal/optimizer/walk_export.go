@@ -166,6 +166,7 @@ func NodeSubplans(n Node) []Node {
 			exprs = append(exprs, t.Key)
 		}
 		exprs = append(exprs, t.Keys...)
+		exprs = append(exprs, t.RangePrefix...)
 		if t.LowKey != nil {
 			exprs = append(exprs, t.LowKey)
 		}

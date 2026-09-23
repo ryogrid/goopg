@@ -3647,8 +3647,29 @@ func indexScanPredicate(ix *optimizer.IndexScan) optimizer.Expr {
 		return &optimizer.InExpr{Operand: ref, List: keys}
 
 	case ix.LowKey != nil || ix.HighKey != nil:
-		col := ix.Index.Columns[0]
+		// M0145-0029 slice 2b: a RangePrefix probe is `Columns[i] =
+		// RangePrefix[i]` for the prefix, with the bounds on the column after
+		// it. The prefix equalities MUST be rebuilt here: the restriction path
+		// dropped them from the Filter above the scan, so a predicate without
+		// them would match (and update/delete) rows outside the probe.
+		np := len(ix.RangePrefix)
+		if np >= len(ix.Index.Columns) {
+			return nil
+		}
+		col := ix.Index.Columns[np]
 		var combined optimizer.Expr
+		for i, key := range ix.RangePrefix {
+			ref, ok := indexScanColumnRef(ix, ix.Index.Columns[i])
+			if !ok {
+				return nil
+			}
+			eq := &optimizer.BinaryOp{Op: parser.OpEq, Left: ref, Right: key}
+			if combined == nil {
+				combined = eq
+			} else {
+				combined = &optimizer.BinaryOp{Op: parser.OpAnd, Left: combined, Right: eq}
+			}
+		}
 		if ix.LowKey != nil {
 			ref, ok := indexScanColumnRef(ix, col)
 			if !ok {
@@ -3658,7 +3679,12 @@ func indexScanPredicate(ix *optimizer.IndexScan) optimizer.Expr {
 			if ix.LowOp == parser.OpGt {
 				op = parser.OpGt
 			}
-			combined = &optimizer.BinaryOp{Op: op, Left: ref, Right: ix.LowKey}
+			low := &optimizer.BinaryOp{Op: op, Left: ref, Right: ix.LowKey}
+			if combined == nil {
+				combined = low
+			} else {
+				combined = &optimizer.BinaryOp{Op: parser.OpAnd, Left: combined, Right: low}
+			}
 		}
 		if ix.HighKey != nil {
 			ref, ok := indexScanColumnRef(ix, col)

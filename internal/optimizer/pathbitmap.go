@@ -285,6 +285,16 @@ func matchBitmapIndexQuals(
 	var clauses []indexPathClause
 
 	for pos, colName := range idx.Columns {
+		// The bound columns must be a GAPLESS leading prefix: the probe binds
+		// Keys[i] to Index.Columns[i] positionally, and createBitmapIndexScanPlan
+		// panics on a list that skips a column ("claims index column 2"). An
+		// equality on a later column with an earlier one unbound is not an
+		// index qual here (PG 18 would use a btree skip scan, which goopg's
+		// probe cannot express — ledgered). M0145-0029: reached on the
+		// jointree arm, where single-relation scopes plan through the search.
+		if len(clauses) < pos {
+			break
+		}
 		for _, conj := range conjuncts {
 			bin, ok := conj.(*BinaryOp)
 			if !ok || bin.Op != parser.OpEq {
