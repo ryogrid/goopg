@@ -7230,7 +7230,7 @@ spill route is net-negative.
       fire\-set, isolation family — PASS. ea\-ratchet: 2 FIXED, 2 NEW \(owning
       task S2b\-17a\).
     Movement: none
-  - [ ] **M0141-S2b-17a — recon: the ea\-ratchet NEW class "PG\-faithful
+  - [x] **M0141-S2b-17a — recon: the ea\-ratchet NEW class "PG\-faithful
     estimate on a PG\-unmatched relset"** \(filed 2026\-09\-23 by S2b\-17\).
     Q16 and Q95\'s Hash Semi Joins became findings when their estimates
     moved to PG\'s \(Q95: 1 in both; Q16: 4 vs PG\'s ~5 on the equivalent
@@ -7241,6 +7241,20 @@ spill route is net-negative.
     divergence \(file the estimator task\).
     Kind: recon
     Parent: M0141-S2b-17
+    - **CLOSED 2026\-09\-24 \(ralph2 loop \#31\): both PG\-shared.** PG actuals
+      from a read\-only EXPLAIN with actuals on the TPC\-DS reference cluster;
+      design doc §S2b\-17a.
+      - Q95: goopg 1/22 \(qerr 22\); PG\'s nearest scope 1/22 \(22\), its semi
+        join 1/12 \(12\).
+      - Q16: goopg 4/145 \(36\); PG\'s nearest scope about 6/145 \(about 23\).
+        The PG\-relative bar would be 46, so it would pass.
+    - **OWNER QUESTION:** G4 forbids an UNMATCHED\-IN\-PG repin when the
+      change under review introduced the keys, and S2b\-17b did. Until an
+      owner call \(extend G4 to "introduced but shown PG\-shared", or keep
+      the two NEW keys as standing findings\), every `make ea\-ratchet` run
+      reports FAIL on Q16/Q95. Later loops must read that as known, not as a
+      regression of their own change.
+    Movement: none
   - [x] **M0141-S2b-7** — filed 2026-09-17 by M0141-S7's corpus measurement
     (design doc's "Update 2026-09-17h"). `electOrderedGrouping`
     (`upperorderedgrouping.go:236`) calls `addOrderedPaths` directly, once

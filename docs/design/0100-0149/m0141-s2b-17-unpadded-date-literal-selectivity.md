@@ -65,3 +65,28 @@ without the fix) and `TestNumericValueUnpaddedDate`.
 `date_in` accepts many more spellings (`May 1 2002`, `2002/5/1`, DateStyle
 orders, 2-digit years, BC). The planner parsers still take only the ISO dash
 form, so those literals still get no histogram estimate or fold.
+
+## M0141-S2b-17a — classifying the two NEW ea-ratchet findings (2026-09-24)
+
+PG's plan fixtures (`bench/tpcds/plans-pg`) are EXPLAIN-only, so PG's
+actuals came from a read-only `EXPLAIN (ANALYZE)` of each SELECT on the
+TPC-DS reference cluster (db `tpcds025`). Each goopg finding is compared
+with PG's nearest equivalent scope:
+
+| finding | goopg est / actual / qerr | PG nearest scope | PG est / actual / qerr |
+|---|---|---|---|
+| Q95 Hash Semi Join `{cte:ws_wh, ca, dd, ws, web_site}` | 1 / 22 / 22 | `Nested Loop {ws1, dd, ca, web_site}` | 1 / 22 / 22 |
+| | | its `Nested Loop Semi Join` over `ws_wh` | 1 / 12 / 12 |
+| Q16 Hash Semi Join `{call_center, cs, ca, dd}` | 4 / 145 / 36 | `Nested Loop {cs1, dd, ca}` (3 workers + leader) | about 6 total (2 per worker) / 145 / about 23 |
+
+**Both are PG-shared misestimates.** PG misses by the same order on the same
+inputs. Under the ratchet's own PG-relative bar (qerr > max(10, 2 x PG
+qerr)), Q16 would pass (36 < 46) and Q95 sits at PG's figure. They are
+findings only because the scorer cannot match their relation sets in PG's
+plans (`pg_est=null`) and falls back to the absolute bar.
+
+**Repin is not permitted as the rules stand.** AGENT.md G4 allows an
+UNMATCHED-IN-PG-only repin only when "the change under review introduced
+none of them", and M0141-S2b-17b introduced both. Until the owner decides,
+every `make ea-ratchet` run reports FAIL with these two NEW keys. Escalated
+(fix_plan, M0141-S2b-17a).
