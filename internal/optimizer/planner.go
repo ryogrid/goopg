@@ -2013,7 +2013,7 @@ func planSelectImpl(s *parser.SelectStmt, cat catalog.Catalog, plannerSet Planne
 					return nil, err
 				} else if ok {
 					node = idxNode
-				} else if flat, ok := flattenCorrelatedSeqScanFilters(node); ok {
+				} else if flat, ok := flattenStrandedSeqScanFilters(node); ok {
 					// M0145-0027: the producer above only reads a WHERE that
 					// is ONE equality (Q17's body). A multi-conjunct WHERE
 					// (TPC-H Q20's `l_partkey = ps_partkey AND l_suppkey =
@@ -11394,28 +11394,40 @@ func planIsBareSeqScanTree(n Node) bool {
 	return false
 }
 
-// flattenCorrelatedSeqScanFilters merges a chain of `*Filter` wrappers over a
+// flattenStrandedSeqScanFilters merges a chain of `*Filter` wrappers over a
 // single `*SeqScan` into ONE unsearched `Filter{SeqScan}`, but only when some
-// conjunct in the chain carries an `OuterColumnRef` (a correlated restriction).
+// conjunct in the chain is one the search refuses as a leaf qual
+// (`conjunctIsLocalEligible`: an `OuterColumnRef` or a sublink).
 //
 // It exists for the one-relation route that skips the rule-based bypass
-// (M0145-0027): there the search attaches the scope's constant quals to a
-// SEARCHED leaf Filter and holds the correlated ones above it, because
-// `conjunctIsLocalEligible` refuses outer references as leaf quals. The
-// resulting `Filter{corr}(Filter_searched{local}(SeqScan))` is invisible to
-// `rewriteScanInputsWithSingleTablePredicates`, the producer that turns a
-// correlated equality into an index probe on the bypass arm.
+// (M0145-0027, M0145-0008): there the search attaches the scope's plain quals
+// to a SEARCHED leaf Filter and holds the ineligible ones in a residual Filter
+// above it. PG has no such split — every one of these is a restriction clause
+// of the one base rel, evaluated in the scan's single qual list
+// (`./postgres/src/backend/optimizer/plan/createplan.c:5420`
+// `order_qual_clauses`). The split is not only cosmetic:
+//
+//   - a correlated equality above a searched leaf is invisible to
+//     `rewriteScanInputsWithSingleTablePredicates`, the producer that turns it
+//     into an index probe on the bypass arm (TPC-H Q20, M0145-0027);
+//   - a sublink conjunct above a searched leaf is charged per input row of
+//     the leaf instead of after the cheap quals, and EXPLAIN renders only
+//     one of the two Filters (TPC-DS Q41, the SF0.25 parity floor).
+//
+// Order: the merged list is sorted by source position — the WHERE's written
+// order, which is exactly the list the bypass arm builds. PG orders by
+// per-tuple cost (`order_qual_clauses`); goopg has no per-clause cost
+// evaluator, so the bypass order is the faithful baseline here (ledgered).
+// Conjuncts without a source position (derived clauses) keep their relative
+// order after the positioned ones.
 //
 // Coordinates: every Filter in the chain sits directly on the same SeqScan
 // with no Project between, so all their predicates already address the
 // SeqScan's own output — merging needs no rebase. Any other node in the chain
 // (a Project, a narrowed boundary, a second relation) declines, fail-closed,
-// as does a chain with no correlated conjunct: then the search's own
-// (seq-scan) election stands and nothing is overridden.
-//
-// Conjunct order is outer Filter first, then inward — the residual correlated
-// quals came first in the WHERE the search split.
-func flattenCorrelatedSeqScanFilters(n Node) (Node, bool) {
+// as does a chain with no ineligible conjunct: then the search's own
+// election stands and nothing is overridden.
+func flattenStrandedSeqScanFilters(n Node) (Node, bool) {
 	top, ok := n.(*Filter)
 	if !ok {
 		return nil, false
@@ -11438,9 +11450,23 @@ func flattenCorrelatedSeqScanFilters(n Node) (Node, bool) {
 		// Already the bypass shape; nothing is stranded.
 		return nil, false
 	}
-	if !exprHasOuterRefList(conjs) {
+	stranded := false
+	for _, c := range conjs {
+		if !conjunctIsLocalEligible(c) {
+			stranded = true
+			break
+		}
+	}
+	if !stranded {
 		return nil, false
 	}
+	sort.SliceStable(conjs, func(i, j int) bool {
+		pi, pj := conjs[i].Pos(), conjs[j].Pos()
+		if pi <= 0 || pj <= 0 {
+			return pi > 0 && pj <= 0
+		}
+		return pi < pj
+	})
 	return &Filter{pos: top.Pos(), Child: ss, Predicate: joinPlannerAnd(conjs)}, true
 }
 
