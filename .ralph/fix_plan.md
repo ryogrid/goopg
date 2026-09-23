@@ -37,7 +37,9 @@ the order written inside the item. `[!]` tasks are not selectable.
    bulk-triage) → **M0144-0011** (first vertical-slice campaign — gated on
    0002+0007 output). M0137-0019's parallel triage is subsumed in part by
    M0144-0002 (the census is the triage instrument); it stays filed for its
-   per-query write-up. **Children 0003a and 0003b stay `[!]`** — their wall
+   per-query write-up. **Children 0003a and 0003b are closed** (owner disposition 2026-09-23:
+   0003a superseded into M0146-0008, 0003b discharged by
+   M0145-0004/0004a) — their wall
    is the resolver-time lowering, fixed inside item 3's M0145-0003/0004.
 3. **M0145 jointree-first planner** (flow unification, owner decision
    2026-09-20 — fix the medium-level route divergence documented in
@@ -91,7 +93,11 @@ the order written inside the item. `[!]` tasks are not selectable.
    **M0145-0022** (shape/time regression channel) and
    **M0145-0023** (flow-convergence instrument) may run any time;
    rationale `tmp/progress-planner-rewrite-260922/01-progress-assessment.md`
-   (local, gitignored).
+   (local, gitignored). **After the M0145-0008 flip lands, this item's
+   continuation is M0146** (`docs/milestones/0146-post-cutover-plan-parity.md`,
+   task entries at the end of this file) — the executor-substrate /
+   election / statistics burn-down, sequenced by M0146-0001's
+   re-baseline census. Until the flip, no M0146 task is selectable.
 4. **M0141-S2a-fix2r** — re-apply the PG-faithful `hashAggEntrySize` change that
    was discarded for parity reasons (owner Q4: no reverts). Degradations it
    causes are filed as their own tasks, not reverted.
@@ -124,13 +130,35 @@ FROZEN-PREFIXES:
 (the M0142-0008 chain was UNFROZEN by owner decision 2026-09-20; see below —
 the empty prefix list is what makes them selectable again)
 
-LINEAGE-BASELINE: M0145-0001 M0145-0003 M0145-0006 M0145-0014 M0145-0015 M0145-0016 M0145-0017
+LINEAGE-BASELINE: M0145-0001 M0145-0003 M0145-0006 M0145-0014 M0145-0015 M0145-0016 M0145-0017 M0145-0004a M0145-0005 M0145-0007 M0145-0027 M0145-0028
 (owner re-pin 2026-09-22: the six completed M0145-0001 descendants listed
 above are pinned OUT of the S4 last-5 lineage-budget window — the count
 restarts from the re-open point. This is NOT a root exemption: every
 completion that lands from now on still accumulates toward a fresh budget.
 Chosen over exempting the root after M0145-0004's LINEAGE NOTE recorded that
 the guard cannot see the owner re-open.)
+(owner re-pin 2026-09-23, second: M0145-0004a/0005/0007/0027/0028 are added
+to the pin. Their `Movement: none` streak is an instrument artefact — every
+movement instrument measures the DEFAULT arm, which none of them touches;
+the M0145-0008 flip is the first descendant that can move an instrument.
+Blocking the lineage at the flip is the guard's blind spot, not a signal of
+inert work. Still not a root exemption: post-flip completions accumulate
+toward a fresh budget and the instruments DO see the default arm then.)
+
+LINEAGE-BASELINE: M0142-0005 M0142-0005b M0142-0005c M0142-0005d M0142-0005e M0142-0005f
+(owner pin 2026-09-23, delegated: required so M0146-0004 — the per-worker
+Memoize re-home — can carry `Parent: M0142-0005`. The five pinned
+descendants are the closed B8/`indexProbeCostMultiplier` recon chain; their
+Movement:none reflects that the chain's honest exit is a corpus action
+outside the loop's reach, not inert planner work. The Memoize resume
+measures on M0146-0001's post-flip baseline.)
+
+LINEAGE-BASELINE: M0144-0002 M0144-0011a-2 M0144-0011a-3 M0144-0011b M0144-0011b-1 M0144-0011c
+(owner pin 2026-09-23, delegated: required so M0146-0010 — the Materialize
+re-home — can carry `Parent: M0144-0011c`. The pinned five are the
+M0144-0011 campaign's Movement:none tail; the campaign's only movement
+(0011a) falls back inside the window, and the campaign itself is closed —
+superseded into M0146 — not restarted.)
 
 OWNER DECISIONS 2026-09-22 (progress-report review
 `tmp/progress-planner-rewrite-260922-2/01-progress-assessment.md`; details
@@ -149,6 +177,44 @@ in each task's entry):
 - New filings: **M0145-0004a** (whole-chain UNION ALL flattening, the
   lineage-refused residual), **M0145-0024**, **M0145-0025** (TPC-H
   parity baseline re-take on the pinned-seed lane).
+
+OWNER DECISIONS 2026-09-23 (progress-report review
+`/home/ryo/work/tmp/ef5e65e27094282ab28769901e05621c/01-progress-assessment-260923.md`,
+delegated scope M0137–M0145; details in each task's entry):
+- **M0145-0001 second lineage exhaustion: resolved — option (a).**
+  `LINEAGE-BASELINE` re-pinned (0004a/0005/0007/0027/0028 added); the
+  Movement:none streak is an instrument artefact (instruments measure
+  the default arm). GO on the flip's remaining blockers: groups I/B are
+  filed as **M0145-0029** (one-relation index-path coverage) and
+  **M0145-0030** (behavioural-triage adjudication) — both land BEFORE
+  the M0145-0008 flip commit; option (b) (pin tests to legacy and flip
+  over known gaps) is rejected — the group-I class is exactly the
+  route-borne bypass loss that regressed Q17/Q20.
+- **M0145-0010: CLOSED — premises refuted by measurement.** Option (c)
+  of its design doc: the substantive legality work (scope c/d, shared
+  jointype predicates) already landed; scope (b)'s consumer
+  (partitionwise joins) does not exist; scope (a)'s consumer is 2
+  lateral fires, ledgered with a post-cutover re-census trigger
+  (M0146-0011).
+- **M0140-0007: re-scoped (option a) → M0146-0002** (fidelity port:
+  build inside Gather, shared publication, barrier, error propagation).
+- **M0141-S7: HELD (option b)** — Incremental Sort stays parked until
+  the input-candidate divergence moves; resume = M0146-0006, sequenced
+  after M0146-0005.
+- **M0144-0003a / 0003b / 0011: CLOSED — superseded into M0146**
+  (0003a → M0146-0008, 0003b discharged by M0145-0004/0004a, 0011's
+  Materialize hypothesis → M0146-0010, Q8 join-order residue →
+  M0146-0005).
+- **M0137-0019a / M0142-0005: stay `[!]`** — parked on executor
+  capabilities that are now named M0146 members (row-emitting
+  PartialAgg = M0146-0003; per-worker Memoize = M0146-0004).
+- **M0145-0012 stays `[!]`** per the 2026-09-22 direction — unchanged;
+  M0145-0024 is its live recon.
+- **New milestone filed: M0146 — post-cutover plan parity**
+  (`docs/milestones/0146-post-cutover-plan-parity.md`), the
+  executor-substrate / election / statistics burn-down the M0145 flow
+  parity makes reachable. Its tasks are gated on the M0145-0008 flip
+  landing — do not select them before it.
 
 **UNFROZEN (owner decision 2026-09-20) — selectable again:** the M0142-0008
 chain (`M0142-0008a-3`, `M0142-0008c-1a`, `M0142-0008c-3d`,
@@ -4138,6 +4204,13 @@ before/after proving the defect it closes.
     partial inner (family A's floor) is **M0140-0007**. When S6 and
     0007 land, this task's premise is re-evaluated — measured on the
     canonical capture, not assumed.
+  - **OWNER DISPOSITION 2026-09-23 (delegated, scope M0137–M0145):**
+    stays `[!]` — its blocker is real and now scheduled. Row-emitting
+    PartialAgg runs as **M0146-0003** (which adopts the M0141-S3→S6
+    chain); the partial-inner `Parallel Hash` port runs as
+    **M0146-0002** (M0140-0007's re-scope). This task's re-evaluation
+    fires when both land — measured on the canonical capture per the
+    note above, not assumed.
 - [x] **M0137-0019b — file a partial path beneath `Nested Loop Semi Join`**
   (filed by M0137-0019's triage). TPC-H Q4 is the corpus's only fully
   SERIAL plan in parallel mode: goopg plans
@@ -5789,46 +5862,18 @@ setting that yields a serial plan.
     > that Q9/Q21/half\-Q10 are join\-order divergences. The executor
     > capability inventory \(`m0145-0008-executor-capability-inventory.md`,
     > member 1\) confirms the shape is never generated today.
-  - **CLOSED 2026-09-22 (loop \#78): the completion census is run and the
-    task's four ledger steps are all discharged.**
-    Movement: none — `CATEGORIES-EXCL-MATCH` unchanged on the default arm;
-    a recon, no production file touched.
-    Design: `docs/design/planner-b06-cte-stats/DESIGN.md`
-    §"Closing census (2026-09-22)".
-    - **The census answers the step's question, and the answer is that the
-      `*CTEScan` bucket is NOT a residual.** TPC-DS SF0.25 knob arm,
-      `GOOPG_NLI_CENSUS=1`, all 99 queries, both arms from this loop (same
-      recipe, same binary sha):
-      - `GOOPG_PULLUP_CTE_LEAF` **off** (default): `(pulled)` 27,
-        `any-body-leaf-(*optimizer.CTEScan)` 15, `SubqueryExpr@scalar` 15,
-        `ExistsExpr@or` 2, `InExpr@or` 1.
-      - `GOOPG_PULLUP_CTE_LEAF` **on**: `(pulled)` **42**, `*CTEScan`
-        **0**, the other three unchanged.
-      - 27 + 15 = 42 — the class converts ONE-FOR-ONE, with no partial
-        conversion and no other class moving. M0145-0013's admission
-        already addresses it in code; what is left is that arm's
-        promote-or-delete decision (C5), not more synthesis.
-    - The `@or` classes and `SubqueryExpr@scalar` are unchanged, as
-      M0145-0015 predicted — declines PG makes too
-      (`prepjointree.c:877` `/* Stop if not an AND */`; EXPR sublinks are
-      never jointree citizens).
-    - **The arm is not free**: 302 plan-diff lines between the two goopg
-      captures and `qual-placement` 28 -> 29 with `match` still 1. Inside
-      the ±3 noise band, so not a measured regression — but not "no plan
-      change" either. M0145-0013's decision should re-measure rather than
-      read that +1 off this run.
-    - **Measurement caveat, recorded as a rule**: M0145-0015's census
-      (nominally the same recipe) reported almost exactly DOUBLE every
-      figure across all five classes, proportions unchanged. Five
-      independent halvings are less likely than one capture-recipe
-      difference. Unresolved here; the consequence is that **absolute
-      census totals compare only within an identical capture recipe, and
-      the class PROPORTIONS are what carries across captures**. The
-      conclusion above rests on a within-capture A/B, so it holds either
-      way. Ledgered.
-    - Step 4 respected to the end: the `rows<=1` guard and the Q78
-      firewall were NOT touched by this task in any slice.
-
+    >
+    > **OWNER ANSWER 2026-09-23 \(delegated, scope M0137–M0145\): OPTION
+    > \(a\) — re-scope as a fidelity item, re-filed as M0146-0002.**
+    > Under the plan-parity goal "print PG's shape" IS the deliverable,
+    > but only when the execution model actually is PG's — so the task
+    > carries the genuinely-partial-inner port \(build inside the Gather,
+    > shared publication, build\-completion barrier, error propagation\)
+    > AND the label together, each pinned by per-shape parallel-vs-serial
+    > identity tests. The escalation's caveat stands and is copied into
+    > M0146-0002: Q9/Q21/half-Q10 are join-order divergences, not family-A
+    > members — they are M0146-0005's territory. This entry stays `[!]`
+    > as a pointer; the live work is M0146-0002.
   - **On completion — reconsider the blocked work (evaluate, do not
     auto-do):** re-run the family-A witnesses (Q3 Q9 Q10 Q14 Q16 Q18
     Q21) under the canonical parallel capture; M0137-0019a's family-A
@@ -7173,27 +7218,31 @@ spill route is net-negative.
   `aggPartialAccum`; reuses `combineAggRuntime`'s existing rules; leaves the
   hash-strategy accumulator path untouched. **Entry gate: needs S1/S2's live
   measurement to show a TPC-DS-specific, genuinely parallel-shaped residual
-  large enough to justify it.**
+  large enough to justify it.** **Adopted by M0146-0003 (owner disposition
+  2026-09-23): this chain runs under M0146, gated on the M0145-0008 flip —
+  do not select standalone before it.**
 - [ ] **M0141-S4 — `aggRuntime` serialize/deserialize** — PG's
   `aggserialfn`/`aggdeserialfn`, bounded to the decomposable whitelist's actual
   pointer surface (`numericSum`, `intSx`/`intSxx *big.Int`,
   `numericSx`/`numericSxx *big.Rat`, `userState`, the float/bool/count/sum
   scalars — `DISTINCT`/`WITHIN GROUP`/`array_agg`/`string_agg` are already
   refused by `AggregateIsDecomposable`). Needs S3 (defines the transport
-  shape).
+  shape). Runs under M0146-0003, gated on the M0145-0008 flip.
 - [ ] **M0141-S5 — GatherMerge-fed Finalize-Sorted** — a new merge-combine
   executor operator consuming the key-interleaved stream `GatherMerge`
   produces from S3/S4's rows, folding same-key runs across workers via
   `combineAggRuntime` before finalizing (today's Finalize path only handles
   "drain the Gather to EOF, read the whole accumulator", which is wrong for a
-  merge-ordered stream where a key can recur). Needs S3+S4.
+  merge-ordered stream where a key can recur). Needs S3+S4. Runs under
+  M0146-0003, gated on the M0145-0008 flip.
 - [ ] **M0141-S6 — wire and measure** — pick which of the two existing
   producers (`parallel.go`'s legacy pass, or `partialaggupper.go`'s costed-path
   version — note its own unresolved 7/22-vs-12/22 regression against the
   legacy pass, out of scope to fix here) hosts the new shape; fix the
   `Aggregate`/`GroupAggregate (N keys)` EXPLAIN mislabel (doc
   `parallel-query/06` §4.1 — both currently render as a hash aggregate
-  regardless of `Strategy`); re-measure the full corpus. Needs S5.
+  regardless of `Strategy`); re-measure the full corpus. Needs S5. Runs
+  under M0146-0003, gated on the M0145-0008 flip.
 - [!] **M0141-S7 — re-adjudicate and implement Incremental Sort** — **verified
   Kind: recon
 
@@ -7224,6 +7273,17 @@ spill route is net-negative.
   > - **Owner options:** \(a\) open S2b\-9/S2b\-8 as implementation under
   >   a re\-scoped item 6; \(b\) hold Incremental Sort until the
   >   candidate\-pool divergence \(join\-order / parallel shapes\) moves.
+  >
+  > **OWNER ANSWER 2026\-09\-23 \(delegated, scope M0137–M0145\): OPTION
+  > \(b\) — HOLD.** The 2026\-09\-18 decomposition says the
+  > input\-candidate divergence decides 6 of 7 reachable witnesses, so
+  > S2b\-9/S2b\-8 would land arms that still lose to divergent inputs —
+  > building them now buys code, not movement. The resume is filed as
+  > **M0146\-0006** \(S2b\-9 seed arm + S2b\-8 sorted\-grouping arm\),
+  > explicitly sequenced AFTER **M0146\-0005** \(the candidate\-pool /
+  > join\-order burn\-down that decides those inputs\). This task stays
+  > `[!]`; no descendant is filed or selected under it. Banner item 6's
+  > "cost diagnosis only" scope stays in force until then.
 
   2026-09-15: PG emits `Incremental Sort` in 14 of the 99 TPC-DS reference plans
   (`bench/tpcds/plans-pg/`), and goopg has no implementation at all** — the only
@@ -8505,6 +8565,15 @@ cross-layer programme that has never been scoped.
   + reload + re-pin), then one parity-measurement loop. Open-but-frozen
   child: M0142-0005g (patternsel 2× recon — still real, still unblocked
   technically, but unfundable under S4 until the owner reopens).
+  - **OWNER DISPOSITION 2026-09-23 (delegated, scope M0137–M0145):**
+    stays `[!]`, with the two open threads split by scope. (1) The
+    per-worker Memoize / `partialPathDrivingKind` resume — planner +
+    executor work — is adopted as **M0146-0004** (M0142-0005b remains
+    its filed child; M0146-0004 carries the scoping pass this entry
+    requires). (2) The `indexProbeCostMultiplier` honest exit is a
+    `:65433` reference-cluster rebuild in PG's ctid order (R1) — a
+    cluster-lifecycle action that is NOT inside the delegated scope and
+    stays with the real owner. M0142-0005g likewise stays frozen.
 - [x] **M0142-0005a — admit a Memoize-wrapped bare index probe as a
   Gather-driving kind.** **DONE 2026-09-19; full writeup in
   `docs/design/0100-0149/m0142-0005a-partial-memoize-nli-gather-admission.md`.**
@@ -13540,7 +13609,7 @@ goopg's processing route diverged from PG's upstream of the fix).
   Movement: none
   Kind: recon
   Parent: none
-- [!] **M0144-0003a — Phase-B leaf admission through the sunk-conjunct
+- [x] **M0144-0003a — Phase-B leaf admission through the sunk-conjunct
   Filter** (filed by M0144-0003 item (a)+(e), same root). Phase B's chain
   `spineJoins[0]` is the outermost pinned Semi/Anti join whose `Left`
   carries `Filter{sunk}(origChain)` (predp.go:49-55's documented shape);
@@ -13638,6 +13707,14 @@ goopg's processing route diverged from PG's upstream of the fix).
       not license an assumption about those nodes' SHAPE.** The previous
       loop censused the type and inferred the shape; probe the predicate
       you intend to gate on, not just the type switch.
+    - **CLOSED 2026-09-23 — owner disposition (delegated, scope
+      M0137–M0145): superseded into M0146-0008.** The named wall
+      (M0145-0003's jointree-level pull-up) has landed; this entry's own
+      probe refuted the leaf-admission fix shape, so nothing here
+      transfers verbatim. The live residual — opaque `*Project` leaves
+      that are already-planned composites — is re-censused on the
+      jointree arm by **M0146-0008**, which owns whatever admission work
+      survives that census.
 - [x] **M0144-0003b-1 — carry each set operation's SETOP rel to the link
   above** (the enabling slice of M0144-0003b; LANDED, inert). Refutes the
   parent's factual premise: `addPartialSetOpPath` does NOT admit 0/99 — the
@@ -13659,7 +13736,7 @@ goopg's processing route diverged from PG's upstream of the fix).
   Design: docs/design/0100-0149/m0144-0003b-1-setop-chain-branch-rel.md
   Kind: impl
   Parent: M0144-0003b
-- [!] **M0144-0003b — jointree-level UNION ALL flattening**
+- [x] **M0144-0003b — jointree-level UNION ALL flattening**
   (`pull_up_simple_union_all` analog; filed by M0144-0003 item (b)). PG
   flattens UNION ALL-in-FROM into an appendrel during jointree
   preprocessing (prepjointree.c:1617 via pull_up_subqueries planner.c:754)
@@ -13687,6 +13764,12 @@ goopg's processing route diverged from PG's upstream of the fix).
   the appendrel lives at jointree level in the new flow — flattening
   happens there, before lowering. Stays `[!]`; the wall is M0145-0001's
   IR plus 0003/0004.
+  **CLOSED 2026-09-23 — owner disposition (delegated, scope M0137–M0145).**
+  The wall is discharged: M0145-0004 landed jointree-level UNION ALL
+  flattening and M0145-0004a completed the whole-chain recursion — this
+  task's substance exists, on the jointree arm, as designed. Any residual
+  appendrel-citizenship gap is part of the flow-completion evidence the
+  M0145-0008 flip re-measures, not separate work here.
   Kind: impl
   Parent: M0144-0003
 - [x] **M0144-0003c — pre-cost upper narrowing** (filed by M0144-0003 item
@@ -13934,14 +14017,16 @@ goopg's processing route diverged from PG's upstream of the fix).
     rows survive by default (`stale-candidate` is high-precision, not
     exhaustive). Report: `analysis/m0144/m0144-0010-ledger-triage.md`;
     design: `docs/design/0100-0149/m0144-0010-ledger-bulk-triage.md`.
-- [!] **M0144-0011 — first vertical-slice campaign** (03-forward-plan §4).
+- [x] **M0144-0011 — first vertical-slice campaign** (03-forward-plan §4).
   **ESCALATED 2026-09-20 (loop \#49) under AGENT.md S4 — five consecutive
   completed descendants reporting `Movement: none`. No further descendant
   is selected or filed; only the owner reopens this root.**
   (For when it is reopened: the `unexpressible` substrate floors the
   slices kept hitting now have filed owners — row-emitting PartialAgg is
   M0141-S3–S6, parallel-inner hash build is M0140-0007, derived-input
-  statistics is M0145-0009, parameterized-path legality is M0145-0010.)
+  statistics is M0145-0009, parameterized-path legality is M0145-0010.
+  **Updated 2026-09-23:** those homes moved — M0146-0003 (adopting
+  S3–S6), M0146-0002, M0146-0009, M0146-0011 respectively.)
   - What was tried, and what each step proved:
     - **M0144-0011a** — `inputNodePathkeys` gained an `*Aggregate` arm, so a
       sorted `GroupAggregate` that already emits the ORDER BY order is taken
@@ -14016,6 +14101,18 @@ goopg's processing route diverged from PG's upstream of the fix).
     NL-vs-HJ join election under the agg and `Materialize` existence are
     the deeper layers. Children 0011a/b/c filed below. Design doc:
     `docs/design/0100-0149/m0144-0011-q8-vertical-slice.md`.
+  - **CLOSED 2026-09-23 — owner disposition (delegated, scope
+    M0137–M0145): superseded into M0146, not reopened.** The campaign's
+    surviving hypotheses are re-homed, each with its measured size:
+    `Materialize` (the only hypothesis with a claim outside the ±3 band —
+    `missingnode` 25 → 14, sized in four slices by
+    `docs/design/0100-0149/m0144-0011c-materialize-sizing.md` §4) is
+    **M0146-0010**; Q8's residual `depth=3` join-ORDER divergence and the
+    general join-order class are **M0146-0005**; the
+    `unexpressible` substrate floors are M0146-0002/0003/0004. Reopening
+    this root would restart a breadth-first campaign whose remaining
+    members all have named owners downstream — the milestone boundary is
+    the cleaner accounting.
 - [x] **M0144-0011a — ordering-claim propagation at the ORDERED-step
   boundary** (filed by M0144-0011). `inputNodePathkeys`
   (`internal/optimizer/upperorderedinput.go:176`) returns nil for every
@@ -14441,7 +14538,7 @@ EXISTS/IN body via `planSelectWithParent` before unnest/search ever run
 M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
 `-3i-lateral-route` all block on this milestone's 0003.
 
-- [!] **M0145-0001 — recon: the jointree-level IR and the lowering
+- [x] **M0145-0001 — recon: the jointree-level IR and the lowering
   contract** (design the representation the whole milestone builds on).
   **DONE 2026-09-21.**
 
@@ -14487,6 +14584,19 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
   >   I/B then the flip; \(b\) accept a flip commit that pins the group I/B
   >   tests to legacy and files them as post\-flip defects; \(c\) hold the
   >   cutover.
+  >
+  > **OWNER ANSWER 2026-09-23 (delegated): OPTION (a) — re-pin done, GO
+  > on groups I/B, then flip.** `LINEAGE-BASELINE` re-pinned with the five
+  > spent descendants (banner). Groups I/B are filed as **M0145-0029** and
+  > **M0145-0030**; both land BEFORE the flip commit. Option (b) is
+  > rejected: the group-I class (one-relation index paths the rule bypass
+  > produced and the search loses) is exactly the route-borne bypass-loss
+  > defect that regressed Q17/Q20 — flipping over known coverage gaps
+  > would put them on the DEFAULT arm. Option (c) is rejected: holding
+  > preserves the dual pipeline indefinitely while the measured evidence
+  > (value-identical on both corpora, timing-neutral, parity-floor-equal)
+  > says the knob arm is ready modulo I/B. The loop now resumes the
+  > cutover chain: M0145-0029 → M0145-0030 → M0145-0008 flip slice.
 
   > **OWNER ANSWER 2026-09-22: GO — CONTINUE.** Root re-opened by
   > owner directive. Per the answer the measured downstream walls
@@ -16002,9 +16112,11 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
   row-emitting PartialAgg (plan-flow doc D3; M0144-0011c's Materialize
   sizing) are parity-enablers that stay OUT of this milestone — the
   cutover records which census records remain `unexpressible` for that
-  reason so the executor milestone inherits an exact list (filed homes:
-  **M0140-0007** for the partial-inner hash build, **M0141-S3–S6** for
-  row-emitting PartialAgg). Requires
+  reason so the executor milestone inherits an exact list (filed homes —
+  **updated 2026-09-23**: **M0146-0002** for the partial-inner hash build
+  (re-scoped from M0140-0007), **M0146-0003** for row-emitting PartialAgg
+  (adopting M0141-S3–S6), **M0146-0004** for per-worker Memoize,
+  **M0146-0010** for Materialize). Requires
   M0145-0006 as well as 0007: the cutover must not retire the stage
   builders while upper-rel elections still live in them.
   **Prerequisite sub-inventory (owner direction 2026-09-22,
@@ -16159,6 +16271,15 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
       \(floor 3, inside the ±3 band, arm\-independent\) — for
       M0145\-0025's re\-baseline.
     - Movement: none \(measurement\).
+  - **OWNER ORDERING 2026\-09\-23 \(delegated\): the flip slice runs
+    AFTER M0145\-0029 and M0145\-0030 land** \(the two unfiled triage
+    groups, now filed — the M0145\-0001 escalation's option \(a\)\). The
+    executor\-capability sub\-inventory is DONE \(its four members are
+    classified, the generatable\-but\-unexecutable set is empty, and the
+    `unexpressible` handoff list now has milestone homes: M0146\-0002 /
+    0003 / 0004 / 0010\). Sequence: 0029 → 0030 → flip commit \(with the
+    group\-K tests and the two script knob defaults changing in it\) →
+    legacy\-deletion slices → this task's gate suite.
 - [x] **M0145-0009 — CTE-output statistics (B-06 resume): wire the landed
   synthesis into the estimator** (filed 2026-09-21 by owner directive;
   carries TODO_ALL B-06 / ledger `take3-B-06-deferred`). Three of this
@@ -16379,7 +16500,47 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
       goopg-only divergence to retire.
     - Re-run the pull-up/seam decline census afterwards so the residual
       buckets reflect the new state.
-- [ ] **M0145-0010 — parameterized-path legality: port
+  - **CLOSED 2026-09-22 (loop \#78): the completion census is run and the
+    task's four ledger steps are all discharged.**
+    Movement: none — `CATEGORIES-EXCL-MATCH` unchanged on the default arm;
+    a recon, no production file touched.
+    Design: `docs/design/planner-b06-cte-stats/DESIGN.md`
+    §"Closing census (2026-09-22)".
+    - **The census answers the step's question, and the answer is that the
+      `*CTEScan` bucket is NOT a residual.** TPC-DS SF0.25 knob arm,
+      `GOOPG_NLI_CENSUS=1`, all 99 queries, both arms from this loop (same
+      recipe, same binary sha):
+      - `GOOPG_PULLUP_CTE_LEAF` **off** (default): `(pulled)` 27,
+        `any-body-leaf-(*optimizer.CTEScan)` 15, `SubqueryExpr@scalar` 15,
+        `ExistsExpr@or` 2, `InExpr@or` 1.
+      - `GOOPG_PULLUP_CTE_LEAF` **on**: `(pulled)` **42**, `*CTEScan`
+        **0**, the other three unchanged.
+      - 27 + 15 = 42 — the class converts ONE-FOR-ONE, with no partial
+        conversion and no other class moving. M0145-0013's admission
+        already addresses it in code; what is left is that arm's
+        promote-or-delete decision (C5), not more synthesis.
+    - The `@or` classes and `SubqueryExpr@scalar` are unchanged, as
+      M0145-0015 predicted — declines PG makes too
+      (`prepjointree.c:877` `/* Stop if not an AND */`; EXPR sublinks are
+      never jointree citizens).
+    - **The arm is not free**: 302 plan-diff lines between the two goopg
+      captures and `qual-placement` 28 -> 29 with `match` still 1. Inside
+      the ±3 noise band, so not a measured regression — but not "no plan
+      change" either. M0145-0013's decision should re-measure rather than
+      read that +1 off this run.
+    - **Measurement caveat, recorded as a rule**: M0145-0015's census
+      (nominally the same recipe) reported almost exactly DOUBLE every
+      figure across all five classes, proportions unchanged. Five
+      independent halvings are less likely than one capture-recipe
+      difference. Unresolved here; the consequence is that **absolute
+      census totals compare only within an identical capture recipe, and
+      the class PROPORTIONS are what carries across captures**. The
+      conclusion above rests on a within-capture A/B, so it holds either
+      way. Ledgered.
+    - Step 4 respected to the end: the `rows<=1` guard and the Q78
+      firewall were NOT touched by this task in any slice.
+
+- [x] **M0145-0010 — parameterized-path legality: port
   `reparameterize_path` / `required_outer`** (filed 2026-09-21 by owner
   directive; carries the `lateral` decline family's resume point). The
   seam declines `lateral` problems — 8 corpus fires, real lateral
@@ -16550,6 +16711,23 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
       predicates the two widening loops introduced.
     - The loop does not choose. Building as filed would implement
       machinery for consumers measurement says are absent.
+    - **OWNER ANSWER 2026-09-23 (delegated): CLOSE — option (c).** This
+      task is `[x]`. What the task actually needed already landed: the
+      substantive legality work is scope (c)'s shared jointype
+      predicates (`partialNestLoopJoinType`/`partialNestLoopJointype`)
+      plus scope (d)'s capability-before-admission discipline, both
+      measured; scope (b)'s named consumer (appendrel child-path
+      re-pricing for partitionwise joins) does not exist in goopg; and
+      scope (a)'s rel-level `param_info`/`lateral_relids` refactor has a
+      measured consumer of 2 corpus fires (Q30/Q68 — the `lateral`
+      decline family keeps its posthoc fallback post-flip, so this is
+      reachability, not correctness). A rel-level refactor for 2 fires
+      fails the measured-demand bar. The lateral residual is carried
+      forward as **M0146-0011** (post-cutover re-census; escalate to an
+      impl task only if the population grows or `lateral_relids` become
+      load-bearing for another admitted shape). `Movement: none` —
+      scopes (c)/(d) landed under this entry's earlier slices and were
+      already recorded; the closure itself changes no code.
   - **On completion — reconsider the blocked work (evaluate, do not
     auto-do):** the `lateral` decline family (Q30/Q68 witnesses) on the
     then-default arm; the partial-NLI whitelist's LEFT/ANTI entries
@@ -18029,3 +18207,196 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
     acceptance arm, SF0.25 sweep, fire set \(24 fires\) — all PASS.
   - Ledgered: PG orders scan quals by per\-tuple cost
     \(`order_qual_clauses`\); goopg uses the WHERE order.
+- [ ] **M0145-0029 — group I: close the one-relation index-path coverage
+  gaps before the flip** (filed 2026-09-23 by the M0145-0001 second
+  lineage escalation, owner GO same day). The local flip fails ≥10 tests
+  where the one-relation search on the jointree arm misses an index path
+  the rule-based bypass produced (`TestSAOPWithConjunctMoves`, executor
+  index/IOS tests — full list in
+  `docs/design/0100-0149/m0145-0008-flip-test-triage.md`). For each: on
+  the knob arm, measure whether the index path is GENERATED-but-out-costed
+  or never generated; if never generated, port the producer (the bypass
+  is rule machinery the search must subsume); if out-costed, record the
+  cost gap and escalate if it reproduces on the corpus. Every closed gap
+  is pinned by the re-enabled test; do NOT pin a gap to the legacy
+  pipeline and proceed — that was owner-rejected (option (b)): these are
+  the same defect class as the Q17/Q20 route-borne bypass losses.
+  Kind: impl
+  Parent: M0145-0008
+  - **Slice 1 LANDED 2026\-09\-23 \(ralph2 loop \#12\), `fe3d1b0aa`.** Design
+    doc `docs/design/0100-0149/m0145-0029-one-rel-index-path-coverage.md`.
+    - Measured: the one\-rel search filed NO plain restriction index path
+      at all \(only prebuilt \+ equality\-only bitmap\) — a generation gap.
+    - Slice 1 ports `build_index_paths`' baserestrictinfo arm for the
+      equality prefix \(`pathindexrestrict.go`\); lowering drops the
+      consumed conjuncts from the leaf Filter. No plan moves on either arm.
+    - PG 18.3 oracle: the varchar witness is a Bitmap Heap Scan in PG too
+      \(stale expectation\); the composite witness is an Index Only Scan
+      WITH quals \(gap → slice 3\).
+    - Remaining: slice 2 range quals, 3 index\-only with quals, 4 SAOP,
+      5 re\-run group I \+ update stale expectations.
+- [ ] **M0145-0030 — group B: adjudicate the 11 behavioural flip-triage
+  tests before the flip** (same filing). The flip-triage doc lists 11
+  behavioural failures: grouping strategy, nested scalar subquery, NLI
+  semi/anti election, hashed-IN SubPlan, two EXPLAIN expectations (one
+  already classified stale/PG-faithful). For each: classify as
+  stale-pin/PG-faithful-divergence (update the test to assert the jointree
+  arm's PG-faithful shape, recording the oracle evidence) or real
+  regression (fix before the flip, or file a named post-flip defect with
+  owner visibility). Also in this task's scope: the script audit —
+  enumerate every harness site that defaults the knob to `0` (known:
+  `scripts/tpcds-sf025-regression.sh:310`,
+  `scripts/tpch-estimate-audit-arm.sh:108`) and hand the flip commit the
+  exact list. Do NOT change the defaults here — they must flip atomically
+  WITH the pipeline default in the M0145-0008 commit, or pre-flip
+  baselines silently switch arms.
+  Kind: impl
+  Parent: M0145-0008
+
+## M0146 — Post-cutover plan parity (filed 2026-09-23, owner decision)
+
+**Milestone doc:** `docs/milestones/0146-post-cutover-plan-parity.md`.
+**GATE: every task below is unselectable until the M0145-0008 flip
+commits.** The milestone is the burn-down the flow parity exposes —
+executor substrate, plan election/costing, statistics — sequenced by the
+M0146-0001 re-baseline census on the new default arm.
+
+- [ ] **M0146-0001 — post-cutover parity re-baseline** (recon). On the
+  NEW default arm after the flip: re-run the first-divergence census and
+  the category counts on TPC-DS SF0.25 + SF1 and TPC-H (pinned-seed
+  lane), produce the ranked residual list, and re-sequence this
+  milestone's tasks on it. Complements M0145-0025 (which measures the
+  PRE-flip TPC-H arm); this task measures the post-flip default.
+  Kind: recon
+  Parent: M0145-0008
+- [ ] **M0146-0002 — `Parallel Hash` over a genuinely partial inner**
+  (impl; supersedes M0140-0007 per owner answer 2026-09-23, option (a)).
+  Port the real thing: hash build inside the Gather over a partial inner
+  (PG's `Parallel Hash` / shared `parallel_hash` model), shared
+  publication, build-completion barrier, error propagation — label and
+  execution model land together, each pinned by a per-shape
+  parallel-vs-serial identity test. Expected movement: Q14/Q16 leave the
+  TPC-H `parallelism` category. Explicitly NOT in scope: Q9/Q21/half-Q10
+  (join-order divergences — M0146-0005).
+  Kind: impl
+  Parent: M0140-0007
+- [ ] **M0146-0003 — row-emitting PartialAgg** (impl; adopts the filed
+  M0141-S3→S4→S5→S6 chain as its slices). Convert Partial Aggregate from
+  the zero-row shared-accumulator model to one that emits real partial
+  rows (transition-state publication → serialize/deserialize →
+  GatherMerge-fed Finalize-Sorted merge-combine → wire + measure), so
+  PG's `Finalize GroupAggregate → Gather Merge → Sort → Partial
+  HashAggregate` stack (`gather_grouping_paths`, planner.c:7704-7724)
+  becomes expressible. On completion M0137-0019a's premise is
+  re-evaluated on the canonical capture.
+  Kind: impl
+  Parent: M0137-0019a
+- [ ] **M0146-0004 — per-worker Memoize + Gather-over-Memoize
+  admission** (impl; M0142-0005 resume option (a), owner disposition
+  2026-09-23). Executor: `nodeMemoize.c`'s `parallel_worker_number`-keyed
+  cache model; planner: relax `partialPathDrivingKind`'s lateral-probe
+  branch to admit `PathMemoize`. Carries the scoping/floor-measurement
+  pass M0142-0005's own note requires before implementation. The
+  `indexProbeCostMultiplier` question is a separate M0142-0005 thread
+  whose honest exit is a `:65433` corpus rebuild — a real-owner action,
+  NOT part of this task.
+  Kind: impl
+  Parent: M0142-0005
+- [ ] **M0146-0005 — join-order / candidate-pool divergence burn-down**
+  (impl). The largest residual category (~90 SF0.25 `join-order`
+  records): work the per-family decomposition M0146-0001's census
+  produces — owns Q8's `depth=3` join-order residue (M0144-0011b) and
+  the Q9/Q21/half-Q10 TPC-H family. On completion: re-evaluate
+  M0141-S7's S2b-9/S2b-8 (the owner hold releases here) and re-run the
+  lateral census (M0146-0011's data).
+  Kind: impl
+  Parent: none
+- [ ] **M0146-0006 — Incremental Sort election** (impl; M0141-S7's
+  resume, sequenced after M0146-0005 per the owner hold). The two filed
+  resume points: S2b-9 (offer an Incremental Sort over the seed itself —
+  Q4's `keys=1 ncommon=1` witness) and S2b-8 (the SORTED grouping arm —
+  Q64's CTE). Executor node + EXPLAIN rendering + the `addOrderedPaths`
+  third arm already exist behind `GOOPG_INCREMENTAL_SORT`; this task
+  wires the candidate production the flag needs.
+  Kind: impl
+  Parent: M0141-S7
+- [ ] **M0146-0007 — `inline_cte` single-reference CTE inlining**
+  (impl). Port PG's `inline_cte` (prepjointree.c): a single-ref,
+  non-recursive CTE is inlined into the jointree so its quals and
+  statistics reach the search — divergence class D6. Operates on the
+  jointree IR, so it is jointree-arm work by construction; check
+  interaction with `pushQualsThroughSingleRefCTEs` (overlapping but
+  shallower) and fold or keep per measurement.
+  Kind: impl
+  Parent: none
+- [ ] **M0146-0008 — leaf-count residual re-census + admission**
+  (impl; M0144-0003a's successor). First re-census the opaque-leaf
+  population on the NEW default arm — the earlier probe showed the
+  leaves are already-planned composites (`*Gather`/`*CTEScan`/`*Filter`/
+  `*Join` under non-identity `*Project`s), not the identity projections
+  the original fix assumed; the jointree arm may have dissolved some of
+  them already. Then implement whatever leaf/admission work the census
+  shows is still real. If the census shows zero residue, this closes by
+  measurement.
+  Kind: impl
+  Parent: M0144-0003a
+- [ ] **M0146-0009 — statistics/cardinality burn-down** (impl). Work
+  the 53-finding ea-ratchet baseline
+  (`analysis/planner-refactor-take3/c20a-estimator-census-20260922/ea-baseline.txt`)
+  toward zero under the standing no-NEW rule; includes the B-06
+  CTE-output residual M0145-0009's census named (the *CTEScan bucket
+  M0145-0013's promote-or-delete decision owns). Decompose by mechanism
+  first; each fix is its own gated change.
+  Kind: impl
+  Parent: none
+- [ ] **M0146-0010 — `Materialize` node** (impl; M0144-0011c's sizing is
+  the spec — `docs/design/0100-0149/m0144-0011c-materialize-sizing.md`
+  §4's four slices). (1) plan node + EXPLAIN + `createPlan`, inert;
+  (2) `cost_material` + `cost_rescan`'s Material arm as tested pure
+  functions; (3) the NL admission rule files the matpath candidate AND
+  `join_nl_stream.go` stops wrapping unconditionally — the moving slice;
+  (4) re-time the Q54-class `nlInnerWorkMemEnabled` cliff once (2) lands.
+  Expected movement: `missingnode` 25 → 14 (Q1 Q8 Q10 Q16 Q47 Q57 Q59
+  Q65 Q77 Q78 Q91).
+  Kind: impl
+  Parent: M0144-0011c
+- [ ] **M0146-0011 — lateral/parameterized-path post-cutover re-census**
+  (recon; M0145-0010's residual). Re-measure the `lateral` decline
+  family on the new default arm (2 fires today — Q30/Q68, posthoc
+  fallback intact). Escalates to an impl task (rel-level
+  `param_info`/`lateral_relids`) only if the population grows OR another
+  admitted shape needs the machinery; otherwise record and close.
+  Kind: recon
+  Parent: M0145-0010
+- [ ] **M0146-0012 — correlated restrictions as base-rel index quals**
+  (impl; M0145-0027's ledger residual). PG treats an outer reference as
+  a `PARAM_EXEC` and `match_clause_to_indexcol` accepts it as a
+  pseudo-constant (`is_pseudo_constant_for_index`, indxpath.c:4596), so
+  `l_partkey = $1 AND l_suppkey = $2` costed as ordinary base
+  restrictions drives the composite-index probe. Port: admit
+  `OuterColumnRef` conjuncts as leaf restrictions, teach base-rel index
+  pathgen to use them, then retire `flattenCorrelatedSeqScanFilters` /
+  the restoring rule. PREREQUISITE — prove executor rescan semantics
+  first: a hash build / Memoize / CTE cache over a correlated leaf must
+  rebuild per outer binding (PG's chgParam/extParam signalling); the
+  rescan-staleness risk is why design 01 §3.1.3 excluded outer refs.
+  Witnesses: TPC-H Q17/Q20, TPC-DS Q41.
+  Kind: impl
+  Parent: none
+- [ ] **M0146-0013 — `cost_qual_eval` per-clause qual ordering**
+  (impl; M0145-0028's ledger residual). Port `cost_qual_eval`
+  (costsize.c) and apply `order_qual_clauses`'s stable cost sort
+  (createplan.c:5420, incl. the leakproof/security-level refinement) at
+  every Filter build site: `flattenStrandedSeqScanFilters`, the bypass
+  Filter build in `planSelectImpl`, and the search's leaf-qual
+  attachment. Movement: rendering/qual-placement on queries that write
+  a sublink before a cheap qual.
+  Kind: impl
+  Parent: none
+- [ ] **M0146-0014 — parity-closure sweep** (recon; the milestone's
+  exit report). Re-run the first-divergence census on both corpora and
+  prove every remaining record is either assigned to a live task above
+  or presented to the owner as a named, measured, waived residual —
+  "no unnamed first-divergence records" is the acceptance bar.
+  Kind: recon
+  Parent: none

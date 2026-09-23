@@ -1,6 +1,6 @@
 # M0145 — Jointree-first planner flow
 
-**Filed:** 2026-09-20 (owner decision). **Status:** planned.
+**Filed:** 2026-09-20 (owner decision). **Status:** in-progress.
 **Basis:** `docs/design/not_ralph/plan_parity_fix_take2/METHODOLOGY4/plan-flow-medium-abstraction.md`
 (the six medium-level divergences) + `tmp/planner-rewrite-possibility260920.md`
 (feasibility assessment) + `docs/design/0100-0149/m0142-0008a-3i-lateral-route-recon.md`
@@ -49,7 +49,7 @@ lowering replaces the interleaved stage-builder resolutions.
 | M0145-0007 | impl | Single Path→Node lowering pass (create_plan analogue) consolidating all post-election resolution |
 | M0145-0008 | impl | Cutover: default flip, full gate suite on the new pipeline, legacy pipeline + dead guard deletion, executor-substrate handoff list |
 | M0145-0009 | impl | CTE-output statistics (B-06 resume — TODO_ALL B-06 / ledger `take3-B-06-deferred`): wire the landed inert synthesis (`cte_stats_synthesis.go`, design `docs/design/planner-b06-cte-stats/`) into the estimator. On completion the blocked unlifts are RE-EVALUATED, not auto-done: `flattenPulledBodyTree`'s bare-`*SeqScan` rule (0003's ANY-CTE residue), the `outer-over-derived` firewall (its own named resume condition — owner hard constraint, ambiguous evidence escalates), and the `rows<=1` guard |
-| M0145-0010 | impl | Parameterized-path legality — rel-level `param_info`/`lateral_relids` + `reparameterize_path` analogue (`pathnode.c`), extending the existing `Path.RequiredOuter` machinery: the `lateral` decline family (8 corpus fires, Q30/Q68) and the partial-NLI whitelist's LEFT/ANTI entries re-evaluated on completion, not auto-admitted; every newly admitted shape passes an executor-capability check first |
+| M0145-0010 | impl | Parameterized-path legality — rel-level `param_info`/`lateral_relids` + `reparameterize_path` analogue (`pathnode.c`), extending the existing `Path.RequiredOuter` machinery: the `lateral` decline family (8 corpus fires at filing — re-measured **2**, Q30/Q68, 2026-09-23) and the partial-NLI whitelist's LEFT/ANTI entries re-evaluated on completion, not auto-admitted; every newly admitted shape passes an executor-capability check first. **Closed 2026-09-23 (owner decision, option (c))**: premises refuted by measurement — scope (b)'s consumer (partitionwise joins) does not exist; scope (c)/(d) landed as the shared jointype predicates; the 2-fire lateral residual carries forward as M0146-0011 |
 | M0145-0011 | impl | Measured re-evaluation of the derived-input blockers (proposal `tmp/blocker-re-think-260912/01-proposal.md` 案A): diagnostic firewall-bypass flag (production change → `Kind: impl` per C1) + knob-arm E1 (Q78 + `outer-over-derived` fires) and E2 (`*CTEScan` leaf admission — downstream of E1 since pulled bodies become Semi/Anti SJIs). Produces evidence for an owner decision; lands no relaxation |
 | M0145-0012 | impl | Retire the `rows<=1` CTE fallback (`initialRelRows`, `joinsearch.go:520-526`) — a goopg-only divergence (PG's `clamp_row_est` keeps the collapse): demonstrate `derived >= guard effect` on the corpus fires or wire a mechanism that makes it hold, then remove. Sequenced after 0011's evidence |
 | M0145-0013 | impl | Admit pulled `*CTEScan` leaves at the seam (`pulled-leaf-not-scan`/`flat-leaf-not-scan`, 30 fires — Q14/Q23/Q95): Table-less `rangeBinding` + statistics-free `estimateBaseRelInfo` arm + third-site audit. E2's resume point; problems then wait on 0018 at the firewall |
@@ -71,8 +71,14 @@ lowering replaces the interleaved stage-builder resolutions.
 | M0145-0023 | impl | Harness: flow-convergence instrument — route-ratio + decline-bucket trend log, observability only, not a movement instrument (knob-arm lane added 2026-09-22: the sweep's plan channel now also captures under `GOOPG_JOINTREE_PIPELINE=1` so the route ratio it trends actually moves) |
 | M0145-0024 | recon | Q74 `year_total` residual collapse + the `rows<=1` fallback arm A/B — the last measurement before M0145-0012's removal can be re-judged |
 | M0145-0025 | recon | Re-take the TPC-H plan-parity baseline on the pinned-seed lane — pre-pin captures are non-comparable (A/A measured `changed=20/21` on sampling noise) |
+| M0145-0026 | recon | Duplicate hashclause in the path key list (filed by 0007 slice 5 — find where the duplicate enters and whether costing/selectivity reads the doubled list; recon only) |
+| M0145-0027 | impl | Knob-arm TPC-H Q20 correlated-scalar decorrelation fix — `flattenCorrelatedSeqScanFilters` (landed; residual: PG's Param-as-pseudo-constant index-qual mechanism → M0146-0012) |
+| M0145-0028 | impl | Knob-arm SF0.25 floor match Q41 — `flattenStrandedSeqScanFilters` (landed; residual: per-clause qual cost ordering → M0146-0013) |
+| M0145-0029 | impl | Group I of the flip triage: close the one-relation index-path coverage gaps on the jointree arm BEFORE the flip (owner GO 2026-09-23 — no pinning-to-legacy) |
+| M0145-0030 | impl | Group B of the flip triage: adjudicate the 11 behavioural test failures BEFORE the flip + the script-default audit (`tpcds-sf025-regression.sh`/`tpch-estimate-audit-arm.sh` knob defaults follow the flip) |
 
 Dependencies: 0001 → {0003, 0004} → 0005 → {0006, 0007} → 0008.
+0029 → 0030 → 0008's flip slice (owner ordering 2026-09-23).
 0002 is independent and should land early so every later task is measurable.
 0010 is sequenced after the chain: it is planner machinery (not executor
 substrate, so it is inside this milestone where 0008's note puts executor
@@ -104,7 +110,9 @@ relaxed plans stay clean.
 - **M0142-0008a-3i-route-a** step 2 (flattening splice) is the pilot of
   0003 — implement against the IR if 0001 lands first. Step 1
   (`.Subquery` retention + `sublinkBodyIsSimple`) landed `6d2c6b9ad`.
-- **M0144-0003a / 0003b** stay `[!]` — superseded by 0003/0004.
+- **M0144-0003a / 0003b** — superseded by 0003/0004; **closed 2026-09-23**
+  (owner disposition, scope M0137–M0145 — 0003a's live residual moved to
+  M0146-0008; 0003b's substance landed as 0004/0004a).
 - **M0142-0008a-3** increments (i)/(ii)/(iii) are the pinned-spine route to
   the same end state; re-verify which remain meaningful after 0005.
 - **M0144-0011a** residual gates → owned by 0006.
@@ -114,6 +122,9 @@ relaxed plans stay clean.
   (M0144-0011c sizing). These are parity-enablers the new flow will
   *generate shapes for*; admission gates stay until they land. M0145-0008's
   cutover hands the executor milestone an exact `unexpressible` list.
+  **That handoff is now scheduled**: the list's members are M0146-0002 /
+  0003 / 0004 / 0010 (`docs/milestones/0146-post-cutover-plan-parity.md`,
+  filed 2026-09-23).
 - M0144-0004/0005/0006 (instrumented PG) remain valid measurement support —
   the instrumented tree's OPTIMIZER_DEBUG output compares against the new
   pipeline's DPPATH trace.

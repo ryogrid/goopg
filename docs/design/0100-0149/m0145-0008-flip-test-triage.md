@@ -1,9 +1,9 @@
 # M0145-0008 flip: unit-suite triage
 
 Status: triage produced 2026-09-23; group L pinned (test-only commit); groups
-I and B NOT filed — the S4 lineage budget of root M0145-0001 is exhausted, so
-they are held in that root's escalation block for the owner. The default is
-NOT flipped yet.
+I and B were held in the M0145-0001 escalation until the owner's 2026-09-23
+answer — **now filed as M0145-0029 (group I) and M0145-0030 (group B)**,
+both sequenced before the flip. The default is NOT flipped yet.
 Task: `.ralph/fix_plan.md` M0145-0008 (Kind: impl). Parent design:
 `m0145-0008-cutover-readiness-timing-ab.md`.
 
