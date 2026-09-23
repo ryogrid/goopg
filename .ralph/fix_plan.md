@@ -2048,13 +2048,42 @@ heuristic stays live.)
     breakage across the other amcheck ports), units PASS, pgbench smoke via
     the hook. No spotcheck/sf025/acceptance-arm — zero production diff.
 
-- [ ] **testport/TestPort_PgoutputInterop* subscriber/publisher-start
+- [x] **testport/TestPort_PgoutputInterop* subscriber/publisher-start
   failures (AI-20260922-004850-006 … -015, was AI-20260921-000212-008 …
-  -017)** — **STILL OPEN. Does NOT reproduce at HEAD; this loop fixed the
-  reason nobody can tell why, not the defect itself.**
+  -017)** — **FIXED 2026\-09\-23 \(`0734cab60`\).** Design doc
+  `docs/design/0100-0149/nightly-control-socket-sun-path.md`.
   Kind: test-fix
   Parent: none
   Movement: none
+  - **Root cause, read from the inlined `cluster.log` tail of nightly
+    `20260923-001346`:** every failing subscriber died at
+    `control listener: … listen unix …/.goopg.ctl.sock: invalid argument`.
+    Under the nightly worktree prefix the socket path is 108–136 bytes;
+    `sun_path` holds 107 \+ NUL. Only long case names fail; the repo\-root
+    prefix is shorter, which is why local re\-runs never reproduced it.
+  - Fix: `control.SocketPathFor` keeps `<datadir>/.goopg.ctl.sock` when
+    ≤103 bytes, else binds `$TMPDIR/goopg-<16hex sha256\(abs datadir\)>.ctl.sock`;
+    clients already dial the pidfile's `SocketPath`.
+  - Verified: HEAD binary reproduces the exact error on a 143\-byte socket
+    path; the fix starts/status/query/stops and cleans up. Gates: units,
+    tpch\-spotcheck, SF0.25 sweep \(plans same=99\), two interop cases.
+  - Final confirmation is the next full nightly \(the `20260923` run
+    ABORTED at the TPC\-H stage, rc=4, after testport\).
+- [ ] **testport isolation schedule diffs in the aborted nightly
+  `20260923-001346`** — `TestPort_IsolationEvalPlanQual` \(L1092: `c2:
+  COMMIT` printed before `read_a`, 1470 vs 1468 lines\),
+  `TestPort_IsolationInsertConflictDoUpdate4` \(L34 missing `c2: COMMIT`,
+  49 vs 63 lines\), `TestPort_IsolationIntraGrantInplaceDb` \(extra
+  `\(0 rows\)` at L28\). Not in `action-items.md` \(the run aborted before
+  generating it\); filed by hand. Step 1: re\-run each at HEAD \(`go test
+  -v -run '^<name>$' ./internal/testport/`\) — the isolation runner decides
+  `<waiting>` by a 300 ms timing window only, so nightly load is a plausible
+  cause and a green local run is the stale/flaky verdict; a red one is a
+  real schedule divergence to fix. Also record why the nightly aborted
+  \(`[S2] tpch: waiting for canonical 65433 to be server-free`, rc=4\) —
+  owner infra, escalate rather than touch `:65433`.
+  Kind: test-fix
+  Parent: none
   - **Reproduction attempted faithfully and FAILED to reproduce.** The named
     repro passes at HEAD (2.7s). All ten cases pass run together (62s). And
     the full `./internal/testport/` package — which is what the nightly
