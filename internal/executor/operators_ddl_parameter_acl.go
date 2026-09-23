@@ -93,6 +93,9 @@ func (o *ddlOp) execParameterACLChange(pc *parser.ParameterACLChange) error {
 	if err := checkGrantedByCurrentUser(o.ctx.NonSuperuserRole, pc.GrantedBy); err != nil {
 		return err
 	}
+	if err := checkGrantOptionToPublic(pc.Revoke, pc.WithGrantOption, pc.Grantees); err != nil {
+		return err
+	}
 	im, ok := o.ctx.Catalog.(*catalog.InMemory)
 	if !ok {
 		return nil

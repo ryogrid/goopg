@@ -73,6 +73,9 @@ func (o *ddlOp) execDatabaseACLChange(dc *parser.DatabaseACLChange) error {
 	if err := checkGrantedByCurrentUser(o.ctx.NonSuperuserRole, dc.GrantedBy); err != nil {
 		return err
 	}
+	if err := checkGrantOptionToPublic(dc.Revoke, dc.WithGrantOption, dc.Grantees); err != nil {
+		return err
+	}
 	im, ok := o.ctx.Catalog.(*catalog.InMemory)
 	if !ok {
 		return nil

@@ -23688,6 +23688,19 @@ func resolveUserTypeOID(im *catalog.InMemory, name string) (uint32, userTypeKind
 // server/grant_ddl.go's identically-behaved errGrantorMustBeCurrentUser check
 // for the table-ACL path, since the executor package cannot import server (it
 // would create an import cycle). M0119-0004-ACLHEAP.
+// checkGrantOptionToPublic rejects GRANT … TO PUBLIC WITH GRANT OPTION with
+// PostgreSQL's 0LP01 (merge_acl_with_grant, aclchk.c:208 — shared by every
+// object class and by ALTER DEFAULT PRIVILEGES). It runs before any ACL entry
+// is written: goopg's ACL store is not transactional, so a mid-loop failure
+// would leave the earlier grantees recorded where PG's rollback leaves none.
+// REVOKE never trips it.
+func checkGrantOptionToPublic(revoke, withGrantOption bool, grantees []string) error {
+	if revoke || !catalog.GrantOptionToPublic(withGrantOption, grantees) {
+		return nil
+	}
+	return &ExecError{Code: "0LP01", Message: catalog.GrantOptionToPublicMessage}
+}
+
 func checkGrantedByCurrentUser(actingRole, grantedBy string) error {
 	if grantedBy == "" {
 		return nil
@@ -23717,6 +23730,9 @@ func checkGrantedByCurrentUser(actingRole, grantedBy string) error {
 // grant_ddl.go's table-ACL check. M0119-0004-ACLHEAP.
 func (o *ddlOp) execTypeACLChange(tc *parser.TypeACLChange) error {
 	if err := checkGrantedByCurrentUser(o.ctx.NonSuperuserRole, tc.GrantedBy); err != nil {
+		return err
+	}
+	if err := checkGrantOptionToPublic(tc.Revoke, tc.WithGrantOption, tc.Grantees); err != nil {
 		return err
 	}
 	im, ok := o.ctx.Catalog.(*catalog.InMemory)
@@ -23872,6 +23888,9 @@ func columnAttNum(tbl *catalog.Table, colName string) int16 {
 // database/parameter check. M0119-0004-ACLHEAP (attacl grantor half).
 func (o *ddlOp) execAttrACLChange(ac *parser.AttrACLChange) error {
 	if err := checkGrantedByCurrentUser(o.ctx.NonSuperuserRole, ac.GrantedBy); err != nil {
+		return err
+	}
+	if err := checkGrantOptionToPublic(ac.Revoke, ac.WithGrantOption, ac.Grantees); err != nil {
 		return err
 	}
 	im, ok := o.ctx.Catalog.(*catalog.InMemory)
