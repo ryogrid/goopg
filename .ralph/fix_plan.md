@@ -18450,6 +18450,15 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
       defect on the jointree arm: `Hash Cond: \(t1.a = t1.a\)` where the
       inner side is t2;
     - `TestExplainAnalyzeRowsRemovedByJoinFilter` — already classed stale.
+  - **Fix 1 LANDED 2026\-09\-23 \(ralph2 loop \#22\), `903780b3e`.** Design doc
+    `docs/design/0100\-0149/m0145\-0030\-group\-b\-adjudication.md`.
+    - Alias collision: pulled\-up sublink bodies now get their own
+      SourceTableIdx range \(`assignPulledSourceOffsets`\), as the legacy
+      unnest does with `remapSourceTableIdx`. The witness passes under the
+      flip; knob\-arm fire\-set plans identical apart from qualifiers.
+    - Housekeeping: the fire\-set gate hit ENOSPC; 91 loop\-owned
+      `tmp/m0145\-00\*\-data\*` clones were removed \(≈150G\). The gate
+      leaves ~14G of clones per run.
 
 ## M0146 — Post-cutover plan parity (filed 2026-09-23, owner decision)
 
