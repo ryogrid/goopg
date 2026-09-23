@@ -8,7 +8,8 @@
 // File layout:
 //
 //	<DataDir>/postmaster.pid       # text file, one value per line
-//	<DataDir>/.goopg.ctl.sock      # Unix-domain command socket
+//	<DataDir>/.goopg.ctl.sock      # Unix-domain command socket (see
+//	                               # SocketPathFor for the over-long-path fallback)
 //
 // The pidfile carries everything `goopg status` needs without
 // touching the socket: process pid, listen address, socket path,
@@ -19,6 +20,8 @@ package control
 
 import (
 	"bufio"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net"
@@ -40,10 +43,52 @@ const PIDFileName = "postmaster.pid"
 // SocketName is the relative path of the control socket inside the
 // data directory. It starts with `.` so a casual `ls` of an
 // upstream-shaped data directory doesn't show goopg-only files in
-// the natural sort order, and is short enough to fit within the
-// sun_path 108-byte limit on Linux when the data directory is at a
-// reasonable depth.
+// the natural sort order, and short so that most data directories keep
+// the socket inside themselves; SocketPathFor moves it out when the
+// joined path would overflow sun_path.
 const SocketName = ".goopg.ctl.sock"
+
+// maxSocketPathLen is the longest Unix-domain socket path this package will
+// bind. `sockaddr_un.sun_path` is 108 bytes on Linux and 104 on macOS, and
+// the kernel needs the terminating NUL, so Go's net.Listen rejects a path of
+// len >= sizeof(sun_path). 103 fits both.
+const maxSocketPathLen = 103
+
+// SocketPathFor returns where the control socket for dataDir is bound.
+//
+// Normally `<dataDir>/.goopg.ctl.sock`. When that path does not fit
+// `sun_path`, the socket moves to a short, deterministic path in the system
+// temp directory — `goopg-<first 16 hex of sha256(abs dataDir)>.ctl.sock` —
+// instead of failing the whole server start. Before this, a data directory
+// nested deeply enough (a nightly worktree `tmp/nightly-src-<run>/tmp/<case>/…`
+// was the witness) made `goopg start` exit with "listen unix …: invalid
+// argument" after the pidfile was already written.
+//
+// Clients never recompute this: `goopg stop|reload|status|checkpoint|promote`
+// dial the `SocketPath` line of `postmaster.pid`, which records whichever path
+// was chosen. The hash keys on the absolute data directory, so the fallback is
+// stable across restarts of the same cluster and distinct between clusters;
+// two servers on one data directory are already excluded by the pidfile.
+// PostgreSQL has no counterpart (the control socket replaces pg_ctl's signal
+// path); for its own client sockets PG simply refuses an over-long path
+// ("Unix-domain socket path ... is too long").
+func SocketPathFor(dataDir string) string {
+	p := filepath.Join(dataDir, SocketName)
+	if len(p) <= maxSocketPathLen {
+		return p
+	}
+	abs, err := filepath.Abs(dataDir)
+	if err != nil {
+		abs = dataDir
+	}
+	sum := sha256.Sum256([]byte(filepath.Clean(abs)))
+	name := "goopg-" + hex.EncodeToString(sum[:8]) + ".ctl.sock"
+	fallback := filepath.Join(os.TempDir(), name)
+	if len(fallback) > maxSocketPathLen {
+		fallback = filepath.Join("/tmp", name)
+	}
+	return fallback
+}
 
 // PIDFile is the parsed contents of <DataDir>/postmaster.pid.
 type PIDFile struct {

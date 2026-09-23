@@ -709,7 +709,10 @@ func (s *Server) Run(ctx context.Context) error {
 // actual process restart.
 func (s *Server) startControlPlane(runCtx context.Context, runCancel context.CancelFunc, ln net.Listener) error {
 	dir := s.cfg.DataDir
-	socketPath := filepath.Join(dir, control.SocketName)
+	// SocketPathFor keeps the socket inside the data directory unless that
+	// path overflows sun_path; clients read whichever it chose back from the
+	// pidfile's SocketPath line.
+	socketPath := control.SocketPathFor(dir)
 	clog := control.PIDFile{
 		PID:        os.Getpid(),
 		DataDir:    dir,
