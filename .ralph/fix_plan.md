@@ -2436,7 +2436,7 @@ heuristic stays live.)
     - Design doc `docs/design/0100-0149/m-nightly-index-null-key-guard.md`.
       The storage fix is filed below.
     Movement: none
-- [ ] **store NULL\-keyed index entries \(the real fix behind the NULL\-key
+- [x] **store NULL\-keyed index entries \(the real fix behind the NULL\-key
   guard\)** \(filed 2026\-09\-24\). PostgreSQL stores index tuples with NULL
   key columns; goopg skips them, so the planner must refuse valid index
   plans \(upstream `btree\_index`\'s composite SAOP probe, `limit`\'s
@@ -2496,11 +2496,24 @@ heuristic stays live.)
     Kind: bug
     Parent: none
     Movement: none
-  - [ ] **store\-null\-keys S3 — relax the planner guard** for tuple\-format
+  - [x] **store\-null\-keys S3 — relax the planner guard** for tuple\-format
     indexes in flagged clusters \(move the format predicate where the
     optimizer can import it\). Design §Slices 3. After S1 and S2.
     Kind: impl
     Parent: none
+    - **LANDED 2026\-09\-24 \(ralph2 loop \#46\), `42a6c9abc`.** The format
+      test stays in the executor and is registered with catalog at init;
+      `catalog.IndexHasNullKeyedEntries` lets both guard helpers accept
+      tuple\-format indexes of capable clusters.
+      - Recovered on a capable cluster: limit\'s GroupAggregate over the
+        tenk1\_thous\_tenthous index\-only scan; create\_index\'s
+        `thousand = 42 AND \(tenthous …\)` index scans. Guard tests run in
+        both capability states.
+      - Gates: units, spotcheck, sf025 \(changed=0 — the bench clusters
+        predate the capability\), acceptance arm, fire\-set.
+      - Parent task complete; remaining gap ledgered \(no upgrade path for
+        existing clusters\).
+    Movement: none
 - [x] **setop output type is the FIRST member's, not `select_common_type`'s
   (found 2026-09-21 by an M0145-0004 discovery probe)** — **FIXED
   2026-09-22** for PostgreSQL's numeric type category, which covers both

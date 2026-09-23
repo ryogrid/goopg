@@ -1,8 +1,9 @@
 # Index scans and NULL-keyed rows: the interim guard
 
-Status: landed 2026-09-24 (`821eda191`). The real fix, storing NULL-keyed
-index entries, is filed as its own task (fix_plan M-NIGHTLY, "store
-NULL-keyed index entries").
+Status: landed 2026-09-24 (`821eda191`). Since `42a6c9abc` it applies only
+to indexes that do not store NULL-keyed entries: in a cluster with the
+null_keyed_index_entries capability, tuple-format indexes hold every row and
+pass the guard. See [storing NULL-keyed index entries](m-nightly-store-null-keyed-index-entries.md).
 
 ## The defect
 

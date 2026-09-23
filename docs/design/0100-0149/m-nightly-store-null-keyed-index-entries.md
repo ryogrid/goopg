@@ -1,6 +1,6 @@
 # Storing NULL-keyed index entries: design and slices
 
-Status: S1+S2 landed 2026-09-24 (`83f5635c8`); S3 open. Follows
+Status: complete 2026-09-24 — S1+S2 `83f5635c8`, DESC fix `63d720bd2`, S3 `42a6c9abc`. Follows
 [the interim guard](m-nightly-index-null-key-guard.md) (`821eda191`). Task:
 `.ralph/fix_plan.md` M-NIGHTLY "store NULL-keyed index entries".
 
@@ -135,3 +135,25 @@ as value bounds and converted to index-order bounds (`rangeColumnReversed`
 swaps the ends and their strictness). The NULL stop works in index order,
 where NULLS FIRST is DESC's default, so DESC columns get it too. The earlier
 "DESC key columns get no NULL stop" gap is closed.
+
+## S3 landed (2026-09-24, `42a6c9abc`)
+
+The tuple-format test stayed in the executor, where its type and comparator
+tables live. The executor registers it with catalog at init
+(`catalog.SetIndexFormatStoresNullKeysFunc`), and
+`catalog.IndexHasNullKeyedEntries(idx)` answers "capable cluster AND
+tuple-format index". Both guard helpers (`indexUnboundKeysNullSafe`,
+`indexUnboundKeysNotNull`) accept such an index, so every producer they
+protect may use it again. Blob-format and expression indexes, and every
+index of an older cluster, keep the guard. An optimizer-only binary, which
+never registers the test, keeps it too.
+
+Recovered on a capable cluster (upstream regress, with `create_index` run
+first so `tenk1_thous_tenthous` exists):
+- `limit`'s GroupAggregate over `Index Only Scan using tenk1_thous_tenthous`
+  (diff 272 → 269 lines);
+- `create_index`'s `thousand = 42 AND (tenthous …)` plans, back from Seq
+  Scan to Index Scan on that index.
+
+The benchmark clusters predate the capability, so no TPC-H or TPC-DS plan
+moves until they are rebuilt.
