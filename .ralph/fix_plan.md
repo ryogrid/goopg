@@ -2451,16 +2451,26 @@ heuristic stays live.)
     - Old indexes: a cluster capability flag written at initdb
       \(`global/pg\_goopg\_features`\), not a per\-index marker \(none is
       durable without a visible reloption\).
-  - [ ] **store\-null\-keys S1 — readers stop at NULL** on open\-ended bounds
+  - [x] **store\-null\-keys S1 — readers stop at NULL** on open\-ended bounds
     \(index, index\-only, bitmap range probes; NULLS FIRST low end\). Design
     §Slices 1.
     Kind: impl
     Parent: none
-  - [ ] **store\-null\-keys S2 — writers store NULL\-keyed entries behind the
+  - [x] **store\-null\-keys S2 — writers store NULL\-keyed entries behind the
     cluster flag** \(marker file, build/runtime/arbiter writers, amcheck\).
     Design §Slices 2. May land with S1.
     Kind: impl
     Parent: none
+    - **S1\+S2 LANDED 2026\-09\-24 \(ralph2 loop \#44\), `83f5635c8`.**
+      Capability marker `global/pg\_goopg\_features`; writers \(bulk,
+      runtime, arbiter — the arbiter had a separate gap, a NULL conflict key
+      skipped its entry\) keep NULLs in capable clusters; one\-sided ranges
+      stop at the NULL group; amcheck expects the entries.
+      - Proof: heapallindexed on three indexes incl. after kill \-9 \+ WAL
+        replay; range shapes vs the no\-index answer, each failing with the
+        stop disabled; regress on a capable cluster identical to HEAD.
+      - Gates: units, spotcheck, sf025 \(changed=0\), acceptance arm.
+      Movement: none
   - [ ] **store\-null\-keys S3 — relax the planner guard** for tuple\-format
     indexes in flagged clusters \(move the format predicate where the
     optimizer can import it\). Design §Slices 3. After S1 and S2.

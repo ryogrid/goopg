@@ -1,6 +1,6 @@
 # Storing NULL-keyed index entries: design and slices
 
-Status: design, 2026-09-24. Follows
+Status: S1+S2 landed 2026-09-24 (`83f5635c8`); S3 open. Follows
 [the interim guard](m-nightly-index-null-key-guard.md) (`821eda191`). Task:
 `.ralph/fix_plan.md` M-NIGHTLY "store NULL-keyed index entries".
 
@@ -89,3 +89,39 @@ scope.
 
 Slices 1 and 2 may land together if slice 1 cannot be exercised without
 real entries; slice 3 must not land before both.
+
+## S1+S2 landed (2026-09-24, `83f5635c8`)
+
+As designed, with these specifics:
+
+- **Marker file.** `global/pg_goopg_features` (an `initdb.SampleFiles`
+  entry) holds `null_keyed_index_entries`. `initdb.Open` reads it before
+  any index is touched and sets `catalog.SetNullKeyedIndexEntries`.
+- **Bulk build.** `indexBuildEntryKey` returns the NULL-bearing image in a
+  capable cluster. `collectBTreeEntries` files it in `nullEntries`, which
+  is appended after the duplicate walk: two NULL images compare equal in
+  index order, and `BulkCreate` sorts its input anyway.
+- **Runtime writes.** `indexEntryKey` projects through
+  `indexRowKeyValuesKeepNull`, while `indexRowProbeKey` keeps
+  `indexRowKeyValues` (NULL means no probe).
+- **ON CONFLICT.** `arbiterEntryKey` keeps NULLs and `arbiterProbeKey` does
+  not. `applyInsert` had gated the arbiter entry on a probe key existing,
+  so a NULL conflict key left the arbiter without an entry; it now files
+  one.
+- **Scan bounds.** `nullStopRangeBound` applies only to a range with
+  exactly ONE bound. With none, the scan is a full scan or an
+  equality-prefix probe, and both keep the NULL entries. The index scan
+  (`nullStopLo`/`nullStopHi` feed `NewScanCursor`) and the index-only scan
+  (`RangeScanWithPosLeafFilter`) both use it. Bitmap scans only probe
+  equality.
+- **Verification.**
+  - `bt_index_check(…, heapallindexed)` passes on bulk-built,
+    runtime-maintained and arbiter indexes, and passes again after a
+    kill -9 restart (WAL replay).
+  - Every one-sided shape matches the no-index answer, and each fails with
+    the stop disabled.
+  - Upstream regress on a capable cluster is identical to HEAD.
+
+Not covered (ledgered): DESC key columns get no NULL stop; a cluster can
+only gain the capability at initdb (no upgrade path); removing the marker
+from a capable cluster would leave its NULL entries unguarded.
