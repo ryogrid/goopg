@@ -2319,6 +2319,14 @@ heuristic stays live.)
     affected. This probe ran on the jointree arm; the legacy default
     reaches the same executor arms \(its index\-only case is verified
     above\).
+  - **ROOT CAUSE found 2026\-09\-23 \(`98f68622d`\):** the byte\-key btree stores
+    NO entry whose key has a NULL column \(`collectBTreeEntries` in
+    `internal/executor/operators_ddl.go`: "not storable in the byte\-key
+    btree \(no null bitmap\)"; runtime maintenance skips them too\). Any
+    index scan that does not itself exclude NULLs in some key column misses
+    those rows. The jointree restriction producers now decline such indexes;
+    the rule\-based, bitmap, parameterised and ordered producers do not yet.
+    Real fix: a NULLS\-LAST NULL encoding so the entries are stored.
 - [x] **setop output type is the FIRST member's, not `select_common_type`'s
   (found 2026-09-21 by an M0145-0004 discovery probe)** — **FIXED
   2026-09-22** for PostgreSQL's numeric type category, which covers both
@@ -18382,6 +18390,18 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
       family for that commit. Bisected and fixed here.
     - `TestPort_IsolationEvalPlanQual` is intermittent at HEAD as well
       \(already filed by the nightly\).
+  - **SAOP \+ range and the NULL\-key guard 2026\-09\-23 \(ralph2 loop \#20\),
+    `98f68622d`.**
+    - `a IN \(…\) AND b > x` on `\(a, b\)` is one probe \(SAOPKeys \+
+      second\-column bounds\); live flip server identical to PG.
+    - Restriction producers now decline an index whose UNBOUND key columns
+      are nullable: the byte\-key btree stores no entry with a NULL key
+      column \(root cause of the filed trailing\-NULL bug\).
+    - Group\-I witness `TestSAOPWithConjunctMoves` still fails under the
+      flip only because its fixture has no stats \(1 row, 1 page\); the
+      shape it wants now exists.
+    - Remaining for group I: the owner's multiplier call; fixture
+      dispositions in the flip commit.
 - [ ] **M0145-0030 — group B: adjudicate the 11 behavioural flip-triage
   tests before the flip** (same filing). The flip-triage doc lists 11
   behavioural failures: grouping strategy, nested scalar subquery, NLI

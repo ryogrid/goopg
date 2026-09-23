@@ -361,3 +361,40 @@ previous HEAD, and passes with `8a8f1c11f`. `TestUniqueColumnEqualityUsesIsUniqu
 pins it. `TestPort_IsolationEvalPlanQual` fails intermittently at the previous
 HEAD too (1 of 3 runs passed) and is already filed by the nightly.
 
+## Follow-up: SAOP + second-column range, and the NULL-key root cause (`98f68622d`)
+
+**SAOP followed by a range.** PG binds `a IN (7, 8) AND b > 90` on `(a, b)` as
+one probe: `Index Cond: ((a = ANY (...)) AND (b > 90))`. `IndexScan` now
+carries `LowKey`/`HighKey` beside `SAOPKeys`, meaning bounds on index column 1.
+With no bound set, the old SAOP probe is unchanged byte for byte.
+- **Executor.** `rescanSAOP` runs each element's descent over
+  `[elem, low] .. [elem, high]`, with the range branch's padding rules applied
+  one column further in. The cursor gets strictness only for bounds the plan
+  actually carries.
+- **Producer.** A leading SAOP is followed by `restrictionRangeOnColumn(…, 1)`.
+  The bound stays as a Filter recheck; the IN is dropped. Selectivity is
+  `scalararraysel` times the range band.
+- **Consumers.** The SAOP lowering sets the bounds, EXPLAIN renders them,
+  `indexScanPredicate` (UPDATE/DELETE) rebuilds `IN AND bounds`, and the EPQ
+  fold's row-locality check covers the bounds.
+
+**Root cause of the filed trailing-NULL bug.** The byte-key btree stores **no
+entry whose key has a NULL column**: `collectBTreeEntries` skips it as "not
+storable in the byte-key btree (no null bitmap)", and runtime maintenance does
+the same. A probe that leaves a nullable key column unbound therefore misses
+every matching row with a NULL there. On a live server,
+`a IN (7, 8) AND b > 90` on `(a, b, c)` lost the `(7, 92, NULL)` row. The
+restriction, SAOP, prefix+range and index-only-with-quals producers now
+decline an index whose unbound key columns are not all `NOT NULL`
+(`indexUnboundKeysNotNull`). Bound columns are safe, since a NULL there fails
+the qual. The rule-based, bitmap, parameterised and ordered producers keep the
+exposure; that is the filed bug's scope. The real fix is to store NULL keys,
+which needs a NULLS-LAST null encoding in the byte-key format.
+
+Checked on a live flip server against PG 18.3, on 20,000 rows with NULLs in
+`b` and `c`, strict and inclusive bounds, 2- and 3-column indexes, duplicate
+and NULL IN elements, a subquery-wrapped count, UPDATE and DELETE: every
+result is identical. `TestRestrictionSAOPPlusRangeOnJointreePipeline` and
+`TestRestrictionProbeDeclinesUnboundNullableKeyColumn` pin the shape and the
+guard. No corpus plan moved on either arm.
+

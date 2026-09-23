@@ -1,31 +1,31 @@
 Task: M0145-0029 — one-relation index-path coverage (flip-triage group I).
-Landed: slices 1, 2a, 2b, 3, 4; slice 5 re-run; index_update_stats;
-planner toggles + eqsel isunique (8a8f1c11f).
-Open: SAOP-prefix + range (TestSAOPWithConjunctMoves); owner multiplier call.
+Landed: slices 1, 2a, 2b, 3, 4; slice 5 re-run; index_update_stats; planner
+toggles + eqsel isunique; SAOP + second-column range + NULL-key guard
+(98f68622d). Group I remaining: owner's indexProbeCostMultiplier call, and
+fixture/expectation edits that ride the flip commit (M0145-0008).
 
-Files (this loop): internal/postmaster/dispatch.go (plannerSettingsFrom reads
-enable_seqscan/indexscan/bitmapscan/sort), internal/optimizer/joinsearch.go
-(prebuiltLeafDisabledNodes), selectivity.go (uniqueColumnTuples,
-uniqueEqSelectivity), planner.go (seqWinsEqualityProbe synthetic scan carries
-index uniqueness); tests unique_eqsel_test.go, plan_cache_cost_gucs_test.go.
+Files (this loop): executor operators_index.go rescanSAOP (bounds on column
+1), operators_explain.go SAOP Index Cond, operators_storage.go
+indexScanPredicate SAOP arm, operators_lockrows.go EPQ locality; optimizer
+pathindexrestrict.go (SAOP + restrictionRangeOnColumn(…,1),
+indexUnboundKeysNotNull, boundIndexColumns), pathindexonly.go
+(consumingIndexClauses guard), createplanindex.go createSAOPIndexScanPlan.
 
 Findings:
-- The four toggles were never read into PlannerSettings, so the search
-  ignored SET enable_* on both pipelines. Fixed.
-- 292b1af2e (CREATE INDEX size recording) had REGRESSED the pass-required
-  TestPort_IsolationMultipleRowVersions (1M-row PK point UPDATE seq-scanned
-  because the key was priced at 1/200). Fixed via eqsel isunique; bisected.
-  LESSON: run the TestPort_Isolation family for any change that alters
-  table statistics or selectivity, not just the regress suite.
-- TestPort_IsolationEvalPlanQual is intermittent at HEAD too (1/3 passed
-  there) — the nightly item AI-20260922-004850-001.
+- ROOT CAUSE of the filed trailing-NULL wrong-results bug: the byte-key btree
+  stores NO entry with a NULL key column (collectBTreeEntries). Jointree
+  restriction producers now decline indexes with unbound nullable key
+  columns; rule-based / bitmap / parameterised / ordered producers still
+  exposed (bug entry updated with the root cause; real fix = NULL encoding).
+- isunique for never-analysed tables needs estimated tuples (ledgered).
 
-Next step: per banner, M0145-0029 SAOP-prefix + range (an IN list followed by
-a range on the next index column; needs a SAOP probe with a trailing bound in
-the executor); or the owner's multiplier answer if given.
+Next step: per banner — group I is down to owner-gated and flip-commit items,
+so consider M0145-0029 done-pending-owner and move to M0145-0030 (group B:
+adjudicate 11 behavioural flip-triage tests, plus the knob-default script
+audit). Re-read the banner first.
 
 Gates run: units, tpch-spotcheck (Q12=2 Q13=33), tpcds-sf025 (PASS=96,
 same=99), acceptance arm (identical), tpcds-fireset (knob plans identical),
-TestPort_RegressSuite, TestPort_Isolation family (only the pre-existing
-EvalPlanQual flake fails) — PASS.
+TestPort_RegressSuite, TestPort_Isolation (only the known intermittent
+EvalPlanQual) — PASS.
 In-flight: none.
