@@ -1,6 +1,6 @@
 # M0145-0030 — group B: adjudicating the behavioural flip-triage tests
 
-Status: in progress (started 2026-09-23). Task: `.ralph/fix_plan.md`
+Status: complete 2026-09-23 (loop #24). Residue is handed to the flip commit (§Hand-off). Task: `.ralph/fix_plan.md`
 M0145-0030 (Kind: impl, Parent: M0145-0008). Origin: the M0145-0008 flip
 triage, group B (`m0145-0008-flip-test-triage.md`).
 
@@ -39,9 +39,29 @@ belong to M0145-0029's residue, not to this task.
 | `TestCreateGroupingPathsGucOnPkFdStaysHash` | real defect: the index-ordered sorted variant was priced from its rule-era display cost | **fixed** (fix 2, below) |
 | `TestPlannerSettingsReachScalarSubqueryJoin/…/nested`, `TestScalarSubqueryPropagationKeepsDefaultPlan/nested` | PG-faithful: the middle subquery's single-rel scan is now costed (145 = PG's seq-scan cost); the innermost join is unchanged at 171.25..354.75 | **stale pin, updated**: nested arms read the innermost costed plan (`innermostCostedScalarInner`) |
 | `TestExplainAnalyzeRowsRemovedByJoinFilter` | PG-faithful: PG 18.3 puts the one-sided ON qual `b.val <> 'y'` in b's scan Filter | **stale expectation, updated**: the query uses the two-sided residual `a.id + b.id <> 4`, which PG prints as `Join Filter` / `Rows Removed by Join Filter: 1` |
-| `TestNLISemiResidualExecution`, `TestNLIAntiResidualExecution`, `TestParallelNLIJointypeIdentity/semi` | NLI semi/anti not elected (Hash Semi Join instead) | open |
-| `TestHashedInProbeActuallyFires` | the hashed-IN SubPlan is not built (nil kvcache) | open |
-| `TestRunFastJoinConcrete` | not yet diagnosed | open |
+| `TestNLISemiResidualExecution`, `TestNLIAntiResidualExecution` | PG-faithful: on the 4-row inner PG 18.3 also elects Hash Semi/Anti Join, never the index probe (not even with hash, merge and material all off) | **stale fixture, re-based**: `newNLIResidualFixtureLargeInner` adds 100k non-matching inner rows, where PG elects the probe `Nested Loop Semi Join`. Passes on both arms. For NOT EXISTS PG elects Merge Right Anti Join, which goopg lacks (no JOIN\_RIGHT\_ANTI, ledgered) |
+| `TestParallelNLIJointypeIdentity/semi`, `/anti` | fixture re-based (100 outer x 100k inner, stats seeded, PG elects the probe). The jointree arm emits R25's decomposed lateral `Join`, not the fused node, and with `GOOPG_INDEX_PROBE_MULT=2` a bitmap probe, neither partial-capable | **legacy-only family.** The guard now also requires `NestedLoopIndexJoinIsPartialCapable`, so it fails as "wrong family" instead of a false N-copy. The flip commit pins or deletes it. Partial decomposed semi/anti is a capability gap (ledgered) |
+| `TestHashedInProbeActuallyFires` (+ `TestHashedInBudgetPressure`, hidden behind its panic) | relied on the legacy unnest switch to keep a top-level IN as a SubPlan. PG pulls that IN up; it hashes the SubPlan only where pull-up is impossible | **stale query, updated**: `… IN (…) OR a < 0`, PG's `(hashed SubPlan 1)` shape. Passes on both arms |
+| `TestHashedInMixedKindFallsBack` (hidden behind the same panic) | **non-PG premise**: PG rejects int IN (text subquery) with 42883. goopg accepts it and the arms disagree (1 row vs 0) | annotated; type-check gap ledgered; the flip commit decides (see §Hand-off) |
+| `TestSubqueryUnnestKillSwitch` (hidden behind the same panic) | asserts goopg's internal unnest kill switch, which PG has no equivalent of and the jointree pull-up does not consult | **legacy-only (group L)**; the flip commit pins or deletes it |
+| `TestRunFastJoinConcrete` | stale structure pin: the join search emits Project over Project over Join (with scan narrowing Projects). The legacy arm emits the identical stack whenever it searches (verified with the comma-join form); its single wrapper came from the rule-built explicit-JOIN path | **updated**: walk past any chain of Projects. Passes on both arms |
+
+## Hand-off to the M0145-0008 flip commit
+
+After this task, under the flip the optimizer and executor packages fail
+only on:
+- **group I** (M0145-0029's residue, not this task): `TestSAOPWithConjunctMoves`,
+  the executor index end-to-end tests, `TestIOS_HeapFallback`, and the two
+  deform tests;
+- **three executor tests this task hands over:**
+  - `TestParallelNLIJointypeIdentity/semi`, `/anti` (legacy-only fused family);
+  - `TestSubqueryUnnestKillSwitch` (legacy-only switch);
+  - `TestHashedInMixedKindFallsBack` (non-PG premise; convert it to a 42883
+    assertion once the type check lands, or pin it until then).
+  The optimizer package's `pinLegacyPipeline` is test-local and cannot be
+  reached from `internal/executor`. AGENT.md forbids a second
+  pipeline-selection mechanism, so the flip commit chooses between deleting
+  these arms and adding a sanctioned test-only pin.
 
 ## Fix 1: pulled-up bodies get their own SourceTableIdx range (`903780b3e`)
 

@@ -18422,7 +18422,7 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
       of `TestSAOPWithConjunctMoves`;
     - to the filed bug: the byte\-key btree's missing NULL\-key entries.
   Movement: none
-- [ ] **M0145-0030 — group B: adjudicate the 11 behavioural flip-triage
+- [x] **M0145-0030 — group B: adjudicate the 11 behavioural flip-triage
   tests before the flip** (same filing). The flip-triage doc lists 11
   behavioural failures: grouping strategy, nested scalar subquery, NLI
   semi/anti election, hashed-IN SubPlan, two EXPLAIN expectations (one
@@ -18480,6 +18480,23 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
     - Script audit done: the exact site list for the flip commit is in the
       design doc. The fire\-set gate\'s legacy\-vs\-knob comparison needs a
       post\-flip definition, which the flip commit decides.
+  - **CLOSED 2026\-09\-23 \(loop \#24\).** Every group\-B test is dispositioned
+    against PG 18.3 \(design doc table and §Hand\-off\).
+    - Re\-based or updated, passing on both arms: NLI semi/anti residual
+      \(large\-inner fixture; PG itself probes only there\), hashed\-IN probe
+      and budget \(IN under OR, PG\'s hashed\-SubPlan shape\),
+      `TestRunFastJoinConcrete` \(Project stack\).
+    - Handed to the M0145\-0008 flip commit, still red under the flip:
+      `TestParallelNLIJointypeIdentity/semi`, `/anti` \(legacy\-only fused
+      family\), `TestSubqueryUnnestKillSwitch` \(legacy\-only switch\),
+      `TestHashedInMixedKindFallsBack` \(non\-PG premise: PG raises
+      42883\). `pinLegacyPipeline` cannot be reached from the executor, so
+      the flip commit either deletes them or adds a sanctioned test pin.
+    - Ledgered: no JOIN\_RIGHT\_ANTI/RIGHT\_SEMI; partial decomposed
+      lateral semi/anti; int IN text\-subquery accepted instead of 42883;
+      the rule\-era sorted\-input builder; hash\-build EXPLAIN ANALYZE
+      `loops=0`.
+    - Group I \(index coverage\) remains M0145\-0029\'s residue.
 
 ## M0146 — Post-cutover plan parity (filed 2026-09-23, owner decision)
 
