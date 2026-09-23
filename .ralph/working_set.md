@@ -1,16 +1,26 @@
-(idle — nothing in flight)
+Task: M0145-0029 — one-relation index-path coverage (flip-triage group I).
+Slice 1 LANDED fe3d1b0aa (plain restriction IndexScan path, equality prefix).
 
-Last loop (ralph2 #11): sweep item 2 FIXED (40ae756e9): LOCK TABLE 25P01,
-DO/CALL bodies not top-level (enterRoutineBody), PL/pgSQL non-DML SQL
-passthrough. Sweep task open with 4 items (REINDEX NOTICE, NOTIFY PID 1 +
-NOTIFY/LISTEN in routines, DISCARD ALL, CREATE PUBLICATION warning).
+Files: internal/optimizer/pathindexrestrict.go (producer), createplanindex.go
+(rewrapLeafDropping), pathindexclauses.go (indexPathClause.local); design doc
+docs/design/0100-0149/m0145-0029-one-rel-index-path-coverage.md.
 
-OWNER DECISIONS 2026-09-23 appeared in the working tree mid-loop (banner +
-new tasks, NOT yet committed by the owner — do not commit or edit the banner;
-commit fix_plan only via an index blob built from HEAD + your own edits):
-M0145-0001 option (a) — LINEAGE-BASELINE re-pinned; M0145-0029 (one-rel
-index-path coverage) and M0145-0030 (behavioural triage) filed and must land
-BEFORE the M0145-0008 flip; M0140-0007 → M0146-0002; M0141-S7 held →
-M0146-0006; new milestone M0146 gated on the flip.
-Next step: re-read the banner — item 3 (M0145) is selectable again; take
-M0145-0029 (see docs/design/0100-0149/m0145-0008-flip-test-triage.md group I).
+Findings: search filed NO plain restriction index path before (prebuilt +
+equality-only bitmap). PG oracle: varchar witness = Bitmap Heap Scan in PG
+too (stale test expectation); composite witness = Index Only Scan WITH quals
+(goopg IOS producer is quals-less → slice 3). No corpus plan moves (default
+sweep same=99, knob fire-set plans unchanged).
+
+Next step: slice 2 or 3 — suggest slice 3 (index-only scan with index quals,
+pathindexonly.go addIndexOnlyPaths + IndexOnlyScan lowering), verify with
+TestIOS_CompositeInt4Int4 under a local flip (flip line: jointreepipeline.go
+jointreePipelineFromEnv `v == "1"` → `v != "0"`; REVERT before commit).
+
+NOTE: owner's banner/decision edits in .ralph/fix_plan.md are UNCOMMITTED
+(M0145-0029/0030 + M0146 entries live only there). Commit fix_plan only via
+an index blob built from HEAD + your own edits; your M0145-0029 bullet is in
+the working tree and rides with the owner's commit.
+
+Gates run: units, tpch-spotcheck, tpcds-sf025 (same=99), acceptance arm,
+tpcds-fireset (24 fires) — all PASS.
+In-flight: none.
