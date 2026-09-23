@@ -43,6 +43,10 @@ type ddlOp struct {
 	plan *optimizer.DDL
 	ctx  *Context
 	done bool
+	// buildHeapTuples is the live heap-tuple count the latest btree build's
+	// heap scan saw — heapam_index_build_range_scan's return value, which
+	// index_update_stats publishes as the heap's reltuples.
+	buildHeapTuples float64
 	// pendingDropShadow carries the table a CREATE displaced by overwriting a
 	// same-transaction deferred-DROP's still-present catalog slot
 	// (M0134-0023). Set by execCreateTable right after
@@ -14733,6 +14737,7 @@ func (o *ddlOp) createBTreeIndex(pos int, idxName parser.ObjectName, tbl *catalo
 	if sess, ok := o.ctx.Session.(*BasicSession); ok {
 		sess.RecordDDLCreate(DDLUndoEntry{Name: idxName, RelOID: idx.OID, IsIndex: true})
 	}
+	o.indexUpdateHeapStats(tbl, o.buildHeapTuples)
 	if catalogHeapSyncAvailable(o.ctx) {
 		if syncErr := syncIndexToCatalogHeap(o.ctx, idx); syncErr != nil {
 			return fmt.Errorf("DDL catalog sync: %w", syncErr)
@@ -14746,6 +14751,57 @@ func (o *ddlOp) createBTreeIndex(pos int, idxName parser.ObjectName, tbl *catalo
 	// entry from both at startup. A real PG standby replays the same heap
 	// inserts (no rmid-128 record).
 	return nil
+}
+
+// indexUpdateHeapStats is the heap half of index_update_stats
+// (postgres/src/backend/catalog/index.c:2809): after an index build, the
+// heap's pg_class reltuples/relpages become the build scan's live-tuple count
+// and the heap's block count, which ends the never-vacuumed 10-page floor
+// (table_block_relation_estimate_size, tableam.c:696) for a table indexed
+// after it was loaded. PG's guards, in order:
+//
+//   - an EMPTY heap whose reltuples is still "never measured" (-1) stays so,
+//     so CREATE TABLE … PRIMARY KEY does not make a table look vacuumed;
+//   - nothing is written unless autovacuum is active (AutoVacuumingActive:
+//     the autovacuum GUC and track_counts) and the table's
+//     autovacuum_enabled reloption is not false — a dump restore may have
+//     loaded statistics the user expects to keep.
+//
+// relallvisible needs no write: goopg reads it live from the VM. Published
+// and persisted exactly as VACUUM does (UpdateRelStats + persistRelSize);
+// a failed size write is non-fatal, as there.
+func (o *ddlOp) indexUpdateHeapStats(tbl *catalog.Table, reltuples float64) {
+	if tbl == nil || tbl.PartitionMethod != "" {
+		return
+	}
+	if reltuples == 0 && (tbl.Stats == nil || !tbl.Stats.Analyzed) {
+		return
+	}
+	if !autoVacuumingActive(o.ctx) || (tbl.AutovacuumEnabledSet && !tbl.AutovacuumEnabled) {
+		return
+	}
+	nBlocks, err := o.ctx.Pool.NBlocks(o.ctx.Catalog.RelFileNode(tbl))
+	if err != nil {
+		return
+	}
+	o.ctx.Catalog.UpdateRelStats(tbl, int(nBlocks), int64(reltuples))
+	_ = persistRelSize(o.ctx, tbl, int64(reltuples), int(nBlocks))
+}
+
+// autoVacuumingActive is PG's AutoVacuumingActive(): the autovacuum GUC and
+// track_counts both on. Unset or unreadable settings take PG's boot values
+// (both on).
+func autoVacuumingActive(ctx *Context) bool {
+	if !shouldTrackCounts(ctx) {
+		return false
+	}
+	if ctx == nil || ctx.GetSetting == nil {
+		return true
+	}
+	if v, ok := ctx.GetSetting("autovacuum"); ok && v == "off" {
+		return false
+	}
+	return true
 }
 
 // bulkBuildBTreeFull collects all heap entries into memory, then calls
@@ -14827,6 +14883,7 @@ func (o *ddlOp) collectBTreeEntries(idx *catalog.Index, tbl *catalog.Table, cols
 		return nil, &ExecError{Code: "XX000", Pos: pos, Message: err.Error()}
 	}
 	var entries []nbtree.BulkEntry
+	o.buildHeapTuples = 0
 	// seenNull dedups null-bearing rows for a NULLS NOT DISTINCT unique index
 	// (NULLs collide). Lazily allocated; nil for every default index so non-NND
 	// builds are byte-for-byte unchanged.
@@ -14869,6 +14926,9 @@ func (o *ddlOp) collectBTreeEntries(idx *catalog.Index, tbl *catalog.Table, cols
 			if !isLiveForUniqueCheck(o.ctx, tuple.Header.Xmin, tuple.Header.Xmax) {
 				continue
 			}
+			// Counted before any predicate or decode skip: PG's reltuples is
+			// the heap's live-tuple count, not the index's entry count.
+			o.buildHeapTuples++
 			// M0054-0005c: reuse a per-CREATE-INDEX decode buffer to
 			// avoid the per-row `make(Row, len(tbl.Columns))` that
 			// the M0054-0004 idx-window pprof showed at 39 % cum.

@@ -505,6 +505,7 @@ func TestIndexDeformQ6ShapeStillThreeOfEight(t *testing.T) {
 // consumer reads past it.
 func TestIndexDeformRescanPersistsBound(t *testing.T) {
 	ctx := deformW8Fixture(t)
+	withAutovacuumOff(ctx)
 	if err := runDDL(t, ctx, `CREATE INDEX w_a_idx ON w (a)`); err != nil {
 		t.Fatalf("CREATE INDEX: %v", err)
 	}

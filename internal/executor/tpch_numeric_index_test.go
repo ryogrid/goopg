@@ -34,6 +34,7 @@ import (
 func TestTPCHNumericSingleColumnIndexesAccepted(t *testing.T) {
 	ctx, _, cleanup := newDDLFixture(t)
 	defer cleanup()
+	withAutovacuumOff(ctx)
 
 	for _, ddl := range tpch.DDL() {
 		if err := runDDL(t, ctx, ddl); err != nil {

@@ -91,6 +91,7 @@ func newTpchTypeFixture(t *testing.T) (*Context, catalog.Catalog, func()) {
 func TestIndexScanVarcharEndToEnd(t *testing.T) {
 	ctx, _, cleanup := newDDLFixture(t)
 	defer cleanup()
+	withAutovacuumOff(ctx)
 
 	if err := runDDL(t, ctx, "CREATE TABLE part (p_partkey int, p_type varchar(25))"); err != nil {
 		t.Fatal(err)
@@ -145,6 +146,7 @@ func TestIndexScanVarcharEndToEnd(t *testing.T) {
 func TestIndexScanCharEndToEnd(t *testing.T) {
 	ctx, _, cleanup := newDDLFixture(t)
 	defer cleanup()
+	withAutovacuumOff(ctx)
 
 	if err := runDDL(t, ctx, "CREATE TABLE customer (c_custkey int, c_mktsegment char(10))"); err != nil {
 		t.Fatal(err)
@@ -197,6 +199,7 @@ func TestIndexScanCharEndToEnd(t *testing.T) {
 func TestIndexScanTimestampEndToEnd(t *testing.T) {
 	ctx, _, cleanup := newDDLFixture(t)
 	defer cleanup()
+	withAutovacuumOff(ctx)
 
 	if err := runDDL(t, ctx, "CREATE TABLE lineitem (l_linenumber int, l_shipdate timestamp)"); err != nil {
 		t.Fatal(err)
