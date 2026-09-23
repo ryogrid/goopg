@@ -113,6 +113,13 @@ type indexPathClause struct {
 	// operand, supplied by the parameterising relations. This is what becomes
 	// `IndexScan.Keys[indexCol]`.
 	key Expr
+	// local is the leaf-local restriction conjunct this clause was taken from
+	// (unparameterised restriction paths only, pathindexrestrict.go); nil for
+	// a join-clause index qual. createIndexScanPlan drops it from the leaf's
+	// reinstated Filter, since the probe already applies it — PG's
+	// create_indexscan_plan leaves such quals out of qpqual
+	// (is_redundant_with_indexclauses, createplan.c:3068-3088).
+	local Expr
 }
 
 // indexPathClauses is `build_index_paths`' `index_clauses` accumulation

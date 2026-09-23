@@ -60,6 +60,9 @@ func (s *searchCtx) addBaseRelIndexPaths(cat catalog.Catalog) {
 	// express a preference in, and retires with the legacy planner (P6).
 	s.addParameterizedIndexPaths(cat)
 	s.addOrderedIndexPaths(cat)
+	// M0145-0029: the plain half's restriction arm — `index_clauses` from the
+	// relation's own quals (pathindexrestrict.go).
+	s.addRestrictionIndexPaths(cat)
 	// M0128-P2.4: bitmap scan paths compete alongside index scan paths in
 	// add_path for every usable index. They are always generated — PG's
 	// create_index_paths generates both indexscan and bitmap paths for every

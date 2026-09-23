@@ -452,5 +452,53 @@ func createIndexScanPlan(p *Path) Node {
 	default:
 		is.Keys = keys
 	}
+	// A restriction path's index quals came out of the leaf's own Filter:
+	// reinstate the Filter WITHOUT them (PG's qpqual excludes quals redundant
+	// with the index quals, createplan.c:3068-3088).
+	drop := map[Expr]bool{}
+	for _, c := range p.IndexClauses {
+		if c.local != nil {
+			drop[c.local] = true
+		}
+	}
+	if len(drop) > 0 {
+		return rewrapLeafDropping(p.Rel.baseLeaf, is, drop)
+	}
 	return rewrap(is)
+}
+
+// rewrapLeafDropping rebuilds `leaf`'s Filter chain over `scan`, as
+// scanLeafFor's rewrapper does, but with the conjuncts in `drop` removed; a
+// wrapper left with no conjunct is omitted. Conjuncts are matched by pointer
+// identity against flattenExprAnd of each wrapper's predicate — the same
+// decomposition extractFilterConjuncts gave the producer.
+func rewrapLeafDropping(leaf Node, scan Node, drop map[Expr]bool) Node {
+	var wrappers []*Filter
+	for n := leaf; ; {
+		f, ok := n.(*Filter)
+		if !ok {
+			break
+		}
+		wrappers = append(wrappers, f)
+		n = f.Child
+	}
+	out := scan
+	for i := len(wrappers) - 1; i >= 0; i-- {
+		w := wrappers[i]
+		var keep []Expr
+		for _, c := range flattenExprAnd(w.Predicate) {
+			if !drop[c] {
+				keep = append(keep, c)
+			}
+		}
+		if len(keep) == 0 {
+			continue
+		}
+		pred := keep[0]
+		for _, c := range keep[1:] {
+			pred = &BinaryOp{pos: pred.Pos(), Op: parser.OpAnd, Left: pred, Right: c}
+		}
+		out = &Filter{pos: w.pos, Child: out, Predicate: pred, LeafLocal: w.LeafLocal}
+	}
+	return out
 }
