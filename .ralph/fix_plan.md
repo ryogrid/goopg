@@ -14582,7 +14582,7 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
       escalation block instead and that root is now `[!]` pending an
       owner decision — see the escalation for the full write-up.
 
-- [ ] **M0145-0004 — UNION ALL flattening to an appendrel jointree entry**
+- [x] **M0145-0004 — UNION ALL flattening to an appendrel jointree entry**
   (`pull_up_simple_union_all` analogue, prepjointree.c:1617). Absorbs
   M0144-0003b's residual: the branches whose subtree never reached the
   search at all (Q5's `*Project:nil-rel` on both sides, Q2/Q33/Q56/Q60)
@@ -14916,6 +14916,22 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
     prebuilt-over-nested-winner); `is_safe_append_member`'s pull-up
     half is inapplicable in this model (members are not promoted —
     member WHERE quals ride `spliceBranchEmission` per worker).
+  - **CLOSED 2026-09-23 (loop \#13).** The headline — whole-chain
+    UNION ALL flattening — landed as M0145-0004a (`Gather → Parallel
+    Append{ws,cs,store_sales}` verified against PG 18.3, both arms,
+    290 rows). Every remaining bullet above is a ledgered deferral
+    with a named resume point (deferral_ledger rows under
+    M0145-0004): member rtable + `distribute_qual_to_rels` is
+    M0145-0005's IR work, serial-side member-path competition is its
+    member-rel costing question, LATERAL propagation and the
+    `is_safe_append_member` pull-up half are recorded as
+    inapplicable-at-seam-granularity, and Q2's single-reference
+    union CTE is the already-tracked `inline_cte` structural
+    question (M0142-0016c/d lineage). Nothing selectable remains
+    inside this task.
+  Movement: none — bookkeeping closure only; the plan movement
+    (Q14/Q66/Q71 `parallelism` convergence) is recorded under
+    M0145-0004a's own Movement line below.
 - [x] **M0145-0004a — whole-chain UNION ALL flattening**
   (filed 2026-09-22 under the re-pinned lineage baseline; the residual
   M0145-0004's LINEAGE NOTE could not file). PostgreSQL's
@@ -15639,6 +15655,47 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
         its named TIMING blockers are now discharged (gap 1.06x).
         Whether the flip can be split from the legacy-pipeline deletion
         is a scoping decision for the banner's owner.
+    - **Slice-4 blocker RE-ADJUDICATED 2026-09-23 (loop \#13) —
+      DISCHARGED by architecture, verdict changed to NO-FOLD.** The
+      2026-09-21 measurement predates M0145-0005 slice 7
+      (`15fbcf78d`), which retired the pinned-spine route on the
+      jointree arm entirely. Fresh `GOOPG_NLI_CENSUS=1` +
+      `jointree-parity-capture` on private clones, both corpora:
+      - Route counts (`SUBLINKCENSUS`): default arm SF0.25 = 207
+        pinned-spine / TPC-H = 16 (byte-stable control); knob arm
+        SF0.25 = **0 pinned-spine, 23 jointree-pullup, 22
+        jointree-posthoc**; knob arm TPC-H = **0 / 5 / 4**. Declined
+        conjuncts now route to `jointree-posthoc`
+        (`unnestSubqueriesInPlan`, planner.go:2075), which never
+        touches `predp.go`.
+      - Denominator correction: the old knob-arm 291 counted every
+        WHERE-bearing statement S5a fired for (its eligibility test is
+        vacuous for sublink-free predicates); the jointree-arm notes
+        fire only when sublinks are present. Honest sublink-bearing
+        events: SF0.25 = 45 (51% pulled), TPC-H = 9 (56%).
+      - `PULLUPCENSUS` knob arm: SF0.25 = 27 pulled + declines
+        `CTEScan`-leaf 15 (B-06 / M0145-0009; `GOOPG_PULLUP_CTE_LEAF`
+        stays measurement-only OFF), `SubqueryExpr@scalar` 15 (correct
+        — PG does not convert `EXPR_SUBLINK`), `ExistsExpr@or` 2,
+        `InExpr@or` 1. TPC-H = 6 pulled + scalar 4, `InExpr@top` 1,
+        `any-body-not-simple` 1.
+      - Caller trace post-slice-7: `spliceSearchedSpine` (predp.go:207
+        only), `layoutPosMap`/`remapByPosMap`/`remapSublinkOuterRefs`
+        live only in `predp.go`; `runJoinSearchBelowPinned`'s sole
+        caller is planner.go:1932 under `!jointree`. Four recon-named
+        members (`applyJoinTreePosMap`, `remapWithBindings`,
+        `remapPosMapAfterRewrite`, `remapExprRefsToMHJ`) no longer
+        exist as functions — absorbed since the recon.
+        `reresolveJoinByName` + `remapOuterRefsInSubplan` are shared
+        `joinlayout.go` machinery serving the posthoc route on BOTH
+        arms — not splice leftovers.
+      - Verdict: slice 4 has NO fold work. The `predp.go` members die
+        wholesale at M0145-0008's cutover (they must NOT be deleted
+        now — the default arm still fires them 207/16 times); the
+        M0145-0003 coverage gate recorded above is obsolete — coverage
+        now selects pullup-vs-posthoc, never whether the splice
+        family runs. Remaining 0007 work: slice 5
+        (`fillJoinHashKeys`) only.
     - TRAP, recorded in the design doc: a plans capture taken under
       `GOOPG_JOINTREE_PIPELINE=1` lands in the same results directory the
       next DEFAULT sweep diffs against. The sweep after this census

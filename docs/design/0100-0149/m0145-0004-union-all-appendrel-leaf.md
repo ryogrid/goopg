@@ -1,10 +1,13 @@
 # M0145-0004 — UNION ALL subqueries as appendrel leaves
 
-Status: **mark-propagation repair LANDED 2026-09-22**; the Q9 acceptance block
+Status: **CLOSED 2026-09-23** — mark-propagation repair LANDED 2026-09-22;
+the Q9 acceptance block
 that held it was a measurement error, not a gate failure (see the final
-section). Whole-chain UNION ALL flattening remains this task's open residual.
-**`tlist_same_datatypes` landed 2026-09-22** — see the final section; it also
-records an over-refusal the measurement caught before it shipped.
+section). **`tlist_same_datatypes` landed 2026-09-22** — see the final
+section; it also records an over-refusal the measurement caught before it
+shipped. **TASK CLOSED 2026-09-23 (loop #13)**: the whole-chain flattening
+residual landed as M0145-0004a and every remaining bullet is a ledgered
+deferral with a named resume point, so the fix_plan task is marked `[x]`.
 Task: `.ralph/fix_plan.md` M0145-0004. Parent: M0145-0001 (IR contract),
 M0145-0002 (harness), M0144-0003b-1 (the `setOpBranchTag` carry this
 slice consumes). Kind: impl.

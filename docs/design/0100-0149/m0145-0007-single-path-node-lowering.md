@@ -1,9 +1,12 @@
 # Single Path→Node lowering (M0145-0007)
 
 Status: recon complete; slices 1 (lowering-locality guard), 2 (the NLI route
-census) and 3 (the sublink-route census) landed. Both censuses reach the same
-conclusion: this task's remaining items are CUTOVER-blocked, not lowering
-refactors. Task: `.ralph/fix_plan.md`
+census) and 3 (the sublink-route census) landed; slice 4 RE-ADJUDICATED
+2026-09-23 — its recorded blocker was discharged by M0145-0005 slice 7 (the
+pinned-spine route fires 0 times on the jointree arm on both corpora), so the
+family has no fold work and retires wholesale at the M0145-0008 cutover. The
+one remaining actionable item is slice 5 (`fillJoinHashKeys`). Task:
+`.ralph/fix_plan.md`
 M0145-0007. Parent: M0145-0005 (the DP that produces the path tree),
 M0145-0006 (the upper rels that extend it). Kind: impl.
 
@@ -234,7 +237,7 @@ one does — but it is not a capability gap, and it does not gate the cutover.
 | 1 | Retire item 1 by absence: pin that `translateToLayout` is lowering-local (a guard test that fails if a call site appears outside `createplan*.go`), and record the measurement. | Cheap, and it converts a retirement-list line into an enforced invariant instead of a claim. |
 | 2 | **Landed.** The NLI route census (above). Result: the search has a coverage hole — SEMI/ANTI — that must be closed before 0008 may delete the rewrite. |
 | 3 | **Landed as a census, not a fold.** The family's only live caller is the legacy pinned-spine route, which still plans 207 TPC-DS and 16 TPC-H sublink events on the default arm (294 vs 5 on the knob arm). Folding it into lowering would re-implement a route the milestone deletes. |
-| 4 | The rest of the splice/re-resolution family — now understood to be **blocked on M0145-0003**, not on 0005: it retires with the pinned-spine route once the jointree pull-up covers `IN`/`NOT IN`, non-flat bodies and outer-local-only correlation. | The census puts the pull-up's current coverage under 2% of sublink-planning events. |
+| 4 | **Adjudicated NO-FOLD 2026-09-23** — the blocker recorded below ("blocked on M0145-0003 coverage") was discharged by M0145-0005 slice 7 retiring the pinned-spine route on the jointree arm (`pinned-spine=0` on both corpora). The family's `predp.go` members are legacy-arm-only and die wholesale at M0145-0008; `reresolveJoinByName`/`remapOuterRefsInSubplan` are shared lowering machinery that also serve the posthoc route, not splice leftovers. | Nothing to fold — the earlier "coverage" gate measured a route that no longer exists on the target arm. |
 | 5 | `fillJoinHashKeys` folded into the join arm. | LAST, per item 2 — its lateness is a defence, and the defence is only unnecessary once slices 3-4 have removed the mutators. |
 
 ## Gates
@@ -310,3 +313,57 @@ are now discharged and the arm-vs-arm gap is 1.06x.
 Whether the cutover's two halves could be split — flip the default now, defer
 deleting the legacy pipeline until the pull-up covers more shapes — is a
 scoping decision for the banner's owner, not one this loop takes.
+
+## Slice-4 blocker RE-ADJUDICATED (2026-09-23, loop #13)
+
+The 2026-09-21 blocker above was measured BEFORE M0145-0005 slice 7
+(`15fbcf78d`) retired Phase A/B and the pinned-spine route on the jointree arm,
+so the premise it cites — "291 of 308 sublink events still take the pinned
+spine on the knob arm" — no longer describes a route that exists. Re-measured
+with `GOOPG_NLI_CENSUS=1` + `scripts/jointree-parity-capture.sh` on private
+clones, both corpora, both arms:
+
+| arm | corpus | pinned-spine | jointree-pullup | jointree-posthoc |
+|---|---|---|---|---|
+| default | TPC-DS SF0.25 | 207 | 0 | 0 |
+| default | TPC-H SF1 | 16 | 0 | 0 |
+| `GOOPG_JOINTREE_PIPELINE=1` | TPC-DS SF0.25 | **0** | 23 | 22 |
+| `GOOPG_JOINTREE_PIPELINE=1` | TPC-H SF1 | **0** | 5 | 4 |
+
+The default-arm rows are byte-stable controls; on the jointree arm the
+pinned-spine route fires **zero** times — declined conjuncts now route to
+`jointree-posthoc` (`unnestSubqueriesInPlan`, planner.go:2075), which uses the
+`joinlayout.go` machinery and never touches `predp.go`.
+
+The old knob-arm denominator (291/308) was also inflated: the legacy
+`SUBLINKCENSUS` note fired per WHERE-bearing statement because S5a's
+eligibility test is vacuous for predicates without sublinks, while the
+jointree-arm notes fire only when sublinks are actually present
+(`ctx.jtPullup != nil` or `countSublinksInExpr(f.Predicate) > 0`). The honest
+sublink-bearing event counts are 45 on SF0.25 (23 pulled = 51%) and 9 on
+TPC-H (5 pulled = 56%).
+
+`PULLUPCENSUS` (knob arm, per examined conjunct):
+
+| corpus | pulled | decline breakdown |
+|---|---|---|
+| SF0.25 | 27 | `any-body-leaf-(*optimizer.CTEScan)` 15 (B-06 → M0145-0009; the seam's leaf-kind/resume point is documented in `joinsearchseam.go` — `GOOPG_PULLUP_CTE_LEAF` stays measurement-only OFF), `SubqueryExpr@scalar` 15 (correctly declined — PG does not convert `EXPR_SUBLINK`), `ExistsExpr@or` 2, `InExpr@or` 1 |
+| TPC-H | 6 | `SubqueryExpr@scalar` 4, `InExpr@top` 1, `any-body-not-simple` 1 |
+
+Caller trace post-slice-7: `spliceSearchedSpine` has exactly one call site
+(predp.go:207); `layoutPosMap`, `remapByPosMap`, `remapSublinkOuterRefs` live
+only in predp.go; `runJoinSearchBelowPinned` is called once, at
+planner.go:1932 under `!jointree`. Four recon-named members no longer exist
+as functions at all — `applyJoinTreePosMap`, `remapWithBindings`,
+`remapPosMapAfterRewrite`, `remapExprRefsToMHJ` appear only in comments,
+absorbed since the recon. `reresolveJoinByName` (joinlayout.go:550,
+nl_index_join.go:532) and `remapOuterRefsInSubplan` (joinlayout.go, 8 sites)
+are shared lowering machinery serving the posthoc route on BOTH arms.
+
+**Verdict.** Slice 4 is adjudicated NO-FOLD. There is no lowering work to do:
+the predp.go-confined members retire wholesale when M0145-0008 deletes the
+legacy pipeline (they must NOT be deleted now — the default arm still fires
+them 207/16 times), and the shared joinlayout.go members are already where
+lowering wants them. The recorded dependency on M0145-0003's pull-up coverage
+is obsolete — coverage now changes only WHICH route plans declined conjuncts
+(pullup vs posthoc), never whether the splice family runs.
