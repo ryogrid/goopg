@@ -6758,7 +6758,7 @@ spill route is net-negative.
     Movement: none
     Kind: impl
     Parent: M0141-S2b-4
-  - [ ] **M0141-S2b-4d — hashed Distinct label and the DISTINCT election**
+  - [x] **M0141-S2b-4d — hashed Distinct label and the DISTINCT election**
     \(filed 2026\-09\-24 by S2b\-4a\). goopg labels a hashed `*Distinct`
     `Unique`; PG prints `HashAggregate` with a `Group Key` for SELECT DISTINCT
     and hashed UNION. The relabel is held back because it turns TPC\-DS Q41\'s
@@ -6769,6 +6769,22 @@ spill route is net-negative.
     order \(`create\_final\_distinct\_paths`\) and the presorted\-input arm.
     Q41 must end as an honest MATCH with the correct label. Design doc
     §"What was tried and held back".
+    - **LANDED 2026\-09\-24 \(ralph2 loop \#37\), `fcae392ae`.**
+      - The ordered\-rel election already existed \(`electOrderedDistinct`\);
+        the defect was its input \(the ORDER BY Sort below the DISTINCT\) and
+        the hashed candidate being credited with the executor\'s re\-sort.
+      - Now: distinct\-clause order \(`Distinct.SortKeys`, ORDER BY items
+        first\), ORDER BY Sort spliced out from under the DISTINCT, hashed
+        carries no order, hashed label `HashAggregate` \+ `Group Key:`.
+      - SF0.25: Q41 honest MATCH \(`Unique → Sort`\), Q75 PG\'s HashAggregate
+        structure; match 2 → 2, aggregation\-strategy 44 → 43 \(inside the
+        ±3 band\); SF1 unchanged.
+      - Gates: units, spotcheck, sf025, acceptance arm, fire\-set — PASS;
+        ea\-ratchet only the pre\-existing Q16/Q95 keys.
+      - Regress select\_distinct/union: hashed\-where\-PG\-sorts plans lose
+        their accidental `Unique` match \(pre\-existing election gaps over
+        presorted inputs, same blocker as S2b\-4e\).
+    Movement: none
     Kind: impl
     Parent: M0141-S2b-4
   - [x] **M0141-S2b-5** — resolve `electOrderedGrouping`'s `anyTranslated`

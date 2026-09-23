@@ -1,7 +1,8 @@
 # M0141-S2b-4 — UNION (distinct) planning: decomposition against PG 18.3
 
 Status: S2b-4a (`ded1b8db3`), S2b-4b (`f311b4b1a`) and S2b-4c
-(`5af350059`) landed 2026-09-24; 4d open; 4e blocked (see its section). Task: `.ralph/fix_plan.md` M0141-S2b-4.
+(`5af350059`) and S2b-4d (`fcae392ae`) landed 2026-09-24; 4e blocked (see
+its section). Task: `.ralph/fix_plan.md` M0141-S2b-4.
 
 ## Witnesses (TPC-DS SF0.25, current tree)
 
@@ -214,3 +215,63 @@ on the default arm yet.
 - **Resume.** Re-apply the above after M0145-0008, then find a witness:
   upstream `union.sql`'s `enable_hashagg = off` tenk1 cases plan Merge
   Append over `Index Only Scan` children in PG.
+
+## S2b-4d landed (2026-09-24, `fcae392ae`)
+
+The prerequisite named in "What was tried and held back" turned out to be
+mostly in place: `electOrderedDistinct` (upperordereddistinct.go) already
+offers every DISTINCT candidate on the ordered rel. What made Q41's match
+accidental was the input and the order credit:
+
+- goopg's ORDER BY stage stacks its Sort below the DISTINCT, so both
+  DISTINCT candidates were built over an ORDER BY-sorted input.
+- The hashed candidate was credited with the executor's incidental
+  ascending re-sort (`distinctOp`), so over that Sort it needed no Sort of
+  its own and won Q41, where its `Unique` label matched PG's real Unique.
+
+Now, as in PG:
+
+- **Distinct-clause order** (`transformDistinctClause`, parse\_clause.c):
+  `Distinct.SortKeys` lists the ORDER BY items first, with their direction
+  and NULLS placement, then the remaining output columns ascending
+  (`distinctClauseKeys`). The unique candidate sorts on it, so its output
+  delivers the ORDER BY: `DISTINCT a, b … ORDER BY b DESC` is Unique over
+  one Sort `(b DESC, a)`.
+- **DISTINCT over the unsorted input** (`create_distinct_paths` runs
+  before `create_ordered_paths`): when every ORDER BY key resolves against
+  the DISTINCT output, `spliceOrderSortBelowDistinct` takes the ORDER BY
+  stage's Sort out from under the DISTINCT. It walks through Project/Filter
+  parents only; a non-deferrable Limit, LockRows or ProjectSet in between
+  keeps the Sort.
+- **Hashed carries no order** (AGG\_HASHED has no pathkeys):
+  `distinctEmissionPathkeys` returns an empty order for it, so the ordered
+  rel stacks a Sort above it.
+- **EXPLAIN**: the hashed `*Distinct` prints `HashAggregate` with a `Group
+  Key:` in distinct-clause order. Keys are chased to their source as the
+  Aggregate arm does, and a target listed twice prints once. This applies
+  to SELECT DISTINCT and to a hashed UNION.
+
+Result on TPC-DS SF0.25:
+
+- Q41 is `Limit → Unique → Sort → Seq Scan`, still a MATCH, now on the
+  right mechanism.
+- Q75's UNION is `HashAggregate → Gather → Parallel Append`, PG's
+  structure (Group Key text differs, see below).
+- Default arm: match 2 → 2; aggregation-strategy 44 → 43; D4-upperrel
+  25 → 24. SF1 unchanged.
+
+Upstream regress (`select_distinct`, `union`): several plans where goopg
+hashes but PG sorts over a presorted input (Gather Merge, Incremental Sort,
+index order) used to match by accident under the `Unique` label. They now
+show as HashAggregate against PG's Unique. Those election gaps pre-date
+this slice; the presorted inputs share S2b-4e's blocker.
+
+Not ported (ledgered):
+
+- PG rejects `SELECT DISTINCT … ORDER BY <expression not in the select
+  list>` (42P10); goopg accepts it and keeps an outer Sort.
+- A hashed UNION's Group Key deparses through the first branch in PG
+  (`date_dim.d_year`, `((ss_quantity - COALESCE(...)))`); goopg prints the
+  union output names.
+- goopg's `distinctOp` still re-sorts its output, work PG's HashAggregate
+  does not do (no plan effect now that no order is credited).
