@@ -16,7 +16,7 @@ func horizonsCatalog(t *testing.T) (catalog.Catalog, *catalog.Table) {
 	t.Helper()
 	c := catalog.NewInMemory()
 	tbl, err := c.CreateTable(parser.ObjectName{Name: "horizons_tst"}, []catalog.Column{
-		{Name: "data", Type: catalog.Type{Name: "int4"}},
+		{Name: "data", Type: catalog.Type{Name: "int4"}, NotNull: true},
 	})
 	if err != nil {
 		t.Fatal(err)

@@ -138,6 +138,10 @@ var exprSwitchInventory = map[string]walkerRole{
 	// audited by this role change; only a walker whose switch vanishes
 	// entirely loses its line.
 	"joinlayout.go:remapByPosMap":           nonRecursiveClassifier, // moved from bushy.go at M0127-P6.3 (rename only)
+	// M-NIGHTLY NULL-key guard (2026-09-24): decides whether a top-level AND
+	// conjunct strictly tests one column; descends only through AND, and an
+	// unenumerated type answers "not proven", which keeps the index guard.
+	"pathindexrestrict.go:qualsRejectNull": nonRecursiveClassifier,
 	"joinlayout.go:remapOuterRefsInSubplan": walkerPending, // 5 of 32 arms; moved from bushy.go at M0127-P6.3
 	// `joinlayout.go:remapPosMapAfterRewrite` (walkerPending, 8 of 32 arms)
 	// was deleted by C-20b: the walker mutated nothing — its posMap parameter

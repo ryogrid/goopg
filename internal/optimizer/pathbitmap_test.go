@@ -14,8 +14,8 @@ func testCatWithIdx(t *testing.T) (catalog.Catalog, *catalog.Table, *catalog.Ind
 	t.Helper()
 	cat := catalog.NewInMemory()
 	tbl, err := cat.CreateTable(parser.ObjectName{Name: "t"}, []catalog.Column{
-		{Name: "a", Type: catalog.Type{Name: "int4"}},
-		{Name: "b", Type: catalog.Type{Name: "int4"}},
+		{Name: "a", Type: catalog.Type{Name: "int4"}, NotNull: true},
+		{Name: "b", Type: catalog.Type{Name: "int4"}, NotNull: true},
 	})
 	if err != nil {
 		t.Fatalf("CreateTable: %v", err)

@@ -122,8 +122,8 @@ func TestAddOrderedIndexPathsSurvivesACheaperSeqScan(t *testing.T) {
 func TestAddOrderedIndexPathsTruncatesAtTheFirstUnmergeableColumn(t *testing.T) {
 	c := catalog.NewInMemory()
 	tbl, err := c.CreateTable(parser.ObjectName{Name: "part"}, []catalog.Column{
-		{Name: "p_partkey", Type: catalog.Type{Name: "int4"}},
-		{Name: "p_brand", Type: catalog.Type{Name: "int4"}},
+		{Name: "p_partkey", Type: catalog.Type{Name: "int4"}, NotNull: true},
+		{Name: "p_brand", Type: catalog.Type{Name: "int4"}, NotNull: true},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -198,7 +198,7 @@ func TestAddOrderedIndexPathsRejectsNonMergeableClauseKinds(t *testing.T) {
 func TestAddOrderedIndexPathsRejectsUnorderedAndPartialIndexes(t *testing.T) {
 	c := catalog.NewInMemory()
 	tbl, err := c.CreateTable(parser.ObjectName{Name: "t"}, []catalog.Column{
-		{Name: "k", Type: catalog.Type{Name: "int4"}},
+		{Name: "k", Type: catalog.Type{Name: "int4"}, NotNull: true},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -242,7 +242,7 @@ func TestAddOrderedIndexPathsRejectsUnorderedAndPartialIndexes(t *testing.T) {
 func TestAddOrderedIndexPathsHonoursDescendingKeys(t *testing.T) {
 	c := catalog.NewInMemory()
 	tbl, err := c.CreateTable(parser.ObjectName{Name: "t"}, []catalog.Column{
-		{Name: "k", Type: catalog.Type{Name: "int4"}},
+		{Name: "k", Type: catalog.Type{Name: "int4"}, NotNull: true},
 	})
 	if err != nil {
 		t.Fatal(err)

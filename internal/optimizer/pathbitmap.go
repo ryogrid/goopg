@@ -152,6 +152,12 @@ func (s *searchCtx) buildOneBitmapPath(
 	if len(indexClauses) == 0 && partialPredicate == nil {
 		return nil
 	}
+	// The heap recheck cannot restore rows the index never yields: goopg
+	// stores no index entry whose key has a NULL column, so a key column the
+	// clauses leave unbound must be NOT NULL (indexUnboundKeysNotNull).
+	if !indexUnboundKeysNotNull(tbl, idx, boundIndexColumns(indexClauses)) {
+		return nil
+	}
 
 	// Index geometry — same as the regular index scan cost model.
 	indexPages, indexTuples, treeHeight := estimateIndexGeometry(idx, tbl, relTuples)
@@ -586,6 +592,10 @@ func (s *searchCtx) buildOneParameterizedBitmapPath(
 		sel *= varEqNonConstSelectivity(columnStatsByName(tbl, colName), relTuples)
 	}
 	if len(clauses) == 0 {
+		return nil
+	}
+	// Same NULL-key rule as the unparameterised bitmap and index producers.
+	if !indexUnboundKeysNotNull(tbl, idx, len(clauses)) {
 		return nil
 	}
 	sel = clampSelectivity(sel)

@@ -193,7 +193,16 @@ func cpIndexedProblem(t *testing.T, names []string) *joinlistProblem {
 	c := catalog.NewInMemory()
 	for i, name := range names {
 		old := prob.relInfos[i].table
-		tbl, err := c.CreateTable(parser.ObjectName{Name: name}, old.Columns)
+		// The indexed join column is NOT NULL: an ordering-only index path
+		// is a full scan, which goopg only offers over non-nullable key
+		// columns (it stores no NULL-keyed index entries).
+		cols := append([]catalog.Column(nil), old.Columns...)
+		for j := range cols {
+			if cols[j].Name == name+"0" {
+				cols[j].NotNull = true
+			}
+		}
+		tbl, err := c.CreateTable(parser.ObjectName{Name: name}, cols)
 		if err != nil {
 			t.Fatal(err)
 		}

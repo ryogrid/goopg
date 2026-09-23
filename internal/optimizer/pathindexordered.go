@@ -179,6 +179,13 @@ func (s *searchCtx) addOneOrderedIndexPath(rel *RelOptInfo, tbl *catalog.Table, 
 	if idx.HasPredicate {
 		return false
 	}
+	// An ordering-only path is a full index scan: it binds no key column,
+	// and goopg stores no index entry whose key has a NULL column, so over a
+	// nullable key column it would drop those rows (a merge LEFT JOIN lost
+	// its NULL-keyed outer rows). PG stores NULL keys and has no such rule.
+	if !indexUnboundKeysNotNull(tbl, idx, 0) {
+		return false
+	}
 
 	// Steps 2 and 2b of `build_index_paths`, fused — see the note below on why
 	// the fusion is exact rather than a shortcut. The scan direction those keys

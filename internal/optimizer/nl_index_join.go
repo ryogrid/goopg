@@ -1104,6 +1104,14 @@ func pickIndexCoveringLeadingPrefix(cat catalog.Catalog, tbl *catalog.Table, inn
 			// this parameterisation at all.
 			continue
 		}
+		// The columns after the bound prefix are unbound, and goopg stores
+		// no index entry whose key has a NULL column: a probe on the prefix
+		// would miss every inner row with a NULL there (`r.a = o.x` on
+		// (a, b) lost (10, NULL)). Only an index whose unbound key columns
+		// are all NOT NULL is complete for the probe.
+		if !indexUnboundKeysNotNull(tbl, idx, len(keys)) {
+			continue
+		}
 		// Prefer the probe that BINDS the most columns — more bound
 		// columns is a strictly narrower scan on the same table. Ties go
 		// to the first index seen, so the choice is stable.

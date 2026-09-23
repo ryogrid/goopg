@@ -630,6 +630,12 @@ func indexOrderedAggInput(aggNode *Aggregate, child Node, cat catalog.Catalog) (
 		if idx == nil || idx.DeclaredHash || idx.HasPredicate {
 			continue
 		}
+		// A full ordered scan binds no key column, and goopg stores no index
+		// entry whose key has a NULL column: over a nullable key column the
+		// scan would drop those rows (a GROUP BY lost its NULL group).
+		if !indexUnboundKeysNotNull(seqScan.Table, idx, 0) {
+			continue
+		}
 		if idx.Method != "" && idx.Method != "btree" {
 			continue
 		}

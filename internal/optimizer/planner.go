@@ -11649,7 +11649,7 @@ func planIndexScanFromWhereShape(where parser.Expr, ctx *resolveContext, cat cat
 			// Var-op-Const shape — it is passed through only so the helper's
 			// (correct) refusal is by shape, not by omission.
 			queryClause := Expr(&BinaryOp{pos: where.Pos(), Op: b.Op, Left: col, Right: resolvedKey})
-			idx := findBTreeIndexForColumn(cat, tbl, col.Name, queryClause)
+			idx := findBTreeIndexForColumn(cat, tbl, col.Name, queryClause, queryClause)
 			if idx == nil {
 				return nil, false, nil
 			}
@@ -11742,7 +11742,7 @@ func planIndexScanFromWhereShape(where parser.Expr, ctx *resolveContext, cat cat
 	// literal Const (ParamRef, CastExpr, TypedStringLit) — the helper's
 	// toLiteralValue-based recognizer refuses those by shape, as it should.
 	queryClause := Expr(&BinaryOp{pos: where.Pos(), Op: b.Op, Left: col, Right: resolvedKey})
-	idx := findBTreeIndexForColumn(cat, tbl, col.Name, queryClause)
+	idx := findBTreeIndexForColumn(cat, tbl, col.Name, queryClause, queryClause)
 	if idx == nil {
 		return nil, false, nil
 	}
@@ -11860,7 +11860,9 @@ func trySAOPIndexScan(ix *parser.InExpr, tbl *catalog.Table, ctx *resolveContext
 		}
 		keys = append(keys, rk)
 	}
-	idx := findBTreeIndexForColumn(cat, tbl, col.Name, nil)
+	// The IN list is the whole restriction here, and it binds only the
+	// leading column.
+	idx := findBTreeIndexForColumn(cat, tbl, col.Name, nil, nil)
 	if idx == nil {
 		return nil, false, nil
 	}
@@ -12068,7 +12070,7 @@ func rewriteMinMaxAggregates(s *parser.SelectStmt, ctx *resolveContext, cat cata
 		// The index-only shape is off the table when the session disabled it
 		// (review/260831-2 X-8) — the SeqScan+Agg fallback below is what PG
 		// falls back to as well.
-		if idx := findBTreeIndexForColumn(cat, tbl, argCR.Name, nil); idx != nil &&
+		if idx := findBTreeIndexForColumn(cat, tbl, argCR.Name, nil, wherePred); idx != nil &&
 			!indexOnlyScanRejected(cat) &&
 			(wherePred == nil || wherePredSafeForIOS(wherePred, argCR)) {
 			covered, ok := cat.LookupColumn(tbl, argCR.Name)
@@ -12488,7 +12490,11 @@ func wherePredSafeForIOS(wherePred Expr, argCR *ColumnRef) bool {
 // specialization (both clauses are `Var op Const` over the same column, same
 // operator, equal constant). A nil queryClause can never prove anything, so
 // callers that pass nil keep today's blanket decline exactly as before.
-func findBTreeIndexForColumn(cat catalog.Catalog, tbl *catalog.Table, col string, queryClause Expr) *catalog.Index {
+//
+// quals is the resolved restriction the scan will apply (nil when none is
+// known). It only widens which composite index is complete for the probe:
+// see the NULL-key rule below.
+func findBTreeIndexForColumn(cat catalog.Catalog, tbl *catalog.Table, col string, queryClause, quals Expr) *catalog.Index {
 	var composite *catalog.Index
 	for _, idx := range cat.IndexesOnTable(tbl) {
 		if strings.ToLower(idx.Method) != "btree" {
@@ -12529,7 +12535,14 @@ func findBTreeIndexForColumn(cat catalog.Catalog, tbl *catalog.Table, col string
 		if len(idx.Columns) == 1 {
 			return idx
 		}
-		if composite == nil {
+		// A composite index is probed on its leading column only, so every
+		// later key column is unbound: a row with a NULL there has no entry
+		// (goopg stores no NULL-keyed index entries) and the probe would
+		// silently miss it — `WHERE a = 10` on (a, b) lost (10, NULL). An
+		// index is complete for the probe only when each unbound key column
+		// is NOT NULL or strictly restricted by quals (a NULL there fails the
+		// qual anyway) — the path-search producers' rule, widened by quals.
+		if composite == nil && indexUnboundKeysNullSafe(tbl, idx, 1, quals) {
 			composite = idx
 		}
 	}
@@ -12748,6 +12761,9 @@ func tryRangeIndexScan(where parser.Expr, tbl *catalog.Table, ctx *resolveContex
 	if len(tbl.PartitionKey) > 0 {
 		return nil, false, nil
 	}
+	// The whole restriction, resolved, for the index finder's NULL-key rule
+	// (a nil result only makes that rule stricter).
+	rangeQuals, _ := resolveExpr(where, ctx)
 	conjuncts := collectAndConjuncts(where)
 
 	var chosenColName string
@@ -12815,7 +12831,7 @@ func tryRangeIndexScan(where parser.Expr, tbl *catalog.Table, ctx *resolveContex
 		// Ensure column is from the target table (not outer ref)
 		if chosenColName == "" {
 			// First indexed column: look up a B-tree index for it
-			idx := findBTreeIndexForColumn(cat, tbl, col.Name, nil)
+			idx := findBTreeIndexForColumn(cat, tbl, col.Name, nil, rangeQuals)
 			if idx == nil {
 				continue
 			}
@@ -17768,6 +17784,12 @@ func tryPromoteOrderedIndexOnlyScan(proj *Project, cat catalog.Catalog) Node {
 	// Find a covering, ordering-providing index.
 	for _, idx := range cat.IndexesOnTable(seqScan.Table) {
 		if idx == nil || idx.DeclaredHash || idx.HasPredicate {
+			continue
+		}
+		// A full-range scan binds no key column; goopg stores no index entry
+		// whose key has a NULL column, so a nullable key column would lose
+		// rows (indexUnboundKeysNotNull).
+		if !indexUnboundKeysNotNull(seqScan.Table, idx, 0) {
 			continue
 		}
 		if idx.Method != "" && idx.Method != "btree" {

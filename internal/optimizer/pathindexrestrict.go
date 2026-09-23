@@ -455,6 +455,72 @@ func boundIndexColumns(clauses []indexPathClause) int {
 	return n
 }
 
+// indexUnboundKeysNullSafe widens indexUnboundKeysNotNull with the query's
+// own restriction: an unbound key column that a strict conjunct of quals
+// restricts (`b = 20`, `b > 3`, `b IN (...)`, `b IS NOT NULL`) cannot lose a
+// qualifying row to a missing NULL-keyed entry, because a row with a NULL
+// there fails that conjunct anyway. quals may be nil (no restriction known).
+func indexUnboundKeysNullSafe(tbl *catalog.Table, idx *catalog.Index, bound int, quals Expr) bool {
+	if tbl == nil || idx == nil {
+		return false
+	}
+	for i := bound; i < len(idx.Columns); i++ {
+		name := idx.Columns[i]
+		if name == "" {
+			return false
+		}
+		if qualsRejectNull(name, quals) {
+			continue
+		}
+		notNull := false
+		for _, c := range tbl.Columns {
+			if c.Name == name {
+				notNull = c.NotNull
+				break
+			}
+		}
+		if !notNull {
+			return false
+		}
+	}
+	return true
+}
+
+// qualsRejectNull reports whether some top-level AND conjunct of quals is a
+// strict test of column name — a comparison, an IN list, or IS NOT NULL —
+// that is never true when the column is NULL.
+func qualsRejectNull(name string, quals Expr) bool {
+	isCol := func(e Expr) bool {
+		for {
+			if c, ok := e.(*CastExpr); ok {
+				e = c.Operand
+				continue
+			}
+			break
+		}
+		cr, ok := e.(*ColumnRef)
+		return ok && cr.Name == name
+	}
+	var walk func(e Expr) bool
+	walk = func(e Expr) bool {
+		switch x := e.(type) {
+		case *BinaryOp:
+			switch x.Op {
+			case parser.OpAnd:
+				return walk(x.Left) || walk(x.Right)
+			case parser.OpEq, parser.OpNe, parser.OpLt, parser.OpLe, parser.OpGt, parser.OpGe:
+				return isCol(x.Left) || isCol(x.Right)
+			}
+		case *InExpr:
+			return isCol(x.Operand)
+		case *IsNullExpr:
+			return x.Negated && isCol(x.Operand)
+		}
+		return false
+	}
+	return quals != nil && walk(quals)
+}
+
 // indexUnboundKeysNotNull reports whether every index key column from
 // position `bound` on is declared NOT NULL — the condition under which a
 // probe binding only the first `bound` columns cannot miss rows the byte-key

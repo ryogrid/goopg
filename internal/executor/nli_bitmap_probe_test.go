@@ -38,7 +38,10 @@ func mkBitmapProbeFixture(t *testing.T, indexes ...string) (*Context, func()) {
 	ctx, _, cleanup := newDDLFixture(t)
 	stmts := []string{
 		"CREATE TABLE ord (o_key int, o_val int)",
-		"CREATE TABLE line (l_key int, l_c int, l_r int)",
+		// l_c is NOT NULL: a probe on the (l_key, l_c) prefix leaves l_c
+		// unbound, which goopg only allows over a non-nullable column (it
+		// stores no NULL-keyed index entries).
+		"CREATE TABLE line (l_key int, l_c int NOT NULL, l_r int)",
 	}
 	stmts = append(stmts, indexes...)
 	stmts = append(stmts,

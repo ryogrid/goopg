@@ -244,8 +244,8 @@ func TestAddParameterizedIndexPathsNonUniqueUsesNdistinct(t *testing.T) {
 func TestAddParameterizedIndexPathsAcceptsALeadingPrefix(t *testing.T) {
 	c := catalog.NewInMemory()
 	tbl, err := c.CreateTable(parser.ObjectName{Name: "partsupp"}, []catalog.Column{
-		{Name: "ps_partkey", Type: catalog.Type{Name: "int4"}},
-		{Name: "ps_suppkey", Type: catalog.Type{Name: "int4"}},
+		{Name: "ps_partkey", Type: catalog.Type{Name: "int4"}, NotNull: true},
+		{Name: "ps_suppkey", Type: catalog.Type{Name: "int4"}, NotNull: true},
 	})
 	if err != nil {
 		t.Fatal(err)
