@@ -27,7 +27,9 @@ func distinctFixture() (*upperRels, *Distinct, *RelOptInfo) {
 // the grouping twin and for the same reason — `create_ordered_paths` has no
 // minimum, it iterates the whole input pathlist. A lone candidate whose
 // emission order already delivers the ORDER BY must therefore be elected
-// as-is, not declined into the legacy unconditional-Sort fallback.
+// on the ORDERED rel, not declined into the legacy fallback. The lone
+// candidate here is hashed, which carries no order since M0141-S2b-4d (PG's
+// AGG_HASHED path has no pathkeys), so the ORDERED rel stacks a Sort on it.
 func TestElectOrderedDistinctOffersALoneCandidate(t *testing.T) {
 	u := newUpperRels()
 	in := upperOrderedInput(1000)
@@ -42,8 +44,12 @@ func TestElectOrderedDistinctOffersALoneCandidate(t *testing.T) {
 	if !ok || got == nil {
 		t.Fatal("a lone candidate declined; PG offers it like one of many")
 	}
-	if _, isDistinct := got.(*Distinct); !isDistinct {
-		t.Fatalf("winner is %T; want the bare *Distinct — its emission order already delivers the ORDER BY", got)
+	srt, isSort := got.(*Sort)
+	if !isSort {
+		t.Fatalf("winner is %T; want a Sort over the hashed *Distinct (hashed output is unordered)", got)
+	}
+	if _, isDistinct := srt.Child.(*Distinct); !isDistinct {
+		t.Fatalf("Sort child is %T; want the lone hashed *Distinct", srt.Child)
 	}
 
 	// An EMPTY rel still declines: there is nothing to offer.
@@ -56,11 +62,10 @@ func TestElectOrderedDistinctOffersALoneCandidate(t *testing.T) {
 }
 
 // TestElectOrderedDistinctNoSortOnAscendingPrefixOrder: ORDER BY an
-// ascending, nulls-last prefix of the output columns is exactly the order
-// BOTH addDistinctPaths candidates already deliver (distinctOp's forced
-// re-sort for hashed, distinctOnOp's streamed producer-Sort order for
-// unique) — the loop must elect a bare *Distinct/*DistinctOn winner, never
-// stacking a redundant Sort.
+// ascending, nulls-last prefix of the output columns is the order the unique
+// candidate's producer Sort already delivers, so the unique candidate
+// competes as-is and the hashed one under a Sort (PG's create_ordered_paths
+// over both). Whichever wins, no Sort may be stacked over the Unique.
 func TestElectOrderedDistinctNoSortOnAscendingPrefixOrder(t *testing.T) {
 	u, spec, _ := distinctFixture()
 	kType := spec.Output()[0].Type
@@ -69,10 +74,14 @@ func TestElectOrderedDistinctNoSortOnAscendingPrefixOrder(t *testing.T) {
 	if !ok || got == nil {
 		t.Fatal("ascending-prefix ORDER BY declined; want no-sort election")
 	}
-	switch got.(type) {
-	case *Distinct, *DistinctOn:
+	switch w := got.(type) {
+	case *DistinctOn:
+	case *Sort:
+		if _, ok := w.Child.(*Distinct); !ok {
+			t.Fatalf("Sort over %T; a Sort may only sit over the hashed *Distinct", w.Child)
+		}
 	default:
-		t.Fatalf("winner is %T; want a bare *Distinct/*DistinctOn (no Sort)", got)
+		t.Fatalf("winner is %T; want a bare *DistinctOn or a Sort over the hashed *Distinct", got)
 	}
 }
 
@@ -109,10 +118,15 @@ func TestElectOrderedDistinctIgnoresStalePreDistinctOrderedEntry(t *testing.T) {
 	if !ok || got == nil {
 		t.Fatal("declined with a stale pre-distinct ORDERED entry present; want election to still succeed")
 	}
-	switch got.(type) {
+	switch w := got.(type) {
 	case *Distinct, *DistinctOn:
 	case *Sort:
-		t.Fatalf("winner is a bare *Sort (the stale pre-distinct candidate leaked back in); want *Distinct/*DistinctOn")
+		// A Sort over the hashed candidate is legitimate (hashed output is
+		// unordered); a Sort over anything else is the stale pre-distinct
+		// candidate leaking back in.
+		if _, ok := w.Child.(*Distinct); !ok {
+			t.Fatalf("winner is a Sort over %T (the stale pre-distinct candidate leaked back in); want DISTINCT-rooted", w.Child)
+		}
 	default:
 		t.Fatalf("winner is %T; want *Distinct/*DistinctOn", got)
 	}
@@ -143,9 +157,9 @@ func TestElectOrderedDistinctAddsSortOnDescendingOrder(t *testing.T) {
 
 // TestDistinctEmissionPathkeysGates pins distinctEmissionPathkeys' own
 // negatives directly: nil inputs, wrong Kind, and a Unique candidate whose
-// Pathkeys are not the full-column ascending/nulls-last positional shape
-// addDistinctPaths always builds (defence against a future addDistinctPaths
-// change reusing a differently-ordered pre-sorted child).
+// Pathkeys are not one output-column reference per output column (the shape
+// of the producer's distinct-clause Sort), plus the hashed candidate's
+// translation: unordered, as PG's AGG_HASHED path (M0141-S2b-4d).
 func TestDistinctEmissionPathkeysGates(t *testing.T) {
 	in := upperOrderedInput(1000)
 	spec := distinctTestSpec(in)
@@ -158,23 +172,29 @@ func TestDistinctEmissionPathkeysGates(t *testing.T) {
 	if got := distinctEmissionPathkeys(spec, &Path{Kind: PathSort}); got != nil {
 		t.Errorf("non-distinct kind: translated %d keys, want nil", len(got))
 	}
-	// Unique candidate with a DESC leading key (not the all-ascending shape
-	// the real producer Sort always builds) must decline, not be trusted.
-	badUnique := &Path{Kind: PathDistinct, Distinct: spec, Unique: true,
+	// A Unique candidate whose pathkeys cover only part of the output, or
+	// name one column twice, is not the producer's Sort: decline.
+	short := &Path{Kind: PathDistinct, Distinct: spec, Unique: true,
 		Pathkeys: []PathKey{{Expr: &ColumnRef{Index: 0, Name: "k"}, SortAsc: false}}}
-	if got := distinctEmissionPathkeys(spec, badUnique); got != nil {
-		t.Errorf("descending unique pathkeys: translated %d keys, want nil", len(got))
+	if got := distinctEmissionPathkeys(spec, short); got != nil {
+		t.Errorf("partial unique pathkeys: translated %d keys, want nil", len(got))
 	}
-	// Hashed candidate (no Pathkeys stamp at all) always translates: the
-	// executor contract (distinctOp) is fixed, not read off the Path.
+	dup := &Path{Kind: PathDistinct, Distinct: spec, Unique: true, Pathkeys: []PathKey{
+		{Expr: &ColumnRef{Index: 0}}, {Expr: &ColumnRef{Index: 0}}, {Expr: &ColumnRef{Index: 2}}}}
+	if got := distinctEmissionPathkeys(spec, dup); got != nil {
+		t.Errorf("duplicate-column unique pathkeys: translated %d keys, want nil", len(got))
+	}
+	// A distinct-clause order led by a DESC ORDER BY key (column 1 first)
+	// is trusted as-is.
+	clause := &Path{Kind: PathDistinct, Distinct: spec, Unique: true, Pathkeys: []PathKey{
+		{Expr: &ColumnRef{Index: 1}}, {Expr: &ColumnRef{Index: 0}, SortAsc: true}, {Expr: &ColumnRef{Index: 2}, SortAsc: true}}}
+	if got := distinctEmissionPathkeys(spec, clause); len(got) != 3 {
+		t.Errorf("distinct-clause unique pathkeys: translated %d keys, want 3", len(got))
+	}
+	// Hashed: translated (non-nil) but unordered.
 	hashed := &Path{Kind: PathDistinct, Distinct: spec, Unique: false}
 	got := distinctEmissionPathkeys(spec, hashed)
-	if len(got) != len(spec.Output()) {
-		t.Fatalf("hashed translation returned %d keys, want %d (one per output column)", len(got), len(spec.Output()))
-	}
-	for i, pk := range got {
-		if !pk.SortAsc || pk.NullsFirst {
-			t.Fatalf("hashed key[%d] = %+v, want ascending/nulls-last", i, pk)
-		}
+	if got == nil || len(got) != 0 {
+		t.Fatalf("hashed translation = %v (nil=%v); want an empty, non-nil order", got, got == nil)
 	}
 }

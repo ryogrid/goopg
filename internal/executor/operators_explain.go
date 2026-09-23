@@ -1295,6 +1295,45 @@ func emitNodeDetailLines(n optimizer.Node, indent string, verbose bool, rows *[]
 		if attachedFilter != nil {
 			*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + wrapParen(formatExprQual(attachedFilter, reg, qualify)))})
 		}
+	case *optimizer.Distinct:
+		// M0141-S2b-4d: the hashed DISTINCT's `Group Key:` (explain.c
+		// show_agg_keys) lists the distinct clause in PG's order — the ORDER
+		// BY items first (Distinct.SortKeys), else every output column.
+		keys := p.SortKeys
+		if len(keys) != len(p.Output()) {
+			keys = keys[:0:0]
+			for i, c := range p.Output() {
+				keys = append(keys, optimizer.SortKey{Expr: &optimizer.ColumnRef{Index: i, Name: c.Name, Type: c.Type}})
+			}
+		}
+		// Rendered as the *optimizer.Aggregate arm renders a HashAggregate's
+		// keys: a ColumnRef chases past republishing layers to the source PG
+		// prints, and no OUTER_VAR wrap (the hash sits on its input). A
+		// target listed twice is one distinct-clause item upstream
+		// (transformDistinctClause skips targets already in the list), so a
+		// repeated key prints once.
+		if len(keys) > 0 {
+			parts := make([]string, 0, len(keys))
+			seen := make(map[string]bool, len(keys))
+			for _, k := range keys {
+				keyExpr := k.Expr
+				if _, ok := keyExpr.(*optimizer.ColumnRef); ok {
+					if chased, hit := resolveKeySource(keyExpr, p.Child, reg); hit {
+						keyExpr = chased
+					}
+				}
+				str := formatExprQual(keyExpr, reg, qualify)
+				if seen[str] {
+					continue
+				}
+				seen[str] = true
+				parts = append(parts, str)
+			}
+			*rows = append(*rows, Row{NewStringDatum(indent + "Group Key: " + strings.Join(parts, ", "))})
+		}
+		if attachedFilter != nil {
+			*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + wrapParen(formatExprQual(attachedFilter, reg, qualify)))})
+		}
 	case *optimizer.IncrementalSort:
 		// M0141-S7-exec-c: mirrors the *optimizer.Sort arm above (same
 		// show_sort_group_keys oracle, explain.c:2588-2593 calls it with
@@ -3394,13 +3433,11 @@ func describePlanMode(n optimizer.Node, nm *explainNames, verbose bool) string {
 	case *optimizer.GatherMerge:
 		return "Gather Merge"
 	case *optimizer.Distinct:
-		// KNOWN DIVERGENCE (ledgered, M0141-S2b-4d): goopg's *Distinct is a
-		// HASHED dedup of the whole row, which PG labels `HashAggregate` with
-		// a `Group Key:` line — for SELECT DISTINCT and for a hashed UNION
-		// alike. The honest label is held back until the DISTINCT election
-		// matches PG's: relabelling alone turns TPC-DS Q41's floor match into
-		// a shape-diff, because goopg hashes where PG sorts there.
-		return "Unique"
+		// goopg's *Distinct is a HASHED dedup of the whole row: PG's
+		// AGG_HASHED Agg for SELECT DISTINCT and for a hashed UNION alike,
+		// labelled `HashAggregate` with a `Group Key:` line (M0141-S2b-4d;
+		// the sorted candidate is a *DistinctOn, labelled `Unique`).
+		return "HashAggregate"
 	case *optimizer.Aggregate:
 		// P9: PG prefixes a split aggregate's two halves with "Partial " and
 		// "Finalize " (explain.c, from the Agg node's aggsplit). Without them

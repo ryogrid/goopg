@@ -170,6 +170,39 @@ func distinctAllColKeys(child Node) []SortKey {
 	return keys
 }
 
+// distinctClauseKeys is transformDistinctClause's distinct-clause order
+// (parse_clause.c) for SELECT DISTINCT with an ORDER BY: each ORDER BY item
+// first, keeping its direction and NULLS placement, then every output
+// column the ORDER BY did not name, ascending, in output order. PG requires
+// every SELECT DISTINCT sort key to be an output column (42P10 otherwise),
+// so an ORDER BY key that is not a plain output-column reference returns
+// nil — the caller keeps the all-columns-ascending default.
+func distinctClauseKeys(orderKeys []SortKey, cols Schema) []SortKey {
+	if len(orderKeys) == 0 {
+		return nil
+	}
+	seen := make([]bool, len(cols))
+	keys := make([]SortKey, 0, len(cols))
+	for _, k := range orderKeys {
+		cr, ok := k.Expr.(*ColumnRef)
+		if !ok || cr.Index < 0 || cr.Index >= len(cols) {
+			return nil
+		}
+		if seen[cr.Index] {
+			continue
+		}
+		seen[cr.Index] = true
+		c := cols[cr.Index]
+		keys = append(keys, SortKey{Expr: &ColumnRef{Index: cr.Index, Name: c.Name, Type: c.Type}, Desc: k.Desc, NullsFirst: k.NullsFirst})
+	}
+	for i, c := range cols {
+		if !seen[i] {
+			keys = append(keys, SortKey{Expr: &ColumnRef{Index: i, Name: c.Name, Type: c.Type}})
+		}
+	}
+	return keys
+}
+
 // distinctAllKeyCols is every output position — the `DistinctOn.KeyCols`
 // for the unique candidate (full-row dedup).
 func distinctAllKeyCols(child Node) []int {
@@ -253,7 +286,11 @@ func distinctCandidates(distinctRel *RelOptInfo, seed *Path, distinctNode *Disti
 	// as generate_union_paths does (`if (groupList != NIL) path =
 	// create_sort_path(...)`, prepunion.c) — M0141-S2b-4a.
 	sortInput := seed
-	if keys := distinctAllColKeys(child); len(keys) > 0 {
+	keys := distinctAllColKeys(child)
+	if len(distinctNode.SortKeys) == len(keys) {
+		keys = distinctNode.SortKeys
+	}
+	if len(keys) > 0 {
 		sortInput = sortPathForBounded(seed, pathkeysForSortKeys(keys), cp, -1)
 	}
 	uniqueCost := distinctCost(sortInput.Cost.Startup, sortInput.Cost.Total, inputRows, numDistinct, cp)

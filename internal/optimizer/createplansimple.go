@@ -265,7 +265,7 @@ func createDistinctPlan(p *Path) (Node, outputLayout) {
 	if p.Unique {
 		return &DistinctOn{pos: p.Distinct.pos, Child: child, KeyCols: distinctAllKeyCols(child), schema: p.Distinct.schema}, nil
 	}
-	return &Distinct{pos: p.Distinct.pos, Child: child, schema: p.Distinct.schema}, nil
+	return &Distinct{pos: p.Distinct.pos, Child: child, schema: p.Distinct.schema, SortKeys: p.Distinct.SortKeys}, nil
 }
 
 // createUniquePlan is the PathUnique arm (M0142-0008c-1): emit a

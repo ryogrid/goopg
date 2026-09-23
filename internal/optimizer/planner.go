@@ -2898,28 +2898,16 @@ func planSelectImpl(s *parser.SelectStmt, cat catalog.Catalog, plannerSet Planne
 	// DistinctOn (defense-in-depth: both parsers leave Distinct=false for
 	// DISTINCT ON today, but the ast.go contract claims otherwise).
 	if s.Distinct && len(s.DistinctOn) == 0 {
-		spec := &Distinct{pos: s.Pos(), Child: out, schema: out.Output()}
-		// The registry is this scope's function-local `upper` (C-11), as
-		// the ORDER BY and aggregate sites read it.
-		dnode, derr := createDistinctPaths(upper, spec, cat, plannerSet, orderTupleFraction)
-		if derr != nil {
-			return nil, derr
-		}
-		out = dnode
-		// The distinctOp sorts rows internally in ascending order.  When the
-		// query has ORDER BY, that inner sort loses the requested direction.
-		// Re-apply ORDER BY on top of Distinct by resolving each ORDER BY key
-		// against the Distinct output schema (schema-only, no bindings, so
-		// only unqualified column-name references work — which is fine since
-		// ORDER BY in a DISTINCT query must reference projected columns).
-		// M0097-0046.
+		// The ORDER BY keys are resolved against the DISTINCT output first
+		// (DISTINCT keeps its input's schema, so out.Output() is it).
+		var outerKeys []SortKey
 		if len(s.OrderBy) > 0 {
 			distinctOut := out.Output()
 			outerCtx := newResolveContext(nil, distinctOut, plannerSet)
 			outerCtx.cat = cat
 			// A-01(ii) cut 2: rebuilt contexts keep the statement scope.
 			outerCtx.rtScope = scope
-			outerKeys := make([]SortKey, 0, len(s.OrderBy))
+			outerKeys = make([]SortKey, 0, len(s.OrderBy))
 			for _, sb := range s.OrderBy {
 				var e Expr
 				// `ORDER BY <n>` is a 1-based reference into the DISTINCT
@@ -2967,16 +2955,40 @@ func planSelectImpl(s *parser.SelectStmt, cat catalog.Catalog, plannerSet Planne
 				}
 				outerKeys = append(outerKeys, SortKey{Expr: e, Desc: sb.Desc, NullsFirst: sortByNullsFirst(sb)})
 			}
-			if len(outerKeys) > 0 {
-				// M0141-S2b-1: let the ORDERED rel adjudicate BOTH
-				// `addDistinctPaths` candidates (hashed, unique-over-sorted)
-				// against outerKeys before falling back to the legacy
-				// single-node `distinctOutputSatisfiesOrder` check + always-Sort.
-				if built, ok := electOrderedDistinct(upper, spec, outerKeys, s.Pos(), plannerSet.costParams(), orderTupleFraction, orderLimitTuples); ok {
-					out = built
-				} else if !distinctOutputSatisfiesOrder(out, outerKeys) {
-					out = &Sort{pos: s.Pos(), Child: out, Keys: outerKeys}
-				}
+		}
+		// M0141-S2b-4d: PG plans DISTINCT over the unsorted input
+		// (create_distinct_paths) and applies ORDER BY afterwards
+		// (create_ordered_paths), with the distinct clause ordered by the
+		// ORDER BY (transformDistinctClause). goopg's ORDER BY stage has
+		// already stacked its Sort below the DISTINCT; when every ORDER BY
+		// key resolved against the DISTINCT output, that Sort is taken out
+		// again, and the unique candidate sorts on the distinct clause
+		// instead, so its output delivers the ORDER BY without a second Sort.
+		child := out
+		var clauseKeys []SortKey
+		if len(outerKeys) > 0 && selectSrfPending == nil {
+			if spliced, ok := spliceOrderSortBelowDistinct(out, orderSort); ok {
+				child = spliced
+			}
+			clauseKeys = distinctClauseKeys(outerKeys, child.Output())
+		}
+		spec := &Distinct{pos: s.Pos(), Child: child, schema: child.Output(), SortKeys: clauseKeys}
+		// The registry is this scope's function-local `upper` (C-11), as
+		// the ORDER BY and aggregate sites read it.
+		dnode, derr := createDistinctPaths(upper, spec, cat, plannerSet, orderTupleFraction)
+		if derr != nil {
+			return nil, derr
+		}
+		out = dnode
+		if len(outerKeys) > 0 {
+			// M0141-S2b-1: let the ORDERED rel adjudicate BOTH
+			// `addDistinctPaths` candidates (hashed, unique-over-sorted)
+			// against outerKeys before falling back to the legacy
+			// single-node `distinctOutputSatisfiesOrder` check + always-Sort.
+			if built, ok := electOrderedDistinct(upper, spec, outerKeys, s.Pos(), plannerSet.costParams(), orderTupleFraction, orderLimitTuples); ok {
+				out = built
+			} else if !distinctOutputSatisfiesOrder(out, outerKeys) {
+				out = &Sort{pos: s.Pos(), Child: out, Keys: outerKeys}
 			}
 		}
 	}
@@ -18096,6 +18108,40 @@ func findExprInSchema(re Expr, outSchema Schema, proj Node) int {
 		}
 	}
 	return -1
+}
+
+// spliceOrderSortBelowDistinct removes the ORDER BY stage's Sort from under
+// a SELECT DISTINCT's input (M0141-S2b-4d). It walks down from the DISTINCT
+// input through Project/Filter wrappers only — anything else between them
+// (a Limit that could not be deferred, a LockRows, a ProjectSet) means the
+// Sort's order is consumed below the DISTINCT, and the splice declines. The
+// wrapper directly above the Sort is re-pointed at the Sort's child; the
+// returned node is the (possibly unchanged) DISTINCT input.
+func spliceOrderSortBelowDistinct(in Node, orderSort *Sort) (Node, bool) {
+	if in == nil || orderSort == nil {
+		return in, false
+	}
+	if in == Node(orderSort) {
+		return orderSort.Child, true
+	}
+	for cur := in; ; {
+		switch n := cur.(type) {
+		case *Project:
+			if n.Child == Node(orderSort) {
+				n.Child = orderSort.Child
+				return in, true
+			}
+			cur = n.Child
+		case *Filter:
+			if n.Child == Node(orderSort) {
+				n.Child = orderSort.Child
+				return in, true
+			}
+			cur = n.Child
+		default:
+			return in, false
+		}
+	}
 }
 
 // distinctSortKeyOutputIndex maps a SELECT DISTINCT sort key onto the

@@ -42,64 +42,56 @@ func traceDistinctDecline(reason string, cand *Path) {
 // means "untranslatable": the caller falls through to the legacy
 // `distinctOutputSatisfiesOrder` + unconditional-Sort behavior.
 //
-// Both shapes `addDistinctPaths` builds today are ALREADY fully ordered,
-// by construction of their respective executors, never by a `Path.Pathkeys`
-// stamp the hashed arm happens to carry:
+// The two candidates `addDistinctPaths` builds:
 //
 //   - Unique (`cand.Unique`): `distinctOnOp` (operators_distinct.go) streams
-//     its child's row order verbatim — the child is always the producer's
-//     own full-column Sort (`addDistinctPaths`' `sortInput`,
-//     `distinctAllColKeys`), so `cand.Pathkeys` (stamped from that Sort) is
-//     trusted only after verifying it actually has the shape that Sort always
-//     builds: one ascending, nulls-last key per output column, in position
-//     order 0..n-1. A future `addDistinctPaths` change that reuses a
-//     differently-ordered pre-sorted child would still be caught correctly
-//     here (or safely declined if the shape check no longer holds).
-//   - Hashed (`!cand.Unique`): `distinctOp` (operators_distinct.go) hash-dedups
-//     then UNCONDITIONALLY re-sorts every row ascending, nulls-last, over
-//     every output column in position order (`sort.Slice`, comparing column 0
-//     upward) — a fixed executor contract this candidate carries with no
-//     `Pathkeys` stamp at all (`addDistinctPaths` never sets one for this
-//     arm), so the order is derived here directly rather than read off the
-//     Path.
+//     its child's row order verbatim, and the child is the producer's own
+//     Sort on the distinct clause (`Distinct.SortKeys`, ORDER BY items
+//     first — M0141-S2b-4d — or every column ascending). `cand.Pathkeys`,
+//     stamped from that Sort, is trusted after checking it has one key per
+//     output column, each a different output-column reference.
+//   - Hashed (`!cand.Unique`): no order, as PG's AGG_HASHED path. goopg's
+//     `distinctOp` does re-sort its output ascending, but that is an
+//     executor detail PG's plan does not have; crediting it elected the
+//     hashed candidate (with no Sort above) where PG plans Unique over a
+//     Sort, e.g. TPC-DS Q41.
 func distinctEmissionPathkeys(distinctNode *Distinct, cand *Path) []PathKey {
 	if distinctNode == nil || cand == nil || cand.Kind != PathDistinct || cand.Distinct == nil {
 		return nil
 	}
 	outCols := distinctNode.Output()
 	if cand.Unique {
+		// The Sort under the Unique is the producer's own, on the distinct
+		// clause (Distinct.SortKeys: ORDER BY items first, then the rest;
+		// or every column ascending). Trust its pathkeys only in that shape:
+		// one key per output column, each a distinct output-column ref.
 		if len(cand.Pathkeys) != len(outCols) {
 			traceDistinctDecline("unique-pathkeys-len-mismatch", cand)
 			return nil
 		}
+		seen := make([]bool, len(outCols))
 		for i, pk := range cand.Pathkeys {
-			if !pk.SortAsc || pk.NullsFirst {
-				traceDistinctDecline(fmt.Sprintf("unique-pathkey[%d]-not-asc-nullslast", i), cand)
-				return nil
-			}
 			cr, ok := pk.Expr.(*ColumnRef)
-			if !ok || cr.Index != i {
-				traceDistinctDecline(fmt.Sprintf("unique-pathkey[%d]-not-positional-columnref", i), cand)
+			if !ok || cr.Index < 0 || cr.Index >= len(outCols) || seen[cr.Index] {
+				traceDistinctDecline(fmt.Sprintf("unique-pathkey[%d]-not-output-columnref", i), cand)
 				return nil
 			}
+			seen[cr.Index] = true
 		}
 		if dpTrace {
 			fmt.Fprintf(os.Stderr, "DPDISTINCT translated ok keys=%d unique=true\n", len(cand.Pathkeys))
 		}
 		return cand.Pathkeys
 	}
-	emitted := make([]PathKey, len(outCols))
-	for i, c := range outCols {
-		emitted[i] = PathKey{
-			Expr:       &ColumnRef{Index: i, Name: c.Name, Type: c.Type},
-			SortAsc:    true,
-			NullsFirst: false,
-		}
-	}
+	// Hashed: no order. PG's AGG_HASHED path carries no pathkeys, so the
+	// ORDERED rel stacks a Sort over it (M0141-S2b-4d). goopg's distinctOp
+	// happens to re-sort its output, but crediting that order made the
+	// hashed candidate win ORDER BY statements PG plans as Unique over a
+	// Sort. The empty, non-nil slice means "translated, unordered".
 	if dpTrace {
-		fmt.Fprintf(os.Stderr, "DPDISTINCT translated ok keys=%d unique=false\n", len(emitted))
+		fmt.Fprintf(os.Stderr, "DPDISTINCT translated ok keys=0 unique=false\n")
 	}
-	return emitted
+	return []PathKey{}
 }
 
 // electOrderedDistinct runs the same ordered-level loop electOrderedGrouping

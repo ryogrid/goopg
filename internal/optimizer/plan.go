@@ -2958,6 +2958,14 @@ type Distinct struct {
 	pos    int
 	Child  Node
 	schema Schema
+	// SortKeys is the statement's distinct clause in PostgreSQL's order
+	// (transformDistinctClause, parse_clause.c): the ORDER BY items first,
+	// with their direction, then every remaining output column ascending
+	// (M0141-S2b-4d). The unique-over-sorted candidate sorts on it, so its
+	// output already delivers the ORDER BY, and EXPLAIN prints the hashed
+	// candidate's `Group Key:` in it. nil means every column ascending, in
+	// output order.
+	SortKeys []SortKey
 }
 
 func (n *Distinct) Pos() int       { return n.pos }

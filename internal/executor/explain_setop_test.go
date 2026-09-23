@@ -26,8 +26,8 @@ import (
 //
 // Since M0141-S2b-4a goopg plans UNION (distinct) in PG's shape: one distinct
 // step above an n-ary Append of every same-kind branch, instead of the old
-// fused `HashSetOp Union`. The hashed step still renders `Unique` where PG
-// prints `HashAggregate` (M0141-S2b-4d).
+// fused `HashSetOp Union`. The hashed step renders `HashAggregate` with a
+// `Group Key:` line, as PG's does (M0141-S2b-4d).
 
 // setopExplainFixture creates two same-shaped tables and returns the
 // EXPLAIN lines for sql.
@@ -105,11 +105,10 @@ func TestExplainIntersectExceptRenderHashSetOp(t *testing.T) {
 		{"SELECT id FROM eso_a INTERSECT ALL SELECT id FROM eso_b", "HashSetOp Intersect All"},
 		{"SELECT id FROM eso_a EXCEPT SELECT id FROM eso_b", "HashSetOp Except"},
 		{"SELECT id FROM eso_a EXCEPT ALL SELECT id FROM eso_b", "HashSetOp Except All"},
-		// PG plans a hashed UNION as HashAggregate over Append. Since
-		// M0141-S2b-4a goopg plans the same shape (a hashed Distinct over
-		// Append) but still labels the hashed Distinct `Unique` — a known,
-		// ledgered divergence (M0141-S2b-4d).
-		{"SELECT id FROM eso_a UNION SELECT id FROM eso_b", "Unique"},
+		// PG plans a hashed UNION as HashAggregate over Append; goopg plans
+		// the same shape (M0141-S2b-4a) and, since M0141-S2b-4d, labels its
+		// hashed Distinct the same way.
+		{"SELECT id FROM eso_a UNION SELECT id FROM eso_b", "HashAggregate"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.want, func(t *testing.T) {
@@ -340,5 +339,69 @@ func TestUnionMergeAppendArm(t *testing.T) {
 	// {1a,2b,3c,4d,5-NULL,NULL-n}: six distinct rows, in merge order.
 	if len(want) != 6 || strings.Join(got, "|") != strings.Join(want, "|") {
 		t.Errorf("merge-arm rows = %v, want %v", got, want)
+	}
+}
+
+// TestSelectDistinctOrderByPGShape pins M0141-S2b-4d. PG plans SELECT
+// DISTINCT over the unsorted input; its sorted candidate sorts on the
+// distinct clause, ORDER BY items first (transformDistinctClause), so the
+// ORDER BY needs no second Sort; its hashed candidate prints as
+// HashAggregate with a Group Key. Rows must come back deduplicated and in
+// the requested order, including DESC, NULLS placement and an ORDER BY on a
+// non-leading column.
+func TestSelectDistinctOrderByPGShape(t *testing.T) {
+	ctx := setopFixtureCtx(t)
+	runSQL(t, ctx, "CREATE TABLE eso_d (a int, b text)")
+	runSQL(t, ctx, "INSERT INTO eso_d VALUES (1,'x'),(2,'y'),(1,'x'),(NULL,'z'),(3,'y'),(2,'y'),(NULL,'z')")
+
+	lines := runExplainRows(t, ctx, "EXPLAIN (COSTS OFF) SELECT DISTINCT a, b FROM eso_d ORDER BY b DESC")
+	joined := strings.Join(lines, "\n")
+	// Either PG candidate may win on this tiny table, each in PG's form:
+	// Unique over one Sort on the distinct clause, or a Sort over the
+	// HashAggregate whose Group Key lists the distinct clause (b first).
+	sortedShape := strings.HasPrefix(strings.TrimSpace(lines[0]), "Unique") &&
+		countLines(lines, "Sort Key: b DESC, a") == 1 && countLines(lines, "->  Sort") == 1
+	hashedShape := strings.HasPrefix(strings.TrimSpace(lines[0]), "Sort") &&
+		countLines(lines, "Sort Key: b DESC") == 1 && countLines(lines, "->  HashAggregate") == 1 &&
+		countLines(lines, "Group Key: b, a") == 1
+	if !sortedShape && !hashedShape {
+		t.Errorf("want Unique over a (b DESC, a) Sort, or Sort over HashAggregate (Group Key: b, a):\n%s", joined)
+	}
+
+	restore := hashAggSeed(true)
+	defer restore()
+	lines = runExplainRows(t, ctx, "EXPLAIN (COSTS OFF) SELECT id FROM eso_a UNION SELECT id FROM eso_b")
+	joined = strings.Join(lines, "\n")
+	if !strings.HasPrefix(strings.TrimSpace(lines[0]), "HashAggregate") || countLines(lines, "Group Key:") != 1 {
+		t.Errorf("want HashAggregate with a Group Key for the hashed UNION:\n%s", joined)
+	}
+
+	for _, tc := range []struct {
+		sql  string
+		want string
+	}{
+		{"SELECT DISTINCT a, b FROM eso_d ORDER BY b DESC, a", "[<nil> z]|[2 y]|[3 y]|[1 x]"},
+		{"SELECT DISTINCT a FROM eso_d ORDER BY a DESC", "[<nil>]|[3]|[2]|[1]"},
+		{"SELECT DISTINCT a FROM eso_d ORDER BY a NULLS FIRST", "[<nil>]|[1]|[2]|[3]"},
+		{"SELECT DISTINCT a FROM eso_d ORDER BY a", "[1]|[2]|[3]|[<nil>]"},
+	} {
+		var got []string
+		for _, r := range runQuery(t, ctx, tc.sql) {
+			cells := make([]string, len(r))
+			for i, d := range r {
+				switch {
+				case d.IsNull():
+					cells[i] = "<nil>"
+				case d.Kind == KindString || d.ArenaID != 0 || len(d.Buf) > 0:
+					cells[i] = d.StringValue()
+				default:
+					cells[i] = fmt.Sprint(d.Int)
+				}
+			}
+			got = append(got, "["+strings.Join(cells, " ")+"]")
+		}
+		if strings.Join(got, "|") != tc.want {
+			t.Errorf("%s: rows %s, want %s", tc.sql, strings.Join(got, "|"), tc.want)
+		}
 	}
 }
