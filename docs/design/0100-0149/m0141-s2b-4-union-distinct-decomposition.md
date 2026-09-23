@@ -1,7 +1,7 @@
 # M0141-S2b-4 — UNION (distinct) planning: decomposition against PG 18.3
 
 Status: S2b-4a (`ded1b8db3`), S2b-4b (`f311b4b1a`) and S2b-4c
-(`5af350059`) landed 2026-09-24; 4d and 4e open. Task: `.ralph/fix_plan.md` M0141-S2b-4.
+(`5af350059`) landed 2026-09-24; 4d open; 4e blocked (see its section). Task: `.ralph/fix_plan.md` M0141-S2b-4.
 
 ## Witnesses (TPC-DS SF0.25, current tree)
 
@@ -11,8 +11,13 @@ nested **binary** `HashSetOp Union` nodes. PG plans neither that way:
 - **Q49** (`… UNION … UNION …`, three branches): `Limit → Incremental Sort →
   Unique → Sort → Append` (three children). One n-ary Append, then Sort →
   Unique, elected over HashAggregate by cost.
-- **Q75**: `HashAggregate → Unique → Merge Append` over presorted
-  (`Gather Merge`) children. The ordered children let PG skip the Sort.
+- **Q75**: goopg plans the distinct UNION as nested binary HashSetOps.
+  (Corrected 2026-09-24 by S2b-4e: this line first claimed PG plans
+  `Unique → Merge Append` over Gather Merge children. The fire-set PG
+  captures at both scales show `HashAggregate → Gather → Parallel Append`,
+  the hashed candidate over the pure parallel Append. After S2b-4a/4b goopg
+  plans the same structure; the remaining difference is the `Unique` label
+  on goopg's hashed step, which is S2b-4d.)
 
 The knob (jointree) pipeline plans both exactly like the default one; M0145's
 appendrel work flattened only `UNION ALL`.
@@ -178,3 +183,34 @@ candidate costs more than PG's, and Q75 still elects the hashed candidate.
 PG 18.3, `tpcds025`, `enable_hashagg = off`, a two-branch UNION over `item`:
 `Unique → Merge Append → Incremental Sort (Presorted Key: i_item_sk) → Index
 Scan using item_pkey`, for each branch.
+
+## S2b-4e: presorted branch paths (2026-09-24, blocked)
+
+Tried and not landed. The mechanism is sound, but it has nothing to reuse
+on the default arm yet.
+
+- **Q75 is not a witness.** PG elects the hashed candidate for Q75's UNION
+  at SF0.25 and SF1 (see the corrected Witnesses entry). No TPC-DS query
+  plans a Merge Append in PG.
+- **What was built.** Each simple UNION branch was planned a second time with
+  `ORDER BY 1, …, n`, drawing RTIDs from a scratch scope that started at the
+  branch's original first RTID (so a substituted plan keeps its alias
+  numbering). The Merge Append candidate took that plan when its total cost
+  was below the explicit Sort's. That is the same choice as PG's
+  `get_cheapest_path_for_pathkeys(TOTAL_COST)` over the child pathlist that
+  `build_setop_child_paths` fills.
+- **Why it was inert.** On the default arm a single-table `ORDER BY` never
+  gets an ordered index path. goopg planned `SELECT i_item_sk FROM item
+  WHERE i_item_sk < 100 ORDER BY 1` as `Sort → Index Scan using item_pkey`,
+  where PG plans a bare `Index Only Scan`. This is the ledgered
+  `c07-single-rel-never-reaches-ordered-index-producer`: `addOrderedIndexPaths`
+  runs only inside the join search, which declines one-relation scopes on
+  the legacy arm. The knob arm searches single-table statements since
+  M0145 slice 4, so the default arm gets them at the M0145-0008 cutover.
+  With no cheaper ordered plan available, the second planning pass only
+  cost planning time. The plans were unchanged: upstream `union.sql`,
+  TPC-DS Q49/Q75, and a large two-table UNION with `enable_hashagg = off`
+  (where PG also sorts both branches explicitly).
+- **Resume.** Re-apply the above after M0145-0008, then find a witness:
+  upstream `union.sql`'s `enable_hashagg = off` tenk1 cases plan Merge
+  Append over `Index Only Scan` children in PG.

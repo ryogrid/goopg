@@ -6731,7 +6731,7 @@ spill route is net-negative.
     Movement: none
     Kind: impl
     Parent: M0141-S2b-4
-  - [ ] **M0141-S2b-4e — presorted branch paths for the Merge Append arm**
+  - [!] **M0141-S2b-4e — presorted branch paths for the Merge Append arm**
     \(filed 2026\-09\-24 by S2b\-4c\). PG\'s `build\_setop\_child\_paths`
     offers each UNION child\'s cheapest path sorted on the union pathkeys,
     reusing an already\-sorted path \(index scan, Gather Merge over a partial
@@ -6740,6 +6740,22 @@ spill route is net-negative.
     than PG\'s. Witness TPC\-DS Q75 \(PG: Unique → Merge Append over Gather
     Merge children; goopg: hashed\). Design doc §"Not ported \(filed as
     S2b\-4e\)".
+    - **BLOCKED 2026\-09\-24 \(ralph2 loop \#36\)** on M0145\-0008 \(cutover\)
+      / ledger `c07\-single\-rel\-never\-reaches\-ordered\-index\-producer`.
+      - Witness corrected: PG plans Q75\'s UNION as `HashAggregate → Gather
+        → Parallel Append` at SF0.25 and SF1, not a Merge Append. goopg
+        already has that structure; its remaining gap is the S2b\-4d label.
+      - Built and not landed: re\-plan each simple branch with `ORDER BY
+        1..n` \(scratch RTID scope\), use it when cheaper than the explicit
+        Sort. Inert on the default arm: a single\-table ORDER BY never gets
+        an ordered index path \(`Sort → Index Scan using item\_pkey` where
+        PG plans `Index Only Scan`\). No plan moved \(union.sql, Q49/Q75,
+        a large two\-table probe where PG also sorts\), so it would only add
+        planning time.
+      - Resume after M0145\-0008; witness: upstream union.sql tenk1
+        enable\_hashagg=off cases \(PG: Merge Append over Index Only Scans\).
+    Blocked\-by: M0145-0008
+    Movement: none
     Kind: impl
     Parent: M0141-S2b-4
   - [ ] **M0141-S2b-4d — hashed Distinct label and the DISTINCT election**
