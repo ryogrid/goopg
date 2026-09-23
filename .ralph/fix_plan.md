@@ -2281,7 +2281,7 @@ heuristic stays live.)
       `OpIterator`; CTAS WITH NO DATA → `CREATE TABLE AS`.
     - Gates: units, tpch\-spotcheck, SF0.25 sweep, acceptance arm,
       `TestPort_RegressSuite` — all PASS.
-- [ ] **six divergences found by the 2026\-09\-23 command\-tag sweep**
+- [x] **six divergences found by the 2026\-09\-23 command\-tag sweep**
   \(each measured live against a private PG 18.3\).
   Kind: bug
   Parent: none
@@ -2344,6 +2344,19 @@ heuristic stays live.)
     to publish logical changes` when wal\_level is not `logical` \(check
     goopg's effective wal\_level first — the warning may be correctly
     absent\).
+    - **FIXED 2026\-09\-24 \(ralph2 loop \#42\), `a510ecd68`.** goopg\'s
+      wal\_level boots at `replica` like PG, so the warning was genuinely
+      missing. Now emitted with its 55000 code and HINT \(hint\-carrying
+      warnings added to the executor Context\).
+      - Found with it: the extended protocol dropped every executor NOTICE
+        and WARNING \(DROP IF EXISTS, REINDEX, …\). Both paths now share
+        `executorNoticeFrames`. Verified live with psql `\bind`; the HEAD
+        build printed none of the messages.
+      - Regress publication \+12 lines: goopg accepts six CREATE
+        PUBLICATIONs PG rejects, and now warns on them \(ledgered\).
+  - **All six closed 2026\-09\-24** \(two fixed earlier, REINDEX NOTICE
+    `804cfe74b`, DISCARD ALL `02e57b0c8`, NOTIFY PID refuted, this one\).
+    Movement: none
   - Take one per loop; each is small and independently testable.
 
 - [ ] **work\_mem boots at 512MB; PostgreSQL\'s default is 4MB** \(found
