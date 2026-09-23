@@ -15012,7 +15012,7 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
     margin is a costing question for M0145-0005's member-rel work.
   - Design doc:
     `docs/design/0100-0149/m0145-0004a-whole-chain-union-all-flattening.md`.
-- [ ] **M0145-0005 — single-pass DP over the jointree** (the search
+- [x] **M0145-0005 — single-pass DP over the jointree** (the search
   consumes the IR directly; semi/anti entries are legal searched partners
   via a `join_is_legal` port over the SJInfo-equivalent, joinrels.c:350).
   Retires the Phase A/B split, `runJoinSearchBelowPinned`, the pinned
@@ -15374,6 +15374,37 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
         classes.
       - Remaining for the task: slice-5 ledgered families
         (`outer-over-derived` post-B-06, `lateral`).
+    - **CLOSED 2026-09-23 (loop \#14).** Every named retirement in the
+      task text is landed on the jointree arm — Phase A/B +
+      `runJoinSearchBelowPinned` + the pinned spine + splice-time
+      re-resolution are unreachable there (slice 7, `same=99
+      changed=0` probe evidence), and `admitSemiAnti` is unconditional
+      in production. Their code deletion is M0145-0008's scope, not
+      this task's. Every remaining bullet is ledgered or filed:
+      - `outer-over-derived` — RESOLVED by M0145-0018 (firewall
+        retired; seam census `3 → 0` on both arms).
+      - `lateral` — filed as **M0145-0010** (recon + design doc
+        landed; the `lateral_relids`/`direct_lateral_relids` port).
+      - `leaf-count` residual (10 fires post-0013/0016/0018) —
+        already-planned composite leaves (`*Project`/`*Gather`/NLI/
+        `*CTEScan`) no admission predicate decomposes; the
+        positional-identity `*Project` descent is **M0144-0003a**'s
+        filed scope, whose recorded wall (resolver-time lowering via
+        M0145-0003/0004) is now discharged — flagged for owner
+        re-adjudication of the `[!]` mark.
+      - `leaf-count-overflow` — measured live, recorded as a
+        deliberate divergence, pinned (`TestSeamDeclinesAtTheRelSetWidth`).
+      - `residual-hits-pad` (4 fires) — ledgered under M0145-0013's
+        row (census the class, name wall-vs-bug).
+      - Missed-opts skips (`injectLikeRangePredicates`,
+        `planIndexScanFromWhere`, the default-arm ONEREL reduction
+        gap) — three deferral-ledger rows with corrected resume
+        points; `reduceNotNullQuals` closed.
+      - Depends-on M0145-0004 — satisfied (whole-chain flattening via
+        0004a; CTE-wrapped residual ledgered under 0004).
+      Nothing selectable remains inside this task.
+  Movement: none — bookkeeping closure; every movement was recorded
+    under its own slice/task entry.
 - [x] **M0145-0006 — upper-rel pathlists** (extend the lattice through
   `create_grouping_paths`/`create_ordered_paths` analogues so ordering and
   grouping are elected over candidate sets, not by stage-builder

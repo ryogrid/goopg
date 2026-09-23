@@ -1,38 +1,33 @@
-# Working Set — loop #13 end-state
+# Working Set — loop #14 end-state
 
-Task: M0145-0007 slice 4 re-adjudication + M0145-0004 close-out. Both done.
+Task: M0145-0005 close-out audit → CLOSED `[x]` (bookkeeping, no code).
 
 Files:
-- `.ralph/fix_plan.md` — 0004 marked `[x]` (headline via 0004a, residuals
-  ledgered); 0007 gained the "Slice-4 RE-ADJUDICATED 2026-09-23" bullets.
-- `docs/design/0100-0149/m0145-0007-single-path-node-lowering.md` — Status,
-  slice-plan row 4, new RE-ADJUDICATED section.
-- `docs/design/README.md` — m0145-0007 index cell rewritten.
+- `.ralph/fix_plan.md` — 0005 `[x]` + CLOSED audit bullet (residual homes).
+- `docs/design/0100-0149/m0145-0005-single-pass-dp-over-jointree.md` —
+  `Status:` line → CLOSED (D3).
+- `docs/design/README.md` — m0145-0005 status cell updated.
 
-Key symbols: `runJoinSearchBelowPinned` (sole caller planner.go:1932 under
-`!jointree`); `spliceSearchedSpine`/`layoutPosMap`/`remapByPosMap`/
-`remapSublinkOuterRefs` (predp.go only); `unnestSubqueriesInPlan`
-(posthoc site planner.go:2075); `SUBLINKCENSUS`/`PULLUPCENSUS` (nlicensus.go).
+Key symbols: `admitSemiAnti` (unconditional in production);
+`runJoinSearchBelowPinned` (dead on knob arm, legacy-only until 0008);
+`traceSeamDecline` reasons: `leaf-count` 10, `residual-hits-pad` 4,
+`outer-over-derived` 0 post-0018.
 
 Hypothesis/Findings:
-- The 2026-09-21 slice-4 blocker (291/308 pinned-spine, "blocked on
-  M0145-0003 coverage") predates 0005 slice 7 (`15fbcf78d`). Fresh census,
-  both corpora both arms: knob arm pinned-spine = **0** (SF0.25: 23 pullup /
-  22 posthoc; TPC-H: 5 / 4); default arm unchanged 207 / 16 (control).
-- Old denominator inflated: legacy note fired per WHERE-bearing statement;
-  jointree notes fire only with sublinks present. Honest sublink-bearing
-  events: SF0.25 = 45 (51% pulled), TPC-H = 9 (56%).
-- `applyJoinTreePosMap`, `remapWithBindings`, `remapPosMapAfterRewrite`,
-  `remapExprRefsToMHJ` exist only in comments — absorbed since recon.
-- `reresolveJoinByName`/`remapOuterRefsInSubplan` are shared machinery for
-  the posthoc route on BOTH arms — not splice leftovers.
-- Verdict: slice 4 = NO-FOLD. predp.go members die wholesale at M0145-0008;
-  remaining 0007 work = slice 5 (`fillJoinHashKeys`) only.
+- Every 0005-named retirement is landed on the jointree arm (slices 1-7);
+  code deletion is M0145-0008's scope.
+- Residual homes: `outer-over-derived`→0018 (done), `lateral`→0010 (filed),
+  leaf-count composites (Project/Gather/NLI/CTEScan, ~10 fires)→
+  **M0144-0003a** `[!]` — its recorded wall (resolver-time lowering via
+  0003/0004) is DISCHARGED since both are `[x]`; flagged for owner
+  re-adjudication. `leaf-count-overflow`→deliberate divergence+pinned.
+  `residual-hits-pad`→0013 ledger row. Missed-opts→3 ledger rows.
+- Nightly triage: all 16 AI-20260922 items already filed `[x]` — nothing new.
 
-Next step: commit doc/plan updates and push; next loop selects per the
-banner (M0145-0007 slice 5 or a re-pin).
+Next step: banner order → M0145-0007 slice 5 (`fillJoinHashKeys` fold) is
+the next open chain task; then 0008 (cutover — needs executor-capability
+ledger per its prerequisite sub-inventory), 0010, 0024, 0025.
 
-Gates run: 4× `jointree-parity-capture` (sf025+tpch × knob+default) PASS;
-census + caller-trace greps. No code changed — measurement/docs only.
+Gates run: none needed — docs/bookkeeping only (census greps as evidence).
 
 In-flight: none.

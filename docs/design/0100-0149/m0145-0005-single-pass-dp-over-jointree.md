@@ -1,13 +1,18 @@
 # M0145-0005 — single-pass DP over the jointree
 
-Status: slices 1 (knob-arm `splitOuterSpine` retired), 2 (pulled
+Status: **CLOSED 2026-09-23** — slices 1 (knob-arm `splitOuterSpine`
+retired), 2 (pulled
 semi/anti as real leaf items), 3 (IR-direct leaf materialisation —
 `jtScopeTable`/`extractScopeLeaves`), 4 (one-relation + degenerate
 scopes through the same entry), 5-partial (searched-subtree opacity
 for the residual pushdown family), 6 (chain-extracted semi/anti as
 deferred real leaf items — slice 2's chain half) and 7 (Phase A/B /
-pinned-spine retirement on the jointree arm) landed; the rest of
-slice 5 is ledgered below. Task:
+pinned-spine retirement on the jointree arm) landed; every residual
+is ledgered or filed elsewhere (`outer-over-derived` → M0145-0018,
+`lateral` → M0145-0010, leaf-count composites → M0144-0003a,
+leaf-count-overflow → deliberate divergence, residual-hits-pad →
+0013 ledger, missed-opts → ledger rows), so the fix_plan task is
+marked `[x]`. Task:
 `.ralph/fix_plan.md` M0145-0005. Parent:
 M0145-0001 (IR contract + retirement matrix), M0145-0003 (semi/anti leaf
 entries), M0145-0004 (appendrel leaves). Kind: impl.
