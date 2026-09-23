@@ -15905,6 +15905,10 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
       it should land before the flip.
       - FIXED 2026\-09\-23 by M0145\-0027 \(`a80588e30`\): knob Q20 0.18 s,
         knob/default total 1.01x.
+    - **Pre\-flip floor check 2026\-09\-23:** knob SF0.25 read match=1 \(Q41
+      lost\) → fixed by **M0145\-0028**; knob now SF0.25 match=2 \(= floor\),
+      TPC\-H 2/22 \(= default; the parallel floor of 3 is unmet on BOTH
+      arms — M0145\-0025's re\-baseline\). Next slice: the flip itself.
     - TPC\-H capture reads `match=2/22` on BOTH arms at `PGSHAPED=1`
       \(floor 3, inside the ±3 band, arm\-independent\) — for
       M0145\-0025's re\-baseline.
@@ -17761,3 +17765,21 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
       fire set \(SF0.25\+SF1, 25 fires, introduced=none\) — all PASS.
     - Residual: PG's mechanism \(outer ref = Param = pseudo\-constant
       index qual on the composite index\) is ledgered.
+- [x] **M0145-0028 — knob arm loses the TPC-DS SF0.25 floor match Q41**
+  \(filed and fixed 2026-09-23, ralph2 loop \#4, found by the M0145-0008
+  pre-flip floor check\). Knob SF0.25 read match=1 vs floor 2 \(Q9, Q41\).
+  Kind: impl
+  Parent: M0145-0008
+  Movement: none
+  - Same split as M0145-0027 with a sublink: the one\-rel search put Q41's
+    `i_manufact_id` range in a searched leaf Filter and stranded
+    `\(SubPlan 1\) > 0` above it — SubPlan priced per leaf row \(986.78 vs
+    180.78\), EXPLAIN printing one of two Filters, a redundant second Sort.
+  - Fix `6de31332c`: `flattenStrandedSeqScanFilters` \(renamed,
+    generalised to every `conjunctIsLocalEligible` refusal, merged in WHERE
+    source order\).
+  - Knob SF0.25 match 1 → 2, only Q41 changed; TPC\-H knob plans
+    unchanged; default sweep plans same=99. Gates: units, spotcheck,
+    acceptance arm, SF0.25 sweep, fire set \(24 fires\) — all PASS.
+  - Ledgered: PG orders scan quals by per\-tuple cost
+    \(`order_qual_clauses`\); goopg uses the WHERE order.

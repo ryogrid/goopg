@@ -530,3 +530,46 @@ references as leaf quals, so both arms still reach the probe through a rule
 (one column, `l_suppkey` as a filter). Pin:
 `TestOneRelIndexProducerKeepsMultiConjunctCorrelatedProbe` fails on the
 jointree and one-rel routes with the fix disabled.
+
+## Parity floor on the knob arm: Q41 lost, then restored (2026-09-23, M0145-0028)
+
+A cutover that loses a current PG match is a regression (`AGENT.md` §Goal), so
+before the flip the floor was re-read on the knob arm. TPC-DS SF0.25 read
+**match=1** on `GOOPG_JOINTREE_PIPELINE=1` against the floor of 2 (Q9, Q41):
+Q41 was lost. TPC-H read 2/22 on both arms (unchanged by the knob).
+
+Mechanism — the Q20 split again, with a sublink instead of an outer reference.
+A miniature of Q41's outer scope planned on both routes:
+
+| route | tree |
+|---|---|
+| default (bypass) | `Limit(Distinct(Project(Sort(Project(Filter[3 conjuncts](SeqScan))))))` |
+| jointree | `…Sort(Project(Filter[1, unsearched](Filter[2, searched, leaf-local](SeqScan))))` |
+
+The search took the `i_manufact_id` range into a searched leaf Filter and held
+`(SubPlan 1) > 0` above it (`conjunctIsLocalEligible` refuses sublinks as leaf
+quals, like outer references). Consequences on the real query: the SubPlan was
+priced over every leaf row (seq scan 986.78 vs 180.78), EXPLAIN printed only
+ONE of the two Filters, and the upper rel stacked a redundant second Sort — three
+category divergences (join-order, parameterisation, sort-strategy) from one
+split.
+
+Fix: the M0145-0027 helper, generalised and renamed
+`flattenStrandedSeqScanFilters` — it fires on ANY leaf-ineligible conjunct (the
+test is `conjunctIsLocalEligible` itself), and orders the merged list by source
+position, i.e. the WHERE order the bypass builds. PG orders a scan's quals by
+per-tuple cost (`./postgres/src/backend/optimizer/plan/createplan.c:5420`
+`order_qual_clauses`), which puts the SubPlan last; goopg has no per-clause
+cost evaluator, so the bypass order is the faithful baseline (ledgered). For Q41
+the two orders coincide.
+
+Result: knob-arm SF0.25 **match 1 → 2** (Q9, Q41 — floor held), only Q41
+changed; TPC-H knob plans byte-identical to the M0145-0027 capture; default arm
+untouched (sweep plans `same=99 changed=0`). Q41's knob plan is now identical
+to the default's, so it left the fire set (25 → 24 fires). Gates: units,
+spotcheck, acceptance arm, SF0.25 sweep, fire set — all PASS.
+
+**Cutover floor status after this:** knob arm TPC-DS SF0.25 match=2 (= floor),
+TPC-H 2/22 (= default arm; the recorded parallel floor of 3 is not met by
+EITHER arm today — for M0145-0025's pinned-seed re-baseline, not a knob
+regression).
