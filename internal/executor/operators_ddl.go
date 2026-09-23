@@ -19851,8 +19851,8 @@ func (o *ddlOp) execDropTrigger(s *parser.DropTriggerStmt) error {
 	return nil
 }
 
-// execDropRule handles DROP RULE. Rules are not implemented; always reports
-// "rule does not exist".
+// execDropRule handles DROP RULE: the rule exists when its `name@table` key is
+// in the compat-object registry (every CREATE RULE form registers it).
 func (o *ddlOp) execDropRule(s *parser.DropRuleStmt) error {
 	_, tblOk := o.lookupTableWithSearch(s.Table)
 	if !tblOk {
@@ -19875,11 +19875,10 @@ func (o *ddlOp) execDropRule(s *parser.DropRuleStmt) error {
 		}
 		return &ExecError{Code: "42P01", Pos: s.Pos(), Message: fmt.Sprintf("relation %q does not exist", s.Table.Name)}
 	}
-	if s.IfExists {
-		o.ctx.AddNotice(fmt.Sprintf("rule %q for relation %q does not exist, skipping", s.Name, s.Table.Name))
-		return nil
-	}
 	// Check compat registry: if the rule was registered via CREATE RULE (noop), succeed silently.
+	// IF EXISTS is decided AFTER the lookup: before 2026-09-23 it short-
+	// circuited here, so DROP RULE IF EXISTS on an EXISTING rule emitted the
+	// "does not exist, skipping" notice and dropped nothing.
 	if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
 		key := s.Name + "@" + s.Table.String()
 		if im.DropCompatObject("rule", key) {
@@ -19900,23 +19899,34 @@ func (o *ddlOp) execDropRule(s *parser.DropRuleStmt) error {
 			return nil
 		}
 	}
+	if s.IfExists {
+		o.ctx.AddNotice(fmt.Sprintf("rule %q for relation %q does not exist, skipping", s.Name, s.Table.Name))
+		return nil
+	}
 	return &ExecError{Code: "42704", Pos: s.Pos(),
 		Message: fmt.Sprintf("rule %q for relation %q does not exist", s.Name, s.Table.Name)}
 }
 
-// execAlterRuleRename handles `ALTER RULE name ON table RENAME TO newname`.
-// Only the DO-NOTHING rule form goopg reifies into catalog.RuleInfo
-// (tbl.Rules — see execCreateRule) is renameable; any rule that fell to the
-// CompatNoopStmt path (a real DO INSTEAD/DO ALSO action) is not in tbl.Rules
-// and correctly reports "does not exist" here, matching this slice's scope
-// boundary. Mirrors postgres/src/backend/rewrite/rewriteDefine.c:793
-// RenameRewriteRule (including the reserved-name check for "_RETURN", the
-// view SELECT rule, and the duplicate-name collision check). M0134-0065.
+// execAlterRuleRename handles `ALTER RULE name ON table RENAME TO newname`,
+// mirroring postgres/src/backend/rewrite/rewriteDefine.c:793
+// RenameRewriteRule (the reserved-name check for "_RETURN", the view SELECT
+// rule, and the duplicate-name collision check). M0134-0065.
+//
+// goopg tracks a rule's existence in two places: the DO-NOTHING form is
+// reified as a catalog.RuleInfo on the table (tbl.Rules, what pg_rewrite and
+// pg_get_ruledef read), and EVERY rule — including the DO INSTEAD/ALSO action
+// forms that stay CompatNoop — is registered in the compat-object registry
+// under `name@table`, which is what DROP RULE consults. The rename must move
+// both: renaming only tbl.Rules left DROP RULE newname failing "does not
+// exist" and DROP RULE oldname succeeding (2026-09-23, found live).
 func (o *ddlOp) execAlterRuleRename(s *parser.AlterRuleRenameStmt) error {
 	tbl, ok := o.lookupTableWithSearch(s.Table)
 	if !ok {
 		return &ExecError{Code: "42P01", Pos: s.Pos(), Message: fmt.Sprintf("relation %q does not exist", s.Table.Name)}
 	}
+	im, _ := o.ctx.Catalog.(*catalog.InMemory)
+	oldKey := s.Name + "@" + s.Table.String()
+	newKey := s.NewName + "@" + s.Table.String()
 	idx := -1
 	for i := range tbl.Rules {
 		if tbl.Rules[i].Name == s.Name {
@@ -19924,27 +19934,34 @@ func (o *ddlOp) execAlterRuleRename(s *parser.AlterRuleRenameStmt) error {
 			break
 		}
 	}
-	if idx == -1 {
+	registered := im != nil && im.HasCompatObject("rule", oldKey)
+	if idx == -1 && !registered {
 		return &ExecError{Code: "42704", Pos: s.Pos(),
 			Message: fmt.Sprintf("rule %q for relation %q does not exist", s.Name, tbl.Name)}
 	}
 	// RenameRewriteRule disallows renaming a view's ON SELECT rule (which PG
 	// always names "_RETURN"), since that would break the invariant that a
-	// view's rewrite rule is discoverable by that fixed name. goopg does not
-	// model view rules in tbl.Rules (only the DO-NOTHING form reaches here),
-	// so this is effectively unreachable today but guarded for fidelity
-	// should that change.
+	// view's rewrite rule is discoverable by that fixed name.
 	if strings.EqualFold(s.Name, "_RETURN") {
 		return &ExecError{Code: "42939", Pos: s.Pos(),
 			Message: "renaming an ON SELECT rule is not allowed"}
 	}
+	collides := im != nil && s.NewName != s.Name && im.HasCompatObject("rule", newKey)
 	for i := range tbl.Rules {
 		if i != idx && tbl.Rules[i].Name == s.NewName {
-			return &ExecError{Code: "42710", Pos: s.Pos(),
-				Message: fmt.Sprintf("rule %q for relation %q already exists", s.NewName, tbl.Name)}
+			collides = true
 		}
 	}
-	tbl.Rules[idx].Name = s.NewName
+	if collides {
+		return &ExecError{Code: "42710", Pos: s.Pos(),
+			Message: fmt.Sprintf("rule %q for relation %q already exists", s.NewName, tbl.Name)}
+	}
+	if idx >= 0 {
+		tbl.Rules[idx].Name = s.NewName
+	}
+	if registered {
+		im.RenameCompatObject("rule", oldKey, newKey)
+	}
 	return nil
 }
 

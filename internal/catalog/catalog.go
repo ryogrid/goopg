@@ -18435,6 +18435,30 @@ func (c *InMemory) DropCompatObject(objType, name string) bool {
 	return false
 }
 
+// HasCompatObject reports whether name is registered under objType.
+func (c *InMemory) HasCompatObject(objType, name string) bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	_, ok := c.compatObjects[strings.ToLower(objType)][name]
+	return ok
+}
+
+// RenameCompatObject moves a registered name to newName under objType,
+// returning false when oldName was not registered. Used by ALTER … RENAME of
+// objects whose existence the registry tracks (rules), so a later DROP finds
+// them under the new name.
+func (c *InMemory) RenameCompatObject(objType, oldName, newName string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	m := c.compatObjects[strings.ToLower(objType)]
+	if _, ok := m[oldName]; !ok {
+		return false
+	}
+	delete(m, oldName)
+	m[newName] = struct{}{}
+	return true
+}
+
 // ListCompatObjects returns all registered names for a given object type.
 func (c *InMemory) ListCompatObjects(objType string) []string {
 	c.mu.RLock()
