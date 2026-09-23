@@ -14255,9 +14255,52 @@ EXISTS/IN body via `planSelectWithParent` before unnest/search ever run
 M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
 `-3i-lateral-route` all block on this milestone's 0003.
 
-- [x] **M0145-0001 — recon: the jointree-level IR and the lowering
+- [!] **M0145-0001 — recon: the jointree-level IR and the lowering
   contract** (design the representation the whole milestone builds on).
   **DONE 2026-09-21.**
+
+  > ## ESCALATION 2026-09-23 (ralph2 loop \#5) — lineage budget exhausted again, OWNER DECISION NEEDED
+  >
+  > The lineage guard refused two new descendants: the last five completed
+  > ones — M0145-0004a, M0145-0005, M0145-0007, M0145-0027, M0145-0028 —
+  > all carry `Movement: none` (the `LINEAGE-BASELINE` re-pin is spent).
+  > Root marked `[!]`; the loop selects elsewhere until the owner answers.
+  >
+  > - **Attempted since the last GO:** 0005/0007 closed by measurement
+  >   \(slice 5: 0 key drift on 670 joins; M0145\-0026 filed\); the
+  >   M0145\-0008 executor\-capability inventory \(unexecutable set EMPTY\);
+  >   M0145\-0027 \(knob Q20 3.80 s → 0.18 s, arm gap 1.06x → 1.01x\);
+  >   M0145\-0028 \(knob SF0.25 floor match Q41 restored, 1 → 2\).
+  > - **What each step proved:** the knob arm is value\-identical on both
+  >   corpora, timing\-neutral \(1.01x\) and at the parity floor \(SF0.25 2
+  >   = default, TPC\-H 2/22 = default\). Each is `Movement: none` BY
+  >   CONSTRUCTION: the instruments measure the default arm, which none of
+  >   these touches until the flip.
+  > - **Remaining blocker to the flip**
+  >   \(`docs/design/0100-0149/m0145-0008-flip-test-triage.md`\): a local
+  >   flip fails 54 unit tests — 31 legacy\-machinery tests pinned
+  >   \(`3b8b771f6`\), 2 state the default \(flip commit\), and two groups
+  >   that would have been filed as descendants: \(I\) ≥10 tests where the
+  >   one\-relation search misses an index path the rule bypass produced
+  >   \(`TestSAOPWithConjunctMoves`, executor index/IOS tests\) — measure
+  >   generated\-vs\-out\-costed, close real gaps; \(B\) 11 behavioural tests
+  >   \(grouping strategy, nested scalar subquery, NLI semi/anti election,
+  >   hashed\-IN SubPlan, two EXPLAIN expectations — one already classified
+  >   stale/PG\-faithful\). Plus a script audit: the SF0.25 sweep and the
+  >   TPC\-H estimate\-audit arm default the knob to `0` and must change in
+  >   the flip commit.
+  > - **Expected movement if unblocked:** the flip is the first commit in
+  >   this lineage that CAN move the instruments — the knob arm's category
+  >   counts become the default's. Honest size: the arms are within ±3 on
+  >   every category today \(e.g. TPC\-DS SF0.25 `join-order` 90 knob vs 91
+  >   default\), so the flip's own movement is small; its value is retiring
+  >   the dual pipeline \(the deletion slice\).
+  > - **Remaining size:** groups I \+ B \(≈21 tests, 1–3 loops\), the flip
+  >   commit with full gates \(1 loop\), legacy deletion \(several loops\).
+  > - **Owner options:** \(a\) re\-pin `LINEAGE-BASELINE` and GO groups
+  >   I/B then the flip; \(b\) accept a flip commit that pins the group I/B
+  >   tests to legacy and files them as post\-flip defects; \(c\) hold the
+  >   cutover.
 
   > **OWNER ANSWER 2026-09-22: GO — CONTINUE.** Root re-opened by
   > owner directive. Per the answer the measured downstream walls
@@ -15909,6 +15952,23 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
       lost\) → fixed by **M0145\-0028**; knob now SF0.25 match=2 \(= floor\),
       TPC\-H 2/22 \(= default; the parallel floor of 3 is unmet on BOTH
       arms — M0145\-0025's re\-baseline\). Next slice: the flip itself.
+    - **Flip unit\-suite triage 2026\-09\-23 \(ralph2 loop \#5\)** — design doc
+      `docs/design/0100-0149/m0145-0008-flip-test-triage.md`. A local flip
+      \(`jointreePipelineFromEnv`: `v == "1"` → `v != "0"`\) fails **54**
+      unit tests \(37 optimizer, 17 executor\).
+      - Correctness claim checked first: `TestUnnestCorrelatedIn_Rejects*`
+        guard a LEGACY keying bug; on the new pipeline the correlated IN
+        becomes a semi join with BOTH conditions in its predicate — PG 18.3
+        converts it the same way \(LATERAL, `convert_ANY_sublink_to_join`\).
+      - Group L \(31 legacy\-machinery tests\): pinned with
+        `pinLegacyPipeline\(t\)` — test\-only commit `3b8b771f6`.
+      - Group K \(2, polarity \+ `planner-flags.env`\): change in the flip
+        commit. Groups I \(≥10, one\-rel index\-path coverage\) and B \(11
+        behavioural\) are NOT filed: the S4 lineage budget of root
+        M0145\-0001 is exhausted — held in its escalation block.
+      - Script audit: `tpcds-sf025-regression.sh:310` and
+        `tpch-estimate-audit-arm.sh:108` default the knob to `0` — must
+        change in the flip commit or the gates keep measuring legacy.
     - TPC\-H capture reads `match=2/22` on BOTH arms at `PGSHAPED=1`
       \(floor 3, inside the ±3 band, arm\-independent\) — for
       M0145\-0025's re\-baseline.
