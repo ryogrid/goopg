@@ -457,3 +457,76 @@ over a miniature of Q17's shape and asserts the correlated scalar SURVIVES as a
 subquery expression. It fails on both affected routes without the fix
 (`Project(Filter(Join{algo:Hash}))` — the decorrelated tree) and passes on the
 bypass control either way, so it pins the defect rather than the code.
+
+## Q20 FIXED (2026-09-23, M0145-0027): the second producer was shut out
+
+The executor-capability inventory (`m0145-0008-executor-capability-inventory.md`)
+found Q20 still 29x slower on the knob arm (0.13 s → 3.80 s), hidden inside the
+1.06x total: the knob arm decorrelated `ps_availqty > (SELECT 0.5 * sum(…) FROM
+lineitem WHERE l_partkey = ps_partkey AND l_suppkey = ps_suppkey AND l_shipdate
+…)` into a whole-lineitem `HashAggregate`, while PG 18.3 and the default arm keep
+the SubPlan with an index probe (PG never converts `EXPR_SUBLINK` —
+`./postgres/src/backend/optimizer/prep/prepjointree.c:652`).
+
+### Measured, not guessed
+
+The inventory's guess — "the scalar sits inside a pulled-up `IN` body, so it is
+planned on a route the Q17 fix does not cover" — was WRONG. A throwaway probe
+(`canUnnestSubquery`'s input shape, the Q17 rule's inputs, the bypass producer's
+verdict, and the scan-input pass's before/after, on both arms) showed:
+
+| step | default arm | knob arm |
+|---|---|---|
+| rule-based producer `planIndexScanFromWhere` on the 4-conjunct WHERE | **declines** (bypass) | **declines** (Q17 rule fires, same verdict) |
+| tree entering `rewriteScanInputsWithSingleTablePredicates` | `Filter{corr,corr,range,range}(SeqScan)` | `Filter{corr,corr}(Filter_searched,leafLocal{range,range}(SeqScan))` |
+| that pass's output | **`Filter(IndexScan)`** — probe on `l_partkey` | unchanged |
+| body seen by `canUnnestSubquery` | `Aggregate(Filter(IndexScan))` → probe-cheap → SubPlan kept | `Aggregate(Filter(Filter(SeqScan)))` → decorrelated |
+
+So the bypass arm's correlated probe never came from the rule-based producer at
+all — for a multi-conjunct WHERE it comes from the SECOND producer, the
+scan-input pass, which absorbs the equality out of `Filter{SeqScan}`. On the
+jointree/one-rel routes the one-relation search puts the constant quals into a
+SEARCHED leaf Filter and holds the correlated ones above it, because
+`conjunctIsLocalEligible` (`local_filters.go`) refuses any conjunct holding an
+`OuterColumnRef` as a leaf qual; the scan-input pass returns at `isSearchedTree`
+(P5.9-b), so the equality is never absorbed. Q17 escaped this only because its
+WHERE is the one equality the rule-based producer reads.
+
+### Fix
+
+`flattenCorrelatedSeqScanFilters` (planner.go), called from the same M0145-0008
+restoring rule when its producer declines: a chain of Filters directly over one
+SeqScan (no Project, no second relation — all predicates already address the
+SeqScan's output, so no rebase) that carries a correlated conjunct is merged into
+the ONE unsearched `Filter{SeqScan}` the bypass builds, and the scan-input pass
+then does exactly what it does on the default arm. Fail-closed: no correlated
+conjunct, a single Filter, or any other node in the chain → the search's
+election stands. Gated like the rule (`jointree || GOOPG_ONEREL_SEARCH`), so the
+default arm is untouched.
+
+### Result
+
+| | before | after |
+|---|---|---|
+| knob Q20 plan | decorrelated `HashAggregate` over `Seq Scan on lineitem` | `SubPlan 1` = `Aggregate` over `Index Scan using lineitem_part_supp_fkidx`, `Index Cond: (l_partkey = partsupp.ps_partkey)` |
+| knob Q20 time (full 22-query arm) | 3.80 s | **0.18 s** (default 0.15 s) |
+| knob/default TPC-H total | 1.06x | **1.01x** |
+
+Values 24/24 identical. Blast radius: TPC-H knob capture — only Q20 changed;
+TPC-DS SF0.25 knob capture — only Q41 changed (its correlated `item` body now
+prints ONE Filter holding the correlation and the constant OR tree, as PG
+prints it; `qual-placement` left Q41's divergence list). Default arm: the SF0.25
+sweep's plan channel `same=99 changed=0`. Gates: units, tpch-spotcheck,
+acceptance arm, SF0.25 sweep, fire set (25 fires, SF0.25+SF1) — all PASS.
+
+Residual PG divergence (ledgered): PG plans the correlation as an index qual of
+a PARAMETERISED base-rel path — the outer reference is a `PARAM_EXEC`
+(`./postgres/src/backend/optimizer/util/paramassign.c:121` `replace_outer_var`),
+which `match_clause_to_indexcol`
+(`./postgres/src/backend/optimizer/path/indxpath.c:2712`) accepts as a
+pseudo-constant (`is_pseudo_constant_for_index`, `indxpath.c:4596`), so it
+probes the composite index on BOTH columns. goopg's search refuses outer
+references as leaf quals, so both arms still reach the probe through a rule
+(one column, `l_suppkey` as a filter). Pin:
+`TestOneRelIndexProducerKeepsMultiConjunctCorrelatedProbe` fails on the
+jointree and one-rel routes with the fix disabled.

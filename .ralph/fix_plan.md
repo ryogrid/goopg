@@ -15903,6 +15903,8 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
       nested inside the `IN` body into a whole\-lineitem HashAggregate;
       PG and the default arm keep the SubPlan. Filed **M0145\-0027**;
       it should land before the flip.
+      - FIXED 2026\-09\-23 by M0145\-0027 \(`a80588e30`\): knob Q20 0.18 s,
+        knob/default total 1.01x.
     - TPC\-H capture reads `match=2/22` on BOTH arms at `PGSHAPED=1`
       \(floor 3, inside the ±3 band, arm\-independent\) — for
       M0145\-0025's re\-baseline.
@@ -17713,7 +17715,7 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
   \(`GOOPG_HASHKEY_PROBE=1`, `verdict=DIFFLEN` lines\). Recon only.
   Kind: recon
   Parent: M0145-0007
-- [ ] **M0145-0027 — knob-arm TPC-H Q20 decorrelates a correlated scalar
+- [x] **M0145-0027 — knob-arm TPC-H Q20 decorrelates a correlated scalar
   subquery PG keeps as a SubPlan** \(filed 2026-09-23 by the M0145-0008
   executor-capability inventory\). Full 22-query acceptance arm, same
   binary: Q20 0.13 s default → **3.80 s** knob \(29x\), values identical.
@@ -17736,3 +17738,26 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
   full knob acceptance arm. Blocks the M0145-0008 flip.
   Kind: impl
   Parent: M0145-0008
+  Movement: none
+  - **FIXED 2026\-09\-23 \(ralph2 loop \#3\)** — code `a80588e30`, pin
+    `b9316d276`. Design doc `m0145-0008-cutover-readiness-timing-ab.md`
+    §"Q20 FIXED".
+    - The filed hypothesis \(nesting inside the pulled `IN` body\) was
+      WRONG. Probe on both arms: the rule\-based producer declines Q20's
+      4\-conjunct WHERE on BOTH arms; the default arm gets its probe from
+      `rewriteScanInputsWithSingleTablePredicates`, which on the knob arm
+      meets `Filter\{corr\}\(Filter\_searched\{range\}\(SeqScan\)\)` — the
+      search stranded the correlated conjuncts above a searched leaf
+      \(`conjunctIsLocalEligible` refuses `OuterColumnRef`\), and the pass
+      skips searched subtrees.
+    - Fix: `flattenCorrelatedSeqScanFilters` in the M0145\-0008 restoring
+      rule merges that chain into the bypass's unsearched
+      `Filter\{SeqScan\}`; fail\-closed; knob/one\-rel routes only.
+    - Knob Q20 3.80 s → **0.18 s** \(default 0.15 s\); total gap 1.06x →
+      **1.01x**; values 24/24. Blast radius: TPC\-H knob only Q20; TPC\-DS
+      SF0.25 knob only Q41 \(now one Filter, as PG prints it\); default
+      arm sweep plans same=99 changed=0.
+    - Gates: units, tpch\-spotcheck, acceptance arm, SF0.25 sweep,
+      fire set \(SF0.25\+SF1, 25 fires, introduced=none\) — all PASS.
+    - Residual: PG's mechanism \(outer ref = Param = pseudo\-constant
+      index qual on the composite index\) is ledgered.

@@ -1,7 +1,8 @@
 # M0145-0008 prerequisite: executor-capability inventory
 
 Status: inventory produced 2026-09-23 — no member is a "generatable but
-unexecutable" shape; one NEW readiness finding (Q20, filed as M0145-0027).
+unexecutable" shape; one NEW readiness finding (Q20, filed as M0145-0027 —
+FIXED the same day, knob Q20 3.80 s → 0.18 s).
 Task: `.ralph/fix_plan.md` M0145-0008 (Kind: impl), owner direction
 2026-09-22 (progress-report §5.6). Measurement only — no product code.
 
@@ -99,7 +100,10 @@ arms at `PGSHAPED=1`, parallel mode; both arms score `match=2/22`):
   `:679`/`:733`), so the knob arm is
   the unfaithful one — a fidelity defect as well as 29x.
 
-The outcome has the same shape as Q17's (`canUnnestSubquery`'s probe-cheap
+**CORRECTED 2026-09-23 (M0145-0027, fixed):** the nesting guess below was
+wrong — the real cause is the multi-conjunct WHERE; see
+`m0145-0008-cutover-readiness-timing-ab.md` §"Q20 FIXED". Original text:
+the outcome has the same shape as Q17's (`canUnnestSubquery`'s probe-cheap
 guard reading a body that never got its index path — a hypothesis for Q20,
 not yet measured), but the Q17 fix
 (`planner.go:2008`, `isSimpleSingle && (jointree || oneRelSearchEnabled()) &&
