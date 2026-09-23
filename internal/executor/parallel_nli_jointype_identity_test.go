@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"testing"
 
+	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/optimizer"
 	"github.com/goopg/goopg/internal/parser"
 )
@@ -41,7 +42,7 @@ func nliJointypeFixture(t *testing.T) (*Context, func()) {
 			t.Fatalf("%s: %v", ddl, err)
 		}
 	}
-	for i := 0; i < 400; i++ {
+	for i := 0; i < 100; i++ {
 		if err := runDDL(t, ctx, fmt.Sprintf("INSERT INTO nlij_outer VALUES (%d, %d)", i, i)); err != nil {
 			cleanup()
 			t.Fatalf("insert outer: %v", err)
@@ -56,15 +57,48 @@ func nliJointypeFixture(t *testing.T) (*Context, func()) {
 			t.Fatalf("insert inner: %v", err)
 		}
 	}
+	// 100,000 inner rows that match no outer key: the probe has to earn
+	// its election as it does in PG. On 400 outer x 50 inner rows PG 18.3
+	// elects Hash Semi/Anti Join and Merge Left Join; with 100 outer rows
+	// over this inner it elects `Nested Loop Semi Join` and `Nested Loop
+	// Left Join` over an index probe (M0145-0030). For NOT EXISTS PG
+	// elects Merge Right Anti Join, which goopg lacks (no JOIN_RIGHT_ANTI,
+	// ledgered); the NL anti probe is goopg's election there.
+	if err := runDDL(t, ctx, "INSERT INTO nlij_inner SELECT 1000 + g, g FROM generate_series(1, 100000) g"); err != nil {
+		cleanup()
+		t.Fatalf("insert inner filler: %v", err)
+	}
+	// The in-process ANALYZE is a no-op, so seed what ANALYZE would record.
+	// Without it the outer is sized by the never-analysed 10-page floor
+	// (2260 rows, as PG's estimate_rel_size also does) and hash wins.
+	if tbl, ok := ctx.Catalog.LookupTable(parser.ObjectName{Name: "nlij_outer"}); ok {
+		tbl.Stats = &catalog.TableStats{RowCount: 100, Columns: []catalog.ColumnStats{
+			{NDistinct: 100}, {NDistinct: 100},
+		}}
+	}
+	if tbl, ok := ctx.Catalog.LookupTable(parser.ObjectName{Name: "nlij_inner"}); ok {
+		tbl.Stats = &catalog.TableStats{RowCount: 100050, Columns: []catalog.ColumnStats{
+			{NDistinct: 100050}, {NDistinct: 100050},
+		}}
+	}
 	return ctx, cleanup
 }
 
 // topNLIJointype reports the jointype of the fused NLI below the root, so a
 // fixture can assert WHICH shape it exercises. A plain `*Join` here means the
 // planner did not fuse and the test would be measuring the wrong family.
+//
+// It also requires the fused node to be partial-capable by the shared
+// predicate. A fused NLI over a non-partial probe (a bitmap probe, say) is
+// never put under a Gather by the planner, and wrapping one by hand, as this
+// test does, runs the whole plan in every participant. That would read as
+// a false N-copy failure instead of "wrong family" (M0145-0030).
 func topNLIJointype(n optimizer.Node) (optimizer.JoinType, bool) {
 	switch x := n.(type) {
 	case *optimizer.NestedLoopIndexJoin:
+		if !optimizer.NestedLoopIndexJoinIsPartialCapable(x) {
+			return x.Type, false
+		}
 		return x.Type, true
 	case *optimizer.Project:
 		return topNLIJointype(x.Child)

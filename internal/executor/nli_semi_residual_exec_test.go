@@ -75,6 +75,31 @@ func newNLIResidualFixture(t *testing.T) (*Context, func()) {
 	return ctx, cleanup
 }
 
+// newNLIResidualFixtureLargeInner is newNLIResidualFixture plus 100,000
+// inner rows whose keys (>= 101) match no outer row, with stats to match.
+// The index probe must earn its election the way it does in PG: on the
+// 4-row inner PG 18.3 elects Hash Semi/Anti Join (and, with hash and merge
+// off, a Materialize'd full scan), never the parameterised probe. With this
+// inner PG elects `Nested Loop Semi Join` over `Index Scan using
+// line_key_idx` (Index Cond + Filter). For NOT EXISTS PG elects Merge
+// Right Anti Join, which goopg does not have (no JOIN_RIGHT_ANTI — ledgered
+// under M0145-0030); goopg's `Nested Loop Anti Join` of the same shape is
+// PG's choice under enable_mergejoin = off. The extra rows change no answer.
+func newNLIResidualFixtureLargeInner(t *testing.T) (*Context, func()) {
+	t.Helper()
+	ctx, cleanup := newNLIResidualFixture(t)
+	if err := runDDL(t, ctx, "INSERT INTO line SELECT 100 + g, g % 7, g % 11 FROM generate_series(1, 100000) g"); err != nil {
+		cleanup()
+		t.Fatalf("large-inner fixture: %v", err)
+	}
+	if tbl, ok := ctx.Catalog.LookupTable(parser.ObjectName{Name: "line"}); ok {
+		tbl.Stats = &catalog.TableStats{RowCount: 100005, Columns: []catalog.ColumnStats{
+			{NDistinct: 100003}, {NDistinct: 8}, {NDistinct: 12},
+		}}
+	}
+	return ctx, cleanup
+}
+
 func nliResidualRows(t *testing.T, ctx *Context, sql string) []string {
 	t.Helper()
 	rows, err := runQueryWithErr(ctx, sql)
@@ -105,7 +130,7 @@ func nliResidualExplain(t *testing.T, ctx *Context, sql string) string {
 func TestNLISemiResidualExecution(t *testing.T) {
 	optimizer.SetIndexKeyHarvestEnabled(true)
 	t.Cleanup(func() { optimizer.SetIndexKeyHarvestEnabled(true) }) // restore the ON default
-	ctx, cleanup := newNLIResidualFixture(t)
+	ctx, cleanup := newNLIResidualFixtureLargeInner(t)
 	defer cleanup()
 
 	sql := "SELECT o_key FROM ord WHERE EXISTS (SELECT 1 FROM line WHERE l_key = o_key AND l_c < l_r) ORDER BY o_key"
@@ -133,7 +158,7 @@ func TestNLISemiResidualExecution(t *testing.T) {
 func TestNLIAntiResidualExecution(t *testing.T) {
 	optimizer.SetIndexKeyHarvestEnabled(true)
 	t.Cleanup(func() { optimizer.SetIndexKeyHarvestEnabled(true) }) // restore the ON default
-	ctx, cleanup := newNLIResidualFixture(t)
+	ctx, cleanup := newNLIResidualFixtureLargeInner(t)
 	defer cleanup()
 
 	sql := "SELECT o_key FROM ord WHERE NOT EXISTS (SELECT 1 FROM line WHERE l_key = o_key AND l_c < l_r) ORDER BY o_key"

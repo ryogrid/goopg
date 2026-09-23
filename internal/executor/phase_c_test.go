@@ -652,9 +652,13 @@ func TestRunFastJoinConcrete(t *testing.T) {
 	if err != nil {
 		t.Fatalf("BuildFast: %v", err)
 	}
-	// Walk past an optional Project wrapper.
+	// Walk past the Project wrappers. The join search emits a Project
+	// over the join plus the final projection above it (M0145-0030: the
+	// jointree pipeline always searches; the legacy pipeline emits the
+	// same stack whenever it searches, and its single wrapper only on the
+	// rule-built explicit-JOIN path).
 	nIdx := rootIdx
-	if tree.ops[nIdx].Kind == OpProject {
+	for tree.ops[nIdx].Kind == OpProject {
 		nIdx = tree.ops[nIdx].childA
 	}
 	if tree.ops[nIdx].Kind != OpJoin {

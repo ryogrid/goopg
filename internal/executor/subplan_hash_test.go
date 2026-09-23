@@ -114,7 +114,14 @@ func TestHashedInProbeActuallyFires(t *testing.T) {
 	defer optimizer.SetSubqueryUnnestEnabled(true)
 	SetHashedSubPlanEnabled(true)
 
-	runQuery(t, ctx, "SELECT a FROM ht1 WHERE b IN (SELECT b FROM ht2) ORDER BY a")
+	// The IN sits under an OR, where no pipeline can pull it up. That is
+	// the shape PG 18.3 itself runs as `(hashed SubPlan 1)`. A top-level IN
+	// is pulled up into a semi join by PG and by the jointree pipeline,
+	// which does not consult the legacy unnest switch above (M0145-0030).
+	got := runQuery(t, ctx, "SELECT a FROM ht1 WHERE b IN (SELECT b FROM ht2) OR a < 0 ORDER BY a")
+	if len(got) != 1 {
+		t.Fatalf("got %d rows, want 1 (a=1; PG 18.3's answer)", len(got))
+	}
 	// Two entries under the constant key stem: the []Datum slice and
 	// the derived subPlanHash.
 	if n := ctx.subqCacheScoped.Len(); n < 2 {
@@ -140,6 +147,12 @@ func TestHashedInAnyAllFormsUnaffected(t *testing.T) {
 // coercion applies (`10 = '10'` is TRUE). If the hash answered, the
 // family mismatch would wrongly report a miss — the probe must decline
 // instead.
+//
+// NOT PG behaviour (M0145-0030): PG 18.3 rejects this query at parse time
+// with 42883 "operator does not exist: integer = text". goopg accepts it on
+// both pipelines, and they disagree (legacy 1 row, jointree 0: its semi join
+// hashes int against text). The type-check gap is ledgered. This test
+// should become a 42883 assertion when that check lands.
 func TestHashedInMixedKindFallsBack(t *testing.T) {
 	ctx, cleanup := hashFixture(t)
 	defer cleanup()
@@ -158,8 +171,10 @@ func TestHashedInBudgetPressure(t *testing.T) {
 	ctx, cleanup := hashFixture(t)
 	defer cleanup()
 	ctx.WorkMem = 64 // budget = 16 bytes: nothing fits
+	// Under an OR so a SubPlan is built on either pipeline (see
+	// TestHashedInProbeActuallyFires).
 	got := runBothHashPaths(t, ctx,
-		"SELECT a FROM ht1 WHERE b IN (SELECT b FROM ht2) ORDER BY a")
+		"SELECT a FROM ht1 WHERE b IN (SELECT b FROM ht2) OR a < 0 ORDER BY a")
 	if len(got) != 1 {
 		t.Fatalf("budget-squeezed IN: got %d rows, want 1", len(got))
 	}
