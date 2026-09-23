@@ -1,7 +1,7 @@
 # M0141-S2b-4 — UNION (distinct) planning: decomposition against PG 18.3
 
-Status: S2b-4a (`ded1b8db3`) and S2b-4b (`f311b4b1a`) landed 2026-09-24;
-4c and 4d open. Task: `.ralph/fix_plan.md` M0141-S2b-4.
+Status: S2b-4a (`ded1b8db3`), S2b-4b (`f311b4b1a`) and S2b-4c
+(`5af350059`) landed 2026-09-24; 4d and 4e open. Task: `.ralph/fix_plan.md` M0141-S2b-4.
 
 ## Witnesses (TPC-DS SF0.25, current tree)
 
@@ -134,3 +134,47 @@ Not ported (ledgered): PG offers each distinct candidate over both the
 serial Append (`apath`) and the Gather (`gpath`) and elects among all four.
 goopg's chain elects serial vs Gather first and builds the distinct
 candidates over that one input.
+
+## S2b-4c landed (2026-09-24, `5af350059`)
+
+goopg had no Merge Append path, node or executor. The slice adds all three,
+narrowly, for the distinct UNION:
+
+- **Plan node.** `SetOp.MergeKeys` makes a UNION ALL link an ordered-merge
+  link. A left-deep chain of them is the Merge Append; it is only built
+  serially.
+- **Path.** `addUnionMergeAppendPath` (windowsetoppaths.go) sorts every
+  leaf on the union pathkeys, chains the Sorts, prices the chain as one
+  node by `cost_merge_append` and offers `Unique` over it. It is filed
+  after the hashed and Sort → Unique candidates, as in `generate_union_paths`.
+- **Executor.** The streaming `setOp` does a two-way merge on `MergeKeys`,
+  sharing Gather Merge's key comparison (`mergeKeysLess`).
+- **EXPLAIN.** `Merge Append` with a `Sort Key:` line deparsed through the
+  first branch (PG deparses through the merge's targetlist, which is the
+  first child's). Merge links and plain Append links never absorb each
+  other.
+
+The serial chain's Append seed is now priced by `cost_append` over the same
+leaves (`unionAppendCost`). The chain's SetOp links carry no PlanCost, and
+the legacy display derivation charged a full `cpu_tuple_cost` per row. With
+that tilt, upstream `union.sql`'s two-row VALUES unions elected the merge
+where PG keeps Sort → Unique. `add_path`'s 1% fuzz makes these ties
+decisive: a Merge Append within 1% of the cheapest total, with cheaper
+startup, dominates it.
+
+Result: upstream `union.sql`'s `enable_hashagg = off` cases gain PG's
+`Unique → Merge Append → Sort, Sort`; `select_distinct` is unchanged. On
+TPC-DS SF0.25 only Q49's cost moves (shape the same); the floor holds.
+
+### Not ported (filed as S2b-4e)
+
+PG's `build_setop_child_paths` offers each child's cheapest path sorted on
+the union pathkeys, and a path that is already sorted needs no Sort: an
+index scan, a Gather Merge over a partial path (TPC-DS Q75), or an
+Incremental Sort over a partially sorted path (the `item_pkey` probe
+below). goopg sorts every branch's finished plan explicitly, so its merge
+candidate costs more than PG's, and Q75 still elects the hashed candidate.
+
+PG 18.3, `tpcds025`, `enable_hashagg = off`, a two-branch UNION over `item`:
+`Unique → Merge Append → Incremental Sort (Presorted Key: i_item_sk) → Index
+Scan using item_pkey`, for each branch.

@@ -6713,9 +6713,33 @@ spill route is net-negative.
     Movement: none
     Kind: impl
     Parent: M0141-S2b-4
-  - [ ] **M0141-S2b-4c — Merge Append → Unique when every child is sorted
+  - [x] **M0141-S2b-4c — Merge Append → Unique when every child is sorted
     on the union pathkeys.** Check first whether goopg has a Merge Append
     path/executor. Witness Q75. Depends on S2b\-4b.
+    - **LANDED 2026\-09\-24 \(ralph2 loop \#35\), `5af350059`.** goopg had no
+      Merge Append; added the node \(`SetOp.MergeKeys` chain\), a two\-way
+      merge in the streaming setOp, the EXPLAIN spelling, and the path
+      \(`addUnionMergeAppendPath`, `cost\_merge\_append`\). The serial Append
+      seed is now `cost\_append` over the leaves \(the legacy derivation\'s
+      full per\-row charge made VALUES unions elect the merge where PG sorts\).
+      - Upstream union.sql enable\_hashagg=off cases gain PG\'s Merge Append;
+        select\_distinct unchanged. SF0.25: Q49 cost only; floor held.
+      - Gates: units, regress union/select\_distinct \(vs HEAD worktree\),
+        spotcheck, sf025, acceptance arm, fire\-set — PASS; ea\-ratchet only
+        the pre\-existing Q16/Q95 keys.
+      - Witness Q75 NOT closed: it needs presorted branch paths → S2b\-4e.
+    Movement: none
+    Kind: impl
+    Parent: M0141-S2b-4
+  - [ ] **M0141-S2b-4e — presorted branch paths for the Merge Append arm**
+    \(filed 2026\-09\-24 by S2b\-4c\). PG\'s `build\_setop\_child\_paths`
+    offers each UNION child\'s cheapest path sorted on the union pathkeys,
+    reusing an already\-sorted path \(index scan, Gather Merge over a partial
+    path, Incremental Sort over a partially sorted one\). goopg sorts every
+    branch\'s finished plan explicitly, so the merge candidate costs more
+    than PG\'s. Witness TPC\-DS Q75 \(PG: Unique → Merge Append over Gather
+    Merge children; goopg: hashed\). Design doc §"Not ported \(filed as
+    S2b\-4e\)".
     Kind: impl
     Parent: M0141-S2b-4
   - [ ] **M0141-S2b-4d — hashed Distinct label and the DISTINCT election**
