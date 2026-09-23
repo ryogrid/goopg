@@ -115,5 +115,28 @@ func gatherChildPlan(p *Path, what string) (Node, outputLayout, int) {
 			"createPlan: %s over a subtree with no driving scan; every worker would read the whole relation and the Gather would return %d+1 copies of every row",
 			what, workers))
 	}
+	// M0141-S2b-16: a prebuilt serial input (an upper-rel seed marked partial)
+	// reaches here with its driving scan still carrying serial rows; give it
+	// the per-worker figure. A scan lowered from a partial scan path is
+	// already PerWorker and is left alone.
+	if stamped != child {
+		perWorkerDisplayRows(stamped, gatherPathDivisor(p, sub))
+	}
 	return stamped, layout, workers
+}
+
+// gatherPathDivisor recovers the parallel divisor a Gather path was priced
+// with. createPlan has no costParams, but computeGatherRows set the Gather's
+// rows to clampRowEst(sub.Rows * divisor), so the leader-participation
+// setting that reproduces p.Rows exactly is the one in force. With no exact
+// match (or no rows to compare), it falls back to PG's default, leader
+// participating.
+func gatherPathDivisor(p, sub *Path) float64 {
+	with := getParallelDivisor(sub.ParallelWorkers, true)
+	without := getParallelDivisor(sub.ParallelWorkers, false)
+	if sub.Rows > 0 && p.Rows > 0 &&
+		clampRowEst(sub.Rows*without) == p.Rows && clampRowEst(sub.Rows*with) != p.Rows {
+		return without
+	}
+	return with
 }

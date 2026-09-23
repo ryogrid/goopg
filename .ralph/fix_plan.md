@@ -7150,7 +7150,7 @@ spill route is net-negative.
       Movement: none added this loop — the impl's movement was already
       recorded (CATEGORIES-EXCL-MATCH agg 44→43, sort 69→67, qual
       23→22 at equal match floor).
-  - [ ] **M0141-S2b-16** — impl (small): partial-path `rows=` display
+  - [x] **M0141-S2b-16** — impl (small): partial-path `rows=` display
     convention. S2b-15 fixed the path-model Gather stamp
     (`rel->rows`), but the S2b-14-observed divergence — goopg EXPLAIN
     shows TOTAL rows on partial nodes (`Parallel Seq Scan
@@ -7169,6 +7169,20 @@ spill route is net-negative.
     ea-ratchet (rows= keys will churn again).
     Kind: impl
     Parent: M0141-S2b-15
+    - **LANDED 2026\-09\-23 \(ralph2 loop \#29\).** Design doc
+      `docs/design/0100-0149/m0141-s2b-16-partial-scan-per-worker-rows.md`.
+      - Four late\-stamping routes found: the post\-pass, `gatherChildPlan`
+        over prebuilt inputs, the split\-agg lowering, and partial\-Append
+        members. All now divide a serial scan\'s rows by the divisor;
+        `PlanCost.PerWorker` prevents double division.
+      - SF0.25: Q5/Q6/Q22/Q58/Q59/Q83/Q84 partial scans now at PG\'s
+        per\-worker figures \(`store_sales` 719876 → 232218\).
+      - Gates: units, tpch\-spotcheck, tpcds\-sf025 \(PASS=96\), acceptance
+        arm \(identical\), fire\-set \(introduced=none\), ea\-ratchet PASS
+        \(53 → 52, Q71 fixed\).
+      - Ledgered: serial cost on these scans, intermediate nodes, Q5\'s
+        Append rows.
+    Movement: none
   - [ ] **M0141-S2b-17** — recon+impl (small): the two divergences
     S2b-15's repin triage isolated on the post-`9a2b9d47b`
     parallel shapes.

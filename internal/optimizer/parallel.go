@@ -215,7 +215,7 @@ func maybeAddGatherInner(root Node, s ParallelSettings, ancGathered bool) Node {
 		return graftTop(root, s, ancGathered)
 	}
 
-	return rebuildWithGather(root, tgt, workers)
+	return rebuildWithGather(root, tgt, workers, s.LeaderParticipates)
 }
 
 // subtreeHasGather reports whether the tree already carries a Gather or a
@@ -1466,7 +1466,7 @@ func tableParallelWorkersReloption(t *catalog.Table) int {
 // rebuildWithGather returns a copy of root's spine with target replaced by
 // Gather{target}. Nodes not on the path are shared by pointer; nothing is
 // mutated.
-func rebuildWithGather(root Node, tgt partialTarget, workers int) Node {
+func rebuildWithGather(root Node, tgt partialTarget, workers int, leader bool) Node {
 	if root == tgt.node {
 		switch {
 		case tgt.mergeKeys != nil:
@@ -1495,26 +1495,92 @@ func rebuildWithGather(root Node, tgt partialTarget, workers int) Node {
 			if stampedChild == srt.Child {
 				return NewGatherMerge(root.Pos(), root, workers, tgt.mergeKeys)
 			}
+			perWorkerDisplayRows(stampedChild, getParallelDivisor(workers, leader))
 			// Shallow copy: this pass runs on a plan the process-wide cache may
 			// be handing to other sessions right now (file header, property 2).
 			c := *srt
 			c.Child = stampedChild
 			return NewGatherMerge(c.Pos(), &c, workers, tgt.mergeKeys)
 		case tgt.splitAgg:
-			return splitAggregate(root.(*Aggregate), workers)
+			orig := root.(*Aggregate)
+			split := splitAggregate(orig, workers)
+			// splitAggregate's Partial is a fresh copy whose Child is the
+			// freshly stamped subtree; rescale that subtree's driving scan.
+			if fin, ok := split.(*Aggregate); ok {
+				if g, ok := fin.Child.(*Gather); ok {
+					if part, ok := g.Child.(*Aggregate); ok && part.Child != orig.Child {
+						perWorkerDisplayRows(part.Child, getParallelDivisor(workers, leader))
+					}
+				}
+			}
+			return split
 		}
 		stamped := stampParallelScan(root)
+		if stamped != root {
+			perWorkerDisplayRows(stamped, getParallelDivisor(workers, leader))
+		}
 		return NewGather(stamped.Pos(), stamped, workers)
 	}
 	kids := parallelChildren(root)
 	if len(kids) != 1 {
 		return root
 	}
-	rebuilt := rebuildWithGather(kids[0], tgt, workers)
+	rebuilt := rebuildWithGather(kids[0], tgt, workers, leader)
 	if rebuilt == kids[0] {
 		return root
 	}
 	return replaceSingleChild(root, rebuilt)
+}
+
+// perWorkerDisplayRows gives the driving scan of a subtree the post-pass
+// just stamped parallel PG's per-worker row estimate (M0141-S2b-16).
+//
+// The post-pass relabels a SERIAL scan `Parallel` after planning, so its
+// PlanCost still carries the serial row count, and EXPLAIN printed
+// `Parallel Seq Scan … rows=719876` where PG prints the per-worker
+// `rows=232218` — cost_seqscan's parallel arm sets `path->rows =
+// clamp_row_est(rows / get_parallel_divisor)` (costsize.c:335-353). The
+// path-model route (gatherChildPlan) needs none of this: its scan comes from
+// a partial path already priced per worker.
+//
+// Rows only. The cost stays the serial figure, because splitting it into
+// the disk term (charged in full to every worker) and the CPU term (divided)
+// needs the relation's page and tuple inputs, which a finished plan does
+// not carry (ledgered). Display only: the Gather above sizes itself from
+// EstimateRows, which reads table statistics rather than this PlanCost, and
+// display-cost parents read the child's cost, not its rows.
+//
+// stamped must be the COPY stampParallelScan returned (never a node shared
+// with the cached serial plan). The driving scan inside it is then a fresh
+// copy too, since stamping copies every node on the path down to it.
+//
+// A scan whose PlanCost is already PerWorker (lowered from a partial scan
+// path) is left alone; only a scan carrying serial figures, from the
+// post-pass or from a prebuilt serial subtree under a path-model Gather,
+// is divided. divisor is get_parallel_divisor for the Gather's workers.
+//
+// A SetOp driving node stands for its streamed branches (drivingScans); each
+// branch scan is treated on its own and the SetOp itself is never divided.
+func perWorkerDisplayRows(stamped Node, divisor float64) {
+	if !(divisor > 1) {
+		return
+	}
+	for _, scan := range drivingScans(stamped) {
+		if _, isSetOp := scan.(*SetOp); isSetOp {
+			continue
+		}
+		setter, ok := scan.(planCostSetter)
+		if !ok {
+			continue
+		}
+		pc := legacyDisplayCostOf(scan)
+		if pc.PerWorker {
+			continue
+		}
+		pc.PlanRows = clampRowEst(pc.PlanRows / divisor)
+		pc.PerWorker = true
+		setter.setPlanCost(pc)
+	}
 }
 
 // splitAggregate turns one Aggregate into Finalize -> Gather -> Partial.

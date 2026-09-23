@@ -228,6 +228,13 @@ func createFinalizeAggPlan(p *Path) (Node, outputLayout) {
 	if built.PartialSource == nil || drivingScan(built.PartialSource.Child) == nil {
 		panic("createPlan: PathFinalizeAgg over a subtree with no driving scan; every worker would read the whole relation")
 	}
+	// M0141-S2b-16: the partial input is a prebuilt serial subtree, so its
+	// driving scan still carries serial rows; give it the per-worker figure,
+	// with the divisor the Gather path was priced with (gatherChildPlan's
+	// rule).
+	if built.PartialSource.Child != child {
+		perWorkerDisplayRows(built.PartialSource.Child, gatherPathDivisor(gather, partial))
+	}
 	return built, layout
 }
 
