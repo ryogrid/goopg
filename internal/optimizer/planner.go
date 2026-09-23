@@ -2013,6 +2013,27 @@ func planSelectImpl(s *parser.SelectStmt, cat catalog.Catalog, plannerSet Planne
 					return nil, err
 				} else if ok {
 					node = idxNode
+				} else if flat, ok := flattenCorrelatedSeqScanFilters(node); ok {
+					// M0145-0027: the producer above only reads a WHERE that
+					// is ONE equality (Q17's body). A multi-conjunct WHERE
+					// (TPC-H Q20's `l_partkey = ps_partkey AND l_suppkey =
+					// ps_suppkey AND l_shipdate …`) is declined there on
+					// every route; the bypass arm gets its correlated probe
+					// from the SECOND producer instead —
+					// `rewriteScanInputsWithSingleTablePredicates` below,
+					// which absorbs the equality out of `Filter{SeqScan}`.
+					// On this route that producer is shut out: the search
+					// took the constant quals into a SEARCHED leaf
+					// `Filter{SeqScan}` (a searched subtree keeps its own
+					// leaves, P5.9-b) and left the correlated conjuncts —
+					// which `conjunctIsLocalEligible` refuses as leaf quals —
+					// in a residual Filter above it. Flattening the two into
+					// the one unsearched `Filter{SeqScan}` the bypass would
+					// have built hands the tree to that producer unchanged.
+					// Same contract as the rule above: it fires only on a
+					// bare seq-scan tree (the search elected no index) and
+					// only when a correlated conjunct is stranded above it.
+					node = flat
 				}
 			}
 		}
@@ -11371,6 +11392,56 @@ func planIsBareSeqScanTree(n Node) bool {
 		return planIsBareSeqScanTree(x.Child)
 	}
 	return false
+}
+
+// flattenCorrelatedSeqScanFilters merges a chain of `*Filter` wrappers over a
+// single `*SeqScan` into ONE unsearched `Filter{SeqScan}`, but only when some
+// conjunct in the chain carries an `OuterColumnRef` (a correlated restriction).
+//
+// It exists for the one-relation route that skips the rule-based bypass
+// (M0145-0027): there the search attaches the scope's constant quals to a
+// SEARCHED leaf Filter and holds the correlated ones above it, because
+// `conjunctIsLocalEligible` refuses outer references as leaf quals. The
+// resulting `Filter{corr}(Filter_searched{local}(SeqScan))` is invisible to
+// `rewriteScanInputsWithSingleTablePredicates`, the producer that turns a
+// correlated equality into an index probe on the bypass arm.
+//
+// Coordinates: every Filter in the chain sits directly on the same SeqScan
+// with no Project between, so all their predicates already address the
+// SeqScan's own output — merging needs no rebase. Any other node in the chain
+// (a Project, a narrowed boundary, a second relation) declines, fail-closed,
+// as does a chain with no correlated conjunct: then the search's own
+// (seq-scan) election stands and nothing is overridden.
+//
+// Conjunct order is outer Filter first, then inward — the residual correlated
+// quals came first in the WHERE the search split.
+func flattenCorrelatedSeqScanFilters(n Node) (Node, bool) {
+	top, ok := n.(*Filter)
+	if !ok {
+		return nil, false
+	}
+	var conjs []Expr
+	cur := Node(top)
+	for {
+		f, isF := cur.(*Filter)
+		if !isF {
+			break
+		}
+		conjs = append(conjs, splitAnd(f.Predicate)...)
+		cur = f.Child
+	}
+	ss, ok := cur.(*SeqScan)
+	if !ok {
+		return nil, false
+	}
+	if _, single := top.Child.(*SeqScan); single {
+		// Already the bypass shape; nothing is stranded.
+		return nil, false
+	}
+	if !exprHasOuterRefList(conjs) {
+		return nil, false
+	}
+	return &Filter{pos: top.Pos(), Child: ss, Predicate: joinPlannerAnd(conjs)}, true
 }
 
 // planIndexScanFromWhere is the rule-based WHERE -> index producer; it wraps
