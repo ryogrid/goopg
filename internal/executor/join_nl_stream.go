@@ -142,6 +142,8 @@ func (o *joinOp) openNestedLoop(ctx *Context, captureCTID bool) error {
 		// own findScanLeaf walker at Open time.
 		if sl, err := findScanLeaf(o.left); err == nil {
 			m.scanLeaf = sl
+			// The capture reads sl.currentTID after each outer row.
+			disableFilterReadAhead(o.left)
 		}
 	}
 	o.nlStream = m

@@ -562,6 +562,12 @@ type filterOp struct {
 	batchRejected int
 	batchErr      error
 	batchNil      bool
+	// noReadAhead pins the per-row path: set by disableFilterReadAhead when a
+	// consumer above reads the scan leaf's CURRENT position (currentTID) in
+	// lockstep with the rows this operator emits. The batch path pulls up to
+	// filterBatchSize child rows before emitting the first, which moves that
+	// position past the row being emitted.
+	noReadAhead bool
 }
 
 func newFilterOp(plan *optimizer.Filter, child Operator) *filterOp {
@@ -570,7 +576,7 @@ func newFilterOp(plan *optimizer.Filter, child Operator) *filterOp {
 
 func (o *filterOp) Open(ctx *Context) error {
 	o.ctx = ctx
-	o.batchEnabled = batchFilterEligible(o.pred)
+	o.batchEnabled = !o.noReadAhead && batchFilterEligible(o.pred)
 	o.batchRows = o.batchRows[:0]
 	o.batchLeft = o.batchLeft[:0]
 	o.batchRight = o.batchRight[:0]

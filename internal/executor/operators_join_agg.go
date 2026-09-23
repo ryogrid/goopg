@@ -699,6 +699,8 @@ func (o *joinOp) buildLazyHashTable(ctx *Context) (bool, error) {
 			if ferr != nil {
 				return false, ferr
 			}
+			// The build drain reads sl.currentTID after each inner row.
+			disableFilterReadAhead(o.right)
 			if sl != nil {
 			// The CTID exception: lazyHashCTID is a map[string] keyed in
 			// lockstep with lazyHash, so this build stays on the string map

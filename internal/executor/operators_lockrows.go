@@ -477,6 +477,68 @@ func findScanLeaf(op Operator) (currentTIDProvider, error) {
 	}
 }
 
+// disableFilterReadAhead pins every filterOp between a currentTID consumer and
+// its scan leaves to the per-row path.
+//
+// A currentTIDProvider reports the position of the row its scan leaf produced
+// MOST RECENTLY. Every consumer (LockRows, the streaming NL join's ctid capture,
+// the hash join's preserved build-side ctids, setOp's delegation) reads it right
+// after pulling a row, and relies on nothing having been pulled since. The
+// filterOp batch path (M0122-0012) breaks that: it pulls up to filterBatchSize
+// rows before emitting the first, so the leaf's position belongs to a later row
+// — for a partitioned table possibly in another partition. The witness is
+// isolation spec insert-conflict-do-update-4: `SELECT … FOR UPDATE` over a
+// partitioned table locked the wrong (relation, ctid) pair and failed with
+// "short read at block".
+//
+// The descent mirrors findScanLeaf/findScanLeafForRel (single-child spine,
+// both setOp branches, both join sides, the NLI outer) so every
+// filterOp either walker can pass through is covered. It clears batchEnabled
+// directly as well as setting the sticky flag, because consumers call it after
+// the child's Open (which already chose the path) but before its first Next.
+func disableFilterReadAhead(op Operator) {
+	for op != nil {
+		switch v := op.(type) {
+		case *filterOp:
+			v.noReadAhead = true
+			v.batchEnabled = false
+			op = v.child
+		case *projectOp:
+			op = v.child
+		case *sortOp:
+			op = v.child
+		case *limitOp:
+			op = v.child
+		case *distinctOp:
+			op = v.child
+		case *distinctOnOp:
+			op = v.child
+		case *ordinalityOp:
+			op = v.child
+		case *windowOp:
+			op = v.child
+		case *projectSetOp:
+			op = v.child
+		case *materializeOp:
+			op = v.child
+		case *instrumentedOp:
+			op = v.inner
+		case *setOp:
+			disableFilterReadAhead(v.left)
+			op = v.right
+		case *joinOp:
+			disableFilterReadAhead(v.left)
+			op = v.right
+		case *nestedLoopIndexJoinOp:
+			// The inner is an index probe (nliInner), not an operator tree —
+			// no filterOp can sit there.
+			op = v.outer
+		default:
+			return
+		}
+	}
+}
+
 // findScanLeafForRel finds the currentTIDProvider for a specific relation
 // (identified by its storage.RelFileNode), preferring the leftmost occurrence.
 // Called after o.child.Open so seqScanOp.rel and indexScanOp.ctx are set.
@@ -807,6 +869,9 @@ func (o *lockRowsOp) Open(ctx *Context) error {
 	if err := o.child.Open(ctx); err != nil {
 		return err
 	}
+	// This operator reads the scan leaf's currentTID after every row it
+	// pulls; no filter below may read ahead of it.
+	disableFilterReadAhead(o.child)
 	// Prefer the scan for the first physical locked relation so that
 	// the TID tracked by drainAndStamp comes from the right table.
 	// This matters when the locked table is not the leftmost scan leaf
