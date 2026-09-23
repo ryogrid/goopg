@@ -121,3 +121,47 @@ func TestPlanIsBareSeqScanTreeIsFailClosed(t *testing.T) {
 		t.Fatal("nil must be refused")
 	}
 }
+
+// TestOneRelIndexProducerKeepsMultiConjunctCorrelatedProbe is the Q20 pin
+// (M0145-0027), in miniature: the correlated scalar body's WHERE is the
+// correlation AND a constant restriction. `planIndexScanFromWhere` declines a
+// multi-conjunct WHERE on every route; the bypass gets its probe from
+// `rewriteScanInputsWithSingleTablePredicates`, which the jointree/one-rel
+// routes could not reach because the search split the constant qual into a
+// searched leaf Filter and stranded the correlation above it.
+func TestOneRelIndexProducerKeepsMultiConjunctCorrelatedProbe(t *testing.T) {
+	cat := oneRelIndexCatalog(t)
+	const sql = `select q from ori_outer where q < (select avg(v) from ori_inner where k = ori_outer.k and v > 3)`
+
+	for _, tc := range []struct {
+		name     string
+		jointree bool
+		oneRel   bool
+	}{
+		{"bypass-route", false, false},
+		{"jointree-route", true, false},
+		{"onerel-search-route", false, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			defer func(j bool) { jointreePipeline = j }(jointreePipeline)
+			jointreePipeline = tc.jointree
+			defer func(o bool) { oneRelSearch = o }(oneRelSearch)
+			oneRelSearch = tc.oneRel
+
+			node, err := Plan(parseOne(t, sql), cat)
+			if err != nil {
+				t.Fatalf("Plan: %v", err)
+			}
+			found := false
+			walkPlanExprs(node, func(e Expr) {
+				if _, ok := e.(*SubqueryExpr); ok {
+					found = true
+				}
+			})
+			if !found {
+				t.Fatalf("correlated scalar was decorrelated on route %s — the multi-conjunct body never reached its index probe; tree: %s",
+					tc.name, describePlanTree(node))
+			}
+		})
+	}
+}
