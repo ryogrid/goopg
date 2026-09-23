@@ -1,8 +1,7 @@
 # M0145-0026 — duplicate hashclause in the path key list (recon)
 
-Status: complete 2026-09-23. Task: `.ralph/fix_plan.md` M0145-0026 (Kind:
-recon, Parent: M0145-0007). No production code; the fix is filed as
-M0145-0026a.
+Status: complete 2026-09-23; the fix landed as M0145-0026a (§Fix landed).
+Task: `.ralph/fix_plan.md` M0145-0026 (Kind: recon, Parent: M0145-0007).
 
 ## Question
 
@@ -83,3 +82,30 @@ downstream reader of that field. It serves both pipelines, which matches
 M0145-0007's both-arms report. Gates: the full
 default-arm set plus the fire-set gate, with the Q78 hash-anti costs before
 and after as the movement witness.
+
+## Fix landed (M0145-0026a, 2026-09-23)
+
+`semiAntiPredHasKeyEq` (joinsearchseam.go) reports whether an AND-conjunct
+of the link predicate is already `LeftKey = RightKey` in either orientation,
+using the fail-closed `exprEqual`. Both folds (`extractSearchLeaves`,
+`extractScopeLeaves`) now add the key equality only when it is absent.
+Unnest-built semi/anti joins, whose `Predicate` excludes the key, fold
+exactly as before. Pinned by
+`TestExtractSearchLeaves_OuterReductionAntiKeyFoldedOnce` (fails without the
+fix: 2 equalities) and `TestSemiAntiPredHasKeyEq`.
+
+Movement, TPC-DS SF0.25, values unchanged, plan shapes unchanged apart from
+costs (the plan diff counts Q78 as changed only because costs moved):
+
+| Q78 hash anti join | default arm (startup..total) | knob arm (startup..total) |
+|---|---|---|
+| web | 1256.80..10452.70 → 1212.00..9958.01 | 824.80..14338.82 → 780.00..12269.52 |
+| catalog | 2581.82..20950.74 → 2491.65..19959.59 | 1712.82..28489.16 → 1622.65..24344.53 |
+| store | 4885.09..35815.99 → 4705.90..33837.11 | 3167.09..37045.76 → 2987.90..33267.19 |
+
+On the default arm each delta is exactly one clause's
+`cpu_operator_cost × (build rows + probe rows)`. For the web join that is
+0.0025 × 17 920 = 44.80 at startup and 0.0025 × 197 876 = 494.69 in total.
+The knob arm's startup deltas match, and its total deltas are larger. The
+knob arm's hash costing charges the clause count through more than the
+initial term; that was not decomposed further.

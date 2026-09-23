@@ -1885,12 +1885,18 @@ func extractSearchLeaves(node Node) (scans []Node, widths []int, onQuals []chain
 				// (createplanjoin.go:492-504) — otherwise a plan built from
 				// `pred` alone would silently become an unconditional
 				// (Cartesian-like) Semi/Anti.
-				eq := &BinaryOp{pos: j.LeftKey.Pos(), Op: parser.OpEq, Left: j.LeftKey, Right: j.RightKey}
-				conjuncts := []Expr{eq}
-				if pred != nil {
-					conjuncts = append(conjuncts, pred)
+				// M0145-0026a: only when `pred` lacks it. A LEFT->ANTI
+				// reduction built by planFromItem keeps the equality in
+				// Predicate as well, and folding it again handed the search
+				// two restrictinfos for one clause (see semiAntiPredHasKeyEq).
+				if !semiAntiPredHasKeyEq(pred, j.LeftKey, j.RightKey) {
+					eq := &BinaryOp{pos: j.LeftKey.Pos(), Op: parser.OpEq, Left: j.LeftKey, Right: j.RightKey}
+					conjuncts := []Expr{eq}
+					if pred != nil {
+						conjuncts = append(conjuncts, pred)
+					}
+					pred = combineAnd(conjuncts)
 				}
-				pred = combineAnd(conjuncts)
 			}
 			if pred != nil {
 				shifted, okShift := rebaseSemiAntiChainQual(pred, outerWidth, base, rightBase)
@@ -2249,12 +2255,15 @@ func extractScopeLeaves(tab *jtScopeTable, sjis []*SpecialJoinInfo) (scans []Nod
 			outerWidth := len(lk.jn.Left.Output())
 			pred := lk.jn.Predicate
 			if lk.jn.LeftKey != nil && lk.jn.RightKey != nil {
-				eq := &BinaryOp{pos: lk.jn.LeftKey.Pos(), Op: parser.OpEq, Left: lk.jn.LeftKey, Right: lk.jn.RightKey}
-				conjuncts := []Expr{eq}
-				if pred != nil {
-					conjuncts = append(conjuncts, pred)
+				// M0145-0026a: same guard as extractSearchLeaves' fold.
+				if !semiAntiPredHasKeyEq(pred, lk.jn.LeftKey, lk.jn.RightKey) {
+					eq := &BinaryOp{pos: lk.jn.LeftKey.Pos(), Op: parser.OpEq, Left: lk.jn.LeftKey, Right: lk.jn.RightKey}
+					conjuncts := []Expr{eq}
+					if pred != nil {
+						conjuncts = append(conjuncts, pred)
+					}
+					pred = combineAnd(conjuncts)
 				}
-				pred = combineAnd(conjuncts)
 			}
 			if pred != nil {
 				shifted, okShift := rebaseSemiAntiChainQual(pred, outerWidth, base, rightBase)
@@ -3080,4 +3089,36 @@ func applyLeafPerm(perm []int, scans *[]Node, widths *[]int, semiAnti []semiAnti
 	for i := range onQuals {
 		onQuals[i].belowNullable = permuteRelSet(onQuals[i].belowNullable, perm)
 	}
+}
+
+// semiAntiPredHasKeyEq reports whether some AND-conjunct of pred is the
+// equality `lk = rk`, in either orientation. The semi/anti link folds call it
+// before adding the join's key equality to its predicate (M0145-0026a).
+//
+// The folds were written for the unnest rewrite, which keeps its primary
+// equijoin out of Predicate. The LEFT->ANTI outer-join reduction that
+// planFromItem builds keeps the ON equality in Predicate AND copies it into
+// LeftKey/RightKey. Folding unconditionally therefore gave the search two
+// restrictinfos for one clause (TPC-DS Q78: `wr_order_number =
+// ws_order_number` and its commuted twin), and hashJoinCost charged one
+// hash clause too many. PG holds one RestrictInfo per clause
+// (hash_inner_and_outer, joinpath.c).
+//
+// exprEqual is fail-closed: an operand it cannot decide reads unequal, so an
+// undecidable case folds as before rather than dropping a needed key.
+func semiAntiPredHasKeyEq(pred, lk, rk Expr) bool {
+	if pred == nil || lk == nil || rk == nil {
+		return false
+	}
+	for _, c := range splitAnd(pred) {
+		b, ok := c.(*BinaryOp)
+		if !ok || b.Op != parser.OpEq {
+			continue
+		}
+		if (exprEqual(b.Left, lk) && exprEqual(b.Right, rk)) ||
+			(exprEqual(b.Left, rk) && exprEqual(b.Right, lk)) {
+			return true
+		}
+	}
+	return false
 }

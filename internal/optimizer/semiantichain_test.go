@@ -735,3 +735,70 @@ func TestPgShapedOffsetChecksOK_SyntheticLastInWalkOrder(t *testing.T) {
 		t.Errorf("declineReason = %q, want %q", reason, "spine-offset-disagreement")
 	}
 }
+
+// TestExtractSearchLeaves_OuterReductionAntiKeyFoldedOnce pins M0145-0026a.
+// A LEFT->ANTI outer-join reduction built by planFromItem keeps its ON
+// equality in Predicate AND copies it into LeftKey/RightKey. The link fold
+// must not add `LeftKey = RightKey` a second time: the search would get two
+// restrictinfos for one clause, and hashJoinCost would charge an extra hash
+// clause (TPC-DS Q78's three return-side anti joins). PG holds one
+// RestrictInfo per clause.
+func TestExtractSearchLeaves_OuterReductionAntiKeyFoldedOnce(t *testing.T) {
+	pinLegacyPipeline(t)
+	cat := analyzedThreeTablesCatalog(t)
+	sql := "SELECT x FROM t1 LEFT JOIN t2 ON t2.z = t1.x WHERE t2.z IS NULL"
+	node, err := Plan(parseOne(t, sql), cat)
+	if err != nil {
+		t.Fatal(err)
+	}
+	j := findFirstJoinByType(node, JoinTypeAnti)
+	if j == nil {
+		t.Fatalf("no JoinTypeAnti found: %s", planString(node))
+	}
+	if !j.FromOuterReduction || j.LeftKey == nil || j.RightKey == nil {
+		t.Fatalf("fixture drifted: want a keyed FromOuterReduction anti join, got FromOuterReduction=%v keys={%v,%v}", j.FromOuterReduction, j.LeftKey, j.RightKey)
+	}
+	if !semiAntiPredHasKeyEq(j.Predicate, j.LeftKey, j.RightKey) {
+		t.Fatalf("fixture drifted: Predicate %#v no longer carries the key equality, so this is not the M0145-0026a shape", j.Predicate)
+	}
+
+	_, _, _, _, semiAnti, ok := extractSearchLeaves(j)
+	if !ok || len(semiAnti) != 1 {
+		t.Fatalf("extractSearchLeaves(j) = (%d links, ok=%v), want 1 link", len(semiAnti), ok)
+	}
+	eqs := 0
+	for _, c := range splitAnd(semiAnti[0].pred) {
+		if b, isBin := c.(*BinaryOp); isBin && b.Op == parser.OpEq {
+			eqs++
+		}
+	}
+	if eqs != 1 {
+		t.Errorf("semiAnti[0].pred holds %d equalities, want 1 (the key equality folded once): %+v", eqs, splitAnd(semiAnti[0].pred))
+	}
+}
+
+// TestSemiAntiPredHasKeyEq covers the helper's orientation and fail-closed
+// cases.
+func TestSemiAntiPredHasKeyEq(t *testing.T) {
+	a := &ColumnRef{Index: 0, Name: "a", SourceTableIdx: 1}
+	b := &ColumnRef{Index: 3, Name: "b", SourceTableIdx: 2}
+	c := &ColumnRef{Index: 4, Name: "c", SourceTableIdx: 2}
+	eq := func(l, r Expr) Expr { return &BinaryOp{Op: parser.OpEq, Left: l, Right: r} }
+	cases := []struct {
+		name string
+		pred Expr
+		want bool
+	}{
+		{"nil predicate", nil, false},
+		{"same orientation", eq(a, b), true},
+		{"commuted", eq(b, a), true},
+		{"inside a conjunction", combineAnd([]Expr{eq(a, c), eq(b, a)}), true},
+		{"different column", eq(a, c), false},
+		{"not an equality", &BinaryOp{Op: parser.OpLt, Left: a, Right: b}, false},
+	}
+	for _, tc := range cases {
+		if got := semiAntiPredHasKeyEq(tc.pred, a, b); got != tc.want {
+			t.Errorf("%s: semiAntiPredHasKeyEq = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
