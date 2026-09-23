@@ -1,6 +1,6 @@
 # M0141-S7 — the corpus measurement (0/14, 0/99) and the cost-breakdown diagnosis for the 14 witnesses
 
-Status: accepted (measurement landed `004f02bf1`, 2026-09-17; cost diagnosis landed `7c27145b1`, 2026-09-18). Recon/measurement, with two doc-comment corrections in `internal/optimizer` only. The inline 2026-09-17i sub-update records **M0141-S2b-7**'s own landing (`96f53705e`, 2026-09-17, production change in `upperorderedgrouping.go`) because it is the fix this measurement filed and re-measured; S2b-7's task-level writeup is in `m0141-s2b-scoping-decomposition.md`.
+Status: accepted; parent M0141-S7 ESCALATED [!] 2026-09-23 (S4 lineage budget — owner decision pending) (measurement landed `004f02bf1`, 2026-09-17; cost diagnosis landed `7c27145b1`, 2026-09-18). Recon/measurement, with two doc-comment corrections in `internal/optimizer` only. The inline 2026-09-17i sub-update records **M0141-S2b-7**'s own landing (`96f53705e`, 2026-09-17, production change in `upperorderedgrouping.go`) because it is the fix this measurement filed and re-measured; S2b-7's task-level writeup is in `m0141-s2b-scoping-decomposition.md`.
 
 Parent: M0141-S7 — see [m0141-s7-readjudicate-and-scope-incremental-sort.md](m0141-s7-readjudicate-and-scope-incremental-sort.md)
 
@@ -399,3 +399,22 @@ component named above already has a filed, tracked task).
 Gates run: none beyond the trace captures themselves — no production file
 touched. `make ralph-state-guard` passed at commit time. Pre-commit hook's
 pgbench smoke: PASS.
+
+## Update 2026-09-22 — fresh default-pipeline confirmation and S4 escalation
+
+The required private SF0.25 default-pipeline capture was repeated with
+`GOOPG_INCREMENTAL_SORT=on` and `GOOPG_JOINTREE_PIPELINE=0`. It completed
+successfully with `queries=99`, `match=2`, `shapediff=69`, `missingnode=25`,
+`error=3`, and `timeout=0`; the plan text contains zero `Incremental Sort`
+nodes. The emitted plan and diff SHA-256 values were respectively
+`aeaace4eeb6eb7648b2bc469e9f588dd6891c7e3263e108176e6b3518ee4cf67` and
+`2c02f599184a8bc32eb9d82b8a89761ea75705665181b06e777bb7bc5f6399e2`.
+
+This is not a sixth diagnostic subtask. M0141-S7 already has six completed
+direct descendants with `Movement: none`: `exec-a`, `exec-b`, `exec-c`,
+`cd-q64`, `cd-q64-reclassify`, and `cd-candidatepool`. Under S4, no further
+recon child may be selected or filed. The pending implementation tasks
+M0141-S2b-8 and M0141-S2b-9 remain the documented resume points, but banner
+item 6 forbids their production or executor work while S7 is selected. The
+root is consequently marked `[!]` pending owner re-open; no new PostgreSQL
+semantic gap was discovered, so no ledger row is needed.

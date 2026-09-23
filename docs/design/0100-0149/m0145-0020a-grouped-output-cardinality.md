@@ -1,6 +1,6 @@
 # M0145-0020a — Q39 grouped-output cardinality
 
-Status: **IN PROGRESS 2026-09-22.**
+Status: **LANDED 2026-09-22** (`4c6f7ab8d`). Movement: yes — Q39's `CTE Scan on inv` 1 -> 19 and its aggregate 20 -> 3901 at SF0.25. Follow-up: M0145-0020c owns the 2 NEW ea-ratchet findings.
 Kind: impl
 Parent: M0145-0020
 

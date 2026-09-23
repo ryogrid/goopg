@@ -1,7 +1,8 @@
 # `Parallel Hash`: a shared table built from a PARTIAL inner (M0140-0007)
 
-Status: scoping recon, 2026-09-21. No production change. Implementation NOT
-started — the task's central premise needed checking first, and it is
+Status: blocked — owner decision required (2026-09-22). No production change.
+Implementation must not start until the owner chooses a faithful partial-inner
+barrier protocol or closes the task: its central premise was checked and is
 understated in a way that changes the slicing.
 
 Task: `.ralph/fix_plan.md` M0140-0007. Kind: impl. Parent: none. Carries ledger
@@ -238,3 +239,18 @@ The measured state does not justify the task as filed. Either:
    divergences this task could never have fixed anyway (Finding 2 above).
 
 The loop does not choose. It declines to ship a label-only change.
+
+## 2026-09-22 escalation — no selectable faithful implementation
+
+The source path remains decisive: `prebuildSharedHashJoins` reaches
+`parallelBuildLazyHashTable` for Q14 and Q16, so goopg already cooperatively
+scans the complete `part` inner into one shared table. This is not PG's
+`parallel_hash = true` model: PG has a partial inner whose participants insert
+into the shared target before a build-completion barrier releases probes.
+
+Changing only the planner label would falsely assert that model. The faithful
+alternative needs an explicitly owner-approved re-scope covering partial-inner
+execution, shared publication, barrier/error behaviour, and a
+parallel-versus-serial identity test. The root is therefore `[!]`; its expected
+measured movement is limited to Q14/Q16 leaving the TPC-H `parallelism`
+category, not a promised plan match.

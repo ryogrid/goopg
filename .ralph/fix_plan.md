@@ -5517,7 +5517,7 @@ setting that yields a serial plan.
     not flatten (LIMIT in subquery) still get the arm — marker sees
     nesting, not flattenability. Design doc:
     `docs/design/0100-0149/m0140-0006c-3-mixed-partial-setop-append.md`.
-- [ ] **M0140-0007 — `Parallel Hash` (`parallel_hash = true`): workers
+- [!] **M0140-0007 — `Parallel Hash` (`parallel_hash = true`): workers
   cooperatively build ONE shared table from a PARTIAL inner** (filed
   2026-09-21 by owner directive; carries ledger
   `m0140-0005-q14-parallel-hash-execution-model`, K92, and plan-flow doc
@@ -5632,6 +5632,24 @@ setting that yields a serial plan.
       half-Q10 are join-order divergences this task could never fix.
     - If re-scoped, the partial-inner port is the real work and must be
       pinned by a parallel-vs-serial IDENTITY test per shape.
+  - > ## ESCALATION 2026-09-23 (ralph2 loop \#6) — marked `[!]`, OWNER DECISION NEEDED
+    >
+    > The OWNER DECISION REQUIRED above \(2026\-09\-21, loop \#38\) was never
+    > reflected in the task state, so every later loop re\-read this entry
+    > as selectable. Nothing implementable remains without the owner:
+    > goopg ALREADY builds one shared table cooperatively
+    > \(`prebuildSharedHashJoins` → `parallelBuildLazyHashTable`, Q14/Q16\),
+    > and the only change a loop could land alone — filing
+    > `parallel_hash = true` over a COMPLETE inner — would print PG's label
+    > over an execution model goopg does not use. Options: \(a\) re\-scope
+    > as a fidelity item porting a genuinely partial inner \(build inside
+    > the Gather, shared publication, build\-completion barrier, error
+    > propagation\), pinned per shape by a parallel\-vs\-serial identity
+    > test — expected movement: Q14/Q16 leave TPC\-H `parallelism`, not a
+    > promised match; \(b\) close, recording the existing capability and
+    > that Q9/Q21/half\-Q10 are join\-order divergences. The executor
+    > capability inventory \(`m0145-0008-executor-capability-inventory.md`,
+    > member 1\) confirms the shape is never generated today.
   - **CLOSED 2026-09-22 (loop \#78): the completion census is run and the
     task's four ledger steps are all discharged.**
     Movement: none — `CATEGORIES-EXCL-MATCH` unchanged on the default arm;
@@ -7037,8 +7055,37 @@ spill route is net-negative.
   `Aggregate`/`GroupAggregate (N keys)` EXPLAIN mislabel (doc
   `parallel-query/06` §4.1 — both currently render as a hash aggregate
   regardless of `Strategy`); re-measure the full corpus. Needs S5.
-- [ ] **M0141-S7 — re-adjudicate and implement Incremental Sort** — **verified
+- [!] **M0141-S7 — re-adjudicate and implement Incremental Sort** — **verified
   Kind: recon
+
+  > ## ESCALATION 2026-09-23 (ralph2 loop \#6) — S4 lineage budget exhausted, OWNER DECISION NEEDED
+  >
+  > - **Budget:** six completed descendants with `Movement: none` \(a
+  >   missing field counts as none\): `exec-a`, `exec-b`, `exec-c`,
+  >   `cd-q64`, `cd-q64-reclassify`, `cd-candidatepool`. No further child
+  >   may be selected or filed.
+  > - **What was tried / proved:** the node, executor operator, EXPLAIN
+  >   rendering and the `addOrderedPaths` third arm are built \(flag
+  >   `GOOPG_INCREMENTAL_SORT`, default off\); banner item 6's diagnosis
+  >   ran on all 14 witnesses \(2026\-09\-18\): 7 reach the arm and lose on
+  >   cost, dominated in 6 of 7 by the input\-candidate pool, not the sort
+  >   formula; the rest are gated by other filed tasks. A fresh
+  >   default\-pipeline SF0.25 capture with the flag on \(2026\-09\-22\):
+  >   `match=2`, zero `Incremental Sort` nodes \(design doc
+  >   `m0141-s7-corpus-measurement-and-cost-diagnosis.md`\).
+  > - **Blocker:** the resume points are implementation tasks —
+  >   **M0141\-S2b\-9** \(offer an Incremental Sort over the seed itself;
+  >   Q4 `keys=1 ncommon=1`\) and **M0141\-S2b\-8** \(the SORTED grouping
+  >   arm; Q64's CTE\) — which banner item 6 \("cost diagnosis only, no
+  >   production\-code change"\) forbids.
+  > - **Expected movement if unblocked:** `sort-strategy` on the witnesses
+  >   S2b\-9/S2b\-8 reach \(Q4, Q64 first\); honest size — the 2026\-09\-18
+  >   decomposition says the input\-candidate divergence, not the arm,
+  >   decides 6 of 7, so the first measurable movement may be small.
+  > - **Owner options:** \(a\) open S2b\-9/S2b\-8 as implementation under
+  >   a re\-scoped item 6; \(b\) hold Incremental Sort until the
+  >   candidate\-pool divergence \(join\-order / parallel shapes\) moves.
+
   2026-09-15: PG emits `Incremental Sort` in 14 of the 99 TPC-DS reference plans
   (`bench/tpcds/plans-pg/`), and goopg has no implementation at all** — the only
   occurrences in `internal/` are **7 hits across 7 files, every one a comment or

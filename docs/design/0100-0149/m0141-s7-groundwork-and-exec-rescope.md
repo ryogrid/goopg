@@ -1,6 +1,6 @@
 # M0141-S7 — Incremental Sort groundwork primitives (Finding 3 rows 1-3) and the executor-step re-scope
 
-Status: accepted (landed `fd5537907`, `65351372a`, `9c4884d36`, `ff5234006`, 2026-09-17). Production change: `pathkeysCountContainedIn` and `costIncrementalSort` (zero callers at landing) plus `addIncrementalSortPaths`, `addOrderedPaths`'s third arm, gated off by default behind `GOOPG_INCREMENTAL_SORT`. The 2026-09-17c row landed as M0141-S2b-2c (`9c4884d36`); its own writeup lives in `m0141-s2b-scoping-decomposition.md` §"S2b-2c landed" and is recorded here from M0141-S7's implementation-order view.
+Status: accepted; parent M0141-S7 ESCALATED [!] 2026-09-23 (S4 lineage budget — owner decision pending) (landed `fd5537907`, `65351372a`, `9c4884d36`, `ff5234006`, 2026-09-17). Production change: `pathkeysCountContainedIn` and `costIncrementalSort` (zero callers at landing) plus `addIncrementalSortPaths`, `addOrderedPaths`'s third arm, gated off by default behind `GOOPG_INCREMENTAL_SORT`. The 2026-09-17c row landed as M0141-S2b-2c (`9c4884d36`); its own writeup lives in `m0141-s2b-scoping-decomposition.md` §"S2b-2c landed" and is recorded here from M0141-S7's implementation-order view.
 
 Parent: M0141-S7 — see [m0141-s7-readjudicate-and-scope-incremental-sort.md](m0141-s7-readjudicate-and-scope-incremental-sort.md)
 

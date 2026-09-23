@@ -1,15 +1,16 @@
 # M0141-S7 — re-adjudicate Incremental Sort under the plan-parity goal, and scope it
 
-Status: accepted — scoping recon (landed `c69c57e77`, 2026-09-16, no
-production change *in this doc's own task*). No longer "no production
-change" overall: the implementation this doc scoped landed through its
-sub-tasks — M0141-S7's own groundwork (`fd5537907`, `65351372a`,
-`ff5234006`), M0141-S2b-2c (`9c4884d36`), M0141-S7-exec-a/b/c
-(`99a0a39a6`, `9697099c6`, `c3f10a329`), the corpus measurement
-(`004f02bf1`, `7c27145b1`) and the three `-cd-*` trace tasks
-(`073ab2748`, `18390e924`, `c7e231ae1`). See the index below; the
-M0141-S7 fix_plan line itself is still unchecked (the feature is built
-but wins nothing on the corpus, and the flag stays default-off)
+Status: blocked — owner re-open required by the S4 lineage budget
+(2026-09-22). The scoping recon landed `c69c57e77` on 2026-09-16 with no
+production change in its own task. Its implementation landed through
+M0141-S7's groundwork (`fd5537907`, `65351372a`, `ff5234006`),
+M0141-S2b-2c (`9c4884d36`), M0141-S7-exec-a/b/c (`99a0a39a6`,
+`9697099c6`, `c3f10a329`), the corpus measurement (`004f02bf1`,
+`7c27145b1`), and the three `-cd-*` trace tasks (`073ab2748`,
+`18390e924`, `c7e231ae1`). The fresh default-pipeline SF0.25 capture with
+`GOOPG_INCREMENTAL_SORT=on` still produces zero Incremental-Sort nodes and
+the same `match=2` floor. Six direct Movement-none descendants now exhaust
+S4; the root is marked `[!]`, and further diagnosis must not be selected.
 
 ## Task
 
