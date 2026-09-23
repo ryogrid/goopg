@@ -2325,12 +2325,38 @@ heuristic stays live.)
       procedure\) fails `unsupported statement type *parser.NotifyStmt` —
       they are handled only by the postmaster; PG allows them anywhere
       \(ledgered 2026\-09\-23\).
+    - **REFUTED 2026\-09\-24 \(ralph2 loop \#41\).** The self\-notification
+      carries this backend\'s own PID, equal to `pg\_backend\_pid\(\)` \(both
+      read 1\). goopg numbers backends with a per\-server counter
+      \(`s.nextPID`\) rather than OS PIDs, uniformly across BackendKeyData,
+      pg\_stat\_activity, cancel and NOTIFY — an architectural divergence,
+      ledgered, not a NOTIFY defect.
   - `DISCARD ALL` is a syntax error \(PG: `DISCARD ALL`\).
+    - **FIXED 2026\-09\-24 \(ralph2 loop \#41\), `02e57b0c8`.** Grammar
+      accepts it; every form gets its own tag \(DISCARD ALL / PLANS /
+      SEQUENCES / TEMP — the bare "DISCARD" tag was a second divergence\);
+      DiscardAll semantics: 25001 in a block, else session authorization,
+      role, RESET ALL, advisory locks, temp tables, sequences \(executor\)
+      and prepared statements, cursors, LISTEN \(postmaster, both paths\).
+      A 27\-statement probe matches PG 18.3 apart from the work\_mem default
+      \(filed below\). Regress guc 452 → 420 diff lines.
   - `CREATE PUBLICATION` lacks PG's WARNING `"wal_level" is insufficient
     to publish logical changes` when wal\_level is not `logical` \(check
     goopg's effective wal\_level first — the warning may be correctly
     absent\).
   - Take one per loop; each is small and independently testable.
+
+- [ ] **work\_mem boots at 512MB; PostgreSQL\'s default is 4MB** \(found
+  2026\-09\-24 by the DISCARD ALL probe: `RESET ALL` returns each server to
+  its own default\). `internal/utils/misc/defaults.go` registers work\_mem with
+  `BootVal: "512MB"`, undocumented, against the rule that GUC boot values are
+  PG 18\'s \(`guc\_tables.c`: 4096 kB\).
+  Kind: impl
+  Parent: none
+  - Owner call: the value feeds hash\-table sizing and spill costing
+    everywhere \(plans and timing move; the bench clusters may rely on it\),
+    so the fix is PG\'s 4MB boot value with any bench\-side override set in
+    postgresql.conf, not in the boot value.
 
 - [x] **WRONG RESULTS: an index\-only prefix probe on a composite index
   skips entries whose trailing key column is NULL** \(found 2026\-09\-23 by
