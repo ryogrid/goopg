@@ -2441,6 +2441,31 @@ heuristic stays live.)
     expects them. Then relax the guard for tuple\-format indexes. Indexes
     built earlier need REINDEX.
   - Design doc §"The real fix".
+  - **Design slice 2026\-09\-24 \(ralph2 loop \#43\):**
+    `docs/design/0100-0149/m-nightly-store-null-keyed-index-entries.md`.
+    - Audit: probe values skip NULL on every path \(row\-derived probes must
+      keep that\); open\-ended ranges \(`a > 5`, no recheck on the legacy
+      single\-conjunct shape\) and NULLS FIRST low ends would leak stored
+      NULLs; writers, the arbiter entry and amcheck assume none; VACUUM and
+      HOT need no change; the optimizer cannot see the index format.
+    - Old indexes: a cluster capability flag written at initdb
+      \(`global/pg\_goopg\_features`\), not a per\-index marker \(none is
+      durable without a visible reloption\).
+  - [ ] **store\-null\-keys S1 — readers stop at NULL** on open\-ended bounds
+    \(index, index\-only, bitmap range probes; NULLS FIRST low end\). Design
+    §Slices 1.
+    Kind: impl
+    Parent: none
+  - [ ] **store\-null\-keys S2 — writers store NULL\-keyed entries behind the
+    cluster flag** \(marker file, build/runtime/arbiter writers, amcheck\).
+    Design §Slices 2. May land with S1.
+    Kind: impl
+    Parent: none
+  - [ ] **store\-null\-keys S3 — relax the planner guard** for tuple\-format
+    indexes in flagged clusters \(move the format predicate where the
+    optimizer can import it\). Design §Slices 3. After S1 and S2.
+    Kind: impl
+    Parent: none
 - [x] **setop output type is the FIRST member's, not `select_common_type`'s
   (found 2026-09-21 by an M0145-0004 discovery probe)** — **FIXED
   2026-09-22** for PostgreSQL's numeric type category, which covers both
