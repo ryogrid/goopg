@@ -79,7 +79,10 @@ package optimizer
 // list is populated on real paths (`indexPathClauses`, pathparamindex.go:338).
 // `pathindexclauses_test.go` is still where its invariants are falsifiable.
 
-import "github.com/goopg/goopg/internal/catalog"
+import (
+	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/parser"
+)
 
 // indexPathClause is one entry of PG's `indexclauses` list (`IndexClause`,
 // pathnodes.h:1865): the restriction that became an index qual, the index column
@@ -120,6 +123,12 @@ type indexPathClause struct {
 	// create_indexscan_plan leaves such quals out of qpqual
 	// (is_redundant_with_indexclauses, createplan.c:3068-3088).
 	local Expr
+	// op is the clause's operator in canonical `indexcol op key` form. The
+	// zero value is equality — every join-clause and equality-prefix clause.
+	// OpGt/OpGe mark a LOWER and OpLt/OpLe an UPPER range bound on the
+	// index's leading column (M0145-0029 slice 2, pathindexrestrict.go);
+	// createIndexScanPlan lowers those onto IndexScan.LowKey/HighKey.
+	op parser.OpCode
 }
 
 // indexPathClauses is `build_index_paths`' `index_clauses` accumulation

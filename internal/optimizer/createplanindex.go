@@ -408,6 +408,14 @@ func createIndexScanPlan(p *Path) Node {
 		return ios
 	}
 
+	// M0145-0029 slice 2: a range path's clauses are bounds on the leading
+	// column (`op` != equality), lowered onto LowKey/HighKey with the
+	// ORIGINAL strictness in LowOp/HighOp — the fields tryRangeIndexScan
+	// fills, which the executor and EXPLAIN already read.
+	if hasRangeClause(p.IndexClauses) {
+		return createRangeIndexScanPlan(p, id, rewrap)
+	}
+
 	ncols := len(p.IndexInfo.Columns)
 	switch {
 	case len(p.IndexClauses) == 0:
@@ -483,6 +491,65 @@ func createIndexScanPlan(p *Path) Node {
 	// with the index quals, createplan.c:3068-3088).
 	drop := map[Expr]bool{}
 	for _, c := range p.IndexClauses {
+		if c.local != nil {
+			drop[c.local] = true
+		}
+	}
+	if len(drop) > 0 {
+		return rewrapLeafDropping(p.Rel.baseLeaf, is, drop)
+	}
+	return rewrap(is)
+}
+
+// hasRangeClause reports whether any clause is a range bound.
+func hasRangeClause(clauses []indexPathClause) bool {
+	for _, c := range clauses {
+		if c.op != parser.OpUnknown {
+			return true
+		}
+	}
+	return false
+}
+
+// createRangeIndexScanPlan lowers a leading-column range path
+// (restrictionLeadingRange): at most one lower and one upper bound, every
+// clause on index column 0, none of them equality — anything else is a
+// producer bug, like the equality arm's panics.
+func createRangeIndexScanPlan(p *Path, id *scanIdentity, rewrap scanLeafRewrap) Node {
+	if p.IndexOnly || p.RequiredOuter != 0 {
+		panic(fmt.Sprintf("createPlan: range PathIndexScan on %s must be a plain unparameterised scan", p.IndexInfo.Name))
+	}
+	is := &IndexScan{
+		pos:                   id.pos,
+		Table:                 id.table,
+		Alias:                 id.alias,
+		RTID:                  id.rtid,
+		Index:                 p.IndexInfo,
+		schema:                id.schema,
+		SmallDim:              id.smallDim,
+		UniqueKeys:            id.uniqueKeys,
+		PrivilegeCheckRole:    id.privilegeCheckRole,
+		PrivilegeCheckRoleSet: id.privilegeCheckRoleSet,
+	}
+	drop := map[Expr]bool{}
+	for i, c := range p.IndexClauses {
+		if c.indexCol != 0 || c.key == nil {
+			panic(fmt.Sprintf("createPlan: range clause %d of %s is not a bound on the leading column", i, p.IndexInfo.Name))
+		}
+		switch c.op {
+		case parser.OpGt, parser.OpGe:
+			if is.LowKey != nil {
+				panic(fmt.Sprintf("createPlan: range PathIndexScan on %s carries two lower bounds", p.IndexInfo.Name))
+			}
+			is.LowKey, is.LowOp = c.key, c.op
+		case parser.OpLt, parser.OpLe:
+			if is.HighKey != nil {
+				panic(fmt.Sprintf("createPlan: range PathIndexScan on %s carries two upper bounds", p.IndexInfo.Name))
+			}
+			is.HighKey, is.HighOp = c.key, c.op
+		default:
+			panic(fmt.Sprintf("createPlan: range PathIndexScan on %s mixes an equality clause into its bounds", p.IndexInfo.Name))
+		}
 		if c.local != nil {
 			drop[c.local] = true
 		}

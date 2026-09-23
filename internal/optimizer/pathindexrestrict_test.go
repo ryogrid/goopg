@@ -155,3 +155,81 @@ func TestIndexOnlyScanPlanCarriesIndexQuals(t *testing.T) {
 		t.Fatalf("one-column prefix: want Key set and Keys nil, got %#v", createIndexScanPlan(p))
 	}
 }
+
+// Slice 2: on the jointree pipeline a single-relation range band over an
+// indexed column is planned by the search's restriction producer as a range
+// IndexScan — LowKey/HighKey with the ORIGINAL strictness (a mirrored
+// `const op col` is flipped to canonical form) — and, on a single-column
+// index, with both bounds dropped from the reinstated Filter (PG's qpqual
+// excludes quals redundant with the index quals).
+func TestRestrictionRangeIndexScanOnJointreePipeline(t *testing.T) {
+	prev := jointreePipeline
+	jointreePipeline = true
+	t.Cleanup(func() { jointreePipeline = prev })
+
+	c := saopFixture(t)
+	item, ok := c.LookupTable(parser.ObjectName{Name: "item"})
+	if !ok {
+		t.Fatal("item missing")
+	}
+	// A measured 100k-row table: the default range-band selectivity then
+	// makes the index probe cheaper than the seq scan, as PG would find.
+	item.Stats = &catalog.TableStats{RowCount: 100000, Pages: 10000, Analyzed: true}
+	cases := []struct {
+		sql           string
+		lowOp, highOp parser.OpCode
+		lowVal, hiVal int64
+	}{
+		{"SELECT i_item_id FROM item WHERE i_item_sk > 2 AND i_item_sk < 5", parser.OpGt, parser.OpLt, 2, 5},
+		{"SELECT i_item_id FROM item WHERE 5 >= i_item_sk AND 2 <= i_item_sk", parser.OpGe, parser.OpLe, 2, 5},
+		{"SELECT i_item_id FROM item WHERE i_item_sk BETWEEN 2 AND 5", parser.OpGe, parser.OpLe, 2, 5},
+	}
+	for _, tc := range cases {
+		node, err := Plan(parseOne(t, tc.sql), c)
+		if err != nil {
+			t.Fatalf("%s: Plan: %v", tc.sql, err)
+		}
+		scan := findIndexScan(node)
+		if scan == nil {
+			t.Fatalf("%s: want a range IndexScan, got root %T", tc.sql, node)
+		}
+		lo, lok := scan.LowKey.(*IntegerConst)
+		hi, hok := scan.HighKey.(*IntegerConst)
+		if (scan.Index.Name != "item_pkey" && scan.Index.Name != "idx_item_sk_flag") || !lok || !hok || lo.Value != tc.lowVal || hi.Value != tc.hiVal ||
+			scan.LowOp != tc.lowOp || scan.HighOp != tc.highOp || scan.Key != nil || len(scan.Keys) != 0 {
+			t.Fatalf("%s: got IndexScan %s lo=%v/%v hi=%v/%v", tc.sql, scan.Index.Name, scan.LowKey, scan.LowOp, scan.HighKey, scan.HighOp)
+		}
+		// Single-column index: both bounds dropped from the Filter. Composite
+		// (the two tie on cost here): the bounds stay as a recheck, since an
+		// exclusive padded bound can admit trailing-column entries.
+		f := findFilterOver(node, scan)
+		if len(scan.Index.Columns) == 1 && f != nil {
+			t.Fatalf("%s: both bounds are index quals on a single-column index; want no Filter over the scan, got %v", tc.sql, f.Predicate)
+		}
+		if len(scan.Index.Columns) > 1 && f == nil {
+			t.Fatalf("%s: a composite-index range must keep its bounds as a Filter recheck", tc.sql)
+		}
+	}
+}
+
+// findFilterOver returns the *Filter whose child is scan, or nil.
+func findFilterOver(n Node, scan Node) *Filter {
+	for n != nil {
+		switch v := n.(type) {
+		case *Filter:
+			if v.Child == scan {
+				return v
+			}
+			n = v.Child
+		case *Project:
+			n = v.Child
+		case *Sort:
+			n = v.Child
+		case *Limit:
+			n = v.Child
+		default:
+			return nil
+		}
+	}
+	return nil
+}

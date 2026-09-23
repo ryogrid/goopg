@@ -19,8 +19,11 @@ package optimizer
 // Slice 1 covers the EQUALITY prefix: `col = const` conjuncts bound to a
 // gapless leading prefix of the index's columns (PG's btree `amoptionalkey`
 // rule, the same prefix `pickIndexCoveringLeadingPrefix` binds for the
-// parameterised arm). Range bounds and ScalarArrayOp (`IN (…)`) quals are the
-// next slices — ledgered.
+// parameterised arm). Slice 2 adds RANGE bounds (`<`, `<=`, `>`, `>=`) on the
+// index's LEADING column when no equality binds it — the one range shape the
+// executor's probe expresses (LowKey/HighKey carry no equality prefix).
+// An equality prefix followed by a range column, and ScalarArrayOp (`IN (…)`)
+// quals, are not built yet — ledgered.
 
 import (
 	"github.com/goopg/goopg/internal/catalog"
@@ -111,6 +114,98 @@ func restrictionEqualityPrefix(cat catalog.Catalog, tbl *catalog.Table, idx *cat
 	return clauses
 }
 
+// restrictionLeadingRange binds the index's LEADING column to the first local
+// lower bound (`col > c` / `col >= c`, either operand order) and the first
+// upper bound (`col < c` / `col <= c`) on it, returning up to two clauses with
+// `op` in canonical `col op key` form. Only the leading column: the probe's
+// LowKey/HighKey carry no equality prefix, so a range on a later column is
+// not an index qual here (PG's `build_index_paths` would bind it behind an
+// equality prefix — ledgered).
+//
+// The consumed conjunct is recorded in `local` — so the lowering drops it
+// from the reinstated Filter — only for a SINGLE-column index. On a composite
+// index an exclusive lower bound's padded key can admit trailing-column
+// entries that share the bound value (the guard `tryRangeIndexScan` keeps),
+// so there the conjunct stays in the Filter as a recheck; the clause is still
+// an index qual for costing.
+func restrictionLeadingRange(cat catalog.Catalog, tbl *catalog.Table, idx *catalog.Index, conjuncts []Expr) []indexPathClause {
+	if len(idx.Columns) == 0 {
+		return nil
+	}
+	lead := idx.Columns[0]
+	var lo, hi *indexPathClause
+	for _, conj := range conjuncts {
+		bin, ok := conj.(*BinaryOp)
+		if !ok {
+			continue
+		}
+		switch bin.Op {
+		case parser.OpLt, parser.OpLe, parser.OpGt, parser.OpGe:
+		default:
+			continue
+		}
+		cr, val, colOnRight, ok := normalizeColumnConstRange(bin.Left, bin.Right)
+		if !ok {
+			continue
+		}
+		if cr.Index < 0 || cr.Index >= len(tbl.Columns) || tbl.Columns[cr.Index].Name != lead {
+			continue
+		}
+		if !restrictionKeyUsable(cat, tbl.Columns[cr.Index], val) {
+			continue
+		}
+		op := bin.Op
+		if colOnRight {
+			op = swapInequalityOp(op)
+		}
+		c := &indexPathClause{indexCol: 0, key: val, op: op}
+		if len(idx.Columns) == 1 {
+			c.local = conj
+		}
+		switch op {
+		case parser.OpGt, parser.OpGe:
+			if lo == nil {
+				lo = c
+			}
+		default:
+			if hi == nil {
+				hi = c
+			}
+		}
+	}
+	var out []indexPathClause
+	if lo != nil {
+		out = append(out, *lo)
+	}
+	if hi != nil {
+		out = append(out, *hi)
+	}
+	return out
+}
+
+// rangeIndexSelectivity is the range clauses' selectivity: clauselist_
+// selectivity over the index quals, which pairs a lower and an upper bound on
+// the same column into one band (`hibound + lobound - 1`, clausesel.c) —
+// goopg's conjunctionSelectivity. The clauses' source conjuncts are found by
+// operator and key identity, since a composite index's clauses carry no
+// `local`.
+func rangeIndexSelectivity(leaf Node, conjuncts []Expr, clauses []indexPathClause) float64 {
+	var quals []Expr
+	for _, c := range clauses {
+		for _, conj := range conjuncts {
+			bin, ok := conj.(*BinaryOp)
+			if ok && (bin.Left == c.key || bin.Right == c.key) {
+				quals = append(quals, conj)
+				break
+			}
+		}
+	}
+	if len(quals) == 0 {
+		return 1
+	}
+	return clampSelectivity(conjunctionSelectivity(quals, leaf))
+}
+
 // restrictionKeyUsable admits the probe-key kinds the executor's btree key
 // encoder takes directly — the set the rule-based producer
 // (planIndexScanFromWhereShape) accepted. A boolean key and a string against a
@@ -172,6 +267,11 @@ func (s *searchCtx) addOneRestrictionIndexPath(cat catalog.Catalog, rel *RelOptI
 		return false
 	}
 	clauses := restrictionEqualityPrefix(cat, tbl, idx, conjuncts)
+	isRange := false
+	if len(clauses) == 0 {
+		clauses = restrictionLeadingRange(cat, tbl, idx, conjuncts)
+		isRange = true
+	}
 	if len(clauses) == 0 {
 		return false
 	}
@@ -183,7 +283,13 @@ func (s *searchCtx) addOneRestrictionIndexPath(cat catalog.Catalog, rel *RelOptI
 	if s.restrictionPathIsIndexOnly(cat, tbl, idx, conjuncts) {
 		return false
 	}
-	sel, unique := restrictionIndexSelectivity(tbl, idx, clauses, relTuples)
+	var sel float64
+	var unique bool
+	if isRange {
+		sel = rangeIndexSelectivity(rel.baseLeaf, conjuncts, clauses)
+	} else {
+		sel, unique = restrictionIndexSelectivity(tbl, idx, clauses, relTuples)
+	}
 
 	var keys []PathKey
 	dir := ForwardScanDirection
