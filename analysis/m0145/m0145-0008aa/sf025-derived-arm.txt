@@ -1,0 +1,6 @@
+=== SUMMARY: PASS=96 (60 ck-verified, 36 ck=n/a) MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0 SKIP=3 ===
+SLOWER     Q39 3s->6s (2.0x)
+FASTER     Q95 16s->2s (0.1x)
+TOTAL      156s -> 144s (-7.7%)  <== aggregate move; no single query need cross 2.0x for this to matter
+changed (3): Q14 Q23 Q95
+=== PLAN-SHAPE: queries=99 same=96 changed=3 added=0 removed=0 ===

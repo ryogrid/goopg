@@ -1,0 +1,24 @@
+FIRE-SET: baseline=0914c3a71f7ff2f28f79e201745b44846e034666 (d0815be51912) candidate=worktree (60cd2de09c14)
+PLAN-PARITY: queries=99 match=4 shapediff=67 unparsed=0 missingnode=25 error=3 timeout=0
+CATEGORIES-EXCL-MATCH: join-order=91 join-method=66 scan-type=59 parameterisation=55 aggregation-strategy=41 sort-strategy=62 parallelism=74 qual-placement=27 rendering=25
+PLAN-PARITY: queries=99 match=4 shapediff=67 unparsed=0 missingnode=25 error=3 timeout=0
+CATEGORIES-EXCL-MATCH: join-order=91 join-method=66 scan-type=59 parameterisation=55 aggregation-strategy=41 sort-strategy=62 parallelism=74 qual-placement=27 rendering=25
+# fireset m0145-0008aa-tpcds-sf025-baseline-execute Q14 PASS (result tmp/m0145-0008aa/fireset/tpcds-sf025/m0145-0008aa-tpcds-sf025-baseline-execute-q14.result.txt)
+# fireset m0145-0008aa-tpcds-sf025-baseline-execute Q23 PASS (result tmp/m0145-0008aa/fireset/tpcds-sf025/m0145-0008aa-tpcds-sf025-baseline-execute-q23.result.txt)
+# fireset m0145-0008aa-tpcds-sf025-baseline-execute Q95 PASS (result tmp/m0145-0008aa/fireset/tpcds-sf025/m0145-0008aa-tpcds-sf025-baseline-execute-q95.result.txt)
+# fireset m0145-0008aa-tpcds-sf025-candidate-execute Q14 PASS (result tmp/m0145-0008aa/fireset/tpcds-sf025/m0145-0008aa-tpcds-sf025-candidate-execute-q14.result.txt)
+# fireset m0145-0008aa-tpcds-sf025-candidate-execute Q23 PASS (result tmp/m0145-0008aa/fireset/tpcds-sf025/m0145-0008aa-tpcds-sf025-candidate-execute-q23.result.txt)
+# fireset m0145-0008aa-tpcds-sf025-candidate-execute Q95 PASS (result tmp/m0145-0008aa/fireset/tpcds-sf025/m0145-0008aa-tpcds-sf025-candidate-execute-q95.result.txt)
+FIRE-SET-TIMEOUTS: fires=Q14 Q23 Q95 introduced=none unchanged=none missing=none
+PLAN-PARITY: queries=99 match=6 shapediff=68 unparsed=0 missingnode=22 error=3 timeout=0
+CATEGORIES-EXCL-MATCH: join-order=85 join-method=65 scan-type=59 parameterisation=49 aggregation-strategy=44 sort-strategy=68 parallelism=76 qual-placement=25 rendering=22
+PLAN-PARITY: queries=99 match=6 shapediff=68 unparsed=0 missingnode=22 error=3 timeout=0
+CATEGORIES-EXCL-MATCH: join-order=85 join-method=64 scan-type=59 parameterisation=49 aggregation-strategy=44 sort-strategy=68 parallelism=76 qual-placement=25 rendering=22
+# fireset m0145-0008aa-tpcds-sf1-baseline-execute Q14 PASS (result tmp/m0145-0008aa/fireset/tpcds-sf1/m0145-0008aa-tpcds-sf1-baseline-execute-q14.result.txt)
+# fireset m0145-0008aa-tpcds-sf1-baseline-execute Q23 PASS (result tmp/m0145-0008aa/fireset/tpcds-sf1/m0145-0008aa-tpcds-sf1-baseline-execute-q23.result.txt)
+# fireset m0145-0008aa-tpcds-sf1-baseline-execute Q95 PASS (result tmp/m0145-0008aa/fireset/tpcds-sf1/m0145-0008aa-tpcds-sf1-baseline-execute-q95.result.txt)
+# fireset m0145-0008aa-tpcds-sf1-candidate-execute Q14 PASS (result tmp/m0145-0008aa/fireset/tpcds-sf1/m0145-0008aa-tpcds-sf1-candidate-execute-q14.result.txt)
+# fireset m0145-0008aa-tpcds-sf1-candidate-execute Q23 PASS (result tmp/m0145-0008aa/fireset/tpcds-sf1/m0145-0008aa-tpcds-sf1-candidate-execute-q23.result.txt)
+# fireset m0145-0008aa-tpcds-sf1-candidate-execute Q95 TIMEOUT (result tmp/m0145-0008aa/fireset/tpcds-sf1/m0145-0008aa-tpcds-sf1-candidate-execute-q95.result.txt)
+FIRE-SET-TIMEOUTS: fires=Q14 Q23 Q95 introduced=Q95 unchanged=none missing=none
+gate-stamp: tpcds-fireset FAIL -> /home/ryo/work/goopg/goopg/tmp/gate-stamps/tpcds-fireset.json

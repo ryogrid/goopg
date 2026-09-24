@@ -17282,7 +17282,7 @@ Movement: none — no plan moved on TPC-DS SF0.25/SF1 or TPC-H across all four d
     - `sublinkBodyIsSimple` is goopg\'s own gate, not PG\'s → M0145\-0008aa.
     Movement: none — recon.
 
-- [ ] **M0145\-0008aa — pull up an ANY sublink whose body is not simple
+- [x] **M0145\-0008aa — pull up an ANY sublink whose body is not simple
   as one derived semi\-side leaf, as PG does** \(filed 2026\-09\-25 by
   M0145\-0008z\). A grouped/HAVING body \(TPC\-H Q18\) or a body over a CTE
   scan \(TPC\-DS Q14 ×5, Q23 ×8\) is declined \(`any\-body\-not\-simple`,
@@ -17299,6 +17299,71 @@ Movement: none — no plan moved on TPC-DS SF0.25/SF1 or TPC-H across all four d
   - Expected movement: first divergences on TPC\-H Q18 \(`parallelism`\) and
     TPC\-DS Q14 \(`join\-order`\) / Q23 \(`scan\-type`\), measured on the
     canonical captures.
+  - **DONE 2026\-09\-25 \(`9e99ea944`\), derived\-body arm only.** Design doc
+    `docs/design/0100\-0149/m0145\-0008aa\-any\-derived\-body\-pullup.md`;
+    evidence `analysis/m0145/m0145\-0008aa/`.
+    - A non\-simple body is planned as a FROM subquery aliased
+      `ANY\_subquery` and enters the search as ONE leaf
+      \(`pullUpAnyDerivedBody`\); the seam admits it without a catalog table
+      \(`seamLeafBinding`\). Correlated bodies \(PG\'s LATERAL case\) still
+      decline.
+    - TPC\-H fire set: Q18 only. Its join order moved toward PG\'s
+      \(`aggregation\-strategy` 4 → 3\), but its estimate got worse
+      \(3.0M rows against PG\'s 470K\): goopg keeps a semi join where PG
+      unique\-ifies into an inner join → M0145\-0008ab.
+    - TPC\-DS fire set: no changed query at SF0.25 or SF1.
+    - Promoting the CTE\-leaf admission \(Q14/Q23\) failed the SF1 fire\-set
+      gate \(Q95 TIMEOUT introduced\) → held as M0145\-0008ac; the diff is
+      preserved as a patch.
+  Movement: none — TPC-H PLAN-PARITY match 3 -> 3; aggregation-strategy 4 -> 3 is inside the noise band
+- [ ] **M0145\-0008ab — unique\-ify a derived semi\-side leaf into an inner
+  join, as PG\'s create\_unique\_path does** \(filed 2026\-09\-25 by
+  M0145\-0008aa\). PG proves the grouped `ANY\_subquery` distinct
+  \(`query\_is\_distinct\_for`,
+  `postgres/src/backend/optimizer/plan/analyzejoins.c`\), so its unique path
+  costs nothing extra, and it joins TPC\-H Q18 as an inner Hash Join against
+  117,504 groups. goopg\'s `createUniquePath` is reachable only for the
+  legacy `PathPrebuilt` atomic RHS, and `pulledSemiJoinInfo` never fills
+  `SemiRhsExprs`, so the derived leaf stays a Hash Semi Join estimated at 750K
+  of 1.5M `orders` rows.
+  Kind: impl
+  Parent: M0145-0008aa
+  - First step: populate `SemiRhsExprs`/`SemiCanHash`/`SemiCanBtree` for a
+    pulled derived body and let `createUniquePath` accept its leaf path;
+    port the `query\_is\_distinct\_for` GROUP BY / DISTINCT arms as the
+    no\-cost fast path \(pathnode.c `create\_unique\_path`\).
+  - Expected movement: TPC\-H Q18 `join\-method`/`join\-order` against PG
+    \(inner Hash Join over the grouped body\) and its row estimate
+    \(3.0M → PG\'s 470K\), measured on the TPC\-H fire set / parallel
+    capture.
+- [!] **M0145\-0008ac — promote the pulled `\*CTEScan` leaf admission
+  \(`GOOPG\_PULLUP\_CTE\_LEAF`\)** \(filed 2026\-09\-25 by M0145\-0008aa\).
+  PG pulls a CTE reference in a simple sublink body up like any base rel;
+  goopg admits it only behind the default\-off knob. Promoting it moves
+  TPC\-DS Q14/Q23/Q95 with values identical, but Q95 goes 3 s → 16 s at
+  SF0.25 and **times out at SF1** \(fire\-set gate FAIL, introduced\).
+  Kind: impl
+  Parent: M0145-0008aa
+  - Patch: `analysis/m0145/m0145\-0008aa/combined\-derived\-arm\-plus\-cte\-leaf\-promotion.patch`
+    \(the CTE half is the `flaglabels.go`, `planner\-flags.env`,
+    `pullup\_cte\_leaf\_test.go` and `flattenPulledBodyTree` hunks\).
+  - **ESCALATION \(2026\-09\-25\):** blocked, not reverted \(R3\).
+    - What was tried: unconditional admission; values held at SF0.25; the
+      SF1 fire set timed out Q95.
+    - What it proved: goopg\'s new Q95 plan has PG\'s shape \(nested\-loop
+      semi joins with the `ws\_wh` CTE scan inside\), but PG\'s inner
+      `web\_returns` access is an Index Only Scan parameterised by the outer
+      `ws1.ws\_order\_number`, pushed through a hash join; goopg builds no
+      parameterised path through a join, so it rescans a 3M\-row hash join
+      per outer row.
+    - Blocker: parameterised inner paths through a join — the
+      M0146\-0012 / M0145\-0010 family.
+    - Expected movement if unblocked: TPC\-DS Q14/Q23/Q95 first divergences
+      \(`join\-order` / `scan\-type`\) at both scales.
+    - Size: the promotion itself is the patch above; the blocker is the
+      large part.
+    - Owner decision needed: sequence the parameterised\-path work ahead of
+      this, or accept Q95\'s SF1 timeout as a coverage loss under G5.
 
 
 - [x] **M0145-0009 — CTE-output statistics (B-06 resume): wire the landed
