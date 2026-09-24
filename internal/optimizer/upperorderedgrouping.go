@@ -257,6 +257,24 @@ func electOrderedGrouping(u *upperRels, agg *aggregateSurface, node Node, keys [
 	if len(cands) < 1 {
 		return decline(fmt.Sprintf("cands<1(%d)", len(cands)))
 	}
+	// M0145-0008h: every candidate's spec is the grouping-time snapshot of the
+	// aggregate. Resolving the ORDER BY keys (and the targets) can append a
+	// functionally-dependent passthrough column to `agg.node` AFTER that
+	// snapshot (`GROUP BY pk ORDER BY <dependent column>`, the upstream
+	// aggregates.out agg_sort_order case). A winner rebuilt from the snapshot
+	// lacks that column, so the Sort's key would name a column the aggregate
+	// no longer emits, and the copy-back below would erase it from `agg.node`
+	// too. That panicked in assertSortInputTargetCoversKeys and took the whole
+	// server down. Grafting the column onto the winner is not safe either: its
+	// child may be a narrowed or index-ordered input with remapped positions.
+	// So decline, and let the normal ordered arm sort over `agg.node` itself,
+	// which carries the passthrough.
+	for _, c := range cands {
+		if c.Agg == nil || len(c.Agg.Passthrough) != len(agg.node.Passthrough) ||
+			len(c.Agg.Output()) != len(agg.node.Output()) {
+			return decline("agg-surface-grew-after-snapshot")
+		}
+	}
 	translated := make([][]PathKey, len(cands))
 	anyTranslated := false
 	for i, c := range cands {
