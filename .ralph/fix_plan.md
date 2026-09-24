@@ -19794,6 +19794,19 @@ Movement: none — no plan moved on TPC-DS SF0.25/SF1 or TPC-H across all four d
     - Next: S3 — autovacuum index \+ second pass, `PageAddHeapTuple` reuse
       under `PD\_HAS\_FREE\_LINES` \(capability\-gated\), free\-space
       ceiling, SSI SIREAD audit, pgbench growth measurement.
+  - **S3a LANDED 2026\-09\-25:** closed a race S2 opened \(two interleaved
+    VACUUMs: A\'s stale dead TIDs could delete a reused offset\'s NEW index
+    entries, because goopg\'s VACUUM lock is acquire\-then\-release and
+    autovacuum takes none\) with a per\-relation VACUUM gate held first
+    pass → second pass \(manual blocks, SKIP\_LOCKED/autovacuum skip\).
+    Autovacuum now runs the index pass \(`executor.VacuumRelationIndexes`,
+    namespace confirmed by identity\) and the second pass.
+    - Gates: units, race \(vacuum \+ lifecycle tests\), spotcheck,
+      acceptance 24 MATCH, sf025 96/96, isolation and regress = HEAD\'s
+      failures.
+    - Next: S3b — reuse in `PageAddHeapTuple` \+ free\-space ceiling
+      \(capability\-gated\), after the SSI SIREAD audit; measure pgbench
+      growth.
 
 - [ ] **M0145\-0008u — a pin\-held \(zero\-copy\) seq\-scan slot**
   \(filed 2026\-09\-25 by M0145\-0008q\). With compaction under a cleanup

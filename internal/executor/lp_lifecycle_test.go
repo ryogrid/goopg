@@ -4,6 +4,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/commands/vacuum"
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/storage"
 )
@@ -103,5 +105,61 @@ func TestVacuumSecondHeapPassKeepsIndexesExact(t *testing.T) {
 				t.Fatalf("the point query uses no index; nothing is exercised:\n%s", plan)
 			}
 		})
+	}
+}
+
+// TestAutovacuumSequenceCleansIndexesAndFreesItems pins the autovacuum path
+// (M0145-0008v): the launcher's sequence — heap pass, VacuumRelationIndexes,
+// VacuumDeadItems — leaves no LP_DEAD item on a capable cluster and keeps the
+// index exact, exactly like manual VACUUM. VacuumRelationIndexes resolves the
+// table's own catalog namespace; a table it cannot confirm answers false.
+func TestAutovacuumSequenceCleansIndexesAndFreesItems(t *testing.T) {
+	storage.SetHeapLinePointerLifecycle(true)
+	defer storage.SetHeapLinePointerLifecycle(false)
+	ctx, cleanup := newVMFixture(t)
+	defer cleanup()
+	for _, s := range []string{
+		"CREATE TABLE avt (id int, v text)",
+		"INSERT INTO avt SELECT g, 'row-' || g FROM generate_series(1, 1500) g",
+		"CREATE INDEX avt_id ON avt (id)",
+		"ANALYZE avt",
+		"DELETE FROM avt WHERE id % 4 = 0",
+	} {
+		runSQL(t, ctx, s)
+	}
+	commitTx(t, ctx)
+	beginTx(t, ctx)
+
+	tbl, _ := ctx.Catalog.LookupTable(parser.ObjectName{Name: "avt"})
+	rel := ctx.Catalog.RelFileNode(tbl)
+	release, ok := vacuum.TryLockRelationForVacuum(rel)
+	if !ok {
+		t.Fatal("relation VACUUM gate unexpectedly held")
+	}
+	stats, err := vacuum.VacuumWithOptions(ctx.Pool, ctx.TxnMgr, rel, vacuum.VacuumOptions{})
+	if err != nil || len(stats.DeadTIDs) == 0 {
+		release()
+		t.Fatalf("heap pass: %d dead TIDs, %v", len(stats.DeadTIDs), err)
+	}
+	if !VacuumRelationIndexes(ctx.Pool, ctx.TxnMgr, ctx.Catalog, tbl, stats.DeadTIDs) {
+		release()
+		t.Fatal("VacuumRelationIndexes did not report the btree-only table clean")
+	}
+	if n, err := vacuum.VacuumDeadItems(ctx.Pool, rel, stats.DeadTIDs); err != nil || n != len(stats.DeadTIDs) {
+		release()
+		t.Fatalf("second pass freed %d of %d (%v)", n, len(stats.DeadTIDs), err)
+	}
+	release()
+	if dead, _ := countHeapLPDead(t, ctx, "avt"); dead != 0 {
+		t.Fatalf("%d LP_DEAD items left", dead)
+	}
+	if VacuumRelationIndexes(ctx.Pool, ctx.TxnMgr, ctx.Catalog, &catalog.Table{OID: tbl.OID, Name: "impostor"}, stats.DeadTIDs) {
+		t.Fatal("a table the catalog cannot confirm by identity must not be reported clean")
+	}
+	runSQL(t, ctx, "INSERT INTO avt SELECT g, 'new-' || g FROM generate_series(5000, 5400) g")
+	got := sortedRowStrings(t, ctx, "SELECT id, v FROM avt WHERE id BETWEEN 30 AND 60")
+	want := sortedRowStrings(t, ctx, "SELECT id, v FROM avt WHERE id + 0 BETWEEN 30 AND 60")
+	if strings.Join(got, "|") != strings.Join(want, "|") {
+		t.Fatalf("indexed %v != heap %v", got, want)
 	}
 }

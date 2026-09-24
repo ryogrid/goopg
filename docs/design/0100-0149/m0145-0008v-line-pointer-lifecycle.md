@@ -1,6 +1,6 @@
 # M0145-0008v: heap line-pointer lifecycle (LP_DEAD, LP_UNUSED, recycling)
 
-Status: **S1 and S2 LANDED 2026-09-25; S3 open.** Task: `.ralph/fix_plan.md`
+Status: **S1, S2 and S3a LANDED 2026-09-25; S3b (reuse) open.** Task: `.ralph/fix_plan.md`
 M0145-0008v (Kind: impl, Parent: M0145-0008t). Found by M0145-0008t
 (`m0145-0008t-prune-on-access.md`, "The premise that did not hold").
 
@@ -212,3 +212,52 @@ every freeze plan.
   exists.
 - Audit tuple-grain SSI SIREAD locks on reused TIDs.
 - Measure pgbench small-table growth.
+
+## S3a as landed (2026-09-25): one VACUUM per relation; autovacuum's index and second passes
+
+**A race S2 introduced, now closed.** PG holds ShareUpdateExclusiveLock for
+a whole VACUUM (`vacuum_rel`); autovacuum takes it with
+`ConditionalLockRelationOid` and skips a table it cannot lock. goopg's
+VACUUM only *waits* for that lock (`acquireRelLockMaybeTransient` acquires
+and releases it at once), and autovacuum takes none. Once S2 let truncation
+reuse offsets, two interleaved VACUUMs could delete a live row's index
+entry:
+1. VACUUM A collects dead TIDs.
+2. VACUUM B frees and truncates the same items.
+3. An insert reuses one of the offsets.
+4. A's index pass removes the new tuple's entries.
+
+**The fix is a per-relation VACUUM gate** (`vacuum.LockRelationForVacuum` /
+`TryLockRelationForVacuum`, `commands/vacuum/relation_gate.go`), held from
+the first heap pass through the second:
+- manual VACUUM blocks on it, with a deferred release so a panic cannot
+  leave it held;
+- VACUUM (SKIP_LOCKED) and autovacuum take it conditionally and skip a busy
+  relation, as in PG.
+
+**Autovacuum** now runs the passes it used to drop:
+- the index pass, through the new `executor.VacuumRelationIndexes`;
+- `vacuum.VacuumDeadItems` when every index is clean.
+
+`VacuumRelationIndexes` looks up the catalog namespace that actually holds
+the table: `LookupTableByOIDAllDBs`, confirmed by pointer identity. An
+empty index list reads as "clean", so a namespace mismatch would otherwise
+free items that live indexes still reference. If the table can't be
+confirmed, it answers false.
+
+**Tests.**
+- `TestRelationVacuumGate`: the conditional gate is refused while a
+  relation is held, granted for another relation, and granted again after
+  release.
+- `TestAutovacuumSequenceCleansIndexesAndFreesItems`: the launcher's exact
+  sequence leaves no LP_DEAD item and exact index results; an impostor
+  table is refused.
+- Both are clean under the race detector.
+
+**Gates.** units, spotcheck, acceptance (24 MATCH) and sf025 (96/96, 99/99
+shapes) pass; isolation and regress show only HEAD's failures.
+
+**Next: S3b.** `PageAddHeapTuple` reuses the first unused item under
+`PD_HAS_FREE_LINES`, gated on the capability, and `PageGetHeapFreeSpace`
+stops answering 0 at the ceiling while a free line exists. Both need the
+SSI SIREAD audit first, then a measurement of pgbench small-table growth.
