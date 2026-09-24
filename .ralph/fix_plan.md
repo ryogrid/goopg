@@ -15160,9 +15160,47 @@ EXISTS/IN body via `planSelectWithParent` before unnest/search ever run
 M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
 `-3i-lateral-route` all block on this milestone's 0003.
 
-- [x] **M0145-0001 — recon: the jointree-level IR and the lowering
+- [!] **M0145-0001 — recon: the jointree-level IR and the lowering
   contract** (design the representation the whole milestone builds on).
   **DONE 2026-09-21.**
+
+  > ## ESCALATION 2026-09-24 (ralph2 loop \#49) — lineage budget exhausted after the flip, OWNER DECISION NEEDED
+  >
+  > The lineage guard refused three new descendants filed by the flip: the
+  > last five completed ones — M0145-0004, M0145-0026, M0145-0026a,
+  > M0145-0029, M0145-0030 — all carry `Movement: none`. Root marked `[!]`;
+  > the loop selects elsewhere until the owner answers.
+  >
+  > - **Attempted:** the M0145-0008 flip LANDED
+  >   \(`docs/design/0100-0149/m0145-0008-cutover-flip.md`; code in
+  >   `ddb4eabd4`, swept by a concurrent pathspec\-less commit; NULL\-key
+  >   prerequisite `eb0e7d388`\).
+  > - **What it proved:** the jointree default is value\-identical \(sweep
+  >   96/96, acceptance identical, fire set clean\) and at the parity floors
+  >   \(TPC\-H 2/22 = baseline, SF0.25 2\), with every category within the
+  >   ±3 band — `Movement: none`, as the loop \#5 escalation predicted.
+  > - **The three would\-be descendants \(held here, each with a ledger row\):**
+  >   - **\(0008b, recon\)** TPC\-H Q18 1.6x / Q22 3.2x slower on the new
+  >     default \(one binary: Q18 12.31 s → 20.19 s, Q22 0.48 s → 1.52 s;
+  >     neither the estimator fixes nor the NULL\-key guard cause it\); both
+  >     SHAPE\-DIFF vs PG on both arms. Expected movement: none by itself.
+  >   - **\(0008c, recon\)** ea\-ratchet NEW
+  >     `Q95:cte:ws_wh+customer_address+date_dim+web_sales+web_site` \(Hash
+  >     Semi Join est 1 / actual 22, `pg_est` null\), introduced by the flip;
+  >     G4 permits no repin without PG\-shared evidence. Expected movement:
+  >     ea\-ratchet NEW 1 → 0.
+  >   - **\(0008d, impl\)** grouping ignores ORDER BY's DESC direction \(PG:
+  >     GroupAggregate over one `Sort … DESC`\). Expected movement:
+  >     aggregation/sort\-strategy on `GROUP BY k … ORDER BY k DESC` shapes.
+  > - **Remaining in M0145-0008:** the legacy\-deletion slices \(delete
+  >   `planSelectLegacyPipeline`, legacy\-only machinery with the group\-L
+  >   tests, the seam guards on 0001's retired list, the knob\), then the
+  >   fire\-set gate's HEAD\-vs\-staged redesign. Several loops. By
+  >   construction also `Movement: none` \(deletion changes no default plan\).
+  > - **Owner options:** \(a\) re\-pin `LINEAGE-BASELINE` \(the five above\)
+  >   and GO on the deletion slices plus 0008b/c/d; \(b\) GO on 0008b/c/d
+  >   only, deferring legacy deletion; \(c\) hold item 3 and continue with
+  >   item 4 \(M0141\-S2a\-fix2r\).
 
   > ## ESCALATION 2026-09-23 (ralph2 loop \#5) — lineage budget exhausted again, OWNER DECISION NEEDED
   >
@@ -16938,6 +16976,38 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
     `[ ]` again: the flip commit sequence from the 2026\-09\-23 ordering
     stands \(group\-K tests, stale group\-I expectations, the two script
     knob defaults, then this task's gate suite\).
+  - **FLIP LANDED 2026\-09\-24 \(ralph2 loop \#49\)**: the jointree pipeline
+    is the default \(`GOOPG_JOINTREE_PIPELINE=0` = legacy\). Design doc:
+    `docs/design/0100-0149/m0145-0008-cutover-flip.md`.
+    - **Attribution:** the gated staged flip was swept into a concurrent
+      session's pathspec\-less commit `ddb4eabd4` \("analysis\(latency\-trend\)"\),
+      already pushed. That commit IS the flip; the gates ran on exactly that
+      staged tree. History is not rewritten.
+    - Prerequisite fixed on its own first, `eb0e7d388`: WRONG RESULTS, the
+      index\-only producer's bare branch skipped the NULL\-key guard
+      \(reachable on the legacy default too, through any searched join\).
+    - Two PG\-faithful estimator fixes the flip exposed: IN\-list elements get
+      eqsel's `isunique` \(scalararraysel, selfuncs.c:1821/:338\); an unanalysed
+      base column divides by `rel->tuples` \(`EstRelRows`\).
+    - Owner\-sanctioned hooks `SetJointreePipeline` /
+      `SetIndexProbeCostMultiplier`. 13 red tests dispositioned against PG
+      18.3 \(table in the doc\).
+    - Gates on the new default: units, tpch\-spotcheck, sf025 96/96
+      \(PLAN\-SHAPE changed=25, the fire set\), acceptance values identical,
+      fireset clean, TPC\-H match=2/22 \(= baseline\), SF0.25 match=2
+      \(floor\). ea\-ratchet 53→50 with 1 NEW \(Q95, unmatched in PG\): held in
+      the M0145\-0001 escalation 2026\-09\-24.
+    - Wall time: arm total 1.14x; Q18 1.6x and Q22 3.2x slower \(held in
+      the M0145\-0001 escalation 2026\-09\-24\).
+    Movement: none — TPC\-H CATEGORIES\-EXCL\-MATCH within ±3 of the
+    baseline, SF0.25 within ±1 of the same\-binary legacy control, match
+    unchanged on both corpora.
+  - Remaining here: the legacy\-deletion slices \(`planSelectLegacyPipeline`
+    and legacy\-only machinery with the group\-L tests, the seam guards on
+    0001's retired list, the knob\), then the fire\-set gate's HEAD\-vs\-staged
+    redesign.
+
+
 - [x] **M0145-0009 — CTE-output statistics (B-06 resume): wire the landed
   synthesis into the estimator** (filed 2026-09-21 by owner directive;
   carries TODO_ALL B-06 / ledger `take3-B-06-deferred`). Three of this

@@ -1,6 +1,6 @@
 # M0145-0001 — the jointree-level IR and the lowering contract
 
-Status: ESCALATED [!] 2026-09-23 (second time) — S4 lineage budget exhausted again (M0145-0004a, -0005, -0007, -0027, -0028 all Movement: none) at the M0145-0008 flip triage; owner decision pending (escalation block in `.ralph/fix_plan.md` M0145-0001). The 2026-09-22 escalation was answered GO — CONTINUE. Recon itself complete 2026-09-21.
+Status: ESCALATED [!] 2026-09-24 (third time) — S4 lineage budget exhausted after the M0145-0008 flip landed (M0145-0004, -0026, -0026a, -0029, -0030 all Movement: none); three would-be children (0008b Q18/Q22 timing, 0008c Q95 ea finding, 0008d grouping direction) held in the escalation block in `.ralph/fix_plan.md` M0145-0001; owner decision pending. The 2026-09-23 escalation was answered option (a); the 2026-09-22 one GO — CONTINUE. Recon itself complete 2026-09-21.
 ESCALATED `[!]` 2026-09-22 — the lineage budget for this root is exhausted:
 its last five completed descendants (M0145-0006, M0145-0014, M0145-0015,
 M0145-0016, M0145-0017) all carry `Movement: none`. No further descendant may
