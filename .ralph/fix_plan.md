@@ -19368,7 +19368,7 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
     TPC\-H Q22 elects PG's NL Anti Join \+ Index Only Scan
     \(`join\-method`/`parameterisation`\); acceptance\-arm Q22 time.
 
-- [ ] **M0145-0008c — recon: PG-shared attribution for the flip's NEW
+- [x] **M0145-0008c — recon: PG-shared attribution for the flip's NEW
   ea-ratchet key `Q95:cte:ws_wh+customer_address+date_dim+web_sales+
   web_site`** (same filing). The flip introduced a Hash Semi Join est 1
   vs actual 22 (`pg_est` null) finding; G4 forbids repinning an
@@ -19379,6 +19379,20 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
   Parent: M0145-0008
   - Expected movement: ea-ratchet NEW findings 1 → 0 (fix or attributed
     repin).
+  - **DONE 2026\-09\-24.** Design:
+    `docs/design/0100-0149/m0145-0008c-ea-ratchet-pg-shared-attribution.md`;
+    evidence `analysis/m0145/m0145-0008c/`.
+    - At HEAD the ratchet had 3 NEW keys. A/B at `a04b5c00e` shows Q95 is
+      the flip's and both Q14 keys came from M0146\-0002e `bb90e51a4`, which
+      had not run the ratchet.
+    - All three are PG\-shared. Q95: PG estimates the 4\-rel base and the
+      full semi scope at 1, with the same 22x/12x error. Q14: the estimates
+      did not change; the scorer's largest\-actual representative moved
+      under a Gather, and PG's nearest scope `\{cross\_items,date\_dim,item,
+      store\_sales\}` is est 1 vs 21135.
+    - Repinned under the G4 PG\-shared extension \(standalone non\-code
+      commit\); `make ea\-ratchet` PASS 52 vs 52.
+    Movement: yes — ea-ratchet NEW findings 3 -> 0 (attributed PG-shared repin, the task's stated exit; FIXED Q49 x2, Q54, Q94 dropped from the baseline).
 
 - [ ] **M0145-0008d — grouping pathkeys follow the ORDER BY direction
   when compatible** (same filing; ledger row exists). PG plans
