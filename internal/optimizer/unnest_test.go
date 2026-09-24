@@ -431,37 +431,6 @@ func outerExtra2() *OuterColumnRef {
 	return &OuterColumnRef{pos: 0, Level: 1, Index: 1, Name: "p_size", Type: catalog.Type{Name: "int8"}}
 }
 
-// TestInResidualLiftUnnests pins S4a/D3.2 item 2: a non-negated IN
-// whose only correlation is a liftable non-equi residual now unnests
-// to a semi join. The IN's own operand/projection equality supplies
-// the hash key (there is no equijoin param), and the residual is
-// AND-ed onto the join predicate — mirroring the EXISTS treatment.
-func TestInResidualLiftUnnests(t *testing.T) {
-	pinLegacyPipeline(t)
-	cat := twoTablesCatalog(t)
-	sql := "SELECT x FROM t1 WHERE x IN (SELECT y FROM t2 WHERE z > t1.x)"
-	node, err := Plan(parseOne(t, sql), cat)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if in := findInExpr(node); in != nil {
-		t.Errorf("InExpr survived residual-lift unnesting: %s", planString(node))
-	}
-	j := findFirstJoinByType(node, JoinTypeSemi)
-	if j == nil {
-		t.Fatalf("residual-only IN did not become a semi join: %s", planString(node))
-	}
-	if j.Algo != JoinAlgoHash {
-		t.Errorf("IN semi join algo = %d, want JoinAlgoHash (operand equality is the key)", j.Algo)
-	}
-	if j.LeftKey == nil || j.RightKey == nil {
-		t.Error("IN semi join must keep the operand/projection hash keys")
-	}
-	if j.Predicate == nil {
-		t.Error("lifted residual missing from the IN semi join predicate")
-	}
-}
-
 // TestNotInResidualStaysSubPlan pins the deliberate S4a non-goal: a
 // correlated NOT IN with a lifted residual must stay a SubPlan. NOT IN
 // carries three-valued NULL semantics (one NULL in the inner set makes

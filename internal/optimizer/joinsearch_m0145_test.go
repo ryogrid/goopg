@@ -77,23 +77,6 @@ func m0145AssertSearchedOuterSpine(t *testing.T, node, out Node, residual Expr, 
 // SpecialJoinInfos through `joinIsLegal`.
 func TestJointreeSearchesAFlatOuterSpine(t *testing.T) {
 	withPGShapedDP(t)
-	defer func(v bool) { jointreePipeline = v }(jointreePipeline)
-	jointreePipeline = true
-
-	names := []string{"a", "b", "c"}
-	node, ctx := m0145LeftSpine(t, names, []int64{100_000, 50_000, 10})
-	out, residual, used := tryPGShapedJoinSearch(node, seamLocal(names, 0), ctx, nil)
-	m0145AssertSearchedOuterSpine(t, node, out, residual, used, names)
-}
-
-// TestLegacyArmSearchesTheSameFlatOuterSpine is the parity pin: the flat
-// LEFT/RIGHT spine was already a single searched problem on the legacy arm
-// (the peel only ever saw pinned tops), so slice 1 changes no reachable
-// behaviour there — it retires machinery the arm no longer runs.
-func TestLegacyArmSearchesTheSameFlatOuterSpine(t *testing.T) {
-	withPGShapedDP(t)
-	defer func(v bool) { jointreePipeline = v }(jointreePipeline)
-	jointreePipeline = false
 
 	names := []string{"a", "b", "c"}
 	node, ctx := m0145LeftSpine(t, names, []int64{100_000, 50_000, 10})
@@ -109,8 +92,6 @@ func TestLegacyArmSearchesTheSameFlatOuterSpine(t *testing.T) {
 // syntactic tree stands, exactly the outcome the peel produced.
 func TestJointreeDeclinesAFullSpine(t *testing.T) {
 	withPGShapedDP(t)
-	defer func(v bool) { jointreePipeline = v }(jointreePipeline)
-	jointreePipeline = true
 
 	names := []string{"a", "b", "c"}
 	node, ctx := seamFixture(names, []int64{100_000, 50_000, 10})
@@ -146,13 +127,9 @@ func TestJointreeDeclinesAFullSpine(t *testing.T) {
 // arm keeps the isSimpleSingle bypass: no tag.
 func TestJointreeSearchesOneRelationScope(t *testing.T) {
 	cat := jtpCatalog(t)
-	jointreePlan := planOnPipeline(t, `SELECT k FROM jtp_o WHERE k > 5`, cat, true)
+	jointreePlan := planOnPipeline(t, `SELECT k FROM jtp_o WHERE k > 5`, cat)
 	if !treeHasSearched(jointreePlan) {
 		t.Fatalf("jointree arm planned a single-table statement without the search; tree: %s", describePlanTree(jointreePlan))
-	}
-	legacyPlan := planOnPipeline(t, `SELECT k FROM jtp_o WHERE k > 5`, cat, false)
-	if treeHasSearched(legacyPlan) {
-		t.Fatalf("legacy arm searched a one-relation statement — the bypass is gone; tree: %s", describePlanTree(legacyPlan))
 	}
 }
 
@@ -168,11 +145,8 @@ func TestJointreeSearchesAFilterlessScope(t *testing.T) {
 		`SELECT k FROM jtp_o`,
 		`SELECT * FROM jtp_o, jtp_i`,
 	} {
-		if !treeHasSearched(planOnPipeline(t, sql, cat, true)) {
+		if !treeHasSearched(planOnPipeline(t, sql, cat)) {
 			t.Fatalf("jointree arm left a filterless scope unsearched: %s", sql)
-		}
-		if treeHasSearched(planOnPipeline(t, sql, cat, false)) {
-			t.Fatalf("legacy arm searched a filterless scope: %s", sql)
 		}
 	}
 }
@@ -186,7 +160,7 @@ func TestJointreeSearchesAFilterlessScope(t *testing.T) {
 func TestJointreePullsExistsOverSingleTable(t *testing.T) {
 	cat := jtpCatalog(t)
 	node := planOnPipeline(t,
-		`SELECT k FROM jtp_o WHERE EXISTS (SELECT 1 FROM jtp_i WHERE jtp_i.j = jtp_o.k)`, cat, true)
+		`SELECT k FROM jtp_o WHERE EXISTS (SELECT 1 FROM jtp_i WHERE jtp_i.j = jtp_o.k)`, cat)
 	j := findSemiOrAntiJoin(node)
 	if j == nil || j.Type != JoinTypeSemi {
 		t.Fatalf("single-table EXISTS did not become a searched SEMI join; tree: %s", describePlanTree(node))
@@ -205,8 +179,6 @@ func TestJointreePullsExistsOverSingleTable(t *testing.T) {
 // alone.
 func TestJointreeAdmitsAOneRelProblem(t *testing.T) {
 	withPGShapedDP(t)
-	defer func(v bool) { jointreePipeline = v }(jointreePipeline)
-	jointreePipeline = true
 	defer setOneRelSearchForTest(false)()
 
 	names := []string{"a"}
@@ -223,22 +195,6 @@ func TestJointreeAdmitsAOneRelProblem(t *testing.T) {
 	}
 }
 
-// TestLegacyArmDeclinesAOneRelProblem is the arm-scoping pin: with the
-// pipeline knob off and GOOPG_ONEREL_SEARCH unset the floor stays 2 —
-// slice 4 must not leak the lift onto the arm the env knob still owns.
-func TestLegacyArmDeclinesAOneRelProblem(t *testing.T) {
-	withPGShapedDP(t)
-	defer func(v bool) { jointreePipeline = v }(jointreePipeline)
-	jointreePipeline = false
-	defer setOneRelSearchForTest(false)()
-
-	names := []string{"a"}
-	node, ctx := seamFixture(names, []int64{100_000})
-	if _, _, used := tryPGShapedJoinSearch(node, seamLocal(names, 0), ctx, nil); used {
-		t.Fatal("the legacy arm searched a one-relation problem with both knobs off — the floor is gone")
-	}
-}
-
 // TestJointreeSearchesADemotedAntiLink is M0145-0005 slice 6's headline
 // pin on the real planner: a mid-chain LEFT→ANTI demotion —
 // `jtp_o ANTI jtp_i ⋈ jtp_i2` — is a searched problem on the jointree
@@ -251,7 +207,7 @@ func TestJointreeSearchesADemotedAntiLink(t *testing.T) {
 		`LEFT JOIN jtp_i ON jtp_o.k = jtp_i.j ` +
 		`JOIN jtp_i2 ON jtp_o.k = jtp_i2.j2 ` +
 		`WHERE jtp_i.j IS NULL`
-	node := planOnPipeline(t, sql, cat, true)
+	node := planOnPipeline(t, sql, cat)
 	if !treeHasSearched(node) {
 		t.Fatalf("jointree arm left a demoted-ANTI chain unsearched; tree: %s", describePlanTree(node))
 	}
@@ -288,7 +244,7 @@ func TestJointreeArmBypassesThePinnedSpineRoute(t *testing.T) {
 	delete(sublinkRouteCounts, spineRoutePosthoc)
 	delete(sublinkRouteCounts, spineRouteJointree)
 
-	node := planOnPipeline(t, sql, preDPCatalog(t), true)
+	node := planOnPipeline(t, sql, preDPCatalog(t))
 	if n := sublinkRouteCounts[spineRouteLegacy]; n != 0 {
 		t.Fatalf("jointree arm entered runJoinSearchBelowPinned %d times — "+
 			"slice 7 retired the pinned-spine route on this arm", n)
@@ -301,11 +257,4 @@ func TestJointreeArmBypassesThePinnedSpineRoute(t *testing.T) {
 		t.Fatal("jointree arm returned a nil plan for a declined pull-up")
 	}
 
-	// The legacy arm keeps the route until the M0145-0008 cutover — the
-	// gate must be arm-scoped, not a deletion of the machinery.
-	planOnPipeline(t, sql, preDPCatalog(t), false)
-	if n := sublinkRouteCounts[spineRouteLegacy]; n != 1 {
-		t.Fatalf("legacy arm routed %d statements through the pinned-spine "+
-			"route, want 1 — the slice-7 gate leaked onto the legacy arm", n)
-	}
 }

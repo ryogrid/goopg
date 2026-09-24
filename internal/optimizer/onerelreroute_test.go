@@ -97,18 +97,6 @@ func TestOneRelRerouteSearchesSingleTableStatement(t *testing.T) {
 	}
 }
 
-// (2) Knob OFF is the historical branch: no search.
-func TestOneRelRerouteIsInertWithTheKnobOff(t *testing.T) {
-	pinLegacyPipeline(t)
-	withPGShapedDP(t)
-	t.Cleanup(setOneRelSearchForTest(false))
-	cat := oneRelRoutedCatalog(t)
-	node := planRouted(t, cat, "SELECT a FROM t WHERE a > 5")
-	if treeHasSearched(node) {
-		t.Fatal("knob off: searched subtree present — the rule chooser's branch was disturbed")
-	}
-}
-
 // (3) The FROM fallthrough does not break WHERE-less statements.
 func TestOneRelReroutePlansWhereLessSingleTable(t *testing.T) {
 	withPGShapedDP(t)

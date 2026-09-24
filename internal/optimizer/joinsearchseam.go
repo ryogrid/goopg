@@ -225,78 +225,38 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 		return node, pred, false
 	}
 	nrels := len(ctx.bindings)
-	// E-21 Cut 1 (onerelsearch.go): the floor is `minSearchRels()`, which is 2
-	// historically and 1 under `GOOPG_ONEREL_SEARCH`.
-	//
-	// The comment this replaces read "One relation is not a search
-	// (`make_rel_from_joinlist` returns the item)". That is true of the join
-	// ORDER and false of everything else: upstream runs
-	// `set_base_rel_pathlists` (allpaths.c:221) BEFORE
+	// The floor is one relation (E-21 Cut 1 / M0145-0005 slice 4, the only
+	// value since the M0145-0008 legacy deletion). "One relation is not a
+	// search" is true of the join ORDER and false of everything else:
+	// upstream runs `set_base_rel_pathlists` (allpaths.c:221) BEFORE
 	// `make_rel_from_joinlist` (allpaths.c:226), so the rel its
 	// `levels_needed == 1` branch returns already carries its `pathlist` AND
-	// its `partial_pathlist`. Declining here is what leaves a single-table
-	// statement with no `RelOptInfo` at all — no access-method comparison and,
-	// the reason E-21 exists, no partial path for `generateUsefulGatherPaths`
-	// to read. See DESIGN §1.1-§1.2.
+	// its `partial_pathlist`. Declining here would leave a single-table
+	// statement with no `RelOptInfo` at all — no access-method comparison
+	// and no partial path for `generateUsefulGatherPaths` to read (a UNION
+	// ALL appendrel member, M0145-0004, needs exactly that partial path).
 	//
 	// Past `maxSearchRels` the RelSet cannot address the problem at all, and
 	// the joinlist's own leaf indices would exceed the clause list's bit width.
-	//
-	// M0145-0004: a UNION ALL appendrel's member scope carries
-	// ctx.appendrelMember — the member needs its searched rel's
-	// PartialPathlist for the parent SETOP rel's partial arms, exactly
-	// the hole E-21 names below. Lower the one-relation floor for it the
-	// same way GOOPG_ONEREL_SEARCH does globally; the flag is set only
-	// inside planSelectImpl for a scope that arrived as a marked union's
-	// member, so this is the jointree arm alone.
-	//
-	// M0145-0005 slice 4: the jointree arm takes the PG-faithful value
-	// unconditionally — `make_one_rel` calls `set_base_rel_pathlists`
-	// (allpaths.c:221) for every base rel before `make_rel_from_joinlist`
-	// ever counts items, so a one-item joinlist is not a reason to skip
-	// base-rel path generation. GOOPG_ONEREL_SEARCH keeps governing the
-	// legacy arm alone; on this arm the floor is 1 whether or not the
-	// knob is exported.
-	floor := minSearchRels()
-	if (jointreePipeline || ctx.appendrelMember) && floor > 1 {
-		floor = 1
-	}
+	const floor = 1
 	if nrels < floor || nrels > maxSearchRels || len(ctx.joinlist) == 0 {
 		traceSeamDecline("size-or-no-joinlist", nrels, len(ctx.joinlist))
 		return node, pred, false
 	}
-	// M0127-P5.9-s: peel the pinned outer spine off the top and search what is
-	// below it. With no outer link this is the identity — `chain == node`,
-	// `spine` empty, `jl == ctx.joinlist` — so the shapes P5.9-r already searched
-	// take exactly the path they took before.
-	// M0145-0005 slice 1 (m0145-0005 design doc §"Slice 1"): the jointree
-	// arm does not peel at all — the search consumes the whole node tree
-	// and the unpeeled joinlist in one pass. Since C-04a/b relaxed LEFT and
-	// RIGHT to collapse-dependent, `joinPinned` pins only FULL (plus a
-	// LEFT/RIGHT stacked over a FULL pin), and `spineLinkSearchable` never
-	// certifies FULL — so a certified non-empty spine is unreachable today:
-	// every reachable statement either has no pinned items (the flat
-	// LEFT/RIGHT case, already searched whole through `outerChainLink`s and
-	// `joinIsLegal`) or carries a pin the search cannot build, which
-	// declines at `extractSearchLeaves`' leaf-count check or at
-	// `makeRelFromJoinlist`'s `pinnedUnsearchable` arm instead of here —
-	// the same `used=false` fall-back to the syntactic tree, one gate
-	// earlier in the machinery the arm is retiring. `splitOuterSpine`,
-	// `spineLinkSearchable`, `prefixNullable` and the splice below stay for
-	// the legacy arm until the M0145-0008 cutover.
-	var chain Node
+	// M0145-0005 slice 1 (m0145-0005 design doc §"Slice 1"): the search
+	// consumes the whole node tree and the unpeeled joinlist in one pass —
+	// no outer spine is peeled. Since C-04a/b relaxed LEFT and RIGHT to
+	// collapse-dependent, `joinPinned` pins only FULL (plus a LEFT/RIGHT
+	// stacked over a FULL pin), and a pin the search cannot build declines
+	// at `extractSearchLeaves`' leaf-count check or at
+	// `makeRelFromJoinlist`'s `pinnedUnsearchable` arm — the `used=false`
+	// fall-back to the syntactic tree. `spine` is therefore always empty
+	// since the M0145-0008 legacy deletion removed the peeling
+	// (`splitOuterSpine`); the spine-aware code below reads it as such and
+	// retires in a later deletion slice.
+	chain, jl := node, ctx.joinlist
 	var spine []*Join
-	var jl joinlist
 	var ok bool
-	if jointreePipeline {
-		chain, spine, jl, ok = node, nil, ctx.joinlist, true
-	} else {
-		chain, spine, jl, ok = splitOuterSpine(node, ctx.joinlist)
-	}
-	if !ok {
-		traceSeamDecline("outer-spine", nrels, len(spine))
-		return node, pred, false
-	}
 	// The prefix's own width, in FROM items. Everything below is written against
 	// it rather than against `nrels`, because the spine's relations are outside
 	// the problem: their columns lie beyond the prefix window, so every conjunct
@@ -324,15 +284,12 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 		nReal -= pu.nLeaves
 	}
 	nPulled := nprefix - nReal
-	nChain := 0
-	if jointreePipeline {
-		nChain = nprefix - nPulled - nrels
-		if nChain < 0 {
-			traceSeamDecline("prefix-exceeds-bindings", nrels, nprefix)
-			return node, pred, false
-		}
-		nReal = nrels
+	nChain := nprefix - nPulled - nrels
+	if nChain < 0 {
+		traceSeamDecline("prefix-exceeds-bindings", nrels, nprefix)
+		return node, pred, false
 	}
+	nReal = nrels
 	// R41/K75: fail closed when the joinlist claims MORE relations than the
 	// statement has bindings. `ctx.bindings[:nReal]` below would be an
 	// index-out-of-range PANIC, and until R41 the `leaf-count` check was the
@@ -394,7 +351,7 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 	// before `unnestSubqueriesInPlan` runs) stays structurally unable to
 	// contain one, per §28.3's finding.
 	//
-	// M0145-0005 slice 3 (jointreescope.go): on the jointree arm the
+	// M0145-0005 slice 3 (jointreescope.go): the
 	// leaf/link record planFromItem emitted at construction time is the
 	// extraction source — `extractScopeLeaves` rebuilds the identical
 	// tuple from it. The `root == chain` pin keeps the node walk for any
@@ -405,7 +362,7 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 	var onQuals []chainOnQual
 	var outerLinks []outerChainLink
 	var semiAnti []semiAntiChainLink
-	if jointreePipeline && ctx.jtScope != nil && ctx.jtScope.root == chain {
+	if ctx.jtScope != nil && ctx.jtScope.root == chain {
 		scans, widths, onQuals, outerLinks, semiAnti, ok = extractScopeLeaves(ctx.jtScope, ctx.joinInfoList)
 	} else {
 		scans, widths, onQuals, outerLinks, semiAnti, ok = extractSearchLeaves(chain)

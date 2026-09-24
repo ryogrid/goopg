@@ -332,47 +332,31 @@ type sjiScope struct {
 // resolve structurally, unqualified ones fall back to syn.
 func newSjiScope(from []parser.FromExpr, cat catalog.Catalog) *sjiScope {
 	sc := &sjiScope{cat: cat, tableMap: make(map[string]*catalog.Table)}
-	if jointreePipeline {
-		// M0145-0005 slice 6: under the jointree numbering every SEMI/ANTI
-		// link's right side IS a leaf — PG's deconstruct_recurse emits it —
-		// but a DEFERRED one: non-emitting, numbered after all emitting
-		// leaves, in link-encounter order. The leaves slice still records
-		// every range variable in DFS order (name resolution needs the
-		// semijoin RHS in scope); only the leaf index it stamps diverges.
-		// This numbering and the joinlist's must stay identical —
-		// deconstructJointreeScopedSJI derives it from the same helpers.
-		emitTotal := 0
-		for i := range from {
-			emitTotal += jointreeItemEmittingRels(from[i])
-		}
-		emitNext, deferred := 0, emitTotal
-		for i := range from {
-			start := len(sc.leaves)
-			sc.addLeaf(from[i].Base, cat, emitNext)
-			emitNext++
-			for _, j := range from[i].Joins {
-				if j.Type == parser.JoinSemi || j.Type == parser.JoinAnti {
-					sc.addLeaf(j.Right, cat, deferred)
-					deferred++
-					continue
-				}
-				sc.addLeaf(j.Right, cat, emitNext)
-				emitNext++
-			}
-			sc.items = append(sc.items, [2]int{start, len(sc.leaves)})
-		}
-		return sc
+	// M0145-0005 slice 6: under the jointree numbering every SEMI/ANTI
+	// link's right side IS a leaf — PG's deconstruct_recurse emits it —
+	// but a DEFERRED one: non-emitting, numbered after all emitting
+	// leaves, in link-encounter order. The leaves slice still records
+	// every range variable in DFS order (name resolution needs the
+	// semijoin RHS in scope); only the leaf index it stamps diverges.
+	// This numbering and the joinlist's must stay identical —
+	// deconstructJointreeScopedSJI derives it from the same helpers.
+	emitTotal := 0
+	for i := range from {
+		emitTotal += jointreeItemEmittingRels(from[i])
 	}
+	emitNext, deferred := 0, emitTotal
 	for i := range from {
 		start := len(sc.leaves)
-		sc.addLeaf(from[i].Base, cat, len(sc.leaves))
-		// R41/K74: skip exactly the sides `antiCollapsedJoins` (collapse.go)
-		// gives no leaf index to, or every SJI hand to the RIGHT of a
-		// collapsed link would name the wrong relation. This numbering and
-		// the joinlist's must stay identical, which is why both read the same
-		// helper rather than re-deriving the rule.
-		for _, j := range from[i].Joins[antiCollapsedJoins(from[i]):] {
-			sc.addLeaf(j.Right, cat, len(sc.leaves))
+		sc.addLeaf(from[i].Base, cat, emitNext)
+		emitNext++
+		for _, j := range from[i].Joins {
+			if j.Type == parser.JoinSemi || j.Type == parser.JoinAnti {
+				sc.addLeaf(j.Right, cat, deferred)
+				deferred++
+				continue
+			}
+			sc.addLeaf(j.Right, cat, emitNext)
+			emitNext++
 		}
 		sc.items = append(sc.items, [2]int{start, len(sc.leaves)})
 	}

@@ -17059,6 +17059,32 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
       legacy\-only machinery and the tests pinned through
       `SetJointreePipeline\("0"\)`; then retire the knob
       \(`flagProvenanceRetired`\) and the sf025 legacy control pass.
+  - **Legacy\-deletion slice 2 LANDED 2026\-09\-24: the legacy pipeline and
+    `GOOPG\_JOINTREE\_PIPELINE` are deleted.** Design:
+    `docs/design/0100-0149/m0145-0008-del2-legacy-pipeline-deleted.md`;
+    evidence `analysis/m0145/m0145-0008-del2/`.
+    - Dispatch collapsed into `planSelectWithSettings`; every
+      `jointree`/`jointreePipeline` branch folded \(rule\-based single\-table
+      bypass, S5a pre\-DP arm, outer\-spine peel, floor 2, legacy leaf
+      numbering\); the knob is retired via `flagProvenanceRetired`; the sf025
+      legacy control pass is off by default.
+    - Legacy\-pinned tests were run unpinned first: passing ones kept, 30
+      legacy\-shape pins deleted, and the correlated\-IN correctness pins
+      rewritten to PG 18.3's LATERAL semi join property \(both conjuncts
+      kept\).
+    - Gates: units, spotcheck, fire\-set HEAD\-vs\-staged `fires=none` at
+      SF0.25 \+ SF1, sweep 96/96 \(shapes 99/99 same\), acceptance 24 MATCH,
+      ea\-ratchet 52/52.
+    Movement: none — no plan moved on either corpus.
+    - Note for the owner: AGENT.md §"Plan\-parity harness" G8 still
+      describes `GOOPG\_JOINTREE\_PIPELINE` as the live dual\-pipeline
+      knob; that section is owner\-edited.
+    - Next slice \(dead code\): the 20 functions `deadcode ./cmd/goopg` newly
+      reports \(`predp.go`, the spine peel, `enclosingtree.go` splice
+      asserts, remap helpers, `joinTreeHasOuterLink`\), retiring the unread
+      `GOOPG\_ONEREL\_SEARCH` / `GOOPG\_UNNEST\_PREDP`, the spine\-aware code
+      in `tryPGShapedJoinSearch`, the sf025 `SF025\_FLOW\_KNOB` block and the
+      scripts' `JOINTREE` variables; then the retired seam guards.
 
 
 - [x] **M0145-0009 — CTE-output statistics (B-06 resume): wire the landed

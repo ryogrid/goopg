@@ -48,13 +48,11 @@ func jtpCatalog(t *testing.T) catalog.Catalog {
 // planOnPipeline plans sql with the package pipeline knob forced to on,
 // restoring it afterwards — same pattern the dispatch test uses (the
 // knob is process-global and this package's tests do not run parallel).
-func planOnPipeline(t *testing.T, sql string, cat catalog.Catalog, on bool) Node {
+func planOnPipeline(t *testing.T, sql string, cat catalog.Catalog) Node {
 	t.Helper()
-	defer func(v bool) { jointreePipeline = v }(jointreePipeline)
-	jointreePipeline = on
 	node, err := Plan(parseOne(t, sql), cat)
 	if err != nil {
-		t.Fatalf("Plan(%q, jointree=%v): %v", sql, on, err)
+		t.Fatalf("Plan(%q): %v", sql, err)
 	}
 	return node
 }
@@ -113,7 +111,7 @@ func planSeqScans(n Node) []string {
 func TestJointreePullupExistsSplicesSemiJoin(t *testing.T) {
 	cat := jtpCatalog(t)
 	node := planOnPipeline(t,
-		`select tag from jtp_o where exists (select 1 from jtp_i where j = k)`, cat, true)
+		`select tag from jtp_o where exists (select 1 from jtp_i where j = k)`, cat)
 	j := findSemiOrAntiJoin(node)
 	if j == nil {
 		t.Fatalf("knob-on EXISTS did not decorrelate to a semi/anti join; tree: %s", describePlanTree(node))
@@ -143,7 +141,7 @@ func TestJointreePullupExistsSplicesSemiJoin(t *testing.T) {
 func TestJointreePullupStarBodySplices(t *testing.T) {
 	cat := jtpCatalog(t)
 	node := planOnPipeline(t,
-		`select tag from jtp_o where exists (select * from jtp_i where j = k)`, cat, true)
+		`select tag from jtp_o where exists (select * from jtp_i where j = k)`, cat)
 	j := findSemiOrAntiJoin(node)
 	if j == nil {
 		t.Fatalf("SELECT * EXISTS produced no semi join; tree: %s", describePlanTree(node))
@@ -160,7 +158,7 @@ func TestJointreePullupStarBodySplices(t *testing.T) {
 func TestJointreePullupNotExistsSplicesAntiJoin(t *testing.T) {
 	cat := jtpCatalog(t)
 	node := planOnPipeline(t,
-		`select tag from jtp_o where not exists (select 1 from jtp_i where j = k)`, cat, true)
+		`select tag from jtp_o where not exists (select 1 from jtp_i where j = k)`, cat)
 	j := findSemiOrAntiJoin(node)
 	if j == nil {
 		t.Fatalf("knob-on NOT EXISTS produced no anti join; tree: %s", describePlanTree(node))
@@ -179,7 +177,7 @@ func TestJointreePullupNotExistsSplicesAntiJoin(t *testing.T) {
 func TestJointreePullupMultiRelBody(t *testing.T) {
 	cat := jtpCatalog(t)
 	node := planOnPipeline(t,
-		`select tag from jtp_o where exists (select 1 from jtp_i a, jtp_i2 b where a.j = k and a.v = b.j2)`, cat, true)
+		`select tag from jtp_o where exists (select 1 from jtp_i a, jtp_i2 b where a.j = k and a.v = b.j2)`, cat)
 	j := findSemiOrAntiJoin(node)
 	if j == nil {
 		t.Fatalf("multi-rel EXISTS produced no semi join; tree: %s", describePlanTree(node))
@@ -410,24 +408,20 @@ func TestJointreePullupDeclineParity(t *testing.T) {
 	for name, sql := range cases {
 		t.Run(name, func(t *testing.T) {
 			cat := jtpCatalog(t)
-			off := planOnPipeline(t, sql, cat, false)
-			on := planOnPipeline(t, sql, cat, true)
-			if dOff, dOn := describePlanTree(off), describePlanTree(on); dOff != dOn {
-				t.Errorf("declined pull-up changed the plan shape\nknob-off: %s\nknob-on:  %s", dOff, dOn)
+			// Since the M0145-0008 legacy deletion there is no knob-off
+			// plan to compare with; the pin is the route itself — the
+			// pull-up declined, and the statement went to the post-hoc
+			// unnest instead.
+			delete(sublinkRouteCounts, spineRoutePosthoc)
+			delete(sublinkRouteCounts, spineRouteJointree)
+			if planOnPipeline(t, sql, cat) == nil {
+				t.Fatal("declined pull-up returned a nil plan")
 			}
-			if planHasExistsExpr(off) != planHasExistsExpr(on) {
-				t.Errorf("declined pull-up changed the decorrelation outcome (off hasExists=%v, on hasExists=%v)",
-					planHasExistsExpr(off), planHasExistsExpr(on))
+			if n := sublinkRouteCounts[spineRouteJointree]; n != 0 {
+				t.Errorf("pull-up engaged %d times on a shape it must decline", n)
 			}
-			var offType, onType JoinType
-			if j := findSemiOrAntiJoin(off); j != nil {
-				offType = j.Type
-			}
-			if j := findSemiOrAntiJoin(on); j != nil {
-				onType = j.Type
-			}
-			if offType != onType {
-				t.Errorf("declined pull-up changed the join type: off=%v on=%v", offType, onType)
+			if n := sublinkRouteCounts[spineRoutePosthoc]; n != 1 {
+				t.Errorf("post-hoc route fired %d times, want 1", n)
 			}
 		})
 	}
@@ -439,7 +433,7 @@ func TestJointreePullupDeclineParity(t *testing.T) {
 func TestJointreePullupSiblingConjunctPreserved(t *testing.T) {
 	cat := jtpCatalog(t)
 	node := planOnPipeline(t,
-		`select tag from jtp_o where tag = 'x' and exists (select 1 from jtp_i where j = k)`, cat, true)
+		`select tag from jtp_o where tag = 'x' and exists (select 1 from jtp_i where j = k)`, cat)
 	if findSemiOrAntiJoin(node) == nil {
 		t.Fatalf("no semi join; tree: %s", describePlanTree(node))
 	}
@@ -475,16 +469,9 @@ func TestJointreePullupSiblingConjunctPreserved(t *testing.T) {
 func TestJointreePullupNoExistsKeepsLegacyIdentical(t *testing.T) {
 	cat := jtpCatalog(t)
 	sql := `select tag from jtp_o where k > 3`
-	off := planOnPipeline(t, sql, cat, false)
-	on := planOnPipeline(t, sql, cat, true)
-	if dOff, dOn := describePlanTree(off), describePlanTree(on); dOff != dOn {
-		t.Errorf("sublink-free statement diverged\nknob-off: %s\nknob-on:  %s", dOff, dOn)
-	}
+	on := planOnPipeline(t, sql, cat)
 	if !treeHasSearched(on) {
-		t.Errorf("knob-on plan is not a search product — the single-table scope stayed unsearched")
-	}
-	if treeHasSearched(off) {
-		t.Errorf("knob-off plan carries the search tag — the lift leaked onto the legacy arm")
+		t.Errorf("plan is not a search product — the single-table scope stayed unsearched")
 	}
 }
 
@@ -564,7 +551,7 @@ func TestJointreePullupBodyLocalQual(t *testing.T) {
 	}
 	// End to end: the knob-on plan carries the semijoin and no residual
 	// ExistsExpr — the body really entered the join-order problem.
-	plan := planOnPipeline(t, sql, cat, true)
+	plan := planOnPipeline(t, sql, cat)
 	if planHasExistsExpr(plan) {
 		t.Fatalf("ExistsExpr survived in the knob-on plan; tree: %s", describePlanTree(plan))
 	}

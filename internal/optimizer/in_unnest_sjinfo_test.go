@@ -19,51 +19,6 @@ import (
 // (joinsearchseam.go:1445-1447), exactly as it does for the EXISTS
 // producer's placeholder.
 
-func TestInUnnestSJInfoCorrelatedSemi(t *testing.T) {
-	pinLegacyPipeline(t)
-	cat := twoTablesCatalog(t)
-	sql := "SELECT x FROM t1 WHERE x IN (SELECT y FROM t2 WHERE y = t1.x)"
-	node, err := Plan(parseOne(t, sql), cat)
-	if err != nil {
-		t.Fatal(err)
-	}
-	j := findFirstJoinByType(node, JoinTypeSemi)
-	if j == nil {
-		t.Fatalf("no JoinTypeSemi found: %s", planString(node))
-	}
-	sj := j.SJInfo
-	if sj == nil {
-		t.Fatal("Join.SJInfo is nil")
-	}
-	if sj.Jointype != parser.JoinSemi {
-		t.Errorf("Jointype = %v, want JoinSemi", sj.Jointype)
-	}
-	if sj.SynLefthand != RelSet(1) || sj.SynRighthand != RelSet(2) {
-		t.Errorf("Syn = {%v,%v}, want {1,2}", sj.SynLefthand, sj.SynRighthand)
-	}
-	if sj.MinLefthand != RelSet(1) || sj.MinRighthand != RelSet(2) {
-		t.Errorf("Min = {%v,%v}, want {1,2}", sj.MinLefthand, sj.MinRighthand)
-	}
-	if !sj.LhsStrict {
-		t.Error("LhsStrict = false, want true (equijoin key is a strict operator)")
-	}
-	if !sj.SemiCanHash || !sj.SemiCanBtree {
-		t.Errorf("SemiCanHash=%v SemiCanBtree=%v, want true/true (hash-keyed SEMI)", sj.SemiCanHash, sj.SemiCanBtree)
-	}
-	// SemiRhsExprs must carry the subquery-side ("y") operand of the
-	// equijoin — the params' SubCols — not the outer side.
-	if len(sj.SemiRhsExprs) != 1 {
-		t.Fatalf("len(SemiRhsExprs) = %d, want 1", len(sj.SemiRhsExprs))
-	}
-	cr, ok := sj.SemiRhsExprs[0].(*ColumnRef)
-	if !ok {
-		t.Fatalf("SemiRhsExprs[0] = %T, want *ColumnRef", sj.SemiRhsExprs[0])
-	}
-	if cr.Name != "y" {
-		t.Errorf("SemiRhsExprs[0].Name = %q, want %q", cr.Name, "y")
-	}
-}
-
 func TestInUnnestSJInfoNonCorrelatedSemi(t *testing.T) {
 	cat := twoTablesCatalog(t)
 	sql := "SELECT x FROM t1 WHERE x IN (SELECT y FROM t2 WHERE z > 0)"

@@ -168,9 +168,6 @@ func TestIndexOnlyScanPlanCarriesIndexQuals(t *testing.T) {
 // index, with both bounds dropped from the reinstated Filter (PG's qpqual
 // excludes quals redundant with the index quals).
 func TestRestrictionRangeIndexScanOnJointreePipeline(t *testing.T) {
-	prev := jointreePipeline
-	jointreePipeline = true
-	t.Cleanup(func() { jointreePipeline = prev })
 
 	c := saopFixture(t)
 	item, ok := c.LookupTable(parser.ObjectName{Name: "item"})
@@ -245,9 +242,6 @@ func findFilterOver(n Node, scan Node) *Filter {
 // kept there; the gates trySAOPIndexScan applies (NOT IN, ALL, `!= ANY`, a
 // non-column operand) decline, leaving no SAOP probe.
 func TestRestrictionSAOPIndexScanOnJointreePipeline(t *testing.T) {
-	prev := jointreePipeline
-	jointreePipeline = true
-	t.Cleanup(func() { jointreePipeline = prev })
 
 	c := saopFixture(t)
 	item, ok := c.LookupTable(parser.ObjectName{Name: "item"})
@@ -303,9 +297,6 @@ func TestRestrictionSAOPIndexScanOnJointreePipeline(t *testing.T) {
 // dropped from the Filter; the bound stays there as a recheck (an open bound
 // runs to the prefix's padded upper bound, past NULLs in the bounded column).
 func TestRestrictionPrefixRangeIndexScanOnJointreePipeline(t *testing.T) {
-	prev := jointreePipeline
-	jointreePipeline = true
-	t.Cleanup(func() { jointreePipeline = prev })
 
 	c := catalog.NewInMemory()
 	tbl, err := c.CreateTable(parser.ObjectName{Name: "pr"}, []catalog.Column{
@@ -368,9 +359,6 @@ func TestMatchBitmapIndexQualsIsGapless(t *testing.T) {
 // SAOPKeys on a and the bound on b (PG `Index Cond: ((a = ANY (...)) AND
 // (b > 90))`); the bound stays in the Filter as a recheck, the IN does not.
 func TestRestrictionSAOPPlusRangeOnJointreePipeline(t *testing.T) {
-	prev := jointreePipeline
-	jointreePipeline = true
-	t.Cleanup(func() { jointreePipeline = prev })
 
 	c := prTestCatalog(t, []string{"a", "b"}, true)
 	node, err := Plan(parseOne(t, "SELECT c FROM pr WHERE a IN (7, 8) AND b > 90"), c)
@@ -394,9 +382,6 @@ func TestRestrictionSAOPPlusRangeOnJointreePipeline(t *testing.T) {
 // leaves a NULLABLE key column unbound would miss rows: on (a, b, c) with c
 // nullable, `a = 7 AND b > 90` must not use the index; with c NOT NULL it may.
 func TestRestrictionProbeDeclinesUnboundNullableKeyColumn(t *testing.T) {
-	prev := jointreePipeline
-	jointreePipeline = true
-	t.Cleanup(func() { jointreePipeline = prev })
 
 	for _, cNotNull := range []bool{false, true} {
 		c := prTestCatalog(t, []string{"a", "b", "c"}, cNotNull)

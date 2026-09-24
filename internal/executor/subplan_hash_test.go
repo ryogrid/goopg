@@ -142,32 +142,6 @@ func TestHashedInAnyAllFormsUnaffected(t *testing.T) {
 	}
 }
 
-// TestHashedInMixedKindFallsBack: an int operand probed against a text
-// inner set must take the linear path, where compareEq's int↔string
-// coercion applies (`10 = '10'` is TRUE). If the hash answered, the
-// family mismatch would wrongly report a miss — the probe must decline
-// instead.
-//
-// NOT PG behaviour (M0145-0030): PG 18.3 rejects this query at parse time
-// with 42883 "operator does not exist: integer = text". goopg accepts it on
-// both pipelines, and they disagree (legacy 1 row, jointree 0: its semi join
-// hashes int against text). The type-check gap is ledgered. This test
-// should become a 42883 assertion when that check lands. Until then it is
-// pinned to the legacy pipeline, whose linear-probe fallback it covers
-// (owner decision 2026-09-24, M0145-0008).
-func TestHashedInMixedKindFallsBack(t *testing.T) {
-	defer optimizer.SetJointreePipeline("0")()
-	ctx, cleanup := hashFixture(t)
-	defer cleanup()
-	got := runBothHashPaths(t, ctx,
-		"SELECT a FROM ht1 WHERE b IN (SELECT s FROM ht3) ORDER BY a")
-	// b=10 coerces equal to '10' → row a=1 kept; 99 misses (no NULLs
-	// in ht3) → dropped; NULL operand over non-empty inner → NULL.
-	if len(got) != 1 || datumKey(got[0][0]) != datumKey(NewIntDatum(1)) {
-		t.Fatalf("int-vs-text IN: got %d rows, want exactly a=1 (coercion via linear path)", len(got))
-	}
-}
-
 // TestHashedInBudgetPressure: a tiny WorkMem keeps the hash (and even
 // the value slice) from being retained; results must be identical.
 func TestHashedInBudgetPressure(t *testing.T) {

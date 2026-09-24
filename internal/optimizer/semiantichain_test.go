@@ -20,53 +20,6 @@ import (
 // semiAntiOnQualsOK and by semiAntiLinksHaveSJInfos against a real
 // existsUnnestSJInfo-built SpecialJoinInfo.
 
-func TestSemiAntiOnQualsOK_AcceptsWellFormedLink(t *testing.T) {
-	pinLegacyPipeline(t)
-	cat := analyzedThreeTablesCatalog(t)
-	sql := "SELECT x FROM t1 WHERE EXISTS (" +
-		"SELECT 1 FROM t2, t3 WHERE t2.z = t1.x AND t2.y = t3.a)"
-	node, err := Plan(parseOne(t, sql), cat)
-	if err != nil {
-		t.Fatal(err)
-	}
-	j := findFirstJoinByType(node, JoinTypeSemi)
-	if j == nil {
-		t.Fatalf("no JoinTypeSemi found: %s", planString(node))
-	}
-
-	// Mirror the probe's leaf/width reconstruction: t1 (leaf 0), RHS *Project
-	// as one opaque leaf (leaf 1).
-	scans, widths, _, _, ok := extractSearchLeavesAdmitSemiAnti(j)
-	if !ok || len(scans) != 2 {
-		t.Fatalf("extractSearchLeavesAdmitSemiAnti(j) = (%v leaves, ok=%v), want 2 leaves ok=true", len(scans), ok)
-	}
-	cum := make([]int, len(widths)+1)
-	for i, w := range widths {
-		cum[i+1] = cum[i] + w
-	}
-	cumOffsets := spansFromCumulative(cum)
-
-	pred := j.Predicate
-	if pred == nil && j.LeftKey != nil && j.RightKey != nil {
-		pred = &BinaryOp{Op: parser.OpEq, Left: j.LeftKey, Right: j.RightKey}
-	}
-	if pred == nil {
-		t.Fatalf("no correlation predicate on the Semi join: %#v", j)
-	}
-
-	link := semiAntiChainLink{
-		jointype: parser.JoinSemi,
-		lhs:      leafRangeRelSet(0, 1),
-		rhs:      leafRangeRelSet(1, 2),
-		pred:     pred,
-	}
-
-	if !semiAntiOnQualsOK([]semiAntiChainLink{link}, cumOffsets) {
-		t.Errorf("semiAntiOnQualsOK(well-formed Semi link) = false, want true — " +
-			"this is exactly the shape outerOnQualsOK incorrectly declined (§15)")
-	}
-}
-
 func TestSemiAntiOnQualsOK_DeclinesSingleSideConjunct(t *testing.T) {
 	// A conjunct confined to one side has no place in a Semi/Anti link's
 	// correlation predicate (any such filter should already have been pushed
@@ -139,98 +92,6 @@ func TestSemiAntiLinksHaveSJInfos_DeclinesMismatchedSides(t *testing.T) {
 // (not the throwaway `extractSearchLeavesAdmitSemiAnti` probe copy), against
 // the same Q69-witness-class fixture the probe and the two tests above
 // already established produces `j.Right = *Project{Child: *Join{Inner}}`.
-
-// TestExtractSearchLeaves_AdmitSemiAnti_BuildsLinkAndRebuildsSJInfo proves
-// items 2-4 of §22.4's scaffold together: the walk extension flattens the
-// Semi join's LHS while keeping its RHS one opaque leaf, builds a
-// `semiAntiChainLink` real consumers (`semiAntiOnQualsOK`,
-// `semiAntiLinksHaveSJInfos`) accept, and rebuilds the join's own attached
-// `SJInfo` (originally `existsUnnestSJInfo`'s throwaway synL=1/synR=2) with
-// the real leaf-index bits.
-func TestExtractSearchLeaves_AdmitSemiAnti_BuildsLinkAndRebuildsSJInfo(t *testing.T) {
-	pinLegacyPipeline(t)
-	cat := analyzedThreeTablesCatalog(t)
-	sql := "SELECT x FROM t1 WHERE EXISTS (" +
-		"SELECT 1 FROM t2, t3 WHERE t2.z = t1.x AND t2.y = t3.a)"
-	node, err := Plan(parseOne(t, sql), cat)
-	if err != nil {
-		t.Fatal(err)
-	}
-	j := findFirstJoinByType(node, JoinTypeSemi)
-	if j == nil {
-		t.Fatalf("no JoinTypeSemi found: %s", planString(node))
-	}
-	if j.SJInfo == nil {
-		t.Fatalf("j.SJInfo = nil, want the inert SpecialJoinInfo unnestExistsExpr attaches")
-	}
-	// The placeholder this loop's change replaces (unnest.go's
-	// existsUnnestSJInfo, §22.4 item 4's stated target).
-	if j.SJInfo.SynLefthand != 1 || j.SJInfo.SynRighthand != 2 {
-		t.Fatalf("j.SJInfo.{SynLefthand,SynRighthand} = {%#x,%#x} before admission, want the throwaway {1,2} placeholder — fixture or existsUnnestSJInfo changed out from under this test", j.SJInfo.SynLefthand, j.SJInfo.SynRighthand)
-	}
-	// This fixture is the FINAL planned tree (post join-method selection):
-	// a hash-keyed Semi/Anti carries its correlation as (LeftKey, RightKey),
-	// not j.Predicate (m0142_0008a_3i_plumbing_probe_test.go's own finding).
-	// extractSearchLeaves's real production call site (predp.go's pre-search
-	// origChain) runs BEFORE method selection, so Predicate is always
-	// populated there — reconstruct it here purely to exercise that real,
-	// predicate-bearing case against this post-selection fixture.
-	if j.Predicate == nil && j.LeftKey != nil && j.RightKey != nil {
-		j.Predicate = &BinaryOp{Op: parser.OpEq, Left: j.LeftKey, Right: j.RightKey}
-	}
-	if j.Predicate == nil {
-		t.Fatalf("no correlation predicate on the Semi join: %#v", j)
-	}
-
-	scans, widths, onQuals, outer, semiAnti, ok := extractSearchLeaves(j)
-	if !ok {
-		t.Fatalf("extractSearchLeaves(j) ok=false, want true: %s", planString(node))
-	}
-	if len(scans) != 2 {
-		t.Fatalf("scans = %d leaves (%v), want 2 (t1, and the RHS *Project as one opaque leaf) — widths=%v", len(scans), scans, widths)
-	}
-	if _, isProj := scans[1].(*Project); !isProj {
-		t.Errorf("scans[1] = %T, want *Project (RHS stays opaque, no recursion into inner t2/t3)", scans[1])
-	}
-	if len(onQuals) != 0 {
-		t.Errorf("onQuals = %v, want none — the Semi join's predicate must land in `semiAnti`, not `onQuals`", onQuals)
-	}
-	if len(outer) != 0 {
-		t.Errorf("outer = %v, want none — a Semi/Anti link is a semiAntiChainLink, not an outerChainLink", outer)
-	}
-	if len(semiAnti) != 1 {
-		t.Fatalf("semiAnti = %d links, want exactly 1: %+v", len(semiAnti), semiAnti)
-	}
-	lk := semiAnti[0]
-	wantLHS, wantRHS := leafRangeRelSet(0, 1), leafRangeRelSet(1, 2)
-	if lk.jointype != parser.JoinSemi {
-		t.Errorf("semiAnti[0].jointype = %v, want parser.JoinSemi", lk.jointype)
-	}
-	if lk.lhs != wantLHS || lk.rhs != wantRHS {
-		t.Errorf("semiAnti[0] = {lhs:%#x, rhs:%#x}, want {lhs:%#x, rhs:%#x}", lk.lhs, lk.rhs, wantLHS, wantRHS)
-	}
-	if lk.pred == nil {
-		t.Fatalf("semiAnti[0].pred = nil, want the correlation predicate")
-	}
-
-	cumOffsets := buildLeafSpans(widths, semiAnti)
-	if !semiAntiOnQualsOK(semiAnti, cumOffsets) {
-		t.Errorf("semiAntiOnQualsOK(semiAnti, cumOffsets) = false, want true — the walk's own link must satisfy the consumer it was built to feed")
-	}
-
-	// Item 4: the placeholder synL=1/synR=2 must be REPLACED by the real
-	// leaf-index bits, in place, on the same *SpecialJoinInfo the Join node
-	// already carries.
-	if j.SJInfo.SynLefthand != wantLHS || j.SJInfo.SynRighthand != wantRHS {
-		t.Errorf("after admission, j.SJInfo.{SynLefthand,SynRighthand} = {%#x,%#x}, want {%#x,%#x} (rebuilt from real leaf-index bits, replacing the {1,2} placeholder)", j.SJInfo.SynLefthand, j.SJInfo.SynRighthand, wantLHS, wantRHS)
-	}
-	if j.SJInfo.MinLefthand != wantLHS || j.SJInfo.MinRighthand != wantRHS {
-		t.Errorf("after admission, j.SJInfo.{MinLefthand,MinRighthand} = {%#x,%#x}, want {%#x,%#x}", j.SJInfo.MinLefthand, j.SJInfo.MinRighthand, wantLHS, wantRHS)
-	}
-	if !semiAntiLinksHaveSJInfos(semiAnti, []*SpecialJoinInfo{j.SJInfo}) {
-		t.Errorf("semiAntiLinksHaveSJInfos(semiAnti, [j.SJInfo]) = false, want true — the rebuilt SJInfo must match the link the same walk just built")
-	}
-}
 
 // TestExtractSearchLeaves_AdmitSemiAnti_NarrowsMinLefthandToCorrelatedRelation
 // (M0142-0008a-3i-plumbing-c10, design doc §44.3-44.4, filed by c9) proves the
@@ -339,66 +200,6 @@ func TestExtractSearchLeaves_AdmitSemiAnti_NarrowsMinLefthandToCorrelatedRelatio
 	wantRHS := leafRangeRelSet(2, 3)
 	if j.SJInfo.MinRighthand != wantRHS {
 		t.Errorf("j.SJInfo.MinRighthand = %#x, want %#x (the single synthetic RHS leaf, unchanged)", j.SJInfo.MinRighthand, wantRHS)
-	}
-}
-
-// TestExtractSearchLeaves_AdmitSemiAnti_FoldsKeyEquijoinIntoPred pins design
-// doc §28.4's finding (M0142-0008a-3i-plumbing-b2 step 3 scoping pass): a
-// bare correlated EXISTS with no OTHER residual leaves `j.Predicate` nil —
-// its whole correlation lives in (LeftKey, RightKey), which unnestExistsExpr
-// deliberately excludes from Predicate since the hash match enforces it at
-// execution time (unnest.go's `join := &Join{Predicate: joinPredicate}`
-// followed by a SEPARATE `join.LeftKey = outerKey` assignment). Unlike
-// TestExtractSearchLeaves_AdmitSemiAnti_BuildsLinkAndRebuildsSJInfo (which
-// hand-patches j.Predicate before calling extractSearchLeaves, working around
-// exactly this gap), this fixture calls extractSearchLeaves against the
-// UNPATCHED, naturally-nil Predicate: before the §28.4 fix the resulting
-// semiAntiChainLink.pred would be nil (semiAntiOnQualsOK declines a nil pred,
-// per TestSemiAntiOnQualsOK_DeclinesNilPredicate) — a future plan-build arm
-// consuming `pred` alone would silently build an unconditional (Cartesian-
-// like) Semi/Anti now that admitSemiAnti is wired live.
-func TestExtractSearchLeaves_AdmitSemiAnti_FoldsKeyEquijoinIntoPred(t *testing.T) {
-	pinLegacyPipeline(t)
-	cat := analyzedThreeTablesCatalog(t)
-	sql := "SELECT x FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.z = t1.x)"
-	node, err := Plan(parseOne(t, sql), cat)
-	if err != nil {
-		t.Fatal(err)
-	}
-	j := findFirstJoinByType(node, JoinTypeSemi)
-	if j == nil {
-		t.Fatalf("no JoinTypeSemi found: %s", planString(node))
-	}
-	if j.Predicate != nil {
-		t.Fatalf("j.Predicate = %#v, want nil — this fixture is only a witness for the gap if the equijoin is ENTIRELY absent from Predicate (fixture drifted, or unnestExistsExpr's own convention changed)", j.Predicate)
-	}
-	if j.LeftKey == nil || j.RightKey == nil {
-		t.Fatalf("j.{LeftKey,RightKey} = {%v,%v}, want both set — this fixture must produce a hash-keyed Semi join", j.LeftKey, j.RightKey)
-	}
-
-	_, widths, _, _, semiAnti, ok := extractSearchLeaves(j)
-	if !ok {
-		t.Fatalf("extractSearchLeaves(j) ok=false, want true: %s", planString(node))
-	}
-	if len(semiAnti) != 1 {
-		t.Fatalf("semiAnti = %d links, want exactly 1: %+v", len(semiAnti), semiAnti)
-	}
-	lk := semiAnti[0]
-	if lk.pred == nil {
-		t.Fatalf("semiAnti[0].pred = nil, want the (LeftKey = RightKey) equijoin folded in — the equality is otherwise dropped entirely (§28.4)")
-	}
-	conjuncts := splitAnd(lk.pred)
-	if len(conjuncts) != 1 {
-		t.Fatalf("splitAnd(semiAnti[0].pred) = %d conjuncts, want exactly 1 (Predicate was nil, so only the folded-in key equality should be present): %+v", len(conjuncts), conjuncts)
-	}
-	eq, ok := conjuncts[0].(*BinaryOp)
-	if !ok || eq.Op != parser.OpEq || eq.Left != Expr(j.LeftKey) || eq.Right != Expr(j.RightKey) {
-		t.Errorf("semiAnti[0].pred's conjunct = %#v, want (LeftKey = RightKey) built from j.LeftKey/j.RightKey by pointer", conjuncts[0])
-	}
-
-	cumOffsets := buildLeafSpans(widths, semiAnti)
-	if !semiAntiOnQualsOK(semiAnti, cumOffsets) {
-		t.Errorf("semiAntiOnQualsOK(semiAnti, cumOffsets) = false, want true — the walk's own link must satisfy the consumer it was built to feed")
 	}
 }
 
@@ -733,47 +534,6 @@ func TestPgShapedOffsetChecksOK_SyntheticLastInWalkOrder(t *testing.T) {
 		t.Errorf("pgShapedOffsetChecksOK(...) = accepted for spineOffset=%d (the OLD buggy target, cumOffsets' raw last .hi), want declined — this would mean the fix regressed back to comparing against the synthetic leaf's out-of-band span", wA+wB)
 	} else if reason != "spine-offset-disagreement" {
 		t.Errorf("declineReason = %q, want %q", reason, "spine-offset-disagreement")
-	}
-}
-
-// TestExtractSearchLeaves_OuterReductionAntiKeyFoldedOnce pins M0145-0026a.
-// A LEFT->ANTI outer-join reduction built by planFromItem keeps its ON
-// equality in Predicate AND copies it into LeftKey/RightKey. The link fold
-// must not add `LeftKey = RightKey` a second time: the search would get two
-// restrictinfos for one clause, and hashJoinCost would charge an extra hash
-// clause (TPC-DS Q78's three return-side anti joins). PG holds one
-// RestrictInfo per clause.
-func TestExtractSearchLeaves_OuterReductionAntiKeyFoldedOnce(t *testing.T) {
-	pinLegacyPipeline(t)
-	cat := analyzedThreeTablesCatalog(t)
-	sql := "SELECT x FROM t1 LEFT JOIN t2 ON t2.z = t1.x WHERE t2.z IS NULL"
-	node, err := Plan(parseOne(t, sql), cat)
-	if err != nil {
-		t.Fatal(err)
-	}
-	j := findFirstJoinByType(node, JoinTypeAnti)
-	if j == nil {
-		t.Fatalf("no JoinTypeAnti found: %s", planString(node))
-	}
-	if !j.FromOuterReduction || j.LeftKey == nil || j.RightKey == nil {
-		t.Fatalf("fixture drifted: want a keyed FromOuterReduction anti join, got FromOuterReduction=%v keys={%v,%v}", j.FromOuterReduction, j.LeftKey, j.RightKey)
-	}
-	if !semiAntiPredHasKeyEq(j.Predicate, j.LeftKey, j.RightKey) {
-		t.Fatalf("fixture drifted: Predicate %#v no longer carries the key equality, so this is not the M0145-0026a shape", j.Predicate)
-	}
-
-	_, _, _, _, semiAnti, ok := extractSearchLeaves(j)
-	if !ok || len(semiAnti) != 1 {
-		t.Fatalf("extractSearchLeaves(j) = (%d links, ok=%v), want 1 link", len(semiAnti), ok)
-	}
-	eqs := 0
-	for _, c := range splitAnd(semiAnti[0].pred) {
-		if b, isBin := c.(*BinaryOp); isBin && b.Op == parser.OpEq {
-			eqs++
-		}
-	}
-	if eqs != 1 {
-		t.Errorf("semiAnti[0].pred holds %d equalities, want 1 (the key equality folded once): %+v", eqs, splitAnd(semiAnti[0].pred))
 	}
 }
 

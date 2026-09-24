@@ -33,29 +33,6 @@ func oneRelSeamFixture(rows int64) (Node, *resolveContext) {
 	return seamFixture([]string{"a"}, []int64{rows})
 }
 
-// TestOneRelSearchIsInertWithTheKnobOff: the rollback arm. A one-relation
-// statement must take exactly the path it took before this cut — the seam
-// declines at `minSearchRels()` and returns its inputs untouched.
-func TestOneRelSearchIsInertWithTheKnobOff(t *testing.T) {
-	pinLegacyPipeline(t)
-	withPGShapedDP(t)
-	t.Cleanup(setOneRelSearchForTest(false))
-
-	node, ctx := oneRelSeamFixture(10_000_000)
-	pred := seamLocal([]string{"a"}, 0)
-
-	out, residual, used := tryPGShapedJoinSearch(node, pred, ctx, nil)
-	if used {
-		t.Fatal("the seam searched a one-relation statement with GOOPG_ONEREL_SEARCH off")
-	}
-	if out != node || residual != pred {
-		t.Fatal("the seam altered its inputs while declining")
-	}
-	if minSearchRels() != 2 {
-		t.Fatalf("minSearchRels() = %d with the knob off, want 2", minSearchRels())
-	}
-}
-
 // TestOneRelSearchAdmitsASingleTableStatement: with the knob on, the same
 // statement is planned by the search. This is the whole of Cut 1's mechanism —
 // everything downstream (`relfromjoinlist.go`'s `jl.nrels() == 1` carve-out and

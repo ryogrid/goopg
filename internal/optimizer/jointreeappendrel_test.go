@@ -163,8 +163,6 @@ func TestAppendrelMarkSurvivesEarlierFromSibling(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			defer func(v bool) { jointreePipeline = v }(jointreePipeline)
-			jointreePipeline = true
 			sel, ok := parseOne(t, tc.sql).(*parser.SelectStmt)
 			if !ok {
 				t.Fatal("parsed statement is not a SELECT")
@@ -194,7 +192,7 @@ func TestAppendrelMemberScopeEngagesSearch(t *testing.T) {
 		cat := appendrelTestCat(t)
 		sql := `SELECT * FROM (SELECT a, v FROM zz_m1 UNION ALL SELECT a, v FROM zz_m2) u, zz_d d WHERE u.a = d.a`
 
-		node := planOnPipeline(t, sql, cat, true)
+		node := planOnPipeline(t, sql, cat)
 		leaf := findSetOpLeaf(node)
 		if leaf == nil {
 			t.Fatal("jointree arm: no *SetOp leaf in the plan")
@@ -223,19 +221,6 @@ func TestAppendrelMemberScopeEngagesSearch(t *testing.T) {
 			}
 		}
 
-		legacy := planOnPipeline(t, sql, cat, false)
-		lleaf := findSetOpLeaf(legacy)
-		if lleaf == nil {
-			t.Fatal("legacy arm: no *SetOp leaf in the plan")
-		}
-		lcarrier, ok := Node(lleaf).(setOpBranchRelNode)
-		if !ok {
-			t.Fatalf("legacy arm: leaf %T is not a carrier", lleaf)
-		}
-		lsr := lcarrier.setOpBranchRel()
-		if lsr != nil && len(lsr.PartialPathlist) != 0 {
-			t.Errorf("legacy arm: SETOP rel has %d partial paths — the appendrel machinery leaked off-knob", len(lsr.PartialPathlist))
-		}
 	})
 }
 
@@ -409,16 +394,15 @@ func TestAppendrelConsiderParallelInheritsSetOp(t *testing.T) {
 // the shared drivingScans sizing fix: an aggregate over a UNION ALL leaf
 // can split into partial-agg → Gather → partial-agg → SetOp because
 // computeParallelWorkers/upperSplitWorkers now see the member scans
-// through the SetOp driving node. Shared machinery — both arms produce
-// the shape.
+// through the SetOp driving node.
 func TestPartialAggOverUnionLeafGathers(t *testing.T) {
 	withParallelOn(t, func() {
 		cat := appendrelTestCat(t)
 		sql := `SELECT count(*) FROM (SELECT a, v FROM zz_m1 UNION ALL SELECT a, v FROM zz_m2) u`
-		for _, on := range []bool{false, true} {
+		// One arm since the M0145-0008 legacy deletion; `on` only labels
+		// the failure messages.
+		for _, on := range []bool{true} {
 			func() {
-				defer func(v bool) { jointreePipeline = v }(jointreePipeline)
-				jointreePipeline = on
 				ps := DefaultPlannerSettings()
 				ps.ParallelStatementOK = true
 				node, err := PlanWithSettings(parseOne(t, sql), cat, ps)
@@ -561,7 +545,7 @@ func TestUnionAllChainLeafFilesGatherablePartial(t *testing.T) {
 		cat := appendrelTestCat(t)
 		sql := `SELECT * FROM (SELECT a, v FROM zz_m1 UNION ALL SELECT a, v FROM zz_m2 UNION ALL SELECT a, v FROM zz_m3) u, zz_d d WHERE u.a = d.a`
 
-		node := planOnPipeline(t, sql, cat, true)
+		node := planOnPipeline(t, sql, cat)
 		leaf := findSetOpLeaf(node)
 		if leaf == nil {
 			t.Fatal("jointree arm: no *SetOp leaf in the plan")

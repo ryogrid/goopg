@@ -117,23 +117,17 @@ func TestParallelNLIJointypeIdentity(t *testing.T) {
 		sql  string
 		want optimizer.JoinType
 	}{
-		{"semi", "SELECT id FROM nlij_outer o WHERE EXISTS (SELECT 1 FROM nlij_inner i WHERE i.k = o.k)", optimizer.JoinTypeSemi},
-		{"anti", "SELECT id FROM nlij_outer o WHERE NOT EXISTS (SELECT 1 FROM nlij_inner i WHERE i.k = o.k)", optimizer.JoinTypeAnti},
+		// semi/anti rows were deleted with the legacy pipeline (M0145-0008):
+		// the fused semi/anti NLI family was legacy-only — the jointree
+		// pipeline decomposes a pulled-up EXISTS into a lateral Join, which
+		// is not partial-capable (M0145-0030; partial decomposed semi/anti
+		// is ledgered).
 		// The `AND o.id > 0` keeps the planner off the LEFT->RIGHT
 		// commutation; without it this plans as a hash join and the fixture
 		// would silently stop exercising the fused family.
 		{"left", "SELECT o.id FROM nlij_outer o LEFT JOIN nlij_inner i ON i.k = o.k AND o.id > 0", optimizer.JoinTypeLeft},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if tc.want != optimizer.JoinTypeLeft {
-				// The fused semi/anti NLI family is legacy-only: the jointree
-				// pipeline decomposes the pulled-up EXISTS into a lateral Join,
-				// which is not partial-capable (M0145-0030; partial decomposed
-				// semi/anti is ledgered). Pinned to the legacy pipeline until
-				// the legacy-deletion slice removes the family (owner decision
-				// 2026-09-24, M0145-0008).
-				defer optimizer.SetJointreePipeline("0")()
-			}
 			serialRows, err := runQueryWithErr(ctx, tc.sql)
 			if err != nil {
 				t.Fatalf("serial: %v", err)

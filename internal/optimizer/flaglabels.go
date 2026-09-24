@@ -178,11 +178,6 @@ var flagResolvedState = map[string]func(string) string{
 	"GOOPG_INCREMENTAL_SORT": func(v string) string {
 		return incrementalSortModeLabel(incrementalSortModeFromEnv(v))
 	},
-	// M0145-0002 (AGENT.md §"Plan-parity harness" G8): selects the
-	// jointree-first pipeline at planSelectWithSettings. Default `off` —
-	// the legacy pipeline stays the value-gated arm through the whole
-	// transition; the knob is retired by M0145-0008's cutover.
-	"GOOPG_JOINTREE_PIPELINE": func(v string) string { return onOff(jointreePipelineFromEnv(v)) },
 	// M0145-0011 scope (c) (jointreepullup.go): admits a `*CTEScan` leaf into
 	// the pulled body's flat splice. Default OFF, and plan-SHAPING, so it is
 	// registered here rather than exempted. (It joined paired with
@@ -286,10 +281,9 @@ var flagProvenanceOrder = []string{
 	// `initialRelRows` (joinsearch.go). Default `on`; `off` is the knob-arm
 	// A/B that answers whether the arm can be retired.
 	"GOOPG_CTE_ROWS_FALLBACK",
-	// Joined at M0145-0002: selects the jointree-first pipeline
-	// (AGENT.md §"Plan-parity harness" G8). Default `off`; a knob-arm
-	// capture that does not name the flag cannot say which pipeline it
-	// measured, and the stamp is what keeps the dual-pipeline A/B honest.
+	// Joined at M0145-0002: selected the jointree-first pipeline (AGENT.md
+	// §"Plan-parity harness" G8). Retired at M0145-0008 — see
+	// flagProvenanceRetired below.
 	"GOOPG_JOINTREE_PIPELINE",
 }
 
@@ -339,6 +333,10 @@ var flagProvenanceRetired = map[string]string{
 	// existed to suppress, and the owner-authorised re-verification showed no
 	// non-degenerate NL election remained — so nothing reads the variable.
 	"GOOPG_DERIVED_FIREWALL": "M0145-0018",
+	// The M0145-0002 dual-pipeline knob. M0145-0008 flipped its default to
+	// the jointree pipeline, and its legacy-deletion slice 2 deleted the
+	// legacy pipeline the `=0` value selected, so nothing reads the variable.
+	"GOOPG_JOINTREE_PIPELINE": "M0145-0008",
 }
 
 // FlagProvenanceTable is the authoritative list of planner env flags that a

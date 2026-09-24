@@ -242,8 +242,6 @@ func TestCreateGroupingPathsGucOnPkFdStaysHash(t *testing.T) {
 // out-bid the hash; priced from the search rel's own index path, hashed
 // wins, as PG 18.3 elects HashAggregate over Seq Scan on this shape.
 func TestIndexOrderedGroupingPricedFromSearchRelJointree(t *testing.T) {
-	defer func(v bool) { jointreePipeline = v }(jointreePipeline)
-	jointreePipeline = true
 	cat, _, _ := btgIndexOrderCatalog(t)
 	stmt := parseOne(t, "select count(*) from btg group by y, x")
 	node, err := PlanWithSettings(stmt, cat, hashAggSettings(true))

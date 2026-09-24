@@ -325,7 +325,6 @@ func TestSearchConsumesAsksTheProducer(t *testing.T) {
 // correctness reason rather than a tuning one (see the file header of
 // joinsearchseam.go).
 func TestPGShapedSeamDeclines(t *testing.T) {
-	pinLegacyPipeline(t)
 	withPGShapedDP(t)
 	names := []string{"a", "b", "c"}
 
@@ -383,12 +382,9 @@ func TestPGShapedSeamDeclines(t *testing.T) {
 		}
 	})
 
-	t.Run("single relation", func(t *testing.T) {
-		node, ctx := seamFixture([]string{"a"}, []int64{100})
-		if _, _, used := tryPGShapedJoinSearch(node, seamLocal([]string{"a"}, 0), ctx, nil); used {
-			t.Fatal("the seam ran a search for one relation")
-		}
-	})
+	// "single relation" was a legacy-arm decline (floor 2); the floor is 1
+	// since the M0145-0008 legacy deletion — TestJointreeSearchesOneRelation*
+	// pin the admission.
 }
 
 // TestSearchedTreeIsOpaqueToTheLegacyRewrites is 08 §3's coexistence rule for

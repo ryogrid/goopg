@@ -14,9 +14,6 @@ import (
 // (assignPulledSourceOffsets), as the legacy unnest does with
 // remapSourceTableIdx. M0145-0030.
 func TestPulledExistsBodyGetsItsOwnSourceTableIdx(t *testing.T) {
-	prev := jointreePipeline
-	jointreePipeline = true
-	t.Cleanup(func() { jointreePipeline = prev })
 
 	c := catalog.NewInMemory()
 	if _, err := c.CreateTable(parser.ObjectName{Name: "t"}, []catalog.Column{

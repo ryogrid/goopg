@@ -611,40 +611,6 @@ func equalStrings(a, b []string) bool {
 	return true
 }
 
-// TestSubqueryUnnestKillSwitch pins the S1 rollback path: with the pass
-// disabled the planner must leave sublinks alone, and re-enabling must restore
-// the decorrelated shape. Uses an index-free fixture, where the pull-up does
-// fire at HEAD (with an index on the inner correlation column the correlation is
-// absorbed into IndexScan.Key and the collectors miss it — the D3.0 gap).
-// The switch belongs to the legacy post-hoc unnest pass; the jointree
-// pull-up does not consult it (PG has no such switch), so the test is pinned
-// to the legacy pipeline until the legacy-deletion slice removes both
-// (owner decision 2026-09-24, M0145-0008).
-func TestSubqueryUnnestKillSwitch(t *testing.T) {
-	defer optimizer.SetJointreePipeline("0")()
-	ctx, cleanup := newSemanticsFixture(t)
-	defer cleanup()
-
-	const sql = "SELECT a FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.a = t1.a) ORDER BY a"
-
-	optimizer.SetSubqueryUnnestEnabled(true)
-	defer optimizer.SetSubqueryUnnestEnabled(true)
-	on := explainText(t, ctx, sql)
-
-	optimizer.SetSubqueryUnnestEnabled(false)
-	off := explainText(t, ctx, sql)
-
-	if !strings.Contains(off, "SubPlan 1") {
-		t.Errorf("with unnesting disabled the sublink must survive as a SubPlan; plan:\n%s", off)
-	}
-	if strings.Contains(on, "SubPlan 1") && !strings.Contains(off, "SubPlan 1") {
-		t.Errorf("kill switch inverted")
-	}
-	if on == off {
-		t.Errorf("kill switch had no effect on the plan:\n%s", on)
-	}
-}
-
 // explainText renders EXPLAIN output for sql as a single string.
 func explainText(t *testing.T, ctx *Context, sql string) string {
 	t.Helper()

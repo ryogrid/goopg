@@ -391,28 +391,20 @@ func deconstructJointreeScopedSJI(from []parser.FromExpr, lim collapseLimits, sc
 	// is also the order pullUpSublinksIntoJointree's own deferred band
 	// then continues. `newSjiScope` derives the same indices for name
 	// resolution — all three sites read the same helpers.
-	var nextDeferred *int
-	var emitCounts []int
-	if jointreePipeline {
-		emitTotal := 0
-		emitCounts = make([]int, len(from))
-		for i := range from {
-			emitCounts[i] = jointreeItemEmittingRels(from[i])
-			emitTotal += emitCounts[i]
-		}
-		d := emitTotal
-		nextDeferred = &d
+	emitTotal := 0
+	emitCounts := make([]int, len(from))
+	for i := range from {
+		emitCounts[i] = jointreeItemEmittingRels(from[i])
+		emitTotal += emitCounts[i]
 	}
+	d := emitTotal
+	nextDeferred := &d
 	var deferred joinlist
 	for i := range from {
 		sub, made, def := deconstructFromItemScoped(from[i], nextRel, lim, sc, i, lower, nextDeferred)
 		lower = append(lower, made...)
 		deferred = append(deferred, def...)
-		if jointreePipeline {
-			nextRel += emitCounts[i]
-		} else {
-			nextRel += fromItemRels(from[i])
-		}
+		nextRel += emitCounts[i]
 		// PG's sub_members count includes the semijoin RHS leaves (they are
 		// members of the item's joinlist upstream), so the collapse-limit
 		// comparison adds them even though the items land at the tail.

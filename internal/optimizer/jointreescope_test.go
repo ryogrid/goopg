@@ -112,8 +112,6 @@ func sameTuple(t *testing.T, wScans []Node, wWidths []int, wOn []chainOnQual, wO
 func TestScopeExtractionMatchesWalk(t *testing.T) {
 	// The scope extraction only runs on the jointree arm — set the knob
 	// so the joinlist/scope numbering below is the one the seam consumes.
-	defer func(v bool) { jointreePipeline = v }(jointreePipeline)
-	jointreePipeline = true
 	cat := scopeTestCatalog(t)
 	for _, q := range []string{
 		"SELECT * FROM a",
@@ -171,8 +169,6 @@ func TestScopeExtractionMatchesWalk(t *testing.T) {
 // whereas the node-walk extraction still produces the synthetic
 // representation, so the two tuples legitimately differ here.
 func TestScopeExtractionSemiAntiDeferred(t *testing.T) {
-	defer func(v bool) { jointreePipeline = v }(jointreePipeline)
-	jointreePipeline = true
 	cat := scopeTestCatalog(t)
 	// `a ANTI b JOIN c`: the WHERE conjunct demotes the LEFT link —
 	// emitting leaves are a, c; b is the deferred leaf at index 2.

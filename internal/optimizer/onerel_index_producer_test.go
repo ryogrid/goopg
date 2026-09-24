@@ -64,13 +64,12 @@ func TestOneRelIndexProducerKeepsCorrelatedScalarProbe(t *testing.T) {
 		jointree bool
 		oneRel   bool
 	}{
-		{"bypass-route", false, false},
+		// The rule-based bypass route was deleted with the legacy
+		// pipeline (M0145-0008); GOOPG_ONEREL_SEARCH still toggles.
 		{"jointree-route", true, false},
-		{"onerel-search-route", false, true},
+		{"onerel-search-route", true, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			defer func(j bool) { jointreePipeline = j }(jointreePipeline)
-			jointreePipeline = tc.jointree
 			defer func(o bool) { oneRelSearch = o }(oneRelSearch)
 			oneRelSearch = tc.oneRel
 
@@ -138,13 +137,12 @@ func TestOneRelIndexProducerKeepsMultiConjunctCorrelatedProbe(t *testing.T) {
 		jointree bool
 		oneRel   bool
 	}{
-		{"bypass-route", false, false},
+		// The rule-based bypass route was deleted with the legacy
+		// pipeline (M0145-0008); GOOPG_ONEREL_SEARCH still toggles.
 		{"jointree-route", true, false},
-		{"onerel-search-route", false, true},
+		{"onerel-search-route", true, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			defer func(j bool) { jointreePipeline = j }(jointreePipeline)
-			jointreePipeline = tc.jointree
 			defer func(o bool) { oneRelSearch = o }(oneRelSearch)
 			oneRelSearch = tc.oneRel
 

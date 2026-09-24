@@ -136,3 +136,6 @@ list, and the knob. The fire-set gate's HEAD-vs-staged redesign landed FIRST
 (slice 1, `m0145-0008-del1-fireset-head-vs-staged.md`), because deleting the
 knob under the old legacy-vs-jointree design would have made the gate derive
 zero fires on every run.
+Slice 2 (`m0145-0008-del2-legacy-pipeline-deleted.md`) deleted the legacy
+pipeline and retired the knob; no plan moved. The dead code it left, the
+retired seam guards and the knob's script remnants remain.

@@ -81,22 +81,12 @@ func TestNotNullReductionIsArmIndependent(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			var shapes [2]string
-			for i, jt := range []bool{false, true} {
-				prev := jointreePipeline
-				jointreePipeline = jt
-				n, err := PlanWithSettings(parseOne(t, c.sql), cat, DefaultPlannerSettings())
-				jointreePipeline = prev
-				if err != nil {
-					t.Fatalf("jointree=%v: %v", jt, err)
-				}
-				shapes[i] = planShapeSpine(t, n)
+			n, err := PlanWithSettings(parseOne(t, c.sql), cat, DefaultPlannerSettings())
+			if err != nil {
+				t.Fatal(err)
 			}
-			if shapes[0] != shapes[1] {
-				t.Fatalf("arms disagree:\n  default  = %s\n  jointree = %s", shapes[0], shapes[1])
-			}
-			if shapes[0] != c.want {
-				t.Fatalf("shape = %s, want %s", shapes[0], c.want)
+			if got := planShapeSpine(t, n); got != c.want {
+				t.Fatalf("shape = %s, want %s", got, c.want)
 			}
 		})
 	}

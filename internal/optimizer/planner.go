@@ -1171,35 +1171,15 @@ func setOpBindsTighter(inner, outer parser.SetOpType) bool {
 	return inner == parser.SetOpIntersect && outer != parser.SetOpIntersect
 }
 
-// planSelectWithSettings is the M0145-0002 dual-pipeline dispatch point
-// (AGENT.md §"Plan-parity harness" G8): the jointree-first pipeline is the
-// default since M0145-0008's cutover, and GOOPG_JOINTREE_PIPELINE=0 selects
-// the legacy one. The knob is the only pipeline-selection mechanism and goes
-// with the legacy pipeline in the legacy-deletion slices. Every planning scope re-enters here — subqueries, CTE bodies,
-// set-op branches — matching the way PG's subquery_planner recurses per
-// Query.
+// planSelectWithSettings plans one SELECT scope through the jointree-first
+// pipeline (M0145): WHERE sublinks pulled up into the jointree before the
+// join-order search, one search problem per scope, the post-hoc unnest for
+// what the pull-up declined. Every planning scope re-enters here —
+// subqueries, CTE bodies, set-op branches — matching the way PG's
+// subquery_planner recurses per Query. The legacy node-tree pipeline and
+// its GOOPG_JOINTREE_PIPELINE selection knob were deleted by M0145-0008's
+// legacy-deletion slices.
 func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSet PlannerSettings, scope *rtableScope) (Node, error) {
-	if jointreePipeline {
-		return planSelectJointreePipeline(s, cat, plannerSet, scope)
-	}
-	return planSelectLegacyPipeline(s, cat, plannerSet, scope)
-}
-
-// planSelectLegacyPipeline is the pre-M0145 node-tree pipeline, kept whole
-// behind the dispatch above until M0145-0008 deletes it. The name dates
-// from M0145-0002; the body is the former planSelectWithSettings verbatim.
-func planSelectLegacyPipeline(s *parser.SelectStmt, cat catalog.Catalog, plannerSet PlannerSettings, scope *rtableScope) (Node, error) {
-	return planSelectImpl(s, cat, plannerSet, scope, false)
-}
-
-// planSelectImpl is the shared statement body both pipeline arms run.
-// `jointree` selects the M0145 divergence points: today that is the
-// WHERE-arm sublink pull-up (M0145-0003, jointreepullup.go) alone;
-// each later milestone adds its own guarded site. Everything else is
-// identical between the arms, which is what keeps the transition
-// reviewable — the retirement path is `jointree` becoming constant
-// true site by site (M0145-0008).
-func planSelectImpl(s *parser.SelectStmt, cat catalog.Catalog, plannerSet PlannerSettings, scope *rtableScope, jointree bool) (Node, error) {
 	// M0103-0008: indirection-star rewrite runs at Plan() entry
 	// before the analyzer; nested-SELECT planning paths (subqueries,
 	// UNION branches) reach planSelectWithSettings directly without
@@ -1588,20 +1568,14 @@ func planSelectImpl(s *parser.SelectStmt, cat catalog.Catalog, plannerSet Planne
 	appendrelMember := plannerSet.appendrelMember
 	plannerSet.appendrelMember = false
 
-	// M0145-0005 slice 4 (m0145-0005 design doc §"Slice 4"): on the
-	// jointree arm the one-relation scope is a searched problem like any
-	// other — `make_one_rel` runs `set_base_rel_pathlists`
-	// (allpaths.c:221) unconditionally before looking at the joinlist, so
-	// a single-FROM-item statement routes through planFromClause and the
-	// join search rather than the rule-based bypass below. The legacy arm
-	// keeps the bypass byte for byte; `jointree` is the arm flag.
+	// M0145-0005 slice 4 (m0145-0005 design doc §"Slice 4"): the
+	// one-relation scope is a searched problem like any other —
+	// `make_one_rel` runs `set_base_rel_pathlists` (allpaths.c:221)
+	// unconditionally before looking at the joinlist, so a single-FROM-item
+	// statement routes through planFromClause and the join search. (The
+	// legacy rule-based single-table bypass was deleted in M0145-0008.)
 	var node Node
 	var ctx *resolveContext
-	// fromOnly tracks whether the single-table FROM clause used `FROM ONLY`
-	// (set below in the isSimpleSingle branch); planIndexScanFromWhere uses
-	// it to decide whether an IndexScan may safely skip accessible
-	// inheritance children (root-0026 SELECT-side twin, M0119-0004).
-	var fromOnly bool
 
 	if len(s.ValuesRows) > 0 && len(s.From) == 0 && len(s.Targets) == 0 {
 		// Standalone VALUES statement: VALUES (r1), (r2), ...
@@ -1619,37 +1593,6 @@ func planSelectImpl(s *parser.SelectStmt, cat catalog.Catalog, plannerSet Planne
 			Rows:   [][]Expr{{}},
 			schema: nil,
 		}
-	} else if isSimpleSingle && !oneRelSearchEnabled() && !appendrelMember && !jointree {
-		rv := s.From[0]
-		fromOnly = rv.Only
-		// Delegate the simple-single-table case to
-		// planScanRangeVar so view substitution / virtual-rows
-		// dispatch live in one place. SourceTableIdx 1 — only
-		// one binding ever in this branch (0 is the
-		// "unknown / derived" sentinel). The statement scope stamps
-		// the scan's RTID (A-01(ii) cut 1).
-		nrv, b, err := planScanRangeVar(rv, cat, 1, nil, plannerSet, scope)
-		if err != nil {
-			return nil, err
-		}
-		node = nrv
-		schema := tableSchemaWithSource(b.table, b.sourceIdx)
-		// View substitution may have rewritten the schema to
-		// merge the view's column names with the inner plan's
-		// types — preserve it.
-		if b.table.View != nil {
-			schema = make(Schema, len(b.table.Columns))
-			innerOut := node.Output()
-			for i, c := range b.table.Columns {
-				ty := c.Type
-				if i < len(innerOut) {
-					ty = innerOut[i].Type
-				}
-				schema[i] = SchemaColumn{Name: c.Name, Type: ty, SourceTableIdx: b.sourceIdx}
-			}
-		}
-		ctx = newResolveContext([]rangeBinding{b}, schema, plannerSet)
-		ctx.upper = upper
 	} else {
 		// Cost-based join-order reordering: when every comma-FROM
 		// take2 P3-12: the pre-search greedy FROM-list permutation
@@ -1720,10 +1663,6 @@ func planSelectImpl(s *parser.SelectStmt, cat catalog.Catalog, plannerSet Planne
 		ctx.tupleFraction = searchTupleFraction(s.Limit, s.Offset)
 	}
 
-	// preDPUnnested marks that the S5a pre-DP path already ran the
-	// sublink pull-up, so the legacy post-pushdown call site must not
-	// run it a second time.
-	preDPUnnested := false
 	if s.Where != nil {
 		// Aggregate functions are not allowed in WHERE. M0097-0035.
 		// Exception: correlated outer-scope aggregates (all column refs reference
@@ -1759,345 +1698,214 @@ func planSelectImpl(s *parser.SelectStmt, cat catalog.Catalog, plannerSet Planne
 			whereClause = stripForcingNullQuals(s.Where, ctx.antiForcedNullCols, buildTableMap(s.FromExprs, cat), cat)
 		}
 		whereQual := canonicalizeQual(whereClause)
-		// E-21 Cut 1b: under GOOPG_ONEREL_SEARCH a single-table statement
-		// is planned by the search, not by the rule-based chooser below —
-		// replacing that chooser with `add_path` for every single-table
-		// statement is what closes the row. The generic arm builds
-		// Filter{scan} and runs the full machinery (unnest, tryJoinSearch,
-		// pathkeys derivation); the seam admits one-relation problems at
-		// `minSearchRels()` (Cut 1) and the one-relation protocol picks
-		// the access method on cost. What the rule chooser did that the
-		// generic arm does not (LIKE-range injection, NOT NULL reduction)
-		// is a missed optimisation in the ON arm, never a wrong answer:
-		// both are value-preserving rewrites. Default OFF: the condition
-		// below is the historical branch, byte for byte.
-		// M0145-0005 slice 4: `!jointree` lifts the same chooser on the
-		// jointree arm — every single-table+WHERE scope plans through the
-		// generic arm (Filter → pull-up → tryJoinSearch) so its base rel
-		// carries a real pathlist, and a flat EXISTS/NOT EXISTS over one
-		// table now reaches `pullUpSublinksIntoJointree` instead of the
-		// post-hoc unnest below.
-		if isSimpleSingle && !oneRelSearchEnabled() && !appendrelMember && !jointree {
-			// M0051-0004: inject synthetic range predicates alongside any
-			// LIKE conjuncts so tryRangeIndexScan can activate a B-tree.
-			whereForIndex := injectLikeRangePredicates(whereQual)
-			if idxNode, ok, err := planIndexScanFromWhere(whereForIndex, ctx, cat, !fromOnly); err != nil {
+		// R40/K69: whereQual can be nil here when a demotedForPlan
+		// ANTI transplant's forcing conjunct was the ENTIRE WHERE
+		// clause (stripForcingNullQuals above) — mirror the
+		// single-relation arm's `rewritten == nil` convention
+		// (restriction_is_always_true) rather than calling resolveExpr
+		// on a nil Expr, which its own type switch does not special-
+		// case and would reach a default/error arm.
+		var pred Expr
+		if whereQual != nil {
+			var err error
+			pred, err = resolveExpr(whereQual, ctx)
+			if err != nil {
 				return nil, err
-			} else if ok {
-				node = idxNode
-			} else {
-				pred, err := resolveExpr(whereQual, ctx)
-				if err != nil {
-					return nil, err
-				}
-				// R44/K83 step A: fold before the estimator, where PG's
-				// preprocess_expression runs eval_const_expressions. An
-				// unfolded constant sub-expression fails `isConstExpr` and
-				// the clause is estimated at selectivity 1.0.
-				if pred, err = foldQualConstants(pred); err != nil {
-					return nil, err
-				}
-				// M0134-0010 §4: NOT NULL-driven reduction of IS [NOT] NULL
-				// restriction quals (initsplan.c add_base_clause_to_rel /
-				// restriction_is_always_true / restriction_is_always_false),
-				// single-baserel only — this branch IS that gate. See
-				// docs/design/m0134-0010-notnull-qual-reduction.md and
-				// notnull_qual_reduce.go.
-				var reduceTbl *catalog.Table
-				var reduceSrcIdx int
-				if len(ctx.bindings) == 1 {
-					reduceTbl = ctx.bindings[0].table
-					reduceSrcIdx = int(ctx.bindings[0].sourceIdx)
-				}
-				rewritten, alwaysFalse := reduceNotNullQuals(pred, reduceTbl, reduceSrcIdx)
+			}
+			// R44/K83 step A: see the sibling call in the single-relation
+			// arm above.
+			if pred, err = foldQualConstants(pred); err != nil {
+				return nil, err
+			}
+			// M0145-0005: the NOT NULL-driven reduction PG applies to
+			// every single-baserel restriction clause
+			// (`restriction_is_always_true` / `restriction_is_always_false`,
+			// initsplan.c's `add_base_clause_to_rel`). Slice 4 routed
+			// single-table+WHERE scopes through THIS arm, so the reduction
+			// lives here: without it `WHERE not_null_col IS NULL` plans as
+			// a real scan under a Filter instead of PG's childless
+			// `Result / One-Time Filter: false`. Single-binding scopes
+			// only; widening it to multi-relation scopes is a separate,
+			// corpus-visible change — ledgered, not smuggled in.
+			reduced := false
+			if len(ctx.bindings) == 1 {
+				rewritten, alwaysFalse := reduceNotNullQuals(pred,
+					ctx.bindings[0].table, int(ctx.bindings[0].sourceIdx))
 				switch {
 				case alwaysFalse:
-					// restriction_is_always_false: replace the scan with a
-					// CHILDLESS Result{OneTimeFilter: false} — PG's plan is
-					// `Result / One-Time Filter: false` with NO scan
-					// underneath at all (predicate.out lines 34-40/75-81: 2
-					// rows total, no `->` line). The now-unreachable scan
-					// must not be attached as Child (round 2: it was
-					// wrongly kept, producing a dangling `-> Seq Scan` line
-					// PG never emits). resultOp.Open evaluates OneTimeFilter
-					// against a nil slot and short-circuits to EOF BEFORE
-					// ever touching Child (operators.go Open/Next/Close all
-					// gate on qualFailed first) — the same childless shape
-					// already used by the S6 min/max top-node Result, so a
-					// nil Child here is a pre-existing, exercised path, not
-					// a new one. Targets stay a pass-through identity
-					// projection so Output()/row description still reports
-					// the scan's original column shape for `SELECT *`; they
-					// are never evaluated at runtime since qualFailed always
-					// short-circuits first.
+					// The childless Result the chooser arm builds, for
+					// the reason stated there: PG emits no scan under a
+					// false One-Time Filter.
 					scanSchema := node.Output()
 					node = &Result{pos: s.Where.Pos(), Targets: identityResultTargets(scanSchema),
 						OneTimeFilter: &BooleanConst{pos: s.Where.Pos(), Value: false},
 						Child:         nil, schema: scanSchema}
+					reduced = true
 				case rewritten == nil:
-					// restriction_is_always_true for every conjunct: bare
-					// scan, no Filter node at all.
+					// Every conjunct was always-true: the bare scan, no
+					// Filter node at all.
+					reduced = true
 				default:
-					node = &Filter{pos: s.Where.Pos(), Child: node, Predicate: rewritten}
+					pred = rewritten
 				}
 			}
-		} else {
-			// R40/K69: whereQual can be nil here when a demotedForPlan
-			// ANTI transplant's forcing conjunct was the ENTIRE WHERE
-			// clause (stripForcingNullQuals above) — mirror the
-			// single-relation arm's `rewritten == nil` convention
-			// (restriction_is_always_true) rather than calling resolveExpr
-			// on a nil Expr, which its own type switch does not special-
-			// case and would reach a default/error arm.
-			var pred Expr
-			if whereQual != nil {
-				var err error
-				pred, err = resolveExpr(whereQual, ctx)
-				if err != nil {
-					return nil, err
-				}
-				// R44/K83 step A: see the sibling call in the single-relation
-				// arm above.
-				if pred, err = foldQualConstants(pred); err != nil {
-					return nil, err
-				}
-				// M0145-0005: the NOT NULL-driven reduction PG applies to
-				// every single-baserel restriction clause
-				// (`restriction_is_always_true` / `restriction_is_always_false`,
-				// initsplan.c's `add_base_clause_to_rel`). Slice 4 routed the
-				// jointree arm's single-table+WHERE scopes through THIS arm
-				// and the reduction stayed behind in the rule chooser, so the
-				// knob arm planned `WHERE not_null_col IS NULL` as a real scan
-				// under a Filter where the default arm already emits PG's
-				// childless `Result / One-Time Filter: false`. That gap is
-				// harmless while the knob is off and a regression the moment
-				// M0145-0008 flips it, which is why it is closed here rather
-				// than at the cutover.
-				//
-				// Knob-gated: on the default arm this arm is reached by
-				// MULTI-relation scopes (the chooser above owns the
-				// single-table ones), and a single-binding scope only lands
-				// here under `GOOPG_ONEREL_SEARCH`. Widening it there is a
-				// separate, corpus-visible change — ledgered, not smuggled in.
-				reduced := false
-				if jointree && len(ctx.bindings) == 1 {
-					rewritten, alwaysFalse := reduceNotNullQuals(pred,
-						ctx.bindings[0].table, int(ctx.bindings[0].sourceIdx))
-					switch {
-					case alwaysFalse:
-						// The childless Result the chooser arm builds, for
-						// the reason stated there: PG emits no scan under a
-						// false One-Time Filter.
-						scanSchema := node.Output()
-						node = &Result{pos: s.Where.Pos(), Targets: identityResultTargets(scanSchema),
-							OneTimeFilter: &BooleanConst{pos: s.Where.Pos(), Value: false},
-							Child:         nil, schema: scanSchema}
-						reduced = true
-					case rewritten == nil:
-						// Every conjunct was always-true: the bare scan, no
-						// Filter node at all.
-						reduced = true
-					default:
-						pred = rewritten
-					}
-				}
-				if reduced {
-					// Downstream reads `whereQual != nil` as "there is a
-					// Filter to search under" — the pre-DP arm asserts
-					// `node.(*Filter)` on that basis. A reduced scope has no
-					// Filter and nothing left to search, so the clause is
-					// spent here.
-					whereQual = nil
-				} else {
-					node = &Filter{pos: s.Where.Pos(), Child: node, Predicate: pred}
-				}
-			}
-			// M0127-P5.9-b's `root->tuple_fraction` assignment lived HERE,
-			// inside the WHERE arm, until C-17 (P4-08) moved it to the
-			// convergent stamping block above — same call, same value, but
-			// reached by every FROM arm rather than only the two that run the
-			// join search. See the comment there.
-			// C-07: `standard_qp_callback` runs here for the same reason
-			// `preprocess_limit` does — before `query_planner` builds a rel.
-			ctx.queryPathkeys = deriveQueryPathkeys(s, ctx)
-			ctx.neededCols, ctx.neededColsKnown = neededColumnNames(s)
-			ctx.outputCols, ctx.outputColsKnown = outputColumnNames(s)
-			// R40/K69: `whereQual != nil` guards the unchecked `node.(*Filter)`
-			// assertion below — a fully-stripped WHERE (stripForcingNullQuals
-			// elided the entire clause) leaves `node` as the bare join tree,
-			// never a Filter, and `whereEligibleForPreDPUnnest(nil)` is
-			// vacuously true (its walk never visits anything), so without
-			// this guard that assertion would panic. Before R40 this could
-			// not happen: `whereQual` was only nil when `s.Where` itself was,
-			// and this whole block is already gated on `s.Where != nil`.
-			//
-			// M0145-0003: on the jointree pipeline the WHERE-clause sublinks
-			// are pulled up HERE — PG's pull_up_sublinks position, before
-			// join-order search — into leaf entries + SpecialJoinInfo on
-			// ctx.jtPullup, which tryJoinSearch folds into the one search
-			// problem (jointreepullup.go). The predicate itself is NOT
-			// rewritten: a pulled sublink keeps its planned body, so a
-			// declined search falls back to the exact legacy shape below.
-			// When the pull-up engaged, the S5a pre-DP arm is skipped —
-			// its pinned-spine route is the legacy answer to the same
-			// problem this replaces.
-			if jointree {
-				if f, okf := node.(*Filter); okf {
-					ctx.jtPullup = pullUpSublinksIntoJointree(f.Predicate, ctx, cat, plannerSet)
-					if ctx.jtPullup != nil {
-						// M0145-0007 slice 3 census (nlicensus.go).
-						noteSublinkRoute(spineRouteJointree)
-					} else if countSublinksInExpr(f.Predicate) > 0 {
-						// M0145-0005 slice 7: pull-up declined every
-						// sublink-bearing conjunct, so the statement falls
-						// through to the single-pass search and the
-						// post-hoc unnest builds the pinned spine above
-						// it — the S5a arm below is legacy-only now.
-						noteSublinkRoute(spineRoutePosthoc)
-					}
-				}
-			}
-			if unnestPreDPEnabled() && !jointree && ctx.jtPullup == nil && whereQual != nil && whereEligibleForPreDPUnnest(pred) {
-				// S5a (D3.1): pull up sublinks BEFORE join-order
-				// search — matching upstream's pull_up_sublinks-
-				// before-join-planning order — then run the join
-				// search on the subtree below the pinned semi/anti
-				// spine. Engaged only for EXISTS/IN-family WHERE
-				// sublinks; see predp.go for the scope rationale
-				// and the post-search spine re-resolution.
-				//
-				// M0145-0005 slice 7: `!jointree` retires this arm on
-				// the jointree pipeline — one DP problem per jointree
-				// scope means no "search below a pinned spine, then
-				// again above it". A declined pull-up takes the Filter
-				// arm instead and `unnestSubqueriesInPlan` pins the
-				// spine AFTER the search (sf025 corpus: 99/99 plan
-				// shapes identical to the retired route).
-				f := node.(*Filter)
-				origChain := f.Child
-				// M0145-0007 slice 3 census (nlicensus.go): this is the
-				// legacy pinned-spine route, the only live caller of the
-				// splice/re-resolution family.
-				noteSublinkRoute(spineRouteLegacy)
-				node = unnestSubqueriesInPlan(node)
-				node = runJoinSearchBelowPinned(node, origChain, ctx, cat)
-				preDPUnnested = true
-			} else if f, ok := node.(*Filter); ok {
-				// Legacy order (GOOPG_UNNEST_PREDP=off, or a scalar-
-				// family sublink in the WHERE): run the join-order
-				// search over the left-deep CROSS chain. Until
-				// M0127-P6.3 this door led to the subset-bitmask bushy
-				// DP (bushy.go, deleted); it now leads to the PG-shaped
-				// search alone. See internal/planner/joinsearchseam.go.
-				if newChild, newPred := tryJoinSearch(f.Child, f.Predicate, ctx, cat); newPred == nil {
-					node = newChild // all conjuncts consumed → remove Filter
-				} else if newChild != f.Child {
-					f.Child = newChild
-					f.Predicate = newPred
-					node = pushPredicatesIntoCrossJoins(node)
-				} else {
-					// Comma-FROM produces a left-deep CROSS-join chain.
-					// Push WHERE-side equalities into the deepest Join
-					// whose schema spans both sides so the planner can
-					// pick hash join instead of running a Cartesian
-					// product through Filter. See
-					// internal/planner/pushdown.go.
-					node = pushPredicatesIntoCrossJoins(node)
-				}
-			} else if whereQual == nil {
-				// R40/K69: the WHERE clause existed (`s.Where != nil`) but
-				// was entirely the forcing IS NULL conjunct(s)
-				// `stripForcingNullQuals` elided — `node` is the bare join
-				// tree, not a `*Filter`, so neither arm above runs. The
-				// join-order search must still run so an ANTI-demoted item
-				// gets a cost-based join order rather than the untouched
-				// left-deep CROSS chain (K27's eligibility axis) — mirrors
-				// the WHERE-less `joinTreeHasOuterLink` arm below exactly
-				// (nil predicate, same `tryJoinSearch` call).
-				if newChild, newPred := tryJoinSearch(node, nil, ctx, cat); newPred == nil {
-					node = newChild
-				} else if newChild != node {
-					node = &Filter{pos: node.Pos(), Child: newChild, Predicate: newPred}
-				}
-			}
-			// Push outer-only quals below a LATERAL join onto its outer
-			// child so a side-effecting lateral RHS (e.g. verify_heapam)
-			// is only opened for outer rows that pass the restriction.
-			// See pushOuterQualsIntoLaterals in pushdown.go.
-			node = pushOuterQualsIntoLaterals(node)
-
-			// M0145-0008: restore the one-relation index producer on the
-			// routes that SKIP the rule-based bypass above.
-			//
-			// The bypass at the top of this chain is the ONLY producer of
-			// an index path driven by a correlated (outer-reference)
-			// restriction. `jointree` and `GOOPG_ONEREL_SEARCH` both route
-			// a single-relation scope through this generic arm instead —
-			// PG-faithfully, since `make_one_rel` runs
-			// `set_base_rel_pathlists` unconditionally — but the search's
-			// base-rel pathlist has no such producer, so the scope comes
-			// out as a bare `Filter{SeqScan}`.
-			//
-			// Measured 2026-09-21 on TPC-H Q17's correlated scalar body
-			// (`SELECT 0.2 * avg(l_quantity) FROM lineitem WHERE
-			// l_partkey = p_partkey`): the body was BORN `Filter(SeqScan)`
-			// on both of those routes and `Aggregate(BitmapHeapScan(
-			// BitmapIndexScan))` on the bypass. That is not a cosmetic
-			// difference — `canUnnestSubquery`'s S6/D6.2 guard
-			// (`innerPlanIsIndexProbeCheap`) reads the body's SHAPE to
-			// decide whether decorrelating it is a loss, so a body that
-			// never got its probe reads as "not cheap" and is decorrelated
-			// into a whole-table GROUP BY. Q17 went 1021 ms -> 11155 ms
-			// (jointree) and 1021 ms -> 10625 ms (GOOPG_ONEREL_SEARCH=on
-			// on the DEFAULT arm — the defect is route-borne, not
-			// arm-borne).
-			//
-			// The rule is strictly NARROWER than the bypass it restores:
-			// it fires only when the search elected NO index path at all,
-			// so it can never displace a costed index choice — it only
-			// fills the hole where this route produces none.
-			if isSimpleSingle && (jointree || oneRelSearchEnabled()) &&
-				whereQual != nil && planIsBareSeqScanTree(node) {
-				onlyFrom := len(s.From) == 1 && s.From[0].Only
-				whereForIndex := injectLikeRangePredicates(whereQual)
-				if idxNode, ok, err := planIndexScanFromWhere(whereForIndex, ctx, cat, !onlyFrom); err != nil {
-					return nil, err
-				} else if ok {
-					node = idxNode
-				} else if flat, ok := flattenStrandedSeqScanFilters(node); ok {
-					// M0145-0027: the producer above only reads a WHERE that
-					// is ONE equality (Q17's body). A multi-conjunct WHERE
-					// (TPC-H Q20's `l_partkey = ps_partkey AND l_suppkey =
-					// ps_suppkey AND l_shipdate …`) is declined there on
-					// every route; the bypass arm gets its correlated probe
-					// from the SECOND producer instead —
-					// `rewriteScanInputsWithSingleTablePredicates` below,
-					// which absorbs the equality out of `Filter{SeqScan}`.
-					// On this route that producer is shut out: the search
-					// took the constant quals into a SEARCHED leaf
-					// `Filter{SeqScan}` (a searched subtree keeps its own
-					// leaves, P5.9-b) and left the correlated conjuncts —
-					// which `conjunctIsLocalEligible` refuses as leaf quals —
-					// in a residual Filter above it. Flattening the two into
-					// the one unsearched `Filter{SeqScan}` the bypass would
-					// have built hands the tree to that producer unchanged.
-					// Same contract as the rule above: it fires only on a
-					// bare seq-scan tree (the search elected no index) and
-					// only when a correlated conjunct is stranded above it.
-					node = flat
-				}
+			if reduced {
+				// Downstream reads `whereQual != nil` as "there is a
+				// Filter to search under" — the pre-DP arm asserts
+				// `node.(*Filter)` on that basis. A reduced scope has no
+				// Filter and nothing left to search, so the clause is
+				// spent here.
+				whereQual = nil
+			} else {
+				node = &Filter{pos: s.Where.Pos(), Child: node, Predicate: pred}
 			}
 		}
-	} else if joinTreeHasOuterLink(node) || appendrelMember || jointree {
-		// M0145-0005 slice 4: `|| jointree` — on the jointree arm every
-		// filterless scope reaches the seam, not only outer-linked and
-		// member trees. A WHERE-less single-table statement (`SELECT …
-		// FROM t`) is the one-relation search the floor now admits, and a
-		// filterless inner join is searched whole — the "gated round" the
-		// comment below defers on the legacy arm is what the pipeline
-		// knob itself gates here. A declined seam still returns the tree
-		// untouched.
-		// M0145-0004: `|| appendrelMember` — a UNION ALL appendrel's
+		// M0127-P5.9-b's `root->tuple_fraction` assignment lived HERE,
+		// inside the WHERE arm, until C-17 (P4-08) moved it to the
+		// convergent stamping block above — same call, same value, but
+		// reached by every FROM arm rather than only the two that run the
+		// join search. See the comment there.
+		// C-07: `standard_qp_callback` runs here for the same reason
+		// `preprocess_limit` does — before `query_planner` builds a rel.
+		ctx.queryPathkeys = deriveQueryPathkeys(s, ctx)
+		ctx.neededCols, ctx.neededColsKnown = neededColumnNames(s)
+		ctx.outputCols, ctx.outputColsKnown = outputColumnNames(s)
+		// M0145-0003: the WHERE-clause sublinks are pulled up HERE —
+		// PG's pull_up_sublinks position, before join-order search —
+		// into leaf entries + SpecialJoinInfo on ctx.jtPullup, which
+		// tryJoinSearch folds into the one search problem
+		// (jointreepullup.go). The predicate itself is NOT rewritten: a
+		// pulled sublink keeps its planned body, so a declined search
+		// falls back to the syntactic shape, and the post-hoc unnest
+		// below pins the spine AFTER the search. (The legacy S5a pre-DP
+		// arm — search below a pinned spine, then again above it — was
+		// deleted with the legacy pipeline, M0145-0008.)
+		if f, okf := node.(*Filter); okf {
+			ctx.jtPullup = pullUpSublinksIntoJointree(f.Predicate, ctx, cat, plannerSet)
+			if ctx.jtPullup != nil {
+				// M0145-0007 slice 3 census (nlicensus.go).
+				noteSublinkRoute(spineRouteJointree)
+			} else if countSublinksInExpr(f.Predicate) > 0 {
+				// M0145-0005 slice 7: pull-up declined every
+				// sublink-bearing conjunct, so the statement falls
+				// through to the single-pass search and the
+				// post-hoc unnest builds the pinned spine above it.
+				noteSublinkRoute(spineRoutePosthoc)
+			}
+		}
+		// R40/K69: a fully-stripped WHERE (stripForcingNullQuals elided
+		// the entire clause) leaves `node` as the bare join tree, never
+		// a Filter — the `whereQual == nil` arm below.
+		if f, ok := node.(*Filter); ok {
+			// Run the join-order search over the left-deep CROSS
+			// chain. Until M0127-P6.3 this door led to the
+			// subset-bitmask bushy DP (bushy.go, deleted); it now
+			// leads to the PG-shaped search alone. See
+			// joinsearchseam.go.
+			if newChild, newPred := tryJoinSearch(f.Child, f.Predicate, ctx, cat); newPred == nil {
+				node = newChild // all conjuncts consumed → remove Filter
+			} else if newChild != f.Child {
+				f.Child = newChild
+				f.Predicate = newPred
+				node = pushPredicatesIntoCrossJoins(node)
+			} else {
+				// Comma-FROM produces a left-deep CROSS-join chain.
+				// Push WHERE-side equalities into the deepest Join
+				// whose schema spans both sides so the planner can
+				// pick hash join instead of running a Cartesian
+				// product through Filter. See
+				// internal/planner/pushdown.go.
+				node = pushPredicatesIntoCrossJoins(node)
+			}
+		} else if whereQual == nil {
+			// R40/K69: the WHERE clause existed (`s.Where != nil`) but
+			// was entirely the forcing IS NULL conjunct(s)
+			// `stripForcingNullQuals` elided — `node` is the bare join
+			// tree, not a `*Filter`, so neither arm above runs. The
+			// join-order search must still run so an ANTI-demoted item
+			// gets a cost-based join order rather than the untouched
+			// left-deep CROSS chain (K27's eligibility axis) — mirrors
+			// the WHERE-less `joinTreeHasOuterLink` arm below exactly
+			// (nil predicate, same `tryJoinSearch` call).
+			if newChild, newPred := tryJoinSearch(node, nil, ctx, cat); newPred == nil {
+				node = newChild
+			} else if newChild != node {
+				node = &Filter{pos: node.Pos(), Child: newChild, Predicate: newPred}
+			}
+		}
+		// Push outer-only quals below a LATERAL join onto its outer
+		// child so a side-effecting lateral RHS (e.g. verify_heapam)
+		// is only opened for outer rows that pass the restriction.
+		// See pushOuterQualsIntoLaterals in pushdown.go.
+		node = pushOuterQualsIntoLaterals(node)
+
+		// M0145-0008: restore the one-relation index producer on the
+		// routes that SKIP the rule-based bypass above.
+		//
+		// The legacy rule-based bypass (deleted with the legacy
+		// pipeline, M0145-0008) was the ONLY producer of an index path
+		// driven by a correlated (outer-reference) restriction. Every
+		// single-relation scope now plans through this generic arm —
+		// PG-faithfully, since `make_one_rel` runs
+		// `set_base_rel_pathlists` unconditionally — but the search's
+		// base-rel pathlist has no such producer, so the scope comes
+		// out as a bare `Filter{SeqScan}`.
+		//
+		// Measured 2026-09-21 on TPC-H Q17's correlated scalar body
+		// (`SELECT 0.2 * avg(l_quantity) FROM lineitem WHERE
+		// l_partkey = p_partkey`): the body was BORN `Filter(SeqScan)`
+		// on both of those routes and `Aggregate(BitmapHeapScan(
+		// BitmapIndexScan))` on the bypass. That is not a cosmetic
+		// difference — `canUnnestSubquery`'s S6/D6.2 guard
+		// (`innerPlanIsIndexProbeCheap`) reads the body's SHAPE to
+		// decide whether decorrelating it is a loss, so a body that
+		// never got its probe reads as "not cheap" and is decorrelated
+		// into a whole-table GROUP BY. Q17 went 1021 ms -> 11155 ms
+		// (jointree) and 1021 ms -> 10625 ms (GOOPG_ONEREL_SEARCH=on
+		// on the DEFAULT arm — the defect is route-borne, not
+		// arm-borne).
+		//
+		// The rule is strictly NARROWER than the bypass it restores:
+		// it fires only when the search elected NO index path at all,
+		// so it can never displace a costed index choice — it only
+		// fills the hole where this route produces none.
+		if isSimpleSingle && whereQual != nil && planIsBareSeqScanTree(node) {
+			onlyFrom := len(s.From) == 1 && s.From[0].Only
+			whereForIndex := injectLikeRangePredicates(whereQual)
+			if idxNode, ok, err := planIndexScanFromWhere(whereForIndex, ctx, cat, !onlyFrom); err != nil {
+				return nil, err
+			} else if ok {
+				node = idxNode
+			} else if flat, ok := flattenStrandedSeqScanFilters(node); ok {
+				// M0145-0027: the producer above only reads a WHERE that
+				// is ONE equality (Q17's body). A multi-conjunct WHERE
+				// (TPC-H Q20's `l_partkey = ps_partkey AND l_suppkey =
+				// ps_suppkey AND l_shipdate …`) is declined there on
+				// every route; the bypass arm gets its correlated probe
+				// from the SECOND producer instead —
+				// `rewriteScanInputsWithSingleTablePredicates` below,
+				// which absorbs the equality out of `Filter{SeqScan}`.
+				// On this route that producer is shut out: the search
+				// took the constant quals into a SEARCHED leaf
+				// `Filter{SeqScan}` (a searched subtree keeps its own
+				// leaves, P5.9-b) and left the correlated conjuncts —
+				// which `conjunctIsLocalEligible` refuses as leaf quals —
+				// in a residual Filter above it. Flattening the two into
+				// the one unsearched `Filter{SeqScan}` the bypass would
+				// have built hands the tree to that producer unchanged.
+				// Same contract as the rule above: it fires only on a
+				// bare seq-scan tree (the search elected no index) and
+				// only when a correlated conjunct is stranded above it.
+				node = flat
+			}
+		}
+	} else {
+		// M0145-0005 slice 4, unconditional since the M0145-0008 legacy
+		// deletion: every filterless scope reaches the seam. A WHERE-less
+		// single-table statement (`SELECT … FROM t`) is the one-relation
+		// search the floor admits, and a filterless inner join is searched
+		// whole. A declined seam still returns the tree untouched.
+		// M0145-0004: a UNION ALL appendrel's
 		// member scope plans through the join search even when the
 		// member has no WHERE and no outer link (a bare `SELECT … FROM t`
 		// member, the benchmark corpus's dominant shape). PG gives every
@@ -2114,11 +1922,6 @@ func planSelectImpl(s *parser.SelectStmt, cat catalog.Catalog, plannerSet Planne
 		// customer scan can only become PG's covering `Index Only Scan
 		// using customer_pk` through the search's base-rel path generation.
 		//
-		// Gated on an OUTER link being present: a filterless INNER/CROSS
-		// tree is left on the legacy path for now — the outer-spine shape is
-		// the one whose LEFT side has NO other route to cost-based access
-		// selection, while widening to every filterless join tree moves many
-		// long-stable plans at once and deserves its own gated round.
 		// The search is invoked with a nil predicate (an empty conjunct
 		// list); a declined search returns the tree untouched, and a residual
 		// can only arise from unconsumed ON quals, which the Filter below
@@ -2137,15 +1940,11 @@ func planSelectImpl(s *parser.SelectStmt, cat catalog.Catalog, plannerSet Planne
 		}
 	}
 
-	// Unnest correlated subqueries. With the S5a pre-DP position
-	// engaged the pull-up already ran before join search above; this
-	// legacy call site covers everything else (single-table paths,
-	// scalar-family statements, GOOPG_UNNEST_PREDP=off). Subqueries
-	// that are unnestable are rewritten to semi/anti joins or GROUP BY
-	// aggregate + hash join. See internal/planner/unnest.go.
-	if !preDPUnnested {
-		node = unnestSubqueriesInPlan(node)
-	}
+	// Unnest correlated subqueries the jointree pull-up did not take
+	// (declined sublinks, scalar-family sublinks): unnestable ones are
+	// rewritten to semi/anti joins or GROUP BY aggregate + hash join
+	// AFTER the join search. See unnest.go.
+	node = unnestSubqueriesInPlan(node)
 
 	// The MultiHashJoin packing pass (`rewriteMultiWayChain`, guarded by
 	// `mhjPackingEnabled`) ran here until M0127-P6.2 deleted it (08 §4). PG has
@@ -5893,7 +5692,7 @@ func planSubqueryRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int
 	// SQL LATERAL property: only RangeVar.Lateral makes the UNION member
 	// potentially parameterised and therefore ineligible for this one-shot
 	// appendrel path.
-	appendrelSubquery := jointreePipeline && !rv.Lateral &&
+	appendrelSubquery := !rv.Lateral &&
 		subqueryChainIsSimpleUnionAll(rv.Subquery)
 	if lateralCtx != nil {
 		latCtxWithCat := *lateralCtx

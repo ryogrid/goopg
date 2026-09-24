@@ -455,85 +455,6 @@ func TestIndexKeyScalarJoinInnerDecorrelates(t *testing.T) {
 	}
 }
 
-// TestIndexKeyExistsResidualBecomesNLISemi is the S6 (D6.2) end-to-end
-// Q4-shape assertion: with the harvest on, an EXISTS whose body carries
-// an inner-only residual AND whose WHERE has an outer local conjunct
-// must plan as an index-driven NLI semi join — residual on the PROBE as
-// IndexScan.Cond (R48 Half 2: PG's inner-Filter placement), the local
-// conjunct sunk BELOW the join (pushConjunctsBelowSemiAnti) so the
-// probe count and the NLI cost gate both see the filtered outer.
-func TestIndexKeyExistsResidualBecomesNLISemi(t *testing.T) {
-	pinLegacyPipeline(t)
-	SetIndexKeyHarvestEnabled(true)
-	t.Cleanup(func() { SetIndexKeyHarvestEnabled(true) }) // restore the ON default
-
-	cat := indexedCorrCatalog(t)
-	sql := "SELECT o_key FROM outer_t WHERE o_val > 5 AND EXISTS (SELECT 1 FROM inner_t WHERE i_key = outer_t.o_key AND i_a < i_b)"
-	node, err := Plan(parseOne(t, sql), cat)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var nli *NestedLoopIndexJoin
-	var walk func(Node)
-	walk = func(n Node) {
-		if n == nil || nli != nil {
-			return
-		}
-		switch x := n.(type) {
-		case *NestedLoopIndexJoin:
-			if x.Type == JoinTypeSemi {
-				nli = x
-				return
-			}
-			walk(x.Outer)
-		case *Join:
-			walk(x.Left)
-			walk(x.Right)
-		case *Filter:
-			walk(x.Child)
-		case *Project:
-			walk(x.Child)
-		case *Aggregate:
-			walk(x.Child)
-		case *Sort:
-			walk(x.Child)
-		case *Limit:
-			walk(x.Child)
-		}
-	}
-	walk(node)
-	if nli == nil {
-		t.Fatalf("EXISTS with inner residual did not become an NLI semi join")
-	}
-	if nli.Predicate != nil {
-		t.Fatalf("the inner-only residual should live on the probe Cond, not the join — NLI.Predicate is %#v", nli.Predicate)
-	}
-	probe := nliIn(nli.Inner)
-	if probe == nil {
-		t.Fatalf("inner-only residual must leave a plain IndexScan probe (F2: IOS declines on Cond); inner is %T", nli.Inner)
-	}
-	if probe.Cond == nil {
-		t.Fatal("the inner residual was lost — probe Cond is nil")
-	}
-	if !exprTreeMentions(probe.Cond, "i_a") || !exprTreeMentions(probe.Cond, "i_b") {
-		t.Fatalf("the probe Cond does not carry the i_a < i_b residual; got %#v", probe.Cond)
-	}
-	assertCondLeafLocal(t, probe.Cond, probe)
-	f, isFilter := nli.Outer.(*Filter)
-	if !isFilter {
-		t.Fatalf("the outer local conjunct was not sunk below the semi join; NLI.Outer is %T", nli.Outer)
-	}
-	if !exprTreeMentions(f.Predicate, "o_val") {
-		t.Fatalf("the sunk Filter does not carry the o_val conjunct")
-	}
-	if sp := selfProbeIndexScan(node); sp != nil {
-		t.Fatalf("self-probe IndexScan survived: %v", sp.Index)
-	}
-	if planHasSubqueryExpr(node) {
-		t.Fatalf("an ExistsExpr survived after decorrelation")
-	}
-}
-
 // TestIndexKeyToggleDeterminism: the same correlated EXISTS decorrelates
 // whether or not the inner correlation column is indexed. Before the fix
 // only the index-less form fired.
@@ -653,28 +574,4 @@ func findSemiOrAntiNLI(n Node) *NestedLoopIndexJoin {
 	}
 	walk(n)
 	return found
-}
-
-// TestIndexKeyRangeCorrelationStaysSubPlan: a range correlation lands in
-// LowKey/HighKey, which is NOT an equijoin and must keep the shape a
-// SubPlan (matrix row M14).
-func TestIndexKeyRangeCorrelationStaysSubPlan(t *testing.T) {
-	pinLegacyPipeline(t)
-	// The harvest is ON by default since S6; enabled explicitly here so the
-	// test is self-contained regardless of sibling-test toggles.
-	SetIndexKeyHarvestEnabled(true)
-	t.Cleanup(func() { SetIndexKeyHarvestEnabled(true) }) // restore the ON default
-
-	cat := indexedCorrCatalog(t)
-	sql := "SELECT o_key FROM outer_t WHERE EXISTS (SELECT 1 FROM inner_t WHERE i_key > outer_t.o_key)"
-	node, err := Plan(parseOne(t, sql), cat)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if hasAnySemiOrAnti(node) {
-		t.Fatalf("range-correlated EXISTS must NOT decorrelate to a semi/anti join")
-	}
-	if !planHasSubqueryExpr(node) {
-		t.Fatalf("range-correlated EXISTS should remain a SubPlan (ExistsExpr)")
-	}
 }

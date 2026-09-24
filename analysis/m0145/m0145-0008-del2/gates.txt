@@ -1,0 +1,13 @@
+FIRE-SET: baseline=d7ca698fa2ec9d0ac2eafd52e22cfa5396702f7c (3d1f8a5e0560) candidate=worktree (11d962a2fb0d)
+FIRE-SET: corpus=tpcds-sf025 fires=none (plan A/B had no changed query)
+FIRE-SET: corpus=tpcds-sf1 fires=none (plan A/B had no changed query)
+=== SUMMARY: PASS=96 (60 ck-verified, 36 ck=n/a) MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0 SKIP=3 ===
+=== PLAN-SHAPE: queries=99 same=99 changed=0 added=0 removed=0 ===
+FLOW-CONVERGENCE: label=sweep-20260924-221958.txt pinned-spine=0 jointree-pullup=23 pinned-per-pullup=0.00 seam-classes=1 seam-declines=2
+SUMMARY: 24 MATCH
+VERDICT: PASS — every label matched on values, not merely on row count
+  baseline findings: 52   current: 52
+EA-RATCHET: PASS
+tpch-spotcheck: Q12 PASS — rows=2 (expected 2)
+tpch-spotcheck: Q13 PASS — rows=33 (expected 33)
+tpch-spotcheck: RESULT=PASS

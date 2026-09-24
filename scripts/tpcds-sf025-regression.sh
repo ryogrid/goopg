@@ -828,7 +828,11 @@ sf025_plan_channel() {
     # next default sweep diff `same=74 changed=25` against itself).
     # SF025_FLOW_KNOB=0 skips it; like the rest of this channel it is
     # report-only and never touches the verdict.
-    if [[ "${SF025_FLOW_KNOB:-1}" == "1" && "${rc}" -eq 0 ]]; then
+    # M0145-0008 legacy-deletion slice 2 deleted the legacy pipeline and
+    # retired GOOPG_JOINTREE_PIPELINE, so this pass would now be a second
+    # capture of the SAME pipeline mislabelled as a legacy control: it is
+    # OFF by default, and the block goes with the dead-code slice.
+    if [[ "${SF025_FLOW_KNOB:-0}" == "1" && "${rc}" -eq 0 ]]; then
         knob_plans="${report%/*}/plansknob-${report##*/sweep-}"
         knob_trace="${knob_plans%.txt}.flow.log"
         knob_log_lines=$(wc -l < "${SF025_LOG}" 2>/dev/null || echo 0)

@@ -91,20 +91,6 @@ func TestJoinOnInSubquery_CorrelatedToJoinRightSide(t *testing.T) {
 	}
 }
 
-// TestJoinOnInSubquery_InnerJoin: acceptance 2c, INNER JOIN variant.
-func TestJoinOnInSubquery_InnerJoin(t *testing.T) {
-	pinLegacyPipeline(t)
-	cat := joinOnInSubqueryCatalog(t)
-	sql := "SELECT * FROM tenk1 a JOIN tenk2 b ON a.hundred IN (SELECT c.hundred FROM tenk2 c)"
-	node, err := Plan(parseOne(t, sql), cat)
-	if err != nil {
-		t.Fatalf("Plan() failed for INNER JOIN...ON IN (subquery): %v", err)
-	}
-	if in := findInExpr(node); in == nil {
-		t.Fatalf("no SubPlan InExpr found in plan:\n%s", planString(node))
-	}
-}
-
 // TestJoinOnNotInSubquery: acceptance 2c, NOT IN variant.
 func TestJoinOnNotInSubquery(t *testing.T) {
 	cat := joinOnInSubqueryCatalog(t)
