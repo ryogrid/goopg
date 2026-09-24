@@ -19512,7 +19512,7 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
       M0145\-0008h \(S2 escalation below\).
     Movement: yes — CATEGORIES-EXCL-MATCH TPC-H aggregation-strategy 3 -> 4, sort-strategy 8 -> 9, rendering 4 -> 3 (Q18 only; its five PK-determined group keys PG prunes to two, M0145-0008i); SF0.25 unchanged.
 
-- [ ] **M0145\-0008h — planner panic crashes the server on `GROUP BY pk …
+- [x] **M0145\-0008h — planner panic crashes the server on `GROUP BY pk …
   ORDER BY` a dependent column with an ordered aggregate** \(found
   2026\-09\-24 by M0145\-0008d; reproduces at HEAD `7a46f9fab`\). The upstream
   regress query `aggregates.out:3158`, `SELECT array\_agg\(c1 ORDER BY c2\), c2
@@ -19535,6 +19535,54 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
   > M0145\-0008h: one SELECT \(the upstream `aggregates` regress query\) kills
   > the server process for every session. It is filed and not selected
   > ahead of the banner, per S2; the owner decides its placement.
+  >
+  > **CORRECTION 2026\-09\-24 \(loop, M0145\-0008h\):** re\-checked on a HEAD
+  > build: `serveConn` recovers the panic, so only the SESSION is dropped
+  > \(`connection closed reason=panic`\); the server process stays up. The
+  > "kills the server" wording above was a misreading of a job\-control line.
+  > The defect is fixed by `39751edc9`; see below.
+  - **DONE 2026\-09\-24 `39751edc9` \(comment fix `71b5b84d6`\).** Design:
+    `docs/design/0100-0149/m0145-0008h-ordered-grouping-passthrough-snapshot.md`.
+    - Root cause: the ORDER BY key appends the PK\-dependent column as an
+      aggregate passthrough AFTER the grouping\-path snapshot;
+      `electOrderedGrouping` rebuilt its winner from the snapshot, and the
+      copy\-back erased the passthrough.
+    - Fix: the loop declines \(`agg\-surface\-grew\-after\-snapshot`\); the normal
+      ordered arm sorts over `agg.node`. The plan now equals PG's
+      aggregates.out line for line; `TestAggSortOrderPassthroughOrderBy` pins
+      the plan and rows.
+    - Gates: units, spotcheck, sf025 96/96 \(shapes 99/99 same\), acceptance
+      arm, fire\-set, ea\-ratchet; TPC\-H categories unchanged.
+    - Found a PRE\-EXISTING wrong result with the same root → M0145\-0008m.
+    Movement: none — no corpus plan changed; a regress case's panic is gone.
+
+- [ ] **M0145\-0008m — WRONG RESULTS: a PK\-dependent column reads NULL when
+  grouping elects an index\-ordered input** \(found 2026\-09\-24 by
+  M0145\-0008h; reproduces at HEAD `714738019`\). `SELECT sum\(c1\), c2 FROM
+  agg\_sort\_order GROUP BY c1` \(c1 PRIMARY KEY\) returns `1|`, `2|`, … with c2
+  NULL; PG returns the c2 values. The grouping election picks
+  `indexOrderedAggInput`'s Index Only Scan on the primary key, whose coverage
+  check \(`buildIndexOrderedScan`, groupagg\_indexorder.go\) reads
+  `aggNode.Passthrough`, still empty at election time. The functionally
+  dependent c2 is appended as a passthrough later, during target
+  resolution \(`resolveTargetsAfterAggregate` /
+  `resolveExprAfterAggregate`, planner.go\), and reads a column the narrowed
+  child does not produce.
+  Kind: impl
+  Parent: M0145-0008h
+  - First step: have the index\-ordered variant \(and any grouping candidate
+    whose child narrows\) know every column referenced above the aggregate
+    before the election. Either collect the functionally\-dependent
+    passthroughs before grouping paths are built, or make the lazy append
+    re\-validate the elected child and fall back to a plain\-scan input.
+    Pin with the values probe in `analysis/m0145/m0145\-0008h/probe.txt`.
+
+  > ## ESCALATION 2026\-09\-24 \(S2\) — wrong results
+  >
+  > M0145\-0008m: `GROUP BY pk` selecting a functionally dependent column
+  > returns NULL for that column when the grouping election picks the
+  > index\-ordered Index Only Scan input. Filed and not selected ahead of the
+  > banner, per S2; the owner decides its placement.
 
 - [ ] **M0145\-0008i — multi\-relation `remove\_useless\_groupby\_columns`**:
   PG drops GROUP BY columns that a primary key or unique NOT NULL index of
