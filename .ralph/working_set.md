@@ -1,16 +1,15 @@
 (idle — nothing in flight)
 
-This loop: M0145-0008d landed as e32442db1. Grouping follows PG's
-processed_groupClause (direction copy + ORDER BY prefix reorder). The probe
-is identical to PG. Gates all green, including ea-ratchet 52/52.
-Filed:
-- M0145-0008h (impl, S2 escalation): a planner panic kills the server on the
-  upstream aggregates.out:3158 query (GROUP BY pk ORDER BY a dependent column,
-  with array_agg ORDER BY). Reproduces at HEAD.
-- M0145-0008i (impl): multi-relation remove_useless_groupby_columns (Q18's
-  five keys → PG's two).
+This loop: M0145-0008e landed as d7dad3c1a, with its premise corrected. The
+jointree arm DOES narrow. Q18 was losing its whole join search to
+`seam-decline reason=residual-hits-pad`: the non-pulled-up grouped IN made
+the pad check's name walk partial. The pad check now steps over an
+uncorrelated inner plan. Q18 went from 13.17 s to 9.53 s (legacy 9.94 s).
+The 0008b design doc now carries a Correction section.
+Filed M0145-0008j (EXPLAIN drops one of two stacked Filters; pre-existing).
 
-Next per the banner (item 3): M0145-0008e (jointree lowering narrows join
-tuples, Q18), then 0008f/g, then 0008h/i unless the owner re-places 0008h,
-and the legacy-deletion slices. The M0146 continuation (0002f) after.
+Next per the banner (item 3): M0145-0008f (HashAggregate build throughput,
+Q18 semi body 12 s vs PG 3.3 s), then 0008g (expression IN-list selectivity,
+Q22), 0008h (planner crash, S2 escalation, awaiting owner placement),
+0008i, 0008j, then the legacy-deletion slices and the M0146 continuation.
 Parked: tmp/m0122-alter-system-wip.patch.

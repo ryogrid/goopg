@@ -1,7 +1,9 @@
 # M0145-0008b: why TPC-H Q18 and Q22 run slower on the jointree default
 
 Status: recon complete 2026-09-24. Follow-up implementation: M0145-0008e,
-M0145-0008f, M0145-0008g.
+M0145-0008f, M0145-0008g. **Q18 factor 1 corrected 2026-09-24 by M0145-0008e:**
+the jointree arm does narrow; the seam discarded its join search
+(`residual-hits-pad`), see the Correction section.
 Task: `.ralph/fix_plan.md` M0145-0008b (Kind: recon, Parent: M0145-0008).
 Evidence: `analysis/m0145/m0145-0008b/`. It holds EXPLAIN ANALYZE of both arms
 on one binary (`bb90e51a4`, private TPC-H lane, parallel mode, `PGSHAPED=1`,
@@ -62,3 +64,17 @@ These are the same ratios as the flip's ledger row (1.6x → 2.0x and 3.2x →
   own triage.
 - M0146-0002e: Q22's InitPlan filter moving to the customer scan (PG's place)
   changed neither arm's election. The legacy arm keeps it on the NL anti.
+
+## Correction (M0145-0008e, 2026-09-24)
+
+Q18 factor 1 is wrong as stated. A trace inside `narrowBuildInput` shows the
+jointree arm narrowing its hash inputs. The 1622 width is the join's output,
+and the 869 MB / 2-batch hash is built on the 6M-row `lineitem`, not on an
+unnarrowed `customer ⋈ orders`.
+
+The real cause is that the seam declined the join search
+(`seam-decline reason=residual-hits-pad`). The non-pulled-up grouped IN in
+the residual made the pad check's name walk partial. Execution then used the
+unsearched syntactic tree. Fixed by M0145-0008e: Q18 went from 13.17 s to
+9.53 s, the legacy arm's level. Factor 2 (HashAggregate throughput) and the
+Q22 finding stand.

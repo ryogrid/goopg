@@ -19331,7 +19331,7 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
       M0145\-0008g.
     Movement: none — recon.
 
-- [ ] **M0145\-0008e — the jointree lowering narrows join tuples as the
+- [x] **M0145\-0008e — the jointree lowering narrows join tuples as the
   legacy lowering does**: on TPC\-H Q18 the jointree arm's `orders ⋈
   customer` hash carries width 1622 \(869 MB, 2 batches\) where legacy
   carries 268 \(581 MB, 1 batch\); PG's widths are 25–45 \(only referenced
@@ -19342,6 +19342,37 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
   Parent: M0145-0008b
   - Expected movement: Q18 build side back to one batch; acceptance\-arm
     Q18 time; width columns of the parity capture.
+  - **DONE 2026\-09\-24 `d7dad3c1a` — premise corrected.** Design:
+    `docs/design/0100-0149/m0145-0008e-residual-pad-check-uncorrelated-sublink.md`;
+    evidence `analysis/m0145/m0145-0008e/`.
+    - A trace in `narrowBuildInput` shows the jointree arm DOES narrow. The
+      real cause was `seam\-decline reason=residual\-hits\-pad`: Q18's
+      non\-pulled\-up grouped IN made the pad check's walk partial, the
+      subquery's own names matched padded outer slots, and the search was
+      discarded for the syntactic tree \(hash on 6M lineitem\).
+    - `residualColumnRefsByName` steps over an uncorrelated inner plan; the
+      shared body is `walkColumnRefsByName`.
+    - Q18 on the jointree default: 13.17 s → 9.53 s \(legacy 9.94 s\).
+      Gates: units, spotcheck, sf025 96/96 \(shapes 99/99 same\), acceptance
+      arm, fire\-set, ea\-ratchet 52/52.
+    - Found: EXPLAIN omits one of two stacked Filters → M0145\-0008j.
+    Movement: none — CATEGORIES-EXCL-MATCH unchanged on TPC-H and SF0.25 (Q18's category set holds with the searched join order); the time moved, which is reported not judged.
+
+- [ ] **M0145\-0008j — EXPLAIN omits one of two stacked Filters over a
+  scan** \(found 2026\-09\-24 by M0145\-0008e; reproduces at HEAD `877b51039`\):
+  `SELECT a FROM ht1 WHERE a \> 1 AND EXISTS \(SELECT 1 FROM ht3\)` prints only
+  `Filter: \(EXISTS\(SubPlan 1\)\)` on the Seq Scan, although both predicates
+  execute \(results are correct\). PG prints `Filter: \(a \> 1\)` on the scan and
+  the EXISTS as a gating `One\-Time Filter` \(pseudoconstant qual,
+  `create\_gating\_plan`, createplan.c\). The plan is a residual Filter stacked
+  on the searched leaf Filter; the EXPLAIN scan arm absorbs one \(the
+  `attachedFilter` path in operators\_explain.go\) and drops the other.
+  Kind: impl
+  Parent: M0145-0008e
+  - First step: EXPLAIN\-render every Filter in a Filter\-over\-Filter\-over\-scan
+    chain, then consider the PG shape: a qual with no Vars becomes a gating
+    Result One\-Time Filter. Expected movement: `rendering` /
+    `qual\-placement` on shapes with an uncorrelated EXISTS conjunct.
 
 - [ ] **M0145\-0008f — HashAggregate build throughput on a many\-group
   input**: TPC\-H Q18's semi body \(`GROUP BY l\_orderkey HAVING sum \> 313`, 6M
