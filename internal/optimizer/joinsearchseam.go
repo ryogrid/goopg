@@ -906,13 +906,12 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 	// shape to price).
 	//
 	// M0145-0011 scope (c) measured the OTHER reading of "anything else":
-	// with `GOOPG_PULLUP_CTE_LEAF=on` the producer admits `*CTEScan`
-	// leaves and every one of them dies HERE instead, so the two sites
-	// are one invariant and must be relaxed together. Whoever relaxes the
-	// producer owns this loop too: a derived leaf has no `ss.Table` or
-	// `ss.Alias` to build the `rangeBinding` from, and no catalog
-	// statistics for `estimateBaseRelInfo`/`applyRelSizeFallback` below.
-	// Filed as M0145-0013 (owner directive 2026-09-21).
+	// a producer admitting `*CTEScan` leaves made every one of them die
+	// HERE instead, so the two sites are one invariant and are relaxed
+	// together in `seamLeafBinding` (M0145-0013): a `*CTEScan` leaf (the
+	// producer admits one only under `GOOPG_PULLUP_CTE_LEAF=on`), or a
+	// derived ANY body's single leaf (M0145-0008aa), binds with no catalog
+	// table and prices from its plan.
 	//
 	// M0145-0005 slice 6: the non-emitting band is TWO populations —
 	// deferred chain semi/anti leaves at [nReal, pulledBase) and pulled
@@ -2716,7 +2715,15 @@ func seamLeafBinding(scan Node, offset int, pullCtx *resolveContext, k int) (ran
 			b.alias = x.Alias
 		}
 	default:
-		return rangeBinding{}, false
+		// M0145-0008aa: a pulled ANY body that is not simple is ONE leaf
+		// holding the body's whole plan — PG's un-flattened subquery RTE.
+		// The body binding carries the derived table's synthetic
+		// `*catalog.Table` (column names only, no statistics); drop it so
+		// the leaf prices from its plan like a CTE leaf does.
+		if pullCtx == nil || !pulledLeafIsDerived(pullCtx, k) {
+			return rangeBinding{}, false
+		}
+		b.table = nil
 	}
 	return b, true
 }
@@ -2735,6 +2742,22 @@ func pulledBodyBinding(ctx *resolveContext, k int) (rangeBinding, bool) {
 		k -= len(body.bodyBindings)
 	}
 	return rangeBinding{}, false
+}
+
+// pulledLeafIsDerived reports whether the k-th pulled leaf (the same body-order
+// count `pulledBodyBinding` uses) is a derived body's single opaque leaf.
+func pulledLeafIsDerived(ctx *resolveContext, k int) bool {
+	pu := ctx.jtPullup
+	if pu == nil || k < 0 {
+		return false
+	}
+	for _, body := range pu.bodies {
+		if k < len(body.bodyBindings) {
+			return body.derived
+		}
+		k -= len(body.bodyBindings)
+	}
+	return false
 }
 
 // seamLeafRelInfo prices a spliced seam leaf, routing on whether the binding

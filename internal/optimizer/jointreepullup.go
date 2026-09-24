@@ -149,6 +149,11 @@ type jtPulledBody struct {
 	// the parent column from. `TestJointreePullupDeclineParity/nested-exists`
 	// is the witness for exactly that plan.
 	subtreeLeaves int
+	// derived marks a body pulled as ONE opaque leaf — the whole body's
+	// plan, PG's un-flattened subquery RTE (M0145-0008aa) — rather than as
+	// its own base-relation leaves. The seam admits that leaf without a
+	// catalog table and prices it from its plan (`seamLeafBinding`).
+	derived bool
 }
 
 // maxPulledSublinkDepth bounds the nested pull-up recursion. PG has no
@@ -287,12 +292,28 @@ func assignPulledSourceOffsets(bodies []*jtPulledBody, ctx *resolveContext) bool
 			}
 		}
 		pb.srcOffset = next
-		for i, leaf := range pb.leafScans {
-			shifted, err := remapSourceTableIdx(leaf, next)
-			if err != nil || shifted == nil {
-				return false
+		if pb.derived {
+			// M0145-0008aa: a derived leaf is a whole planned body, and
+			// remapSourceTableIdx covers only the node kinds the legacy
+			// unnest met (no Distinct, no set operations). The shift is
+			// EXPLAIN-naming hygiene, not a value dependency — the leaf is its
+			// own scope and the link qual reads it by position — so a body
+			// the remap cannot walk keeps its own numbering (offset 0), which
+			// is what the post-hoc route does with the same plan.
+			if shifted, err := remapSourceTableIdx(pb.leafScans[0], next); err == nil && shifted != nil {
+				pb.leafScans[0] = shifted
+			} else {
+				pb.srcOffset = 0
+				continue
 			}
-			pb.leafScans[i] = shifted
+		} else {
+			for i, leaf := range pb.leafScans {
+				shifted, err := remapSourceTableIdx(leaf, next)
+				if err != nil || shifted == nil {
+					return false
+				}
+				pb.leafScans[i] = shifted
+			}
 		}
 		for i := range pb.bodyBindings {
 			if pb.bodyBindings[i].sourceIdx != 0 {
@@ -1332,12 +1353,6 @@ func anyPullupConjunct(c Expr) (*InExpr, bool) {
 // needs exactly one body column to bind to.
 func pullUpAnyBody(in *InExpr, parent *resolveContext, cat catalog.Catalog, ps PlannerSettings, depth int) (*jtPulledBody, string, bool) {
 	sub := in.Subquery
-	if !sublinkBodyIsSimple(sub) {
-		return nil, "any-body-not-simple", false
-	}
-	if len(sub.Targets) != 1 || sub.Targets[0].Expr == nil {
-		return nil, "any-target-not-single", false
-	}
 	// `contain_volatile_functions(sublink->testexpr)` (subselect.c:1385):
 	// once the testexpr becomes a join clause its evaluation count is the
 	// join's, not once per outer row.
@@ -1348,6 +1363,17 @@ func pullUpAnyBody(in *InExpr, parent *resolveContext, cat catalog.Catalog, ps P
 	// arm is about to move; refuse rather than reason about it.
 	if exprHasSublinkPlan(in.Operand) {
 		return nil, "any-nested-sublink-operand", false
+	}
+	// M0145-0008aa: PG does not ask whether the body is simple here —
+	// convert_ANY_sublink_to_join makes ANY sub-select a subquery RTE, and
+	// only pull_up_subqueries later decides whether to flatten it. A body
+	// goopg cannot flatten therefore enters the search as that subquery RTE:
+	// one derived leaf.
+	if !sublinkBodyIsSimple(sub) {
+		return pullUpAnyDerivedBody(in, parent, cat, ps)
+	}
+	if len(sub.Targets) != 1 || sub.Targets[0].Expr == nil {
+		return nil, "any-target-not-single", false
 	}
 	bodyCtx, leafScans, leafWidths, onQuals, why, ok := bindPulledBodyScope(sub, parent, cat, ps)
 	if !ok {
@@ -1392,6 +1418,70 @@ func pullUpAnyBody(in *InExpr, parent *resolveContext, cat catalog.Catalog, ps P
 		bodyBindings: bodyCtx.bindings,
 		quals:        append([]Expr{link}, quals...),
 		children:     children,
+	}, "", true
+}
+
+// anyDerivedAlias is the range-table alias PG gives the subquery RTE it
+// builds for a pulled-up ANY sublink (`makeAlias("ANY_subquery", NIL)`,
+// postgres/src/backend/optimizer/plan/subselect.c:1395).
+const anyDerivedAlias = "ANY_subquery"
+
+// pullUpAnyDerivedBody is the half of `convert_ANY_sublink_to_join` that
+// `pullUpAnyBody`'s flat splice cannot express: a body that is not simple
+// (grouped, HAVING, DISTINCT, set operations, LIMIT, its own WITH) becomes
+// ONE semi-side leaf carrying the body's whole plan — the subquery RTE PG
+// appends to the parent's range table
+// (postgres/src/backend/optimizer/plan/subselect.c:1390-1401), which
+// `pull_up_subqueries` then leaves in place because `is_simple_subquery`
+// refuses it (postgres/src/backend/optimizer/prep/prepjointree.c:1143).
+//
+// The body is planned exactly as a FROM-clause subquery is — goopg's
+// subquery RTE — through `planFromClause` over a one-item FROM list
+// `(<body>) AS ANY_subquery`. The testexpr becomes `operand =
+// ANY_subquery.col0`, synthesised the same way the flat arm does, so the
+// seam files it as the link predicate and the search may unique-ify the
+// leaf into an inner join (`create_unique_path`).
+//
+// One of PG's cases is refused: a CORRELATED body. PG marks that RTE
+// LATERAL (`use_lateral`, subselect.c:1357) and the search then needs a
+// parameterised path for it, which goopg's search does not build for a
+// derived leaf (the M0145-0010 family). The statement keeps the post-hoc
+// route instead, exactly as before this arm existed.
+func pullUpAnyDerivedBody(in *InExpr, parent *resolveContext, cat catalog.Catalog, ps PlannerSettings) (*jtPulledBody, string, bool) {
+	wrap := &parser.SelectStmt{FromExprs: []parser.FromExpr{{
+		Base: parser.RangeVar{Subquery: in.Subquery, Alias: anyDerivedAlias},
+	}}}
+	node, bodyCtx, err := planFromClause(wrap, cat, ps, parent.rtScope)
+	if err != nil || bodyCtx == nil || len(bodyCtx.bindings) != 1 {
+		return nil, "any-derived-not-plannable", false
+	}
+	if _, isJoin := node.(*Join); isJoin {
+		return nil, "any-derived-not-one-leaf", false
+	}
+	out := node.Output()
+	if len(out) != 1 {
+		return nil, "any-target-not-single", false
+	}
+	if planHasEscapingOuterRef(node, 1) {
+		return nil, "any-derived-body-correlated", false
+	}
+	bodyCtx.cat = cat
+	bodyCtx.parent = parent
+	bodyCtx.settings = ps
+	outer, okOuter := outerOperandAsLevel1(in.Operand)
+	if !okOuter {
+		return nil, "any-operand-not-outer-columns", false
+	}
+	target := &ColumnRef{Index: 0, Name: out[0].Name, Type: out[0].Type, SourceTableIdx: out[0].SourceTableIdx}
+	link := &BinaryOp{Op: parser.OpEq, Left: outer, Right: target}
+	return &jtPulledBody{
+		expr:         in,
+		jointype:     parser.JoinSemi,
+		leafScans:    []Node{node},
+		leafWidths:   []int{len(out)},
+		bodyBindings: bodyCtx.bindings,
+		quals:        []Expr{link},
+		derived:      true,
 	}, "", true
 }
 
