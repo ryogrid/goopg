@@ -19684,7 +19684,7 @@ Movement: none — no plan moved on TPC-DS SF0.25/SF1 or TPC-H across all four d
       worktree also shows \(open nightly items\).
     Movement: none — storage discipline; no plan or value moved.
 
-- [ ] **M0145\-0008t — prune a heap page when it is read, as PG does**
+- [x] **M0145\-0008t — prune a heap page when it is read, as PG does**
   \(filed 2026\-09\-25 by M0145\-0008q\). goopg prunes only when a HOT update
   finds its page full; PG calls `heap\_page\_prune\_opt` whenever a scan
   or index fetch reads a page \(`heap\_prepare\_pagescan`,
@@ -19699,6 +19699,47 @@ Movement: none — no plan moved on TPC-DS SF0.25/SF1 or TPC-H across all four d
     index heap fetch when `pd\_prune\_xid` is set and the page is under
     PG\'s free\-space threshold \(`Max\(fillfactor target, BLCKSZ/10\)`\);
     measure branches/tellers growth and TPC\-B tps against HEAD.
+  - **DONE 2026\-09\-25.** Design:
+    `docs/design/0100-0149/m0145-0008t-prune-on-access.md`; evidence
+    `analysis/m0145/m0145-0008t/`.
+    - `storage.PagePruneXIDSet` / `PagePruneOnAccessWanted` port the
+      `heap\_page\_prune\_opt` gate; `executor.pruneHeapPageOnAccess` prunes
+      under `ConditionalLockForCleanup` from the seq scan \(pool pins\), the
+      index fetch \(per heap\-block switch\) and the bitmap heap scan. Skipped
+      on a standby, with the GUC off, and for catalogs.
+    - **Premise refuted:** pgbench small\-table growth is unchanged
+      \(branches 80/83 → 80/81, tellers 85 → 86/87 blocks; tps within
+      noise\). `PageAddHeapTuple` never reuses an unused line pointer, so a
+      page that has held 291 versions is full however much it is pruned →
+      M0145\-0008v.
+    - sf025: the first candidate pass took Q39 3.1 → 5.4 s \(one\-time prune
+      of stale\-hint pages in the gate cluster\); the second pass 3.06 s.
+    - Gates: units, spotcheck, acceptance 24 MATCH, sf025 96/96 ×2,
+      isolation and full regress = only the failures HEAD also has.
+    Movement: none — no plan, value or table growth moved.
+
+- [ ] **M0145\-0008v — heap line\-pointer lifecycle: LP\_DEAD on prune,
+  LP\_UNUSED after index vacuum, recycling** \(filed 2026\-09\-25 by
+  M0145\-0008t\). goopg\'s `PageAddHeapTuple` always appends a line
+  pointer and `PageGetHeapFreeSpace` returns 0 at `MaxHeapTuplesPerPage`,
+  so a frequently updated row fills its page after 291 versions however
+  much the page is pruned: pgbench\'s 2\-row `pgbench\_branches` reaches
+  \~80 heap blocks in 30 s. PG recycles unused line pointers
+  \(`PageAddItemExtended` with `PD\_HAS\_FREE\_LINES`, bufpage.c\) and
+  truncates the trailing ones \(`PageTruncateLinePointerArray`\). That is
+  safe in PG because prune marks a dead non\-HOT tuple `LP\_DEAD`, and only
+  VACUUM sets `LP\_UNUSED` after its index entries are gone
+  \(`heap\_page\_prune\_and\_freeze`, `lazy\_vacuum\_heap\_page`\). goopg\'s
+  `pagePruneCore` marks such tuples `LP\_UNUSED` at once while index
+  entries still point at them, which is why it must never recycle today.
+  Kind: impl
+  Parent: M0145-0008t
+  - First step: make `pagePruneCore` mark dead non\-HOT tuples `LP\_DEAD`
+    \(WAL and redo siblings too\), have VACUUM turn `LP\_DEAD` into
+    `LP\_UNUSED` after index cleanup, then let `PageAddHeapTuple` reuse
+    `LP\_UNUSED` slots under `PD\_HAS\_FREE\_LINES`. Measure pgbench
+    small\-table growth and TPC\-B tps against HEAD; gate on the isolation
+    family and the index\-scan correctness tests.
 
 - [ ] **M0145\-0008u — a pin\-held \(zero\-copy\) seq\-scan slot**
   \(filed 2026\-09\-25 by M0145\-0008q\). With compaction under a cleanup

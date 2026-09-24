@@ -1931,6 +1931,12 @@ func (o *seqScanOp) Next() (TupleSlot, error) {
 				// proceed while the parent operator processes the
 				// yielded slot. Page eviction is still prevented by
 				// the pin alone.
+				//
+				// heap_prepare_pagescan's heap_page_prune_opt: prune the
+				// page on the way in when it is short of space and holds
+				// prunable tuples (M0145-0008t). Ring-buffer pages are
+				// private copies and are not pruned.
+				pruneHeapPageOnAccess(o.ctx, slot, o.tbl, rel, o.curBlock)
 				o.pinned = slot
 				o.activePage = slot.Page()
 			}

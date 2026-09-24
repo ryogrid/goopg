@@ -647,6 +647,8 @@ func (o *bitmapHeapScanOp) nextSerial() (TupleSlot, error) {
 					return nil, err
 				}
 			}
+			// The bitmap page fetch's heap_page_prune_opt (M0145-0008t).
+			pruneHeapPageOnAccess(o.ctx, slot, o.tbl, o.rel, block)
 			// Pin only — the page RLock is scoped per tuple fetch
 			// (fetchOneTuple). Holding it across a yield deadlocks
 			// lockRowsOp.stampLock, which write-locks the same page
@@ -744,6 +746,7 @@ func (o *bitmapHeapScanOp) nextParallel() (TupleSlot, error) {
 		if err != nil {
 			return nil, err
 		}
+		pruneHeapPageOnAccess(o.ctx, slot, o.tbl, o.rel, block) // M0145-0008t
 		o.pinned = slot
 		o.pageBuf = slot.Page()
 		o.pageBlock = block

@@ -362,6 +362,11 @@ type indexScanOp struct {
 	// scanRow stays full-width — only the deform window narrows, so a
 	// bound equal to the column count takes the exact pre-EX1-02b path.
 	deformBound int
+	// prunedBlock / prunedBlockSet remember the heap block the last
+	// on-access prune ran for, so the prune runs once per block switch
+	// (M0145-0008t).
+	prunedBlock    storage.BlockNumber
+	prunedBlockSet bool
 
 	// M0092-0007: embedded slot reused across every Next() call so
 	// we don't allocate a fresh MaterializedSlot per emission.
@@ -994,6 +999,12 @@ func (o *indexScanOp) Next() (TupleSlot, error) {
 		slot, err := o.ctx.Pool.Pin(storage.BufferTag{Rel: o.heapRel, Block: ptr.Block})
 		if err != nil {
 			return nil, err
+		}
+		// heapam_index_fetch_tuple prunes when it moves to a new heap
+		// buffer (M0145-0008t); consecutive TIDs on one block prune once.
+		if !o.prunedBlockSet || o.prunedBlock != ptr.Block {
+			o.prunedBlock, o.prunedBlockSet = ptr.Block, true
+			pruneHeapPageOnAccess(o.ctx, slot, o.plan.Table, o.heapRel, ptr.Block)
 		}
 		// M0092-0006: hold the RLock across decode so we can use
 		// followHOTChainNoCopy → tuple.Data aliases the page bytes.

@@ -1,0 +1,10 @@
+# M0145-0008t pgbench TPC-B A/B (scale 2, -c 8 -j 4 -T 30, fresh cluster per arm, :5534).
+# HEAD a7f4b4958 vs candidate. 'pages:' = max heap block in ctid after the run.
+head number of failed transactions: 0 (0.000%) tps = 602.766970 (without initial connection time)  pages: pgbench_branches|80 pgbench_tellers|85 pgbench_accounts|3335 
+cand number of failed transactions: 0 (0.000%) tps = 606.958601 (without initial connection time)  pages: pgbench_branches|80 pgbench_tellers|86 pgbench_accounts|3334 
+head number of failed transactions: 0 (0.000%) tps = 627.516504 (without initial connection time)  pages: pgbench_branches|83 pgbench_tellers|85 pgbench_accounts|3335 
+cand number of failed transactions: 0 (0.000%) tps = 613.877346 (without initial connection time)  pages: pgbench_branches|81 pgbench_tellers|87 pgbench_accounts|3335 
+
+# TPC-DS SF0.25 sweep: first candidate pass Q39 3.1s -> 5.4s (one-time prune of stale
+# pd_prune_xid pages in the persistent gate cluster); second pass Q39 3.06s. Totals:
+# first 148s (-0.7%), second 154s (+4.1%; recent quiet sweeps 141-148s, noisy ones up to 200s).

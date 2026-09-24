@@ -49,6 +49,40 @@ func PagePruneOpt(p Page, oldestXmin TransactionID) (PruneResult, error) {
 	return res, err
 }
 
+// PagePruneXIDSet reports whether p's pd_prune_xid hint is set: some tuple on
+// the page may have become prunable since the last prune. It is the cheap
+// first test of heap_page_prune_opt (pruneheap.c), made before the horizon is
+// computed. The caller holds at least the share content lock.
+func PagePruneXIDSet(p Page) bool {
+	h, err := Header(p)
+	return err == nil && TransactionID(h.PruneXID()) != InvalidTransactionID
+}
+
+// PagePruneOnAccessWanted is the rest of heap_page_prune_opt's gate
+// (M0145-0008t): pd_prune_xid precedes the oldestXmin horizon, and the page
+// is full or has less free space than
+// Max(RelationGetTargetPageFreeSpace(fillfactor), BLCKSZ/10). A reader
+// prunes a page only when both hold, so pages with room to spare are left for
+// VACUUM. The caller holds at least the share content lock.
+func PagePruneOnAccessWanted(p Page, oldestXmin TransactionID, fillfactor int) bool {
+	h, err := Header(p)
+	if err != nil || oldestXmin == InvalidTransactionID {
+		return false
+	}
+	pruneXID := TransactionID(h.PruneXID())
+	if pruneXID == InvalidTransactionID || !XIDPrecedes(pruneXID, oldestXmin) {
+		return false
+	}
+	if fillfactor <= 0 || fillfactor > 100 {
+		fillfactor = HeapDefaultFillfactor
+	}
+	minfree := BlockSize * (100 - fillfactor) / 100
+	if minfree < BlockSize/10 {
+		minfree = BlockSize / 10
+	}
+	return h.Flags()&PDPageFull != 0 || PageGetHeapFreeSpace(p) < minfree
+}
+
 // PageVacuumPrune is the VACUUM-time counterpart of PagePruneOpt. It applies
 // the identical HOT-chain-aware, multixact-aware dead-tuple reclamation, but
 // UNCONDITIONALLY — VACUUM must prune regardless of the pd_prune_xid hint,
