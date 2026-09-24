@@ -492,7 +492,13 @@ func (o *indexOnlyScanOp) pruneTouchedTempPages(ctx *Context, heapRel storage.Re
 			ctx.Pool.Unpin(slot)
 			continue
 		}
-		slot.Lock()
+		// Pruning moves tuple bytes: take the cleanup lock, and skip a page
+		// someone else still has pinned, as heap_page_prune_opt does with
+		// ConditionalLockBufferForCleanup (M0145-0008q).
+		if !ctx.Pool.ConditionalLockForCleanup(slot) {
+			ctx.Pool.Unpin(slot)
+			continue
+		}
 		pr, _, perr := storage.PageVacuumPrune(page, horizon)
 		if perr != nil || (len(pr.Redirects) == 0 && len(pr.Unused) == 0) {
 			slot.Unlock()

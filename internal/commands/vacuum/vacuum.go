@@ -29,12 +29,26 @@ type Stats struct {
 	// skips never stall advancement.
 	SkippedAllVisible int
 	SkippedAllFrozen  int
+	// SkippedPinned counts blocks a non-aggressive pass left unpruned
+	// because another backend held a pin (no cleanup lock without
+	// waiting; M0145-0008q). Their unfrozen xmins were not examined, so
+	// callers must not advance relfrozenxid when it is > 0, as for
+	// SkippedAllVisible (RelfrozenxidGuarded).
+	SkippedPinned int
 	OldestXmin        storage.TransactionID
 	NewFrozenXID      storage.TransactionID // lowest unfrozen xmin after this pass (0 if all frozen)
 	// DeadTIDs is the list of heap (block, offset) pointers that were
 	// reclaimed in this pass. Index vacuum uses these to remove stale
 	// index entries (M0047-0002).
 	DeadTIDs []storage.ItemPointer
+}
+
+// RelfrozenxidGuarded reports whether a pass with this aggressiveness left
+// pages unexamined, so relfrozenxid must not advance: VM-skipped
+// all-visible pages (vacuumlazy.c skippedallvis) and pinned pages it did
+// not wait for.
+func (s Stats) RelfrozenxidGuarded(aggressive bool) bool {
+	return !aggressive && (s.SkippedAllVisible > 0 || s.SkippedPinned > 0)
 }
 
 // VacuumOptions controls optional vacuum behaviours beyond the core dead-tuple
@@ -181,10 +195,34 @@ func vacuumCore(pool *storage.Pool, mgr *transam.Manager, rel storage.RelFileNod
 			stats.Pages++
 			continue
 		}
-		// Take the per-page content lock so concurrent readers /
-		// writers can't tear the dead-set scan + repack + pd_lsn
-		// stamp under MarkDirtyChangeRecord.
-		slot.Lock()
+		// Take the page's cleanup lock: the exclusive content lock, held
+		// while this pin is the only one, because the repack moves tuple
+		// bytes a pinned reader may still be using (M0145-0008q). PG's
+		// lazy_scan_heap tries ConditionalLockBufferForCleanup first; a
+		// non-aggressive pass that cannot get it scans the page without
+		// pruning (lazy_scan_noprune), and only an aggressive pass waits.
+		// goopg's non-aggressive pass does the same under the share lock:
+		// it counts the tuples the prune would keep (reltuples), assumes
+		// the page non-empty for truncation, and neither prunes, freezes
+		// nor sets VM bits. The page's unfrozen xmins go unexamined, so
+		// relfrozenxid does not advance (Stats.SkippedPinned).
+		if !pool.ConditionalLockForCleanup(slot) {
+			if !opts.Aggressive {
+				slot.RLock()
+				live, lerr := storage.PageCountVacuumLive(page, horizon)
+				slot.RUnlock()
+				pool.Unpin(slot)
+				if lerr != nil {
+					return stats, lerr
+				}
+				stats.Pages++
+				stats.Live += live
+				stats.SkippedPinned++
+				lastNonEmpty = blk
+				continue
+			}
+			pool.LockForCleanup(slot)
+		}
 
 		pageDirty := false
 

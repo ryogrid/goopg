@@ -292,7 +292,7 @@ func (o *vacuumOp) Next() (TupleSlot, error) {
 		// relfrozenxid skip-guard (vacuumlazy.c skippedallvis): a
 		// non-aggressive pass that SKIPPED all-visible-but-not-all-frozen
 		// pages cannot know their oldest unfrozen xmin and must not advance.
-		guardedSkip := !relOpts.Aggressive && stats.SkippedAllVisible > 0
+		guardedSkip := stats.RelfrozenxidGuarded(relOpts.Aggressive)
 		if err == nil && freezeBelow > 0 && !guardedSkip && stats.NewFrozenXID != 0 {
 			// Advance relfrozenxid to the lowest unfrozen xmin found.
 			tbl.RelFrozenXID = stats.NewFrozenXID

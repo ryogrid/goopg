@@ -2154,6 +2154,65 @@ func (p *Pool) SlotPinCount(tag BufferTag) int32 {
 	return int32(statePin(st))
 }
 
+// Cleanup locks (M0145-0008q). PG moves tuple bytes on a heap page (prune,
+// vacuum repack) only under a cleanup lock: the exclusive content lock, held
+// while the caller's pin is the page's only pin (bufmgr.c
+// LockBufferForCleanup / ConditionalLockBufferForCleanup /
+// IsBufferCleanupOK). A backend that holds a pin may then keep reading a
+// tuple after it drops the content lock, because nothing can compact the page
+// under it. A new pin taken while the cleanup lock is held is harmless: the
+// new pinner reads nothing until it gets the content lock.
+//
+// goopg has no per-backend private refcount, so "only pin" is the shared pin
+// count equal to 1. A caller that holds two pins on the same page itself
+// (a scan's plus an updater's) therefore never gets the cleanup lock, which
+// PG's conditional variant also refuses.
+
+// IsCleanupOK reports whether a caller that already holds s's exclusive
+// content lock and one pin holds the page's only pin (PG IsBufferCleanupOK).
+func (p *Pool) IsCleanupOK(s *Slot) bool {
+	return statePin(s.state.Load()) == 1
+}
+
+// ConditionalLockForCleanup takes s's cleanup lock without waiting (PG
+// ConditionalLockBufferForCleanup). It returns false, holding no content
+// lock, when the content lock is busy or another pin exists. The caller
+// holds one pin.
+func (p *Pool) ConditionalLockForCleanup(s *Slot) bool {
+	if !s.contentMu.TryLock() {
+		return false
+	}
+	if p.IsCleanupOK(s) {
+		return true
+	}
+	s.contentMu.Unlock()
+	return false
+}
+
+// cleanupLockMaxBackoff caps the wait between LockForCleanup retries.
+const cleanupLockMaxBackoff = 10 * time.Millisecond
+
+// LockForCleanup takes s's cleanup lock, waiting until the caller's pin is
+// the only one (PG LockBufferForCleanup). PG sleeps until the last other
+// unpinner signals it (BM_PIN_COUNT_WAITER); this retries with a capped
+// backoff instead, dropping the content lock between attempts so the other
+// pinners can finish their page. The caller holds one pin and must not hold
+// a second pin on s, or this never returns.
+func (p *Pool) LockForCleanup(s *Slot) {
+	backoff := 50 * time.Microsecond
+	for {
+		s.contentMu.Lock()
+		if p.IsCleanupOK(s) {
+			return
+		}
+		s.contentMu.Unlock()
+		time.Sleep(backoff)
+		if backoff *= 2; backoff > cleanupLockMaxBackoff {
+			backoff = cleanupLockMaxBackoff
+		}
+	}
+}
+
 // Unpin decrements the slot's pin count via CAS.
 func (p *Pool) Unpin(s *Slot) {
 	for {

@@ -242,7 +242,7 @@ func (l *Launcher) runVacuum(log *slog.Logger, tbl *catalog.Table,
 
 	// relfrozenxid skip-guard: non-aggressive passes that skipped
 	// visible-not-frozen pages cannot advance (vacuumlazy.c:884–892).
-	guardedSkip := !aggressive && stats.SkippedAllVisible > 0
+	guardedSkip := stats.RelfrozenxidGuarded(aggressive)
 	if freezeBelow > 0 && !guardedSkip {
 		switch {
 		case stats.NewFrozenXID != 0:

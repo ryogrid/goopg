@@ -19650,7 +19650,7 @@ Movement: none — no plan moved on TPC-DS SF0.25/SF1 or TPC-H across all four d
       M0145\-0008s\).
     Movement: none — executor only; no plan moved.
 
-- [ ] **M0145\-0008q — page compaction takes a cleanup lock \(pin count 1\),
+- [x] **M0145\-0008q — page compaction takes a cleanup lock \(pin count 1\),
   as PG's does** \(filed 2026\-09\-25 by M0145\-0008k\). goopg compacts heap
   pages under the exclusive content lock alone in the opportunistic prune
   \(`PagePruneOpt`\), VACUUM \(`PageVacuumPrune`\) and the index\-only
@@ -19666,6 +19666,53 @@ Movement: none — no plan moved on TPC-DS SF0.25/SF1 or TPC-H across all four d
     \(retention clone only at Sort / Hash build / Material, PG's
     `ExecMaterializeSlot` point\). Gates: isolation family \(prune vs
     concurrent scan\), race gate, pgbench.
+  - **DONE 2026\-09\-25.** Design:
+    `docs/design/0100-0149/m0145-0008q-cleanup-lock.md`; evidence
+    `analysis/m0145/m0145-0008q/`.
+    - `Pool.IsCleanupOK` / `ConditionalLockForCleanup` / `LockForCleanup`
+      \(capped\-backoff retry\) on the shared pin count. HOT\-path prune uses
+      `IsCleanupOK`; IOS temp\-page prune is conditional; VACUUM is
+      conditional, a non\-aggressive pass does `lazy\_scan\_noprune`
+      \(`PageCountVacuumLive` under the share lock, `Stats.SkippedPinned`
+      guards relfrozenxid via `RelfrozenxidGuarded`\), an aggressive pass
+      waits. Redo compacts private page copies, so it needs no lock.
+    - pgbench TPC\-B A/B: tps within noise \(\~625 both\); small\-table
+      growth identical except tellers 84 → 90 blocks. The \~80\-block growth
+      of 2\-row branches exists on HEAD too → M0145\-0008t.
+    - Gates: units, race \(storage \+ vacuum\), spotcheck, acceptance 24
+      MATCH, sf025 96/96, isolation family = the two failures a clean HEAD
+      worktree also shows \(open nightly items\).
+    Movement: none — storage discipline; no plan or value moved.
+
+- [ ] **M0145\-0008t — prune a heap page when it is read, as PG does**
+  \(filed 2026\-09\-25 by M0145\-0008q\). goopg prunes only when a HOT update
+  finds its page full; PG calls `heap\_page\_prune\_opt` whenever a scan
+  or index fetch reads a page \(`heap\_prepare\_pagescan`,
+  `heapam\_index\_fetch\_tuple`, heapam.c / heapam\_handler.c\), gated on
+  `pd\_prune\_xid` and free space below the fill threshold, under a
+  conditional cleanup lock. Symptom: after 30 s of pgbench TPC\-B at scale
+  2, `pgbench\_branches` \(2 rows\) reaches heap block 83 on HEAD.
+  Kind: impl
+  Parent: M0145-0008q
+  - First step: call `storage.PagePruneOpt` under
+    `Pool.ConditionalLockForCleanup` from the seq\-scan page switch and the
+    index heap fetch when `pd\_prune\_xid` is set and the page is under
+    PG\'s free\-space threshold \(`Max\(fillfactor target, BLCKSZ/10\)`\);
+    measure branches/tellers growth and TPC\-B tps against HEAD.
+
+- [ ] **M0145\-0008u — a pin\-held \(zero\-copy\) seq\-scan slot**
+  \(filed 2026\-09\-25 by M0145\-0008q\). With compaction under a cleanup
+  lock, a scan may hand its parent a slot that reads the pinned page after
+  the content lock is released, as `ExecStoreBufferHeapTuple` does, and
+  clone only where a consumer retains the row \(Sort, Hash build, Material:
+  PG\'s `ExecMaterializeSlot` point\). Removes the per\-tuple retention
+  clone the M0145\-0008p/k measurements attribute seq\-scan time to.
+  Kind: impl
+  Parent: M0145-0008q
+  - First step: audit every consumer that keeps a row past the next
+    `Next\(\)` call and confirm it already materializes; then drop
+    `cloneRowOwnedPrefix` in `seqScanOp.Next` behind that audit, with the
+    tail\-poison harness and the isolation family as gates.
 
 - [ ] **M0145\-0008r — WRONG RESULTS: a bitmap scan over an unproven partial
   index drops the rows its predicate excludes** \(found 2026\-09\-25 while

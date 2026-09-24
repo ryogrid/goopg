@@ -73,6 +73,41 @@ func PageVacuumPrune(p Page, oldestXmin TransactionID) (PruneResult, int, error)
 	return pagePruneCore(p, oldestXmin)
 }
 
+// PageCountVacuumLive counts the LP_NORMAL tuples on p that a prune at
+// oldestXmin would keep: the live count PageVacuumPrune returns, without
+// touching the page. It is VACUUM's count for a page it could not get a
+// cleanup lock on (PG lazy_scan_noprune counts live_tuples the same way and
+// leaves the dead ones as missed_dead_tuples; M0145-0008q). The caller holds
+// at least the page's share content lock.
+func PageCountVacuumLive(p Page, oldestXmin TransactionID) (int, error) {
+	count, err := PageLinePointerCount(p)
+	if err != nil {
+		return 0, err
+	}
+	live := 0
+	for idx := 0; idx < count; idx++ {
+		item, err := readItemID(p, idx)
+		if err != nil {
+			return 0, err
+		}
+		if item.Flags != ItemIDNormal {
+			continue
+		}
+		off, ln := int(item.Offset), int(item.Length)
+		if off < 0 || ln < 0 || off+ln > len(p) {
+			continue // skip corrupt items, as pagePruneCore does
+		}
+		t, err := parseHeapTupleAlias(p[off : off+ln])
+		if err != nil {
+			continue
+		}
+		if oldestXmin == InvalidTransactionID || !TupleDeadToAll(t.Header, oldestXmin) {
+			live++
+		}
+	}
+	return live, nil
+}
+
 // TupleDeadToAll reports whether hdr's tuple is dead to EVERY current and
 // future snapshot: xmax set, not lock-only, and the effective updater xid
 // is below the oldestXmin horizon. Extracted from pagePruneCore's isDead

@@ -4408,7 +4408,11 @@ func tryApplyHOTUpdate(
 	newSlot, addErr := storage.PageAddHeapTuple(s.Page(), tup)
 	if addErr != nil && errors.Is(addErr, storage.ErrNoSpaceInPage) {
 		// Page full: attempt opportunistic pruning before giving up on HOT.
-		if ctx.EnableOpportunisticPrune && ctx.TxnMgr != nil {
+		// Pruning moves tuple bytes, so it needs the cleanup lock: the
+		// exclusive lock is already held, and the updater's pin must be
+		// the only one (PG IsBufferCleanupOK; M0145-0008q). A page another
+		// scan still has pinned is not pruned; the update leaves HOT.
+		if ctx.EnableOpportunisticPrune && ctx.TxnMgr != nil && ctx.Pool.IsCleanupOK(s) {
 			oldestXmin := ctx.TxnMgr.OldestXmin()
 			result, pruneErr := storage.PagePruneOpt(s.Page(), oldestXmin)
 			if pruneErr == nil && (len(result.Redirects)+len(result.Unused)) > 0 {
