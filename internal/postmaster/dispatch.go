@@ -1950,6 +1950,7 @@ func plannerSettingsFrom(get func(string) (string, bool)) optimizer.PlannerSetti
 	readBool("enable_bitmapscan", &ps.EnableBitmapScan)
 	readBool("enable_sort", &ps.EnableSort)
 	readBool("enable_hashjoin", &ps.EnableHashJoin)
+	readBool("enable_parallel_hash", &ps.EnableParallelHash)
 	readBool("enable_mergejoin", &ps.EnableMergeJoin)
 	readBool("enable_nestloop", &ps.EnableNestLoop)
 	readBool("enable_memoize", &ps.EnableMemoize)
@@ -2063,6 +2064,7 @@ func plannerCacheFingerprint(ps optimizer.PlannerSettings, disableSeqScan, disab
 		float(ps.EffectiveCacheSize),
 		strconv.FormatInt(ps.WorkMem, 10),
 		bit(ps.EnableHashJoin),
+		bit(ps.EnableParallelHash),
 		bit(ps.EnableMergeJoin),
 		bit(ps.EnableNestLoop),
 		bit(ps.EnableSort),

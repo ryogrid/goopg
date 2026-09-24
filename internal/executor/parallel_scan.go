@@ -695,8 +695,30 @@ func (cs *parallelClaimSet) attachParallelHashBuildSides(op Operator) bool {
 		return cs.attachParallelHashBuildSides(x.child)
 	case *instrumentedOp:
 		return cs.attachParallelHashBuildSides(x.inner)
+	case *aggregateOp:
+		return cs.attachParallelHashBuildSides(x.child)
+	case *sortOp:
+		return cs.attachParallelHashBuildSides(x.child)
+	case *nestedLoopIndexJoinOp:
+		if !optimizer.NestedLoopIndexJoinIsPartialCapable(x.plan) {
+			return false
+		}
+		return cs.attachParallelHashBuildSides(x.outer)
 	case *joinOp:
-		if x.plan == nil || x.plan.Algo != optimizer.JoinAlgoHash {
+		if x.plan == nil {
+			return false
+		}
+		switch x.plan.Algo {
+		case optimizer.JoinAlgoNestedLoop:
+			// Partial through the literal left, as attachParallelScan.
+			if ordinaryInnerNestedLoopPartial(x.plan) || lateralProbeJoinPartial(x.plan, x.right) {
+				return cs.attachParallelHashBuildSides(x.left)
+			}
+			return false
+		case optimizer.JoinAlgoMerge:
+			return cs.attachParallelHashBuildSides(x.left)
+		case optimizer.JoinAlgoHash:
+		default:
 			return false
 		}
 		probe, build := x.right, x.left
@@ -705,11 +727,10 @@ func (cs *parallelClaimSet) attachParallelHashBuildSides(op Operator) bool {
 		}
 		attached := false
 		if x.plan.ParallelHash {
-			kid := cs.hashBuildBranch(x.plan)
-			attached = kid.attachAll(build)
-			// A Parallel Hash nested on this build side is built by the
-			// same participants, over the build side's own claims.
-			attached = kid.attachParallelHashBuildSides(build) || attached
+			// attachAll also wires a Parallel Hash nested on this build
+			// side (it runs attachParallelHashBuildSides itself), over the
+			// build side's own claims.
+			attached = cs.hashBuildBranch(x.plan).attachAll(build)
 		}
 		return cs.attachParallelHashBuildSides(probe) || attached
 	}

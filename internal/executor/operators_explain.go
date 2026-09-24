@@ -3418,13 +3418,16 @@ func describePlanMode(n optimizer.Node, nm *explainNames, verbose bool) string {
 		if p.Algo == optimizer.JoinAlgoMerge {
 			algo = "Merge"
 		}
-		// R7 (plan-parity-fix-take2): PG's prefix is a single generic rule
-		// over any node with `parallel_aware` set (explain.c:1630), NOT a
-		// hash-join special case — which is why the *optimizer.SeqScan arm
-		// below already applies the same prefix from its own flag. goopg
-		// builds the hash cooperatively (executor/parallel_hash_build.go),
-		// so this states a fact about the node rather than dressing it up.
-		if p.ParallelAware {
+		// PG's prefix is the generic parallel_aware rule (explain.c:1630),
+		// and for a join `parallel_aware` is set only by the
+		// `parallel_hash = true` hash join (create_hashjoin_path:
+		// parallel_aware = consider_parallel && parallel_hash; merge and
+		// nested-loop joins are never parallel-aware). M0146-0002: goopg
+		// now has that node — participants build a partial inner into one
+		// shared table — so the prefix follows Join.ParallelHash. The
+		// complete-inner partial hash join (leader-prebuilt table, R7's
+		// earlier reason for the prefix) is PG's plain `Hash Join`.
+		if p.ParallelHash && p.Algo == optimizer.JoinAlgoHash {
 			return "Parallel " + joinLabel(algo, p.Type)
 		}
 		return joinLabel(algo, p.Type)

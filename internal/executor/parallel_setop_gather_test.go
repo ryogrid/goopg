@@ -42,6 +42,11 @@ func planPartialSetOpWinner(t *testing.T, ctx *Context, sql string) optimizer.No
 	ps.ParallelSetupCost = 0
 	ps.ParallelTupleCost = 0
 	ps.MaxParallelWorkersPerGather = 8
+	// M0146-0002: a partial SetOp branch cannot carry a Parallel Hash yet (the
+	// branch claim sets hold no per-join build state; ledgered), so with it on
+	// the planner prefers a serial SetOp over per-branch Gathers of Parallel
+	// Hash joins. This test's subject is the Gather over a partial SetOp.
+	ps.EnableParallelHash = false
 	node, err := optimizer.PlanWithSettings(stmts[0], ctx.Catalog, ps)
 	if err != nil {
 		t.Fatalf("plan: %v", err)

@@ -73,6 +73,11 @@ import (
 // design's §7.1 inequality describes.
 func c19fSettings() optimizer.PlannerSettings {
 	ps := optimizer.DefaultPlannerSettings()
+	// C-19f's subject is PG's `parallel_hash = false` join: a partial outer
+	// over a COMPLETE inner whose table the leader prebuilds and shares.
+	// M0146-0002's `parallel_hash = true` variant wins on these shapes when
+	// enabled; its own consumer check is TestParallelHashPathModelWinner.
+	ps.EnableParallelHash = false
 	ps.MinParallelTableScanSize = 1
 	ps.MinParallelIndexScanSize = 1
 	ps.MaxParallelWorkersPerGather = 4

@@ -176,6 +176,10 @@ func (ph *parallelHashBuild) wait(ctx *Context) error {
 // client sees; this one only stops the waiter from probing.
 var errParallelHashAbandoned = errors.New("parallel hash join: build abandoned (parallel group cancelled)")
 
+// errParallelHashUnregistered is returned by a Parallel Hash join that reaches
+// execution without the Gather-registered shared build state.
+var errParallelHashUnregistered = errors.New("parallel hash join: no shared build state is registered for this join (not under a Gather that registered it)")
+
 // errParallelHashSpilled refuses a participant build that ended in batches.
 // PG's parallel hash batches (ExecParallelHashIncreaseNumBatches) are not
 // ported; keeping a spilled participant table would publish only its batch 0.
@@ -196,8 +200,7 @@ func lookupParallelHashBuild(ctx *Context, p *optimizer.Join) *parallelHashBuild
 // reference). Returns whether anything was registered, so Close knows to
 // retract it.
 func registerParallelHashBuilds(ctx *Context, plan optimizer.Node, groupDone <-chan struct{}) bool {
-	var joins []*optimizer.Join
-	collectParallelHashJoins(plan, &joins)
+	joins := optimizer.ParallelHashJoinsIn(plan)
 	if len(joins) == 0 {
 		return false
 	}
@@ -207,34 +210,6 @@ func registerParallelHashBuilds(ctx *Context, plan optimizer.Node, groupDone <-c
 	}
 	ctx.ParallelHashBuilds = m
 	return true
-}
-
-// collectParallelHashJoins walks the partial path the way the claim walks do
-// (probe side only) and collects every ParallelHash join. A Parallel Hash
-// join's OWN build side is partial too, so its build subtree is walked as
-// well: a Parallel Hash nested there is built by the same participants.
-func collectParallelHashJoins(n optimizer.Node, out *[]*optimizer.Join) {
-	switch x := n.(type) {
-	case nil:
-		return
-	case *optimizer.Join:
-		if x.Algo != optimizer.JoinAlgoHash {
-			return
-		}
-		probe, build := x.Right, x.Left
-		if probeSideIsLeft(x) {
-			probe, build = x.Left, x.Right
-		}
-		if x.ParallelHash {
-			*out = append(*out, x)
-			collectParallelHashJoins(build, out)
-		}
-		collectParallelHashJoins(probe, out)
-	case *optimizer.Filter:
-		collectParallelHashJoins(x.Child, out)
-	case *optimizer.Project:
-		collectParallelHashJoins(x.Child, out)
-	}
 }
 
 // openParallelHashJoin is openLazyHashJoin for a Parallel Hash join: build

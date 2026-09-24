@@ -626,21 +626,23 @@ func stampParallelScan(n Node) Node {
 			c.Left = left
 			return &c
 		}
-		if joinProbeSideIsLeft(x) {
-			left := stampParallelScan(x.Left)
-			if left == x.Left {
-				return x
-			}
-			c := *x
-			c.Left = left
-			return &c
+		// The probe side is partial. M0146-0002: a Parallel Hash join's
+		// build side is partial too (each participant builds its claimed
+		// share), so it is labelled as well — the same side the executor's
+		// attachParallelHashBuildSides wires to the join's own claim set.
+		probeLeft := joinProbeSideIsLeft(x)
+		left, right := x.Left, x.Right
+		if probeLeft || (x.ParallelHash && x.Algo == JoinAlgoHash) {
+			left = stampParallelScan(x.Left)
 		}
-		right := stampParallelScan(x.Right)
-		if right == x.Right {
+		if !probeLeft || (x.ParallelHash && x.Algo == JoinAlgoHash) {
+			right = stampParallelScan(x.Right)
+		}
+		if left == x.Left && right == x.Right {
 			return x
 		}
 		c := *x
-		c.Right = right
+		c.Left, c.Right = left, right
 		return &c
 	case *NestedLoopIndexJoin:
 		// M0142-0005a: mirror of the drivingScan arm — partial through the
@@ -1000,6 +1002,51 @@ func HasShareableHashJoin(n Node) bool {
 		}
 	}
 	return false
+}
+
+// ParallelHashJoinsIn returns every Parallel Hash join (Join.ParallelHash) a
+// Gather's partial subtree runs, so the Gather can register their shared build
+// states before fan-out (M0146-0002). It walks exactly what the claim walks
+// run — the descent HasShareableHashJoin makes, plus a partial merge join's
+// outer — and a Parallel Hash join's own build side, which is partial too.
+// A join this walk misses reaches the executor unregistered and fails loudly
+// (errParallelHashUnregistered) rather than probing a partial table.
+func ParallelHashJoinsIn(n Node) []*Join {
+	var out []*Join
+	var walk func(Node)
+	walk = func(n Node) {
+		switch x := n.(type) {
+		case nil:
+			return
+		case *Join:
+			if hashJoinIsPartialCapable(x) {
+				probe, build := x.Right, x.Left
+				if joinProbeSideIsLeft(x) {
+					probe, build = x.Left, x.Right
+				}
+				if x.ParallelHash {
+					out = append(out, x)
+					walk(build)
+				}
+				walk(probe)
+				return
+			}
+			if nestedLoopJoinIsPartialCapable(x) || lateralProbeJoinIsPartialCapable(x) || mergeJoinIsPartialCapable(x) {
+				walk(x.Left)
+			}
+			return
+		case *NestedLoopIndexJoin:
+			if NestedLoopIndexJoinIsPartialCapable(x) {
+				walk(x.Outer)
+			}
+			return
+		}
+		for _, c := range parallelChildren(n) {
+			walk(c)
+		}
+	}
+	walk(n)
+	return out
 }
 
 // joinProbeSideIsLeft mirrors the executor's probeSideIsLeft. The two must
@@ -1891,12 +1938,16 @@ func unstampParallelScan(n Node) Node {
 		c.Child = child
 		return &c
 	case *Join:
+		// M0146-0002: a Parallel Hash join whose Gather is stripped runs
+		// serially, so it must also stop claiming a shared partial build
+		// (its `Parallel Hash` label and the executor's barrier lookup).
 		left, right := unstampParallelScan(x.Left), unstampParallelScan(x.Right)
-		if left == x.Left && right == x.Right {
+		if left == x.Left && right == x.Right && !x.ParallelHash {
 			return n
 		}
 		c := *x
 		c.Left, c.Right = left, right
+		c.ParallelHash = false
 		return &c
 	case *NestedLoopIndexJoin:
 		// M0142-0005a: the inverse of stampParallelScan's NLI arm — the

@@ -77,7 +77,10 @@ package optimizer
 // :2418).
 import "strconv"
 
-import "github.com/goopg/goopg/internal/parser"
+import (
+	"github.com/goopg/goopg/internal/executor/hashsize"
+	"github.com/goopg/goopg/internal/parser"
+)
 
 func addPartialHashJoinPath(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp costParams,
 	jt parser.JoinType, keys, residual []*restrictInfo, bucket float64, final hashJoinFinalCostInput,
@@ -164,6 +167,15 @@ func addPartialHashJoinPath(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp 
 	if !partialPathShapeIsGatherable(o) {
 		tracePVetoCtx(s, "hash", traceRelids(joinrel), traceRelids(outer), traceRelids(inner), "V6", "jt="+traceJoinTypeName(jt))
 		return
+	}
+
+	// joinpath.c:2436-2448: "Can we use a partial inner plan too, so that we
+	// can build a shared hash table in parallel?" — tried FIRST, beside the
+	// complete-inner variant below; add_partial_path keeps the cheaper.
+	// JOIN_UNIQUE_INNER is excluded ("we can't guarantee uniqueness").
+	// M0146-0002.
+	if uniq != uniqueSideInner && cp.enableParallelHash && len(inner.PartialPathlist) > 0 {
+		addParallelHashJoinPath(s, joinrel, outer, inner, o, inner.PartialPathlist[0], cp, jt, keys, residual, bucket, final)
 	}
 
 	// `get_cheapest_parallel_safe_total_inner` (pathkeys.c:699). Upstream first
@@ -522,4 +534,91 @@ func cheapestParallelSafeTotalInner(paths []*Path) *Path {
 		}
 	}
 	return best
+}
+
+// addParallelHashJoinPath is `try_partial_hashjoin_path(..., parallel_hash =
+// true)` (joinpath.c:1290-1297): a partial outer probing ONE shared table that
+// the participants build cooperatively from a PARTIAL inner — the executor's
+// Parallel Hash (internal/executor/parallel_hash_shared.go). M0146-0002;
+// design docs/design/0100-0149/m0146-0002-parallel-hash-partial-inner.md.
+//
+// Priced as initial_cost_hashjoin with parallel_hash (costsize.c:4160-4260):
+// the build's startup is the partial inner's own (per-participant) cost, every
+// CPU term reads the per-participant inner rows, and only the table geometry
+// sees the total under the combined budget (hashJoinInputs.parallelHash).
+//
+// Two refusals PG does not have, both executor capacity (M0145-0010 scope (d):
+// never admit a shape the executor cannot run):
+//   - the inner must be a partial SEQ SCAN — the one build shape whose claims
+//     the executor wires (attachParallelHashBuildSides; partialPathDrivingKind
+//     refuses the rest the same way);
+//   - the build must fit ONE batch, both as a whole under the combined budget
+//     and per participant under hash_mem: parallel hash batching is not
+//     ported and the executor refuses a spilled share (ledgered).
+func addParallelHashJoinPath(s *searchCtx, joinrel, outer, inner *RelOptInfo, o, i *Path, cp costParams,
+	jt parser.JoinType, keys, residual []*restrictInfo, bucket float64, final hashJoinFinalCostInput) {
+	veto := func(code string) {
+		tracePVetoCtx(s, "hash", traceRelids(joinrel), traceRelids(outer), traceRelids(inner), code, "phash jt="+traceJoinTypeName(jt))
+	}
+	if i == nil || !i.ParallelSafe || i.ParallelWorkers <= 0 || i.RequiredOuter != 0 {
+		veto("PH1")
+		return
+	}
+	if partialPathDrivingKind(i) != PathSeqScan {
+		veto("PH2")
+		return
+	}
+	if calcNonNestloopRequiredOuter(o, i) != 0 {
+		veto("PH3")
+		return
+	}
+	// inner_path_rows_total = inner_path_rows * get_parallel_divisor(inner_path)
+	innerTotal := i.Rows * getParallelDivisor(i.ParallelWorkers, cp.parallelLeaderParticipation)
+	if hashsize.Choose(innerTotal, pathNCols(i), pathAvgVarBytes(i), cp.workMem*int64(o.ParallelWorkers+1)).NBatch > 1 ||
+		hashsize.Choose(i.Rows, pathNCols(i), pathAvgVarBytes(i), cp.workMem).NBatch > 1 {
+		veto("PH4-batches")
+		return
+	}
+
+	divisor := getParallelDivisor(o.ParallelWorkers, cp.parallelLeaderParticipation)
+	rows := clampRowEst(joinrel.Rows / divisor)
+	cost := hashJoinCost(cp, hashJoinInputs{
+		outer: o.Cost, inner: i.Cost,
+		outerRows: o.Rows, innerRows: i.Rows,
+		outputRows:      rows,
+		numHashClauses:  len(keys),
+		innerBucketSize: bucket,
+		final:           final,
+		outerWidth:      pathWidth(o),
+		innerWidth:      pathWidth(i),
+		outerCols:       pathNCols(o), innerCols: pathNCols(i),
+		outerAvgVarBytes: pathAvgVarBytes(o), innerAvgVarBytes: pathAvgVarBytes(i),
+		parallelHash:     true,
+		innerRowsTotal:   innerTotal,
+		parallelWorkers:  o.ParallelWorkers,
+	})
+	cost.Total += qualEvalCost(cp, len(residual), rows)
+
+	addPartialPath(joinrel, &Path{
+		Kind:          PathHashJoin,
+		Jointype:      jt,
+		Rel:           joinrel,
+		Rows:          rows,
+		Cost:          cost,
+		DisabledNodes: disabledNodesFor(!cp.enableHashJoin, o, i),
+		Children:      []*Path{o, i},
+		OuterRelids:   outer.Relids,
+		InnerRelids:   inner.Relids,
+		HashKeys:      keys,
+		Residual:      residual,
+		Pathkeys:      nil,
+		RequiredOuter: 0,
+		// create_hashjoin_path: parallel_aware = consider_parallel &&
+		// parallel_hash — here it is the real thing.
+		ParallelSafe:    parallelSafeWith(joinrel, o, i),
+		ParallelWorkers: o.ParallelWorkers,
+		ParallelAware:   true,
+		ParallelHash:    true,
+	}, "join.hash.partial.parallelhash")
+	veto("PH-filed")
 }

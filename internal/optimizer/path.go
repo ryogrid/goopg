@@ -346,6 +346,12 @@ type Path struct {
 	// allocated thousands of times per join search, and appending the bool
 	// after the int would have grown it from 336 to 344 bytes for one bit.
 	ParallelAware bool
+	// ParallelHash: this PathHashJoin is PG's `parallel_hash = true` variant
+	// (try_partial_hashjoin_path, joinpath.c:1290-1297) — Children[1], the
+	// build side, is itself a PARTIAL path whose share each participant
+	// builds into one shared table. createHashJoinPlan carries it to
+	// Join.ParallelHash. M0146-0002.
+	ParallelHash bool
 
 	ParallelWorkers int
 

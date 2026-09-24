@@ -64,6 +64,11 @@ type PlannerSettings struct {
 	EnableMergeJoin bool
 	EnableNestLoop  bool
 
+	// EnableParallelHash is PG's `enable_parallel_hash` (joinpath.c:2437):
+	// unlike the method toggles above it IS a generation gate — PG files no
+	// `parallel_hash = true` path when it is off. M0146-0002.
+	EnableParallelHash bool
+
 	// EnableSort is PG's `enable_sort` (B-17a): cost_sort's own flag on top of
 	// the input's disabled_nodes count (costsize.c:2144). The producer
 	// (sortPathFor) still builds the Sort path when off, so a query whose
@@ -216,6 +221,7 @@ func DefaultPlannerSettings() PlannerSettings {
 		EnableHashJoin:  true,
 		EnableMergeJoin: true,
 		EnableNestLoop:  true,
+		EnableParallelHash: true,
 		EnableSort:      true,
 		EnableSeqScan:    true,
 		EnableIndexScan:  true,
@@ -279,6 +285,7 @@ func (ps PlannerSettings) costParams() costParams {
 		// method toggles ride along with the cost inputs they are weighed
 		// against.
 		enableHashJoin:  ps.EnableHashJoin,
+		enableParallelHash: ps.EnableParallelHash,
 		enableMergeJoin: ps.EnableMergeJoin,
 		enableNestLoop:  ps.EnableNestLoop,
 		enableSort:      ps.EnableSort,

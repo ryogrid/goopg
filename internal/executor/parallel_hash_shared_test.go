@@ -187,3 +187,62 @@ func TestParallelHashBarrier(t *testing.T) {
 		t.Fatalf("a participant's failure must reach every waiter; got %v", err)
 	}
 }
+
+// TestParallelHashPathModelWinner is slice 2's consumer check: on plans the
+// PATH MODEL chose with enable_parallel_hash on, the gathered hash join is the
+// `parallel_hash = true` variant — both scans stamped partial, labelled
+// `Parallel Hash Join` — and it returns exactly the serial rows. "An unwinnable
+// path is an untested path": the planner arm is only proven once a plan it
+// won has executed.
+func TestParallelHashPathModelWinner(t *testing.T) {
+	ctx, cleanup := pqJoinFixture(t)
+	defer cleanup()
+
+	chosen := 0
+	for _, sql := range c19fCorpus() {
+		t.Run(sql, func(t *testing.T) {
+			restoreOff := optimizer.SetGatherPathsMode("off")
+			serialPlan := c19fPlan(t, ctx, sql)
+			restoreOff()
+
+			restoreAll := optimizer.SetGatherPathsMode("all")
+			advanceStmtCounter(ctx)
+			stmts, err := parser.Parse(sql)
+			if err != nil {
+				t.Fatalf("parse: %v", err)
+			}
+			ps := c19fSettings()
+			ps.EnableParallelHash = true
+			parPlan, err := optimizer.PlanWithSettings(stmts[0], ctx.Catalog, ps)
+			restoreAll()
+			if err != nil {
+				t.Fatalf("plan: %v", err)
+			}
+			gather := c19fFindGather(parPlan)
+			if gather == nil {
+				t.Skip("the path model chose no Gather for this shape")
+			}
+			j := c19fFindJoin(gather.Child)
+			if j == nil || j.Algo != optimizer.JoinAlgoHash || !j.ParallelHash {
+				t.Skipf("the gathered join is not a Parallel Hash (%+v)", j)
+			}
+			chosen++
+			for side, n := range map[string]optimizer.Node{"left": j.Left, "right": j.Right} {
+				if s := c19fScanOf(n); s == nil || !s.Parallel {
+					t.Errorf("the %s scan of a Parallel Hash join is not stamped Parallel; both sides are partial", side)
+				}
+			}
+			if got := describePlan(j, nil); !strings.HasPrefix(got, "Parallel Hash") {
+				t.Errorf("EXPLAIN label = %q, want the Parallel Hash Join label", got)
+			}
+			want := c19fRun(t, ctx, serialPlan)
+			got := c19fRun(t, ctx, parPlan)
+			if strings.Join(got, "\n") != strings.Join(want, "\n") {
+				t.Fatalf("Parallel Hash plan returned %d rows, serial %d (or rows differ)", len(got), len(want))
+			}
+		})
+	}
+	if chosen == 0 {
+		t.Fatal("no shape produced a planner-chosen Parallel Hash; the arm was never exercised")
+	}
+}

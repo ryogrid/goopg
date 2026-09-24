@@ -573,6 +573,8 @@ func createHashJoinPlan(p *Path) (Node, outputLayout) {
 		Left:      in.outer,
 		Right:     in.inner,
 		Predicate: in.joinPredicate("PathHashJoin", pairs, p.Residual),
+		// M0146-0002: the build side is partial and built cooperatively.
+		ParallelHash: p.ParallelHash,
 		// `HashKeys[0] IS (LeftKey, RightKey), by pointer` (plan.go:840) — the
 		// single-pair view and the list view must not be able to disagree, so
 		// the pair is shared rather than rebuilt.

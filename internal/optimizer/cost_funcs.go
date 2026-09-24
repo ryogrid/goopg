@@ -83,6 +83,9 @@ type costParams struct {
 	// means the method is enabled; a disabled method still PRODUCES its path
 	// and increments Path.DisabledNodes, as PG 18 does.
 	enableHashJoin  bool
+	// enableParallelHash: enable_parallel_hash, a generation gate for the
+	// `parallel_hash = true` partial hash join (M0146-0002).
+	enableParallelHash bool
 	enableMergeJoin bool
 	enableNestLoop  bool
 	// enableSort is `enable_sort` (B-17a): cost_sort's own flag on top of the
@@ -143,6 +146,7 @@ func defaultCostParams() costParams {
 		// is what let the two drift apart in the first place.
 		workMem:         hashsize.HashMemLimit(hashsize.DefaultMemLimitBytes, hashsize.DefaultHashMemMultiplier),
 		enableHashJoin:  true,
+		enableParallelHash: true,
 		enableMergeJoin: true,
 		enableNestLoop:  true,
 		enableSort:      true,
@@ -796,6 +800,27 @@ type hashJoinInputs struct {
 	// `hashsize.Choose`. Populated from RelOptInfo.AvgVarBytes; zero when no
 	// ANALYZE stats exist (correct for fixed-width relations). M0128-P3.1.
 	outerAvgVarBytes, innerAvgVarBytes float64
+
+	// parallelHash is initial_cost_hashjoin's `parallel_hash` (costsize.c:4165):
+	// innerRows is then the PER-PARTICIPANT count of a partial inner, and only
+	// the table geometry uses the total (inner_path_rows_total = rows ×
+	// get_parallel_divisor, :4209-4210) under the combined budget
+	// (ExecChooseHashTableSize's try_combined_hash_mem: hash_mem ×
+	// (parallel_workers + 1), nodeHash.c:699-707). Every CPU term keeps the
+	// per-participant rows, as PG's does. M0146-0002.
+	parallelHash    bool
+	innerRowsTotal  float64
+	parallelWorkers int
+}
+
+// hashGeometryInputs returns the inner row count and memory budget the hash
+// table geometry is solved for: the path's own rows and hash_mem, or — for a
+// Parallel Hash — the total rows and the combined budget of every participant.
+func (in hashJoinInputs) hashGeometryInputs(cp costParams) (float64, int64) {
+	if !in.parallelHash {
+		return in.innerRows, cp.workMem
+	}
+	return in.innerRowsTotal, cp.workMem * int64(in.parallelWorkers+1)
 }
 
 // hashJoinCost reproduces initial_cost_hashjoin + final_cost_hashjoin
@@ -858,7 +883,8 @@ func hashJoinCost(cp costParams, in hashJoinInputs) Cost {
 		// PG's packed-tuple virtual buckets, not Goopg's map capacity. The
 		// existing cpuOperatorCost*numHashClauses remains this model's surrogate
 		// for hash_qual_cost.per_tuple; no general QualCost model is implied.
-		if geometry, ok := pgHashGeometry(in.innerRows, in.innerWidth, cp.workMem); ok {
+		geoRows, geoMem := in.hashGeometryInputs(cp)
+		if geometry, ok := pgHashGeometry(geoRows, in.innerWidth, geoMem); ok {
 			unmatched := in.outerRows - outerMatched
 			if unmatched > 0 {
 				bucketTuples := clampRowEst(in.innerRows / float64(geometry.virtualBuckets))

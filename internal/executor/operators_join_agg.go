@@ -562,6 +562,14 @@ func (o *joinOp) openLazyHashJoin(ctx *Context) error {
 	if ph := lookupParallelHashBuild(ctx, o.plan); ph != nil {
 		return o.openParallelHashJoin(ctx, ph)
 	}
+	if o.plan.ParallelHash {
+		// A Parallel Hash join with no registered build state would build
+		// only this participant's claimed share of the inner and probe it as
+		// if complete. Every producer registers one (the Gather, before
+		// fan-out; StripGather clears the flag), so reaching here is a planner
+		// or executor bug — fail loudly rather than drop matches.
+		return errParallelHashUnregistered
+	}
 	if sb := lookupSharedHashBuild(ctx, o.plan); sb != nil {
 		o.applySharedBuild(ctx, sb)
 		return o.openProbeSide(ctx, sb.probeIsLeft)

@@ -537,6 +537,16 @@ func partialPathDrivingKind(p *Path) PathKind {
 		if p.RequiredOuter != 0 || len(p.Children) != 2 {
 			return PathPrebuilt
 		}
+		// M0146-0002: a Parallel Hash join's BUILD side is partial too, and
+		// the executor claims it through the join's own claim set
+		// (attachParallelHashBuildSides). Only a partial seq scan is admitted
+		// there: a bitmap build would find no prebuilt bitmap in that set,
+		// and any other shape is one this slice never proved — an unclaimed
+		// build side means every participant builds the whole relation into
+		// the shared table, N copies of every inner row.
+		if p.ParallelHash && partialPathDrivingKind(p.Children[1]) != PathSeqScan {
+			return PathPrebuilt
+		}
 		return partialPathDrivingKind(p.Children[0])
 	case PathMergeJoin:
 		// E-20 Cut 3 (`try_partial_mergejoin_path`, joinpath.c:1145). A
@@ -715,6 +725,11 @@ func setOpBranchDrivingKindIsSupported(p *Path) bool {
 		// branch's workers each private-build its inner, correct and Nx
 		// the memory, the same E-20 deferral the top level already carries.
 		if p.RequiredOuter != 0 || len(p.Children) != 2 {
+			return false
+		}
+		// M0146-0002: no Parallel Hash inside a partial SetOp branch — the
+		// branch claim sets carry no per-join build state.
+		if p.ParallelHash {
 			return false
 		}
 		return setOpBranchDrivingKindIsSupported(p.Children[0])
