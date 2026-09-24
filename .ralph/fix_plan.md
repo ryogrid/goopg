@@ -169,7 +169,7 @@ FROZEN-PREFIXES:
 (the M0142-0008 chain was UNFROZEN by owner decision 2026-09-20; see below —
 the empty prefix list is what makes them selectable again)
 
-LINEAGE-BASELINE: M0145-0001 M0145-0003 M0145-0006 M0145-0014 M0145-0015 M0145-0016 M0145-0017 M0145-0004a M0145-0005 M0145-0007 M0145-0027 M0145-0028
+LINEAGE-BASELINE: M0145-0001 M0145-0003 M0145-0006 M0145-0014 M0145-0015 M0145-0016 M0145-0017 M0145-0004a M0145-0005 M0145-0007 M0145-0027 M0145-0028 M0145-0004 M0145-0026 M0145-0026a M0145-0029 M0145-0030
 (owner re-pin 2026-09-22: the six completed M0145-0001 descendants listed
 above are pinned OUT of the S4 last-5 lineage-budget window — the count
 restarts from the re-open point. This is NOT a root exemption: every
@@ -183,6 +183,17 @@ the M0145-0008 flip is the first descendant that can move an instrument.
 Blocking the lineage at the flip is the guard's blind spot, not a signal of
 inert work. Still not a root exemption: post-flip completions accumulate
 toward a fresh budget and the instruments DO see the default arm then.)
+(owner re-pin 2026-09-24, third, delegated — resolves the same-day
+M0145-0001 escalation, option (a) plus a bounded exemption:
+M0145-0004/0026/0026a/0029/0030 are added to the pin — the same pre-flip
+instrument-artefact class the second re-pin adjudicated. GO on
+M0145-0008b/c/d and on the M0145-0008 legacy-deletion slices.
+**Bounded exemption**: while any M0145-0008 legacy-deletion slice remains
+open, the loop may APPEND newly completed M0145-0001-descendant ids to
+this LINEAGE-BASELINE line itself — owner-delegated, this line only, no
+other banner edits — so deletion-era `Movement: none` streaks need no
+further owner round-trip. The delegation ends when the deletion slices
+close; completions after that accumulate toward a fresh budget.)
 
 LINEAGE-BASELINE: M0142-0005 M0142-0005b M0142-0005c M0142-0005d M0142-0005e M0142-0005f
 (owner pin 2026-09-23, delegated: required so M0146-0004 — the per-worker
@@ -298,6 +309,15 @@ delegated; details in each task's entry):
 - **Banner re-rank (item 10 split / pre-flip M0146 executor-substrate):
   NOT NEEDED** — the two flip unblocks above restore the M0145-0008
   critical path; M0146's flip gate stays as filed.
+- **M0145-0001 third lineage exhaustion (ralph2 loop #49): resolved —
+  option (a) + bounded exemption.** The five in the window
+  (0004/0026/0026a/0029/0030) are pre-flip completions — the same
+  instrument-artefact class the second re-pin adjudicated — so
+  `LINEAGE-BASELINE` is re-pinned again; GO on M0145-0008b/c/d (ordered
+  0008b → 0008c → 0008d) and on the legacy-deletion slices. Until those
+  slices close, the loop may self-append completed M0145-0001
+  descendants to the root's `LINEAGE-BASELINE` line (delegated — that
+  line only).
 - **work_mem 512MB→4MB: RESOLVED 2026-09-24** — every measurement
   cluster on both engines carries `work_mem = 512MB` explicitly in
   `postgresql.conf`, no session `SET`; the remaining BootVal-fidelity
@@ -15160,7 +15180,7 @@ EXISTS/IN body via `planSelectWithParent` before unnest/search ever run
 M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
 `-3i-lateral-route` all block on this milestone's 0003.
 
-- [!] **M0145-0001 — recon: the jointree-level IR and the lowering
+- [x] **M0145-0001 — recon: the jointree-level IR and the lowering
   contract** (design the representation the whole milestone builds on).
   **DONE 2026-09-21.**
 
@@ -15201,6 +15221,17 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
   >   and GO on the deletion slices plus 0008b/c/d; \(b\) GO on 0008b/c/d
   >   only, deferring legacy deletion; \(c\) hold item 3 and continue with
   >   item 4 \(M0141\-S2a\-fix2r\).
+  >
+  > **OWNER ANSWER 2026\-09\-24 \(delegated\): option \(a\) — re\-pin, GO on
+  > 0008b/c/d \(ordered 0008b → 0008c → 0008d\) and on the legacy\-deletion
+  > slices, PLUS a bounded exemption:** while any M0145\-0008
+  > legacy\-deletion slice is open the loop may self\-append completed
+  > M0145\-0001 descendants to this root's `LINEAGE\-BASELINE` line \(see
+  > the banner's third re\-pin note\). The five pinned are pre\-flip
+  > completions — the instrument\-artefact class the 09\-23 re\-pin already
+  > adjudicated; post\-flip, instruments see the default arm \(M0146\-0002's
+  > `Movement: yes` proved it\). The three held items are filed as
+  > **M0145\-0008b / 0008c / 0008d** below.
 
   > ## ESCALATION 2026-09-23 (ralph2 loop \#5) — lineage budget exhausted again, OWNER DECISION NEEDED
   >
@@ -19271,6 +19302,45 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
       the rule\-era sorted\-input builder; hash\-build EXPLAIN ANALYZE
       `loops=0`.
     - Group I \(index coverage\) remains M0145\-0029\'s residue.
+
+- [ ] **M0145-0008b — recon: attribute the Q18/Q22 slowdown on the
+  jointree default** (filed 2026-09-24, held in the M0145-0001 third
+  lineage escalation until the owner answer above; ledger row exists).
+  On the flip commit's own binary, TPC-H Q18 runs 1.6x and Q22 3.2x
+  slower on the jointree default than on legacy (12.31 s → 20.19 s,
+  0.48 s → 1.52 s); neither the estimator fixes nor the NULL-key guard
+  causes it, and both queries are SHAPE-DIFF vs PG on both arms. Diff
+  the two arms' plans per query, find the divergence the jointree arm
+  adds, and name the fix (or attribute it to an already-filed task).
+  Kind: recon
+  Parent: M0145-0008
+  - Expected movement: none by itself (recon); impl follow-ups file
+    their own.
+
+- [ ] **M0145-0008c — recon: PG-shared attribution for the flip's NEW
+  ea-ratchet key `Q95:cte:ws_wh+customer_address+date_dim+web_sales+
+  web_site`** (same filing). The flip introduced a Hash Semi Join est 1
+  vs actual 22 (`pg_est` null) finding; G4 forbids repinning an
+  introduced key without PG-shared evidence. Run the PG nearest-scope
+  estimate for this relset; then either fix the estimate or repin under
+  the G4 PG-shared extension with the measured evidence.
+  Kind: recon
+  Parent: M0145-0008
+  - Expected movement: ea-ratchet NEW findings 1 → 0 (fix or attributed
+    repin).
+
+- [ ] **M0145-0008d — grouping pathkeys follow the ORDER BY direction
+  when compatible** (same filing; ledger row exists). PG plans
+  `GROUP BY c … ORDER BY c DESC` as GroupAggregate over one
+  `Sort … DESC` — the group clause adopts ORDER BY's direction
+  (planner.c `preprocess_groupclause`, pathkeys) — keeping the Subquery
+  Scan; goopg hashes or sorts twice. Port the pathkey-direction
+  adoption for grouping when compatible with the ordering request.
+  Kind: impl
+  Parent: M0145-0008
+  - Expected movement: `aggregation-strategy` / `sort-strategy` on
+    `GROUP BY k … ORDER BY k DESC` shapes on the canonical parallel
+    capture.
 
 ## M0146 — Post-cutover plan parity (filed 2026-09-23, owner decision)
 
