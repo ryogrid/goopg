@@ -112,8 +112,8 @@ func TestVacuumSecondHeapPassKeepsIndexesExact(t *testing.T) {
 				{"SELECT id, v FROM lpt WHERE id = 99", "SELECT id, v FROM lpt WHERE id + 0 = 99"},
 				{"SELECT id, v FROM lpt WHERE id BETWEEN 3100 AND 3140", "SELECT id, v FROM lpt WHERE id + 0 BETWEEN 3100 AND 3140"},
 			} {
-				got := sortedRowStrings(t, ctx, q.indexed)
-				want := sortedRowStrings(t, ctx, q.noIndex)
+				got := sortedRowValues(t, ctx, q.indexed)
+				want := sortedRowValues(t, ctx, q.noIndex)
 				if strings.Join(got, "|") != strings.Join(want, "|") {
 					t.Fatalf("%s: indexed %v, heap %v\nplan:\n%s", q.indexed, got, want,
 						strings.Join(runExplainRows(t, ctx, "EXPLAIN "+q.indexed), "\n"))
@@ -175,8 +175,8 @@ func TestAutovacuumSequenceCleansIndexesAndFreesItems(t *testing.T) {
 		t.Fatal("a table the catalog cannot confirm by identity must not be reported clean")
 	}
 	runSQL(t, ctx, "INSERT INTO avt SELECT g, 'new-' || g FROM generate_series(5000, 5400) g")
-	got := sortedRowStrings(t, ctx, "SELECT id, v FROM avt WHERE id BETWEEN 30 AND 60")
-	want := sortedRowStrings(t, ctx, "SELECT id, v FROM avt WHERE id + 0 BETWEEN 30 AND 60")
+	got := sortedRowValues(t, ctx, "SELECT id, v FROM avt WHERE id BETWEEN 30 AND 60")
+	want := sortedRowValues(t, ctx, "SELECT id, v FROM avt WHERE id + 0 BETWEEN 30 AND 60")
 	if strings.Join(got, "|") != strings.Join(want, "|") {
 		t.Fatalf("indexed %v != heap %v", got, want)
 	}

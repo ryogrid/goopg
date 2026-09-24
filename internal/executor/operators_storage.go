@@ -1062,6 +1062,11 @@ type seqScanOp struct {
 	// stay full-width — only the deform window narrows, so bound ==
 	// len(cols) takes the exact pre-EX1-01 path. See scan_deform.go.
 	deformBound int
+	// borrowRows is set at Build when the parent consumes every row before
+	// the next Next() and retains nothing of it (aggregateBorrowsScanRows):
+	// Next then yields scanRow itself instead of a per-tuple clone
+	// (M0145-0008u).
+	borrowRows bool
 	// scanSlot is the boxed SlotView over scanRow, cached because
 	// converting a slice to an interface heap-allocates
 	// (runtime.convTslice) and scanRow's identity does not change
@@ -2240,7 +2245,16 @@ func (o *seqScanOp) Next() (TupleSlot, error) {
 			//
 			// M0145-0008f: only the deformed survivor window is detached;
 			// the undeformed tail is stale and never read (EX1-03a).
-			row = cloneRowOwnedPrefix(row, survivorBound)
+			//
+			// M0145-0008u: a parent that consumes each row before its next
+			// Next() and keeps nothing of it (borrowRows) takes the scan's
+			// own row, as PG hands an aggregate a slot over the buffer
+			// (ExecStoreBufferHeapTuple). Datums never alias page bytes
+			// (varlena values live in the scan's per-page arena), so only
+			// the row slice and the arena's page lifetime are shared.
+			if !o.borrowRows {
+				row = cloneRowOwnedPrefix(row, survivorBound)
+			}
 			// Inject KindEnum datums for enum-typed columns (M0097-enum).
 			if len(o.enumTypes) > 0 {
 				for i, et := range o.enumTypes {

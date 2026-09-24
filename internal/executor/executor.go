@@ -296,6 +296,15 @@ func buildNode(plan optimizer.Node, bound int, scope *instrumenter) (Operator, e
 		// into a fresh groupValues Row before pulling the next
 		// child slot — slot lifetime is bounded by the per-Next
 		// read, no borrow contract needed.
+		//
+		// M0145-0008u: for an aggregate that provably keeps nothing of
+		// the row it reads (aggregateBorrowsScanRows), a seq scan child
+		// hands up its own reused row instead of a per-tuple clone.
+		if aggregateBorrowsScanRows(p) {
+			if so := unwrapSeqScanOp(child); so != nil {
+				so.borrowRows = true
+			}
+		}
 		return maybeInstrument(p, newAggregateOp(p, child), scope), nil
 	case *optimizer.WindowAgg:
 		child, err := buildNode(p.Child, deformBoundFull, scope)

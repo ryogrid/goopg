@@ -19887,7 +19887,7 @@ Movement: none — no plan moved on TPC-DS SF0.25/SF1 or TPC-H across all four d
       and regress = HEAD\'s failures.
     Movement: none — storage bookkeeping; no plan or value moved.
 
-- [ ] **M0145\-0008u — a pin\-held \(zero\-copy\) seq\-scan slot**
+- [x] **M0145\-0008u — a pin\-held \(zero\-copy\) seq\-scan slot**
   \(filed 2026\-09\-25 by M0145\-0008q\). With compaction under a cleanup
   lock, a scan may hand its parent a slot that reads the pinned page after
   the content lock is released, as `ExecStoreBufferHeapTuple` does, and
@@ -19900,6 +19900,22 @@ Movement: none — no plan moved on TPC-DS SF0.25/SF1 or TPC-H across all four d
     `Next\(\)` call and confirm it already materializes; then drop
     `cloneRowOwnedPrefix` in `seqScanOp.Next` behind that audit, with the
     tail\-poison harness and the isolation family as gates.
+  - **DONE 2026\-09\-25.** Design:
+    `docs/design/0100-0149/m0145-0008u-borrowed-scan-rows.md`; evidence
+    `analysis/m0145/m0145-0008u/`.
+    - Audit result: the clone detaches the reused row slice and the per\-page
+      arena; datums never alias page bytes. A seq scan now hands its own row
+      to a direct\-parent aggregate that keeps nothing \(built\-in
+      count/sum/avg/min/max; no passthrough, user aggs, DISTINCT, ORDER BY,
+      WITHIN GROUP, sorted strategy or Finalize\).
+    - Serial `count\(\*\)` 1.50 → 0.95 s \(PG 0.96\), `sum` 2.91 → 2.13 s,
+      parallel 0.57 → 0.24 / 1.10 → 0.65 s; TPC\-H Q1 4.17 → 3.12 s; values
+      identical.
+    - Found: test helper `sortedRowStrings` renders only `Datum.Int`; the
+      0008v lifecycle tests now use a value\-rendering helper.
+    - Gates: units, race, spotcheck, acceptance 24 MATCH, sf025 96/96,
+      isolation and regress = HEAD\'s failures.
+    Movement: none — executor only; no plan moved.
 
 - [ ] **M0145\-0008r — WRONG RESULTS: a bitmap scan over an unproven partial
   index drops the rows its predicate excludes** \(found 2026\-09\-25 while
