@@ -1,0 +1,20 @@
+# M0145-0008p A/B, TPC-H SF1 lineitem (6,001,726 rows), private copy of the
+# acceptance-arm clone on :5534, HEAD b1f93fb81 vs candidate (working tree).
+# GOMEMLIMIT=12GiB GOGC=100. Arms alternate head/cand/head/cand; each arm is a
+# fresh server; four runs per query, the first warms. ms via psql \timing.
+head workers=0 count(*)  6657 5069 4788 4754   val=6001726
+head workers=0 sum(l_quantity)  3229 3283 3388 3399   val=153055315
+head workers=2 count(*)  2049 1797 1831 1763   val=6001726
+head workers=2 sum(l_quantity)  1001 1004 1000 967   val=153055315
+cand workers=0 count(*)  3273 1460 1478 1473   val=6001726
+cand workers=0 sum(l_quantity)  3418 3508 3375 3538   val=153055315
+cand workers=2 count(*)  1270 564 578 580   val=6001726
+cand workers=2 sum(l_quantity)  1022 998 982 976   val=153055315
+head workers=0 count(*)  6556 4879 4980 4919   val=6001726
+head workers=0 sum(l_quantity)  3341 3342 3358 3370   val=153055315
+head workers=2 count(*)  2004 1727 1714 1737   val=6001726
+head workers=2 sum(l_quantity)  1004 1004 1015 1006   val=153055315
+cand workers=0 count(*)  2864 1534 1555 1538   val=6001726
+cand workers=0 sum(l_quantity)  3328 3350 3366 3341   val=153055315
+cand workers=2 count(*)  2614 565 580 573   val=6001726
+cand workers=2 sum(l_quantity)  995 994 1000 1006   val=153055315

@@ -1057,9 +1057,10 @@ type seqScanOp struct {
 	// Build-time consumer walk proved no consumer reads past it. Stamped by
 	// both Build paths (buildNode / buildRec); 0 means unset and behaves as
 	// full width (the safe default for directly-constructed scans that
-	// bypass both paths, e.g. COPY's scan). scanRow/schema stay full-width —
-	// only the deform window narrows, so bound == len(cols) takes the exact
-	// pre-EX1-01 path. See scan_deform.go.
+	// bypass both paths, e.g. COPY's scan). deformWidthZero means no column
+	// is deformed: the parent consumes none (M0145-0008p). scanRow/schema
+	// stay full-width — only the deform window narrows, so bound ==
+	// len(cols) takes the exact pre-EX1-01 path. See scan_deform.go.
 	deformBound int
 	// scanSlot is the boxed SlotView over scanRow, cached because
 	// converting a slice to an interface heap-allocates
@@ -2090,11 +2091,9 @@ func (o *seqScanOp) Next() (TupleSlot, error) {
 			// previous contents (poisoned at deform time when the debug
 			// flag is armed). The bound always covers the prefilter
 			// prefix: the walk folds the same predicate it derives
-			// MaxCols from.
-			survivorBound := len(o.cols)
-			if o.deformBound > 0 && o.deformBound < survivorBound {
-				survivorBound = o.deformBound
-			}
+			// MaxCols from. A zero-consumer parent (count(*)) stamps
+			// deformWidthZero, and the window is empty (M0145-0008p).
+			survivorBound := seqScanSurvivorWidth(o.deformBound, len(o.cols))
 			// earlyDecided records that the absorbed qual already returned a
 			// verdict for this row at the EARLY position, so the LATE
 			// position must not evaluate it again. At most one VERDICT per

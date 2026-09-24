@@ -36,7 +36,11 @@ import (
 //     Arg/Arg2/ExtraArgs/Filter/OrderBy/WithinGroupOrderBy, Passthrough,
 //     all in child-output space) as consumers first, re-narrowing the fresh
 //     bound, and the walk continues below. This is what moves Q6-class
-//     scans (Aggregate→Filter→SeqScan).
+//     scans (Aggregate→Filter→SeqScan). The fresh bound starts at
+//     deformBoundZero, not deformBoundNone: an Aggregate whose arms fold
+//     nothing (count(*)) consumes no child column, and the scan below it
+//     deforms none (M0145-0008p). A Finalize aggregate reads its child's
+//     partial-state columns without an arm, so it starts at None instead.
 //   - Join maps the merged-space Predicate AND the remapped above-join
 //     refs through the join's output layout, per side (EX1-02): the
 //     canonical source is Join.Predicate split by the exprSide cutoff
@@ -83,9 +87,25 @@ import (
 // takes the exact pre-EX1-01 path (no behaviour change, no poison).
 const (
 	// deformBoundNone threads while no consumer reference has been recorded.
+	// At the plan root that means the rows go to the client whole, so a leaf
+	// resolves it to full width.
 	deformBoundNone = -1
+	// deformBoundZero is a consumer boundary that reads no child column: an
+	// Aggregate whose arms fold no reference (count(*)). PG deforms nothing
+	// there; the aggregate never calls slot_getsomeattrs (execTuples.c). It
+	// sorts below deformBoundNone, so plain max keeps the algebra: a column
+	// reference folded later raises it to that index, and meeting None
+	// (every `incoming < 0` mapping arm below) widens it to full, the safe
+	// direction. Only a SeqScan leaf resolves it to width 0 (M0145-0008p).
+	deformBoundZero = -2
 	// deformBoundFull is sticky full width: max() with it never narrows.
 	deformBoundFull = int(^uint(0) >> 1)
+	// deformWidthZero is the stamp effectiveDeformBound gives a leaf for
+	// deformBoundZero: deform no column. Stamps are otherwise widths, and 0
+	// already means "unset, full width" for scans built outside Build. The
+	// index and bitmap heap leaves read any stamp <= 0 as full width; the
+	// SeqScan resolves this one through seqScanSurvivorWidth.
+	deformWidthZero = -1
 )
 
 // deformScanRefs records the highest ColumnRef.Index e reads in *maxRef,
@@ -274,7 +294,14 @@ func deformBoundBelow(parent optimizer.Node, incoming int) int {
 		// space and cannot map through it, so it is dropped. The arms
 		// below ARE in child-output space, so they are read as consumers
 		// first and re-narrow the fresh bound; the walk continues below.
-		bound := deformFoldRefs(deformBoundNone, p.GroupExprs...)
+		// With no arm folding a reference the bound stays deformBoundZero
+		// and the scan deforms nothing. A Finalize aggregate consumes its
+		// child's state columns without an arm, so it starts at None.
+		fresh := deformBoundZero
+		if p.Mode == optimizer.AggModeFinal {
+			fresh = deformBoundNone
+		}
+		bound := deformFoldRefs(fresh, p.GroupExprs...)
 		for i := range p.Aggs {
 			a := &p.Aggs[i]
 			bound = deformFoldRefs(bound, a.Arg, a.Arg2)
@@ -689,18 +716,38 @@ func deformNLIInnerWidth(n optimizer.Node) int {
 
 // effectiveDeformBound resolves the threaded bound to the exclusive deform
 // width for a leaf with ncols columns. deformBoundNone (no consumer recorded
-// — e.g. a bare scan) and deformBoundFull both mean full width; anything
-// else clamps to [1, ncols]. An effective bound equal to ncols must take the
-// exact pre-EX1-01 decode path.
+// — e.g. a bare scan) and deformBoundFull both mean full width;
+// deformBoundZero stamps deformWidthZero; anything else clamps to
+// [1, ncols]. An effective bound equal to ncols must take the exact
+// pre-EX1-01 decode path.
 func effectiveDeformBound(bound, ncols int) int {
 	if ncols <= 0 {
 		return 0
+	}
+	if bound == deformBoundZero {
+		return deformWidthZero
 	}
 	if bound < 0 || bound == deformBoundFull {
 		return ncols
 	}
 	if need := bound + 1; need < ncols {
 		return need
+	}
+	return ncols
+}
+
+// seqScanSurvivorWidth resolves a SeqScan's stamp to the number of leading
+// columns its survivor path deforms: 0 for deformWidthZero, the stamp for a
+// narrowing stamp, and ncols for unset (0) or full. The absorbed qual's
+// columns are always inside it: the walk folds the Filter predicate before
+// the scan is built, so a qual that reads a column never leaves the bound
+// at deformBoundZero.
+func seqScanSurvivorWidth(stamp, ncols int) int {
+	if stamp == deformWidthZero {
+		return 0
+	}
+	if stamp > 0 && stamp < ncols {
+		return stamp
 	}
 	return ncols
 }

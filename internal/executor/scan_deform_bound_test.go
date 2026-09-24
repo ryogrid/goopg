@@ -39,8 +39,8 @@ func deformLt(l, r optimizer.Expr) optimizer.Expr {
 }
 
 // seqLeafBound walks a built operator tree to its SeqScan leaf and reports
-// the stamped deform bound (normalised: unset reads as full width) and the
-// leaf column count. Gather is followed through the worker buildChild
+// the stamped deform bound (normalised: unset reads as full width, the
+// zero-consumer stamp as 0) and the leaf column count. Gather is followed through the worker buildChild
 // closure, which is exactly the EX1-01 capture under test.
 func seqLeafBound(t *testing.T, op Operator) (bound, ncols int) {
 	t.Helper()
@@ -48,10 +48,7 @@ func seqLeafBound(t *testing.T, op Operator) (bound, ncols int) {
 		switch o := op.(type) {
 		case *seqScanOp:
 			n := len(o.cols)
-			if o.deformBound <= 0 {
-				return n, n
-			}
-			return o.deformBound, n
+			return seqScanSurvivorWidth(o.deformBound, n), n
 		case *filterOp:
 			op = o.child
 		case *projectOp:
@@ -309,6 +306,7 @@ func TestEffectiveDeformBoundEdges(t *testing.T) {
 	}{
 		{deformBoundNone, 16, 16},
 		{deformBoundFull, 16, 16},
+		{deformBoundZero, 16, deformWidthZero},
 		{5, 16, 6},
 		{0, 16, 1},
 		{15, 16, 16},

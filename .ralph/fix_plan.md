@@ -2358,6 +2358,42 @@ heuristic stays live.)
       segments. No code change.
     Movement: none
 
+### Nightly run 20260925-002342 (sha `2e923ff37337`, 5 items) — filed 2026-09-25
+- [ ] **testport/TestE2E_PGColdStartOnGoopgDataDir** — testport TestE2E\_PGColdStartOnGoopgDataDir FAILed
+  (AI-20260925-002342-001; repro: `go test -v -run '^TestE2E_PGColdStartOnGoopgDataDir$' ./internal/testport/`,
+  evidence `ci/logs/20260925-002342/testport/go-test.log`).
+  Kind: impl
+  Parent: none
+- [ ] **testport/TestPort_IsolationEvalPlanQual** — testport TestPort\_IsolationEvalPlanQual FAILed \(reopened: the 2026\-09\-22 task was closed stale\)
+  (AI-20260925-002342-002; repro: `go test -v -run '^TestPort_IsolationEvalPlanQual$' ./internal/testport/`,
+  evidence `ci/logs/20260925-002342/testport/go-test.log`).
+  Kind: impl
+  Parent: none
+- [ ] **testport/TestPort_IsolationReadWriteUnique4** — testport TestPort\_IsolationReadWriteUnique4 FAILed
+  (AI-20260925-002342-003; repro: `go test -v -run '^TestPort_IsolationReadWriteUnique4$' ./internal/testport/`,
+  evidence `ci/logs/20260925-002342/testport/go-test.log`).
+  Kind: impl
+  Parent: none
+- [ ] **testport/TestPort_IsolationTemporalRangeIntegrity** — testport TestPort\_IsolationTemporalRangeIntegrity FAILed
+  (AI-20260925-002342-004; repro: `go test -v -run '^TestPort_IsolationTemporalRangeIntegrity$' ./internal/testport/`,
+  evidence `ci/logs/20260925-002342/testport/go-test.log`).
+  Kind: impl
+  Parent: none
+- [ ] **testport/TestPort_RegressSuite** — testport TestPort\_RegressSuite FAILed \(must\-pass subtests: portals\_p2, union; reopened: the 2026\-09\-22 task was closed\)
+  (AI-20260925-002342-005; repro: `go test -v -run '^TestPort_RegressSuite$' ./internal/testport/`,
+  evidence `ci/logs/20260925-002342/testport/go-test.log`).
+  Kind: impl
+  Parent: none
+  - Triage 2026\-09\-25: `union` PASSes at HEAD \(`b1f93fb81`\).
+    `portals\_p2` passes alone but FAILs after `create\_index` with a wrong
+    result: a bitmap scan over an unproven partial index → M0145\-0008r
+    \(S2 escalation\).
+  - `union` PASSes alone but FAILs in the full suite, on a clean HEAD
+    worktree too: `count\(\*\)` over `INTERSECT` returns a nondeterministic
+    1660 / 1721 \(PG 5000\), a HashSetOp run per worker over Parallel Seq
+    Scans → M0145\-0008s \(S2 escalation\). Close this item when 0008r and
+    0008s land.
+
 ### Manually discovered (not yet in a nightly `ci/logs/action-items.md` run) — filed 2026-09-15
 
 - [x] **`CREATE FUNCTION` completes with command tag `OK`, not `CREATE
@@ -19584,7 +19620,7 @@ Movement: none — no plan moved on TPC-DS SF0.25/SF1 or TPC-H across all four d
       zero\-copy slot.
     Movement: none — recon.
 
-- [ ] **M0145\-0008p — a scan under a zero\-consumer aggregate deforms and
+- [x] **M0145\-0008p — a scan under a zero\-consumer aggregate deforms and
   copies nothing** \(filed 2026\-09\-25 by M0145\-0008k\). `deformBoundBelow`'s
   Aggregate arm returns `deformBoundNone` when no arm folds a reference
   \(`count\(\*\)`\), and `effectiveDeformBound` maps that to full width. Add a
@@ -19597,6 +19633,22 @@ Movement: none — no plan moved on TPC-DS SF0.25/SF1 or TPC-H across all four d
   - Expected movement: none on parity \(executor only\); serial `count\(\*\)`
     over TPC\-H lineitem 4.8 s → ~1.5 s \(probe\), parallel 1.76 → ~0.6 s;
     acceptance\-arm times on count\(\*\)\-shaped queries.
+  - **DONE 2026\-09\-25.** Design:
+    `docs/design/0100-0149/m0145-0008p-zero-consumer-deform.md`; evidence
+    `analysis/m0145/m0145-0008p/`.
+    - `deformBoundZero` \(\-2\) is the Aggregate arm\'s fresh bound
+      \(Finalize keeps None\); `effectiveDeformBound` stamps
+      `deformWidthZero`; the SeqScan resolves it through
+      `seqScanSurvivorWidth` to window 0. Index/bitmap leaves read the stamp
+      as full width \(a Zero bound cannot reach them: key columns and
+      recheck quals always fold\).
+    - Measured A/B on a private clone: serial `count\(\*\)` 4.8 → 1.5 s,
+      2 workers 1.7 → 0.57 s; `sum` unchanged; values identical.
+    - Gates: units, spotcheck, sf025 96/96 \(99/99 shapes same\),
+      acceptance 24 MATCH, ea\-ratchet 52/52, full regress suite = the same
+      two pre\-existing failures as a clean HEAD worktree \(→ M0145\-0008r,
+      M0145\-0008s\).
+    Movement: none — executor only; no plan moved.
 
 - [ ] **M0145\-0008q — page compaction takes a cleanup lock \(pin count 1\),
   as PG's does** \(filed 2026\-09\-25 by M0145\-0008k\). goopg compacts heap
@@ -19614,6 +19666,75 @@ Movement: none — no plan moved on TPC-DS SF0.25/SF1 or TPC-H across all four d
     \(retention clone only at Sort / Hash build / Material, PG's
     `ExecMaterializeSlot` point\). Gates: isolation family \(prune vs
     concurrent scan\), race gate, pgbench.
+
+- [ ] **M0145\-0008r — WRONG RESULTS: a bitmap scan over an unproven partial
+  index drops the rows its predicate excludes** \(found 2026\-09\-25 while
+  filing nightly AI\-20260925\-002342\-005; reproduces at HEAD `b1f93fb81`\).
+  The must\-pass regress case `portals\_p2` returns `\(0 rows\)` for `SELECT
+  \* FROM onek2 WHERE unique1 = 50` \(and `= 60`\); PG returns one row each.
+  `create\_index` adds `onek2\_u1\_prtl ON onek2\(unique1\) WHERE stringu1 \<
+  'B'`, and goopg plans `Bitmap Heap Scan / Recheck Cond: \(stringu1 \< 'B'\)
+  / Bitmap Index Scan on onek2\_u1\_prtl`. Minimal repro: a 1000\-row table
+  with that partial index; `unique1 = 51` \(stringu1 'Z'\) returns 0 rows.
+  Kind: impl
+  Parent: M0145-0008
+  - Root cause: `buildOneBitmapPath` \(pathbitmap.go\) builds a path for a
+    partial index whose predicate the query does not imply, on the premise
+    that rechecking the predicate on the heap keeps it correct. It does
+    not: a row the predicate excludes has no index entry, so no recheck
+    can bring it back. PG generates the path only when `predOK` holds
+    \(`check\_index\_predicates` / `create\_index\_paths`, indxpath.c\). The
+    other producers \(`addOneOrderedIndexPath`, `findBTreeIndexForColumn`,
+    `pathindexonly.go`, `pathindexrestrict.go`\) already decline; the
+    last reuses the M0134\-0017b narrow `Var op Const` prover.
+  - Likely trigger \(not bisected\): first seen in the 2026\-09\-25 nightly.
+    The legacy single\-table WHERE bypass \(`planIndexScanFromWhere`, which
+    declined unproven partial indexes\) was deleted by the M0145\-0008
+    legacy\-deletion slice 2, so single\-table queries now reach the
+    bitmap producer.
+  - First step: in `buildOneBitmapPath`, decline a partial index unless its
+    predicate is proven from the leaf's conjuncts \(reuse the prover
+    `findBTreeIndexForColumn` uses\); drop the recheck\-append premise and
+    its comment. Pin with the repro above and re\-run `create\_index` \+
+    `portals\_p2` \(`GOOPG\_REGRESS\_DIFF\_DIR` shows the diff\).
+
+  > ## ESCALATION 2026\-09\-25 \(S2\) — wrong results
+  >
+  > M0145\-0008r: a single\-table equality query returns no row when goopg
+  > elects a bitmap scan over a partial index the query does not imply.
+  > The must\-pass regress case `portals\_p2` is red in the nightly. Filed
+  > and not selected ahead of the banner, per S2; the owner decides its
+  > placement.
+
+- [ ] **M0145\-0008s — WRONG RESULTS: a HashSetOp runs per worker over
+  partial \(Parallel Seq Scan\) inputs** \(found 2026\-09\-25 while triaging
+  nightly AI\-20260925\-002342\-005; reproduces at HEAD `b1f93fb81` on a clean
+  worktree\). The must\-pass regress case `union` returns 1660 / 1721 \(varies
+  per run\) for `select count\(\*\) from \( select unique1 from tenk1 intersect
+  select fivethous from tenk1 \) ss`; PG returns 5000. goopg's plan is
+  `Finalize Aggregate / Gather \(4 workers\) / Partial Aggregate / HashSetOp
+  Intersect / Parallel Seq Scan on tenk1, Parallel Seq Scan on tenk1\_1`.
+  Each worker intersects its own share of each side, so a match whose two
+  rows land in different workers is lost. It shows only in the full suite
+  \(the earlier cases leave tenk1 with statistics that make the parallel
+  plan win\); `union` alone passes.
+  Kind: impl
+  Parent: none
+  - PG never builds a SetOp over partial paths: `generate\_nonunion\_paths`
+    \(prepunion.c\) plans both children as complete paths, and a SetOp path
+    is not partial, so a Gather can only sit below it on each child.
+  - First step: find where goopg makes the setop subtree parallel \(Gather
+    stamping above a Partial Aggregate whose input is a SetOp, see memory
+    "goopg parallelism = Gather stamping"\) and refuse a partial scan under
+    a SetOp. Pin with the regress query at 4 workers.
+
+  > ## ESCALATION 2026\-09\-25 \(S2\) — wrong results
+  >
+  > M0145\-0008s: `INTERSECT` \(and presumably `EXCEPT`\) under a parallel
+  > aggregate returns a nondeterministic, too\-small result, because each
+  > worker applies the set operation to only its share of both inputs. The
+  > must\-pass regress case `union` is red in the nightly. Filed and not
+  > selected ahead of the banner, per S2; the owner decides its placement.
 
 - [x] **M0145\-0008g — `expr = ANY \(const list\)` with an expression operand is
   estimated as PG does**: PG prices `substr\(c\_phone,1,2\) IN \(7 values\)` at
