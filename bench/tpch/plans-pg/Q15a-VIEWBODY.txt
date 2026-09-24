@@ -1,6 +1,12 @@
 === Q15a-VIEWBODY
-HashAggregate  (cost=266565.93..266690.97 rows=10003 width=37)
+Finalize GroupAggregate  (cost=165420.98..170653.61 rows=10035 width=37)
   Group Key: l_suppkey
-  ->  Seq Scan on lineitem  (cost=0.00..264331.51 rows=223442 width=17)
-        Filter: ((l_shipdate >= to_date('1996-01-01'::text, 'YYYY-MM-DD'::text)) AND (l_shipdate < (to_date('1996-01-01'::text, 'YYYY-MM-DD'::text) + '3 mons'::interval)))
+  ->  Gather Merge  (cost=165420.98..170227.13 rows=40140 width=37)
+        Workers Planned: 4
+        ->  Sort  (cost=164420.92..164446.01 rows=10035 width=37)
+              Sort Key: l_suppkey
+              ->  Partial HashAggregate  (cost=163628.52..163753.96 rows=10035 width=37)
+                    Group Key: l_suppkey
+                    ->  Parallel Seq Scan on lineitem  (cost=0.00..163090.32 rows=53820 width=17)
+                          Filter: ((l_shipdate >= to_date('1996-01-01'::text, 'YYYY-MM-DD'::text)) AND (l_shipdate < (to_date('1996-01-01'::text, 'YYYY-MM-DD'::text) + '3 mons'::interval)))
 

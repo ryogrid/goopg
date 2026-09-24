@@ -2378,17 +2378,64 @@ heuristic stays live.)
   - Remaining, ledgered: PG prints casts as `(c1)::text`
     \(get\_coercion\_expr\); goopg prints `c1::text`.
 
-- [ ] **work\_mem boots at 512MB; PostgreSQL\'s default is 4MB** \(found
+- [x] **work\_mem boots at 512MB; PostgreSQL\'s default is 4MB** \(found
   2026\-09\-24 by the DISCARD ALL probe: `RESET ALL` returns each server to
   its own default\). `internal/utils/misc/defaults.go` registers work\_mem with
   `BootVal: "512MB"`, undocumented, against the rule that GUC boot values are
   PG 18\'s \(`guc\_tables.c`: 4096 kB\).
   Kind: impl
   Parent: none
-  - Owner call: the value feeds hash\-table sizing and spill costing
-    everywhere \(plans and timing move; the bench clusters may rely on it\),
-    so the fix is PG\'s 4MB boot value with any bench\-side override set in
-    postgresql.conf, not in the boot value.
+  - **OWNER DECISION 2026\-09\-24 \(owner\-directed change, devin\):** the
+    benchmark/measurement question is resolved the OTHER way — instead of
+    moving goopg\'s boot value to PG\'s 4MB, **every measurement cluster on
+    both engines carries `work_mem = 512MB` explicitly in
+    `postgresql.conf` and no session `SET` may override it**. The conf line
+    is the single alignment mechanism; the capture scripts
+    \(`capture-tpch.sh`, `capture-tpcds.sh`, `goopg-margin-census.py`\) now
+    issue no `SET` and verify the values via `SHOW` instead.
+    Landed: five cluster confs \(:65432/:65433/:65436/:65437/:65438\),
+    `setup_goopg.sh`/`setup_pg.sh` templates,
+    `internal/utils/misc/postgresql.conf.sample` \(uncommented — `goopg
+    init` writes the convention automatically\), a `server.sh` warning when
+    a TPC\-DS conf leaves `work_mem` implicit, AGENT.md harness rule,
+    `bench/tp*/README.md`, `m0137-0003` procedure, and the `plans-pg`
+    fixtures re\-captured under 512MB.
+  - Residual, deliberately parked — NOT required for the convention:
+    goopg\'s GUC BootVal remains `512MB` where PG\'s is 4MB, visible via
+    `SHOW work_mem`/`RESET ALL` on a cluster whose conf omits the line.
+    Flipping the BootVal to 4MB stays parked behind take3\-B\-13\'s stated
+    prerequisites \(spill\-cost calibration + a work_mem sweep; deferral
+    ledger `take3-B-13-deferred-2` measured real plan regressions at 4MB\).
+    Since measurement now never reads the boot value, that flip is a pure
+    SHOW-fidelity item — an ordinary M-NIGHTLY-scale task, no longer
+    benchmark-blocking. If it ever lands, the conf/sample convention above
+    keeps measurement at 512MB regardless.
+  - **Incident record 2026\-09\-24 — the first post\-change tpch\-spotcheck
+    appeared to hang \(Q12 running >8 min\) and initially looked like an
+    executor defect exposed by the 512MB plan flip \(Q12 now elects
+    Nested Loop + per\-row `orders_pk` index probes, matching the freshly
+    recaptured PG 18\.3 512MB shape\). Investigation showed the cause was
+    NOT the executor: `goopg-workloads.slice` sat at ~25\.4GB against
+    `memory.high` ~23\.6GB with PSI `some avg10≈78` because the voided
+    SF0\.25 sweep had left its server on :65437 holding ~12\.4GB plus the
+    SF1 server ~9\.7GB. Every scope in the slice was stalled in direct
+    reclaim \(the earlier 5\.7MB\-stalled `pg_basebackup` clone and the
+    voided sweep's Q2/Q4/Q5 timeouts are the same signature\). After
+    stopping the idle :65437 server, the IDENTICAL spotcheck re\-ran
+    clean: Q12 4\.84s rows=2 PASS, Q13 17\.71s rows=33 PASS. No executor
+    code was changed — there was nothing to fix.
+    - Lesson recorded: a spotcheck/gate run must first reap leftover
+      benchmark servers \(`bench/tpcds/server.sh stop sf025`/`sf1`\) when
+      the slice is saturated; PSI on `goopg-workloads.slice` is the
+      diagnostic.
+    - Watch item \(not a defect\): Q13 at ~17\.7s vs ~5s historical under
+      the new 512MB plan shape — track via the next sf025/tpch timing
+      baseline rather than treating as a regression now.
+    - Note: the PASS run still stamped FAIL via gate\-stamp dirty\-code
+      detection — `internal/`/`cmd/` had unstaged changes \(this task's
+      `cmd/estimate-audit` edit plus a concurrent loop's WIP\); the gate
+      verdict itself was PASS and the binary under test was the
+      current\-tree build.
 
 - [x] **WRONG RESULTS: an index\-only prefix probe on a composite index
   skips entries whose trailing key column is NULL** \(found 2026\-09\-23 by

@@ -20,6 +20,13 @@ Provenance:
   fail on PG too, mirroring the sweep.
 
 Re-capture ONLY when the queries or the dataset change (new PG version,
-new scale factor, regenerated `query*.sql`): re-run the two captures
-above and diff the result against these fixtures before committing —
-an unexpected move means the reference moved, not goopg.
+new scale factor, regenerated `query*.sql`) or when the measurement
+convention moves: re-run the two captures above and diff the result against
+these fixtures before committing — an unexpected move means the reference
+moved, not goopg.
+
+**Recaptured 2026-09-24** under the new measurement convention (owner
+decision): the PG clusters now carry `work_mem = 512MB` in
+`postgresql.conf` and the capture issues no session `SET` — earlier
+fixtures were taken under the 64MB session pin (TPC-DS additionally while
+the cluster ran its 4MB default underneath).

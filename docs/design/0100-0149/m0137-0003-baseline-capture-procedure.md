@@ -136,9 +136,11 @@ to bare `EXPLAIN`s).
   above — no `work_mem`, no `effective_cache_size`. Both must already match
   between the two clusters' `postgresql.conf`; verify against
   `bench/tpch/README.md`'s "Cross-engine fairness" table
-  (`shared_buffers=2048MB`, `autovacuum=on`, `work_mem=64MB`,
-  `effective_cache_size=2GB` on both sides as of 2026-09-06) before trusting
-  a capture — a drifted cluster measures configuration, not planning (K10).
+  (`shared_buffers=2048MB`, `autovacuum=on`, `work_mem=512MB`,
+  `effective_cache_size=2GB` on both sides — the 512MB measurement
+  convention, owner decision 2026-09-24, superseding the 64MB alignment of
+  2026-09-06) before trusting a capture — a drifted cluster measures
+  configuration, not planning (K10).
 - **`<label>.txt` opens with a `# stats-epoch: <hash>` line (M0137-0006)** —
   the same `sha256(relname|n_live_tup)`, first-16-hex-chars fingerprint
   `scripts/lib/capture-stamp.sh` writes for `capture-tpch.sh`/
@@ -184,10 +186,14 @@ scripts/capture-tpcds.sh 65438 tpcds025 ryo \
   durable across new connections on this cluster. Do not generalise this to
   TPC-H — the two corpora are asymmetric here for a stated, verified reason,
   not a default assumption.
-- GUCs **are** pinned in-session by the script itself
-  (`work_mem='64MB' max_parallel_workers_per_gather=4`, identical to
-  `capture-tpch.sh`'s `PIN` array) — no cluster-config alignment step is
-  needed for this half.
+- GUCs are **no longer pinned in-session** — the 2026-09-24 measurement
+  convention (owner decision) removed the `SET work_mem='64MB'` /
+  `SET max_parallel_workers_per_gather=4` pins from both capture scripts.
+  Both engines' clusters carry `work_mem=512MB` /
+  `max_parallel_workers_per_gather=4` in `postgresql.conf` and the script
+  verifies them via `SHOW` before capturing (`want_guc`), failing loudly on
+  drift. The earlier statement that pinning made cluster-config alignment
+  unnecessary is superseded: the conf IS the alignment mechanism now.
 - **`GOOPG_ANALYZE_SEED` is pinned by `bench/tpcds/env_tpcds.sh`** (default
   `20260905`, M0137-0020), not by `capture-tpcds.sh` itself — the script only
   opens client `psql` sessions and never runs `ANALYZE`, so it has no seam to

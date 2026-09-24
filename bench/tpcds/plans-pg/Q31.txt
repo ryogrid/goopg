@@ -1,9 +1,8 @@
-Sort  (cost=197733.33..197733.34 rows=1 width=210)
+Sort  (cost=123685.26..123685.27 rows=1 width=210)
   Sort Key: ((ss3.store_sales / ss2.store_sales))
   CTE ss
-    ->  HashAggregate  (cost=84896.06..102121.05 rows=658149 width=54)
+    ->  HashAggregate  (cost=35740.56..43967.42 rows=658149 width=54)
           Group Key: customer_address.ca_county, date_dim.d_qoy, date_dim.d_year
-          Planned Partitions: 32
           ->  Hash Join  (cost=5328.60..29159.07 rows=658149 width=28)
                 Hash Cond: (store_sales.ss_sold_date_sk = date_dim.d_date_sk)
                 ->  Hash Join  (cost=2261.00..24285.59 rows=687914 width=24)
@@ -14,9 +13,8 @@ Sort  (cost=197733.33..197733.34 rows=1 width=210)
                 ->  Hash  (cost=2154.49..2154.49 rows=73049 width=12)
                       ->  Seq Scan on date_dim  (cost=0.00..2154.49 rows=73049 width=12)
   CTE ws
-    ->  HashAggregate  (cost=28050.81..32758.72 rows=179884 width=54)
+    ->  HashAggregate  (cost=14615.73..16864.28 rows=179884 width=54)
           Group Key: customer_address_1.ca_county, date_dim_1.d_qoy, date_dim_1.d_year
-          Planned Partitions: 8
           ->  Hash Join  (cost=5328.60..12816.89 rows=179884 width=28)
                 Hash Cond: (web_sales.ws_bill_addr_sk = customer_address_1.ca_address_sk)
                 ->  Hash Join  (cost=3067.60..10083.57 rows=179914 width=18)

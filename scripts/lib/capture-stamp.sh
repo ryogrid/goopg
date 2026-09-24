@@ -17,7 +17,9 @@
 #   # engine-id: <trees> diff=<digest>              (bench_engine_id)
 #   # repo-head: <git log -1 --oneline>[ [DIRTY]]
 #   # planner-flags: VAR=value VAR=value ...          (planner_flags_body)
-#   # pinned-GUCs: <caller-supplied description of the session SET list>
+#   # pinned-GUCs: <caller-supplied description of the GUC regime — since the
+#     2026-09-24 convention this names the postgresql.conf-managed values and
+#     notes there are no session SETs; older captures list a session SET list>
 #   # engine-binary: pid=<pid> pid-alive=yes|no path=<path> inode=<n> sha=<h>
 #     -- or -- engine-binary: UNKNOWN(no datadir given — pass a 6th arg to
 #        capture-tpch.sh/capture-tpcds.sh to stamp the serving binary)

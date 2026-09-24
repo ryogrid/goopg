@@ -1,12 +1,12 @@
 === Q20
-Sort  (cost=94991.08..94991.35 rows=108 width=52)
+Sort  (cost=95012.62..95012.89 rows=108 width=52)
   Sort Key: supplier.s_name
-  ->  Hash Right Semi Join  (cost=257.77..94987.43 rows=108 width=52)
+  ->  Hash Right Semi Join  (cost=257.77..95008.97 rows=108 width=52)
         Hash Cond: (partsupp.ps_suppkey = supplier.s_suppkey)
-        ->  Nested Loop  (cost=0.42..94718.91 rows=2693 width=5)
+        ->  Nested Loop  (cost=0.42..94740.45 rows=2693 width=5)
               ->  Seq Scan on part  (cost=0.00..6699.00 rows=2020 width=6)
                     Filter: ((p_name)::text ~~ 'forest%'::text)
-              ->  Index Scan using partsupp_part_fkidx on partsupp  (cost=0.42..43.56 rows=1 width=11)
+              ->  Index Scan using partsupp_part_fkidx on partsupp  (cost=0.42..43.57 rows=1 width=11)
                     Index Cond: (ps_partkey = part.p_partkey)
                     Filter: (ps_availqty > (SubPlan 1))
                     SubPlan 1

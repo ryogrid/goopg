@@ -1,8 +1,12 @@
 === Q1
-Sort  (cost=411160.79..411160.80 rows=6 width=236)
-  Sort Key: l_returnflag, l_linestatus
-  ->  HashAggregate  (cost=411160.54..411160.71 rows=6 width=236)
-        Group Key: l_returnflag, l_linestatus
-        ->  Seq Scan on lineitem  (cost=0.00..204337.95 rows=5909217 width=25)
-              Filter: (l_shipdate <= '1998-09-02 00:00:00'::timestamp without time zone)
+Finalize GroupAggregate  (cost=200862.17..200865.99 rows=6 width=236)
+  Group Key: l_returnflag, l_linestatus
+  ->  Gather Merge  (cost=200862.17..200865.05 rows=24 width=236)
+        Workers Planned: 4
+        ->  Sort  (cost=199862.12..199862.13 rows=6 width=236)
+              Sort Key: l_returnflag, l_linestatus
+              ->  Partial HashAggregate  (cost=199861.90..199862.04 rows=6 width=236)
+                    Group Key: l_returnflag, l_linestatus
+                    ->  Parallel Seq Scan on lineitem  (cost=0.00..148092.84 rows=1479116 width=25)
+                          Filter: (l_shipdate <= '1998-09-02 00:00:00'::timestamp without time zone)
 

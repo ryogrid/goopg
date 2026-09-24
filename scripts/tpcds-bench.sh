@@ -54,6 +54,18 @@ for _ in $(seq 1 180); do
 done
 pg_isready -h "${PG_HOST}" -p "${PG_PORT}" -U "${PG_SUPERUSER}" >/dev/null 2>&1 || die "goopg not ready after 180s"
 
+# Measurement convention (owner decision 2026-09-24): work_mem and
+# max_parallel_workers_per_gather are postgresql.conf-managed (512MB / 4 on
+# both engines). Verify the ambient values via SHOW instead of pinning them
+# with a session SET — drift must fail loudly, not be silently repaired.
+want_guc() {
+    local got
+    got=$(timeout 15 psql -h "${PG_HOST}" -p "${PG_PORT}" -U "${PG_SUPERUSER}" -d postgres -X -w -tAc "SHOW $1" 2>/dev/null || true)
+    [[ "${got}" == "$2" ]] || die "expected $1=$2, got '${got:-<unreadable>}' — fix postgresql.conf and restart the cluster"
+}
+want_guc work_mem 512MB
+want_guc max_parallel_workers_per_gather 4
+
 # ---- 3. Load DDL schema (into postgres database, bypassing per-DB scoping gap) -
 log "Loading TPC-DS schema into postgres database..."
 SCHEMA_ERRORS="${TPCDS_RESULTS_DIR}/schema_errors.txt"
@@ -179,7 +191,6 @@ for q in $(seq 1 99); do
     START_TIME=$SECONDS
     RESULT=$(timeout "${PER_QUERY_TIMEOUT}" psql \
         -h "${PG_HOST}" -p "${PG_PORT}" -U "${PG_SUPERUSER}" -d postgres \
-        -c "SET max_parallel_workers_per_gather = 4;" \
         -f "${QFILE}" 2>&1) || true
     ELAPSED=$((SECONDS - START_TIME))
 

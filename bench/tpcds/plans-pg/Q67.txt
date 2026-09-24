@@ -1,11 +1,11 @@
-Limit  (cost=23749.46..23755.98 rows=100 width=273)
-  ->  Incremental Sort  (cost=23749.46..24978.93 rows=18846 width=273)
+Limit  (cost=21365.96..21372.48 rows=100 width=273)
+  ->  Incremental Sort  (cost=21365.96..22595.43 rows=18846 width=273)
         Sort Key: dw1.i_category, dw1.i_class, dw1.i_brand, dw1.i_product_name, dw1.d_year, dw1.d_qoy, dw1.d_moy, dw1.s_store_id, dw1.sumsales, (rank() OVER w1)
         Presorted Key: dw1.i_category
-        ->  WindowAgg  (cost=23744.49..24121.39 rows=18846 width=273)
+        ->  WindowAgg  (cost=21360.99..21737.89 rows=18846 width=273)
               Window: w1 AS (PARTITION BY dw1.i_category ORDER BY dw1.sumsales ROWS UNBOUNDED PRECEDING)
               Run Condition: (rank() OVER w1 <= 100)
-              ->  Sort  (cost=23744.47..23791.58 rows=18846 width=265)
+              ->  Sort  (cost=21360.97..21408.08 rows=18846 width=265)
                     Sort Key: dw1.i_category, dw1.sumsales DESC
                     ->  Subquery Scan on dw1  (cost=19319.25..20022.71 rows=18846 width=265)
                           ->  GroupAggregate  (cost=19319.25..20022.71 rows=18846 width=265)

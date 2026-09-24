@@ -99,6 +99,14 @@ ref_wait_ready() {
 ref_cluster_start() {
     local port="$1"
     ref_cluster_info "${port}" || return 1
+    # Measurement convention (owner decision 2026-09-24): measurement clusters
+    # carry work_mem explicitly in postgresql.conf (= 512MB on both engines)
+    # and no session SET may override it. Warn when the conf leaves it
+    # implicit — the effective value then silently follows the GUC BootVal.
+    if ! grep -qE '^[[:space:]]*work_mem[[:space:]]*=' "${RC_DATA}/postgresql.conf" 2>/dev/null; then
+        echo "ref-clusters: WARNING — work_mem is not set in ${RC_DATA}/postgresql.conf;" >&2
+        echo "ref-clusters:   the measurement convention wants it written explicitly (512MB)." >&2
+    fi
     if [[ "${RC_ENGINE}" == "pg" ]]; then
         # Same command bench/tpch/setup_pg.sh / bench/tpcds/server.sh issue on
         # their start path; pg_ctl start never initdb's.

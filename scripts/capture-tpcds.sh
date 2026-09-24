@@ -1,8 +1,12 @@
 #!/usr/bin/env bash
 # scripts/capture-tpcds.sh — capture TPC-DS EXPLAIN plan sections
 # (sf05_capture_plans format, normalised to `=== Qn` so
-# scripts/pg-plan-parity-diff.py's SECTION_RE matches), GUCs pinned as in
-# capture-tpch.sh.
+# scripts/pg-plan-parity-diff.py's SECTION_RE matches). Since the
+# 2026-09-24 measurement-convention change the planner-visible GUCs come
+# from each cluster's postgresql.conf (work_mem=512MB,
+# max_parallel_workers_per_gather=4 on both engines) and the script
+# VERIFYs them via SHOW instead of pinning them in-session — see the
+# want_guc block below.
 #
 # Promoted from
 # docs/design/not_ralph/plan_parity_fix_take2/{methodology,r2-instrument}/capture-tpcds.sh
@@ -56,8 +60,27 @@ PORT="$1"; DB="$2"; USER="$3"; OUT="$4"; HDR="$5"; DATADIR="${6:-}"
 capture_verify_serving_binary "capture-tpcds.sh" "$PORT" "$DATADIR" || exit 1
 
 QDIR="${TPCDS_QUERY_DIR:-${REPO_ROOT}/bench/tpcds/runtime_goopg/tpcds-data/queries}"
-PIN=(-c "SET work_mem='64MB'" -c "SET max_parallel_workers_per_gather=4")
-PIN_DESC="work_mem=64MB max_parallel_workers_per_gather=4"
+
+# Measurement convention (owner decision 2026-09-24): no session SETs at
+# all. The planner-visible settings live in each cluster's postgresql.conf —
+# work_mem = 512MB and max_parallel_workers_per_gather = 4 on BOTH engines.
+# This script VERIFIES the ambient values instead of pinning them, so a
+# cluster whose conf drifts fails loudly rather than being silently
+# corrected into a comparable-but-wrong capture.
+PIN_DESC="postgresql.conf-managed (work_mem=512MB max_parallel_workers_per_gather=4; SHOW-verified, no session SETs)"
+
+want_guc() {
+    local got
+    got=$(timeout 15 psql -h 127.0.0.1 -p "$PORT" -U "$USER" -d "$DB" -X -w -tAc "SHOW $1" 2>/dev/null || true)
+    if [ "$got" != "$2" ]; then
+        echo "capture-tpcds.sh: $1 reads '${got:-<unreadable>}' but the measurement" >&2
+        echo "  convention requires '$2'. Set it in the cluster's postgresql.conf" >&2
+        echo "  and restart — do NOT re-add a session SET here." >&2
+        exit 1
+    fi
+}
+want_guc work_mem 512MB
+want_guc max_parallel_workers_per_gather 4
 
 # Deterministic, not $$ — see capture-tpch.sh's header comment.
 tmp="${TMPDIR:-/tmp}/goopg-parity-capture-$(basename "$OUT").sql"
@@ -84,7 +107,7 @@ for stmt in src.split(';'):
         print("EXPLAIN " + stmt.strip() + ";")
 PY
     if ! timeout 120 psql -h 127.0.0.1 -p "$PORT" -U "$USER" -d "$DB" -X \
-            "${PIN[@]}" -f "$tmp" 2>&1 | grep -vx SET >> "$OUT"; then
+            -f "$tmp" 2>&1 | grep -vx SET >> "$OUT"; then
         echo "(explain failed)" >> "$OUT"
     fi
 done

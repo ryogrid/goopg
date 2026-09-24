@@ -1,12 +1,15 @@
 === Q12
-GroupAggregate  (cost=328047.88..328610.49 rows=7 width=27)
+Finalize GroupAggregate  (cost=190868.12..191015.99 rows=7 width=27)
   Group Key: lineitem.l_shipmode
-  ->  Sort  (cost=328047.88..328118.20 rows=28127 width=27)
-        Sort Key: lineitem.l_shipmode
-        ->  Hash Join  (cost=61564.00..325969.34 rows=28127 width=27)
-              Hash Cond: (lineitem.l_orderkey = orders.o_orderkey)
-              ->  Seq Scan on lineitem  (cost=0.00..264331.51 rows=28127 width=17)
-                    Filter: ((l_shipmode = ANY ('{MAIL,SHIP}'::bpchar[])) AND (l_commitdate < l_receiptdate) AND (l_shipdate < l_commitdate) AND (l_receiptdate >= '1994-01-01'::date) AND (l_receiptdate < '1995-01-01 00:00:00'::timestamp without time zone))
-              ->  Hash  (cost=42814.00..42814.00 rows=1500000 width=22)
-                    ->  Seq Scan on orders  (cost=0.00..42814.00 rows=1500000 width=22)
+  ->  Gather Merge  (cost=190868.12..191015.71 rows=28 width=27)
+        Workers Planned: 4
+        ->  Partial GroupAggregate  (cost=189868.06..190012.31 rows=7 width=27)
+              Group Key: lineitem.l_shipmode
+              ->  Sort  (cost=189868.06..189886.09 rows=7209 width=27)
+                    Sort Key: lineitem.l_shipmode
+                    ->  Nested Loop  (cost=0.43..189406.13 rows=7209 width=27)
+                          ->  Parallel Seq Scan on lineitem  (cost=0.00..163090.32 rows=7209 width=17)
+                                Filter: ((l_shipmode = ANY ('{MAIL,SHIP}'::bpchar[])) AND (l_commitdate < l_receiptdate) AND (l_shipdate < l_commitdate) AND (l_receiptdate >= '1994-01-01'::date) AND (l_receiptdate < '1995-01-01 00:00:00'::timestamp without time zone))
+                          ->  Index Scan using orders_pk on orders  (cost=0.43..3.65 rows=1 width=22)
+                                Index Cond: (o_orderkey = lineitem.l_orderkey)
 

@@ -31,8 +31,10 @@ usage:
         --qdir DIR --qpat 'query{n}.sql' --port P --db D --user U \
         --log SERVER.log --out OUT.txt [--only Q3,Q7] [--limit N]
 
-The server must already be running (private lane).  Session pins match the
-capture harness: work_mem=64MB, max_parallel_workers_per_gather=4.
+The server must already be running (private lane).  No session SETs are
+issued — the measurement convention (owner decision 2026-09-24) is that the
+cluster's postgresql.conf carries work_mem=512MB and
+max_parallel_workers_per_gather=4 on both engines.
 """
 
 import argparse
@@ -161,8 +163,7 @@ def run_explain(args, stmts, extra_sets):
         if s.strip():
             sql.append("EXPLAIN " + s.strip() + ";")
     cmd = [PSQL, "-h", "127.0.0.1", "-p", str(args.port), "-U", args.user,
-           "-d", args.db, "-X", "-c", "SET work_mem='64MB'",
-           "-c", "SET max_parallel_workers_per_gather=4"]
+           "-d", args.db, "-X"]
     for st in extra_sets:
         cmd += ["-c", "SET " + st]
     p = subprocess.run(cmd + ["-f", "-"], input="\n".join(sql),

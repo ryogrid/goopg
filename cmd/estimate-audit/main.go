@@ -363,6 +363,20 @@ func (s *session) ensure(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("conn: %w", err)
 	}
+	// Measurement convention (owner decision 2026-09-24): the cluster's
+	// work_mem comes from postgresql.conf (= 512MB on both engines), never
+	// from a session SET here — so verify the ambient value instead of
+	// pinning it. Drift must fail loudly rather than produce a capture
+	// under the wrong memory budget.
+	var workMem string
+	if err := conn.QueryRowContext(ctx, "SHOW work_mem").Scan(&workMem); err != nil {
+		conn.Close()
+		return fmt.Errorf("SHOW work_mem: %w", err)
+	}
+	if workMem != "512MB" {
+		conn.Close()
+		return fmt.Errorf("work_mem is %q, want 512MB — set it in postgresql.conf and restart the cluster (no session SET per the measurement convention)", workMem)
+	}
 	if s.serial {
 		// Without this every joinrel under a Gather audits as "(no
 		// ANALYZE)" — see the package comment.

@@ -14,11 +14,13 @@ read as a matched pair.
   budget.
 - goopg runs under the cgroup memory cap with `GOGC=100 GOMEMLIMIT=12GiB` and
   `GOOPG_ANALYZE_SEED` pinned.
-- Both engines run the **same** measurement settings, aligned 2026-09-06 (see
-  `../README.md`): `shared_buffers = 2048MB`, `work_mem = 64MB`,
-  `effective_cache_size = 2GB`, `autovacuum = on`. Each file's header records
-  what its engine actually reported, read back from the live server rather than
-  from the config file.
+- Both engines run the **same** measurement settings, aligned 2026-09-06 and
+  moved to the explicit-conf convention on 2026-09-24 (see `../README.md`):
+  `shared_buffers = 2048MB`, `work_mem = 512MB` (was 64MB before the
+  convention change), `effective_cache_size = 2GB`, `autovacuum = on` — all
+  in postgresql.conf, with no session `SET` overrides. Each file's header
+  records what its engine actually reported, read back from the live server
+  rather than from the config file.
 
 ## Reading these files
 

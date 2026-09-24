@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # scripts/capture-tpch.sh — capture TPC-H EXPLAIN plan sections from a goopg
-# or PG server, with the planner-visible session GUCs PINNED so a cluster's
-# ambient config cannot decide the comparison (R2: the TPC-DS pair was
-# running 512MB vs 4MB). The `SET` command tags are stripped — they parse as
+# or PG server. Since the 2026-09-24 measurement-convention change the
+# planner-visible GUCs come from each cluster's postgresql.conf
+# (work_mem=512MB, max_parallel_workers_per_gather=4 on both engines) and the
+# script VERIFYs them via SHOW instead of pinning them in-session — see the
+# want_guc block below. The `SET` command tags are stripped — they parse as
 # a plan node named SET.
 #
 # Promoted from
@@ -79,8 +81,26 @@ if [ ! -d "$Q" ] || [ ! -f "$Q15A" ]; then
     exit 1
 fi
 
-PIN=(-c "SET work_mem='64MB'" -c "SET max_parallel_workers_per_gather=4")
-PIN_DESC="work_mem=64MB max_parallel_workers_per_gather=4"
+# Measurement convention (owner decision 2026-09-24): no session SETs at
+# all. The planner-visible settings live in each cluster's postgresql.conf —
+# work_mem = 512MB and max_parallel_workers_per_gather = 4 on BOTH engines.
+# This script VERIFIES the ambient values instead of pinning them, so a
+# cluster whose conf drifts fails loudly rather than being silently
+# corrected into a comparable-but-wrong capture.
+PIN_DESC="postgresql.conf-managed (work_mem=512MB max_parallel_workers_per_gather=4; SHOW-verified, no session SETs)"
+
+want_guc() {
+    local got
+    got=$(timeout 15 psql -h 127.0.0.1 -p "$PORT" -U "$USER" -d "$DB" -X -w -tAc "SHOW $1" 2>/dev/null || true)
+    if [ "$got" != "$2" ]; then
+        echo "capture-tpch.sh: $1 reads '${got:-<unreadable>}' but the measurement" >&2
+        echo "  convention requires '$2'. Set it in the cluster's postgresql.conf" >&2
+        echo "  and restart — do NOT re-add a session SET here." >&2
+        exit 1
+    fi
+}
+want_guc work_mem 512MB
+want_guc max_parallel_workers_per_gather 4
 
 : > "$OUT"
 {
@@ -91,7 +111,7 @@ PIN_DESC="work_mem=64MB max_parallel_workers_per_gather=4"
 run() {
     echo "=== $1" >> "$OUT"
     if ! timeout 180 psql -h 127.0.0.1 -p "$PORT" -U "$USER" -d "$DB" -X \
-            "${PIN[@]}" -f "$2" 2>&1 | grep -vx SET >> "$OUT"; then
+            -f "$2" 2>&1 | grep -vx SET >> "$OUT"; then
         echo "(capture failed)" >> "$OUT"
     fi
 }

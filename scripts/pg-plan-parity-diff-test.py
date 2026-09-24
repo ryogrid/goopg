@@ -9,17 +9,20 @@ budget before re-pinning.
 Corpus: goopg analysis/leftdeep-joins/a01ii-cut3-paired.plans.txt
 (=== QN sections) vs PG bench/tpch/plans-pg/QN.txt fixtures.
 
-Budget provenance (pinned 2026-09-05, tool reviewed query-by-query):
-- MATCH (5): Q1/Q6/Q14/Q15a-VIEWBODY identical after normalisation; Q13
-  identical after right-join canonicalisation + Hash stripping (rendering
-  notes on key text only).
-- MISSING-NODE (2): Q5/Q8 -- PG-only Materialize over the 1-row region
-  scan; goopg's EXPLAIN renderer has no Materialize arm.
-- SHAPE-DIFF (15): remainder, categories verified per query (phases live
-  here: join-order/method for Phase 3, aggregation/sort-strategy for
-  Phase 4, parameterisation for decorrelation/SubPlan work).
-- parallelism=0: both captures are serial EXPLAIN without ANALYZE; the
-  category is implemented and self-tested, just empty on this corpus.
+Budget provenance:
+- Re-pinned 2026-09-24: the PG fixtures were re-captured under the current
+  measurement convention — postgresql.conf work_mem = 512MB (superseding
+  the old capture-time SET work_mem='64MB' pin) and the canonical parallel
+  mode (max_parallel_workers_per_gather=4; the previous fixtures predate
+  it and hold serial PG plans). The goopg side is still the historical
+  a01ii-cut3 paired capture, so this budget deliberately mixes eras: it is
+  a movement tripwire, not a parity scoreboard.
+- Now: MATCH (1) = Q13 (right-join canonicalisation + Hash stripping);
+  SHAPE-DIFF (21); parallelism=19 (the PG side now plans Gather paths).
+- Previous pin (2026-09-05, serial-era PG fixtures): MATCH (5)
+  Q1/Q6/Q13/Q14/Q15a-VIEWBODY, MISSING-NODE (2) Q5/Q8 (PG-only
+  Materialize over the 1-row region scan), SHAPE-DIFF (15),
+  parallelism=0.
 
 Usage: python3 scripts/pg-plan-parity-diff-test.py [-v]
 """
@@ -36,58 +39,42 @@ TOOL = os.path.join(ROOT, "scripts", "pg-plan-parity-diff.py")
 GOOPG_PLANS = os.path.join(
     ROOT, "analysis", "leftdeep-joins", "a01ii-cut3-paired.plans.txt")
 PG_DIR = os.path.join(ROOT, "bench", "tpch", "plans-pg")
-PG_SINGLE = os.path.join(
-    ROOT, "analysis", "leftdeep-joins", "a01ii-cut3-paired.pg.plans.txt")
 
 # Pinned mismatch budget: query -> (verdict, categories).
+# Re-pinned 2026-09-24 for the work_mem=512MB / parallel-mode fixture
+# re-capture -- see "Budget provenance" in the module docstring.
 EXPECTED = {
-    "Q1": ("MATCH", ()),
-    "Q2": ("SHAPE-DIFF", ("join-order", "join-method", "parameterisation",
-                           "aggregation-strategy")),
-    "Q3": ("SHAPE-DIFF", ("join-method", "scan-type", "rendering")),
-    "Q4": ("SHAPE-DIFF", ("aggregation-strategy", "sort-strategy",
-                           "qual-placement")),
-    "Q5": ("MISSING-NODE", ("join-order", "join-method",
-                             "aggregation-strategy", "sort-strategy",
-                             "qual-placement", "rendering")),
-    "Q6": ("MATCH", ()),
-    "Q7": ("SHAPE-DIFF", ("join-order", "join-method", "scan-type",
-                           "aggregation-strategy", "sort-strategy",
-                           "qual-placement")),
-    "Q8": ("MISSING-NODE", ("join-order", "join-method", "scan-type",
-                             "aggregation-strategy", "sort-strategy")),
-    "Q9": ("SHAPE-DIFF", ("join-order", "join-method", "rendering")),
-    "Q10": ("SHAPE-DIFF", ("join-order", "rendering")),
-    "Q11": ("SHAPE-DIFF", ("parameterisation", "qual-placement",
-                            "rendering")),
-    "Q12": ("SHAPE-DIFF", ("join-order", "join-method", "scan-type",
-                            "aggregation-strategy", "sort-strategy")),
+    "Q1": ("SHAPE-DIFF", ("join-order", "aggregation-strategy", "sort-strategy", "parallelism")),
+    "Q2": ("SHAPE-DIFF", ("join-order", "join-method", "parameterisation", "aggregation-strategy", "parallelism")),
+    "Q3": ("SHAPE-DIFF", ("join-order", "join-method", "parallelism", "rendering")),
+    "Q4": ("SHAPE-DIFF", ("join-order", "aggregation-strategy", "sort-strategy", "parallelism")),
+    "Q5": ("SHAPE-DIFF", ("join-order", "join-method", "scan-type", "aggregation-strategy", "sort-strategy", "parallelism", "rendering")),
+    "Q6": ("SHAPE-DIFF", ("join-order", "aggregation-strategy", "parallelism")),
+    "Q7": ("SHAPE-DIFF", ("join-order", "join-method", "aggregation-strategy", "sort-strategy", "parallelism", "qual-placement")),
+    "Q8": ("SHAPE-DIFF", ("join-order", "join-method", "scan-type", "aggregation-strategy", "sort-strategy", "parallelism")),
+    "Q9": ("SHAPE-DIFF", ("join-order", "join-method", "aggregation-strategy", "parallelism", "rendering")),
+    "Q10": ("SHAPE-DIFF", ("join-order", "parallelism", "rendering")),
+    "Q11": ("SHAPE-DIFF", ("parameterisation", "qual-placement", "rendering")),
+    "Q12": ("SHAPE-DIFF", ("join-order", "join-method", "scan-type", "aggregation-strategy", "sort-strategy", "parallelism")),
     "Q13": ("MATCH", ("rendering",)),
-    "Q14": ("MATCH", ()),
-    "Q15a-VIEWBODY": ("MATCH", ()),
-    "Q16": ("SHAPE-DIFF", ("join-order", "join-method", "parameterisation",
-                            "rendering")),
-    "Q17": ("SHAPE-DIFF", ("join-order", "join-method", "scan-type",
-                            "parameterisation", "qual-placement")),
-    "Q18": ("SHAPE-DIFF", ("join-order", "join-method", "scan-type",
-                            "rendering")),
-    "Q19": ("SHAPE-DIFF", ("join-order", "join-method", "scan-type",
-                            "qual-placement")),
-    "Q20": ("SHAPE-DIFF", ("join-order", "join-method", "scan-type",
-                            "parameterisation", "qual-placement")),
-    "Q21": ("SHAPE-DIFF", ("join-order", "join-method",
-                            "aggregation-strategy", "sort-strategy")),
-    "Q22": ("SHAPE-DIFF", ("parameterisation", "aggregation-strategy",
-                            "sort-strategy")),
+    "Q14": ("SHAPE-DIFF", ("join-order", "scan-type", "aggregation-strategy", "parallelism")),
+    "Q15a-VIEWBODY": ("SHAPE-DIFF", ("join-order", "aggregation-strategy", "sort-strategy", "parallelism")),
+    "Q16": ("SHAPE-DIFF", ("join-order", "parameterisation", "sort-strategy", "parallelism", "rendering")),
+    "Q17": ("SHAPE-DIFF", ("join-order", "join-method", "scan-type", "parameterisation", "parallelism", "qual-placement")),
+    "Q18": ("SHAPE-DIFF", ("join-order", "join-method", "aggregation-strategy", "parallelism", "qual-placement", "rendering")),
+    "Q19": ("SHAPE-DIFF", ("join-order", "join-method", "scan-type", "aggregation-strategy", "parallelism")),
+    "Q20": ("SHAPE-DIFF", ("join-order", "join-method", "scan-type", "parameterisation", "qual-placement")),
+    "Q21": ("SHAPE-DIFF", ("join-order", "join-method", "aggregation-strategy", "sort-strategy", "parallelism", "qual-placement")),
+    "Q22": ("SHAPE-DIFF", ("join-order", "parameterisation", "aggregation-strategy", "sort-strategy", "parallelism")),
 }
 
-EXPECTED_ROLLUP = {"MATCH": 5, "SHAPE-DIFF": 15, "MISSING-NODE": 2,
+EXPECTED_ROLLUP = {"MATCH": 1, "SHAPE-DIFF": 21, "MISSING-NODE": 0,
                    "ERROR": 0, "TIMEOUT": 0}
 
-EXPECTED_CATEGORIES = {"join-order": 13, "join-method": 13, "scan-type": 8,
-                       "parameterisation": 6, "aggregation-strategy": 8,
-                       "sort-strategy": 7, "parallelism": 0,
-                       "qual-placement": 7, "rendering": 8}
+EXPECTED_CATEGORIES = {"join-order": 20, "join-method": 12, "scan-type": 7,
+                       "parameterisation": 6, "aggregation-strategy": 15,
+                       "sort-strategy": 10, "parallelism": 19,
+                       "qual-placement": 6, "rendering": 8}
 
 # `blocked-excluding-matches` (AGENT.md plan-parity harness): the same tally
 # with MATCH queries dropped. Differs from the raw roll-up by exactly one
@@ -167,15 +154,29 @@ class ParityDiffTest(unittest.TestCase):
 
     def test_pg_single_file_mode_agrees(self):
         """PG side as one === sections file matches the fixture-dir mode."""
-        if not os.path.exists(PG_SINGLE):
-            self.skipTest("paired PG capture absent")
-        proc = run_tool(GOOPG_PLANS, PG_SINGLE)
-        self.assertEqual(proc.returncode, 0, proc.stderr)
-        per_query, _, _, _ = parse_report(proc.stdout)
-        for key, (verdict, _) in EXPECTED.items():
-            self.assertIn(key, per_query)
-            self.assertEqual(per_query[key][0], verdict,
-                             "mode disagreement on %s" % key)
+        # The single-file input is synthesised from the current fixture dir:
+        # each QN.txt already carries its `=== QN` header, so concatenating
+        # them yields a valid sections file. The historical
+        # a01ii-cut3-paired.pg.plans.txt is an era-pinned artifact and must
+        # NOT be overwritten just to feed this test.
+        if not os.path.isdir(PG_DIR):
+            self.skipTest("PG fixture dir absent")
+        with tempfile.TemporaryDirectory() as tmp:
+            single = os.path.join(tmp, "pg.plans.txt")
+            with open(single, "w") as fh:
+                for name in sorted(os.listdir(PG_DIR)):
+                    if not name.endswith(".txt"):
+                        continue
+                    with open(os.path.join(PG_DIR, name)) as src:
+                        fh.write(src.read())
+                    fh.write("\n")
+            proc = run_tool(GOOPG_PLANS, single)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            per_query, _, _, _ = parse_report(proc.stdout)
+            for key, (verdict, _) in EXPECTED.items():
+                self.assertIn(key, per_query)
+                self.assertEqual(per_query[key][0], verdict,
+                                 "mode disagreement on %s" % key)
 
     def run_on_fixtures(self, sections):
         """Run the tool over an ad-hoc corpus: {key: (goopg_lines, pg_lines)}."""

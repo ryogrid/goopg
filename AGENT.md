@@ -515,9 +515,25 @@ measured in parallel mode** (owner decision 2026-09-20): both engines with
 -serial=false`. Floor: TPC-H parallel match ≥ 3 (last measured P0-E7,
 2026-09-18; re-pinned by M0144-0001's capture), TPC-DS SF0.25 match ≥ 2 (Q9,
 Q41 — the floor is SF0.25 only; at SF1 the corpus reads 1/99, see P0-H12).
-TPC-DS captures already pin `max_parallel_workers_per_gather=4`, unchanged.
 Serial-mode TPC-H (match 8/22 at `27d4ae001`) stays a diagnostic capture, not
 the floor. Losing a current match is a regression.
+
+**Measurement-convention rule (owner decision 2026-09-24):** every
+measurement cluster — goopg AND PostgreSQL — carries `work_mem = 512MB`
+written explicitly in `postgresql.conf`, and **no session `SET` may override
+it** afterwards. The capture scripts (`capture-tpch.sh`, `capture-tpcds.sh`)
+issue no `SET` at all and verify `work_mem=512MB` /
+`max_parallel_workers_per_gather=4` via `SHOW` before capturing, failing
+loudly on drift; `cmd/estimate-audit` verifies `work_mem` the same way at
+session open. This supersedes the former `SET work_mem='64MB'` session
+pins; the conf line is the single alignment mechanism. `goopg init` writes
+the convention automatically via `internal/utils/misc/postgresql.conf.sample`;
+`bench/tpch/setup_{goopg,pg}.sh` and the TPC-DS cluster confs carry it too,
+and `bench/tpcds/server.sh` plus `scripts/lib/ref-clusters.sh` warn when a
+conf leaves `work_mem` implicit. Deliberate non-canonical arms may still SET
+these GUCs as their measured variable (e.g. `estimate-audit -serial`,
+`goopg-margin-census.py`'s forcing arms) — what is prohibited is silently
+overriding the ambient convention inside a canonical measurement.
 
 ### R — Hard prohibitions (no exceptions, no "dry run")
 - **R1 Shared clusters.** Reference clusters `:65432` (PG TPC-H), `:65433`
@@ -744,15 +760,15 @@ Run on the change, in the task that changes production code:
 
 ## GUC sample-file discipline
 
-`internal/config/postgresql.conf.sample` is the operator-facing template
+`internal/utils/misc/postgresql.conf.sample` is the operator-facing template
 for every supported GUC. `goopg init` writes its bytes verbatim to
 `<datadir>/postgresql.conf` (see M0108 + design doc
 `docs/design/0108-0001-postgresql-conf-sample-template.md`). It is
 hand-maintained, mirroring PG 18.3's section structure.
 
 When you register a new GUC under
-`internal/config/defaults.go::BuildDefaultRegistry` (or remove an existing
-one), you MUST update `internal/config/postgresql.conf.sample` in the
+`internal/utils/misc/defaults.go::BuildDefaultRegistry` (or remove an existing
+one), you MUST update `internal/utils/misc/postgresql.conf.sample` in the
 same commit:
 
 - Add a commented-out entry under the appropriate PG-style section,
@@ -765,7 +781,7 @@ same commit:
 - GUC names must match PG's names exactly — operators rely on lifting
   tuned PG `postgresql.conf` files against goopg.
 
-The unit test `TestSampleConfigCoversRegistry` in `internal/config/sample_test.go`
+The unit test `TestSampleConfigCoversRegistry` in `internal/utils/misc/sample_test.go`
 is the mechanical enforcement gate; it MUST pass before the commit is
 opened. Letting the sample drift from the registry is a regression on
 usability and on PG-operator-mental-model compatibility.

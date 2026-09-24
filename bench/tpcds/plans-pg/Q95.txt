@@ -1,6 +1,6 @@
-Limit  (cost=143822.29..143822.30 rows=1 width=72)
+Limit  (cost=141010.29..141010.30 rows=1 width=72)
   CTE ws_wh
-    ->  Hash Join  (cost=9496.01..58335.98 rows=1765977 width=12)
+    ->  Hash Join  (cost=8793.01..55523.98 rows=1765977 width=12)
           Hash Cond: (ws1_1.ws_order_number = ws2.ws_order_number)
           Join Filter: (ws1_1.ws_warehouse_sk <> ws2.ws_warehouse_sk)
           ->  Seq Scan on web_sales ws1_1  (cost=0.00..6543.56 rows=179956 width=8)

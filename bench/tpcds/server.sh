@@ -87,6 +87,14 @@ goopg_start() {
         echo "tpcds-server:   the cluster will use the 128MB default (16384 slots) against a" >&2
         echo "tpcds-server:   >1 GiB working set. Values gates stay valid; do NOT publish timing." >&2
     fi
+    # Measurement convention (owner decision 2026-09-24): measurement clusters
+    # carry work_mem explicitly in postgresql.conf (= 512MB on both engines) and
+    # no session SET may override it. Warn when the conf leaves it implicit —
+    # the effective value then silently follows the GUC BootVal instead.
+    if ! grep -qE '^[[:space:]]*work_mem[[:space:]]*=' "${DATA}/postgresql.conf" 2>/dev/null; then
+        echo "tpcds-server: WARNING — work_mem is not set in ${DATA}/postgresql.conf;" >&2
+        echo "tpcds-server:   the measurement convention wants it written explicitly (512MB)." >&2
+    fi
     goopg_stop "$1" >/dev/null
     local hba_arg=()
     [[ -f "${DATA}/pg_hba.conf" ]] && hba_arg=(--hba "${DATA}/pg_hba.conf")

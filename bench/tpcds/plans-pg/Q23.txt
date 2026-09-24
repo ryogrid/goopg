@@ -1,4 +1,4 @@
-Limit  (cost=150493.93..150493.94 rows=1 width=32)
+Limit  (cost=103187.40..103187.41 rows=1 width=32)
   CTE frequent_ss_items
     ->  HashAggregate  (cost=21849.55..22032.46 rows=4573 width=48)
           Group Key: (substr((item.i_item_desc)::text, 1, 30)), item.i_item_sk, date_dim_2.d_date
@@ -15,10 +15,9 @@ Limit  (cost=150493.93..150493.94 rows=1 width=32)
                       ->  Index Scan using item_pkey on item  (cost=0.29..0.31 rows=1 width=106)
                             Index Cond: (i_item_sk = store_sales.ss_item_sk)
   CTE best_ss_customer
-    ->  HashAggregate  (cost=95463.76..103925.81 rows=33333 width=36)
+    ->  HashAggregate  (cost=54869.27..56619.27 rows=33333 width=36)
           Group Key: customer_1.c_customer_sk
           Filter: (sum(((store_sales_2.ss_quantity)::numeric * store_sales_2.ss_sales_price)) > (0.95000000000000000000 * (InitPlan 2).col1))
-          Planned Partitions: 4
           InitPlan 2
             ->  Aggregate  (cost=22094.29..22094.30 rows=1 width=32)
                   ->  HashAggregate  (cost=21766.84..21930.57 rows=13098 width=36)
@@ -77,7 +76,7 @@ Limit  (cost=150493.93..150493.94 rows=1 width=32)
                                       ->  HashAggregate  (cost=102.89..104.89 rows=200 width=4)
                                             Group Key: frequent_ss_items_1.item_sk
                                             ->  CTE Scan on frequent_ss_items frequent_ss_items_1  (cost=0.00..91.46 rows=4573 width=4)
-Limit  (cost=150521.13..150521.29 rows=63 width=84)
+Limit  (cost=103214.60..103214.76 rows=63 width=84)
   CTE frequent_ss_items
     ->  HashAggregate  (cost=21849.55..22032.46 rows=4573 width=48)
           Group Key: (substr((item.i_item_desc)::text, 1, 30)), item.i_item_sk, date_dim_2.d_date
@@ -94,10 +93,9 @@ Limit  (cost=150521.13..150521.29 rows=63 width=84)
                       ->  Index Scan using item_pkey on item  (cost=0.29..0.31 rows=1 width=106)
                             Index Cond: (i_item_sk = store_sales.ss_item_sk)
   CTE best_ss_customer
-    ->  HashAggregate  (cost=95463.76..103925.81 rows=33333 width=36)
+    ->  HashAggregate  (cost=54869.27..56619.27 rows=33333 width=36)
           Group Key: customer_3.c_customer_sk
           Filter: (sum(((store_sales_2.ss_quantity)::numeric * store_sales_2.ss_sales_price)) > (0.95000000000000000000 * (InitPlan 2).col1))
-          Planned Partitions: 4
           InitPlan 2
             ->  Aggregate  (cost=22094.29..22094.30 rows=1 width=32)
                   ->  HashAggregate  (cost=21766.84..21930.57 rows=13098 width=36)

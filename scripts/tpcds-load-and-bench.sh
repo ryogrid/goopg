@@ -28,6 +28,18 @@ PG="psql -h ${PG_HOST} -p ${PG_PORT} -U ${PG_SUPERUSER} -d ${BENCH_DB}"
 # ---- 0. Ensure goopg is ready -------------------------------------
 pg_isready -h "${PG_HOST}" -p "${PG_PORT}" -U "${PG_SUPERUSER}" >/dev/null 2>&1 || die "goopg not running"
 
+# Measurement convention (owner decision 2026-09-24): work_mem and
+# max_parallel_workers_per_gather are postgresql.conf-managed (512MB / 4 on
+# both engines). Verify the ambient values via SHOW instead of pinning them
+# with a session SET — drift must fail loudly, not be silently repaired.
+want_guc() {
+    local got
+    got=$(timeout 15 psql -h "${PG_HOST}" -p "${PG_PORT}" -U "${PG_SUPERUSER}" -d postgres -X -w -tAc "SHOW $1" 2>/dev/null || true)
+    [[ "${got}" == "$2" ]] || die "expected $1=$2, got '${got:-<unreadable>}' — fix postgresql.conf and restart the cluster"
+}
+want_guc work_mem 512MB
+want_guc max_parallel_workers_per_gather 4
+
 # ---- 1. Re-create schema if needed --------------------------------
 log "Ensuring TPC-DS schema..."
 for table in call_center catalog_page catalog_returns catalog_sales customer \
@@ -113,7 +125,6 @@ for q in $(seq 1 99); do
     log "  Q${q}: running..."
     START=$SECONDS
     QOUT=$(timeout "${PER_QUERY_TIMEOUT}" ${PG} \
-        -c "SET max_parallel_workers_per_gather = 4;" \
         -f "${QFILE}" 2>&1) || true
     ELAPSED=$((SECONDS - START))
 
