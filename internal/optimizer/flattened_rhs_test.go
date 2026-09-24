@@ -393,25 +393,6 @@ func TestFlattenedRHSInExpr(t *testing.T) {
 	}
 }
 
-func TestFlattenedRHSNotInExpr(t *testing.T) {
-	cat := analyzedThreeTablesCatalog(t)
-	node, err := Plan(parseOne(t,
-		"SELECT x FROM t1 WHERE t1.x NOT IN (SELECT y FROM t2 WHERE z > 0)"), cat)
-	if err != nil {
-		t.Fatal(err)
-	}
-	j := findFirstJoinByType(node, JoinTypeAnti)
-	if j == nil {
-		t.Fatalf("no anti join: %s", planString(node))
-	}
-	if !j.FlattenedRHS {
-		t.Error("FlattenedRHS not set on the NOT IN anti join")
-	}
-	if !j.NullAware {
-		t.Error("NullAware not preserved — NOT IN needs the null-aware anti join")
-	}
-}
-
 // A body whose planned inner projections narrow the leaf-concat schema is
 // not flattenable — it stays one opaque RHS leaf, the pre-step-2 behaviour.
 func TestFlattenedRHSDeclinesPrunedBody(t *testing.T) {

@@ -3224,6 +3224,16 @@ func canUnnestInExprDepth(in *InExpr, depth int) bool {
 	if !inExprIsPlainEquality(in) {
 		return false
 	}
+	// M0146-0002c: NOT IN is never unnested, as in PG. It is `<> ALL`, an
+	// ALL_SUBLINK, and pull_up_sublinks_qual_recurse converts ANY_SUBLINK and
+	// EXISTS_SUBLINK only (prepjointree.c:665/731), so PG keeps it a
+	// `(hashed SubPlan)` filter on the scan. The anti join goopg used to build
+	// was value-correct (null-aware) but put the join outside the search.
+	// `NOT (x IN (...))` is declined the same way where the flip is visible
+	// (effNegated in unnestInExpr / unnestNonCorrelatedInExpr).
+	if in.Negated {
+		return false
+	}
 	// M0069-0005: non-correlated IN — the inner plan has zero
 	// OuterColumnRefs and the outer key is the IN's left operand
 	// (`x IN (SELECT y FROM ...)` becomes a SemiJoin on x = y).
@@ -3395,6 +3405,12 @@ func unnestInExpr(in *InExpr, outer Node) (Node, error) {
 		return nil, nil
 	}
 	effNegated := in.Negated != negateFlip
+	if effNegated {
+		// M0146-0002c: `NOT (x IN (...))` is PG's NOT over an ANY_SUBLINK,
+		// which pull_up_sublinks leaves a SubPlan (it converts only
+		// `NOT EXISTS` under a NOT) — see canUnnestInExprDepth.
+		return nil, nil
+	}
 
 	outerChild := filter.Child
 	outerWidth := len(outerChild.Output())
@@ -3652,6 +3668,12 @@ func unnestNonCorrelatedInExpr(in *InExpr, outer Node) (Node, error) {
 		return nil, nil
 	}
 	effNegated := in.Negated != negateFlip
+	if effNegated {
+		// M0146-0002c: `NOT (x IN (...))` is PG's NOT over an ANY_SUBLINK,
+		// which pull_up_sublinks leaves a SubPlan (it converts only
+		// `NOT EXISTS` under a NOT) — see canUnnestInExprDepth.
+		return nil, nil
+	}
 
 	outerChild := filter.Child
 	outerWidth := len(outerChild.Output())

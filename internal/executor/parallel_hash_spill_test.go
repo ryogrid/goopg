@@ -567,8 +567,10 @@ func pqSpillCorpus() []string {
 		"SELECT f.fid, d.dname FROM ps_fact f LEFT JOIN ps_dim d ON f.fk = d.dk",
 		"SELECT f.fid FROM ps_fact f WHERE EXISTS (SELECT 1 FROM ps_dim d WHERE d.dk = f.fk)",
 		"SELECT f.fid FROM ps_fact f WHERE NOT EXISTS (SELECT 1 FROM ps_dim d WHERE d.dk = f.fk)",
-		"SELECT f.fid FROM ps_fact f WHERE f.fk NOT IN (SELECT d.dk FROM ps_dim d)",
-		"SELECT f.fid FROM ps_fact f WHERE f.fk NOT IN (SELECT d.dk FROM ps_dim d WHERE d.dk IS NOT NULL)",
+		// No NOT IN: since M0146-0002c the planner keeps NOT IN a hashed
+		// SubPlan, as PG does, so it builds no shared hash join to spill.
+		// The null-aware anti build itself stays pinned, planner-free, by
+		// TestSharedSpillingBuildParticipantsMatchSerial's nullAware shapes.
 	}
 }
 

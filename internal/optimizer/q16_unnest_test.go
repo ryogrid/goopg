@@ -29,7 +29,7 @@ import (
 // present, so it was most likely a stale/un-rebuilt server binary at
 // observation time rather than a planner defect. This test pins the
 // now-verified-correct behaviour so a future regression is caught.
-func TestPlanQ16NotInUnnestsWithRealSchema(t *testing.T) {
+func TestPlanQ16NotInStaysSubPlanWithRealSchema(t *testing.T) {
 	cat, err := tpch.Catalog()
 	if err != nil {
 		t.Fatalf("tpch.Catalog: %v", err)
@@ -69,11 +69,14 @@ func TestPlanQ16NotInUnnestsWithRealSchema(t *testing.T) {
 	if err != nil {
 		t.Fatalf("plan: %v", err)
 	}
-	j := findFirstJoinByType(node, JoinTypeAnti)
-	if j == nil {
-		t.Fatalf("Q16: expected a NullAware Anti join from the NOT IN unnest, got plan:\n%s", planTreeString(node))
+	// M0146-0002c: PG keeps Q16's `ps_suppkey NOT IN (SELECT s_suppkey ...)`
+	// a hashed SubPlan filter on the partsupp scan; it must not become an
+	// anti join (which put the join outside the search and cost Q16 PG's
+	// Parallel Hash + Gather Merge shape).
+	if j := findFirstJoinByType(node, JoinTypeAnti); j != nil {
+		t.Fatalf("Q16: the NOT IN became an anti join; PG keeps a hashed SubPlan:\n%s", planTreeString(node))
 	}
-	if !j.NullAware {
-		t.Error("Q16: Anti join from NOT IN must be NullAware")
+	if findInExpr(node) == nil {
+		t.Fatalf("Q16: the NOT IN sublink vanished without becoming a SubPlan:\n%s", planTreeString(node))
 	}
 }

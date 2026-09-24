@@ -261,18 +261,29 @@ func TestExplainSemiAntiJoinLabels(t *testing.T) {
 		t.Errorf("correlated IN did not produce a Semi Join label:\n%s", semi)
 	}
 
-	// A non-correlated NOT IN unnests to a null-aware anti join, and
-	// the null-aware flag is surfaced so plan diffs can tell the two
-	// anti joins apart.
+	// NOT EXISTS pulls up to an anti join (PG's pull_up_sublinks converts
+	// EXISTS under a NOT); the label must name it.
 	anti, _ := joinedPlan(t, ctx,
-		"EXPLAIN SELECT * FROM t1 WHERE t1.a NOT IN (SELECT t2.a FROM t2)")
+		"EXPLAIN SELECT * FROM t1 WHERE NOT EXISTS (SELECT 1 FROM t2 WHERE t2.a = t1.a)")
 	if strings.Contains(anti, "(?)") {
 		t.Errorf("join type rendered as `(?)`:\n%s", anti)
 	}
 	if !strings.Contains(anti, "Anti Join") {
-		t.Errorf("non-correlated NOT IN did not produce an Anti Join label:\n%s", anti)
+		t.Errorf("NOT EXISTS did not produce an Anti Join label:\n%s", anti)
 	}
 	assertNoOpaqueExpr(t, anti)
+
+	// M0146-0002c: NOT IN is `<> ALL`, which PG never pulls up — it stays a
+	// SubPlan filter (`NOT (ANY (a = (hashed SubPlan 1).col1))`), not a join.
+	notIn, _ := joinedPlan(t, ctx,
+		"EXPLAIN SELECT * FROM t1 WHERE t1.a NOT IN (SELECT t2.a FROM t2)")
+	if strings.Contains(notIn, "Anti Join") {
+		t.Errorf("non-correlated NOT IN produced an Anti Join; PG keeps a SubPlan:\n%s", notIn)
+	}
+	if !strings.Contains(notIn, "SubPlan") {
+		t.Errorf("non-correlated NOT IN did not render as a SubPlan:\n%s", notIn)
+	}
+	assertNoOpaqueExpr(t, notIn)
 }
 
 // TestJoinTypeNameSemiAnti pins the label strings directly, so the

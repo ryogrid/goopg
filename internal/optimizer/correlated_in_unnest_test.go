@@ -55,28 +55,10 @@ func TestUnnestCorrelatedIn_SafeSelfReferencing(t *testing.T) {
 	}
 }
 
-// TestUnnestCorrelatedNotIn_SafeSelfReferencing is the NOT IN sibling
-// of the above: the correlation predicate's equality guarantees the
-// subquery's per-row output is either empty or exactly {t1.x}, never
-// NULL, so a plain (non-NullAware) Anti join already implements NOT
-// IN's three-valued semantics correctly for this shape.
-func TestUnnestCorrelatedNotIn_SafeSelfReferencing(t *testing.T) {
-	cat := twoTablesCatalog(t)
-	sql := "SELECT x FROM t1 WHERE x NOT IN (SELECT y FROM t2 WHERE y = t1.x)"
-	node, err := Plan(parseOne(t, sql), cat)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if in := findInExpr(node); in != nil {
-		t.Fatalf("InExpr survived unnesting: %#v", in)
-	}
-	j := findFirstJoinByType(node, JoinTypeAnti)
-	if j == nil {
-		t.Fatalf("no JoinTypeAnti found after unnesting: %s", planString(node))
-	}
-	if j.Algo != JoinAlgoHash {
-		t.Errorf("Anti join algo = %d, want JoinAlgoHash", j.Algo)
-	}
+// TestCorrelatedNotInStaysSubPlan: the correlated NOT IN is declined too —
+// PG converts no ALL_SUBLINK, correlated or not (M0146-0002c).
+func TestCorrelatedNotInStaysSubPlan(t *testing.T) {
+	assertNotInStaysSubPlan(t, "SELECT x FROM t1 WHERE x NOT IN (SELECT y FROM t2 WHERE y = t1.x)")
 }
 
 // TestUnnestCorrelatedIn_RejectsOperandNotCorrelationColumn is a

@@ -64,42 +64,6 @@ func TestInUnnestSJInfoCorrelatedSemi(t *testing.T) {
 	}
 }
 
-func TestInUnnestSJInfoCorrelatedAnti(t *testing.T) {
-	cat := twoTablesCatalog(t)
-	sql := "SELECT x FROM t1 WHERE x NOT IN (SELECT y FROM t2 WHERE y = t1.x)"
-	node, err := Plan(parseOne(t, sql), cat)
-	if err != nil {
-		t.Fatal(err)
-	}
-	j := findFirstJoinByType(node, JoinTypeAnti)
-	if j == nil {
-		t.Fatalf("no JoinTypeAnti found: %s", planString(node))
-	}
-	sj := j.SJInfo
-	if sj == nil {
-		t.Fatal("Join.SJInfo is nil")
-	}
-	if sj.Jointype != parser.JoinAnti {
-		t.Errorf("Jointype = %v, want JoinAnti", sj.Jointype)
-	}
-	if sj.SynLefthand != RelSet(1) || sj.SynRighthand != RelSet(2) {
-		t.Errorf("Syn = {%v,%v}, want {1,2}", sj.SynLefthand, sj.SynRighthand)
-	}
-	// The correlated path builds a PLAIN (non-NullAware) anti join — the
-	// safe-self-referencing shape guarantees the correlated side never
-	// yields NULL — so the strict `=` clause is strict for the LHS.
-	if !sj.LhsStrict {
-		t.Error("LhsStrict = false, want true (plain strict `=` anti clause)")
-	}
-	// Semi-only fields must stay unset for ANTI.
-	if sj.SemiCanHash || sj.SemiCanBtree {
-		t.Errorf("SemiCanHash=%v SemiCanBtree=%v, want false/false for ANTI", sj.SemiCanHash, sj.SemiCanBtree)
-	}
-	if len(sj.SemiRhsExprs) != 0 {
-		t.Errorf("len(SemiRhsExprs) = %d, want 0 for ANTI", len(sj.SemiRhsExprs))
-	}
-}
-
 func TestInUnnestSJInfoNonCorrelatedSemi(t *testing.T) {
 	cat := twoTablesCatalog(t)
 	sql := "SELECT x FROM t1 WHERE x IN (SELECT y FROM t2 WHERE z > 0)"
@@ -143,42 +107,6 @@ func TestInUnnestSJInfoNonCorrelatedSemi(t *testing.T) {
 	}
 	if out := j.Right.Output(); len(out) > 0 && cr.SourceTableIdx != out[0].SourceTableIdx {
 		t.Errorf("SemiRhsExprs[0].SourceTableIdx = %d, want %d (innerOut[0]'s)", cr.SourceTableIdx, out[0].SourceTableIdx)
-	}
-}
-
-// TestInUnnestSJInfoNonCorrelatedAntiNullAware pins the conservative
-// contract for the NullAware (NOT IN) anti shape: LhsStrict=false (a
-// null-aware clause is not a plain strict equality and LhsStrict feeds
-// joinIsLegal's commute checks) and no Semi-only fields.
-func TestInUnnestSJInfoNonCorrelatedAntiNullAware(t *testing.T) {
-	cat := twoTablesCatalog(t)
-	sql := "SELECT x FROM t1 WHERE x NOT IN (SELECT y FROM t2 WHERE z > 0)"
-	node, err := Plan(parseOne(t, sql), cat)
-	if err != nil {
-		t.Fatal(err)
-	}
-	j := findFirstJoinByType(node, JoinTypeAnti)
-	if j == nil {
-		t.Fatalf("no JoinTypeAnti found: %s", planString(node))
-	}
-	if !j.NullAware {
-		t.Fatal("fixture sanity: expected NullAware=true on the NOT IN anti join")
-	}
-	sj := j.SJInfo
-	if sj == nil {
-		t.Fatal("Join.SJInfo is nil")
-	}
-	if sj.Jointype != parser.JoinAnti {
-		t.Errorf("Jointype = %v, want JoinAnti", sj.Jointype)
-	}
-	if sj.LhsStrict {
-		t.Error("LhsStrict = true, want false for the NullAware anti join")
-	}
-	if sj.SemiCanHash || sj.SemiCanBtree {
-		t.Errorf("SemiCanHash=%v SemiCanBtree=%v, want false/false for ANTI", sj.SemiCanHash, sj.SemiCanBtree)
-	}
-	if len(sj.SemiRhsExprs) != 0 {
-		t.Errorf("len(SemiRhsExprs) = %d, want 0 for ANTI", len(sj.SemiRhsExprs))
 	}
 }
 
