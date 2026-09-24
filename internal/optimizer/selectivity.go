@@ -157,15 +157,25 @@ func inListSelectivity(e *InExpr, cr *ColumnRef, stats *catalog.ColumnStats, tup
 // default (PG punts operator-less shapes to 0.5; the file-local default
 // applies here pending P1-14b's DEFAULT_* alignment).
 func inListElementSelectivity(e *InExpr, cr *ColumnRef, elem Expr, stats *catalog.ColumnStats, tuples float64, child Node) float64 {
+	// scalararraysel calls the element operator's own estimator, so eqsel's
+	// isunique branch (selfuncs.c:338) applies per element exactly as it does
+	// to a scalar `col = const` (uniqueEqSelectivity; sibling twins must
+	// agree), and neqsel inherits it as 1 - eqsel.
+	eq := func() float64 {
+		if sel, ok := uniqueEqSelectivity(cr, elem, child); ok {
+			return sel
+		}
+		return eqSelectivityForColumn(stats, elem, tuples)
+	}
 	if e.NotEqualAny {
 		// OR of `<>`: one minus the equality mass per element.
-		return 1 - eqSelectivityForColumn(stats, elem, tuples)
+		return 1 - eq()
 	}
 	switch e.AnyOp {
 	case 0, parser.OpEq:
-		return eqSelectivityForColumn(stats, elem, tuples)
+		return eq()
 	case parser.OpNe:
-		return 1 - eqSelectivityForColumn(stats, elem, tuples)
+		return 1 - eq()
 	case parser.OpLt, parser.OpLe, parser.OpGt, parser.OpGe:
 		return rangeOpSelectivity(e.AnyOp, cr, elem, child)
 	case parser.OpLike, parser.OpILike, parser.OpNotLike, parser.OpNotILike:
@@ -1018,7 +1028,10 @@ func clauseSelectivityWithSource(expr Expr, child Node) selectivityEstimate {
 			return selectivityEstimate{value: defaultGenericSelectivity, reliable: false}
 		}
 		stats := columnStatsForChild(cr.Index, child)
-		if stats == nil {
+		// A unique key column is priced from the catalog alone (the isunique
+		// branch inListElementSelectivity applies), so it is reliable
+		// without statistics, as eqOpSelectivityWithSource treats it.
+		if _, unique := uniqueColumnTuples(cr.Index, child); stats == nil && !unique {
 			return selectivityEstimate{value: defaultGenericSelectivity, reliable: false}
 		}
 		sel := inListSelectivity(e, cr, stats, columnRawRowsForChild(cr.Index, child), child)

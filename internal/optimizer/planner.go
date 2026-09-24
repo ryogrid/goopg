@@ -1172,10 +1172,10 @@ func setOpBindsTighter(inner, outer parser.SetOpType) bool {
 }
 
 // planSelectWithSettings is the M0145-0002 dual-pipeline dispatch point
-// (AGENT.md §"Plan-parity harness" G8): GOOPG_JOINTREE_PIPELINE=1 selects
-// the jointree-first pipeline, anything else the legacy one. The knob is
-// the only pipeline-selection mechanism and is retired by M0145-0008's
-// cutover. Every planning scope re-enters here — subqueries, CTE bodies,
+// (AGENT.md §"Plan-parity harness" G8): the jointree-first pipeline is the
+// default since M0145-0008's cutover, and GOOPG_JOINTREE_PIPELINE=0 selects
+// the legacy one. The knob is the only pipeline-selection mechanism and goes
+// with the legacy pipeline in the legacy-deletion slices. Every planning scope re-enters here — subqueries, CTE bodies,
 // set-op branches — matching the way PG's subquery_planner recurses per
 // Query.
 func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSet PlannerSettings, scope *rtableScope) (Node, error) {

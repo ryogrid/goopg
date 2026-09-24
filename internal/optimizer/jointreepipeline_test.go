@@ -4,9 +4,9 @@ package optimizer
 // (docs/design/0100-0149/m0145-0002-dual-pipeline-harness.md, AGENT.md
 // §"Plan-parity harness" G8). Two pins:
 //
-//  1. the resolver is fail-closed — only the literal "1" arms the new
-//     pipeline, so an unset/misspelled environment can never silently
-//     route planning off the value-gated path;
+//  1. the resolver's polarity — since the M0145-0008 cutover the jointree
+//     pipeline is the default and only the literal "0" selects legacy, so an
+//     unset or misspelled environment stays on the value-gated path;
 //  2. the dispatch reaches the arm it names: on a scope the arms plan
 //     differently (a single-table statement, since M0145-0005 slice 4
 //     lifted the isSimpleSingle bypass on the jointree arm), the
@@ -24,12 +24,12 @@ func TestJointreePipelineKnobPolarity(t *testing.T) {
 		env  string
 		want bool
 	}{
-		{"", false},     // unset — the default: the legacy pipeline is the arm
-		{"0", false},    // explicit off
-		{"1", true},     // the only on value
-		{"on", false},   // unrecognised: fail closed, stay legacy
-		{"true", false}, // unrecognised: fail closed, stay legacy
-		{"yes", false},  // unrecognised: fail closed, stay legacy
+		{"", true},     // unset — the default since the M0145-0008 cutover
+		{"0", false},   // the only legacy value
+		{"1", true},    // explicit on
+		{"on", true},   // anything but "0" keeps the default
+		{"off", true},  // not a legacy spelling: only "0" is
+		{"false", true},
 	} {
 		if got := jointreePipelineFromEnv(tc.env); got != tc.want {
 			t.Errorf("jointreePipelineFromEnv(%q) = %v, want %v", tc.env, got, tc.want)

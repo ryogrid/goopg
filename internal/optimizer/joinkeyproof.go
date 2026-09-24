@@ -477,6 +477,15 @@ func baseColumnOfTable(scan Node, tbl *catalog.Table, uniq [][]string, idx int) 
 			ref.stats = &tbl.Stats.Columns[idx]
 		}
 	}
+	// Without ANALYZE, PG's divisor is still `vardata->rel->tuples`: the
+	// estimate_rel_size row count get_relation_info stamped on the rel
+	// (plancat.c), never zero for a relation with a live block count. goopg
+	// stamps the same estimate on the scan as EstRelRows.
+	if ref.rawRows == 0 {
+		if ss, ok := scan.(*SeqScan); ok && ss.EstRelRows > 0 {
+			ref.rawRows = float64(ss.EstRelRows)
+		}
+	}
 	// take2 P1-19: `get_variable_numdistinct`'s isunique branch
 	// (selfuncs.c:6332) — "assume it is unique no matter what pg_statistic
 	// says". `examine_variable` sets `vardata->isunique` from

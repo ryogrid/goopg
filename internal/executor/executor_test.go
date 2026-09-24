@@ -8,6 +8,30 @@ import (
 	"github.com/goopg/goopg/internal/optimizer"
 )
 
+// planOneIndexScan plans sql under enable_seqscan = off and
+// enable_bitmapscan = off, where PG 18.3 elects an Index Scan. Tests that
+// exist to drive the executor's IndexScan on a tiny never-ANALYZEd table use
+// it: at default settings PG itself plans a Bitmap Heap Scan (or a Seq Scan)
+// there, and the cost-based search now agrees (M0145-0008 cutover).
+func planOneIndexScan(t *testing.T, sql string, cat catalog.Catalog) optimizer.Node {
+	t.Helper()
+	stmts, err := parser.Parse(sql)
+	if err != nil {
+		t.Fatalf("Parse(%q): %v", sql, err)
+	}
+	if len(stmts) != 1 {
+		t.Fatalf("Parse(%q): %d stmts", sql, len(stmts))
+	}
+	ps := optimizer.DefaultPlannerSettings()
+	ps.EnableSeqScan = false
+	ps.EnableBitmapScan = false
+	plan, err := optimizer.PlanWithSettings(stmts[0], cat, ps)
+	if err != nil {
+		t.Fatalf("Plan(%q): %v", sql, err)
+	}
+	return plan
+}
+
 func planOne(t *testing.T, sql string, cat catalog.Catalog) optimizer.Node {
 	t.Helper()
 	stmts, err := parser.Parse(sql)

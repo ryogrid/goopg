@@ -176,3 +176,27 @@
 2026-09-21T09:28:50+09:00 next fire at 2026-09-22T00:00:00+09:00 (sleeping 52270s)
 2026-09-22T00:48:50+09:00 firing nightly batch (scheduled 2026-09-22T00:00; woke 2026-09-22T00:48:50+09:00)
 2026-09-22T00:48:50+09:00 next fire at 2026-09-23T00:00:00+09:00 (sleeping 83470s)
+2026-09-22T10:11:12+09:00 scheduler start pid=622325 repo=/home/ryo/work/goopg/goopg fire_hour=00
+2026-09-22T10:11:12+09:00 next fire at 2026-09-23T00:00:00+09:00 (sleeping 49728s)
+2026-09-22T10:13:35+09:00 scheduler start pid=624530 repo=/home/ryo/work/goopg/goopg fire_hour=00
+2026-09-22T10:13:35+09:00 next fire at 2026-09-23T00:00:00+09:00 (sleeping 49585s)
+2026-09-22T10:22:17+09:00 scheduler start pid=628661 repo=/home/ryo/work/goopg/goopg fire_hour=00
+2026-09-22T10:22:17+09:00 next fire at 2026-09-23T00:00:00+09:00 (sleeping 49063s)
+2026-09-22T10:54:04+09:00 scheduler start pid=680836 repo=/home/ryo/work/goopg/goopg fire_hour=00
+2026-09-22T10:54:04+09:00 next fire at 2026-09-23T00:00:00+09:00 (sleeping 47156s)
+2026-09-22T11:04:10+09:00 scheduler start pid=699903 repo=/home/ryo/work/goopg/goopg fire_hour=00
+2026-09-22T11:04:10+09:00 next fire at 2026-09-23T00:00:00+09:00 (sleeping 46550s)
+2026-09-22T11:33:57+09:00 scheduler start pid=727695 repo=/home/ryo/work/goopg/goopg fire_hour=00
+2026-09-22T11:33:57+09:00 next fire at 2026-09-23T00:00:00+09:00 (sleeping 44763s)
+2026-09-22T16:58:28+09:00 scheduler start pid=1191412 repo=/home/ryo/work/goopg/goopg fire_hour=00
+2026-09-22T16:58:28+09:00 next fire at 2026-09-23T00:00:00+09:00 (sleeping 25292s)
+2026-09-23T00:13:46+09:00 firing nightly batch (scheduled 2026-09-23T00:00; woke 2026-09-23T00:13:46+09:00)
+2026-09-23T00:13:46+09:00 next fire at 2026-09-24T00:00:00+09:00 (sleeping 85574s)
+2026-09-23T03:29:50+09:00 scheduler start pid=2100537 repo=/home/ryo/work/goopg/goopg fire_hour=00
+2026-09-23T03:29:50+09:00 next fire at 2026-09-24T00:00:00+09:00 (sleeping 73810s)
+2026-09-23T09:44:57+09:00 scheduler start pid=2433580 repo=/home/ryo/work/goopg/goopg fire_hour=00
+2026-09-23T09:44:57+09:00 next fire at 2026-09-24T00:00:00+09:00 (sleeping 51303s)
+2026-09-23T09:47:32+09:00 scheduler start pid=2436408 repo=/home/ryo/work/goopg/goopg fire_hour=00
+2026-09-23T09:47:32+09:00 next fire at 2026-09-24T00:00:00+09:00 (sleeping 51148s)
+2026-09-24T00:54:46+09:00 firing nightly batch (scheduled 2026-09-24T00:00; woke 2026-09-24T00:54:46+09:00)
+2026-09-24T00:54:46+09:00 next fire at 2026-09-25T00:00:00+09:00 (sleeping 83114s)

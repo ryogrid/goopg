@@ -1156,6 +1156,19 @@ func indexProbeMultFromEnv(v string) float64 {
 	return indexProbeMultCalibrated
 }
 
+// SetIndexProbeCostMultiplier sets indexProbeCostMultiplier from a label an
+// operator would export as GOOPG_INDEX_PROBE_MULT, resolved through the SAME
+// indexProbeMultFromEnv production uses, and returns the restore. It exists
+// for executor tests that pin PG's index-vs-bitmap election, where PG prices
+// the two within 0.01 and the calibrated 2x would decide them (owner decision
+// 2026-09-24, M0145-0008 option (c)). Process-global, like SetGatherPathsMode:
+// the caller must run the returned restore.
+func SetIndexProbeCostMultiplier(label string) (restore func()) {
+	prev := indexProbeCostMultiplier
+	indexProbeCostMultiplier = indexProbeMultFromEnv(label)
+	return func() { indexProbeCostMultiplier = prev }
+}
+
 // indexProbeMultCalibrated is the validated default (see the block comment on
 // indexProbeCostMultiplier for the measurement that set it). Named rather than
 // inlined so the flag-provenance table resolves the same default the process

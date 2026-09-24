@@ -11,20 +11,29 @@ import (
 // process-wide (AGENT.md §"Plan-parity harness" G8). It is the sanctioned
 // dual-pipeline migration mechanism — precedent: GOOPG_PGSHAPED_DP,
 // GOOPG_UNNEST_PREDP — and the ONLY pipeline-selection knob for the
-// transition: G8 forbids a second one. Default off: the legacy pipeline
-// stays the value-gated path for the whole transition, so every gate
-// (tpcds-sf025 sweep, tpch-spotcheck, acceptance arms) keeps measuring it
-// while the new pipeline is built under the knob on private, EXPLAIN-only
-// lanes. The knob is retired by M0145-0008's cutover — the deciding
-// measurement is the knob-arm parity capture this dispatch enables
-// (scripts/jointree-parity-capture.sh).
+// transition: G8 forbids a second one. Default ON since the M0145-0008
+// cutover: every value gate measures the jointree pipeline, and
+// GOOPG_JOINTREE_PIPELINE=0 selects the legacy pipeline until the
+// legacy-deletion slices remove it together with this knob.
 var jointreePipeline = jointreePipelineFromEnv(os.Getenv("GOOPG_JOINTREE_PIPELINE"))
 
-// jointreePipelineFromEnv resolves the knob. Fail-closed: only the literal
-// "1" engages the new pipeline; unset, "0" and anything unrecognised stay on
-// the legacy pipeline — a typo must never silently arm the path the value
-// gates do not cover (oneRelSearchFromEnv sets the precedent).
-func jointreePipelineFromEnv(v string) bool { return v == "1" }
+// jointreePipelineFromEnv resolves the knob. Only the literal "0" selects the
+// legacy pipeline; unset and anything else keep the default, the
+// GOOPG_PGSHAPED_DP convention for a default-on knob.
+func jointreePipelineFromEnv(v string) bool { return v != "0" }
+
+// SetJointreePipeline selects the pipeline from a label an operator would
+// export as GOOPG_JOINTREE_PIPELINE, resolved through jointreePipelineFromEnv,
+// and returns the restore. It is the same knob reached across the package
+// boundary, not a second selection mechanism (owner decision 2026-09-24,
+// M0145-0008): executor tests of legacy-only machinery pin "0" with it until
+// the legacy-deletion slices delete them with the code they cover.
+// Process-global, like SetGatherPathsMode: the caller must run the restore.
+func SetJointreePipeline(label string) (restore func()) {
+	prev := jointreePipeline
+	jointreePipeline = jointreePipelineFromEnv(label)
+	return func() { jointreePipeline = prev }
+}
 
 // planSelectJointreePipeline is the jointree-first pipeline's per-scope
 // entry point, dispatched from planSelectWithSettings — every subquery,

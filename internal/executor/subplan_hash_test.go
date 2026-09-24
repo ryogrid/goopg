@@ -152,8 +152,11 @@ func TestHashedInAnyAllFormsUnaffected(t *testing.T) {
 // with 42883 "operator does not exist: integer = text". goopg accepts it on
 // both pipelines, and they disagree (legacy 1 row, jointree 0: its semi join
 // hashes int against text). The type-check gap is ledgered. This test
-// should become a 42883 assertion when that check lands.
+// should become a 42883 assertion when that check lands. Until then it is
+// pinned to the legacy pipeline, whose linear-probe fallback it covers
+// (owner decision 2026-09-24, M0145-0008).
 func TestHashedInMixedKindFallsBack(t *testing.T) {
+	defer optimizer.SetJointreePipeline("0")()
 	ctx, cleanup := hashFixture(t)
 	defer cleanup()
 	got := runBothHashPaths(t, ctx,

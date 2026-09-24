@@ -32,7 +32,8 @@
 #              enumeration-provenance section (M0127-P5.9-l-ii). Only
 #              meaningful with PGSHAPED=1: the trace is written by the
 #              PG-shaped search, so a PGSHAPED=0 arm produces an empty one.
-#   JOINTREE   GOOPG_JOINTREE_PIPELINE for this arm (default 0) — the
+#   JOINTREE   GOOPG_JOINTREE_PIPELINE for this arm (default 1, the
+#              default pipeline since the M0145-0008 cutover; 0 = legacy) — the
 #              M0145-0002 dual-pipeline knob (AGENT.md G8). Set EXPLICITLY
 #              for the same reason as PGSHAPED: an unset flag stops being a
 #              well-defined arm the day the default flips, and the knob IS
@@ -105,7 +106,7 @@ export GOOPG_MEM_HIGH="${GOOPG_MEM_HIGH:-20G}" GOOPG_MEM_MAX="${GOOPG_MEM_MAX:-2
 export GOOPG_MEM_SWAP_MAX="${GOOPG_MEM_SWAP_MAX:-0}"
 export GOOPG_PGSHAPED_DP="${PGSHAPED:-0}"
 export GOOPG_PGSHAPED_DP_TRACE="${DP_TRACE:-0}"
-export GOOPG_JOINTREE_PIPELINE="${JOINTREE:-0}"
+export GOOPG_JOINTREE_PIPELINE="${JOINTREE:-1}"
 # M0145-0021b: pin the reservoir sample, same default and same reason as
 # tpch-acceptance-arm.sh. goopg's statistics are per-connection and ANALYZE is
 # sampled, so an UNPINNED arm plans against a different sample every run. This

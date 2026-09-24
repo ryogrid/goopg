@@ -114,7 +114,7 @@ func TestIndexScanVarcharEndToEnd(t *testing.T) {
 	}
 
 	sql := "SELECT p_partkey FROM part WHERE p_type = 'PROMO BRUSHED STEEL'"
-	plan := planOne(t, sql, ctx.Catalog)
+	plan := planOneIndexScan(t, sql, ctx.Catalog)
 
 	// Verify the planner chose IndexScan.
 	proj, ok := plan.(*optimizer.Project)
@@ -168,7 +168,7 @@ func TestIndexScanCharEndToEnd(t *testing.T) {
 	}
 
 	sql := "SELECT c_custkey FROM customer WHERE c_mktsegment = 'FURNITURE'"
-	plan := planOne(t, sql, ctx.Catalog)
+	plan := planOneIndexScan(t, sql, ctx.Catalog)
 
 	proj, ok := plan.(*optimizer.Project)
 	if !ok {
@@ -226,7 +226,7 @@ func TestIndexScanTimestampEndToEnd(t *testing.T) {
 	}
 
 	sql := "SELECT l_linenumber FROM lineitem WHERE l_shipdate = timestamp '1995-09-15'"
-	plan := planOne(t, sql, ctx.Catalog)
+	plan := planOneIndexScan(t, sql, ctx.Catalog)
 
 	proj, ok := plan.(*optimizer.Project)
 	if !ok {

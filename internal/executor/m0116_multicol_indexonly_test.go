@@ -189,6 +189,11 @@ func TestIOS_CompositeInt4Text(t *testing.T) {
 func TestIOS_HeapFallback(t *testing.T) {
 	ctx, cleanup := newVMFixture(t)
 	defer cleanup()
+	// PG prices the index and bitmap paths here within 0.01 of each other;
+	// goopg's calibrated 2x probe multiplier would decide them, so the test
+	// plans with PG's constants (multiplier 1). Owner decision 2026-09-24,
+	// M0145-0008 option (c).
+	defer optimizer.SetIndexProbeCostMultiplier("1")()
 
 	runComposite(t, ctx,
 		"CREATE TABLE hf (a int, b int, c text)",

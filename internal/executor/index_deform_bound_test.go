@@ -16,6 +16,7 @@ import (
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/optimizer"
 	"github.com/goopg/goopg/internal/parser"
+	"github.com/goopg/goopg/internal/storage"
 )
 
 // idxDeformEff normalises an operator's stamped deformBound the way the
@@ -602,11 +603,12 @@ func TestIndexDeformRescanPersistsBound(t *testing.T) {
 	// promotion, keeping the heap path; the bound narrows to 2/8.
 	// The plan-shape gate proves the index (not a seq scan) serves it and
 	// the built probe actually narrowed.
+	// Planned under enable_seqscan/enable_bitmapscan = off: at default
+	// settings PG 18.3 plans this unmeasured table as a Bitmap Heap Scan,
+	// and the cost-based search now agrees (M0145-0008 cutover).
 	const pointSQL = `SELECT a, b FROM w WHERE a = 20`
-	pointPlan, err := testPlanDeform(t, ctx, pointSQL)
-	if err != nil {
-		t.Fatalf("plan point: %v", err)
-	}
+	advanceStmtCounter(ctx)
+	pointPlan := planOneIndexScan(t, pointSQL, ctx.Catalog)
 	for n := pointPlan; ; {
 		switch v := n.(type) {
 		case *optimizer.IndexScan:
@@ -869,6 +871,23 @@ func TestBitmapDeformLossyRecheckPoison(t *testing.T) {
 func TestIndexOnlyDeformColdAndVisible(t *testing.T) {
 	ctx, cleanup := newVMFixture(t)
 	defer cleanup()
+	// PG prices the index and bitmap paths here within 0.01 of each other;
+	// goopg's calibrated 2x probe multiplier would decide them, so the test
+	// plans with PG's constants (multiplier 1). Owner decision 2026-09-24,
+	// M0145-0008 option (c).
+	defer optimizer.SetIndexProbeCostMultiplier("1")()
+	// The live block-count reader the server installs (initdb.Open): PG
+	// sizes these never-ANALYZEd tables from RelationGetNumberOfBlocks
+	// (estimate_rel_size's 10-page floor), and without the reader the
+	// fixture prices them as one row on one page — the M0145-0029 slice 5
+	// finding for this test.
+	ctx.Catalog.(*catalog.InMemory).SetRelationSizer(func(rfn storage.RelFileNode) (int64, bool) {
+		n, err := ctx.Pool.NBlocks(rfn)
+		if err != nil {
+			return 0, false
+		}
+		return int64(n), true
+	})
 
 	mkWide := func(name, index string) {
 		cols := "a int, b int, c int, d int, e int, f int, g int, h int"

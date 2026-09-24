@@ -122,9 +122,13 @@ func TestExplainTransitiveGroupKeyRendersInnerCall(t *testing.T) {
 
 	// Q13-key2 miniature: the outer group key names the inner agg's
 	// output positionally (`c` vs inner `count`) and renders the inner
-	// call — parenthesised in Group Key since M0141-S2b-13's sorted-first
-	// grouping order elects a GroupAggregate here (was: bare under the
-	// deviation-era HashAggregate over Project, S18), wrapped in Sort Key.
+	// call, wrapped in Sort Key. The pin is the rendering, not the
+	// strategy: since the inner aggregate is estimated at PG's 200 groups
+	// (M0145-0008, `vardata->rel->tuples` without ANALYZE) the outer one is
+	// a HashAggregate (bare call) where it had been a GroupAggregate
+	// (parenthesised). PG 18.3 elects GroupAggregate over one Sort DESC and
+	// keeps the Subquery Scan (`Group Key: unnamed_subquery.c`); goopg does
+	// not adopt ORDER BY's direction for grouping (ledgered, own task).
 	rows := runExplainRows(t, ctx,
 		"EXPLAIN (COSTS OFF) SELECT c, count(*) FROM (SELECT g, count(x) AS c FROM r66t GROUP BY g) GROUP BY c ORDER BY c DESC")
 	var sortLine, groupLine string
@@ -140,8 +144,8 @@ func TestExplainTransitiveGroupKeyRendersInnerCall(t *testing.T) {
 	if sortLine != "Sort Key: (count(x)) DESC" {
 		t.Errorf("expected transitive `Sort Key: (count(x)) DESC`; got:\n%s", strings.Join(rows, "\n"))
 	}
-	if groupLine != "Group Key: (count(x))" {
-		t.Errorf("expected transitive `Group Key: (count(x))`; got:\n%s", strings.Join(rows, "\n"))
+	if groupLine != "Group Key: count(x)" && groupLine != "Group Key: (count(x))" {
+		t.Errorf("expected transitive `Group Key: count(x)`; got:\n%s", strings.Join(rows, "\n"))
 	}
 	assertNoOpaqueExpr(t, strings.Join(rows, "\n"))
 }

@@ -6,6 +6,7 @@ import (
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/parser"
+	"github.com/goopg/goopg/internal/storage"
 )
 
 // B-14 (P2-09a) — ScalarArrayOp index path fixtures.
@@ -184,6 +185,13 @@ func TestSAOPMultiTableRewriteMoves(t *testing.T) {
 // Filter — the same division the `=` rewrite arm performs.
 func TestSAOPWithConjunctMoves(t *testing.T) {
 	c := saopFixture(t)
+	// PG always has a block count for the relation: 0 here, so
+	// estimate_rel_size applies its 10-page floor and a density row count
+	// (plancat.c), under which PG 18.3 elects the Index Scan on
+	// idx_item_sk_flag. Without a sizer the catalog reports no size at all
+	// and the seq path is priced as one row on one page, a state PG never
+	// plans against (M0145-0008 flip; M0145-0029 slice 5 records the oracle).
+	c.(*catalog.InMemory).SetRelationSizer(func(storage.RelFileNode) (int64, bool) { return 0, true })
 	node, err := Plan(parseOne(t,
 		"SELECT i_item_id FROM item WHERE i_item_sk IN (2, 3) AND i_flag > 1"), c)
 	if err != nil {

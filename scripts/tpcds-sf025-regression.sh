@@ -307,7 +307,7 @@ sf025_final_bad=0                # MISMATCH+CKMISMATCH+ERROR of the finished swe
 sf025_final_timeouts=0           # TIMEOUT count of the finished sweep
 sf025_nli_census="${GOOPG_NLI_CENSUS:-0}"          # preserve an explicit caller trace request
 sf025_dp_trace="${GOOPG_PGSHAPED_DP_TRACE:-0}"     # preserve an explicit caller trace request
-sf025_jointree_pipeline="${GOOPG_JOINTREE_PIPELINE:-0}"  # pipeline arm for the next server start (plan channel only)
+sf025_jointree_pipeline="${GOOPG_JOINTREE_PIPELINE:-1}"  # pipeline arm for the next server start; 1 = the default since the M0145-0008 cutover
 
 sf025_ensure_bin() {
     local tree_sha dirty built="rebuilt from tree"
@@ -817,12 +817,12 @@ sf025_plan_channel() {
     # would leak knob-arm SUBLINKCENSUS/seam-decline events into the default
     # lane's flow report.
     tail -n +$((log_lines + 1)) "${SF025_LOG}" > "${trace}" 2>/dev/null || true
-    # Knob-arm flow lane (M0145-0023 follow-up, progress-report §5.3): the
-    # default-arm capture measures `jointree-pullup` structurally at 0 —
-    # the route ratio that actually shows convergence only exists on the
-    # knob arm. One extra EXPLAIN-only pass under GOOPG_JOINTREE_PIPELINE=1
-    # feeds the same flow-convergence.py into the same trend with a
-    # `-knob` label. The capture file is named `plansknob-*` on purpose:
+    # Knob-arm flow lane (M0145-0023 follow-up, progress-report §5.3). Since
+    # the M0145-0008 cutover the default arm IS the jointree pipeline, so
+    # this extra EXPLAIN-only pass runs the LEGACY pipeline
+    # (GOOPG_JOINTREE_PIPELINE=0) as a control side channel until the
+    # legacy-deletion slices remove it; it feeds the same
+    # flow-convergence.py trend under the `-knob` label. The capture file is named `plansknob-*` on purpose:
     # it must NEVER match the `plans-*.txt` baseline glob (the recorded
     # trap: a knob-arm capture landing in the baseline slot once made the
     # next default sweep diff `same=74 changed=25` against itself).
@@ -832,14 +832,14 @@ sf025_plan_channel() {
         knob_plans="${report%/*}/plansknob-${report##*/sweep-}"
         knob_trace="${knob_plans%.txt}.flow.log"
         knob_log_lines=$(wc -l < "${SF025_LOG}" 2>/dev/null || echo 0)
-        sf025_jointree_pipeline=1
+        sf025_jointree_pipeline=0
         (
             sf025_goopg_start
             # The env prefix must sit on the capture call too: the header's
             # planner-flags line reads the SCRIPT's env, so without it the
-            # knob-arm file would stamp GOOPG_JOINTREE_PIPELINE=unset(off)
-            # on a knob-on capture.
-            GOOPG_JOINTREE_PIPELINE=1 sf025_capture_plans "${knob_plans}"
+            # control file would stamp GOOPG_JOINTREE_PIPELINE=unset(on)
+            # on a legacy-arm capture.
+            GOOPG_JOINTREE_PIPELINE=0 sf025_capture_plans "${knob_plans}"
             sf025_goopg_stop
         ) >> "${SF025_LOG}" 2>&1 || knob_rc=$?
         tail -n +$((knob_log_lines + 1)) "${SF025_LOG}" > "${knob_trace}" 2>/dev/null || true
@@ -883,7 +883,7 @@ sf025_plan_channel() {
         fi
         if [[ -n "${knob_plans:-}" ]]; then
             if [[ "${knob_rc}" -ne 0 ]]; then
-                echo "=== FLOW-CONVERGENCE(knob arm, GOOPG_JOINTREE_PIPELINE=1): capture FAILED (rc=${knob_rc}) — see ${SF025_LOG}; the verdict above is unaffected ==="
+                echo "=== FLOW-CONVERGENCE(knob arm, GOOPG_JOINTREE_PIPELINE=0 legacy control): capture FAILED (rc=${knob_rc}) — see ${SF025_LOG}; the verdict above is unaffected ==="
             else
                 python3 "${SCRIPT_DIR}/flow-convergence.py" \
                     --label "${report##*/}-knob" --trend "${trend}" "${knob_trace}" 2>&1 || knob_flow_rc=$?
