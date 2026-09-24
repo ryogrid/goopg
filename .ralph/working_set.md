@@ -1,24 +1,14 @@
-Task: M0146-0002 — `Parallel Hash` over a genuinely partial inner. Slices 1
-(executor, 171c5d58a) and 2 (planner + label, cf02e88b9) landed. TPC-H
-match 2→3 (Q14 now matches), SF0.25 match 2→4.
+(idle — nothing in flight)
 
-Files: internal/optimizer/joinpathsparallel.go (addParallelHashJoinPath),
-cost_funcs.go (hashGeometryInputs), parallel.go (ParallelHashJoinsIn,
-stamp/unstamp), gatherpaths.go (driving kind), executor parallel_hash_shared.go,
-parallel_scan.go (attachParallelHashBuildSides), operators_explain.go (label).
-Design: docs/design/0100-0149/m0146-0002-parallel-hash-partial-inner.md.
-Raw: analysis/m0146/m0146-0002/.
+Loop #52 closed M0146-0002 (Parallel Hash): slices 1 (171c5d58a, executor)
+and 2 (cf02e88b9, planner + label) landed, and TPC-H Q14 matches. Slice 3
+attributed Q16's residual `parallelism` to the NOT IN route: the legacy
+unnest turns NOT IN into an anti join outside the search, and the post-pass
+Gather cannot elect Parallel Hash. Filed as M0146-0002b.
 
-Findings: Q16 still carries `parallelism` although both engines build over
-`part`. Q12/Q21/Q4 gained categories (M0146-0002a, recon).
+Next per the banner (item 3's M0146 continuation, file order): M0146-0002b
+(recon: NOT IN anti-join census + NULL-bearing value check), then M0146-0002a
+(recon: Q12/Q21/Q4 category regressions). M0145-0001 is still [!], pending
+the owner's answer to the 2026-09-24 lineage escalation.
 
-Next step: slice 3, Q16. Diff goopg's Q16 plan (the "=== Q16" section of
-tmp/m0146-0002-cap/s2-tpch.plans.txt) against PG's
-(s2-tpch-pg.plans.txt) and name the remaining parallel difference, then
-M0146-0002a in file order.
-
-Gates run: units; tpch-spotcheck (Q12=2, Q13=33); sf025 96/96
-(changed=59); acceptance arm identical; fireset; TPC-H + SF0.25 parity
-captures.
-
-In-flight: none. Parked: tmp/m0122-alter-system-wip.patch (M0122 ALTER SYSTEM).
+Parked: tmp/m0122-alter-system-wip.patch (M0122 ALTER SYSTEM).

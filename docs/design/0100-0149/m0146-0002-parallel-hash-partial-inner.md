@@ -1,6 +1,6 @@
 # M0146-0002: `Parallel Hash` over a genuinely partial inner
 
-Status: slice 1 (executor) LANDED `171c5d58a`; slice 2 (planner + label) LANDED `cf02e88b9` 2026-09-24 — TPC-H Q14 matches PG. Open: Q16 (slice 3) and the Q12/Q21/Q4 category regressions (M0146-0002a). Task:
+Status: COMPLETE 2026-09-24 — slices 1 (`171c5d58a`) and 2 (`cf02e88b9`) landed, TPC-H Q14 matches PG; slice 3 attributed Q16's residue to the NOT IN route (M0146-0002b). Category regressions: M0146-0002a.
 `.ralph/fix_plan.md` M0146-0002 (Kind: impl, Parent: M0140-0007). Scope was
 set by the owner's 2026-09-23 answer to M0140-0007, option (a): a fidelity
 port. The label and the execution model land together, each shape pinned by a
@@ -195,3 +195,25 @@ Per query, TPC-H:
 Values: the sweep is 96/96 with no mismatches or timeouts although 59 SF0.25
 plan shapes changed, the acceptance arm is identical, and the fire set is
 clean. Raw diffs are in `analysis/m0146/m0146-0002/`.
+
+## Slice 3: Q16 attribution (2026-09-24, no code change)
+
+Q16 still carries `parallelism`, and the cause is not Parallel Hash
+capability:
+
+- A planner DP trace of Q16 on the private TPC-H lane shows the
+  `parallel_hash = true` path **filed** for `{part+partsupp}` in both
+  directions. It is the cheapest partial path: 27131, against 29388 for the
+  complete-inner variant (outer `partsupp`).
+- The join search covers only `{part+partsupp}`. goopg's legacy unnest turns
+  `ps_suppkey NOT IN (SELECT s_suppkey …)` into an anti join outside the
+  search. PG keeps it as a `(hashed SubPlan)` filter on the scan:
+  `pull_up_sublinks` converts ANY and EXISTS only (`prepjointree.c:665/731`).
+- At the search root, a Gather over the partial path (≈39.9k with setup and
+  transfer) loses to the serial hash (37118). The Gather above the anti join
+  is then added by the post-pass over a serial plan, and the post-pass cannot
+  elect a Parallel Hash. PG, with the NOT IN inside the scan, places a Gather
+  Merge + GroupAggregate over the whole `part ⋈ partsupp` Parallel Hash.
+
+Owned by M0146-0002b, which also owns the 2026-09-21 ledger row on the NOT IN
+→ anti conversion.

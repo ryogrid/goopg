@@ -19288,7 +19288,7 @@ M0146-0001 re-baseline census on the new default arm.
   PRE-flip TPC-H arm); this task measures the post-flip default.
   Kind: recon
   Parent: M0145-0008
-- [ ] **M0146-0002 — `Parallel Hash` over a genuinely partial inner**
+- [x] **M0146-0002 — `Parallel Hash` over a genuinely partial inner**
   (impl; supersedes M0140-0007 per owner answer 2026-09-23, option (a)).
   Port the real thing: hash build inside the Gather over a partial inner
   (PG's `Parallel Hash` / shared `parallel_hash` model), shared
@@ -19322,9 +19322,44 @@ M0146-0001 re-baseline census on the new default arm.
     - Gates: units, spotcheck Q12=2/Q13=33, sf025 96/96 \(changed=59\),
       acceptance identical, fireset.
     Movement: yes — TPC\-H MATCH 2 → 3 \(Q14\), parallelism 16 → 11; TPC\-DS SF0.25 MATCH 2 → 4 \(Q93, Q98\), parallelism 81 → 74.
-  - Next: slice 3 — Q16 still carries `parallelism` \(both engines build
-    over `part`\); diff goopg's Q16 plan against PG's on the canonical
-    capture and find the remaining parallel difference.
+  - **Slice 3 \(Q16 attribution\) DONE 2026\-09\-24 — no code change; Q16's
+    residual `parallelism` is NOT a Parallel Hash gap.**
+    - DP trace on the private TPC\-H lane: the `parallel\_hash` path IS filed
+      for `\{part\+partsupp\}` and is the cheapest partial path \(27131 vs the
+      complete\-inner 29388\).
+    - The search covers only `\{part\+partsupp\}`: goopg's legacy unnest
+      converts `NOT IN \(SELECT s\_suppkey …\)` into an anti join OUTSIDE
+      the search, where PG keeps a hashed SubPlan filter on the scan
+      \(`pull\_up\_sublinks` converts ANY/EXISTS only\). At the search root a
+      Gather over the partial path \(≈39.9k with setup \+ transfer\) loses to
+      the serial hash \(37118\); the Gather above the anti join is then
+      added by the post\-pass over a serial plan, which cannot elect a
+      Parallel Hash.
+    - Filed as M0146\-0002b \(owner of the 2026\-09\-21 M0145\-0003 NOT IN
+      ledger row, which had none\).
+  - **CLOSED 2026\-09\-24**: label \+ execution model landed together with
+    identity pins; the witness Q14 matches PG. The Q16 remainder is owned by
+    M0146\-0002b; category regressions by M0146\-0002a.
+
+- [ ] **M0146\-0002b — `NOT IN` is converted to an anti join; PG keeps a
+  hashed SubPlan** \(measured 2026\-09\-24 on TPC\-H Q16 by M0146\-0002's slice
+  3; owns the 2026\-09\-21 M0145\-0003 ledger row\). goopg's legacy unnest
+  \(`canUnnestInExpr` / `unnestInExpr`, `internal/optimizer/unnest.go`\) still
+  runs on the jointree default and turns `x NOT IN \(SELECT …\)` into an anti
+  join; PG's `pull\_up\_sublinks\_qual\_recurse` converts ANY and EXISTS only
+  \(`prepjointree.c:665/731`\), so `NOT IN` stays a `\(hashed SubPlan\)`
+  filter on the scan.
+  Kind: recon
+  Parent: M0146-0002
+  - On Q16 the anti join sits outside the join search, so the Gather is
+    added by the post\-pass over a serial plan and can elect neither
+    Parallel Hash nor PG's Gather Merge \+ GroupAggregate shape.
+  - First step: census the default\-arm queries whose plans carry a
+    NOT\-IN\-derived anti join \(TPC\-H \+ TPC\-DS SF0.25\), and check values on
+    a NULL\-bearing inner column against PG \(the ledger row's correctness
+    question; goopg's anti join tracks `antiBuildHasNull`\). Expected
+    movement: Q16 leaving `parallelism` and `aggregation\-strategy` once the
+    `Negated` arm is dropped and NOT IN plans as a hashed SubPlan.
 
 - [ ] **M0146\-0002a — category regressions from the Parallel Hash arm**
   \(measured 2026\-09\-24 at slice 2, TPC\-H parallel lane\): Q12 gains
