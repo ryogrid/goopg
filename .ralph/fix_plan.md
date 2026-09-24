@@ -19499,7 +19499,7 @@ Movement: none — no plan moved on TPC-DS SF0.25/SF1 or TPC-H across all four d
       TPC\-H \(no corpus plan text changed\), sweep 96/96.
     Movement: none — no corpus plan text changed; CATEGORIES-EXCL-MATCH identical on both arms at SF0.25 and SF1.
 
-- [ ] **M0145\-0008o — pseudoconstant quals gate the plan; an uncorrelated
+- [x] **M0145\-0008o — pseudoconstant quals gate the plan; an uncorrelated
   EXISTS is an InitPlan** \(filed 2026\-09\-24 by M0145\-0008j\). PG 18.3 plans
   `WHERE a \> 1 AND EXISTS \(SELECT 1 FROM t3\)` as `Result / One\-Time Filter:
   \(InitPlan 1\).col1 / InitPlan 1 / \-\> Seq Scan on t3 / \-\> Seq Scan on t1
@@ -19514,6 +19514,19 @@ Movement: none — no plan moved on TPC-DS SF0.25/SF1 or TPC-H across all four d
     EXISTS / constant\-qual shapes. The fire\-set gate shows neither corpus
     has this shape today, so the measurement is the upstream regress cases
     \(`subselect`, `join`\) plus a PG\-pinned EXPLAIN unit test.
+  - **DONE 2026\-09\-25.** Design:
+    `docs/design/0100-0149/m0145-0008o-pseudoconstant-gating-initplan-exists.md`.
+    - `gatePseudoconstantQuals` lifts uncorrelated\-sublink conjuncts \(a
+      fail\-closed whitelist\) out of the WHERE residual into a gating
+      `Result` One\-Time Filter above the scope's FROM tree; an uncorrelated
+      EXISTS renders as `\(InitPlan N\).col1`; `EstimateRows\(Result\)` passes
+      the child's rows through.
+    - Four shapes pinned line for line against PG 18.3 \(EXISTS, NOT EXISTS,
+      scalar InitPlan comparison, target\-list EXISTS\) plus values.
+    - Gates: units, spotcheck, fire\-set `fires=none` at SF0.25, SF1 and
+      TPC\-H, sweep 96/96 \(one mem\_guard\-killed attempt under nightly load,
+      re\-run clean\), acceptance 24 MATCH, ea\-ratchet 52/52.
+    Movement: none — no corpus plan changed.
 
 - [x] **M0145\-0008f — HashAggregate build throughput on a many\-group
   input**: TPC\-H Q18's semi body \(`GROUP BY l\_orderkey HAVING sum \> 313`, 6M

@@ -140,6 +140,9 @@ var exprSwitchInventory = map[string]walkerRole{
 	// M-NIGHTLY NULL-key guard (2026-09-24): decides whether a top-level AND
 	// conjunct strictly tests one column; descends only through AND, and an
 	// unenumerated type answers "not proven", which keeps the index guard.
+	"pseudoconstant_gate.go:SublinkIsInitPlan":        nonRecursiveClassifier, // M0145-0008o: sublink kind -> InitPlan or SubPlan, no recursion
+	"pseudoconstant_gate.go:isPseudoconstantConjunct": nonRecursiveClassifier, // M0145-0008o: a walkExprRefs Visit callback; the recursion is the driver's
+
 	"pathindexrestrict.go:qualsRejectNull": nonRecursiveClassifier,
 	// `joinlayout.go:remapPosMapAfterRewrite` (walkerPending, 8 of 32 arms)
 	// was deleted by C-20b: the walker mutated nothing — its posMap parameter

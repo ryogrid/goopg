@@ -617,7 +617,7 @@ func emitSubPlanSubtrees(rows *[]Row, detailIndent string, opts parser.ExplainOp
 			// rest keep the `SubPlan N` label. Same discriminator as
 			// subPlanName so the number and its subtree agree.
 			kind := "SubPlan"
-			if sq, ok := sp.expr.(*optimizer.SubqueryExpr); ok && sq.IsNonCorrelated {
+			if optimizer.SublinkIsInitPlan(sp.expr) {
 				kind = "InitPlan"
 			}
 			line := detailIndent + fmt.Sprintf("%s %d", kind, sp.n)
@@ -1837,11 +1837,21 @@ func formatIndexCondParts(index *catalog.Index, keys []optimizer.Expr, key, lowK
 // (`"*VALUES*".column1`, `tattle(9, 8)`) since goopg does not yet build a
 // One-Time Filter of those shapes — deferred with the rest of the join-qual
 // slice (M0134-0010c round 2 report).
+//
+// M0145-0008o adds the other bare operand PG leaves unparenthesised there: an
+// InitPlan param, `(InitPlan 1).col1` (a gating Result over an uncorrelated
+// EXISTS, or a scalar InitPlan used as a boolean). A NOT over it, or an
+// operator comparing it, is compound and keeps its parens:
+// `(NOT (InitPlan 1).col1)`, `((InitPlan 1).col1 > 0)` (PG 18.3).
 func isLiteralOneTimeFilterConst(e optimizer.Expr) bool {
-	switch e.(type) {
+	switch x := e.(type) {
 	case *optimizer.BooleanConst, *optimizer.IntegerConst, *optimizer.NumericConst,
 		*optimizer.StringConst, *optimizer.NullConst:
 		return true
+	case *optimizer.ExistsExpr:
+		return !x.Negated && optimizer.SublinkIsInitPlan(x)
+	case *optimizer.SubqueryExpr:
+		return optimizer.SublinkIsInitPlan(x)
 	}
 	return false
 }
@@ -2216,7 +2226,7 @@ func (r *subPlanReg) takePending() []subPlanEntry {
 func subPlanName(r *subPlanReg, e optimizer.Expr, plan optimizer.Node) string {
 	if n := r.assign(e, plan); n > 0 {
 		kind := "SubPlan"
-		if sq, ok := e.(*optimizer.SubqueryExpr); ok && sq.IsNonCorrelated {
+		if optimizer.SublinkIsInitPlan(e) {
 			kind = "InitPlan"
 		}
 		return fmt.Sprintf("%s %d", kind, n)
@@ -2340,9 +2350,15 @@ func formatExprQual(e optimizer.Expr, reg *subPlanReg, qualify bool) string {
 		}
 		return "'" + strings.ReplaceAll(lit, "'", "''") + "'::interval"
 	case *optimizer.ExistsExpr:
-		// Upstream renders EXISTS sublinks as `EXISTS(SubPlan N)`
-		// (ruleutils.c get_rule_expr, T_SubPlan / EXISTS_SUBLINK).
-		s := "EXISTS(" + subPlanName(reg, x, x.Plan) + ")"
+		// Upstream renders a correlated EXISTS as `EXISTS(SubPlan N)`
+		// (ruleutils.c get_rule_expr, T_SubPlan / EXISTS_SUBLINK). An
+		// uncorrelated one is an initplan param (make_subplan), read as
+		// `(InitPlan N).col1` like a scalar InitPlan (M0145-0008o).
+		name := subPlanName(reg, x, x.Plan)
+		s := "EXISTS(" + name + ")"
+		if strings.HasPrefix(name, "InitPlan") {
+			s = "(" + name + ").col1"
+		}
 		if x.Negated {
 			return "NOT " + s
 		}

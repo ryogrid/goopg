@@ -138,6 +138,13 @@ func EstimateRows(n Node) int64 {
 		return EstimateRows(x.Child)
 	case *CTEDMLPrefix:
 		return EstimateRows(x.Body)
+	case *Result:
+		// A gating Result (M0145-0008o) passes its child's rows through:
+		// create_gating_plan copies the gated plan's plan_rows. The childless
+		// Result keeps its old "no estimate".
+		if x.Child != nil {
+			return EstimateRows(x.Child)
+		}
 	case *SetOp:
 		return estimateSetOp(x)
 	case *NestedLoopIndexJoin:

@@ -184,8 +184,14 @@ func TestScopedCacheDepthConsistency(t *testing.T) {
 	// SubPlan by accident. The OR arm is true for every row, so all three
 	// ht1 rows reach both sublinks (the EXISTS may be evaluated above the
 	// IN's filter).
+	//
+	// The EXISTS sits under an OR for the same reason (M0145-0008o): a bare
+	// uncorrelated EXISTS conjunct is a pseudoconstant, which PG, and now
+	// goopg, evaluates ONCE as a gating Result's One-Time Filter
+	// (create_gating_plan), never per row. The OR keeps it a per-row SubPlan,
+	// which is the shared-scoped-store case this test exists for.
 	runQuery(t, ctx, "SELECT a FROM ht1 WHERE (b IN (SELECT b FROM ht2) OR a > 0)"+
-		" AND EXISTS (SELECT 1 FROM ht3) ORDER BY a")
+		" AND (EXISTS (SELECT 1 FROM ht3) OR a > 0) ORDER BY a")
 
 	var inStat, existsStat *SubPlanSiteStats
 	for e, s := range ctx.SubPlanStats {

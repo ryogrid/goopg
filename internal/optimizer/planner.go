@@ -1999,6 +1999,10 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 	// C-02c: the pass may splice out Filters whose every conjunct moved
 	// below, so it returns the replacement tree.
 	node = pushSingleSideQualsIntoInnerJoinInputs(node)
+	// M0145-0008o: PG's gating plan for pseudoconstant WHERE quals — an
+	// uncorrelated sublink conjunct becomes a Result's One-Time Filter above
+	// the scope's FROM tree instead of a per-row Filter (create_gating_plan).
+	node = gatePseudoconstantQuals(node, cat)
 
 	// Aggregate sublink promotion: when the outer SELECT has exactly one target
 	// that is a scalar subquery containing a single aggregate referencing outer
