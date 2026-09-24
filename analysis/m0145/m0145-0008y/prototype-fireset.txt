@@ -1,0 +1,24 @@
+# M0145-0008y prototype (NOT committed): canUnnestSubquery refuses every scalar sublink (PG's rule).
+# Fire-set gate HEAD e69db7415 vs prototype worktree, CORPORA=tpcds-sf025 tpcds-sf1 tpch.
+FIRE-SET: baseline=e69db74152078dbfd9c371e399d9e1be30755f63 (ead599d01492) candidate=worktree (1f0cb7385bc1)
+PLAN-PARITY: queries=99 match=4 shapediff=67 unparsed=0 missingnode=25 error=3 timeout=0
+CATEGORIES-EXCL-MATCH: join-order=91 join-method=66 scan-type=59 parameterisation=55 aggregation-strategy=41 sort-strategy=62 parallelism=74 qual-placement=27 rendering=25
+PLAN-PARITY: queries=99 match=4 shapediff=67 unparsed=0 missingnode=25 error=3 timeout=0
+CATEGORIES-EXCL-MATCH: join-order=91 join-method=65 scan-type=59 parameterisation=55 aggregation-strategy=37 sort-strategy=62 parallelism=74 qual-placement=28 rendering=25
+FIRE-SET-TIMEOUTS: fires=Q1 Q6 Q32 Q92 introduced=none unchanged=none missing=none
+PLAN-PARITY: queries=99 match=6 shapediff=68 unparsed=0 missingnode=22 error=3 timeout=0
+CATEGORIES-EXCL-MATCH: join-order=85 join-method=65 scan-type=59 parameterisation=49 aggregation-strategy=44 sort-strategy=68 parallelism=76 qual-placement=25 rendering=22
+PLAN-PARITY: queries=99 match=6 shapediff=68 unparsed=0 missingnode=22 error=3 timeout=0
+CATEGORIES-EXCL-MATCH: join-order=85 join-method=64 scan-type=59 parameterisation=49 aggregation-strategy=40 sort-strategy=68 parallelism=76 qual-placement=26 rendering=22
+FIRE-SET-TIMEOUTS: fires=Q1 Q6 Q32 Q92 introduced=none unchanged=none missing=none
+PLAN-PARITY: queries=22 match=3 shapediff=19 unparsed=0 missingnode=0 error=0 timeout=0
+CATEGORIES-EXCL-MATCH: join-order=17 join-method=11 scan-type=12 parameterisation=7 aggregation-strategy=4 sort-strategy=8 parallelism=11 qual-placement=5 rendering=2
+PLAN-PARITY: queries=22 match=3 shapediff=19 unparsed=0 missingnode=0 error=0 timeout=0
+CATEGORIES-EXCL-MATCH: join-order=17 join-method=10 scan-type=13 parameterisation=7 aggregation-strategy=3 sort-strategy=8 parallelism=12 qual-placement=5 rendering=2
+FIRE-SET-TIMEOUTS: fires=Q2 introduced=none unchanged=none missing=none
+
+# TPC-H Q2 execution (acceptance-arm subset, same rows 463, same checksum):
+m0145-0008y-tpch-baseline-execute-fireset-arm.txt: Q2: OK elapsed=1.50s colsig=98559dc0378d935e ordered=08d93c5bb42c01eb unordered=a7655104482ba6a1 rows=463
+m0145-0008y-tpch-candidate-execute-fireset-arm.txt: Q2: OK elapsed=307.36s colsig=98559dc0378d935e ordered=08d93c5bb42c01eb unordered=a7655104482ba6a1 rows=463
+
+# TPC-DS fired queries: all PASS on both arms at SF0.25 and SF1 (600 s budget).

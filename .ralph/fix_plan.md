@@ -17219,7 +17219,7 @@ Movement: none — no plan moved on TPC-DS SF0.25/SF1 or TPC-H across all four d
     Movement: none — recon.
 
 
-- [ ] **M0145\-0008y — keep a correlated scalar subquery as a SubPlan, as
+- [!] **M0145\-0008y — keep a correlated scalar subquery as a SubPlan, as
   PG does** \(filed 2026\-09\-25 by M0145\-0008n\). goopg\'s post\-hoc unnest
   decorrelates `x op \(SELECT agg … WHERE correlated\)` into a join; PG
   keeps it as a correlated SubPlan \(`pull\_up\_sublinks` converts only
@@ -17235,6 +17235,23 @@ Movement: none — no plan moved on TPC-DS SF0.25/SF1 or TPC-H across all four d
     goopg than the decorrelated join; PG runs it with index access\).
   - Expected movement: TPC\-DS SF0.25 first divergences on Q1/Q6/Q32/Q92
     and TPC\-H Q2 move past that join; measured on the canonical captures.
+  - **BLOCKED 2026\-09\-25 on M0146\-0012** \(evidence
+    `analysis/m0145/m0145\-0008y/prototype\-fireset.txt`\).
+    - Prototype \(not committed\): `canUnnestSubquery` refuses every scalar
+      sublink. The fire\-set gate fired exactly TPC\-H Q2 and TPC\-DS Q1, Q6,
+      Q32, Q92 and introduced no timeouts. Categories improved slightly
+      \(aggregation\-strategy SF0.25 41→37, SF1 44→40, TPC\-H 4→3\); match
+      counts unchanged.
+    - **TPC\-H Q2: 1.50 s → 307.36 s** with identical rows. goopg\'s SubPlan
+      scans the inner in full per outer row; PG makes it cheap by planning
+      the correlation as a parameterised index qual \(`ps\_partkey = \$1`\),
+      which is M0146\-0012 \(`is\_pseudo\_constant\_for\_index`\).
+    - The S6 comment in `canUnnestSubquery` claims upstream "can decorrelate
+      unconditionally"; that is wrong. `pull\_up\_sublinks` never converts a
+      scalar sublink, and the decorrelation is goopg\'s performance
+      substitute for M0146\-0012.
+    - Resume: after M0146\-0012 lands, re\-run the prototype and the Q2
+      timing.
 
 - [ ] **M0145\-0008z — the pull\-up declines sublinks PG pulls up \(TPC\-H
   Q18, TPC\-DS Q14/Q23\)** \(filed 2026\-09\-25 by M0145\-0008n\). TPC\-H Q18\'s
@@ -20629,6 +20646,10 @@ M0146-0001 re-baseline census on the new default arm.
   Witnesses: TPC-H Q17/Q20, TPC-DS Q41.
   Kind: impl
   Parent: none
+  - Also the prerequisite of M0145\-0008y \(2026\-09\-25\): keeping TPC\-H Q2\'s
+    correlated scalar subquery as a SubPlan, PG\'s shape, costs 1.50 s →
+    307 s until the SubPlan inner can probe `partsupp` by the outer
+    parameter. Further witnesses: TPC\-H Q2, TPC\-DS Q1/Q6/Q32/Q92.
 - [ ] **M0146-0013 — `cost_qual_eval` per-clause qual ordering**
   (impl; M0145-0028's ledger residual). Port `cost_qual_eval`
   (costsize.c) and apply `order_qual_clauses`'s stable cost sort
