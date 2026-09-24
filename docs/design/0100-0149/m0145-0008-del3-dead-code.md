@@ -1,6 +1,6 @@
 # M0145-0008 legacy-deletion slice 3: the code only the legacy pipeline reached
 
-Status: **LANDED 2026-09-24**. Task: `.ralph/fix_plan.md` M0145-0008. Earlier
+Status: task M0145-0008 CLOSED 2026-09-24 (legacy-deletion slice 4, `m0145-0008-del4-pgshaped-knob-and-retirement-audit.md`). Earlier: **LANDED 2026-09-24**. Task: `.ralph/fix_plan.md` M0145-0008. Earlier
 slices: `m0145-0008-del1-fireset-head-vs-staged.md` (the gate),
 `m0145-0008-del2-legacy-pipeline-deleted.md` (the pipeline and its knob).
 Evidence: `analysis/m0145/m0145-0008-del3/`.

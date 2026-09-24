@@ -76,7 +76,6 @@ func m0145AssertSearchedOuterSpine(t *testing.T, node, out Node, residual Expr, 
 // pass — every leaf a searched item, both outer links constrained by their
 // SpecialJoinInfos through `joinIsLegal`.
 func TestJointreeSearchesAFlatOuterSpine(t *testing.T) {
-	withPGShapedDP(t)
 
 	names := []string{"a", "b", "c"}
 	node, ctx := m0145LeftSpine(t, names, []int64{100_000, 50_000, 10})
@@ -91,7 +90,6 @@ func TestJointreeSearchesAFlatOuterSpine(t *testing.T) {
 // members) instead of the retired peel's `spineLinkSearchable` refusal. The
 // syntactic tree stands, exactly the outcome the peel produced.
 func TestJointreeDeclinesAFullSpine(t *testing.T) {
-	withPGShapedDP(t)
 
 	names := []string{"a", "b", "c"}
 	node, ctx := seamFixture(names, []int64{100_000, 50_000, 10})
@@ -177,7 +175,6 @@ func TestJointreePullsExistsOverSingleTable(t *testing.T) {
 // nprefix=1 is a searched problem (the floor is 1; GOOPG_ONEREL_SEARCH,
 // which once lowered it for the legacy arm, retired in M0145-0008).
 func TestJointreeAdmitsAOneRelProblem(t *testing.T) {
-	withPGShapedDP(t)
 
 	names := []string{"a"}
 	node, ctx := seamFixture(names, []int64{100_000})

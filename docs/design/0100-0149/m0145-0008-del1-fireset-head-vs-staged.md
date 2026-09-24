@@ -1,6 +1,6 @@
 # M0145-0008 legacy-deletion slice 1: the fire-set gate compares HEAD with the staged tree
 
-Status: **LANDED 2026-09-24** (harness only; no engine code). Task:
+Status: task M0145-0008 CLOSED 2026-09-24 (legacy-deletion slice 4, `m0145-0008-del4-pgshaped-knob-and-retirement-audit.md`). Earlier: **LANDED 2026-09-24** (harness only; no engine code). Task:
 `.ralph/fix_plan.md` M0145-0008 (the cutover; this is the first of its
 legacy-deletion slices). Earlier docs: `m0145-0008-cutover-flip.md`,
 `m0145-0021-fireset-derivation.md`, `m0145-0021a-fireset-gate-enforcement.md`,

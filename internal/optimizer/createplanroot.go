@@ -391,7 +391,7 @@ func projectToBindingOrder(child Node, m []int, fills map[int]SchemaColumn) Node
 // reason: name-based evidence says nothing where there is no name. Production
 // targets come from resolved leaf schemas and carry one.
 func assertSearchedBoundariesIntact(root Node) {
-	if !pgShapedDPEnabled() || root == nil {
+	if root == nil {
 		return
 	}
 	var walk func(Node)

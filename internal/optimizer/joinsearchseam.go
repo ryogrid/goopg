@@ -221,7 +221,7 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 	// filterless statement whose customer scan must become PG's
 	// `Index Only Scan using customer_pk`. `splitAnd(nil)` is an empty
 	// conjunct list and every consumer below already handles it.
-	if !pgShapedDPEnabled() || node == nil || ctx == nil {
+	if node == nil || ctx == nil {
 		return node, pred, false
 	}
 	nrels := len(ctx.bindings)

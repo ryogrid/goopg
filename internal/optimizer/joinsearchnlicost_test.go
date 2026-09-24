@@ -26,9 +26,6 @@ import (
 // the failure should be loud here rather than surfacing as a TPC-H timing
 // regression three gates later.
 func TestPGShapedSearchPicksNLIOnCost(t *testing.T) {
-	if !pgShapedDPEnabled() {
-		t.Skip("kill-switch set; this test is about the searched arm")
-	}
 	cat := catalog.NewInMemory()
 	part, err := cat.CreateTable(parser.ObjectName{Name: "part"}, []catalog.Column{
 		{Name: "p_partkey", Type: catalog.Type{Name: "int4"}, NotNull: true},
@@ -72,9 +69,6 @@ func TestPGShapedSearchPicksNLIOnCost(t *testing.T) {
 // must key it on the equi-pair rather than leaving a bare cross product with a
 // filter above it.
 func TestPGShapedSearchPicksHashJoinOnCost(t *testing.T) {
-	if !pgShapedDPEnabled() {
-		t.Skip("kill-switch set; this test is about the searched arm")
-	}
 	cat := catalog.NewInMemory()
 	a, err := cat.CreateTable(parser.ObjectName{Name: "a"}, []catalog.Column{
 		{Name: "x", Type: catalog.Type{Name: "int4"}, NotNull: true},

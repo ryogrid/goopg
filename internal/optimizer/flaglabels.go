@@ -79,7 +79,6 @@ func onOff(on bool) string {
 var flagResolvedState = map[string]func(string) string{
 	"GOOPG_MEMOIZE":           func(v string) string { return onOff(memoizeFromEnv(v)) },
 	"GOOPG_PARALLEL":          func(v string) string { return onOff(parallelFromEnv(v)) },
-	"GOOPG_PGSHAPED_DP":       func(v string) string { return onOff(pgShapedDPFromEnv(v)) },
 	"GOOPG_EXISTS_TO_ANY":     func(v string) string { return onOff(existsToAnyFromEnv(v)) },
 	"GOOPG_INDEXKEY_HARVEST":  func(v string) string { return onOff(indexKeyHarvestFromEnv(v)) },
 	"GOOPG_HASH_OUTER_JOIN":   func(v string) string { return onOff(hashOuterJoinFromEnv(v)) },
@@ -195,6 +194,7 @@ var flagProvenanceOrder = []string{
 	"GOOPG_COST_DRIVEN_JOINORDER",
 	"GOOPG_MEMOIZE",
 	"GOOPG_PARALLEL",
+	// Retired at M0145-0008 — see flagProvenanceRetired.
 	"GOOPG_PGSHAPED_DP",
 	"GOOPG_PGSHAPED_COLLAPSE",
 	"GOOPG_EXISTS_TO_ANY",
@@ -339,6 +339,10 @@ var flagProvenanceRetired = map[string]string{
 	// (M0145-0005 slice 4); with the legacy pipeline deleted (M0145-0008)
 	// nothing reads the variable.
 	"GOOPG_ONEREL_SEARCH": "M0145-0008",
+	// The PG-shaped join search's kill-switch. `=0` meant "no join-order search
+	// at all" since M0127-P6.3 deleted the bushy enumerator; the search is
+	// unconditional since M0145-0008, so nothing reads the variable.
+	"GOOPG_PGSHAPED_DP": "M0145-0008",
 }
 
 // FlagProvenanceTable is the authoritative list of planner env flags that a

@@ -1,0 +1,27 @@
+tmp/m0145-del4-fireset.log:FIRE-SET: baseline=14e36d8493777038a0fa496cb1765faa1a8d1024 (a5ae1bed926c) candidate=worktree (a9d71135cae6)
+tmp/m0145-del4-fireset.log:PLAN-PARITY: queries=99 match=4 shapediff=67 unparsed=0 missingnode=25 error=3 timeout=0
+tmp/m0145-del4-fireset.log:CATEGORIES-EXCL-MATCH: join-order=91 join-method=67 scan-type=59 parameterisation=55 aggregation-strategy=41 sort-strategy=62 parallelism=74 qual-placement=27 rendering=25
+tmp/m0145-del4-fireset.log:PLAN-PARITY: queries=99 match=4 shapediff=67 unparsed=0 missingnode=25 error=3 timeout=0
+tmp/m0145-del4-fireset.log:CATEGORIES-EXCL-MATCH: join-order=91 join-method=67 scan-type=59 parameterisation=55 aggregation-strategy=41 sort-strategy=62 parallelism=74 qual-placement=27 rendering=25
+tmp/m0145-del4-fireset.log:FIRE-SET: corpus=tpcds-sf025 fires=none (plan A/B had no changed query)
+tmp/m0145-del4-fireset.log:PLAN-PARITY: queries=99 match=6 shapediff=68 unparsed=0 missingnode=22 error=3 timeout=0
+tmp/m0145-del4-fireset.log:CATEGORIES-EXCL-MATCH: join-order=85 join-method=65 scan-type=59 parameterisation=49 aggregation-strategy=44 sort-strategy=68 parallelism=76 qual-placement=25 rendering=22
+tmp/m0145-del4-fireset.log:PLAN-PARITY: queries=99 match=6 shapediff=68 unparsed=0 missingnode=22 error=3 timeout=0
+tmp/m0145-del4-fireset.log:CATEGORIES-EXCL-MATCH: join-order=85 join-method=65 scan-type=59 parameterisation=49 aggregation-strategy=44 sort-strategy=68 parallelism=76 qual-placement=25 rendering=22
+tmp/m0145-del4-fireset.log:FIRE-SET: corpus=tpcds-sf1 fires=none (plan A/B had no changed query)
+tmp/m0145-del4-tpch.log:FIRE-SET: baseline=14e36d8493777038a0fa496cb1765faa1a8d1024 (ba2aa5f76c7d) candidate=worktree (a9d71135cae6)
+tmp/m0145-del4-tpch.log:PLAN-PARITY: queries=22 match=3 shapediff=19 unparsed=0 missingnode=0 error=0 timeout=0
+tmp/m0145-del4-tpch.log:CATEGORIES-EXCL-MATCH: join-order=16 join-method=14 scan-type=13 parameterisation=6 aggregation-strategy=3 sort-strategy=8 parallelism=11 qual-placement=5 rendering=4
+tmp/m0145-del4-tpch.log:PLAN-PARITY: queries=22 match=3 shapediff=19 unparsed=0 missingnode=0 error=0 timeout=0
+tmp/m0145-del4-tpch.log:CATEGORIES-EXCL-MATCH: join-order=16 join-method=14 scan-type=13 parameterisation=6 aggregation-strategy=3 sort-strategy=8 parallelism=11 qual-placement=5 rendering=4
+tmp/m0145-del4-tpch.log:FIRE-SET: corpus=tpch fires=none (plan A/B had no changed query)
+=== SUMMARY: PASS=96 (60 ck-verified, 36 ck=n/a) MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0 SKIP=3 ===
+=== PLAN-SHAPE: queries=99 same=99 changed=0 added=0 removed=0 ===
+SUMMARY: 24 MATCH
+VERDICT: PASS — every label matched on values, not merely on row count
+  baseline findings: 52   current: 52
+EA-RATCHET: PASS
+tpch-spotcheck: Q12 PASS — rows=2 (expected 2)
+tpch-spotcheck: Q13 PASS — rows=33 (expected 33)
+tpch-spotcheck: RESULT=PASS
+slice3 tpch lane (PGSHAPED=0 default): PLAN-PARITY: queries=22 match=1 shapediff=21 unparsed=0 missingnode=0 error=0 timeout=0

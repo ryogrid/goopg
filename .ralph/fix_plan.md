@@ -16795,7 +16795,7 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
         TPC\-H run measured the legacy DP \(0 lowering\-built joins\).
         Pass `PGSHAPED=1` for the shipped planner.
       - Movement: none \(measurement\).
-- [ ] **M0145-0008 — cutover**: flip `GOOPG_JOINTREE_PIPELINE` default,
+- [x] **M0145-0008 — cutover**: flip `GOOPG_JOINTREE_PIPELINE` default,
   re-run the full corpus gates on the new pipeline (sf025 sweep,
   tpch-spotcheck, acceptance arm, plan-parity capture), then delete the
   legacy pipeline and the retired seam guards from 0001's list. Requires
@@ -17103,6 +17103,41 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
       `planFromClause`, the `joinlist` proto\-IR, several decline
       classes\), so they need a per\-row verdict: gone / dead / live plus
       its blocking task. Close the dead rows and file the live ones.
+  - **Legacy\-deletion slice 4 LANDED 2026\-09\-24 — task CLOSED:
+    `GOOPG\_PGSHAPED\_DP` retired; §6 retirement audit.** Design:
+    `docs/design/0100-0149/m0145-0008-del4-pgshaped-knob-and-retirement-audit.md`;
+    evidence `analysis/m0145/m0145-0008-del4/`.
+    - The kill\-switch \(`=0` = no join search\) is gone with its guards,
+      resolver and script variables. `tpch\-estimate\-audit\-arm.sh`
+      defaulted to it, so the TPC\-H capture lane read `match=1`; on the
+      shipped planner it reads `match=3`. Both fire\-set arms are identical,
+      so that is a lane correction, not a plan move.
+    - 15 rule\-arm tests \(NLI promotion, small\-dim build side, OR\-of\-ANDs
+      key\) were deleted; searched\-arm counterparts exist; the residue is
+      ledgered.
+    - §6 audit: everything §6 assigns to 0008 is GONE. The LIVE rows are the
+      shipped route that 0003/0005/0007 were meant to replace \(post\-hoc
+      unnest, the node\-tree seam walk, rule passes, rowmark passes,
+      `planFromClause`\) → M0145\-0008n.
+    - Gates: units, spotcheck, fire\-set `fires=none` at SF0.25, SF1 and
+      TPC\-H, sweep 96/96 \(shapes 99/99 same\), acceptance 24 MATCH,
+      ea\-ratchet 52/52, deadcode 84.
+Movement: none — no plan moved on TPC-DS SF0.25/SF1 or TPC-H across all four deletion slices.
+
+- [ ] **M0145\-0008n — sequence the M0145\-0001 §6 rows that are still the
+  live route** \(filed 2026\-09\-24 by M0145\-0008 slice 4\). The audit table in
+  `m0145\-0008\-del4\-pgshaped\-knob\-and\-retirement\-audit.md` lists them:
+  the post\-hoc unnest family, the node\-tree seam walk
+  \(`tryJoinSearch`/`extractSearchLeaves`\) and its decline classes, the rule
+  passes \(`rewriteJoinsToNLI`, scan\-input and pushdown rewrites\), the
+  rowmark passes and `planFromClause`. Retiring them is reimplementation,
+  not deletion.
+  Kind: recon
+  Parent: M0145-0008
+  - First step: map each LIVE row to the M0146\-0001 census categories it
+    affects \(does a row produce a first divergence from PG on the corpora?\);
+    rows that never do are refactor\-only and wait; rows that do become impl
+    tasks naming their expected movement \(S5\).
 
 
 - [x] **M0145-0009 — CTE-output statistics (B-06 resume): wire the landed

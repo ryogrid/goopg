@@ -152,9 +152,6 @@ func TestQ2DecorrelatedGroupKeyResolvesInAggregateInput(t *testing.T) {
 			name = "pgshaped=true"
 		}
 		t.Run(name, func(t *testing.T) {
-			saved := pgShapedDP
-			pgShapedDP = on
-			defer func() { pgShapedDP = saved }()
 
 			stmts, err := parser.Parse(jsgQ2SQL)
 			if err != nil {

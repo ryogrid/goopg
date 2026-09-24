@@ -7,43 +7,6 @@ import (
 	"github.com/goopg/goopg/internal/parser"
 )
 
-// TestNLIRulePromotesEquiJoinOnIndexedInner asserts the M0054-0006c
-// rewrite fires for the canonical shape: a binary equi-join whose
-// inner table has a single-column B-tree index on the join key.
-func TestNLIRulePromotesEquiJoinOnIndexedInner(t *testing.T) {
-	// M0127-P5.9: a legacy-rule assertion; see useLegacyEnumerator.
-	useLegacyEnumerator(t)
-	cat := catalog.NewInMemory()
-	parts, err := cat.CreateTable(parser.ObjectName{Name: "part"}, []catalog.Column{
-		{Name: "p_partkey", Type: catalog.Type{Name: "int4"}, NotNull: true},
-		{Name: "p_name", Type: catalog.Type{Name: "varchar", Args: []int64{55}}},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := cat.CreateIndex(parser.ObjectName{Name: "part_pk"}, parts,
-		[]string{"p_partkey"}, true, "btree", true); err != nil {
-		t.Fatal(err)
-	}
-	_, err = cat.CreateTable(parser.ObjectName{Name: "lineitem"}, []catalog.Column{
-		{Name: "l_orderkey", Type: catalog.Type{Name: "int4"}, NotNull: true},
-		{Name: "l_partkey", Type: catalog.Type{Name: "int4"}, NotNull: true},
-		{Name: "l_quantity", Type: catalog.Type{Name: "int4"}},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	stmt := parseOne(t, `SELECT p_name, l_quantity FROM lineitem, part WHERE l_partkey = p_partkey`)
-	node, err := Plan(stmt, cat)
-	if err != nil {
-		t.Fatalf("Plan: %v", err)
-	}
-	if !findNLI(node) {
-		t.Fatalf("expected NestedLoopIndexJoin in plan; got: %s", describePlanTree(node))
-	}
-}
-
 // TestNLIRuleSkipsWhenInnerHasNoIndex asserts the rewrite is a
 // no-op when the inner side's join column has no B-tree index.
 // The cost-gate path is also exercised — outer is small but no
@@ -101,52 +64,6 @@ func TestNLIRuleRespectsKillSwitch(t *testing.T) {
 	}
 	if findNLI(node) {
 		t.Fatalf("kill-switch off: did not expect NLI; tree: %s", describePlanTree(node))
-	}
-}
-
-// TestNLIRulePromotesCompositeKeyJoinWithFullLeadingPrefix
-// (M0054-0006-followup-Q9-composite) asserts that when every
-// leading column of a composite B-tree index is bound by an
-// equi-conjunct, the rule emits an NLI with `Keys` populated
-// and a multi-column probe.
-func TestNLIRulePromotesCompositeKeyJoinWithFullLeadingPrefix(t *testing.T) {
-	// M0127-P5.9: a legacy-rule assertion; see useLegacyEnumerator.
-	useLegacyEnumerator(t)
-	cat := catalog.NewInMemory()
-	parts, err := cat.CreateTable(parser.ObjectName{Name: "partsupp"}, []catalog.Column{
-		{Name: "ps_partkey", Type: catalog.Type{Name: "int4"}, NotNull: true},
-		{Name: "ps_suppkey", Type: catalog.Type{Name: "int4"}, NotNull: true},
-		{Name: "ps_supplycost", Type: catalog.Type{Name: "int4"}},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := cat.CreateIndex(parser.ObjectName{Name: "partsupp_pk"}, parts,
-		[]string{"ps_partkey", "ps_suppkey"}, true, "btree", true); err != nil {
-		t.Fatal(err)
-	}
-	_, err = cat.CreateTable(parser.ObjectName{Name: "lineitem"}, []catalog.Column{
-		{Name: "l_orderkey", Type: catalog.Type{Name: "int4"}, NotNull: true},
-		{Name: "l_partkey", Type: catalog.Type{Name: "int4"}, NotNull: true},
-		{Name: "l_suppkey", Type: catalog.Type{Name: "int4"}, NotNull: true},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	stmt := parseOne(t, `SELECT * FROM lineitem, partsupp WHERE l_partkey = ps_partkey AND l_suppkey = ps_suppkey`)
-	node, err := Plan(stmt, cat)
-	if err != nil {
-		t.Fatalf("Plan: %v", err)
-	}
-	nli := firstNLI(node)
-	if nli == nil {
-		t.Fatalf("expected NLI in plan; tree: %s", describePlanTree(node))
-	}
-	if got := len(nliIn(nli.Inner).Keys); got != 2 {
-		t.Fatalf("expected Inner.Keys length 2 for composite-key full-prefix probe; got %d (Inner.Key=%v)", got, nliIn(nli.Inner).Key)
-	}
-	if nliIn(nli.Inner).Index == nil || nliIn(nli.Inner).Index.Name != "partsupp_pk" {
-		t.Fatalf("expected partsupp_pk index; got %v", nliIn(nli.Inner).Index)
 	}
 }
 
@@ -291,49 +208,6 @@ func TestNLIRuleSkipsIsolatedScopeOuter(t *testing.T) {
 	}
 	if nli := firstNLI(node); nli != nil {
 		t.Fatalf("M0063-0001: NLI must NOT fire for IsolatedScope outer; tree: %s", describePlanTree(node))
-	}
-}
-
-// TestNLIRulePromotesAcrossOROfANDsCommonEqui
-// (M0054-0006-followup-Q19) covers the Q19-shape disjunctive
-// predicate where the join equi-conjunct is repeated in every
-// OR branch. The rule must factor the common equi-conjunct
-// into the join key while keeping the full OR as the residual
-// Predicate on NLI for per-branch filtering.
-func TestNLIRulePromotesAcrossOROfANDsCommonEqui(t *testing.T) {
-	// M0127-P5.9: a legacy-rule assertion; see useLegacyEnumerator.
-	useLegacyEnumerator(t)
-	cat := catalog.NewInMemory()
-	part, err := cat.CreateTable(parser.ObjectName{Name: "part"}, []catalog.Column{
-		{Name: "p_partkey", Type: catalog.Type{Name: "int4"}, NotNull: true},
-		{Name: "p_brand", Type: catalog.Type{Name: "char", Args: []int64{10}}},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := cat.CreateIndex(parser.ObjectName{Name: "part_pk"}, part, []string{"p_partkey"}, true, "btree", true); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := cat.CreateTable(parser.ObjectName{Name: "lineitem"}, []catalog.Column{
-		{Name: "l_partkey", Type: catalog.Type{Name: "int4"}, NotNull: true},
-		{Name: "l_quantity", Type: catalog.Type{Name: "int4"}},
-	}); err != nil {
-		t.Fatal(err)
-	}
-	stmt := parseOne(t, `SELECT * FROM lineitem, part WHERE
-		(p_partkey = l_partkey AND p_brand = 'Brand#12' AND l_quantity >= 1)
-		OR (p_partkey = l_partkey AND p_brand = 'Brand#23' AND l_quantity >= 10)
-		OR (p_partkey = l_partkey AND p_brand = 'Brand#34' AND l_quantity >= 20)`)
-	node, err := Plan(stmt, cat)
-	if err != nil {
-		t.Fatalf("Plan: %v", err)
-	}
-	nli := firstNLI(node)
-	if nli == nil {
-		t.Fatalf("expected NLI from OR-factor; tree: %s", describePlanTree(node))
-	}
-	if nliIn(nli.Inner).Index == nil || nliIn(nli.Inner).Index.Name != "part_pk" {
-		t.Fatalf("expected part_pk on inner; got %v", nliIn(nli.Inner).Index)
 	}
 }
 

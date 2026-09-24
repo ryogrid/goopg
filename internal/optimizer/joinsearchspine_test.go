@@ -218,7 +218,6 @@ func TestSearchRefusesToPlanAPinnedOuterJoin(t *testing.T) {
 //   - the LEFT link planned as an INNER join, which is the wrong answer the
 //     whole C-03 series exists to prevent.
 func TestSeamPlansALeftLinkInsideOneSearchProblem(t *testing.T) {
-	withPGShapedDP(t)
 	names := []string{"a", "b", "c", "d"}
 	node, ctx := seamChainFromSQL(t, names, []int64{1_000_000, 500_000, 10, 100},
 		"a JOIN b ON a.x = b.x JOIN c ON b.x = c.x LEFT JOIN d ON c.x = d.x")
@@ -282,7 +281,6 @@ func TestSeamPlansALeftLinkInsideOneSearchProblem(t *testing.T) {
 // is its adjudication: the conjunct must come back as the residual, by
 // identity, and no leaf may have acquired a filter.
 func TestPGShapedSeamKeepsANullableSideQualAboveTheOuterJoin(t *testing.T) {
-	withPGShapedDP(t)
 	names := []string{"a", "b", "c", "d"}
 	node, ctx := seamChainFromSQL(t, names, []int64{1_000_000, 500_000, 10, 100},
 		"a JOIN b ON a.x = b.x JOIN c ON b.x = c.x LEFT JOIN d ON c.x = d.x")
@@ -313,7 +311,6 @@ func TestPGShapedSeamKeepsANullableSideQualAboveTheOuterJoin(t *testing.T) {
 // The delay test is `qual reaches the nullable side`, not `qual is a leaf
 // local`, precisely so this conjunct is held too.
 func TestPGShapedSeamHoldsAMultiRelationNullableSideQual(t *testing.T) {
-	withPGShapedDP(t)
 	names := []string{"a", "b", "c", "d"}
 	node, ctx := seamChainFromSQL(t, names, []int64{1_000_000, 500_000, 10, 100},
 		"a JOIN b ON a.x = b.x JOIN c ON b.x = c.x LEFT JOIN d ON c.x = d.x")
@@ -340,7 +337,6 @@ func TestPGShapedSeamHoldsAMultiRelationNullableSideQual(t *testing.T) {
 // refuses — and the fixture checks the tree came back untouched rather than
 // half-spliced.
 func TestPGShapedSeamDeclinesAFullSpine(t *testing.T) {
-	withPGShapedDP(t)
 	names := []string{"a", "b", "c", "d"}
 	node, ctx := seamChainFromSQL(t, names, []int64{1_000_000, 500_000, 10, 100},
 		"a JOIN b ON a.x = b.x JOIN c ON b.x = c.x FULL JOIN d ON c.x = d.x")
@@ -370,7 +366,6 @@ func TestPGShapedSeamDeclinesAFullSpine(t *testing.T) {
 // are new: exactly one LEFT join with `d` alone on its preserved input, and a
 // preserved-side `WHERE` that DOES distribute.
 func TestSeamPlansARightLinkInsideOneSearchProblem(t *testing.T) {
-	withPGShapedDP(t)
 	names := []string{"a", "b", "c", "d"}
 	from := "a JOIN b ON a.x = b.x JOIN c ON b.x = c.x RIGHT JOIN d ON c.x = d.x"
 
@@ -474,7 +469,6 @@ func TestSeamPlansARightLinkInsideOneSearchProblem(t *testing.T) {
 // (which sits on the LEFT link's PRESERVED side) and is still delayed above
 // the whole tree.
 func TestSeamPlansARightLinkUnderALeftLinkInOneProblem(t *testing.T) {
-	withPGShapedDP(t)
 	names := []string{"a", "b", "c", "d"}
 	node, ctx := seamChainFromSQL(t, names, []int64{1_000_000, 500_000, 10, 100},
 		"a JOIN b ON a.x = b.x RIGHT JOIN c ON b.x = c.x LEFT JOIN d ON c.x = d.x")
@@ -523,7 +517,6 @@ func TestSeamPlansARightLinkUnderALeftLinkInOneProblem(t *testing.T) {
 // join — 03 §4.4's real work, not this task's. It must decline, and the fixture
 // checks the tree came back untouched rather than half-spliced.
 func TestPGShapedSeamDeclinesAnOuterLinkBelowAnInnerOne(t *testing.T) {
-	withPGShapedDP(t)
 	names := []string{"a", "b", "c"}
 	node, ctx := seamChainFromSQL(t, names, []int64{1_000_000, 500_000, 10},
 		"a LEFT JOIN b ON a.x = b.x JOIN c ON b.x = c.x")
@@ -544,7 +537,6 @@ func TestPGShapedSeamDeclinesAnOuterLinkBelowAnInnerOne(t *testing.T) {
 // contract honest — a "searched" tree of one leaf would tag a scan and make the
 // legacy layout passes skip it for nothing.
 func TestPGShapedSeamSearchesAOneRelationPrefixUnderASpine(t *testing.T) {
-	withPGShapedDP(t)
 	names := []string{"a", "b"}
 	node, ctx := seamChainFromSQL(t, names, []int64{1_000_000, 10},
 		"a LEFT JOIN b ON a.x = b.x")
@@ -591,7 +583,6 @@ func TestPGShapedSeamSearchesAOneRelationPrefixUnderASpine(t *testing.T) {
 // survive as LEFT joins in the searched tree — a chain that admitted one and
 // planned the other as an inner join is the failure this fixture is sized for.
 func TestPGShapedSeamPeelsATwoLinkSpine(t *testing.T) {
-	withPGShapedDP(t)
 	names := []string{"a", "b", "c", "d", "e"}
 	node, ctx := seamChainFromSQL(t, names, []int64{1_000_000, 500_000, 10, 100, 50},
 		"a JOIN b ON a.x = b.x JOIN c ON b.x = c.x "+

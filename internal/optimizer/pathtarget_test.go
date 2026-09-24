@@ -1927,9 +1927,6 @@ func TestSlice3CorrelatedBodyDeclinesParentAware(t *testing.T) {
 	// (the acceptance test that caught the first interaction): the decline
 	// keeps the group key in the body's searched output.
 	if agg := func() *Aggregate {
-		saved := pgShapedDP
-		pgShapedDP = true
-		defer func() { pgShapedDP = saved }()
 		stmts, err := parser.Parse(jsgQ2SQL)
 		if err != nil {
 			t.Fatalf("parse: %v", err)

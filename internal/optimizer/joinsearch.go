@@ -28,7 +28,6 @@ package optimizer
 import (
 	"fmt"
 	"math/bits"
-	"os"
 
 	"github.com/goopg/goopg/internal/catalog"
 )
@@ -53,37 +52,12 @@ import (
 // longer exists: bushy.go was deleted with that DP at M0127-P6.3.
 const maxSearchRels = 32
 
-// pgShapedDP gates the whole PG-shaped search (08 §2, S5). **FLIPPED ON
-// 2026-08-06 by M0127-P5.9** — the acceptance event. Every P5 task landed dark
-// behind this gate; run 4 of the 09 §3 bar (2026-08-06, HEAD `9e0cfe67`) is the
-// first run in which nothing in the evidence is attributed to the flag —
-// clauses 1-5 PASS, and clause 6 was discharged by measurement two days later
-// (09 §3.13: both PG-only bushy partitions were OFFERED to `makeJoinRel` at
-// phase 2, so the search can express them and lost them on cost, which the §4
-// ratchet admits).
-//
-// The knob survives the flip as a KILL-SWITCH, not a soak switch. Until
-// M0127-P6.3 the rollback story for S5 was "flips `GOOPG_PGSHAPED_DP` OFF,
-// restoring the `tryBushyDP` enumerator"; P6.3 deleted that enumerator
-// (08 §4), so `=0` now means "no join-order search at all" — the statement
-// keeps its syntactic FROM order and the rule-driven rewrites
-// (`rewriteJoinsToNLI`, the qual-placement passes) do what they have always
-// done to such a tree. Anything else (unset, `1`, garbage) is ON, mirroring
-// `GOOPG_JOIN_SLOT_CHAIN` (08 §2 S1: "default ON, env kill-switch OFF only").
-//
-// The gate is read once at process start so a plan cannot change shape
-// mid-statement.
-var pgShapedDP = pgShapedDPFromEnv(os.Getenv("GOOPG_PGSHAPED_DP"))
-
-// pgShapedDPFromEnv is the kill-switch's polarity, factored out so it is
-// testable without a subprocess: only the exact string "0" turns the search
-// off. An unset variable reads as "" and is therefore ON.
-func pgShapedDPFromEnv(v string) bool { return v != "0" }
-
-// pgShapedDPEnabled reports whether the PG-shaped join search is active. P5.3's
-// entry point is its only production caller; exposed as a function so the flag
-// stays a single read site.
-func pgShapedDPEnabled() bool { return pgShapedDP }
+// The PG-shaped search is unconditional. It was gated by GOOPG_PGSHAPED_DP
+// (flipped on by M0127-P5.9 on 2026-08-06, then kept as a kill-switch whose
+// `=0` meant "no join-order search at all" once M0127-P6.3 deleted the bushy
+// enumerator). M0145-0008 retired the knob with the legacy pipeline: `=0` was a
+// planner nothing ships, and arm scripts defaulting to it measured that
+// planner by accident.
 
 // SetPGShapedJoinSearch — the cross-package test pin for the other enumerator
 // arm — went away with the old DP at M0127-P6.3 (08 §4), as its doc always

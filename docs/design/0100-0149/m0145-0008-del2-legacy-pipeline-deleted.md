@@ -1,6 +1,6 @@
 # M0145-0008 legacy-deletion slice 2: the legacy pipeline and its knob are deleted
 
-Status: **LANDED 2026-09-24**. Task: `.ralph/fix_plan.md` M0145-0008 (the
+Status: task M0145-0008 CLOSED 2026-09-24 (legacy-deletion slice 4, `m0145-0008-del4-pgshaped-knob-and-retirement-audit.md`). Earlier: **LANDED 2026-09-24**. Task: `.ralph/fix_plan.md` M0145-0008 (the
 cutover). Slice 1 (the HEAD-vs-staged fire-set gate, the precondition):
 `m0145-0008-del1-fireset-head-vs-staged.md`. Flip: `m0145-0008-cutover-flip.md`.
 

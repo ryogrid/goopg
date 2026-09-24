@@ -88,29 +88,6 @@ func hashKeyTestCatalog(t *testing.T) catalog.Catalog {
 	return cat
 }
 
-// TestHashKeysAreInt64OnPlannedIntegerJoin is the one that matters: a join
-// planned from real SQL over real catalog columns must reach the int64 lane.
-// Mixed integer WIDTHS (int8 = int4, int4 = int2) are included because the
-// executor's int64 key is width-agnostic while a type check written as "both
-// sides are the same type" would reject them.
-func TestHashKeysAreInt64OnPlannedIntegerJoin(t *testing.T) {
-	// M0127-P5.9: a legacy-rule assertion; see useLegacyEnumerator.
-	useLegacyEnumerator(t)
-	cat := hashKeyTestCatalog(t)
-	joins := planHashJoins(t, cat, `select s_name, n_name
-from supplier, nation, lineitem
-where s_nationkey = n_nationkey and l_suppkey = s_suppkey`)
-	if len(joins) == 0 {
-		t.Fatal("no hash join in the plan — the fixture no longer exercises the path")
-	}
-	for i, j := range joins {
-		if !j.HashKeysAreInt64() {
-			t.Errorf("join %d (%v = %v): HashKeysAreInt64 = false, want true — "+
-				"integer-keyed joins must reach the int64 build", i, j.LeftKey, j.RightKey)
-		}
-	}
-}
-
 // TestHashKeysAreInt64RejectsNonIntegerKeys pins the conservative half. A text
 // key must not be promised as int64 (the executor would demote mid-build and
 // re-key the whole table), and neither must numeric — for numeric it is the

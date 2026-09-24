@@ -1,6 +1,6 @@
 # Cutover readiness: the arm-vs-arm timing A/B (M0145-0008)
 
-Status: task BLOCKED 2026-09-23 on two owner calls (multiplier; executor legacy pin) — see fix_plan M0145-0008 escalation. Earlier: measurement landed 2026-09-21; BOTH named blockers are now FIXED the
+Status: task M0145-0008 CLOSED 2026-09-24 (legacy-deletion slice 4, `m0145-0008-del4-pgshaped-knob-and-retirement-audit.md`). Earlier: task BLOCKED 2026-09-23 on two owner calls (multiplier; executor legacy pin) — see fix_plan M0145-0008 escalation. Earlier: measurement landed 2026-09-21; BOTH named blockers are now FIXED the
 same day — the semijoin one (see "The fix, measured") and Q17 (see "Q17 FIXED").
 Q17's attribution was also CORRECTED in the process: the defect is route-borne,
 not arm-borne, and is reachable on the DEFAULT arm.

@@ -34,7 +34,6 @@ func widthFixture(n int) ([]string, Node, *resolveContext) {
 // the relset width and not some other property of a wide comma FROM list
 // (which is what a one-armed test would leave open).
 func TestSeamDeclinesAtTheRelSetWidth(t *testing.T) {
-	withPGShapedDP(t)
 
 	t.Run("at the width the problem is searched", func(t *testing.T) {
 		names, node, ctx := widthFixture(maxSearchRels)

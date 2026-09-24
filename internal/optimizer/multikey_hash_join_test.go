@@ -103,15 +103,7 @@ func TestSplitEqualityForHashMultiKey(t *testing.T) {
 		}
 	}
 
-	t.Run("legacy syntactic builder", func(t *testing.T) {
-		prev := pgShapedDP
-		pgShapedDP = false
-		t.Cleanup(func() { pgShapedDP = prev })
-		assertHashJoin(t, multiKeyCatalog(t, 0))
-	})
-
 	t.Run("searched enumerator", func(t *testing.T) {
-		withPGShapedDP(t)
 		assertHashJoin(t, multiKeyCatalog(t, 800_000))
 	})
 }

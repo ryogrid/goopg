@@ -34,7 +34,6 @@ func oneRelSeamFixture(rows int64) (Node, *resolveContext) {
 // everything downstream (`relfromjoinlist.go`'s `jl.nrels() == 1` carve-out and
 // the one-relation protocol it runs) already existed and was simply unreachable.
 func TestOneRelSearchAdmitsASingleTableStatement(t *testing.T) {
-	withPGShapedDP(t)
 
 	node, ctx := oneRelSeamFixture(10_000_000)
 	pred := seamLocal([]string{"a"}, 0)

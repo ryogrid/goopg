@@ -54,7 +54,6 @@ func c04cJointypesFor(lines []string, relids string) (map[string]bool, int, int)
 // would drop the unmatched `a` rows and no row count on this fixture would
 // notice.
 func TestEnumTraceAdmitsALeftLinkBelowAnInnerLink(t *testing.T) {
-	withPGShapedDP(t)
 	names := []string{"a", "b", "c"}
 	node, ctx := c04cBelowInner(t, names, []int64{100_000, 50_000, 10}, rfjEq(names, 0, 2))
 	lines, used := c04cTraceSeam(t, node, seamLocal(names, 0), ctx)
@@ -81,7 +80,6 @@ func TestEnumTraceAdmitsALeftLinkBelowAnInnerLink(t *testing.T) {
 // an un-re-based qual would name `a0 = b0`, the {b,c} pairing would carry no
 // clause and the search would never offer it.
 func TestEnumTraceAdmitsALeftLinkOnANonFirstCommaItem(t *testing.T) {
-	withPGShapedDP(t)
 	names := []string{"a", "b", "c"}
 	node, ctx := seamFixture(names, []int64{100_000, 50_000, 10})
 	a, b, c := seamLeaves(t, node)
@@ -122,7 +120,6 @@ func TestEnumTraceAdmitsALeftLinkOnANonFirstCommaItem(t *testing.T) {
 // could not reach, so a remap that happened to work only for a top-of-chain
 // link would fail here.
 func TestBelowInnerLeftLinkSurvivesCollapseSplit(t *testing.T) {
-	withPGShapedDP(t)
 	for _, n := range []int{4, 8, 9, 10, 11} {
 		names := make([]string, n)
 		rows := make([]int64, n)

@@ -64,7 +64,6 @@ func c04cBelowInner(t *testing.T, names []string, rows []int64, top Expr) (Node,
 // drops the unmatched `a` rows — the Q72 failure), and both quals are still
 // enforced (a dropped `ON` qual is a cross product, not a slow plan).
 func TestSeamPlansALeftLinkBelowAnInnerLink(t *testing.T) {
-	withPGShapedDP(t)
 	names := []string{"a", "b", "c"}
 	// The INNER link's qual reads the LEFT link's PRESERVED side only, so it
 	// carries no delay obligation — the admitted case.
@@ -103,7 +102,6 @@ func TestSeamPlansALeftLinkBelowAnInnerLink(t *testing.T) {
 // syntactic tree), so nothing regresses; upstream's fix is the
 // `required_relids` widening, ledgered as the resume point.
 func TestSeamDeclinesAnInnerOnQualReachingALinkBelowItsNullableSide(t *testing.T) {
-	withPGShapedDP(t)
 	names := []string{"a", "b", "c"}
 	node, ctx := c04cBelowInner(t, names, []int64{100_000, 50_000, 10}, rfjEq(names, 1, 2))
 	pred := seamLocal(names, 0)
@@ -147,7 +145,6 @@ func TestSeamDeclinesAnInnerOnQualReachingALinkBelowItsNullableSide(t *testing.T
 // re-basing would enforce the wrong equality and the test would see `a0=b0`
 // instead of `b0=c0` — a wrong answer, silently.
 func TestSeamPlansALeftLinkOnANonFirstCommaItem(t *testing.T) {
-	withPGShapedDP(t)
 	names := []string{"a", "b", "c"}
 	node, ctx := seamFixture(names, []int64{100_000, 50_000, 10})
 	a, b, c := seamLeaves(t, node)
@@ -188,7 +185,6 @@ func TestSeamPlansALeftLinkOnANonFirstCommaItem(t *testing.T) {
 // check for both link types and lifting it is one change; stating the inner
 // half separately keeps its blast radius visible.
 func TestSeamPlansAnInnerLinkOnANonFirstCommaItem(t *testing.T) {
-	withPGShapedDP(t)
 	names := []string{"a", "b", "c"}
 	node, ctx := seamFixture(names, []int64{100_000, 50_000, 10})
 	a, b, c := seamLeaves(t, node)

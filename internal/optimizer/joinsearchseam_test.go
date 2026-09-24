@@ -17,16 +17,6 @@ import (
 	"github.com/goopg/goopg/internal/parser"
 )
 
-// withPGShapedDP forces the flag on for one test and restores it. The flag is
-// read once at process start in production (joinsearch.go), which is exactly
-// why a test may not rely on the environment for it.
-func withPGShapedDP(t *testing.T) {
-	t.Helper()
-	prev := pgShapedDP
-	pgShapedDP = true
-	t.Cleanup(func() { pgShapedDP = prev })
-}
-
 // seamFixture builds what `planSelect` hands the seam for `FROM n0, n1, …`: a
 // left-deep CROSS chain of `*SeqScan` leaves, the bindings in FROM order, and
 // the joinlist a comma FROM list produces.
@@ -86,39 +76,11 @@ func seamOrOfAnds(names []string, a, b int) Expr {
 	return &BinaryOp{Op: parser.OpOr, Left: branch(true), Right: branch(false)}
 }
 
-// TestPGShapedSeamIsInertWithTheFlagOff is the rollback guarantee of 08 §2: with
-// `GOOPG_PGSHAPED_DP` off the seam must not merely produce the same plan, it
-// must not run at all — the node and the predicate come back by identity.
-//
-// M0127-P5.9 flipped the default ON, so this test now forces the flag off
-// itself instead of asserting the process default. That is not a weakening —
-// the guarantee under test was always about the OFF arm, and before the flip
-// the process default happened to be the arm it needed. After the flip it is
-// the kill-switch arm, and the kill-switch is exactly what must keep working:
-// it is S5's whole rollback story until S7 deletes the old DP.
-func TestPGShapedSeamIsInertWithTheFlagOff(t *testing.T) {
-	prev := pgShapedDP
-	pgShapedDP = false
-	t.Cleanup(func() { pgShapedDP = prev })
-	names := []string{"a", "b", "c"}
-	node, ctx := seamFixture(names, []int64{1_000_000, 10, 1000})
-	pred := combineAnd([]Expr{rfjEq(names, 0, 1), rfjEq(names, 1, 2)})
-
-	out, residual, used := tryPGShapedJoinSearch(node, pred, ctx, nil)
-	if used {
-		t.Fatal("the seam ran with the flag off")
-	}
-	if out != node || residual != pred {
-		t.Fatal("the seam altered its inputs while declining")
-	}
-}
-
 // TestPGShapedSeamSearchesAndPublishesBindingOrder: the flag-on path plans the
 // whole FROM list as one problem, tags the root so the legacy layout family
 // leaves it alone, and republishes the pre-search concatenation (03 §10) — the
 // property every expression above the join was resolved against.
 func TestPGShapedSeamSearchesAndPublishesBindingOrder(t *testing.T) {
-	withPGShapedDP(t)
 	names := []string{"a", "b", "c"}
 	node, ctx := seamFixture(names, []int64{1_000_000, 500_000, 10})
 	pred := combineAnd([]Expr{rfjEq(names, 0, 1), rfjEq(names, 1, 2)})
@@ -144,7 +106,6 @@ func TestPGShapedSeamSearchesAndPublishesBindingOrder(t *testing.T) {
 // asserts all three at once because the failure mode is a conjunct that reaches
 // NONE of them — a qual silently dropped is a wrong answer, not a slow plan.
 func TestPGShapedSeamResidualIsWhatTheSearchDidNotPlace(t *testing.T) {
-	withPGShapedDP(t)
 	names := []string{"a", "b", "c"}
 	node, ctx := seamFixture(names, []int64{1_000_000, 500_000, 10})
 	local := seamLocal(names, 0)
@@ -261,7 +222,6 @@ func seamEqualities(n Node) map[string]bool {
 // the searched tree, the WHERE restriction is found on its leaf, and the
 // residual is empty — the three destinations, all three checked at once.
 func TestPGShapedSeamSearchesAnExplicitInnerChain(t *testing.T) {
-	withPGShapedDP(t)
 	names := []string{"a", "b", "c"}
 	node, ctx := seamInnerChain(t, names, []int64{1_000_000, 500_000, 10})
 
@@ -325,7 +285,6 @@ func TestSearchConsumesAsksTheProducer(t *testing.T) {
 // correctness reason rather than a tuning one (see the file header of
 // joinsearchseam.go).
 func TestPGShapedSeamDeclines(t *testing.T) {
-	withPGShapedDP(t)
 	names := []string{"a", "b", "c"}
 
 	t.Run("lateral item", func(t *testing.T) {
@@ -482,7 +441,6 @@ func TestSearchTupleFractionReadsTheParseTree(t *testing.T) {
 // the fraction's own arithmetic is pinned by
 // `TestSearchTupleFractionReadsTheParseTree` and `tuplefraction_test.go`.
 func TestPGShapedSeamSearchesTwoRelationProblems(t *testing.T) {
-	withPGShapedDP(t)
 	names := []string{"a", "b"}
 	node, ctx := seamFixture(names, []int64{1_000, 10})
 	ctx.tupleFraction = 10

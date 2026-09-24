@@ -42,9 +42,6 @@
 #              `tpch-acceptance-arm.sh QUERIES=…` on ITS private clone and
 #              `tpch-fireset-parse.py` maps the arm's per-query lines onto the
 #              same three-status vocabulary.
-#   TPCH_FIRESET_PGSHAPED  GOOPG_PGSHAPED_DP for the TPC-H fire-set arm
-#              (default 1 — the shipped planner, NOT tpch-acceptance-arm.sh's
-#              own 0 default).
 #   FIRESET_STATUS_OUT  destination for FIRESET_QUERIES status records. The
 #              caller owns truncation so several isolated arms can append.
 #   FIRESET_TIMEOUT  per-query execution timeout in seconds (default 600).
@@ -145,18 +142,10 @@ if [[ "${CORPUS}" == "tpch" ]]; then
     if [[ "${fireset_requested}" == 1 ]]; then
         mkdir -p "$(dirname "${FIRESET_STATUS_OUT}")" || exit 2
         arm_out="${OUTDIR}/${LABEL}-fireset-arm.txt"
-        # PGSHAPED is pinned to 1 explicitly even though the arm script now
-        # defaults to 1 (owner call 2026-09-22): pinning here keeps the fire
-        # set comparable against captures recorded before that default flip,
-        # and guards against a future arm-script default change. Measuring a
-        # non-shipped planner is how TPC-H Q9 produced a false red gate for
-        # three loops (m0145-0020a-grouped-output-cardinality.md).
-        #
         # GATE_STAMP_DIR is redirected so this subset run cannot overwrite the
         # real tmp/gate-stamps/tpch-acceptance-arm.json — a QUERIES subset
         # always stamps NO-COMPARE, and a fire-set execution must never
         # destroy (or fabricate) a gate verdict.
-        PGSHAPED="${TPCH_FIRESET_PGSHAPED:-1}" \
         QUERIES="${FIRESET_QUERIES}" \
         PER_Q="${FIRESET_TIMEOUT:-600}" \
         GATE_STAMP_DIR="${OUTDIR}/gate-stamps" \

@@ -511,7 +511,6 @@ func TestNoCorpusQueryHasAnInnerOnlyJoinChain(t *testing.T) {
 // must not be confused — confusing them is the exact defect P5.9-m recorded.
 // `TestNoCorpusQueryHasAnInnerOnlyJoinChain` above measures the second.
 func TestExplicitJoinChainReachesTheSearch(t *testing.T) {
-	withPGShapedDP(t)
 	names := []string{"a", "b", "c"}
 	// The chain `planFromItem` builds for that FROM clause, and the joinlist
 	// the deconstruction actually produces for it.

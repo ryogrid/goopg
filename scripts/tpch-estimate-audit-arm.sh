@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # tpch-estimate-audit-arm.sh — run the 09 §5 estimate audit / §4 per-joinrel
-# parity ratchet for ONE arm (GOOPG_PGSHAPED_DP off or on) against the TPC-H
+# parity ratchet for ONE arm against the TPC-H
 # SF1 cluster, on a fresh capped server.
 #
 # Promoted into the repo at M0127-P5.9 run 3, for the reason P5.9-d promoted
@@ -14,24 +14,20 @@
 # Usage:
 #   scripts/tpch-estimate-audit-arm.sh <label> [estimate-audit args...]
 #
-#   PGSHAPED=0 scripts/tpch-estimate-audit-arm.sh 2026-08-05-p59run3-audit-off
-#   PGSHAPED=1 scripts/tpch-estimate-audit-arm.sh 2026-08-05-p59run3-audit-on
+#   scripts/tpch-estimate-audit-arm.sh 2026-09-24-audit
 #
 # Writes analysis/leftdeep-joins/<label>.txt (+ .plans.txt) via the audit tool's
 # own --out default.
 #
 # Environment:
-#   PGSHAPED   GOOPG_PGSHAPED_DP for this arm (default 0). Set EXPLICITLY on
-#              both arms — see tpch-acceptance-arm.sh's note on why an unset
-#              flag stops being a well-defined arm the day the default flips.
-#              (COLLAPSE was GOOPG_PGSHAPED_COLLAPSE; take3 C-06 retired the
-#              flag and explicit-JOIN flattening is unconditional, so the
-#              knob is gone rather than silently inert.)
+#   (PGSHAPED was GOOPG_PGSHAPED_DP, defaulting to 0 here — a planner with
+#              no join-order search, which nothing ships. M0145-0008 retired
+#              the flag; the search is unconditional. COLLAPSE, likewise, was
+#              GOOPG_PGSHAPED_COLLAPSE, retired by take3 C-06.)
 #   DP_TRACE   1 = run the server with GOOPG_PGSHAPED_DP_TRACE=1 and hand its
 #              log to the audit tool as --enum-trace, which adds the clause-6
 #              enumeration-provenance section (M0127-P5.9-l-ii). Only
-#              meaningful with PGSHAPED=1: the trace is written by the
-#              PG-shaped search, so a PGSHAPED=0 arm produces an empty one.
+#              written by the PG-shaped search.
 #   REFERENCE  PG 18.3 reference plans file for the §4 parity gate. Default is
 #              the committed capture, so the ratchet stays comparable to the
 #              baseline §4.1 pinned; pass empty to skip the parity column, or
@@ -96,7 +92,6 @@ REFERENCE="${REFERENCE-${REPO_ROOT}/analysis/leftdeep-joins/2026-08-05-p56giii-p
 export GOMEMLIMIT="${GOMEMLIMIT:-12GiB}" GOGC="${GOGC:-off}"
 export GOOPG_MEM_HIGH="${GOOPG_MEM_HIGH:-20G}" GOOPG_MEM_MAX="${GOOPG_MEM_MAX:-24G}"
 export GOOPG_MEM_SWAP_MAX="${GOOPG_MEM_SWAP_MAX:-0}"
-export GOOPG_PGSHAPED_DP="${PGSHAPED:-0}"
 export GOOPG_PGSHAPED_DP_TRACE="${DP_TRACE:-0}"
 # M0145-0021b: pin the reservoir sample, same default and same reason as
 # tpch-acceptance-arm.sh. goopg's statistics are per-connection and ANALYZE is
@@ -209,7 +204,7 @@ audit_args=(-host "${PG_HOST}" -port "${PG_PORT}" --label "${LABEL}" --timeout "
 [[ "${GOOPG_PGSHAPED_DP_TRACE}" == "1" ]] && audit_args+=(--enum-trace "${SRV_LOG}")
 [[ "${PLAN_ONLY:-0}" == "1" ]] && audit_args+=(--plan-only)
 
-echo "# audit ${LABEL} GOOPG_PGSHAPED_DP=${GOOPG_PGSHAPED_DP} DP_TRACE=${GOOPG_PGSHAPED_DP_TRACE} PLAN_ONLY=${PLAN_ONLY:-0} started $(date -Is)"
+echo "# audit ${LABEL} DP_TRACE=${GOOPG_PGSHAPED_DP_TRACE} PLAN_ONLY=${PLAN_ONLY:-0} started $(date -Is)"
 ( cd "${REPO_ROOT}" && "${AUDIT_BIN}" "${audit_args[@]}" "$@" )
 rc=$?
 echo "# audit ${LABEL} finished $(date -Is) rc=${rc}"

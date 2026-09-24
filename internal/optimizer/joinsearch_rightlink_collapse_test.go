@@ -11,7 +11,6 @@ import "testing"
 // bits no item-space joinrel contains, and without the remap the link comes
 // back INNER.
 func TestRightLinkSurvivesCollapseSplit(t *testing.T) {
-	withPGShapedDP(t)
 	for _, n := range []int{4, 8, 9, 10, 11} {
 		names := make([]string, n)
 		rows := make([]int64, n)

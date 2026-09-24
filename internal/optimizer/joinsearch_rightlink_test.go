@@ -47,7 +47,6 @@ func seamDeclineReasons(lines []string) []string {
 // the LEFT join the link reduces to (`reduceRightLink`), and PG's own
 // JOIN_RIGHT is the reversed direction C-03b declines.
 func TestSeamRightLinkDPPathOfferedAndAccepted(t *testing.T) {
-	withPGShapedDP(t)
 	enableDPTrace(t)
 	names := []string{"a", "b", "c"}
 	node, ctx := seamChainFromSQL(t, names, []int64{100_000, 50_000, 10}, rightChain3)
@@ -105,7 +104,6 @@ func TestSeamRightLinkDPPathOfferedAndAccepted(t *testing.T) {
 // mutation-checked against the same OR under a LEFT link's PRESERVED side,
 // where the residual is a correct place and the statement is searched.
 func TestSeamDeclinesAnUnconsumedInnerOnQualUnderARightLink(t *testing.T) {
-	withPGShapedDP(t)
 	enableDPTrace(t)
 	names := []string{"a", "b", "c"}
 	rows := []int64{100_000, 50_000, 10}
@@ -147,7 +145,6 @@ func TestSeamDeclinesAnUnconsumedInnerOnQualUnderARightLink(t *testing.T) {
 // a PRESERVED-side-only one (`c1 > 5`) has no destination in a searched tree
 // and declines the statement.
 func TestSeamRightLinkOnQualDestinations(t *testing.T) {
-	withPGShapedDP(t)
 	names := []string{"a", "b", "c"}
 	rows := []int64{100_000, 50_000, 10}
 
@@ -193,7 +190,6 @@ func TestSeamRightLinkOnQualDestinations(t *testing.T) {
 // S9.4; the fixture bypasses that pass, which is the point — the seam must
 // hold on its own.)
 func TestSeamDeclinesAnOuterLinkUnderARightLinksNullableSide(t *testing.T) {
-	withPGShapedDP(t)
 	names := []string{"a", "b", "c"}
 	for _, from := range []string{
 		"a LEFT JOIN b ON a.x = b.x RIGHT JOIN c ON b.x = c.x",

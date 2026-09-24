@@ -1,6 +1,6 @@
 # M0145-0008 prerequisite: executor-capability inventory
 
-Status: task BLOCKED 2026-09-23 on two owner calls (multiplier; executor legacy pin) — see fix_plan M0145-0008 escalation. Earlier: inventory produced 2026-09-23 — no member is a "generatable but
+Status: task M0145-0008 CLOSED 2026-09-24 (legacy-deletion slice 4, `m0145-0008-del4-pgshaped-knob-and-retirement-audit.md`). Earlier: task BLOCKED 2026-09-23 on two owner calls (multiplier; executor legacy pin) — see fix_plan M0145-0008 escalation. Earlier: inventory produced 2026-09-23 — no member is a "generatable but
 unexecutable" shape; one NEW readiness finding (Q20, filed as M0145-0027 —
 FIXED the same day, knob Q20 3.80 s → 0.18 s).
 Task: `.ralph/fix_plan.md` M0145-0008 (Kind: impl), owner direction

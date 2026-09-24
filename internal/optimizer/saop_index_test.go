@@ -155,31 +155,6 @@ func TestSAOPQ45ShapeMoves(t *testing.T) {
 	}
 }
 
-// TestSAOPMultiTableRewriteMoves pins the rewrite-pass half: the same shape
-// in a multi-table query promotes the matching SeqScan under the join.
-// Legacy arm (useLegacyEnumerator): the rewrite pass skips searched trees
-// (isSearchedTree — coordinates), so this is pinned where the pass runs,
-// exactly like the `=` arm it mirrors.
-func TestSAOPMultiTableRewriteMoves(t *testing.T) {
-	useLegacyEnumerator(t)
-	c := saopFixture(t)
-	node, err := Plan(parseOne(t,
-		"SELECT i_item_id FROM item, store WHERE i_item_sk = s_sk AND s_sk IN (1, 2)"), c)
-	if err != nil {
-		t.Fatalf("Plan: %v", err)
-	}
-	// findIndexScan (not planContainsIndexScan): the join may rewrite to
-	// an NLI whose probe lives on Inner, which the shared helper does
-	// not descend into.
-	scan := findIndexScan(node)
-	if scan == nil {
-		t.Fatalf("multi-table SAOP: want an IndexScan under the join, got none")
-	}
-	if len(scan.SAOPKeys) != 2 {
-		t.Fatalf("multi-table SAOP: SAOPKeys has %d elements, want 2", len(scan.SAOPKeys))
-	}
-}
-
 // TestSAOPWithConjunctMoves pins the multi-conjunct single-table shape:
 // the IN probes (SAOPKeys) while the remaining range conjunct stays as the
 // Filter — the same division the `=` rewrite arm performs.

@@ -1,7 +1,7 @@
 # M0145-0008: the cutover flip — the jointree pipeline becomes the default
 
-Status: flip landed 2026-09-24; the legacy-deletion slices remain (task stays
-open). Task: `.ralph/fix_plan.md` M0145-0008 (Kind: impl, Parent: M0145-0007).
+Status: flip landed 2026-09-24; legacy-deletion slices 1-4 landed the same day;
+task CLOSED. Task: `.ralph/fix_plan.md` M0145-0008 (Kind: impl, Parent: M0145-0007).
 Earlier docs: `m0145-0008-cutover-readiness-timing-ab.md`,
 `m0145-0008-executor-capability-inventory.md`, `m0145-0008-flip-test-triage.md`.
 
@@ -139,5 +139,8 @@ zero fires on every run.
 Slice 2 (`m0145-0008-del2-legacy-pipeline-deleted.md`) deleted the legacy
 pipeline and retired the knob; no plan moved. Slice 3
 (`m0145-0008-del3-dead-code.md`) deleted the code only legacy reached and the
-knob's script remnants. What remains is the audit of M0145-0001's §6
-retirement rows, many of which are still the live route.
+knob's script remnants. Slice 4
+(`m0145-0008-del4-pgshaped-knob-and-retirement-audit.md`) retired
+`GOOPG_PGSHAPED_DP` and audited M0145-0001's §6 rows: every 0008 row is gone,
+and the rows still live are the shipped route (M0145-0008n). The task is
+closed.
