@@ -93,7 +93,12 @@ func clauseSelectivity(expr Expr, child Node) float64 {
 		}
 		cr, ok := e.Operand.(*ColumnRef)
 		if !ok {
-			return defaultGenericSelectivity
+			// M0145-0008g: scalararraysel over an expression operand.
+			sel := inListExprSelectivity(e, child)
+			if e.Negated {
+				return 1 - sel
+			}
+			return sel
 		}
 		stats := columnStatsForChild(cr.Index, child)
 		sel := inListSelectivity(e, cr, stats, columnRawRowsForChild(cr.Index, child), child)
@@ -122,6 +127,17 @@ func clauseSelectivity(expr Expr, child Node) float64 {
 // (in [0,1]); in the common small-sum case that reproduces the old plain
 // sum bit-for-bit, and out-of-range sums fall back to the OR merge.
 func inListSelectivity(e *InExpr, cr *ColumnRef, stats *catalog.ColumnStats, tuples float64, child Node) float64 {
+	return inListMergeSelectivity(e, func(elem Expr) float64 {
+		return inListElementSelectivity(e, cr, elem, stats, tuples, child)
+	})
+}
+
+// inListMergeSelectivity is scalararraysel's merge (selfuncs.c:1821): OR
+// (ANY) or AND (ALL) of the per-element selectivities elemSel returns, with
+// the equality-ANY disjoint sum (and the inequality-ALL twin) accepted when
+// it stays in [0,1]. Factored out of inListSelectivity so the column and
+// expression operands share one merge (M0145-0008g).
+func inListMergeSelectivity(e *InExpr, elemSel func(Expr) float64) float64 {
 	useOr := !e.AllOp
 	isEquality := (e.AnyOp == 0 || e.AnyOp == parser.OpEq) && !e.NotEqualAny
 	isInequality := e.AnyOp == parser.OpNe
@@ -131,7 +147,7 @@ func inListSelectivity(e *InExpr, cr *ColumnRef, stats *catalog.ColumnStats, tup
 	}
 	s1disjoint := s1
 	for _, elem := range e.List {
-		s2 := inListElementSelectivity(e, cr, elem, stats, tuples, child)
+		s2 := elemSel(elem)
 		if useOr {
 			s1 = s1 + s2 - s1*s2
 			if isEquality {
@@ -148,6 +164,28 @@ func inListSelectivity(e *InExpr, cr *ColumnRef, stats *catalog.ColumnStats, tup
 		s1 = s1disjoint
 	}
 	return clampProbability(s1)
+}
+
+// inListExprSelectivity is scalararraysel for an operand that is not a bare
+// column (M0145-0008g): `substr(c_phone, 1, 2) IN ('13', '31', …)`. PG calls
+// the element operator's estimator per element (eqsel → var_eq_const, which
+// with no statistics for the expression answers 1/DEFAULT_NUM_DISTINCT via
+// get_variable_numdistinct) and merges; for TPC-H Q22's 7-element list that
+// is 7 × 1/200 = 0.035, where goopg returned the generic 1/3. The per-element
+// estimate here is the scalar clause estimator on the synthesized
+// `operand <op> element`, so it is by construction what the same comparison
+// gets when written out (sibling agreement with `expr = const`).
+func inListExprSelectivity(e *InExpr, child Node) float64 {
+	op := e.AnyOp
+	if op == 0 {
+		op = parser.OpEq
+	}
+	if e.NotEqualAny {
+		op = parser.OpNe
+	}
+	return inListMergeSelectivity(e, func(elem Expr) float64 {
+		return clauseSelectivity(&BinaryOp{Op: op, Left: e.Operand, Right: elem}, child)
+	})
 }
 
 // inListElementSelectivity prices one `operand <op> element` comparison
@@ -1025,7 +1063,15 @@ func clauseSelectivityWithSource(expr Expr, child Node) selectivityEstimate {
 		}
 		cr, ok := e.Operand.(*ColumnRef)
 		if !ok {
-			return selectivityEstimate{value: defaultGenericSelectivity, reliable: false}
+			// M0145-0008g: scalararraysel over an expression operand — the
+			// same estimate the plain arm returns (sibling twins agree).
+			// Unreliable: with no expression statistics PG's own answer is
+			// get_variable_numdistinct's default (isdefault).
+			sel := inListExprSelectivity(e, child)
+			if e.Negated {
+				sel = 1 - sel
+			}
+			return selectivityEstimate{value: sel, reliable: false}
 		}
 		stats := columnStatsForChild(cr.Index, child)
 		// A unique key column is priced from the catalog alone (the isunique
