@@ -1,0 +1,28 @@
+tmp/m0145-0008l-fireset.log:FIRE-SET: baseline=2e923ff37337778ef01825694a6fbdf894092e12 (6fa66e62e93c) candidate=worktree (24ac2bc881ec)
+tmp/m0145-0008l-fireset.log:FIRE-SET-TIMEOUTS: fires=Q64 Q94 introduced=none unchanged=none missing=none
+tmp/m0145-0008l-fireset.log:FIRE-SET: corpus=tpcds-sf1 fires=none (plan A/B had no changed query)
+tmp/m0145-0008l-tpch.log:FIRE-SET: baseline=2e923ff37337778ef01825694a6fbdf894092e12 (e2f2b2c55171) candidate=worktree (24ac2bc881ec)
+tmp/m0145-0008l-tpch.log:FIRE-SET-TIMEOUTS: fires=Q4 Q21 Q22 introduced=none unchanged=none missing=none
+tpch baseline: PLAN-PARITY: queries=22 match=3 shapediff=19 unparsed=0 missingnode=0 error=0 timeout=0
+tpch baseline: CATEGORIES-EXCL-MATCH: join-order=16 join-method=14 scan-type=13 parameterisation=6 aggregation-strategy=3 sort-strategy=8 parallelism=11 qual-placement=5 rendering=4
+tpch baseline: Q21 SHAPE-DIFF [join-order,join-method,parallelism,qual-placement] estimates(goopg cost=277827.17..277827.17 rows=1 widt
+tpch baseline: Q22 SHAPE-DIFF [join-order,join-method,scan-type,parallelism,rendering] estimates(goopg cost=63837.77..63839.77 rows=200
+tpch baseline: Q4 SHAPE-DIFF [join-method,scan-type,sort-strategy,parallelism] estimates(goopg cost=174486.20..174486.21 rows=5 width=7
+tpch exec baseline (nightly running): Q4: OK elapsed=5.45s
+tpch exec baseline (nightly running): Q21: OK elapsed=3.86s
+tpch exec baseline (nightly running): Q22: OK elapsed=1.85s
+tpch candidate: PLAN-PARITY: queries=22 match=3 shapediff=19 unparsed=0 missingnode=0 error=0 timeout=0
+tpch candidate: CATEGORIES-EXCL-MATCH: join-order=17 join-method=11 scan-type=12 parameterisation=7 aggregation-strategy=4 sort-strategy=9 parallelism=11 qual-placement=5 rendering=3
+tpch candidate: Q21 SHAPE-DIFF [join-order,parallelism,qual-placement] estimates(goopg cost=263195.09..263195.10 rows=1 width=112 | pg c
+tpch candidate: Q22 SHAPE-DIFF [join-order,scan-type,parameterisation,sort-strategy,parallelism] estimates(goopg cost=28043.65..28045.65
+tpch candidate: Q4 SHAPE-DIFF [join-order,aggregation-strategy,sort-strategy,parallelism] estimates(goopg cost=172846.25..172846.30 rows
+tpch exec candidate (nightly running): Q4: OK elapsed=1.90s
+tpch exec candidate (nightly running): Q21: OK elapsed=4.77s
+tpch exec candidate (nightly running): Q22: OK elapsed=0.56s
+=== SUMMARY: PASS=96 (60 ck-verified, 36 ck=n/a) MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0 SKIP=3 ===
+=== PLAN-SHAPE: queries=99 same=97 changed=2 added=0 removed=0 ===
+SUMMARY: 24 MATCH
+VERDICT: PASS — every label matched on values, not merely on row count
+  baseline findings: 52   current: 52
+EA-RATCHET: PASS
+tpch-spotcheck: RESULT=PASS

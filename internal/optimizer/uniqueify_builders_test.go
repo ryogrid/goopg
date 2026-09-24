@@ -28,7 +28,7 @@ func TestAddNestLoopPath_UniqueSideInnerSubstitutesInner(t *testing.T) {
 	rhsRel.CheapestTotal = subpath
 
 	joinrel := newRelOptInfo(outer.Relids|rhsRel.Relids, 5000, 64)
-	addNestLoopPath(joinrel, outer, rhsRel, cp, parser.JoinInner, nil, uniqueSideInner, sjinfo)
+	addNestLoopPath(joinrel, outer, rhsRel, cp, parser.JoinInner, nil, uniqueSideInner, sjinfo, semiAntiJoinFactors{})
 
 	if len(joinrel.Pathlist) != 1 {
 		t.Fatalf("got %d paths, want 1", len(joinrel.Pathlist))
@@ -65,7 +65,7 @@ func TestAddNestLoopPath_UniqueSideInnerDeclinesWhenUnUniqueIfiable(t *testing.T
 	sjinfo.SemiCanBtree = false
 
 	joinrel := newRelOptInfo(outer.Relids|rhsRel.Relids, 5000, 64)
-	addNestLoopPath(joinrel, outer, rhsRel, cp, parser.JoinInner, nil, uniqueSideInner, sjinfo)
+	addNestLoopPath(joinrel, outer, rhsRel, cp, parser.JoinInner, nil, uniqueSideInner, sjinfo, semiAntiJoinFactors{})
 
 	if len(joinrel.Pathlist) != 0 {
 		t.Fatalf("got %d paths, want 0 (createUniquePath declined)", len(joinrel.Pathlist))
@@ -84,7 +84,7 @@ func TestAddNLIPaths_UniqueSideOuterSubstitutesOuter(t *testing.T) {
 
 	inner := nliInnerRel(relsetOf(1), 1000000, lhsRel.Relids, indexProbeCost(cp))
 	joinrel := newRelOptInfo(lhsRel.Relids|inner.Relids, 5000, 64)
-	addNLIPaths(nil, joinrel, lhsRel, inner, cp, parser.JoinInner, nil, 0, uniqueSideOuter, sjinfo)
+	addNLIPaths(nil, joinrel, lhsRel, inner, cp, parser.JoinInner, nil, 0, uniqueSideOuter, sjinfo, semiAntiJoinFactors{})
 
 	if len(joinrel.Pathlist) == 0 {
 		t.Fatal("got 0 paths, want at least 1 (indexed inner over a substituted outer)")
@@ -117,7 +117,7 @@ func TestAddNLIPaths_UniqueSideOuterDeclinesWhenUnUniqueIfiable(t *testing.T) {
 
 	inner := nliInnerRel(relsetOf(1), 1000000, lhsRel.Relids, indexProbeCost(cp))
 	joinrel := newRelOptInfo(lhsRel.Relids|inner.Relids, 5000, 64)
-	addNLIPaths(nil, joinrel, lhsRel, inner, cp, parser.JoinInner, nil, 0, uniqueSideOuter, sjinfo)
+	addNLIPaths(nil, joinrel, lhsRel, inner, cp, parser.JoinInner, nil, 0, uniqueSideOuter, sjinfo, semiAntiJoinFactors{})
 
 	if len(joinrel.Pathlist) != 0 {
 		t.Fatalf("got %d paths, want 0 (createUniquePath declined)", len(joinrel.Pathlist))

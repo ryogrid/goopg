@@ -277,7 +277,7 @@ func probeEnforcedClauses(p *Path) map[*restrictInfo]bool {
 // loop) is where the substitution belongs, before the loop below runs. A nil
 // substitution declines the whole call, matching `create_unique_path`'s own
 // "can't unique-ify, return NULL" contract.
-func addNLIPaths(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp costParams, jt parser.JoinType, clauses []*restrictInfo, paramSrc RelSet, uniq uniqueSide, sjinfo *SpecialJoinInfo) {
+func addNLIPaths(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp costParams, jt parser.JoinType, clauses []*restrictInfo, paramSrc RelSet, uniq uniqueSide, sjinfo *SpecialJoinInfo, semi semiAntiJoinFactors) {
 	// R64 (ledger R63-#3): decline when the inner is the preserved side. A
 	// RIGHT join preserves its inner child, which in this arm is a
 	// parameterized probe — unmatched preserved rows surface from no probe
@@ -368,9 +368,19 @@ func addNLIPaths(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp costParams,
 			// the startup included — PG's rescan_total, not just its
 			// run half.
 			rsStart := nestLoopInnerRescanStartup(in)
-			cost := nestloopCost(cp, o.Cost, in.Cost, o.Rows, in.Rows, rsStart, matRescan+rsStart)
+			var cost Cost
+			if semi.apply {
+				// M0145-0008l: final_cost_nestloop's SEMI/ANTI branch.
+				// A parameterised index probe that enforces every join
+				// clause makes an unmatched outer row an empty probe
+				// (has_indexed_join_quals).
+				cost = nestloopCostSemiAnti(cp, o.Cost, in.Cost, o.Rows, in.Rows, rsStart, matRescan+rsStart,
+					semi, hasIndexedJoinQuals(in, residual), len(residual))
+			} else {
+				cost = nestloopCost(cp, o.Cost, in.Cost, o.Rows, in.Rows, rsStart, matRescan+rsStart)
+				cost.Total += qualEvalCost(cp, len(residual), o.Rows*in.Rows)
+			}
 			cost.Total += matBuild
-			cost.Total += qualEvalCost(cp, len(residual), o.Rows*in.Rows)
 			filed = true
 			addPath(joinrel, &Path{
 				Kind:     PathNestLoop,
@@ -426,7 +436,7 @@ func addNLIPaths(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp costParams,
 // check has nothing to read — no LATERAL shape reaches path generation
 // (C-08 invariant, cited the same way the two landed partial producers
 // cite it: by comment, with no field to test).
-func addPartialNestLoopPaths(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp costParams, jt parser.JoinType, clauses []*restrictInfo) {
+func addPartialNestLoopPaths(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp costParams, jt parser.JoinType, clauses []*restrictInfo, semi semiAntiJoinFactors) {
 	// V0: the reader-only gate, shared with both landed partial producers
 	// (`joinpathsparallel.go:82-91`): nothing but `generateUsefulGatherPaths`
 	// and the next level's own partial producer reads a partial path.
@@ -551,9 +561,18 @@ func addPartialNestLoopPaths(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp
 				// creating the path — and the post-costing domination
 				// decides identically, so it is not mirrored.)
 				matBuild, matRescan := nestLoopInnerRescanCost(in, cp)
-				cost := nestloopCost(cp, o.Cost, in.Cost, o.Rows, in.Rows, 0, matRescan)
+				var cost Cost
+				if semi.apply {
+					// M0145-0008l: as the serial NLI arm. The factors are in
+					// total-relation coordinates and apply to this partial
+					// outer's own rows, as in final_cost_nestloop.
+					cost = nestloopCostSemiAnti(cp, o.Cost, in.Cost, o.Rows, in.Rows, 0, matRescan,
+						semi, hasIndexedJoinQuals(in, residual), len(residual))
+				} else {
+					cost = nestloopCost(cp, o.Cost, in.Cost, o.Rows, in.Rows, 0, matRescan)
+					cost.Total += qualEvalCost(cp, len(residual), o.Rows*in.Rows)
+				}
 				cost.Total += matBuild
-				cost.Total += qualEvalCost(cp, len(residual), o.Rows*in.Rows)
 				// `final_cost_nestloop` (costsize.c:4307-4314-twin): "For
 				// partial paths, scale row estimate." One divisor, applied
 				// here and undone by `computeGatherRows` — not two.

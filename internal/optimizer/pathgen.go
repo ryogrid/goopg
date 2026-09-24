@@ -173,7 +173,7 @@ func addHashJoinPath(joinRel, probe, build *RelOptInfo, cp costParams, jt parser
 // `try_nestloop_path` with the single substituted inner, this function's
 // domain. A nil substitution declines the whole path, matching
 // `create_unique_path`'s own "can't unique-ify, return NULL" contract.
-func addNestLoopPath(joinRel, outer, inner *RelOptInfo, cp costParams, jt parser.JoinType, quals []*restrictInfo, uniq uniqueSide, sjinfo *SpecialJoinInfo) {
+func addNestLoopPath(joinRel, outer, inner *RelOptInfo, cp costParams, jt parser.JoinType, quals []*restrictInfo, uniq uniqueSide, sjinfo *SpecialJoinInfo, semi semiAntiJoinFactors) {
 	o, i := outer.CheapestTotal, inner.CheapestTotal
 	if uniq == uniqueSideInner {
 		i = createUniquePath(inner, inner.CheapestTotal, sjinfo, cp)
@@ -188,9 +188,17 @@ func addNestLoopPath(joinRel, outer, inner *RelOptInfo, cp costParams, jt parser
 	// take2 P2-06: goopg's nested loop always materialises its inner, so the
 	// rescan is a cache replay and the build is paid once.
 	matBuild, matRescan := nestLoopInnerRescanCost(i, cp)
-	cost := nestloopCost(cp, o.Cost, i.Cost, o.Rows, i.Rows, 0, matRescan)
+	var cost Cost
+	if semi.apply {
+		// M0145-0008l: SEMI/ANTI stop at the first inner match
+		// (final_cost_nestloop's semi/anti branch). An unparameterised inner
+		// is never "indexed", so an unmatched outer row scans it all.
+		cost = nestloopCostSemiAnti(cp, o.Cost, i.Cost, o.Rows, i.Rows, 0, matRescan, semi, false, len(quals))
+	} else {
+		cost = nestloopCost(cp, o.Cost, i.Cost, o.Rows, i.Rows, 0, matRescan)
+		cost.Total += qualEvalCost(cp, len(quals), o.Rows*i.Rows)
+	}
 	cost.Total += matBuild
-	cost.Total += qualEvalCost(cp, len(quals), o.Rows*i.Rows)
 	addPath(joinRel, &Path{
 		Kind:          PathNestLoop,
 		Jointype:      jt, // C-03b; see addHashJoinPath.

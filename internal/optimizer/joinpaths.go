@@ -323,6 +323,11 @@ func addPathsToJoinrel(s *searchCtx, joinrel, outer, inner *RelOptInfo, clauses 
 	// PG-specific refinement, never wrong). See jointypeForDirection's
 	// contract note above.
 	mergeDeclined := jt == parser.JoinSemi || jt == parser.JoinAnti
+	// M0145-0008l: PG computes the semi/anti factors once per pair
+	// (add_paths_to_joinrel → compute_semi_anti_join_factors) and every
+	// nested-loop candidate for the pair reads them. `jt` is already
+	// demoted to INNER when a side is unique-ified, as in PG.
+	semi := s.semiAntiJoinFactorsFor(outer, inner, jt, clauses)
 
 	// 03 §9 rule 2 — PATH_PARAM_BY_REL (joinpath.c:43-47). The two directions
 	// are refused for genuinely different reasons, so they are named
@@ -435,12 +440,12 @@ func addPathsToJoinrel(s *searchCtx, joinrel, outer, inner *RelOptInfo, clauses 
 		// residual: it evaluates every clause, on every pair. Passing
 		// `clauses` whole rather than `append(keys, residual...)` also keeps
 		// the input order.
-		addNestLoopPath(joinrel, outer, inner, cp, jt, clauses, uniq, sjinfo)
+		addNestLoopPath(joinrel, outer, inner, cp, jt, clauses, uniq, sjinfo, semi)
 	}
 	// PG runs this inside the same `outerrel->pathlist` loop as the arms above
 	// (joinpath.c:1949), unconditionally for every jointype `nestjoinOK`
 	// admits — which under 03 §4.4's INNER-only pin is all of them.
-	addNLIPaths(s, joinrel, outer, inner, cp, jt, clauses, paramSrc, uniq, sjinfo)
+	addNLIPaths(s, joinrel, outer, inner, cp, jt, clauses, paramSrc, uniq, sjinfo, semi)
 	// R60 (plan-parity-fix take2): PG's post-serial-arms parallel block runs
 	// `consider_parallel_nestloop` over the same pair irrespective of inner
 	// parameterisation — that is the producer's point — so it sits here
@@ -448,7 +453,7 @@ func addPathsToJoinrel(s *searchCtx, joinrel, outer, inner *RelOptInfo, clauses 
 	// dispatch gate and the already-computed `paramSrc` unused (partial
 	// results must be fully unparameterised; there is no star-schema
 	// exception to test).
-	addPartialNestLoopPaths(s, joinrel, outer, inner, cp, jt, clauses)
+	addPartialNestLoopPaths(s, joinrel, outer, inner, cp, jt, clauses, semi)
 	// M0145-0008 follow-up census (nlicensus.go): the full candidate set for a
 	// semi/anti joinrel, after every arm has filed. Off unless
 	// GOOPG_NLI_CENSUS=1.

@@ -19629,7 +19629,7 @@ Movement: none — no plan moved on TPC-DS SF0.25/SF1 or TPC-H across all four d
       ea\-ratchet 52/52.
     Movement: yes — CATEGORIES-EXCL-MATCH TPC-H parameterisation 7 -> 6, aggregation-strategy 4 -> 3, sort-strategy 9 -> 8, rendering 3 -> 4 (Q22 net -2); SF0.25 unchanged.
 
-- [ ] **M0145\-0008l — nestloop semi/anti costing follows
+- [x] **M0145\-0008l — nestloop semi/anti costing follows
   `final\_cost\_nestloop`**: goopg's `nestloopCost` \(cost\_funcs.go\) charges the
   full inner rescan for every outer row of a SEMI/ANTI \(or inner\-unique\)
   nested loop. PG's `final\_cost\_nestloop` \(costsize.c:3349\+\) has a branch
@@ -19645,6 +19645,20 @@ Movement: none — no plan moved on TPC-DS SF0.25/SF1 or TPC-H across all four d
   - Expected movement: TPC\-H Q22 `join\-method` / `parameterisation` \(NL anti
     elected\); check for Q21 / TPC\-DS NOT EXISTS moves with the fire\-set gate
     and ea\-ratchet.
+  - **DONE 2026\-09\-25.** Design:
+    `docs/design/0100-0149/m0145-0008l-nestloop-semi-anti-costing.md`;
+    evidence `analysis/m0145/m0145-0008l/`.
+    - Ported `compute\_semi\_anti\_join\_factors` \(once per pair\), the
+      SEMI/ANTI branch of `final\_cost\_nestloop` and `has\_indexed\_join\_quals`
+      into the plain, NLI and partial nested\-loop producers.
+    - TPC\-H Q4, Q21, Q22 leave `join\-method`; Q22 elects PG's Nested Loop
+      Anti Join \(cost 63,838 → 28,044; PG 13,200\). TPC\-DS SF0.25 Q64/Q94
+      moved \(no category change\), SF1 none. Values identical, no
+      introduced timeout.
+    - Gates: units, spotcheck, fire\-set \(SF0.25, SF1, TPC\-H\), sweep 96/96,
+      acceptance 24 MATCH, ea\-ratchet 52/52 \(acceptance and sweep ran with
+      FORCE=1: nightly batch live, values only\).
+    Movement: none — CATEGORIES-EXCL-MATCH TPC-H join-method 14 -> 11 (not beyond ±3); match counts unchanged.
 
 - [x] **M0145-0008c — recon: PG-shared attribution for the flip's NEW
   ea-ratchet key `Q95:cte:ws_wh+customer_address+date_dim+web_sales+

@@ -283,7 +283,7 @@ func TestJoinPathRowsComeFromChildPaths(t *testing.T) {
 		setCheapest(inner)
 
 		joinrel := newRelOptInfo(0b0011, 100, 16)
-		addNestLoopPath(joinrel, outer, inner, cp, parser.JoinInner, []*restrictInfo{{}}, uniqueSideNone, nil)
+		addNestLoopPath(joinrel, outer, inner, cp, parser.JoinInner, []*restrictInfo{{}}, uniqueSideNone, nil, semiAntiJoinFactors{})
 		return joinrel.Pathlist[0].Cost.Total
 	}
 

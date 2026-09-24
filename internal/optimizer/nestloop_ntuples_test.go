@@ -44,7 +44,7 @@ func nlCollapsedPair(t *testing.T, innerRows float64) *RelOptInfo {
 	joinRel := newRelOptInfo(RelSet(0b11), 1, 80)
 	keys := []*restrictInfo{{}, {}, {}, {}}
 	generateHashJoinPaths(joinRel, outer, inner, cp, parser.JoinInner, keys, nil, nil)
-	addNestLoopPath(joinRel, outer, inner, cp, parser.JoinInner, keys, uniqueSideNone, nil)
+	addNestLoopPath(joinRel, outer, inner, cp, parser.JoinInner, keys, uniqueSideNone, nil, semiAntiJoinFactors{})
 	setCheapest(joinRel)
 	return joinRel
 }
@@ -128,7 +128,7 @@ func TestNestLoopSurvivesForAClauselessPair(t *testing.T) {
 	inner := relWithScanCost(RelSet(0b10), 1000, 50)
 	joinRel := newRelOptInfo(RelSet(0b11), 1000000, 80)
 	// A cartesian pair: no keys, so addPathsToJoinrel would skip the hash arm.
-	addNestLoopPath(joinRel, outer, inner, cp, parser.JoinInner, nil, uniqueSideNone, nil)
+	addNestLoopPath(joinRel, outer, inner, cp, parser.JoinInner, nil, uniqueSideNone, nil, semiAntiJoinFactors{})
 	setCheapest(joinRel)
 
 	if joinRel.CheapestTotal == nil || joinRel.CheapestTotal.Kind != PathNestLoop {
