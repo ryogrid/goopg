@@ -264,8 +264,9 @@ func electOrderedGrouping(u *upperRels, agg *aggregateSurface, node Node, keys [
 	// aggregates.out agg_sort_order case). A winner rebuilt from the snapshot
 	// lacks that column, so the Sort's key would name a column the aggregate
 	// no longer emits, and the copy-back below would erase it from `agg.node`
-	// too. That panicked in assertSortInputTargetCoversKeys and took the whole
-	// server down. Grafting the column onto the winner is not safe either: its
+	// too. That panicked in assertSortInputTargetCoversKeys, which dropped the
+	// session (serveConn recovers it) where PG returns rows. Grafting the
+	// column onto the winner is not safe either: its
 	// child may be a narrowed or index-ordered input with remapped positions.
 	// So decline, and let the normal ordered arm sort over `agg.node` itself,
 	// which carries the passthrough.

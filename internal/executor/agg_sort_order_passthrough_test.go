@@ -8,7 +8,7 @@ import (
 // TestAggSortOrderPassthroughOrderBy pins M0145-0008h: the upstream
 // aggregates regress case (aggregates.out:3158, agg_sort_order) — `GROUP BY`
 // a primary key, `ORDER BY` a functionally dependent column — panicked the
-// planner (assertSortInputTargetCoversKeys) and took the whole server down.
+// planner (assertSortInputTargetCoversKeys), dropping the session.
 // The ORDER BY key appends the dependent column as an aggregate passthrough
 // AFTER the grouping paths were snapshotted, and electOrderedGrouping rebuilt
 // its winner from the snapshot, which lacks it. The loop now declines in that
