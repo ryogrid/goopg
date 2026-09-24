@@ -1,0 +1,19 @@
+Time: 2026-09-25 00:08:53 JST
+Duration: 12s, Total samples = 12650ms (105.41%)
+Showing nodes accounting for 9000ms, 71.15% of 12650ms total
+Dropped 103 nodes (cum <= 63.25ms)
+Showing top 15 nodes out of 84
+      flat  flat%   sum%        cum   cum%
+    2370ms 18.74% 18.74%     5350ms 42.29%  github.com/goopg/goopg/internal/executor.decodeRowRangeInfo
+    1490ms 11.78% 30.51%     4100ms 32.41%  github.com/goopg/goopg/internal/executor.cloneRowOwned
+    1100ms  8.70% 39.21%     2940ms 23.24%  github.com/goopg/goopg/internal/executor.decodePhysicalPGValueLowered
+     840ms  6.64% 45.85%      840ms  6.64%  runtime.memmove
+     500ms  3.95% 49.80%     1140ms  9.01%  github.com/goopg/goopg/internal/nodes.NumericInt64FromStoredPayload
+     450ms  3.56% 53.36%    11320ms 89.49%  github.com/goopg/goopg/internal/executor.(*seqScanOp).Next
+     350ms  2.77% 56.13%    12040ms 95.18%  github.com/goopg/goopg/internal/executor.(*aggregateOp).Open
+     340ms  2.69% 58.81%      340ms  2.69%  github.com/goopg/goopg/internal/utils/mmgr.(*Context).Bytes
+     280ms  2.21% 61.03%     1410ms 11.15%  github.com/goopg/goopg/internal/executor.Datum.MaterializeArena
+     270ms  2.13% 63.16%      270ms  2.13%  runtime.nextFreeFast (inline)
+     250ms  1.98% 65.14%      250ms  1.98%  runtime.(*fixalloc).alloc
+     240ms  1.90% 67.04%      380ms  3.00%  github.com/goopg/goopg/internal/utils/mmgr.(*Context).allocBytes
+     180ms  1.42% 68.46%      920ms  7.27%  github.com/goopg/goopg/internal/storage.PageGetHeapTupleInto

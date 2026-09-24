@@ -19539,7 +19539,7 @@ Movement: none — no plan moved on TPC-DS SF0.25/SF1 or TPC-H across all four d
       \(and the GC it drives\) → M0145\-0008k.
     Movement: none — executor only; sf025 plan shapes 99/99 unchanged; the acceptance-arm time moved (reported, not judged).
 
-- [ ] **M0145\-0008k — the seq scan allocates and copies a row per tuple where
+- [x] **M0145\-0008k — the seq scan allocates and copies a row per tuple where
   PG copies nothing**: at its retention boundary the scan allocates a
   full\-width row \(`acquireRow`\) and deep\-copies the survivor window for every
   visible tuple, because it releases the page lock before the parent reads
@@ -19555,6 +19555,52 @@ Movement: none — no plan moved on TPC-DS SF0.25/SF1 or TPC-H across all four d
     then decide whether a pin\-held slot \(copy on retention only\) is sound
     under goopg's page mutation paths \(HOT prune compaction, hint bits\).
     Expected movement: none on parity; acceptance\-arm scan\-heavy times.
+  - **DONE 2026\-09\-25 \(recon\).** Design:
+    `docs/design/0100-0149/m0145-0008k-seqscan-row-copy-recon.md`; evidence
+    `analysis/m0145/m0145-0008k/`.
+    - Inversion explained: `effectiveDeformBound` maps `deformBoundNone` to
+      FULL width, and a zero\-arm Aggregate \(`count\(\*\)`\) leaves the bound at
+      `deformBoundNone`, so the query that reads no column deforms and clones
+      all 16 \(`decodeScanRow` 5.5 s \+ `cloneRowOwned` 4.1 s cumulative\).
+      A throwaway probe \(bound 0\) took serial `count\(\*\)` 4.8 s → 1.55 s
+      and parallel 1.76 → 0.61 s, values unchanged → M0145\-0008p.
+    - Pin\-held slot: UNSOUND today. All three goopg compaction paths
+      \(opportunistic prune, VACUUM, IOS on\-access prune\) compact under the
+      exclusive content lock alone; PG requires a cleanup lock \(pin count
+      1, pruneheap.c:245, vacuumlazy.c:1343\) → M0145\-0008q, then the
+      zero\-copy slot.
+    Movement: none — recon.
+
+- [ ] **M0145\-0008p — a scan under a zero\-consumer aggregate deforms and
+  copies nothing** \(filed 2026\-09\-25 by M0145\-0008k\). `deformBoundBelow`'s
+  Aggregate arm returns `deformBoundNone` when no arm folds a reference
+  \(`count\(\*\)`\), and `effectiveDeformBound` maps that to full width. Add a
+  distinct "zero columns consumed" bound; make the seq scan's survivor window
+  0 \(skip deform and the retention clone; visibility and the prefilter path
+  unchanged\); audit the index / bitmap leaf stamps and the parallel worker
+  closure; pin with the EX1 tail\-poison test harness.
+  Kind: impl
+  Parent: M0145-0008k
+  - Expected movement: none on parity \(executor only\); serial `count\(\*\)`
+    over TPC\-H lineitem 4.8 s → ~1.5 s \(probe\), parallel 1.76 → ~0.6 s;
+    acceptance\-arm times on count\(\*\)\-shaped queries.
+
+- [ ] **M0145\-0008q — page compaction takes a cleanup lock \(pin count 1\),
+  as PG's does** \(filed 2026\-09\-25 by M0145\-0008k\). goopg compacts heap
+  pages under the exclusive content lock alone in the opportunistic prune
+  \(`PagePruneOpt`\), VACUUM \(`PageVacuumPrune`\) and the index\-only
+  on\-access prune. PG requires a cleanup lock:
+  `ConditionalLockBufferForCleanup` in `heap\_page\_prune\_opt`
+  \(pruneheap.c:245\), which skips a pinned page, and
+  `LockBufferForCleanup` in VACUUM \(vacuumlazy.c:1343/1373\). Port the pair
+  onto the buffer pool's pin count and take it at every compaction site.
+  This is the prerequisite for a pin\-held \(zero\-copy\) scan slot.
+  Kind: impl
+  Parent: M0145-0008k
+  - Expected movement: none on parity; enables the zero\-copy slot
+    \(retention clone only at Sort / Hash build / Material, PG's
+    `ExecMaterializeSlot` point\). Gates: isolation family \(prune vs
+    concurrent scan\), race gate, pgbench.
 
 - [x] **M0145\-0008g — `expr = ANY \(const list\)` with an expression operand is
   estimated as PG does**: PG prices `substr\(c\_phone,1,2\) IN \(7 values\)` at
