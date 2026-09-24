@@ -100,12 +100,12 @@ func BuildDefaultRegistry() *Registry {
 	}))
 	r.MustRegister(NewVariable(Variable{
 		Name: "is_superuser", Type: TypeBool, BootVal: "off",
-		Context: ContextInternal, Flags: FlagReport | FlagDisallowInFile,
+		Context: ContextInternal, Flags: FlagReport | FlagDisallowInFile | FlagNoShowAll,
 		Scope: ScopeSession,
 	}))
 	r.MustRegister(NewVariable(Variable{
 		Name: "session_authorization", Type: TypeString, BootVal: "",
-		Context: ContextUserset, Flags: FlagReport,
+		Context: ContextUserset, Flags: FlagReport | FlagNoShowAll,
 		Scope: ScopeSession,
 	}))
 	r.MustRegister(NewVariable(Variable{
@@ -228,6 +228,7 @@ func BuildDefaultRegistry() *Registry {
 		EnumOptions: []string{"md5", "scram-sha-256"},
 		Context:     ContextUserset, Scope: ScopeSession | ScopeTransaction,
 	}))
+	registerSSLGUCs(r)
 	r.MustRegister(NewVariable(Variable{
 		// Upstream models this as an int parsed with strtol(..., base 0)
 		// and *displayed* in octal by show_log_file_mode (guc_tables.c:2556),
@@ -969,8 +970,8 @@ func BuildDefaultRegistry() *Registry {
 	// default_with_oids — removed in PG12, retained as a recognised no-op.
 	r.MustRegister(NewVariable(Variable{
 		Name: "default_with_oids", Type: TypeBool, BootVal: "off",
-		Context: ContextUserset,
-		Scope:   ScopeSession | ScopeTransaction,
+		Context: ContextUserset, Flags: FlagNoShowAll,
+		Scope: ScopeSession | ScopeTransaction,
 	}))
 	// allow_in_place_tablespaces — developer/regression option permitting
 	// CREATE TABLESPACE ... LOCATION '' to create an in-place tablespace directly
@@ -1598,6 +1599,73 @@ func checkFileMode(value string) error {
 	}
 	if n < 0 || n > 0o777 {
 		return fmt.Errorf("value %s out of range [0000, 0777]", value)
+	}
+	return nil
+}
+
+// registerSSLGUCs registers the CONN_AUTH_SSL family (plus ssl_library and
+// ssl_renegotiation_limit) as guc_tables.c defines it for a build WITHOUT
+// USE_SSL — the configuration of the PG 18.3 oracle under ./postgres, and of
+// goopg, which answers every SSLRequest with 'N'. Boot values are the
+// #ifndef USE_SSL arms: ssl_ciphers and ssl_groups are "none", ssl_library
+// is empty. Design: docs/design/0100-0149/0122-0008-ssl-guc-family-nossl-build.md.
+func registerSSLGUCs(r *Registry) {
+	sighup := func(name string, typ Type, boot string) Variable {
+		return Variable{Name: name, Type: typ, BootVal: boot, Context: ContextSigHup, Scope: ScopeServer}
+	}
+	ssl := sighup("ssl", TypeBool, "off")
+	ssl.CheckFn = checkSSL
+	r.MustRegister(NewVariable(ssl))
+	for _, s := range []struct{ name, boot string }{
+		{"ssl_ca_file", ""},
+		{"ssl_cert_file", "server.crt"},
+		{"ssl_ciphers", "none"},
+		{"ssl_crl_dir", ""},
+		{"ssl_crl_file", ""},
+		{"ssl_dh_params_file", ""},
+		{"ssl_groups", "none"},
+		{"ssl_key_file", "server.key"},
+		{"ssl_passphrase_command", ""},
+		{"ssl_tls13_ciphers", ""},
+	} {
+		r.MustRegister(NewVariable(sighup(s.name, TypeString, s.boot)))
+	}
+	r.MustRegister(NewVariable(sighup("ssl_passphrase_command_supports_reload", TypeBool, "off")))
+	r.MustRegister(NewVariable(sighup("ssl_prefer_server_ciphers", TypeBool, "on")))
+	// ssl_protocol_versions_info; the minimum omits its PG_TLS_ANY ("") row.
+	minProto := sighup("ssl_min_protocol_version", TypeEnum, "TLSv1.2")
+	minProto.EnumOptions = []string{"TLSv1", "TLSv1.1", "TLSv1.2", "TLSv1.3"}
+	r.MustRegister(NewVariable(minProto))
+	maxProto := sighup("ssl_max_protocol_version", TypeEnum, "")
+	maxProto.EnumOptions = []string{"", "TLSv1", "TLSv1.1", "TLSv1.2", "TLSv1.3"}
+	r.MustRegister(NewVariable(maxProto))
+	r.MustRegister(NewVariable(Variable{
+		Name: "ssl_library", Type: TypeString, BootVal: "",
+		Context: ContextInternal, Flags: FlagDisallowInFile | FlagNotInSample,
+		Scope: ScopeServer,
+	}))
+	// A compatibility stub: renegotiation was removed, and the only
+	// accepted value is 0. MinVal = MaxVal = 0 reads as "unbounded" to the
+	// int canonicaliser, so the 0..0 range lives in a CheckFn.
+	r.MustRegister(NewVariable(Variable{
+		Name: "ssl_renegotiation_limit", Type: TypeInt, BootVal: "0",
+		Context: ContextUserset,
+		Flags:   FlagNoShowAll | FlagNotInSample | FlagDisallowInFile,
+		Scope:   ScopeSession | ScopeTransaction,
+		CheckFn: func(value string) error {
+			if value != "0" {
+				return &ValidationError{Msg: fmt.Sprintf(
+					"%s is outside the valid range for parameter \"ssl_renegotiation_limit\" (0 .. 0)", value)}
+			}
+			return nil
+		},
+	}))
+}
+
+// checkSSL is commands/variable.c check_ssl for a build without USE_SSL.
+func checkSSL(value string) error {
+	if value == "on" {
+		return &ValidationError{Msg: "SSL is not supported by this build"}
 	}
 	return nil
 }

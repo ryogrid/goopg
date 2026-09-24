@@ -42,6 +42,27 @@
 #password_encryption = 'scram-sha-256'  # md5 | scram-sha-256; accepted,
                                         # verifier form follows pg_hba
 
+# - SSL -
+# This build has no SSL support, like a PostgreSQL built without
+# --with-ssl: setting ssl to on is rejected, and ssl_ciphers and
+# ssl_groups default to 'none'.
+
+#ssl = off
+#ssl_ca_file = ''
+#ssl_cert_file = 'server.crt'
+#ssl_crl_file = ''
+#ssl_crl_dir = ''
+#ssl_key_file = 'server.key'
+#ssl_ciphers = 'none'                   # allowed TLSv1.2 ciphers
+#ssl_tls13_ciphers = ''                 # allowed TLSv1.3 cipher suites, blank for default
+#ssl_prefer_server_ciphers = on
+#ssl_groups = 'none'
+#ssl_min_protocol_version = 'TLSv1.2'
+#ssl_max_protocol_version = ''
+#ssl_dh_params_file = ''
+#ssl_passphrase_command = ''
+#ssl_passphrase_command_supports_reload = off
+
 
 #------------------------------------------------------------------------------
 # RESOURCE USAGE (except WAL)
