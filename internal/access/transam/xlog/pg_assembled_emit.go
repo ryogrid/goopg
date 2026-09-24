@@ -483,11 +483,13 @@ const sizeOfXLogHeapPruneData = 2
 // prune (opportunistic or VACUUM-scan). Main data is {reason=0, flags}; block 0
 // carries the redirection pairs (XLHP_HAS_REDIRECTIONS: ntargets + u2[2*n], each
 // pair = old-slot, target-slot, matching goopg's [2]uint16 redirects exactly)
-// followed by the now-unused slots (XLHP_HAS_NOW_UNUSED_ITEMS: ntargets + u2[n]).
-// goopg reclaims LP_DEAD items directly, so there is no XLHP_HAS_DEAD_ITEMS.
+// then the now-dead slots (XLHP_HAS_DEAD_ITEMS: ntargets + u2[n]; items left
+// LP_DEAD because an index entry still points at them, M0145-0008v), then the
+// now-unused slots (XLHP_HAS_NOW_UNUSED_ITEMS: ntargets + u2[n]), in PG's
+// sub-record order.
 // opcode = XLOG_HEAP2_PRUNE_ON_ACCESS; xl_xid = 0 (pruning is not transactional
 // user-data).
-func EncodeHeapPruneOptPG(rel storage.RelFileNode, blk storage.BlockNumber, redirects [][2]uint16, unused []uint16) ([]byte, error) {
+func EncodeHeapPruneOptPG(rel storage.RelFileNode, blk storage.BlockNumber, redirects [][2]uint16, dead, unused []uint16) ([]byte, error) {
 	// XLHP_CLEANUP_LOCK unconditionally: goopg's prune redirects chain roots
 	// and reclaims slots that still have storage, which is precisely the
 	// full-prune shape upstream refuses to replay without this flag. See the
@@ -500,6 +502,13 @@ func EncodeHeapPruneOptPG(rel storage.RelFileNode, blk storage.BlockNumber, redi
 		for _, r := range redirects {
 			blockData = binary.LittleEndian.AppendUint16(blockData, r[0])
 			blockData = binary.LittleEndian.AppendUint16(blockData, r[1])
+		}
+	}
+	if len(dead) > 0 {
+		flags |= xlhpHasDeadItems
+		blockData = binary.LittleEndian.AppendUint16(blockData, uint16(len(dead)))
+		for _, d := range dead {
+			blockData = binary.LittleEndian.AppendUint16(blockData, d)
 		}
 	}
 	if len(unused) > 0 {

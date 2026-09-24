@@ -54,7 +54,7 @@ func pruneHeapPageOnAccess(ctx *Context, slot *storage.Slot, tbl *catalog.Table,
 		return
 	}
 	result, err := storage.PagePruneOpt(slot.Page(), horizon)
-	if err != nil || len(result.Redirects)+len(result.Unused) == 0 {
+	if err != nil || result.Reclaimed() == 0 {
 		return
 	}
 	_ = markHeapPruneOptDirty(ctx.Pool, slot, rel, blk, result)

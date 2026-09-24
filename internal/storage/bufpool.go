@@ -823,8 +823,9 @@ type LogHeapHotUpdateFunc func(rel RelFileNode, blk BlockNumber, oldSlot, newSlo
 // new version lands at (newBlk, newSlot); oldBlk may equal newBlk.
 type LogHeapUpdateFunc func(rel RelFileNode, oldBlk BlockNumber, oldSlot uint16, newBlk BlockNumber, newSlot uint16, xmax TransactionID, tupleBytes []byte) (LSN, error)
 
-// LogHeapPruneOptFunc emits one opportunistic page-pruning redo record.
-type LogHeapPruneOptFunc func(rel RelFileNode, blk BlockNumber, redirects [][2]uint16, unused []uint16) (LSN, error)
+// LogHeapPruneOptFunc emits one page-pruning redo record: the redirected, the
+// now-LP_DEAD and the now-unused line pointers (PruneResult's three lists).
+type LogHeapPruneOptFunc func(rel RelFileNode, blk BlockNumber, redirects [][2]uint16, dead, unused []uint16) (LSN, error)
 
 // NewPool allocates a Pool of cfg.Slots fixed buffers backed by a
 // Go-heap arena.

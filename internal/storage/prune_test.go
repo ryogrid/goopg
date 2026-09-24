@@ -33,9 +33,10 @@ func TestPagePruneOptBasic(t *testing.T) {
 	if err != nil {
 		t.Fatalf("PagePruneOpt: %v", err)
 	}
-	// Dead tuple is a standalone delete (no HOT flags) → marked unused.
-	if len(result.Unused) != 1 || result.Unused[0] != 1 {
-		t.Errorf("expected Unused=[1], got %v", result.Unused)
+	// Dead tuple is a standalone delete (no HOT flags): an index entry may
+	// point at it, so it becomes LP_DEAD, not LP_UNUSED (M0145-0008v).
+	if len(result.Dead) != 1 || result.Dead[0] != 1 || len(result.Unused) != 0 {
+		t.Errorf("expected Dead=[1] Unused=[], got %+v", result)
 	}
 	if len(result.Redirects) != 0 {
 		t.Errorf("expected no redirects, got %v", result.Redirects)
@@ -49,8 +50,8 @@ func TestPagePruneOptBasic(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if item.Flags != ItemIDUnused {
-		t.Errorf("slot 1 should be ItemIDUnused after prune, got flags=%d", item.Flags)
+	if item.Flags != ItemIDDead || item.Offset != 0 || item.Length != 0 {
+		t.Errorf("slot 1 should be LP_DEAD with no storage after prune, got %+v", item)
 	}
 
 	got, err := PageGetHeapTuple(page, 2)
@@ -267,7 +268,7 @@ func TestPagePruneOptMultiXactXmax(t *testing.T) {
 		t.Cleanup(func() { ResolveMultiUpdater = prev })
 	}
 
-	pruned := func(r PruneResult) bool { return len(r.Unused)+len(r.Redirects) != 0 }
+	pruned := func(r PruneResult) bool { return r.Reclaimed() != 0 }
 
 	t.Run("updater older than horizon -> dead, pruned", func(t *testing.T) {
 		page := build(t)
@@ -281,8 +282,8 @@ func TestPagePruneOptMultiXactXmax(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if len(result.Unused) != 1 || result.Unused[0] != 1 {
-			t.Errorf("updater older than horizon must be pruned, got %+v", result)
+		if len(result.Dead) != 1 || result.Dead[0] != 1 {
+			t.Errorf("updater older than horizon must be pruned to LP_DEAD, got %+v", result)
 		}
 	})
 
@@ -450,10 +451,77 @@ func TestPagePruneOptStopsAtNonHOTChainEnd(t *testing.T) {
 	if len(result.Redirects) != 0 {
 		t.Errorf("chain ends at a non-HOT successor: expected no redirect, got %v", result.Redirects)
 	}
-	if len(result.Unused) != 2 || result.Unused[0] != 1 || result.Unused[1] != 2 {
-		t.Errorf("expected Unused=[1 2], got %v", result.Unused)
+	// The indexed root becomes LP_DEAD (its index entry still points at it);
+	// the dead HEAP_ONLY member has no index entry and becomes LP_UNUSED.
+	if len(result.Dead) != 1 || result.Dead[0] != 1 || len(result.Unused) != 1 || result.Unused[0] != 2 {
+		t.Errorf("expected Dead=[1] Unused=[2], got %+v", result)
 	}
 	if got, err := PageGetHeapTuple(page, 3); err != nil || string(got.Data) != "othr" {
 		t.Errorf("unrelated live row must survive: data=%q err=%v", got.Data, err)
 	}
+}
+
+// TestPruneLPDeadLifecycleArms pins the M0145-0008v arms of pagePruneCore: a
+// redirect root whose whole chain died becomes LP_DEAD (it used to be left as
+// a stale redirect), markUnusedNow turns would-be LP_DEAD items into
+// LP_UNUSED, and PageDeadItems lists the LP_DEAD items VACUUM must hand to
+// index cleanup.
+func TestPruneLPDeadLifecycleArms(t *testing.T) {
+	saved := XidCommitted
+	XidCommitted = func(TransactionID) bool { return true }
+	defer func() { XidCommitted = saved }()
+	const deadXID, horizon = TransactionID(5), TransactionID(10)
+
+	build := func(t *testing.T) Page {
+		t.Helper()
+		p := make(Page, BlockSize)
+		if err := InitPage(p); err != nil {
+			t.Fatal(err)
+		}
+		// Slot 1: an indexed root, HOT-updated to slot 2, both dead.
+		root := NewHeapTuple(1, deadXID, []byte("root"))
+		root.Header.SetHotUpdated()
+		root.Header.CTID = ItemPointer{Block: 0, Offset: 2}
+		if _, err := PageAddHeapTuple(p, root); err != nil {
+			t.Fatal(err)
+		}
+		tip := NewHeapTuple(deadXID, deadXID, []byte("tip."))
+		tip.Header.SetHeapOnly()
+		if _, err := PageAddHeapTuple(p, tip); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+
+	t.Run("dead-redirect-root", func(t *testing.T) {
+		p := build(t)
+		// Turn the root into a redirect to the (now dead) tip, as an earlier
+		// prune would have left it.
+		if err := PageSetItemIDRedirect(p, 1, 2); err != nil {
+			t.Fatal(err)
+		}
+		r, _, err := PageVacuumPrune(p, horizon, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(r.Dead) != 1 || r.Dead[0] != 1 || len(r.Unused) != 1 || r.Unused[0] != 2 {
+			t.Fatalf("want Dead=[1] Unused=[2], got %+v", r)
+		}
+		if dead, _ := PageDeadItems(p); len(dead) != 1 || dead[0] != 1 {
+			t.Fatalf("PageDeadItems = %v, want [1]", dead)
+		}
+	})
+	t.Run("mark-unused-now", func(t *testing.T) {
+		p := build(t)
+		r, _, err := PageVacuumPrune(p, horizon, true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(r.Dead) != 0 || len(r.Unused) != 2 {
+			t.Fatalf("markUnusedNow: want Unused=[1 2] Dead=[], got %+v", r)
+		}
+		if dead, _ := PageDeadItems(p); len(dead) != 0 {
+			t.Fatalf("markUnusedNow left LP_DEAD items %v", dead)
+		}
+	})
 }

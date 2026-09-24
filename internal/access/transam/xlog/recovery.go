@@ -5297,9 +5297,9 @@ const sizeOfXLHPFreezePlan = 11
 // trailing offset array). Sub-records appear in flag order — freeze plans,
 // redirections, dead items (skipped; goopg has none), now-unused — with the
 // freeze offset array trailing after all of them.
-func decodeXLogHeapPrune(mainData, blockData []byte) (redirects [][2]uint16, unused, frozenSlots []uint16, err error) {
+func decodeXLogHeapPrune(mainData, blockData []byte) (redirects [][2]uint16, dead, unused, frozenSlots []uint16, err error) {
 	if len(mainData) < sizeOfXLogHeapPruneData {
-		return nil, nil, nil, fmt.Errorf("wal: invalid xlog heap-prune main-data len %d (want >= %d)", len(mainData), sizeOfXLogHeapPruneData)
+		return nil, nil, nil, nil, fmt.Errorf("wal: invalid xlog heap-prune main-data len %d (want >= %d)", len(mainData), sizeOfXLogHeapPruneData)
 	}
 	flags := mainData[1]
 	off := 0
@@ -5316,14 +5316,14 @@ func decodeXLogHeapPrune(mainData, blockData []byte) (redirects [][2]uint16, unu
 	if flags&xlhpHasFreezePlans != 0 {
 		nplans, e := read16()
 		if e != nil {
-			return nil, nil, nil, e
+			return nil, nil, nil, nil, e
 		}
 		if _, e = read16(); e != nil { // pad2
-			return nil, nil, nil, e
+			return nil, nil, nil, nil, e
 		}
 		for i := 0; i < int(nplans); i++ {
 			if off+sizeOfXLHPFreezePlan > len(blockData) {
-				return nil, nil, nil, fmt.Errorf("wal: truncated xlog heap-prune freeze plan")
+				return nil, nil, nil, nil, fmt.Errorf("wal: truncated xlog heap-prune freeze plan")
 			}
 			ntuples := binary.LittleEndian.Uint16(blockData[off+9 : off+11])
 			nFreezeTuples += int(ntuples)
@@ -5333,17 +5333,17 @@ func decodeXLogHeapPrune(mainData, blockData []byte) (redirects [][2]uint16, unu
 	if flags&xlhpHasRedirections != 0 {
 		n, e := read16()
 		if e != nil {
-			return nil, nil, nil, e
+			return nil, nil, nil, nil, e
 		}
 		redirects = make([][2]uint16, n)
 		for i := range redirects {
 			a, e := read16()
 			if e != nil {
-				return nil, nil, nil, e
+				return nil, nil, nil, nil, e
 			}
 			b, e := read16()
 			if e != nil {
-				return nil, nil, nil, e
+				return nil, nil, nil, nil, e
 			}
 			redirects[i] = [2]uint16{a, b}
 		}
@@ -5351,24 +5351,27 @@ func decodeXLogHeapPrune(mainData, blockData []byte) (redirects [][2]uint16, unu
 	if flags&xlhpHasDeadItems != 0 {
 		n, e := read16()
 		if e != nil {
-			return nil, nil, nil, e
+			return nil, nil, nil, nil, e
 		}
-		for i := 0; i < int(n); i++ { // goopg reclaims directly — nothing to do with LP_DEAD
-			if _, e := read16(); e != nil {
-				return nil, nil, nil, e
+		dead = make([]uint16, n)
+		for i := range dead {
+			v, e := read16()
+			if e != nil {
+				return nil, nil, nil, nil, e
 			}
+			dead[i] = v
 		}
 	}
 	if flags&xlhpHasNowUnusedItems != 0 {
 		n, e := read16()
 		if e != nil {
-			return nil, nil, nil, e
+			return nil, nil, nil, nil, e
 		}
 		unused = make([]uint16, n)
 		for i := range unused {
 			v, e := read16()
 			if e != nil {
-				return nil, nil, nil, e
+				return nil, nil, nil, nil, e
 			}
 			unused[i] = v
 		}
@@ -5378,12 +5381,12 @@ func decodeXLogHeapPrune(mainData, blockData []byte) (redirects [][2]uint16, unu
 		for i := range frozenSlots {
 			v, e := read16()
 			if e != nil {
-				return nil, nil, nil, e
+				return nil, nil, nil, nil, e
 			}
 			frozenSlots[i] = v
 		}
 	}
-	return redirects, unused, frozenSlots, nil
+	return redirects, dead, unused, frozenSlots, nil
 }
 
 // replayDecodedXLogHeapPrune applies a PG xl_heap_prune to block 0's page:
@@ -5400,7 +5403,7 @@ func replayDecodedXLogHeapPrune(mgr *storage.Manager, r Record, xlog *XLogDecode
 	if block.HasImage && block.ImageApply {
 		return restoreDecodedXLogBlockImage(mgr, block, storage.LSN(r.EndLSN))
 	}
-	redirects, unused, frozenSlots, err := decodeXLogHeapPrune(xlog.MainData, block.Data)
+	redirects, dead, unused, frozenSlots, err := decodeXLogHeapPrune(xlog.MainData, block.Data)
 	if err != nil {
 		return err
 	}
@@ -5436,8 +5439,11 @@ func replayDecodedXLogHeapPrune(mgr *storage.Manager, r Record, xlog *XLogDecode
 	// the cluster unstartable after a crash under write load. The native
 	// replayHeapPruneOpt below always compacts; this PG-format arm (A7) had
 	// drifted from both siblings.
-	if len(redirects) > 0 || len(unused) > 0 {
-		if _, err := storage.VacuumHeapPageBySlots(page, unused); err != nil {
+	// The now-dead items go through the same compaction as the runtime
+	// prune (storage.PruneHeapPageBySlots), so redo leaves them LP_DEAD with
+	// no storage exactly as pagePruneCore did (M0145-0008v).
+	if len(redirects) > 0 || len(dead) > 0 || len(unused) > 0 {
+		if _, err := storage.PruneHeapPageBySlots(page, unused, dead); err != nil {
 			return fmt.Errorf("wal: xlog heap-prune compact: %w", err)
 		}
 		storage.MustHeader(page).SetPruneXID(0)

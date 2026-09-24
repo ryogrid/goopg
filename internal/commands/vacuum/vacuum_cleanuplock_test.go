@@ -93,3 +93,36 @@ func TestVacuumPinnedPageAggressiveWaitsForCleanupLock(t *testing.T) {
 		t.Fatalf("stats=%+v want Dead=1 Live=1 SkippedPinned=0", stats)
 	}
 }
+
+// TestVacuumCollectsPreexistingLPDeadItems pins lazy_scan_prune's
+// deadoffsets (M0145-0008v): a tuple an on-access prune already left LP_DEAD
+// still has an index entry, so VACUUM must hand its TID to index cleanup even
+// though its own prune finds nothing left to do on the page.
+func TestVacuumCollectsPreexistingLPDeadItems(t *testing.T) {
+	pool, _, rel, cleanup := newRel(t)
+	defer cleanup()
+	mvccMgr, deadSlot := cleanupLockFixture(t, pool, rel)
+
+	s, err := pool.Pin(storage.BufferTag{Rel: rel, Block: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Lock()
+	h := storage.MustHeader(s.Page())
+	h.SetPruneXID(1)
+	r, err := storage.PagePruneOpt(s.Page(), mvccMgr.OldestXmin())
+	s.Unlock()
+	pool.Unpin(s)
+	if err != nil || len(r.Dead) != 1 || r.Dead[0] != deadSlot {
+		t.Fatalf("on-access prune = %+v, %v; want Dead=[%d]", r, err, deadSlot)
+	}
+
+	stats, err := VacuumWithOptions(pool, mvccMgr, rel, VacuumOptions{})
+	if err != nil {
+		t.Fatalf("VacuumWithOptions: %v", err)
+	}
+	want := storage.ItemPointer{Block: 0, Offset: deadSlot}
+	if len(stats.DeadTIDs) != 1 || stats.DeadTIDs[0] != want {
+		t.Fatalf("DeadTIDs = %v, want [%v]", stats.DeadTIDs, want)
+	}
+}

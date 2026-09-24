@@ -3797,7 +3797,7 @@ func markHeapPruneOptDirty(
 		return nil
 	}
 	return pool.MarkDirtyChangeRecord(slot, func() (storage.LSN, error) {
-		return logPrune(rel, blk, result.Redirects, result.Unused)
+		return logPrune(rel, blk, result.Redirects, result.Dead, result.Unused)
 	})
 }
 
@@ -4421,7 +4421,7 @@ func tryApplyHOTUpdate(
 		if ctx.EnableOpportunisticPrune && ctx.TxnMgr != nil && ctx.Pool.IsCleanupOK(s) {
 			oldestXmin := ctx.TxnMgr.OldestXmin()
 			result, pruneErr := storage.PagePruneOpt(s.Page(), oldestXmin)
-			if pruneErr == nil && (len(result.Redirects)+len(result.Unused)) > 0 {
+			if pruneErr == nil && result.Reclaimed() > 0 {
 				// Emit WAL for the prune BEFORE the HOT-insert WAL so replay
 				// restores space first.
 				if pderr := markHeapPruneOptDirty(ctx.Pool, s, rel, blk, result); pderr == nil {

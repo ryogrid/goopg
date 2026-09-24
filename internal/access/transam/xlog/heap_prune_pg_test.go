@@ -7,16 +7,17 @@ import (
 	"github.com/goopg/goopg/internal/storage"
 )
 
-// TestEncodeHeapPruneOptPGRoundTrip drives a prune (redirects + now-unused)
-// through the real encode + decode path and asserts the record is a PG
-// xl_heap_prune (RM_HEAP2 / PRUNE_ON_ACCESS) whose block-0 sub-records decode
-// back to the same redirect pairs and unused slots.
+// TestEncodeHeapPruneOptPGRoundTrip drives a prune (redirects + now-dead +
+// now-unused) through the real encode + decode path and asserts the record is
+// a PG xl_heap_prune (RM_HEAP2 / PRUNE_ON_ACCESS) whose block-0 sub-records
+// decode back to the same redirect pairs, dead items and unused slots.
 func TestEncodeHeapPruneOptPGRoundTrip(t *testing.T) {
 	rel := storage.RelFileNode{DBOid: 1, RelOid: 44, Fork: storage.MainFork}
 	redirects := [][2]uint16{{1, 3}, {4, 6}}
+	dead := []uint16{7, 8}
 	unused := []uint16{2, 5}
 
-	framed, err := EncodeHeapPruneOptPG(rel, 7, redirects, unused)
+	framed, err := EncodeHeapPruneOptPG(rel, 7, redirects, dead, unused)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -42,9 +43,15 @@ func TestEncodeHeapPruneOptPGRoundTrip(t *testing.T) {
 		t.Fatalf("block ref rel/blk = %+v/%d", block.Rel, block.Block)
 	}
 
-	gotR, gotU, gotF, err := decodeXLogHeapPrune(dec.XLog.MainData, block.Data)
+	if flags := dec.XLog.MainData[1]; flags&xlhpHasDeadItems == 0 {
+		t.Fatalf("flags %#x lack XLHP_HAS_DEAD_ITEMS", flags)
+	}
+	gotR, gotD, gotU, gotF, err := decodeXLogHeapPrune(dec.XLog.MainData, block.Data)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(gotD, dead) {
+		t.Fatalf("dead = %v, want %v", gotD, dead)
 	}
 	if !reflect.DeepEqual(gotR, redirects) {
 		t.Fatalf("redirects = %v, want %v", gotR, redirects)

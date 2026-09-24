@@ -689,11 +689,11 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	// Opportunistic page-pruning change record (M0046-0002). Carries
 	// the freed slot list so replay can deterministically reclaim the
 	// same dead slots without re-running the isDead predicate.
-	logHeapPruneOpt := func(rel storage.RelFileNode, blk storage.BlockNumber, redirects [][2]uint16, unused []uint16) (storage.LSN, error) {
+	logHeapPruneOpt := func(rel storage.RelFileNode, blk storage.BlockNumber, redirects [][2]uint16, dead, unused []uint16) (storage.LSN, error) {
 		// A7: emit a PostgreSQL xl_heap_prune (RM_HEAP2) record with the redirect
 		// + now-unused sub-records instead of the goopg-native body. Recovery
 		// routes it to replayDecodedXLogHeapPrune.
-		payload, err := xlog.EncodeHeapPruneOptPG(rel, blk, redirects, unused)
+		payload, err := xlog.EncodeHeapPruneOptPG(rel, blk, redirects, dead, unused)
 		if err != nil {
 			return 0, err
 		}

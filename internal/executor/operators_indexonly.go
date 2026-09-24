@@ -499,8 +499,8 @@ func (o *indexOnlyScanOp) pruneTouchedTempPages(ctx *Context, heapRel storage.Re
 			ctx.Pool.Unpin(slot)
 			continue
 		}
-		pr, _, perr := storage.PageVacuumPrune(page, horizon)
-		if perr != nil || (len(pr.Redirects) == 0 && len(pr.Unused) == 0) {
+		pr, _, perr := storage.PageVacuumPrune(page, horizon, false)
+		if perr != nil || pr.Reclaimed() == 0 {
 			slot.Unlock()
 			ctx.Pool.Unpin(slot)
 			continue
@@ -508,7 +508,7 @@ func (o *indexOnlyScanOp) pruneTouchedTempPages(ctx *Context, heapRel storage.Re
 		if logPrune != nil {
 			blkCopy := blk
 			_ = ctx.Pool.MarkDirtyChangeRecord(slot, func() (storage.LSN, error) {
-				return logPrune(heapRel, blkCopy, pr.Redirects, pr.Unused)
+				return logPrune(heapRel, blkCopy, pr.Redirects, pr.Dead, pr.Unused)
 			})
 		} else {
 			ctx.Pool.MarkDirty(slot)

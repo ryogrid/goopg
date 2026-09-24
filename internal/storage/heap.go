@@ -1155,6 +1155,17 @@ func CollectDeadHeapSlots(p Page, isDead func(HeapTupleHeader) bool) ([]uint16, 
 // any out-of-range or non-LP_NORMAL entry returns an error and the
 // page is left untouched.
 func VacuumHeapPageBySlots(p Page, deadSlots []uint16) (HeapPageVacuumStats, error) {
+	return PruneHeapPageBySlots(p, deadSlots, nil)
+}
+
+// PruneHeapPageBySlots is VacuumHeapPageBySlots with a second set: the
+// LP_NORMAL or LP_REDIRECT items in lpDead become ItemIDDead with no storage
+// (PG's ItemIdSetDead, pruneheap.c heap_page_prune_execute), while the ones
+// in unusedSlots become ItemIDUnused. Both lose their tuple bodies in the
+// repack. An LP_DEAD item keeps its offset number because index entries
+// still point at it (M0145-0008v).
+func PruneHeapPageBySlots(p Page, unusedSlots, lpDead []uint16) (HeapPageVacuumStats, error) {
+	deadSlots := unusedSlots
 	h, err := Header(p)
 	if err != nil {
 		return HeapPageVacuumStats{}, err
@@ -1170,6 +1181,13 @@ func VacuumHeapPageBySlots(p Page, deadSlots []uint16) (HeapPageVacuumStats, err
 		}
 		deadSet[int(s)-1] = struct{}{}
 	}
+	lpDeadSet := make(map[int]struct{}, len(lpDead))
+	for _, s := range lpDead {
+		if s == 0 || int(s) > count {
+			return HeapPageVacuumStats{}, fmt.Errorf("%w: LP_DEAD slot %d out of range (count=%d)", ErrInvalidSlot, s, count)
+		}
+		lpDeadSet[int(s)-1] = struct{}{}
+	}
 	type live struct {
 		idx  int
 		body []byte
@@ -1180,6 +1198,18 @@ func VacuumHeapPageBySlots(p Page, deadSlots []uint16) (HeapPageVacuumStats, err
 		item, err := readItemID(p, idx)
 		if err != nil {
 			return HeapPageVacuumStats{}, err
+		}
+		if _, isLPDead := lpDeadSet[idx]; isLPDead {
+			// A redirect root whose chain died, or a dead LP_NORMAL
+			// tuple: no storage from here on.
+			if item.Flags != ItemIDNormal && item.Flags != ItemIDRedirect {
+				continue
+			}
+			if err := writeItemID(p, idx, ItemID{Flags: ItemIDDead}); err != nil {
+				return HeapPageVacuumStats{}, err
+			}
+			stats.Dead++
+			continue
 		}
 		if item.Flags != ItemIDNormal {
 			continue

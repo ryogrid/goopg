@@ -52,7 +52,7 @@ func BenchmarkPagePruneOpt(b *testing.B) {
 	b.ReportAllocs()
 	for b.Loop() {
 		copy(scratch, p)
-		if _, _, err := pagePruneCore(scratch, TransactionID(50)); err != nil {
+		if _, _, err := pagePruneCore(scratch, TransactionID(50), false); err != nil {
 			b.Fatal(err)
 		}
 	}

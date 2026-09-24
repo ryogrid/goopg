@@ -2364,6 +2364,11 @@ heuristic stays live.)
   evidence `ci/logs/20260925-002342/testport/go-test.log`).
   Kind: impl
   Parent: none
+  - Triage 2026\-09\-25: reproduces at HEAD `5247eecea` on a clean
+    worktree. The test rejects goopg\'s `postgresql.conf` because it carries
+    an active `work\_mem = 512MB` line besides the harness\'s `fsync = off`
+    \(`e2e\_pg\_coldstart\_on\_goopgdata\_test.go:204`\); a plain `goopg init`
+    must write only PG\'s commented defaults.
 - [ ] **testport/TestPort_IsolationEvalPlanQual** — testport TestPort\_IsolationEvalPlanQual FAILed \(reopened: the 2026\-09\-22 task was closed stale\)
   (AI-20260925-002342-002; repro: `go test -v -run '^TestPort_IsolationEvalPlanQual$' ./internal/testport/`,
   evidence `ci/logs/20260925-002342/testport/go-test.log`).
@@ -19740,6 +19745,19 @@ Movement: none — no plan moved on TPC-DS SF0.25/SF1 or TPC-H across all four d
     `LP\_UNUSED` slots under `PD\_HAS\_FREE\_LINES`. Measure pgbench
     small\-table growth and TPC\-B tps against HEAD; gate on the isolation
     family and the index\-scan correctness tests.
+  - **S1 LANDED 2026\-09\-25** \(design
+    `docs/design/0100-0149/m0145-0008v-line-pointer-lifecycle.md`, slice
+    plan S1–S3\): prune writes storage\-less LP\_DEAD for dead non\-HOT
+    tuples, dead roots and dead\-chain redirects \(`PruneResult.Dead`,
+    `PruneHeapPageBySlots`\); the PG prune record carries
+    `XLHP\_HAS\_DEAD\_ITEMS` and redo applies it byte\-identically; VACUUM
+    hands every LP\_DEAD item to index cleanup \(`PageDeadItems`\).
+    - Gates: units, spotcheck, acceptance 24 MATCH, sf025 96/96,
+      isolation and regress = HEAD\'s failures only, amcheck ports, real\-PG
+      WAL consumption tests; pgbench A/B within host noise.
+    - Next: S2 — the post\-index\-cleanup heap pass \(LP\_DEAD → LP\_UNUSED,
+      `PageTruncateLinePointerArray`, `PRUNE\_VACUUM\_CLEANUP` record\) and
+      autovacuum\'s missing index pass; then S3 recycling.
 
 - [ ] **M0145\-0008u — a pin\-held \(zero\-copy\) seq\-scan slot**
   \(filed 2026\-09\-25 by M0145\-0008q\). With compaction under a cleanup

@@ -232,7 +232,10 @@ func vacuumCore(pool *storage.Pool, mgr *transam.Manager, rel storage.RelFileNod
 		// multi xmax resolves its updater before the horizon compare). The old
 		// naive "xmax < horizon → remove slot" pass broke HOT chains and treated
 		// a raw MultiXactId as an xid — see the freeze-the-dead spec (M0118-0009).
-		pr, liveOnPage, err := storage.PageVacuumPrune(page, horizon)
+		// markUnusedNow stays false: vacuumCore does not know whether the
+		// relation has indexes, so a dead non-HOT tuple is left LP_DEAD for
+		// the index pass (PG sets it only for an index-less relation).
+		pr, liveOnPage, err := storage.PageVacuumPrune(page, horizon, false)
 		if err != nil {
 			slot.Unlock()
 			pool.Unpin(slot)
@@ -241,12 +244,12 @@ func vacuumCore(pool *storage.Pool, mgr *transam.Manager, rel storage.RelFileNod
 		if cnt, cerr := storage.PageLinePointerCount(page); cerr == nil && (cnt > 0 || liveOnPage > 0) {
 			lastNonEmpty = blk
 		}
-		reclaimed := len(pr.Redirects) + len(pr.Unused)
+		reclaimed := pr.Reclaimed()
 		stats.Live += liveOnPage
 		if reclaimed > 0 {
 			if logPrune != nil {
 				err = pool.MarkDirtyChangeRecord(slot, func() (storage.LSN, error) {
-					return logPrune(rel, blk, pr.Redirects, pr.Unused)
+					return logPrune(rel, blk, pr.Redirects, pr.Dead, pr.Unused)
 				})
 				if err != nil {
 					slot.Unlock()
@@ -259,14 +262,19 @@ func vacuumCore(pool *storage.Pool, mgr *transam.Manager, rel storage.RelFileNod
 			pageDirty = true
 			stats.Dead += reclaimed
 			lastNonEmpty = blk
-			// Collect dead TIDs for index vacuum (M0047-0002). Only the
-			// fully-removed (Unused) line pointers may carry an index entry
-			// that must be cleared; redirected roots keep their index entry
-			// valid. HOT-only Unused tuples have no index entry, so removing a
-			// (nonexistent) entry for their TID is a harmless no-op.
-			for _, s := range pr.Unused {
-				stats.DeadTIDs = append(stats.DeadTIDs, storage.ItemPointer{Block: blk, Offset: s})
-			}
+		}
+		// Collect dead TIDs for index vacuum (M0047-0002): every LP_DEAD item
+		// on the page, whether this prune or an earlier on-access prune left
+		// it dead (lazy_scan_prune's deadoffsets; M0145-0008v). Unused items
+		// have no index entry; redirected roots keep theirs valid.
+		deadItems, derr := storage.PageDeadItems(page)
+		if derr != nil {
+			slot.Unlock()
+			pool.Unpin(slot)
+			return stats, derr
+		}
+		for _, s := range deadItems {
+			stats.DeadTIDs = append(stats.DeadTIDs, storage.ItemPointer{Block: blk, Offset: s})
 		}
 
 		// Tuple-freeze pass (M0046-0005): rewrite old xmin → FrozenTransactionID.
