@@ -63,6 +63,16 @@ func findIndentLine(t *testing.T, lines []string, sub string) string {
 // node — and the root `Sort Key: b DESC` doubles as evidence that the new
 // arm carries direction rather than eliding any ORDER BY over a grouped
 // input.
+//
+// M0145-0008d (2026-09-24): `ORDER BY 2 DESC` stopped being a re-ordering.
+// The GROUP BY item b now copies ORDER BY's direction, as PG's
+// transformGroupClauseExpr does, so the aggregate's input is sorted b DESC
+// and the outer Sort is gone. PG goes further and reads the unique index
+// backward, with no Sort at all. The fixture now orders by the aggregate
+// (`ORDER BY 1`), a re-ordering no grouping order can deliver, which
+// restores the 4-level shape for the indent arithmetic. The upstream-exact
+// query (`GROUP BY` the primary key `ORDER BY 2`) crashes the planner
+// (M0145-0008h), so it cannot be the fixture yet.
 func deepSortFixture(t *testing.T) *Context {
 	t.Helper()
 	ctx, _, cleanup := newDDLFixture(t)
@@ -76,7 +86,7 @@ func deepSortFixture(t *testing.T) *Context {
 	return ctx
 }
 
-const deepSortSQL = "SELECT array_agg(a ORDER BY b), b FROM t WHERE b < 100 GROUP BY b ORDER BY 2 DESC"
+const deepSortSQL = "SELECT array_agg(a ORDER BY b), b FROM t WHERE b < 100 GROUP BY b ORDER BY 1"
 
 // TestExplainIndentDeepNesting pins the plain-EXPLAIN twin: raw "->  "
 // columns 0/2/8/14/20 and matching detail-line columns, verified against

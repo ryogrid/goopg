@@ -1451,6 +1451,24 @@ type Aggregate struct {
 	// §"S8 Slice 2c").
 	GroupKeyOrder []int
 
+	// GroupClause is PG's processed_groupClause for a plain GROUP BY
+	// (M0145-0008d): the order and direction sort-based grouping consumes
+	// its input in, as positions into GroupExprs plus each key's DESC /
+	// NULLS FIRST flags. PG builds it in two steps. Parse analysis gives a
+	// GROUP BY item that ORDER BY also names ORDER BY's sort operator and
+	// nulls ordering (transformGroupClauseExpr, parse_clause.c:2424-2438).
+	// Then preprocess_groupclause (planner.c:2828) moves the GROUP BY items
+	// that form a prefix of ORDER BY to the front, in ORDER BY's order.
+	// `GROUP BY g ORDER BY g DESC` therefore sorts once, DESC, and the
+	// GroupAggregate's output already satisfies the ORDER BY.
+	//
+	// Like GroupKeyOrder, it never reorders GroupExprs: every output binding
+	// is fixed to the written position, so the permutation lives beside the
+	// list. nil means written order, ASC NULLS LAST — the default every
+	// construction site without an ORDER BY gets. Grouping sets never
+	// carry it (PG forces the rollup order there).
+	GroupClause []GroupClauseKey
+
 	// InputTarget / InputTargetKnown is the aggregate's input-column keep list —
 	// B-01c second cut (COMPUTE-ONLY group_input_target): the ascending
 	// child-output positions of the group-input columns (group keys ∪
@@ -1838,6 +1856,14 @@ func (n *CTEScan) DeclKey() string {
 }
 
 // Sort — orders the child's rows by the given keys.
+// GroupClauseKey is one entry of Aggregate.GroupClause: the GroupExprs
+// position it sorts and the direction it sorts that key in.
+type GroupClauseKey struct {
+	Pos        int
+	Desc       bool
+	NullsFirst bool
+}
+
 type SortKey struct {
 	Expr       Expr
 	Desc       bool

@@ -9145,6 +9145,16 @@ func buildAggregateStage(s *parser.SelectStmt, child Node, inputCtx *resolveCont
 	// (src/backend/parser/parse_agg.c) validates the target list before this
 	// pruning runs — a key column that pruning dropped still proves the
 	// dependency.
+	// M0145-0008d: groupOrigIdx[k] is the s.GroupBy index GroupExprs[k] came
+	// from, carried through the pruning below so buildGroupClause can match
+	// each surviving key against ORDER BY by its written form.
+	var groupOrigIdx []int
+	if len(groupExprs) == len(s.GroupBy) {
+		groupOrigIdx = make([]int, len(groupExprs))
+		for i := range groupOrigIdx {
+			groupOrigIdx[i] = i
+		}
+	}
 	originalGroupInputCols := map[int]bool{}
 	for inputIdx := range groupByInputCol {
 		originalGroupInputCols[inputIdx] = true
@@ -9172,13 +9182,20 @@ func buildAggregateStage(s *parser.SelectStmt, child Node, inputCtx *resolveCont
 			}
 			newGroupExprs := make([]Expr, 0, newIdx)
 			newSchema := make(Schema, 0, newIdx)
+			var newOrigIdx []int
 			for i := range groupExprs {
 				if keep[i] {
 					newGroupExprs = append(newGroupExprs, groupExprs[i])
 					newSchema = append(newSchema, outputSchema[i])
+					if groupOrigIdx != nil {
+						newOrigIdx = append(newOrigIdx, groupOrigIdx[i])
+					}
 				}
 			}
 			groupExprs = newGroupExprs
+			if groupOrigIdx != nil {
+				groupOrigIdx = newOrigIdx
+			}
 			outputSchema = newSchema
 			for key, old := range groupByExpr {
 				if old >= 0 && old < len(oldToNew) && oldToNew[old] >= 0 {
@@ -9426,6 +9443,11 @@ func buildAggregateStage(s *parser.SelectStmt, child Node, inputCtx *resolveCont
 		schema:        outputSchema,
 		GroupingSets:  gsSets,
 		GroupingMasks: groupingMasks,
+	}
+	// M0145-0008d: processed_groupClause (groupclause.go). Grouping sets and
+	// the default order leave it nil.
+	if gsSets == nil && groupOrigIdx != nil && len(groupOrigIdx) == len(groupExprs) {
+		aggNode.GroupClause = buildGroupClause(s, groupOrigIdx)
 	}
 	// B-01c second cut: keys-only construction stamp (above not yet built,
 	// passthroughs not yet appended — the append sites below re-stamp to

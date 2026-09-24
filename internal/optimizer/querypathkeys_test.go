@@ -191,11 +191,13 @@ func TestDeriveQueryPathkeys(t *testing.T) {
 		},
 		{
 			// The shared prefix ends at the first ORDER BY item that is not a
-			// grouping item; the rest of the group list follows with default
-			// ordering.
+			// grouping item. The prefix scan stops at count(*), so the written order stands,
+			// but b still copies ORDER BY's direction: transformGroupClauseExpr
+			// gives any GROUP BY item ORDER BY names its SortGroupClause,
+			// prefix or not (M0145-0008d; PG 18.3 verified on this shape).
 			name: "GROUP BY prefix reuse stops at a non-grouping sort item",
 			sql:  "SELECT a, b, count(*) FROM t GROUP BY a, b ORDER BY count(*), b DESC",
-			want: []string{"a/ASC/NL", "b/ASC/NL"},
+			want: []string{"a/ASC/NL", "b/DESC/NF"},
 		},
 		{
 			// A pathkey list is a PREFIX contract: an unexpressible key

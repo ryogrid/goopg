@@ -249,9 +249,10 @@ func presortedAggKeysOrAbsent(aggNode *Aggregate, ps PlannerSettings) ([]SortKey
 		return nil, false
 	}
 
+	// root->group_pathkeys: the processed group clause (M0145-0008d).
 	var grouppathkeys []PathKey
-	for _, g := range aggNode.GroupExprs {
-		grouppathkeys = append(grouppathkeys, PathKey{Expr: g, SortAsc: true, NullsFirst: false})
+	for _, k := range groupClauseKeys(aggNode) {
+		grouppathkeys = append(grouppathkeys, PathKey{Expr: aggNode.GroupExprs[k.Pos], SortAsc: !k.Desc, NullsFirst: k.NullsFirst})
 	}
 
 	bestCount := 0
@@ -308,12 +309,15 @@ func presortedAggKeysOrAbsent(aggNode *Aggregate, ps PlannerSettings) ([]SortKey
 	return finalSortKeys, true
 }
 
-// groupKeysSortKeys is one ascending SortKey per group expression — the
-// input order a plain sorted aggregate consumes.
+// groupKeysSortKeys is one SortKey per group expression, in the order and
+// direction a plain sorted aggregate consumes: PG's processed_groupClause
+// (Aggregate.GroupClause, groupclause.go — ORDER BY's prefix first, each key
+// in the direction ORDER BY asks for it), written order ASC NULLS LAST when
+// there is none.
 func groupKeysSortKeys(aggNode *Aggregate) []SortKey {
 	keys := make([]SortKey, 0, len(aggNode.GroupExprs))
-	for _, g := range aggNode.GroupExprs {
-		keys = append(keys, SortKey{Expr: g, Desc: false, NullsFirst: false})
+	for _, k := range groupClauseKeys(aggNode) {
+		keys = append(keys, SortKey{Expr: aggNode.GroupExprs[k.Pos], Desc: k.Desc, NullsFirst: k.NullsFirst})
 	}
 	return keys
 }

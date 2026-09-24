@@ -446,7 +446,12 @@ func aggregateEmissionPathkeys(agg *Aggregate) []PathKey {
 	if len(out) < len(groups) {
 		return nil
 	}
-	for j, g := range groups {
+	// M0145-0008d: the same processed-group-clause translation as
+	// groupingEmissionPathkeys — child key j is the group key at clause
+	// position j, emitted at output position clause[j].Pos.
+	clause := groupClauseKeys(agg)
+	for j, k := range clause {
+		g := groups[k.Pos]
 		// Bare group keys only: the output side names positions, and only a
 		// column has a name. Both sides are input-coordinate here, so
 		// `exprEqual`'s positional `Index` equality is the match.
@@ -458,14 +463,14 @@ func aggregateEmissionPathkeys(agg *Aggregate) []PathKey {
 		}
 		// An empty name is a column nobody can address by name, so the claim
 		// cannot be confirmed and stops there.
-		if out[j].Name == "" || out[j].Name != groupExprName(g) {
+		if out[k.Pos].Name == "" || out[k.Pos].Name != groupExprName(g) {
 			return nil
 		}
 	}
-	emitted := make([]PathKey, len(groups))
-	for j := range groups {
+	emitted := make([]PathKey, len(clause))
+	for j, k := range clause {
 		emitted[j] = PathKey{
-			Expr:       &ColumnRef{Index: j, Name: out[j].Name, Type: out[j].Type},
+			Expr:       &ColumnRef{Index: k.Pos, Name: out[k.Pos].Name, Type: out[k.Pos].Type},
 			SortAsc:    !childKeys[j].Desc,
 			NullsFirst: childKeys[j].NullsFirst,
 		}

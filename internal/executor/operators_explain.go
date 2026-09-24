@@ -1538,6 +1538,17 @@ func emitNodeDetailLines(n optimizer.Node, indent string, verbose bool, rows *[]
 			// fixed to its written position, is untouched. nil means the
 			// written order (every pre-2c-i plan).
 			order := p.GroupKeyOrder
+			if order == nil && len(p.GroupClause) == len(p.GroupExprs) {
+				// M0145-0008d: PG prints the processed group clause
+				// (preprocess_groupclause: ORDER BY's prefix first) for every
+				// strategy — `GROUP BY h, g ORDER BY g DESC, h` shows
+				// `Group Key: g, h` under a HashAggregate too. An index-driven
+				// GroupKeyOrder, set by the producer, still wins above.
+				order = make([]int, 0, len(p.GroupClause))
+				for _, k := range p.GroupClause {
+					order = append(order, k.Pos)
+				}
+			}
 			if order == nil {
 				order = make([]int, len(p.GroupExprs))
 				for i := range order {

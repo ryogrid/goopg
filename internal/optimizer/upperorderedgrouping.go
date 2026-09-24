@@ -111,17 +111,24 @@ func groupingEmissionPathkeys(aggNode *Aggregate, cand *Path) []PathKey {
 	}
 	childPK := cand.Children[0].Pathkeys
 	groups := spec.GroupExprs
-	for j, g := range groups {
+	// M0145-0008d: the input is sorted in the processed group clause's order
+	// (groupKeysSortKeys), so the j-th child sort key is the group key at
+	// clause position j, and the group it names sits at output position
+	// clause[j].Pos (GroupExprs is never reordered). Written order when the
+	// spec has no GroupClause, which is the pre-M0145-0008d translation.
+	clause := groupClauseKeys(spec)
+	for j, k := range clause {
+		g := groups[k.Pos]
 		// Bare group keys only: the output side names positions, and
 		// only a column has a name. Both sides are input-coordinate
 		// here, so `exprEqual`'s positional `Index` equality is the
 		// match (Name/SourceTableIdx excluded, exprwalk.go:555+).
 		if _, ok := g.(*ColumnRef); !ok {
-			traceGroupDecline(fmt.Sprintf("group-expr[%d]-not-columnref(%T)", j, g), cand)
+			traceGroupDecline(fmt.Sprintf("group-expr[%d]-not-columnref(%T)", k.Pos, g), cand)
 			return nil
 		}
 		if j >= len(childPK) || !exprEqual(childPK[j].Expr, g) {
-			traceGroupDecline(fmt.Sprintf("group-expr[%d]-not-leading-child-sortkey", j), cand)
+			traceGroupDecline(fmt.Sprintf("group-expr[%d]-not-leading-child-sortkey", k.Pos), cand)
 			return nil
 		}
 	}
@@ -136,10 +143,10 @@ func groupingEmissionPathkeys(aggNode *Aggregate, cand *Path) []PathKey {
 			return nil
 		}
 	}
-	emitted := make([]PathKey, len(groups))
-	for j := range groups {
+	emitted := make([]PathKey, len(clause))
+	for j, k := range clause {
 		emitted[j] = PathKey{
-			Expr:       &ColumnRef{Index: j, Name: outCols[j].Name, Type: outCols[j].Type},
+			Expr:       &ColumnRef{Index: k.Pos, Name: outCols[k.Pos].Name, Type: outCols[k.Pos].Type},
 			SortAsc:    childPK[j].SortAsc,
 			NullsFirst: childPK[j].NullsFirst,
 		}
