@@ -1,30 +1,24 @@
-Task: M0146-0002 — `Parallel Hash` over a genuinely partial inner (item 3's
-M0146 continuation; M0145-0001 lineage is [!], so M0146-0001 is held and
-this is the first selectable M0146 task in file order).
+Task: M0146-0002 — `Parallel Hash` over a genuinely partial inner. Slices 1
+(executor, 171c5d58a) and 2 (planner + label, cf02e88b9) landed. TPC-H
+match 2→3 (Q14 now matches), SF0.25 match 2→4.
 
-Files: slice 1 landed as 171c5d58a. internal/executor/parallel_hash_shared.go
-(barrier, participant protocol), parallel_scan.go (hashBuildBranch claim
-sets), operators_gather*.go (register/retract), plus optimizer.Join.ParallelHash.
+Files: internal/optimizer/joinpathsparallel.go (addParallelHashJoinPath),
+cost_funcs.go (hashGeometryInputs), parallel.go (ParallelHashJoinsIn,
+stamp/unstamp), gatherpaths.go (driving kind), executor parallel_hash_shared.go,
+parallel_scan.go (attachParallelHashBuildSides), operators_explain.go (label).
 Design: docs/design/0100-0149/m0146-0002-parallel-hash-partial-inner.md.
+Raw: analysis/m0146/m0146-0002/.
 
-Key symbols: parallelHashBuild{attach,finish,wait,merge};
-openParallelHashJoin; registerParallelHashBuilds;
-cs.attachParallelHashBuildSides; addPartialHashJoinPath (slice 2 target).
+Findings: Q16 still carries `parallelism` although both engines build over
+`part`. Q12/Q21/Q4 gained categories (M0146-0002a, recon).
 
-Findings: the executor model is proven (identity 5 join types under -race,
-5 builders). "Spilled" means nbatch > 1, because a batch state is always
-installed.
+Next step: slice 3, Q16. Diff goopg's Q16 plan (the "=== Q16" section of
+tmp/m0146-0002-cap/s2-tpch.plans.txt) against PG's
+(s2-tpch-pg.plans.txt) and name the remaining parallel difference, then
+M0146-0002a in file order.
 
-Next step: slice 2, the planner. In internal/optimizer/joinpathsparallel.go
-add the parallel_hash = true arm: read inner.PartialPathlist and price per
-costsize.c initial_cost_hashjoin/final_cost_hashjoin with parallel_hash.
-Restrict to INNER/SEMI/ANTI/LEFT-build-right and an inner that fits
-hash_mem. Stamp Join.ParallelHash in createPlan and render EXPLAIN
-`Parallel Hash Join` / `Parallel Hash` (take PG's Q14 text from the PG
-TPC-H reference cluster, EXPLAIN only). Then the full gate set plus the
-parallel TPC-H capture (Q14/Q16 witnesses).
-
-Gates run (slice 1): units; tpch-spotcheck; tpcds-sf025 (same=99);
-acceptance arm; fireset.
+Gates run: units; tpch-spotcheck (Q12=2, Q13=33); sf025 96/96
+(changed=59); acceptance arm identical; fireset; TPC-H + SF0.25 parity
+captures.
 
 In-flight: none. Parked: tmp/m0122-alter-system-wip.patch (M0122 ALTER SYSTEM).

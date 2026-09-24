@@ -1,6 +1,6 @@
 # M0146-0002: `Parallel Hash` over a genuinely partial inner
 
-Status: slice 1 (executor mechanism) LANDED 2026-09-24 `171c5d58a`; slice 2 (planner) next. Task:
+Status: slice 1 (executor) LANDED `171c5d58a`; slice 2 (planner + label) LANDED `cf02e88b9` 2026-09-24 — TPC-H Q14 matches PG. Open: Q16 (slice 3) and the Q12/Q21/Q4 category regressions (M0146-0002a). Task:
 `.ralph/fix_plan.md` M0146-0002 (Kind: impl, Parent: M0140-0007). Scope was
 set by the owner's 2026-09-23 answer to M0140-0007, option (a): a fidelity
 port. The label and the execution model land together, each shape pinned by a
@@ -148,3 +148,50 @@ fireset. Inert by construction: no production producer sets `ParallelHash`.
 
 Next, slice 2: the planner's `parallel_hash = true` arm and the EXPLAIN
 `Parallel Hash` label.
+
+## Slice 2 landed (2026-09-24, `cf02e88b9`): the planner arm and the label
+
+- **Producer.** `addParallelHashJoinPath` is `try_partial_hashjoin_path(...,
+  parallel_hash = true)` at `hash_inner_and_outer`'s partial-inner site
+  (`joinpath.c:2436-2448`). It pairs the cheapest partial outer with the
+  cheapest partial inner, is not used for JOIN_UNIQUE_INNER, and is gated
+  by `enable_parallel_hash` (now wired end to end: `PlannerSettings`,
+  `costParams`, the session reader, the plan-cache fingerprint).
+- **Pricing** (`costsize.c:4160-4260`). Every CPU term takes the per-participant
+  inner rows and cost, PG's bucket walk included. Only the table geometry
+  sees `inner_path_rows_total` under the combined budget `hash_mem ×
+  (workers+1)` (`nodeHash.c:699-707`, `hashJoinInputs.hashGeometryInputs`).
+- **Executor-capacity refusals** (M0145-0010 scope (d)). The inner must be a
+  partial seq scan (`partialPathDrivingKind` agrees), and the build must fit
+  one batch in total and per participant (batching is ledgered).
+- **Label.** The join's `Parallel ` prefix follows `Join.ParallelHash`. For a
+  join PG sets `parallel_aware` only for `parallel_hash`
+  (`create_hashjoin_path`). So goopg's complete-inner partial hash join
+  (leader-prebuilt table) is now PG's plain `Hash Join`, retiring R7's
+  labelling.
+- **Walks.** The Gather registers states through
+  `optimizer.ParallelHashJoinsIn`, and the claim walk mirrors
+  `attachParallelScan` arm for arm (aggregate, sort, fused NLI outer, partial
+  NL/merge outer). `tpch-spotcheck` caught the first cut: Q12's Parallel
+  Hash sat below a Partial Aggregate and was never registered. It failed
+  loudly (the new `errParallelHashUnregistered`), not with wrong rows.
+
+### Measurement (canonical lanes, same day)
+
+| corpus | match | categories changed |
+|---|---|---|
+| TPC-H (parallel, `PGSHAPED=1`) | **2 → 3** (Q14 joins Q6, Q11) | parallelism 16 → **11**, join-method 11 → 14, scan-type 11 → 13, aggregation 4 → 3 |
+| TPC-DS SF0.25 | **2 → 4** (Q93, Q98 join Q9, Q41) | parallelism 81 → **74**, rendering 26 → 24 |
+
+Per query, TPC-H:
+- Q14 now MATCHes, the named witness.
+- Q7, Q9, Q10 and Q19 leave `parallelism`.
+- **Q12** gains join-method, join-order and scan-type; **Q21** gains
+  join-method; **Q4** trades aggregation-strategy / join-order for join-method /
+  scan-type. Filed as M0146-0002a, not reverted (R3).
+- Q16 keeps `parallelism`, so slice 3 finds out why its build over `part`
+  still differs.
+
+Values: the sweep is 96/96 with no mismatches or timeouts although 59 SF0.25
+plan shapes changed, the acceptance arm is identical, and the fire set is
+clean. Raw diffs are in `analysis/m0146/m0146-0002/`.

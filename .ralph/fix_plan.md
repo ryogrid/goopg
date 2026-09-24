@@ -19311,11 +19311,33 @@ M0146-0001 re-baseline census on the new default arm.
     - Gates: units, tpch\-spotcheck, sf025 \(same=99\), acceptance arm,
       fireset.
     Movement: none — inert slice.
-  - Next: slice 2 — planner `parallel\_hash = true` arm in
-    `joinpathsparallel.go` \(read `inner.PartialPathlist`, PG's
-    `initial/final\_cost\_hashjoin` parallel\_hash pricing\) \+ EXPLAIN
-    `Parallel Hash Join` / `Parallel Hash`; then slice 3 measurement on the
-    canonical parallel TPC\-H capture \(Q14/Q16\).
+  - **Slice 2 LANDED 2026\-09\-24 `cf02e88b9`** \(planner arm \+ label\):
+    - `addParallelHashJoinPath` \(PG pricing: per\-participant CPU terms,
+      combined\-budget geometry\); refusals: partial seq\-scan inner, one
+      batch; `enable\_parallel\_hash` wired; join label follows PG's
+      parallel\_hash rule \(R7's prefix on complete\-inner joins retired\).
+    - Registration/claim walks mirror the claim walks; tpch\-spotcheck
+      caught Q12's unregistered Parallel Hash below a Partial Aggregate
+      \(failed loudly, fixed\).
+    - Gates: units, spotcheck Q12=2/Q13=33, sf025 96/96 \(changed=59\),
+      acceptance identical, fireset.
+    Movement: yes — TPC\-H MATCH 2 → 3 \(Q14\), parallelism 16 → 11; TPC\-DS SF0.25 MATCH 2 → 4 \(Q93, Q98\), parallelism 81 → 74.
+  - Next: slice 3 — Q16 still carries `parallelism` \(both engines build
+    over `part`\); diff goopg's Q16 plan against PG's on the canonical
+    capture and find the remaining parallel difference.
+
+- [ ] **M0146\-0002a — category regressions from the Parallel Hash arm**
+  \(measured 2026\-09\-24 at slice 2, TPC\-H parallel lane\): Q12 gains
+  join\-method, join\-order and scan\-type; Q21 gains join\-method; Q4 trades
+  aggregation\-strategy/join\-order for join\-method/scan\-type.
+  Kind: recon
+  Parent: M0146-0002
+  - First step: per query, diff the slice\-2 plan against PG's and against
+    the pre\-slice plan \(`analysis/m0145/m0145\-0008\-flip/flip\-tpch\-diff.txt`
+    vs `analysis/m0146/m0146\-0002/s2\-tpch\-diff.txt`\); decide whether the
+    Parallel Hash election is where PG differs or exposes an older
+    divergence. Expected movement: the join\-method category back to 11 on
+    TPC\-H if the elections are corrected.
 - [ ] **M0146-0003 — row-emitting PartialAgg** (impl; adopts the filed
   M0141-S3→S4→S5→S6 chain as its slices). Convert Partial Aggregate from
   the zero-row shared-accumulator model to one that emits real partial
