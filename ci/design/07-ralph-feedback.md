@@ -213,6 +213,11 @@ Notes on the mechanics:
   **does** include the banner clause; both formulations agree because both
   defer to the banner. Since 2026-09-14 the banner's preemption clause is
   parked: filing stays unconditional, selection ranks M0137–M0143 first.)
+  **Updated 2026-09-24:** task-selection rules consolidated — authority is
+  `.ralph/PROMPT.md` (procedure) + the banner's "Selection rules"
+  subsection (rank); this whole bullet is design history, not the live
+  rule (AGENT.md's pick-topmost copy is also gone — replaced by a pointer
+  to the same two authorities).
 
 ## C. One-line hook in `.ralph/PROMPT.md` (implementation edit)
 

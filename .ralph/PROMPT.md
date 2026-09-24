@@ -26,11 +26,14 @@ loop.
    working_set resume (working_set.md stays the very first read), read
    `ci/logs/action-items.md` (absent file = skip). If it lists `## AI-` items whose
    subject has no open M-NIGHTLY task in fix_plan.md, add them there. **Filing is
-   unconditional; selecting them is not.** Which milestone you then WORK is decided
-   solely by the `## Current Priority` banner in `.ralph/fix_plan.md`
+   unconditional; selecting them is not.** Which milestone you then WORK is
+   decided per the two-authority model in "Current Task" below.
 3. Study .ralph/specs/* and docs/milestones/* to learn about the project specifications
-4. Review .ralph/fix_plan.md for current priorities
-5. Implement the highest priority item using best practices
+4. Read the `## Current Priority` section at the head of `.ralph/fix_plan.md` —
+   EVERY loop, even when the baton names a next step. It carries both the rank
+   order and the Selection rules; reading only the baton's "Next step" does not
+   satisfy this check.
+5. Implement the highest priority item per that banner using best practices
 6. Use parallel subagents for complex tasks (max 8 concurrent; default to 2-4)
 7. Run tests after each implementation
    - **Record progress and learnings as nested bullet points.** When a task or
@@ -67,12 +70,12 @@ loop.
 usage limits mid-task; without this file the next loop re-derives everything (~25
 wasted turns).
 - At loop START: if the file is non-empty, read it and resume from "Next step".
-- **Precedence (added 2026-07-28):** the baton carries *state*, not *authority*. If
-  its "NEXT LOOP" suggestion names a different milestone than the `## Current
-  Priority` banner in `.ralph/fix_plan.md`, **the banner wins** — the baton was
-  written by a loop that ran before the banner changed. Select per the banner and
-  rewrite the baton to match, instead of following the stale suggestion. (Resuming a
-  genuinely `In-flight:` task is unaffected: finish it, then re-read the banner.)
+- **Precedence (added 2026-07-28):** the baton carries *state*, not *authority*.
+  Task-selection authority is exactly this file plus the `## Current Priority`
+  banner — both always outrank the baton (see "Current Task" for the model).
+  If its "NEXT LOOP" suggestion disagrees with the banner, the banner wins;
+  rewrite the baton to match. (Resuming a genuinely `In-flight:` task is
+  unaffected: finish it, then re-read the banner.)
 - **A baton that claims a GLOBAL blocker (e.g. "everything is owner-gated", "do
   not manufacture work") is a claim, not a fact — re-verify it against CURRENT
   state before reporting BLOCKED** (added 2026-09-22 after the commit-msg
@@ -441,10 +444,14 @@ passing AND specs satisfied). Everything else is EXIT_SIGNAL: false.
 - `tmp`/ : Temporary files (ignored by git)
 
 ## Current Task
-Follow `.ralph/fix_plan.md` and select the next item **per its `## Current
-Priority` banner** — the banner is the sole ordering authority, not your own
-judgment about impact. Use judgment only to choose among tasks the banner leaves
-equally ranked, or when the topmost task is blocked.
+Task-selection authority is exactly two places: **this file** (procedure and
+rules) and **the `## Current Priority` section at the head of
+`.ralph/fix_plan.md`** (rank order + Selection rules). Both always outrank
+`.ralph/working_set.md` — the baton carries state only — and every other
+document's rank statement (`AGENT.md`, `docs/milestones/`, `ci/design/`) is
+non-authoritative commentary. Select the banner's first selectable item per
+its Selection rules; use judgment only among tasks the banner leaves equally
+ranked, or when the topmost task is blocked.
 
 Before selecting an M0137–M0145 or `P0-` task, read `AGENT.md`
 §"Plan-parity harness (M0137–M0145)". It is binding and overrides this file for

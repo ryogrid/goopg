@@ -9,8 +9,47 @@ not priority. Previous banners: `docs/design/0100-0149/plan-parity-harness-backg
 
 **Before selecting anything below, read `AGENT.md` §"Plan-parity harness".**
 
-Take the first item that has a selectable (`[ ]`, dependencies met) task, in
-the order written inside the item. `[!]` tasks are not selectable.
+### Selection rules
+
+Consolidated here 2026-09-24 (owner consolidation; these moved from
+`AGENT.md` §S / §"Loop discipline" and keep their S-numbers for citation
+stability — S3–S5, filing/completion discipline, remain in `AGENT.md` §S;
+**do not add a `## ` heading inside this banner**: the guards slice the
+banner at the next `## ` line).
+
+- **S1** The banner is the only ordering authority. Take the first item
+  that has a selectable (`[ ]`, dependencies met) task, in the order
+  written inside the item. `[!]` tasks are not selectable.
+- **S2** A newly found defect that loses data, returns wrong results or
+  corrupts a shared resource: file it as a task, add an escalation block
+  naming it, and continue with the banner. The owner places it in the
+  banner (normally at position 0). Do not reorder the banner yourself.
+- **S6** Tasks under the banner's `FROZEN-PREFIXES:` or marked
+  `[!] FROZEN` are not selected, re-statused, deleted or given children.
+- **S7** An open task the banner does not name is selectable only when
+  every banner item is exhausted or blocked — **except** a task filed
+  under a milestone or task family the banner DOES name (a `Parent:` /
+  filed child of a named item's family): it inherits that item's rank
+  **and its gates and constraints** — a child of a `[!]`/held item, a
+  task gated on the M0145-0008 flip (M0146 below), or a family under an
+  item's scope-limited constraint (e.g. item 6's diagnosis-only) stays
+  unselectable/constrained exactly as its named ancestor is. An item is
+  "live" while it still has at least one selectable task; a held item is
+  not live. When several items name the family, the task takes the rank
+  of the item whose stated scope it belongs to; when ambiguous, the
+  LOWEST-ranked of the candidate items (conservative).
+  *(Amended 2026-09-24, owner decision — see OWNER DECISIONS 2026-09-24:
+  the unamended rule ranked every unlisted task below M-NIGHTLY, which
+  stranded parity-family work filed under named milestones.)*
+- **Ties and exhaustion:** among tasks the banner leaves equally ranked —
+  and, when every banner item is exhausted/blocked, among the unnamed
+  tasks S7 then admits — take the topmost unchecked task in file order.
+- **S8 Nothing selectable** (all remaining work blocked on the owner):
+  write one escalation block into `.ralph/working_set.md` listing each
+  blocker, and end the loop without code changes. Do not invent work.
+- **M-NIGHTLY** filing is unconditional (the paragraph at this section's
+  tail); **selecting** one ahead of the order above is allowed only when
+  it breaks the build or a gate this banner's work needs.
 
 0. **P0 — incident recovery. Nothing from item 1 onward is selected until
    P0-E7 is `[x]`** (section `## P0` below):
@@ -216,6 +255,54 @@ delegated scope M0137–M0145; details in each task's entry):
   parity makes reachable. Its tasks are gated on the M0145-0008 flip
   landing — do not select them before it.
 
+OWNER DECISIONS 2026-09-24 (progress-report review
+`/home/ryo/work/tmp/ef5e65e27094282ab28769901e05621c/01-progress-assessment-260924.md`,
+delegated; details in each task's entry):
+- **M0145-0008 flip unblock (a) — `indexProbeCostMultiplier`: option
+  (c), sanction a test-only setter.** The multiplier is load-bearing
+  (`mult = 1` elects PG-shaped NL plans that run 2–3x slower — the
+  documented B8 trade-off), so (a) retiring it is the measured-regression
+  exit and stays parked. (b) re-baselining the two executor tests to the
+  bitmap shape would silently drop executor coverage of the index-only /
+  index-probe path. A test-only setter (same mechanism class as
+  `pinLegacyPipeline`) keeps both shapes coverable: tests pin the value
+  they exercise.
+- **M0145-0008 flip unblock (b) — executor legacy-pin export:
+  sanctioned.** Export `pinLegacyPipeline` as a shared testutil helper
+  for the executor package's legacy-only tests. It pins the SAME
+  env-knob mechanism — it is not a second pipeline-selection mechanism
+  (G8's prohibition is production selection paths), and precedent
+  `3b8b771f6` already landed the optimizer-side pin. Keeps
+  `TestParallelNLIJointypeIdentity/semi|anti`,
+  `TestSubqueryUnnestKillSwitch`, `TestHashedInMixedKindFallsBack`
+  covered until the legacy-deletion slices remove them.
+- **M0145-0012: option (a) — retire the `rows<=1` CTE fallback arm for
+  plan parity.** M0145-0024 measured that PG 18.3 collapses Q74
+  identically; the arm is now a goopg-only divergence FROM PG's elected
+  plan, and the task's own "reproduces the collapse class = automatic
+  no-go" criterion is superseded — the collapse class IS PG's plan.
+  Timing note: post-removal goopg (29.61 s) still beats PG (53.49 s) on
+  the same plan, so this is parity-convergent, not a performance
+  concession. Same gate discipline as filed: knob-arm evidence first,
+  full gates before default-arm removal.
+- **M0141-S2b-17a: G4 extended — repin "introduced but shown PG-shared"
+  keys.** Both NEW findings (Q16, Q95) measured PG-shared misestimates;
+  a permanently red ratchet gate trains loops to ignore it. The G4 text
+  in `AGENT.md` is amended accordingly.
+- **S7 amended (design call from the same report §5.3):** unlisted tasks
+  filed under a banner-named milestone/family inherit that item's rank
+  **and its gates/constraints** — text in this section's Selection rules.
+  Families the banner names nowhere (in-progress milestones absent from
+  item 10's list, e.g. M0094/M0096/M0097/M0123/M0132) stay below item 10
+  by owner confirm — a later re-rank can name them explicitly.
+- **Banner re-rank (item 10 split / pre-flip M0146 executor-substrate):
+  NOT NEEDED** — the two flip unblocks above restore the M0145-0008
+  critical path; M0146's flip gate stays as filed.
+- **work_mem 512MB→4MB: RESOLVED 2026-09-24** — every measurement
+  cluster on both engines carries `work_mem = 512MB` explicitly in
+  `postgresql.conf`, no session `SET`; the remaining BootVal-fidelity
+  item is parked per its task entry.
+
 **UNFROZEN (owner decision 2026-09-20) — selectable again:** the M0142-0008
 chain (`M0142-0008a-3`, `M0142-0008c-1a`, `M0142-0008c-3d`,
 `M0142-0008c-4`) is unfrozen by direct owner instruction. P0-E7's private-lane
@@ -235,9 +322,9 @@ row dated 2026-09-20).
 
 **M-NIGHTLY filing is unconditional**: every loop reads
 `ci/logs/action-items.md` and files each new `## AI-` subject under M-NIGHTLY.
-Selecting one ahead of the order above is allowed only if it breaks the build
-or a gate this banner's work needs. When selected: re-run its repro at HEAD
-first, fix with normal gates, cite the AI-id, tick it.
+Its selection condition lives in this section's **Selection rules**
+(item-10 order plus the build/gate exception). When selected: re-run its
+repro at HEAD first, fix with normal gates, cite the AI-id, tick it.
 
 ## Notes / rules
 
@@ -2737,7 +2824,9 @@ enforcement + upsert arbiter) and -0005 (pg_waldump WD-003/WD-004 canonical
 prune-WAL round-trip — M0119-0005 is now fully landed, no open bullet
 remains). The one open item below carries the remaining unbuilt scope. It was
 the whole file's active task between 2026-09-01 and 2026-09-14; **since
-2026-09-14 the banner ranks M0137–M0143 above it.**
+2026-09-14 the banner demoted it; its live rank is whatever the `## Current
+Priority` banner at the head of this file currently says (item 10 tail as of
+2026-09-24).**
 
 - [ ] **M0119-0006 — pg_amcheck server tier**.
   - 2026-09-19 (bq): repaired two regressions that had every ported
@@ -7678,6 +7767,14 @@ spill route is net-negative.
       the two NEW keys as standing findings\), every `make ea\-ratchet` run
       reports FAIL on Q16/Q95. Later loops must read that as known, not as a
       regression of their own change.
+    - **OWNER ANSWER 2026\-09\-24 \(delegated; OWNER DECISIONS 2026\-09\-24
+      in the banner\): extend G4 — repin permitted.** The per\-key
+      attribution is already produced above \(PG\'s nearest scope shows the
+      same misestimate on both keys\), so these are PG\-shared, not
+      goopg regressions; holding them as standing NEW findings would leave
+      `make ea\-ratchet` permanently red and train loops to ignore it.
+      `AGENT.md` G4\'s text is amended; the repin runs as a standalone
+      non\-code commit per G4.
     Movement: none
   - [x] **M0141-S2b-7** — filed 2026-09-17 by M0141-S7's corpus measurement
     (design doc's "Update 2026-09-17h"). `electOrderedGrouping`
@@ -16629,7 +16726,7 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
         TPC\-H run measured the legacy DP \(0 lowering\-built joins\).
         Pass `PGSHAPED=1` for the shipped planner.
       - Movement: none \(measurement\).
-- [!] **M0145-0008 — cutover**: flip `GOOPG_JOINTREE_PIPELINE` default,
+- [ ] **M0145-0008 — cutover**: flip `GOOPG_JOINTREE_PIPELINE` default,
   re-run the full corpus gates on the new pipeline (sf025 sweep,
   tpch-spotcheck, acceptance arm, plan-parity capture), then delete the
   legacy pipeline and the retired seam guards from 0001's list. Requires
@@ -16831,6 +16928,16 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
       sites in `m0145\-0030\-group\-b\-adjudication.md` §Script audit.
     - Loop continues with item 3's selectable recons \(M0145\-0024 →
       0025 → 0026\) until the owner answers.
+  - **OWNER ANSWERS 2026\-09\-24 \(delegated; OWNER DECISIONS 2026\-09\-24
+    in the banner\):** \(1\) `indexProbeCostMultiplier` — **option \(c\)**,
+    a test\-only setter is sanctioned; retiring stays parked \(measured
+    2–3x wall\-clock regression\) and the bitmap re\-baseline would drop
+    index\-probe executor coverage. \(2\) executor legacy pin — **export
+    sanctioned** as a shared testutil helper \(same env\-knob mechanism,
+    not a second selection mechanism; precedent `3b8b771f6`\). Task is
+    `[ ]` again: the flip commit sequence from the 2026\-09\-23 ordering
+    stands \(group\-K tests, stale group\-I expectations, the two script
+    knob defaults, then this task's gate suite\).
 - [x] **M0145-0009 — CTE-output statistics (B-06 resume): wire the landed
   synthesis into the estimator** (filed 2026-09-21 by owner directive;
   carries TODO_ALL B-06 / ledger `take3-B-06-deferred`). Three of this
@@ -17376,7 +17483,7 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
   Movement: none — the default arm is unchanged by construction (both flags
   default to today's behaviour) and the gates confirm it; the knob-arm census
   moved `any-body-leaf-(*optimizer.CTEScan)` 30 -> 0.
-- [!] **M0145-0012 — retire the `rows<=1` CTE fallback guard
+- [ ] **M0145-0012 — retire the `rows<=1` CTE fallback guard
   (`initialRelRows`, `joinsearch.go:520-526`)** (filed 2026-09-21 by
   owner directive; same proposal). The M0129-S1 arm — when a
   filter-wrapped `*CTEScan` leaf's estimate collapses to <=1, substitute
@@ -17454,6 +17561,15 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
     takes 53.49 s\). Option \(b\): keep it as a named, owner\-accepted
     performance divergence and close this task won\'t\-do. The removal steps
     are in `m0145\-0024\-q74\-residual\-collapse\-recon.md`.
+  - **OWNER ANSWER 2026\-09\-24 \(delegated; OWNER DECISIONS 2026\-09\-24 in
+    the banner\): option \(a\) — retire the arm for plan parity.** The
+    recon inverted the trade: the collapse class the arm prevents is now
+    PG\'s own elected plan on Q74, so the arm is a divergence, not a
+    guard. The \"reproduces the collapse class = automatic no\-go\"
+    criterion above is superseded — collapsing IS matching PG here.
+    Post\-removal goopg \(29.61 s\) still beats PG \(53.49 s\) on the same
+    plan. Execute with the filed gate discipline \(knob\-arm evidence
+    first, full gates before default\-arm removal\); task is `[ ]` again.
 - [x] **M0145-0013 — admit pulled `*CTEScan` leaves at the seam
   (`pulled-leaf-not-scan` / `flat-leaf-not-scan`)** (filed 2026-09-21
   by owner directive; the follow-on task M0145-0011's E2 resume point

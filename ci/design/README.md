@@ -51,7 +51,7 @@ local time.
 | [04-logging-and-reporting.md](04-logging-and-reporting.md) | `ci/logs/<ts>/` layout, progress log, summary schema, perf-tolerance policy, §C.1 mid-run build breaks (`build_kills`, source fingerprints), §C.2 the same collapse on the units/race lanes, retention |
 | [05-tpch-stage.md](05-tpch-stage.md) | The 2-hour-bounded TPC-H sweep: budget algorithm, EXPLAIN capture, comparisons |
 | [06-scheduler.md](06-scheduler.md) | Resident daemon, `flock` single-instance control, the `ralph_loop.sh` hook patch |
-| [07-ralph-feedback.md](07-ralph-feedback.md) | Failures → `ci/logs/action-items.md` → standing `M-NIGHTLY` filing milestone in `.ralph/fix_plan.md` (filing unconditional; selection ranked by the Current Priority banner) |
+| [07-ralph-feedback.md](07-ralph-feedback.md) | Failures → `ci/logs/action-items.md` → standing `M-NIGHTLY` filing milestone in `.ralph/fix_plan.md` (filing unconditional; selection rules live in the Current Priority banner's "Selection rules" subsection — consolidated 2026-09-24) |
 
 ## Design invariants (the short list)
 

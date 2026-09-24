@@ -3,7 +3,8 @@
 
 `goopg` is a from-scratch Go reimplementation of PostgreSQL. The project
 target platform is x86_64 Linux only. See `.ralph/specs/GOAL_AND_REQUIREMENTS.md`
-for the authoritative goals; pick work from `.ralph/fix_plan.md`.
+for the authoritative goals; pick work from `.ralph/fix_plan.md` per its
+`## Current Priority` banner (the sole ordering authority).
 
 ## At Start of Session
 
@@ -440,17 +441,17 @@ If Go symbol operations fail:
 
 ## Loop discipline (for Ralph)
 
-- One item per loop. Pick the topmost unchecked task in
-  `.ralph/fix_plan.md` unless **the `## Current Priority` banner** or a
-  dependency forces another order. The banner wins over topmost placement, and
-  it also outranks `.ralph/working_set.md`'s "NEXT LOOP" note, which carries
-  state, not priority.
-- **Priority comes from the banner.** Tasks in M0137–M0145 and `P0-` tasks
-  follow §"Plan-parity harness" below — read it before selecting one.
-  **M-NIGHTLY filing is unconditional:** every loop reads
-  `ci/logs/action-items.md` and files each new `## AI-` subject, but M-NIGHTLY
-  items are selected only when the banner says so, or when they break the build
-  or a gate the banner's work depends on.
+- One item per loop. Task-selection authority is exactly two places:
+  `.ralph/PROMPT.md` (procedure and rules) and the `## Current Priority`
+  section at the head of `.ralph/fix_plan.md` (rank order + the Selection
+  rules subsection, which holds S1/S2/S6/S7/S8 and the M-NIGHTLY selection
+  condition). Both always outrank `.ralph/working_set.md`'s "NEXT LOOP"
+  note, which carries state, not priority — and any other document's rank
+  statement is non-authoritative.
+- For M0137–M0145 and `P0-` tasks, §"Plan-parity harness" below is binding —
+  read it before selecting one. **M-NIGHTLY filing is unconditional:** every
+  loop reads `ci/logs/action-items.md` and files each new `## AI-` subject;
+  its selection condition lives in the banner's Selection rules.
 - Search before assuming something is missing. Prefer reading the spec and
   the upstream source over guessing.
 - Land a design doc alongside or just before any non-trivial subsystem. This
@@ -577,12 +578,13 @@ overriding the ambient convention inside a canonical measurement.
 obstacle: do not look for another command that achieves the same effect.
 
 ### S — Selection
-- **S1** The banner is the only ordering authority. Take its first selectable
-  item; inside an item, follow its stated order.
-- **S2** A newly found defect that loses data, returns wrong results or corrupts
-  a shared resource: file it as a task, add an escalation block naming it, and
-  continue with the banner. The owner places it in the banner (normally at
-  position 0). Do not reorder the banner yourself.
+
+**The selection rules (S1, S2, S6, S7, S8 and the M-NIGHTLY selection
+condition) moved 2026-09-24 to the `## Current Priority` banner's
+"Selection rules" subsection in `.ralph/fix_plan.md`** — that text is now
+the authority; the S-numbers are kept there for citation stability. What
+remains below is filing/completion discipline, not rank.
+
 - **S3** Every new task carries `Kind: recon|impl` and `Parent: <task-id|none>`;
   every task completed from now on carries `Movement: yes — <evidence>` or
   `Movement: none`. Write each field **at the start of its own line** — a field
@@ -607,13 +609,6 @@ obstacle: do not look for another command that achieves the same effect.
 - **S5** A recon may file an implementation task only if the task names its
   expected movement (queries, categories or ea-ratchet findings vs PG) and how
   it will be measured.
-- **S6** Tasks under the banner's `FROZEN-PREFIXES:` or marked `[!] FROZEN` are
-  not selected, re-statused, deleted or given children.
-- **S7** An open task the banner does not name is selectable only when every
-  banner item is exhausted or blocked.
-- **S8 Nothing selectable** (all remaining work blocked on the owner): write one
-  escalation block into `.ralph/working_set.md` listing each blocker, and end
-  the loop without code changes. Do not invent work.
 
 ### C — Changes
 - **C1 Recon** commits touch no non-test file under `internal/` or `cmd/`
@@ -682,8 +677,12 @@ Run on the change, in the task that changes production code:
   churn AND the NEW-vs-baseline diff consists solely of keys the scorer
   marks UNMATCHED-IN-PG (`pg_est=null`), with the attribution A/B attached
   (a clean-HEAD re-score showing the change under review introduced none
-  of them). Anything else stays forbidden: a NEW key with a PG-side
-  estimate is an estimator regression and must be fixed, not repinned.
+  of them). **Extended 2026-09-24 (owner, M0141-S2b-17a):** keys the change
+  under review DID introduce may also be repinned when the task's per-key
+  attribution (attached) shows the misestimate is PG-shared — PG's own
+  nearest-scope estimate exhibits the same divergence. Anything else stays
+  forbidden: a NEW key with a PG-side estimate that PG does not share is an
+  estimator regression and must be fixed, not repinned.
 - **G5** A matching plan that times out lands with a ledger row (coverage loss);
   never raise a timeout to hide it. A values mismatch stops the task.
 - **G6** Commit a gated code change only after its gates PASS for exactly the
