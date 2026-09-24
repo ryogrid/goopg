@@ -17185,7 +17185,7 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
       ea\-ratchet 52/52, deadcode 84.
 Movement: none — no plan moved on TPC-DS SF0.25/SF1 or TPC-H across all four deletion slices.
 
-- [ ] **M0145\-0008n — sequence the M0145\-0001 §6 rows that are still the
+- [x] **M0145\-0008n — sequence the M0145\-0001 §6 rows that are still the
   live route** \(filed 2026\-09\-24 by M0145\-0008 slice 4\). The audit table in
   `m0145\-0008\-del4\-pgshaped\-knob\-and\-retirement\-audit.md` lists them:
   the post\-hoc unnest family, the node\-tree seam walk
@@ -17199,6 +17199,55 @@ Movement: none — no plan moved on TPC-DS SF0.25/SF1 or TPC-H across all four d
     affects \(does a row produce a first divergence from PG on the corpora?\);
     rows that never do are refactor\-only and wait; rows that do become impl
     tasks naming their expected movement \(S5\).
+  - **DONE 2026\-09\-25 \(recon\).** Design:
+    `docs/design/0100-0149/m0145-0008n-live-route-attribution.md`; evidence
+    `analysis/m0145/m0145\-0008n/` \(per\-query `NLICENSUS` /
+    `SUBLINKCENSUS` routes, TPC\-H via `--queries N` runs, TPC\-DS SF0.25 via
+    log offsets; pull\-up total 23 matches the sweep\).
+    - **Produces first divergences:**
+      - Post\-hoc unnest decorrelates a correlated scalar subquery PG keeps
+        as a SubPlan: TPC\-H Q2, TPC\-DS Q1, Q6, Q32, Q92 \(PG 2 SubPlans,
+        goopg 0; first divergence at that join\) → M0145\-0008y.
+      - Post\-hoc semi join where PG pulls up: TPC\-H Q18 \(grouped IN →
+        PG unique\-ified inner Parallel Hash Join\), TPC\-DS Q14/Q23 extra
+        semi/anti joins → M0145\-0008z.
+    - **Refactor\-only \(same shape as PG, waits\):** the post\-hoc route on
+      Q16, Q17, Q20, Q30, Q41, Q45, Q54, Q58, Q81, Q95; `rewriteJoinsToNLI`
+      \(one node in all corpora, TPC\-H Q20\); rowmark passes \(no corpus
+      query locks rows\); seam declines \(2, `leaf\-count`\);
+      `planFromClause` \(on every query, no per\-query attribution\).
+    Movement: none — recon.
+
+
+- [ ] **M0145\-0008y — keep a correlated scalar subquery as a SubPlan, as
+  PG does** \(filed 2026\-09\-25 by M0145\-0008n\). goopg\'s post\-hoc unnest
+  decorrelates `x op \(SELECT agg … WHERE correlated\)` into a join; PG
+  keeps it as a correlated SubPlan \(`pull\_up\_sublinks` converts only
+  ANY/EXISTS; scalar sublinks stay SubPlans\). First divergence at that join
+  on TPC\-H Q2 and TPC\-DS Q1, Q6, Q32, Q92 \(PG plans show 2 SubPlans,
+  goopg none\).
+  Kind: impl
+  Parent: M0145-0008n
+  - First step: locate the scalar\-subquery arm of the post\-hoc unnest
+    \(`unnestSubqueriesInPlan` family\), decline it the way M0146\-0002c
+    declined the NOT IN arm, and measure the five queries\' first
+    divergences plus execution times \(a per\-row SubPlan can be slower in
+    goopg than the decorrelated join; PG runs it with index access\).
+  - Expected movement: TPC\-DS SF0.25 first divergences on Q1/Q6/Q32/Q92
+    and TPC\-H Q2 move past that join; measured on the canonical captures.
+
+- [ ] **M0145\-0008z — the pull\-up declines sublinks PG pulls up \(TPC\-H
+  Q18, TPC\-DS Q14/Q23\)** \(filed 2026\-09\-25 by M0145\-0008n\). TPC\-H Q18\'s
+  `IN \(SELECT l\_orderkey … GROUP BY … HAVING …\)` goes to the post\-hoc
+  route and becomes a Left Semi join; PG\'s `convert\_ANY\_sublink\_to\_join`
+  pulls it up and then unique\-ifies the grouped side into an inner Parallel
+  Hash Join. TPC\-DS Q14 and Q23 carry more semi/anti joins than PG \(5 vs
+  0, 8 vs 4\).
+  Kind: recon
+  Parent: M0145-0008n
+  - First step: read the `PULLUPCENSUS decline=` reason for each sublink
+    of Q18, Q14 and Q23 \(`GOOPG\_NLI\_CENSUS=1`\) and compare with PG\'s
+    admission rules for grouped/HAVING subqueries.
 
 
 - [x] **M0145-0009 — CTE-output statistics (B-06 resume): wire the landed
