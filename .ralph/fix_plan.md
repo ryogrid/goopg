@@ -17253,7 +17253,7 @@ Movement: none — no plan moved on TPC-DS SF0.25/SF1 or TPC-H across all four d
     - Resume: after M0146\-0012 lands, re\-run the prototype and the Q2
       timing.
 
-- [ ] **M0145\-0008z — the pull\-up declines sublinks PG pulls up \(TPC\-H
+- [x] **M0145\-0008z — the pull\-up declines sublinks PG pulls up \(TPC\-H
   Q18, TPC\-DS Q14/Q23\)** \(filed 2026\-09\-25 by M0145\-0008n\). TPC\-H Q18\'s
   `IN \(SELECT l\_orderkey … GROUP BY … HAVING …\)` goes to the post\-hoc
   route and becomes a Left Semi join; PG\'s `convert\_ANY\_sublink\_to\_join`
@@ -17265,6 +17265,40 @@ Movement: none — no plan moved on TPC-DS SF0.25/SF1 or TPC-H across all four d
   - First step: read the `PULLUPCENSUS decline=` reason for each sublink
     of Q18, Q14 and Q23 \(`GOOPG\_NLI\_CENSUS=1`\) and compare with PG\'s
     admission rules for grouped/HAVING subqueries.
+  - **DONE 2026\-09\-25 \(recon\).** Evidence
+    `analysis/m0145/m0145\-0008z/decline\-reasons.txt`.
+    - TPC\-H Q18: `decline=any\-body\-not\-simple`. The grouped/HAVING `IN`
+      body fails `sublinkBodyIsSimple` \(`pullUpAnyBody`,
+      `jointreepullup.go`\).
+    - TPC\-DS Q14 \(5\) and Q23 \(8\): `decline=any\-body\-leaf\-\(\*CTEScan\)`.
+      The `IN \(SELECT … FROM cte\)` body\'s leaf is a CTE scan, and the
+      pull\-up admits only base\-scan leaves.
+    - PG converts both. `convert\_ANY\_sublink\_to\_join` \(subselect.c\) makes
+      any uncorrelated body a subquery RTE on the semi side, and
+      `pull\_up\_subqueries` flattens it only if simple. The planner may then
+      unique\-ify the inner and join it as an inner join \(Q18: an inner
+      Parallel Hash Join; Q14/Q23: no semi joins in PG\'s plans\). goopg
+      already has the unique\-ify path \(`createuniquepath.go`\).
+    - `sublinkBodyIsSimple` is goopg\'s own gate, not PG\'s → M0145\-0008aa.
+    Movement: none — recon.
+
+- [ ] **M0145\-0008aa — pull up an ANY sublink whose body is not simple
+  as one derived semi\-side leaf, as PG does** \(filed 2026\-09\-25 by
+  M0145\-0008z\). A grouped/HAVING body \(TPC\-H Q18\) or a body over a CTE
+  scan \(TPC\-DS Q14 ×5, Q23 ×8\) is declined \(`any\-body\-not\-simple`,
+  `any\-body\-leaf\-\(\*CTEScan\)`\) and takes the post\-hoc route to a
+  Left Semi join; PG makes the body a subquery RTE on the semi side and can
+  then unique\-ify it into an inner join.
+  Kind: impl
+  Parent: M0145-0008z
+  - First step: admit a non\-simple body as a single derived leaf \(the
+    plan of the whole body, like M0145\-0013\'s pulled `\*CTEScan` leaf\)
+    in `pullUpAnyBody`, and check that the search considers the
+    unique\-ified inner for it. Watch the Q78 `outer\-over\-derived` lesson:
+    run the fire\-set gate at both scales.
+  - Expected movement: first divergences on TPC\-H Q18 \(`parallelism`\) and
+    TPC\-DS Q14 \(`join\-order`\) / Q23 \(`scan\-type`\), measured on the
+    canonical captures.
 
 
 - [x] **M0145-0009 — CTE-output statistics (B-06 resume): wire the landed
