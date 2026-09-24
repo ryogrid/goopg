@@ -19394,7 +19394,7 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
       commit\); `make ea\-ratchet` PASS 52 vs 52.
     Movement: yes — ea-ratchet NEW findings 3 -> 0 (attributed PG-shared repin, the task's stated exit; FIXED Q49 x2, Q54, Q94 dropped from the baseline).
 
-- [ ] **M0145-0008d — grouping pathkeys follow the ORDER BY direction
+- [x] **M0145-0008d — grouping pathkeys follow the ORDER BY direction
   when compatible** (same filing; ledger row exists). PG plans
   `GROUP BY c … ORDER BY c DESC` as GroupAggregate over one
   `Sort … DESC` — the group clause adopts ORDER BY's direction
@@ -19406,6 +19406,57 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
   - Expected movement: `aggregation-strategy` / `sort-strategy` on
     `GROUP BY k … ORDER BY k DESC` shapes on the canonical parallel
     capture.
+  - **DONE 2026\-09\-24 `e32442db1`.** Design:
+    `docs/design/0100-0149/m0145-0008d-group-clause-follows-order-by.md`;
+    evidence `analysis/m0145/m0145-0008d/`.
+    - `processedGroupOrder` \(transformGroupClauseExpr direction copy \+
+      preprocess\_groupclause prefix reorder\) feeds `Aggregate.GroupClause`
+      and the presearch group\_pathkeys; the sort producers, both emission
+      twins and EXPLAIN's Group Key follow it.
+    - The five\-plan `enable\_hashagg=off` probe is identical to PG 18.3,
+      pinned as `TestExplainGroupClauseFollowsOrderBy`.
+    - Gates: units, spotcheck, sf025 96/96, acceptance arm, fire\-set,
+      ea\-ratchet 52/52.
+    - The upstream `agg\_sort\_order` query crashes the planner at HEAD →
+      M0145\-0008h \(S2 escalation below\).
+    Movement: yes — CATEGORIES-EXCL-MATCH TPC-H aggregation-strategy 3 -> 4, sort-strategy 8 -> 9, rendering 4 -> 3 (Q18 only; its five PK-determined group keys PG prunes to two, M0145-0008i); SF0.25 unchanged.
+
+- [ ] **M0145\-0008h — planner panic crashes the server on `GROUP BY pk …
+  ORDER BY` a dependent column with an ordered aggregate** \(found
+  2026\-09\-24 by M0145\-0008d; reproduces at HEAD `7a46f9fab`\). The upstream
+  regress query `aggregates.out:3158`, `SELECT array\_agg\(c1 ORDER BY c2\), c2
+  FROM agg\_sort\_order WHERE c2 \< 100 GROUP BY c1 ORDER BY 2` with c1 a
+  primary key and a unique index on c2, panics in
+  `assertSortInputTargetCoversKeys` \(`createPlan: Sort input target \[\] drops
+  sort\-key column "b" of a 2\-column input row`, `sort\_input\_target.go:191`
+  via `stampSortInputTarget`, planner.go:2513\), and the whole server process
+  exits, dropping every session. PG plans it as Sort / GroupAggregate / Sort
+  c1, c2 / Index Scan.
+  Kind: impl
+  Parent: M0145-0008d
+  - First step: reproduce as a unit plan \(the deep\-indent fixture with `a
+    PRIMARY KEY` and `GROUP BY a ORDER BY 2`\); find why the Sort's input
+    target is empty for a functionally\-dependent sort key; and check why a
+    planner panic is not contained to the session.
+
+  > ## ESCALATION 2026\-09\-24 \(S2\) — a planner panic takes the whole server down
+  >
+  > M0145\-0008h: one SELECT \(the upstream `aggregates` regress query\) kills
+  > the server process for every session. It is filed and not selected
+  > ahead of the banner, per S2; the owner decides its placement.
+
+- [ ] **M0145\-0008i — multi\-relation `remove\_useless\_groupby\_columns`**:
+  PG drops GROUP BY columns that a primary key or unique NOT NULL index of
+  their relation makes redundant, for every relation in a join
+  \(`remove\_useless\_groupby\_columns`, initsplan.c\). goopg's
+  `pruneUselessGroupByColumns` handles only a single\-relation FROM. TPC\-H Q18
+  groups on five keys that PG prunes to `\(c\_custkey, o\_orderkey\)`. With five,
+  the ORDER BY prefix now reorders goopg's group clause and a GroupAggregate
+  wins; with two, PG keeps HashAggregate \+ Sort.
+  Kind: impl
+  Parent: M0145-0008d
+  - Expected movement: TPC\-H Q18 `aggregation\-strategy` / `sort\-strategy`
+    \(and its Group Key rendering\) on the canonical parallel capture.
 
 ## M0146 — Post-cutover plan parity (filed 2026-09-23, owner decision)
 

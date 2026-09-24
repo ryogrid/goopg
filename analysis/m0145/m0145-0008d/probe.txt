@@ -1,0 +1,69 @@
+# M0145-0008d probe, 2026-09-24: PG 18.3 scratch (:5534) vs goopg candidate (:5533), table gd(g,h,x) 200k rows, analyzed, enable_hashagg=off
+set max_parallel_workers_per_gather=0; set enable_hashagg=off;
+explain (costs off) select g, count(*) from gd group by g order by g desc;
+explain (costs off) select g, h, count(*) from gd group by h, g order by g desc, h;
+explain (costs off) select g, h, count(*) from gd group by h, g order by g desc;
+explain (costs off) select g, count(*) from gd group by g order by g desc nulls last;
+explain (costs off) select g, count(*) from gd group by g order by count(*) desc, g desc;
+select 'r1', string_agg(g::text||':'||h::text, ',') from (select g, h from gd group by h, g order by g desc, h limit 6) q;
+select 'r2', string_agg(g::text, ',') from (select g from gd group by g order by g desc limit 6) q;
+## PG 18.3
+GroupAggregate
+  Group Key: g
+  ->  Sort
+        Sort Key: g DESC
+        ->  Seq Scan on gd
+GroupAggregate
+  Group Key: g, h
+  ->  Sort
+        Sort Key: g DESC, h
+        ->  Seq Scan on gd
+GroupAggregate
+  Group Key: g, h
+  ->  Sort
+        Sort Key: g DESC, h
+        ->  Seq Scan on gd
+GroupAggregate
+  Group Key: g
+  ->  Sort
+        Sort Key: g DESC NULLS LAST
+        ->  Seq Scan on gd
+Sort
+  Sort Key: (count(*)) DESC, g DESC
+  ->  GroupAggregate
+        Group Key: g
+        ->  Sort
+              Sort Key: g DESC
+              ->  Seq Scan on gd
+r1|999:0,999:1,999:2,999:3,999:4,999:5
+r2|999,998,997,996,995,994
+## goopg candidate (identical to PG)
+GroupAggregate
+  Group Key: g
+  ->  Sort
+        Sort Key: g DESC
+        ->  Seq Scan on gd
+GroupAggregate
+  Group Key: g, h
+  ->  Sort
+        Sort Key: g DESC, h
+        ->  Seq Scan on gd
+GroupAggregate
+  Group Key: g, h
+  ->  Sort
+        Sort Key: g DESC, h
+        ->  Seq Scan on gd
+GroupAggregate
+  Group Key: g
+  ->  Sort
+        Sort Key: g DESC NULLS LAST
+        ->  Seq Scan on gd
+Sort
+  Sort Key: (count(*)) DESC, g DESC
+  ->  GroupAggregate
+        Group Key: g
+        ->  Sort
+              Sort Key: g DESC
+              ->  Seq Scan on gd
+r1|999:0,999:1,999:2,999:3,999:4,999:5
+r2|999,998,997,996,995,994
