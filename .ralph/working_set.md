@@ -1,17 +1,12 @@
 (idle — nothing in flight)
 
-This loop: M0145-0008f landed as 11968441a (executor only). The scan's
-retention clone copies only the deformed window, and the hashed grouping loop
-uses scratch key buffers. Q18 went from 9.53 s to 8.48 s; serial GROUP BY
-from 4.55 s to 3.8 s (PG 1.86 s). The remaining gap is the scan's per-row row
-allocation, filed as M0145-0008k (recon), which also covers count(*) being
-slower than sum().
-Note: the RALPH_LOOP guard pattern-matches command TEXT. A heredoc mentioning
-the reference port next to words like l_comment or ANALYZE is blocked; keep
-the port number out of write commands.
+This loop: M0145-0008g landed as 70d0478bd. An expression-operand IN list is
+now estimated as PG's scalararraysel. Q22's leaf is 1750 rows = PG, and its
+upper plan is PG's. TPC-H categories net -2 on Q22; SF0.25 unchanged;
+ea-ratchet 52/52. Q22's anti join stays hash because nestloopCost lacks
+final_cost_nestloop's semi/anti arm. Filed as M0145-0008l.
 
-Next per the banner (item 3): M0145-0008g (expression IN-list selectivity,
-Q22), then 0008h (planner crash, S2 escalation, still awaiting owner
-placement), 0008i, 0008j, 0008k, then the legacy-deletion slices and the
-M0146 continuation.
+Next per the banner (item 3): M0145-0008h (planner crash, S2 escalation;
+check the banner for owner placement first), then 0008i, 0008j, 0008k,
+0008l, then the legacy-deletion slices and the M0146 continuation (0002f).
 Parked: tmp/m0122-alter-system-wip.patch.

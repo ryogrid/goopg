@@ -19415,7 +19415,7 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
     under goopg's page mutation paths \(HOT prune compaction, hint bits\).
     Expected movement: none on parity; acceptance\-arm scan\-heavy times.
 
-- [ ] **M0145\-0008g — `expr = ANY \(const list\)` with an expression operand is
+- [x] **M0145\-0008g — `expr = ANY \(const list\)` with an expression operand is
   estimated as PG does**: PG prices `substr\(c\_phone,1,2\) IN \(7 values\)` at
   0.035 \(scalararraysel: per\-element eqsel, default 1/DEFAULT\_NUM\_DISTINCT
   for an expression without stats, OR\-merged\); goopg's `clauseSelectivity`
@@ -19428,6 +19428,36 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
     PG \(`final\_cost\_nestloop` semi/anti early exit\). Expected movement:
     TPC\-H Q22 elects PG's NL Anti Join \+ Index Only Scan
     \(`join\-method`/`parameterisation`\); acceptance\-arm Q22 time.
+  - **DONE 2026\-09\-24 `70d0478bd`.** Design:
+    `docs/design/0100-0149/m0145-0008g-inlist-expr-selectivity.md`;
+    evidence `analysis/m0145/m0145-0008g/`.
+    - `inListExprSelectivity` applies the scalar clause estimator to each
+      synthesized `operand <op> element`, merged by the shared
+      `inListMergeSelectivity`; both arms, pinned at PG's 0.035.
+    - Q22's customer leaf 1750 rows \(PG 1750\); upper plan now PG's
+      GroupAggregate over Gather Merge. The anti join stays hash: goopg's
+      `nestloopCost` has no semi/anti early\-exit arm and joins get no
+      index\-only inner → M0145\-0008l.
+    - Gates: units, spotcheck, sf025 96/96, acceptance arm, fire\-set,
+      ea\-ratchet 52/52.
+    Movement: yes — CATEGORIES-EXCL-MATCH TPC-H parameterisation 7 -> 6, aggregation-strategy 4 -> 3, sort-strategy 9 -> 8, rendering 3 -> 4 (Q22 net -2); SF0.25 unchanged.
+
+- [ ] **M0145\-0008l — nestloop semi/anti costing follows
+  `final\_cost\_nestloop`**: goopg's `nestloopCost` \(cost\_funcs.go\) charges the
+  full inner rescan for every outer row of a SEMI/ANTI \(or inner\-unique\)
+  nested loop. PG's `final\_cost\_nestloop` \(costsize.c:3349\+\) has a branch
+  for those join types, using `compute\_semi\_anti\_join\_factors`'
+  `outer\_match\_frac` / `match\_count`: matched outer rows scan only until the
+  first match \(`inner\_scan\_frac = 2 / \(match\_count \+ 1\)`\), and unmatched
+  ones are priced by whether the join quals are indexed. On TPC\-H Q22 with
+  hash joins off, goopg's NL anti costs 5450 \+ 1500 × 55.85 = 89470. PG
+  elects NL Anti \+ Index Only Scan on `order\_customer\_fkidx` at ~5881 \(its
+  inner is also an index\-only path goopg does not generate for joins\).
+  Kind: impl
+  Parent: M0145-0008g
+  - Expected movement: TPC\-H Q22 `join\-method` / `parameterisation` \(NL anti
+    elected\); check for Q21 / TPC\-DS NOT EXISTS moves with the fire\-set gate
+    and ea\-ratchet.
 
 - [x] **M0145-0008c — recon: PG-shared attribution for the flip's NEW
   ea-ratchet key `Q95:cte:ws_wh+customer_address+date_dim+web_sales+

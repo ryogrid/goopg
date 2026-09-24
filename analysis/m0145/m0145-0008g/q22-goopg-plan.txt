@@ -1,0 +1,17 @@
+=== Q22
+GroupAggregate  (cost=63837.77..63839.77 rows=200 width=72)
+  Group Key: cntrycode
+  ->  Gather Merge  (cost=63757.84..63834.48 rows=658 width=64)
+        Workers Planned: 2
+        ->  Sort  (cost=62757.82..62758.50 rows=274 width=64)
+              Sort Key: (substr(customer.c_phone, 1, 2))
+              ->  Hash Anti Join  (cost=60295.00..66165.96 rows=658 width=624)
+                    Hash Cond: (customer.c_custkey = orders.o_custkey)
+                    ->  Parallel Seq Scan on customer  (cost=0.00..5825.00 rows=1750 width=624)
+                          Filter: ((substr(c_phone, 1, 2) = ANY ('13', '31', '23', '29', '30', '18', '17')) AND (c_acctbal > (InitPlan 1).col1))
+                          InitPlan 1
+                            ->  Aggregate  (cost=5836.93..5836.94 rows=1 width=32)
+                                  ->  Seq Scan on customer_1  (cost=0.00..5825.00 rows=4771 width=624)
+                                        Filter: ((c_acctbal > 0.00) AND (substr(c_phone, 1, 2) = ANY ('13', '31', '23', '29', '30', '18', '17')))
+                    ->  Seq Scan on orders  (cost=0.00..41545.00 rows=1500000 width=448)
+

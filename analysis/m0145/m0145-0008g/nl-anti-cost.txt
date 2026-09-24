@@ -1,0 +1,3 @@
+# M0145-0008g: NL anti join cost with hash joins off, private TPC-H lane, serial
+Nested Loop Anti Join (cost=8.46..89470.58 rows=563) = 5450 + 1500 x 55.85: the full bitmap-heap inner is charged per outer row.
+PG: Nested Loop Anti Join over Index Only Scan on order_customer_fkidx (0.43..4.01 per probe), priced by final_cost_nestloop's semi/anti arm (outer_matched_rows, inner_scan_frac).
