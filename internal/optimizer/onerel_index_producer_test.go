@@ -59,19 +59,15 @@ func TestOneRelIndexProducerKeepsCorrelatedScalarProbe(t *testing.T) {
 	cat := oneRelIndexCatalog(t)
 	const sql = `select q from ori_outer where q < (select avg(v) from ori_inner where k = ori_outer.k)`
 
+	// One route since the M0145-0008 legacy deletion: the rule-based bypass
+	// and the GOOPG_ONEREL_SEARCH arm both retired into the jointree
+	// pipeline's searched one-relation scope.
 	for _, tc := range []struct {
-		name     string
-		jointree bool
-		oneRel   bool
+		name string
 	}{
-		// The rule-based bypass route was deleted with the legacy
-		// pipeline (M0145-0008); GOOPG_ONEREL_SEARCH still toggles.
-		{"jointree-route", true, false},
-		{"onerel-search-route", true, true},
+		{"jointree-route"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			defer func(o bool) { oneRelSearch = o }(oneRelSearch)
-			oneRelSearch = tc.oneRel
 
 			node, err := Plan(parseOne(t, sql), cat)
 			if err != nil {
@@ -132,19 +128,15 @@ func TestOneRelIndexProducerKeepsMultiConjunctCorrelatedProbe(t *testing.T) {
 	cat := oneRelIndexCatalog(t)
 	const sql = `select q from ori_outer where q < (select avg(v) from ori_inner where k = ori_outer.k and v > 3)`
 
+	// One route since the M0145-0008 legacy deletion: the rule-based bypass
+	// and the GOOPG_ONEREL_SEARCH arm both retired into the jointree
+	// pipeline's searched one-relation scope.
 	for _, tc := range []struct {
-		name     string
-		jointree bool
-		oneRel   bool
+		name string
 	}{
-		// The rule-based bypass route was deleted with the legacy
-		// pipeline (M0145-0008); GOOPG_ONEREL_SEARCH still toggles.
-		{"jointree-route", true, false},
-		{"onerel-search-route", true, true},
+		{"jointree-route"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			defer func(o bool) { oneRelSearch = o }(oneRelSearch)
-			oneRelSearch = tc.oneRel
 
 			node, err := Plan(parseOne(t, sql), cat)
 			if err != nil {

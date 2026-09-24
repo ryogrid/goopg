@@ -293,42 +293,6 @@ func (jl joinlist) leaves(dst []int) []int {
 	return dst
 }
 
-// innerPrefixBelowOuterSpine splits a statement's joinlist into the INNER
-// PREFIX a search may plan and the pinned OUTER links stacked above it,
-// outermost first. `spine` is empty — and `prefix` is `jl` itself — when the
-// joinlist is not topped by a pinned outer join.
-//
-// M0127-P5.9-s. The shape it recognises is the one `deconstructFromItem` builds
-// for the corpus's every explicit-JOIN query: a left-deep chain whose INNER
-// links flatten into one subproblem and whose outer links each wrap that
-// subproblem in a two-member pin, so the joinlist nests exactly as deep as the
-// chain has outer links. Peeling them is what makes the prefix searchable while
-// the outer links keep the order they were written in — the same division
-// `runJoinSearchBelowPinned` (predp.go) already makes for the semi/anti spine
-// pre-DP unnesting pins, and for the same reason: goopg cannot yet infer the
-// `SpecialJoinInfo` ordering constraints that would let an outer join enter the
-// search legally (03 §4.4), so the choice is "search what is below it" or
-// "search nothing", and before this the answer was nothing.
-//
-// A pin whose sub is not `pinnedItem`'s two-member `[left, right]` shape is
-// declined rather than interpreted: which member is the left side is the whole
-// question here, and guessing it wrong swaps the join's sides.
-func (jl joinlist) innerPrefixBelowOuterSpine() (prefix joinlist, spine []parser.JoinType) {
-	cur := jl
-	for len(cur) == 1 && cur[0].pinnedOuter() {
-		sub := cur[0].sub
-		if len(sub) != 2 || sub[0].isLeaf() {
-			return jl, nil
-		}
-		spine = append(spine, cur[0].jointype)
-		cur = sub[0].sub
-	}
-	if len(spine) == 0 {
-		return jl, nil
-	}
-	return cur, spine
-}
-
 // deconstructJointree computes the joinlist for a whole FROM clause: upstream's
 // `deconstruct_recurse` on the query's top `FromExpr` (initsplan.c:1190-1248),
 // whose `fromlist` is goopg's comma-separated `[]parser.FromExpr`.
@@ -440,16 +404,6 @@ func deconstructRangeVars(n int) joinlist {
 		jl[i] = leafItem(i)
 	}
 	return jl
-}
-
-// fromItemRels is the number of base relations one comma-separated FROM item
-// contributes: its base range variable plus one per JOIN in its chain. Exactly
-// the number of `rangeBinding`s `planFromItem` appends for the same item
-// (planner.go:2101-2117 — one `planScanRangeVar` for the base and one per
-// `item.Joins` entry), which is what keeps leaf numbering and binding order in
-// step.
-func fromItemRels(item parser.FromExpr) int {
-	return 1 + len(item.Joins) - antiCollapsedJoins(item)
 }
 
 // antiCollapsedJoins is the number of LEADING SEMI/ANTI links in one FROM

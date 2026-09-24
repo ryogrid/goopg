@@ -18108,24 +18108,3 @@ func findExprInTargets(re Expr, targets []Expr) int {
 	return -1
 }
 
-
-// joinTreeHasOuterLink reports whether node is a join tree carrying at least
-// one non-INNER, non-CROSS link — the gate for M0134-0188's WHERE-less seam
-// arm. Cheap and shape-only: it answers "is there an outer spine here for
-// `splitOuterSpine` to peel", not whether the peel will succeed.
-func joinTreeHasOuterLink(node Node) bool {
-	j, ok := node.(*Join)
-	if !ok {
-		return false
-	}
-	for {
-		if j.Type != JoinTypeInner && j.Type != JoinTypeCross {
-			return true
-		}
-		next, ok := j.Left.(*Join)
-		if !ok {
-			return false
-		}
-		j = next
-	}
-}

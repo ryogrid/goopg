@@ -137,12 +137,10 @@ var exprSwitchInventory = map[string]walkerRole{
 	// function, so the pin DEMOTES instead of disappearing. A conversion is
 	// audited by this role change; only a walker whose switch vanishes
 	// entirely loses its line.
-	"joinlayout.go:remapByPosMap":           nonRecursiveClassifier, // moved from bushy.go at M0127-P6.3 (rename only)
 	// M-NIGHTLY NULL-key guard (2026-09-24): decides whether a top-level AND
 	// conjunct strictly tests one column; descends only through AND, and an
 	// unenumerated type answers "not proven", which keeps the index guard.
 	"pathindexrestrict.go:qualsRejectNull": nonRecursiveClassifier,
-	"joinlayout.go:remapOuterRefsInSubplan": walkerPending, // 5 of 32 arms; moved from bushy.go at M0127-P6.3
 	// `joinlayout.go:remapPosMapAfterRewrite` (walkerPending, 8 of 32 arms)
 	// was deleted by C-20b: the walker mutated nothing — its posMap parameter
 	// was never read — so there was no conversion to finish, only dead weight
@@ -325,8 +323,6 @@ var exprSwitchInventory = map[string]walkerRole{
 	"planner.go:replaceExprNode":                 walkerPending, // 6 of 32 arms
 	"planner.go:shiftColumnRefsBy":               walkerPending, // 13 of 32 arms
 	"planner.go:withinGroupDirectArgColumnName":  walkerPending, // 2 of 32 arms
-	"predp.go:remapSublinkOuterRefs":             walkerPending, // 3 of 32 arms
-	"predp.go:whereEligibleForPreDPUnnest":       nonRecursiveClassifier,
 	// Added by take2 P1-14b (patternsel slice): a 2-arm shape recogniser
 	// (StringConst / LikeEscapePattern) with decline-by-default — an
 	// unenumerated type falls through to the match default, the

@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
-# scripts/jointree-parity-capture.sh — M0145-0002 dual-pipeline harness:
-# the knob-arm plan-parity capture recipe (AGENT.md §"Plan-parity harness" G8).
+# scripts/jointree-parity-capture.sh — M0145-0002 plan-parity capture recipe
+# (AGENT.md §"Plan-parity harness" G8), born as the dual-pipeline harness's
+# knob-arm capture. Since the M0145-0008 legacy deletion there is one
+# pipeline and no knob; the name stays because the fire-set gate and the
+# design docs call it by it.
 #
 # Produces pg-plan-parity-diff.py-compatible `=== Qn` plan files for ONE
-# corpus on a private lane, with GOOPG_JOINTREE_PIPELINE exported into the
-# measured server's environment. EXPLAIN-only throughout: a plan the
-# executor cannot yet run is still comparable evidence, and nothing here
-# executes a query body (G8's own rule for the transition).
+# corpus on a private lane. EXPLAIN-only unless FIRESET_QUERIES asks for
+# execution (below).
 #
 # Usage:
 #   scripts/jointree-parity-capture.sh tpch        <label> <outdir>
@@ -14,18 +15,13 @@
 #   scripts/jointree-parity-capture.sh tpcds-sf1   <label> <outdir>
 #
 # Writes into <outdir>:
-#   <label>.plans.txt      goopg arm — knob state = $JOINTREE
+#   <label>.plans.txt      goopg arm
 #   <label>-pg.plans.txt   PG 18.3 reference arm
 #   <label>-diff.txt       pg-plan-parity-diff.py output (PLAN-PARITY +
 #                          CATEGORIES / CATEGORIES-EXCL-MATCH)
 #   <label>-class.txt      pg-plan-divergence-class.py per-stage report
 #
 # Environment:
-#   JOINTREE   GOOPG_JOINTREE_PIPELINE for the goopg arm (default 1 — this
-#              script exists to measure the knob arm; JOINTREE=0 is a
-#              control arm through identical machinery). Value gates never
-#              run through here: they are the DEFAULT pipeline's property
-#              (G8), so a green knob-arm capture discharges nothing.
 #   GOOPG_BIN  engine image for the TPC-DS lane (default
 #              tmp/goopg-jointree-bin, built from HEAD here). The TPC-H
 #              lane builds its own inside tpch-estimate-audit-arm.sh.
@@ -61,7 +57,7 @@
 #
 # Arms:
 #   tpch       delegates server bring-up to tpch-estimate-audit-arm.sh
-#              (JOINTREE=<n> PLAN_ONLY=1 … -serial=false — the canonical
+#              (PLAN_ONLY=1 … -serial=false — the canonical
 #              parallel-mode TPC-H parity arm, M0144-0001), then captures
 #              the PG reference itself with a bare estimate-audit
 #              invocation: -warm-stats=false, NEVER -ref-port — that flag
@@ -96,8 +92,6 @@ esac
 [[ -n "${LABEL}" && -n "${OUTDIR}" ]] || { echo "usage: $0 ${CORPUS} <label> <outdir>" >&2; exit 2; }
 mkdir -p "${OUTDIR}" || exit 2
 
-JOINTREE="${JOINTREE:-1}"
-export GOOPG_JOINTREE_PIPELINE="${JOINTREE}"
 
 GOOPG_PLANS="${OUTDIR}/${LABEL}.plans.txt"
 PG_PLANS="${OUTDIR}/${LABEL}-pg.plans.txt"
@@ -132,7 +126,7 @@ if [[ "${CORPUS}" == "tpch" ]]; then
     # REFERENCE= empty: the §4 ratchet's committed baseline is absent from
     # this checkout and a plan-only run cannot consume it anyway — the
     # recipe captures its own PG arm below instead.
-    JOINTREE="${JOINTREE}" PLAN_ONLY=1 REFERENCE= \
+    PLAN_ONLY=1 REFERENCE= \
         "${SCRIPT_DIR}/tpch-estimate-audit-arm.sh" "${LABEL}" \
         -serial=false -out "${OUTDIR}" || exit $?
     AUDIT_BIN="${AUDIT_BIN:-${REPO_ROOT}/tmp/estimate-audit}"
@@ -292,7 +286,7 @@ else
     # (capture-stamp.sh refuses an unlabelled private lane).
     CAPTURE_ENGINE=goopg GOOPG_EXPECT_BIN_SHA256="${EXPECT_BIN_SHA}" \
         "${SCRIPT_DIR}/capture-tpcds.sh" "${PORT}" postgres postgres \
-        "${GOOPG_PLANS}" "${LABEL} goopg ${CORPUS} JOINTREE=${JOINTREE}" "${CLONE}" || exit $?
+        "${GOOPG_PLANS}" "${LABEL} goopg ${CORPUS}" "${CLONE}" || exit $?
 fi
 
 # Optional fire-set execution stays inside this already-isolated clone.  A

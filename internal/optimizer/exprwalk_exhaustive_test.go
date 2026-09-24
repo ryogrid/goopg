@@ -366,31 +366,6 @@ func TestMultiAssignSubqElemReachesItsRowAsASlot(t *testing.T) {
 	}
 }
 
-func TestRewritePlanExprInPlaceMutates(t *testing.T) {
-	left := colRef(0, "a")
-	e := Expr(&BinaryOp{Left: left, Right: colRef(1, "b")})
-	ok := rewriteExprRefsInPlace(&e, scopeIgnore, exprRewriter{
-		Rewrite: func(n Expr) Expr {
-			if c, isCol := n.(*ColumnRef); isCol {
-				c.Index += 10
-			}
-			return n
-		},
-	})
-	if !ok {
-		t.Fatal("rewrite aborted")
-	}
-	bin := e.(*BinaryOp)
-	if bin.Left.(*ColumnRef).Index != 10 || bin.Right.(*ColumnRef).Index != 11 {
-		t.Fatalf("indices not shifted in place: %d, %d",
-			bin.Left.(*ColumnRef).Index, bin.Right.(*ColumnRef).Index)
-	}
-	// In-place means the ORIGINAL node object was mutated.
-	if left.Index != 10 {
-		t.Fatalf("original ColumnRef not mutated (index %d) — this driver is the in-place one", left.Index)
-	}
-}
-
 func TestCloneRewritePlanExprLeavesOriginalUntouched(t *testing.T) {
 	orig := &BinaryOp{Left: colRef(0, "a"), Right: colRef(1, "b")}
 	got, ok := cloneExprRefs(orig, scopeIgnore, exprRewriter{

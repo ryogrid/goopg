@@ -17085,6 +17085,24 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
       `GOOPG\_ONEREL\_SEARCH` / `GOOPG\_UNNEST\_PREDP`, the spine\-aware code
       in `tryPGShapedJoinSearch`, the sf025 `SF025\_FLOW\_KNOB` block and the
       scripts' `JOINTREE` variables; then the retired seam guards.
+  - **Legacy\-deletion slice 3 LANDED 2026\-09\-24: the dead code.** Design:
+    `docs/design/0100-0149/m0145-0008-del3-dead-code.md`; evidence
+    `analysis/m0145/m0145-0008-del3/`.
+    - Deleted `predp.go` and `onerelsearch.go` whole, the outer\-spine
+      peel/splice and every `spine` read in `tryPGShapedJoinSearch`, the
+      enclosing\-tree splice tripwires, the splice\-only remap helpers and
+      `joinTreeHasOuterLink`; retired `GOOPG\_UNNEST\_PREDP` and
+      `GOOPG\_ONEREL\_SEARCH`; removed the sf025 knob lane and the scripts'
+      `JOINTREE` variables. deadcode 106 → 84 \(below the pre\-slice\-2 87\).
+    - Gates: units, spotcheck, fire\-set `fires=none` at SF0.25, SF1 and
+      TPC\-H, sweep 96/96 \(shapes 99/99 same\), acceptance 24 MATCH,
+      ea\-ratchet 52/52.
+    Movement: none.
+    - Next: an AUDIT of M0145\-0001's §6 retirement rows. Many are still
+      the live route \(`tryJoinSearch`, the post\-hoc unnest family,
+      `planFromClause`, the `joinlist` proto\-IR, several decline
+      classes\), so they need a per\-row verdict: gone / dead / live plus
+      its blocking task. Close the dead rows and file the live ones.
 
 
 - [x] **M0145-0009 — CTE-output statistics (B-06 resume): wire the landed

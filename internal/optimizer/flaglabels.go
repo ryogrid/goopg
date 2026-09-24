@@ -81,7 +81,6 @@ var flagResolvedState = map[string]func(string) string{
 	"GOOPG_PARALLEL":          func(v string) string { return onOff(parallelFromEnv(v)) },
 	"GOOPG_PGSHAPED_DP":       func(v string) string { return onOff(pgShapedDPFromEnv(v)) },
 	"GOOPG_EXISTS_TO_ANY":     func(v string) string { return onOff(existsToAnyFromEnv(v)) },
-	"GOOPG_UNNEST_PREDP":      func(v string) string { return onOff(unnestPreDPFromEnv(v)) },
 	"GOOPG_INDEXKEY_HARVEST":  func(v string) string { return onOff(indexKeyHarvestFromEnv(v)) },
 	"GOOPG_HASH_OUTER_JOIN":   func(v string) string { return onOff(hashOuterJoinFromEnv(v)) },
 	// Take2 P4-01 rev 10 step 3: narrows hash-join build sides to the
@@ -126,11 +125,6 @@ var flagResolvedState = map[string]func(string) string{
 	"GOOPG_PARTIAL_AGG_PATHS": func(v string) string {
 		return partialAggModeLabel(partialAggModeFromEnv(v))
 	},
-	// E-21 Cut 1 (onerelsearch.go): decides whether a statement with ONE FROM
-	// item enters the path search at all. It moves access-method selection for
-	// every single-table query, not only the Gather it exists for, so an
-	// artefact that does not name it cannot say which arm was measured.
-	"GOOPG_ONEREL_SEARCH": func(v string) string { return oneRelSearchLabel(oneRelSearchFromEnv(v)) },
 	// C-19e: selects which authority decides `Gather Merge -> Sort -> partial`
 	// — the retired type switch or the priced two-candidate tournament. It
 	// moves the plan of every parallel ORDER BY / merge-input sort, so an
@@ -248,8 +242,7 @@ var flagProvenanceOrder = []string{
 	"GOOPG_PARTIAL_AGG_PATHS",
 	// Joined at take3 E-21 Cut 1: admits a one-FROM-item statement to the path
 	// search, as PG's set_base_rel_pathlists does unconditionally
-	// (allpaths.c:221). Default `off` pending the corpora A/B
-	// (docs/design/planner-e20-e21-parallel-path-search/DESIGN.md §4, §6).
+	// (allpaths.c:221). Retired at M0145-0008 — see flagProvenanceRetired.
 	"GOOPG_ONEREL_SEARCH",
 	// Joined at take3 C-19e (P5-05). Default `off` pending the measurement in
 	// docs/design/planner-c19e-partial-sort/DESIGN.md §5.
@@ -337,6 +330,15 @@ var flagProvenanceRetired = map[string]string{
 	// the jointree pipeline, and its legacy-deletion slice 2 deleted the
 	// legacy pipeline the `=0` value selected, so nothing reads the variable.
 	"GOOPG_JOINTREE_PIPELINE": "M0145-0008",
+	// take2's S5a pre-DP sublink pull-up position (default on). The jointree
+	// pipeline pulls sublinks up into the one search problem instead, and
+	// M0145-0008's legacy deletion removed the route, so nothing reads it.
+	"GOOPG_UNNEST_PREDP": "M0145-0008",
+	// E-21's one-relation search floor for the legacy pipeline. The jointree
+	// pipeline searches every one-relation scope unconditionally
+	// (M0145-0005 slice 4); with the legacy pipeline deleted (M0145-0008)
+	// nothing reads the variable.
+	"GOOPG_ONEREL_SEARCH": "M0145-0008",
 }
 
 // FlagProvenanceTable is the authoritative list of planner env flags that a

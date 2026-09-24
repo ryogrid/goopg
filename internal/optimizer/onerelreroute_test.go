@@ -89,7 +89,6 @@ func treeHasSearched(n Node) bool {
 // (1) Knob ON routes the single-table statement through the search.
 func TestOneRelRerouteSearchesSingleTableStatement(t *testing.T) {
 	withPGShapedDP(t)
-	t.Cleanup(setOneRelSearchForTest(true))
 	cat := oneRelRoutedCatalog(t)
 	node := planRouted(t, cat, "SELECT a FROM t WHERE a > 5")
 	if !treeHasSearched(node) {
@@ -100,7 +99,6 @@ func TestOneRelRerouteSearchesSingleTableStatement(t *testing.T) {
 // (3) The FROM fallthrough does not break WHERE-less statements.
 func TestOneRelReroutePlansWhereLessSingleTable(t *testing.T) {
 	withPGShapedDP(t)
-	t.Cleanup(setOneRelSearchForTest(true))
 	cat := oneRelRoutedCatalog(t)
 	node := planRouted(t, cat, "SELECT a FROM t")
 	if node == nil {

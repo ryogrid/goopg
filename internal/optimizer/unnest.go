@@ -36,32 +36,13 @@ func init() {
 	// variable GOOPG_INDEXKEY_HARVEST=off at server start (operational
 	// kill switch, same spirit as the planned GOOPG_SUBPLAN_RESCAN).
 	indexKeyHarvestOn.Store(indexKeyHarvestFromEnv(os.Getenv("GOOPG_INDEXKEY_HARVEST")))
-	// S5a (D3.1): run sublink pull-up BEFORE join-order search so
-	// decorrelated semi/anti joins pin above the DP result and their
-	// sunk residual conjuncts participate in join search. Default ON;
-	// GOOPG_UNNEST_PREDP=off restores the historical post-DP position
-	// (field rollback — the legacy call site is kept intact behind
-	// this flag).
-	unnestPreDPOn.Store(unnestPreDPFromEnv(os.Getenv("GOOPG_UNNEST_PREDP")))
 }
 
-// indexKeyHarvestFromEnv / unnestPreDPFromEnv are the two kill-switches'
-// polarities, factored out of init so the provenance table (flaglabels.go) can
-// render their unset defaults from the same functions production resolves them
-// with; see memoizeFromEnv.
+// indexKeyHarvestFromEnv is the kill-switch's polarity, factored out of init
+// so the provenance table (flaglabels.go) can render its unset default from
+// the same function production resolves it with; see memoizeFromEnv. (Its
+// sibling GOOPG_UNNEST_PREDP retired with the S5a pre-DP route, M0145-0008.)
 func indexKeyHarvestFromEnv(v string) bool { return v != "off" }
-func unnestPreDPFromEnv(v string) bool     { return v != "off" }
-
-// unnestPreDPOn gates the S5a pipeline reorder (pull-up before join
-// search). See init above and runJoinSearchBelowPinned in predp.go.
-var unnestPreDPOn atomic.Bool
-
-// SetUnnestPreDPEnabled flips the S5a pre-DP pull-up position. Test
-// hook, mirroring SetIndexKeyHarvestEnabled.
-func SetUnnestPreDPEnabled(on bool) { unnestPreDPOn.Store(on) }
-
-// unnestPreDPEnabled reports whether pull-up runs before join search.
-func unnestPreDPEnabled() bool { return unnestPreDPOn.Load() }
 
 // SetSubqueryUnnestEnabled flips the sublink pull-up pass on or off.
 // Test-only API, mirroring SetNLIEnabled: there is deliberately no

@@ -1,33 +1,32 @@
-Task: M0145-0008 (cutover), legacy-deletion slice 2 — DONE and committed:
-the legacy pipeline and GOOPG_JOINTREE_PIPELINE are deleted (Movement: none).
-Files: internal/optimizer/{planner.go,joinsearchseam.go,collapse.go,
-specialjoin.go,flaglabels.go}; jointreepipeline.go(+_test) and
-pipeline_pin_test.go deleted; about 25 test files unpinned or trimmed;
-scripts/planner-flags.env regenerated; scripts/tpcds-sf025-regression.sh
-(SF025_FLOW_KNOB now defaults to 0); design doc
-m0145-0008-del2-legacy-pipeline-deleted.md + README + flip doc;
-analysis/m0145/m0145-0008-del2/ (gates, deadcode before/after).
-Key symbols: planSelectWithSettings (now the body), tryPGShapedJoinSearch
-(floor const 1, spine always empty), flagProvenanceRetired.
-Findings:
-- Legacy-pinned tests were run unpinned: 32 failed, all on legacy-only shapes
-  (hash keys, SubPlan refusals PG no longer makes, the floor-2 decline).
-  Deleted, except the 2 correlated-IN pins, which were rewritten: PG pulls
-  a correlated IN up as a LATERAL semi join, and the new pin checks that
-  both conjuncts are kept.
-- deadcode: 20 newly unreachable optimizer functions (list in the design doc
-  and analysis/m0145/m0145-0008-del2/deadcode-after.txt).
-Next step: legacy-deletion slice 3 (dead code). Delete those 20 functions and
-their test references (about 20 test files: predp_test, enclosingtree_test,
-joinsearchspine_test, collapse_corpus_test, onerelsearch_test, ...). Retire
-GOOPG_ONEREL_SEARCH and GOOPG_UNNEST_PREDP through flagProvenanceRetired and
-regenerate planner-flags.env. Simplify the spine-aware code in
-tryPGShapedJoinSearch (len(spine)==0). Delete the sf025 SF025_FLOW_KNOB block
-and the scripts' JOINTREE vars. Rerun deadcode to confirm; fires should stay
-none. Then the seam guards on M0145-0001's retired list.
-Gates run: units PASS; tpch-spotcheck PASS (Q12=2, Q13=33); fireset HEAD vs
-staged: fires=none at SF0.25 and SF1, PASS; sf025 sweep 96/96, shapes 99/99
-same; acceptance arm 24 MATCH vs arm-on-20260922-loop77; ea-ratchet 52/52.
-Selection: M0145-0008 parent (topmost in item 3; owner GO'd the deletion
-slices). 0008m (wrong results, S2) is still waiting for owner placement.
+Task: M0145-0008 (cutover), legacy-deletion slice 3 — DONE and committed:
+the code only the legacy pipeline reached is deleted (Movement: none).
+Files: internal/optimizer: predp.go and onerelsearch.go deleted;
+joinsearchseam.go (spine code gone; pgShapedOffsetChecksOK(spans,
+nonEmitting, bindingOffsets)); enclosingtree.go, collapse.go, exprwalk.go,
+joinlayout.go, planner.go, joinsearchtrace.go, unnest.go, flaglabels.go;
+tests trimmed (remap_arms_test.go -> outerref_fixture_test.go).
+Scripts: sf025 (knob lane gone), fireset/parity-capture/estimate-audit
+(JOINTREE vars gone), planner-flags.env regenerated. Design doc
+m0145-0008-del3-dead-code.md + README + flip doc.
+Findings: deadcode for internal/optimizer went 106 -> 84, below the
+pre-slice-2 baseline of 87. No plan moved on TPC-DS SF0.25/SF1 or TPC-H
+(fire-set fires=none on all three).
+Side note: the tpch capture lane (estimate-audit-arm) still defaults
+GOOPG_PGSHAPED_DP=0 (PGSHAPED unset), so a CORPORA=tpch fire-set run
+measures the non-shipped DP. It reads TPC-H match=1, not the flip's 2. This
+is pre-existing and not filed yet; consider pinning PGSHAPED=1 in
+jointree-parity-capture.sh's tpch lane.
+Next step: an audit of M0145-0001's §6 retirement list
+(docs/design/0100-0149/m0145-0001-jointree-ir-and-lowering-contract.md:381).
+For each row, give a verdict: gone / dead (deadcode) / live, and if live,
+the task that must land before it can go. Many rows are still the live route
+(tryJoinSearch, the unnest family, planFromClause, the joinlist proto-IR,
+decline classes). Close the dead rows; file the live ones as children of
+M0145-0008 or map them to the M0146 tasks. That decides whether
+M0145-0008 can be marked [x].
+Gates run: units PASS; spotcheck PASS (Q12=2, Q13=33); fireset HEAD vs
+staged fires=none at SF0.25 and SF1, and with CORPORA=tpch; sf025 96/96,
+shapes 99/99 same; acceptance 24 MATCH; ea-ratchet 52/52.
+Selection: M0145-0008 parent (item 3; owner GO on the deletion slices).
+0008m (wrong results, S2) is still waiting for owner placement.
 In-flight: none

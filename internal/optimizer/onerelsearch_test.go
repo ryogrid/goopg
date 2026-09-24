@@ -3,14 +3,10 @@ package optimizer
 // E-21 Cut 1 — the one-relation path search
 // (docs/design/planner-e20-e21-parallel-path-search/DESIGN.md §4 Cut 1).
 //
-// Two things have to hold and neither is observable from a values gate, which
-// is why they are pinned here rather than measured on a corpus:
-//
-//  1. with `GOOPG_ONEREL_SEARCH` off the seam is INERT for a one-relation
-//     statement — node and predicate come back by identity, the same rollback
-//     guarantee `TestPGShapedSeamIsInertWithTheFlagOff` makes for the search
-//     as a whole;
-//  2. with it on, the statement reaches the path search and its base rel
+// What has to hold is not observable from a values gate, which is why it is
+// pinned here rather than measured on a corpus: a one-relation statement
+// reaches the path search (unconditionally since M0145-0008 retired the
+// `GOOPG_ONEREL_SEARCH` knob with the legacy pipeline) and its base rel
 //     acquires the `PartialPathlist` entry `create_plain_partial_paths`
 //     (allpaths.c:806) files for every plain relation — the thing E-21 says
 //     does not exist today, and the input `generateUsefulGatherPaths` reads.
@@ -39,20 +35,16 @@ func oneRelSeamFixture(rows int64) (Node, *resolveContext) {
 // the one-relation protocol it runs) already existed and was simply unreachable.
 func TestOneRelSearchAdmitsASingleTableStatement(t *testing.T) {
 	withPGShapedDP(t)
-	t.Cleanup(setOneRelSearchForTest(true))
 
 	node, ctx := oneRelSeamFixture(10_000_000)
 	pred := seamLocal([]string{"a"}, 0)
 
 	out, _, used := tryPGShapedJoinSearch(node, pred, ctx, nil)
 	if !used {
-		t.Fatal("the seam declined a one-relation statement with GOOPG_ONEREL_SEARCH on")
+		t.Fatal("the seam declined a one-relation statement")
 	}
 	if !isSearchedTree(out) {
 		t.Fatalf("the seam returned %T untagged — the statement was not searched", out)
-	}
-	if minSearchRels() != 1 {
-		t.Fatalf("minSearchRels() = %d with the knob on, want 1", minSearchRels())
 	}
 }
 
@@ -74,7 +66,6 @@ func TestOneRelSearchAdmitsASingleTableStatement(t *testing.T) {
 // statement is sufficient and no second change is needed. Both halves are
 // required and neither implies the other.
 func TestOneRelSearchFilesAPartialPath(t *testing.T) {
-	t.Cleanup(setOneRelSearchForTest(true))
 
 	const rows = 10_000_000
 	_, ctx := oneRelSeamFixture(rows)

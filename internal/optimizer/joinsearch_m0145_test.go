@@ -174,12 +174,10 @@ func TestJointreePullsExistsOverSingleTable(t *testing.T) {
 }
 
 // TestJointreeAdmitsAOneRelProblem pins the floor itself at the seam:
-// nprefix=1 on the jointree arm is a searched problem even with
-// GOOPG_ONEREL_SEARCH off — the env knob now governs the legacy arm
-// alone.
+// nprefix=1 is a searched problem (the floor is 1; GOOPG_ONEREL_SEARCH,
+// which once lowered it for the legacy arm, retired in M0145-0008).
 func TestJointreeAdmitsAOneRelProblem(t *testing.T) {
 	withPGShapedDP(t)
-	defer setOneRelSearchForTest(false)()
 
 	names := []string{"a"}
 	node, ctx := seamFixture(names, []int64{100_000})
