@@ -134,6 +134,10 @@ func indexFullScansKeepNullKeyedRows(t *testing.T) {
 	}{
 		{"seqscan-off-order-by", func(ps *optimizer.PlannerSettings) { ps.EnableSeqScan = false }, "SELECT a FROM %s ORDER BY a"},
 		{"group-by-index-order", func(ps *optimizer.PlannerSettings) { ps.EnableHashAgg = false; ps.EnableSeqScan = false }, "SELECT a, count(*) FROM %s GROUP BY a"},
+		// Two relations, so the legacy pipeline also reaches the cost-based
+		// search, whose index-only producer offers a full scan of x's index
+		// when x has no local qual.
+		{"join-bare-index-only", func(ps *optimizer.PlannerSettings) { ps.EnableSeqScan = false }, "SELECT x.a FROM %s x, f2 WHERE f2.a = 3"},
 		{"merge-left-join", func(ps *optimizer.PlannerSettings) {
 			ps.EnableHashJoin = false
 			ps.EnableNestLoop = false

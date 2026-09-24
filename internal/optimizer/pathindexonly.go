@@ -80,6 +80,11 @@ func (s *searchCtx) addIndexOnlyPaths(cat catalog.Catalog) {
 				if clauses == nil {
 					continue
 				}
+			} else if !indexUnboundKeysNotNull(tbl, idx, 0) {
+				// A full scan leaves every key column unbound, so it needs the
+				// same NULL-key rule as consumingIndexClauses: an index without
+				// NULL-keyed entries would drop those rows.
+				continue
 			}
 			if s.addOneIndexOnlyPath(cat, rel, tbl, idx, needed, clauses, relPages, relTuples, totalPages) {
 				added = true
