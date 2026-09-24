@@ -19341,7 +19341,7 @@ M0146-0001 re-baseline census on the new default arm.
     identity pins; the witness Q14 matches PG. The Q16 remainder is owned by
     M0146\-0002b; category regressions by M0146\-0002a.
 
-- [ ] **M0146\-0002b — `NOT IN` is converted to an anti join; PG keeps a
+- [x] **M0146\-0002b — `NOT IN` is converted to an anti join; PG keeps a
   hashed SubPlan** \(measured 2026\-09\-24 on TPC\-H Q16 by M0146\-0002's slice
   3; owns the 2026\-09\-21 M0145\-0003 ledger row\). goopg's legacy unnest
   \(`canUnnestInExpr` / `unnestInExpr`, `internal/optimizer/unnest.go`\) still
@@ -19360,6 +19360,31 @@ M0146-0001 re-baseline census on the new default arm.
     question; goopg's anti join tracks `antiBuildHasNull`\). Expected
     movement: Q16 leaving `parallelism` and `aggregation\-strategy` once the
     `Negated` arm is dropped and NOT IN plans as a hashed SubPlan.
+  - **DONE 2026\-09\-24 \(recon\).** Design:
+    `docs/design/0100-0149/m0146-0002b-not-in-anti-join-census.md`; raw
+    `analysis/m0146/m0146\-0002b/not\-in\-probe.txt`.
+    - Correctness REFUTED: goopg \(HEAD `9aa73d50c`\) and PG 18.3 return
+      identical results on six NULL\-bearing NOT IN cases; the anti join is
+      null\-aware, so the divergence is plan shape only.
+    - Corpus reach: TPC\-H Q16 is the only NOT\-IN\-derived anti join
+      \(TPC\-DS has no NOT IN; its anti joins are NOT EXISTS\).
+    - Follow\-up filed: M0146\-0002c.
+    Movement: none — recon.
+
+- [ ] **M0146\-0002c — plan `NOT IN` as a hashed SubPlan, as PG does**
+  \(filed 2026\-09\-24 by M0146\-0002b\): drop the `Negated` arm of the legacy
+  IN unnest \(`canUnnestInExprDepth` / the `effNegated` path in
+  `internal/optimizer/unnest.go`\) so `x NOT IN \(SELECT …\)` stays a
+  `\(hashed SubPlan\)` filter \(PG: `pull\_up\_sublinks\_qual\_recurse` converts
+  ANY/EXISTS only, `prepjointree.c:665/731`\).
+  Kind: impl
+  Parent: M0146-0002b
+  - Expected movement: TPC\-H Q16 loses the anti\-join\-driven divergences
+    \(`parallelism`, `aggregation\-strategy`, `join\-order`\); measured on the
+    canonical parallel TPC\-H capture \(`JOINTREE=1 PGSHAPED=1
+    scripts/jointree\-parity\-capture.sh tpch`\).
+  - Values are already identical \(the NULL probe\); pin the hashed\-SubPlan
+    shape with a NULL\-bearing identity test against the recorded PG answers.
 
 - [ ] **M0146\-0002a — category regressions from the Parallel Hash arm**
   \(measured 2026\-09\-24 at slice 2, TPC\-H parallel lane\): Q12 gains
