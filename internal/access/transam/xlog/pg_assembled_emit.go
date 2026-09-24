@@ -522,6 +522,29 @@ func EncodeHeapPruneOptPG(rel storage.RelFileNode, blk storage.BlockNumber, redi
 	return framedAssemble(RmgrHeap2, xlogHeap2PruneOnAccess, 0, mainData, []BlockRef{{ID: 0, Rel: rel, Block: blk, Data: blockData}})
 }
 
+// EncodeHeapVacuumCleanupPG builds the xl_heap_prune record VACUUM's second
+// heap pass writes (lazy_vacuum_heap_page, vacuumlazy.c): opcode
+// XLOG_HEAP2_PRUNE_VACUUM_CLEANUP, reason PRUNE_VACUUM_CLEANUP, and only the
+// now-unused sub-record, listing LP_DEAD items whose index entries are gone.
+// No XLHP_CLEANUP_LOCK: no tuple byte moves, so PG's redo only marks the items
+// unused and truncates the line-pointer array (heap_page_prune_execute's
+// lp_truncate_only arm). M0145-0008v.
+func EncodeHeapVacuumCleanupPG(rel storage.RelFileNode, blk storage.BlockNumber, unused []uint16) ([]byte, error) {
+	if len(unused) == 0 {
+		return nil, fmt.Errorf("wal: heap vacuum-cleanup record needs at least one now-unused item")
+	}
+	blockData := binary.LittleEndian.AppendUint16(nil, uint16(len(unused)))
+	for _, u := range unused {
+		blockData = binary.LittleEndian.AppendUint16(blockData, u)
+	}
+	mainData := []byte{pruneReasonVacuumCleanup, xlhpHasNowUnusedItems}
+	return framedAssemble(RmgrHeap2, xlogHeap2PruneVacuumClean, 0, mainData, []BlockRef{{ID: 0, Rel: rel, Block: blk, Data: blockData}})
+}
+
+// pruneReasonVacuumCleanup is PG's PRUNE_VACUUM_CLEANUP (PruneReason, heapam.h),
+// the xl_heap_prune.reason of a second-heap-pass record.
+const pruneReasonVacuumCleanup = 2
+
 // EncodeHeapFreezePG builds a PostgreSQL xl_heap_prune record for one page's
 // tuple freeze. goopg freezes uniformly (rewrites each frozen tuple's xmin to
 // FrozenTransactionId — no per-tuple xmax/infomask variation), so a single

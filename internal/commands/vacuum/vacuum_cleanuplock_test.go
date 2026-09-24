@@ -126,3 +126,41 @@ func TestVacuumCollectsPreexistingLPDeadItems(t *testing.T) {
 		t.Fatalf("DeadTIDs = %v, want [%v]", stats.DeadTIDs, want)
 	}
 }
+
+// TestVacuumDeadItemsGatedByLifecycleCapability pins VACUUM's second heap
+// pass (M0145-0008v): without the heap_lp_lifecycle capability it leaves the
+// LP_DEAD item alone; with it the item becomes LP_UNUSED and the trailing
+// line pointer is truncated.
+func TestVacuumDeadItemsGatedByLifecycleCapability(t *testing.T) {
+	for _, capable := range []bool{false, true} {
+		pool, _, rel, cleanup := newRel(t)
+		mvccMgr, deadSlot := cleanupLockFixture(t, pool, rel)
+		storage.SetHeapLinePointerLifecycle(capable)
+		stats, err := VacuumWithOptions(pool, mvccMgr, rel, VacuumOptions{})
+		if err != nil || len(stats.DeadTIDs) != 1 {
+			storage.SetHeapLinePointerLifecycle(false)
+			cleanup()
+			t.Fatalf("first pass: %+v, %v", stats, err)
+		}
+		n, err := VacuumDeadItems(pool, rel, stats.DeadTIDs)
+		storage.SetHeapLinePointerLifecycle(false)
+		s, perr := pool.Pin(storage.BufferTag{Rel: rel, Block: 0})
+		if perr != nil {
+			cleanup()
+			t.Fatal(perr)
+		}
+		count, _ := storage.PageLinePointerCount(s.Page())
+		dead, _ := storage.PageDeadItems(s.Page())
+		pool.Unpin(s)
+		cleanup()
+		if err != nil {
+			t.Fatalf("capable=%v: %v", capable, err)
+		}
+		if !capable && (n != 0 || len(dead) != 1 || count != int(deadSlot)) {
+			t.Fatalf("incapable cluster: n=%d dead=%v count=%d, want untouched", n, dead, count)
+		}
+		if capable && (n != 1 || len(dead) != 0 || count != int(deadSlot)-1) {
+			t.Fatalf("capable cluster: n=%d dead=%v count=%d, want the dead slot unused and truncated", n, dead, count)
+		}
+	}
+}

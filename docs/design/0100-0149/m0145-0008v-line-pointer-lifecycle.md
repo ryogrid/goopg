@@ -1,6 +1,6 @@
 # M0145-0008v: heap line-pointer lifecycle (LP_DEAD, LP_UNUSED, recycling)
 
-Status: **S1 LANDED 2026-09-25; S2 and S3 open.** Task: `.ralph/fix_plan.md`
+Status: **S1 and S2 LANDED 2026-09-25; S3 open.** Task: `.ralph/fix_plan.md`
 M0145-0008v (Kind: impl, Parent: M0145-0008t). Found by M0145-0008t
 (`m0145-0008t-prune-on-access.md`, "The premise that did not hold").
 
@@ -123,8 +123,9 @@ nothing is recycled yet.
 - Isolation family and full regress: only the failures HEAD also has.
 - pg_amcheck ports: PASS.
 - Real-PG WAL consumption (`TestE2E_PGStandbyFullCycle`, the pg_waldump
-  ports including `PgWaldumpVacuumPruneRoundtrip`, the standby catch-up
-  E2Es): PASS. `TestE2E_PGColdStartOnGoopgDataDir` fails identically on a
+  ports, the standby catch-up E2Es): PASS.
+  `PgWaldumpVacuumPruneRoundtrip` **skips**, so it proved nothing (noted
+  during S2, which verified the records with `pg_waldump` by hand). `TestE2E_PGColdStartOnGoopgDataDir` fails identically on a
   clean HEAD worktree, on goopg's `work_mem` line in `postgresql.conf`.
 
 **Next: S2.** After `vacuumIndexes`, a second pass over the pages that had
@@ -133,3 +134,81 @@ array. It is WAL-logged as a `PRUNE_VACUUM_CLEANUP` record with only
 now-unused items. The redo needs a DEAD→UNUSED primitive, because
 `VacuumHeapPageBySlots` skips non-NORMAL items. Autovacuum must run the
 index pass too before S3.
+
+## S2 as landed (2026-09-25)
+
+- **The `heap_lp_lifecycle` cluster capability.** Clusters written before
+  S1 hold LP_UNUSED items whose index entries were never deleted, so
+  nothing may ever reuse a slot there.
+  - `initdb` now names the capability in `global/pg_goopg_features`, the
+    same marker the NULL-keyed index entries use.
+  - Open sets `storage.HeapLinePointerLifecycle` from it.
+  - A cluster without it keeps S1 behaviour: LP_DEAD items stay dead.
+- **Audit of every LP_UNUSED writer in a capable cluster:**
+  - the prune: dead HEAP_ONLY tuples, which have no index entry;
+  - `PageRemoveHeapTuple`: the orphaned HOT tuple undo, never indexed;
+  - the new second pass itself.
+- **`storage.PageVacuumDeadItems`** is `lazy_vacuum_heap_page`'s page step:
+  - LP_DEAD items (asserted storage-less) become LP_UNUSED;
+  - then **`storage.PageTruncateLinePointerArray`**, a port of bufpage.c:
+    it drops the trailing unused items, keeps item 1, and sets or clears
+    `PD_HAS_FREE_LINES`.
+  - No tuple byte moves, so the exclusive content lock suffices.
+- **`vacuum.VacuumDeadItems`** is `lazy_vacuum_heap_rel`: it runs per block
+  over `Stats.DeadTIDs`, skips any item that is no longer LP_DEAD, and logs
+  `xlog.EncodeHeapVacuumCleanupPG`:
+  - `XLOG_HEAP2_PRUNE_VACUUM_CLEANUP`, reason `PRUNE_VACUUM_CLEANUP`;
+  - now-unused items only, with no `XLHP_CLEANUP_LOCK`;
+  - through the new pool hook `LogHeapVacuumCleanup`.
+- **The VACUUM operator** runs the second pass only when `vacuumIndexes`
+  reports every index clean:
+  - all indexes btree, where `USING hash` counts because it rides the
+    btree substrate;
+  - every one opened and vacuumed without error.
+  - A GIN, GiST or BRIN index, or any failure, keeps the LP_DEAD items
+    dead.
+- **Redo.** `replayDecodedXLogHeapPrune` recognises the cleanup shape (no
+  cleanup-lock flag; only now-unused items) and applies
+  `PageVacuumDeadItems`, PG's `lp_truncate_only` arm. Freeze records also
+  use this info, so the recognition is by content, not by opcode.
+  - Byte-identical to runtime: `TestReplayPGHeapVacuumCleanupLikeRuntime`.
+  - PG 18.3's `pg_waldump` decodes goopg's records as `PRUNE_ON_ACCESS …
+    ndead: N, dead: [...]` and `PRUNE_VACUUM_CLEANUP … nunused: N, unused:
+    [...]`. Checked on a fresh cluster with DELETE + VACUUM; the
+    `pg_waldump` testport case skips.
+
+**Consequence.** Truncation lets the next insert reuse the truncated
+trailing offsets, which is PG's behaviour. `TestVacuumSecondHeapPassKeepsIndexesExact`
+covers it end to end:
+- after DELETE + VACUUM + INSERT, index-driven queries equal the heap
+  (`+ 0` twins);
+- a capable btree-only table has no LP_DEAD item left and shows
+  `PD_HAS_FREE_LINES`;
+- a legacy cluster and a GIN-indexed table keep their LP_DEAD items.
+
+**Measured.** pgbench TPC-B A/B on fresh (capable) clusters: 635 / 639 tps
+on HEAD against 637 / 636 on the candidate. Growth is unchanged: interior
+unused items are only reused in S3, and autovacuum does not run the second
+pass.
+
+**Gates.**
+- units, `tpch-spotcheck`, acceptance (24 MATCH) and `tpcds-sf025` (96/96,
+  99/99 shapes) pass.
+- Isolation and full regress: only HEAD's failures.
+- Real-PG WAL / amcheck testport set: PASS.
+
+**Found on the way** (pre-existing, filed): goopg writes an 11-byte
+`xlhp_freeze_plan`, but PG's struct is 12 bytes, with one byte of padding
+before `ntuples`. PG 18.3's `pg_waldump` therefore reads goopg's freeze
+records as `ntuples: 256` with offsets `[768, 1280, …]`. goopg's own decoder
+reads 11 bytes and agrees with itself; a real PG standby would misapply
+every freeze plan.
+
+**Next: S3.**
+- Autovacuum's index pass plus the second pass.
+- `PageAddHeapTuple` reuses the first unused item under
+  `PD_HAS_FREE_LINES` (`PageAddItemExtended`), gated on the capability.
+- `PageGetHeapFreeSpace` stops answering 0 at the ceiling while a free line
+  exists.
+- Audit tuple-grain SSI SIREAD locks on reused TIDs.
+- Measure pgbench small-table growth.

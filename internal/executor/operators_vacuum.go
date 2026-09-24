@@ -302,9 +302,14 @@ func (o *vacuumOp) Next() (TupleSlot, error) {
 		}
 
 		// Index vacuum (M0047-0002): remove stale B-tree entries pointing
-		// to dead heap tuples and delete any empty leaf pages.
+		// to dead heap tuples and delete any empty leaf pages. Then, only if
+		// every index is now free of those entries, the second heap pass
+		// turns the LP_DEAD items LP_UNUSED (lazy_vacuum_heap_rel,
+		// M0145-0008v).
 		if err == nil && len(stats.DeadTIDs) > 0 && o.ctx.Pool != nil {
-			vacuumIndexes(o.ctx, tbl, stats.DeadTIDs)
+			if vacuumIndexes(o.ctx, tbl, stats.DeadTIDs) {
+				_, _ = vacuum.VacuumDeadItems(o.ctx.Pool, rel, stats.DeadTIDs)
+			}
 		}
 
 		// If we vacuumed a nailed catalog relation (pg_class, pg_attribute,
@@ -536,19 +541,31 @@ func relationStillExists(ctx *Context, tbl *catalog.Table) bool {
 // vacuumIndexes removes stale B-tree index entries that point to dead heap
 // tuples collected during the heap vacuum pass. Empty index leaf pages are
 // deleted and the tree is compacted if fully empty (M0047-0002).
-func vacuumIndexes(ctx *Context, tbl *catalog.Table, deadTIDs []storage.ItemPointer) {
+//
+// It reports whether EVERY index of tbl is now free of entries for deadTIDs,
+// which is the precondition for the second heap pass: an LP_UNUSED item may
+// be reused, so no index may still point at it. A non-btree index (goopg's
+// index vacuum covers btree only), an index that cannot be opened, or a
+// failed page vacuum answers false, and the LP_DEAD items stay dead.
+func vacuumIndexes(ctx *Context, tbl *catalog.Table, deadTIDs []storage.ItemPointer) bool {
+	clean := true
 	indexes := ctx.Catalog.IndexesOnTable(tbl, catalog.NamespaceDBOid(ctx.CurrentDatabaseOid))
 	for _, idx := range indexes {
 		if idx.Method != "btree" {
+			clean = false
 			continue
 		}
 		idxRel := ctx.Catalog.IndexRelFileNode(idx)
 		tree, err := openIndexBTree(ctx, idx, idxRel)
 		if err != nil {
+			clean = false
 			continue // index may not exist yet (e.g. freshly created)
 		}
-		_, _ = tree.VacuumIndexPages(deadTIDs)
+		if _, err := tree.VacuumIndexPages(deadTIDs); err != nil {
+			clean = false
+		}
 	}
+	return clean
 }
 
 // isNailedCatalogOID returns true if oid is one of the four nailed local

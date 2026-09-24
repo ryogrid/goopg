@@ -2400,6 +2400,26 @@ heuristic stays live.)
     0008s land.
 
 ### Manually discovered (not yet in a nightly `ci/logs/action-items.md` run) — filed 2026-09-15
+- [ ] **goopg\'s freeze WAL record is unreadable to real PostgreSQL:
+  `xlhp\_freeze\_plan` is written as 11 bytes, PG\'s struct is 12** \(found
+  2026\-09\-25 by M0145\-0008v S2\). PG pads one byte after `frzflags`
+  before `ntuples` \(`heapam\_xlog.h`\); `EncodeHeapFreezePG`
+  \(`pg\_assembled\_emit.go`\) and goopg\'s decoder \(`sizeOfXLHPFreezePlan =
+  11`, recovery.go\) both omit it. PG 18.3 `pg\_waldump` shows goopg\'s freeze
+  records as `ntuples: 256, offsets: \[768, 1280, …\]` for one plan of one
+  slot; a real PG standby would misapply every freeze plan.
+  Kind: impl
+  Parent: none
+  - First step: pad the plan to 12 bytes on both sides \(encoder and
+    `decodeXLogHeapPrune`\), keep reading 11\-byte plans from existing WAL
+    if old segments must replay, and pin with a `pg\_waldump` check.
+
+  > ## ESCALATION 2026\-09\-25 \(S2\) — a PG standby would corrupt frozen pages
+  >
+  > goopg\'s freeze records decode wrongly in real PostgreSQL \(missing C
+  > struct padding\). Filed and not selected ahead of the banner, per S2;
+  > the owner decides its placement.
+
 
 - [x] **`CREATE FUNCTION` completes with command tag `OK`, not `CREATE
   FUNCTION`** \(found 2026\-09\-23 while diffing a GRANT script against a
@@ -19758,6 +19778,22 @@ Movement: none — no plan moved on TPC-DS SF0.25/SF1 or TPC-H across all four d
     - Next: S2 — the post\-index\-cleanup heap pass \(LP\_DEAD → LP\_UNUSED,
       `PageTruncateLinePointerArray`, `PRUNE\_VACUUM\_CLEANUP` record\) and
       autovacuum\'s missing index pass; then S3 recycling.
+  - **S2 LANDED 2026\-09\-25:** VACUUM\'s second heap pass
+    \(`vacuum.VacuumDeadItems` → `storage.PageVacuumDeadItems` \+
+    `PageTruncateLinePointerArray`, logged as PG\'s
+    `PRUNE\_VACUUM\_CLEANUP`; truncate\-only redo, byte\-identical\). It
+    runs only when every index is clean \(btree incl. `USING hash`; GIN or
+    any failure blocks it\) and only on clusters with the new
+    `heap\_lp\_lifecycle` capability \(pre\-S1 clusters hold LP\_UNUSED
+    items with live index entries\).
+    - Verified with PG 18.3 `pg\_waldump` on a fresh cluster: both new
+      record shapes decode.
+    - Gates: units, spotcheck, acceptance 24 MATCH, sf025 96/96, isolation
+      and regress = HEAD\'s failures, WAL/amcheck testport set, pgbench A/B
+      neutral.
+    - Next: S3 — autovacuum index \+ second pass, `PageAddHeapTuple` reuse
+      under `PD\_HAS\_FREE\_LINES` \(capability\-gated\), free\-space
+      ceiling, SSI SIREAD audit, pgbench growth measurement.
 
 - [ ] **M0145\-0008u — a pin\-held \(zero\-copy\) seq\-scan slot**
   \(filed 2026\-09\-25 by M0145\-0008q\). With compaction under a cleanup

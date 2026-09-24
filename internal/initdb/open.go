@@ -283,7 +283,9 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	if err == nil {
 		// Cluster capabilities (global/pg_goopg_features): set before any
 		// index is read or written.
-		catalog.SetNullKeyedIndexEntries(readGoopgFeatures(abs)[catalog.NullKeyedIndexEntriesFeature])
+		features := readGoopgFeatures(abs)
+		catalog.SetNullKeyedIndexEntries(features[catalog.NullKeyedIndexEntriesFeature])
+		storage.SetHeapLinePointerLifecycle(features[storage.HeapLinePointerLifecycleFeature])
 	}
 	if err != nil {
 		return nil, fmt.Errorf("goopg: resolve %q: %w", opts.DataDir, err)
@@ -704,6 +706,21 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		return storage.LSN(end), nil
 	}
 
+	// VACUUM's second-heap-pass record (M0145-0008v): the LP_DEAD items whose
+	// index entries are gone become LP_UNUSED, as a PG
+	// XLOG_HEAP2_PRUNE_VACUUM_CLEANUP record.
+	logHeapVacuumCleanup := func(rel storage.RelFileNode, blk storage.BlockNumber, unused []uint16) (storage.LSN, error) {
+		payload, err := xlog.EncodeHeapVacuumCleanupPG(rel, blk, unused)
+		if err != nil {
+			return 0, err
+		}
+		_, end, err := walWriter.Append(payload)
+		if err != nil {
+			return 0, err
+		}
+		return storage.LSN(end), nil
+	}
+
 	// Atomic HOT-update change record (M0046-0001). Encodes the
 	// old-slot xmax stamp + new tuple bytes on the same page in one
 	// record so replay can reconstruct the HOT chain atomically.
@@ -785,6 +802,7 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		LogHeapHotUpdate:         logHeapHotUpdate,
 		LogHeapUpdate:            logHeapUpdate,
 		LogHeapPruneOpt:          logHeapPruneOpt,
+		LogHeapVacuumCleanup:     logHeapVacuumCleanup,
 		LogSmgrCreate:            logSmgrCreate,
 		LogChangeRecord:          logChangeRecord,
 		FullPageWrites:           true,

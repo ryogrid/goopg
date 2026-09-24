@@ -206,7 +206,7 @@ func SampleFiles() []FileSpec {
 const goopgFeaturesFile = "global/pg_goopg_features"
 
 func defaultGoopgFeatures() []byte {
-	return []byte(catalog.NullKeyedIndexEntriesFeature + "\n")
+	return []byte(catalog.NullKeyedIndexEntriesFeature + "\n" + storage.HeapLinePointerLifecycleFeature + "\n")
 }
 
 // readGoopgFeatures returns the capability names in dataDir's marker file,

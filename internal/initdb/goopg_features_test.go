@@ -6,12 +6,14 @@ import (
 	"testing"
 
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/storage"
 )
 
 // TestGoopgFeaturesMarker: initdb writes the cluster capability marker
-// (global/pg_goopg_features) naming null_keyed_index_entries, and a cluster
-// without the file — one created before the capability existed — reads as
-// having none, so open leaves catalog.NullKeyedIndexEntries off.
+// (global/pg_goopg_features) naming null_keyed_index_entries and
+// heap_lp_lifecycle (M0145-0008v), and a cluster without the file — one
+// created before the capabilities existed — reads as having none, so open
+// leaves both off.
 func TestGoopgFeaturesMarker(t *testing.T) {
 	var spec *FileSpec
 	for _, f := range SampleFiles() {
@@ -33,7 +35,8 @@ func TestGoopgFeaturesMarker(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, spec.Path), spec.Build(), spec.Mode); err != nil {
 		t.Fatal(err)
 	}
-	if got := readGoopgFeatures(dir); !got[catalog.NullKeyedIndexEntriesFeature] || len(got) != 1 {
-		t.Fatalf("written marker: features %v, want exactly %s", got, catalog.NullKeyedIndexEntriesFeature)
+	if got := readGoopgFeatures(dir); !got[catalog.NullKeyedIndexEntriesFeature] || !got[storage.HeapLinePointerLifecycleFeature] || len(got) != 2 {
+		t.Fatalf("written marker: features %v, want exactly %s and %s", got,
+			catalog.NullKeyedIndexEntriesFeature, storage.HeapLinePointerLifecycleFeature)
 	}
 }

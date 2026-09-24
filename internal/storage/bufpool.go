@@ -157,6 +157,8 @@ type Pool struct {
 	logHeapUpdate LogHeapUpdateFunc
 	// logHeapPruneOpt emits an opportunistic page-pruning WAL record.
 	logHeapPruneOpt LogHeapPruneOptFunc
+	// logHeapVacuumCleanup emits VACUUM's second-heap-pass record.
+	logHeapVacuumCleanup LogHeapVacuumCleanupFunc
 	// logSmgrTruncateTo emits the truncate-to-N WAL record (parity E2).
 	logSmgrTruncateTo func(rel RelFileNode, keep BlockNumber) error
 	// logSmgrCreate emits a relation-file creation WAL record. A9: carries the
@@ -675,6 +677,9 @@ type PoolConfig struct {
 	LogHeapUpdate            LogHeapUpdateFunc
 	LogHeapPruneOpt          LogHeapPruneOptFunc
 	LogSmgrCreate            func(rel RelFileNode, xid TransactionID) error
+	// LogHeapVacuumCleanup emits VACUUM's second-heap-pass record
+	// (M0145-0008v). nil falls back to MarkDirty.
+	LogHeapVacuumCleanup LogHeapVacuumCleanupFunc
 	// LogSmgrTruncateTo emits the truncate-to-N WAL record BEFORE the
 	// physical file shrink (WAL-first, upstream XLOG_SMGR_TRUNCATE order).
 	LogSmgrTruncateTo func(rel RelFileNode, keep BlockNumber) error
@@ -827,6 +832,10 @@ type LogHeapUpdateFunc func(rel RelFileNode, oldBlk BlockNumber, oldSlot uint16,
 // now-LP_DEAD and the now-unused line pointers (PruneResult's three lists).
 type LogHeapPruneOptFunc func(rel RelFileNode, blk BlockNumber, redirects [][2]uint16, dead, unused []uint16) (LSN, error)
 
+// LogHeapVacuumCleanupFunc emits one VACUUM second-heap-pass record: the
+// LP_DEAD items set LP_UNUSED once their index entries were removed.
+type LogHeapVacuumCleanupFunc func(rel RelFileNode, blk BlockNumber, unused []uint16) (LSN, error)
+
 // NewPool allocates a Pool of cfg.Slots fixed buffers backed by a
 // Go-heap arena.
 func NewPool(mgr *Manager, cfg PoolConfig) (*Pool, error) {
@@ -863,6 +872,7 @@ func NewPool(mgr *Manager, cfg PoolConfig) (*Pool, error) {
 		logHeapHotUpdate:         cfg.LogHeapHotUpdate,
 		logHeapUpdate:            cfg.LogHeapUpdate,
 		logHeapPruneOpt:          cfg.LogHeapPruneOpt,
+		logHeapVacuumCleanup:     cfg.LogHeapVacuumCleanup,
 		logSmgrTruncateTo:        cfg.LogSmgrTruncateTo,
 		logSmgrCreate:            cfg.LogSmgrCreate,
 		logChangeRecord:          cfg.LogChangeRecord,
@@ -989,6 +999,9 @@ func (p *Pool) LogHeapUpdate() LogHeapUpdateFunc { return p.logHeapUpdate }
 
 // LogHeapPruneOpt returns the configured opportunistic-pruning change-record hook.
 func (p *Pool) LogHeapPruneOpt() LogHeapPruneOptFunc { return p.logHeapPruneOpt }
+
+// LogHeapVacuumCleanup returns the VACUUM second-heap-pass record hook.
+func (p *Pool) LogHeapVacuumCleanup() LogHeapVacuumCleanupFunc { return p.logHeapVacuumCleanup }
 
 // BtreeRecycleHorizonFunc reports the two FullTransactionIds b-tree page
 // deletion needs (M0130-S11.5d-3c):

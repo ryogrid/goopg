@@ -5417,6 +5417,20 @@ func replayDecodedXLogHeapPrune(mgr *storage.Manager, r Record, xlog *XLogDecode
 	if skip {
 		return nil
 	}
+	// VACUUM's second heap pass (EncodeHeapVacuumCleanupPG, M0145-0008v): no
+	// XLHP_CLEANUP_LOCK and only now-unused items, which are LP_DEAD items
+	// whose index entries are gone. PG's heap_page_prune_execute takes its
+	// lp_truncate_only arm for this shape: mark them unused and truncate the
+	// line-pointer array, moving no tuple byte. The runtime twin is
+	// vacuum.vacuumDeadItemsPass -> storage.PageVacuumDeadItems.
+	if xlog.MainData[1]&xlhpCleanupLock == 0 && len(unused) > 0 &&
+		len(redirects) == 0 && len(dead) == 0 && len(frozenSlots) == 0 {
+		if _, err := storage.PageVacuumDeadItems(page, unused); err != nil {
+			return fmt.Errorf("wal: xlog heap vacuum-cleanup: %w", err)
+		}
+		storage.MustHeader(page).SetLSN(storage.LSN(r.EndLSN))
+		return mgr.WriteBlock(block.Rel, block.Block, page)
+	}
 	if len(frozenSlots) > 0 {
 		if err := storage.PageFreezeBySlots(page, frozenSlots); err != nil {
 			return fmt.Errorf("wal: xlog heap-prune freeze: %w", err)
