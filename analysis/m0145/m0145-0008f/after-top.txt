@@ -1,0 +1,34 @@
+File: goopg
+Build ID: a84e231558dc900ce5caefed24aeb306472a0cf8
+Type: cpu
+Time: 2026-09-24 19:59:57 JST
+Duration: 13s, Total samples = 15.50s (119.23%)
+Showing nodes accounting for 9.58s, 61.81% of 15.50s total
+Dropped 210 nodes (cum <= 0.08s)
+Showing top 25 nodes out of 137
+      flat  flat%   sum%        cum   cum%
+     1.15s  7.42%  7.42%      2.33s 15.03%  github.com/goopg/goopg/internal/executor.decodeRowRangeInfo
+     1.12s  7.23% 14.65%      1.75s 11.29%  runtime.scanObject
+     0.78s  5.03% 19.68%      0.78s  5.03%  internal/runtime/maps.ctrlGroup.matchH2 (inline)
+     0.71s  4.58% 24.26%      0.71s  4.58%  aeshashbody
+     0.55s  3.55% 27.81%      1.78s 11.48%  github.com/goopg/goopg/internal/executor.cloneRowOwnedPrefix
+     0.49s  3.16% 30.97%      0.85s  5.48%  github.com/goopg/goopg/internal/nodes.NumericInt64FromStoredPayload
+     0.47s  3.03% 34.00%     12.06s 77.81%  github.com/goopg/goopg/internal/executor.(*aggregateOp).Open
+     0.47s  3.03% 37.03%      0.47s  3.03%  runtime.memmove
+     0.33s  2.13% 39.16%      0.33s  2.13%  internal/runtime/syscall/linux.Syscall6
+     0.31s  2.00% 41.16%      0.31s  2.00%  runtime.spanClass.sizeclass (inline)
+     0.29s  1.87% 43.03%      0.64s  4.13%  github.com/goopg/goopg/internal/executor.(*aggregateOp).finalizeGroup
+     0.28s  1.81% 44.84%      0.28s  1.81%  runtime.memclrNoHeapPointers
+     0.27s  1.74% 46.58%      0.53s  3.42%  github.com/goopg/goopg/internal/executor.(*aggregateOp).applyAgg
+     0.25s  1.61% 48.19%      0.31s  2.00%  github.com/goopg/goopg/internal/storage.pageChecksumBlock
+     0.24s  1.55% 49.74%      0.24s  1.55%  runtime.findObject
+     0.22s  1.42% 51.16%      0.92s  5.94%  github.com/goopg/goopg/internal/executor.(*aggregateOp).evalGroupKeysScratch
+     0.22s  1.42% 52.58%      5.97s 38.52%  github.com/goopg/goopg/internal/executor.(*seqScanOp).Next
+     0.21s  1.35% 53.94%      1.16s  7.48%  github.com/goopg/goopg/internal/executor.decodePhysicalPGValueLowered
+     0.21s  1.35% 55.29%      0.54s  3.48%  runtime.sweepone
+     0.20s  1.29% 56.58%      0.30s  1.94%  github.com/goopg/goopg/internal/executor.(*aggregateOp).Open.func1
+     0.18s  1.16% 57.74%      0.18s  1.16%  runtime.nextFreeFast (inline)
+     0.16s  1.03% 58.77%      0.16s  1.03%  github.com/goopg/goopg/internal/executor.Datum.MaterializeArena
+     0.16s  1.03% 59.81%      0.53s  3.42%  github.com/goopg/goopg/internal/storage.PageGetHeapTupleInto
+     0.16s  1.03% 60.84%      0.56s  3.61%  runtime.tryDeferToSpanScan
+     0.15s  0.97% 61.81%      0.15s  0.97%  runtime.(*fixalloc).alloc

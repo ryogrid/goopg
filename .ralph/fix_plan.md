@@ -19374,7 +19374,7 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
     Result One\-Time Filter. Expected movement: `rendering` /
     `qual\-placement` on shapes with an uncorrelated EXISTS conjunct.
 
-- [ ] **M0145\-0008f — HashAggregate build throughput on a many\-group
+- [x] **M0145\-0008f — HashAggregate build throughput on a many\-group
   input**: TPC\-H Q18's semi body \(`GROUP BY l\_orderkey HAVING sum \> 313`, 6M
   rows → 1.5M groups\) builds in 12.2 s inside goopg's plan, while PG's
   HashAggregate runs the whole aggregate in 3.3 s serial. The election is
@@ -19384,6 +19384,36 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
   Parent: M0145-0008b
   - Expected movement: acceptance\-arm Q18 time \(and every HashAggregate\-heavy
     query\); no plan change.
+  - **DONE 2026\-09\-24 `11968441a`.** Design:
+    `docs/design/0100-0149/m0145-0008f-hashagg-and-scan-row-copies.md`;
+    evidence `analysis/m0145/m0145-0008f/`.
+    - The seq scan's retention clone copies only the deformed survivor window
+      \(`cloneRowOwnedPrefix`\); the hashed grouping loop uses scratch key
+      buffers and detaches keys only for a group\-founding row
+      \(`evalGroupKeysScratch`, single\-key `setGroupKey`\).
+    - Serial GROUP BY 4.55 s → 3.8 s \(PG 1.86 s\); with HAVING sum ~6.8 s →
+      ~6.1 s \(PG 3.05 s\); acceptance arm Q18 9.53 → 8.48 s, total 64.0 →
+      62.6 s, 24 MATCH. Parallel aggregate tests pass under \-race.
+    - The remaining gap is the scan's per\-row full\-width row allocation
+      \(and the GC it drives\) → M0145\-0008k.
+    Movement: none — executor only; sf025 plan shapes 99/99 unchanged; the acceptance-arm time moved (reported, not judged).
+
+- [ ] **M0145\-0008k — the seq scan allocates and copies a row per tuple where
+  PG copies nothing**: at its retention boundary the scan allocates a
+  full\-width row \(`acquireRow`\) and deep\-copies the survivor window for every
+  visible tuple, because it releases the page lock before the parent reads
+  the slot. PG hands the parent a slot pointing into a PINNED shared buffer
+  \(heapgettup / ExecStoreBufferHeapTuple; a pin blocks pruning's cleanup
+  lock\), so an aggregate over lineitem copies nothing. On TPC\-H lineitem this
+  is about half of a serial grouped aggregate's time plus most of its GC.
+  Also: `count\(\*\)` over lineitem \(4.95 s\) is slower than
+  `sum\(l\_quantity\)` \(3.2 s\) on goopg \(PG 0.96 s / 1.40 s\).
+  Kind: recon
+  Parent: M0145-0008f
+  - First step: explain the count\(\*\) \> sum\(\) inversion \(plan and profile\),
+    then decide whether a pin\-held slot \(copy on retention only\) is sound
+    under goopg's page mutation paths \(HOT prune compaction, hint bits\).
+    Expected movement: none on parity; acceptance\-arm scan\-heavy times.
 
 - [ ] **M0145\-0008g — `expr = ANY \(const list\)` with an expression operand is
   estimated as PG does**: PG prices `substr\(c\_phone,1,2\) IN \(7 values\)` at
