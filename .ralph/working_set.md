@@ -1,33 +1,30 @@
-Task: M0145-0008 — cutover. FLIP LANDED 2026-09-24 (loop #49); the
-legacy-deletion slices remain, so the task stays [ ].
+Task: M0146-0002 — `Parallel Hash` over a genuinely partial inner (item 3's
+M0146 continuation; M0145-0001 lineage is [!], so M0146-0001 is held and
+this is the first selectable M0146 task in file order).
 
-Files: see docs/design/0100-0149/m0145-0008-cutover-flip.md. The flip code is
-commit ddb4eabd4: a concurrent session's pathspec-less
-"analysis(latency-trend)" commit swept the loop's gated staged index. It is
-already pushed and is NOT rewritten. The prerequisite NULL-key fix is
-eb0e7d388.
+Files: slice 1 landed as 171c5d58a. internal/executor/parallel_hash_shared.go
+(barrier, participant protocol), parallel_scan.go (hashBuildBranch claim
+sets), operators_gather*.go (register/retract), plus optimizer.Join.ParallelHash.
+Design: docs/design/0100-0149/m0146-0002-parallel-hash-partial-inner.md.
 
-Key symbols: jointreePipelineFromEnv (v != "0"); SetJointreePipeline /
-SetIndexProbeCostMultiplier (test hooks); inListElementSelectivity
-(isunique); baseColumnOfTable (EstRelRows fallback);
-planOneIndexScan (executor tests).
+Key symbols: parallelHashBuild{attach,finish,wait,merge};
+openParallelHashJoin; registerParallelHashBuilds;
+cs.attachParallelHashBuildSides; addPartialHashJoinPath (slice 2 target).
 
-Findings: every gate is green on the new default. TPC-H match 2/22 equals
-the baseline; SF0.25 match 2 holds the floor. ea-ratchet 53->50 with 1 NEW
-(Q95), filed as M0145-0008c. Q18 1.6x / Q22 3.2x slower, filed as
-M0145-0008b. Grouping ignores ORDER BY DESC: M0145-0008d.
+Findings: the executor model is proven (identity 5 join types under -race,
+5 builders). "Spilled" means nbatch > 1, because a batch state is always
+installed.
 
-Next step: root M0145-0001 is [!]: the S4 lineage budget is exhausted
-(escalation 2026-09-24 in its entry, holding would-be 0008b/c/d). Item 3
-is held until the owner answers, so select item 4 (M0141-S2a-fix2r) per
-the banner, or the next live item. Do not select M0145 descendants.
+Next step: slice 2, the planner. In internal/optimizer/joinpathsparallel.go
+add the parallel_hash = true arm: read inner.PartialPathlist and price per
+costsize.c initial_cost_hashjoin/final_cost_hashjoin with parallel_hash.
+Restrict to INNER/SEMI/ANTI/LEFT-build-right and an inner that fits
+hash_mem. Stamp Join.ParallelHash in createPlan and render EXPLAIN
+`Parallel Hash Join` / `Parallel Hash` (take PG's Q14 text from the PG
+TPC-H reference cluster, EXPLAIN only). Then the full gate set plus the
+parallel TPC-H capture (Q14/Q16 witnesses).
 
-Gates run: units; tpch-spotcheck; tpcds-sf025 sweep; acceptance arm (vs
-loop77); fireset; TPC-H + SF0.25 parity captures; make ea-ratchet
-(re-run after the scratch PG on :5534 voided the first run).
+Gates run (slice 1): units; tpch-spotcheck; tpcds-sf025 (same=99);
+acceptance arm; fireset.
 
-Parked WIP (M0122-0008 ALTER SYSTEM, outranked by the banner):
-tmp/m0122-alter-system-wip.patch (sqlkeywords.QuoteIdentifier only). Oracle
-behaviour for ALTER SYSTEM was captured in loop #48's transcript.
-
-In-flight: none.
+In-flight: none. Parked: tmp/m0122-alter-system-wip.patch (M0122 ALTER SYSTEM).

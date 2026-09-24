@@ -19299,6 +19299,23 @@ M0146-0001 re-baseline census on the new default arm.
   (join-order divergences — M0146-0005).
   Kind: impl
   Parent: M0140-0007
+  - Design doc: `docs/design/0100-0149/m0146-0002-parallel-hash-partial-inner.md`.
+  - **Slice 1 LANDED 2026\-09\-24 `171c5d58a`** \(executor model, inert
+    until slice 2\):
+    - `optimizer.Join.ParallelHash`; `parallelHashBuild` \(attach / finish /
+      wait barrier, dynamic attach, loud failure incl. panic and group
+      cancellation\); per\-join build\-side claim sets; leader prebuild and
+      cooperative builder skip the node; donated arenas.
+    - Identity with serial for 5 join types under \-race; builders=5,
+      5939 rows published exactly once; spill refused loudly.
+    - Gates: units, tpch\-spotcheck, sf025 \(same=99\), acceptance arm,
+      fireset.
+    Movement: none — inert slice.
+  - Next: slice 2 — planner `parallel\_hash = true` arm in
+    `joinpathsparallel.go` \(read `inner.PartialPathlist`, PG's
+    `initial/final\_cost\_hashjoin` parallel\_hash pricing\) \+ EXPLAIN
+    `Parallel Hash Join` / `Parallel Hash`; then slice 3 measurement on the
+    canonical parallel TPC\-H capture \(Q14/Q16\).
 - [ ] **M0146-0003 — row-emitting PartialAgg** (impl; adopts the filed
   M0141-S3→S4→S5→S6 chain as its slices). Convert Partial Aggregate from
   the zero-row shared-accumulator model to one that emits real partial
