@@ -20204,7 +20204,7 @@ commits.** The milestone is the burn-down the flow parity exposes —
 executor substrate, plan election/costing, statistics — sequenced by the
 M0146-0001 re-baseline census on the new default arm.
 
-- [ ] **M0146-0001 — post-cutover parity re-baseline** (recon). On the
+- [x] **M0146-0001 — post-cutover parity re-baseline** (recon). On the
   NEW default arm after the flip: re-run the first-divergence census and
   the category counts on TPC-DS SF0.25 + SF1 and TPC-H (pinned-seed
   lane), produce the ranked residual list, and re-sequence this
@@ -20212,6 +20212,35 @@ M0146-0001 re-baseline census on the new default arm.
   PRE-flip TPC-H arm); this task measures the post-flip default.
   Kind: recon
   Parent: M0145-0008
+  - **DONE 2026\-09\-25 \(recon\).** Design:
+    `docs/design/0100-0149/m0146-0001-post-cutover-rebaseline.md`; captures,
+    diffs, censuses and the ranked map in `analysis/m0146/m0146\-0001/`
+    \(HEAD `8b249d462`, `scripts/jointree\-parity\-capture.sh` per corpus,
+    `scripts/pg\-plan\-first\-divergence.py`, `rank.py`\).
+    - Match: TPC\-H 3/22 \(M0144: 1\), TPC\-DS SF0.25 4/99 \(2\), SF1 6/99
+      \(1\).
+    - CATEGORIES\-EXCL\-MATCH: TPC\-H join\-order 17, scan\-type 12,
+      join\-method 11, parallelism 11; TPC\-DS SF0.25 join\-order 91,
+      parallelism 74, join\-method 66, sort\-strategy 62.
+    - **Sequence \(first\-divergence records owned, TPC\-H \+ SF0.25 \+
+      SF1\):**
+      1. M0146\-0005 join order / method / presorted input — 50
+         \(5 \+ 24 \+ 21\)
+      2. M0146\-0003 row\-emitting PartialAgg / parallel aggregation — 32
+      3. M0146\-0002a parallel over\-election — 26
+      4. M0146\-0012 restriction placement — 22
+      5. M0146\-0006 Incremental Sort — 21
+      6. M0146\-0007 `inline\_cte` — 15
+      7. M0146\-0009 statistics \(hash vs sort grouping\) — 9
+      8. M0146\-0011 lateral / parameterised — 5
+      9. new, unowned until now: M0146\-0016 Subquery Scan retention 6,
+         M0146\-0017 WindowAgg sort sharing 4, M0146\-0018 Group node 4,
+         M0146\-0019 index\-only scan inner 3, M0146\-0020 MixedAggregate 3.
+      The 6 `error` records are Q36/Q70/Q86 on both arms \(dsqgen
+      artefacts\).
+    - M0146\-0002f/g/h and M0146\-0015 are children of the Parallel Hash
+      / SubPlan work and keep their places under M0146\-0002a.
+    Movement: none — recon.
 - [x] **M0146-0002 — `Parallel Hash` over a genuinely partial inner**
   (impl; supersedes M0140-0007 per owner answer 2026-09-23, option (a)).
   Port the real thing: hash build inside the Gather over a partial inner
@@ -20561,6 +20590,57 @@ M0146-0001 re-baseline census on the new default arm.
   a sublink before a cheap qual.
   Kind: impl
   Parent: none
+- [ ] **M0146\-0016 — keep a Subquery Scan whose qual cannot be pushed
+  down, as PG does** \(filed 2026\-09\-25 by M0146\-0001\). TPC\-DS Q39,
+  Q53, Q89 \(both scales\): PG keeps `Subquery Scan on foo/tmp1` above a
+  window or aggregate output with the outer qual on it; goopg flattens it
+  and the first divergence is `PG Subquery Scan | goopg HashAggregate /
+  WindowAgg`.
+  Kind: recon
+  Parent: M0146-0001
+  - First step: diff PG's `set_subquery_pathlist` / `subquery_planner`
+    pushdown refusal \(`subquery_is_pushdown_safe`, window/aggregate
+    output quals\) against goopg's flattening for Q53.
+
+- [ ] **M0146\-0017 — stacked WindowAggs share one sort, as PG does**
+  \(filed 2026\-09\-25 by M0146\-0001\). TPC\-DS Q47, Q57 \(both scales\): PG
+  places two WindowAggs directly over one Sort \(compatible window
+  orderings, `select_active_windows` ordering\); goopg inserts a Sort
+  between them.
+  Kind: recon
+  Parent: M0146-0001
+  - First step: compare goopg's window\-clause ordering with PG's
+    `select_active_windows` / `common_prefix_cmp` on Q47.
+
+- [ ] **M0146\-0018 — grouping without aggregates plans as PG\'s `Group`
+  node** \(filed 2026\-09\-25 by M0146\-0001\). TPC\-DS Q37, Q82 \(both
+  scales\): `PG Group | goopg GroupAggregate` under a Limit.
+  Kind: recon
+  Parent: M0146-0001
+  - First step: check whether PG\'s `create_group_path` \(no aggregates,
+    presorted input\) is the elected shape and whether goopg\'s EXPLAIN
+    merely labels it differently \(rendering\) or builds a different node.
+
+- [ ] **M0146\-0019 — Index Only Scan where goopg seq\-scans a probed
+  relation** \(filed 2026\-09\-25 by M0146\-0001\). TPC\-H Q13 \(`customer\_pk`
+  under a Hash Join\), TPC\-DS Q23 \(`customer\_pkey`\), SF1 Q9
+  \(`reason\_pkey` at the root\).
+  Kind: recon
+  Parent: M0146-0001
+  - First step: for each, check whether goopg generates the index\-only
+    path at all \(ledger: no index\-only inner for a join, M0145\-0008l
+    note\) or generates and loses it on cost.
+
+- [ ] **M0146\-0020 — grouping sets plan as PG\'s `MixedAggregate`**
+  \(filed 2026\-09\-25 by M0146\-0001\). TPC\-DS Q22 \(both scales\), Q27
+  \(SF1\): `PG MixedAggregate | goopg HashAggregate \(N keys, M grouping
+  sets\)`.
+  Kind: recon
+  Parent: M0146-0001
+  - First step: compare PG\'s `consider_groupingsets_paths` mixed\-strategy
+    choice \(hash the sets that fit work\_mem, sort the rest\) with goopg\'s
+    all\-hash grouping sets.
+
 - [ ] **M0146-0014 — parity-closure sweep** (recon; the milestone's
   exit report). Re-run the first-divergence census on both corpora and
   prove every remaining record is either assigned to a live task above

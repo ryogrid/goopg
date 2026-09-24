@@ -1,0 +1,224 @@
+owner                                                                 tpch tpcds-sf025   tpcds-sf1  total
+M0146-0005 join order / method                                           5          18          14     37
+M0146-0003 row-emitting PartialAgg / parallel aggregation                7          11          14     32
+M0146-0002a parallel over-election                                       1          13          12     26
+M0146-0012 restriction placement                                         3          11           8     22
+M0146-0006 incremental sort                                              0          10          11     21
+M0146-0007 inline_cte                                                    0           8           7     15
+M0146-0005 join order / presorted input                                  0           6           7     13
+M0146-0009 statistics (hash vs sort grouping election)                   1           4           4      9
+n/a (both error: dsqgen artefact)                                        0           3           3      6
+UNOWNED scan-type                                                        0           3           3      6
+M0146-0011 lateral / parameterised paths                                 1           2           2      5
+UNOWNED sort-strategy                                                    0           2           3      5
+UNOWNED Group node (grouping without aggregates)                         0           2           2      4
+UNOWNED index-only scan (join inner / pkey probe)                        1           1           1      3
+UNOWNED MixedAggregate (grouping sets)                                   0           1           2      3
+
+tpch	Q1	sort-strategy	M0146-0003 row-emitting PartialAgg / parallel aggregation
+tpch	Q2	parameterisation	M0146-0011 lateral / parameterised paths
+tpch	Q3	join-method	M0146-0005 join order / method
+tpch	Q4	aggregation-strategy	M0146-0003 row-emitting PartialAgg / parallel aggregation
+tpch	Q5	aggregation-strategy	M0146-0003 row-emitting PartialAgg / parallel aggregation
+tpch	Q7	qual-placement	M0146-0012 restriction placement
+tpch	Q8	sort-strategy	M0146-0003 row-emitting PartialAgg / parallel aggregation
+tpch	Q9	join-method	M0146-0005 join order / method
+tpch	Q10	join-method	M0146-0005 join order / method
+tpch	Q12	sort-strategy	M0146-0003 row-emitting PartialAgg / parallel aggregation
+tpch	Q13	scan-type	UNOWNED index-only scan (join inner / pkey probe)
+tpch	Q15a-VIEWBODY	aggregation-strategy	M0146-0003 row-emitting PartialAgg / parallel aggregation
+tpch	Q16	aggregation-strategy	M0146-0009 statistics (hash vs sort grouping election)
+tpch	Q17	join-method	M0146-0005 join order / method
+tpch	Q18	parallelism	M0146-0002a parallel over-election
+tpch	Q19	join-method	M0146-0005 join order / method
+tpch	Q20	qual-placement	M0146-0012 restriction placement
+tpch	Q21	qual-placement	M0146-0012 restriction placement
+tpch	Q22	sort-strategy	M0146-0003 row-emitting PartialAgg / parallel aggregation
+tpcds-sf025	Q1	sort-strategy	M0146-0002a parallel over-election
+tpcds-sf025	Q2	sort-strategy	M0146-0002a parallel over-election
+tpcds-sf025	Q3	sort-strategy	M0146-0006 incremental sort
+tpcds-sf025	Q4	join-order	M0146-0005 join order / method
+tpcds-sf025	Q5	sort-strategy	M0146-0007 inline_cte
+tpcds-sf025	Q6	parallelism	M0146-0002a parallel over-election
+tpcds-sf025	Q7	join-order	M0146-0005 join order / method
+tpcds-sf025	Q8	join-method	M0146-0005 join order / method
+tpcds-sf025	Q10	parallelism	M0146-0002a parallel over-election
+tpcds-sf025	Q11	join-order	M0146-0005 join order / method
+tpcds-sf025	Q12	join-method	M0146-0005 join order / method
+tpcds-sf025	Q13	join-order	M0146-0005 join order / method
+tpcds-sf025	Q14	join-order	M0146-0005 join order / method
+tpcds-sf025	Q15	join-method	M0146-0005 join order / method
+tpcds-sf025	Q16	join-method	M0146-0005 join order / method
+tpcds-sf025	Q17	sort-strategy	M0146-0005 join order / presorted input
+tpcds-sf025	Q18	aggregation-strategy	M0146-0009 statistics (hash vs sort grouping election)
+tpcds-sf025	Q19	aggregation-strategy	M0146-0003 row-emitting PartialAgg / parallel aggregation
+tpcds-sf025	Q20	join-method	M0146-0005 join order / method
+tpcds-sf025	Q21	qual-placement	M0146-0012 restriction placement
+tpcds-sf025	Q22	aggregation-strategy	UNOWNED MixedAggregate (grouping sets)
+tpcds-sf025	Q23	scan-type	UNOWNED index-only scan (join inner / pkey probe)
+tpcds-sf025	Q24	qual-placement	M0146-0012 restriction placement
+tpcds-sf025	Q25	sort-strategy	M0146-0005 join order / presorted input
+tpcds-sf025	Q26	parallelism	M0146-0002a parallel over-election
+tpcds-sf025	Q27	aggregation-strategy	M0146-0009 statistics (hash vs sort grouping election)
+tpcds-sf025	Q28	sort-strategy	M0146-0003 row-emitting PartialAgg / parallel aggregation
+tpcds-sf025	Q29	sort-strategy	M0146-0005 join order / presorted input
+tpcds-sf025	Q30	join-method	M0146-0005 join order / method
+tpcds-sf025	Q31	join-method	M0146-0005 join order / method
+tpcds-sf025	Q32	parameterisation	M0146-0011 lateral / parameterised paths
+tpcds-sf025	Q33	sort-strategy	M0146-0007 inline_cte
+tpcds-sf025	Q34	qual-placement	M0146-0012 restriction placement
+tpcds-sf025	Q35	sort-strategy	M0146-0006 incremental sort
+tpcds-sf025	Q36	error	n/a (both error: dsqgen artefact)
+tpcds-sf025	Q37	aggregation-strategy	UNOWNED Group node (grouping without aggregates)
+tpcds-sf025	Q38	join-order	M0146-0005 join order / method
+tpcds-sf025	Q39	scan-type	UNOWNED scan-type
+tpcds-sf025	Q40	aggregation-strategy	M0146-0003 row-emitting PartialAgg / parallel aggregation
+tpcds-sf025	Q42	parallelism	M0146-0002a parallel over-election
+tpcds-sf025	Q43	sort-strategy	M0146-0006 incremental sort
+tpcds-sf025	Q44	sort-strategy	M0146-0005 join order / presorted input
+tpcds-sf025	Q45	parallelism	M0146-0002a parallel over-election
+tpcds-sf025	Q46	qual-placement	M0146-0012 restriction placement
+tpcds-sf025	Q47	sort-strategy	UNOWNED sort-strategy
+tpcds-sf025	Q48	parallelism	M0146-0002a parallel over-election
+tpcds-sf025	Q49	sort-strategy	M0146-0006 incremental sort
+tpcds-sf025	Q50	sort-strategy	M0146-0005 join order / presorted input
+tpcds-sf025	Q51	scan-type	M0146-0007 inline_cte
+tpcds-sf025	Q52	parallelism	M0146-0002a parallel over-election
+tpcds-sf025	Q53	scan-type	UNOWNED scan-type
+tpcds-sf025	Q54	sort-strategy	M0146-0006 incremental sort
+tpcds-sf025	Q55	join-method	M0146-0005 join order / method
+tpcds-sf025	Q56	sort-strategy	M0146-0007 inline_cte
+tpcds-sf025	Q57	sort-strategy	UNOWNED sort-strategy
+tpcds-sf025	Q58	sort-strategy	M0146-0006 incremental sort
+tpcds-sf025	Q59	aggregation-strategy	M0146-0009 statistics (hash vs sort grouping election)
+tpcds-sf025	Q60	sort-strategy	M0146-0006 incremental sort
+tpcds-sf025	Q61	aggregation-strategy	M0146-0003 row-emitting PartialAgg / parallel aggregation
+tpcds-sf025	Q62	sort-strategy	M0146-0003 row-emitting PartialAgg / parallel aggregation
+tpcds-sf025	Q63	sort-strategy	M0146-0006 incremental sort
+tpcds-sf025	Q64	qual-placement	M0146-0012 restriction placement
+tpcds-sf025	Q65	qual-placement	M0146-0012 restriction placement
+tpcds-sf025	Q66	parallelism	M0146-0002a parallel over-election
+tpcds-sf025	Q67	sort-strategy	M0146-0006 incremental sort
+tpcds-sf025	Q68	qual-placement	M0146-0012 restriction placement
+tpcds-sf025	Q69	sort-strategy	M0146-0002a parallel over-election
+tpcds-sf025	Q70	error	n/a (both error: dsqgen artefact)
+tpcds-sf025	Q71	parallelism	M0146-0002a parallel over-election
+tpcds-sf025	Q72	sort-strategy	M0146-0005 join order / presorted input
+tpcds-sf025	Q73	qual-placement	M0146-0012 restriction placement
+tpcds-sf025	Q74	aggregation-strategy	M0146-0009 statistics (hash vs sort grouping election)
+tpcds-sf025	Q75	parallelism	M0146-0002a parallel over-election
+tpcds-sf025	Q76	sort-strategy	M0146-0003 row-emitting PartialAgg / parallel aggregation
+tpcds-sf025	Q77	sort-strategy	M0146-0007 inline_cte
+tpcds-sf025	Q78	sort-strategy	M0146-0007 inline_cte
+tpcds-sf025	Q79	join-method	M0146-0005 join order / method
+tpcds-sf025	Q80	sort-strategy	M0146-0007 inline_cte
+tpcds-sf025	Q81	parameterisation	M0146-0011 lateral / parameterised paths
+tpcds-sf025	Q82	aggregation-strategy	UNOWNED Group node (grouping without aggregates)
+tpcds-sf025	Q83	sort-strategy	M0146-0006 incremental sort
+tpcds-sf025	Q84	sort-strategy	M0146-0003 row-emitting PartialAgg / parallel aggregation
+tpcds-sf025	Q85	aggregation-strategy	M0146-0003 row-emitting PartialAgg / parallel aggregation
+tpcds-sf025	Q86	error	n/a (both error: dsqgen artefact)
+tpcds-sf025	Q87	join-order	M0146-0005 join order / method
+tpcds-sf025	Q88	aggregation-strategy	M0146-0003 row-emitting PartialAgg / parallel aggregation
+tpcds-sf025	Q89	scan-type	UNOWNED scan-type
+tpcds-sf025	Q90	aggregation-strategy	M0146-0003 row-emitting PartialAgg / parallel aggregation
+tpcds-sf025	Q91	qual-placement	M0146-0012 restriction placement
+tpcds-sf025	Q92	join-method	M0146-0005 join order / method
+tpcds-sf025	Q94	qual-placement	M0146-0012 restriction placement
+tpcds-sf025	Q95	qual-placement	M0146-0012 restriction placement
+tpcds-sf025	Q96	join-order	M0146-0005 join order / method
+tpcds-sf025	Q97	join-order	M0146-0007 inline_cte
+tpcds-sf025	Q99	sort-strategy	M0146-0003 row-emitting PartialAgg / parallel aggregation
+tpcds-sf1	Q1	join-method	M0146-0005 join order / method
+tpcds-sf1	Q2	sort-strategy	M0146-0002a parallel over-election
+tpcds-sf1	Q3	sort-strategy	M0146-0006 incremental sort
+tpcds-sf1	Q4	aggregation-strategy	M0146-0009 statistics (hash vs sort grouping election)
+tpcds-sf1	Q5	sort-strategy	M0146-0007 inline_cte
+tpcds-sf1	Q6	parallelism	M0146-0002a parallel over-election
+tpcds-sf1	Q7	join-method	M0146-0005 join order / method
+tpcds-sf1	Q8	join-order	M0146-0005 join order / method
+tpcds-sf1	Q9	scan-type	UNOWNED index-only scan (join inner / pkey probe)
+tpcds-sf1	Q10	sort-strategy	M0146-0005 join order / presorted input
+tpcds-sf1	Q11	aggregation-strategy	M0146-0009 statistics (hash vs sort grouping election)
+tpcds-sf1	Q13	aggregation-strategy	M0146-0003 row-emitting PartialAgg / parallel aggregation
+tpcds-sf1	Q14	join-order	M0146-0005 join order / method
+tpcds-sf1	Q16	sort-strategy	M0146-0002a parallel over-election
+tpcds-sf1	Q17	sort-strategy	M0146-0005 join order / presorted input
+tpcds-sf1	Q18	aggregation-strategy	M0146-0009 statistics (hash vs sort grouping election)
+tpcds-sf1	Q19	aggregation-strategy	M0146-0003 row-emitting PartialAgg / parallel aggregation
+tpcds-sf1	Q21	qual-placement	M0146-0012 restriction placement
+tpcds-sf1	Q22	aggregation-strategy	UNOWNED MixedAggregate (grouping sets)
+tpcds-sf1	Q23	join-method	M0146-0005 join order / method
+tpcds-sf1	Q24	qual-placement	M0146-0012 restriction placement
+tpcds-sf1	Q25	sort-strategy	M0146-0005 join order / presorted input
+tpcds-sf1	Q26	sort-strategy	M0146-0002a parallel over-election
+tpcds-sf1	Q27	aggregation-strategy	UNOWNED MixedAggregate (grouping sets)
+tpcds-sf1	Q28	sort-strategy	M0146-0003 row-emitting PartialAgg / parallel aggregation
+tpcds-sf1	Q29	sort-strategy	M0146-0005 join order / presorted input
+tpcds-sf1	Q30	sort-strategy	M0146-0002a parallel over-election
+tpcds-sf1	Q31	join-order	M0146-0005 join order / method
+tpcds-sf1	Q32	parameterisation	M0146-0011 lateral / parameterised paths
+tpcds-sf1	Q33	sort-strategy	M0146-0007 inline_cte
+tpcds-sf1	Q34	qual-placement	M0146-0012 restriction placement
+tpcds-sf1	Q35	sort-strategy	M0146-0006 incremental sort
+tpcds-sf1	Q36	error	n/a (both error: dsqgen artefact)
+tpcds-sf1	Q37	aggregation-strategy	UNOWNED Group node (grouping without aggregates)
+tpcds-sf1	Q38	join-order	M0146-0005 join order / method
+tpcds-sf1	Q39	scan-type	UNOWNED scan-type
+tpcds-sf1	Q40	aggregation-strategy	M0146-0003 row-emitting PartialAgg / parallel aggregation
+tpcds-sf1	Q42	parallelism	M0146-0002a parallel over-election
+tpcds-sf1	Q43	sort-strategy	M0146-0006 incremental sort
+tpcds-sf1	Q44	sort-strategy	UNOWNED sort-strategy
+tpcds-sf1	Q45	sort-strategy	M0146-0003 row-emitting PartialAgg / parallel aggregation
+tpcds-sf1	Q46	qual-placement	M0146-0012 restriction placement
+tpcds-sf1	Q47	sort-strategy	UNOWNED sort-strategy
+tpcds-sf1	Q48	qual-placement	M0146-0012 restriction placement
+tpcds-sf1	Q49	sort-strategy	M0146-0006 incremental sort
+tpcds-sf1	Q50	sort-strategy	M0146-0005 join order / presorted input
+tpcds-sf1	Q51	scan-type	M0146-0007 inline_cte
+tpcds-sf1	Q52	parallelism	M0146-0002a parallel over-election
+tpcds-sf1	Q53	scan-type	UNOWNED scan-type
+tpcds-sf1	Q54	sort-strategy	M0146-0006 incremental sort
+tpcds-sf1	Q55	join-method	M0146-0005 join order / method
+tpcds-sf1	Q56	sort-strategy	M0146-0007 inline_cte
+tpcds-sf1	Q57	sort-strategy	UNOWNED sort-strategy
+tpcds-sf1	Q58	sort-strategy	M0146-0006 incremental sort
+tpcds-sf1	Q59	parallelism	M0146-0002a parallel over-election
+tpcds-sf1	Q60	sort-strategy	M0146-0006 incremental sort
+tpcds-sf1	Q61	aggregation-strategy	M0146-0003 row-emitting PartialAgg / parallel aggregation
+tpcds-sf1	Q62	sort-strategy	M0146-0003 row-emitting PartialAgg / parallel aggregation
+tpcds-sf1	Q63	sort-strategy	M0146-0006 incremental sort
+tpcds-sf1	Q64	qual-placement	M0146-0012 restriction placement
+tpcds-sf1	Q65	join-method	M0146-0005 join order / method
+tpcds-sf1	Q66	parallelism	M0146-0002a parallel over-election
+tpcds-sf1	Q67	sort-strategy	M0146-0006 incremental sort
+tpcds-sf1	Q68	qual-placement	M0146-0012 restriction placement
+tpcds-sf1	Q69	parallelism	M0146-0002a parallel over-election
+tpcds-sf1	Q70	error	n/a (both error: dsqgen artefact)
+tpcds-sf1	Q71	aggregation-strategy	M0146-0003 row-emitting PartialAgg / parallel aggregation
+tpcds-sf1	Q72	sort-strategy	M0146-0005 join order / presorted input
+tpcds-sf1	Q73	aggregation-strategy	M0146-0003 row-emitting PartialAgg / parallel aggregation
+tpcds-sf1	Q74	aggregation-strategy	M0146-0009 statistics (hash vs sort grouping election)
+tpcds-sf1	Q75	parallelism	M0146-0002a parallel over-election
+tpcds-sf1	Q76	sort-strategy	M0146-0003 row-emitting PartialAgg / parallel aggregation
+tpcds-sf1	Q77	sort-strategy	M0146-0007 inline_cte
+tpcds-sf1	Q78	sort-strategy	M0146-0006 incremental sort
+tpcds-sf1	Q79	join-method	M0146-0005 join order / method
+tpcds-sf1	Q80	sort-strategy	M0146-0007 inline_cte
+tpcds-sf1	Q81	join-method	M0146-0005 join order / method
+tpcds-sf1	Q82	aggregation-strategy	UNOWNED Group node (grouping without aggregates)
+tpcds-sf1	Q83	sort-strategy	M0146-0006 incremental sort
+tpcds-sf1	Q84	sort-strategy	M0146-0005 join order / presorted input
+tpcds-sf1	Q85	aggregation-strategy	M0146-0003 row-emitting PartialAgg / parallel aggregation
+tpcds-sf1	Q86	error	n/a (both error: dsqgen artefact)
+tpcds-sf1	Q87	join-order	M0146-0005 join order / method
+tpcds-sf1	Q88	aggregation-strategy	M0146-0003 row-emitting PartialAgg / parallel aggregation
+tpcds-sf1	Q89	scan-type	UNOWNED scan-type
+tpcds-sf1	Q90	aggregation-strategy	M0146-0003 row-emitting PartialAgg / parallel aggregation
+tpcds-sf1	Q91	join-method	M0146-0005 join order / method
+tpcds-sf1	Q92	parameterisation	M0146-0011 lateral / parameterised paths
+tpcds-sf1	Q94	sort-strategy	M0146-0002a parallel over-election
+tpcds-sf1	Q95	qual-placement	M0146-0012 restriction placement
+tpcds-sf1	Q96	join-order	M0146-0005 join order / method
+tpcds-sf1	Q97	join-order	M0146-0007 inline_cte
+tpcds-sf1	Q99	sort-strategy	M0146-0003 row-emitting PartialAgg / parallel aggregation
