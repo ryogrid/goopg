@@ -19499,7 +19499,7 @@ M0146-0001 re-baseline census on the new default arm.
     - Cause 3 \(rendering\): execution is already hashed \(`subplan\_hash.go`\);
       only the EXPLAIN deparse differs → M0146\-0002g.
 
-- [ ] **M0146\-0002e — place an uncorrelated sublink conjunct on its base
+- [x] **M0146\-0002e — place an uncorrelated sublink conjunct on its base
   relation, as PG does**: `conjunctIsLocalEligible` \(`local\_filters.go`\)
   admits a conjunct whose sublinks are all `IsNonCorrelated`, and
   `localizeExprToLeaf` rebases it with `scopeIgnore` \(only the testexpr's
@@ -19512,6 +19512,39 @@ M0146-0001 re-baseline census on the new default arm.
     ledgered. Expected movement: TPC\-H Q16 `qual\-placement`, measured on the
     canonical parallel capture; values pinned by the NOT IN NULL probe
     cases \(`analysis/m0146/m0146-0002b/not-in-probe.txt`\).
+  - **DONE 2026\-09\-24 `bb90e51a4`.** Design:
+    `docs/design/0100-0149/m0146-0002e-uncorrelated-subplan-restriction.md`;
+    evidence `analysis/m0146/m0146-0002e/`.
+    - `conjunctIsLocalEligible` admits an uncorrelated sublink
+      \(`sublinkIsUncorrelated`: plan, no PARAM\_EXEC Args, no escaping outer
+      ref\); `localizeExprToLeaf` rebases with `scopeIgnore`.
+    - A bare non\-negated ANY \(`x IN \(SELECT …\)`\) stays in the residual
+      \(`anySublinkPullupCandidate`\): PG pulls it up into a semi join. The first
+      cut admitted it, and TPC\-DS Q95 timed out at SF1 \(its two `IN \(… ws\_wh\)`
+      ran in every parallel worker\); caught by the fire\-set gate.
+    - The sibling legacy post\-pass pushdown \(`innerJoinPushTarget` /
+      `shiftConjunctForInput`\) is NOT extended: it duplicates by default, which
+      would evaluate a SubPlan twice; ledgered.
+    - Values: 10\-case probe identical to PG 18.3. Gates: units, spotcheck,
+      sf025 96/96, acceptance arm, fire\-set PASS.
+    - Q16 filter now on the partsupp scan; TPC\-DS Q6's join tree is PG's; Q22's
+      InitPlan qual on customer.
+    Movement: yes — plan shape: Q16/Q22/TPC\-DS Q6 qual placement now PG's; CATEGORIES\-EXCL\-MATCH did not improve \(TPC\-H parameterisation 6→7 via Q22; SF0.25 Q6 −scan\-type \+aggregation\-strategy \+rendering\), match 3/4 unchanged.
+
+- [ ] **M0146\-0002h — a SubPlan clause is estimated at PG's default
+  selectivity**: `clauseSelectivity`'s `InExpr`\-with\-Plan arm returns
+  `defaultGenericSelectivity` whatever the negation, and a `SubqueryExpr`
+  comparison goes through the operator estimators with an unknown RHS. PG
+  estimates a SubPlan clause through `boolvarsel`'s default 0.5 \(`clausesel.c`
+  final arm → `selfuncs.c:1520`\), and `NOT` gives `1 \- 0.5`. Visible now
+  that the qual is a leaf restriction: PG's Q16 partsupp scan is rows=100000
+  per worker \(0.5 applied\); goopg's shows no reduction.
+  Kind: impl
+  Parent: M0146-0002e
+  - First step: EXPLAIN the Q16 partsupp leaf on the private lane and trace
+    which estimator the leaf row count takes \(`applyLocalFilterSelectivity` vs
+    the partial\-path rows\). Expected movement: Q16 leaf row estimate within
+    PG's; category movement only if it flips an election.
 
 - [ ] **M0146\-0002f — a parallel\-safe SubPlan does not make its relation
   parallel\-unsafe**: port `max\_parallel\_hazard\_walker`'s SubPlan arm
