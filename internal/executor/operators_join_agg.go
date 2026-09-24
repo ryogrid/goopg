@@ -2001,6 +2001,14 @@ type aggregateOp struct {
 	plan   *optimizer.Aggregate
 	child  Operator
 	schema optimizer.Schema
+	// gkVals / gkKeys are the hashed grouping loop's per-row scratch
+	// (M0145-0008f): the group-key values and their datumKey strings are
+	// rebuilt for every input row but retained only when the row founds a
+	// new group, so they live in reused buffers instead of two fresh slices
+	// per row. The sorted path keeps its own allocations: it holds the
+	// previous row's key parts across rows (curParts).
+	gkVals Row
+	gkKeys []string
 	// slot is reused across emissions (review/260831 EO2-24).
 	slot MaterializedSlot
 
@@ -2309,7 +2317,7 @@ func (o *aggregateOp) Open(ctx *Context) error {
 		// keys below are cut out of that one vector. This is the whole point
 		// of the single-pass shape — the source is read once and each row is
 		// routed into every set's hash table.
-		allVals, allKeys, err := o.evalGroupExprs(slot)
+		allVals, allKeys, err := o.evalGroupKeysScratch(slot)
 		if err != nil {
 			return err
 		}
@@ -2340,7 +2348,11 @@ func (o *aggregateOp) Open(ctx *Context) error {
 						gv[i] = NullDatum
 					}
 					for _, ci := range set {
-						gv[ci] = allVals[ci]
+						// M0073-0004 retention boundary, moved here from
+						// evalGroupExprs (M0145-0008f): only a group-founding
+						// row's key values are retained, so only they are
+						// detached from the input arena.
+						gv[ci] = allVals[ci].MaterializeArena()
 					}
 				}
 				gr = &groupRuntime{setIdx: si, groupValues: gv, passthroughVals: ptVals, aggs: make([]aggRuntime, len(o.plan.Aggs))}
@@ -2527,12 +2539,44 @@ func (o *aggregateOp) evalGroupExprs(slot TupleSlot) (Row, []string, error) {
 	return vals, parts, nil
 }
 
+// evalGroupKeysScratch is evalGroupExprs for the hashed grouping loop: the
+// values and keys land in the operator's reused scratch buffers, and the
+// values are NOT detached from the input arena — the caller materializes the
+// ones it retains (a new group's groupValues). The returned slices are valid
+// only until the next call. The datumKey strings are freshly built (every
+// arm copies), so a key stored in the group map never aliases the arena.
+func (o *aggregateOp) evalGroupKeysScratch(slot TupleSlot) (Row, []string, error) {
+	n := len(o.plan.GroupExprs)
+	if n == 0 {
+		return nil, nil, nil
+	}
+	vals := o.gkVals[:0]
+	keys := o.gkKeys[:0]
+	for _, g := range o.plan.GroupExprs {
+		v, err := evalExprSlot(g, slot, o.ctx)
+		if err != nil {
+			return nil, nil, err
+		}
+		vals = append(vals, v)
+		keys = append(keys, datumKey(v))
+	}
+	o.gkVals, o.gkKeys = vals, keys
+	return vals, keys, nil
+}
+
 // setGroupKey builds the hash key for grouping set si over one input row's
 // per-column keys. When there is only one set the set index is left out, so
 // an ordinary aggregate keys exactly as it always did.
 func (o *aggregateOp) setGroupKey(si int, set []int, allKeys []string, multiSet bool) string {
 	if len(set) == 0 && !multiSet {
 		return "__all__"
+	}
+	// M0145-0008f: one grouping column in one set is the common case, and its
+	// key is exactly that column's datumKey (the builder below would copy it
+	// unchanged). datumKey is always type-tagged ("m:", "s:", "n", ...), so it
+	// cannot collide with "__all__", and a set's keys all take this one form.
+	if len(set) == 1 && !multiSet {
+		return allKeys[set[0]]
 	}
 	var b strings.Builder
 	if multiSet {

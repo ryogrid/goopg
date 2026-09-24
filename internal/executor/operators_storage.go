@@ -2232,7 +2232,10 @@ func (o *seqScanOp) Next() (TupleSlot, error) {
 			// must be safe to read after the page becomes writable
 			// to other sessions; a concurrent UPDATE could otherwise
 			// tear the bytes the parent is decoding.
-			row = cloneRowOwned(row)
+			//
+			// M0145-0008f: only the deformed survivor window is detached;
+			// the undeformed tail is stale and never read (EX1-03a).
+			row = cloneRowOwnedPrefix(row, survivorBound)
 			// Inject KindEnum datums for enum-typed columns (M0097-enum).
 			if len(o.enumTypes) > 0 {
 				for i, et := range o.enumTypes {

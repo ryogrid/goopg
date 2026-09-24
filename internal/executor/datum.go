@@ -502,6 +502,35 @@ func cloneRowOwned(src Row) Row {
 	return dst
 }
 
+// cloneRowOwnedPrefix is cloneRowOwned for a row whose cells at and past
+// bound were never deformed (the seq scan's EX1-03a survivor window). Only
+// [0, bound) is detached from the producer arena. The tail holds the
+// previous tuple's stale datums, which no consumer may read, so copying it
+// (arena bytes and all) was pure waste: on TPC-H lineitem it cost a deep
+// copy of ~11 dead columns, l_comment included, per tuple (M0145-0008f). The
+// tail is written as NULL, or kept poisoned when the EX1-01 debug flag is
+// armed, so a read past the bound still panics there.
+func cloneRowOwnedPrefix(src Row, bound int) Row {
+	if bound >= len(src) {
+		return cloneRowOwned(src)
+	}
+	if bound < 0 {
+		bound = 0
+	}
+	dst := acquireRow(len(src))
+	for i := 0; i < bound; i++ {
+		dst[i] = src[i].MaterializeArena()
+	}
+	tail := NullDatum
+	if seqScanDeformPoison {
+		tail = deformPoisonDatum()
+	}
+	for i := bound; i < len(src); i++ {
+		dst[i] = tail
+	}
+	return dst
+}
+
 // NewTimeDatum constructs a KindTime Datum from a time.Time.
 // The timestamp is normalized to UTC and stored as Unix nanoseconds.
 func NewTimeDatum(t time.Time) Datum {
