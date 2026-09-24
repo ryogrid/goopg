@@ -154,7 +154,7 @@ var exprSwitchInventory = map[string]walkerRole{
 	// empty-Name *ColumnRef), attributed by the census to its enclosing
 	// function. Same demoted shape as commits 1, 2, 5 and 6's producer half.
 	// RC-1a class 45 -> 44.
-	"joinlayout.go:visitColumnRefsByName": nonRecursiveClassifier, // moved from bushy.go at M0127-P6.3 (rename only)
+	"joinlayout.go:walkColumnRefsByName": nonRecursiveClassifier, // moved from bushy.go at M0127-P6.3 (rename only); body split out of visitColumnRefsByName at M0145-0008e (scope callback)
 	// Added by M0145-0003. Both are built on the exprwalk drivers —
 	// rebasePulledQual's dispatch lives inside the cloneExprRefs
 	// Rewrite closure (rebase *ColumnRef / convert or veto

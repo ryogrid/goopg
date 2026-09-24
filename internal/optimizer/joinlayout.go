@@ -120,6 +120,15 @@ import "fmt"
 // constant per table) and *MergeActionExpr (MERGE action state, not a
 // column).
 func visitColumnRefsByName(e Expr, fn func(string)) bool {
+	return walkColumnRefsByName(e, fn, func(Node) bool { return false })
+}
+
+// walkColumnRefsByName is visitColumnRefsByName's body with the scope
+// decision handed to the caller: scopeOK reports whether an inner plan may be
+// stepped over without clearing `total`. visitColumnRefsByName never accepts
+// one; the seam's residual pad check accepts an uncorrelated one
+// (residualColumnRefsByName, narrowoutput.go — M0145-0008e).
+func walkColumnRefsByName(e Expr, fn func(string), scopeOK func(Node) bool) bool {
 	total := true
 	walkExprRefs(e, scopeSignal, exprVisitor{
 		Visit: func(n Expr) bool {
@@ -135,7 +144,11 @@ func visitColumnRefsByName(e Expr, fn func(string)) bool {
 			}
 			return true
 		},
-		OnScope:   func(Node) { total = false },
+		OnScope: func(plan Node) {
+			if !scopeOK(plan) {
+				total = false
+			}
+		},
 		OnUnknown: func(Expr) { total = false },
 	})
 	return total

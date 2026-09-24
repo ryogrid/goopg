@@ -202,7 +202,15 @@ func TestScopedCacheDepthConsistency(t *testing.T) {
 
 	// One statement, TWO scoped non-correlated sublinks (IN + EXISTS):
 	// they share the scoped store and previously ping-pong-cleared it.
-	runQuery(t, ctx, "SELECT a FROM ht1 WHERE b IN (SELECT b FROM ht2)"+
+	// The IN sits under an OR so it stays a SubPlan on the jointree
+	// pipeline, whose ANY pull-up (PG's convert_ANY_sublink_to_join) turns a
+	// bare top-level IN into a semi join regardless of the legacy unnest
+	// knob — see TestHashedInProbeActuallyFires. Until M0145-0008e the seam
+	// declined this statement (residual-hits-pad) and kept the bare IN as a
+	// SubPlan by accident. The OR arm is true for every row, so all three
+	// ht1 rows reach both sublinks (the EXISTS may be evaluated above the
+	// IN's filter).
+	runQuery(t, ctx, "SELECT a FROM ht1 WHERE (b IN (SELECT b FROM ht2) OR a > 0)"+
 		" AND EXISTS (SELECT 1 FROM ht3) ORDER BY a")
 
 	var inStat, existsStat *SubPlanSiteStats
