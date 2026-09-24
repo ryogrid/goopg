@@ -3090,6 +3090,26 @@ the whole file's active task between 2026-09-01 and 2026-09-14; **since
 - [ ] **M0122-0008 — Auth / roles / multi-DB isolation / encoding**.
   Kind: impl
   Parent: none
+  - 2026\-09\-24 \(ralph2 loop \#48\): **the `ssl\*` GUC family, as the
+    oracle's no\-SSL build defines it** \(`0853825e4`\).
+    Movement: none — GUC registry conformance; no planner path touched.
+    Design: `docs/design/0100-0149/0122-0008-ssl-guc-family-nossl-build.md`.
+    - Re\-verified the auth group first: SASLprep and `scram\_iterations`
+      are already done; channel binding is the remaining scope, and it
+      needs TLS.
+    - The oracle is built WITHOUT SSL \(`USE\_OPENSSL` undefined\). It
+      answers SSLRequest with 'N', as goopg does, but registers all 17
+      `ssl\*` GUCs with the no\-SSL defaults and rejects `ssl = on`.
+      goopg registered none, so `SHOW ssl` failed.
+    - Landed: all 17 registered; `check\_ssl` on SET, at boot and on
+      reload; `CheckFn` runs for every type; new `FlagNoShowAll` also
+      hides `is\_superuser`, `session\_authorization` and
+      `default\_with\_oids` from SHOW ALL, as PG does; 16 pg\_settings rows
+      byte\-identical to the oracle.
+    - Gates: units, tpch\-spotcheck, tpcds\-sf025, acceptance arm; regress
+      guc and sysviews identical to a HEAD baseline.
+    - Found and filed separately: ALTER SYSTEM is a no\-op; GUC range
+      errors use goopg's own wording.
   - 2026\-09\-23 \(ralph2 loop \#8\): **`GRANT … TO PUBLIC WITH GRANT
     OPTION` refused with 0LP01 on every grant path** \(`75140193f`\),
     closing the divergence the M0122\-0008a fixture ledgered.
@@ -3151,6 +3171,35 @@ the whole file's active task between 2026-09-01 and 2026-09-14; **since
       render test while the writer's tests stay green.
     - Gates: units; `internal/executor` + `internal/catalog`; tpch-spotcheck
       Q12=2/Q13=33; tpcds-sf025 `PLAN-SHAPE same=99 changed=0`; pgbench smoke.
+
+- [!] **TLS server and SCRAM\-SHA\-256\-PLUS channel binding** \(filed
+  2026\-09\-24 by the ssl GUC slice\). **Owner call.**
+  Kind: impl
+  Parent: M0122-0008
+  - The PG 18.3 oracle and its psql/libpq are built without SSL, so a goopg
+    TLS server would diverge from the reference and could not be checked
+    against it. Decide whether goopg targets an OpenSSL\-built PG here \(and
+    rebuild an SSL oracle\) or stays with the no\-SSL build.
+  - Resume point: `handleStartup`'s SSLRequest arm \(internal/postmaster/server.go\),
+    `connTypeFor` \(ConnHostSSL\), then `scram.go`'s `p=` branch and the
+    mechanism list.
+
+- [ ] **ALTER SYSTEM is a no\-op** \(measured 2026\-09\-24\): `ALTER SYSTEM
+  SET geqo\_effort = 11` and `ALTER SYSTEM SET ssl = on` both report
+  ALTER SYSTEM, and `postgresql.auto.conf` is never written. PG validates
+  the value \(parse\_and\_validate\_value\), rejects DISALLOW\_IN\_FILE and
+  internal parameters, and rewrites postgresql.auto.conf
+  \(`AlterSystemSetConfigFile`, guc.c\).
+  Kind: bug
+  Parent: M0122-0008
+
+- [ ] **GUC range errors use goopg's own wording** \(measured 2026\-09\-24\):
+  `SET geqo\_effort = 11` reports `value 11 out of range [1, 10]`; PG
+  reports `11 is outside the valid range for parameter "geqo\_effort"
+  (1 .. 10)` \(guc.c parse\_and\_validate\_value\). The same holds for the
+  real\-valued GUCs.
+  Kind: bug
+  Parent: M0122-0008
 
 - [x] **`pg_database.datacl` does not survive a restart** (measured 2026-09-22
   while landing the cross-database GRANT fix).
