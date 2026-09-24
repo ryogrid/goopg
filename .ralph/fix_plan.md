@@ -19471,7 +19471,7 @@ Movement: none — no plan moved on TPC-DS SF0.25/SF1 or TPC-H across all four d
     - Found: EXPLAIN omits one of two stacked Filters → M0145\-0008j.
     Movement: none — CATEGORIES-EXCL-MATCH unchanged on TPC-H and SF0.25 (Q18's category set holds with the searched join order); the time moved, which is reported not judged.
 
-- [ ] **M0145\-0008j — EXPLAIN omits one of two stacked Filters over a
+- [x] **M0145\-0008j — EXPLAIN omits one of two stacked Filters over a
   scan** \(found 2026\-09\-24 by M0145\-0008e; reproduces at HEAD `877b51039`\):
   `SELECT a FROM ht1 WHERE a \> 1 AND EXISTS \(SELECT 1 FROM ht3\)` prints only
   `Filter: \(EXISTS\(SubPlan 1\)\)` on the Seq Scan, although both predicates
@@ -19486,6 +19486,34 @@ Movement: none — no plan moved on TPC-DS SF0.25/SF1 or TPC-H across all four d
     chain, then consider the PG shape: a qual with no Vars becomes a gating
     Result One\-Time Filter. Expected movement: `rendering` /
     `qual\-placement` on shapes with an uncorrelated EXISTS conjunct.
+  - **DONE 2026\-09\-24.** Design:
+    `docs/design/0100-0149/m0145-0008j-explain-stacked-filters.md`.
+    - `walkPlanFiltered` collapses stacked Filter wrappers into ONE
+      `Filter:` line carrying their conjunction \(inner first\); the
+      outermost wrapper stays the row source. Pinned by
+      `TestExplainRendersEveryStackedFilter`.
+    - PG 18.3 plans the shape differently \(gating `Result` with
+      `One\-Time Filter: \(InitPlan 1\).col1` over `Filter: \(a \> 1\)`\) →
+      M0145\-0008o.
+    - Gates: units, spotcheck, fire\-set `fires=none` at SF0.25, SF1 and
+      TPC\-H \(no corpus plan text changed\), sweep 96/96.
+    Movement: none — no corpus plan text changed; CATEGORIES-EXCL-MATCH identical on both arms at SF0.25 and SF1.
+
+- [ ] **M0145\-0008o — pseudoconstant quals gate the plan; an uncorrelated
+  EXISTS is an InitPlan** \(filed 2026\-09\-24 by M0145\-0008j\). PG 18.3 plans
+  `WHERE a \> 1 AND EXISTS \(SELECT 1 FROM t3\)` as `Result / One\-Time Filter:
+  \(InitPlan 1\).col1 / InitPlan 1 / \-\> Seq Scan on t3 / \-\> Seq Scan on t1
+  Filter: \(a \> 1\)`; goopg evaluates the EXISTS per row as a SubPlan in the
+  scan's Filter. Port `create\_gating\_plan` \(createplan.c: a qual with no
+  current\-level Vars and no volatile functions goes to a gating
+  `Result.OneTimeFilter`\) and make an uncorrelated `EXISTS\_SUBLINK` an
+  initplan param \(subselect.c `make\_subplan`\), rendered `\(InitPlan N\).col1`.
+  Kind: impl
+  Parent: M0145-0008j
+  - Expected movement: `qual\-placement` / `rendering` on uncorrelated
+    EXISTS / constant\-qual shapes. The fire\-set gate shows neither corpus
+    has this shape today, so the measurement is the upstream regress cases
+    \(`subselect`, `join`\) plus a PG\-pinned EXPLAIN unit test.
 
 - [x] **M0145\-0008f — HashAggregate build throughput on a many\-group
   input**: TPC\-H Q18's semi body \(`GROUP BY l\_orderkey HAVING sum \> 313`, 6M

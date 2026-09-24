@@ -477,16 +477,17 @@ func walkPlanFiltered(n optimizer.Node, indent int, rows *[]Row, opts parser.Exp
 		}
 		next := f.Predicate
 		nextNode := optimizer.Node(f)
-		// If multiple Filter wrappers stack, render only the
-		// outermost predicate to keep the detail line readable.
-		// Inner Filter predicates collapse with the outer via
-		// short-circuit AND — but PG's Filter detail is a single
-		// expression line; chaining is uncommon so prefer the
-		// outermost predicate for v0. The outermost wrapper is also
-		// the right one to take rows from: its estimate already
-		// scales through every inner wrapper below it.
+		// Stacked Filter wrappers collapse into ONE `Filter:` line
+		// carrying their conjunction — PG prints a node's whole qual
+		// list as one line (explain.c show_upper_qual over plan->qual).
+		// The inner (closer to the scan) predicate leads: it is
+		// evaluated first. Until M0145-0008j only the outermost
+		// predicate printed, so a searched leaf's own `a > 1` under a
+		// residual EXISTS Filter executed but never appeared.
+		// The outermost wrapper stays the row source: its estimate
+		// already scales through every inner wrapper below it.
 		if attachedFilter != nil {
-			next = attachedFilter
+			next = &optimizer.BinaryOp{Op: parser.OpAnd, Left: f.Predicate, Right: attachedFilter}
 			nextNode = attachedFilterNode
 		}
 		walkPlanFiltered(f.Child, indent, rows, opts, next, nextNode, reg)
