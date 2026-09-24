@@ -53,7 +53,7 @@ func PagePruneOpt(p Page, oldestXmin TransactionID) (PruneResult, error) {
 
 	h := MustHeader(p)
 	pruneXID := TransactionID(h.PruneXID())
-	if pruneXID == InvalidTransactionID || pruneXID >= oldestXmin {
+	if pruneXID == InvalidTransactionID || !XIDPrecedes(pruneXID, oldestXmin) {
 		// Fast path: pd_prune_xid not set or not old enough.
 		return PruneResult{}, nil
 	}

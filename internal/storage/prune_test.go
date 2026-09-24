@@ -137,9 +137,11 @@ func TestPageSetHeapTupleXmaxUpdatesPruneXID(t *testing.T) {
 	if err := PageSetHeapTupleXmax(page, slot2, 3); err != nil {
 		t.Fatal(err)
 	}
-	// Smaller xmax must not decrease pd_prune_xid.
-	if got := TransactionID(MustHeader(page).PruneXID()); got != 7 {
-		t.Errorf("pd_prune_xid should remain 7 (not decrease to 3), got %d", got)
+	// PG's PageSetPrunable keeps the OLDEST xid, so a smaller xmax lowers
+	// pd_prune_xid (M0145-0008x; the old keep-newest rule kept continuously
+	// updated pages from ever passing the prune gate).
+	if got := TransactionID(MustHeader(page).PruneXID()); got != 3 {
+		t.Errorf("pd_prune_xid should drop to the older 3, got %d", got)
 	}
 }
 

@@ -19862,7 +19862,7 @@ Movement: none — no plan moved on TPC-DS SF0.25/SF1 or TPC-H across all four d
       M0145\-0008x.
     Movement: none — recon.
 
-- [ ] **M0145\-0008x — `pd\_prune\_xid` keeps the OLDEST prunable xid, as
+- [x] **M0145\-0008x — `pd\_prune\_xid` keeps the OLDEST prunable xid, as
   PG\'s `PageSetPrunable` does** \(filed 2026\-09\-25 by M0145\-0008w\). Five
   setters in `internal/storage/heap.go` \(xmax stamp, non\-HOT update stamp,
   HOT old\-tuple stamp, chain\-update stamp, multixact updater stamp\) keep
@@ -19876,6 +19876,16 @@ Movement: none — no plan moved on TPC-DS SF0.25/SF1 or TPC-H across all four d
   - Expected movement: pgbench `pgbench\_branches` \~85 → \~18 blocks,
     `pgbench\_tellers` \~90 → 0–2, TPC\-B tps \+3%; pin with a unit test and
     the pgbench block counts.
+  - **DONE 2026\-09\-25.** Design:
+    `docs/design/0100-0149/m0145-0008x-pd-prune-xid-keeps-oldest.md`.
+    - The five producers call the existing `pageSetPrunablePG` \(now
+      `XIDPrecedes`\-ordered\); `PagePruneOpt`\'s fast path uses the same
+      modular order. Runtime and redo now agree on `pd\_prune\_xid`.
+    - pgbench A/B: branches 73/85 → 21/13 blocks, tellers 80/94 → 1/1 \(PG:
+      7 / 2\); tps within host noise.
+    - Gates: units, spotcheck, acceptance 24 MATCH, sf025 96/96, isolation
+      and regress = HEAD\'s failures.
+    Movement: none — storage bookkeeping; no plan or value moved.
 
 - [ ] **M0145\-0008u — a pin\-held \(zero\-copy\) seq\-scan slot**
   \(filed 2026\-09\-25 by M0145\-0008q\). With compaction under a cleanup

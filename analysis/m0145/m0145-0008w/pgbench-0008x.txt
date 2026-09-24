@@ -1,0 +1,7 @@
+# M0145-0008x pgbench TPC-B A/B (scale 2, -c 8 -j 4 -T 30, fresh capable clusters, :5534).
+# HEAD 0a3f69302 vs candidate (pd_prune_xid keeps the oldest xid). 'pages:' = max heap block in ctid.
+head number of failed transactions: 0 (0.000%) tps = 550.531204 (without initial connection time)  pages: pgbench_branches|73 pgbench_tellers|80 pgbench_accounts|3335 
+cand number of failed transactions: 0 (0.000%) tps = 671.387752 (without initial connection time)  pages: pgbench_branches|21 pgbench_tellers|1 pgbench_accounts|3336 
+head number of failed transactions: 0 (0.000%) tps = 647.330775 (without initial connection time)  pages: pgbench_branches|85 pgbench_tellers|94 pgbench_accounts|3335 
+cand number of failed transactions: 0 (0.000%) tps = 517.937540 (without initial connection time)  pages: pgbench_branches|13 pgbench_tellers|1 pgbench_accounts|3335 
+# PG 18.3 same workload (analysis/m0145/m0145-0008w): branches 7 blocks, tellers 2 blocks.
