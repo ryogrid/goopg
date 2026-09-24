@@ -2929,7 +2929,7 @@ func (o *insertOp) Next() (TupleSlot, error) {
 			// against any SERIALIZABLE reader that holds a covering predicate
 			// lock (page or relation grain), and aborts this INSERT in place
 			// (40001) when it closes a dangerous structure to a committed pivot.
-			if serr := ssiRecordTupleWrite(o.ctx, targetRel, ptr.Block, ptr.Offset); serr != nil {
+			if serr := ssiRecordTupleInsert(o.ctx, targetRel, ptr.Block); serr != nil {
 				return nil, serr
 			}
 			// SSI hash-index bucket conflict-in (design 0118-0099): forms the
@@ -2975,7 +2975,7 @@ func (o *insertOp) Next() (TupleSlot, error) {
 		}
 		// M0104-0007 / M0118-0001: SSI write-path hook for the non-partitioned
 		// insert path; aborts in place (40001) on a committed-pivot structure.
-		if serr := ssiRecordTupleWrite(o.ctx, targetRel, ptr.Block, ptr.Offset); serr != nil {
+		if serr := ssiRecordTupleInsert(o.ctx, targetRel, ptr.Block); serr != nil {
 			return nil, serr
 		}
 		// SSI hash-index bucket conflict-in (design 0118-0099): forms the rw-edge

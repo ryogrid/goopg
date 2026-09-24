@@ -631,10 +631,33 @@ func PageGetHeapFreeSpace(p Page) int {
 	space -= itemIDSize
 	if space > 0 {
 		if n, err := PageLinePointerCount(p); err != nil || n >= MaxHeapTuplesPerPage {
+			// PG's arm: a page at the line-pointer ceiling still has room
+			// when a free line can be reused (heap_lp_lifecycle clusters
+			// only; M0145-0008v). The ItemIdData subtraction stays, as in PG.
+			if err == nil && HeapLinePointerLifecycle() && h.Flags()&PDHasFreeLines != 0 {
+				if _, ok := firstReusableLinePointer(p, n); ok {
+					return space
+				}
+			}
 			return 0
 		}
 	}
 	return space
+}
+
+// firstReusableLinePointer finds the first LP_UNUSED item without storage
+// among p's count line pointers, as PageAddItemExtended's scan does.
+func firstReusableLinePointer(p Page, count int) (int, bool) {
+	for idx := 0; idx < count; idx++ {
+		item, err := readItemID(p, idx)
+		if err != nil {
+			return 0, false
+		}
+		if item.Flags == ItemIDUnused && item.Length == 0 {
+			return idx, true
+		}
+	}
+	return 0, false
 }
 
 // HeapInsertTargetFreeSpace returns the amount of free space an *existing*
@@ -693,6 +716,29 @@ func PageAddHeapTuple(p Page, t HeapTuple) (uint16, error) {
 	// reads exactly the tuple bytes; the trailing 0..7 bytes are
 	// padding (zero from InitPage). M0106-0010 batched-36.
 	alignedSize := maxAlign8(len(raw))
+	count, err := PageLinePointerCount(p)
+	if err != nil {
+		return 0, err
+	}
+	// PageAddItemExtended's reuse arm (bufpage.c): with PD_HAS_FREE_LINES set
+	// the first LP_UNUSED item without storage takes the tuple, and the hint
+	// is cleared when none is left. Only on a heap_lp_lifecycle cluster,
+	// where no LP_UNUSED item is referenced by an index (M0145-0008v).
+	if HeapLinePointerLifecycle() && h.Flags()&PDHasFreeLines != 0 {
+		if idx, ok := firstReusableLinePointer(p, count); ok {
+			if upper-lower < alignedSize {
+				return 0, ErrNoSpaceInPage
+			}
+			newUpper := upper - alignedSize
+			copy(p[newUpper:newUpper+len(raw)], raw)
+			if err := writeItemID(p, idx, ItemID{Offset: uint16(newUpper), Flags: ItemIDNormal, Length: uint16(len(raw))}); err != nil {
+				return 0, err
+			}
+			h.SetUpper(uint16(newUpper))
+			return uint16(idx + 1), nil
+		}
+		h.SetFlags(h.Flags() &^ PDHasFreeLines)
+	}
 	needed := itemIDSize + alignedSize
 	if upper-lower < needed {
 		return 0, ErrNoSpaceInPage
@@ -701,10 +747,6 @@ func PageAddHeapTuple(p Page, t HeapTuple) (uint16, error) {
 	newUpper := upper - alignedSize
 	copy(p[newUpper:newUpper+len(raw)], raw)
 
-	count, err := PageLinePointerCount(p)
-	if err != nil {
-		return 0, err
-	}
 	item := ItemID{Offset: uint16(newUpper), Flags: ItemIDNormal, Length: uint16(len(raw))}
 	if err := writeItemID(p, count, item); err != nil {
 		return 0, err
@@ -1260,6 +1302,21 @@ func PruneHeapPageBySlots(p Page, unusedSlots, lpDead []uint16) (HeapPageVacuumS
 		}
 	}
 	h.SetUpper(uint16(upper))
+	// PageRepairFragmentation's hint (bufpage.c): PD_HAS_FREE_LINES records
+	// whether any LP_UNUSED item is left, so the next insert may reuse it
+	// (PageAddHeapTuple, M0145-0008v). It is only a hint; reuse itself is
+	// gated on the heap_lp_lifecycle capability.
+	hasUnused := false
+	for idx := 0; idx < count && !hasUnused; idx++ {
+		if it, rerr := readItemID(p, idx); rerr == nil && it.Flags == ItemIDUnused {
+			hasUnused = true
+		}
+	}
+	if hasUnused {
+		h.SetFlags(h.Flags() | PDHasFreeLines)
+	} else {
+		h.SetFlags(h.Flags() &^ PDHasFreeLines)
+	}
 	return stats, nil
 }
 

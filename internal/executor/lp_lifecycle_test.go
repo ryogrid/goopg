@@ -10,6 +10,9 @@ import (
 	"github.com/goopg/goopg/internal/storage"
 )
 
+// lpUnusedCount is the LP_UNUSED item count of the last countHeapLPDead call.
+var lpUnusedCount int
+
 // countHeapLPDead counts the LP_DEAD items across every heap block of table,
 // and the blocks whose PD_HAS_FREE_LINES hint is set (only VACUUM's second
 // heap pass sets it).
@@ -25,6 +28,7 @@ func countHeapLPDead(t *testing.T, ctx *Context, table string) (int, int) {
 		t.Fatal(err)
 	}
 	total, freeLines := 0, 0
+	lpUnusedCount = 0
 	for blk := storage.BlockNumber(0); blk < n; blk++ {
 		s, err := ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: blk})
 		if err != nil {
@@ -32,6 +36,13 @@ func countHeapLPDead(t *testing.T, ctx *Context, table string) (int, int) {
 		}
 		s.RLock()
 		dead, _ := storage.PageDeadItems(s.Page())
+		if cnt, err := storage.PageLinePointerCount(s.Page()); err == nil {
+			for off := uint16(1); int(off) <= cnt; off++ {
+				if id, err := storage.PageGetItemID(s.Page(), off); err == nil && id.Flags == storage.ItemIDUnused {
+					lpUnusedCount++
+				}
+			}
+		}
 		if storage.MustHeader(s.Page()).Flags()&storage.PDHasFreeLines != 0 {
 			freeLines++
 		}
@@ -87,7 +98,14 @@ func TestVacuumSecondHeapPassKeepsIndexesExact(t *testing.T) {
 			if (dead > 0) != tc.wantDead || (freeLines > 0) == tc.wantDead {
 				t.Fatalf("after VACUUM: %d LP_DEAD items, %d pages with free lines; want dead=%v", dead, freeLines, tc.wantDead)
 			}
+			unusedBefore := lpUnusedCount
 			runSQL(t, ctx, "INSERT INTO lpt SELECT g, 'new-' || g FROM generate_series(3000, 3700) g")
+			countHeapLPDead(t, ctx, "lpt")
+			// S3b: on a capable btree-only table the inserts fill the freed
+			// lines instead of appending new ones.
+			if !tc.wantDead && lpUnusedCount >= unusedBefore {
+				t.Fatalf("freed lines not reused: %d LP_UNUSED before the inserts, %d after", unusedBefore, lpUnusedCount)
+			}
 			runSQL(t, ctx, "ANALYZE lpt")
 			for _, q := range []struct{ indexed, noIndex string }{
 				{"SELECT id, v FROM lpt WHERE id BETWEEN 90 AND 130", "SELECT id, v FROM lpt WHERE id + 0 BETWEEN 90 AND 130"},

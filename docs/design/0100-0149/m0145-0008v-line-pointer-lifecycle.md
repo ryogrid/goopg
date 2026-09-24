@@ -1,6 +1,6 @@
 # M0145-0008v: heap line-pointer lifecycle (LP_DEAD, LP_UNUSED, recycling)
 
-Status: **S1, S2 and S3a LANDED 2026-09-25; S3b (reuse) open.** Task: `.ralph/fix_plan.md`
+Status: **COMPLETE 2026-09-25 (S1, S2, S3a, S3b landed).** Task: `.ralph/fix_plan.md`
 M0145-0008v (Kind: impl, Parent: M0145-0008t). Found by M0145-0008t
 (`m0145-0008t-prune-on-access.md`, "The premise that did not hold").
 
@@ -261,3 +261,53 @@ shapes) pass; isolation and regress show only HEAD's failures.
 `PD_HAS_FREE_LINES`, gated on the capability, and `PageGetHeapFreeSpace`
 stops answering 0 at the ceiling while a free line exists. Both need the
 SSI SIREAD audit first, then a measurement of pgbench small-table growth.
+
+## S3b as landed (2026-09-25): reuse
+
+- **`PageAddHeapTuple`** takes the first LP_UNUSED item without storage when
+  `PD_HAS_FREE_LINES` is set, and clears the hint when none is left. This is
+  `PageAddItemExtended`'s scan. It needs only the tuple's aligned size, since
+  no new line pointer is added.
+- **`PageGetHeapFreeSpace`** keeps PG's ceiling arm: at
+  `MaxHeapTuplesPerPage` it reports the page's space while a free line
+  exists, keeping the `ItemIdData` subtraction as PG does.
+- Both are gated on `heap_lp_lifecycle`.
+- **Prune compaction** (`PruneHeapPageBySlots`) now sets or clears
+  `PD_HAS_FREE_LINES` like `PageRepairFragmentation`, so a dead HEAP_ONLY
+  version's line is reusable without waiting for VACUUM.
+- **Redo:** `redoHeapPageAddItemOverwrite` already overwrote an unused line
+  at the record's offset. `TestReplayPGHeapInsertIntoReusedLineLikeRuntime`
+  pins byte parity for an insert into a freed interior line; the only
+  runtime-side input is the self-pointing `t_ctid` the insert path stamps.
+- **SSI audit.** INSERT's conflict-in check started from the new tuple's
+  TID. With reuse, a tuple-grain SIREAD on that TID can only be a leftover
+  lock on the slot's dead-to-all previous occupant, and would raise a false
+  rw-conflict. `ssiRecordTupleInsert` starts the walk at the page instead.
+  PG's `heap_insert` checks the relation grain; goopg keeps the page grain,
+  which its heap-page SIREAD phantom detection relies on. The isolation
+  family is unchanged.
+- **Catalogs and TOAST** never reach the second pass. Their on-disk indexes
+  may not be listed in `IndexesOnTable`, and an unlisted index reads as
+  clean.
+- **Tests:**
+  - `TestPageAddHeapTupleReusesFreeLine`: reuse order, hint clearing,
+    legacy append, the ceiling arm;
+  - the redo parity test above;
+  - `TestVacuumSecondHeapPassKeepsIndexesExact` now also requires that
+    post-VACUUM inserts consume freed lines on a capable btree-only table,
+    with index results still equal to the heap.
+
+## Outcome against the original symptom
+
+pgbench TPC-B A/B on fresh capable clusters: `pgbench_branches` still
+reaches ~85 heap blocks on both arms, and tps is equal. So the line-pointer
+ceiling was not the whole story.
+
+A page dump after a 10 s run shows blocks 0–3 **empty**: 226 line
+pointers, all LP_UNUSED or LP_DEAD, `pd_upper` = 8192, free lines set.
+Reuse is available, but nothing inserts there again:
+- the LP_DEAD survivors show that many updates were non-HOT;
+- the insertion target never learns about on-access-pruned space.
+
+That is filed as **M0145-0008w** (recon). The lifecycle port itself is
+complete, and the invariants it needs are pinned by tests. Movement: none.

@@ -597,7 +597,11 @@ func VacuumRelationIndexes(pool *storage.Pool, mgr *transam.Manager, cat catalog
 }
 
 func vacuumIndexesImpl(ctx *Context, tbl *catalog.Table, deadTIDs []storage.ItemPointer) bool {
-	clean := true
+	// System catalogs and TOAST relations can carry on-disk indexes that the
+	// catalog's IndexesOnTable does not list (the PG-format catalog indexes
+	// goopg writes for a PG reader), and an unlisted index reads as clean.
+	// Their LP_DEAD items therefore never become reusable (M0145-0008v).
+	clean := tbl != nil && tbl.OID >= firstNormalObjectOID && tbl.Schema != "pg_toast"
 	indexes := ctx.Catalog.IndexesOnTable(tbl, catalog.NamespaceDBOid(ctx.CurrentDatabaseOid))
 	for _, idx := range indexes {
 		if idx.Method != "btree" {

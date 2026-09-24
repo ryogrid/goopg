@@ -583,6 +583,29 @@ func ssiRecordTupleWrite(ctx *Context, rel storage.RelFileNode, block storage.Bl
 	return nil
 }
 
+// ssiRecordTupleInsert is the SSI write hook for a NEWLY INSERTED tuple. It
+// starts the conflict-in walk at the page, not the tuple: a tuple-grain
+// SIREAD on a brand-new TID can only be a leftover lock on the slot's
+// previous, dead-to-all occupant, reachable once VACUUM frees and a later
+// insert reuses the offset (M0145-0008v), and would raise a false rw-conflict.
+// PG's heap_insert checks the relation grain alone
+// (CheckForSerializableConflictIn(relation, NULL, InvalidBlockNumber)); goopg
+// keeps the page grain as well, which is what its heap-page SIREAD locks rely
+// on for phantom detection.
+func ssiRecordTupleInsert(ctx *Context, rel storage.RelFileNode, block storage.BlockNumber) error {
+	if !ssiActive(ctx) {
+		return nil
+	}
+	if block == storage.InvalidBlockNumber {
+		return nil
+	}
+	tag := transam.PageLockTag(rel.DBOid, rel.RelOid, block)
+	if err := ctx.TxnMgr.CheckForSerializableConflictInReportingFailure(ctx.Tx.Handle, tag); err != nil {
+		return ssiReadAbortError(err)
+	}
+	return nil
+}
+
 // ssiRecordTableWrite is the executor-side SSI hook for a relation-wide
 // logical mass delete/rewrite — TRUNCATE, DROP, or REFRESH MATERIALIZED VIEW.
 // Mirroring upstream CheckTableForSerializableConflictIn (predicate.c), it

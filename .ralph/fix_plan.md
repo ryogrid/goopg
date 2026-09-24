@@ -19743,7 +19743,7 @@ Movement: none — no plan moved on TPC-DS SF0.25/SF1 or TPC-H across all four d
       isolation and full regress = only the failures HEAD also has.
     Movement: none — no plan, value or table growth moved.
 
-- [ ] **M0145\-0008v — heap line\-pointer lifecycle: LP\_DEAD on prune,
+- [x] **M0145\-0008v — heap line\-pointer lifecycle: LP\_DEAD on prune,
   LP\_UNUSED after index vacuum, recycling** \(filed 2026\-09\-25 by
   M0145\-0008t\). goopg\'s `PageAddHeapTuple` always appends a line
   pointer and `PageGetHeapFreeSpace` returns 0 at `MaxHeapTuplesPerPage`,
@@ -19807,6 +19807,46 @@ Movement: none — no plan moved on TPC-DS SF0.25/SF1 or TPC-H across all four d
     - Next: S3b — reuse in `PageAddHeapTuple` \+ free\-space ceiling
       \(capability\-gated\), after the SSI SIREAD audit; measure pgbench
       growth.
+  - **S3b LANDED 2026\-09\-25 — task complete.**
+    - `PageAddHeapTuple` reuses the first LP\_UNUSED item without storage
+      under `PD\_HAS\_FREE\_LINES` \(`PageAddItemExtended`\) and
+      `PageGetHeapFreeSpace` stops answering 0 at the ceiling while a free
+      line exists; both gated on `heap\_lp\_lifecycle`. Prune compaction
+      sets/clears the hint like `PageRepairFragmentation`. Redo of an insert
+      into a reused line is byte\-identical.
+    - SSI audit: INSERT now checks conflict\-in from the PAGE grain
+      \(`ssiRecordTupleInsert`\), since a tuple\-grain SIREAD on a new TID can
+      only be a stale lock on a reused slot; PG checks the relation grain.
+    - Catalogs and TOAST relations never reach the second pass \(their
+      on\-disk indexes may not be listed in the catalog\).
+    - Measured: pgbench small\-table growth UNCHANGED \(branches \~85
+      blocks both arms, tps equal\). Page dump: emptied pages carry free
+      lines but are never inserted into again → M0145\-0008w.
+    - Gates: units, spotcheck, acceptance 24 MATCH, sf025 96/96 ×2
+      \(single\-query swings Q8, Q67 reverse between runs\), isolation and
+      regress = HEAD\'s failures, WAL/amcheck testport set.
+    Movement: none — storage lifecycle; no plan or value moved.
+
+- [ ] **M0145\-0008w — pgbench\'s small tables still grow \~40 heap blocks per
+  10 s: emptied pages are never inserted into again** \(filed 2026\-09\-25 by
+  M0145\-0008v\). After 10 s of TPC\-B at scale 2, `pgbench\_branches`
+  blocks 0–3 each hold 226 line pointers that are all LP\_UNUSED or
+  LP\_DEAD, with `pd\_upper = 8192` and `PD\_HAS\_FREE\_LINES` set
+  \(`analysis/m0145/m0145\-0008v/pgbench\-s3b.txt`\).
+  Kind: recon
+  Parent: M0145-0008v
+  - Hypotheses to measure, not yet verified:
+    - Non\-HOT updates dominate: the LP\_DEAD survivors show updates that
+      left their page. The HOT path prunes only under `IsCleanupOK`, which
+      a concurrent reader\'s pin defeats with 8 clients on 2 rows.
+    - The insertion target \(FSM / target block\) never learns about space
+      an on\-access prune freed, so emptied pages are only revisited after
+      VACUUM updates the FSM. PG\'s `RelationGetBufferForTuple` tries the
+      update\'s own page first \(`heap\_update`\) and keeps `rd\_targblock`.
+  - First step: count HOT vs non\-HOT updates in a 10 s run \(the
+    `s321Note` counters in `tryApplyHOTUpdate`\) and log which block each
+    non\-HOT new version lands on; compare with PG 18.3 running the same
+    pgbench on a scratch cluster.
 
 - [ ] **M0145\-0008u — a pin\-held \(zero\-copy\) seq\-scan slot**
   \(filed 2026\-09\-25 by M0145\-0008q\). With compaction under a cleanup

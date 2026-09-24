@@ -47,3 +47,82 @@ func TestPageVacuumDeadItemsTruncates(t *testing.T) {
 		t.Fatalf("next insert slot = %d (%v), want 4", slot, err)
 	}
 }
+
+// TestPageAddHeapTupleReusesFreeLine pins PageAddItemExtended's reuse arm
+// (M0145-0008v S3b): on a heap_lp_lifecycle cluster an insert takes the first
+// LP_UNUSED item without storage, and appends (clearing PD_HAS_FREE_LINES) when
+// none is left; without the capability it always appends. A page at the
+// line-pointer ceiling reports free space only while a free line exists.
+func TestPageAddHeapTupleReusesFreeLine(t *testing.T) {
+	build := func(t *testing.T) Page {
+		t.Helper()
+		p := make(Page, BlockSize)
+		if err := InitPage(p); err != nil {
+			t.Fatal(err)
+		}
+		for i := 0; i < 5; i++ {
+			if _, err := PageAddHeapTuple(p, NewHeapTuple(1, InvalidTransactionID, []byte("row"))); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if _, err := PruneHeapPageBySlots(p, nil, []uint16{2, 3}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := PageVacuumDeadItems(p, []uint16{2, 3}); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	add := func(t *testing.T, p Page) uint16 {
+		t.Helper()
+		s, err := PageAddHeapTuple(p, NewHeapTuple(1, InvalidTransactionID, []byte("new")))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return s
+	}
+
+	SetHeapLinePointerLifecycle(false)
+	if s := add(t, build(t)); s != 6 {
+		t.Fatalf("legacy cluster: slot %d, want an append (6)", s)
+	}
+
+	SetHeapLinePointerLifecycle(true)
+	defer SetHeapLinePointerLifecycle(false)
+	p := build(t)
+	for _, want := range []uint16{2, 3, 6} {
+		if s := add(t, p); s != want {
+			t.Fatalf("slot %d, want %d", s, want)
+		}
+	}
+	if MustHeader(p).Flags()&PDHasFreeLines != 0 {
+		t.Fatal("PD_HAS_FREE_LINES must be cleared once no free line is left")
+	}
+
+	// The ceiling: fill the array to MaxHeapTuplesPerPage with tiny tuples,
+	// free one interior item, and the page reports room again.
+	q := make(Page, BlockSize)
+	if err := InitPage(q); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < MaxHeapTuplesPerPage; i++ {
+		if _, err := PageAddHeapTuple(q, NewHeapTuple(1, InvalidTransactionID, nil)); err != nil {
+			t.Fatalf("filling slot %d: %v", i+1, err)
+		}
+	}
+	if PageGetHeapFreeSpace(q) != 0 {
+		t.Fatal("a page at the ceiling with no free line must report 0")
+	}
+	if _, err := PruneHeapPageBySlots(q, nil, []uint16{10}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := PageVacuumDeadItems(q, []uint16{10}); err != nil {
+		t.Fatal(err)
+	}
+	if PageGetHeapFreeSpace(q) == 0 {
+		t.Fatal("a page at the ceiling with a free line must report its space")
+	}
+	if s := add(t, q); s != 10 {
+		t.Fatalf("ceiling page reuse: slot %d, want 10", s)
+	}
+}
