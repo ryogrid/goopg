@@ -19303,7 +19303,7 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
       `loops=0`.
     - Group I \(index coverage\) remains M0145\-0029\'s residue.
 
-- [ ] **M0145-0008b — recon: attribute the Q18/Q22 slowdown on the
+- [x] **M0145-0008b — recon: attribute the Q18/Q22 slowdown on the
   jointree default** (filed 2026-09-24, held in the M0145-0001 third
   lineage escalation until the owner answer above; ledger row exists).
   On the flip commit's own binary, TPC-H Q18 runs 1.6x and Q22 3.2x
@@ -19316,6 +19316,57 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
   Parent: M0145-0008
   - Expected movement: none by itself (recon); impl follow-ups file
     their own.
+  - **DONE 2026\-09\-24 \(recon, no code\).** Design:
+    `docs/design/0100-0149/m0145-0008b-q18-q22-jointree-slowdown-attribution.md`;
+    evidence `analysis/m0145/m0145-0008b/` \(EXPLAIN ANALYZE of both arms on
+    one binary; PG 18.3 probes\). Q18 9.94 s → 19.93 s, Q22 0.51 s → 1.38 s.
+    - Q18 factor 1: the jointree lowering keeps join tuples unnarrowed \(width
+      1622 vs 268; build 869 MB in 2 batches vs 581 MB in 1\) → M0145\-0008e.
+    - Q18 factor 2: the jointree arm elects PG's HashAggregate for the grouped
+      semi body; goopg's HashAggregate build takes 12.2 s where PG's takes
+      3.3 s serial → M0145\-0008f.
+    - Q22: the outer estimate for `substr\(c\_phone,1,2\) IN \(7\)` is 1/3 \(or
+      1.0\) where PG gives 0.035, so the NL anti \(PG's shape, legacy's
+      rule\) costs 265k and loses to a hash anti over all of orders →
+      M0145\-0008g.
+    Movement: none — recon.
+
+- [ ] **M0145\-0008e — the jointree lowering narrows join tuples as the
+  legacy lowering does**: on TPC\-H Q18 the jointree arm's `orders ⋈
+  customer` hash carries width 1622 \(869 MB, 2 batches\) where legacy
+  carries 268 \(581 MB, 1 batch\); PG's widths are 25–45 \(only referenced
+  columns reach a join's tlist, `build\_joinrel\_tlist` / attr\_needed\).
+  Find where the legacy lowering narrows \(`narrowoutput.go`\) and why the
+  jointree path skips it.
+  Kind: impl
+  Parent: M0145-0008b
+  - Expected movement: Q18 build side back to one batch; acceptance\-arm
+    Q18 time; width columns of the parity capture.
+
+- [ ] **M0145\-0008f — HashAggregate build throughput on a many\-group
+  input**: TPC\-H Q18's semi body \(`GROUP BY l\_orderkey HAVING sum \> 313`, 6M
+  rows → 1.5M groups\) builds in 12.2 s inside goopg's plan, while PG's
+  HashAggregate runs the whole aggregate in 3.3 s serial. The election is
+  PG's, and the executor is 3–4x slower. Profile the hash\-agg build \(group
+  lookup, transition state allocation, numeric sum\).
+  Kind: impl
+  Parent: M0145-0008b
+  - Expected movement: acceptance\-arm Q18 time \(and every HashAggregate\-heavy
+    query\); no plan change.
+
+- [ ] **M0145\-0008g — `expr = ANY \(const list\)` with an expression operand is
+  estimated as PG does**: PG prices `substr\(c\_phone,1,2\) IN \(7 values\)` at
+  0.035 \(scalararraysel: per\-element eqsel, default 1/DEFAULT\_NUM\_DISTINCT
+  for an expression without stats, OR\-merged\); goopg's `clauseSelectivity`
+  / `clauseSelectivityWithSource` IN arms return 1/3 for a non\-ColumnRef
+  operand, and the TPC\-H Q22 leaf shows even less reduction. That makes the
+  NL anti cost 265k, and it loses to a hash anti over all of orders.
+  Kind: impl
+  Parent: M0145-0008b
+  - Also check the anti NL's per\-outer\-row charge: ≈5.3 in goopg vs ≈0.8 in
+    PG \(`final\_cost\_nestloop` semi/anti early exit\). Expected movement:
+    TPC\-H Q22 elects PG's NL Anti Join \+ Index Only Scan
+    \(`join\-method`/`parameterisation`\); acceptance\-arm Q22 time.
 
 - [ ] **M0145-0008c — recon: PG-shared attribution for the flip's NEW
   ea-ratchet key `Q95:cte:ws_wh+customer_address+date_dim+web_sales+
