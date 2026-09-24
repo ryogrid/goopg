@@ -19399,7 +19399,7 @@ M0146-0001 re-baseline census on the new default arm.
       the partsupp scan → M0146\-0002d.
     Movement: none — TPC\-H CATEGORIES\-EXCL\-MATCH unchanged; Q16 keeps its six categories.
 
-- [ ] **M0146\-0002d — a SubPlan\-bearing restriction is not placed on its
+- [x] **M0146\-0002d — a SubPlan\-bearing restriction is not placed on its
   base relation** \(found 2026\-09\-24 by M0146\-0002c on TPC\-H Q16\):
   `ps\_suppkey NOT IN \(SELECT …\)` references only `partsupp`, and PG pushes
   it to the partsupp scan \(`distribute\_restrictinfo\_to\_rels`; a hashed
@@ -19415,6 +19415,54 @@ M0146-0001 re-baseline census on the new default arm.
     the SubPlan is parallel\-safe in goopg's `relConsiderParallel`. Expected
     movement: TPC\-H Q16 `qual\-placement` and `parallelism`, measured on the
     canonical parallel capture.
+  - **DONE 2026\-09\-24 \(recon, no code\).** Design:
+    `docs/design/0100-0149/m0146-0002d-subplan-restriction-placement.md`;
+    evidence `analysis/m0146/m0146-0002d/` \(PG and goopg EXPLAIN of Q16\).
+    - PG 18.3 puts the filter on `Parallel Index Only Scan on partsupp`, under
+      a `Parallel Hash Join`.
+    - Cause 1 \(placement\): `conjunctIsLocalEligible` declines every sublink,
+      so `partitionConjunctsForJoinPlanning` keeps it in the join residual →
+      M0146\-0002e.
+    - Cause 2 \(parallelism\): `exprsParallelSafe` refuses every inner\-plan
+      slot; PG admits a parallel\-safe SubPlan \(`clauses.c:900\-912`\) →
+      M0146\-0002f.
+    - Cause 3 \(rendering\): execution is already hashed \(`subplan\_hash.go`\);
+      only the EXPLAIN deparse differs → M0146\-0002g.
+
+- [ ] **M0146\-0002e — place an uncorrelated sublink conjunct on its base
+  relation, as PG does**: `conjunctIsLocalEligible` \(`local\_filters.go`\)
+  admits a conjunct whose sublinks are all `IsNonCorrelated`, and
+  `localizeExprToLeaf` rebases it with `scopeIgnore` \(only the testexpr's
+  same\-scope columns move; the inner plan has no references to this
+  level\). The sibling legacy pushdown \(`innerJoinPushTarget`\) follows the
+  same rule \(Hard\-won Rule 2\).
+  Kind: impl
+  Parent: M0146-0002d
+  - Correlated sublinks stay declined \(they need `remapOuterRefsInSubplan`\);
+    ledgered. Expected movement: TPC\-H Q16 `qual\-placement`, measured on the
+    canonical parallel capture; values pinned by the NOT IN NULL probe
+    cases \(`analysis/m0146/m0146-0002b/not-in-probe.txt`\).
+
+- [ ] **M0146\-0002f — a parallel\-safe SubPlan does not make its relation
+  parallel\-unsafe**: port `max\_parallel\_hazard\_walker`'s SubPlan arm
+  \(`clauses.c:900\-912`: the subplan must be parallel\_safe, and its
+  testexpr is checked with the SubPlan's params counted as safe\) into
+  `exprsParallelSafe` \(`considerparallel.go`\), together with worker\-safe
+  SubPlan evaluation: prove the sublink caches \(`subq\_cache.go`\) and the
+  hashed probe \(`subplan\_hash.go`\) are worker\-local or thread\-safe, with a
+  parallel\-vs\-serial identity test under `\-race`.
+  Kind: impl
+  Parent: M0146-0002d
+  - Depends on M0146\-0002e for Q16 to move. Expected movement: Q16
+    `parallelism` \(Parallel Hash Join over the filtered partsupp scan\).
+
+- [ ] **M0146\-0002g — EXPLAIN renders a hashed SubPlan as PG does**:
+  `NOT \(ANY \(x = \(hashed SubPlan N\).col1\)\)` instead of
+  `NOT \(x = ANY \(SubPlan N\)\)` \(the SubPlan arm of `get\_rule\_expr`,
+  `ruleutils.c`\); execution is already hashed.
+  Kind: impl
+  Parent: M0146-0002d
+  - Expected movement: Q16 `rendering`.
 
 - [ ] **M0146\-0015 — upstream regress `subselect` hangs: a nested
   EXISTS / NOT EXISTS over `tenk1` runs for more than an hour** \(found
