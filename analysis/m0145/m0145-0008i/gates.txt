@@ -1,0 +1,25 @@
+tmp/m0145-0008i-fireset.log:FIRE-SET: baseline=68b13597c71db0ad2102db07049e1c379f869889 (5bc4f2a7e8d0) candidate=worktree (a1a91ee42854)
+tmp/m0145-0008i-fireset.log:FIRE-SET-TIMEOUTS: fires=Q39 Q64 introduced=none unchanged=none missing=none
+tmp/m0145-0008i-fireset.log:FIRE-SET-TIMEOUTS: fires=Q39 Q64 introduced=none unchanged=none missing=none
+tmp/m0145-0008i-tpch2.log:FIRE-SET: baseline=68b13597c71db0ad2102db07049e1c379f869889 (f57370f74c6b) candidate=worktree (a1a91ee42854)
+tmp/m0145-0008i-tpch2.log:FIRE-SET-TIMEOUTS: fires=Q10 Q18 introduced=none unchanged=none missing=none
+tpch baseline: PLAN-PARITY: queries=22 match=3 shapediff=19 unparsed=0 missingnode=0 error=0 timeout=0
+tpch baseline: CATEGORIES-EXCL-MATCH: join-order=17 join-method=11 scan-type=12 parameterisation=7 aggregation-strategy=4 sort-strategy=9 parallelism=11 qual-placement=5 rendering=3
+tpch baseline: Q10 SHAPE-DIFF [join-order,join-method,scan-type,parameterisation,rendering] estimates(goopg cost=177501.19..1
+tpch baseline: Q18 SHAPE-DIFF [join-order,join-method,scan-type,aggregation-strategy,sort-strategy,parallelism] estimates(goo
+tpch candidate: PLAN-PARITY: queries=22 match=3 shapediff=19 unparsed=0 missingnode=0 error=0 timeout=0
+tpch candidate: CATEGORIES-EXCL-MATCH: join-order=17 join-method=11 scan-type=12 parameterisation=7 aggregation-strategy=4 sort-strategy=8 parallelism=11 qual-placement=5 rendering=2
+tpch candidate: Q10 SHAPE-DIFF [join-order,join-method,scan-type,parameterisation] estimates(goopg cost=176342.67..176487.49 r
+tpch candidate: Q18 SHAPE-DIFF [join-order,join-method,scan-type,aggregation-strategy,parallelism] estimates(goopg cost=410945
+# Q10/Q18 alternating A/B (acceptance arm, FORCE=1, nightly live, same load both arms):
+baseline r1: Q10: elapsed=9.06s Q18: elapsed=12.45s 
+candidate r1: Q10: elapsed=8.60s Q18: elapsed=11.68s 
+baseline r2: Q10: elapsed=8.68s Q18: elapsed=11.60s 
+candidate r2: Q10: elapsed=8.48s Q18: elapsed=12.20s 
+=== SUMMARY: PASS=96 (60 ck-verified, 36 ck=n/a) MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0 SKIP=3 ===
+=== PLAN-SHAPE: queries=99 same=97 changed=2 added=0 removed=0 ===
+SUMMARY: 24 MATCH
+VERDICT: PASS — every label matched on values, not merely on row count
+  baseline findings: 52   current: 52
+EA-RATCHET: PASS
+tpch-spotcheck: RESULT=PASS

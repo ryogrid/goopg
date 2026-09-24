@@ -8631,49 +8631,82 @@ func walkExprForWindows(e parser.Expr, fn func(*parser.FuncCall) error) error {
 	return nil
 }
 
-// pruneUselessGroupByColumns implements the single-relation arm of PostgreSQL's
-// remove_useless_groupby_columns
-// (postgres/src/backend/optimizer/plan/initsplan.c:412).
+// pruneUselessGroupByColumns is PostgreSQL's remove_useless_groupby_columns
+// (postgres/src/backend/optimizer/plan/initsplan.c:412), over every base
+// relation of the FROM clause.
 //
-// When a GROUP BY lists two or more columns of ONE base relation and some
-// non-deferrable unique/PK index on that relation has a key that is a proper
-// subset of those columns, the surplus group columns are functionally
-// determined by the key and PG drops them, grouping on the minimal set. The
+// For each base relation, when a GROUP BY lists two or more of its columns and
+// some non-deferrable unique/PK index on it has a key that is a proper subset
+// of those columns, the surplus group columns are functionally determined by
+// the key and PG drops them, grouping on the minimal set. Relations are
+// decided independently and the drops are unioned (PG's `surplusvars[k]`,
+// one bitmapset per range-table entry); PG applies no outer-join guard, since
+// a NULL-extended key still determines its NULL-extended dependents. The
 // pruned columns remain addressable as functionally-determined passthroughs
 // because parse analysis validated them against the FULL group clause before
 // pruning ran (see aggregateSurface.prunedInputCols).
 //
+// M0145-0008i widened this from the single-relation arm to every relation;
+// the per-relation decision is uselessGroupByKeyForBinding, unchanged.
+//
 // Returns keep[i] == false for each group expression to drop, plus the
-// input-schema indices of the pruned ColumnRefs. Returns (nil, nil) unless
-// EVERY eligibility guard holds — fail-closed, matching PG's "skip" paths.
+// input-schema indices of the pruned ColumnRefs. Returns (nil, nil) when no
+// relation can drop anything — fail-closed, matching PG's "skip" paths.
 func pruneUselessGroupByColumns(groupExprs []Expr, inputCtx *resolveContext, cat catalog.Catalog) ([]bool, map[int]bool) {
 	// Guard: at least two GROUP BY items (initsplan.c:422).
 	if len(groupExprs) < 2 {
 		return nil, nil
 	}
-	// Guard: exactly one base relation (RTE_RELATION; initsplan.c:494). PG
-	// processes each rtable relation independently, but this slice implements
-	// only the single-relation arm; a multi-relation FROM is left untouched.
-	var base *rangeBinding
+	// Per base relation (PG's `rte->rtekind == RTE_RELATION`), the winning
+	// key's column set, keyed by the binding's source index. Subquery, CTE,
+	// VALUES and function-scan bindings carry a SYNTHESISED catalog.Table with
+	// no OID, and a view binding carries the view's own; neither is a plain
+	// relation with keys, so both are skipped explicitly rather than relying
+	// on IndexesOnTable finding nothing for them.
+	keyBySource := map[int16]map[string]bool{}
 	for i := range inputCtx.bindings {
 		b := &inputCtx.bindings[i]
-		if b.table == nil {
-			continue // subquery/CTE/function-scan bindings carry no catalog table
+		if b.table == nil || b.table.OID == 0 || b.table.View != nil {
+			continue
 		}
-		if base != nil {
-			return nil, nil
+		if inKey := uselessGroupByKeyForBinding(groupExprs, b, cat); inKey != nil {
+			keyBySource[b.sourceIdx] = inKey
 		}
-		base = b
 	}
-	if base == nil {
+	if len(keyBySource) == 0 {
 		return nil, nil
 	}
+	// Mark surplus: a relation's group ColumnRefs whose column is not in that
+	// relation's winning key. PG keeps the original group order with the
+	// surplus removed and always keeps non-Var / outer-Var items
+	// (initsplan.c:610-625).
+	keep := make([]bool, len(groupExprs))
+	prunedInputCols := map[int]bool{}
+	for i, g := range groupExprs {
+		keep[i] = true
+		cr, ok := g.(*ColumnRef)
+		if !ok {
+			continue
+		}
+		if inKey, has := keyBySource[cr.SourceTableIdx]; has && !inKey[cr.Name] {
+			keep[i] = false
+			prunedInputCols[cr.Index] = true
+		}
+	}
+	return keep, prunedInputCols
+}
+
+// uselessGroupByKeyForBinding is one relation's turn in
+// remove_useless_groupby_columns: the column set of the smallest qualifying
+// unique key that is a proper subset of this relation's grouped columns, or
+// nil when the relation cannot drop anything.
+func uselessGroupByKeyForBinding(groupExprs []Expr, base *rangeBinding, cat catalog.Catalog) map[string]bool {
 	tbl := base.table
 	// Guard: an inheritance parent may produce duplicate rows from its child
 	// rels, which would not collapse under GROUP BY; partitioned tables are
 	// exempt because their children partition disjoint row sets (initsplan.c:502).
 	if base.tableOidColIdx > 0 && len(tbl.PartitionKey) == 0 {
-		return nil, nil
+		return nil
 	}
 	// Collect the GROUP BY items that are plain ColumnRefs of this relation,
 	// keyed by column name (a base-relation name maps 1:1 to an attno).
@@ -8689,7 +8722,7 @@ func pruneUselessGroupByColumns(groupExprs []Expr, inputCtx *resolveContext, cat
 	// (initsplan.c:507, bms_membership(relattnos) == BMS_MULTIPLE) — one column
 	// cannot make a redundant pair.
 	if len(groupColByName) < 2 {
-		return nil, nil
+		return nil
 	}
 	// Scan the relation's indexes for a qualifying unique key with the fewest
 	// columns (initsplan.c:578) — the fewer the key columns, the more surplus
@@ -8753,7 +8786,7 @@ func pruneUselessGroupByColumns(groupExprs []Expr, inputCtx *resolveContext, cat
 		}
 	}
 	if bestKey == nil {
-		return nil, nil
+		return nil
 	}
 	// Guard: a partitioned table's unique index is only a safe key if it covers
 	// the ENTIRE partition key. PG enforces this at index creation — "unique
@@ -8774,29 +8807,15 @@ func pruneUselessGroupByColumns(groupExprs []Expr, inputCtx *resolveContext, cat
 		}
 		for _, c := range tbl.PartitionKey {
 			if !inKey[c] {
-				return nil, nil
+				return nil
 			}
 		}
 	}
-	// Mark surplus: this relation's group ColumnRefs whose column is not in the
-	// winning key. PG keeps the original group order with the surplus removed
-	// and always keeps non-Var / outer-Var items (initsplan.c:610-625).
-	keep := make([]bool, len(groupExprs))
-	prunedInputCols := map[int]bool{}
 	inKey := map[string]bool{}
 	for _, c := range bestKey {
 		inKey[c] = true
 	}
-	for i, g := range groupExprs {
-		cr, ok := g.(*ColumnRef)
-		if ok && cr.SourceTableIdx == base.sourceIdx && !inKey[cr.Name] {
-			keep[i] = false
-			prunedInputCols[cr.Index] = true
-		} else {
-			keep[i] = true
-		}
-	}
-	return keep, prunedInputCols
+	return inKey
 }
 
 // groupByNameIsInputColumn is a name-*visibility* probe (not a bind) for

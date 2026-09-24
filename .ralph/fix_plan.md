@@ -19785,7 +19785,7 @@ Movement: none — no plan moved on TPC-DS SF0.25/SF1 or TPC-H across all four d
   > index\-ordered Index Only Scan input. Filed and not selected ahead of the
   > banner, per S2; the owner decides its placement.
 
-- [ ] **M0145\-0008i — multi\-relation `remove\_useless\_groupby\_columns`**:
+- [x] **M0145\-0008i — multi\-relation `remove\_useless\_groupby\_columns`**:
   PG drops GROUP BY columns that a primary key or unique NOT NULL index of
   their relation makes redundant, for every relation in a join
   \(`remove\_useless\_groupby\_columns`, initsplan.c\). goopg's
@@ -19797,6 +19797,20 @@ Movement: none — no plan moved on TPC-DS SF0.25/SF1 or TPC-H across all four d
   Parent: M0145-0008d
   - Expected movement: TPC\-H Q18 `aggregation\-strategy` / `sort\-strategy`
     \(and its Group Key rendering\) on the canonical parallel capture.
+  - **DONE 2026\-09\-25.** Design:
+    `docs/design/0100-0149/m0145-0008i-groupby-prune-every-relation.md`;
+    evidence `analysis/m0145/m0145-0008i/`.
+    - Pruning runs per base\-relation binding and unions the drops
+      \(PG's `surplusvars`\); synthesised \(OID 0\) and view bindings are
+      skipped explicitly; no outer\-join guard, as in PG.
+    - TPC\-H Q18 and Q10 print PG's exact Group Key; Q18 elects PG's
+      HashAggregate \+ Sort \(sort\-strategy 9→8, rendering 3→2\). TPC\-DS
+      Q39/Q64 group\-key text only. Values identical; alternating A/B shows
+      no timing regression.
+    - Gates: units, spotcheck, fire\-set \(SF0.25, SF1, TPC\-H\), sweep 96/96,
+      acceptance 24 MATCH, ea\-ratchet 52/52 \(FORCE=1 where the nightly was
+      live\).
+    Movement: none — CATEGORIES-EXCL-MATCH TPC-H sort-strategy 9 -> 8, rendering 3 -> 2 (within ±3); match counts unchanged.
 
 ## M0146 — Post-cutover plan parity (filed 2026-09-23, owner decision)
 
