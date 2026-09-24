@@ -973,6 +973,15 @@ func HasShareableHashJoin(n Node) bool {
 			}
 			return false
 		}
+		if x.ParallelHash {
+			// M0146-0002: the participants build a parallel-hash join
+			// themselves, behind a barrier, so it is NOT leader-prebuilt;
+			// only hash joins further down its probe side can be.
+			if joinProbeSideIsLeft(x) {
+				return HasShareableHashJoin(x.Left)
+			}
+			return HasShareableHashJoin(x.Right)
+		}
 		return true
 	}
 	if x, ok := n.(*NestedLoopIndexJoin); ok {

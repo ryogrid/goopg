@@ -1187,6 +1187,16 @@ type Join struct {
 	// single pair. M0127-P2.1; design leftdeep-joins/05 §5.
 	HashKeys  []JoinKeyPair
 	BuildLeft bool // hash join: build on left input instead of right
+	// ParallelHash marks PG's `parallel_hash = true` hash join
+	// (try_partial_hashjoin_path, joinpath.c:1290-1297): the build side is a
+	// PARTIAL path, every participant under the Gather builds its share into
+	// one shared table behind a build-completion barrier, and EXPLAIN renders
+	// `Parallel Hash Join` / `Parallel Hash`. Legal only on a Gather's partial
+	// path, for join types whose build side needs no after-probe sweep (INNER,
+	// SEMI, ANTI, LEFT built on the right). The leader prebuild never builds
+	// such a join (HasShareableHashJoin skips it). M0146-0002; design
+	// docs/design/0100-0149/m0146-0002-parallel-hash-partial-inner.md.
+	ParallelHash bool
 	// UsingLeftCols / UsingRightCols hold the ABSOLUTE column
 	// indices (relative to the merged schema) of the USING
 	// columns from the left and right sides respectively.

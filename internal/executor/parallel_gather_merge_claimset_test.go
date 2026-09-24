@@ -215,6 +215,19 @@ func TestParallelClaimSetAttachesEveryKind(t *testing.T) {
 		}, func(op Operator, cs *parallelClaimSet) bool {
 			return op.(*setOp).claimLeft == &cs.setOpLeft.claimedWhole
 		}},
+		// M0146-0002: a Parallel Hash join's partial BUILD side takes its
+		// own per-join claim state (hashBuildBranch); the probe side keeps
+		// the flat pscan. One state for both would share a block count
+		// across two relations.
+		{"hashBuildKids", &joinOp{
+			plan:  &optimizer.Join{Algo: optimizer.JoinAlgoHash, Type: optimizer.JoinTypeInner, ParallelHash: true},
+			left:  &seqScanOp{},
+			right: &seqScanOp{},
+		}, func(op Operator, cs *parallelClaimSet) bool {
+			j := op.(*joinOp)
+			build := j.right.(*seqScanOp).pscan
+			return j.left.(*seqScanOp).pscan == cs.pscan && build == cs.hashBuildBranch(j.plan).pscan && build != cs.pscan
+		}},
 	}
 
 	covered := map[string]bool{}
@@ -240,8 +253,11 @@ func TestParallelClaimSetAttachesEveryKind(t *testing.T) {
 	n := 0
 	cst := reflect.TypeOf(parallelClaimSet{})
 	onceType := reflect.TypeOf(sync.Once{})
+	mutexType := reflect.TypeOf(sync.Mutex{})
 	for i := 0; i < cst.NumField(); i++ {
-		if cst.Field(i).Type == onceType {
+		// sync.Once / sync.Mutex are growth locks for lazily built claim
+		// sets (setOpKidsOnce, hashKidsMu), not claim kinds.
+		if ft := cst.Field(i).Type; ft == onceType || ft == mutexType {
 			continue
 		}
 		n++

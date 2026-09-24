@@ -119,6 +119,12 @@ func NewWorkerContext(leader *Context, workerMctx *mmgr.Context, workerCtx conte
 	// would defeat the entire point of building once.
 	w.SharedHashBuilds = leader.SharedHashBuilds
 
+	// M0146-0002: Parallel Hash build states, by reference. Every participant
+	// must reach the SAME state — a private copy would make each worker's
+	// barrier count only itself and probe its own partial table.
+	w.ParallelHashBuilds = leader.ParallelHashBuilds
+	w.parallelHashObserver = leader.parallelHashObserver
+
 	// P9: partial-aggregate accumulators, by reference. Shared and WRITTEN by
 	// this worker — each accumulator serialises its own merges.
 	w.PartialAggStates = leader.PartialAggStates

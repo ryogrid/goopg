@@ -291,7 +291,13 @@ func collectShareableJoins(op Operator, out *[]*joinOp) {
 		if x.plan == nil || x.plan.Algo != optimizer.JoinAlgoHash || x.plan.Lateral {
 			return
 		}
-		*out = append(*out, x)
+		// M0146-0002: a Parallel Hash join is built by the participants
+		// behind a barrier, never prebuilt — the plan-side twin
+		// (HasShareableHashJoin) skips it the same way. Its probe side is
+		// still walked: hash joins below it are prebuilt as usual.
+		if !x.plan.ParallelHash {
+			*out = append(*out, x)
+		}
 		if probeSideIsLeft(x.plan) {
 			collectShareableJoins(x.left, out)
 		} else {
@@ -489,6 +495,12 @@ func coopDrivingScan(node optimizer.Node) *optimizer.SeqScan {
 //
 // The function never mutates join state.
 func (o *joinOp) parallelBuildEligible(ctx *Context, buildLeft bool) bool {
+	// M0146-0002: a Parallel Hash participant builds only its CLAIMED share
+	// of the inner. The cooperative builder rebuilds the subtree over its own
+	// scan state and would read the whole relation into every participant.
+	if o.plan.ParallelHash {
+		return false
+	}
 	// Rule 1: must be shareable (P8 eligibility).
 	if o.plan.Type == optimizer.JoinTypeFull || o.plan.Type == optimizer.JoinTypeRight {
 		return false

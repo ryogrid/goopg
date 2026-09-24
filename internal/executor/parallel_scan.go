@@ -653,6 +653,67 @@ type parallelClaimSet struct {
 	// set whose SetOp branch is partial — the zero value is the
 	// "unclaimed" state CAS expects, so no constructor work is needed.
 	claimedWhole atomic.Bool
+
+	// hashBuildKids (M0146-0002) is the INDEPENDENT claim state of each
+	// Parallel Hash join's build side, keyed by the join. The build side is
+	// a partial path over a different relation from the probe side, so it
+	// cannot share this set's pscan/pidx (parallelScanState publishes the
+	// block count of whichever scan opens it first — the SetOp hazard above).
+	// Grown lazily under hashKidsMu: attachAll runs in every participant
+	// concurrently, and every participant must reach the SAME state for a
+	// given join or each would scan the whole inner.
+	hashKidsMu    sync.Mutex
+	hashBuildKids map[*optimizer.Join]*parallelClaimSet
+}
+
+// hashBuildBranch returns the claim set for join j's partial build side,
+// creating it on first use.
+func (cs *parallelClaimSet) hashBuildBranch(j *optimizer.Join) *parallelClaimSet {
+	cs.hashKidsMu.Lock()
+	defer cs.hashKidsMu.Unlock()
+	if cs.hashBuildKids == nil {
+		cs.hashBuildKids = make(map[*optimizer.Join]*parallelClaimSet)
+	}
+	kid, ok := cs.hashBuildKids[j]
+	if !ok {
+		kid = newLeafParallelClaimSet()
+		cs.hashBuildKids[j] = kid
+	}
+	return kid
+}
+
+// attachParallelHashBuildSides wires every Parallel Hash join's build side on
+// op's probe path to that join's own claim set (hashBuildBranch). It walks
+// exactly what attachParallelScan walks, which never descends a hash join's
+// build side itself — the leader-prebuilt build is complete, but a Parallel
+// Hash build is partial and must be claimed.
+func (cs *parallelClaimSet) attachParallelHashBuildSides(op Operator) bool {
+	switch x := op.(type) {
+	case *filterOp:
+		return cs.attachParallelHashBuildSides(x.child)
+	case *projectOp:
+		return cs.attachParallelHashBuildSides(x.child)
+	case *instrumentedOp:
+		return cs.attachParallelHashBuildSides(x.inner)
+	case *joinOp:
+		if x.plan == nil || x.plan.Algo != optimizer.JoinAlgoHash {
+			return false
+		}
+		probe, build := x.right, x.left
+		if probeSideIsLeft(x.plan) {
+			probe, build = x.left, x.right
+		}
+		attached := false
+		if x.plan.ParallelHash {
+			kid := cs.hashBuildBranch(x.plan)
+			attached = kid.attachAll(build)
+			// A Parallel Hash nested on this build side is built by the
+			// same participants, over the build side's own claims.
+			attached = kid.attachParallelHashBuildSides(build) || attached
+		}
+		return cs.attachParallelHashBuildSides(probe) || attached
+	}
+	return false
 }
 
 // newParallelClaimSet builds the claim state that needs no pre-pass. pbm is
@@ -818,6 +879,7 @@ func (cs *parallelClaimSet) attachAll(op Operator) bool {
 	attached := attachParallelScan(op, cs.pscan)
 	attached = attachParallelBitmapScan(op, cs.pbm) || attached
 	attached = attachParallelIndexScan(op, cs.pidx) || attached
+	attached = cs.attachParallelHashBuildSides(op) || attached
 	return attached
 }
 

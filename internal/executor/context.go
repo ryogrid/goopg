@@ -323,6 +323,18 @@ type Context struct {
 	// Nil outside a Gather, which is the serial case.
 	SharedHashBuilds map[*optimizer.Join]*sharedHashBuild
 
+	// ParallelHashBuilds carries the shared build state of every
+	// `Parallel Hash` join (optimizer.Join.ParallelHash) under a Gather. Unlike
+	// SharedHashBuilds the tables are WRITTEN by every participant, under the
+	// state's lock and only until its build barrier completes; after that they
+	// are frozen and read unlocked, like SharedHashBuilds. The map itself is
+	// built by the Gather before any worker exists. Nil outside a Gather.
+	// M0146-0002.
+	ParallelHashBuilds map[*optimizer.Join]*parallelHashBuild
+	// parallelHashObserver, when set (tests only), is called with the build
+	// state each Parallel Hash participant attaches to.
+	parallelHashObserver func(*parallelHashBuild)
+
 	// PartialAggStates carries per-group aggregate transition states from the
 	// Partial nodes running in workers up to the Finalize node in the leader
 	// (P9, chapter 06), keyed by the Partial node.

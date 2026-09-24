@@ -79,6 +79,10 @@ type joinOp struct {
 	// Row headers stay per-row — this covers payloads only.
 	buildBytes       *mmgr.Context
 	buildBytesShared bool
+	// buildCellsShared is buildBytesShared's stratum-D twin: set by a Parallel
+	// Hash participant that published rows backed by its cell arena into the
+	// shared table (M0146-0002), so Close only dereferences the arena.
+	buildCellsShared bool
 
 	// EX3-02 Cut 2 (stratum D): per-joinOp build arena for Datum cells.
 	// The struct copy lands in buildCells.AllocAligned(w*48, 8) and the
@@ -553,6 +557,11 @@ func (o *joinOp) openLazyHashJoin(ctx *Context) error {
 	// same key list the leader built with — deriving it from the plan (rather
 	// than shipping it in sharedHashBuild) makes that agreement structural.
 	o.initExecKeys()
+	// M0146-0002: a Parallel Hash join is built by the participants
+	// themselves, behind the Gather's barrier, never by the leader prebuild.
+	if ph := lookupParallelHashBuild(ctx, o.plan); ph != nil {
+		return o.openParallelHashJoin(ctx, ph)
+	}
 	if sb := lookupSharedHashBuild(ctx, o.plan); sb != nil {
 		o.applySharedBuild(ctx, sb)
 		return o.openProbeSide(ctx, sb.probeIsLeft)

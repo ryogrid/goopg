@@ -96,6 +96,9 @@ type gatherOp struct {
 	// ownsSharedBuilds records that this Gather published hash tables on the
 	// session context (P8) and must retract them at Close.
 	ownsSharedBuilds bool
+	// ownsParallelHash records that this Gather published Parallel Hash
+	// build states on ctx (M0146-0002) and must retract them at Close.
+	ownsParallelHash bool
 
 	// EX0-03b (new): scope is the instrumenter active on this op's own
 	// Build() call, handed over by maybeInstrument (instrumentScopeCarrier).
@@ -230,6 +233,11 @@ func (o *gatherOp) Open(ctx *Context) error {
 	o.ch = make(chan rowBatch, gatherChanDepth*(n+1))
 	// One claim set shared by every child tree, including the leader's.
 	o.parallelClaimSet = newParallelClaimSet()
+
+	// M0146-0002: Parallel Hash build states, one per join, published before
+	// any worker context exists (NewWorkerContext copies the reference) so
+	// every participant reaches the same barrier.
+	o.ownsParallelHash = registerParallelHashBuilds(ctx, o.plan.Child, o.group.Context().Done())
 
 	// P8: hash-join build sides run ONCE, here, before anything fans out.
 	// This must precede both NewWorkerContext (which copies the reference)
@@ -506,6 +514,11 @@ func (o *gatherOp) Close() error {
 		a.Release()
 	}
 	o.workers, o.arenas = nil, nil
+	if o.ownsParallelHash && o.ctx != nil {
+		// Retract after the join: no participant can still be reading.
+		o.ctx.ParallelHashBuilds = nil
+		o.ownsParallelHash = false
+	}
 	if o.ownsSharedBuilds && o.ctx != nil {
 		// Retract the published tables so a later serial statement on this
 		// session does not adopt a stale build for the same plan node, and
