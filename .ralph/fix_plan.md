@@ -19827,7 +19827,7 @@ Movement: none — no plan moved on TPC-DS SF0.25/SF1 or TPC-H across all four d
       regress = HEAD\'s failures, WAL/amcheck testport set.
     Movement: none — storage lifecycle; no plan or value moved.
 
-- [ ] **M0145\-0008w — pgbench\'s small tables still grow \~40 heap blocks per
+- [x] **M0145\-0008w — pgbench\'s small tables still grow \~40 heap blocks per
   10 s: emptied pages are never inserted into again** \(filed 2026\-09\-25 by
   M0145\-0008v\). After 10 s of TPC\-B at scale 2, `pgbench\_branches`
   blocks 0–3 each hold 226 line pointers that are all LP\_UNUSED or
@@ -19847,6 +19847,35 @@ Movement: none — no plan moved on TPC-DS SF0.25/SF1 or TPC-H across all four d
     `s321Note` counters in `tryApplyHOTUpdate`\) and log which block each
     non\-HOT new version lands on; compare with PG 18.3 running the same
     pgbench on a scratch cluster.
+  - **RECON COMPLETE 2026\-09\-25.** Design:
+    `docs/design/0100-0149/m0145-0008w-pd-prune-xid-keeps-newest-recon.md`;
+    evidence `analysis/m0145/m0145\-0008w/measurements.txt`.
+    - Both hypotheses refuted as the main cause. The cleanup lock was never
+      refused \(probe: `lockfail=0`, HOT\-path foreign pin 36×\), but the
+      prune GATE failed: 18,575 hinted reads, 258 passed.
+    - Cause: five `pd\_prune\_xid` setters in `storage/heap.go` keep the
+      NEWEST xid \(`xmax > pruneXID`\); PG\'s `PageSetPrunable` keeps the
+      OLDEST. A continuously updated page\'s hint is never below the
+      horizon, so neither prune path runs.
+    - Uncommitted keep\-oldest build: branches 85 → 18 blocks, tellers 91 →
+      0, `hot\_nospace` 5,211 → 3,547, tps 641 → 662 \(PG: 7 / 2 blocks\) →
+      M0145\-0008x.
+    Movement: none — recon.
+
+- [ ] **M0145\-0008x — `pd\_prune\_xid` keeps the OLDEST prunable xid, as
+  PG\'s `PageSetPrunable` does** \(filed 2026\-09\-25 by M0145\-0008w\). Five
+  setters in `internal/storage/heap.go` \(xmax stamp, non\-HOT update stamp,
+  HOT old\-tuple stamp, chain\-update stamp, multixact updater stamp\) keep
+  the NEWEST, so a continuously updated page never passes the prune gate.
+  Kind: impl
+  Parent: M0145-0008w
+  - Port `PageSetPrunable` \(`bufpage.h`\) as one helper used by all six
+    setters, with `XIDPrecedes` \(wraparound\-safe\); check whether the redo
+    arms should set the hint too \(PG\'s delete/update redo calls
+    `PageSetPrunable`\).
+  - Expected movement: pgbench `pgbench\_branches` \~85 → \~18 blocks,
+    `pgbench\_tellers` \~90 → 0–2, TPC\-B tps \+3%; pin with a unit test and
+    the pgbench block counts.
 
 - [ ] **M0145\-0008u — a pin\-held \(zero\-copy\) seq\-scan slot**
   \(filed 2026\-09\-25 by M0145\-0008q\). With compaction under a cleanup

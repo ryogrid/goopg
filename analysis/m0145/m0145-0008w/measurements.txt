@@ -1,0 +1,23 @@
+# M0145-0008w recon — pgbench TPC-B scale 2, -c 8 -j 4 -T 30, fresh capable cluster, :5534.
+# HEAD d84baf944 (goopg) unless noted. 'blocks' = max heap block in ctid.
+
+## goopg HEAD, GOOPG_S321_PROBE=1
+tps = 622.5 ; pgbench_branches 82, pgbench_tellers 89, pgbench_accounts 3335
+S321: hot_skip_concurrent=1062 hot_nospace=5127 hot_applied=49461
+
+## goopg HEAD + uncommitted on-access-prune probe counters
+tps = 640.6 ; pgbench_branches 85, pgbench_tellers 91
+PROBEOA calls=22000 hinted=18575 wanted=258 lockfail=0 recheckfail=0 prunedEmpty=0 pruned=258 hotNotCleanup=36
+S321: hot_skip_concurrent=1050 hot_nospace=5211 hot_applied=51283
+-> the cleanup lock is NOT the obstacle (lockfail=0, HOT path lacked the only pin 36 times);
+   the gate fails: 18575 hinted reads, 258 wanted.
+
+## goopg HEAD + uncommitted PageSetPrunable fix (keep the OLDEST pd_prune_xid at the 5 setters)
+tps = 662.5 ; pgbench_branches 18, pgbench_tellers 0, pgbench_accounts 3336
+S321: hot_skip_concurrent=1342 hot_nospace=3547 hot_applied=54488
+
+## PostgreSQL 18.3 scratch cluster (fsync=off, autovacuum=off), same pgbench
+tps = 5214.6 (156426 txns)
+pgbench_accounts 3384 blocks, n_tup_upd 156426, n_tup_hot_upd 150178
+pgbench_branches    7 blocks, n_tup_upd 156426, n_tup_hot_upd 156408
+pgbench_tellers     2 blocks, n_tup_upd 156426, n_tup_hot_upd 156420
