@@ -19371,7 +19371,7 @@ M0146-0001 re-baseline census on the new default arm.
     - Follow\-up filed: M0146\-0002c.
     Movement: none — recon.
 
-- [ ] **M0146\-0002c — plan `NOT IN` as a hashed SubPlan, as PG does**
+- [x] **M0146\-0002c — plan `NOT IN` as a hashed SubPlan, as PG does**
   \(filed 2026\-09\-24 by M0146\-0002b\): drop the `Negated` arm of the legacy
   IN unnest \(`canUnnestInExprDepth` / the `effNegated` path in
   `internal/optimizer/unnest.go`\) so `x NOT IN \(SELECT …\)` stays a
@@ -19385,6 +19385,51 @@ M0146-0001 re-baseline census on the new default arm.
     scripts/jointree\-parity\-capture.sh tpch`\).
   - Values are already identical \(the NULL probe\); pin the hashed\-SubPlan
     shape with a NULL\-bearing identity test against the recorded PG answers.
+  - **DONE 2026\-09\-24 `c2339a072`.** Design:
+    `docs/design/0100-0149/m0146-0002c-not-in-hashed-subplan.md`.
+    - `canUnnestInExprDepth` declines a negated IN; both `unnestInExpr`
+      paths decline `effNegated` \(`NOT \(x IN …\)`\). Seven optimizer pins
+      now assert PG's rule; two SJInfo tests for the unreachable anti arm
+      removed.
+    - Regress NOT IN files identical to HEAD \(rowsecurity delta is noise\);
+      subselect blocked by a pre\-existing >1 h query \(M0146\-0015\).
+    - Gates: units, spotcheck, sf025 same=99, acceptance arm \(Q16 18215
+      rows\), fireset; TPC\-H capture unchanged \(match=3\).
+    - Q16's NOT IN is a SubPlan now, but the filter lands on the join, not
+      the partsupp scan → M0146\-0002d.
+    Movement: none — TPC\-H CATEGORIES\-EXCL\-MATCH unchanged; Q16 keeps its six categories.
+
+- [ ] **M0146\-0002d — a SubPlan\-bearing restriction is not placed on its
+  base relation** \(found 2026\-09\-24 by M0146\-0002c on TPC\-H Q16\):
+  `ps\_suppkey NOT IN \(SELECT …\)` references only `partsupp`, and PG pushes
+  it to the partsupp scan \(`distribute\_restrictinfo\_to\_rels`; a hashed
+  SubPlan is parallel\-safe, so it runs inside the workers\). goopg leaves it
+  as a `Filter` on the `Hash Join`, above which the post\-pass adds the
+  Gather, so neither Parallel Hash nor PG's Gather Merge \+ GroupAggregate
+  can be elected. The label also differs: goopg `NOT \(x = ANY \(SubPlan 1\)\)`,
+  PG `NOT \(ANY \(x = \(hashed SubPlan 1\).col1\)\)`.
+  Kind: recon
+  Parent: M0146-0002c
+  - First step: find where the jointree pipeline sets aside a sublink\-bearing
+    conjunct \(why it is not a base restriction of `partsupp`\) and whether
+    the SubPlan is parallel\-safe in goopg's `relConsiderParallel`. Expected
+    movement: TPC\-H Q16 `qual\-placement` and `parallelism`, measured on the
+    canonical parallel capture.
+
+- [ ] **M0146\-0015 — upstream regress `subselect` hangs: a nested
+  EXISTS / NOT EXISTS over `tenk1` runs for more than an hour** \(found
+  2026\-09\-24 while verifying M0146\-0002c; reproduces at HEAD `d23b1fd87`
+  without the change\): `select a.thousand from tenk1 a, tenk1 b where
+  a.thousand = b.thousand and exists \(select 1 from tenk1 c where
+  b.hundred = c.hundred and not exists \(select 1 from tenk1 d where
+  a.thousand = d.thousand\)\)`. PG plans it in milliseconds.
+  Kind: recon
+  Parent: none
+  - First step: EXPLAIN it on a throwaway cluster seeded with the regress
+    `tenk1` on both pipelines \(`GOOPG\_JOINTREE\_PIPELINE=0/1`\) to see
+    whether the M0145\-0008 cutover introduced it, and compare with PG's
+    plan. Blocks running `subselect` in the regress comparison. Expected
+    movement: none on the parity instruments; it restores a regress case.
 
 - [ ] **M0146\-0002a — category regressions from the Parallel Hash arm**
   \(measured 2026\-09\-24 at slice 2, TPC\-H parallel lane\): Q12 gains
