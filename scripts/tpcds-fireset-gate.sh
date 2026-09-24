@@ -9,8 +9,27 @@
 #
 # Usage: scripts/tpcds-fireset-gate.sh <label> <outdir>
 #
+# Arms (M0145-0008 legacy-deletion slice 1: HEAD-vs-staged). The baseline arm
+# runs an engine built from BASELINE_REV (default HEAD) and the candidate arm
+# an engine built from this checkout, which the stamp's dirty_code rule
+# forces to equal the index — so the fire set is the set of plans the STAGED
+# CHANGE moves, on the shipped pipeline. Before the redesign both arms ran
+# one binary and differed only in GOOPG_JOINTREE_PIPELINE (legacy vs
+# jointree); after the cutover that measured the retired pipeline, not the
+# change being committed, and it could not survive the knob's deletion.
+#   BASELINE_REV   git revision whose `go.mod go.sum cmd internal` build the
+#                  baseline engine (default HEAD; resolved once and recorded
+#                  in <outdir>/<label>-baseline-rev.txt, which a
+#                  FIRESET_RESUME=1 run reuses). `worktree` = the candidate's
+#                  own binary, for an env-file or knob A/B on one engine;
+#                  that mode refuses an A/A (same knob, no env file).
+#   BASELINE_JOINTREE / CANDIDATE_JOINTREE  GOOPG_JOINTREE_PIPELINE per arm
+#                  (default 1 on both — the shipped pipeline).
+#   FIRESET_KEEP_CLONES  1 = keep the per-arm TPC-DS clone datadirs (3.3 GB
+#                  each at SF1) after the corpus; default 0 deletes them.
+#
 # Defaults cover the task requirement: CORPORA="tpcds-sf025 tpcds-sf1",
-# BASELINE_JOINTREE=0, CANDIDATE_JOINTREE=1. `tpch` is a supported corpus
+# BASELINE_REV=HEAD, both arms on the default pipeline. `tpch` is a supported corpus
 # (M0145-0021b) but deliberately NOT a default — its fires execute at SF1
 # through tpch-acceptance-arm.sh, so it is opt-in:
 # `CORPORA="tpcds-sf025 tpcds-sf1 tpch" scripts/tpcds-fireset-gate.sh …`. Either arm may source a local
@@ -53,11 +72,13 @@ OUTDIR="$2"
 mkdir -p "${OUTDIR}"
 
 CORPORA="${CORPORA:-tpcds-sf025 tpcds-sf1}"
-BASELINE_JOINTREE="${BASELINE_JOINTREE:-0}"
+BASELINE_REV="${BASELINE_REV:-HEAD}"
+BASELINE_JOINTREE="${BASELINE_JOINTREE:-1}"
 CANDIDATE_JOINTREE="${CANDIDATE_JOINTREE:-1}"
 FIRESET_TIMEOUT="${FIRESET_TIMEOUT:-600}"
 FIRESET_RESUME="${FIRESET_RESUME:-0}"
 FIRESET_BATCH_SIZE="${FIRESET_BATCH_SIZE:-0}"
+FIRESET_KEEP_CLONES="${FIRESET_KEEP_CLONES:-0}"
 
 for value in "${BASELINE_JOINTREE}" "${CANDIDATE_JOINTREE}"; do
     [[ "${value}" =~ ^[0-9]+$ ]] || {
@@ -67,18 +88,87 @@ for value in "${BASELINE_JOINTREE}" "${CANDIDATE_JOINTREE}"; do
 done
 [[ "${FIRESET_RESUME}" =~ ^[01]$ ]] || { echo "FATAL: FIRESET_RESUME must be 0 or 1" >&2; exit 2; }
 [[ "${FIRESET_BATCH_SIZE}" =~ ^[0-9]+$ ]] || { echo "FATAL: FIRESET_BATCH_SIZE must be a non-negative integer" >&2; exit 2; }
+[[ "${FIRESET_KEEP_CLONES}" =~ ^[01]$ ]] || { echo "FATAL: FIRESET_KEEP_CLONES must be 0 or 1" >&2; exit 2; }
+# One engine, one knob value and no env file on either side is an A/A: every
+# plan matches, the fire set is empty and the gate would PASS having
+# compared nothing.
+if [[ "${BASELINE_REV}" == worktree && "${BASELINE_JOINTREE}" == "${CANDIDATE_JOINTREE}" \
+    && -z "${BASELINE_ENV_FILE:-}" && -z "${CANDIDATE_ENV_FILE:-}" ]]; then
+    echo "FATAL: BASELINE_REV=worktree with identical arms is an A/A comparison — set an env file or differing JOINTREE values" >&2
+    exit 2
+fi
+
+# Engine images. Both are lane-private (never a shared server's image) and
+# every capture below runs with NO_BUILD=1 against them, so the two arms
+# differ exactly by the source tree they were built from.
+BIN_DIR="${ROOT}/tmp/fireset-bin"
+CANDIDATE_BIN="${BIN_DIR}/${LABEL}-candidate"
+mkdir -p "${BIN_DIR}"
+( cd "${ROOT}" && go build -o "${CANDIDATE_BIN}" ./cmd/goopg ) || { echo "FATAL: candidate build failed" >&2; exit 4; }
+
+rev_file="${OUTDIR}/${LABEL}-baseline-rev.txt"
+if [[ "${BASELINE_REV}" == worktree ]]; then
+    BASELINE_BIN="${CANDIDATE_BIN}"
+    baseline_sha=worktree
+else
+    # A resumed run keeps the revision the captures were taken with, even if
+    # HEAD moved in between.
+    if [[ "${FIRESET_RESUME}" == 1 && -s "${rev_file}" ]]; then
+        baseline_sha="$(head -1 "${rev_file}")"
+    else
+        baseline_sha="$(git -C "${ROOT}" rev-parse --verify "${BASELINE_REV}^{commit}")" || {
+            echo "FATAL: BASELINE_REV ${BASELINE_REV} does not name a commit" >&2; exit 2; }
+    fi
+    BASELINE_BIN="${BIN_DIR}/${LABEL}-baseline"
+    baseline_src="${ROOT}/tmp/fireset-src/${LABEL}-baseline"
+    rm -rf "${baseline_src}"
+    mkdir -p "${baseline_src}"
+    # cmd/goopg's in-module dependency closure is cmd/ + internal/ (go:embed
+    # files included); the generated parser is checked in, so no generation
+    # step is needed.
+    git -C "${ROOT}" archive --format=tar "${baseline_sha}" -- go.mod go.sum cmd internal \
+        | tar -x -C "${baseline_src}" || { echo "FATAL: cannot export ${baseline_sha}" >&2; exit 4; }
+    ( cd "${baseline_src}" && go build -o "${BASELINE_BIN}" ./cmd/goopg ) || {
+        echo "FATAL: baseline build (${baseline_sha}) failed" >&2; exit 4; }
+    rm -rf "${baseline_src}"
+fi
+printf '%s\n' "${baseline_sha}" >"${rev_file}"
+echo "FIRE-SET: baseline=${baseline_sha} ($(sha256sum "${BASELINE_BIN}" | cut -c1-12)) candidate=worktree ($(sha256sum "${CANDIDATE_BIN}" | cut -c1-12))"
+
+# The TPC-H execution half runs tpch-acceptance-arm.sh, which under NO_BUILD=1
+# also expects its runner image to exist. The runner is a client, so one
+# worktree build serves both arms.
+if [[ " ${CORPORA} " == *" tpch "* ]]; then
+    export RUNNER_BIN="${BIN_DIR}/${LABEL}-tpch-runner"
+    ( cd "${ROOT}" && go build -o "${RUNNER_BIN}" ./cmd/tpch-runner ) || { echo "FATAL: tpch-runner build failed" >&2; exit 4; }
+fi
 
 run_arm() {
-    local arm="$1" env_file="$2" jointree="$3"
-    shift 3
+    local arm="$1" env_file="$2" jointree="$3" bin="$4"
+    shift 4
     (
         if [[ -n "${env_file}" ]]; then
             [[ -r "${env_file}" ]] || { echo "FATAL: unreadable ${arm} env file: ${env_file}" >&2; exit 2; }
             # shellcheck source=/dev/null
             source "${env_file}"
         fi
-        JOINTREE="${jointree}" FIRESET_TIMEOUT="${FIRESET_TIMEOUT}" "$@"
+        GOOPG_BIN="${bin}" NO_BUILD=1 JOINTREE="${jointree}" FIRESET_TIMEOUT="${FIRESET_TIMEOUT}" "$@"
     )
+}
+
+# remove_clone <dir> — drop a finished arm's private clone unless it still
+# has a live postmaster (never delete a running server's datadir).
+remove_clone() {
+    local dir="$1" pid
+    [[ -d "${dir}" ]] || return 0
+    if [[ -f "${dir}/postmaster.pid" ]]; then
+        pid="$(head -1 "${dir}/postmaster.pid" 2>/dev/null || true)"
+        if [[ -n "${pid}" ]] && kill -0 "${pid}" 2>/dev/null; then
+            echo "FIRE-SET: keeping ${dir} (live postmaster ${pid})" >&2
+            return 0
+        fi
+    fi
+    rm -rf "${dir}"
 }
 
 derive_fires() {
@@ -127,15 +217,30 @@ for corpus in ${CORPORA}; do
             exit 2
         }
     else
-        run_arm baseline "${BASELINE_ENV_FILE:-}" "${BASELINE_JOINTREE}" \
+        run_arm baseline "${BASELINE_ENV_FILE:-}" "${BASELINE_JOINTREE}" "${BASELINE_BIN}" \
             "${CAPTURE}" "${corpus}" "${baseline_label}" "${corpus_dir}"
-        run_arm candidate "${CANDIDATE_ENV_FILE:-}" "${CANDIDATE_JOINTREE}" \
+        run_arm candidate "${CANDIDATE_ENV_FILE:-}" "${CANDIDATE_JOINTREE}" "${CANDIDATE_BIN}" \
             "${CAPTURE}" "${corpus}" "${candidate_label}" "${corpus_dir}"
     fi
 
     diff_out="${corpus_dir}/${LABEL}-${corpus}-fires.diff.txt"
     fires="$(derive_fires "${corpus_dir}/${baseline_label}.plans.txt" "${corpus_dir}/${candidate_label}.plans.txt" "${diff_out}")"
     printf '%s\n' "${fires}" >"${corpus_dir}/${LABEL}-${corpus}-fires.txt"
+    clone_seed="$(printf '%s' "${LABEL}-${corpus}" | sha256sum | cut -c1-12)"
+    # The four private clones jointree-parity-capture.sh makes for this
+    # corpus (tmp/<clone label>-data-<corpus>); the TPC-H lane clones inside
+    # its arm scripts, so none of these exist for it.
+    corpus_clones=(
+        "${ROOT}/tmp/${baseline_label}-data-${corpus}"
+        "${ROOT}/tmp/${candidate_label}-data-${corpus}"
+        "${ROOT}/tmp/fireset-${clone_seed}-b-data-${corpus}"
+        "${ROOT}/tmp/fireset-${clone_seed}-c-data-${corpus}"
+    )
+    # The capture clones are done once the fire set is derived; dropping them
+    # here keeps the SF1 peak at two clones (execution), not four.
+    if [[ "${FIRESET_KEEP_CLONES}" != 1 ]]; then
+        for dir in "${corpus_clones[@]}"; do remove_clone "${dir}"; done
+    fi
     if [[ -z "${fires}" ]]; then
         echo "FIRE-SET: corpus=${corpus} fires=none (plan A/B had no changed query)"
         continue
@@ -143,7 +248,6 @@ for corpus in ${CORPORA}; do
 
     baseline_status="${corpus_dir}/${baseline_label}.status.txt"
     candidate_status="${corpus_dir}/${candidate_label}.status.txt"
-    clone_seed="$(printf '%s' "${LABEL}-${corpus}" | sha256sum | cut -c1-12)"
     if [[ "${FIRESET_RESUME}" != 1 ]]; then
         : >"${baseline_status}"
         : >"${candidate_status}"
@@ -151,14 +255,17 @@ for corpus in ${CORPORA}; do
     baseline_pending="$(missing_fires "${fires}" "${baseline_status}")"
     candidate_pending="$(missing_fires "${fires}" "${candidate_status}")"
     if [[ -n "${baseline_pending}" ]]; then
-        run_arm baseline "${BASELINE_ENV_FILE:-}" "${BASELINE_JOINTREE}" \
+        run_arm baseline "${BASELINE_ENV_FILE:-}" "${BASELINE_JOINTREE}" "${BASELINE_BIN}" \
             env FIRESET_QUERIES="${baseline_pending}" FIRESET_STATUS_OUT="${baseline_status}" FIRESET_SKIP_CAPTURE=1 CLONE_LABEL="fireset-${clone_seed}-b" \
             "${CAPTURE}" "${corpus}" "${baseline_label}-execute" "${corpus_dir}"
     fi
     if [[ -n "${candidate_pending}" ]]; then
-        run_arm candidate "${CANDIDATE_ENV_FILE:-}" "${CANDIDATE_JOINTREE}" \
+        run_arm candidate "${CANDIDATE_ENV_FILE:-}" "${CANDIDATE_JOINTREE}" "${CANDIDATE_BIN}" \
             env FIRESET_QUERIES="${candidate_pending}" FIRESET_STATUS_OUT="${candidate_status}" FIRESET_SKIP_CAPTURE=1 CLONE_LABEL="fireset-${clone_seed}-c" \
             "${CAPTURE}" "${corpus}" "${candidate_label}-execute" "${corpus_dir}"
+    fi
+    if [[ "${FIRESET_KEEP_CLONES}" != 1 ]]; then
+        for dir in "${corpus_clones[@]}"; do remove_clone "${dir}"; done
     fi
     python3 "${STATUS}" --fires "${fires}" --baseline "${baseline_status}" --candidate "${candidate_status}"
 done

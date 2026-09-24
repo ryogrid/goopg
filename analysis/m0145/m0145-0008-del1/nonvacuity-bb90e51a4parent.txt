@@ -1,0 +1,22 @@
+FIRE-SET: baseline=2819244991b76a83ad6f6ac546d090012793a9d0 (0b59a396a3c1) candidate=worktree (5859137e5de4)
+PLAN-PARITY: queries=99 match=4 shapediff=67 unparsed=0 missingnode=25 error=3 timeout=0
+CATEGORIES-EXCL-MATCH: join-order=91 join-method=67 scan-type=60 parameterisation=55 aggregation-strategy=40 sort-strategy=62 parallelism=74 qual-placement=27 rendering=24
+PLAN-PARITY: queries=99 match=4 shapediff=67 unparsed=0 missingnode=25 error=3 timeout=0
+CATEGORIES-EXCL-MATCH: join-order=91 join-method=67 scan-type=59 parameterisation=55 aggregation-strategy=41 sort-strategy=62 parallelism=74 qual-placement=27 rendering=25
+# fireset m0145-del1-nv-tpcds-sf025-baseline-execute Q6 PASS (result tmp/m0145-del1-nv/tpcds-sf025/m0145-del1-nv-tpcds-sf025-baseline-execute-q6.result.txt)
+# fireset m0145-del1-nv-tpcds-sf025-baseline-execute Q8 PASS (result tmp/m0145-del1-nv/tpcds-sf025/m0145-del1-nv-tpcds-sf025-baseline-execute-q8.result.txt)
+# fireset m0145-del1-nv-tpcds-sf025-baseline-execute Q12 PASS (result tmp/m0145-del1-nv/tpcds-sf025/m0145-del1-nv-tpcds-sf025-baseline-execute-q12.result.txt)
+# fireset m0145-del1-nv-tpcds-sf025-baseline-execute Q14 PASS (result tmp/m0145-del1-nv/tpcds-sf025/m0145-del1-nv-tpcds-sf025-baseline-execute-q14.result.txt)
+# fireset m0145-del1-nv-tpcds-sf025-baseline-execute Q20 PASS (result tmp/m0145-del1-nv/tpcds-sf025/m0145-del1-nv-tpcds-sf025-baseline-execute-q20.result.txt)
+# fireset m0145-del1-nv-tpcds-sf025-baseline-execute Q54 PASS (result tmp/m0145-del1-nv/tpcds-sf025/m0145-del1-nv-tpcds-sf025-baseline-execute-q54.result.txt)
+# fireset m0145-del1-nv-tpcds-sf025-baseline-execute Q58 PASS (result tmp/m0145-del1-nv/tpcds-sf025/m0145-del1-nv-tpcds-sf025-baseline-execute-q58.result.txt)
+# fireset m0145-del1-nv-tpcds-sf025-baseline-execute Q98 PASS (result tmp/m0145-del1-nv/tpcds-sf025/m0145-del1-nv-tpcds-sf025-baseline-execute-q98.result.txt)
+# fireset m0145-del1-nv-tpcds-sf025-candidate-execute Q6 PASS (result tmp/m0145-del1-nv/tpcds-sf025/m0145-del1-nv-tpcds-sf025-candidate-execute-q6.result.txt)
+# fireset m0145-del1-nv-tpcds-sf025-candidate-execute Q8 PASS (result tmp/m0145-del1-nv/tpcds-sf025/m0145-del1-nv-tpcds-sf025-candidate-execute-q8.result.txt)
+# fireset m0145-del1-nv-tpcds-sf025-candidate-execute Q12 PASS (result tmp/m0145-del1-nv/tpcds-sf025/m0145-del1-nv-tpcds-sf025-candidate-execute-q12.result.txt)
+# fireset m0145-del1-nv-tpcds-sf025-candidate-execute Q14 PASS (result tmp/m0145-del1-nv/tpcds-sf025/m0145-del1-nv-tpcds-sf025-candidate-execute-q14.result.txt)
+# fireset m0145-del1-nv-tpcds-sf025-candidate-execute Q20 PASS (result tmp/m0145-del1-nv/tpcds-sf025/m0145-del1-nv-tpcds-sf025-candidate-execute-q20.result.txt)
+# fireset m0145-del1-nv-tpcds-sf025-candidate-execute Q54 PASS (result tmp/m0145-del1-nv/tpcds-sf025/m0145-del1-nv-tpcds-sf025-candidate-execute-q54.result.txt)
+# fireset m0145-del1-nv-tpcds-sf025-candidate-execute Q58 PASS (result tmp/m0145-del1-nv/tpcds-sf025/m0145-del1-nv-tpcds-sf025-candidate-execute-q58.result.txt)
+# fireset m0145-del1-nv-tpcds-sf025-candidate-execute Q98 PASS (result tmp/m0145-del1-nv/tpcds-sf025/m0145-del1-nv-tpcds-sf025-candidate-execute-q98.result.txt)
+FIRE-SET-TIMEOUTS: fires=Q6 Q8 Q12 Q14 Q20 Q54 Q58 Q98 introduced=none unchanged=none missing=none

@@ -132,5 +132,7 @@ the SAOP fixture, 200 groups for the r66t inner aggregate.
 
 The legacy-deletion slices: delete `planSelectLegacyPipeline` and the machinery
 only it runs (the group L tests go with it), the seam guards retired by 0001's
-list, and the knob. Then the fire-set gate is redesigned as HEAD-vs-staged on
-the one pipeline.
+list, and the knob. The fire-set gate's HEAD-vs-staged redesign landed FIRST
+(slice 1, `m0145-0008-del1-fireset-head-vs-staged.md`), because deleting the
+knob under the old legacy-vs-jointree design would have made the gate derive
+zero fires on every run.

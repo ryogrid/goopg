@@ -17037,6 +17037,28 @@ M0144-0003a, M0144-0003b's residual, M0142-0008a-3(i)/(ii) and
     and legacy\-only machinery with the group\-L tests, the seam guards on
     0001's retired list, the knob\), then the fire\-set gate's HEAD\-vs\-staged
     redesign.
+  - **Legacy\-deletion slice 1 LANDED 2026\-09\-24: the fire\-set gate is
+    HEAD\-vs\-staged** \(done first — deleting the knob under the old
+    legacy\-vs\-jointree A/B would make the gate derive zero fires forever\).
+    Design: `docs/design/0100-0149/m0145-0008-del1-fireset-head-vs-staged.md`;
+    evidence `analysis/m0145/m0145-0008-del1/`.
+    - `tpcds-fireset-gate.sh`: baseline engine built from `BASELINE_REV`
+      \(default HEAD, `git archive` of `go.mod go.sum cmd internal`\),
+      candidate from the checkout; both arms on the shipped pipeline,
+      `NO_BUILD=1`. Resume reuses the recorded baseline sha;
+      `BASELINE_REV=worktree` refuses an A/A; `RUNNER\_BIN` built for the
+      TPC\-H lane.
+    - The gate now deletes its four per\-corpus private clones
+      \(`FIRESET\_KEEP\_CLONES=1` keeps them\); 132 stale execution clones
+      \(262 GB\) were removed, disk 89% → 62%.
+    - A/A \(HEAD vs worktree\): `fires=none` at SF0.25 and SF1, stamp PASS.
+      Non\-vacuity vs `bb90e51a4^`: 8 fires executed, `introduced=none`.
+    Movement: none — harness only.
+    - Next slice: delete `planSelectLegacyPipeline` / the `jointree`
+      parameter and the `jointreePipeline` branch sites with their
+      legacy\-only machinery and the tests pinned through
+      `SetJointreePipeline\("0"\)`; then retire the knob
+      \(`flagProvenanceRetired`\) and the sf025 legacy control pass.
 
 
 - [x] **M0145-0009 — CTE-output statistics (B-06 resume): wire the landed
