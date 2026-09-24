@@ -1,9 +1,10 @@
 # Retiring the `rows<=1` CTE fallback guard (M0145-0012)
 
-Status: MEASURED 2026-09-21, and the task as filed is a **NO-GO**. Both routes
-its text offers are refuted by measurement, and the mechanism that would make
-retirement correct is a third thing neither route names. No removal landed.
-The task is marked `[!]` pending an owner decision.
+Status: **LANDED 2026-09-24 — the arm is retired** (owner decision
+2026-09-24, option (a) of `m0145-0024-q74-residual-collapse-recon.md`; see
+"Retirement" at the end). Earlier: MEASURED 2026-09-21 as a NO-GO under the
+task's original criterion, which M0145-0024 later superseded (the collapse
+the arm prevented is PG 18.3's own plan on Q74).
 
 Task: `.ralph/fix_plan.md` M0145-0012. Kind: impl. Parent: none.
 
@@ -139,3 +140,44 @@ CTE outputs that ARE plain `Var`s over base-table columns, exactly the case
 No removal landed; the arm is byte-identical on the default arm (the flag
 defaults to today's behaviour) and the full gate set confirms it. All
 arm-off captures are private evidence on a private clone and a private port.
+
+## Retirement (2026-09-24)
+
+The owner chose option (a) of the M0145-0024 recon: retire the arm for plan
+parity. On the current tree it fired on Q74 alone, and there the "collapse
+class" it prevented is PG 18.3's own elected plan. The original "a
+collapse-class move on removal is an automatic no-go" criterion is
+superseded: collapsing IS matching PG here.
+
+Removed:
+- the `rows <= 1 && cteRowsFallbackEnabled` arm in `initialRelRows`
+  (`joinsearch.go`). A CTE leaf now keeps its own estimate, floored at 1 by
+  `clamp_row_est`, as `set_cte_size_estimates` does
+  (`postgres/src/backend/optimizer/path/costsize.c:5356-5363`);
+- `cteRowsFallbackEnabled` and `traceCTERowsFallback` (`nlicensus.go`);
+- the `GOOPG_CTE_ROWS_FALLBACK` resolver. The flag is retired through
+  `flagProvenanceRetired` (`"M0145-0012"`), and `planner-flags.env` is
+  regenerated.
+
+`TestInitialRelRowsCTEFallbackGate` became
+`TestInitialRelRowsCTEKeepsCollapsedEstimate` (`cte_rows_collapse_test.go`).
+It now pins PG's behaviour: 1, not the body count. The change is invisible to
+every value gate, so it keeps a unit-level witness.
+
+Gates (staged tree; evidence `analysis/m0145/m0145-0012/`):
+- **Fire-set gate, HEAD `79a47d624` vs staged:** exactly one fire, **Q74**, at
+  both SF0.25 and SF1. It executed on both arms at both scales with
+  `introduced=none`: no SF1 timeout, which is the scale-dependence M0145-0011
+  warned about. Rows are identical.
+- **Parity:** at SF0.25, Q74 leaves the `join-method` category
+  (`CATEGORIES-EXCL-MATCH join-method 67 → 66`); every other category is
+  unchanged. At SF1 every category is unchanged. Q74 stays SHAPE-DIFF on the
+  other categories, as it was before.
+- `tpcds-sf025 sweep`: 96/96 PASS, PLAN-SHAPE `changed (1): Q74`, Q74
+  2 s → 29 s. This is the recorded trade: PG 18.3 takes 53.49 s on the same
+  plan.
+- `tpch-spotcheck` PASS; acceptance arm 24 MATCH; ea-ratchet 52/52.
+
+Movement: none. The `join-method` move is within ±3, and match counts are
+unchanged.
+

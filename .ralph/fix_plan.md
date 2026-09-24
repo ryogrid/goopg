@@ -17685,7 +17685,7 @@ Movement: none — no plan moved on TPC-DS SF0.25/SF1 or TPC-H across all four d
   Movement: none — the default arm is unchanged by construction (both flags
   default to today's behaviour) and the gates confirm it; the knob-arm census
   moved `any-body-leaf-(*optimizer.CTEScan)` 30 -> 0.
-- [ ] **M0145-0012 — retire the `rows<=1` CTE fallback guard
+- [x] **M0145-0012 — retire the `rows<=1` CTE fallback guard
   (`initialRelRows`, `joinsearch.go:520-526`)** (filed 2026-09-21 by
   owner directive; same proposal). The M0129-S1 arm — when a
   filter-wrapped `*CTEScan` leaf's estimate collapses to <=1, substitute
@@ -17772,6 +17772,18 @@ Movement: none — no plan moved on TPC-DS SF0.25/SF1 or TPC-H across all four d
     Post\-removal goopg \(29.61 s\) still beats PG \(53.49 s\) on the same
     plan. Execute with the filed gate discipline \(knob\-arm evidence
     first, full gates before default\-arm removal\); task is `[ ]` again.
+  - **DONE 2026\-09\-24 — the arm is retired.** Design:
+    `docs/design/0100-0149/m0145-0012-cte-rows-fallback-retirement.md`
+    §"Retirement"; evidence `analysis/m0145/m0145-0012/`.
+    - Knob\-arm evidence was M0145\-0024's 99\-query ON/OFF A/B \(only Q74
+      moves\). Removed the arm in `initialRelRows`, `cteRowsFallbackEnabled`,
+      its trace and the `GOOPG\_CTE\_ROWS\_FALLBACK` flag \(retired\); the
+      unit witness now pins PG's collapsed\-and\-floored estimate.
+    - Fire\-set HEAD vs staged: exactly Q74 at SF0.25 and SF1, rows
+      identical, `introduced=none` \(no SF1 timeout\). SF0.25 sweep 96/96,
+      only Q74 changed, 2 s → 29 s \(PG 53 s on the same plan\). Spotcheck,
+      acceptance 24 MATCH, ea\-ratchet 52/52.
+    Movement: none — CATEGORIES-EXCL-MATCH SF0.25 join-method 67 -> 66 only (within ±3); SF1 and match counts unchanged.
 - [x] **M0145-0013 — admit pulled `*CTEScan` leaves at the seam
   (`pulled-leaf-not-scan` / `flat-leaf-not-scan`)** (filed 2026-09-21
   by owner directive; the follow-on task M0145-0011's E2 resume point

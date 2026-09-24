@@ -1,0 +1,27 @@
+FIRE-SET: baseline=79a47d624b61785969f75ada011bfd500f2aa967 (bcd17b125ede) candidate=worktree (d2afc61d0289)
+# fireset m0145-0012-tpcds-sf025-baseline-execute Q74 PASS (result tmp/m0145-0012-fireset/tpcds-sf025/m0145-0012-tpcds-sf025-baseline-execute-q74.result.txt)
+# fireset m0145-0012-tpcds-sf025-candidate-execute Q74 PASS (result tmp/m0145-0012-fireset/tpcds-sf025/m0145-0012-tpcds-sf025-candidate-execute-q74.result.txt)
+FIRE-SET-TIMEOUTS: fires=Q74 introduced=none unchanged=none missing=none
+# fireset m0145-0012-tpcds-sf1-baseline-execute Q74 PASS (result tmp/m0145-0012-fireset/tpcds-sf1/m0145-0012-tpcds-sf1-baseline-execute-q74.result.txt)
+# fireset m0145-0012-tpcds-sf1-candidate-execute Q74 PASS (result tmp/m0145-0012-fireset/tpcds-sf1/m0145-0012-tpcds-sf1-candidate-execute-q74.result.txt)
+FIRE-SET-TIMEOUTS: fires=Q74 introduced=none unchanged=none missing=none
+sf025 baseline: Q74 SHAPE-DIFF [join-order,join-method,parameterisation,aggregation-strategy,sort-strategy,parallelism,qual-placement,rendering] estimates(goopg cost=1754.28..1775.10 rows=1 width=384 | pg cost=30505.75..30505.76 rows=1 width=276)
+sf025 baseline: CATEGORIES-EXCL-MATCH: join-order=91 join-method=67 scan-type=59 parameterisation=55 aggregation-strategy=41 sort-strategy=62 parallelism=74 qual-placement=27 rendering=25
+sf025 candidate: Q74 SHAPE-DIFF [join-order,parameterisation,aggregation-strategy,sort-strategy,parallelism,qual-placement,rendering] estimates(goopg cost=333.15..333.17 rows=1 width=384 | pg cost=30505.75..30505.76 rows=1 width=276)
+sf025 candidate: CATEGORIES-EXCL-MATCH: join-order=91 join-method=66 scan-type=59 parameterisation=55 aggregation-strategy=41 sort-strategy=62 parallelism=74 qual-placement=27 rendering=25
+sf1 baseline: Q74 SHAPE-DIFF [join-order,join-method,aggregation-strategy,sort-strategy,parallelism,qual-placement,rendering] estimates(goopg cost=7029.42..7112.83 rows=1 width=384 | pg cost=99516.72..99516.72 rows=1 width=276)
+sf1 baseline: CATEGORIES-EXCL-MATCH: join-order=85 join-method=65 scan-type=59 parameterisation=49 aggregation-strategy=44 sort-strategy=68 parallelism=76 qual-placement=25 rendering=22
+sf1 candidate: Q74 SHAPE-DIFF [join-order,join-method,aggregation-strategy,sort-strategy,parallelism,qual-placement,rendering] estimates(goopg cost=1334.51..1334.53 rows=1 width=384 | pg cost=99516.72..99516.72 rows=1 width=276)
+sf1 candidate: CATEGORIES-EXCL-MATCH: join-order=85 join-method=65 scan-type=59 parameterisation=49 aggregation-strategy=44 sort-strategy=68 parallelism=76 qual-placement=25 rendering=22
+Q74  PASS       29s (29529ms)        0 rows  ck=1f18d650d205d71d
+=== SUMMARY: PASS=96 (60 ck-verified, 36 ck=n/a) MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0 SKIP=3 ===
+SLOWER     Q74 2s->29s (14.5x)
+changed (1): Q74
+=== PLAN-SHAPE: queries=99 same=98 changed=1 added=0 removed=0 ===
+# join-method: Q74 hash-3 nestloop+3
+=== JOIN-METHOD-ELECTION: moved=1 into-nestloop=1 suspects=Q74 ===
+  baseline findings: 52   current: 52
+EA-RATCHET: PASS
+SUMMARY: 24 MATCH
+VERDICT: PASS — every label matched on values, not merely on row count
+tpch-spotcheck: RESULT=PASS

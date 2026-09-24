@@ -493,52 +493,21 @@ func initialRelRows(leaf Node, info baseRelInfo) float64 {
 		// already-built join subtree: `filteredRows` was derived from a
 		// synthetic catalog.Table and means nothing, so read the subtree.
 		rows = EstimateRows(leaf)
-		// M0129-S1: CTE scans have no per-column statistics, so
-		// filterSelectivity defaults to defaultEqSelectivity (0.005)
-		// per conjunct. For a CTE like year_total with 4 conjuncts
-		// over columns that actually have 2 distinct values each,
-		// 0.005⁴×17977≈0.000011 collapses to 1 row — a severe
-		// under-estimate that makes nested loops look free. Fall
-		// back to the CTE body's unfiltered row count to avoid
-		// the default-selectivity cliff.
+		// A CTE leaf keeps its own (possibly collapsed) estimate, as PG's
+		// `set_cte_size_estimates` does: the only adjustment is the
+		// `clamp_row_est` floor at 1 below
+		// (postgres/src/backend/optimizer/path/costsize.c:5356-5363).
 		//
-		// M0145-0012 measured what retiring this arm costs, and named the
-		// mechanism that would make retiring it correct.
-		//
-		// The arm engages on exactly three TPC-DS queries (SF0.25, default
-		// arm): Q31 `ws` 1→1846, Q39 `inv` 1→20, Q74 `year_total` 1→8325.
-		// Removing it (`GOOPG_CTE_ROWS_FALLBACK=off`) turns every one of
-		// those Hash/Merge joins into a Nested Loop over rows=1 CTE scans —
-		// the exact collapse class the arm was written for — and Q74 goes
-		// 1509 ms → 25005 ms (16.6x) with values unchanged. So `derived >=
-		// guard effect` does NOT hold, and the arm cannot simply go.
-		//
-		// The arm is still a goopg-only SHAPE: PG's `set_cte_size_estimates`
-		// keeps the collapsed estimate and only floors it at 1
-		// (`clamp_row_est`, postgres/src/backend/optimizer/path/costsize.c).
-		// But PG does not COLLAPSE in the first place, and the reason is
-		// upstream of that function: `examine_simple_variable`
-		// (postgres/src/backend/utils/adt/selfuncs.c) has an explicit
-		// non-recursive-CTE arm — it finds the CTE's subroot via
-		// `cte_plan_ids`, reads the target-list entry for the referenced
-		// attribute, and recurses on the underlying Var, so a qual on
-		// `year_total.dyear` is estimated from `date_dim.d_year`'s real
-		// pg_statistic row rather than from DEFAULT_EQ_SEL. THAT is the
-		// port that retires this arm; substituting the unfiltered body
-		// count is a stand-in for it.
-		//
-		// Note for whoever does the port: all three corpus fires are
-		// MULTI-reference CTEs (ws x3, inv x2, year_total x4), so the
-		// `pushQualsThroughSingleRefCTEs` refs==1 inline path cannot serve
-		// any of them.
-		if rows <= 1 && cteRowsFallbackEnabled {
-			if cte, ok := leafBaseScan(leaf).(*CTEScan); ok && cte.Child != nil {
-				if bodyRows := EstimateRows(cte.Child); bodyRows > 1 {
-					traceCTERowsFallback(cte.Name, rows, bodyRows)
-					rows = bodyRows
-				}
-			}
-		}
+		// goopg used to substitute the CTE body's UNFILTERED row count when
+		// the estimate collapsed to <=1 (M0129-S1). PG has no such arm.
+		// M0145-0024 showed that on the current tree it fired on TPC-DS Q74
+		// alone, and there it made goopg diverge from the plan PG 18.3
+		// itself elects (the collapsed Nested Loop shape). M0145-0012
+		// retired it for plan parity (owner decision 2026-09-24): Q74 runs
+		// 2.27 s -> 29.61 s on goopg, still faster than PG's 53.49 s on the
+		// same plan. The upstream route to a better estimate is
+		// `examine_simple_variable`'s CTE arm (selfuncs.c), not a
+		// substitution here.
 	}
 	if rows < 1 {
 		return 1

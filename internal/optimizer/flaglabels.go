@@ -178,11 +178,6 @@ var flagResolvedState = map[string]func(string) string{
 	// by the `outer-over-derived` firewall. M0145-0018 removed the firewall,
 	// so the flag now stands alone.)
 	"GOOPG_PULLUP_CTE_LEAF": func(v string) string { return onOff(v == "on") },
-	// M0145-0012 (joinsearch.go): gates the M0129-S1 `rows<=1` CTE fallback.
-	// Default ON = today's behaviour. Plan-SHAPING — the arm changes an
-	// initial rel's cardinality, which the DP then costs on — so it belongs
-	// in the table, not in `flagProvenanceExempt`.
-	"GOOPG_CTE_ROWS_FALLBACK": func(v string) string { return onOff(v != "off") },
 }
 
 // flagProvenanceOrder is the order the flags are stamped in. The first six are
@@ -271,8 +266,8 @@ var flagProvenanceOrder = []string{
 	// since M0145-0018 removed the firewall.
 	"GOOPG_PULLUP_CTE_LEAF",
 	// Joined at M0145-0012: gates the goopg-only `rows<=1` CTE fallback in
-	// `initialRelRows` (joinsearch.go). Default `on`; `off` is the knob-arm
-	// A/B that answers whether the arm can be retired.
+	// `initialRelRows` (joinsearch.go). Retired at M0145-0012 — see
+	// flagProvenanceRetired.
 	"GOOPG_CTE_ROWS_FALLBACK",
 	// Joined at M0145-0002: selected the jointree-first pipeline (AGENT.md
 	// §"Plan-parity harness" G8). Retired at M0145-0008 — see
@@ -343,6 +338,10 @@ var flagProvenanceRetired = map[string]string{
 	// at all" since M0127-P6.3 deleted the bushy enumerator; the search is
 	// unconditional since M0145-0008, so nothing reads the variable.
 	"GOOPG_PGSHAPED_DP": "M0145-0008",
+	// The M0129-S1 `rows<=1` CTE fallback's A/B knob. M0145-0012 retired the
+	// arm itself for plan parity (PG's set_cte_size_estimates keeps the
+	// collapsed estimate), so nothing reads the variable.
+	"GOOPG_CTE_ROWS_FALLBACK": "M0145-0012",
 }
 
 // FlagProvenanceTable is the authoritative list of planner env flags that a
