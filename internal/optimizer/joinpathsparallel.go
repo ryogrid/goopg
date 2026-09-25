@@ -490,7 +490,7 @@ func tryPartialMergeJoinPath(s *searchCtx, joinrel *RelOptInfo, o, i *Path, oute
 		// nil like the hash twin ("a hashjoin never has pathkeys",
 		// pathnode.c:2879): a merge join delivers its outer's order, and
 		// FULL/RIGHT deliver none.
-		Pathkeys:      buildJoinPathkeys(jt, resultKeys),
+		Pathkeys:      buildJoinPathkeysFor(joinrel, jt, resultKeys),
 		RequiredOuter: 0,
 		// create_mergejoin_path field for field, minus parallel_aware:
 		//   parallel_safe   = consider_parallel && both inputs safe

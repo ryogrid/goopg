@@ -344,6 +344,20 @@ func addMergeJoinPath(joinrel, outer, inner *RelOptInfo, cp costParams, jt parse
 // Sort, so the same over-claim would be a WRONG ANSWER — rows returned out of
 // order with a correct row count, the class that no row-count gate can see.
 func buildJoinPathkeys(jt parser.JoinType, outerKeys []PathKey) []PathKey {
+	return buildJoinPathkeysFor(nil, jt, outerKeys)
+}
+
+// buildJoinPathkeysFor is build_join_pathkeys proper: the rule above, then
+// truncate_useless_pathkeys against the joinrel (M0146-0005n).
+func buildJoinPathkeysFor(joinrel *RelOptInfo, jt parser.JoinType, outerKeys []PathKey) []PathKey {
+	if joinrel != nil {
+		return truncateUselessPathkeys(joinrel.usefulKeys, buildJoinPathkeysRule(jt, outerKeys))
+	}
+	return buildJoinPathkeysRule(jt, outerKeys)
+}
+
+// buildJoinPathkeysRule is the FULL/RIGHT rule alone.
+func buildJoinPathkeysRule(jt parser.JoinType, outerKeys []PathKey) []PathKey {
 	switch jt {
 	case parser.JoinFull, parser.JoinRight:
 		return nil
@@ -428,7 +442,7 @@ func tryMergeJoinPath(joinrel *RelOptInfo, o, i *Path, outerRelids, innerRelids 
 		Rel:      joinrel,
 		Rows:     joinrel.Rows,
 		Cost:     cost,
-		Pathkeys: buildJoinPathkeys(jt, resultKeys),
+		Pathkeys: buildJoinPathkeysFor(joinrel, jt, resultKeys),
 		// Children[0] is the outer (streaming left) side, Children[1] the
 		// inner — the same convention the hash and nested-loop arms use, so
 		// P5.5's createPlan reads one layout for every join kind. When a side

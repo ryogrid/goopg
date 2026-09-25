@@ -97,8 +97,15 @@ func TestSetOpJoinPromotesToHashJoin(t *testing.T) {
 	}
 	// The residual Filter must keep only the genuinely single-sided
 	// restrictions; both equi-joins are now join conditions.
-	if strings.Contains(plan, "sold_item_sk = i_item_sk") || strings.Contains(plan, "time_sk = t_time_sk") {
-		t.Fatalf("an equi-join is still rendered as a Filter conjunct:\n%s", plan)
+	// Only a node's own `Filter:` line counts: a nested loop's `Join Filter:`
+	// IS the promoted join condition (the R36 note above).
+	for _, line := range strings.Split(plan, "\n") {
+		if !strings.HasPrefix(strings.TrimSpace(line), "Filter:") {
+			continue
+		}
+		if strings.Contains(line, "sold_item_sk = i_item_sk") || strings.Contains(line, "time_sk = t_time_sk") {
+			t.Fatalf("an equi-join is still rendered as a Filter conjunct:\n%s", plan)
+		}
 	}
 }
 

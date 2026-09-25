@@ -1,0 +1,9 @@
+sf025.log:=== SUMMARY: PASS=96 (60 ck-verified, 36 ck=n/a) MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0 SKIP=3 ===
+sf025.log:SLOWER     Q31 2s->5s (2.5x)
+sf025.log:TOTAL      136s -> 142s (+4.4%)  <== aggregate move; no single query need cross 2.0x for this to matter
+sf025.log:=== STATUS-DELTA: compared=99 verdict-changes=none runtime-moves=1 total-delta=+4.4% (>=2.0x, floor 5s, total band 2.0%, TIMEOUT readings excluded) ===
+sf025.log:=== PLAN-SHAPE: queries=99 same=63 changed=36 added=0 removed=0 ===
+sf025b.log:=== SUMMARY: PASS=96 (60 ck-verified, 36 ck=n/a) MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0 SKIP=3 ===
+sf025b.log:FASTER     Q31 5s->2s (0.4x)
+sf025b.log:=== STATUS-DELTA: compared=99 verdict-changes=none runtime-moves=1 total-delta=+1.4% (>=2.0x, floor 5s, total band 2.0%, TIMEOUT readings excluded) ===
+sf025b.log:=== PLAN-SHAPE: queries=99 same=99 changed=0 added=0 removed=0 ===

@@ -783,6 +783,10 @@ type rangeTblEntry struct {
 	// `outputLayout` (createplanjoin.go) is the per-node translation built
 	// from this field.
 	baseOffset int
+
+	// usefulKeys is what truncate_useless_pathkeys reads for this joinrel
+	// (M0146-0005n): set by makeJoinRel, nil elsewhere (no truncation).
+	usefulKeys *pathkeyUsefulness
 }
 
 // newRelOptInfo creates a rel with the given relids and (once-computed) size.

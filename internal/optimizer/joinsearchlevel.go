@@ -624,6 +624,7 @@ func (s *searchCtx) makeJoinRel(rel1, rel2 *RelOptInfo) (*RelOptInfo, error) {
 			rows = 1
 		}
 		joinrel = newRelOptInfo(joinrelids, rows, width)
+		joinrel.usefulKeys = s.pathkeyUsefulnessFor(joinrelids)
 		// take2 P4-01 rev 10 step 1: a join rel is built during the search,
 		// after s.neededCols is published, so it takes the set directly.
 		joinrel.NeededCols, joinrel.NeededColsKnown = s.neededCols, s.neededColsKnown

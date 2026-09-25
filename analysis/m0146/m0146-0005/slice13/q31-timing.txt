@@ -1,0 +1,4 @@
+Q31 SF0.25 A/B on one private clone, fire-set binaries, fresh server per arm (ms):
+baseline: 2550 2416 2385 2416
+candidate: 2351 4985 4096 2421 2432 2369
+Warm runs are equal (~2.4 s); the candidate shows occasional slow first executions. Results byte-identical.

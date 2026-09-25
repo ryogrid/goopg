@@ -547,6 +547,17 @@ where PG loops. PG's `build_join_pathkeys` truncates useless pathkeys
 M0146-0005n and blocks re-applying the patch. Evidence:
 `analysis/m0146/m0146-0005/recon-0005m/`.
 
+## Slice 13 (M0146-0005n): join paths drop useless pathkeys
+
+`build_join_pathkeys` now truncates as PG's does: a join path keeps its
+outer's ordering only as far as a later merge join (an equivalence class
+with a member outside the joinrel, right direction) or the ORDER BY can
+use it. `pathkeys_useful.go` computes each joinrel's merge-useful
+expressions once in `makeJoinRel`, and all four in-search callers apply
+it. Census: only Q65 changes category at the same depth; TPC-H is
+identical. This unblocks re-applying M0146-0005m. Evidence:
+`analysis/m0146/m0146-0005/slice13/`.
+
 ## Remaining records
 
 Per M0146-0001's `m0146-0001-ranked.txt`, still to be worked:

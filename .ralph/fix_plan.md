@@ -21434,7 +21434,7 @@ M0146-0001 re-baseline census on the new default arm.
       `truncate\_useless\_pathkeys` \(PG\'s `build\_join\_pathkeys` does\), so
       every outer ordering becomes a separately kept path. Blocked on
       M0146\-0005n.
-- [ ] **M0146\-0005n — `build\_join\_pathkeys` truncates useless pathkeys**
+- [x] **M0146\-0005n — `build\_join\_pathkeys` truncates useless pathkeys**
   \(filed 2026\-09\-26 by M0146\-0005m\): PG\'s `build\_join\_pathkeys`
   returns `truncate\_useless\_pathkeys\(root, joinrel, outer\_pathkeys\)`
   \(pathkeys.c\): a join path keeps its outer\'s ordering only as far as a
@@ -21450,6 +21450,17 @@ M0146-0001 re-baseline census on the new default arm.
     `mergeableColumnExprsFor` does for index paths\) and the ORDER BY prefix
     from `s.queryPathkeys`; truncate to the longer. Then re\-apply the
     M0146\-0005m patch and re\-measure its census.
+  - **DONE 2026\-09\-26.** Design doc §"Slice 13"; evidence
+    `analysis/m0146/m0146\-0005/slice13/`.
+    - `pathkeys\_useful.go`: per\-joinrel merge\-useful expressions \(set in
+      `makeJoinRel`\) and `truncateUselessPathkeys` \(merge prefix with
+      `right\_merge\_direction`, ORDER BY prefix\); all four in\-search
+      `buildJoinPathkeys` callers apply it.
+    - Census: only Q65 changes category at the same depth; TPC\-H identical;
+      all gates pass. `setop\_join\_promotion\_test.go` now checks only
+      `Filter:` lines \(a `Join Filter:` is the promoted join\).
+    - Grouping/distinct/set\-op arms ledgered.
+  Movement: none \(prerequisite for M0146\-0005m\)
 - [ ] **The goopg TPC\-DS measurement clusters hold `char\(n\)` values stored
   unpadded by an older build** \(found 2026\-09\-25 by M0146\-0005d\):
   on a private clone of `data\-sf025` \(loaded 2026\-09\-16\), a stored

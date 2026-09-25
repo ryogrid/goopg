@@ -376,7 +376,7 @@ func addNLIPaths(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp costParams,
 				Residual:    residual,
 				// The outer path's ordering survives the loop
 				// (build_join_pathkeys, match_unsorted_outer; M0146-0005l).
-				Pathkeys: buildJoinPathkeys(jt, o.Pathkeys),
+				Pathkeys: buildJoinPathkeysFor(joinrel, jt, o.Pathkeys),
 				// Empty by the test above. Carried through the constructor
 				// rather than hard-coded so the star-schema case is a one-line
 				// relaxation once P5.6's sizer exists.
@@ -568,7 +568,7 @@ func addPartialNestLoopPaths(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp
 					Residual:    residual,
 					// consider_parallel_nestloop: the partial outer's
 					// per-worker ordering survives the loop (M0146-0005l).
-					Pathkeys: buildJoinPathkeys(jt, o.Pathkeys),
+					Pathkeys: buildJoinPathkeysFor(joinrel, jt, o.Pathkeys),
 					// Empty by the V8 refusal above. Carried through the
 					// constructor rather than hard-coded, as the NLI arm does.
 					RequiredOuter: req,
