@@ -17316,7 +17316,7 @@ Movement: none — no plan moved on TPC-DS SF0.25/SF1 or TPC-H across all four d
       gate \(Q95 TIMEOUT introduced\) → held as M0145\-0008ac; the diff is
       preserved as a patch.
   Movement: none — TPC-H PLAN-PARITY match 3 -> 3; aggregation-strategy 4 -> 3 is inside the noise band
-- [ ] **M0145\-0008ab — unique\-ify a derived semi\-side leaf into an inner
+- [x] **M0145\-0008ab — unique\-ify a derived semi\-side leaf into an inner
   join, as PG\'s create\_unique\_path does** \(filed 2026\-09\-25 by
   M0145\-0008aa\). PG proves the grouped `ANY\_subquery` distinct
   \(`query\_is\_distinct\_for`,
@@ -17336,6 +17336,37 @@ Movement: none — no plan moved on TPC-DS SF0.25/SF1 or TPC-H across all four d
     \(inner Hash Join over the grouped body\) and its row estimate
     \(3.0M → PG\'s 470K\), measured on the TPC\-H fire set / parallel
     capture.
+  - **DONE 2026\-09\-25 \(`f8fb6d64c`\).** Design doc
+    `docs/design/0100\-0149/m0145\-0008ab\-derived\-leaf\-unique\-ify.md`;
+    evidence `analysis/m0145/m0145\-0008ab/`.
+    - Ported `create\_unique\_path`\'s NOOP arm via `query\_is\_distinct\_for`
+      \(`queryIsDistinctForFirstColumn`, `createPulledUniquePath`\).
+    - Ported the JOIN\_UNIQUE\_INNER paths PG offers beside the plain SEMI
+      paths \(`addPathsToJoinrel` → `addPathsForJointype` twice\).
+    - Ported `examine\_simple\_variable`\'s `isunique` for a lone
+      DISTINCT/GROUP BY subquery column \(`subqueryOutputIsUnique`,
+      `joinVarStats.isUnique`\).
+    - TPC\-H Q18: semi estimate 750K → 135K \(PG 117K\), final 3.0M → 539K
+      \(PG 470K\), join order now PG\'s \(`orders ⋈ grouped lineitem`, then an
+      index nested loop\). The unique\-inner candidates are built but lose on
+      cost to the Hash Semi Join → M0145\-0008ad.
+    - TPC\-DS: no changed query at either scale; EA\-RATCHET 52 → 52.
+  Movement: none — TPC-H PLAN-PARITY match 3 -> 3; category moves within the noise band
+- [ ] **M0145\-0008ad — TPC\-H Q18 elects a Hash Semi Join where PG elects
+  the unique\-inner Hash Join** \(filed 2026\-09\-25 by M0145\-0008ab\). Both
+  candidates now exist for `orders ⋈ ANY\_subquery` \(DP trace shows the
+  JOIN\_UNIQUE\_INNER arms costed\); goopg\'s semi path wins, PG\'s inner path
+  wins. The difference is in the hash\-join costing of SEMI against INNER
+  \(`final\_cost\_hashjoin`\'s semi arm, `outer\_match\_frac` / unmatched
+  probes, `postgres/src/backend/optimizer/path/costsize.c`\) or in the
+  semifactors fed to it.
+  Kind: recon
+  Parent: M0145-0008ab
+  - First step: print both candidates\' cost components for Q18 on a private
+    TPC\-H clone \(`GOOPG\_PGSHAPED\_DP\_TRACE=1`\) and compare with PG\'s
+    `final\_cost\_hashjoin` inputs for the same pair.
+  - Expected movement: TPC\-H Q18 `join\-method` \(Hash Semi Join → Hash
+    Join\), measured on the TPC\-H fire set.
 - [!] **M0145\-0008ac — promote the pulled `\*CTEScan` leaf admission
   \(`GOOPG\_PULLUP\_CTE\_LEAF`\)** \(filed 2026\-09\-25 by M0145\-0008aa\).
   PG pulls a CTE reference in a simple sublink body up like any base rel;
