@@ -85,7 +85,15 @@ func TestConsiderParallel_SetAndClearedByShape(t *testing.T) {
 		{"qual calls a user function marked PARALLEL SAFE", cpFilter(cpScan(plain), call("safe_f")), plain, true},
 		{"qual calls nextval (builtin 'u')", cpFilter(cpScan(plain), call("nextval")), plain, false},
 		{"qual calls a builtin not in the restricted table", cpFilter(cpScan(plain), call("abs")), plain, true},
-		{"qual carries a SubPlan (clauses.c:857)", cpFilter(cpScan(plain), &ExistsExpr{Plan: cpScan(plain)}), plain, false},
+		// M0146-0002f: max_parallel_hazard_walker's SubPlan arm — a SubPlan
+		// is safe when its plan is parallel_safe (uncorrelated, no Gather /
+		// CTE / temp relation / restricted expression inside).
+		{"qual carries an uncorrelated SubPlan over a plain relation", cpFilter(cpScan(plain), &ExistsExpr{Plan: cpScan(plain)}), plain, true},
+		{"qual carries a correlated SubPlan (PARAM_EXEC inside)", cpFilter(cpScan(plain), &ExistsExpr{Plan: cpFilter(cpScan(plain), &BinaryOp{Op: parser.OpEq, Left: cpCol(0), Right: &OuterColumnRef{}})}), plain, false},
+		{"qual carries a SubPlan over a temp table", cpFilter(cpScan(plain), &ExistsExpr{Plan: cpScan(temp)}), plain, false},
+		{"qual carries a SubPlan over a CTE scan", cpFilter(cpScan(plain), &ExistsExpr{Plan: &CTEScan{Name: "w", Child: cpScan(plain)}}), plain, false},
+		{"qual carries a SubPlan whose body holds a Gather", cpFilter(cpScan(plain), &ExistsExpr{Plan: &Gather{Child: cpScan(plain)}}), plain, false},
+		{"qual carries a SubPlan whose body calls nextval", cpFilter(cpScan(plain), &InExpr{Operand: cpCol(0), Plan: cpFilter(cpScan(plain), call("nextval"))}), plain, false},
 		{"qual carries a PARAM_EXEC reference (clauses.c:894)", cpFilter(cpScan(plain), &BinaryOp{Op: parser.OpEq, Left: cpCol(0), Right: &OuterColumnRef{}}), plain, false},
 		{"CTE scan (RTE_CTE, allpaths.c:706)", &CTEScan{Name: "w", Child: cpScan(plain)}, nil, false},
 		{"subquery leaf without LIMIT (RTE_SUBQUERY)", &Project{Child: cpScan(plain)}, nil, true},

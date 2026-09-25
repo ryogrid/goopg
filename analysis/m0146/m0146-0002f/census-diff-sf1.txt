@@ -1,0 +1,20 @@
+6c6
+< Q6 depth=3 [parallelism] under GroupAggregate: PG Nested Loop Inner | goopg Gather Merge
+---
+> Q6 depth=3 [sort-strategy] under GroupAggregate: PG Nested Loop Inner | goopg Sort
+45c45
+< Q45 depth=2 [sort-strategy] under GroupAggregate: PG Gather Merge | goopg Sort
+---
+> Q45 depth=4 [parameterisation] under Sort: PG Nested Loop Inner | goopg Nested Loop Inner
+101c101
+< CATEGORY-ROLLUP: sort-strategy=31 aggregation-strategy=23 parallelism=9 qual-placement=7 join-method=5 scan-type=5 parameterisation=5 error=3 join-order=2
+---
+> CATEGORY-ROLLUP: sort-strategy=31 aggregation-strategy=23 parallelism=8 qual-placement=7 parameterisation=6 join-method=5 scan-type=5 error=3 join-order=2
+122c122
+<     1  parallelism      under GroupAggregate   PG Nested Loop Inner            goopg Gather Merge                 depth=3
+---
+>     1  sort-strategy    under GroupAggregate   PG Nested Loop Inner            goopg Sort                         depth=3
+139c139
+<     1  sort-strategy    under GroupAggregate   PG Gather Merge                 goopg Sort                         depth=2
+---
+>     1  parameterisation under Sort             PG Nested Loop Inner            goopg Nested Loop Inner            depth=4

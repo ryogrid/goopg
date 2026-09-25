@@ -20851,7 +20851,7 @@ M0146-0001 re-baseline census on the new default arm.
     - TPC\-DS Q10/Q35 plans change; census unchanged; all gates pass.
   Movement: TPC\-H Q16 partsupp leaf estimate matches PG \(no category move\)
 
-- [ ] **M0146\-0002f — a parallel\-safe SubPlan does not make its relation
+- [x] **M0146\-0002f — a parallel\-safe SubPlan does not make its relation
   parallel\-unsafe**: port `max\_parallel\_hazard\_walker`'s SubPlan arm
   \(`clauses.c:900\-912`: the subplan must be parallel\_safe, and its
   testexpr is checked with the SubPlan's params counted as safe\) into
@@ -20863,6 +20863,16 @@ M0146-0001 re-baseline census on the new default arm.
   Parent: M0146-0002d
   - Depends on M0146\-0002e for Q16 to move. Expected movement: Q16
     `parallelism` \(Parallel Hash Join over the filtered partsupp scan\).
+  - **DONE 2026\-09\-26.** Design doc
+    `docs/design/0100\-0149/m0146\-0002f\-parallel\-safe\-subplan.md`;
+    evidence `analysis/m0146/m0146\-0002f/`.
+    - `isParallelSafeExpr` judges a SubPlan by `subPlanParallelSafe`
+      \(uncorrelated, allowlisted nodes, safe expressions, no Gather/CTE/temp\).
+    - Worker safety: sublink caches and the hashed probe are worker\-local
+      by construction; `TestParallelSubPlanIdentity` \(\-race, 1/2/4 workers\).
+    - TPC\-H Q16 plans PG\'s Parallel Hash Join; TPC\-DS Q6/Q14/Q45/Q58 move;
+      all gates pass.
+  Movement: TPC\-H Q16 Parallel Hash Join over the filtered partsupp scan; TPC\-DS Q6 parallelism → sort\-strategy
 
 - [ ] **M0146\-0002g — EXPLAIN renders a hashed SubPlan as PG does**:
   `NOT \(ANY \(x = \(hashed SubPlan N\).col1\)\)` instead of

@@ -441,7 +441,7 @@ func isParallelSafeExpr(e Expr, cat catalog.Catalog) bool {
 		return true
 	}
 	safe := true
-	ok := walkExprRefs(e, scopeVeto, exprVisitor{
+	ok := walkExprRefs(e, scopeSignal, exprVisitor{
 		Visit: func(x Expr) bool {
 			if !safe {
 				return false
@@ -454,14 +454,12 @@ func isParallelSafeExpr(e Expr, cat catalog.Catalog) bool {
 			case *OuterColumnRef, *ExecParamRef:
 				safe = false
 			}
-			// A SubPlan in any of its forms: an expression that owns an
-			// inner-scope plan slot. Decided by the slot table rather than
-			// a type list so a sublink form added later is restricted by
-			// construction (the veto below is the walker's own backstop).
+			// A multi-assignment row subquery stays restricted: only the
+			// plain SubPlan forms are judged by their plan (OnScope below).
 			if safe {
 				if slots, ok := exprChildSlots(x); ok {
 					for _, sl := range slots {
-						if sl.kind == slotInnerPlan || sl.kind == slotSubqRow {
+						if sl.kind == slotSubqRow {
 							safe = false
 							break
 						}
@@ -470,9 +468,77 @@ func isParallelSafeExpr(e Expr, cat catalog.Catalog) bool {
 			}
 			return safe
 		},
+		// max_parallel_hazard_walker's SubPlan arm (clauses.c): a SubPlan
+		// is restricted unless its plan is parallel_safe; the test
+		// expression (the operand) is walked as usual by the Visit above.
+		// M0146-0002f.
+		OnScope: func(p Node) {
+			if safe && !subPlanParallelSafe(p, cat) {
+				safe = false
+			}
+		},
 		OnUnknown: func(Expr) { safe = false },
 	})
 	return ok && safe
+}
+
+// subPlanParallelSafe is make_subplan's `splan->parallel_safe`: the
+// subquery's plan is parallel-safe as a whole. A correlated body is not —
+// its outer references are PARAM_EXEC Params, parallel-restricted unless
+// an initplan supplies them — and neither is a body holding a Gather, a CTE
+// or worktable scan, a row lock, a temp or virtual relation, or any
+// parallel-restricted expression (nested SubPlans recurse through
+// isParallelSafeExpr). Unenumerated node kinds fail closed.
+//
+// The executor evaluates such a SubPlan inside the worker: sublink result
+// caches and hashed probe sets live on the worker's own Context
+// (NewWorkerContext creates them empty), and the plan itself is read-only.
+func subPlanParallelSafe(n Node, cat catalog.Catalog) bool {
+	if n == nil || subtreeHasUnsafeNode(n) {
+		return false
+	}
+	ok := true
+	var walk func(Node)
+	walk = func(cur Node) {
+		if cur == nil || !ok {
+			return
+		}
+		switch x := cur.(type) {
+		case *SeqScan:
+			ok = !tableIsUnsafeForParallel(x.Table)
+		case *IndexScan:
+			ok = !tableIsUnsafeForParallel(x.Table)
+		case *IndexOnlyScan:
+			ok = !tableIsUnsafeForParallel(x.Table)
+		case *BitmapHeapScan:
+			ok = !tableIsUnsafeForParallel(x.Table)
+		case *Project, *Filter, *Join, *NestedLoopIndexJoin, *Aggregate, *Sort,
+			*Distinct, *DistinctOn, *Limit, *Values:
+		default:
+			ok = false
+		}
+		if !ok {
+			return
+		}
+		kids, known := planChildNodes(cur)
+		if !known {
+			ok = false
+			return
+		}
+		for _, k := range kids {
+			walk(k)
+		}
+	}
+	walk(n)
+	if !ok {
+		return false
+	}
+	walkPlanExprs(n, func(e Expr) {
+		if ok && !isParallelSafeExpr(e, cat) {
+			ok = false
+		}
+	})
+	return ok
 }
 
 // funcCallIsParallelSafe resolves one call: a user routine by name through the
