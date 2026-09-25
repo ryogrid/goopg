@@ -20843,7 +20843,7 @@ M0146-0001 re-baseline census on the new default arm.
   Parent: M0146-0002d
   - Expected movement: Q16 `rendering`.
 
-- [ ] **M0146\-0015 — upstream regress `subselect` hangs: a nested
+- [x] **M0146\-0015 — upstream regress `subselect` hangs: a nested
   EXISTS / NOT EXISTS over `tenk1` runs for more than an hour** \(found
   2026\-09\-24 while verifying M0146\-0002c; reproduces at HEAD `d23b1fd87`
   without the change\): `select a.thousand from tenk1 a, tenk1 b where
@@ -20863,6 +20863,73 @@ M0146-0001 re-baseline census on the new default arm.
     correctness review. If the bisect shows the cutover introduced the
     hang it re\-enters as an S2\-class cutover regression; if pre\-existing
     it keeps normal M0146 order.
+  - **RECON DONE 2026\-09\-25.** Evidence and write\-up
+    `analysis/m0146/m0146\-0015/`.
+    - **Bisect: the cutover introduced the hang.** Pre\-flip
+      \(`ddb4eabd4^`\) runs the query in 207 s \(0 rows, correct\) with both
+      SubPlans as index probes; HEAD seq\-scans SubPlan 1 and full\-scans
+      the index in SubPlan 2 \(\~10^11 row visits vs \~10^7\). PG 18.3: 4 ms.
+    - Mechanism: the jointree pipeline\'s index\-path producers
+      \(`restrictionEqualityPrefix` / `restrictionKeyUsable` /
+      `restrictionRangeOnColumn` / `consumingIndexClauses`\) take a key only
+      if `isConstExpr` — a literal — so an `OuterColumnRef` is never an
+      index key, in either operand order. PG\'s `match\_clause\_to\_indexcol`
+      takes any pseudo\-constant operand, including the `PARAM\_EXEC` Param
+      an outer Var becomes. Bind parameters are unaffected.
+    - Pre\-existing and separate: neither build pulls the sublinks up into
+      joins as PG does → M0146\-0015b.
+  Movement: none
+- [ ] **M0146\-0015a — index keys from correlated outer references \(cutover
+  regression\)** \(filed 2026\-09\-25 by M0146\-0015\): at HEAD a correlated
+  SubPlan never uses its outer reference as an index key, so `where
+  d.thousand = a.thousand` inside a subquery becomes a Filter over a full
+  scan; before the cutover, and in PG, it is `Index Cond: \(thousand =
+  a.thousand\)`. This turns the regress `subselect` case into a >1 h query.
+  Kind: impl
+  Parent: M0146\-0015
+  - First step: let the index\-key recogniser used by
+    `restrictionEqualityPrefix`, `restrictionRangeOnColumn` and
+    `consumingIndexClauses` \(`pathindexrestrict.go`, `pathindexonly.go`\)
+    accept an `OuterColumnRef` \(and an `ExecParamRef`\) as a pseudo\-constant
+    key, as PG\'s `match\_clause\_to\_indexcol` does. Price the selectivity as
+    PG prices a Var compared with an unknown value \(`var\_eq\_non\_const`,
+    1/ndistinct\), not as a literal. Then check that the lowering and the
+    executor evaluate the key per call: the legacy pipeline did so through
+    `$n` params, and `harvestIndexKeyParams` in `unnest.go` is a likely reuse
+    point.
+  - Also check the side observation in the evidence README: HEAD seq\-scans
+    `unique1 < 3` where pre\-flip used the index.
+  - Pin: the one\-level scalar\-subquery plan \(`Index Cond: \(thousand =
+    a.thousand\)`\) and the `subselect` query finishing. Expected movement:
+    none on the parity instruments; it restores a regress case.
+  - **Rank:** a descendant of an item\-2a task, so it inherits item 2a
+    \(OWNER DECISIONS 2026\-09\-25\).
+
+  > ## ESCALATION 2026\-09\-25 \(S2\) — cutover regression: correlated subqueries lose index keys
+  >
+  > M0146\-0015\'s placement said a cutover\-caused hang re\-enters as an
+  > S2\-class cutover regression. The bisect shows it is one. Every
+  > correlated SubPlan whose outer reference was an index key before the
+  > flip is now a full scan per outer row. That is a performance cliff, not
+  > wrong results. M0146\-0015a inherits item 2a\'s rank as a descendant; the
+  > owner decides whether it needs a different placement.
+
+- [ ] **M0146\-0015b — pull up nested EXISTS / NOT EXISTS into semi/anti
+  joins** \(filed 2026\-09\-25 by M0146\-0015; pre\-existing, not caused by
+  the cutover\): for the regress `subselect` query PG plans a Nested Loop
+  Semi Join over a Hash Anti Join \(a, d\) in 4 ms; goopg keeps both
+  sublinks as correlated SubPlans in either pipeline \(pre\-flip 207 s\).
+  Kind: recon
+  Parent: M0146\-0015
+  - First step: trace PG\'s `pull\_up\_sublinks\_qual\_recurse` /
+    `convert\_EXISTS\_sublink\_to\_join` \(`subselect.c`,
+    `prepjointree.c`\) over this query. Find which step pulls the inner NOT
+    EXISTS \(which references the grandparent `a`\) into the anti join, and
+    where goopg\'s sublink pull\-up \(`sublinkpullup.go`\) declines.
+  - **Rank:** per M0146\-0015\'s placement, a pre\-existing cause keeps
+    normal M0146 order; being a descendant of an item\-2a task would place it
+    in 2a. The two readings conflict, and the loop takes the conservative
+    one \(normal M0146 order\) until the owner rules.
 
 - [ ] **M0146\-0002a — category regressions from the Parallel Hash arm**
   \(measured 2026\-09\-24 at slice 2, TPC\-H parallel lane\): Q12 gains
