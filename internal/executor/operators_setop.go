@@ -60,6 +60,13 @@ type setOp struct {
 	mergeInit bool
 	mergeErr  error
 	ctx       *Context
+
+	// sorted is the SETOP_SORTED form of INTERSECT / EXCEPT (M0146-0005q):
+	// both inputs arrive sorted on plan.MergeKeys and are merged group by
+	// group. pendingRow / pendingN are the current group's output copies.
+	sorted     bool
+	pendingRow Row
+	pendingN   int
 }
 
 func newSetOp(p *optimizer.SetOp, left, right Operator) *setOp {
@@ -91,7 +98,15 @@ func (o *setOp) Open(ctx *Context) error {
 		return err
 	}
 	o.opened = true
+	o.ctx = ctx
 	if o.streaming {
+		return nil
+	}
+	o.sorted = len(o.plan.MergeKeys) > 0 &&
+		(o.plan.Op == parser.SetOpIntersect || o.plan.Op == parser.SetOpExcept)
+	if o.sorted {
+		o.mergeInit = false
+		o.pendingN = 0
 		return nil
 	}
 	if err := o.computeBuffered(); err != nil {
@@ -120,6 +135,9 @@ func (o *setOp) Next() (TupleSlot, error) {
 	}
 	if o.streaming {
 		return o.nextStreaming()
+	}
+	if o.sorted {
+		return o.nextSorted()
 	}
 	if o.idx >= len(o.rows) {
 		return nil, EOF
@@ -394,4 +412,79 @@ func (o *setOp) currentTID() (storage.RelFileNode, storage.ItemPointer, bool) {
 		return src.currentTID()
 	}
 	return storage.RelFileNode{}, storage.ItemPointer{}, false
+}
+
+// nextSorted is nodeSetOp.c's sorted mode for INTERSECT / EXCEPT: both inputs
+// are sorted on plan.MergeKeys (every column), so each distinct left row is a
+// run of equal left rows; the matching right run is found by advancing the
+// right side past smaller keys. The group then emits, per SetOpCmd:
+//
+//	INTERSECT      1 if both runs are non-empty
+//	INTERSECT ALL  min(nLeft, nRight)
+//	EXCEPT         1 if the right run is empty
+//	EXCEPT ALL     max(nLeft - nRight, 0)
+//
+// Right-only groups never emit. NULLs compare equal, as set operations
+// require, because mergeKeysLess orders two NULLs as equal.
+func (o *setOp) nextSorted() (TupleSlot, error) {
+	if !o.mergeInit {
+		o.mergeInit = true
+		for side := 0; side < 2; side++ {
+			if err := o.mergeAdvance(side); err != nil {
+				return nil, err
+			}
+		}
+	}
+	keys := o.plan.MergeKeys
+	less := func(a, b []Datum) bool {
+		return mergeKeysLess(keys, a, b, &o.mergeErr)
+	}
+	for {
+		if o.pendingN > 0 {
+			o.pendingN--
+			return SlotFromRow(o.plan.Output(), o.pendingRow), nil
+		}
+		if !o.mergeLive[0] {
+			return nil, EOF
+		}
+		row, gkeys := o.mergeCur[0], o.mergeKeys[0]
+		nLeft := 0
+		for o.mergeLive[0] && !less(gkeys, o.mergeKeys[0]) && !less(o.mergeKeys[0], gkeys) {
+			nLeft++
+			if err := o.mergeAdvance(0); err != nil {
+				return nil, err
+			}
+		}
+		for o.mergeLive[1] && less(o.mergeKeys[1], gkeys) {
+			if err := o.mergeAdvance(1); err != nil {
+				return nil, err
+			}
+		}
+		nRight := 0
+		for o.mergeLive[1] && !less(gkeys, o.mergeKeys[1]) && !less(o.mergeKeys[1], gkeys) {
+			nRight++
+			if err := o.mergeAdvance(1); err != nil {
+				return nil, err
+			}
+		}
+		if o.mergeErr != nil {
+			return nil, o.mergeErr
+		}
+		n := 0
+		switch {
+		case o.plan.Op == parser.SetOpIntersect && o.plan.All:
+			n = min(nLeft, nRight)
+		case o.plan.Op == parser.SetOpIntersect:
+			if nLeft > 0 && nRight > 0 {
+				n = 1
+			}
+		case o.plan.All:
+			n = max(nLeft-nRight, 0)
+		default:
+			if nRight == 0 {
+				n = 1
+			}
+		}
+		o.pendingRow, o.pendingN = row, n
+	}
 }

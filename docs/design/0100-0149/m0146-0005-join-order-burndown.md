@@ -598,6 +598,22 @@ input (the worst case), and `estimateSetOp` now does the same instead of
 halving. No TPC-DS or TPC-H plan changes. Evidence:
 `analysis/m0146/m0146-0005/slice16/`.
 
+## Slice 17 (M0146-0005q): SETOP_SORTED for INTERSECT / EXCEPT
+
+goopg had only the hashed set-op executor, while PG 18 also offers
+SETOP_SORTED. That path has the same total as the hashed one and a
+startup of just the inputs' startups, so it wins whenever both inputs are
+presorted. Q38/Q87's DISTINCT arms are presorted. The change adds:
+- a merge executor (`nextSorted`, nodeSetOp.c semantics for all four
+  commands);
+- the planner candidate over presorted arms (a Unique over an all-column
+  Sort, or a nested sorted set-op), with PG's cost and pathkeys;
+- the `SetOp <cmd>` EXPLAIN label.
+
+Q38 now diverges at depth 3 (was 2) and Q87 at depth 4 (was 1). PG's
+INTERSECT smaller-input swap is the next Q38 residue. Evidence:
+`analysis/m0146/m0146-0005/slice17/`.
+
 ## Remaining records
 
 Per M0146-0001's `m0146-0001-ranked.txt`, still to be worked:

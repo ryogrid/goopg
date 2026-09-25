@@ -1,0 +1,19 @@
+== Q38 baseline
+         ->  HashSetOp Intersect  (cost=19763.92..43124.14 rows=852 width=68)
+               ->  HashSetOp Intersect  (cost=19763.92..34162.10 rows=1696 width=68)
+                     ->  Unique  (cost=19763.92..19804.62 rows=3256 width=68)
+                     ->  Unique  (cost=14319.32..14340.52 rows=1696 width=68)
+               ->  Unique  (cost=8942.88..8953.53 rows=852 width=68)
+== Q38 candidate
+         ->  SetOp Intersect  (cost=19763.92..43124.14 rows=852 width=68)
+               ->  SetOp Intersect  (cost=19763.92..34162.10 rows=1696 width=68)
+                     ->  Unique  (cost=19763.92..19804.62 rows=3256 width=68)
+                     ->  Unique  (cost=14319.32..14340.52 rows=1696 width=68)
+               ->  Unique  (cost=8942.88..8953.53 rows=852 width=68)
+== Q38 candidate-pg
+         ->  SetOp Intersect  (cost=42423.44..43211.65 rows=862 width=212)
+               ->  Unique  (cost=8913.45..9020.31 rows=862 width=56)
+               ->  SetOp Intersect  (cost=33509.99..34169.89 rows=1711 width=212)
+                     ->  Unique  (cost=14171.51..14386.77 rows=1711 width=56)
+                     ->  Unique  (cost=19338.47..19742.38 rows=3150 width=56)
+                                 ->  Unique  (cost=18338.43..18348.59 rows=1016 width=56)

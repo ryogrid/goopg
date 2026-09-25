@@ -3904,6 +3904,10 @@ func setOpNodeName(p *optimizer.SetOp) string {
 		}
 		return "Append"
 	}
+	if len(p.MergeKeys) > 0 {
+		// M0146-0005q: SETOP_SORTED renders as plain "SetOp <cmd>".
+		return "SetOp " + setOpCommandName(p)
+	}
 	return "HashSetOp " + setOpCommandName(p)
 }
 

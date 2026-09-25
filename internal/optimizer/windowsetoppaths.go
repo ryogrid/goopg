@@ -62,6 +62,7 @@ const (
 	windowProducer             = "upper.window.sorted"
 	setOpAppendProducer        = "upper.setop.append"
 	setOpHashedProducer        = "upper.setop.hashed"
+	setOpSortedProducer        = "upper.setop.sorted"
 	setOpMergeAppendProducer   = "upper.setop.mergeappend"
 	setOpPartialAppendProducer = "upper.setop.append.partial"
 	setOpMixedAppendProducer   = "upper.setop.append.mixed"
@@ -663,6 +664,101 @@ func addSetOpPaths(setOpRel *RelOptInfo, lseed, rseed *Path, setOpNode *SetOp, c
 			setOpRel.Rows, setOpRel.NCols),
 		Children: []*Path{lseed, rseed},
 	}, producer)
+	addSortedSetOpPath(setOpRel, lseed, rseed, setOpNode, cp)
+}
+
+// addSortedSetOpPath is generate_nonunion_paths' SETOP_SORTED candidate
+// (prepunion.c) for INTERSECT / EXCEPT whose two inputs already deliver the
+// set operation's ordering — every output column ascending, which is the
+// sort-based DISTINCT arm's ordering (`setOpArmSortedAllCols`). PG prices it
+// in create_setop_path (pathnode.c): the inputs' startups as startup, and the
+// same total the hashed arm has, so over presorted inputs it wins add_path on
+// startup and carries the ordering as pathkeys (M0146-0005q).
+//
+// Not ported (ledgered): PG also offers the sorted arm over an explicitly
+// Sorted cheapest input (or the input rel's cheapest presorted path); that
+// candidate only wins under a LIMIT's fractional election.
+func addSortedSetOpPath(setOpRel *RelOptInfo, lseed, rseed *Path, setOpNode *SetOp, cp costParams) {
+	if setOpNode.Op != parser.SetOpIntersect && setOpNode.Op != parser.SetOpExcept {
+		return
+	}
+	if !setOpArmSortedAllCols(setOpNode.Left) || !setOpArmSortedAllCols(setOpNode.Right) {
+		return
+	}
+	keys := distinctAllColKeys(setOpNode.Left)
+	if len(keys) == 0 {
+		return
+	}
+	sorted := *setOpNode
+	sorted.MergeKeys = keys
+	numCols := float64(setOpRel.NCols)
+	startup := lseed.Cost.Startup + rseed.Cost.Startup
+	total := lseed.Cost.Total + rseed.Cost.Total +
+		cp.cpuOperatorCost*(lseed.Rows+rseed.Rows)*numCols +
+		cp.cpuOperatorCost*setOpRel.Rows
+	addPath(setOpRel, &Path{
+		Kind: PathSetOp, SetOp: &sorted,
+		Rel: setOpRel, Rows: setOpRel.Rows,
+		DisabledNodes: lseed.DisabledNodes + rseed.DisabledNodes,
+		Cost:          Cost{Startup: startup, Total: total},
+		Pathkeys:      pathkeysForSortKeys(keys),
+		Children:      []*Path{lseed, rseed},
+	}, setOpSortedProducer)
+}
+
+// setOpArmSortedAllCols reports whether a set-operation arm's finished plan
+// is sorted on all of its output columns ascending (NULLS LAST): a sort-based
+// DISTINCT (a Unique — goopg's DistinctOn over every column, or Distinct —
+// over a Sort whose keys are the output columns in order), or a nested
+// sorted INTERSECT / EXCEPT, whose merge emits in that order. Anything else —
+// a hashed DISTINCT, a bare scan — answers false, so the sorted candidate is
+// simply not offered.
+func setOpArmSortedAllCols(n Node) bool {
+	ncols := len(n.Output())
+	if ncols == 0 {
+		return false
+	}
+	var child Node
+	switch x := n.(type) {
+	case *SetOp:
+		return len(x.MergeKeys) == ncols && (x.Op == parser.SetOpIntersect || x.Op == parser.SetOpExcept) &&
+			sortKeysAllColsAsc(x.MergeKeys, ncols)
+	case *DistinctOn:
+		if len(x.KeyCols) != ncols {
+			return false
+		}
+		for i, c := range x.KeyCols {
+			if c != i {
+				return false
+			}
+		}
+		child = x.Child
+	case *Distinct:
+		child = x.Child
+	default:
+		return false
+	}
+	srt, ok := child.(*Sort)
+	if !ok || len(srt.Output()) != ncols {
+		return false
+	}
+	return sortKeysAllColsAsc(srt.Keys, ncols)
+}
+
+// sortKeysAllColsAsc reports whether keys begin with output columns
+// 0..ncols-1, each ascending with NULLS LAST.
+func sortKeysAllColsAsc(keys []SortKey, ncols int) bool {
+	if len(keys) < ncols {
+		return false
+	}
+	for i := 0; i < ncols; i++ {
+		k := keys[i]
+		cr, isCol := k.Expr.(*ColumnRef)
+		if !isCol || cr.Index != i || k.Desc || k.NullsFirst {
+			return false
+		}
+	}
+	return true
 }
 
 // addPartialSetOpPath is M0140-0006b + M0140-0006c-3: the streaming-UNION-ALL

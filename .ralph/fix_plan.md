@@ -21507,6 +21507,20 @@ M0146-0001 re-baseline census on the new default arm.
       count; goopg halved it. No TPC\-DS or TPC\-H plan changes; all gates
       pass \(sweep/arm FORCE=1 during the nightly batch\).
   Movement: none
+- [x] **M0146\-0005q — SETOP\_SORTED for INTERSECT / EXCEPT** \(opened
+  2026\-09\-26 from the residual triage: TPC\-DS Q38 / Q87\).
+  Kind: impl
+  Parent: M0146\-0005
+  - **DONE 2026\-09\-26.** Design doc §"Slice 17"; evidence
+    `analysis/m0146/m0146\-0005/slice17/`.
+    - Executor `nextSorted` \(nodeSetOp.c sorted mode, all four commands;
+      checked against the hashed form\); planner candidate over presorted
+      arms with create\_setop\_path\'s cost and pathkeys; EXPLAIN `SetOp`.
+    - Q38 depth 2 → 3, Q87 depth 1 → 4 \(SF0.25\); SF1 and TPC\-H unchanged;
+      all gates pass.
+    - Ledgered: sorted arm over explicitly sorted inputs; INTERSECT
+      smaller\-input swap \(Q38\'s residue\); hashed\-arm hash\-memory rule.
+  Movement: TPC\-DS SF0.25 Q38 depth 2 → 3, Q87 depth 1 → 4
 - [ ] **The goopg TPC\-DS measurement clusters hold `char\(n\)` values stored
   unpadded by an older build** \(found 2026\-09\-25 by M0146\-0005d\):
   on a private clone of `data\-sf025` \(loaded 2026\-09\-16\), a stored
