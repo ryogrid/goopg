@@ -1,0 +1,21 @@
+## filter: none
+# forced hash
+  ->  Hash Join  (cost=7250.51..212338.14 rows=6029 width=8)
+        ->  Seq Scan on lineitem  (cost=0.00..189340.35 rows=5998835 width=14)
+# forced nl
+  ->  Nested Loop  (cost=0.43..31876.68 rows=6029 width=8)
+        ->  Index Scan using lineitem_part_supp_fkidx on lineitem  (cost=0.43..122.23 rows=30 width=14)
+## filter: and l_quantity < 5
+# forced hash
+  ->  Hash Join  (cost=7250.51..212886.57 rows=497 width=8)
+        ->  Seq Scan on lineitem  (cost=0.00..204337.44 rows=494704 width=14)
+# forced nl
+  ->  Nested Loop  (cost=0.43..31835.47 rows=497 width=8)
+        ->  Index Scan using lineitem_part_supp_fkidx on lineitem  (cost=0.43..122.31 rows=2 width=14)
+## filter: and l_quantity < (select 0.2 * avg(l_quantity) from lineitem l2 where l2.l_partkey = p_partkey)
+# forced hash
+  ->  Hash Join  (cost=7250.51..213575.53 rows=2010 width=8)
+        ->  Seq Scan on lineitem  (cost=0.00..189340.35 rows=5998835 width=19)
+# forced nl
+  ->  Nested Loop  (cost=0.43..778120.62 rows=2010 width=8)
+        ->  Index Scan using lineitem_part_supp_fkidx on lineitem  (cost=0.43..3835.09 rows=10 width=19)

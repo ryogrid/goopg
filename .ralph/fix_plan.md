@@ -21096,6 +21096,21 @@ M0146-0001 re-baseline census on the new default arm.
     - Next: Q17 / Q19 \(`join\-method`\), then the TPC\-DS records; re\-run
       the first\-divergence census on the slice\-2 capture first.
     Movement: yes — TPC-DS PLAN-PARITY match SF0.25 4 -> 7, SF1 6 -> 8
+  - **Slice 3 IN PROGRESS 2026\-09\-25 — diagnosis done, no code yet.**
+    Evidence `analysis/m0146/m0146\-0005/slice3/`; design doc §"Slice 3".
+    - TPC\-H at HEAD `28a4a715a`: match 5/22; remaining `join\-method` first
+      divergences are Q17 and Q19.
+    - Q17: goopg never prices a correlated SubPlan in a join qual
+      \(`qualEvalCost` charges a flat `cpu\_operator\_cost` per conjunct\), so
+      its nested loop, which runs the SubPlan about 5,940 times, looks cheap
+      \(31572\). PG charges 123.76 per call and wins with a hash join
+      \(212797\).
+    - PG\'s hash join charges the filter on only `outer\_matched` = 10,
+      because `part` is inner\-unique and `outer\_match\_frac` is the
+      inner\-join selectivity. goopg\'s `outerMatchFrac = joinrel.Rows /
+      outer.Rows` lacks the `/ inner.Rows`.
+    - Next: implement per the design doc §"Slice 3 / Planned change", then
+      fire set at both scales. Every filter containing a SubPlan reprices.
 - [ ] **M0146-0006 — Incremental Sort election** (impl; M0141-S7's
   resume, sequenced after M0146-0005 per the owner hold). The two filed
   resume points: S2b-9 (offer an Incremental Sort over the seed itself —

@@ -1,0 +1,19 @@
+=== Q17
+Aggregate  (cost=31571.87..31571.88 rows=1 width=32)
+  ->  Nested Loop  (cost=1008.53..31571.70 rows=68 width=1098)
+        Filter: (lineitem.l_quantity < (SubPlan 1))
+        SubPlan 1
+          ->  Aggregate  (cost=123.51..123.52 rows=1 width=32)
+                ->  Bitmap Heap Scan on lineitem_1  (cost=8.53..123.51 rows=29 width=550)
+                      Filter: (l_partkey = part.p_partkey)
+                      ->  Bitmap Index Scan on lineitem_part_supp_fkidx  (cost=0.38..8.53 rows=29 width=550)
+                            Index Cond: (l_partkey = part.p_partkey)
+        ->  Gather  (cost=1000.00..6079.60 rows=206 width=548)
+              Workers Planned: 2
+              ->  Parallel Seq Scan on part  (cost=0.00..5059.00 rows=86 width=548)
+                    Filter: ((p_brand = 'Brand#23') AND (p_container = 'MED BOX'))
+        ->  Bitmap Heap Scan on lineitem  (cost=8.53..123.44 rows=29 width=550)
+              Recheck Cond: (l_partkey = p_partkey)
+              ->  Bitmap Index Scan on lineitem_part_supp_fkidx  (cost=0.38..8.53 rows=29 width=550)
+                    Index Cond: (l_partkey = p_partkey)
+

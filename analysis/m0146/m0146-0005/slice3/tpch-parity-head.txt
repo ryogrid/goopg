@@ -1,0 +1,2 @@
+PLAN-PARITY: queries=22 match=5 shapediff=17 unparsed=0 missingnode=0 error=0 timeout=0
+CATEGORIES-EXCL-MATCH: join-order=15 join-method=7 scan-type=10 parameterisation=4 aggregation-strategy=4 sort-strategy=9 parallelism=12 qual-placement=6 rendering=2

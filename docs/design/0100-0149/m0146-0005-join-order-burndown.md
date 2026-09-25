@@ -147,6 +147,63 @@ sibling-path defect (hard-won rule 2).
 Movement: yes. TPC-DS PLAN-PARITY match 4 → 7 at SF0.25 (Q12, Q15, Q20) and
 6 → 8 at SF1 (Q7, Q91).
 
+## Slice 3 (in progress): Q17 — a correlated SubPlan filter is never priced
+
+Evidence: `analysis/m0146/m0146-0005/slice3/`. The measurements come from the
+private instrumented PG 18.3, with two temporary `debug_plan_candidates`-gated
+traces in `final_cost_hashjoin` and `approx_tuple_count`.
+
+### Finding
+
+TPC-H Q17 (`l_quantity < (SELECT 0.2 * avg(l_quantity) … WHERE l_partkey =
+p_partkey)`) is a join-method divergence. PG hash-joins a full `lineitem`
+seq scan (212797); goopg picks a nested loop with a parameterised bitmap
+probe (31572). Forcing each join method in PG with and without the filter:
+
+| join filter | hash join | nested loop |
+|---|---|---|
+| none | 212338 | 31877 |
+| the SubPlan | 213576 | 778121 |
+
+- **Per call:** PG prices the correlated SubPlan at `cost_subplan`'s per-call
+  cost. For an EXPR_SUBLINK that is the run cost plus the startup, because a
+  correlated subplan re-pays its startup: 123.76.
+- **Nested loop:** the filter runs on every probed inner row (30 per probe,
+  about 5,940 in total).
+- **Hash join:** `part` is inner-unique, so `final_cost_hashjoin` charges the
+  join filter on `outer_matched_rows` only: 10.
+  - `compute_semi_anti_join_factors` requests JOIN_SEMI but passes the
+    join's own `sjinfo`, whose `jointype` is JOIN_INNER, and `eqjoinsel`
+    switches on that. So `outer_match_frac` is the inner-join selectivity
+    of the restrict list: joinrel.rows / (outer.rows × inner.rows),
+    1/200000 × 1/3 here.
+  - `match_count` = nselec × inner.rows / jselec.
+
+goopg has neither piece:
+- `qualEvalCost` charges a flat `cpu_operator_cost` per join conjunct at all
+  eight join-qual sites, with no SubPlan term, so its nested loop never pays
+  for the 5,940 evaluations.
+- `hashJoinFinalCostInputFor` sets `outerMatchFrac = joinrel.Rows /
+  outer.Rows`, which lacks the `/ inner.Rows`, and `hashJoinCost` fixes
+  `match_count` at 1.
+
+### Planned change
+
+1. A `cost_qual_eval`-style per-conjunct cost: the existing
+   `cpu_operator_cost` plus `cost_subplan` for each SubPlan in the conjunct.
+   - Correlated: per-call = run + startup.
+   - Uncorrelated with a materialising root: startup once.
+   - EXISTS: run / rows.
+   - ANY / ALL: half the run plus half the rows × `cpu_operator_cost`.
+   It reads the SubPlan's planned `PlanCost`, and is used at the join-qual
+   sites (NL, hash, merge, parallel arms).
+2. The hash join charges its non-hash join quals on `hashjointuples`: the
+   inner-unique `outer_matched`, else approx_tuple_count. `outerMatchFrac`
+   and `matchCount` become PG's.
+
+This overlaps M0146-0013 (`cost_qual_eval` ordering), which will reuse the
+per-conjunct cost.
+
 ## Remaining records
 
 Per M0146-0001's `m0146-0001-ranked.txt`, still to be worked:

@@ -1,0 +1,1 @@
+HJCOST outer=5.99884e+06 inner=201 hashjointuples=10 qp_per_tuple=123.762 qp_startup=0 hash_per_tuple=0.0025 nrestrict=2
