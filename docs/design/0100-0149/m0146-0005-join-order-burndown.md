@@ -566,6 +566,21 @@ the index/Memoize and plain nested-loop producers. JOIN_UNIQUE_OUTER keeps
 its single outer. Q44's join tree is now exactly PG's, and nothing
 regresses in the census. Evidence: `analysis/m0146/m0146-0005/slice14/`.
 
+## Residual triage (2026-09-26)
+
+After slices 1–14 the remaining join-method/join-order records mostly have
+causes outside join search:
+- stale unpadded `char(n)` TPC-DS data plus the probe multiplier (Q79, Q55,
+  Q23, Q30);
+- sublink decorrelation (Q1, Q92);
+- aggregation strategy (Q65);
+- a PG cost tie (Q4, Q11);
+- set-op strategy (Q38, Q87);
+- CTE/upper structure (Q2, Q31, Q97).
+
+Q8 and Q14 are untraced. Evidence:
+`analysis/m0146/m0146-0005/residual-triage-20260926/`.
+
 ## Remaining records
 
 Per M0146-0001's `m0146-0001-ranked.txt`, still to be worked:

@@ -21063,6 +21063,16 @@ M0146-0001 re-baseline census on the new default arm.
   lateral census (M0146-0011's data).
   Kind: impl
   Parent: none
+  - **Residual triage 2026\-09\-26 \(HEAD `b57acc6cd`\).** Evidence
+    `analysis/m0146/m0146\-0005/residual\-triage\-20260926/`.
+    - Stale `char\(n\)` data \+ probe multiplier: Q79, Q55, Q23, Q30 \(Q55:
+      goopg\'s `item` is under `min\_parallel\_table\_scan\_size`, so no
+      item\-driven partial nested loop\).
+    - Sublink decorrelation \(PG keeps a SubPlan\): Q1, Q92.
+    - Aggregation strategy \(M0146\-0003\): Q65.
+    - A PG cost tie \(0.02\): Q4, Q11.
+    - Set\-op strategy: Q38, Q87. CTE/upper structure: Q2, Q31, Q97.
+    - Not yet traced: Q8, Q14 \(depth 7\).
   - **Slice 1 LANDED 2026\-09\-25 \(`23edfda2e`\).** Design doc
     `docs/design/0100\-0149/m0146\-0005\-join\-order\-burndown.md`;
     evidence `analysis/m0146/m0146\-0005/`.
@@ -21490,6 +21500,9 @@ M0146-0001 re-baseline census on the new default arm.
     `bench/tpcds/README.md`, then re\-run the sweep, the fire\-set baseline
     and M0146\-0001\'s census. Also check, read\-only, whether the TPC\-H
     goopg reference cluster holds unpadded `char\(n\)` values.
+  - More evidence 2026\-09\-26 \(M0146\-0005 residual triage\): Q55, Q23 and
+    Q30 also diverge on the smaller heaps; goopg\'s `item` \(~5.6 MB\) falls
+    under `min\_parallel\_table\_scan\_size`, so its parallel paths vanish.
   - TPC\-H checked read\-only 2026\-09\-25 \(M0146\-0005e loop\): the goopg
     TPC\-H cluster pads `char\(n\)` \(`l\_shipmode` reads back with
     `octet\_length` 10\), so only the TPC\-DS clusters are affected.

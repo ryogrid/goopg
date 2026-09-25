@@ -1,0 +1,17 @@
+Q1 depth=2 [join-method] under Sort: PG Nested Loop Inner | goopg Hash Join Inner
+Q11 depth=4 [join-order] under HashAggregate: PG Hash Join Inner | goopg Hash Join Inner
+Q14 depth=7 [join-order] under Nested Loop: PG Parallel Hash Join Inner | goopg Parallel Hash Join Inner
+Q2 depth=2 [join-order] under CTE: PG Finalize HashAggregate | goopg Append
+Q23 depth=4 [join-method] under Gather: PG Nested Loop Inner | goopg Hash Join Inner
+Q30 depth=5 [join-method] under Nested Loop: PG Nested Loop Inner | goopg Hash Join Inner
+Q31 depth=3 [join-order] under HashAggregate: PG Hash Join Inner | goopg Hash Join Inner
+Q38 depth=2 [join-order] under Aggregate: PG SetOp Intersect | goopg HashSetOp Intersect
+Q4 depth=4 [join-order] under HashAggregate: PG Hash Join Inner | goopg Hash Join Inner
+Q55 depth=6 [join-method] under Nested Loop: PG Nested Loop Inner | goopg Hash Join Inner
+Q65 depth=3 [join-method] under Nested Loop: PG Merge Join Inner | goopg Hash Join Inner
+Q79 depth=2 [join-method] under Sort: PG Nested Loop Inner | goopg Hash Join Inner
+Q8 depth=3 [join-method] under Sort: PG Nested Loop Inner | goopg Hash Join Inner
+Q8 depth=3 [join-order] under Sort: PG Hash Join Inner | goopg Hash Join Inner
+Q87 depth=1 [join-order] under Aggregate: PG SetOp Except | goopg HashSetOp Except
+Q92 depth=3 [join-method] under Aggregate: PG Nested Loop Inner | goopg Hash Join Inner
+Q97 depth=1 [join-order] under Limit: PG Aggregate | goopg CTE ssci
