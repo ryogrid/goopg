@@ -591,6 +591,13 @@ TPC-DS SF0.25 Q8 now plans PG's nested loops. SF1 Q8 diverges only because
 PG's SF1 `store` table has no statistics. Evidence:
 `analysis/m0146/m0146-0005/slice15/`.
 
+## Slice 16 (M0146-0005p): UNION keeps its whole input
+
+`generate_union_paths` takes a non-ALL UNION's group count as the whole
+input (the worst case), and `estimateSetOp` now does the same instead of
+halving. No TPC-DS or TPC-H plan changes. Evidence:
+`analysis/m0146/m0146-0005/slice16/`.
+
 ## Remaining records
 
 Per M0146-0001's `m0146-0001-ranked.txt`, still to be worked:

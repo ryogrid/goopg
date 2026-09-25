@@ -73,9 +73,10 @@ func TestEstimateRowsSetOpRules(t *testing.T) {
 		all  bool
 		want int64
 	}{
-		// prepunion.c: UNION's non-ALL dedup is still approximated /2.
+		// prepunion.c generate_union_paths: non-ALL UNION's group count is
+		// the whole input ("the worst case"), as for UNION ALL (M0146-0005p).
 		{"union all = l+r", parser.SetOpUnion, true, 1400},
-		{"union = (l+r)/2", parser.SetOpUnion, false, 700},
+		{"union = l+r", parser.SetOpUnion, false, 1400},
 		{"intersect all = min", parser.SetOpIntersect, true, 400},
 		// M0146-0005o, generate_nonunion_paths: the smaller arm's GROUPS for
 		// INTERSECT, the left arm's for EXCEPT. These fixture columns are

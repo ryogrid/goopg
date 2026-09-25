@@ -215,19 +215,10 @@ func filterSelectivity(f *Filter) float64 {
 	return sel
 }
 
-// estimateSetOp mirrors upstream's output-row rules
-// (prepunion.c:1146-1151): EXCEPT keeps the left input's count,
-// INTERSECT the smaller input's, UNION ALL the sum. For the
-// non-ALL forms upstream runs estimate_num_groups on the input
-// (prepunion.c `estimate_size`), and the dedup here is still
-// approximated as /2.
-//
-// M0127-P5.6-f-vii built that estimator — `estimateNumGroups`
-// below — but wiring it here needs the set-op's output columns
-// expressed as grouping expressions over EACH input, which this
-// node does not carry. Ledgered as `estimate-num-groups setop-dedup`
-// rather than folded in: the sweep that measures the aggregate
-// change must not also be measuring a set-op change.
+// estimateSetOp mirrors upstream's output-row rules (prepunion.c):
+// UNION, ALL or not, keeps the whole input (generate_union_paths' "worst
+// case" group count); INTERSECT and EXCEPT follow generate_nonunion_paths'
+// per-arm group counts (setOpArmGroups).
 func estimateSetOp(s *SetOp) int64 {
 	l := EstimateRows(s.Left)
 	r := EstimateRows(s.Right)
@@ -253,21 +244,10 @@ func estimateSetOp(s *SetOp) int64 {
 		}
 		return rg
 	}
-	var out int64
-	switch s.Op {
-	case parser.SetOpIntersect:
-		out = l
-		if r < out {
-			out = r
-		}
-	case parser.SetOpExcept:
-		out = l
-	default: // UNION
-		out = l + r
-	}
-	if !s.All {
-		out /= 2
-	}
+	// UNION: generate_union_paths takes "the number of distinct groups as
+	// equal to the total input size, i.e., the worst case" for the non-ALL
+	// form too (M0146-0005p; goopg used to halve it).
+	out := l + r
 	if out < 1 {
 		return 1
 	}
