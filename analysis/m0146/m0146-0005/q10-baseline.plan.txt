@@ -1,0 +1,22 @@
+=== Q10
+Sort  (cost=176342.67..176487.49 rows=57926 width=684)
+  Sort Key: (sum((l_extendedprice * (1 - l_discount)))) DESC
+  ->  HashAggregate  (cost=171180.91..171760.17 rows=57926 width=684)
+        Group Key: c_custkey, nation.n_name
+        ->  Gather  (cost=159422.26..170456.84 rows=57926 width=892)
+              Workers Planned: 2
+              ->  Hash Join  (cost=158422.26..163664.24 rows=24136 width=892)
+                    Hash Cond: (c_nationkey = nation.n_nationkey)
+                    ->  Parallel Hash Join  (cost=158420.70..163330.81 rows=24136 width=756)
+                          Hash Cond: (c_custkey = orders.o_custkey)
+                          ->  Parallel Seq Scan on customer  (cost=0.00..4200.00 rows=62500 width=624)
+                          ->  Nested Loop  (cost=0.38..158239.68 rows=14482 width=552)
+                                ->  Parallel Seq Scan on lineitem  (cost=0.00..134049.21 rows=374274 width=550)
+                                      Filter: (l_returnflag = 'R')
+                                ->  Memoize  (cost=0.38..0.56 rows=1 width=448)
+                                      Cache Key: l_orderkey
+                                      ->  Index Scan using orders_pk on orders  (cost=0.38..0.56 rows=1 width=448)
+                                            Index Cond: (o_orderkey = l_orderkey)
+                                            Filter: ((o_orderdate >= '1993-10-01'::date) AND (o_orderdate < '1994-01-01 00:00:00'::timestamp))
+                    ->  Seq Scan on nation  (cost=0.00..1.25 rows=25 width=490)
+

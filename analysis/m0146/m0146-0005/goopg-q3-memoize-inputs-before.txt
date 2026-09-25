@@ -1,0 +1,6 @@
+      2 ABMEMO calls=147854 nd=147854 def=false innerTotal=1.9945 tuples=7.91 estEntries=475628 hit=0.0000 total=2.0268
+      2 ABMEMO calls=1568425 nd=93573 def=false innerTotal=0.4359 tuples=1.00 estEntries=3195660 hit=0.9403 total=0.0410
+      3 ABMEMO calls=30150 nd=30150 def=false innerTotal=8.1133 tuples=7.86 estEntries=478633 hit=0.0000 total=8.1454
+      3 ABMEMO calls=3198286 nd=404086 def=false innerTotal=0.4692 tuples=1.00 estEntries=2485513 hit=0.8737 total=0.0743
+      4 ABMEMO calls=735593 nd=735593 def=false innerTotal=1.9945 tuples=7.91 estEntries=475628 hit=0.0000 total=2.0310
+      4 ABMEMO calls=735593 nd=93573 def=false innerTotal=0.4359 tuples=1.00 estEntries=3195660 hit=0.8728 total=0.0704

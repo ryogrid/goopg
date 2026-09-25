@@ -20748,6 +20748,22 @@ M0146-0001 re-baseline census on the new default arm.
   lateral census (M0146-0011's data).
   Kind: impl
   Parent: none
+  - **Slice 1 LANDED 2026\-09\-25 \(`23edfda2e`\).** Design doc
+    `docs/design/0100\-0149/m0146\-0005\-join\-order\-burndown.md`;
+    evidence `analysis/m0146/m0146\-0005/`.
+    - Mechanism: `getMemoizePath` priced the cache with the outer REL\'s rows;
+      PG uses `outer\_path\->rows` \(joinpath.c:812\-819\). A partial outer\'s
+      per\-worker cache looked 3\-4x more reused, so TPC\-H Q3\'s partial
+      Memoize nested loop \(37991\) undercut PG\'s Parallel Hash Join \(38260\);
+      PG prices that nested loop at ≥ 185294.
+    - TPC\-H: **Q3 and Q10 now match PG** \(match 3 → 5\); `join\-order`
+      17 → 15, `join\-method` 10 → 8, `parameterisation` 8 → 4.
+    - TPC\-DS: 52/37 plans change, parity unchanged, no timeouts; values
+      identical everywhere; EA\-RATCHET 52 → 52.
+    - Next: Q9 \(still a nested loop under Partial HashAggregate\), then
+      Q17/Q19 and the TPC\-DS records — re\-run the first\-divergence census
+      on each slice\'s capture first.
+    Movement: yes — TPC-H PLAN-PARITY match 3 -> 5 (Q3, Q10)
 - [ ] **M0146-0006 — Incremental Sort election** (impl; M0141-S7's
   resume, sequenced after M0146-0005 per the owner hold). The two filed
   resume points: S2b-9 (offer an Incremental Sort over the seed itself —
