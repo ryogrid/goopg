@@ -410,7 +410,7 @@ func rangeOpSelectivity(op parser.OpCode, left, right Expr, child Node) float64 
 		op = swapInequalityOp(op)
 	}
 	stats := columnStatsForChild(col.Index, child)
-	if sel, measured := rangeOpSelectivityStats(op, col, val, stats); measured {
+	if sel, measured := rangeOpSelectivityStats(op, col, val, stats, columnRawRowsForChild(col.Index, child)); measured {
 		return sel
 	}
 	return defaultIneqSelectivity
@@ -427,7 +427,7 @@ func rangeOpSelectivity(op parser.OpCode, left, right Expr, child Node) float64 
 // ok=false when the shape carries no measurement (no statistics, a
 // short histogram, or a non-constant) and the caller keeps its own
 // default.
-func rangeOpSelectivityStats(op parser.OpCode, col *ColumnRef, val Expr, stats *catalog.ColumnStats) (float64, bool) {
+func rangeOpSelectivityStats(op parser.OpCode, col *ColumnRef, val Expr, stats *catalog.ColumnStats, tuples float64) (float64, bool) {
 	// M0142-0009: a column whose distinct values all fit the MCV list
 	// (analyze.c's `nmultiple == ndistinct` case, `computeColumnStats`
 	// mirrors it at operators_analyze.go:1441) legitimately stores NO
@@ -469,7 +469,7 @@ func rangeOpSelectivityStats(op parser.OpCode, col *ColumnRef, val Expr, stats *
 	if nonMCVMass < 0 {
 		nonMCVMass = 0
 	}
-	histSel := histogramOpSelectivity(op, stats.Histogram, literal, col.Type.Name)
+	histSel := histogramOpSelectivity(op, stats.Histogram, literal, col.Type.Name, histogramEqSel(stats, tuples))
 	sel := mcvHits + histSel*nonMCVMass
 	if sel < 0 {
 		return 0, true
@@ -480,49 +480,88 @@ func rangeOpSelectivityStats(op parser.OpCode, col *ColumnRef, val Expr, stats *
 	return sel, true
 }
 
-// histogramOpSelectivity returns the fraction of the histogram's
-// mass (treated as 1.0 across the boundaries) that satisfies op
-// for the given literal. Boundaries are sorted ascending.
-func histogramOpSelectivity(op parser.OpCode, bounds []string, literal, typeName string) float64 {
+// histogramOpSelectivity is PG's ineq_histogram_selectivity
+// (postgres/src/backend/utils/adt/selfuncs.c) over a sorted histogram: the
+// fraction of the histogram's mass satisfying `x <op> literal`. eqSel is the
+// function's eq_selec, the selectivity of `x = literal` among the non-MCV
+// values (histogramEqSel).
+//
+// PG first estimates `x <= literal` (histfrac): the bin holding the literal
+// is found by counting the bounds that satisfy the probe (`bound < literal`
+// for `<`/`>=`, `bound <= literal` for `<=`/`>`), and the literal's place
+// inside it is interpolated. The first bin is narrower than the rest by
+// eq_selec, so it is rescaled to make `x <= first bound` come out as eq_selec;
+// `<` and `>=` then subtract eq_selec, and `>`/`>=` flip the result. Without
+// the eq_selec step goopg scored `>=` like `>` and `<=` like `<`: TPC-DS's
+// `d_year BETWEEN 1999 AND 2001` lost two eq_selec (705 rows where PG
+// estimates 1049; M0146-0005s).
+//
+// Not ported: the cutoff clamp to a hundredth of the histogram resolution
+// and get_actual_variable_range's endpoint refresh.
+func histogramOpSelectivity(op parser.OpCode, bounds []string, literal, typeName string, eqSel float64) float64 {
 	k := len(bounds) - 1 // bucket count
 	if k < 1 {
 		return defaultIneqSelectivity
 	}
-	// Find the first boundary >= literal.
-	idx := -1
-	for i, b := range bounds {
-		if histCmp(b, literal, typeName) >= 0 {
-			idx = i
-			break
-		}
-	}
+	var isgt, iseq bool
 	switch op {
-	case parser.OpLt, parser.OpLe:
-		if idx <= 0 {
-			// literal <= bounds[0]: nothing to the left.
-			if idx == 0 && op == parser.OpLe && histCmp(bounds[0], literal, typeName) == 0 {
-				// literal == low boundary; <= keeps a sliver of
-				// the first bucket. Approximate as 1/k.
-				return 1.0 / float64(k)
-			}
-			return 0.0
-		}
-		if idx == -1 {
-			// literal greater than every boundary.
-			return 1.0
-		}
-		whole := float64(idx-1) / float64(k)
-		frac := bucketFraction(bounds[idx-1], bounds[idx], literal, typeName)
-		return whole + frac/float64(k)
-	case parser.OpGt, parser.OpGe:
-		// Symmetric: 1 - sel(<) for >=, 1 - sel(<=) for >.
-		flip := parser.OpLe
-		if op == parser.OpGe {
-			flip = parser.OpLt
-		}
-		return 1.0 - histogramOpSelectivity(flip, bounds, literal, typeName)
+	case parser.OpLt:
+	case parser.OpLe:
+		iseq = true
+	case parser.OpGt:
+		isgt = true
+	case parser.OpGe:
+		isgt, iseq = true, true
+	default:
+		return defaultIneqSelectivity
 	}
-	return defaultIneqSelectivity
+	strict := isgt == iseq // `<` and `>=` probe with `bound < literal`
+	lobound := 0
+	for _, b := range bounds {
+		c := histCmp(b, literal, typeName)
+		if c < 0 || (c == 0 && !strict) {
+			lobound++
+			continue
+		}
+		break
+	}
+	var histfrac float64
+	switch {
+	case lobound == 0:
+		histfrac = 0
+	case lobound > k:
+		histfrac = 1
+	default:
+		i := lobound
+		binfrac := bucketFraction(bounds[i-1], bounds[i], literal, typeName)
+		histfrac = (float64(i-1) + binfrac) / float64(k)
+		if i == 1 {
+			histfrac += eqSel * (1.0 - binfrac)
+		}
+		if strict {
+			histfrac -= eqSel
+		}
+		histfrac = clampSelectivity(histfrac)
+	}
+	if isgt {
+		return 1.0 - histfrac
+	}
+	return histfrac
+}
+
+// histogramEqSel is ineq_histogram_selectivity's eq_selec: every non-MCV
+// distinct value is assumed equally common, 1/(ndistinct - #MCV), and 0 when
+// that count is not above 1. `tuples` resolves a relative ndistinct; with 0
+// only the absolute form is used.
+func histogramEqSel(stats *catalog.ColumnStats, tuples float64) float64 {
+	if stats == nil {
+		return 0
+	}
+	other := stats.ResolvedNDistinct(tuples) - float64(len(stats.MCV))
+	if other > 1 {
+		return 1.0 / other
+	}
+	return 0
 }
 
 // bucketFraction returns the fraction of a single histogram

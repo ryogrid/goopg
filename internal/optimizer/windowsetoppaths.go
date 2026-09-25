@@ -675,21 +675,35 @@ func addSetOpPaths(setOpRel *RelOptInfo, lseed, rseed *Path, setOpNode *SetOp, c
 // same total the hashed arm has, so over presorted inputs it wins add_path on
 // startup and carries the ordering as pathkeys (M0146-0005q).
 //
+// When an arm's elected plan is a hashed DISTINCT, PG's arm rel still holds
+// the sort-based Unique path (add_path keeps it for its pathkeys), and
+// generate_nonunion_paths takes that cheapest presorted path
+// (get_cheapest_path_for_pathkeys) for the sorted SetOp. goopg's DISTINCT
+// rel elects one plan, so sortedSetOpArm rebuilds the Unique alternative
+// with the same arithmetic. The sorted SetOp then ties the hashed one
+// fuzzily on total and dominates it on startup and pathkeys, as in PG:
+// TPC-DS Q38/Q87's first arm elects HashAggregate once the arm's date range
+// is estimated PG's way (M0146-0005s), and PG still plans SetOp over Unique.
+//
 // Not ported (ledgered): PG also offers the sorted arm over an explicitly
-// Sorted cheapest input (or the input rel's cheapest presorted path); that
-// candidate only wins under a LIMIT's fractional election.
+// Sorted cheapest input when the arm has no presorted path; that candidate
+// only wins under a LIMIT's fractional election.
 func addSortedSetOpPath(setOpRel *RelOptInfo, lseed, rseed *Path, setOpNode *SetOp, cp costParams) {
 	if setOpNode.Op != parser.SetOpIntersect && setOpNode.Op != parser.SetOpExcept {
 		return
 	}
-	if !setOpArmSortedAllCols(setOpNode.Left) || !setOpArmSortedAllCols(setOpNode.Right) {
+	left, lpath := sortedSetOpArm(setOpRel, setOpNode.Left, lseed, cp)
+	right, rpath := sortedSetOpArm(setOpRel, setOpNode.Right, rseed, cp)
+	if lpath == nil || rpath == nil {
 		return
 	}
-	keys := distinctAllColKeys(setOpNode.Left)
+	lseed, rseed = lpath, rpath
+	keys := distinctAllColKeys(left)
 	if len(keys) == 0 {
 		return
 	}
 	sorted := *setOpNode
+	sorted.Left, sorted.Right = left, right
 	sorted.MergeKeys = keys
 	numCols := float64(setOpRel.NCols)
 	startup := lseed.Cost.Startup + rseed.Cost.Startup
@@ -704,6 +718,31 @@ func addSortedSetOpPath(setOpRel *RelOptInfo, lseed, rseed *Path, setOpNode *Set
 		Pathkeys:      pathkeysForSortKeys(keys),
 		Children:      []*Path{lseed, rseed},
 	}, setOpSortedProducer)
+}
+
+// sortedSetOpArm returns the arm a sorted SetOp reads and its seed path: the
+// arm itself when its plan is already sorted on every output column, or,
+// for a hashed DISTINCT arm, the Sort + Unique candidate distinctCandidates
+// prices over the same input (createDistinctPaths' seed, rebuilt). nil when
+// the arm has no sorted form.
+func sortedSetOpArm(setOpRel *RelOptInfo, arm Node, seed *Path, cp costParams) (Node, *Path) {
+	if setOpArmSortedAllCols(arm) {
+		return arm, seed
+	}
+	d, ok := arm.(*Distinct)
+	if !ok || d.Child == nil {
+		return nil, nil
+	}
+	distinctRel := &RelOptInfo{}
+	sizeDistinctRelFromNode(distinctRel, d)
+	child := seedPathForNode(distinctRel, d.Child)
+	child.Rows = math.Max(0, float64(EstimateRows(d.Child)))
+	_, unique := distinctCandidates(distinctRel, child, d, d.Child, cp, PlannerSettings{EnableHashAgg: true})
+	node, _ := createPlanNode(unique)
+	if node == nil || !setOpArmSortedAllCols(node) {
+		return nil, nil
+	}
+	return node, seedPathForNode(setOpRel, node)
 }
 
 // setOpArmSortedAllCols reports whether a set-operation arm's finished plan

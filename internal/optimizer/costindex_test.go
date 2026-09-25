@@ -428,11 +428,12 @@ func TestEstimateIndexGeometryPartialScalesTuples(t *testing.T) {
 		return &catalog.Index{Name: "t_id_prtl", Columns: []string{"id"}, HasPredicate: true, Predicate: pe}
 	}
 
-	// Histogram [1..500], id<200 -> 0.4: 1000 heap rows become 400 index rows.
+	// Histogram [1..500], id<200 -> 0.4 less eq_selec 1/500 = 0.398: 1000
+	// heap rows become 398 index rows.
 	tbl := statsTable()
 	_, tuples, _ := estimateIndexGeometry(mkPartial(t, tbl), tbl, 1000)
-	if tuples != 400 {
-		t.Errorf("partial index tuples = %v, want 400 (1000 x 0.4)", tuples)
+	if tuples != 398 {
+		t.Errorf("partial index tuples = %v, want 398 (1000 x 0.398)", tuples)
 	}
 
 	// Non-partial index on the same shape keeps the heap count.

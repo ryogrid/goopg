@@ -584,7 +584,7 @@ func (s *searchCtx) orRangeSelectivity(bo *BinaryOp) (float64, bool) {
 		return defaultUnhandledClauseSel, true
 	}
 	stats := columnStatsByName(s.relInfos[i].table, col.Name)
-	if sel, measured := rangeOpSelectivityStats(op, col, val, stats); measured {
+	if sel, measured := rangeOpSelectivityStats(op, col, val, stats, float64(s.relInfos[i].baseRows)); measured {
 		return sel, false
 	}
 	return defaultUnhandledClauseSel, true
@@ -640,7 +640,7 @@ func (s *searchCtx) orInListSelectivity(e *InExpr) (float64, bool) {
 			s2 = eqSelectivityForColumn(stats, elem, tuples)
 		} else {
 			var measured bool
-			if s2, measured = rangeOpSelectivityStats(e.AnyOp, cr, elem, stats); !measured {
+			if s2, measured = rangeOpSelectivityStats(e.AnyOp, cr, elem, stats, tuples); !measured {
 				return decline()
 			}
 		}
@@ -1104,5 +1104,5 @@ func fractionAtMost(cs *catalog.ColumnStats, bound, typeName string) float64 {
 		// numeric column. Refuse rather than guess.
 		return 1
 	}
-	return histogramOpSelectivity(parser.OpLe, cs.Histogram, bound, typeName)
+	return histogramOpSelectivity(parser.OpLe, cs.Histogram, bound, typeName, histogramEqSel(cs, 0))
 }

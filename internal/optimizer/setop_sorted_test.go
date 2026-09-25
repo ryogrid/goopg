@@ -74,3 +74,33 @@ func TestSetOpArmSortedShapes(t *testing.T) {
 		t.Fatal("a hashed INTERSECT arm is unordered")
 	}
 }
+
+// TestSortedSetOpArmRebuildsUnique pins M0146-0005s: a hashed DISTINCT arm
+// still offers the sorted SetOp its Sort + Unique form (PG's arm rel keeps
+// that path for its pathkeys), a presorted arm is used as is, and an arm with
+// no DISTINCT has no sorted form.
+func TestSortedSetOpArmRebuildsUnique(t *testing.T) {
+	cp := defaultCostParams()
+	rel := newRelOptInfo(0, 50, 16)
+	in := upperOrderedInput(1000)
+	hashed := &Distinct{Child: in, schema: in.Output()}
+	node, p := sortedSetOpArm(rel, hashed, &Path{Kind: PathPrebuilt, Rows: 100}, cp)
+	on, ok := node.(*DistinctOn)
+	if !ok || p == nil {
+		t.Fatalf("hashed arm: got %T, want the rebuilt Unique", node)
+	}
+	if _, isSort := on.Child.(*Sort); !isSort || !setOpArmSortedAllCols(on) {
+		t.Fatalf("rebuilt arm is not a Unique over an all-column Sort: child %T", on.Child)
+	}
+	if p.Cost.Startup <= 0 || p.Cost.Total < p.Cost.Startup {
+		t.Fatalf("rebuilt arm carries no Sort cost: %+v", p.Cost)
+	}
+	sorted := sortedDistinctArm(100, false)
+	seed := &Path{Kind: PathPrebuilt, Rows: 100}
+	if n, sp := sortedSetOpArm(rel, sorted, seed, cp); n != Node(sorted) || sp != seed {
+		t.Fatal("a presorted arm must be used as is")
+	}
+	if n, sp := sortedSetOpArm(rel, in, seed, cp); n != nil || sp != nil {
+		t.Fatal("an arm without DISTINCT has no sorted form")
+	}
+}

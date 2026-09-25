@@ -1,0 +1,18 @@
+date_dim (SF0.25, 73049 rows), EXPLAIN row estimates. PG 18.3 = private
+instrumented PG (own ANALYZE sample); goopg = private clone of data-sf025.
+
+clause                               PG 18.3   goopg HEAD   goopg 0005s
+d_year >= 1999                        36809      37003        37366
+d_year <= 2001                        37289      36751        36751
+d_year > 1999                         36449      37003        37003
+d_year < 2001                         36928      36751        36387
+d_year between 1999 and 2001           1049        705         1069   (actual 1096)
+d_year >= 1999 and d_year < 2002       1033       1058         1058
+
+web_sales JOIN date_dim d3 ON ws_sold_date_sk = d_date_sk AND d3.d_year BETWEEN 1999 AND 2001
+(serial): PG 2584 rows, goopg HEAD 1737, goopg 0005s 2633 (actual 107668).
+
+HEAD scored `>=` like `>` and `<` like `<=`: ineq_histogram_selectivity's
+eq_selec = 1/(ndistinct - #MCV) step was missing. The two samples differ, so
+equal estimates are not expected; what matches now is the arithmetic
+(PG: >= minus > = 360 rows = eq_selec x non-MCV mass x rows).

@@ -512,7 +512,7 @@ func TestConvertStringToScalar(t *testing.T) {
 // of 3/10 + (20/26)/10 ≈ 0.3769 — not the 0.35 the flat 0.5 gave.
 func TestStringHistogramInterpolatesAcrossTenBounds(t *testing.T) {
 	bounds := []string{"a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k"}
-	got := histogramOpSelectivity(parser.OpLt, bounds, "du", "text")
+	got := histogramOpSelectivity(parser.OpLt, bounds, "du", "text", 0)
 	want := 0.3 + (20.0/26.0)/10.0
 	if math.Abs(got-want) > 1e-9 {
 		t.Errorf("10-bound text histogram selectivity = %.6f, want %.6f", got, want)
@@ -612,7 +612,7 @@ func TestRangeOpSelectivityUsesMCVWithoutHistogram(t *testing.T) {
 	scan := mcvCompleteScan(t)
 	col := mcvBound(parser.OpGe, 4).(*BinaryOp).Left.(*ColumnRef)
 
-	sel, measured := rangeOpSelectivityStats(parser.OpGe, col, &IntegerConst{Value: 4}, columnStatsByName(scan.Table, "moy"))
+	sel, measured := rangeOpSelectivityStats(parser.OpGe, col, &IntegerConst{Value: 4}, columnStatsByName(scan.Table, "moy"), 0)
 	if !measured {
 		t.Fatal("MCV-complete stats (no histogram) were reported as unmeasured; the clause falls back to the 1/3 default")
 	}

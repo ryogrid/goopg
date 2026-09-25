@@ -614,6 +614,24 @@ Q38 now diverges at depth 3 (was 2) and Q87 at depth 4 (was 1). PG's
 INTERSECT smaller-input swap is the next Q38 residue. Evidence:
 `analysis/m0146/m0146-0005/slice17/`.
 
+## Slice 18 (M0146-0005s): range estimates take PG's eq_selec
+
+goopg scored `x >= c` like `x > c` and `x < c` like `x <= c`. PG's
+ineq_histogram_selectivity estimates `x <= c` from the histogram,
+rescales the first bin, and subtracts eq_selec = 1/(ndistinct - #MCV) for
+`<` and `>=`. Without that step `d_year BETWEEN 1999 AND 2001` lost one
+eq_selec: 705 rows against PG's 1049 (actual 1096). The low estimate
+flipped Q14's INTERSECT swap (0005r, not landed) the wrong way.
+`histogramOpSelectivity` now follows PG; the estimate is 1069 rows.
+
+The better estimate moved Q38/Q87's first DISTINCT arm across add_path's
+1% fuzz, from Sort + Unique to HashAggregate, and both queries lost
+slice 17's sorted SetOp. PG keeps the Unique path on the arm rel for its
+pathkeys and uses it for the sorted SetOp. `sortedSetOpArm` rebuilds it
+for a hashed DISTINCT arm. The SF0.25 census is identical to HEAD. At SF1
+Q38 (depth 2 to 3) and Q87 (depth 1 to 4) now plan PG's sorted SetOp.
+Evidence: `analysis/m0146/m0146-0005/slice18/`.
+
 ## Remaining records
 
 Per M0146-0001's `m0146-0001-ranked.txt`, still to be worked:

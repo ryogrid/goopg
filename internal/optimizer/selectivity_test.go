@@ -80,7 +80,8 @@ func TestSelectivityEqualityFallsThroughMCV(t *testing.T) {
 
 // TestSelectivityRangeUsesHistogram: a numeric column with
 // boundaries [1, 100, 200, 300, 400, 500] (5 buckets) and `id <
-// 200` should land at bucket 2 / 5 = 0.4. With no MCV, the whole
+// 200` should land at bucket 2 / 5 = 0.4, less PG's eq_selec (1/500) for
+// `<` (ineq_histogram_selectivity, M0146-0005s). With no MCV, the whole
 // non-MCV mass = 1 and the histogram drives the answer.
 func TestSelectivityRangeUsesHistogram(t *testing.T) {
 	tbl := makeStatsTable(&catalog.TableStats{
@@ -98,8 +99,8 @@ func TestSelectivityRangeUsesHistogram(t *testing.T) {
 		Right: &IntegerConst{Value: 200},
 	}
 	got := clauseSelectivity(pred, scan)
-	if math.Abs(got-0.4) > 1e-9 {
-		t.Errorf("clauseSelectivity(id<200)=%v want 0.4", got)
+	if want := 0.4 - 1.0/500; math.Abs(got-want) > 1e-9 {
+		t.Errorf("clauseSelectivity(id<200)=%v want %v", got, want)
 	}
 }
 
@@ -134,7 +135,7 @@ func TestSelectivityAndProductRule(t *testing.T) {
 		},
 	}
 	got := clauseSelectivity(pred, scan)
-	want := 0.8 * 0.4
+	want := 0.8 * (0.4 - 1.0/500)
 	if math.Abs(got-want) > 1e-9 {
 		t.Errorf("clauseSelectivity(F AND <200)=%v want %v", got, want)
 	}

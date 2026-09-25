@@ -1,0 +1,5 @@
+tpch-spotcheck: Q13 PASS — rows=33 (expected 33)
+tpch-spotcheck: RESULT=PASS
+SUMMARY: 24 MATCH
+VERDICT: PASS — every label matched on values, not merely on row count
+TPC-H first-divergence census: identical to slice 17 (tmp census diff empty)
