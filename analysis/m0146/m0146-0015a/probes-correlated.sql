@@ -1,0 +1,12 @@
+select sum(x) from (select (select count(*) from tenk1 d where a.thousand = d.thousand) x from tenk1 a) s;
+select sum(x) from (select (select count(*) from tenk1 d where d.thousand > a.thousand) x from tenk1 a where a.unique1 < 50) s;
+select count(*) from tenk1 a where exists (select 1 from tenk1 c where c.hundred = a.hundred and c.unique1 = a.unique1 + 1);
+select (select count(*) from tenk1 d where d.thousand > a.thousand) from tenk1 a where a.unique1 < 3 order by 1;
+select sum((select count(*) from tenk1 d, tenk1 e where d.unique1 = e.unique2 and d.thousand = a.thousand)) from tenk1 a where a.unique1 < 20;
+select sum((select count(e.unique1) from tenk1 d left join tenk1 e on e.unique1 = d.unique2 and e.hundred = a.hundred where d.thousand = a.thousand)) from tenk1 a where a.unique1 < 20;
+select sum((select count(*) from tenk1 d where d.unique1 = i8.k)) from i8;
+select sum((select count(*) from tenk1 d where d.unique1 = i8.v)) from i8;
+select count(*) from tenk1 a where a.unique1 < 30 and exists (select 1 from tenk1 b where b.thousand = a.thousand and exists (select 1 from tenk1 c where c.unique2 = a.unique2 and c.hundred = b.hundred));
+select count(*) from tenk1 a where a.unique1 < 30 and not exists (select 1 from tenk1 b where b.unique1 = a.unique2);
+select sum((select max(d.unique2) from tenk1 d where d.thousand = a.thousand and d.ten = a.ten)) from tenk1 a where a.unique1 < 40;
+select sum((select count(*) from tenk1 d where d.hundred = a.hundred and d.thousand between a.thousand and a.thousand + 100)) from tenk1 a where a.unique1 < 40;

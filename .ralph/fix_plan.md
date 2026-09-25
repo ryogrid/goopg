@@ -20879,7 +20879,7 @@ M0146-0001 re-baseline census on the new default arm.
     - Pre\-existing and separate: neither build pulls the sublinks up into
       joins as PG does → M0146\-0015b.
   Movement: none
-- [ ] **M0146\-0015a — index keys from correlated outer references \(cutover
+- [x] **M0146\-0015a — index keys from correlated outer references \(cutover
   regression\)** \(filed 2026\-09\-25 by M0146\-0015\): at HEAD a correlated
   SubPlan never uses its outer reference as an index key, so `where
   d.thousand = a.thousand` inside a subquery becomes a Filter over a full
@@ -20904,6 +20904,76 @@ M0146-0001 re-baseline census on the new default arm.
     none on the parity instruments; it restores a regress case.
   - **Rank:** a descendant of an item\-2a task, so it inherits item 2a
     \(OWNER DECISIONS 2026\-09\-25\).
+  - **DONE 2026\-09\-25 \(`5dd5144e1`\).** Design doc
+    `docs/design/0100\-0149/m0146\-0015a\-correlated\-outer\-ref\-index\-keys.md`;
+    evidence `analysis/m0146/m0146\-0015a/`.
+    - One\-relation scopes make the correlated qual a base restriction;
+      the index producers take `OuterColumnRef` / `ExecParamRef` keys
+      \(same type only, priced with `var\_eq\_non\_const`\).
+    - Multi\-relation scopes keep the old placement: sinking the qual under
+      the body\'s join hid it from the post\-planning EXISTS→ANY pass \(TPC\-DS
+      Q35 timed out in a draft\). Ledgered.
+    - Fixed with it: the nested pull\-up rebase \(hop counting; nested
+      emitting refs decline → M0146\-0015c\), the unnest collectors lifting
+      from a semi RHS \(wrong rows in a draft\), the Q17/Q20 bypass hand\-off,
+      and bitmap SubPlan rescans.
+    - Regress `subselect` query: ~197 s standalone \(pre\-flip level, from
+      >1 h\); the `subselect` file completes in 11.9 s. PG\'s 4 ms needs
+      M0146\-0015b.
+    - Gates: units, tpch\-spotcheck, acceptance arm, SF0.25 96 PASS / 0
+      timeouts, fire set PASS \(Q6 cost\-only\), full `TestPort\_RegressSuite`
+      PASS.
+  Movement: none
+- [ ] **M0146\-0015c — pull up a nested EXISTS body that references the
+  emitting scope** \(filed 2026\-09\-25 by M0146\-0015a\): `rebasePulledQual`
+  now declines a nested body whose qual reads the grandparent statement
+  \(e.g. `a … EXISTS \(b … EXISTS \(c WHERE c.x = a.y AND c.z = b.w\)\)`\),
+  because the search cannot place the resulting join clause between `a` and
+  a rel inside the nested semi join\'s RHS: `createPlan` panicked re\-basing
+  it \("join clause references binding column … not among the output
+  columns"\). PG plans it.
+  Kind: impl
+  Parent: M0146\-0015
+  - First step: see how PG\'s `pull\_up\_sublinks\_qual\_recurse` leaves such
+    a qual \(it joins across the nested semi join; `join\_is\_legal` /
+    `SpecialJoinInfo.min\_righthand` widen\), then teach goopg\'s special\-join
+    bookkeeping the same widening before lifting the decline
+    \(`noteRebaseFail\("nested\-body\-emitting\-ref"\)`\).
+  - Rank: per M0146\-0015\'s placement a pre\-existing capability gap keeps
+    normal M0146 order.
+- [ ] **WRONG RESULTS: an index created with an explicit opclass returns
+  wrong rows after a clean restart** \(found 2026\-09\-25 by M0146\-0015a\):
+  `CREATE INDEX t1_a ON t1 USING btree \(a int4_ops\)`, clean stop, start —
+  `SELECT count\(\*\) FROM t1 WHERE a < 50` returns 0 \(49 before the
+  restart\); the same index without the opclass is correct; a heavier
+  cluster also returned garbage `min\(\)` values \(-2147483520\). Reproduces
+  on `b4154eddf`, before this loop\'s changes. Repro
+  `analysis/m0146/m0146\-0015a/opclass\-restart\-repro.sh`.
+  Kind: bug
+  Parent: none
+  - First step: compare the index\'s catalog entry \(opclass / key codec\)
+    before and after the restart — the catalog reload probably resolves the
+    explicit opclass to a different key encoding than the one the index was
+    built with.
+
+  > ## ESCALATION 2026\-09\-25 \(S2\) — explicit\-opclass indexes return wrong rows after restart
+  >
+  > Any user index declared with an explicit opclass \(the regress suite\'s
+  > `tenk1` indexes are\) silently returns wrong rows once the server
+  > restarts. Filed and not selected ahead of the banner, per S2; the owner
+  > decides its placement.
+
+- [ ] **An outer reference in a LEFT JOIN ON clause errors `column … does
+  not exist`** \(found 2026\-09\-25 by M0146\-0015a; reproduces at HEAD\):
+  `select sum\(\(select count\(e.unique1\) from tenk1 d left join tenk1 e on
+  e.unique1 = d.unique2 and e.hundred = a.hundred where d.thousand =
+  a.thousand\)\) from tenk1 a where a.unique1 < 20` → `ERROR: column
+  "hundred" does not exist`; PG returns 2.
+  Kind: bug
+  Parent: none
+  - First step: find which resolver scope the ON clause of a join inside a
+    correlated subquery binds against; the outer\-level fallback appears to
+    skip the parent scope for ON quals.
 
   > ## ESCALATION 2026\-09\-25 \(S2\) — cutover regression: correlated subqueries lose index keys
   >

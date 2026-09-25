@@ -1,0 +1,2 @@
+    --- SKIP: TestPort_RegressSuite/subselect (11.87s)
+ok  	github.com/goopg/goopg/internal/testport	286.482s
