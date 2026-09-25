@@ -558,6 +558,12 @@ func pqSpillFixture(t *testing.T) (*Context, func()) {
 	if err := runDDL(t, ctx, "INSERT INTO ps_fact VALUES "+sb.String()); err != nil {
 		fail(err, "insert fact")
 	}
+	// What ANALYZE would record (M0146-0005c): 3000 dimension rows with a
+	// near-unique key (15 NULLs), 2000 fact rows whose fk takes ~1960
+	// distinct values. Without them the shared hash build under test is
+	// priced at PG's default 0.1 bucket and never planned.
+	setFixtureStats(t, ctx, "ps_dim", 3000, map[string]int64{"dk": 2985})
+	setFixtureStats(t, ctx, "ps_fact", 2000, map[string]int64{"fid": 2000, "fk": 1960})
 	return ctx, cleanup
 }
 

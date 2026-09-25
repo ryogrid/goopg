@@ -68,6 +68,10 @@ func spillFixtureWidth(t *testing.T, probeRows, buildRows, distinct, padBytes in
 	}
 	fill("sp_probe", probeRows)
 	fill("sp_build", buildRows)
+	// What ANALYZE would record (M0146-0005c): without a measured key the
+	// hash join these tests exercise is priced at PG's default 0.1 bucket.
+	setFixtureStats(t, ctx, "sp_probe", int64(probeRows), map[string]int64{"k": int64(distinct)})
+	setFixtureStats(t, ctx, "sp_build", int64(buildRows), map[string]int64{"k": int64(distinct)})
 	return ctx
 }
 

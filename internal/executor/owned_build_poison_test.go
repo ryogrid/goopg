@@ -283,7 +283,33 @@ func obpMkTable(t *testing.T, c catalog.Catalog, name string, rows int64, cols .
 	if err != nil {
 		t.Fatal(err)
 	}
-	c.SetTableStats(tbl, &catalog.TableStats{RowCount: rows, Pages: int(rows / 100), Analyzed: true})
+	c.SetTableStats(tbl, &catalog.TableStats{RowCount: rows, Pages: int(rows / 100), Analyzed: true,
+		Columns: obpKeyStats(cols, rows)})
+}
+
+// obpKeyNDistinct is the TPC-H SF1 key cardinality these fixtures' ANALYZE
+// would record. Without measured join keys every hash key is a
+// default-ndistinct key, which PG prices at a 0.1 bucket
+// (estimate_hash_bucket_stats, M0146-0005c) — and the hash builds under test
+// would not be planned.
+var obpKeyNDistinct = map[string]int64{
+	"p_partkey": 200_000, "s_suppkey": 10_000, "o_orderkey": 1_500_000, "n_nationkey": 25,
+	"l_partkey": 200_000, "l_suppkey": 10_000, "l_orderkey": 1_500_000,
+	"ps_partkey": 200_000, "ps_suppkey": 10_000, "s_nationkey": 25, "o_custkey": 100_000,
+}
+
+// obpKeyStats builds a table's column statistics: the TPC-H keys above, and
+// a unique `k` (the synthetic fixtures' join key).
+func obpKeyStats(cols []string, rows int64) []catalog.ColumnStats {
+	out := make([]catalog.ColumnStats, len(cols))
+	for i, cn := range cols {
+		if nd, ok := obpKeyNDistinct[cn]; ok {
+			out[i] = catalog.ColumnStats{NDistinct: nd}
+		} else if cn == "k" {
+			out[i] = catalog.ColumnStats{NDistinct: rows}
+		}
+	}
+	return out
 }
 
 // obpWidePair is a two-table wide-schema fixture: SELECT * needs every
@@ -337,7 +363,8 @@ func obpQ9Catalog(t *testing.T) catalog.Catalog {
 		if err != nil {
 			t.Fatal(err)
 		}
-		c.SetTableStats(tbl, &catalog.TableStats{RowCount: rows[name], Pages: int(rows[name] / 100), Analyzed: true})
+		c.SetTableStats(tbl, &catalog.TableStats{RowCount: rows[name], Pages: int(rows[name] / 100), Analyzed: true,
+			Columns: obpKeyStats(cols, rows[name])})
 	}
 	mk("part", "p_partkey", "p_name", "p_mfgr", "p_brand", "p_type", "p_size", "p_container", "p_retailprice", "p_comment")
 	mk("supplier", "s_suppkey", "s_name", "s_address", "s_nationkey", "s_phone", "s_acctbal", "s_comment")
@@ -532,7 +559,11 @@ func TestOwnedBuildPoisonNarrowedWidths(t *testing.T) {
 		if !ok {
 			t.Fatalf("table %s not in catalog", name)
 		}
-		ctx.Catalog.SetTableStats(tbl, &catalog.TableStats{RowCount: 400_000, Pages: 4000, Analyzed: true})
+		// k measured as unique (M0146-0005c): an unmeasured join key is
+		// priced at PG's default 0.1 hash bucket and the build is not planned.
+		ks := make([]catalog.ColumnStats, len(tbl.Columns))
+		ks[0] = catalog.ColumnStats{NDistinct: 400_000}
+		ctx.Catalog.SetTableStats(tbl, &catalog.TableStats{RowCount: 400_000, Pages: 4000, Analyzed: true, Columns: ks})
 	}
 	const liveSQL = `SELECT b.a, s.x FROM obp_big b, obp_small s WHERE b.k = s.k ORDER BY b.a`
 	plan, err := testPlanDeform(t, ctx, liveSQL)

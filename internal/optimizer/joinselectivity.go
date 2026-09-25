@@ -916,11 +916,15 @@ func (s *searchCtx) mergeJoinTuples(joinrelRows float64, residual []*restrictInf
 // cost the same — the degeneracy `reselectDegenerateHashKeys` was written to
 // work around (Q78's collapsed bucket, M0125-0035b).
 //
-// Returns 0 when no operand resolves to a statistic. 0 means "no information"
-// and the caller must skip the term entirely rather than substitute a guess:
-// inventing a bucket size without stats would move plans on nothing, which is
-// the failure this bundle keeps recording.
+// Returns 0 only when no hash clause has an inner-side operand. A key
+// without statistics is NOT skipped: like PG it gets the default ndistinct
+// and the 0.1 bucket (M0146-0005 slice 5).
 func (s *searchCtx) estimateHashBucketSize(clauses []*restrictInfo, innerRelids RelSet) float64 {
+	// No search context (a hand-built unit-test pair) has no planner state
+	// to examine a key against: report "no information", as before.
+	if s == nil {
+		return 0
+	}
 	// PG takes the SMALLEST bucketsize over the hash clauses: "we use the
 	// smallest bucketsize estimated for any individual hashclause", because the
 	// most selective key is the one that spreads the table.
@@ -939,9 +943,15 @@ func (s *searchCtx) estimateHashBucketSize(clauses []*restrictInfo, innerRelids 
 			continue
 		}
 		v := s.examineJoinVar(key, relids)
-		if v.stats == nil && !v.isBool {
-			continue
-		}
+		// M0146-0005 slice 5: no `continue` for a key without statistics.
+		// PG's estimate_hash_bucket_stats calls get_variable_numdistinct for
+		// every hash key; a stats-less key (a derived relation's GROUP BY
+		// output, an expression) comes back isdefault on a relation of 200+
+		// rows and takes the Max(0.1, mcv_freq) arm below — ten entries per
+		// bucket. Skipping it priced TPC-DS Q79's hash of a 1131-row
+		// aggregated subquery with no bucket walk at all (goopg 22509 vs
+		// PG's 37599 for the same join), so the hash join beat PG's
+		// nested loop into customer_pkey.
 		// `mcv_freq`: the first MCV entry is the most common value
 		// (ColumnStats.MCV is stored Frequency-desc, catalog.go:1809).
 		mcvFreq := 0.0

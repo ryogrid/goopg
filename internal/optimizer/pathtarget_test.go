@@ -1193,6 +1193,14 @@ func TestSlice3WitnessModelArithmetic(t *testing.T) {
 // slice3Q9Catalog builds the six TPC-H relations at realistic widths with
 // analyzed stats (no indexes — the live Q9 baseline is all seq scans), so
 // the 6-way comma join plans as hash joins the derivation can narrow.
+// slice3Q9KeyNDistinct is the TPC-H SF1 key cardinality the Q9 fixture's
+// ANALYZE would record.
+var slice3Q9KeyNDistinct = map[string]int64{
+	"p_partkey": 200_000, "s_suppkey": 10_000, "o_orderkey": 1_500_000, "n_nationkey": 25,
+	"l_partkey": 200_000, "l_suppkey": 10_000, "l_orderkey": 1_500_000,
+	"ps_partkey": 200_000, "ps_suppkey": 10_000, "s_nationkey": 25, "o_custkey": 100_000,
+}
+
 func slice3Q9Catalog(t *testing.T) catalog.Catalog {
 	t.Helper()
 	c := catalog.NewInMemory()
@@ -1215,7 +1223,17 @@ func slice3Q9Catalog(t *testing.T) catalog.Catalog {
 		if err != nil {
 			t.Fatal(err)
 		}
-		c.SetTableStats(tbl, &catalog.TableStats{RowCount: rows[name], Pages: int(rows[name] / 100), Analyzed: true})
+		// Key columns carry what ANALYZE would measure: a primary key is
+		// distinct per row, a foreign key has its parent's row count. Without
+		// them every hash key is a default-ndistinct key, which PG prices at a
+		// 0.1 bucket (estimate_hash_bucket_stats, M0146-0005 slice 5).
+		colStats := make([]catalog.ColumnStats, len(cols))
+		for i, cn := range cols {
+			if nd, ok := slice3Q9KeyNDistinct[cn]; ok {
+				colStats[i] = catalog.ColumnStats{NDistinct: nd}
+			}
+		}
+		c.SetTableStats(tbl, &catalog.TableStats{RowCount: rows[name], Pages: int(rows[name] / 100), Analyzed: true, Columns: colStats})
 	}
 	mk("part", "p_partkey", "p_name", "p_mfgr", "p_brand", "p_type", "p_size", "p_container", "p_retailprice", "p_comment")
 	mk("supplier", "s_suppkey", "s_name", "s_address", "s_nationkey", "s_phone", "s_acctbal", "s_comment")
