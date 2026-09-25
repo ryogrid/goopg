@@ -527,6 +527,16 @@ also covers analysed nested-loop joins it cannot measure (ledgered). Four
 TPC-DS plans change, with no timeouts and no shallower record, and TPC-H
 is unchanged. Evidence: `analysis/m0146/m0146-0005/slice11/`.
 
+## Slice 12 (M0146-0005l): nested loops keep the outer's ordering
+
+goopg's nested-loop paths carried no pathkeys, so an ordered outer (Q44's
+rank merge join) lost its order at the loop. Under ORDER BY … LIMIT, the
+fractional election had to pay a Sort for any nested loop. The three
+nested-loop producers now set `buildJoinPathkeys(jt, outer.Pathkeys)`, as
+PG's `match_unsorted_outer` does. The top join of Q31 and Q44 is now a
+Nested Loop as in PG, and Q65 diverges deeper. The next gap, trying every
+outer path, is M0146-0005m. Evidence: `analysis/m0146/m0146-0005/slice12/`.
+
 ## Remaining records
 
 Per M0146-0001's `m0146-0001-ranked.txt`, still to be worked:

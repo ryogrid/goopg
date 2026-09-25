@@ -21400,6 +21400,31 @@ M0146-0001 re-baseline census on the new default arm.
     - 4 TPC\-DS plans change, no timeouts, no shallower census record;
       TPC\-H unchanged. All gates pass.
   Movement: TPC\-DS SF1 Q44 depth\-1 record sort\-strategy → parameterisation
+- [x] **M0146\-0005l — nested\-loop paths inherit the outer path\'s ordering**
+  \(opened 2026\-09\-26 from the census: TPC\-DS Q44 top join\).
+  Kind: impl
+  Parent: M0146\-0005
+  - **DONE 2026\-09\-26.** Design doc §"Slice 12"; evidence
+    `analysis/m0146/m0146\-0005/slice12/`.
+    - The plain, index/Memoize and partial nested\-loop producers now set
+      `buildJoinPathkeys\(jt, outer.Pathkeys\)` \(match\_unsorted\_outer\);
+      before, every nested loop reported no ordering.
+    - The top join of Q31 and Q44 is now a Nested Loop as in PG; Q65 diverges
+      deeper at SF1; nothing got shallower. Q4\'s CTE\-join order changed
+      \(6.7 s → 10.2 s, under 2x; census unchanged\).
+  Movement: TPC\-DS Q31/Q44 top join now PG\'s method; SF1 Q65 depth 2 → 3
+- [ ] **M0146\-0005m — nested loops try every outer path**
+  \(filed 2026\-09\-26 by M0146\-0005l\): `match\_unsorted\_outer`
+  \(joinpath.c\) loops over every path in `outerrel\->pathlist` \(plus the
+  cheapest\-startup one\) when building nested loops; goopg\'s producers use
+  only `outer.CheapestTotal`. So Q44\'s all\-nested\-loop path over the ordered
+  rank merge join is never built, and its lower `item` join stays hashed.
+  Kind: impl
+  Parent: M0146\-0005
+  - First step: in `addNLIPaths` / `addNestLoopPath` iterate the outer rel\'s
+    unparameterised pathlist \(PG skips parameterised outers that the inner
+    cannot satisfy\), measure the path\-count and planning\-time cost on the
+    fire set, then land with the usual gates.
 - [ ] **The goopg TPC\-DS measurement clusters hold `char\(n\)` values stored
   unpadded by an older build** \(found 2026\-09\-25 by M0146\-0005d\):
   on a private clone of `data\-sf025` \(loaded 2026\-09\-16\), a stored

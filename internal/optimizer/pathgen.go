@@ -212,6 +212,10 @@ func addNestLoopPath(joinRel, outer, inner *RelOptInfo, cp costParams, jt parser
 		OuterRelids: outer.Relids,
 		InnerRelids: inner.Relids,
 		Residual:    quals,
+		// match_unsorted_outer (joinpath.c): a nested loop streams its outer
+		// row by row, so it delivers build_join_pathkeys of the outer path's
+		// ordering (M0146-0005l).
+		Pathkeys: buildJoinPathkeys(jt, o.Pathkeys),
 		// A nested loop DISCHARGES an inner parameterised by the outer, so
 		// this is a subtraction, not a union (pathnode.c:2592).
 		RequiredOuter: calcNestloopRequiredOuter(outer.Relids, o.RequiredOuter, inner.Relids, i.RequiredOuter),
