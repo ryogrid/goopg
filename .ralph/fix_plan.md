@@ -20874,13 +20874,22 @@ M0146-0001 re-baseline census on the new default arm.
       all gates pass.
   Movement: TPC\-H Q16 Parallel Hash Join over the filtered partsupp scan; TPC\-DS Q6 parallelism → sort\-strategy
 
-- [ ] **M0146\-0002g — EXPLAIN renders a hashed SubPlan as PG does**:
+- [x] **M0146\-0002g — EXPLAIN renders a hashed SubPlan as PG does**:
   `NOT \(ANY \(x = \(hashed SubPlan N\).col1\)\)` instead of
   `NOT \(x = ANY \(SubPlan N\)\)` \(the SubPlan arm of `get\_rule\_expr`,
   `ruleutils.c`\); execution is already hashed.
   Kind: impl
   Parent: M0146-0002d
   - Expected movement: Q16 `rendering`.
+  - **DONE 2026\-09\-26.** Design doc
+    `docs/design/0100\-0149/m0146\-0002g\-hashed\-subplan\-explain.md`;
+    evidence `analysis/m0146/m0146\-0002g/`.
+    - `formatSubPlanInExprPG` prints `\(ANY \(x = \(hashed SubPlan N\).col1\)\)`;
+      `subPlanUsesHashTable` is subplan\_is\_hashable for the shapes the
+      executor hashes, against the session\'s hash\_mem.
+    - TPC\-H Q16 filter byte\-identical to PG; TPC\-DS Q45 SF1 MATCH; all
+      gates pass.
+  Movement: TPC\-DS Q45 SF1 first divergence → MATCH; parameterisation 32 → 31 \(SF0.25\), 45 → 44 \(SF1\)
 
 - [x] **M0146\-0015 — upstream regress `subselect` hangs: a nested
   EXISTS / NOT EXISTS over `tenk1` runs for more than an hour** \(found

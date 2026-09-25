@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/executor/hashsize"
 	"github.com/goopg/goopg/internal/optimizer"
 	"github.com/goopg/goopg/internal/parser"
 )
@@ -120,7 +121,7 @@ func (o *explainOp) Open(ctx *Context) error {
 			return nil
 		}
 		var b strings.Builder
-		walkPlanAnalyze(&b, o.plan.Child, 0, &o.rows, opts, stats, ctx.SubPlanStats, ctx.MemoizeStats, ctx.HashJoinStats, ctx.GatherLaunched, ctx.GatherWorkerStats, ctx.SortStats, ctx.SortWorkerStats)
+		walkPlanAnalyze(&b, o.plan.Child, 0, &o.rows, opts, stats, ctx.SubPlanStats, ctx.MemoizeStats, ctx.HashJoinStats, ctx.GatherLaunched, ctx.GatherWorkerStats, ctx.SortStats, ctx.SortWorkerStats, explainHashMem(ctx))
 		appendExplainSettingsRow(ctx, opts, &o.rows)
 		if summary {
 			o.rows = append(o.rows,
@@ -150,7 +151,7 @@ func (o *explainOp) Open(ctx *Context) error {
 		return nil
 	}
 	var b strings.Builder
-	walkPlan(&b, o.plan.Child, 0, &o.rows, opts)
+	walkPlan(&b, o.plan.Child, 0, &o.rows, opts, explainHashMem(ctx))
 	appendExplainSettingsRow(ctx, opts, &o.rows)
 	return nil
 }
@@ -432,8 +433,8 @@ func (o *explainOp) Close() error { return nil }
 // `(rows=N)` is only appended when opts.Costs is true (the PG
 // default). `EXPLAIN (COSTS OFF) ...` therefore renders bare
 // node labels, matching upstream `COSTS OFF` output.
-func walkPlan(b *strings.Builder, n optimizer.Node, depth int, rows *[]Row, opts parser.ExplainOptions) {
-	walkPlanFiltered(n, depth, rows, opts, nil, nil, &subPlanReg{rel: newExplainNames(n), cte: collectCTEHoist(n)})
+func walkPlan(b *strings.Builder, n optimizer.Node, depth int, rows *[]Row, opts parser.ExplainOptions, hashMem int64) {
+	walkPlanFiltered(n, depth, rows, opts, nil, nil, &subPlanReg{rel: newExplainNames(n), cte: collectCTEHoist(n), hashMemLimit: hashMem})
 }
 
 // walkPlanFiltered is the inner driver for walkPlan. attachedFilter
@@ -1951,6 +1952,10 @@ type subPlanReg struct {
 	// first (explainNames.columnIn), the way PG deparses a Var against the
 	// node's own children. Set by both walkers for each node; nil outside.
 	current optimizer.Node
+	// hashMemLimit is the session's hash_mem in bytes (work_mem *
+	// hash_mem_multiplier), which decides whether a SubPlan renders as
+	// `hashed` (subPlanUsesHashTable). 0 means unknown: the defaults.
+	hashMemLimit int64
 	// cte holds the CTE bodies lifted out of their reference sites for this
 	// render, so a multiply-referenced CTE prints once as a `CTE <name>`
 	// section instead of once per reference (M0125-0049). Shared with the
@@ -2513,15 +2518,70 @@ func formatExprQual(e optimizer.Expr, reg *subPlanReg, qualify bool) string {
 	return fmt.Sprintf("<%T>", e)
 }
 
-// formatInExprPG renders an InExpr — either a sublink form
-// (`x = ANY (SubPlan N)`) or a literal in-list (`x = ANY (...)`).
-//
-// Divergence from upstream: PG renders an ANY sublink as
-// `(ANY (<testexpr>))`, where the testexpr's PARAM_EXEC
-// references (`$0`) stand in for the subplan's output. goopg has
-// no param slots yet, so the operand and the SubPlan reference are
-// rendered side by side instead; this converges on PG's form when
-// D4.1 lands param slots.
+// formatSubPlanInExprPG renders an ANY / ALL sublink as get_rule_expr's
+// T_SubPlan arm does: `(ANY <testexpr>)`, whose PARAM_EXEC references to
+// the subplan's output print as `(SubPlan N).colK` — `(hashed SubPlan N)`
+// when the subplan uses a hash table (get_parameter →
+// find_param_generator, ruleutils.c). A row operand compares column by
+// column, ANDed, as the testexpr does. NOT IN is the boolean NOT above it.
+// M0146-0002g.
+func formatSubPlanInExprPG(x *optimizer.InExpr, reg *subPlanReg, qualify bool, operand, op, quant string) string {
+	ref := subPlanName(reg, x, x.Plan)
+	if subPlanUsesHashTable(x, reg) {
+		ref = "hashed " + ref
+	}
+	var test string
+	if row, isRow := x.Operand.(*optimizer.RowExpr); isRow && len(row.Elems) > 1 {
+		parts := make([]string, len(row.Elems))
+		for i, el := range row.Elems {
+			parts[i] = fmt.Sprintf("(%s %s (%s).col%d)", formatExprQual(el, reg, qualify), op, ref, i+1)
+		}
+		test = "(" + strings.Join(parts, " AND ") + ")"
+	} else {
+		test = fmt.Sprintf("(%s %s (%s).col1)", operand, op, ref)
+	}
+	s := "(" + quant + " " + test + ")"
+	if x.Negated {
+		return "(NOT " + s + ")"
+	}
+	return s
+}
+
+// subPlanUsesHashTable is subplan_is_hashable (subselect.c) for the shapes
+// goopg's executor hashes (evalInHashProbe): an uncorrelated ANY sublink
+// over a single operand with plain equality, whose estimated result —
+// rows × (MAXALIGN(width) + MAXALIGN(SizeofHeapTupleHeader)) — fits in
+// hash_mem. PG never hashes an ALL sublink.
+func subPlanUsesHashTable(x *optimizer.InExpr, reg *subPlanReg) bool {
+	if x == nil || x.Plan == nil || !x.IsNonCorrelated || x.AllOp || x.NotEqualAny ||
+		(x.AnyOp != 0 && x.AnyOp != parser.OpEq) || !hashedSubPlanEnabled() {
+		return false
+	}
+	if row, isRow := x.Operand.(*optimizer.RowExpr); isRow && len(row.Elems) > 1 {
+		return false
+	}
+	rows, _, _, width := explainCostFields(x.Plan, optimizer.EstimateRows(x.Plan))
+	maxAlign := func(n int) int { return (n + 7) &^ 7 }
+	size := float64(rows) * float64(maxAlign(width)+maxAlign(23))
+	limit := hashsize.HashMemLimit(0, 0)
+	if reg != nil && reg.hashMemLimit > 0 {
+		limit = reg.hashMemLimit
+	}
+	return size <= float64(limit)
+}
+
+// explainHashMem is the session's hash_mem in bytes, the limit
+// subPlanUsesHashTable compares against.
+func explainHashMem(ctx *Context) int64 {
+	if ctx == nil {
+		return 0
+	}
+	return hashsize.HashMemLimit(ctx.WorkMem, ctxHashMemMultiplier(ctx))
+}
+
+// formatInExprPG renders an InExpr — a sublink form through
+// formatSubPlanInExprPG (`(ANY (x = (SubPlan N).col1))`, PG's T_SubPlan
+// deparse) or a literal in-list (`x = ANY (...)`).
 func formatInExprPG(x *optimizer.InExpr, reg *subPlanReg, qualify bool) string {
 	operand := formatExprQual(x.Operand, reg, qualify)
 
@@ -2540,10 +2600,11 @@ func formatInExprPG(x *optimizer.InExpr, reg *subPlanReg, qualify bool) string {
 		quant = "ALL"
 	}
 
-	var rhs string
 	if x.Plan != nil {
-		rhs = subPlanName(reg, x, x.Plan)
-	} else {
+		return formatSubPlanInExprPG(x, reg, qualify, operand, op, quant)
+	}
+	var rhs string
+	{
 		parts := make([]string, len(x.List))
 		for i, v := range x.List {
 			parts[i] = formatExprQual(v, reg, qualify)
@@ -2578,8 +2639,8 @@ func schemaColumnNames(n optimizer.Node) []string {
 // `(actual time=startup..total rows=R loops=L)` suffix pulled
 // from the instrumentation table. Loops > 0 means the operator
 // ran at least once. Total time is in milliseconds.
-func walkPlanAnalyze(b *strings.Builder, n optimizer.Node, depth int, rows *[]Row, opts parser.ExplainOptions, stats nodeStatsTable, spStats map[optimizer.Expr]*SubPlanSiteStats, memoStats map[*optimizer.Memoize]*MemoizeStats, hashStats map[*optimizer.Join]*HashJoinStats, gatherLaunched gatherLaunchedTable, workerStats workerNodeStatsTable, sortStats map[*optimizer.Sort]SortStat, sortWorkers map[*optimizer.Sort][]SortStat) {
-	reg := &subPlanReg{rel: newExplainNames(n), cte: collectCTEHoist(n)}
+func walkPlanAnalyze(b *strings.Builder, n optimizer.Node, depth int, rows *[]Row, opts parser.ExplainOptions, stats nodeStatsTable, spStats map[optimizer.Expr]*SubPlanSiteStats, memoStats map[*optimizer.Memoize]*MemoizeStats, hashStats map[*optimizer.Join]*HashJoinStats, gatherLaunched gatherLaunchedTable, workerStats workerNodeStatsTable, sortStats map[*optimizer.Sort]SortStat, sortWorkers map[*optimizer.Sort][]SortStat, hashMem int64) {
+	reg := &subPlanReg{rel: newExplainNames(n), cte: collectCTEHoist(n), hashMemLimit: hashMem}
 	reg.sortStats, reg.sortWorkers = sortStats, sortWorkers
 	walkPlanAnalyzeFiltered(n, depth, rows, opts, stats, spStats, memoStats, hashStats, gatherLaunched, workerStats, nil, nil, 0, reg)
 }

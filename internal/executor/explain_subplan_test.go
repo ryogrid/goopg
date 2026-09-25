@@ -165,12 +165,25 @@ func TestFormatInExprSubPlanForms(t *testing.T) {
 		{
 			name: "in subquery",
 			expr: &optimizer.InExpr{Operand: operand, Plan: inner},
-			want: "(b = ANY (SubPlan 1))",
+			want: "(ANY (b = (SubPlan 1).col1))",
 		},
 		{
 			name: "not in subquery",
 			expr: &optimizer.InExpr{Operand: operand, Plan: inner, Negated: true},
-			want: "(NOT (b = ANY (SubPlan 1)))",
+			want: "(NOT (ANY (b = (SubPlan 1).col1)))",
+		},
+		// M0146-0002g: an uncorrelated plain-equality ANY sublink whose
+		// result fits hash_mem is PG's hashed SubPlan (TPC-H Q16's
+		// `NOT (ANY (ps_suppkey = (hashed SubPlan 1).col1))`).
+		{
+			name: "hashed not in subquery",
+			expr: &optimizer.InExpr{Operand: operand, Plan: inner, Negated: true, IsNonCorrelated: true},
+			want: "(NOT (ANY (b = (hashed SubPlan 1).col1)))",
+		},
+		{
+			name: "ALL sublink is never hashed",
+			expr: &optimizer.InExpr{Operand: operand, Plan: inner, AllOp: true, AnyOp: parser.OpLt, IsNonCorrelated: true},
+			want: "(ALL (b < (SubPlan 1).col1))",
 		},
 		{
 			name: "literal list",
