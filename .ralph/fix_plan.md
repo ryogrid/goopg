@@ -21151,7 +21151,7 @@ M0146-0001 re-baseline census on the new default arm.
       It makes TPC\-DS Q47 time out \(310 s\): a nested loop over `CTE Scan`
       with a 1\-row inner merge join, costed as cached, where PG
       merge\-joins over `Materialize`.
-- [ ] **M0146\-0005a — goopg elects a cached\-inner nested loop over CTE
+- [x] **M0146\-0005a — goopg elects a cached\-inner nested loop over CTE
   scans where PG merge\-joins \(TPC\-DS Q47\)** \(filed 2026\-09\-25 by
   M0146\-0005 slice 5\): with stats\-less hash keys given PG\'s 0.1 bucket, Q47\'s
   `v1 / v1\_lag / v1\_lead` CTE self\-join elects `Nested Loop \(CTE Scan
@@ -21166,6 +21166,31 @@ M0146-0001 re-baseline census on the new default arm.
     goopg\'s DPPATH on the patched build. Is the nested loop offered by PG
     and priced higher \(its cost\_rescan of a MergeJoin inner / Materialize
     path\), or not offered?
+  - **RECON DONE 2026\-09\-25.** Evidence `analysis/m0146/m0146\-0005/slice5/`.
+    - PG\'s winner for the three\-CTE joinrel is a Merge Join at 0..369
+      with no Sort: PG\'s `set\_cte\_pathlist` converts the CTE plan\'s
+      pathkeys \(`convert\_subquery\_pathkeys`\) onto the CTE scan path, so
+      the scans arrive ordered by the window\'s keys. No nested loop is ever
+      added; every alternative dies at `add\_path\_precheck` at 378 or more.
+    - goopg\'s CTE scans carry no pathkeys, so its merge join must sort and
+      the cached\-inner nested loop \(856\) wins. Filed M0146\-0005b.
+  Movement: none
+- [ ] **M0146\-0005b — CTE scans carry the CTE plan\'s output pathkeys, as
+  PG\'s `set\_cte\_pathlist` gives them** \(filed 2026\-09\-25 by
+  M0146\-0005a\): PG converts the CTE subplan\'s pathkeys into the outer query
+  \(`convert\_subquery\_pathkeys`, allpaths.c `set\_cte\_pathlist`\), so TPC\-DS
+  Q47\'s `v1` self\-join merge\-joins its CTE scans without sorting.
+  goopg\'s CTE scan paths have no pathkeys. This blocks
+  `slice5/default\-hash\-bucket.wip.patch` \(Q47 timeout\) and with it the
+  Q79/Q1/Q55 "PG nested loop, goopg hash join" family.
+  Kind: impl
+  Parent: M0146\-0005
+  - First step: find where goopg builds the CTE\-scan leaf path
+    \(`*CTEScan` leaves in the search, `cte\_leaves\_reach\_search\_wrapped`\),
+    derive the CTE body\'s output ordering \(its top Sort / WindowAgg /
+    ordered aggregate\) in the CTE\'s output columns, and set it as the
+    leaf path\'s `Pathkeys`. Then re\-apply the slice\-5 patch and re\-run the
+    fire set; Q47 must not time out.
 - [ ] **M0146-0006 — Incremental Sort election** (impl; M0141-S7's
   resume, sequenced after M0146-0005 per the owner hold). The two filed
   resume points: S2b-9 (offer an Incremental Sort over the seed itself —

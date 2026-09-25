@@ -45,3 +45,18 @@ is not PG's. The nested loop's cost for an unparameterised inner
 (`nestLoopInnerRescanCost`: build plus cpu_operator_cost per row per rescan)
 assumes goopg's executor cache. This is filed as M0146-0005a and must land
 first.
+
+## M0146-0005a recon (same day): why PG does not take the nested loop
+
+On the private instrumented PG (`q47-pg-private.explain.txt`,
+`pg-q47-cte-joinrel-plancand.txt`), the three-CTE joinrel's winner is a
+**Merge Join at 0..369 with no Sort** under it. The CTE scans are already
+ordered, because PG's `set_cte_pathlist` (allpaths.c) converts the CTE
+plan's pathkeys (`convert_subquery_pathkeys`) and gives them to the CTE scan
+path, a PG 17+ behaviour. Every other candidate for that joinrel dies at
+`add_path_precheck` at 378 or more; no nested loop is ever added.
+
+goopg's CTE scans carry no pathkeys, so its merge join must sort. The
+cached-inner nested loop (856) wins once the hash join pays PG's
+default-bucket walk. The prerequisite is therefore CTE-scan pathkeys, filed
+as M0146-0005b.
