@@ -21425,6 +21425,31 @@ M0146-0001 re-baseline census on the new default arm.
     unparameterised pathlist \(PG skips parameterised outers that the inner
     cannot satisfy\), measure the path\-count and planning\-time cost on the
     fire set, then land with the usual gates.
+  - **ATTEMPT 2026\-09\-26 — not landed.** Evidence and patch
+    `analysis/m0146/m0146\-0005/recon\-0005m/`.
+    - Q44 plans exactly as PG, and the gates pass \(96/96, −4.2 % total\),
+      but the census regresses: SF0.25 Q13 depth 4 → 1, Q48 depth 2 → 1, SF1
+      Q91 loses its MATCH. Merge joins appear where PG has nested loops.
+    - Cause: goopg\'s `buildJoinPathkeys` does not
+      `truncate\_useless\_pathkeys` \(PG\'s `build\_join\_pathkeys` does\), so
+      every outer ordering becomes a separately kept path. Blocked on
+      M0146\-0005n.
+- [ ] **M0146\-0005n — `build\_join\_pathkeys` truncates useless pathkeys**
+  \(filed 2026\-09\-26 by M0146\-0005m\): PG\'s `build\_join\_pathkeys`
+  returns `truncate\_useless\_pathkeys\(root, joinrel, outer\_pathkeys\)`
+  \(pathkeys.c\): a join path keeps its outer\'s ordering only as far as a
+  later merge join \(`pathkeys\_useful\_for\_merging`: an equijoin clause
+  linking the joinrel to a rel outside it\) or the query\'s ORDER BY
+  \(`pathkeys\_useful\_for\_ordering`\) can use it. goopg returns the
+  outer\'s keys whole, for merge and nested\-loop joins alike.
+  Kind: impl
+  Parent: M0146\-0005
+  - First step: give `buildJoinPathkeys` the search context and joinrel;
+    compute the merge\-useful prefix from the equijoin clauses crossing the
+    joinrel boundary \(syntactic ColumnRef match, as
+    `mergeableColumnExprsFor` does for index paths\) and the ORDER BY prefix
+    from `s.queryPathkeys`; truncate to the longer. Then re\-apply the
+    M0146\-0005m patch and re\-measure its census.
 - [ ] **The goopg TPC\-DS measurement clusters hold `char\(n\)` values stored
   unpadded by an older build** \(found 2026\-09\-25 by M0146\-0005d\):
   on a private clone of `data\-sf025` \(loaded 2026\-09\-16\), a stored

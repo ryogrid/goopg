@@ -537,6 +537,16 @@ PG's `match_unsorted_outer` does. The top join of Q31 and Q44 is now a
 Nested Loop as in PG, and Q65 diverges deeper. The next gap, trying every
 outer path, is M0146-0005m. Evidence: `analysis/m0146/m0146-0005/slice12/`.
 
+## M0146-0005m attempt (not landed): nested loops over every outer path
+
+Building nested loops over every outer path, as `match_unsorted_outer`
+does, gives Q44 PG's exact plan. But it regresses Q13, Q48 and SF1 Q91 in
+the census: kept ordered paths flood the top joinrels and merge joins win
+where PG loops. PG's `build_join_pathkeys` truncates useless pathkeys
+(`truncate_useless_pathkeys`); goopg's does not. That port is filed as
+M0146-0005n and blocks re-applying the patch. Evidence:
+`analysis/m0146/m0146-0005/recon-0005m/`.
+
 ## Remaining records
 
 Per M0146-0001's `m0146-0001-ranked.txt`, still to be worked:
