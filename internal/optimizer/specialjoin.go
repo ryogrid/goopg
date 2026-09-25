@@ -40,6 +40,19 @@ type SpecialJoinInfo struct {
 	SemiCanHash  bool        // true if semi_operators are all hash
 	SemiOperators []uint32   // OIDs of equality join operators
 	SemiRhsExprs  []Expr     // righthand-side expressions of these ops
+
+	// SemiRhsProblemSpace marks SemiRhsExprs written in the join problem's
+	// column space (a pulled sublink body, jointreepullup.go) rather than in
+	// the RHS node's own output (the legacy unnest's atomic RHS).
+	// createUniquePath maps them through the RHS rel's baseOffset.
+	SemiRhsProblemSpace bool
+	// SemiRhsDistinct records that the RHS is a pulled ANY_subquery whose
+	// sub-select `query_is_distinct_for` its one output column
+	// (M0145-0008ab). PG asks that of the rel's subquery RTE inside
+	// create_unique_path (postgres/src/backend/optimizer/util/
+	// pathnode.c:1955-1975); goopg's rel carries no parse tree, so the
+	// pull-up answers it and records it here.
+	SemiRhsDistinct bool
 }
 
 // makeSpecialJoinInfo builds a SpecialJoinInfo for an outer/semi/anti join

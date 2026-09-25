@@ -1167,6 +1167,12 @@ var builtinSRFNames = map[string]bool{
 // parse_func.c:2500-2680) at the specific call sites goopg rejects them for
 // (currently LIMIT/OFFSET only — M0134-0180; the other seven contexts named
 // there are deferred, see the deferral ledger).
+// ExprHasSRF is exprHasSRF for callers outside the analyzer: the planner's
+// port of PG's `query->hasTargetSRFs` test in `query_is_distinct_for`
+// (postgres/src/backend/optimizer/plan/analyzejoins.c) asks it of a
+// sub-select's target list (M0145-0008ab).
+func ExprHasSRF(e parser.Expr, cat catalog.Catalog) bool { return exprHasSRF(e, cat) }
+
 func exprHasSRF(e parser.Expr, cat catalog.Catalog) bool {
 	switch x := e.(type) {
 	case *parser.BinaryOp:

@@ -299,6 +299,32 @@ func addPathsToJoinrel(s *searchCtx, joinrel, outer, inner *RelOptInfo, clauses 
 	if !legal {
 		return nil
 	}
+	if err := addPathsForJointype(s, joinrel, outer, inner, clauses, cp, sjinfo, jt, uniq); err != nil {
+		return err
+	}
+	// M0145-0008ab: PG's JOIN_SEMI arm of populate_joinrel_with_paths
+	// (postgres/src/backend/optimizer/path/joinrels.c:991-1014) does not
+	// stop at the plain SEMI paths. When the inner rel IS the semijoin's RHS
+	// and create_unique_path can unique-ify it, it also adds the
+	// JOIN_UNIQUE_INNER paths — a regular inner join over the unique-ified
+	// RHS — for the same direction. (Its JOIN_UNIQUE_OUTER twin is the swapped
+	// direction, which jointypeForDirection's fallback already admits.)
+	// Before this, goopg offered the unique-ified inner only when the plain
+	// SEMI direction was illegal, so a free NOOP unique path — the derived
+	// ANY_subquery's — could never compete with the semi join it replaces.
+	if jt == parser.JoinSemi && uniq == uniqueSideNone && sjinfo != nil &&
+		sjinfo.SynRighthand == inner.Relids &&
+		createUniquePath(inner, inner.CheapestTotal, sjinfo, cp) != nil {
+		return addPathsForJointype(s, joinrel, outer, inner, clauses, cp, sjinfo, jt, uniqueSideInner)
+	}
+	return nil
+}
+
+// addPathsForJointype is the body of `add_paths_to_joinrel` for one
+// (direction, jointype) pair — split out of addPathsToJoinrel so a SEMI
+// direction can be offered twice, once as SEMI and once unique-ified
+// (M0145-0008ab).
+func addPathsForJointype(s *searchCtx, joinrel, outer, inner *RelOptInfo, clauses []*restrictInfo, cp costParams, sjinfo *SpecialJoinInfo, jt parser.JoinType, uniq uniqueSide) error {
 	// M0142-0008c-3a: fully resolve the sentinel before calling ANY builder.
 	// `uniq` names which side jointypeForDirection found unique-ifiable, but
 	// no builder yet knows to substitute that side's path with

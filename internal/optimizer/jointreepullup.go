@@ -154,6 +154,14 @@ type jtPulledBody struct {
 	// its own base-relation leaves. The seam admits that leaf without a
 	// catalog table and prices it from its plan (`seamLeafBinding`).
 	derived bool
+	// distinct records, for a derived body, PG's `query_is_distinct_for`
+	// on its one output column (M0145-0008ab): the leaf's unique-ified path
+	// is then the leaf itself (create_unique_path's UNIQUE_PATH_NOOP).
+	distinct bool
+	// uniqueOutput is PG's `isunique` for the body's one output column
+	// (`subqueryOutputIsUnique`), which the join selectivity reads through
+	// baseRelInfo.subqueryUniqueOutput (M0145-0008ab).
+	uniqueOutput bool
 }
 
 // maxPulledSublinkDepth bounds the nested pull-up recursion. PG has no
@@ -837,6 +845,9 @@ func classifyPulledQuals(pu *jtPullup, nReal int, spans []leafSpan, ctx *resolve
 			sjLeft = leftBits &^ emittingBits
 		}
 		if sj := pulledSemiJoinInfo(pb.jointype, sjRhs, sjLeft, spanning, spans); sj != nil && !joinInfoListHas(ctx.joinInfoList, sj) {
+			// M0145-0008ab: a derived ANY_subquery proven distinct on its
+			// output unique-ifies for free — see SpecialJoinInfo.SemiRhsDistinct.
+			sj.SemiRhsDistinct = pb.derived && pb.distinct && pb.subtreeLeaves == 1
 			ctx.joinInfoList = append(ctx.joinInfoList, sj)
 		}
 		pos += n
@@ -900,6 +911,10 @@ func pulledSemiJoinInfo(jointype parser.JoinType, rhs, emittingBits RelSet, span
 		sj.SemiCanBtree = true
 		sj.SemiCanHash = true
 		sj.SemiRhsExprs = rhsExprs
+		// The spanning quals are rebased into problem space, so the RHS
+		// operands are problem-space column refs, not positions in the RHS
+		// leaf's own output.
+		sj.SemiRhsProblemSpace = true
 	}
 	return sj
 }
@@ -1482,6 +1497,8 @@ func pullUpAnyDerivedBody(in *InExpr, parent *resolveContext, cat catalog.Catalo
 		bodyBindings: bodyCtx.bindings,
 		quals:        []Expr{link},
 		derived:      true,
+		distinct:     queryIsDistinctForFirstColumn(in.Subquery, cat),
+		uniqueOutput: subqueryOutputIsUnique(in.Subquery),
 	}, "", true
 }
 

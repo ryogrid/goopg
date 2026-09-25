@@ -109,6 +109,13 @@ type joinVarStats struct {
 	// to compare numerically or byte-wise — `histCmp` falls back to
 	// strings.Compare without it, which orders "10" before "9". take2 P2-12.
 	typeName string
+
+	// isUnique is PG's `vardata->isunique` for the one case goopg sets it:
+	// the output column of a derived ANY_subquery leaf that is the
+	// sub-select's lone DISTINCT/GROUP BY column (baseRelInfo.
+	// subqueryUniqueOutput). `getVariableNumDistinct` then treats the column
+	// as unique over the relation's rows, as upstream does.
+	isUnique bool
 }
 
 // examineJoinVar resolves ONE operand of a join clause to its base relation's
@@ -154,6 +161,19 @@ func (s *searchCtx) examineJoinVar(key Expr, relids RelSet) joinVarStats {
 		v.isBool = cr.Type.Name == "bool"
 	}
 	if !ok {
+		// M0145-0008ab: `examine_simple_variable`'s RTE_SUBQUERY arm. A
+		// derived leaf has no catalog table to read statistics from, but PG
+		// still learns one fact from the sub-select: its lone DISTINCT or
+		// GROUP BY output column is unique. vardata->rel is the subquery rel,
+		// so `tuples`/`rows` are the leaf's own.
+		if cr != nil && relids != 0 && relids&(relids-1) == 0 {
+			j := bits.TrailingZeros32(uint32(relids))
+			if j < len(s.relInfos) && s.relInfos[j].subqueryUniqueOutput {
+				v.isUnique = true
+				v.tuples = float64(s.relInfos[j].baseRows)
+				v.rows = float64(s.relInfos[j].filteredRows)
+			}
+		}
 		return v
 	}
 	info := s.relInfos[i]
@@ -235,6 +255,16 @@ func getVariableNumDistinct(v joinVarStats) (float64, bool) {
 		stadistinct = v.stats.StaDistinct()
 	case v.isBool:
 		stadistinct = 2.0
+	}
+	// "If there is a unique index or DISTINCT clause for the variable, assume
+	// it is unique no matter what pg_statistic says" — upstream overrides
+	// whatever the branches above found.
+	if v.isUnique {
+		nullfrac := 0.0
+		if v.stats != nil {
+			nullfrac = v.stats.NullFrac
+		}
+		stadistinct = -1.0 * (1.0 - nullfrac)
 	}
 
 	// An absolute estimate is used as-is, whatever the relation's size.

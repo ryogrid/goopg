@@ -988,6 +988,7 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 			leaves[i] = scan
 		}
 		relInfos[i] = seamLeafRelInfo(i, b, scan, local, cat)
+		relInfos[i].subqueryUniqueOutput = pulledLeafUniqueOutput(ctx, i-pulledBase)
 		// The leaf's own coordinates are non-emitting (a SEMI/ANTI join
 		// never projects its RHS), so the boundary filler must mark them
 		// fillable exactly like the extracted leaves' — which is what the
@@ -2754,6 +2755,22 @@ func pulledLeafIsDerived(ctx *resolveContext, k int) bool {
 	for _, body := range pu.bodies {
 		if k < len(body.bodyBindings) {
 			return body.derived
+		}
+		k -= len(body.bodyBindings)
+	}
+	return false
+}
+
+// pulledLeafUniqueOutput reports whether the k-th pulled leaf is a derived
+// body whose output column PG's estimator treats as unique (M0145-0008ab).
+func pulledLeafUniqueOutput(ctx *resolveContext, k int) bool {
+	pu := ctx.jtPullup
+	if pu == nil || k < 0 {
+		return false
+	}
+	for _, body := range pu.bodies {
+		if k < len(body.bodyBindings) {
+			return body.derived && body.uniqueOutput
 		}
 		k -= len(body.bodyBindings)
 	}

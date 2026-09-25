@@ -67,6 +67,9 @@ func createUniquePath(rel *RelOptInfo, subpath *Path, sjinfo *SpecialJoinInfo, c
 	if len(sjinfo.SemiRhsExprs) == 0 {
 		return nil
 	}
+	if sjinfo.SemiRhsProblemSpace {
+		return createPulledUniquePath(rel, subpath, sjinfo)
+	}
 	// See the domain note above: the only live producer of SemiRhsExprs
 	// wraps its subquery body as a PathPrebuilt, and cr.Index is only
 	// meaningful against THAT node's Output(). Any other Path kind is
@@ -137,4 +140,42 @@ func createUniquePath(rel *RelOptInfo, subpath *Path, sjinfo *SpecialJoinInfo, c
 	}
 	rel.CheapestUnique = uniquePath
 	return uniquePath
+}
+
+// createPulledUniquePath is createUniquePath for a SEMI join whose RHS is a
+// pulled sublink body (jointreepullup.go), whose SemiRhsExprs are written in
+// the join problem's column space.
+//
+// Only PG's UNIQUE_PATH_NOOP arm is ported for it (M0145-0008ab): an
+// ANY_subquery whose sub-select `query_is_distinct_for` its output
+// (postgres/src/backend/optimizer/util/pathnode.c:1955-1975). That path is the
+// subpath itself — rows = rel->rows, the subpath's own costs and pathkeys — so
+// returning subpath unchanged is exactly PG's node. Every other pulled RHS
+// still declines: a base relation would need PG's own NOOP arm first
+// (`relation_has_unique_index_for`, pathnode.c:1940) and the HASH method
+// (ledger M0142-0008c-1a), and electing a paid Sort+Unique where PG takes one
+// of those would be a divergence of goopg's own making.
+func createPulledUniquePath(rel *RelOptInfo, subpath *Path, sjinfo *SpecialJoinInfo) *Path {
+	if !sjinfo.SemiRhsDistinct {
+		return nil
+	}
+	// The RHS must be exactly one base leaf — the derived ANY_subquery — and
+	// every uniq expr must name a column of it; anything else is a desync to
+	// decline on, not a shape to guess at.
+	if rel.baseLeaf == nil || subpath.Kind != PathPrebuilt || subpath.node == nil {
+		return nil
+	}
+	out := subpath.node.Output()
+	for _, e := range sjinfo.SemiRhsExprs {
+		cr, ok := e.(*ColumnRef)
+		if !ok {
+			return nil
+		}
+		local := cr.Index - rel.baseOffset
+		if local < 0 || local >= len(out) || out[local].Name != cr.Name {
+			return nil
+		}
+	}
+	rel.CheapestUnique = subpath
+	return subpath
 }

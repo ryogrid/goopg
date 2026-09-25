@@ -738,6 +738,13 @@ type baseRelInfo struct {
 	// planSubqueryRangeVar. `addAppendRelPartialPaths` reads it to hoist
 	// the leaf's Parallel Append candidate onto the search leaf rel.
 	appendrel bool
+	// subqueryUniqueOutput marks a derived ANY_subquery leaf whose one output
+	// column PG's `examine_simple_variable` would call `isunique`: it is the
+	// sub-select's only DISTINCT column or only GROUP BY column
+	// (postgres/src/backend/utils/adt/selfuncs.c, RTE_SUBQUERY arm). The
+	// leaf has no catalog table, so this is the whole of its column
+	// statistics — `examineJoinVar` reads it (M0145-0008ab).
+	subqueryUniqueOutput bool
 }
 
 // estimateBaseRelInfo computes a `baseRelInfo` for one FROM
