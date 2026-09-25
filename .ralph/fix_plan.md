@@ -2483,9 +2483,10 @@ heuristic stays live.)
     `decodeXLogHeapPrune`\), keep reading 11\-byte plans from existing WAL
     if old segments must replay, and pin with a `pg\_waldump` check.
   - **FIXED 2026\-09\-25 \(`0b37c784b`\).** Evidence
-    `analysis/m-nightly/freeze\-wal\-plan\-padding/`; design log
-    `docs/design/wal\-pg\-identical\-stream/IMPLEMENTATION\-TODO.md` \(A7
-    correction\).
+    `analysis/m\-nightly/freeze\-wal\-plan\-padding/`; design doc
+    `docs/design/wal\-pg\-identical\-stream/freeze\-plan\-padding.md`
+    \(corrects the A7\-freeze entry of the WAL tracker, which is over the
+    D3 size limit\).
     - Encoder and decoder use PG\'s 12\-byte plan; the decoder still reads
       the legacy 11\-byte form, recognised by its odd block\-data length.
     - PG 18.3 `pg\_waldump` now prints `ntuples: 3, offsets: \[1, 3, 5\]`
