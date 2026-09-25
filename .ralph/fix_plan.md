@@ -2464,11 +2464,13 @@ heuristic stays live.)
   evidence `ci/logs/20260925-002342/testport/go-test.log`).
   Kind: impl
   Parent: none
+  - Recurred in the 2026\-09\-26 nightly \(`AI-20260926-011809-001`\).
 - [ ] **testport/TestPort_IsolationTemporalRangeIntegrity** — testport TestPort\_IsolationTemporalRangeIntegrity FAILed
   (AI-20260925-002342-004; repro: `go test -v -run '^TestPort_IsolationTemporalRangeIntegrity$' ./internal/testport/`,
   evidence `ci/logs/20260925-002342/testport/go-test.log`).
   Kind: impl
   Parent: none
+  - Recurred in the 2026\-09\-26 nightly \(`AI-20260926-011809-002`\).
 - [x] **testport/TestPort_RegressSuite** — testport TestPort\_RegressSuite FAILed \(must\-pass subtests: portals\_p2, union; reopened: the 2026\-09\-22 task was closed\)
   (AI-20260925-002342-005; repro: `go test -v -run '^TestPort_RegressSuite$' ./internal/testport/`,
   evidence `ci/logs/20260925-002342/testport/go-test.log`).
