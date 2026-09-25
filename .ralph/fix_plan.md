@@ -80,13 +80,35 @@ banner at the next `## ` line).
    0003a superseded into M0146-0008, 0003b discharged by
    M0145-0004/0004a) — their wall
    is the resolver-time lowering, fixed inside item 3's M0145-0003/0004.
+2a. **Post-cutover correctness and gate-red batch** (owner decision
+   2026-09-25 — S2 placement; see OWNER DECISIONS 2026-09-25 below), in
+   this order: **M0145-0008r** (bitmap scan over an unproven partial
+   index drops rows — regress `portals_p2` red) → **M0145-0008s**
+   (per-worker HashSetOp over partial inputs — regress `union` red) →
+   **M0145-0008m** (PK-dependent column reads NULL under an
+   index-ordered grouping input) → **the freeze-WAL record** (the
+   manually-discovered `xlhp_freeze_plan` 11-vs-12-byte item under
+   M-NIGHTLY) → **M0146-0015** (`subselect` >1h hang — recon; its
+   bisect answers whether the cutover introduced it) →
+   **testport/TestE2E_PGColdStartOnGoopgDataDir** (init-template conf
+   fidelity: `goopg init` writes PG's commented `work_mem` default; the
+   512MB convention lives in the bench runtime confs, not the
+   template). The `TestPort_RegressSuite` reopen item closes when
+   0008r and 0008s land. The three isolation specs (EvalPlanQual,
+   ReadWriteUnique4, TemporalRangeIntegrity) are SSI-semantics /
+   scheduling divergences and keep M-NIGHTLY order — no bump.
+   Descendants filed under this item's tasks inherit item 2a's rank
+   (explicit owner placement; S7's lowest-candidate tiebreak does not
+   re-queue them under item 3).
 3. **M0145 jointree-first planner** (flow unification, owner decision
    2026-09-20 — fix the medium-level route divergence documented in
    `METHODOLOGY4/plan-flow-medium-abstraction.md` at the boundary, not per
    plan: a jointree-level IR built before lowering, sublinks pulled up into
    it, one DP pass over it, one Path→Node lowering at the end; the new
    pipeline is selectable behind `GOOPG_JOINTREE_PIPELINE=1` and the legacy
-   pipeline stays the default until the M0145-0008 cutover deletes it).
+   pipeline stays the default until the M0145-0008 cutover deletes it —
+   **the flip HAS landed 2026-09-24/25: the jointree pipeline is the only
+   pipeline and the knob is retired**).
    Order: **M0145-0001** (IR recon/design) →
    **M0145-0002** (dual-pipeline harness) → **M0145-0003** (sublink
    pull-up — the pilot is already in flight as M0142-0008a-3i-route-a
@@ -136,7 +158,8 @@ banner at the next `## ` line).
    continuation is M0146** (`docs/milestones/0146-post-cutover-plan-parity.md`,
    task entries at the end of this file) — the executor-substrate /
    election / statistics burn-down, sequenced by M0146-0001's
-   re-baseline census. Until the flip, no M0146 task is selectable.
+   re-baseline census. The flip has landed, so M0146 is live — but item
+   2a (above) ranks ahead of it until the batch drains.
 4. **M0141-S2a-fix2r** — re-apply the PG-faithful `hashAggEntrySize` change that
    was discarded for parity reasons (owner Q4: no reverts). Degradations it
    causes are filed as their own tasks, not reverted.
@@ -322,6 +345,33 @@ delegated; details in each task's entry):
   cluster on both engines carries `work_mem = 512MB` explicitly in
   `postgresql.conf`, no session `SET`; the remaining BootVal-fidelity
   item is parked per its task entry.
+
+OWNER DECISIONS 2026-09-25 (post-cutover wrong-results review
+`/home/ryo/work/tmp/ef5e65e27094282ab28769901e05621c/00-after-cutover-teport.md`,
+delegated; details in each task's entry):
+- **S2 batch → new item 2a.** Four open S2 defects, ordered by
+  reachability: 0008r → 0008s → 0008m → freeze-WAL. M0146-0015's
+  cutover-causality bisect and the TestE2E conf-template fix join the
+  same batch; the three isolation specs keep M-NIGHTLY order.
+- **M0145-0008ac: option (i) — sequence parameterised-path work
+  first.** Q95's SF1 timeout is NOT accepted as a G5 coverage loss.
+  The task stays `[!]` until parameterised inner paths through a join
+  (M0146-0012 / M0145-0010 family) land, then re-apply the preserved
+  patch and re-run the fire set at both scales. The same blocker
+  gates M0145-0008y.
+- **TLS / SCRAM-SHA-256-PLUS: stay no-SSL.** The PG 18.3 oracle is
+  built without SSL, so TLS work is unverifiable divergence today.
+  The task stays `[!]` until an SSL-enabled oracle exists.
+- **partition_aggregate inventory row: option (i) — correct it to
+  `status=failed`.** Measured never-passed and needs two unbuilt
+  milestone-scale planner features, so the must-pass gate was
+  permanently red on unscheduled work. Row corrected in
+  `docs/test-port/postgres-oracle-target-inventory.csv`.
+- **template1 catalog namespace: Option A.** Route
+  `ResolveDatabaseOid` around the `DefaultDBOid` sentinel for
+  template1 (the design doc's recommendation, explicitly a
+  workaround); Option B stays the M0122-0007 epic (slices 4b-4e).
+  Task re-opened `[ ]`.
 
 **UNFROZEN (owner decision 2026-09-20) — selectable again:** the M0142-0008
 chain (`M0142-0008a-3`, `M0142-0008c-1a`, `M0142-0008c-3d`,
@@ -2023,11 +2073,11 @@ heuristic stays live.)
     (`octet_length` 2, 2, 2 and 3 on a `char(6)` holding 'ab'). Only the
     `lower`/`upper`/`initcap` family was fixed here.
 
-- [!] **testport/TestPort_RegressSuite/partition_aggregate — partitionwise
+- [x] **testport/TestPort_RegressSuite/partition_aggregate — partitionwise
   aggregation (AI-20260922-004850-016, split out)** — **SCOPING RECON DONE
-  2026-09-22 (loop \#62), no production change. Marked `[!]`: it needs an
-  OWNER DECISION on the inventory row before any code, and the feature
-  itself is milestone-scale, not loop-scale.**
+  2026-09-22 (loop \#62), no production change. Owner decision
+  2026-09-25 (below): inventory row corrected to `status=failed`;
+  the feature itself stays unscheduled — CLOSED.**
   Kind: recon
   Parent: none
   Movement: none — no production change.
@@ -2091,6 +2141,16 @@ heuristic stays live.)
     on all of them except this one — so for the other 20 the STATUS is right
     and only the rationale text is stale. This is a single-row defect, not a
     consolidation-wide one, and no other must-pass case is affected.
+  - **OWNER ANSWER 2026\-09\-25 \(delegated\): option \(i\) — the
+    inventory row is corrected to `status=failed`, `pass_required=no`.**
+    Finding 1 \(never passed, byte\-identical before the blamed commit\)
+    and Finding 2 \(two unimplemented milestone\-scale planner features\)
+    make `status=pass` a false claim; the honest state is "in\-scope,
+    diverging". Row corrected in
+    `docs/test-port/postgres-oracle-target-inventory.csv`; scheduling
+    \(a\)-\(d\) is NOT taken — partitionwise work re\-enters planning
+    through the normal milestone route if the owner wants it built.
+    CLOSED.
 
 - [x] **bpchar-text-function-class — every text function receiving a bpchar
   must apply the rtrim1 cast** (filed 2026-09-22 out of
@@ -2369,6 +2429,12 @@ heuristic stays live.)
     an active `work\_mem = 512MB` line besides the harness\'s `fsync = off`
     \(`e2e\_pg\_coldstart\_on\_goopgdata\_test.go:204`\); a plain `goopg init`
     must write only PG\'s commented defaults.
+  - **OWNER DIRECTION 2026\-09\-25 \(delegated\): fix the template, keep
+    the convention.** `goopg init` writes PG\'s commented `work_mem`
+    default again \(PG\-faithful\); the 512MB measurement convention is
+    carried by the explicit lines already in the bench runtime
+    `postgresql.conf` files \(`bench/tpch|tpcds/runtime*/`\), not by the
+    init template. Placed in banner item 2a.
 - [ ] **testport/TestPort_IsolationEvalPlanQual** — testport TestPort\_IsolationEvalPlanQual FAILed \(reopened: the 2026\-09\-22 task was closed stale\)
   (AI-20260925-002342-002; repro: `go test -v -run '^TestPort_IsolationEvalPlanQual$' ./internal/testport/`,
   evidence `ci/logs/20260925-002342/testport/go-test.log`).
@@ -2419,6 +2485,11 @@ heuristic stays live.)
   > goopg\'s freeze records decode wrongly in real PostgreSQL \(missing C
   > struct padding\). Filed and not selected ahead of the banner, per S2;
   > the owner decides its placement.
+  >
+  > **OWNER ANSWER 2026\-09\-25 \(delegated\):** placed in banner item
+  > 2a, fourth of the batch \(after 0008r, 0008s, 0008m\). No live PG
+  > standby consumes goopg WAL today, so it ranks below the
+  > query\-visible wrong results but ahead of parity work.
 
 
 - [x] **`CREATE FUNCTION` completes with command tag `OK`, not `CREATE
@@ -3252,10 +3323,8 @@ Priority` banner at the head of this file currently says (item 10 tail as of
     `partition_aggregate`); tpch-spotcheck Q12=2/Q13=33; tpcds-sf025;
     acceptance arm 24/24; pgbench smoke.
 
-- [!] **template1 shares the `postgres` catalog namespace** — **MAPPED
-  2026-09-22; marked `[!]` because the fix is an OWNER/DESIGN CHOICE between
-  two options with very different blast radii, one of which is an existing
-  epic.** Design:
+- [ ] **template1 shares the `postgres` catalog namespace** — **MAPPED
+  2026-09-22; Option A chosen by owner decision 2026-09-25 (below).** Design:
   `docs/design/0100-0149/0119-0006bv-template1-namespace-collision.md`.
   Kind: bug
   Parent: M0119-0006
@@ -3303,6 +3372,12 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       labelled as routing around the sentinel, with Option B named as the
       real fix. But accepting a correct-but-narrow fix that leaves a known
       structural hazard is an owner call, not the loop's.
+  - **OWNER ANSWER 2026\-09\-25 \(delegated\): Option A.** Route
+    `ResolveDatabaseOid` around `DefaultDBOid` for template1 — the
+    bounded fix now, labelled a sentinel workaround as the design doc
+    recommends. Option B \(postgres namespace 5, one oid per database at
+    every layer\) remains the real fix inside M0122\-0007 slices 4b\-4e;
+    this task does not pull that epic forward. Re\-opened.
 
 - [ ] **M0122-0008 — Auth / roles / multi-DB isolation / encoding**.
   Kind: impl
@@ -3400,6 +3475,11 @@ Priority` banner at the head of this file currently says (item 10 tail as of
   - Resume point: `handleStartup`'s SSLRequest arm \(internal/postmaster/server.go\),
     `connTypeFor` \(ConnHostSSL\), then `scram.go`'s `p=` branch and the
     mechanism list.
+  - **OWNER ANSWER 2026\-09\-25 \(delegated\): stay no\-SSL.** The PG
+    18.3 oracle is built without SSL, so a TLS server and channel
+    binding could not be checked against it — unverifiable divergence is
+    worse than an honest gap. The task stays `[!]` until an SSL\-enabled
+    PG 18.3 oracle exists to measure against; the resume point stands.
 
 - [ ] **ALTER SYSTEM is a no\-op** \(measured 2026\-09\-24\): `ALTER SYSTEM
   SET geqo\_effort = 11` and `ALTER SYSTEM SET ssl = on` both report
@@ -17236,7 +17316,9 @@ Movement: none — no plan moved on TPC-DS SF0.25/SF1 or TPC-H across all four d
   - Expected movement: TPC\-DS SF0.25 first divergences on Q1/Q6/Q32/Q92
     and TPC\-H Q2 move past that join; measured on the canonical captures.
   - **BLOCKED 2026\-09\-25 on M0146\-0012** \(evidence
-    `analysis/m0145/m0145\-0008y/prototype\-fireset.txt`\).
+    `analysis/m0145/m0145\-0008y/prototype\-fireset.txt`\) — confirmed by
+    the 2026\-09\-25 owner decision on M0145\-0008ac: parameterised inner
+    paths land first; this stays `[!]` until then.
     - Prototype \(not committed\): `canUnnestSubquery` refuses every scalar
       sublink. The fire\-set gate fired exactly TPC\-H Q2 and TPC\-DS Q1, Q6,
       Q32, Q92 and introduced no timeouts. Categories improved slightly
@@ -17439,6 +17521,14 @@ Movement: none — no plan moved on TPC-DS SF0.25/SF1 or TPC-H across all four d
       large part.
     - Owner decision needed: sequence the parameterised\-path work ahead of
       this, or accept Q95\'s SF1 timeout as a coverage loss under G5.
+    - **OWNER ANSWER 2026\-09\-25 \(delegated\): option \(i\) — sequence
+      the parameterised\-path work ahead.** A 60x\+ Q95 timeout is a
+      real coverage hole, not an acceptable G5 loss. This task stays
+      `[!]` until parameterised inner paths through a join \(the
+      M0146\-0012 / M0145\-0010 family\) land; then re\-apply the
+      preserved patch and re\-run the fire set at SF0\.25 and SF1. The
+      same blocker gates M0145\-0008y, so unblocking it clears two
+      items.
 
 
 - [x] **M0145-0009 — CTE-output statistics (B-06 resume): wire the landed
@@ -20195,6 +20285,10 @@ Movement: none — no plan moved on TPC-DS SF0.25/SF1 or TPC-H across all four d
   > The must\-pass regress case `portals\_p2` is red in the nightly. Filed
   > and not selected ahead of the banner, per S2; the owner decides its
   > placement.
+  >
+  > **OWNER ANSWER 2026\-09\-25 \(delegated\):** placed FIRST in banner
+  > item 2a — wrong results on an ordinary single\-table equality query,
+  > the most reachable of the open S2 defects.
 
 - [ ] **M0145\-0008s — WRONG RESULTS: a HashSetOp runs per worker over
   partial \(Parallel Seq Scan\) inputs** \(found 2026\-09\-25 while triaging
@@ -20225,6 +20319,10 @@ Movement: none — no plan moved on TPC-DS SF0.25/SF1 or TPC-H across all four d
   > worker applies the set operation to only its share of both inputs. The
   > must\-pass regress case `union` is red in the nightly. Filed and not
   > selected ahead of the banner, per S2; the owner decides its placement.
+  >
+  > **OWNER ANSWER 2026\-09\-25 \(delegated\):** placed second in banner
+  > item 2a — nondeterministic wrong results under a plan shape the
+  > corpus can elect \(TPC\-DS carries INTERSECT/EXCEPT queries\).
 
 - [x] **M0145\-0008g — `expr = ANY \(const list\)` with an expression operand is
   estimated as PG does**: PG prices `substr\(c\_phone,1,2\) IN \(7 values\)` at
@@ -20408,6 +20506,10 @@ Movement: none — no plan moved on TPC-DS SF0.25/SF1 or TPC-H across all four d
   > returns NULL for that column when the grouping election picks the
   > index\-ordered Index Only Scan input. Filed and not selected ahead of the
   > banner, per S2; the owner decides its placement.
+  >
+  > **OWNER ANSWER 2026\-09\-25 \(delegated\):** placed third in banner
+  > item 2a — wrong results on a narrower election shape than 0008r /
+  > 0008s but still live query corruption.
 
 - [x] **M0145\-0008i — multi\-relation `remove\_useless\_groupby\_columns`**:
   PG drops GROUP BY columns that a primary key or unique NOT NULL index of
@@ -20700,10 +20802,16 @@ M0146-0001 re-baseline census on the new default arm.
   Kind: recon
   Parent: none
   - First step: EXPLAIN it on a throwaway cluster seeded with the regress
-    `tenk1` on both pipelines \(`GOOPG\_JOINTREE\_PIPELINE=0/1`\) to see
-    whether the M0145\-0008 cutover introduced it, and compare with PG's
-    plan. Blocks running `subselect` in the regress comparison. Expected
+    `tenk1` on a pre\-flip commit \(the `GOOPG\_JOINTREE\_PIPELINE` knob no
+    longer exists at HEAD — build a worktree at the flip parent\) vs HEAD,
+    to see whether the M0145\-0008 cutover introduced it, and compare with
+    PG's plan. Blocks running `subselect` in the regress comparison. Expected
     movement: none on the parity instruments; it restores a regress case.
+  - **PLACEMENT 2026\-09\-25 \(owner decision, delegated\):** banner item
+    2a, fifth — its causality bisect is part of the post\-cutover
+    correctness review. If the bisect shows the cutover introduced the
+    hang it re\-enters as an S2\-class cutover regression; if pre\-existing
+    it keeps normal M0146 order.
 
 - [ ] **M0146\-0002a — category regressions from the Parallel Hash arm**
   \(measured 2026\-09\-24 at slice 2, TPC\-H parallel lane\): Q12 gains
