@@ -322,6 +322,42 @@ estimated at 1 row and costed as cached, where PG merge-joins over
 `Materialize`. The patch waits on that election (M0146-0005a). Q79 would
 additionally need PG's fuzzy startup tie-break against the nested loop.
 
+### M0146-0005b: CTE scans carry the CTE body's pathkeys (landed)
+
+Landed 2026-09-25 (`5301b111b`); `internal/optimizer/ctescanpathkeys.go`.
+
+PG's `set_cte_pathlist` gives a CTE scan path the CTE plan's pathkeys,
+translated into the outer query by `convert_subquery_pathkeys`.
+`addCTEScanPathkeys` does the same for goopg's prebuilt CTE-scan leaf paths,
+once the clause list and query pathkeys are published:
+- the body's output ordering comes from `inputNodePathkeys`;
+- each ordered output column maps to this query's expression for it, using
+  the same useful-column map the ordered index paths consult;
+- translation stops at the first key with no counterpart, as
+  `convert_subquery_pathkeys` does.
+
+The executor's CTE row cache returns rows in body order, so the claim holds
+for every reference.
+
+**Measured:**
+- TPC-DS Q47's three CTE scans now merge-join without a Sort (goopg 0..263,
+  PG 0..369).
+- The fire set fires Q47 only at both scales: join-method 55 → 54 (SF0.25)
+  and 60 → 58 (SF1); scan-type +2 at each scale, where PG puts `Materialize`
+  over its inner CTE scans.
+- Values are identical, with no timeouts.
+
+With 0005b in place, the slice-5 bucket patch no longer times out Q47
+(SF0.25 96 PASS). It stays parked on one remaining blocker, M0146-0005c:
+twelve executor tests build unanalyzed tables and rely on hash joins, which
+PG's default bucket now prices out
+(`slice5/executor-tests-failing-with-patch.txt`).
+
+**Not ported (ledgered):**
+- PG converts subquery-scan pathkeys the same way (`set_subquery_pathlist`).
+- PG's merge join adds `Materialize` over an inner that cannot mark/restore
+  cheaply.
+
 ## Remaining records
 
 Per M0146-0001's `m0146-0001-ranked.txt`, still to be worked:

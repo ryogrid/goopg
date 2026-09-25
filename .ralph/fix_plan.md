@@ -21175,7 +21175,7 @@ M0146-0001 re-baseline census on the new default arm.
     - goopg\'s CTE scans carry no pathkeys, so its merge join must sort and
       the cached\-inner nested loop \(856\) wins. Filed M0146\-0005b.
   Movement: none
-- [ ] **M0146\-0005b — CTE scans carry the CTE plan\'s output pathkeys, as
+- [x] **M0146\-0005b — CTE scans carry the CTE plan\'s output pathkeys, as
   PG\'s `set\_cte\_pathlist` gives them** \(filed 2026\-09\-25 by
   M0146\-0005a\): PG converts the CTE subplan\'s pathkeys into the outer query
   \(`convert\_subquery\_pathkeys`, allpaths.c `set\_cte\_pathlist`\), so TPC\-DS
@@ -21191,6 +21191,33 @@ M0146-0001 re-baseline census on the new default arm.
     ordered aggregate\) in the CTE\'s output columns, and set it as the
     leaf path\'s `Pathkeys`. Then re\-apply the slice\-5 patch and re\-run the
     fire set; Q47 must not time out.
+  - **DONE 2026\-09\-25 \(`5301b111b`\).** `ctescanpathkeys.go`
+    \(`addCTEScanPathkeys`\); design doc §"M0146\-0005b"; evidence
+    `analysis/m0146/m0146\-0005/slice5/`.
+    - Q47\'s three CTE scans now merge\-join presorted, as PG does. The fire
+      set fires Q47 only: join\-method SF0.25 55 → 54, SF1 60 → 58;
+      scan\-type \+2 \(PG\'s `Materialize`\).
+    - With the slice\-5 patch on top, Q47 no longer times out. The patch
+      stays parked on M0146\-0005c.
+  Movement: none
+- [ ] **M0146\-0005c — twelve executor tests depend on hash joins over
+  unanalyzed tables** \(filed 2026\-09\-25 by M0146\-0005b\): with PG\'s default
+  0.1 hash bucket for a stats\-less key
+  \(`slice5/default\-hash\-bucket.wip.patch`\), the tests in
+  `slice5/executor\-tests\-failing\-with\-patch.txt` get merge joins and
+  fail. They cover spill, bucket/batch reporting, parallel shared builds and
+  owned\-build poisoning, over `spillFixture` / `pqCompositeFixture`\-style
+  tables that are never ANALYZEd, some written with `writeHeapRow`. The
+  patch is the last step to price the TPC\-DS "PG nested loop, goopg hash
+  join" family \(Q1, Q79, Q55, …\).
+  Kind: impl
+  Parent: M0146\-0005
+  - First step: per fixture, decide whether ANALYZE \(real key statistics\)
+    restores the hash join the test exercises without changing the spill or
+    batch geometry it asserts. Where it cannot, pin the plan a PG\-faithful
+    way \(a planner\-settings hook in the executor fixture\), not by keeping
+    the stats\-less skip. Then land the patch with the full gates and the
+    fire set.
 - [ ] **M0146-0006 — Incremental Sort election** (impl; M0141-S7's
   resume, sequenced after M0146-0005 per the owner hold). The two filed
   resume points: S2b-9 (offer an Incremental Sort over the seed itself —
